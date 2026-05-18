@@ -1,6 +1,7 @@
 package initdb
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -35,7 +36,7 @@ func bootstrapRelcacheInitFiles(dataDir string) error {
 	if err := writeRelcacheInitFile(dataDir, false, nailedLocalRels); err != nil {
 		return fmt.Errorf("local relcache init (base/1): %w", err)
 	}
-	// Also copy to base/5/ for the "postgres" database.
+	// Copy to base/5/ for the "postgres" database (same nailed local rels).
 	src := filepath.Join(dataDir, "base", "1", "pg_internal.init")
 	dst := filepath.Join(dataDir, "base", "5", "pg_internal.init")
 	srcData, err := os.ReadFile(src)
@@ -45,11 +46,8 @@ func bootstrapRelcacheInitFiles(dataDir string) error {
 	if err := os.WriteFile(dst, srcData, 0o600); err != nil {
 		return fmt.Errorf("write base/5/pg_internal.init: %w", err)
 	}
-	// Read-only to prevent PG from overwriting.
-	if err := os.Chmod(dst, 0o400); err != nil {
-		return fmt.Errorf("chmod base/5/pg_internal.init: %w", err)
-	}
-
+	// No chmod — PG must be able to unlink and rewrite the file when a
+	// nailed-rel DDL transaction commits (RelationCacheInitFilePreInvalidate).
 	return nil
 }
 
@@ -1424,7 +1422,288 @@ func indexKeyAttrs(natts int16) []nailedAttr {
 	return attrs
 }
 
+
+// === Relcache init file: index sub-record support (batched-30) ===
+
+const (
+	// heapTupleDataSize is sizeof(HeapTupleData) = HEAPTUPLESIZE on amd64.
+	// uint32(4) + ItemPointerData(6) + Oid(4) + pad(2) + ptr(8) = 24.
+	heapTupleDataSize = 24
+
+	// pgIndexTupleHdrSize is SizeofHeapTupleHeader =
+	// offsetof(HeapTupleHeaderData, t_bits) = 23 on all PG platforms.
+	pgIndexTupleHdrSize = 23
+
+	// pgIndexNumCols is the number of columns in pg_index (PG18).
+	pgIndexNumCols = 21
+
+	// pgIndexNullBitmapBytes is ceil(21/8) = 3.
+	pgIndexNullBitmapBytes = 3
+
+	// pgIndexTupleHoff is t_hoff for a pg_index tuple with 21 cols and 2 NULLs.
+	// MAXALIGN(23 + 3) = 32 on 64-bit systems.
+	pgIndexTupleHoff = 32
+
+	// btreeAmsupport is BTNProcs = 6 for PG18's btree AM (nbtree.h:723).
+	// Support procs 1-4 and 6 exist; slot 5 is unused but still counted.
+	btreeAmsupport = 6
+)
+
+// criticalSharedHeapOIDs / criticalSharedIndexOIDs are the canonical
+// PG18 nailed-rel sets: NUM_CRITICAL_SHARED_RELS=5 (relcache.c:4086) and
+// NUM_CRITICAL_SHARED_INDEXES=6 (relcache.c:4226). Order matches the
+// formrdesc + load_critical_index calls at relcache.c:4075-4226.
+var (
+	criticalSharedHeapOIDs  = []uint32{1262, 1260, 1261, 3592, 6100}
+	criticalSharedIndexOIDs = []uint32{2671, 2672, 2676, 2677, 2695, 3593}
+
+	// NUM_CRITICAL_LOCAL_RELS=4 (relcache.c:4143), NUM_CRITICAL_LOCAL_INDEXES=7 (:4194).
+	criticalLocalHeapOIDs  = []uint32{1259, 1249, 1255, 1247}
+	criticalLocalIndexOIDs = []uint32{2662, 2659, 2679, 2687, 2655, 2693, 2701}
+)
+
+// opcClassInfo holds the opfamily and input type for a pg_opclass row.
+type opcClassInfo struct {
+	family uint32
+	intype uint32
+}
+
+// amprocCompKey identifies a (family, input-type) pair for amproc lookups.
+type amprocCompKey struct {
+	family uint32
+	intype uint32
+}
+
+// buildOpcInfoByOID returns an OID→{family,intype} map built from
+// pgOpclassInitialEntries.
+func buildOpcInfoByOID() map[uint32]opcClassInfo {
+	m := make(map[uint32]opcClassInfo)
+	for _, e := range pgOpclassInitialEntries() {
+		m[e.OID] = opcClassInfo{family: e.Family, intype: e.IntType}
+	}
+	return m
+}
+
+// buildAmprocCompByKey returns a {family,intype}→procOID map for btree
+// support proc #1 (comparison function) from pgAmprocInitialEntries.
+func buildAmprocCompByKey() map[amprocCompKey]uint32 {
+	m := make(map[amprocCompKey]uint32)
+	for _, e := range pgAmprocInitialEntries() {
+		if e.Num == 1 {
+			m[amprocCompKey{family: e.Family, intype: e.LeftType}] = e.Proc
+		}
+	}
+	return m
+}
+
+// buildPgIndexEntryByRelid returns an indexRelid→pgIndexEntry map built
+// from pgIndexInitialEntries.
+func buildPgIndexEntryByRelid() map[uint32]pgIndexEntry {
+	m := make(map[uint32]pgIndexEntry)
+	for _, e := range pgIndexInitialEntries() {
+		m[e.IndexRelid] = e
+	}
+	return m
+}
+
+// filterCriticalRels extracts exactly the canonical heap + index records
+// from rels in the order required by PG's trailing-count check
+// (relcache.c:6510-6547). Heaps are emitted before indexes.
+func filterCriticalRels(rels []nailedRel, heapOIDs, indexOIDs []uint32) []nailedRel {
+	byOID := make(map[uint32]nailedRel, len(rels))
+	for _, r := range rels {
+		byOID[r.OID] = r
+	}
+	out := make([]nailedRel, 0, len(heapOIDs)+len(indexOIDs))
+	for _, oid := range heapOIDs {
+		if r, ok := byOID[oid]; ok {
+			out = append(out, r)
+		}
+	}
+	for _, oid := range indexOIDs {
+		if r, ok := byOID[oid]; ok {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// padBufferTo4 appends zero bytes to buf until its length is a multiple of 4.
+func padBufferTo4(buf *bytes.Buffer) {
+	if rem := buf.Len() % 4; rem != 0 {
+		buf.Write(make([]byte, 4-rem))
+	}
+}
+
+// buildPgIndexUserData builds the user-data section of a pg_index HeapTuple.
+// Columns 1-19 are written; columns 20-21 (indexprs, indpred) are NULL
+// (reflected in the null bitmap — no bytes emitted for NULL cols).
+// Variable-length fields (cols 16-19) are 4-byte aligned per PG's
+// att_align_pointer convention for typalign='i'.
+func buildPgIndexUserData(e pgIndexEntry) []byte {
+	var buf bytes.Buffer
+	natts := int16(len(e.IndKey))
+
+	// Cols 1-2: OID (4 bytes each)
+	binary.Write(&buf, binary.LittleEndian, e.IndexRelid) // 1: indexrelid
+	binary.Write(&buf, binary.LittleEndian, e.IndRelid)   // 2: indrelid
+	// Cols 3-4: int2 (2 bytes each)
+	binary.Write(&buf, binary.LittleEndian, natts) // 3: indnatts
+	binary.Write(&buf, binary.LittleEndian, natts) // 4: indnkeyatts
+	// Cols 5-15: bool (1 byte each), ordered per pg_index.h
+	for _, v := range []bool{
+		e.IsUnique,  // 5:  indisunique
+		false,       // 6:  indnullsnotdistinct
+		e.IsPrimary, // 7:  indisprimary
+		false,       // 8:  indisexclusion
+		true,        // 9:  indimmediate
+		false,       // 10: indisclustered
+		true,        // 11: indisvalid
+		false,       // 12: indcheckxmin
+		true,        // 13: indisready
+		true,        // 14: indislive
+		false,       // 15: indisreplident
+	} {
+		if v {
+			buf.WriteByte(1)
+		} else {
+			buf.WriteByte(0)
+		}
+	}
+	// 23 bytes so far (4+4+2+2+11×1). Pad to 4 before first varlena.
+	padBufferTo4(&buf) // → 24 bytes
+
+	// Col 16: indkey (int2vector, 4-byte aligned varlena)
+	buf.Write(int2VectorBytes(e.IndKey))
+	padBufferTo4(&buf)
+
+	// Col 17: indcollation (oidvector)
+	buf.Write(oidVectorBytes(e.IndCollation))
+	padBufferTo4(&buf)
+
+	// Col 18: indclass (oidvector)
+	buf.Write(oidVectorBytes(e.IndClass))
+	padBufferTo4(&buf)
+
+	// Col 19: indoption (int2vector); cols 20-21 are NULL — no bytes
+	buf.Write(int2VectorBytes(e.IndOption))
+
+	return buf.Bytes()
+}
+
+// buildPgIndexTupleBytes builds the binary representation of a pg_index
+// HeapTuple as written to the relcache init file. Layout:
+//
+//	[HeapTupleData (heapTupleDataSize = 24 bytes)]
+//	[HeapTupleHeaderData + null bitmap + padding (pgIndexTupleHoff = 32 bytes)]
+//	[user data: pg_index cols 1-19]
+//
+// t_data is written as zeros; the reader fixes it up to point immediately
+// after the HeapTupleData block (relcache.c:6328).
+func buildPgIndexTupleBytes(e pgIndexEntry) []byte {
+	userData := buildPgIndexUserData(e)
+	tLen := uint32(pgIndexTupleHoff) + uint32(len(userData))
+
+	var buf bytes.Buffer
+
+	// HeapTupleData (24 bytes)
+	binary.Write(&buf, binary.LittleEndian, tLen)         // t_len (4)
+	buf.Write(make([]byte, 6))                             // t_self (6)
+	binary.Write(&buf, binary.LittleEndian, uint32(2610)) // t_tableOid = pg_index (4)
+	buf.Write(make([]byte, 2))                             // alignment padding (2)
+	buf.Write(make([]byte, 8))                             // t_data pointer (8, fixed on read)
+
+	// HeapTupleHeaderData (23 fixed bytes)
+	binary.Write(&buf, binary.LittleEndian, uint32(1)) // t_xmin = Bootstrap XID (4)
+	binary.Write(&buf, binary.LittleEndian, uint32(0)) // t_xmax = 0 (4)
+	binary.Write(&buf, binary.LittleEndian, uint32(0)) // t_cid = 0 (4)
+	buf.Write(make([]byte, 6))                         // t_ctid (6)
+	binary.Write(&buf, binary.LittleEndian, uint16(pgIndexNumCols)) // t_infomask2 = 21 (2)
+	// t_infomask: HEAP_HASNULL(0x0001) | HEAP_HASVARWIDTH(0x0002) | HEAP_XMIN_COMMITTED(0x0100)
+	binary.Write(&buf, binary.LittleEndian, uint16(0x0103)) // (2)
+	buf.WriteByte(pgIndexTupleHoff)                         // t_hoff (1)
+
+	// Null bitmap (3 bytes): cols 1-19 not-null (bit=1), cols 20-21 null (bit=0)
+	buf.WriteByte(0xFF) // cols 1-8: all not-null
+	buf.WriteByte(0xFF) // cols 9-16: all not-null
+	buf.WriteByte(0x07) // cols 17-19 not-null (bits 0-2), cols 20-21 null (bits 3-4) = 0b00000111
+
+	// Padding to pgIndexTupleHoff (= 32 - 23 - 3 = 6 bytes)
+	buf.Write(make([]byte, pgIndexTupleHoff-pgIndexTupleHdrSize-pgIndexNullBitmapBytes))
+
+	buf.Write(userData)
+	return buf.Bytes()
+}
+
+// writePgIndexSubrecord appends the index sub-record for rel to buf.
+// Format mirrors write_relcache_init_file (relcache.c:6702-6744):
+//
+//	indexTupleLen uint32  + indexTuple bytes
+//	opfamilyLen   uint32  + opfamily   []uint32 (natts entries)
+//	opcintypeLen  uint32  + opcintype  []uint32 (natts entries)
+//	supportLen    uint32  + support    []uint32 (natts × btreeAmsupport entries)
+//	indcollLen    uint32  + indcoll    []uint32 (natts entries)
+//	indoptLen     uint32  + indoption  []int16  (natts entries)
+//	per-col: opcoptLen uint32 (= 0 for standard btree indexes)
+func writePgIndexSubrecord(
+	buf *bytes.Buffer,
+	rel nailedRel,
+	entry pgIndexEntry,
+	opcInfo map[uint32]opcClassInfo,
+	amprocComp map[amprocCompKey]uint32,
+) {
+	natts := int(rel.RelNatts)
+
+	// pg_index HeapTuple
+	tup := buildPgIndexTupleBytes(entry)
+	binary.Write(buf, binary.LittleEndian, uint32(len(tup)))
+	buf.Write(tup)
+
+	// Per-column arrays
+	opfam := make([]byte, natts*4)
+	opcintype := make([]byte, natts*4)
+	support := make([]byte, natts*btreeAmsupport*4)
+	indcoll := make([]byte, natts*4)
+	indopt := make([]byte, natts*2)
+
+	for i := 0; i < natts; i++ {
+		info := opcInfo[entry.IndClass[i]]
+		binary.LittleEndian.PutUint32(opfam[i*4:], info.family)
+		binary.LittleEndian.PutUint32(opcintype[i*4:], info.intype)
+		// Support proc #1 (comparison) at position i*btreeAmsupport;
+		// slots 1-5 (procs 2-6) stay zero (optional/unsupported procs).
+		cmpProc := amprocComp[amprocCompKey{family: info.family, intype: info.intype}]
+		binary.LittleEndian.PutUint32(support[i*btreeAmsupport*4:], cmpProc)
+		binary.LittleEndian.PutUint32(indcoll[i*4:], entry.IndCollation[i])
+		binary.LittleEndian.PutUint16(indopt[i*2:], uint16(entry.IndOption[i]))
+	}
+
+	binary.Write(buf, binary.LittleEndian, uint32(len(opfam)))
+	buf.Write(opfam)
+	binary.Write(buf, binary.LittleEndian, uint32(len(opcintype)))
+	buf.Write(opcintype)
+	binary.Write(buf, binary.LittleEndian, uint32(len(support)))
+	buf.Write(support)
+	binary.Write(buf, binary.LittleEndian, uint32(len(indcoll)))
+	buf.Write(indcoll)
+	binary.Write(buf, binary.LittleEndian, uint32(len(indopt)))
+	buf.Write(indopt)
+
+	// opcoptions: all zero-length for standard btree indexes
+	for i := 0; i < natts; i++ {
+		binary.Write(buf, binary.LittleEndian, uint32(0))
+	}
+}
+
 func writeRelcacheInitFile(dataDir string, shared bool, rels []nailedRel) error {
+	// Restrict to exactly the canonical critical set required by
+	// PG's trailing-count check (relcache.c:6510-6547).
+	if shared {
+		rels = filterCriticalRels(rels, criticalSharedHeapOIDs, criticalSharedIndexOIDs)
+	} else {
+		rels = filterCriticalRels(rels, criticalLocalHeapOIDs, criticalLocalIndexOIDs)
+	}
+
 	var path string
 	if shared {
 		path = filepath.Join(dataDir, "global", "pg_internal.init")
@@ -1432,58 +1711,49 @@ func writeRelcacheInitFile(dataDir string, shared bool, rels []nailedRel) error 
 		path = filepath.Join(dataDir, "base", "1", "pg_internal.init")
 	}
 
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
+	// Build index lookup tables once per call.
+	opcInfo := buildOpcInfoByOID()
+	amprocComp := buildAmprocCompByKey()
+	idxByRelid := buildPgIndexEntryByRelid()
 
-	// Magic number
-	if err := binary.Write(f, binary.LittleEndian, uint32(relCacheInitFileMagic)); err != nil {
-		return err
-	}
+	var buf bytes.Buffer
+
+	// Magic number (RELCACHE_INIT_FILEMAGIC = 0x573266, relcache.c:93)
+	binary.Write(&buf, binary.LittleEndian, uint32(relCacheInitFileMagic))
 
 	for _, rel := range rels {
 		// 1. RelationData blob
 		relData := buildRelationDataBlob(rel)
-		if err := binary.Write(f, binary.LittleEndian, uint32(len(relData))); err != nil {
-			return err
-		}
-		if _, err := f.Write(relData); err != nil {
-			return err
-		}
+		binary.Write(&buf, binary.LittleEndian, uint32(len(relData)))
+		buf.Write(relData)
 
 		// 2. FormData_pg_class blob
 		pgClass := buildPgClassBlob(rel)
-		if err := binary.Write(f, binary.LittleEndian, uint32(len(pgClass))); err != nil {
-			return err
-		}
-		if _, err := f.Write(pgClass); err != nil {
-			return err
-		}
+		binary.Write(&buf, binary.LittleEndian, uint32(len(pgClass)))
+		buf.Write(pgClass)
 
 		// 3. FormData_pg_attribute for each column
 		for _, a := range rel.Attrs {
 			attrBlob := buildPgAttributeBlob(a)
-			if err := binary.Write(f, binary.LittleEndian, uint32(len(attrBlob))); err != nil {
-				return err
-			}
-			if _, err := f.Write(attrBlob); err != nil {
-				return err
-			}
+			binary.Write(&buf, binary.LittleEndian, uint32(len(attrBlob)))
+			buf.Write(attrBlob)
 		}
 
-		// 4. Access method options length (zero — no options)
-		if err := binary.Write(f, binary.LittleEndian, uint32(0)); err != nil {
-			return err
+		// 4. reloptions length (zero — no AM-specific options)
+		binary.Write(&buf, binary.LittleEndian, uint32(0))
+
+		// 5. Index sub-record — only for RELKIND_INDEX ('i').
+		// Absent for heap rels; reader branches on relkind at :6305.
+		if rel.RelKind == 'i' {
+			entry, ok := idxByRelid[rel.OID]
+			if !ok {
+				return fmt.Errorf("writeRelcacheInitFile: no pg_index entry for OID %d", rel.OID)
+			}
+			writePgIndexSubrecord(&buf, rel, entry, opcInfo, amprocComp)
 		}
 	}
 
-	if err := f.Close(); err != nil {
-		return err
-	}
-	// Write as read-only to prevent PG's write_relcache_init_file from
-	// overwriting hand-crafted init data when the standby starts up.
-	return os.Chmod(path, 0o400)
+	return os.WriteFile(path, buf.Bytes(), 0o600)
 }
 
 func buildRelationDataBlob(rel nailedRel) []byte {
