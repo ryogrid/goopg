@@ -566,6 +566,8 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 		3712, // pg_ts_config_oid_index ← Step 3ck
 		3604, // pg_ts_dict_dictname_index ← Step 3cm
 		3605, // pg_ts_dict_oid_index ← Step 3cm
+		3606, // pg_ts_parser_prsname_index ← Step 3cn
+		3607, // pg_ts_parser_oid_index ← Step 3cn
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680,
 		2684, 2685, // pg_namespace_nspname_index, pg_namespace_oid_index ← Step 3t
 		2687, 2688, 2690, 2691, 2693, 2701, 2703, 2704}

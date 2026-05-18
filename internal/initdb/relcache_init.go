@@ -542,6 +542,25 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// NULLABLE. pg_ts_dict DOES have an `oid` system column — attnums
 	// start at 1 = oid.
 	{3600, "pg_ts_dict", 83, 'r', 6, false, pgTsDictAttrs()},
+	// M0106-0010 step 3cn: pg_ts_parser is opened during PG-standby boot
+	// once Step 3cm cleared pg_ts_dict. Without a pg_class row,
+	// `RelationBuildDesc(3601) → ScanPgRelation(3601)` returns NULL
+	// and the backend FATALs with `could not open relation with OID
+	// 3601`. RelType=83 is safe because pg_ts_parser is not formrdesc'd
+	// (no `TSParserRelation_Rowtype_Id` constant in PG18 headers — only
+	// pg_database/pg_authid/pg_auth_members/pg_shseclabel/pg_subscription
+	// are formrdesc'd shared rels at
+	// `postgres/src/backend/utils/cache/relcache.c:4075-4083`). Schema per
+	// `postgres/src/include/catalog/pg_ts_parser.h` (PG18,
+	// TSParserRelationId == 3601). 8 columns total, all fixed-width
+	// NOT NULL: oid (26) + prsname (name 19, 64-byte NameData) +
+	// prsnamespace (oid 26, BKI_LOOKUP pg_namespace) + prsstart / prstoken
+	// / prsend / prsheadline / prslextype (regproc 24, all BKI_LOOKUP
+	// pg_proc; prsheadline is BKI_LOOKUP_OPT — the target proc may be
+	// InvalidOid but the column itself is NOT NULL with value 0 when
+	// absent). pg_ts_parser DOES have an `oid` system column — attnum
+	// 1 = oid.
+	{3601, "pg_ts_parser", 83, 'r', 8, false, pgTsParserAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1132,6 +1151,26 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// RelationIdGetRelation(3605) FATALs; flattenRels derives
 		// RelNatts=1 via pgIndexNattsByOID.
 		{3605, "pg_ts_dict_oid_index"},
+		// M0106-0010 Step 3cn: pg_ts_parser_prsname_index. PG18
+		// `postgres/src/include/catalog/pg_ts_parser.h:56` declares
+		// `DECLARE_UNIQUE_INDEX(pg_ts_parser_prsname_index, 3606,
+		// TSParserNameNspIndexId, pg_ts_parser, btree(prsname name_ops,
+		// prsnamespace oid_ops))`. UNIQUE (NOT PRIMARY) 2-column composite
+		// key. Heap OID 3601 (pg_ts_parser) is the nailed local rel above.
+		// Backs MAKE_SYSCACHE(TSPARSERNAMENSP, pg_ts_parser_prsname_index, 2).
+		// Without this entry RelationIdGetRelation(3606) FATALs; flattenRels
+		// derives RelNatts=2 via pgIndexNattsByOID.
+		{3606, "pg_ts_parser_prsname_index"},
+		// M0106-0010 Step 3cn: pg_ts_parser_oid_index. PG18
+		// `postgres/src/include/catalog/pg_ts_parser.h:57` declares
+		// `DECLARE_UNIQUE_INDEX_PKEY(pg_ts_parser_oid_index, 3607,
+		// TSParserOidIndexId, pg_ts_parser, btree(oid oid_ops))`. UNIQUE
+		// PRIMARY single-column key. Heap OID 3601 (pg_ts_parser) is the
+		// nailed local rel above. Backs MAKE_SYSCACHE(TSPARSEROID,
+		// pg_ts_parser_oid_index, 2). Without this entry
+		// RelationIdGetRelation(3607) FATALs; flattenRels derives
+		// RelNatts=1 via pgIndexNattsByOID.
+		{3607, "pg_ts_parser_oid_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1560,6 +1599,29 @@ func pgTsDictAttrs() []nailedAttr {
 		{Name: "dictowner", TypeOID: 26, Num: 4, Len: 4, NotNull: true},
 		{Name: "dicttemplate", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
 		{Name: "dictinitoption", TypeOID: 25, Num: 6, Len: -1, NotNull: false},
+	}
+}
+
+// pgTsParserAttrs returns the pg_ts_parser column descriptors (M0106-0010
+// Step 3cn). Source: PG18 `postgres/src/include/catalog/pg_ts_parser.h:29`
+// (`CATALOG(pg_ts_parser,3601,TSParserRelationId)`) and `pg_ts_parser_d.h`
+// (Anum_pg_ts_parser_* 1..8, Natts_pg_ts_parser == 8). pg_ts_parser DOES
+// have an `oid` system column — attnums start at 1 = oid. All 8 columns
+// are fixed-width NOT NULL: oid (26, 4-byte) + prsname (name 19, 64-byte
+// NameData) + prsnamespace (oid 26, BKI_LOOKUP pg_namespace) + prsstart /
+// prstoken / prsend / prsheadline / prslextype (regproc 24, all 4-byte).
+// prsheadline is BKI_LOOKUP_OPT — the target proc may be InvalidOid but
+// the column itself is NOT NULL (value 0 when absent).
+func pgTsParserAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "prsname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
+		{Name: "prsnamespace", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "prsstart", TypeOID: 24, Num: 4, Len: 4, NotNull: true},
+		{Name: "prstoken", TypeOID: 24, Num: 5, Len: 4, NotNull: true},
+		{Name: "prsend", TypeOID: 24, Num: 6, Len: 4, NotNull: true},
+		{Name: "prsheadline", TypeOID: 24, Num: 7, Len: 4, NotNull: true},
+		{Name: "prslextype", TypeOID: 24, Num: 8, Len: 4, NotNull: true},
 	}
 }
 

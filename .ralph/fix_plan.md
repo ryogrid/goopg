@@ -7834,6 +7834,70 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
         PASS. Design:
         `docs/design/0106-0010-step3cm-pg-ts-dict-nailed-rel.md`.
+      - Step 3cn LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 3601` PG-standby boot blocker that surfaces
+        after Step 3cm seeded the pg_ts_dict family. OID 3601 is
+        `pg_ts_parser` per
+        `postgres/src/include/catalog/pg_ts_parser.h:29`
+        (`CATALOG(pg_ts_parser,3601,TSParserRelationId)`).
+        Per-database (non-shared) catalog. Family-complete seed: heap
+        3601 + both declared indexes 3606
+        (`pg_ts_parser_prsname_index`, UNIQUE btree(prsname name_ops,
+        prsnamespace oid_ops), backs `MAKE_SYSCACHE(TSPARSERNAMENSP,
+        …, 2)`) and 3607 (`pg_ts_parser_oid_index`, UNIQUE PRIMARY
+        btree(oid oid_ops), backs `MAKE_SYSCACHE(TSPARSEROID, …, 2)`).
+        (a) `pgTsParserAttrs()` (relcache_init.go) returns the
+        8-column PG18 schema verbatim: oid (26/4 NOT NULL) + prsname
+        (name 19/64 NOT NULL) + prsnamespace (26/4 NOT NULL BKI_LOOKUP
+        pg_namespace) + prsstart / prstoken / prsend / prsheadline /
+        prslextype (regproc 24/4 all NOT NULL; prsheadline is
+        BKI_LOOKUP_OPT — the target proc may be InvalidOid but the
+        column itself is NOT NULL). pg_ts_parser DOES have an `oid`
+        system column. RelType=83 is safe (no
+        `TSParserRelation_Rowtype_Id` in PG18 headers).
+        (b) `nailedLocalRels` heap list gains `{3601, "pg_ts_parser",
+        83, 'r', 8, false, pgTsParserAttrs()}` after the Step 3cm
+        3600 entry; idxSpec list gains `{3606,
+        "pg_ts_parser_prsname_index"}` and `{3607,
+        "pg_ts_parser_oid_index"}` after the Step 3cm 3605 entry.
+        (c) `pgIndexInitialEntries` local section gains
+        `entry(3606, 3601, []int16{2, 3}, []uint32{nameOps, oidOps},
+        []uint32{cCollation, 0}, true, false)` and `entry(3607, 3601,
+        []int16{1}, []uint32{oidOps}, []uint32{0}, true, true)`.
+        (d) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain 3606 and 3607 after the
+        Step 3cm 3605 entry.
+        (e) `bootstrapMappedLocalCatalogHeaps` oids slice and
+        `localRelMap` gain 3601 (authoritative OID per
+        `pg_ts_parser.h:29`); pre-existing 3767 placeholder
+        (previously bare "pg_ts_parser" comment — 3767 has no
+        upstream catalog assignment) is left in place as a harmless
+        empty 8 KiB heap page; comment updated to flag the historical
+        mislabel.
+        (f) No new type-helper entries needed: oid (26), name (19),
+        regproc (24) are all already registered in
+        `pgCatalogTypeOID` / `pgCatalogTypeLen` / `pgTypeByVal` /
+        `pgTypeAlignChar` / `pgTypeStorageChar` (regproc wired in
+        Step 3a for pg_proc bootstrap).
+        Regression pins:
+        `TestNailedLocalRelsContainsPgTsParser`,
+        `TestNailedLocalRelsContainsPgTsParserIndexes`,
+        `TestPgTsParserIndexInitialEntries`,
+        `TestPgTsParserAttrsTypeOIDsMatchPG18` in
+        `internal/initdb/pg_ts_parser_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended
+        with `3606:{2,3}` + `3607:{1}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3606 + 3607.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        '<targeted>' ./internal/initdb/` PASS; `go test -count=1
+        ./internal/initdb/` — same 14 pre-existing baseline failures
+        as Step 3cm (no new regressions); cross-package smoke
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
+        PASS. Design:
+        `docs/design/0106-0010-step3cn-pg-ts-parser-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

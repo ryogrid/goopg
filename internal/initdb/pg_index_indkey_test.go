@@ -111,6 +111,8 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		3712: {1},         // pg_ts_config_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ck
 		3604: {2, 3},      // pg_ts_dict_dictname_index : btree(dictname name_ops, dictnamespace oid_ops) UNIQUE ← Step 3cm
 		3605: {1},         // pg_ts_dict_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3cm
+		3606: {2, 3},      // pg_ts_parser_prsname_index : btree(prsname name_ops, prsnamespace oid_ops) UNIQUE ← Step 3cn
+		3607: {1},         // pg_ts_parser_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3cn
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {
