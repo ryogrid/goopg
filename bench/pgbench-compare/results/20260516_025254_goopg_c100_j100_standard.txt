@@ -1,0 +1,32 @@
+pgbench (18.3)
+starting vacuum...end.
+progress: 30.0 s, 462.9 tps, lat 215.167 ms stddev 83.328, 0 failed
+progress: 60.0 s, 487.8 tps, lat 204.956 ms stddev 39.751, 0 failed
+progress: 90.0 s, 430.7 tps, lat 207.763 ms stddev 42.564, 0 failed
+progress: 120.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 150.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 180.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 210.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 240.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 270.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 300.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 330.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 360.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 390.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 420.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 450.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 480.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 510.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 540.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 570.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 600.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 630.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 660.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 690.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 720.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 750.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 780.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 810.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 840.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 870.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed
+progress: 900.0 s, 0.0 tps, lat 0.000 ms stddev 0.000, 0 failed

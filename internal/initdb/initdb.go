@@ -2151,6 +2151,20 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// E2E test surfaced OID 2681 as the next FATAL after Step 3bi
 		// seeded pg_foreign_table_relid_index.
 		entry(2681, 2612, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false), // pg_language_name_index
+		// M0106-0010 Step 3bk: pg_language_oid_index.
+		//   postgres/src/include/catalog/pg_language.h:70
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_language_oid_index, 2682,
+		//       LanguageOidIndexId, pg_language, btree(oid oid_ops));
+		//   MAKE_SYSCACHE(LANGOID, pg_language_oid_index, 4);
+		// UNIQUE PRIMARY KEY single oid_ops key (no collation) over
+		// pg_language heap OID 2612 (already a nailed local rel). Same
+		// single-column oid PKEY pattern as pg_cast_oid_index (2660),
+		// pg_foreign_server_oid_index (113), pg_extension_oid_index
+		// (3080), pg_event_trigger_oid_index (3468). Companion to
+		// pg_language_name_index (2681, Step 3bj). E2E test surfaced
+		// OID 2682 as the next FATAL after Step 3bj seeded
+		// pg_language_name_index.
+		entry(2682, 2612, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_language_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

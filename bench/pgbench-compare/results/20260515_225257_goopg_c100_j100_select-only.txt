@@ -1,0 +1,211 @@
+pgbench (18.3)
+starting vacuum...end.
+pgbench:pgbench: pgbench:error: pgbench:  pgbench:pgbench:error: empty range given to random
+empty range given to random
+ pgbench:pgbench:pgbench: error:   pgbench:pgbench:pgbench: pgbench:pgbench:pgbench:  pgbench:empty range given to random
+pgbench:pgbench:pgbench:pgbench:error:  error: empty range given to random
+ empty range given to random
+pgbench: pgbench:   pgbench:pgbench: error:  error:  pgbench: empty range given to random
+pgbench: pgbench: pgbench:error: error: pgbench:empty range given to random
+pgbench:error:  pgbench:pgbench:error:  error:  empty range given to random
+error: empty range given to random
+ pgbench:pgbench:error: empty range given to random
+pgbench:empty range given to random
+pgbench:pgbench: error: empty range given to random
+ error: pgbench:pgbench:client 22 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench: error: pgbench:pgbench:pgbench:pgbench: error:  empty range given to random
+pgbench:pgbench:pgbench:pgbench:  error: pgbench: error: pgbench: error: pgbench:pgbench:pgbench: error: pgbench: pgbench: pgbench: error:   pgbench:error: error: pgbench:pgbench:empty range given to random
+empty range given to random
+pgbench:error: pgbench:pgbench: error:  pgbench:empty range given to random
+pgbench: error: pgbench:pgbench:empty range given to random
+ pgbench: error: empty range given to random
+ pgbench:pgbench:error: pgbench: error: pgbench:empty range given to random
+empty range given to random
+pgbench:pgbench: pgbench:pgbench:pgbench:empty range given to random
+pgbench: pgbench:pgbench:error: pgbench:error:  pgbench:client 23 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench: error:  error: empty range given to random
+error: empty range given to random
+pgbench:client 4 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:  pgbench:pgbench:error: pgbench:error: error:   empty range given to random
+pgbench: pgbench:error: empty range given to random
+error: pgbench:pgbench: pgbench:   pgbench:error: error:  pgbench:client 14 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: pgbench: empty range given to random
+pgbench:error: pgbench: error: pgbench: error: error: empty range given to random
+pgbench:client 8 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error:  error: empty range given to random
+pgbench:  error:  error: client 60 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:empty range given to random
+pgbench: error: empty range given to random
+pgbench:pgbench:empty range given to random
+error: pgbench: empty range given to random
+pgbench:error: pgbench:pgbench:pgbench:   error:  client 49 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: client 70 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:error:  pgbench: client 3 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ client 9 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error: error: empty range given to random
+pgbench:pgbench:  pgbench:error: pgbench:empty range given to random
+empty range given to random
+pgbench:pgbench:  error: pgbench:pgbench: error:  error: empty range given to random
+pgbench: error:  empty range given to random
+empty range given to random
+client 46 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: pgbench:pgbench:pgbench: error:   empty range given to random
+error: error: pgbench:empty range given to random
+pgbench:  error: pgbench:error: client 6 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+  error:  empty range given to random
+pgbench:pgbench:  pgbench:error: empty range given to random
+client 85 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ pgbench:pgbench:error:   empty range given to random
+error: error: pgbench:pgbench:client 62 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error:  pgbench:empty range given to random
+ error:  error:  empty range given to random
+pgbench:error: empty range given to random
+ error: error:  empty range given to random
+client 31 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: error: empty range given to random
+pgbench:empty range given to random
+pgbench: error:  empty range given to random
+error: client 68 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 13 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error: error: empty range given to random
+error:  empty range given to random
+pgbench: pgbench: error: client 81 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error:  empty range given to random
+error: error: client 93 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:client 45 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error:  error: empty range given to random
+error: error: pgbench:error: empty range given to random
+ client 12 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 78 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+  error: empty range given to random
+error: client 24 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 27 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error:   empty range given to random
+client 91 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+empty range given to random
+pgbench:error: pgbench: empty range given to random
+ error: pgbench:empty range given to random
+client 73 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ pgbench:error:  error: client 51 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: empty range given to random
+client 10 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:   error:  client 47 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ pgbench:error: empty range given to random
+error: client 48 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:empty range given to random
+  pgbench:error: pgbench: error: empty range given to random
+ pgbench:error:  error: error: client 11 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 38 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:error: pgbench:empty range given to random
+ error: pgbench:  error: error: client 32 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+empty range given to random
+pgbench: error: error: client 75 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 79 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:client 33 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ empty range given to random
+error:  pgbench:error: client 88 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+  error: client 65 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: pgbench: empty range given to random
+error: error: pgbench: pgbench:client 99 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:error:  error: empty range given to random
+ empty range given to random
+pgbench: error:  error: client 26 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+empty range given to random
+client 40 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+empty range given to random
+pgbench:error:   error: error: client 59 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: empty range given to random
+ empty range given to random
+pgbench: error: client 20 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ empty range given to random
+ error: error: pgbench:empty range given to random
+ error: empty range given to random
+ empty range given to random
+pgbench:pgbench:pgbench: error: empty range given to random
+empty range given to random
+error: error: client 98 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 74 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+empty range given to random
+empty range given to random
+client 18 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:pgbench: error: error: error: pgbench:empty range given to random
+empty range given to random
+client 16 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:pgbench:error:   error: client 37 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error:   client 43 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: error: pgbench:pgbench:client 34 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error: error: client 15 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ pgbench:error:  pgbench:error: error: error: client 66 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 83 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 36 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: pgbench:client 1 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: empty range given to random
+empty range given to random
+pgbench:pgbench: empty range given to random
+pgbench:error: pgbench:error:  error:  error:  error: error: empty range given to random
+client 71 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 25 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:client 44 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:  client 5 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ client 82 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error: error: error: error: client 96 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+empty range given to random
+pgbench:client 17 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 19 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ pgbench:error:  empty range given to random
+error: empty range given to random
+pgbench: client 53 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+empty range given to random
+client 87 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error:   error: client 89 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 64 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 55 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 57 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error: empty range given to random
+client 50 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench: error: empty range given to random
+pgbench:pgbench: error: pgbench: client 42 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error:   client 52 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: error: error: error: empty range given to random
+error: empty range given to random
+pgbench: client 72 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: client 95 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 80 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:pgbench:error: pgbench: error: client 28 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ client 69 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: client 76 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 39 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error: error: error: client 0 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 77 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: empty range given to random
+pgbench:pgbench:client 56 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error: client 61 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 90 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: client 35 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ client 54 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: client 2 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: client 94 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: client 21 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: client 84 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+empty range given to random
+pgbench: error: client 41 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+empty range given to random
+client 97 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench:  error: client 30 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+ error:  error: empty range given to random
+client 7 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 92 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+pgbench: error: client 67 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 63 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+error: client 58 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 29 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+client 86 aborted in command 0 (set) of script 0; evaluation of meta-command failed
+transaction type: <builtin: select only>
+scaling factor: 0
+query mode: simple
+number of clients: 100
+number of threads: 100
+maximum number of tries: 1
+duration: 180 s
+number of transactions actually processed: 0
+pgbench: error: Run was aborted; the above results are incomplete.

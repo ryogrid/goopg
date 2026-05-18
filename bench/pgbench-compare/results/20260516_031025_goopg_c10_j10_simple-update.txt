@@ -1,0 +1,23 @@
+pgbench (18.3)
+starting vacuum...end.
+progress: 30.0 s, 333.2 tps, lat 29.996 ms stddev 9.366, 0 failed
+progress: 60.0 s, 356.4 tps, lat 28.057 ms stddev 8.888, 0 failed
+progress: 90.0 s, 352.7 tps, lat 28.357 ms stddev 8.936, 0 failed
+progress: 120.0 s, 345.8 tps, lat 28.913 ms stddev 9.291, 0 failed
+progress: 150.0 s, 314.7 tps, lat 31.771 ms stddev 10.210, 0 failed
+pgbench: error: client 9 script 0 aborted in command 5 query 0: ERROR:  DecodePhysicalPGRow: filler: truncated short varlena
+progress: 180.0 s, 305.3 tps, lat 31.840 ms stddev 10.399, 0 failed
+transaction type: <builtin: simple update>
+scaling factor: 100
+query mode: simple
+number of clients: 10
+number of threads: 10
+maximum number of tries: 1
+duration: 180 s
+number of transactions actually processed: 60252
+number of failed transactions: 0 (0.000%)
+latency average = 29.736 ms
+latency stddev = 9.619 ms
+initial connection time = 2.276 ms
+tps = 334.686226 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.

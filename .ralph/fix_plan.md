@@ -6031,6 +6031,59 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS. Design:
         `docs/design/0106-0010-step3bj-pg-language-name-index.md`.
+      - Step 3bk LANDED 2026-05-18. Closes the anticipated FATAL
+        `could not open relation with OID 2682` PG-standby boot blocker
+        that surfaces after Step 3bj seeded `pg_language_name_index`
+        (OID 2681). OID 2682 is `pg_language_oid_index` per
+        `postgres/src/include/catalog/pg_language.h:70`
+        (`DECLARE_UNIQUE_INDEX_PKEY(pg_language_oid_index, 2682,
+        LanguageOidIndexId, pg_language, btree(oid oid_ops))`). Backs
+        `MAKE_SYSCACHE(LANGOID, pg_language_oid_index, 4)`. Pure
+        catalog-seed addition mirroring single-column `oid_ops` UNIQUE
+        PKEY pattern of Steps 3ax (pg_extension_oid_index 3080), 3at
+        (pg_event_trigger_oid_index 3468), 3bd
+        (pg_foreign_data_wrapper_oid_index 112), 3bg
+        (pg_foreign_server_oid_index 113), and 3l
+        (pg_opclass_oid_index 2687); no encoder/builder/Init flow
+        change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` appends
+        `entry(2682, 2612, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` after the Step 3bj 2681 entry. UNIQUE PRIMARY
+        single oid_ops key (no collation) over pg_language heap OID
+        2612 (already a nailed local rel).
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{2682, "pg_language_oid_index"}` after the 2681 entry.
+        `flattenRels`+`pgIndexNattsByOID` derives `RelKind='i',
+        RelNatts=1` so the `relnatts==indnatts` check (relcache.c:1492)
+        passes.
+        (c) Three empty-placeholder OID lists at
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        already include 2682 (bundled with `2678, 2679, 2680, 2682`
+        from an earlier sweep). No edit needed. Step-3k empty-btree
+        placeholder is sufficient because pg_language is currently
+        unpopulated — any `SearchSysCache1(LANGOID, …)` probe correctly
+        returns no row.
+        Regression pins:
+        `TestPgLanguageOidIndexSeededFromInitialEntries` /
+        `TestNailedLocalRelsContainsPgLanguageOidIndex` in
+        `internal/initdb/pg_language_oid_index_test.go`; existing
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `2682:{1}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2682. Verified: `go build ./...` PASS; targeted
+        tests `TestPgLanguageOidIndex…|TestNailedLocalRelsContainsPgLanguageOidIndex|
+        TestPgLanguageNameIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|
+        TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|
+        TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|
+        TestPgClassOidIndexHasSingleKeyColumn` PASS;
+        `go test -count=1 ./internal/initdb/` shows the same 14
+        pre-existing baseline failures as Step 3bj (no new regressions);
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Closes Step 3bj's deferred companion —
+        both pg_language indexes (2681 name + 2682 oid) are now seeded.
+        Design:
+        `docs/design/0106-0010-step3bk-pg-language-oid-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

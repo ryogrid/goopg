@@ -1,0 +1,15 @@
+pgbench (18.3)
+starting vacuum...end.
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 100
+number of threads: 100
+maximum number of tries: 1
+duration: 1 s
+number of transactions actually processed: 566
+number of failed transactions: 0 (0.000%)
+latency average = 185.401 ms
+latency stddev = 55.186 ms
+initial connection time = 51.889 ms
+tps = 493.503368 (without initial connection time)
