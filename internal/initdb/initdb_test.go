@@ -39,9 +39,17 @@ func TestInitLaysOutDirectoryStructure(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "pg_subtrans")); err != nil {
 		t.Errorf("missing CRITICAL subdir pg_subtrans: %v", err)
 	}
-	// base/<DBOid> for the default database.
-	if _, err := os.Stat(filepath.Join(dir, "base", "1")); err != nil {
-		t.Errorf("missing base/1: %v", err)
+	// base/{1,4,5}/PG_VERSION must exist for all seeded databases (M0106-0010 batched-08).
+	for _, dbOID := range []string{"1", "4", "5"} {
+		pvPath := filepath.Join(dir, "base", dbOID, "PG_VERSION")
+		pv, err := os.ReadFile(pvPath)
+		if err != nil {
+			t.Errorf("missing base/%s/PG_VERSION: %v", dbOID, err)
+			continue
+		}
+		if string(pv) != "18\n" {
+			t.Errorf("base/%s/PG_VERSION=%q want %q", dbOID, string(pv), "18\n")
+		}
 	}
 	for _, want := range []string{"PG_VERSION", "postgresql.conf", "pg_hba.conf"} {
 		path := filepath.Join(dir, want)

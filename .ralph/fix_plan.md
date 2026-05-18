@@ -9613,7 +9613,7 @@ relcache init → replication readiness) and intra-package grouped.
         TestPhysicalSlotJSONUnchangedAcrossM0008 replaced.
         All slot tests PASS; pre-existing wal baseline failures unchanged.
 
-- [ ] **M0106-0010 batched-08** (bootstrap-procedure task 8)
+- [x] **M0106-0010 batched-08** (bootstrap-procedure task 8)
       - Summary: Add `createPerDatabaseScaffolding(dboid, name)` writing
         `base/<dboid>/` directory and `base/<dboid>/PG_VERSION = "18\n"`;
         emit for OIDs 1 (template1), 4 (template0), 5 (postgres).
@@ -9623,6 +9623,9 @@ relcache init → replication readiness) and intra-package grouped.
       - Test: `internal/initdb/initdb_test.go` extended —
         `base/{1,4,5}/PG_VERSION` exist with `"18\n"`.
       - Risk gate: parser/planner/executor.
+      - COMPLETE 2026-05-19: createPerDatabaseScaffolding added; Init calls it
+        for OIDs 1/4/5 replacing old single-dir mkdir; TestInitLaysOutDirectoryStructure
+        extended to verify base/{1,4,5}/PG_VERSION = "18\n". All targeted tests PASS.
 
 - [ ] **M0106-0010 batched-09** (bootstrap-procedure task 9)
       - Summary: Write `postgresql.auto.conf` two-line `ALTER SYSTEM`

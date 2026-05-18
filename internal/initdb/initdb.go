@@ -152,6 +152,20 @@ type Options struct {
 }
 
 // Init lays out the data directory according to opts.
+// createPerDatabaseScaffolding creates base/<dbOID>/ and writes
+// base/<dbOID>/PG_VERSION so upstream PG ValidatePgVersion passes.
+// Must be called for every database OID seeded in pg_database.
+func createPerDatabaseScaffolding(dataDir string, dbOID uint32) error {
+	dbDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(dbOID), 10))
+	if err := os.MkdirAll(dbDir, 0o700); err != nil {
+		return fmt.Errorf("create base/%d: %w", dbOID, err)
+	}
+	if err := os.WriteFile(filepath.Join(dbDir, "PG_VERSION"), []byte(CatalogVersion+"\n"), 0o600); err != nil {
+		return fmt.Errorf("write base/%d/PG_VERSION: %w", dbOID, err)
+	}
+	return nil
+}
+
 func Init(opts Options) error {
 	if opts.DataDir == "" {
 		return errors.New("goopg init: -D <data-directory> is required")
@@ -172,14 +186,14 @@ func Init(opts Options) error {
 			return fmt.Errorf("goopg init: mkdir %q: %w", path, err)
 		}
 	}
-	// Default-database directory under base/. DBOid matches
-	// catalog.DefaultDBOid so the on-disk layout aligns with what
-	// the in-memory catalog hands out. Upstream initdb creates
-	// base/1 (template1) plus base/<oid> for each database; v0
-	// only needs the one.
-	defaultDB := filepath.Join(abs, "base", strconv.FormatUint(uint64(catalog.DefaultDBOid), 10))
-	if err := os.Mkdir(defaultDB, 0o700); err != nil {
-		return fmt.Errorf("goopg init: mkdir %q: %w", defaultDB, err)
+	// Per-database directories for the three system databases seeded in
+	// pg_database (OID 1 = template1, OID 4 = template0, OID 5 = postgres).
+	// Each needs base/<dboid>/ and base/<dboid>/PG_VERSION so PG's
+	// ValidatePgVersion passes at standby startup.
+	for _, dbOID := range []uint32{1, 4, 5} {
+		if err := createPerDatabaseScaffolding(abs, dbOID); err != nil {
+			return fmt.Errorf("goopg init: %w", err)
+		}
 	}
 	for _, f := range SampleFiles() {
 		path := filepath.Join(abs, f.Path)
