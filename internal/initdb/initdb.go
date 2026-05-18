@@ -705,6 +705,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3080, // pg_extension_oid_index (Step 3ax)
 		3081, // pg_extension_name_index (Step 3ay)
 		548,  // pg_foreign_data_wrapper_name_index (Step 3bc)
+		112,  // pg_foreign_data_wrapper_oid_index (Step 3bd)
 	} {
 		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -812,6 +813,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3080, // pg_extension_oid_index (Step 3ax)
 		3081, // pg_extension_name_index (Step 3ay)
 		548,  // pg_foreign_data_wrapper_name_index (Step 3bc)
+		112,  // pg_foreign_data_wrapper_oid_index (Step 3bd)
 	} {
 		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -850,6 +852,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3080, // pg_extension_oid_index (Step 3ax)
 		3081, // pg_extension_name_index (Step 3ay)
 		548,  // pg_foreign_data_wrapper_name_index (Step 3bc)
+		112,  // pg_foreign_data_wrapper_oid_index (Step 3bd)
 	} {
 		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2042,6 +2045,27 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// companion 112) because process_settings → catcache init opens
 		// FOREIGNDATAWRAPPERNAME before FOREIGNDATAWRAPPEROID.
 		entry(548, 2328, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false), // pg_foreign_data_wrapper_name_index
+		// M0106-0010 Step 3bd: pg_foreign_data_wrapper_oid_index.
+		//   postgres/src/include/catalog/pg_foreign_data_wrapper.h:55
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_foreign_data_wrapper_oid_index, 112,
+		//       ForeignDataWrapperOidIndexId, pg_foreign_data_wrapper,
+		//       btree(oid oid_ops));
+		//   MAKE_SYSCACHE(FOREIGNDATAWRAPPEROID,
+		//     pg_foreign_data_wrapper_oid_index, 2);
+		// pg_foreign_data_wrapper attnums (pg_foreign_data_wrapper_d.h):
+		// 1=oid. UNIQUE PRIMARY (DECLARE_UNIQUE_INDEX_PKEY) over the
+		// pg_foreign_data_wrapper heap OID 2328 (Step 3bb nailed rel).
+		// Single oid_ops key (no collation) — same single-column oid
+		// PKEY pattern as pg_extension_oid_index (3080, Step 3ax),
+		// pg_event_trigger_oid_index (3468, Step 3at),
+		// pg_default_acl_oid_index (828, Step 3am),
+		// pg_conversion_oid_index (2670, Step 3ai),
+		// pg_cast_oid_index (2660, Step 3ab),
+		// pg_collation_oid_index (3085, Step 3af),
+		// pg_enum_oid_index (3502, Step 3ao),
+		// pg_opclass_oid_index (2687, Step 3l). Companion to OID 548
+		// (pg_foreign_data_wrapper_name_index, Step 3bc).
+		entry(112, 2328, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_foreign_data_wrapper_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

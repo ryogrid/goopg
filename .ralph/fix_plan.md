@@ -5656,6 +5656,63 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         companion from Step 3bb) — Step 3bd territory.
         Design:
         `docs/design/0106-0010-step3bc-pg-foreign-data-wrapper-name-index.md`.
+      - Step 3bd LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 112` PG-standby boot blocker
+        that surfaced after Step 3bc seeded
+        `pg_foreign_data_wrapper_name_index` (OID 548). OID 112 is
+        `pg_foreign_data_wrapper_oid_index` per
+        `postgres/src/include/catalog/pg_foreign_data_wrapper.h:55`
+        (`DECLARE_UNIQUE_INDEX_PKEY(pg_foreign_data_wrapper_oid_index,
+        112, ForeignDataWrapperOidIndexId, pg_foreign_data_wrapper,
+        btree(oid oid_ops))`). Backs `MAKE_SYSCACHE(FOREIGNDATAWRAPPEROID,
+        pg_foreign_data_wrapper_oid_index, 2)`. Pure catalog-seed
+        addition mirroring the single-column `oid_ops` UNIQUE PKEY
+        pattern of Steps 3ax (pg_extension_oid_index 3080), 3at
+        (pg_event_trigger_oid_index 3468), 3am (pg_default_acl_oid_index
+        828), 3ai (pg_conversion_oid_index 2670), 3ab
+        (pg_cast_oid_index 2660), 3af (pg_collation_oid_index 3085),
+        3ao (pg_enum_oid_index 3502), and 3l (pg_opclass_oid_index
+        2687); no encoder/builder/Init flow change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(112, 2328, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` — UNIQUE PRIMARY single oid_ops key (no
+        collation) over the pg_foreign_data_wrapper heap OID 2328
+        (Step 3bb nailed rel).
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{112, "pg_foreign_data_wrapper_oid_index"}`;
+        `flattenRels` + `pgIndexNattsByOID` derives
+        `RelKind='i', RelNatts=1` so `relnatts==indnatts` check
+        (relcache.c:1492) passes.
+        (c) Three empty-placeholder OID lists in
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        gain `112 // pg_foreign_data_wrapper_oid_index (Step 3bd)`.
+        The Step-3k empty-btree placeholder is sufficient because
+        pg_foreign_data_wrapper is currently unpopulated — any
+        `SearchSysCache1(FOREIGNDATAWRAPPEROID, …)` probe correctly
+        returns no row.
+        Regression pins:
+        `TestPgForeignDataWrapperOidIndexSeededFromInitialEntries`
+        (pins `(IndRelid=2328, IndKey=[1], IsUnique=true,
+        IsPrimary=true, IndCollation=[0])`) and
+        `TestNailedLocalRelsContainsPgForeignDataWrapperOidIndex`
+        (pins `RelName, RelKind='i', RelNatts=1`) in
+        `internal/initdb/pg_foreign_data_wrapper_oid_index_test.go`.
+        Existing pins extended:
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds `112: {1}`
+        (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 112.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgForeignDataWrapperOidIndex|TestNailedLocalRelsContainsPgForeignDataWrapperOidIndex|TestPgForeignDataWrapperNameIndex|TestNailedLocalRelsContainsPgForeignDataWrapperNameIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedLocalRelsContainsPgForeignDataWrapper|TestNailedLocalRelsContainsPgExtensionNameIndex|TestPgExtensionNameIndex|TestPgExtensionOidIndex'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bc (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Closes Step 3bb's
+        deferred companion list — both pg_foreign_data_wrapper indexes
+        (112 oid + 548 name) are now seeded.
+        Design:
+        `docs/design/0106-0010-step3bd-pg-foreign-data-wrapper-oid-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
