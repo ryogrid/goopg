@@ -7898,6 +7898,81 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
         PASS. Design:
         `docs/design/0106-0010-step3cn-pg-ts-parser-nailed-rel.md`.
+      - Step 3co LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 3764` PG-standby boot blocker that surfaces
+        after Step 3cn seeded the pg_ts_parser family. OID 3764 is
+        `pg_ts_template` per
+        `postgres/src/include/catalog/pg_ts_template.h:29`
+        (`CATALOG(pg_ts_template,3764,TSTemplateRelationId)`).
+        Per-database (non-shared) catalog. Family-complete seed: heap
+        3764 + both declared indexes 3766
+        (`pg_ts_template_tmplname_index`, UNIQUE btree(tmplname
+        name_ops, tmplnamespace oid_ops), backs
+        `MAKE_SYSCACHE(TSTEMPLATENAMENSP, …, 2)`) and 3767
+        (`pg_ts_template_oid_index`, UNIQUE PRIMARY btree(oid
+        oid_ops), backs `MAKE_SYSCACHE(TSTEMPLATEOID, …, 2)`).
+        Notable historical reclaim: prior Step 3cm/3cn comments
+        mislabeled 3766/3767 as stale `pg_ts_dict`/`pg_ts_parser`
+        placeholders with "no upstream catalog assignment" — that
+        was factually incorrect; 3766/3767 are the canonical
+        pg_ts_template index OIDs per `pg_ts_template.h:48-49`. Step
+        3co corrects the mislabel by re-purposing those slots; the
+        heap-placeholder pages are overwritten by btree root pages
+        in the critical-index block.
+        (a) `pgTsTemplateAttrs()` (relcache_init.go) returns the
+        5-column PG18 schema verbatim: oid (26/4 NOT NULL) + tmplname
+        (name 19/64 NOT NULL) + tmplnamespace (26/4 NOT NULL
+        BKI_LOOKUP pg_namespace) + tmplinit / tmpllexize (regproc
+        24/4 all NOT NULL; tmplinit is BKI_LOOKUP_OPT — the target
+        proc may be InvalidOid but the column itself is NOT NULL
+        with value 0 when absent, mirroring the prsheadline pattern
+        in pg_ts_parser). pg_ts_template DOES have an `oid` system
+        column. RelType=83 is safe (no
+        `TSTemplateRelation_Rowtype_Id` in PG18 headers).
+        (b) `nailedLocalRels` heap list gains `{3764, "pg_ts_template",
+        83, 'r', 5, false, pgTsTemplateAttrs()}` after the Step 3cn
+        3601 entry; idxSpec list gains `{3766,
+        "pg_ts_template_tmplname_index"}` and `{3767,
+        "pg_ts_template_oid_index"}` after the Step 3cn 3607 entry.
+        (c) `pgIndexInitialEntries` local section gains
+        `entry(3766, 3764, []int16{2, 3}, []uint32{nameOps, oidOps},
+        []uint32{cCollation, 0}, true, false)` and `entry(3767, 3764,
+        []int16{1}, []uint32{oidOps}, []uint32{0}, true, true)`.
+        (d) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain 3766 and 3767 after the
+        Step 3cn 3607 entry.
+        (e) `bootstrapMappedLocalCatalogHeaps` oids slice and
+        `localRelMap` gain 3764 (authoritative OID per
+        `pg_ts_template.h:29`). 3766/3767 entries' comments updated
+        to reflect they are pg_ts_template indexes (their heap-page
+        placeholders are overwritten with btree root pages in the
+        critical-index block); 3768 placeholder retained as no-op
+        empty heap with comment updated to flag that 3768 has no
+        upstream catalog assignment.
+        (f) No new type-helper entries needed: oid (26), name (19),
+        regproc (24) are all already registered in
+        `pgCatalogTypeOID` / `pgCatalogTypeLen` / `pgTypeByVal` /
+        `pgTypeAlignChar` / `pgTypeStorageChar` (regproc wired in
+        Step 3a for pg_proc bootstrap).
+        Regression pins:
+        `TestNailedLocalRelsContainsPgTsTemplate`,
+        `TestNailedLocalRelsContainsPgTsTemplateIndexes`,
+        `TestPgTsTemplateIndexInitialEntries`,
+        `TestPgTsTemplateAttrsTypeOIDsMatchPG18` in
+        `internal/initdb/pg_ts_template_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended
+        with `3766:{2,3}` + `3767:{1}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3766 + 3767.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        '<targeted>' ./internal/initdb/` PASS; `go test -count=1
+        ./internal/initdb/` — same 14 pre-existing baseline failures
+        as Step 3cn (no new regressions); cross-package smoke
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
+        PASS. Design:
+        `docs/design/0106-0010-step3co-pg-ts-template-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

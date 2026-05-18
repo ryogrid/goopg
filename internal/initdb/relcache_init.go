@@ -561,6 +561,24 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// absent). pg_ts_parser DOES have an `oid` system column — attnum
 	// 1 = oid.
 	{3601, "pg_ts_parser", 83, 'r', 8, false, pgTsParserAttrs()},
+	// M0106-0010 step 3co: pg_ts_template is opened during PG-standby boot
+	// once Step 3cn cleared pg_ts_parser. Without a pg_class row,
+	// `RelationBuildDesc(3764) → ScanPgRelation(3764)` returns NULL
+	// and the backend FATALs with `could not open relation with OID
+	// 3764`. RelType=83 is safe because pg_ts_template is not formrdesc'd
+	// (no `TSTemplateRelation_Rowtype_Id` constant in PG18 headers — only
+	// pg_database/pg_authid/pg_auth_members/pg_shseclabel/pg_subscription
+	// are formrdesc'd shared rels at
+	// `postgres/src/backend/utils/cache/relcache.c:4075-4083`). Schema per
+	// `postgres/src/include/catalog/pg_ts_template.h` (PG18,
+	// TSTemplateRelationId == 3764). 5 columns total, all fixed-width
+	// NOT NULL: oid (26) + tmplname (name 19, 64-byte NameData) +
+	// tmplnamespace (oid 26, BKI_LOOKUP pg_namespace) + tmplinit / tmpllexize
+	// (regproc 24; tmplinit is BKI_LOOKUP_OPT — the target proc may be
+	// InvalidOid but the column itself is NOT NULL with value 0 when
+	// absent, mirroring the prsheadline pattern in pg_ts_parser).
+	// pg_ts_template DOES have an `oid` system column — attnum 1 = oid.
+	{3764, "pg_ts_template", 83, 'r', 5, false, pgTsTemplateAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1171,6 +1189,26 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// RelationIdGetRelation(3607) FATALs; flattenRels derives
 		// RelNatts=1 via pgIndexNattsByOID.
 		{3607, "pg_ts_parser_oid_index"},
+		// M0106-0010 Step 3co: pg_ts_template_tmplname_index. PG18
+		// `postgres/src/include/catalog/pg_ts_template.h:48` declares
+		// `DECLARE_UNIQUE_INDEX(pg_ts_template_tmplname_index, 3766,
+		// TSTemplateNameNspIndexId, pg_ts_template, btree(tmplname name_ops,
+		// tmplnamespace oid_ops))`. UNIQUE (NOT PRIMARY) 2-column composite
+		// key. Heap OID 3764 (pg_ts_template) is the nailed local rel above.
+		// Backs MAKE_SYSCACHE(TSTEMPLATENAMENSP, pg_ts_template_tmplname_index, 2).
+		// Without this entry RelationIdGetRelation(3766) FATALs; flattenRels
+		// derives RelNatts=2 via pgIndexNattsByOID.
+		{3766, "pg_ts_template_tmplname_index"},
+		// M0106-0010 Step 3co: pg_ts_template_oid_index. PG18
+		// `postgres/src/include/catalog/pg_ts_template.h:49` declares
+		// `DECLARE_UNIQUE_INDEX_PKEY(pg_ts_template_oid_index, 3767,
+		// TSTemplateOidIndexId, pg_ts_template, btree(oid oid_ops))`. UNIQUE
+		// PRIMARY single-column key. Heap OID 3764 (pg_ts_template) is the
+		// nailed local rel above. Backs MAKE_SYSCACHE(TSTEMPLATEOID,
+		// pg_ts_template_oid_index, 2). Without this entry
+		// RelationIdGetRelation(3767) FATALs; flattenRels derives
+		// RelNatts=1 via pgIndexNattsByOID.
+		{3767, "pg_ts_template_oid_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1622,6 +1660,27 @@ func pgTsParserAttrs() []nailedAttr {
 		{Name: "prsend", TypeOID: 24, Num: 6, Len: 4, NotNull: true},
 		{Name: "prsheadline", TypeOID: 24, Num: 7, Len: 4, NotNull: true},
 		{Name: "prslextype", TypeOID: 24, Num: 8, Len: 4, NotNull: true},
+	}
+}
+
+// pgTsTemplateAttrs returns the pg_ts_template column descriptors (M0106-0010
+// Step 3co). Source: PG18 `postgres/src/include/catalog/pg_ts_template.h:29`
+// (`CATALOG(pg_ts_template,3764,TSTemplateRelationId)`) and
+// `pg_ts_template_d.h` (Anum_pg_ts_template_* 1..5, Natts_pg_ts_template == 5).
+// pg_ts_template DOES have an `oid` system column — attnums start at 1 = oid.
+// All 5 columns are fixed-width NOT NULL: oid (26, 4-byte) + tmplname
+// (name 19, 64-byte NameData) + tmplnamespace (oid 26, BKI_LOOKUP
+// pg_namespace) + tmplinit / tmpllexize (regproc 24, all 4-byte). tmplinit
+// is BKI_LOOKUP_OPT — the target proc may be InvalidOid but the column
+// itself is NOT NULL (value 0 when absent), mirroring prsheadline in
+// pg_ts_parser.
+func pgTsTemplateAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "tmplname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
+		{Name: "tmplnamespace", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "tmplinit", TypeOID: 24, Num: 4, Len: 4, NotNull: true},
+		{Name: "tmpllexize", TypeOID: 24, Num: 5, Len: 4, NotNull: true},
 	}
 }
 

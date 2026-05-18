@@ -448,10 +448,11 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		3603, // pg_ts_config_map (M0106-0010 step 3cj) — authoritative OID per pg_ts_config_map.h:30
 		3765, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603, seeded above; placeholder retained as no-op empty heap)
 		3600, // pg_ts_dict (M0106-0010 step 3cm) — authoritative OID per pg_ts_dict.h:29
-		3766, // pg_ts_dict (stale — true pg_ts_dict OID is 3600, seeded above; placeholder retained as no-op empty heap)
+		3766, // pg_ts_template_tmplname_index (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:48; heap-placeholder page is overwritten with a btree root page in the critical-index block below.
 		3601, // pg_ts_parser (M0106-0010 step 3cn) — authoritative OID per pg_ts_parser.h:29
-		3767, // pg_ts_parser (stale — true pg_ts_parser OID is 3601, seeded above; placeholder retained as no-op empty heap)
-		3768, // pg_ts_template
+		3767, // pg_ts_template_oid_index (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:49; heap-placeholder page is overwritten with a btree root page in the critical-index block below.
+		3764, // pg_ts_template (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:29
+		3768, // pg_ts_template (stale — true pg_ts_template OID is 3764, seeded above; 3768 has no upstream catalog assignment; placeholder retained as no-op empty heap)
 		3466, // pg_event_trigger (M0106-0010 step 3ar)
 		3079, // pg_extension (M0106-0010 step 3aw)
 		2328, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
@@ -796,10 +797,11 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{3603, 3603}, // pg_ts_config_map (M0106-0010 step 3cj) — authoritative OID per pg_ts_config_map.h:30
 		{3765, 3765}, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603, mapped above)
 		{3600, 3600}, // pg_ts_dict (M0106-0010 step 3cm) — authoritative OID per pg_ts_dict.h:29
-		{3766, 3766}, // pg_ts_dict (stale — true pg_ts_dict OID is 3600, mapped above)
+		{3766, 3766}, // pg_ts_template_tmplname_index (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:48
 		{3601, 3601}, // pg_ts_parser (M0106-0010 step 3cn) — authoritative OID per pg_ts_parser.h:29
-		{3767, 3767}, // pg_ts_parser (stale — true pg_ts_parser OID is 3601, mapped above)
-		{3768, 3768}, // pg_ts_template
+		{3767, 3767}, // pg_ts_template_oid_index (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:49
+		{3764, 3764}, // pg_ts_template (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:29
+		{3768, 3768}, // pg_ts_template (stale — true pg_ts_template OID is 3764, mapped above; 3768 has no upstream catalog assignment)
 		{3466, 3466}, // pg_event_trigger (M0106-0010 step 3ar)
 		{3079, 3079}, // pg_extension (M0106-0010 step 3aw)
 		{2328, 2328}, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
@@ -893,6 +895,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3605, // pg_ts_dict_oid_index (Step 3cm)
 		3606, // pg_ts_parser_prsname_index (Step 3cn)
 		3607, // pg_ts_parser_oid_index (Step 3cn)
+		3766, // pg_ts_template_tmplname_index (Step 3co)
+		3767, // pg_ts_template_oid_index (Step 3co)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -974,6 +978,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3605, // pg_ts_dict_oid_index (Step 3cm)
 		3606, // pg_ts_parser_prsname_index (Step 3cn)
 		3607, // pg_ts_parser_oid_index (Step 3cn)
+		3766, // pg_ts_template_tmplname_index (Step 3co)
+		3767, // pg_ts_template_oid_index (Step 3co)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2803,6 +2809,28 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// rel added in Step 3cn. UNIQUE PRIMARY single-column key, oid_ops
 		// with no collation.
 		entry(3607, 3601, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_ts_parser_oid_index
+		// M0106-0010 Step 3co: pg_ts_template_tmplname_index. PG18
+		//   postgres/src/include/catalog/pg_ts_template.h:48
+		//     DECLARE_UNIQUE_INDEX(pg_ts_template_tmplname_index, 3766,
+		//       TSTemplateNameNspIndexId, pg_ts_template,
+		//       btree(tmplname name_ops, tmplnamespace oid_ops));
+		//   MAKE_SYSCACHE(TSTEMPLATENAMENSP, pg_ts_template_tmplname_index, 2);
+		// pg_ts_template attnums (pg_ts_template_d.h): 1=oid, 2=tmplname,
+		// 3=tmplnamespace, 4=tmplinit, 5=tmpllexize. IndKey = {2, 3}. Heap
+		// OID 3764 is the nailed local rel added in Step 3co. UNIQUE (NOT
+		// PRIMARY) 2-column composite key; tmplname uses C_COLLATION_OID
+		// (name catalog columns use C collation), tmplnamespace has no
+		// collation.
+		entry(3766, 3764, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false), // pg_ts_template_tmplname_index
+		// M0106-0010 Step 3co: pg_ts_template_oid_index. PG18
+		//   postgres/src/include/catalog/pg_ts_template.h:49
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_ts_template_oid_index, 3767,
+		//       TSTemplateOidIndexId, pg_ts_template, btree(oid oid_ops));
+		//   MAKE_SYSCACHE(TSTEMPLATEOID, pg_ts_template_oid_index, 2);
+		// pg_ts_template attnums: 1=oid. Heap OID 3764 is the nailed local
+		// rel added in Step 3co. UNIQUE PRIMARY single-column key, oid_ops
+		// with no collation.
+		entry(3767, 3764, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_ts_template_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
