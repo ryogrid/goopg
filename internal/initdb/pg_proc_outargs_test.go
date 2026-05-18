@@ -183,3 +183,156 @@ func TestPgProcRowStatGetWalReceiverOutArgsMatchPgProcDat(t *testing.T) {
 		}
 	}
 }
+
+// TestPgProcReplicationSRFOutArgsMatchPgProcDat pins the OUT-args metadata
+// for the five SRFs backing the remaining replication views against
+// postgres/src/include/catalog/pg_proc.dat. These rows land in base/1/1255
+// via bootstrapPgProcTuples and must match PG18's proallargtypes/proargnames
+// exactly so the standby's build_function_result_tupdesc_d resolves the
+// view column types correctly. (batched-27)
+//
+// | OID  | Function                     | Cite (pg_proc.dat)       |
+// |------|------------------------------|--------------------------|
+// | 3099 | pg_stat_get_wal_senders      | :5659-5667               |
+// | 6118 | pg_stat_get_subscription     | :5695-5702               |
+// | 6169 | pg_stat_get_replication_slot | :5675-5681               |
+// | 6248 | pg_stat_get_recovery_prefetch| :6027-6033               |
+// | 3781 | pg_get_replication_slots     | :11464-11472             |
+func TestPgProcReplicationSRFOutArgsMatchPgProcDat(t *testing.T) {
+	type srfWant struct {
+		oid      uint32
+		name     string
+		retSet   bool
+		volatile byte
+		parallel byte
+		strict   bool
+		argTypes []uint32 // pronargs IN args (proargtypes oidvector)
+		allTypes []uint32 // proallargtypes
+		modes    []byte   // proargmodes
+		names    []string // proargnames
+	}
+	wants := []srfWant{
+		{
+			oid: 3099, name: "pg_stat_get_wal_senders",
+			retSet: true, volatile: 's', parallel: 'r', strict: false,
+			argTypes: []uint32{},
+			allTypes: []uint32{23, 25, 3220, 3220, 3220, 3220, 1186, 1186, 1186, 23, 25, 1184},
+			modes:    []byte{'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o'},
+			names:    []string{"pid", "state", "sent_lsn", "write_lsn", "flush_lsn", "replay_lsn", "write_lag", "flush_lag", "replay_lag", "sync_priority", "sync_state", "reply_time"},
+		},
+		{
+			oid: 6118, name: "pg_stat_get_subscription",
+			retSet: true, volatile: 's', parallel: 'r', strict: false,
+			argTypes: []uint32{26},
+			allTypes: []uint32{26, 26, 26, 23, 23, 3220, 1184, 1184, 3220, 1184, 25},
+			modes:    []byte{'i', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o'},
+			names:    []string{"subid", "subid", "relid", "pid", "leader_pid", "received_lsn", "last_msg_send_time", "last_msg_receipt_time", "latest_end_lsn", "latest_end_time", "worker_type"},
+		},
+		{
+			oid: 6169, name: "pg_stat_get_replication_slot",
+			retSet: false, volatile: 's', parallel: 'r', strict: true,
+			argTypes: []uint32{25},
+			allTypes: []uint32{25, 25, 20, 20, 20, 20, 20, 20, 20, 20, 1184},
+			modes:    []byte{'i', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o'},
+			names:    []string{"slot_name", "slot_name", "spill_txns", "spill_count", "spill_bytes", "stream_txns", "stream_count", "stream_bytes", "total_txns", "total_bytes", "stats_reset"},
+		},
+		{
+			oid: 6248, name: "pg_stat_get_recovery_prefetch",
+			retSet: true, volatile: 'v', parallel: 's', strict: true,
+			argTypes: []uint32{},
+			allTypes: []uint32{1184, 20, 20, 20, 20, 20, 20, 23, 23, 23},
+			modes:    []byte{'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o'},
+			names:    []string{"stats_reset", "prefetch", "hit", "skip_init", "skip_new", "skip_fpw", "skip_rep", "wal_distance", "block_distance", "io_depth"},
+		},
+		{
+			oid: 3781, name: "pg_get_replication_slots",
+			retSet: true, volatile: 's', parallel: 's', strict: false,
+			argTypes: []uint32{},
+			allTypes: []uint32{19, 19, 25, 26, 16, 16, 23, 28, 28, 3220, 3220, 25, 20, 16, 3220, 1184, 16, 25, 16, 16},
+			modes:    []byte{'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o'},
+			names:    []string{"slot_name", "plugin", "slot_type", "datoid", "temporary", "active", "active_pid", "xmin", "catalog_xmin", "restart_lsn", "confirmed_flush_lsn", "wal_status", "safe_wal_size", "two_phase", "two_phase_at", "inactive_since", "conflicting", "invalidation_reason", "failover", "synced"},
+		},
+	}
+
+	byOID := make(map[uint32]pgProcEntry)
+	for _, e := range pgProcInitialEntries() {
+		byOID[e.OID] = e
+	}
+
+	for _, w := range wants {
+		t.Run(w.name, func(t *testing.T) {
+			got, ok := byOID[w.oid]
+			if !ok {
+				t.Fatalf("OID %d (%s) missing from pgProcInitialEntries", w.oid, w.name)
+			}
+			if got.Name != w.name {
+				t.Errorf("name=%q, want %q", got.Name, w.name)
+			}
+			if got.RetType != 2249 {
+				t.Errorf("rettype=%d, want 2249 (record)", got.RetType)
+			}
+			if got.RetSet != w.retSet {
+				t.Errorf("retset=%v, want %v", got.RetSet, w.retSet)
+			}
+			gotVol := got.Volatile
+			if gotVol == 0 {
+				gotVol = 'v'
+			}
+			if gotVol != w.volatile {
+				t.Errorf("volatile=%q, want %q", gotVol, w.volatile)
+			}
+			gotPar := got.Parallel
+			if gotPar == 0 {
+				gotPar = 's'
+			}
+			if gotPar != w.parallel {
+				t.Errorf("parallel=%q, want %q", gotPar, w.parallel)
+			}
+			// NotStrict=true means proisstrict=false (not strict); strict=false means same thing.
+			// Mismatch when NotStrict and strict point the same direction.
+			if got.NotStrict == w.strict {
+				t.Errorf("notstrict=%v (strict=%v), want strict=%v", got.NotStrict, !got.NotStrict, w.strict)
+			}
+			// proargtypes (IN args only)
+			if len(got.ArgTypes) != len(w.argTypes) {
+				t.Errorf("ArgTypes len=%d, want %d", len(got.ArgTypes), len(w.argTypes))
+			} else {
+				for i, a := range w.argTypes {
+					if got.ArgTypes[i] != a {
+						t.Errorf("ArgTypes[%d]=%d, want %d", i, got.ArgTypes[i], a)
+					}
+				}
+			}
+			// proallargtypes
+			if len(got.AllArgTypes) != len(w.allTypes) {
+				t.Errorf("AllArgTypes len=%d, want %d", len(got.AllArgTypes), len(w.allTypes))
+			} else {
+				for i, a := range w.allTypes {
+					if got.AllArgTypes[i] != a {
+						t.Errorf("AllArgTypes[%d]=%d, want %d", i, got.AllArgTypes[i], a)
+					}
+				}
+			}
+			// proargmodes
+			if len(got.ArgModes) != len(w.modes) {
+				t.Errorf("ArgModes len=%d, want %d", len(got.ArgModes), len(w.modes))
+			} else {
+				for i, m := range w.modes {
+					if got.ArgModes[i] != m {
+						t.Errorf("ArgModes[%d]=%q, want %q", i, got.ArgModes[i], m)
+					}
+				}
+			}
+			// proargnames
+			if len(got.ArgNames) != len(w.names) {
+				t.Errorf("ArgNames len=%d, want %d", len(got.ArgNames), len(w.names))
+			} else {
+				for i, n := range w.names {
+					if got.ArgNames[i] != n {
+						t.Errorf("ArgNames[%d]=%q, want %q", i, got.ArgNames[i], n)
+					}
+				}
+			}
+		})
+	}
+}

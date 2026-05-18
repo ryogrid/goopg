@@ -9898,7 +9898,7 @@ relcache init → replication readiness) and intra-package grouped.
         `bootstrap-procedure/10-implementation-roadmap.md`).
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-27** (bootstrap-procedure task 27)
+- [x] **M0106-0010 batched-27** (bootstrap-procedure task 27)
       - Summary: Seed `pg_proc` rows 3099, 6118, 6169, 6248, 3781 (SRFs
         backing the remaining 5 replication views) with full PG18
         `proallargtypes` / `proargnames` arrays.
