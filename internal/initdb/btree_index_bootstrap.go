@@ -272,15 +272,36 @@ func pgBuildBtreeBulkLoad(sortedTuples [][]byte, nkeyatts uint16) ([]byte, error
 			nextBlock = uint32(li + 2) // next leaf block (li+1 in 0-based, +1 for 1-based block)
 		}
 		// Non-rightmost leaves get a P_HIKEY pivot tuple derived from the
-		// last data tuple in this leaf. PG18 V4 heapkeyspace btrees REQUIRE
-		// the high key to satisfy BTreeTupleIsPivot() — INDEX_ALT_TID_MASK
-		// in t_info and natts encoded in ip_posid. A verbatim data-tuple
-		// copy fails `_bt_check_natts` (nbtutils.c:4163) and aborts every
-		// PG backend at nbtsearch.c:707 the first time `_bt_compare` walks
-		// the index. See pgBuildBtreeLeafHighKey for the exact encoding.
+		// FIRST data tuple of the NEXT leaf ("firstright"), matching PG's
+		// `_bt_truncate` semantics (postgres/src/backend/access/nbtree/nbtutils.c:3776).
+		// PG18 V4 heapkeyspace btrees REQUIRE the high key to satisfy
+		// BTreeTupleIsPivot() — INDEX_ALT_TID_MASK in t_info and natts
+		// encoded in ip_posid.
+		//
+		// Using `lastleft` (the last tuple of THIS leaf) here was wrong even
+		// when correctly pivot-encoded: PG's _bt_compare at
+		// `postgres/src/backend/access/nbtree/nbtsearch.c:829` treats a scan
+		// key with `keysz == ntupatts && heapTid == NULL && scantid == NULL`
+		// as STRICTLY GREATER than the pivot, so a forward search for the
+		// last key on a leaf would step right past the matching leaf into a
+		// page that doesn't contain it. Step 3az's INDEX_ALT_TID_MASK fix
+		// silenced the assertion but kept this wrong direction; the
+		// pg_shseclabel_object_index (OID 3593) lookup blew up under
+		// `RelationGetIndexAttOptions → get_attoptions(3593, 2)` because
+		// (3593, 2) is the last entry on leaf 1 of
+		// pg_attribute_relid_attnum_index. Using firstright = (3593, 3) here
+		// makes the key comparison itself settle direction
+		// (2 < 3 → scan key < HIKEY → stay on leaf).
+		//
+		// For our unique 16-byte indexes nkeyatts == nattrs, so there's no
+		// suffix to truncate and no heap-TID tiebreaker (firstright always
+		// strictly > lastleft on the prior leaf). For a non-unique index
+		// where consecutive tuples could tie on all keys, PG would append a
+		// heap-TID tiebreaker (BT_PIVOT_HEAP_TID_ATTR) here. None of the
+		// nailed indexes currently bulk-loaded need that.
 		var highKey []byte
 		if !isRightmost {
-			highKey = pgBuildBtreeLeafHighKey(group[len(group)-1], nkeyatts)
+			highKey = pgBuildBtreeLeafHighKey(leafGroups[li+1][0], nkeyatts)
 		}
 		page, err := pgBuildBtreeLeafPage(group, highKey, prevBlock, nextBlock)
 		if err != nil {

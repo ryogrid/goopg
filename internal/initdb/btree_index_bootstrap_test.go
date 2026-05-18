@@ -723,12 +723,18 @@ func TestPgBuildBtreeBulkLoadTwoLeafLayoutMatchesPG18(t *testing.T) {
 	if hikeyLen != fixedIndexTupleSize {
 		t.Errorf("P_HIKEY length = %d, want %d", hikeyLen, fixedIndexTupleSize)
 	}
-	// P_HIKEY must be a PG18 V4 heapkeyspace pivot tuple derived from leaf 1's
-	// last data tuple (= tuples[maxTuplesPerNonRightmostLeaf-1]) — with
+	// P_HIKEY must be a PG18 V4 heapkeyspace pivot tuple derived from the
+	// FIRST data tuple of the NEXT leaf (= tuples[maxTuplesPerNonRightmostLeaf]),
+	// matching PG's `_bt_truncate(lastleft, firstright)` semantics
+	// (postgres/src/backend/access/nbtree/nbtutils.c:3776). The pivot has
 	// INDEX_ALT_TID_MASK set in t_info and ip_posid encoding nkeyatts (2).
-	// Without this encoding, `_bt_check_natts` aborts every PG backend at
-	// nbtsearch.c:707; see pgBuildBtreeLeafHighKey.
-	srcHikey := tuples[maxTuplesPerNonRightmostLeaf-1]
+	// Using leaf 1's last data tuple here instead breaks forward syscache
+	// lookups for that key: PG's _bt_compare (nbtsearch.c:829) treats a
+	// scankey with `keysz == ntupatts && heapTid == NULL && scantid == NULL`
+	// as STRICTLY GREATER than the pivot and steps right past the matching
+	// leaf — manifesting as `cache lookup failed for attribute N of
+	// relation R` for any key that happened to land at a leaf boundary.
+	srcHikey := tuples[maxTuplesPerNonRightmostLeaf]
 	gotHikey := leaf1[hikeyOff : hikeyOff+uint32(fixedIndexTupleSize)]
 	// Key payload (bytes [8..]) carries through unchanged from the source data
 	// tuple — the pivot transform only touches ip_posid (4..6) and t_info

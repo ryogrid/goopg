@@ -5445,6 +5445,80 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         territory.
         Design:
         `docs/design/0106-0010-step3az-multi-leaf-btree-hikey-and-pnone.md`.
+      - Step 3ba LANDED 2026-05-18. Closed the
+        `FATAL: cache lookup failed for attribute 2 of relation 3593` PG-
+        standby boot blocker that has been firing on every backend
+        `InitPostgres` since Step 3az silenced the multi-leaf btree
+        assertion. The error originates from
+        `RelationGetIndexAttOptions → get_attoptions(3593, 2)`
+        (`postgres/src/backend/utils/cache/relcache.c:6008` →
+        `lsyscache.c:1074`) while the standby's relcache opens
+        `pg_shseclabel_object_index` (OID 3593).
+      - Investigation: direct on-disk dumps of the standby's
+        `base/{1,5}/{1249,2659}` (md5-identical to a freshly-`initdb`'d
+        goopg datadir — WAL replay isn't disturbing the files) showed
+        the underlying heap row at `pg_attribute (block 0, offset 60)`
+        decoding cleanly to `attrelid=3593, attnum=2`, and
+        `pg_attribute_relid_attnum_index` (OID 2659) holding the
+        corresponding entry at leaf 1 slot 407. The entry sits at the
+        **leaf boundary**: leaf 1 ends at `(3593, 2)`, leaf 2 starts at
+        `(3593, 3)`.
+      - Root cause: PG's `_bt_compare`
+        (`postgres/src/backend/access/nbtree/nbtsearch.c:806-831`) for a
+        forward scan key against a heapkeyspace pivot tuple with
+        `keysz == ntupatts && heapTid == NULL && scantid == NULL`
+        returns 1 (treats scan key as STRICTLY GREATER than the
+        pivot). `_bt_moveright` (nbtsearch.c:311) then steps RIGHT to
+        the next leaf, which has no `(3593, 2)` entry. Step 3az's
+        `pgBuildBtreeBulkLoad` set the P_HIKEY's source tuple to
+        `group[len(group)-1]` (= lastleft, the LAST tuple of the
+        current leaf). PG's `_bt_truncate`
+        (`postgres/src/backend/access/nbtree/nbtutils.c:3776`) instead
+        uses **firstright** — the FIRST tuple of the NEXT leaf — and
+        truncates suffix attrs only on key ties.
+      - Fix: change `pgBuildBtreeBulkLoad` (one-line change in
+        `internal/initdb/btree_index_bootstrap.go`) to source the pivot
+        from `leafGroups[li+1][0]`. With HIKEY = (3593, 3), the
+        scankey (3593, 2) compares strictly less in col 2 (2 < 3),
+        `_bt_compare` returns -1, the search stays on leaf 1, and
+        `_bt_binsrch` finds slot 407 = (3593, 2). Pivot encoding
+        helper (`pgBuildBtreeLeafHighKey`) is unchanged — Step 3az's
+        INDEX_ALT_TID_MASK + ip_posid=nkeyatts encoding remains
+        correct, it just paired with the wrong source tuple. Safe for
+        every currently bulk-loaded index because they're all UNIQUE
+        — consecutive keys are distinct, so PG's `_bt_keep_natts`
+        returns `nkeyatts` (no heap-TID tiebreaker needed, no suffix
+        truncation). A future non-unique bulk-loaded index would need
+        `BT_PIVOT_HEAP_TID_ATTR` + appended `ItemPointerData`.
+        Single-leaf-root fast path
+        (`pgBuildBtreeLeafRootPage`) is untouched (no high key at all
+        — leftmost == rightmost).
+      - Regression pin update:
+        `TestPgBuildBtreeBulkLoadTwoLeafLayoutMatchesPG18` now compares
+        the P_HIKEY source against `tuples[maxTuplesPerNonRightmostLeaf]`
+        (= firstright) instead of
+        `tuples[maxTuplesPerNonRightmostLeaf-1]` (= lastleft); comment
+        documents the forward-`_bt_compare`-steps-right failure mode.
+        `TestPgBuildBtreeLeafHighKeyMatchesPGPivotEncoding` and
+        `TestPgBuildBtreeBulkLoadSingleLeafByteIdenticalToLegacy`
+        unchanged.
+      - Verified: `go build ./...` PASS;
+        `go test -count=1 -run 'TestPgBuildBtree|TestBootstrapPgAttribute|TestMakeBtreeRootPage' ./internal/initdb/`
+        PASS;
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS;
+        `go test -count=1 ./internal/initdb/` — only
+        `TestSynchronousCommitFlushesByDefault` fails (pre-existing
+        baseline failure tracked as M0106-0012, carried through Steps
+        3a*-3az); every other test, including the updated
+        `TestPgBuildBtreeBulkLoadTwoLeafLayoutMatchesPG18`, passes.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`:
+        the cache-lookup blocker is closed; new blocker surfaces as
+        `FATAL: could not open relation with OID 2328` (= PG18
+        `pg_db_role_setting`, accessed during `process_settings` in
+        `InitPostgres`) — Step 3bb territory.
+        Design:
+        `docs/design/0106-0010-step3ba-multi-leaf-btree-hikey-firstright.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
