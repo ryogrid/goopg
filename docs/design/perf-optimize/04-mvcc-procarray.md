@@ -100,12 +100,20 @@ is mechanical.
 type procSlot struct {
     // All access is via atomic primitives. 64-byte cache-line
     // alignment ensures no false sharing between slots.
-    state    atomic.Uint32   // bit-packed: see below
-    xid      atomic.Uint64   // current top-level xid, 0 if none
-    xmin     atomic.Uint64   // backend's xmin horizon, MaxUint64 if none
-    procNum  int32           // dense backend ID; matches activity slot
-    _pad     [44]byte        // pad to 64 B
+    state            atomic.Uint32   // bit-packed: see below
+    xid              atomic.Uint64   // current top-level xid, 0 if none
+    xmin             atomic.Uint64   // backend's xmin horizon, MaxUint64 if none
+    procNum          int32           // dense backend ID; matches activity slot
+    // First-snapshot cache (RR / SERIALIZABLE; see §8). Pointer-free
+    // (offset/length into the owning txnCtx). Resolved via
+    //   mctx.Lookup(txnCtxID).Bytes(firstSnapshotOff, firstSnapshotLen)
+    // Zero when no first snapshot is cached (RC isolation, or no txn).
+    txnCtxID         uint16          // mctx.ContextID of owning txnCtx
+    firstSnapshotOff uint32          // offset within that ctx's chunk stream
+    firstSnapshotLen uint32          // length of the cached Snapshot blob
+    _pad             [26]byte        // pad to 64 B (4+8+8+4+2+4+4 = 34; 26 fills to 64)
 }
+// unsafe.Sizeof(procSlot{}) == 64; asserted in internal/mvcc/procarray_test.go.
 
 // procSlot.state bit layout:
 //   bit  0       inUse           (claimed by a backend)
@@ -191,6 +199,17 @@ contention to write transactions only.
 
 ### SnapshotFor — lock-free walk
 
+The walk's correctness argument deserves an explicit statement: a
+concurrent `Begin` from another backend may complete its
+`xidgen.Allocate` after our `Peek()` snapshot of Xmax. That new xid is
+above our Xmax horizon and is correctly excluded from our snapshot
+(by the `xid >= snap.Xmax` test in the loop). Conversely, a concurrent
+`Commit` may clear `flagHasXid` between our `state.Load()` and
+`xid.Load()`; we may include the just-committed xid in our in-progress
+list, but visibility checks for that xid will consult CLOG via
+`clog.GetStatus`, observe `XactCommitted`, and treat it as visible —
+matching PG's `GetSnapshotData` + `XidInMVCCSnapshot` two-stage check.
+
 ```go
 // SnapshotFor builds a Snapshot for procNum's pending statement.
 // O(maxBackends) with no mutex; only atomic loads.
@@ -224,8 +243,10 @@ func (m *Manager) SnapshotFor(procNum int32, mc *mctx.Context) *Snapshot {
 ```
 
 PG calls this pattern "the dense xid array walk"
-(`postgres/src/backend/storage/ipc/procarray.c:2175 GetSnapshotData`,
-PG 14+ uses `pgxactoff[]`). The walk is read-only against the slot
+(`postgres/src/backend/storage/ipc/procarray.c::GetSnapshotData` —
+the function header lives around line 2179 in PG 18.3, with the
+"dense xid array" loop body slightly below; PG 14+ uses `pgxactoff[]`).
+The walk is read-only against the slot
 array; concurrent Begin/Commit only update individual slots atomically.
 A snapshot may include an xid that committed mid-walk (caller treats
 it as in-progress, will reread CLOG when checking visibility — same
@@ -355,7 +376,10 @@ type CLog struct {
 ```
 
 — uses a single RWMutex over all of `data`. Splitting into banks
-matches PG `clog.c:304`'s SLRU bank lock granularity. The on-disk
+matches PG's per-bank SLRU lock pattern (`postgres/src/backend/access/
+transam/slru.c::SimpleLruGetBankLock`; the per-bank lock-granularity
+work that the CLOG cache builds on lives in `slru.c`, with CLOG-
+specific glue in `clog.c::TransactionIdSetStatusBit`). The on-disk
 **file format is unchanged** (2 bits per xid, sequential bytes).
 Bank count is computed at startup from the current max xid; banks
 grow on demand.
@@ -481,7 +505,15 @@ type Manager struct {
     procArray *ProcArray
     xidgen    *XidGen
     clog      *CLog
-    // SSI / predicate locks remain on Manager directly; cold path.
+    // SSI / predicate locks each carry their own private mutex; they
+    // are not protected by a manager-wide lock. The pre-refactor
+    // discipline ("Manager.mu covers SSI/predlock") is replaced by
+    // ssiState.mu (private to ssiState) and predicateLocks.mu
+    // (private). SERIALIZABLE isolation already routes through these
+    // narrower locks today; the change is internal renaming. Cold
+    // path: SERIALIZABLE workloads are rare in pgbench and our
+    // optimisation target; the per-subsystem locks are sized for
+    // correctness, not throughput.
     ssiState        ssiState
     predicateLocks  predicateLocksRegistry
     // xactMarker callback for WAL commit-status hook:
@@ -506,7 +538,7 @@ func (m *Manager) OldestXmin() storage.TransactionID
 | `procSlot` per-backend         | `PGPROC` struct in `proc.h`                                       |
 | GetSnapshotData lock-free walk | `procarray.c:2175 GetSnapshotData`                                |
 | XidGen atomic counter          | `varsup.c:77 GetNewTransactionId` (under `XidGenLock`)            |
-| CLOG bank locks                | `clog.c:304` (`MAX_CLOG_BANKLOCKS` per-bank)                      |
+| CLOG bank locks                | `slru.c::SimpleLruGetBankLock` + `clog.c::TransactionIdSetStatusBit` |
 | OldestXmin walk                | `procarray.c:1850 GetOldestNonRemovableTransactionId`             |
 | First-snapshot caching         | `snapmgr.c FirstXactSnapshot`                                     |
 

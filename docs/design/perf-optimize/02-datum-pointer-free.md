@@ -61,15 +61,16 @@ Final shape (subject to fieldalignment lint at implementation time):
 
 type Datum struct {
     Kind    DatumKind       // 1 B   (uint8 backing; was 8 B int)
+    Flags   uint8           // 1 B   (IsNull, IsBigNumeric, IsToast, reserved)
     ArenaID mctx.ContextID  // 2 B   (uint16; resolves via mctx.Lookup)
     Scale   int8            // 1 B   (numeric scale; signed)
-    Flags   uint8           // 1 B   (IsNull, IsBigNumeric, IsToast, reserved)
-    _pad0   [3]byte         // 3 B   alignment to 8 B
+    _pad0   [3]byte         // 3 B   pad to 8-byte boundary before Lo
     Lo      uint64          // 8 B   (scalar / (offset<<32)|length / mantissa lo)
     Hi      uint64          // 8 B   (numeric hi mantissa / interval micros / TID lo)
 }
 
-// unsafe.Sizeof(Datum{}) == 24 B, with zero GC-traced fields.
+// Field layout (offsets): Kind@0, Flags@1, ArenaID@2, Scale@4, _pad0@5..7,
+// Lo@8, Hi@16. unsafe.Sizeof(Datum{}) == 24 B, with zero GC-traced fields.
 const _ uintptr = 24 - unsafe.Sizeof(Datum{}) // compile-error if not 24
 
 // IsNull is encoded via Flags bit 0 (not a separate Kind) so the
@@ -103,21 +104,31 @@ less memmove.
 
 ## 3. Per-Kind encoding rules
 
-| Kind                       | Lo                                       | Hi               | ArenaID  | Flags        |
-|----------------------------|------------------------------------------|------------------|----------|--------------|
-| KindNull                   | 0                                        | 0                | 0        | flagNull     |
-| KindBool                   | 0 or 1                                   | 0                | 0        | 0            |
-| KindInt (int2/int4/int8)   | int64 value                              | 0                | 0        | 0            |
-| KindFloat (float4/float8)  | bits of float64                          | 0                | 0        | 0            |
-| KindString                 | (offset << 32) \| length                 | 0                | own ctx  | 0            |
-| KindBytes (bytea)          | (offset << 32) \| length                 | 0                | own ctx  | 0            |
-| KindTime (timestamp/tz)    | unix-nanos UTC                           | 0                | 0        | 0            |
-| KindInterval               | (months << 32) \| days (signed)          | micros           | 0        | 0            |
-| KindNumeric (fast path)    | int64 mantissa                           | 0                | 0        | 0 (Scale set)|
-| KindNumeric (big path)     | (offset << 32) \| length of BE mantissa  | 0                | own ctx  | flagBigNumeric |
-| KindToastPointer           | toastrelid (uint32) << 32 \| chunk id    | va_extsize       | 0        | flagToast    |
-| KindTID                    | block (uint32) << 32 \| offset (uint16)  | 0                | 0        | 0            |
-| KindUUID                   | low 64 bits                              | high 64 bits     | 0        | 0            |
+The **`ArenaID` invariant**: `ArenaID = 0` means *the Datum has no
+arena-resident payload*; its value is fully encoded in `Lo` / `Hi` /
+`Flags` / `Scale`. Accessors that consult mctx (`StringValue`,
+`BytesValue`, `BigIntValue`) check `ArenaID != 0` before calling
+`mctx.Lookup`, so the chapter-01 reserved `InvalidContextID = 0`
+slot is never dereferenced. The literal-payload path that today
+uses `permArena` is migrated to `ArenaID = mctx.PermContextID` (= 1)
+([[01-memory-context]] §6), keeping `ArenaID = 0` clean as the
+"no payload" sentinel. The accessors below enforce this gate.
+
+| Kind                       | Lo                                       | Hi               | ArenaID            | Flags        |
+|----------------------------|------------------------------------------|------------------|--------------------|--------------|
+| KindNull                   | 0                                        | 0                | 0                  | flagNull     |
+| KindBool                   | 0 or 1                                   | 0                | 0                  | 0            |
+| KindInt (int2/int4/int8)   | int64 value                              | 0                | 0                  | 0            |
+| KindFloat (float4/float8)  | bits of float64                          | 0                | 0                  | 0            |
+| KindString                 | (offset << 32) \| length                 | 0                | own ctx (or Perm)  | 0            |
+| KindBytes (bytea)          | (offset << 32) \| length                 | 0                | own ctx (or Perm)  | 0            |
+| KindTime (timestamp/tz)    | unix-nanos UTC                           | 0                | 0                  | 0            |
+| KindInterval               | (months << 32) \| days (signed)          | micros           | 0                  | 0            |
+| KindNumeric (fast path)    | int64 mantissa                           | 0                | 0                  | 0 (Scale set)|
+| KindNumeric (big path)     | (offset << 32) \| length of BE mantissa  | 0                | own ctx            | flagBigNumeric |
+| KindToastPointer           | toastrelid (uint32) << 32 \| chunk id    | va_extsize       | 0                  | flagToast    |
+| KindTID                    | block (uint32) << 32 \| offset (uint16)  | 0                | 0                  | 0            |
+| KindUUID                   | low 64 bits                              | high 64 bits     | 0                  | 0            |
 
 All KindString / KindBytes / big-Numeric payloads live in their
 context's chunk storage; resolution is
@@ -135,15 +146,33 @@ The current `KindNumeric` either stores an int64 mantissa in `Int`
 the big-endian byte representation stored in mctx:
 
 ```go
-// Big-numeric encoding into mctx (one allocation per non-fast-path Numeric):
-b := bi.Bytes()  // big-endian magnitude
-signFlag := byte(0)
-if bi.Sign() < 0 { signFlag = 0x80 }
-offset, length := ctx.AllocBytes(append([]byte{signFlag}, b...))  // length includes sign byte
+// Big-numeric encoding into mctx (zero GC-heap allocation):
+b := bi.Bytes()                     // big-endian magnitude; one heap alloc inside big.Int
+mag := len(b)
+buf := ctx.Alloc(1 + mag)           // sign byte + magnitude bytes; mctx-resident
+if bi.Sign() < 0 {
+    buf[0] = 0x80
+}
+copy(buf[1:], b)
+// Resolve buf's offset/length via the helper that goes through Alloc's
+// returned (slice, offset) pair (chapter 01 §5):
+offset, length := ctx.OffsetOf(buf)
 d.Lo = uint64(offset)<<32 | uint64(length)
 d.Flags |= flagBigNumeric
 d.ArenaID = ctx.ID()
 ```
+
+(`OffsetOf(buf []byte) (offset, length uint32)` is a small helper on
+`*mctx.Context` that returns the logical offset of `buf`'s first byte
+within the context's chunk stream; it is a pointer-comparison against
+each chunk plus an arithmetic remainder. Added to [[01-memory-context]]
+§5 alongside `Alloc`.)
+
+The residual `bi.Bytes()` allocation is inside `*big.Int` itself — a
+caller-provided value — and is unavoidable without rewriting big.Int.
+Big-numeric construction is rare enough (constant folding at plan time,
+or rare data-type conversion) that the residual cost is tolerable; the
+per-row hot path is on the fast path (`int64` mantissa, zero alloc).
 
 `Datum.BigIntValue() *big.Int` rehydrates on demand for arithmetic
 that genuinely needs `*big.Int` (compare, multiply, etc.). The
@@ -293,20 +322,28 @@ inventory below.
 ## 7. API impact (call sites to migrate)
 
 Migration of `d.Buf`, `d.Big`, `d.arena.Bytes(...)`, and direct field
-access to the new accessors. Predicted scope by package:
+access to the new accessors. The implementer **must** generate the
+authoritative inventory immediately before Phase B begins, via:
 
-| Package                        | Approx. call sites | Notes                                              |
-|--------------------------------|---------------------|----------------------------------------------------|
-| `internal/executor/`           | ~80                 | codec.go, datum.go internal kernels, operators_*.go |
-| `internal/planner/`            | ~30                 | const folding, type coercion                       |
-| `internal/wal/`                | ~15                 | record encoders that serialise tuple fields        |
-| `internal/access/heap/`        | ~15                 | tuple decode / form                                |
-| `internal/initdb/`             | ~10                 | catalog seed data                                  |
-| `internal/protocol/`           | ~10                 | wire encode/decode                                 |
-| `internal/server/`             | ~5                  | result row formatting                              |
-| Tests (`*_test.go`)            | ~60                 | use `NewXDatum` constructors                       |
+```bash
+grep -RInE '\.Buf|\.Big|\.arena\.Bytes\(' \
+    /home/ryo/work/goopg/goopg/internal \
+    | grep -v '_test.go' | wc -l
+```
 
-Total: ~225 call sites. The implementation strategy is:
+and a separate `_test.go` count. The pre-refactor estimate (production
++ tests combined) is in the low-to-mid hundreds; we deliberately do
+not freeze a number here because it drifts with day-to-day commits.
+The phased per-package rollout in §migration below is sized in
+*packages*, not call sites, so the count delta does not affect the
+plan.
+
+Package coverage (the packages that have at least one access today):
+`internal/executor/`, `internal/planner/`, `internal/wal/`,
+`internal/access/heap/`, `internal/initdb/`, `internal/protocol/`,
+`internal/server/`, plus their `*_test.go` files.
+
+The implementation strategy is:
 
 1. Land the new `Datum` layout behind a `//go:build datumv2` build
    tag.

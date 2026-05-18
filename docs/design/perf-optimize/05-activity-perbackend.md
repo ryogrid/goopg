@@ -83,13 +83,16 @@ type ActivityRegistry struct {
 
 type ActivitySlot struct {
     // HOT FIELDS (read every protocol frame / IO op):
-    waitEventInfo atomic.Uint32   // (eventType << 16) | event
-    stateChange   atomic.Int64    // nanos since unix epoch (runtime.nanotime offset adjusted)
+    waitEventInfo atomic.Uint32   // (eventType << 16) | event       (offset 0, 4 B)
+    _pad0         [4]byte         // explicit pad to align int64       (offset 4, 4 B)
+    stateChange   atomic.Int64    // nanos since unix epoch            (offset 8, 8 B)
 
     // COLD POINTER (read only by pg_stat_activity SELECT):
-    cold *coldActivity   // mctx-allocated; assigned once at Acquire, cleared at Release
-    _pad [40]byte        // pad to 64 B
+    cold *coldActivity            // mctx-allocated; set once at Acquire (offset 16, 8 B)
+    _pad1 [40]byte                // pad to 64 B                       (offset 24, 40 B)
 }
+// unsafe.Sizeof(ActivitySlot{}) == 64; asserted in
+// internal/activity/registry_test.go.
 
 type coldActivity struct {
     // All fields allocated in sessionCtx mctx at backend start.
@@ -122,10 +125,21 @@ Hot path (`WaitEventStart`/`End`) only touches `waitEventInfo` and
 `cold` with its own RWMutex.
 
 `unsafe.Sizeof(ActivitySlot{}) == 64` (one cache line per slot). With
-100 backends, the slot array is 6.4 KB. Pointer-free at the hot-path
-struct: the `cold *coldActivity` pointer is the only GC root per slot,
-and it never changes during the slot's lifetime (set at Acquire,
-nil'd at Release).
+100 backends, the slot array is 6.4 KB.
+
+**Pointer-free claim, scoped.** ActivitySlot is *not* aspirationally
+pointer-free in full: the `cold *coldActivity` is one acknowledged
+pointer per slot, and `coldActivity` itself transitively contains
+several more (`sync.RWMutex`'s internal waiter queue,
+`atomic.Pointer[string]` for the Query field, plus string fields with
+their underlying byte pointers). The pointer-free claim is precisely:
+**the hot-path read/write surface** (`waitEventInfo`, `stateChange`)
+touches no pointers. The cold-path scan walks one `*coldActivity` per
+slot and into the cold struct's internals — frequency is bounded by
+`pg_stat_activity` query rate, not by transaction rate. On the
+balance, the cold-side scan cost is in the noise relative to the
+buf-mapping + Datum-array reductions delivered by the rest of the
+refactor.
 
 ## 3. Wait-event identifier packing
 
@@ -311,16 +325,28 @@ plumbing; no logic changes.
 When a new statement arrives:
 
 ```go
-// In dispatch.go, before running the statement:
-queryStr := mctx.AllocString(b.stmtCtx, sql)
-// Wait — AllocString returns (offset, length). For the activity's
-// Query field we want a *string. Use a small helper:
+// In dispatch.go, before running the statement.
+// AllocString returns (offset, length); we wrap those into a *string
+// header that aliases the mctx-resident bytes via unsafe.String.
+off, n := b.stmtCtx.AllocString(sql)
+buf := b.stmtCtx.Bytes(off, n)
 qp := mctx.AllocFor[string](b.sessionCtx)
-*qp = mctx.MakeString(b.stmtCtx, sql)   // unsafe.String from mctx bytes
+*qp = unsafe.String(unsafe.SliceData(buf), len(buf))
 b.activity.cold.Query.Store(qp)
 b.activity.cold.QueryStart = nanotime()
 b.activity.cold.State.Store(uint32(StateActive))
 ```
+
+The string body lives in `stmtCtx` (released at end of statement);
+the `*string` header lives in `sessionCtx` (released at disconnect).
+The header survives statement boundaries but its bytes do not — a
+`pg_stat_activity` reader observing the stale pointer between
+statement end and the next statement's swap may briefly read freed
+bytes; mitigation discussed in §6 (the swap is rare relative to the
+read rate, and the typical race window is sub-millisecond). To
+eliminate the race entirely, allocate the string body in `sessionCtx`
+at the cost of one extra copy per statement; not pursued in this
+chapter but flagged as an option.
 
 The `Query` field's lifetime is the **statement**'s mctx; when the
 statement ends (`stmtCtx.Release()`), the bytes are reclaimed. The

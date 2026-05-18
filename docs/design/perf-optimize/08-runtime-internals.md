@@ -166,8 +166,8 @@ func UnpinP() { runtime_procUnpin() }
 const xidCacheBatch = 32   // xids per refill
 
 type perPCache struct {
-    next, end storage.TransactionID
-    _pad [48]byte   // pad to 64 B
+    next, end storage.TransactionID   // TransactionID == uint32; 4 B each
+    _pad      [56]byte                // pad to 64 B (4+4+56 = 64)
 }
 
 type XidGen struct {
@@ -185,8 +185,12 @@ func (g *XidGen) Allocate() storage.TransactionID {
         return x
     }
     // Refill: fetch xidCacheBatch from global, install in this P's
-    // cache. Must unpin before any operation that could block; the
-    // global Add is atomic-only (non-blocking) so we stay pinned.
+    // cache. The global Add is atomic-only (non-blocking) so we stay
+    // pinned through it. runtime_procPin disables preemption by
+    // incrementing m.locks (runtime invariant), so the goroutine
+    // cannot be migrated to a different P while we mutate c — that
+    // is what makes the unsynchronised c.next++ safe inside the
+    // pinned window.
     base := storage.TransactionID(g.global.Add(xidCacheBatch))
     c.next = base - xidCacheBatch
     c.end  = base
@@ -200,6 +204,19 @@ func (g *XidGen) Allocate() storage.TransactionID {
 The per-P cache reduces the atomic contention on `g.global` by 32×.
 At c=100 SU (~7 K xacts/sec × 1 xid/xact), that drops to ~220 atomic
 adds/sec on the global counter — well below any contention threshold.
+
+**Correctness of cached-but-unused xids.** A P may cache xids it never
+hands out (e.g., the P sits idle with `c.next < c.end`, then the
+process exits or the P's caches are abandoned at shutdown). Those xids
+are leaked from the perspective of `g.global` (which has already
+advanced past them) but are **never recorded in any procSlot's xid
+field** and **never written to CLOG**. A subsequent visibility check
+for such a leaked xid `X` consults `clog.GetStatus(X)` which returns
+the default "no status recorded" value; the CLOG fast path treats this
+identically to an aborted transaction — the leaked xid is invisible to
+all snapshots. No correctness hazard, modest xid-space waste (bounded
+by `xidCacheBatch × GOMAXPROCS = 32 × 16 = 512` xids per shutdown,
+trivially small against the 32-bit xid space).
 
 PG analogue: PG uses a single `XidGenLock` and bulk-allocates xids
 inside the lock to amortise. We use the per-P cache + atomic counter,
@@ -348,13 +365,13 @@ Go minor.
 
 ## 9. PG counterparts
 
-| goopg concept                | PG counterpart                                              |
-|------------------------------|-------------------------------------------------------------|
-| `Nanotime`                   | `INSTR_TIME_SET_CURRENT` macro using `clock_gettime(MONOTONIC)` |
-| `PinP` / per-P sharding      | PG processes are inherently per-process-sharded; no equivalent  |
-| Per-P xid allocator cache    | `GetNewTransactionId` allocates one xid at a time under XidGenLock |
-| Per-P stats counters         | `pgstat_*` per-backend local counters (PGSTAT_BACKEND_INFO_*) |
-| `SemaAcquire` / `SemaRelease`| PG's `PGSemaphore` (SysV semaphore on Linux)                |
+| goopg concept                | PG counterpart                                                                          |
+|------------------------------|-----------------------------------------------------------------------------------------|
+| `Nanotime`                   | `INSTR_TIME_SET_CURRENT` macro in `postgres/src/include/portability/instr_time.h`; uses `clock_gettime(CLOCK_MONOTONIC)` |
+| `PinP` / per-P sharding      | PG processes are inherently per-process-sharded; closest analogue is each backend's `MyProc` global in `postgres/src/backend/storage/lmgr/proc.c` |
+| Per-P xid allocator cache    | `GetNewTransactionId` in `postgres/src/backend/access/transam/varsup.c::GetNewTransactionId` (single global counter under `XidGenLock`; PG does not batch-cache, but the design space is the same) |
+| Per-P stats counters         | Per-backend `pgstat_*` flush model in `postgres/src/backend/utils/activity/pgstat.c` (each backend accumulates locally, flushes to shared on a slow cadence) |
+| `SemaAcquire` / `SemaRelease`| PG's `PGSemaphore` abstraction in `postgres/src/include/storage/pg_sema.h`; POSIX implementation in `postgres/src/backend/port/posix_sema.c`  |
 
 PG's process model gives it most of the per-P sharding "for free" —
 each backend is its own process. We compensate with `runtime_procPin`

@@ -232,7 +232,7 @@ After all phases ship, re-running
 | `activity.Registry.*` in mutex top-20               | 95 % of c=100 SO         | **absent**                      |
 | `bufferPartition.mu` in mutex top-20                | dominates writes         | **absent**                      |
 | Datum pointer count                                 | 3 per Datum              | **0 per Datum**                 |
-| `unsafe.Sizeof(Datum{})`                            | 64 B                     | **24 B (or 32 B, lint-final)**  |
+| `unsafe.Sizeof(Datum{})`                            | 64 B                     | **24 B** (compile-time asserted)|
 | pgbench-history c=100 livelock                      | 19 goroutines stuck      | **does not reproduce**          |
 
 The per-chapter verification subsections refine these into chapter-

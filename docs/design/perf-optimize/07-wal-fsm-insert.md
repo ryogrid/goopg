@@ -50,10 +50,14 @@ rates or larger records the serialisation becomes meaningful.
 the upstream `mvcc.Manager.mu` is removed ([[04-mvcc-procarray]]) and
 write throughput rises. The fix is cheap and pre-emptive.
 
-PG counterpart: `postgres/src/backend/access/transam/xlog.c:151`
-defines `NUM_XLOGINSERT_LOCKS = 8`; `xlog.c:570 WALInsertLocks[]`
-holds the stripe; `xlog.c:1392,1399` stripes by `MyProcNumber %
-NUM_XLOGINSERT_LOCKS`.
+PG counterpart: `postgres/src/backend/access/transam/xlog.c` defines
+`NUM_XLOGINSERT_LOCKS = 8` (around line 151); the static
+`WALInsertLocks[]` array is declared a few lines below the constant
+(around line 154); the stripe selection (`MyProcNumber %
+NUM_XLOGINSERT_LOCKS`) lives inside `WALInsertLockAcquire` /
+`WALInsertLockAcquireExclusive`. (Exact line numbers drift between PG
+minor versions; the implementer should grep the in-tree `postgres/`
+for `NUM_XLOGINSERT_LOCKS` to locate current call sites.)
 
 ### Tail-page determinism
 
@@ -156,8 +160,65 @@ func (w *Writer) reserveSpace(size int) LSN {
 This atomic reserve is racy with the segment-rotation logic (because
 two writers may reserve LSNs that span a segment boundary). The fix
 is the same as PG's: a stripe that reserves space in a new segment
-must coordinate the rotation via a separate `rotateMu sync.Mutex`
-(coarse but rare — once per `wal_segment_size`, typically 16 MB).
+takes a separate `rotateMu sync.Mutex` (added to the Writer struct
+alongside `appendLocks [8]paddedMutex`; the lock is coarse but rare —
+once per `wal_segment_size`, typically 16 MB).
+
+```go
+type Writer struct {
+    appendLocks [8]paddedMutex
+    rotateMu    sync.Mutex   // covers segment-boundary crossings
+    nextLSN     atomic.Uint64
+    segSize     uint64       // wal_segment_size, immutable after init
+    // ... existing fields (group-commit queue, etc.)
+}
+
+// reserveSpaceWithinSegment reserves `size` bytes for one record.
+// If the reservation would straddle the next segment boundary, it
+// coordinates via rotateMu so segment rotation is serialised even
+// while the 8 stripe locks remain non-overlapping.
+func (w *Writer) reserveSpaceWithinSegment(size int) LSN {
+    for {
+        old := w.nextLSN.Load()
+        end := old + uint64(size)
+        oldSeg := old / w.segSize
+        endSeg := (end - 1) / w.segSize
+        if oldSeg == endSeg {
+            // No boundary crossing; plain CAS.
+            if w.nextLSN.CompareAndSwap(old, end) {
+                return LSN(old)
+            }
+            continue
+        }
+        // Crossing a segment boundary. Take rotateMu, advance LSN to
+        // the next segment's start, perform the rotation IO, then
+        // reserve within the new segment.
+        w.rotateMu.Lock()
+        // Recheck: another writer may have rotated while we waited.
+        old = w.nextLSN.Load()
+        oldSeg = old / w.segSize
+        nextStart := (oldSeg + 1) * w.segSize
+        if old < nextStart {
+            // Advance LSN to nextStart, padding the current segment's tail.
+            // (Implementation pads with a NOOP WAL record and bumps nextLSN.)
+            w.padToSegmentBoundary(old, nextStart)
+            w.nextLSN.Store(nextStart)
+        }
+        // Now reserve inside the new segment via plain CAS (within rotateMu;
+        // contention is bounded by rotation rate, not insert rate).
+        old = w.nextLSN.Load()
+        w.nextLSN.Store(old + uint64(size))
+        w.rotateMu.Unlock()
+        return LSN(old)
+    }
+}
+```
+
+The boundary-crossing case enters the slow path under `rotateMu`; the
+common in-segment case is one atomic CAS. Stripe locks order with
+`rotateMu` as: stripe.Lock → (rare: rotateMu.Lock → rotateMu.Unlock) →
+stripe.Unlock. Two stripes that both straddle the boundary serialise
+on `rotateMu`; otherwise they proceed in parallel.
 
 PG counterpart: `xlog.c:1392,1399` does the same — `XLogInsertRecord`
 takes the stripe's `WALInsertLock`, calls `ReserveXLogInsertLocation`
@@ -217,20 +278,19 @@ func selectInsertPage(rel relation.Handle, tupleSize int, ctx *Context) (storage
     proc := ctx.ProcNum
 
     // 1. Consult FSM for top-N candidate pages with enough free space.
-    candidates := fsm.GetCandidates(tupleSize+fsmSlop, candidatesPerInsert)
+    candidates := fsm.GetCandidates(rel, tupleSize+fsmSlop, candidatesPerInsert)
     // candidatesPerInsert == 4 — see §rationale.
 
-    // 2. Rank candidates by pin count (low is better).
+    // 2. Rank candidates by pin count (low is better). The pinCount
+    //    extraction goes through Pool.SlotPinCount (defined in
+    //    [[06-bufpool-lockfree]]) rather than inlining the bit-mask
+    //    arithmetic; keeps this code robust to slotState layout
+    //    changes.
     bestBlock := storage.InvalidBlockNumber
     bestPin   := int32(math.MaxInt32)
     for _, blk := range candidates {
         tag := bufferTag(rel, blk)
-        slotIdx, _ := ctx.Pool.bufmap.Lookup(tag)
-        var pin int32 = 0
-        if slotIdx >= 0 {
-            state := ctx.Pool.slots[slotIdx].state.Load()
-            pin = int32(state & ((1<<22) - 1))   // pinCount field
-        }
+        pin := ctx.Pool.SlotPinCount(tag)   // returns 0 for unmapped tags
         if pin < bestPin {
             bestPin = pin
             bestBlock = blk
@@ -371,7 +431,7 @@ preserved.
 | goopg concept                     | PG counterpart                                              |
 |-----------------------------------|-------------------------------------------------------------|
 | 8-stripe `appendLocks`            | `WALInsertLocks[NUM_XLOGINSERT_LOCKS]` in `xlog.c:151,570`   |
-| Atomic LSN reserve                | `ReserveXLogInsertLocation` in `xlog.c:1404`                |
+| Atomic LSN reserve                | `ReserveXLogInsertLocation` in `xlog.c` (locate via grep on the symbol; line drifts) |
 | Stripe selection by procNum       | `MyProcNumber % NUM_XLOGINSERT_LOCKS` in `xlog.c:1392`      |
 | FSM `GetCandidates`               | `GetPageWithFreeSpace` family in `freespace.c`              |
 | Pin-count aware page selection    | (PG does not have this — it relies on FSM staleness + retry)|

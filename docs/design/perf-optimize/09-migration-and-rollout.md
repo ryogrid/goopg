@@ -160,7 +160,14 @@ or D5-first.
 | D4 (wal+fsm)  | c=100 SU/standard livelock           | c=100 SU TPS ≥ 500 (was SKIPPED); c=100 standard TPS ≥ 500 |
 | D5 (runtime)  | per-P xid contention; semaphore wait | Combined `runtime.futex` drop with D3; nanotime bench ~5 ns |
 
-**Final integrated acceptance band (after all of D1..D5):**
+**Final integrated acceptance band (after all of D1..D5).**
+
+Pre-refactor numbers are sourced from
+`analysis/perf-optimize/runs/20260518_115032/results_summary.tsv` (the
+run captured at commit `ab1b955`); the post-refactor numbers are
+re-measured against the same script and pgbench parameters so the
+comparison is apples-to-apples. Both this table and the overview
+table in [[00-overview]] §8 draw from this same TSV.
 
 | Metric                           | Pre-refactor (`ab1b955`) | Post-refactor target          |
 |----------------------------------|--------------------------|-------------------------------|
@@ -239,7 +246,7 @@ inline.
 | `//go:linkname` site breaks on Go upgrade | Low | Build-tag-gated fallbacks for every linkname site (per [[08-runtime-internals]]); per-Go-minor CI smoke test; bump procedure documented. |
 | ProcArray slot exhaustion at high `max_connections` | Low | Slot array sized at server start with 2× over-provision; documented bound (`max_connections` GUC limit); explicit panic on exhaustion (better than silent corruption). |
 | Lock-free `bufmap` race on insert | Medium | Robin-Hood with version words; CAS retry loop bounded; `-race` stress tests with 1 000 concurrent goroutines doing Pin/Unpin/evict for 30 s. |
-| WAL stripe LSN reservation races with segment rotation | Medium | The atomic `nextLSN.Add` reserves; a separate `rotateMu sync.Mutex` (rare; once per `wal_segment_size`) serializes segment rotation. Mirrors PG. |
+| WAL stripe LSN reservation races with segment rotation | Medium | The atomic `nextLSN.Add` reserves; `rotateMu sync.Mutex` (declared on `wal.Writer` in [[07-wal-fsm-insert]] §2; rare — once per `wal_segment_size`) serializes segment rotation. Mirrors PG. |
 | Phase D landing in fragments breaks pgbench mid-suite | Medium | Each sub-milestone's smoke test is the full pgbench c=10/c=50 suite (excluding c=100 SU/standard until D3+D4 land together). c=100 SU/standard are part of the integrated D3+D4 gate. |
 | Reviewer subagent misses subtle issues | Low | Two-pass review: re-run reviewer after addressing findings; user is the final reviewer before any implementation milestone opens; CI gates each phase via the smoke tests above. |
 | Cold-path operator adapter (Phase C) hides bugs in vacuum/cluster paths | Low | A `go vet`-style lint asserts that no hot-path call site reaches the adapter at runtime (a runtime flag panics if hot-path code paths hit the adapter); cold paths are exercised by the existing vacuum + analyze + DDL tests. |

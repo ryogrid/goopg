@@ -112,7 +112,8 @@ Lifetime contracts:
 
 PG reference: `MemoryContextInit`, `AllocSetContextCreate`,
 `MemoryContextReset`, `MemoryContextDelete` in
-`postgres/src/backend/utils/mmgr/mcxt.c:174,358` and
+`postgres/src/backend/utils/mmgr/mcxt.c` (`MemoryContextInit` around
+line 342, `AllocSetContextCreate` exported in `aset.c`) and
 `aset.c:441` (chunk-class allocator).
 
 ## 4. Backing allocator: slab + bump
@@ -307,14 +308,29 @@ func AllocFor[T any](c *Context) *T {
 ```
 
 The cast is safe because `buf[0]` resides inside `c`'s chunk backing
-array, which is live as long as `c` is alive. Callers must respect
-the lifetime contract: returning a `*T` past `c.Reset()` is a use-after-
-free. The `runtime.KeepAlive(c)` discipline is documented per call site
-where the cast escapes the immediate function (practice doc §5).
+array, which is live as long as `c` is alive. Callers must respect the
+lifetime contract: returning a `*T` past `c.Reset()` is a use-after-
+free.
+
+**Keep-alive discipline (practice doc §5).** Every backend's context
+tree (session → txn → stmt) is reachable from the backend's serving
+struct (`internal/server/backend.go`); that struct is itself
+reachable from the backend goroutine's stack throughout the
+connection's lifetime. Therefore the chain `goroutine → backend →
+sessionCtx → ... → chunks → []byte` keeps the chunk-backing arrays
+live for the whole connection: a Go GC cannot reclaim the backing
+slab while any descendant `*T` is held. Code paths that hand a `*T`
+to a different goroutine (e.g., the WAL writer worker reading a
+slot's bytes by index) are by contract synchronous within the
+backend's lifetime and do not require an additional
+`runtime.KeepAlive`. The single exception is the per-P xid cache in
+[[08-runtime-internals]], whose backing slab is the global `XidGen`
+struct and whose lifetime is the process — no KeepAlive needed.
+Debug-build `mctxProbe` (see §7) verifies this contract at runtime.
 
 `AllocSlice[T any]` is analogous, returning `unsafe.Slice((*T)(...), n)`.
 
-### Pointer-free guarantee
+### Pointer-free guarantee — and acknowledged GC roots per Context
 
 The `chunks []chunk` field is a slice of structs, each containing one
 `[]byte`. The Go GC scans each `[]byte`'s slice header (one pointer
@@ -329,6 +345,24 @@ struct allocations via `AllocFor`, AST nodes, plan nodes, Datum payload
 bytes) — the GC does **not** descend into them because the slice
 element type is `byte` (a non-pointer type). This is the central
 trick of the design.
+
+**Acknowledged GC roots per Context** (for completeness, since later
+chapters claim "Datum is pointer-free, ProcArray is pointer-free,
+bufmap is pointer-free" — `Context` itself is not aspirationally
+pointer-free; these are the deliberate exceptions):
+
+| Field            | Type            | Per-cycle scan cost  | Justification                                                              |
+|------------------|-----------------|----------------------|----------------------------------------------------------------------------|
+| `parent`         | `*Context`      | one pointer per ctx  | Cascade `Reset`/`Release`; cold path                                       |
+| `chunks`         | `[]chunk`       | one slice header     | Chunks carry `[]byte` (pointer-free); GC reads slice headers only          |
+| `chunks[i].buf`  | `[]byte`        | one slice header per chunk | Pointer-free bytes inside; GC stops at the byte boundary             |
+| `children`       | `[]*Context`    | one slice header + N pointers | Cascade `Reset`/`Release`; cold path; size bounded by max children   |
+
+A live backend with `session → txn → stmt → expr` = 4 contexts ×
+(2 pointer fields + ~3 chunk slice headers) ≈ 20 pointer reads per
+backend per GC cycle. At 100 backends ≈ 2 000 reads. Compare today's
+per-Datum scan cost of ~10⁶ pointers per second; the residual cost is
+in the noise.
 
 ## 6. Registry
 
@@ -384,13 +418,17 @@ statement per microsecond for ~136 hours).
 
 The lifecycle is threaded through the existing server code:
 
-1. **`internal/server/server.go::serveConn`** (around line 661) — at
-   connection start, after PID allocation but before the auth handshake,
-   call `sessionCtx := mctx.Acquire(nil, mctx.KindSession)`. Store
-   `sessionCtx` on the backend's serving struct. Defer `sessionCtx.Release()`
-   on connection teardown.
-2. **`internal/server/dispatch.go::executeOneSimpleStmt`** (lines
-   586-599) — at statement entry, `stmtCtx := mctx.Acquire(sessionCtx,
+1. **`internal/server/server.go::serveConn`** — at connection start,
+   after PID allocation but before the auth handshake, call
+   `sessionCtx := mctx.Acquire(nil, mctx.KindSession)`. Store
+   `sessionCtx` on the backend's serving struct. Defer
+   `sessionCtx.Release()` on connection teardown. (Symbol reference,
+   not a line number: `serveConn` lives at `server.go:563+` in the
+   current tree, but the hook lands wherever the activity registration
+   happens today — implementer should use the symbol, not a stale
+   line.)
+2. **`internal/server/dispatch.go::executeOneSimpleStmt`** — at
+   statement entry, `stmtCtx := mctx.Acquire(sessionCtx,
    mctx.KindStmt)`. After the statement completes (success or error),
    `stmtCtx.Release()`. The existing `executor.Context` struct gains
    a `Mctx *mctx.Context` field threaded through to every Open / Next /

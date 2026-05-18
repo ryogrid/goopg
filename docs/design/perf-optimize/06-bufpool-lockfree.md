@@ -141,7 +141,12 @@ the buf-mapping structure.
 ```go
 func bufTagHash(t BufferTag) uint64 {
     // 64-bit fmix from MurmurHash3; runs on a 16-byte POD struct.
+    // CRITICAL: every byte of BufferTag must feed the hash, including
+    // the Fork (heap / FSM / VM / init) discriminator. A prior draft
+    // ignored Fork; that produced guaranteed cross-fork collisions
+    // and was caught in design review.
     h := uint64(t.Rel.DBOid) | uint64(t.Rel.RelOid)<<32
+    h ^= uint64(t.Rel.Fork) * 0xBF58476D1CE4E5B9   // mix in Fork
     h ^= uint64(t.Block) * 0x9E3779B97F4A7C15
     h ^= h >> 33
     h *= 0xFF51AFD7ED558CCD
@@ -161,17 +166,25 @@ in the inner loop.
 
 ```go
 // Lookup returns (slot, gen) for tag, or (-1, 0) if not present.
-// Lock-free: only atomic loads.
+// Lock-free: only atomic loads. Tombstones do not terminate probing;
+// only true-empty buckets do.
 func (m *bufmap) Lookup(tag BufferTag) (slot int32, gen uint32) {
     h := bufTagHash(tag) & m.mask
     dist := uint64(0)
     for {
         v := atomic.LoadUint64(&m.vals[h])
-        if v == 0 {
-            return -1, 0   // empty bucket; tag not present
+        switch {
+        case v == bufmapEmpty:
+            return -1, 0   // true empty; tag not present
+        case v == bufmapTombstone:
+            // Tombstone: continue probing without checking the key
+            // (the key field may be stale).
+            h = (h + 1) & m.mask
+            dist++
+            continue
         }
-        // Read key under acquire ordering: vals' CAS publishes the
-        // key write that happened in Insert.
+        // Live entry. Read key under acquire ordering: vals' CAS publishes
+        // the key write that happened in Insert.
         if m.keys[h] == tag {
             return int32(v >> 32), uint32(v)
         }
@@ -194,6 +207,17 @@ is bounded by the Robin-Hood property.
 ### Insert (CAS)
 
 ```go
+// vals[h] sentinels:
+//   0  — empty bucket (no entry ever; safe to skip on Lookup)
+//   1  — tombstone   (was occupied, key may still be in keys[h];
+//                     Insert may reuse, Lookup must continue probing)
+//   *  — live entry (high 32 bits: slotIdx; low 32 bits: gen)
+
+const (
+    bufmapEmpty     uint64 = 0
+    bufmapTombstone uint64 = 1
+)
+
 // Insert publishes a (tag, slotIdx, gen) entry. Returns true on
 // success; false if a concurrent inserter beat us with the same tag.
 // Callers use Insert when finalising a miss; they should call Lookup
@@ -203,31 +227,48 @@ func (m *bufmap) Insert(tag BufferTag, slotIdx int32, gen uint32) bool {
     h := bufTagHash(tag) & m.mask
     for {
         v := atomic.LoadUint64(&m.vals[h])
-        if v == 0 {
-            // Write key under non-atomic store (it's a 16-byte struct, but
-            // the CAS on vals publishes a release-fence; readers checking
-            // the key only after observing a non-zero vals are safe.)
+        switch {
+        case v == bufmapEmpty || v == bufmapTombstone:
+            // Reusable bucket. Stage the key write, then publish via
+            // CAS — see memory-model note below.
             m.keys[h] = tag
-            if atomic.CompareAndSwapUint64(&m.vals[h], 0, val) {
+            if atomic.CompareAndSwapUint64(&m.vals[h], v, val) {
                 return true
             }
-            continue   // someone else won; retry with same h
+            continue   // someone else won this bucket; retry with same h
+        default:
+            // Live entry. If it's our tag, we lost the publish race.
+            if m.keys[h] == tag {
+                return false
+            }
+            h = (h + 1) & m.mask
         }
-        // Slot occupied. Robin-Hood:
-        if m.keys[h] == tag {
-            return false   // already published; don't insert duplicate
-        }
-        h = (h + 1) & m.mask
     }
 }
 ```
 
-The 16-byte BufferTag store on `m.keys[h]` is two 8-byte writes. On
-x86 these are not atomic with each other, but the CAS on `vals[h]`
-publishes a release fence; a Lookup observing a non-zero `vals[h]`
-must observe the matching key write (because the CAS happens-before
-the reader's load). The Robin-Hood property is enforced by the writer
-strictly increasing probe distance.
+**Memory-model argument.** The 16-byte `BufferTag` store on
+`m.keys[h]` compiles to two 8-byte stores; these are not atomic
+relative to each other. However, the subsequent `CompareAndSwapUint64`
+on `m.vals[h]` is documented by Go's memory model
+([go.dev/ref/mem](https://go.dev/ref/mem)) to act as a **release**
+operation: every memory write sequenced-before the CAS in program order
+is visible to any goroutine performing an atomic-load on the same
+location and observing the post-CAS value (the load acts as **acquire**).
+A reader executing `atomic.LoadUint64(&m.vals[h])` and observing a
+non-`bufmapEmpty`/non-`bufmapTombstone` value is therefore guaranteed to
+observe the corresponding `m.keys[h]` write that the inserter staged
+immediately before the CAS. The same release-acquire pair holds on
+weak-memory architectures (ARM64, RISC-V) because Go's `sync/atomic`
+package compiles `CompareAndSwap` to a sequentially-consistent or
+release-semantics machine instruction (`STLXR` + `LDAXR` pair on ARM64).
+
+The Robin-Hood property is enforced by the writer strictly increasing
+probe distance; tombstone reuse does not break the property because the
+tombstone marker preserves the original probe distance for the entry
+that was deleted (the next inserter writing into the tombstone slot
+starts at its own preferred bucket and only reaches the tombstone via
+the same probing sequence).
 
 Edge case — the **stronger** Robin-Hood variant (probe-distance-based
 swap during insert) requires more complex CAS sequencing. For our
@@ -239,17 +280,21 @@ the full Robin-Hood.
 
 ```go
 // Delete clears (tag, slotIdx). Called by evictLocked after the slot
-// is recycled. Uses a tombstone marker (vals[h] == 1) so Lookup can
-// continue probing past deleted entries.
+// is recycled. Uses bufmapTombstone (== 1) so Lookup must continue
+// probing past deleted entries until it sees a bufmapEmpty bucket.
 func (m *bufmap) Delete(tag BufferTag, slotIdx int32) {
     h := bufTagHash(tag) & m.mask
     for {
         v := atomic.LoadUint64(&m.vals[h])
-        if v == 0 {
+        switch {
+        case v == bufmapEmpty:
             return   // not present
+        case v == bufmapTombstone:
+            h = (h + 1) & m.mask
+            continue
         }
         if m.keys[h] == tag && int32(v>>32) == slotIdx {
-            atomic.StoreUint64(&m.vals[h], 1)   // tombstone
+            atomic.StoreUint64(&m.vals[h], bufmapTombstone)
             return
         }
         h = (h + 1) & m.mask
@@ -265,13 +310,18 @@ lock).
 
 ```go
 // internal/storage/slot.go (rewritten)
+//
+// Slot is sized to exactly 64 B (one cache line) so per-slot CAS
+// traffic does not cause false sharing across slots. The single GC
+// root per slot is the page slice header.
 
 type Slot struct {
-    page  Page          // bytes pointer; this is the only GC root per slot
-    tag   BufferTag     // POD 16 B
-    state atomic.Uint64 // packed; see layout below
-    _pad  [40]byte      // pad to 64 B (page = 24 B header + tag = 16 B + state = 8 B = 48 B; pad to 64)
+    page  Page          // slice header (24 B); aliases shared_buffers slab
+    tag   BufferTag     // 16 B POD
+    state atomic.Uint64 // 8 B packed; layout below
+    _pad  [16]byte      // 16 B pad to 64 (24+16+8+16=64)
 }
+// unsafe.Sizeof(Slot{}) == 64; asserted in internal/storage/slot_test.go.
 
 // slotState bit layout:
 //   bit  0..21  pinCount    (22 bits → 4 M concurrent pins)
@@ -354,7 +404,10 @@ func (p *Pool) Unpin(pin Pin) {
         if pinCount == 0 {
             panic("storage: Unpin on slot with pinCount==0")
         }
-        new := old - 1   // decrement pinCount
+        // Decrement pinCount via explicit field arithmetic — never rely
+        // on (old - 1) even though pinShift == 0 today; explicit form
+        // survives future layout reshuffles.
+        new := (old &^ uint64(pinMask)) | ((pinCount - 1) & uint64(pinMask))
         if s.state.CompareAndSwap(old, new) {
             return
         }
@@ -374,6 +427,27 @@ type Pin struct {
 `unsafe.Sizeof(Pin{}) == 8`. Pointer-free. Passed by value through
 the executor. Caller invokes `pool.Unpin(pin)` (or `defer
 pool.Unpin(pin)`) before the slot's content lifetime expires.
+
+### Helper: `Pool.SlotPinCount`
+
+Consumers outside the Pin/Unpin core that need to inspect a slot's
+pin count (e.g., [[07-wal-fsm-insert]]'s FSM hot-page avoidance)
+use a helper rather than inlining the bitmask:
+
+```go
+// SlotPinCount returns the current pinCount for tag's slot, or 0
+// if tag is not currently mapped. Lock-free.
+func (p *Pool) SlotPinCount(tag BufferTag) int32 {
+    slotIdx, _ := p.bufmap.Lookup(tag)
+    if slotIdx < 0 {
+        return 0
+    }
+    return int32(p.slots[slotIdx].state.Load() & uint64(pinMask))
+}
+```
+
+This isolates the bit-layout details behind a method so future
+slotState reshuffles don't ripple into FSM logic.
 
 The slot's `page Page` field is the **only GC root** per slot (the
 underlying arena byte slice). The `slots []*Slot` slice header is one
@@ -499,20 +573,45 @@ coordinate concurrent fetches of the same tag. Post-refactor:
 
 - `ioInflightBit` in `slot.state` marks "this slot is reading the tag
   from disk."
-- A Pin that observes `ioInflightBit` parks via `runtime_semacquire`
-  on a per-slot semaphore (declared as `state[16]_pad` area's first
-  8 bytes used as semaphore counter — or simpler: a `parkSem
-  semapool.Semaphore` field, sized once at Slot init).
+- A Pin that observes `ioInflightBit` parks via the per-slot semaphore.
 - After the disk read completes, the loader clears `ioInflightBit`
-  and releases all waiters via `runtime_semrelease`.
+  and releases all waiters.
 
-The per-slot semaphore is held by a `[N]uint32` table indexed by slot
-index; we use `runtime.semacquire` / `runtime.semrelease` via
-`//go:linkname` ([[08-runtime-internals]]).
+**Design choice: per-slot semaphore counter in a parallel `[N]uint32`
+table** (not a field inside `Slot`, because keeping `Slot` at exactly
+64 B is more valuable than locality of the semaphore):
 
-If `//go:linkname` is unavailable (build-tag fallback), the slow path
-uses a plain `sync.Mutex` + condition variable per slot. Same
-semantics, slightly slower wakeup.
+```go
+type Pool struct {
+    slots    []Slot       // N entries, each 64 B
+    slotSema []uint32     // N entries, parallel to slots; used by runtimeshim.SemaAcquire/Release
+    // ... other fields
+}
+```
+
+Wait/wake uses the runtime semaphore primitive via
+`internal/runtimeshim` ([[08-runtime-internals]] §5):
+
+```go
+// Waiter (called when Pin observes ioInflightBit):
+runtimeshim.SemaAcquire(&p.slotSema[slotIdx])
+
+// Loader (clears ioInflightBit and wakes all current waiters):
+for i := 0; i < waiterCount(slotIdx); i++ {
+    runtimeshim.SemaRelease(&p.slotSema[slotIdx])
+}
+```
+
+`waiterCount` reads the runtime semaphore's outstanding-wait counter
+(maintained by the runtime); on the rare condition that exact counter
+isn't accessible, the loader does a fixed-batch release (e.g., 32) and
+the slow path retries — bounded and rare.
+
+**Fallback** when `//go:linkname` is unavailable: a parallel
+`[]sync.Mutex` + `[]sync.Cond` table per slot, with identical
+semantics. Slower wakeup (~10 µs vs ~1 µs for the runtime semaphore)
+but functionally equivalent. The fallback's structure is sized so the
+hot-path Pin (which does not block) never touches it.
 
 ## 10. GC scan implications
 

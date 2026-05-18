@@ -144,7 +144,8 @@ const (
     OpCluster
     OpCall
     OpCopy
-    // ... up to 36 total; see internal/executor/operators_*.go
+    // ... full list generated at implementation time from the grep
+    // command below; the *shape* is fixed, the *count* is not frozen.
 )
 
 type OpNode struct {
@@ -155,9 +156,35 @@ type OpNode struct {
     state    [opStateSize]byte   // raw bytes; cast to per-Kind state via unsafe.Pointer
 }
 
-const opStateSize = 192   // = max(sizeof(seqScanState), sizeof(hashJoinState), ...)
-                           // determined at implementation time by fieldalignment + size profiling
+// opStateSize is sized empirically. The implementer MUST run the
+// state-size profiler before freezing this constant:
+//
+//   for each xxxState struct in internal/executor/, print unsafe.Sizeof.
+//   opStateSize = max(...) rounded up to 8-byte alignment.
+//
+// Initial estimate: 192 bytes covers the typical kernel states
+// (seqScanState ~88 B, hashJoinState ~120 B, sortState ~80 B,
+// updateState ~96 B). The largest state we expect is hashJoinState
+// because of its embedded hashTable header; if measurement shows
+// >192 B for any state, either grow the constant in 64-byte increments
+// or move the offending state behind the `ext` overflow slab. The
+// latter is the documented escape valve.
+const opStateSize = 192   // tentative — refit at implementation time
 ```
+
+The kind count is regenerated from:
+
+```bash
+grep -RInE 'func \([a-zA-Z]+ \*[a-zA-Z]+Op\) (Open|Next|Close|Schema)\(' \
+    /home/ryo/work/goopg/goopg/internal/executor \
+    | sed 's|.*func ([a-zA-Z]\+ \*\([a-zA-Z]\+Op\)).*|\1|' \
+    | sort -u | wc -l
+```
+
+(38 in the pre-refactor tree at commit `ab1b955`; the design accepts
+the count produced by this command at implementation time.) A
+`TestOpKindCount` build-time test asserts the enum length matches the
+production code, preventing silent drift.
 
 The `state` field is **raw bytes**, large enough for the largest
 per-kind state struct. For each `OpKind`, a `func castXxxState(n *OpNode) *xxxState`
@@ -270,7 +297,7 @@ func filterNext(ops []OpNode, n *OpNode, dst *Slot) error {
         if err := opNext(ops, child, dst); err != nil {
             return err   // includes EOF
         }
-        if expr.Eval(s.pred, dst).BoolValue() {
+        if exprEvalBool(exprs, s.predIdx, dst) {
             return nil
         }
         // else loop; reuse dst.Cells, no alloc
@@ -278,22 +305,84 @@ func filterNext(ops []OpNode, n *OpNode, dst *Slot) error {
 }
 ```
 
-Note: `expr.Eval` is itself a tagged-union dispatch on `planner.Expr`
-(60-ish concrete Expr kinds); the same sum-type pattern applies. The
-existing `internal/executor/expr.go` already does some of this; the
-refactor completes it.
+The expression evaluator gets the same tagged-union treatment as
+operators. The current `planner.Expr` is an interface with many
+implementors (`BinaryOp`, `FuncCall`, `ColumnRef`, `CaseExpr`,
+`SubqueryExpr`, comparison ops, arithmetic ops, casts, etc.). The
+implementer **must** generate the exact `ExprKind` count via:
+
+```bash
+grep -RInE 'func \([a-zA-Z]+ \*[A-Z][a-zA-Z]+\) (Eval|exprNode)\(' \
+    /home/ryo/work/goopg/goopg/internal/planner \
+    | wc -l
+```
+
+Expectation: the count is **higher than 36** (operators) but bounded
+by the Expr interface's implementor set. The shape:
+
+```go
+type ExprKind uint8
+const (
+    ExprInvalid ExprKind = iota
+    ExprColumnRef
+    ExprIntConst
+    ExprStringConst
+    ExprBoolConst
+    ExprBinaryOp
+    ExprUnaryOp
+    ExprFuncCall
+    ExprCast
+    ExprCaseExpr
+    ExprCoalesce
+    ExprIsNull
+    ExprSubquery
+    // ... full list generated from grep above
+)
+
+type ExprNode struct {
+    Kind     ExprKind
+    OpCode   uint16    // BinaryOp / UnaryOp / FuncCall sub-discrimination
+    children [2]int32  // index into expr-slab; -1 == none
+    payload  [40]byte  // per-kind state; cast via *xxxState pointers
+}
+```
+
+Like `OpNode`, `ExprNode` is allocated from `stmtCtx`; the expression
+tree is a `[]ExprNode` slab. Hot-path evaluators dispatch via
+`switch n.Kind` inside a single `func exprEval(exprs []ExprNode, idx int32,
+slot *Slot) Datum`. The existing `internal/executor/expr.go` already
+performs some sum-type dispatch (for arithmetic ops); the refactor
+completes it. **This is in scope for Phase C**: the chapter's
+verification target (interface dispatch absent from hot path) requires
+the ExprNode migration, not just the OpNode migration.
 
 ## 5. `Slot` redesign (interface deleted)
 
 ```go
 type Slot struct {
-    Schema  planner.Schema    // pointer; refers to mctx-allocated Schema; tolerable
+    Schema  planner.Schema    // []SchemaColumn slice; mctx-allocated
     Cells   []Datum           // 24-byte Datum (pointer-free per [[02-datum-pointer-free]])
     Owner   mctx.ContextID    // arena holding payload bytes
     Pin     storage.Pin       // pointer-free; for slots aliasing a buffer-pool page
     pinHeld bool              // true if Pin must be released on Slot.Reset
 }
 ```
+
+**GC roots in `Slot`.** Slot is **not** claimed fully pointer-free.
+The acknowledged roots, per row scanned:
+
+- `Schema` — a `[]SchemaColumn` slice header (the backing array lives
+  in stmtCtx; `SchemaColumn` itself contains string fields whose
+  underlying bytes also live in mctx). One slice-header pointer read
+  per Slot scan, plus N column-string slice-headers when the schema
+  is scanned in full. Mitigation: schemas are stable for a statement;
+  the GC scans the slice header once per cycle regardless of row count.
+- `Cells` — a `[]Datum` slice header. One pointer read per Slot.
+
+Two slice headers per Slot, scanned once per GC cycle independently
+of row throughput. Compared to today's per-Datum `Buf` + `Big` +
+`arena` (3 pointer reads × 50 columns × every row), this is a
+~10⁵-fold reduction in scan work per second at c=100 SO.
 
 `Slot` is **always a concrete struct**, never an interface. Consumers
 that need multiple slot kinds (scan slot vs join virtual slot)
@@ -368,10 +457,10 @@ construction in `planSelect` calls `mctx.AllocSlice[PlanNode](stmtCtx,
 `append` semantics, but the backing array is mctx-resident. **No GC
 heap allocations** during planning.
 
-Expression nodes (`planner.Expr` and subtypes — `BinaryOp`, `FuncCall`,
-`ColumnRef`, `CaseExpr`, `SubqueryExpr`, etc.) get the same treatment.
-There are roughly 20–30 Expr kinds; same `ExprKind` enum + `ExprNode`
-sum-type.
+Expression nodes (`planner.Expr` and subtypes) get the treatment
+detailed earlier in §4 — the `ExprKind` enum + `ExprNode` sum-type
+listed there. The exact kind count is generated from the grep
+instruction in §4; the design freezes the *shape*, not the *count*.
 
 The same applies to AST nodes (`parser.Stmt`, `parser.Expr`). The
 existing `tokenSlicePool` and `parserPool` in `internal/parser/parser.go`
@@ -510,8 +599,10 @@ After Phase C of [[09-migration-and-rollout]] ships:
 - **Compile-time** — `grep -RIn 'type.*Operator interface\|type.*TupleSlot interface'
   internal/executor/` returns zero (only the deleted operator.go reference
   remains, and only as comment history).
-- **Symbol count** — `mcp__serena__find_symbol Operator` returns the
-  cold-path adapter only; all 36 hot-path implementations gone.
+- **Symbol count** — `grep -RInE 'func \([a-zA-Z]+ \*[a-zA-Z]+Op\) (Open|Next|Close|Schema)\(' internal/executor/`
+  shows only the cold-path adapter implementations; all hot-path
+  operator-method implementations gone (equivalent serena query:
+  `mcp__serena__find_symbol Operator` returns only adapters).
 - **Sizeof** — `unsafe.Sizeof(OpNode{}) <= 220` asserted (sized at
   implementation, including the `state [N]byte` budget).
 - **Plan-tree allocation** — runtime allocations from `planner.Plan`
