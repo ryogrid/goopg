@@ -548,6 +548,7 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 		2228, // pg_range_rngmultitypid_index ← Step 3bz
 		6001, // pg_replication_origin_roiident_index ← Step 3ca
 		6002, // pg_replication_origin_roname_index ← Step 3ca
+		5002, // pg_sequence_seqrelid_index ← Step 3cb
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680,
 		2684, 2685, // pg_namespace_nspname_index, pg_namespace_oid_index ← Step 3t
 		2687, 2688, 2690, 2691, 2693, 2701, 2703, 2704}

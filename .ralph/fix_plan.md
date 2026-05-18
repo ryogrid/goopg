@@ -7093,6 +7093,71 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         / pg_statistic / pg_statistic_ext catalog territory (Step 3cb).
         Design:
         `docs/design/0106-0010-step3ca-pg-replication-origin-nailed-rel.md`.
+      - Step 3cb LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 2224` PG-standby boot blocker that surfaces
+        after Step 3ca seeded the pg_replication_origin family. OID
+        2224 is `pg_sequence` per
+        `postgres/src/include/catalog/pg_sequence.h:23`
+        (`CATALOG(pg_sequence,2224,SequenceRelationId)`). Per-database
+        (non-shared) catalog — follows the Step 3bz pg_range template
+        rather than the Step 3ca shared-rel template. Family-complete
+        seed in one step: heap 2224 + its single declared UNIQUE
+        PRIMARY index 5002 (pg_sequence_seqrelid_index, btree on
+        seqrelid oid_ops, backs `MAKE_SYSCACHE(SEQRELID, …, 32)`).
+        (a) `pgSequenceAttrs()` (relcache_init.go) returns the
+        8-column PG18 schema: seqrelid (oid TypeOID 26 Len 4 NotNull),
+        seqtypid (oid TypeOID 26 Len 4 NotNull), seqstart /
+        seqincrement / seqmax / seqmin / seqcache (int8 TypeOID 20
+        Len 8 NotNull each), seqcycle (bool TypeOID 16 Len 1 NotNull).
+        All 8 columns fixed-width NOT NULL. pg_sequence has **no
+        `oid` system column** — attnums start at 1 = seqrelid.
+        RelType=83 is safe (no `SequenceRelation_Rowtype_Id` in PG18
+        headers).
+        (b) `nailedLocalRels` (relcache_init.go) heap list gains
+        `{2224, "pg_sequence", 83, 'r', 8, false, pgSequenceAttrs()}`
+        after the Step 3bz 3541 entry; idxSpec list gains
+        `{5002, "pg_sequence_seqrelid_index"}` after the Step 3bz
+        2228 entry.
+        (c) `pgIndexInitialEntries` local section (initdb.go) gains
+        `entry(5002, 2224, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` (UNIQUE PRIMARY seqrelid oid_ops) after the Step
+        3bz 2228 entry.
+        (d) `bootstrapMappedLocalCatalogHeaps` oid list +
+        `localRelMap` in `bootstrapPostgresDatabase` both gain `2224`
+        / `{2224, 2224}` after the Step 3bz 3541 entries. Also fixed
+        a long-standing stale comment that mis-labelled OID 6102 as
+        `pg_sequence` — the true OID of pg_sequence is 2224 (the new
+        entry); 6102 is `pg_subscription_rel`.
+        (e) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain `5002` after the Step 3bz
+        2228 entry. Empty-btree placeholder is sufficient because
+        pg_sequence is unpopulated at bootstrap (sequences are
+        created by `CREATE SEQUENCE` at runtime).
+        Regression pins:
+        `TestNailedLocalRelsContainsPgSequence`,
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgSequence`,
+        `TestPgSequenceSeqrelidIndexInitialEntry`,
+        `TestNailedLocalRelsContainsPgSequenceSeqrelidIndex` in
+        `internal/initdb/pg_sequence_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended
+        with `5002:{1}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 5002;
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        extended with 2224 (strict list guard).
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgSequence|TestBootstrapMappedLocalCatalogHeapsIncludesPgSequence|TestPgSequenceSeqrelidIndexInitialEntry|TestNailedLocalRelsContainsPgSequenceSeqrelidIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3ca (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. With the heap
+        (2224) + PKEY (5002) both seeded, the pg_sequence family is
+        fully wired. Next anticipated blocker on E2E re-run lies in
+        the pg_subscription / pg_subscription_rel / pg_statistic /
+        pg_statistic_ext catalog territory (Step 3cc). Design:
+        `docs/design/0106-0010-step3cb-pg-sequence-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

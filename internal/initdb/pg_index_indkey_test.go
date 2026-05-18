@@ -93,6 +93,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		2228: {3},         // pg_range_rngmultitypid_index : btree(rngmultitypid oid_ops) UNIQUE ← Step 3bz
 		6001: {1},         // pg_replication_origin_roiident_index : btree(roident oid_ops) UNIQUE PRIMARY ← Step 3ca
 		6002: {2},         // pg_replication_origin_roname_index : btree(roname text_ops) UNIQUE ← Step 3ca
+		5002: {1},         // pg_sequence_seqrelid_index : btree(seqrelid oid_ops) UNIQUE PRIMARY ← Step 3cb
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

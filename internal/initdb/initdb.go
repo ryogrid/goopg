@@ -459,9 +459,10 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		6237, // pg_publication_namespace (M0106-0010 step 3bx)
 		6106, // pg_publication_rel (M0106-0010 step 3by)
 		3541, // pg_range (M0106-0010 step 3bz)
+		2224, // pg_sequence (M0106-0010 step 3cb)
 		6003, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		6101, // pg_publication_rel
-		6102, // pg_sequence
+		6102, // pg_subscription_rel (stale comment was "pg_sequence" — true pg_sequence OID is 2224, seeded above)
 		6137, // pg_transform
 		6245, // pg_statistic_ext_data
 		9400, // pg_db_role_setting
@@ -800,9 +801,10 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{6237, 6237}, // pg_publication_namespace (M0106-0010 step 3bx)
 		{6106, 6106}, // pg_publication_rel (M0106-0010 step 3by)
 		{3541, 3541}, // pg_range (M0106-0010 step 3bz)
+		{2224, 2224}, // pg_sequence (M0106-0010 step 3cb)
 		{6003, 6003}, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		{6101, 6101}, // pg_publication_rel
-		{6102, 6102}, // pg_sequence
+		{6102, 6102}, // pg_subscription_rel (stale comment was "pg_sequence" — true pg_sequence OID is 2224, mapped above)
 		{6137, 6137}, // pg_transform
 		{6239, 6239}, // pg_authid (shared but also local copy sometimes)
 		{6245, 6245}, // pg_statistic_ext_data
@@ -859,6 +861,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		6116, // pg_publication_rel_prpubid_index (Step 3by)
 		3542, // pg_range_rngtypid_index (Step 3bz)
 		2228, // pg_range_rngmultitypid_index (Step 3bz)
+		5002, // pg_sequence_seqrelid_index (Step 3cb)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -920,6 +923,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		6116, // pg_publication_rel_prpubid_index (Step 3by)
 		3542, // pg_range_rngtypid_index (Step 3bz)
 		2228, // pg_range_rngmultitypid_index (Step 3bz)
+		5002, // pg_sequence_seqrelid_index (Step 3cb)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2528,6 +2532,18 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_range heap OID 3541. attnum 3 = rngmultitypid. Without this
 		// entry RelationIdGetRelation(2228) FATALs.
 		entry(2228, 3541, []int16{3}, []uint32{oidOps}, []uint32{0}, true, false), // pg_range_rngmultitypid_index
+		// M0106-0010 Step 3cb: pg_sequence_seqrelid_index.
+		//   postgres/src/include/catalog/pg_sequence.h:42
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_sequence_seqrelid_index, 5002,
+		//       SequenceRelidIndexId, pg_sequence, btree(seqrelid oid_ops));
+		//   MAKE_SYSCACHE(SEQRELID, pg_sequence_seqrelid_index, 32);
+		// pg_sequence attnums (pg_sequence_d.h): 1=seqrelid, 2=seqtypid,
+		// 3=seqstart, 4=seqincrement, 5=seqmax, 6=seqmin, 7=seqcache,
+		// 8=seqcycle. UNIQUE PRIMARY (DECLARE_UNIQUE_INDEX_PKEY) single
+		// oid_ops key (no collation) over pg_sequence heap OID 2224 (Step
+		// 3cb nailed local rel). Without this entry RelationIdGetRelation(5002)
+		// FATALs.
+		entry(5002, 2224, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_sequence_seqrelid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

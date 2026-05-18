@@ -356,6 +356,18 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// rngmultitypid, rngcollation, rngsubopc, rngcanonical, rngsubdiff).
 	// pg_range has no `oid` system column — attnums start at 1.
 	{3541, "pg_range", 83, 'r', 7, false, pgRangeAttrs()},
+	// M0106-0010 step 3cb: pg_sequence is opened during PG-standby boot once
+	// Step 3ca cleared the pg_replication_origin family. Without a pg_class
+	// row, `RelationBuildDesc(2224) → ScanPgRelation(2224)` returns NULL and
+	// the backend FATALs with `could not open relation with OID 2224`.
+	// RelType=83 is safe because pg_sequence is not formrdesc'd (no
+	// `SequenceRelation_Rowtype_Id` constant in PG18 headers). Schema per
+	// `postgres/src/include/catalog/pg_sequence.h` (PG18,
+	// SequenceRelationId == 2224). 8 columns total, all fixed-width NOT NULL
+	// (seqrelid oid, seqtypid oid, seqstart/seqincrement/seqmax/seqmin/seqcache
+	// int8, seqcycle bool). pg_sequence has no `oid` system column — attnums
+	// start at 1 = seqrelid.
+	{2224, "pg_sequence", 83, 'r', 8, false, pgSequenceAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -796,6 +808,17 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// MAKE_SYSCACHE(RANGEMULTIRANGE, pg_range_rngmultitypid_index, 4).
 		// Without this entry RelationIdGetRelation(2228) FATALs.
 		{2228, "pg_range_rngmultitypid_index"},
+		// M0106-0010 Step 3cb: pg_sequence_seqrelid_index. PG18
+		// `postgres/src/include/catalog/pg_sequence.h:42` declares
+		// `SequenceRelidIndexId = 5002` as UNIQUE PRIMARY KEY on
+		// btree(seqrelid oid_ops). Heap OID 2224 (pg_sequence) is the
+		// nailed local rel above (Step 3cb). Backs
+		// MAKE_SYSCACHE(SEQRELID, pg_sequence_seqrelid_index, 32). Without
+		// this entry RelationIdGetRelation(5002) FATALs because no
+		// pg_class row gets seeded; flattenRels derives RelNatts=1 via
+		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+		// relnatts/indnatts check (relcache.c:1492).
+		{5002, "pg_sequence_seqrelid_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1678,6 +1701,27 @@ func pgRangeAttrs() []nailedAttr {
 		{Name: "rngsubopc", TypeOID: 26, Num: 5, Len: 4, NotNull: true},      // oid → pg_opclass
 		{Name: "rngcanonical", TypeOID: 24, Num: 6, Len: 4, NotNull: true},   // regproc → pg_proc (LOOKUP_OPT)
 		{Name: "rngsubdiff", TypeOID: 24, Num: 7, Len: 4, NotNull: true},     // regproc → pg_proc (LOOKUP_OPT)
+	}
+}
+
+// pgSequenceAttrs defines the 8-column PG18 pg_sequence schema. PG
+// `RelationBuildDesc(2224) → ScanPgRelation(2224)` looks up these rows
+// during standby startup; without them the backend FATALs with
+// `could not open relation with OID 2224`. Sourced verbatim from
+// `postgres/src/include/catalog/pg_sequence.h` (PG18,
+// SequenceRelationId == 2224). pg_sequence has no `oid` system column —
+// attnums start at 1 = seqrelid. All 8 columns are fixed-width and
+// NOT NULL (oid 4B, int8 8B, bool 1B). M0106-0010 step 3cb.
+func pgSequenceAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "seqrelid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},     // oid → pg_class (BKI_LOOKUP)
+		{Name: "seqtypid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},     // oid → pg_type  (BKI_LOOKUP)
+		{Name: "seqstart", TypeOID: 20, Num: 3, Len: 8, NotNull: true},     // int8
+		{Name: "seqincrement", TypeOID: 20, Num: 4, Len: 8, NotNull: true}, // int8
+		{Name: "seqmax", TypeOID: 20, Num: 5, Len: 8, NotNull: true},       // int8
+		{Name: "seqmin", TypeOID: 20, Num: 6, Len: 8, NotNull: true},       // int8
+		{Name: "seqcache", TypeOID: 20, Num: 7, Len: 8, NotNull: true},     // int8
+		{Name: "seqcycle", TypeOID: 16, Num: 8, Len: 1, NotNull: true},     // bool
 	}
 }
 
