@@ -7158,6 +7158,87 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         the pg_subscription / pg_subscription_rel / pg_statistic /
         pg_statistic_ext catalog territory (Step 3cc). Design:
         `docs/design/0106-0010-step3cb-pg-sequence-nailed-rel.md`.
+      - Step 3cc LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 3429` PG-standby boot blocker that surfaces
+        after Step 3cb seeded the pg_sequence family. OID 3429 is
+        `pg_statistic_ext_data` per
+        `postgres/src/include/catalog/pg_statistic_ext_data.h:31`
+        (`CATALOG(pg_statistic_ext_data,3429,StatisticExtDataRelationId)`).
+        Per-database (non-shared) catalog — follows the Step 3cb
+        pg_sequence template. Family-complete seed in one step: heap 3429
+        + its single declared **composite** UNIQUE PRIMARY index 3433
+        (pg_statistic_ext_data_stxoid_inh_index, btree on
+        (stxoid oid_ops, stxdinherit bool_ops), backs
+        `MAKE_SYSCACHE(STATEXTDATASTXOID, …, 4)`). **First non-single-column
+        nailed index seeded in M0106-0010** — exercises the multi-column
+        IndKey/IndClass slot.
+        (a) `pgStatisticExtDataAttrs()` (relcache_init.go) returns the
+        6-column PG18 schema (verified against PostgreSQL 18.3 runtime
+        pg_attribute lookup): 2 fixed NOT NULL (stxoid oid TypeOID 26
+        Len 4, stxdinherit bool TypeOID 16 Len 1) + 4 CATALOG_VARLEN
+        nullable (stxdndistinct pg_ndistinct TypeOID 3361,
+        stxddependencies pg_dependencies TypeOID 3402, stxdmcv
+        pg_mcv_list TypeOID 5017, stxdexpr _pg_statistic TypeOID 10028;
+        all Len -1). pg_statistic_ext_data has **no `oid` system
+        column** — attnums start at 1 = stxoid. `_pg_statistic` (10028)
+        is in the FirstGenbkiObjectId range (10000..11999), stable
+        across PG18 installs. RelType=83 is safe (no
+        `StatisticExtDataRelation_Rowtype_Id` in PG18 headers).
+        (b) `nailedLocalRels` (relcache_init.go) heap list gains
+        `{3429, "pg_statistic_ext_data", 83, 'r', 6, false, pgStatisticExtDataAttrs()}`
+        after the Step 3cb 2224 entry; idxSpec list gains
+        `{3433, "pg_statistic_ext_data_stxoid_inh_index"}` after the
+        Step 3cb 5002 entry.
+        (c) `pgIndexInitialEntries` local section (initdb.go) gains
+        `entry(3433, 3429, []int16{1, 2}, []uint32{oidOps, boolOps},
+        []uint32{0, 0}, true, true)` (composite UNIQUE PRIMARY) after
+        the Step 3cb 5002 entry. New `boolOps uint32 = 1984` const
+        (btree bool_ops, matches `boolBtreeOps` used elsewhere).
+        (d) `bootstrapMappedLocalCatalogHeaps` oid list +
+        `localRelMap` in `bootstrapPostgresDatabase` both gain `3429`
+        / `{3429, 3429}` after the Step 3cb 2224 entries.
+        (e) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain `3433` after the Step 3cb
+        5002 entry. Empty-btree placeholder is sufficient because
+        pg_statistic_ext_data is unpopulated at bootstrap
+        (extended-statistics data is only written when ANALYZE runs
+        against a CREATE STATISTICS object).
+        (f) `pgTypeAlignChar` (initdb.go) extended: case 'i' gains
+        3361/3402/5017; case 'd' gains 10028 (typalign='d' because
+        _pg_statistic's element rowtype pg_statistic carries
+        int8/float8-aligned columns). `pgTypeStorageChar` extended:
+        case 'x' (EXTENDED) gains 3361/3402/5017/10028 so the nailed
+        pg_attribute row for stxdndistinct/stxddependencies/stxdmcv/
+        stxdexpr emits attstorage='x' instead of the wrong 'p' default
+        (silent corruption hazard the moment any row gets written).
+        Regression pins:
+        `TestNailedLocalRelsContainsPgStatisticExtData`,
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgStatisticExtData`,
+        `TestPgStatisticExtDataStxoidInhIndexInitialEntry`,
+        `TestNailedLocalRelsContainsPgStatisticExtDataStxoidInhIndex`,
+        `TestPgStatisticExtDataAttrsTypeOIDsMatchPG18`,
+        `TestPgTypeAlignAndStorageFor_pg_statisticArray` in
+        `internal/initdb/pg_statistic_ext_data_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended
+        with `3433:{1,2}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3433;
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        extended with 3429 (strict list guard).
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgStatisticExtData|TestBootstrapMappedLocalCatalogHeapsIncludesPgStatisticExtData|TestPgStatisticExtDataStxoidInhIndexInitialEntry|TestNailedLocalRelsContainsPgStatisticExtDataStxoidInhIndex|TestPgStatisticExtDataAttrsTypeOIDsMatchPG18|TestPgTypeAlignAndStorageFor_pg_statisticArray|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3cb (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. With the heap
+        (3429) + composite PKEY (3433) both seeded, the
+        pg_statistic_ext_data family is fully wired. Next anticipated
+        blocker on E2E re-run lies in the pg_subscription /
+        pg_subscription_rel / pg_statistic / pg_statistic_ext catalog
+        territory (Step 3cd). Design:
+        `docs/design/0106-0010-step3cc-pg-statistic-ext-data-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

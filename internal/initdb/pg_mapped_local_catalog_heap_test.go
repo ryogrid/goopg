@@ -55,6 +55,7 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 		6106, // pg_publication_rel (M0106-0010 step 3by)
 		3541, // pg_range (M0106-0010 step 3bz)
 		2224, // pg_sequence (M0106-0010 step 3cb)
+		3429, // pg_statistic_ext_data (M0106-0010 step 3cc)
 		6003, 6101, 6102, 6137,
 		6245, 9400,
 	}

@@ -460,6 +460,7 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		6106, // pg_publication_rel (M0106-0010 step 3by)
 		3541, // pg_range (M0106-0010 step 3bz)
 		2224, // pg_sequence (M0106-0010 step 3cb)
+		3429, // pg_statistic_ext_data (M0106-0010 step 3cc)
 		6003, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		6101, // pg_publication_rel
 		6102, // pg_subscription_rel (stale comment was "pg_sequence" — true pg_sequence OID is 2224, seeded above)
@@ -802,6 +803,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{6106, 6106}, // pg_publication_rel (M0106-0010 step 3by)
 		{3541, 3541}, // pg_range (M0106-0010 step 3bz)
 		{2224, 2224}, // pg_sequence (M0106-0010 step 3cb)
+		{3429, 3429}, // pg_statistic_ext_data (M0106-0010 step 3cc)
 		{6003, 6003}, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		{6101, 6101}, // pg_publication_rel
 		{6102, 6102}, // pg_subscription_rel (stale comment was "pg_sequence" — true pg_sequence OID is 2224, mapped above)
@@ -862,6 +864,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3542, // pg_range_rngtypid_index (Step 3bz)
 		2228, // pg_range_rngmultitypid_index (Step 3bz)
 		5002, // pg_sequence_seqrelid_index (Step 3cb)
+		3433, // pg_statistic_ext_data_stxoid_inh_index (Step 3cc)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -924,6 +927,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3542, // pg_range_rngtypid_index (Step 3bz)
 		2228, // pg_range_rngmultitypid_index (Step 3bz)
 		5002, // pg_sequence_seqrelid_index (Step 3cb)
+		3433, // pg_statistic_ext_data_stxoid_inh_index (Step 3cc)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -1745,6 +1749,7 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		textOps            uint32 = 3126
 		charOps            uint32 = 1985
 		oidvectorOps       uint32 = 1987
+		boolOps            uint32 = 1984
 		float4Ops          uint32 = 10012 // btree float4_ops (postgres.bki: am=403 / btree)
 		cCollation         uint32 = 950   // C_COLLATION_OID — name/text use C in catalogs
 	)
@@ -2544,6 +2549,23 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// 3cb nailed local rel). Without this entry RelationIdGetRelation(5002)
 		// FATALs.
 		entry(5002, 2224, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_sequence_seqrelid_index
+		// M0106-0010 Step 3cc: pg_statistic_ext_data_stxoid_inh_index.
+		//   postgres/src/include/catalog/pg_statistic_ext_data.h:57
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_ext_data_stxoid_inh_index, 3433,
+		//       StatisticExtDataStxoidInhIndexId, pg_statistic_ext_data,
+		//       btree(stxoid oid_ops, stxdinherit bool_ops));
+		//   MAKE_SYSCACHE(STATEXTDATASTXOID,
+		//     pg_statistic_ext_data_stxoid_inh_index, 4);
+		// pg_statistic_ext_data attnums (pg_statistic_ext_data_d.h):
+		// 1=stxoid, 2=stxdinherit, 3=stxdndistinct, 4=stxddependencies,
+		// 5=stxdmcv, 6=stxdexpr. UNIQUE PRIMARY (DECLARE_UNIQUE_INDEX_PKEY)
+		// composite (2-column) key: stxoid oid_ops + stxdinherit bool_ops
+		// (no collation on either column) over pg_statistic_ext_data heap
+		// OID 3429 (Step 3cc nailed local rel). First non-single-column
+		// nailed index seeded in M0106-0010 — exercises the multi-column
+		// IndKey/IndClass slot. Without this entry RelationIdGetRelation(3433)
+		// FATALs.
+		entry(3433, 3429, []int16{1, 2}, []uint32{oidOps, boolOps}, []uint32{0, 0}, true, true), // pg_statistic_ext_data_stxoid_inh_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
@@ -3056,9 +3078,13 @@ func pgTypeAlignChar(oid uint32) string {
 		return "c"
 	case 21:
 		return "s"
-	case 23, 26, 700, 194, 1009, 1034, 2277, 24, 325, 269, 30, 22, 1002, 1028:
+	case 23, 26, 700, 194, 1009, 1034, 2277, 24, 325, 269, 30, 22, 1002, 1028, 3361, 3402, 5017:
 		return "i"
-	case 20, 701:
+	case 20, 701, 10028:
+		// PG18 runtime pg_type lookup: _pg_statistic (10028) has typalign='d'
+		// because its element rowtype pg_statistic carries int8/float8-aligned
+		// columns (stanullfrac, stadistinct float4 padded to 8-byte; stavalues
+		// anyarray). M0106-0010 Step 3cc.
 		return "d"
 	}
 	return "i"
@@ -3066,7 +3092,13 @@ func pgTypeAlignChar(oid uint32) string {
 
 func pgTypeStorageChar(oid uint32) string {
 	switch oid {
-	case 25, 1043, 1042, 194, 1009, 1034, 2277, 1002, 1028:
+	case 25, 1043, 1042, 194, 1009, 1034, 2277, 1002, 1028, 3361, 3402, 5017, 10028:
+		// M0106-0010 Step 3cc: pg_ndistinct (3361) / pg_dependencies (3402) /
+		// pg_mcv_list (5017) / _pg_statistic (10028) all carry typstorage='x'
+		// (EXTENDED) per PG18 runtime pg_type lookup. Without this entry the
+		// nailed pg_attribute row for stxdndistinct/stxddependencies/stxdmcv/
+		// stxdexpr would emit attstorage='p' (PLAIN), confusing PG-standby's
+		// TOAST machinery the moment any pg_statistic_ext_data row is written.
 		return "x"
 	}
 	return "p"

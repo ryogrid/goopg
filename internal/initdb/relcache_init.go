@@ -368,6 +368,19 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// int8, seqcycle bool). pg_sequence has no `oid` system column — attnums
 	// start at 1 = seqrelid.
 	{2224, "pg_sequence", 83, 'r', 8, false, pgSequenceAttrs()},
+	// M0106-0010 step 3cc: pg_statistic_ext_data is opened during PG-standby
+	// boot once Step 3cb cleared the pg_sequence family. Without a pg_class
+	// row, `RelationBuildDesc(3429) → ScanPgRelation(3429)` returns NULL and
+	// the backend FATALs with `could not open relation with OID 3429`.
+	// RelType=83 is safe because pg_statistic_ext_data is not formrdesc'd
+	// (no `StatisticExtDataRelation_Rowtype_Id` constant in PG18 headers).
+	// Schema per `postgres/src/include/catalog/pg_statistic_ext_data.h`
+	// (PG18, StatisticExtDataRelationId == 3429). 6 columns total: 2 fixed
+	// NOT NULL (stxoid oid, stxdinherit bool) + 4 CATALOG_VARLEN nullable
+	// (stxdndistinct pg_ndistinct, stxddependencies pg_dependencies,
+	// stxdmcv pg_mcv_list, stxdexpr _pg_statistic). pg_statistic_ext_data
+	// has no `oid` system column — attnums start at 1 = stxoid.
+	{3429, "pg_statistic_ext_data", 83, 'r', 6, false, pgStatisticExtDataAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -819,6 +832,17 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
 		{5002, "pg_sequence_seqrelid_index"},
+		// M0106-0010 Step 3cc: pg_statistic_ext_data_stxoid_inh_index. PG18
+		// `postgres/src/include/catalog/pg_statistic_ext_data.h:57` declares
+		// `StatisticExtDataStxoidInhIndexId = 3433` as UNIQUE PRIMARY KEY on
+		// btree(stxoid oid_ops, stxdinherit bool_ops). Composite key. Heap
+		// OID 3429 (pg_statistic_ext_data) is the nailed local rel above
+		// (Step 3cc). Backs MAKE_SYSCACHE(STATEXTDATASTXOID,
+		// pg_statistic_ext_data_stxoid_inh_index, 4). Without this entry
+		// RelationIdGetRelation(3433) FATALs; flattenRels derives RelNatts=2
+		// via pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+		// relnatts/indnatts check (relcache.c:1492).
+		{3433, "pg_statistic_ext_data_stxoid_inh_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1722,6 +1746,37 @@ func pgSequenceAttrs() []nailedAttr {
 		{Name: "seqmin", TypeOID: 20, Num: 6, Len: 8, NotNull: true},       // int8
 		{Name: "seqcache", TypeOID: 20, Num: 7, Len: 8, NotNull: true},     // int8
 		{Name: "seqcycle", TypeOID: 16, Num: 8, Len: 1, NotNull: true},     // bool
+	}
+}
+
+
+// pgStatisticExtDataAttrs returns the 6-column PG18 schema for
+// `pg_statistic_ext_data` (OID 3429,
+// `postgres/src/include/catalog/pg_statistic_ext_data.h:31`,
+// `StatisticExtDataRelationId == 3429`). Two fixed-width NOT NULL leading
+// columns followed by four CATALOG_VARLEN nullable columns. PG18 row-type
+// OIDs from `_pg_statistic_ext_data_d.h` and runtime pg_type lookup against
+// PostgreSQL 18.3 confirm the type IDs verbatim:
+//
+//   1 stxoid          oid             (TypeOID 26,    Len 4,  NotNull)
+//   2 stxdinherit     bool            (TypeOID 16,    Len 1,  NotNull)
+//   3 stxdndistinct   pg_ndistinct    (TypeOID 3361,  Len -1, nullable)
+//   4 stxddependencies pg_dependencies(TypeOID 3402,  Len -1, nullable)
+//   5 stxdmcv         pg_mcv_list     (TypeOID 5017,  Len -1, nullable)
+//   6 stxdexpr        _pg_statistic   (TypeOID 10028, Len -1, nullable)
+//
+// pg_statistic_ext_data has no `oid` system column — attnums start at 1.
+// The `_pg_statistic` (array of pg_statistic rowtype) OID is 10028, in the
+// FirstGenbkiObjectId range (10000..11999) and stable across PG18 installs
+// because genbki assigns rowtype/array OIDs deterministically.
+func pgStatisticExtDataAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "stxoid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},          // oid → pg_statistic_ext (BKI_LOOKUP)
+		{Name: "stxdinherit", TypeOID: 16, Num: 2, Len: 1, NotNull: true},     // bool
+		{Name: "stxdndistinct", TypeOID: 3361, Num: 3, Len: -1, NotNull: false},   // pg_ndistinct (varlena)
+		{Name: "stxddependencies", TypeOID: 3402, Num: 4, Len: -1, NotNull: false}, // pg_dependencies (varlena)
+		{Name: "stxdmcv", TypeOID: 5017, Num: 5, Len: -1, NotNull: false},     // pg_mcv_list (varlena)
+		{Name: "stxdexpr", TypeOID: 10028, Num: 6, Len: -1, NotNull: false},   // _pg_statistic array (varlena)
 	}
 }
 
