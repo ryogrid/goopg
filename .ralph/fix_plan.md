@@ -9750,7 +9750,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3cq-pg-type-heap-canonical-typalign.md`,
         `0106-0010-step3cz-pg-type-oid-index-populated.md`.
 
-- [ ] **M0106-0010 batched-16** (bootstrap-procedure task 16)
+- [x] **M0106-0010 batched-16** (bootstrap-procedure task 16)
       - Summary: Seed `pg_operator` (799 rows) heap + indexes (2688, 2689).
       - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
       - Files: `internal/initdb/pg_operator_bootstrap.go` (new),

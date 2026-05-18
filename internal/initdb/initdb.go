@@ -338,6 +338,19 @@ func Init(opts Options) error {
 	if err := bootstrapPgProcOidIndex(abs, pgProcTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_proc_oid_index: %w", err)
 	}
+	// M0106-0010 batched-16: overwrite base/{1,5}/2617 with all 799
+	// pg_operator rows so PG's OPEROID/OPERNAMENSP syscaches resolve
+	// operator lookups during planning and expression compilation.
+	pgOperatorTIDs, err := bootstrapPgOperatorTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_operator tuples: %w", err)
+	}
+	if err := bootstrapPgOperatorOidIndex(abs, pgOperatorTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_operator_oid_index: %w", err)
+	}
+	if err := bootstrapPgOperatorOprnameIndex(abs, pgOperatorTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_operator_oprname_l_r_n_index: %w", err)
+	}
 	// M0106-0010 step 3b: write pg_opclass rows so PG's
 	// RelationInitIndexAccessInfo → SearchSysCache1(CLAOID, ...)
 	// resolves every opclass referenced by a nailed index's

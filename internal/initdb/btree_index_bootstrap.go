@@ -1654,3 +1654,138 @@ func bootstrapPgAuthidIndexes(dataDir string, entries []pgAuthidEntry) error {
 	}
 	return nil
 }
+
+// pgBuildIndexTupleNameOidOidOidKey builds an 88-byte IndexTuple for a
+// 4-column (name_ops, oid_ops, oid_ops, oid_ops) index.  Layout:
+//
+//	[0..7]   IndexTupleData header (ItemPointerData + t_info)
+//	[8..71]  NameData (64 bytes, zero-padded)
+//	[72..75] oid1
+//	[76..79] oid2
+//	[80..83] oid3
+//	[84..87] MAXALIGN padding (already zero)
+func pgBuildIndexTupleNameOidOidOidKey(heapBlk uint32, heapOff uint16, name string, oid1, oid2, oid3 uint32) []byte {
+	const (
+		nameDataLen = 64
+		hoff        = 8
+		size        = 88 // MAXALIGN(8 + 64 + 4 + 4 + 4) = MAXALIGN(84) = 88
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	n := len(name)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff:hoff+n], name[:n])
+	le.PutUint32(out[hoff+nameDataLen:hoff+nameDataLen+4], oid1)
+	le.PutUint32(out[hoff+nameDataLen+4:hoff+nameDataLen+8], oid2)
+	le.PutUint32(out[hoff+nameDataLen+8:hoff+nameDataLen+12], oid3)
+	return out
+}
+
+// bootstrapPgOperatorOidIndex (M0106-0010 batched-16) overwrites the empty
+// btree placeholder at base/{1,5}/2688 (pg_operator_oid_index, PKEY) with a
+// populated multi-page btree carrying one oid-keyed IndexTuple per pg_operator
+// row. Required so PG's SearchSysCache1(OPEROID, ...) resolves operator OIDs.
+func bootstrapPgOperatorOidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type indexed struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(tids))
+	for oid, tid := range tids {
+		items = append(items, indexed{oid: oid, block: tid.Block, off: tid.Offset})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
+	if err != nil {
+		return fmt.Errorf("pg_operator_oid_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2688, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_operator_oid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgOperatorOprnameIndex (M0106-0010 batched-16) overwrites the
+// empty btree placeholder at base/{1,5}/2689
+// (pg_operator_oprname_l_r_n_index, UNIQUE) with a populated multi-page btree
+// carrying one (oprname,oprleft,oprright,oprnamespace)-keyed IndexTuple per
+// pg_operator row. Required for the OPERNAMENSP syscache.
+func bootstrapPgOperatorOprnameIndex(dataDir string, tids map[uint32]heapTID) error {
+	entries := pgOperatorInitialEntries()
+	type indexed struct {
+		name      string
+		leftType  uint32
+		rightType uint32
+		namespace uint32
+		block     uint32
+		off       uint16
+	}
+	items := make([]indexed, 0, len(entries))
+	for _, e := range entries {
+		tid, ok := tids[e.OID]
+		if !ok {
+			return fmt.Errorf("pg_operator_oprname_l_r_n_index: no heap TID for operator OID %d", e.OID)
+		}
+		items = append(items, indexed{
+			name:      e.Name,
+			leftType:  e.LeftType,
+			rightType: e.RightType,
+			namespace: e.Namespace,
+			block:     tid.Block,
+			off:       tid.Offset,
+		})
+	}
+	// Sort by (oprname, oprleft, oprright, oprnamespace) — matches name_ops
+	// C-locale comparison which is memcmp on the 64-byte zero-padded NameData.
+	// For pure ASCII operator names Go's string < is equivalent.
+	sort.Slice(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.name != b.name {
+			return a.name < b.name
+		}
+		if a.leftType != b.leftType {
+			return a.leftType < b.leftType
+		}
+		if a.rightType != b.rightType {
+			return a.rightType < b.rightType
+		}
+		return a.namespace < b.namespace
+	})
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleNameOidOidOidKey(it.block, it.off, it.name, it.leftType, it.rightType, it.namespace)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 88, 4)
+	if err != nil {
+		return fmt.Errorf("pg_operator_oprname_l_r_n_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2689, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_operator_oprname_l_r_n_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
