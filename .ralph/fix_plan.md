@@ -8071,6 +8071,81 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/initdb/` PASS; standby log shows the FATAL
         location explicitly (`tupdesc.c:105`). Design:
         `docs/design/0106-0010-step3cq-pg-type-heap-canonical-typalign.md`.
+      - Step 3cq PROPER LANDED 2026-05-18. New file
+        `internal/initdb/pg_type_bootstrap.go` adds:
+        (a) `pgTypeColDefs()` — 32-column descriptor mirroring PG18
+        `FormData_pg_type`. Fixed part = 29 columns + 3
+        CATALOG_VARLEN trailers (typdefaultbin / typdefault /
+        typacl, emitted NULL via the Step 3i null-bitmap path).
+        Layout verified to place typalign at struct offset 128
+        (matching the byte PG's `Form_pg_type *` cast reads in
+        TupleDescInitEntry, tupdesc.c:902).
+        (b) `pgTypeEntry` struct + `pgTypeCanonical(oid)` switch
+        with PG18-authoritative metadata for 33 OIDs sourced
+        verbatim from `postgres/src/include/catalog/pg_type.dat`:
+        16/17/18/19/20/21/22/23/24/25/26/27/28/29/30 (core),
+        194 (pg_node_tree), 269/325 (AM handlers),
+        700/701/1021 (floats + _float4), 1002/1009/1028 (char/
+        text/oid arrays), 1033/1034 (aclitem/_aclitem),
+        1042/1043 (bpchar/varchar), 1184/1185 (timestamptz
+        scalar+array), 2277 (anyarray), 2281 (internal),
+        3220 (pg_lsn), 3361/3402/5017 (pg_ndistinct/dependencies/
+        mcv_list), 10028 (_pg_statistic).
+        (c) `pgTypeOIDsUsedByNailedAttrs()` walks
+        `nailedSharedRels + nailedLocalRels` via
+        `pgAttrEntriesForRel`; returns the deduplicated sorted
+        slice of TypeOIDs — the minimum set PG18 will SysCache-
+        look-up during early standby boot.
+        (d) `pgTypeInitialEntries()` composes (c) with (b).
+        (e) `pgTypeRow(e)` encodes one pgTypeEntry into a
+        32-column `executor.Row`. Optional regproc columns and
+        the three CATALOG_VARLEN trailers are zero/NULL — only
+        the load-bearing fields (typname/typlen/typbyval/typtype/
+        typcategory/typalign/typstorage) are populated.
+        (f) `bootstrapPgTypeTuples(dataDir)` calls
+        `writeMultiPageHeapRows(dataDir, "1247", cols, rows)` to
+        overwrite `base/1/1247` and `base/5/1247` (same
+        idempotent overwrite pattern as
+        `bootstrapPgAttributeTuples`). `internal/initdb/initdb.go::
+        Init` calls `bootstrapPgTypeTuples(abs)` immediately
+        after `bootstrapPgAttributeTuples`, so the PG-canonical
+        layout overwrites the v0 layout that
+        `bootstrapSystemCatalogs` wrote earlier.
+        Regression pins (all new, in
+        `internal/initdb/pg_type_bootstrap_test.go`):
+        `TestPgTypeColDefsLayoutMatchesPG18` (encodes int4/OID 23,
+        asserts byte 128 == 'i', byte 129 == 'p');
+        `TestPgTypeInitialEntriesCoverNailedAttrTypeOIDs` (strict
+        guard — every TypeOID a nailedAttr references must have
+        a `pgTypeCanonical` entry; future column additions that
+        reference new OIDs fail loudly);
+        `TestPgTypeRowCanonicalTypalignByte` (every entry encoded
+        via `EncodeRowPG` has `payload[128] == e.Align` and
+        `payload[129] == e.Storage`);
+        `TestBootstrapPgTypeTuplesWritesCanonicalHeap` (end-to-end
+        — invokes `bootstrapPgTypeTuples` in a temp data dir,
+        walks `base/1/1247` + `base/5/1247` line-pointer by line-
+        pointer, asserts byte 128 ∈ {c,s,i,d} and byte 129 ∈
+        {p,e,x,m} for every tuple).
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgType|TestBootstrapPgType' ./internal/initdb/` PASS
+        (5/5 new tests); `go test -count=1 ./internal/initdb/`
+        — 15 baseline failures (prior 14 +
+        `TestBootstrappedPGTypeRowsReadable`, which now fails
+        because goopg-v0 `catalog.DecodePGTypeRow` cannot parse
+        the PG-canonical heap — joins the existing
+        `TestBootstrappedPGClassRowsReadable` /
+        `TestBootstrappedPGAttributeRowsReadable` failures from
+        the same family in Steps 3i/3w). Cross-package smoke
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
+        PASS. Design:
+        `docs/design/0106-0010-step3cq-pg-type-heap-canonical-typalign.md`
+        (updated with implementation section). Next blocker (Step
+        3cr): one-shot `FATAL: could not open file "base/5/2672"`
+        (pg_database_oid_index, shared) raised by the
+        autovacuum-launcher-equivalent first backend after Step
+        3cq lets user backends past InitPostgres.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

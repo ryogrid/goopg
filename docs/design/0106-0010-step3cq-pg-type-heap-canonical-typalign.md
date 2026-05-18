@@ -2,7 +2,7 @@
 
 ## Status
 
-Diagnostic / root-cause loop. No PG-canonical pg_type rewrite yet.
+Accepted. Step 3cq proper landed 2026-05-18 — `bootstrapPgTypeTuples` now overwrites `base/{1,5}/1247` with PG-canonical `FormData_pg_type` rows for every TypeOID referenced by any nailedRel attribute. The diagnostic root-cause sections below (3cq diagnostic loop) explain why the rewrite is needed; the implementation section at the bottom records what landed.
 
 This loop:
 
@@ -204,3 +204,79 @@ next blocker (likely the `base/5/2672` follow-up or a
 - Modified: `.ralph/fix_plan.md` — records partial progress + new
   Step 3cq scope.
 - Modified: `docs/design/README.md` — index entry for this doc.
+
+## Implementation (Step 3cq proper, landed 2026-05-18)
+
+- New: `internal/initdb/pg_type_bootstrap.go`
+  - `pgTypeColDefs()` — 32-column descriptor mirroring PG18
+    `FormData_pg_type`. Fixed-part columns (29) + 3 CATALOG_VARLEN
+    trailers (typdefaultbin / typdefault / typacl), all emitted NULL
+    via the Step 3i null-bitmap path. Layout verified to place
+    typalign at struct offset 128.
+  - `pgTypeEntry` — fixed-part metadata struct
+    `{OID, Name, Len, ByVal, Type, Category, Align, Storage}`.
+  - `pgTypeCanonical(oid)` — authoritative typname/typlen/typbyval/
+    typtype/typcategory/typalign/typstorage map for every OID that
+    any nailedRel attribute can reference. Sourced verbatim from
+    `postgres/src/include/catalog/pg_type.dat`. Includes 33 OIDs
+    spanning core scalars (16/17/18/19/20/21/22/23/24/25/26/27/28/29/30),
+    pseudo (2277/2281), pg_node_tree (194), AM handlers (269/325),
+    floats (700/701, 1021), char/text/oid arrays (1002/1009/1028),
+    aclitem (1033/1034), bpchar/varchar (1042/1043), timestamptz
+    (1184/1185), pg_lsn (3220), extended statistics (3361/3402/5017),
+    and `_pg_statistic` (10028).
+  - `pgTypeOIDsUsedByNailedAttrs()` — walks
+    `nailedSharedRels + nailedLocalRels` via
+    `pgAttrEntriesForRel` and returns a deduplicated, sorted slice
+    of TypeOIDs. Provides the minimum set PG18 will SysCache-look-up
+    during early standby boot.
+  - `pgTypeInitialEntries()` — composes pgTypeOIDsUsedByNailedAttrs
+    with pgTypeCanonical and emits one pgTypeEntry per OID.
+  - `pgTypeRow(e)` — encodes one pgTypeEntry into a 32-column
+    `executor.Row` matching `pgTypeColDefs()`. Optional regproc and
+    varlena columns are zero/NULL — only the load-bearing fixed
+    fields (typname/typlen/typbyval/typtype/typcategory/typalign/
+    typstorage) are populated.
+  - `bootstrapPgTypeTuples(dataDir)` — uses
+    `writeMultiPageHeapRows(dataDir, "1247", pgTypeColDefs(), rows)`
+    to overwrite `base/1/1247` and `base/5/1247` with canonical
+    heap pages. Same idempotent overwrite pattern as
+    `bootstrapPgAttributeTuples`.
+
+- Modified: `internal/initdb/initdb.go::Init` — calls
+  `bootstrapPgTypeTuples(abs)` immediately after
+  `bootstrapPgAttributeTuples`. This sits AFTER
+  `bootstrapSystemCatalogs` (which writes goopg-v0-encoded pg_type
+  rows for the goopg planner) so the PG-canonical layout overwrites
+  the v0 layout. Must run before any pg_type-index bootstrap so the
+  index TIDs would point at the canonical heap.
+
+### Regression coverage (landed)
+
+- `TestPgTypeColDefsLayoutMatchesPG18` — encodes an int4 (OID 23)
+  row and asserts byte 128 == 'i' and byte 129 == 'p'.
+- `TestPgTypeInitialEntriesCoverNailedAttrTypeOIDs` — every TypeOID
+  in any nailedAttr must have a `pgTypeCanonical` entry; strict
+  guard against future regressions.
+- `TestPgTypeRowCanonicalTypalignByte` — every entry from
+  `pgTypeInitialEntries()` encoded via `executor.EncodeRowPG` has
+  `payload[128] == e.Align` and `payload[129] == e.Storage`.
+- `TestBootstrapPgTypeTuplesWritesCanonicalHeap` — end-to-end:
+  invokes `bootstrapPgTypeTuples` in a temp data dir, walks
+  `base/1/1247` + `base/5/1247` line-pointer-by-line-pointer, and
+  asserts every tuple's data byte 128 is `c/s/i/d` and byte 129
+  is `p/e/x/m`.
+
+### Verification
+
+- `go build ./...` PASS.
+- `go test -count=1 -run 'TestPgType|TestBootstrapPgType' ./internal/initdb/` PASS (5/5 new tests).
+- `go test -count=1 ./internal/initdb/` — 15 pre-existing baseline
+  failures (the prior 14 + `TestBootstrappedPGTypeRowsReadable`,
+  which fails because the goopg-v0 `catalog.DecodePGTypeRow` cannot
+  parse the new PG-canonical heap, joining the existing
+  `TestBootstrappedPGClassRowsReadable` /
+  `TestBootstrappedPGAttributeRowsReadable` failures that fell
+  into the same family in Steps 3i/3w).
+- `go test -count=1 ./internal/executor/ ./internal/server/
+  ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS.

@@ -202,6 +202,17 @@ func Init(opts Options) error {
 	if err != nil {
 		return fmt.Errorf("goopg init: pg_attribute tuples: %w", err)
 	}
+	// M0106-0010 step 3cq: overwrite base/{1,5}/1247 with PG-canonical
+	// FormData_pg_type heap tuples for every TypeOID a nailedRel attr
+	// references. bootstrapSystemCatalogs above writes v0-encoded
+	// pg_type rows for the goopg planner; PG18's TupleDescInitEntry
+	// reads typalign at struct offset 128 after Form_pg_type cast and
+	// FATALs on `\0` if the heap is v0-encoded. Must run before any
+	// pg_type-index bootstrap (none currently exist) so the index TIDs
+	// would point at the canonical heap rows.
+	if err := bootstrapPgTypeTuples(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_type tuples: %w", err)
+	}
 	// M0106-0010 step 2: write pg_am rows so PG's
 	// RelationInitIndexAccessInfo → SearchSysCache1(AMOID, ...) does
 	// not return NULL and PANIC when opening a critical index.
