@@ -109,32 +109,109 @@ func TestPgProcRowBtreeHandlerMatchesFormPgProc(t *testing.T) {
 // (335). The mapping mirrors pgAmInitialEntries.
 func TestPgProcInitialEntriesCoverAMHandlers(t *testing.T) {
 	entries := pgProcInitialEntries()
-	if got, want := len(entries), 7; got != want {
+	// 7 AM handlers + 24 type I/O regprocs (M0106-0010 Step 3dc(1)).
+	if got, want := len(entries), 31; got != want {
 		t.Fatalf("pgProcInitialEntries len: got %d, want %d", got, want)
 	}
-	wantNames := map[uint32]string{
-		3:   "heap_tableam_handler",
-		330: "bthandler",
-		331: "hashhandler",
-		332: "gisthandler",
-		333: "ginhandler",
-		334: "spghandler",
-		335: "brinhandler",
-	}
-	wantRet := map[uint32]uint32{
-		3:   269, // table_am_handler
-		330: 325, // index_am_handler
-		331: 325, 332: 325, 333: 325, 334: 325, 335: 325,
-	}
+	byOID := make(map[uint32]pgProcEntry, len(entries))
 	for _, e := range entries {
-		if e.Name != wantNames[e.OID] {
-			t.Errorf("oid=%d: name=%q, want %q", e.OID, e.Name, wantNames[e.OID])
+		if _, dup := byOID[e.OID]; dup {
+			t.Fatalf("duplicate pg_proc OID %d (%q)", e.OID, e.Name)
 		}
-		if e.HandlerName != wantNames[e.OID] {
-			t.Errorf("oid=%d: handler=%q, want %q", e.OID, e.HandlerName, wantNames[e.OID])
+		byOID[e.OID] = e
+	}
+	// AM handlers — defaults: single `internal` arg, PROVOLATILE 'v'.
+	handlers := map[uint32]struct {
+		name string
+		ret  uint32
+	}{
+		3:   {"heap_tableam_handler", 269}, // table_am_handler
+		330: {"bthandler", 325},             // index_am_handler
+		331: {"hashhandler", 325},
+		332: {"gisthandler", 325},
+		333: {"ginhandler", 325},
+		334: {"spghandler", 325},
+		335: {"brinhandler", 325},
+	}
+	for oid, w := range handlers {
+		e, ok := byOID[oid]
+		if !ok {
+			t.Fatalf("oid=%d (%q): missing from pgProcInitialEntries", oid, w.name)
 		}
-		if e.RetType != wantRet[e.OID] {
-			t.Errorf("oid=%d: rettype=%d, want %d", e.OID, e.RetType, wantRet[e.OID])
+		if e.Name != w.name {
+			t.Errorf("oid=%d: name=%q, want %q", oid, e.Name, w.name)
+		}
+		if e.HandlerName != w.name {
+			t.Errorf("oid=%d: handler=%q, want %q", oid, e.HandlerName, w.name)
+		}
+		if e.RetType != w.ret {
+			t.Errorf("oid=%d: rettype=%d, want %d", oid, e.RetType, w.ret)
+		}
+	}
+	// Type I/O regprocs — values sourced from pg_proc.dat. Pinning
+	// canonical prorettype / proargtypes / provolatile protects the
+	// fmgr_info dereferences against silent regressions.
+	type want struct {
+		name string
+		ret  uint32
+		args []uint32
+		vol  byte
+	}
+	ioRegprocs := map[uint32]want{
+		// int4 quad.
+		42:   {"int4in", 23, []uint32{2275}, 'v'},
+		43:   {"int4out", 2275, []uint32{23}, 'v'},
+		2406: {"int4recv", 23, []uint32{2281}, 'v'},
+		2407: {"int4send", 17, []uint32{23}, 'v'},
+		// text quad.
+		46:   {"textin", 25, []uint32{2275}, 'v'},
+		47:   {"textout", 2275, []uint32{25}, 'v'},
+		2414: {"textrecv", 25, []uint32{2281}, 's'},
+		2415: {"textsend", 17, []uint32{25}, 's'},
+		// name quad.
+		34:   {"namein", 19, []uint32{2275}, 'v'},
+		35:   {"nameout", 2275, []uint32{19}, 'v'},
+		2422: {"namerecv", 19, []uint32{2281}, 's'},
+		2423: {"namesend", 17, []uint32{19}, 's'},
+		// oid quad.
+		1798: {"oidin", 26, []uint32{2275}, 'v'},
+		1799: {"oidout", 2275, []uint32{26}, 'v'},
+		2418: {"oidrecv", 26, []uint32{2281}, 'v'},
+		2419: {"oidsend", 17, []uint32{26}, 'v'},
+		// bool quad.
+		1242: {"boolin", 16, []uint32{2275}, 'v'},
+		1243: {"boolout", 2275, []uint32{16}, 'v'},
+		2436: {"boolrecv", 16, []uint32{2281}, 'v'},
+		2437: {"boolsend", 17, []uint32{16}, 'v'},
+		// Generic array I/O quad.
+		750:  {"array_in", 2277, []uint32{2275, 26, 23}, 's'},
+		751:  {"array_out", 2275, []uint32{2277}, 's'},
+		2400: {"array_recv", 2277, []uint32{2281, 26, 23}, 's'},
+		2401: {"array_send", 17, []uint32{2277}, 's'},
+	}
+	for oid, w := range ioRegprocs {
+		e, ok := byOID[oid]
+		if !ok {
+			t.Errorf("oid=%d (%q): missing from pgProcInitialEntries", oid, w.name)
+			continue
+		}
+		if e.Name != w.name || e.HandlerName != w.name {
+			t.Errorf("oid=%d: name=%q handler=%q, want both %q", oid, e.Name, e.HandlerName, w.name)
+		}
+		if e.RetType != w.ret {
+			t.Errorf("oid=%d (%s): rettype=%d, want %d", oid, w.name, e.RetType, w.ret)
+		}
+		if e.Volatile != w.vol {
+			t.Errorf("oid=%d (%s): volatile=%q, want %q", oid, w.name, e.Volatile, w.vol)
+		}
+		if got, ww := len(e.ArgTypes), len(w.args); got != ww {
+			t.Errorf("oid=%d (%s): nargs=%d, want %d", oid, w.name, got, ww)
+			continue
+		}
+		for i, a := range w.args {
+			if e.ArgTypes[i] != a {
+				t.Errorf("oid=%d (%s): argtypes[%d]=%d, want %d", oid, w.name, i, e.ArgTypes[i], a)
+			}
 		}
 	}
 	if t.Failed() {
@@ -165,11 +242,15 @@ func TestBootstrapPgProcTuplesWritesRowsToBase1And5(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if got := len(raw); got != storage.BlockSize {
-			t.Fatalf("%s: page size %d, want %d", path, got, storage.BlockSize)
+		// M0106-0010 Step 3dc(1) bumped the seed from 7 → 31 rows; the
+		// file may now span multiple BlockSize pages depending on
+		// per-tuple varlena padding. The invariant is page-aligned
+		// size, not single-page.
+		if got := len(raw); got == 0 || got%storage.BlockSize != 0 {
+			t.Fatalf("%s: file size %d, want non-zero multiple of %d", path, got, storage.BlockSize)
 		}
 		if !bytes.Contains(raw, needle) {
-			t.Fatalf("%s: bthandler proname not found in page", path)
+			t.Fatalf("%s: bthandler proname not found in pages", path)
 		}
 	}
 }

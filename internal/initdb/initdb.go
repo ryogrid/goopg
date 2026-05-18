@@ -1316,6 +1316,8 @@ type pgProcEntry struct {
 	OID         uint32
 	Name        string // proname (NameData, ≤63 bytes)
 	RetType     uint32 // prorettype OID
+	ArgTypes    []uint32 // proargtypes vector. nil/empty → defaults to [2281] (internal)
+	Volatile    byte   // provolatile char. 0 → defaults to 'v' (volatile)
 	HandlerName string // prosrc text (e.g. "bthandler") — fmgr internal lookup key
 }
 
@@ -1368,22 +1370,83 @@ func pgProcColDefs() []catalog.Column {
 // (12), pronamespace = 11 (pg_catalog), proowner = 10 (bootstrap
 // superuser), one `internal` argument (OID 2281).
 func pgProcInitialEntries() []pgProcEntry {
+	const (
+		oidBool     uint32 = 16
+		oidBytea    uint32 = 17
+		oidName     uint32 = 19
+		oidInt4     uint32 = 23
+		oidText     uint32 = 25
+		oidOID      uint32 = 26
+		oidCString  uint32 = 2275
+		oidAnyArray uint32 = 2277
+		oidInternal uint32 = 2281
+	)
 	return []pgProcEntry{
-		// Table AM handler
-		{3, "heap_tableam_handler", 269, "heap_tableam_handler"},
-		// Index AM handlers
-		{330, "bthandler", 325, "bthandler"},
-		{331, "hashhandler", 325, "hashhandler"},
-		{332, "gisthandler", 325, "gisthandler"},
-		{333, "ginhandler", 325, "ginhandler"},
-		{334, "spghandler", 325, "spghandler"},
-		{335, "brinhandler", 325, "brinhandler"},
+		// Table AM handler.
+		{3, "heap_tableam_handler", 269, nil, 0, "heap_tableam_handler"},
+		// Index AM handlers.
+		{330, "bthandler", 325, nil, 0, "bthandler"},
+		{331, "hashhandler", 325, nil, 0, "hashhandler"},
+		{332, "gisthandler", 325, nil, 0, "gisthandler"},
+		{333, "ginhandler", 325, nil, 0, "ginhandler"},
+		{334, "spghandler", 325, nil, 0, "spghandler"},
+		{335, "brinhandler", 325, nil, 0, "brinhandler"},
+
+		// Type I/O regprocs sourced verbatim from
+		// postgres/src/include/catalog/pg_proc.dat. M0106-0010 Step
+		// 3dc(1): seeding these rows lets fmgr_info's
+		// SearchSysCache1(PROCOID, …) return a non-NULL tuple so the
+		// GETSTRUCT(tup)->prosrc dereference can bind the C symbol —
+		// the lone surviving SIGSEGV after Step 3db came from this
+		// NULL tuple.
+		// int4 quad (all 'v').
+		{42, "int4in", oidInt4, []uint32{oidCString}, 'v', "int4in"},
+		{43, "int4out", oidCString, []uint32{oidInt4}, 'v', "int4out"},
+		{2406, "int4recv", oidInt4, []uint32{oidInternal}, 'v', "int4recv"},
+		{2407, "int4send", oidBytea, []uint32{oidInt4}, 'v', "int4send"},
+		// text quad (recv/send 's' stable upstream).
+		{46, "textin", oidText, []uint32{oidCString}, 'v', "textin"},
+		{47, "textout", oidCString, []uint32{oidText}, 'v', "textout"},
+		{2414, "textrecv", oidText, []uint32{oidInternal}, 's', "textrecv"},
+		{2415, "textsend", oidBytea, []uint32{oidText}, 's', "textsend"},
+		// name quad (recv/send 's' stable upstream).
+		{34, "namein", oidName, []uint32{oidCString}, 'v', "namein"},
+		{35, "nameout", oidCString, []uint32{oidName}, 'v', "nameout"},
+		{2422, "namerecv", oidName, []uint32{oidInternal}, 's', "namerecv"},
+		{2423, "namesend", oidBytea, []uint32{oidName}, 's', "namesend"},
+		// oid quad (all 'v').
+		{1798, "oidin", oidOID, []uint32{oidCString}, 'v', "oidin"},
+		{1799, "oidout", oidCString, []uint32{oidOID}, 'v', "oidout"},
+		{2418, "oidrecv", oidOID, []uint32{oidInternal}, 'v', "oidrecv"},
+		{2419, "oidsend", oidBytea, []uint32{oidOID}, 'v', "oidsend"},
+		// bool quad (all 'v').
+		{1242, "boolin", oidBool, []uint32{oidCString}, 'v', "boolin"},
+		{1243, "boolout", oidCString, []uint32{oidBool}, 'v', "boolout"},
+		{2436, "boolrecv", oidBool, []uint32{oidInternal}, 'v', "boolrecv"},
+		{2437, "boolsend", oidBytea, []uint32{oidBool}, 'v', "boolsend"},
+		// Generic array I/O quad ('s' stable; array_in / array_recv
+		// take three args — value/elem-OID/typmod).
+		{750, "array_in", oidAnyArray, []uint32{oidCString, oidOID, oidInt4}, 's', "array_in"},
+		{751, "array_out", oidCString, []uint32{oidAnyArray}, 's', "array_out"},
+		{2400, "array_recv", oidAnyArray, []uint32{oidInternal, oidOID, oidInt4}, 's', "array_recv"},
+		{2401, "array_send", oidBytea, []uint32{oidAnyArray}, 's', "array_send"},
 	}
 }
 
 // pgProcRow materialises one pgProcEntry as the 30-column row that
-// EncodeRowPG will pack into the on-disk heap tuple.
+// EncodeRowPG will pack into the on-disk heap tuple. A nil/empty
+// ArgTypes defaults to `(internal)`; a zero Volatile defaults to 'v'.
+// These defaults preserve the bthandler-style AM-handler row shape
+// pinned by TestPgProcRowBtreeHandlerMatchesFormPgProc.
 func pgProcRow(e pgProcEntry) executor.Row {
+	argTypes := e.ArgTypes
+	if len(argTypes) == 0 {
+		argTypes = []uint32{2281}
+	}
+	vol := e.Volatile
+	if vol == 0 {
+		vol = 'v'
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)),               // 1  oid
 		executor.NewStringDatum(e.Name),                  // 2  proname
@@ -1399,12 +1462,12 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NewBoolDatum(false),                     // 12 proleakproof
 		executor.NewBoolDatum(true),                      // 13 proisstrict
 		executor.NewBoolDatum(false),                     // 14 proretset
-		executor.NewStringDatum("v"),                     // 15 provolatile = 'v' (volatile)
+		executor.NewStringDatum(string(vol)),             // 15 provolatile
 		executor.NewStringDatum("s"),                     // 16 proparallel = 's' (safe)
-		executor.NewIntDatum(1),                          // 17 pronargs = 1 (single `internal` arg)
+		executor.NewIntDatum(int64(len(argTypes))),       // 17 pronargs
 		executor.NewIntDatum(0),                          // 18 pronargdefaults
 		executor.NewIntDatum(int64(e.RetType)),           // 19 prorettype
-		executor.NewBytesDatum(oidVectorBytes([]uint32{2281})), // 20 proargtypes = (internal)
+		executor.NewBytesDatum(oidVectorBytes(argTypes)), // 20 proargtypes
 		executor.NewStringDatum(""),                      // 21 proallargtypes
 		executor.NewStringDatum(""),                      // 22 proargmodes
 		executor.NewStringDatum(""),                      // 23 proargnames

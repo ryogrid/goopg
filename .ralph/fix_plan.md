@@ -8878,6 +8878,66 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         Working assumption for 3dc(1) ordering: try the int4 quad
         first; if that's not enough, expand to the full ~30-row
         set derived from `pgTypeCanonical`.
+      - Step 3dc(1) LANDED 2026-05-18: pg_proc I/O regproc heap rows
+        seeded. `pgProcInitialEntries` extended from 7 AM-handler
+        rows to 31 by adding the 24 type-I/O regprocs for the core
+        types referenced by nailed pg_type entries — bool quad
+        (1242/1243/2436/2437), name quad (34/35/2422/2423), int4
+        quad (42/43/2406/2407), text quad (46/47/2414/2415), oid
+        quad (1798/1799/2418/2419), and the generic array I/O quad
+        (750/751/2400/2401). `pgProcEntry` gains
+        `ArgTypes []uint32` + `Volatile byte`; `pgProcRow` defaults
+        nil/empty `ArgTypes` to `[2281]` (internal) and zero
+        `Volatile` to `'v'` so the AM-handler byte layout pinned by
+        `TestPgProcRowBtreeHandlerMatchesFormPgProc` stays valid
+        without edit. All `prorettype` / `proargtypes` /
+        `provolatile` values sourced verbatim from
+        `postgres/src/include/catalog/pg_proc.dat` — text/name
+        recv/send and the entire array I/O quad carry
+        `provolatile = 's'`, everything else `'v'`; `array_in` and
+        `array_recv` carry the canonical three-argument
+        `(cstring|internal, oid, int4)` signature.
+        `bootstrapPgProcOidIndex` already iterates
+        `pgProcInitialEntries` and the single-leaf-page layout
+        comfortably holds 31 IndexTuples;
+        `bootstrapPgProcTuples` (via `writeMultiPageHeapRows`)
+        transparently grows to a second BlockSize page on
+        overflow. Regression pins:
+        `TestPgProcInitialEntriesCoverAMHandlers` rewritten — pin
+        count 7→31, reject duplicate OIDs, pin every I/O regproc's
+        name/rettype/argtypes/volatile against the `pg_proc.dat`
+        source values;
+        `TestBootstrapPgProcTuplesWritesRowsToBase1And5` page-size
+        check relaxed from `== BlockSize` to "non-zero multiple of
+        BlockSize" so the load-bearing invariant remains page
+        alignment, not single-page. Verified: `go build ./...` PASS;
+        targeted `go test -count=1 -run
+        'TestPgProc|TestBootstrapPgProc' ./internal/initdb/` PASS;
+        full `go test -count=1 ./internal/initdb/` — same 15
+        pre-existing baseline failures as Step 3db (confirmed via
+        `git stash` baseline round-trip; no new regressions);
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3dc-pg-proc-io-regproc-heap-rows.md`.
+        E2E impact: `[m0102-pg-standby-log]` capture
+        (`GOOPG_RUN_BLOCKED_M0102_E2E=1
+        TestE2E_FailoverGoopgToPG/async`) — pending re-run; will
+        be appended after the test completes.
+        Next blocker (Step 3dd, contingent on E2E): if SIGSEGV
+        persists, fall back to non-invasive diagnostic — build a
+        small `tools/segv_backtrace/` C shared library that
+        installs a `sigaction(SIGSEGV)` handler calling
+        `backtrace_symbols_fd(STDERR_FILENO)` and re-raising;
+        wire it into `pgcluster.Start` via `LD_PRELOAD` env var
+        (gated by `GOOPG_TEST_SEGV_BACKTRACE=1`). PG installs no
+        SIGSEGV handler of its own, so the LD_PRELOAD'd handler
+        fires before the kernel terminates the child and the
+        stderr-written backtrace appears in pg.log under the
+        Step-3cy `[m0102-pg-standby-log]` tag. If the SIGSEGV
+        clears, the next iteration should re-capture the
+        `cache lookup failed for type / function` counts to
+        identify any newly-reachable SysCache miss path.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
