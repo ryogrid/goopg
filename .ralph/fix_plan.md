@@ -6617,6 +6617,60 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/executor/ ./internal/server/ ./internal/storage/
         ./internal/catalog/ ./internal/mvcc/` PASS. Design:
         `docs/design/0106-0010-step3bs-pg-partitioned-table-nailed-rel.md`.
+      - Step 3bt LANDED 2026-05-18. Closes the anticipated FATAL
+        `could not open relation with OID 3351` PG-standby boot blocker
+        that surfaces after Step 3bs seeded `pg_partitioned_table`
+        (OID 3350). OID 3351 is `pg_partitioned_table_partrelid_index`
+        per `postgres/src/include/catalog/pg_partitioned_table.h:69`
+        (`DECLARE_UNIQUE_INDEX_PKEY(pg_partitioned_table_partrelid_index,
+        3351, PartitionedRelidIndexId, pg_partitioned_table,
+        btree(partrelid oid_ops))`). Backs
+        `MAKE_SYSCACHE(PARTRELID, pg_partitioned_table_partrelid_index,
+        32)`. Pure catalog-seed addition mirroring the single-column
+        `oid_ops` UNIQUE PKEY pattern of Steps 3bk/3l/3ax/3at/3bd/3bg/
+        3bi/3bo/3br; no encoder/builder/Init flow change.
+        (a) `pgIndexInitialEntries` (initdb.go) gains
+        `entry(3351, 3350, []int16{1}, []uint32{oidOps},
+        []uint32{0}, true, true)` — UNIQUE PRIMARY single oid_ops key
+        (no collation) over pg_partitioned_table heap OID 3350 (Step 3bs
+        nailed local rel). pg_partitioned_table has NO `oid` system
+        column — `partrelid` (attnum 1) IS the primary key, mirroring
+        pg_foreign_table's ftrelid (Step 3bi).
+        (b) `nailedLocalRels` idxSpec (relcache_init.go) gains
+        `{3351, "pg_partitioned_table_partrelid_index"}` after the
+        Step 3bo `{2755, "pg_opfamily_oid_index"}` entry;
+        `flattenRels`+`pgIndexNattsByOID` derives `RelKind='i',
+        RelNatts=1`, satisfying the `relnatts==indnatts` check
+        (relcache.c:1492).
+        (c) Three placeholder OID lists at `bootstrapPostgresDatabase`
+        (`base/1/`, `base/5/`, `global/`) gain `3351` so PG's
+        `load_critical_index` finds the empty-btree placeholder file
+        before any backend `mdopen` (Step-3k makeBtreeRootPage with
+        btm_root=P_NONE is sufficient — pg_partitioned_table is empty
+        at bootstrap).
+        Regression pins:
+        `TestPgPartitionedTablePartrelidIndexSeededFromInitialEntries`
+        (full per-field audit) and
+        `TestNailedLocalRelsContainsPgPartitionedTablePartrelidIndex`
+        (RelKind='i', RelNatts=1) in
+        `internal/initdb/pg_partitioned_table_partrelid_index_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds `3351:{1}` to
+        the authoritative map (strict count guard forces future
+        additions to update);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3351 so the populated 2679 btree must carry this
+        leaf.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgPartitionedTablePartrelidIndexSeededFromInitialEntries|TestNailedLocalRelsContainsPgPartitionedTablePartrelidIndex|TestNailedLocalRelsContainsPgPartitionedTable|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestBootstrapPgIndexTuples|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestNailedRelTypesMatchPG18FormrdescConstants|TestBootstrapMappedLocalCatalogHeapsIncludesPgPartitionedTable|TestPgClassOidIndexHasSingleKeyColumn'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bs (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Closes Step 3bs's
+        deferred companion — pg_partitioned_table heap (3350) + its sole
+        declared index (3351 partrelid PKEY backing MAKE_SYSCACHE PARTRELID)
+        are now seeded; the family is complete. Design:
+        `docs/design/0106-0010-step3bt-pg-partitioned-table-partrelid-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

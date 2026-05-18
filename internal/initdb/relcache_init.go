@@ -606,7 +606,18 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
 	{2755, "pg_opfamily_oid_index"},
-})
+		// M0106-0010 Step 3bt: pg_partitioned_table_partrelid_index.
+		// `postgres/src/include/catalog/pg_partitioned_table.h:69`
+		// declares `PartitionedRelidIndexId = 3351` as UNIQUE PRIMARY KEY
+		// on btree(partrelid oid_ops). Heap OID 3350 (pg_partitioned_table)
+		// is already a nailed local rel above (Step 3bs). Backs
+		// MAKE_SYSCACHE(PARTRELID, pg_partitioned_table_partrelid_index, 32).
+		// Without this entry RelationIdGetRelation(3351) FATALs because no
+		// pg_class row gets seeded; flattenRels derives RelNatts=1 via
+		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+		// relnatts/indnatts check (relcache.c:1492).
+		{3351, "pg_partitioned_table_partrelid_index"},
+	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
 	return nailedRel{

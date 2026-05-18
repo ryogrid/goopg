@@ -718,8 +718,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		113,  // pg_foreign_server_oid_index (Step 3bg)
 		3119, // pg_foreign_table_relid_index (Step 3bi)
 		2681, // pg_language_name_index (Step 3bj)
-	} {
-		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
+		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
+		} {
+			if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
 		}
 	}
@@ -838,8 +839,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		113,  // pg_foreign_server_oid_index (Step 3bg)
 		3119, // pg_foreign_table_relid_index (Step 3bi)
 		2681, // pg_language_name_index (Step 3bj)
-	} {
-		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
+		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
+		} {
+			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
 		}
 	}
@@ -887,8 +889,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		113,  // pg_foreign_server_oid_index (Step 3bg)
 		3119, // pg_foreign_table_relid_index (Step 3bi)
 		2681, // pg_language_name_index (Step 3bj)
-	} {
-		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
+		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
+		} {
+			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
 		}
 	}
@@ -2277,6 +2280,26 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_foreign_data_wrapper_oid_index (112, Step 3bd),
 		// pg_foreign_server_oid_index (113, Step 3bg).
 		entry(2755, 2753, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_opfamily_oid_index
+		// M0106-0010 Step 3bt: pg_partitioned_table_partrelid_index.
+		//   postgres/src/include/catalog/pg_partitioned_table.h:69
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_partitioned_table_partrelid_index, 3351,
+		//       PartitionedRelidIndexId, pg_partitioned_table,
+		//       btree(partrelid oid_ops));
+		//   MAKE_SYSCACHE(PARTRELID, pg_partitioned_table_partrelid_index, 32);
+		// pg_partitioned_table attnums (pg_partitioned_table_d.h):
+		// 1=partrelid (oid), 2=partstrat, 3=partnatts, 4=partdefid,
+		// 5=partattrs, 6=partclass, 7=partcollation, 8=partexprs.
+		// UNIQUE PRIMARY (DECLARE_UNIQUE_INDEX_PKEY) single oid_ops key
+		// (no collation) over pg_partitioned_table heap OID 3350 (Step 3bs
+		// nailed local rel). pg_partitioned_table has NO `oid` system
+		// column — `partrelid` (attnum 1) IS the primary key, mirroring
+		// pg_foreign_table's ftrelid (Step 3bi). Without this entry
+		// RelationIdGetRelation(3351) FATALs even though the Form_pg_index
+		// row exists in the upstream init data, because no pg_class row
+		// gets seeded. E2E test (TestE2E_FailoverGoopgToPG/async with
+		// GOOPG_RUN_BLOCKED_M0102_E2E=1) is expected to surface OID 3351
+		// as the next FATAL after Step 3bs seeded pg_partitioned_table.
+		entry(3351, 3350, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_partitioned_table_partrelid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
