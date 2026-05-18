@@ -454,6 +454,22 @@ func Init(opts Options) error {
 	if err := bootstrapPgCollationNameEncNspIndex(abs, pgCollationTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_collation_name_enc_nsp_index: %w", err)
 	}
+	// M0106-0010 batched-22: write all 128 pg_conversion rows so PG's
+	// CONDEFAULT, CONNAMENSP, and CONVOID syscaches resolve conversion
+	// lookups (FindDefaultConversion / FindConversion paths).
+	pgConversionTIDs, err := bootstrapPgConversionTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_conversion tuples: %w", err)
+	}
+	if err := bootstrapPgConversionOidIndex(abs, pgConversionTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_conversion_oid_index: %w", err)
+	}
+	if err := bootstrapPgConversionNameNspIndex(abs, pgConversionTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_conversion_name_nsp_index: %w", err)
+	}
+	if err := bootstrapPgConversionDefaultIndex(abs, pgConversionTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_conversion_default_index: %w", err)
+	}
 	// M0106-0010 step 3m: overwrite the empty btree placeholder at
 	// base/{1,5}/2662 + global/2662 with a populated 2-page btree
 	// (metapage + leaf-root) carrying one oid-keyed IndexTuple per

@@ -2116,3 +2116,173 @@ func bootstrapPgCollationNameEncNspIndex(dataDir string, tids map[uint32]heapTID
 	}
 	return nil
 }
+
+// pgBuildIndexTupleOidInt4Int4OidKey builds a 4-column index tuple with key
+// schema (oid, int4, int4, oid). Used by pg_conversion_default_index (OID
+// 2668): btree(connamespace oid_ops, conforencoding int4_ops, contoencoding
+// int4_ops, oid oid_ops).
+// Size: MAXALIGN(8 + 4 + 4 + 4 + 4) = 24 bytes.
+func pgBuildIndexTupleOidInt4Int4OidKey(heapBlk uint32, heapOff uint16, oid1 uint32, enc1, enc2 int32, oid2 uint32) []byte {
+	const (
+		hoff = 8
+		size = 24 // MAXALIGN(8 + 4 + 4 + 4 + 4) = 24
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	le.PutUint32(out[hoff:hoff+4], oid1)
+	le.PutUint32(out[hoff+4:hoff+8], uint32(enc1))
+	le.PutUint32(out[hoff+8:hoff+12], uint32(enc2))
+	le.PutUint32(out[hoff+12:hoff+16], oid2)
+	return out
+}
+
+// bootstrapPgConversionOidIndex writes pg_conversion_oid_index (OID 2670) —
+// UNIQUE PRIMARY KEY btree on oid — to base/{1,5}/2670.
+func bootstrapPgConversionOidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type indexed struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(tids))
+	for oid, tid := range tids {
+		items = append(items, indexed{oid: oid, block: tid.Block, off: tid.Offset})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
+	if err != nil {
+		return fmt.Errorf("pg_conversion_oid_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2670, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_conversion_oid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgConversionNameNspIndex writes pg_conversion_name_nsp_index
+// (OID 2669) — UNIQUE btree on (conname, connamespace) — to
+// base/{1,5}/2669.
+func bootstrapPgConversionNameNspIndex(dataDir string, tids map[uint32]heapTID) error {
+	entries := pgConversionInitialEntries()
+	type indexed struct {
+		name  string
+		nsp   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(entries))
+	for _, e := range entries {
+		tid, ok := tids[e.OID]
+		if !ok {
+			return fmt.Errorf("pg_conversion_name_nsp_index: no heap TID for conversion OID %d", e.OID)
+		}
+		items = append(items, indexed{
+			name:  e.ConName,
+			nsp:   e.ConNamespace,
+			block: tid.Block,
+			off:   tid.Offset,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.name != b.name {
+			return a.name < b.name
+		}
+		return a.nsp < b.nsp
+	})
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleNameOidKey(it.block, it.off, it.name, it.nsp)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 80, 2)
+	if err != nil {
+		return fmt.Errorf("pg_conversion_name_nsp_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2669, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_conversion_name_nsp_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgConversionDefaultIndex writes pg_conversion_default_index
+// (OID 2668) — UNIQUE btree on (connamespace, conforencoding, contoencoding,
+// oid) — to base/{1,5}/2668.
+func bootstrapPgConversionDefaultIndex(dataDir string, tids map[uint32]heapTID) error {
+	entries := pgConversionInitialEntries()
+	type indexed struct {
+		nsp    uint32
+		forEnc int32
+		toEnc  int32
+		oid    uint32
+		block  uint32
+		off    uint16
+	}
+	items := make([]indexed, 0, len(entries))
+	for _, e := range entries {
+		tid, ok := tids[e.OID]
+		if !ok {
+			return fmt.Errorf("pg_conversion_default_index: no heap TID for conversion OID %d", e.OID)
+		}
+		items = append(items, indexed{
+			nsp:    e.ConNamespace,
+			forEnc: e.ConForEncoding,
+			toEnc:  e.ConToEncoding,
+			oid:    e.OID,
+			block:  tid.Block,
+			off:    tid.Offset,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.nsp != b.nsp {
+			return a.nsp < b.nsp
+		}
+		if a.forEnc != b.forEnc {
+			return a.forEnc < b.forEnc
+		}
+		if a.toEnc != b.toEnc {
+			return a.toEnc < b.toEnc
+		}
+		return a.oid < b.oid
+	})
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidInt4Int4OidKey(it.block, it.off, it.nsp, it.forEnc, it.toEnc, it.oid)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 24, 4)
+	if err != nil {
+		return fmt.Errorf("pg_conversion_default_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2668, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_conversion_default_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}

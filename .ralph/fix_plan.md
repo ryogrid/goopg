@@ -9815,7 +9815,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3ac-pg-cast-source-target-index.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-21** (bootstrap-procedure task 21)
+- [x] **M0106-0010 batched-21** (bootstrap-procedure task 21)
       - Summary: Seed `pg_collation` (7 BKI rows) heap + indexes (3164, 3085).
       - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
       - Files: `internal/initdb/pg_collation_bootstrap.go` (new).
@@ -9824,8 +9824,10 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3ae-pg-collation-name-enc-nsp-index.md`,
         `0106-0010-step3af-pg-collation-oid-index.md`.
       - Risk gate: parser/planner/executor.
+      - Done: bootstrapPgCollationTuples (7 rows) + OID index (3085) +
+        name_enc_nsp index (3164) via pgBuildBtreeBulkLoadSized. Commit: 0b0c171.
 
-- [ ] **M0106-0010 batched-22** (bootstrap-procedure task 22)
+- [x] **M0106-0010 batched-22** (bootstrap-procedure task 22)
       - Summary: Seed `pg_conversion` (128 rows) heap + indexes
         (2668, 2669, 2670).
       - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
@@ -9837,6 +9839,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3ai-pg-conversion-oid-index.md`,
         `0106-0010-step3aj-pg-conversion-name-nsp-index.md`.
       - Risk gate: parser/planner/executor.
+      - Commit: TBD (batched-22).
 
 - [ ] **M0106-0010 batched-23** (bootstrap-procedure task 23)
       - Summary: Seed `pg_aggregate` (161 rows) heap + index (2650);
