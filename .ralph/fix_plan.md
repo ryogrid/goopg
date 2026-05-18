@@ -5787,6 +5787,60 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/mvcc/` PASS.
         Design:
         `docs/design/0106-0010-step3be-pg-foreign-server-nailed-rel.md`.
+      - Step 3bf LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 549` PG-standby boot blocker
+        that surfaced after Step 3be added pg_foreign_server (OID 1417)
+        to nailedLocalRels. OID 549 is `pg_foreign_server_name_index`
+        per `postgres/src/include/catalog/pg_foreign_server.h:55`
+        (`DECLARE_UNIQUE_INDEX(pg_foreign_server_name_index, 549,
+        ForeignServerNameIndexId, pg_foreign_server,
+        btree(srvname name_ops))`). Backs `MAKE_SYSCACHE(
+        FOREIGNSERVERNAME, pg_foreign_server_name_index, 2)`. Pure
+        catalog-seed addition mirroring single-column `name_ops` UNIQUE
+        non-PKEY pattern of Steps 3bc (pg_foreign_data_wrapper_name_index
+        548), 3ay (pg_extension_name_index 3081), 3as
+        (pg_event_trigger_evtname_index 3467), and 3t
+        (pg_namespace_nspname_index 2684); no encoder/builder/Init flow
+        change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(549, 1417, []int16{2}, []uint32{nameOps},
+        []uint32{cCollation}, true, false)` — UNIQUE (non-PRIMARY)
+        single name_ops key with C_COLLATION_OID=950 over
+        pg_foreign_server heap OID 1417 (Step 3be nailed rel).
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        list gains `{549, "pg_foreign_server_name_index"}` after Step
+        3bd's OID 112 entry. `flattenRels` + `pgIndexNattsByOID()`
+        derives `RelKind='i', RelNatts=1` so PG's
+        `RelationInitIndexAccessInfo` `relnatts == indnatts` check
+        (relcache.c:1492) passes.
+        (c) Three empty-placeholder OID lists at `initdb.go:710/819/858`
+        (base/1/, base/5/, global/) gain `549` so PG's `mdopen`
+        finds a valid empty-btree file before
+        `bootstrapPgIndexIndexrelidIndex` overwrites the metapage.
+        Step-3k empty-btree placeholder is sufficient because
+        pg_foreign_server is currently unpopulated.
+        Regression pins:
+        `TestPgForeignServerNameIndexSeededFromInitialEntries` (full
+        per-field `(IndRelid, IndKey, IsUnique, IsPrimary, IndCollation)`
+        audit) and `TestNailedLocalRelsContainsPgForeignServerNameIndex`
+        (RelName/RelKind/RelNatts pin) in
+        `internal/initdb/pg_foreign_server_name_index_test.go`.
+        Existing pins extended:
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map gains
+        `549:{2}` (strict count guard catches future adds without map
+        updates); `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 549. Verified: `go build ./...` PASS; `go test
+        -count=1 -run 'TestPgForeignServerNameIndex|TestNailedLocalRelsContainsPgForeignServerNameIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestNailedLocalRelsContainsPgForeignServer|TestBootstrapMappedLocalCatalogHeapsIncludesPgForeignServer|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3be (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Closes Step 3be's
+        first deferred companion (549, name); the second companion
+        OID 113 (`pg_foreign_server_oid_index`, UNIQUE PKEY on
+        `oid_ops`, backs FOREIGNSERVEROID) is deferred to Step 3bg
+        until a concrete E2E blocker surfaces. Design:
+        `docs/design/0106-0010-step3bf-pg-foreign-server-name-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
