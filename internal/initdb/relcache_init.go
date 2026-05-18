@@ -122,6 +122,13 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	{2694, "pg_auth_members_role_member_index"},
 	{2695, "pg_auth_members_member_role_index"},
 	{3593, "pg_shseclabel_object_index"},
+	// M0106-0010 Step 3bq: pg_parameter_acl_parname_index (OID 6246).
+	// PG18 `postgres/src/include/catalog/pg_parameter_acl.h:53` declares
+	// `ParameterAclParnameIndexId = 6246` as UNIQUE btree(parname text_ops).
+	// Without this entry RelationIdGetRelation(6246) FATALs because no
+	// pg_class row gets seeded for the index. Companion to OID 6247
+	// (pg_parameter_acl_oid_index, UNIQUE PRIMARY) deferred to Step 3br.
+	{6246, "pg_parameter_acl_parname_index"},
 })
 
 // nailedLocalRels lists all local nailed relations (heaps + indexes flattened).

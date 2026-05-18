@@ -6420,6 +6420,76 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `pg_parameter_acl_parname_index` (Step 3bq territory).
         Design:
         `docs/design/0106-0010-step3bp-pg-parameter-acl-nailed-rel.md`.
+      - Step 3bq LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 6246` PG-standby boot blocker
+        that surfaced after Step 3bp seeded `pg_parameter_acl` (OID 6243).
+        OID 6246 is `pg_parameter_acl_parname_index` per
+        `postgres/src/include/catalog/pg_parameter_acl.h:53`:
+        `DECLARE_UNIQUE_INDEX(pg_parameter_acl_parname_index, 6246,
+        ParameterAclParnameIndexId, pg_parameter_acl,
+        btree(parname text_ops));
+        MAKE_SYSCACHE(PARAMETERACLNAME, pg_parameter_acl_parname_index, 4)`.
+        Pure catalog-seed addition on the **shared** track
+        (`nailedSharedRels`, not `nailedLocalRels`) mirroring Steps
+        3ay/3bc/3bf for the name-keyed UNIQUE non-PKEY shape; no
+        encoder/builder/Init flow change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` shared
+        slice gains `entry(6246, 6243, []int16{2}, []uint32{textOps},
+        []uint32{cCollation}, true, false)`. UNIQUE but NOT primary —
+        DECLARE_UNIQUE_INDEX is not the _PKEY variant; pg_parameter_acl's
+        PKEY is OID 6247 (deferred to Step 3br). `parname` is `text`
+        (not `name`), so the key uses `text_ops` (OID 3126) with
+        C_COLLATION_OID 950 — same convention as the text_ops `provider`
+        slot of `pg_shseclabel_object_index` (3593).
+        (b) `internal/initdb/relcache_init.go::nailedSharedRels` idxSpec
+        gains `{6246, "pg_parameter_acl_parname_index"}`; `flattenRels`
+        consults `pgIndexNattsByOID()` (returns 1 for OID 6246), so the
+        nailed rel carries `RelKind='i', RelNatts=1` and
+        `RelationInitIndexAccessInfo`'s `relnatts == indnatts` check
+        (relcache.c:1492) passes.
+        (c) The global/ empty-placeholder OID list in
+        `bootstrapPostgresDatabase` gains
+        `6246, // pg_parameter_acl_parname_index (Step 3bq)`. The
+        Step-3k `makeBtreeRootPage` produces a PG-conformant empty btree
+        metapage (`btm_root = P_NONE`), correct here because
+        pg_parameter_acl is unpopulated — any
+        `SearchSysCache1(PARAMETERACLNAME, …)` probe correctly returns
+        no row. Shared indexes only live in `global/` (not
+        `base/{1,5}/`), so no addition to the per-DB lists.
+        Seed threads automatically through
+        `bootstrapPgClassTuples` → `bootstrapPgAttributeTuples`
+        (1 row for the parname key column) →
+        `bootstrapPgIndexTuples` (writes Form_pg_index row, captures TID
+        in `pgIndexTIDs` map) → `bootstrapPgIndexIndexrelidIndex`
+        (adds leaf to populated 2-page btree at file 2679) →
+        `bootstrapPgClassOidIndex` (leaf at file 2662).
+        Regression pins:
+        `TestPgParameterAclParnameIndexSeededFromInitialEntries`
+        (asserts `(IndRelid=6243, IndKey=[2], IsUnique=true,
+        IsPrimary=false, IndClass=[3126 textOps], IndCollation=[950
+        cCollation])`) and
+        `TestNailedSharedRelsContainsPgParameterAclParnameIndex`
+        (asserts `RelName="pg_parameter_acl_parname_index", RelKind='i',
+        RelNatts=1`) in
+        `internal/initdb/pg_parameter_acl_parname_index_test.go`.
+        Existing pins extended:
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds `6246:{2}` to
+        the authoritative map (strict count guard forces future
+        additions to update);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 6246 so the populated 2679 btree must carry this
+        leaf.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgParameterAclParnameIndex|TestNailedSharedRelsContainsPgParameterAclParnameIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedRelTypesMatchPG18FormrdescConstants|TestNailedSharedRelsContainsPgParameterAcl|TestNailedLocalRelsContainsPgOpfamily|TestPgOpfamilyOidIndex'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bp (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Next blocker
+        (Step 3br territory): `FATAL: could not open relation with OID
+        6247` = `pg_parameter_acl_oid_index` (UNIQUE PRIMARY on oid
+        oid_ops) — the OID-PKEY companion to 6246. Design:
+        `docs/design/0106-0010-step3bq-pg-parameter-acl-parname-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

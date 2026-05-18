@@ -849,6 +849,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2671, 2672, 2676, 2677,
 		2694, // pg_auth_members_role_member_index (Step 3z)
 		2695, 3593,
+		6246, // pg_parameter_acl_parname_index (Step 3bq)
 		// Also copy all local critical indexes to global/
 		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
 		828, // pg_default_acl_oid_index (Step 3am)
@@ -1743,6 +1744,24 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_shseclabel columns (PG18, pg_shseclabel.h): 1=objoid, 2=classoid,
 		// 3=provider, 4=label. Index = btree(objoid, classoid, provider text_ops).
 		entry(3593, 3592, []int16{1, 2, 3}, []uint32{oidOps, oidOps, textOps}, []uint32{0, 0, cCollation}, true, true), // pg_shseclabel_object_index
+		// M0106-0010 Step 3bq: pg_parameter_acl_parname_index.
+		//   postgres/src/include/catalog/pg_parameter_acl.h:53
+		//     DECLARE_UNIQUE_INDEX(pg_parameter_acl_parname_index, 6246,
+		//       ParameterAclParnameIndexId, pg_parameter_acl,
+		//       btree(parname text_ops));
+		//   MAKE_SYSCACHE(PARAMETERACLNAME, pg_parameter_acl_parname_index, 4);
+		// pg_parameter_acl attnums (pg_parameter_acl_d.h):
+		// 1=oid, 2=parname, 3=paracl. UNIQUE but NOT primary —
+		// DECLARE_UNIQUE_INDEX is not the _PKEY variant; pg_parameter_acl's
+		// PKEY is OID 6247 (pg_parameter_acl_oid_index). Single text_ops key
+		// with C_COLLATION_OID = 950 — same convention as the text_ops
+		// `provider` slot of pg_shseclabel_object_index (3593) and any other
+		// text-typed nailed index key. Shared catalog (BKI_SHARED_RELATION)
+		// over pg_parameter_acl heap OID 6243 (Step 3bp nailed shared rel).
+		// E2E test (TestE2E_FailoverGoopgToPG/async with
+		// GOOPG_RUN_BLOCKED_M0102_E2E=1) surfaced OID 6246 as the next
+		// FATAL after Step 3bp seeded pg_parameter_acl.
+		entry(6246, 6243, []int16{2}, []uint32{textOps}, []uint32{cCollation}, true, false), // pg_parameter_acl_parname_index
 	}
 	// Local-catalog index rows mirroring nailedLocalRels.
 	local := []pgIndexEntry{
