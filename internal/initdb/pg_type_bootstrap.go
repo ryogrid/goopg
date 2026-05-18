@@ -253,13 +253,12 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 // (`invalid attalign value:`). Writing the canonical heap here makes
 // the SysCache lookup return a proper Form_pg_type pointer with
 // typalign at offset 128.
-func bootstrapPgTypeTuples(dataDir string) error {
+func bootstrapPgTypeTuples(dataDir string) ([]heapTID, error) {
 	cols := pgTypeColDefs()
 	entries := pgTypeInitialEntries()
 	rows := make([]executor.Row, 0, len(entries))
 	for _, e := range entries {
 		rows = append(rows, pgTypeRow(e))
 	}
-	_, err := writeMultiPageHeapRows(dataDir, "1247", cols, rows)
-	return err
+	return writeMultiPageHeapRows(dataDir, "1247", cols, rows)
 }

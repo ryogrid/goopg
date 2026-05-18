@@ -95,7 +95,7 @@ func TestBootstrapPgTypeTuplesWritesCanonicalHeap(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := bootstrapPgTypeTuples(dataDir); err != nil {
+	if _, err := bootstrapPgTypeTuples(dataDir); err != nil {
 		t.Fatalf("bootstrapPgTypeTuples: %v", err)
 	}
 	for _, base := range []string{"base/1", "base/5"} {

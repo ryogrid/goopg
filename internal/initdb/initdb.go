@@ -234,8 +234,20 @@ func Init(opts Options) error {
 	// FATALs on `\0` if the heap is v0-encoded. Must run before any
 	// pg_type-index bootstrap (none currently exist) so the index TIDs
 	// would point at the canonical heap rows.
-	if err := bootstrapPgTypeTuples(abs); err != nil {
+	pgTypeTIDs, err := bootstrapPgTypeTuples(abs)
+	if err != nil {
 		return fmt.Errorf("goopg init: pg_type tuples: %w", err)
+	}
+	// M0106-0010 step 3cz: overwrite the empty btree placeholder at
+	// base/{1,5}/2703 with a populated 2-page btree (metapage +
+	// leaf-root) carrying one oid-keyed IndexTuple per pg_type heap
+	// row so PG's TupleDescInitEntry → typeidType →
+	// SearchSysCache1(TYPEOID, ObjectIdGetDatum(oid)) finds the
+	// type row (e.g. int4 OID=23). Without this the first client
+	// backend FATALs with `XX000: cache lookup failed for type 23`
+	// at tupdesc.c:896 on the standby's first query.
+	if err := bootstrapPgTypeOidIndex(abs, pgTypeTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_type_oid_index: %w", err)
 	}
 	// M0106-0010 step 2: write pg_am rows so PG's
 	// RelationInitIndexAccessInfo → SearchSysCache1(AMOID, ...) does

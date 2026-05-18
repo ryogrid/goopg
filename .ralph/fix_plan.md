@@ -8702,6 +8702,48 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `base/<dbid>/1247`) or relcache-init-file diff if 2703 is
         already populated. Regression pin must include the `(23,)`
         leaf — that exact OID is what triggered the FATAL.
+      - Step 3cz LANDED 2026-05-18: pg_type_oid_index populated.
+        Hypothesis confirmed — 2703 was indeed the Step-3k empty
+        placeholder. Fix mirrors Steps 3cs/3cw/3cx:
+        `bootstrapPgTypeTuples` widened to return `([]heapTID,
+        error)`; new `bootstrapPgTypeOidIndex(dataDir, tids)` in
+        `internal/initdb/btree_index_bootstrap.go` reuses
+        `pgBuildIndexTupleOidKey`, sorts the (oid, block, off) triples
+        by oid ascending, builds the 2-page btree (metapage +
+        populated leaf-root) via `pgBuildBtreeLeafRootPage` /
+        `pgBuildBtreeMetapageWithRoot(1, 0)`, and writes to
+        `base/1/2703` and `base/5/2703` only (pg_type is per-DB).
+        `Init` captures `pgTypeTIDs` from `bootstrapPgTypeTuples`
+        and calls the new bootstrap immediately afterwards, before
+        any subsequent step touches pg_type via syscache.
+        Regression pin (new in
+        `internal/initdb/pg_type_oid_index_test.go`):
+        `TestBootstrapPgTypeOidIndexWritesPopulatedBtree` — both
+        `base/{1,5}/2703` exactly 2 × BlockSize; leaf line-pointer
+        count == `len(tids)`; OID keys strictly ascending;
+        **mandatory presence of an `oid=23` leaf** (the exact key
+        whose absence triggered the FATAL).
+        Verified: `go build ./...` PASS; targeted
+        `go test -count=1 -run
+        'TestBootstrapPgTypeOidIndex|TestBootstrapPgTypeTuples'
+        ./internal/initdb/` PASS (2/2); `go test -count=1
+        ./internal/initdb/` — same 15 pre-existing baseline failures
+        as Step 3cy (no new regressions); cross-package smoke
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
+        PASS. Design:
+        `docs/design/0106-0010-step3cz-pg-type-oid-index-populated.md`.
+        Next blocker (Step 3da): re-run
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        and capture the standby `pg.log` via the Step-3cy
+        `[m0102-pg-standby-log]` cleanup tag. The `cache lookup
+        failed for type 23` line is expected to disappear; the
+        derivative SIGSEGV on the follow-up backend should also
+        disappear (working hypothesis is that the SIGSEGV was
+        downstream of uninitialised state from the failed lookup).
+        If the SIGSEGV survives, promote it to Step 3da with a
+        fresh capture; otherwise the next FATAL line (whatever it
+        is) becomes Step 3da's scope.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
