@@ -158,7 +158,7 @@ func TestBootstrapPgOpclassTuplesWritesRowsToBase1And5(t *testing.T) {
 			t.Fatalf("mkdir %s: %v", sub, err)
 		}
 	}
-	if err := bootstrapPgOpclassTuples(dir); err != nil {
+	if _, err := bootstrapPgOpclassTuples(dir); err != nil {
 		t.Fatalf("bootstrapPgOpclassTuples: %v", err)
 	}
 	needle := make([]byte, 64)
@@ -169,11 +169,12 @@ func TestBootstrapPgOpclassTuplesWritesRowsToBase1And5(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if got := len(raw); got != storage.BlockSize {
-			t.Fatalf("%s: page size %d, want %d", path, got, storage.BlockSize)
+		// 177 rows span 3 heap pages (each ~96-byte payload + overhead ~120 bytes → ~67/page).
+		if got := len(raw); got == 0 || got%storage.BlockSize != 0 {
+			t.Fatalf("%s: file size %d is not a multiple of BlockSize %d", path, got, storage.BlockSize)
 		}
 		if !bytes.Contains(raw, needle) {
-			t.Fatalf("%s: oid_ops opcname not found in page", path)
+			t.Fatalf("%s: oid_ops opcname not found in file", path)
 		}
 	}
 }

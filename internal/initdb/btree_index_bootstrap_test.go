@@ -152,7 +152,11 @@ func TestBootstrapPgOpclassOidIndexWritesPopulatedBtree(t *testing.T) {
 			t.Fatalf("mkdir %s: %v", sub, err)
 		}
 	}
-	if err := bootstrapPgOpclassOidIndex(dir); err != nil {
+	tids := make(map[uint32]heapTID)
+	for i, e := range pgOpclassInitialEntries() {
+		tids[e.OID] = heapTID{Block: 0, Offset: uint16(i + 1)}
+	}
+	if err := bootstrapPgOpclassOidIndex(dir, tids); err != nil {
 		t.Fatalf("bootstrapPgOpclassOidIndex: %v", err)
 	}
 	entries := pgOpclassInitialEntries()

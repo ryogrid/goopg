@@ -662,32 +662,26 @@ func pgBuildBtreeMetapageWithRoot(rootBlk uint32, level uint32) []byte {
 //
 // Index tuples are sorted by OID before page assembly so PG's _bt_binsrch
 // finds them via the standard ordered search.
-func bootstrapPgOpclassOidIndex(dataDir string) error {
-	type oidTid struct {
-		oid uint32
-		tid uint16 // 1-based heap offset; block is always 0 for the 12-row pg_opclass seed
+func bootstrapPgOpclassOidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type indexed struct {
+		oid   uint32
+		block uint32
+		off   uint16
 	}
-	entries := pgOpclassInitialEntries()
-	pairs := make([]oidTid, len(entries))
-	for i, e := range entries {
-		pairs[i] = oidTid{oid: e.OID, tid: uint16(i + 1)}
+	items := make([]indexed, 0, len(tids))
+	for oid, tid := range tids {
+		items = append(items, indexed{oid: oid, block: tid.Block, off: tid.Offset})
 	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].oid < pairs[j].oid })
+	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
 
-	tuples := make([][]byte, len(pairs))
-	for i, p := range pairs {
-		tuples[i] = pgBuildIndexTupleOidKey(0 /* heap block */, p.tid, p.oid)
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
 	}
-	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
 	if err != nil {
-		return fmt.Errorf("pg_opclass_oid_index leaf: %w", err)
+		return fmt.Errorf("pg_opclass_oid_index bulk-load: %w", err)
 	}
-	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
-
-	file := make([]byte, 0, 2*storage.BlockSize)
-	file = append(file, meta...)
-	file = append(file, leaf...)
-
 	for _, dir := range []string{
 		filepath.Join(dataDir, "base", "1"),
 		filepath.Join(dataDir, "base", "5"),
@@ -1780,6 +1774,126 @@ func bootstrapPgOperatorOprnameIndex(dataDir string, tids map[uint32]heapTID) er
 	} {
 		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2689, 10)), file, 0o600); err != nil {
 			return fmt.Errorf("write pg_operator_oprname_l_r_n_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+
+// pgBuildIndexTupleOidNameOidKey builds a 3-column composite IndexTuple
+// for indexes of the form btree(oid oid_ops, name name_ops, oid oid_ops),
+// matching pg_opfamily_am_name_nsp_index (2754) and
+// pg_opclass_am_name_nsp_index (2686).
+// Layout: hoff=8, key=[oid(4) + name(64) + oid(4)] = 72 bytes, size=80.
+func pgBuildIndexTupleOidNameOidKey(heapBlk uint32, heapOff uint16, oid1 uint32, name string, oid2 uint32) []byte {
+	const (
+		nameDataLen = 64
+		hoff        = 8
+		size        = 80 // MAXALIGN(8 + 4 + 64 + 4) = MAXALIGN(80) = 80
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	le.PutUint32(out[hoff:hoff+4], oid1)
+	n := len(name)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff+4:hoff+4+n], name[:n])
+	le.PutUint32(out[hoff+4+nameDataLen:hoff+4+nameDataLen+4], oid2)
+	return out
+}
+
+// bootstrapPgOpfamilyOidIndex writes pg_opfamily_oid_index (OID 2755)
+// — a UNIQUE PRIMARY btree on oid — to base/{1,5}/2755.
+func bootstrapPgOpfamilyOidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type indexed struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(tids))
+	for oid, tid := range tids {
+		items = append(items, indexed{oid: oid, block: tid.Block, off: tid.Offset})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
+	if err != nil {
+		return fmt.Errorf("pg_opfamily_oid_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2755, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_opfamily_oid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgOpfamilyAmNameNspIndex writes pg_opfamily_am_name_nsp_index
+// (OID 2754) — a UNIQUE btree on (opfmethod, opfname, opfnamespace) —
+// to base/{1,5}/2754.
+func bootstrapPgOpfamilyAmNameNspIndex(dataDir string, tids map[uint32]heapTID) error {
+	entries := pgOpfamilyInitialEntries()
+	type indexed struct {
+		method    uint32
+		name      string
+		namespace uint32
+		block     uint32
+		off       uint16
+	}
+	items := make([]indexed, 0, len(entries))
+	for _, e := range entries {
+		tid, ok := tids[e.OID]
+		if !ok {
+			return fmt.Errorf("pg_opfamily_am_name_nsp_index: no heap TID for opfamily OID %d", e.OID)
+		}
+		items = append(items, indexed{
+			method:    e.Method,
+			name:      e.Name,
+			namespace: e.Namespace,
+			block:     tid.Block,
+			off:       tid.Offset,
+		})
+	}
+	// Sort by (opfmethod, opfname, opfnamespace) — matches oid_ops/name_ops/oid_ops ordering.
+	sort.Slice(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.method != b.method {
+			return a.method < b.method
+		}
+		if a.name != b.name {
+			return a.name < b.name
+		}
+		return a.namespace < b.namespace
+	})
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidNameOidKey(it.block, it.off, it.method, it.name, it.namespace)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 80, 4)
+	if err != nil {
+		return fmt.Errorf("pg_opfamily_am_name_nsp_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2754, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_opfamily_am_name_nsp_index in %s: %w", dir, err)
 		}
 	}
 	return nil
