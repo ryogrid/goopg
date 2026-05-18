@@ -192,6 +192,18 @@ func Init(opts Options) error {
 	if err := bootstrapPostgresDatabase(abs); err != nil {
 		return fmt.Errorf("goopg init: postgres database: %w", err)
 	}
+	// M0106-0010 step 3cs: overwrite the empty btree placeholder at
+	// global/2672 with a populated 2-page btree carrying oid-keyed
+	// IndexTuples for the two pg_database heap rows just written
+	// (template1 OID 1, postgres OID 5). Without populated entries
+	// PG's CheckMyDatabase (postinit.c:335) FATALs with
+	// `cache lookup failed for database 5` because the syscache
+	// DATABASEOID lookup via pg_database_oid_index returns NULL.
+	// This is the next blocker after step 3cr made reltablespace=1664
+	// route shared catalogs to global/<relfilenode>.
+	if err := bootstrapPgDatabaseOidIndex(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_database_oid_index: %w", err)
+	}
 	// M0106-0008: populate pg_class/pg_attribute heap tuples so
 	// vanilla PG's RelationBuildDesc → ScanPgRelation finds them.
 	pgClassTIDs, err := bootstrapPgClassTuples(abs)

@@ -616,6 +616,60 @@ func bootstrapPgOpclassOidIndex(dataDir string) error {
 	return nil
 }
 
+
+// bootstrapPgDatabaseOidIndex overwrites the empty btree placeholder at
+// global/2672 with a populated 2-page btree (metapage + leaf-root)
+// carrying one oid-keyed IndexTuple per pg_database heap row written by
+// bootstrapPostgresDatabase.
+//
+// M0106-0010 step 3cs: surfaced by TestE2E_FailoverGoopgToPG/async after
+// step 3cr made pg_class.reltablespace=1664 route shared-catalog file
+// paths to global/<relfilenode>. The empty placeholder satisfied
+// `BasicOpenFile` but PG's CheckMyDatabase (postinit.c:335) probes
+// the syscache DATABASEOID — backed by pg_database_oid_index (PG18
+// OID 2672) — to validate that MyDatabaseId references a live row in
+// pg_database. With an empty btree the syscache returns NULL and the
+// backend FATALs with `cache lookup failed for database 5` (the
+// "postgres" database OID that pg_basebackup connected against).
+//
+// pg_database tuples are written by bootstrapPostgresDatabase in
+// deterministic order onto a fresh block 0:
+//
+//	offset 1: template1 (oid=1)
+//	offset 2: postgres  (oid=5)
+//
+// Keys must be ascending in the leaf page (btree invariant); oids 1 and
+// 5 are already sorted so we emit them in the natural order. Index
+// lives only under global/ — pg_database is a shared catalog (relisshared
+// = true, reltablespace = 1664) and PG resolves it exclusively there.
+func bootstrapPgDatabaseOidIndex(dataDir string) error {
+	type oidTid struct {
+		oid uint32
+		tid uint16
+	}
+	entries := []oidTid{
+		{oid: 1, tid: 1}, // template1
+		{oid: 5, tid: 2}, // postgres
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].oid < entries[j].oid })
+
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleOidKey(0 /* heap block */, e.tid, e.oid)
+	}
+	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		return fmt.Errorf("pg_database_oid_index leaf: %w", err)
+	}
+	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
+
+	file := make([]byte, 0, 2*storage.BlockSize)
+	file = append(file, meta...)
+	file = append(file, leaf...)
+
+	return os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(2672, 10)), file, 0o600)
+}
+
 // bootstrapPgClassOidIndex overwrites the empty btree placeholders at
 // base/{1,5}/2662 and global/2662 with a 2-block btree file (metapage +
 // populated leaf-root) carrying one IndexTuple per pg_class heap row,

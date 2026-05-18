@@ -8198,10 +8198,57 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
         PASS. Design:
         `docs/design/0106-0010-step3cr-pg-class-reltablespace-shared.md`.
-        Next blocker (Step 3cs): re-run
-        `TestE2E_FailoverGoopgToPG/async` with
-        `GOOPG_RUN_BLOCKED_M0102_E2E=1` to surface whichever FATAL
-        now appears once `global/2672` is reachable.
+      - Step 3cs LANDED 2026-05-18. Closes the FATAL
+        `cache lookup failed for database 5` at
+        `CheckMyDatabase, postinit.c:335` that surfaced as the next
+        E2E blocker once Step 3cr routed `pg_database_oid_index`
+        (OID 2672) to `global/2672`. Root cause: the empty btree
+        placeholder seeded by `bootstrapPostgresDatabase` satisfied
+        `mdopen()` but PG's `CheckMyDatabase` probes syscache
+        `DATABASEOID` — backed by pg_database_oid_index — to validate
+        that `MyDatabaseId` references a live `pg_database` row; with
+        no index entries the syscache lookup returns NULL and every
+        connecting backend FATALs. A cascading symptom appeared as
+        `invalid attalign value:` FATALs on follow-up backends — those
+        disappeared once the first FATAL was closed (the first
+        backend's failed InitPostgres was leaving stale catcache
+        state for followers). Fix: new `bootstrapPgDatabaseOidIndex`
+        in `internal/initdb/btree_index_bootstrap.go` overwrites
+        `global/2672` with a populated 2-page btree (metapage +
+        leaf-root) carrying oid-keyed `IndexTuple`s for both
+        `pg_database` heap rows written deterministically by
+        `bootstrapPostgresDatabase` (template1 at TID (0,1) → oid 1;
+        postgres at TID (0,2) → oid 5). Index lives only under
+        `global/` because pg_database is a shared catalog
+        (relisshared=true, reltablespace=1664). Wired into
+        `internal/initdb/initdb.go::Init` immediately after
+        `bootstrapPostgresDatabase`. Regression pin (new, in
+        `internal/initdb/pg_database_oid_index_test.go`):
+        `TestBootstrapPgDatabaseOidIndexWritesPopulatedBtree` asserts
+        file size = 2 × BlockSize, leaf line-pointer count = 2 (no
+        P_HIKEY for leaf root), both IndexTuples carry the expected
+        ascending oid keys (1, 5) and embedded heap block 0.
+        Verified: `go build ./...` PASS; targeted
+        `go test -run TestBootstrapPgDatabaseOidIndexWritesPopulatedBtree
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 15 baseline failures as Step 3cr (no new regressions);
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS; E2E
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -run
+        TestE2E_FailoverGoopgToPG/async ./internal/testport/`
+        re-run confirms the `cache lookup failed for database 5`
+        FATAL is gone and `invalid attalign value` no longer
+        cascades. Design:
+        `docs/design/0106-0010-step3cs-pg-database-oid-index-populated.md`.
+        Next blocker (Step 3ct): standby backends now hit
+        `TRAP: failed Assert("j > attnum"), File: "heaptuple.c",
+        Line: 642` (`slot_deform_heap_tuple` null-bitmap loop)
+        with `client backend ... was terminated by signal 6:
+        Aborted`. Likely a `t_natts` / null-bitmap mismatch in a row
+        PG opens immediately after `CheckMyDatabase` succeeds — needs
+        further investigation to identify which catalog rel and
+        which tuple trip the assert.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
