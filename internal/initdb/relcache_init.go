@@ -492,6 +492,38 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// the column itself stays NOT NULL. pg_transform DOES have an `oid`
 	// system column — attnum 1 = oid.
 	{3576, "pg_transform", 83, 'r', 5, false, pgTransformAttrs()},
+	// M0106-0010 step 3cj: pg_ts_config_map is opened during PG-standby
+	// boot once Step 3ci cleared the pg_transform family. Without a
+	// pg_class row, `RelationBuildDesc(3603) → ScanPgRelation(3603)`
+	// returns NULL and the backend FATALs with `could not open relation
+	// with OID 3603`. RelType=83 is safe because pg_ts_config_map is not
+	// formrdesc'd (no `TSConfigMapRelation_Rowtype_Id` constant in PG18
+	// headers — only pg_database/pg_authid/pg_auth_members/pg_shseclabel/
+	// pg_subscription are formrdesc'd shared rels at
+	// `postgres/src/backend/utils/cache/relcache.c:4075-4083`). Schema per
+	// `postgres/src/include/catalog/pg_ts_config_map.h` (PG18,
+	// TSConfigMapRelationId == 3603). 4 columns total, all fixed-width
+	// NOT NULL: mapcfg (oid 26, BKI_LOOKUP pg_ts_config) + maptokentype
+	// (int4 23) + mapseqno (int4 23) + mapdict (oid 26, BKI_LOOKUP
+	// pg_ts_dict). pg_ts_config_map has no `oid` system column —
+	// attnums start at 1 = mapcfg.
+	{3603, "pg_ts_config_map", 83, 'r', 4, false, pgTsConfigMapAttrs()},
+	// M0106-0010 step 3ck: pg_ts_config is opened during PG-standby boot
+	// once Step 3cj cleared the pg_ts_config_map family. Without a
+	// pg_class row, `RelationBuildDesc(3602) → ScanPgRelation(3602)`
+	// returns NULL and the backend FATALs with `could not open relation
+	// with OID 3602`. RelType=83 is safe because pg_ts_config is not
+	// formrdesc'd (no `TSConfigRelation_Rowtype_Id` constant in PG18
+	// headers — only pg_database/pg_authid/pg_auth_members/pg_shseclabel/
+	// pg_subscription are formrdesc'd shared rels at
+	// `postgres/src/backend/utils/cache/relcache.c:4075-4083`). Schema per
+	// `postgres/src/include/catalog/pg_ts_config.h` (PG18,
+	// TSConfigRelationId == 3602). 5 columns total, all fixed-width NOT
+	// NULL: oid (26) + cfgname (name 19, 64-byte NameData) + cfgnamespace
+	// (oid 26, BKI_LOOKUP pg_namespace) + cfgowner (oid 26, BKI_LOOKUP
+	// pg_authid) + cfgparser (oid 26, BKI_LOOKUP pg_ts_parser). pg_ts_config
+	// DOES have an `oid` system column — attnum 1 = oid.
+	{3602, "pg_ts_config", 83, 'r', 5, false, pgTsConfigAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1031,6 +1063,37 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// RelationIdGetRelation(3575) FATALs; flattenRels derives
 		// RelNatts=2 via pgIndexNattsByOID.
 		{3575, "pg_transform_type_lang_index"},
+		// M0106-0010 Step 3cj: pg_ts_config_map_index. PG18
+		// `postgres/src/include/catalog/pg_ts_config_map.h:48` declares
+		// `DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_map_index, 3609,
+		// TSConfigMapIndexId, pg_ts_config_map, btree(mapcfg oid_ops,
+		// maptokentype int4_ops, mapseqno int4_ops))`. UNIQUE PRIMARY
+		// 3-column composite key. Heap OID 3603 (pg_ts_config_map) is the
+		// nailed local rel above. Backs MAKE_SYSCACHE(TSCONFIGMAP,
+		// pg_ts_config_map_index, 2). Without this entry
+		// RelationIdGetRelation(3609) FATALs; flattenRels derives
+		// RelNatts=3 via pgIndexNattsByOID.
+		{3609, "pg_ts_config_map_index"},
+		// M0106-0010 Step 3ck: pg_ts_config_cfgname_index. PG18
+		// `postgres/src/include/catalog/pg_ts_config.h:50` declares
+		// `DECLARE_UNIQUE_INDEX(pg_ts_config_cfgname_index, 3608,
+		// TSConfigNameNspIndexId, pg_ts_config, btree(cfgname name_ops,
+		// cfgnamespace oid_ops))`. UNIQUE (NOT PRIMARY) 2-column composite
+		// key. Heap OID 3602 (pg_ts_config) is the nailed local rel above.
+		// Backs MAKE_SYSCACHE(TSCONFIGNAMENSP, pg_ts_config_cfgname_index, 2).
+		// Without this entry RelationIdGetRelation(3608) FATALs; flattenRels
+		// derives RelNatts=2 via pgIndexNattsByOID.
+		{3608, "pg_ts_config_cfgname_index"},
+		// M0106-0010 Step 3ck: pg_ts_config_oid_index. PG18
+		// `postgres/src/include/catalog/pg_ts_config.h:51` declares
+		// `DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_oid_index, 3712,
+		// TSConfigOidIndexId, pg_ts_config, btree(oid oid_ops))`. UNIQUE
+		// PRIMARY single-column key. Heap OID 3602 (pg_ts_config) is the
+		// nailed local rel above. Backs MAKE_SYSCACHE(TSCONFIGOID,
+		// pg_ts_config_oid_index, 2). Without this entry
+		// RelationIdGetRelation(3712) FATALs; flattenRels derives
+		// RelNatts=1 via pgIndexNattsByOID.
+		{3712, "pg_ts_config_oid_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1400,6 +1463,43 @@ func pgTransformAttrs() []nailedAttr {
 		{Name: "trflang", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
 		{Name: "trffromsql", TypeOID: 24, Num: 4, Len: 4, NotNull: true},
 		{Name: "trftosql", TypeOID: 24, Num: 5, Len: 4, NotNull: true},
+	}
+}
+
+// pgTsConfigMapAttrs returns the pg_ts_config_map column descriptors
+// (M0106-0010 Step 3cj). Source: PG18
+// `postgres/src/include/catalog/pg_ts_config_map.h:30`
+// (`CATALOG(pg_ts_config_map,3603,TSConfigMapRelationId)`) and
+// `pg_ts_config_map_d.h` (Anum_pg_ts_config_map_* 1..4,
+// Natts_pg_ts_config_map == 4). pg_ts_config_map has no `oid` system
+// column — attnums start at 1 = mapcfg. All columns are fixed-width
+// NOT NULL: mapcfg / mapdict are 4-byte OID columns (BKI_LOOKUP
+// pg_ts_config / pg_ts_dict), maptokentype / mapseqno are 4-byte int4.
+func pgTsConfigMapAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "mapcfg", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "maptokentype", TypeOID: 23, Num: 2, Len: 4, NotNull: true},
+		{Name: "mapseqno", TypeOID: 23, Num: 3, Len: 4, NotNull: true},
+		{Name: "mapdict", TypeOID: 26, Num: 4, Len: 4, NotNull: true},
+	}
+}
+
+// pgTsConfigAttrs returns the pg_ts_config column descriptors (M0106-0010
+// Step 3ck). Source: PG18 `postgres/src/include/catalog/pg_ts_config.h:30`
+// (`CATALOG(pg_ts_config,3602,TSConfigRelationId)`) and `pg_ts_config_d.h`
+// (Anum_pg_ts_config_* 1..5, Natts_pg_ts_config == 5). pg_ts_config DOES
+// have an `oid` system column — attnums start at 1 = oid. All columns
+// are fixed-width NOT NULL: oid / cfgnamespace / cfgowner / cfgparser are
+// 4-byte OID columns (cfgnamespace BKI_LOOKUP pg_namespace, cfgowner
+// BKI_LOOKUP pg_authid, cfgparser BKI_LOOKUP pg_ts_parser); cfgname is
+// the 64-byte NameData fixed string (typoid 19).
+func pgTsConfigAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "cfgname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
+		{Name: "cfgnamespace", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "cfgowner", TypeOID: 26, Num: 4, Len: 4, NotNull: true},
+		{Name: "cfgparser", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
 	}
 }
 

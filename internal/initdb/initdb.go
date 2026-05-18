@@ -443,8 +443,10 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		3381, // pg_statistic_ext
 		3501, // pg_enum (M0106-0010 step 3an)
 		3596, // pg_seclabel
-		3764, // pg_ts_config
-		3765, // pg_ts_config_map
+		3602, // pg_ts_config (M0106-0010 step 3ck) — authoritative OID per pg_ts_config.h:30
+		3764, // pg_ts_config (stale — true pg_ts_config OID is 3602, seeded above; placeholder retained as no-op empty heap)
+		3603, // pg_ts_config_map (M0106-0010 step 3cj) — authoritative OID per pg_ts_config_map.h:30
+		3765, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603, seeded above; placeholder retained as no-op empty heap)
 		3766, // pg_ts_dict
 		3767, // pg_ts_parser
 		3768, // pg_ts_template
@@ -787,8 +789,10 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{3381, 3381}, // pg_statistic_ext
 		{3501, 3501}, // pg_enum (M0106-0010 step 3an)
 		{3596, 3596}, // pg_seclabel
-		{3764, 3764}, // pg_ts_config
-		{3765, 3765}, // pg_ts_config_map
+		{3602, 3602}, // pg_ts_config (M0106-0010 step 3ck) — authoritative OID per pg_ts_config.h:30
+		{3764, 3764}, // pg_ts_config (stale — true pg_ts_config OID is 3602, mapped above)
+		{3603, 3603}, // pg_ts_config_map (M0106-0010 step 3cj) — authoritative OID per pg_ts_config_map.h:30
+		{3765, 3765}, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603, mapped above)
 		{3766, 3766}, // pg_ts_dict
 		{3767, 3767}, // pg_ts_parser
 		{3768, 3768}, // pg_ts_template
@@ -878,6 +882,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2698, // pg_tablespace_spcname_index (Step 3ch)
 		3574, // pg_transform_oid_index (Step 3ci)
 		3575, // pg_transform_type_lang_index (Step 3ci)
+		3609, // pg_ts_config_map_index (Step 3cj)
+		3608, // pg_ts_config_cfgname_index (Step 3ck)
+		3712, // pg_ts_config_oid_index (Step 3ck)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -952,6 +959,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2698, // pg_tablespace_spcname_index (Step 3ch)
 		3574, // pg_transform_oid_index (Step 3ci)
 		3575, // pg_transform_type_lang_index (Step 3ci)
+		3609, // pg_ts_config_map_index (Step 3cj)
+		3608, // pg_ts_config_cfgname_index (Step 3ck)
+		3712, // pg_ts_config_oid_index (Step 3ck)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2704,6 +2714,39 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// UNIQUE (NOT PRIMARY) 2-column composite key, both oid_ops with no
 		// collation.
 		entry(3575, 3576, []int16{2, 3}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, false), // pg_transform_type_lang_index
+		// M0106-0010 Step 3cj: pg_ts_config_map_index. PG18
+		//   postgres/src/include/catalog/pg_ts_config_map.h:48
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_map_index, 3609,
+		//       TSConfigMapIndexId, pg_ts_config_map,
+		//       btree(mapcfg oid_ops, maptokentype int4_ops, mapseqno int4_ops));
+		//   MAKE_SYSCACHE(TSCONFIGMAP, pg_ts_config_map_index, 2);
+		// pg_ts_config_map attnums (pg_ts_config_map_d.h): 1=mapcfg,
+		// 2=maptokentype, 3=mapseqno, 4=mapdict. IndKey = {1, 2, 3}. Heap OID
+		// 3603 is the nailed local rel added in Step 3cj. UNIQUE PRIMARY
+		// 3-column composite key, no collations (oid_ops + int4_ops only).
+		entry(3609, 3603, []int16{1, 2, 3}, []uint32{oidOps, int4Ops, int4Ops}, []uint32{0, 0, 0}, true, true), // pg_ts_config_map_index
+		// M0106-0010 Step 3ck: pg_ts_config_cfgname_index. PG18
+		//   postgres/src/include/catalog/pg_ts_config.h:50
+		//     DECLARE_UNIQUE_INDEX(pg_ts_config_cfgname_index, 3608,
+		//       TSConfigNameNspIndexId, pg_ts_config,
+		//       btree(cfgname name_ops, cfgnamespace oid_ops));
+		//   MAKE_SYSCACHE(TSCONFIGNAMENSP, pg_ts_config_cfgname_index, 2);
+		// pg_ts_config attnums (pg_ts_config_d.h): 1=oid, 2=cfgname,
+		// 3=cfgnamespace, 4=cfgowner, 5=cfgparser. IndKey = {2, 3}. Heap OID
+		// 3602 is the nailed local rel added in Step 3ck. UNIQUE (NOT
+		// PRIMARY) 2-column composite key; cfgname uses C_COLLATION_OID
+		// (name catalog columns use C collation), cfgnamespace has no
+		// collation.
+		entry(3608, 3602, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false), // pg_ts_config_cfgname_index
+		// M0106-0010 Step 3ck: pg_ts_config_oid_index. PG18
+		//   postgres/src/include/catalog/pg_ts_config.h:51
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_oid_index, 3712,
+		//       TSConfigOidIndexId, pg_ts_config, btree(oid oid_ops));
+		//   MAKE_SYSCACHE(TSCONFIGOID, pg_ts_config_oid_index, 2);
+		// pg_ts_config attnums: 1=oid. Heap OID 3602 is the nailed local
+		// rel added in Step 3ck. UNIQUE PRIMARY single-column key, oid_ops
+		// with no collation.
+		entry(3712, 3602, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_ts_config_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

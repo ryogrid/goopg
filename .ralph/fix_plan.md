@@ -7319,6 +7319,140 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         FATAL on 3381 is closed — next FATAL is OID 2619 (`pg_statistic`),
         to be handled by Step 3ce. Design:
         `docs/design/0106-0010-step3cd-pg-statistic-ext-nailed-rel.md`.
+      - Step 3ck LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 3602` PG-standby boot blocker that surfaces
+        after Step 3cj seeded the pg_ts_config_map family. OID 3602 is
+        `pg_ts_config` per
+        `postgres/src/include/catalog/pg_ts_config.h:30`
+        (`CATALOG(pg_ts_config,3602,TSConfigRelationId)`). Per-database
+        (non-shared) catalog. Family-complete seed: heap 3602 + both
+        declared indexes 3608 (`pg_ts_config_cfgname_index`, UNIQUE
+        btree(cfgname name_ops, cfgnamespace oid_ops), backs
+        `MAKE_SYSCACHE(TSCONFIGNAMENSP, …, 2)`) and 3712
+        (`pg_ts_config_oid_index`, UNIQUE PRIMARY btree(oid oid_ops),
+        backs `MAKE_SYSCACHE(TSCONFIGOID, …, 2)`).
+        (a) `pgTsConfigAttrs()` (relcache_init.go) returns the 5-column
+        PG18 schema verbatim from `pg_ts_config.h:30-46` +
+        `pg_ts_config_d.h` (Anum_pg_ts_config_* 1..5, Natts_pg_ts_config
+        == 5): oid (26/4 NOT NULL) + cfgname (name 19/64 NOT NULL) +
+        cfgnamespace (26/4 NOT NULL BKI_LOOKUP pg_namespace) + cfgowner
+        (26/4 NOT NULL BKI_LOOKUP pg_authid) + cfgparser (26/4 NOT NULL
+        BKI_LOOKUP pg_ts_parser). pg_ts_config DOES have an `oid` system
+        column. RelType=83 is safe (no `TSConfigRelation_Rowtype_Id` in
+        PG18 headers).
+        (b) `nailedLocalRels` (relcache_init.go) heap list gains
+        `{3602, "pg_ts_config", 83, 'r', 5, false, pgTsConfigAttrs()}`
+        after the Step 3cj 3603 entry; idxSpec list gains
+        `{3608, "pg_ts_config_cfgname_index"}` and
+        `{3712, "pg_ts_config_oid_index"}` after the Step 3cj 3609
+        entry.
+        (c) `pgIndexInitialEntries` local section (initdb.go) gains
+        `entry(3608, 3602, []int16{2, 3}, []uint32{nameOps, oidOps},
+        []uint32{cCollation, 0}, true, false)` and
+        `entry(3712, 3602, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` after the Step 3cj 3609 entry. IndKey for cfgname
+        leads on attnum 2 (cfgname), then attnum 3 (cfgnamespace);
+        cfgname uses `C_COLLATION_OID = 950` because catalog `name`
+        columns use C collation.
+        (d) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain `3608` and `3712` after the
+        Step 3cj 3609 entry.
+        (e) `bootstrapMappedLocalCatalogHeaps` oids list and
+        `localRelMap` gain `3602` (authoritative pg_ts_config OID per
+        `pg_ts_config.h:30`). Pre-existing stale 3764 placeholder
+        (mislabeled "pg_ts_config" — 3764 has no upstream catalog
+        assignment) is left in place as a harmless empty 8 KiB heap
+        page; its comment is updated to flag the historical mislabel.
+        (f) No new type-helper entries: `oid` (26) and `name` (19) are
+        already registered in `pgCatalogTypeOID` / `pgCatalogTypeLen` /
+        `pgTypeByVal` / `pgTypeAlignChar` / `pgTypeStorageChar`.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgTsConfig`,
+        `TestNailedLocalRelsContainsPgTsConfigIndexes`,
+        `TestPgTsConfigIndexInitialEntries`,
+        `TestPgTsConfigAttrsTypeOIDsMatchPG18` in
+        `internal/initdb/pg_ts_config_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `3608:{2,3}` + `3712:{1}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3608 + 3712.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgTsConfig|TestPgTsConfigIndexInitialEntries|TestPgTsConfigAttrsTypeOIDsMatchPG18|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgClassOidIndexHasSingleKeyColumn|TestPgIndexColDefsMatchesRelcacheAttrs'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3cj (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Next FATAL: the
+        OID surfaced by the next standby-boot iteration, to be handled
+        by Step 3cl. Design:
+        `docs/design/0106-0010-step3ck-pg-ts-config-nailed-rel.md`.
+      - Step 3cj LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 3603` PG-standby boot blocker that surfaces
+        after Step 3ci seeded the pg_transform family. OID 3603 is
+        `pg_ts_config_map` per
+        `postgres/src/include/catalog/pg_ts_config_map.h:30`
+        (`CATALOG(pg_ts_config_map,3603,TSConfigMapRelationId)`).
+        Per-database (non-shared) catalog. Family-complete seed: heap
+        3603 + single declared UNIQUE PRIMARY composite index 3609
+        (`pg_ts_config_map_index`, btree on `(mapcfg oid_ops,
+        maptokentype int4_ops, mapseqno int4_ops)`, backs
+        `MAKE_SYSCACHE(TSCONFIGMAP, …, 2)`).
+        (a) `pgTsConfigMapAttrs()` (relcache_init.go) returns the
+        4-column PG18 schema verbatim from `pg_ts_config_map.h:30-43` +
+        `pg_ts_config_map_d.h` (Anum_pg_ts_config_map_* 1..4,
+        Natts_pg_ts_config_map == 4): mapcfg (oid 26/4 NOT NULL
+        BKI_LOOKUP pg_ts_config) + maptokentype (int4 23/4 NOT NULL) +
+        mapseqno (int4 23/4 NOT NULL) + mapdict (oid 26/4 NOT NULL
+        BKI_LOOKUP pg_ts_dict). pg_ts_config_map has no `oid` system
+        column — attnums start at 1 = mapcfg. RelType=83 is safe (no
+        `TSConfigMapRelation_Rowtype_Id` in PG18 headers).
+        (b) `nailedLocalRels` (relcache_init.go) heap list gains
+        `{3603, "pg_ts_config_map", 83, 'r', 4, false, pgTsConfigMapAttrs()}`
+        after the Step 3ci 3576 entry; idxSpec list gains
+        `{3609, "pg_ts_config_map_index"}` after the Step 3ci 3575 entry.
+        (c) `pgIndexInitialEntries` local section (initdb.go) gains
+        `entry(3609, 3603, []int16{1, 2, 3}, []uint32{oidOps, int4Ops,
+        int4Ops}, []uint32{0, 0, 0}, true, true)` after the Step 3ci
+        3575 entry. IndKey leads on mapcfg (attnum 1), then maptokentype
+        (attnum 2), then mapseqno (attnum 3). No collation (oid_ops +
+        int4_ops are non-collatable).
+        (d) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain `3609` after the Step 3ci
+        3575 entry.
+        (e) `bootstrapMappedLocalCatalogHeaps` oids list and
+        `localRelMap` gain `3603` (authoritative pg_ts_config_map OID
+        per `pg_ts_config_map.h:30`). Pre-existing stale 3765
+        placeholder (mislabeled "pg_ts_config_map" — 3765 has no
+        upstream catalog assignment) is left in place as a harmless
+        empty 8 KiB heap page; its comment is updated to flag the
+        historical mislabel.
+        (f) No new type-helper entries: `oid` (26) and `int4` (23) are
+        already registered in `pgCatalogTypeOID` / `pgCatalogTypeLen` /
+        `pgTypeByVal` / `pgTypeAlignChar` / `pgTypeStorageChar`.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgTsConfigMap`,
+        `TestNailedLocalRelsContainsPgTsConfigMapIndexes`,
+        `TestPgTsConfigMapIndexInitialEntries`,
+        `TestPgTsConfigMapAttrsTypeOIDsMatchPG18` in
+        `internal/initdb/pg_ts_config_map_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `3609:{1,2,3}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3609.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgTsConfigMap|TestPgTsConfigMapIndexInitialEntries|TestPgTsConfigMapAttrsTypeOIDsMatchPG18|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgClassOidIndexHasSingleKeyColumn|TestPgIndexColDefsMatchesRelcacheAttrs'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3ci (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. E2E re-run
+        (`GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -run
+        TestE2E_FailoverGoopgToPG/async ./internal/testport/`) confirms
+        FATAL on 3603 is closed — next FATAL is OID 3602
+        (`pg_ts_config`), to be handled by Step 3ck. Design:
+        `docs/design/0106-0010-step3cj-pg-ts-config-map-nailed-rel.md`.
       - Step 3ci LANDED 2026-05-18. Closes the FATAL `could not open
         relation with OID 3576` PG-standby boot blocker that surfaces
         after Step 3ch seeded the pg_tablespace family. OID 3576 is

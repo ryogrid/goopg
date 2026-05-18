@@ -106,6 +106,9 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		2698: {2},         // pg_tablespace_spcname_index : btree(spcname name_ops) UNIQUE (SHARED) ← Step 3ch
 		3574: {1},         // pg_transform_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ci
 		3575: {2, 3},      // pg_transform_type_lang_index : btree(trftype oid_ops, trflang oid_ops) UNIQUE ← Step 3ci
+		3609: {1, 2, 3},   // pg_ts_config_map_index : btree(mapcfg oid_ops, maptokentype int4_ops, mapseqno int4_ops) UNIQUE PRIMARY ← Step 3cj
+		3608: {2, 3},      // pg_ts_config_cfgname_index : btree(cfgname name_ops, cfgnamespace oid_ops) UNIQUE ← Step 3ck
+		3712: {1},         // pg_ts_config_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ck
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {
