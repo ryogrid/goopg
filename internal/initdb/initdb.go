@@ -253,6 +253,20 @@ func Init(opts Options) error {
 	if err := bootstrapPgAuthidIndexes(abs, pgAuthidEntries); err != nil {
 		return fmt.Errorf("goopg init: pg_authid indexes: %w", err)
 	}
+	// M0106-0010 batched-12: overwrite the empty placeholder at global/1213
+	// with two pg_tablespace rows (pg_default OID 1663, pg_global OID 1664)
+	// and populate the oid-index (global/2697) and spcname-index (global/2698)
+	// so PG's TABLESPACEOID syscache lookup during InitPostgres finds them.
+	pgTablespaceEntries, err := bootstrapPgTablespaceTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_tablespace tuples: %w", err)
+	}
+	if err := bootstrapPgTablespaceOidIndex(abs, pgTablespaceEntries); err != nil {
+		return fmt.Errorf("goopg init: pg_tablespace_oid_index: %w", err)
+	}
+	if err := bootstrapPgTablespaceSpcnameIndex(abs, pgTablespaceEntries); err != nil {
+		return fmt.Errorf("goopg init: pg_tablespace_spcname_index: %w", err)
+	}
 	// M0106-0008: populate pg_class/pg_attribute heap tuples so
 	// vanilla PG's RelationBuildDesc → ScanPgRelation finds them.
 	pgClassTIDs, err := bootstrapPgClassTuples(abs)
