@@ -6807,6 +6807,80 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         UNIQUE name idx 6111 + UNIQUE PRIMARY oid idx 6110) is now
         fully seeded. Design:
         `docs/design/0106-0010-step3bw-pg-publication-oid-index.md`.
+      - Step 3bx LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 6237` PG-standby boot blocker that surfaces
+        after Step 3bw seeded `pg_publication_oid_index` (6110). OID
+        6237 is `pg_publication_namespace` per
+        `postgres/src/include/catalog/pg_publication_namespace.h:30`
+        (`CATALOG(pg_publication_namespace,6237,
+        PublicationNamespaceRelationId)`). Family-complete seed in one
+        step: heap 6237 + both declared indexes 6238 (UNIQUE PRIMARY
+        oid_ops, backs `MAKE_SYSCACHE(PUBLICATIONNAMESPACE)`) and 6239
+        (UNIQUE composite `(pnnspid, pnpubid) oid_ops`, backs
+        `MAKE_SYSCACHE(PUBLICATIONNAMESPACEMAP)`). Pure catalog-seed
+        addition mirroring the nailed-local-rel pattern of Steps
+        3w/3aa/3ag/3ak/3an/3ar/3aw/3bb/3be/3bh/3bm/3bp/3bs/3bu plus the
+        single-column oid PKEY pattern of Steps 3bk/3l/3ax/3at/3bd/3bg/
+        3bo/3br/3bt/3bw; no encoder/builder/Init flow change.
+        (a) `pgPublicationNamespaceAttrs()` (relcache_init.go) returns
+        the 3-column PG18 schema verbatim, all fixed-width NOT NULL:
+        oid(26/4), pnpubid(26/4 → pg_publication), pnnspid(26/4 →
+        pg_namespace). `nailedLocalRels` gains
+        `{6237, "pg_publication_namespace", 83, 'r', 3, false,
+        pgPublicationNamespaceAttrs()}` after the Step 3bu
+        pg_publication entry. RelType=83 is safe — pg_publication_namespace
+        has no `PublicationNamespaceRelation_Rowtype_Id` in PG18
+        headers, so Step 3v's tdtypeid assertion does not fire.
+        (b) `bootstrapMappedLocalCatalogHeaps` (initdb.go) OID list
+        gains `6237, // pg_publication_namespace (M0106-0010 step 3bx)`
+        after the Step 3bu 6104 entry; `localRelMap` gains
+        `{6237, 6237}` analogously.
+        (c) `pgIndexInitialEntries` (initdb.go) gains
+        `entry(6238, 6237, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` (UNIQUE PRIMARY oid PKEY) and
+        `entry(6239, 6237, []int16{3, 2}, []uint32{oidOps, oidOps},
+        []uint32{0, 0}, true, false)` (UNIQUE composite (pnnspid,
+        pnpubid) — attnums 3,2 per pg_publication_namespace_d.h)
+        after the Step 3bw 6110 row.
+        (d) `nailedLocalRels` idxSpec list (relcache_init.go) gains
+        `{6238, "pg_publication_namespace_oid_index"}` and
+        `{6239, "pg_publication_namespace_pnnspid_pnpubid_index"}`
+        after the Step 3bw 6110 entry; `flattenRels`+`pgIndexNattsByOID`
+        derives `RelKind='i', RelNatts=1/2` so the `relnatts==indnatts`
+        check (relcache.c:1492) passes.
+        (e) Three critical-index placeholder OID lists at
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        each gain `6238, // pg_publication_namespace_oid_index (Step 3bx)`
+        and `6239, // pg_publication_namespace_pnnspid_pnpubid_index
+        (Step 3bx)`. Empty-btree placeholder is sufficient because
+        pg_publication_namespace is unpopulated at bootstrap.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgPublicationNamespace`,
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgPublicationNamespace`,
+        `TestPgPublicationNamespaceOidIndexInitialEntry`,
+        `TestPgPublicationNamespacePnnspidPnpubidIndexInitialEntry`
+        in `internal/initdb/pg_publication_namespace_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `6238:{1}` + `6239:{3,2}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 6238 + 6239;
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        extended with 6237 (strict list guard).
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgPublicationNamespace|TestBootstrapMappedLocalCatalogHeapsIncludesPgPublicationNamespace|TestPgPublicationNamespaceOidIndexInitialEntry|TestPgPublicationNamespacePnnspidPnpubidIndexInitialEntry|TestNailedLocalRelsContainsPgPublication|TestBootstrapMappedLocalCatalogHeapsIncludesPgPublication|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestNailedLocalRelsContainsPgPublicationPubnameIndex|TestPgPublicationPubnameIndexInitialEntry|TestNailedLocalRelsContainsPgPublicationOidIndex|TestPgPublicationOidIndexInitialEntry'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bw (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. E2E re-run with
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        advances past OID 6237 and surfaces the next anticipated
+        blocker `FATAL: could not open relation with OID 6106`
+        (`pg_publication_rel` — Step 3by territory). The
+        pg_publication_namespace family (heap 6237 + UNIQUE PRIMARY
+        oid idx 6238 + UNIQUE composite (pnnspid, pnpubid) idx 6239)
+        is now fully seeded. Design:
+        `docs/design/0106-0010-step3bx-pg-publication-namespace-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

@@ -293,6 +293,18 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// (oid, pubname, pubowner, puballtables, pubinsert, pubupdate,
 	// pubdelete, pubtruncate, pubviaroot, pubgencols).
 	{6104, "pg_publication", 83, 'r', 10, false, pgPublicationAttrs()},
+	// M0106-0010 step 3bx: pg_publication_namespace is opened during
+	// PG-standby boot once Step 3bw cleared `pg_publication_oid_index`.
+	// Without a pg_class row, `RelationBuildDesc(6237) →
+	// ScanPgRelation(6237)` returns NULL and the backend FATALs with
+	// `could not open relation with OID 6237`. RelType=83 is safe because
+	// pg_publication_namespace is not formrdesc'd (no
+	// `PublicationNamespaceRelation_Rowtype_Id` constant in PG18
+	// headers). Schema per
+	// `postgres/src/include/catalog/pg_publication_namespace.h` (PG18,
+	// PublicationNamespaceRelationId == 6237). 3 columns, all fixed-width
+	// NOT NULL (oid, pnpubid, pnnspid).
+	{6237, "pg_publication_namespace", 83, 'r', 3, false, pgPublicationNamespaceAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -651,6 +663,31 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
 		{6110, "pg_publication_oid_index"},
+		// M0106-0010 Step 3bx: pg_publication_namespace_oid_index.
+		// `postgres/src/include/catalog/pg_publication_namespace.h:44`
+		// declares `PublicationNamespaceObjectIndexId = 6238` as UNIQUE
+		// PRIMARY KEY on btree(oid oid_ops). Heap OID 6237
+		// (pg_publication_namespace) is already a nailed local rel above
+		// (Step 3bx). Backs
+		// MAKE_SYSCACHE(PUBLICATIONNAMESPACE, pg_publication_namespace_oid_index, 64).
+		// Without this entry RelationIdGetRelation(6238) FATALs because
+		// no pg_class row gets seeded; flattenRels derives RelNatts=1
+		// via pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+		// relnatts/indnatts check (relcache.c:1492).
+		{6238, "pg_publication_namespace_oid_index"},
+		// M0106-0010 Step 3bx: pg_publication_namespace_pnnspid_pnpubid_index.
+		// `postgres/src/include/catalog/pg_publication_namespace.h:45`
+		// declares `PublicationNamespacePnnspidPnpubidIndexId = 6239`
+		// as UNIQUE (NOT primary) on btree(pnnspid oid_ops, pnpubid
+		// oid_ops). Heap OID 6237 (pg_publication_namespace) is already
+		// a nailed local rel above (Step 3bx). Backs
+		// MAKE_SYSCACHE(PUBLICATIONNAMESPACEMAP,
+		// pg_publication_namespace_pnnspid_pnpubid_index, 64). Without
+		// this entry RelationIdGetRelation(6239) FATALs because no
+		// pg_class row gets seeded; flattenRels derives RelNatts=2 via
+		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+		// relnatts/indnatts check (relcache.c:1492).
+		{6239, "pg_publication_namespace_pnnspid_pnpubid_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1474,6 +1511,22 @@ func pgPublicationAttrs() []nailedAttr {
 		{Name: "pubtruncate", TypeOID: 16, Num: 8, Len: 1, NotNull: true},   // bool
 		{Name: "pubviaroot", TypeOID: 16, Num: 9, Len: 1, NotNull: true},    // bool
 		{Name: "pubgencols", TypeOID: 18, Num: 10, Len: 1, NotNull: true},   // char
+	}
+}
+
+// pgPublicationNamespaceAttrs defines the 3-column PG18
+// pg_publication_namespace schema. PG `RelationBuildDesc(6237) →
+// ScanPgRelation(6237)` looks up the catalog descriptor during standby
+// boot once Step 3bw seeded pg_publication_oid_index (6110); without
+// this entry, the backend FATALs with `could not open relation with
+// OID 6237`. Sourced verbatim from
+// `postgres/src/include/catalog/pg_publication_namespace.h` (PG18,
+// PublicationNamespaceRelationId == 6237). M0106-0010 step 3bx.
+func pgPublicationNamespaceAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},     // oid
+		{Name: "pnpubid", TypeOID: 26, Num: 2, Len: 4, NotNull: true}, // oid → pg_publication
+		{Name: "pnnspid", TypeOID: 26, Num: 3, Len: 4, NotNull: true}, // oid → pg_namespace
 	}
 }
 

@@ -456,6 +456,7 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		2753, // pg_opfamily (M0106-0010 step 3bm)
 		3350, // pg_partitioned_table (M0106-0010 step 3bs)
 		6104, // pg_publication (M0106-0010 step 3bu)
+		6237, // pg_publication_namespace (M0106-0010 step 3bx)
 		6003, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		6101, // pg_publication_rel
 		6102, // pg_sequence
@@ -794,6 +795,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{2753, 2753}, // pg_opfamily (M0106-0010 step 3bm)
 		{3350, 3350}, // pg_partitioned_table (M0106-0010 step 3bs)
 		{6104, 6104}, // pg_publication (M0106-0010 step 3bu)
+		{6237, 6237}, // pg_publication_namespace (M0106-0010 step 3bx)
 		{6003, 6003}, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		{6101, 6101}, // pg_publication_rel
 		{6102, 6102}, // pg_sequence
@@ -846,6 +848,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
 		6111, // pg_publication_pubname_index (Step 3bv)
 		6110, // pg_publication_oid_index (Step 3bw)
+		6238, // pg_publication_namespace_oid_index (Step 3bx)
+		6239, // pg_publication_namespace_pnnspid_pnpubid_index (Step 3bx)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -898,6 +902,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
 		6111, // pg_publication_pubname_index (Step 3bv)
 		6110, // pg_publication_oid_index (Step 3bw)
+		6238, // pg_publication_namespace_oid_index (Step 3bx)
+		6239, // pg_publication_namespace_pnnspid_pnpubid_index (Step 3bx)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2354,6 +2360,55 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// is expected to surface OID 6110 as the next FATAL after Step 3bv
 		// seeded pg_publication_pubname_index (6111).
 		entry(6110, 6104, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_publication_oid_index
+		// M0106-0010 Step 3bx: pg_publication_namespace_oid_index.
+		//   postgres/src/include/catalog/pg_publication_namespace.h:44
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_publication_namespace_oid_index, 6238,
+		//       PublicationNamespaceObjectIndexId, pg_publication_namespace,
+		//       btree(oid oid_ops));
+		//   MAKE_SYSCACHE(PUBLICATIONNAMESPACE,
+		//     pg_publication_namespace_oid_index, 64);
+		// pg_publication_namespace attnums (pg_publication_namespace_d.h /
+		// pg_publication_namespace.h): 1=oid, 2=pnpubid, 3=pnnspid.
+		// UNIQUE PRIMARY (DECLARE_UNIQUE_INDEX_PKEY) single oid_ops key
+		// (no collation) over pg_publication_namespace heap OID 6237
+		// (Step 3bx nailed local rel). Same single-column oid_ops UNIQUE
+		// PRIMARY pattern as pg_publication_oid_index (6110, Step 3bw),
+		// pg_opfamily_oid_index (2755, Step 3bo),
+		// pg_language_oid_index (2682, Step 3bk),
+		// pg_extension_oid_index (3080, Step 3ax),
+		// pg_event_trigger_oid_index (3468, Step 3at),
+		// pg_foreign_data_wrapper_oid_index (112, Step 3bd),
+		// pg_foreign_server_oid_index (113, Step 3bg). Without this
+		// entry RelationIdGetRelation(6238) FATALs. E2E test
+		// (TestE2E_FailoverGoopgToPG/async with
+		// GOOPG_RUN_BLOCKED_M0102_E2E=1) is expected to surface OID
+		// 6238 alongside the heap and the composite UNIQUE companion
+		// 6239 after Step 3bw seeded pg_publication_oid_index.
+		entry(6238, 6237, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_publication_namespace_oid_index
+		// M0106-0010 Step 3bx: pg_publication_namespace_pnnspid_pnpubid_index.
+		//   postgres/src/include/catalog/pg_publication_namespace.h:45
+		//     DECLARE_UNIQUE_INDEX(pg_publication_namespace_pnnspid_pnpubid_index, 6239,
+		//       PublicationNamespacePnnspidPnpubidIndexId, pg_publication_namespace,
+		//       btree(pnnspid oid_ops, pnpubid oid_ops));
+		//   MAKE_SYSCACHE(PUBLICATIONNAMESPACEMAP,
+		//     pg_publication_namespace_pnnspid_pnpubid_index, 64);
+		// pg_publication_namespace attnums (pg_publication_namespace_d.h /
+		// pg_publication_namespace.h): 1=oid, 2=pnpubid, 3=pnnspid.
+		// UNIQUE (NOT primary; DECLARE_UNIQUE_INDEX, not the _PKEY
+		// variant — PKEY is 6238 = pg_publication_namespace_oid_index)
+		// composite (pnnspid, pnpubid) oid_ops over
+		// pg_publication_namespace heap OID 6237 (Step 3bx nailed
+		// local rel). Neither key carries a collation (oid_ops is
+		// typeless). Same all-oid_ops composite UNIQUE non-PKEY pattern
+		// — though no other catalog has the exact (oid,oid) shape;
+		// closest analogue is pg_amop_fam_strat_index (2653) which
+		// adds an int2_ops tail. Without this entry
+		// RelationIdGetRelation(6239) FATALs. E2E test
+		// (TestE2E_FailoverGoopgToPG/async with
+		// GOOPG_RUN_BLOCKED_M0102_E2E=1) is expected to surface OID
+		// 6239 alongside the heap and the oid PKEY companion 6238
+		// after Step 3bw seeded pg_publication_oid_index.
+		entry(6239, 6237, []int16{3, 2}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, false), // pg_publication_namespace_pnnspid_pnpubid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
