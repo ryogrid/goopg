@@ -66,7 +66,9 @@ func TestPgAmopRowInt4LessMatchesFormPgAmop(t *testing.T) {
 // TestPgAmopInitialEntriesCoverPinnedOpclasses asserts every
 // pinned default opclass family/lefttype pair has the canonical
 // five strategy operator rows (<, <=, =, >=, >) keyed by
-// pg_operator.dat OIDs.
+// pg_operator.dat OIDs. It also verifies no (family, left, right,
+// strategy) duplicate exists across all 945 entries (btree + hash +
+// gist + gin + spgist + brin).
 func TestPgAmopInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 	entries := pgAmopInitialEntries()
 	type key struct {
@@ -77,11 +79,9 @@ func TestPgAmopInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 	}
 	byKey := make(map[key]pgAmopEntry, len(entries))
 	for _, e := range entries {
-		if e.Method != 403 {
-			t.Errorf("entry %+v: method=%d, want 403 (btree)", e, e.Method)
-		}
-		if e.Purpose != 's' {
-			t.Errorf("entry %+v: purpose=%q, want 's'", e, e.Purpose)
+		// method and purpose are AM-specific; we don't enforce a single value.
+		if e.Purpose != 's' && e.Purpose != 'o' {
+			t.Errorf("entry %+v: purpose=%q, want 's' or 'o'", e, e.Purpose)
 		}
 		k := key{e.Family, e.LeftType, e.RightType, e.Strategy}
 		if _, dup := byKey[k]; dup {
@@ -129,9 +129,8 @@ func TestPgAmopInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 			}
 		}
 	}
-	// Total row count = 11 default-type families × 5 strategies +
-	// 6 cross-type integer_ops combos × 5 strategies = 85.
-	if got, want := len(entries), 85; got != want {
+	// Total row count matches pg_amop.dat: 945 entries across all AMs.
+	if got, want := len(entries), 945; got != want {
 		t.Errorf("entry count: got %d, want %d", got, want)
 	}
 }
@@ -163,11 +162,12 @@ func TestBootstrapPgAmopTuplesWritesRowsToBase1And5(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if got := len(raw); got != storage.BlockSize {
-			t.Fatalf("%s: page size %d, want %d", path, got, storage.BlockSize)
+		// 945 rows × ~56 bytes/tuple ≈ 7 pages; must be a multiple of BlockSize.
+		if got := len(raw); got == 0 || got%storage.BlockSize != 0 {
+			t.Fatalf("%s: file size %d is not a positive multiple of BlockSize %d", path, got, storage.BlockSize)
 		}
 		if !bytes.Contains(raw, needle) {
-			t.Fatalf("%s: int4 strategy-1 row prefix not found in page", path)
+			t.Fatalf("%s: int4 strategy-1 row prefix not found in heap", path)
 		}
 	}
 }

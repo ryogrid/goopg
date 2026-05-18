@@ -9760,7 +9760,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3bl-pg-operator-oprname-l-r-n-index.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-17** (bootstrap-procedure task 17)
+- [x] **M0106-0010 batched-17** (bootstrap-procedure task 17)
       - Summary: Complete `pg_amop` seed: add cross-type rows for
         `text_ops` (1994), `datetime_ops` (434), `numeric_ops` (1988),
         plus hash/gist/gin/spgist/brin tail (target 945 rows).
