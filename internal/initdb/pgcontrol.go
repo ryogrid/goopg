@@ -32,12 +32,23 @@ const pgControlFile = "global/pg_control"
 
 // PostgreSQL pg_control constants (PG18).
 const (
-	pgControlVersion       = 1800
-	pgCatalogVersionNo     = 202506291
-	pgControlFileSize      = 8192
-	pgControlDataSize      = 296 // sizeof(ControlFileData) on x86_64
-	pgControlCRCOffset     = 292 // offsetof(ControlFileData, crc) on x86_64
-	pgControlMockNonceLen  = 32
+	pgControlVersion      = 1800
+	pgCatalogVersionNo    = 202506291
+	pgControlFileSize     = 8192
+	pgControlDataSize     = 296 // sizeof(ControlFileData) on x86_64
+	pgControlCRCOffset    = 292 // offsetof(ControlFileData, crc) on x86_64
+	pgControlMockNonceLen = 32
+
+	// Initial checkpoint LSN: wal_segment_size(16 MiB) + SizeOfXLogLongPHD(40).
+	// Segment 1 starts at byte 0x01000000; the first WAL record follows the
+	// 40-byte XLogLongPageHeaderData, so the checkpoint record lands at 0x01000028.
+	pgInitCheckpointLSN = uint64(16*1024*1024 + 40)
+
+	// Bootstrap values from BootStrapXLOG (xlog.c:5115-5132).
+	pgFirstNormalXID  = uint64(3)     // FirstNormalTransactionId
+	pgFirstGenbkiOID  = uint32(10000) // FirstGenbkiObjectId
+	pgFirstMultiXact  = uint32(1)     // FirstMultiXactId
+	pgTemplate1DbOID  = uint32(1)     // Template1DbOid
 )
 
 // dbStateShutdowned mirrors PostgreSQL's DB_SHUTDOWNED enum value.
@@ -158,12 +169,50 @@ func buildPgControl(systemID uint64, now time.Time) []byte {
 	le.PutUint32(hdr[16:], dbStateShutdowned)
 	// time (pg_time_t/int64): offset 24
 	le.PutUint64(hdr[24:], uint64(now.Unix()))
-	// checkPoint (XLogRecPtr): offset 32 — no checkpoint yet
-	le.PutUint64(hdr[32:], 0)
+	// checkPoint (XLogRecPtr): offset 32.
+	// Initial LSN is wal_segment_size + SizeOfXLogLongPHD = 0x01000028.
+	le.PutUint64(hdr[32:], pgInitCheckpointLSN)
 
-	// checkPointCopy (CheckPoint struct, 88 bytes): offset 40..128
-	//   We leave all CheckPoint fields zero; the cluster was just
-	//   initialised and has no recorded checkpoint history.
+	// checkPointCopy (CheckPoint struct, 88 bytes): offset 40..128.
+	// Mirrors BootStrapXLOG (xlog.c:5115-5132).
+
+	// offset 40: CheckPoint.redo (XLogRecPtr)
+	le.PutUint64(hdr[40:], pgInitCheckpointLSN)
+	// offset 48: CheckPoint.ThisTimeLineID (uint32) — BootstrapTimeLineID=1
+	le.PutUint32(hdr[48:], 1)
+	// offset 52: CheckPoint.PrevTimeLineID (uint32) — BootstrapTimeLineID=1
+	le.PutUint32(hdr[52:], 1)
+	// offset 56: CheckPoint.fullPageWrites (bool) — GUC default on
+	hdr[56] = 1
+	// offset 57-59: padding (zero)
+	// offset 60: CheckPoint.wal_level (int) — replica=1
+	le.PutUint32(hdr[60:], 1)
+	// offset 64: CheckPoint.nextXid (FullTransactionId=uint64) — FirstNormalTransactionId=3
+	le.PutUint64(hdr[64:], pgFirstNormalXID)
+	// offset 72: CheckPoint.nextOid (Oid=uint32) — FirstGenbkiObjectId=10000
+	le.PutUint32(hdr[72:], pgFirstGenbkiOID)
+	// offset 76: CheckPoint.nextMulti (MultiXactId=uint32) — FirstMultiXactId=1
+	le.PutUint32(hdr[76:], pgFirstMultiXact)
+	// offset 80: CheckPoint.nextMultiOffset (MultiXactOffset=uint32) — 0
+	le.PutUint32(hdr[80:], 0)
+	// offset 84: CheckPoint.oldestXid (TransactionId=uint32) — FirstNormalTransactionId=3
+	le.PutUint32(hdr[84:], uint32(pgFirstNormalXID))
+	// offset 88: CheckPoint.oldestXidDB (Oid=uint32) — Template1DbOid=1
+	le.PutUint32(hdr[88:], pgTemplate1DbOID)
+	// offset 92: CheckPoint.oldestMulti (MultiXactId=uint32) — FirstMultiXactId=1
+	le.PutUint32(hdr[92:], pgFirstMultiXact)
+	// offset 96: CheckPoint.oldestMultiDB (Oid=uint32) — Template1DbOid=1
+	le.PutUint32(hdr[96:], pgTemplate1DbOID)
+	// offset 100-103: 4-byte alignment padding (zero)
+	// offset 104: CheckPoint.time (pg_time_t=int64)
+	le.PutUint64(hdr[104:], uint64(now.Unix()))
+	// offset 112: CheckPoint.oldestCommitTsXid (TransactionId=uint32) — InvalidTransactionId=0
+	le.PutUint32(hdr[112:], 0)
+	// offset 116: CheckPoint.newestCommitTsXid (TransactionId=uint32) — InvalidTransactionId=0
+	le.PutUint32(hdr[116:], 0)
+	// offset 120: CheckPoint.oldestActiveXid (TransactionId=uint32) — InvalidTransactionId=0
+	le.PutUint32(hdr[120:], 0)
+	// offset 124-127: 4-byte tail padding (zero)
 
 	// unloggedLSN (XLogRecPtr): offset 128
 	le.PutUint64(hdr[128:], 0)

@@ -9499,7 +9499,7 @@ the underlying spec lives in the rest of the bundle. Pick tasks in numeric
 order — the ordering is bottom-up (ControlFile → WAL → catalogs → views →
 relcache init → replication readiness) and intra-package grouped.
 
-- [ ] **M0106-0010 batched-01** (bootstrap-procedure task 1)
+- [x] **M0106-0010 batched-01** (bootstrap-procedure task 1)
       - Summary: Fill `checkPointCopy` substructure (redo, TLI×2,
         nextXid=3, nextOid=10000, nextMulti=1, oldestXid=3,
         oldestXidDB=1, oldestMulti=1, oldestMultiDB=1, fullPageWrites,
@@ -9509,6 +9509,15 @@ relcache init → replication readiness) and intra-package grouped.
       - Test: `internal/initdb/pg_control_test.go` (new) — assert
         offsets 32..127 match expected.
       - Risk gate: wal/replication.
+      - COMPLETE 2026-05-19: All checkPointCopy fields set per spec.
+        Constants pgInitCheckpointLSN/pgFirstNormalXID/pgFirstGenbkiOID/
+        pgFirstMultiXact/pgTemplate1DbOID added. Tests: 3 new assertions
+        (TestBuildPgControlCheckpointFields, TestBuildPgControlFileSize,
+        TestBuildPgControlCompatibilityFields) all PASS. No new
+        regressions in ./internal/initdb/ (17 pre-existing failures
+        confirmed identical to baseline). ./internal/executor/ ./internal/
+        server/ ./internal/storage/ ./internal/catalog/ ./internal/mvcc/
+        all PASS.
 
 - [ ] **M0106-0010 batched-02** (bootstrap-procedure task 2)
       - Summary: Set `unloggedLSN = FirstNormalUnloggedLSN = 1000` and
