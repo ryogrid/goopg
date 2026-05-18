@@ -9519,7 +9519,7 @@ relcache init → replication readiness) and intra-package grouped.
         server/ ./internal/storage/ ./internal/catalog/ ./internal/mvcc/
         all PASS.
 
-- [ ] **M0106-0010 batched-02** (bootstrap-procedure task 2)
+- [x] **M0106-0010 batched-02** (bootstrap-procedure task 2)
       - Summary: Set `unloggedLSN = FirstNormalUnloggedLSN = 1000` and
         pipe live GUCs (`MaxConnections`, `max_worker_processes`,
         `max_wal_senders`, `max_prepared_xacts`, `max_locks_per_xact`,
@@ -9531,7 +9531,7 @@ relcache init → replication readiness) and intra-package grouped.
       - Test: `internal/initdb/pg_control_test.go` extended.
       - Risk gate: wal/replication.
 
-- [ ] **M0106-0010 batched-03** (bootstrap-procedure task 3)
+- [x] **M0106-0010 batched-03** (bootstrap-procedure task 3)
       - Summary: Add `updateControlFile(dataDir, fn func(*ControlFileData)) error`
         helper; thread it through `wal/checkpointer.go::runCheckpoint`,
         `server/basebackup.go::handleBaseBackup`, and the (future)

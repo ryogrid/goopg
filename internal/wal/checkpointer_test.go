@@ -2,8 +2,11 @@ package wal
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -489,6 +492,73 @@ func TestEncodeDecodePageImageRoundTrip(t *testing.T) {
 	}
 	if gotPage[321] != 0xA1 {
 		t.Fatalf("page byte = %#x, want 0xA1", gotPage[321])
+	}
+}
+
+
+// TestCheckpointerUpdatesPgControl verifies that runCheckpoint writes an
+// updated pg_control to disk (state=DB_IN_PRODUCTION, non-zero checkPoint)
+// when CheckpointerConfig.DataDir is set.
+func TestCheckpointerUpdatesPgControl(t *testing.T) {
+	dir := t.TempDir()
+	globalDir := filepath.Join(dir, "global")
+	if err := os.MkdirAll(globalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	walDir := filepath.Join(dir, "pg_wal")
+
+	// Build a minimal valid pg_control file (8192 bytes, correct CRC).
+	buf := make([]byte, 8192)
+	le := binary.LittleEndian
+	le.PutUint64(buf[0:], 0x0102030405060708) // system_identifier sentinel
+	le.PutUint32(buf[8:], 1800)               // pg_control_version
+	le.PutUint32(buf[16:], 1)                 // state = DB_SHUTDOWNED
+	crcTable := crc32.MakeTable(crc32.Castagnoli)
+	crc := crc32.Checksum(buf[:292], crcTable)
+	le.PutUint32(buf[292:], crc)
+	if err := os.WriteFile(filepath.Join(globalDir, "pg_control"), buf, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// PageHeaders=true + TimelineID=1 mimics the production server so the
+	// first WAL record has a 40-byte leading page header (SizeOfXLogLongPHD),
+	// making startLSN=41 and checkLSN0=40 (non-zero) in pg_control.
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096,
+		PageHeaders: true, TimelineID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+		DataDir: dir,
+	})
+	if err := cp.runCheckpoint(context.Background(), false); err != nil {
+		t.Fatalf("runCheckpoint: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(globalDir, "pg_control"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// system_identifier must not change.
+	if sysID := le.Uint64(got[0:]); sysID != 0x0102030405060708 {
+		t.Errorf("system_identifier changed: %#x", sysID)
+	}
+	// State must be DB_IN_PRODUCTION (6).
+	if state := le.Uint32(got[16:]); state != 6 {
+		t.Errorf("state: got %d want 6 (DB_IN_PRODUCTION)", state)
+	}
+	// checkPoint must be non-zero.
+	if cp := le.Uint64(got[32:]); cp == 0 {
+		t.Error("checkPoint is still 0 after checkpoint")
+	}
+	// CRC must be valid.
+	wantCRC := crc32.Checksum(got[:292], crcTable)
+	gotCRC := le.Uint32(got[292:])
+	if gotCRC != wantCRC {
+		t.Errorf("CRC mismatch after checkpoint: got %#x want %#x", gotCRC, wantCRC)
 	}
 }
 

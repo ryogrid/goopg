@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/control"
 )
 
 // pgControlFile is the path (relative to the data directory) for the
@@ -124,79 +125,33 @@ func walLevelInt(reg *config.Registry) uint32 {
 	}
 }
 
-// dbStateInProduction mirrors PostgreSQL's DB_IN_PRODUCTION enum value (6).
-// DB_STARTUP=0, DB_SHUTDOWNED=1, DB_SHUTDOWNED_IN_RECOVERY=2,
-// DB_SHUTDOWNING=3, DB_IN_CRASH_RECOVERY=4, DB_IN_ARCHIVE_RECOVERY=5,
-// DB_IN_PRODUCTION=6.
-const dbStateInProduction = 6
-
+// UpdateControlCheckpoint overwrites the checkpoint-related fields in the
+// on-disk pg_control file. Used by BASE_BACKUP after a forced checkpoint so
+// a PostgreSQL standby booted from the backup sees a valid REDO location.
 // UpdateControlCheckpoint overwrites the checkpoint-related fields in the
 // on-disk pg_control file. Used by BASE_BACKUP after a forced checkpoint so
 // a PostgreSQL standby booted from the backup sees a valid REDO location.
 func UpdateControlCheckpoint(dataDir string, redoLSN uint64) error {
-	path := filepath.Join(dataDir, pgControlFile)
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("update pg_control: %w", err)
-	}
-	if len(body) < pgControlCRCOffset+4 {
-		return fmt.Errorf("update pg_control: file too short (%d bytes)", len(body))
-	}
-	le := binary.LittleEndian
-	now := time.Now()
 	// goopg uses 1-based LSNs internally; PG expects 0-based.
 	lsn0 := redoLSN - 1
-
-	// ControlFileData layout (PG18, verified from pg_control.h):
-	//   offset 16: state (uint32)
-	//   offset 24: time (pg_time_t, int64)
-	//   offset 32: checkPoint (XLogRecPtr, 8 bytes)
-	//   offset 40: checkPointCopy (CheckPoint, 88 bytes) — no prevCheckPoint
-	//     → offset 40: checkPointCopy.redo (XLogRecPtr, 8)
-	//     → offset 48: checkPointCopy.ThisTimeLineID (uint32, 4)
-	//     → offset 52: checkPointCopy.PrevTimeLineID (uint32, 4)
-	//   offset 128: unloggedLSN (XLogRecPtr, 8 bytes)
-	//   offset 136: minRecoveryPoint (XLogRecPtr, 8 bytes)
-	//   offset 144: minRecoveryPointTLI (TimeLineID, 4 bytes)
-
-	// state → DB_IN_PRODUCTION (taken from a running server)
-	le.PutUint32(body[16:], dbStateInProduction)
-	// time → now
-	le.PutUint64(body[24:], uint64(now.Unix()))
-	// checkPoint → redoLSN (0-based)
-	le.PutUint64(body[32:], lsn0)
-	// checkPointCopy.redo → redoLSN (0-based)
-	le.PutUint64(body[40:], lsn0)
-	// checkPointCopy.ThisTimeLineID → 1
-	le.PutUint32(body[48:], 1)
-	// checkPointCopy.PrevTimeLineID → 1 (match PG-generated backups)
-	le.PutUint32(body[52:], 1)
-	// checkPointCopy.fullPageWrites → on (1) at offset 56
-	body[56] = 1
-	// minRecoveryPoint → set to a small non-zero value so
-	// CheckRecoveryConsistency doesn't bail out immediately
-	// (XLogRecPtrIsInvalid(0) returns true, causing an early return).
-	// Use 1 so minRecoveryPoint <= lastReplayedEndRecPtr is satisfied
-	// after the first WAL record (the checkpoint) has been replayed.
-	le.PutUint64(body[136:], 1)
-	le.PutUint32(body[144:], 1) // minRecoveryPointTLI
-	// backupEndPoint → redo LSN. read_backup_label sets
-	// backupEndRequired=true, which blocks reachedConsistency in
-	// CheckRecoveryConsistency. PG clears backupEndRequired only via
-	// ReachedEndOfBackup(), which requires backupEndPoint (non-zero)
-	// <= lastReplayedEndRecPtr. Set to the REDO LSN so the condition
-	// is satisfied immediately after checkpoint replay.
-	le.PutUint64(body[160:], lsn0)
-	// backupEndRequired → false. Even if the control file has this as
-	// true, read_backup_label overrides it. Left as false (zero) so
-	// the initial state is clean. We clear it via backupEndPoint above.
-	crc := crc32.Checksum(body[:pgControlCRCOffset], crcCastagnoliTable)
-	le.PutUint32(body[pgControlCRCOffset:], crc)
-
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		return fmt.Errorf("update pg_control: write: %w", err)
-	}
-	return nil
+	now := time.Now()
+	return control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		cd.State = control.DBStateInProduction
+		cd.Time = now.Unix()
+		cd.CheckPoint = lsn0
+		cd.CheckPointCopyRedo = lsn0
+		cd.CheckPointCopyTime = now.Unix()
+		cd.CheckPointCopyThisTLI = 1
+		cd.CheckPointCopyPrevTLI = 1
+		cd.CheckPointCopyFullPageWrites = true
+		// minRecoveryPoint must be non-zero so CheckRecoveryConsistency
+		// doesn't bail out immediately (XLogRecPtrIsInvalid(0) returns true).
+		cd.MinRecoveryPoint = 1
+		cd.MinRecoveryPointTLI = 1
+		// backupEndPoint = redo LSN so ReachedEndOfBackup() is satisfied
+		// after the first WAL record (the checkpoint) has been replayed.
+		cd.BackupEndPoint = lsn0
+	})
 }
 
 // buildPgControl renders a PG-compatible pg_control file image with

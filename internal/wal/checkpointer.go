@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"time"
+
+	"github.com/goopg/goopg/internal/control"
 )
 
 // DirtyPageFlusher is the buffer-pool contract used by the checkpointer.
@@ -80,6 +82,11 @@ type CheckpointerConfig struct {
 	// by EncodeCheckpointCompat to compute the correct first-page
 	// header size when encoding a PG-compatible checkpoint record.
 	SegmentSize int64
+	// DataDir, when non-empty, causes each successful checkpoint to
+	// update <DataDir>/global/pg_control via control.UpdateControlFile.
+	// When empty the pg_control update is skipped (tests that don't
+	// write a real data directory leave this blank).
+	DataDir string
 }
 
 func (c *CheckpointerConfig) withDefaults() {
@@ -353,6 +360,27 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 	// BASE_BACKUP so pg_control carries a valid redo point.
 	c.lastCheckpointRedoLSN.Store(startLSN)
 	c.lastCheckpointLSN.Store(endLSN)
+	// Update pg_control on disk so pg_controldata and standbys see the
+	// current checkpoint location. Mirrors CreateCheckPoint (post-flush)
+	// in upstream's UpdateControlFile call (xlog.c:7306).
+	if c.cfg.DataDir != "" {
+		checkLSN0 := startLSN - 1 // convert 1-based internal to 0-based PG LSN
+		now := time.Now().Unix()
+		if err := control.UpdateControlFile(c.cfg.DataDir, func(cd *control.ControlFileData) {
+			cd.State = control.DBStateInProduction
+			cd.Time = now
+			cd.CheckPoint = checkLSN0
+			cd.CheckPointCopyRedo = redoLSN0
+			cd.CheckPointCopyTime = now
+			cd.CheckPointCopyThisTLI = 1
+			cd.CheckPointCopyPrevTLI = 1
+			cd.CheckPointCopyFullPageWrites = true
+			cd.MinRecoveryPoint = 0
+			cd.MinRecoveryPointTLI = 0
+		}); err != nil {
+			c.cfg.Logger.Warn("pg_control update failed after checkpoint", "err", err)
+		}
+	}
 	if spread {
 		c.numTimed.Add(1)
 	} else {
