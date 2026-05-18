@@ -165,6 +165,23 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// backing MAKE_SYSCACHE(REPLORIGNAME, …). Companion to OID 6001
 	// (pg_replication_origin_roiident_index, UNIQUE PRIMARY).
 	{6002, "pg_replication_origin_roname_index"},
+	// M0106-0010 Step 3cf: pg_subscription_oid_index (OID 6114).
+	// PG18 `postgres/src/include/catalog/pg_subscription.h:103` declares
+	// `SubscriptionObjectIndexId = 6114` as UNIQUE PRIMARY btree(oid
+	// oid_ops), backing MAKE_SYSCACHE(SUBSCRIPTIONOID, …). PG's
+	// load_critical_index pass opens every declared index of a nailed
+	// rel; without this entry RelationIdGetRelation(6114) FATALs because
+	// no pg_class row gets seeded.
+	{6114, "pg_subscription_oid_index"},
+	// M0106-0010 Step 3cf: pg_subscription_subname_index (OID 6115).
+	// PG18 `postgres/src/include/catalog/pg_subscription.h:104` declares
+	// `SubscriptionNameIndexId = 6115` as UNIQUE composite
+	// btree(subdbid oid_ops, subname name_ops), backing
+	// MAKE_SYSCACHE(SUBSCRIPTIONNAME, …). Surfaced by
+	// `TestE2E_FailoverGoopgToPG/async` as the next FATAL after Step 3ce
+	// seeded pg_statistic. Companion to OID 6114 (oid PKEY) over the
+	// already-nailed pg_subscription heap OID 6100.
+	{6115, "pg_subscription_subname_index"},
 })
 
 // nailedLocalRels lists all local nailed relations (heaps + indexes flattened).

@@ -869,6 +869,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3997, // pg_statistic_ext_name_index (Step 3cd)
 		3379, // pg_statistic_ext_relid_index (Step 3cd)
 		2696, // pg_statistic_relid_att_inh_index (Step 3ce)
+		6114, // pg_subscription_oid_index (Step 3cf)
+		6115, // pg_subscription_subname_index (Step 3cf)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -936,6 +938,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3997, // pg_statistic_ext_name_index (Step 3cd)
 		3379, // pg_statistic_ext_relid_index (Step 3cd)
 		2696, // pg_statistic_relid_att_inh_index (Step 3ce)
+		6114, // pg_subscription_oid_index (Step 3cf)
+		6115, // pg_subscription_subname_index (Step 3cf)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -1861,6 +1865,32 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// (BKI_SHARED_RELATION) over pg_replication_origin heap OID 6000.
 		// Without this entry RelationIdGetRelation(6002) FATALs.
 		entry(6002, 6000, []int16{2}, []uint32{textOps}, []uint32{cCollation}, true, false), // pg_replication_origin_roname_index
+		// M0106-0010 Step 3cf: pg_subscription_oid_index.
+		//   postgres/src/include/catalog/pg_subscription.h:103
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_subscription_oid_index, 6114,
+		//       SubscriptionObjectIndexId, pg_subscription,
+		//       btree(oid oid_ops));
+		//   MAKE_SYSCACHE(SUBSCRIPTIONOID, pg_subscription_oid_index, 4);
+		// pg_subscription attnums (pg_subscription_d.h): 1=oid, 2=subdbid,
+		// 3=subskiplsn, 4=subname, ... UNIQUE PRIMARY single oid_ops key
+		// (no collation) over pg_subscription heap OID 6100 (already
+		// nailed shared rel). Same single-column oid_ops UNIQUE PRIMARY
+		// pattern as pg_replication_origin_roiident_index (6001).
+		entry(6114, 6100, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_subscription_oid_index
+		// M0106-0010 Step 3cf: pg_subscription_subname_index.
+		//   postgres/src/include/catalog/pg_subscription.h:104
+		//     DECLARE_UNIQUE_INDEX(pg_subscription_subname_index, 6115,
+		//       SubscriptionNameIndexId, pg_subscription,
+		//       btree(subdbid oid_ops, subname name_ops));
+		//   MAKE_SYSCACHE(SUBSCRIPTIONNAME, pg_subscription_subname_index, 4);
+		// pg_subscription attnums: subdbid = col 2 (oid_ops, no
+		// collation), subname = col 4 (name_ops, C_COLLATION_OID = 950).
+		// UNIQUE (NOT primary; DECLARE_UNIQUE_INDEX, not the _PKEY
+		// variant — PKEY is 6114). Composite shared-catalog btree.
+		// E2E test (TestE2E_FailoverGoopgToPG/async with
+		// GOOPG_RUN_BLOCKED_M0102_E2E=1) surfaced OID 6115 as the next
+		// FATAL after Step 3ce seeded pg_statistic.
+		entry(6115, 6100, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_subscription_subname_index
 	}
 	// Local-catalog index rows mirroring nailedLocalRels.
 	local := []pgIndexEntry{

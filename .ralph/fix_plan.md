@@ -7319,6 +7319,62 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         FATAL on 3381 is closed — next FATAL is OID 2619 (`pg_statistic`),
         to be handled by Step 3ce. Design:
         `docs/design/0106-0010-step3cd-pg-statistic-ext-nailed-rel.md`.
+      - Step 3cf LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 6115` PG-standby boot blocker that surfaces
+        after Step 3ce seeded pg_statistic. OID 6115 is
+        `pg_subscription_subname_index` per
+        `postgres/src/include/catalog/pg_subscription.h:104`
+        (`DECLARE_UNIQUE_INDEX(pg_subscription_subname_index, 6115,
+        SubscriptionNameIndexId, pg_subscription, btree(subdbid
+        oid_ops, subname name_ops))`). pg_subscription is shared
+        (`BKI_SHARED_RELATION`); the heap (6100) was already nailed by
+        an earlier step but its two declared indexes were missing.
+        PG's `load_critical_index` opens every declared index of a
+        nailed rel, so both must be seeded family-complete: 6114
+        `pg_subscription_oid_index` UNIQUE PRIMARY single `oid
+        oid_ops` (backs `MAKE_SYSCACHE(SUBSCRIPTIONOID, …, 4)`); 6115
+        UNIQUE composite `(subdbid oid_ops, subname name_ops)` (backs
+        `MAKE_SYSCACHE(SUBSCRIPTIONNAME, …, 4)`).
+        (a) `nailedSharedRels` idxSpec list (relcache_init.go) gains
+        `{6114, "pg_subscription_oid_index"}` and `{6115,
+        "pg_subscription_subname_index"}` after the Step 3ca 6002
+        entry.
+        (b) `pgIndexInitialEntries` shared section (initdb.go) gains
+        `entry(6114, 6100, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` and `entry(6115, 6100, []int16{2, 4},
+        []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true,
+        false)` after the Step 3ca 6002 entry. Subname is heap col 4
+        (subskiplsn at col 3 sits between subdbid and subname).
+        (c) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain `6114` and `6115` after the
+        Step 3ce 2696 entry.
+        (d) No new entries in `bootstrapSharedCatalogPlaceholders`
+        heapOIDs — `6100` (pg_subscription heap under `global/`) was
+        already seeded.
+        (e) No new type-helper entries: `oid` (26) and `name` (19) are
+        already registered in `pgCatalogTypeOID` / `pgCatalogTypeLen`
+        / `pgTypeByVal` / `pgTypeAlignChar` / `pgTypeStorageChar`.
+        Regression pins:
+        `TestNailedSharedRelsContainsPgSubscriptionIndexes`,
+        `TestPgSubscriptionIndexInitialEntries` in
+        `internal/initdb/pg_subscription_indexes_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `6114:{1}` and `6115:{2,4}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 6114, 6115.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedSharedRelsContainsPgSubscriptionIndexes|TestPgSubscriptionIndexInitialEntries|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgClassOidIndexHasSingleKeyColumn|TestPgIndexColDefsMatchesRelcacheAttrs'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3ce (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. E2E re-run
+        (`GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -run
+        TestE2E_FailoverGoopgToPG/async ./internal/testport/`) confirms
+        FATAL on 6115 is closed — next FATAL is OID 6102
+        (`pg_subscription_rel`), to be handled by Step 3cg. Design:
+        `docs/design/0106-0010-step3cf-pg-subscription-indexes.md`.
       - Step 3ce LANDED 2026-05-18. Closes the FATAL `could not open
         relation with OID 2619` PG-standby boot blocker that surfaces
         after Step 3cd seeded the pg_statistic_ext family. OID 2619 is
