@@ -7774,6 +7774,66 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/executor/ ./internal/server/ ./internal/storage/
         ./internal/catalog/ ./internal/mvcc/` PASS. Design:
         `docs/design/0106-0010-step3ce-pg-statistic-nailed-rel.md`.
+      - Step 3cm LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 3600` PG-standby boot blocker that surfaces
+        after Step 3ck seeded the pg_ts_config family. OID 3600 is
+        `pg_ts_dict` per `postgres/src/include/catalog/pg_ts_dict.h:29`
+        (`CATALOG(pg_ts_dict,3600,TSDictionaryRelationId)`).
+        Per-database (non-shared) catalog. Family-complete seed: heap
+        3600 + both declared indexes 3604 (`pg_ts_dict_dictname_index`,
+        UNIQUE btree(dictname name_ops, dictnamespace oid_ops), backs
+        `MAKE_SYSCACHE(TSDICTNAMENSP, …, 2)`) and 3605
+        (`pg_ts_dict_oid_index`, UNIQUE PRIMARY btree(oid oid_ops),
+        backs `MAKE_SYSCACHE(TSDICTOID, …, 2)`). First nailed catalog
+        in M0106-0010 with a CATALOG_VARLEN NULLABLE column
+        (dictinitoption text 25/-1).
+        (a) `pgTsDictAttrs()` (relcache_init.go) returns the 6-column
+        PG18 schema: oid (26/4 NOT NULL) + dictname (name 19/64 NOT
+        NULL) + dictnamespace (26/4 NOT NULL BKI_LOOKUP pg_namespace)
+        + dictowner (26/4 NOT NULL BKI_LOOKUP pg_authid) + dicttemplate
+        (26/4 NOT NULL BKI_LOOKUP pg_ts_template) + dictinitoption
+        (text 25/-1 NULLABLE, CATALOG_VARLEN). pg_ts_dict DOES have an
+        `oid` system column. RelType=83 is safe (no
+        `TSDictionaryRelation_Rowtype_Id` in PG18 headers).
+        (b) `nailedLocalRels` heap list gains `{3600, "pg_ts_dict", 83,
+        'r', 6, false, pgTsDictAttrs()}` after the Step 3ck 3602 entry;
+        idxSpec list gains `{3604, "pg_ts_dict_dictname_index"}` and
+        `{3605, "pg_ts_dict_oid_index"}` after the Step 3ck 3712 entry.
+        (c) `pgIndexInitialEntries` local section gains
+        `entry(3604, 3600, []int16{2, 3}, []uint32{nameOps, oidOps},
+        []uint32{cCollation, 0}, true, false)` and `entry(3605, 3600,
+        []int16{1}, []uint32{oidOps}, []uint32{0}, true, true)`.
+        (d) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain 3604 and 3605 after the Step
+        3ck 3712 entry.
+        (e) `bootstrapMappedLocalCatalogHeaps` `oids` slice and
+        `localRelMap` gain 3600 (the authoritative OID); pre-existing
+        stale 3766 placeholder (mislabeled "pg_ts_dict" — 3766 has no
+        upstream catalog assignment) is left in place and its comment
+        updated to flag the historical mislabel.
+        (f) No new type-helper entries needed: oid (26), name (19),
+        text (25) are all already registered in
+        `pgCatalogTypeOID` / `pgCatalogTypeLen` / `pgTypeByVal` /
+        `pgTypeAlignChar` / `pgTypeStorageChar`.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgTsDict`,
+        `TestNailedLocalRelsContainsPgTsDictIndexes`,
+        `TestPgTsDictIndexInitialEntries`,
+        `TestPgTsDictAttrsTypeOIDsMatchPG18` in
+        `internal/initdb/pg_ts_dict_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended
+        with `3604:{2,3}` and `3605:{1}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3604 and 3605.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        '<targeted>' ./internal/initdb/` PASS; `go test -count=1
+        ./internal/initdb/` — same 14 pre-existing baseline failures
+        as Step 3ck (no new regressions); cross-package smoke `go test
+        -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
+        PASS. Design:
+        `docs/design/0106-0010-step3cm-pg-ts-dict-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

@@ -524,6 +524,24 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pg_authid) + cfgparser (oid 26, BKI_LOOKUP pg_ts_parser). pg_ts_config
 	// DOES have an `oid` system column — attnum 1 = oid.
 	{3602, "pg_ts_config", 83, 'r', 5, false, pgTsConfigAttrs()},
+	// M0106-0010 step 3cm: pg_ts_dict is opened during PG-standby boot
+	// once Step 3ck cleared the pg_ts_config family. Without a pg_class
+	// row, `RelationBuildDesc(3600) → ScanPgRelation(3600)` returns NULL
+	// and the backend FATALs with `could not open relation with OID
+	// 3600`. RelType=83 is safe because pg_ts_dict is not formrdesc'd
+	// (no `TSDictionaryRelation_Rowtype_Id` constant in PG18 headers —
+	// only pg_database/pg_authid/pg_auth_members/pg_shseclabel/
+	// pg_subscription are formrdesc'd shared rels at
+	// `postgres/src/backend/utils/cache/relcache.c:4075-4083`). Schema per
+	// `postgres/src/include/catalog/pg_ts_dict.h` (PG18,
+	// TSDictionaryRelationId == 3600). 6 columns total: oid (26) +
+	// dictname (name 19, 64-byte NameData) + dictnamespace (oid 26,
+	// BKI_LOOKUP pg_namespace) + dictowner (oid 26, BKI_LOOKUP pg_authid)
+	// + dicttemplate (oid 26, BKI_LOOKUP pg_ts_template) are all
+	// fixed-width NOT NULL; dictinitoption (text 25) is CATALOG_VARLEN
+	// NULLABLE. pg_ts_dict DOES have an `oid` system column — attnums
+	// start at 1 = oid.
+	{3600, "pg_ts_dict", 83, 'r', 6, false, pgTsDictAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1094,6 +1112,26 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// RelationIdGetRelation(3712) FATALs; flattenRels derives
 		// RelNatts=1 via pgIndexNattsByOID.
 		{3712, "pg_ts_config_oid_index"},
+		// M0106-0010 Step 3cm: pg_ts_dict_dictname_index. PG18
+		// `postgres/src/include/catalog/pg_ts_dict.h:56` declares
+		// `DECLARE_UNIQUE_INDEX(pg_ts_dict_dictname_index, 3604,
+		// TSDictionaryNameNspIndexId, pg_ts_dict, btree(dictname name_ops,
+		// dictnamespace oid_ops))`. UNIQUE (NOT PRIMARY) 2-column composite
+		// key. Heap OID 3600 (pg_ts_dict) is the nailed local rel above.
+		// Backs MAKE_SYSCACHE(TSDICTNAMENSP, pg_ts_dict_dictname_index, 2).
+		// Without this entry RelationIdGetRelation(3604) FATALs; flattenRels
+		// derives RelNatts=2 via pgIndexNattsByOID.
+		{3604, "pg_ts_dict_dictname_index"},
+		// M0106-0010 Step 3cm: pg_ts_dict_oid_index. PG18
+		// `postgres/src/include/catalog/pg_ts_dict.h:57` declares
+		// `DECLARE_UNIQUE_INDEX_PKEY(pg_ts_dict_oid_index, 3605,
+		// TSDictionaryOidIndexId, pg_ts_dict, btree(oid oid_ops))`. UNIQUE
+		// PRIMARY single-column key. Heap OID 3600 (pg_ts_dict) is the
+		// nailed local rel above. Backs MAKE_SYSCACHE(TSDICTOID,
+		// pg_ts_dict_oid_index, 2). Without this entry
+		// RelationIdGetRelation(3605) FATALs; flattenRels derives
+		// RelNatts=1 via pgIndexNattsByOID.
+		{3605, "pg_ts_dict_oid_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1500,6 +1538,28 @@ func pgTsConfigAttrs() []nailedAttr {
 		{Name: "cfgnamespace", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
 		{Name: "cfgowner", TypeOID: 26, Num: 4, Len: 4, NotNull: true},
 		{Name: "cfgparser", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
+	}
+}
+
+// pgTsDictAttrs returns the pg_ts_dict column descriptors (M0106-0010
+// Step 3cm). Source: PG18 `postgres/src/include/catalog/pg_ts_dict.h:29`
+// (`CATALOG(pg_ts_dict,3600,TSDictionaryRelationId)`) and
+// `pg_ts_dict_d.h` (Anum_pg_ts_dict_* 1..6, Natts_pg_ts_dict == 6).
+// pg_ts_dict DOES have an `oid` system column — attnums start at 1 = oid.
+// Columns 1..5 are fixed-width NOT NULL: oid / dictnamespace / dictowner
+// / dicttemplate are 4-byte OID columns (dictnamespace BKI_LOOKUP
+// pg_namespace, dictowner BKI_LOOKUP pg_authid, dicttemplate BKI_LOOKUP
+// pg_ts_template); dictname is the 64-byte NameData fixed string
+// (typoid 19). Column 6 dictinitoption is a CATALOG_VARLEN text (typoid
+// 25, varlena Len=-1) and is NULLABLE.
+func pgTsDictAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "dictname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
+		{Name: "dictnamespace", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "dictowner", TypeOID: 26, Num: 4, Len: 4, NotNull: true},
+		{Name: "dicttemplate", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
+		{Name: "dictinitoption", TypeOID: 25, Num: 6, Len: -1, NotNull: false},
 	}
 }
 

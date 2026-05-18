@@ -447,7 +447,8 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		3764, // pg_ts_config (stale — true pg_ts_config OID is 3602, seeded above; placeholder retained as no-op empty heap)
 		3603, // pg_ts_config_map (M0106-0010 step 3cj) — authoritative OID per pg_ts_config_map.h:30
 		3765, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603, seeded above; placeholder retained as no-op empty heap)
-		3766, // pg_ts_dict
+		3600, // pg_ts_dict (M0106-0010 step 3cm) — authoritative OID per pg_ts_dict.h:29
+		3766, // pg_ts_dict (stale — true pg_ts_dict OID is 3600, seeded above; placeholder retained as no-op empty heap)
 		3767, // pg_ts_parser
 		3768, // pg_ts_template
 		3466, // pg_event_trigger (M0106-0010 step 3ar)
@@ -793,7 +794,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{3764, 3764}, // pg_ts_config (stale — true pg_ts_config OID is 3602, mapped above)
 		{3603, 3603}, // pg_ts_config_map (M0106-0010 step 3cj) — authoritative OID per pg_ts_config_map.h:30
 		{3765, 3765}, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603, mapped above)
-		{3766, 3766}, // pg_ts_dict
+		{3600, 3600}, // pg_ts_dict (M0106-0010 step 3cm) — authoritative OID per pg_ts_dict.h:29
+		{3766, 3766}, // pg_ts_dict (stale — true pg_ts_dict OID is 3600, mapped above)
 		{3767, 3767}, // pg_ts_parser
 		{3768, 3768}, // pg_ts_template
 		{3466, 3466}, // pg_event_trigger (M0106-0010 step 3ar)
@@ -885,6 +887,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3609, // pg_ts_config_map_index (Step 3cj)
 		3608, // pg_ts_config_cfgname_index (Step 3ck)
 		3712, // pg_ts_config_oid_index (Step 3ck)
+		3604, // pg_ts_dict_dictname_index (Step 3cm)
+		3605, // pg_ts_dict_oid_index (Step 3cm)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -962,6 +966,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3609, // pg_ts_config_map_index (Step 3cj)
 		3608, // pg_ts_config_cfgname_index (Step 3ck)
 		3712, // pg_ts_config_oid_index (Step 3ck)
+		3604, // pg_ts_dict_dictname_index (Step 3cm)
+		3605, // pg_ts_dict_oid_index (Step 3cm)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2747,6 +2753,28 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// rel added in Step 3ck. UNIQUE PRIMARY single-column key, oid_ops
 		// with no collation.
 		entry(3712, 3602, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_ts_config_oid_index
+		// M0106-0010 Step 3cm: pg_ts_dict_dictname_index. PG18
+		//   postgres/src/include/catalog/pg_ts_dict.h:56
+		//     DECLARE_UNIQUE_INDEX(pg_ts_dict_dictname_index, 3604,
+		//       TSDictionaryNameNspIndexId, pg_ts_dict,
+		//       btree(dictname name_ops, dictnamespace oid_ops));
+		//   MAKE_SYSCACHE(TSDICTNAMENSP, pg_ts_dict_dictname_index, 2);
+		// pg_ts_dict attnums (pg_ts_dict_d.h): 1=oid, 2=dictname,
+		// 3=dictnamespace, 4=dictowner, 5=dicttemplate, 6=dictinitoption.
+		// IndKey = {2, 3}. Heap OID 3600 is the nailed local rel added in
+		// Step 3cm. UNIQUE (NOT PRIMARY) 2-column composite key; dictname
+		// uses C_COLLATION_OID (name catalog columns use C collation),
+		// dictnamespace has no collation.
+		entry(3604, 3600, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false), // pg_ts_dict_dictname_index
+		// M0106-0010 Step 3cm: pg_ts_dict_oid_index. PG18
+		//   postgres/src/include/catalog/pg_ts_dict.h:57
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_ts_dict_oid_index, 3605,
+		//       TSDictionaryOidIndexId, pg_ts_dict, btree(oid oid_ops));
+		//   MAKE_SYSCACHE(TSDICTOID, pg_ts_dict_oid_index, 2);
+		// pg_ts_dict attnums: 1=oid. Heap OID 3600 is the nailed local rel
+		// added in Step 3cm. UNIQUE PRIMARY single-column key, oid_ops with
+		// no collation.
+		entry(3605, 3600, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_ts_dict_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

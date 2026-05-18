@@ -109,6 +109,8 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		3609: {1, 2, 3},   // pg_ts_config_map_index : btree(mapcfg oid_ops, maptokentype int4_ops, mapseqno int4_ops) UNIQUE PRIMARY ← Step 3cj
 		3608: {2, 3},      // pg_ts_config_cfgname_index : btree(cfgname name_ops, cfgnamespace oid_ops) UNIQUE ← Step 3ck
 		3712: {1},         // pg_ts_config_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ck
+		3604: {2, 3},      // pg_ts_dict_dictname_index : btree(dictname name_ops, dictnamespace oid_ops) UNIQUE ← Step 3cm
+		3605: {1},         // pg_ts_dict_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3cm
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {
