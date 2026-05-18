@@ -474,6 +474,24 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pg_subscription_rel has no `oid` system column — attnums start at
 	// 1 = srsubid.
 	{6102, "pg_subscription_rel", 83, 'r', 4, false, pgSubscriptionRelAttrs()},
+	// M0106-0010 step 3ci: pg_transform is opened during PG-standby boot
+	// once Step 3ch cleared the pg_tablespace family. Without a pg_class
+	// row, `RelationBuildDesc(3576) → ScanPgRelation(3576)` returns NULL
+	// and the backend FATALs with `could not open relation with OID 3576`.
+	// RelType=83 is safe because pg_transform is not formrdesc'd (no
+	// `TransformRelation_Rowtype_Id` constant in PG18 headers — only
+	// pg_database/pg_authid/pg_auth_members/pg_shseclabel/pg_subscription
+	// are formrdesc'd shared rels at
+	// `postgres/src/backend/utils/cache/relcache.c:4075-4083`). Schema per
+	// `postgres/src/include/catalog/pg_transform.h` (PG18,
+	// TransformRelationId == 3576). 5 columns total: oid (26) + trftype
+	// (26, BKI_LOOKUP pg_type) + trflang (26, BKI_LOOKUP pg_language) +
+	// trffromsql (regproc 24, BKI_LOOKUP_OPT pg_proc) + trftosql (regproc
+	// 24, BKI_LOOKUP_OPT pg_proc). All fixed-width NOT NULL — BKI_LOOKUP_OPT
+	// means the FK lookup is optional (stores 0 when no function), but
+	// the column itself stays NOT NULL. pg_transform DOES have an `oid`
+	// system column — attnum 1 = oid.
+	{3576, "pg_transform", 83, 'r', 5, false, pgTransformAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -992,6 +1010,27 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// RelationIdGetRelation(6117) FATALs; flattenRels derives RelNatts=2
 		// via pgIndexNattsByOID.
 		{6117, "pg_subscription_rel_srrelid_srsubid_index"},
+		// M0106-0010 Step 3ci: pg_transform_oid_index. PG18
+		// `postgres/src/include/catalog/pg_transform.h:43` declares
+		// `DECLARE_UNIQUE_INDEX_PKEY(pg_transform_oid_index, 3574,
+		// TransformOidIndexId, pg_transform, btree(oid oid_ops))`. UNIQUE
+		// PRIMARY single-column key. Heap OID 3576 (pg_transform) is the
+		// nailed local rel above. Backs MAKE_SYSCACHE(TRFOID,
+		// pg_transform_oid_index, 16). Without this entry
+		// RelationIdGetRelation(3574) FATALs; flattenRels derives
+		// RelNatts=1 via pgIndexNattsByOID.
+		{3574, "pg_transform_oid_index"},
+		// M0106-0010 Step 3ci: pg_transform_type_lang_index. PG18
+		// `postgres/src/include/catalog/pg_transform.h:44` declares
+		// `DECLARE_UNIQUE_INDEX(pg_transform_type_lang_index, 3575,
+		// TransformTypeLangIndexId, pg_transform, btree(trftype oid_ops,
+		// trflang oid_ops))`. UNIQUE (NOT PRIMARY) 2-column composite key,
+		// both oid_ops with no collation. Heap OID 3576 (pg_transform) is
+		// the nailed local rel above. Backs MAKE_SYSCACHE(TRFTYPELANG,
+		// pg_transform_type_lang_index, 16). Without this entry
+		// RelationIdGetRelation(3575) FATALs; flattenRels derives
+		// RelNatts=2 via pgIndexNattsByOID.
+		{3575, "pg_transform_type_lang_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1341,6 +1380,26 @@ func pgSubscriptionRelAttrs() []nailedAttr {
 		{Name: "srrelid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
 		{Name: "srsubstate", TypeOID: 18, Num: 3, Len: 1, NotNull: true},
 		{Name: "srsublsn", TypeOID: 3220, Num: 4, Len: 8, NotNull: false},
+	}
+}
+
+// pgTransformAttrs returns the pg_transform column descriptors
+// (M0106-0010 Step 3ci). Source: PG18
+// `postgres/src/include/catalog/pg_transform.h:29`
+// (`CATALOG(pg_transform,3576,TransformRelationId)`) and
+// `pg_transform_d.h` (Anum_pg_transform_* 1..5, Natts_pg_transform == 5).
+// pg_transform DOES have an `oid` system column — attnum 1 = oid. All
+// columns are fixed-width NOT NULL: trftype/trflang/trffromsql/trftosql
+// are 4-byte OID columns. BKI_LOOKUP_OPT on trffromsql/trftosql means the
+// pg_proc FK lookup is optional (stores 0 when the transform has no
+// fromsql / tosql function), but the column itself is still NOT NULL.
+func pgTransformAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "trftype", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
+		{Name: "trflang", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "trffromsql", TypeOID: 24, Num: 4, Len: 4, NotNull: true},
+		{Name: "trftosql", TypeOID: 24, Num: 5, Len: 4, NotNull: true},
 	}
 }
 

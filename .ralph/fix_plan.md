@@ -7319,6 +7319,76 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         FATAL on 3381 is closed — next FATAL is OID 2619 (`pg_statistic`),
         to be handled by Step 3ce. Design:
         `docs/design/0106-0010-step3cd-pg-statistic-ext-nailed-rel.md`.
+      - Step 3ci LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 3576` PG-standby boot blocker that surfaces
+        after Step 3ch seeded the pg_tablespace family. OID 3576 is
+        `pg_transform` per
+        `postgres/src/include/catalog/pg_transform.h:29`
+        (`CATALOG(pg_transform,3576,TransformRelationId)`). Per-database
+        (non-shared) catalog. Family-complete seed: heap 3576 + both
+        declared indexes 3574 (`pg_transform_oid_index`, UNIQUE PRIMARY
+        btree(oid oid_ops), backs `MAKE_SYSCACHE(TRFOID, …, 16)`) and
+        3575 (`pg_transform_type_lang_index`, UNIQUE btree(trftype
+        oid_ops, trflang oid_ops), backs `MAKE_SYSCACHE(TRFTYPELANG, …,
+        16)`).
+        (a) `pgTransformAttrs()` (relcache_init.go) returns the 5-column
+        PG18 schema verbatim from `pg_transform.h:29-36` +
+        `pg_transform_d.h` (Anum_pg_transform_* 1..5, Natts_pg_transform
+        == 5): oid (26/4 NOT NULL) + trftype (26/4 NOT NULL BKI_LOOKUP
+        pg_type) + trflang (26/4 NOT NULL BKI_LOOKUP pg_language) +
+        trffromsql (regproc 24/4 NOT NULL BKI_LOOKUP_OPT pg_proc — stores
+        0 when no fromsql func) + trftosql (regproc 24/4 NOT NULL
+        BKI_LOOKUP_OPT pg_proc — same). pg_transform DOES have an `oid`
+        system column. RelType=83 is safe (no
+        `TransformRelation_Rowtype_Id` in PG18 headers; only
+        pg_database/pg_authid/pg_auth_members/pg_shseclabel/pg_subscription
+        are formrdesc'd at
+        `postgres/src/backend/utils/cache/relcache.c:4075-4083`).
+        (b) `nailedLocalRels` (relcache_init.go) heap list gains
+        `{3576, "pg_transform", 83, 'r', 5, false, pgTransformAttrs()}`
+        after the Step 3cg 6102 entry; idxSpec list gains
+        `{3574, "pg_transform_oid_index"}` and `{3575,
+        "pg_transform_type_lang_index"}` after the Step 3cg 6117 entry.
+        (c) `pgIndexInitialEntries` local section (initdb.go) gains
+        `entry(3574, 3576, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` and `entry(3575, 3576, []int16{2, 3},
+        []uint32{oidOps, oidOps}, []uint32{0, 0}, true, false)` after
+        the Step 3cg 6117 entry.
+        (d) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain `3574` and `3575` after the
+        Step 3ch 2698 entry.
+        (e) `bootstrapMappedLocalCatalogHeaps` oids list and
+        `localRelMap` gain `3576` (authoritative pg_transform OID per
+        `pg_transform.h:29`). Pre-existing stale 6137 placeholder
+        (mislabeled "pg_transform" — 6137 has no upstream catalog
+        assignment) is left in place as a harmless empty 8 KiB heap
+        page; its comment is updated to flag the historical mislabel.
+        (f) No new type-helper entries: `oid` (26) and `regproc` (24)
+        are already registered in `pgCatalogTypeOID` / `pgCatalogTypeLen`
+        / `pgTypeByVal` / `pgTypeAlignChar` / `pgTypeStorageChar`.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgTransform`,
+        `TestNailedLocalRelsContainsPgTransformIndexes`,
+        `TestPgTransformIndexInitialEntries`,
+        `TestPgTransformAttrsTypeOIDsMatchPG18` in
+        `internal/initdb/pg_transform_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `3574:{1}` + `3575:{2,3}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3574 + 3575.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgTransform|TestPgTransformIndexInitialEntries|TestPgTransformAttrsTypeOIDsMatchPG18|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgClassOidIndexHasSingleKeyColumn|TestPgIndexColDefsMatchesRelcacheAttrs'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3ch (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. E2E re-run
+        (`GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -run
+        TestE2E_FailoverGoopgToPG/async ./internal/testport/`) confirms
+        FATAL on 3576 is closed — next FATAL is OID 3603
+        (`pg_ts_config_map`), to be handled by Step 3cj. Design:
+        `docs/design/0106-0010-step3ci-pg-transform-nailed-rel.md`.
       - Step 3ch LANDED 2026-05-18. Closes the FATAL `could not open
         relation with OID 1213` PG-standby boot blocker that surfaces
         after Step 3cg seeded the pg_subscription_rel family. OID 1213

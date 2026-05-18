@@ -461,10 +461,11 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		3541, // pg_range (M0106-0010 step 3bz)
 		2224, // pg_sequence (M0106-0010 step 3cb)
 		3429, // pg_statistic_ext_data (M0106-0010 step 3cc)
+		3576, // pg_transform (M0106-0010 step 3ci) — authoritative OID per pg_transform.h
 		6003, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		6101, // pg_publication_rel
 		6102, // pg_subscription_rel (stale comment was "pg_sequence" — true pg_sequence OID is 2224, seeded above)
-		6137, // pg_transform
+		6137, // pg_transform (stale — true pg_transform OID is 3576, seeded above; placeholder retained as no-op empty heap)
 		6245, // pg_statistic_ext_data
 		9400, // pg_db_role_setting
 	}
@@ -804,10 +805,11 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{3541, 3541}, // pg_range (M0106-0010 step 3bz)
 		{2224, 2224}, // pg_sequence (M0106-0010 step 3cb)
 		{3429, 3429}, // pg_statistic_ext_data (M0106-0010 step 3cc)
+		{3576, 3576}, // pg_transform (M0106-0010 step 3ci) — authoritative OID per pg_transform.h
 		{6003, 6003}, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		{6101, 6101}, // pg_publication_rel
 		{6102, 6102}, // pg_subscription_rel (stale comment was "pg_sequence" — true pg_sequence OID is 2224, mapped above)
-		{6137, 6137}, // pg_transform
+		{6137, 6137}, // pg_transform (stale — true pg_transform OID is 3576, mapped above)
 		{6239, 6239}, // pg_authid (shared but also local copy sometimes)
 		{6245, 6245}, // pg_statistic_ext_data
 		{9400, 9400}, // pg_db_role_setting (shared but may need local mapping)
@@ -874,6 +876,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		6117, // pg_subscription_rel_srrelid_srsubid_index (Step 3cg)
 		2697, // pg_tablespace_oid_index (Step 3ch)
 		2698, // pg_tablespace_spcname_index (Step 3ch)
+		3574, // pg_transform_oid_index (Step 3ci)
+		3575, // pg_transform_type_lang_index (Step 3ci)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -946,6 +950,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		6117, // pg_subscription_rel_srrelid_srsubid_index (Step 3cg)
 		2697, // pg_tablespace_oid_index (Step 3ch)
 		2698, // pg_tablespace_spcname_index (Step 3ch)
+		3574, // pg_transform_oid_index (Step 3ci)
+		3575, // pg_transform_type_lang_index (Step 3ci)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2679,6 +2685,25 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// added in Step 3cg. UNIQUE PRIMARY 2-column composite key, both
 		// columns oid_ops with no collation.
 		entry(6117, 6102, []int16{2, 1}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, true), // pg_subscription_rel_srrelid_srsubid_index
+		// M0106-0010 Step 3ci: pg_transform_oid_index. PG18
+		//   postgres/src/include/catalog/pg_transform.h:43
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_transform_oid_index, 3574,
+		//       TransformOidIndexId, pg_transform, btree(oid oid_ops));
+		//   MAKE_SYSCACHE(TRFOID, pg_transform_oid_index, 16);
+		// pg_transform attnums (pg_transform_d.h): 1=oid. Heap OID 3576 is
+		// the nailed local rel added in Step 3ci. UNIQUE PRIMARY single-column
+		// key, oid_ops with no collation.
+		entry(3574, 3576, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_transform_oid_index
+		// M0106-0010 Step 3ci: pg_transform_type_lang_index. PG18
+		//   postgres/src/include/catalog/pg_transform.h:44
+		//     DECLARE_UNIQUE_INDEX(pg_transform_type_lang_index, 3575,
+		//       TransformTypeLangIndexId, pg_transform,
+		//       btree(trftype oid_ops, trflang oid_ops));
+		//   MAKE_SYSCACHE(TRFTYPELANG, pg_transform_type_lang_index, 16);
+		// pg_transform attnums: 1=oid, 2=trftype, 3=trflang. IndKey = {2, 3}.
+		// UNIQUE (NOT PRIMARY) 2-column composite key, both oid_ops with no
+		// collation.
+		entry(3575, 3576, []int16{2, 3}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, false), // pg_transform_type_lang_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
