@@ -6284,6 +6284,68 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         (`pg_opfamily_oid_index`, UNIQUE PRIMARY) deferred to Step 3bo.
         Design:
         `docs/design/0106-0010-step3bn-pg-opfamily-am-name-nsp-index.md`.
+      - Step 3bo LANDED 2026-05-18. Closes the anticipated FATAL
+        `could not open relation with OID 2755` PG-standby boot blocker
+        that surfaces after Step 3bn seeded
+        `pg_opfamily_am_name_nsp_index` (OID 2754). OID 2755 is
+        `pg_opfamily_oid_index` per
+        `postgres/src/include/catalog/pg_opfamily.h:54`
+        (`DECLARE_UNIQUE_INDEX_PKEY(pg_opfamily_oid_index, 2755,
+        OpfamilyOidIndexId, pg_opfamily, btree(oid oid_ops))`). Backs
+        `MAKE_SYSCACHE(OPFAMILYOID, pg_opfamily_oid_index, 8)`. Pure
+        catalog-seed addition mirroring the single-column `oid_ops`
+        UNIQUE PKEY pattern of Steps 3bk (pg_language_oid_index 2682),
+        3l (pg_opclass_oid_index 2687), 3ax (pg_extension_oid_index
+        3080), 3at (pg_event_trigger_oid_index 3468), 3bd
+        (pg_foreign_data_wrapper_oid_index 112), and 3bg
+        (pg_foreign_server_oid_index 113); no encoder/builder/Init flow
+        change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` appends
+        `entry(2755, 2753, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` after the Step 3bn 2754 entry. UNIQUE PRIMARY
+        single oid_ops key (no collation) over pg_opfamily heap OID
+        2753 (already a nailed local rel since Step 3bm).
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{2755, "pg_opfamily_oid_index"}` after the 2754 entry.
+        `flattenRels`+`pgIndexNattsByOID` derives `RelKind='i',
+        RelNatts=1` so the `relnatts==indnatts` check (relcache.c:1492)
+        passes.
+        (c) Three empty-placeholder OID lists at
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        gain `2755 // pg_opfamily_oid_index (Step 3bo)` immediately
+        after the 2754 entry from Step 3bn. Step-3k empty-btree
+        placeholder is sufficient because pg_opfamily is currently
+        unpopulated — any `SearchSysCache1(OPFAMILYOID, …)` probe
+        correctly returns no row.
+        Regression pins:
+        `TestPgOpfamilyOidIndexSeededFromInitialEntries` (pins
+        `(IndRelid=2753, IndKey=[1], IsUnique=true, IsPrimary=true,
+        IndCollation=[0])`) and
+        `TestNailedLocalRelsContainsPgOpfamilyOidIndex` (pins
+        `RelName, RelKind='i', RelNatts=1`) in
+        `internal/initdb/pg_opfamily_oid_index_test.go`; existing
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `2755:{1}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2755. Verified: `go build ./...` PASS; targeted
+        tests
+        `TestPgOpfamilyOidIndex|TestNailedLocalRelsContainsPgOpfamilyOidIndex|
+        TestPgOpfamilyAmNameNspIndex|TestNailedLocalRelsContainsPgOpfamilyAmNameNspIndex|
+        TestNailedLocalRelsContainsPgOpfamily|TestPgIndexInitialEntriesIndkeyMatchesPG18|
+        TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|
+        TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|
+        TestPgClassOidIndexHasSingleKeyColumn|TestBootstrapMappedLocalCatalogHeapsIncludesPgOpfamily|
+        TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestPgOperatorOprnameLRNIndex|
+        TestPgLanguageOidIndex|TestPgLanguageNameIndex` PASS;
+        `go test -count=1 ./internal/initdb/` — same 14 pre-existing
+        baseline failures as Step 3bn (no new regressions);
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Closes Step 3bn's deferred companion —
+        both pg_opfamily indexes (2754 am_name_nsp + 2755 oid PKEY)
+        are now seeded.
+        Design:
+        `docs/design/0106-0010-step3bo-pg-opfamily-oid-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

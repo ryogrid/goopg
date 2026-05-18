@@ -702,6 +702,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, 2692, 2693, 2701, 2703,
 		2754, // pg_opfamily_am_name_nsp_index (Step 3bn)
+		2755, // pg_opfamily_oid_index (Step 3bo)
 		2704, 3085, 3164,
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
@@ -820,6 +821,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, 2692, 2693, 2701, 2703,
 		2754, // pg_opfamily_am_name_nsp_index (Step 3bn)
+		2755, // pg_opfamily_oid_index (Step 3bo)
 		2704, 3085, 3164,
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
@@ -866,6 +868,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, 2692, 2693, 2701, 2703,
 		2754, // pg_opfamily_am_name_nsp_index (Step 3bn)
+		2755, // pg_opfamily_oid_index (Step 3bo)
 		2704, 3085, 3164,
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
@@ -2219,6 +2222,24 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// with GOOPG_RUN_BLOCKED_M0102_E2E=1) confirmed OID 2754 as the
 		// next FATAL after Step 3bm seeded pg_opfamily heap.
 		entry(2754, 2753, []int16{2, 3, 4}, []uint32{oidOps, nameOps, oidOps}, []uint32{0, cCollation, 0}, true, false), // pg_opfamily_am_name_nsp_index
+		// M0106-0010 Step 3bo: pg_opfamily_oid_index.
+		//   postgres/src/include/catalog/pg_opfamily.h:54
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_opfamily_oid_index, 2755,
+		//       OpfamilyOidIndexId, pg_opfamily, btree(oid oid_ops));
+		//   MAKE_SYSCACHE(OPFAMILYOID, pg_opfamily_oid_index, 8);
+		// UNIQUE PRIMARY single oid_ops key (no collation) on pg_opfamily
+		// heap OID 2753 (already a nailed local rel since Step 3bm). E2E
+		// test (TestE2E_FailoverGoopgToPG/async with
+		// GOOPG_RUN_BLOCKED_M0102_E2E=1) is expected to surface OID 2755
+		// as the next FATAL after Step 3bn seeded
+		// pg_opfamily_am_name_nsp_index. Mirrors the single-column oid_ops
+		// UNIQUE PKEY pattern of pg_language_oid_index (2682, Step 3bk),
+		// pg_opclass_oid_index (2687, Step 3l),
+		// pg_extension_oid_index (3080, Step 3ax),
+		// pg_event_trigger_oid_index (3468, Step 3at),
+		// pg_foreign_data_wrapper_oid_index (112, Step 3bd),
+		// pg_foreign_server_oid_index (113, Step 3bg).
+		entry(2755, 2753, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_opfamily_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
