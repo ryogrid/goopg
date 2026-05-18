@@ -72,6 +72,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		548:  {2},         // pg_foreign_data_wrapper_name_index : btree(fdwname name_ops) UNIQUE ← Step 3bc
 		112:  {1},         // pg_foreign_data_wrapper_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3bd
 		549:  {2},         // pg_foreign_server_name_index : btree(srvname name_ops) UNIQUE ← Step 3bf
+		113:  {1},         // pg_foreign_server_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3bg
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

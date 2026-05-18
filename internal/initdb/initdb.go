@@ -708,6 +708,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		548,  // pg_foreign_data_wrapper_name_index (Step 3bc)
 		112,  // pg_foreign_data_wrapper_oid_index (Step 3bd)
 		549,  // pg_foreign_server_name_index (Step 3bf)
+		113,  // pg_foreign_server_oid_index (Step 3bg)
 	} {
 		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -818,6 +819,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		548,  // pg_foreign_data_wrapper_name_index (Step 3bc)
 		112,  // pg_foreign_data_wrapper_oid_index (Step 3bd)
 		549,  // pg_foreign_server_name_index (Step 3bf)
+		113,  // pg_foreign_server_oid_index (Step 3bg)
 	} {
 		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -858,6 +860,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		548,  // pg_foreign_data_wrapper_name_index (Step 3bc)
 		112,  // pg_foreign_data_wrapper_oid_index (Step 3bd)
 		549,  // pg_foreign_server_name_index (Step 3bf)
+		113,  // pg_foreign_server_oid_index (Step 3bg)
 	} {
 		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2090,6 +2093,21 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// after Step 3be — process_settings → catcache init opens
 		// FOREIGNSERVERNAME before FOREIGNSERVEROID.
 		entry(549, 1417, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false), // pg_foreign_server_name_index
+		// M0106-0010 Step 3bg: pg_foreign_server_oid_index.
+		//   postgres/src/include/catalog/pg_foreign_server.h:58
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_foreign_server_oid_index, 113,
+		//       ForeignServerOidIndexId, pg_foreign_server,
+		//       btree(oid oid_ops));
+		//   MAKE_SYSCACHE(FOREIGNSERVEROID,
+		//     pg_foreign_server_oid_index, 2);
+		// pg_foreign_server attnums (pg_foreign_server_d.h):
+		// 1=oid. UNIQUE PRIMARY KEY over the pg_foreign_server heap OID
+		// 1417 (Step 3be nailed rel). Single oid_ops key with collation
+		// 0 — same single-column oid PKEY pattern as
+		// pg_foreign_data_wrapper_oid_index (112, Step 3bd) and
+		// pg_extension_oid_index. Companion to OID 549 (Step 3bf);
+		// surfaced as the next E2E FATAL after Step 3bf landed.
+		entry(113, 1417, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_foreign_server_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
