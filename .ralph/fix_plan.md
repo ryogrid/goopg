@@ -9123,6 +9123,57 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `attcollation=0` on rolname vs PG's expected 950, which
         would cause `FunctionCall2Coll` to pass a NULL `OidCollation
         *` that `namecmp` would deref).
+      - Step 3dg LANDED 2026-05-18: pg_authid_rolname_index typed-key
+        descriptor. Step 3df capture in `tmp/m0106-step3dg/e2e_run1.log`
+        shows `si_addr == RDI == 0x00000000006f7972` and `RDX == 0x40`;
+        byte-wise RDI decodes to `"ryo\0\0\0\0\0"` — the inline NameData
+        prefix of the leaf `IndexTuple` in `global/2676` loaded as a
+        by-value Datum and passed to `__strncmp_avx2` as a pointer.
+        Neither the leaf encoding nor the heap row was at fault (both
+        already byte-pinned by Steps 3cx/3de); the bug was in the
+        *relcache descriptor*. `internal/initdb/relcache_init.go::
+        indexKeyAttrs` unconditionally stamped every nailed index key
+        as `oid`-typed (TypeOID=26, Len=4, attbyval=1), so PG's
+        `_bt_compare→index_getattr(itup, 1, descr, &isnull)` did a
+        `fetch_att` with `attbyval=true, attlen=4` — a `*(int32*)`
+        load over the leaf's NameData area producing Datum `0x006f7972`.
+        Fix widens `idxSpec` with an optional `Attrs []nailedAttr`
+        override threaded through `indexNailed` and `flattenRels`; the
+        shared-rel entry for OID 2676 now carries
+        `{Name:"rolname", TypeOID:19, Num:1, Len:64, NotNull:true}` so
+        `buildPgAttributeBlob` emits `attbyval=0, attlen=64,
+        attalign='c'`. All other `idxSpec` literals converted from
+        positional to named-field form so they remain valid against
+        the widened struct (no semantic change). Pin
+        `internal/initdb/pg_authid_indexes_test.go::
+        TestNailedPgAuthidRolnameIndexHasNameDescriptor` asserts
+        the entry's RelKind/RelNatts/Attrs, then re-encodes the blob
+        and checks attbyval (offset 82) == 0, attalign (offset 83)
+        == 'c', attlen (int16 LE at 72:74) == 64. Targeted tests
+        pass (`go test -run 'TestNailedPgAuthidRolnameIndex|
+        TestBootstrapPgAuthid|TestPgBuildIndexTupleName' ./internal/
+        initdb/`); full `./internal/initdb/` — same pre-existing
+        baseline failures as Step 3df (TestSynchronousCommitFlushes
+        ByDefault et al. — already tracked as M0106-0012 / unrelated
+        migration tests; no new regressions). E2E (`tmp/m0106-step3dg/
+        e2e_run2.log`): no `GOOPG_SEGV_BACKTRACE` lines, no `signal
+        11` lines. New failure is `FATAL: 3D000: database "postgres"
+        does not exist` at the very first psql connection. Design:
+        `docs/design/0106-0010-step3dg-pg-authid-rolname-index-name-
+        typed-descriptor.md`.
+        Next blocker (Step 3dh): the postgres backend rejects the
+        first `psql -d postgres` because pg_database (`global/1262`)
+        is missing the canonical row with `datname='postgres'`,
+        `oid=5`. Audit `bootstrapPgDatabaseTuples` (or equivalent)
+        for the seeded rows — likely the row is present but with
+        wrong datname or wrong OID, or pg_database_datname_index
+        (OID 2671) leaf is empty / non-PG-conformant. Use the same
+        E2E re-run as the verification gate. Note: 2671 is also a
+        name-typed key, so it carries the *same* latent SEGV that
+        3dg just fixed for 2676 — its idxSpec needs the same
+        `Attrs: [{Name:"datname", TypeOID:19, Len:64, …}]` override.
+        Pre-emptive fix or wait for the next E2E to surface it as a
+        SEGV is a judgement call for whoever opens Step 3dh.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

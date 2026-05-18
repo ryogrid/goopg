@@ -186,6 +186,66 @@ func leafContainsName(file []byte, name string) bool {
 	return false
 }
 
+
+// TestNailedPgAuthidRolnameIndexHasNameDescriptor (M0106-0010 Step 3dg)
+// pins the relcache nailedRel descriptor for pg_authid_rolname_index (OID
+// 2676). The default indexKeyAttrs() stamps every key as the 4-byte oid
+// type (attbyval=1, attlen=4); leaving that on a name_ops btree makes PG's
+// _bt_compare→index_getattr load the first 4 inline NameData bytes of the
+// leaf IndexTuple as a by-val Datum and pass them to btnamecmp as a
+// pointer. For the OS-user rolname "ryo" the load produces Datum
+// 0x006f7972, which __strncmp_avx2 dereferences → SIGSEGV at si_addr
+// 0x6f7972 (captured by the LD_PRELOAD shim in Step 3df).
+//
+// The fix supplies an explicit attr with TypeOID=19 (name), Len=64, which
+// makes buildPgAttributeBlob emit attbyval=0, attlen=64, attalign='c' —
+// the contract btnamecmp expects.
+func TestNailedPgAuthidRolnameIndexHasNameDescriptor(t *testing.T) {
+	var rel *nailedRel
+	for i := range nailedSharedRels {
+		if nailedSharedRels[i].OID == 2676 {
+			rel = &nailedSharedRels[i]
+			break
+		}
+	}
+	if rel == nil {
+		t.Fatal("nailedSharedRels: OID 2676 (pg_authid_rolname_index) missing")
+	}
+	if rel.RelKind != 'i' {
+		t.Errorf("RelKind=%q, want 'i'", rel.RelKind)
+	}
+	if rel.RelNatts != 1 {
+		t.Errorf("RelNatts=%d, want 1", rel.RelNatts)
+	}
+	if len(rel.Attrs) != 1 {
+		t.Fatalf("Attrs len=%d, want 1", len(rel.Attrs))
+	}
+	a := rel.Attrs[0]
+	if a.TypeOID != 19 {
+		t.Errorf("Attrs[0].TypeOID=%d, want 19 (name)", a.TypeOID)
+	}
+	if a.Len != 64 {
+		t.Errorf("Attrs[0].Len=%d, want 64 (NAMEDATALEN)", a.Len)
+	}
+	if a.Name != "rolname" {
+		t.Errorf("Attrs[0].Name=%q, want \"rolname\"", a.Name)
+	}
+	// Most importantly: the materialised pg_attribute blob must have
+	// attbyval=0 and attalign='c'. If either of these regresses to the
+	// oid defaults (attbyval=1, attalign='i') the SEGV returns.
+	blob := buildPgAttributeBlob(a)
+	if blob[82] != 0 {
+		t.Errorf("buildPgAttributeBlob.attbyval=%d, want 0", blob[82])
+	}
+	if blob[83] != 'c' {
+		t.Errorf("buildPgAttributeBlob.attalign=%q, want 'c'", blob[83])
+	}
+	// attlen at offset 72:74 (int16 LE).
+	if got := uint16(blob[72]) | uint16(blob[73])<<8; got != 64 {
+		t.Errorf("buildPgAttributeBlob.attlen=%d, want 64", got)
+	}
+}
+
 func leafContainsOid(file []byte, oid uint32) bool {
 	leaf := file[storage.BlockSize : 2*storage.BlockSize]
 	le := binary.LittleEndian

@@ -156,26 +156,40 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// `global/2964` is produced by `bootstrapSharedCatalogPlaceholders`.
 	{2964, "pg_db_role_setting", 83, 'r', 3, true, pgDbRoleSettingAttrs()},
 }, []idxSpec{
-	{2671, "pg_database_datname_index"},
-	{2672, "pg_database_oid_index"},
-	{2676, "pg_authid_rolname_index"},
-	{2677, "pg_authid_oid_index"},
+	{OID: 2671, Name: "pg_database_datname_index"},
+	{OID: 2672, Name: "pg_database_oid_index"},
+	// M0106-0010 Step 3dg: pg_authid_rolname_index (OID 2676) is a
+	// 1-column UNIQUE btree on pg_authid.rolname (name_ops). The
+	// default oid-stamped descriptor (attlen=4, attbyval=1) was wrong:
+	// PG's _bt_compare→index_getattr loaded the first 4 inline
+	// NameData bytes of the leaf IndexTuple as a by-val Datum and
+	// passed those bytes to btnamecmp as a pointer. For the OS-user
+	// rolname "ryo" the 4 bytes are 0x72 0x79 0x6f 0x00 → Datum
+	// 0x006f7972, which __strncmp_avx2 dereferenced → SIGSEGV
+	// (si_addr=0x6f7972, RDI=0x6f7972 captured via the LD_PRELOAD
+	// shim in Step 3df). The name-typed override below makes PG
+	// read the key as a fixed-length 64-byte NameData pointer, which
+	// is what btnamecmp expects.
+	{OID: 2676, Name: "pg_authid_rolname_index", Attrs: []nailedAttr{
+		{Name: "rolname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
+	}},
+	{OID: 2677, Name: "pg_authid_oid_index"},
 	// M0106-0010 Step 3z: pg_auth_members_role_member_index. PG18
 	// `postgres/src/include/catalog/pg_auth_members.h:49` declares
 	// `AuthMemRoleMemIndexId = 2694` as a 3-column composite
 	// btree(roleid, member, grantor). Without this entry
 	// RelationIdGetRelation(2694) FATALs because no pg_class row
 	// gets seeded; the sibling 2695 follows the same pattern.
-	{2694, "pg_auth_members_role_member_index"},
-	{2695, "pg_auth_members_member_role_index"},
-	{3593, "pg_shseclabel_object_index"},
+	{OID: 2694, Name: "pg_auth_members_role_member_index"},
+	{OID: 2695, Name: "pg_auth_members_member_role_index"},
+	{OID: 3593, Name: "pg_shseclabel_object_index"},
 	// M0106-0010 Step 3bq: pg_parameter_acl_parname_index (OID 6246).
 	// PG18 `postgres/src/include/catalog/pg_parameter_acl.h:53` declares
 	// `ParameterAclParnameIndexId = 6246` as UNIQUE btree(parname text_ops).
 	// Without this entry RelationIdGetRelation(6246) FATALs because no
 	// pg_class row gets seeded for the index. Companion to OID 6247
 	// (pg_parameter_acl_oid_index, UNIQUE PRIMARY) seeded in Step 3br below.
-	{6246, "pg_parameter_acl_parname_index"},
+	{OID: 6246, Name: "pg_parameter_acl_parname_index"},
 	// M0106-0010 Step 3br: pg_parameter_acl_oid_index (OID 6247).
 	// PG18 `postgres/src/include/catalog/pg_parameter_acl.h:54` declares
 	// `ParameterAclOidIndexId = 6247` as UNIQUE PRIMARY btree(oid oid_ops),
@@ -183,20 +197,20 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// RelationIdGetRelation(6247) FATALs even though the Form_pg_index row
 	// exists, because no pg_class row gets seeded. Sibling to OID 6246
 	// (parname text_ops UNIQUE non-PKEY) from Step 3bq.
-	{6247, "pg_parameter_acl_oid_index"},
+	{OID: 6247, Name: "pg_parameter_acl_oid_index"},
 	// M0106-0010 Step 3ca: pg_replication_origin_roiident_index (OID 6001).
 	// PG18 `postgres/src/include/catalog/pg_replication_origin.h:57` declares
 	// `ReplicationOriginIdentIndex = 6001` as UNIQUE PRIMARY btree(roident
 	// oid_ops), backing MAKE_SYSCACHE(REPLORIGIDENT, …). Without this entry
 	// RelationIdGetRelation(6001) FATALs because no pg_class row gets seeded
 	// for the index. Sibling to OID 6002 (roname text_ops UNIQUE non-PKEY).
-	{6001, "pg_replication_origin_roiident_index"},
+	{OID: 6001, Name: "pg_replication_origin_roiident_index"},
 	// M0106-0010 Step 3ca: pg_replication_origin_roname_index (OID 6002).
 	// PG18 `postgres/src/include/catalog/pg_replication_origin.h:58` declares
 	// `ReplicationOriginNameIndex = 6002` as UNIQUE btree(roname text_ops),
 	// backing MAKE_SYSCACHE(REPLORIGNAME, …). Companion to OID 6001
 	// (pg_replication_origin_roiident_index, UNIQUE PRIMARY).
-	{6002, "pg_replication_origin_roname_index"},
+	{OID: 6002, Name: "pg_replication_origin_roname_index"},
 	// M0106-0010 Step 3cf: pg_subscription_oid_index (OID 6114).
 	// PG18 `postgres/src/include/catalog/pg_subscription.h:103` declares
 	// `SubscriptionObjectIndexId = 6114` as UNIQUE PRIMARY btree(oid
@@ -204,7 +218,7 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// load_critical_index pass opens every declared index of a nailed
 	// rel; without this entry RelationIdGetRelation(6114) FATALs because
 	// no pg_class row gets seeded.
-	{6114, "pg_subscription_oid_index"},
+	{OID: 6114, Name: "pg_subscription_oid_index"},
 	// M0106-0010 Step 3cf: pg_subscription_subname_index (OID 6115).
 	// PG18 `postgres/src/include/catalog/pg_subscription.h:104` declares
 	// `SubscriptionNameIndexId = 6115` as UNIQUE composite
@@ -213,7 +227,7 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// `TestE2E_FailoverGoopgToPG/async` as the next FATAL after Step 3ce
 	// seeded pg_statistic. Companion to OID 6114 (oid PKEY) over the
 	// already-nailed pg_subscription heap OID 6100.
-	{6115, "pg_subscription_subname_index"},
+	{OID: 6115, Name: "pg_subscription_subname_index"},
 	// M0106-0010 Step 3ch: pg_tablespace_oid_index (OID 2697).
 	// PG18 `postgres/src/include/catalog/pg_tablespace.h:52` declares
 	// `TablespaceOidIndexId = 2697` as UNIQUE PRIMARY btree(oid oid_ops),
@@ -222,14 +236,14 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// RelationIdGetRelation(2697) FATALs because no pg_class row gets
 	// seeded for the index. Sibling to OID 2698 (spcname name_ops UNIQUE
 	// non-PKEY).
-	{2697, "pg_tablespace_oid_index"},
+	{OID: 2697, Name: "pg_tablespace_oid_index"},
 	// M0106-0010 Step 3ch: pg_tablespace_spcname_index (OID 2698).
 	// PG18 `postgres/src/include/catalog/pg_tablespace.h:53` declares
 	// `TablespaceNameIndexId = 2698` as UNIQUE btree(spcname name_ops)
 	// (no MAKE_SYSCACHE — used directly by get_tablespace_oid()).
 	// Companion to OID 2697 (oid PKEY) over the pg_tablespace heap OID 1213
 	// nailed in this same step.
-	{2698, "pg_tablespace_spcname_index"},
+	{OID: 2698, Name: "pg_tablespace_spcname_index"},
 	// M0106-0010 Step 3cu: pg_db_role_setting_databaseid_rol_index (OID 2965).
 	// PG18 `postgres/src/include/catalog/pg_db_role_setting.h:51` declares
 	// `DECLARE_UNIQUE_INDEX_PKEY(pg_db_role_setting_databaseid_rol_index,
@@ -240,7 +254,7 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// every declared index of a nailed rel; without this entry
 	// RelationIdGetRelation(2965) FATALs because no pg_class row gets
 	// seeded.
-	{2965, "pg_db_role_setting_databaseid_rol_index"},
+	{OID: 2965, Name: "pg_db_role_setting_databaseid_rol_index"},
 })
 
 // nailedLocalRels lists all local nailed relations (heaps + indexes flattened).
@@ -623,26 +637,26 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// an `oid` system column — attnum 1 = oid.
 	{1418, "pg_user_mapping", 83, 'r', 4, false, pgUserMappingAttrs()},
 }, []idxSpec{
-	{2703, "pg_type_oid_index"},
-	{2704, "pg_type_typname_nsp_index"},
-	{2658, "pg_attribute_relid_attnam_index"},
-	{2659, "pg_attribute_relid_attnum_index"},
-	{2662, "pg_class_oid_index"},
-	{2663, "pg_class_relname_nsp_index"},
-	{2690, "pg_proc_oid_index"},
-	{2691, "pg_proc_proname_args_nsp_index"},
-	{2678, "pg_index_indrelid_index"},
-	{2679, "pg_index_indexrelid_index"},
-	{2687, "pg_opclass_oid_index"},
-	{2655, "pg_amproc_oid_index"},
-	{2693, "pg_rewrite_rel_rulename_index"},
-	{2701, "pg_trigger_tgrelid_tgname_index"},
-	{2667, "pg_constraint_oid_index"},
-	{2688, "pg_operator_oid_index"},
-	{2680, "pg_inherits_relid_seqno_index"},
-	{2684, "pg_namespace_nspname_index"},
-	{2685, "pg_namespace_oid_index"},
-	{2654, "pg_amop_opr_fam_index"},
+	{OID: 2703, Name: "pg_type_oid_index"},
+	{OID: 2704, Name: "pg_type_typname_nsp_index"},
+	{OID: 2658, Name: "pg_attribute_relid_attnam_index"},
+	{OID: 2659, Name: "pg_attribute_relid_attnum_index"},
+	{OID: 2662, Name: "pg_class_oid_index"},
+	{OID: 2663, Name: "pg_class_relname_nsp_index"},
+	{OID: 2690, Name: "pg_proc_oid_index"},
+	{OID: 2691, Name: "pg_proc_proname_args_nsp_index"},
+	{OID: 2678, Name: "pg_index_indrelid_index"},
+	{OID: 2679, Name: "pg_index_indexrelid_index"},
+	{OID: 2687, Name: "pg_opclass_oid_index"},
+	{OID: 2655, Name: "pg_amproc_oid_index"},
+	{OID: 2693, Name: "pg_rewrite_rel_rulename_index"},
+	{OID: 2701, Name: "pg_trigger_tgrelid_tgname_index"},
+	{OID: 2667, Name: "pg_constraint_oid_index"},
+	{OID: 2688, Name: "pg_operator_oid_index"},
+	{OID: 2680, Name: "pg_inherits_relid_seqno_index"},
+	{OID: 2684, Name: "pg_namespace_nspname_index"},
+	{OID: 2685, Name: "pg_namespace_oid_index"},
+	{OID: 2654, Name: "pg_amop_opr_fam_index"},
 	// M0106-0010 Step 3x: pg_aggregate_fnoid_index. PG18
 	// `postgres/src/include/catalog/pg_aggregate.h:113` declares
 	// `AggregateFnoidIndexId = 2650`. RelationInitIndexAccessInfo's
@@ -650,14 +664,14 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// entry to flow through flattenRels → pgIndexNattsByOID so the
 	// nailed pg_class row's relnatts matches the pg_index row's
 	// indnatts == 1.
-	{2650, "pg_aggregate_fnoid_index"},
+	{OID: 2650, Name: "pg_aggregate_fnoid_index"},
 	// M0106-0010 Step 3y: pg_amop_fam_strat_index. PG18
 	// `postgres/src/include/catalog/pg_amop.h:90` declares
 	// `AccessMethodStrategyIndexId = 2653` as a 4-column composite
 	// btree(amopfamily, amoplefttype, amoprighttype, amopstrategy).
 	// Without this entry RelationIdGetRelation(2653) FATALs because
 	// no pg_class row gets seeded.
-	{2653, "pg_amop_fam_strat_index"},
+	{OID: 2653, Name: "pg_amop_fam_strat_index"},
 	// M0106-0010 Step 3ab: pg_cast_oid_index. PG18
 	// `postgres/src/include/catalog/pg_cast.h:59` declares
 	// `CastOidIndexId = 2660` as UNIQUE PRIMARY KEY on
@@ -665,7 +679,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// FATALs because no pg_class row gets seeded; flattenRels also
 	// derives RelNatts=1 via pgIndexNattsByOID, satisfying
 	// RelationInitIndexAccessInfo's relnatts/indnatts check.
-	{2660, "pg_cast_oid_index"},
+	{OID: 2660, Name: "pg_cast_oid_index"},
 	// M0106-0010 Step 3ac: pg_cast_source_target_index. PG18
 	// `postgres/src/include/catalog/pg_cast.h:60` declares
 	// `CastSourceTargetIndexId = 2661` as UNIQUE (not PRIMARY) on
@@ -673,7 +687,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// RelationIdGetRelation(2661) FATALs because no pg_class row gets
 	// seeded; flattenRels derives RelNatts=2 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check.
-	{2661, "pg_cast_source_target_index"},
+	{OID: 2661, Name: "pg_cast_source_target_index"},
 	// M0106-0010 Step 3ad: pg_opclass_am_name_nsp_index. PG18
 	// `postgres/src/include/catalog/pg_opclass.h:85` declares
 	// `OpclassAmNameNspIndexId = 2686` as UNIQUE (not PRIMARY) on
@@ -682,7 +696,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pg_class row gets seeded; flattenRels derives RelNatts=3 via
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
-	{2686, "pg_opclass_am_name_nsp_index"},
+	{OID: 2686, Name: "pg_opclass_am_name_nsp_index"},
 	// M0106-0010 Step 3ae: pg_collation_name_enc_nsp_index. PG18
 	// `postgres/src/include/catalog/pg_collation.h:62` declares
 	// `CollationNameEncNspIndexId = 3164` as UNIQUE (not PRIMARY) on
@@ -691,7 +705,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pg_class row gets seeded; flattenRels derives RelNatts=3 via
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
-	{3164, "pg_collation_name_enc_nsp_index"},
+	{OID: 3164, Name: "pg_collation_name_enc_nsp_index"},
 	// M0106-0010 Step 3af: pg_collation_oid_index. PG18
 	// `postgres/src/include/catalog/pg_collation.h:63` declares
 	// `CollationOidIndexId = 3085` as UNIQUE PRIMARY on btree(oid oid_ops).
@@ -699,7 +713,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pg_class row gets seeded; flattenRels derives RelNatts=1 via
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
-	{3085, "pg_collation_oid_index"},
+	{OID: 3085, Name: "pg_collation_oid_index"},
 	// M0106-0010 Step 3ah: pg_conversion_default_index. PG18
 	// `postgres/src/include/catalog/pg_conversion.h:63` declares
 	// `ConversionDefaultIndexId = 2668` as UNIQUE (not PRIMARY) on
@@ -709,7 +723,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pg_class row gets seeded; flattenRels derives RelNatts=4 via
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
-	{2668, "pg_conversion_default_index"},
+	{OID: 2668, Name: "pg_conversion_default_index"},
 	// M0106-0010 Step 3ai: pg_conversion_oid_index. PG18
 	// `postgres/src/include/catalog/pg_conversion.h:65` declares
 	// `ConversionOidIndexId = 2670` as UNIQUE PRIMARY KEY on
@@ -719,7 +733,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// because no pg_class row gets seeded; flattenRels derives RelNatts=1
 	// via pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
-	{2670, "pg_conversion_oid_index"},
+	{OID: 2670, Name: "pg_conversion_oid_index"},
 	// M0106-0010 Step 3aj: pg_conversion_name_nsp_index. PG18
 	// `postgres/src/include/catalog/pg_conversion.h:64` declares
 	// `ConversionNameNspIndexId = 2669` as UNIQUE (not PRIMARY) on
@@ -730,7 +744,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// RelNatts=2 via pgIndexNattsByOID, satisfying
 	// RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{2669, "pg_conversion_name_nsp_index"},
+	{OID: 2669, Name: "pg_conversion_name_nsp_index"},
 	// M0106-0010 Step 3al: pg_default_acl_role_nsp_obj_index. PG18
 	// `postgres/src/include/catalog/pg_default_acl.h:54` declares
 	// `DefaultAclRoleNspObjIndexId = 827` as UNIQUE (not PRIMARY) on
@@ -742,7 +756,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// row gets seeded; flattenRels derives RelNatts=3 via
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
-	{827, "pg_default_acl_role_nsp_obj_index"},
+	{OID: 827, Name: "pg_default_acl_role_nsp_obj_index"},
 	// M0106-0010 Step 3am: pg_default_acl_oid_index. PG18
 	// `postgres/src/include/catalog/pg_default_acl.h:55` declares
 	// `DefaultAclOidIndexId = 828` as UNIQUE PRIMARY KEY on
@@ -752,7 +766,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pg_class row gets seeded; flattenRels derives RelNatts=1 via
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
-	{828, "pg_default_acl_oid_index"},
+	{OID: 828, Name: "pg_default_acl_oid_index"},
 	// M0106-0010 Step 3ao: pg_enum_oid_index. PG18
 	// `postgres/src/include/catalog/pg_enum.h:47` declares
 	// `EnumOidIndexId = 3502` as UNIQUE PRIMARY KEY on btree(oid oid_ops).
@@ -764,7 +778,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// RelNatts=1 via pgIndexNattsByOID, satisfying
 	// RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{3502, "pg_enum_oid_index"},
+	{OID: 3502, Name: "pg_enum_oid_index"},
 	// M0106-0010 Step 3ap: pg_enum_typid_label_index. PG18
 	// `postgres/src/include/catalog/pg_enum.h:48` declares
 	// `EnumTypIdLabelIndexId = 3503` as UNIQUE (non-PKEY) composite on
@@ -775,7 +789,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=2 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{3503, "pg_enum_typid_label_index"},
+	{OID: 3503, Name: "pg_enum_typid_label_index"},
 	// M0106-0010 Step 3aq: pg_enum_typid_sortorder_index. PG18
 	// `postgres/src/include/catalog/pg_enum.h:48` declares
 	// `EnumTypIdSortOrderIndexId = 3534` as UNIQUE (non-PKEY) composite on
@@ -786,7 +800,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// row gets seeded; flattenRels derives RelNatts=2 via
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
-	{3534, "pg_enum_typid_sortorder_index"},
+	{OID: 3534, Name: "pg_enum_typid_sortorder_index"},
 	// M0106-0010 Step 3as: pg_event_trigger_evtname_index. PG18
 	// `postgres/src/include/catalog/pg_event_trigger.h:54` declares
 	// `EventTriggerNameIndexId = 3467` as UNIQUE (non-PKEY) on
@@ -797,7 +811,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{3467, "pg_event_trigger_evtname_index"},
+	{OID: 3467, Name: "pg_event_trigger_evtname_index"},
 	// M0106-0010 Step 3at: pg_event_trigger_oid_index. PG18
 	// `postgres/src/include/catalog/pg_event_trigger.h:55` declares
 	// `EventTriggerOidIndexId = 3468` as UNIQUE PRIMARY KEY on
@@ -808,7 +822,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{3468, "pg_event_trigger_oid_index"},
+	{OID: 3468, Name: "pg_event_trigger_oid_index"},
 	// M0106-0010 Step 3ax: pg_extension_oid_index. PG18
 	// `postgres/src/include/catalog/pg_extension.h:56` declares
 	// `ExtensionOidIndexId = 3080` as UNIQUE PRIMARY KEY on
@@ -819,7 +833,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{3080, "pg_extension_oid_index"},
+	{OID: 3080, Name: "pg_extension_oid_index"},
 	// M0106-0010 Step 3ay: pg_extension_name_index. PG18
 	// `postgres/src/include/catalog/pg_extension.h:57` declares
 	// `ExtensionNameIndexId = 3081` as UNIQUE (non-PKEY) on
@@ -830,7 +844,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{3081, "pg_extension_name_index"},
+	{OID: 3081, Name: "pg_extension_name_index"},
 	// M0106-0010 Step 3bc: pg_foreign_data_wrapper_name_index. PG18
 	// `postgres/src/include/catalog/pg_foreign_data_wrapper.h:56`
 	// declares `ForeignDataWrapperNameIndexId = 548` as UNIQUE
@@ -842,7 +856,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{548, "pg_foreign_data_wrapper_name_index"},
+	{OID: 548, Name: "pg_foreign_data_wrapper_name_index"},
 	// M0106-0010 Step 3bd: pg_foreign_data_wrapper_oid_index. PG18
 	// `postgres/src/include/catalog/pg_foreign_data_wrapper.h:55`
 	// declares `ForeignDataWrapperOidIndexId = 112` as UNIQUE PRIMARY
@@ -854,7 +868,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{112, "pg_foreign_data_wrapper_oid_index"},
+	{OID: 112, Name: "pg_foreign_data_wrapper_oid_index"},
 	// M0106-0010 Step 3bf: pg_foreign_server_name_index. PG18
 	// `postgres/src/include/catalog/pg_foreign_server.h:55`
 	// declares `ForeignServerNameIndexId = 549` as UNIQUE
@@ -866,7 +880,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{549, "pg_foreign_server_name_index"},
+	{OID: 549, Name: "pg_foreign_server_name_index"},
 	// M0106-0010 Step 3bg: pg_foreign_server_oid_index. PG18
 	// `postgres/src/include/catalog/pg_foreign_server.h:58`
 	// declares `ForeignServerOidIndexId = 113` as UNIQUE PRIMARY
@@ -878,7 +892,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{113, "pg_foreign_server_oid_index"},
+	{OID: 113, Name: "pg_foreign_server_oid_index"},
 	// M0106-0010 Step 3bi: pg_foreign_table_relid_index. PG18
 	// `postgres/src/include/catalog/pg_foreign_table.h:47`
 	// declares `ForeignTableRelidIndexId = 3119` as UNIQUE PRIMARY
@@ -889,7 +903,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{3119, "pg_foreign_table_relid_index"},
+	{OID: 3119, Name: "pg_foreign_table_relid_index"},
 	// M0106-0010 Step 3bj: pg_language_name_index. PG18
 	// `postgres/src/include/catalog/pg_language.h:69`
 	// declares `LanguageNameIndexId = 2681` as UNIQUE (NOT primary)
@@ -900,7 +914,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{2681, "pg_language_name_index"},
+	{OID: 2681, Name: "pg_language_name_index"},
 	// M0106-0010 Step 3bk: pg_language_oid_index. PG18
 	// `postgres/src/include/catalog/pg_language.h:70`
 	// declares `LanguageOidIndexId = 2682` as UNIQUE PRIMARY KEY
@@ -911,7 +925,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{2682, "pg_language_oid_index"},
+	{OID: 2682, Name: "pg_language_oid_index"},
 	// M0106-0010 Step 3bl: pg_operator_oprname_l_r_n_index. PG18
 	// `postgres/src/include/catalog/pg_operator.h:86`
 	// declares `OperatorNameNspIndexId = 2689` as UNIQUE (NOT primary)
@@ -923,7 +937,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=4 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{2689, "pg_operator_oprname_l_r_n_index"},
+	{OID: 2689, Name: "pg_operator_oprname_l_r_n_index"},
 	// M0106-0010 Step 3bn: pg_opfamily_am_name_nsp_index. PG18
 	// `postgres/src/include/catalog/pg_opfamily.h:47`
 	// declares `OpfamilyAmNameNspIndexId = 2754` as UNIQUE (NOT primary)
@@ -935,7 +949,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pg_class row gets seeded; flattenRels derives RelNatts=3 via
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
-	{2754, "pg_opfamily_am_name_nsp_index"},
+	{OID: 2754, Name: "pg_opfamily_am_name_nsp_index"},
 	// M0106-0010 Step 3bo: pg_opfamily_oid_index.
 	// `postgres/src/include/catalog/pg_opfamily.h:54`
 	// declares `OpfamilyOidIndexId = 2755` as UNIQUE PRIMARY KEY on
@@ -946,7 +960,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// pg_class row gets seeded; flattenRels derives RelNatts=1 via
 	// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 	// relnatts/indnatts check (relcache.c:1492).
-	{2755, "pg_opfamily_oid_index"},
+	{OID: 2755, Name: "pg_opfamily_oid_index"},
 		// M0106-0010 Step 3bt: pg_partitioned_table_partrelid_index.
 		// `postgres/src/include/catalog/pg_partitioned_table.h:69`
 		// declares `PartitionedRelidIndexId = 3351` as UNIQUE PRIMARY KEY
@@ -957,7 +971,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_class row gets seeded; flattenRels derives RelNatts=1 via
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
-		{3351, "pg_partitioned_table_partrelid_index"},
+		{OID: 3351, Name: "pg_partitioned_table_partrelid_index"},
 		// M0106-0010 Step 3bv: pg_publication_pubname_index.
 		// `postgres/src/include/catalog/pg_publication.h:73`
 		// declares `PublicationNameIndexId = 6111` as UNIQUE (NOT primary)
@@ -968,7 +982,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_class row gets seeded; flattenRels derives RelNatts=1 via
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
-		{6111, "pg_publication_pubname_index"},
+		{OID: 6111, Name: "pg_publication_pubname_index"},
 		// M0106-0010 Step 3bw: pg_publication_oid_index.
 		// `postgres/src/include/catalog/pg_publication.h:72`
 		// declares `PublicationObjectIndexId = 6110` as UNIQUE PRIMARY KEY
@@ -979,7 +993,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_class row gets seeded; flattenRels derives RelNatts=1 via
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
-		{6110, "pg_publication_oid_index"},
+		{OID: 6110, Name: "pg_publication_oid_index"},
 		// M0106-0010 Step 3bx: pg_publication_namespace_oid_index.
 		// `postgres/src/include/catalog/pg_publication_namespace.h:44`
 		// declares `PublicationNamespaceObjectIndexId = 6238` as UNIQUE
@@ -991,7 +1005,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// no pg_class row gets seeded; flattenRels derives RelNatts=1
 		// via pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
-		{6238, "pg_publication_namespace_oid_index"},
+		{OID: 6238, Name: "pg_publication_namespace_oid_index"},
 		// M0106-0010 Step 3bx: pg_publication_namespace_pnnspid_pnpubid_index.
 		// `postgres/src/include/catalog/pg_publication_namespace.h:45`
 		// declares `PublicationNamespacePnnspidPnpubidIndexId = 6239`
@@ -1004,7 +1018,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_class row gets seeded; flattenRels derives RelNatts=2 via
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
-		{6239, "pg_publication_namespace_pnnspid_pnpubid_index"},
+		{OID: 6239, Name: "pg_publication_namespace_pnnspid_pnpubid_index"},
 		// M0106-0010 Step 3by: pg_publication_rel_oid_index.
 		// `postgres/src/include/catalog/pg_publication_rel.h:50`
 		// declares `PublicationRelObjectIndexId = 6112` as UNIQUE
@@ -1016,7 +1030,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// gets seeded; flattenRels derives RelNatts=1 via
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
-		{6112, "pg_publication_rel_oid_index"},
+		{OID: 6112, Name: "pg_publication_rel_oid_index"},
 		// M0106-0010 Step 3by: pg_publication_rel_prrelid_prpubid_index.
 		// `postgres/src/include/catalog/pg_publication_rel.h:51`
 		// declares `PublicationRelPrrelidPrpubidIndexId = 6113`
@@ -1029,7 +1043,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_class row gets seeded; flattenRels derives RelNatts=2
 		// via pgIndexNattsByOID, satisfying
 		// RelationInitIndexAccessInfo's relnatts/indnatts check.
-		{6113, "pg_publication_rel_prrelid_prpubid_index"},
+		{OID: 6113, Name: "pg_publication_rel_prrelid_prpubid_index"},
 		// M0106-0010 Step 3by: pg_publication_rel_prpubid_index.
 		// `postgres/src/include/catalog/pg_publication_rel.h:52`
 		// declares `PublicationRelPrpubidIndexId = 6116` via
@@ -1042,7 +1056,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// gets seeded; flattenRels derives RelNatts=1 via
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
-		{6116, "pg_publication_rel_prpubid_index"},
+		{OID: 6116, Name: "pg_publication_rel_prpubid_index"},
 		// M0106-0010 Step 3bz: pg_range_rngtypid_index. PG18
 		// `postgres/src/include/catalog/pg_range.h:60` declares
 		// `RangeTypidIndexId = 3542` as UNIQUE PRIMARY KEY on
@@ -1053,7 +1067,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_class row gets seeded; flattenRels derives RelNatts=1 via
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
-		{3542, "pg_range_rngtypid_index"},
+		{OID: 3542, Name: "pg_range_rngtypid_index"},
 		// M0106-0010 Step 3bz: pg_range_rngmultitypid_index. PG18
 		// `postgres/src/include/catalog/pg_range.h:61` declares
 		// `RangeMultirangeTypidIndexId = 2228` as UNIQUE (NOT primary)
@@ -1061,7 +1075,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// the nailed local rel above (Step 3bz). Backs
 		// MAKE_SYSCACHE(RANGEMULTIRANGE, pg_range_rngmultitypid_index, 4).
 		// Without this entry RelationIdGetRelation(2228) FATALs.
-		{2228, "pg_range_rngmultitypid_index"},
+		{OID: 2228, Name: "pg_range_rngmultitypid_index"},
 		// M0106-0010 Step 3cb: pg_sequence_seqrelid_index. PG18
 		// `postgres/src/include/catalog/pg_sequence.h:42` declares
 		// `SequenceRelidIndexId = 5002` as UNIQUE PRIMARY KEY on
@@ -1072,7 +1086,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_class row gets seeded; flattenRels derives RelNatts=1 via
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
-		{5002, "pg_sequence_seqrelid_index"},
+		{OID: 5002, Name: "pg_sequence_seqrelid_index"},
 		// M0106-0010 Step 3cc: pg_statistic_ext_data_stxoid_inh_index. PG18
 		// `postgres/src/include/catalog/pg_statistic_ext_data.h:57` declares
 		// `StatisticExtDataStxoidInhIndexId = 3433` as UNIQUE PRIMARY KEY on
@@ -1083,7 +1097,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// RelationIdGetRelation(3433) FATALs; flattenRels derives RelNatts=2
 		// via pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
-		{3433, "pg_statistic_ext_data_stxoid_inh_index"},
+		{OID: 3433, Name: "pg_statistic_ext_data_stxoid_inh_index"},
 		// M0106-0010 Step 3cd: pg_statistic_ext_oid_index. PG18
 		// `postgres/src/include/catalog/pg_statistic_ext.h:73` declares
 		// `DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_ext_oid_index, 3380,
@@ -1095,7 +1109,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// gets seeded; flattenRels derives RelNatts=1 via
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
-		{3380, "pg_statistic_ext_oid_index"},
+		{OID: 3380, Name: "pg_statistic_ext_oid_index"},
 		// M0106-0010 Step 3cd: pg_statistic_ext_name_index. PG18
 		// `postgres/src/include/catalog/pg_statistic_ext.h:74` declares
 		// `DECLARE_UNIQUE_INDEX(pg_statistic_ext_name_index, 3997,
@@ -1106,7 +1120,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// MAKE_SYSCACHE(STATEXTNAMENSP, pg_statistic_ext_name_index, 4).
 		// Without this entry RelationIdGetRelation(3997) FATALs; flattenRels
 		// derives RelNatts=2 via pgIndexNattsByOID.
-		{3997, "pg_statistic_ext_name_index"},
+		{OID: 3997, Name: "pg_statistic_ext_name_index"},
 		// M0106-0010 Step 3cd: pg_statistic_ext_relid_index. PG18
 		// `postgres/src/include/catalog/pg_statistic_ext.h:75` declares
 		// `DECLARE_INDEX(pg_statistic_ext_relid_index, 3379,
@@ -1117,7 +1131,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// extended-statistics objects defined on a given table. Without
 		// this entry RelationIdGetRelation(3379) FATALs; flattenRels
 		// derives RelNatts=1.
-		{3379, "pg_statistic_ext_relid_index"},
+		{OID: 3379, Name: "pg_statistic_ext_relid_index"},
 		// M0106-0010 Step 3ce: pg_statistic_relid_att_inh_index. PG18
 		// `postgres/src/include/catalog/pg_statistic.h:139` declares
 		// `DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_relid_att_inh_index, 2696,
@@ -1128,7 +1142,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// MAKE_SYSCACHE(STATRELATTINH, pg_statistic_relid_att_inh_index, 128).
 		// Without this entry RelationIdGetRelation(2696) FATALs; flattenRels
 		// derives RelNatts=3 via pgIndexNattsByOID.
-		{2696, "pg_statistic_relid_att_inh_index"},
+		{OID: 2696, Name: "pg_statistic_relid_att_inh_index"},
 		// M0106-0010 Step 3cg: pg_subscription_rel_srrelid_srsubid_index. PG18
 		// `postgres/src/include/catalog/pg_subscription_rel.h:52` declares
 		// `DECLARE_UNIQUE_INDEX_PKEY(pg_subscription_rel_srrelid_srsubid_index,
@@ -1139,7 +1153,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_subscription_rel_srrelid_srsubid_index, 64). Without this entry
 		// RelationIdGetRelation(6117) FATALs; flattenRels derives RelNatts=2
 		// via pgIndexNattsByOID.
-		{6117, "pg_subscription_rel_srrelid_srsubid_index"},
+		{OID: 6117, Name: "pg_subscription_rel_srrelid_srsubid_index"},
 		// M0106-0010 Step 3ci: pg_transform_oid_index. PG18
 		// `postgres/src/include/catalog/pg_transform.h:43` declares
 		// `DECLARE_UNIQUE_INDEX_PKEY(pg_transform_oid_index, 3574,
@@ -1149,7 +1163,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_transform_oid_index, 16). Without this entry
 		// RelationIdGetRelation(3574) FATALs; flattenRels derives
 		// RelNatts=1 via pgIndexNattsByOID.
-		{3574, "pg_transform_oid_index"},
+		{OID: 3574, Name: "pg_transform_oid_index"},
 		// M0106-0010 Step 3ci: pg_transform_type_lang_index. PG18
 		// `postgres/src/include/catalog/pg_transform.h:44` declares
 		// `DECLARE_UNIQUE_INDEX(pg_transform_type_lang_index, 3575,
@@ -1160,7 +1174,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_transform_type_lang_index, 16). Without this entry
 		// RelationIdGetRelation(3575) FATALs; flattenRels derives
 		// RelNatts=2 via pgIndexNattsByOID.
-		{3575, "pg_transform_type_lang_index"},
+		{OID: 3575, Name: "pg_transform_type_lang_index"},
 		// M0106-0010 Step 3cj: pg_ts_config_map_index. PG18
 		// `postgres/src/include/catalog/pg_ts_config_map.h:48` declares
 		// `DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_map_index, 3609,
@@ -1171,7 +1185,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_ts_config_map_index, 2). Without this entry
 		// RelationIdGetRelation(3609) FATALs; flattenRels derives
 		// RelNatts=3 via pgIndexNattsByOID.
-		{3609, "pg_ts_config_map_index"},
+		{OID: 3609, Name: "pg_ts_config_map_index"},
 		// M0106-0010 Step 3ck: pg_ts_config_cfgname_index. PG18
 		// `postgres/src/include/catalog/pg_ts_config.h:50` declares
 		// `DECLARE_UNIQUE_INDEX(pg_ts_config_cfgname_index, 3608,
@@ -1181,7 +1195,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// Backs MAKE_SYSCACHE(TSCONFIGNAMENSP, pg_ts_config_cfgname_index, 2).
 		// Without this entry RelationIdGetRelation(3608) FATALs; flattenRels
 		// derives RelNatts=2 via pgIndexNattsByOID.
-		{3608, "pg_ts_config_cfgname_index"},
+		{OID: 3608, Name: "pg_ts_config_cfgname_index"},
 		// M0106-0010 Step 3ck: pg_ts_config_oid_index. PG18
 		// `postgres/src/include/catalog/pg_ts_config.h:51` declares
 		// `DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_oid_index, 3712,
@@ -1191,7 +1205,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_ts_config_oid_index, 2). Without this entry
 		// RelationIdGetRelation(3712) FATALs; flattenRels derives
 		// RelNatts=1 via pgIndexNattsByOID.
-		{3712, "pg_ts_config_oid_index"},
+		{OID: 3712, Name: "pg_ts_config_oid_index"},
 		// M0106-0010 Step 3cm: pg_ts_dict_dictname_index. PG18
 		// `postgres/src/include/catalog/pg_ts_dict.h:56` declares
 		// `DECLARE_UNIQUE_INDEX(pg_ts_dict_dictname_index, 3604,
@@ -1201,7 +1215,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// Backs MAKE_SYSCACHE(TSDICTNAMENSP, pg_ts_dict_dictname_index, 2).
 		// Without this entry RelationIdGetRelation(3604) FATALs; flattenRels
 		// derives RelNatts=2 via pgIndexNattsByOID.
-		{3604, "pg_ts_dict_dictname_index"},
+		{OID: 3604, Name: "pg_ts_dict_dictname_index"},
 		// M0106-0010 Step 3cm: pg_ts_dict_oid_index. PG18
 		// `postgres/src/include/catalog/pg_ts_dict.h:57` declares
 		// `DECLARE_UNIQUE_INDEX_PKEY(pg_ts_dict_oid_index, 3605,
@@ -1211,7 +1225,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_ts_dict_oid_index, 2). Without this entry
 		// RelationIdGetRelation(3605) FATALs; flattenRels derives
 		// RelNatts=1 via pgIndexNattsByOID.
-		{3605, "pg_ts_dict_oid_index"},
+		{OID: 3605, Name: "pg_ts_dict_oid_index"},
 		// M0106-0010 Step 3cn: pg_ts_parser_prsname_index. PG18
 		// `postgres/src/include/catalog/pg_ts_parser.h:56` declares
 		// `DECLARE_UNIQUE_INDEX(pg_ts_parser_prsname_index, 3606,
@@ -1221,7 +1235,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// Backs MAKE_SYSCACHE(TSPARSERNAMENSP, pg_ts_parser_prsname_index, 2).
 		// Without this entry RelationIdGetRelation(3606) FATALs; flattenRels
 		// derives RelNatts=2 via pgIndexNattsByOID.
-		{3606, "pg_ts_parser_prsname_index"},
+		{OID: 3606, Name: "pg_ts_parser_prsname_index"},
 		// M0106-0010 Step 3cn: pg_ts_parser_oid_index. PG18
 		// `postgres/src/include/catalog/pg_ts_parser.h:57` declares
 		// `DECLARE_UNIQUE_INDEX_PKEY(pg_ts_parser_oid_index, 3607,
@@ -1231,7 +1245,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_ts_parser_oid_index, 2). Without this entry
 		// RelationIdGetRelation(3607) FATALs; flattenRels derives
 		// RelNatts=1 via pgIndexNattsByOID.
-		{3607, "pg_ts_parser_oid_index"},
+		{OID: 3607, Name: "pg_ts_parser_oid_index"},
 		// M0106-0010 Step 3co: pg_ts_template_tmplname_index. PG18
 		// `postgres/src/include/catalog/pg_ts_template.h:48` declares
 		// `DECLARE_UNIQUE_INDEX(pg_ts_template_tmplname_index, 3766,
@@ -1241,7 +1255,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// Backs MAKE_SYSCACHE(TSTEMPLATENAMENSP, pg_ts_template_tmplname_index, 2).
 		// Without this entry RelationIdGetRelation(3766) FATALs; flattenRels
 		// derives RelNatts=2 via pgIndexNattsByOID.
-		{3766, "pg_ts_template_tmplname_index"},
+		{OID: 3766, Name: "pg_ts_template_tmplname_index"},
 		// M0106-0010 Step 3co: pg_ts_template_oid_index. PG18
 		// `postgres/src/include/catalog/pg_ts_template.h:49` declares
 		// `DECLARE_UNIQUE_INDEX_PKEY(pg_ts_template_oid_index, 3767,
@@ -1251,7 +1265,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pg_ts_template_oid_index, 2). Without this entry
 		// RelationIdGetRelation(3767) FATALs; flattenRels derives
 		// RelNatts=1 via pgIndexNattsByOID.
-		{3767, "pg_ts_template_oid_index"},
+		{OID: 3767, Name: "pg_ts_template_oid_index"},
 		// M0106-0010 Step 3cp: pg_user_mapping_oid_index. PG18
 		// `postgres/src/include/catalog/pg_user_mapping.h:52` declares
 		// `DECLARE_UNIQUE_INDEX_PKEY(pg_user_mapping_oid_index, 174,
@@ -1261,7 +1275,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// MAKE_SYSCACHE(USERMAPPINGOID, pg_user_mapping_oid_index, 2).
 		// Without this entry RelationIdGetRelation(174) FATALs; flattenRels
 		// derives RelNatts=1 via pgIndexNattsByOID.
-		{174, "pg_user_mapping_oid_index"},
+		{OID: 174, Name: "pg_user_mapping_oid_index"},
 		// M0106-0010 Step 3cp: pg_user_mapping_user_server_index. PG18
 		// `postgres/src/include/catalog/pg_user_mapping.h:53` declares
 		// `DECLARE_UNIQUE_INDEX(pg_user_mapping_user_server_index, 175,
@@ -1271,21 +1285,34 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// no collation. Backs MAKE_SYSCACHE(USERMAPPINGUSERSERVER,
 		// pg_user_mapping_user_server_index, 2). flattenRels derives
 		// RelNatts=2 via pgIndexNattsByOID.
-		{175, "pg_user_mapping_user_server_index"},
+		{OID: 175, Name: "pg_user_mapping_user_server_index"},
 	})
 
-func indexNailed(oid uint32, name string, natts int16) nailedRel {
+func indexNailed(oid uint32, name string, natts int16, attrs []nailedAttr) nailedRel {
+	if attrs == nil {
+		attrs = indexKeyAttrs(natts)
+	}
 	return nailedRel{
 		OID: oid, RelName: name, RelKind: 'i',
 		RelNatts: natts, RelType: 0,
-		Attrs: indexKeyAttrs(natts),
+		Attrs: attrs,
 	}
 }
 
 type idxSpec struct {
-	OID     uint32
-	Name    string
-}
+		OID  uint32
+		Name string
+		// Attrs, when non-nil, overrides the default oid-stamped descriptors
+		// from indexKeyAttrs. Required for any index whose first key is a
+		// non-oid type (e.g. name_ops, text_ops). PG's _bt_compare reads
+		// values via index_getattr using these attlen/attbyval/attalign
+		// fields; if attlen=4/attbyval=1 is left on a name-typed key, PG
+		// loads 4 inline NameData bytes ("ryo\0") as a by-val Datum and
+		// passes it to btnamecmp as a pointer → SIGSEGV in __strncmp_avx2.
+		// Step 3dg: discovered via SEGV shim attribution
+		// (si_addr=0x6f7972 == RDI, the "ryo\0" inline bytes).
+		Attrs []nailedAttr
+	}
 
 func flattenRels(heaps []nailedRel, idxs []idxSpec) []nailedRel {
 	var out []nailedRel
@@ -1315,7 +1342,7 @@ func flattenRels(heaps []nailedRel, idxs []idxSpec) []nailedRel {
 			// for OID-keyed unique indexes.
 			n = 1
 		}
-		ix := indexNailed(idx.OID, idx.Name, n)
+		ix := indexNailed(idx.OID, idx.Name, n, idx.Attrs)
 		ix.IsShared = isShared
 		out = append(out, ix)
 	}
