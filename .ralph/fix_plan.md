@@ -6346,6 +6346,80 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         are now seeded.
         Design:
         `docs/design/0106-0010-step3bo-pg-opfamily-oid-index.md`.
+      - Step 3bp LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 6243` PG-standby boot blocker
+        that surfaced after Step 3bo closed the pg_opfamily family. OID
+        6243 is `pg_parameter_acl` per
+        `postgres/src/include/catalog/pg_parameter_acl_d.h:23`
+        (`#define ParameterAclRelationId 6243`) and `pg_parameter_acl.h:30`
+        (`CATALOG(pg_parameter_acl,6243,ParameterAclRelationId)
+        BKI_SHARED_RELATION`). Stores ACL entries for GRANTed configuration
+        parameters; backs the `PARAMETERACLNAME`/`PARAMETERACLOID`
+        syscaches per `MAKE_SYSCACHE` macros in `pg_parameter_acl.h:55-56`.
+        Opened during every backend's `InitPostgres` ACL-cache init path.
+        Pure catalog-seed addition mirroring Steps 3w/3aa/3ag/3ak/3an/3ar/
+        3aw/3ba/3bd/3bh/3bm, but on the **shared** track
+        (`nailedSharedRels`, not `nailedLocalRels`); no encoder/builder/
+        Init flow change.
+        (a) `internal/initdb/relcache_init.go` gains new
+        `pgParameterAclAttrs()` returning the 3-column PG18 schema
+        verbatim from `pg_parameter_acl.h`: oid (TypeOID 26 / Len 4 /
+        NotNull true), parname (25 text / -1 / NotNull true —
+        `BKI_FORCE_NOT_NULL`), paracl (1034 aclitem[] / -1 / NotNull
+        false — `BKI_DEFAULT(_null_)`).
+        (b) `nailedSharedRels` gains
+        `{6243, "pg_parameter_acl", 83, 'r', 3, true,
+        pgParameterAclAttrs()}` immediately after the existing
+        pg_subscription entry; `IsShared=true` propagates the correct
+        `relisshared` flag into both the heap row and `Form_pg_class`
+        blob. `RelType=83` is safe because pg_parameter_acl is not
+        formrdesc'd (no `ParameterAclRelation_Rowtype_Id` constant in
+        PG18 headers; only pg_database/pg_authid/pg_auth_members/
+        pg_shseclabel/pg_subscription are formrdesc'd shared rels at
+        `postgres/src/backend/utils/cache/relcache.c:4075-4083`), so
+        the Phase3 `relation->rd_att->tdtypeid == relp->reltype`
+        assertion (relcache.c:4293) does not fire.
+        (c) The empty 8 KiB heap at `global/6243` is already produced
+        by `bootstrapSharedCatalogPlaceholders` (`initdb.go:367-389`)
+        — OID 6243 was already on the shared heap-OID list at line
+        376 from an earlier sweep, so no edit needed.
+        Heap row + 3 pg_attribute rows still thread through
+        `bootstrapPgClassTuples` / `bootstrapPgAttributeTuples` (which
+        iterate `nailedSharedRels` then `nailedLocalRels` regardless of
+        IsShared) into `base/{1,5}/1259` and `base/{1,5}/1249`
+        respectively, since pg_class and pg_attribute are themselves
+        local catalogs holding metadata for both local and shared rels.
+        `bootstrapPgClassOidIndex` adds the 6243 leaf to the populated
+        2-page btree at `base/{1,5}/2662 + global/2662`;
+        `bootstrapPgAttributeRelidAttnumIndex` adds 3 composite-key
+        leaves at file 2659.
+        Companion indexes 6246 (`pg_parameter_acl_parname_index`,
+        UNIQUE on `parname text_ops`) and 6247
+        (`pg_parameter_acl_oid_index`, UNIQUE PRIMARY on `oid oid_ops`)
+        are intentionally deferred — the E2E re-run after this step's
+        fix confirmed `could not open relation with OID 6246` as the
+        next FATAL, validating that 6243 itself is now loadable.
+        Regression pin: `TestNailedSharedRelsContainsPgParameterAcl`
+        in `internal/initdb/pg_parameter_acl_nailed_test.go` walks
+        `nailedSharedRels`, asserts OID 6243's
+        `(RelName, RelKind, IsShared, RelNatts, RelType)`, and pins
+        every column's `(Name, TypeOID, Num, Len, NotNull)` against
+        PG18's `pg_parameter_acl.h` authoritative definitions —
+        catches silent removal that would re-introduce the FATAL.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedSharedRelsContainsPgParameterAcl|TestNailedLocalRelsContainsPgOpfamily|TestPgOpfamilyOidIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestPgClassOidIndexHasSingleKeyColumn|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestBootstrapPgIndexIndexrelidIndex|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedRelTypesMatchPG18FormrdescConstants'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bo (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        TestE2E_FailoverGoopgToPG/async` advances past
+        `could not open relation with OID 6243` to the next blocker:
+        `FATAL: could not open relation with OID 6246` =
+        `pg_parameter_acl_parname_index` (Step 3bq territory).
+        Design:
+        `docs/design/0106-0010-step3bp-pg-parameter-acl-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

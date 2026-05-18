@@ -88,6 +88,26 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// docs/design/0106-0010-step3v-pg-shseclabel-reltype.md.
 	{3592, "pg_shseclabel", 4066, 'r', 6, true, pgShseclabelAttrs()},
 	{6100, "pg_subscription", 6101, 'r', 9, true, pgSubscriptionAttrs()},
+	// M0106-0010 step 3bp: pg_parameter_acl is opened during PG-standby
+	// boot once Step 3bo cleared the pg_opfamily family. Without a
+	// pg_class row, `RelationBuildDesc(6243) → ScanPgRelation(6243)`
+	// returns NULL and every forked backend FATALs with
+	// `could not open relation with OID 6243`. RelType=83 is safe because
+	// pg_parameter_acl is not formrdesc'd (no
+	// `ParameterAclRelation_Rowtype_Id` constant in PG18 headers; only
+	// pg_database/pg_authid/pg_auth_members/pg_shseclabel/pg_subscription
+	// are formrdesc'd shared rels at
+	// `postgres/src/backend/utils/cache/relcache.c:4075-4083`), so the
+	// Phase3 `relation->rd_att->tdtypeid == relp->reltype` assertion
+	// (relcache.c:4293) does not fire. Schema per
+	// `postgres/src/include/catalog/pg_parameter_acl.h` (PG18, 3 cols:
+	// oid/parname/paracl). The empty 8 KiB heap at `global/6243` is
+	// already produced by `bootstrapSharedCatalogPlaceholders`.
+	// Companion indexes 6246 (`pg_parameter_acl_parname_index`) and
+	// 6247 (`pg_parameter_acl_oid_index`) are deferred to follow-up
+	// steps — the Step-3k empty btree placeholders are sufficient
+	// because pg_parameter_acl is currently unpopulated.
+	{6243, "pg_parameter_acl", 83, 'r', 3, true, pgParameterAclAttrs()},
 }, []idxSpec{
 	{2671, "pg_database_datname_index"},
 	{2672, "pg_database_oid_index"},
@@ -1481,6 +1501,20 @@ func pgForeignTableAttrs() []nailedAttr {
 		{Name: "ftrelid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},      // oid → pg_class
 		{Name: "ftserver", TypeOID: 26, Num: 2, Len: 4, NotNull: true},     // oid → pg_foreign_server
 		{Name: "ftoptions", TypeOID: 1009, Num: 3, Len: -1, NotNull: false}, // text[] (nullable)
+	}
+}
+
+// pgParameterAclAttrs returns the 3-column PG18 pg_parameter_acl schema
+// per `postgres/src/include/catalog/pg_parameter_acl.h`. parname is the
+// only non-nullable variable-length column (BKI_FORCE_NOT_NULL); paracl
+// is `aclitem[]` (typeOID 1034, same as pg_class.relacl) and nullable
+// (BKI_DEFAULT(_null_)). Used by the M0106-0010 Step 3bp nailed shared
+// relation entry.
+func pgParameterAclAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},      // oid
+		{Name: "parname", TypeOID: 25, Num: 2, Len: -1, NotNull: true}, // text BKI_FORCE_NOT_NULL
+		{Name: "paracl", TypeOID: 1034, Num: 3, Len: -1, NotNull: false}, // aclitem[] BKI_DEFAULT(_null_)
 	}
 }
 
