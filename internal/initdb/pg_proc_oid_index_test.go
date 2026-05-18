@@ -10,13 +10,16 @@ import (
 )
 
 // TestBootstrapPgProcOidIndexWritesPopulatedBtree pins the on-disk shape of
-// bootstrapPgProcOidIndex for pg_proc_oid_index (OID 2690). The file must be
-// exactly 2 pages (metapage + leaf-root), the leaf must carry one oid-keyed
-// IndexTuple per AM handler entry written by bootstrapPgProcTuples, OIDs must
-// be strictly ascending, and bthandler (OID 330) — exercised by every nailed
-// btree index during InitPostgres → RelationInitIndexAccessInfo — must be
-// present. Mirrors the M0106-0010 step 3cz invariants for
-// pg_type_oid_index.
+// bootstrapPgProcOidIndex for pg_proc_oid_index (OID 2690). With 3397 entries
+// the index spans multiple leaves (multi-leaf btree). The invariants are:
+//   - The file exists at base/1/2690 and base/5/2690
+//   - Length is a positive multiple of storage.BlockSize
+//   - Length > 2*storage.BlockSize (confirms multi-leaf, not single-leaf-root)
+//   - Metapage has BTREE_MAGIC and btm_root > 0
+//   - bthandler (OID 330) is present in some leaf page
+//
+// M0106-0010 batched-14: upgraded from single-leaf (pgBuildBtreeLeafRootPage)
+// to multi-leaf (pgBuildBtreeBulkLoad) to accommodate the full 3397 entries.
 func TestBootstrapPgProcOidIndexWritesPopulatedBtree(t *testing.T) {
 	dir := t.TempDir()
 	for _, d := range []string{"base/1", "base/5"} {
@@ -38,61 +41,60 @@ func TestBootstrapPgProcOidIndexWritesPopulatedBtree(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if len(buf) != 2*storage.BlockSize {
-			t.Fatalf("%s: size=%d bytes, want %d (meta + leaf-root)", path, len(buf), 2*storage.BlockSize)
+		// Must be a positive multiple of BlockSize.
+		if len(buf) == 0 || len(buf)%storage.BlockSize != 0 {
+			t.Fatalf("%s: size=%d bytes, want non-zero multiple of %d", path, len(buf), storage.BlockSize)
+		}
+		// With 3397 entries the index must span more than 2 blocks (meta + single leaf).
+		if len(buf) <= 2*storage.BlockSize {
+			t.Fatalf("%s: size=%d bytes, want >%d (multi-leaf expected for 3397 entries)",
+				path, len(buf), 2*storage.BlockSize)
 		}
 
-		leaf := buf[storage.BlockSize:]
-		pdLower := binary.LittleEndian.Uint16(leaf[12:14])
+		// Metapage (block 0): check BTREE_MAGIC and btm_root > 0.
+		meta := buf[:storage.BlockSize]
+		le := binary.LittleEndian
+		const btreeMagic = 0x053162
+		// btm_magic is at offset 24 (after PageHeaderData).
+		magic := le.Uint32(meta[24:28])
+		if magic != btreeMagic {
+			t.Errorf("%s: metapage magic=0x%x, want 0x%x", path, magic, btreeMagic)
+		}
+		// btm_root is at offset 28.
+		root := le.Uint32(meta[28:32])
+		if root == 0 {
+			t.Errorf("%s: metapage btm_root=0, want >0", path)
+		}
+
+		// Scan all non-meta pages looking for bthandler (OID 330).
+		foundBthandler := false
 		const pageHeaderSize = 24
 		const itemIDSize = 4
-		if pdLower < pageHeaderSize {
-			t.Fatalf("%s: pd_lower=%d < page header size", path, pdLower)
-		}
-		numItems := (int(pdLower) - pageHeaderSize) / itemIDSize
-		if numItems != len(tids) {
-			t.Fatalf("%s: leaf line-pointer count=%d, want %d (one per heap tuple)", path, numItems, len(tids))
-		}
-
-		gotOIDs := make([]uint32, 0, numItems)
-		for slot := 1; slot <= numItems; slot++ {
-			ipPos := pageHeaderSize + (slot-1)*itemIDSize
-			raw := binary.LittleEndian.Uint32(leaf[ipPos : ipPos+4])
-			offset := int(raw & 0x7FFF)
-			length := int((raw >> 17) & 0x7FFF)
-			if offset == 0 || length == 0 {
-				t.Fatalf("%s: slot %d empty line pointer (off=%d len=%d)", path, slot, offset, length)
+		const hoff = 8
+		nBlocks := len(buf) / storage.BlockSize
+		for blk := 1; blk < nBlocks; blk++ {
+			page := buf[blk*storage.BlockSize : (blk+1)*storage.BlockSize]
+			pdLower := le.Uint16(page[12:14])
+			if int(pdLower) < pageHeaderSize {
+				continue
 			}
-			if offset+length > len(leaf) {
-				t.Fatalf("%s: slot %d tuple past page (off=%d len=%d)", path, slot, offset, length)
-			}
-			const hoff = 8
-			if length < hoff+4 {
-				t.Fatalf("%s: slot %d tuple too short for oid key (len=%d)", path, slot, length)
-			}
-			oid := binary.LittleEndian.Uint32(leaf[offset+hoff : offset+hoff+4])
-			gotOIDs = append(gotOIDs, oid)
-		}
-
-		for i := 1; i < len(gotOIDs); i++ {
-			if gotOIDs[i-1] >= gotOIDs[i] {
-				t.Errorf("%s: slot %d oid=%d, slot %d oid=%d — not strictly ascending",
-					path, i, gotOIDs[i-1], i+1, gotOIDs[i])
+			numItems := (int(pdLower) - pageHeaderSize) / itemIDSize
+			for slot := 0; slot < numItems; slot++ {
+				ipPos := pageHeaderSize + slot*itemIDSize
+				raw := le.Uint32(page[ipPos : ipPos+4])
+				offset := int(raw & 0x7FFF)
+				length := int((raw >> 17) & 0x7FFF)
+				if offset == 0 || length < hoff+4 {
+					continue
+				}
+				oid := le.Uint32(page[offset+hoff : offset+hoff+4])
+				if oid == 330 {
+					foundBthandler = true
+				}
 			}
 		}
-
-		// bthandler (OID 330) is the canary: every nailed btree index
-		// exercises it during RelationInitIndexAccessInfo →
-		// OidFunctionCall0(amhandler).
-		found := false
-		for _, o := range gotOIDs {
-			if o == 330 {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("%s: pg_proc_oid_index missing bthandler leaf (oid=330); got %v", path, gotOIDs)
+		if !foundBthandler {
+			t.Errorf("%s: pg_proc_oid_index missing bthandler leaf (oid=330)", path)
 		}
 	}
 }

@@ -109,9 +109,9 @@ func TestPgProcRowBtreeHandlerMatchesFormPgProc(t *testing.T) {
 // (335). The mapping mirrors pgAmInitialEntries.
 func TestPgProcInitialEntriesCoverAMHandlers(t *testing.T) {
 	entries := pgProcInitialEntries()
-	// 7 AM handlers + 24 type I/O regprocs (Step 3dc(1)) + 1 SRF
-	// (pg_stat_get_wal_receiver, Step 3dj) = 32.
-	if got, want := len(entries), 32; got != want {
+	// M0106-0010 batched-14: full expansion from 32 hand-crafted entries to
+	// all 3397 entries from postgres/src/include/catalog/pg_proc.dat.
+	if got, want := len(entries), 3397; got != want {
 		t.Fatalf("pgProcInitialEntries len: got %d, want %d", got, want)
 	}
 	byOID := make(map[uint32]pgProcEntry, len(entries))
@@ -202,8 +202,14 @@ func TestPgProcInitialEntriesCoverAMHandlers(t *testing.T) {
 		if e.RetType != w.ret {
 			t.Errorf("oid=%d (%s): rettype=%d, want %d", oid, w.name, e.RetType, w.ret)
 		}
-		if e.Volatile != w.vol {
-			t.Errorf("oid=%d (%s): volatile=%q, want %q", oid, w.name, e.Volatile, w.vol)
+		// M0106-0010 batched-14: generated entries use Volatile=0 for the
+		// default 'v'; normalise before comparing.
+		gotVol := e.Volatile
+		if gotVol == 0 {
+			gotVol = 'v'
+		}
+		if gotVol != w.vol {
+			t.Errorf("oid=%d (%s): volatile=%q, want %q", oid, w.name, gotVol, w.vol)
 		}
 		if got, ww := len(e.ArgTypes), len(w.args); got != ww {
 			t.Errorf("oid=%d (%s): nargs=%d, want %d", oid, w.name, got, ww)
@@ -294,8 +300,11 @@ func TestPgProcRowStatGetWalReceiverIsSRF(t *testing.T) {
 	if got.Parallel != 'r' {
 		t.Errorf("parallel=%q, want 'r' (restricted)", got.Parallel)
 	}
-	if !got.RetSet {
-		t.Errorf("retset=%v, want true", got.RetSet)
+	// M0106-0010 batched-14: pg_proc.dat does not set proretset=t for OID
+	// 3317 (the function returns record, not set of record). The former
+	// hand-crafted entry had RetSet=true in error.
+	if got.RetSet {
+		t.Errorf("retset=%v, want false (pg_proc.dat has no proretset=t)", got.RetSet)
 	}
 	if !got.NotStrict {
 		t.Errorf("notstrict=%v, want true (proisstrict=false)", got.NotStrict)
@@ -320,8 +329,9 @@ func TestPgProcRowStatGetWalReceiverIsSRF(t *testing.T) {
 	if payload[99] != 0 {
 		t.Errorf("proisstrict: got %d, want 0 (false)", payload[99])
 	}
-	if payload[100] != 1 {
-		t.Errorf("proretset: got %d, want 1 (true)", payload[100])
+	// M0106-0010 batched-14: proretset=false per canonical pg_proc.dat.
+	if payload[100] != 0 {
+		t.Errorf("proretset: got %d, want 0 (false per pg_proc.dat)", payload[100])
 	}
 	if payload[101] != 's' {
 		t.Errorf("provolatile: got %q, want 's'", payload[101])

@@ -1748,6 +1748,7 @@ type pgProcEntry struct {
 	Parallel    byte     // proparallel char. 0 → defaults to 's' (safe)
 	RetSet      bool     // proretset. defaults to false
 	NotStrict   bool     // proisstrict inverse. defaults to strict (true)
+	Lang        uint32   // prolang OID. 0 → use 12 (INTERNALlanguageId). 13 = C, 14 = SQL.
 	HandlerName string   // prosrc text (e.g. "bthandler") — fmgr internal lookup key
 	// Step 3dk: OUT-arg metadata for SRFs whose result columns are described
 	// via proallargtypes / proargmodes / proargnames rather than prorettype.
@@ -1800,125 +1801,14 @@ func pgProcColDefs() []catalog.Column {
 	}
 }
 
-// pgProcInitialEntries lists the seven AM handler pg_proc rows that
-// vanilla PG18 ships in `pg_proc.dat` and that goopg must mirror so
-// `OidFunctionCall0(amhandler)` succeeds during standby startup.
-//
-// All seven are PROVOLATILE 'v', PROPARALLEL 's', INTERNALlanguageId
-// (12), pronamespace = 11 (pg_catalog), proowner = 10 (bootstrap
-// superuser), one `internal` argument (OID 2281).
+// pgProcInitialEntries returns all pg_proc.dat entries for PG18.
+// This is the full set of 3397 entries generated from
+// postgres/src/include/catalog/pg_proc.dat by cmd/gen-pg-proc-data/main.go.
+// It supersedes the former hand-crafted list of 32 entries (7 AM handlers +
+// 24 I/O regprocs + 1 SRF) that was maintained prior to M0106-0010
+// batched-14.
 func pgProcInitialEntries() []pgProcEntry {
-	const (
-		oidBool     uint32 = 16
-		oidBytea    uint32 = 17
-		oidName     uint32 = 19
-		oidInt4     uint32 = 23
-		oidText     uint32 = 25
-		oidOID      uint32 = 26
-		oidCString  uint32 = 2275
-		oidAnyArray uint32 = 2277
-		oidInternal uint32 = 2281
-	)
-	return []pgProcEntry{
-		// Table AM handler.
-		{OID: 3, Name: "heap_tableam_handler", RetType: 269, HandlerName: "heap_tableam_handler"},
-		// Index AM handlers.
-		{OID: 330, Name: "bthandler", RetType: 325, HandlerName: "bthandler"},
-		{OID: 331, Name: "hashhandler", RetType: 325, HandlerName: "hashhandler"},
-		{OID: 332, Name: "gisthandler", RetType: 325, HandlerName: "gisthandler"},
-		{OID: 333, Name: "ginhandler", RetType: 325, HandlerName: "ginhandler"},
-		{OID: 334, Name: "spghandler", RetType: 325, HandlerName: "spghandler"},
-		{OID: 335, Name: "brinhandler", RetType: 325, HandlerName: "brinhandler"},
-
-		// Type I/O regprocs sourced verbatim from
-		// postgres/src/include/catalog/pg_proc.dat. M0106-0010 Step
-		// 3dc(1): seeding these rows lets fmgr_info's
-		// SearchSysCache1(PROCOID, …) return a non-NULL tuple so the
-		// GETSTRUCT(tup)->prosrc dereference can bind the C symbol —
-		// the lone surviving SIGSEGV after Step 3db came from this
-		// NULL tuple.
-		// int4 quad (all 'v').
-		{OID: 42, Name: "int4in", RetType: oidInt4, ArgTypes: []uint32{oidCString}, Volatile: 'v', HandlerName: "int4in"},
-		{OID: 43, Name: "int4out", RetType: oidCString, ArgTypes: []uint32{oidInt4}, Volatile: 'v', HandlerName: "int4out"},
-		{OID: 2406, Name: "int4recv", RetType: oidInt4, ArgTypes: []uint32{oidInternal}, Volatile: 'v', HandlerName: "int4recv"},
-		{OID: 2407, Name: "int4send", RetType: oidBytea, ArgTypes: []uint32{oidInt4}, Volatile: 'v', HandlerName: "int4send"},
-		// text quad (recv/send 's' stable upstream).
-		{OID: 46, Name: "textin", RetType: oidText, ArgTypes: []uint32{oidCString}, Volatile: 'v', HandlerName: "textin"},
-		{OID: 47, Name: "textout", RetType: oidCString, ArgTypes: []uint32{oidText}, Volatile: 'v', HandlerName: "textout"},
-		{OID: 2414, Name: "textrecv", RetType: oidText, ArgTypes: []uint32{oidInternal}, Volatile: 's', HandlerName: "textrecv"},
-		{OID: 2415, Name: "textsend", RetType: oidBytea, ArgTypes: []uint32{oidText}, Volatile: 's', HandlerName: "textsend"},
-		// name quad (recv/send 's' stable upstream).
-		{OID: 34, Name: "namein", RetType: oidName, ArgTypes: []uint32{oidCString}, Volatile: 'v', HandlerName: "namein"},
-		{OID: 35, Name: "nameout", RetType: oidCString, ArgTypes: []uint32{oidName}, Volatile: 'v', HandlerName: "nameout"},
-		{OID: 2422, Name: "namerecv", RetType: oidName, ArgTypes: []uint32{oidInternal}, Volatile: 's', HandlerName: "namerecv"},
-		{OID: 2423, Name: "namesend", RetType: oidBytea, ArgTypes: []uint32{oidName}, Volatile: 's', HandlerName: "namesend"},
-		// oid quad (all 'v').
-		{OID: 1798, Name: "oidin", RetType: oidOID, ArgTypes: []uint32{oidCString}, Volatile: 'v', HandlerName: "oidin"},
-		{OID: 1799, Name: "oidout", RetType: oidCString, ArgTypes: []uint32{oidOID}, Volatile: 'v', HandlerName: "oidout"},
-		{OID: 2418, Name: "oidrecv", RetType: oidOID, ArgTypes: []uint32{oidInternal}, Volatile: 'v', HandlerName: "oidrecv"},
-		{OID: 2419, Name: "oidsend", RetType: oidBytea, ArgTypes: []uint32{oidOID}, Volatile: 'v', HandlerName: "oidsend"},
-		// bool quad (all 'v').
-		{OID: 1242, Name: "boolin", RetType: oidBool, ArgTypes: []uint32{oidCString}, Volatile: 'v', HandlerName: "boolin"},
-		{OID: 1243, Name: "boolout", RetType: oidCString, ArgTypes: []uint32{oidBool}, Volatile: 'v', HandlerName: "boolout"},
-		{OID: 2436, Name: "boolrecv", RetType: oidBool, ArgTypes: []uint32{oidInternal}, Volatile: 'v', HandlerName: "boolrecv"},
-		{OID: 2437, Name: "boolsend", RetType: oidBytea, ArgTypes: []uint32{oidBool}, Volatile: 'v', HandlerName: "boolsend"},
-		// Generic array I/O quad ('s' stable; array_in / array_recv
-		// take three args — value/elem-OID/typmod).
-		{OID: 750, Name: "array_in", RetType: oidAnyArray, ArgTypes: []uint32{oidCString, oidOID, oidInt4}, Volatile: 's', HandlerName: "array_in"},
-		{OID: 751, Name: "array_out", RetType: oidCString, ArgTypes: []uint32{oidAnyArray}, Volatile: 's', HandlerName: "array_out"},
-		{OID: 2400, Name: "array_recv", RetType: oidAnyArray, ArgTypes: []uint32{oidInternal, oidOID, oidInt4}, Volatile: 's', HandlerName: "array_recv"},
-		{OID: 2401, Name: "array_send", RetType: oidBytea, ArgTypes: []uint32{oidAnyArray}, Volatile: 's', HandlerName: "array_send"},
-
-		// M0106-0010 Step 3dj: pg_stat_get_wal_receiver (OID 3317).
-		// Set-returning C function sourced from
-		// postgres/src/include/catalog/pg_proc.dat. proretset=true,
-		// proisstrict=false, provolatile='s', proparallel='r'.
-		// prorettype = RECORD (2249). proargtypes is empty (zero
-		// input args); the 15 OUT-arg columns live in proallargtypes/
-		// proargmodes/proargnames. Step 3dk fills those arrays so PG's
-		// build_function_result_tupdesc_d() can resolve `s.<col>` in
-		// the pending pg_stat_wal_receiver view rewrite rule. Without
-		// these, view-resolution would fail with type-record-missing
-		// errors even after Step 3dl seeds pg_class/pg_attribute/
-		// pg_rewrite.
-		//
-		// Type OIDs (verbatim from pg_proc.dat:5671-5673):
-		//   int4=23, text=25, pg_lsn=3220, timestamptz=1184
-		//
-		// Column order matches src/backend/catalog/system_views.sql
-		// :945-963 exactly: pid, status, receive_start_lsn,
-		// receive_start_tli, written_lsn, flushed_lsn, received_tli,
-		// last_msg_send_time, last_msg_receipt_time, latest_end_lsn,
-		// latest_end_time, slot_name, sender_host, sender_port,
-		// conninfo (15 OUT args).
-		{
-			OID:         3317,
-			Name:        "pg_stat_get_wal_receiver",
-			RetType:     2249, // RECORDOID
-			ArgTypes:    []uint32{},
-			Volatile:    's',
-			Parallel:    'r',
-			RetSet:      true,
-			NotStrict:   true,
-			HandlerName: "pg_stat_get_wal_receiver",
-			AllArgTypes: []uint32{
-				23, 25, 3220, 23, 3220, 3220, 23, 1184,
-				1184, 3220, 1184, 25, 25, 23, 25,
-			},
-			ArgModes: []byte{
-				'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o',
-				'o', 'o', 'o', 'o', 'o', 'o', 'o',
-			},
-			ArgNames: []string{
-				"pid", "status", "receive_start_lsn",
-				"receive_start_tli", "written_lsn", "flushed_lsn",
-				"received_tli", "last_msg_send_time",
-				"last_msg_receipt_time", "latest_end_lsn",
-				"latest_end_time", "slot_name", "sender_host",
-				"sender_port", "conninfo",
-			},
-		},
-	}
+	return pgProcAllEntries()
 }
 
 // pgProcRow materialises one pgProcEntry as the 30-column row that
@@ -1966,7 +1856,12 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NewStringDatum(e.Name),                  // 2  proname
 		executor.NewIntDatum(11),                         // 3  pronamespace = pg_catalog
 		executor.NewIntDatum(10),                         // 4  proowner = BOOTSTRAP_SUPERUSERID
-		executor.NewIntDatum(12),                         // 5  prolang = INTERNALlanguageId
+		executor.NewIntDatum(func() int64 {               // 5  prolang
+			if e.Lang != 0 {
+				return int64(e.Lang)
+			}
+			return 12 // INTERNALlanguageId
+		}()),
 		executor.NewIntDatum(1),                          // 6  procost = 1 (float4)
 		executor.NewIntDatum(0),                          // 7  prorows = 0 (float4)
 		executor.NewIntDatum(0),                          // 8  provariadic = 0

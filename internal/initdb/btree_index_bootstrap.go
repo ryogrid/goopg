@@ -899,15 +899,10 @@ func bootstrapPgProcOidIndex(dataDir string, tids []heapTID) error {
 	for i, it := range items {
 		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
 	}
-	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
 	if err != nil {
-		return fmt.Errorf("pg_proc_oid_index leaf: %w", err)
+		return fmt.Errorf("pg_proc_oid_index bulk-load: %w", err)
 	}
-	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
-
-	file := make([]byte, 0, 2*storage.BlockSize)
-	file = append(file, meta...)
-	file = append(file, leaf...)
 
 	for _, dir := range []string{
 		filepath.Join(dataDir, "base", "1"),
