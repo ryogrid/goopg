@@ -5979,6 +5979,58 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         (`pg_index_indrelid_index`) — Step 3bj territory. Closes
         Step 3bh's deferred companion. Design:
         `docs/design/0106-0010-step3bi-pg-foreign-table-relid-index.md`.
+      - Step 3bj LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2681` PG-standby boot blocker
+        that surfaced after Step 3bi seeded `pg_foreign_table_relid_index`
+        (OID 3119). Step 3bi's note guessed 2681 was
+        `pg_index_indrelid_index`; the authoritative
+        `postgres/src/include/catalog/pg_language.h:69` (and
+        `pg_language_d.h:24`) confirm OID 2681 is `pg_language_name_index`
+        — `DECLARE_UNIQUE_INDEX(pg_language_name_index, 2681,
+        LanguageNameIndexId, pg_language, btree(lanname name_ops))`,
+        backing `MAKE_SYSCACHE(LANGNAME, pg_language_name_index, 4)`.
+        Note: `DECLARE_UNIQUE_INDEX` not `_PKEY` — UNIQUE but NOT
+        primary; pg_language's PKEY is OID 2682
+        (`pg_language_oid_index`). pg_language heap (OID 2612) is
+        already a nailed local rel.
+        Pure catalog-seed addition mirroring the single-column
+        `name_ops` UNIQUE pattern of `pg_database_datname_index` (2671),
+        `pg_authid_rolname_index` (2676), `pg_namespace_nspname_index`
+        (2684); no encoder/builder/Init flow change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` appends
+        `entry(2681, 2612, []int16{2}, []uint32{nameOps},
+        []uint32{cCollation}, true, false)` after the Step 3bi 3119
+        entry. `Anum_pg_language_lanname = 2` per pg_language_d.h.
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{2681, "pg_language_name_index"}` after the 3119 entry.
+        `flattenRels`+`pgIndexNattsByOID` derives `RelKind='i',
+        RelNatts=1` so the `relnatts==indnatts` check (relcache.c:1492)
+        passes.
+        (c) Three empty-placeholder OID lists at
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        gain `2681` so PG's `mdopen` finds a valid empty-btree file
+        before `bootstrapPgIndexIndexrelidIndex` overwrites the
+        metapage. Step-3k empty-btree placeholder is sufficient because
+        pg_language is currently unpopulated.
+        Regression pins:
+        `TestPgLanguageNameIndexSeededFromInitialEntries` /
+        `TestNailedLocalRelsContainsPgLanguageNameIndex` in
+        `internal/initdb/pg_language_name_index_test.go`; existing
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `2681:{2}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2681. Verified: `go build ./...` PASS; targeted
+        tests `TestPgLanguageNameIndex…|TestNailedLocalRelsContainsPgLanguageNameIndex|
+        TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|
+        TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|
+        TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|
+        TestPgForeignTableRelidIndex|TestNailedLocalRelsContainsPgForeignTableRelidIndex`
+        PASS; `go test -count=1 ./internal/initdb/` shows the same 14
+        pre-existing baseline failures as Step 3bi (no new regressions);
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3bj-pg-language-name-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

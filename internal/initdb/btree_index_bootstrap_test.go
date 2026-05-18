@@ -529,6 +529,7 @@ func TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree(t *testing.T) {
 		549,  // pg_foreign_server_name_index ← Step 3bf
 		113,  // pg_foreign_server_oid_index ← Step 3bg
 		3119, // pg_foreign_table_relid_index ← Step 3bi
+		2681, // pg_language_name_index ← Step 3bj
 		2654, 2655, 2658, 2659, 2662, 2663, 2667, 2678, 2679, 2680,
 		2684, 2685, // pg_namespace_nspname_index, pg_namespace_oid_index ← Step 3t
 		2687, 2688, 2690, 2691, 2693, 2701, 2703, 2704}

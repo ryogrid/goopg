@@ -711,6 +711,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		549,  // pg_foreign_server_name_index (Step 3bf)
 		113,  // pg_foreign_server_oid_index (Step 3bg)
 		3119, // pg_foreign_table_relid_index (Step 3bi)
+		2681, // pg_language_name_index (Step 3bj)
 	} {
 		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -824,6 +825,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		549,  // pg_foreign_server_name_index (Step 3bf)
 		113,  // pg_foreign_server_oid_index (Step 3bg)
 		3119, // pg_foreign_table_relid_index (Step 3bi)
+		2681, // pg_language_name_index (Step 3bj)
 	} {
 		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -866,6 +868,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		549,  // pg_foreign_server_name_index (Step 3bf)
 		113,  // pg_foreign_server_oid_index (Step 3bg)
 		3119, // pg_foreign_table_relid_index (Step 3bi)
+		2681, // pg_language_name_index (Step 3bj)
 	} {
 		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2131,6 +2134,23 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// (ftrelid) all the same. E2E test surfaced OID 3119 as the
 		// next FATAL after Step 3bh seeded the heap nailed rel.
 		entry(3119, 3118, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_foreign_table_relid_index
+		// M0106-0010 Step 3bj: pg_language_name_index.
+		//   postgres/src/include/catalog/pg_language.h:69
+		//     DECLARE_UNIQUE_INDEX(pg_language_name_index, 2681,
+		//       LanguageNameIndexId, pg_language,
+		//       btree(lanname name_ops));
+		//   MAKE_SYSCACHE(LANGNAME, pg_language_name_index, 4);
+		// pg_language attnums (pg_language_d.h):
+		// 1=oid, 2=lanname. UNIQUE but NOT primary —
+		// DECLARE_UNIQUE_INDEX is not the _PKEY variant; pg_language's
+		// PKEY is OID 2682 (pg_language_oid_index). Single name_ops key
+		// with C collation — same single-column name_ops UNIQUE pattern
+		// as pg_database_datname_index (2671), pg_authid_rolname_index
+		// (2676), pg_namespace_nspname_index (2684). pg_language heap
+		// OID 2612 is already a nailed local rel (relcache_init.go).
+		// E2E test surfaced OID 2681 as the next FATAL after Step 3bi
+		// seeded pg_foreign_table_relid_index.
+		entry(2681, 2612, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false), // pg_language_name_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
