@@ -6881,6 +6881,87 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         oid idx 6238 + UNIQUE composite (pnnspid, pnpubid) idx 6239)
         is now fully seeded. Design:
         `docs/design/0106-0010-step3bx-pg-publication-namespace-nailed-rel.md`.
+      - Step 3by LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 6106` PG-standby boot blocker that surfaces
+        after Step 3bx seeded the pg_publication_namespace family. OID
+        6106 is `pg_publication_rel` per
+        `postgres/src/include/catalog/pg_publication_rel.h:29`
+        (`CATALOG(pg_publication_rel,6106,PublicationRelRelationId)`).
+        Family-complete seed in one step: heap 6106 + all three
+        declared indexes 6112 (UNIQUE PRIMARY oid_ops, backs
+        `MAKE_SYSCACHE(PUBLICATIONREL)`), 6113 (UNIQUE composite
+        `(prrelid, prpubid) oid_ops`, backs
+        `MAKE_SYSCACHE(PUBLICATIONRELMAP)`), and 6116 (non-UNIQUE
+        `(prpubid) oid_ops` via `DECLARE_INDEX`; used by
+        `GetPublicationRelations()` to enumerate publication tables —
+        no syscache). First non-UNIQUE entry pinned in
+        `pgIndexInitialEntries` for this family.
+        (a) `pgPublicationRelAttrs()` (relcache_init.go) returns the
+        5-column PG18 schema: 3 fixed-width NOT NULL (oid/prpubid/
+        prrelid, all 26/4) + 2 CATALOG_VARLEN nullable (prqual
+        pg_node_tree TypeOID 194 Len -1, prattrs int2vector TypeOID 22
+        Len -1 — neither carries BKI_FORCE_NOT_NULL upstream). Both
+        varlena types already supported by pgCatalogTypeOID /
+        pgCatalogTypeLen from earlier steps; heap is unpopulated at
+        bootstrap so the varlena encoder is not exercised. RelType=83
+        is safe (no `PublicationRelRelation_Rowtype_Id` in PG18
+        headers).
+        (b) `bootstrapMappedLocalCatalogHeaps` (initdb.go) OID list
+        gains `6106, // pg_publication_rel (M0106-0010 step 3by)`
+        after the Step 3bx 6237 entry; `localRelMap` gains
+        `{6106, 6106}` analogously. (The legacy `6101, //
+        pg_publication_rel` placeholder remains untouched — same
+        pattern as Step 3bu leaving the stale `6003` comment alone.)
+        (c) `pgIndexInitialEntries` (initdb.go) gains
+        `entry(6112, 6106, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` (UNIQUE PRIMARY oid PKEY),
+        `entry(6113, 6106, []int16{3, 2}, []uint32{oidOps, oidOps},
+        []uint32{0, 0}, true, false)` (UNIQUE composite (prrelid,
+        prpubid) — attnums 3,2 per pg_publication_rel_d.h), and
+        `entry(6116, 6106, []int16{2}, []uint32{oidOps}, []uint32{0},
+        false, false)` (non-UNIQUE single prpubid) after the Step 3bx
+        6239 row.
+        (d) `nailedLocalRels` idxSpec list (relcache_init.go) gains
+        `{6112, "pg_publication_rel_oid_index"}`,
+        `{6113, "pg_publication_rel_prrelid_prpubid_index"}`, and
+        `{6116, "pg_publication_rel_prpubid_index"}` after the Step
+        3bx 6239 entry; `flattenRels`+`pgIndexNattsByOID` derives
+        `RelKind='i', RelNatts=1/2/1` so the `relnatts==indnatts`
+        check (relcache.c:1492) passes for each.
+        (e) Three critical-index placeholder OID lists at
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        each gain `6112, // pg_publication_rel_oid_index (Step 3by)`,
+        `6113, // pg_publication_rel_prrelid_prpubid_index (Step 3by)`,
+        and `6116, // pg_publication_rel_prpubid_index (Step 3by)`.
+        Empty-btree placeholder is sufficient because
+        pg_publication_rel is unpopulated at bootstrap.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgPublicationRel`,
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgPublicationRel`,
+        `TestPgPublicationRelOidIndexInitialEntry`,
+        `TestPgPublicationRelPrrelidPrpubidIndexInitialEntry`,
+        `TestPgPublicationRelPrpubidIndexInitialEntry` (first
+        non-UNIQUE pin — `IsUnique=false` guard is meaningful) in
+        `internal/initdb/pg_publication_rel_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `6112:{1}` + `6113:{3,2}` + `6116:{2}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 6112 + 6113 + 6116;
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        extended with 6106 (strict list guard).
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgPublicationRel|TestBootstrapMappedLocalCatalogHeapsIncludesPgPublicationRel|TestPgPublicationRelOidIndexInitialEntry|TestPgPublicationRelPrrelidPrpubidIndexInitialEntry|TestPgPublicationRelPrpubidIndexInitialEntry|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bx (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. With the heap
+        (6106) + PKEY (6112) + UNIQUE composite (6113) + non-UNIQUE
+        (6116) all seeded, the pg_publication_rel family is fully
+        wired. Next anticipated blocker on E2E re-run lies in the
+        next pg_publication_* / pg_subscription_* nailed-rel
+        territory (Step 3bz). Design:
+        `docs/design/0106-0010-step3by-pg-publication-rel-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

@@ -305,6 +305,18 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// PublicationNamespaceRelationId == 6237). 3 columns, all fixed-width
 	// NOT NULL (oid, pnpubid, pnnspid).
 	{6237, "pg_publication_namespace", 83, 'r', 3, false, pgPublicationNamespaceAttrs()},
+	// M0106-0010 step 3by: pg_publication_rel is opened during PG-standby
+	// boot once Step 3bx cleared the pg_publication_namespace family.
+	// Without a pg_class row, `RelationBuildDesc(6106) →
+	// ScanPgRelation(6106)` returns NULL and the backend FATALs with
+	// `could not open relation with OID 6106`. RelType=83 is safe because
+	// pg_publication_rel is not formrdesc'd (no
+	// `PublicationRelRelation_Rowtype_Id` constant in PG18 headers).
+	// Schema per `postgres/src/include/catalog/pg_publication_rel.h`
+	// (PG18, PublicationRelRelationId == 6106). 5 columns total: 3
+	// fixed-width NOT NULL (oid, prpubid, prrelid) + 2 CATALOG_VARLEN
+	// nullable (prqual pg_node_tree, prattrs int2vector).
+	{6106, "pg_publication_rel", 83, 'r', 5, false, pgPublicationRelAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -688,6 +700,44 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
 		{6239, "pg_publication_namespace_pnnspid_pnpubid_index"},
+		// M0106-0010 Step 3by: pg_publication_rel_oid_index.
+		// `postgres/src/include/catalog/pg_publication_rel.h:50`
+		// declares `PublicationRelObjectIndexId = 6112` as UNIQUE
+		// PRIMARY KEY on btree(oid oid_ops). Heap OID 6106
+		// (pg_publication_rel) is already a nailed local rel above
+		// (Step 3by). Backs MAKE_SYSCACHE(PUBLICATIONREL,
+		// pg_publication_rel_oid_index, 64). Without this entry
+		// RelationIdGetRelation(6112) FATALs because no pg_class row
+		// gets seeded; flattenRels derives RelNatts=1 via
+		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+		// relnatts/indnatts check (relcache.c:1492).
+		{6112, "pg_publication_rel_oid_index"},
+		// M0106-0010 Step 3by: pg_publication_rel_prrelid_prpubid_index.
+		// `postgres/src/include/catalog/pg_publication_rel.h:51`
+		// declares `PublicationRelPrrelidPrpubidIndexId = 6113`
+		// as UNIQUE (NOT primary) on btree(prrelid oid_ops, prpubid
+		// oid_ops). Heap OID 6106 (pg_publication_rel) is already a
+		// nailed local rel above (Step 3by). Backs
+		// MAKE_SYSCACHE(PUBLICATIONRELMAP,
+		// pg_publication_rel_prrelid_prpubid_index, 64). Without this
+		// entry RelationIdGetRelation(6113) FATALs because no
+		// pg_class row gets seeded; flattenRels derives RelNatts=2
+		// via pgIndexNattsByOID, satisfying
+		// RelationInitIndexAccessInfo's relnatts/indnatts check.
+		{6113, "pg_publication_rel_prrelid_prpubid_index"},
+		// M0106-0010 Step 3by: pg_publication_rel_prpubid_index.
+		// `postgres/src/include/catalog/pg_publication_rel.h:52`
+		// declares `PublicationRelPrpubidIndexId = 6116` via
+		// `DECLARE_INDEX` (non-UNIQUE) on btree(prpubid oid_ops).
+		// Heap OID 6106 (pg_publication_rel) is already a nailed
+		// local rel above (Step 3by). Used by
+		// GetPublicationRelations() to enumerate relations for a
+		// given publication. Without this entry
+		// RelationIdGetRelation(6116) FATALs because no pg_class row
+		// gets seeded; flattenRels derives RelNatts=1 via
+		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+		// relnatts/indnatts check (relcache.c:1492).
+		{6116, "pg_publication_rel_prpubid_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1527,6 +1577,27 @@ func pgPublicationNamespaceAttrs() []nailedAttr {
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},     // oid
 		{Name: "pnpubid", TypeOID: 26, Num: 2, Len: 4, NotNull: true}, // oid → pg_publication
 		{Name: "pnnspid", TypeOID: 26, Num: 3, Len: 4, NotNull: true}, // oid → pg_namespace
+	}
+}
+
+// pgPublicationRelAttrs defines the 5-column PG18 pg_publication_rel
+// schema. PG `RelationBuildDesc(6106) → ScanPgRelation(6106)` looks
+// up the catalog descriptor during standby boot once Step 3bx seeded
+// pg_publication_namespace; without this entry the backend FATALs with
+// `could not open relation with OID 6106`. Sourced verbatim from
+// `postgres/src/include/catalog/pg_publication_rel.h` (PG18,
+// PublicationRelRelationId == 6106). 3 fixed-width NOT NULL columns
+// (oid, prpubid, prrelid) + 2 CATALOG_VARLEN nullable columns
+// (prqual pg_node_tree, prattrs int2vector — neither carries
+// BKI_FORCE_NOT_NULL upstream). The heap is unpopulated at bootstrap
+// so the varlena encoder is not exercised. M0106-0010 step 3by.
+func pgPublicationRelAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},       // oid
+		{Name: "prpubid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},   // oid → pg_publication
+		{Name: "prrelid", TypeOID: 26, Num: 3, Len: 4, NotNull: true},   // oid → pg_class
+		{Name: "prqual", TypeOID: 194, Num: 4, Len: -1, NotNull: false}, // pg_node_tree (nullable)
+		{Name: "prattrs", TypeOID: 22, Num: 5, Len: -1, NotNull: false}, // int2vector (nullable)
 	}
 }
 
