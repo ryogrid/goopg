@@ -446,6 +446,13 @@ func Init(opts Options) error {
 	if err != nil {
 		return fmt.Errorf("goopg init: system_identifier: %w", err)
 	}
+	// Write the bootstrap WAL segment (pg_wal/000000010000000000000001)
+	// BEFORE pg_control so the ordering invariant matches BootStrapXLOG
+	// (xlog.c:5175-5219): WAL flushed → pg_control written.
+	// M0106-0010 batched-04.
+	if err := WriteBootstrapWAL(abs, sysID, time.Now()); err != nil {
+		return fmt.Errorf("goopg init: bootstrap wal: %w", err)
+	}
 	// Write the PG-compatible pg_control file so pg_controldata,
 	// pg_checksums, and other client tools can inspect the cluster
 	// (M0095-0001).

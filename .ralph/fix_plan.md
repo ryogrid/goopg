@@ -9544,7 +9544,7 @@ relcache init → replication readiness) and intra-package grouped.
         `internal/wal/checkpointer_test.go` extended.
       - Risk gate: wal/replication.
 
-- [ ] **M0106-0010 batched-04** (bootstrap-procedure task 4)
+- [x] **M0106-0010 batched-04** (bootstrap-procedure task 4)
       - Summary: Add `WriteBootstrapWAL(dataDir, sysID, now) error`
         writing `pg_wal/000000010000000000000001`: 40-byte long page
         header + `XLOG_CHECKPOINT_SHUTDOWN` record (114 B total),
@@ -9555,6 +9555,12 @@ relcache init → replication readiness) and intra-package grouped.
       - Test: `internal/initdb/wal_bootstrap_test.go` (new) —
         byte-diff vs vanilla `pg_basebackup` first segment.
       - Risk gate: wal/replication.
+      - COMPLETE 2026-05-19: `WriteBootstrapWAL` added in
+        `internal/initdb/wal_bootstrap.go`; `encodeCheckPointBody` fills
+        88-byte CheckPoint struct matching `buildPgControl checkPointCopy`
+        layout; wired into `Init` between `LoadOrCreateSystemID` and
+        `writePgControl`; `TestWriteBootstrapWAL` + `TestWriteBootstrapWAL_Idempotent`
+        both PASS; pre-existing wal/initdb test failures confirmed unchanged.
 
 - [ ] **M0106-0010 batched-05** (bootstrap-procedure task 5)
       - Summary: Add `excludeFiles` and `excludeDirContents` tables and
