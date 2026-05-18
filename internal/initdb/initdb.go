@@ -428,6 +428,19 @@ func Init(opts Options) error {
 	if err := bootstrapPgOpfamilyAmNameNspIndex(abs, pgOpfamilyTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_opfamily_am_name_nsp_index: %w", err)
 	}
+	// M0106-0010 batched-20: write all 235 pg_cast rows so PG's
+	// CASTSOURCETARGET syscache resolves cast lookups during expression
+	// compilation (implicit/assignment casts in parser/optimizer).
+	pgCastTIDs, err := bootstrapPgCastTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_cast tuples: %w", err)
+	}
+	if err := bootstrapPgCastOidIndex(abs, pgCastTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_cast_oid_index: %w", err)
+	}
+	if err := bootstrapPgCastSourceTargetIndex(abs, pgCastTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_cast_source_target_index: %w", err)
+	}
 	// M0106-0010 step 3m: overwrite the empty btree placeholder at
 	// base/{1,5}/2662 + global/2662 with a populated 2-page btree
 	// (metapage + leaf-root) carrying one oid-keyed IndexTuple per

@@ -1898,3 +1898,105 @@ func bootstrapPgOpfamilyAmNameNspIndex(dataDir string, tids map[uint32]heapTID) 
 	}
 	return nil
 }
+
+// pgBuildIndexTupleOidOidKey encodes a 2-OID composite index tuple.
+// Layout: hoff=8, data = 4 (oid1) + 4 (oid2), size = MAXALIGN(16) = 16.
+func pgBuildIndexTupleOidOidKey(heapBlk uint32, heapOff uint16, oid1, oid2 uint32) []byte {
+	const (
+		hoff = 8
+		size = 16 // MAXALIGN(hoff + 4 + 4)
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+	le.PutUint32(out[hoff:hoff+4], oid1)
+	le.PutUint32(out[hoff+4:hoff+8], oid2)
+	return out
+}
+
+// bootstrapPgCastOidIndex writes pg_cast_oid_index (OID 2660) —
+// UNIQUE PRIMARY KEY btree on oid — to base/{1,5}/2660.
+func bootstrapPgCastOidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type indexed struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(tids))
+	for oid, tid := range tids {
+		items = append(items, indexed{oid: oid, block: tid.Block, off: tid.Offset})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
+	if err != nil {
+		return fmt.Errorf("pg_cast_oid_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2660, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_cast_oid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgCastSourceTargetIndex writes pg_cast_source_target_index
+// (OID 2661) — UNIQUE btree on (castsource, casttarget) — to
+// base/{1,5}/2661.
+func bootstrapPgCastSourceTargetIndex(dataDir string, tids map[uint32]heapTID) error {
+	entries := pgCastInitialEntries()
+	type indexed struct {
+		src   uint32
+		tgt   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(entries))
+	for _, e := range entries {
+		tid, ok := tids[e.OID]
+		if !ok {
+			return fmt.Errorf("pg_cast_source_target_index: no heap TID for cast OID %d", e.OID)
+		}
+		items = append(items, indexed{
+			src:   e.CastSource,
+			tgt:   e.CastTarget,
+			block: tid.Block,
+			off:   tid.Offset,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.src != b.src {
+			return a.src < b.src
+		}
+		return a.tgt < b.tgt
+	})
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidOidKey(it.block, it.off, it.src, it.tgt)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 2)
+	if err != nil {
+		return fmt.Errorf("pg_cast_source_target_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2661, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_cast_source_target_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}

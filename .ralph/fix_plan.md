@@ -9791,25 +9791,19 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3e-pg-amproc-sortsupport-equalimage.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-19** (bootstrap-procedure task 19)
+- [x] **M0106-0010 batched-19** (bootstrap-procedure task 19)
       - Summary: Seed `pg_opclass` (177 rows) heap + index (2687); add
         `pgOpfamilyInitialEntries()` for `pg_opfamily` (146 rows) heap +
         indexes (2754, 2755).
-      - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
-      - Files: `internal/initdb/initdb.go::pgOpclassInitialEntries`, new
-        `internal/initdb/pg_opfamily_bootstrap.go`.
-      - Test: `internal/initdb/pg_opclass_bootstrap_test.go`,
-        `pg_opfamily_*_test.go`.
-      - Originating step-3* docs:
-        `0106-0010-step3b-pg-opclass-bootstrap.md`,
-        `0106-0010-step3ad-pg-opclass-am-name-nsp-index.md`,
-        `0106-0010-step3bm-pg-opfamily-nailed-rel.md`,
-        `0106-0010-step3bn-pg-opfamily-am-name-nsp-index.md`,
-        `0106-0010-step3bo-pg-opfamily-oid-index.md`,
-        `0106-0010-step3l-pg-opclass-oid-index-tuples.md`.
-      - Risk gate: parser/planner/executor.
+      - COMPLETE 2026-05-19 (loop 7): expanded pgOpclassInitialEntries from
+        12 to 177 rows (all PG18 AMs/types); added pg_opfamily_bootstrap.go
+        with pgOpfamilyInitialEntries() (146 rows); updated
+        bootstrapPgOpclassOidIndex to take TIDs + use pgBuildBtreeBulkLoad;
+        added bootstrapPgOpfamilyOidIndex (2755) and
+        bootstrapPgOpfamilyAmNameNspIndex (2754) + pgBuildIndexTupleOidNameOidKey
+        helper. All tests pass. Commit: e1defa1.
 
-- [ ] **M0106-0010 batched-20** (bootstrap-procedure task 20)
+- [x] **M0106-0010 batched-20** (bootstrap-procedure task 20)
       - Summary: Seed `pg_cast` (235 rows) heap + indexes (2660, 2661).
       - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
       - Files: `internal/initdb/pg_cast_bootstrap.go` (new).
