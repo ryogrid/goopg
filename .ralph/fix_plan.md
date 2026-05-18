@@ -9562,7 +9562,7 @@ relcache init → replication readiness) and intra-package grouped.
         `writePgControl`; `TestWriteBootstrapWAL` + `TestWriteBootstrapWAL_Idempotent`
         both PASS; pre-existing wal/initdb test failures confirmed unchanged.
 
-- [ ] **M0106-0010 batched-05** (bootstrap-procedure task 5)
+- [x] **M0106-0010 batched-05** (bootstrap-procedure task 5)
       - Summary: Add `excludeFiles` and `excludeDirContents` tables and
         table-driven exclusion in basebackup; ship the 11 missing
         entries (`pg_internal.init*` prefix, `backup_label`,
@@ -9574,6 +9574,15 @@ relcache init → replication readiness) and intra-package grouped.
       - Test: `internal/server/basebackup_test.go` extended;
         `internal/testport/e2e_failover_*` smoke.
       - Risk gate: wal/replication.
+      - COMPLETE 2026-05-19: `baseBackupExcluded` map replaced with
+        `excludeFiles` (slice with prefix flag, 9 entries) and
+        `excludeDirContents` (map, 7 entries); `isExcludedFile` helper
+        added; walk callback uses base-name check for files and
+        base-name check for dirs (include dir entry, SkipDir for
+        contents); inline pg_replslot special-case and synthetic step 3
+        removed. `TestBaseBackupWireProtocolFraming` extended with
+        fixtures for excluded files + dir-content dirs and asserts dirs
+        are present, contents absent. All server tests PASS.
 
 - [ ] **M0106-0010 batched-06** (bootstrap-procedure task 6)
       - Summary: Bind the `XLOG_PARAMETER_CHANGE` redo path on the

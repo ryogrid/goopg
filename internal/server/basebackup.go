@@ -26,10 +26,13 @@
 // under `<DataDir>` except the per-process state listed in
 // `baseBackupExcluded`. A synthetic `backup_label` is prepended;
 // `global/pg_control` is emitted last so a recovering standby sees a
-// consistent control file (upstream invariant). Tablespaces beyond
-// the default are out of v0 scope — the tablespace list result-set
-// always reports a single NULL/NULL row mirroring the upstream
-// "default tablespace only" shape.
+// consistent control file (upstream invariant). Files matching
+// `excludeFiles` and the contents of directories matching
+// `excludeDirContents` are omitted; the excluded directories themselves
+// are shipped as empty tar entries (upstream invariant). Tablespaces
+// beyond the default are out of v0 scope — the tablespace list
+// result-set always reports a single NULL/NULL row mirroring the
+// upstream "default tablespace only" shape.
 //
 // Verification: `internal/server/basebackup_test.go` drives a server
 // through BASE_BACKUP via the in-process protocol harness and asserts
@@ -82,18 +85,53 @@ const baseBackupChunkBytes = 64 * 1024
 // 1 MiB of tar bytes shipped.
 const baseBackupProgressInterval = 1 << 20
 
-// baseBackupExcluded names entries (paths relative to DataDir) that
-// must NEVER be included in the backup tar. These are per-process
-// runtime artefacts; copying them would either race a running
-// primary or break the standby's boot.
-//
-// Mirrors `excludeFiles` / `excludeDirContents` in upstream
-// postgres/src/backend/backup/basebackup.c, scoped to entries goopg
-// actually creates today.
-var baseBackupExcluded = map[string]struct{}{
-	"postmaster.pid":   {},
-	".goopg.ctl.sock":  {},
-	"postmaster.opts":  {},
+// excludeFiles lists filenames (base name only) that are never streamed in
+// a BASE_BACKUP. When prefix is true the name is a prefix (e.g.
+// "pg_internal.init" matches "pg_internal.init", "pg_internal.init.1", …).
+// Mirrors upstream's excludeFiles[] in
+// postgres/src/backend/backup/basebackup.c:191-225.
+var excludeFiles = []struct {
+	name   string
+	prefix bool
+}{
+	{"postmaster.pid", false},
+	{"postmaster.opts", false},
+	{".goopg.ctl.sock", false}, // goopg-specific runtime socket
+	{"postgresql.auto.conf.tmp", false},
+	{"current_logfiles.tmp", false},
+	{"backup_label", false},
+	{"tablespace_map", false},
+	{"backup_manifest", false},
+	{"pg_internal.init", true}, // relcache init file — standby rebuilds on first access
+}
+
+// excludeDirContents lists directory base names whose contents are never
+// streamed. The directory entry itself IS shipped as an empty tar directory
+// so a standby's startup code can stat the path without error.
+// Mirrors upstream's excludeDirContents[] in basebackup.c:151-186.
+var excludeDirContents = map[string]struct{}{
+	"pg_replslot":  {}, // slot files are primary-owned; standby rebuilds them
+	"pg_stat_tmp":  {}, // per-process stats; recreated on standby start
+	"pg_dynshmem":  {}, // cleared by dsm_cleanup_for_mmap
+	"pg_notify":    {}, // cleared by AsyncShmemInit
+	"pg_serial":    {}, // not required for replay
+	"pg_snapshots": {}, // cleared by DeleteAllExportedSnapshotFiles
+	"pg_subtrans":  {}, // zeroed by StartupSUBTRANS
+}
+
+// isExcludedFile reports whether the file with the given base name should be
+// omitted from the backup tar stream.
+func isExcludedFile(base string) bool {
+	for _, e := range excludeFiles {
+		if e.prefix {
+			if strings.HasPrefix(base, e.name) {
+				return true
+			}
+		} else if base == e.name {
+			return true
+		}
+	}
+	return false
 }
 
 // replyBaseBackup is the top-level handler invoked from
@@ -365,24 +403,24 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 		if rel == "." {
 			return nil
 		}
-		if _, skip := baseBackupExcluded[rel]; skip {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
 		// Defer pg_control to the end; record but don't queue.
 		if rel == filepath.Join("global", "pg_control") {
 			pgControlPath = path
 			return nil
 		}
-		// M0102-0007: exclude goopg slot directory tree (JSON
-		// format) from the backup — PG expects binary state files
-		// with a magic number and panics on parse or missing files.
-		// We emit an empty pg_replslot/ directory later so PG
-		// doesn't complain about a missing directory.
-		if rel == "pg_replslot" || strings.HasPrefix(rel, "pg_replslot/") {
-			return filepath.SkipDir
+		base := filepath.Base(rel)
+		if info.IsDir() {
+			if _, skip := excludeDirContents[base]; skip {
+				// Ship the directory entry itself as an empty tar dir
+				// so standby startup code can stat the path, but omit
+				// all contents (slots, stats, etc. are primary-owned).
+				entries = append(entries, entry{abs: path, rel: rel, info: info, isFile: false})
+				return filepath.SkipDir
+			}
+		} else {
+			if isExcludedFile(base) {
+				return nil
+			}
 		}
 		entries = append(entries, entry{abs: path, rel: rel, info: info, isFile: !info.IsDir()})
 		return nil
@@ -410,14 +448,7 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 		}
 	}
 
-	// 3. Synthetic empty pg_replslot/ — PG requires this directory
-	// to exist even if there are no local replication slots.
-	// goopg's slot files are JSON, excluded above (M0102-0007).
-	if err := writeTarDir(tw, "pg_replslot/", time.Now(), 0o700); err != nil {
-		return err
-	}
-
-	// 4. pg_control last (upstream invariant for atomic recovery).
+	// 3. pg_control last (upstream invariant for atomic recovery).
 	if pgControlPath != "" {
 		data, err := os.ReadFile(pgControlPath)
 		if err != nil {

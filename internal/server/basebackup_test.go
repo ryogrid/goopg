@@ -42,9 +42,23 @@ func startBaseBackupTestServer(t *testing.T) (string, string, func()) {
 	// 8 KiB pg_control stub — content doesn't matter for the test,
 	// only that it's emitted last.
 	must(os.WriteFile(filepath.Join(dataDir, "global", "pg_control"), bytes.Repeat([]byte{0xC0}, 8192), 0o600))
-	// Per-process artefacts that MUST be excluded from the tar.
+
+	// --- excludeFiles fixtures: must NOT appear in tar ---
 	must(os.WriteFile(filepath.Join(dataDir, "postmaster.pid"), []byte("99999\n"), 0o600))
 	must(os.WriteFile(filepath.Join(dataDir, ".goopg.ctl.sock"), []byte(""), 0o600))
+	must(os.WriteFile(filepath.Join(dataDir, "postgresql.auto.conf.tmp"), []byte("x=1\n"), 0o600))
+	must(os.WriteFile(filepath.Join(dataDir, "current_logfiles.tmp"), []byte("tmp\n"), 0o600))
+	must(os.WriteFile(filepath.Join(dataDir, "backup_manifest"), []byte("{}\n"), 0o600))
+	// pg_internal.init prefix match — file is inside base/1/ to prove
+	// the check applies to the base name, not just the top-level path.
+	must(os.WriteFile(filepath.Join(dataDir, "base", "1", "pg_internal.init"), []byte("init\n"), 0o600))
+
+	// --- excludeDirContents fixtures: directory present, contents absent ---
+	must(os.MkdirAll(filepath.Join(dataDir, "pg_replslot", "s1"), 0o700))
+	must(os.WriteFile(filepath.Join(dataDir, "pg_replslot", "s1", "state"), []byte("slot\n"), 0o600))
+	must(os.MkdirAll(filepath.Join(dataDir, "pg_stat_tmp"), 0o700))
+	must(os.WriteFile(filepath.Join(dataDir, "pg_stat_tmp", "pgstat.stat"), []byte("stat\n"), 0o600))
+
 	// Seed a timeline_id so the BASE_BACKUP reply doesn't need to
 	// generate one mid-stream (which would race with another reader).
 	must(initdb.WriteTimelineID(dataDir, 1))
@@ -223,14 +237,16 @@ func TestBaseBackupWireProtocolFraming(t *testing.T) {
 	}
 
 	// ---- tar contents: backup_label present, pg_control LAST,
-	// excluded files absent.
+	// excluded files absent, excluded-dir-contents absent but dirs present.
 	tr := tar.NewReader(&tarBytes)
 	var (
-		names         []string
-		sawLabel      bool
-		sawPgControl  bool
-		sawBase1_1259 bool
-		lastFile      string
+		names              []string
+		sawLabel           bool
+		sawPgControl       bool
+		sawBase1_1259      bool
+		sawPgReplslotDir   bool
+		sawPgStatTmpDir    bool
+		lastFile           string
 	)
 	for {
 		hdr, err := tr.Next()
@@ -268,8 +284,28 @@ func TestBaseBackupWireProtocolFraming(t *testing.T) {
 			sawPgControl = true
 		case "base/1/1259":
 			sawBase1_1259 = true
-		case "postmaster.pid", ".goopg.ctl.sock":
-			t.Errorf("tar contains excluded entry %q", hdr.Name)
+		case "pg_replslot/":
+			sawPgReplslotDir = true
+		case "pg_stat_tmp/":
+			sawPgStatTmpDir = true
+
+		// --- excludeFiles: these must never appear ---
+		case "postmaster.pid", "postmaster.opts", ".goopg.ctl.sock",
+			"postgresql.auto.conf.tmp", "current_logfiles.tmp",
+			"backup_manifest", "tablespace_map":
+			t.Errorf("tar contains excluded file %q", hdr.Name)
+		}
+		// pg_internal.init prefix match — covers any base name beginning
+		// with "pg_internal.init" at any path depth.
+		if strings.HasSuffix(hdr.Name, "pg_internal.init") ||
+			strings.Contains(hdr.Name, "pg_internal.init.") {
+			t.Errorf("tar contains excluded pg_internal.init* entry %q", hdr.Name)
+		}
+		// excludeDirContents: contents must not appear.
+		for _, dirPrefix := range []string{"pg_replslot/s1", "pg_stat_tmp/pgstat.stat"} {
+			if hdr.Name == dirPrefix || strings.HasPrefix(hdr.Name, dirPrefix+"/") {
+				t.Errorf("tar contains excluded dir-content entry %q", hdr.Name)
+			}
 		}
 	}
 	if !sawLabel {
@@ -280,6 +316,12 @@ func TestBaseBackupWireProtocolFraming(t *testing.T) {
 	}
 	if !sawBase1_1259 {
 		t.Error("tar missing base/1/1259 (sample relfile)")
+	}
+	if !sawPgReplslotDir {
+		t.Error("tar missing pg_replslot/ directory entry (standby startup requires it)")
+	}
+	if !sawPgStatTmpDir {
+		t.Error("tar missing pg_stat_tmp/ directory entry (excludeDirContents ships dir, not contents)")
 	}
 	if lastFile != "global/pg_control" {
 		t.Errorf("last regular file in tar = %q, want global/pg_control "+
