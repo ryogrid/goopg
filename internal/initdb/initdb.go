@@ -3016,7 +3016,21 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewIntDatum(10),                  // 80: relowner
 		executor.NewIntDatum(relAm),               // 84: relam
 		executor.NewIntDatum(int64(rel.OID)),      // 88: relfilenode
-		executor.NewIntDatum(0),                   // 92: reltablespace
+		// M0106-0010 Step 3cr: shared catalogs must store reltablespace
+		// = GLOBALTABLESPACE_OID (1664). PG's RelationInitPhysicalAddr
+		// (postgres/src/backend/utils/cache/relcache.c:1347-1354)
+		// resolves the spcOid purely from pg_class.reltablespace:
+		//   if (reltablespace) spcOid = reltablespace;
+		//   else                spcOid = MyDatabaseTableSpace;
+		//   if (spcOid == GLOBALTABLESPACE_OID) dbOid = InvalidOid;
+		//   else                                dbOid = MyDatabaseId;
+		// The comment at line 1335-1336 explicitly states "we do not
+		// look at relisshared here" — so the only way a shared catalog
+		// file path resolves to `global/` is reltablespace == 1664.
+		// formrdesc sets this in memory at Phase 2 (relcache.c:1948),
+		// but Phase 3 then overrides rd_rel with the on-disk pg_class
+		// row, so the on-disk value must match.
+		pgClassReltablespaceFor(rel.IsShared),     // 92: reltablespace
 		executor.NewIntDatum(0),                   // 96: relpages
 		executor.NewIntDatum(0),                   // 100: reltuples
 		executor.NewIntDatum(0),                   // 104: relallvisible
@@ -3043,6 +3057,18 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewStringDatum("{}"),             // reloptions (empty text[])
 		executor.NewStringDatum(""),               // relpartbound (empty pg_node_tree)
 	}
+}
+
+// pgClassReltablespaceFor returns the pg_class.reltablespace value for a
+// nailed relation. Shared catalogs must store GLOBALTABLESPACE_OID (1664)
+// so the file path resolves to `global/<relfilenode>`; local catalogs
+// store 0 (the default, which routes to the database's tablespace).
+// See pgClassRow callsite for the relcache.c:1347-1354 derivation.
+func pgClassReltablespaceFor(isShared bool) executor.Datum {
+	if isShared {
+		return executor.NewIntDatum(1664) // GLOBALTABLESPACE_OID
+	}
+	return executor.NewIntDatum(0)
 }
 
 // pgAttrColDefs returns the 24 pg_attribute column descriptors.

@@ -8146,6 +8146,62 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         (pg_database_oid_index, shared) raised by the
         autovacuum-launcher-equivalent first backend after Step
         3cq lets user backends past InitPostgres.
+      - Step 3cr LANDED 2026-05-18. Closes the FATAL `could not open
+        file "base/5/2672"` (pg_database_oid_index, shared) that
+        surfaced after Step 3cq let PG-standby user backends past
+        InitPostgres. Root cause: `bootstrapPgClassTuples` wrote
+        `reltablespace = 0` for every nailed rel — including the
+        eight shared heaps and their indexes — but PG18's
+        `RelationInitPhysicalAddr` (relcache.c:1347-1354, with
+        explicit comment "we do not look at relisshared here")
+        routes file paths purely from `pg_class.reltablespace`:
+        shared catalogs MUST store GLOBALTABLESPACE_OID = 1664 to
+        resolve to `global/<relfilenode>`, otherwise
+        `spcOid = MyDatabaseTableSpace` and the path becomes
+        `base/<MyDatabaseId>/<relfilenode>`. `formrdesc` sets
+        reltablespace=1664 in memory at Phase 2 (relcache.c:1948),
+        but Phase 3 then overrides `rd_rel` with the on-disk pg_class
+        row, so the on-disk value must match. Second, independent
+        layer of the bug: `relcache_init.go::flattenRels` created
+        each index from `idxSpec` with `IsShared = false` (struct
+        zero value) regardless of the parent heap's flag, so
+        shared-catalog indexes (e.g. pg_database_oid_index OID 2672)
+        were encoded with relisshared=false too. Fix:
+        (a) `flattenRels` propagates `IsShared` from `heaps[0]`
+        (all heaps in one call share the same value — the call sites
+        are `nailedSharedRels = flattenRels(all-shared, …)` and
+        `nailedLocalRels = flattenRels(all-local, …)`) to each
+        emitted `indexNailed` entry;
+        (b) new helper `pgClassReltablespaceFor(isShared)` returns
+        1664 for shared and 0 for local, called from `pgClassRow`
+        at the reltablespace Datum slot;
+        (c) `buildPgClassBlob` writes 1664 at struct offset 92 for
+        shared rels in the init-file encoder too, keeping the two
+        paths in sync (even though `RelationCacheInitFileRemove`
+        wipes init files at standby startup — see Step 3cq).
+        Regression pins (all new, in
+        `internal/initdb/pg_class_reltablespace_test.go`):
+        `TestPgClassRowSharedReltablespaceIsGlobalTablespaceOID`
+        (Datum value for {shared,local} cases);
+        `TestPgClassRowSharedReltablespaceInEncodedPayload` (bytes
+        [92:96] decode to LE uint32 == 1664 after `EncodeRowPG`);
+        `TestFlattenRelsPropagatesIsSharedToIndexes` (every
+        `RelKind='i'` in `nailedSharedRels` has `IsShared=true`;
+        every such entry in `nailedLocalRels` has `IsShared=false`).
+        Verified: `go build ./...` PASS; targeted
+        `go test -count=1 -run 'TestPgClassRowShared|TestFlattenRelsPropagatesIsSharedToIndexes'
+        ./internal/initdb/` PASS (3/3 new tests);
+        `go test -count=1 ./internal/initdb/` — same 15 baseline
+        failures as Step 3cq (no new regressions, baseline-diff
+        confirmed via `git stash`); cross-package smoke
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
+        PASS. Design:
+        `docs/design/0106-0010-step3cr-pg-class-reltablespace-shared.md`.
+        Next blocker (Step 3cs): re-run
+        `TestE2E_FailoverGoopgToPG/async` with
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1` to surface whichever FATAL
+        now appears once `global/2672` is reachable.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

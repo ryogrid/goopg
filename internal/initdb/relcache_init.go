@@ -1263,6 +1263,18 @@ func flattenRels(heaps []nailedRel, idxs []idxSpec) []nailedRel {
 	var out []nailedRel
 	out = append(out, heaps...)
 	natts := pgIndexNattsByOID()
+	// M0106-0010 Step 3cr: indexes inherit IsShared from their parent
+	// heap. All heaps in a single flattenRels call share the same
+	// IsShared (nailedSharedRels is all-shared, nailedLocalRels is
+	// all-local), so propagating from heaps[0] is unambiguous.
+	// Without this, the per-database pg_class entry for a shared index
+	// such as 2672 (pg_database_oid_index) had relisshared=false and
+	// reltablespace=0, so PG's RelationInitPhysicalAddr resolved the
+	// file path to `base/<MyDatabaseId>/2672` instead of `global/2672`
+	// and standby user backends FATAL'd with
+	//   could not open file "base/5/2672": No such file or directory
+	// after Step 3cq let them past InitPostgres.
+	isShared := len(heaps) > 0 && heaps[0].IsShared
 	for _, idx := range idxs {
 		// Each index's natts MUST equal its pg_index.indnatts; PG's
 		// RelationInitIndexAccessInfo asserts relnatts == indnatts and
@@ -1275,7 +1287,9 @@ func flattenRels(heaps []nailedRel, idxs []idxSpec) []nailedRel {
 			// for OID-keyed unique indexes.
 			n = 1
 		}
-		out = append(out, indexNailed(idx.OID, idx.Name, n))
+		ix := indexNailed(idx.OID, idx.Name, n)
+		ix.IsShared = isShared
+		out = append(out, ix)
 	}
 	return out
 }
@@ -1397,6 +1411,14 @@ func buildPgClassBlob(rel nailedRel) []byte {
 	}
 	// relfilenode (offset 88) = OID for nailed relations
 	le.PutUint32(buf[88:92], rel.OID)
+	// reltablespace (offset 92): M0106-0010 Step 3cr. Shared catalogs
+	// must record GLOBALTABLESPACE_OID = 1664 so PG's
+	// RelationInitPhysicalAddr (relcache.c:1347-1354) resolves the
+	// file path to `global/<relfilenode>` instead of
+	// `base/<MyDatabaseId>/<relfilenode>`. Local rels store 0.
+	if rel.IsShared {
+		le.PutUint32(buf[92:96], 1664)
+	}
 	// relpages (offset 96) = 0
 	// reltuples (offset 100) = 0
 	// relallvisible (offset 104) = 0
