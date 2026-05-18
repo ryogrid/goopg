@@ -6149,6 +6149,80 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/server/ ./internal/storage/ ./internal/catalog/
         ./internal/mvcc/` PASS. Design:
         `docs/design/0106-0010-step3bl-pg-operator-oprname-l-r-n-index.md`.
+      - Step 3bm LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2753` PG-standby boot blocker
+        that surfaced after Step 3bl seeded
+        `pg_operator_oprname_l_r_n_index` (OID 2689). OID 2753 is
+        `pg_opfamily` per `postgres/src/include/catalog/pg_opfamily_d.h:23`
+        (`#define OperatorFamilyRelationId 2753`). Pure catalog-seed
+        change mirroring the nailed-rel pattern of Steps 3w
+        (pg_aggregate=2600), 3aa (pg_cast=2605), 3ag
+        (pg_conversion=2607), 3ak (pg_default_acl=826), 3an
+        (pg_enum=3501), 3ar (pg_event_trigger=3466), 3aw
+        (pg_extension=3079), 3bb (pg_foreign_data_wrapper=2328), 3be
+        (pg_foreign_server=1417), and 3bh (pg_foreign_table=3118); no
+        encoder, builder, or `Init` flow change.
+        (a) `internal/initdb/relcache_init.go` gains new
+        `pgOpfamilyAttrs()` returning the 5-column PG18 schema sourced
+        verbatim from `pg_opfamily.h`: oid (26/4), opfmethod (26/4 →
+        pg_am), opfname (19 name/64), opfnamespace (26/4 →
+        pg_namespace), opfowner (26/4 → pg_authid). All five columns
+        are fixed-width NOT NULL — no CATALOG_VARLEN columns.
+        (b) `nailedLocalRels` gains
+        `{2753, "pg_opfamily", 83, 'r', 5, false, pgOpfamilyAttrs()}`
+        immediately after the Step 3bh pg_foreign_table entry.
+        `RelType=83` is safe because pg_opfamily is not formrdesc'd
+        (no `OperatorFamilyRelation_Rowtype_Id` constant in PG18
+        headers), so Step 3v's
+        `relation->rd_att->tdtypeid == relp->reltype` Phase-3
+        assertion does not fire.
+        (c) `internal/initdb/initdb.go::bootstrapMappedLocalCatalogHeaps`
+        OID list gains `2753` so an `InitPage`-stamped 8 KiB empty
+        heap is written to `base/{1,5}/2753` before PG's mdopen.
+        (d) `internal/initdb/initdb.go::localRelMap` gains
+        `{2753, 2753}` so PG's relfilenode mapper resolves OID 2753 to
+        a backing file.
+        Companion indexes 2754 (`pg_opfamily_am_name_nsp_index`,
+        UNIQUE composite `btree(opfmethod oid_ops, opfname name_ops,
+        opfnamespace oid_ops)`, backs
+        `MAKE_SYSCACHE(OPFAMILYAMNAMENSP, …)`) and 2755
+        (`pg_opfamily_oid_index`, UNIQUE PRIMARY KEY on `oid_ops`,
+        backs `MAKE_SYSCACHE(OPFAMILYOID, …)`) deferred to subsequent
+        steps in the single-OID rhythm.
+        The new nailedLocalRels entry threads automatically through
+        `bootstrapPgClassTuples → bootstrapPgAttributeTuples →
+        bootstrapPgClassOidIndex` (leaf for 2753 at file 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (5 composite-key leaves
+        at file 2659; Step 3av's bulk-load builder handles bookkeeping)
+        and `writeRelcacheInitFile` emits a `Form_pg_class` + 5
+        `Form_pg_attribute` blob group.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgOpfamily` (full per-column
+        `(Name, TypeOID, Num, Len, NotNull)` audit) and
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgOpfamily`
+        (asserts `base/{1,5}/2753` exists, is exactly 8 KiB, and
+        InitPage-stamped) in
+        `internal/initdb/pg_opfamily_nailed_test.go`. Existing pin
+        extended:
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        gains 2753 so the placeholder OID list cannot silently drop
+        pg_opfamily.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgOpfamily|TestBootstrapMappedLocalCatalogHeapsIncludesPgOpfamily|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedLocalRelsContainsPgForeignTable|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexInitialEntriesIndkeyMatchesPG18'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bl
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design:
+        `docs/design/0106-0010-step3bm-pg-opfamily-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

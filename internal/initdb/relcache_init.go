@@ -222,6 +222,16 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// has no `oid` system column — `ftrelid` is the primary key. The
 	// trailing CATALOG_VARLEN ftoptions column is nullable.
 	{3118, "pg_foreign_table", 83, 'r', 3, false, pgForeignTableAttrs()},
+	// M0106-0010 step 3bm: pg_opfamily is opened during PG-standby boot
+	// once Step 3bl cleared `pg_operator_oprname_l_r_n_index`. Without a
+	// pg_class row, `RelationBuildDesc(2753) → ScanPgRelation(2753)`
+	// returns NULL and the backend FATALs with `could not open relation
+	// with OID 2753`. RelType=83 is safe because pg_opfamily is not
+	// formrdesc'd (no `OperatorFamilyRelation_Rowtype_Id` constant in
+	// PG18 headers). Schema per
+	// `postgres/src/include/catalog/pg_opfamily.h` (PG18,
+	// OperatorFamilyRelationId == 2753). 5 columns, all NotNull.
+	{2753, "pg_opfamily", 83, 'r', 5, false, pgOpfamilyAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1284,6 +1294,24 @@ func pgConversionAttrs() []nailedAttr {
 		{Name: "contoencoding", TypeOID: 23, Num: 6, Len: 4, NotNull: true},   // int4
 		{Name: "conproc", TypeOID: 24, Num: 7, Len: 4, NotNull: true},         // regproc → pg_proc
 		{Name: "condefault", TypeOID: 16, Num: 8, Len: 1, NotNull: true},      // bool
+	}
+}
+
+// pgOpfamilyAttrs defines the 5-column PG18 pg_opfamily schema. PG
+// `RelationBuildDesc(2753) → ScanPgRelation(2753)` looks up the
+// `Form_pg_class` row first; without a nailedLocalRels entry no row
+// gets seeded and PG FATALs with `could not open relation with OID
+// 2753`. Sourced verbatim from
+// `postgres/src/include/catalog/pg_opfamily.h` (PG18). All five
+// columns are fixed-width NOT NULL — no CATALOG_VARLEN columns.
+// M0106-0010 step 3bm.
+func pgOpfamilyAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},           // oid
+		{Name: "opfmethod", TypeOID: 26, Num: 2, Len: 4, NotNull: true},     // oid → pg_am
+		{Name: "opfname", TypeOID: 19, Num: 3, Len: 64, NotNull: true},      // name
+		{Name: "opfnamespace", TypeOID: 26, Num: 4, Len: 4, NotNull: true},  // oid → pg_namespace
+		{Name: "opfowner", TypeOID: 26, Num: 5, Len: 4, NotNull: true},      // oid → pg_authid
 	}
 }
 

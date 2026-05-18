@@ -40,6 +40,7 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 		1417, // pg_foreign_server (M0106-0010 step 3be)
 		2328, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
 		3118, // pg_foreign_table (M0106-0010 step 3bh)
+		2753, // pg_opfamily (M0106-0010 step 3bm)
 		2600, 2604, 2605, 2606, 2607, 2608, 2609, 2611, 2612,
 		2613, 2614, 2615, 2617, 2618, 2619, 2620,
 		3079, // pg_extension (M0106-0010 step 3aw)
