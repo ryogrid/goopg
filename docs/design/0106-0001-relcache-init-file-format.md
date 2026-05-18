@@ -1,9 +1,18 @@
 # 0106-0001 — PG Relcache Init File Format and Generation
 
-**Status:** draft
-**Date:** 2026-05-17
+**Status:** superseded
+**Superseded by:** [`bootstrap-procedure/08-relcache-init-and-version-files.md`](bootstrap-procedure/08-relcache-init-and-version-files.md)
+**Date:** 2026-05-17 (superseded 2026-05-19)
 **Milestone:** M0106
 **Upstream reference:** `postgres/src/backend/utils/cache/relcache.c`
+
+> **This doc is retained for history only.** The full specification — including
+> the complete nailed-rel inventory across shared+local files, the continuous
+> maintenance rule for unlinking `pg_internal.init` on nailed-rel mutation, the
+> per-database layout, the trailing-count read-time validation, and the WAL
+> `RelcacheInitFileInval` flag — now lives in the bootstrap-procedure bundle.
+> See [`bootstrap-procedure/README.md`](bootstrap-procedure/README.md) for the
+> full reading order.
 
 ## Problem
 

@@ -2334,6 +2334,20 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
 
 ## M0106 — PG Relcache Init File Compatibility (filed 2026-05-17)
 
+**Authoritative spec for remaining work:**
+[`docs/design/bootstrap-procedure/README.md`](../docs/design/bootstrap-procedure/README.md).
+The bundle replaces the reactive step-3* loop (116+ docs at
+`docs/design/0106-0010-step3*.md`) with a single batched specification of
+every PG18 artefact goopg must produce **and** continuously maintain so a
+vanilla PG18 standby can attach via `pg_basebackup` at any time. The 35-task
+implementation roadmap lives at
+[`bootstrap-procedure/10-implementation-roadmap.md`](../docs/design/bootstrap-procedure/10-implementation-roadmap.md);
+the per-operation continuous-maintenance matrix is at
+[`bootstrap-procedure/11-continuous-maintenance.md`](../docs/design/bootstrap-procedure/11-continuous-maintenance.md).
+New Ralph loops should pick the next un-done task from
+`10-implementation-roadmap.md` instead of waiting for the next
+TestE2E_FailoverGoopgToPG/async FATAL.
+
 Operational note (2026-05-17):
 - This milestone is a follow-up blocker from M0105-0010: PG standby
   reaches PM_HOT_STANDBY but backends PANIC because critical system
@@ -9472,6 +9486,497 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
             pointing at the new heap row. After phase B, the E2E test's
             `SELECT status FROM pg_catalog.pg_stat_wal_receiver` probe
             should advance past the `42P01` error.
+
+#### Batched implementation tasks (from `docs/design/bootstrap-procedure/`)
+
+The 35 tasks below derive from the bootstrap-procedure design bundle
+(filed 2026-05-19) that replaces the reactive step-3* loop. Each task is
+one Ralph loop's worth of work. Full per-task details (files, originating
+step-3* docs, tests, risk gate) live in
+[`docs/design/bootstrap-procedure/10-implementation-roadmap.md`](../docs/design/bootstrap-procedure/10-implementation-roadmap.md);
+the underlying spec lives in the rest of the bundle. Pick tasks in numeric
+order — the ordering is bottom-up (ControlFile → WAL → catalogs → views →
+relcache init → replication readiness) and intra-package grouped.
+
+- [ ] **M0106-0010 batched-01** (bootstrap-procedure task 1)
+      - Summary: Fill `checkPointCopy` substructure (redo, TLI×2,
+        nextXid=3, nextOid=10000, nextMulti=1, oldestXid=3,
+        oldestXidDB=1, oldestMulti=1, oldestMultiDB=1, fullPageWrites,
+        wal_level, time) in `buildPgControl`.
+      - Spec: `bootstrap-procedure/02-pg-control-and-checkpoint.md`.
+      - Files: `internal/initdb/pgcontrol.go`.
+      - Test: `internal/initdb/pg_control_test.go` (new) — assert
+        offsets 32..127 match expected.
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-02** (bootstrap-procedure task 2)
+      - Summary: Set `unloggedLSN = FirstNormalUnloggedLSN = 1000` and
+        pipe live GUCs (`MaxConnections`, `max_worker_processes`,
+        `max_wal_senders`, `max_prepared_xacts`, `max_locks_per_xact`,
+        `wal_level`) into ControlFile from `internal/config` instead of
+        hard-coded constants.
+      - Spec: `bootstrap-procedure/02-pg-control-and-checkpoint.md`,
+        `09-streaming-replication-readiness.md`.
+      - Files: `internal/initdb/pgcontrol.go`.
+      - Test: `internal/initdb/pg_control_test.go` extended.
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-03** (bootstrap-procedure task 3)
+      - Summary: Add `updateControlFile(dataDir, fn func(*ControlFileData)) error`
+        helper; thread it through `wal/checkpointer.go::runCheckpoint`,
+        `server/basebackup.go::handleBaseBackup`, and the (future)
+        promotion path.
+      - Spec: `bootstrap-procedure/02-pg-control-and-checkpoint.md`.
+      - Files: `internal/initdb/pgcontrol.go` → moved to
+        `internal/control/pgcontrol.go`, `internal/wal/checkpointer.go`,
+        `internal/server/basebackup.go`.
+      - Test: `internal/control/control_test.go`,
+        `internal/wal/checkpointer_test.go` extended.
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-04** (bootstrap-procedure task 4)
+      - Summary: Add `WriteBootstrapWAL(dataDir, sysID, now) error`
+        writing `pg_wal/000000010000000000000001`: 40-byte long page
+        header + `XLOG_CHECKPOINT_SHUTDOWN` record (114 B total),
+        zero-pad to `wal_segment_size`, `fsync` before `writePgControl`.
+      - Spec: `bootstrap-procedure/03-wal-bootstrap-segment.md`.
+      - Files: `internal/initdb/wal_bootstrap.go` (new),
+        `internal/initdb/initdb.go`.
+      - Test: `internal/initdb/wal_bootstrap_test.go` (new) —
+        byte-diff vs vanilla `pg_basebackup` first segment.
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-05** (bootstrap-procedure task 5)
+      - Summary: Add `excludeFiles` and `excludeDirContents` tables and
+        table-driven exclusion in basebackup; ship the 11 missing
+        entries (`pg_internal.init*` prefix, `backup_label`,
+        `tablespace_map`, `backup_manifest`, `postgresql.auto.conf.tmp`,
+        `current_logfiles.tmp`, plus 6 dir-contents) and demote the
+        inline `pg_replslot` prefix-strip.
+      - Spec: `bootstrap-procedure/09-streaming-replication-readiness.md`.
+      - Files: `internal/server/basebackup.go`.
+      - Test: `internal/server/basebackup_test.go` extended;
+        `internal/testport/e2e_failover_*` smoke.
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-06** (bootstrap-procedure task 6)
+      - Summary: Bind the `XLOG_PARAMETER_CHANGE` redo path on the
+        standby side to `updateControlFile` so a goopg standby imprints
+        replayed GUC echoes.
+      - Spec: `bootstrap-procedure/02-pg-control-and-checkpoint.md`,
+        `09-streaming-replication-readiness.md`.
+      - Files: `internal/wal/recovery.go`, `internal/control/pgcontrol.go`.
+      - Test: `internal/wal/recovery_test.go` extended (table-driven
+        `XLOG_PARAMETER_CHANGE` replay).
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-07** (bootstrap-procedure task 7)
+      - Summary: Replace JSON slot file writer with PG-binary `state`
+        (magic `0x1051CA1`, version 5, CRC32C,
+        `ReplicationSlotPersistentData`); keep `state.tmp` + atomic
+        `rename` + parent-dir `fsync`.
+      - Spec: `bootstrap-procedure/09-streaming-replication-readiness.md`.
+      - Files: `internal/wal/slots_pg.go` (new), `internal/wal/slots.go`.
+      - Test: `internal/wal/slots_test.go` extended — CRC self-check,
+        magic+version assertion, round-trip.
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-08** (bootstrap-procedure task 8)
+      - Summary: Add `createPerDatabaseScaffolding(dboid, name)` writing
+        `base/<dboid>/` directory and `base/<dboid>/PG_VERSION = "18\n"`;
+        emit for OIDs 1 (template1), 4 (template0), 5 (postgres).
+      - Spec: `bootstrap-procedure/01-data-directory-layout.md`,
+        `08-relcache-init-and-version-files.md`.
+      - Files: `internal/initdb/initdb.go`.
+      - Test: `internal/initdb/initdb_test.go` extended —
+        `base/{1,4,5}/PG_VERSION` exist with `"18\n"`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-09** (bootstrap-procedure task 9)
+      - Summary: Write `postgresql.auto.conf` two-line `ALTER SYSTEM`
+        header at initdb.
+      - Spec: `bootstrap-procedure/01-data-directory-layout.md`.
+      - Files: `internal/initdb/initdb.go` (extend `SampleFiles`).
+      - Test: `internal/initdb/initdb_test.go`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-10** (bootstrap-procedure task 10)
+      - Summary: Seed `pg_database` OID 4 (`template0`,
+        `datistemplate=true`, `datallowconn=false`) plus its leaf entries
+        in `pg_database_oid_index` (2672) and `pg_database_datname_index`
+        (2671).
+      - Spec: `bootstrap-procedure/04-shared-catalog-bootstrap.md`,
+        `08-relcache-init-and-version-files.md`.
+      - Files: `internal/initdb/initdb.go::bootstrapPostgresDatabase`,
+        `internal/initdb/btree_index_bootstrap.go`.
+      - Test: `internal/initdb/pg_database_*_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3cs-pg-database-oid-index-populated.md`,
+        `0106-0010-step3ct-pg-database-pg18-row-layout.md`,
+        `0106-0010-step3dh-pg-database-datname-index.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-11** (bootstrap-procedure task 11)
+      - Summary: Seed 16 predefined `pg_authid` rows
+        (`pg_database_owner`, `pg_read_all_data`, …
+        `pg_signal_autovacuum_worker`); rewrite
+        `rolpassword`/`rolvaliduntil` as NULL; set `HEAP_XMIN_FROZEN`.
+        Update `pg_authid_oid_index` (2677) and
+        `pg_authid_rolname_index` (2676) leaves.
+      - Spec: `bootstrap-procedure/04-shared-catalog-bootstrap.md`.
+      - Files: `internal/initdb/initdb.go::bootstrapPostgresRole`,
+        `internal/initdb/btree_index_bootstrap.go::bootstrapPgAuthidIndexes`.
+      - Test: `internal/initdb/pg_authid_heap_row_test.go`,
+        `pg_authid_indexes_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3cx-pg-authid-os-user-and-indexes.md`,
+        `0106-0010-step3de-pg-authid-heap-rolname-byte-layout.md`,
+        `0106-0010-step3dg-pg-authid-rolname-index-name-typed-descriptor.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-12** (bootstrap-procedure task 12)
+      - Summary: Seed 2 default `pg_tablespace` rows (1663 `pg_default`,
+        1664 `pg_global`) and update `pg_tablespace_oid_index` (2697)
+        and `pg_tablespace_spcname_index` (2698) leaves.
+      - Spec: `bootstrap-procedure/04-shared-catalog-bootstrap.md`.
+      - Files: `internal/initdb/sharedcatalog.go` (new),
+        `internal/initdb/btree_index_bootstrap.go`.
+      - Test: `internal/initdb/pg_class_reltablespace_test.go` extended;
+        new `pg_tablespace_heap_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3ch-pg-tablespace-nailed-rel.md`,
+        `0106-0010-step3cr-pg-class-reltablespace-shared.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-13** (bootstrap-procedure task 13)
+      - Summary: Wire `pg_auth_members_oid_index` (6303) and
+        `pg_auth_members_grantor_index` (6302) into the
+        critical-shared-index loop so the empty placeholders match
+        vanilla.
+      - Spec: `bootstrap-procedure/04-shared-catalog-bootstrap.md`.
+      - Files: `internal/initdb/btree_index_bootstrap.go`.
+      - Test: `internal/initdb/pg_auth_members_*_index_test.go`.
+      - Originating step-3* doc:
+        `0106-0010-step3z-pg-auth-members-role-member-index.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-14** (bootstrap-procedure task 14)
+      - Summary: Expand `bootstrapPgProcTuples` from 7 AM-handler rows
+        to the full `pg_proc.dat` row set (~3397 rows); add an embedded
+        `pg_proc.dat`-derived inventory; populate
+        `proallargtypes`/`proargnames`/`proargmodes` arrays with PG18
+        byte layout.
+      - Spec: `bootstrap-procedure/05-local-catalog-bootstrap.md`,
+        `06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/pg_proc_view.go` (extend),
+        `internal/initdb/initdb.go::bootstrapPgProcTuples`.
+      - Test: `internal/initdb/pg_proc_bootstrap_test.go`,
+        `pg_proc_oid_index_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3a-pg-proc-bootstrap.md`,
+        `0106-0010-step3da-pg-type-io-regproc-oids.md`,
+        `0106-0010-step3dc-pg-proc-io-regproc-heap-rows.md`,
+        `0106-0010-step3db-pg-proc-oid-index-populated.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-15** (bootstrap-procedure task 15)
+      - Summary: Expand `bootstrapPgTypeTuples` from ~25 to ~612 rows
+        (112 base + ~500 derived array / multirange / rowtype); fix
+        `typalign` byte-offset (Step 3cq).
+      - Spec: `bootstrap-procedure/05-local-catalog-bootstrap.md`,
+        `06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/pg_type_bootstrap.go`,
+        `internal/initdb/initdb.go`.
+      - Test: `internal/initdb/pg_attribute_attalign_offset_test.go`,
+        new `pg_type_heap_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3cq-pg-type-heap-canonical-typalign.md`,
+        `0106-0010-step3cz-pg-type-oid-index-populated.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-16** (bootstrap-procedure task 16)
+      - Summary: Seed `pg_operator` (799 rows) heap + indexes (2688, 2689).
+      - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/pg_operator_bootstrap.go` (new),
+        `internal/initdb/btree_index_bootstrap.go`.
+      - Test: `internal/initdb/pg_operator_oprname_l_r_n_index_test.go`.
+      - Originating step-3* doc:
+        `0106-0010-step3bl-pg-operator-oprname-l-r-n-index.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-17** (bootstrap-procedure task 17)
+      - Summary: Complete `pg_amop` seed: add cross-type rows for
+        `text_ops` (1994), `datetime_ops` (434), `numeric_ops` (1988),
+        plus hash/gist/gin/spgist/brin tail (target 945 rows).
+      - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`
+        §"Cross-type opfamily rows".
+      - Files: `internal/initdb/initdb.go::pgAmopInitialEntries`.
+      - Test: `internal/initdb/pg_amop_bootstrap_test.go`,
+        `pg_amop_fam_strat_index_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3c-pg-amop-amproc-bootstrap.md`,
+        `0106-0010-step3d-pg-amop-amproc-pinned-opfamily-fix.md`,
+        `0106-0010-step3e-pg-amproc-sortsupport-equalimage.md`,
+        `0106-0010-step3h-pg-amop-amproc-crosstype-integer.md`,
+        `0106-0010-step3y-pg-amop-fam-strat-index.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-18** (bootstrap-procedure task 18)
+      - Summary: Complete `pg_amproc` seed: cross-type cmp procs for
+        text / datetime / numeric, plus hash/gist/gin support functions
+        (target 714 rows).
+      - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/initdb.go::pgAmprocInitialEntries`,
+        `internal/initdb/btree_index_bootstrap.go`.
+      - Test: `internal/initdb/pg_amproc_bootstrap_test.go`,
+        `pg_amproc_fam_proc_index_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3cw-pg-amproc-fam-proc-index.md`,
+        `0106-0010-step3e-pg-amproc-sortsupport-equalimage.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-19** (bootstrap-procedure task 19)
+      - Summary: Seed `pg_opclass` (177 rows) heap + index (2687); add
+        `pgOpfamilyInitialEntries()` for `pg_opfamily` (146 rows) heap +
+        indexes (2754, 2755).
+      - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/initdb.go::pgOpclassInitialEntries`, new
+        `internal/initdb/pg_opfamily_bootstrap.go`.
+      - Test: `internal/initdb/pg_opclass_bootstrap_test.go`,
+        `pg_opfamily_*_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3b-pg-opclass-bootstrap.md`,
+        `0106-0010-step3ad-pg-opclass-am-name-nsp-index.md`,
+        `0106-0010-step3bm-pg-opfamily-nailed-rel.md`,
+        `0106-0010-step3bn-pg-opfamily-am-name-nsp-index.md`,
+        `0106-0010-step3bo-pg-opfamily-oid-index.md`,
+        `0106-0010-step3l-pg-opclass-oid-index-tuples.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-20** (bootstrap-procedure task 20)
+      - Summary: Seed `pg_cast` (235 rows) heap + indexes (2660, 2661).
+      - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/pg_cast_bootstrap.go` (new).
+      - Test: `internal/initdb/pg_cast_nailed_test.go`,
+        `pg_cast_*_index_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3aa-pg-cast-nailed-rel.md`,
+        `0106-0010-step3ab-pg-cast-oid-index.md`,
+        `0106-0010-step3ac-pg-cast-source-target-index.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-21** (bootstrap-procedure task 21)
+      - Summary: Seed `pg_collation` (7 BKI rows) heap + indexes (3164, 3085).
+      - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/pg_collation_bootstrap.go` (new).
+      - Test: `internal/initdb/pg_collation_*_index_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3ae-pg-collation-name-enc-nsp-index.md`,
+        `0106-0010-step3af-pg-collation-oid-index.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-22** (bootstrap-procedure task 22)
+      - Summary: Seed `pg_conversion` (128 rows) heap + indexes
+        (2668, 2669, 2670).
+      - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/pg_conversion_bootstrap.go` (new).
+      - Test: `internal/initdb/pg_conversion_*_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3ag-pg-conversion-nailed-rel.md`,
+        `0106-0010-step3ah-pg-conversion-default-index.md`,
+        `0106-0010-step3ai-pg-conversion-oid-index.md`,
+        `0106-0010-step3aj-pg-conversion-name-nsp-index.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-23** (bootstrap-procedure task 23)
+      - Summary: Seed `pg_aggregate` (161 rows) heap + index (2650);
+        ensure each row's `aggfnoid` resolves into the expanded
+        `pg_proc` set from task 14.
+      - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/pg_aggregate_bootstrap.go` (new).
+      - Test: `internal/initdb/pg_aggregate_*_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3w-pg-aggregate-nailed-rel.md`,
+        `0106-0010-step3x-pg-aggregate-fnoid-index.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-24** (bootstrap-procedure task 24)
+      - Summary: Seed `pg_range` (6 rows) + the 6 multirange `pg_type`
+        peers; add range `pg_cast` rows; add indexes (3542, 2228).
+      - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/pg_range_bootstrap.go` (new).
+      - Test: `internal/initdb/pg_range_nailed_test.go`.
+      - Originating step-3* doc:
+        `0106-0010-step3bz-pg-range-nailed-rel.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-25** (bootstrap-procedure task 25)
+      - Summary: Seed `pg_language` (3 BKI rows) heap + indexes
+        (2681, 2682).
+      - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/pg_language_bootstrap.go` (new).
+      - Test: `internal/initdb/pg_language_*_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3bj-pg-language-name-index.md`,
+        `0106-0010-step3bk-pg-language-oid-index.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-26** (bootstrap-procedure task 26)
+      - Summary: Backfill the residual nailed-rel placeholders surfaced
+        by the step-3a..3cp chain (`pg_default_acl`, `pg_enum`,
+        `pg_event_trigger`, `pg_extension`, `pg_foreign_data_wrapper`,
+        `pg_foreign_server`, `pg_foreign_table`, `pg_parameter_acl`,
+        `pg_partitioned_table`, `pg_publication`,
+        `pg_publication_namespace`, `pg_publication_rel`,
+        `pg_replication_origin`, `pg_sequence`, `pg_statistic`,
+        `pg_statistic_ext`, `pg_statistic_ext_data`,
+        `pg_subscription_rel`, `pg_transform`, `pg_ts_*`,
+        `pg_user_mapping`, `pg_db_role_setting`, `pg_shseclabel` schema
+        fix) — audit residual gaps and add whichever placeholder indexes
+        are still missing from `bootstrapMappedLocalCatalogHeaps`.
+      - Spec: `bootstrap-procedure/05-local-catalog-bootstrap.md`,
+        `06-bki-derived-catalog-seeds.md`.
+      - Files: `internal/initdb/initdb.go`,
+        `internal/initdb/btree_index_bootstrap.go`.
+      - Test: `internal/initdb/pg_*_nailed_test.go`,
+        `pg_*_oid_index_test.go`.
+      - Originating step-3* docs: all `0106-0010-step3ak..3cp` docs
+        (see "Superseded step-3* docs" in
+        `bootstrap-procedure/10-implementation-roadmap.md`).
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-27** (bootstrap-procedure task 27)
+      - Summary: Seed `pg_proc` rows 3099, 6118, 6169, 6248, 3781 (SRFs
+        backing the remaining 5 replication views) with full PG18
+        `proallargtypes` / `proargnames` arrays.
+      - Spec: `bootstrap-procedure/07-system-views-and-pg-rewrite.md`.
+      - Files: `internal/initdb/pg_proc_view.go`.
+      - Test: `internal/initdb/pg_proc_view_test.go`,
+        `pg_proc_outargs_test.go`.
+      - Originating step-3* docs:
+        `0106-0010-step3dj-pg-proc-stat-get-wal-receiver.md`,
+        `0106-0010-step3dk-pg-proc-3317-out-args-arrays.md`,
+        `0106-0010-step3di-segv-chain-eliminated-pg-stat-wal-receiver-missing.md`,
+        `0106-0010-step3dd-segv-backtrace-ld-preload.md`,
+        `0106-0010-step3df-segv-backtrace-si-addr-and-registers.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-28** (bootstrap-procedure task 28)
+      - Summary: Seed `pg_class` + `pg_attribute` + `pg_type` (composite
+        rowtype) rows for the 5 remaining replication views
+        (`pg_stat_replication` 12102, `pg_stat_recovery_prefetch` 12103,
+        `pg_stat_subscription` 12104, `pg_replication_slots` 12105,
+        `pg_stat_replication_slots` 12106).
+      - Spec: `bootstrap-procedure/07-system-views-and-pg-rewrite.md`.
+      - Files: `internal/initdb/relcache_init.go::nailedLocalRels`,
+        `internal/initdb/aio_views.go` extended.
+      - Test: `internal/initdb/aio_views_test.go` extended.
+      - Originating step-3* doc:
+        `0106-0010-step3dl-pg-stat-wal-receiver-view-pg-class.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-29** (bootstrap-procedure task 29)
+      - Summary: Add `replicationViewRewriteEntries()` emitting `_RETURN`
+        rule tuples (8-col PG18 layout) for the 5 remaining views into
+        `pg_rewrite` (2618) and `pg_rewrite_rel_rulename_index` (2693);
+        embed `.dat` ev_action captures.
+      - Spec: `bootstrap-procedure/07-system-views-and-pg-rewrite.md`
+        §"ev_action encoding".
+      - Files: `internal/initdb/pg_rewrite_bootstrap.go`, new
+        `pg_*_ev_action.dat` files.
+      - Test: `internal/initdb/pg_rewrite_bootstrap_test.go`,
+        `pg_rewrite_schema_test.go`.
+      - Originating step-3* doc:
+        `0106-0010-step3dm-pg-rewrite-schema-fix.md`.
+      - Risk gate: parser/planner/executor.
+
+- [ ] **M0106-0010 batched-30** (bootstrap-procedure task 30)
+      - Summary: Fix `writeRelcacheInitFile`: emit exactly 5 shared /
+        4 local rels + 6 / 7 critical indexes (trailing-count check
+        `relcache.c:6524-6534`); write the index sub-record (pg_index
+        tuple, opfamily, opcintype, support, indcollation, indoption,
+        opcoptions) for every index entry. Drop the `chmod 0o400` so PG
+        can rewrite. **Supersedes** the older
+        `docs/design/0106-0001-relcache-init-file-format.md`.
+      - Spec: `bootstrap-procedure/08-relcache-init-and-version-files.md`.
+      - Files: `internal/initdb/relcache_init.go`.
+      - Test: `internal/initdb/relcache_init_test.go` (new) — magic
+        byte, record count, reader round-trip via a vanilla-PG18
+        `load_relcache_init_file` simulator.
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-31** (bootstrap-procedure task 31)
+      - Summary: Add `internal/catalog/RelcacheInitFileUnlink(dataDir, dboid)`
+        and `WithRelCacheInitLock(fn)`; funnel every PG-canonical
+        nailed-rel DDL through them; emit commit-record
+        `RelcacheInitFileInval=true`.
+      - Spec: `bootstrap-procedure/08-relcache-init-and-version-files.md`,
+        `11-continuous-maintenance.md`.
+      - Files: `internal/catalog/relcache_inval.go` (new),
+        `internal/executor/operators_ddl.go`,
+        `internal/executor/operators_vacuum.go`,
+        `internal/wal/recovery.go`.
+      - Test: `internal/catalog/relcache_inval_test.go` (new);
+        `internal/wal/recovery_test.go` extended for
+        `ProcessCommittedInvalidationMessages` redo.
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-32** (bootstrap-procedure task 32)
+      - Summary: Add `internal/catalog/PgCanonicalHeapInsert(rel, row)`
+        + `PgCanonicalBtreeInsert(rel, key, tid)` +
+        `RelationMapUpdateMap(dboid, relid, relfilenode, shared)`
+        helpers; funnel `internal/executor/operators_ddl.go` DDL paths
+        through them so `CREATE TABLE` / `CREATE INDEX` / `CREATE VIEW`
+        / `CREATE FUNCTION` / `CREATE TYPE` / `CREATE TRIGGER` emit
+        `XLOG_HEAP_INSERT` + `XLOG_BTREE_INSERT_LEAF` +
+        `XLOG_RELMAP_UPDATE` and queue `CacheInvalidateHeapTuple` SI
+        messages.
+      - Spec: `bootstrap-procedure/05-local-catalog-bootstrap.md`,
+        `06-bki-derived-catalog-seeds.md`,
+        `11-continuous-maintenance.md`.
+      - Files: `internal/catalog/canonical.go` (new),
+        `internal/executor/operators_ddl.go`.
+      - Test: `internal/catalog/canonical_test.go` (new); existing
+        `internal/executor/*_test.go` extended with WAL-byte capture
+        assertions.
+      - Originating step-3* docs: 3f, 3g, 3i, 3j, 3k, 3n, 3o, 3p, 3q,
+        3r, 3s, 3m, 3au, 3av, 3az, 3ba — see
+        `bootstrap-procedure/10-implementation-roadmap.md` task 32 for
+        the full list.
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-33** (bootstrap-procedure task 33)
+      - Summary: Add a primary-side `ReportParameters` entry point in
+        `wal/parameter_change.go` that, on postmaster start and
+        `SIGHUP`, diffs the 8 GUC fields and emits
+        `XLOG_PARAMETER_CHANGE` + `updateControlFile`.
+      - Spec: `bootstrap-procedure/09-streaming-replication-readiness.md`,
+        `02-pg-control-and-checkpoint.md`.
+      - Files: `internal/wal/parameter_change.go` (new),
+        `internal/wal/checkpointer.go`.
+      - Test: `internal/wal/parameter_change_test.go` (new).
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-34** (bootstrap-procedure task 34)
+      - Summary: Wire `wal.WriteHistory` into the primary-initiated
+        promotion path (post-recovery TLI bump, `pg_promote()` SQL
+        function) — already wired for standby-initiated promotion.
+      - Spec: `bootstrap-procedure/09-streaming-replication-readiness.md`.
+      - Files: `internal/wal/recovery.go`, `cmd/goopg/standby.go`.
+      - Test: `internal/testport/e2e_failover_*` extended.
+      - Risk gate: wal/replication.
+
+- [ ] **M0106-0010 batched-35** (bootstrap-procedure task 35 — E2E gate)
+      - Summary: Run `TestE2E_FailoverGoopgToPG/async` end-to-end and
+        confirm the milestone-completion predicates from
+        `bootstrap-procedure/10-implementation-roadmap.md`
+        §"Acceptance criteria": standby reaches hot standby,
+        `pg_stat_wal_receiver.status = 'streaming'`, no FATAL on any of
+        the spec-doc error chains.
+      - Spec: all of `docs/design/bootstrap-procedure/`.
+      - Files: `internal/testport/e2e_failover_goopg_to_pg_test.go`.
+      - Test: `go test -v -run TestE2E_FailoverGoopgToPG/async ./internal/testport/`.
+      - Risk gate: wal/replication.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
