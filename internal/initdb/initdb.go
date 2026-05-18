@@ -497,6 +497,19 @@ func Init(opts Options) error {
 	if err := bootstrapPgRangeRngmultitypidIndex(abs, pgRangeTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_range_rngmultitypid_index: %w", err)
 	}
+	// M0106-0010 batched-25: write the 3 pg_language rows (internal/c/sql)
+	// to base/{1,5}/2612 so PG's LANGNAME and LANGOID syscaches resolve
+	// language OID lookups during function compilation and handler dispatch.
+	pgLanguageTIDs, err := bootstrapPgLanguageTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_language tuples: %w", err)
+	}
+	if err := bootstrapPgLanguageOidIndex(abs, pgLanguageTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_language_oid_index: %w", err)
+	}
+	if err := bootstrapPgLanguageNameIndex(abs, pgLanguageTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_language_name_index: %w", err)
+	}
 	// M0106-0010 step 3m: overwrite the empty btree placeholder at
 	// base/{1,5}/2662 + global/2662 with a populated 2-page btree
 	// (metapage + leaf-root) carrying one oid-keyed IndexTuple per
@@ -690,7 +703,7 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		2608, // pg_depend
 		2609, // pg_description
 		2611, // pg_inherits
-		2612, // pg_language
+		// 2612 pg_language: dedicated bootstrapper (bootstrapPgLanguageTuples)
 		2613, // pg_largeobject
 		2614, // pg_largeobject_metadata
 		// 2615 pg_namespace: dedicated bootstrapper (bootstrapPgNamespaceTuples)

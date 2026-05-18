@@ -2393,3 +2393,76 @@ func bootstrapPgRangeRngmultitypidIndex(dataDir string, tids map[uint32]heapTID)
 	}
 	return nil
 }
+
+// bootstrapPgLanguageOidIndex builds pg_language_oid_index (OID 2682) —
+// UNIQUE PRIMARY KEY on pg_language.oid (oid_ops, no collation) —
+// and writes the btree file to base/{1,5}/2682.
+func bootstrapPgLanguageOidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type indexed struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(tids))
+	for oid, tid := range tids {
+		items = append(items, indexed{oid: oid, block: tid.Block, off: tid.Offset})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
+	if err != nil {
+		return fmt.Errorf("pg_language_oid_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "2682"), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_language_oid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgLanguageNameIndex builds pg_language_name_index (OID 2681) —
+// UNIQUE (not primary) on pg_language.lanname (name_ops, C collation) —
+// and writes the btree file to base/{1,5}/2681.
+func bootstrapPgLanguageNameIndex(dataDir string, tids map[uint32]heapTID) error {
+	entries := pgLanguageInitialEntries()
+	type indexed struct {
+		name  string
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(entries))
+	for _, e := range entries {
+		tid, ok := tids[e.OID]
+		if !ok {
+			return fmt.Errorf("pg_language_name_index: no heap TID for language OID %d", e.OID)
+		}
+		items = append(items, indexed{name: e.LanName, block: tid.Block, off: tid.Offset})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].name < items[j].name })
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleNameKey(it.block, it.off, it.name)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 72, 1)
+	if err != nil {
+		return fmt.Errorf("pg_language_name_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "2681"), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_language_name_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
