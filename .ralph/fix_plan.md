@@ -9415,22 +9415,63 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         Pre-existing 15 baseline failures unchanged via `git stash`
         round-trip — no new regressions.
       - Design: `docs/design/0106-0010-step3dl-pg-stat-wal-receiver-view-pg-class.md`.
-      - Next blocker (Step 3dm): seed the `pg_rewrite` row carrying the
-        `ev_action` `pg_node_tree` for `SELECT … FROM
-        pg_stat_get_wal_receiver() s WHERE s.pid IS NOT NULL`.
-        Generating a canonical `nodeToString` serialization of the
-        rewrite Query tree (RTEs, targetlist, qual) is itself a
-        multi-step problem; without the rule, PG's rewriter will fail
-        with `rule "_RETURN" for view ... does not exist` or silently
-        return zero rows. Approach options: (i) extract the bytes from
-        a running PG instance via `SELECT ev_action FROM pg_rewrite
-        WHERE ev_class = 'pg_stat_wal_receiver'::regclass` (need to
-        rewrite the ev_class OID reference to 12100), (ii) hand-build
-        the nodeToString string from the upstream `pg_node_tree`
-        grammar in `src/backend/nodes/outfuncs.c`. After Step 3dm
-        lands, the E2E test's `SELECT status FROM
-        pg_catalog.pg_stat_wal_receiver` probe should advance past the
-        `42P01` error.
+      - Step 3dm phase A LANDED 2026-05-18: pg_rewrite TupleDesc fixed
+        to PG18 canonical 8-column form. Inspection of an upstream PG
+        instance (via `postgres/local_install/bin/psql \d pg_rewrite`)
+        revealed `internal/initdb/relcache_init.go::pgRewriteAttrs`
+        carried a 7-column drifted layout `(oid, ev_class, ev_type,
+        ev_action, ev_owner, ev_enabled, rulename)`; the canonical PG18
+        layout from `postgres/src/include/catalog/pg_rewrite.h:32-44`
+        is 8 columns `(oid, rulename, ev_class, ev_type, ev_enabled,
+        is_instead, ev_qual, ev_action)`. Three substantive shape
+        changes: (a) the spurious `ev_owner` slot removed (PG18 tracks
+        rule ownership via the owning relation's `pg_class.relowner`);
+        (b) `is_instead bool` and `ev_qual pg_node_tree` added (both
+        `BKI_FORCE_NOT_NULL`); (c) `ev_action`'s storage type changed
+        from `text` (OID 25) to `pg_node_tree` (OID 194). The
+        `pg_rewrite_rel_rulename_index` entry in `initdb.go:2403`
+        already assumed canonical column positions `indkey=[3, 2]` —
+        under the prior 7-column layout that referenced slots
+        `ev_type` and `ev_class`, so any seeded pg_rewrite tuple would
+        have produced an index pointing at the wrong columns.
+        `nailedLocalRels` entry at OID 2618 bumps `relnatts` 7 → 8 so
+        the init-file TupleDesc agrees with the heap layout. Phase A
+        deliberately scopes out the heap-tuple seed (ev_action bytes
+        captured in `.ralph/tmp_pg_stat_wal_receiver_ev_action.txt`,
+        5928 bytes, awaiting OID-rewrite from PG-shipped 12240 to
+        goopg's 12100). Regression pins (2 new):
+        `TestPgRewriteAttrsMatchesPg18FormPgRewrite` (8-tuple per-attr
+        pin), `TestNailedLocalRelsPgRewriteRelnatts8` (`RelNatts == 8`
+        + `len(Attrs) == 8`). Verified: targeted `TestPgRewrite|
+        TestNailedLocalRels|TestPgClassRowForView|TestPgStatWalReceiver
+        |TestPgIndex|TestPgClassOidIndex|TestNailedIndexRelnatts
+        ./internal/initdb/` PASS; cross-package smoke
+        `./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS; pre-existing
+        `TestSynchronousCommitFlushesByDefault` failure (tracked as
+        M0106-0012) reproduced under the unmodified baseline via
+        `git stash` round-trip. Design:
+        `docs/design/0106-0010-step3dm-pg-rewrite-schema-fix.md`.
+      - Next blocker (Step 3dm phase B): seed the heap tuple for OID
+        `pg_stat_wal_receiver._RETURN` in `base/{1,5}/2618`:
+          - `oid` = stable goopg-private OID (suggest 12101).
+          - `rulename` = `_RETURN`.
+          - `ev_class` = 12100.
+          - `ev_type` = `'1'` (CMD_SELECT).
+          - `ev_enabled` = `'O'` (ALWAYS).
+          - `is_instead` = true.
+          - `ev_qual` = empty `pg_node_tree` (`<>`).
+          - `ev_action` = the 5928-byte `pg_node_tree` from
+            `.ralph/tmp_pg_stat_wal_receiver_ev_action.txt`, with the
+            view-side RTE relid rewritten from upstream PG's dynamic
+            12240 to goopg's 12100. Function OIDs
+            (`pg_stat_get_wal_receiver = 3317`) and type OIDs are
+            stable across PG/goopg.
+          - `pg_rewrite_rel_rulename_index` (OID 2693) and
+            `pg_rewrite_oid_index` (OID 2692) need leaf entries
+            pointing at the new heap row. After phase B, the E2E test's
+            `SELECT status FROM pg_catalog.pg_stat_wal_receiver` probe
+            should advance past the `42P01` error.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

@@ -277,7 +277,7 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{2610, "pg_index", 75, 'r', 21, false, pgIndexAttrs()},
 	{2616, "pg_opclass", 83, 'r', 9, false, pgOpclassAttrs()},
 	{2603, "pg_amproc", 83, 'r', 6, false, pgAmprocAttrs()},
-	{2618, "pg_rewrite", 83, 'r', 7, false, pgRewriteAttrs()},
+	{2618, "pg_rewrite", 83, 'r', 8, false, pgRewriteAttrs()},
 	{2620, "pg_trigger", 83, 'r', 8, false, pgTriggerAttrs()},
 	{2615, "pg_namespace", 83, 'r', 5, false, pgNamespaceAttrs()},
 	{2604, "pg_attrdef", 83, 'r', 3, false, pgAttrdefAttrs()},
@@ -2066,15 +2066,28 @@ func pgAmprocAttrs() []nailedAttr {
 	}
 }
 
+// pgRewriteAttrs returns the 8 PG18-canonical pg_attribute rows for
+// `pg_catalog.pg_rewrite`. Column order, names, and types are verbatim
+// from `postgres/src/include/catalog/pg_rewrite.h:32-44`. ev_qual and
+// ev_action are stored as `pg_node_tree` (TypeOID 194, varlena) with
+// BKI_FORCE_NOT_NULL. is_instead is the PG18 boolean column omitted by
+// the pre-Step-3dm 7-column layout (the prior layout's `ev_owner` does
+// not exist in PG18 at all; rule ownership is tracked via the owning
+// relation's pg_class.relowner). The index entry at
+// `initdb.go::bootstrapPgIndexTuples` for pg_rewrite_rel_rulename_index
+// already assumes this canonical layout (indkey=[3,2] = ev_class,
+// rulename); fixing the schema makes the TupleDesc and the index
+// agree.
 func pgRewriteAttrs() []nailedAttr {
 	return []nailedAttr{
 		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
-		{Name: "ev_class", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
-		{Name: "ev_type", TypeOID: 18, Num: 3, Len: 1, NotNull: true},
-		{Name: "ev_action", TypeOID: 25, Num: 4, Len: -1, NotNull: true},
-		{Name: "ev_owner", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
-		{Name: "ev_enabled", TypeOID: 18, Num: 6, Len: 1, NotNull: true},
-		{Name: "rulename", TypeOID: 19, Num: 7, Len: 64, NotNull: true},
+		{Name: "rulename", TypeOID: 19, Num: 2, Len: 64, NotNull: true},
+		{Name: "ev_class", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "ev_type", TypeOID: 18, Num: 4, Len: 1, NotNull: true},
+		{Name: "ev_enabled", TypeOID: 18, Num: 5, Len: 1, NotNull: true},
+		{Name: "is_instead", TypeOID: 16, Num: 6, Len: 1, NotNull: true},
+		{Name: "ev_qual", TypeOID: 194, Num: 7, Len: -1, NotNull: true},
+		{Name: "ev_action", TypeOID: 194, Num: 8, Len: -1, NotNull: true},
 	}
 }
 
