@@ -53,8 +53,10 @@ func TestBootstrapPostgresRoleHeapRowRolnameByteLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bootstrapPostgresRole: %v", err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("entries=%d, want 2 (postgres + ryo)", len(entries))
+	// 2 bootstrap rows (postgres + ryo) + 16 predefined roles = 18 total.
+	const wantEntries = 18
+	if len(entries) != wantEntries {
+		t.Fatalf("entries=%d, want %d (2 bootstrap + 16 predefined)", len(entries), wantEntries)
 	}
 
 	raw, err := os.ReadFile(filepath.Join(dir, "global", "1260"))
@@ -68,11 +70,12 @@ func TestBootstrapPostgresRoleHeapRowRolnameByteLayout(t *testing.T) {
 	le := binary.LittleEndian
 	pdLower := le.Uint16(raw[12:14])
 	nItems := int((pdLower - storage.SizeOfPageHeaderData) / 4)
-	if nItems != 2 {
-		t.Fatalf("nItems=%d, want 2", nItems)
+	if nItems != wantEntries {
+		t.Fatalf("nItems=%d, want %d", nItems, wantEntries)
 	}
 
-	wantRolname := map[uint32]string{
+	// Bootstrap rows: OID→expected rolname.
+	bootstrapRolname := map[uint32]string{
 		10:    "postgres",
 		16384: "ryo",
 	}
@@ -85,46 +88,173 @@ func TestBootstrapPostgresRoleHeapRowRolnameByteLayout(t *testing.T) {
 			t.Fatalf("item %d: lp_off=%d lp_len=%d overflows page", i, lpOff, lpLen)
 		}
 		tup := raw[lpOff : lpOff+lpLen]
-		// HeapTupleHeader is 23 bytes (+ optional null bitmap, then payload at t_hoff).
 		// PG layout: t_xmin(4) t_xmax(4) t_field3(4) t_ctid(6) t_infomask2(2) t_infomask(2) t_hoff(1)
 		tHoff := int(tup[22])
-		if tHoff != 24 {
-			t.Errorf("item %d: t_hoff=%d, want 24", i, tHoff)
-		}
 		infomask2 := le.Uint16(tup[18:20])
 		natts := int(infomask2 & 0x07FF)
 		if natts != 12 {
 			t.Errorf("item %d: natts=%d, want 12 (Natts_pg_authid)", i, natts)
 		}
 		infomask := le.Uint16(tup[20:22])
-		// Bootstrap rows must NOT have HEAP_HASNULL set — every column
-		// is seeded to a non-null value. If a future encoder change
-		// flips a default to NULL, the null bitmap shifts t_hoff and
-		// every offset below breaks.
-		if infomask&0x0001 != 0 {
-			t.Errorf("item %d: HEAP_HASNULL set (infomask=0x%04x), want clear", i, infomask)
-		}
 
 		payload := tup[tHoff:]
 		if len(payload) < 4+64 {
 			t.Fatalf("item %d: payload too short for oid+NameData: %d", i, len(payload))
 		}
 		oid := le.Uint32(payload[0:4])
-		want, ok := wantRolname[oid]
-		if !ok {
-			t.Fatalf("item %d: unexpected oid=%d", i, oid)
-		}
-		// rolname NameData = payload[4..67]. First len(want) bytes match
-		// the seeded role name; the rest must be zero-padded so strncmp
-		// terminates at the NUL boundary.
-		got := string(payload[4 : 4+len(want)])
-		if got != want {
-			t.Errorf("item %d: oid=%d rolname cstring prefix=%q, want %q", i, oid, got, want)
-		}
-		for j := 4 + len(want); j < 4+64; j++ {
-			if payload[j] != 0 {
-				t.Errorf("item %d: oid=%d NameData[%d]=0x%02x, want zero (NAME zero-pad)", i, oid, j-4, payload[j])
+
+		if want, isBootstrap := bootstrapRolname[oid]; isBootstrap {
+			// Bootstrap rows must NOT have HEAP_HASNULL — every column is
+			// seeded non-null so t_hoff stays at 24 (no null bitmap).
+			if tHoff != 24 {
+				t.Errorf("item %d (bootstrap oid=%d): t_hoff=%d, want 24", i, oid, tHoff)
 			}
+			if infomask&0x0001 != 0 {
+				t.Errorf("item %d (bootstrap oid=%d): HEAP_HASNULL set (infomask=0x%04x), want clear", i, oid, infomask)
+			}
+			// rolname NameData = payload[4..67].
+			got := string(payload[4 : 4+len(want)])
+			if got != want {
+				t.Errorf("item %d: oid=%d rolname prefix=%q, want %q", i, oid, got, want)
+			}
+			for j := 4 + len(want); j < 4+64; j++ {
+				if payload[j] != 0 {
+					t.Errorf("item %d: oid=%d NameData[%d]=0x%02x, want zero", i, oid, j-4, payload[j])
+				}
+			}
+		} else {
+			// Predefined-role rows must have HEAP_HASNULL (null bitmap) and
+			// t_hoff=32 (24-byte header + 2-byte bitmap rounded to MAXALIGN=8).
+			if tHoff != 32 {
+				t.Errorf("item %d (predefined oid=%d): t_hoff=%d, want 32", i, oid, tHoff)
+			}
+			if infomask&0x0001 == 0 {
+				t.Errorf("item %d (predefined oid=%d): HEAP_HASNULL not set (infomask=0x%04x)", i, oid, infomask)
+			}
+		}
+	}
+}
+
+// TestBootstrapPredefinedRolesHaveNullBitmapAndFrozenXmin pins the key
+// invariants for the 16 predefined-role rows that batched-11 adds:
+//   - null bitmap byte 0 = 0xFF (cols 0-7 not null)
+//   - null bitmap byte 1 = 0x03 (cols 8-9 not null, cols 10-11 null)
+//   - t_hoff = 32 (MAXALIGN(23-byte header + 2-byte bitmap) = 32)
+//   - xmin = FrozenTransactionID (2) for permanent visibility
+//   - each expected OID and rolname is present in the page
+func TestBootstrapPredefinedRolesHaveNullBitmapAndFrozenXmin(t *testing.T) {
+	t.Setenv("USER", "postgres") // keep bootstrap to 1 row so slot index = simple
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o700); err != nil {
+		t.Fatalf("mkdir global: %v", err)
+	}
+	entries, err := bootstrapPostgresRole(dir)
+	if err != nil {
+		t.Fatalf("bootstrapPostgresRole: %v", err)
+	}
+	// USER=="postgres" → 1 bootstrap row + 16 predefined = 17 total.
+	if len(entries) != 17 {
+		t.Fatalf("entries=%d, want 17 (1 bootstrap + 16 predefined)", len(entries))
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "global", "1260"))
+	if err != nil {
+		t.Fatalf("read global/1260: %v", err)
+	}
+
+	le := binary.LittleEndian
+	pdLower := le.Uint16(raw[12:14])
+	nItems := int((pdLower - storage.SizeOfPageHeaderData) / 4)
+	if nItems != 17 {
+		t.Fatalf("nItems=%d, want 17", nItems)
+	}
+
+	// Expected predefined roles: OID → rolname.
+	wantPredefined := map[uint32]string{
+		6171: "pg_database_owner",
+		6181: "pg_read_all_data",
+		6182: "pg_write_all_data",
+		3373: "pg_monitor",
+		3374: "pg_read_all_settings",
+		3375: "pg_read_all_stats",
+		3377: "pg_stat_scan_tables",
+		4569: "pg_read_server_files",
+		4570: "pg_write_server_files",
+		4571: "pg_execute_server_program",
+		4200: "pg_signal_backend",
+		4544: "pg_checkpoint",
+		6337: "pg_maintain",
+		4550: "pg_use_reserved_connections",
+		6304: "pg_create_subscription",
+		6392: "pg_signal_autovacuum_worker",
+	}
+	foundPredefined := map[uint32]bool{}
+
+	for i := 0; i < nItems; i++ {
+		lp := le.Uint32(raw[storage.SizeOfPageHeaderData+i*4:])
+		lpOff := int(lp & 0x7FFF)
+		lpLen := int((lp >> 17) & 0x7FFF)
+		tup := raw[lpOff : lpOff+lpLen]
+		tHoff := int(tup[22])
+		infomask := le.Uint16(tup[20:22])
+
+		payload := tup[tHoff:]
+		oid := le.Uint32(payload[0:4])
+
+		wantName, isPredefined := wantPredefined[oid]
+		if !isPredefined {
+			continue // bootstrap row (OID 10)
+		}
+
+		foundPredefined[oid] = true
+
+		// t_hoff = 32: header(23) + bitmap(2) rounded to MAXALIGN(8) = 32.
+		if tHoff != 32 {
+			t.Errorf("predefined oid=%d: t_hoff=%d, want 32", oid, tHoff)
+		}
+
+		// HEAP_HASNULL must be set.
+		if infomask&0x0001 == 0 {
+			t.Errorf("predefined oid=%d: HEAP_HASNULL not set (infomask=0x%04x)", oid, infomask)
+		}
+
+		// xmin = FrozenTransactionID (2).
+		xmin := le.Uint32(tup[0:4])
+		if xmin != 2 {
+			t.Errorf("predefined oid=%d: xmin=%d, want 2 (FrozenTransactionID)", oid, xmin)
+		}
+
+		// Null bitmap: byte 0 = 0xFF (cols 0-7 not null),
+		// byte 1 = 0x03 (cols 8-9 not null, cols 10-11 null).
+		// PG places the bitmap immediately after the 23-byte fixed header.
+		bm0 := tup[23]
+		bm1 := tup[24]
+		if bm0 != 0xFF {
+			t.Errorf("predefined oid=%d: bitmap[0]=0x%02x, want 0xFF", oid, bm0)
+		}
+		if bm1 != 0x03 {
+			t.Errorf("predefined oid=%d: bitmap[1]=0x%02x, want 0x03", oid, bm1)
+		}
+
+		// rolname NameData = payload[4..67].
+		if len(payload) < 4+64 {
+			t.Fatalf("predefined oid=%d: payload too short: %d", oid, len(payload))
+		}
+		got := string(payload[4 : 4+len(wantName)])
+		if got != wantName {
+			t.Errorf("predefined oid=%d: rolname prefix=%q, want %q", oid, got, wantName)
+		}
+		for j := 4 + len(wantName); j < 4+64; j++ {
+			if payload[j] != 0 {
+				t.Errorf("predefined oid=%d: NameData[%d]=0x%02x, want zero", oid, j-4, payload[j])
+			}
+		}
+	}
+
+	// All 16 predefined roles must be present.
+	for oid, name := range wantPredefined {
+		if !foundPredefined[oid] {
+			t.Errorf("predefined role oid=%d (%s) missing from page", oid, name)
 		}
 	}
 }

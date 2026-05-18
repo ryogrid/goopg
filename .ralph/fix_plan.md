@@ -9651,7 +9651,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3dh-pg-database-datname-index.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-11** (bootstrap-procedure task 11)
+- [x] **M0106-0010 batched-11** (bootstrap-procedure task 11)
       - Summary: Seed 16 predefined `pg_authid` rows
         (`pg_database_owner`, `pg_read_all_data`, …
         `pg_signal_autovacuum_worker`); rewrite

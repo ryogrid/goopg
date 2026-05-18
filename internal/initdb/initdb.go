@@ -719,7 +719,10 @@ func bootstrapPostgresRole(dataDir string) ([]pgAuthidEntry, error) {
 		{Name: "rolpassword", Type: catalog.Type{Name: "text"}, Ordinal: 10},
 		{Name: "rolvaliduntil", Type: catalog.Type{Name: "timestamptz"}, Ordinal: 11},
 	}
-	buildRow := func(oid int64, rolname string) executor.Row {
+	// Bootstrap superuser row (OID 10) and optional OS-user row (OID 16384).
+	// rolpassword/rolvaliduntil are written as empty-string/epoch for the
+	// bootstrap rows to keep HEAP_HASNULL clear (no null bitmap, t_hoff=24).
+	buildBootstrapRow := func(oid int64, rolname string) executor.Row {
 		return executor.Row{
 			executor.NewIntDatum(oid),         // oid
 			executor.NewStringDatum(rolname),  // rolname
@@ -733,6 +736,26 @@ func bootstrapPostgresRole(dataDir string) ([]pgAuthidEntry, error) {
 			executor.NewIntDatum(-1),          // rolconnlimit
 			executor.NewStringDatum(""),       // rolpassword (empty, not null)
 			executor.NewTimeDatum(time.Unix(0, 0).UTC()), // rolvaliduntil (epoch, not null)
+		}
+	}
+	// Predefined-role rows: rolsuper=false, rolinherit=true, all other
+	// privilege flags false, rolconnlimit=-1, rolpassword/rolvaliduntil NULL.
+	// xmin is stamped FrozenTransactionID (= 2) so the rows are permanently
+	// visible without a VACUUM FREEZE pass.
+	buildPredefinedRow := func(oid int64, rolname string) executor.Row {
+		return executor.Row{
+			executor.NewIntDatum(oid),    // oid
+			executor.NewStringDatum(rolname), // rolname
+			executor.NewBoolDatum(false), // rolsuper
+			executor.NewBoolDatum(true),  // rolinherit
+			executor.NewBoolDatum(false), // rolcreaterole
+			executor.NewBoolDatum(false), // rolcreatedb
+			executor.NewBoolDatum(false), // rolcanlogin
+			executor.NewBoolDatum(false), // rolreplication
+			executor.NewBoolDatum(false), // rolbypassrls
+			executor.NewIntDatum(-1),     // rolconnlimit
+			executor.NullDatum,           // rolpassword (NULL)
+			executor.NullDatum,           // rolvaliduntil (NULL)
 		}
 	}
 
@@ -751,13 +774,35 @@ func bootstrapPostgresRole(dataDir string) ([]pgAuthidEntry, error) {
 		seeds = append(seeds, roleSeed{oid: 16384, rolname: osUser})
 	}
 
+	// 16 predefined roles from pg_authid.dat (PG18).
+	predefined := []roleSeed{
+		{oid: 6171, rolname: "pg_database_owner"},
+		{oid: 6181, rolname: "pg_read_all_data"},
+		{oid: 6182, rolname: "pg_write_all_data"},
+		{oid: 3373, rolname: "pg_monitor"},
+		{oid: 3374, rolname: "pg_read_all_settings"},
+		{oid: 3375, rolname: "pg_read_all_stats"},
+		{oid: 3377, rolname: "pg_stat_scan_tables"},
+		{oid: 4569, rolname: "pg_read_server_files"},
+		{oid: 4570, rolname: "pg_write_server_files"},
+		{oid: 4571, rolname: "pg_execute_server_program"},
+		{oid: 4200, rolname: "pg_signal_backend"},
+		{oid: 4544, rolname: "pg_checkpoint"},
+		{oid: 6337, rolname: "pg_maintain"},
+		{oid: 4550, rolname: "pg_use_reserved_connections"},
+		{oid: 6304, rolname: "pg_create_subscription"},
+		{oid: 6392, rolname: "pg_signal_autovacuum_worker"},
+	}
+
 	page := make(storage.Page, storage.BlockSize)
 	if err := storage.InitPage(page); err != nil {
 		return nil, err
 	}
-	entries := make([]pgAuthidEntry, 0, len(seeds))
+	entries := make([]pgAuthidEntry, 0, len(seeds)+len(predefined))
+
+	// Bootstrap rows (no null bitmap, xmin=1).
 	for _, s := range seeds {
-		payload, err := executor.EncodeRowPG(cols, buildRow(s.oid, s.rolname))
+		payload, err := executor.EncodeRowPG(cols, buildBootstrapRow(s.oid, s.rolname))
 		if err != nil {
 			return nil, fmt.Errorf("encode %s role: %w", s.rolname, err)
 		}
@@ -773,6 +818,28 @@ func bootstrapPostgresRole(dataDir string) ([]pgAuthidEntry, error) {
 			TID:     heapTID{Block: 0, Offset: slot},
 		})
 	}
+
+	// Predefined-role rows (null bitmap for rolpassword/rolvaliduntil, xmin=FrozenTransactionID).
+	for _, s := range predefined {
+		row := buildPredefinedRow(s.oid, s.rolname)
+		payload, err := executor.EncodeRowPG(cols, row)
+		if err != nil {
+			return nil, fmt.Errorf("encode predefined role %s: %w", s.rolname, err)
+		}
+		bitmap := executor.NullBitmapPG(row)
+		tuple := storage.NewHeapTupleWithNulls(storage.FrozenTransactionID, storage.InvalidTransactionID, bitmap, payload)
+		tuple.Header.SetNatts(len(cols))
+		slot, err := storage.PageAddHeapTuple(page, tuple)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, pgAuthidEntry{
+			OID:     uint32(s.oid),
+			Rolname: s.rolname,
+			TID:     heapTID{Block: 0, Offset: slot},
+		})
+	}
+
 	path := filepath.Join(dataDir, "global", "1260") // pg_authid OID
 	if err := os.WriteFile(path, page, 0o600); err != nil {
 		return nil, err

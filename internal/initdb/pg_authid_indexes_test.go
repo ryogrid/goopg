@@ -263,3 +263,65 @@ func leafContainsOid(file []byte, oid uint32) bool {
 	}
 	return false
 }
+
+// TestBootstrapPgAuthidIndexesAllRoles is an integration test that seeds the
+// full pg_authid heap via bootstrapPostgresRole (2 bootstrap + 16 predefined
+// rows) and then rebuilds both indexes. It verifies:
+//   - both index files are 2 pages each (metapage + leaf-root)
+//   - each index has 18 line-pointer entries (USER="ryo" gives 2 bootstrap rows)
+//   - all 16 predefined-role OIDs are present in the OID index
+//   - a selection of predefined rolnames appear in the rolname index
+func TestBootstrapPgAuthidIndexesAllRoles(t *testing.T) {
+	t.Setenv("USER", "ryo")
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o700); err != nil {
+		t.Fatalf("mkdir global: %v", err)
+	}
+
+	entries, err := bootstrapPostgresRole(dir)
+	if err != nil {
+		t.Fatalf("bootstrapPostgresRole: %v", err)
+	}
+	const wantRows = 18 // 2 bootstrap + 16 predefined
+	if len(entries) != wantRows {
+		t.Fatalf("entries=%d, want %d", len(entries), wantRows)
+	}
+
+	if err := bootstrapPgAuthidIndexes(dir, entries); err != nil {
+		t.Fatalf("bootstrapPgAuthidIndexes: %v", err)
+	}
+
+	le := binary.LittleEndian
+	for _, oid := range []uint32{2676, 2677} {
+		raw, err := os.ReadFile(filepath.Join(dir, "global", oidPath(oid)))
+		if err != nil {
+			t.Fatalf("read index %d: %v", oid, err)
+		}
+		if len(raw) != 2*storage.BlockSize {
+			t.Errorf("index %d: size=%d, want %d", oid, len(raw), 2*storage.BlockSize)
+			continue
+		}
+		leaf := raw[storage.BlockSize : 2*storage.BlockSize]
+		pdLower := le.Uint16(leaf[12:14])
+		nItems := int((pdLower - storage.SizeOfPageHeaderData) / 4)
+		if nItems != wantRows {
+			t.Errorf("index %d: nItems=%d, want %d", oid, nItems, wantRows)
+		}
+	}
+
+	// Spot-check predefined roles in the OID index.
+	rawOid, _ := os.ReadFile(filepath.Join(dir, "global", "2677"))
+	for _, oid := range []uint32{6171, 6181, 4200, 6392, 3373} {
+		if !leafContainsOid(rawOid, oid) {
+			t.Errorf("pg_authid_oid_index missing predefined OID %d", oid)
+		}
+	}
+
+	// Spot-check predefined roles in the rolname index.
+	rawName, _ := os.ReadFile(filepath.Join(dir, "global", "2676"))
+	for _, name := range []string{"pg_database_owner", "pg_monitor", "pg_signal_autovacuum_worker"} {
+		if !leafContainsName(rawName, name) {
+			t.Errorf("pg_authid_rolname_index missing predefined role %q", name)
+		}
+	}
+}
