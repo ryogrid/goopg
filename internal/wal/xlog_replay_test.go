@@ -2,6 +2,9 @@ package wal
 
 import (
 	"encoding/binary"
+	"hash/crc32"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -342,6 +345,141 @@ func TestReplayedXactInfoUsesDecodedXLogRecord(t *testing.T) {
 				t.Fatalf("committed = %v, want %v", committed, tt.committed)
 			}
 		})
+	}
+}
+
+// TestApplyRecordReplaysXLogParameterChange verifies the XLOG_PARAMETER_CHANGE
+// redo path (batched-06): a decoded RmgrXLog / 0x60 record must update the 8
+// GUC echo fields in pg_control and report applied=true.
+func TestApplyRecordReplaysXLogParameterChange(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a minimal valid pg_control: 8192 zero bytes + CRC32C over [0:292].
+	const pgControlFileSize = 8192
+	const pgControlCRCOffset = 292
+	buf := make([]byte, pgControlFileSize)
+	crcTable := crc32.MakeTable(crc32.Castagnoli)
+	le := binary.LittleEndian
+	crc := crc32.Checksum(buf[:pgControlCRCOffset], crcTable)
+	le.PutUint32(buf[pgControlCRCOffset:], crc)
+	pgCtlPath := filepath.Join(dir, "global", "pg_control")
+	if err := os.WriteFile(pgCtlPath, buf, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Construct an xl_parameter_change payload (28 bytes):
+	//   offset 0:  MaxConnections        = 200
+	//   offset 4:  max_worker_processes  = 16
+	//   offset 8:  max_wal_senders       = 20
+	//   offset 12: max_prepared_xacts    = 5
+	//   offset 16: max_locks_per_xact    = 128
+	//   offset 20: wal_level             = 2 (logical)
+	//   offset 24: wal_log_hints         = 1
+	//   offset 25: track_commit_ts       = 0
+	//   offset 26: padding               = 0, 0
+	payload := make([]byte, 28)
+	le.PutUint32(payload[0:], 200)  // MaxConnections
+	le.PutUint32(payload[4:], 16)   // max_worker_processes
+	le.PutUint32(payload[8:], 20)   // max_wal_senders
+	le.PutUint32(payload[12:], 5)   // max_prepared_xacts
+	le.PutUint32(payload[16:], 128) // max_locks_per_xact
+	le.PutUint32(payload[20:], 2)   // wal_level (logical)
+	payload[24] = 1                  // wal_log_hints = true
+	payload[25] = 0                  // track_commit_timestamp = false
+
+	rec := Record{
+		StartLSN: 100,
+		EndLSN:   200,
+		XLog: &XLogDecodedRecord{
+			Header:   XLogRecord{Rmid: RmgrXLog, Info: xlogXLogParameterChange},
+			MainData: payload,
+		},
+	}
+
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer func() { _ = mgr.Close() }()
+
+	applied, err := ApplyRecord(mgr, rec)
+	if err != nil {
+		t.Fatalf("ApplyRecord: %v", err)
+	}
+	if !applied {
+		t.Error("ApplyRecord applied=false, want true")
+	}
+
+	// Read back pg_control and verify GUC echo fields at their known offsets.
+	got, err := os.ReadFile(pgCtlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name   string
+		offset int
+		want   uint32
+	}{
+		{"wal_level", 172, 2},
+		{"MaxConnections", 180, 200},
+		{"max_worker_processes", 184, 16},
+		{"max_wal_senders", 188, 20},
+		{"max_prepared_xacts", 192, 5},
+		{"max_locks_per_xact", 196, 128},
+	}
+	for _, c := range cases {
+		if v := le.Uint32(got[c.offset:]); v != c.want {
+			t.Errorf("%s @ offset %d: got %d, want %d", c.name, c.offset, v, c.want)
+		}
+	}
+	// wal_log_hints at offset 176
+	if got[176] != 1 {
+		t.Errorf("wal_log_hints @ 176: got %d, want 1", got[176])
+	}
+	// track_commit_timestamp at offset 200
+	if got[200] != 0 {
+		t.Errorf("track_commit_timestamp @ 200: got %d, want 0", got[200])
+	}
+}
+
+// TestApplyRecordXLogParameterChangeNilMgrNoOp verifies that an
+// XLOG_PARAMETER_CHANGE record with a nil manager is a clean no-op.
+func TestApplyRecordXLogParameterChangeNilMgrNoOp(t *testing.T) {
+	payload := make([]byte, 28)
+	rec := Record{
+		XLog: &XLogDecodedRecord{
+			Header:   XLogRecord{Rmid: RmgrXLog, Info: xlogXLogParameterChange},
+			MainData: payload,
+		},
+	}
+	applied, err := ApplyRecord(nil, rec)
+	if err != nil {
+		t.Fatalf("ApplyRecord with nil mgr: %v", err)
+	}
+	if applied {
+		t.Error("ApplyRecord applied=true, want false for nil mgr")
+	}
+}
+
+// TestApplyRecordXLogParameterChangeShortPayloadErrors verifies that a
+// truncated payload returns an error rather than a panic.
+func TestApplyRecordXLogParameterChangeShortPayloadErrors(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer func() { _ = mgr.Close() }()
+
+	rec := Record{
+		XLog: &XLogDecodedRecord{
+			Header:   XLogRecord{Rmid: RmgrXLog, Info: xlogXLogParameterChange},
+			MainData: make([]byte, 10), // too short
+		},
+	}
+	_, err := ApplyRecord(mgr, rec)
+	if err == nil {
+		t.Error("ApplyRecord: want error for short payload, got nil")
 	}
 }
 

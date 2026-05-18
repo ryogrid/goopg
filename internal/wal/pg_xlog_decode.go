@@ -19,6 +19,10 @@ const (
 	xlogXactAbort           uint8 = 0x20
 	xlogXactOpMask          uint8 = 0x70
 	xlogStandbyRunningXacts uint8 = 0x10
+	// xlogXLogParameterChange is the xl_info opcode for XLOG_PARAMETER_CHANGE
+	// (pg_control.h:74). Emitted by the primary when GUC echo fields change;
+	// replayed on the standby to update pg_control's GUC echo section.
+	xlogXLogParameterChange uint8 = 0x60
 
 	bkpBlockForkMask byte = 0x0F
 	bkpBlockHasImage byte = 0x10

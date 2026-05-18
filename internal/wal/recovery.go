@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -2120,7 +2121,14 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 	}
 	switch xlog.Header.Rmid {
 	case RmgrXLog:
-		return false, nil
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogXLogParameterChange:
+			return replayXLogParameterChange(mgr, xlog)
+		default:
+			// Other RmgrXLog opcodes (checkpoint, noop, switch, …) need no
+			// physical replay action on the standby.
+			return false, nil
+		}
 	case RmgrXact:
 		switch xlog.Header.Info & xlogXactOpMask {
 		case xlogXactCommit, xlogXactAbort:
@@ -2152,6 +2160,64 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 	default:
 		return false, unsupportedDecodedXLogRecord(r)
 	}
+}
+
+// replayXLogParameterChange applies an XLOG_PARAMETER_CHANGE record on the
+// standby, mirroring upstream xlog_redo (xlog.c:8558-8620).
+//
+// The primary emits this record whenever the 8 GUC echo fields diverge from
+// what is stored in pg_control.  On replay we decode the 28-byte
+// xl_parameter_change payload and write the updated values back to pg_control
+// so a PG18 standby's CheckRequiredParameterValues sees consistent values.
+//
+// Payload layout (little-endian, matching xl_parameter_change in
+// src/include/access/xlog_internal.h:273):
+//
+//	offset 0:  MaxConnections        int32
+//	offset 4:  max_worker_processes  int32
+//	offset 8:  max_wal_senders       int32
+//	offset 12: max_prepared_xacts    int32
+//	offset 16: max_locks_per_xact    int32
+//	offset 20: wal_level             int32
+//	offset 24: wal_log_hints         bool (1 byte)
+//	offset 25: track_commit_ts       bool (1 byte)
+//	offset 26: padding               2 bytes
+func replayXLogParameterChange(mgr *storage.Manager, xlog *XLogDecodedRecord) (bool, error) {
+	const minPayload = 26 // 6 × int32 + 2 × bool
+	data := xlog.MainData
+	if len(data) < minPayload {
+		return false, fmt.Errorf("wal: XLOG_PARAMETER_CHANGE payload too short: %d bytes", len(data))
+	}
+	if mgr == nil {
+		// No storage manager means no pg_control to update (e.g. test stubs).
+		return false, nil
+	}
+	dataDir := mgr.DataDir()
+	if dataDir == "" {
+		return false, nil
+	}
+	le := binary.LittleEndian
+	maxConn := le.Uint32(data[0:])
+	maxWorker := le.Uint32(data[4:])
+	maxWalSnd := le.Uint32(data[8:])
+	maxPrepared := le.Uint32(data[12:])
+	maxLocks := le.Uint32(data[16:])
+	walLvl := le.Uint32(data[20:])
+	walLogHints := data[24] != 0
+	trackCommitTS := data[25] != 0
+	if err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		cd.WalLevel = walLvl
+		cd.WalLogHints = walLogHints
+		cd.MaxConnections = maxConn
+		cd.MaxWorkerProcesses = maxWorker
+		cd.MaxWalSenders = maxWalSnd
+		cd.MaxPreparedXacts = maxPrepared
+		cd.MaxLocksPerXact = maxLocks
+		cd.TrackCommitTimestamp = trackCommitTS
+	}); err != nil {
+		return false, fmt.Errorf("wal: XLOG_PARAMETER_CHANGE: %w", err)
+	}
+	return true, nil
 }
 
 func unsupportedDecodedXLogRecord(r Record) error {

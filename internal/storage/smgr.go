@@ -135,6 +135,9 @@ func (m *Manager) Close() error {
 	return firstErr
 }
 
+// DataDir returns the root data directory this Manager was configured with.
+func (m *Manager) DataDir() string { return m.cfg.DataDir }
+
 // SetAIO attaches an AIO engine to the manager. PrefetchBlock
 // submits through it. nil clears any previously-set engine
 // (PrefetchBlock then falls back to a synchronous read).

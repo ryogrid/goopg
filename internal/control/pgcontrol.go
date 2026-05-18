@@ -73,6 +73,24 @@ type ControlFileData struct {
 	BackupEndPoint uint64
 	// offset 168: bool — backup must end before recovery is consistent
 	BackupEndRequired bool
+	// GUC echo fields (offsets 172-200) — replicated from primary via
+	// XLOG_PARAMETER_CHANGE; used by standby CheckRequiredParameterValues.
+	// offset 172: wal_level (int → uint32)
+	WalLevel uint32
+	// offset 176: wal_log_hints (bool)
+	WalLogHints bool
+	// offset 180: MaxConnections (int → uint32)
+	MaxConnections uint32
+	// offset 184: max_worker_processes (int → uint32)
+	MaxWorkerProcesses uint32
+	// offset 188: max_wal_senders (int → uint32)
+	MaxWalSenders uint32
+	// offset 192: max_prepared_xacts (int → uint32)
+	MaxPreparedXacts uint32
+	// offset 196: max_locks_per_xact (int → uint32)
+	MaxLocksPerXact uint32
+	// offset 200: track_commit_timestamp (bool)
+	TrackCommitTimestamp bool
 }
 
 // decodeControlFileData reads the mutable runtime fields from a raw
@@ -95,6 +113,14 @@ func decodeControlFileData(buf []byte) *ControlFileData {
 		BackupStartPoint:             le.Uint64(buf[152:]),
 		BackupEndPoint:               le.Uint64(buf[160:]),
 		BackupEndRequired:            buf[168] != 0,
+		WalLevel:                     le.Uint32(buf[172:]),
+		WalLogHints:                  buf[176] != 0,
+		MaxConnections:               le.Uint32(buf[180:]),
+		MaxWorkerProcesses:           le.Uint32(buf[184:]),
+		MaxWalSenders:                le.Uint32(buf[188:]),
+		MaxPreparedXacts:             le.Uint32(buf[192:]),
+		MaxLocksPerXact:              le.Uint32(buf[196:]),
+		TrackCommitTimestamp:         buf[200] != 0,
 	}
 }
 
@@ -124,6 +150,22 @@ func encodeControlFileData(buf []byte, cd *ControlFileData) {
 		buf[168] = 1
 	} else {
 		buf[168] = 0
+	}
+	le.PutUint32(buf[172:], cd.WalLevel)
+	if cd.WalLogHints {
+		buf[176] = 1
+	} else {
+		buf[176] = 0
+	}
+	le.PutUint32(buf[180:], cd.MaxConnections)
+	le.PutUint32(buf[184:], cd.MaxWorkerProcesses)
+	le.PutUint32(buf[188:], cd.MaxWalSenders)
+	le.PutUint32(buf[192:], cd.MaxPreparedXacts)
+	le.PutUint32(buf[196:], cd.MaxLocksPerXact)
+	if cd.TrackCommitTimestamp {
+		buf[200] = 1
+	} else {
+		buf[200] = 0
 	}
 }
 
