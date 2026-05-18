@@ -35,28 +35,36 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 	// 1247 pg_type is intentionally absent — bootstrapSystemCatalogs already
 	// seeds it in goopg's internal format and overwriting would wipe the
 	// rows TestBootstrappedPGTypeRowsReadable depends on.
+	// 2612 pg_language: dedicated bootstrapper (bootstrapPgLanguageTuples).
+	// 2615 pg_namespace: dedicated bootstrapper (bootstrapPgNamespaceTuples).
+	// 2618 pg_rewrite: dedicated bootstrapper (bootstrapPgRewriteTuples).
 	wantOIDs := []uint32{
-		826, // pg_default_acl (M0106-0010 step 3ak)
+		826,  // pg_default_acl (M0106-0010 step 3ak)
 		1417, // pg_foreign_server (M0106-0010 step 3be)
+		1418, // pg_user_mapping (M0106-0010 step 3cp)
+		2224, // pg_sequence (M0106-0010 step 3cb)
 		2328, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
-		3118, // pg_foreign_table (M0106-0010 step 3bh)
+		2600, 2604, 2605, 2606, 2607, 2608, 2609, 2611,
+		2613, 2614,
+		2617,
+		2619, 2620,
 		2753, // pg_opfamily (M0106-0010 step 3bm)
-		3350, // pg_partitioned_table (M0106-0010 step 3bs)
-		2600, 2604, 2605, 2606, 2607, 2608, 2609, 2611, 2612,
-		2613, 2614, 2615, 2617, 2618, 2619, 2620,
 		3079, // pg_extension (M0106-0010 step 3aw)
+		3118, // pg_foreign_table (M0106-0010 step 3bh)
+		3350, // pg_partitioned_table (M0106-0010 step 3bs)
 		3381,
+		3429, // pg_statistic_ext_data (M0106-0010 step 3cc)
 		3466, // pg_event_trigger (M0106-0010 step 3ar)
 		3501, // pg_enum (M0106-0010 step 3an)
-		3596,
-		3764, 3765, 3766, 3767, 3768,
-		6104, // pg_publication (M0106-0010 step 3bu)
-		6237, // pg_publication_namespace (M0106-0010 step 3bx)
-		6106, // pg_publication_rel (M0106-0010 step 3by)
 		3541, // pg_range (M0106-0010 step 3bz)
-		2224, // pg_sequence (M0106-0010 step 3cb)
-		3429, // pg_statistic_ext_data (M0106-0010 step 3cc)
-		6003, 6101, 6102, 6137,
+		3576, // pg_transform (M0106-0010 step 3ci)
+		3596,
+		3600, // pg_ts_dict (M0106-0010 step 3cm)
+		3601, // pg_ts_parser (M0106-0010 step 3cn)
+		3602, // pg_ts_config (M0106-0010 step 3ck)
+		3603, // pg_ts_config_map (M0106-0010 step 3cj)
+		3764, 3765, 3766, 3767, 3768,
+		6003, 6101, 6102, 6104, 6106, 6137, 6237,
 		6245, 9400,
 	}
 

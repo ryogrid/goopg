@@ -9863,7 +9863,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3bz-pg-range-nailed-rel.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-25** (bootstrap-procedure task 25)
+- [x] **M0106-0010 batched-25** (bootstrap-procedure task 25)
       - Summary: Seed `pg_language` (3 BKI rows) heap + indexes
         (2681, 2682).
       - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.
@@ -9874,7 +9874,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3bk-pg-language-oid-index.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-26** (bootstrap-procedure task 26)
+- [x] **M0106-0010 batched-26** (bootstrap-procedure task 26)
       - Summary: Backfill the residual nailed-rel placeholders surfaced
         by the step-3a..3cp chain (`pg_default_acl`, `pg_enum`,
         `pg_event_trigger`, `pg_extension`, `pg_foreign_data_wrapper`,
