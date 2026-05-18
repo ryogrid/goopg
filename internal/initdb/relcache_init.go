@@ -579,6 +579,21 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// absent, mirroring the prsheadline pattern in pg_ts_parser).
 	// pg_ts_template DOES have an `oid` system column — attnum 1 = oid.
 	{3764, "pg_ts_template", 83, 'r', 5, false, pgTsTemplateAttrs()},
+	// M0106-0010 step 3cp: pg_user_mapping is opened during PG-standby
+	// boot once Step 3co cleared pg_ts_template. Without a pg_class row,
+	// `RelationBuildDesc(1418) → ScanPgRelation(1418)` returns NULL and
+	// the backend FATALs with `could not open relation with OID 1418`.
+	// RelType=83 is safe — pg_user_mapping is not formrdesc'd (no
+	// `UserMappingRelation_Rowtype_Id` constant in PG18 headers, only
+	// pg_database/pg_authid/pg_auth_members/pg_shseclabel/pg_subscription
+	// are formrdesc'd at relcache.c:4075-4083). Schema per
+	// `postgres/src/include/catalog/pg_user_mapping.h` (PG18,
+	// UserMappingRelationId == 1418): 4 columns total — oid (26),
+	// umuser (26, BKI_LOOKUP_OPT pg_authid; value 0 means PUBLIC),
+	// umserver (26, BKI_LOOKUP pg_foreign_server), and umoptions
+	// (text[] 1009, CATALOG_VARLEN — nullable). pg_user_mapping has
+	// an `oid` system column — attnum 1 = oid.
+	{1418, "pg_user_mapping", 83, 'r', 4, false, pgUserMappingAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1209,6 +1224,26 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// RelationIdGetRelation(3767) FATALs; flattenRels derives
 		// RelNatts=1 via pgIndexNattsByOID.
 		{3767, "pg_ts_template_oid_index"},
+		// M0106-0010 Step 3cp: pg_user_mapping_oid_index. PG18
+		// `postgres/src/include/catalog/pg_user_mapping.h:52` declares
+		// `DECLARE_UNIQUE_INDEX_PKEY(pg_user_mapping_oid_index, 174,
+		// UserMappingOidIndexId, pg_user_mapping, btree(oid oid_ops))`.
+		// UNIQUE PRIMARY single-column key on attnum 1 (oid). Heap OID
+		// 1418 (pg_user_mapping) is the nailed local rel above. Backs
+		// MAKE_SYSCACHE(USERMAPPINGOID, pg_user_mapping_oid_index, 2).
+		// Without this entry RelationIdGetRelation(174) FATALs; flattenRels
+		// derives RelNatts=1 via pgIndexNattsByOID.
+		{174, "pg_user_mapping_oid_index"},
+		// M0106-0010 Step 3cp: pg_user_mapping_user_server_index. PG18
+		// `postgres/src/include/catalog/pg_user_mapping.h:53` declares
+		// `DECLARE_UNIQUE_INDEX(pg_user_mapping_user_server_index, 175,
+		// UserMappingUserServerIndexId, pg_user_mapping,
+		// btree(umuser oid_ops, umserver oid_ops))`. UNIQUE (NOT PRIMARY)
+		// 2-column composite on (umuser=2, umserver=3); both oid_ops with
+		// no collation. Backs MAKE_SYSCACHE(USERMAPPINGUSERSERVER,
+		// pg_user_mapping_user_server_index, 2). flattenRels derives
+		// RelNatts=2 via pgIndexNattsByOID.
+		{175, "pg_user_mapping_user_server_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1681,6 +1716,30 @@ func pgTsTemplateAttrs() []nailedAttr {
 		{Name: "tmplnamespace", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
 		{Name: "tmplinit", TypeOID: 24, Num: 4, Len: 4, NotNull: true},
 		{Name: "tmpllexize", TypeOID: 24, Num: 5, Len: 4, NotNull: true},
+	}
+}
+
+// pgUserMappingAttrs returns the verbatim 4-column PG18 pg_user_mapping
+// schema sourced from `postgres/src/include/catalog/pg_user_mapping.h` and
+// pg_user_mapping_d.h (M0106-0010 step 3cp). Source:
+//   CATALOG(pg_user_mapping,1418,UserMappingRelationId)
+//   {
+//     Oid  oid;
+//     Oid  umuser   BKI_LOOKUP_OPT(pg_authid);
+//     Oid  umserver BKI_LOOKUP(pg_foreign_server);
+//     #ifdef CATALOG_VARLEN
+//     text umoptions[1];
+//     #endif
+//   } FormData_pg_user_mapping;
+// Three fixed-width 4-byte NOT NULL oid columns plus a CATALOG_VARLEN
+// text[] (typeoid 1009) — umoptions is nullable. umuser is BKI_LOOKUP_OPT
+// so InvalidOid (0) means PUBLIC; the column itself is still NOT NULL.
+func pgUserMappingAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "umuser", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
+		{Name: "umserver", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
+		{Name: "umoptions", TypeOID: 1009, Num: 4, Len: -1, NotNull: false},
 	}
 }
 

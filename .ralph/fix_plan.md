@@ -7973,6 +7973,63 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
         PASS. Design:
         `docs/design/0106-0010-step3co-pg-ts-template-nailed-rel.md`.
+      - Step 3cp LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 1418` PG-standby boot blocker that surfaces
+        after Step 3co seeded the pg_ts_template family. OID 1418 is
+        `pg_user_mapping` per
+        `postgres/src/include/catalog/pg_user_mapping.h:28`
+        (`CATALOG(pg_user_mapping,1418,UserMappingRelationId)`) — the
+        foreign-data-wrapper user-mapping catalog. Per-database
+        (non-shared). Family-complete seed: heap 1418 + both declared
+        indexes 174 (`pg_user_mapping_oid_index`, UNIQUE PRIMARY
+        btree(oid oid_ops), backs `MAKE_SYSCACHE(USERMAPPINGOID, …, 2)`)
+        and 175 (`pg_user_mapping_user_server_index`, UNIQUE btree(
+        umuser oid_ops, umserver oid_ops), backs
+        `MAKE_SYSCACHE(USERMAPPINGUSERSERVER, …, 2)`). The deliberately
+        low index OIDs 174/175 are upstream-pinned from when
+        pg_user_mapping was first added in PG 8.4 — not typos.
+        (a) `pgUserMappingAttrs()` (relcache_init.go) returns the
+        4-column PG18 schema verbatim per `pg_user_mapping_d.h`: oid
+        (26/4 NOT NULL) + umuser (26/4 NOT NULL, BKI_LOOKUP_OPT
+        pg_authid; InvalidOid=PUBLIC) + umserver (26/4 NOT NULL,
+        BKI_LOOKUP pg_foreign_server) + umoptions (text[] 1009/-1
+        NULLABLE, CATALOG_VARLEN). pg_user_mapping DOES have an `oid`
+        system column. RelType=83 is safe (no
+        `UserMappingRelation_Rowtype_Id` in PG18 headers).
+        (b) `nailedLocalRels` heap list gains `{1418, "pg_user_mapping",
+        83, 'r', 4, false, pgUserMappingAttrs()}` after the Step 3co
+        3764 entry; idxSpec list gains `{174, "pg_user_mapping_oid_index"}`
+        and `{175, "pg_user_mapping_user_server_index"}` after the Step
+        3co 3767 entry.
+        (c) `pgIndexInitialEntries` local section gains `entry(174,
+        1418, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true)`
+        and `entry(175, 1418, []int16{2, 3}, []uint32{oidOps, oidOps},
+        []uint32{0, 0}, true, false)` after the Step 3co 3767 entry.
+        (d) Both "Critical index placeholder pages" OID lists
+        (dbDir + global) at `bootstrapPostgresDatabase` gain 174 and
+        175 after the Step 3co 3767 entries.
+        (e) `bootstrapMappedLocalCatalogHeaps` oids slice and
+        `localRelMap` gain 1418 (authoritative OID per
+        `pg_user_mapping.h:28`) after the Step 3be 1417 entry.
+        (f) No new type-helper entries — oid (26), text[] (1009) are
+        already registered (text[] wired in Step 1 for pg_class.relacl).
+        Regression pins:
+        `TestNailedLocalRelsContainsPgUserMapping`,
+        `TestNailedLocalRelsContainsPgUserMappingIndexes`,
+        `TestPgUserMappingIndexInitialEntries` in
+        `internal/initdb/pg_user_mapping_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended
+        with `174:{1}` + `175:{2,3}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 174 + 175.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        '<targeted>' ./internal/initdb/` PASS; `go test -count=1
+        ./internal/initdb/` — same 14 pre-existing baseline failures
+        as Step 3co (no new regressions); cross-package smoke
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/`
+        PASS. Design:
+        `docs/design/0106-0010-step3cp-pg-user-mapping-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

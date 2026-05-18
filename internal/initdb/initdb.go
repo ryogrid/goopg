@@ -457,6 +457,7 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		3079, // pg_extension (M0106-0010 step 3aw)
 		2328, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
 		1417, // pg_foreign_server (M0106-0010 step 3be)
+		1418, // pg_user_mapping (M0106-0010 step 3cp) — authoritative OID per pg_user_mapping.h:28
 		3118, // pg_foreign_table (M0106-0010 step 3bh)
 		2753, // pg_opfamily (M0106-0010 step 3bm)
 		3350, // pg_partitioned_table (M0106-0010 step 3bs)
@@ -806,6 +807,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{3079, 3079}, // pg_extension (M0106-0010 step 3aw)
 		{2328, 2328}, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
 		{1417, 1417}, // pg_foreign_server (M0106-0010 step 3be)
+		{1418, 1418}, // pg_user_mapping (M0106-0010 step 3cp) — authoritative OID per pg_user_mapping.h:28
 		{3118, 3118}, // pg_foreign_table (M0106-0010 step 3bh)
 		{2753, 2753}, // pg_opfamily (M0106-0010 step 3bm)
 		{3350, 3350}, // pg_partitioned_table (M0106-0010 step 3bs)
@@ -897,6 +899,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3607, // pg_ts_parser_oid_index (Step 3cn)
 		3766, // pg_ts_template_tmplname_index (Step 3co)
 		3767, // pg_ts_template_oid_index (Step 3co)
+		174,  // pg_user_mapping_oid_index (Step 3cp)
+		175,  // pg_user_mapping_user_server_index (Step 3cp)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -980,6 +984,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3607, // pg_ts_parser_oid_index (Step 3cn)
 		3766, // pg_ts_template_tmplname_index (Step 3co)
 		3767, // pg_ts_template_oid_index (Step 3co)
+		174,  // pg_user_mapping_oid_index (Step 3cp)
+		175,  // pg_user_mapping_user_server_index (Step 3cp)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2831,6 +2837,25 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// rel added in Step 3co. UNIQUE PRIMARY single-column key, oid_ops
 		// with no collation.
 		entry(3767, 3764, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_ts_template_oid_index
+		// M0106-0010 Step 3cp: pg_user_mapping_oid_index. PG18
+		//   postgres/src/include/catalog/pg_user_mapping.h:52
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_user_mapping_oid_index, 174,
+		//       UserMappingOidIndexId, pg_user_mapping, btree(oid oid_ops));
+		//   MAKE_SYSCACHE(USERMAPPINGOID, pg_user_mapping_oid_index, 2);
+		// pg_user_mapping attnums (pg_user_mapping_d.h): 1=oid, 2=umuser,
+		// 3=umserver, 4=umoptions. Heap OID 1418 is the nailed local rel
+		// added in Step 3cp. UNIQUE PRIMARY single-column key, oid_ops
+		// with no collation.
+		entry(174, 1418, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_user_mapping_oid_index
+		// M0106-0010 Step 3cp: pg_user_mapping_user_server_index. PG18
+		//   postgres/src/include/catalog/pg_user_mapping.h:53
+		//     DECLARE_UNIQUE_INDEX(pg_user_mapping_user_server_index, 175,
+		//       UserMappingUserServerIndexId, pg_user_mapping,
+		//       btree(umuser oid_ops, umserver oid_ops));
+		//   MAKE_SYSCACHE(USERMAPPINGUSERSERVER, pg_user_mapping_user_server_index, 2);
+		// IndKey = {2, 3}. UNIQUE (NOT PRIMARY) 2-column composite key;
+		// both oid_ops with no collation.
+		entry(175, 1418, []int16{2, 3}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, false), // pg_user_mapping_user_server_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
