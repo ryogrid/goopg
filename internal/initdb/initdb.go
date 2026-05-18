@@ -871,6 +871,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2696, // pg_statistic_relid_att_inh_index (Step 3ce)
 		6114, // pg_subscription_oid_index (Step 3cf)
 		6115, // pg_subscription_subname_index (Step 3cf)
+		6117, // pg_subscription_rel_srrelid_srsubid_index (Step 3cg)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -940,6 +941,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2696, // pg_statistic_relid_att_inh_index (Step 3ce)
 		6114, // pg_subscription_oid_index (Step 3cf)
 		6115, // pg_subscription_subname_index (Step 3cf)
+		6117, // pg_subscription_rel_srrelid_srsubid_index (Step 3cg)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2638,6 +2640,17 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// 3ce. UNIQUE PRIMARY 3-column composite key with three different
 		// opclasses (oid_ops, int2_ops, bool_ops) and no collations.
 		entry(2696, 2619, []int16{1, 2, 3}, []uint32{oidOps, int2Ops, boolOps}, []uint32{0, 0, 0}, true, true), // pg_statistic_relid_att_inh_index
+		// M0106-0010 Step 3cg: pg_subscription_rel_srrelid_srsubid_index. PG18
+		//   postgres/src/include/catalog/pg_subscription_rel.h:52
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_subscription_rel_srrelid_srsubid_index, 6117,
+		//       SubscriptionRelSrrelidSrsubidIndexId, pg_subscription_rel,
+		//       btree(srrelid oid_ops, srsubid oid_ops));
+		//   MAKE_SYSCACHE(SUBSCRIPTIONRELMAP, pg_subscription_rel_srrelid_srsubid_index, 64);
+		// pg_subscription_rel attnums: 1=srsubid, 2=srrelid. Index leads on
+		// srrelid → IndKey = {2, 1}. Heap OID 6102 is the nailed local rel
+		// added in Step 3cg. UNIQUE PRIMARY 2-column composite key, both
+		// columns oid_ops with no collation.
+		entry(6117, 6102, []int16{2, 1}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, true), // pg_subscription_rel_srrelid_srsubid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
@@ -3140,6 +3153,11 @@ func pgTypeByVal(oid uint32) bool {
 	switch oid {
 	case 16, 18, 21, 23, 26, 700, 20, 701, 24, 325, 269:
 		return true
+	case 3220:
+		// M0106-0010 Step 3cg: pg_lsn typbyval = FLOAT8PASSBYVAL (true on
+		// 64-bit). pg_subscription_rel.srsublsn and pg_subscription.subskiplsn
+		// both depend on this.
+		return true
 	}
 	return false
 }
@@ -3152,11 +3170,13 @@ func pgTypeAlignChar(oid uint32) string {
 		return "s"
 	case 23, 26, 700, 194, 1009, 1034, 2277, 24, 325, 269, 30, 22, 1002, 1028, 3361, 3402, 5017:
 		return "i"
-	case 20, 701, 10028:
+	case 20, 701, 10028, 3220:
 		// PG18 runtime pg_type lookup: _pg_statistic (10028) has typalign='d'
 		// because its element rowtype pg_statistic carries int8/float8-aligned
 		// columns (stanullfrac, stadistinct float4 padded to 8-byte; stavalues
 		// anyarray). M0106-0010 Step 3cc.
+		// pg_lsn (3220) is 8-byte XLogRecPtr with typalign='d' per
+		// `postgres/src/include/catalog/pg_type.dat:413`. M0106-0010 Step 3cg.
 		return "d"
 	}
 	return "i"

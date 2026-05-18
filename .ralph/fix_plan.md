@@ -7319,6 +7319,68 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         FATAL on 3381 is closed — next FATAL is OID 2619 (`pg_statistic`),
         to be handled by Step 3ce. Design:
         `docs/design/0106-0010-step3cd-pg-statistic-ext-nailed-rel.md`.
+      - Step 3cg LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 6102` PG-standby boot blocker that surfaces
+        after Step 3cf seeded the pg_subscription index pair. OID 6102
+        is `pg_subscription_rel` per
+        `postgres/src/include/catalog/pg_subscription_rel.h:31`
+        (`CATALOG(pg_subscription_rel,6102,SubscriptionRelRelationId)`).
+        Per-database (non-shared) catalog — follows the Step 3ce
+        template. Family-complete seed: heap 6102 + its single declared
+        UNIQUE PRIMARY composite index 6117
+        (`pg_subscription_rel_srrelid_srsubid_index`, btree on
+        `(srrelid oid_ops, srsubid oid_ops)`, backs
+        `MAKE_SYSCACHE(SUBSCRIPTIONRELMAP, …, 64)`).
+        (a) `pgSubscriptionRelAttrs()` (relcache_init.go) returns the
+        4-column PG18 schema: 3 fixed NOT NULL leading (srsubid oid
+        26/4, srrelid oid 26/4, srsubstate char 18/1) + 1 fixed-width
+        nullable pg_lsn (srsublsn 3220/8, BKI_FORCE_NULL inside
+        CATALOG_VARLEN). pg_subscription_rel has no `oid` system
+        column — attnums start at 1 = srsubid. RelType=83 is safe (no
+        `SubscriptionRelRelation_Rowtype_Id` in PG18 headers).
+        (b) `nailedLocalRels` (relcache_init.go) heap list gains
+        `{6102, "pg_subscription_rel", 83, 'r', 4, false, pgSubscriptionRelAttrs()}`
+        after the Step 3ce 2619 entry; idxSpec list gains
+        `{6117, "pg_subscription_rel_srrelid_srsubid_index"}` after
+        the Step 3ce 2696 entry.
+        (c) `pgIndexInitialEntries` local section (initdb.go) gains
+        `entry(6117, 6102, []int16{2, 1}, []uint32{oidOps, oidOps},
+        []uint32{0, 0}, true, true)` after the Step 3ce 2696 entry.
+        IndKey leads on srrelid (attnum 2), then srsubid (attnum 1).
+        (d) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain `6117` after the Step 3cf
+        6115 entry.
+        (e) No new entries in `bootstrapMappedLocalCatalogHeaps` oid
+        list or in `localRelMap` — both already contained 6102 from a
+        long-standing baseline placeholder (Step 3cb fixed the stale
+        comment that had mis-labelled 6102 as pg_sequence).
+        (f) Type-helper additions for pg_lsn (3220) per
+        `postgres/src/include/catalog/pg_type.dat:410-413`:
+        `pgTypeByVal(3220) → true` (FLOAT8PASSBYVAL on 64-bit) and
+        `pgTypeAlignChar(3220) → "d"`. Fixes a pre-existing latent
+        bug: `pg_subscription.subskiplsn` (TypeOID 3220) had been
+        nailed by an earlier step but pg_lsn was never registered in
+        the helpers, silently emitting `attbyval=false, attalign='i'`.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgSubscriptionRel`,
+        `TestNailedLocalRelsContainsPgSubscriptionRelSrrelidSrsubidIndex`,
+        `TestPgSubscriptionRelIndexInitialEntries`,
+        `TestPgSubscriptionRelAttrsTypeOIDsMatchPG18`,
+        `TestPgLsnTypeHelpersMatchPG18` in
+        `internal/initdb/pg_subscription_rel_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `6117:{2,1}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 6117.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgSubscriptionRel|TestPgSubscriptionRelIndexInitialEntries|TestPgSubscriptionRelAttrsTypeOIDsMatchPG18|TestPgLsnTypeHelpersMatchPG18|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgClassOidIndexHasSingleKeyColumn|TestPgIndexColDefsMatchesRelcacheAttrs|TestNailedSharedRelsContainsPgSubscriptionIndexes|TestPgSubscriptionIndexInitialEntries'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3cf (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3cg-pg-subscription-rel-nailed-rel.md`.
       - Step 3cf LANDED 2026-05-18. Closes the FATAL `could not open
         relation with OID 6115` PG-standby boot blocker that surfaces
         after Step 3ce seeded pg_statistic. OID 6115 is

@@ -430,6 +430,19 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// anyarray NULLABLE. pg_statistic has no `oid` system column —
 	// attnums start at 1 = starelid.
 	{2619, "pg_statistic", 83, 'r', 31, false, pgStatisticAttrs()},
+	// M0106-0010 step 3cg: pg_subscription_rel is opened during PG-standby
+	// boot once Step 3cf cleared the pg_subscription index pair. Without a
+	// pg_class row, `RelationBuildDesc(6102) → ScanPgRelation(6102)` returns
+	// NULL and the backend FATALs with `could not open relation with OID
+	// 6102`. RelType=83 is safe because pg_subscription_rel is not
+	// formrdesc'd (no `SubscriptionRelRelation_Rowtype_Id` constant in PG18
+	// headers). Schema per `postgres/src/include/catalog/pg_subscription_rel.h`
+	// (PG18, SubscriptionRelRelationId == 6102). 4 columns: 3 leading fixed
+	// NOT NULL (srsubid oid, srrelid oid, srsubstate char) + 1 fixed-width
+	// nullable pg_lsn (srsublsn, BKI_FORCE_NULL inside CATALOG_VARLEN).
+	// pg_subscription_rel has no `oid` system column — attnums start at
+	// 1 = srsubid.
+	{6102, "pg_subscription_rel", 83, 'r', 4, false, pgSubscriptionRelAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -937,6 +950,17 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// Without this entry RelationIdGetRelation(2696) FATALs; flattenRels
 		// derives RelNatts=3 via pgIndexNattsByOID.
 		{2696, "pg_statistic_relid_att_inh_index"},
+		// M0106-0010 Step 3cg: pg_subscription_rel_srrelid_srsubid_index. PG18
+		// `postgres/src/include/catalog/pg_subscription_rel.h:52` declares
+		// `DECLARE_UNIQUE_INDEX_PKEY(pg_subscription_rel_srrelid_srsubid_index,
+		// 6117, SubscriptionRelSrrelidSrsubidIndexId, pg_subscription_rel,
+		// btree(srrelid oid_ops, srsubid oid_ops))`. UNIQUE PRIMARY 2-column
+		// composite key. Heap OID 6102 (pg_subscription_rel) is the nailed
+		// local rel above. Backs MAKE_SYSCACHE(SUBSCRIPTIONRELMAP,
+		// pg_subscription_rel_srrelid_srsubid_index, 64). Without this entry
+		// RelationIdGetRelation(6117) FATALs; flattenRels derives RelNatts=2
+		// via pgIndexNattsByOID.
+		{6117, "pg_subscription_rel_srrelid_srsubid_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1268,6 +1292,24 @@ func pgSubscriptionAttrs() []nailedAttr {
 		{Name: "subbinary", TypeOID: 16, Num: 7, Len: 1, NotNull: true},
 		{Name: "substream", TypeOID: 16, Num: 8, Len: 1, NotNull: true},
 		{Name: "subtwophasestate", TypeOID: 18, Num: 9, Len: 1, NotNull: true},
+	}
+}
+
+// pgSubscriptionRelAttrs returns the pg_subscription_rel column descriptors
+// (M0106-0010 Step 3cg). Source: PG18
+// `postgres/src/include/catalog/pg_subscription_rel.h:31`
+// (`CATALOG(pg_subscription_rel,6102,SubscriptionRelRelationId)`) and
+// `pg_subscription_rel_d.h` (Anum_pg_subscription_rel_* 1..4,
+// Natts_pg_subscription_rel == 4). pg_subscription_rel has no `oid` system
+// column — attnums start at 1 = srsubid. srsublsn is fixed-width pg_lsn
+// (TypeOID 3220, 8 bytes) but BKI_FORCE_NULL inside CATALOG_VARLEN, so it
+// must reflect NotNull=false in pg_attribute.
+func pgSubscriptionRelAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "srsubid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "srrelid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
+		{Name: "srsubstate", TypeOID: 18, Num: 3, Len: 1, NotNull: true},
+		{Name: "srsublsn", TypeOID: 3220, Num: 4, Len: 8, NotNull: false},
 	}
 }
 
