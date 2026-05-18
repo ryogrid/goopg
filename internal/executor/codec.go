@@ -316,6 +316,11 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		}
 		return d.BytesValue(), nil
 	case "pg_node_tree":
+		// KindBytes passthrough: pre-encoded varlena bytes (e.g. PGLZ-compressed
+		// varlena produced by pglzVarlenaDatum in initdb bootstrap).
+		if d.Kind == KindBytes || d.Kind == KindBytesArena {
+			return d.BytesValue(), nil
+		}
 		// pg_node_tree is varlena-text; PG only reads it conditionally
 		// (e.g. relpartbound when relispartition=true). Empty varlena.
 		s := d.StringValue()

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -44,14 +45,14 @@ func TestPgRewriteColDefsMatchesPg18(t *testing.T) {
 }
 
 // TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn pins the
-// one ON-SELECT rule we seed: pg_stat_wal_receiver._RETURN. Without
-// this row a PG standby attaching to the goopg primary FATALs with
-// "cache lookup failed for rule …" the first time anything (including
-// pg_dump and the regression harness) opens the view.
+// six ON-SELECT rules we seed (one per replication view). The wal_receiver
+// entry is the load-bearing one for the M0106 E2E gate; the remaining five
+// (batched-29) guard against "cache lookup failed for rule …" FATALs when
+// a PG standby opens any of the other replication views.
 func TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn(t *testing.T) {
 	entries := pgRewriteInitialEntries()
-	if len(entries) != 1 {
-		t.Fatalf("pgRewriteInitialEntries: %d rows, want 1", len(entries))
+	if len(entries) != 6 {
+		t.Fatalf("pgRewriteInitialEntries: %d rows, want 6", len(entries))
 	}
 	e := entries[0]
 	if e.OID != pgRewriteOIDPgStatWalReceiverReturn {
@@ -87,6 +88,60 @@ func TestPgRewriteInitialEntriesContainsPgStatWalReceiverReturn(t *testing.T) {
 	}
 }
 
+// TestReplicationViewRewriteEntries pins the five batched-29 _RETURN rules
+// (pg_stat_replication through pg_stat_replication_slots). Each entry must
+// have the correct view OID, non-empty ev_action, and the parenthesised
+// pg_node_tree framing that PG's stringToNode expects.
+func TestReplicationViewRewriteEntries(t *testing.T) {
+	type want struct {
+		oid     uint32
+		evClass uint32
+		minLen  int
+	}
+	wants := []want{
+		{pgRewriteOIDPgStatReplicationReturn, pgStatReplicationViewOID, 5000},
+		{pgRewriteOIDPgStatRecoveryPrefetchReturn, pgStatRecoveryPrefetchViewOID, 1000},
+		{pgRewriteOIDPgStatSubscriptionReturn, pgStatSubscriptionViewOID, 1000},
+		{pgRewriteOIDPgReplicationSlotsReturn, pgReplicationSlotsViewOID, 1000},
+		{pgRewriteOIDPgStatReplicationSlotsReturn, pgStatReplicationSlotsViewOID, 1000},
+	}
+	entries := replicationViewRewriteEntries()
+	if len(entries) != len(wants) {
+		t.Fatalf("replicationViewRewriteEntries: %d rows, want %d", len(entries), len(wants))
+	}
+	for i, w := range wants {
+		e := entries[i]
+		if e.OID != w.oid {
+			t.Errorf("[%d] OID = %d, want %d", i, e.OID, w.oid)
+		}
+		if e.EvClass != w.evClass {
+			t.Errorf("[%d] EvClass = %d, want %d", i, e.EvClass, w.evClass)
+		}
+		if e.RuleName != "_RETURN" {
+			t.Errorf("[%d] RuleName = %q, want %q", i, e.RuleName, "_RETURN")
+		}
+		if e.EvType != '1' {
+			t.Errorf("[%d] EvType = %q, want '1'", i, e.EvType)
+		}
+		if e.EvEnabled != 'O' {
+			t.Errorf("[%d] EvEnabled = %q, want 'O'", i, e.EvEnabled)
+		}
+		if !e.IsInstead {
+			t.Errorf("[%d] IsInstead = false, want true", i)
+		}
+		if e.EvQual != "<>" {
+			t.Errorf("[%d] EvQual = %q, want %q", i, e.EvQual, "<>")
+		}
+		if len(e.EvAction) < w.minLen {
+			t.Errorf("[%d] EvAction length = %d, want ≥ %d", i, len(e.EvAction), w.minLen)
+		}
+		if e.EvAction[0] != '(' || e.EvAction[len(e.EvAction)-1] != ')' {
+			t.Errorf("[%d] EvAction must be parenthesised; got first=%q last=%q",
+				i, e.EvAction[0], e.EvAction[len(e.EvAction)-1])
+		}
+	}
+}
+
 // TestPgRewriteRowOrderMatchesColDefs pins that pgRewriteRow returns
 // datums in the exact column order of pgRewriteColDefs (i.e. oid first,
 // ev_action last). PG's heap_deformtuple iterates the TupleDesc; a
@@ -113,9 +168,28 @@ func TestPgRewriteRowOrderMatchesColDefs(t *testing.T) {
 	if row[2].Int != int64(entries[0].EvClass) {
 		t.Errorf("row[2].Int = %d, want %d (ev_class)", row[2].Int, entries[0].EvClass)
 	}
-	// ev_action (col 7) is the big pg_node_tree blob.
-	if got := row[7].StringValue(); got != entries[0].EvAction {
-		t.Errorf("row[7] != entries[0].EvAction (lengths got=%d want=%d)", len(got), len(entries[0].EvAction))
+	// ev_action (col 7) is a large pg_node_tree blob. pglzVarlenaDatum
+	// compresses it, so the datum kind is KindBytes and its BytesValue()
+	// is the complete compressed varlena (header + tcinfo + payload).
+	// Verify the compressed varlena header encodes the correct raw size.
+	evActionDatum := row[7]
+	if evActionDatum.Kind != executor.KindBytes {
+		t.Errorf("row[7].Kind = %v, want KindBytes (pglz compressed varlena)", evActionDatum.Kind)
+	} else {
+		b := evActionDatum.BytesValue()
+		if len(b) < 8 {
+			t.Errorf("row[7] KindBytes too short: %d bytes", len(b))
+		} else {
+			vaHeader := binary.LittleEndian.Uint32(b[0:4])
+			if vaHeader&0x03 != 0x02 {
+				t.Errorf("row[7] varlena header bits 1-0 = %d, want 0x02 (compressed)", vaHeader&0x03)
+			}
+			tcinfo := binary.LittleEndian.Uint32(b[4:8])
+			rawSize := int(tcinfo >> 2)
+			if rawSize != len(entries[0].EvAction) {
+				t.Errorf("row[7] tcinfo rawSize = %d, want %d (ev_action length)", rawSize, len(entries[0].EvAction))
+			}
+		}
 	}
 }
 
@@ -135,8 +209,8 @@ func TestBootstrapPgRewriteTuplesWritesRowToBase1And5(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bootstrapPgRewriteTuples: %v", err)
 	}
-	if len(tids) != 1 {
-		t.Fatalf("tids len = %d, want 1", len(tids))
+	if len(tids) != 6 {
+		t.Fatalf("tids len = %d, want 6", len(tids))
 	}
 	tid, ok := tids[pgRewriteOIDPgStatWalReceiverReturn]
 	if !ok {

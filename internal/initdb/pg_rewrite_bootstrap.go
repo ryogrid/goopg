@@ -29,12 +29,45 @@ import (
 //go:embed pg_stat_wal_receiver_ev_action.dat
 var pgStatWalReceiverEvAction string
 
-// pgRewriteOIDPgStatWalReceiverReturn is a goopg-private stable OID
-// assigned to the pg_stat_wal_receiver._RETURN rule. PG normally
-// assigns rule OIDs dynamically at initdb time; this OID lives in
-// PG18's FirstUnpinnedObjectId..FirstNormalObjectId range
-// (12000..16383) and stays adjacent to the view OID 12100 (Step 3dl).
-const pgRewriteOIDPgStatWalReceiverReturn uint32 = 12101
+//go:embed pg_stat_replication_ev_action.dat
+var pgStatReplicationEvAction string
+
+//go:embed pg_stat_recovery_prefetch_ev_action.dat
+var pgStatRecoveryPrefetchEvAction string
+
+//go:embed pg_stat_subscription_ev_action.dat
+var pgStatSubscriptionEvAction string
+
+//go:embed pg_replication_slots_ev_action.dat
+var pgReplicationSlotsEvAction string
+
+//go:embed pg_stat_replication_slots_ev_action.dat
+var pgStatReplicationSlotsEvAction string
+
+// Rule OIDs for the six replication-view _RETURN rules. Assigned from
+// PG18's FirstUnpinnedObjectId..FirstNormalObjectId range (12000..16383).
+// View OIDs 12100..12106 are reserved in relcache_init.go; rule OIDs
+// start at 12101 (adjacent to wal_receiver view 12100) and continue at
+// 12107..12111 for the five batched-28 views (12102..12106).
+const (
+	pgRewriteOIDPgStatWalReceiverReturn      uint32 = 12101
+	pgRewriteOIDPgStatReplicationReturn      uint32 = 12107
+	pgRewriteOIDPgStatRecoveryPrefetchReturn uint32 = 12108
+	pgRewriteOIDPgStatSubscriptionReturn     uint32 = 12109
+	pgRewriteOIDPgReplicationSlotsReturn     uint32 = 12110
+	pgRewriteOIDPgStatReplicationSlotsReturn uint32 = 12111
+)
+
+// View OIDs for the five batched-28 replication views (mirrors of the
+// nailedLocalRels entries in relcache_init.go; kept here for
+// pg_rewrite.ev_class cross-reference).
+const (
+	pgStatReplicationViewOID      uint32 = 12102
+	pgStatRecoveryPrefetchViewOID uint32 = 12103
+	pgStatSubscriptionViewOID     uint32 = 12104
+	pgReplicationSlotsViewOID     uint32 = 12105
+	pgStatReplicationSlotsViewOID uint32 = 12106
+)
 
 // pgRewriteColDefs returns the canonical PG18 8-column Form_pg_rewrite
 // layout (postgres/src/include/catalog/pg_rewrite.h:32-44):
@@ -78,11 +111,13 @@ type pgRewriteEntry struct {
 }
 
 // pgRewriteInitialEntries returns one row per ON-SELECT rule needed for
-// the nailed local views. Currently only pg_stat_wal_receiver — adding
-// further system_views.sql views is mechanical (capture ev_action from
-// an upstream PG dump, add an entry here).
+// the nailed local replication views (all six in the 12100..12106 range).
+// Each ev_action is a verbatim nodeToString(Query) dump captured from an
+// upstream PG18 instance running system_views.sql; no OID rewriting is
+// needed because the RTEs reference the backing SRF funcid, not the view's
+// pg_class OID.
 func pgRewriteInitialEntries() []pgRewriteEntry {
-	return []pgRewriteEntry{
+	base := []pgRewriteEntry{
 		{
 			OID:       pgRewriteOIDPgStatWalReceiverReturn,
 			RuleName:  "_RETURN",
@@ -92,6 +127,67 @@ func pgRewriteInitialEntries() []pgRewriteEntry {
 			IsInstead: true,
 			EvQual:    "<>", // empty node tree — no WHERE clause on the rule
 			EvAction:  pgStatWalReceiverEvAction,
+		},
+	}
+	return append(base, replicationViewRewriteEntries()...)
+}
+
+// replicationViewRewriteEntries returns the five _RETURN rule entries for
+// the remaining replication views seeded in batched-28
+// (pg_stat_replication, pg_stat_recovery_prefetch, pg_stat_subscription,
+// pg_replication_slots, pg_stat_replication_slots). These follow the same
+// ev_action capture pattern as the wal_receiver entry above.
+func replicationViewRewriteEntries() []pgRewriteEntry {
+	return []pgRewriteEntry{
+		{
+			OID:       pgRewriteOIDPgStatReplicationReturn,
+			RuleName:  "_RETURN",
+			EvClass:   pgStatReplicationViewOID,
+			EvType:    '1',
+			EvEnabled: 'O',
+			IsInstead: true,
+			EvQual:    "<>",
+			EvAction:  pgStatReplicationEvAction,
+		},
+		{
+			OID:       pgRewriteOIDPgStatRecoveryPrefetchReturn,
+			RuleName:  "_RETURN",
+			EvClass:   pgStatRecoveryPrefetchViewOID,
+			EvType:    '1',
+			EvEnabled: 'O',
+			IsInstead: true,
+			EvQual:    "<>",
+			EvAction:  pgStatRecoveryPrefetchEvAction,
+		},
+		{
+			OID:       pgRewriteOIDPgStatSubscriptionReturn,
+			RuleName:  "_RETURN",
+			EvClass:   pgStatSubscriptionViewOID,
+			EvType:    '1',
+			EvEnabled: 'O',
+			IsInstead: true,
+			EvQual:    "<>",
+			EvAction:  pgStatSubscriptionEvAction,
+		},
+		{
+			OID:       pgRewriteOIDPgReplicationSlotsReturn,
+			RuleName:  "_RETURN",
+			EvClass:   pgReplicationSlotsViewOID,
+			EvType:    '1',
+			EvEnabled: 'O',
+			IsInstead: true,
+			EvQual:    "<>",
+			EvAction:  pgReplicationSlotsEvAction,
+		},
+		{
+			OID:       pgRewriteOIDPgStatReplicationSlotsReturn,
+			RuleName:  "_RETURN",
+			EvClass:   pgStatReplicationSlotsViewOID,
+			EvType:    '1',
+			EvEnabled: 'O',
+			IsInstead: true,
+			EvQual:    "<>",
+			EvAction:  pgStatReplicationSlotsEvAction,
 		},
 	}
 }
@@ -105,16 +201,22 @@ const pgStatWalReceiverViewOID uint32 = 12100
 // pgRewriteColDefs order. All columns are BKI_FORCE_NOT_NULL so the
 // null-bitmap is unused (every datum is a real value, including the
 // empty-string ev_qual encoded as varlena "<>").
+// pgRewriteRow builds the 8-column Form_pg_rewrite row in
+// pgRewriteColDefs order. ev_qual and ev_action use pglzVarlenaDatum so
+// large payloads (e.g. pg_stat_replication's 27 KB ev_action) are
+// stored as PGLZ-compressed varlena bytes, which is the same format PG
+// produces during system_views.sql processing. Small payloads fall back
+// to uncompressed varlena.
 func pgRewriteRow(e pgRewriteEntry) executor.Row {
 	return executor.Row{
-		executor.NewIntDatum(int64(e.OID)),             // 1 oid
-		executor.NewStringDatum(e.RuleName),            // 2 rulename
-		executor.NewIntDatum(int64(e.EvClass)),         // 3 ev_class
-		executor.NewIntDatum(int64(e.EvType)),          // 4 ev_type (char → byte via Int path in codec)
-		executor.NewIntDatum(int64(e.EvEnabled)),       // 5 ev_enabled
-		executor.NewBoolDatum(e.IsInstead),             // 6 is_instead
-		executor.NewStringDatum(e.EvQual),              // 7 ev_qual    (varlena pg_node_tree)
-		executor.NewStringDatum(e.EvAction),            // 8 ev_action  (varlena pg_node_tree)
+		executor.NewIntDatum(int64(e.OID)),       // 1 oid
+		executor.NewStringDatum(e.RuleName),      // 2 rulename
+		executor.NewIntDatum(int64(e.EvClass)),   // 3 ev_class
+		executor.NewIntDatum(int64(e.EvType)),    // 4 ev_type (char → byte via Int path in codec)
+		executor.NewIntDatum(int64(e.EvEnabled)), // 5 ev_enabled
+		executor.NewBoolDatum(e.IsInstead),       // 6 is_instead
+		pglzVarlenaDatum(e.EvQual),               // 7 ev_qual    (varlena pg_node_tree)
+		pglzVarlenaDatum(e.EvAction),             // 8 ev_action  (varlena pg_node_tree)
 	}
 }
 

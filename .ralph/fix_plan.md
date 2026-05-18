@@ -9928,7 +9928,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3dl-pg-stat-wal-receiver-view-pg-class.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-29** (bootstrap-procedure task 29)
+- [x] **M0106-0010 batched-29** (bootstrap-procedure task 29)
       - Summary: Add `replicationViewRewriteEntries()` emitting `_RETURN`
         rule tuples (8-col PG18 layout) for the 5 remaining views into
         `pg_rewrite` (2618) and `pg_rewrite_rel_rulename_index` (2693);
