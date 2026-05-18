@@ -43,6 +43,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		2687: {1},        // pg_opclass_oid_index
 		2655: {2, 3, 4, 5}, // pg_amproc_fam_proc_index : btree(amprocfamily, lefttype, righttype, amprocnum)
 		2693: {3, 2},     // pg_rewrite_rel_rulename_index : btree(ev_class, rulename)  ← Step 3n
+		2692: {1},        // pg_rewrite_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3dm phase B
 		2701: {2, 4},     // pg_trigger_tgrelid_tgname_index : btree(tgrelid, tgname)   ← Step 3n
 		2667: {1},        // pg_constraint_oid_index
 		2688: {1},        // pg_operator_oid_index

@@ -1262,6 +1262,167 @@ func pgBuildIndexTupleNameKey(heapBlk uint32, heapOff uint16, name string) []byt
 	return out
 }
 
+// pgBuildIndexTupleOidNameKey returns the on-disk IndexTuple bytes for
+// a composite (oid, name) btree leaf entry. Used by
+// pg_rewrite_rel_rulename_index (OID 2693, indkey=[ev_class, rulename]).
+//
+// PG's `index_form_tuple` for an (oid att1, name att2) tuple lays out:
+//
+//	[0..1]   bi_hi          (ItemPointerData)
+//	[2..3]   bi_lo
+//	[4..5]   ip_posid
+//	[6..7]   t_info         (low 13 bits = size, no var/null bits)
+//	[8..11]  oid key        (LE uint32 — oid_ops compares as unsigned)
+//	[12..75] NameData       (NAMEDATALEN bytes, zero-padded)
+//	[76..79] MAXALIGN padding (zero)
+//
+// Total = MAXALIGN(IndexTupleHeader + sizeof(oid) + NAMEDATALEN) =
+// MAXALIGN(8 + 4 + 64) = MAXALIGN(76) = 80. NameData's typalign is
+// 'c' so no inter-attribute padding is needed between the oid and the
+// name. The trailing MAXALIGN pad never participates in comparisons.
+func pgBuildIndexTupleOidNameKey(heapBlk uint32, heapOff uint16, oid uint32, name string) []byte {
+	const (
+		nameDataLen = 64
+		hoff        = 8
+		size        = 80 // MAXALIGN(hoff + 4 + nameDataLen) = MAXALIGN(76) = 80
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	// ItemPointerData.
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+
+	// t_info: tuple size in low 13 bits.
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	// Key data.
+	le.PutUint32(out[hoff:hoff+4], oid)
+	n := len(name)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff+4:hoff+4+n], name[:n])
+	// Bytes [76..79] are MAXALIGN padding — already zero.
+	return out
+}
+
+// bootstrapPgRewriteOidIndex overwrites base/{1,5}/2692 with a populated
+// 2-block btree (metapage + leaf-root) carrying one oid-keyed
+// IndexTuple per Form_pg_rewrite heap row. M0106-0010 Step 3dm phase B.
+//
+// PG's RelationCacheInitializePhase3 / relcache view-loading path
+// fetches the ON-SELECT rule via SearchSysCache1(RULEOID, oid). Without
+// this leaf the cache lookup falls through to a sequential heap scan
+// (still correct) — but the rel_rulename leaf (OID 2693) IS load-
+// bearing because relcache view opening calls SearchSysCache2(
+// RULERELNAME, ev_class, rulename). We bootstrap both for parity.
+func bootstrapPgRewriteOidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type entry struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	entries := make([]entry, 0, len(tids))
+	for oid, t := range tids {
+		entries = append(entries, entry{oid: oid, block: t.Block, off: t.Offset})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].oid < entries[j].oid })
+
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleOidKey(e.block, e.off, e.oid)
+	}
+	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		return fmt.Errorf("pg_rewrite_oid_index leaf: %w", err)
+	}
+	meta := pgBuildBtreeMetapageWithRoot(1, 0)
+
+	file := make([]byte, 0, 2*storage.BlockSize)
+	file = append(file, meta...)
+	file = append(file, leaf...)
+
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2692, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_rewrite_oid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgRewriteRelRulenameIndex overwrites base/{1,5}/2693 with a
+// populated 2-block btree carrying one (ev_class, rulename)-keyed
+// IndexTuple per Form_pg_rewrite heap row. M0106-0010 Step 3dm phase B.
+//
+// PG's RelationBuildRuleLock (postgres/src/backend/utils/cache/relcache.c)
+// runs systable_beginscan(RewriteRelRulenameIndexId, ev_class=rel_oid)
+// every time a relhasrules=true relation is opened, so this leaf must
+// exist before PG's first probe of the seeded view.
+//
+// rewriteEntries supplies (ev_class, rulename) → heap TID for each
+// rule; bootstrapPgRewriteTuples produces the OID-keyed map and the
+// caller looks up the per-rule columns from pgRewriteInitialEntries.
+func bootstrapPgRewriteRelRulenameIndex(dataDir string, tids map[uint32]heapTID) error {
+	type entry struct {
+		evClass  uint32
+		ruleName string
+		block    uint32
+		off      uint16
+	}
+	rewriteEntries := pgRewriteInitialEntries()
+	entries := make([]entry, 0, len(rewriteEntries))
+	for _, e := range rewriteEntries {
+		t, ok := tids[e.OID]
+		if !ok {
+			return fmt.Errorf("pg_rewrite_rel_rulename_index: no heap TID for rule OID %d", e.OID)
+		}
+		entries = append(entries, entry{
+			evClass:  e.EvClass,
+			ruleName: e.RuleName,
+			block:    t.Block,
+			off:      t.Offset,
+		})
+	}
+	// Composite key: ev_class ASC, then rulename ASC (memcmp over the
+	// zero-padded NameData — name_ops uses bttextcmp-equivalent byte
+	// comparison for the C locale).
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].evClass != entries[j].evClass {
+			return entries[i].evClass < entries[j].evClass
+		}
+		return entries[i].ruleName < entries[j].ruleName
+	})
+
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleOidNameKey(e.block, e.off, e.evClass, e.ruleName)
+	}
+	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		return fmt.Errorf("pg_rewrite_rel_rulename_index leaf: %w", err)
+	}
+	meta := pgBuildBtreeMetapageWithRoot(1, 0)
+
+	file := make([]byte, 0, 2*storage.BlockSize)
+	file = append(file, meta...)
+	file = append(file, leaf...)
+
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2693, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_rewrite_rel_rulename_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
 // bootstrapPgAuthidIndexes populates the two pg_authid critical indexes
 // (rolname → OID 2676; OID → OID 2677) with one IndexTuple per bootstrapped
 // pg_authid heap row.  Both are shared catalogs and live exclusively under

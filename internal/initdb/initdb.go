@@ -372,6 +372,22 @@ func Init(opts Options) error {
 	if err := bootstrapPgAttributeRelidAttnumIndex(abs, pgAttrTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_attribute_relid_attnum_index: %w", err)
 	}
+	// M0106-0010 step 3dm phase B: seed pg_rewrite heap + leaf indices.
+	// Step 3dl seeded pg_stat_wal_receiver into pg_class with
+	// relhasrules=true, which tells PG's relcache to fetch the
+	// ON-SELECT rule via RewriteRelRulenameIndexId. Without a real
+	// Form_pg_rewrite row and the two leaf btrees the next FATAL is
+	// "cache lookup failed for rule" on first open of the view.
+	pgRewriteTIDs, err := bootstrapPgRewriteTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_rewrite tuples: %w", err)
+	}
+	if err := bootstrapPgRewriteOidIndex(abs, pgRewriteTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_rewrite_oid_index: %w", err)
+	}
+	if err := bootstrapPgRewriteRelRulenameIndex(abs, pgRewriteTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_rewrite_rel_rulename_index: %w", err)
+	}
 	// M0106-0010 step 3w: write an empty heap page for every mapped local
 	// catalog that lacks a dedicated bootstrapper (pg_aggregate=2600,
 	// pg_type=1247, pg_namespace=2615, …). Without these files PG's
@@ -2401,6 +2417,15 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_rewrite columns (PG18, pg_rewrite.h): 1=oid, 2=rulename,
 		// 3=ev_class. Index = btree(ev_class oid_ops, rulename name_ops).
 		entry(2693, 2618, []int16{3, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_rewrite_rel_rulename_index
+		// M0106-0010 Step 3dm phase B: pg_rewrite_oid_index.
+		//   postgres/src/include/catalog/pg_rewrite.h:46
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_rewrite_oid_index, 2692,
+		//       RewriteOidIndexId, pg_rewrite,
+		//       btree(oid oid_ops));
+		//   MAKE_SYSCACHE(RULEOID, pg_rewrite_oid_index, 4);
+		// Single-column oid_ops UNIQUE PRIMARY over pg_rewrite heap OID
+		// 2618. Companion to OID 2693 (ev_class/rulename UNIQUE non-PKEY).
+		entry(2692, 2618, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_rewrite_oid_index
 		// pg_trigger columns (PG18, pg_trigger.h): 1=oid, 2=tgrelid,
 		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
 		entry(2701, 2620, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_trigger_tgrelid_tgname_index
