@@ -2000,3 +2000,119 @@ func bootstrapPgCastSourceTargetIndex(dataDir string, tids map[uint32]heapTID) e
 	}
 	return nil
 }
+
+// pgBuildIndexTupleNameInt4OidKey builds a 3-column index tuple with key
+// schema (name, int4, oid). Used by pg_collation_name_enc_nsp_index (OID
+// 3164): btree(collname name_ops, collencoding int4_ops, collnamespace oid_ops).
+func pgBuildIndexTupleNameInt4OidKey(heapBlk uint32, heapOff uint16, name string, enc int32, oid uint32) []byte {
+	const (
+		nameDataLen = 64
+		hoff        = 8
+		size        = 80 // MAXALIGN(8 + 64 + 4 + 4) = 80
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	n := len(name)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff:hoff+n], name[:n])
+	le.PutUint32(out[hoff+nameDataLen:hoff+nameDataLen+4], uint32(enc))
+	le.PutUint32(out[hoff+nameDataLen+4:hoff+nameDataLen+8], oid)
+	return out
+}
+
+// bootstrapPgCollationOidIndex writes pg_collation_oid_index (OID 3085) —
+// UNIQUE PRIMARY KEY btree on oid — to base/{1,5}/3085.
+func bootstrapPgCollationOidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type indexed struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(tids))
+	for oid, tid := range tids {
+		items = append(items, indexed{oid: oid, block: tid.Block, off: tid.Offset})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
+	if err != nil {
+		return fmt.Errorf("pg_collation_oid_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(3085, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_collation_oid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgCollationNameEncNspIndex writes pg_collation_name_enc_nsp_index
+// (OID 3164) — UNIQUE btree on (collname, collencoding, collnamespace) — to
+// base/{1,5}/3164.
+func bootstrapPgCollationNameEncNspIndex(dataDir string, tids map[uint32]heapTID) error {
+	entries := pgCollationInitialEntries()
+	type indexed struct {
+		name  string
+		enc   int32
+		nsp   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(entries))
+	for _, e := range entries {
+		tid, ok := tids[e.OID]
+		if !ok {
+			return fmt.Errorf("pg_collation_name_enc_nsp_index: no heap TID for collation OID %d", e.OID)
+		}
+		items = append(items, indexed{
+			name:  e.CollName,
+			enc:   e.CollEncoding,
+			nsp:   e.CollNamespace,
+			block: tid.Block,
+			off:   tid.Offset,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.name != b.name {
+			return a.name < b.name
+		}
+		if a.enc != b.enc {
+			return a.enc < b.enc
+		}
+		return a.nsp < b.nsp
+	})
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleNameInt4OidKey(it.block, it.off, it.name, it.enc, it.nsp)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 80, 3)
+	if err != nil {
+		return fmt.Errorf("pg_collation_name_enc_nsp_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(3164, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_collation_name_enc_nsp_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}

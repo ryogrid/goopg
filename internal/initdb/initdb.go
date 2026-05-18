@@ -441,6 +441,19 @@ func Init(opts Options) error {
 	if err := bootstrapPgCastSourceTargetIndex(abs, pgCastTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_cast_source_target_index: %w", err)
 	}
+	// M0106-0010 batched-21: write all 7 pg_collation rows so PG's
+	// COLLNAMEENCNSP and COLLOID syscaches resolve collation lookups
+	// during expression compilation and text comparison.
+	pgCollationTIDs, err := bootstrapPgCollationTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_collation tuples: %w", err)
+	}
+	if err := bootstrapPgCollationOidIndex(abs, pgCollationTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_collation_oid_index: %w", err)
+	}
+	if err := bootstrapPgCollationNameEncNspIndex(abs, pgCollationTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_collation_name_enc_nsp_index: %w", err)
+	}
 	// M0106-0010 step 3m: overwrite the empty btree placeholder at
 	// base/{1,5}/2662 + global/2662 with a populated 2-page btree
 	// (metapage + leaf-root) carrying one oid-keyed IndexTuple per
