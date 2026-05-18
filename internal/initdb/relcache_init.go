@@ -409,6 +409,18 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
 	{3081, "pg_extension_name_index"},
+	// M0106-0010 Step 3bc: pg_foreign_data_wrapper_name_index. PG18
+	// `postgres/src/include/catalog/pg_foreign_data_wrapper.h:56`
+	// declares `ForeignDataWrapperNameIndexId = 548` as UNIQUE
+	// (non-PKEY) on btree(fdwname name_ops). Heap OID 2328
+	// (pg_foreign_data_wrapper, Step 3bb nailed rel). Backs
+	// MAKE_SYSCACHE(FOREIGNDATAWRAPPERNAME,
+	// pg_foreign_data_wrapper_name_index, 2). Without this entry
+	// RelationIdGetRelation(548) FATALs because no pg_class row gets
+	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
+	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
+	// (relcache.c:1492).
+	{548, "pg_foreign_data_wrapper_name_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {

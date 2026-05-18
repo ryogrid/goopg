@@ -5592,6 +5592,70 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/mvcc/` PASS.
         Design:
         `docs/design/0106-0010-step3bb-pg-foreign-data-wrapper-nailed-rel.md`.
+      - Step 3bc LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 548` PG-standby boot blocker
+        that surfaced after Step 3bb seeded `pg_foreign_data_wrapper`
+        (OID 2328). OID 548 is `pg_foreign_data_wrapper_name_index`
+        per `postgres/src/include/catalog/pg_foreign_data_wrapper.h:56`
+        (`DECLARE_UNIQUE_INDEX(pg_foreign_data_wrapper_name_index, 548,
+        ForeignDataWrapperNameIndexId, pg_foreign_data_wrapper,
+        btree(fdwname name_ops))`). Backs
+        `MAKE_SYSCACHE(FOREIGNDATAWRAPPERNAME,
+        pg_foreign_data_wrapper_name_index, 2)`. Pure catalog-seed
+        addition mirroring the single-column `name_ops` UNIQUE non-PKEY
+        pattern of Steps 3ay (pg_extension_name_index 3081), 3as
+        (pg_event_trigger_evtname_index 3467), and 3t
+        (pg_namespace_nspname_index 2684); no encoder/builder/Init flow
+        change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(548, 2328, []int16{2}, []uint32{nameOps},
+        []uint32{cCollation}, true, false)` — UNIQUE (non-PRIMARY)
+        single name_ops key with C_COLLATION_OID = 950 over the
+        pg_foreign_data_wrapper heap OID 2328 (Step 3bb nailed rel).
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{548, "pg_foreign_data_wrapper_name_index"}`;
+        `flattenRels` + `pgIndexNattsByOID` derives
+        `RelKind='i', RelNatts=1` so `relnatts==indnatts` check
+        (relcache.c:1492) passes.
+        (c) Three empty-placeholder OID lists in
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        gain `548 // pg_foreign_data_wrapper_name_index (Step 3bc)`.
+        Step-3k empty-btree placeholder is sufficient because
+        pg_foreign_data_wrapper is currently unpopulated — any
+        `SearchSysCache1(FOREIGNDATAWRAPPERNAME, …)` probe correctly
+        returns no row.
+        The seed threads automatically through:
+        `bootstrapPgClassTuples → bootstrapPgAttributeTuples →
+        bootstrapPgIndexTuples (captures TID) →
+        bootstrapPgIndexIndexrelidIndex (adds leaf at 2679) →
+        bootstrapPgClassOidIndex (adds leaf at 2662) →
+        bootstrapPgAttributeRelidAttnumIndex (composite leaf at 2659)`.
+        Regression pins:
+        `TestPgForeignDataWrapperNameIndexSeededFromInitialEntries`
+        (pins `(IndRelid=2328, IndKey=[2], IsUnique=true,
+        IsPrimary=false, IndCollation=[950])`) and
+        `TestNailedLocalRelsContainsPgForeignDataWrapperNameIndex`
+        (pins `RelName, RelKind='i', RelNatts=1`) in
+        `internal/initdb/pg_foreign_data_wrapper_name_index_test.go`.
+        Existing pins extended:
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` adds `548: {2}`
+        (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 548.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestPgForeignDataWrapperNameIndex|TestNailedLocalRelsContainsPgForeignDataWrapperNameIndex|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedLocalRelsContainsPgForeignDataWrapper|TestNailedLocalRelsContainsPgExtensionNameIndex|TestPgExtensionNameIndex'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bb (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS.
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`:
+        OID 548 blocker closed; new blocker surfaces as
+        `FATAL: could not open relation with OID 112`
+        (= `pg_foreign_data_wrapper_oid_index`, the second deferred
+        companion from Step 3bb) — Step 3bd territory.
+        Design:
+        `docs/design/0106-0010-step3bc-pg-foreign-data-wrapper-name-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
