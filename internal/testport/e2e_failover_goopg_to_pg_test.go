@@ -100,6 +100,12 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	}
 
 	standbyDir := filepath.Join(baseDir, "pg-standby")
+	t.Cleanup(func() {
+		pgLogPath := filepath.Join(filepath.Dir(standbyDir), "pg.log")
+		if pgLog, rerr := os.ReadFile(pgLogPath); rerr == nil {
+			t.Logf("[m0102-pg-standby-log] %s:\n%s", pgLogPath, string(pgLog))
+		}
+	})
 	// Standard PG streaming replication procedure:
 	// pg_basebackup -C -S slot_name -R creates the slot, streams the
 	// backup, and writes standby.signal + postgresql.auto.conf.

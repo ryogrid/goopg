@@ -8645,6 +8645,63 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         300s timeout — start by widening the timeout to 600s, dumping
         the standby PG server log, and confirming whether the
         `28000: role "ryo" does not exist` FATAL is in fact gone.
+      - Step 3cy LANDED 2026-05-18 (diagnostic). Permanent test
+        improvement only:
+        `internal/testport/e2e_failover_goopg_to_pg_test.go::runFailoverGoopgToPG`
+        gains an unconditional `t.Cleanup` installed immediately
+        after `standbyDir` is known. The cleanup reads
+        `<baseDir>/pg.log` and emits it under a greppable
+        `[m0102-pg-standby-log]` tag, so the standby PG server log
+        is captured on success AND failure (the previous dump only
+        fired on `WaitReady` failure, which hid post-WaitReady FATALs
+        like Step 3cx's 300s timeout). Reproduction archived to
+        `tmp/m0106-step3cy/run1.log` (~38 K lines).
+        Findings:
+        ✅ `28000: role "ryo" does not exist` is GONE (zero
+        occurrences); Step 3cx fix is confirmed working end-to-end.
+        ✅ Standby boots past role check, reaches
+        `consistent recovery state reached at 0/4288`, walreceiver
+        streams from primary at LSN 0/0 timeline 1.
+        ❌ NEW first-order blocker: the first client backend that
+        runs the test's `SELECT 1` probe (via `WaitReady` /
+        `QueryScalar`) errors with
+        `XX000: cache lookup failed for type 23` at
+        `TupleDescInitEntry, tupdesc.c:896` (type OID 23 = `int4`).
+        ❌ Second-order: a *follow-up* backend on the same
+        postmaster crashes with `signal 11: Segmentation fault`,
+        forcing `HandleChildCrash → terminating any other active
+        server processes` and a full postmaster reinit. This cycle
+        repeats every ~1.5s until pg_ctl can't reach the postmaster
+        for graceful shutdown — that is why Step 3cx's
+        `standby.Stop()` (called from the test's deferred cleanup
+        after `waitForPhysicalStreamingGoopgToPG` t.Fatalf'd on the
+        recovery-mode psql error) blocked in `cmd.Wait()` and
+        consumed the remaining 300s budget. The SIGSEGV is treated
+        as derivative of the cache-lookup ERROR (likely uninitialised
+        InitPostgres state after the failed lookup); promote to its
+        own step only if it survives the Step 3cz fix.
+        Verified: `go vet ./internal/testport/` clean;
+        E2E re-run captures the diagnostic with the expected new
+        ERROR line visible under the `[m0102-pg-standby-log]` tag.
+        Design:
+        `docs/design/0106-0010-step3cy-e2e-standby-log-capture-and-type-23-cache-miss.md`.
+        Next blocker (Step 3cz): close the
+        `XX000: cache lookup failed for type 23` FATAL. Working
+        hypothesis: `pg_type_oid_index` (OID 2703) is still a
+        Step-3k empty btree placeholder, so `SearchSysCache1(TYPEOID,
+        ObjectIdGetDatum(23))` returns zero rows even though the
+        pg_type heap contains the int4 row. Apply the Step-3cx /
+        Step-3cw pattern: byte-exact single-OID-column IndexTuple
+        builder (reuse `pgBuildIndexTupleOidKey`), sort the existing
+        seeded pg_type entries by OID asc, build a populated 2-page
+        btree (metapage + leaf-root) via the established
+        `pgBuildBtreeLeafRootPage` / `pgBuildBtreeMetapageWithRoot`
+        helpers, and write to `base/{1,5}/2703` (pg_type is per-DB
+        not shared, so no `global/` copy). Falls back to direct
+        pg_type heap inspection (`pg_filedump` of the standby's
+        `base/<dbid>/1247`) or relcache-init-file diff if 2703 is
+        already populated. Regression pin must include the `(23,)`
+        leaf — that exact OID is what triggered the FATAL.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
