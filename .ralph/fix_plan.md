@@ -6084,6 +6084,71 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         both pg_language indexes (2681 name + 2682 oid) are now seeded.
         Design:
         `docs/design/0106-0010-step3bk-pg-language-oid-index.md`.
+      - Step 3bl LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2689` PG-standby boot blocker
+        that surfaced after Step 3bk closed both pg_language indexes
+        (2681 name + 2682 oid). E2E test (`TestE2E_FailoverGoopgToPG/async`
+        with `GOOPG_RUN_BLOCKED_M0102_E2E=1`) confirmed 2689 as the next
+        FATAL via `psql: connection to server … failed: FATAL: could not
+        open relation with OID 2689`. OID 2689 is
+        `pg_operator_oprname_l_r_n_index` per
+        `postgres/src/include/catalog/pg_operator.h:86`
+        (`DECLARE_UNIQUE_INDEX(pg_operator_oprname_l_r_n_index, 2689,
+        OperatorNameNspIndexId, pg_operator, btree(oprname name_ops,
+        oprleft oid_ops, oprright oid_ops, oprnamespace oid_ops))`).
+        Backs `MAKE_SYSCACHE(OPERNAMENSP,
+        pg_operator_oprname_l_r_n_index, 256)`. UNIQUE but NOT primary
+        — pg_operator's PKEY is OID 2688 (`pg_operator_oid_index`, Step
+        3 backbone).
+        Pure catalog-seed addition mirroring the multi-column
+        UNIQUE non-PKEY mixed-opclass pattern of Step 3y
+        (`pg_amop_fam_strat_index`, 4 oid_ops keys) and Step 3ad
+        (`pg_opclass_am_name_nsp_index`, oid_ops+name_ops+oid_ops);
+        no encoder/builder/Init flow change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` appends
+        `entry(2689, 2617, []int16{2, 8, 9, 3}, []uint32{nameOps,
+        oidOps, oidOps, oidOps}, []uint32{cCollation, 0, 0, 0}, true,
+        false)` after the Step 3bk 2682 entry. pg_operator column order
+        per `pg_operator.h`: 1=oid, 2=oprname, 3=oprnamespace, 4=oprowner,
+        5=oprkind, 6=oprcanmerge, 7=oprcanhash, 8=oprleft, 9=oprright,
+        10=oprresult, 11=oprcom, 12=oprnegate, 13=oprcode, 14=oprrest,
+        15=oprjoin. `oprname` (name_ops) carries C collation 950; the
+        three oid_ops keys carry no collation.
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{2689, "pg_operator_oprname_l_r_n_index"}` after the
+        2682 entry. `flattenRels`+`pgIndexNattsByOID` derives
+        `RelKind='i', RelNatts=4` so the `relnatts==indnatts` check
+        (relcache.c:1492) passes. pg_operator heap OID 2617 is
+        already a nailed local rel; `pgOperatorAttrs()` already
+        declares 10 columns so attnums 2/3/8/9 are present in the
+        TupleDesc.
+        (c) Three placeholder OID lists at `bootstrapPostgresDatabase`
+        (`base/1/`, `base/5/`, `global/`) gain `2689 //
+        pg_operator_oprname_l_r_n_index (Step 3bl)` between the existing
+        `2688` and `2690` entries. Step-3k empty-btree placeholder is
+        sufficient because pg_operator is currently unpopulated — any
+        `SearchSysCache4(OPERNAMENSP, …)` probe correctly returns no row.
+        Regression pins:
+        `TestPgOperatorOprnameLRNIndexSeededFromInitialEntries` /
+        `TestNailedLocalRelsContainsPgOperatorOprnameLRNIndex` in
+        `internal/initdb/pg_operator_oprname_l_r_n_index_test.go`;
+        existing `TestPgIndexInitialEntriesIndkeyMatchesPG18` map
+        extended with `2689:{2,8,9,3}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2689. Verified: `go build ./...` PASS; targeted
+        tests
+        `TestPgOperatorOprnameLRNIndex|TestNailedLocalRelsContainsPgOperatorOprnameLRNIndex|
+        TestPgLanguageOidIndex|TestPgLanguageNameIndex|
+        TestPgIndexInitialEntriesIndkeyMatchesPG18|
+        TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|
+        TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|
+        TestPgClassOidIndexHasSingleKeyColumn` PASS;
+        `go test -count=1 ./internal/initdb/` shows the same 14
+        pre-existing baseline failures as Step 3bk (no new regressions);
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3bl-pg-operator-oprname-l-r-n-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

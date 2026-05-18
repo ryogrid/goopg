@@ -512,6 +512,18 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
 	{2682, "pg_language_oid_index"},
+	// M0106-0010 Step 3bl: pg_operator_oprname_l_r_n_index. PG18
+	// `postgres/src/include/catalog/pg_operator.h:86`
+	// declares `OperatorNameNspIndexId = 2689` as UNIQUE (NOT primary)
+	// on btree(oprname name_ops, oprleft oid_ops, oprright oid_ops,
+	// oprnamespace oid_ops). Heap OID 2617 (pg_operator) is already a
+	// nailed local rel above. Backs MAKE_SYSCACHE(OPERNAMENSP,
+	// pg_operator_oprname_l_r_n_index, 256). Without this entry
+	// RelationIdGetRelation(2689) FATALs because no pg_class row gets
+	// seeded; flattenRels derives RelNatts=4 via pgIndexNattsByOID,
+	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
+	// (relcache.c:1492).
+	{2689, "pg_operator_oprname_l_r_n_index"},
 })
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {

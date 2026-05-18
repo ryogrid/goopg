@@ -76,6 +76,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		3119: {1},         // pg_foreign_table_relid_index : btree(ftrelid oid_ops) UNIQUE PRIMARY ← Step 3bi
 		2681: {2},         // pg_language_name_index : btree(lanname name_ops) UNIQUE ← Step 3bj
 		2682: {1},         // pg_language_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3bk
+		2689: {2, 8, 9, 3}, // pg_operator_oprname_l_r_n_index : btree(oprname name_ops, oprleft oid_ops, oprright oid_ops, oprnamespace oid_ops) UNIQUE ← Step 3bl
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

@@ -697,7 +697,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2678, 2679, 2680, 2682,
 		2684, 2685,
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
-		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
+		2687, 2688,
+		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
+		2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
@@ -811,7 +813,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2678, 2679, 2680, 2682,
 		2684, 2685,
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
-		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
+		2687, 2688,
+		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
+		2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
@@ -854,7 +858,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2678, 2679, 2680, 2682,
 		2684, 2685,
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
-		2687, 2688, 2690, 2691, 2692, 2693, 2701, 2703,
+		2687, 2688,
+		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
+		2690, 2691, 2692, 2693, 2701, 2703,
 		2704, 3085, 3164,
 		3502, // pg_enum_oid_index (Step 3ao)
 		3503, // pg_enum_typid_label_index (Step 3ap)
@@ -2165,6 +2171,26 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// OID 2682 as the next FATAL after Step 3bj seeded
 		// pg_language_name_index.
 		entry(2682, 2612, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_language_oid_index
+		// M0106-0010 Step 3bl: pg_operator_oprname_l_r_n_index.
+		//   postgres/src/include/catalog/pg_operator.h:86
+		//     DECLARE_UNIQUE_INDEX(pg_operator_oprname_l_r_n_index, 2689,
+		//       OperatorNameNspIndexId, pg_operator,
+		//       btree(oprname name_ops, oprleft oid_ops,
+		//             oprright oid_ops, oprnamespace oid_ops));
+		//   MAKE_SYSCACHE(OPERNAMENSP, pg_operator_oprname_l_r_n_index, 256);
+		// pg_operator attnums (pg_operator.h struct order):
+		// 1=oid, 2=oprname, 3=oprnamespace, 4=oprowner, 5=oprkind,
+		// 6=oprcanmerge, 7=oprcanhash, 8=oprleft, 9=oprright, 10=oprresult,
+		// 11=oprcom, 12=oprnegate, 13=oprcode, 14=oprrest, 15=oprjoin.
+		// UNIQUE but NOT primary — DECLARE_UNIQUE_INDEX is not the _PKEY
+		// variant; pg_operator's PKEY is OID 2688 (pg_operator_oid_index).
+		// `oprname` is a `name` column whose btree opclass uses C collation
+		// (C_COLLATION_OID=950) — same convention as pg_proc_proname_args_nsp_index
+		// (2691), pg_opclass_am_name_nsp_index (2686). The three oid_ops
+		// keys carry no collation. pg_operator heap OID 2617 is already a
+		// nailed local rel (relcache_init.go:122). E2E test surfaced OID
+		// 2689 as the next FATAL after Step 3bk seeded pg_language_oid_index.
+		entry(2689, 2617, []int16{2, 8, 9, 3}, []uint32{nameOps, oidOps, oidOps, oidOps}, []uint32{cCollation, 0, 0, 0}, true, false), // pg_operator_oprname_l_r_n_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
