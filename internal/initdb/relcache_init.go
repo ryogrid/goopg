@@ -647,6 +647,35 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// (text[] 1009, CATALOG_VARLEN — nullable). pg_user_mapping has
 	// an `oid` system column — attnum 1 = oid.
 	{1418, "pg_user_mapping", 83, 'r', 4, false, pgUserMappingAttrs()},
+	// M0106-0010 Step 3dl: pg_stat_wal_receiver — first relkind='v' (view)
+	// entry seeded into the bootstrap pg_class heap. After Steps 3dj/3dk
+	// landed pg_proc OID 3317 (`pg_stat_get_wal_receiver`) with its 15
+	// OUT-arg metadata arrays, PG can resolve the view's column list via
+	// `build_function_result_tupdesc_d()`. This row makes PG's
+	// `RangeVarGetRelid("pg_catalog.pg_stat_wal_receiver")` return a
+	// non-zero OID so the E2E test's
+	// `SELECT status FROM pg_catalog.pg_stat_wal_receiver` probe no longer
+	// errors with `42P01 relation "pg_stat_wal_receiver" does not exist`.
+	//
+	// OID 12100 is a goopg-private stable assignment in the
+	// `FirstUnpinnedObjectId..FirstNormalObjectId` range (PG18:
+	// 12000..16383). PG itself assigns system_views.sql view OIDs
+	// dynamically at initdb time, so there is no upstream-canonical OID
+	// to mirror; 12100 is chosen unilaterally and pinned by regression
+	// test.
+	//
+	// RelType=2249 (RECORDOID) matches the underlying function's
+	// prorettype (pg_proc.dat:5670) so any code path that consults
+	// pg_class.reltype gets a valid composite-type pointer (PG always
+	// has the anonymous RECORD type registered).
+	//
+	// RelNatts=15 matches the OUT-arg list. pgClassRow handles
+	// RelKind='v' specially: relam=0, relfilenode=0, relhasrules=true
+	// (PG fetches the rewrite rule from pg_rewrite when relhasrules is
+	// true). The pg_rewrite row carrying ev_action is the next blocker
+	// (Step 3dm) — without it the view is openable but `SELECT` returns
+	// no rows.
+	{12100, "pg_stat_wal_receiver", 2249, 'v', 15, false, pgStatWalReceiverAttrs()},
 }, []idxSpec{
 	{OID: 2703, Name: "pg_type_oid_index"},
 	{OID: 2704, Name: "pg_type_typname_nsp_index"},
@@ -2046,6 +2075,39 @@ func pgRewriteAttrs() []nailedAttr {
 		{Name: "ev_owner", TypeOID: 26, Num: 5, Len: 4, NotNull: true},
 		{Name: "ev_enabled", TypeOID: 18, Num: 6, Len: 1, NotNull: true},
 		{Name: "rulename", TypeOID: 19, Num: 7, Len: 64, NotNull: true},
+	}
+}
+
+
+// pgStatWalReceiverAttrs returns the 15 pg_attribute rows for the
+// `pg_catalog.pg_stat_wal_receiver` view (M0106-0010 Step 3dl). Column
+// order, names, and types are verbatim from
+// `postgres/src/backend/catalog/system_views.sql:945-963`, which
+// projects all 15 OUT-args of `pg_stat_get_wal_receiver()` (pg_proc OID
+// 3317, see Step 3dj/3dk). View columns inherit nullability from the
+// underlying expression so pg_attribute.attnotnull is false even for
+// fixed-width columns.
+//
+// Type OID legend (verbatim from `postgres/src/include/catalog/pg_proc.dat:5671`):
+//
+//	int4 = 23, text = 25, pg_lsn = 3220, timestamptz = 1184
+func pgStatWalReceiverAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "pid", TypeOID: 23, Num: 1, Len: 4},
+		{Name: "status", TypeOID: 25, Num: 2, Len: -1},
+		{Name: "receive_start_lsn", TypeOID: 3220, Num: 3, Len: 8},
+		{Name: "receive_start_tli", TypeOID: 23, Num: 4, Len: 4},
+		{Name: "written_lsn", TypeOID: 3220, Num: 5, Len: 8},
+		{Name: "flushed_lsn", TypeOID: 3220, Num: 6, Len: 8},
+		{Name: "received_tli", TypeOID: 23, Num: 7, Len: 4},
+		{Name: "last_msg_send_time", TypeOID: 1184, Num: 8, Len: 8},
+		{Name: "last_msg_receipt_time", TypeOID: 1184, Num: 9, Len: 8},
+		{Name: "latest_end_lsn", TypeOID: 3220, Num: 10, Len: 8},
+		{Name: "latest_end_time", TypeOID: 1184, Num: 11, Len: 8},
+		{Name: "slot_name", TypeOID: 25, Num: 12, Len: -1},
+		{Name: "sender_host", TypeOID: 25, Num: 13, Len: -1},
+		{Name: "sender_port", TypeOID: 23, Num: 14, Len: 4},
+		{Name: "conninfo", TypeOID: 25, Num: 15, Len: -1},
 	}
 }
 

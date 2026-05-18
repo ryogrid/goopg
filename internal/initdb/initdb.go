@@ -3395,6 +3395,18 @@ func pgClassRow(rel nailedRel) executor.Row {
 	} else if rel.RelKind == 'i' {
 		relAm = 403
 	}
+	// M0106-0010 Step 3dl: views have no physical storage. PG's
+	// `RELKIND_HAS_STORAGE` macro (pg_class.h:200) explicitly excludes
+	// RELKIND_VIEW ('v'); pg_class.relfilenode is therefore 0 and relam
+	// is 0 (no table access method). pg_class.relhasrules is true so
+	// that PG's relcache fetches the view's ON-SELECT rewrite rule from
+	// pg_rewrite when the view is opened.
+	relFilenode := int64(rel.OID)
+	relHasRules := false
+	if rel.RelKind == 'v' {
+		relFilenode = 0
+		relHasRules = true
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(rel.OID)),      // 0: oid
 		executor.NewStringDatum(rel.RelName),      // 4: relname
@@ -3403,7 +3415,7 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewIntDatum(0),                   // 76: reloftype
 		executor.NewIntDatum(10),                  // 80: relowner
 		executor.NewIntDatum(relAm),               // 84: relam
-		executor.NewIntDatum(int64(rel.OID)),      // 88: relfilenode
+		executor.NewIntDatum(relFilenode),         // 88: relfilenode
 		// M0106-0010 Step 3cr: shared catalogs must store reltablespace
 		// = GLOBALTABLESPACE_OID (1664). PG's RelationInitPhysicalAddr
 		// (postgres/src/backend/utils/cache/relcache.c:1347-1354)
@@ -3430,7 +3442,7 @@ func pgClassRow(rel nailedRel) executor.Row {
 		executor.NewStringDatum(string(rune(rel.RelKind))), // 119: relkind
 		executor.NewIntDatum(int64(rel.RelNatts)), // 120: relnatts
 		executor.NewIntDatum(0),                   // 122: relchecks
-		executor.NewBoolDatum(false),              // 124: relhasrules
+		executor.NewBoolDatum(relHasRules),        // 124: relhasrules
 		executor.NewBoolDatum(false),              // 125: relhastriggers
 		executor.NewBoolDatum(false),              // 126: relhassubclass
 		executor.NewBoolDatum(false),              // 127: relrowsecurity

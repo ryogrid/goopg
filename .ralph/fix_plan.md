@@ -9370,16 +9370,67 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `TestSystemCatalogRelfilesAreValidHeapPages`) — confirmed
         identical via `git stash` round-trip; no new regressions.
       - Design: `docs/design/0106-0010-step3dk-pg-proc-3317-out-args-arrays.md`.
-      - Next blocker (Step 3dl): seed the view side — `pg_class` row
-        (relkind='v', goopg-stable OID), 15 `pg_attribute` rows
-        matching `system_views.sql:945-963`, and a `pg_rewrite` row
-        carrying the parser-output query tree for `SELECT … FROM
-        pg_stat_get_wal_receiver() s WHERE s.pid IS NOT NULL`. With
-        Step 3dk's OUT-args metadata in place, the view's column
-        list will resolve through `build_function_result_tupdesc_d()`
-        — once 3dl lands, the E2E test's
-        `SELECT status FROM pg_catalog.pg_stat_wal_receiver` probe
-        should advance past the `42P01` error.
+      - Step 3dl LANDED 2026-05-18 (partial scope — pg_class + pg_attribute
+        only; pg_rewrite ev_action deferred to Step 3dm). First
+        relkind='v' (view) entry seeded into the bootstrap
+        pg_class/pg_attribute heaps. Two layers cooperate:
+        (a) `pgClassRow` (`internal/initdb/initdb.go`) learns a
+            `RelKind == 'v'` branch: relam=0, relfilenode=0,
+            relhasrules=true. Views have no storage per
+            `RELKIND_HAS_STORAGE` macro (pg_class.h:200);
+            relhasrules=true makes PG's relcache fetch the
+            ON-SELECT rewrite rule from pg_rewrite when the view is
+            opened. Existing relkind='r' / 'i' branches preserve
+            their prior byte layout exactly.
+        (b) New `pgStatWalReceiverAttrs()` (`internal/initdb/relcache_init.go`)
+            returns the 15 columns verbatim from `system_views.sql:945-963`
+            with type OIDs from `pg_proc.dat:5671` (int4=23, text=25,
+            pg_lsn=3220, timestamptz=1184). `attnotnull=false` on every
+            column because view columns inherit nullability from the
+            underlying expression.
+        One new entry appended to `nailedLocalRels`:
+          `{12100, "pg_stat_wal_receiver", 2249, 'v', 15, false, pgStatWalReceiverAttrs()}`.
+        OID 12100 is a goopg-private stable assignment in PG18's
+        `FirstUnpinnedObjectId..FirstNormalObjectId` range
+        (12000..16383); PG assigns system_views.sql view OIDs
+        dynamically so there is no upstream-canonical OID to mirror.
+        RelType=2249 (RECORDOID) matches the underlying function's
+        prorettype so any code path that follows pg_class.reltype gets a
+        valid composite-type pointer.
+      - Regression pins: 2 new tests in `pg_stat_wal_receiver_nailed_test.go` —
+        `TestNailedLocalRelsContainsPgStatWalReceiver` (OID 12100, relkind='v',
+        reltype=2249, relnatts=15, IsShared=false, and per-attr
+        (Name, TypeOID, Len, Num)+NotNull==false for all 15 columns;
+        column order matches system_views.sql:945-963 byte-for-byte);
+        `TestPgClassRowForViewSetsZeroRelfilenode` (the three
+        view-specific overrides on a synthetic relkind='v' nailedRel).
+      - Verified: `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgStatWalReceiver|TestPgClassRowForViewSetsZeroRelfilenode'
+        ./internal/initdb/` PASS;
+        `go test -count=1 -run
+        'TestPgProc|TestBootstrapPgProc|TestPgIndex|TestBootstrapPgIndex|TestPgClassOidIndex|TestNailedLocalRels|TestPgClassRowForView|TestPgStatWalReceiver|TestNailedIndexRelnatts|TestMakeBtreeRootPage|TestOidArrayBytes|TestCharArrayBytes|TestTextArrayBytes'
+        ./internal/initdb/` PASS;
+        `go test -count=1 ./internal/executor/ ./internal/server/
+        ./internal/storage/ ./internal/catalog/ ./internal/mvcc/` PASS.
+        Pre-existing 15 baseline failures unchanged via `git stash`
+        round-trip — no new regressions.
+      - Design: `docs/design/0106-0010-step3dl-pg-stat-wal-receiver-view-pg-class.md`.
+      - Next blocker (Step 3dm): seed the `pg_rewrite` row carrying the
+        `ev_action` `pg_node_tree` for `SELECT … FROM
+        pg_stat_get_wal_receiver() s WHERE s.pid IS NOT NULL`.
+        Generating a canonical `nodeToString` serialization of the
+        rewrite Query tree (RTEs, targetlist, qual) is itself a
+        multi-step problem; without the rule, PG's rewriter will fail
+        with `rule "_RETURN" for view ... does not exist` or silently
+        return zero rows. Approach options: (i) extract the bytes from
+        a running PG instance via `SELECT ev_action FROM pg_rewrite
+        WHERE ev_class = 'pg_stat_wal_receiver'::regclass` (need to
+        rewrite the ev_class OID reference to 12100), (ii) hand-build
+        the nodeToString string from the upstream `pg_node_tree`
+        grammar in `src/backend/nodes/outfuncs.c`. After Step 3dm
+        lands, the E2E test's `SELECT status FROM
+        pg_catalog.pg_stat_wal_receiver` probe should advance past the
+        `42P01` error.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
