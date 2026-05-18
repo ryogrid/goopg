@@ -1323,12 +1323,25 @@ func int2VectorBytes(values []int16) []byte {
 // pgProcEntry is a minimal description of a pg_proc row produced
 // during initdb. v0 only needs to seed the AM handler functions so
 // PG's RelationInitIndexAccessInfo can resolve amhandler via fmgr.
+//
+// M0106-0010 Step 3dj extends the shape with two switches —
+// `RetSet` and `NotStrict` — so a single SRF entry (OID 3317,
+// pg_stat_get_wal_receiver) can opt into proretset=true and
+// proisstrict=false without disturbing the AM-handler / type-IO
+// rows pinned by TestPgProcRowBtreeHandlerMatchesFormPgProc et al.
+// The CATALOG_VARLEN array columns (proallargtypes, proargmodes,
+// proargnames) remain empty here; populating them is Step 3dk
+// (view-side seeding) work because the view rewrite rule must
+// resolve `s.<col>` references through proargnames anyway.
 type pgProcEntry struct {
 	OID         uint32
 	Name        string // proname (NameData, ≤63 bytes)
 	RetType     uint32 // prorettype OID
 	ArgTypes    []uint32 // proargtypes vector. nil/empty → defaults to [2281] (internal)
 	Volatile    byte   // provolatile char. 0 → defaults to 'v' (volatile)
+	Parallel    byte   // proparallel char. 0 → defaults to 's' (safe)
+	RetSet      bool   // proretset. defaults to false
+	NotStrict   bool   // proisstrict inverse. defaults to strict (true)
 	HandlerName string // prosrc text (e.g. "bthandler") — fmgr internal lookup key
 }
 
@@ -1394,14 +1407,14 @@ func pgProcInitialEntries() []pgProcEntry {
 	)
 	return []pgProcEntry{
 		// Table AM handler.
-		{3, "heap_tableam_handler", 269, nil, 0, "heap_tableam_handler"},
+		{OID: 3, Name: "heap_tableam_handler", RetType: 269, HandlerName: "heap_tableam_handler"},
 		// Index AM handlers.
-		{330, "bthandler", 325, nil, 0, "bthandler"},
-		{331, "hashhandler", 325, nil, 0, "hashhandler"},
-		{332, "gisthandler", 325, nil, 0, "gisthandler"},
-		{333, "ginhandler", 325, nil, 0, "ginhandler"},
-		{334, "spghandler", 325, nil, 0, "spghandler"},
-		{335, "brinhandler", 325, nil, 0, "brinhandler"},
+		{OID: 330, Name: "bthandler", RetType: 325, HandlerName: "bthandler"},
+		{OID: 331, Name: "hashhandler", RetType: 325, HandlerName: "hashhandler"},
+		{OID: 332, Name: "gisthandler", RetType: 325, HandlerName: "gisthandler"},
+		{OID: 333, Name: "ginhandler", RetType: 325, HandlerName: "ginhandler"},
+		{OID: 334, Name: "spghandler", RetType: 325, HandlerName: "spghandler"},
+		{OID: 335, Name: "brinhandler", RetType: 325, HandlerName: "brinhandler"},
 
 		// Type I/O regprocs sourced verbatim from
 		// postgres/src/include/catalog/pg_proc.dat. M0106-0010 Step
@@ -1411,36 +1424,62 @@ func pgProcInitialEntries() []pgProcEntry {
 		// the lone surviving SIGSEGV after Step 3db came from this
 		// NULL tuple.
 		// int4 quad (all 'v').
-		{42, "int4in", oidInt4, []uint32{oidCString}, 'v', "int4in"},
-		{43, "int4out", oidCString, []uint32{oidInt4}, 'v', "int4out"},
-		{2406, "int4recv", oidInt4, []uint32{oidInternal}, 'v', "int4recv"},
-		{2407, "int4send", oidBytea, []uint32{oidInt4}, 'v', "int4send"},
+		{OID: 42, Name: "int4in", RetType: oidInt4, ArgTypes: []uint32{oidCString}, Volatile: 'v', HandlerName: "int4in"},
+		{OID: 43, Name: "int4out", RetType: oidCString, ArgTypes: []uint32{oidInt4}, Volatile: 'v', HandlerName: "int4out"},
+		{OID: 2406, Name: "int4recv", RetType: oidInt4, ArgTypes: []uint32{oidInternal}, Volatile: 'v', HandlerName: "int4recv"},
+		{OID: 2407, Name: "int4send", RetType: oidBytea, ArgTypes: []uint32{oidInt4}, Volatile: 'v', HandlerName: "int4send"},
 		// text quad (recv/send 's' stable upstream).
-		{46, "textin", oidText, []uint32{oidCString}, 'v', "textin"},
-		{47, "textout", oidCString, []uint32{oidText}, 'v', "textout"},
-		{2414, "textrecv", oidText, []uint32{oidInternal}, 's', "textrecv"},
-		{2415, "textsend", oidBytea, []uint32{oidText}, 's', "textsend"},
+		{OID: 46, Name: "textin", RetType: oidText, ArgTypes: []uint32{oidCString}, Volatile: 'v', HandlerName: "textin"},
+		{OID: 47, Name: "textout", RetType: oidCString, ArgTypes: []uint32{oidText}, Volatile: 'v', HandlerName: "textout"},
+		{OID: 2414, Name: "textrecv", RetType: oidText, ArgTypes: []uint32{oidInternal}, Volatile: 's', HandlerName: "textrecv"},
+		{OID: 2415, Name: "textsend", RetType: oidBytea, ArgTypes: []uint32{oidText}, Volatile: 's', HandlerName: "textsend"},
 		// name quad (recv/send 's' stable upstream).
-		{34, "namein", oidName, []uint32{oidCString}, 'v', "namein"},
-		{35, "nameout", oidCString, []uint32{oidName}, 'v', "nameout"},
-		{2422, "namerecv", oidName, []uint32{oidInternal}, 's', "namerecv"},
-		{2423, "namesend", oidBytea, []uint32{oidName}, 's', "namesend"},
+		{OID: 34, Name: "namein", RetType: oidName, ArgTypes: []uint32{oidCString}, Volatile: 'v', HandlerName: "namein"},
+		{OID: 35, Name: "nameout", RetType: oidCString, ArgTypes: []uint32{oidName}, Volatile: 'v', HandlerName: "nameout"},
+		{OID: 2422, Name: "namerecv", RetType: oidName, ArgTypes: []uint32{oidInternal}, Volatile: 's', HandlerName: "namerecv"},
+		{OID: 2423, Name: "namesend", RetType: oidBytea, ArgTypes: []uint32{oidName}, Volatile: 's', HandlerName: "namesend"},
 		// oid quad (all 'v').
-		{1798, "oidin", oidOID, []uint32{oidCString}, 'v', "oidin"},
-		{1799, "oidout", oidCString, []uint32{oidOID}, 'v', "oidout"},
-		{2418, "oidrecv", oidOID, []uint32{oidInternal}, 'v', "oidrecv"},
-		{2419, "oidsend", oidBytea, []uint32{oidOID}, 'v', "oidsend"},
+		{OID: 1798, Name: "oidin", RetType: oidOID, ArgTypes: []uint32{oidCString}, Volatile: 'v', HandlerName: "oidin"},
+		{OID: 1799, Name: "oidout", RetType: oidCString, ArgTypes: []uint32{oidOID}, Volatile: 'v', HandlerName: "oidout"},
+		{OID: 2418, Name: "oidrecv", RetType: oidOID, ArgTypes: []uint32{oidInternal}, Volatile: 'v', HandlerName: "oidrecv"},
+		{OID: 2419, Name: "oidsend", RetType: oidBytea, ArgTypes: []uint32{oidOID}, Volatile: 'v', HandlerName: "oidsend"},
 		// bool quad (all 'v').
-		{1242, "boolin", oidBool, []uint32{oidCString}, 'v', "boolin"},
-		{1243, "boolout", oidCString, []uint32{oidBool}, 'v', "boolout"},
-		{2436, "boolrecv", oidBool, []uint32{oidInternal}, 'v', "boolrecv"},
-		{2437, "boolsend", oidBytea, []uint32{oidBool}, 'v', "boolsend"},
+		{OID: 1242, Name: "boolin", RetType: oidBool, ArgTypes: []uint32{oidCString}, Volatile: 'v', HandlerName: "boolin"},
+		{OID: 1243, Name: "boolout", RetType: oidCString, ArgTypes: []uint32{oidBool}, Volatile: 'v', HandlerName: "boolout"},
+		{OID: 2436, Name: "boolrecv", RetType: oidBool, ArgTypes: []uint32{oidInternal}, Volatile: 'v', HandlerName: "boolrecv"},
+		{OID: 2437, Name: "boolsend", RetType: oidBytea, ArgTypes: []uint32{oidBool}, Volatile: 'v', HandlerName: "boolsend"},
 		// Generic array I/O quad ('s' stable; array_in / array_recv
 		// take three args — value/elem-OID/typmod).
-		{750, "array_in", oidAnyArray, []uint32{oidCString, oidOID, oidInt4}, 's', "array_in"},
-		{751, "array_out", oidCString, []uint32{oidAnyArray}, 's', "array_out"},
-		{2400, "array_recv", oidAnyArray, []uint32{oidInternal, oidOID, oidInt4}, 's', "array_recv"},
-		{2401, "array_send", oidBytea, []uint32{oidAnyArray}, 's', "array_send"},
+		{OID: 750, Name: "array_in", RetType: oidAnyArray, ArgTypes: []uint32{oidCString, oidOID, oidInt4}, Volatile: 's', HandlerName: "array_in"},
+		{OID: 751, Name: "array_out", RetType: oidCString, ArgTypes: []uint32{oidAnyArray}, Volatile: 's', HandlerName: "array_out"},
+		{OID: 2400, Name: "array_recv", RetType: oidAnyArray, ArgTypes: []uint32{oidInternal, oidOID, oidInt4}, Volatile: 's', HandlerName: "array_recv"},
+		{OID: 2401, Name: "array_send", RetType: oidBytea, ArgTypes: []uint32{oidAnyArray}, Volatile: 's', HandlerName: "array_send"},
+
+		// M0106-0010 Step 3dj: pg_stat_get_wal_receiver (OID 3317).
+		// Set-returning C function sourced from
+		// postgres/src/include/catalog/pg_proc.dat. proretset=true,
+		// proisstrict=false, provolatile='s', proparallel='r'.
+		// prorettype = RECORD (2249). proargtypes is empty (zero
+		// input args); the 15 OUT-arg columns live in proallargtypes/
+		// proargmodes/proargnames and remain emptyArrayTypeBytes()
+		// shells until Step 3dk populates them as part of the
+		// pg_stat_wal_receiver view + rewrite-rule seed. Seeding the
+		// pg_proc row in isolation is harmless: PG's syscache will
+		// resolve OID 3317 by HandlerName for any code path that
+		// dereferences prosrc directly, and the OUT-arg-dependent
+		// view-resolution path is not reached until the view itself
+		// is on disk.
+		{
+			OID:         3317,
+			Name:        "pg_stat_get_wal_receiver",
+			RetType:     2249, // RECORDOID
+			ArgTypes:    []uint32{},
+			Volatile:    's',
+			Parallel:    'r',
+			RetSet:      true,
+			NotStrict:   true,
+			HandlerName: "pg_stat_get_wal_receiver",
+		},
 	}
 }
 
@@ -1450,13 +1489,22 @@ func pgProcInitialEntries() []pgProcEntry {
 // These defaults preserve the bthandler-style AM-handler row shape
 // pinned by TestPgProcRowBtreeHandlerMatchesFormPgProc.
 func pgProcRow(e pgProcEntry) executor.Row {
+	// nil ArgTypes preserves the legacy AM-handler default (one
+	// `internal` argument, OID 2281). An explicitly empty non-nil
+	// slice (e.g. `[]uint32{}`) is the unambiguous spelling for a
+	// zero-argument function — required by Step 3dj's
+	// pg_stat_get_wal_receiver entry (proargtypes => '' upstream).
 	argTypes := e.ArgTypes
-	if len(argTypes) == 0 {
+	if argTypes == nil {
 		argTypes = []uint32{2281}
 	}
 	vol := e.Volatile
 	if vol == 0 {
 		vol = 'v'
+	}
+	parallel := e.Parallel
+	if parallel == 0 {
+		parallel = 's'
 	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)),               // 1  oid
@@ -1471,10 +1519,10 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NewStringDatum("f"),                     // 10 prokind = 'f' (function)
 		executor.NewBoolDatum(false),                     // 11 prosecdef
 		executor.NewBoolDatum(false),                     // 12 proleakproof
-		executor.NewBoolDatum(true),                      // 13 proisstrict
-		executor.NewBoolDatum(false),                     // 14 proretset
+		executor.NewBoolDatum(!e.NotStrict),              // 13 proisstrict
+		executor.NewBoolDatum(e.RetSet),                  // 14 proretset
 		executor.NewStringDatum(string(vol)),             // 15 provolatile
-		executor.NewStringDatum("s"),                     // 16 proparallel = 's' (safe)
+		executor.NewStringDatum(string(parallel)),        // 16 proparallel
 		executor.NewIntDatum(int64(len(argTypes))),       // 17 pronargs
 		executor.NewIntDatum(0),                          // 18 pronargdefaults
 		executor.NewIntDatum(int64(e.RetType)),           // 19 prorettype

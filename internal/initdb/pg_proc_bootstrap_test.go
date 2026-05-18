@@ -109,8 +109,9 @@ func TestPgProcRowBtreeHandlerMatchesFormPgProc(t *testing.T) {
 // (335). The mapping mirrors pgAmInitialEntries.
 func TestPgProcInitialEntriesCoverAMHandlers(t *testing.T) {
 	entries := pgProcInitialEntries()
-	// 7 AM handlers + 24 type I/O regprocs (M0106-0010 Step 3dc(1)).
-	if got, want := len(entries), 31; got != want {
+	// 7 AM handlers + 24 type I/O regprocs (Step 3dc(1)) + 1 SRF
+	// (pg_stat_get_wal_receiver, Step 3dj) = 32.
+	if got, want := len(entries), 32; got != want {
 		t.Fatalf("pgProcInitialEntries len: got %d, want %d", got, want)
 	}
 	byOID := make(map[uint32]pgProcEntry, len(entries))
@@ -252,6 +253,97 @@ func TestBootstrapPgProcTuplesWritesRowsToBase1And5(t *testing.T) {
 		if !bytes.Contains(raw, needle) {
 			t.Fatalf("%s: bthandler proname not found in pages", path)
 		}
+	}
+}
+
+// TestPgProcRowStatGetWalReceiverIsSRF (M0106-0010 Step 3dj) pins the
+// PG18-canonical FormData_pg_proc byte layout for the
+// pg_stat_get_wal_receiver SRF row (OID 3317).  The four switches
+// distinguishing this entry from the AM-handler / type-IO rows —
+// proisstrict=false, proretset=true, provolatile='s', proparallel='r'
+// — were sourced verbatim from
+// `postgres/src/include/catalog/pg_proc.dat:5668`.
+// proargtypes must be an empty oidvector (zero input args); the OUT
+// args metadata (proallargtypes / proargmodes / proargnames) is the
+// next-step (3dk) work and is intentionally left as empty
+// ArrayType shells here.
+func TestPgProcRowStatGetWalReceiverIsSRF(t *testing.T) {
+	cols := pgProcColDefs()
+	var got pgProcEntry
+	for _, e := range pgProcInitialEntries() {
+		if e.OID == 3317 {
+			got = e
+			break
+		}
+	}
+	if got.OID != 3317 {
+		t.Fatalf("pgProcInitialEntries: OID 3317 (pg_stat_get_wal_receiver) missing")
+	}
+	if got.Name != "pg_stat_get_wal_receiver" || got.HandlerName != "pg_stat_get_wal_receiver" {
+		t.Errorf("name=%q handler=%q, want both %q", got.Name, got.HandlerName, "pg_stat_get_wal_receiver")
+	}
+	if got.RetType != 2249 { // RECORDOID
+		t.Errorf("rettype=%d, want 2249 (record)", got.RetType)
+	}
+	if got.ArgTypes == nil || len(got.ArgTypes) != 0 {
+		t.Errorf("argtypes=%v, want non-nil empty slice (zero-arg SRF)", got.ArgTypes)
+	}
+	if got.Volatile != 's' {
+		t.Errorf("volatile=%q, want 's' (stable)", got.Volatile)
+	}
+	if got.Parallel != 'r' {
+		t.Errorf("parallel=%q, want 'r' (restricted)", got.Parallel)
+	}
+	if !got.RetSet {
+		t.Errorf("retset=%v, want true", got.RetSet)
+	}
+	if !got.NotStrict {
+		t.Errorf("notstrict=%v, want true (proisstrict=false)", got.NotStrict)
+	}
+
+	row := pgProcRow(got)
+	payload, err := executor.EncodeRowPG(cols, row)
+	if err != nil {
+		t.Fatalf("EncodeRowPG: %v", err)
+	}
+	le := binary.LittleEndian
+	if oid := le.Uint32(payload[0:4]); oid != 3317 {
+		t.Fatalf("oid: got %d, want 3317", oid)
+	}
+	want := make([]byte, 64)
+	copy(want, []byte("pg_stat_get_wal_receiver"))
+	if !bytes.Equal(payload[4:68], want) {
+		t.Fatalf("proname: got % x, want NUL-padded 'pg_stat_get_wal_receiver'", payload[4:68])
+	}
+	// proisstrict is the bool at offset 99, proretset at 100,
+	// provolatile (char) at 101, proparallel at 102.
+	if payload[99] != 0 {
+		t.Errorf("proisstrict: got %d, want 0 (false)", payload[99])
+	}
+	if payload[100] != 1 {
+		t.Errorf("proretset: got %d, want 1 (true)", payload[100])
+	}
+	if payload[101] != 's' {
+		t.Errorf("provolatile: got %q, want 's'", payload[101])
+	}
+	if payload[102] != 'r' {
+		t.Errorf("proparallel: got %q, want 'r'", payload[102])
+	}
+	// pronargs is int2 at offset 104.
+	if nargs := int16(le.Uint16(payload[104:106])); nargs != 0 {
+		t.Errorf("pronargs: got %d, want 0", nargs)
+	}
+	// prorettype is oid at offset 108.
+	if rettype := le.Uint32(payload[108:112]); rettype != 2249 {
+		t.Errorf("prorettype: got %d, want 2249 (record)", rettype)
+	}
+	// proargtypes is empty oidvector at offset 112 — 24-byte header,
+	// header value (24<<2) = 96.
+	if vh := le.Uint32(payload[112:116]); vh != 24<<2 {
+		t.Errorf("proargtypes varlena header: got %#x, want %#x (empty oidvector)", vh, 24<<2)
+	}
+	if dim1 := le.Uint32(payload[128:132]); dim1 != 0 {
+		t.Errorf("proargtypes dim1: got %d, want 0 (zero-arg SRF)", dim1)
 	}
 }
 

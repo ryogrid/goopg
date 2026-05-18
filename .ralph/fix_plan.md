@@ -9272,6 +9272,81 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         s WHERE s.pid IS NOT NULL`. Re-run E2E afterwards; plausible
         next candidates surfaced by that re-run: `pg_stat_replication`
         (similar shape), `pg_replication_slots`, `pg_stat_activity`.
+      - Step 3dj LANDED 2026-05-18 (foundation seed; E2E unblock
+        carries through Step 3dk's view-side seed). Adds the
+        pg_stat_get_wal_receiver (OID 3317) pg_proc heap row to
+        `pgProcInitialEntries()` in `internal/initdb/initdb.go` so PG's
+        `SearchSysCache1(PROCOID, 3317)` returns a non-NULL tuple. The
+        five non-default scalar fields — proretset=true,
+        proisstrict=false, provolatile='s', proparallel='r',
+        prorettype=2249 (RECORDOID), proargtypes=empty oidvector —
+        match `postgres/src/include/catalog/pg_proc.dat:5668-5675`
+        verbatim.
+      - `pgProcEntry` gains four new fields (`Parallel`, `RetSet`,
+        `NotStrict`, plus a `nil` vs explicit `[]uint32{}` distinction
+        for the zero-argument case) and `pgProcRow` reads them. All 31
+        legacy entries (7 AM handlers + 24 type-IO regprocs) are
+        converted from positional to keyed struct literals so the
+        addition does not require touching each row. Defaults preserve
+        the pre-change byte layout: `TestPgProcRowBtreeHandlerMatchesFormPgProc`
+        continues to pass unmodified.
+      - `bootstrapPgProcOidIndex` already iterates over
+        `pgProcInitialEntries()`, so OID 3317 gets a populated leaf
+        slot at `pg_proc_oid_index` (OID 2690) automatically — no
+        index-side change needed.
+      - The CATALOG_VARLEN OUT-arg columns (`proallargtypes`,
+        `proargmodes`, `proargnames`) remain `emptyArrayTypeBytes`
+        shells. Populating them requires new array encoders for
+        `oid[]`, `char[]`, `text[]` and ties into Step 3dk's view
+        seeding because PG's view-rewrite path consults proargnames
+        to resolve `s.pid` etc. through
+        `build_function_result_tupdesc_d()`. Until 3dk lands the
+        `pg_class`/`pg_attribute`/`pg_rewrite` rows, the E2E test
+        still surfaces `42P01: relation pg_stat_wal_receiver does not
+        exist` at the same place.
+      - Regression pins (`internal/initdb/pg_proc_bootstrap_test.go`):
+        new `TestPgProcRowStatGetWalReceiverIsSRF` pins the OID 3317
+        heap-tuple byte layout (proisstrict@99=0, proretset@100=1,
+        provolatile@101='s', proparallel@102='r', pronargs@104=0,
+        prorettype@108=2249, empty oidvector header @112=24<<2 with
+        dim1@128=0). `TestPgProcInitialEntriesCoverAMHandlers` length
+        pin bumped 31 → 32.
+      - Targeted tests PASS (`go test -count=1 -run
+        'TestPgProcRow|TestPgProcInitial|TestPgProcAttrs|TestPgProcOid|TestBootstrapPgProc'
+        ./internal/initdb/`). `go build ./...` clean. Cross-package
+        smoke `./internal/executor/ ./internal/wal/ ./internal/mvcc/
+        ./internal/server/ ./internal/config/` shows two failures
+        (TestCheckpointerWritesCheckpointMarkers,
+        TestEncodeRecordXLogClassifiesXactCommitXID) that are
+        pre-existing baseline failures at HEAD (a0afdb2, verified
+        via `git stash` round-trip) — no new regressions. Full
+        `./internal/initdb/` shows the same M0106-0012 baseline
+        failures present since Step 3r/3s. `make ralph-state-guard`
+        PASS. Design:
+        `docs/design/0106-0010-step3dj-pg-proc-stat-get-wal-receiver.md`.
+      - Next blocker (Step 3dk): seed the view side. Requires
+        (a) `pg_class` row for `pg_stat_wal_receiver` (relkind='v',
+        pick a goopg-stable OID — upstream allocates this dynamically
+        from system_views.sql so there is no canonical OID),
+        (b) 15 `pg_attribute` rows for the SELECT-list columns
+        (pid int4, status text, receive_start_lsn pg_lsn,
+        receive_start_tli int4, written_lsn pg_lsn,
+        flushed_lsn pg_lsn, received_tli int4,
+        last_msg_send_time timestamptz,
+        last_msg_receipt_time timestamptz, latest_end_lsn pg_lsn,
+        latest_end_time timestamptz, slot_name text, sender_host text,
+        sender_port int4, conninfo text),
+        (c) a `pg_rewrite` row carrying the parser-output query tree
+        for the defining `SELECT … FROM pg_stat_get_wal_receiver() s
+        WHERE s.pid IS NOT NULL`,
+        (d) populated `proallargtypes`/`proargmodes`/`proargnames`
+        arrays on the OID 3317 pg_proc row so PG's
+        `build_function_result_tupdesc_d` can resolve `s.<col>` —
+        this is the work that needs new `oid[]`, `char[]`, `text[]`
+        encoders modelled on `oidVectorBytes` and the existing
+        `emptyArrayTypeBytes` path. The view shape (15 cols, not 16
+        as Step 3di's working note guessed) was confirmed against
+        `postgres/src/backend/catalog/system_views.sql:945-963`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
