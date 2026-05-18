@@ -281,6 +281,18 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// oidvector — all BKI_FORCE_NOT_NULL) + 1 CATALOG_VARLEN nullable
 	// (partexprs pg_node_tree).
 	{3350, "pg_partitioned_table", 83, 'r', 8, false, pgPartitionedTableAttrs()},
+	// M0106-0010 step 3bu: pg_publication is opened during PG-standby boot
+	// once Step 3bt cleared `pg_partitioned_table_partrelid_index`. Without
+	// a pg_class row, `RelationBuildDesc(6104) → ScanPgRelation(6104)`
+	// returns NULL and the backend FATALs with `could not open relation
+	// with OID 6104`. RelType=83 is safe because pg_publication is not
+	// formrdesc'd (no `PublicationRelation_Rowtype_Id` constant in
+	// PG18 headers). Schema per
+	// `postgres/src/include/catalog/pg_publication.h` (PG18,
+	// PublicationRelationId == 6104). 10 columns, all fixed-width NOT NULL
+	// (oid, pubname, pubowner, puballtables, pubinsert, pubupdate,
+	// pubdelete, pubtruncate, pubviaroot, pubgencols).
+	{6104, "pg_publication", 83, 'r', 10, false, pgPublicationAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1416,6 +1428,30 @@ func pgPartitionedTableAttrs() []nailedAttr {
 		{Name: "partclass", TypeOID: 30, Num: 6, Len: -1, NotNull: true},     // oidvector → pg_opclass BKI_FORCE_NOT_NULL
 		{Name: "partcollation", TypeOID: 30, Num: 7, Len: -1, NotNull: true}, // oidvector → pg_collation BKI_FORCE_NOT_NULL
 		{Name: "partexprs", TypeOID: 194, Num: 8, Len: -1, NotNull: false},   // pg_node_tree (CATALOG_VARLEN, nullable)
+	}
+}
+
+
+// pgPublicationAttrs defines the 10-column PG18 pg_publication schema.
+// PG `RelationBuildDesc(6104) → ScanPgRelation(6104)` looks up the
+// `Form_pg_class` row first; without a nailedLocalRels entry no row
+// gets seeded and PG FATALs with `could not open relation with OID
+// 6104`. Sourced verbatim from `postgres/src/include/catalog/pg_publication.h`
+// (PG18, PublicationRelationId == 6104). M0106-0010 step 3bu.
+// All ten columns are fixed-width and NOT NULL; the heap is currently
+// empty (no publications are created at initdb time).
+func pgPublicationAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},           // oid
+		{Name: "pubname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},      // name
+		{Name: "pubowner", TypeOID: 26, Num: 3, Len: 4, NotNull: true},      // oid → pg_authid
+		{Name: "puballtables", TypeOID: 16, Num: 4, Len: 1, NotNull: true},  // bool
+		{Name: "pubinsert", TypeOID: 16, Num: 5, Len: 1, NotNull: true},     // bool
+		{Name: "pubupdate", TypeOID: 16, Num: 6, Len: 1, NotNull: true},     // bool
+		{Name: "pubdelete", TypeOID: 16, Num: 7, Len: 1, NotNull: true},     // bool
+		{Name: "pubtruncate", TypeOID: 16, Num: 8, Len: 1, NotNull: true},   // bool
+		{Name: "pubviaroot", TypeOID: 16, Num: 9, Len: 1, NotNull: true},    // bool
+		{Name: "pubgencols", TypeOID: 18, Num: 10, Len: 1, NotNull: true},   // char
 	}
 }
 

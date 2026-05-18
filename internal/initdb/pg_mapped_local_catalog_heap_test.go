@@ -49,7 +49,9 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 		3466, // pg_event_trigger (M0106-0010 step 3ar)
 		3501, // pg_enum (M0106-0010 step 3an)
 		3596,
-		3764, 3765, 3766, 3767, 3768, 6003, 6101, 6102, 6137,
+		3764, 3765, 3766, 3767, 3768,
+		6104, // pg_publication (M0106-0010 step 3bu)
+		6003, 6101, 6102, 6137,
 		6245, 9400,
 	}
 

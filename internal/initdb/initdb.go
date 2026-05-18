@@ -455,7 +455,8 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		3118, // pg_foreign_table (M0106-0010 step 3bh)
 		2753, // pg_opfamily (M0106-0010 step 3bm)
 		3350, // pg_partitioned_table (M0106-0010 step 3bs)
-		6003, // pg_publication
+		6104, // pg_publication (M0106-0010 step 3bu)
+		6003, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		6101, // pg_publication_rel
 		6102, // pg_sequence
 		6137, // pg_transform
@@ -790,7 +791,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{3118, 3118}, // pg_foreign_table (M0106-0010 step 3bh)
 		{2753, 2753}, // pg_opfamily (M0106-0010 step 3bm)
 		{3350, 3350}, // pg_partitioned_table (M0106-0010 step 3bs)
-		{6003, 6003}, // pg_publication
+		{6104, 6104}, // pg_publication (M0106-0010 step 3bu)
+		{6003, 6003}, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		{6101, 6101}, // pg_publication_rel
 		{6102, 6102}, // pg_sequence
 		{6137, 6137}, // pg_transform

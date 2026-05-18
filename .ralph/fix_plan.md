@@ -6671,6 +6671,50 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         declared index (3351 partrelid PKEY backing MAKE_SYSCACHE PARTRELID)
         are now seeded; the family is complete. Design:
         `docs/design/0106-0010-step3bt-pg-partitioned-table-partrelid-index.md`.
+      - Step 3bu LANDED 2026-05-18. Closes the `FATAL: could not open
+        relation with OID 6104` PG-standby boot blocker that surfaced
+        after Step 3bt seeded pg_partitioned_table_partrelid_index
+        (3351). OID 6104 is `pg_publication` per
+        `postgres/src/include/catalog/pg_publication.h:29`
+        (`CATALOG(pg_publication,6104,PublicationRelationId)`). Pure
+        catalog-seed addition mirroring the nailed-local-rel pattern of
+        Steps 3w/3aa/3ag/3ak/3an/3ar/3aw/3bb/3be/3bh/3bm/3bp/3bs; no
+        encoder/builder/Init flow change.
+        (a) `pgPublicationAttrs()` (relcache_init.go) returns the
+        10-column PG18 schema verbatim, all fixed-width NOT NULL:
+        oid(26/4), pubname(19/64 name), pubowner(26/4 → pg_authid),
+        puballtables/pubinsert/pubupdate/pubdelete/pubtruncate/
+        pubviaroot(16/1 bool), pubgencols(18/1 char). `nailedLocalRels`
+        gains `{6104, "pg_publication", 83, 'r', 10, false,
+        pgPublicationAttrs()}` after the Step 3bs
+        pg_partitioned_table entry. RelType=83 is safe — pg_publication
+        has no `PublicationRelation_Rowtype_Id` in PG18 headers, so
+        Step 3v's tdtypeid assertion does not fire.
+        (b) `bootstrapMappedLocalCatalogHeaps` (initdb.go) OID list
+        gains `6104, // pg_publication (M0106-0010 step 3bu)` after
+        the Step 3bs 3350 entry. The pre-existing `6003 // pg_publication`
+        entry is retained (stale comment — no upstream catalog uses
+        OID 6003 — but the placeholder file does no harm). `localRelMap`
+        gains `{6104, 6104}` analogously.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgPublication` (full per-column
+        audit) and `TestBootstrapMappedLocalCatalogHeapsIncludesPgPublication`
+        (asserts `base/{1,5}/6104` exists, 8 KiB, InitPage-stamped) in
+        `internal/initdb/pg_publication_nailed_test.go`; existing
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        extended with 6104 (strict list guard).
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgPublication|TestBootstrapMappedLocalCatalogHeapsIncludesPgPublication|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedLocalRelsContainsPgPartitionedTable|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexInitialEntriesIndkeyMatchesPG18'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bt (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. E2E re-run with
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        advances past OID 6104 and surfaces the next anticipated
+        blocker `FATAL: could not open relation with OID 6111`
+        (pg_publication_pubname_index — Step 3bv territory). Design:
+        `docs/design/0106-0010-step3bu-pg-publication-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
