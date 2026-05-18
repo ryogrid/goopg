@@ -6223,6 +6223,67 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/mvcc/` PASS.
         Design:
         `docs/design/0106-0010-step3bm-pg-opfamily-nailed-rel.md`.
+      - Step 3bn LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2754` PG-standby boot blocker
+        confirmed by `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        TestE2E_FailoverGoopgToPG/async` after Step 3bm seeded
+        `pg_opfamily` (heap OID 2753). OID 2754 is
+        `pg_opfamily_am_name_nsp_index` per
+        `postgres/src/include/catalog/pg_opfamily.h:47`
+        (`DECLARE_UNIQUE_INDEX(pg_opfamily_am_name_nsp_index, 2754,
+        OpfamilyAmNameNspIndexId, pg_opfamily, btree(opfmethod oid_ops,
+        opfname name_ops, opfnamespace oid_ops))`). Backs
+        `MAKE_SYSCACHE(OPFAMILYAMNAMENSP, pg_opfamily_am_name_nsp_index, 8)`.
+        Pure catalog-seed addition mirroring the composite UNIQUE
+        non-PKEY (oid_ops, name_ops, oid_ops) pattern of Step 3ad
+        (`pg_opclass_am_name_nsp_index` 2686), Step 3aj
+        (`pg_conversion_name_nsp_index` 2669), and Step 3ae
+        (`pg_collation_name_enc_nsp_index` 3164); no encoder/builder/
+        Init flow change. UNIQUE but NOT primary — pg_opfamily's PKEY
+        is OID 2755 (deferred to Step 3bo).
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` gains
+        `entry(2754, 2753, []int16{2,3,4},
+        []uint32{oidOps,nameOps,oidOps},
+        []uint32{0,cCollation,0}, true, false)` after the Step 3bl
+        2689 entry. pg_opfamily attnums: 1=oid, 2=opfmethod, 3=opfname,
+        4=opfnamespace, 5=opfowner. `opfname` is a `name` column whose
+        btree `name_ops` uses C collation (C_COLLATION_OID=950); the
+        two `oid_ops` keys carry no collation.
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{2754, "pg_opfamily_am_name_nsp_index"}` after the
+        2689 entry. `flattenRels`+`pgIndexNattsByOID` derives
+        `RelKind='i', RelNatts=3` so the `relnatts==indnatts` check
+        (relcache.c:1492) passes.
+        (c) Three empty-placeholder OID lists at
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        gain `2754 // pg_opfamily_am_name_nsp_index (Step 3bn)`.
+        Step-3k empty-btree placeholder is sufficient because
+        pg_opfamily is currently unpopulated.
+        Regression pins:
+        `TestPgOpfamilyAmNameNspIndexSeededFromInitialEntries` (pins
+        `(IndRelid=2753, IndKey=[2 3 4], IsUnique=true, IsPrimary=false,
+        IndCollation=[0 950 0])`) and
+        `TestNailedLocalRelsContainsPgOpfamilyAmNameNspIndex` (pins
+        `RelName, RelKind='i', RelNatts=3`) in
+        `internal/initdb/pg_opfamily_am_name_nsp_index_test.go`;
+        existing `TestPgIndexInitialEntriesIndkeyMatchesPG18` map
+        extended with `2754:{2,3,4}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2754. Verified: `go build ./...` PASS; targeted
+        tests `TestPgOpfamilyAmNameNspIndex|TestNailedLocalRelsContainsPgOpfamilyAmNameNspIndex|
+        TestNailedLocalRelsContainsPgOpfamily|TestPgIndexInitialEntriesIndkeyMatchesPG18|
+        TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|
+        TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|
+        TestPgClassOidIndexHasSingleKeyColumn|TestBootstrapMappedLocalCatalogHeapsIncludesPgOpfamily|
+        TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestPgOperatorOprnameLRNIndex`
+        PASS; `go test -count=1 ./internal/initdb/` — same 14
+        pre-existing baseline failures as Step 3bm (no new regressions);
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Companion 2755
+        (`pg_opfamily_oid_index`, UNIQUE PRIMARY) deferred to Step 3bo.
+        Design:
+        `docs/design/0106-0010-step3bn-pg-opfamily-am-name-nsp-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
