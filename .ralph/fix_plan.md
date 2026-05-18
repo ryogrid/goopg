@@ -9627,7 +9627,7 @@ relcache init → replication readiness) and intra-package grouped.
         for OIDs 1/4/5 replacing old single-dir mkdir; TestInitLaysOutDirectoryStructure
         extended to verify base/{1,4,5}/PG_VERSION = "18\n". All targeted tests PASS.
 
-- [ ] **M0106-0010 batched-09** (bootstrap-procedure task 9)
+- [x] **M0106-0010 batched-09** (bootstrap-procedure task 9)
       - Summary: Write `postgresql.auto.conf` two-line `ALTER SYSTEM`
         header at initdb.
       - Spec: `bootstrap-procedure/01-data-directory-layout.md`.
