@@ -1,0 +1,189 @@
+# go tool pprof -top -nodecount=40 -cum  /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_standard.heap.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: inuse_space
+Time: 2026-05-18 13:09:36 JST
+Showing nodes accounting for 2.68GB, 99.84% of 2.68GB total
+Dropped 23 nodes (cum <= 0.01GB)
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%     2.68GB 99.85%  github.com/goopg/goopg/internal/initdb.Open
+         0     0%     0%     2.68GB 99.85%  main.main
+         0     0%     0%     2.68GB 99.85%  main.run
+         0     0%     0%     2.68GB 99.85%  main.runStart
+         0     0%     0%     2.68GB 99.85%  runtime.main
+    0.04GB  1.40%  1.40%     2.54GB 94.61%  github.com/goopg/goopg/internal/storage.NewPool
+    2.50GB 93.20% 94.59%     2.50GB 93.20%  github.com/goopg/goopg/internal/storage.newArena
+         0     0% 94.59%     0.14GB  5.24%  github.com/goopg/goopg/internal/wal.NewWriter
+         0     0% 94.59%     0.14GB  5.24%  github.com/goopg/goopg/internal/wal.loadState
+    0.12GB  4.66% 99.25%     0.12GB  4.66%  github.com/goopg/goopg/internal/wal.newWALBuffer (inline)
+    0.02GB  0.58% 99.84%     0.02GB  0.58%  github.com/goopg/goopg/internal/wal.NewMemRing (inline)
+
+# top symbols (-list) — top 8 hot functions, flat order
+## -list cum%
+no matches found for regexp: cum%
+
+## -list github.com/goopg/goopg/internal/storage.newArena
+Total: 2.68GB
+ROUTINE ======================== github.com/goopg/goopg/internal/storage.newArena in /home/ryo/work/goopg/goopg/internal/storage/arena.go
+    2.50GB     2.50GB (flat, cum) 93.20% of Total
+         .          .     18:func newArena(nslots int) (*arena, error) {
+         .          .     19:	if nslots <= 0 {
+         .          .     20:		return nil, fmt.Errorf("arena: nslots must be > 0, got %d", nslots)
+         .          .     21:	}
+         .          .     22:	size := nslots * BlockSize
+         .          .     23:	const align = 4096
+    2.50GB     2.50GB     24:	raw := make([]byte, size+align)
+         .          .     25:	off := align - (int(uintptrOf(raw[:1])) % align)
+         .          .     26:	if off == align {
+         .          .     27:		off = 0
+         .          .     28:	}
+         .          .     29:	return &arena{mem: raw[off : off+size]}, nil
+
+## -list (inline)
+no matches found for regexp: (inline)
+
+## -list github.com/goopg/goopg/internal/storage.NewPool
+Total: 2.68GB
+ROUTINE ======================== github.com/goopg/goopg/internal/storage.NewPool in /home/ryo/work/goopg/goopg/internal/storage/bufpool.go
+   38.37MB     2.54GB (flat, cum) 94.61% of Total
+         .          .    482:func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
+         .          .    483:	if cfg.Slots <= 0 {
+         .          .    484:		return nil, fmt.Errorf("pool: Slots must be > 0, got %d", cfg.Slots)
+         .          .    485:	}
+         .     2.50GB    486:	a, err := newArena(cfg.Slots)
+         .          .    487:	if err != nil {
+         .          .    488:		return nil, err
+         .          .    489:	}
+         .          .    490:	logger := cfg.Logger
+         .          .    491:	if logger == nil {
+         .          .    492:		logger = slog.Default()
+         .          .    493:	}
+         .          .    494:	p := &Pool{
+         .          .    495:		mgr:                      mgr,
+         .          .    496:		arena:                    a,
+    2.52MB     2.52MB    497:		slots:                    make([]*Slot, cfg.Slots),
+         .          .    498:		wal:                      cfg.WAL,
+         .          .    499:		logFPI:                   cfg.LogPageImage,
+         .          .    500:		logBtreeSplit:            cfg.LogBtreeSplit,
+         .          .    501:		logHeapInsert:            cfg.LogHeapInsert,
+         .          .    502:		logBtreeInsert:           cfg.LogBtreeInsert,
+         .          .    503:		logHeapDelete:            cfg.LogHeapDelete,
+         .          .    504:		logHeapLock:              cfg.LogHeapLock,
+         .          .    505:		logHeapVacuum:            cfg.LogHeapVacuum,
+         .          .    506:		logBtreeVacuum:           cfg.LogBtreeVacuum,
+         .          .    507:		logBtreeUnlinkPage:       cfg.LogBtreeUnlinkPage,
+         .          .    508:		logBtreeNewRoot:          cfg.LogBtreeNewRoot,
+         .          .    509:		logBtreeMarkPageHalfDead: cfg.LogBtreeMarkPageHalfDead,
+         .          .    510:		logHeapFreeze:            cfg.LogHeapFreeze,
+         .          .    511:		logHeapHotUpdate:         cfg.LogHeapHotUpdate,
+         .          .    512:		logHeapPruneOpt:          cfg.LogHeapPruneOpt,
+         .          .    513:		logSmgrCreate:            cfg.LogSmgrCreate,
+         .          .    514:		logChangeRecord:          cfg.LogChangeRecord,
+         .          .    515:		logger:                   logger,
+         .          .    516:	}
+         .          .    517:	p.fullPageWrites.Store(cfg.FullPageWrites)
+         .          .    518:	// M0098-0003: initialize 128 partitions.
+
+## -list (inline)
+no matches found for regexp: (inline)
+
+## -list github.com/goopg/goopg/internal/initdb.Open
+Total: 2.68GB
+ROUTINE ======================== github.com/goopg/goopg/internal/initdb.Open in /home/ryo/work/goopg/goopg/internal/initdb/open.go
+         0     2.68GB (flat, cum) 99.85% of Total
+         .          .    182:func Open(opts OpenOptions) (*Runtime, error) {
+         .          .    183:	if opts.DataDir == "" {
+         .          .    184:		return nil, errors.New("goopg: -D <data-directory> is required")
+         .          .    185:	}
+         .          .    186:	abs, err := filepath.Abs(opts.DataDir)
+         .          .    187:	if err != nil {
+         .          .    188:		return nil, fmt.Errorf("goopg: resolve %q: %w", opts.DataDir, err)
+         .          .    189:	}
+         .          .    190:	if err := verifyInitialized(abs); err != nil {
+         .          .    191:		return nil, err
+         .          .    192:	}
+         .          .    193:
+         .          .    194:	slots := opts.PoolSlots
+         .          .    195:	if slots <= 0 {
+         .          .    196:		slots = 16384
+         .          .    197:	}
+         .          .    198:
+         .          .    199:	mgr := storage.NewManager(storage.ManagerConfig{
+         .          .    200:		DataDir: abs,
+         .          .    201:	})
+         .          .    202:
+         .          .    203:	// Activity registry (M0022): must be created early so WAL writer,
+         .          .    204:	// AIO engine, and Manager hooks can register their goroutines via
+         .          .    205:	// activity.RegisterCurrentGoroutine. The pg_stat_activity virtual
+         .          .    206:	// view is registered later, after the catalog is fully set up.
+         .          .    207:	act := activity.NewRegistry()
+         .          .    208:
+         .          .    209:	// AIO engine: optional. With opts.AIOMethod=="" no engine is
+         .          .    210:	// constructed and storage Manager.PrefetchBlock falls back to
+         .          .    211:	// synchronous reads. When set we adapt the engine through a
+         .          .    212:	// thin shim so internal/storage doesn't have to import
+         .          .    213:	// internal/aio (the aio package would otherwise need to know
+         .          .    214:	// about storage.RelFileNode types).
+         .          .    215:	var aioEngine *aio.Engine
+         .          .    216:	if opts.AIOMethod != "" {
+         .          .    217:		eng, err := aio.NewEngine(aio.EngineConfig{
+         .          .    218:			Method:         opts.AIOMethod,
+
+## -list github.com/goopg/goopg/internal/wal.NewWriter
+Total: 2.68GB
+ROUTINE ======================== github.com/goopg/goopg/internal/wal.NewWriter in /home/ryo/work/goopg/goopg/internal/wal/writer.go
+         0      144MB (flat, cum)  5.24% of Total
+         .          .    417:func NewWriter(cfg Config) (*Writer, error) {
+         .          .    418:	cfg.withDefaults()
+         .          .    419:	if err := os.MkdirAll(cfg.WALDir, 0o700); err != nil {
+         .          .    420:		return nil, fmt.Errorf("wal: mkdir %s: %w", cfg.WALDir, err)
+         .          .    421:	}
+         .          .    422:
+         .      144MB    423:	st, err := loadState(cfg)
+         .          .    424:	if err != nil {
+         .          .    425:		return nil, err
+         .          .    426:	}
+         .          .    427:
+         .          .    428:	bufCounters := &walBufferCounters{}
+
+## -list github.com/goopg/goopg/internal/wal.loadState
+Total: 2.68GB
+ROUTINE ======================== github.com/goopg/goopg/internal/wal.loadState in /home/ryo/work/goopg/goopg/internal/wal/writer.go
+         0      144MB (flat, cum)  5.24% of Total
+         .          .    740:func loadState(cfg Config) (*state, error) {
+         .          .    741:	// M0014-0004 step 2: fail fast if the existing data dir holds
+         .          .    742:	// WAL in a format the configured writer cannot append to.
+         .          .    743:	// Detection is read-only and skips CRC validation. Unknown
+         .          .    744:	// (empty / fresh / unclassifiable) is treated as "no mismatch
+         .          .    745:	// signal" — both modes can claim the dir, and detectWritePos's
+         .          .    746:	// later record-level scan will catch any deeper incompatibility.
+         .          .    747:	detected, _ := DetectWALFormat(cfg.WALDir)
+         .          .    748:	if detected == WALFormatLegacy && cfg.PageHeaders {
+         .          .    749:		return nil, fmt.Errorf("%w: data dir contains %s WAL but PageHeaders=true requests pgcompat output",
+         .          .    750:			ErrWALFormatMismatch, detected)
+         .          .    751:	}
+         .          .    752:	if detected == WALFormatPGCompat && !cfg.PageHeaders {
+         .          .    753:		return nil, fmt.Errorf("%w: data dir contains %s WAL but PageHeaders=false requests legacy output",
+         .          .    754:			ErrWALFormatMismatch, detected)
+         .          .    755:	}
+         .          .    756:	writePos, prevRecPtr, err := detectWritePos(cfg.WALDir, cfg.SegmentSize, cfg.PageHeaders)
+         .          .    757:	if err != nil {
+         .          .    758:		return nil, err
+         .          .    759:	}
+         .          .    760:	st := &state{
+         .          .    761:		cfg:         cfg,
+         .          .    762:		writePos:    writePos,
+         .          .    763:		writeLSN:    uint64(writePos),
+         .          .    764:		flushedLSN:  uint64(writePos),
+         .          .    765:		drainedLSN:  uint64(writePos),
+         .          .    766:		files:       make(map[uint64]*os.File),
+         .          .    767:		dirty:       make(map[uint64]bool),
+         .          .    768:		aio:         cfg.AIO,
+         .       16MB    769:		memRing:     NewMemRing(cfg.SenderMemoryBuffer),
+         .      128MB    770:		walBuf:      newWALBuffer(cfg.WALBuffers),
+         .          .    771:		pageHeaders: cfg.PageHeaders,
+         .          .    772:		prevRecPtr:  prevRecPtr,
+         .          .    773:		sysID:       cfg.SystemID,
+         .          .    774:		tli:         cfg.TimelineID,
+         .          .    775:	}
+

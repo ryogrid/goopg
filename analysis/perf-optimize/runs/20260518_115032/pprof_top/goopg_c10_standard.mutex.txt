@@ -1,0 +1,109 @@
+# go tool pprof -top -nodecount=40 -cum  /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_standard.mutex.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 12:07:18 JST
+Showing nodes accounting for 2705.92s, 99.73% of 2713.21s total
+Dropped 681 nodes (cum <= 13.57s)
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%   2632.10s 97.01%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0%     0%   2632.10s 97.01%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0%     0%   2632.10s 97.01%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0%     0%   2628.52s 96.88%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0%     0%   2628.52s 96.88%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0%     0%   2628.52s 96.88%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+  2617.62s 96.48% 96.48%   2617.67s 96.48%  sync.(*Mutex).Unlock (partial-inline)
+         0     0% 96.48%   2427.19s 89.46%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 96.48%   2386.16s 87.95%  github.com/goopg/goopg/internal/mvcc.(*Manager).Commit (inline)
+         0     0% 96.48%   2386.16s 87.95%  github.com/goopg/goopg/internal/mvcc.(*Manager).finish
+         0     0% 96.48%    169.40s  6.24%  github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor
+    70.48s  2.60% 99.07%     70.48s  2.60%  runtime.unlock (partial-inline)
+         0     0% 99.07%     45.20s  1.67%  runtime.schedule
+         0     0% 99.07%     45.19s  1.67%  runtime.mcall
+         0     0% 99.07%     43.89s  1.62%  runtime.findRunnable
+         0     0% 99.07%     42.16s  1.55%  runtime.park_m
+    17.82s  0.66% 99.73%     36.53s  1.35%  sync.(*RWMutex).Unlock
+         0     0% 99.73%     33.82s  1.25%  runtime.gcstopm
+         0     0% 99.73%     26.34s  0.97%  github.com/goopg/goopg/internal/executor.(*updateOp).Next
+         0     0% 99.73%     22.18s  0.82%  github.com/goopg/goopg/internal/storage.(*Bgwriter).run
+         0     0% 99.73%     22.18s  0.82%  github.com/goopg/goopg/internal/storage.(*Pool).WriteDirtyPages
+         0     0% 99.73%     22.15s  0.82%  github.com/goopg/goopg/internal/storage.(*Bgwriter).Start.gowrap1
+         0     0% 99.73%     17.10s  0.63%  github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex
+         0     0% 99.73%     16.19s   0.6%  runtime.systemstack
+         0     0% 99.73%     16.13s  0.59%  github.com/goopg/goopg/internal/mvcc.(*Manager).Begin
+         0     0% 99.73%     15.88s  0.59%  github.com/goopg/goopg/internal/executor.tryApplyHOTUpdate
+         0     0% 99.73%     15.44s  0.57%  github.com/goopg/goopg/internal/mvcc.(*Manager).OldestXmin
+
+# top symbols (-list) — top 8 hot functions, flat order
+## -list cum%
+no matches found for regexp: cum%
+
+## -list (partial-inline)
+no matches found for regexp: (partial-inline)
+
+## -list runtime.unlock
+Total: 2713.21s
+ROUTINE ======================== runtime.unlock in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/lock_spinbit.go
+    70.48s     70.48s (flat, cum)  2.60% of Total
+         .          .    260:func unlock(l *mutex) {
+    70.48s     70.48s    261:	unlockWithRank(l)
+         .          .    262:}
+         .          .    263:
+         .          .    264:// We might not be holding a p in this code.
+         .          .    265://
+         .          .    266://go:nowritebarrier
+
+## -list sync.(*RWMutex).Unlock
+parsing argument regexp sync.(*RWMutex).Unlock: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/executor.(*updateOp).Next
+parsing argument regexp github.com/goopg/goopg/internal/executor.(*updateOp).Next: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex
+parsing argument regexp github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/executor.tryApplyHOTUpdate
+Total: 2713.21s
+ROUTINE ======================== github.com/goopg/goopg/internal/executor.tryApplyHOTUpdate in /home/ryo/work/goopg/goopg/internal/executor/operators_storage.go
+         0     15.88s (flat, cum)  0.59% of Total
+         .          .   1303:func tryApplyHOTUpdate(
+         .          .   1304:	ctx *Context,
+         .          .   1305:	rel storage.RelFileNode,
+         .          .   1306:	cols []catalog.Column,
+         .          .   1307:	blk storage.BlockNumber,
+         .          .   1308:	oldSlot uint16,
+         .          .   1309:	newRow Row,
+         .          .   1310:) (bool, error) {
+         .          .   1311:	// M0093: materialise the transaction's XID BEFORE the
+         .          .   1312:	// isConcurrentlyUpdated race check (line 646). Calling it
+         .          .   1313:	// after would feed XID=0 into the check, letting a foreign
+         .          .   1314:	// xmax stamp slip through as a false negative (orphan visible
+         .          .   1315:	// tuples — the M0090 invariant we explicitly guard).
+         .          .   1316:	if err := ctx.MaterializeWriterXID(); err != nil {
+         .          .   1317:		return false, err
+         .          .   1318:	}
+         .          .   1319:	body, err := EncodeRow(cols, newRow)
+         .          .   1320:	if err != nil {
+         .          .   1321:		return false, &ExecError{Code: "XX000", Message: err.Error()}
+         .          .   1322:	}
+         .          .   1323:	tup := storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+         .          .   1324:	tup.Header.Infomask |= storage.HeapOnlyTuple
+         .          .   1325:	tupleBytes, err := tup.MarshalBinary()
+         .          .   1326:	if err != nil {
+         .          .   1327:		return false, err
+         .          .   1328:	}
+         .          .   1329:
+         .     6.35ms   1330:	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+         .          .   1331:	if err != nil {
+         .          .   1332:		return false, err
+         .          .   1333:	}
+         .          .   1334:	s.Lock()
+         .          .   1335:
+         .          .   1336:	// Race check: between the scan-time RLock release and this Lock
+         .          .   1337:	// acquire, a concurrent UPDATE/DELETE or an opportunistic prune
+         .          .   1338:	// in another session may have flipped the old slot out of
+         .          .   1339:	// LP_NORMAL. Detect that here, before adding the new tuple, so
+
+## -list github.com/goopg/goopg/internal/mvcc.(*Manager).Begin
+parsing argument regexp github.com/goopg/goopg/internal/mvcc.(*Manager).Begin: error parsing regexp: missing argument to repetition operator: `*`
+

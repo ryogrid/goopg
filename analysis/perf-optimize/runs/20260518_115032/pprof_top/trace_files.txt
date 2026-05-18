@@ -1,0 +1,10 @@
+# trace files
+-rw-r--r-- 1 ryo ryo 78944488 May 18 12:31 /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_select-only.trace.out
+-rw-r--r-- 1 ryo ryo 35079612 May 18 12:37 /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_simple-update.trace.out
+-rw-r--r-- 1 ryo ryo   562577 May 18 13:08 /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_standard.trace.out
+-rw-r--r-- 1 ryo ryo 41841975 May 18 11:53 /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_select-only.trace.out
+-rw-r--r-- 1 ryo ryo 42095649 May 18 11:59 /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_simple-update.trace.out
+-rw-r--r-- 1 ryo ryo 40150175 May 18 12:05 /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_standard.trace.out
+-rw-r--r-- 1 ryo ryo 64625663 May 18 12:12 /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c50_select-only.trace.out
+-rw-r--r-- 1 ryo ryo 38552125 May 18 12:18 /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c50_simple-update.trace.out
+-rw-r--r-- 1 ryo ryo 42398004 May 18 12:24 /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c50_standard.trace.out

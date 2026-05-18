@@ -1,0 +1,28 @@
+# go tool pprof -top -nodecount=40 -cum -base /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_standard.mutex_base.pb.gz /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_standard.mutex.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 12:05:10 JST
+Showing nodes accounting for 962.68s, 99.89% of 963.70s total
+Dropped 511 nodes (cum <= 4.82s)
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%    953.11s 98.90%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0%     0%    953.11s 98.90%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0%     0%    953.11s 98.90%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0%     0%    952.70s 98.86%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0%     0%    952.70s 98.86%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0%     0%    952.70s 98.86%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+   952.32s 98.82% 98.82%    952.34s 98.82%  sync.(*Mutex).Unlock
+         0     0% 98.82%    885.23s 91.86%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 98.82%    875.71s 90.87%  github.com/goopg/goopg/internal/mvcc.(*Manager).Commit (inline)
+         0     0% 98.82%    875.71s 90.87%  github.com/goopg/goopg/internal/mvcc.(*Manager).finish
+         0     0% 98.82%     61.99s  6.43%  github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor
+    10.36s  1.07% 99.89%     10.36s  1.07%  runtime.unlock (partial-inline)
+         0     0% 99.89%      8.10s  0.84%  runtime.schedule
+         0     0% 99.89%      8.03s  0.83%  runtime.mcall
+         0     0% 99.89%      7.86s  0.82%  runtime.park_m
+         0     0% 99.89%      7.73s   0.8%  runtime.findRunnable
+         0     0% 99.89%      7.58s  0.79%  github.com/goopg/goopg/internal/executor.(*updateOp).Next
+         0     0% 99.89%      5.20s  0.54%  github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex
+         0     0% 99.89%      5.01s  0.52%  github.com/goopg/goopg/internal/mvcc.(*Manager).Begin
+         0     0% 99.89%      4.92s  0.51%  github.com/goopg/goopg/internal/executor.tryApplyHOTUpdate

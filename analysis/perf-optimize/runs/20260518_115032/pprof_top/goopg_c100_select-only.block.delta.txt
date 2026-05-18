@@ -1,0 +1,49 @@
+# go tool pprof -top -nodecount=40 -cum -base /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_select-only.block_base.pb.gz /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_select-only.block.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 12:30:43 JST
+Showing nodes accounting for 3037.72s, 98.15% of 3094.87s total
+Dropped 35 nodes (cum <= 15.47s)
+Showing top 40 nodes out of 62
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%   2306.70s 74.53%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0%     0%   2306.70s 74.53%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0%     0%   2306.70s 74.53%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+  2233.59s 72.17% 72.17%   2233.59s 72.17%  sync.(*Mutex).Lock (inline)
+     6.71s  0.22% 72.39%   2158.57s 69.75%  sync.(*RWMutex).Lock
+         0     0% 72.39%   2011.84s 65.01%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0% 72.39%   2011.84s 65.01%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0% 72.39%   2011.84s 65.01%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0% 72.39%   1706.47s 55.14%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteFrame
+         0     0% 72.39%   1617.19s 52.25%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart
+         0     0% 72.39%   1589.57s 51.36%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func6
+         0     0% 72.39%   1565.99s 50.60%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteReadyForQuery
+   724.09s 23.40% 95.78%    724.09s 23.40%  runtime.selectgo
+         0     0% 95.78%    534.08s 17.26%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd
+         0     0% 95.78%    364.67s 11.78%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 95.78%    351.87s 11.37%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func7
+         0     0% 95.78%    234.98s  7.59%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).Flush
+         0     0% 95.78%    217.07s  7.01%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteFrame.func1
+         0     0% 95.78%    209.59s  6.77%  github.com/goopg/goopg/internal/protocol.(*FrameReader).ReadFrame
+         0     0% 95.78%    182.11s  5.88%  github.com/goopg/goopg/internal/protocol.(*FrameReader).ReadFrame.func1
+         0     0% 95.78%    182.11s  5.88%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func5
+         0     0% 95.78%    180.85s  5.84%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteRowDescription
+         0     0% 95.78%    150.31s  4.86%  net/http.(*Server).Serve.gowrap3
+         0     0% 95.78%    150.31s  4.86%  net/http.(*conn).serve
+         0     0% 95.78%    150.31s  4.86%  net/http.(*ServeMux).ServeHTTP
+         0     0% 95.78%    150.31s  4.86%  net/http.HandlerFunc.ServeHTTP
+         0     0% 95.78%    150.31s  4.86%  net/http.serverHandler.ServeHTTP
+         0     0% 95.78%    150.05s  4.85%  net/http/pprof.sleep
+         0     0% 95.78%    120.40s  3.89%  github.com/goopg/goopg/internal/wal.(*state).loop
+         0     0% 95.78%    120.40s  3.89%  github.com/goopg/goopg/internal/wal.NewWriter.gowrap1
+         0     0% 95.78%    120.32s  3.89%  net/http/pprof.Profile
+         0     0% 95.78%    120.24s  3.89%  github.com/goopg/goopg/internal/initdb.Open.func37
+         0     0% 95.78%    120.07s  3.88%  github.com/goopg/goopg/internal/server.(*ApplyLauncher).Run
+         0     0% 95.78%    120.07s  3.88%  github.com/goopg/goopg/internal/server.(*Server).Run.gowrap2
+         0     0% 95.78%    120.05s  3.88%  github.com/goopg/goopg/internal/wal.(*Checkpointer).Run
+         0     0% 95.78%    120.05s  3.88%  main.runStart.func4
+         0     0% 95.78%    100.20s  3.24%  github.com/goopg/goopg/internal/storage.(*Bgwriter).Start.gowrap1
+         0     0% 95.78%    100.20s  3.24%  github.com/goopg/goopg/internal/storage.(*Bgwriter).run
+         0     0% 95.78%     74.37s  2.40%  github.com/goopg/goopg/internal/storage.(*Pool).Pin
+    73.32s  2.37% 98.15%     73.32s  2.37%  sync.(*RWMutex).RLock (inline)

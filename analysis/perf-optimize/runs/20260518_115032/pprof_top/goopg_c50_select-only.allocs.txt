@@ -1,0 +1,197 @@
+# go tool pprof -top -nodecount=40 -cum  /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c50_select-only.allocs.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: alloc_space
+Time: 2026-05-18 12:13:41 JST
+Showing nodes accounting for 5022.77MB, 64.98% of 7729.72MB total
+Dropped 161 nodes (cum <= 38.65MB)
+Showing top 40 nodes out of 115
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%  4703.42MB 60.85%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+    0.50MB 0.0065% 0.0065%  4703.42MB 60.85%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0% 0.0065%  4698.92MB 60.79%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0% 0.0065%  4529.41MB 58.60%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0% 0.0065%  4432.90MB 57.35%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+       9MB  0.12%  0.12%  4321.40MB 55.91%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0%  0.12%  2982.40MB 38.58%  runtime.main
+         0     0%  0.12%  2981.89MB 38.58%  github.com/goopg/goopg/internal/initdb.Open
+         0     0%  0.12%  2981.89MB 38.58%  main.main
+         0     0%  0.12%  2981.89MB 38.58%  main.run
+         0     0%  0.12%  2981.89MB 38.58%  main.runStart
+   36.29MB  0.47%  0.59%  2596.30MB 33.59%  github.com/goopg/goopg/internal/storage.NewPool
+ 2560.01MB 33.12% 33.71%  2560.01MB 33.12%  github.com/goopg/goopg/internal/storage.newArena
+         0     0% 33.71%  1810.28MB 23.42%  github.com/goopg/goopg/internal/planner.Plan
+   52.50MB  0.68% 34.39%  1648.77MB 21.33%  github.com/goopg/goopg/internal/planner.planSelect
+      41MB  0.53% 34.92%  1037.24MB 13.42%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+      19MB  0.25% 35.17%   868.19MB 11.23%  github.com/goopg/goopg/internal/parser.Parse
+  577.13MB  7.47% 42.63%   620.13MB  8.02%  github.com/goopg/goopg/internal/planner.buildBindingsPosMap
+  202.06MB  2.61% 45.25%   601.09MB  7.78%  github.com/goopg/goopg/internal/parser.(*parser).parseSelect
+         0     0% 45.25%   601.09MB  7.78%  github.com/goopg/goopg/internal/parser.(*parser).parseStatement
+         0     0% 45.25%   444.06MB  5.74%  github.com/goopg/goopg/internal/executor.(*projectOp).Open
+         0     0% 45.25%   420.01MB  5.43%  github.com/goopg/goopg/internal/executor.(*indexScanOp).Open
+  360.59MB  4.66% 49.91%   360.59MB  4.66%  github.com/goopg/goopg/internal/planner.tableSchemaWithSource (inline)
+  324.15MB  4.19% 54.11%   324.15MB  4.19%  github.com/goopg/goopg/internal/executor.NewContext (inline)
+         0     0% 54.11%      324MB  4.19%  github.com/goopg/goopg/internal/executor.(*indexScanOp).Rescan
+         0     0% 54.11%   322.07MB  4.17%  github.com/goopg/goopg/internal/planner.remapWithBindings
+         0     0% 54.11%   320.50MB  4.15%  github.com/goopg/goopg/internal/access/btree.(*BTree).RangeScan
+  317.51MB  4.11% 58.21%   317.51MB  4.11%  time.Time.Format
+    4.50MB 0.058% 58.27%      310MB  4.01%  github.com/goopg/goopg/internal/access/btree.(*BTree).descendToLeaf
+         0     0% 58.27%   298.75MB  3.86%  sync.(*Pool).Get
+         0     0% 58.27%   298.06MB  3.86%  github.com/goopg/goopg/internal/planner.remapTopProjection
+         0     0% 58.27%   294.50MB  3.81%  github.com/goopg/goopg/internal/access/btree.findChildBlockDirect
+      50MB  0.65% 58.92%   290.05MB  3.75%  github.com/goopg/goopg/internal/planner.planScanRangeVar
+         0     0% 58.92%   254.50MB  3.29%  github.com/goopg/goopg/internal/access/btree.findChildBlockDirect.func1 (inline)
+         0     0% 58.92%   254.50MB  3.29%  sort.Search (inline)
+         0     0% 58.92%   235.04MB  3.04%  github.com/goopg/goopg/internal/executor.Build
+  164.02MB  2.12% 61.04%   228.02MB  2.95%  github.com/goopg/goopg/internal/parser.(*parser).parseFromList
+     206MB  2.67% 63.71%      206MB  2.67%  github.com/goopg/goopg/internal/storage.PageGetItemRaw
+   98.51MB  1.27% 64.98%   194.02MB  2.51%  github.com/goopg/goopg/internal/planner.planIndexScanFromWhere
+         0     0% 64.98%   192.02MB  2.48%  github.com/goopg/goopg/internal/wal.ReadAll
+
+# top symbols (-list) — top 8 hot functions, flat order
+## -list cum%
+no matches found for regexp: cum%
+
+## -list github.com/goopg/goopg/internal/storage.newArena
+Total: 7.55GB
+ROUTINE ======================== github.com/goopg/goopg/internal/storage.newArena in /home/ryo/work/goopg/goopg/internal/storage/arena.go
+    2.50GB     2.50GB (flat, cum) 33.12% of Total
+         .          .     18:func newArena(nslots int) (*arena, error) {
+         .          .     19:	if nslots <= 0 {
+         .          .     20:		return nil, fmt.Errorf("arena: nslots must be > 0, got %d", nslots)
+         .          .     21:	}
+         .          .     22:	size := nslots * BlockSize
+         .          .     23:	const align = 4096
+    2.50GB     2.50GB     24:	raw := make([]byte, size+align)
+         .          .     25:	off := align - (int(uintptrOf(raw[:1])) % align)
+         .          .     26:	if off == align {
+         .          .     27:		off = 0
+         .          .     28:	}
+         .          .     29:	return &arena{mem: raw[off : off+size]}, nil
+
+## -list github.com/goopg/goopg/internal/planner.buildBindingsPosMap
+Total: 7.55GB
+ROUTINE ======================== github.com/goopg/goopg/internal/planner.buildBindingsPosMap in /home/ryo/work/goopg/goopg/internal/planner/bushy.go
+  577.13MB   620.13MB (flat, cum)  8.02% of Total
+         .          .   1635:func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
+         .          .   1636:	type scanEntry struct {
+         .          .   1637:		key scanKey
+         .          .   1638:		off int
+         .          .   1639:	}
+         .          .   1640:	var entries []scanEntry
+         .          .   1641:	var off int
+         .          .   1642:	var collect func(Node)
+         .          .   1643:	collect = func(n Node) {
+         .          .   1644:		if n == nil {
+         .          .   1645:			return
+         .          .   1646:		}
+         .          .   1647:		switch x := n.(type) {
+         .          .   1648:		case *SeqScan:
+         .          .   1649:			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
+         .          .   1650:			off += len(x.Output())
+         .          .   1651:		case *IndexScan:
+         .          .   1652:			// M0062-0002: preserve Alias so self-joins (Q8 `nation n1, nation n2`)
+         .          .   1653:			// can disambiguate when one side flips to IndexScan.
+         .          .   1654:			entries = append(entries, scanEntry{key: scanKey{table: x.Table, alias: x.Alias}, off: off})
+         .          .   1655:			off += len(x.Output())
+         .          .   1656:		case *MultiHashJoin:
+         .          .   1657:			for _, t := range x.Tables {
+         .          .   1658:				switch s := t.(type) {
+         .          .   1659:				case *SeqScan:
+         .          .   1660:					entries = append(entries, scanEntry{key: scanKey{table: s.Table, alias: s.Alias}, off: off})
+         .          .   1661:					off += len(s.Output())
+         .          .   1662:				case *IndexScan:
+         .          .   1663:					// M0062-0002: same alias preservation as the
+         .          .   1664:					// top-level IndexScan arm.
+         .          .   1665:					entries = append(entries, scanEntry{key: scanKey{table: s.Table, alias: s.Alias}, off: off})
+         .          .   1666:					off += len(s.Output())
+         .          .   1667:				}
+         .          .   1668:			}
+         .          .   1669:		case *Join:
+         .          .   1670:			collect(x.Left)
+         .          .   1671:			collect(x.Right)
+
+## -list github.com/goopg/goopg/internal/planner.tableSchemaWithSource
+Total: 7.55GB
+ROUTINE ======================== github.com/goopg/goopg/internal/planner.tableSchemaWithSource in /home/ryo/work/goopg/goopg/internal/planner/planner.go
+  360.59MB   360.59MB (flat, cum)  4.66% of Total
+         .          .    266:func tableSchemaWithSource(t *catalog.Table, sourceIdx int16) Schema {
+  360.59MB   360.59MB    267:	out := make(Schema, len(t.Columns))
+         .          .    268:	for i, c := range t.Columns {
+         .          .    269:		out[i] = SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: sourceIdx}
+         .          .    270:	}
+         .          .    271:	return out
+         .          .    272:}
+
+## -list github.com/goopg/goopg/internal/executor.NewContext
+Total: 7.55GB
+ROUTINE ======================== github.com/goopg/goopg/internal/executor.NewContext in /home/ryo/work/goopg/goopg/internal/executor/context.go
+  324.15MB   324.15MB (flat, cum)  4.19% of Total
+         .          .    354:func NewContext() *Context {
+  324.15MB   324.15MB    355:	return &Context{Now: time.Now()}
+         .          .    356:}
+         .          .    357:
+         .          .    358:// MaterializeWriterXID ensures the context's transaction has a real
+         .          .    359:// XID assigned. M0093 (PG-parity lazy XID allocation): the manager
+         .          .    360:// no longer allocates an XID at Begin time; the first write site
+
+## -list time.Time.Format
+Total: 7.55GB
+ROUTINE ======================== time.Time.Format in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/time/format.go
+  317.51MB   317.51MB (flat, cum)  4.11% of Total
+         .          .    639:func (t Time) Format(layout string) string {
+         .          .    640:	const bufSize = 64
+         .          .    641:	var b []byte
+         .          .    642:	max := len(layout) + 10
+         .          .    643:	if max < bufSize {
+         .          .    644:		var buf [bufSize]byte
+         .          .    645:		b = buf[:0]
+         .          .    646:	} else {
+         .          .    647:		b = make([]byte, 0, max)
+         .          .    648:	}
+         .          .    649:	b = t.AppendFormat(b, layout)
+  317.51MB   317.51MB    650:	return string(b)
+         .          .    651:}
+         .          .    652:
+         .          .    653:// AppendFormat is like [Time.Format] but appends the textual
+         .          .    654:// representation to b and returns the extended buffer.
+         .          .    655:func (t Time) AppendFormat(b []byte, layout string) []byte {
+
+## -list github.com/goopg/goopg/internal/storage.PageGetItemRaw
+Total: 7.55GB
+ROUTINE ======================== github.com/goopg/goopg/internal/storage.PageGetItemRaw in /home/ryo/work/goopg/goopg/internal/storage/heap.go
+     206MB      206MB (flat, cum)  2.67% of Total
+         .          .   1077:func PageGetItemRaw(p Page, slot uint16) ([]byte, error) {
+         .          .   1078:	if slot == 0 {
+         .          .   1079:		return nil, ErrInvalidSlot
+         .          .   1080:	}
+         .          .   1081:	count, err := PageLinePointerCount(p)
+         .          .   1082:	if err != nil {
+         .          .   1083:		return nil, err
+         .          .   1084:	}
+         .          .   1085:	idx := int(slot) - 1
+         .          .   1086:	if idx < 0 || idx >= count {
+         .          .   1087:		return nil, ErrInvalidSlot
+         .          .   1088:	}
+         .          .   1089:	item, err := readItemID(p, idx)
+         .          .   1090:	if err != nil {
+         .          .   1091:		return nil, err
+         .          .   1092:	}
+         .          .   1093:	if item.Flags != ItemIDNormal {
+         .          .   1094:		return nil, fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+         .          .   1095:	}
+         .          .   1096:	off := int(item.Offset)
+         .          .   1097:	ln := int(item.Length)
+         .          .   1098:	if off < 0 || ln < 0 || off+ln > len(p) {
+         .          .   1099:		return nil, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, slot, off, ln)
+         .          .   1100:	}
+     206MB      206MB   1101:	return append([]byte(nil), p[off:off+ln]...), nil
+         .          .   1102:}
+         .          .   1103:
+         .          .   1104:// PageGetItemRawNoCopy is the alias-the-page variant of
+         .          .   1105:// PageGetItemRaw. The returned slice REFERENCES the page bytes
+         .          .   1106:// directly — no allocation, but the caller MUST hold the page pin
+
+## -list github.com/goopg/goopg/internal/parser.(*parser).parseSelect
+parsing argument regexp github.com/goopg/goopg/internal/parser.(*parser).parseSelect: error parsing regexp: missing argument to repetition operator: `*`
+

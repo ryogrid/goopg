@@ -205,7 +205,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		logger.Info("GOMEMLIMIT applied", "bytes", cur)
 	}
 
-	// Start pprof HTTP endpoint on 127.0.0.1:6060 for CPU/heap profiling.
+	// Start pprof HTTP endpoint on 127.0.0.1:6060 (default) for CPU/heap profiling.
+	// Override the bind address with GOOPG_PPROF_ADDR (e.g. "127.0.0.1:6160")
+	// when running side-by-side with another goopg instance.
 	// Available endpoints:
 	//   /debug/pprof/profile?seconds=30  — CPU profile (download with go tool pprof)
 	//   /debug/pprof/heap               — heap profile
@@ -214,6 +216,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	//   /debug/pprof/block              — blocking events  (needs GOOPG_BLOCK_PROFILE_RATE>0)
 	go func() {
 		pprofAddr := "127.0.0.1:6060"
+		if v := os.Getenv("GOOPG_PPROF_ADDR"); v != "" {
+			pprofAddr = v
+		}
 		ln, err := net.Listen("tcp", pprofAddr)
 		if err != nil {
 			logger.Debug("pprof listener not available", "addr", pprofAddr, "err", err)

@@ -1,0 +1,4 @@
+[pprof_collect goopg_c10_simple-update] warmup=30s cpu=120s trace=30s win=180s
+[pprof_collect goopg_c10_simple-update] trace done
+[pprof_collect goopg_c10_simple-update] cpu profile done
+[pprof_collect goopg_c10_simple-update] done

@@ -1,0 +1,49 @@
+# go tool pprof -top -nodecount=40 -cum -base /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_select-only.block_base.pb.gz /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_select-only.block.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 11:52:29 JST
+Showing nodes accounting for 812.18s, 100% of 812.18s total
+Dropped 63 nodes (cum <= 4.06s)
+Showing top 40 nodes out of 43
+      flat  flat%   sum%        cum   cum%
+   731.37s 90.05% 90.05%    731.37s 90.05%  runtime.selectgo
+         0     0% 90.05%    149.44s 18.40%  net/http.(*Server).Serve.gowrap3
+         0     0% 90.05%    149.44s 18.40%  net/http.(*conn).serve
+         0     0% 90.05%    149.44s 18.40%  net/http.(*ServeMux).ServeHTTP
+         0     0% 90.05%    149.44s 18.40%  net/http.HandlerFunc.ServeHTTP
+         0     0% 90.05%    149.44s 18.40%  net/http.serverHandler.ServeHTTP
+         0     0% 90.05%    149.20s 18.37%  net/http/pprof.sleep
+         0     0% 90.05%    119.78s 14.75%  github.com/goopg/goopg/internal/wal.(*state).loop
+         0     0% 90.05%    119.78s 14.75%  github.com/goopg/goopg/internal/wal.NewWriter.gowrap1
+         0     0% 90.05%    119.69s 14.74%  net/http/pprof.Profile
+         0     0% 90.05%    119.66s 14.73%  github.com/goopg/goopg/internal/initdb.Open.func37
+         0     0% 90.05%    119.44s 14.71%  github.com/goopg/goopg/internal/server.(*ApplyLauncher).Run
+         0     0% 90.05%    119.44s 14.71%  github.com/goopg/goopg/internal/server.(*Server).Run.gowrap2
+         0     0% 90.05%    119.43s 14.71%  github.com/goopg/goopg/internal/wal.(*Checkpointer).Run
+         0     0% 90.05%    119.43s 14.71%  main.runStart.func4
+         0     0% 90.05%    107.17s 13.20%  github.com/goopg/goopg/internal/storage.(*Bgwriter).Start.gowrap1
+         0     0% 90.05%    107.17s 13.20%  github.com/goopg/goopg/internal/storage.(*Bgwriter).run
+    58.03s  7.15% 97.20%     58.03s  7.15%  runtime.chanrecv1
+         0     0% 97.20%     57.79s  7.12%  runtime.(*wakeableSleep).sleep
+         0     0% 97.20%     29.75s  3.66%  net/http/pprof.Trace
+         0     0% 97.20%     29.73s  3.66%  runtime.traceStartReadCPU.func1
+         0     0% 97.20%     28.06s  3.45%  runtime.(*traceAdvancerState).start.func1
+         0     0% 97.20%     19.47s  2.40%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0% 97.20%     19.47s  2.40%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0% 97.20%     19.47s  2.40%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0% 97.20%     18.01s  2.22%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0% 97.20%     18.01s  2.22%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0% 97.20%     18.01s  2.22%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0% 97.20%     14.50s  1.79%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 97.20%     13.62s  1.68%  github.com/goopg/goopg/internal/storage.(*Pool).Pin
+    12.07s  1.49% 98.68%     12.07s  1.49%  sync.(*RWMutex).RLock (inline)
+         0     0% 98.68%     10.88s  1.34%  github.com/goopg/goopg/internal/executor.(*projectOp).Open
+         0     0% 98.68%     10.78s  1.33%  github.com/goopg/goopg/internal/executor.(*indexScanOp).Open
+     3.26s   0.4% 99.08%      9.85s  1.21%  sync.(*RWMutex).Lock
+     7.45s  0.92%   100%      7.45s  0.92%  sync.(*Mutex).Lock (inline)
+         0     0%   100%      6.30s  0.78%  github.com/goopg/goopg/internal/access/btree.(*BTree).readMeta
+         0     0%   100%      6.04s  0.74%  github.com/goopg/goopg/internal/access/btree.(*BTree).RangeScan
+         0     0%   100%      6.04s  0.74%  github.com/goopg/goopg/internal/executor.(*indexScanOp).Rescan
+         0     0%   100%      5.19s  0.64%  github.com/goopg/goopg/internal/access/btree.(*BTree).descendToLeaf
+         0     0%   100%      4.74s  0.58%  github.com/goopg/goopg/internal/access/btree.Open

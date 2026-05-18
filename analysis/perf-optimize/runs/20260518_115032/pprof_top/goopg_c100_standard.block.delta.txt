@@ -1,0 +1,28 @@
+# go tool pprof -top -nodecount=40 -cum -base /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_standard.block_base.pb.gz /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_standard.block.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 13:07:31 JST
+Showing nodes accounting for 689.43s, 100% of 689.43s total
+Dropped 12 nodes (cum <= 3.45s)
+      flat  flat%   sum%        cum   cum%
+   629.54s 91.31% 91.31%    629.54s 91.31%  runtime.selectgo
+         0     0% 91.31%    149.81s 21.73%  net/http.(*Server).Serve.gowrap3
+         0     0% 91.31%    149.81s 21.73%  net/http.(*conn).serve
+         0     0% 91.31%    149.81s 21.73%  net/http.(*ServeMux).ServeHTTP
+         0     0% 91.31%    149.81s 21.73%  net/http.HandlerFunc.ServeHTTP
+         0     0% 91.31%    149.81s 21.73%  net/http.serverHandler.ServeHTTP
+         0     0% 91.31%    149.81s 21.73%  net/http/pprof.sleep
+         0     0% 91.31%    120.02s 17.41%  github.com/goopg/goopg/internal/wal.(*state).loop
+         0     0% 91.31%    120.02s 17.41%  github.com/goopg/goopg/internal/wal.NewWriter.gowrap1
+         0     0% 91.31%       120s 17.41%  github.com/goopg/goopg/internal/initdb.Open.func37
+         0     0% 91.31%    119.85s 17.38%  github.com/goopg/goopg/internal/server.(*ApplyLauncher).Run
+         0     0% 91.31%    119.85s 17.38%  github.com/goopg/goopg/internal/server.(*Server).Run.gowrap2
+         0     0% 91.31%    119.85s 17.38%  net/http/pprof.Profile
+         0     0% 91.31%    119.85s 17.38%  github.com/goopg/goopg/internal/wal.(*Checkpointer).Run
+         0     0% 91.31%    119.85s 17.38%  main.runStart.func4
+    59.90s  8.69%   100%     59.90s  8.69%  runtime.chanrecv1
+         0     0%   100%     59.90s  8.69%  runtime.(*wakeableSleep).sleep
+         0     0%   100%     29.96s  4.35%  net/http/pprof.Trace
+         0     0%   100%     29.96s  4.34%  runtime.traceStartReadCPU.func1
+         0     0%   100%     29.94s  4.34%  runtime.(*traceAdvancerState).start.func1

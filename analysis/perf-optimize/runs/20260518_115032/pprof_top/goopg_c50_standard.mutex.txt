@@ -1,0 +1,72 @@
+# go tool pprof -top -nodecount=40 -cum  /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c50_standard.mutex.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 12:26:26 JST
+Showing nodes accounting for 4.42hrs, 99.93% of 4.43hrs total
+Dropped 720 nodes (cum <= 0.02hrs)
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%    4.39hrs 99.26%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0%     0%    4.39hrs 99.26%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0%     0%    4.39hrs 99.26%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+   4.39hrs 99.13% 99.13%    4.39hrs 99.13%  sync.(*Mutex).Unlock (partial-inline)
+         0     0% 99.13%    4.34hrs 97.93%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0% 99.13%    4.34hrs 97.93%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0% 99.13%    4.34hrs 97.93%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0% 99.13%    3.89hrs 87.97%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 99.13%    3.79hrs 85.68%  github.com/goopg/goopg/internal/mvcc.(*Manager).Commit (inline)
+         0     0% 99.13%    3.79hrs 85.68%  github.com/goopg/goopg/internal/mvcc.(*Manager).finish
+         0     0% 99.13%    0.27hrs  6.14%  github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor
+   0.01hrs  0.26% 99.39%    0.27hrs  6.00%  sync.(*RWMutex).Unlock
+         0     0% 99.39%    0.16hrs  3.65%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteFrame
+         0     0% 99.39%    0.15hrs  3.47%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart
+         0     0% 99.39%    0.15hrs  3.47%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart.deferwrap1
+         0     0% 99.39%    0.15hrs  3.37%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func6
+         0     0% 99.39%    0.14hrs  3.08%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteReadyForQuery
+         0     0% 99.39%    0.10hrs  2.18%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd
+         0     0% 99.39%    0.10hrs  2.17%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd.deferwrap1
+         0     0% 99.39%    0.06hrs  1.32%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func7
+         0     0% 99.39%    0.05hrs  1.05%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).Flush
+         0     0% 99.39%    0.04hrs  0.96%  github.com/goopg/goopg/internal/protocol.(*FrameReader).ReadFrame
+         0     0% 99.39%    0.04hrs  0.95%  github.com/goopg/goopg/internal/executor.(*updateOp).Next
+         0     0% 99.39%    0.04hrs  0.85%  github.com/goopg/goopg/internal/protocol.(*FrameReader).ReadFrame.func1
+         0     0% 99.39%    0.04hrs  0.85%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func5
+         0     0% 99.39%    0.03hrs  0.67%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteRowDescription
+         0     0% 99.39%    0.03hrs  0.66%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteFrame.func1
+         0     0% 99.39%    0.03hrs  0.59%  github.com/goopg/goopg/internal/mvcc.(*Manager).Begin
+   0.02hrs  0.54% 99.93%    0.02hrs  0.54%  runtime.unlock
+
+# top symbols (-list) — top 8 hot functions, flat order
+## -list cum%
+no matches found for regexp: cum%
+
+## -list (partial-inline)
+no matches found for regexp: (partial-inline)
+
+## -list runtime.unlock
+Total: 4.43hrs
+ROUTINE ======================== runtime.unlock in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/lock_spinbit.go
+    86.60s     86.60s (flat, cum)  0.54% of Total
+         .          .    260:func unlock(l *mutex) {
+    86.60s     86.60s    261:	unlockWithRank(l)
+         .          .    262:}
+         .          .    263:
+         .          .    264:// We might not be holding a p in this code.
+         .          .    265://
+         .          .    266://go:nowritebarrier
+
+## -list sync.(*RWMutex).Unlock
+parsing argument regexp sync.(*RWMutex).Unlock: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd
+parsing argument regexp github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd.deferwrap1
+parsing argument regexp github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd.deferwrap1: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart
+parsing argument regexp github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart.deferwrap1
+parsing argument regexp github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart.deferwrap1: error parsing regexp: missing argument to repetition operator: `*`
+
