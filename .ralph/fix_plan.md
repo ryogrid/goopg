@@ -5934,6 +5934,51 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/executor/ ./internal/server/ ./internal/storage/
         ./internal/catalog/ ./internal/mvcc/` PASS. Design:
         `docs/design/0106-0010-step3bh-pg-foreign-table-nailed-rel.md`.
+      - Step 3bi LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 3119` PG-standby boot blocker
+        that surfaced after Step 3bh seeded `pg_foreign_table` (OID
+        3118). OID 3119 is `pg_foreign_table_relid_index` per
+        `postgres/src/include/catalog/pg_foreign_table.h:47`
+        (`DECLARE_UNIQUE_INDEX_PKEY(pg_foreign_table_relid_index,
+        3119, ForeignTableRelidIndexId, pg_foreign_table,
+        btree(ftrelid oid_ops))`). Backs `MAKE_SYSCACHE(
+        FOREIGNTABLEREL, pg_foreign_table_relid_index, 4)`. Pure
+        catalog-seed addition mirroring the single-column `oid_ops`
+        UNIQUE PKEY pattern of Steps 3bd / 3bg / 3ax / 3at / 3l; no
+        encoder/builder/Init flow change.
+        (a) `internal/initdb/initdb.go::pgIndexInitialEntries` appends
+        `entry(3119, 3118, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` after the Step 3bg 113 entry. Note: pg_foreign_table
+        has no system `oid` column — `ftrelid` (attnum 1, also of type
+        oid, referencing pg_class.oid) is the primary key.
+        (b) `internal/initdb/relcache_init.go::nailedLocalRels` idxSpec
+        gains `{3119, "pg_foreign_table_relid_index"}` after the 113
+        entry. `flattenRels`+`pgIndexNattsByOID` derives `RelKind='i',
+        RelNatts=1` so the `relnatts==indnatts` check (relcache.c:1492)
+        passes.
+        (c) Three empty-placeholder OID lists at
+        `bootstrapPostgresDatabase` (`base/1/`, `base/5/`, `global/`)
+        gain `3119` so PG's `mdopen` finds a valid empty-btree file
+        before `bootstrapPgIndexIndexrelidIndex` overwrites the
+        metapage. Step-3k empty-btree placeholder is sufficient because
+        pg_foreign_table is currently unpopulated.
+        Regression pins: `TestPgForeignTableRelidIndexSeededFromInitialEntries`
+        / `TestNailedLocalRelsContainsPgForeignTableRelidIndex` in
+        `internal/initdb/pg_foreign_table_relid_index_test.go`;
+        existing `TestPgIndexInitialEntriesIndkeyMatchesPG18` map
+        extended with `3119:{1}` (strict count guard); existing
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3119. Verified: `go build ./...` PASS; targeted
+        tests PASS; `go test -count=1 ./internal/initdb/` shows the
+        same 14 pre-existing baseline failures as Step 3bh (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        TestE2E_FailoverGoopgToPG/async` re-run: standby advances past
+        the OID 3119 FATAL to `could not open relation with OID 2681`
+        (`pg_index_indrelid_index`) — Step 3bj territory. Closes
+        Step 3bh's deferred companion. Design:
+        `docs/design/0106-0010-step3bi-pg-foreign-table-relid-index.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

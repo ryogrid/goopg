@@ -710,6 +710,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		112,  // pg_foreign_data_wrapper_oid_index (Step 3bd)
 		549,  // pg_foreign_server_name_index (Step 3bf)
 		113,  // pg_foreign_server_oid_index (Step 3bg)
+		3119, // pg_foreign_table_relid_index (Step 3bi)
 	} {
 		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -822,6 +823,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		112,  // pg_foreign_data_wrapper_oid_index (Step 3bd)
 		549,  // pg_foreign_server_name_index (Step 3bf)
 		113,  // pg_foreign_server_oid_index (Step 3bg)
+		3119, // pg_foreign_table_relid_index (Step 3bi)
 	} {
 		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -863,6 +865,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		112,  // pg_foreign_data_wrapper_oid_index (Step 3bd)
 		549,  // pg_foreign_server_name_index (Step 3bf)
 		113,  // pg_foreign_server_oid_index (Step 3bg)
+		3119, // pg_foreign_table_relid_index (Step 3bi)
 	} {
 		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2110,6 +2113,24 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_extension_oid_index. Companion to OID 549 (Step 3bf);
 		// surfaced as the next E2E FATAL after Step 3bf landed.
 		entry(113, 1417, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_foreign_server_oid_index
+		// M0106-0010 Step 3bi: pg_foreign_table_relid_index.
+		//   postgres/src/include/catalog/pg_foreign_table.h:47
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_foreign_table_relid_index, 3119,
+		//       ForeignTableRelidIndexId, pg_foreign_table,
+		//       btree(ftrelid oid_ops));
+		//   MAKE_SYSCACHE(FOREIGNTABLEREL,
+		//     pg_foreign_table_relid_index, 4);
+		// pg_foreign_table attnums (pg_foreign_table_d.h):
+		// 1=ftrelid. UNIQUE PRIMARY KEY over the pg_foreign_table heap
+		// OID 3118 (Step 3bh nailed rel). Single oid_ops key with
+		// collation 0 — same single-column oid PKEY pattern as
+		// pg_foreign_data_wrapper_oid_index (112, Step 3bd) and
+		// pg_foreign_server_oid_index (113, Step 3bg). Unlike most
+		// catalogs, pg_foreign_table has no system `oid` column —
+		// ftrelid is the primary key, but indkey points at attnum 1
+		// (ftrelid) all the same. E2E test surfaced OID 3119 as the
+		// next FATAL after Step 3bh seeded the heap nailed rel.
+		entry(3119, 3118, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_foreign_table_relid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
