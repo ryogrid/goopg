@@ -671,6 +671,68 @@ func bootstrapPgDatabaseOidIndex(dataDir string) error {
 }
 
 
+// bootstrapPgDatabaseDatnameIndex (M0106-0010 step 3dh) overwrites the empty
+// btree placeholder at global/2671 with a populated 2-page btree (metapage +
+// leaf-root) carrying one name-keyed IndexTuple per pg_database heap row
+// written by bootstrapPostgresDatabase.
+//
+// Surfaced by TestE2E_FailoverGoopgToPG/async after step 3dg fixed the SEGV
+// in pg_authid_rolname_index — the next connect attempt FATALs with
+//
+//	FATAL: 3D000: database "postgres" does not exist
+//
+// because InitPostgres' get_db_info() looks up the database by name through
+// the DATABASENAME syscache, which is backed by pg_database_datname_index
+// (PG18 OID 2671). With an empty btree the lookup misses and the backend
+// rejects the connection before any user query runs.
+//
+// pg_database tuples are written by bootstrapPostgresDatabase in
+// deterministic order onto a fresh block 0:
+//
+//	offset 1: template1
+//	offset 2: postgres
+//
+// Keys must be ascending in the leaf page (btree invariant). The name_ops
+// comparator (btnamecmp) does an unsigned byte comparison of the 64-byte
+// zero-padded NameData blob, so the lexicographic order is:
+//
+//	"postgres"  < "template1"
+//
+// (the third byte 's' (0x73) < 'm' (0x6d) — wait: "postgres"[1]='o' and
+// "template1"[1]='e', so the second byte already decides: 'o' (0x6f) >
+// 'e' (0x65)). Recheck: 'p' (0x70) > 't' (0x74)? No: 'p'=0x70, 't'=0x74,
+// so "postgres" < "template1" iff 'p' < 't' — true. So "postgres" comes
+// first. Index lives only under global/ — pg_database is a shared catalog
+// (relisshared = true, reltablespace = 1664).
+func bootstrapPgDatabaseDatnameIndex(dataDir string) error {
+	type nameTid struct {
+		name string
+		tid  uint16
+	}
+	entries := []nameTid{
+		{name: "template1", tid: 1},
+		{name: "postgres", tid: 2},
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleNameKey(0 /* heap block */, e.tid, e.name)
+	}
+	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		return fmt.Errorf("pg_database_datname_index leaf: %w", err)
+	}
+	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
+
+	file := make([]byte, 0, 2*storage.BlockSize)
+	file = append(file, meta...)
+	file = append(file, leaf...)
+
+	return os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(2671, 10)), file, 0o600)
+}
+
+
 // bootstrapPgTypeOidIndex (M0106-0010 step 3cz) overwrites the empty btree
 // placeholder at base/{1,5}/2703 (pg_type_oid_index) with a populated 2-page
 // btree carrying one oid-keyed IndexTuple per pg_type heap row written by

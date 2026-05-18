@@ -206,6 +206,17 @@ func Init(opts Options) error {
 	if err := bootstrapPgDatabaseOidIndex(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_database_oid_index: %w", err)
 	}
+	// M0106-0010 step 3dh: overwrite the empty btree placeholder at
+	// global/2671 with a populated 2-page btree carrying name-keyed
+	// IndexTuples for the same two pg_database heap rows. Without
+	// populated entries PG's InitPostgres → get_db_info() FATALs with
+	// `3D000: database "postgres" does not exist` because the syscache
+	// DATABASENAME lookup via pg_database_datname_index returns NULL.
+	// Surfaced by TestE2E_FailoverGoopgToPG/async after step 3dg fixed
+	// the SEGV in pg_authid_rolname_index.
+	if err := bootstrapPgDatabaseDatnameIndex(abs); err != nil {
+		return fmt.Errorf("goopg init: pg_database_datname_index: %w", err)
+	}
 	// M0106-0010 step 3cx: overwrite the empty btree placeholders at
 	// global/2676 (pg_authid_rolname_index) and global/2677
 	// (pg_authid_oid_index) with populated 2-page btrees so PG's

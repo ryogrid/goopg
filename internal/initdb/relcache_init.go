@@ -156,7 +156,18 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// `global/2964` is produced by `bootstrapSharedCatalogPlaceholders`.
 	{2964, "pg_db_role_setting", 83, 'r', 3, true, pgDbRoleSettingAttrs()},
 }, []idxSpec{
-	{OID: 2671, Name: "pg_database_datname_index"},
+	// M0106-0010 Step 3dh: pg_database_datname_index (OID 2671) is a
+	// 1-column UNIQUE btree on pg_database.datname (name_ops) — same
+	// shape as pg_authid_rolname_index. The default oid-stamped
+	// descriptor would make PG's _bt_compare→index_getattr load the
+	// first 4 inline NameData bytes of the leaf IndexTuple as a by-val
+	// Datum and pass them to btnamecmp as a pointer (latent SEGV — the
+	// exact bug fixed for OID 2676 in Step 3dg). The name-typed Attrs
+	// override below pre-empts that crash for the next backend lookup
+	// (InitPostgres → get_db_info() → SearchSysCache1(DATABASENAME, ...)).
+	{OID: 2671, Name: "pg_database_datname_index", Attrs: []nailedAttr{
+		{Name: "datname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
+	}},
 	{OID: 2672, Name: "pg_database_oid_index"},
 	// M0106-0010 Step 3dg: pg_authid_rolname_index (OID 2676) is a
 	// 1-column UNIQUE btree on pg_authid.rolname (name_ops). The

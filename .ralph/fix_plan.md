@@ -9174,6 +9174,53 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `Attrs: [{Name:"datname", TypeOID:19, Len:64, …}]` override.
         Pre-emptive fix or wait for the next E2E to surface it as a
         SEGV is a judgement call for whoever opens Step 3dh.
+      - Step 3dh LANDED 2026-05-18: pg_database_datname_index name-typed
+        descriptor + seeded leaf. Two-part fix:
+        (a) New `bootstrapPgDatabaseDatnameIndex` in
+        `internal/initdb/btree_index_bootstrap.go` overwrites the empty
+        btree placeholder at `global/2671` with a populated 2-page btree
+        (metapage + leaf-root) carrying name-keyed IndexTuples for the
+        two canonical pg_database rows: `template1` (tid=1) and `postgres`
+        (tid=2). Modelled on `bootstrapPgDatabaseOidIndex` (Step 3cs) and
+        the rolname half of `bootstrapPgAuthidIndexes` (Step 3cx). Keys
+        sorted lexicographically (`"postgres" < "template1"` byte-wise)
+        to honor the btree invariant. Wired into `bootstrap` in
+        `internal/initdb/initdb.go` immediately after
+        `bootstrapPgDatabaseOidIndex`, before `bootstrapPgAuthidIndexes`.
+        (b) `internal/initdb/relcache_init.go`: OID 2671 idxSpec gains an
+        explicit `Attrs: [{Name:"datname", TypeOID:19, Num:1, Len:64,
+        NotNull:true}]` override mirroring Step 3dg's fix for 2676. Without
+        this, `buildPgAttributeBlob` would emit oid-stamped defaults
+        (attbyval=1, attlen=4, attalign='i') and PG's
+        `_bt_compare→index_getattr→btnamecmp` would reproduce the same
+        4-byte by-val Datum SEGV on the very first lookup against the now-
+        populated leaf. The typed override makes the blob emit
+        attbyval=0, attlen=64, attalign='c' — the byref/64-byte NameData
+        contract btnamecmp expects.
+        Regression pins in `internal/initdb/pg_database_datname_index_test.go`:
+        `TestNailedPgDatabaseDatnameIndexHasNameDescriptor` asserts
+        descriptor + re-encoded pg_attribute blob bytes (attbyval @82,
+        attalign @83, attlen @72:74); `TestBootstrapPgDatabaseDatnameIndexWritesPopulatedBtree`
+        asserts file is 2 × BlockSize at global/2671, btm_root=1, nItems=2,
+        both seeded names present in leaf; `TestBootstrapPgDatabaseDatnameIndexLeafKeysAscending`
+        pins on-disk ordering (insertion-order regression would break
+        `_bt_search` despite both tuples being physically present).
+        Targeted tests pass (`go test -count=1 -run
+        'TestNailedPgDatabaseDatnameIndex|TestBootstrapPgDatabaseDatnameIndex|
+        TestNailedPgAuthidRolnameIndex|TestBootstrapPgAuthid|
+        TestPgBuildIndexTupleName' ./internal/initdb/`); `go build ./...`
+        clean; `make ralph-state-guard` PASS. Design:
+        `docs/design/0106-0010-step3dh-pg-database-datname-index.md`.
+        Next blocker (Step 3di): re-run
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        with the fix in place; capture the new fail (if any) and attribute
+        it. Working hypothesis: the next FATAL is in
+        `pg_namespace_nspname_index` (OID 2684) or
+        `pg_tablespace_spcname_index` (OID 2698) — both name-typed indexes
+        with the same latent SEGV risk; current relcache_init.go does
+        not yet carry typed overrides for either. Pre-emptive fix or wait
+        for the E2E to surface them is a judgement call for whoever
+        opens Step 3di.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
