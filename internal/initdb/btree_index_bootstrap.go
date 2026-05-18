@@ -908,3 +908,146 @@ func bootstrapPgIndexIndexrelidIndex(dataDir string, tids map[uint32]heapTID) er
 	}
 	return nil
 }
+
+// pgBuildIndexTupleOidOidOidInt2Key constructs an IndexTuple for the
+// (oid amprocfamily, oid amproclefttype, oid amprocrighttype,
+// int2 amprocnum) composite key used by pg_amproc_fam_proc_index
+// (OID 2655). Mirrors the byte layout PG's `index_form_tuple` produces
+// for a no-nulls 4-attribute tuple with all-fixed-width keys:
+//
+//	[0..1]   ItemPointerData.ip_blkid.bi_hi (heapBlk>>16, LE uint16)
+//	[2..3]   ItemPointerData.ip_blkid.bi_lo (heapBlk&0xFFFF, LE uint16)
+//	[4..5]   ItemPointerData.ip_posid       (heapOff, LE uint16)
+//	[6..7]   t_info (size_low_13_bits | flags=0)
+//	[8..11]  amprocfamily   (LE uint32)
+//	[12..15] amproclefttype (LE uint32)
+//	[16..19] amprocrighttype (LE uint32)
+//	[20..21] amprocnum       (LE int16)
+//	[22..23] MAXALIGN padding (zero)
+//
+// PG's _bt_compare walks the 4 keys lexicographically using their
+// respective opclasses (oid_ops, oid_ops, oid_ops, int2_ops) over the
+// fixed windows above; the trailing MAXALIGN pad never participates
+// in comparisons, only in tuple sizing.
+//
+// Total size = MAXALIGN(IndexTupleHeader + 4 + 4 + 4 + 2) =
+// MAXALIGN(22) = 24. The on-disk size stored in t_info's low 13 bits
+// is the MAXALIGN'd total (24) so PG `IndexTupleSize` matches
+// `len(out)`.
+//
+// See pgBuildIndexTupleOidKey for BlockIdData layout rationale.
+func pgBuildIndexTupleOidOidOidInt2Key(heapBlk uint32, heapOff uint16, family, lefttype, righttype uint32, num int16) []byte {
+	const (
+		hoff = 8
+		size = 24 // MAXALIGN(hoff + 4 + 4 + 4 + 2) = MAXALIGN(22) = 24
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	// ItemPointerData: bi_hi at [0..1], bi_lo at [2..3], ip_posid at [4..5].
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+
+	// t_info: lower 13 bits = size; no INDEX_VAR_MASK / INDEX_NULL_MASK.
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	// Key data — four packed columns, no inter-column padding (all
+	// fixed-width; alignment of int2 after three 4-byte oids is
+	// satisfied because the running offset 8+12=20 is already 2-aligned).
+	le.PutUint32(out[hoff:hoff+4], family)
+	le.PutUint32(out[hoff+4:hoff+8], lefttype)
+	le.PutUint32(out[hoff+8:hoff+12], righttype)
+	le.PutUint16(out[hoff+12:hoff+14], uint16(num))
+	// Bytes [22..23] are MAXALIGN padding — already zero.
+	return out
+}
+
+// bootstrapPgAmprocFamProcIndex overwrites the empty btree placeholders
+// at base/{1,5}/2655 + global/2655 with a populated 2-page btree
+// (metapage + leaf-root) carrying one IndexTuple per pg_amproc heap row,
+// keyed on (amprocfamily, amproclefttype, amprocrighttype, amprocnum).
+//
+// M0106-0010 step 3cw: surfaced by TestE2E_FailoverGoopgToPG/async after
+// step 3cv cleared the pg_shseclabel attalign FATAL. The next FATAL is
+//
+//	missing support function 1 for attribute 1 of index "pg_authid_rolname_index"
+//
+// emitted from `postgres/src/backend/access/index/indexam.c:946` when
+// `irel->rd_support[procindex] == InvalidOid`. The rd_support array is
+// filled during `IndexSupportInitialize` via a sysscan of
+// `pg_amproc_fam_proc_index`. Step 3k's empty btree placeholder returned
+// zero rows for every (family, lefttype, righttype, num) probe, so PG
+// stored InvalidOid in every slot of rd_support and FATALed on the
+// first index dispatch (`pg_authid_rolname_index` opens early during
+// `InitPostgres` for client-auth lookups).
+//
+// pgAmprocInitialEntries currently emits 36 rows (≤ one 8-KiB page even
+// at 24-byte tuples + 4-byte line pointers = 28 bytes per item =
+// ~1 KiB total) so the simple single-leaf-root builder is sufficient.
+// If the entry count later exceeds ~292 rows the bulk-load builder
+// must be generalised to 24-byte tuples — left as a future step.
+//
+// nkeyatts = 4 because the index is fully composite over four
+// fixed-width columns (3× oid_ops + int2_ops).
+func bootstrapPgAmprocFamProcIndex(dataDir string, tids []heapTID) error {
+	entries := pgAmprocInitialEntries()
+	if len(entries) != len(tids) {
+		return fmt.Errorf("pg_amproc_fam_proc_index: entries=%d tids=%d", len(entries), len(tids))
+	}
+	type indexed struct {
+		family, lefttype, righttype uint32
+		num                         int16
+		block                       uint32
+		off                         uint16
+	}
+	items := make([]indexed, len(entries))
+	for i, e := range entries {
+		items[i] = indexed{
+			family:    e.Family,
+			lefttype:  e.LeftType,
+			righttype: e.RightType,
+			num:       int16(e.Num),
+			block:     tids[i].Block,
+			off:       tids[i].Offset,
+		}
+	}
+	sort.Slice(items, func(i, j int) bool {
+		a, b := items[i], items[j]
+		if a.family != b.family {
+			return a.family < b.family
+		}
+		if a.lefttype != b.lefttype {
+			return a.lefttype < b.lefttype
+		}
+		if a.righttype != b.righttype {
+			return a.righttype < b.righttype
+		}
+		return a.num < b.num
+	})
+
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidOidOidInt2Key(it.block, it.off, it.family, it.lefttype, it.righttype, it.num)
+	}
+	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		return fmt.Errorf("pg_amproc_fam_proc_index leaf: %w", err)
+	}
+	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
+
+	file := make([]byte, 0, 2*storage.BlockSize)
+	file = append(file, meta...)
+	file = append(file, leaf...)
+
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2655, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_amproc_fam_proc_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}

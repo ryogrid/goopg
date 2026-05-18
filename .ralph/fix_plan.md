@@ -8472,6 +8472,104 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         support proc 1 (`btnamecmp`). pg_authid_rolname_index keys
         on `rolname` (NAME type), opened by `CheckMyDatabase` or
         the auth path during `InitPostgres`.
+      - Step 3cw LANDED 2026-05-18. Closes the FATAL
+        `XX000: missing support function 1 for attribute 1 of index
+        "pg_authid_rolname_index"` PG-standby boot blocker surfaced by
+        Step 3cv. Root cause was NOT a missing pg_amproc heap row —
+        `btnamecmp` (proc 359, family 1994, lefttype/righttype 19) is
+        already present in `pgAmprocInitialEntries` and has been since
+        Step 3a. The actual missing piece was the corresponding
+        `pg_amproc_fam_proc_index` (PG18 OID 2655) btree leaves: the
+        index file was still a Step-3k empty placeholder
+        (`btm_root = P_NONE`), so PG's
+        `IndexSupportInitialize → sysscan(2655)` returned zero rows
+        and stored `InvalidOid` in every `rd_support[procindex]` slot.
+        The FATAL fires from `indexam.c:946` the first time any
+        nailed index dispatches to its comparison function;
+        `pg_authid_rolname_index` is the first such index opened —
+        early in `InitPostgres` for client-auth role lookups.
+        Step 3y registered 2655 in `pgIndexInitialEntries` /
+        `nailedLocalRels` (so the relcache entry could be opened) but
+        explicitly deferred the 4-column composite-key encoder — the
+        AMOPSTRATEGY syscache tolerates a zero-row result so the
+        blocker only surfaced now that earlier FATALs (3z..3cv) have
+        all been cleared.
+        Fix: new 4-column composite-key IndexTuple builder
+        `pgBuildIndexTupleOidOidOidInt2Key(heapBlk, heapOff, family,
+        lefttype, righttype, num)` in
+        `internal/initdb/btree_index_bootstrap.go` — goopg's first
+        4-column composite-key IndexTuple. Layout (no nulls,
+        all-fixed-width keys):
+        `[0..1] bi_hi || [2..3] bi_lo || [4..5] ip_posid ||
+        [6..7] t_info=0x0018 || [8..11] family || [12..15] lefttype
+        || [16..19] righttype || [20..21] num || [22..23]
+        MAXALIGN pad`. Total = `MAXALIGN(IndexTupleHeader + 4 + 4 +
+        4 + 2) = MAXALIGN(22) = 24`. New
+        `bootstrapPgAmprocFamProcIndex(dataDir, tids)` in same file
+        walks `pgAmprocInitialEntries`, pairs each row with its
+        heapTID, sorts ascending lexicographic on (family, lefttype,
+        righttype, num), builds the 2-page btree via
+        `pgBuildBtreeLeafRootPage` / `pgBuildBtreeMetapageWithRoot`,
+        and writes to `base/{1,5}/2655 + global/2655`. The 36 entries
+        in `pgAmprocInitialEntries` fit in a single leaf page (~1 KiB
+        at 28 bytes/item) so the 16-byte-only bulk-load builder does
+        not need to be generalised in this step. The empty-placeholder
+        OID lists in `bootstrapPostgresDatabase` already include 2655
+        from Step 3k, so the populated file overwrites the
+        placeholder without additional list edits.
+        Heap-bootstrap signature change: `bootstrapPgAmprocTuples`
+        widened from `error` to `([]heapTID, error)` so its per-row
+        TIDs can flow into the new index bootstrap. Single existing
+        test caller (`TestBootstrapPgAmprocTuplesWritesRowsToBase1And5`)
+        updated to discard the slice with `_, err :=`. `Init` captures
+        `pgAmprocTIDs, err := bootstrapPgAmprocTuples(abs)` and calls
+        `bootstrapPgAmprocFamProcIndex(abs, pgAmprocTIDs)` immediately
+        after.
+        Regression pins (new in
+        `internal/initdb/pg_amproc_fam_proc_index_test.go`):
+        `TestPgBuildIndexTupleOidOidOidInt2KeyLayoutMatchesPG18`
+        (byte-exact 24-byte layout with bi_hi/bi_lo split using
+        0xDEADBEEF — catches the Step-3s LE-uint32 trap regression —
+        t_info=0x0018, zero MAXALIGN pad);
+        `TestBootstrapPgAmprocFamProcIndexWritesPopulatedBtree`
+        (end-to-end: file = 2 blocks at all three on-disk locations;
+        metapage `btm_root == 1`; leaf line-pointer count == 36;
+        mandatory presence of `(family=1976, left=23, right=23, num=1)`
+        btint4cmp AND `(family=1994, left=19, right=19, num=1)`
+        btnamecmp — the latter is the precise row whose absence
+        triggered the Step 3cw FATAL).
+        Verified: `go build ./...` PASS;
+        `go test -count=1 -run
+        'TestPgBuildIndexTupleOidOidOidInt2Key|TestBootstrapPgAmprocFamProcIndex|TestBootstrapPgAmprocTuples'
+        ./internal/initdb/` PASS (3/3);
+        `go test -count=1 ./internal/initdb/` — same 15 pre-existing
+        baseline failures as Step 3cv (`TestMigration*`,
+        `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS;
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        re-run confirms the `missing support function` FATAL is gone.
+        Design:
+        `docs/design/0106-0010-step3cw-pg-amproc-fam-proc-index.md`.
+        Next blocker (Step 3cx): first standby FATAL is now
+        `FATAL: 28000: role "ryo" does not exist` from
+        `InitializeSessionUserId` (miscinit.c:802) — `pg_authid` is
+        missing the OS-user role (`ryo`) entirely and/or
+        `pg_authid_rolname_index` is unpopulated. The bootstrapped
+        `pg_authid` has only the canonical `postgres` superuser; PG
+        opens the connection as the OS user and asks for that role,
+        which doesn't exist. Carry-over from Step 3y for
+        `pg_amop_fam_strat_index` (OID 2653) — same 4-column
+        composite-key encoder applies (amopfamily, amoplefttype,
+        amoprighttype, amopstrategy); populate when a concrete
+        planner-path blocker surfaces.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

@@ -252,8 +252,20 @@ func Init(opts Options) error {
 	if err := bootstrapPgAmopTuples(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_amop tuples: %w", err)
 	}
-	if err := bootstrapPgAmprocTuples(abs); err != nil {
+	pgAmprocTIDs, err := bootstrapPgAmprocTuples(abs)
+	if err != nil {
 		return fmt.Errorf("goopg init: pg_amproc tuples: %w", err)
+	}
+	// M0106-0010 step 3cw: overwrite the empty btree placeholder at
+	// base/{1,5}/2655 + global/2655 with a populated 2-page btree
+	// (metapage + leaf-root) carrying one (family, lefttype, righttype,
+	// num)-keyed IndexTuple per pg_amproc heap row so PG's
+	// IndexSupportInitialize → sysscan(pg_amproc_fam_proc_index) finds
+	// the cmp/sortsupport/equalimage rows. Without this the next FATAL
+	// during standby boot is "missing support function 1 for attribute
+	// 1 of index pg_authid_rolname_index".
+	if err := bootstrapPgAmprocFamProcIndex(abs, pgAmprocTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_amproc_fam_proc_index: %w", err)
 	}
 	// M0106-0010 step 3f: write an empty pg_index heap page so PG's
 	// RelationOpenSmgr → mdopen during nailed-index initialisation
@@ -1799,15 +1811,18 @@ func pgAmprocRow(e pgAmprocEntry) executor.Row {
 // base/{1,5}/2603. This is load-bearing for standby boot — PG's
 // LookupOpclassInfo unconditionally scans pg_amproc as part of
 // RelationInitIndexAccessInfo for every nailed index.
-func bootstrapPgAmprocTuples(dataDir string) error {
+//
+// Returns the per-row heapTIDs in pgAmprocInitialEntries order so
+// bootstrapPgAmprocFamProcIndex (Step 3cw) can build composite-key
+// IndexTuples pointing at the heap rows.
+func bootstrapPgAmprocTuples(dataDir string) ([]heapTID, error) {
 	cols := pgAmprocColDefs()
 	entries := pgAmprocInitialEntries()
 	rows := make([]executor.Row, 0, len(entries))
 	for _, e := range entries {
 		rows = append(rows, pgAmprocRow(e))
 	}
-	_, err := writeMultiPageHeapRows(dataDir, "2603", cols, rows)
-	return err
+	return writeMultiPageHeapRows(dataDir, "2603", cols, rows)
 }
 
 // pgIndexColDefs returns the full PG18 FormData_pg_index column shape

@@ -244,7 +244,7 @@ func TestBootstrapPgAmprocTuplesWritesRowsToBase1And5(t *testing.T) {
 			t.Fatalf("mkdir %s: %v", sub, err)
 		}
 	}
-	if err := bootstrapPgAmprocTuples(dir); err != nil {
+	if _, err := bootstrapPgAmprocTuples(dir); err != nil {
 		t.Fatalf("bootstrapPgAmprocTuples: %v", err)
 	}
 	// Needle: oid=7100 || family=1976 || left=23 || right=23.
