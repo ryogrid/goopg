@@ -458,6 +458,7 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		6104, // pg_publication (M0106-0010 step 3bu)
 		6237, // pg_publication_namespace (M0106-0010 step 3bx)
 		6106, // pg_publication_rel (M0106-0010 step 3by)
+		3541, // pg_range (M0106-0010 step 3bz)
 		6003, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		6101, // pg_publication_rel
 		6102, // pg_sequence
@@ -798,6 +799,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{6104, 6104}, // pg_publication (M0106-0010 step 3bu)
 		{6237, 6237}, // pg_publication_namespace (M0106-0010 step 3bx)
 		{6106, 6106}, // pg_publication_rel (M0106-0010 step 3by)
+		{3541, 3541}, // pg_range (M0106-0010 step 3bz)
 		{6003, 6003}, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
 		{6101, 6101}, // pg_publication_rel
 		{6102, 6102}, // pg_sequence
@@ -855,6 +857,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		6112, // pg_publication_rel_oid_index (Step 3by)
 		6113, // pg_publication_rel_prrelid_prpubid_index (Step 3by)
 		6116, // pg_publication_rel_prpubid_index (Step 3by)
+		3542, // pg_range_rngtypid_index (Step 3bz)
+		2228, // pg_range_rngmultitypid_index (Step 3bz)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -912,6 +916,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		6112, // pg_publication_rel_oid_index (Step 3by)
 		6113, // pg_publication_rel_prrelid_prpubid_index (Step 3by)
 		6116, // pg_publication_rel_prpubid_index (Step 3by)
+		3542, // pg_range_rngtypid_index (Step 3bz)
+		2228, // pg_range_rngmultitypid_index (Step 3bz)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2465,6 +2471,30 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_publication_rel family. Without this entry
 		// RelationIdGetRelation(6116) FATALs.
 		entry(6116, 6106, []int16{2}, []uint32{oidOps}, []uint32{0}, false, false), // pg_publication_rel_prpubid_index
+		// M0106-0010 Step 3bz: pg_range_rngtypid_index.
+		//   postgres/src/include/catalog/pg_range.h:60
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_range_rngtypid_index, 3542,
+		//       RangeTypidIndexId, pg_range, btree(rngtypid oid_ops));
+		//   MAKE_SYSCACHE(RANGETYPE, pg_range_rngtypid_index, 4);
+		// pg_range attnums (pg_range_d.h): 1=rngtypid, 2=rngsubtype,
+		// 3=rngmultitypid, 4=rngcollation, 5=rngsubopc, 6=rngcanonical,
+		// 7=rngsubdiff. UNIQUE PRIMARY (DECLARE_UNIQUE_INDEX_PKEY) single
+		// oid_ops key (no collation) over pg_range heap OID 3541 (Step 3bz
+		// nailed local rel). Without this entry RelationIdGetRelation(3542)
+		// FATALs.
+		entry(3542, 3541, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_range_rngtypid_index
+		// M0106-0010 Step 3bz: pg_range_rngmultitypid_index.
+		//   postgres/src/include/catalog/pg_range.h:61
+		//     DECLARE_UNIQUE_INDEX(pg_range_rngmultitypid_index, 2228,
+		//       RangeMultirangeTypidIndexId, pg_range,
+		//       btree(rngmultitypid oid_ops));
+		//   MAKE_SYSCACHE(RANGEMULTIRANGE,
+		//     pg_range_rngmultitypid_index, 4);
+		// UNIQUE (NOT primary; DECLARE_UNIQUE_INDEX, not the _PKEY variant
+		// — PKEY is 3542 = pg_range_rngtypid_index) single oid_ops key over
+		// pg_range heap OID 3541. attnum 3 = rngmultitypid. Without this
+		// entry RelationIdGetRelation(2228) FATALs.
+		entry(2228, 3541, []int16{3}, []uint32{oidOps}, []uint32{0}, true, false), // pg_range_rngmultitypid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

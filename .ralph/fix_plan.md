@@ -6962,6 +6962,70 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         next pg_publication_* / pg_subscription_* nailed-rel
         territory (Step 3bz). Design:
         `docs/design/0106-0010-step3by-pg-publication-rel-nailed-rel.md`.
+      - Step 3bz LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 3541` PG-standby boot blocker that surfaces
+        after Step 3by seeded the pg_publication_rel family. OID 3541
+        is `pg_range` per
+        `postgres/src/include/catalog/pg_range.h:29`
+        (`CATALOG(pg_range,3541,RangeRelationId)`).
+        Family-complete seed in one step: heap 3541 + both declared
+        indexes 3542 (UNIQUE PRIMARY `oid_ops` over rngtypid, backs
+        `MAKE_SYSCACHE(RANGETYPE)`) and 2228 (UNIQUE `oid_ops` over
+        rngmultitypid, backs `MAKE_SYSCACHE(RANGEMULTIRANGE)`).
+        (a) `pgRangeAttrs()` (relcache_init.go) returns the 7-column
+        PG18 schema: all 7 columns fixed-width NOT NULL — 5 `oid`
+        (rngtypid, rngsubtype, rngmultitypid, rngcollation, rngsubopc;
+        TypeOID 26, Len 4) + 2 `regproc` (rngcanonical, rngsubdiff;
+        TypeOID 24, Len 4). pg_range has **no `oid` system column**
+        — attnums start at 1 = rngtypid per pg_range_d.h;
+        BKI_LOOKUP_OPT columns still NOT NULL (value 0 is a
+        sentinel). RelType=83 is safe (no `RangeRelation_Rowtype_Id`
+        in PG18 headers).
+        (b) `bootstrapMappedLocalCatalogHeaps` (initdb.go) OID list
+        gains `3541, // pg_range (M0106-0010 step 3bz)` after the
+        Step 3by 6106 entry; `localRelMap` gains `{3541, 3541}`
+        analogously.
+        (c) `pgIndexInitialEntries` (initdb.go) gains
+        `entry(3542, 3541, []int16{1}, []uint32{oidOps}, []uint32{0},
+        true, true)` (UNIQUE PRIMARY rngtypid PKEY) and
+        `entry(2228, 3541, []int16{3}, []uint32{oidOps}, []uint32{0},
+        true, false)` (UNIQUE non-PKEY rngmultitypid) after the
+        Step 3by 6116 entry.
+        (d) `nailedLocalRels` idxSpec list (relcache_init.go) gains
+        `{3542, "pg_range_rngtypid_index"}` and
+        `{2228, "pg_range_rngmultitypid_index"}` after the Step 3by
+        6116 entry; `flattenRels`+`pgIndexNattsByOID` derives
+        `RelKind='i', RelNatts=1` for both.
+        (e) Two critical-index placeholder OID lists at
+        `bootstrapPostgresDatabase` (`base/<dboid>/` and `global/`)
+        each gain `3542, // pg_range_rngtypid_index (Step 3bz)` and
+        `2228, // pg_range_rngmultitypid_index (Step 3bz)`.
+        Empty-btree placeholder is sufficient because pg_range is
+        unpopulated at bootstrap.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgRange`,
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgRange`,
+        `TestPgRangeRngtypidIndexInitialEntry`,
+        `TestPgRangeRngmultitypidIndexInitialEntry` in
+        `internal/initdb/pg_range_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended
+        with `3542:{1}` + `2228:{3}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3542 + 2228;
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        extended with 3541 (strict list guard).
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgRange|TestBootstrapMappedLocalCatalogHeapsIncludesPgRange|TestPgRangeRngtypidIndexInitialEntry|TestPgRangeRngmultitypidIndexInitialEntry|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3by (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. With the heap
+        (3541) + PKEY (3542) + UNIQUE secondary (2228) all seeded,
+        the pg_range family is fully wired. Next anticipated blocker
+        on E2E re-run lies in the next pg_subscription / pg_statistic
+        catalog territory (Step 3ca). Design:
+        `docs/design/0106-0010-step3bz-pg-range-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

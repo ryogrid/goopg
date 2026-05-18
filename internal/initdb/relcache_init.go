@@ -317,6 +317,17 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// fixed-width NOT NULL (oid, prpubid, prrelid) + 2 CATALOG_VARLEN
 	// nullable (prqual pg_node_tree, prattrs int2vector).
 	{6106, "pg_publication_rel", 83, 'r', 5, false, pgPublicationRelAttrs()},
+	// M0106-0010 step 3bz: pg_range is opened during PG-standby boot once
+	// Step 3by cleared the pg_publication_rel family. Without a pg_class row,
+	// `RelationBuildDesc(3541) → ScanPgRelation(3541)` returns NULL and the
+	// backend FATALs with `could not open relation with OID 3541`. RelType=83
+	// is safe because pg_range is not formrdesc'd (no
+	// `RangeRelation_Rowtype_Id` constant in PG18 headers). Schema per
+	// `postgres/src/include/catalog/pg_range.h` (PG18, RangeRelationId == 3541).
+	// 7 columns total, all fixed-width NOT NULL (rngtypid, rngsubtype,
+	// rngmultitypid, rngcollation, rngsubopc, rngcanonical, rngsubdiff).
+	// pg_range has no `oid` system column — attnums start at 1.
+	{3541, "pg_range", 83, 'r', 7, false, pgRangeAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -738,6 +749,25 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
 		{6116, "pg_publication_rel_prpubid_index"},
+		// M0106-0010 Step 3bz: pg_range_rngtypid_index. PG18
+		// `postgres/src/include/catalog/pg_range.h:60` declares
+		// `RangeTypidIndexId = 3542` as UNIQUE PRIMARY KEY on
+		// btree(rngtypid oid_ops). Heap OID 3541 (pg_range) is the
+		// nailed local rel above (Step 3bz). Backs
+		// MAKE_SYSCACHE(RANGETYPE, pg_range_rngtypid_index, 4). Without
+		// this entry RelationIdGetRelation(3542) FATALs because no
+		// pg_class row gets seeded; flattenRels derives RelNatts=1 via
+		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+		// relnatts/indnatts check (relcache.c:1492).
+		{3542, "pg_range_rngtypid_index"},
+		// M0106-0010 Step 3bz: pg_range_rngmultitypid_index. PG18
+		// `postgres/src/include/catalog/pg_range.h:61` declares
+		// `RangeMultirangeTypidIndexId = 2228` as UNIQUE (NOT primary)
+		// on btree(rngmultitypid oid_ops). Heap OID 3541 (pg_range) is
+		// the nailed local rel above (Step 3bz). Backs
+		// MAKE_SYSCACHE(RANGEMULTIRANGE, pg_range_rngmultitypid_index, 4).
+		// Without this entry RelationIdGetRelation(2228) FATALs.
+		{2228, "pg_range_rngmultitypid_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1598,6 +1628,28 @@ func pgPublicationRelAttrs() []nailedAttr {
 		{Name: "prrelid", TypeOID: 26, Num: 3, Len: 4, NotNull: true},   // oid → pg_class
 		{Name: "prqual", TypeOID: 194, Num: 4, Len: -1, NotNull: false}, // pg_node_tree (nullable)
 		{Name: "prattrs", TypeOID: 22, Num: 5, Len: -1, NotNull: false}, // int2vector (nullable)
+	}
+}
+
+// pgRangeAttrs defines the 7-column PG18 pg_range schema. PG
+// `RelationBuildDesc(3541) → ScanPgRelation(3541)` looks up these
+// rows during standby startup; without them the backend FATALs with
+// `could not open relation with OID 3541`. Sourced verbatim from
+// `postgres/src/include/catalog/pg_range.h` (PG18,
+// RangeRelationId == 3541). pg_range has no `oid` system column —
+// attnums start at 1 = rngtypid. All 7 columns are fixed-width
+// (oid 4B, regproc 4B). BKI_LOOKUP_OPT columns are still NOT NULL in
+// the table descriptor (value 0 is a sentinel meaning "no canonical /
+// no subdiff"). M0106-0010 step 3bz.
+func pgRangeAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "rngtypid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},       // oid → pg_type
+		{Name: "rngsubtype", TypeOID: 26, Num: 2, Len: 4, NotNull: true},     // oid → pg_type
+		{Name: "rngmultitypid", TypeOID: 26, Num: 3, Len: 4, NotNull: true},  // oid → pg_type
+		{Name: "rngcollation", TypeOID: 26, Num: 4, Len: 4, NotNull: true},   // oid → pg_collation (LOOKUP_OPT)
+		{Name: "rngsubopc", TypeOID: 26, Num: 5, Len: 4, NotNull: true},      // oid → pg_opclass
+		{Name: "rngcanonical", TypeOID: 24, Num: 6, Len: 4, NotNull: true},   // regproc → pg_proc (LOOKUP_OPT)
+		{Name: "rngsubdiff", TypeOID: 24, Num: 7, Len: 4, NotNull: true},     // regproc → pg_proc (LOOKUP_OPT)
 	}
 }
 
