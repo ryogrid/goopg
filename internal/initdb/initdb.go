@@ -837,15 +837,15 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	// datlocale, daticurules, datcollversion, datacl are NULL per BKI defaults
 	// (libc uses datcollate/datctype, not datlocale; no ICU rules; no recorded
 	// collation version; no ACL means default-public access).
-	buildRow := func(oid uint32, name string) executor.Row {
+	buildRow := func(oid uint32, name string, isTemplate bool, allowConn bool) executor.Row {
 		return executor.Row{
 			executor.NewIntDatum(int64(oid)),     // oid
 			executor.NewStringDatum(name),        // datname
 			executor.NewIntDatum(10),             // datdba = bootstrap superuser
 			executor.NewIntDatum(6),              // encoding = PG_UTF8
 			executor.NewStringDatum("c"),         // datlocprovider = libc
-			executor.NewBoolDatum(false),         // datistemplate
-			executor.NewBoolDatum(true),          // datallowconn
+			executor.NewBoolDatum(isTemplate),    // datistemplate
+			executor.NewBoolDatum(allowConn),     // datallowconn
 			executor.NewBoolDatum(false),         // dathasloginevt
 			executor.NewIntDatum(-1),             // datconnlimit
 			executor.NewIntDatum(3),              // datfrozenxid
@@ -889,10 +889,13 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	if err := storage.InitPage(page); err != nil {
 		return err
 	}
-	if err := writeRow(page, buildRow(1, "template1")); err != nil {
+	if err := writeRow(page, buildRow(1, "template1", true, true)); err != nil {
 		return err
 	}
-	if err := writeRow(page, buildRow(5, "postgres")); err != nil {
+	if err := writeRow(page, buildRow(5, "postgres", false, true)); err != nil {
+		return err
+	}
+	if err := writeRow(page, buildRow(4, "template0", true, false)); err != nil {
 		return err
 	}
 	// Also create index placeholders in base/1/ (goopg's default
@@ -1037,7 +1040,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	// Critical index placeholder pages — PG backends PANIC if these
 	// files don't exist (load_critical_index in relcache.c).
 	btreePage = makeBtreeRootPage()
-	for _, oid := range []uint32{
+	perDBIndexOIDs := []uint32{
 		// Local critical indexes
 		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
 		828, // pg_default_acl_oid_index (Step 3am)
@@ -1108,8 +1111,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3767, // pg_ts_template_oid_index (Step 3co)
 		174,  // pg_user_mapping_oid_index (Step 3cp)
 		175,  // pg_user_mapping_user_server_index (Step 3cp)
-		} {
-			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
+	}
+	for _, oid := range perDBIndexOIDs {
+		if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
 		}
 	}
@@ -1201,6 +1205,36 @@ func bootstrapPostgresDatabase(dataDir string) error {
 			return err
 		}
 	}
+	// Create the database directory for template0 (OID 4) with the same
+	// structure as postgres (OID 5): PG_VERSION, catalog copies, relmap, indexes.
+	tmpl0Dir := filepath.Join(dataDir, "base", "4")
+	if err := os.MkdirAll(tmpl0Dir, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(tmpl0Dir, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		return err
+	}
+	entries4, _ := os.ReadDir(base1Dir)
+	for _, e := range entries4 {
+		src := filepath.Join(base1Dir, e.Name())
+		dst := filepath.Join(tmpl0Dir, e.Name())
+		data, err := os.ReadFile(src)
+		if err != nil {
+			continue
+		}
+		if err := os.WriteFile(dst, data, 0o600); err != nil {
+			return err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(tmpl0Dir, "pg_filenode.map"), localRelMap, 0o600); err != nil {
+		return err
+	}
+	for _, oid := range perDBIndexOIDs {
+		if err := os.WriteFile(filepath.Join(tmpl0Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
+			return err
+		}
+	}
+
 	path := filepath.Join(dataDir, "global", "1262") // pg_database OID
 	return os.WriteFile(path, page, 0o600)
 }

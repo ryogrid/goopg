@@ -9635,7 +9635,7 @@ relcache init → replication readiness) and intra-package grouped.
       - Test: `internal/initdb/initdb_test.go`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-10** (bootstrap-procedure task 10)
+- [x] **M0106-0010 batched-10** (bootstrap-procedure task 10)
       - Summary: Seed `pg_database` OID 4 (`template0`,
         `datistemplate=true`, `datallowconn=false`) plus its leaf entries
         in `pg_database_oid_index` (2672) and `pg_database_datname_index`

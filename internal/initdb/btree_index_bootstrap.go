@@ -733,6 +733,7 @@ func bootstrapPgDatabaseOidIndex(dataDir string) error {
 	}
 	entries := []oidTid{
 		{oid: 1, tid: 1}, // template1
+		{oid: 4, tid: 3}, // template0
 		{oid: 5, tid: 2}, // postgres
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].oid < entries[j].oid })
@@ -795,7 +796,8 @@ func bootstrapPgDatabaseDatnameIndex(dataDir string) error {
 	}
 	entries := []nameTid{
 		{name: "template1", tid: 1},
-		{name: "postgres", tid: 2},
+		{name: "postgres",  tid: 2},
+		{name: "template0", tid: 3},
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
 

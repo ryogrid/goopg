@@ -77,9 +77,8 @@ func TestPgDatabaseAttrsMatchesPG18FormPgDatabase(t *testing.T) {
 func TestBootstrapPostgresDatabaseTupleHasVarWidthAndNullBitmap(t *testing.T) {
 	dir := t.TempDir()
 	// bootstrapPostgresDatabase writes more than just global/1262 — it
-	// also seeds the per-database directories. Pre-create them so the
-	// downstream copy/walk loops succeed.
-	for _, sub := range []string{"global", "base/1", "base/5"} {
+	// also seeds the per-database directories (base/1, base/4, base/5).
+	for _, sub := range []string{"global", "base/1", "base/4", "base/5"} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
 			t.Fatalf("mkdir %s: %v", sub, err)
 		}
@@ -100,8 +99,9 @@ func TestBootstrapPostgresDatabaseTupleHasVarWidthAndNullBitmap(t *testing.T) {
 	pdLower := binary.LittleEndian.Uint16(page[12:14])
 	// Line pointer array starts at offset 24, 4 bytes each.
 	nItems := (int(pdLower) - 24) / 4
-	if nItems != 2 {
-		t.Fatalf("expected 2 line pointers (template1 + postgres), got %d", nItems)
+	// Three pg_database rows: template1 (OID 1), postgres (OID 5), template0 (OID 4).
+	if nItems != 3 {
+		t.Fatalf("expected 3 line pointers (template1 + postgres + template0), got %d", nItems)
 	}
 	const (
 		heapHasNull     uint16 = 0x0001

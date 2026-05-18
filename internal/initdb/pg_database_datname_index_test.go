@@ -65,9 +65,8 @@ func TestNailedPgDatabaseDatnameIndexHasNameDescriptor(t *testing.T) {
 
 // TestBootstrapPgDatabaseDatnameIndexWritesPopulatedBtree verifies that the
 // bootstrap helper lands a 2-page btree at global/2671 carrying name-keyed
-// IndexTuples for both canonical pg_database rows ("template1" at tid=1 and
-// "postgres" at tid=2). Without this, InitPostgres → get_db_info() FATALs
-// with `3D000: database "postgres" does not exist` on the first connect.
+// IndexTuples for all three pg_database rows: "template1" (tid=1),
+// "postgres" (tid=2), and "template0" (tid=3).
 func TestBootstrapPgDatabaseDatnameIndexWritesPopulatedBtree(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o700); err != nil {
@@ -92,8 +91,8 @@ func TestBootstrapPgDatabaseDatnameIndexWritesPopulatedBtree(t *testing.T) {
 	leaf := raw[storage.BlockSize : 2*storage.BlockSize]
 	pdLower := le.Uint16(leaf[12:14])
 	nItems := int((pdLower - storage.SizeOfPageHeaderData) / 4)
-	if nItems != 2 {
-		t.Errorf("nItems=%d, want 2", nItems)
+	if nItems != 3 {
+		t.Errorf("nItems=%d, want 3", nItems)
 	}
 	if !leafContainsName(raw, "template1") {
 		t.Error("leaf missing tuple keyed on \"template1\"")
@@ -101,18 +100,21 @@ func TestBootstrapPgDatabaseDatnameIndexWritesPopulatedBtree(t *testing.T) {
 	if !leafContainsName(raw, "postgres") {
 		t.Error("leaf missing tuple keyed on \"postgres\"")
 	}
+	if !leafContainsName(raw, "template0") {
+		t.Error("leaf missing tuple keyed on \"template0\"")
+	}
 }
 
 // TestBootstrapPgDatabaseDatnameIndexLeafKeysAscending pins the on-disk
-// ordering of leaf tuples: the btree invariant requires ascending keys, and
-// btnamecmp does an unsigned byte comparison on the zero-padded NameData
-// blob. For the two seeded datnames the lexicographic order is:
+// ordering of leaf tuples. btnamecmp does unsigned byte comparison on the
+// 64-byte zero-padded NameData blob, so the three seeded datnames sort as:
 //
-//	"postgres"  < "template1"
+//	"postgres" < "template0" < "template1"
 //
-// because 'p' (0x70) < 't' (0x74) at byte 0. A regression that sorts in
-// insertion order ("template1", "postgres") would break _bt_search and
-// surface as a missed lookup even though both tuples are physically present.
+// ('p'=0x70 < 't'=0x74; "template0" vs "template1" differ at the last byte:
+// '0'=0x30 < '1'=0x31). A regression that emits in insertion order would
+// break _bt_search and surface as missed lookups even though all tuples
+// are physically present.
 func TestBootstrapPgDatabaseDatnameIndexLeafKeysAscending(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o700); err != nil {
@@ -129,8 +131,8 @@ func TestBootstrapPgDatabaseDatnameIndexLeafKeysAscending(t *testing.T) {
 	le := binary.LittleEndian
 	pdLower := le.Uint16(leaf[12:14])
 	nItems := int((pdLower - storage.SizeOfPageHeaderData) / 4)
-	if nItems != 2 {
-		t.Fatalf("nItems=%d, want 2", nItems)
+	if nItems != 3 {
+		t.Fatalf("nItems=%d, want 3", nItems)
 	}
 	readName := func(idx int) string {
 		lp := le.Uint32(leaf[storage.SizeOfPageHeaderData+idx*4:])
@@ -142,11 +144,14 @@ func TestBootstrapPgDatabaseDatnameIndexLeafKeysAscending(t *testing.T) {
 		}
 		return string(nd[:n])
 	}
-	got0, got1 := readName(0), readName(1)
+	got0, got1, got2 := readName(0), readName(1), readName(2)
 	if got0 != "postgres" {
 		t.Errorf("leaf[0]=%q, want \"postgres\"", got0)
 	}
-	if got1 != "template1" {
-		t.Errorf("leaf[1]=%q, want \"template1\"", got1)
+	if got1 != "template0" {
+		t.Errorf("leaf[1]=%q, want \"template0\"", got1)
+	}
+	if got2 != "template1" {
+		t.Errorf("leaf[2]=%q, want \"template1\"", got2)
 	}
 }
