@@ -8396,6 +8396,82 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/mvcc/` PASS.
         Design:
         `docs/design/0106-0010-step3cu-pg-db-role-setting-nailed-rel.md`.
+      - Step 3cv LANDED 2026-05-18. Closes the persistent
+        `XX000: invalid attalign value:` (empty `%c`) PG-standby
+        user-backend FATAL surfaced by Step 3cu. Root cause:
+        `pgShseclabelAttrs()` declared a 6-column schema (`oid`,
+        `classoid`, `objoid`, `objsubid`, `provider`, `label`) and
+        `nailedSharedRels[3592].RelNatts = 6`, but PG18's
+        `postgres/src/include/catalog/pg_shseclabel.h` defines
+        exactly 4 columns (`objoid`, `classoid`, `provider`,
+        `label`). PG's `formrdesc("pg_shseclabel",
+        Natts_pg_shseclabel=4, Desc_pg_shseclabel)` at Phase2
+        allocates a 4-element `rd_att` array; the on-disk
+        pg_class.relnatts=6 then caused the first user-backend's
+        `write_relcache_init_file(true)` to iterate 6 slots over
+        the 4-element array, OOB-writing two garbage CompactAttribute
+        slots into `global/pg_internal.init`. Every subsequent
+        backend's `load_relcache_init_file(true)` parsed the garbage
+        and FATALed at `populate_compact_attribute_internal,
+        tupdesc.c:105` (attlen=488=sizeofRelationData,
+        attalign=0x00, attstorage=0xa0 — classic OOB read
+        fingerprint).
+        Diagnostic that nailed it (reverted after investigation per
+        AGENT.md): `elog(LOG, ...)` with `backtrace_symbols` in
+        tupdesc.c plus per-attr trace in `load_relcache_init_file`
+        showed `relno=19 rel_oid=3592 relnatts=6 attr[0..3] OK
+        attr[4] attrelid=126 attlen=488 attalign=0x00`.
+        Fix:
+        (a) `internal/initdb/relcache_init.go::pgShseclabelAttrs()`
+        rewritten to the PG18 4-column schema in exact order
+        (objoid oid Num=1 Len=4 NotNull; classoid oid Num=2 Len=4
+        NotNull; provider text Num=3 Len=-1 NotNull; label text
+        Num=4 Len=-1 NotNull). The previous `oid` and `objsubid`
+        columns were never real columns of this catalog at all.
+        (b) `nailedSharedRels` entry for OID 3592 changes
+        `RelNatts: 6 → 4`.
+        (c) The companion index `pg_shseclabel_object_index` (OID
+        3593, attnums `{1,2,3}`) had a comment naming the keys as
+        "objoid, classoid, provider" but with goopg's old attr
+        order those attnums pointed at `oid, classoid, objoid` —
+        silently wrong. After the attr renumbering they correctly
+        resolve to `objoid, classoid, provider`. No code change to
+        the index entry was required.
+        Regression pins (new in
+        `internal/initdb/pg_shseclabel_pg18_schema_test.go`):
+        `TestPgShseclabelAttrsMatchesPG18FormPgShseclabel` (strict
+        4-attr fixture by name/TypeOID/Num/Len/NotNull, count guard
+        forces future divergence to update the fixture);
+        `TestNailedSharedRelsPgShseclabelRelnattsIsFour` (load-
+        bearing `RelNatts == 4` guard + `OID == 3592` +
+        `RelType == 4066 (SharedSecLabelRelation_Rowtype_Id)`).
+        Verified: `go build ./...` PASS; targeted
+        `go test -count=1 -run 'TestPgShseclabel|TestNailedSharedRelsPgShseclabel'
+        ./internal/initdb/` PASS (2/2 new tests);
+        `go test -count=1 ./internal/initdb/` — same 15 baseline
+        failures as Step 3cu (`TestMigration*`, `TestCreate*`,
+        `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS;
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        re-run confirms the `invalid attalign value:` FATAL is
+        gone.
+        Design:
+        `docs/design/0106-0010-step3cv-pg-shseclabel-pg18-schema.md`.
+        Next blocker (Step 3cw): first standby FATAL is now
+        `FATAL: XX000: missing support function 1 for attribute 1
+        of index "pg_authid_rolname_index"` — a missing
+        `pg_amproc` row for `name_ops` family's comparison
+        support proc 1 (`btnamecmp`). pg_authid_rolname_index keys
+        on `rolname` (NAME type), opened by `CheckMyDatabase` or
+        the auth path during `InitPostgres`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

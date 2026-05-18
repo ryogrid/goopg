@@ -86,7 +86,7 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// `relation->rd_att->tdtypeid == relp->reltype` (relcache.c:4293)
 	// PANICs every connecting client backend. See
 	// docs/design/0106-0010-step3v-pg-shseclabel-reltype.md.
-	{3592, "pg_shseclabel", 4066, 'r', 6, true, pgShseclabelAttrs()},
+	{3592, "pg_shseclabel", 4066, 'r', 4, true, pgShseclabelAttrs()},
 	{6100, "pg_subscription", 6101, 'r', 9, true, pgSubscriptionAttrs()},
 	// M0106-0010 step 3bp: pg_parameter_acl is opened during PG-standby
 	// boot once Step 3bo cleared the pg_opfamily family. Without a
@@ -1612,14 +1612,21 @@ func pgAuthMembersAttrs() []nailedAttr {
 	}
 }
 
+// pgShseclabelAttrs returns the 4-column PG18 pg_shseclabel schema
+// (postgres/src/include/catalog/pg_shseclabel.h / schemapg.h
+// Schema_pg_shseclabel). The catalog has objoid + classoid + provider +
+// label and no `oid` column — it is BKI_BOOTSTRAP-without-oids. PG18's
+// formrdesc("pg_shseclabel", Natts_pg_shseclabel=4, Desc_pg_shseclabel)
+// builds a 4-column TupleDesc at Phase2; goopg must report relnatts=4
+// in pg_class so write_relcache_init_file does not iterate past the
+// rd_att array end and emit garbage attribute slots (M0106-0010 Step
+// 3cv root cause).
 func pgShseclabelAttrs() []nailedAttr {
 	return []nailedAttr{
-		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
+		{Name: "objoid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},
 		{Name: "classoid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
-		{Name: "objoid", TypeOID: 26, Num: 3, Len: 4, NotNull: true},
-		{Name: "objsubid", TypeOID: 23, Num: 4, Len: 4, NotNull: true},
-		{Name: "provider", TypeOID: 25, Num: 5, Len: -1, NotNull: true},
-		{Name: "label", TypeOID: 25, Num: 6, Len: -1, NotNull: true},
+		{Name: "provider", TypeOID: 25, Num: 3, Len: -1, NotNull: true},
+		{Name: "label", TypeOID: 25, Num: 4, Len: -1, NotNull: true},
 	}
 }
 
