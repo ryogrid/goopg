@@ -26,6 +26,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 
@@ -266,6 +267,19 @@ func Init(opts Options) error {
 	if err := bootstrapPgAmTuples(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_am tuples: %w", err)
 	}
+	// Seed pg_namespace (OIDs 11/99/2200) + indexes so PG's NAMESPACENAME
+	// and NAMESPACEOID syscache lookups find pg_catalog. Without these rows,
+	// schema-qualified relation lookups (SELECT … FROM pg_catalog.X) fail.
+	pgNamespaceTIDs, err := bootstrapPgNamespaceTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_namespace tuples: %w", err)
+	}
+	if err := bootstrapPgNamespaceNspnameIndex(abs, pgNamespaceTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_namespace_nspname_index: %w", err)
+	}
+	if err := bootstrapPgNamespaceOidIndex(abs, pgNamespaceTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_namespace_oid_index: %w", err)
+	}
 	// M0106-0010 step 3a: write pg_proc rows for the AM handler
 	// functions so PG's RelationInitIndexAccessInfo →
 	// OidFunctionCall0(amhandler) finds bthandler /
@@ -358,6 +372,9 @@ func Init(opts Options) error {
 	// standby boot is "could not open critical system index 2671".
 	if err := bootstrapPgClassOidIndex(abs, pgClassTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_class_oid_index: %w", err)
+	}
+	if err := bootstrapPgClassRelnameNspIndex(abs, pgClassTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_class_relname_nsp_index: %w", err)
 	}
 	// M0106-0010 step 3o: overwrite the empty btree placeholder at
 	// base/{1,5}/2659 + global/2659 with a populated btree (metapage +
@@ -534,9 +551,9 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		2612, // pg_language
 		2613, // pg_largeobject
 		2614, // pg_largeobject_metadata
-		2615, // pg_namespace
+		// 2615 pg_namespace: dedicated bootstrapper (bootstrapPgNamespaceTuples)
 		2617, // pg_operator
-		2618, // pg_rewrite
+		// 2618 pg_rewrite: dedicated bootstrapper (bootstrapPgRewriteTuples)
 		2619, // pg_statistic
 		2620, // pg_trigger
 		3381, // pg_statistic_ext
@@ -864,11 +881,13 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
-		2684, 2685,
+		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688,
 		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
-		2690, 2691, 2692, 2693, 2701, 2703,
+		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
+		// 2692, 2693: dedicated bootstrappers (pg_rewrite_oid_index/pg_rewrite_rel_rulename_index)
+		2701, 2703,
 		2754, // pg_opfamily_am_name_nsp_index (Step 3bn)
 		2755, // pg_opfamily_oid_index (Step 3bo)
 		2704, 3085, 3164,
@@ -938,10 +957,10 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{2612, 2612}, // pg_language
 		{2613, 2613}, // pg_largeobject
 		{2614, 2614}, // pg_largeobject_metadata
-		{2615, 2615}, // pg_namespace
+		// {2615, 2615}: dedicated bootstrapper (bootstrapPgNamespaceTuples)
 		{2616, 2616}, // pg_opclass
 		{2617, 2617}, // pg_operator
-		{2618, 2618}, // pg_rewrite
+		// {2618, 2618}: dedicated bootstrapper (bootstrapPgRewriteTuples)
 		{2619, 2619}, // pg_statistic
 		{2620, 2620}, // pg_trigger
 		{3381, 3381}, // pg_statistic_ext
@@ -1000,11 +1019,13 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
-		2684, 2685,
+		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688,
 		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
-		2690, 2691, 2692, 2693, 2701, 2703,
+		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
+		// 2692, 2693: dedicated bootstrappers (pg_rewrite_oid_index/pg_rewrite_rel_rulename_index)
+		2701, 2703,
 		2754, // pg_opfamily_am_name_nsp_index (Step 3bn)
 		2755, // pg_opfamily_oid_index (Step 3bo)
 		2704, 3085, 3164,
@@ -1086,11 +1107,13 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
 		2670, // pg_conversion_oid_index (Step 3ai)
 		2678, 2679, 2680, 2682,
-		2684, 2685,
+		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688,
 		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
-		2690, 2691, 2692, 2693, 2701, 2703,
+		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
+		// 2692, 2693: dedicated bootstrappers (pg_rewrite_oid_index/pg_rewrite_rel_rulename_index)
+		2701, 2703,
 		2754, // pg_opfamily_am_name_nsp_index (Step 3bn)
 		2755, // pg_opfamily_oid_index (Step 3bo)
 		2704, 3085, 3164,
@@ -1278,6 +1301,137 @@ func bootstrapPgAmTuples(dataDir string) error {
 	}
 	_, err := writeMultiPageHeapRows(dataDir, "2601", cols, rows)
 	return err
+}
+
+// pgNamespaceColDefs returns PG18's 4-column FormData_pg_namespace layout.
+// pg_namespace.h: oid, nspname, nspowner, nspacl.
+func pgNamespaceColDefs() []catalog.Column {
+	return []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},
+		{Name: "nspname", Type: catalog.Type{Name: "name"}},
+		{Name: "nspowner", Type: catalog.Type{Name: "oid"}},
+		{Name: "nspacl", Type: catalog.Type{Name: "aclitem[]"}},
+	}
+}
+
+type pgNamespaceEntry struct {
+	OID      uint32
+	NspName  string
+	NspOwner uint32
+}
+
+// pgNamespaceInitialEntries returns the three namespaces PG18 initdb creates:
+// pg_catalog (11), pg_toast (99), and public (2200).
+func pgNamespaceInitialEntries() []pgNamespaceEntry {
+	return []pgNamespaceEntry{
+		{OID: 11, NspName: "pg_catalog", NspOwner: 10},
+		{OID: 99, NspName: "pg_toast", NspOwner: 10},
+		{OID: 2200, NspName: "public", NspOwner: 10},
+	}
+}
+
+func pgNamespaceRow(e pgNamespaceEntry) executor.Row {
+	return executor.Row{
+		executor.NewIntDatum(int64(e.OID)),       // oid
+		executor.NewStringDatum(e.NspName),       // nspname
+		executor.NewIntDatum(int64(e.NspOwner)),  // nspowner
+		executor.NewStringDatum("{}"),            // nspacl (empty aclitem[])
+	}
+}
+
+// bootstrapPgNamespaceTuples writes pg_catalog(11)/pg_toast(99)/public(2200)
+// rows to base/{1,5}/2615 so PG's NAMESPACENAME and NAMESPACEOID syscache
+// lookups find the namespaces via pg_namespace_nspname_index (2684) and
+// pg_namespace_oid_index (2685). Without these rows, any schema-qualified
+// relation lookup (e.g. SELECT … FROM pg_catalog.pg_stat_wal_receiver) fails
+// with "schema does not exist" before the relation lookup is even attempted.
+func bootstrapPgNamespaceTuples(dataDir string) (map[uint32]heapTID, error) {
+	cols := pgNamespaceColDefs()
+	entries := pgNamespaceInitialEntries()
+	rows := make([]executor.Row, 0, len(entries))
+	for _, e := range entries {
+		rows = append(rows, pgNamespaceRow(e))
+	}
+	tids, err := writeMultiPageHeapRows(dataDir, "2615", cols, rows)
+	if err != nil {
+		return nil, fmt.Errorf("pg_namespace heap: %w", err)
+	}
+	m := make(map[uint32]heapTID, len(entries))
+	for i, e := range entries {
+		m[e.OID] = tids[i]
+	}
+	return m, nil
+}
+
+// bootstrapPgNamespaceNspnameIndex writes base/{1,5}/2684 with one
+// 72-byte name-keyed IndexTuple per pg_namespace row.
+func bootstrapPgNamespaceNspnameIndex(dataDir string, tids map[uint32]heapTID) error {
+	type entry struct {
+		name string
+		blk  uint32
+		off  uint16
+	}
+	entries := make([]entry, 0, len(tids))
+	for _, e := range pgNamespaceInitialEntries() {
+		t := tids[e.OID]
+		entries = append(entries, entry{name: e.NspName, blk: t.Block, off: t.Offset})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleNameKey(e.blk, e.off, e.name)
+	}
+	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		return fmt.Errorf("pg_namespace_nspname_index leaf: %w", err)
+	}
+	meta := pgBuildBtreeMetapageWithRoot(1, 0)
+	file := append(meta, leaf...)
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "2684"), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_namespace_nspname_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgNamespaceOidIndex writes base/{1,5}/2685 with one
+// 16-byte oid-keyed IndexTuple per pg_namespace row.
+func bootstrapPgNamespaceOidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type entry struct {
+		oid uint32
+		blk uint32
+		off uint16
+	}
+	entries := make([]entry, 0, len(tids))
+	for oid, t := range tids {
+		entries = append(entries, entry{oid: oid, blk: t.Block, off: t.Offset})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].oid < entries[j].oid })
+
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleOidKey(e.blk, e.off, e.oid)
+	}
+	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	if err != nil {
+		return fmt.Errorf("pg_namespace_oid_index leaf: %w", err)
+	}
+	meta := pgBuildBtreeMetapageWithRoot(1, 0)
+	file := append(meta, leaf...)
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "2685"), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_namespace_oid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
 }
 
 
@@ -3430,7 +3584,11 @@ func pgClassRow(rel nailedRel) executor.Row {
 	relHasRules := false
 	if rel.RelKind == 'v' {
 		relFilenode = 0
-		relHasRules = true
+		// Keep relHasRules=false: the view is found in pg_class (name lookup works)
+		// and PG won't try to load the rewrite rule. Querying the view will return
+		// an error (no storage) but won't crash. Needed until the ev_action format
+		// is fully compatible with the running PG18 version.
+		// relHasRules = true
 	}
 	return executor.Row{
 		executor.NewIntDatum(int64(rel.OID)),      // 0: oid

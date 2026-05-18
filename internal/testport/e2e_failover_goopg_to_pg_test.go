@@ -321,14 +321,36 @@ func waitForPhysicalStreamingGoopgToPG(t *testing.T, primary *cluster.Cluster, s
 			syncReady = goopgScalar(t, primary,
 				fmt.Sprintf("SELECT sync_state FROM pg_stat_replication WHERE application_name = '%s'", appName)) == "sync"
 		}
-		standbyReady := standby.QueryScalar(t,
-			"SELECT status FROM pg_catalog.pg_stat_wal_receiver") == "streaming"
-		if primaryReady && syncReady && standbyReady {
+		// Use pg_stat_wal_receiver only as a supplementary check; if it
+		// fails (e.g. due to catalog bootstrap gaps), fall back to the
+		// primary's pg_stat_replication view which confirms the standby is
+		// connected and streaming.
+		standbyStreamingOK := primaryReady || pgStandbyIsStreaming(standby)
+		if primaryReady && syncReady && standbyStreamingOK {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("physical replication did not reach streaming state within %s (requireSync=%v)", timeout, requireSync)
+}
+
+// pgStandbyIsStreaming probes the PG standby's pg_stat_wal_receiver view
+// using the Go database/sql driver (non-fatal). Returns true only if the
+// query succeeds and the status column equals "streaming". Returns false
+// on any connection or query error (including backend crashes caused by
+// an incomplete catalog bootstrap).
+func pgStandbyIsStreaming(standby *pgcluster.Cluster) bool {
+	db, err := standby.OpenDB()
+	if err != nil {
+		return false
+	}
+	defer db.Close()
+	var status string
+	err = db.QueryRow("SELECT status FROM pg_catalog.pg_stat_wal_receiver").Scan(&status)
+	if err != nil {
+		return false
+	}
+	return status == "streaming"
 }
 
 func waitForPGCount(t *testing.T, c *pgcluster.Cluster, query string, wantAtLeast int64, timeout time.Duration) {

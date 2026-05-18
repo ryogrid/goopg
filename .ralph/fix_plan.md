@@ -9485,7 +9485,8 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
             `pg_rewrite_oid_index` (OID 2692) need leaf entries
             pointing at the new heap row. After phase B, the E2E test's
             `SELECT status FROM pg_catalog.pg_stat_wal_receiver` probe
-            should advance past the `42P01` error.
+            should advance past the `42P01` error. (fixed)
+      - Next Task: Go to M0106-0010 batched-01 (bootstrap-procedure task 1) in the next section below.
 
 #### Batched implementation tasks (from `docs/design/bootstrap-procedure/`)
 

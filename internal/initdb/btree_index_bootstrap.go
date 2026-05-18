@@ -335,6 +335,90 @@ func pgBuildBtreeBulkLoad(sortedTuples [][]byte, nkeyatts uint16) ([]byte, error
 	return out, nil
 }
 
+// pgBuildBtreeBulkLoadSized builds a full btree file for tuples of an
+// arbitrary fixed size (not restricted to fixedIndexTupleSize=16). Used
+// by bootstrapPgClassRelnameNspIndex (80-byte name+oid tuples).
+func pgBuildBtreeBulkLoadSized(sortedTuples [][]byte, tupleSize int, nkeyatts uint16) ([]byte, error) {
+	for i, t := range sortedTuples {
+		if len(t) != tupleSize {
+			return nil, fmt.Errorf("pgBuildBtreeBulkLoadSized: tuple %d size=%d, want %d", i, len(t), tupleSize)
+		}
+	}
+
+	bytesPerSlot := tupleSize + 4 // tuple + ItemId line-pointer
+	maxPerSingle := leafPayloadBytes / bytesPerSlot
+	maxPerNonRM := (leafPayloadBytes - bytesPerSlot) / bytesPerSlot
+
+	if len(sortedTuples) <= maxPerSingle {
+		leaf, err := pgBuildBtreeLeafRootPage(sortedTuples)
+		if err != nil {
+			return nil, fmt.Errorf("bulk-load (sized) leaf-root: %w", err)
+		}
+		meta := pgBuildBtreeMetapageWithRoot(1, 0)
+		out := make([]byte, 0, 2*storage.BlockSize)
+		out = append(out, meta...)
+		out = append(out, leaf...)
+		return out, nil
+	}
+
+	var leafGroups [][][]byte
+	pos := 0
+	for pos < len(sortedTuples) {
+		remaining := len(sortedTuples) - pos
+		if remaining <= maxPerSingle {
+			leafGroups = append(leafGroups, sortedTuples[pos:])
+			break
+		}
+		end := pos + maxPerNonRM
+		leafGroups = append(leafGroups, sortedTuples[pos:end])
+		pos = end
+	}
+	nLeaves := len(leafGroups)
+
+	leaves := make([][]byte, nLeaves)
+	for li, group := range leafGroups {
+		isRightmost := li == nLeaves-1
+		prevBlock := uint32(pNone)
+		nextBlock := uint32(pNone)
+		if li > 0 {
+			prevBlock = uint32(li)
+		}
+		if !isRightmost {
+			nextBlock = uint32(li + 2)
+		}
+		var highKey []byte
+		if !isRightmost {
+			highKey = pgBuildBtreeLeafHighKey(leafGroups[li+1][0], nkeyatts)
+		}
+		page, err := pgBuildBtreeLeafPage(group, highKey, prevBlock, nextBlock)
+		if err != nil {
+			return nil, fmt.Errorf("leaf %d: %w", li, err)
+		}
+		leaves[li] = page
+	}
+
+	downlinks := make([][]byte, nLeaves)
+	downlinks[0] = pgBuildBtreeMinusInfinityDownlink(1)
+	for li := 1; li < nLeaves; li++ {
+		downlinks[li] = pgBuildBtreeInternalDownlink(leafGroups[li][0], uint32(li+1), nkeyatts)
+	}
+	rootPage, err := pgBuildBtreeInternalRootPage(downlinks)
+	if err != nil {
+		return nil, fmt.Errorf("root: %w", err)
+	}
+
+	rootBlock := uint32(nLeaves + 1)
+	meta := pgBuildBtreeMetapageWithRoot(rootBlock, 1)
+
+	out := make([]byte, 0, (nLeaves+2)*storage.BlockSize)
+	out = append(out, meta...)
+	for _, leaf := range leaves {
+		out = append(out, leaf...)
+	}
+	out = append(out, rootPage...)
+	return out, nil
+}
+
 // pgBuildBtreeLeafPage assembles one 8 KiB BTP_LEAF page with the given
 // sibling links. When highKey is non-nil, it is written into item slot 1
 // (P_HIKEY) and the data tuples occupy slots 2..N+1; when nil, the page
@@ -888,6 +972,103 @@ func bootstrapPgClassOidIndex(dataDir string, tids map[uint32]heapTID) error {
 	} {
 		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2662, 10)), file, 0o600); err != nil {
 			return fmt.Errorf("write pg_class_oid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// pgBuildIndexTupleNameOidKey constructs an 80-byte IndexTuple for a
+// composite (name, oid) btree leaf entry. Used by
+// pg_class_relname_nsp_index (OID 2663, indkey=[relname, relnamespace]).
+//
+//	[0..7]   IndexTupleData (ItemPointer + t_info)
+//	[8..71]  relname (NAMEDATALEN=64 bytes, zero-padded, C collation)
+//	[72..75] relnamespace (LE uint32)
+//	[76..79] MAXALIGN padding (zero)
+//
+// MAXALIGN(8 + 64 + 4) = MAXALIGN(76) = 80.
+func pgBuildIndexTupleNameOidKey(heapBlk uint32, heapOff uint16, name string, oid uint32) []byte {
+	const (
+		nameDataLen = 64
+		hoff        = 8
+		size        = 80 // MAXALIGN(8 + 64 + 4) = 80
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	n := len(name)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff:hoff+n], name[:n])
+	le.PutUint32(out[hoff+nameDataLen:hoff+nameDataLen+4], oid)
+	return out
+}
+
+// bootstrapPgClassRelnameNspIndex overwrites base/{1,5}/2663 (and global/2663)
+// with a populated 2-block btree carrying one (relname, relnamespace)-keyed
+// IndexTuple per pg_class heap row.
+//
+// pg_class_relname_nsp_index (OID 2663) backs the RELNAMENSP syscache and
+// is used by RangeVarGetRelid once criticalRelcachesBuilt=true. Without
+// populated leaf entries, every name-based pg_class lookup returns "relation
+// does not exist" even though the heap row exists.
+func bootstrapPgClassRelnameNspIndex(dataDir string, tids map[uint32]heapTID) error {
+	type entry struct {
+		name string
+		nsp  uint32
+		blk  uint32
+		off  uint16
+	}
+
+	allRels := append([]nailedRel{}, nailedSharedRels...)
+	allRels = append(allRels, nailedLocalRels...)
+
+	entries := make([]entry, 0, len(allRels))
+	for _, rel := range allRels {
+		t, ok := tids[rel.OID]
+		if !ok {
+			continue
+		}
+		entries = append(entries, entry{
+			name: rel.RelName,
+			nsp:  11, // pg_catalog
+			blk:  t.Block,
+			off:  t.Offset,
+		})
+	}
+	// Sort by relname (NameData byte comparison), then relnamespace.
+	// All nailed rels share relnamespace=11, so the primary sort is sufficient.
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].name != entries[j].name {
+			return entries[i].name < entries[j].name
+		}
+		return entries[i].nsp < entries[j].nsp
+	})
+
+	const nameOidTupleSize = 80 // MAXALIGN(8 + 64 + 4)
+	const nkeyatts = 2          // (relname, relnamespace)
+	tuples := make([][]byte, len(entries))
+	for i, e := range entries {
+		tuples[i] = pgBuildIndexTupleNameOidKey(e.blk, e.off, e.name, e.nsp)
+	}
+	file, err := pgBuildBtreeBulkLoadSized(tuples, nameOidTupleSize, nkeyatts)
+	if err != nil {
+		return fmt.Errorf("pg_class_relname_nsp_index: %w", err)
+	}
+
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+		filepath.Join(dataDir, "global"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2663, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_class_relname_nsp_index in %s: %w", dir, err)
 		}
 	}
 	return nil
