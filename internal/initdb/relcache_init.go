@@ -381,6 +381,22 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// stxdmcv pg_mcv_list, stxdexpr _pg_statistic). pg_statistic_ext_data
 	// has no `oid` system column — attnums start at 1 = stxoid.
 	{3429, "pg_statistic_ext_data", 83, 'r', 6, false, pgStatisticExtDataAttrs()},
+	// M0106-0010 step 3cd: pg_statistic_ext is opened during PG-standby
+	// boot once Step 3cc cleared the pg_statistic_ext_data family. Without
+	// a pg_class row, `RelationBuildDesc(3381) → ScanPgRelation(3381)`
+	// returns NULL and the backend FATALs with `could not open relation
+	// with OID 3381`. RelType=83 is safe because pg_statistic_ext is not
+	// formrdesc'd (no `StatisticExtRelation_Rowtype_Id` constant in PG18
+	// headers). Schema per `postgres/src/include/catalog/pg_statistic_ext.h`
+	// (PG18, StatisticExtRelationId == 3381). 9 columns total, all 5
+	// leading fixed-width NOT NULL (oid, stxrelid, stxname, stxnamespace,
+	// stxowner) + 1 CATALOG_VARLEN NOT NULL int2vector (stxkeys
+	// BKI_FORCE_NOT_NULL) + 1 fixed-width nullable (stxstattarget int2
+	// BKI_FORCE_NULL) + 1 CATALOG_VARLEN NOT NULL _char (stxkind
+	// BKI_FORCE_NOT_NULL) + 1 CATALOG_VARLEN nullable pg_node_tree
+	// (stxexprs). pg_statistic_ext DOES have an `oid` system column —
+	// attnum 1 is oid.
+	{3381, "pg_statistic_ext", 83, 'r', 9, false, pgStatisticExtAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -843,6 +859,40 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// via pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
 		// relnatts/indnatts check (relcache.c:1492).
 		{3433, "pg_statistic_ext_data_stxoid_inh_index"},
+		// M0106-0010 Step 3cd: pg_statistic_ext_oid_index. PG18
+		// `postgres/src/include/catalog/pg_statistic_ext.h:73` declares
+		// `DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_ext_oid_index, 3380,
+		// StatisticExtOidIndexId, pg_statistic_ext, btree(oid oid_ops))`.
+		// Heap OID 3381 (pg_statistic_ext) is the nailed local rel above
+		// (Step 3cd). Backs MAKE_SYSCACHE(STATEXTOID,
+		// pg_statistic_ext_oid_index, 4). Without this entry
+		// RelationIdGetRelation(3380) FATALs because no pg_class row
+		// gets seeded; flattenRels derives RelNatts=1 via
+		// pgIndexNattsByOID, satisfying RelationInitIndexAccessInfo's
+		// relnatts/indnatts check (relcache.c:1492).
+		{3380, "pg_statistic_ext_oid_index"},
+		// M0106-0010 Step 3cd: pg_statistic_ext_name_index. PG18
+		// `postgres/src/include/catalog/pg_statistic_ext.h:74` declares
+		// `DECLARE_UNIQUE_INDEX(pg_statistic_ext_name_index, 3997,
+		// StatisticExtNameIndexId, pg_statistic_ext, btree(stxname
+		// name_ops, stxnamespace oid_ops))`. UNIQUE (NOT primary)
+		// composite (2-column) key. Heap OID 3381 (pg_statistic_ext) is
+		// the nailed local rel above (Step 3cd). Backs
+		// MAKE_SYSCACHE(STATEXTNAMENSP, pg_statistic_ext_name_index, 4).
+		// Without this entry RelationIdGetRelation(3997) FATALs; flattenRels
+		// derives RelNatts=2 via pgIndexNattsByOID.
+		{3997, "pg_statistic_ext_name_index"},
+		// M0106-0010 Step 3cd: pg_statistic_ext_relid_index. PG18
+		// `postgres/src/include/catalog/pg_statistic_ext.h:75` declares
+		// `DECLARE_INDEX(pg_statistic_ext_relid_index, 3379,
+		// StatisticExtRelidIndexId, pg_statistic_ext, btree(stxrelid
+		// oid_ops))`. NON-UNIQUE. Heap OID 3381 (pg_statistic_ext) is the
+		// nailed local rel above (Step 3cd). Used by
+		// RemoveStatisticsExtById / dependency cleanup paths to enumerate
+		// extended-statistics objects defined on a given table. Without
+		// this entry RelationIdGetRelation(3379) FATALs; flattenRels
+		// derives RelNatts=1.
+		{3379, "pg_statistic_ext_relid_index"},
 	})
 
 func indexNailed(oid uint32, name string, natts int16) nailedRel {
@@ -1777,6 +1827,40 @@ func pgStatisticExtDataAttrs() []nailedAttr {
 		{Name: "stxddependencies", TypeOID: 3402, Num: 4, Len: -1, NotNull: false}, // pg_dependencies (varlena)
 		{Name: "stxdmcv", TypeOID: 5017, Num: 5, Len: -1, NotNull: false},     // pg_mcv_list (varlena)
 		{Name: "stxdexpr", TypeOID: 10028, Num: 6, Len: -1, NotNull: false},   // _pg_statistic array (varlena)
+	}
+}
+
+// pgStatisticExtAttrs returns the 9-column PG18 schema for `pg_statistic_ext`
+// (OID 3381, `postgres/src/include/catalog/pg_statistic_ext.h:33`,
+// `StatisticExtRelationId == 3381`). Five fixed-width NOT NULL leading
+// columns followed by one CATALOG_VARLEN NOT NULL (stxkeys), one fixed-width
+// nullable (stxstattarget), and two CATALOG_VARLEN columns (stxkind NOT
+// NULL, stxexprs nullable). Schema verified verbatim against
+// `pg_statistic_ext_d.h:28..38` (Anum_pg_statistic_ext_* 1–9, Natts == 9):
+//
+//	1 oid           oid          (TypeOID 26,   Len  4,  NotNull)
+//	2 stxrelid      oid          (TypeOID 26,   Len  4,  NotNull)
+//	3 stxname       name         (TypeOID 19,   Len 64,  NotNull)
+//	4 stxnamespace  oid          (TypeOID 26,   Len  4,  NotNull)
+//	5 stxowner      oid          (TypeOID 26,   Len  4,  NotNull)
+//	6 stxkeys       int2vector   (TypeOID 22,   Len -1,  NotNull — BKI_FORCE_NOT_NULL)
+//	7 stxstattarget int2         (TypeOID 21,   Len  2,  nullable — BKI_FORCE_NULL)
+//	8 stxkind       _char        (TypeOID 1002, Len -1,  NotNull — BKI_FORCE_NOT_NULL)
+//	9 stxexprs      pg_node_tree (TypeOID 194,  Len -1,  nullable)
+//
+// pg_statistic_ext DOES have an `oid` system column (declared in the CATALOG
+// block as `Oid oid`), so attnum 1 is `oid`. M0106-0010 step 3cd.
+func pgStatisticExtAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},           // oid (system column)
+		{Name: "stxrelid", TypeOID: 26, Num: 2, Len: 4, NotNull: true},      // oid → pg_class (BKI_LOOKUP)
+		{Name: "stxname", TypeOID: 19, Num: 3, Len: 64, NotNull: true},      // name
+		{Name: "stxnamespace", TypeOID: 26, Num: 4, Len: 4, NotNull: true},  // oid → pg_namespace (BKI_LOOKUP)
+		{Name: "stxowner", TypeOID: 26, Num: 5, Len: 4, NotNull: true},      // oid → pg_authid (BKI_LOOKUP)
+		{Name: "stxkeys", TypeOID: 22, Num: 6, Len: -1, NotNull: true},      // int2vector BKI_FORCE_NOT_NULL
+		{Name: "stxstattarget", TypeOID: 21, Num: 7, Len: 2, NotNull: false}, // int2 BKI_FORCE_NULL
+		{Name: "stxkind", TypeOID: 1002, Num: 8, Len: -1, NotNull: true},    // _char BKI_FORCE_NOT_NULL
+		{Name: "stxexprs", TypeOID: 194, Num: 9, Len: -1, NotNull: false},   // pg_node_tree
 	}
 }
 

@@ -7239,6 +7239,86 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         pg_subscription_rel / pg_statistic / pg_statistic_ext catalog
         territory (Step 3cd). Design:
         `docs/design/0106-0010-step3cc-pg-statistic-ext-data-nailed-rel.md`.
+      - Step 3cd LANDED 2026-05-18. Closes the FATAL `could not open
+        relation with OID 3381` PG-standby boot blocker that surfaces
+        after Step 3cc seeded the pg_statistic_ext_data family. OID 3381 is
+        `pg_statistic_ext` per
+        `postgres/src/include/catalog/pg_statistic_ext.h:33`
+        (`CATALOG(pg_statistic_ext,3381,StatisticExtRelationId)`).
+        Per-database (non-shared) catalog — follows the Step 3cb/3cc
+        template. Family-complete seed in one step: heap 3381 + **all
+        three** declared indexes from `pg_statistic_ext.h:73..75`:
+        3380 `pg_statistic_ext_oid_index` UNIQUE PRIMARY single
+        `oid oid_ops` (backs `MAKE_SYSCACHE(STATEXTOID, …, 4)`);
+        3997 `pg_statistic_ext_name_index` UNIQUE composite
+        `(stxname name_ops, stxnamespace oid_ops)` (backs
+        `MAKE_SYSCACHE(STATEXTNAMENSP, …, 4)`); 3379
+        `pg_statistic_ext_relid_index` NON-UNIQUE single
+        `stxrelid oid_ops` (no syscache; used by `RemoveStatisticsExtById` /
+        dependency cleanup). PG's `load_critical_index` opens every
+        declared index of a nailed rel, so all three must be seeded.
+        (a) `pgStatisticExtAttrs()` (relcache_init.go) returns the
+        9-column PG18 schema (verified against PostgreSQL 18.3 runtime
+        pg_attribute and `pg_statistic_ext_d.h:28..38`): 5 fixed NOT NULL
+        leading (oid 26/4, stxrelid 26/4, stxname 19/64, stxnamespace
+        26/4, stxowner 26/4) + 1 CATALOG_VARLEN NOT NULL int2vector
+        (stxkeys 22/-1, BKI_FORCE_NOT_NULL) + 1 fixed-width nullable int2
+        (stxstattarget 21/2, BKI_FORCE_NULL — declared inside
+        CATALOG_VARLEN block but fixed-width) + 1 CATALOG_VARLEN NOT
+        NULL _char (stxkind 1002/-1, BKI_FORCE_NOT_NULL) + 1
+        CATALOG_VARLEN nullable pg_node_tree (stxexprs 194/-1).
+        pg_statistic_ext DOES have an `oid` system column (declared
+        `Oid oid` in the CATALOG block) — attnum 1 = oid (unlike
+        pg_statistic_ext_data which has none). RelType=83 is safe (no
+        `StatisticExtRelation_Rowtype_Id` in PG18 headers).
+        (b) `nailedLocalRels` (relcache_init.go) heap list gains
+        `{3381, "pg_statistic_ext", 83, 'r', 9, false, pgStatisticExtAttrs()}`
+        after the Step 3cc 3429 entry; idxSpec list gains three new
+        entries: `{3380, "pg_statistic_ext_oid_index"}`,
+        `{3997, "pg_statistic_ext_name_index"}`,
+        `{3379, "pg_statistic_ext_relid_index"}`.
+        (c) `pgIndexInitialEntries` local section (initdb.go) gains
+        three new rows after the Step 3cc 3433 entry:
+        `entry(3380, 3381, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true)`,
+        `entry(3997, 3381, []int16{3,4}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false)`,
+        `entry(3379, 3381, []int16{2}, []uint32{oidOps}, []uint32{0}, false, false)`.
+        (d) Both "Critical index placeholder pages" OID lists
+        (`base/<dboid>/` block + `global/` fallback block) at
+        `bootstrapPostgresDatabase` gain `3380`, `3997`, `3379` after
+        the Step 3cc 3433 entry.
+        (e) No new entries in `bootstrapMappedLocalCatalogHeaps` oid
+        list or in `localRelMap` — both already contained `3381` from
+        the Step 3w / 3cc baseline (the existing `3381` heap-page
+        placeholder is sufficient because pg_statistic_ext is
+        unpopulated at bootstrap).
+        (f) No new type-helper entries needed: `int2vector` (22),
+        `name` (19), `_char` (1002), `pg_node_tree` (194), `int2` (21),
+        `oid` (26) are all already registered in `pgCatalogTypeOID` /
+        `pgCatalogTypeLen` / `pgTypeByVal` / `pgTypeAlignChar` /
+        `pgTypeStorageChar`.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgStatisticExt`,
+        `TestNailedLocalRelsContainsPgStatisticExtIndexes`,
+        `TestPgStatisticExtIndexInitialEntries`,
+        `TestPgStatisticExtAttrsTypeOIDsMatchPG18` in
+        `internal/initdb/pg_statistic_ext_nailed_test.go`;
+        `TestPgIndexInitialEntriesIndkeyMatchesPG18` map extended with
+        `3380:{1}`, `3997:{3,4}`, `3379:{2}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 3380, 3997, 3379.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgStatisticExt|TestPgStatisticExtIndexInitialEntries|TestPgStatisticExtAttrsTypeOIDsMatchPG18|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedIndexRelnattsAgreesWithIndnatts'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3cc (no new
+        regressions; confirmed via baseline diff with the changes
+        stashed); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. E2E re-run
+        (`GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -run
+        TestE2E_FailoverGoopgToPG/async ./internal/testport/`) confirms
+        FATAL on 3381 is closed — next FATAL is OID 2619 (`pg_statistic`),
+        to be handled by Step 3ce. Design:
+        `docs/design/0106-0010-step3cd-pg-statistic-ext-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

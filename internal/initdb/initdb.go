@@ -865,6 +865,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2228, // pg_range_rngmultitypid_index (Step 3bz)
 		5002, // pg_sequence_seqrelid_index (Step 3cb)
 		3433, // pg_statistic_ext_data_stxoid_inh_index (Step 3cc)
+		3380, // pg_statistic_ext_oid_index (Step 3cd)
+		3997, // pg_statistic_ext_name_index (Step 3cd)
+		3379, // pg_statistic_ext_relid_index (Step 3cd)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -928,6 +931,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2228, // pg_range_rngmultitypid_index (Step 3bz)
 		5002, // pg_sequence_seqrelid_index (Step 3cb)
 		3433, // pg_statistic_ext_data_stxoid_inh_index (Step 3cc)
+		3380, // pg_statistic_ext_oid_index (Step 3cd)
+		3997, // pg_statistic_ext_name_index (Step 3cd)
+		3379, // pg_statistic_ext_relid_index (Step 3cd)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2566,6 +2572,29 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// IndKey/IndClass slot. Without this entry RelationIdGetRelation(3433)
 		// FATALs.
 		entry(3433, 3429, []int16{1, 2}, []uint32{oidOps, boolOps}, []uint32{0, 0}, true, true), // pg_statistic_ext_data_stxoid_inh_index
+		// M0106-0010 Step 3cd: pg_statistic_ext indexes (3 total).
+		//   postgres/src/include/catalog/pg_statistic_ext.h:73..75
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_ext_oid_index, 3380,
+		//       StatisticExtOidIndexId, pg_statistic_ext, btree(oid oid_ops));
+		//     DECLARE_UNIQUE_INDEX(pg_statistic_ext_name_index, 3997,
+		//       StatisticExtNameIndexId, pg_statistic_ext,
+		//       btree(stxname name_ops, stxnamespace oid_ops));
+		//     DECLARE_INDEX(pg_statistic_ext_relid_index, 3379,
+		//       StatisticExtRelidIndexId, pg_statistic_ext,
+		//       btree(stxrelid oid_ops));
+		//   MAKE_SYSCACHE(STATEXTOID, pg_statistic_ext_oid_index, 4);
+		//   MAKE_SYSCACHE(STATEXTNAMENSP, pg_statistic_ext_name_index, 4);
+		// pg_statistic_ext attnums (pg_statistic_ext_d.h): 1=oid, 2=stxrelid,
+		// 3=stxname, 4=stxnamespace, 5=stxowner, 6=stxkeys, 7=stxstattarget,
+		// 8=stxkind, 9=stxexprs. Heap OID 3381 is the nailed local rel
+		// added in Step 3cd. Three indexes:
+		//  - 3380 UNIQUE PRIMARY single oid_ops over attnum 1 (oid)
+		//  - 3997 UNIQUE composite name_ops (cCollation) + oid_ops over
+		//         attnums 3,4 (stxname, stxnamespace)
+		//  - 3379 NON-UNIQUE single oid_ops over attnum 2 (stxrelid)
+		entry(3380, 3381, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                  // pg_statistic_ext_oid_index
+		entry(3997, 3381, []int16{3, 4}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),         // pg_statistic_ext_name_index
+		entry(3379, 3381, []int16{2}, []uint32{oidOps}, []uint32{0}, false, false),                                // pg_statistic_ext_relid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)
