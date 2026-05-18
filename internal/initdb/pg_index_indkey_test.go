@@ -117,6 +117,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		3767: {1},         // pg_ts_template_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3co
 		174:  {1},         // pg_user_mapping_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3cp
 		175:  {2, 3},      // pg_user_mapping_user_server_index : btree(umuser oid_ops, umserver oid_ops) UNIQUE ← Step 3cp
+		2965: {1, 2},      // pg_db_role_setting_databaseid_rol_index : btree(setdatabase oid_ops, setrole oid_ops) UNIQUE PRIMARY (SHARED) ← Step 3cu
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {

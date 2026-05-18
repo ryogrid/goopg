@@ -8314,6 +8314,88 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         the first FATAL is closed by seeding pg_db_role_setting.
         Design:
         `docs/design/0106-0010-step3ct-pg-database-pg18-row-layout.md`.
+      - Step 3cu LANDED 2026-05-18. Closes the FATAL
+        `XX000: could not open relation with OID 2964` PG-standby
+        user-backend blocker surfaced by Step 3ct. OID 2964 is
+        `pg_db_role_setting` per
+        `postgres/src/include/catalog/pg_db_role_setting.h:34`
+        (`CATALOG(pg_db_role_setting, 2964, DbRoleSettingRelationId)
+        BKI_SHARED_RELATION`); opened by `process_settings(MyDatabaseId,
+        GetSessionUserId())` at the tail of `InitPostgres` to apply
+        per-database/per-role GUC defaults. The cascading
+        `invalid attalign value:` follower FATALs are the Step 3cs
+        catcache-stale pattern and disappear once the first FATAL is
+        closed.
+        Pure catalog-seed addition mirroring Step 3ch's pg_tablespace
+        pattern; no encoder, builder, or `Init` flow change.
+        (a) New `pgDbRoleSettingAttrs()` in
+        `internal/initdb/relcache_init.go` returns the 3-column PG18
+        schema verbatim from pg_db_role_setting.h: setdatabase (oid
+        26/4 NotNull), setrole (oid 26/4 NotNull), setconfig (text[]
+        1009/-1 NULLABLE CATALOG_VARLEN).
+        (b) `nailedSharedRels` gains heap entry
+        `{2964, "pg_db_role_setting", 83, 'r', 3, true,
+        pgDbRoleSettingAttrs()}` immediately after the Step 3ch
+        pg_tablespace entry. RelType=83 is safe — pg_db_role_setting
+        is not formrdesc'd (no `DbRoleSettingRelation_Rowtype_Id`
+        constant in PG18 headers; only pg_database/pg_authid/
+        pg_auth_members/pg_shseclabel/pg_subscription are formrdesc'd
+        at relcache.c:4075-4083), so Step 3v's
+        `relation->rd_att->tdtypeid == relp->reltype` Phase3 assertion
+        does not fire.
+        (c) `nailedSharedRels` idxSpec list gains
+        `{2965, "pg_db_role_setting_databaseid_rol_index"}` so
+        `flattenRels` derives `RelKind='i', RelNatts=2` via
+        `pgIndexNattsByOID`.
+        (d) `internal/initdb/initdb.go::pgIndexInitialEntries` shared
+        section gains `entry(2965, 2964, []int16{1,2},
+        []uint32{oidOps, oidOps}, []uint32{0,0}, true, true)`.
+        UNIQUE PRIMARY composite per pg_db_role_setting.h:51
+        (DECLARE_UNIQUE_INDEX_PKEY). No MAKE_SYSCACHE; `process_settings`
+        looks up rows via direct sysscan on the composite key.
+        (e) `bootstrapSharedCatalogPlaceholders` heap list gains 2964
+        so the empty 8 KiB heap at `global/2964` exists before PG's
+        `mdopen`. The shared-index placeholder loop in
+        `bootstrapPostgresDatabase` gains 2965 (alongside 2671/2/6/7,
+        2694, 2695, 3593, 6246/7, 6001/2). pg_db_role_setting is
+        shared so files live under `global/`, not `base/<dboid>/`.
+        Seed threads automatically through `bootstrapPgClassTuples` →
+        `bootstrapPgAttributeTuples` (3 attribute rows + 2 indexKeyAttrs
+        rows for 2965) → `bootstrapPgIndexTuples` (writes Form_pg_index
+        row with indnatts=2 + captures TID in `pgIndexTIDs[2965]`) →
+        `bootstrapPgIndexIndexrelidIndex` (leaf at file 2679) →
+        `bootstrapPgClassOidIndex` (leaf at 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (2 composite-key leaves
+        at 2659).
+        Regression pins:
+        `TestNailedSharedRelsContainsPgDbRoleSetting` (asserts heap
+        entry's OID/RelName/RelKind/RelNatts/RelType + 3-column schema),
+        `TestNailedSharedRelsContainsPgDbRoleSettingDatabaseidRolIndex`
+        (asserts companion index 2965 is registered), and
+        `TestPgDbRoleSettingDatabaseidRolIndexSeededFromInitialEntries`
+        (asserts `(IndRelid=2964, IndKey=[1,2], IsUnique=true,
+        IsPrimary=true)`) in
+        `internal/initdb/pg_db_role_setting_nailed_test.go`. Existing
+        pins extended: `TestPgIndexInitialEntriesIndkeyMatchesPG18`
+        adds `2965: {1, 2}` (strict count guard);
+        `TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree::mustHave`
+        extended with 2965.
+        Verified: `go build ./...` PASS; targeted `go test -count=1
+        -run 'TestPgDbRoleSetting|TestNailedSharedRelsContainsPgDbRoleSetting|TestPgIndexInitialEntriesIndkeyMatchesPG18|TestBootstrapPgIndexIndexrelidIndex|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexColDefsMatchesRelcacheAttrs|TestBootstrapPgIndexTuples|TestPgClassOidIndexHasSingleKeyColumn'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 15 baseline failures as Step 3ct (`TestMigration*`,
+        `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design:
+        `docs/design/0106-0010-step3cu-pg-db-role-setting-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

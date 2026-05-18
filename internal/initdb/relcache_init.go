@@ -138,6 +138,23 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// oid/spcname/spcowner/spcacl/spcoptions). The empty 8 KiB heap at
 	// `global/1213` is already produced by `bootstrapSharedCatalogPlaceholders`.
 	{1213, "pg_tablespace", 83, 'r', 5, true, pgTablespaceAttrs()},
+	// M0106-0010 step 3cu: pg_db_role_setting is opened by
+	// `process_settings(MyDatabaseId, GetSessionUserId())` during
+	// InitPostgres right after `CheckMyDatabase` returns. Without a
+	// pg_class row, `RelationBuildDesc(2964) → ScanPgRelation(2964)`
+	// returns NULL and every forked backend FATALs with
+	// `could not open relation with OID 2964`. RelType=83 is safe because
+	// pg_db_role_setting is not formrdesc'd (no
+	// `DbRoleSettingRelation_Rowtype_Id` constant in PG18 headers; only
+	// pg_database/pg_authid/pg_auth_members/pg_shseclabel/pg_subscription
+	// are formrdesc'd shared rels at
+	// `postgres/src/backend/utils/cache/relcache.c:4075-4083`), so the
+	// Phase3 `relation->rd_att->tdtypeid == relp->reltype` assertion
+	// (relcache.c:4293) does not fire. Schema per
+	// `postgres/src/include/catalog/pg_db_role_setting.h` (PG18, 3 cols:
+	// setdatabase/setrole/setconfig). The empty 8 KiB heap at
+	// `global/2964` is produced by `bootstrapSharedCatalogPlaceholders`.
+	{2964, "pg_db_role_setting", 83, 'r', 3, true, pgDbRoleSettingAttrs()},
 }, []idxSpec{
 	{2671, "pg_database_datname_index"},
 	{2672, "pg_database_oid_index"},
@@ -213,6 +230,17 @@ var nailedSharedRels = flattenRels([]nailedRel{
 	// Companion to OID 2697 (oid PKEY) over the pg_tablespace heap OID 1213
 	// nailed in this same step.
 	{2698, "pg_tablespace_spcname_index"},
+	// M0106-0010 Step 3cu: pg_db_role_setting_databaseid_rol_index (OID 2965).
+	// PG18 `postgres/src/include/catalog/pg_db_role_setting.h:51` declares
+	// `DECLARE_UNIQUE_INDEX_PKEY(pg_db_role_setting_databaseid_rol_index,
+	// 2965, DbRoleSettingDatidRolidIndexId, pg_db_role_setting,
+	// btree(setdatabase oid_ops, setrole oid_ops))`. There is no
+	// MAKE_SYSCACHE — `process_settings` looks up rows via direct
+	// index scan, not syscache. PG's load_critical_index pass opens
+	// every declared index of a nailed rel; without this entry
+	// RelationIdGetRelation(2965) FATALs because no pg_class row gets
+	// seeded.
+	{2965, "pg_db_role_setting_databaseid_rol_index"},
 })
 
 // nailedLocalRels lists all local nailed relations (heaps + indexes flattened).
@@ -2653,6 +2681,24 @@ func pgTablespaceAttrs() []nailedAttr {
 		{Name: "spcowner", TypeOID: 26, Num: 3, Len: 4, NotNull: true},   // oid → pg_authid
 		{Name: "spcacl", TypeOID: 1034, Num: 4, Len: -1, NotNull: false}, // aclitem[] BKI_DEFAULT(_null_)
 		{Name: "spcoptions", TypeOID: 1009, Num: 5, Len: -1, NotNull: false}, // text[] BKI_DEFAULT(_null_)
+	}
+}
+
+// pgDbRoleSettingAttrs defines the 3-column PG18 pg_db_role_setting
+// schema per `postgres/src/include/catalog/pg_db_role_setting.h:34-43`
+// and `pg_db_role_setting_d.h` (Anum_pg_db_role_setting_* 1..3,
+// Natts_pg_db_role_setting == 3). Shared catalog (BKI_SHARED_RELATION).
+// Two fixed-width leading oid columns (setdatabase BKI_LOOKUP_OPT(pg_database),
+// setrole BKI_LOOKUP_OPT(pg_authid)) + one CATALOG_VARLEN nullable text[]
+// (setconfig — GUC settings to apply at login). The oid columns are NotNull
+// in practice (the index 2965 keys both); setconfig is the only varlena and
+// is nullable by absence of BKI_FORCE_NOT_NULL. Used by M0106-0010 Step
+// 3cu nailed shared relation entry.
+func pgDbRoleSettingAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "setdatabase", TypeOID: 26, Num: 1, Len: 4, NotNull: true},   // oid (0 ⇒ role-specific)
+		{Name: "setrole", TypeOID: 26, Num: 2, Len: 4, NotNull: true},       // oid (0 ⇒ database-specific)
+		{Name: "setconfig", TypeOID: 1009, Num: 3, Len: -1, NotNull: false}, // text[] (CATALOG_VARLEN, nullable)
 	}
 }
 

@@ -397,6 +397,7 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 		6000, // pg_replication_origin
 		6100, // pg_subscription
 		6243, // pg_parameter_acl
+		2964, // pg_db_role_setting (M0106-0010 Step 3cu)
 	}
 	for _, oid := range heapOIDs {
 		path := filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10))
@@ -985,6 +986,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		6247, // pg_parameter_acl_oid_index (Step 3br)
 		6001, // pg_replication_origin_roiident_index (Step 3ca)
 		6002, // pg_replication_origin_roname_index (Step 3ca)
+		2965, // pg_db_role_setting_databaseid_rol_index (Step 3cu)
 		// Also copy all local critical indexes to global/
 		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
 		828, // pg_default_acl_oid_index (Step 3am)
@@ -2028,6 +2030,17 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// pg_database_datname_index (2671), pg_authid_rolname_index (2676)
 		// and other shared-catalog name-keyed indexes.
 		entry(2698, 1213, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false), // pg_tablespace_spcname_index
+		// M0106-0010 Step 3cu: pg_db_role_setting_databaseid_rol_index.
+		//   postgres/src/include/catalog/pg_db_role_setting.h:51
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_db_role_setting_databaseid_rol_index,
+		//       2965, DbRoleSettingDatidRolidIndexId, pg_db_role_setting,
+		//       btree(setdatabase oid_ops, setrole oid_ops));
+		// pg_db_role_setting attnums (pg_db_role_setting_d.h): 1=setdatabase,
+		// 2=setrole, 3=setconfig. UNIQUE PRIMARY composite over pg_db_role_setting
+		// heap OID 2964 (Step 3cu nailed shared rel). No MAKE_SYSCACHE —
+		// `process_settings` looks up rows via direct index scan (sysscan on the
+		// composite key), not syscache.
+		entry(2965, 2964, []int16{1, 2}, []uint32{oidOps, oidOps}, []uint32{0, 0}, true, true), // pg_db_role_setting_databaseid_rol_index
 	}
 	// Local-catalog index rows mirroring nailedLocalRels.
 	local := []pgIndexEntry{
