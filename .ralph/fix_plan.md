@@ -9853,7 +9853,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3x-pg-aggregate-fnoid-index.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-24** (bootstrap-procedure task 24)
+- [x] **M0106-0010 batched-24** (bootstrap-procedure task 24)
       - Summary: Seed `pg_range` (6 rows) + the 6 multirange `pg_type`
         peers; add range `pg_cast` rows; add indexes (3542, 2228).
       - Spec: `bootstrap-procedure/06-bki-derived-catalog-seeds.md`.

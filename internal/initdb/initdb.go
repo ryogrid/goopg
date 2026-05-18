@@ -482,6 +482,21 @@ func Init(opts Options) error {
 	if err := bootstrapPgAggregateFnoidIndex(abs, pgAggregateTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_aggregate_fnoid_index: %w", err)
 	}
+	// M0106-0010 batched-24: write all 6 pg_range rows to base/{1,5}/3541
+	// and populate pg_range_rngtypid_index (3542, PKEY) and
+	// pg_range_rngmultitypid_index (2228) so PG's RANGETYPE /
+	// RANGEMULTIRANGE syscaches resolve range-type lookups. pg_range has
+	// no 'oid' column; rngtypid is the natural key.
+	pgRangeTIDs, err := bootstrapPgRangeTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_range tuples: %w", err)
+	}
+	if err := bootstrapPgRangeRngtypidIndex(abs, pgRangeTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_range_rngtypid_index: %w", err)
+	}
+	if err := bootstrapPgRangeRngmultitypidIndex(abs, pgRangeTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_range_rngmultitypid_index: %w", err)
+	}
 	// M0106-0010 step 3m: overwrite the empty btree placeholder at
 	// base/{1,5}/2662 + global/2662 with a populated 2-page btree
 	// (metapage + leaf-root) carrying one oid-keyed IndexTuple per

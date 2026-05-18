@@ -178,3 +178,171 @@ func TestPgRangeRngmultitypidIndexInitialEntry(t *testing.T) {
 		t.Errorf("IsPrimary=true want false (DECLARE_UNIQUE_INDEX, not the _PKEY variant)")
 	}
 }
+
+// TestPgRangeInitialEntriesCount pins that pgRangeInitialEntries returns
+// exactly 6 rows matching the 6 entries in pg_range.dat.
+func TestPgRangeInitialEntriesCount(t *testing.T) {
+	entries := pgRangeInitialEntries()
+	if len(entries) != 6 {
+		t.Fatalf("pgRangeInitialEntries: got %d entries, want 6", len(entries))
+	}
+}
+
+// TestPgRangeEntriesRngtypidUnique pins that every rngtypid is distinct.
+func TestPgRangeEntriesRngtypidUnique(t *testing.T) {
+	seen := make(map[uint32]bool)
+	for _, e := range pgRangeInitialEntries() {
+		if seen[e.RngTypID] {
+			t.Errorf("duplicate rngtypid %d", e.RngTypID)
+		}
+		seen[e.RngTypID] = true
+	}
+}
+
+// TestPgRangeEntriesRngmultitypidUnique pins that every rngmultitypid
+// is distinct (each range type maps to a distinct multirange type).
+func TestPgRangeEntriesRngmultitypidUnique(t *testing.T) {
+	seen := make(map[uint32]bool)
+	for _, e := range pgRangeInitialEntries() {
+		if seen[e.RngMultiTypID] {
+			t.Errorf("duplicate rngmultitypid %d (rngtypid=%d)", e.RngMultiTypID, e.RngTypID)
+		}
+		seen[e.RngMultiTypID] = true
+	}
+}
+
+// TestPgRangeEntriesSpotCheck pins a representative subset of the 6 rows
+// against the pg_range.dat source of truth.
+func TestPgRangeEntriesSpotCheck(t *testing.T) {
+	type want struct {
+		rngtypid      uint32
+		rngsubtype    uint32
+		rngmultitypid uint32
+		rngsubopc     uint32
+		rngcanonical  uint32
+		rngsubdiff    uint32
+	}
+	// Sourced from pg_range.dat + pg_type.dat + pg_proc.dat + pg_opclass.dat.
+	cases := []want{
+		{3904, 23, 4451, 1978, 3914, 3922},   // int4range
+		{3906, 1700, 4532, 3125, 0, 3924},    // numrange (no canonical)
+		{3926, 20, 4536, 3124, 3928, 3923},   // int8range
+	}
+	entries := pgRangeInitialEntries()
+	byTypID := make(map[uint32]pgRangeEntry, len(entries))
+	for _, e := range entries {
+		byTypID[e.RngTypID] = e
+	}
+	for _, w := range cases {
+		e, ok := byTypID[w.rngtypid]
+		if !ok {
+			t.Errorf("missing entry for rngtypid %d", w.rngtypid)
+			continue
+		}
+		if e.RngSubtype != w.rngsubtype {
+			t.Errorf("rngtypid %d: rngsubtype=%d want %d", w.rngtypid, e.RngSubtype, w.rngsubtype)
+		}
+		if e.RngMultiTypID != w.rngmultitypid {
+			t.Errorf("rngtypid %d: rngmultitypid=%d want %d", w.rngtypid, e.RngMultiTypID, w.rngmultitypid)
+		}
+		if e.RngSubOpc != w.rngsubopc {
+			t.Errorf("rngtypid %d: rngsubopc=%d want %d", w.rngtypid, e.RngSubOpc, w.rngsubopc)
+		}
+		if e.RngCanonical != w.rngcanonical {
+			t.Errorf("rngtypid %d: rngcanonical=%d want %d", w.rngtypid, e.RngCanonical, w.rngcanonical)
+		}
+		if e.RngSubDiff != w.rngsubdiff {
+			t.Errorf("rngtypid %d: rngsubdiff=%d want %d", w.rngtypid, e.RngSubDiff, w.rngsubdiff)
+		}
+	}
+}
+
+// TestBootstrapPgRangeTuplesWritesHeap pins that bootstrapPgRangeTuples
+// writes a valid heap file to base/{1,5}/3541 and returns 6 TIDs.
+func TestBootstrapPgRangeTuplesWritesHeap(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"base/1", "base/5"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	tids, err := bootstrapPgRangeTuples(dir)
+	if err != nil {
+		t.Fatalf("bootstrapPgRangeTuples: %v", err)
+	}
+	if len(tids) != 6 {
+		t.Errorf("TID map length: got %d, want 6", len(tids))
+	}
+	for _, e := range pgRangeInitialEntries() {
+		if _, ok := tids[e.RngTypID]; !ok {
+			t.Errorf("no TID for rngtypid %d", e.RngTypID)
+		}
+	}
+	for _, sub := range []string{"base/1/3541", "base/5/3541"} {
+		info, err := os.Stat(filepath.Join(dir, sub))
+		if err != nil {
+			t.Errorf("heap file %s missing: %v", sub, err)
+			continue
+		}
+		if info.Size()%8192 != 0 {
+			t.Errorf("heap file %s size %d is not a multiple of 8192", sub, info.Size())
+		}
+	}
+}
+
+// TestBootstrapPgRangeRngtypidIndexWritesPopulatedBtree pins that
+// bootstrapPgRangeRngtypidIndex writes a ≥2-page btree to base/{1,5}/3542.
+func TestBootstrapPgRangeRngtypidIndexWritesPopulatedBtree(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"base/1", "base/5"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	tids, err := bootstrapPgRangeTuples(dir)
+	if err != nil {
+		t.Fatalf("bootstrapPgRangeTuples: %v", err)
+	}
+	if err := bootstrapPgRangeRngtypidIndex(dir, tids); err != nil {
+		t.Fatalf("bootstrapPgRangeRngtypidIndex: %v", err)
+	}
+	for _, sub := range []string{"base/1/3542", "base/5/3542"} {
+		info, err := os.Stat(filepath.Join(dir, sub))
+		if err != nil {
+			t.Errorf("index file %s missing: %v", sub, err)
+			continue
+		}
+		if info.Size() < 2*8192 {
+			t.Errorf("index file %s size %d too small (want ≥2 pages)", sub, info.Size())
+		}
+	}
+}
+
+// TestBootstrapPgRangeRngmultitypidIndexWritesPopulatedBtree pins that
+// bootstrapPgRangeRngmultitypidIndex writes a ≥2-page btree to
+// base/{1,5}/2228.
+func TestBootstrapPgRangeRngmultitypidIndexWritesPopulatedBtree(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"base/1", "base/5"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	tids, err := bootstrapPgRangeTuples(dir)
+	if err != nil {
+		t.Fatalf("bootstrapPgRangeTuples: %v", err)
+	}
+	if err := bootstrapPgRangeRngmultitypidIndex(dir, tids); err != nil {
+		t.Fatalf("bootstrapPgRangeRngmultitypidIndex: %v", err)
+	}
+	for _, sub := range []string{"base/1/2228", "base/5/2228"} {
+		info, err := os.Stat(filepath.Join(dir, sub))
+		if err != nil {
+			t.Errorf("index file %s missing: %v", sub, err)
+			continue
+		}
+		if info.Size() < 2*8192 {
+			t.Errorf("index file %s size %d too small (want ≥2 pages)", sub, info.Size())
+		}
+	}
+}

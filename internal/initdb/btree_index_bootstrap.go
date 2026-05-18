@@ -2320,3 +2320,76 @@ func bootstrapPgAggregateFnoidIndex(dataDir string, tids map[uint32]heapTID) err
 	}
 	return nil
 }
+
+// bootstrapPgRangeRngtypidIndex writes pg_range_rngtypid_index
+// (OID 3542) — UNIQUE PRIMARY btree on (rngtypid) — to base/{1,5}/3542.
+func bootstrapPgRangeRngtypidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type indexed struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(tids))
+	for oid, tid := range tids {
+		items = append(items, indexed{oid: oid, block: tid.Block, off: tid.Offset})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
+	if err != nil {
+		return fmt.Errorf("pg_range_rngtypid_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "3542"), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_range_rngtypid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+// bootstrapPgRangeRngmultitypidIndex writes pg_range_rngmultitypid_index
+// (OID 2228) — UNIQUE btree on (rngmultitypid) — to base/{1,5}/2228.
+func bootstrapPgRangeRngmultitypidIndex(dataDir string, tids map[uint32]heapTID) error {
+	entries := pgRangeInitialEntries()
+	type indexed struct {
+		multitypid uint32
+		block      uint32
+		off        uint16
+	}
+	items := make([]indexed, 0, len(entries))
+	for _, e := range entries {
+		tid, ok := tids[e.RngTypID]
+		if !ok {
+			return fmt.Errorf("pg_range_rngmultitypid_index: no heap TID for rngtypid %d", e.RngTypID)
+		}
+		items = append(items, indexed{
+			multitypid: e.RngMultiTypID,
+			block:      tid.Block,
+			off:        tid.Offset,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].multitypid < items[j].multitypid })
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.multitypid)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
+	if err != nil {
+		return fmt.Errorf("pg_range_rngmultitypid_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "2228"), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_range_rngmultitypid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}
