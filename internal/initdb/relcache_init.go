@@ -688,6 +688,15 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// (Step 3dm) — without it the view is openable but `SELECT` returns
 	// no rows.
 	{12100, "pg_stat_wal_receiver", 2249, 'v', 15, false, pgStatWalReceiverAttrs()},
+	// M0106-0010 batched-28: seed pg_class + pg_attribute rows for the 5
+	// remaining replication views so PG's RangeVarGetRelid returns a non-zero
+	// OID. RelType=2249 (RECORDOID) matches the underlying SRF's prorettype.
+	// pg_rewrite _RETURN rows are deferred to batched-29 (Step 3dm).
+	{12102, "pg_stat_replication", 2249, 'v', 20, false, pgStatReplicationViewAttrs()},
+	{12103, "pg_stat_recovery_prefetch", 2249, 'v', 10, false, pgStatRecoveryPrefetchViewAttrs()},
+	{12104, "pg_stat_subscription", 2249, 'v', 11, false, pgStatSubscriptionViewAttrs()},
+	{12105, "pg_replication_slots", 2249, 'v', 21, false, pgReplicationSlotsViewAttrs()},
+	{12106, "pg_stat_replication_slots", 2249, 'v', 10, false, pgStatReplicationSlotsViewAttrs()},
 }, []idxSpec{
 	{OID: 2703, Name: "pg_type_oid_index"},
 	{OID: 2704, Name: "pg_type_typname_nsp_index"},
@@ -2133,6 +2142,121 @@ func pgStatWalReceiverAttrs() []nailedAttr {
 		{Name: "sender_host", TypeOID: 25, Num: 13, Len: -1},
 		{Name: "sender_port", TypeOID: 23, Num: 14, Len: 4},
 		{Name: "conninfo", TypeOID: 25, Num: 15, Len: -1},
+	}
+}
+
+// pgStatReplicationViewAttrs returns the 20 pg_attribute rows for the
+// pg_catalog.pg_stat_replication view (OID 12102, batched-28).
+// Column order and types from system_views.sql:906-930 + pg_proc.dat (OID 3099).
+// View columns inherit nullability from the underlying expression → NotNull=false.
+func pgStatReplicationViewAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "pid", TypeOID: 23, Num: 1, Len: 4},
+		{Name: "usesysid", TypeOID: 26, Num: 2, Len: 4},
+		{Name: "usename", TypeOID: 19, Num: 3, Len: 64},
+		{Name: "application_name", TypeOID: 25, Num: 4, Len: -1},
+		{Name: "client_addr", TypeOID: 869, Num: 5, Len: -1},
+		{Name: "client_hostname", TypeOID: 25, Num: 6, Len: -1},
+		{Name: "client_port", TypeOID: 23, Num: 7, Len: 4},
+		{Name: "backend_start", TypeOID: 1184, Num: 8, Len: 8},
+		{Name: "backend_xmin", TypeOID: 28, Num: 9, Len: 4},
+		{Name: "state", TypeOID: 25, Num: 10, Len: -1},
+		{Name: "sent_lsn", TypeOID: 3220, Num: 11, Len: 8},
+		{Name: "write_lsn", TypeOID: 3220, Num: 12, Len: 8},
+		{Name: "flush_lsn", TypeOID: 3220, Num: 13, Len: 8},
+		{Name: "replay_lsn", TypeOID: 3220, Num: 14, Len: 8},
+		{Name: "write_lag", TypeOID: 1186, Num: 15, Len: 16},
+		{Name: "flush_lag", TypeOID: 1186, Num: 16, Len: 16},
+		{Name: "replay_lag", TypeOID: 1186, Num: 17, Len: 16},
+		{Name: "sync_priority", TypeOID: 23, Num: 18, Len: 4},
+		{Name: "sync_state", TypeOID: 25, Num: 19, Len: -1},
+		{Name: "reply_time", TypeOID: 1184, Num: 20, Len: 8},
+	}
+}
+
+// pgStatRecoveryPrefetchViewAttrs returns the 10 pg_attribute rows for the
+// pg_catalog.pg_stat_recovery_prefetch view (OID 12103, batched-28).
+// Column order and types from system_views.sql:965-977 + pg_proc.dat (OID 6248).
+func pgStatRecoveryPrefetchViewAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "stats_reset", TypeOID: 1184, Num: 1, Len: 8},
+		{Name: "prefetch", TypeOID: 20, Num: 2, Len: 8},
+		{Name: "hit", TypeOID: 20, Num: 3, Len: 8},
+		{Name: "skip_init", TypeOID: 20, Num: 4, Len: 8},
+		{Name: "skip_new", TypeOID: 20, Num: 5, Len: 8},
+		{Name: "skip_fpw", TypeOID: 20, Num: 6, Len: 8},
+		{Name: "skip_rep", TypeOID: 20, Num: 7, Len: 8},
+		{Name: "wal_distance", TypeOID: 23, Num: 8, Len: 4},
+		{Name: "block_distance", TypeOID: 23, Num: 9, Len: 4},
+		{Name: "io_depth", TypeOID: 23, Num: 10, Len: 4},
+	}
+}
+
+// pgStatSubscriptionViewAttrs returns the 11 pg_attribute rows for the
+// pg_catalog.pg_stat_subscription view (OID 12104, batched-28).
+// Column order and types from system_views.sql:979-994 + pg_proc.dat (OID 6118).
+func pgStatSubscriptionViewAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "subid", TypeOID: 26, Num: 1, Len: 4},
+		{Name: "subname", TypeOID: 19, Num: 2, Len: 64},
+		{Name: "worker_type", TypeOID: 25, Num: 3, Len: -1},
+		{Name: "pid", TypeOID: 23, Num: 4, Len: 4},
+		{Name: "leader_pid", TypeOID: 23, Num: 5, Len: 4},
+		{Name: "relid", TypeOID: 26, Num: 6, Len: 4},
+		{Name: "received_lsn", TypeOID: 3220, Num: 7, Len: 8},
+		{Name: "last_msg_send_time", TypeOID: 1184, Num: 8, Len: 8},
+		{Name: "last_msg_receipt_time", TypeOID: 1184, Num: 9, Len: 8},
+		{Name: "latest_end_lsn", TypeOID: 3220, Num: 10, Len: 8},
+		{Name: "latest_end_time", TypeOID: 1184, Num: 11, Len: 8},
+	}
+}
+
+// pgReplicationSlotsViewAttrs returns the 21 pg_attribute rows for the
+// pg_catalog.pg_replication_slots view (OID 12105, batched-28).
+// Column order and types from system_views.sql:1019-1043 + pg_proc.dat (OID 3781).
+// PG18 adds two_phase_at, inactive_since, conflicting, invalidation_reason,
+// failover, synced as the last six entries.
+func pgReplicationSlotsViewAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "slot_name", TypeOID: 19, Num: 1, Len: 64},
+		{Name: "plugin", TypeOID: 19, Num: 2, Len: 64},
+		{Name: "slot_type", TypeOID: 25, Num: 3, Len: -1},
+		{Name: "datoid", TypeOID: 26, Num: 4, Len: 4},
+		{Name: "database", TypeOID: 19, Num: 5, Len: 64},
+		{Name: "temporary", TypeOID: 16, Num: 6, Len: 1},
+		{Name: "active", TypeOID: 16, Num: 7, Len: 1},
+		{Name: "active_pid", TypeOID: 23, Num: 8, Len: 4},
+		{Name: "xmin", TypeOID: 28, Num: 9, Len: 4},
+		{Name: "catalog_xmin", TypeOID: 28, Num: 10, Len: 4},
+		{Name: "restart_lsn", TypeOID: 3220, Num: 11, Len: 8},
+		{Name: "confirmed_flush_lsn", TypeOID: 3220, Num: 12, Len: 8},
+		{Name: "wal_status", TypeOID: 25, Num: 13, Len: -1},
+		{Name: "safe_wal_size", TypeOID: 20, Num: 14, Len: 8},
+		{Name: "two_phase", TypeOID: 16, Num: 15, Len: 1},
+		{Name: "two_phase_at", TypeOID: 3220, Num: 16, Len: 8},
+		{Name: "inactive_since", TypeOID: 1184, Num: 17, Len: 8},
+		{Name: "conflicting", TypeOID: 16, Num: 18, Len: 1},
+		{Name: "invalidation_reason", TypeOID: 25, Num: 19, Len: -1},
+		{Name: "failover", TypeOID: 16, Num: 20, Len: 1},
+		{Name: "synced", TypeOID: 16, Num: 21, Len: 1},
+	}
+}
+
+// pgStatReplicationSlotsViewAttrs returns the 10 pg_attribute rows for the
+// pg_catalog.pg_stat_replication_slots view (OID 12106, batched-28).
+// Column order and types from system_views.sql:1045-1059 + pg_proc.dat (OID 6169).
+func pgStatReplicationSlotsViewAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "slot_name", TypeOID: 19, Num: 1, Len: 64},
+		{Name: "spill_txns", TypeOID: 20, Num: 2, Len: 8},
+		{Name: "spill_count", TypeOID: 20, Num: 3, Len: 8},
+		{Name: "spill_bytes", TypeOID: 20, Num: 4, Len: 8},
+		{Name: "stream_txns", TypeOID: 20, Num: 5, Len: 8},
+		{Name: "stream_count", TypeOID: 20, Num: 6, Len: 8},
+		{Name: "stream_bytes", TypeOID: 20, Num: 7, Len: 8},
+		{Name: "total_txns", TypeOID: 20, Num: 8, Len: 8},
+		{Name: "total_bytes", TypeOID: 20, Num: 9, Len: 8},
+		{Name: "stats_reset", TypeOID: 1184, Num: 10, Len: 8},
 	}
 }
 

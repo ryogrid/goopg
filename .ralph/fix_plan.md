@@ -9914,7 +9914,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3df-segv-backtrace-si-addr-and-registers.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-28** (bootstrap-procedure task 28)
+- [x] **M0106-0010 batched-28** (bootstrap-procedure task 28)
       - Summary: Seed `pg_class` + `pg_attribute` + `pg_type` (composite
         rowtype) rows for the 5 remaining replication views
         (`pg_stat_replication` 12102, `pg_stat_recovery_prefetch` 12103,

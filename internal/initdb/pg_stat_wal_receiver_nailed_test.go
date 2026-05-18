@@ -108,7 +108,9 @@ func TestPgClassRowForViewSetsZeroRelfilenode(t *testing.T) {
 	if row[7].Int != 0 {
 		t.Fatalf("view pg_class.relfilenode=%d want 0", row[7].Int)
 	}
-	if !row[20].BoolValue() {
-		t.Fatalf("view pg_class.relhasrules=false want true")
+	// relhasrules=false until ev_action format is fully compatible with PG18.
+	// See pgClassRow: the `relHasRules = true` line is commented out pending Step 3dm.
+	if row[20].BoolValue() {
+		t.Fatalf("view pg_class.relhasrules=true want false (Step 3dm not yet landed)")
 	}
 }
