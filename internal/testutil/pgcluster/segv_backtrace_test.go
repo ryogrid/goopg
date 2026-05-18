@@ -73,6 +73,19 @@ func TestEnsureSegvBacktraceSOBuilds(t *testing.T) {
 	if !strings.Contains(string(out), "end of backtrace") {
 		t.Fatalf("shim did not complete — output lacked footer:\n%s", out)
 	}
+	// Step 3df: si_addr must be present. The helper does *p=1 where p=0,
+	// so si_addr is NULL — encoded as 16 zero hex digits.
+	if !strings.Contains(string(out), "si_addr=0x0000000000000000") {
+		t.Fatalf("shim did not emit si_addr for NULL deref:\n%s", out)
+	}
+	// Step 3df: every saved register slot must be present. We don't pin
+	// values (RDI/RIP are call-site-specific) but the labels must all
+	// appear together on the regs: line.
+	for _, label := range []string{"regs:", " RDI=0x", " RSI=0x", " RDX=0x", " RAX=0x", " RIP=0x", " RSP=0x"} {
+		if !strings.Contains(string(out), label) {
+			t.Fatalf("shim output missing register marker %q:\n%s", label, out)
+		}
+	}
 }
 
 // TestAppendLDPreloadMergesExisting verifies that an existing LD_PRELOAD

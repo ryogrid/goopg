@@ -9067,6 +9067,62 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         crash to `arg1` (leaf NameData pointer) or `arg2`
         (scan-key Name pointer). The fix that step prescribes
         will depend on which pointer was bad.
+      - Step 3df LANDED 2026-05-18 (diagnostic only). Closes the
+        attribution gap exposed by Step 3de: with both candidate
+        pointers byte-correct (leaf IndexTuple in `global/2676` and
+        heap `Form_pg_authid::rolname` in `global/1260`), the
+        surviving `btnamecmp+0x52 → namecmp → __strncmp_avx2` SIGSEGV
+        cannot be attributed without seeing which pointer was
+        dereferenced. Extends `tools/segv_backtrace/segv_backtrace.c`
+        to emit two new lines before the existing symbolic backtrace:
+        `[GOOPG_SEGV_BACKTRACE] si_addr=0x<16 hex>` (the faulting
+        address from `siginfo_t.si_addr`, always emitted — works on
+        every architecture) and `[GOOPG_SEGV_BACKTRACE] regs:
+        RDI=0x… RSI=0x… RDX=0x… RAX=0x… RIP=0x… RSP=0x…` (gated by
+        `#if defined(__x86_64__)`, pulled from
+        `uc->uc_mcontext.gregs[REG_*]` — the SysV-AMD64 call-
+        convention slots that identify args 1..3, return value,
+        instruction pointer, stack pointer). New
+        `static void hex16(uint64_t, char[16])` +
+        `static void write_reg(const char *label, size_t, uint64_t)`
+        keep the handler async-signal-safe — stack-resident 18-byte
+        buffers, two `write(2)` calls per register, no `printf` /
+        `strlen` / malloc / locale. Embedded copy
+        `internal/testutil/pgcluster/segv_backtrace_src.txt` synced
+        byte-for-byte; `ensureSegvBacktraceSO`'s cache filename
+        derives from `sha256(segvBacktraceSource)[:16]` so the new
+        bytes auto-trigger a re-compile of
+        `libsegv_backtrace_<newhash>.so` (no manual hash bump
+        required). `TestEnsureSegvBacktraceSOBuilds` extended (not
+        replaced) with exact-match `si_addr=0x0000000000000000` (the
+        helper does `int *p=0;*p=1;` → NULL si_addr) plus label-
+        presence asserts for `regs:` and every label in `{" RDI=0x",
+        " RSI=0x", " RDX=0x", " RAX=0x", " RIP=0x", " RSP=0x"}`.
+        Register *values* deliberately not pinned (RIP/RDI are call-
+        site-specific across compiler/glibc builds — the label-
+        presence pin is the right level for a diagnostic-only shim).
+        Verified: `go test -count=1 -run
+        'TestSegvBacktrace|TestEnsureSegvBacktraceSOBuilds|TestAppendLDPreload'
+        ./internal/testutil/pgcluster/` PASS (all 4 + 3 subtests);
+        `make ralph-state-guard` PASS. Design:
+        `docs/design/0106-0010-step3df-segv-backtrace-si-addr-and-registers.md`.
+        Next blocker (Step 3dg): re-run
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        GOOPG_TEST_SEGV_BACKTRACE=1
+        TestE2E_FailoverGoopgToPG/async`, capture the new `si_addr=`
+        and `RDI=`/`RSI=` lines from
+        `tmp/m0106-step3df/e2e_run1.log`, and attribute the crash to
+        either the leaf-side `NameData *` (arg1=RDI) or the scan-key
+        side `Name *` from `MyProcPort->user_name` (arg2=RSI). The
+        Step 3dg fix depends entirely on which pointer the kernel
+        reports as bad — if `si_addr == RDI` the leaf-side encoder
+        in `bootstrapPgAuthidIndexes` is the culprit; if `si_addr ==
+        RSI` the scan-key construction in PG's
+        `get_role_oid → SearchSysCache → hba_getauthmethod` chain has
+        a contract goopg's bootstrap is violating (likely
+        `attcollation=0` on rolname vs PG's expected 950, which
+        would cause `FunctionCall2Coll` to pass a NULL `OidCollation
+        *` that `namecmp` would deref).
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
