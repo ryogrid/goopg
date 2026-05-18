@@ -8630,10 +8630,21 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         ./internal/mvcc/` PASS.
         Design:
         `docs/design/0106-0010-step3cx-pg-authid-os-user-and-indexes.md`.
-        Next blocker (Step 3cy): TBD once
-        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
-        is re-run end-to-end past the `role "ryo" does not exist`
-        line.
+        E2E observation: `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        TestE2E_FailoverGoopgToPG/async` with `-timeout 300s` hits the
+        Go test deadline at 300s (goroutine dump only — the actual
+        FATAL log lines were not captured by this run's stdout
+        plumbing). Previous Step verifications completed well within
+        300s, so the hang is the new symptom Step 3cy needs to
+        diagnose. Likely the role lookup now succeeds and PG advances
+        to a later step that loops/blocks (e.g., an unpopulated index
+        whose sysscan retries, or a recovery/checkpoint stall);
+        capture the standby's `log/server.log` (not just go-test
+        stdout) to see the first new FATAL line.
+        Next blocker (Step 3cy): investigate the post-Step-3cx
+        300s timeout — start by widening the timeout to 600s, dumping
+        the standby PG server log, and confirming whether the
+        `28000: role "ryo" does not exist` FATAL is in fact gone.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
