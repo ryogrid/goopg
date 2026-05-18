@@ -8570,6 +8570,70 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         composite-key encoder applies (amopfamily, amoplefttype,
         amoprighttype, amopstrategy); populate when a concrete
         planner-path blocker surfaces.
+      - Step 3cx LANDED 2026-05-18. Closes the FATAL
+        `28000: role "ryo" does not exist` PG-standby boot blocker
+        surfaced by Step 3cw. Two interacting gaps closed in one step:
+        (1) `bootstrapPostgresRole` seeded both `postgres` and the OS
+        user at OID 10 — distinct AUTHOID lookups for the OS user
+        could not find a stable heap row; (2) the
+        `pg_authid_rolname_index` (OID 2676) and `pg_authid_oid_index`
+        (OID 2677) shared-catalog btrees were still Step-3k empty
+        placeholders (`btm_root = P_NONE`), so `AUTHNAME`/`AUTHOID`
+        syscache lookups returned zero rows.
+        Fix: `internal/initdb/initdb.go::bootstrapPostgresRole` now
+        returns `([]pgAuthidEntry, error)` where each entry carries
+        `{OID, Rolname, TID}`; OS user (when distinct from
+        `postgres`) is seeded at `FirstNormalObjectId = 16384` while
+        `postgres` stays pinned at `BOOTSTRAP_SUPERUSERID = 10`. New
+        companion struct `pgAuthidEntry` lives next to `heapTID`.
+        New 8-byte-aligned single-NAME-column IndexTuple builder
+        `pgBuildIndexTupleNameKey(heapBlk, heapOff, name)` in
+        `internal/initdb/btree_index_bootstrap.go`: 8-byte
+        IndexTupleHeader + NAMEDATALEN=64 zero-padded NameData =
+        72 bytes total (already MAXALIGN'd). Mirrors PG's
+        `index_form_tuple → heap_fill_tuple` for a fixed-width
+        NAME column with no nulls, and the same on-disk layout as
+        `encodeValuePG`'s `name` case. `namestrcpy`-style truncation:
+        names ≥ NAMEDATALEN fill all 64 bytes (no trailing
+        terminator).
+        New `bootstrapPgAuthidIndexes(dataDir, entries)`: builds both
+        2-page btrees (metapage + populated leaf-root) — oid-keyed
+        via existing `pgBuildIndexTupleOidKey` for 2677 (sorted by
+        OID asc), name-keyed via the new builder for 2676 (sorted
+        lexicographically on rolname) — and writes to `global/<oid>`
+        only (pg_authid is a shared catalog). `Init` captures
+        `pgAuthidEntries, err := bootstrapPostgresRole(abs)` and
+        calls `bootstrapPgAuthidIndexes(abs, pgAuthidEntries)`
+        immediately after `bootstrapPgDatabaseOidIndex`.
+        Regression pins (new in
+        `internal/initdb/pg_authid_indexes_test.go`):
+        `TestPgBuildIndexTupleNameKeyLayoutMatchesPG18` (byte-exact
+        72-byte layout with asymmetric block-number 0xDEADBEEF, so
+        the Step-3s LE-uint32 trap regression is caught loudly;
+        t_info=0x0048; NameData zero-padded past name bytes);
+        `TestPgBuildIndexTupleNameKeyTruncatesAtNamedataLen` (80-byte
+        input fills all 64 NameData bytes);
+        `TestBootstrapPgAuthidIndexesWritesPopulatedBtrees`
+        (both 2-page files at `global/2676` and `global/2677`;
+        `btm_root == 1`; line-pointer counts match the seeded
+        entry count; mandatory presence of a `"ryo"` leaf in 2676
+        AND an OID-16384 leaf in 2677 — these are the exact keys
+        whose absence triggered the Step 3cw FATAL).
+        Verified: `go build ./...` PASS;
+        `go test -count=1 -run
+        'TestPgBuildIndexTupleNameKey|TestBootstrapPgAuthidIndexes'
+        ./internal/initdb/` PASS (3/3); `go test -count=1
+        ./internal/initdb/` — same 15 pre-existing baseline
+        failures as Step 3cw (no new regressions); cross-package
+        smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design:
+        `docs/design/0106-0010-step3cx-pg-authid-os-user-and-indexes.md`.
+        Next blocker (Step 3cy): TBD once
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        is re-run end-to-end past the `role "ryo" does not exist`
+        line.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

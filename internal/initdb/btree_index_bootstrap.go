@@ -1051,3 +1051,107 @@ func bootstrapPgAmprocFamProcIndex(dataDir string, tids []heapTID) error {
 	}
 	return nil
 }
+
+
+// pgBuildIndexTupleNameKey returns the on-disk IndexTuple bytes for a single
+// fixed-width NAME-keyed btree leaf entry (e.g. pg_authid_rolname_index).
+//
+// Layout (no nulls, fixed-width NAMEDATALEN=64 key):
+//
+//	[0..1]   bi_hi          (ItemPointerData)
+//	[2..3]   bi_lo
+//	[4..5]   ip_posid
+//	[6..7]   t_info         (low 13 bits = size; INDEX_VAR/NULL bits clear)
+//	[8..71]  NameData       (zero-padded to NAMEDATALEN)
+//
+// Total = MAXALIGN(IndexTupleHeader + NAMEDATALEN) = MAXALIGN(72) = 72 — no
+// trailing pad required because 72 is already 8-byte aligned. NAMEDATALEN is
+// the PG18-canonical 64 so this matches `_bt_form_tuple → index_form_tuple`
+// for a single NAME column with no nulls.
+func pgBuildIndexTupleNameKey(heapBlk uint32, heapOff uint16, name string) []byte {
+	const (
+		nameDataLen = 64
+		hoff        = 8
+		size        = hoff + nameDataLen // 72, already MAXALIGN'd
+	)
+	out := make([]byte, size)
+	le := binary.LittleEndian
+
+	// ItemPointerData.
+	le.PutUint16(out[0:2], uint16(heapBlk>>16))
+	le.PutUint16(out[2:4], uint16(heapBlk&0xFFFF))
+	le.PutUint16(out[4:6], heapOff)
+
+	// t_info: lower 13 bits hold tuple size.
+	le.PutUint16(out[6:8], uint16(size)&indexSizeMask)
+
+	// NameData: NAMEDATALEN bytes, zero-padded. PG's NameData is a fixed-
+	// size struct (NAMEDATALEN char array); pg_authid.rolname is stored as
+	// exactly 64 bytes with trailing zeros for short names. Truncate
+	// silently if the caller hands us a longer string — that mirrors PG's
+	// `namestrcpy` semantics.
+	n := len(name)
+	if n > nameDataLen {
+		n = nameDataLen
+	}
+	copy(out[hoff:hoff+n], name[:n])
+	return out
+}
+
+// bootstrapPgAuthidIndexes populates the two pg_authid critical indexes
+// (rolname → OID 2676; OID → OID 2677) with one IndexTuple per bootstrapped
+// pg_authid heap row.  Both are shared catalogs and live exclusively under
+// `global/`; the empty btree placeholders written by
+// `bootstrapSharedCatalogPlaceholders` are overwritten in place.
+//
+// Without these populated indexes, PG's
+// `InitializeSessionUserId → SearchSysCache1(AUTHNAME, $USER)` returns
+// `(InvalidOid, NULL)` and PG FATALs with `28000: role "<os-user>" does
+// not exist` — even though the corresponding heap row is sitting in
+// `global/1260`.  Step 3cx (M0106-0010).
+func bootstrapPgAuthidIndexes(dataDir string, entries []pgAuthidEntry) error {
+	if len(entries) == 0 {
+		return fmt.Errorf("pg_authid indexes: no entries")
+	}
+
+	// pg_authid_oid_index (2677): sort by OID asc; oid-keyed.
+	oidSorted := append([]pgAuthidEntry(nil), entries...)
+	sort.Slice(oidSorted, func(i, j int) bool { return oidSorted[i].OID < oidSorted[j].OID })
+	oidTuples := make([][]byte, len(oidSorted))
+	for i, e := range oidSorted {
+		oidTuples[i] = pgBuildIndexTupleOidKey(e.TID.Block, e.TID.Offset, e.OID)
+	}
+	oidLeaf, err := pgBuildBtreeLeafRootPage(oidTuples)
+	if err != nil {
+		return fmt.Errorf("pg_authid_oid_index leaf: %w", err)
+	}
+	oidMeta := pgBuildBtreeMetapageWithRoot(1, 0)
+	oidFile := make([]byte, 0, 2*storage.BlockSize)
+	oidFile = append(oidFile, oidMeta...)
+	oidFile = append(oidFile, oidLeaf...)
+	if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(2677, 10)), oidFile, 0o600); err != nil {
+		return fmt.Errorf("write pg_authid_oid_index: %w", err)
+	}
+
+	// pg_authid_rolname_index (2676): sort by rolname asc (lexicographic on
+	// raw bytes — matches `bttextcmp`/`btnamecmp` for ASCII single-byte
+	// rolnames, which is what bootstrap seeds).  name-keyed leaf tuples.
+	nameSorted := append([]pgAuthidEntry(nil), entries...)
+	sort.Slice(nameSorted, func(i, j int) bool { return nameSorted[i].Rolname < nameSorted[j].Rolname })
+	nameTuples := make([][]byte, len(nameSorted))
+	for i, e := range nameSorted {
+		nameTuples[i] = pgBuildIndexTupleNameKey(e.TID.Block, e.TID.Offset, e.Rolname)
+	}
+	nameLeaf, err := pgBuildBtreeLeafRootPage(nameTuples)
+	if err != nil {
+		return fmt.Errorf("pg_authid_rolname_index leaf: %w", err)
+	}
+	nameMeta := pgBuildBtreeMetapageWithRoot(1, 0)
+	nameFile := make([]byte, 0, 2*storage.BlockSize)
+	nameFile = append(nameFile, nameMeta...)
+	nameFile = append(nameFile, nameLeaf...)
+	if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(2676, 10)), nameFile, 0o600); err != nil {
+		return fmt.Errorf("write pg_authid_rolname_index: %w", err)
+	}
+	return nil
+}

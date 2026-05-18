@@ -185,8 +185,10 @@ func Init(opts Options) error {
 	if err := bootstrapSharedCatalogPlaceholders(abs); err != nil {
 		return fmt.Errorf("goopg init: shared catalog placeholders: %w", err)
 	}
-	// Overwrite pg_authid placeholder with a minimal "postgres" superuser row.
-	if err := bootstrapPostgresRole(abs); err != nil {
+	// Overwrite pg_authid placeholder with a minimal "postgres" superuser row
+	// plus (if distinct from "postgres") an OS-user role at OID 16384.
+	pgAuthidEntries, err := bootstrapPostgresRole(abs)
+	if err != nil {
 		return fmt.Errorf("goopg init: postgres role: %w", err)
 	}
 	if err := bootstrapPostgresDatabase(abs); err != nil {
@@ -203,6 +205,16 @@ func Init(opts Options) error {
 	// route shared catalogs to global/<relfilenode>.
 	if err := bootstrapPgDatabaseOidIndex(abs); err != nil {
 		return fmt.Errorf("goopg init: pg_database_oid_index: %w", err)
+	}
+	// M0106-0010 step 3cx: overwrite the empty btree placeholders at
+	// global/2676 (pg_authid_rolname_index) and global/2677
+	// (pg_authid_oid_index) with populated 2-page btrees so PG's
+	// InitializeSessionUserId → SearchSysCache1(AUTHNAME, "<os-user>") and
+	// SearchSysCache1(AUTHOID, oid) lookups succeed against the heap rows
+	// just written by bootstrapPostgresRole. Without these, the next FATAL
+	// during standby boot is `28000: role "<os-user>" does not exist`.
+	if err := bootstrapPgAuthidIndexes(abs, pgAuthidEntries); err != nil {
+		return fmt.Errorf("goopg init: pg_authid indexes: %w", err)
 	}
 	// M0106-0008: populate pg_class/pg_attribute heap tuples so
 	// vanilla PG's RelationBuildDesc → ScanPgRelation finds them.
@@ -591,7 +603,7 @@ func makeBtreeRootPage() []byte {
 // bootstrapPostgresRole writes a minimal pg_authid tuple for the
 // "postgres" superuser so PG standby accepts connections. The tuple
 // uses PG's native heap-tuple encoding (not goopg's internal format).
-func bootstrapPostgresRole(dataDir string) error {
+func bootstrapPostgresRole(dataDir string) ([]pgAuthidEntry, error) {
 	// pg_authid columns (postgres/src/include/catalog/pg_authid.h)
 	cols := []catalog.Column{
 		{Name: "oid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
@@ -607,9 +619,9 @@ func bootstrapPostgresRole(dataDir string) error {
 		{Name: "rolpassword", Type: catalog.Type{Name: "text"}, Ordinal: 10},
 		{Name: "rolvaliduntil", Type: catalog.Type{Name: "timestamptz"}, Ordinal: 11},
 	}
-	buildRow := func(rolname string) executor.Row {
+	buildRow := func(oid int64, rolname string) executor.Row {
 		return executor.Row{
-			executor.NewIntDatum(10),          // oid (bootstrap superuser)
+			executor.NewIntDatum(oid),         // oid
 			executor.NewStringDatum(rolname),  // rolname
 			executor.NewBoolDatum(true),       // rolsuper
 			executor.NewBoolDatum(true),       // rolinherit
@@ -624,37 +636,48 @@ func bootstrapPostgresRole(dataDir string) error {
 		}
 	}
 
-	page := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(page); err != nil {
-		return err
+	// Roles to seed. OID 10 = BOOTSTRAP_SUPERUSERID (pinned by PG18 for the
+	// canonical bootstrap "postgres" role). The OS user (if different) gets
+	// a distinct OID at FirstNormalObjectId=16384 so PG's syscache lookups
+	// by name and by OID find separate rows and PG's
+	// `InitializeSessionUserId → SearchSysCache1(AUTHNAME, $USER)` succeeds.
+	type roleSeed struct {
+		oid     int64
+		rolname string
 	}
-	// Add "postgres" role.
-	row := buildRow("postgres")
-	payload, err := executor.EncodeRowPG(cols, row)
-	if err != nil {
-		return fmt.Errorf("encode postgres role: %w", err)
-	}
-	tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
-	tuple.Header.SetNatts(len(cols))
-	if _, err := storage.PageAddHeapTuple(page, tuple); err != nil {
-		return err
-	}
-	// Add OS user role.
+	seeds := []roleSeed{{oid: 10, rolname: "postgres"}}
 	osUser := os.Getenv("USER")
 	if osUser != "" && osUser != "postgres" {
-		row2 := buildRow(osUser)
-		payload2, err := executor.EncodeRowPG(cols, row2)
+		seeds = append(seeds, roleSeed{oid: 16384, rolname: osUser})
+	}
+
+	page := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(page); err != nil {
+		return nil, err
+	}
+	entries := make([]pgAuthidEntry, 0, len(seeds))
+	for _, s := range seeds {
+		payload, err := executor.EncodeRowPG(cols, buildRow(s.oid, s.rolname))
 		if err != nil {
-			return fmt.Errorf("encode %s role: %w", osUser, err)
+			return nil, fmt.Errorf("encode %s role: %w", s.rolname, err)
 		}
-		tuple2 := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload2)
-		tuple2.Header.SetNatts(len(cols))
-		if _, err := storage.PageAddHeapTuple(page, tuple2); err != nil {
-			return err
+		tuple := storage.NewHeapTuple(storage.TransactionID(1), storage.InvalidTransactionID, payload)
+		tuple.Header.SetNatts(len(cols))
+		slot, err := storage.PageAddHeapTuple(page, tuple)
+		if err != nil {
+			return nil, err
 		}
+		entries = append(entries, pgAuthidEntry{
+			OID:     uint32(s.oid),
+			Rolname: s.rolname,
+			TID:     heapTID{Block: 0, Offset: slot},
+		})
 	}
 	path := filepath.Join(dataDir, "global", "1260") // pg_authid OID
-	return os.WriteFile(path, page, 0o600)
+	if err := os.WriteFile(path, page, 0o600); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }
 
 // bootstrapPostgresDatabase writes a minimal pg_database tuple for the
@@ -3290,6 +3313,16 @@ func hasVarWidthCol(cols []catalog.Column) bool {
 type heapTID struct {
 	Block  uint32
 	Offset uint16
+}
+
+
+// pgAuthidEntry describes a bootstrapped pg_authid row and the heap-TID
+// where it was written, so the rolname / oid index bootstrap (Step 3cx)
+// can build IndexTuples pointing at each row.
+type pgAuthidEntry struct {
+	OID     uint32
+	Rolname string
+	TID     heapTID
 }
 
 // writeMultiPageHeap writes multiple heap tuples (one per nailed rel) into
