@@ -1320,6 +1320,93 @@ func int2VectorBytes(values []int16) []byte {
 	return buf
 }
 
+// oidArrayBytes builds a binary `oid[]` ArrayType for pg_proc.proallargtypes
+// (and any other oid[] column that needs a non-empty value). Layout matches
+// PG's construct_array output for typcategory='A' / typelem=26 / typalign='i':
+// 24-byte header (vl_len_, ndim, dataoffset, elemtype, dim[0], lbound[0]) then
+// N×4-byte little-endian OIDs. lbound=1 mirrors construct_array's default
+// (unlike pg_proc.proargtypes which uses oidvector with lbound=0).
+//
+// Step 3dk: feeds executor.NewBytesDatum so encodeValuePG's KindBytes
+// passthrough path emits the blob unchanged. NULL pg_proc rows still use
+// emptyArrayTypeBytes(26).
+func oidArrayBytes(oids []uint32) []byte {
+	const headerSize = 24
+	total := headerSize + 4*len(oids)
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	binary.LittleEndian.PutUint32(buf[4:8], 1)
+	binary.LittleEndian.PutUint32(buf[8:12], 0)
+	binary.LittleEndian.PutUint32(buf[12:16], 26)
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(oids)))
+	binary.LittleEndian.PutUint32(buf[20:24], 1)
+	for i, o := range oids {
+		binary.LittleEndian.PutUint32(buf[24+i*4:28+i*4], o)
+	}
+	return buf
+}
+
+// charArrayBytes builds a binary `char[]` ArrayType for pg_proc.proargmodes
+// (and any other char[] column needing a non-empty value). PG's CHAR (OID 18)
+// is single-byte with typalign='c'; elements are packed without padding.
+// Layout: 24-byte header + N×1 byte payload.
+//
+// Step 3dk: feeds executor.NewBytesDatum / KindBytes passthrough.
+func charArrayBytes(chars []byte) []byte {
+	const headerSize = 24
+	total := headerSize + len(chars)
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	binary.LittleEndian.PutUint32(buf[4:8], 1)
+	binary.LittleEndian.PutUint32(buf[8:12], 0)
+	binary.LittleEndian.PutUint32(buf[12:16], 18)
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(chars)))
+	binary.LittleEndian.PutUint32(buf[20:24], 1)
+	copy(buf[24:], chars)
+	return buf
+}
+
+// textArrayBytes builds a binary `text[]` ArrayType for pg_proc.proargnames
+// (and any other text[] column needing a non-empty value). text is a 4-byte
+// aligned varlena (typalign='i'); PG's array_seek walks elements by
+// `att_align_nominal(off, 'i') == (off+3) &^ 3` before reading each element's
+// 4-byte varlena header.
+//
+// Layout: 24-byte header (vl_len_, ndim=1, dataoffset=0, elemtype=25, dim[0]=N,
+// lbound[0]=1) then a packed-with-4-byte-alignment sequence of long-form
+// varlenas (4-byte length + payload). Each element's varlena header encodes
+// total size via SET_VARSIZE_4B: (totalSize << 2) with low 2 bits = 00.
+//
+// Step 3dk: feeds executor.NewBytesDatum / KindBytes passthrough.
+func textArrayBytes(strs []string) []byte {
+	const headerSize = 24
+	align4 := func(n int) int { return (n + 3) &^ 3 }
+
+	// Compute element offsets and total array size up-front.
+	elemOffsets := make([]int, len(strs))
+	off := headerSize
+	for i, s := range strs {
+		off = align4(off)
+		elemOffsets[i] = off
+		off += 4 + len(s)
+	}
+	total := off
+
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	binary.LittleEndian.PutUint32(buf[4:8], 1)
+	binary.LittleEndian.PutUint32(buf[8:12], 0)
+	binary.LittleEndian.PutUint32(buf[12:16], 25)
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(strs)))
+	binary.LittleEndian.PutUint32(buf[20:24], 1)
+	for i, s := range strs {
+		eoff := elemOffsets[i]
+		binary.LittleEndian.PutUint32(buf[eoff:eoff+4], uint32(4+len(s))<<2)
+		copy(buf[eoff+4:], []byte(s))
+	}
+	return buf
+}
+
 // pgProcEntry is a minimal description of a pg_proc row produced
 // during initdb. v0 only needs to seed the AM handler functions so
 // PG's RelationInitIndexAccessInfo can resolve amhandler via fmgr.
@@ -1335,14 +1422,22 @@ func int2VectorBytes(values []int16) []byte {
 // resolve `s.<col>` references through proargnames anyway.
 type pgProcEntry struct {
 	OID         uint32
-	Name        string // proname (NameData, ≤63 bytes)
-	RetType     uint32 // prorettype OID
+	Name        string   // proname (NameData, ≤63 bytes)
+	RetType     uint32   // prorettype OID
 	ArgTypes    []uint32 // proargtypes vector. nil/empty → defaults to [2281] (internal)
-	Volatile    byte   // provolatile char. 0 → defaults to 'v' (volatile)
-	Parallel    byte   // proparallel char. 0 → defaults to 's' (safe)
-	RetSet      bool   // proretset. defaults to false
-	NotStrict   bool   // proisstrict inverse. defaults to strict (true)
-	HandlerName string // prosrc text (e.g. "bthandler") — fmgr internal lookup key
+	Volatile    byte     // provolatile char. 0 → defaults to 'v' (volatile)
+	Parallel    byte     // proparallel char. 0 → defaults to 's' (safe)
+	RetSet      bool     // proretset. defaults to false
+	NotStrict   bool     // proisstrict inverse. defaults to strict (true)
+	HandlerName string   // prosrc text (e.g. "bthandler") — fmgr internal lookup key
+	// Step 3dk: OUT-arg metadata for SRFs whose result columns are described
+	// via proallargtypes / proargmodes / proargnames rather than prorettype.
+	// nil leaves the corresponding column as the legacy empty-ArrayType shell;
+	// non-nil triggers pgProcRow to emit a binary ArrayType blob via
+	// executor.NewBytesDatum + codec.go's KindBytes passthrough.
+	AllArgTypes []uint32 // proallargtypes (oid[])
+	ArgModes    []byte   // proargmodes (char[]; 'i'/'o'/'b'/'v'/'t')
+	ArgNames    []string // proargnames (text[])
 }
 
 // pgProcColDefs returns the 30-column PG18 FormData_pg_proc layout.
@@ -1461,14 +1556,22 @@ func pgProcInitialEntries() []pgProcEntry {
 		// proisstrict=false, provolatile='s', proparallel='r'.
 		// prorettype = RECORD (2249). proargtypes is empty (zero
 		// input args); the 15 OUT-arg columns live in proallargtypes/
-		// proargmodes/proargnames and remain emptyArrayTypeBytes()
-		// shells until Step 3dk populates them as part of the
-		// pg_stat_wal_receiver view + rewrite-rule seed. Seeding the
-		// pg_proc row in isolation is harmless: PG's syscache will
-		// resolve OID 3317 by HandlerName for any code path that
-		// dereferences prosrc directly, and the OUT-arg-dependent
-		// view-resolution path is not reached until the view itself
-		// is on disk.
+		// proargmodes/proargnames. Step 3dk fills those arrays so PG's
+		// build_function_result_tupdesc_d() can resolve `s.<col>` in
+		// the pending pg_stat_wal_receiver view rewrite rule. Without
+		// these, view-resolution would fail with type-record-missing
+		// errors even after Step 3dl seeds pg_class/pg_attribute/
+		// pg_rewrite.
+		//
+		// Type OIDs (verbatim from pg_proc.dat:5671-5673):
+		//   int4=23, text=25, pg_lsn=3220, timestamptz=1184
+		//
+		// Column order matches src/backend/catalog/system_views.sql
+		// :945-963 exactly: pid, status, receive_start_lsn,
+		// receive_start_tli, written_lsn, flushed_lsn, received_tli,
+		// last_msg_send_time, last_msg_receipt_time, latest_end_lsn,
+		// latest_end_time, slot_name, sender_host, sender_port,
+		// conninfo (15 OUT args).
 		{
 			OID:         3317,
 			Name:        "pg_stat_get_wal_receiver",
@@ -1479,6 +1582,22 @@ func pgProcInitialEntries() []pgProcEntry {
 			RetSet:      true,
 			NotStrict:   true,
 			HandlerName: "pg_stat_get_wal_receiver",
+			AllArgTypes: []uint32{
+				23, 25, 3220, 23, 3220, 3220, 23, 1184,
+				1184, 3220, 1184, 25, 25, 23, 25,
+			},
+			ArgModes: []byte{
+				'o', 'o', 'o', 'o', 'o', 'o', 'o', 'o',
+				'o', 'o', 'o', 'o', 'o', 'o', 'o',
+			},
+			ArgNames: []string{
+				"pid", "status", "receive_start_lsn",
+				"receive_start_tli", "written_lsn", "flushed_lsn",
+				"received_tli", "last_msg_send_time",
+				"last_msg_receipt_time", "latest_end_lsn",
+				"latest_end_time", "slot_name", "sender_host",
+				"sender_port", "conninfo",
+			},
 		},
 	}
 }
@@ -1506,6 +1625,23 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	if parallel == 0 {
 		parallel = 's'
 	}
+	// Step 3dk: emit OUT-arg metadata as binary ArrayType blobs when
+	// supplied. NewStringDatum("") falls through to encodeValuePG's
+	// emptyArrayTypeBytes path; NewBytesDatum lands a KindBytes datum
+	// that the new codec.go passthrough emits verbatim. Behaviour for
+	// all pre-Step-3dk entries is unchanged because their fields are nil.
+	allArgs := executor.NewStringDatum("")
+	if e.AllArgTypes != nil {
+		allArgs = executor.NewBytesDatum(oidArrayBytes(e.AllArgTypes))
+	}
+	argModes := executor.NewStringDatum("")
+	if e.ArgModes != nil {
+		argModes = executor.NewBytesDatum(charArrayBytes(e.ArgModes))
+	}
+	argNames := executor.NewStringDatum("")
+	if e.ArgNames != nil {
+		argNames = executor.NewBytesDatum(textArrayBytes(e.ArgNames))
+	}
 	return executor.Row{
 		executor.NewIntDatum(int64(e.OID)),               // 1  oid
 		executor.NewStringDatum(e.Name),                  // 2  proname
@@ -1527,9 +1663,9 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NewIntDatum(0),                          // 18 pronargdefaults
 		executor.NewIntDatum(int64(e.RetType)),           // 19 prorettype
 		executor.NewBytesDatum(oidVectorBytes(argTypes)), // 20 proargtypes
-		executor.NewStringDatum(""),                      // 21 proallargtypes
-		executor.NewStringDatum(""),                      // 22 proargmodes
-		executor.NewStringDatum(""),                      // 23 proargnames
+		allArgs,                                          // 21 proallargtypes
+		argModes,                                         // 22 proargmodes
+		argNames,                                         // 23 proargnames
 		executor.NewStringDatum(""),                      // 24 proargdefaults (pg_node_tree)
 		executor.NewStringDatum(""),                      // 25 protrftypes
 		executor.NewStringDatum(e.HandlerName),           // 26 prosrc — fmgr internal lookup key

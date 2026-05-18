@@ -262,17 +262,40 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// PG binary empty ArrayType, elemtype = aclitem (1033).
 		// PG's deconstruct_array asserts on ARR_ELEMTYPE; a text varlena
 		// "{}" is not a valid ArrayType*. Match construct_empty_array.
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
 		return emptyArrayTypeBytes(1033), nil
 	case "text[]", "_text":
-		// PG binary empty ArrayType, elemtype = text (25).
+		// PG binary empty ArrayType, elemtype = text (25). M0106-0010
+		// Step 3dk lets callers (initdb pg_proc seed) pass a pre-built
+		// ArrayType blob via KindBytes so non-empty proargnames/proconfig
+		// arrays land on disk in PG-native form. Mirrors the oidvector
+		// passthrough pattern already used by pg_proc.proargtypes.
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
 		return emptyArrayTypeBytes(25), nil
 	case "oid[]", "_oid":
+		// Step 3dk: KindBytes passthrough for non-empty oid[] blobs
+		// (e.g. pg_proc.proallargtypes on SRFs).
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
 		return emptyArrayTypeBytes(26), nil
 	case "int2[]", "_int2":
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
 		return emptyArrayTypeBytes(21), nil
 	case "char[]", "_char":
 		// PG binary empty ArrayType, elemtype = char (18).
 		// Used for pg_proc.proargmodes when no per-arg modes are set.
+		// Step 3dk: KindBytes passthrough for non-empty char[] blobs
+		// (e.g. pg_proc.proargmodes on SRFs with OUT args).
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
 		return emptyArrayTypeBytes(18), nil
 	case "oidvector":
 		// oidvector is a fixed-shape varlena ArrayType: 1-D, lbound=0,
