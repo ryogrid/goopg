@@ -1864,6 +1864,15 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
 		}
 	}
+
+	// Signal that this transaction wrote to nailed catalog relations (pg_class
+	// and pg_attribute). The xact-marker hook in open.go reads this flag at
+	// commit time to emit RecordKindXactCommitInval and unlink both
+	// pg_internal.init files so the next backend reloads fresh descriptors.
+	if ctx.TxnMgr != nil {
+		ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+
 	return nil
 }
 

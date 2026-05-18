@@ -194,6 +194,14 @@ type Context struct {
 	// for its periodic poll. nil disables the wakeup (the launcher
 	// still converges via the timer). M0103-0002.
 	OnSubscriptionChange func()
+
+	// DataDir is the cluster's data directory, used by DDL operators that
+	// write to nailed catalog relations (pg_class, pg_attribute, pg_proc,
+	// pg_type) to call catalog.RelcacheInitFileUnlink at commit time via
+	// TxnMgr.SetRelcacheInvalPending. Empty means the DDL runs without
+	// relcache-init-file invalidation (tests that don't set up a full
+	// cluster). M0106-0010 batched-31.
+	DataDir string
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.

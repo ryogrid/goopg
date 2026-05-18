@@ -9943,7 +9943,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3dm-pg-rewrite-schema-fix.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-30** (bootstrap-procedure task 30)
+- [x] **M0106-0010 batched-30** (bootstrap-procedure task 30)
       - Summary: Fix `writeRelcacheInitFile`: emit exactly 5 shared /
         4 local rels + 6 / 7 critical indexes (trailing-count check
         `relcache.c:6524-6534`); write the index sub-record (pg_index
@@ -9957,8 +9957,14 @@ relcache init → replication readiness) and intra-package grouped.
         byte, record count, reader round-trip via a vanilla-PG18
         `load_relcache_init_file` simulator.
       - Risk gate: wal/replication.
+      - COMPLETE 2026-05-19 (loop 17): filterCriticalRels restricts output
+        to canonical 5+6 / 4+7 OIDs; writePgIndexSubrecord emits pg_index
+        HeapTuple + opfamily/opcintype/support (btreeAmsupport=6) /
+        indcollation/indoption/opcoptions; chmod 0o400 dropped from both
+        bootstrapRelcacheInitFiles and writeRelcacheInitFile; 3 new tests
+        all PASS; TestE2E_PhysicalReplication PASS; commit fe3968a.
 
-- [ ] **M0106-0010 batched-31** (bootstrap-procedure task 31)
+- [x] **M0106-0010 batched-31** (bootstrap-procedure task 31)
       - Summary: Add `internal/catalog/RelcacheInitFileUnlink(dataDir, dboid)`
         and `WithRelCacheInitLock(fn)`; funnel every PG-canonical
         nailed-rel DDL through them; emit commit-record
@@ -9973,6 +9979,28 @@ relcache init → replication readiness) and intra-package grouped.
         `internal/wal/recovery_test.go` extended for
         `ProcessCommittedInvalidationMessages` redo.
       - Risk gate: wal/replication.
+      - COMPLETE 2026-05-19 (loop 18):
+        - `catalog.RelcacheInitFileUnlink(dataDir, dboid)` removes both
+          pg_internal.init files (global/ + base/<dboid>/); ENOENT-safe.
+        - `catalog.WithRelCacheInitLock(fn)` serializes unlink/rewrite ops.
+        - `RecordKindXactCommitInval byte = 32` — new WAL commit kind.
+        - `wal.EncodeXactCommitInval(xid)` encodes 5-byte commit payload.
+        - `wal.ProcessCommittedInvalidationMessages(dataDir, dboid)` —
+          standby-side redo: unlinks both init files.
+        - `ApplyRecord` handles `RecordKindXactCommitInval` by calling
+          `ProcessCommittedInvalidationMessages` then returns (false, nil).
+        - `DecodeXactMarker` updated to accept RecordKindXactCommitInval.
+        - `mvcc.Manager.SetRelcacheInvalPending()` / `TakeRelcacheInvalPending()`
+          — DDL uses SetRelcacheInvalPending; xactMarkerLogger uses Take.
+        - `syncTableToCatalogHeap` calls `SetRelcacheInvalPending()` after
+          writing to pg_class + pg_attribute nailed rels.
+        - `vacuumOp.Next` calls `SetRelcacheInvalPending()` when vacuuming
+          a nailed catalog table OID.
+        - `open.go` xactMarkerLogger: if TakeRelcacheInvalPending(), uses
+          EncodeXactCommitInval + calls WithRelCacheInitLock/RelcacheInitFileUnlink.
+        - `executor.Context.DataDir` field added; server dispatch wires
+          s.cfg.DataDir into it.
+        - 5 catalog tests + 5 wal tests all PASS; -race clean.
 
 - [ ] **M0106-0010 batched-32** (bootstrap-procedure task 32)
       - Summary: Add `internal/catalog/PgCanonicalHeapInsert(rel, row)`

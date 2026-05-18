@@ -75,6 +75,15 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 		if err == nil && len(stats.DeadTIDs) > 0 && o.ctx.Pool != nil {
 			vacuumIndexes(o.ctx, tbl, stats.DeadTIDs)
 		}
+
+		// If we vacuumed a nailed catalog relation (pg_class, pg_attribute,
+		// pg_proc, or pg_type), signal that the relcache init files need
+		// invalidation. This mirrors PG's in-place update path which calls
+		// RegisterInvalidationMessage with the nailed OID, causing both
+		// pg_internal.init files to be unlinked at commit. M0106-0010 batched-31.
+		if isNailedCatalogOID(tbl.OID) {
+			o.ctx.TxnMgr.SetRelcacheInvalPending()
+		}
 	}
 	return nil, EOF
 }
@@ -95,6 +104,22 @@ func vacuumIndexes(ctx *Context, tbl *catalog.Table, deadTIDs []storage.ItemPoin
 		}
 		_, _ = tree.VacuumIndexPages(deadTIDs)
 	}
+}
+
+// isNailedCatalogOID returns true if oid is one of the four nailed local
+// catalog relations whose relcache descriptors are cached in pg_internal.init.
+// Vacuuming any of them touches their heap pages in a way that may invalidate
+// cached descriptors, so the xact-marker hook must unlink both init files at
+// commit time (M0106-0010 batched-31).
+func isNailedCatalogOID(oid uint32) bool {
+	switch oid {
+	case catalog.RelationRelationId, // pg_class = 1259
+		catalog.AttributeRelationId, // pg_attribute = 1249
+		catalog.TypeRelationId,      // pg_type = 1247
+		1255:                        // pg_proc (no catalog constant defined)
+		return true
+	}
+	return false
 }
 
 // vacuumTableTargets resolves the *catalog.Table list to vacuum (so we can

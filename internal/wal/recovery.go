@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -387,6 +388,22 @@ const (
 	//   numHeapTuples(8) | lastCleanupNumDeletedTuples(8)
 	RecordKindBtreeMetaCleanup byte = 31
 
+	// RecordKindXactCommitInval is a commit record that additionally signals
+	// relcache-init-file invalidation (M0106-0010 batched-31). Emitted when a
+	// committed transaction wrote to a nailed catalog relation (pg_class,
+	// pg_attribute, pg_proc, or pg_type). On the standby, the replay path
+	// calls ProcessCommittedInvalidationMessages to unlink both
+	// pg_internal.init files so the next backend recreates them. Format is
+	// identical to RecordKindXactCommit: "kind(1) | xid(4)" = 5 bytes; the
+	// invalidation is implicit in the kind byte rather than encoded as a flag.
+	RecordKindXactCommitInval byte = 32
+
+	// defaultRecoveryDBOid is the database OID used by
+	// ProcessCommittedInvalidationMessages when unlinking the per-database
+	// pg_internal.init. Matches catalog.DefaultDBOid = 1 (v0 single-database
+	// cluster). Kept as a local constant to avoid a circular import.
+	defaultRecoveryDBOid uint32 = 1
+
 	// btreeMetaCleanupSize: kind(1)+DBOid(4)+RelOid(4)+Fork(1)
 	// +numHeapTuples(8)+lastCleanupNumDeletedTuples(8) = 26.
 	btreeMetaCleanupSize = 26
@@ -732,6 +749,41 @@ func EncodeXactAbort(xid storage.TransactionID) []byte {
 	return out
 }
 
+// EncodeXactCommitInval returns a 5-byte commit-with-relcache-invalidation
+// WAL payload. It is used instead of EncodeXactCommit when the committing
+// transaction wrote to a nailed catalog relation. On the standby, the replay
+// path calls ProcessCommittedInvalidationMessages before delivering the commit.
+func EncodeXactCommitInval(xid storage.TransactionID) []byte {
+	out := make([]byte, xactRecordSize)
+	out[0] = RecordKindXactCommitInval
+	binary.LittleEndian.PutUint32(out[1:5], uint32(xid))
+	return out
+}
+
+// ProcessCommittedInvalidationMessages unlinks both pg_internal.init files
+// (global/pg_internal.init and base/<dboid>/pg_internal.init) so the next
+// backend reloads fresh relcache descriptors. ENOENT is silently ignored.
+//
+// On the primary, this is called by the xact-marker hook inside open.go.
+// On the standby, this is called by ApplyRecord when it processes a
+// RecordKindXactCommitInval WAL record. Mirrors PG's
+// inval.c:ProcessCommittedInvalidationMessages (standby-side redo path).
+func ProcessCommittedInvalidationMessages(dataDir string, dboid uint32) error {
+	paths := [2]string{
+		filepath.Join(dataDir, "global", "pg_internal.init"),
+		filepath.Join(dataDir, "base", fmt.Sprintf("%d", dboid), "pg_internal.init"),
+	}
+	var firstErr error
+	for _, p := range paths {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("relcache init unlink %s: %w", p, err)
+			}
+		}
+	}
+	return firstErr
+}
+
 // DecodeXactMarker returns the xid carried by a commit or abort
 // marker payload. The caller already knows the kind from the
 // payload's first byte; this helper just unpacks the xid.
@@ -739,7 +791,10 @@ func DecodeXactMarker(payload []byte) (storage.TransactionID, error) {
 	if len(payload) != xactRecordSize {
 		return 0, fmt.Errorf("wal: invalid xact-marker payload len %d (want %d)", len(payload), xactRecordSize)
 	}
-	if payload[0] != RecordKindXactCommit && payload[0] != RecordKindXactAbort {
+	switch payload[0] {
+	case RecordKindXactCommit, RecordKindXactAbort, RecordKindXactCommitInval:
+		// valid xact-marker kinds
+	default:
 		return 0, fmt.Errorf("wal: record kind %d is not an xact marker", payload[0])
 	}
 	return storage.TransactionID(binary.LittleEndian.Uint32(payload[1:5])), nil
@@ -2024,6 +2079,18 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// markers exist purely so the M0008 logical decoder can
 		// drive its reorder buffer. See
 		// docs/design/0008-0001-logical-decoding-pipeline.md.
+		return false, nil
+	case RecordKindXactCommitInval:
+		// Commit with relcache-init-file invalidation (M0106-0010
+		// batched-31). Mirrors ProcessCommittedInvalidationMessages
+		// in PG's inval.c standby-side redo path: unlink both
+		// pg_internal.init files before the transaction's heap writes
+		// become visible so no backend reads stale nailed-rel
+		// descriptors from cache. ENOENT is silently ignored.
+		// Physical replay of the heap/btree changes was already done
+		// by the earlier RecordKindHeapInsert/Update records in the
+		// same transaction; this record carries no additional data.
+		_ = ProcessCommittedInvalidationMessages(mgr.DataDir(), defaultRecoveryDBOid)
 		return false, nil
 	case RecordKindCreateDatabase, RecordKindDropDatabase:
 		// CREATE/DROP DATABASE records (M0054-0001) carry only a database

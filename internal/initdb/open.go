@@ -615,7 +615,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		var payload []byte
 		switch kind {
 		case mvcc.XactCommit:
-			payload = wal.EncodeXactCommit(xid)
+			// If the transaction wrote to a nailed catalog relation (pg_class,
+			// pg_attribute, pg_proc, or pg_type), emit a commit-with-inval
+			// record and unlink both pg_internal.init files so the next backend
+			// reloads fresh relcache descriptors. Mirrors PG's commit-path
+			// AtEOXact_Inval → RelationCacheInitFilePreInvalidate sequence.
+			// M0106-0010 batched-31.
+			if txnMgr.TakeRelcacheInvalPending() {
+				payload = wal.EncodeXactCommitInval(xid)
+				_ = catalog.WithRelCacheInitLock(func() error {
+					return catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid)
+				})
+			} else {
+				payload = wal.EncodeXactCommit(xid)
+			}
 		case mvcc.XactAbort:
 			payload = wal.EncodeXactAbort(xid)
 		default:

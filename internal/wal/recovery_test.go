@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -946,5 +947,129 @@ func TestReplaySmgrTruncateZerosRelfile(t *testing.T) {
 	n, _ := mgr.NBlocks(rel)
 	if n != 0 {
 		t.Errorf("NBlocks after SmgrTruncate = %d, want 0", n)
+	}
+}
+
+// TestEncodeXactCommitInvalRoundTrip pins the on-wire shape of the
+// commit-with-relcache-invalidation record (M0106-0010 batched-31).
+func TestEncodeXactCommitInvalRoundTrip(t *testing.T) {
+	xid := storage.TransactionID(12345)
+	payload := EncodeXactCommitInval(xid)
+
+	if len(payload) != xactRecordSize {
+		t.Fatalf("EncodeXactCommitInval len = %d, want %d", len(payload), xactRecordSize)
+	}
+	if payload[0] != RecordKindXactCommitInval {
+		t.Errorf("kind byte = %d, want RecordKindXactCommitInval (%d)", payload[0], RecordKindXactCommitInval)
+	}
+	got, err := DecodeXactMarker(payload)
+	if err != nil {
+		t.Fatalf("DecodeXactMarker: %v", err)
+	}
+	if got != xid {
+		t.Errorf("decoded xid = %d, want %d", got, xid)
+	}
+}
+
+// TestDecodeXactMarkerAcceptsCommitInval confirms DecodeXactMarker treats
+// RecordKindXactCommitInval identically to RecordKindXactCommit.
+func TestDecodeXactMarkerAcceptsCommitInval(t *testing.T) {
+	xid := storage.TransactionID(999)
+	for _, payload := range [][]byte{
+		EncodeXactCommit(xid),
+		EncodeXactCommitInval(xid),
+		EncodeXactAbort(xid),
+	} {
+		got, err := DecodeXactMarker(payload)
+		if err != nil {
+			t.Errorf("DecodeXactMarker(kind=%d): %v", payload[0], err)
+		}
+		if got != xid {
+			t.Errorf("decoded xid = %d, want %d (kind=%d)", got, xid, payload[0])
+		}
+	}
+}
+
+// TestProcessCommittedInvalidationMessagesUnlinksBothFiles verifies that
+// ProcessCommittedInvalidationMessages removes both pg_internal.init files
+// and ignores ENOENT (M0106-0010 batched-31 — mirrors inval.c standby redo).
+func TestProcessCommittedInvalidationMessagesUnlinksBothFiles(t *testing.T) {
+	dir := t.TempDir()
+	globalDir := filepath.Join(dir, "global")
+	dbDir := filepath.Join(dir, "base", "1")
+	for _, d := range []string{globalDir, dbDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	globalInit := filepath.Join(globalDir, "pg_internal.init")
+	dbInit := filepath.Join(dbDir, "pg_internal.init")
+	for _, p := range []string{globalInit, dbInit} {
+		if err := os.WriteFile(p, []byte("placeholder"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := ProcessCommittedInvalidationMessages(dir, 1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, p := range []string{globalInit, dbInit} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be removed", p)
+		}
+	}
+}
+
+// TestProcessCommittedInvalidationMessagesEnoentOK confirms the function
+// is safe when the init files are absent (idempotent redo).
+func TestProcessCommittedInvalidationMessagesEnoentOK(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"global", filepath.Join("base", "1")} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := ProcessCommittedInvalidationMessages(dir, 1); err != nil {
+		t.Fatalf("expected nil on absent files, got: %v", err)
+	}
+}
+
+// TestApplyRecordXactCommitInvalUnlinksInitFiles verifies that ApplyRecord
+// for a RecordKindXactCommitInval payload calls ProcessCommittedInvalidationMessages
+// (unlinks both pg_internal.init files) and returns (false, nil), mirroring the
+// standby-side redo behaviour (M0106-0010 batched-31).
+func TestApplyRecordXactCommitInvalUnlinksInitFiles(t *testing.T) {
+	dataDir := t.TempDir()
+	globalDir := filepath.Join(dataDir, "global")
+	dbDir := filepath.Join(dataDir, "base", "1")
+	for _, d := range []string{globalDir, dbDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	globalInit := filepath.Join(globalDir, "pg_internal.init")
+	dbInit := filepath.Join(dbDir, "pg_internal.init")
+	for _, p := range []string{globalInit, dbInit} {
+		if err := os.WriteFile(p, []byte("placeholder"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	xid := storage.TransactionID(42)
+	payload := EncodeXactCommitInval(xid)
+	applied, err := ApplyRecord(mgr, Record{Payload: payload})
+	if err != nil {
+		t.Fatalf("ApplyRecord: %v", err)
+	}
+	if applied {
+		t.Error("ApplyRecord returned applied=true, want false (logical-only record)")
+	}
+	for _, p := range []string{globalInit, dbInit} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be removed after ApplyRecord, stat: %v", p, err)
+		}
 	}
 }

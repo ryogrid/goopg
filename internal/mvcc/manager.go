@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -75,6 +76,12 @@ type Manager struct {
 	nextHandle TxnHandle
 	active     map[TxnHandle]*txState
 	xactMarker func(storage.TransactionID, XactMarker) error
+
+	// relcacheInvalPending is set by DDL that writes to nailed catalog
+	// relations (pg_class, pg_attribute, pg_proc, pg_type) so the
+	// xact-marker hook can emit RecordKindXactCommitInval and unlink
+	// both pg_internal.init files at commit time.
+	relcacheInvalPending atomic.Bool
 
 	// commitCond is broadcast whenever a transaction commits or aborts.
 	// Used by WaitForXID to block until a specific XID finishes.
@@ -541,6 +548,22 @@ func (m *Manager) SetXactMarkerLogger(fn func(storage.TransactionID, XactMarker)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.xactMarker = fn
+}
+
+// SetRelcacheInvalPending marks the current transaction as having written to
+// a nailed catalog relation (pg_class, pg_attribute, pg_proc, or pg_type).
+// The xact-marker hook reads this flag at commit time to choose between
+// EncodeXactCommit and EncodeXactCommitInval and to unlink both
+// pg_internal.init files so the next backend reloads fresh descriptors.
+func (m *Manager) SetRelcacheInvalPending() {
+	m.relcacheInvalPending.Store(true)
+}
+
+// TakeRelcacheInvalPending atomically reads and clears the relcache-inval
+// pending flag. Returns true if the flag was set, meaning the committing
+// transaction touched a nailed catalog relation.
+func (m *Manager) TakeRelcacheInvalPending() bool {
+	return m.relcacheInvalPending.Swap(false)
 }
 
 func (m *Manager) captureSnapshotLocked() Snapshot {
