@@ -721,6 +721,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2681, // pg_language_name_index (Step 3bj)
 		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
 		6111, // pg_publication_pubname_index (Step 3bv)
+		6110, // pg_publication_oid_index (Step 3bw)
 		} {
 			if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -844,6 +845,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2681, // pg_language_name_index (Step 3bj)
 		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
 		6111, // pg_publication_pubname_index (Step 3bv)
+		6110, // pg_publication_oid_index (Step 3bw)
 		} {
 			if err := os.WriteFile(filepath.Join(dbDir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -895,6 +897,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2681, // pg_language_name_index (Step 3bj)
 		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
 		6111, // pg_publication_pubname_index (Step 3bv)
+		6110, // pg_publication_oid_index (Step 3bw)
 		} {
 			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
@@ -2329,6 +2332,28 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// surfaced OID 6111 as the next FATAL after Step 3bu seeded
 		// pg_publication.
 		entry(6111, 6104, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false), // pg_publication_pubname_index
+		// M0106-0010 Step 3bw: pg_publication_oid_index.
+		//   postgres/src/include/catalog/pg_publication.h:72
+		//     DECLARE_UNIQUE_INDEX_PKEY(pg_publication_oid_index, 6110,
+		//       PublicationObjectIndexId, pg_publication,
+		//       btree(oid oid_ops));
+		//   MAKE_SYSCACHE(PUBLICATIONOID, pg_publication_oid_index, 8);
+		// UNIQUE PRIMARY (DECLARE_UNIQUE_INDEX_PKEY) single oid_ops key
+		// (no collation) over pg_publication heap OID 6104 (Step 3bu nailed
+		// local rel). pg_publication's oid system column is attnum 1.
+		// Mirrors the single oid_ops UNIQUE PRIMARY pattern of
+		// pg_language_oid_index (2682, Step 3bk),
+		// pg_extension_oid_index (3080, Step 3ax),
+		// pg_event_trigger_oid_index (3468, Step 3at),
+		// pg_foreign_data_wrapper_oid_index (112, Step 3bd),
+		// pg_foreign_server_oid_index (113, Step 3bg),
+		// pg_opfamily_oid_index (2755, Step 3bo),
+		// pg_parameter_acl_oid_index (6247, Step 3br). Without this entry
+		// RelationIdGetRelation(6110) FATALs. E2E test
+		// (TestE2E_FailoverGoopgToPG/async with GOOPG_RUN_BLOCKED_M0102_E2E=1)
+		// is expected to surface OID 6110 as the next FATAL after Step 3bv
+		// seeded pg_publication_pubname_index (6111).
+		entry(6110, 6104, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_publication_oid_index
 	}
 	out := make([]pgIndexEntry, 0, len(shared)+len(local))
 	out = append(out, shared...)

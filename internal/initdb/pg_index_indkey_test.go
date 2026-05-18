@@ -83,6 +83,7 @@ func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
 		6247: {1},         // pg_parameter_acl_oid_index : btree(oid oid_ops) UNIQUE PRIMARY (SHARED) ← Step 3br
 		3351: {1},         // pg_partitioned_table_partrelid_index : btree(partrelid oid_ops) UNIQUE PRIMARY ← Step 3bt
 		6111: {2},         // pg_publication_pubname_index : btree(pubname name_ops) UNIQUE ← Step 3bv
+		6110: {1},         // pg_publication_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3bw
 	}
 	got := make(map[uint32][]int16, len(want))
 	for _, e := range pgIndexInitialEntries() {
