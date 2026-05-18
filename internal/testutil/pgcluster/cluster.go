@@ -245,7 +245,13 @@ func (c *Cluster) Start() error {
 		"-D", c.dataDir,
 		"-p", fmt.Sprintf("%d", c.port),
 		"-h", "127.0.0.1")
-	cmd.Env = c.env()
+	env := c.env()
+	if soPath, ok, errPre := segvBacktraceLDPreload(); ok {
+		env = appendLDPreload(env, soPath)
+	} else if errPre != nil {
+		fmt.Fprintf(logFile, "[pgcluster] WARNING: SEGV backtrace shim disabled: %v\n", errPre)
+	}
+	cmd.Env = env
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
@@ -440,6 +446,24 @@ func (c *Cluster) env() []string {
 		env = append(env, "LD_LIBRARY_PATH="+c.libDir)
 	}
 	return env
+}
+
+// appendLDPreload merges the given .so path into the LD_PRELOAD entry of
+// env (creating one if absent). Existing LD_PRELOAD values are preserved
+// — entries are space-separated per ld.so(8).
+func appendLDPreload(env []string, soPath string) []string {
+	for i, kv := range env {
+		if len(kv) >= 11 && kv[:11] == "LD_PRELOAD=" {
+			existing := kv[11:]
+			if existing == "" {
+				env[i] = "LD_PRELOAD=" + soPath
+			} else {
+				env[i] = "LD_PRELOAD=" + existing + " " + soPath
+			}
+			return env
+		}
+	}
+	return append(env, "LD_PRELOAD="+soPath)
 }
 
 func freePort() (int, error) {

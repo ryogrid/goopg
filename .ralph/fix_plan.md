@@ -8924,20 +8924,78 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         (`GOOPG_RUN_BLOCKED_M0102_E2E=1
         TestE2E_FailoverGoopgToPG/async`) — pending re-run; will
         be appended after the test completes.
-        Next blocker (Step 3dd, contingent on E2E): if SIGSEGV
-        persists, fall back to non-invasive diagnostic — build a
-        small `tools/segv_backtrace/` C shared library that
-        installs a `sigaction(SIGSEGV)` handler calling
-        `backtrace_symbols_fd(STDERR_FILENO)` and re-raising;
-        wire it into `pgcluster.Start` via `LD_PRELOAD` env var
-        (gated by `GOOPG_TEST_SEGV_BACKTRACE=1`). PG installs no
-        SIGSEGV handler of its own, so the LD_PRELOAD'd handler
-        fires before the kernel terminates the child and the
-        stderr-written backtrace appears in pg.log under the
-        Step-3cy `[m0102-pg-standby-log]` tag. If the SIGSEGV
-        clears, the next iteration should re-capture the
-        `cache lookup failed for type / function` counts to
-        identify any newly-reachable SysCache miss path.
+        E2E re-run (2026-05-18) confirmed: `cache lookup failed for
+        type 23` is GONE; the standby now SIGSEGVs silently in the
+        first client backend forked after WaitReady. Step 3dd
+        promotes the contingent diagnostic to LANDED.
+      - Step 3dd LANDED 2026-05-18 (diagnostic only). Closes the
+        silent-SIGSEGV blind spot exposed by Step 3dc(1).
+        `tools/segv_backtrace/segv_backtrace.c` — async-signal-safe
+        `sigaction(SIGSEGV)` constructor that writes a
+        `[GOOPG_SEGV_BACKTRACE]` header, calls `backtrace(3)` +
+        `backtrace_symbols_fd(STDERR_FILENO)`, restores `SIG_DFL`,
+        and re-raises. `internal/testutil/pgcluster/segv_backtrace.go`
+        embeds the same source (as `segv_backtrace_src.txt` — Go
+        rejects loose `.c` files in non-cgo packages) and
+        content-addressed-builds `libsegv_backtrace_<hash>.so` into
+        `os.TempDir()/goopg-segv-backtrace/` on first
+        `Cluster.Start()` when `GOOPG_TEST_SEGV_BACKTRACE=1`; build
+        failures degrade gracefully (single-line WARNING in pg.log,
+        no LD_PRELOAD). `cluster.go::Start` now computes env, asks
+        `segvBacktraceLDPreload()`, and `appendLDPreload`s the .so
+        path into the postmaster's env (other exec.Command sites —
+        pg_ctl/psql/pgbench — deliberately untouched; backends are
+        forked, not exec'd, so a single postmaster preload covers
+        every backend). PG installs no SIGSEGV handler of its own
+        (`pqsignal.c` only `sigdelset(BlockSig, SIGSEGV)`), so the
+        constructor-installed handler fires before the kernel
+        terminates the child. Regression pins:
+        `TestSegvBacktraceSourceMatchesToolsCopy` (byte-equality
+        between embedded `.txt` and canonical
+        `tools/segv_backtrace/segv_backtrace.c`),
+        `TestSegvBacktraceLDPreloadGateOff` (gate-off returns
+        ok=false soPath="" — no LD_PRELOAD leak into production
+        runs), `TestEnsureSegvBacktraceSOBuilds` (end-to-end shim
+        verification — builds the .so, execs a null-deref helper
+        under LD_PRELOAD, asserts `[GOOPG_SEGV_BACKTRACE]` marker
+        AND footer on stderr), `TestAppendLDPreloadMergesExisting`
+        (absent / empty-existing / pre-populated merge cases).
+        Verified: `go test -count=1 -run
+        'TestSegvBacktrace|TestEnsureSegvBacktraceSO|TestAppendLDPreload'
+        ./internal/testutil/pgcluster/` PASS;
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 GOOPG_TEST_SEGV_BACKTRACE=1
+        TestE2E_FailoverGoopgToPG/async` captured the SEGV
+        backtrace at
+        `tmp/m0106-step3dc/e2e_segv_run.log:1685–1720` under the
+        Step-3cy `[m0102-pg-standby-log]` tag. Design:
+        `docs/design/0106-0010-step3dd-segv-backtrace-ld-preload.md`.
+        Backtrace findings (input to Step 3de):
+        crash site is `btnamecmp+0x52` → `FunctionCall2Coll+0xac`
+        → `_bt_compare+0x2fe` → `_bt_first+0x13e1` →
+        `btgettuple+0xbc` → `index_getnext_slot+0x37` →
+        `systable_getnext+0x55` → `SearchCatCache+0x49` →
+        `SearchSysCache+0x99` → `GetSysCacheOid+0x51` →
+        `get_role_oid+0x44` → `hba_getauthmethod+0x1c` →
+        `ClientAuthentication+0x4c`. Working hypothesis: an
+        `AUTHNAME` SysCache lookup walks
+        `pg_authid_rolname_index` and the comparator dereferences
+        a heap tuple with a corrupt/NULL `rolname` pointer. The
+        Step-3a–3cz playbook is bootstrap-the-missing-index +
+        repopulate the heap with byte-exact `name` payload; new
+        files will follow the pattern of Steps 3cs / 3cw / 3cx.
+        Next blocker (Step 3de): seed
+        `pg_authid_rolname_index` (OID 2676) as a populated
+        2-page btree over the existing bootstrap superuser
+        (`postgres`) and the test role (`ryo`), and confirm the
+        underlying `pg_authid` heap rows carry valid
+        `Form_pg_authid::rolname` payloads. Reuse
+        `pgBuildBtreeMetapageWithRoot` / leaf builders and the
+        IndexTuple byte-exact `name`-key helper (`name` is a
+        fixed-64-byte type, not varlena, so the IndexTuple key
+        layout differs from the OID-key indexes seeded in 3cs/cw).
+        Falls back to direct `pg_filedump` inspection of
+        `global/1260` if the index turns out already populated
+        but the heap is the corrupt side.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
