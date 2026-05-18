@@ -5519,6 +5519,79 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         `InitPostgres`) — Step 3bb territory.
         Design:
         `docs/design/0106-0010-step3ba-multi-leaf-btree-hikey-firstright.md`.
+      - Step 3bb LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 2328` PG-standby boot blocker
+        that surfaced after Step 3ba landed the multi-leaf btree
+        firstright HIKEY pivot. OID 2328 is `pg_foreign_data_wrapper`
+        per `postgres/src/include/catalog/pg_foreign_data_wrapper_d.h:23`
+        (`#define ForeignDataWrapperRelationId 2328`) — NOT
+        `pg_db_role_setting` as the Step 3ba note speculated (which is
+        OID 2964/9400 and BKI_SHARED_RELATION). Pure catalog-seed
+        change mirroring the nailed-rel pattern of Steps 3w
+        (pg_aggregate), 3aa (pg_cast), 3ag (pg_conversion), 3ak
+        (pg_default_acl), 3an (pg_enum), 3ar (pg_event_trigger), and
+        3aw (pg_extension); no encoder, builder, or `Init` flow change.
+        (a) `internal/initdb/relcache_init.go` gains new
+        `pgForeignDataWrapperAttrs()` returning the 7-column PG18
+        schema verbatim from `pg_foreign_data_wrapper.h` /
+        `pg_foreign_data_wrapper_d.h`: oid (26/4), fdwname (19 name/64),
+        fdwowner (26/4 → pg_authid), fdwhandler (26/4 → pg_proc opt),
+        fdwvalidator (26/4 → pg_proc opt), fdwacl (1034 aclitem[]/-1
+        nullable), fdwoptions (1009 text[]/-1 nullable). The two CATALOG_VARLEN
+        columns carry no BKI_FORCE_NOT_NULL — nullable.
+        (b) `nailedLocalRels` gains
+        `{2328, "pg_foreign_data_wrapper", 83, 'r', 7, false, pgForeignDataWrapperAttrs()}`
+        immediately after the Step 3aw pg_extension entry. RelType=83
+        is safe because pg_foreign_data_wrapper is not formrdesc'd
+        (no `ForeignDataWrapperRelation_Rowtype_Id` constant in PG18
+        headers), so Step 3v's
+        `relation->rd_att->tdtypeid == relp->reltype` Phase-3
+        assertion does not fire.
+        (c) `internal/initdb/initdb.go::localRelMap` gains `{2328, 2328}`
+        so PG's relfilenode mapper resolves OID 2328 to a backing file.
+        (d) `internal/initdb/initdb.go::bootstrapMappedLocalCatalogHeaps`
+        OID list gains `2328` so an `InitPage`-stamped 8 KiB heap exists
+        at `base/{1,5}/2328` before PG's mdopen runs.
+        The single nailedLocalRels entry threads automatically through
+        `bootstrapPgClassTuples → bootstrapPgAttributeTuples
+        → bootstrapPgClassOidIndex` (leaf for 2328 at file 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (7 composite-key leaves
+        at file 2659) and `writeRelcacheInitFile` emits a
+        `Form_pg_class` + 7 `Form_pg_attribute` blob group. Companion
+        indexes 112 (`pg_foreign_data_wrapper_oid_index`, UNIQUE
+        PRIMARY KEY on `oid_ops`, backs FOREIGNDATAWRAPPEROID
+        syscache) and 548 (`pg_foreign_data_wrapper_name_index`,
+        UNIQUE non-PKEY on `fdwname name_ops`, backs
+        FOREIGNDATAWRAPPERNAME syscache) intentionally deferred until
+        concrete E2E blockers surface, preserving the single-OID
+        rhythm of Steps 3w → 3aa → 3ag → 3ak → 3an → 3ar → 3aw.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgForeignDataWrapper` (full
+        per-column `(Name, TypeOID, Num, Len, NotNull)` audit) and
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgForeignDataWrapper`
+        (asserts `base/{1,5}/2328` exists, is exactly 8 KiB, and
+        InitPage-stamped) in
+        `internal/initdb/pg_foreign_data_wrapper_nailed_test.go`.
+        Existing pin extended:
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        gains 2328 so the placeholder list cannot silently drop
+        pg_foreign_data_wrapper.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgForeignDataWrapper|TestBootstrapMappedLocalCatalogHeapsIncludesPgForeignDataWrapper|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestNailedLocalRelsContainsPgExtension|TestNailedLocalRelsContainsPgEnum|TestNailedIndexRelnattsAgreesWithIndnatts|TestPgIndexInitialEntriesIndkeyMatchesPG18'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3ba
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design:
+        `docs/design/0106-0010-step3bb-pg-foreign-data-wrapper-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

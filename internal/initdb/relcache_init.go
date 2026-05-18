@@ -190,6 +190,16 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// convention — the heap is empty at bootstrap time so the encoder
 	// is never exercised.
 	{3079, "pg_extension", 83, 'r', 8, false, pgExtensionAttrs()},
+	// M0106-0010 step 3bb: pg_foreign_data_wrapper is opened during PG-standby
+	// boot once Step 3ba cleared the multi-leaf btree HIKEY blocker. Without a
+	// pg_class row, `RelationBuildDesc(2328) → ScanPgRelation(2328)` returns
+	// NULL and the backend FATALs with `could not open relation with OID 2328`.
+	// RelType=83 is safe because pg_foreign_data_wrapper is not formrdesc'd
+	// (no `ForeignDataWrapperRelation_Rowtype_Id` constant in PG18 headers).
+	// Schema per `postgres/src/include/catalog/pg_foreign_data_wrapper.h`
+	// (PG18, ForeignDataWrapperRelationId == 2328). 7 columns; fdwacl and
+	// fdwoptions are in the CATALOG_VARLEN block (nullable).
+	{2328, "pg_foreign_data_wrapper", 83, 'r', 7, false, pgForeignDataWrapperAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1242,6 +1252,28 @@ func pgExtensionAttrs() []nailedAttr {
 		{Name: "extversion", TypeOID: 25, Num: 6, Len: -1, NotNull: true},     // text (BKI_FORCE_NOT_NULL)
 		{Name: "extconfig", TypeOID: 1028, Num: 7, Len: -1, NotNull: false},   // oid[] (nullable)
 		{Name: "extcondition", TypeOID: 1009, Num: 8, Len: -1, NotNull: false}, // text[] (nullable)
+	}
+}
+
+// pgForeignDataWrapperAttrs defines the 7-column PG18
+// pg_foreign_data_wrapper schema. PG `RelationBuildDesc(2328) →
+// ScanPgRelation(2328)` looks up the `Form_pg_class` row first; without a
+// nailedLocalRels entry no row gets seeded and PG FATALs with `could not
+// open relation with OID 2328`. Sourced verbatim from
+// `postgres/src/include/catalog/pg_foreign_data_wrapper.h` and
+// `pg_foreign_data_wrapper_d.h` (Anum_pg_foreign_data_wrapper_* 1–7).
+// M0106-0010 step 3bb. The first five columns are fixed-width NOT NULL;
+// fdwacl is aclitem[] (TypeOID 1034) and fdwoptions is text[] (TypeOID
+// 1009), both nullable per the CATALOG_VARLEN block convention.
+func pgForeignDataWrapperAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},             // oid
+		{Name: "fdwname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},        // name
+		{Name: "fdwowner", TypeOID: 26, Num: 3, Len: 4, NotNull: true},        // oid → pg_authid
+		{Name: "fdwhandler", TypeOID: 26, Num: 4, Len: 4, NotNull: true},      // oid → pg_proc (opt)
+		{Name: "fdwvalidator", TypeOID: 26, Num: 5, Len: 4, NotNull: true},    // oid → pg_proc (opt)
+		{Name: "fdwacl", TypeOID: 1034, Num: 6, Len: -1, NotNull: false},      // aclitem[] (nullable)
+		{Name: "fdwoptions", TypeOID: 1009, Num: 7, Len: -1, NotNull: false},  // text[] (nullable)
 	}
 }
 
