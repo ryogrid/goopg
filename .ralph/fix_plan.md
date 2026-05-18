@@ -9584,7 +9584,7 @@ relcache init → replication readiness) and intra-package grouped.
         fixtures for excluded files + dir-content dirs and asserts dirs
         are present, contents absent. All server tests PASS.
 
-- [ ] **M0106-0010 batched-06** (bootstrap-procedure task 6)
+- [x] **M0106-0010 batched-06** (bootstrap-procedure task 6)
       - Summary: Bind the `XLOG_PARAMETER_CHANGE` redo path on the
         standby side to `updateControlFile` so a goopg standby imprints
         replayed GUC echoes.
@@ -9595,7 +9595,7 @@ relcache init → replication readiness) and intra-package grouped.
         `XLOG_PARAMETER_CHANGE` replay).
       - Risk gate: wal/replication.
 
-- [ ] **M0106-0010 batched-07** (bootstrap-procedure task 7)
+- [x] **M0106-0010 batched-07** (bootstrap-procedure task 7)
       - Summary: Replace JSON slot file writer with PG-binary `state`
         (magic `0x1051CA1`, version 5, CRC32C,
         `ReplicationSlotPersistentData`); keep `state.tmp` + atomic
@@ -9605,6 +9605,13 @@ relcache init → replication readiness) and intra-package grouped.
       - Test: `internal/wal/slots_test.go` extended — CRC self-check,
         magic+version assertion, round-trip.
       - Risk gate: wal/replication.
+      - COMPLETE 2026-05-19: slots_pg.go adds marshalSlotBinary /
+        unmarshalSlotBinary (200-byte PG struct + 64-byte goopg extension
+        for logical slot database name). writeSlotLocked switches to
+        binary; readSlotFile falls back to JSON for old files.
+        Parent-dir fsync added. TestSlotBinaryMagicVersionCRC added;
+        TestPhysicalSlotJSONUnchangedAcrossM0008 replaced.
+        All slot tests PASS; pre-existing wal baseline failures unchanged.
 
 - [ ] **M0106-0010 batched-08** (bootstrap-procedure task 8)
       - Summary: Add `createPerDatabaseScaffolding(dboid, name)` writing

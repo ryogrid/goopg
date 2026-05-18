@@ -9,9 +9,10 @@
 // has durably persisted (advances on each standby-status update).
 //
 // Slots persist to `<DataDir>/pg_replslot/<slot_name>/state` as a
-// small JSON file, mirroring upstream's per-slot directory layout.
-// The file is rewritten via tempfile + rename so a crash mid-update
-// can't leave a torn record.
+// 200-byte PG-compatible binary file (see slots_pg.go), mirroring
+// upstream's per-slot directory layout. Logical slots append a 64-byte
+// goopg extension for the database name. The file is rewritten via
+// tempfile + rename so a crash mid-update can't leave a torn record.
 //
 // See docs/design/0005-0001-streaming-replication-architecture.md.
 package wal
@@ -73,6 +74,11 @@ type Slot struct {
 	// it advances. Maps to upstream's
 	// pg_replication_slots.catalog_xmin.
 	CatalogXmin uint64 `json:"catalog_xmin,omitempty"`
+
+	// DatabaseOID is the PG Oid of the database a logical slot is
+	// anchored in (0 = InvalidOid for physical slots). Stored in the
+	// binary state file but not in the JSON fallback format.
+	DatabaseOID uint32 `json:"-"`
 
 	// Active is in-memory only; the durable state file records
 	// the slot's existence, while Active reflects whether a
@@ -395,17 +401,16 @@ func (s *Slots) writeSlotLocked(slot *Slot) error {
 	if err := os.MkdirAll(slotDir, 0o700); err != nil {
 		return fmt.Errorf("slots: mkdir %s: %w", slotDir, err)
 	}
+	data := marshalSlotBinary(slot)
 	tmp, err := os.CreateTemp(slotDir, "state.tmp-*")
 	if err != nil {
 		return fmt.Errorf("slots: tempfile: %w", err)
 	}
 	tmpName := tmp.Name()
-	enc := json.NewEncoder(tmp)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(slot); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return fmt.Errorf("slots: encode %q: %w", slot.Name, err)
+		return fmt.Errorf("slots: write %q: %w", slot.Name, err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
@@ -421,6 +426,16 @@ func (s *Slots) writeSlotLocked(slot *Slot) error {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("slots: rename %q: %w", slot.Name, err)
 	}
+	// Fsync state file and slot directory to make the rename durable,
+	// mirroring upstream's SaveSlotToPath fsync sequence.
+	if f, err := os.Open(finalName); err == nil {
+		_ = f.Sync()
+		_ = f.Close()
+	}
+	if d, err := os.Open(slotDir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	return nil
 }
 
@@ -430,6 +445,16 @@ func readSlotFile(slotDir string) (*Slot, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Binary format: first byte is 0xA1 (low byte of slotMagic 0x01051CA1,
+	// little-endian). JSON files start with '{' (0x7B).
+	if len(body) >= slotOnDiskSize && body[0] != '{' {
+		slot, err := unmarshalSlotBinary(body, filepath.Base(slotDir))
+		if err != nil {
+			return nil, fmt.Errorf("decode binary: %w", err)
+		}
+		return slot, nil
+	}
+	// JSON fallback for files written by older goopg versions.
 	body = []byte(strings.TrimSpace(string(body)))
 	var slot Slot
 	if err := json.Unmarshal(body, &slot); err != nil {

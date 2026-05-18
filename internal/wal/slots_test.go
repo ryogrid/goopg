@@ -1,7 +1,9 @@
 package wal
 
 import (
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -210,7 +212,9 @@ func TestCreateLogicalRequiresPluginAndDatabase(t *testing.T) {
 // `plugin`/`database`/`catalog_xmin` keys (omitempty), so a
 // pre-M0008 slot file round-trips through reopen without the new
 // fields appearing.
-func TestPhysicalSlotJSONUnchangedAcrossM0008(t *testing.T) {
+// TestSlotBinaryMagicVersionCRC verifies that a freshly written slot state
+// file carries the correct PG magic, version, and CRC32C checksum.
+func TestSlotBinaryMagicVersionCRC(t *testing.T) {
 	dir := t.TempDir()
 	s, _ := OpenSlots(dir)
 	if _, err := s.Create("phys1", SlotPhysical, 0x100); err != nil {
@@ -220,18 +224,25 @@ func TestPhysicalSlotJSONUnchangedAcrossM0008(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{`"plugin"`, `"database"`, `"catalog_xmin"`} {
-		if bytesContains(body, key) {
-			t.Errorf("physical slot JSON includes %s; expected omitempty", key)
-		}
+	if len(body) < slotOnDiskSize {
+		t.Fatalf("state file too short: %d bytes", len(body))
+	}
+
+	magic := binary.LittleEndian.Uint32(body[slotOffMagic:])
+	if magic != slotMagic {
+		t.Errorf("magic = 0x%x, want 0x%x", magic, slotMagic)
+	}
+
+	ver := binary.LittleEndian.Uint32(body[slotOffVersion:])
+	if ver != slotVersion {
+		t.Errorf("version = %d, want %d", ver, slotVersion)
+	}
+
+	stored := binary.LittleEndian.Uint32(body[slotOffChecksum:])
+	computed := crc32.Checksum(body[slotChecksumFrom:slotOnDiskSize], pgSlotCRCTable)
+	if stored != computed {
+		t.Errorf("CRC mismatch: stored=0x%08x computed=0x%08x", stored, computed)
 	}
 }
 
-func bytesContains(b []byte, s string) bool {
-	for i := 0; i+len(s) <= len(b); i++ {
-		if string(b[i:i+len(s)]) == s {
-			return true
-		}
-	}
-	return false
-}
+
