@@ -8996,6 +8996,77 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         Falls back to direct `pg_filedump` inspection of
         `global/1260` if the index turns out already populated
         but the heap is the corrupt side.
+      - Step 3de LANDED 2026-05-18: pg_authid heap row + index
+        leaf byte-layouts verified end-to-end. The index seed
+        itself (`bootstrapPgAuthidIndexes` →
+        `global/{2676,2677}` as populated 2-page btrees) and the
+        heap seed (`bootstrapPostgresRole` →
+        `global/1260` with one tuple per role) both already
+        landed in Step 3cx (commit `06ab6bc`). Step 3de adds the
+        missing byte-level regression pin:
+        `internal/initdb/pg_authid_heap_row_test.go::
+        TestBootstrapPostgresRoleHeapRowRolnameByteLayout` reads
+        the bootstrap output's `global/1260`, decodes both heap
+        tuples, and asserts (1) `t_hoff == 24` (no null
+        bitmap — every column non-null), (2) Natts_pg_authid ==
+        12, (3) HEAP_HASNULL clear, (4) oid at payload offset
+        0..3, (5) the 64-byte rolname NameData at offset 4..67
+        with cstring prefix == seeded role name and trailing
+        `64 - len(name)` bytes zero-padded. The matching index
+        leaf invariant (16384-byte file, btm_root=1, leaf
+        entries keyed on `"postgres"` and `"ryo"` as byte-exact
+        72-byte NameData IndexTuples) is already pinned by
+        `TestBootstrapPgAuthidIndexesWritesPopulatedBtrees`.
+        Direct hex inspection of a freshly initialised goopg
+        data dir AND the standby's basebackup-streamed copy
+        (`tmp/m0106-step3dc/e2e_segv_run.log`'s sibling test
+        dir) confirmed both files match the byte invariants:
+        heap row payload `0a000000 + "postgres" + 56×0x00 +
+        01 01 01 00 01 01 01 + 00 + ffffffff + 03 + 7×0x00 +
+        0020c8c4fea2fcff`; rolname IndexTuples at lp_off=
+        8104/8032, lp_len=72, with NameData prefix `postgres`
+        and `ryo` zero-padded to NAMEDATALEN. Verified:
+        `go test -count=1 -run 'TestBootstrapPostgresRoleHeapRowRolnameByteLayout
+        |TestBootstrapPgAuthidIndexes' ./internal/initdb/`
+        PASS; `make ralph-state-guard` PASS. Design:
+        `docs/design/0106-0010-step3de-pg-authid-heap-rolname-byte-layout.md`.
+        E2E impact: `GOOPG_RUN_BLOCKED_M0102_E2E=1
+        GOOPG_TEST_SEGV_BACKTRACE=1
+        TestE2E_FailoverGoopgToPG/async` re-run captured at
+        `tmp/m0106-step3de/e2e_run1.log` (test killed at
+        240s timeout; standby
+        `pg.log:1677-1712` shows the same
+        `btnamecmp+0x52 → namecmp → __strncmp_avx2`
+        crash chain as Step 3dd). Critically — Step 3dd's
+        working hypothesis is now **falsified**: both the leaf
+        IndexTuple AND the heap-row NameData are byte-correct;
+        the unmapped dereference is somewhere else.
+        Disassembling the bundled postgres binary confirmed
+        the `+0x8192cf` frame Step 3dd couldn't attribute is
+        `namecmp` (the `nbtcompare.c` wrapper btnamecmp calls
+        before strncmp) — not strncmp@plt as previously
+        guessed. The remaining suspects (1) scan-key Datum
+        constructed from `MyProcPort->user_name`, (2) buffer-
+        pool page mapping for `global/2676`, (3) attlen/
+        typalign mismatch on rolname (`attcollation=0` in
+        `pgAttributeRow` vs PG's normal 950) require seeing
+        which pointer was bad — i.e. `si_addr` + saved
+        `RDI`/`RSI`/`RIP` from `ucontext_t`. That is the
+        named work for Step 3df.
+        Next blocker (Step 3df): extend
+        `tools/segv_backtrace/segv_backtrace.c` to also
+        write `[GOOPG_SEGV_BACKTRACE] si_addr=…` and the
+        six function-arg / instruction-pointer register
+        slots from the `ucontext_t` saved-register area on
+        x86_64 (`REG_RDI`, `REG_RSI`, `REG_RDX`, `REG_RAX`,
+        `REG_RIP`, `REG_RSP`). Stays async-signal-safe (use
+        `write(2)` + a stack-resident 64-byte hex buffer; no
+        `printf`). Re-derive the .so hash; update the
+        embedded `.txt` and the byte-equality pin. Re-run
+        E2E and read the captured `si_addr` to attribute the
+        crash to `arg1` (leaf NameData pointer) or `arg2`
+        (scan-key Name pointer). The fix that step prescribes
+        will depend on which pointer was bad.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
