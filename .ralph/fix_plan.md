@@ -9221,6 +9221,57 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         not yet carry typed overrides for either. Pre-emptive fix or wait
         for the E2E to surface them is a judgement call for whoever
         opens Step 3di.
+      - Step 3di LANDED 2026-05-18 (diagnostic/scoping only — no production
+        code change). **The PG-against-goopg SIGSEGV chain that has
+        dominated Step 3 since Step 3da is gone.** Re-running
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 TestE2E_FailoverGoopgToPG/async`
+        with Step 3dh in place captures a PG standby that completes its
+        full startup sequence cleanly: `starting up replication slots`
+        → `initializing for hot standby` →
+        `completed backup recovery with redo LSN 0/4210` →
+        `consistent recovery state reached at 0/4288` →
+        `database system is ready to accept read-only connections` →
+        `updating PMState from PM_RECOVERY to PM_HOT_STANDBY` →
+        `started streaming WAL from primary at 0/0 on timeline 1` →
+        `sending hot standby feedback xmin 0`. The working hypothesis
+        from Step 3dh (next FATAL in `pg_namespace_nspname_index` or
+        `pg_tablespace_spcname_index`) is **falsified** — those latent
+        SEGV sites simply aren't reached by the current E2E because
+        the standby boot path doesn't probe them, and once the standby
+        is running the workload is goopg-side (no PG syscache lookup of
+        those indexes).
+        New failure mode is at the SQL layer, not the kernel:
+        `waitForPhysicalStreamingGoopgToPG` calls
+        `standby.QueryScalar(t, "SELECT status FROM pg_catalog.pg_stat_wal_receiver")`,
+        and `QueryScalar` `t.Fatalf`s on
+        `ERROR: 42P01: relation "pg_catalog.pg_stat_wal_receiver" does not exist`.
+        Root cause: `pg_stat_wal_receiver` is created by PG's
+        `system_views.sql` script (CREATE VIEW … FROM
+        pg_stat_get_wal_receiver() s WHERE s.pid IS NOT NULL), not a
+        bootstrap catalog row. goopg currently models it as a *virtual*
+        view (`internal/initdb/replication_views.go::registerStatWalReceiverView`,
+        materialised at runtime by `internal/wal/replmon.go`); no row
+        exists in physical `pg_class` / `pg_attribute` / `pg_rewrite`,
+        and the SRF `pg_stat_get_wal_receiver()` (OID 3317) is not in
+        the physical `pg_proc`. PG sees the absent row state and the
+        syscache returns NULL — hence `42P01`.
+        No code change in 3di. The existing E2E test is the regression
+        guard for the SEGV chain (if any future change reintroduces an
+        early-startup crash, it will fail *before* the
+        pg_stat_wal_receiver poll, attributing the regression). The
+        Step 3dh pins remain the lowest-level guard on the final SEGV
+        hop. `make ralph-state-guard` PASS. Design:
+        `docs/design/0106-0010-step3di-segv-chain-eliminated-pg-stat-wal-receiver-missing.md`.
+        Next blocker (Step 3dj): seed `pg_stat_get_wal_receiver` (OID
+        3317) as a physical pg_proc row (C-language SRF, proretset=true,
+        with OUT-arg list matching the 16 view columns sourced from
+        `postgres/src/include/catalog/pg_proc.dat`), then seed
+        `pg_stat_wal_receiver` as a physical pg_class row (relkind='v')
+        with pg_attribute rows for its 16 columns and a pg_rewrite row
+        carrying the rule action `SELECT … FROM pg_stat_get_wal_receiver()
+        s WHERE s.pid IS NOT NULL`. Re-run E2E afterwards; plausible
+        next candidates surfaced by that re-run: `pg_stat_replication`
+        (similar shape), `pg_replication_slots`, `pg_stat_activity`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
