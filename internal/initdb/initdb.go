@@ -452,6 +452,7 @@ func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
 		3079, // pg_extension (M0106-0010 step 3aw)
 		2328, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
 		1417, // pg_foreign_server (M0106-0010 step 3be)
+		3118, // pg_foreign_table (M0106-0010 step 3bh)
 		6003, // pg_publication
 		6101, // pg_publication_rel
 		6102, // pg_sequence
@@ -777,6 +778,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{3079, 3079}, // pg_extension (M0106-0010 step 3aw)
 		{2328, 2328}, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
 		{1417, 1417}, // pg_foreign_server (M0106-0010 step 3be)
+		{3118, 3118}, // pg_foreign_table (M0106-0010 step 3bh)
 		{6003, 6003}, // pg_publication
 		{6101, 6101}, // pg_publication_rel
 		{6102, 6102}, // pg_sequence

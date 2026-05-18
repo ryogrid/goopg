@@ -211,6 +211,17 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// four CATALOG_VARLEN columns (srvtype, srvversion, srvacl, srvoptions)
 	// are nullable.
 	{1417, "pg_foreign_server", 83, 'r', 8, false, pgForeignServerAttrs()},
+	// M0106-0010 step 3bh: pg_foreign_table is opened during PG-standby
+	// boot once Step 3bg cleared both pg_foreign_server index OIDs.
+	// Without a pg_class row, `RelationBuildDesc(3118) → ScanPgRelation(3118)`
+	// returns NULL and the backend FATALs with `could not open relation
+	// with OID 3118`. RelType=83 is safe because pg_foreign_table is not
+	// formrdesc'd (no `ForeignTableRelation_Rowtype_Id` constant in PG18
+	// headers). Schema per `postgres/src/include/catalog/pg_foreign_table.h`
+	// (PG18, ForeignTableRelationId == 3118). 3 columns; pg_foreign_table
+	// has no `oid` system column — `ftrelid` is the primary key. The
+	// trailing CATALOG_VARLEN ftoptions column is nullable.
+	{3118, "pg_foreign_table", 83, 'r', 3, false, pgForeignTableAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1356,6 +1367,24 @@ func pgForeignServerAttrs() []nailedAttr {
 		{Name: "srvversion", TypeOID: 25, Num: 6, Len: -1, NotNull: false},    // text (nullable)
 		{Name: "srvacl", TypeOID: 1034, Num: 7, Len: -1, NotNull: false},      // aclitem[] (nullable)
 		{Name: "srvoptions", TypeOID: 1009, Num: 8, Len: -1, NotNull: false},  // text[] (nullable)
+	}
+}
+
+// pgForeignTableAttrs defines the 3-column PG18 pg_foreign_table schema.
+// PG `RelationBuildDesc(3118) → ScanPgRelation(3118)` looks up the
+// `Form_pg_class` row first; without a nailedLocalRels entry no row gets
+// seeded and PG FATALs with `could not open relation with OID 3118`.
+// Sourced verbatim from `postgres/src/include/catalog/pg_foreign_table.h`
+// and `pg_foreign_table_d.h` (Anum_pg_foreign_table_* 1–3,
+// Natts_pg_foreign_table == 3). M0106-0010 step 3bh. Unlike most catalogs,
+// pg_foreign_table has no `oid` system column — `ftrelid` is the primary
+// key. The first two columns are fixed-width NOT NULL oids; ftoptions is
+// text[] (TypeOID 1009) in the CATALOG_VARLEN block (nullable).
+func pgForeignTableAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "ftrelid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},      // oid → pg_class
+		{Name: "ftserver", TypeOID: 26, Num: 2, Len: 4, NotNull: true},     // oid → pg_foreign_server
+		{Name: "ftoptions", TypeOID: 1009, Num: 3, Len: -1, NotNull: false}, // text[] (nullable)
 	}
 }
 

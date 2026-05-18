@@ -5893,6 +5893,47 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         last deferred companion — both pg_foreign_server indexes
         (113 oid + 549 name) are now seeded. Design:
         `docs/design/0106-0010-step3bg-pg-foreign-server-oid-index.md`.
+      - Step 3bh LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 3118` PG-standby boot blocker
+        that surfaced after Step 3bg seeded `pg_foreign_server_oid_index`
+        (OID 113). OID 3118 is `pg_foreign_table` per
+        `postgres/src/include/catalog/pg_foreign_table_d.h:23`
+        (`#define ForeignTableRelationId 3118`). Pure catalog-seed
+        change mirroring the nailed-rel pattern of Steps 3w / 3aa /
+        3ag / 3ak / 3an / 3ar / 3aw / 3bb / 3be; no encoder/builder/
+        Init flow change.
+        (a) New `pgForeignTableAttrs()` in
+        `internal/initdb/relcache_init.go` defines the 3-column PG18
+        schema from `pg_foreign_table.h` (`Natts_pg_foreign_table == 3`):
+        `ftrelid` (oid 26 → pg_class) NOT NULL, `ftserver` (oid 26 →
+        pg_foreign_server) NOT NULL, `ftoptions` (text[] 1009) nullable
+        CATALOG_VARLEN. Unlike most catalogs, pg_foreign_table has
+        **no `oid` system column** — `ftrelid` is the primary key.
+        (b) `nailedLocalRels` gains
+        `{3118, "pg_foreign_table", 83, 'r', 3, false, pgForeignTableAttrs()}`.
+        RelType=83 safe because pg_foreign_table is not formrdesc'd
+        (no `ForeignTableRelation_Rowtype_Id` constant in PG18).
+        (c) `internal/initdb/initdb.go`: `bootstrapMappedLocalCatalogHeaps`
+        OID list and `bootstrapPostgresDatabase` `localRelMap` both gain
+        `3118` so the empty heap file exists at `base/{1,5}/3118` before
+        PG's mdopen.
+        Companion index 3119 (`pg_foreign_table_relid_index`, UNIQUE
+        PRIMARY on `ftrelid oid_ops`, backing `FOREIGNTABLEREL`
+        syscache) deferred until a concrete E2E blocker surfaces;
+        pg_foreign_table is currently empty so the syscache scan
+        returns zero rows regardless.
+        Regression pins: `TestNailedLocalRelsContainsPgForeignTable`
+        (full per-column audit) and
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgForeignTable`
+        in `internal/initdb/pg_foreign_table_nailed_test.go`. Existing
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        extended with 3118. Verified: `go build ./...` PASS; targeted
+        tests PASS; `go test -count=1 ./internal/initdb/` shows the
+        same 14 pre-existing baseline failures as Step 3bg (no new
+        regressions); cross-package smoke `go test -count=1
+        ./internal/executor/ ./internal/server/ ./internal/storage/
+        ./internal/catalog/ ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3bh-pg-foreign-table-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
