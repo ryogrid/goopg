@@ -68,18 +68,13 @@ func TestPgAmprocInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 	}
 	byKey := make(map[key]pgAmprocEntry, len(entries))
 	for _, e := range entries {
-		switch e.Num {
-		case 1, 2, 4:
-		default:
-			t.Errorf("entry %+v: only amprocnum 1/2/4 are seeded", e)
-		}
 		k := key{e.Family, e.LeftType, e.RightType, e.Num}
 		if _, dup := byKey[k]; dup {
 			t.Errorf("duplicate (family=%d, left=%d, right=%d, num=%d)", e.Family, e.LeftType, e.RightType, e.Num)
 		}
 		byKey[k] = e
 	}
-	// (family, lefttype, expected proc OID).
+	// Check that canonical pinned-opclass comparison procs are present.
 	want := []struct {
 		family   uint32
 		lefttype uint32
@@ -108,9 +103,8 @@ func TestPgAmprocInitialEntriesCoverPinnedOpclasses(t *testing.T) {
 			t.Errorf("%s: proc=%d, want %d", w.label, got.Proc, w.proc)
 		}
 	}
-	// 11 cmp + 8 sortsupport (no sortsupport for bool/char/oidvector)
-	// + 11 equalimage + 6 cross-type integer_ops cmp = 36 rows.
-	if got, want := len(entries), 36; got != want {
+	// Full PG18 pg_amproc.dat has 714 rows covering all access methods.
+	if got, want := len(entries), 714; got != want {
 		t.Errorf("entry count: got %d, want %d", got, want)
 	}
 }
@@ -247,24 +241,26 @@ func TestBootstrapPgAmprocTuplesWritesRowsToBase1And5(t *testing.T) {
 	if _, err := bootstrapPgAmprocTuples(dir); err != nil {
 		t.Fatalf("bootstrapPgAmprocTuples: %v", err)
 	}
-	// Needle: oid=7100 || family=1976 || left=23 || right=23.
+	// Needle: oid=7100 || family=1976 || left=23 || right=23 (first entry: btarraycmp is at 7100
+	// but the integer_ops int4 cmp is the historically pinned row).
 	le := binary.LittleEndian
 	needle := make([]byte, 16)
-	le.PutUint32(needle[0:4], 7100)
-	le.PutUint32(needle[4:8], 1976)
-	le.PutUint32(needle[8:12], 23)
-	le.PutUint32(needle[12:16], 23)
+	le.PutUint32(needle[0:4], 7100)   // OID of first entry
+	le.PutUint32(needle[4:8], 397)    // family=array_ops (first in PG18 dat order)
+	le.PutUint32(needle[8:12], 2277)  // lefttype=anyarray
+	le.PutUint32(needle[12:16], 2277) // righttype=anyarray
 	for _, sub := range []string{"base/1", "base/5"} {
 		path := filepath.Join(dir, sub, "2603")
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if got := len(raw); got != storage.BlockSize {
-			t.Fatalf("%s: page size %d, want %d", path, got, storage.BlockSize)
+		// 714 rows × ~28 bytes/row ≈ 20 KiB — multiple pages expected.
+		if len(raw) == 0 || len(raw)%storage.BlockSize != 0 {
+			t.Fatalf("%s: file size %d not a multiple of BlockSize", path, len(raw))
 		}
 		if !bytes.Contains(raw, needle) {
-			t.Fatalf("%s: int4 cmp row prefix not found in page", path)
+			t.Fatalf("%s: first row (OID=7100, array_ops) not found in heap pages", path)
 		}
 	}
 }

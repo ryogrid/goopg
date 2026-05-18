@@ -3257,77 +3257,7 @@ func pgAmprocColDefs() []catalog.Column {
 //   - amprocnum=1 → cmp        (always present)
 //   - amprocnum=2 → sortsupport (where PG18 ships one)
 //   - amprocnum=4 → equalimage  (always present in PG18)
-func pgAmprocInitialEntries() []pgAmprocEntry {
-	const (
-		famInteger            uint32 = 1976
-		famOID                uint32 = 1989
-		famText               uint32 = 1994
-		famTextPattern        uint32 = 2095
-		famBool               uint32 = 424
-		famCharBtree          uint32 = 429
-		famOidvectorBtree     uint32 = 1991
-		famBpcharPatternBtree uint32 = 2097
-		// pg_proc OIDs for equalimage support procs (pg_proc.dat).
-		btequalimageOID       uint32 = 5051 // generic image-equality
-		btvarstrequalimageOID uint32 = 5050 // text / name / varchar
-	)
-	const baseOID uint32 = 7100
-	out := []pgAmprocEntry{
-		// integer_ops — cmp + sortsupport + equalimage per type.
-		{0, famInteger, 23, 23, 1, 351},                // btint4cmp
-		{0, famInteger, 21, 21, 1, 350},                // btint2cmp
-		{0, famInteger, 20, 20, 1, 842},                // btint8cmp
-		{0, famInteger, 23, 23, 2, 3130},               // btint4sortsupport
-		{0, famInteger, 21, 21, 2, 3129},               // btint2sortsupport
-		{0, famInteger, 20, 20, 2, 3131},               // btint8sortsupport
-		{0, famInteger, 23, 23, 4, btequalimageOID},    // int4
-		{0, famInteger, 21, 21, 4, btequalimageOID},    // int2
-		{0, famInteger, 20, 20, 4, btequalimageOID},    // int8
-		// integer_ops cross-type cmp procs (pg_amproc.dat). Match
-		// the cross-type amop strategy rows above so PG's btree
-		// LookupOpclassInfo can drive an index scan across integer
-		// widths without falling back to lossy cast comparison.
-		{0, famInteger, 21, 23, 1, 2190}, // btint24cmp
-		{0, famInteger, 21, 20, 1, 2192}, // btint28cmp
-		{0, famInteger, 23, 21, 1, 2191}, // btint42cmp
-		{0, famInteger, 23, 20, 1, 2188}, // btint48cmp
-		{0, famInteger, 20, 21, 1, 2193}, // btint82cmp
-		{0, famInteger, 20, 23, 1, 2189}, // btint84cmp
-		// oid_ops — cmp + sortsupport + equalimage.
-		{0, famOID, 26, 26, 1, 356},                    // btoidcmp
-		{0, famOID, 26, 26, 2, 3134},                   // btoidsortsupport
-		{0, famOID, 26, 26, 4, btequalimageOID},
-		// text_ops — text and name share the family. PG seeds
-		// sortsupport + varstr equalimage for both.
-		{0, famText, 25, 25, 1, 360},                   // bttextcmp
-		{0, famText, 19, 19, 1, 359},                   // btnamecmp
-		{0, famText, 25, 25, 2, 3255},                  // bttextsortsupport
-		{0, famText, 19, 19, 2, 3135},                  // btnamesortsupport
-		{0, famText, 25, 25, 4, btvarstrequalimageOID}, // text
-		{0, famText, 19, 19, 4, btvarstrequalimageOID}, // name
-		// text_pattern_ops — sortsupport + generic equalimage.
-		{0, famTextPattern, 25, 25, 1, 2166},           // bttext_pattern_cmp
-		{0, famTextPattern, 25, 25, 2, 3332},           // bttext_pattern_sortsupport
-		{0, famTextPattern, 25, 25, 4, btequalimageOID},
-		// bool_ops — cmp + equalimage (no sortsupport in PG18).
-		{0, famBool, 16, 16, 1, 1693},                  // btboolcmp
-		{0, famBool, 16, 16, 4, btequalimageOID},
-		// char_ops — cmp + equalimage (no sortsupport in PG18).
-		{0, famCharBtree, 18, 18, 1, 358},              // btcharcmp
-		{0, famCharBtree, 18, 18, 4, btequalimageOID},
-		// oidvector_ops — cmp + equalimage (no sortsupport in PG18).
-		{0, famOidvectorBtree, 30, 30, 1, 404},         // btoidvectorcmp
-		{0, famOidvectorBtree, 30, 30, 4, btequalimageOID},
-		// bpchar_pattern_ops — cmp + sortsupport + equalimage.
-		{0, famBpcharPatternBtree, 1042, 1042, 1, 2180},          // btbpchar_pattern_cmp
-		{0, famBpcharPatternBtree, 1042, 1042, 2, 3333},          // btbpchar_pattern_sortsupport
-		{0, famBpcharPatternBtree, 1042, 1042, 4, btequalimageOID},
-	}
-	for i := range out {
-		out[i].OID = baseOID + uint32(i)
-	}
-	return out
-}
+
 
 // pgAmprocRow encodes one pg_amproc row. Field order mirrors
 // FormData_pg_amproc so PG's GETSTRUCT cast is byte-for-byte

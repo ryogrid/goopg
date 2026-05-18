@@ -9777,7 +9777,7 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3y-pg-amop-fam-strat-index.md`.
       - Risk gate: parser/planner/executor.
 
-- [ ] **M0106-0010 batched-18** (bootstrap-procedure task 18)
+- [x] **M0106-0010 batched-18** (bootstrap-procedure task 18)
       - Summary: Complete `pg_amproc` seed: cross-type cmp procs for
         text / datetime / numeric, plus hash/gist/gin support functions
         (target 714 rows).

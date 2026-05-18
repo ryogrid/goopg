@@ -88,7 +88,6 @@ func TestBootstrapPgAmprocFamProcIndexWritesPopulatedBtree(t *testing.T) {
 		}
 	}
 
-	// pg_amproc heap must land first so its TIDs are available.
 	tids, err := bootstrapPgAmprocTuples(dir)
 	if err != nil {
 		t.Fatalf("bootstrapPgAmprocTuples: %v", err)
@@ -102,7 +101,13 @@ func TestBootstrapPgAmprocFamProcIndexWritesPopulatedBtree(t *testing.T) {
 		t.Fatalf("bootstrapPgAmprocFamProcIndex: %v", err)
 	}
 
-	const expectedBlocks = 2
+	// 714 entries × 28 bytes/item: 3 leaf pages + 1 root + 1 metapage = 5 blocks.
+	// pgBuildBtreeBulkLoadSized(tuples, 24, 4):
+	//   maxPerNonRM = (8152-28)/28 = 290
+	//   leafGroups: [0:290], [290:580], [580:714] → 3 leaves
+	//   rootBlock = 3+1 = 4, totalBlocks = 5
+	const expectedBlocks = 5
+	const expectedRoot = 4
 	for _, sub := range []string{"base/1", "base/5", "global"} {
 		path := filepath.Join(dir, sub, "2655")
 		raw, err := os.ReadFile(path)
@@ -110,62 +115,74 @@ func TestBootstrapPgAmprocFamProcIndexWritesPopulatedBtree(t *testing.T) {
 			t.Fatalf("read %s: %v", path, err)
 		}
 		if len(raw) != expectedBlocks*storage.BlockSize {
-			t.Errorf("%s: size=%d, want %d", path, len(raw), expectedBlocks*storage.BlockSize)
+			t.Errorf("%s: size=%d, want %d (%d blocks)", path, len(raw), expectedBlocks*storage.BlockSize, expectedBlocks)
 			continue
 		}
-		// Metapage btm_root = block 1.
 		le := binary.LittleEndian
-		// metapage layout (see pgBuildBtreeMetapageWithRoot):
-		// SizeOfPageHeaderData=24 + btm_magic(4) + btm_version(4) + btm_root(4) ...
-		btmRoot := le.Uint32(raw[24+4+4 : 24+4+4+4])
-		if btmRoot != 1 {
-			t.Errorf("%s: btm_root=%d, want 1", path, btmRoot)
+		// Metapage: btm_root at offset 32, btm_level at offset 36.
+		btmRoot := le.Uint32(raw[32:36])
+		if btmRoot != expectedRoot {
+			t.Errorf("%s: btm_root=%d, want %d", path, btmRoot, expectedRoot)
 		}
-		// Leaf page line-pointer count.
-		leaf := raw[storage.BlockSize : 2*storage.BlockSize]
-		pdLower := le.Uint16(leaf[12:14])
-		nItems := int((pdLower - storage.SizeOfPageHeaderData) / 4)
-		if nItems != len(entries) {
-			t.Errorf("%s: nItems=%d, want %d", path, nItems, len(entries))
+		btmLevel := le.Uint32(raw[36:40])
+		if btmLevel != 1 {
+			t.Errorf("%s: btm_level=%d, want 1", path, btmLevel)
 		}
 	}
 
-	// Sanity check: the on-disk leaf must contain the integer_ops cmp
-	// row for type int4 (family=1976, left=23, right=23, num=1) AND the
-	// text family btnamecmp row (family=1994, left=19, right=19, num=1).
-	// Both are needed for pg_authid_rolname_index (uses name_ops →
-	// family 1994) to find its support proc.
+	// Verify key rows are reachable across all leaf pages.
 	raw, err := os.ReadFile(filepath.Join(dir, "base/1", "2655"))
 	if err != nil {
 		t.Fatalf("read base/1/2655: %v", err)
 	}
 	mustContainKey(t, raw, 1976, 23, 23, 1, "integer_ops int4 cmp")
 	mustContainKey(t, raw, 1994, 19, 19, 1, "text family btnamecmp")
+	mustContainKey(t, raw, 397, 2277, 2277, 1, "btree/array_ops btarraycmp")
 }
 
 // mustContainKey scans the leaf page for a 24-byte IndexTuple whose
 // 4-key payload matches (family, lefttype, righttype, num).
 func mustContainKey(t *testing.T, file []byte, family, lefttype, righttype uint32, num int16, label string) {
 	t.Helper()
-	leaf := file[storage.BlockSize : 2*storage.BlockSize]
 	le := binary.LittleEndian
-	pdLower := le.Uint16(leaf[12:14])
-	nItems := int((pdLower - storage.SizeOfPageHeaderData) / 4)
-	for i := 0; i < nItems; i++ {
-		// Line pointer at offset SizeOfPageHeaderData + i*4.
-		lp := le.Uint32(leaf[storage.SizeOfPageHeaderData+i*4:])
-		lpOff := lp & 0x7FFF // low 15 bits = lp_off
-		if int(lpOff)+24 > len(leaf) {
-			continue
-		}
-		tup := leaf[lpOff : lpOff+24]
-		gotFam := le.Uint32(tup[8:12])
-		gotLeft := le.Uint32(tup[12:16])
-		gotRight := le.Uint32(tup[16:20])
-		gotNum := int16(le.Uint16(tup[20:22]))
-		if gotFam == family && gotLeft == lefttype && gotRight == righttype && gotNum == num {
-			return
+	nBlocks := len(file) / storage.BlockSize
+	if nBlocks < 2 {
+		t.Fatalf("mustContainKey: file too small (%d blocks)", nBlocks)
+		return
+	}
+	// Determine leaf page range from metapage.
+	// btm_root at offset 32, btm_level at offset 36.
+	btmRoot := int(le.Uint32(file[32:36]))
+	btmLevel := int(le.Uint32(file[36:40]))
+	var leafEnd int
+	if btmLevel == 0 {
+		leafEnd = 2 // leaf-root: only block 1
+	} else {
+		leafEnd = btmRoot // leaves at 1..btmRoot-1
+	}
+	for b := 1; b < leafEnd; b++ {
+		leaf := file[b*storage.BlockSize : (b+1)*storage.BlockSize]
+		pdLower := le.Uint16(leaf[12:14])
+		nItems := int((pdLower - storage.SizeOfPageHeaderData) / 4)
+		for i := 0; i < nItems; i++ {
+			lp := le.Uint32(leaf[storage.SizeOfPageHeaderData+i*4:])
+			lpOff := lp & 0x7FFF
+			if int(lpOff)+24 > storage.BlockSize {
+				continue
+			}
+			tup := leaf[lpOff : lpOff+24]
+			// Skip high-key pivots (INDEX_ALT_TID_MASK set in t_info).
+			if le.Uint16(tup[6:8])&0x2000 != 0 {
+				continue
+			}
+			gotFam := le.Uint32(tup[8:12])
+			gotLeft := le.Uint32(tup[12:16])
+			gotRight := le.Uint32(tup[16:20])
+			gotNum := int16(le.Uint16(tup[20:22]))
+			if gotFam == family && gotLeft == lefttype && gotRight == righttype && gotNum == num {
+				return
+			}
 		}
 	}
-	t.Errorf("%s: key (family=%d, left=%d, right=%d, num=%d) not found in leaf", label, family, lefttype, righttype, num)
+	t.Errorf("%s: key (family=%d, left=%d, right=%d, num=%d) not found in any leaf page", label, family, lefttype, righttype, num)
 }

@@ -1368,15 +1368,10 @@ func bootstrapPgAmprocFamProcIndex(dataDir string, tids []heapTID) error {
 	for i, it := range items {
 		tuples[i] = pgBuildIndexTupleOidOidOidInt2Key(it.block, it.off, it.family, it.lefttype, it.righttype, it.num)
 	}
-	leaf, err := pgBuildBtreeLeafRootPage(tuples)
+	file, err := pgBuildBtreeBulkLoadSized(tuples, 24, 4)
 	if err != nil {
-		return fmt.Errorf("pg_amproc_fam_proc_index leaf: %w", err)
+		return fmt.Errorf("pg_amproc_fam_proc_index bulk-load: %w", err)
 	}
-	meta := pgBuildBtreeMetapageWithRoot(1 /* root block */, 0 /* leaf level */)
-
-	file := make([]byte, 0, 2*storage.BlockSize)
-	file = append(file, meta...)
-	file = append(file, leaf...)
 
 	for _, dir := range []string{
 		filepath.Join(dataDir, "base", "1"),
