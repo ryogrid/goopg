@@ -2286,3 +2286,37 @@ func bootstrapPgConversionDefaultIndex(dataDir string, tids map[uint32]heapTID) 
 	}
 	return nil
 }
+
+// bootstrapPgAggregateFnoidIndex writes the populated btree for
+// pg_aggregate_fnoid_index (OID 2650) — UNIQUE PRIMARY btree on
+// aggfnoid (column 1, oid_ops) — to base/{1,5}/2650.
+// The empty btree placeholder from step 3x is overwritten.
+func bootstrapPgAggregateFnoidIndex(dataDir string, tids map[uint32]heapTID) error {
+	type indexed struct {
+		oid   uint32
+		block uint32
+		off   uint16
+	}
+	items := make([]indexed, 0, len(tids))
+	for oid, tid := range tids {
+		items = append(items, indexed{oid: oid, block: tid.Block, off: tid.Offset})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].oid < items[j].oid })
+	tuples := make([][]byte, len(items))
+	for i, it := range items {
+		tuples[i] = pgBuildIndexTupleOidKey(it.block, it.off, it.oid)
+	}
+	file, err := pgBuildBtreeBulkLoad(tuples, 1)
+	if err != nil {
+		return fmt.Errorf("pg_aggregate_fnoid_index bulk-load: %w", err)
+	}
+	for _, dir := range []string{
+		filepath.Join(dataDir, "base", "1"),
+		filepath.Join(dataDir, "base", "5"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, strconv.FormatUint(2650, 10)), file, 0o600); err != nil {
+			return fmt.Errorf("write pg_aggregate_fnoid_index in %s: %w", dir, err)
+		}
+	}
+	return nil
+}

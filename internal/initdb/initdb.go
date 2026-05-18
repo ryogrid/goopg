@@ -470,6 +470,18 @@ func Init(opts Options) error {
 	if err := bootstrapPgConversionDefaultIndex(abs, pgConversionTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_conversion_default_index: %w", err)
 	}
+	// M0106-0010 batched-23: write all 161 pg_aggregate rows and the
+	// populated pg_aggregate_fnoid_index (OID 2650) so PG's AGGFNOID
+	// syscache resolves aggregate lookups (e.g. during function parsing
+	// of calls like SUM, AVG, COUNT). The aggfnoid column (regproc) is
+	// the primary key — no separate oid column exists in pg_aggregate.
+	pgAggregateTIDs, err := bootstrapPgAggregateTuples(abs)
+	if err != nil {
+		return fmt.Errorf("goopg init: pg_aggregate tuples: %w", err)
+	}
+	if err := bootstrapPgAggregateFnoidIndex(abs, pgAggregateTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_aggregate_fnoid_index: %w", err)
+	}
 	// M0106-0010 step 3m: overwrite the empty btree placeholder at
 	// base/{1,5}/2662 + global/2662 with a populated 2-page btree
 	// (metapage + leaf-root) carrying one oid-keyed IndexTuple per

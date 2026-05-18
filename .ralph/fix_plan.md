@@ -9839,9 +9839,9 @@ relcache init → replication readiness) and intra-package grouped.
         `0106-0010-step3ai-pg-conversion-oid-index.md`,
         `0106-0010-step3aj-pg-conversion-name-nsp-index.md`.
       - Risk gate: parser/planner/executor.
-      - Commit: TBD (batched-22).
+      - Commit: 43fc4d1.
 
-- [ ] **M0106-0010 batched-23** (bootstrap-procedure task 23)
+- [x] **M0106-0010 batched-23** (bootstrap-procedure task 23)
       - Summary: Seed `pg_aggregate` (161 rows) heap + index (2650);
         ensure each row's `aggfnoid` resolves into the expanded
         `pg_proc` set from task 14.
