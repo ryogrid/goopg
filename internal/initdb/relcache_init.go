@@ -200,6 +200,17 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// (PG18, ForeignDataWrapperRelationId == 2328). 7 columns; fdwacl and
 	// fdwoptions are in the CATALOG_VARLEN block (nullable).
 	{2328, "pg_foreign_data_wrapper", 83, 'r', 7, false, pgForeignDataWrapperAttrs()},
+	// M0106-0010 step 3be: pg_foreign_server is opened during PG-standby
+	// boot once Step 3bd cleared the pg_foreign_data_wrapper index family.
+	// Without a pg_class row, `RelationBuildDesc(1417) → ScanPgRelation(1417)`
+	// returns NULL and the backend FATALs with `could not open relation
+	// with OID 1417`. RelType=83 is safe because pg_foreign_server is not
+	// formrdesc'd (no `ForeignServerRelation_Rowtype_Id` constant in PG18
+	// headers). Schema per `postgres/src/include/catalog/pg_foreign_server.h`
+	// (PG18, ForeignServerRelationId == 1417). 8 columns; the trailing
+	// four CATALOG_VARLEN columns (srvtype, srvversion, srvacl, srvoptions)
+	// are nullable.
+	{1417, "pg_foreign_server", 83, 'r', 8, false, pgForeignServerAttrs()},
 }, []idxSpec{
 	{2703, "pg_type_oid_index"},
 	{2704, "pg_type_typname_nsp_index"},
@@ -1298,6 +1309,29 @@ func pgForeignDataWrapperAttrs() []nailedAttr {
 		{Name: "fdwvalidator", TypeOID: 26, Num: 5, Len: 4, NotNull: true},    // oid → pg_proc (opt)
 		{Name: "fdwacl", TypeOID: 1034, Num: 6, Len: -1, NotNull: false},      // aclitem[] (nullable)
 		{Name: "fdwoptions", TypeOID: 1009, Num: 7, Len: -1, NotNull: false},  // text[] (nullable)
+	}
+}
+
+// pgForeignServerAttrs defines the 8-column PG18 pg_foreign_server schema.
+// PG `RelationBuildDesc(1417) → ScanPgRelation(1417)` looks up the
+// `Form_pg_class` row first; without a nailedLocalRels entry no row gets
+// seeded and PG FATALs with `could not open relation with OID 1417`.
+// Sourced verbatim from `postgres/src/include/catalog/pg_foreign_server.h`
+// and `pg_foreign_server_d.h` (Anum_pg_foreign_server_* 1–8). M0106-0010
+// step 3be. The first four columns are fixed-width NOT NULL; srvtype and
+// srvversion are text (TypeOID 25), srvacl is aclitem[] (TypeOID 1034),
+// srvoptions is text[] (TypeOID 1009) — all four in the CATALOG_VARLEN
+// block with no BKI_FORCE_NOT_NULL, so nullable.
+func pgForeignServerAttrs() []nailedAttr {
+	return []nailedAttr{
+		{Name: "oid", TypeOID: 26, Num: 1, Len: 4, NotNull: true},             // oid
+		{Name: "srvname", TypeOID: 19, Num: 2, Len: 64, NotNull: true},        // name
+		{Name: "srvowner", TypeOID: 26, Num: 3, Len: 4, NotNull: true},        // oid → pg_authid
+		{Name: "srvfdw", TypeOID: 26, Num: 4, Len: 4, NotNull: true},          // oid → pg_foreign_data_wrapper
+		{Name: "srvtype", TypeOID: 25, Num: 5, Len: -1, NotNull: false},       // text (nullable)
+		{Name: "srvversion", TypeOID: 25, Num: 6, Len: -1, NotNull: false},    // text (nullable)
+		{Name: "srvacl", TypeOID: 1034, Num: 7, Len: -1, NotNull: false},      // aclitem[] (nullable)
+		{Name: "srvoptions", TypeOID: 1009, Num: 8, Len: -1, NotNull: false},  // text[] (nullable)
 	}
 }
 

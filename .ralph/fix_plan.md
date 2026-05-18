@@ -5713,6 +5713,80 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         (112 oid + 548 name) are now seeded.
         Design:
         `docs/design/0106-0010-step3bd-pg-foreign-data-wrapper-oid-index.md`.
+      - Step 3be LANDED 2026-05-18. Closes the FATAL
+        `could not open relation with OID 1417` PG-standby boot blocker
+        that surfaced after Step 3bd closed both pg_foreign_data_wrapper
+        companion indexes (112, 548). OID 1417 is `pg_foreign_server`
+        per `postgres/src/include/catalog/pg_foreign_server_d.h:23`
+        (`#define ForeignServerRelationId 1417`). Pure catalog-seed
+        change mirroring the nailed-rel pattern of Steps 3w
+        (pg_aggregate), 3aa (pg_cast), 3ag (pg_conversion), 3ak
+        (pg_default_acl), 3an (pg_enum), 3ar (pg_event_trigger), 3aw
+        (pg_extension), and 3bb (pg_foreign_data_wrapper); no encoder,
+        builder, or `Init` flow change.
+        (a) `internal/initdb/relcache_init.go` gains new
+        `pgForeignServerAttrs()` returning the 8-column PG18 schema
+        verbatim from `pg_foreign_server.h` /
+        `pg_foreign_server_d.h`: oid (26/4), srvname (19 name/64),
+        srvowner (26/4 → pg_authid), srvfdw (26/4 →
+        pg_foreign_data_wrapper), srvtype (25 text/-1 nullable),
+        srvversion (25 text/-1 nullable), srvacl (1034 aclitem[]/-1
+        nullable), srvoptions (1009 text[]/-1 nullable). The four
+        CATALOG_VARLEN columns carry no BKI_FORCE_NOT_NULL — nullable.
+        (b) `nailedLocalRels` gains
+        `{1417, "pg_foreign_server", 83, 'r', 8, false, pgForeignServerAttrs()}`
+        immediately after the Step 3bb pg_foreign_data_wrapper entry.
+        RelType=83 is safe because pg_foreign_server is not
+        formrdesc'd (no `ForeignServerRelation_Rowtype_Id` constant in
+        PG18 headers), so Step 3v's
+        `relation->rd_att->tdtypeid == relp->reltype` Phase-3
+        assertion does not fire.
+        (c) `internal/initdb/initdb.go::localRelMap` gains
+        `{1417, 1417}` so PG's relfilenode mapper resolves OID 1417 to
+        a backing file.
+        (d) `internal/initdb/initdb.go::bootstrapMappedLocalCatalogHeaps`
+        OID list gains `1417` so an `InitPage`-stamped 8 KiB heap
+        exists at `base/{1,5}/1417` before PG's mdopen runs.
+        The single nailedLocalRels entry threads automatically through
+        `bootstrapPgClassTuples → bootstrapPgAttributeTuples
+        → bootstrapPgClassOidIndex` (leaf for 1417 at file 2662) →
+        `bootstrapPgAttributeRelidAttnumIndex` (8 composite-key leaves
+        at file 2659) and `writeRelcacheInitFile` emits a
+        `Form_pg_class` + 8 `Form_pg_attribute` blob group. Companion
+        indexes 113 (`pg_foreign_server_oid_index`, UNIQUE PRIMARY
+        KEY on `oid_ops`, backs FOREIGNSERVEROID syscache) and 549
+        (`pg_foreign_server_name_index`, UNIQUE non-PKEY on
+        `srvname name_ops`, backs FOREIGNSERVERNAME syscache)
+        intentionally deferred until concrete E2E blockers surface,
+        preserving the single-OID rhythm of Steps 3w → 3aa → 3ag →
+        3ak → 3an → 3ar → 3aw → 3bb.
+        Regression pins:
+        `TestNailedLocalRelsContainsPgForeignServer` (full
+        per-column `(Name, TypeOID, Num, Len, NotNull)` audit) and
+        `TestBootstrapMappedLocalCatalogHeapsIncludesPgForeignServer`
+        (asserts `base/{1,5}/1417` exists, is exactly 8 KiB, and
+        InitPage-stamped) in
+        `internal/initdb/pg_foreign_server_nailed_test.go`.
+        Existing pin extended:
+        `TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages::wantOIDs`
+        gains 1417 so the placeholder list cannot silently drop
+        pg_foreign_server.
+        Verified: `go build ./...` PASS; `go test -count=1 -run
+        'TestNailedLocalRelsContainsPgForeignServer|TestBootstrapMappedLocalCatalogHeapsIncludesPgForeignServer|TestNailedLocalRelsContainsPgForeignDataWrapper|TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages|TestPgForeignDataWrapperOidIndex|TestPgForeignDataWrapperNameIndex|TestNailedIndexRelnattsAgreesWithIndnatts'
+        ./internal/initdb/` PASS; `go test -count=1 ./internal/initdb/`
+        — same 14 pre-existing baseline failures as Step 3bd
+        (`TestMigration*`, `TestCreate*`, `TestBootstrappedPG*`,
+        `TestSynchronousCommitFlushesByDefault`,
+        `TestOpenOldClusterWithoutM0030*`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestCommittedTableSurvivesCrashRestart`,
+        `TestRuntimeCloseTriggersFinalCheckpoint`,
+        `TestMultipleTablesLoadFromHeap`) — no new regressions;
+        cross-package smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS.
+        Design:
+        `docs/design/0106-0010-step3be-pg-foreign-server-nailed-rel.md`.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
