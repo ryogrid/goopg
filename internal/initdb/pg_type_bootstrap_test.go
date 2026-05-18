@@ -82,6 +82,54 @@ func TestPgTypeRowCanonicalTypalignByte(t *testing.T) {
 	}
 }
 
+// TestPgTypeRowEmbedsCanonicalIORegprocOIDs pins the I/O regproc OIDs
+// emitted in every bootstrapped pg_type row. The int4 case in
+// particular is load-bearing: an int4 row with typoutput=0 makes PG18's
+// getTypeOutputInfo (lsyscache.c:3063) raise
+// `ERROR: 42883: no output function available for type integer` on the
+// standby's very first `SELECT 1` probe — the M0106-0010 Step 3da
+// FATAL chain. typoutput lives at FormData_pg_type offset 104.
+func TestPgTypeRowEmbedsCanonicalIORegprocOIDs(t *testing.T) {
+	cols := pgTypeColDefs()
+	cases := []struct {
+		oid                                      uint32
+		wantIn, wantOut, wantRecv, wantSend      uint32
+	}{
+		{23, 42, 43, 2406, 2407},   // int4
+		{16, 1242, 1243, 2436, 2437}, // bool
+		{25, 46, 47, 2414, 2415},   // text
+		{26, 1798, 1799, 2418, 2419}, // oid
+		{19, 34, 35, 2422, 2423},   // name
+	}
+	for _, tc := range cases {
+		e, ok := pgTypeCanonical(tc.oid)
+		if !ok {
+			t.Errorf("pgTypeCanonical(%d): missing", tc.oid)
+			continue
+		}
+		if e.Input != tc.wantIn || e.Output != tc.wantOut || e.Receive != tc.wantRecv || e.Send != tc.wantSend {
+			t.Errorf("oid=%d (%s): I/O OIDs = (%d,%d,%d,%d); want (%d,%d,%d,%d)",
+				tc.oid, e.Name, e.Input, e.Output, e.Receive, e.Send,
+				tc.wantIn, tc.wantOut, tc.wantRecv, tc.wantSend)
+		}
+		payload, err := executor.EncodeRowPG(cols, pgTypeRow(e))
+		if err != nil {
+			t.Fatalf("oid=%d: EncodeRowPG: %v", tc.oid, err)
+		}
+		// FormData_pg_type fixed-part layout: typinput at offset 100,
+		// typoutput at 104, typreceive at 108, typsend at 112.
+		gotIn := uint32(payload[100]) | uint32(payload[101])<<8 | uint32(payload[102])<<16 | uint32(payload[103])<<24
+		gotOut := uint32(payload[104]) | uint32(payload[105])<<8 | uint32(payload[106])<<16 | uint32(payload[107])<<24
+		gotRecv := uint32(payload[108]) | uint32(payload[109])<<8 | uint32(payload[110])<<16 | uint32(payload[111])<<24
+		gotSend := uint32(payload[112]) | uint32(payload[113])<<8 | uint32(payload[114])<<16 | uint32(payload[115])<<24
+		if gotIn != tc.wantIn || gotOut != tc.wantOut || gotRecv != tc.wantRecv || gotSend != tc.wantSend {
+			t.Errorf("oid=%d (%s): encoded I/O OIDs = (%d,%d,%d,%d); want (%d,%d,%d,%d)",
+				tc.oid, e.Name, gotIn, gotOut, gotRecv, gotSend,
+				tc.wantIn, tc.wantOut, tc.wantRecv, tc.wantSend)
+		}
+	}
+}
+
 // TestBootstrapPgTypeTuplesWritesCanonicalHeap end-to-end test: invoke
 // bootstrapPgTypeTuples in a temp data dir (after seeding base/1 and
 // base/5), then walk base/1/1247 page 0 and assert every heap tuple's

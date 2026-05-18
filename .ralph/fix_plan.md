@@ -8744,6 +8744,62 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         If the SIGSEGV survives, promote it to Step 3da with a
         fresh capture; otherwise the next FATAL line (whatever it
         is) becomes Step 3da's scope.
+      - Step 3da LANDED 2026-05-18: pg_type I/O regproc OIDs
+        populated. The first standby `SELECT 1` probe after Step 3cz
+        succeeded at the SysCache layer but immediately ERRORed at
+        `getTypeOutputInfo` (`lsyscache.c:3063`) with
+        `ERROR: 42883: no output function available for type integer`
+        because every bootstrapped pg_type row had
+        `typinput/typoutput/typreceive/typsend = 0`. Fix:
+        `internal/initdb/pg_type_bootstrap.go::pgTypeEntry` gains
+        four `uint32` fields (`Input/Output/Receive/Send`); every
+        case in `pgTypeCanonical` fills them with the PG18-canonical
+        regproc OIDs from `postgres/src/include/catalog/pg_proc.dat`
+        (e.g. int4 → 42/43/2406/2407, bool → 1242/1243/2436/2437,
+        text → 46/47/2414/2415, oid → 1798/1799/2418/2419). Array
+        types share the generic `array_in/out/recv/send` quad
+        (750/751/2400/2401); aclitem and the three pseudo types
+        (`table_am_handler`, `index_am_handler`, `internal`) carry 0
+        in typreceive/typsend (no binary I/O upstream). `pgTypeRow`
+        emits these at columns 16–19 instead of zero; the on-disk
+        fixed-part layout is unchanged.
+        Regression pin (new in
+        `internal/initdb/pg_type_bootstrap_test.go`):
+        `TestPgTypeRowEmbedsCanonicalIORegprocOIDs` covers 5 cases
+        (int4, bool, text, oid, name) at both the `pgTypeEntry`
+        level and the encoded payload byte offsets 100/104/108/112;
+        **mandatory `(23, 42, 43, 2406, 2407)` for int4** — the
+        exact value whose absence triggered the FATAL.
+        Verified: `go build ./...` PASS; targeted
+        `go test -count=1 -run 'TestPgType|TestBootstrapPgType'
+        ./internal/initdb/` PASS (7/7); `go test -count=1
+        ./internal/initdb/` — same 15 pre-existing baseline
+        failures as Step 3cz (no new regressions); cross-package
+        smoke `go test -count=1 ./internal/executor/
+        ./internal/server/ ./internal/storage/ ./internal/catalog/
+        ./internal/mvcc/` PASS. Design:
+        `docs/design/0106-0010-step3da-pg-type-io-regproc-oids.md`.
+        E2E impact (the load-bearing metric): `[m0102-pg-standby-log]`
+        capture before vs after — `cache lookup failed for type 23`
+        lines 0→0 (Step 3cz invariant holds), `no output function
+        available for type integer` lines 41→0, `signal 11:
+        Segmentation fault` lines **56→1**, standby quiet-running
+        window **0s→8+ minutes**. The standby now boots past
+        `SELECT 1` and the postmaster's checkpointer idles for the
+        rest of the test budget.
+        Next blocker (Step 3db): the lone surviving SIGSEGV happens
+        on a follow-up backend inside `InitPostgres` (postinit.c:723)
+        during an `aio_shared_buffer_readv_cb` cycle; no FATAL or
+        ERROR precedes it. Working hypothesis: the now-resolvable
+        SysCache chain reaches a previously-unexercised pg_proc row
+        — int4out (OID 43) is the obvious next dependency. Step 3db
+        should grep the standby's `base/{1,5}/1255` (pg_proc) for
+        OID 43 / `int4out` and apply the same pattern
+        (canonical heap row + populated `pg_proc_oid_index`) used by
+        Steps 3cw / 3cx / 3cz if it's missing. Falls back to a
+        fresh standby pg.log capture via the Step-3cy cleanup tag
+        + `gdb --batch -ex bt` against the SIGSEGV PID if the heap
+        + index path is already populated.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

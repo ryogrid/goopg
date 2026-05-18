@@ -56,7 +56,8 @@ func pgTypeColDefs() []catalog.Column {
 
 // pgTypeEntry captures the load-bearing fixed-part fields of a PG18
 // pg_type row.  Field values are sourced from
-// `postgres/src/include/catalog/pg_type.dat`.
+// `postgres/src/include/catalog/pg_type.dat` (with regproc OIDs cross-
+// referenced via `postgres/src/include/catalog/pg_proc.dat`).
 type pgTypeEntry struct {
 	OID      uint32
 	Name     string
@@ -66,6 +67,15 @@ type pgTypeEntry struct {
 	Category byte // typcategory; capital letter per pg_type.h TYPCATEGORY_*
 	Align    byte // 'c'/'s'/'i'/'d'
 	Storage  byte // 'p'/'e'/'x'/'m'
+	// I/O regproc OIDs (pg_proc.oid). 0 = no function (legitimate for
+	// pseudo types and aclitem). PG18's getTypeOutputInfo
+	// (lsyscache.c:3063) ERRORs with `no output function available for
+	// type ...` when typoutput == 0, which is the immediate FATAL the
+	// M0106-0010 Step 3da fix closes for int4 (OID 23).
+	Input   uint32 // typinput
+	Output  uint32 // typoutput
+	Receive uint32 // typreceive
+	Send    uint32 // typsend
 }
 
 // pgTypeCanonical returns the PG18-canonical metadata for an OID.
@@ -75,84 +85,97 @@ type pgTypeEntry struct {
 // enforces that invariant so a future nailedAttr referencing a new OID
 // cannot regress the FATAL silently.
 func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
+	// Array types share the generic array_in/out/recv/send quad
+	// (pg_proc.dat OIDs 750/751/2400/2401).
+	const (
+		arrayIn   uint32 = 750
+		arrayOut  uint32 = 751
+		arrayRecv uint32 = 2400
+		arraySend uint32 = 2401
+	)
 	switch oid {
 	case 16:
-		return pgTypeEntry{16, "bool", 1, true, 'b', 'B', 'c', 'p'}, true
+		return pgTypeEntry{16, "bool", 1, true, 'b', 'B', 'c', 'p', 1242, 1243, 2436, 2437}, true
 	case 17:
-		return pgTypeEntry{17, "bytea", -1, false, 'b', 'U', 'i', 'x'}, true
+		return pgTypeEntry{17, "bytea", -1, false, 'b', 'U', 'i', 'x', 1244, 31, 2412, 2413}, true
 	case 18:
-		return pgTypeEntry{18, "char", 1, true, 'b', 'Z', 'c', 'p'}, true
+		return pgTypeEntry{18, "char", 1, true, 'b', 'Z', 'c', 'p', 1245, 33, 2434, 2435}, true
 	case 19:
-		return pgTypeEntry{19, "name", 64, false, 'b', 'S', 'c', 'p'}, true
+		return pgTypeEntry{19, "name", 64, false, 'b', 'S', 'c', 'p', 34, 35, 2422, 2423}, true
 	case 20:
-		return pgTypeEntry{20, "int8", 8, true, 'b', 'N', 'd', 'p'}, true
+		return pgTypeEntry{20, "int8", 8, true, 'b', 'N', 'd', 'p', 460, 461, 2408, 2409}, true
 	case 21:
-		return pgTypeEntry{21, "int2", 2, true, 'b', 'N', 's', 'p'}, true
+		return pgTypeEntry{21, "int2", 2, true, 'b', 'N', 's', 'p', 38, 39, 2404, 2405}, true
 	case 22:
-		return pgTypeEntry{22, "int2vector", -1, false, 'b', 'A', 'i', 'p'}, true
+		return pgTypeEntry{22, "int2vector", -1, false, 'b', 'A', 'i', 'p', 40, 41, 2410, 2411}, true
 	case 23:
-		return pgTypeEntry{23, "int4", 4, true, 'b', 'N', 'i', 'p'}, true
+		return pgTypeEntry{23, "int4", 4, true, 'b', 'N', 'i', 'p', 42, 43, 2406, 2407}, true
 	case 24:
-		return pgTypeEntry{24, "regproc", 4, true, 'b', 'N', 'i', 'p'}, true
+		return pgTypeEntry{24, "regproc", 4, true, 'b', 'N', 'i', 'p', 44, 45, 2444, 2445}, true
 	case 25:
-		return pgTypeEntry{25, "text", -1, false, 'b', 'S', 'i', 'x'}, true
+		return pgTypeEntry{25, "text", -1, false, 'b', 'S', 'i', 'x', 46, 47, 2414, 2415}, true
 	case 26:
-		return pgTypeEntry{26, "oid", 4, true, 'b', 'N', 'i', 'p'}, true
+		return pgTypeEntry{26, "oid", 4, true, 'b', 'N', 'i', 'p', 1798, 1799, 2418, 2419}, true
 	case 27:
-		return pgTypeEntry{27, "tid", 6, false, 'b', 'U', 's', 'p'}, true
+		return pgTypeEntry{27, "tid", 6, false, 'b', 'U', 's', 'p', 48, 49, 2438, 2439}, true
 	case 28:
-		return pgTypeEntry{28, "xid", 4, true, 'b', 'U', 'i', 'p'}, true
+		return pgTypeEntry{28, "xid", 4, true, 'b', 'U', 'i', 'p', 50, 51, 2440, 2441}, true
 	case 29:
-		return pgTypeEntry{29, "cid", 4, true, 'b', 'U', 'i', 'p'}, true
+		return pgTypeEntry{29, "cid", 4, true, 'b', 'U', 'i', 'p', 52, 53, 2442, 2443}, true
 	case 30:
-		return pgTypeEntry{30, "oidvector", -1, false, 'b', 'A', 'i', 'p'}, true
+		return pgTypeEntry{30, "oidvector", -1, false, 'b', 'A', 'i', 'p', 54, 55, 2420, 2421}, true
 	case 194:
-		return pgTypeEntry{194, "pg_node_tree", -1, false, 'b', 'S', 'i', 'x'}, true
+		return pgTypeEntry{194, "pg_node_tree", -1, false, 'b', 'S', 'i', 'x', 195, 196, 197, 198}, true
 	case 269:
-		return pgTypeEntry{269, "table_am_handler", 4, true, 'p', 'P', 'i', 'p'}, true
+		// pseudo type: no recv/send.
+		return pgTypeEntry{269, "table_am_handler", 4, true, 'p', 'P', 'i', 'p', 267, 268, 0, 0}, true
 	case 325:
-		return pgTypeEntry{325, "index_am_handler", 4, true, 'p', 'P', 'i', 'p'}, true
+		// pseudo type: no recv/send.
+		return pgTypeEntry{325, "index_am_handler", 4, true, 'p', 'P', 'i', 'p', 326, 327, 0, 0}, true
 	case 700:
-		return pgTypeEntry{700, "float4", 4, true, 'b', 'N', 'i', 'p'}, true
+		return pgTypeEntry{700, "float4", 4, true, 'b', 'N', 'i', 'p', 200, 201, 2424, 2425}, true
 	case 701:
-		return pgTypeEntry{701, "float8", 8, true, 'b', 'N', 'd', 'p'}, true
+		return pgTypeEntry{701, "float8", 8, true, 'b', 'N', 'd', 'p', 214, 215, 2426, 2427}, true
 	case 1002:
-		return pgTypeEntry{1002, "_char", -1, false, 'b', 'A', 'i', 'x'}, true
+		return pgTypeEntry{1002, "_char", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1021:
-		return pgTypeEntry{1021, "_float4", -1, false, 'b', 'A', 'i', 'x'}, true
+		return pgTypeEntry{1021, "_float4", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1009:
-		return pgTypeEntry{1009, "_text", -1, false, 'b', 'A', 'i', 'x'}, true
+		return pgTypeEntry{1009, "_text", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1028:
-		return pgTypeEntry{1028, "_oid", -1, false, 'b', 'A', 'i', 'x'}, true
+		return pgTypeEntry{1028, "_oid", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1033:
-		return pgTypeEntry{1033, "aclitem", 12, false, 'b', 'U', 'i', 'p'}, true
+		// aclitem has only in/out (no binary recv/send in upstream).
+		return pgTypeEntry{1033, "aclitem", 12, false, 'b', 'U', 'i', 'p', 1031, 1032, 0, 0}, true
 	case 1034:
-		return pgTypeEntry{1034, "_aclitem", -1, false, 'b', 'A', 'i', 'x'}, true
+		return pgTypeEntry{1034, "_aclitem", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1042:
-		return pgTypeEntry{1042, "bpchar", -1, false, 'b', 'S', 'i', 'x'}, true
+		return pgTypeEntry{1042, "bpchar", -1, false, 'b', 'S', 'i', 'x', 1044, 1045, 2430, 2431}, true
 	case 1043:
-		return pgTypeEntry{1043, "varchar", -1, false, 'b', 'S', 'i', 'x'}, true
+		return pgTypeEntry{1043, "varchar", -1, false, 'b', 'S', 'i', 'x', 1046, 1047, 2432, 2433}, true
 	case 1184:
-		return pgTypeEntry{1184, "timestamptz", 8, true, 'b', 'D', 'd', 'p'}, true
+		return pgTypeEntry{1184, "timestamptz", 8, true, 'b', 'D', 'd', 'p', 1150, 1151, 2476, 2477}, true
 	case 1185:
-		return pgTypeEntry{1185, "_timestamptz", -1, false, 'b', 'A', 'd', 'x'}, true
+		return pgTypeEntry{1185, "_timestamptz", -1, false, 'b', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 2277:
-		return pgTypeEntry{2277, "anyarray", -1, false, 'p', 'P', 'i', 'x'}, true
+		return pgTypeEntry{2277, "anyarray", -1, false, 'p', 'P', 'i', 'x', 2296, 2297, 2502, 2503}, true
 	case 2281:
-		return pgTypeEntry{2281, "internal", 4, true, 'p', 'P', 'i', 'p'}, true
+		// pseudo type: no recv/send.
+		return pgTypeEntry{2281, "internal", 4, true, 'p', 'P', 'i', 'p', 2304, 2305, 0, 0}, true
 	case 3220:
-		return pgTypeEntry{3220, "pg_lsn", 8, true, 'b', 'U', 'd', 'p'}, true
+		return pgTypeEntry{3220, "pg_lsn", 8, true, 'b', 'U', 'd', 'p', 3229, 3230, 3238, 3239}, true
 	case 3361:
-		return pgTypeEntry{3361, "pg_ndistinct", -1, false, 'b', 'Z', 'i', 'x'}, true
+		return pgTypeEntry{3361, "pg_ndistinct", -1, false, 'b', 'Z', 'i', 'x', 3355, 3356, 3357, 3358}, true
 	case 3402:
-		return pgTypeEntry{3402, "pg_dependencies", -1, false, 'b', 'Z', 'i', 'x'}, true
+		return pgTypeEntry{3402, "pg_dependencies", -1, false, 'b', 'Z', 'i', 'x', 3404, 3405, 3406, 3407}, true
 	case 5017:
-		return pgTypeEntry{5017, "pg_mcv_list", -1, false, 'b', 'Z', 'i', 'x'}, true
+		return pgTypeEntry{5017, "pg_mcv_list", -1, false, 'b', 'Z', 'i', 'x', 5018, 5019, 5020, 5021}, true
 	case 10028:
 		// rowtype array for pg_statistic — typtype='c' carries no special
 		// meaning for the standby's TupleDescInitEntry path; the load-
-		// bearing fields are typalign='d' + typstorage='x'.
-		return pgTypeEntry{10028, "_pg_statistic", -1, false, 'c', 'A', 'd', 'x'}, true
+		// bearing fields are typalign='d' + typstorage='x'. Uses the
+		// generic array I/O quad like every other multi-dim array.
+		return pgTypeEntry{10028, "_pg_statistic", -1, false, 'c', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	}
 	return pgTypeEntry{}, false
 }
@@ -217,10 +240,10 @@ func pgTypeRow(e pgTypeEntry) executor.Row {
 		executor.NewIntDatum(0),                    // 13 typsubscript
 		executor.NewIntDatum(0),                    // 14 typelem
 		executor.NewIntDatum(0),                    // 15 typarray
-		executor.NewIntDatum(0),                    // 16 typinput
-		executor.NewIntDatum(0),                    // 17 typoutput
-		executor.NewIntDatum(0),                    // 18 typreceive
-		executor.NewIntDatum(0),                    // 19 typsend
+		executor.NewIntDatum(int64(e.Input)),       // 16 typinput
+		executor.NewIntDatum(int64(e.Output)),      // 17 typoutput
+		executor.NewIntDatum(int64(e.Receive)),     // 18 typreceive
+		executor.NewIntDatum(int64(e.Send)),        // 19 typsend
 		executor.NewIntDatum(0),                    // 20 typmodin
 		executor.NewIntDatum(0),                    // 21 typmodout
 		executor.NewIntDatum(0),                    // 22 typanalyze
