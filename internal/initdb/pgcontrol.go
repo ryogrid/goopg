@@ -23,7 +23,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
+
+	"github.com/goopg/goopg/internal/config"
 )
 
 // pgControlFile is the path (relative to the data directory) for the
@@ -49,6 +53,12 @@ const (
 	pgFirstGenbkiOID  = uint32(10000) // FirstGenbkiObjectId
 	pgFirstMultiXact  = uint32(1)     // FirstMultiXactId
 	pgTemplate1DbOID  = uint32(1)     // Template1DbOid
+
+	// pgFirstNormalUnloggedLSN mirrors FirstNormalUnloggedLSN
+	// (src/include/access/xlogdefs.h:37). Unlogged relations use a
+	// monotonically-increasing fake LSN space starting at 1000 so they
+	// are always treated as "newer than any real WAL" by recovery logic.
+	pgFirstNormalUnloggedLSN = uint64(1000)
 )
 
 // dbStateShutdowned mirrors PostgreSQL's DB_SHUTDOWNED enum value.
@@ -63,13 +73,55 @@ var crcCastagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 // <dataDir>/global/pg_control. The file is 8192 bytes (PG_CONTROL_FILE_SIZE)
 // with a 296-byte ControlFileData struct at the start and zeros elsewhere.
 // systemID must match the cluster's system_identifier (see LoadOrCreateSystemID).
-func writePgControl(dataDir string, systemID uint64) error {
-	buf := buildPgControl(systemID, time.Now())
+func writePgControl(dataDir string, systemID uint64, cfg *config.Registry) error {
+	buf := buildPgControl(systemID, time.Now(), cfg)
 	path := filepath.Join(dataDir, pgControlFile)
 	if err := os.WriteFile(path, buf, 0o600); err != nil {
 		return fmt.Errorf("goopg: write pg_control: %w", err)
 	}
 	return nil
+}
+
+// gucInt reads an integer GUC from reg, returning def when reg is nil,
+// the GUC is absent, or its value is unparseable. Mirrors upstream's
+// C-side GUC variable access pattern (xlog.c:4223-4227).
+func gucInt(reg *config.Registry, name string, def int32) int32 {
+	if reg == nil {
+		return def
+	}
+	v, ok := reg.Get(name)
+	if !ok || v.Value == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v.Value, 10, 32)
+	if err != nil {
+		return def
+	}
+	return int32(n)
+}
+
+// walLevelInt maps the wal_level GUC enum string to the C WAL_LEVEL_*
+// integer stored in ControlFileData (xlog.c:4228):
+//
+//	minimal=0, replica=1, logical=2.
+//
+// Returns 1 (replica) when reg is nil or the GUC is absent.
+func walLevelInt(reg *config.Registry) uint32 {
+	if reg == nil {
+		return 1
+	}
+	v, ok := reg.Get("wal_level")
+	if !ok {
+		return 1
+	}
+	switch strings.ToLower(v.Value) {
+	case "minimal":
+		return 0
+	case "logical":
+		return 2
+	default:
+		return 1 // replica
+	}
 }
 
 // dbStateInProduction mirrors PostgreSQL's DB_IN_PRODUCTION enum value (6).
@@ -151,7 +203,7 @@ func UpdateControlCheckpoint(dataDir string, redoLSN uint64) error {
 // the given system identifier and timestamp. The payload is 8192 bytes
 // total; the first 296 bytes are the ControlFileData struct, the rest
 // is zero padding (matching upstream's WriteControlFile).
-func buildPgControl(systemID uint64, now time.Time) []byte {
+func buildPgControl(systemID uint64, now time.Time, cfg *config.Registry) []byte {
 	file := make([]byte, pgControlFileSize)
 	hdr := file[:pgControlDataSize]
 
@@ -185,8 +237,8 @@ func buildPgControl(systemID uint64, now time.Time) []byte {
 	// offset 56: CheckPoint.fullPageWrites (bool) — GUC default on
 	hdr[56] = 1
 	// offset 57-59: padding (zero)
-	// offset 60: CheckPoint.wal_level (int) — replica=1
-	le.PutUint32(hdr[60:], 1)
+	// offset 60: CheckPoint.wal_level (int) — live GUC
+	le.PutUint32(hdr[60:], walLevelInt(cfg))
 	// offset 64: CheckPoint.nextXid (FullTransactionId=uint64) — FirstNormalTransactionId=3
 	le.PutUint64(hdr[64:], pgFirstNormalXID)
 	// offset 72: CheckPoint.nextOid (Oid=uint32) — FirstGenbkiObjectId=10000
@@ -214,8 +266,8 @@ func buildPgControl(systemID uint64, now time.Time) []byte {
 	le.PutUint32(hdr[120:], 0)
 	// offset 124-127: 4-byte tail padding (zero)
 
-	// unloggedLSN (XLogRecPtr): offset 128
-	le.PutUint64(hdr[128:], 0)
+	// unloggedLSN (XLogRecPtr): offset 128 — FirstNormalUnloggedLSN=1000
+	le.PutUint64(hdr[128:], pgFirstNormalUnloggedLSN)
 	// minRecoveryPoint (XLogRecPtr): offset 136
 	le.PutUint64(hdr[136:], 0)
 	// minRecoveryPointTLI (TimeLineID/uint32): offset 144
@@ -228,21 +280,21 @@ func buildPgControl(systemID uint64, now time.Time) []byte {
 	// backupEndRequired (bool): offset 168
 	hdr[168] = 0
 	// pad 3: 169..172
-	// wal_level (int): offset 172 — replica
-	le.PutUint32(hdr[172:], 1)
+	// wal_level (int): offset 172 — live GUC (replica=1)
+	le.PutUint32(hdr[172:], walLevelInt(cfg))
 	// wal_log_hints (bool): offset 176
 	hdr[176] = 0
 	// pad 3: 177..180
-	// MaxConnections (int): offset 180
-	le.PutUint32(hdr[180:], 100)
-	// max_worker_processes (int): offset 184
-	le.PutUint32(hdr[184:], 8)
-	// max_wal_senders (int): offset 188
-	le.PutUint32(hdr[188:], 10)
-	// max_prepared_xacts (int): offset 192
-	le.PutUint32(hdr[192:], 0)
-	// max_locks_per_xact (int): offset 196
-	le.PutUint32(hdr[196:], 64)
+	// MaxConnections (int): offset 180 — live GUC
+	le.PutUint32(hdr[180:], uint32(gucInt(cfg, "max_connections", 100)))
+	// max_worker_processes (int): offset 184 — live GUC
+	le.PutUint32(hdr[184:], uint32(gucInt(cfg, "max_worker_processes", 8)))
+	// max_wal_senders (int): offset 188 — live GUC
+	le.PutUint32(hdr[188:], uint32(gucInt(cfg, "max_wal_senders", 10)))
+	// max_prepared_xacts (int): offset 192 — live GUC (max_prepared_transactions)
+	le.PutUint32(hdr[192:], uint32(gucInt(cfg, "max_prepared_transactions", 0)))
+	// max_locks_per_xact (int): offset 196 — live GUC (max_locks_per_transaction)
+	le.PutUint32(hdr[196:], uint32(gucInt(cfg, "max_locks_per_transaction", 64)))
 	// track_commit_timestamp (bool): offset 200
 	hdr[200] = 0
 	// pad 3: 201..204

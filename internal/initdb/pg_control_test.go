@@ -5,6 +5,8 @@ import (
 	"math"
 	"testing"
 	"time"
+
+	"github.com/goopg/goopg/internal/config"
 )
 
 // TestBuildPgControlCheckpointFields verifies that buildPgControl fills the
@@ -15,7 +17,7 @@ import (
 func TestBuildPgControlCheckpointFields(t *testing.T) {
 	const sysID = uint64(0xABCDEF0123456789)
 	before := time.Now()
-	buf := buildPgControl(sysID, before)
+	buf := buildPgControl(sysID, before, nil)
 	after := time.Now()
 
 	le := binary.LittleEndian
@@ -152,7 +154,7 @@ func TestBuildPgControlCheckpointFields(t *testing.T) {
 // TestBuildPgControlFileSize verifies the total file size and that zero-pad
 // bytes beyond the active payload are all zero.
 func TestBuildPgControlFileSize(t *testing.T) {
-	buf := buildPgControl(0x1234567890ABCDEF, time.Now())
+	buf := buildPgControl(0x1234567890ABCDEF, time.Now(), nil)
 	if len(buf) != pgControlFileSize {
 		t.Fatalf("buildPgControl: len=%d, want %d", len(buf), pgControlFileSize)
 	}
@@ -169,7 +171,7 @@ func TestBuildPgControlFileSize(t *testing.T) {
 // maxAlign, floatFormat, blcksz, relseg_size, xlog_blcksz, xlog_seg_size,
 // nameDataLen, indexMaxKeys, toast_max_chunk_size, loblksize, float8ByVal.
 func TestBuildPgControlCompatibilityFields(t *testing.T) {
-	buf := buildPgControl(0, time.Now())
+	buf := buildPgControl(0, time.Now(), nil)
 	le := binary.LittleEndian
 
 	checks := []struct {
@@ -212,5 +214,65 @@ func TestBuildPgControlCompatibilityFields(t *testing.T) {
 	// float8ByVal (bool) at offset 248 — true on 64-bit platforms
 	if buf[248] != 1 {
 		t.Errorf("float8ByVal at offset 248: got %d, want 1", buf[248])
+	}
+}
+
+// TestBuildPgControlUnloggedLSN verifies that unloggedLSN at offset 128 is
+// set to FirstNormalUnloggedLSN=1000, not zero. A zero value causes PG's
+// CreateUnloggedFile to treat every unlogged relation as if it were at the
+// start of the LSN space, which confuses recovery (xlogdefs.h:37).
+func TestBuildPgControlUnloggedLSN(t *testing.T) {
+	buf := buildPgControl(0, time.Now(), nil)
+	le := binary.LittleEndian
+	got := le.Uint64(buf[128:])
+	if got != pgFirstNormalUnloggedLSN {
+		t.Errorf("unloggedLSN at offset 128: got %d, want %d (FirstNormalUnloggedLSN)",
+			got, pgFirstNormalUnloggedLSN)
+	}
+}
+
+// TestBuildPgControlGUCWiring verifies that the six GUC echo fields in
+// pg_control (wal_level, MaxConnections, max_worker_processes,
+// max_wal_senders, max_prepared_xacts, max_locks_per_xact) are read from
+// the supplied *config.Registry rather than hard-coded constants when a
+// non-nil registry is passed. A standby's CheckRequiredParameterValues
+// (xlog.c:5423) fatals if these values fall below the primary's.
+func TestBuildPgControlGUCWiring(t *testing.T) {
+	reg := config.BuildDefaultRegistry()
+	// Set non-default values so the test would fail if defaults are used.
+	for name, val := range map[string]string{
+		"max_connections":         "200",
+		"max_worker_processes":    "16",
+		"max_wal_senders":         "20",
+		"max_prepared_transactions": "5",
+		"max_locks_per_transaction": "128",
+		"wal_level":               "logical",
+	} {
+		if err := reg.Set(name, val, config.SourceCommandLine); err != nil {
+			t.Fatalf("reg.Set(%q, %q): %v", name, val, err)
+		}
+	}
+
+	buf := buildPgControl(0, time.Now(), reg)
+	le := binary.LittleEndian
+
+	checks := []struct {
+		offset int
+		want   uint32
+		name   string
+	}{
+		{60, 2, "checkPointCopy.wal_level (logical=2)"},
+		{172, 2, "wal_level (logical=2)"},
+		{180, 200, "MaxConnections"},
+		{184, 16, "max_worker_processes"},
+		{188, 20, "max_wal_senders"},
+		{192, 5, "max_prepared_xacts"},
+		{196, 128, "max_locks_per_xact"},
+	}
+	for _, c := range checks {
+		if got := le.Uint32(buf[c.offset:]); got != c.want {
+			t.Errorf("%s at offset %d: got %d, want %d",
+				c.name, c.offset, got, c.want)
+		}
 	}
 }

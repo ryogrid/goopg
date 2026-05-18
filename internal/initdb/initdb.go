@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
@@ -139,6 +140,15 @@ type Options struct {
 	// doesn't exist; if it exists and is non-empty, init refuses
 	// (matching upstream initdb's "directory not empty" guard).
 	DataDir string
+
+	// Registry, when non-nil, is the server's live GUC registry.
+	// Its values for max_connections, max_worker_processes,
+	// max_wal_senders, max_prepared_transactions,
+	// max_locks_per_transaction, and wal_level are echoed into
+	// global/pg_control so a standby's CheckRequiredParameterValues
+	// sees the primary's resource sizing. When nil, hard-coded
+	// upstream defaults are used.
+	Registry *config.Registry
 }
 
 // Init lays out the data directory according to opts.
@@ -439,7 +449,7 @@ func Init(opts Options) error {
 	// Write the PG-compatible pg_control file so pg_controldata,
 	// pg_checksums, and other client tools can inspect the cluster
 	// (M0095-0001).
-	if err := writePgControl(abs, sysID); err != nil {
+	if err := writePgControl(abs, sysID, opts.Registry); err != nil {
 		return fmt.Errorf("goopg init: pg_control: %w", err)
 	}
 	return nil

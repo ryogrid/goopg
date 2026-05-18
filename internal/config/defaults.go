@@ -139,6 +139,27 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
+	// Resource-sizing GUCs echoed into global/pg_control by InitControlFile
+	// (xlog.c:4223-4227) so a standby's CheckRequiredParameterValues can
+	// verify it has at least as many resources as the primary.
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_worker_processes", Type: TypeInt, BootVal: "8",
+		MinVal: 0, MaxVal: 262143,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_prepared_transactions", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: 262143,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_locks_per_transaction", Type: TypeInt, BootVal: "64",
+		MinVal: 10, MaxVal: 2147483647,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "scram_iterations", Type: TypeInt, BootVal: "4096",
 		MinVal: 1, MaxVal: 1 << 30,
