@@ -2439,10 +2439,22 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         pg_am bootstrap + PageXLogRecPtr LSN encoding + Cluster.Kill
         SIGKILL of the process group) holds end-to-end against vanilla PG.
 
-- [ ] **M0106-0007**
+- [x] **M0106-0007**
       - Summary: Close milestone.
       - Update milestone doc to accepted. Update design doc to accepted.
         Run regression suite. Mark all tasks [x].
+      - COMPLETE 2026-05-20: Milestone doc → accepted; bootstrap-procedure
+        README → accepted; regression suite passed (go test ./internal/wal/...
+        and all previously-passing packages still pass). Fixed two pre-existing
+        test regressions introduced in M0102-0007/M0105-0007:
+        (1) TestCheckpointerWritesCheckpointMarkers — checkpointer now writes
+            88-byte PG-compat checkpoints when PGCompatCheckpoints=true (set in
+            open.go); legacy tests default to false and get 1-byte marker.
+        (2) TestEncodeRecordXLogClassifiesXactCommitXID — updated to reflect
+            M0105-0007 change that routes all goopg-internal records through
+            RmgrXLog/xlogInfoDefault so PG's xlog_redo skips them safely.
+        Also fixed replayStart + DiscoverLastCheckpointLSN to detect 88-byte
+        checkpoint payloads so crash-recovery optimization works on PGCompat WAL.
 
 - [x] **M0106-0008**
       - Summary: Populate pg_class heap tuples for nailed relations, and

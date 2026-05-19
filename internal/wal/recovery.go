@@ -2028,6 +2028,10 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 	if len(r.Payload) == 0 {
 		return false, errors.New("wal: empty record payload")
 	}
+	// PG-compat checkpoint (88 bytes) in legacy WAL: treat as no-op.
+	if isCheckpointRecord(r) && len(r.Payload) == 88 {
+		return false, nil
+	}
 	switch r.Payload[0] {
 	case RecordKindPageImage:
 		if err := replayPageImage(mgr, r.Payload); err != nil {
@@ -3238,15 +3242,27 @@ func replayStart(records []Record) (int, uint64) {
 	startIdx := 0
 	var checkpointLSN uint64
 	for i, r := range records {
-		if len(r.Payload) == 0 {
-			continue
-		}
-		if r.Payload[0] == RecordKindCheckpoint {
+		if isCheckpointRecord(r) {
 			startIdx = i // start FROM this checkpoint (inclusive)
 			checkpointLSN = r.EndLSN
 		}
 	}
 	return startIdx, checkpointLSN
+}
+
+// isCheckpointRecord returns true if r is a checkpoint WAL record in
+// either the legacy 1-byte format (RecordKindCheckpoint) or the
+// PG-compat 88-byte CheckPoint struct format.
+func isCheckpointRecord(r Record) bool {
+	if len(r.Payload) == 1 && r.Payload[0] == RecordKindCheckpoint {
+		return true
+	}
+	// PG-compat checkpoint: 88-byte CheckPoint struct (EncodeCheckpointCompat).
+	// classifyXLogRecord uses the same size heuristic.
+	if len(r.Payload) == 88 {
+		return true
+	}
+	return false
 }
 
 // DiscoverLastCheckpointLSN scans the WAL directory for the most
@@ -3277,7 +3293,7 @@ func DiscoverLastCheckpointLSN(walDir string, segmentSize int64) (uint64, error)
 	// Scan for the LAST checkpoint record in the retained range.
 	var lastLSN uint64
 	for _, r := range records {
-		if len(r.Payload) > 0 && r.Payload[0] == RecordKindCheckpoint {
+		if isCheckpointRecord(r) {
 			lastLSN = r.EndLSN
 		}
 	}

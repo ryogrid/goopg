@@ -112,6 +112,13 @@ type CheckpointerConfig struct {
 	// Errors are logged as warnings and do not fail the checkpoint.
 	// M0106-0011 follow-up (b).
 	PostCheckpointFn func() error
+
+	// PGCompatCheckpoints, when true, writes an 88-byte PG18 CheckPoint
+	// struct (EncodeCheckpointCompat) so PG standbys can parse the
+	// record. When false (default), the legacy 1-byte RecordKindCheckpoint
+	// marker is used. Set to true by initdb.Open; tests that do not need
+	// PG compatibility leave this false so legacy detection code works.
+	PGCompatCheckpoints bool
 }
 
 func (c *CheckpointerConfig) withDefaults() {
@@ -385,7 +392,13 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 	if c.cfg.NextXIDFn != nil {
 		nextXid = c.cfg.NextXIDFn()
 	}
-	startLSN, endLSN, err := c.wal.Append(EncodeCheckpointCompat(redoLSN0, 1, nextXid))
+	var checkpointPayload []byte
+	if c.cfg.PGCompatCheckpoints {
+		checkpointPayload = EncodeCheckpointCompat(redoLSN0, 1, nextXid)
+	} else {
+		checkpointPayload = EncodeCheckpoint()
+	}
+	startLSN, endLSN, err := c.wal.Append(checkpointPayload)
 	if err != nil {
 		return fmt.Errorf("append checkpoint marker: %w", err)
 	}

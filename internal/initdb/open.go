@@ -907,9 +907,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	defaultGUC := wal.DefaultGUCParameters()
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{
-		DataDir:     abs,
-		SegmentSize: walCfg.SegmentSize,
-		GUCParams:   defaultGUC,
+		DataDir:             abs,
+		SegmentSize:         walCfg.SegmentSize,
+		GUCParams:           defaultGUC,
+		PGCompatCheckpoints: true,
 		// M0106-0010 batched-45: refresh checkPointCopy.nextXid into
 		// pg_control at every checkpoint from the live mvcc manager.
 		// batched-47: DataDir above was previously unset on the runtime

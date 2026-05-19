@@ -67,6 +67,10 @@ func TestDecodeRecordXLogRejectsBadMainDataTag(t *testing.T) {
 }
 
 func TestEncodeRecordXLogClassifiesXactCommitXID(t *testing.T) {
+	// Goopg-internal records (non-canonical) are routed through RmgrXLog
+	// with xlogInfoDefault so PG's xlog_redo skips them safely (M0105-0007).
+	// XID is 0 in the header for non-canonical records; canonical records
+	// (0xFE prefix) carry the full XID for logical-replication consumers.
 	payload := EncodeXactCommit(4242)
 	enc, _, err := encodeRecordXLog(payload, 0)
 	if err != nil {
@@ -76,10 +80,10 @@ func TestEncodeRecordXLogClassifiesXactCommitXID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.Rmid != RmgrXact {
-		t.Fatalf("rmid = %d, want %d", h.Rmid, RmgrXact)
+	if h.Rmid != RmgrXLog {
+		t.Fatalf("rmid = %d, want %d (RmgrXLog)", h.Rmid, RmgrXLog)
 	}
-	if h.XID != 4242 {
-		t.Fatalf("xid = %d, want 4242", h.XID)
+	if h.XID != 0 {
+		t.Fatalf("xid = %d, want 0 (non-canonical records carry no XID)", h.XID)
 	}
 }
