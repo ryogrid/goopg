@@ -1073,3 +1073,110 @@ func TestApplyRecordXactCommitInvalUnlinksInitFiles(t *testing.T) {
 		}
 	}
 }
+
+func TestDiscoverLastWALTLI_Empty(t *testing.T) {
+	dir := t.TempDir()
+	tli, err := DiscoverLastWALTLI(dir)
+	if err != nil {
+		t.Fatalf("DiscoverLastWALTLI on empty dir: %v", err)
+	}
+	if tli != 0 {
+		t.Errorf("got TLI %d, want 0 for empty directory", tli)
+	}
+}
+
+func TestDiscoverLastWALTLI_NotExist(t *testing.T) {
+	tli, err := DiscoverLastWALTLI(filepath.Join(t.TempDir(), "missing"))
+	if err != nil {
+		t.Fatalf("DiscoverLastWALTLI on missing dir: %v", err)
+	}
+	if tli != 0 {
+		t.Errorf("got TLI %d, want 0 for missing directory", tli)
+	}
+}
+
+func TestDiscoverLastWALTLI_PGCompat(t *testing.T) {
+	dir := t.TempDir()
+	// TLI=2, segment 1 (PG-compat 24-char name)
+	if err := os.WriteFile(filepath.Join(dir, "000000020000000000000001"), []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// TLI=1 segment (lower TLI)
+	if err := os.WriteFile(filepath.Join(dir, "000000010000000000000001"), []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Non-segment file (should be ignored)
+	if err := os.WriteFile(filepath.Join(dir, "archive_status"), []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tli, err := DiscoverLastWALTLI(dir)
+	if err != nil {
+		t.Fatalf("DiscoverLastWALTLI: %v", err)
+	}
+	if tli != 2 {
+		t.Errorf("got TLI %d, want 2", tli)
+	}
+}
+
+func TestWriteHistoryAfterRecovery_NoChange(t *testing.T) {
+	dir := t.TempDir()
+	// WAL segment on TLI=1 (same as persisted)
+	if err := os.WriteFile(filepath.Join(dir, "000000010000000000000001"), []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newTLI, wrote, err := WriteHistoryAfterRecovery(dir, 1, 0)
+	if err != nil {
+		t.Fatalf("WriteHistoryAfterRecovery: %v", err)
+	}
+	if wrote {
+		t.Error("wrote=true, want false when WAL TLI == persistedTLI")
+	}
+	if newTLI != 1 {
+		t.Errorf("newTLI=%d, want 1", newTLI)
+	}
+}
+
+func TestWriteHistoryAfterRecovery_Bump(t *testing.T) {
+	dir := t.TempDir()
+	// WAL segment on TLI=2 but persistedTLI=1
+	if err := os.WriteFile(filepath.Join(dir, "000000020000000000000001"), []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newTLI, wrote, err := WriteHistoryAfterRecovery(dir, 1, 0x1000)
+	if err != nil {
+		t.Fatalf("WriteHistoryAfterRecovery: %v", err)
+	}
+	if !wrote {
+		t.Error("wrote=false, want true when WAL TLI > persistedTLI")
+	}
+	if newTLI != 2 {
+		t.Errorf("newTLI=%d, want 2", newTLI)
+	}
+	// Verify history file was written with the right content
+	histPath := filepath.Join(dir, TimelineHistoryFileName(2))
+	body, err := os.ReadFile(histPath)
+	if err != nil {
+		t.Fatalf("read history file: %v", err)
+	}
+	if len(body) == 0 {
+		t.Fatal("history file is empty")
+	}
+	// First field is the parent TLI
+	if len(body) < 2 || body[0] != '1' || body[1] != '\t' {
+		t.Errorf("history file content does not start with TLI=1 entry: %q", body)
+	}
+}
+
+func TestWriteHistoryAfterRecovery_EmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	newTLI, wrote, err := WriteHistoryAfterRecovery(dir, 1, 0)
+	if err != nil {
+		t.Fatalf("WriteHistoryAfterRecovery on empty dir: %v", err)
+	}
+	if wrote {
+		t.Error("wrote=true, want false for empty walDir")
+	}
+	if newTLI != 1 {
+		t.Errorf("newTLI=%d, want 1", newTLI)
+	}
+}

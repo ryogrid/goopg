@@ -554,6 +554,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if rt != nil && rt.Standby {
 		sc = startStandby(ctx, rt, registry, logger)
 		cfg.Promote = boundPromoteToServer(sc)
+		cfg.IsStandby = func() bool { return sc.rt.Standby }
 	}
 
 	srv := server.New(cfg)

@@ -206,6 +206,10 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
 	}
 	ectx.DataDir = s.cfg.DataDir
+	ectx.Promote = s.cfg.Promote
+	if s.cfg.IsStandby != nil {
+		ectx.IsStandby = s.cfg.IsStandby()
+	}
 
 	// Update pg_stat_activity before dispatching.
 	if reg := s.cfg.Activity; reg != nil {

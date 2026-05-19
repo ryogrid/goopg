@@ -154,6 +154,12 @@ type Config struct {
 	// already-primary process from a stray `goopg promote`.
 	Promote func() error
 
+	// IsStandby, when non-nil, returns true if the server is currently
+	// acting as a hot standby. pg_is_in_recovery() calls this on every
+	// query. nil makes pg_is_in_recovery() return false (primary mode).
+	// M0106-0010 batched-34.
+	IsStandby func() bool
+
 	// AutovacuumLauncher, when set, is started as a background
 	// goroutine during Run. nil disables autovacuum.
 	AutovacuumLauncher *autovacuum.Launcher

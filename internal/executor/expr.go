@@ -3877,6 +3877,23 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
 	case "localtimestamp":
 		return NewTimeDatum(ctx.Now), nil
+	case "pg_is_in_recovery":
+		return NewBoolDatum(ctx.IsStandby), nil
+	case "pg_promote":
+		// pg_promote(wait boolean DEFAULT true, wait_seconds integer DEFAULT 60)
+		// Returns true if this server is a standby and promotion was triggered.
+		// Returns false without error when not a standby (mirrors upstream).
+		if ctx.Promote == nil {
+			return NewBoolDatum(false), nil
+		}
+		if err := ctx.Promote(); err != nil {
+			return Datum{}, &ExecError{
+				Code:    "XX000",
+				Pos:     x.Pos(),
+				Message: "pg_promote: " + err.Error(),
+			}
+		}
+		return NewBoolDatum(true), nil
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.

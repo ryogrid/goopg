@@ -10038,7 +10038,7 @@ relcache init → replication readiness) and intra-package grouped.
       - Test: `internal/wal/parameter_change_test.go` (new).
       - Risk gate: wal/replication.
 
-- [ ] **M0106-0010 batched-34** (bootstrap-procedure task 34)
+- [x] **M0106-0010 batched-34** (bootstrap-procedure task 34)
       - Summary: Wire `wal.WriteHistory` into the primary-initiated
         promotion path (post-recovery TLI bump, `pg_promote()` SQL
         function) — already wired for standby-initiated promotion.
@@ -10046,6 +10046,33 @@ relcache init → replication readiness) and intra-package grouped.
       - Files: `internal/wal/recovery.go`, `cmd/goopg/standby.go`.
       - Test: `internal/testport/e2e_failover_*` extended.
       - Risk gate: wal/replication.
+      - COMPLETE 2026-05-19 (loop 20):
+        - `wal.DiscoverLastWALTLI(walDir)` — scans PG-compat WAL segment
+          filenames (TLI/Log/Seg hex triplets) and returns highest TLI seen.
+        - `wal.WriteHistoryAfterRecovery(walDir, persistedTLI, switchLSN)`
+          — writes <newTLI>.history if WAL segments carry a higher TLI than
+          persistedTLI; callers must then call `initdb.WriteTimelineID` to
+          persist newTLI.
+        - `internal/initdb/open.go`: after `LoadOrCreateTimelineID`, when
+          NOT in standby mode, calls `wal.WriteHistoryAfterRecovery` and
+          `WriteTimelineID` to fix any TLI mismatch left by a crash between
+          history-file write and timeline_id update. (M0106-0010 batched-34)
+        - `executor.Context.Promote func() error` + `IsStandby bool` —
+          new fields consumed by `pg_promote()` and `pg_is_in_recovery()`.
+        - `server.Config.IsStandby func() bool` — live standby predicate
+          wired from `cmd/goopg/main.go` → `sc.rt.Standby` closure.
+        - `internal/server/dispatch.go` wires `ectx.Promote` and
+          `ectx.IsStandby` from `s.cfg.*`.
+        - `internal/executor/expr.go` adds `pg_promote` and
+          `pg_is_in_recovery` cases in `evalFuncCall`; `pg_promote` calls
+          `ctx.Promote()` and returns bool; `pg_is_in_recovery` returns
+          `ctx.IsStandby`.
+        - `e2e_failover_pg_to_goopg_test.go` extended: after
+          `runGoopgPromote`, asserts `pg_wal/00000002.history` exists.
+        - 6 new unit tests in `internal/wal/recovery_test.go` — all PASS.
+        - Pre-existing `TestStandbyControllerPromoteWritesTimelineHistory`
+          still PASS; `TestSynchronousCommitFlushesByDefault` pre-existing
+          fail (M0106-0012) unaffected. Commit: (this loop).
 
 - [ ] **M0106-0010 batched-35** (bootstrap-procedure task 35 — E2E gate)
       - Summary: Run `TestE2E_FailoverGoopgToPG/async` end-to-end and

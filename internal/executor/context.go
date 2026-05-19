@@ -208,6 +208,16 @@ type Context struct {
 	// mutations. Set only when the WAL writer is in PageHeaders mode (PG-compat WAL);
 	// nil in tests and legacy-WAL configurations. M0106-0010 batched-32.
 	LogCanonical catalog.LogCanonicalFunc
+
+	// Promote, when non-nil, is invoked by pg_promote() to trigger the
+	// standby-to-primary promotion sequence. nil means the server is not
+	// a standby (or pg_promote is not yet wired) — pg_promote() returns
+	// false without error. M0106-0010 batched-34.
+	Promote func() error
+
+	// IsStandby reflects whether the server is currently acting as a hot
+	// standby. pg_is_in_recovery() returns this value. M0106-0010 batched-34.
+	IsStandby bool
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.

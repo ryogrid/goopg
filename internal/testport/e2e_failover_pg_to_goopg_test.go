@@ -234,6 +234,14 @@ func runFailoverPGToGoopg(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	if err := runGoopgPromote(repo, standby.DataDir()); err != nil {
 		t.Fatalf("goopg promote: %v", err)
 	}
+
+	// M0106-0010 batched-34: verify finalizePromotion wrote the TLI-2
+	// history file so downstream PG standbys can follow the history chain.
+	histPath := filepath.Join(standby.DataDir(), "pg_wal", "00000002.history")
+	if _, err := os.Stat(histPath); os.IsNotExist(err) {
+		t.Fatalf("timeline history file missing after promotion: %s", histPath)
+	}
+
 	if err := runMultiHostInsert(repo, psqlBin, primary, standby,
 		"INSERT INTO public.bench_log (client, src) VALUES (-1, 'post')"); err != nil {
 		t.Fatalf("post-failover insert: %v", err)

@@ -262,6 +262,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: timeline_id: %w", err)
 	}
 
+	// M0106-0010 batched-34: post-recovery primary TLI bump.
+	// If WAL segments carry a higher TLI than the persisted timeline_id
+	// (e.g. crash after receiving streaming WAL on a new TLI but before
+	// timeline_id was updated), write the missing history file and advance
+	// timeline_id. Skip in standby mode — finalizePromotion handles the bump.
+	if abs != "" {
+		isStby, _ := IsStandby(abs)
+		if !isStby {
+			walDir := filepath.Join(abs, "pg_wal")
+			if newTLI, wrote, tliErr := wal.WriteHistoryAfterRecovery(walDir, tli, 0); tliErr != nil {
+				_ = mgr.Close()
+				return nil, fmt.Errorf("goopg: post-recovery TLI check: %w", tliErr)
+			} else if wrote {
+				if err := WriteTimelineID(abs, newTLI); err != nil {
+					_ = mgr.Close()
+					return nil, fmt.Errorf("goopg: update timeline_id after TLI recovery: %w", err)
+				}
+				tli = newTLI
+			}
+		}
+	}
+
 	walCfg := wal.Config{
 		WALDir:             filepath.Join(abs, "pg_wal"),
 		SegmentSize:        opts.WALSegmentSize, // 0 → wal.DefaultSegmentSize

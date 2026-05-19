@@ -3266,3 +3266,70 @@ func replaySmgrTruncate(mgr *storage.Manager, payload []byte) error {
 	}
 	return mgr.TruncateRelation(rel)
 }
+
+// DiscoverLastWALTLI returns the highest timeline ID found in PG-compat
+// WAL segment filenames (format: <TLI:8hex><LogNo:8hex><SegNo:8hex>) under
+// walDir. Returns 0 if walDir is empty, does not exist, or contains only
+// legacy (non-PG-compat) segment files.
+func DiscoverLastWALTLI(walDir string) (uint32, error) {
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("wal: list %s: %w", walDir, err)
+	}
+	var maxTLI uint32
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		tli, _, ok := ParseXLogFileName(e.Name(), 0)
+		if !ok {
+			continue
+		}
+		if tli > maxTLI {
+			maxTLI = tli
+		}
+	}
+	return maxTLI, nil
+}
+
+// WriteHistoryAfterRecovery checks whether the WAL directory contains
+// segments on a timeline higher than persistedTLI and, if so, writes the
+// missing <newTLI>.history file.  switchLSN is used as the end-of-life LSN
+// for the old timeline entry (0 is valid — means "unknown at crash time").
+//
+// Returns (persistedTLI, false, nil) when no bump is needed (walTLI ≤
+// persistedTLI or walDir is empty).  Returns (newTLI, true, nil) when a
+// history file was written.
+//
+// Callers should update the persisted timeline_id to newTLI after a
+// successful bump (wrote == true).
+func WriteHistoryAfterRecovery(walDir string, persistedTLI uint32, switchLSN uint64) (newTLI uint32, wrote bool, err error) {
+	walTLI, err := DiscoverLastWALTLI(walDir)
+	if err != nil {
+		return persistedTLI, false, err
+	}
+	if walTLI == 0 || walTLI <= persistedTLI {
+		return persistedTLI, false, nil
+	}
+	// WAL segments carry a higher TLI than the timeline_id file. This
+	// can happen when the server crashed after receiving a streaming
+	// timeline switch but before the timeline_id file was updated (e.g.
+	// crash between WriteHistory and WriteTimelineID in finalizePromotion).
+	// Reconstruct the history chain and write the missing file.
+	prev, err := ReadHistory(walDir, persistedTLI)
+	if err != nil {
+		return persistedTLI, false, fmt.Errorf("wal: read history for TLI %d: %w", persistedTLI, err)
+	}
+	entries := append(prev, TimelineHistoryEntry{
+		TLI:       persistedTLI,
+		SwitchLSN: switchLSN,
+		Reason:    "recovered after primary promotion",
+	})
+	if werr := WriteHistory(walDir, walTLI, entries); werr != nil {
+		return persistedTLI, false, fmt.Errorf("wal: write history for TLI %d: %w", walTLI, werr)
+	}
+	return walTLI, true, nil
+}
