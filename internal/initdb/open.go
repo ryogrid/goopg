@@ -867,6 +867,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: index DDL replay: %w", err)
 	}
 
+	// M0106-0011 follow-up (b): regenerate pg_internal.init files after
+	// WAL recovery completes. Crash recovery replays
+	// RecordKindXactCommitInval records which UNLINK the init files
+	// (mirrors PG's standby-side redo) but does not regenerate them.
+	// Without this, PG standbys that attach via pg_basebackup after a
+	// crash restart would find missing init files until the first DDL
+	// commit. Non-fatal: the PostCheckpointFn hook regenerates on the
+	// next checkpoint as a belt-and-suspenders fallback.
+	if abs != "" {
+		if err := bootstrapRelcacheInitFiles(abs); err != nil {
+			slog.Default().Warn("post-recovery relcache init file regeneration failed", "err", err)
+		}
+	}
+
 	// Replication-slot registry. The retention path on the
 	// checkpointer (wired below in cmd/goopg start once the GUC
 	// values are known) consults this to decide which WAL
@@ -906,6 +920,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// after the basebackup hid every user tuple created by goopg
 		// after initdb.
 		NextXIDFn: func() uint64 { return uint64(txnMgr.NextXID()) },
+		// M0106-0011 follow-up (b): regenerate pg_internal.init after
+		// each checkpoint so PG standbys can always attach. Uses
+		// WithRelCacheInitLock to prevent TOCTOU races with concurrent
+		// backend startup reading the init files.
+		PostCheckpointFn: func() error {
+			if abs == "" {
+				return nil
+			}
+			return catalog.WithRelCacheInitLock(func() error {
+				return bootstrapRelcacheInitFiles(abs)
+			})
+		},
 	})
 
 	// Surface the M0002 checkpointer counters as the

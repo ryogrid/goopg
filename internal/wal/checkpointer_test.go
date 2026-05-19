@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"log/slog"
 	"os"
@@ -641,6 +642,65 @@ func TestCheckpointerWritesNextXidIntoPgControl(t *testing.T) {
 	gotCRC := le.Uint32(got[292:])
 	if gotCRC != wantCRC {
 		t.Errorf("CRC mismatch: got %#x want %#x", gotCRC, wantCRC)
+	}
+}
+
+// TestCheckpointerCallsPostCheckpointFn verifies that runCheckpoint invokes
+// PostCheckpointFn exactly once after a successful checkpoint and that an
+// error returned by the hook is swallowed (non-fatal). M0106-0011 follow-up (b).
+func TestCheckpointerCallsPostCheckpointFn(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096,
+		PageHeaders: true, TimelineID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	var callCount int
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+		PostCheckpointFn: func() error {
+			callCount++
+			return nil
+		},
+	})
+	if err := cp.runCheckpoint(context.Background(), false); err != nil {
+		t.Fatalf("runCheckpoint: %v", err)
+	}
+	if callCount != 1 {
+		t.Errorf("PostCheckpointFn called %d times, want 1", callCount)
+	}
+
+	// A second checkpoint must also invoke the hook.
+	if err := cp.runCheckpoint(context.Background(), false); err != nil {
+		t.Fatalf("second runCheckpoint: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("after second checkpoint: PostCheckpointFn called %d times total, want 2", callCount)
+	}
+}
+
+// TestCheckpointerPostCheckpointFnErrorIsNonFatal verifies that a non-nil
+// error from PostCheckpointFn does not propagate out of runCheckpoint.
+func TestCheckpointerPostCheckpointFnErrorIsNonFatal(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096,
+		PageHeaders: true, TimelineID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+		PostCheckpointFn: func() error {
+			return fmt.Errorf("simulated hook failure")
+		},
+	})
+	// runCheckpoint must succeed even when the hook errors.
+	if err := cp.runCheckpoint(context.Background(), false); err != nil {
+		t.Errorf("runCheckpoint returned error %v, want nil (hook errors must be non-fatal)", err)
 	}
 }
 

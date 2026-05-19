@@ -102,6 +102,16 @@ type CheckpointerConfig struct {
 	// basebackup boots with snapshot xmax=3, hiding every tuple created
 	// after initdb. M0106-0010 batched-45.
 	NextXIDFn func() uint64
+
+	// PostCheckpointFn, when non-nil, is called at the end of each
+	// successful checkpoint (timed, volume-triggered, or on-demand).
+	// initdb.Open wires this to regenerate pg_internal.init files so PG
+	// standbys can always attach: crash-recovery WAL replay of
+	// RecordKindXactCommitInval unlinks the init files, and the commit-
+	// time hook may not run before the next pg_basebackup attempt.
+	// Errors are logged as warnings and do not fail the checkpoint.
+	// M0106-0011 follow-up (b).
+	PostCheckpointFn func() error
 }
 
 func (c *CheckpointerConfig) withDefaults() {
@@ -447,6 +457,14 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 	if c.retainer != nil {
 		if err := c.retainer.Retain(endLSN); err != nil {
 			c.cfg.Logger.Warn("wal retention failed", "err", err)
+		}
+	}
+	// M0106-0011 follow-up (b): call the post-checkpoint hook (when wired)
+	// to regenerate pg_internal.init after crash-recovery WAL replay may
+	// have unlinked it via RecordKindXactCommitInval. Non-fatal.
+	if c.cfg.PostCheckpointFn != nil {
+		if err := c.cfg.PostCheckpointFn(); err != nil {
+			c.cfg.Logger.Warn("post-checkpoint init file refresh failed", "err", err)
 		}
 	}
 	// M0057-0001: log checkpoint complete so benchmark runs can see
