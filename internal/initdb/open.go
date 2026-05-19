@@ -780,8 +780,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	walSubscribers := wal.NewSubscribers()
 	syncRep := wal.NewSyncRep()
 
+	defaultGUC := wal.DefaultGUCParameters()
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{
 		SegmentSize: walCfg.SegmentSize,
+		GUCParams:   defaultGUC,
 	})
 
 	// Surface the M0002 checkpointer counters as the
@@ -1004,6 +1006,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		logCanonical = func(payload []byte) error {
 			_, _, err := walWriter.Append(payload)
 			return err
+		}
+	}
+
+	// M0106-0010 batched-33: emit XLOG_PARAMETER_CHANGE and update pg_control
+	// GUC echo fields so the first PG standby that attaches sees consistent
+	// values in its pg_control copy. Mirrors PG's XLogReportParameters call
+	// from postmaster startup (xlog.c:8147). Only runs in PageHeaders mode;
+	// silently skipped when walWriter is nil or dataDir is empty (tests).
+	if walWriter != nil && walWriter.PageHeadersEnabled() && abs != "" {
+		if err := wal.ReportParameters(abs, walWriter, defaultGUC); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: ReportParameters: %w", err)
 		}
 	}
 

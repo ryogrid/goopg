@@ -87,6 +87,12 @@ type CheckpointerConfig struct {
 	// When empty the pg_control update is skipped (tests that don't
 	// write a real data directory leave this blank).
 	DataDir string
+
+	// GUCParams holds the 8 GUC echo fields that are written into pg_control
+	// at each checkpoint so a PG standby always reads consistent values.
+	// Populated by initdb.Open from DefaultGUCParameters() at server start.
+	// M0106-0010 batched-33.
+	GUCParams GUCParameters
 }
 
 func (c *CheckpointerConfig) withDefaults() {
@@ -366,6 +372,7 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 	if c.cfg.DataDir != "" {
 		checkLSN0 := startLSN - 1 // convert 1-based internal to 0-based PG LSN
 		now := time.Now().Unix()
+		guc := c.cfg.GUCParams
 		if err := control.UpdateControlFile(c.cfg.DataDir, func(cd *control.ControlFileData) {
 			cd.State = control.DBStateInProduction
 			cd.Time = now
@@ -377,6 +384,17 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 			cd.CheckPointCopyFullPageWrites = true
 			cd.MinRecoveryPoint = 0
 			cd.MinRecoveryPointTLI = 0
+			// Refresh GUC echo fields at every checkpoint so a standby that
+			// attaches after the checkpoint record always sees consistent values.
+			// Mirrors CreateCheckPoint's ControlFile copy in xlog.c. M0106-0010.
+			cd.WalLevel = uint32(guc.WalLevel)
+			cd.WalLogHints = guc.WalLogHints
+			cd.MaxConnections = uint32(guc.MaxConnections)
+			cd.MaxWorkerProcesses = uint32(guc.MaxWorkerProcesses)
+			cd.MaxWalSenders = uint32(guc.MaxWalSenders)
+			cd.MaxPreparedXacts = uint32(guc.MaxPreparedXacts)
+			cd.MaxLocksPerXact = uint32(guc.MaxLocksPerXact)
+			cd.TrackCommitTimestamp = guc.TrackCommitTimestamp
 		}); err != nil {
 			c.cfg.Logger.Warn("pg_control update failed after checkpoint", "err", err)
 		}

@@ -10026,7 +10026,7 @@ relcache init → replication readiness) and intra-package grouped.
         the full list.
       - Risk gate: wal/replication.
 
-- [ ] **M0106-0010 batched-33** (bootstrap-procedure task 33)
+- [x] **M0106-0010 batched-33** (bootstrap-procedure task 33)
       - Summary: Add a primary-side `ReportParameters` entry point in
         `wal/parameter_change.go` that, on postmaster start and
         `SIGHUP`, diffs the 8 GUC fields and emits

@@ -203,3 +203,22 @@ func UpdateControlFile(dataDir string, fn func(*ControlFileData)) error {
 	}
 	return nil
 }
+
+// ReadControlFile reads the current pg_control values from dataDir.
+// Returns nil when the file does not exist (fresh cluster before initdb completes).
+// Callers that need to compare GUC echo fields against live configuration
+// use this to avoid a spurious read+write cycle via UpdateControlFile.
+func ReadControlFile(dataDir string) (*ControlFileData, error) {
+	path := filepath.Join(dataDir, pgControlFilePath)
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("control: read pg_control: %w", err)
+	}
+	if len(buf) < pgControlCRCOffset+4 {
+		return nil, fmt.Errorf("control: pg_control too short (%d bytes)", len(buf))
+	}
+	return decodeControlFileData(buf), nil
+}
