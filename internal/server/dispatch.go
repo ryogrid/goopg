@@ -199,6 +199,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	ectx.LockMgr = s.cfg.LockMgr
 	ectx.BackendID = backendID
 	ectx.WAL = s.cfg.WAL
+	ectx.LogCanonical = s.cfg.LogCanonical
 	ectx.SyncRep = s.cfg.SyncRep
 	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
 	if s.applyLauncher != nil {

@@ -184,6 +184,12 @@ type Config struct {
 	// live row per active sender. nil makes registration a no-op.
 	WalSenders *wal.Senders
 
+	// LogCanonical, when non-nil, emits PG-canonical WAL records for
+	// catalog DDL (XLOG_HEAP_INSERT, XLOG_BTREE_INSERT_LEAF) so a vanilla
+	// PG18 standby can replay them. Wired by cmd/goopg from Runtime.LogCanonical
+	// when PageHeaders mode is active. M0106-0010 batched-32.
+	LogCanonical catalog.LogCanonicalFunc
+
 	// WAL exposes the WAL writer's WrittenLSN() so IDENTIFY_SYSTEM
 	// can report a current xlogpos. nil → IDENTIFY_SYSTEM reports
 	// xlogpos=0/0 (acceptable for tests that don't care about the

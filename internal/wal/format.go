@@ -155,6 +155,13 @@ func maxAlignXLog(n int) int {
 }
 
 func wrapXLogMainData(payload []byte) []byte {
+	// M0106-0010 batched-32: RecordKindCanonical (0xFE) payloads carry an
+	// already-formatted PG XLogRecord body (block references + main data)
+	// starting at byte 7 (after the 7-byte canonical envelope header).
+	// Return it verbatim — no xlrBlockIDDataShort wrapping needed.
+	if len(payload) >= 7 && payload[0] == 0xFE {
+		return payload[7:]
+	}
 	if len(payload) <= 0xFF {
 		out := make([]byte, 2+len(payload))
 		out[0] = xlrBlockIDDataShort
@@ -210,6 +217,15 @@ func unwrapXLogMainData(data []byte) ([]byte, error) {
 func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 	if len(payload) == 0 {
 		return RmgrXLog, xlogInfoDefault, 0
+	}
+	// M0106-0010 batched-32: RecordKindCanonical (0xFE) carries a PG-canonical
+	// WAL record body (block references + main data) that a PG18 standby can replay.
+	// The canonical envelope header embeds the target rmgr/info/xid so the
+	// XLogRecord header is produced with the correct resource-manager fields.
+	// See catalog/canonical.go for the encoding; format.go is updated in lock-step.
+	if len(payload) >= 7 && payload[0] == 0xFE {
+		xid := binary.LittleEndian.Uint32(payload[3:7])
+		return Rmgr(payload[1]), payload[2], xid
 	}
 	// M0102-0007: PG-compatible checkpoint record (88-byte CheckPoint struct).
 	// Goopg's record-kind byte (0x02=RecordKindCheckpoint) would map to an

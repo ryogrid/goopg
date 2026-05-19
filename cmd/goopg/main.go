@@ -415,6 +415,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		}
 		cfg.WalSenders = rt.WalSenders
 		cfg.WAL = rt.WAL
+		cfg.LogCanonical = rt.LogCanonical
 		cfg.Activity = rt.Activity
 		cfg.PubSub = rt.PubSub
 		cfg.WALDirPath = filepath.Join(rt.DataDir, "pg_wal")

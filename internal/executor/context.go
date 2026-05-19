@@ -202,6 +202,12 @@ type Context struct {
 	// relcache-init-file invalidation (tests that don't set up a full
 	// cluster). M0106-0010 batched-31.
 	DataDir string
+
+	// LogCanonical, when non-nil, emits a PG-canonical WAL record (XLOG_HEAP_INSERT,
+	// XLOG_BTREE_INSERT_LEAF, …) so a vanilla PG18 standby can replay catalog DDL
+	// mutations. Set only when the WAL writer is in PageHeaders mode (PG-compat WAL);
+	// nil in tests and legacy-WAL configurations. M0106-0010 batched-32.
+	LogCanonical catalog.LogCanonicalFunc
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.

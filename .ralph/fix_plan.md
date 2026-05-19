@@ -10002,7 +10002,7 @@ relcache init → replication readiness) and intra-package grouped.
           s.cfg.DataDir into it.
         - 5 catalog tests + 5 wal tests all PASS; -race clean.
 
-- [ ] **M0106-0010 batched-32** (bootstrap-procedure task 32)
+- [x] **M0106-0010 batched-32** (bootstrap-procedure task 32)
       - Summary: Add `internal/catalog/PgCanonicalHeapInsert(rel, row)`
         + `PgCanonicalBtreeInsert(rel, key, tid)` +
         `RelationMapUpdateMap(dboid, relid, relfilenode, shared)`

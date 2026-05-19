@@ -1841,7 +1841,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		NewStringDatum("p"),
 		NewBoolDatum(false),
 	}
-	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
+	if err := writeHeapRowCanonical(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
 		return fmt.Errorf("pg_class: %w", err)
 	}
 
@@ -1860,7 +1860,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 			NewBoolDatum(col.NotNull),
 			NewBoolDatum(false),
 		}
-		if err := writeHeapRow(ctx, attrRel, catalog.PGAttributeColumns(), attrRow); err != nil {
+		if err := writeHeapRowCanonical(ctx, attrRel, catalog.PGAttributeColumns(), attrRow); err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
 		}
 	}
@@ -1894,10 +1894,36 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		NewStringDatum("p"),
 		NewBoolDatum(false),
 	}
-	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
+	if err := writeHeapRowCanonical(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
 		return fmt.Errorf("pg_class for index: %w", err)
 	}
 	return nil
+}
+
+// writeHeapRowCanonical writes a heap row to a catalog relation and, when
+// ctx.LogCanonical is set, emits a PG-canonical XLOG_HEAP_INSERT WAL record
+// (with full-page image) so a vanilla PG18 standby can replay the catalog
+// insertion. The FPI approach ensures the standby can restore the page without
+// parsing heap-tuple internals. M0106-0010 batched-32.
+func writeHeapRowCanonical(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) error {
+	ptr, err := writeHeapRowReturning(ctx, rel, cols, row)
+	if err != nil {
+		return err
+	}
+	if ctx.LogCanonical == nil || ctx.Pool == nil {
+		return nil
+	}
+	// Re-pin the page to capture a stable FPI after the insert.
+	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+	if err != nil {
+		return fmt.Errorf("canonical WAL pin: %w", err)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	copy(page, slot.Page())
+	ctx.Pool.Unpin(slot)
+
+	xid := uint32(ctx.Tx.XID)
+	return catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset, xid, ctx.LogCanonical)
 }
 
 // execCreateTrigger registers a trigger on a table. M0096-0012.

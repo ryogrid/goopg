@@ -45,6 +45,11 @@ type Runtime struct {
 	// ALL_VISIBLE bit; index-only scans check it to skip heap fetches.
 	VM           *storage.VisibilityMap
 	WAL          *wal.Writer
+	// LogCanonical is the callback for emitting PG-canonical WAL records
+	// (XLOG_HEAP_INSERT, XLOG_BTREE_INSERT_LEAF) from DDL paths so a PG18
+	// standby can replay catalog mutations. Non-nil only when PageHeaders=true.
+	// M0106-0010 batched-32.
+	LogCanonical catalog.LogCanonicalFunc
 	Checkpointer *wal.Checkpointer
 	Slots        *wal.Slots
 	// SyncRep is the synchronous-replication wait primitive
@@ -990,12 +995,25 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: standby signal: %w", err)
 	}
 
+	// M0106-0010 batched-32: build the canonical WAL callback only when the
+	// writer is in PG-compat PageHeaders mode so canonical records can be read
+	// by PG18 standbys. In legacy mode (tests, no standby), LogCanonical stays
+	// nil and DDL paths skip the canonical record emission.
+	var logCanonical catalog.LogCanonicalFunc
+	if walWriter != nil && walWriter.PageHeadersEnabled() {
+		logCanonical = func(payload []byte) error {
+			_, _, err := walWriter.Append(payload)
+			return err
+		}
+	}
+
 	rt := &Runtime{
 		StorageMgr:     mgr,
 		Pool:           pool,
 		TxnMgr:         txnMgr,
 		Catalog:        cat,
 		WAL:            walWriter,
+		LogCanonical:   logCanonical,
 		Checkpointer:   cp,
 		Slots:          slotsReg,
 		SyncRep:        syncRep,

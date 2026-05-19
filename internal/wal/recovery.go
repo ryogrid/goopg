@@ -398,6 +398,19 @@ const (
 	// invalidation is implicit in the kind byte rather than encoded as a flag.
 	RecordKindXactCommitInval byte = 32
 
+	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
+	// references + main data) so a PG18 standby can replay catalog heap and
+	// btree insertions that goopg performs during DDL. The 7-byte envelope
+	// header carries the rmgr/info/xid for the XLogRecord; the body follows.
+	// When the WAL writer is in PageHeaders mode, classifyXLogRecord (format.go)
+	// extracts these fields and wrapXLogMainData passes the body through
+	// unchanged, producing a correct PG-canonical XLogRecord on disk.
+	// Goopg's own crash recovery replays these records via replayDecodedXLogRecord
+	// (since nativeApplyRecordKindKnown returns false for this byte), which
+	// uses the FPI in the block reference to restore the catalog page.
+	// M0106-0010 batched-32.
+	RecordKindCanonical byte = 0xFE
+
 	// defaultRecoveryDBOid is the database OID used by
 	// ProcessCommittedInvalidationMessages when unlinking the per-database
 	// pg_internal.init. Matches catalog.DefaultDBOid = 1 (v0 single-database
@@ -2109,6 +2122,14 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// reconstructed by `internal/initdb.replayIndexDDLRecords`
 		// after physical replay finishes.
 		return false, nil
+	case RecordKindCanonical:
+		// PG-canonical catalog WAL record (M0106-0010 batched-32).
+		// When r.XLog != nil (PageHeaders mode), nativeApplyRecordKindKnown
+		// returns false for this byte and the record is replayed via
+		// replayDecodedXLogRecord using the FPI in the block reference.
+		// In legacy mode (PageHeaders=false), canonical records are never
+		// emitted, so this case is a safety no-op.
+		return false, nil
 	case RecordKindXactAssignment, RecordKindXactRollbackTo, RecordKindXactSubAbort:
 		// Subxact markers (M0050-0003) — physical page recovery is
 		// a no-op. The mvcc.Manager rebuilds its subxact-to-parent
@@ -2164,6 +2185,7 @@ func nativeApplyRecordKindKnown(kind byte) bool {
 		RecordKindCheckpoint,
 		RecordKindXactCommit,
 		RecordKindXactAbort,
+		RecordKindXactCommitInval,
 		RecordKindCreateDatabase,
 		RecordKindDropDatabase,
 		RecordKindCreateIndex,
