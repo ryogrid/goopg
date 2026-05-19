@@ -8,22 +8,21 @@ import (
 	"github.com/goopg/goopg/internal/mctx"
 )
 
-// TestM0073DatumStructSize pins the post-M0073-0001 Datum
-// layout: 64 B exact (was 56 B with 8 B padding pre-M0073;
-// the +arena *Arena field consumed all the headroom). Future
-// field additions will trigger the M0074 packed-layout work.
-// M0107-0001: arena *Arena → mctx *mctx.Context (same pointer size).
-func TestM0073DatumStructSize(t *testing.T) {
-	const want = 64
+// TestM0107DatumStructSize pins the post-M0107-0002 Datum layout:
+// 48 B exact (was 64 B / 3 GC pointers). DatumKind → uint8,
+// mctx *mctx.Context → ArenaID uint16, Big *big.Int removed.
+func TestM0107DatumStructSize(t *testing.T) {
+	const want = 48
 	got := unsafe.Sizeof(Datum{})
 	if got != want {
-		t.Errorf("unsafe.Sizeof(Datum{}) = %d, want %d (M0073-0001 must keep struct exactly 64 B)", got, want)
+		t.Errorf("unsafe.Sizeof(Datum{}) = %d, want %d (M0107-0002 must be exactly 48 B)", got, want)
 	}
 }
 
 // TestM0073DatumStringArenaRoundTrip pins the accessor contract:
-// a KindStringArena Datum encoding (offset, length) in Int returns
-// the original payload via StringValue() through mctx.Bytes().
+// a mctx-backed KindString Datum (ArenaID≠0) returns the original
+// payload via StringValue() through mctx.Bytes(). M0107-0002: merged
+// KindStringArena into KindString (ArenaID field distinguishes).
 func TestM0073DatumStringArenaRoundTrip(t *testing.T) {
 	a := mctx.Acquire(nil, mctx.KindStmt)
 	defer a.Release()
@@ -31,16 +30,19 @@ func TestM0073DatumStringArenaRoundTrip(t *testing.T) {
 	offset, length := a.AllocString(payload)
 
 	d := newStringArenaDatum(a, offset, length)
-	if d.Kind != KindStringArena {
-		t.Errorf("Kind = %d, want KindStringArena", d.Kind)
+	if d.Kind != KindString {
+		t.Errorf("Kind = %d, want KindString (arena-backed, M0107-0002)", d.Kind)
+	}
+	if d.ArenaID == 0 {
+		t.Errorf("ArenaID = 0, want non-zero for arena-backed Datum")
 	}
 	if got := d.StringValue(); got != payload {
 		t.Errorf("StringValue() = %q, want %q", got, payload)
 	}
 }
 
-// TestM0073DatumBytesArenaRoundTrip mirrors the StringArena
-// test for KindBytesArena.
+// TestM0073DatumBytesArenaRoundTrip mirrors the string arena
+// test for bytes (M0107-0002: KindBytesArena merged into KindBytes).
 func TestM0073DatumBytesArenaRoundTrip(t *testing.T) {
 	a := mctx.Acquire(nil, mctx.KindStmt)
 	defer a.Release()
@@ -48,8 +50,11 @@ func TestM0073DatumBytesArenaRoundTrip(t *testing.T) {
 	offset, length := a.AllocBytes(payload)
 
 	d := newBytesArenaDatum(a, offset, length)
-	if d.Kind != KindBytesArena {
-		t.Errorf("Kind = %d, want KindBytesArena", d.Kind)
+	if d.Kind != KindBytes {
+		t.Errorf("Kind = %d, want KindBytes (arena-backed, M0107-0002)", d.Kind)
+	}
+	if d.ArenaID == 0 {
+		t.Errorf("ArenaID = 0, want non-zero for arena-backed Datum")
 	}
 	if got := d.BytesValue(); !bytes.Equal(got, payload) {
 		t.Errorf("BytesValue() = %v, want %v", got, payload)
@@ -58,16 +63,16 @@ func TestM0073DatumBytesArenaRoundTrip(t *testing.T) {
 
 // TestM0073DatumNonArenaPathUnchanged pins the backward-compat
 // invariant: KindString / KindBytes Datums with a Buf payload
-// continue to work via the legacy unsafe.String / Buf path.
-// mctx field is nil for these; the dispatch in StringValue /
-// BytesValue takes the non-arena branch.
+// continue to work via the unsafe.String / Buf path.
+// ArenaID=0 for these; the dispatch in StringValue/BytesValue
+// takes the Buf branch. M0107-0002: mctx field removed; use ArenaID.
 func TestM0073DatumNonArenaPathUnchanged(t *testing.T) {
 	d := NewStringDatum("legacy")
 	if d.Kind != KindString {
 		t.Fatalf("NewStringDatum: Kind = %d, want KindString", d.Kind)
 	}
-	if d.mctx != nil {
-		t.Errorf("NewStringDatum: mctx should be nil; got %p", d.mctx)
+	if d.ArenaID != 0 {
+		t.Errorf("NewStringDatum: ArenaID should be 0 (Buf-backed); got %d", d.ArenaID)
 	}
 	if got := d.StringValue(); got != "legacy" {
 		t.Errorf("StringValue() = %q, want %q", got, "legacy")
@@ -77,8 +82,8 @@ func TestM0073DatumNonArenaPathUnchanged(t *testing.T) {
 	if bd.Kind != KindBytes {
 		t.Fatalf("NewBytesDatum: Kind = %d, want KindBytes", bd.Kind)
 	}
-	if bd.mctx != nil {
-		t.Errorf("NewBytesDatum: mctx should be nil")
+	if bd.ArenaID != 0 {
+		t.Errorf("NewBytesDatum: ArenaID should be 0 (Buf-backed)")
 	}
 	if got := bd.BytesValue(); !bytes.Equal(got, []byte{0x10, 0x20}) {
 		t.Errorf("BytesValue() = %v, want [16 32]", got)
@@ -132,8 +137,8 @@ func TestM0073CloneRowOwnedPromotesArenaDatums(t *testing.T) {
 	if dst[1].Kind != KindString {
 		t.Errorf("dst[1].Kind = %d, want KindString (promoted)", dst[1].Kind)
 	}
-	if dst[1].mctx != nil {
-		t.Errorf("dst[1].mctx = %p, want nil after promotion", dst[1].mctx)
+	if dst[1].ArenaID != 0 {
+		t.Errorf("dst[1].ArenaID = %d, want 0 after promotion (Buf-backed)", dst[1].ArenaID)
 	}
 	if got := dst[1].StringValue(); got != "hello" {
 		t.Errorf("dst[1].StringValue() = %q, want %q", got, "hello")

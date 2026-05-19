@@ -212,7 +212,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		return buf, nil
 	case "char":
 		// PG "char" type: single byte
-		if d.Kind == KindString || d.Kind == KindStringArena {
+		if d.Kind == KindString {
 			s := d.StringValue()
 			if len(s) > 0 {
 				return []byte{s[0]}, nil
@@ -319,7 +319,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 	case "pg_node_tree":
 		// KindBytes passthrough: pre-encoded varlena bytes (e.g. PGLZ-compressed
 		// varlena produced by pglzVarlenaDatum in initdb bootstrap).
-		if d.Kind == KindBytes || d.Kind == KindBytesArena {
+		if d.Kind == KindBytes {
 			return d.BytesValue(), nil
 		}
 		// pg_node_tree is varlena-text; PG only reads it conditionally
@@ -920,7 +920,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			v = d.Int
-		case KindString, KindStringArena:
+		case KindString:
 			var err error
 			v, err = coerceStringToInt64(d.StringValue(), "integer")
 			if err != nil {
@@ -941,7 +941,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			v = d.Int
-		case KindString, KindStringArena:
+		case KindString:
 			var err error
 			v, err = coerceStringToInt64(d.StringValue(), "bigint")
 			if err != nil {
@@ -959,7 +959,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			v = d.Int
-		case KindString, KindStringArena:
+		case KindString:
 			var err error
 			v, err = coerceStringToInt64(d.StringValue(), "smallint")
 			if err != nil {
@@ -984,7 +984,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			s = strconv.FormatInt(d.Int, 10)
-		case KindString, KindStringArena:
+		case KindString:
 			raw := strings.TrimSpace(d.StringValue())
 			if _, err := strconv.ParseFloat(raw, 32); err != nil {
 				return nil, &ExecError{Code: "22P02",
@@ -1004,7 +1004,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			s = strconv.FormatInt(d.Int, 10)
-		case KindString, KindStringArena:
+		case KindString:
 			raw := strings.TrimSpace(d.StringValue())
 			if _, err := strconv.ParseFloat(raw, 64); err != nil {
 				return nil, &ExecError{Code: "22P02",
@@ -1035,7 +1035,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		// comparison. Wire-format formatting back to the
 		// `YYYY-MM-DD` shape would belong in a dedicated KindDate
 		// carrier, deferred to the type-system milestone.
-		if d.Kind == KindString || d.Kind == KindStringArena {
+		if d.Kind == KindString {
 			ts, err := parseCopyTimestamp(d.StringValue())
 			if err != nil {
 				return nil, &ExecError{Code: "22007",
@@ -1051,7 +1051,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		return buf[:], nil
 	case "time", "timetz":
 		// TIME stores only time-of-day as 8-byte big-endian nanos anchored at epoch.
-		if d.Kind == KindString || d.Kind == KindStringArena {
+		if d.Kind == KindString {
 			ts, err := parseTimeString(d.StringValue())
 			if err != nil {
 				return nil, err
@@ -1071,7 +1071,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			n = d.Int
-		case KindString, KindStringArena:
+		case KindString:
 			var err error
 			origStr := d.StringValue() // preserve original for error messages
 			rawStr := strings.TrimSpace(origStr)
@@ -1107,7 +1107,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		// canonical xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx for storage. M0097-0003.
 		var uuidStr string
 		switch d.Kind {
-		case KindString, KindStringArena:
+		case KindString:
 			uuidStr = strings.TrimSpace(d.StringValue())
 			if !isValidUUIDStr(uuidStr) {
 				return nil, &ExecError{Code: "22P02",
@@ -1125,9 +1125,9 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		// M0097-0003.
 		var s string
 		switch d.Kind {
-		case KindString, KindStringArena:
+		case KindString:
 			s = d.StringValue()
-		case KindBytes, KindBytesArena:
+		case KindBytes:
 			s = string(d.BytesValue())
 		case KindInt:
 			s = fmt.Sprintf("%d", d.Int)
@@ -1153,9 +1153,9 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 			return encodeVarlen([]byte(numericText(d))), nil
 		case KindInt:
 			return encodeVarlen([]byte(strconv.FormatInt(d.Int, 10))), nil
-		case KindString, KindStringArena:
+		case KindString:
 			return encodeVarlen([]byte(d.StringValue())), nil
-		case KindBytes, KindBytesArena:
+		case KindBytes:
 			return encodeVarlen(d.BytesValue()), nil
 		}
 		return nil, fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
@@ -1166,9 +1166,9 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 		// representation (mirrors the dedicated numeric arm above).
 		var s string
 		switch d.Kind {
-		case KindString, KindStringArena:
+		case KindString:
 			s = d.StringValue()
-		case KindBytes, KindBytesArena:
+		case KindBytes:
 			return encodeVarlen(d.BytesValue()), nil
 		case KindInt:
 			// Coerce integer to text-form when the target column is text-like.
@@ -1466,7 +1466,7 @@ func decodeValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) (Datum, in
 			return Datum{}, 0, fmt.Errorf("truncated varlen body")
 		}
 		if n == 0 {
-			return Datum{Kind: KindStringArena, mctx: sctx}, 4, nil
+			return Datum{Kind: KindString, ArenaID: sctx.ID()}, 4, nil
 		}
 		moff, mlen := sctx.AllocBytes(data[4 : 4+n])
 		return newStringArenaDatum(sctx, moff, mlen), 4 + n, nil

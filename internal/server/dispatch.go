@@ -973,7 +973,7 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 	switch d.Kind {
 	case executor.KindInt:
 		f = float64(d.Int)
-	case executor.KindString, executor.KindStringArena:
+	case executor.KindString:
 		s := d.StringValue()
 		if parsed, err := strconv.ParseFloat(s, 64); err == nil {
 			f = parsed

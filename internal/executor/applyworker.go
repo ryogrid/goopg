@@ -751,8 +751,8 @@ func rowMatchesKey(row, keyRow Row) bool {
 // Used only by the apply worker's key-matching scan.
 func applyDatumEqual(a, b Datum) bool {
 	if a.Kind != b.Kind {
-		if (a.Kind == KindString || a.Kind == KindStringArena) &&
-			(b.Kind == KindString || b.Kind == KindStringArena) {
+		if (a.Kind == KindString) &&
+			(b.Kind == KindString) {
 			return a.StringValue() == b.StringValue()
 		}
 		return false
@@ -764,7 +764,7 @@ func applyDatumEqual(a, b Datum) bool {
 		return a.Int == b.Int
 	case KindBool:
 		return a.BoolValue() == b.BoolValue()
-	case KindString, KindStringArena:
+	case KindString:
 		return a.StringValue() == b.StringValue()
 	}
 	return false

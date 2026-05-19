@@ -8,7 +8,7 @@ import (
 )
 
 // TestDecodeRowProjectionArenaProjectedKindArena pins
-// that projected varchar columns emit KindStringArena
+// that projected varchar columns emit mctx-backed KindString (ArenaID≠0)
 // when arena != nil. (M0074-0004.)
 func TestDecodeRowProjectionArenaProjectedKindArena(t *testing.T) {
 	cols := []catalog.Column{
@@ -40,10 +40,10 @@ func TestDecodeRowProjectionArenaProjectedKindArena(t *testing.T) {
 	if dst[2].Kind != KindNull {
 		t.Errorf("col 2 (skipped) Kind = %v, want KindNull", dst[2].Kind)
 	}
-	// Projected varchar must be KindStringArena (the arena-bound
+	// Projected varchar must be mctx-backed KindString (ArenaID≠0, M0107-0002).
 	// payload variant from M0073-0001).
-	if dst[1].Kind != KindStringArena {
-		t.Errorf("col 1 (projected varchar) Kind = %v, want KindStringArena", dst[1].Kind)
+	if dst[1].Kind != KindString || dst[1].ArenaID == 0 {
+		t.Errorf("col 1 (projected varchar) Kind = %v ArenaID = %d, want KindString+ArenaID≠0", dst[1].Kind, dst[1].ArenaID)
 	}
 	if dst[1].StringValue() != "hello" {
 		t.Errorf("col 1 StringValue = %q, want %q", dst[1].StringValue(), "hello")

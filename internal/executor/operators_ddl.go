@@ -1458,12 +1458,12 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		}
 		return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not numeric at runtime", col.Name)}
 	case isVarcharType(col.Type.Name):
-		if v.Kind != KindString && v.Kind != KindStringArena {
+		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
 		return btree.EncodeVarchar([]byte(v.StringValue())), nil
 	case isCharType(col.Type.Name):
-		if v.Kind != KindString && v.Kind != KindStringArena {
+		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
 		return btree.EncodeChar([]byte(v.StringValue())), nil
@@ -1477,7 +1477,7 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		// text type: encode as varchar bytes. M0096-0008.
 		var s string
 		switch v.Kind {
-		case KindString, KindStringArena:
+		case KindString:
 			s = v.StringValue()
 		case KindInt:
 			s = fmt.Sprintf("%d", v.Int)

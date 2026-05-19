@@ -176,9 +176,9 @@ func datumToCopyBinary(t catalog.Type, d Datum) ([]byte, error) {
 	default:
 		// text / varchar / char / bytea — raw bytes
 		switch d.Kind {
-		case KindString, KindStringArena:
+		case KindString:
 			return []byte(d.StringValue()), nil
-		case KindBytes, KindBytesArena:
+		case KindBytes:
 			return d.BytesValue(), nil
 		case KindInt:
 			b := make([]byte, 8)

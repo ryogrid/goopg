@@ -982,9 +982,9 @@ func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datu
 		}
 	case isTextTypeName(tn):
 		switch v.Kind {
-		case KindString, KindStringArena:
+		case KindString:
 			return v, nil
-		case KindBytes, KindBytesArena:
+		case KindBytes:
 			return NewStringDatum(string(v.BytesValue())), nil
 		}
 	case isBoolTypeName(tn):
@@ -1015,9 +1015,9 @@ func datumKindName(v Datum) string {
 		return "boolean"
 	case KindInt:
 		return "integer"
-	case KindString, KindStringArena:
+	case KindString:
 		return "text"
-	case KindBytes, KindBytesArena:
+	case KindBytes:
 		return "bytea"
 	case KindTime:
 		return "timestamp"

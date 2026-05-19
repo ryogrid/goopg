@@ -1342,9 +1342,9 @@ func datumKey(d Datum) string {
 		return canonicalNumericKey(d.Int, 0)
 	case KindNumeric:
 		return canonicalNumericKey(d.NumericMantissaValue(), int(d.Scale))
-	case KindString, KindStringArena:
+	case KindString:
 		return "s:" + d.StringValue()
-	case KindBytes, KindBytesArena:
+	case KindBytes:
 		return "x:" + string(d.BytesValue())
 	case KindTime:
 		var buf [20]byte
