@@ -1839,6 +1839,22 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           AFTER DELETE triggers and statement-level triggers are
           separate scope.  Design:
           `docs/design/0100-0005aa-cross-partition-update-before-delete-trigger.md`.
+        - **HeapXmaxInvalid regression fix (2026-05-20 loop 12)**:
+          `PageSetHeapTupleXmax` and `PageSetHeapTupleMovedPartition` now
+          also clear `HeapXmaxInvalid (0x0800)` when stamping a real xmax.
+          Canonical-WAL inserts set this flag to mark "xmax is not a
+          deleter" on fresh rows; without clearing it, `isConcurrentlyUpdated`
+          short-circuited to false for all canonical-WAL tuples, causing
+          `TestPort_IsolationPartitionKeyUpdate1` and `PartitionKeyUpdate4`
+          to regress from PASS to SKIP after M0106-0010.  Fix also adds
+          `findInProgressConflict` Case 3 (lock-only xmax = FOR UPDATE holds
+          the conflict row; upsert should wait).  IsolationRunner gains
+          per-step cancellable contexts + non-blocking connection close to
+          prevent drainWindow-timeout goroutines from deadlocking c.Close().
+          Design: `docs/design/0100-0005-heap-xmax-invalid-clear-on-stamp.md`.
+          After this fix: **PASS count = 8** (was 6 before HeapXmaxInvalid
+          regression): LockCommittedUpdate, InsertConflictDoUpdate,
+          InsertConflictDoNothing, FkSnapshot, PartitionKeyUpdate{1,2,3,4}.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
