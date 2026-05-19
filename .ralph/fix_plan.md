@@ -10265,6 +10265,39 @@ relcache init → replication readiness) and intra-package grouped.
       `base/5/2610`, and the relcache init-file entry for OID 2684;
       compare against canonical PG18 values; regenerate the
       offending row.  No code changes landed this loop.
+    - PARTIAL PROGRESS 2026-05-19 (loop 6): bulk preemptive fix for the
+      remaining 6 name-typed UNIQUE btree indexes in `nailedLocalRels`
+      lacking an `Attrs` override
+      (`internal/initdb/relcache_init.go`):
+        - 3467 `pg_event_trigger_evtname_index` (evtname)
+        - 3081 `pg_extension_name_index` (extname)
+        - 548  `pg_foreign_data_wrapper_name_index` (fdwname)
+        - 549  `pg_foreign_server_name_index` (srvname)
+        - 2681 `pg_language_name_index` (lanname)
+        - 3997 `pg_statistic_ext_name_index` (stxname leading, stxnamespace trailing)
+      Each entry now carries `TypeOID=19, Len=64, NotNull=true` on the
+      leading column so PG18's `_bt_compare → btnamecmp` reads a real
+      64-byte NameData rather than dereferencing the first 4 inline
+      bytes as a by-val pointer. These indexes are not on the
+      bench_log SELECT parse-analyze path so loop 6 did NOT unblock
+      `TestE2E_FailoverGoopgToPG/async` — the same `waitForPGCount`
+      180s timeout fires; the residual crash sits elsewhere.
+      Regression test
+      `TestNailedNameTypedIndexesHaveNameDescriptor`
+      (`internal/initdb/nailed_name_typed_indexes_test.go`) pins all
+      six descriptors + pg_attribute heap rows. Existing
+      `TestNailedPgNamespaceNspnameIndexHasNameDescriptor`,
+      `TestPgNamespaceIndexesSeededFromInitialEntries`,
+      `TestNailedLocalRelsContainsPgNamespaceIndexes`,
+      `TestE2E_PhysicalReplication` — all PASS.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 6" section).
+      Next loop: complete loop-4 audit items (2) `pg_index` row for
+      `indexrelid=2684` from `base/5/2610` and (3) `pg_internal.init`
+      entry for OID 2684; cross-check `indclass[0]/indcollation[0]`
+      against PG18 expected values; also consider widening the audit
+      to oid composite indexes on the SELECT path where the backing
+      heap's pg_attribute may disagree on attnum ordering.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

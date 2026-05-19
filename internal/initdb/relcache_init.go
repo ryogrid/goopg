@@ -891,7 +891,16 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{OID: 3467, Name: "pg_event_trigger_evtname_index"},
+	// M0106-0010 batched-36 loop 6: name-typed Attrs override (parity
+		// with 2684 in loop 5). Without this override flattenRels falls
+		// back to indexKeyAttrs(1)'s oid-stamped (attlen=4, attbyval=true)
+		// descriptor; PG's _bt_compare reads the first 4 inline NameData
+		// bytes of the leaf IndexTuple as a by-val Datum and passes them
+		// to btnamecmp as a pointer → strncmp → SIGSEGV. evtname is a
+		// single-column name_ops key.
+		{OID: 3467, Name: "pg_event_trigger_evtname_index", Attrs: []nailedAttr{
+			{Name: "evtname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
+		}},
 	// M0106-0010 Step 3at: pg_event_trigger_oid_index. PG18
 	// `postgres/src/include/catalog/pg_event_trigger.h:55` declares
 	// `EventTriggerOidIndexId = 3468` as UNIQUE PRIMARY KEY on
@@ -924,7 +933,13 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{OID: 3081, Name: "pg_extension_name_index"},
+	// M0106-0010 batched-36 loop 6: name-typed Attrs override (parity
+		// with 2684). extname is a single-column name_ops key; missing
+		// override here would crash PG's _bt_compare → btnamecmp the
+		// same way as pg_namespace_nspname_index.
+		{OID: 3081, Name: "pg_extension_name_index", Attrs: []nailedAttr{
+			{Name: "extname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
+		}},
 	// M0106-0010 Step 3bc: pg_foreign_data_wrapper_name_index. PG18
 	// `postgres/src/include/catalog/pg_foreign_data_wrapper.h:56`
 	// declares `ForeignDataWrapperNameIndexId = 548` as UNIQUE
@@ -936,7 +951,11 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{OID: 548, Name: "pg_foreign_data_wrapper_name_index"},
+	// M0106-0010 batched-36 loop 6: name-typed Attrs override (parity
+		// with 2684). fdwname is a single-column name_ops key.
+		{OID: 548, Name: "pg_foreign_data_wrapper_name_index", Attrs: []nailedAttr{
+			{Name: "fdwname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
+		}},
 	// M0106-0010 Step 3bd: pg_foreign_data_wrapper_oid_index. PG18
 	// `postgres/src/include/catalog/pg_foreign_data_wrapper.h:55`
 	// declares `ForeignDataWrapperOidIndexId = 112` as UNIQUE PRIMARY
@@ -960,7 +979,11 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{OID: 549, Name: "pg_foreign_server_name_index"},
+	// M0106-0010 batched-36 loop 6: name-typed Attrs override (parity
+		// with 2684). srvname is a single-column name_ops key.
+		{OID: 549, Name: "pg_foreign_server_name_index", Attrs: []nailedAttr{
+			{Name: "srvname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
+		}},
 	// M0106-0010 Step 3bg: pg_foreign_server_oid_index. PG18
 	// `postgres/src/include/catalog/pg_foreign_server.h:58`
 	// declares `ForeignServerOidIndexId = 113` as UNIQUE PRIMARY
@@ -994,7 +1017,11 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	// seeded; flattenRels derives RelNatts=1 via pgIndexNattsByOID,
 	// satisfying RelationInitIndexAccessInfo's relnatts/indnatts check
 	// (relcache.c:1492).
-	{OID: 2681, Name: "pg_language_name_index"},
+	// M0106-0010 batched-36 loop 6: name-typed Attrs override (parity
+		// with 2684). lanname is a single-column name_ops key.
+		{OID: 2681, Name: "pg_language_name_index", Attrs: []nailedAttr{
+			{Name: "lanname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
+		}},
 	// M0106-0010 Step 3bk: pg_language_oid_index. PG18
 	// `postgres/src/include/catalog/pg_language.h:70`
 	// declares `LanguageOidIndexId = 2682` as UNIQUE PRIMARY KEY
@@ -1200,7 +1227,18 @@ var nailedLocalRels = flattenRels([]nailedRel{
 		// MAKE_SYSCACHE(STATEXTNAMENSP, pg_statistic_ext_name_index, 4).
 		// Without this entry RelationIdGetRelation(3997) FATALs; flattenRels
 		// derives RelNatts=2 via pgIndexNattsByOID.
-		{OID: 3997, Name: "pg_statistic_ext_name_index"},
+		// M0106-0010 batched-36 loop 6: composite (name, oid) Attrs override
+		// (parity with 2684 in loop 5). stxname is the leading name_ops
+		// key; without an override the leading column would be stamped by
+		// indexKeyAttrs as oid (attlen=4, attbyval=true) and PG's
+		// _bt_compare → btnamecmp would dereference the first 4 inline
+		// NameData bytes of the leaf IndexTuple → SIGSEGV. Column 2
+		// (stxnamespace) is oid_ops so the indexKeyAttrs default would
+		// already be correct, but we spell it out for clarity.
+		{OID: 3997, Name: "pg_statistic_ext_name_index", Attrs: []nailedAttr{
+			{Name: "stxname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
+			{Name: "stxnamespace", TypeOID: 26, Num: 2, Len: 4, NotNull: true},
+		}},
 		// M0106-0010 Step 3cd: pg_statistic_ext_relid_index. PG18
 		// `postgres/src/include/catalog/pg_statistic_ext.h:75` declares
 		// `DECLARE_INDEX(pg_statistic_ext_relid_index, 3379,

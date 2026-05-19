@@ -397,3 +397,59 @@ Files touched this loop:
   added to the `'c'`-aligned switch arm.
 - `internal/initdb/pg_namespace_index_test.go` — new regression
   test pinning the descriptor + relcache blob + heap row.
+
+## 2026-05-19 loop 6 — bulk name-typed Attrs overrides
+
+The loop-5 patch closed the SEGV on OID 2684 but left 6 other
+name-typed UNIQUE btree indexes in `nailedLocalRels` without an
+`Attrs` override.  They are not on the parse-analyze path of the
+`SELECT count(*) FROM public.bench_log WHERE client = -999` query
+that the failover E2E test fires, so they did not crash this loop —
+but the moment a PG standby promoted from a goopg basebackup
+executes any `CREATE EXTENSION` / `CREATE EVENT TRIGGER` / `CREATE
+SERVER` / `ALTER LANGUAGE` / `CREATE STATISTICS` statement the same
+SIGSEGV class would recur (fetchatt loads the first 4 inline
+NameData bytes as a by-val Datum and hands a bogus pointer to
+`btnamecmp` → `strncmp`).
+
+Loop 6 closes those gaps preemptively:
+
+| OID  | Index name                          | Key column(s)            |
+|------|-------------------------------------|--------------------------|
+| 3467 | pg_event_trigger_evtname_index      | evtname (name)           |
+| 3081 | pg_extension_name_index             | extname (name)           |
+| 548  | pg_foreign_data_wrapper_name_index  | fdwname (name)           |
+| 549  | pg_foreign_server_name_index        | srvname (name)           |
+| 2681 | pg_language_name_index              | lanname (name)           |
+| 3997 | pg_statistic_ext_name_index         | stxname (name), stxnamespace (oid) |
+
+Each entry now carries an explicit `Attrs: []nailedAttr{...}`
+slice with `TypeOID=19, Len=64, NotNull=true` for the leading
+name-typed column.  3997 also pins the trailing oid descriptor
+even though `indexKeyAttrs`'s default would already be byte-correct
+for that column — spelling it out avoids future drift if the
+default ever changes.
+
+Regression coverage: new test
+`TestNailedNameTypedIndexesHaveNameDescriptor`
+(`internal/initdb/nailed_name_typed_indexes_test.go`) walks
+`nailedLocalRels`, asserts each of the six entries has a 64-byte
+name-typed leading attr, and re-derives the on-disk `pg_attribute`
+heap row to confirm `attlen=64 / attbyval=false / attalign='c'`.
+
+`TestE2E_FailoverGoopgToPG/async` — STILL FAILS (180s deadline,
+`waitForPGCount(bench_log) == 1` never reached).  The residual
+crash sits elsewhere — most likely one of the audit items still
+open from loop 4: (a) the `pg_index` row for `indexrelid=2684`
+carrying the wrong `indclass[0]`/`indcollation[0]`, (b) the
+`pg_internal.init` entry for OID 2684, or (c) an index outside
+the name-typed cohort whose key descriptor disagrees with the
+on-disk IndexTuple layout (e.g. an oid composite where the
+backing heap's pg_attribute disagrees on attnum ordering).
+
+Files touched this loop:
+
+- `internal/initdb/relcache_init.go` — `Attrs` overrides on the
+  six idxSpec entries listed above.
+- `internal/initdb/nailed_name_typed_indexes_test.go` — new
+  regression test pinning all six descriptors + pg_attribute rows.
