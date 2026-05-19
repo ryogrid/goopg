@@ -412,3 +412,101 @@ func TestPgProcAttrsMatchesPg18FormPgProc(t *testing.T) {
 		}
 	}
 }
+
+// TestPgProcRowAggregatePrkindIsA (M0106-0010 batched-51) pins
+// prokind='a' on aggregate seed entries (HandlerName ==
+// "aggregate_dummy"). Without this, PG18's
+// ParseFuncOrColumn → check_agg_arguments rejects every `agg(*)`
+// call shape with 42809 "count(*) specified, but count is not an
+// aggregate function". The on-disk byte at offset 96 must read 'a'
+// for OID 2147 (count(any)) and OID 2803 (count(*)).
+func TestPgProcRowAggregatePrkindIsA(t *testing.T) {
+	cols := pgProcColDefs()
+	byOID := make(map[uint32]pgProcEntry)
+	for _, e := range pgProcInitialEntries() {
+		byOID[e.OID] = e
+	}
+	for _, oid := range []uint32{2147, 2803} {
+		e, ok := byOID[oid]
+		if !ok {
+			t.Fatalf("pg_proc OID %d missing from initial entries", oid)
+		}
+		if e.HandlerName != "aggregate_dummy" {
+			t.Fatalf("oid=%d handler=%q, want aggregate_dummy", oid, e.HandlerName)
+		}
+		payload, err := executor.EncodeRowPG(cols, pgProcRow(e))
+		if err != nil {
+			t.Fatalf("EncodeRowPG oid=%d: %v", oid, err)
+		}
+		if got := payload[96]; got != 'a' {
+			t.Fatalf("oid=%d prokind: got %q, want 'a'", oid, got)
+		}
+	}
+}
+
+// TestPgProcRowWindowPrkindIsW (M0106-0010 batched-51) pins
+// prokind='w' on window-function seed entries (HandlerName prefix
+// "window_") so SELECT row_number() OVER … resolves correctly.
+// Covers OID 3100 (row_number) and 3101 (rank).
+func TestPgProcRowWindowPrkindIsW(t *testing.T) {
+	cols := pgProcColDefs()
+	byOID := make(map[uint32]pgProcEntry)
+	for _, e := range pgProcInitialEntries() {
+		byOID[e.OID] = e
+	}
+	for _, oid := range []uint32{3100, 3101} {
+		e, ok := byOID[oid]
+		if !ok {
+			t.Fatalf("pg_proc OID %d missing from initial entries", oid)
+		}
+		payload, err := executor.EncodeRowPG(cols, pgProcRow(e))
+		if err != nil {
+			t.Fatalf("EncodeRowPG oid=%d: %v", oid, err)
+		}
+		if got := payload[96]; got != 'w' {
+			t.Fatalf("oid=%d prokind: got %q, want 'w'", oid, got)
+		}
+	}
+}
+
+// TestPgProcRowExplicitKindOverridesDerivation (M0106-0010
+// batched-51) pins that an explicit Kind on pgProcEntry takes
+// precedence over the HandlerName-based derivation.
+func TestPgProcRowExplicitKindOverridesDerivation(t *testing.T) {
+	cols := pgProcColDefs()
+	e := pgProcEntry{
+		OID:         99999,
+		Name:        "synthetic_proc",
+		RetType:     23,
+		HandlerName: "aggregate_dummy",
+		Kind:        'p',
+	}
+	payload, err := executor.EncodeRowPG(cols, pgProcRow(e))
+	if err != nil {
+		t.Fatalf("EncodeRowPG: %v", err)
+	}
+	if got := payload[96]; got != 'p' {
+		t.Fatalf("prokind: got %q, want 'p' (explicit override)", got)
+	}
+}
+
+// TestDerivePgProcKind (M0106-0010 batched-51) unit-pins the
+// derivation table.
+func TestDerivePgProcKind(t *testing.T) {
+	cases := []struct {
+		handler string
+		want    byte
+	}{
+		{"bthandler", 'f'},
+		{"int4in", 'f'},
+		{"aggregate_dummy", 'a'},
+		{"window_row_number", 'w'},
+		{"window_", 'f'}, // trimmed handler name without suffix → not a window
+		{"", 'f'},
+	}
+	for _, c := range cases {
+		if got := derivePgProcKind(c.handler); got != c.want {
+			t.Errorf("derivePgProcKind(%q): got %q, want %q", c.handler, got, c.want)
+		}
+	}
+}

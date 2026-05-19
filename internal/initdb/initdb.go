@@ -1884,6 +1884,12 @@ type pgProcEntry struct {
 	AllArgTypes []uint32 // proallargtypes (oid[])
 	ArgModes    []byte   // proargmodes (char[]; 'i'/'o'/'b'/'v'/'t')
 	ArgNames    []string // proargnames (text[])
+	// batched-51: prokind override. 0 → derive from HandlerName
+	// (aggregate_dummy → 'a', window_* → 'w', otherwise 'f'). PG18's
+	// ParseFuncOrColumn → check_agg_arguments rejects the agg(*) call
+	// shape unless prokind='a'. Explicit non-zero values take precedence
+	// for entries whose handler does not encode the kind in its name.
+	Kind byte
 }
 
 // pgProcColDefs returns the 30-column PG18 FormData_pg_proc layout.
@@ -1960,6 +1966,10 @@ func pgProcRow(e pgProcEntry) executor.Row {
 	if parallel == 0 {
 		parallel = 's'
 	}
+	kind := e.Kind
+	if kind == 0 {
+		kind = derivePgProcKind(e.HandlerName)
+	}
 	// Step 3dk: emit OUT-arg metadata as binary ArrayType blobs when
 	// supplied. NewStringDatum("") falls through to encodeValuePG's
 	// emptyArrayTypeBytes path; NewBytesDatum lands a KindBytes datum
@@ -1992,7 +2002,7 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NewIntDatum(0),                          // 7  prorows = 0 (float4)
 		executor.NewIntDatum(0),                          // 8  provariadic = 0
 		executor.NewIntDatum(0),                          // 9  prosupport = 0
-		executor.NewStringDatum("f"),                     // 10 prokind = 'f' (function)
+		executor.NewStringDatum(string(kind)),            // 10 prokind
 		executor.NewBoolDatum(false),                     // 11 prosecdef
 		executor.NewBoolDatum(false),                     // 12 proleakproof
 		executor.NewBoolDatum(!e.NotStrict),              // 13 proisstrict
@@ -2013,6 +2023,27 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NewStringDatum(""),                      // 28 prosqlbody
 		executor.NewStringDatum(""),                      // 29 proconfig
 		executor.NewStringDatum(""),                      // 30 proacl
+	}
+}
+
+// derivePgProcKind picks the prokind char for a pg_proc.dat entry
+// when the entry does not set Kind explicitly. Mirrors PG18's
+// PROKIND_* constants in `postgres/src/include/catalog/pg_proc.h`:
+// 'f' regular function, 'a' aggregate, 'w' window, 'p' procedure.
+// goopg's seed data uses the upstream pg_proc.dat handler-name
+// convention — `aggregate_dummy` for aggregates and `window_*` for
+// window functions — so a single handler-name probe recovers the
+// canonical kind without auditing all 3397 seed rows. batched-51:
+// without this, PG18 standby's `ParseFuncOrColumn` rejects every
+// `agg(*)` call shape with 42809 because every prokind reads 'f'.
+func derivePgProcKind(handlerName string) byte {
+	switch {
+	case handlerName == "aggregate_dummy":
+		return 'a'
+	case len(handlerName) > 7 && handlerName[:7] == "window_":
+		return 'w'
+	default:
+		return 'f'
 	}
 }
 

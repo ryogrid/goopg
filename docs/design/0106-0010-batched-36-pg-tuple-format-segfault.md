@@ -2206,3 +2206,70 @@ Confirm `TestE2E_FailoverGoopgToPG/async` advances past 42809; the
 likely next residual is `pg_aggregate` lookup (`AGGFNOID` syscache /
 `pg_aggregate_fnoid_index` OID 2650) — verify whether bootstrap
 populates that path too.
+
+## 2026-05-19 loop 22 (batched-51)
+
+`pgProcEntry` gains a `Kind byte` field (`internal/initdb/initdb.go`).
+`pgProcRow` consults `e.Kind` for the prokind char; when zero the new
+`derivePgProcKind(handlerName)` helper falls back to the upstream
+`pg_proc.dat` handler-name convention — `aggregate_dummy → 'a'`,
+prefix `window_ → 'w'`, otherwise `'f'`. This recovers the canonical
+PROKIND value for every seed entry without touching the 3397-row
+`pg_proc_seed_data.go` table by hand: all 119 `aggregate_dummy`
+entries (count/avg/sum/min/max/variance/stddev/regr_*/percentile/…)
+emit `prokind='a'`, all 19 `window_*` entries (row_number/rank/
+dense_rank/lag/lead/first_value/last_value/nth_value/…) emit
+`prokind='w'`. AM-handler / type-IO / regular function rows retain
+`prokind='f'`. Explicit `Kind` on a per-entry basis remains the
+override path for entries whose handler name does not encode the
+kind (none today, but future-proofs against pg_proc.dat additions
+where the convention breaks).
+
+Regression coverage (`internal/initdb/pg_proc_bootstrap_test.go`):
+
+- `TestPgProcRowAggregatePrkindIsA` — encodes OID 2147
+  (`count("any")`) and OID 2803 (`count(*)`) through
+  `EncodeRowPG(pgProcColDefs(), pgProcRow(...))` and asserts
+  `payload[96] == 'a'` so the on-disk FormData_pg_proc byte that
+  PG18's `Anum_pg_proc_prokind` deformer reads is canonical.
+- `TestPgProcRowWindowPrkindIsW` — same for OID 3100 (`row_number`)
+  and OID 3101 (`rank`), pinning `payload[96] == 'w'`.
+- `TestPgProcRowExplicitKindOverridesDerivation` — synthetic entry
+  with `Kind='p'` plus `HandlerName="aggregate_dummy"` produces
+  `payload[96] == 'p'` so the override path stays load-bearing.
+- `TestDerivePgProcKind` — direct unit pin on the handler-name
+  derivation table including the boundary `len("window_") == 7`
+  case (must NOT match the window prefix).
+
+Existing pinning tests stay green:
+- `TestPgProcRowBtreeHandlerMatchesFormPgProc` continues to assert
+  `payload[96] == 'f'` for the bthandler AM-handler row (handler
+  name `"bthandler"` triggers the default-`'f'` arm).
+- `TestPgProcInitialEntriesCoverAMHandlers`,
+  `TestBootstrapPgProcTuplesWritesRowsToBase1And5`,
+  `TestPgProcRowStatGetWalReceiverIsSRF`,
+  `TestPgProcAttrsMatchesPg18FormPgProc` — all PASS.
+
+`go test ./internal/executor/ ./internal/catalog/ ./internal/storage/
+ ./internal/server/ ./internal/mvcc/` clean. `./internal/initdb/`
+carries the same 17 pre-existing baseline failures inherited from
+batched-50 (none touch the pg_proc bootstrap path).
+`TestE2E_FailoverGoopgToPG/async` was NOT re-run in this loop;
+that verification is the first step of batched-52.
+
+### Next loop (batched-52)
+
+Re-run `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+'TestE2E_FailoverGoopgToPG/async' ./internal/testport/`. If the
+42809 "count is not an aggregate function" symptom is closed, the
+likely next residual is `pg_aggregate` lookup (PG18's
+`ParseFuncOrColumn → resolve_aggregate_transtype` issues
+`SearchSysCache1(AGGFNOID, aggfnoid)` once parse_analyze accepts
+the aggregate call). Verify whether goopg's basebackup payload
+contains `pg_aggregate` heap rows for `aggfnoid=2147/2803` and that
+`pg_aggregate_fnoid_index` (OID 2650) is bootstrapped with a
+populated btree (same family as batched-50 fix for OID 2691). If
+not, file batched-52 work analogous to batched-50: build the
+8-column FormData_pg_aggregate rows, write to base/{1,5}/2600 and
+the global/ shadow, and bootstrap a populated 2650 btree keyed on
+aggfnoid (oid_ops).

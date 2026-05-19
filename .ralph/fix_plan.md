@@ -11125,6 +11125,47 @@ relcache init → replication readiness) and intra-package grouped.
       42809; the likely next residual is `pg_aggregate` lookup
       (`AGGFNOID` syscache / `pg_aggregate_fnoid_index` OID
       2650) — verify whether bootstrap populates that path too.
+    - PARTIAL PROGRESS 2026-05-19 (loop 22, batched-51): `pgProcEntry`
+      gains a `Kind byte` field (`internal/initdb/initdb.go`);
+      `pgProcRow` consults `e.Kind` and falls back to a new
+      `derivePgProcKind(handlerName)` helper that recovers the
+      canonical PROKIND from the upstream pg_proc.dat handler-name
+      convention — `aggregate_dummy → 'a'`, prefix `window_ → 'w'`,
+      otherwise `'f'`. This flips all 119 aggregate seed entries
+      (count/avg/sum/min/max/variance/stddev/regr_*/percentile/…)
+      and all 19 window-function entries (row_number/rank/dense_rank/
+      lag/lead/first_value/last_value/nth_value/…) to the correct
+      prokind char with zero churn against the 3397-row
+      `pg_proc_seed_data.go` table. Explicit `Kind` on a per-entry
+      basis remains the override path. Regression tests added in
+      `internal/initdb/pg_proc_bootstrap_test.go`:
+      `TestPgProcRowAggregatePrkindIsA` (pins payload[96]='a' for
+      OID 2147 count("any") and OID 2803 count(*) via EncodeRowPG),
+      `TestPgProcRowWindowPrkindIsW` (same for OID 3100/3101),
+      `TestPgProcRowExplicitKindOverridesDerivation` (synthetic
+      Kind='p' override), `TestDerivePgProcKind` (helper unit pin
+      including the `len("window_") == 7` boundary case).
+      Existing `TestPgProcRowBtreeHandlerMatchesFormPgProc` still
+      asserts prokind='f' for the bthandler AM-handler row and
+      passes unchanged.
+      Verified: `go test ./internal/executor/ ./internal/catalog/
+      ./internal/storage/ ./internal/server/ ./internal/mvcc/` —
+      all PASS. `./internal/initdb/` carries the same 17
+      pre-existing baseline failures inherited from batched-50
+      (none touch the pg_proc bootstrap path).
+      `TestE2E_FailoverGoopgToPG/async` was NOT re-run in this
+      loop; that verification is the first step of batched-52.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 22 (batched-51)" section).
+      Next loop (batched-52): re-run the failover test. If 42809
+      closes, the likely next residual is `pg_aggregate` lookup
+      (PG18's `resolve_aggregate_transtype` issues
+      `SearchSysCache1(AGGFNOID, aggfnoid)`). Verify whether
+      goopg's basebackup payload contains `pg_aggregate` heap rows
+      for aggfnoid=2147/2803 and `pg_aggregate_fnoid_index` (OID
+      2650) is bootstrapped with a populated btree (same family as
+      batched-50 fix for OID 2691). If not, mirror batched-50's
+      8-column FormData_pg_aggregate + populated-btree pattern.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
