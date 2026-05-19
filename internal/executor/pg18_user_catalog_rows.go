@@ -95,11 +95,12 @@ func pgAttributeColumnsPG18() []catalog.Column {
 // a PG18-canonical pg_attribute row: typlen (attlen), typbyval (attbyval),
 // typalign (attalign), typstorage (attstorage).
 type userTypeAttrs struct {
-	TypLen     int16 // -1 == variable-length
-	TypByVal   bool
-	TypAlign   byte // 'c' | 's' | 'i' | 'd'
-	TypStorage byte // 'p' | 'e' | 'x' | 'm'
-}
+		TypLen        int16 // -1 == variable-length
+		TypByVal      bool
+		TypAlign      byte // 'c' | 's' | 'i' | 'd'
+		TypStorage    byte // 'p' | 'e' | 'x' | 'm'
+		TypCollation  uint32
+	}
 
 // userTypeAttrsForOID returns the PG18 pg_type attributes for the OIDs that
 // user CREATE TABLE can produce. Values match
@@ -115,26 +116,26 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case 18: // "char"
 		return userTypeAttrs{TypLen: 1, TypByVal: true, TypAlign: 'c', TypStorage: 'p'}
-	case 19: // name
-		return userTypeAttrs{TypLen: 64, TypByVal: false, TypAlign: 'c', TypStorage: 'p'}
+	case 19: // name -- pg_type.dat: typcollation => 'C' (C_COLLATION_OID = 950)
+		return userTypeAttrs{TypLen: 64, TypByVal: false, TypAlign: 'c', TypStorage: 'p', TypCollation: cCollationOID}
 	case catalog.OIDInt8: // 20
 		return userTypeAttrs{TypLen: 8, TypByVal: true, TypAlign: 'd', TypStorage: 'p'}
 	case catalog.OIDInt2: // 21
 		return userTypeAttrs{TypLen: 2, TypByVal: true, TypAlign: 's', TypStorage: 'p'}
 	case catalog.OIDInt4: // 23
 		return userTypeAttrs{TypLen: 4, TypByVal: true, TypAlign: 'i', TypStorage: 'p'}
-	case catalog.OIDText: // 25
-		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDText: // 25 -- pg_type.dat: typcollation => 'default'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x', TypCollation: defaultCollationOID}
 	case catalog.OIDOID: // 26
 		return userTypeAttrs{TypLen: 4, TypByVal: true, TypAlign: 'i', TypStorage: 'p'}
 	case catalog.OIDFloat4: // 700
 		return userTypeAttrs{TypLen: 4, TypByVal: true, TypAlign: 'i', TypStorage: 'p'}
 	case catalog.OIDFloat8: // 701
 		return userTypeAttrs{TypLen: 8, TypByVal: true, TypAlign: 'd', TypStorage: 'p'}
-	case catalog.OIDBpChar: // 1042
-		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
-	case catalog.OIDVarChar: // 1043
-		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDBpChar: // 1042 -- pg_type.dat: typcollation => 'default'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x', TypCollation: defaultCollationOID}
+	case catalog.OIDVarChar: // 1043 -- pg_type.dat: typcollation => 'default'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x', TypCollation: defaultCollationOID}
 	case catalog.OIDDate: // 1082
 		return userTypeAttrs{TypLen: 4, TypByVal: true, TypAlign: 'i', TypStorage: 'p'}
 	case catalog.OIDTime: // 1083
@@ -164,8 +165,18 @@ const (
 
 	// minFrozenXID matches initdb's bootstrap value for relfrozenxid /
 	// relminmxid on freshly created relations (transam.h FirstNormalTransactionId).
-	minFrozenXID int64 = 3
+	minFrozenXID  int64 = 3
 	minFrozenMXID int64 = 1
+
+	// defaultCollationOID matches PG18's pg_collation_d.h::DEFAULT_COLLATION_OID
+	// (100). Used for text/varchar/bpchar pg_attribute.attcollation so a
+	// PG-side standby can resolve the default collation when planning
+	// expressions like `WHERE textcol = 'literal'`.
+	defaultCollationOID uint32 = 100
+	// cCollationOID matches PG18's pg_collation_d.h::C_COLLATION_OID (950).
+	// Used for the `name` type whose pg_type.dat entry pins
+	// `typcollation => 'C'`.
+	cCollationOID uint32 = 950
 )
 
 // buildUserPGClassRow constructs a 34-column PG18-canonical pg_class row for
@@ -277,7 +288,7 @@ func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 		NewBoolDatum(false),                       // attisdropped
 		NewBoolDatum(true),                        // attislocal
 		NewIntDatum(0),                            // attinhcount
-		NewIntDatum(0),                            // attcollation
+		NewIntDatum(int64(attrs.TypCollation)),    // attcollation
 		// attacl / attoptions / attfdwoptions / attmissingval are nullable
 		// varlena columns; PG18 stores NULL when unset. NullDatum signals
 		// EncodeRowPG to skip the column and the bitmap helper to clear

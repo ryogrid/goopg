@@ -329,3 +329,44 @@ func TestPgRowHasVarWidthDetectsVarlenaCols(t *testing.T) {
 		t.Errorf("pgRowHasVarWidth(varCols, nullVarRow) = true, want false (null varlena does not stamp HEAP_HASVARWIDTH)")
 	}
 }
+
+
+// TestBuildUserPGAttributeRowEncodesTypCollation pins that runtime DDL emits
+// PG18-canonical attcollation values: DEFAULT_COLLATION_OID (100) for
+// text/varchar/bpchar, C_COLLATION_OID (950) for name, 0 for the
+// non-collatable scalar types. Regression for M0106-0010 batched-53: PG
+// standby raised "42P22 could not determine which collation to use for
+// string comparison" on `WHERE textcol = literal` because every user
+// pg_attribute row was emitting attcollation=0.
+func TestBuildUserPGAttributeRowEncodesTypCollation(t *testing.T) {
+	cases := []struct {
+		typeName    string
+		wantCollOID uint32
+	}{
+		{"text", defaultCollationOID},
+		{"varchar", defaultCollationOID},
+		{"bpchar", defaultCollationOID},
+		{"int4", 0},
+		{"int8", 0},
+		{"bool", 0},
+		{"bytea", 0},
+		{"timestamp", 0},
+		{"numeric", 0},
+	}
+	tbl := &catalog.Table{Schema: "public", Name: "t", OID: 16500}
+	const attcollationIdx = 19 // 0-indexed position in pgAttributeColumnsPG18()
+	for _, tc := range cases {
+		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName}, Ordinal: 0}
+		row := buildUserPGAttributeRow(tbl, col)
+		got := uint32(row[attcollationIdx].Int)
+		if got != tc.wantCollOID {
+			t.Errorf("%s: attcollation=%d want %d", tc.typeName, got, tc.wantCollOID)
+		}
+	}
+	// `name` is not reachable through TypeNameToOID (it falls back to text);
+	// verify the OID 19 mapping directly so the cCollationOID branch is
+	// pinned for the day a NAMEOID user column path lands.
+	if got := userTypeAttrsForOID(19).TypCollation; got != cCollationOID {
+		t.Errorf("name (OID 19) TypCollation=%d want %d", got, cCollationOID)
+	}
+}

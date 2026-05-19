@@ -2404,3 +2404,117 @@ column; (b) `pg_attribute.attcollation` for `bench_log.src` is 0.
 Audit the heap row goopg writes for bench_log against PG18's
 expected `attcollation = 100` (DEFAULT_COLLATION_OID) for text
 columns, fix the encoder if needed, and re-run the failover test.
+
+## 2026-05-20 loop 24 (batched-53)
+
+The `42P22 could not determine which collation to use for string comparison`
+residual at `parse_collate.c::assign_collations_walker` (`check_collation_set,
+varlena.c:1645`) is **CLOSED**.
+
+### Root cause (confirmed)
+
+Hypothesis (b) from batched-52 was correct.  `pg_class` has no
+`relcollation` column in PG18 (only `pg_type.typcollation` and
+`pg_attribute.attcollation` exist); hypothesis (a) was a misread of the
+catalog schema.  Audit narrowed the failure to one site: every
+`pg_attribute` row produced by the runtime DDL path
+(`internal/executor/pg18_user_catalog_rows.go::buildUserPGAttributeRow`)
+emitted `attcollation = 0` regardless of the column's type.  PG's
+parser computes the expression collation from
+`pg_attribute.attcollation`, defaulting to `pg_type.typcollation` only
+during *attribute creation* (see `heap.c::780-820`); once the tuple is
+on disk with `attcollation = 0`, the standby's
+`assign_collations_walker` sees a non-collatable text column and
+raises `42P22`.
+
+PG18's catalog data shows the canonical defaults goopg must reproduce:
+
+| pg_type.dat OID | typname              | typcollation literal | numeric OID |
+| --------------: | -------------------- | -------------------- | ----------: |
+| 19              | name                 | `'C'`                | 950         |
+| 25              | text                 | `'default'`          | 100         |
+| 1042            | bpchar               | `'default'`          | 100         |
+| 1043            | varchar              | `'default'`          | 100         |
+| other scalars   | int*/float*/bool/... | (unset)              | 0           |
+
+### Fix
+
+`internal/executor/pg18_user_catalog_rows.go`:
+
+1. `userTypeAttrs` gains a `TypCollation uint32` field (no
+   serialization concern — it never enters a heap tuple directly).
+2. New package-level constants
+   `defaultCollationOID = 100` (matches
+   `pg_collation_d.h::DEFAULT_COLLATION_OID`) and
+   `cCollationOID = 950` (matches `C_COLLATION_OID`).
+3. `userTypeAttrsForOID` populates `TypCollation`:
+   * 19 (`name`) → 950
+   * 25 (`text`), 1042 (`bpchar`), 1043 (`varchar`) → 100
+   * everything else → 0 (struct zero-value)
+4. `buildUserPGAttributeRow` replaces the hardcoded
+   `NewIntDatum(0)` at the attcollation slot with
+   `NewIntDatum(int64(attrs.TypCollation))`.
+
+initdb's `pgAttributeRow` path (for nailed-catalog attributes only
+— pg_class/pg_attribute/pg_proc/...) is intentionally unchanged in
+this loop; nailed-catalog `attcollation = 0` matches PG's
+hand-curated bootstrap data (`pg_attribute.h` declares
+`attcollation` as `BKI_LOOKUP_OPT(pg_collation)` — the OPT means
+"may be 0" and PG's own bootstrap leaves catalog-table text
+columns at 0 because the relcache never plans expressions over
+them).  Should a future failure prove that wrong, the same
+`userTypeAttrsForOID` table is the single source of truth to
+mirror.
+
+### Regression pin
+
+`internal/executor/pg18_user_catalog_rows_test.go::TestBuildUserPGAttributeRowEncodesTypCollation`
+constructs a `catalog.Column` for each interesting type, calls
+`buildUserPGAttributeRow`, and asserts the attcollation Datum at
+row index 19 matches the table above (including a direct
+`userTypeAttrsForOID(19)` check for `name` since `TypeNameToOID`
+falls back to text and would mask a regression).
+
+### Verification
+
+* `go test -count=1 ./internal/executor/` — PASS.
+* `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+  'TestE2E_FailoverGoopgToPG/async' ./internal/testport/` — the
+  `WHERE src = 'pre'` query now passes PG's parser without raising
+  42P22 (confirmed via `goopg-diag: exec_simple_query start: SELECT
+  count(*) FROM public.bench_log WHERE src = 'pre'` reaching the
+  executor on PG side).  The test still fails on a new, unrelated
+  residual:
+
+  ```
+  ERROR: XX000: xlog flush request 10307B0/0 is not satisfied ---
+  flushed only to 0/1091DA0
+  CONTEXT:  writing block 0 of relation "base/5/1249"
+  ```
+
+  `base/5/1249` is the pg_attribute heap; PG's checkpointer is
+  trying to flush a buffer whose page LSN (`10307B0/0`) is far
+  ahead of the WAL `flushedUpto` (`0/1091DA0`).  This is the next
+  residual, tracked as batched-54.
+
+### Next loop (batched-54)
+
+Diagnose the xlog flush mismatch.  Two leading hypotheses:
+
+(a) goopg's WAL record for the pg_attribute heap writes (runtime
+    DDL path) stamps an LSN past the segment that the standby has
+    actually received — likely a confused
+    `XLogFlush()` call site or a stale `LogwrtResult.Flush` field
+    in the standby's bootstrap state.
+
+(b) goopg writes the heap buffer with a page LSN it forgot to
+    accompany with a matching WAL record (PG's invariant:
+    `PageGetLSN(page) <= LogwrtResult.Write`).  The buffer's LSN
+    was inherited from a basebackup snapshot that included pages
+    from a higher WAL position than the WAL segments shipped.
+
+Inspect the basebackup ordering: do we copy data files before or
+after taking the checkpoint LSN?  PG's `pg_basebackup` snapshots
+the checkpoint LSN first, then walks data files; goopg's
+implementation in `internal/server/basebackup/` should mirror
+that.

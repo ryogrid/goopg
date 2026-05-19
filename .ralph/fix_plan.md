@@ -11255,6 +11255,92 @@ relcache init → replication readiness) and intra-package grouped.
       and `attcollation` against PG18's
       `DEFAULT_COLLATION_OID = 100` for text columns and patch
       whichever site is emitting zero.
+    - PARTIAL PROGRESS 2026-05-20 (loop 24, batched-53): the 42P22
+      "could not determine which collation to use for string
+      comparison" residual is CLOSED. New residual surfaced and
+      isolated.
+      Root cause of 42P22 (hypothesis (b) confirmed; hypothesis
+      (a) was a misread — pg_class has no relcollation column in
+      PG18, only pg_type.typcollation and
+      pg_attribute.attcollation exist):
+      every pg_attribute row produced by the runtime DDL path
+      (`internal/executor/pg18_user_catalog_rows.go::
+      buildUserPGAttributeRow`) hardcoded `attcollation = 0` for
+      every column type. PG's `assign_collations_walker` sees a
+      non-collatable text column on the standby and raises 42P22
+      at `parse_collate.c::check_collation_set`.
+      Fix landed (three coordinated edits in one file,
+      `internal/executor/pg18_user_catalog_rows.go`):
+      (1) `userTypeAttrs` struct gains a `TypCollation uint32`
+          field.
+      (2) Two new package-level constants:
+          `defaultCollationOID = 100` (mirrors
+          `pg_collation_d.h::DEFAULT_COLLATION_OID`) and
+          `cCollationOID = 950` (mirrors `C_COLLATION_OID`).
+          Doc comments cite the upstream defines.
+      (3) `userTypeAttrsForOID` populates `TypCollation` from
+          PG18 `pg_type.dat`:
+            - 19  `name`    → 950
+            - 25  `text`    → 100
+            - 1042 `bpchar` → 100
+            - 1043 `varchar`→ 100
+            - everything else → 0 (struct zero value)
+          `buildUserPGAttributeRow` swaps the hardcoded
+          `NewIntDatum(0)` at the attcollation slot (row index
+          19) for `NewIntDatum(int64(attrs.TypCollation))`.
+      Initdb's `pgAttributeRow` path (nailed catalog attributes
+      only — pg_class/pg_attribute/pg_proc/...) is intentionally
+      unchanged this loop: nailed-catalog `attcollation = 0`
+      matches PG's hand-curated bootstrap data
+      (`pg_attribute.h` declares `attcollation` as
+      `BKI_LOOKUP_OPT(pg_collation)` — the OPT means "may be 0"
+      and PG's own bootstrap leaves catalog-table text columns
+      at 0 because the relcache never plans expressions over
+      them). The single source of truth lives in
+      `userTypeAttrsForOID` should a future failure prove that
+      wrong.
+      Regression pin:
+        - `internal/executor/pg18_user_catalog_rows_test.go::
+          TestBuildUserPGAttributeRowEncodesTypCollation`
+          constructs a `catalog.Column` for each interesting
+          type, calls `buildUserPGAttributeRow`, and asserts
+          the attcollation Datum at row index 19 matches the
+          table above; includes a direct
+          `userTypeAttrsForOID(19)` check for `name` (since
+          `catalog.TypeNameToOID` falls back to text and would
+          mask a regression at the `name` branch).
+      Verified: `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+      'TestE2E_FailoverGoopgToPG/async' ./internal/testport/` —
+      PG-side `goopg-diag: exec_simple_query start: SELECT
+      count(*) FROM public.bench_log WHERE src = 'pre'` now
+      reaches the executor without raising 42P22. The test
+      still fails on a new, unrelated residual:
+        ERROR: XX000: xlog flush request 10307B0/0 is not
+        satisfied --- flushed only to 0/1091DA0
+        CONTEXT: writing block 0 of relation "base/5/1249"
+      `base/5/1249` is the pg_attribute heap; PG's checkpointer
+      is trying to flush a buffer whose page LSN (`10307B0/0`)
+      is far ahead of WAL `flushedUpto` (`0/1091DA0`). This is
+      the next residual, tracked as batched-54. Executor
+      package tests all pass:
+        `go test -count=1 ./internal/executor/` — PASS.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-20 loop 24 (batched-53)" section).
+      Next loop (batched-54): diagnose `XX000 xlog flush
+      request 10307B0/0 is not satisfied`. Two leading
+      hypotheses:
+      (a) goopg writes runtime-DDL pg_attribute pages with a
+          page LSN inherited from a basebackup snapshot that
+          included pages at a higher WAL position than the WAL
+          segments shipped (PG invariant violated:
+          `PageGetLSN(page) <= LogwrtResult.Write`);
+      (b) goopg's basebackup ordering snapshots data files
+          BEFORE pinning the checkpoint LSN, so the shipped
+          pages carry future LSNs.
+      Audit `internal/server/basebackup/` against PG's
+      `pg_basebackup` semantics (checkpoint LSN first, then
+      walk data files) and `internal/storage/` for the
+      page-LSN stamping path.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
