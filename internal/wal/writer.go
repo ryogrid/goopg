@@ -798,8 +798,16 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 		if err != nil {
 			return 0, 0, fmt.Errorf("wal: stat %s: %w", e.Name(), err)
 		}
-		if st.Size() < 0 || st.Size() > segSize {
+		if st.Size() < 0 {
 			return 0, 0, fmt.Errorf("wal: invalid segment size %d for %s", st.Size(), e.Name())
+		}
+		// Skip segments whose size doesn't match the configured segment size.
+		// This handles the case where goopg init always creates a 16MB bootstrap
+		// segment but the server may be configured with a different segment size
+		// (e.g. in tests). Pre-fix, parseSegmentName silently skipped PG-format
+		// names; now we skip explicitly on size mismatch. M0106-0010 batched-35.
+		if st.Size() > segSize {
+			continue
 		}
 		segSizes[segNo] = st.Size()
 	}

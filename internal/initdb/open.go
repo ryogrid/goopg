@@ -651,7 +651,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			if txnMgr.TakeRelcacheInvalPending() {
 				payload = wal.EncodeXactCommitInval(xid)
 				_ = catalog.WithRelCacheInitLock(func() error {
-					return catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid)
+					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
+						return err
+					}
+					// Regenerate pg_internal.init immediately after unlinking
+					// so the primary always has fresh copies for pg_basebackup.
+					// The nailed-rel lists are static (system catalogs only).
+					// M0106-0010 batched-35.
+					return bootstrapRelcacheInitFiles(abs)
 				})
 			} else {
 				payload = wal.EncodeXactCommit(xid)

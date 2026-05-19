@@ -264,10 +264,17 @@ func encodeRecordXLog(payload []byte, prev uint64) ([]byte, int, error) {
 	wrapped := wrapXLogMainData(payload)
 	rmgr, info, xid := classifyXLogRecord(payload)
 	realLen := xlogRecordHeaderSize + len(wrapped)
+	// prev is goopg's 1-based LSN; xl_prev in XLogRecord must be the
+	// 0-based PG LSN (= goopg 1-based - 1). When prev==0 (first record,
+	// InvalidXLogRecPtr), keep it 0. M0106-0010 batched-35.
+	prevPG := prev
+	if prevPG > 0 {
+		prevPG--
+	}
 	header := XLogRecord{
 		TotLen: uint32(realLen),
 		XID:    xid,
-		Prev:   prev,
+		Prev:   prevPG,
 		Info:   info,
 		Rmid:   rmgr,
 	}
@@ -294,20 +301,25 @@ func decodeRecordXLog(stream []byte) ([]byte, int, error) {
 	return decoded.Payload, decoded.Consumed, nil
 }
 
+// formatSegmentName generates a PG-compatible WAL segment filename for
+// the given absolute segment number (segNo * DefaultSegmentSize = first byte
+// of the segment). Uses TLI=1 (the bootstrap timeline). Mirrors
+// XLogFilePath() in postgres/src/include/access/xlog_internal.h.
 func formatSegmentName(segNo uint64) string {
-	return fmt.Sprintf("%024X", segNo)
+	const tli = 1
+	totalBytes := segNo * uint64(DefaultSegmentSize)
+	logNo := uint32(totalBytes >> 32)
+	segInLog := uint32((totalBytes & 0xFFFFFFFF) / uint64(DefaultSegmentSize))
+	return fmt.Sprintf("%08X%08X%08X", tli, logNo, segInLog)
 }
 
+// parseSegmentName parses a PG-compatible WAL segment filename
+// (24 hex chars: TLI + LOG + SEG, each 8 hex digits) and returns
+// the absolute segment number such that segNo*DefaultSegmentSize equals
+// the segment's first byte position. Returns false for non-WAL filenames.
 func parseSegmentName(name string) (uint64, bool) {
-	if len(name) != 24 {
-		return 0, false
-	}
-	var seg uint64
-	_, err := fmt.Sscanf(name, "%024X", &seg)
-	if err != nil {
-		return 0, false
-	}
-	return seg, true
+	_, segno, ok := ParseXLogFileName(name, 0)
+	return segno, ok
 }
 
 func segmentForLSN(lsn uint64, segSize int64) uint64 {

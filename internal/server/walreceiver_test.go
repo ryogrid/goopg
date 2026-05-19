@@ -134,7 +134,7 @@ func TestWalReceiverTrimsOverlappingRawWALData(t *testing.T) {
 	if err := srcWAL.FlushUpTo(end); err != nil {
 		t.Fatalf("src FlushUpTo: %v", err)
 	}
-	rawPath := filepath.Join(srcDir, "000000000000000000000000")
+	rawPath := filepath.Join(srcDir, wal.XLogFileName(1, 0, wal.DefaultSegmentSize))
 	raw, err := os.ReadFile(rawPath)
 	if err != nil {
 		t.Fatalf("ReadFile raw WAL: %v", err)
@@ -171,7 +171,7 @@ func TestWalReceiverTrimsOverlappingRawWALData(t *testing.T) {
 	if err := dstWAL.FlushUpTo(dstWAL.WrittenLSN()); err != nil {
 		t.Fatalf("dst FlushUpTo: %v", err)
 	}
-	gotRaw, err := os.ReadFile(filepath.Join(dstDir, "000000000000000000000000"))
+	gotRaw, err := os.ReadFile(filepath.Join(dstDir, wal.XLogFileName(1, 0, wal.DefaultSegmentSize)))
 	if err != nil {
 		t.Fatalf("ReadFile dst WAL: %v", err)
 	}
