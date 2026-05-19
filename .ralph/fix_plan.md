@@ -11057,6 +11057,74 @@ relcache init → replication readiness) and intra-package grouped.
       that `pg_proc_proname_args_nsp_index` (OID 2691) is
       bootstrapped with at least an empty metapage (same family
       as batched-48's OID 2665 fix).
+    - PARTIAL PROGRESS 2026-05-19 (loop 21, batched-50): the
+      42883 "function count() does not exist" symptom is CLOSED.
+      Root cause: `pg_proc_proname_args_nsp_index` (OID 2691)
+      was an empty btree placeholder (metapage + zero-entry
+      leaf) at `base/{1,5}/2691` and `global/2691`. PG18's
+      `ParseFuncOrColumn → FuncnameGetCandidates →
+      SearchSysCacheList1(PROCNAMEARGSNSP, "count")` is backed
+      by 2691, so an empty index returned no candidates and
+      reported "function does not exist" even though the heap
+      already contained the canonical pg_proc rows
+      (OID 2147 for count("any"), OID 2803 for count(*)).
+      Fix landed: new file
+      `internal/initdb/pg_proc_proname_args_nsp_index_bootstrap.go`
+      with three layered builders:
+      (a) `pgEncodeOidvectorForIndex(oids)` — on-disk binary
+          form of a pg_proc.proargtypes oidvector (24-byte
+          ArrayType header + n*4-byte values).
+      (b) `pgBuildIndexTupleProcKey(blk, off, proname,
+          proargtypes, pronamespace)` — variable-length
+          IndexTuple builder; sets `INDEX_VAR_MASK` (0x4000) on
+          `t_info` because proargtypes is varlena. For count(*)
+          the tuple is exactly 104 bytes (8 header + 64
+          NameData + 24 empty oidvector + 4 oid + 4 MAXALIGN).
+      (c) `pgBuildBtreeBulkLoadVariable(sortedTuples,
+          nkeyatts)` — generalises `pgBuildBtreeBulkLoadSized`
+          to non-fixed tuple sizes by reserving
+          `max-tuple-size + 4` for the P_HIKEY budget on every
+          non-rightmost leaf. Single-internal-root invariant
+          verified for the pg_proc scale (~3400 entries ⇒ ~50
+          leaves ⇒ ~50 downlinks fit easily in the 8152-byte
+          root payload).
+      `bootstrapPgProcPronameArgsNspIndex` ties them together:
+      iterates `pgProcInitialEntries()` aligned 1:1 with the
+      heap TIDs from `bootstrapPgProcTuples`, normalises nil
+      proargtypes to `[2281]` (matching `pgProcRow`'s default),
+      sorts per PG18 `btoidvectorcmp` semantics (proname →
+      vector length → vector elements → pronamespace), builds
+      the tuples, writes to all three target paths.  Wired in
+      `initdb.go::Init` right after `bootstrapPgProcOidIndex`.
+      Tests added: `pg_proc_proname_args_nsp_index_test.go`
+      with `TestBootstrapPgProcPronameArgsNspIndexWritesPopulatedBtree`
+      (file exists in all three locations, multi-block btree,
+      NameData("count") in some leaf), `TestPgBuildIndexTupleProcKeyLayout`
+      (byte-level pin for the count(*) tuple), and
+      `TestPgEncodeOidvectorForIndex{Empty,OneElement}` (direct
+      unit coverage). All pass.
+      Verified: `TestE2E_FailoverGoopgToPG/async` — PG standby's
+      `count` lookup now succeeds. New residual on the same
+      query:
+        ERROR: 42809: count(*) specified, but count is not an
+        aggregate function at character 8
+      `pgProcRow` hardcodes `prokind='f'` (function) for every
+      entry, but `count` is an aggregate and PG18 needs
+      `prokind='a'`. PG18 finds the index row (the fix worked)
+      but `ParseFuncOrColumn → check_agg_arguments` refuses the
+      `agg(*)` call shape because the kind disagrees.
+      Pre-existing baseline failures unchanged (17 in
+      ./internal/initdb/, 2 in ./internal/wal/).
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 21 (batched-50)" section).
+      Next loop (batched-51): plumb a per-entry `Kind byte` (or
+      `IsAggregate bool`) through `pgProcEntry`, default to
+      `'f'` for non-aggregate rows, set `'a'` on every
+      aggregate (rows whose `HandlerName == "aggregate_dummy"`).
+      Confirm `TestE2E_FailoverGoopgToPG/async` advances past
+      42809; the likely next residual is `pg_aggregate` lookup
+      (`AGGFNOID` syscache / `pg_aggregate_fnoid_index` OID
+      2650) — verify whether bootstrap populates that path too.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

@@ -2105,3 +2105,104 @@ Diagnose the `function count() does not exist` error.
    (OID 2665).
 3. Re-run `TestE2E_FailoverGoopgToPG/async` until the standby
    completes the SELECT and reports a row count ≥ 1.
+
+## 2026-05-19 loop 21 (batched-50)
+
+### Diagnosis
+
+The 42883 "function count() does not exist" error was a populated-index
+problem, not a missing-heap-row one. Confirmed via `pg_proc_seed_data.go`
+that goopg already bootstraps the canonical `count` entries (OID 2147 for
+`count("any")`, OID 2803 for `count(*)`). The hot path on the PG standby
+is `ParseFuncOrColumn → FuncnameGetCandidates → SearchSysCacheList1(
+PROCNAMEARGSNSP, CStringGetDatum("count"))` (parse_func.c:629). That
+syscache is backed by `pg_proc_proname_args_nsp_index` (OID 2691). Before
+this loop, `base/{1,5}/2691` and `global/2691` were empty btree
+placeholders (metapage + zero-entry root) written by the per-DB and
+shared-index initialisation loops in `initdb.go`, so the syscache
+returned no rows and parse-analyse reported the function did not exist.
+
+The hint "with at least an empty metapage" carried over from
+batched-48's pg_constraint fix was misleading. `pg_constraint` genuinely
+has zero user-table rows on the standby (M0106-0011 territory), so an
+empty index returned the right answer (no constraints). `pg_proc` is
+populated at bootstrap and the standby legitimately needs to find its
+3397 rows via the name index.
+
+### Fix landed
+
+New file `internal/initdb/pg_proc_proname_args_nsp_index_bootstrap.go`
+adds three layered builders:
+
+1. `pgEncodeOidvectorForIndex(oids)` — produces the on-disk binary form
+   of an oidvector value (24-byte ArrayType header + n*4-byte values,
+   `vl_len_ = (24 + 4n) << 2`). Matches `oidVectorBytes` in initdb.go
+   and PG18 `buildoidvector` byte-for-byte.
+2. `pgBuildIndexTupleProcKey(blk, off, proname, proargtypes, pronamespace)`
+   — variable-length IndexTuple builder. Sets `INDEX_VAR_MASK` (0x4000)
+   on `t_info` because proargtypes is varlena; tuple body layout is
+   `proname (64) | proargtypes (24+4n) | pronamespace (4)`, MAXALIGN'd
+   to 8. For count(*) the tuple is exactly 104 bytes.
+3. `pgBuildBtreeBulkLoadVariable(sortedTuples, nkeyatts)` — generalises
+   `pgBuildBtreeBulkLoadSized` to non-fixed tuple sizes. Reserves
+   `max-tuple-size + 4` (P_HIKEY budget) on every non-rightmost leaf so
+   packing is monotonic and never has to be rewound. Single-internal-
+   root assumption verified for the pg_proc scale (~50 leaves of ~75
+   tuples each, ~50 downlinks of ~104 B fit easily in the 8152-byte
+   root payload).
+
+`bootstrapPgProcPronameArgsNspIndex` ties them together: iterates
+`pgProcInitialEntries()` aligned 1:1 with the heap TIDs returned by
+`bootstrapPgProcTuples`, normalises a nil proargtypes to `[2281]`
+(matching `pgProcRow`'s default), sorts the entries per PG18
+`btoidvectorcmp` semantics (proname → vector length → vector
+elements → pronamespace), builds the tuples, and writes the file
+to `base/1/2691`, `base/5/2691`, and `global/2691`.
+
+Call site wired in `initdb.go::Init` right after
+`bootstrapPgProcOidIndex`.
+
+### Tests added
+
+`internal/initdb/pg_proc_proname_args_nsp_index_test.go`:
+
+- `TestBootstrapPgProcPronameArgsNspIndexWritesPopulatedBtree` — pins
+  the file exists in all three locations, is a multi-block btree
+  (>2 blocks ⇒ multi-leaf), and that NameData("count") appears in
+  some leaf.
+- `TestPgBuildIndexTupleProcKeyLayout` — byte-level pin for the
+  count(*) IndexTuple (size 104, INDEX_VAR_MASK set, NameData
+  payload, empty oidvector header, pronamespace=11, zero pad).
+- `TestPgEncodeOidvectorForIndex{Empty,OneElement}` — direct unit
+  coverage of the oidvector encoder for proargtypes=[] (count(*))
+  and proargtypes=[2276] (count("any")).
+
+### Verification
+
+`TestE2E_FailoverGoopgToPG/async` — PG standby's `count` lookup now
+succeeds. New residual on the same query:
+
+    ERROR: 42809: count(*) specified, but count is not an aggregate
+    function at character 8
+
+This is `ParseFuncOrColumn → check_agg_arguments` failing because
+`pgProcRow` hardcodes `prokind='f'` (function) for every entry, but the
+two `count` rows are aggregates and require `prokind='a'`. PG18 finds
+the row via the index (the fix worked) but then refuses the call shape
+because the kind disagrees. This is the new blocker for batched-51.
+
+All affected packages pass: `internal/executor`, `internal/catalog`,
+`internal/storage`, `internal/server`, `internal/mvcc`. Pre-existing
+baseline failures unchanged: 17 in `./internal/initdb/`, 2 in
+`./internal/wal/`.
+
+### Next loop (batched-51)
+
+Plumb a per-entry `Kind byte` (or `IsAggregate bool`) through
+`pgProcEntry`, default to `'f'` for non-aggregate rows, set `'a'` on
+the two `count` entries (and every other aggregate in
+`pg_proc_seed_data.go` whose `HandlerName == "aggregate_dummy"`).
+Confirm `TestE2E_FailoverGoopgToPG/async` advances past 42809; the
+likely next residual is `pg_aggregate` lookup (`AGGFNOID` syscache /
+`pg_aggregate_fnoid_index` OID 2650) — verify whether bootstrap
+populates that path too.

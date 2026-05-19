@@ -338,6 +338,17 @@ func Init(opts Options) error {
 	if err := bootstrapPgProcOidIndex(abs, pgProcTIDs); err != nil {
 		return fmt.Errorf("goopg init: pg_proc_oid_index: %w", err)
 	}
+	// M0106-0010 batched-50: overwrite the empty btree placeholder at
+	// base/{1,5}/2691 with a populated multi-leaf btree carrying one
+	// (proname, proargtypes, pronamespace) IndexTuple per pg_proc heap
+	// row. Without this, the PG-standby parse-analyse path returns no
+	// candidates for any built-in function lookup (FuncnameGetCandidates
+	// → SearchSysCacheList1(PROCNAMEARGSNSP, ...)) and a query like
+	// `SELECT count(*) FROM <user table>` fails with 42883 "function
+	// count() does not exist".
+	if err := bootstrapPgProcPronameArgsNspIndex(abs, pgProcTIDs); err != nil {
+		return fmt.Errorf("goopg init: pg_proc_proname_args_nsp_index: %w", err)
+	}
 	// M0106-0010 batched-16: overwrite base/{1,5}/2617 with all 799
 	// pg_operator rows so PG's OPEROID/OPERNAMENSP syscaches resolve
 	// operator lookups during planning and expression compilation.
