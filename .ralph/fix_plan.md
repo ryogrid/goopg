@@ -11791,6 +11791,23 @@ Operational policy (2026-05-20):
         out of top-40; TPC-H all queries within ±10 % (extra attention to
         q5, q9); `TestE2E_FailoverGoopgToPG/async` PASS;
         `make ralph-state-guard` PASS.
+      - PARTIAL PROGRESS 2026-05-20 (loop 10): Phase C.1 foundation landed.
+        New `internal/executor/opnode.go`: `Slot` concrete struct (implements
+        `TupleSlot`/`SlotView`; `HasRow` flag distinguishes DML nil-rows from
+        empty-column real rows); `OpKind` enum; `OpNode` sum-type with `any`
+        state (GC-safe — raw-bytes deferred to Phase C.3); `opOpen`/`opNext`/
+        `opClose` recursive tree lifecycle; per-kind kernels for SeqScan
+        (concrete `*seqScanOp` method call, no itab), Filter, Project, Limit;
+        `opAdapterState` shim for the remaining 37 operators. New executor.go
+        `BuildFast`/`RunFast` drop-in replacements. 13 new regression tests
+        in `phase_c_test.go`. Design doc:
+        `docs/design/0107-0003-phase-c1-opnode-concrete-executor.md`.
+        `go test -race ./internal/executor/ ./internal/server/ ./internal/planner/
+        ./internal/parser/ ./internal/mctx/` all PASS.
+      - Remaining (Phase C.1 follow-up): migrate sortOp, joinOp/hashJoinOp,
+        insertOp, updateOp, deleteOp to concrete dispatch. Phase C.2: slab
+        indices + Slot.CopyTo. Phase C.3: PlanNode/ExprNode sum-types + parser
+        mctx. TPS and gcBgMarkWorker gates require all hot-path ops migrated.
 
  - [ ] **M0107-0004 — Phase D1: ProcArray + atomic XidGen + CLOG bank locks**
       - Summary: Replace `mvcc.Manager.mu` (gates Begin/SnapshotFor/Commit/

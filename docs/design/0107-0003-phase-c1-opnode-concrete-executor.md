@@ -1,0 +1,148 @@
+# 0107-0003 Phase C.1 — Concrete-Type Volcano Executor (OpNode Framework)
+
+**Status**: accepted  
+**Milestone**: M0107-0003  
+**Parent design**: `docs/design/perf-optimize/03-executor-concrete.md`  
+**Commit**: Phase C.1 initial landing
+
+---
+
+## Problem
+
+`internal/executor` has a two-level interface abstraction:
+
+1. `Operator` interface (4 methods: Open/Next/Close/Schema) — 41 concrete types
+2. `TupleSlot` interface (6 methods) — returned by `Next()`
+
+Every row in the hot execution path incurs:
+- One itab lookup + indirect call for `Operator.Next()`
+- One itab lookup + indirect call for `TupleSlot.Row()` / `TupleSlot.Get()`
+- `Materialize()` deep-copy at every retention boundary (`executor.Run`,
+  sort, hash-join, aggregate)
+
+Additionally, the GC scans `MaterializedSlot.row []Datum` and the embedded
+`arena *mctx.Context` pointer (now `ArenaID`, post-Phase B) in every Datum
+per GC cycle, proportional to row throughput.
+
+## Solution — Phase C.1
+
+Phase C.1 of the design doc lands the framework and migrates the four most
+common hot-path operators to concrete dispatch.
+
+### New types (`internal/executor/opnode.go`)
+
+**`Slot`** — a concrete, stack-allocatable row vessel:
+
+```go
+type Slot struct {
+    schema planner.Schema
+    Cells  []Datum
+    HasRow bool  // false == DML nil-row; true == real row (may have 0 cols)
+}
+```
+
+`Slot` implements both `TupleSlot` and `SlotView` so it is a drop-in
+replacement at all call sites that accept those interfaces. `HasRow`
+distinguishes DML nil-rows (INSERT/UPDATE/DELETE returns `(nil, nil)` to
+signal "no result row") from valid rows whose column list happens to be
+empty (e.g. the input to `SELECT 1`, which has a zero-column Values node).
+
+**`OpNode`** — the tagged-union operator node:
+
+```go
+type OpNode struct {
+    Kind   OpKind        // discriminant
+    childA *OpNode       // primary child; nil if none
+    childB *OpNode       // secondary child; nil if none
+    state  any           // per-Kind state struct (GC-traced)
+}
+```
+
+The `any` state field (vs the `[192]byte` raw-bytes from §3 of the design
+doc) is used in Phase C.1 to remain GC-safe before Phase C.3 moves plan
+trees into mctx. The `any` → raw-bytes refactor is a mechanical change
+once plan allocation is mctx-backed.
+
+**`opNext(n *OpNode, dst *Slot) error`** — the single hot-path entry point.
+Dispatches via `switch n.Kind`; Go's compiler can inline small arms.
+
+### Migrated operators (Phase C.1)
+
+| Kind | State type | Per-row dispatch |
+|------|-----------|-----------------|
+| `OpSeqScan` | `*seqScanOp` | Direct concrete method call (no itab) |
+| `OpFilter`  | `*filterState` | `evalExprSlot` with concrete `*Slot` |
+| `OpProject` | `*projectState` | `evalExpr` per target |
+| `OpLimit`   | `*limitState` | Skip/count with concrete child call |
+
+All other operators (41 total) remain behind `OpAdapter` (one type-assert
+per `opNext` call + the legacy `op.Next()` interface cost — identical to
+pre-Phase-C performance for those paths).
+
+### `BuildFast` and `RunFast`
+
+```go
+func BuildFast(plan planner.Node) (*OpNode, error)
+func RunFast(n *OpNode, ctx *Context) ([]Row, error)
+```
+
+Drop-in replacements for `Build` + `Run`. Non-migrated plan nodes fall
+back to `OpAdapter(Build(plan))`.
+
+## Key design decisions
+
+### `any` state vs `[192]byte` raw bytes
+
+The design doc (§3) calls for `state [opStateSize]byte` with unsafe casts.
+This is unsafe if the opNode slab is mctx-allocated (GC won't trace
+pointers within the bytes). Phase C.1 uses `state any` to remain GC-safe.
+
+Migration path: once Phase C.3 lands (plan tree in mctx), the `state any`
+can be replaced with `state [N]byte` + explicit GC roots, or the slab can
+be moved to the GC heap with pre-declared pointer offsets.
+
+### `HasRow` flag
+
+`len(Cells) == 0` is ambiguous between:
+- DML nil-row (`INSERT ... RETURNING` with no matches, or bare DML)
+- Empty-column real row (SELECT without FROM, `SELECT 1` — the Values
+  node has zero input columns)
+
+`HasRow = false` signals the first; `HasRow = true` signals the second.
+`Reset()` sets `HasRow = false`; `fillFromTupleSlot` sets it based on
+whether the TupleSlot is nil.
+
+### Pointer-based children vs slab indices
+
+The design doc uses `children [4]int32` into a `[]OpNode` slab for
+cache-friendly iteration. Phase C.1 uses `*OpNode` pointers for
+simplicity. The pointer → slab-index refactor is part of Phase C.2.
+
+## Verification
+
+Phase C.1 verification gates:
+
+- `go test -race ./internal/executor/ ./internal/server/` — PASS
+- All 13 Phase C.1 tests pass (`TestSlot*`, `TestRunFast*`, `TestBuildFast*`)
+- Legacy `Run` path unchanged; `RunFast` produces bit-identical rows
+- `BuildFast` wraps non-migrated operators in `OpAdapter` transparently
+
+## Remaining scope (Phase C.1 follow-up loops)
+
+- **Migrate remaining hot-path operators**: `sortOp`, `joinOp` / `hashJoinOp`,
+  `insertOp`, `updateOp`, `deleteOp`
+- **Phase C.2**: replace `*OpNode` children with slab indices; add per-statement
+  `[]OpNode` slab in `stmtCtx`
+- **Phase C.3**: move plan tree into mctx; replace `state any` with raw bytes;
+  delete parser/planner GC-heap allocations
+- **`Slot.CopyTo` API**: thread through sort/hash-join/aggregate to eliminate
+  `Materialize()` deep-copy at retention boundaries
+- **Performance gate**: verify `runtime.itabHashFunc` drops from top-40 once
+  all hot-path operators are migrated
+
+## Files changed
+
+- `internal/executor/opnode.go` (new) — Slot, OpKind, OpNode, state types,
+  opOpen/opNext/opClose, per-kind kernels
+- `internal/executor/executor.go` (modified) — BuildFast, RunFast
+- `internal/executor/phase_c_test.go` (new) — regression tests

@@ -287,3 +287,110 @@ func Run(op Operator, ctx *Context) ([]Row, error) {
 	}
 	return out, nil
 }
+
+// ---------------------------------------------------------------------------
+// Phase C.1 — BuildFast / RunFast
+//
+// BuildFast constructs an OpNode tree from a plan, using concrete
+// dispatch for migrated operators (OpSeqScan, OpFilter, OpProject,
+// OpLimit) and opAdapter for everything else. RunFast drives the tree
+// via opNext. Both functions are drop-in replacements for Build+Run;
+// they produce identical result rows.
+//
+// Phase C migration status: seqScan/filter/project/limit are fully
+// migrated (switch dispatch, no per-row itab call). All other operators
+// fall through to the opAdapter path (identical performance to pre-C).
+// ---------------------------------------------------------------------------
+
+// BuildFast constructs an OpNode tree from plan. Non-migrated operators
+// are wrapped in an opAdapter that drives the legacy Operator interface.
+func BuildFast(plan planner.Node) (*OpNode, error) {
+	switch p := plan.(type) {
+	case *planner.SeqScan:
+		return &OpNode{Kind: OpSeqScan, state: newSeqScanOp(p)}, nil
+
+	case *planner.Filter:
+		child, err := BuildFast(p.Child)
+		if err != nil {
+			return nil, err
+		}
+		return &OpNode{
+			Kind:   OpFilter,
+			childA: child,
+			state:  &filterState{pred: p.Predicate},
+		}, nil
+
+	case *planner.Project:
+		child, err := BuildFast(p.Child)
+		if err != nil {
+			return nil, err
+		}
+		return &OpNode{
+			Kind:   OpProject,
+			childA: child,
+			state: &projectState{
+				plan:   p,
+				schema: p.Output(),
+			},
+		}, nil
+
+	case *planner.Limit:
+		child, err := BuildFast(p.Child)
+		if err != nil {
+			return nil, err
+		}
+		return &OpNode{
+			Kind:   OpLimit,
+			childA: child,
+			state:  &limitState{plan: p, limitCount: -1},
+		}, nil
+
+	default:
+		// For non-migrated operators, build the legacy Operator tree
+		// and wrap in an adapter. This path preserves the existing
+		// operator semantics exactly — Open/Next/Close are forwarded.
+		legacyOp, err := Build(plan)
+		if err != nil {
+			return nil, err
+		}
+		return &OpNode{
+			Kind:  OpAdapter,
+			state: &opAdapterState{op: legacyOp},
+		}, nil
+	}
+}
+
+// RunFast opens the OpNode tree, drains it via opNext, and returns all
+// rows. Rows are deep-copied via cloneRowOwned so callers receive
+// independent storage (same invariant as Run).
+func RunFast(n *OpNode, ctx *Context) ([]Row, error) {
+	if err := opOpen(n, ctx); err != nil {
+		_ = opClose(n)
+		return nil, err
+	}
+	var (
+		out []Row
+		dst Slot
+	)
+	for {
+		dst.Reset()
+		err := opNext(n, &dst)
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			_ = opClose(n)
+			return nil, err
+		}
+		// DML / utility ops surface nil-row (HasRow=false); skip.
+		if !dst.HasRow {
+			continue
+		}
+		// Deep-copy at the RunFast boundary so callers own independent rows.
+		out = append(out, cloneRowOwned(Row(dst.Cells)))
+	}
+	if err := opClose(n); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
