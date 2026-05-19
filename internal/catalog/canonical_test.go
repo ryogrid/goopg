@@ -182,3 +182,123 @@ func TestRelationMapUpdateMap_Stub(t *testing.T) {
 		t.Fatalf("RelationMapUpdateMap stub returned error: %v", err)
 	}
 }
+
+
+// TestBuildCanonicalXactCommitPayload pins the byte layout of the
+// canonical XLOG_XACT_COMMIT WAL record (M0106-0010 batched-46). The
+// PG18 standby's `xact_redo_commit` walks the wire bytes directly, so
+// any drift here will silently break replication of post-basebackup
+// commits.
+func TestBuildCanonicalXactCommitPayload(t *testing.T) {
+	const xid = uint32(4711)
+	const xactTime int64 = 1234567890
+
+	payload := BuildCanonicalXactCommitPayload(xid, xactTime)
+
+	// Envelope: kind(1) + rmgr(1) + info(1) + xid(4) = 7 bytes.
+	// Body: main-data-tag(1) + len(1) + xact_time(8) = 10 bytes.
+	const wantLen = canonicalHeaderSize + 2 + 8
+	if len(payload) != wantLen {
+		t.Fatalf("len(payload) = %d, want %d", len(payload), wantLen)
+	}
+
+	if payload[0] != RecordKindCanonical {
+		t.Errorf("payload[0] = 0x%02x, want RecordKindCanonical (0x%02x)", payload[0], RecordKindCanonical)
+	}
+	if payload[1] != canonicalRmgrXact {
+		t.Errorf("rmgr = %d, want RM_XACT_ID (%d)", payload[1], canonicalRmgrXact)
+	}
+	if payload[2] != canonicalInfoXactCommit {
+		t.Errorf("info = 0x%02x, want XLOG_XACT_COMMIT (0x%02x)", payload[2], canonicalInfoXactCommit)
+	}
+	if gotXID := binary.LittleEndian.Uint32(payload[3:7]); gotXID != xid {
+		t.Errorf("xid = %d, want %d", gotXID, xid)
+	}
+
+	// Body inspection.
+	body := payload[canonicalHeaderSize:]
+	if body[0] != canonicalXlogDataShort {
+		t.Errorf("main-data tag = 0x%02x, want xlrBlockIDDataShort (0x%02x)", body[0], canonicalXlogDataShort)
+	}
+	if body[1] != 8 {
+		t.Errorf("main-data len = %d, want 8 (sizeof xl_xact_commit)", body[1])
+	}
+	gotXactTime := int64(binary.LittleEndian.Uint64(body[2:10]))
+	if gotXactTime != xactTime {
+		t.Errorf("xact_time = %d, want %d", gotXactTime, xactTime)
+	}
+}
+
+// TestBuildCanonicalXactAbortPayload mirrors the commit-record test
+// for the abort variant. Only the info byte differs (0x20 vs 0x00).
+func TestBuildCanonicalXactAbortPayload(t *testing.T) {
+	const xid = uint32(99)
+	const xactTime int64 = -42 // negative is legal: pre-Y2K test value
+
+	payload := BuildCanonicalXactAbortPayload(xid, xactTime)
+
+	if payload[2] != canonicalInfoXactAbort {
+		t.Errorf("info = 0x%02x, want XLOG_XACT_ABORT (0x%02x)", payload[2], canonicalInfoXactAbort)
+	}
+	if payload[1] != canonicalRmgrXact {
+		t.Errorf("rmgr = %d, want RM_XACT_ID (%d)", payload[1], canonicalRmgrXact)
+	}
+	if gotXID := binary.LittleEndian.Uint32(payload[3:7]); gotXID != xid {
+		t.Errorf("xid = %d, want %d", gotXID, xid)
+	}
+	body := payload[canonicalHeaderSize:]
+	gotXactTime := int64(binary.LittleEndian.Uint64(body[2:10]))
+	if gotXactTime != xactTime {
+		t.Errorf("xact_time = %d, want %d", gotXactTime, xactTime)
+	}
+}
+
+// TestPgCanonicalXactCommit_NilLogFnIsNoop guards the legacy
+// (non-PageHeaders) WAL path: when the caller passes a nil
+// LogCanonicalFunc, the encoder must short-circuit instead of
+// panicking on a nil callback.
+func TestPgCanonicalXactCommit_NilLogFnIsNoop(t *testing.T) {
+	endLSN, err := PgCanonicalXactCommit(1, 0, nil)
+	if err != nil {
+		t.Fatalf("nil logFn: unexpected error %v", err)
+	}
+	if endLSN != 0 {
+		t.Fatalf("nil logFn: endLSN = %d, want 0", endLSN)
+	}
+	endLSN, err = PgCanonicalXactAbort(1, 0, nil)
+	if err != nil {
+		t.Fatalf("nil logFn (abort): unexpected error %v", err)
+	}
+	if endLSN != 0 {
+		t.Fatalf("nil logFn (abort): endLSN = %d, want 0", endLSN)
+	}
+}
+
+// TestPgCanonicalXactCommit_RouteThroughLogFn proves the encoder
+// hands the payload bytes to the caller-supplied LogCanonicalFunc
+// without modification and returns whatever endLSN the callback
+// reports — the contract the initdb wal-marker logger relies on.
+func TestPgCanonicalXactCommit_RouteThroughLogFn(t *testing.T) {
+	const wantEndLSN = uint64(0xCAFEBABEDEADBEEF)
+	var captured []byte
+	logFn := func(payload []byte) (uint64, error) {
+		captured = append(captured, payload...)
+		return wantEndLSN, nil
+	}
+	got, err := PgCanonicalXactCommit(7, 123, logFn)
+	if err != nil {
+		t.Fatalf("PgCanonicalXactCommit error: %v", err)
+	}
+	if got != wantEndLSN {
+		t.Fatalf("endLSN = %#x, want %#x", got, wantEndLSN)
+	}
+	want := BuildCanonicalXactCommitPayload(7, 123)
+	if len(captured) != len(want) {
+		t.Fatalf("captured len = %d, want %d", len(captured), len(want))
+	}
+	for i := range want {
+		if captured[i] != want[i] {
+			t.Fatalf("byte %d: got 0x%02x, want 0x%02x", i, captured[i], want[i])
+		}
+	}
+}

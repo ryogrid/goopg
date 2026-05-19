@@ -215,6 +215,88 @@ func BuildCanonicalHeapDeletePayload(
 	return buildCanonicalPayload(canonicalRmgrHeap, canonicalInfoHeapDelete, xid, body)
 }
 
+// canonicalRmgrXact mirrors PG's RM_XACT_ID. Defined locally to keep
+// the catalog package free of an import cycle on internal/wal.
+const canonicalRmgrXact uint8 = 1
+
+// PG xact-record info opcodes (high 4 bits of xl_info).
+// See postgres/src/include/access/xact.h.
+const (
+	canonicalInfoXactCommit uint8 = 0x00 // XLOG_XACT_COMMIT
+	canonicalInfoXactAbort  uint8 = 0x20 // XLOG_XACT_ABORT
+)
+
+// PgCanonicalXactCommit emits a PG-canonical XLOG_XACT_COMMIT record
+// (RmgrXact / info=XLOG_XACT_COMMIT) alongside goopg's native
+// RecordKindXactCommit marker. The minimal payload — an 8-byte
+// `TimestampTz xact_time` — is enough for the standby's
+// `xact_redo_commit` to advance `latestObservedXid`, stamp pg_xact via
+// `TransactionIdAsyncCommitTree`, and update `KnownAssignedXids` so
+// post-basebackup commits become visible on the standby (M0106-0010
+// batched-46).
+//
+// Parameters:
+//   - xid: committing transaction's XID (encoded in the XLogRecord
+//     header's xl_xid by classifyXLogRecord).
+//   - xactTimeUsecSinceY2K: PG TimestampTz — microseconds since
+//     2000-01-01 00:00:00 UTC. Callers in the production hot path use
+//     `time.Since(pgEpoch).Microseconds()`; tests pass a fixed value.
+//   - logFn: walWriter.Append wrapper. A nil hook is treated as a
+//     no-op so the legacy / non-PageHeaders WAL path remains intact.
+func PgCanonicalXactCommit(xid uint32, xactTimeUsecSinceY2K int64, logFn LogCanonicalFunc) (uint64, error) {
+	if logFn == nil {
+		return 0, nil
+	}
+	return logFn(BuildCanonicalXactCommitPayload(xid, xactTimeUsecSinceY2K))
+}
+
+// PgCanonicalXactAbort emits a PG-canonical XLOG_XACT_ABORT record.
+// Same shape as the commit variant; the standby uses it to advance
+// `latestObservedXid` and mark the SLRU entry aborted.
+func PgCanonicalXactAbort(xid uint32, xactTimeUsecSinceY2K int64, logFn LogCanonicalFunc) (uint64, error) {
+	if logFn == nil {
+		return 0, nil
+	}
+	return logFn(BuildCanonicalXactAbortPayload(xid, xactTimeUsecSinceY2K))
+}
+
+// BuildCanonicalXactCommitPayload encodes the canonical-envelope-wrapped
+// XLOG_XACT_COMMIT WAL record. Layout:
+//
+//	[envelope header 7]
+//	  [0]      RecordKindCanonical (0xFE)
+//	  [1]      rmgr = RM_XACT_ID (1)
+//	  [2]      info = XLOG_XACT_COMMIT (0x00)
+//	  [3..7]   xl_xid
+//	[xlog body]
+//	  [7]      xlrBlockIDDataShort (0xFF)
+//	  [8]      len = 8
+//	  [9..17]  xact_time (TimestampTz, int64 little-endian)
+//
+// No XLOG_XACT_HAS_INFO bit is set, so the record carries no
+// xl_xact_xinfo, dbinfo, subxacts, relfilelocators, invals, or origin
+// follow-on chunks. PG's `ParseCommitRecord` short-circuits on
+// `info & XLOG_XACT_HAS_INFO == 0`, leaving xinfo=0 in the parsed
+// struct — exactly the minimum needed for `xact_redo_commit`.
+func BuildCanonicalXactCommitPayload(xid uint32, xactTimeUsecSinceY2K int64) []byte {
+	return buildCanonicalXactPayload(canonicalInfoXactCommit, xid, xactTimeUsecSinceY2K)
+}
+
+// BuildCanonicalXactAbortPayload — sibling of BuildCanonicalXactCommitPayload
+// for XLOG_XACT_ABORT (info=0x20). Same minimal payload (xact_time only).
+func BuildCanonicalXactAbortPayload(xid uint32, xactTimeUsecSinceY2K int64) []byte {
+	return buildCanonicalXactPayload(canonicalInfoXactAbort, xid, xactTimeUsecSinceY2K)
+}
+
+func buildCanonicalXactPayload(info uint8, xid uint32, xactTimeUsecSinceY2K int64) []byte {
+	// Body = main-data-only (no block refs): [tag(1)][len(1)][8 bytes xact_time].
+	var body [2 + 8]byte
+	body[0] = canonicalXlogDataShort
+	body[1] = 8
+	binary.LittleEndian.PutUint64(body[2:10], uint64(xactTimeUsecSinceY2K))
+	return buildCanonicalPayload(canonicalRmgrXact, info, xid, body[:])
+}
+
 // buildCanonicalBlockRefFPI encodes a single PG XLogRecord block reference
 // with a full-page image (FPI) for the given relation and block.
 //

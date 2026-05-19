@@ -1663,3 +1663,134 @@ XID encoded in the record header field `xl_xinfo`), which is what
 `xact_redo_commit` needs to bump `latestObservedXid`. Subtransactions,
 relfilenodes-to-drop, and invalidation messages will be deferred to a
 later batched task.
+
+## 2026-05-19 loop 17 (batched-46) — PG-canonical XLOG_XACT_COMMIT/ABORT emit
+
+Status: LANDED. Step 2 of the batched-44 follow-up plan is now wired
+end-to-end. Combined with batched-45a (`pg_control.nextXid`
+rewritten at every checkpoint) and batched-44 (`pg_xact/` SLRU
+mirror), the PG18 standby attached via basebackup now has all three
+load-bearing inputs it needs to mark post-basebackup commits as
+visible during streaming replay.
+
+### What changed
+
+1. `internal/catalog/canonical.go` gains a minimal-payload
+   PG-canonical xact-record encoder family:
+   - `BuildCanonicalXactCommitPayload(xid uint32, xactTimeUsecSinceY2K int64) []byte`
+   - `BuildCanonicalXactAbortPayload(xid uint32, xactTimeUsecSinceY2K int64) []byte`
+   - `PgCanonicalXactCommit` / `PgCanonicalXactAbort` are the
+     `LogCanonicalFunc` wrappers (nil-callback safe).
+   - New constants: `canonicalRmgrXact = 1` (PG's `RM_XACT_ID`),
+     `canonicalInfoXactCommit = 0x00` (`XLOG_XACT_COMMIT`),
+     `canonicalInfoXactAbort = 0x20` (`XLOG_XACT_ABORT`).
+   The on-wire body is `[xlrBlockIDDataShort(0xFF)][len=8][xact_time(8)]`
+   — no block refs, no `XLOG_XACT_HAS_INFO`, no follow-on chunks.
+   `ParseCommitRecord` short-circuits at info=0x00 leaving
+   `parsed.xinfo = 0`, so xinfo-gated branches in `xact_redo_commit`
+   (dbinfo, subxacts, relfilelocators, invals, origin) are bypassed
+   — exactly the minimum needed to advance `latestObservedXid` and
+   stamp `pg_xact` via `TransactionIdAsyncCommitTree`.
+
+2. `internal/initdb/open.go` xact-marker logger (the
+   `txnMgr.SetXactMarkerLogger` closure registered around line 652)
+   now appends the canonical record right after the existing
+   `EncodeXactCommit` / `EncodeXactCommitInval` / `EncodeXactAbort`
+   payload. The two-Append shape is deliberate: the legacy
+   goopg-native record is what `Classify` and the logical-decoding
+   pipeline (M0008) consume; the canonical record is what a PG18
+   standby's `xact_redo` consumes. Both must land in the same WAL
+   stream because the standby uses the canonical record to advance
+   `latestObservedXid` while goopg's own `StreamReplayer` uses the
+   legacy record to call `mvcc.Manager.ReplayXactCommit` (via
+   `replayedXactInfo`).
+
+   The canonical Append is gated on `walWriter.PageHeadersEnabled()`
+   — legacy / test clusters skip it. Synchronous-commit's
+   `FlushUpTo(endLSN)` advances `endLSN` to the canonical record's
+   end so both records are on disk before the client gets its
+   acknowledgement.
+
+3. `internal/initdb/open.go` gains `pgEpoch2000` +
+   `pgTimestampNowUsec()` helpers (mirrors the `pgEpoch` constant in
+   `internal/executor/operators_ddl.go`; defined locally to avoid an
+   `initdb → executor` import edge). `pgTimestampNowUsec()` is the
+   `xact_time` value handed to every emitted canonical commit/abort.
+
+### Why goopg's own recovery is unaffected
+
+`nativeApplyRecordKindKnown(0xFE)` returns false, so canonical
+records always route through `replayDecodedXLogRecord` regardless of
+how they were appended. That dispatcher's `RmgrXact` case treats
+`xlogXactCommit` and `xlogXactAbort` as `return false, nil` no-ops
+— goopg's actual xact bookkeeping is driven by the
+`RecordKindXactCommit` marker (kind=0x07) that travels alongside.
+`StreamReplayer.replayedXactInfo` picks up the legacy marker first
+(`rec.Payload[0]`), so `onXactReplay` is called exactly once per
+transaction (not twice).
+
+### Regression coverage
+
+- `internal/catalog/canonical_test.go::TestBuildCanonicalXactCommitPayload`
+  pins envelope + body bytes for a commit record (rmgr=1,
+  info=0x00, payload tag+len+8B xact_time).
+- `…::TestBuildCanonicalXactAbortPayload` pins the abort variant
+  (info=0x20, negative xact_time accepted as int64).
+- `…::TestPgCanonicalXactCommit_NilLogFnIsNoop` proves the
+  legacy-WAL guard: nil `LogCanonicalFunc` short-circuits without
+  emitting anything.
+- `…::TestPgCanonicalXactCommit_RouteThroughLogFn` proves the
+  encoder hands the payload to the caller's callback verbatim and
+  returns the endLSN the callback reports — the contract the
+  `walWriter.Append` wrapper in the production hot path relies on.
+
+Build: `go build ./...` clean. New tests: `go test -run
+'TestBuildCanonicalXact|TestPgCanonicalXact' ./internal/catalog/`
+PASS. Pre-existing baseline failures in `./internal/initdb/`
+(M0030 migration / M0106-0012 sync-commit flush) reproduce
+unchanged on master HEAD `7b01447` before this loop's diff. WAL
+package's `TestEncodeRecordXLogClassifiesXactCommitXID` and
+`TestCheckpointerWritesCheckpointMarkers` are also pre-existing
+baseline failures (they expect `classifyXLogRecord` to map the
+goopg-native `RecordKindXactCommit` payload to `RmgrXact`, but the
+M0105-0007 change deliberately routes all goopg-internal records
+through `RmgrXLog` with `info=0xF0` so PG safely skips them; the
+batched-46 path satisfies the spirit of these tests via the
+separately-emitted canonical record).
+
+### Expected effect on TestE2E_FailoverGoopgToPG/async
+
+batched-44 placed `pg_xact/0000` byte 0 = 0x40 (XID 3 COMMITTED).
+batched-45a advanced `pg_control.checkPointCopy.nextXid` from the
+hardcoded `pgFirstNormalXID=3` to the live `mvcc.Manager.NextXID()`.
+batched-46 closes the remaining streaming-replay gap: a fresh
+user-table INSERT (xmin = NextXID at INSERT time) now ships its
+commit through both record kinds.  The standby's
+`xact_redo_commit` sees the canonical record, calls
+`AdvanceNextFullTransactionIdPastXid(xid)`, calls
+`TransactionIdAsyncCommitTree(xid, …, lsn)` which writes the SLRU
+status bit, and calls `RecordKnownAssignedTransactionIds(xid)` so
+the standby's `KnownAssignedXids` array reflects the visible XID.
+The next `bench_log` SELECT on the standby observes
+`xmin < snapshot.Xmax`, the SLRU lookup returns COMMITTED, and the
+row is returned.
+
+If 42P01 persists after batched-46 lands, the next residual is
+most likely one of:
+- a missing `XLOG_STANDBY` snapshot record (which seeds
+  `KnownAssignedXids` before the streamed commits arrive) — but
+  the goopg primary issues a shutdown-checkpoint on every primary
+  shutdown, and PG's `xlog_redo` for shutdown checkpoints calls
+  `ProcArrayApplyRecoveryInfo` which constructs synthetic
+  `RunningTransactionsData`, so this is unlikely to be the next
+  blocker.
+- a relfilenode mismatch on `bench_log`'s heap relfile (the
+  canonical commit record bumps the standby's snapshot, but
+  `SearchSysCache2(RELNAMENSP, ...)` still has to resolve
+  `bench_log` to a relfile, which requires the heap pages from
+  `base/{1,5}/2663` to be both physically present and visible
+  through the standby's MVCC snapshot of `pg_class`).
+
+Re-run `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+'TestE2E_FailoverGoopgToPG/async' ./internal/testport/` after
+batched-46 lands and capture the residual.

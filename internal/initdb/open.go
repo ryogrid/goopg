@@ -27,6 +27,14 @@ import (
 // docs/design/0017-data-directory.md.
 const CatalogSnapshotFile = "global/pg_catalog.json"
 
+// pgEpoch2000 is PG's TimestampTz origin: 2000-01-01 00:00:00 UTC.
+// pgTimestampNowUsec returns the current wall-clock time as a
+// TimestampTz (microseconds since pgEpoch2000). Used by the
+// PG-canonical XLOG_XACT_COMMIT/ABORT emit path (M0106-0010 batched-46).
+var pgEpoch2000 = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func pgTimestampNowUsec() int64 { return time.Since(pgEpoch2000).Microseconds() }
+
 // Runtime is the bundle of long-lived handles a running goopg
 // server needs to drive table-touching statements: a storage
 // Manager + Pool, an MVCC manager, and an in-memory catalog. Each
@@ -682,6 +690,35 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_, endLSN, err := walWriter.Append(payload)
 		if err != nil {
 			return err
+		}
+		// M0106-0010 batched-46: also emit a PG-canonical XLOG_XACT_COMMIT /
+		// XLOG_XACT_ABORT record so a PG18 standby's `xact_redo_commit` (or
+		// `xact_redo_abort`) advances `latestObservedXid`, stamps pg_xact via
+		// `TransactionIdAsyncCommitTree`, and updates `KnownAssignedXids`.
+		// Without this, only basebackup-snapshot XIDs are visible on the standby
+		// and any commit after basebackup is invisible until the next basebackup
+		// cycle. Gated on PageHeaders mode — legacy (test) clusters skip the
+		// canonical record because their walWriter is not in PG-wire format.
+		// The flush waits for the canonical end LSN below so both records land
+		// before the client acknowledges commit (synchronous_commit = on).
+		if walWriter.PageHeadersEnabled() {
+			xactTime := pgTimestampNowUsec()
+			switch kind {
+			case mvcc.XactCommit:
+				canonPayload := catalog.BuildCanonicalXactCommitPayload(uint32(xid), xactTime)
+				_, canonEnd, err := walWriter.Append(canonPayload)
+				if err != nil {
+					return err
+				}
+				if canonEnd > endLSN {
+					endLSN = canonEnd
+				}
+			case mvcc.XactAbort:
+				canonPayload := catalog.BuildCanonicalXactAbortPayload(uint32(xid), xactTime)
+				if _, _, err := walWriter.Append(canonPayload); err != nil {
+					return err
+				}
+			}
 		}
 		// Synchronous commit (M0042-0003): flush the commit WAL record to
 		// disk before returning to the client so the transaction is durable

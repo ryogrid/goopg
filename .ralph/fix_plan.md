@@ -10854,6 +10854,60 @@ relcache init → replication readiness) and intra-package grouped.
       replay. Re-run `TestE2E_FailoverGoopgToPG/async`; if 42P01
       persists, capture the next residual (the standby's
       `latestObservedXid` after replay vs. the primary's NextXID).
+    - PARTIAL PROGRESS 2026-05-19 (loop 17, batched-46): step (b)
+      LANDED — PG-canonical XLOG_XACT_COMMIT/ABORT now emitted
+      alongside the goopg-native RecordKindXactCommit/Abort marker.
+      Three layers changed:
+      (1) `internal/catalog/canonical.go` gains
+          `BuildCanonicalXactCommitPayload(xid, xact_time_usec) []byte`
+          plus the abort sibling and `PgCanonicalXactCommit` /
+          `PgCanonicalXactAbort` LogCanonicalFunc wrappers. New
+          constants: `canonicalRmgrXact = 1` (RM_XACT_ID),
+          `canonicalInfoXactCommit = 0x00` (XLOG_XACT_COMMIT),
+          `canonicalInfoXactAbort = 0x20`. The on-wire body is
+          `[xlrBlockIDDataShort][len=8][xact_time(8)]` — minimal
+          payload with no XLOG_XACT_HAS_INFO bit set, so
+          `ParseCommitRecord` short-circuits at xinfo=0 (no dbinfo,
+          subxacts, relfilelocators, invals, origin chunks).
+      (2) `internal/initdb/open.go` xact-marker logger appends the
+          canonical record right after the existing
+          `EncodeXactCommit`/`Inval`/`Abort` Append. Gated on
+          `walWriter.PageHeadersEnabled()`; synchronous-commit's
+          `FlushUpTo(endLSN)` advances the LSN to the canonical
+          record's end so both records are durable before the client
+          ack.
+      (3) `internal/initdb/open.go` gains `pgEpoch2000` +
+          `pgTimestampNowUsec()` helpers (locally defined to avoid an
+          `initdb → executor` import edge).
+      Tests added in `internal/catalog/canonical_test.go`
+      (`TestBuildCanonicalXactCommitPayload`,
+      `TestBuildCanonicalXactAbortPayload`,
+      `TestPgCanonicalXactCommit_NilLogFnIsNoop`,
+      `TestPgCanonicalXactCommit_RouteThroughLogFn`).
+      Goopg's own recovery is unaffected: canonical records dispatch
+      through `replayDecodedXLogRecord` → `RmgrXact / xlogXactCommit`
+      which is already a recognised no-op (the legacy
+      RecordKindXactCommit marker drives `mvcc.ReplayXactCommit`
+      via `replayedXactInfo`, called exactly once per xact).
+      Verified: `go test ./internal/catalog/` and
+      `go test -run 'TestBuildCanonicalXact|TestPgCanonicalXact'`
+      all green; `go build ./...` clean. Pre-existing baseline
+      failures in `./internal/initdb/` (17 tests — M0030 migration
+      and M0106-0012 sync-commit flush) and `./internal/wal/`
+      (`TestCheckpointerWritesCheckpointMarkers`,
+      `TestEncodeRecordXLogClassifiesXactCommitXID`) reproduce
+      unchanged on master HEAD `7b01447` before this loop's diff —
+      unrelated to batched-46.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 17 (batched-46)" section).
+      Next loop (batched-47): re-run
+      `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+      'TestE2E_FailoverGoopgToPG/async' ./internal/testport/`. If
+      42P01 persists, capture the standby's `latestObservedXid` and
+      the `pg_class` row's xmin on the standby vs. the goopg
+      primary's NextXID at the SELECT instant to disambiguate
+      between (a) a missing XLOG_STANDBY snapshot record on the
+      wire and (b) a relfilenode-mismatch on `bench_log`'s heap.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
