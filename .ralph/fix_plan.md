@@ -2422,12 +2422,22 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
       - Verify files exist with correct magic number and non-zero length.
       - File: `internal/initdb/initdb.go`
 
-- [ ] **M0106-0006**
+- [x] **M0106-0006**
       - Summary: Re-verify E2E test.
       - Run `TestE2E_FailoverGoopgToPG/async` — verify:
         pg_basebackup completes, PG standby starts, backends don't PANIC,
         `SELECT 1` succeeds, WAL streams, data replicates, failover works.
       - File: `internal/testport/e2e_failover_goopg_to_pg_test.go`
+      - COMPLETE 2026-05-20 (loop 28): `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test
+        -count=1 -timeout 240s -v -run 'TestE2E_FailoverGoopgToPG/async$'
+        ./internal/testport/` → PASS 1.73s on the unmodified (no diagnostic
+        elog) PG18 binary rebuilt at the end of loop 27. The standby
+        completes pg_basebackup, opens to hot-standby without PANIC,
+        replays primary commits, and promotes successfully on Kill.
+        Confirms the M0106 critical-path requirement (init-file +
+        pg_class/pg_attribute heap parity + empty-array binary encoding +
+        pg_am bootstrap + PageXLogRecPtr LSN encoding + Cluster.Kill
+        SIGKILL of the process group) holds end-to-end against vanilla PG.
 
 - [ ] **M0106-0007**
       - Summary: Close milestone.
