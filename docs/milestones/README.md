@@ -128,7 +128,7 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0099 | M0098 remaining-work closure & target validation | planned | `0099-m0098-remaining-work-target-validation.md` |
 | 0100 | RC isolation-test suite: runtime correctness closure & 21-spec pass (closes M0096-0005, M0096-0013) | in-progress | `0100-rc-isolation-runtime-correctness-and-spec-pass.md` |
 | 0101 | WAL pg_waldump compatibility: enable PG-compatible format by default (implements M0014) | accepted | `0101-wal-pg-waldump-compatibility.md` |
-| 0102 | Heterogeneous streaming-replication + SIGKILL-failover E2E (PG↔goopg, sync + async) | planned | `0102-heterogeneous-replication-failover-e2e.md` |
+| 0102 | Heterogeneous streaming-replication + SIGKILL-failover E2E (PG↔goopg, sync + async) | accepted | `0102-heterogeneous-replication-failover-e2e.md` |
 | 0103 | Heterogeneous logical-replication + SIGKILL-failover E2E (PG↔goopg, sync + async) | accepted | `0103-heterogeneous-logical-replication-failover-e2e.md` |
 | 0104 | SERIALIZABLE isolation via SSI anomaly prevention | planned | `0104-serializable-ssi-anomaly-prevention.md` |
 | 0105 | goopg→PG data-file format parity (heap page, tuple header, catalog) | accepted | `0105-goopg-to-pg-heap-page-and-tuple-format-parity.md` |

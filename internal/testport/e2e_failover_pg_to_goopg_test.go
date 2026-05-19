@@ -318,12 +318,12 @@ func normalizePGWALSegmentNames(t *testing.T, dataDir string) {
 		if entry.IsDir() {
 			continue
 		}
-		_, segno, ok := wal.ParseXLogFileName(entry.Name(), 16<<20)
+				tli, segno, ok := wal.ParseXLogFileName(entry.Name(), 16<<20)
 		if !ok {
 			continue
 		}
 		oldPath := filepath.Join(dataDir, "pg_wal", entry.Name())
-		newName := fmt.Sprintf("%024X", segno)
+		newName := wal.XLogFileName(tli, segno, 16<<20)
 		newPath := filepath.Join(dataDir, "pg_wal", newName)
 		if oldPath == newPath {
 			continue

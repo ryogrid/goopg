@@ -1,6 +1,6 @@
 # 0102-0003 — Heterogeneous Failover E2E Harness
 
-**Status:** draft
+**Status:** accepted (implemented 2026-05-20)
 **Date:** 2026-05-13
 **Milestone:** M0102-0006, M0102-0007, M0102-0008
 **Upstream reference:** `postgres/src/interfaces/libpq/fe-connect.c:1990` (`target_session_attrs` validation), `postgres/src/bin/pg_ctl/pg_ctl.c:1186` (`do_promote`), `postgres/src/bin/pg_basebackup/pg_basebackup.c:2356` (client main flow).

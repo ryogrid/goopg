@@ -15,7 +15,7 @@ Status meanings:
 | mixed | 0 | 2 | 0 |
 | modules | 0 | 0 | 1 |
 | regress | 0 | 1 | 0 |
-| tap | 45 | 3 | 1 |
+| tap | 49 | 3 | 1 |
 | utility | 1 | 0 | 0 |
 
 ## Entries
@@ -77,6 +77,10 @@ Status meanings:
 | e2e-logical-failover-pg-to-goopg-sync | `postgres/src/test/subscription` | tap | port | yes | Scenario A sync_remote_apply: pinned by TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply in internal/testport/pgoutput_interop_test.go (M0103-0007 rung 26; design 0103-0049) | `-` |
 | e2e-logical-failover-goopg-to-pg-async | `postgres/src/test/subscription` | tap | port | yes | Scenario B async: pinned by TestPort_PgoutputInteropGoopgToPG live wrapper in internal/testport/pgoutput_interop_test.go (M0103-0008 loop 19 closure; design 0103-0023) | `-` |
 | e2e-logical-failover-goopg-to-pg-sync | `postgres/src/test/subscription` | tap | port | yes | Scenario B sync_remote_apply: pinned by TestPort_PgoutputInteropGoopgToPG live wrapper in internal/testport/pgoutput_interop_test.go (M0103-0008 loop 19 closure; design 0103-0023) | `-` |
+| e2e-failover-pg-to-goopg-async | `postgres/src/test/recovery` | tap | port | yes | Scenario A async: pinned by TestE2E_FailoverPGtoGoopg/async in internal/testport/e2e_failover_pg_to_goopg_test.go (M0102-0006; design 0102-0003) | `-` |
+| e2e-failover-pg-to-goopg-sync | `postgres/src/test/recovery` | tap | port | yes | Scenario A sync_remote_apply: pinned by TestE2E_FailoverPGtoGoopg/sync_remote_apply in internal/testport/e2e_failover_pg_to_goopg_test.go (M0102-0006; design 0102-0003 + 0102-0005) | `-` |
+| e2e-failover-goopg-to-pg-async | `postgres/src/test/recovery` | tap | port | yes | Scenario B async: pinned by TestE2E_FailoverGoopgToPG/async in internal/testport/e2e_failover_goopg_to_pg_test.go (M0102-0007; design 0102-0003) | `-` |
+| e2e-failover-goopg-to-pg-sync | `postgres/src/test/recovery` | tap | port | yes | Scenario B sync_remote_apply: pinned by TestE2E_FailoverGoopgToPG/sync_remote_apply in internal/testport/e2e_failover_goopg_to_pg_test.go (M0102-0007; design 0102-0003 + 0102-0005) | `-` |
 
 ## Notes
 
