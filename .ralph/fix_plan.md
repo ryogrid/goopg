@@ -11504,6 +11504,27 @@ relcache init → replication readiness) and intra-package grouped.
         snapshot will bit-rot the moment the first DDL runs.
       - Files: `internal/catalog/`, `internal/initdb/relcache_init.go`,
         `internal/server/`
+      - PROGRESS 2026-05-20 (loop 30): `TestRollbackedTableNotVisibleAfterRestart`
+        flipped FAIL → PASS. Root cause was a side-effect of the M0106-0010
+        batched-chain rewiring of runtime CREATE TABLE to emit PG18-canonical
+        `pg_class` / `pg_attribute` rows: `internal/initdb/open.go`'s
+        `loadUserTablesFromHeap` skipped the local-clog filter entirely
+        whenever the physical decoder branch succeeded (intended for trusted
+        PG basebackup tuples), so goopg-emitted rows from a rolled-back txn
+        survived re-Open even though their `xmin` was Aborted in the local
+        clog. Fix: add an explicit `clog.GetStatus(xmin) == TxnStatusAborted`
+        gate ahead of the existing physical/native branch on both the
+        pg_class and pg_attribute scans — the basebackup pass-through stays
+        intact (upstream xids return `TxnStatusUnknown`) and the M0030-0007
+        crash-during-COMMIT safety net for goopg-native rows is preserved.
+        Design: `docs/design/0106-0011-rollback-catalog-rows-clog-filter.md`.
+        Verified: `internal/initdb/` baseline of 16 pre-existing failures
+        unchanged; `executor/catalog/mvcc/server` PASS; `wal` 2 pre-existing
+        failures unchanged.
+        Open follow-ups still under M0106-0011: relcache init-file
+        regeneration on DDL invalidation; checkpoint/shutdown init-file
+        refresh; `TestCrashMidTransactionTableNotVisibleAfterRestart`
+        (implicit-abort sibling of the rollback path).
 
  - [x] **M0106-0012**
       - Summary: Make TestSynchronousCommitFlushesByDefault to be passed.

@@ -1633,9 +1633,20 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 				physicalRow = true
 			}
 			// Skip rows from uncommitted or crashed goopg transactions
-			// (M0030-0007). Physical PostgreSQL basebackup tuples come
-			// from a consistent snapshot, so their xmin does not exist in
-			// goopg's local clog and must not be filtered here.
+			// (M0030-0007). PG basebackup tuples come from a consistent
+			// snapshot and carry xmin values from the upstream cluster
+			// that are out-of-range for our local clog (GetStatus returns
+			// TxnStatusUnknown) — those must not be filtered. But
+			// goopg-emitted rows in the PG18-canonical layout share the
+			// physical decoder path (post-M0106-0010 syncTableToCatalogHeap)
+			// and their xmin IS in our clog: if that xid is aborted (e.g.
+			// CREATE TABLE inside a rolled-back transaction), the row must
+			// be excluded regardless of layout. Applying the filter only
+			// for the explicit Aborted state keeps the basebackup
+			// pass-through intact while honoring local ROLLBACKs.
+			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
+				continue
+			}
 			if !physicalRow && clog != nil && clog.GetStatus(ht.Header.Xmin) != mvcc.TxnStatusCommitted {
 				continue
 			}
@@ -1677,6 +1688,13 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 				continue
 			}
 			if ht.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			// Exclude rows from rolled-back goopg transactions. See the
+			// matching comment above the pg_class scan filter for why
+			// only the explicit Aborted state is checked here (basebackup
+			// pass-through hinges on xids unknown to the local clog).
+			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
 				continue
 			}
 			row, err := catalog.DecodePGAttributeRow(ht.Data)
