@@ -824,6 +824,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{
 		SegmentSize: walCfg.SegmentSize,
 		GUCParams:   defaultGUC,
+		// M0106-0010 batched-45: refresh checkPointCopy.nextXid into
+		// pg_control at every checkpoint from the live mvcc manager.
+		NextXIDFn: func() uint64 { return uint64(txnMgr.NextXID()) },
 	})
 
 	// Surface the M0002 checkpointer counters as the

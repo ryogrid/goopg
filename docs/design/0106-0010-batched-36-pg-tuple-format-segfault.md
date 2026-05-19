@@ -1576,3 +1576,90 @@ Unchanged from M0106 milestone preamble: no PG-source edits beyond
 diagnostic `elog(DEBUG1, ...)` calls; no `if (goopg_compat)`
 branches.  The work is entirely on the goopg side: implement
 `pg_xact/` SLRU directly so PG sees a stock-shaped clog.
+
+## 2026-05-19 loop 16 (batched-45a) — checkpointer rewrites pg_control.nextXid
+
+Status: LANDED. Step 1 of the batched-44 follow-up plan above is now
+wired end-to-end. Step 2 (PG-canonical `XLOG_XACT_COMMIT`) is deferred
+to batched-46 so this loop stays inside Ralph's one-task-per-loop
+contract.
+
+### What changed
+
+1. `internal/control/pgcontrol.go`: `ControlFileData` gains a
+   `CheckPointCopyNextXid uint64` field. `decodeControlFileData`
+   reads `buf[64:]` and `encodeControlFileData` writes it back, so
+   PG's `checkPointCopy.nextXid` (`FullTransactionId`, offset 64)
+   now roundtrips through every `UpdateControlFile` callback instead
+   of being preserved-by-accident-only. Before the fix, the field
+   was preserved because nothing in the codec touched it; after the
+   fix, the value can be deliberately advanced.
+2. `internal/wal/checkpointer.go`: `CheckpointerConfig` gains a
+   `NextXIDFn func() uint64` hook. `runCheckpoint`, after appending
+   the checkpoint marker, reads the hook (when wired) and sets
+   `cd.CheckPointCopyNextXid = max(current, hook())`. The
+   monotonicity guard matters because the hook returns
+   `mvcc.Manager.NextXID()`, which always increases, but pg_control
+   could in theory carry a higher value from a prior crash-recovery
+   replay path that hasn't yet been folded into the manager's
+   in-memory counter.
+3. `internal/initdb/open.go`: when constructing the production
+   checkpointer, wires
+   `NextXIDFn: func() uint64 { return uint64(txnMgr.NextXID()) }`.
+   Test-only constructors leave the hook nil — `runCheckpoint`
+   short-circuits to today's behaviour in that case.
+
+### Regression coverage
+
+- `internal/control/control_test.go::TestUpdateControlFileNextXidRoundTrip` —
+  seeds nextXid=3 in a synthetic pg_control, verifies decode reads
+  3, mutates to 42, verifies the on-disk byte at offset 64 becomes
+  42, then performs a no-op update and confirms the byte is still
+  42. This pins encode/decode symmetry: the bug would manifest as
+  the second update zeroing offset 64 because encode never wrote
+  it.
+- `internal/wal/checkpointer_test.go::TestCheckpointerWritesNextXidIntoPgControl` —
+  end-to-end: wires `NextXIDFn` returning 4711, runs one
+  `runCheckpoint`, and asserts pg_control offset 64 reads 4711.
+  Then re-runs `runCheckpoint` with a hook returning 100 and
+  asserts offset 64 still reads 4711 (monotonicity guard). Final
+  CRC32C check confirms the file is well-formed.
+
+### Expected effect on TestE2E_FailoverGoopgToPG/async
+
+The standby boot log line `next transaction ID: 3` should now read
+the live nextXid from pg_control instead of the hardcoded bootstrap
+value. The bench_log `CREATE TABLE` row (xmin = first user XID) will
+fall *inside* the standby snapshot's visible window and
+`SearchSysCache2` will resolve the relation. If batched-45a alone
+closes the 42P01 residual, the test flips to PASS; if it does not,
+the remaining gap is the streaming-replay path which batched-45b
+(`XLOG_XACT_COMMIT`) will address.
+
+### batched-45b plan (next loop)
+
+Emit a PG-canonical `XLOG_XACT_COMMIT` record alongside the existing
+`RecordKindXactCommit`. PG's `xact_redo_commit`
+(`postgres/src/backend/access/transam/xact.c::xact_redo`) parses the
+record into an `xl_xact_parsed_commit`, advances
+`latestObservedXid` via `ProcArrayApplyXidAssignment`, stamps the
+SLRU via `TransactionIdAsyncCommitTree`, and updates
+`KnownAssignedXids`. Without this record on the wire, the standby's
+snapshot will never advance past the basebackup-time view.
+
+The encoder will live in `internal/wal/xact_record.go` (or a new
+`xact_commit_compat.go`) and mirror the layout in
+`postgres/src/include/access/xact.h::xl_xact_commit`:
+
+```
+struct xl_xact_commit {
+    TimestampTz xact_time;   /* 8B */
+    /* followed optionally by xl_xact_xinfo, xl_xact_dbinfo, ... */
+};
+```
+
+For v0 we emit only the minimum payload (xact_time + the committed
+XID encoded in the record header field `xl_xinfo`), which is what
+`xact_redo_commit` needs to bump `latestObservedXid`. Subtransactions,
+relfilenodes-to-drop, and invalidation messages will be deferred to a
+later batched task.

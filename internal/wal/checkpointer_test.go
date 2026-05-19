@@ -562,6 +562,88 @@ func TestCheckpointerUpdatesPgControl(t *testing.T) {
 	}
 }
 
+// TestCheckpointerWritesNextXidIntoPgControl pins the M0106-0010
+// batched-45 invariant: at every checkpoint the checkpointer must call
+// the NextXIDFn hook and write its value into pg_control offset 64
+// (checkPointCopy.nextXid). Without this, a PG standby attaching via
+// basebackup boots with snapshot xmax = bootstrap XID (3), hiding every
+// tuple created after initdb.
+func TestCheckpointerWritesNextXidIntoPgControl(t *testing.T) {
+	dir := t.TempDir()
+	globalDir := filepath.Join(dir, "global")
+	if err := os.MkdirAll(globalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	walDir := filepath.Join(dir, "pg_wal")
+
+	buf := make([]byte, 8192)
+	le := binary.LittleEndian
+	le.PutUint64(buf[0:], 0x1122334455667788)
+	le.PutUint32(buf[8:], 1800)
+	le.PutUint32(buf[16:], 1) // DB_SHUTDOWNED
+	le.PutUint64(buf[64:], 3) // seed nextXid = FirstNormalTransactionId
+	crcTable := crc32.MakeTable(crc32.Castagnoli)
+	crc := crc32.Checksum(buf[:292], crcTable)
+	le.PutUint32(buf[292:], crc)
+	if err := os.WriteFile(filepath.Join(globalDir, "pg_control"), buf, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096,
+		PageHeaders: true, TimelineID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	var nextCalls int
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+		DataDir: dir,
+		NextXIDFn: func() uint64 {
+			nextCalls++
+			return 4711
+		},
+	})
+	if err := cp.runCheckpoint(context.Background(), false); err != nil {
+		t.Fatalf("runCheckpoint: %v", err)
+	}
+	if nextCalls == 0 {
+		t.Errorf("NextXIDFn was not called during checkpoint")
+	}
+
+	got, err := os.ReadFile(filepath.Join(globalDir, "pg_control"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nx := le.Uint64(got[64:]); nx != 4711 {
+		t.Errorf("nextXid in pg_control after checkpoint: got %d want 4711", nx)
+	}
+
+	// Subsequent checkpoint with a *lower* hook value must NOT roll back
+	// nextXid — pg_control's value is monotonic by design.
+	cp2 := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+		DataDir:   dir,
+		NextXIDFn: func() uint64 { return 100 },
+	})
+	if err := cp2.runCheckpoint(context.Background(), false); err != nil {
+		t.Fatalf("runCheckpoint (regression attempt): %v", err)
+	}
+	got, err = os.ReadFile(filepath.Join(globalDir, "pg_control"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nx := le.Uint64(got[64:]); nx != 4711 {
+		t.Errorf("nextXid regressed after lower-value checkpoint: got %d want 4711", nx)
+	}
+
+	// CRC must still validate.
+	wantCRC := crc32.Checksum(got[:292], crcTable)
+	gotCRC := le.Uint32(got[292:])
+	if gotCRC != wantCRC {
+		t.Errorf("CRC mismatch: got %#x want %#x", gotCRC, wantCRC)
+	}
+}
+
 func waitSignals(t *testing.T, ch <-chan struct{}, n int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.After(timeout)

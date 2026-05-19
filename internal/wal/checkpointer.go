@@ -93,6 +93,15 @@ type CheckpointerConfig struct {
 	// Populated by initdb.Open from DefaultGUCParameters() at server start.
 	// M0106-0010 batched-33.
 	GUCParams GUCParameters
+
+	// NextXIDFn, when non-nil, is invoked at each checkpoint to read the
+	// live "next-to-assign" XID from the MVCC manager so the
+	// checkpointCopy.nextXid field in pg_control reflects current XID
+	// consumption. Without this hook the field stays at the bootstrap
+	// value (FirstNormalTransactionId = 3) and a PG standby attached via
+	// basebackup boots with snapshot xmax=3, hiding every tuple created
+	// after initdb. M0106-0010 batched-45.
+	NextXIDFn func() uint64
 }
 
 func (c *CheckpointerConfig) withDefaults() {
@@ -373,6 +382,10 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 		checkLSN0 := startLSN - 1 // convert 1-based internal to 0-based PG LSN
 		now := time.Now().Unix()
 		guc := c.cfg.GUCParams
+		var nextXid uint64
+		if c.cfg.NextXIDFn != nil {
+			nextXid = c.cfg.NextXIDFn()
+		}
 		if err := control.UpdateControlFile(c.cfg.DataDir, func(cd *control.ControlFileData) {
 			cd.State = control.DBStateInProduction
 			cd.Time = now
@@ -382,6 +395,14 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 			cd.CheckPointCopyThisTLI = 1
 			cd.CheckPointCopyPrevTLI = 1
 			cd.CheckPointCopyFullPageWrites = true
+			// M0106-0010 batched-45: refresh checkPointCopy.nextXid so a
+			// PG standby attached after this checkpoint sees the right
+			// snapshot xmax instead of the bootstrap FirstNormalXID=3.
+			// Only update when the hook is wired and the value advances —
+			// nextXid in pg_control must be monotonic.
+			if nextXid > cd.CheckPointCopyNextXid {
+				cd.CheckPointCopyNextXid = nextXid
+			}
 			cd.MinRecoveryPoint = 0
 			cd.MinRecoveryPointTLI = 0
 			// Refresh GUC echo fields at every checkpoint so a standby that

@@ -10813,6 +10813,47 @@ relcache init → replication readiness) and intra-package grouped.
           advances `latestObservedXid`, updates `KnownAssignedXids`,
           and stamps the SLRU during streaming replay. Without (b)
           only basebackup-snapshot XIDs are visible on the standby.
+    - PARTIAL PROGRESS 2026-05-19 (loop 16, batched-45a): step (a)
+      LANDED — checkpointer now refreshes
+      `checkPointCopy.nextXid` in `global/pg_control` from the live
+      `mvcc.Manager.NextXID()` at every checkpoint. Three layers
+      changed: (1) `internal/control/pgcontrol.go` gains a
+      `CheckPointCopyNextXid uint64` field on `ControlFileData` with
+      decode (`le.Uint64(buf[64:])`) / encode (`le.PutUint64(buf[64:])`)
+      symmetry — before, the field roundtripped only because nothing
+      touched offset 64; now it can be deliberately advanced; (2)
+      `internal/wal/checkpointer.go` gains a `NextXIDFn func() uint64`
+      hook on `CheckpointerConfig`; `runCheckpoint` calls the hook
+      after the checkpoint marker is appended and sets
+      `cd.CheckPointCopyNextXid = max(current, hook())` (monotonicity
+      guard); (3) `internal/initdb/open.go` wires
+      `NextXIDFn: func() uint64 { return uint64(txnMgr.NextXID()) }`
+      on the production checkpointer. Tests added: (i)
+      `TestUpdateControlFileNextXidRoundTrip` in
+      `internal/control/control_test.go` pins encode/decode symmetry
+      (the bug would manifest as a no-op update zeroing offset 64);
+      (ii) `TestCheckpointerWritesNextXidIntoPgControl` in
+      `internal/wal/checkpointer_test.go` exercises the full hook
+      path including monotonicity (hook returning 100 after 4711
+      leaves the file at 4711) and CRC32C validation. Verified:
+      `go test ./internal/control/ ./internal/wal/` all green.
+      Pre-existing baseline failure
+      `TestRollbackedTableNotVisibleAfterRestart` in
+      `./internal/initdb/` reproduces on master HEAD `7a8a818`
+      before this loop's changes — unrelated to nextXid; tracked
+      separately. Step (b) (PG-canonical `XLOG_XACT_COMMIT`) is
+      deferred to batched-46 so this loop honours Ralph's
+      one-task-per-loop contract.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 16 (batched-45a)" section).
+      Next loop (batched-46): implement step (b). Emit
+      PG-canonical `XLOG_XACT_COMMIT` (RmgrXact, `xl_xact_commit`)
+      alongside `RecordKindXactCommit` so PG standby's
+      `xact_redo_commit` advances `latestObservedXid`, updates
+      `KnownAssignedXids`, and stamps the SLRU during streaming
+      replay. Re-run `TestE2E_FailoverGoopgToPG/async`; if 42P01
+      persists, capture the next residual (the standby's
+      `latestObservedXid` after replay vs. the primary's NextXID).
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

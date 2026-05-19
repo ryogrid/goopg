@@ -257,6 +257,68 @@ func TestUpdateControlFileRoundTrip(t *testing.T) {
 	}
 }
 
+// TestUpdateControlFileNextXidRoundTrip pins the M0106-0010 batched-45
+// invariant: checkPointCopy.nextXid (offset 64, uint64 = FullTransactionId)
+// must roundtrip through decode/encode AND respect the
+// monotonic-checkpoint-update contract.  PG18 stores epoch in the high
+// 32 bits and the raw XID in the low 32 bits; bootstrap value is 3.
+// Without this, every checkpoint after initdb would silently zero out
+// the field and a PG standby would boot with snapshot xmax = 0 (rather
+// than the live primary's next-to-assign XID).
+func TestUpdateControlFileNextXidRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, pgControlFileSize)
+	le := binary.LittleEndian
+	// Seed bootstrap-style pg_control with nextXid = 3 at offset 64.
+	le.PutUint64(buf[0:], 0xABCDEF0123456789)
+	le.PutUint32(buf[8:], 1800)
+	le.PutUint32(buf[16:], DBStateShutdowned)
+	le.PutUint64(buf[64:], 3)
+	crc := crc32.Checksum(buf[:pgControlCRCOffset], pgCRCTable)
+	le.PutUint32(buf[pgControlCRCOffset:], crc)
+	path := filepath.Join(dir, pgControlFilePath)
+	if err := os.WriteFile(path, buf, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// First update: advance nextXid to 42. The decoded value should
+	// already carry the seeded 3.
+	if err := UpdateControlFile(dir, func(cd *ControlFileData) {
+		if cd.CheckPointCopyNextXid != 3 {
+			t.Fatalf("decoded nextXid: got %d want 3", cd.CheckPointCopyNextXid)
+		}
+		cd.CheckPointCopyNextXid = 42
+	}); err != nil {
+		t.Fatalf("UpdateControlFile: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nx := le.Uint64(got[64:]); nx != 42 {
+		t.Errorf("nextXid after first update: got %d want 42", nx)
+	}
+
+	// Second update: a no-op callback must not zero out nextXid.
+	if err := UpdateControlFile(dir, func(cd *ControlFileData) {
+		// Touch an unrelated field so the file is rewritten.
+		cd.State = DBStateInProduction
+	}); err != nil {
+		t.Fatalf("UpdateControlFile (no-op nextXid): %v", err)
+	}
+	got, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nx := le.Uint64(got[64:]); nx != 42 {
+		t.Errorf("nextXid after no-op update: got %d want 42 (encode must preserve nextXid)", nx)
+	}
+}
+
 // TestUpdateControlFileMissingDir verifies that UpdateControlFile returns
 // an error (wrapping os.ErrNotExist) when the data directory does not
 // contain a pg_control file.
