@@ -10623,48 +10623,7 @@ relcache init → replication readiness) and intra-package grouped.
       sites and re-run `TestE2E_FailoverGoopgToPG/async`. The
       `TestE2E_CreateTablePersistsRelnameIndexEntryOnDisk` diagnostic
       should flip to PASS at that point.
-
-- [ ] **M0106-0011**
-      - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
-      - DDL operations (CREATE TABLE, ALTER TABLE, DROP TABLE) must maintain
-        PG-compatible pg_class/pg_attribute tuples — not just an init-time
-        snapshot. After any catalog change, goopg must regenerate the
-        relcache init file (`pg_internal.init`) so a PG standby reconnecting
-        (or bootstrapped from a later basebackup) loads correct relation
-        descriptors.
-      - Mirror PG's `write_relcache_init_file()` triggered by
-        `RelationCacheInitFileRemove` on catalog invalidation.
-      - Wire init-file regeneration into the checkpointer (shutdown
-        checkpoint) or a background writer cycle.
-      - Hard requirement for correct ongoing replication — an init-time-only
-        snapshot will bit-rot the moment the first DDL runs.
-      - Files: `internal/catalog/`, `internal/initdb/relcache_init.go`,
-        `internal/server/`
-
- - [ ] **M0106-0012**
-      - Summary: Make TestSynchronousCommitFlushesByDefault to be passed.
-      - Survery failure reason and fix. This test become failing after modifications
-        related catalog bootstrap.
-
- - [ ] **M0106-0013**
-      - Summary: Make goopg use control files same as PostgreSQL
-      - goopg currently uses original control file format like JSON and control file
-        persistence logic is not same as PostgreSQL. Usage of control file is also not same as PostgreSQL. This task is to make goopg use control files same as PostgreSQL and goopg's
-        durability guarantees should be same as PostgreSQL's durability guarantees after this task is done. This is a hard requirement for goopg to be production ready. But must not be **DEFFERED**.
-      - Files: `internal/storage/`, `internal/server/`
-
-## Completed
-
-- [x] Project initialization (Ralph harness wired up).
-
-## Notes
-
-- This file is the authoritative TODO list for Ralph. Update it after every
-  meaningful change.
-- Keep work to ONE item per loop. Decompose further if an item is larger
-  than what fits in a single agent invocation.
-- Every non-trivial subsystem must land alongside (or just before) a design
-  doc under `docs/design/`. The spec treats this as a hard requirement.    - PARTIAL PROGRESS 2026-05-19 (loop 12, batched-41): multi-level
+    - PARTIAL PROGRESS 2026-05-19 (loop 12, batched-41): multi-level
       btree insert + DBOid=5 mirror re-wired. Disk-level diagnostic
       test `TestE2E_CreateTablePersistsRelnameIndexEntryOnDisk` flips
       to PASS — `bench_log` now lands in both `base/1/2663` and
@@ -10710,8 +10669,32 @@ relcache init → replication readiness) and intra-package grouped.
       data being on disk.
       Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
       ("2026-05-19 loop 12 (batched-41)" section).
-      Next loop (batched-42) — investigate residual 42P01 via the
-      hypotheses documented in the design doc, in priority order:
+    - PARTIAL PROGRESS 2026-05-19 (loop 13, batched-42): implemented H1
+      from the batched-41 residual hypothesis list. Every canonical-FPI
+      emit site (heap insert/delete, sys-btree single-leaf insert,
+      leaf-root split, multi-level descend insert, and rebuild) now
+      stamps `pd_lsn` on the rewritten page from the returned WAL
+      end-LSN before unpinning the slot. `LogCanonicalFunc` signature
+      changed from `func([]byte) error` to `func([]byte) (uint64, error)`;
+      all `catalog.PgCanonical*` helpers and the `initdb/open.go`
+      wrapper updated. Verified: `go build ./...` clean; affected
+      packages PASS (`internal/catalog`, `internal/executor`,
+      `internal/storage`, `internal/server`, `internal/mvcc`);
+      `internal/wal` and `internal/initdb` carry the same pre-existing
+      failures as the batched-40/41 baseline (no new regressions, base
+      verified by `git stash` re-run). Disk-level diagnostic
+      `TestE2E_CreateTablePersistsRelnameIndexEntryOnDisk` still PASS.
+      `TestE2E_FailoverGoopgToPG/async` was NOT re-run in this loop;
+      that verification is the first step of batched-43.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 13 (batched-42)" section).
+      Next loop (batched-43): run the failover test end-to-end with the
+      batched-42 changes. If H1 alone closes the 42P01 residual, mark
+      M0106-0010 complete. Otherwise, the disk-byte-compare experiment
+      of H2 (bootstrap-built vs. rebuild-built page via
+      `dumpRelnameNspIndexLayout`) is the next-cheapest probe.
+
+      Original batched-42 hypothesis (kept for reference):
       (H1) Rebuild path leaves `pd_lsn=0` on rewritten pages — when
            PG replays the streamed WAL it may apply a *stale* FPI
            over the basebackup-correct page. Set `pd_lsn` from the
@@ -10733,3 +10716,45 @@ relcache init → replication readiness) and intra-package grouped.
            invalidation. If H1–H3 do not explain the failure,
            investigate whether the standby needs a different
            cache-invalidation signal in the WAL stream.
+
+- [ ] **M0106-0011**
+      - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
+      - DDL operations (CREATE TABLE, ALTER TABLE, DROP TABLE) must maintain
+        PG-compatible pg_class/pg_attribute tuples — not just an init-time
+        snapshot. After any catalog change, goopg must regenerate the
+        relcache init file (`pg_internal.init`) so a PG standby reconnecting
+        (or bootstrapped from a later basebackup) loads correct relation
+        descriptors.
+      - Mirror PG's `write_relcache_init_file()` triggered by
+        `RelationCacheInitFileRemove` on catalog invalidation.
+      - Wire init-file regeneration into the checkpointer (shutdown
+        checkpoint) or a background writer cycle.
+      - Hard requirement for correct ongoing replication — an init-time-only
+        snapshot will bit-rot the moment the first DDL runs.
+      - Files: `internal/catalog/`, `internal/initdb/relcache_init.go`,
+        `internal/server/`
+
+ - [ ] **M0106-0012**
+      - Summary: Make TestSynchronousCommitFlushesByDefault to be passed.
+      - Survery failure reason and fix. This test become failing after modifications
+        related catalog bootstrap.
+
+ - [ ] **M0106-0013**
+      - Summary: Make goopg use control files same as PostgreSQL
+      - goopg currently uses original control file format like JSON and control file
+        persistence logic is not same as PostgreSQL. Usage of control file is also not same as PostgreSQL. This task is to make goopg use control files same as PostgreSQL and goopg's
+        durability guarantees should be same as PostgreSQL's durability guarantees after this task is done. This is a hard requirement for goopg to be production ready. But must not be **DEFFERED**.
+      - Files: `internal/storage/`, `internal/server/`
+
+## Completed
+
+- [x] Project initialization (Ralph harness wired up).
+
+## Notes
+
+- This file is the authoritative TODO list for Ralph. Update it after every
+  meaningful change.
+- Keep work to ONE item per loop. Decompose further if an item is larger
+  than what fits in a single agent invocation.
+- Every non-trivial subsystem must land alongside (or just before) a design
+  doc under `docs/design/`. The spec treats this as a hard requirement.    

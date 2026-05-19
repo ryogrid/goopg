@@ -3156,10 +3156,17 @@ func emitCanonicalHeapInsert(ctx *Context, rel storage.RelFileNode, ptr storage.
 		return fmt.Errorf("canonical WAL pin insert: %w", err)
 	}
 	page := make(storage.Page, storage.BlockSize)
+	slot.Lock()
 	copy(page, slot.Page())
-	ctx.Pool.Unpin(slot)
-	return catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset,
+	endLSN, emitErr := catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset,
 		uint32(ctx.Tx.XID), ctx.LogCanonical)
+	if emitErr == nil && endLSN != 0 {
+		storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
+		ctx.Pool.MarkDirty(slot)
+	}
+	slot.Unlock()
+	ctx.Pool.Unpin(slot)
+	return emitErr
 }
 
 // emitCanonicalHeapDelete emits a PG-canonical XLOG_HEAP_DELETE record with
@@ -3177,8 +3184,15 @@ func emitCanonicalHeapDelete(ctx *Context, rel storage.RelFileNode, blk storage.
 		return fmt.Errorf("canonical WAL pin delete: %w", err)
 	}
 	page := make(storage.Page, storage.BlockSize)
+	s.Lock()
 	copy(page, s.Page())
-	ctx.Pool.Unpin(s)
 	xid := uint32(ctx.Tx.XID)
-	return catalog.PgCanonicalHeapDelete(rel, blk, page, slot, xid, xid, ctx.LogCanonical)
+	endLSN, emitErr := catalog.PgCanonicalHeapDelete(rel, blk, page, slot, xid, xid, ctx.LogCanonical)
+	if emitErr == nil && endLSN != 0 {
+		storage.MustHeader(s.Page()).SetLSN(storage.LSN(endLSN))
+		ctx.Pool.MarkDirty(s)
+	}
+	s.Unlock()
+	ctx.Pool.Unpin(s)
+	return emitErr
 }

@@ -1937,12 +1937,23 @@ func writeHeapRowCanonical(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return ptr, fmt.Errorf("canonical WAL pin: %w", err)
 	}
 	page := make(storage.Page, storage.BlockSize)
+	slot.Lock()
 	copy(page, slot.Page())
-	ctx.Pool.Unpin(slot)
-
 	xid := uint32(ctx.Tx.XID)
-	if err := catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset, xid, ctx.LogCanonical); err != nil {
-		return ptr, err
+	endLSN, emitErr := catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset, xid, ctx.LogCanonical)
+	if emitErr == nil && endLSN != 0 {
+		// M0106-0010 batched-42 H1: stamp pd_lsn so a PG18 standby's recovery
+		// can detect "already applied" via the lsn comparison in
+		// XLogReadBufferForRedo (xlogutils.c). Without this, the basebackup
+		// snapshot's pd_lsn=0 page is unconditionally clobbered by the WAL
+		// FPI on every replay pass.
+		storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
+		ctx.Pool.MarkDirty(slot)
+	}
+	slot.Unlock()
+	ctx.Pool.Unpin(slot)
+	if emitErr != nil {
+		return ptr, emitErr
 	}
 	return ptr, nil
 }

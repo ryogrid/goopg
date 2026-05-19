@@ -1032,9 +1032,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// nil and DDL paths skip the canonical record emission.
 	var logCanonical catalog.LogCanonicalFunc
 	if walWriter != nil && walWriter.PageHeadersEnabled() {
-		logCanonical = func(payload []byte) error {
-			_, _, err := walWriter.Append(payload)
-			return err
+		logCanonical = func(payload []byte) (uint64, error) {
+			_, end, err := walWriter.Append(payload)
+			return end, err
 		}
 	}
 

@@ -11,7 +11,11 @@ import (
 // payload begins with RecordKindCanonical (0xFE) followed by the rmgr/info/xid
 // and the PG-canonical XLogRecord body (block references + main data).
 // Using a callback avoids the import cycle: wal → catalog → wal.
-type LogCanonicalFunc func(payload []byte) error
+//
+// The returned uint64 is the WAL end-LSN of the appended record (caller can
+// stamp it onto the page's pd_lsn so a PG18 standby's recovery applies FPIs
+// only when its on-disk page is older than the record).
+type LogCanonicalFunc func(payload []byte) (uint64, error)
 
 // PG resource manager IDs mirrored from internal/wal/xlog_record.go.
 // Defined locally to avoid the catalog → wal import cycle.
@@ -67,9 +71,9 @@ func PgCanonicalHeapInsert(
 	offnum uint16,
 	xid uint32,
 	logFn LogCanonicalFunc,
-) error {
+) (uint64, error) {
 	if logFn == nil {
-		return nil
+		return 0, nil
 	}
 	payload := BuildCanonicalHeapInsertPayload(rel, blk, page, offnum, xid)
 	return logFn(payload)
@@ -115,9 +119,9 @@ func PgCanonicalBtreeInsert(
 	offnum uint16,
 	xid uint32,
 	logFn LogCanonicalFunc,
-) error {
+) (uint64, error) {
 	if logFn == nil {
-		return nil
+		return 0, nil
 	}
 	payload := BuildCanonicalBtreeInsertPayload(rel, blk, page, offnum, xid)
 	return logFn(payload)
@@ -171,9 +175,9 @@ func PgCanonicalHeapDelete(
 	xid uint32,
 	xmax uint32,
 	logFn LogCanonicalFunc,
-) error {
+) (uint64, error) {
 	if logFn == nil {
-		return nil
+		return 0, nil
 	}
 	return logFn(BuildCanonicalHeapDeletePayload(rel, blk, page, offnum, xid, xmax))
 }

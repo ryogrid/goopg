@@ -406,30 +406,53 @@ func splitLeafRootAndInsert(
 	ctx.Pool.MarkDirty(rootSlot)
 	ctx.Pool.MarkDirty(metaSlot)
 
+	if ctx.LogCanonical != nil {
+		xid := uint32(ctx.Tx.XID)
+		// Children first, then internal root, then metapage. Each record
+		// carries a FPI of the new page state. M0106-0010 batched-42 H1:
+		// stamp pd_lsn on each page from the returned end-LSN so the PG18
+		// standby's recovery can skip already-applied FPIs (xlogutils.c
+		// XLogReadBufferForRedo lsn comparison).
+		leftLSN, err := catalog.PgCanonicalBtreeInsert(rel, sysBtreeRootBlock, leftCopy, 1, xid, ctx.LogCanonical)
+		if err != nil {
+			releaseSplitSlots(ctx, metaSlot, rootSlot, rightSlot)
+			return fmt.Errorf("split: WAL left leaf: %w", err)
+		}
+		if leftLSN != 0 {
+			storage.MustHeader(leafSlot.Page()).SetLSN(storage.LSN(leftLSN))
+		}
+		rightLSN, err := catalog.PgCanonicalBtreeInsert(rel, rightBlk, rightCopy, 1, xid, ctx.LogCanonical)
+		if err != nil {
+			releaseSplitSlots(ctx, metaSlot, rootSlot, rightSlot)
+			return fmt.Errorf("split: WAL right leaf: %w", err)
+		}
+		if rightLSN != 0 {
+			storage.MustHeader(rightSlot.Page()).SetLSN(storage.LSN(rightLSN))
+		}
+		rootLSN, err := catalog.PgCanonicalBtreeInsert(rel, rootBlk, rootCopy, 1, xid, ctx.LogCanonical)
+		if err != nil {
+			releaseSplitSlots(ctx, metaSlot, rootSlot, rightSlot)
+			return fmt.Errorf("split: WAL new root: %w", err)
+		}
+		if rootLSN != 0 {
+			storage.MustHeader(rootSlot.Page()).SetLSN(storage.LSN(rootLSN))
+		}
+		metaLSN, err := catalog.PgCanonicalBtreeInsert(rel, 0, metaCopy, 1, xid, ctx.LogCanonical)
+		if err != nil {
+			releaseSplitSlots(ctx, metaSlot, rootSlot, rightSlot)
+			return fmt.Errorf("split: WAL metapage: %w", err)
+		}
+		if metaLSN != 0 {
+			storage.MustHeader(metaSlot.Page()).SetLSN(storage.LSN(metaLSN))
+		}
+	}
+
 	metaSlot.Unlock()
 	ctx.Pool.Unpin(metaSlot)
 	rootSlot.Unlock()
 	ctx.Pool.Unpin(rootSlot)
 	rightSlot.Unlock()
 	ctx.Pool.Unpin(rightSlot)
-
-	if ctx.LogCanonical != nil {
-		xid := uint32(ctx.Tx.XID)
-		// Children first, then internal root, then metapage. Each record
-		// carries a FPI of the new page state.
-		if err := catalog.PgCanonicalBtreeInsert(rel, sysBtreeRootBlock, leftCopy, 1, xid, ctx.LogCanonical); err != nil {
-			return fmt.Errorf("split: WAL left leaf: %w", err)
-		}
-		if err := catalog.PgCanonicalBtreeInsert(rel, rightBlk, rightCopy, 1, xid, ctx.LogCanonical); err != nil {
-			return fmt.Errorf("split: WAL right leaf: %w", err)
-		}
-		if err := catalog.PgCanonicalBtreeInsert(rel, rootBlk, rootCopy, 1, xid, ctx.LogCanonical); err != nil {
-			return fmt.Errorf("split: WAL new root: %w", err)
-		}
-		if err := catalog.PgCanonicalBtreeInsert(rel, 0, metaCopy, 1, xid, ctx.LogCanonical); err != nil {
-			return fmt.Errorf("split: WAL metapage: %w", err)
-		}
-	}
 
 	_ = insertedIdx // tuple has landed; per-tuple TID tracking deferred.
 	return nil

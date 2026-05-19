@@ -1201,3 +1201,82 @@ Hypotheses for the residual (next-loop investigation candidates):
   `syncIndexToCatalogHeap`.
 - `internal/testport/e2e_failover_goopg_to_pg_test.go` — added inline
   disk-state diagnostic dump (gated on `GOOPG_RUN_BLOCKED_M0102_E2E`).
+
+## 2026-05-19 loop 13 (batched-42): pd_lsn stamping on canonical FPI emit paths (H1)
+
+### What landed
+
+`LogCanonicalFunc` now returns the WAL end-LSN of the appended record so
+canonical-FPI emit sites can stamp `pd_lsn` on the rewritten page. The
+PG18 standby's recovery path (`xlogutils.c::XLogReadBufferForRedo`)
+compares `page->lsn` against the WAL record's LSN; a `pd_lsn` of 0 made
+every replay of an old FPI clobber the basebackup-correct page.
+
+Type / interface changes:
+
+- `internal/catalog/canonical.go`:
+  - `LogCanonicalFunc` signature: `func([]byte) error` →
+    `func([]byte) (uint64, error)` (uint64 is the end-LSN).
+  - `PgCanonicalHeapInsert`, `PgCanonicalBtreeInsert`,
+    `PgCanonicalHeapDelete` all return `(uint64, error)`.
+- `internal/initdb/open.go`: wrapper now returns the end-LSN from
+  `walWriter.Append`.
+
+Call-site updates (every canonical-FPI emit now stamps `pd_lsn` while
+its target slot is still pinned):
+
+- `internal/executor/operators_ddl.go` — `writeHeapRowCanonical` keeps
+  the slot locked during WAL emit, then calls
+  `storage.MustHeader(slot.Page()).SetLSN(endLSN)` before unlocking.
+- `internal/executor/operators_storage.go` — `emitCanonicalHeapInsert`
+  and `emitCanonicalHeapDelete` restructured to lock + WAL-emit +
+  SetLSN + unlock (was: snapshot bytes → unpin → emit).
+- `internal/executor/sys_catalog_index_insert.go::insertIntoSingleLeafRoot`
+  — same lock-then-emit-then-SetLSN sequence inside the `LogCanonical`
+  branch.
+- `internal/executor/sys_catalog_btree_split.go::splitLeafRootAndInsert`
+  — keeps all four slots (leaf, right, root, meta) pinned+locked
+  through the four `PgCanonicalBtreeInsert` calls; stamps `pd_lsn` on
+  each from the returned end-LSN before unpinning.
+- `internal/executor/sys_catalog_btree_multilevel.go::insertIntoExistingLeaf`
+  and `rebuildSysBtreeWithNewEntry` — both stamp `pd_lsn` on rewritten
+  leaf pages from the FPI's end-LSN.
+
+The split path was previously **MarkDirty → Unlock → Unpin → emit**.
+That order was safe for correctness on the goopg-local replay path
+(the writer keeps the page in the buffer pool and `pd_lsn` is
+re-stamped on flush via the writer's own bookkeeping), but the **PG18
+standby has no such bookkeeping** and reads `pd_lsn` directly from the
+on-disk page bytes copied by `pg_basebackup`. Without explicit stamping
+before the slot is flushed, PG sees `pd_lsn=0` and replays every FPI.
+
+### Verification
+
+- `go build ./...` clean.
+- `internal/catalog`, `internal/executor`, `internal/storage`,
+  `internal/server`, `internal/mvcc` — all PASS.
+- `internal/wal` — same two pre-existing failures
+  (`TestCheckpointerWritesCheckpointMarkers`,
+  `TestEncodeRecordXLogClassifiesXactCommitXID`) inherited from
+  batched-40/41 baseline; no new regressions.
+- `internal/initdb` — same pre-existing failure
+  (`TestRollbackedTableNotVisibleAfterRestart`) inherited from the
+  batched-40/41 baseline (verified by `git stash` + re-run); no new
+  regressions.
+- `TestE2E_CreateTablePersistsRelnameIndexEntryOnDisk` — still PASS;
+  `bench_log` lands in both `base/1/2663` and `base/5/2663`.
+
+### Residual
+
+Re-running `TestE2E_FailoverGoopgToPG/async` (gated on
+`GOOPG_RUN_BLOCKED_M0102_E2E=1`) is required to confirm whether the
+stamp closes the residual `42P01: relation "public.bench_log" does
+not exist` and to disambiguate H1 from H2–H4. The test exercises a
+full pg_basebackup + streaming-replication cycle and was not run in
+this loop; that verification is the first step of batched-43.
+
+Next loop (batched-43): run the failover test end-to-end with the
+batched-42 changes; if H1 alone closes it, mark M0106-0010 complete.
+If 42P01 persists, the disk-byte-compare experiment of H2 (a
+bootstrap-built page vs. a rebuild-built page using the
+`dumpRelnameNspIndexLayout` diagnostic) is the next-cheapest probe.

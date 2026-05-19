@@ -358,22 +358,39 @@ func rebuildSysBtreeWithNewEntry(ctx *Context, indexOID uint32, rel storage.RelF
 		slot.Lock()
 		src := imageBytes[blk*storage.BlockSize : (blk+1)*storage.BlockSize]
 		copy(slot.Page(), src)
-		ctx.Pool.MarkDirty(slot)
-		// Snapshot for WAL emission before releasing the buffer.
+		// Snapshot for WAL emission while still holding the slot lock.
 		pageCopy := make(storage.Page, storage.BlockSize)
 		copy(pageCopy, src)
-		slot.Unlock()
-		ctx.Pool.Unpin(slot)
+		ctx.Pool.MarkDirty(slot)
 
 		if ctx.LogCanonical != nil {
 			// XLOG_BTREE_INSERT_LEAF carries a per-page FPI; PG18's
 			// btree_xlog_insert returns BLK_RESTORED so the per-tuple
 			// logic never runs. Use offset 1 as a placeholder (the
 			// FPI is what actually applies).
-			if err := catalog.PgCanonicalBtreeInsert(rel, storage.BlockNumber(blk), pageCopy, 1, xid, ctx.LogCanonical); err != nil {
-				return fmt.Errorf("rebuild: WAL FPI blk %d: %w", blk, err)
+			endLSN, emitErr := catalog.PgCanonicalBtreeInsert(rel, storage.BlockNumber(blk), pageCopy, 1, xid, ctx.LogCanonical)
+			if emitErr != nil {
+				slot.Unlock()
+				ctx.Pool.Unpin(slot)
+				return fmt.Errorf("rebuild: WAL FPI blk %d: %w", blk, emitErr)
+			}
+			if endLSN != 0 {
+				// M0106-0010 batched-42 H1: stamp pd_lsn so the PG18
+				// standby's recovery sees an up-to-date page on disk
+				// and skips the FPI via XLogReadBufferForRedo's lsn
+				// comparison (xlogutils.c). Without this stamping,
+				// pd_lsn stays 0 on overwritten pages, the basebackup
+				// snapshot of those pages also has pd_lsn=0, and
+				// recovery unconditionally replays every FPI — in the
+				// rebuild path this produces a *correct* page for the
+				// last-written rebuild, but masks any later staler
+				// FPI replay from a different rebuild touching the
+				// same block.
+				storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
 			}
 		}
+		slot.Unlock()
+		ctx.Pool.Unpin(slot)
 	}
 	return nil
 }
@@ -426,15 +443,25 @@ func insertIntoExistingLeaf(ctx *Context, indexOID uint32, rel storage.RelFileNo
 	pageCopy := make(storage.Page, storage.BlockSize)
 	copy(pageCopy, page)
 	ctx.Pool.MarkDirty(slot)
-	slot.Unlock()
-	ctx.Pool.Unpin(slot)
 
 	if ctx.LogCanonical != nil {
 		xid := uint32(ctx.Tx.XID)
-		if err := catalog.PgCanonicalBtreeInsert(rel, leafBlk, pageCopy, insertSlot, xid, ctx.LogCanonical); err != nil {
-			return fmt.Errorf("canonical WAL leaf blk %d: %w", leafBlk, err)
+		endLSN, emitErr := catalog.PgCanonicalBtreeInsert(rel, leafBlk, pageCopy, insertSlot, xid, ctx.LogCanonical)
+		if emitErr != nil {
+			slot.Unlock()
+			ctx.Pool.Unpin(slot)
+			return fmt.Errorf("canonical WAL leaf blk %d: %w", leafBlk, emitErr)
+		}
+		if endLSN != 0 {
+			// M0106-0010 batched-42 H1: stamp pd_lsn so a PG18 standby
+			// detects "already applied" via XLogReadBufferForRedo's
+			// lsn comparison; otherwise basebackup pages (pd_lsn=0)
+			// are clobbered by every WAL FPI on replay.
+			storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
 		}
 	}
+	slot.Unlock()
+	ctx.Pool.Unpin(slot)
 	_ = indexOID // retained for log/error context if needed in the future.
 	return nil
 }

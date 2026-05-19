@@ -171,7 +171,7 @@ func TestBuildCanonicalBtreeInsertPayload(t *testing.T) {
 func TestPgCanonicalHeapInsert_NilLogFn(t *testing.T) {
 	rel := storage.RelFileNode{DBOid: 5, RelOid: 1259}
 	page := make(storage.Page, storage.BlockSize)
-	if err := PgCanonicalHeapInsert(rel, 0, page, 1, 42, nil); err != nil {
+	if _, err := PgCanonicalHeapInsert(rel, 0, page, 1, 42, nil); err != nil {
 		t.Fatalf("unexpected error with nil logFn: %v", err)
 	}
 }

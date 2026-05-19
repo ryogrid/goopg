@@ -294,15 +294,23 @@ func insertIntoSingleLeafRoot(ctx *Context, indexOID uint32, rel storage.RelFile
 	copy(pageCopy, page)
 
 	ctx.Pool.MarkDirty(slot)
-	slot.Unlock()
-	ctx.Pool.Unpin(slot)
 
 	if ctx.LogCanonical != nil {
 		xid := uint32(ctx.Tx.XID)
-		if err := catalog.PgCanonicalBtreeInsert(rel, sysBtreeRootBlock, pageCopy, insertSlot, xid, ctx.LogCanonical); err != nil {
-			return fmt.Errorf("canonical WAL sys btree %d: %w", indexOID, err)
+		endLSN, emitErr := catalog.PgCanonicalBtreeInsert(rel, sysBtreeRootBlock, pageCopy, insertSlot, xid, ctx.LogCanonical)
+		if emitErr != nil {
+			slot.Unlock()
+			ctx.Pool.Unpin(slot)
+			return fmt.Errorf("canonical WAL sys btree %d: %w", indexOID, emitErr)
+		}
+		if endLSN != 0 {
+			// M0106-0010 batched-42 H1: stamp pd_lsn from the FPI's
+			// end-LSN so PG18 recovery skips already-applied FPIs.
+			storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
 		}
 	}
+	slot.Unlock()
+	ctx.Pool.Unpin(slot)
 	return nil
 }
 
