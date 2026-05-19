@@ -1794,3 +1794,102 @@ most likely one of:
 Re-run `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
 'TestE2E_FailoverGoopgToPG/async' ./internal/testport/` after
 batched-46 lands and capture the residual.
+
+## 2026-05-19 loop 18 (batched-47) — checkpoint nextXid parameterisation
+
+Closes the 42P01 `relation "public.bench_log" does not exist`
+residual that survived batched-46.
+
+### Why batched-46 alone was insufficient
+
+batched-46 emits a PG-canonical `XLOG_XACT_COMMIT` record alongside
+the goopg-native marker so the standby's `xact_redo_commit`
+advances `latestObservedXid` and seeds `KnownAssignedXids` during
+streaming replay. That path correctly handles xacts that commit
+AFTER the basebackup snapshot. But `bench_log` is created BEFORE
+pg_basebackup runs, so its `pg_class` row's `xmin` is established
+during the *pre-basebackup* CREATE TABLE. The checkpoint record
+inside the basebackup payload is the only carrier of that XID's
+existence — there is no later `xact_redo_commit` to replay.
+
+### Root cause (two layers)
+
+**Layer 1 — load-bearing**: `EncodeCheckpointCompat` in
+`internal/wal/recovery.go:837` hardcoded the CheckPoint struct's
+`nextXid` (offset 24) and `oldestActiveXid` (offset 80) to literal
+`3`. PG's `InitWalRecovery` (xlogrecovery.c) decodes this record
+during standby startup and calls
+`AdvanceNextFullTransactionIdPastXid(checkPoint.nextXid - 1)`,
+which sets `ShmemVariableCache->nextXid` and (transitively)
+`latestCompletedXid`. With the value stuck at 3, the standby's
+recovery snapshot has `xmax = latestCompletedXid + 1 = 3`, so XID
+3 is treated as "future" and every pre-basebackup user tuple is
+invisible. Symptom: `parse_relation.c:1445 parserOpenTable` raises
+42P01 because `RelnameGetRelid` → `SearchSysCache2(RELNAMENSP,
+…)` finds no visible pg_class row for `bench_log`.
+
+**Layer 2 — tooling parity**: the runtime
+`wal.CheckpointerConfig` in `internal/initdb/open.go:861` did NOT
+set `DataDir`, so the `if c.cfg.DataDir != ""` branch in
+`runCheckpoint` (which rewrites `pg_control.CheckPointCopyNextXid`
+via `control.UpdateControlFile`) was a silent no-op in
+production. `TestCheckpointerWritesNextXidIntoPgControl` passes
+only because the test passes `DataDir: dir` itself; batched-45a's
+invariant was never enforced in the real basebackup path. This
+layer affects `pg_controldata` output and any tooling that reads
+`pg_control.nextXid` directly, but it is NOT the visibility
+blocker because the standby reads `nextXid` from the CheckPoint
+WAL record (layer 1), not from `pg_control.nextXid`.
+
+### Fix
+
+1. `internal/wal/recovery.go`:
+   `EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid
+   uint64) []byte`. Writes `nextXid` to offset 24 and
+   `uint32(nextXid)` to offset 80 (`oldestActiveXid` — mirrors PG's
+   shutdown-checkpoint convention since `CheckpointNow` blocks
+   while no user xact is in-flight). Floors at 3 so callers passing
+   0 still encode a sane bootstrap value.
+2. `internal/wal/checkpointer.go`:
+   `runCheckpoint` samples `nextXid := c.cfg.NextXIDFn()` BEFORE
+   calling `Append(EncodeCheckpointCompat(redoLSN0, 1, nextXid))`,
+   so the WAL record carries the live mvcc value. The same value
+   is also fed into the subsequent `control.UpdateControlFile`
+   call (layer 2).
+3. `internal/initdb/open.go`:
+   Runtime `CheckpointerConfig` now sets `DataDir: abs`, enabling
+   layer 2.
+
+### Verification
+
+- `TestCheckpointerWritesNextXidIntoPgControl` — PASS.
+- `TestE2E_FailoverGoopgToPG/async`: standby now logs `next
+  transaction ID: 4; next OID: 16384` (was `3; 16384`) and the
+  42P01 on `bench_log` is closed. The test now progresses past
+  parse-analyse and the next residual is
+  `XX000: could not open relation with OID 2665 at column 22` —
+  a system-catalog-index lookup tracked in batched-48.
+- Pre-existing baseline failures unaffected
+  (`TestCheckpointerWritesCheckpointMarkers`,
+  `TestEncodeRecordXLogClassifiesXactCommitXID`, M0030 migration
+  tests in `./internal/initdb`).
+
+### Why we did NOT also bump nextOid in the CheckPoint record
+
+`nextOid` (offset 32) remains hardcoded at 16384 because goopg has
+no centralised OID allocator that exposes a counter through
+`txnMgr`. Object OIDs are minted ad-hoc in catalog mutators. The
+visibility regime that matters for the 42P01 is keyed on `xmin`
+(pg_xact + snapshot), not OID. Standby's `next OID: 16384`
+display is therefore cosmetic until goopg gains a persisted OID
+counter — tracked under M0106-0013 (pg_control parity).
+
+### Next loop (batched-48)
+
+Diagnose `XX000: could not open relation with OID 2665`. Upstream
+OID 2665 is `pg_largeobject_loid_pn_index`. Likely path: a
+planner / executor stage on the standby is reading a system
+relation goopg's basebackup payload did not seed. Re-run with
+`log_min_messages=debug5` already enabled and capture the failing
+backend's stack frame around `relation_open` /
+`index_open`.

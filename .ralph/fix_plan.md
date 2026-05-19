@@ -10908,6 +10908,59 @@ relcache init → replication readiness) and intra-package grouped.
       primary's NextXID at the SELECT instant to disambiguate
       between (a) a missing XLOG_STANDBY snapshot record on the
       wire and (b) a relfilenode-mismatch on `bench_log`'s heap.
+    - PARTIAL PROGRESS 2026-05-19 (loop 18, batched-47): the 42P01
+      `relation "public.bench_log" does not exist` symptom is
+      CLOSED. Root cause was two-layered:
+      (1) `EncodeCheckpointCompat` in `internal/wal/recovery.go`
+          hardcoded `nextXid = 3` (FirstNormalTransactionId) at the
+          CheckPoint struct's offset 24. PG's `InitWalRecovery`
+          decodes the basebackup-shipped checkpoint record and
+          seeds `ShmemVariableCache->nextXid` /
+          `latestCompletedXid` from it. With nextXid stuck at 3,
+          the standby's recovery snapshot Xmax was `lastCompleted +
+          1 = 3`, so every tuple with `xmin >= 3` (i.e. every
+          user-created row including bench_log's pg_class entry)
+          was treated as "future" and pg_class scans returned no
+          row. Fix: `EncodeCheckpointCompat(redoLSN0, tli,
+          nextXid)` now takes nextXid as a parameter and writes
+          both offset 24 (FullTxnId) and offset 80 (oldestActiveXid
+          for shutdown-style checkpoints). Default fall-back is 3
+          when callers pass 0 so the existing `recovery.go` doc
+          example still encodes a sane bootstrap value.
+      (2) `internal/initdb/open.go`'s runtime checkpointer config
+          was missing `DataDir: abs`, so the `if c.cfg.DataDir !=
+          ""` branch in `wal.Checkpointer.runCheckpoint` (which
+          rewrites `pg_control.CheckPointCopyNextXid`) was a
+          silent no-op in production runs. The unit test
+          `TestCheckpointerWritesNextXidIntoPgControl` passes only
+          because it sets `DataDir: dir` itself. Fix: wire
+          `DataDir: abs` into the runtime construction site.
+      Both layers were needed: the standby reads nextXid out of
+      the CheckPoint WAL record (layer 1, the load-bearing
+      visibility fix) and `pg_controldata`/`pg_basebackup -R`
+      readers consult pg_control (layer 2, for tooling parity).
+      Verified: `TestE2E_FailoverGoopgToPG/async` standby now
+      logs `next transaction ID: 4` (was 3) and reaches the next
+      residual — `could not open relation with OID 2665 at column
+      22 (XX000)`, a system-catalog-index lookup that succeeds
+      on bench_log (parse-analyse cleared, planner stage hit).
+      `TestCheckpointerWritesNextXidIntoPgControl` — PASS
+      (unchanged). Pre-existing baseline failures unrelated to
+      this loop carry through unchanged
+      (`TestCheckpointerWritesCheckpointMarkers`,
+      `TestEncodeRecordXLogClassifiesXactCommitXID`,
+      `./internal/initdb` migrations).
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 18 (batched-47)" section).
+      Next loop (batched-48): diagnose OID 2665 lookup. OID 2665
+      is `pg_largeobject_loid_pn_index` upstream — likely a
+      planner/executor path on the standby is touching a system
+      relation goopg has not initialised in the basebackup payload.
+      Capture the failing backend's stacktrace via
+      `log_min_messages=debug5` + `log_error_verbosity=verbose`
+      already on, then triage whether bench_log resolves through
+      the heap pages OR is short-circuited by relcache/init-file
+      resolution.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

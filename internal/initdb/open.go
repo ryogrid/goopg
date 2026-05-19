@@ -859,10 +859,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	defaultGUC := wal.DefaultGUCParameters()
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{
+		DataDir:     abs,
 		SegmentSize: walCfg.SegmentSize,
 		GUCParams:   defaultGUC,
 		// M0106-0010 batched-45: refresh checkPointCopy.nextXid into
 		// pg_control at every checkpoint from the live mvcc manager.
+		// batched-47: DataDir above was previously unset on the runtime
+		// construction site, so the pg_control update branch inside
+		// runCheckpoint was a silent no-op. Without it the
+		// checkPointCopy.nextXid in basebackup pg_control stayed at the
+		// initdb-time bootstrap value (3), and a PG standby attached
+		// after the basebackup hid every user tuple created by goopg
+		// after initdb.
 		NextXIDFn: func() uint64 { return uint64(txnMgr.NextXID()) },
 	})
 

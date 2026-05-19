@@ -364,7 +364,18 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 		}
 	}
 	redoLSN0 := uint64(pos + int64(leading))
-	startLSN, endLSN, err := c.wal.Append(EncodeCheckpointCompat(redoLSN0, 1))
+	// M0106-0010 batched-47: sample nextXid from the mvcc manager
+	// BEFORE appending the checkpoint record so the on-wire CheckPoint
+	// payload carries the live value. The standby reads nextXid out of
+	// this record to initialise ShmemVariableCache->nextXid and
+	// latestCompletedXid; if the value lags goopg's real allocator, the
+	// standby's recovery snapshots treat post-initdb tuples as "future"
+	// and 42P01s every user table on the first SELECT.
+	var nextXid uint64
+	if c.cfg.NextXIDFn != nil {
+		nextXid = c.cfg.NextXIDFn()
+	}
+	startLSN, endLSN, err := c.wal.Append(EncodeCheckpointCompat(redoLSN0, 1, nextXid))
 	if err != nil {
 		return fmt.Errorf("append checkpoint marker: %w", err)
 	}
@@ -382,10 +393,6 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 		checkLSN0 := startLSN - 1 // convert 1-based internal to 0-based PG LSN
 		now := time.Now().Unix()
 		guc := c.cfg.GUCParams
-		var nextXid uint64
-		if c.cfg.NextXIDFn != nil {
-			nextXid = c.cfg.NextXIDFn()
-		}
 		if err := control.UpdateControlFile(c.cfg.DataDir, func(cd *control.ControlFileData) {
 			cd.State = control.DBStateInProduction
 			cd.Time = now

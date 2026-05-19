@@ -834,7 +834,7 @@ func EncodeCheckpoint() []byte {
 // checkpoint record in the WAL stream. It must match the record's
 // actual start position exactly — PG's xlogreader validates
 // checkPoint.redo against ReadRecPtr.
-func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32) []byte {
+func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64) []byte {
 	// Encode a minimal PG18 CheckPoint struct (sizeof=88).
 	// Offsets verified against compiled PG18 binary (DWARF):
 	//   redo           XLogRecPtr  8  (offset 0)
@@ -857,19 +857,35 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32) []byte {
 	//   newestCommitTsXid TxnId   4  (offset 76)
 	//   oldestActiveXid TxnId     4  (offset 80)
 	//   [trailing pad 4]          —  (offset 84; struct 8-byte align)
+	//
+	// M0106-0010 batched-47: nextXid is now parameterised (was hardcoded
+	// to 3 = FirstNormalTransactionId). PG's InitWalRecovery decodes the
+	// checkpoint record from the basebackup-shipped WAL and seeds
+	// ShmemVariableCache->nextXid + latestCompletedXid from it. With the
+	// old hardcoded 3, every tuple goopg wrote with xmin >= 3 was
+	// invisible to the standby's recovery snapshot (snapshot.Xmax =
+	// latestCompletedXid + 1 = 3, so xid 3 was treated as "future" and
+	// pg_class scans returned no row → 42P01). The runtime checkpointer
+	// now passes mvcc.Manager.NextXID() through.
+	// oldestActiveXid mirrors nextXid because the IMMEDIATE checkpoint
+	// runs while no user xact is in-flight (CheckpointNow blocks
+	// dirty-page flush; the prior xact-marker WAL is already durable).
 	const checkPointSize = 88
+	if nextXid < 3 {
+		nextXid = 3
+	}
 	payload := make([]byte, checkPointSize)
 	le := binary.LittleEndian
 	now := time.Now()
 
-	le.PutUint64(payload[0:8], redoLSN0)           // redo
-	le.PutUint32(payload[8:12], tli)               // ThisTimeLineID
-	le.PutUint32(payload[20:24], 1)                // wal_level (replica)
-	le.PutUint64(payload[24:32], 3)                // nextXid (>= FirstNormalTxnId)
-	le.PutUint32(payload[32:36], 16384)            // nextOid
-	le.PutUint32(payload[36:40], 1)                // nextMulti
-	le.PutUint32(payload[44:48], 3)                // oldestXid
-	le.PutUint32(payload[52:56], 1)                // oldestMulti
+	le.PutUint64(payload[0:8], redoLSN0)             // redo
+	le.PutUint32(payload[8:12], tli)                 // ThisTimeLineID
+	le.PutUint32(payload[20:24], 1)                  // wal_level (replica)
+	le.PutUint64(payload[24:32], nextXid)            // nextXid (>= FirstNormalTxnId)
+	le.PutUint32(payload[32:36], 16384)              // nextOid
+	le.PutUint32(payload[36:40], 1)                  // nextMulti
+	le.PutUint32(payload[44:48], 3)                  // oldestXid
+	le.PutUint32(payload[52:56], 1)                  // oldestMulti
 	// time (pg_time_t=int64, 8-byte aligned → starts at offset 64)
 	le.PutUint64(payload[64:72], uint64(now.Unix())) // time
 	// After time (offset 72): oldestCommitTsXid, newestCommitTsXid,
@@ -877,9 +893,9 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32) []byte {
 	// NOTE: pg_time_t alignment forces 4-byte pad before time, pushing
 	// offsets: time=64, oldestCommitTsXid=72, newestCommitTsXid=76,
 	// oldestActiveXid=80, sizeof(CheckPoint)=88.
-	le.PutUint32(payload[72:76], 3) // oldestCommitTsXid
-	le.PutUint32(payload[76:80], 3) // newestCommitTsXid
-	le.PutUint32(payload[80:84], 3) // oldestActiveXid
+	le.PutUint32(payload[72:76], 3)                  // oldestCommitTsXid
+	le.PutUint32(payload[76:80], 3)                  // newestCommitTsXid
+	le.PutUint32(payload[80:84], uint32(nextXid))    // oldestActiveXid
 
 	return payload
 }
