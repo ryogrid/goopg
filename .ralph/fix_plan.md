@@ -10085,6 +10085,43 @@ relcache init → replication readiness) and intra-package grouped.
       - Files: `internal/testport/e2e_failover_goopg_to_pg_test.go`.
       - Test: `go test -v -run TestE2E_FailoverGoopgToPG/async ./internal/testport/`.
       - Risk gate: wal/replication.
+      - PARTIAL PROGRESS (2026-05-19, loop 21): Three WAL compatibility
+        fixes landed (commit 3e9e104):
+        (a) pg_internal.init regenerated after DDL commit (open.go),
+        so pg_basebackup always finds fresh copies for the standby.
+        (b) WAL segment naming changed to PG TLI+LOG+SEG format
+        (format.go: formatSegmentName/parseSegmentName). WrittenLSN()
+        now correctly starts at 0/1000028 (not 0). detectWritePos
+        skips size-mismatched segments (backward compat for test
+        clusters with non-default segment sizes).
+        (c) xl_prev off-by-one in XLogRecord fixed: goopg 1-based LSN
+        → 0-based PG byte address (format.go: encodeRecordXLog).
+        PG standby NOW REACHES HOT STANDBY from a goopg backup.
+        pg_waldump confirms: init checkpoint chain and server
+        checkpoint both have correct prev-links.
+      - CANONICAL USER-TABLE DML WAL LANDED (2026-05-19, loop 22):
+        Commit 281b9a4 implements canonical XLOG_HEAP_INSERT/DELETE/UPDATE
+        WAL for user-table DML (INSERT, UPDATE, DELETE). Key:
+        (a) Fixed canonical XLog body format bug: main-data header
+            (xlrBlockIDDataShort+len) must precede the FPI in the data
+            section; the prior format had FPI between block ref header
+            and main-data header, causing decoders to treat FPI bytes as
+            additional block-ref headers. New layout correct.
+        (b) In writeHeapRowReturning: suppress logHeap when ctx.LogCanonical
+            != nil (emit canonical instead of legacy WAL).
+        (c) In markHeapDeleteDirtyAndClearVM: suppress logDel when
+            ctx.LogCanonical != nil.
+        (d) emitCanonicalHeapInsert / emitCanonicalHeapDelete helpers added
+            and wired into insertOp.Next(), deleteOp.Next(), updateOp.Next()
+            (SeqScan + IndexScan paths).
+        (e) recovery.go: add XLOG_HEAP_DELETE/UPDATE/HOT_UPDATE replay via
+            replayDecodedXLogHeapFPIBlocks (FPI restore all blocks).
+        Verified: TestE2E_PhysicalReplication PASS (goopg→goopg);
+        TestCanonicalHeapInsertWALRoundTrip PASS (new regression pin);
+        executor/server/mvcc/storage/catalog -race clean.
+      - NEXT ACTION: run TestE2E_FailoverGoopgToPG/async to confirm
+        the PG standby can now replay user-table DML WAL and the E2E
+        test passes end-to-end.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
