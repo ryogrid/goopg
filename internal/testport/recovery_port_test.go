@@ -115,13 +115,7 @@ func TestPort_Recovery013CrashRestart(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping crash-restart test in short mode")
 	}
-	// M0106-0010 batched-55: this test was false-positive prior to the
-	// Kill-pgrp fix because the orphaned goopg server kept serving on
-	// the same listener. With Kill() now SIGKILLing the entire process
-	// group, the actual durability gap (committed user-table rows lost
-	// after a true SIGKILL) is exposed. Re-enable once M0106-0012 /
-	// M0106-0013 close that gap.
-	t.Skip("blocked: real crash-recovery WAL replay pending M0106-0012/M0106-0013 (was false-positive prior to batched-55 Kill-pgrp fix)")
+	// M0106-0013: crash-recovery durability gap closed. Test re-enabled.
 	// upstream: postgres/src/test/recovery/t/013_crash_restart.pl
 
 	c := newCluster(t, "recovery013")

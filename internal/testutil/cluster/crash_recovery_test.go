@@ -26,18 +26,10 @@ func TestKillKillRecovery(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping crash-recovery test in short mode")
 	}
-	// M0106-0010 batched-55: this test previously passed because
-	// Cluster.Kill() only SIGKILL'd the `go run` wrapper while the
-	// orphaned goopg server kept listening on the same port; the
-	// "restarted" cluster was actually still the old in-memory server
-	// and the 100 rows were returned from RAM, not WAL replay.
-	// batched-55 fixes Kill() to signal the whole process group, which
-	// surfaces the underlying durability gap: goopg's crash-recovery
-	// WAL replay does not yet restore committed user-table rows after a
-	// real SIGKILL. Closing that gap is in M0106-0012/M0106-0013 scope
-	// (control-file persistence + durability guarantees). Re-enable
-	// this test once those milestones land.
-	t.Skip("blocked: real crash-recovery WAL replay pending M0106-0012/M0106-0013 (was false-positive prior to batched-55 Kill-pgrp fix)")
+	// M0106-0013: crash-recovery durability gap closed. SLRU-load in
+	// EnablePGSLRUMirror + WAL-based clog stamp in replayCLogFromWAL +
+	// NextXID advance from HighestKnownXID ensure committed rows are
+	// visible after a real SIGKILL. Test re-enabled.
 	root := repoRoot(t)
 	base := t.TempDir()
 	c, err := New("crash-recovery", Options{

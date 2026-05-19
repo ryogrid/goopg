@@ -764,6 +764,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// so both sources contribute to a monotonically advancing counter.
 	if pgCtrl, pce := control.ReadControlFile(abs); pce == nil && pgCtrl != nil {
 		cat.AdvanceNextOIDPast(pgCtrl.CheckPointCopyNextOid)
+		// M0106-0013: also advance txnMgr.NextXID from the checkpoint's
+		// nextXid so snapshots taken after restart have Xmax >= the
+		// last-checkpointed NextXID. The low 32 bits of the FullTransactionId
+		// field hold the raw XID (epoch is in the high 32 bits; epoch ≠ 0
+		// is not yet used in goopg v0).
+		if pgCtrl.CheckPointCopyNextXid != 0 {
+			checkpointNextXid := storage.TransactionID(uint32(pgCtrl.CheckPointCopyNextXid))
+			txnMgr.SetNextXID(checkpointNextXid)
+		}
 	}
 	cat.SetDBOID(detectCatalogDBOID(abs))
 	// Upgrade path: if the clog is empty (old cluster started before M0030-0007
@@ -810,6 +819,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			_ = mgr.Close()
 			return nil, fmt.Errorf("goopg: clog implicit-abort sweep: %w", aerr)
 		}
+	}
+	// M0106-0013: advance NextXID past the highest committed/aborted XID
+	// recorded in the clog (loaded from SLRU above via EnablePGSLRUMirror
+	// or stamped by replayCLogFromWAL below). This ensures that any
+	// snapshot taken by the first post-restart session has Xmax large
+	// enough to see all pre-crash committed rows — even when the catalog
+	// heap (highestCatalogXID) only covers DDL transactions and not
+	// user-table INSERT XIDs.
+	if highClogXID := clog.HighestKnownXID(); highClogXID > 0 {
+		txnMgr.SetNextXID(highClogXID + 1)
 	}
 	// One-shot migration: if this is a legacy JSON-only cluster whose
 	// pg_class has no user-table rows, write all in-memory user tables to
@@ -888,6 +907,25 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: index DDL replay: %w", err)
+	}
+
+	// M0106-0013: stamp the clog from WAL commit/abort records and advance
+	// txnMgr.NextXID past any XIDs recorded in WAL but not yet in the
+	// SLRU/flat-file (the narrow window between WAL fsync and clog writes).
+	// This is the authoritative clog-from-WAL path that mirrors PG's
+	// StartupXLOG xact_redo_commit behaviour. Non-fatal: physical replay
+	// already succeeded; a clog-stamp failure only affects visibility of
+	// some committed rows, which will surface as a user error rather than
+	// a startup error.
+	if abs != "" {
+		if err := replayCLogFromWAL(filepath.Join(abs, "pg_wal"), clog, txnMgr); err != nil {
+			slog.Default().Warn("replayCLogFromWAL failed", "err", err)
+		}
+		// Re-advance NextXID after replayCLogFromWAL may have stamped more
+		// XIDs into the clog.
+		if highClogXID := clog.HighestKnownXID(); highClogXID > 0 {
+			txnMgr.SetNextXID(highClogXID + 1)
+		}
 	}
 
 	// M0106-0011 follow-up (b): regenerate pg_internal.init files after

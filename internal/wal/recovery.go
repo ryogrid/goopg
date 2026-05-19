@@ -443,6 +443,10 @@ const (
 	// xactRecordSize: kind(1) + xid(4) = 5. Shared by
 	// RecordKindXactCommit and RecordKindXactAbort.
 	xactRecordSize = 5
+
+	// XactRecordSize is the exported size for external callers (e.g.
+	// initdb crash-recovery xact-stamp pass). (M0106-0013)
+	XactRecordSize = xactRecordSize
 	// heapLockSize: kind(1) + DBOid(4) + RelOid(4) + Fork(1)
 	// + Block(4) + LineSlot(2) + Xmax(4) + LockStrength(2) = 22.
 	heapLockSize = 22
@@ -834,7 +838,7 @@ func EncodeCheckpoint() []byte {
 // checkpoint record in the WAL stream. It must match the record's
 // actual start position exactly — PG's xlogreader validates
 // checkPoint.redo against ReadRecPtr.
-func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64) []byte {
+func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid uint32) []byte {
 	// Encode a minimal PG18 CheckPoint struct (sizeof=88).
 	// Offsets verified against compiled PG18 binary (DWARF):
 	//   redo           XLogRecPtr  8  (offset 0)
@@ -870,9 +874,19 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64) []byte 
 	// oldestActiveXid mirrors nextXid because the IMMEDIATE checkpoint
 	// runs while no user xact is in-flight (CheckpointNow blocks
 	// dirty-page flush; the prior xact-marker WAL is already durable).
+	//
+	// M0106-0013: nextOid is now parameterised (was hardcoded to 16384 =
+	// FirstNormalObjectId). PG's InitWalRecovery seeds
+	// ShmemVariableCache->nextOid from this field so after a crash the
+	// OID counter is restored from the last checkpoint rather than from
+	// the pg_catalog.json snapshot.
 	const checkPointSize = 88
 	if nextXid < 3 {
 		nextXid = 3
+	}
+	const firstNormalOID = uint32(16384) // FirstNormalObjectId
+	if nextOid < firstNormalOID {
+		nextOid = firstNormalOID
 	}
 	payload := make([]byte, checkPointSize)
 	le := binary.LittleEndian
@@ -882,7 +896,7 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64) []byte 
 	le.PutUint32(payload[8:12], tli)                 // ThisTimeLineID
 	le.PutUint32(payload[20:24], 1)                  // wal_level (replica)
 	le.PutUint64(payload[24:32], nextXid)            // nextXid (>= FirstNormalTxnId)
-	le.PutUint32(payload[32:36], 16384)              // nextOid
+	le.PutUint32(payload[32:36], nextOid)            // nextOid (>= FirstNormalObjectId)
 	le.PutUint32(payload[36:40], 1)                  // nextMulti
 	le.PutUint32(payload[44:48], 3)                  // oldestXid
 	le.PutUint32(payload[52:56], 1)                  // oldestMulti
@@ -1990,6 +2004,13 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 		}
 	}
 	return stats, nil
+}
+
+// ExportedReplayStart returns the start index (first post-checkpoint record)
+// and the checkpoint LSN from a slice of WAL records. Used by the initdb
+// crash-recovery xact-stamp pass to skip pre-checkpoint records. (M0106-0013)
+func ExportedReplayStart(records []Record) (int, uint64) {
+	return replayStart(records)
 }
 
 // ApplyRecord applies a single decoded WAL record to storage. It is

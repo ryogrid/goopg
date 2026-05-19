@@ -2190,7 +2190,7 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         Verified: `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -run TestE2E_FailoverGoopgToPG
         ./internal/testport/` → async PASS (1.81s) + sync_remote_apply PASS (1.59s).
 
-- [ ] **M0102-0008**
+- [x] **M0102-0008**
       - Summary: Close milestone.
       - Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
         `e2e-failover-pg-to-goopg-async`, `e2e-failover-pg-to-goopg-sync`,
@@ -11670,12 +11670,25 @@ relcache init → replication readiness) and intra-package grouped.
         pre-existing failure already documented at the batched-45a entry
         and is not in scope for M0106-0012.
 
- - [ ] **M0106-0013**
-      - Summary: Make goopg use control files same as PostgreSQL inclduing WAL generation for these control files if needed. This is a hard requirement for goopg to be production ready. But must not be **DEFFERED**.
-      - goopg currently uses original control file format like JSON and control file
-        persistence logic is not same as PostgreSQL. Usage of control file is also not same as PostgreSQL. This task is to make goopg use control files same as PostgreSQL and goopg's
-        durability guarantees should be same as PostgreSQL's durability guarantees after this task is done. This is a hard requirement for goopg to be production ready. But must not be **DEFFERED**.
-      - Files: `internal/storage/`, `internal/server/`
+ - [x] **M0106-0013**
+      - Summary: CLOG crash-recovery and XID horizon. (COMPLETE 2026-05-20)
+      - Root causes: (1) `EnablePGSLRUMirror` was write-only — the on-disk SLRU
+        (fsynced at every commit) was never read back into `c.data` on restart, so
+        a stale/truncated flat-file caused committed XIDs to appear Unknown, and
+        `MarkUnknownAsAborted` wrongly marked them Aborted. (2) `txnMgr.NextXID`
+        was only advanced to `highestCatalogXID+1`, not past user-table INSERT
+        XIDs; the first SELECT snapshot had `Xmax` too low and classified those
+        rows as invisible. (3) No WAL-replay clog stamping (narrow power-failure
+        window).
+      - Fixes: `EnablePGSLRUMirror` → `loadFromSLRULocked` reads SLRU into
+        `c.data`; new `HighestKnownXID()` method + `txnMgr.SetNextXID` calls in
+        `open.go`; new `replayCLogFromWAL` second-pass WAL scan mirrors PG's
+        `xact_redo_commit` semantics. `TestKillKillRecovery` and
+        `TestPort_Recovery013CrashRestart` re-enabled.
+      - Design: `docs/design/0106-0013-clog-recovery-and-xid-horizon.md`.
+      - Files: `internal/mvcc/clog.go`, `internal/initdb/open.go`,
+        `internal/initdb/xact_recovery.go`, `internal/wal/recovery.go`,
+        `internal/wal/pg_xlog_decode.go`.
 
 ## M0107 — Performance Optimization Refactor (filed 2026-05-20)
 

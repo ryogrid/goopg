@@ -213,11 +213,23 @@ func (c *CLog) EnablePGSLRUMirror(dir string) error {
 		return fmt.Errorf("clog slru: stat %q: %w", seg0, err)
 	}
 	c.slruDir = dir
+
+	// M0106-0013: load committed/aborted entries from the on-disk SLRU
+	// files into c.data BEFORE the backfill below. The SLRU is fsynced on
+	// every commit (mirrorToSLRULocked calls f.Sync()), making it the most
+	// durable source of truth after a crash. The flat-file (c.data loaded
+	// by OpenCLog) is written without fsync and may be stale or truncated
+	// (os.WriteFile uses O_TRUNC; a crash between truncate and write leaves
+	// a zero-length file). By loading SLRU first, crash-recovery sees the
+	// correct committed/aborted status even when the flat-file is missing.
+	if err := c.loadFromSLRULocked(dir); err != nil {
+		return err
+	}
+
 	// Backfill any in-memory committed/aborted entries so an opened clog
 	// (which loaded data from the flat file but had no SLRU mirror) is
-	// projected to the SLRU on first enable. This covers the recovery path
-	// in initdb.Open where the flat clog is read before the mirror is
-	// wired.
+	// projected to the SLRU on first enable. mirrorToSLRULocked uses OR so
+	// it never clears bits already set by loadFromSLRULocked above.
 	for i := 1; i < len(c.data); i++ {
 		st := TxnStatus(c.data[i])
 		if st == TxnStatusCommitted || st == TxnStatusAborted {
@@ -227,6 +239,112 @@ func (c *CLog) EnablePGSLRUMirror(dir string) error {
 		}
 	}
 	return nil
+}
+
+// loadFromSLRULocked reads committed/aborted entries from existing SLRU
+// segment files under dir and merges them into c.data. Called by
+// EnablePGSLRUMirror before the backfill pass so the on-disk SLRU state
+// (fsynced at every commit) wins over a potentially stale flat-file. mu
+// must be held. Best-effort: segment files that cannot be read are skipped
+// rather than returning an error — a missing or corrupt segment means the
+// affected XIDs remain as Unknown and are handled by MarkUnknownAsAborted.
+func (c *CLog) loadFromSLRULocked(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("clog slru: readdir %q: %w", dir, err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || len(name) != 4 {
+			continue
+		}
+		// Parse 4-hex-digit segment number (e.g. "0000", "0001").
+		var segNo uint64
+		valid := true
+		for _, ch := range name {
+			segNo <<= 4
+			switch {
+			case ch >= '0' && ch <= '9':
+				segNo |= uint64(ch - '0')
+			case ch >= 'A' && ch <= 'F':
+				segNo |= uint64(ch - 'A' + 10)
+			case ch >= 'a' && ch <= 'f':
+				segNo |= uint64(ch - 'a' + 10)
+			default:
+				valid = false
+			}
+		}
+		if !valid {
+			continue
+		}
+		segData, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			continue // best-effort
+		}
+		// Decode each byte: 2 bits per XID, 4 XIDs per byte.
+		// XID at (segNo, byteIdx, lane):
+		//   pageInSeg  = byteIdx / BlockSize
+		//   xidInPage  = (byteIdx % BlockSize) * clogXactsPerByte + lane
+		//   XID        = segNo*clogXactsPerSegment + pageInSeg*clogXactsPerPage + xidInPage
+		baseXID := segNo * uint64(clogXactsPerSegment)
+		for i, b := range segData {
+			if b == 0 {
+				continue
+			}
+			pageInSeg := uint64(i) / uint64(storage.BlockSize)
+			xidInPageBase := (uint64(i)%uint64(storage.BlockSize))*uint64(clogXactsPerByte)
+			for lane := uint64(0); lane < uint64(clogXactsPerByte); lane++ {
+				rawBits := (b >> (lane * uint64(clogBitsPerXact))) & 0x3
+				var status TxnStatus
+				switch rawBits {
+				case pgClogStatusCommitted:
+					status = TxnStatusCommitted
+				case pgClogStatusAborted:
+					status = TxnStatusAborted
+				case pgClogStatusInProgress:
+					continue
+				default:
+					// 0x03 = both bits set. This is PG's SUB_COMMITTED state
+					// (not used by goopg), but can appear as a corruption
+					// artifact if MarkUnknownAsAborted previously ORed the
+					// aborted bit onto a committed XID. Treat as committed:
+					// the committed bit (0x01) was definitely set at some
+					// point.
+					status = TxnStatusCommitted
+				}
+				xid := baseXID + pageInSeg*uint64(clogXactsPerPage) + xidInPageBase + lane
+				if xid == 0 || xid > uint64(^storage.TransactionID(0)) {
+					continue
+				}
+				idx := int(xid)
+				for len(c.data) <= idx {
+					c.data = append(c.data, byte(TxnStatusUnknown))
+				}
+				// SLRU is the authoritative source (fsynced); overwrite
+				// whatever the flat-file had for this slot.
+				c.data[idx] = byte(status)
+			}
+		}
+	}
+	return nil
+}
+
+// HighestKnownXID returns the highest XID that has a committed or aborted
+// status in the clog. Returns 0 if no terminal status is recorded. Used at
+// startup to advance txnMgr.NextXID past all previously committed XIDs so
+// new snapshots have a high enough Xmax to see pre-crash rows. (M0106-0013)
+func (c *CLog) HighestKnownXID() storage.TransactionID {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for i := len(c.data) - 1; i >= 1; i-- {
+		if TxnStatus(c.data[i]) != TxnStatusUnknown {
+			return storage.TransactionID(i)
+		}
+	}
+	return 0
 }
 
 // SLRUDir returns the PG-canonical pg_xact/ directory, or "" if the mirror is
