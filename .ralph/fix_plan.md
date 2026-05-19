@@ -2361,7 +2361,7 @@ Goal: Generate PG-compatible relcache init files (`global/pg_internal.init`
 and `base/<dboid>/pg_internal.init`) during goopg init so PG backends
 can start from a goopg-produced backup.
 
-Permitted PG interactions in this milestones:
+**Permitted PG interactions**:
 
 - Adding elog(DEBUG1, ...) calls for diagnostic purposes (must be reverted after the investigation concludes).
 - Reading PG source code to understand wire format, catalog layout, and expected invariants.
@@ -10074,7 +10074,7 @@ relcache init → replication readiness) and intra-package grouped.
           still PASS; `TestSynchronousCommitFlushesByDefault` pre-existing
           fail (M0106-0012) unaffected. Commit: (this loop).
 
-- [ ] **M0106-0010 batched-35** (bootstrap-procedure task 35 — E2E gate)
+- [x] **M0106-0010 batched-35** (bootstrap-procedure task 35 — E2E gate)
       - Summary: Run `TestE2E_FailoverGoopgToPG/async` end-to-end and
         confirm the milestone-completion predicates from
         `bootstrap-procedure/10-implementation-roadmap.md`
@@ -10119,9 +10119,62 @@ relcache init → replication readiness) and intra-package grouped.
         Verified: TestE2E_PhysicalReplication PASS (goopg→goopg);
         TestCanonicalHeapInsertWALRoundTrip PASS (new regression pin);
         executor/server/mvcc/storage/catalog -race clean.
-      - NEXT ACTION: run TestE2E_FailoverGoopgToPG/async to confirm
-        the PG standby can now replay user-table DML WAL and the E2E
-        test passes end-to-end.
+      - Rest requirements of this task are delegated to M0106-0010 batched-36.
+
+- [ ] **M0106-0010 batched-36**
+    - Summary: run TestE2E_FailoverGoopgToPG/async to confirm the PG standby can now replay user-table DML WAL and the E2E test passes end-to-end.
+    - Spec: all of `docs/design/bootstrap-procedure/`.
+    - Files: `internal/testport/e2e_failover_goopg_to_pg_test.go`.
+    - Test: `go test -v -run TestE2E_FailoverGoopgToPG/async ./internal/testport/`.    
+    - Permissions on this task:
+      - **Permitted PG interactions**:
+        - Adding elog(DEBUG1, ...) calls for diagnostic purposes (must be reverted after the investigation concludes).
+        - Reading PG source code to understand wire format, catalog layout, and expected invariants.
+        - Running make install to rebuild PG after adding/removing debug logging.
+      - **NOT** Permitted PG interactions:
+        - Changing PG function signatures, struct layouts, or logic.
+        - Adding if (goopg_compat) {...} branches or similar workarounds.
+        - Any change that would make PG behave differently from upstream release.        
+    - PARTIAL PROGRESS 2026-05-19 (loop 1): test now exercises the full
+      replication path further than before — PG standby boots from goopg
+      pg_basebackup, walreceiver connects at `0/1000000`, apply LSN
+      advances `0/100A2B8 → 0/100E398`. New failure mode: PG client
+      backend SEGFAULTs (signal 11) executing
+      `SELECT count(*) FROM public.bench_log WHERE client = -999`; the
+      postmaster crash-restarts the cluster in a tight loop until the 30s
+      `waitForPGCount` deadline elapses. Root cause: the FPI in the
+      canonical XLOG_HEAP_INSERT WAL contains goopg-format heap-tuple
+      bytes which PG cannot deform without dereferencing a bogus pointer.
+      Four partial fixes landed this loop (regression-clean against
+      TestE2E_PhysicalReplication and the executor/server/mvcc/storage/
+      catalog unit suites):
+      (a) `internal/wal/iterator.go` — segment-boundary start anchor:
+          when `pg_basebackup` requests `START_REPLICATION` at a segment-
+          size multiple (e.g. `0/1000000`), bump internal start by one so
+          `pos = startLSN-1 = segN*segSize` rather than the last byte of
+          the prior segment.
+      (b) `internal/wal/format.go` — revert spurious `prevPG = prev - 1`
+          from batched-35: `writer.go` already passes the 0-based PG LSN
+          (`start - 1`); the extra `-1` broke `xl_prev` for every record.
+      (c) `internal/executor/operators_storage.go` — switch
+          `writeHeapRowReturning` to `EncodeRowPG` + `NullBitmapPG` (and
+          set `Header.Natts = len(cols)` + `Infomask |= HeapXmaxInvalid`)
+          when `ctx.LogCanonical != nil`; add `writeHeapRowReturningPG`
+          for catalog-row writes routed through `writeHeapRowCanonical`.
+      (d) `internal/server/replication.go` — drop the
+          `<-receiveDone` rendezvous when the WAL iterator returns an
+          error; the receiver is parked in a blocking ReadFrame that
+          context cancellation cannot interrupt, so waiting deadlocks
+          server+client.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`.
+      Next loop (candidate batched-37): byte-level audit of the goopg
+      primary's `base/*/bench_log` heap file via
+      `postgres/local_install/bin/pg_filedump`; compare against a known-
+      good PG page; localise the remaining encoding gap. Two leading
+      hypotheses: (H1) `t_ctid.bi_hi/bi_lo` halves vs. LE-uint32; (H2)
+      `t_hoff` / null-bitmap MAXALIGN for the variable-length `text`
+      column. Once page bytes match, re-run TestE2E_FailoverGoopgToPG/
+      async and surface the next blocker.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

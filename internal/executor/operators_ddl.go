@@ -1906,7 +1906,7 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 // insertion. The FPI approach ensures the standby can restore the page without
 // parsing heap-tuple internals. M0106-0010 batched-32.
 func writeHeapRowCanonical(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) error {
-	ptr, err := writeHeapRowReturning(ctx, rel, cols, row)
+	ptr, err := writeHeapRowReturningPG(ctx, rel, cols, row)
 	if err != nil {
 		return err
 	}

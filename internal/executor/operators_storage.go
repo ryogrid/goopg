@@ -2737,17 +2737,45 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return ptr, &ExecError{Code: "XX000", Message: toastErr.Error()}
 	}
 
-	body, err := EncodeRow(cols, row)
-	if err != nil {
-		// Preserve ExecError (e.g. 22P02 for invalid input syntax) so the
-		// SQLSTATE and message reach the client unchanged. M0097-0003.
-		var ee *ExecError
-		if errors.As(err, &ee) {
-			return ptr, ee
+	// When canonical WAL is active, encode the tuple in PG-native physical
+	// format so the FPI page is valid for a PG standby to read via
+	// heap_deform_tuple. The goopg primary decodes PG-format data back via the
+	// decodePhysicalPGRowIntoArena fallback inside decodeRowIntoArena.
+	// M0106-0010 batched-36.
+	var (
+		body   []byte
+		bitmap []byte
+	)
+	if ctx.LogCanonical != nil {
+		var encErr error
+		body, encErr = EncodeRowPG(cols, row)
+		if encErr != nil {
+			return ptr, &ExecError{Code: "XX000", Message: encErr.Error()}
 		}
-		return ptr, &ExecError{Code: "XX000", Message: err.Error()}
+		bitmap = NullBitmapPG(row)
+	} else {
+		var encErr error
+		body, encErr = EncodeRow(cols, row)
+		if encErr != nil {
+			// Preserve ExecError (e.g. 22P02 for invalid input syntax) so the
+			// SQLSTATE and message reach the client unchanged. M0097-0003.
+			var ee *ExecError
+			if errors.As(encErr, &ee) {
+				return ptr, ee
+			}
+			return ptr, &ExecError{Code: "XX000", Message: encErr.Error()}
+		}
 	}
-	tuple := storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+	var tuple storage.HeapTuple
+	if len(bitmap) > 0 {
+		tuple = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
+	} else {
+		tuple = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+	}
+	if ctx.LogCanonical != nil {
+		tuple.Header.SetNatts(len(cols))
+		tuple.Header.Infomask |= storage.HeapXmaxInvalid
+	}
 	tupleBytes, err := tuple.MarshalBinary()
 	if err != nil {
 		return ptr, err
@@ -2881,6 +2909,154 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
 	}
 	// New page starts dirty — not ALL_VISIBLE (M0046-0004).
+	if ctx.VM != nil {
+		ctx.VM.ClearBlock(rel, blk)
+	}
+	slot.Unlock()
+	ctx.Pool.Unpin(slot)
+	if derr == nil {
+		ptr = storage.ItemPointer{Block: blk, Offset: lineSlot}
+	}
+	return ptr, derr
+}
+
+// writeHeapRowReturningPG is identical to writeHeapRowReturning but encodes the
+// row using PG-native format (EncodeRowPG + NullBitmapPG) instead of goopg's
+// internal format. It also skips TOAST processing because catalog rows
+// (pg_class, pg_attribute) are always small. This variant must be used when
+// writing catalog rows that a vanilla PG standby will replay. M0106-0010.
+func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
+	var ptr storage.ItemPointer
+
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return ptr, err
+	}
+
+	body, err := EncodeRowPG(cols, row)
+	if err != nil {
+		return ptr, &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	bitmap := NullBitmapPG(row)
+	var tuple storage.HeapTuple
+	if len(bitmap) > 0 {
+		tuple = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
+	} else {
+		tuple = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+	}
+	// Set t_infomask2 natts so PG's heap_deform_tuple can locate each attribute.
+	// Set HEAP_XMAX_INVALID so PG's visibility code treats xmax as invalid
+	// without testing the XID. Both are required for correct PG-standby reads.
+	// M0106-0010 batched-36.
+	tuple.Header.SetNatts(len(cols))
+	tuple.Header.Infomask |= storage.HeapXmaxInvalid
+	tupleBytes, err := tuple.MarshalBinary()
+	if err != nil {
+		return ptr, err
+	}
+
+	logHeap := ctx.Pool.LogHeapInsert()
+	if ctx.LogCanonical != nil {
+		logHeap = nil
+	}
+	tryAppendToBlock := func(blk storage.BlockNumber) (bool, error) {
+		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return false, err
+		}
+		slot.Lock()
+		if storage.IsNew(slot.Page()) {
+			if err := storage.InitPage(slot.Page()); err != nil {
+				slot.Unlock()
+				ctx.Pool.Unpin(slot)
+				return false, err
+			}
+		}
+		if lineSlot, err := storage.PageAddHeapTuple(slot.Page(), tuple); err == nil {
+			derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
+			if ctx.FSM != nil {
+				ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
+			}
+			if ctx.VM != nil {
+				ctx.VM.ClearBlock(rel, blk)
+			}
+			slot.Unlock()
+			ctx.Pool.Unpin(slot)
+			if derr == nil {
+				ptr = storage.ItemPointer{Block: blk, Offset: lineSlot}
+			}
+			return true, derr
+		} else if !errors.Is(err, storage.ErrNoSpaceInPage) {
+			slot.Unlock()
+			ctx.Pool.Unpin(slot)
+			return false, err
+		}
+		if ctx.FSM != nil {
+			ctx.FSM.RecordFreeSpace(rel, blk, 0)
+		}
+		slot.Unlock()
+		ctx.Pool.Unpin(slot)
+		return false, nil
+	}
+
+	minFreeBytes := uint16(len(tupleBytes) + 4)
+	if ctx.FSM != nil {
+		if fsmBlk, ok := ctx.FSM.GetPageWithFreeSpace(rel, minFreeBytes); ok {
+			appended, err := tryAppendToBlock(fsmBlk)
+			if err != nil {
+				return ptr, err
+			}
+			if appended {
+				return ptr, nil
+			}
+		}
+	}
+
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return ptr, err
+	}
+	if nBlocks > 0 {
+		appended, err := tryAppendToBlock(nBlocks - 1)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
+		}
+	}
+
+	unlock := lockHeapExtend(rel)
+	defer unlock()
+
+	nBlocks, err = ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return ptr, err
+	}
+	if nBlocks > 0 {
+		appended, err := tryAppendToBlock(nBlocks - 1)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
+		}
+	}
+
+	slot, blk, err := ctx.Pool.PinNew(rel)
+	if err != nil {
+		return ptr, err
+	}
+	slot.Lock()
+	lineSlot, err := storage.PageAddHeapTuple(slot.Page(), tuple)
+	if err != nil {
+		slot.Unlock()
+		ctx.Pool.Unpin(slot)
+		return ptr, err
+	}
+	derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, tupleBytes)
+	if ctx.FSM != nil {
+		ctx.FSM.RecordFreeSpaceForPage(rel, blk, slot.Page())
+	}
 	if ctx.VM != nil {
 		ctx.VM.ClearBlock(rel, blk)
 	}

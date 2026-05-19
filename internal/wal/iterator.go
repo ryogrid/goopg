@@ -78,6 +78,18 @@ func NewRecordIterator(w *Writer, walDir string, segSize int64, startLSN uint64)
 		segSize = DefaultSegmentSize
 	}
 	// startLSN==0 maps to byte offset 0; startLSN==N maps to offset N-1.
+	//
+	// Special case: when startLSN is exactly a segment-size multiple (e.g.
+	// 0x1000000), a naive pos = startLSN−1 would land at the last byte of
+	// the preceding segment. pg_basebackup deliberately rounds its start
+	// position down to the nearest segment boundary (XLogSegmentOffset in
+	// pg_basebackup.c), so goopg receives the boundary value as-is. For
+	// such boundary LSNs the correct 0-indexed position is startLSN itself
+	// (first byte of the new segment), not startLSN−1. Bump the internal
+	// startLSN by one so that pos = startLSN−1 = segN*segSize exactly.
+	if startLSN > 0 && segSize > 0 && startLSN%uint64(segSize) == 0 {
+		startLSN++
+	}
 	var pos int64
 	if startLSN > 0 {
 		pos = int64(startLSN) - 1

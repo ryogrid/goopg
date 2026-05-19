@@ -264,13 +264,10 @@ func encodeRecordXLog(payload []byte, prev uint64) ([]byte, int, error) {
 	wrapped := wrapXLogMainData(payload)
 	rmgr, info, xid := classifyXLogRecord(payload)
 	realLen := xlogRecordHeaderSize + len(wrapped)
-	// prev is goopg's 1-based LSN; xl_prev in XLogRecord must be the
-	// 0-based PG LSN (= goopg 1-based - 1). When prev==0 (first record,
-	// InvalidXLogRecPtr), keep it 0. M0106-0010 batched-35.
+	// prev is the caller's 0-based PG LSN (writer.go stores prevRecPtr as
+	// start-1 which is already the 0-based RecPtr). InvalidXLogRecPtr (0)
+	// means "no previous record" and is used verbatim.
 	prevPG := prev
-	if prevPG > 0 {
-		prevPG--
-	}
 	header := XLogRecord{
 		TotLen: uint32(realLen),
 		XID:    xid,

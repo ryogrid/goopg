@@ -574,7 +574,15 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 				return nil
 			}
 			streamCancel()
-			<-receiveDone
+			// Do NOT block on <-receiveDone here. The receiver goroutine is
+			// blocked inside r.ReadFrame() — a blocking network read that
+			// cannot be interrupted by context cancellation. Waiting for it
+			// while the WAL iterator has already failed creates a livelock:
+			// the receiver waits for the client to send CopyDone, the client
+			// waits for the server to send keepalives or data, and the server
+			// (this goroutine) never sends them because it exited the select.
+			// Instead, return immediately and let the deferred connection close
+			// (when handleConn exits) unblock the receiver via an EOF read.
 			return s.writeStreamingError(w, sqlstate.InternalError, err.Error())
 		}
 	}
