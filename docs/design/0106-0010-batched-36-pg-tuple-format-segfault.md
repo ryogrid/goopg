@@ -1089,3 +1089,115 @@ diagnostic test should flip to PASS.
 - `internal/testport/m0106_create_table_persists_to_disk_test.go` —
   NEW (~220 lines: cluster setup + disk-level dump + pinned
   assertions for both base/1/2663 and base/5/2663).
+
+## 2026-05-19 loop 12 (batched-41): multi-level btree insert + DBOid mirror re-wired
+
+### What landed
+
+Two new helpers and one refactor replace the single-leaf-root-only
+`insertCanonicalSysBtreeLeaf`:
+
+- `internal/executor/sys_catalog_btree_multilevel.go` (NEW, ~360 lines):
+  - `readSysBtreeMeta` — parses `btm_root` / `btm_level` from the metapage.
+  - `descendSysBtreeToLeaf` — walks internal pages selecting downlinks
+    where `key ≤ newKey`, returning the target leaf block.
+  - `collectAllLeafTuples` — descends leftmost via slot-1 minus-infinity
+    downlinks, then follows `btpo_next` across every leaf and returns
+    all data tuples in sorted order (high keys skipped).
+  - `buildBulkSysBtreeLayout` — in-package mirror of
+    `initdb/btree_index_bootstrap.go::pgBuildBtreeBulkLoadSized`
+    (executor → initdb would form an import cycle; helper is
+    duplicated, ~80 lines).
+  - `rebuildSysBtreeWithNewEntry` — overflow fallback that collects all
+    tuples, merges `newTuple`, runs the bulk-build layout, overwrites
+    pages 0..N-1 in place via the buffer pool, and emits one canonical
+    `XLOG_BTREE_INSERT_LEAF` FPI WAL record per touched page.
+  - `insertIntoExistingLeaf` — multi-level-aware in-place insert that
+    respects the leaf's high key (slot 1 on non-rightmost leaves).
+
+- `insertCanonicalSysBtreeLeaf` refactor: reads the metapage first, then
+  dispatches:
+  - `btm_level == 0` → `insertIntoSingleLeafRoot` (the batched-39
+    lightweight path with `splitLeafRootAndInsert` as overflow fallback).
+  - `btm_level >= 1` → `descendSysBtreeToLeaf` +
+    `insertIntoExistingLeaf`; if the target leaf is full, fall back to
+    `rebuildSysBtreeWithNewEntry` (handles downlink propagation
+    uniformly because the bulk-build path regenerates the whole layout).
+
+- `mirrorTouchedCatalogsToPostgresDB` re-wired at both DDL sync sites
+  (`syncTableToCatalogHeap`, `syncIndexToCatalogHeap`).
+
+### Verification
+
+- `TestE2E_CreateTablePersistsRelnameIndexEntryOnDisk` — flips to PASS.
+  Disk dump after CREATE TABLE + clean shutdown:
+  ```
+  base/1/2663 page 1: lpc=97 prev=0 next=2 firsts=[pg_publication_oid_index bench_log pg_aggregate]
+  base/1/2663 page 2: lpc=65 prev=1 next=0 (rightmost) first data=pg_publication_oid_index
+  base/1/2663 page 3: INTROOT lpc=2 (downlinks: -inf→1, pg_publication_oid_index→2)
+  bench_log present in base/1/2663: true
+  bench_log present in base/5/2663: true
+  ```
+- All affected packages PASS: `internal/executor`, `internal/catalog`,
+  `internal/storage`, `internal/server`, `internal/mvcc`. `internal/wal`
+  has the same 2 pre-existing failures
+  (`TestCheckpointerWritesCheckpointMarkers`,
+  `TestEncodeRecordXLogClassifiesXactCommitXID`) inherited from
+  the batched-40 baseline.
+
+### Residual: TestE2E_FailoverGoopgToPG/async still 42P01
+
+Disk-level diagnostic (added inline to the failover test) confirms the
+PG standby's basebackup snapshot **does** contain `bench_log` in both
+`base/1/2663` and `base/5/2663`, and in both `base/1/1259` and
+`base/5/1259` (pg_class heap):
+
+```
+[diag] base/1/2663 (pg_class_relname_nsp_index) size=32768 hasBenchLog=true
+[diag] base/1/1259 (pg_class_heap)              size=40960 hasBenchLog=true
+[diag] base/5/2663 (pg_class_relname_nsp_index) size=32768 hasBenchLog=true
+[diag] base/5/1259 (pg_class_heap)              size=40960 hasBenchLog=true
+```
+
+(2662/1249/2659 correctly do NOT contain the literal "bench_log"
+string because their keys are OID- or attnum-based.) The standby still
+fails `parseopen` with `42P01: relation "public.bench_log" does not
+exist at character 22` once PG attempts to parse the bootstrap INSERT.
+No FATAL / PANIC and no `pg_attribute catalog is missing` (the bad
+mirror symptom in batched-40 is fixed). The 42P01 originates from
+`parserOpenTable, parse_relation.c:1445`, i.e. the standard
+`RangeVarGetRelidExtended` lookup path.
+
+Hypotheses for the residual (next-loop investigation candidates):
+
+- (H1) The rebuilt leaf pages keep a stale `pd_lsn` (the rebuild copies
+  bytes via `slot.Page()` then `MarkDirty` but never sets `pd_lsn` from
+  the WAL record's returned LSN). PG may treat the basebackup file as
+  pre-checkpoint and apply a *stale* FPI from the WAL stream over it.
+- (H2) Subtle high-key / downlink format mismatch: the rebuild uses
+  `buildSysBtreeLeafHighKey` / `buildSysBtreeInternalDownlink` which
+  mirror the initdb helpers, but PG's btree code may also require
+  `INDEX_ALT_TID_MASK` semantics or `ip_posid==nkeyatts` invariants
+  that the helpers under-enforce. Byte-compare a bootstrap-built page
+  vs. a rebuild-built page to spot the divergence.
+- (H3) `pg_internal.init` copied from goopg's `base/1` into the
+  standby's `base/{1,5}` may carry stale relcache descriptors that
+  poison PG's syscache for `RELNAMENSP`. Comment out
+  `copyInitFiles` and re-run to bisect.
+- (H4) The DDL transaction's `RelcacheInvalPending` marker fires a
+  `RecordKindXactCommitInval` that unlinks goopg's init file but
+  the goopg standby replay path does not propagate the
+  invalidation through to the PG standby's view (since this is a
+  *PG* standby, no goopg replay runs there).
+
+### Files touched this loop
+
+- `internal/executor/sys_catalog_btree_multilevel.go` — NEW (~360 lines).
+- `internal/executor/sys_catalog_index_insert.go` — refactored
+  `insertCanonicalSysBtreeLeaf` to dispatch on `btm_level`; split out
+  `insertIntoSingleLeafRoot` (single-leaf-root preserved verbatim).
+- `internal/executor/operators_ddl.go` — wired
+  `mirrorTouchedCatalogsToPostgresDB` in `syncTableToCatalogHeap` and
+  `syncIndexToCatalogHeap`.
+- `internal/testport/e2e_failover_goopg_to_pg_test.go` — added inline
+  disk-state diagnostic dump (gated on `GOOPG_RUN_BLOCKED_M0102_E2E`).

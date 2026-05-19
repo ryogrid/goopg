@@ -199,6 +199,45 @@ func insertCanonicalSysBtreeLeaf(ctx *Context, indexOID uint32, indexTuple []byt
 		return nil
 	}
 
+	// Read metapage to learn whether the index is a single leaf-root
+	// (level==0, root at sysBtreeRootBlock) or a multi-level tree
+	// (level>=1, must descend to the target leaf). M0106-0010 batched-41.
+	rootBlk, level, err := readSysBtreeMeta(ctx, rel)
+	if err != nil {
+		return fmt.Errorf("read meta sys btree %d: %w", indexOID, err)
+	}
+
+	if level == 0 {
+		// Single leaf-root path: keep the lightweight in-place insert +
+		// `splitLeafRootAndInsert` fallback that batched-39 introduced.
+		return insertIntoSingleLeafRoot(ctx, indexOID, rel, indexTuple, cmp)
+	}
+
+	// Multi-level path: descend to the target leaf, attempt in-place
+	// insert, and fall back to a full rebuild when the leaf is full
+	// (rebuild handles downlink propagation uniformly).
+	leafBlk, err := descendSysBtreeToLeaf(ctx, rel, rootBlk, level, indexTuple[sysIndexTupleHoff:], cmp)
+	if err != nil {
+		return fmt.Errorf("descend sys btree %d: %w", indexOID, err)
+	}
+	if err := insertIntoExistingLeaf(ctx, indexOID, rel, leafBlk, indexTuple, cmp); err != nil {
+		if errors.Is(err, storage.ErrNoSpaceInPage) {
+			if rebuildErr := rebuildSysBtreeWithNewEntry(ctx, indexOID, rel, indexTuple, cmp); rebuildErr != nil {
+				return fmt.Errorf("rebuild sys btree %d: %w", indexOID, rebuildErr)
+			}
+			return nil
+		}
+		return fmt.Errorf("insert leaf blk %d sys btree %d: %w", leafBlk, indexOID, err)
+	}
+	return nil
+}
+
+// insertIntoSingleLeafRoot handles the single-leaf-root case (btm_level==0,
+// root at sysBtreeRootBlock=1): in-place sorted insert, with
+// `splitLeafRootAndInsert` (sys_catalog_btree_split.go) as the overflow
+// fallback. This is the unchanged batched-39 path, factored out so the
+// multi-level dispatch in `insertCanonicalSysBtreeLeaf` reads cleanly.
+func insertIntoSingleLeafRoot(ctx *Context, indexOID uint32, rel storage.RelFileNode, indexTuple []byte, cmp keyCompareFn) error {
 	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: sysBtreeRootBlock})
 	if err != nil {
 		return fmt.Errorf("pin sys btree %d block %d: %w", indexOID, sysBtreeRootBlock, err)

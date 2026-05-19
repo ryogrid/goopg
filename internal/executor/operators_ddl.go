@@ -1874,20 +1874,15 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		ctx.TxnMgr.SetRelcacheInvalPending()
 	}
 
-	// M0106-0010 batched-40 (DIAGNOSIS): the runtime sys-btree insert path
-	// writes to base/1/ (DefaultDBOid=1), but a PG18 standby cloning via
-	// pg_basebackup reads catalog rows through `dbname=postgres`
-	// (DBOid=5). The natural fix is `mirrorTouchedCatalogsToPostgresDB(ctx)`
-	// here — but the call is intentionally *not* wired yet because the
-	// underlying `insertCanonicalSysBtreeLeaf` + `splitLeafRootAndInsert`
-	// path corrupts multi-level btrees (production bootstrap of OID 2663
-	// already produces meta+2leaves+root). Mirroring that corruption to
-	// base/5/ trips PG's `pg_attribute catalog is missing N attribute(s)`
-	// FATAL in RelationCacheInitializePhase3.
-	// Follow-up M0106-0010 batched-41: implement proper multi-level btree
-	// navigation (read metapage btm_root, walk downlinks to target leaf,
-	// split + propagate to parent) and then re-enable the mirror.
-	_ = mirrorTouchedCatalogsToPostgresDB
+	// M0106-0010 batched-41: mirror catalog pages updated by this DDL into
+	// the `postgres` database (DBOid=5) so a PG18 standby connecting via
+	// `dbname=postgres` reads the runtime-written pg_class /
+	// pg_attribute rows. batched-41's multi-level descend + rebuild path
+	// keeps the source layout consistent, so the mirror's page-by-page
+	// copy now lands a well-formed btree in base/5/.
+	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
+		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+	}
 
 	return nil
 }
@@ -1913,10 +1908,13 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	if err := insertPgClassRelnameNspIndexEntry(ctx, idx.Name, relnamespace, classTID); err != nil {
 		return fmt.Errorf("pg_class_relname_nsp_index for index: %w", err)
 	}
-	// M0106-0010 batched-40: same diagnostic-only no-op as
-	// syncTableToCatalogHeap — mirror is implemented but un-wired pending
-	// proper multi-level btree split (M0106-0010 batched-41).
-	_ = mirrorTouchedCatalogsToPostgresDB
+	// M0106-0010 batched-41: mirror catalog pages to DBOid=5 (the `postgres`
+	// database) so a PG18 standby connecting via `dbname=postgres` reads
+	// the runtime-written rows. Multi-level descent+rebuild in
+	// `insertCanonicalSysBtreeLeaf` keeps the source layout consistent.
+	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
+		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+	}
 	return nil
 }
 

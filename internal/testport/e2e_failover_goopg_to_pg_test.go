@@ -1,6 +1,7 @@
 package testport
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -110,6 +111,32 @@ func runFailoverGoopgToPG(t *testing.T, repo, pgBasebackupBin, psqlBin string, m
 	// pg_basebackup -C -S slot_name -R creates the slot, streams the
 	// backup, and writes standby.signal + postgresql.auto.conf.
 	runGoopgBasebackupToPG(t, repo, pgBasebackupBin, primary, standbyDir, slotName)
+	// M0106-0010 batched-41 standby disk-state diagnostic: dump bench_log
+	// visibility across base/{1,5}/{pg_class,pg_class_relname_nsp_index,...}
+	// so a re-run failure has the on-disk evidence inline. Cheap (5 stats +
+	// 5 reads per DB) and only runs when GOOPG_RUN_BLOCKED_M0102_E2E=1.
+	for _, dboid := range []uint32{1, 5} {
+		for _, rel := range []struct {
+			file  string
+			label string
+		}{
+			{"2663", "pg_class_relname_nsp_index"},
+			{"2662", "pg_class_oid_index"},
+			{"1259", "pg_class_heap"},
+			{"1249", "pg_attribute_heap"},
+			{"2659", "pg_attribute_relid_attnum_index"},
+		} {
+			p := filepath.Join(standbyDir, "base", fmt.Sprintf("%d", dboid), rel.file)
+			st, err := os.Stat(p)
+			if err != nil {
+				t.Logf("[diag] base/%d/%s (%s) missing on standby: %v", dboid, rel.file, rel.label, err)
+				continue
+			}
+			data, _ := os.ReadFile(p)
+			hasBench := bytes.Contains(data, append([]byte("bench_log"), 0))
+			t.Logf("[diag] base/%d/%s (%s) size=%d hasBenchLog=%v", dboid, rel.file, rel.label, st.Size(), hasBench)
+		}
+	}
 	// M0106: ensure relcache init files are on the standby.
 	copyInitFiles(t, primary.DataDir(), standbyDir)
 	// Overwrite postgresql.auto.conf for precise conninfo control

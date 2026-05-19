@@ -10664,4 +10664,72 @@ relcache init → replication readiness) and intra-package grouped.
 - Keep work to ONE item per loop. Decompose further if an item is larger
   than what fits in a single agent invocation.
 - Every non-trivial subsystem must land alongside (or just before) a design
-  doc under `docs/design/`. The spec treats this as a hard requirement.
+  doc under `docs/design/`. The spec treats this as a hard requirement.    - PARTIAL PROGRESS 2026-05-19 (loop 12, batched-41): multi-level
+      btree insert + DBOid=5 mirror re-wired. Disk-level diagnostic
+      test `TestE2E_CreateTablePersistsRelnameIndexEntryOnDisk` flips
+      to PASS — `bench_log` now lands in both `base/1/2663` and
+      `base/5/2663`. New file
+      `internal/executor/sys_catalog_btree_multilevel.go` (~360 lines):
+      `readSysBtreeMeta` parses `btm_root`/`btm_level` from the
+      metapage; `descendSysBtreeToLeaf` walks internal pages selecting
+      downlinks where `key ≤ newKey`; `collectAllLeafTuples` descends
+      leftmost and follows the `btpo_next` chain returning all data
+      tuples in sorted order; `buildBulkSysBtreeLayout` mirrors
+      `initdb.pgBuildBtreeBulkLoadSized` (executor→initdb cycle
+      prevents reuse); `rebuildSysBtreeWithNewEntry` is the
+      leaf-overflow fallback that merges the new tuple, runs
+      bulk-build, overwrites pages 0..N-1 in place, and emits one
+      `XLOG_BTREE_INSERT_LEAF` FPI WAL record per touched page;
+      `insertIntoExistingLeaf` is the multi-level-aware in-place
+      insert that respects high keys on non-rightmost leaves.
+      `insertCanonicalSysBtreeLeaf` now reads the metapage first,
+      dispatches on `btm_level`: 0 → `insertIntoSingleLeafRoot`
+      (batched-39 path preserved verbatim with
+      `splitLeafRootAndInsert` overflow fallback); ≥1 → descend +
+      `insertIntoExistingLeaf`, falling back to
+      `rebuildSysBtreeWithNewEntry` when the leaf is full.
+      `mirrorTouchedCatalogsToPostgresDB` re-wired at both DDL sync
+      sites (`syncTableToCatalogHeap`, `syncIndexToCatalogHeap`).
+      All affected packages PASS: `internal/executor`,
+      `internal/catalog`, `internal/storage`, `internal/server`,
+      `internal/mvcc`. `internal/wal` has the same 2 pre-existing
+      failures (`TestCheckpointerWritesCheckpointMarkers`,
+      `TestEncodeRecordXLogClassifiesXactCommitXID`) inherited from
+      the batched-40 baseline.
+      `TestE2E_FailoverGoopgToPG/async` — STILL FAILS with 42P01
+      `relation "public.bench_log" does not exist at character 22`,
+      but the inline disk-state diagnostic added to the test confirms
+      the PG standby's basebackup snapshot contains `bench_log` in
+      both `base/{1,5}/2663` (pg_class_relname_nsp_index) and
+      `base/{1,5}/1259` (pg_class heap), and the standby boots
+      cleanly with no segfault and no `pg_attribute catalog is
+      missing N attribute(s)` FATAL (the bad-mirror symptom from
+      batched-40 is fixed). The 42P01 originates from PG's
+      `parserOpenTable` (parse_relation.c:1445) — the standard
+      `RangeVarGetRelidExtended` lookup path — despite the catalog
+      data being on disk.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 12 (batched-41)" section).
+      Next loop (batched-42) — investigate residual 42P01 via the
+      hypotheses documented in the design doc, in priority order:
+      (H1) Rebuild path leaves `pd_lsn=0` on rewritten pages — when
+           PG replays the streamed WAL it may apply a *stale* FPI
+           over the basebackup-correct page. Set `pd_lsn` from the
+           returned WAL LSN before unpinning each slot in
+           `rebuildSysBtreeWithNewEntry`.
+      (H2) Byte-compare a bootstrap-built page vs. a rebuild-built
+           page (use the diagnostic test's
+           `dumpRelnameNspIndexLayout` for both) to spot any
+           high-key / downlink format divergence —
+           `INDEX_ALT_TID_MASK` / `ip_posid==nkeyatts` invariants
+           are the most likely suspects.
+      (H3) `copyInitFiles` may seed the PG standby's relcache with a
+           goopg-shape `pg_internal.init` whose syscache shape PG
+           does not accept; comment it out and re-run as a quick
+           bisect.
+      (H4) The DDL transaction's `RelcacheInvalPending` marker fires
+           a `RecordKindXactCommitInval`; the standby replay path
+           is goopg-side only and the PG standby never sees the
+           invalidation. If H1–H3 do not explain the failure,
+           investigate whether the standby needs a different
+           cache-invalidation signal in the WAL stream.
