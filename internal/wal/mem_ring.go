@@ -106,10 +106,17 @@ func (r *MemRing) Append(pos int64, data []byte) {
 	// bytes can fit. Drop the head portion — those bytes will
 	// never be in RAM.
 	if int64(len(data)) >= r.cap {
-		offset := int64(len(data)) - r.cap
-		copy(r.buf, data[offset:])
 		r.tail = pos + int64(len(data))
 		r.head = r.tail - r.cap
+		tailBytes := data[len(data)-int(r.cap):]
+		writeIdx := r.head % r.cap
+		first := r.cap - writeIdx
+		if first >= r.cap {
+			copy(r.buf, tailBytes)
+		} else {
+			copy(r.buf[writeIdx:], tailBytes[:first])
+			copy(r.buf, tailBytes[first:])
+		}
 		return
 	}
 

@@ -37,8 +37,10 @@ const (
 
 // LSN is the 64-bit log sequence number stored in pd_lsn. Upstream
 // stores it as two 32-bit halves in struct PageXLogRecPtr (high,low);
-// we use a Go uint64 in memory and serialise (low, high) on the wire,
-// matching upstream's PageSetLSN macro.
+// we use a Go uint64 in memory and serialise the high 32 bits at
+// offset 0 (LE uint32) and the low 32 bits at offset 4 (LE uint32),
+// byte-for-byte matching PG18's PageXLogRecPtrSet / PageXLogRecPtrGet
+// (postgres/src/include/storage/bufpage.h:100-112).
 type LSN uint64
 
 // BlockNumber is a relation-relative block index. Upstream uses
@@ -111,16 +113,26 @@ func MustHeader(p Page) PageHeader {
 	return h
 }
 
-// LSN reads pd_lsn. Upstream stores it as two 32-bit halves in
-// (high, low) order using PageXLogRecPtr; the in-file byte order is
-// little-endian high then little-endian low (a u64 LE).
+// LSN reads pd_lsn in PG18's two-uint32 PageXLogRecPtr layout:
+// xlogid (high 32 bits) as LE uint32 at offset 0, xrecoff (low 32
+// bits) as LE uint32 at offset 4. Mirrors PageXLogRecPtrGet at
+// postgres/src/include/storage/bufpage.h:105.
 func (h PageHeader) LSN() LSN {
-	return LSN(binary.LittleEndian.Uint64(h.Page[0:8]))
+	hi := binary.LittleEndian.Uint32(h.Page[0:4])
+	lo := binary.LittleEndian.Uint32(h.Page[4:8])
+	return LSN(uint64(hi)<<32 | uint64(lo))
 }
 
-// SetLSN writes pd_lsn.
+// SetLSN writes pd_lsn in PG18's two-uint32 PageXLogRecPtr layout
+// (high at offset 0, low at offset 4), matching PageXLogRecPtrSet at
+// postgres/src/include/storage/bufpage.h:110. The previous u64-LE
+// encoding shipped pages to PG with the two halves swapped, which
+// surfaced as "xlog flush request <high>/0 is not satisfied" on a
+// PG18 standby reading a basebackup-snapshot page (M0106-0010
+// batched-54).
 func (h PageHeader) SetLSN(v LSN) {
-	binary.LittleEndian.PutUint64(h.Page[0:8], uint64(v))
+	binary.LittleEndian.PutUint32(h.Page[0:4], uint32(uint64(v)>>32))
+	binary.LittleEndian.PutUint32(h.Page[4:8], uint32(uint64(v)))
 }
 
 func (h PageHeader) Checksum() uint16 { return binary.LittleEndian.Uint16(h.Page[8:10]) }

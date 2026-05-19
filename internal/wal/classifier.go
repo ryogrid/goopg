@@ -7,6 +7,9 @@
 //   - HeapInsert: xmin parsed from the encoded heap-tuple bytes
 //     (the on-disk tuple header carries xmin at offset 0).
 //     This is the inserting xact.
+//   - HeapHotUpdate / HeapUpdate: xmin parsed from the new-tuple
+//     bytes — the updating xact stamps xmin on the new tuple
+//     (the same xact also stamps xmax on the old slot).
 //   - HeapDelete: the encoded record carries xmax — the xact
 //     that stamped the tuple as deleted.
 //   - XactCommit / XactAbort: xid in the payload.
@@ -55,6 +58,52 @@ func Classify(d *Decoder, r Record) error {
 			Block:    blk,
 			LineSlot: slot,
 			NewTuple: tuple,
+		})
+		return nil
+	case RecordKindHeapHotUpdate:
+		rel, blk, oldSlot, _, tuple, err := DecodeHeapHotUpdate(r.Payload)
+		if err != nil {
+			return err
+		}
+		// The updating xact's xid lives at offset 0 of the
+		// new tuple body (xmin). xmax in the record header is
+		// the same value, but xminFromTuple keeps the extract
+		// path identical to HeapInsert above.
+		xid, ok := xminFromTuple(tuple)
+		if !ok {
+			return nil
+		}
+		d.ApplyChange(xid, Change{
+			Kind:     ChangeUpdate,
+			LSN:      r.EndLSN,
+			Rel:      rel,
+			Block:    blk,
+			LineSlot: oldSlot,
+			NewTuple: tuple,
+			// OldTuple intentionally empty — HOT-update
+			// records do not carry the pre-image. Under
+			// REPLICA IDENTITY DEFAULT, pgoutput's
+			// writeUpdate emits 'U' relOid 'N' newTuple
+			// directly (no K/O block), matching upstream's
+			// logicalrep_write_update.
+		})
+		return nil
+	case RecordKindHeapUpdate:
+		p, err := DecodeHeapUpdate(r.Payload)
+		if err != nil {
+			return err
+		}
+		xid, ok := xminFromTuple(p.Tuple)
+		if !ok {
+			return nil
+		}
+		d.ApplyChange(xid, Change{
+			Kind:     ChangeUpdate,
+			LSN:      r.EndLSN,
+			Rel:      p.Rel,
+			Block:    p.NewBlk,
+			LineSlot: p.NewLineSlot,
+			NewTuple: p.Tuple,
 		})
 		return nil
 	case RecordKindHeapDelete:

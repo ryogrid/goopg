@@ -1,0 +1,84 @@
+# go tool pprof -top -nodecount=40 -cum  /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_select-only.mutex.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 12:32:51 JST
+Showing nodes accounting for 3090.66s, 99.60% of 3103.02s total
+Dropped 497 nodes (cum <= 15.52s)
+Showing top 40 nodes out of 51
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%   2965.64s 95.57%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0%     0%   2965.64s 95.57%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0%     0%   2965.59s 95.57%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+  2941.33s 94.79% 94.79%   2942.36s 94.82%  sync.(*Mutex).Unlock (partial-inline)
+    76.63s  2.47% 97.26%   2901.28s 93.50%  sync.(*RWMutex).Unlock
+         0     0% 97.26%   2300.21s 74.13%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0% 97.26%   2300.21s 74.13%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0% 97.26%   2300.21s 74.13%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0% 97.26%   1781.89s 57.42%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteFrame
+         0     0% 97.26%   1648.26s 53.12%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart
+         0     0% 97.26%   1647.70s 53.10%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart.deferwrap1
+         0     0% 97.26%   1581.78s 50.98%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func6
+         0     0% 97.26%   1409.62s 45.43%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteReadyForQuery
+         0     0% 97.26%   1141.11s 36.77%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd
+         0     0% 97.26%   1140.62s 36.76%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd.deferwrap1
+         0     0% 97.26%    763.40s 24.60%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 97.26%    748.41s 24.12%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func7
+         0     0% 97.26%    548.90s 17.69%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).Flush
+         0     0% 97.26%    460.19s 14.83%  github.com/goopg/goopg/internal/protocol.(*FrameReader).ReadFrame
+         0     0% 97.26%    418.55s 13.49%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteFrame.func1
+         0     0% 97.26%    392.36s 12.64%  github.com/goopg/goopg/internal/protocol.(*FrameReader).ReadFrame.func1
+         0     0% 97.26%    392.36s 12.64%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func5
+         0     0% 97.26%    359.18s 11.58%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteRowDescription
+         0     0% 97.26%    201.39s  6.49%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).PutDataRowScratch
+         0     0% 97.26%    201.39s  6.49%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteDataRowReuse
+         0     0% 97.26%    155.39s  5.01%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteCommandComplete
+         0     0% 97.26%     79.53s  2.56%  github.com/goopg/goopg/internal/storage.(*Bgwriter).run
+         0     0% 97.26%     79.53s  2.56%  github.com/goopg/goopg/internal/storage.(*Pool).WriteDirtyPages
+         0     0% 97.26%     79.50s  2.56%  github.com/goopg/goopg/internal/storage.(*Bgwriter).Start.gowrap1
+    72.71s  2.34% 99.60%     72.71s  2.34%  runtime.unlock (partial-inline)
+         0     0% 99.60%     66.09s  2.13%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func4
+         0     0% 99.60%     52.19s  1.68%  github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor
+         0     0% 99.60%     47.29s  1.52%  github.com/goopg/goopg/internal/storage.(*Pool).Pin
+         0     0% 99.60%     32.64s  1.05%  github.com/goopg/goopg/internal/mvcc.(*Manager).Begin
+         0     0% 99.60%     31.36s  1.01%  runtime.schedule
+         0     0% 99.60%     30.75s  0.99%  runtime.findRunnable
+         0     0% 99.60%     30.50s  0.98%  runtime.mcall
+         0     0% 99.60%     27.27s  0.88%  github.com/goopg/goopg/internal/executor.(*projectOp).Next
+         0     0% 99.60%     27.27s  0.88%  github.com/goopg/goopg/internal/executor.(*indexScanOp).Next
+         0     0% 99.60%     27.01s  0.87%  runtime.gcstopm
+
+# top symbols (-list) — top 8 hot functions, flat order
+## -list cum%
+no matches found for regexp: cum%
+
+## -list (inline)
+no matches found for regexp: (inline)
+
+## -list sync.(*RWMutex).Unlock
+parsing argument regexp sync.(*RWMutex).Unlock: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list runtime.unlock
+Total: 3103.02s
+ROUTINE ======================== runtime.unlock in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/lock_spinbit.go
+    72.71s     72.71s (flat, cum)  2.34% of Total
+         .          .    260:func unlock(l *mutex) {
+    72.71s     72.71s    261:	unlockWithRank(l)
+         .          .    262:}
+         .          .    263:
+         .          .    264:// We might not be holding a p in this code.
+         .          .    265://
+         .          .    266://go:nowritebarrier
+
+## -list github.com/goopg/goopg/internal/access/btree.(*BTree).RangeScan
+parsing argument regexp github.com/goopg/goopg/internal/access/btree.(*BTree).RangeScan: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/access/btree.(*BTree).descendToLeaf
+parsing argument regexp github.com/goopg/goopg/internal/access/btree.(*BTree).descendToLeaf: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/access/btree.(*BTree).pinR
+parsing argument regexp github.com/goopg/goopg/internal/access/btree.(*BTree).pinR: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd
+parsing argument regexp github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd: error parsing regexp: missing argument to repetition operator: `*`
+

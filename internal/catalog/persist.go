@@ -40,6 +40,7 @@ type Snapshot struct {
 // relations. See docs/design/0006-0002-stats-persistence.md.
 type TableEntry struct {
 	OID            uint32      `json:"oid"`
+	RelFileNodeOID uint32      `json:"relfilenode,omitempty"`
 	Schema         string      `json:"schema,omitempty"`
 	Name           string      `json:"name"`
 	Columns        []Column    `json:"columns"`
@@ -83,6 +84,7 @@ func (c *InMemory) Snapshot() Snapshot {
 		}
 		s.Tables = append(s.Tables, TableEntry{
 			OID:            t.OID,
+			RelFileNodeOID: relFileNodeOIDForSnapshot(t),
 			Schema:         t.Schema,
 			Name:           t.Name,
 			Columns:        append([]Column(nil), t.Columns...),
@@ -130,6 +132,7 @@ func (c *InMemory) Restore(s Snapshot) error {
 			cols[i] = col
 		}
 		t := &Table{
+			RelFileNodeOID: te.RelFileNodeOID,
 			Schema:         te.Schema,
 			Name:           te.Name,
 			Columns:        cols,
@@ -182,6 +185,16 @@ func isKnownSmallDimensionName(name string) bool {
 		return true
 	}
 	return false
+}
+
+func relFileNodeOIDForSnapshot(t *Table) uint32 {
+	if t == nil {
+		return 0
+	}
+	if t.RelFileNodeOID == 0 || t.RelFileNodeOID == t.OID {
+		return 0
+	}
+	return t.RelFileNodeOID
 }
 
 // cloneTableStats deep-copies a TableStats so the snapshot copy

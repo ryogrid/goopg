@@ -23,12 +23,16 @@ const (
 )
 
 const (
-	xlogInfoDefault uint8 = 0xF0
-	xlogInfoDelete  uint8 = 0x10
-	xlogInfoSplit   uint8 = 0x20
-	xlogInfoAbort   uint8 = 0x20
-	xlogInfoVacuum  uint8 = 0x10
-	xlogInfoLock    uint8 = 0x20
+	xlogInfoDefault  uint8 = 0xF0
+	xlogInfoDelete   uint8 = 0x10
+	xlogInfoSplit    uint8 = 0x20
+	xlogInfoAbort    uint8 = 0x20
+	xlogInfoVacuum   uint8 = 0x10
+	xlogInfoLock     uint8 = 0x20
+	// M0102-0007: PG-compatible xl_info values for checkpoint
+	// records so a PG standby can recognise them during recovery.
+	xlogCheckpointOnline   uint8 = 0x10 // XLOG_CHECKPOINT_ONLINE
+	xlogCheckpointShutdown uint8 = 0x00 // XLOG_CHECKPOINT_SHUTDOWN
 )
 
 var (
@@ -151,6 +155,13 @@ func maxAlignXLog(n int) int {
 }
 
 func wrapXLogMainData(payload []byte) []byte {
+	// M0106-0010 batched-32: RecordKindCanonical (0xFE) payloads carry an
+	// already-formatted PG XLogRecord body (block references + main data)
+	// starting at byte 7 (after the 7-byte canonical envelope header).
+	// Return it verbatim — no xlrBlockIDDataShort wrapping needed.
+	if len(payload) >= 7 && payload[0] == 0xFE {
+		return payload[7:]
+	}
 	if len(payload) <= 0xFF {
 		out := make([]byte, 2+len(payload))
 		out[0] = xlrBlockIDDataShort
@@ -207,45 +218,40 @@ func classifyXLogRecord(payload []byte) (Rmgr, uint8, uint32) {
 	if len(payload) == 0 {
 		return RmgrXLog, xlogInfoDefault, 0
 	}
-	kind := payload[0]
-	switch kind {
-	case RecordKindPageImage, RecordKindCheckpoint:
-		return RmgrXLog, xlogInfoDefault, 0
-	case RecordKindHeapInsert:
-		return RmgrHeap, xlogInfoDefault, 0
-	case RecordKindHeapDelete:
-		_, _, _, xmax, _, err := DecodeHeapDelete(payload)
-		if err == nil {
-			return RmgrHeap, xlogInfoDelete, uint32(xmax)
-		}
-		return RmgrHeap, xlogInfoDelete, 0
-	case RecordKindHeapLock:
-		_, _, _, xmax, _, err := DecodeHeapLock(payload)
-		if err == nil {
-			return RmgrHeap, xlogInfoLock, uint32(xmax)
-		}
-		return RmgrHeap, xlogInfoLock, 0
-	case RecordKindHeapVacuum:
-		return RmgrHeap2, xlogInfoVacuum, 0
-	case RecordKindBtreeInsert:
-		return RmgrBtree, xlogInfoDefault, 0
-	case RecordKindBtreeSplit:
-		return RmgrBtree, xlogInfoSplit, 0
-	case RecordKindXactCommit:
-		xid, err := DecodeXactMarker(payload)
-		if err == nil {
-			return RmgrXact, xlogInfoDefault, uint32(xid)
-		}
-		return RmgrXact, xlogInfoDefault, 0
-	case RecordKindXactAbort:
-		xid, err := DecodeXactMarker(payload)
-		if err == nil {
-			return RmgrXact, xlogInfoAbort, uint32(xid)
-		}
-		return RmgrXact, xlogInfoAbort, 0
-	default:
-		return RmgrXLog, xlogInfoDefault, 0
+	// M0106-0010 batched-32: RecordKindCanonical (0xFE) carries a PG-canonical
+	// WAL record body (block references + main data) that a PG18 standby can replay.
+	// The canonical envelope header embeds the target rmgr/info/xid so the
+	// XLogRecord header is produced with the correct resource-manager fields.
+	// See catalog/canonical.go for the encoding; format.go is updated in lock-step.
+	if len(payload) >= 7 && payload[0] == 0xFE {
+		xid := binary.LittleEndian.Uint32(payload[3:7])
+		return Rmgr(payload[1]), payload[2], xid
 	}
+	// M0102-0007: PG-compatible checkpoint record (88-byte CheckPoint struct).
+	// Goopg's record-kind byte (0x02=RecordKindCheckpoint) would map to an
+	// implausible redo LSN (<256 bytes), so this path takes priority over the
+	// legacy kind-byte dispatch.
+	if len(payload) == 88 {
+		// M0105-0009: use XLOG_CHECKPOINT_SHUTDOWN (0x00) instead of
+		// ONLINE (0x10). PG's xlog_redo for shutdown checkpoints calls
+		// ProcArrayApplyRecoveryInfo() which constructs synthetic
+		// RunningTransactionsData and transitions standbyState to
+		// STANDBY_SNAPSHOT_READY. This enables CheckRecoveryConsistency
+		// to send PMSIGNAL_BEGIN_HOT_STANDBY, allowing the postmaster
+		// to enter PM_HOT_STANDBY. Without this, pg_ctl -w never sees
+		// the server as ready.
+		return RmgrXLog, xlogCheckpointShutdown, 0
+	}
+	// M0105-0007: route ALL goopg-internal records through RmgrXLog
+	// with an unknown info byte (0xF0) so PG's xlog_redo safely skips
+	// them during recovery. PG's resource-manager dispatch only
+	// recognizes RmgrXLog with known info values; unknown values fall
+	// through without action. Previously records used RmgrHeap /
+	// RmgrBtree / RmgrXact which caused PG to attempt decoding the
+	// goopg-internal payload as a PG record, resulting in a segfault.
+	// Goopg's own recovery is unaffected — it reads the payload data
+	// directly and dispatches on the record-kind byte.
+	return RmgrXLog, xlogInfoDefault, 0
 }
 
 // encodeRecordXLog returns the on-disk XLogRecord stream
@@ -258,10 +264,14 @@ func encodeRecordXLog(payload []byte, prev uint64) ([]byte, int, error) {
 	wrapped := wrapXLogMainData(payload)
 	rmgr, info, xid := classifyXLogRecord(payload)
 	realLen := xlogRecordHeaderSize + len(wrapped)
+	// prev is the caller's 0-based PG LSN (writer.go stores prevRecPtr as
+	// start-1 which is already the 0-based RecPtr). InvalidXLogRecPtr (0)
+	// means "no previous record" and is used verbatim.
+	prevPG := prev
 	header := XLogRecord{
 		TotLen: uint32(realLen),
 		XID:    xid,
-		Prev:   prev,
+		Prev:   prevPG,
 		Info:   info,
 		Rmid:   rmgr,
 	}
@@ -278,49 +288,35 @@ func encodeRecordXLog(payload []byte, prev uint64) ([]byte, int, error) {
 }
 
 func decodeRecordXLog(stream []byte) ([]byte, int, error) {
-	if len(stream) < xlogRecordHeaderSize {
-		return nil, 0, fmt.Errorf("%w: truncated xlog record header", ErrCorruptRecord)
-	}
-	header, err := DecodeXLogRecordHeader(stream[:xlogRecordHeaderSize])
+	decoded, err := decodeRecordXLogDetailed(stream)
 	if err != nil {
 		return nil, 0, err
 	}
-	total := int(header.TotLen)
-	if total < xlogRecordHeaderSize || total > len(stream) {
-		return nil, 0, fmt.Errorf("%w: bad xlog total length %d", ErrCorruptRecord, total)
+	if decoded.Payload == nil {
+		return nil, decoded.Consumed, fmt.Errorf("%w: record carries structured xlog fragments", ErrCorruptRecord)
 	}
-	wrapped := stream[xlogRecordHeaderSize:total]
-	if err := VerifyXLogRecordCRC(stream[:xlogRecordHeaderSize], wrapped, header.CRC); err != nil {
-		return nil, 0, err
-	}
-	payload, err := unwrapXLogMainData(wrapped)
-	if err != nil {
-		return nil, 0, err
-	}
-	// Skip MAXALIGN trailing pad bytes so callers advance to the
-	// next record header. The pad is always zero-filled by the
-	// encoder.
-	consumed := maxAlignXLog(total)
-	if consumed > len(stream) {
-		consumed = len(stream)
-	}
-	return payload, consumed, nil
+	return decoded.Payload, decoded.Consumed, nil
 }
 
+// formatSegmentName generates a PG-compatible WAL segment filename for
+// the given absolute segment number (segNo * DefaultSegmentSize = first byte
+// of the segment). Uses TLI=1 (the bootstrap timeline). Mirrors
+// XLogFilePath() in postgres/src/include/access/xlog_internal.h.
 func formatSegmentName(segNo uint64) string {
-	return fmt.Sprintf("%024X", segNo)
+	const tli = 1
+	totalBytes := segNo * uint64(DefaultSegmentSize)
+	logNo := uint32(totalBytes >> 32)
+	segInLog := uint32((totalBytes & 0xFFFFFFFF) / uint64(DefaultSegmentSize))
+	return fmt.Sprintf("%08X%08X%08X", tli, logNo, segInLog)
 }
 
+// parseSegmentName parses a PG-compatible WAL segment filename
+// (24 hex chars: TLI + LOG + SEG, each 8 hex digits) and returns
+// the absolute segment number such that segNo*DefaultSegmentSize equals
+// the segment's first byte position. Returns false for non-WAL filenames.
 func parseSegmentName(name string) (uint64, bool) {
-	if len(name) != 24 {
-		return 0, false
-	}
-	var seg uint64
-	_, err := fmt.Sscanf(name, "%024X", &seg)
-	if err != nil {
-		return 0, false
-	}
-	return seg, true
+	_, segno, ok := ParseXLogFileName(name, 0)
+	return segno, ok
 }
 
 func segmentForLSN(lsn uint64, segSize int64) uint64 {

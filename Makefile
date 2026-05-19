@@ -32,7 +32,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff
+.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -50,6 +50,7 @@ help:
 	@echo "  make ralph-state-repair Attempt safe auto-repair for .ralph/status.json and .ralph/progress.json."
 	@echo "  make ralph-state-guard  Check Ralph state, auto-repair if needed, then verify again."
 	@echo "  make pgbench-compare    Run pgbench comparison between goopg and PostgreSQL."
+	@echo "  make pgbench-compare-matrix Run the full goopg pgbench matrix survey."
 	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
 	@echo
 	@echo "Variables (override with 'make VAR=value'):"
@@ -228,6 +229,15 @@ pgo-profile:
 #
 # Uses separate ports (5433 for goopg, 5434 for PostgreSQL)
 # to avoid conflicts with existing instances.
+#
+# Preconditions:
+#   - `make build` is run automatically by this target.
+#   - Upstream PostgreSQL client/server tools must already exist under
+#     `postgres/local_install/`:
+#       `bin/{initdb,pg_ctl,psql,pgbench}` and matching shared libraries in
+#       `lib/`.
+#   - Benchmark clusters are created under `tmp/pgbench-compare/` on first run;
+#     old clusters under `bench/pgbench-compare/` are not reused.
 # ---------------------------------------------------------------
 
 pgbench-compare: build
@@ -236,6 +246,10 @@ pgbench-compare: build
 	@echo ""
 	@echo "Generating report..."
 	@"$(REPO_ROOT)/bench/pgbench-compare/generate_report.sh"
+
+pgbench-compare-matrix: build
+	@echo "Running pgbench matrix validation..."
+	@"$(REPO_ROOT)/bench/pgbench-compare/run_matrix.sh"
 
 pgbench-compare-report:
 	@"$(REPO_ROOT)/bench/pgbench-compare/generate_report.sh"

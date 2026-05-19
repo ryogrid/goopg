@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -43,6 +44,12 @@ type Column struct {
 	GeneratedExpr string
 	// GeneratedAlways is true when the column uses GENERATED ALWAYS AS semantics.
 	GeneratedAlways bool
+	// DefaultExpr holds the parsed AST of the column's DEFAULT clause when
+	// CREATE TABLE provided one. nil for columns without a DEFAULT. The
+	// apply worker evaluates this when filling subscriber-extra columns at
+	// INSERT time so logical replication preserves DEFAULT semantics across
+	// schema-extended subscribers (M0103-0007 rung 13).
+	DefaultExpr parser.Expr
 }
 
 // Table is one relation in the catalog.
@@ -51,6 +58,10 @@ type Table struct {
 	Name    string
 	Columns []Column
 	OID     uint32
+	// RelFileNodeOID overrides the on-disk relfile identity when it differs
+	// from the catalog OID. PostgreSQL physical backups use relfilenode for
+	// storage paths; when zero, goopg falls back to OID (its native layout).
+	RelFileNodeOID uint32
 
 	// Virtual marks tables that don't live on the heap. The planner
 	// short-circuits SeqScan into a materialised Values node by
@@ -71,8 +82,8 @@ type Table struct {
 	// INSERT/UPDATE/DELETE against a view will surface as a
 	// planner error because the substituted plan isn't a heap
 	// scan.
-	View               *parser.SelectStmt
-	ViewColumnAliases  []string
+	View              *parser.SelectStmt
+	ViewColumnAliases []string
 
 	// Stats holds the most recent ANALYZE output for this
 	// table. nil before ANALYZE has run; the planner treats nil
@@ -280,9 +291,11 @@ type Catalog interface {
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
 //
-// OIDs are assigned sequentially starting at FirstUserOID. The DBOid
-// field on the produced RelFileNode is fixed at DefaultDBOid for v0
-// — the multi-database layer arrives with milestone 7.
+// OIDs are assigned sequentially starting at FirstUserOID. The dbOid
+// field on produced RelFileNodes defaults to DefaultDBOid for v0, but
+// startup may override it when importing a physical PostgreSQL backup
+// whose active database lives under a different base/<oid> directory.
+// Full multi-database storage routing still arrives with milestone 7.
 type InMemory struct {
 	mu      sync.RWMutex
 	tables  map[string]*Table
@@ -364,6 +377,16 @@ func IsSystemRelation(oid uint32) bool {
 // catalog entry lives in this database.
 const DefaultDBOid uint32 = 1
 
+// PostgresDBOid is the PG-canonical OID for the "postgres" database
+// (template_pg_database.h: Template1ObjectId=1, PostgresObjectId=5).
+// A PG18 client backend connecting with `dbname=postgres` sysscan'd
+// every catalog lookup at `base/5/...`. M0106-0010 bootstrap mirrors
+// every nailed catalog file (heap + index) to both base/1/ and
+// base/5/; runtime catalog writes (M0106-0010 batched-40) must do
+// the same so a PG-standby clone of a goopg primary that ran any
+// CREATE TABLE sees the user-table row through its postgres-DB lens.
+const PostgresDBOid uint32 = 5
+
 // NewInMemory returns a catalog seeded with the v0 pg_catalog
 // virtual views.
 func NewInMemory() *InMemory {
@@ -382,6 +405,26 @@ func NewInMemory() *InMemory {
 	}
 	c.registerSystemTables()
 	return c
+}
+
+// SetDBOID overrides the database OID used for RelFileNode generation.
+// v0 still exposes a single logical database; this hook exists so
+// physical PostgreSQL backups whose active database is not base/1 can be
+// queried without rewriting relfilenode paths on disk.
+func (c *InMemory) SetDBOID(dbOid uint32) {
+	if dbOid == 0 {
+		return
+	}
+	c.mu.Lock()
+	c.dbOid = dbOid
+	c.mu.Unlock()
+}
+
+// DBOID returns the catalog's current storage database OID.
+func (c *InMemory) DBOID() uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.dbOid
 }
 
 // RegisterInheritanceChild registers childOID as a child of parentOID for
@@ -480,7 +523,7 @@ func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) 
 				if pb.From == "" && pb.To == "" {
 					continue
 				}
-				var from, to int64 = -1<<62, 1<<62
+				var from, to int64 = -1 << 62, 1 << 62
 				if pb.From != "" && pb.From != "MINVALUE" {
 					fmt.Sscanf(pb.From, "%d", &from)
 				}
@@ -674,6 +717,15 @@ func (c *InMemory) tableByOID(oid uint32) (*Table, bool) {
 	return nil, false
 }
 
+// LookupTableByOID is the read-locked public accessor for tableByOID.
+// Used by the executor to render `oid::regclass` for the `tableoid`
+// system column (M0100-0005y) and similar OID-back-to-name lookups.
+func (c *InMemory) LookupTableByOID(oid uint32) (*Table, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.tableByOID(oid)
+}
+
 // advanceNextOIDLocked nudges nextOID past `oid` so subsequent
 // allocations don't collide with the recovered identifier.
 // Caller must hold c.mu.
@@ -704,27 +756,38 @@ func (c *InMemory) ListDatabases() []string {
 func (c *InMemory) Routines() *Routines { return c.routines }
 
 // registerSystemTables installs the minimal pg_catalog v0 needs:
-// pg_class with one row per user table. The OID column is text-typed
-// because regclass casts are no-ops in v0 — pgbench's
-// `oid=$1::pg_catalog.regclass` ends up comparing the bound text
-// parameter (the table name) against pg_class.oid, so storing the
-// relname there makes the equality match.
+// pg_class with one row per user table. The OID column is emitted
+// as the table's numeric OID (decimal text wire format under type
+// OID 26) so libpqrcv can decode it via DatumGetObjectId — required
+// by CREATE SUBSCRIPTION's fetch_remote_table_info probe (M0103-0008
+// rung 16). The regclass cast handles the legacy "name as OID"
+// shape by resolving the bound text parameter through the catalog.
 func (c *InMemory) registerSystemTables() {
 	pgClass := &Table{
 		Schema: "pg_catalog",
 		Name:   "pg_class",
 		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
 			{Name: "relname", Type: Type{Name: "text"}, Ordinal: 1},
 			{Name: "relkind", Type: Type{Name: "text"}, Ordinal: 2},
-			{Name: "relnamespace", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "relnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
 			// Additional columns required by vacuumdb catalog query (M0095-0004).
 			{Name: "relpersistence", Type: Type{Name: "text"}, Ordinal: 4},
-			{Name: "reltoastrelid", Type: Type{Name: "text"}, Ordinal: 5},
-			{Name: "relpages", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "reltoastrelid", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "relpages", Type: Type{Name: "int4"}, Ordinal: 6},
 			// relispopulated: true for tables/views, reflects IsPopulated for matviews.
 			// M0097-0013.
 			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 7},
+			// relnatts: number of user columns. Required by PG's
+			// CREATE SUBSCRIPTION column-list probe (M0103-0008 rung 14):
+			//   `… (array_length(gpt.attrs,1) = c.relnatts) … FROM pg_class c …`
+			// where `gpt = pg_get_publication_tables(...)`.
+			{Name: "relnatts", Type: Type{Name: "int4"}, Ordinal: 8},
+			// relreplident: replica identity setting. Required by PG's
+			// CREATE SUBSCRIPTION tablesync probe (M0103-0008 rung 16):
+			//   `SELECT c.oid, c.relreplident, c.relkind FROM pg_class c …`
+			// 'd' = REPLICA_IDENTITY_DEFAULT (PG default for tables).
+			{Name: "relreplident", Type: Type{Name: "char"}, Ordinal: 9},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -756,14 +819,16 @@ func (c *InMemory) registerSystemTables() {
 				populated = "f"
 			}
 			out = append(out, []string{
-				t.Name,
-				t.Name,
-				relkind,
-				"2200",    // relnamespace: OID of public namespace (matches pg_namespace.oid)
-				"p",       // relpersistence: permanent
-				"0",       // reltoastrelid: no TOAST table
-				"0",       // relpages: estimated page count (0 = unknown)
-				populated, // relispopulated
+				strconv.Itoa(int(t.OID)),     // oid: numeric OID (M0103-0008 rung 16)
+				t.Name,                       // relname
+				relkind,                      // relkind
+				"2200",                       // relnamespace: OID of public namespace
+				"p",                          // relpersistence: permanent
+				"0",                          // reltoastrelid: no TOAST table
+				"0",                          // relpages: estimated page count
+				populated,                    // relispopulated
+				strconv.Itoa(len(t.Columns)), // relnatts: number of user columns
+				"d",                          // relreplident: REPLICA_IDENTITY_DEFAULT
 			})
 		}
 		return out
@@ -1710,6 +1775,9 @@ func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 		return t, true
 	}
 	if name.Schema == "" {
+		if t, ok := c.tables[key(parser.ObjectName{Schema: "public", Name: name.Name})]; ok {
+			return t, true
+		}
 		if t, ok := c.tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
 			return t, true
 		}
@@ -1975,7 +2043,11 @@ func (c *InMemory) HasPrimaryKey(table *Table) bool {
 func (c *InMemory) RelFileNode(table *Table) storage.RelFileNode {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return storage.RelFileNode{DBOid: c.dbOid, RelOid: table.OID, Fork: storage.MainFork}
+	relOID := table.OID
+	if table.RelFileNodeOID != 0 {
+		relOID = table.RelFileNodeOID
+	}
+	return storage.RelFileNode{DBOid: c.dbOid, RelOid: relOID, Fork: storage.MainFork}
 }
 
 // IndexRelFileNode returns the storage manager identity for an index.

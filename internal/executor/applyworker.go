@@ -172,6 +172,8 @@ func (w *ApplyWorker) ApplyMessage(m *wal.DecodedMessage) (uint64, error) {
 		err = w.applyDelete(m)
 	case 'U':
 		err = w.applyUpdate(m)
+	case 'T':
+		err = w.applyTruncate(m)
 	case 'C':
 		commitLSN = m.CommitLSN
 		err = w.applyCommit(m)
@@ -246,10 +248,28 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 			return nil
 		}
 	}
-	row, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
+	row, unchanged, missing, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode insert tuple for %q: %w", r.local.Name, err)
 	}
+	// Defensive: pgoutput's encoder never emits 'u' for an INSERT
+	// (there is no pre-image heap row to inherit from). A corrupt
+	// stream that did so would silently install NULL — refuse here.
+	for i, u := range unchanged {
+		if u {
+			return fmt.Errorf("applyworker: INSERT new-tuple for %q col %d: 'u' (unchanged TOAST) status not valid on INSERT",
+				r.local.Name, i)
+		}
+	}
+	// Subscriber-extra columns (missing[i]=true): evaluate the column's
+	// DEFAULT clause so logical replication preserves CREATE TABLE
+	// DEFAULT semantics across schema-extended subscribers. Mirrors
+	// upstream's slot_fill_defaults() in
+	// src/backend/replication/logical/worker.c. Columns with no DEFAULT
+	// stay NullDatum (matches PG's behaviour when NOT NULL is absent;
+	// a NOT NULL column without DEFAULT will fail the heap write).
+	// M0103-0007 rung 13 — see docs/design/0103-0036.
+	applyDefaultsForMissing(r.local.Columns, row, missing)
 
 	// writeHeapRow expects a Context carrying Pool / Tx. Build
 	// a minimal one — the apply worker doesn't have a session
@@ -261,9 +281,17 @@ func (w *ApplyWorker) applyInsert(m *wal.DecodedMessage) error {
 	ctx.Tx = w.currentTx
 
 	rel := w.cat.RelFileNode(r.local)
-	if err := writeHeapRow(ctx, rel, r.local.Columns, row); err != nil {
+	ptr, err := writeHeapRowReturning(ctx, rel, r.local.Columns, row)
+	if err != nil {
 		return fmt.Errorf("applyworker: writeHeapRow %q: %w", r.local.Name, err)
 	}
+	// Maintain unique/primary-key indexes so fresh-session queries
+	// using equality predicates on indexed columns find the row.
+	// Without this, the dispatcher's IndexScan returns 0 rows even
+	// though SeqScan still sees the tuple — the M0103-0007 rung-1
+	// fresh-session visibility gap surfaced in
+	// `TestPubSubClusterSmokePGToGoopgFreshSessionVisibility`.
+	maintainUniqueIndexesForInsert(ctx, r.local, r.local.Columns, row, ptr)
 	return nil
 }
 
@@ -283,7 +311,7 @@ func (w *ApplyWorker) applyDelete(m *wal.DecodedMessage) error {
 	if len(m.OldTuple) == 0 {
 		return nil
 	}
-	keyRow, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
+	keyRow, _, _, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode delete old-tuple for %q: %w", r.local.Name, err)
 	}
@@ -304,20 +332,99 @@ func (w *ApplyWorker) applyUpdate(m *wal.DecodedMessage) error {
 		return fmt.Errorf("applyworker: UPDATE for relation %s.%s has no local table",
 			r.remote.Schema, r.remote.Name)
 	}
-	if len(m.OldTuple) == 0 {
-		return nil
-	}
-	oldKeyRow, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
-	if err != nil {
-		return fmt.Errorf("applyworker: decode update old-tuple for %q: %w", r.local.Name, err)
-	}
-	newRow, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
+	newRow, newUnchanged, newMissing, err := decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.NewTuple)
 	if err != nil {
 		return fmt.Errorf("applyworker: decode update new-tuple for %q: %w", r.local.Name, err)
 	}
+
+	// Build the row-locator key. Under REPLICA IDENTITY DEFAULT
+	// pgoutput omits OldTuple entirely when no key columns
+	// changed (see `logicalrep_write_update` in upstream proto.c):
+	// the byte after rel_oid is 'N' directly, so the decoder
+	// leaves OldTuple empty. In that case we synthesise the
+	// key from the new tuple's PK columns — the key didn't
+	// change by definition, so newRow's PK values name the
+	// pre-image row.
+	var oldKeyRow Row
+	if len(m.OldTuple) > 0 {
+		// 'u' cells in OldTuple become NullDatum which
+		// rowMatchesKey treats as wildcards — correct, since
+		// the publisher didn't tell us the pre-image value.
+		// missing[] cells (subscriber-extra columns) likewise
+		// become NullDatum wildcards in the key — those columns
+		// never exist on the publisher side so they can't
+		// participate in row-locator matching.
+		oldKeyRow, _, _, err = decodePgoutputTupleAsRow(r.remote.Columns, r.local.Columns, m.OldTuple)
+		if err != nil {
+			return fmt.Errorf("applyworker: decode update old-tuple for %q: %w", r.local.Name, err)
+		}
+	} else {
+		// Rung 12: prefer the wire's per-column identity flags
+		// (LOGICALREP_IS_REPLICA_IDENTITY, bit 0 of DecodedAttr.Flags)
+		// so REPLICA IDENTITY USING INDEX on a non-PK unique index
+		// resolves correctly even when the subscriber declares no PK.
+		// Falls back to the subscriber-side PK lookup when the stream
+		// carries no identity hints (older or corrupt publishers).
+		oldKeyRow = replicaIdentityKeyRow(r.remote.Columns, r.local.Columns, newRow)
+		if oldKeyRow == nil {
+			oldKeyRow = primaryKeyOnlyRow(w.cat, r.local, newRow)
+		}
+		if oldKeyRow == nil {
+			// No identity hint AND no subscriber PK — there's no
+			// safe way to locate the pre-image row from a
+			// no-old-tuple UPDATE. Same conservative behaviour
+			// the prior path took for any empty OldTuple, just
+			// made explicit.
+			return nil
+		}
+	}
 	ctx := w.applyContext()
 	rel := w.cat.RelFileNode(r.local)
-	return applyUpdateByKey(ctx, rel, r.local.Columns, oldKeyRow, newRow)
+	return applyUpdateByKey(ctx, rel, r.local, r.local.Columns, oldKeyRow, newRow, newUnchanged, newMissing)
+}
+
+// applyTruncate handles pgoutput 'T' frames. The publisher emits one
+// 'T' message per TRUNCATE statement, listing every relation in the
+// statement (CASCADE expansion is performed publisher-side so the
+// relid list already includes the transitive closure of foreign-key
+// targets). On the subscriber we treat TRUNCATE as a bulk DELETE:
+// for each relid we look up the local table via the relation cache
+// and stamp xmax on every visible tuple in the heap so subsequent
+// MVCC scans see them as dead. The work happens inside the open
+// apply transaction so a rollback before COMMIT discards the marks
+// alongside any other apply changes — symmetric with applyDelete.
+//
+// RESTART IDENTITY (bit 1 of TruncateOption) and CASCADE (bit 0)
+// are honoured at the publisher: bit 0 was already used to decide
+// which relids to ship, and goopg's apply path has no sequence
+// state to reset. We record the option for diagnostics but take no
+// extra action.
+//
+// Unknown relids (no prior 'R' message) are an apply error — same
+// policy as applyDelete / applyUpdate: a TRUNCATE for a relation
+// goopg never saw a relation descriptor for points at a publisher /
+// subscriber catalog drift the operator must investigate, not a
+// silent data-loss outcome.
+func (w *ApplyWorker) applyTruncate(m *wal.DecodedMessage) error {
+	if !w.inXact {
+		return errors.New("applyworker: TRUNCATE outside transaction")
+	}
+	ctx := w.applyContext()
+	for _, oid := range m.TruncateRels {
+		r, ok := w.relations[oid]
+		if !ok {
+			return fmt.Errorf("applyworker: TRUNCATE for unknown rel_oid %d (no R message seen)", oid)
+		}
+		if r.local == nil {
+			return fmt.Errorf("applyworker: TRUNCATE for relation %s.%s has no local table",
+				r.remote.Schema, r.remote.Name)
+		}
+		rel := w.cat.RelFileNode(r.local)
+		if err := truncateRelation(ctx, rel); err != nil {
+			return fmt.Errorf("applyworker: truncate %q: %w", r.local.Name, err)
+		}
+	}
+	return nil
 }
 
 // applyContext builds a minimal executor Context for apply-worker
@@ -408,16 +515,223 @@ func applyDeleteByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Colu
 
 // applyUpdateByKey finds the row matching oldKeyRow in rel, deletes it,
 // then inserts newRow — implementing a logical UPDATE for the apply worker.
-func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, oldKeyRow, newRow Row) error {
+// When newUnchanged has any true entries (a 'u' / unchanged-TOAST cell in
+// the publisher's NewTuple), a read-only first scan finds the matched
+// heap row and copies its values into newRow for each unchanged slot
+// before the delete+insert phase. The two-scan cost is paid only when
+// 'u' is present — the all-'t'/'n' hot path stays single-scan.
+func applyUpdateByKey(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldKeyRow, newRow Row, newUnchanged, newMissing []bool) error {
+	// needFill picks up two distinct cases that share the same remedy
+	// (overwrite the slot from the matched existing heap row):
+	//   - newUnchanged[i]: publisher emitted 'u' (unchanged TOAST) for
+	//     remote column i; the pre-image value lives in our heap and
+	//     must survive the delete+insert.
+	//   - newMissing[i]: column i exists on the subscriber but not on
+	//     the publisher (subscriber-extra). Without the fill, every
+	//     replicated UPDATE would NULL the subscriber-only value.
+	needFill := false
+	for _, u := range newUnchanged {
+		if u {
+			needFill = true
+			break
+		}
+	}
+	if !needFill {
+		for _, m := range newMissing {
+			if m {
+				needFill = true
+				break
+			}
+		}
+	}
+	if needFill {
+		matched, err := applyScanFirstMatch(ctx, rel, cols, oldKeyRow)
+		if err != nil {
+			return err
+		}
+		if matched != nil {
+			for i := range newRow {
+				if i >= len(matched) {
+					break
+				}
+				take := false
+				if i < len(newUnchanged) && newUnchanged[i] {
+					take = true
+				}
+				if i < len(newMissing) && newMissing[i] {
+					take = true
+				}
+				if take {
+					newRow[i] = matched[i]
+				}
+			}
+		}
+		// If matched == nil, the 'u' / missing slots remain NullDatum.
+		// The subsequent applyDeleteByKey is a no-op (nothing to xmax),
+		// but writeHeapRowReturning still installs newRow — that
+		// preserves the pre-existing "no-match UPDATE installs a row"
+		// behaviour rather than fixing it here.
+	}
 	if err := applyDeleteByKey(ctx, rel, cols, oldKeyRow); err != nil {
 		return err
 	}
-	return writeHeapRow(ctx, rel, cols, newRow)
+	ptr, err := writeHeapRowReturning(ctx, rel, cols, newRow)
+	if err != nil {
+		return err
+	}
+	// Re-add to unique/primary-key indexes so post-UPDATE
+	// equality probes find the new row (matches applyInsert).
+	if tbl != nil {
+		maintainUniqueIndexesForInsert(ctx, tbl, cols, newRow, ptr)
+	}
+	return nil
+}
+
+// applyScanFirstMatch returns a copy of the first visible heap row
+// in rel whose decoded columns match keyRow under rowMatchesKey, or
+// (nil, nil) when no row matches. Used by applyUpdateByKey to source
+// the values for 'u' unchanged-TOAST cells in the publisher's NewTuple.
+// Pure read-only — never stamps xmax or marks pages dirty.
+func applyScanFirstMatch(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, keyRow Row) (Row, error) {
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return nil, err
+	}
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return nil, err
+		}
+		s.RLock()
+		page := s.Page()
+		if storage.IsNew(page) {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			return nil, err
+		}
+		scanRow := make(Row, len(cols))
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			tup, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if !mvcc.TupleVisibleSubxact(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+				continue
+			}
+			if err := DecodeRowInto(scanRow, cols, tup.Data); err != nil {
+				continue
+			}
+			if rowMatchesKey(scanRow, keyRow) {
+				out := append(Row(nil), scanRow...)
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				return out, nil
+			}
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+	}
+	return nil, nil
 }
 
 // rowMatchesKey returns true when every non-null datum in keyRow equals
 // the corresponding datum in row. Null datums in keyRow are skipped
 // (treated as "don't care").
+// primaryKeyOnlyRow returns a partial-key Row aligned with tbl's
+// columns: positions belonging to the primary-key index hold their
+// value from `full`; every other position is NullDatum. rowMatchesKey
+// treats NullDatum cells as "don't care", so the result is a valid
+// row-locator key for `applyUpdateByKey` / `applyDeleteByKey`. Returns
+// nil when the table has no primary key — callers should treat that
+// as "cannot synthesise a key" rather than "no PK columns matter".
+//
+// Used by applyUpdate when pgoutput omits OldTuple (REPLICA IDENTITY
+// DEFAULT + key columns unchanged), where the new tuple's PK values
+// also name the pre-image row.
+func primaryKeyOnlyRow(cat catalog.Catalog, tbl *catalog.Table, full Row) Row {
+	if cat == nil || tbl == nil {
+		return nil
+	}
+	var pkCols []string
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if idx.Primary {
+			pkCols = idx.Columns
+			break
+		}
+	}
+	if len(pkCols) == 0 {
+		return nil
+	}
+	key := make(Row, len(full))
+	for i := range key {
+		key[i] = NullDatum
+	}
+	for _, pkName := range pkCols {
+		for i, col := range tbl.Columns {
+			if col.Name == pkName {
+				if i < len(full) {
+					key[i] = full[i]
+				}
+				break
+			}
+		}
+	}
+	return key
+}
+
+// replicaIdentityKeyRow synthesises a row-locator key from `newRow` using
+// the publisher's per-column identity flags carried on each Relation-message
+// attribute. It is the rung-12 (M0103-0007) replacement for `primaryKeyOnlyRow`
+// in `applyUpdate`'s no-OldTuple branch: where `primaryKeyOnlyRow` looked up
+// the subscriber-side PRIMARY KEY columns, this helper consults the wire's
+// `LOGICALREP_IS_REPLICA_IDENTITY` bit (Flags & 0x01) so REPLICA IDENTITY
+// USING INDEX — where the publisher's identity columns belong to a non-PK
+// unique index — resolves correctly even when the subscriber declares no PK
+// at all.
+//
+// Mirrors upstream PG: `logicalrep_write_attrs` sets the bit on each column
+// covered by the active REPLICA IDENTITY (PK for DEFAULT, all columns for
+// FULL, the chosen unique-index columns for USING INDEX, none for NOTHING).
+// `rowMatchesKey` ignores NullDatum cells, so the returned partial-key Row
+// matches the heap by exactly the columns the publisher named.
+//
+// Returns nil when no remote column carries the identity flag — older or
+// corrupt streams without identity hints fall back to `primaryKeyOnlyRow` in
+// `applyUpdate`. Design doc:
+// docs/design/0103-0035-m0103-0007-rung-12-pg-to-goopg-replica-identity-index.md.
+func replicaIdentityKeyRow(remoteCols []wal.DecodedAttr, localCols []catalog.Column, newRow Row) Row {
+	if len(newRow) != len(localCols) {
+		return nil
+	}
+	key := make(Row, len(localCols))
+	for i := range key {
+		key[i] = NullDatum
+	}
+	any := false
+	for _, rc := range remoteCols {
+		if rc.Flags&0x01 == 0 {
+			continue
+		}
+		for j, lc := range localCols {
+			if lc.Name == rc.Name {
+				key[j] = newRow[j]
+				any = true
+				break
+			}
+		}
+	}
+	if !any {
+		return nil
+	}
+	return key
+}
+
 func rowMatchesKey(row, keyRow Row) bool {
 	for i, k := range keyRow {
 		if i >= len(row) {
@@ -514,37 +828,80 @@ func (w *ApplyWorker) promoteSyncedRels(commitLSN uint64) {
 // decodePgoutputTupleAsRow parses each pgoutput text-format
 // column value to a Datum compatible with the local table's
 // column type. Status 'n' becomes NullDatum; status 't' is
-// parsed per type ('u' / unchanged TOAST is rejected — v0's
-// encoder doesn't emit it).
-func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.Column, tup []wal.DecodedColumn) (Row, error) {
+// parsed per type; status 'u' (unchanged TOAST) becomes
+// NullDatum with the corresponding `unchanged` slot set to
+// true so a downstream UPDATE apply can fill the cell from
+// the matched heap row before insert. Callers that don't
+// expect 'u' (INSERT, DELETE-key, OldTuple key match) can
+// ignore the mask — the NullDatum + rowMatchesKey's
+// "skip NULL key cells" semantics yield correct behaviour
+// for OldTuple/key-row use cases.
+func decodePgoutputTupleAsRow(remoteCols []wal.DecodedAttr, localCols []catalog.Column, tup []wal.DecodedColumn) (Row, []bool, []bool, error) {
 	if len(tup) != len(remoteCols) {
-		return nil, fmt.Errorf("tuple has %d cols, R message described %d", len(tup), len(remoteCols))
+		return nil, nil, nil, fmt.Errorf("tuple has %d cols, R message described %d", len(tup), len(remoteCols))
 	}
-	if len(localCols) < len(remoteCols) {
-		return nil, fmt.Errorf("local table has %d cols, remote sent %d", len(localCols), len(remoteCols))
+	// Build remote-ordinal → local-ordinal map by column name. PG's
+	// apply worker resolves attributes by name (not by position) so
+	// that subscriber DDL can carry the columns in a different order
+	// or add extra columns the publisher doesn't have. Both sides
+	// emit catalog-normalised lowercase names — for unquoted DDL the
+	// names match directly; quoted-identifier mismatches surface as
+	// the explicit error below. claimed[j] tracks which local columns
+	// were referenced by some remote attribute; the unclaimed positions
+	// are subscriber-extra (M0103-0007 rung 11).
+	localIdx := make([]int, len(remoteCols))
+	claimed := make([]bool, len(localCols))
+	for i, rc := range remoteCols {
+		found := -1
+		for j, lc := range localCols {
+			if lc.Name == rc.Name {
+				found = j
+				break
+			}
+		}
+		if found < 0 {
+			return nil, nil, nil, fmt.Errorf("remote col %q has no matching local column", rc.Name)
+		}
+		localIdx[i] = found
+		claimed[found] = true
 	}
 	row := make(Row, len(localCols))
+	unchanged := make([]bool, len(localCols))
+	missing := make([]bool, len(localCols))
 	for i := range row {
 		row[i] = NullDatum
 	}
+	// Subscriber-extra columns: local positions with no claiming remote
+	// attribute. Stay NullDatum in the returned row; missing[j]=true so
+	// applyUpdateByKey can fill from the matched existing heap row
+	// (preserving the subscriber-only value across replicated UPDATEs),
+	// and the INSERT path leaves them NullDatum (full DEFAULT-expression
+	// evaluation is deferred to a later rung).
+	for j, c := range claimed {
+		if !c {
+			missing[j] = true
+		}
+	}
 	for i, col := range tup {
-		local := localCols[i]
+		j := localIdx[i]
+		local := localCols[j]
 		switch col.Status {
 		case 'n':
-			row[i] = NullDatum
+			row[j] = NullDatum
 		case 't':
 			d, err := parsePgoutputText(local.Type, col.Bytes)
 			if err != nil {
-				return nil, fmt.Errorf("col %q: %w", local.Name, err)
+				return nil, nil, nil, fmt.Errorf("col %q: %w", local.Name, err)
 			}
-			row[i] = d
+			row[j] = d
 		case 'u':
-			return nil, fmt.Errorf("col %q: 'u' (unchanged TOAST) status not supported", local.Name)
+			row[j] = NullDatum
+			unchanged[j] = true
 		default:
-			return nil, fmt.Errorf("col %q: unknown status %q", local.Name, col.Status)
+			return nil, nil, nil, fmt.Errorf("col %q: unknown status %q", local.Name, col.Status)
 		}
 	}
-	return row, nil
+	return row, unchanged, missing, nil
 }
 
 // parsePgoutputText converts upstream's canonical text format

@@ -3,6 +3,7 @@ package executor
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -53,6 +54,327 @@ func EncodeRow(cols []catalog.Column, row Row) ([]byte, error) {
 	}
 	return out, nil
 }
+
+// EncodeRowPG encodes a row in PG-native physical tuple format
+// (M0105-0010). Used for catalog pages that PG must read directly,
+// such as pg_authid. The format mirrors PostgreSQL's heap tuple
+// layout: aligned per-type values in little-endian.
+//
+// The returned bytes are the column-data area only — the null bitmap,
+// when needed, must be computed separately via NullBitmapPG and stored
+// in the tuple header via storage.NewHeapTupleWithNulls. PG stores the
+// bitmap between the fixed header and the t_hoff-aligned data region,
+// not inline with the data.
+//
+// Most goopg code should continue using EncodeRow (goopg-internal
+// format) for backward compatibility.
+func EncodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
+	if len(cols) != len(row) {
+		return nil, fmt.Errorf("EncodeRowPG: %d cols vs %d datums", len(cols), len(row))
+	}
+	return encodeRowPG(cols, row)
+}
+
+// NullBitmapPG returns the PG-convention null bitmap for the row, or
+// nil when the row has no NULL columns. The convention matches PG's
+// heap_fill_tuple: bit i is set when column i is NOT NULL, cleared
+// when column i is NULL. Bit numbering is little-endian within each
+// byte (bit 0 = first attribute in the byte). Callers stamp the result
+// into the tuple header via storage.NewHeapTupleWithNulls and the
+// resulting HEAP_HASNULL flag.
+func NullBitmapPG(row Row) []byte {
+	hasNull := false
+	for _, d := range row {
+		if d.IsNull() {
+			hasNull = true
+			break
+		}
+	}
+	if !hasNull {
+		return nil
+	}
+	bmLen := (len(row) + 7) / 8
+	bm := make([]byte, bmLen)
+	for i, d := range row {
+		if !d.IsNull() {
+			bm[i/8] |= 1 << (i % 8)
+		}
+	}
+	return bm
+}
+
+// encodeRowPG encodes a row's column-data area in PG-native physical
+// tuple format. NULL columns are skipped (they consume no data bytes
+// in PG's heap tuple); see NullBitmapPG for the null bitmap that must
+// accompany the result whenever the row contains NULL.
+func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
+	out := make([]byte, 0, 256)
+	off := 0
+	for i, c := range cols {
+		d := row[i]
+		if d.IsNull() {
+			continue
+		}
+		if d.Kind == KindToastPointer {
+			off = alignPhysicalPGOffset(off, 4)
+			for len(out) < off+12 {
+				out = append(out, 0)
+			}
+			copy(out[off:off+12], d.BytesValue())
+			off += 12
+			continue
+		}
+		align := physicalPGTypeAlign(c.Type)
+		off = alignPhysicalPGOffset(off, align)
+		buf, err := encodeValuePG(c.Type, d)
+		if err != nil {
+			return nil, err
+		}
+		for len(out) < off+len(buf) {
+			out = append(out, 0)
+		}
+		copy(out[off:off+len(buf)], buf)
+		off += len(buf)
+	}
+	return out, nil
+}
+
+// encodeValuePG encodes a single datum in PG-native format.
+func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
+	switch strings.ToLower(t.Name) {
+	case "bool", "boolean":
+		if d.Kind != KindBool {
+			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)
+		}
+		if d.BoolValue() {
+			return []byte{1}, nil
+		}
+		return []byte{0}, nil
+	case "int2", "smallint":
+		if d.Kind != KindInt {
+			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		}
+		v := int16(d.Int)
+		var buf [2]byte
+		binary.LittleEndian.PutUint16(buf[:], uint16(v))
+		return buf[:], nil
+	case "int4", "integer", "int", "serial":
+		if d.Kind != KindInt {
+			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		}
+		v := int32(d.Int)
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], uint32(v))
+		return buf[:], nil
+	case "int8", "bigint", "bigserial":
+		if d.Kind != KindInt {
+			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(d.Int))
+		return buf[:], nil
+	case "oid", "regproc":
+		if d.Kind != KindInt {
+			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
+		}
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], uint32(d.Int))
+		return buf[:], nil
+	case "timestamp", "timestamptz":
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		t := d.TimeValue()
+		// PG epoch: 2000-01-01 UTC, in microseconds
+		// goopg stores UnixNano internally; we encode PG-compatible
+		// microseconds since PG epoch.
+		micros := t.UnixMicro() - pgEpochUnixMicros
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(micros))
+		return buf[:], nil
+	case "date":
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		// PG date: days since 2000-01-01 (Julian-style)
+		t := d.TimeValue()
+		micros := t.UnixMicro() - pgEpochUnixMicros
+		days := int32(micros / (24 * 3600 * 1000000))
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], uint32(days))
+		return buf[:], nil
+	case "name":
+		// PG NameData: fixed 64 bytes, '\0' padded
+		s := d.StringValue()
+		buf := make([]byte, 64)
+		copy(buf, s)
+		return buf, nil
+	case "char":
+		// PG "char" type: single byte
+		if d.Kind == KindString || d.Kind == KindStringArena {
+			s := d.StringValue()
+			if len(s) > 0 {
+				return []byte{s[0]}, nil
+			}
+			return []byte{0}, nil
+		}
+		if d.Kind == KindInt {
+			return []byte{byte(d.Int)}, nil
+		}
+		return nil, fmt.Errorf("expected string or int for char, got kind %d", d.Kind)
+	case "float4", "real":
+		// PG float4: 4-byte IEEE 754 little-endian
+		var v float32
+		switch d.Kind {
+		case KindInt:
+			v = float32(d.Int)
+		default:
+			return nil, fmt.Errorf("kind %d cannot encode as float4", d.Kind)
+		}
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], math.Float32bits(v))
+		return buf[:], nil
+	case "float8", "double precision", "double":
+		// PG float8: 8-byte IEEE 754 little-endian
+		var v float64
+		switch d.Kind {
+		case KindInt:
+			v = float64(d.Int)
+		default:
+			return nil, fmt.Errorf("kind %d cannot encode as float8", d.Kind)
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], math.Float64bits(v))
+		return buf[:], nil
+	case "xid", "xid8":
+		// PG TransactionId: 4-byte unsigned LE
+		var v uint32
+		switch d.Kind {
+		case KindInt:
+			v = uint32(d.Int)
+		default:
+			return nil, fmt.Errorf("expected int for xid, got kind %d", d.Kind)
+		}
+		var buf [4]byte
+		binary.LittleEndian.PutUint32(buf[:], v)
+		return buf[:], nil
+	case "aclitem[]", "_aclitem":
+		// PG binary empty ArrayType, elemtype = aclitem (1033).
+		// PG's deconstruct_array asserts on ARR_ELEMTYPE; a text varlena
+		// "{}" is not a valid ArrayType*. Match construct_empty_array.
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
+		return emptyArrayTypeBytes(1033), nil
+	case "text[]", "_text":
+		// PG binary empty ArrayType, elemtype = text (25). M0106-0010
+		// Step 3dk lets callers (initdb pg_proc seed) pass a pre-built
+		// ArrayType blob via KindBytes so non-empty proargnames/proconfig
+		// arrays land on disk in PG-native form. Mirrors the oidvector
+		// passthrough pattern already used by pg_proc.proargtypes.
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
+		return emptyArrayTypeBytes(25), nil
+	case "oid[]", "_oid":
+		// Step 3dk: KindBytes passthrough for non-empty oid[] blobs
+		// (e.g. pg_proc.proallargtypes on SRFs).
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
+		return emptyArrayTypeBytes(26), nil
+	case "int2[]", "_int2":
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
+		return emptyArrayTypeBytes(21), nil
+	case "char[]", "_char":
+		// PG binary empty ArrayType, elemtype = char (18).
+		// Used for pg_proc.proargmodes when no per-arg modes are set.
+		// Step 3dk: KindBytes passthrough for non-empty char[] blobs
+		// (e.g. pg_proc.proargmodes on SRFs with OUT args).
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
+		return emptyArrayTypeBytes(18), nil
+	case "oidvector":
+		// oidvector is a fixed-shape varlena ArrayType: 1-D, lbound=0,
+		// elemtype=OID(26). The caller (initdb) pre-encodes the entire
+		// blob via oidVectorBytes() and passes it through as KindBytes
+		// so this codec only needs to splice the pre-built buffer.
+		if d.Kind != KindBytes {
+			return nil, fmt.Errorf("expected bytes for oidvector, got kind %d", d.Kind)
+		}
+		return d.BytesValue(), nil
+	case "int2vector":
+		// int2vector mirrors oidvector but with elemtype=INT2(21) and
+		// 2-byte payload elements. The caller (initdb) pre-encodes the
+		// blob via int2VectorBytes() and passes KindBytes through here.
+		// Used by pg_index.indkey and pg_index.indoption.
+		if d.Kind != KindBytes {
+			return nil, fmt.Errorf("expected bytes for int2vector, got kind %d", d.Kind)
+		}
+		return d.BytesValue(), nil
+	case "pg_node_tree":
+		// KindBytes passthrough: pre-encoded varlena bytes (e.g. PGLZ-compressed
+		// varlena produced by pglzVarlenaDatum in initdb bootstrap).
+		if d.Kind == KindBytes || d.Kind == KindBytesArena {
+			return d.BytesValue(), nil
+		}
+		// pg_node_tree is varlena-text; PG only reads it conditionally
+		// (e.g. relpartbound when relispartition=true). Empty varlena.
+		s := d.StringValue()
+		return varlenaTextBytes(s), nil
+	default:
+		// text, varchar, char, bpchar, unknown, numeric, etc.
+		// Use PG varlena format (LE): 1-byte header for short values,
+		// 4-byte header for longer ones.
+		return varlenaTextBytes(d.StringValue()), nil
+	}
+}
+
+// emptyArrayTypeBytes returns the 16-byte PG-native serialization of
+// `construct_empty_array(elemType)`: a 4-byte uncompressed varlena
+// header containing total size 16, then ndim=0, dataoffset=0,
+// elemtype=elemType. Required so that PG's deconstruct_array does not
+// fail its ARR_ELEMTYPE assertion when reading nailed pg_class
+// rows where relacl/reloptions are conceptually empty.
+func emptyArrayTypeBytes(elemType uint32) []byte {
+	var buf [16]byte
+	// PG SET_VARSIZE (uncompressed, LE machine): low 2 bits = 00,
+	// total size in upper 30 bits.
+	binary.LittleEndian.PutUint32(buf[0:4], 16<<2)
+	// ndim = 0, dataoffset = 0
+	// (already zero-initialised)
+	binary.LittleEndian.PutUint32(buf[12:16], elemType)
+	return buf[:]
+}
+
+// varlenaTextBytes returns a PG-native varlena serialisation of the
+// given text payload using the 1-byte header for short values and the
+// 4-byte header otherwise. PG's SET_VARSIZE_1B encodes the TOTAL size
+// (data+header), not just the data length; bit 0 = 1 marks the 1-byte
+// form (and the body shifts by one).
+func varlenaTextBytes(s string) []byte {
+	total := len(s) + 1 // data + 1-byte header
+	if total <= 127 {   // 1-byte header: 7 bits for size (max 127)
+		buf := make([]byte, total)
+		buf[0] = byte(total<<1) | 1
+		copy(buf[1:], s)
+		return buf
+	}
+	// 4-byte header (LE): low 2 bits = 00 (uncompressed), total size
+	// in upper 30 bits.
+	total = len(s) + 4
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	copy(buf[4:], s)
+	return buf
+}
+
+// pgEpochUnixMicros is 2000-01-01 UTC in Unix microseconds (used by
+// the PG timestamp encoding).
+var pgEpochUnixMicros = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
 
 // DecodeRow inverts EncodeRow.
 func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
@@ -182,14 +504,14 @@ func decodeValueSize(t catalog.Type, data []byte) (int, error) {
 			return 0, fmt.Errorf("truncated int2")
 		}
 		return 2, nil
-	case "int4", "integer", "int":
+	case "int4", "integer", "int", "serial":
 		if len(data) < 4 {
-			return 0, fmt.Errorf("truncated int4")
+			return 0, fmt.Errorf("truncated int4/serial")
 		}
 		return 4, nil
-	case "int8", "bigint":
+	case "int8", "bigint", "bigserial":
 		if len(data) < 8 {
-			return 0, fmt.Errorf("truncated int8")
+			return 0, fmt.Errorf("truncated int8/bigserial")
 		}
 		return 8, nil
 	case "bool", "boolean":
@@ -255,6 +577,18 @@ func DecodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Aren
 }
 
 func decodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
+	// Try goopg legacy format first (backward compatible).
+	// Fall back to PG-native physical format for M0105-0010 encoded data.
+	if err := decodeGoopgRowIntoArena(dst, cols, data, arena); err == nil {
+		return nil
+	} else if err := decodePhysicalPGRowIntoArena(dst, cols, data, arena); err == nil {
+		return nil
+	} else {
+		return err
+	}
+}
+
+func decodeGoopgRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
 	off := 0
 	for i, c := range cols {
 		if off >= len(data) {
@@ -297,6 +631,188 @@ func decodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Aren
 		off += n
 	}
 	return nil
+}
+
+func decodePhysicalPGRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
+	off := 0
+	for i, c := range cols {
+		off = alignPhysicalPGOffset(off, physicalPGTypeAlign(c.Type))
+		if off > len(data) {
+			return fmt.Errorf("DecodePhysicalPGRow: %s: truncated at offset %d", c.Name, off)
+		}
+		v, n, err := decodePhysicalPGValueArena(c.Type, data[off:], arena)
+		if err != nil {
+			return fmt.Errorf("DecodePhysicalPGRow: %s: %w", c.Name, err)
+		}
+		dst[i] = v
+		off += n
+	}
+	for _, b := range data[off:] {
+		if b != 0 {
+			return fmt.Errorf("DecodePhysicalPGRow: trailing bytes")
+		}
+	}
+	return nil
+}
+
+func alignPhysicalPGOffset(off, align int) int {
+	if align <= 1 {
+		return off
+	}
+	mask := align - 1
+	return (off + mask) &^ mask
+}
+
+func physicalPGTypeAlign(t catalog.Type) int {
+	switch strings.ToLower(t.Name) {
+	case "bool", "boolean", "char":
+		return 1
+	case "int2", "smallint":
+		return 2
+	case "int4", "integer", "int", "serial", "oid", "regproc", "float4", "real", "date", "xid":
+		return 4
+	case "int8", "bigint", "bigserial", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz":
+		return 8
+	case "name":
+		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
+	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "anyarray", "pg_node_tree", "oidvector", "int2vector":
+		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector / int2vector
+	default:
+		return 4
+	}
+}
+
+// pgPhysicalTypeIsVarlena reports whether the PG18 on-disk representation
+// for t uses the varlena (variable-length) layout — i.e. PG's TupleDesc
+// for the catalog stores attlen == -1 for the column. It must agree with
+// the varlena branches of encodeValuePG; the fast-path attcacheoff
+// walker in PG18 nocachegetattr (heaptuple.c:642 — `Assert(j > attnum)`)
+// will trip if HEAP_HASVARWIDTH is unset and any column on the
+// fixed-prefix path turns out to be varlena per the TupleDesc. M0106-0010
+// batched-49.
+func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
+	switch strings.ToLower(t.Name) {
+	case "bool", "boolean", "char",
+		"int2", "smallint",
+		"int4", "integer", "int", "serial",
+		"int8", "bigint", "bigserial",
+		"oid", "regproc",
+		"timestamp", "timestamptz", "date", "time", "timetz",
+		"name",
+		"float4", "real",
+		"float8", "double precision", "double",
+		"xid", "xid8":
+		return false
+	default:
+		// text, varchar, bpchar, numeric, unknown, and all varlena
+		// arrays / oidvector / int2vector / pg_node_tree fall through
+		// to varlena. Mirrors the default branch of encodeValuePG.
+		return true
+	}
+}
+
+// pgRowHasVarWidth reports whether row, encoded with cols via
+// EncodeRowPG, contains at least one non-null varlena value. Used to
+// drive the HEAP_HASVARWIDTH bit on heap tuples written in the
+// PG18-canonical layout. Mirrors PG's heap_fill_tuple which sets the
+// flag only for non-null varlena values
+// (postgres/src/backend/access/common/heaptuple.c:326). M0106-0010
+// batched-49.
+func pgRowHasVarWidth(cols []catalog.Column, row Row) bool {
+	n := len(cols)
+	if len(row) < n {
+		n = len(row)
+	}
+	for i := 0; i < n; i++ {
+		d := row[i]
+		if d.IsNull() {
+			continue
+		}
+		if d.Kind == KindToastPointer {
+			return true
+		}
+		if pgPhysicalTypeIsVarlena(cols[i].Type) {
+			return true
+		}
+	}
+	return false
+}
+
+func decodePhysicalPGValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, error) {
+	switch strings.ToLower(t.Name) {
+	case "bool", "boolean":
+		if len(data) < 1 {
+			return Datum{}, 0, fmt.Errorf("truncated bool")
+		}
+		return NewBoolDatum(data[0] != 0), 1, nil
+	case "int2", "smallint":
+		if len(data) < 2 {
+			return Datum{}, 0, fmt.Errorf("truncated int2")
+		}
+		return NewIntDatum(int64(int16(binary.LittleEndian.Uint16(data[:2])))), 2, nil
+	case "int4", "integer", "int", "serial":
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated int4")
+		}
+		return NewIntDatum(int64(int32(binary.LittleEndian.Uint32(data[:4])))), 4, nil
+	case "oid":
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated oid")
+		}
+		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
+	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown":
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, err
+		}
+		if arena != nil {
+			buf, offset := arena.Allocate(len(payload))
+			copy(buf, payload)
+			return newStringArenaDatum(arena, offset, len(payload)), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
+	case "bytea":
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, err
+		}
+		if arena != nil {
+			buf, offset := arena.Allocate(len(payload))
+			copy(buf, payload)
+			return newBytesArenaDatum(arena, offset, len(payload)), n, nil
+		}
+		return NewBytesDatum(append([]byte(nil), payload...)), n, nil
+	default:
+		return Datum{}, 0, fmt.Errorf("unsupported PostgreSQL physical type %q", t.Name)
+	}
+}
+
+func decodePhysicalPGVarlena(data []byte) ([]byte, int, error) {
+	if len(data) == 0 {
+		return nil, 0, fmt.Errorf("truncated varlena")
+	}
+	header := data[0]
+	if header&0x01 == 0x01 {
+		if header == 0x01 {
+			return nil, 0, fmt.Errorf("external varlena not supported")
+		}
+		total := int(header >> 1)
+		if total < 1 || total > len(data) {
+			return nil, 0, fmt.Errorf("truncated short varlena")
+		}
+		return data[1:total], total, nil
+	}
+	if len(data) < 4 {
+		return nil, 0, fmt.Errorf("truncated 4-byte varlena header")
+	}
+	if header&0x03 == 0x02 {
+		return nil, 0, fmt.Errorf("compressed varlena not supported")
+	}
+	total := int(binary.LittleEndian.Uint32(data[:4]) >> 2)
+	if total < 4 || total > len(data) {
+		return nil, 0, fmt.Errorf("truncated 4-byte varlena")
+	}
+	return data[4:total], total, nil
 }
 
 // parseIntegerInput parses a string as an integer supporting:
@@ -696,6 +1212,7 @@ func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
 //   - Standard: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars)
 //   - Braces:   {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx} (38 chars)
 //   - No-hyphen: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx (32 hex chars)
+//
 // M0097-0003.
 func isValidUUIDStr(s string) bool {
 	if len(s) == 38 && s[0] == '{' && s[37] == '}' {

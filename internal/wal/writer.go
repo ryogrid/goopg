@@ -18,7 +18,7 @@ import (
 type groupFlushReq struct {
 	lsn  uint64
 	done chan struct{} // closed by writer goroutine when flush is complete
-	err  error        // set before done is closed
+	err  error         // set before done is closed
 }
 
 // flushGroup holds the shared queue and signal channel for WAL group
@@ -211,6 +211,7 @@ type opKind int
 
 const (
 	opAppend opKind = iota
+	opAppendRaw
 	opFlush
 	opRecycle
 	opClose
@@ -532,6 +533,31 @@ func (w *Writer) WrittenLSN() uint64 {
 	return w.writeLSNAtomic.Load()
 }
 
+// DrainedLSN returns the last byte position already written into segment
+// files. Bytes between DrainedLSN and WrittenLSN may still live only in the
+// in-memory WAL buffer.
+func (w *Writer) DrainedLSN() uint64 {
+	if st := w.stateRef; st != nil {
+		st.appendMu.Lock()
+		defer st.appendMu.Unlock()
+		return st.drainedLSN
+	}
+	return w.WrittenLSN()
+}
+
+func (w *Writer) readBufferedAt(pos int64, out []byte) int {
+	if len(out) == 0 {
+		return 0
+	}
+	st := w.stateRef
+	if st == nil || st.walBuf == nil {
+		return 0
+	}
+	st.appendMu.Lock()
+	defer st.appendMu.Unlock()
+	return st.walBuf.readAt(pos, out)
+}
+
 // Subscribe registers ch to receive a non-blocking wake-up after
 // every successful Append. Caller is expected to use a buffered
 // channel of capacity ≥ 1 — the Writer drops the wake-up if the
@@ -603,6 +629,26 @@ func (w *Writer) Append(payload []byte) (uint64, uint64, error) {
 	buf := make([]byte, len(payload))
 	copy(buf, payload)
 	if err := w.send(op{kind: opAppend, payload: buf, resp: resp}); err != nil {
+		return 0, 0, err
+	}
+	r := <-resp
+	return r.startLSN, r.endLSN, r.err
+}
+
+// AppendRaw writes an already-encoded WAL byte stream verbatim.
+//
+// Unlike Append, this does not wrap or re-encode the input as a new
+// record. Physical walreceiver uses it to persist PostgreSQL WAL bytes
+// exactly as streamed by the primary so the local iterator sees the
+// original page headers and record framing.
+func (w *Writer) AppendRaw(stream []byte) (uint64, uint64, error) {
+	if len(stream) == 0 {
+		return 0, 0, ErrEmptyPayload
+	}
+	resp := make(chan result, 1)
+	buf := make([]byte, len(stream))
+	copy(buf, stream)
+	if err := w.send(op{kind: opAppendRaw, payload: buf, resp: resp}); err != nil {
 		return 0, 0, err
 	}
 	r := <-resp
@@ -712,20 +758,20 @@ func loadState(cfg Config) (*state, error) {
 		return nil, err
 	}
 	st := &state{
-		cfg:        cfg,
-		writePos:   writePos,
-		writeLSN:   uint64(writePos),
-		flushedLSN: uint64(writePos),
-		drainedLSN: uint64(writePos),
-		files:      make(map[uint64]*os.File),
-		dirty:      make(map[uint64]bool),
-		aio:        cfg.AIO,
-		memRing:    NewMemRing(cfg.SenderMemoryBuffer),
-		walBuf:     newWALBuffer(cfg.WALBuffers),
+		cfg:         cfg,
+		writePos:    writePos,
+		writeLSN:    uint64(writePos),
+		flushedLSN:  uint64(writePos),
+		drainedLSN:  uint64(writePos),
+		files:       make(map[uint64]*os.File),
+		dirty:       make(map[uint64]bool),
+		aio:         cfg.AIO,
+		memRing:     NewMemRing(cfg.SenderMemoryBuffer),
+		walBuf:      newWALBuffer(cfg.WALBuffers),
 		pageHeaders: cfg.PageHeaders,
-		prevRecPtr: prevRecPtr,
-		sysID:      cfg.SystemID,
-		tli:        cfg.TimelineID,
+		prevRecPtr:  prevRecPtr,
+		sysID:       cfg.SystemID,
+		tli:         cfg.TimelineID,
 	}
 	if st.walBuf != nil {
 		st.walBuf.reset(writePos)
@@ -752,8 +798,16 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 		if err != nil {
 			return 0, 0, fmt.Errorf("wal: stat %s: %w", e.Name(), err)
 		}
-		if st.Size() < 0 || st.Size() > segSize {
+		if st.Size() < 0 {
 			return 0, 0, fmt.Errorf("wal: invalid segment size %d for %s", st.Size(), e.Name())
+		}
+		// Skip segments whose size doesn't match the configured segment size.
+		// This handles the case where goopg init always creates a 16MB bootstrap
+		// segment but the server may be configured with a different segment size
+		// (e.g. in tests). Pre-fix, parseSegmentName silently skipped PG-format
+		// names; now we skip explicitly on size mismatch. M0106-0010 batched-35.
+		if st.Size() > segSize {
+			continue
 		}
 		segSizes[segNo] = st.Size()
 	}
@@ -911,7 +965,8 @@ func scanLastSegmentEnd(walDir string, segNo uint64, segSize int64, cfgSegSize i
 			// consume a partially-written record.
 			return int64(off), lastRecPtr, nil
 		}
-		if _, n, err := decodeRecordXLog(fullBytes); err != nil || n != len(fullBytes) {
+		decoded, err := decodeRecordXLogDetailed(fullBytes)
+		if err != nil || decoded.Consumed != len(fullBytes) {
 			// Corrupt record in the last segment —
 			// treat as EOS (unclean shutdown).
 			return int64(off), lastRecPtr, nil
@@ -950,6 +1005,12 @@ func (s *state) loop(ops <-chan op, done chan<- struct{}) {
 			switch req.kind {
 			case opAppend:
 				start, end, err := s.append(req.payload)
+				req.resp <- result{startLSN: start, endLSN: end, err: err}
+				if err == nil && s.onAppend != nil {
+					s.onAppend()
+				}
+			case opAppendRaw:
+				start, end, err := s.appendRaw(req.payload)
 				req.resp <- result{startLSN: start, endLSN: end, err: err}
 				if err == nil && s.onAppend != nil {
 					s.onAppend()
@@ -1069,6 +1130,12 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 	if s.walBuf == nil || !s.walBuf.canHold(len(record)) {
 		// Re-encode under appendMu so writePos is consistent with stream.
 		s.appendMu.Lock()
+		if s.walBuf != nil && s.walBuf.resident() > 0 {
+			if err := s.drainBufferBytes(s.walBuf.resident(), drainReasonOverflow); err != nil {
+				s.appendMu.Unlock()
+				return 0, 0, err
+			}
+		}
 		writePos := s.writePos // authoritative read
 		stream := record
 		leading := 0
@@ -1080,10 +1147,6 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 		// callers write their records after this large record.
 		s.writePos = writePos + int64(len(stream))
 		end := uint64(s.writePos)
-		s.writeLSN = end // optimistic; rolled back below on I/O error
-		if s.writeLSNMirror != nil {
-			s.writeLSNMirror.Store(end)
-		}
 		s.appendMu.Unlock()
 
 		if err := s.writeAt(writePos, stream); err != nil {
@@ -1093,18 +1156,21 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 			s.appendMu.Lock()
 			if s.writePos == writePos+int64(len(stream)) {
 				s.writePos = writePos
-				s.writeLSN = uint64(writePos)
-				if s.writeLSNMirror != nil {
-					s.writeLSNMirror.Store(s.writeLSN)
-				}
 			}
 			s.appendMu.Unlock()
 			return 0, 0, err
 		}
 
 		s.appendMu.Lock()
+		if s.walBuf != nil {
+			s.walBuf.reset(int64(end))
+		}
 		s.memRing.Append(writePos, stream)
 		s.drainedLSN = end
+		s.writeLSN = end
+		if s.writeLSNMirror != nil {
+			s.writeLSNMirror.Store(end)
+		}
 		if s.pageHeaders {
 			s.prevRecPtr = start - 1
 		}
@@ -1148,7 +1214,74 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 		s.writeLSNMirror.Store(end)
 	}
 	if s.pageHeaders {
-		s.prevRecPtr = start
+		// prevRecPtr tracks the 0-based PostgreSQL RecPtr of this record's
+		// start so the NEXT record's xl_prev field is filled correctly.
+		// start is 1-based (goopg convention), so RecPtr = start - 1.
+		s.prevRecPtr = start - 1
+	}
+	return start, end, nil
+}
+
+func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
+	if len(stream) == 0 {
+		return 0, 0, ErrEmptyPayload
+	}
+
+	if s.walBuf == nil || !s.walBuf.canHold(len(stream)) {
+		s.appendMu.Lock()
+		if s.walBuf != nil && s.walBuf.resident() > 0 {
+			if err := s.drainBufferBytes(s.walBuf.resident(), drainReasonOverflow); err != nil {
+				s.appendMu.Unlock()
+				return 0, 0, err
+			}
+		}
+		writePos := s.writePos
+		start := uint64(writePos) + 1
+		s.writePos = writePos + int64(len(stream))
+		end := uint64(s.writePos)
+		s.appendMu.Unlock()
+
+		if err := s.writeAt(writePos, stream); err != nil {
+			s.appendMu.Lock()
+			if s.writePos == writePos+int64(len(stream)) {
+				s.writePos = writePos
+			}
+			s.appendMu.Unlock()
+			return 0, 0, err
+		}
+
+		s.appendMu.Lock()
+		if s.walBuf != nil {
+			s.walBuf.reset(int64(end))
+		}
+		s.memRing.Append(writePos, stream)
+		s.drainedLSN = end
+		s.writeLSN = end
+		if s.writeLSNMirror != nil {
+			s.writeLSNMirror.Store(end)
+		}
+		s.appendMu.Unlock()
+		return start, end, nil
+	}
+
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+
+	writePos := s.writePos
+	start := uint64(writePos) + 1
+	need := int64(len(stream)) - s.walBuf.free()
+	if need > 0 {
+		if err := s.drainBufferBytes(need, drainReasonOverflow); err != nil {
+			return 0, 0, err
+		}
+	}
+	s.walBuf.append(stream)
+	s.memRing.Append(writePos, stream)
+	s.writePos = writePos + int64(len(stream))
+	end := uint64(s.writePos)
+	s.writeLSN = end
+	if s.writeLSNMirror != nil {
+		s.writeLSNMirror.Store(end)
 	}
 	return start, end, nil
 }
@@ -1201,7 +1334,10 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		s.writeLSNMirror.Store(end)
 	}
 	if s.pageHeaders {
-		s.prevRecPtr = start
+		// prevRecPtr tracks the 0-based PostgreSQL RecPtr of this record's
+		// start so the NEXT record's xl_prev field is filled correctly.
+		// start is 1-based (goopg convention), so RecPtr = start - 1.
+		s.prevRecPtr = start - 1
 	}
 	if s.onAppend != nil {
 		s.onAppend()

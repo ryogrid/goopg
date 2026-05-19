@@ -26,13 +26,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/server"
+	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -204,7 +205,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		logger.Info("GOMEMLIMIT applied", "bytes", cur)
 	}
 
-	// Start pprof HTTP endpoint on 127.0.0.1:6060 for CPU/heap profiling.
+	// Start pprof HTTP endpoint on 127.0.0.1:6060 (default) for CPU/heap profiling.
+	// Override the bind address with GOOPG_PPROF_ADDR (e.g. "127.0.0.1:6160")
+	// when running side-by-side with another goopg instance.
 	// Available endpoints:
 	//   /debug/pprof/profile?seconds=30  — CPU profile (download with go tool pprof)
 	//   /debug/pprof/heap               — heap profile
@@ -213,6 +216,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	//   /debug/pprof/block              — blocking events  (needs GOOPG_BLOCK_PROFILE_RATE>0)
 	go func() {
 		pprofAddr := "127.0.0.1:6060"
+		if v := os.Getenv("GOOPG_PPROF_ADDR"); v != "" {
+			pprofAddr = v
+		}
 		ln, err := net.Listen("tcp", pprofAddr)
 		if err != nil {
 			logger.Debug("pprof listener not available", "addr", pprofAddr, "err", err)
@@ -388,8 +394,28 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.VM = rt.VM
 		cfg.Checkpointer = rt.Checkpointer
 		cfg.Slots = rt.Slots
+		// M0102-0007: report the cluster's real system_identifier in
+		// IDENTIFY_SYSTEM so a PG standby's walreceiver can verify
+		// the primary's identity against its own pg_control.
+		if sysID, err := initdb.LoadOrCreateSystemID(*dataDir); err == nil {
+			cfg.SystemID = fmt.Sprintf("%d", sysID)
+		}
+		cfg.SyncRep = rt.SyncRep
+		// M0102-0005: prime the SyncRep rule from the GUC value so the
+		// first commit on a freshly-started cluster sees the configured
+		// synchronous_standby_names. A parse error is logged but does not
+		// fail startup — upstream-parity: an invalid value disables sync
+		// replication rather than refusing to come up.
+		if names := stringGUC(registry, "synchronous_standby_names", ""); names != "" {
+			if err := rt.SyncRep.SetStandbyNames(names); err != nil {
+				logger.Warn("invalid synchronous_standby_names; disabling sync replication", "err", err)
+			} else {
+				logger.Info("sync replication configured", "synchronous_standby_names", names)
+			}
+		}
 		cfg.WalSenders = rt.WalSenders
 		cfg.WAL = rt.WAL
+		cfg.LogCanonical = rt.LogCanonical
 		cfg.Activity = rt.Activity
 		cfg.PubSub = rt.PubSub
 		cfg.WALDirPath = filepath.Join(rt.DataDir, "pg_wal")
@@ -495,9 +521,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			if act := rt.Activity; act != nil {
 				cpPID := "cp-0"
 				act.Register(&activity.Backend{
-					PID:         cpPID,
-					BackendType: "checkpointer",
-					State:       "active",
+					PID:          cpPID,
+					BackendType:  "checkpointer",
+					State:        "active",
 					BackendStart: time.Now().UTC().Format(time.RFC3339Nano),
 				})
 				activity.RegisterCurrentGoroutine(act, cpPID)
@@ -528,6 +554,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	if rt != nil && rt.Standby {
 		sc = startStandby(ctx, rt, registry, logger)
 		cfg.Promote = boundPromoteToServer(sc)
+		cfg.IsStandby = func() bool { return sc.rt.Standby }
 	}
 
 	srv := server.New(cfg)
@@ -562,19 +589,39 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 // supplied context is cancelled (clean shutdown) or the writer
 // closes (process tear-down).
 func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Runtime, logger *slog.Logger) *wal.StreamReplayer {
-	baseLSN := rt.WAL.WrittenLSN()
+	// WrittenLSN() is the LSN of the last byte already written. The
+	// iterator's startLSN argument is the LSN of the next record's
+	// first byte (= writer's "tail" position). Anchoring at WrittenLSN
+	// itself would try to read a record header starting at the last
+	// written byte and fail with "bad xlog total length 0".
+	writtenLSN := rt.WAL.WrittenLSN()
+	iterStartLSN := writtenLSN + 1
 	walDir := filepath.Join(rt.DataDir, "pg_wal")
-	sr := wal.NewStreamReplayer(rt.StorageMgr, baseLSN)
+	sr := wal.NewStreamReplayer(rt.StorageMgr, writtenLSN)
+	// Wire MVCC visibility for hot-standby reads: when the primary
+	// commits a transaction, advance the standby's nextXID past the
+	// committed XID so snapshots taken on the standby see replayed
+	// tuples as committed (xmin < snap.Xmax). Without this hook the
+	// snapshot's Xmax equals the committed XID, making every replayed
+	// tuple invisible ("xid >= Xmax → future").
+	txnMgr := rt.TxnMgr
+	sr.SetXactReplayHook(func(xid storage.TransactionID, committed bool) {
+		if committed {
+			txnMgr.ReplayXactCommit(xid)
+		} else {
+			txnMgr.ReplayXactAbort(xid)
+		}
+	})
 	go func() {
 		defer close(done)
-		iter, err := wal.NewRecordIterator(rt.WAL, walDir, 0, baseLSN)
+		iter, err := wal.NewRecordIterator(rt.WAL, walDir, 0, iterStartLSN)
 		if err != nil {
 			logger.Error("standby replay: iterator init failed", "err", err)
 			return
 		}
 		defer func() { _ = iter.Close() }()
 		logger.Info("standby mode: starting continuous WAL replay",
-			"start_lsn", baseLSN)
+			"start_lsn", iterStartLSN)
 		if err := sr.Run(ctx, iter); err != nil {
 			logger.Error("standby replay: stopped on error",
 				"event", wal.EventStandbyReplayError,
@@ -599,7 +646,7 @@ func startStandbyReplayer(ctx context.Context, done chan struct{}, rt *initdb.Ru
 // is logged and the function returns without spawning — useful for
 // integration tests that exercise the standby-mode boot path
 // without an actual primary.
-func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtime, registry *config.Registry, logger *slog.Logger) {
+func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtime, registry *config.Registry, logger *slog.Logger, applyLSNFunc func() uint64) {
 	conninfo := ""
 	slotName := ""
 	statusInterval := 10 * time.Second
@@ -616,11 +663,14 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			}
 		}
 	}
-	addr := parsePrimaryConninfo(conninfo)
+	addr, appName, user := parsePrimaryConninfoFull(conninfo)
 	if addr == "" {
 		logger.Info("standby mode: primary_conninfo empty or missing host:port; walreceiver not started")
 		close(done)
 		return
+	}
+	if user == "" {
+		user = "postgres"
 	}
 	logger.Info("standby mode: starting walreceiver",
 		"primary", addr, "slot", slotName, "status_interval", statusInterval)
@@ -633,16 +683,23 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			if ctx.Err() != nil {
 				return
 			}
+			// StartLSN is the LSN of the next record's first byte —
+			// i.e., WrittenLSN+1 (one past the last byte already in
+			// our local WAL). Sending WrittenLSN itself would make the
+			// primary's iterator anchor inside the last-applied record
+			// and stream garbage.
 			rec, err := server.DialWalReceiver(ctx, server.WalReceiverConfig{
-				PrimaryAddr:    addr,
-				User:           "postgres",
-				SlotName:       slotName,
-				StartLSN:       rt.WAL.WrittenLSN(),
-				WAL:            rt.WAL,
-				StatusInterval: statusInterval,
-				DialTimeout:    10 * time.Second,
-				Receivers:      rt.WalReceivers,
-				Conninfo:       conninfo,
+				PrimaryAddr:     addr,
+				User:            user,
+				SlotName:        slotName,
+				StartLSN:        rt.WAL.WrittenLSN() + 1,
+				WAL:             rt.WAL,
+				StatusInterval:  statusInterval,
+				DialTimeout:     10 * time.Second,
+				Receivers:       rt.WalReceivers,
+				Conninfo:        conninfo,
+				ApplicationName: appName,
+				ApplyLSNFunc:    applyLSNFunc,
 			})
 			if err != nil {
 				logger.Warn("walreceiver dial failed; will retry",
@@ -665,7 +722,7 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			logger.Info("walreceiver connected",
 				"event", wal.EventWalreceiverConnected,
 				"primary", addr, "slot", slotName,
-				"start_lsn", rt.WAL.WrittenLSN())
+				"start_lsn", rt.WAL.WrittenLSN()+1)
 			runErr := rec.Run(ctx)
 			lastApplied := rec.ApplyLSN()
 			_ = rec.Close()
@@ -691,9 +748,20 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 // provided. v0 honours only host + port; user / password / sslmode
 // follow in later loops.
 func parsePrimaryConninfo(conninfo string) string {
+	addr, _, _ := parsePrimaryConninfoFull(conninfo)
+	return addr
+}
+
+// parsePrimaryConninfoFull extracts host:port, application_name, and user
+// override (if any) from a libpq-style `key=value [key=value ...]` conninfo
+// string. host:port defaults port to 5432; missing host yields empty addr.
+// application_name is forwarded to the primary in the startup parameters so
+// SyncRep can match the standby against synchronous_standby_names.
+// M0102-0005.
+func parsePrimaryConninfoFull(conninfo string) (addr, appName, user string) {
 	conninfo = strings.TrimSpace(conninfo)
 	if conninfo == "" {
-		return ""
+		return "", "", ""
 	}
 	host := ""
 	port := "5432"
@@ -709,12 +777,16 @@ func parsePrimaryConninfo(conninfo string) string {
 			host = v
 		case "port":
 			port = v
+		case "application_name":
+			appName = v
+		case "user":
+			user = v
 		}
 	}
 	if host == "" {
-		return ""
+		return "", appName, user
 	}
-	return host + ":" + port
+	return host + ":" + port, appName, user
 }
 
 // boolGUC reads a boolean GUC by name, returning fallback when the

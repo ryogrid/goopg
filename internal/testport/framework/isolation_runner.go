@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 )
 
@@ -18,7 +19,7 @@ const (
 	blockDetectWait = 300 * time.Millisecond
 	// drainWindow is how long we wait for a pending (blocked) step to
 	// unblock after all steps in a permutation have been submitted.
-	drainWindow = 30 * time.Second
+	drainWindow = 5 * time.Second
 )
 
 // stepOutcome is the result of executing one step in a goroutine.
@@ -26,14 +27,18 @@ type stepOutcome struct {
 	rows     [][]string // rows[0] = column names; rows[1:] = data rows
 	colTypes []string   // "numeric" or "text" per column
 	errText  string     // non-empty when execution returned an error
+	notices  []string   // NOTICE messages emitted during execution
+	session  string     // session name for "session: NOTICE:  msg" prefix
 }
 
 // pendingStep tracks a step goroutine that has been submitted but has not yet
 // completed (i.e., is blocked on a lock).
 type pendingStep struct {
-	name  string
-	sql   string
-	outCh chan stepOutcome
+	name    string
+	sql     string
+	session string // which session this step belongs to
+	outCh   chan stepOutcome
+	queue   *sessionNoticeQueue // nil for non-blocking steps; set for blocked steps
 }
 
 // IsolationRunner executes an IsolationSpec against a live database.
@@ -43,8 +48,9 @@ type IsolationRunner struct {
 
 // RunSpec runs all permutations and returns output formatted like isolationtester.
 //
-// Global setup runs once before the first permutation; global teardown runs
-// once after the last. Per-session setup runs at the start of every permutation.
+// Matches PostgreSQL isolationtester.c: global setup and teardown run around
+// EVERY permutation (not just once at the start/end). Per-session setup also
+// runs at the start of every permutation.
 func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (string, error) {
 	db, err := sql.Open("postgres", r.DSN)
 	if err != nil {
@@ -57,24 +63,49 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		nSessions = 1
 	}
 
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Parsed test spec with %d sessions\n", nSessions)
-
-	// Global setup (runs once before all permutations).
-	if spec.SetupSQL != "" {
-		monitor, err := db.Conn(ctx)
-		if err != nil {
-			return "", fmt.Errorf("open monitor conn for setup: %w", err)
+	// Collect all step names referenced by any permutation.
+	usedSteps := make(map[string]bool)
+	for _, perm := range spec.Permutations {
+		for _, sname := range perm {
+			usedSteps[sname] = true
 		}
-		if err := execConn(ctx, monitor, spec.SetupSQL); err != nil {
-			_ = monitor.Close()
-			return "", fmt.Errorf("global setup: %w", err)
-		}
-		_ = monitor.Close()
 	}
 
+	// Print "unused step name: X" for any declared step not in any permutation,
+	// in definition order. Matches PostgreSQL isolationtester.c output. M0100-0005.
+	var sb strings.Builder
+	for _, sname := range spec.StepOrder {
+		if !usedSteps[sname] {
+			fmt.Fprintf(&sb, "unused step name: %s\n", sname)
+		}
+	}
+	fmt.Fprintf(&sb, "Parsed test spec with %d sessions\n", nSessions)
+
 	for i, perm := range spec.Permutations {
+		// Global setup runs before each permutation (mirrors isolationtester.c).
+		if spec.SetupSQL != "" {
+			monitor, err := db.Conn(ctx)
+			if err != nil {
+				return "", fmt.Errorf("open monitor conn for setup: %w", err)
+			}
+			if err := execConn(ctx, monitor, spec.SetupSQL); err != nil {
+				_ = monitor.Close()
+				return "", fmt.Errorf("global setup (permutation %d): %w", i, err)
+			}
+			_ = monitor.Close()
+		}
+
 		out, err := r.runPermutation(ctx, db, spec, perm)
+
+		// Global teardown runs after each permutation (mirrors isolationtester.c).
+		if spec.TeardownSQL != "" {
+			monitor, _ := db.Conn(ctx)
+			if monitor != nil {
+				_ = execConn(ctx, monitor, spec.TeardownSQL)
+				_ = monitor.Close()
+			}
+		}
+
 		if err != nil {
 			sb.WriteString("\n")
 			fmt.Fprintf(&sb, "starting permutation: %s\n", strings.Join(perm, " "))
@@ -85,16 +116,28 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		sb.WriteString(out)
 	}
 
-	// Global teardown (runs once after all permutations).
-	if spec.TeardownSQL != "" {
-		monitor, err := db.Conn(ctx)
-		if err == nil {
-			_ = execConn(ctx, monitor, spec.TeardownSQL)
-			_ = monitor.Close()
-		}
-	}
-
 	return sb.String(), nil
+}
+
+// sessionNoticeQueue is a thread-safe queue of NOTICE messages for one session.
+type sessionNoticeQueue struct {
+	mu      sync.Mutex
+	notices []string
+}
+
+func (q *sessionNoticeQueue) push(msg string) {
+	q.mu.Lock()
+	q.notices = append(q.notices, msg)
+	q.mu.Unlock()
+}
+
+// drain returns and clears all collected notices.
+func (q *sessionNoticeQueue) drain() []string {
+	q.mu.Lock()
+	n := append([]string(nil), q.notices...)
+	q.notices = q.notices[:0]
+	q.mu.Unlock()
+	return n
 }
 
 // runPermutation executes one permutation using fresh session connections.
@@ -104,10 +147,38 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		sessionNames = []string{"s1"}
 	}
 
+	// Build a per-session pq connector with a notice handler so NOTICE messages
+	// emitted during step execution are captured. Uses pq.ConnectorWithNoticeHandler
+	// to attach the handler at DB-open time (works regardless of Go version).
+	sessionQueues := make(map[string]*sessionNoticeQueue, len(sessionNames))
+	sessionDBs := make(map[string]*sql.DB, len(sessionNames))
+	for _, sname := range sessionNames {
+		q := &sessionNoticeQueue{}
+		sessionQueues[sname] = q
+		base, err := pq.NewConnector(r.DSN)
+		if err == nil {
+			withNotice := pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
+				q.push(n.Message)
+			})
+			sessionDBs[sname] = sql.OpenDB(withNotice)
+		} else {
+			// Fallback: use the shared db without notice capture.
+			sessionDBs[sname] = db
+		}
+	}
+	defer func() {
+		for sname, sdb := range sessionDBs {
+			if sdb != db {
+				_ = sdb.Close()
+			}
+			_ = sname
+		}
+	}()
+
 	// Open one dedicated connection per session.
 	conns := make(map[string]*sql.Conn, len(sessionNames))
 	for _, sname := range sessionNames {
-		conn, err := db.Conn(ctx)
+		conn, err := sessionDBs[sname].Conn(ctx)
 		if err != nil {
 			for _, c := range conns {
 				_ = c.Close()
@@ -152,21 +223,67 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			}
 		}
 
+		// PostgreSQL isolationtester.c: if this session has a pending
+		// (blocked) step, wait for it to complete before sending the next
+		// step to the same session. Each session connection can only
+		// process one query at a time; running a second query on a busy
+		// connection would block indefinitely.
+		for i, p := range pending {
+			if p.session == step.Session {
+				select {
+				case o := <-p.outCh:
+					if p.queue != nil {
+						o.notices = p.queue.drain()
+					}
+					writeCompletedStep(&sb, p.name, p.sql, o)
+					pending = append(pending[:i], pending[i+1:]...)
+				case <-time.After(drainWindow):
+					fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
+					pending = append(pending[:i], pending[i+1:]...)
+				}
+				break
+			}
+		}
+
 		outCh := make(chan stepOutcome, 1)
-		go func(c *sql.Conn, sqlText string, ch chan<- stepOutcome) {
-			ch <- execStep(ctx, c, sqlText)
-		}(conn, step.SQL, outCh)
+		q := sessionQueues[step.Session]
+		go func(c *sql.Conn, sqlText, sess string, queue *sessionNoticeQueue, ch chan<- stepOutcome) {
+			ch <- execStepFromQueue(ctx, c, sqlText, sess, queue)
+		}(conn, step.SQL, step.Session, q, outCh)
 
 		select {
 		case outcome := <-outCh:
-			// Flush any pending steps that completed while we were waiting.
-			pending = drainCompleted(&sb, pending)
+			// Drain notices generated during this non-blocking step.
+			if q != nil {
+				outcome.notices = q.drain()
+			}
+			// Print the current step first, then give pending steps a brief
+			// window to complete (matching PostgreSQL isolationtester order:
+			// unblocked waiting steps appear before the next regular step).
 			sb.WriteString(formatStepOutput(step.Name, step.SQL, outcome, false))
+			pending = drainWithTimeout(&sb, pending, 50*time.Millisecond)
 
 		case <-time.After(blockDetectWait):
-			// Step appears blocked; record and continue.
-			fmt.Fprintf(&sb, "step %s: %s <waiting ...>\n", step.Name, flattenSQL(step.SQL))
-			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, outCh: outCh})
+			// Step appears blocked.  Drain notices that arrived before the
+			// row-level wait (e.g. from RAISE NOTICE in PL/pgSQL predicates
+			// evaluated before the blocking point). These must appear BEFORE
+			// the "step name: sql <waiting ...>" line, matching PostgreSQL
+			// isolationtester's output format.
+			if q != nil {
+				for _, notice := range q.drain() {
+					fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", step.Session, notice)
+				}
+			}
+			// Upstream isolationtester echoes step SQL verbatim and appends
+			// the wait marker once, with a single space separator:
+			//   step name: <raw SQL> <waiting ...>
+			// Multi-line SQL keeps the marker on the SQL's final line
+			// (matches insert-conflict-do-update-4 expected output line 11).
+			// Brace-at-EOL specs (insert-conflict-do-update-3) carry a
+			// leading newline in step.SQL, which renders as `step name: \n
+			// <body> <waiting ...>` — same single format.
+			sb.WriteString(formatWaitingStepHeader(step.Name, step.SQL))
+			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh, queue: q})
 		}
 	}
 
@@ -176,14 +293,44 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		pending = pending[1:]
 		select {
 		case outcome := <-p.outCh:
-			fmt.Fprintf(&sb, "step %s: <... completed>\n", p.name)
-			sb.WriteString(formatStepOutput(p.name, p.sql, outcome, true))
+			if p.queue != nil {
+				outcome.notices = p.queue.drain()
+			}
+			writeCompletedStep(&sb, p.name, p.sql, outcome)
 		case <-time.After(drainWindow):
 			fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
 		}
 	}
 
+	// Per-session teardown: run on session connections and include output in
+	// the permutation result (matches PostgreSQL isolationtester.c output format).
+	for _, sname := range sessionNames {
+		if tdSQL, ok := spec.SessionTeardown[sname]; ok && tdSQL != "" {
+			if c, ok2 := conns[sname]; ok2 {
+				out := execConnCapture(ctx, c, tdSQL)
+				sb.WriteString(out)
+			}
+		}
+	}
+
 	return sb.String(), nil
+}
+
+// writeCompletedStep writes a blocked step's completed output: NOTICEs first
+// (matching PostgreSQL isolationtester's ordering for waiting steps), then
+// the "<... completed>" marker, then result rows.
+func writeCompletedStep(sb *strings.Builder, name, sql string, o stepOutcome) {
+	for _, notice := range o.notices {
+		if o.session != "" {
+			fmt.Fprintf(sb, "%s: NOTICE:  %s\n", o.session, notice)
+		}
+	}
+	fmt.Fprintf(sb, "step %s: <... completed>\n", name)
+	sb.WriteString(formatStepOutput(name, sql, stepOutcome{
+		rows:     o.rows,
+		colTypes: o.colTypes,
+		errText:  o.errText,
+	}, true))
 }
 
 // drainCompleted checks each pending step non-blockingly; completed results
@@ -193,8 +340,10 @@ func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
 	for _, p := range pending {
 		select {
 		case o := <-p.outCh:
-			fmt.Fprintf(sb, "step %s: <... completed>\n", p.name)
-			sb.WriteString(formatStepOutput(p.name, p.sql, o, true))
+			if p.queue != nil {
+				o.notices = p.queue.drain()
+			}
+			writeCompletedStep(sb, p.name, p.sql, o)
 		default:
 			remaining = append(remaining, p)
 		}
@@ -202,8 +351,44 @@ func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
 	return remaining
 }
 
+// drainWithTimeout drains pending steps that complete within the given window.
+// After a regular step completes, this lets unblocked waiting steps surface
+// before the next regular step, matching PostgreSQL isolationtester ordering.
+func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Duration) []pendingStep {
+	if len(pending) == 0 {
+		return pending
+	}
+	remaining := pending[:0]
+	for _, p := range pending {
+		select {
+		case o := <-p.outCh:
+			if p.queue != nil {
+				o.notices = p.queue.drain()
+			}
+			writeCompletedStep(sb, p.name, p.sql, o)
+		case <-time.After(window):
+			remaining = append(remaining, p)
+		}
+	}
+	return remaining
+}
+
+// execStepFromQueue executes sqlText on conn and attaches any NOTICE messages
+// collected in queue (populated by the session's connector notice handler).
+func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session string, queue *sessionNoticeQueue) stepOutcome {
+	if queue != nil {
+		queue.drain() // clear any stale notices from previous steps
+	}
+	o := execStep(ctx, conn, sqlText, "")
+	// Notices are drained by the main goroutine so that pre-wait notices
+	// (generated before a row-level wait) and post-wait notices (from EPQ
+	// recheck) can be printed at the correct positions in the output.
+	o.session = session
+	return o
+}
+
 // execStep executes sqlText on conn and returns the result as a stepOutcome.
-func execStep(ctx context.Context, conn *sql.Conn, sqlText string) stepOutcome {
+func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcome {
 	rows, err := conn.QueryContext(ctx, sqlText)
 	if err != nil {
 		return stepOutcome{errText: formatPQError(err)}
@@ -217,10 +402,17 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText string) stepOutcome {
 
 	colTypes, _ := rows.ColumnTypes()
 	numericCols := make([]string, len(cols))
+	boolCols := make([]bool, len(cols))
 	for i := range cols {
 		numericCols[i] = "text"
-		if i < len(colTypes) && isNumericType(colTypes[i].DatabaseTypeName()) {
-			numericCols[i] = "numeric"
+		if i < len(colTypes) {
+			dbType := colTypes[i].DatabaseTypeName()
+			if isNumericType(dbType) {
+				numericCols[i] = "numeric"
+			}
+			if dbType == "BOOL" {
+				boolCols[i] = true
+			}
 		}
 	}
 
@@ -243,6 +435,9 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText string) stepOutcome {
 		for i, v := range vals {
 			if v.Valid {
 				row[i] = v.String
+				if boolCols[i] {
+					row[i] = normalizeBoolWireText(row[i])
+				}
 			}
 		}
 		result.rows = append(result.rows, row)
@@ -255,11 +450,37 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText string) stepOutcome {
 
 // formatStepOutput renders the output for a step.
 // If afterWaiting is true the "step name: SQL" header was already written.
+// formatStepOutput renders the output for a step.
+// If afterWaiting is true the "step name: SQL" header was already written.
+// formatWaitingStepHeader renders the line emitted when a step is detected
+// as blocked, mirroring upstream isolationtester's verbatim echo:
+//
+//	step <name>: <raw SQL> <waiting ...>\n
+//
+// The SQL is appended raw — multi-line SQL keeps the trailing `<waiting ...>`
+// on the same physical line as its final spec-file line (see
+// insert-conflict-do-update-4 expected output line 11).  Brace-at-EOL specs
+// (e.g. insert-conflict-do-update-3) carry a leading newline in `sql`, which
+// renders as `step name: \n<body> <waiting ...>` — same single format.
+func formatWaitingStepHeader(name, sql string) string {
+	return fmt.Sprintf("step %s: %s <waiting ...>\n", name, sql)
+}
+
 func formatStepOutput(name, sqlText string, o stepOutcome, afterWaiting bool) string {
 	var sb strings.Builder
 
 	if !afterWaiting {
-		fmt.Fprintf(&sb, "step %s: %s\n", name, flattenSQL(sqlText))
+		// NOTICEs appear BEFORE the step SQL line (matches PostgreSQL isolationtester).
+		for _, notice := range o.notices {
+			if o.session != "" {
+				fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", o.session, notice)
+			}
+		}
+		// Upstream isolationtester echoes step SQL verbatim after `step
+		// name: `, preserving the raw block content (including any leading
+		// newline introduced by a brace-at-EOL `{` layout, and any
+		// continuation-line indentation).
+		fmt.Fprintf(&sb, "step %s: %s\n", name, sqlText)
 	}
 
 	if o.errText != "" {
@@ -350,6 +571,8 @@ func pqprintFormat(cols []string, data [][]string, colTypes []string) string {
 	} else {
 		fmt.Fprintf(&sb, "(%d rows)\n", nRows)
 	}
+	// PostgreSQL's PQprint adds a trailing blank line after result sets.
+	sb.WriteString("\n")
 
 	return sb.String()
 }
@@ -363,10 +586,40 @@ func execConn(ctx context.Context, conn *sql.Conn, sqlText string) error {
 	return rows.Close()
 }
 
+// execConnCapture runs sqlText and returns the formatted result set (without a
+// step header). Used for per-session teardown which appears as raw output in
+// PostgreSQL isolationtester's permutation output.
+func execConnCapture(ctx context.Context, conn *sql.Conn, sqlText string) string {
+	outcome := execStep(ctx, conn, sqlText, "")
+	if outcome.errText != "" {
+		return outcome.errText + "\n"
+	}
+	if len(outcome.rows) == 0 {
+		return ""
+	}
+	cols := outcome.rows[0]
+	data := outcome.rows[1:]
+	if len(cols) == 0 {
+		return ""
+	}
+	return pqprintFormat(cols, data, outcome.colTypes)
+}
+
 // formatPQError formats a database error as isolationtester would print it.
+//
+// lib/pq's `(*pq.Error).Error()` returns `"pq: " + Message + " (" + Code + ")"`
+// (vendored v1.12.3, error.go:177-195). Upstream PostgreSQL isolationtester
+// prints only the libpq `PG_DIAG_MESSAGE_PRIMARY` field — there is no trailing
+// `(SQLSTATE)` decoration. M0100-0005l: extract `Message` directly when err is
+// a `*pq.Error` so the harness emits byte-identical output to upstream for
+// every spec that surfaces an error (fk-snapshot L21, partition-key-update,
+// etc.). Non-pq errors fall back to the legacy `"pq: "` trim path.
 func formatPQError(err error) string {
 	if err == nil {
 		return ""
+	}
+	if pqErr, ok := err.(*pq.Error); ok {
+		return "ERROR:  " + pqErr.Message
 	}
 	msg := err.Error()
 	if strings.HasPrefix(msg, "pq: ") {
@@ -375,20 +628,24 @@ func formatPQError(err error) string {
 	return "ERROR:  " + msg
 }
 
-// flattenSQL collapses multi-line SQL for use in step header lines.
-func flattenSQL(s string) string {
-	lines := strings.Split(s, "\n")
-	parts := make([]string, 0, len(lines))
-	for _, l := range lines {
-		l = strings.TrimSpace(l)
-		if l != "" {
-			parts = append(parts, l)
-		}
+// normalizeBoolWireText converts lib/pq's "true"/"false" rendering back to
+// PostgreSQL's standard wire-text "t"/"f". M0100-0005.
+//
+// Why: lib/pq decodes BOOL wire bytes ("t"/"f") into Go bool, which
+// database/sql then renders as "true"/"false" via convertAssign. Upstream
+// PostgreSQL isolationtester (libpq PQprint) prints the raw wire bytes,
+// so it sees "t"/"f". Reversing pq's automatic decode keeps the
+// IsolationRunner output byte-identical to upstream's expected files for
+// specs that select BOOL columns (e.g. insert-conflict-do-update-3's
+// `is_active boolean`).
+func normalizeBoolWireText(s string) string {
+	switch s {
+	case "true":
+		return "t"
+	case "false":
+		return "f"
 	}
-	if len(parts) == 1 {
-		return parts[0]
-	}
-	return strings.Join(parts, "\n\t")
+	return s
 }
 
 // isNumericType reports whether dbTypeName is a numeric PostgreSQL type.

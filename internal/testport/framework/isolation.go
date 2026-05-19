@@ -18,13 +18,15 @@ type IsolationStep struct {
 }
 
 type IsolationSpec struct {
-	Path         string
-	Sessions     []string
-	SetupSQL     string            // global setup run before each permutation
-	TeardownSQL  string            // global teardown run after all permutations
-	SessionSetup map[string]string // per-session setup run before each permutation
-	Steps        map[string]IsolationStep
-	Permutations [][]string
+	Path             string
+	Sessions         []string
+	SetupSQL         string            // global setup run before each permutation
+	TeardownSQL      string            // global teardown run after each permutation
+	SessionSetup     map[string]string // per-session setup run before each permutation
+	SessionTeardown  map[string]string // per-session teardown run after each permutation
+	Steps            map[string]IsolationStep
+	StepOrder        []string          // step names in declaration order (for "unused step" warnings)
+	Permutations     [][]string
 }
 
 type IsolationStepResult struct {
@@ -42,7 +44,8 @@ type IsolationExecutor interface {
 var (
 	reSession      = regexp.MustCompile(`^session\s+("([^"]+)"|(\S+))\s*$`)
 	reStepStart    = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*\{(.*)$`)
-	rePermutation  = regexp.MustCompile(`^permutation\s+(.+)$`)
+	reStepNoBlock  = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*$`)
+	rePermutation  = regexp.MustCompile(`^permutation(?:\s+(.+))?$`)
 	reQuotedTokens = regexp.MustCompile(`"([^"]+)"`)
 )
 
@@ -82,17 +85,37 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 	defer f.Close()
 
 	s := IsolationSpec{
-		Path:         filepath.ToSlash(path),
-		Steps:        map[string]IsolationStep{},
-		SessionSetup: map[string]string{},
+		Path:            filepath.ToSlash(path),
+		Steps:           map[string]IsolationStep{},
+		SessionSetup:    map[string]string{},
+		SessionTeardown: map[string]string{},
 	}
 
 	scanner := bufio.NewScanner(f)
 	ctx := ctxTop
 	currentSession := ""
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	// pendingLine holds a raw line that was read ahead but not yet consumed.
+	pendingLine := ""
+
+	nextLine := func() (string, bool) {
+		if pendingLine != "" {
+			l := pendingLine
+			pendingLine = ""
+			return l, true
+		}
+		if scanner.Scan() {
+			return scanner.Text(), true
+		}
+		return "", false
+	}
+
+	for {
+		rawLine, ok := nextLine()
+		if !ok {
+			break
+		}
+		line := strings.TrimSpace(rawLine)
 		// strip inline comments
 		if idx := strings.Index(line, "#"); idx >= 0 {
 			line = strings.TrimSpace(line[:idx])
@@ -139,27 +162,94 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 			}
 			if strings.HasPrefix(rest, "{") {
 				body := readBlock(rest[1:], scanner)
-				s.TeardownSQL = body
+				if ctx == ctxSession && currentSession != "" {
+					s.SessionTeardown[currentSession] = body
+				} else {
+					s.TeardownSQL = body
+				}
 			}
 			continue
 		}
 
-		// step
+		// step — handles both inline-brace (`step name {`) and next-line brace
+		// (`step name\n{`), and both quoted (`step "name"`) and unquoted names.
+		var stepNameParsed, stepRest string
 		if m := reStepStart.FindStringSubmatch(line); len(m) >= 5 {
-			stepName := m[2]
-			if stepName == "" {
-				stepName = m[3]
+			if m[2] != "" {
+				stepNameParsed = m[2]
+			} else {
+				stepNameParsed = m[3]
 			}
-			rest := m[4]
-			body := readBlock(rest, scanner)
-			session := inferSession(stepName, s.Sessions, currentSession)
-			s.Steps[stepName] = IsolationStep{Name: stepName, Session: session, SQL: strings.TrimSpace(body)}
+			stepRest = m[4]
+		} else if m := reStepNoBlock.FindStringSubmatch(line); len(m) >= 2 {
+			if m[2] != "" {
+				stepNameParsed = m[2]
+			} else {
+				stepNameParsed = m[3]
+			}
+			// Brace is on the next line — advance scanner until we find it.
+			for scanner.Scan() {
+				next := strings.TrimSpace(scanner.Text())
+				if next == "" {
+					continue
+				}
+				if strings.HasPrefix(next, "{") {
+					stepRest = next[1:]
+					break
+				}
+				// Unexpected token — not a step block; skip.
+				stepNameParsed = ""
+				break
+			}
+		}
+		if stepNameParsed != "" {
+			body := readBlock(stepRest, scanner)
+			session := inferSession(stepNameParsed, s.Sessions, currentSession)
+			if _, exists := s.Steps[stepNameParsed]; !exists {
+				s.StepOrder = append(s.StepOrder, stepNameParsed)
+			}
+			// Preserve the verbatim block body. Leading whitespace on
+			// the first content line (and leading `\n` for brace-at-EOL
+			// layouts) is significant for multi-line SQL display; a
+			// trailing `\n` (when `}` sits on its own line) is significant
+			// so a follow-on `<waiting ...>` suffix appears on a fresh
+			// line. See readBlock for the format-parity rationale.
+			s.Steps[stepNameParsed] = IsolationStep{Name: stepNameParsed, Session: session, SQL: body}
 			continue
 		}
 
-		// permutation
+		// permutation — may span multiple lines; continuation lines are indented
 		if m := rePermutation.FindStringSubmatch(line); len(m) == 2 {
-			s.Permutations = append(s.Permutations, parsePermutationTokens(m[1]))
+			tokens := parsePermutationTokens(m[1])
+			// Read continuation lines (indented lines with only step names).
+			for {
+				nextRaw, ok2 := nextLine()
+				if !ok2 {
+					break
+				}
+				// Continuation lines start with whitespace in the original file.
+				isIndented := len(nextRaw) > 0 && (nextRaw[0] == ' ' || nextRaw[0] == '\t')
+				stripped := strings.TrimSpace(nextRaw)
+				if idx := strings.Index(stripped, "#"); idx >= 0 {
+					stripped = strings.TrimSpace(stripped[:idx])
+				}
+				if !isIndented {
+					// Not a continuation — push back and stop. Blank
+					// (zero-length) lines are also non-indented; they
+					// terminate the permutation block.
+					pendingLine = nextRaw
+					break
+				}
+				if stripped == "" {
+					// Indented comment-only line inside a multi-line
+					// permutation block — skip and keep reading. Upstream
+					// specs (e.g. insert-conflict-specconflict.spec) embed
+					// explanatory '#' comments between continuation tokens.
+					continue
+				}
+				tokens = append(tokens, parsePermutationTokens(stripped)...)
+			}
+			s.Permutations = append(s.Permutations, tokens)
 			continue
 		}
 	}
@@ -185,34 +275,65 @@ func nextNonEmpty(scanner *bufio.Scanner) string {
 
 // readBlock reads the content inside a { ... } block from the scanner.
 // rest is the text after the opening '{' on the same line.
+// Raw indentation is preserved so that multi-line SQL prints exactly as
+// written in the spec file (matching PostgreSQL isolationtester output).
 func readBlock(rest string, scanner *bufio.Scanner) string {
-	var body strings.Builder
+	// Single-line: closing brace is on the same line.
 	if idx := strings.Index(rest, "}"); idx >= 0 {
-		body.WriteString(strings.TrimSpace(rest[:idx]))
-		return body.String()
+		return strings.TrimSpace(rest[:idx])
 	}
-	body.WriteString(strings.TrimSpace(rest))
+	// Multi-line: read lines until closing brace.
+	//
+	// Upstream isolationtester (`specscanner.l`, rules for `{`/`}` with
+	// `{space}*` = `[ \t\r\f]*`) captures everything between the opening
+	// brace and the next horizontal-whitespace-before-`}` verbatim, INCLUDING
+	// embedded newlines. Trailing horizontal whitespace immediately before
+	// `}` is eaten, but a `\n` right before `}` is preserved in the buffer.
+	//
+	// Concretely:
+	//   - Opening `{` at end-of-line: the first byte of the body is `\n`,
+	//     which makes the runner's `step name: %s` format render as
+	//     `step name: \n<body>` (i.e. body starts on the next line).
+	//   - Closing `}` on its own line (or after only horizontal whitespace
+	//     on that line): the body ends with `\n`, which makes the runner's
+	//     `step name: %s <waiting ...>` format render with `<waiting ...>`
+	//     on a fresh line (with a single leading space from the format
+	//     string). This is the merge-match-recheck shape — see
+	//     `postgres/src/test/isolation/expected/merge-match-recheck.out`.
+	//   - Closing `}` on the same line as the last SQL content (e.g.
+	//     `INSERT ... }`) does NOT carry a trailing `\n`, so `<waiting ...>`
+	//     stays on the same line as the last SQL line. This is the
+	//     insert-conflict-do-update-4 shape.
+	openedOnEOL := strings.TrimSpace(rest) == ""
+	closedOnOwnLine := false
+	var lines []string
+	if t := strings.TrimSpace(rest); t != "" {
+		lines = append(lines, t)
+	}
 	for scanner.Scan() {
 		next := scanner.Text()
 		if idx := strings.Index(next, "}"); idx >= 0 {
-			part := strings.TrimSpace(next[:idx])
-			if part != "" {
-				if body.Len() > 0 {
-					body.WriteString("\n")
-				}
-				body.WriteString(part)
+			line := strings.TrimRight(next[:idx], " \t")
+			if strings.TrimSpace(line) != "" {
+				lines = append(lines, line)
+			} else {
+				closedOnOwnLine = true
 			}
 			break
 		}
-		part := strings.TrimSpace(next)
-		if part != "" {
-			if body.Len() > 0 {
-				body.WriteString("\n")
-			}
-			body.WriteString(part)
-		}
+		lines = append(lines, next) // preserve raw line with indentation
 	}
-	return body.String()
+	if len(lines) == 0 {
+		return ""
+	}
+	joined := strings.Join(lines, "\n")
+	if openedOnEOL {
+		joined = "\n" + joined
+	}
+	if closedOnOwnLine {
+		joined = joined + "\n"
+	}
+	return joined
 }
 
 // RunIsolationPermutation executes a single permutation sequentially using the

@@ -1,0 +1,1913 @@
+goroutine 498 [running]:
+runtime/pprof.writeGoroutineStacks({0xbe7580, 0xc0ac30e000})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/pprof/pprof.go:756 +0x6b
+runtime/pprof.writeGoroutine({0xbe7580?, 0xc0ac30e000?}, 0x21?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/pprof/pprof.go:745 +0x25
+runtime/pprof.(*Profile).WriteTo(0xf9a5d0?, {0xbe7580?, 0xc0ac30e000?}, 0xc?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/pprof/pprof.go:371 +0x14b
+net/http/pprof.handler.ServeHTTP({0xc0abe7c551, 0x9}, {0xbeb750, 0xc0ac30e000}, 0xc0abd92500)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/pprof/pprof.go:272 +0x52a
+net/http/pprof.Index({0xbeb750, 0xc0ac30e000}, 0xc0abd92500?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/pprof/pprof.go:389 +0xda
+net/http.HandlerFunc.ServeHTTP(0xfabea0?, {0xbeb750?, 0xc0ac30e000?}, 0x669976?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:2322 +0x29
+net/http.(*ServeMux).ServeHTTP(0x47a559?, {0xbeb750, 0xc0ac30e000}, 0xc0abd92500)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:2861 +0x1c7
+net/http.serverHandler.ServeHTTP({0xc0ac65c880?}, {0xbeb750?, 0xc0ac30e000?}, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:3340 +0x8e
+net/http.(*conn).serve(0xc0b418c2d0, {0xbebbc0, 0xc0000c1860})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:2109 +0x665
+created by net/http.(*Server).Serve in goroutine 6
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:3493 +0x485
+
+goroutine 1 [IO wait]:
+internal/poll.runtime_pollWait(0x7538e8918600, 0x72)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc000046480?, 0x10000c0001871f8?, 0x0)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0xc000046480)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_unix.go:613 +0x28c
+net.(*netFD).accept(0xc000046480)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/fd_unix.go:161 +0x29
+net.(*TCPListener).accept(0xc0b3cf0000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/tcpsock_posix.go:159 +0x1b
+net.(*TCPListener).Accept(0xc0b3cf0000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/tcpsock.go:380 +0x30
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbeb600, 0xc0b3cf0000?})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:541 +0xeb
+github.com/goopg/goopg/internal/server.(*Server).Run(0xc0001ba8c0, {0xbebe70, 0xc0000c2640})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:437 +0x41b
+main.runStart({0xc000022200, 0x4, 0x4}, {0x200000003?, 0x0?}, {0xbe6c00, 0xc000080028})
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:559 +0x2352
+main.run({0xc0000221f0, 0x5, 0x5}, {0xbe6c00, 0xc000080020}, {0xbe6c00, 0xc000080028})
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:92 +0x21a
+main.main()
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:77 +0x5e
+
+goroutine 6 [IO wait]:
+internal/poll.runtime_pollWait(0x7538e8918800, 0x72)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc000046500?, 0x900000036?, 0x0)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0xc000046500)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_unix.go:613 +0x28c
+net.(*netFD).accept(0xc000046500)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/fd_unix.go:161 +0x29
+net.(*TCPListener).accept(0xc0000c2680)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/tcpsock_posix.go:159 +0x1b
+net.(*TCPListener).Accept(0xc0000c2680)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/tcpsock.go:380 +0x30
+net/http.(*Server).Serve(0xc00019e700, {0xbeb600, 0xc0000c2680})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:3463 +0x30c
+net/http.Serve(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:2971
+main.runStart.func1()
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:228 +0x217
+created by main.runStart in goroutine 1
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:217 +0x7db
+
+goroutine 8 [syscall, 13 minutes]:
+os/signal.signal_recv()
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sigqueue.go:152 +0x29
+os/signal.loop()
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/os/signal/signal_unix.go:23 +0x13
+created by os/signal.Notify.func1.1 in goroutine 1
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/os/signal/signal.go:152 +0x1f
+
+goroutine 34 [select, 13 minutes]:
+os/signal.NotifyContext.func1()
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/os/signal/signal.go:289 +0x66
+created by os/signal.NotifyContext in goroutine 1
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/os/signal/signal.go:288 +0x158
+
+goroutine 35 [chan receive]:
+github.com/goopg/goopg/internal/aio.(*methodWorker).run(0xc000222140)
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:69 +0xa7
+created by github.com/goopg/goopg/internal/aio.newMethodWorker in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:41 +0xb3
+
+goroutine 36 [chan receive]:
+github.com/goopg/goopg/internal/aio.(*methodWorker).run(0xc000222140)
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:69 +0xa7
+created by github.com/goopg/goopg/internal/aio.newMethodWorker in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:41 +0xb3
+
+goroutine 37 [chan receive]:
+github.com/goopg/goopg/internal/aio.(*methodWorker).run(0xc000222140)
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:69 +0xa7
+created by github.com/goopg/goopg/internal/aio.newMethodWorker in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/aio/method_worker.go:41 +0xb3
+
+goroutine 9 [runnable, locked to thread]:
+github.com/goopg/goopg/internal/aio.(*Handle).Wait(0xc0abe980c0)
+	/home/ryo/work/goopg/goopg/internal/aio/aio.go:150 +0x65
+github.com/goopg/goopg/internal/initdb.walAIOHandleAdapter.Wait({0xbea8a8?})
+	/home/ryo/work/goopg/goopg/internal/initdb/open.go:1184 +0x13
+github.com/goopg/goopg/internal/wal.(*state).writeAt(0xc0001a2140, 0xcd2c6038?, {0xc0055d0010?, 0x2120?, 0x4d39ff0?})
+	/home/ryo/work/goopg/goopg/internal/wal/writer.go:1542 +0x27f
+github.com/goopg/goopg/internal/wal.(*state).drainBufferBytes(0x0?, 0x0?, 0x1)
+	/home/ryo/work/goopg/goopg/internal/wal/writer.go:1360 +0x178
+github.com/goopg/goopg/internal/wal.(*state).drainBufferUpTo(0xc0abe39c80?, 0x7538e8394120?)
+	/home/ryo/work/goopg/goopg/internal/wal/writer.go:1394 +0x32
+github.com/goopg/goopg/internal/wal.(*state).flushUpTo(0xc0001a2140, 0xcd2c8158)
+	/home/ryo/work/goopg/goopg/internal/wal/writer.go:1411 +0x10b
+github.com/goopg/goopg/internal/wal.(*state).handleGroupFlush(0xc0001a2140)
+	/home/ryo/work/goopg/goopg/internal/wal/writer.go:1085 +0x265
+github.com/goopg/goopg/internal/wal.(*state).loop(0xc0001a2140, 0xc0001200e0, 0xc000120150)
+	/home/ryo/work/goopg/goopg/internal/wal/writer.go:1037 +0x1a8
+created by github.com/goopg/goopg/internal/wal.NewWriter in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/wal/writer.go:450 +0x4bb
+
+goroutine 10 [select]:
+github.com/goopg/goopg/internal/initdb.Open.func37()
+	/home/ryo/work/goopg/goopg/internal/initdb/open.go:1040 +0xc7
+created by github.com/goopg/goopg/internal/initdb.Open in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/initdb/open.go:1036 +0x23e5
+
+goroutine 11 [select]:
+github.com/goopg/goopg/internal/storage.(*Bgwriter).run(0xc0abb52840)
+	/home/ryo/work/goopg/goopg/internal/storage/bgwriter.go:71 +0x115
+created by github.com/goopg/goopg/internal/storage.(*Bgwriter).Start in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/storage/bgwriter.go:54 +0x4f
+
+goroutine 20 [select]:
+github.com/goopg/goopg/internal/wal.(*Checkpointer).Run(0xc000231290, {0xbebbf8, 0xc0b3cd6000})
+	/home/ryo/work/goopg/goopg/internal/wal/checkpointer.go:240 +0x1b4
+main.runStart.func4()
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:531 +0x1da
+created by main.runStart in goroutine 1
+	/home/ryo/work/goopg/goopg/cmd/goopg/main.go:516 +0x2257
+
+goroutine 21 [IO wait, 13 minutes]:
+internal/poll.runtime_pollWait(0x7538e8918400, 0x72)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc000046580?, 0x0?, 0x0)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Accept(0xc000046580)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_unix.go:613 +0x28c
+net.(*netFD).accept(0xc000046580)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/fd_unix.go:161 +0x29
+net.(*UnixListener).accept(0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/unixsock_posix.go:172 +0x16
+net.(*UnixListener).Accept(0xc0b3cc65a0)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/unixsock.go:260 +0x30
+github.com/goopg/goopg/internal/control.(*Listener).Serve(0xc000022c60)
+	/home/ryo/work/goopg/goopg/internal/control/control.go:217 +0x42
+github.com/goopg/goopg/internal/server.(*Server).startControlPlane.func5()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:514 +0x25
+created by github.com/goopg/goopg/internal/server.(*Server).startControlPlane in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:513 +0x529
+
+goroutine 22 [chan receive, 13 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).Run.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:415 +0x3e
+created by github.com/goopg/goopg/internal/server.(*Server).Run in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:414 +0x2d6
+
+goroutine 23 [select]:
+github.com/goopg/goopg/internal/server.(*ApplyLauncher).Run(0xc0b3cec000, {0xbebbf8, 0xc0b3cd6050})
+	/home/ryo/work/goopg/goopg/internal/server/applylauncher.go:133 +0x165
+created by github.com/goopg/goopg/internal/server.(*Server).Run in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:423 +0x355
+
+goroutine 436 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 435
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 410 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x0?, 0x1?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0abed1208?, 0xe19c7d83?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b3f86870}, 0xc0ac2a0bd0, 0xc0abed1e08, {0xc0abf847d0, 0x46}, 0xc0b4426480, 0xc0b4588210)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b3f86870}, 0xc0ac2a0bd0, 0xc0abed1e08, {0xc000264a10?, 0x98fc01?, 0xc0abed1468?}, 0xc0b4426480, 0xc0b4588210)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b3f86870}, 0xc0ac2a0bd0, 0xc0abed1e08, {0xc000264a10, 0x47, 0x6f}, 0xc0b4426480, 0xc0b4588210)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438ae10}, 0xc0ac288138, 0xc0b4224540, 0xc0ac2a0bd0, 0xc0abed1e08, 0xc0b45881d0, 0x0, {0xc0b3f82430, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b43940e0})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 457 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 456
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 353 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0xe88d3c20?, 0x0?, 0x80?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac597208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd7310}, 0xc0ac390540, 0xc0ac597e08, {0xc000012e54, 0x4}, 0xc0b4426400, 0xc0b45881a0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd7310}, 0xc0ac390540, 0xc0ac597e08, {0xc0ac57c2a0?, 0x98fc01?, 0xc0ac597468?}, 0xc0b4426400, 0xc0b45881a0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd7310}, 0xc0ac390540, 0xc0ac597e08, {0xc0ac57c2a0, 0x5, 0x70}, 0xc0b4426400, 0xc0b45881a0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb98a50}, 0xc0ac2880f0, 0xc0b3d5ea40, 0xc0ac390540, 0xc0ac597e08, 0xc0b4588160, 0x0, {0xc0b3f822a0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4190050})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 350 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 331
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 441 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 440
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 432 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 431
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 181 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x40?, 0xa8?, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).Begin(0xc0000de000, 0x0)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:191 +0x85
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abc08000}, 0xc0abdb2af0, 0xc0abfb3e08, {0xc0b4184036, 0x6}, 0xc0b3d07580, 0xc0b4388490)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:149 +0xff
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abc08000}, 0xc0abdb2af0, 0xc0abfb3e08, {0xc0abdb0310?, 0x98fc01?, 0xc0abfb3468?}, 0xc0b3d07580, 0xc0b4388490)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abc08000}, 0xc0abdb2af0, 0xc0abfb3e08, {0xc0abdb0310, 0x7, 0x70}, 0xc0b3d07580, 0xc0b4388490)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b448a910}, 0xc0b3cc2258, 0xc0b3d06b40, 0xc0abdb2af0, 0xc0abfb3e08, 0xc0b4388460, 0x0, {0xc0ac6809e0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc000228038})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 337 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48e39d?, 0xe?, 0xc0b44880d0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac4b1208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac9265a0}, 0xc0ac2a0a80, 0xc0ac4b1e08, {0xc0abba0a50, 0x46}, 0xc0b3d5f700, 0xc0002109c0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:170 +0x1e8
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac9265a0}, 0xc0ac2a0a80, 0xc0ac4b1e08, {0xc0001204d0?, 0xc0b44880c0?, 0xc0ac4b1468?}, 0xc0b3d5f700, 0xc0002109c0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac9265a0}, 0xc0ac2a0a80, 0xc0ac4b1e08, {0xc0001204d0, 0x47, 0x70}, 0xc0b3d5f700, 0xc0002109c0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438aa50}, 0xc0b419c390, 0xc0b4224280, 0xc0ac2a0a80, 0xc0ac4b1e08, 0xc000210990, 0x0, {0xc0b4384e60, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394058})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 499 [IO wait]:
+internal/poll.runtime_pollWait(0x7538e8278400, 0x72)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc0abe92080?, 0xc0ac65c8a1?, 0x0)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc0abe92080, {0xc0ac65c8a1, 0x1, 0x1})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x279
+net.(*netFD).Read(0xc0abe92080, {0xc0ac65c8a1?, 0x4993?, 0x0?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/fd_posix.go:68 +0x25
+net.(*conn).Read(0xc0b4394090, {0xc0ac65c8a1?, 0xc00004a601?, 0x1000000000001?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/net.go:196 +0x45
+net/http.(*connReader).backgroundRead(0xc0ac65c880)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:702 +0x33
+created by net/http.(*connReader).startBackgroundRead in goroutine 498
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:698 +0xb6
+
+goroutine 395 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 394
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 440 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x1?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac1f5208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abb980f0}, 0xc0ac2a0e70, 0xc0ac1f5e08, {0xc0abc7e380, 0x6b}, 0xc0b4224f40, 0xc0b428c630)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abb980f0}, 0xc0ac2a0e70, 0xc0ac1f5e08, {0xc0ac298000?, 0x98fc01?, 0xc0ac1f5468?}, 0xc0b4224f40, 0xc0b428c630)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abb980f0}, 0xc0ac2a0e70, 0xc0ac1f5e08, {0xc0ac298000, 0x6c, 0x70}, 0xc0b4224f40, 0xc0b428c630)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438b3b0}, 0xc0ac5862e8, 0xc0b4224d80, 0xc0ac2a0e70, 0xc0ac1f5e08, 0xc0b428c600, 0x0, {0xc0ac800b88, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b43941b0})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 439 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 438
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 180 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0xfcf840?, 0xa0?, 0xc0abd52510?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0aab254d8)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+sync.(*RWMutex).Lock(0xc000122008?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/rwmutex.go:150 +0x32
+github.com/goopg/goopg/internal/storage.(*Slot).Lock(...)
+	/home/ryo/work/goopg/goopg/internal/storage/bufpool.go:69
+github.com/goopg/goopg/internal/executor.writeHeapRowReturning.func1(0x92)
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:2740 +0xcc
+github.com/goopg/goopg/internal/executor.writeHeapRowReturning(0xc0abe252c0, {0x6?, 0x0?, 0x0?}, {0xc0000e4848, 0x6, 0x6}, {0xc0abc82000, 0x6, 0x6})
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:2784 +0x47f
+github.com/goopg/goopg/internal/executor.(*insertOp).Next(0xc0abc08230)
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:985 +0x8d3
+github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt(0xc0001ba8c0, 0xc0abdb2a80, 0xc0abe252c0, {0xbe9e30?, 0xc0ac242340?}, 0xc0b42258c0, 0xc0abd530f7, {0xc0abd53310, 0x1, 0x1})
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:740 +0xeb3
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f83c0}, 0xc0abdb2a80, 0xc0abd53e08, {0xc0ac57c850, 0x6d}, 0xc0b42258c0, 0xc0b428c7c0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:373 +0x169b
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f83c0}, 0xc0abdb2a80, 0xc0abd53e08, {0xc0ac2992d0?, 0x98fc01?, 0xc0abd53468?}, 0xc0b42258c0, 0xc0b428c7c0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f83c0}, 0xc0abdb2a80, 0xc0abd53e08, {0xc0ac2992d0, 0x6e, 0x6f}, 0xc0b42258c0, 0xc0b428c7c0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b448a870}, 0xc0ac586438, 0xc0b3d06800, 0xc0abdb2a80, 0xc0abd53e08, 0xc0b428c790, 0x0, {0xc0ac800f50, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc000228030})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 397 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 396
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 437 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 434
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 415 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 414
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 417 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x40?, 0xa8?, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).Begin(0xc0000de000, 0x0)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:191 +0x85
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac9260a0}, 0xc0ac3909a0, 0xc0ac2d1e08, {0xc0b3db2016, 0x6}, 0xc0000c2ac0, 0xc00003a260)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:149 +0xff
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac9260a0}, 0xc0ac3909a0, 0xc0ac2d1e08, {0xc0ac298380?, 0x98fc01?, 0xc0ac2d1468?}, 0xc0000c2ac0, 0xc00003a260)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac9260a0}, 0xc0ac3909a0, 0xc0ac2d1e08, {0xc0ac298380, 0x7, 0x70}, 0xc0000c2ac0, 0xc00003a260)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb99180}, 0xc0b441e0a8, 0xc0b3d5f280, 0xc0ac3909a0, 0xc0ac2d1e08, 0xc0b3cd21a0, 0x0, {0xc0b40842e0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394140})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 393 [runnable]:
+internal/sync.runtime_Semrelease(0x1?, 0x0?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:124 +0x13
+internal/sync.(*Mutex).unlockSlow(0xc0abf27680?, 0xabf27680?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:232 +0x59
+internal/sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:198
+sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:65
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xfce538?, 0x0?, 0xc0b3d3c000?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:279 +0x57a
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0550}, 0xc0ac2a0b60, 0xc0ac2cde08, {0xc000012c1c, 0x4}, 0xc0b3d5f140, 0xc000210680)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0550}, 0xc0ac2a0b60, 0xc0ac2cde08, {0xc0abc7ee00?, 0x98fc01?, 0xc0ac2cd468?}, 0xc0b3d5f140, 0xc000210680)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0550}, 0xc0ac2a0b60, 0xc0ac2cde08, {0xc0abc7ee00, 0x5, 0x70}, 0xc0b3d5f140, 0xc000210680)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438ad70}, 0xc0b419c1c8, 0xc0b42244c0, 0xc0ac2a0b60, 0xc0ac2cde08, 0xc000210650, 0x0, {0xc0b4384730, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4090018})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 355 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 455
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 418 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x1?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac443208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abbce370}, 0xc0ac3905b0, 0xc0ac443e08, {0xc0b3e8a180, 0x3a}, 0xc0b3d5ee80, 0xc000210560)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abbce370}, 0xc0ac3905b0, 0xc0ac443e08, {0xc0b3cca2a0?, 0x98fc01?, 0xc0ac443468?}, 0xc0b3d5ee80, 0xc000210560)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abbce370}, 0xc0ac3905b0, 0xc0ac443e08, {0xc0b3cca2a0, 0x3b, 0x70}, 0xc0b3d5ee80, 0xc000210560)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb98c30}, 0xc0b419c078, 0xc0b3d5eac0, 0xc0ac3905b0, 0xc0ac443e08, 0xc000210510, 0x0, {0xc0b43843b8, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4190058})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 438 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48e39d?, 0x50?, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac1a7208?, 0xe19c7d83?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b3d84140}, 0xc0ac2a0e00, 0xc0ac1a7e08, {0xc0b44004c0, 0x3a}, 0xc0b401e2c0, 0xc0b3cd2220)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:170 +0x1e8
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b3d84140}, 0xc0ac2a0e00, 0xc0ac1a7e08, {0xc0abdb0070?, 0x98fc01?, 0xc0ac1a7468?}, 0xc0b401e2c0, 0xc0b3cd2220)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b3d84140}, 0xc0ac2a0e00, 0xc0ac1a7e08, {0xc0abdb0070, 0x3b, 0x6f}, 0xc0b401e2c0, 0xc0b3cd2220)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438b310}, 0xc0ac1920f0, 0xc0b4224d00, 0xc0ac2a0e00, 0xc0ac1a7e08, 0xc0b3cd21e0, 0x0, {0xc0b4084308, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394198})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 404 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 334
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 416 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x1?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0abf53208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac7a6a50}, 0xc0ac390c40, 0xc0abf53e08, {0xc0ac302500, 0x4a}, 0xc0b4225600, 0xc0b428c690)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac7a6a50}, 0xc0ac390c40, 0xc0abf53e08, {0xc0ac2988c0?, 0x98fc01?, 0xc0abf53468?}, 0xc0b4225600, 0xc0b428c690)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac7a6a50}, 0xc0ac390c40, 0xc0abf53e08, {0xc0ac2988c0, 0x4b, 0x70}, 0xc0b4225600, 0xc0b428c690)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb992c0}, 0xc0ac586330, 0xc0b3d5f300, 0xc0ac390c40, 0xc0abf53e08, 0xc0b428c660, 0x0, {0xc0ac800c80, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394138})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 431 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x0?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xfcf840?, 0x1000009?, 0xc0ac3f9100?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac5bc0f0}, 0xc0ac390d90, 0xc0ac3f9e08, {0xc0b4600200, 0x3a}, 0xc0b3d5f540, 0xc000210890)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac5bc0f0}, 0xc0ac390d90, 0xc0ac3f9e08, {0xc0abba41c0?, 0x98fc01?, 0xc0ac3f9468?}, 0xc0b3d5f540, 0xc000210890)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac5bc0f0}, 0xc0ac390d90, 0xc0ac3f9e08, {0xc0abba41c0, 0x3b, 0x70}, 0xc0b3d5f540, 0xc000210890)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb994a0}, 0xc0b419c2a0, 0xc0b3d5f480, 0xc0ac390d90, 0xc0ac3f9e08, 0xc000210860, 0x0, {0xc0b4384b68, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4190130})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 413 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 412
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 331 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0xc0ac356b28?, 0x6?, 0xf1845?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).finish(0xc0000de000, {0xc0ac356d10?, 0x464f7a?, 0xd13313?}, 0x0)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:375 +0x6c
+github.com/goopg/goopg/internal/mvcc.(*Manager).Commit(...)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:306
+github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt(0xc0001ba8c0, 0xc0ac390000, 0xc0abed70e0, {0xbea3f8?, 0xc0b3f82558?}, 0xc0b4224780, 0xc0ac3570f7, {0xc0ac357310, 0x1, 0x1})
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:661 +0x6ac
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b408a410}, 0xc0ac390000, 0xc0ac357e08, {0xc0b3f82524, 0x4}, 0xc0b4224780, 0xc0b428c2f0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:373 +0x169b
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b408a410}, 0xc0ac390000, 0xc0ac357e08, {0xc0ac394850?, 0x98fc01?, 0xc0ac357468?}, 0xc0b4224780, 0xc0b428c2f0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b408a410}, 0xc0ac390000, 0xc0ac357e08, {0xc0ac394850, 0x5, 0x70}, 0xc0b4224780, 0xc0b428c2f0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb981e0}, 0xc0ac586120, 0xc0b3d5e240, 0xc0ac390000, 0xc0ac357e08, 0xc0b428c2c0, 0x0, {0xc0ac800518, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394010})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 218 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 217
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 179 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x1?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac569208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abba85f0}, 0xc0abdb2a10, 0xc0ac569e08, {0xc0abf02fa0, 0x4b}, 0xc0b3d07600, 0xc0b43884f0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abba85f0}, 0xc0abdb2a10, 0xc0ac569e08, {0xc0ac394070?, 0x98fc01?, 0xc0ac569468?}, 0xc0b3d07600, 0xc0b43884f0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abba85f0}, 0xc0abdb2a10, 0xc0ac569e08, {0xc0ac394070, 0x4c, 0x70}, 0xc0b3d07600, 0xc0b43884f0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b448a500}, 0xc0b3cc22b8, 0xc0b3d06200, 0xc0abdb2a10, 0xc0ac569e08, 0xc0b43884c0, 0x0, {0xc0ac680ad0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc000228028})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 412 [runnable]:
+github.com/goopg/goopg/internal/executor.(*insertOp).Next(0xc0ac5bc5a0)
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:869 +0x34f
+github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt(0xc0001ba8c0, 0xc0ac2a0c40, 0xc0abc065a0, {0xbe9e30?, 0xc0b3dc24e0?}, 0xc0b44269c0, 0xc0ac58f0f7, {0xc0ac58f310, 0x1, 0x1})
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:740 +0xeb3
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0690}, 0xc0ac2a0c40, 0xc0ac58fe08, {0xc00002eee0, 0x6d}, 0xc0b44269c0, 0xc0b45882e0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:373 +0x169b
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0690}, 0xc0ac2a0c40, 0xc0ac58fe08, {0xc0ac2981c0?, 0x98fc01?, 0xc0ac58f468?}, 0xc0b44269c0, 0xc0b45882e0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0690}, 0xc0ac2a0c40, 0xc0ac58fe08, {0xc0ac2981c0, 0x6e, 0x70}, 0xc0b44269c0, 0xc0b45882e0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438af00}, 0xc0ac288180, 0xc0b4224800, 0xc0ac2a0c40, 0xc0ac58fe08, 0xc0b45882b0, 0x0, {0xc0b3f82630, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394100})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 333 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x1?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac3a5208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abc08b90}, 0xc0ac390150, 0xc0ac3a5e08, {0xc0ac298850, 0x6d}, 0xc0b3d5f040, 0xc0002105c0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abc08b90}, 0xc0ac390150, 0xc0ac3a5e08, {0xc0ac3942a0?, 0x98fc01?, 0xc0ac3a5468?}, 0xc0b3d5f040, 0xc0002105c0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abc08b90}, 0xc0ac390150, 0xc0ac3a5e08, {0xc0ac3942a0, 0x6e, 0x6f}, 0xc0b3d5f040, 0xc0002105c0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb982d0}, 0xc0b419c0d8, 0xc0b3d5e440, 0xc0ac390150, 0xc0ac3a5e08, 0xc000210590, 0x0, {0xc0b43844c0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394038})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 379 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x1?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac58b208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f0230}, 0xc0000e6700, 0xc0ac58be08, {0xc0abba0500, 0x46}, 0xc0b3d5f680, 0xc000210960)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f0230}, 0xc0000e6700, 0xc0ac58be08, {0xc0ac2980e0?, 0x98fc01?, 0xc0ac58b468?}, 0xc0b3d5f680, 0xc000210960)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f0230}, 0xc0000e6700, 0xc0ac58be08, {0xc0ac2980e0, 0x47, 0x70}, 0xc0b3d5f680, 0xc000210960)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b3f4a410}, 0xc0b419c348, 0xc0ac102c00, 0xc0000e6700, 0xc0ac58be08, 0xc000210930, 0x0, {0xc0b4384d70, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b3d8e058})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 414 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48e39d?, 0x58?, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0abf57208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f87d0}, 0xc0ac2a0cb0, 0xc0abf57e08, {0xc0ac5fe954, 0x4}, 0xc0b4426c40, 0xc0b4588340)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:170 +0x1e8
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f87d0}, 0xc0ac2a0cb0, 0xc0abf57e08, {0xc0b3f5a0e0?, 0x98fc01?, 0xc0abf57468?}, 0xc0b4426c40, 0xc0b4588340)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f87d0}, 0xc0ac2a0cb0, 0xc0abf57e08, {0xc0b3f5a0e0, 0x5, 0x70}, 0xc0b4426c40, 0xc0b4588340)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438aff0}, 0xc0ac2881e0, 0xc0b4224880, 0xc0ac2a0cb0, 0xc0abf57e08, 0xc0b4588310, 0x0, {0xc0b3f82730, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394120})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 421 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 420
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 182 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48e39d?, 0x90?, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xfcf840?, 0x1000009?, 0xc0abfaf100?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abe060a0}, 0xc0abdb2b60, 0xc0abfafe08, {0xc0abda4780, 0x4b}, 0xc0b40a2400, 0xc0b3f485f0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:170 +0x1e8
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abe060a0}, 0xc0abdb2b60, 0xc0abfafe08, {0xc0ac000770?, 0x98fc01?, 0xc0abfaf468?}, 0xc0b40a2400, 0xc0b3f485f0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abe060a0}, 0xc0abdb2b60, 0xc0abfafe08, {0xc0ac000770, 0x4c, 0x70}, 0xc0b40a2400, 0xc0b3f485f0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b448aa50}, 0xc0001a60a8, 0xc0b3d06bc0, 0xc0abdb2b60, 0xc0abfafe08, 0xc0b3f485c0, 0x0, {0xc0b3de00b0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc000228040})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 402 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0xc0abed4b28?, 0xd0?, 0xf1841?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).finish(0xc0000de000, {0xc0ac20e040?, 0x14?, 0x1c?}, 0x0)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:375 +0x6c
+github.com/goopg/goopg/internal/mvcc.(*Manager).Commit(...)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:306
+github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt(0xc0001ba8c0, 0xc0ac2a08c0, 0xc0abe24780, {0xbea3f8?, 0xc000012bc0?}, 0xc0b4426380, 0xc0abed50f7, {0xc0abed5310, 0x1, 0x1})
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:661 +0x6ac
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abbb04b0}, 0xc0ac2a08c0, 0xc0abed5e08, {0xc000012bac, 0x4}, 0xc0b4426380, 0xc0b4588130)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:373 +0x169b
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abbb04b0}, 0xc0ac2a08c0, 0xc0abed5e08, {0xc0ac182af0?, 0x98fc01?, 0xc0abed5468?}, 0xc0b4426380, 0xc0b4588130)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abbb04b0}, 0xc0ac2a08c0, 0xc0abed5e08, {0xc0ac182af0, 0x5, 0x70}, 0xc0b4426380, 0xc0b4588130)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438a2d0}, 0xc0ac2880a8, 0xc0b4224000, 0xc0ac2a08c0, 0xc0abed5e08, 0xc0b45880c0, 0x0, {0xc0b3f82098, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394060})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 336 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48e39d?, 0xb0?, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac1f9208?, 0xe19c7d83?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b3d84230}, 0xc0ac2a0a10, 0xc0ac1f9e08, {0xc0b4400680, 0x3a}, 0xc0b4224c00, 0xc0b428c510)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:170 +0x1e8
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b3d84230}, 0xc0ac2a0a10, 0xc0ac1f9e08, {0xc0ac394c40?, 0x98fc01?, 0xc0ac1f9468?}, 0xc0b4224c00, 0xc0b428c510)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b3d84230}, 0xc0ac2a0a10, 0xc0ac1f9e08, {0xc0ac394c40, 0x3b, 0x70}, 0xc0b4224c00, 0xc0b428c510)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438a820}, 0xc0ac586258, 0xc0b4224200, 0xc0ac2a0a10, 0xc0ac1f9e08, 0xc0b428c4e0, 0x0, {0xc0ac800940, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394050})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 184 [runnable]:
+syscall.Syscall(0x1, 0x3d, 0xc0ac041000, 0x16)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/syscall/syscall_linux.go:74 +0x25
+syscall.write(0xc0ac004280?, {0xc0ac041000?, 0xc0abf42e00?, 0x46316b?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/syscall/zsyscall_linux_amd64.go:964 +0x3b
+syscall.Write(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/syscall/syscall_unix.go:211
+internal/poll.ignoringEINTRIO(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_unix.go:738
+internal/poll.(*FD).Write(0xc0ac004280, {0xc0ac041000, 0x16, 0x1000})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_unix.go:374 +0x394
+net.(*netFD).Write(0xc0ac004280, {0xc0ac041000?, 0x0?, 0xc0001a28c0?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/fd_posix.go:109 +0x25
+net.(*conn).Write(0xc000228058, {0xc0ac041000?, 0x3?, 0xaf381b?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/net.go:208 +0x45
+bufio.(*Writer).Flush(0xc0b3d07040)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/bufio/bufio.go:645 +0x55
+github.com/goopg/goopg/internal/protocol.(*FrameWriter).Flush(0xc0abdb2c40)
+	/home/ryo/work/goopg/goopg/internal/protocol/frame.go:251 +0x2f
+github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteReadyForQuery(0xc0abdb2c40, 0x49)
+	/home/ryo/work/goopg/goopg/internal/protocol/messages.go:142 +0x5b
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b420a410}, 0xc0abdb2c40, 0xc0abf43e08, {0xc0b3f5a460, 0x6e}, 0xc0b40a2b40, 0xc0b3f486b0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:401 +0x1f18
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b420a410}, 0xc0abdb2c40, 0xc0abf43e08, {0xc0ac000af0?, 0x98fc01?, 0xc0abf43468?}, 0xc0b40a2b40, 0xc0b3f486b0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b420a410}, 0xc0abdb2c40, 0xc0abf43e08, {0xc0ac000af0, 0x6f, 0x70}, 0xc0b40a2b40, 0xc0b3f486b0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b448abe0}, 0xc0001a6138, 0xc0b3d06f80, 0xc0abdb2c40, 0xc0abf43e08, 0xc0b3f48680, 0x0, {0xc0b3de0570, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc000228058})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 433 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 454
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 183 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x1?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac23f208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac7a69b0}, 0xc0abdb2bd0, 0xc0ac23fe08, {0xc0ac182850, 0x6d}, 0xc0b3d07500, 0xc0b4388430)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac7a69b0}, 0xc0abdb2bd0, 0xc0ac23fe08, {0xc00002e930?, 0x98fc01?, 0xc0ac23f468?}, 0xc0b3d07500, 0xc0b4388430)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac7a69b0}, 0xc0abdb2bd0, 0xc0ac23fe08, {0xc00002e930, 0x6e, 0x6f}, 0xc0b3d07500, 0xc0b4388430)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b448ab40}, 0xc0b3cc21b0, 0xc0b3d06d00, 0xc0abdb2bd0, 0xc0ac23fe08, 0xc0b4388400, 0x0, {0xc0ac6808f0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc000228048})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 428 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 427
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 400 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x40?, 0xa8?, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).Begin(0xc0000de000, 0x0)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:191 +0x85
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abf1e730}, 0xc0ac21ac40, 0xc0ac41de08, {0xc0b3da6440, 0x6}, 0xc0b4224cc0, 0xc0b428c570)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:149 +0xff
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abf1e730}, 0xc0ac21ac40, 0xc0ac41de08, {0xc0ac2989a0?, 0x98fc01?, 0xc0ac41d468?}, 0xc0b4224cc0, 0xc0b428c570)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abf1e730}, 0xc0ac21ac40, 0xc0ac41de08, {0xc0ac2989a0, 0x7, 0x70}, 0xc0b4224cc0, 0xc0b428c570)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abc0a730}, 0xc0ac5862a0, 0xc0b4426d80, 0xc0ac21ac40, 0xc0ac41de08, 0xc0b428c540, 0x0, {0xc0ac800a30, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b40900b0})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 378 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 377
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 406 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 336
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 425 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 417
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 427 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x45b4a0?, 0x0?, 0x7?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xfce538?, 0x0?, 0xc0b3d3c000?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0000}, 0xc0ac390cb0, 0xc0abd57e08, {0xc000012666, 0x6}, 0xc0000c2a40, 0xc00003a210)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:170 +0x1e8
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0000}, 0xc0ac390cb0, 0xc0abd57e08, {0xc0b3f5a700?, 0x98fc01?, 0xc0abd57468?}, 0xc0000c2a40, 0xc00003a210)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0000}, 0xc0ac390cb0, 0xc0abd57e08, {0xc0b3f5a700, 0x7, 0x70}, 0xc0000c2a40, 0xc00003a210)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb99360}, 0xc0b441e048, 0xc0b3d5f380, 0xc0ac390cb0, 0xc0abd57e08, 0xc00003a1b0, 0x0, {0xc0b4584060, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4190100})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 352 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 332
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 407 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 337
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 401 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 400
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 394 [runnable]:
+internal/sync.runtime_Semrelease(0x1?, 0x0?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:124 +0x13
+internal/sync.(*Mutex).unlockSlow(0xc0abf26540?, 0xabf26540?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:232 +0x59
+internal/sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:198
+sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:65
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xfce538?, 0x0?, 0xc00020e000?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:279 +0x57a
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abbf4190}, 0xc0ac21a700, 0xc0ac4ade08, {0xc0ac384500, 0x3a}, 0xc0b3d5f0c0, 0xc000210620)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abbf4190}, 0xc0ac21a700, 0xc0ac4ade08, {0xc0ac394b60?, 0x98fc01?, 0xc0ac4ad468?}, 0xc0b3d5f0c0, 0xc000210620)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abbf4190}, 0xc0ac21a700, 0xc0ac4ade08, {0xc0ac394b60, 0x3b, 0x70}, 0xc0b3d5f0c0, 0xc000210620)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb47e00}, 0xc0b419c150, 0xc0b4426040, 0xc0ac21a700, 0xc0ac4ade08, 0xc0002105f0, 0x0, {0xc0b43845f0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4090028})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 451 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 450
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 351 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 333
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 426 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 416
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 380 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 379
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 381 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 453
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 456 [runnable]:
+internal/sync.runtime_Semrelease(0x1?, 0x0?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:124 +0x13
+internal/sync.(*Mutex).unlockSlow(0xc0abf26240?, 0xabf26240?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:232 +0x59
+internal/sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:198
+sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:65
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac321208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:279 +0x57a
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd7130}, 0xc0ac21ad20, 0xc0ac321e08, {0xc0b40046cc, 0x4}, 0xc0b42257c0, 0xc0b428c760)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd7130}, 0xc0ac21ad20, 0xc0ac321e08, {0xc0ac0007e0?, 0x98fc01?, 0xc0ac321468?}, 0xc0b42257c0, 0xc0b428c760)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd7130}, 0xc0ac21ad20, 0xc0ac321e08, {0xc0ac0007e0, 0x5, 0x70}, 0xc0b42257c0, 0xc0b428c760)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abc0aa50}, 0xc0ac5863d8, 0xc0b4427280, 0xc0ac21ad20, 0xc0ac321e08, 0xc0b428c730, 0x0, {0xc0ac800e60, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4090118})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 455 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0xc0ac420b28?, 0x6?, 0xf1851?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).finish(0xc0000de000, {0xc0abbb44e0?, 0x0?, 0x7?}, 0x0)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:375 +0x6c
+github.com/goopg/goopg/internal/mvcc.(*Manager).Commit(...)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:306
+github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt(0xc0001ba8c0, 0xc0ac12c380, 0xc0abcacd20, {0xbea3f8?, 0xc0b3e8e098?}, 0xc0abc2eac0, 0xc0ac4210f7, {0xc0ac421310, 0x1, 0x1})
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:661 +0x6ac
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f8050}, 0xc0ac12c380, 0xc0ac421e08, {0xc0b3e8e084, 0x4}, 0xc0abc2eac0, 0xc0b412e1d0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:373 +0x169b
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f8050}, 0xc0ac12c380, 0xc0ac421e08, {0xc0ac248e70?, 0x98fc01?, 0xc0ac421468?}, 0xc0abc2eac0, 0xc0b412e1d0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f8050}, 0xc0ac12c380, 0xc0ac421e08, {0xc0ac248e70, 0x5, 0x6f}, 0xc0abc2eac0, 0xc0b412e1d0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b3d842d0}, 0xc0b409a0a8, 0xc0abc2e140, 0xc0ac12c380, 0xc0ac421e08, 0xc0b412e1a0, 0x0, {0xc0000129c0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4090110})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 332 [runnable]:
+github.com/goopg/goopg/internal/storage.(*Slot).RUnlock(0xc0aa7d2730?)
+	/home/ryo/work/goopg/goopg/internal/storage/bufpool.go:72 +0x37
+github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex.func1({0xc00a3274c0?, 0x2000?, 0x2000?}, {0xffff00ec?, 0x2?})
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:1540 +0x205
+github.com/goopg/goopg/internal/access/btree.(*BTree).RangeScan(0xc0abff4420, {0xc000012730, 0x4, 0x4}, {0xc000012730, 0x4, 0x4}, 0xc0ac200708)
+	/home/ryo/work/goopg/goopg/internal/access/btree/btree.go:2059 +0x45f
+github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex(0xc0abff4360, {0x1?, 0x0?, 0xb8?}, {0xc00026f180, 0x4, 0x4})
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:1531 +0x590
+github.com/goopg/goopg/internal/executor.(*updateOp).Next(0xc0abff4360)
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:1792 +0x46b
+github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt(0xc0001ba8c0, 0xc0ac3901c0, 0xc0abe254a0, {0xbe9e58?, 0xc0abd36210?}, 0xc0b401e340, 0xc0ac2010f7, {0xc0ac201310, 0x1, 0x1})
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:740 +0xeb3
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b400a870}, 0xc0ac3901c0, 0xc0ac201e08, {0xc0abf84be0, 0x46}, 0xc0b401e340, 0xc0b3cd22d0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:373 +0x169b
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b400a870}, 0xc0ac3901c0, 0xc0ac201e08, {0xc0ac248460?, 0x98fc01?, 0xc0ac201468?}, 0xc0b401e340, 0xc0b3cd22d0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b400a870}, 0xc0ac3901c0, 0xc0ac201e08, {0xc0ac248460, 0x47, 0x70}, 0xc0b401e340, 0xc0b3cd22d0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb985a0}, 0xc0ac1921c8, 0xc0b3d5e540, 0xc0ac3901c0, 0xc0ac201e08, 0xc0b3cd2280, 0x0, {0xc0b4084400, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394028})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 429 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48e39d?, 0x0?, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac1cd208?, 0xe19c7d83?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abb47ea0}, 0xc0ac390d20, 0xc0ac1cde08, {0xc0ac7b6240, 0x3a}, 0xc0b42256c0, 0xc0b428c6a0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:170 +0x1e8
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abb47ea0}, 0xc0ac390d20, 0xc0ac1cde08, {0xc0002640e0?, 0x98fc01?, 0xc0ac1cd468?}, 0xc0b42256c0, 0xc0b428c6a0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abb47ea0}, 0xc0ac390d20, 0xc0ac1cde08, {0xc0002640e0, 0x3b, 0x70}, 0xc0b42256c0, 0xc0b428c6a0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb99400}, 0xc0ac288270, 0xc0b3d5f400, 0xc0ac390d20, 0xc0ac1cde08, 0xc0b4588430, 0x0, {0xc0b3f829e0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4190118})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 377 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x1?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac3a9208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b3f867d0}, 0xc0000e6690, 0xc0ac3a9e08, {0xc0ac29a690, 0x47}, 0xc0b3d5f1c0, 0xc0002106e0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b3f867d0}, 0xc0000e6690, 0xc0ac3a9e08, {0xc0b3cca310?, 0x98fc01?, 0xc0ac3a9468?}, 0xc0b3d5f1c0, 0xc0002106e0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b3f867d0}, 0xc0000e6690, 0xc0ac3a9e08, {0xc0b3cca310, 0x48, 0x70}, 0xc0b3d5f1c0, 0xc0002106e0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b3f4a320}, 0xc0b419c210, 0xc0ac102440, 0xc0000e6690, 0xc0ac3a9e08, 0xc0002106b0, 0x0, {0xc0b4384820, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b3d8e040})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 398 [runnable]:
+internal/sync.runtime_Semrelease(0x1?, 0x0?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:124 +0x13
+internal/sync.(*Mutex).unlockSlow(0xc0abf26180?, 0xabf26180?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:232 +0x59
+internal/sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:198
+sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:65
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xfcf840?, 0x1000009?, 0xc0ac63b100?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:279 +0x57a
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac926000}, 0xc0ac21abd0, 0xc0ac63be08, {0xc0ac302280, 0x47}, 0xc0b3d5f5c0, 0xc0002108f0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac926000}, 0xc0ac21abd0, 0xc0ac63be08, {0xc0abc7e310?, 0x98fc01?, 0xc0ac63b468?}, 0xc0b3d5f5c0, 0xc0002108f0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac926000}, 0xc0ac21abd0, 0xc0ac63be08, {0xc0abc7e310, 0x48, 0x70}, 0xc0b3d5f5c0, 0xc0002108f0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abc0a500}, 0xc0b419c2e8, 0xc0b4426680, 0xc0ac21abd0, 0xc0ac63be08, 0xc0002108c0, 0x0, {0xc0b4384c60, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4090088})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 420 [runnable]:
+internal/sync.runtime_Semrelease(0x1?, 0x0?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:124 +0x13
+internal/sync.(*Mutex).unlockSlow(0xc0abf27440?, 0xabf27440?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:232 +0x59
+internal/sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:198
+sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:65
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac63f208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:279 +0x57a
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac7a6910}, 0xc0ac3904d0, 0xc0ac63fe08, {0xc0b3cc023c, 0x4}, 0xc0ac102200, 0xc0b3d820c0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac7a6910}, 0xc0ac3904d0, 0xc0ac63fe08, {0xc0b3f5a690?, 0x98fc01?, 0xc0ac63f468?}, 0xc0ac102200, 0xc0b3d820c0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac7a6910}, 0xc0ac3904d0, 0xc0ac63fe08, {0xc0b3f5a690, 0x5, 0x6f}, 0xc0ac102200, 0xc0b3d820c0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb98820}, 0xc0b438e0f0, 0xc0b3d5e7c0, 0xc0ac3904d0, 0xc0ac63fe08, 0xc0b428c360, 0x0, {0xc0ac800638, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4190068})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 409 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 393
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 376 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 375
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 411 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 410
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 423 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 418
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 430 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 429
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 419 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x0?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc00003f208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abc90780}, 0xc0ac3907e0, 0xc00003fe08, {0xc0abf84820, 0x47}, 0xc0abc2e100, 0xc0b412e090)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abc90780}, 0xc0ac3907e0, 0xc00003fe08, {0xc0abdb0540?, 0x98fc01?, 0xc00003f468?}, 0xc0abc2e100, 0xc0b412e090)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abc90780}, 0xc0ac3907e0, 0xc00003fe08, {0xc0abdb0540, 0x48, 0x70}, 0xc0abc2e100, 0xc0b412e090)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb98e10}, 0xc0b409a018, 0xc0b3d5edc0, 0xc0ac3907e0, 0xc00003fe08, 0xc0b412e040, 0x0, {0xc0000125d0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4190060})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 396 [IO wait]:
+internal/poll.runtime_pollWait(0x7538e83c9a00, 0x72)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc0b3d90380?, 0xc0abc58000?, 0x0)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc0b3d90380, {0xc0abc58000, 0x1000, 0x1000})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x279
+net.(*netFD).Read(0xc0b3d90380, {0xc0abc58000?, 0xc00021a120?, 0x0?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/fd_posix.go:68 +0x25
+net.(*conn).Read(0xc0b4090070, {0xc0abc58000?, 0x6d3380?, 0xc0ac59b2f0?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/net.go:196 +0x45
+bufio.(*Reader).Read(0xc0abf86180, {0xc0b3f82399, 0x5, 0x41a885?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/bufio/bufio.go:245 +0x197
+io.ReadAtLeast({0xbe72c0, 0xc0abf86180}, {0xc0b3f82399, 0x5, 0x5}, 0x5)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/io/io.go:335 +0x8e
+io.ReadFull(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/io/io.go:354
+github.com/goopg/goopg/internal/protocol.(*FrameReader).ReadFrame(0xc0b4426500)
+	/home/ryo/work/goopg/goopg/internal/protocol/frame.go:115 +0xcb
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abc0a140}, 0xc0b438e078, 0xc0b4426500, 0xc0ac21a8c0, 0xc0ac59be08, 0xc0b3d82030, 0x0, {0xc0b3e08040, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:940 +0x216
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4090070})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 405 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 335
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 454 [runnable]:
+hash/crc32.ChecksumIEEE({0xc0abdf8690, 0x46, 0x46})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/hash/crc32/crc32.go:243 +0x65
+github.com/goopg/goopg/internal/wal.cachedCRC({0xc0abdf8690, 0x46, 0xb2dd28?})
+	/home/ryo/work/goopg/goopg/internal/wal/format.go:72 +0xc5
+github.com/goopg/goopg/internal/wal.encodeRecord({0xc0abdf8690, 0x46, 0x46})
+	/home/ryo/work/goopg/goopg/internal/wal/format.go:112 +0x69
+github.com/goopg/goopg/internal/wal.(*state).tryAppend(0xc0001a2140, {0xc0abdf8690, 0x46, 0x46})
+	/home/ryo/work/goopg/goopg/internal/wal/writer.go:1288 +0x7a
+github.com/goopg/goopg/internal/wal.(*Writer).Append(0xc000256000, {0xc0abdf8690, 0x46, 0xc0ac7a4478?})
+	/home/ryo/work/goopg/goopg/internal/wal/writer.go:621 +0x65
+github.com/goopg/goopg/internal/initdb.Open.func6({0x1e?, 0x0?, 0xc0?}, 0x92, 0x73, {0xc0b4600280, 0x36, 0x1c8?})
+	/home/ryo/work/goopg/goopg/internal/initdb/open.go:336 +0xd5
+github.com/goopg/goopg/internal/executor.markHeapInsertDirty.func1()
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:2884 +0x35
+github.com/goopg/goopg/internal/storage.(*Pool).MarkDirtyLogicalChange(0xc000122008, 0xc0aab254a0, 0xc0ac7a44f8)
+	/home/ryo/work/goopg/goopg/internal/storage/bufpool.go:1291 +0x7a
+github.com/goopg/goopg/internal/executor.markHeapInsertDirty(0x18?, 0x0?, 0x0?, {0x0?, 0x0?, 0x48?}, 0xc0?, 0x1e?, {0xc0b4600280, 0x36, ...})
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:2883 +0x85
+github.com/goopg/goopg/internal/executor.writeHeapRowReturning.func1(0x92)
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:2749 +0x2ce
+github.com/goopg/goopg/internal/executor.writeHeapRowReturning(0xc0abda03c0, {0x6?, 0x0?, 0x80?}, {0xc0000e4848, 0x6, 0x6}, {0xc0000e0480, 0x6, 0x6})
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:2784 +0x47f
+github.com/goopg/goopg/internal/executor.(*insertOp).Next(0xc0b438a500)
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:985 +0x8d3
+github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt(0xc0001ba8c0, 0xc0ac390e00, 0xc0abda03c0, {0xbe9e30?, 0xc0b3ccc1a0?}, 0xc0b3d5f800, 0xc0ac7a50f7, {0xc0ac7a5310, 0x1, 0x1})
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:740 +0xeb3
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac65a370}, 0xc0ac390e00, 0xc0ac7a5e08, {0xc0ac182460, 0x6e}, 0xc0b3d5f800, 0xc000210a50)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:373 +0x169b
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac65a370}, 0xc0ac390e00, 0xc0ac7a5e08, {0xc0b3cca380?, 0x98fc01?, 0xc0ac7a5468?}, 0xc0b3d5f800, 0xc000210a50)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac65a370}, 0xc0ac390e00, 0xc0ac7a5e08, {0xc0b3cca380, 0x6f, 0x70}, 0xc0b3d5f800, 0xc000210a50)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abb99680}, 0xc0b419c3d8, 0xc0b3d5f740, 0xc0ac390e00, 0xc0ac7a5e08, 0xc000210a20, 0x0, {0xc0b4384f78, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4090108})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 408 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 392
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 335 [runnable]:
+internal/sync.runtime_Semrelease(0x1?, 0x0?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:124 +0x13
+internal/sync.(*Mutex).unlockSlow(0xc0abf27500?, 0xabf27500?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:232 +0x59
+internal/sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:198
+sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:65
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac1c9208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:279 +0x57a
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b408a460}, 0xc0ac2a09a0, 0xc0ac1c9e08, {0xc0abbbb6c0, 0x6d}, 0xc0b4225740, 0xc0b428c700)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b408a460}, 0xc0ac2a09a0, 0xc0ac1c9e08, {0xc00002e7e0?, 0x98fc01?, 0xc0ac1c9468?}, 0xc0b4225740, 0xc0b428c700)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b408a460}, 0xc0ac2a09a0, 0xc0ac1c9e08, {0xc00002e7e0, 0x6e, 0x70}, 0xc0b4225740, 0xc0b428c700)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438a5f0}, 0xc0ac586378, 0xc0b4224180, 0xc0ac2a09a0, 0xc0ac1c9e08, 0xc0b428c6d0, 0x0, {0xc0ac800d68, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394048})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 422 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 353
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 334 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x0?, 0x7538e833db00?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac56d208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abc08b40}, 0xc0ac2a0930, 0xc0ac56de08, {0xc0b3cd0aa0, 0x4c}, 0xc0b4224400, 0xc0b428c1a0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abc08b40}, 0xc0ac2a0930, 0xc0ac56de08, {0xc0ac298690?, 0x98fc01?, 0xc0ac56d468?}, 0xc0b4224400, 0xc0b428c1a0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abc08b40}, 0xc0ac2a0930, 0xc0ac56de08, {0xc0ac298690, 0x4d, 0x70}, 0xc0b4224400, 0xc0b428c1a0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438a410}, 0xc0ac586078, 0xc0b42240c0, 0xc0ac2a0930, 0xc0ac56de08, 0xc0b428c170, 0x0, {0xc0ac800368, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394040})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 452 [select]:
+github.com/goopg/goopg/internal/wal.(*Writer).FlushUpTo(0xc000256000, 0xcd2c8158)
+	/home/ryo/work/goopg/goopg/internal/wal/writer.go:682 +0x246
+github.com/goopg/goopg/internal/initdb.Open.func24(0x35ae2, 0x0)
+	/home/ryo/work/goopg/goopg/internal/initdb/open.go:633 +0xef
+github.com/goopg/goopg/internal/mvcc.(*Manager).finish(0xc0000de000, {0xc0abbb4480?, 0x10?, 0x18?}, 0x0)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:407 +0x16e
+github.com/goopg/goopg/internal/mvcc.(*Manager).Commit(...)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:306
+github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt(0xc0001ba8c0, 0xc0abb4e3f0, 0xc0abf283c0, {0xbea3f8?, 0xc0b4384b00?}, 0xc0abc2e400, 0xc0ac1ab0f7, {0xc0ac1ab310, 0x1, 0x1})
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:661 +0x6ac
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abd00c80}, 0xc0abb4e3f0, 0xc0ac1abe08, {0xc0b4384acc, 0x4}, 0xc0abc2e400, 0xc0b412e170)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:373 +0x169b
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abd00c80}, 0xc0abb4e3f0, 0xc0ac1abe08, {0xc0b3d048c0?, 0xc0b4588380?, 0xc0ac1ab468?}, 0xc0abc2e400, 0xc0b412e170)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abd00c80}, 0xc0abb4e3f0, 0xc0ac1abe08, {0xc0b3d048c0, 0x5, 0x70}, 0xc0abc2e400, 0xc0b412e170)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abe067d0}, 0xc0b409a060, 0xc0b401e3c0, 0xc0abb4e3f0, 0xc0ac1abe08, 0xc0b412e130, 0x0, {0xc000012848, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b40900f8})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 219 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 452
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 424 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 419
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 450 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x0?, 0x0?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac43f208?, 0xe19c7d83?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b3d84050}, 0xc0ac21acb0, 0xc0ac43fe08, {0xc0b4400300, 0x3a}, 0xc0b4427180, 0xc0b4588400)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b3d84050}, 0xc0ac21acb0, 0xc0ac43fe08, {0xc0b3cca620?, 0x98fc01?, 0xc0ac43f468?}, 0xc0b4427180, 0xc0b4588400)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b3d84050}, 0xc0ac21acb0, 0xc0ac43fe08, {0xc0b3cca620, 0x3b, 0x6f}, 0xc0b4427180, 0xc0b4588400)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abc0a8c0}, 0xc0ac288228, 0xc0b4426e80, 0xc0ac21acb0, 0xc0ac43fe08, 0xc0b45883d0, 0x0, {0xc0b3f828b0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b40900d0})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 217 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0xc0b44a4980?, 0xa0?, 0x47b285?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).AssignXID(0xc0000de000, {0x60?, 0xb3d33008?, 0xc000023740?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:221 +0x58
+github.com/goopg/goopg/internal/executor.(*Context).MaterializeWriterXID(0xc0abcac1e0)
+	/home/ryo/work/goopg/goopg/internal/executor/context.go:390 +0x45
+github.com/goopg/goopg/internal/executor.(*updateOp).Next(0xc000023740)
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:1783 +0x15b
+github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt(0xc0001ba8c0, 0xc0abb4e310, 0xc0abcac1e0, {0xbe9e58?, 0xc0ac2022c0?}, 0xc0b3d5f600, 0xc0ac31d0f7, {0xc0ac31d310, 0x1, 0x1})
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:740 +0xeb3
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b3f4aaf0}, 0xc0abb4e310, 0xc0ac31de08, {0xc0ac6010e0, 0x4b}, 0xc0b3d5f600, 0xc000210900)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:373 +0x169b
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b3f4aaf0}, 0xc0abb4e310, 0xc0ac31de08, {0xc0abba4150?, 0x98fc01?, 0xc0ac31d468?}, 0xc0b3d5f600, 0xc000210900)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b3f4aaf0}, 0xc0abb4e310, 0xc0ac31de08, {0xc0abba4150, 0x4c, 0x70}, 0xc0b3d5f600, 0xc000210900)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0abe06140}, 0xc0ac192078, 0xc0b401e080, 0xc0abb4e310, 0xc0ac31de08, 0xc0b3cd2130, 0x0, {0xc0b4084078, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0ac108260})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 375 [runnable]:
+syscall.Syscall(0x1, 0x24, 0xc0abbef000, 0x14)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/syscall/syscall_linux.go:74 +0x25
+syscall.write(0xc0b3e1c500?, {0xc0abbef000?, 0xc0ac116e00?, 0x46316b?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/syscall/zsyscall_linux_amd64.go:964 +0x3b
+syscall.Write(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/syscall/syscall_unix.go:211
+internal/poll.ignoringEINTRIO(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_unix.go:738
+internal/poll.(*FD).Write(0xc0b3e1c500, {0xc0abbef000, 0x14, 0x1000})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_unix.go:374 +0x394
+net.(*netFD).Write(0xc0b3e1c500, {0xc0abbef000?, 0x0?, 0xc0abca48c0?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/fd_posix.go:109 +0x25
+net.(*conn).Write(0xc0b3d8e018, {0xc0abbef000?, 0x3?, 0xaf381b?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/net.go:208 +0x45
+bufio.(*Writer).Flush(0xc0ac102400)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/bufio/bufio.go:645 +0x55
+github.com/goopg/goopg/internal/protocol.(*FrameWriter).Flush(0xc0000e6540)
+	/home/ryo/work/goopg/goopg/internal/protocol/frame.go:251 +0x2f
+github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteReadyForQuery(0xc0000e6540, 0x49)
+	/home/ryo/work/goopg/goopg/internal/protocol/messages.go:142 +0x5b
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f8690}, 0xc0000e6540, 0xc0ac117e08, {0xc0ac126eb0, 0x4c}, 0xc0b3d5f240, 0xc000210740)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:401 +0x1f18
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f8690}, 0xc0000e6540, 0xc0ac117e08, {0xc0ac57c770?, 0x98fc01?, 0xc0ac117468?}, 0xc0b3d5f240, 0xc000210740)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac2f8690}, 0xc0000e6540, 0xc0ac117e08, {0xc0ac57c770, 0x4d, 0x70}, 0xc0b3d5f240, 0xc000210740)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b3f4a1e0}, 0xc0b419c258, 0xc0ac102300, 0xc0000e6540, 0xc0ac117e08, 0xc000210710, 0x0, {0xc0b4384930, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b3d8e018})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 399 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 398
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 403 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 402
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 392 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0xc0abb880f0?, 0x2c?, 0x30?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).OldestXmin(0xbe6ca0?)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:360 +0x58
+github.com/goopg/goopg/internal/executor.tryApplyHOTUpdate(0xc0abed6780, {0xac310280?, 0xc0?, 0x4?}, {0xc00026f340, 0x4, 0x4}, 0x8d27, 0x3, {0xc0abede500, ...})
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:1384 +0x51b
+github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex(0xc0abe82240, {0x1?, 0x0?, 0xb8?}, {0xc00026f340, 0x4, 0x4})
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:1611 +0x7ca
+github.com/goopg/goopg/internal/executor.(*updateOp).Next(0xc0abe82240)
+	/home/ryo/work/goopg/goopg/internal/executor/operators_storage.go:1792 +0x46b
+github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt(0xc0001ba8c0, 0xc0ac2a0af0, 0xc0abed6780, {0xbe9e58?, 0xc0abc14160?}, 0xc0ac102e80, 0xc0ac0690f7, {0xc0ac069310, 0x1, 0x1})
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:740 +0xeb3
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abc90000}, 0xc0ac2a0af0, 0xc0ac069e08, {0xc0ac302af0, 0x4c}, 0xc0ac102e80, 0xc0b3d82200)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:373 +0x169b
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abc90000}, 0xc0ac2a0af0, 0xc0ac069e08, {0xc0001209a0?, 0x98fc01?, 0xc0ac069468?}, 0xc0ac102e80, 0xc0b3d82200)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abc90000}, 0xc0ac2a0af0, 0xc0ac069e08, {0xc0001209a0, 0x4d, 0x70}, 0xc0ac102e80, 0xc0b3d82200)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438acd0}, 0xc0b438e198, 0xc0b4224440, 0xc0ac2a0af0, 0xc0ac069e08, 0xc0b3d821d0, 0x0, {0xc0b3e085a0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4090010})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 453 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x40?, 0xa8?, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).Begin(0xc0000de000, 0x0)
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:191 +0x85
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0050}, 0xc0000e6770, 0xc0ac1fde08, {0xc0b3cc00c6, 0x6}, 0xc0b45a4040, 0xc0b4488090)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:149 +0xff
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0050}, 0xc0000e6770, 0xc0ac1fde08, {0xc0abbba000?, 0x98fc01?, 0xc0ac1fd468?}, 0xc0b45a4040, 0xc0b4488090)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abbb0050}, 0xc0000e6770, 0xc0ac1fde08, {0xc0abbba000, 0x7, 0x70}, 0xc0b45a4040, 0xc0b4488090)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b3f4a780}, 0xc000010198, 0xc0ac102ec0, 0xc0000e6770, 0xc0ac1fde08, 0xc0b4488050, 0x0, {0xc0ac602240, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4090100})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 434 [runnable]:
+internal/sync.runtime_Semrelease(0x1?, 0x0?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:124 +0x13
+internal/sync.(*Mutex).unlockSlow(0xc0abf27800?, 0xabf27800?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:232 +0x59
+internal/sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:198
+sync.(*Mutex).Unlock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:65
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac06d208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:279 +0x57a
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b400a8c0}, 0xc0ac2a0d90, 0xc0ac06de08, {0xc0abf84eb0, 0x47}, 0xc0b4224b80, 0xc0b428c4b0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:170 +0x1e8
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b400a8c0}, 0xc0ac2a0d90, 0xc0ac06de08, {0xc0abdb0460?, 0x98fc01?, 0xc0ac06d468?}, 0xc0b4224b80, 0xc0b428c4b0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b400a8c0}, 0xc0ac2a0d90, 0xc0ac06de08, {0xc0abdb0460, 0x48, 0x70}, 0xc0b4224b80, 0xc0b428c4b0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438b180}, 0xc0ac5861f8, 0xc0b4224a80, 0xc0ac2a0d90, 0xc0ac06de08, 0xc0b428c480, 0x0, {0xc0ac800848, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394148})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 435 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48e39d?, 0x78?, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xfcf840?, 0x1000009?, 0xc0ac3fd100?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b408a4b0}, 0xc0ac2a0d20, 0xc0ac3fde08, {0xc0b3cd0c80, 0x46}, 0xc0b4224a40, 0xc0b428c420)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:170 +0x1e8
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b408a4b0}, 0xc0ac2a0d20, 0xc0ac3fde08, {0xc0ac394930?, 0x98fc01?, 0xc0ac3fd468?}, 0xc0b4224a40, 0xc0b428c420)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b408a4b0}, 0xc0ac2a0d20, 0xc0ac3fde08, {0xc0ac394930, 0x47, 0x70}, 0xc0b4224a40, 0xc0b428c420)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b438b090}, 0xc0ac586198, 0xc0b4224900, 0xc0ac2a0d20, 0xc0ac3fde08, 0xc0b428c3f0, 0x0, {0xc0ac800728, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc0b4394150})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 185 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48e39d?, 0x50?, 0xc0002104f0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac35b208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0b448b4a0}, 0xc0abdb2cb0, 0xc0ac35be08, {0xc0abf851d0, 0x46}, 0xc0b40a2b80, 0xc0b3f486c0)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:170 +0x1e8
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0b448b4a0}, 0xc0abdb2cb0, 0xc0ac35be08, {0xc0ac000690?, 0xc0002104e0?, 0xc0ac35b468?}, 0xc0b40a2b80, 0xc0b3f486c0)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0b448b4a0}, 0xc0abdb2cb0, 0xc0ac35be08, {0xc0ac000690, 0x47, 0x70}, 0xc0b40a2b80, 0xc0b3f486c0)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b448ac80}, 0xc0b3cc2150, 0xc0b3d07080, 0xc0abdb2cb0, 0xc0ac35be08, 0xc0b43883b0, 0x0, {0xc0ac680820, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc000228060})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 186 [IO wait]:
+internal/poll.runtime_pollWait(0x7538e8918200, 0x72)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc0ac004380?, 0xc0ac044000?, 0x0)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc0ac004380, {0xc0ac044000, 0x1000, 0x1000})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x279
+net.(*netFD).Read(0xc0ac004380, {0xc0ac044000?, 0xc00021a120?, 0x0?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/fd_posix.go:68 +0x25
+net.(*conn).Read(0xc000228078, {0xc0ac044000?, 0x6d3380?, 0xc0ac11b2f0?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/net.go:196 +0x45
+bufio.(*Reader).Read(0xc0b45b09c0, {0xc0000126f9, 0x5, 0x41a885?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/bufio/bufio.go:245 +0x197
+io.ReadAtLeast({0xbe72c0, 0xc0b45b09c0}, {0xc0000126f9, 0x5, 0x5}, 0x5)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/io/io.go:335 +0x8e
+io.ReadFull(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/io/io.go:354
+github.com/goopg/goopg/internal/protocol.(*FrameReader).ReadFrame(0xc0b3d07100)
+	/home/ryo/work/goopg/goopg/internal/protocol/frame.go:115 +0xcb
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b448ad70}, 0xc0b3cc2108, 0xc0b3d07100, 0xc0abdb2d20, 0xc0ac11be08, 0xc0b4388350, 0x0, {0xc0ac680730, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:940 +0x216
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc000228078})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 187 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x48db39?, 0x1?, 0x0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac23b208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0ac5bc140}, 0xc0abdb2d90, 0xc0ac23be08, {0xc0ac7d6624, 0x4}, 0xc0b3d07380, 0xc0b4388320)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:344 +0x135a
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0ac5bc140}, 0xc0abdb2d90, 0xc0ac23be08, {0xc0abbbae00?, 0x98fc01?, 0xc0ac23b468?}, 0xc0b3d07380, 0xc0b4388320)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0ac5bc140}, 0xc0abdb2d90, 0xc0ac23be08, {0xc0abbbae00, 0x5, 0x70}, 0xc0b3d07380, 0xc0b4388320)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b448ae60}, 0xc0b3cc20c0, 0xc0b3d07240, 0xc0abdb2d90, 0xc0ac23be08, 0xc0b43882f0, 0x0, {0xc0ac6805d8, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc000228080})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 188 [sync.Mutex.Lock]:
+internal/sync.runtime_SemacquireMutex(0x45b4a0?, 0xc0?, 0x7?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sema.go:95 +0x25
+internal/sync.(*Mutex).lockSlow(0xc0000de000)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:149 +0x15d
+internal/sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/sync/mutex.go:70
+sync.(*Mutex).Lock(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/sync/mutex.go:46
+github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor(0xc0000de000, {0xc0ac7a1208?, 0xe19c7d82?, 0x0?})
+	/home/ryo/work/goopg/goopg/internal/mvcc/manager.go:264 +0x7e
+github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor(0xc0001ba8c0, {0xbebbf8, 0xc0abd01040}, 0xc0abdb2150, 0xc0ac7a1e08, {0xc0ac310756, 0x6}, 0xc0b40a2580, 0xc0b3f48650)
+	/home/ryo/work/goopg/goopg/internal/server/dispatch.go:170 +0x1e8
+github.com/goopg/goopg/internal/server.(*Server).handleQuery(0xc0001ba8c0, {0xbebbf8, 0xc0abd01040}, 0xc0abdb2150, 0xc0ac7a1e08, {0xc0abba45b0?, 0x98fc01?, 0xc0ac7a1468?}, 0xc0b40a2580, 0xc0b3f48650)
+	/home/ryo/work/goopg/goopg/internal/server/query.go:94 +0x62c
+github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy(0xc0001ba8c0, {0xbebbf8, 0xc0abd01040}, 0xc0abdb2150, 0xc0ac7a1e08, {0xc0abba45b0, 0x7, 0x70}, 0xc0b40a2580, 0xc0b3f48650)
+	/home/ryo/work/goopg/goopg/internal/server/copy.go:49 +0x3a5
+github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop(0xc0001ba8c0, {0xbebbf8, 0xc0b448a370}, 0xc0001a60f0, 0xc0b3d06140, 0xc0abdb2150, 0xc0ac7a1e08, 0xc0b3f48620, 0x0, {0xc0b3de03f0, ...})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:1021 +0x670
+github.com/goopg/goopg/internal/server.(*Server).serveConn(0xc0001ba8c0, {0xbebbf8, 0xc0b3cd6050}, {0xbef0f8, 0xc000228088})
+	/home/ryo/work/goopg/goopg/internal/server/server.go:752 +0x158a
+github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:558 +0x5c
+created by github.com/goopg/goopg/internal/server.(*Server).acceptLoop in goroutine 1
+	/home/ryo/work/goopg/goopg/internal/server/server.go:556 +0x19a
+
+goroutine 189 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 188
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 190 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 179
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 191 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 180
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 192 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 181
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 193 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 182
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 466 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 183
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 467 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 184
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 468 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 185
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 469 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 186
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 470 [select, 2 minutes]:
+github.com/goopg/goopg/internal/server.(*Server).serveConn.func2()
+	/home/ryo/work/goopg/goopg/internal/server/server.go:605 +0x74
+created by github.com/goopg/goopg/internal/server.(*Server).serveConn in goroutine 187
+	/home/ryo/work/goopg/goopg/internal/server/server.go:604 +0x339
+
+goroutine 472 [select]:
+net/http/pprof.sleep(0xc0ac2ea280, 0xc0ac30e5a0?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/pprof/pprof.go:117 +0x93
+net/http/pprof.Profile({0xbeb750, 0xc0ac30e5a0}, 0xc0ac2ea280)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/pprof/pprof.go:163 +0x345
+net/http.HandlerFunc.ServeHTTP(0xfabea0?, {0xbeb750?, 0xc0ac30e5a0?}, 0x669976?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:2322 +0x29
+net/http.(*ServeMux).ServeHTTP(0x47a559?, {0xbeb750, 0xc0ac30e5a0}, 0xc0ac2ea280)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:2861 +0x1c7
+net/http.serverHandler.ServeHTTP({0xc0ac102480?}, {0xbeb750?, 0xc0ac30e5a0?}, 0x1?)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:3340 +0x8e
+net/http.(*conn).serve(0xc0b458cb40, {0xbebbc0, 0xc0000c1860})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:2109 +0x665
+created by net/http.(*Server).Serve in goroutine 6
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:3493 +0x485
+
+goroutine 473 [IO wait]:
+internal/poll.runtime_pollWait(0x7538e8278600, 0x72)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/netpoll.go:351 +0x85
+internal/poll.(*pollDesc).wait(0xc0ac004800?, 0xc0ac1024a1?, 0x0)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:84 +0x27
+internal/poll.(*pollDesc).waitRead(...)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_poll_runtime.go:89
+internal/poll.(*FD).Read(0xc0ac004800, {0xc0ac1024a1, 0x1, 0x1})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/poll/fd_unix.go:165 +0x279
+net.(*netFD).Read(0xc0ac004800, {0xc0ac1024a1?, 0x7b5d7?, 0x0?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/fd_posix.go:68 +0x25
+net.(*conn).Read(0xc0ac108010, {0xc0ac1024a1?, 0xc00004a608?, 0xc000260e00?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/net.go:196 +0x45
+net/http.(*connReader).backgroundRead(0xc0ac102480)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:702 +0x33
+created by net/http.(*connReader).startBackgroundRead in goroutine 472
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/net/http/server.go:698 +0xb6
+
+goroutine 474 [sleep]:
+time.Sleep(0x5f5e100)
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/time.go:363 +0x165
+runtime/pprof.profileWriter({0xbe7580?, 0xc0ac30e5a0?})
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/pprof/pprof.go:863 +0x4a
+created by runtime/pprof.StartCPUProfile in goroutine 472
+	/home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/pprof/pprof.go:848 +0x136

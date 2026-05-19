@@ -1,0 +1,294 @@
+# go tool pprof -top -nodecount=40 -cum  /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c50_simple-update.cpu.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: cpu
+Time: 2026-05-18 12:17:57 JST
+Duration: 120.10s, Total samples = 354.33s (295.03%)
+Showing nodes accounting for 241.76s, 68.23% of 354.33s total
+Dropped 1110 nodes (cum <= 1.77s)
+Showing top 40 nodes out of 150
+      flat  flat%   sum%        cum   cum%
+     0.12s 0.034% 0.034%    265.21s 74.85%  runtime.systemstack
+     0.09s 0.025% 0.059%    257.64s 72.71%  runtime.gcBgMarkWorker
+     0.01s 0.0028% 0.062%    254.96s 71.96%  runtime.gcBgMarkWorker.func2
+    21.08s  5.95%  6.01%    254.88s 71.93%  runtime.gcDrain
+    48.15s 13.59% 19.60%    212.10s 59.86%  runtime.scanobject
+         0     0% 19.60%    164.23s 46.35%  runtime.gcDrainMarkWorkerIdle (inline)
+         0     0% 19.60%     90.65s 25.58%  runtime.gcDrainMarkWorkerDedicated (inline)
+    37.99s 10.72% 30.32%     54.41s 15.36%  runtime.findObject
+         0     0% 30.32%     49.29s 13.91%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+     0.03s 0.0085% 30.33%     49.29s 13.91%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0% 30.33%     49.29s 13.91%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+     0.01s 0.0028% 30.33%     46.11s 13.01%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+     0.06s 0.017% 30.35%     45.92s 12.96%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+     0.17s 0.048% 30.40%     45.72s 12.90%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+    12.68s  3.58% 33.98%     44.13s 12.45%  runtime.greyobject
+     0.03s 0.0085% 33.99%     32.46s  9.16%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+     0.05s 0.014% 34.00%     29.67s  8.37%  runtime.mcall
+    29.23s  8.25% 42.25%     29.23s  8.25%  internal/runtime/syscall.Syscall6
+     0.06s 0.017% 42.27%     28.17s  7.95%  syscall.RawSyscall6
+     0.27s 0.076% 42.34%     27.88s  7.87%  runtime.schedule
+    21.74s  6.14% 48.48%     26.41s  7.45%  runtime.typePointers.next
+     0.06s 0.017% 48.49%     24.29s  6.86%  runtime.park_m
+     0.01s 0.0028% 48.50%     23.82s  6.72%  syscall.Syscall
+    23.76s  6.71% 55.20%     23.76s  6.71%  runtime.futex
+     7.57s  2.14% 57.34%     21.68s  6.12%  runtime.(*mspan).typePointersOfUnchecked
+         0     0% 57.34%     18.52s  5.23%  github.com/goopg/goopg/internal/mvcc.(*Manager).Commit (inline)
+     0.05s 0.014% 57.35%     18.52s  5.23%  github.com/goopg/goopg/internal/mvcc.(*Manager).finish
+     0.05s 0.014% 57.37%     18.22s  5.14%  runtime.futexwakeup
+     0.01s 0.0028% 57.37%     17.84s  5.03%  github.com/goopg/goopg/internal/initdb.Open.func24
+         0     0% 57.37%     17.41s  4.91%  github.com/goopg/goopg/internal/mvcc.(*CLog).SetCommitted (inline)
+     0.03s 0.0085% 57.38%     17.41s  4.91%  github.com/goopg/goopg/internal/mvcc.(*CLog).setStatus
+         0     0% 57.38%     17.36s  4.90%  os.WriteFile
+         0     0% 57.38%     15.91s  4.49%  runtime.notewakeup
+     0.33s 0.093% 57.47%     15.05s  4.25%  runtime.findRunnable
+    12.07s  3.41% 60.88%     13.93s  3.93%  runtime.(*mspan).heapBitsSmallForAddr
+    12.31s  3.47% 64.35%     13.88s  3.92%  runtime.spanOf (inline)
+    13.64s  3.85% 68.20%     13.64s  3.85%  runtime.typePointers.nextFast (inline)
+     0.03s 0.0085% 68.21%     13.56s  3.83%  runtime.startm
+         0     0% 68.21%     12.32s  3.48%  internal/poll.ignoringEINTRIO (inline)
+     0.07s  0.02% 68.23%     11.17s  3.15%  runtime.wakep
+
+# top symbols (-list) — top 8 hot functions, flat order
+## -list total
+no matches found for regexp: total
+
+## -list cum%
+no matches found for regexp: cum%
+
+## -list runtime.scanobject
+Total: 354.33s
+ROUTINE ======================== runtime.scanobject in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/mgcmark.go
+    48.15s    212.10s (flat, cum) 59.86% of Total
+     1.98s      1.98s   1444:func scanobject(b uintptr, gcw *gcWork) {
+         .          .   1445:	// Prefetch object before we scan it.
+         .          .   1446:	//
+         .          .   1447:	// This will overlap fetching the beginning of the object with initial
+         .          .   1448:	// setup before we start scanning the object.
+      20ms       20ms   1449:	sys.Prefetch(b)
+         .          .   1450:
+         .          .   1451:	// Find the bits for b and the size of the object at b.
+         .          .   1452:	//
+         .          .   1453:	// b is either the beginning of an object, in which case this
+         .          .   1454:	// is the size of the object to scan, or it points to an
+         .          .   1455:	// oblet, in which case we compute the size to scan below.
+     100ms      9.34s   1456:	s := spanOfUnchecked(b)
+     270ms      270ms   1457:	n := s.elemsize
+     3.36s      3.36s   1458:	if n == 0 {
+         .          .   1459:		throw("scanobject n == 0")
+         .          .   1460:	}
+     550ms      690ms   1461:	if s.spanclass.noscan() {
+         .          .   1462:		// Correctness-wise this is ok, but it's inefficient
+         .          .   1463:		// if noscan objects reach here.
+         .          .   1464:		throw("scanobject of a noscan object")
+         .          .   1465:	}
+         .          .   1466:
+         .          .   1467:	var tp typePointers
+     690ms      690ms   1468:	if n > maxObletBytes {
+         .          .   1469:		// Large object. Break into oblets for better
+         .          .   1470:		// parallelism and lower latency.
+         .          .   1471:		if b == s.base() {
+         .          .   1472:			// Enqueue the other oblets to scan later.
+         .          .   1473:			// Some oblets may be in b's scalar tail, but
+         .          .   1474:			// these will be marked as "no more pointers",
+         .          .   1475:			// so we'll drop out immediately when we go to
+         .          .   1476:			// scan those.
+         .          .   1477:			for oblet := b + maxObletBytes; oblet < s.base()+s.elemsize; oblet += maxObletBytes {
+         .          .   1478:				if !gcw.putObjFast(oblet) {
+         .          .   1479:					gcw.putObj(oblet)
+         .          .   1480:				}
+
+## -list runtime.findObject
+Total: 354.33s
+ROUTINE ======================== runtime.findObject in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/mbitmap.go
+    37.99s     54.41s (flat, cum) 15.36% of Total
+     2.10s      2.10s   1319:func findObject(p, refBase, refOff uintptr) (base uintptr, s *mspan, objIndex uintptr) {
+     110ms     13.98s   1320:	s = spanOf(p)
+         .          .   1321:	// If s is nil, the virtual address has never been part of the heap.
+         .          .   1322:	// This pointer may be to some mmap'd region, so we allow it.
+     1.99s      1.99s   1323:	if s == nil {
+     9.37s      9.37s   1324:		if (GOARCH == "amd64" || GOARCH == "arm64") && p == clobberdeadPtr && debug.invalidptr != 0 {
+         .          .   1325:			// Crash if clobberdeadPtr is seen. Only on AMD64 and ARM64 for now,
+         .          .   1326:			// as they are the only platform where compiler's clobberdead mode is
+         .          .   1327:			// implemented. On these platforms clobberdeadPtr cannot be a valid address.
+         .          .   1328:			badPointer(s, p, refBase, refOff)
+         .          .   1329:		}
+      30ms       30ms   1330:		return
+         .          .   1331:	}
+         .          .   1332:	// If p is a bad pointer, it may not be in s's bounds.
+         .          .   1333:	//
+         .          .   1334:	// Check s.state to synchronize with span initialization
+         .          .   1335:	// before checking other fields. See also spanOfHeap.
+    12.85s     12.87s   1336:	if state := s.state.get(); state != mSpanInUse || p < s.base() || p >= s.limit {
+         .          .   1337:		// Pointers into stacks are also ok, the runtime manages these explicitly.
+         .          .   1338:		if state == mSpanManual {
+         .          .   1339:			return
+         .          .   1340:		}
+         .          .   1341:		// The following ensures that we are rigorous about what data
+         .          .   1342:		// structures hold valid pointers.
+         .          .   1343:		if debug.invalidptr != 0 {
+         .          .   1344:			badPointer(s, p, refBase, refOff)
+         .          .   1345:		}
+         .          .   1346:		return
+         .          .   1347:	}
+         .          .   1348:
+     4.98s      7.51s   1349:	objIndex = s.objIndex(p)
+     5.49s      5.49s   1350:	base = s.base() + objIndex*s.elemsize
+     1.07s      1.07s   1351:	return
+         .          .   1352:}
+         .          .   1353:
+         .          .   1354:// reflect_verifyNotInHeapPtr reports whether converting the not-in-heap pointer into a unsafe.Pointer is ok.
+         .          .   1355://
+
+## -list internal/runtime/syscall.Syscall6
+Total: 354.33s
+ROUTINE ======================== internal/runtime/syscall.Syscall6 in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/internal/runtime/syscall/asm_linux_amd64.s
+    29.23s     29.23s (flat, cum)  8.25% of Total
+         .          .     27:TEXT ·Syscall6<ABIInternal>(SB),NOSPLIT,$0
+         .          .     28:	// a6 already in R9.
+         .          .     29:	// a5 already in R8.
+         .          .     30:	MOVQ	SI, R10 // a4
+      10ms       10ms     31:	MOVQ	DI, DX  // a3
+         .          .     32:	MOVQ	CX, SI  // a2
+         .          .     33:	MOVQ	BX, DI  // a1
+         .          .     34:	// num already in AX.
+         .          .     35:	SYSCALL
+    29.19s     29.19s     36:	CMPQ	AX, $0xfffffffffffff001
+      20ms       20ms     37:	JLS	ok
+         .          .     38:	NEGQ	AX
+         .          .     39:	MOVQ	AX, CX  // errno
+         .          .     40:	MOVQ	$-1, AX // r1
+         .          .     41:	MOVQ	$0, BX  // r2
+         .          .     42:	RET
+         .          .     43:ok:
+         .          .     44:	// r1 already in AX.
+         .          .     45:	MOVQ	DX, BX // r2
+      10ms       10ms     46:	MOVQ	$0, CX // errno
+         .          .     47:	RET
+
+## -list runtime.futex
+Total: 354.33s
+ROUTINE ======================== runtime.futex in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/sys_linux_amd64.s
+    23.76s     23.76s (flat, cum)  6.71% of Total
+         .          .    549:TEXT runtime·futex(SB),NOSPLIT,$0
+         .          .    550:	MOVQ	addr+0(FP), DI
+         .          .    551:	MOVL	op+8(FP), SI
+         .          .    552:	MOVL	val+12(FP), DX
+         .          .    553:	MOVQ	ts+16(FP), R10
+         .          .    554:	MOVQ	addr2+24(FP), R8
+         .          .    555:	MOVL	val3+32(FP), R9
+         .          .    556:	MOVL	$SYS_futex, AX
+     960ms      960ms    557:	SYSCALL
+    22.67s     22.67s    558:	MOVL	AX, ret+40(FP)
+     130ms      130ms    559:	RET
+         .          .    560:
+         .          .    561:// int32 clone(int32 flags, void *stk, M *mp, G *gp, void (*fn)(void));
+         .          .    562:TEXT runtime·clone(SB),NOSPLIT|NOFRAME,$0
+         .          .    563:	MOVL	flags+0(FP), DI
+         .          .    564:	MOVQ	stk+8(FP), SI
+ROUTINE ======================== runtime.futexsleep in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/os_linux.go
+      70ms      5.66s (flat, cum)  1.60% of Total
+         .          .     69:func futexsleep(addr *uint32, val uint32, ns int64) {
+         .          .     70:	// Some Linux kernels have a bug where futex of
+         .          .     71:	// FUTEX_WAIT returns an internal error code
+         .          .     72:	// as an errno. Libpthread ignores the return value
+         .          .     73:	// here, and so can we: as it says a few lines up,
+         .          .     74:	// spurious wakeups are allowed.
+         .          .     75:	if ns < 0 {
+      40ms      5.36s     76:		futex(unsafe.Pointer(addr), _FUTEX_WAIT_PRIVATE, val, nil, nil, 0)
+      20ms       20ms     77:		return
+         .          .     78:	}
+         .          .     79:
+         .          .     80:	var ts timespec
+         .          .     81:	ts.setNsec(ns)
+      10ms      280ms     82:	futex(unsafe.Pointer(addr), _FUTEX_WAIT_PRIVATE, val, unsafe.Pointer(&ts), nil, 0)
+         .          .     83:}
+         .          .     84:
+         .          .     85:// If any procs are sleeping on addr, wake up at most cnt.
+         .          .     86://
+         .          .     87://go:nosplit
+
+## -list runtime.typePointers.next
+Total: 354.33s
+ROUTINE ======================== runtime.typePointers.next in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/mbitmap.go
+    21.74s     26.41s (flat, cum)  7.45% of Total
+     3.20s      3.20s    243:func (tp typePointers) next(limit uintptr) (typePointers, uintptr) {
+     6.01s      6.01s    244:	for {
+     970ms      970ms    245:		if tp.mask != 0 {
+     2.09s      6.09s    246:			return tp.nextFast()
+         .          .    247:		}
+         .          .    248:
+         .          .    249:		// Stop if we don't actually have type information.
+     200ms      200ms    250:		if tp.typ == nil {
+     2.62s      2.62s    251:			return typePointers{}, 0
+         .          .    252:		}
+         .          .    253:
+         .          .    254:		// Advance to the next element if necessary.
+     1.48s      1.48s    255:		if tp.addr+goarch.PtrSize*ptrBits >= tp.elem+tp.typ.PtrBytes {
+     490ms      490ms    256:			tp.elem += tp.typ.Size_
+      20ms       20ms    257:			tp.addr = tp.elem
+         .          .    258:		} else {
+         .          .    259:			tp.addr += ptrBits * goarch.PtrSize
+         .          .    260:		}
+         .          .    261:
+         .          .    262:		// Check if we've exceeded the limit with the last update.
+     530ms      530ms    263:		if tp.addr >= limit {
+      10ms       10ms    264:			return typePointers{}, 0
+         .          .    265:		}
+         .          .    266:
+         .          .    267:		// Grab more bits and try again.
+     980ms      1.65s    268:		tp.mask = readUintptr(addb(getGCMask(tp.typ), (tp.addr-tp.elem)/goarch.PtrSize/8))
+     3.08s      3.08s    269:		if tp.addr+goarch.PtrSize*ptrBits > limit {
+      10ms       10ms    270:			bits := (tp.addr + goarch.PtrSize*ptrBits - limit) / goarch.PtrSize
+      50ms       50ms    271:			tp.mask &^= ((1 << (bits)) - 1) << (ptrBits - bits)
+         .          .    272:		}
+         .          .    273:	}
+         .          .    274:}
+         .          .    275:
+         .          .    276:// fastForward moves the iterator forward by n bytes. n must be a multiple
+ROUTINE ======================== runtime.typePointers.nextFast in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/mbitmap.go
+    13.64s     13.64s (flat, cum)  3.85% of Total
+         .          .    212:func (tp typePointers) nextFast() (typePointers, uintptr) {
+
+## -list runtime.gcDrain
+Total: 354.33s
+ROUTINE ======================== runtime.gcDrain in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/mgcmark.go
+    21.08s    254.88s (flat, cum) 71.93% of Total
+         .          .   1169:func gcDrain(gcw *gcWork, flags gcDrainFlags) {
+         .          .   1170:	if !writeBarrier.enabled {
+         .          .   1171:		throw("gcDrain phase incorrect")
+         .          .   1172:	}
+         .          .   1173:
+         .          .   1174:	// N.B. We must be running in a non-preemptible context, so it's
+         .          .   1175:	// safe to hold a reference to our P here.
+         .          .   1176:	gp := getg().m.curg
+         .          .   1177:	pp := gp.m.p.ptr()
+     900ms      900ms   1178:	preemptible := flags&gcDrainUntilPreempt != 0
+     530ms      530ms   1179:	flushBgCredit := flags&gcDrainFlushBgCredit != 0
+         .          .   1180:	idle := flags&gcDrainIdle != 0
+         .          .   1181:
+         .          .   1182:	initScanWork := gcw.heapScanWork
+         .          .   1183:
+         .          .   1184:	// checkWork is the scan work before performing the next
+         .          .   1185:	// self-preempt check.
+         .          .   1186:	checkWork := int64(1<<63 - 1)
+         .          .   1187:	var check func() bool
+         .          .   1188:	if flags&(gcDrainIdle|gcDrainFractional) != 0 {
+         .          .   1189:		checkWork = initScanWork + drainCheckThreshold
+         .          .   1190:		if idle {
+         .          .   1191:			check = pollWork
+         .          .   1192:		} else if flags&gcDrainFractional != 0 {
+         .          .   1193:			check = pollFractionalWorkerExit
+         .          .   1194:		}
+         .          .   1195:	}
+         .          .   1196:
+         .          .   1197:	// Drain root marking jobs.
+      10ms       10ms   1198:	if work.markrootNext < work.markrootJobs {
+         .          .   1199:		// Stop if we're preemptible, if someone wants to STW, or if
+         .          .   1200:		// someone is calling forEachP.
+      10ms       10ms   1201:		for !(gp.preempt && (preemptible || sched.gcwaiting.Load() || pp.runSafePointFn != 0)) {
+         .          .   1202:			job := atomic.Xadd(&work.markrootNext, +1) - 1
+     120ms      120ms   1203:			if job >= work.markrootJobs {
+         .          .   1204:				break
+         .          .   1205:			}
+

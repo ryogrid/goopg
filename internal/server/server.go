@@ -154,6 +154,12 @@ type Config struct {
 	// already-primary process from a stray `goopg promote`.
 	Promote func() error
 
+	// IsStandby, when non-nil, returns true if the server is currently
+	// acting as a hot standby. pg_is_in_recovery() calls this on every
+	// query. nil makes pg_is_in_recovery() return false (primary mode).
+	// M0106-0010 batched-34.
+	IsStandby func() bool
+
 	// AutovacuumLauncher, when set, is started as a background
 	// goroutine during Run. nil disables autovacuum.
 	AutovacuumLauncher *autovacuum.Launcher
@@ -171,10 +177,24 @@ type Config struct {
 	// docs/design/0005-0001-streaming-replication-architecture.md.
 	Slots *wal.Slots
 
+	// SyncRep is the synchronous-replication wait primitive
+	// (M0102-0005). When non-nil the commit path may call
+	// SyncRep.WaitForLSN(commitLSN, mode) after local flush, and the
+	// walsender feedback handler calls SyncRep.UpdateStandbyProgress
+	// for every Standby Status Update it receives. nil disables sync
+	// replication entirely; goopg in async mode is upstream's default.
+	SyncRep *wal.SyncRep
+
 	// WalSenders, when set, lets each walsender goroutine register
 	// itself so the pg_stat_replication virtual view can render a
 	// live row per active sender. nil makes registration a no-op.
 	WalSenders *wal.Senders
+
+	// LogCanonical, when non-nil, emits PG-canonical WAL records for
+	// catalog DDL (XLOG_HEAP_INSERT, XLOG_BTREE_INSERT_LEAF) so a vanilla
+	// PG18 standby can replay them. Wired by cmd/goopg from Runtime.LogCanonical
+	// when PageHeaders mode is active. M0106-0010 batched-32.
+	LogCanonical catalog.LogCanonicalFunc
 
 	// WAL exposes the WAL writer's WrittenLSN() so IDENTIFY_SYSTEM
 	// can report a current xlogpos. nil → IDENTIFY_SYSTEM reports
@@ -278,6 +298,11 @@ type Server struct {
 	// pc is the cross-session normalized-query plan cache. M0098-0005.
 	// nil when the server is in protocol-only mode (no catalog/storage).
 	pc *planCache
+
+	// applyLauncher is the logical-replication subscription
+	// auto-launcher (M0103-0002). nil when PubSub is unconfigured.
+	// Constructed in New, started in Run, drained on Run exit.
+	applyLauncher *ApplyLauncher
 }
 
 // New constructs a Server but does not start listening. Use Run to start.
@@ -294,8 +319,27 @@ func New(cfg Config) *Server {
 	if cfg.hasStorage() {
 		s.pc = newPlanCache()
 	}
+	// Build the apply-worker launcher when logical replication is
+	// wired (PubSub + storage handles). Server.Run starts it so its
+	// lifetime matches the listener's. M0103-0002.
+	if cfg.PubSub != nil && cfg.hasStorage() {
+		s.applyLauncher = NewApplyLauncher(ApplyLauncherConfig{
+			PubSub:  cfg.PubSub,
+			Catalog: cfg.Catalog,
+			Pool:    cfg.Pool,
+			TxnMgr:  cfg.TxnMgr,
+			Slots:   cfg.Slots,
+			Logger:  cfg.Logger,
+		})
+	}
 	return s
 }
+
+// ApplyLauncher exposes the logical-replication subscription
+// auto-launcher attached to this Server. Returns nil when PubSub or
+// storage is unconfigured. Test-only accessor; production code paths
+// use the wake hook plumbed through executor.Context.
+func (s *Server) ApplyLauncher() *ApplyLauncher { return s.applyLauncher }
 
 // Addr returns the listen address (resolved port if the config used :0).
 // Returns nil before Run has bound the listener; callers in tests should
@@ -383,6 +427,13 @@ func (s *Server) Run(ctx context.Context) error {
 		<-runCtx.Done()
 		s.closeOnce.Do(func() { _ = ln.Close() })
 	}()
+
+	// Start the apply-worker auto-launcher if logical replication
+	// is wired. M0103-0002. Lifetime is bound to runCtx so a STOP
+	// from the control plane drains every in-flight apply worker.
+	if s.applyLauncher != nil {
+		go s.applyLauncher.Run(runCtx)
+	}
 
 	// Start the autovacuum launcher if configured.
 	if s.cfg.AutovacuumLauncher != nil {
@@ -710,7 +761,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication)
+	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -888,7 +939,7 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // simple Query messages into handleQuery; Terminate closes the connection
 // cleanly; anything else is an "unsupported" ErrorResponse followed by
 // another ReadyForQuery so the client can keep going.
-func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName string) {
 	extended := newExtendedState()
 	connTx := &connTxState{}         // per-connection explicit transaction state (M0096-0005)
 	prepStmts := newPreparedStatements() // per-connection prepared statements (M0096-0006)
@@ -956,10 +1007,10 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 			// falls back to the normal handler so utility commands
 			// like SHOW still work for diagnostics.
 			if isReplication {
-				handled, err := s.handleReplicationCommand(ctx, r, w, f.Payload)
-				entry.clearQueryCancel()
-				queryCancel()
+				handled, err := s.handleReplicationCommand(ctx, r, w, f.Payload, appName)
 				if err != nil {
+					entry.clearQueryCancel()
+					queryCancel()
 					if errors.Is(err, errQueryErrorSent) {
 						// Error + ReadyForQuery already sent cleanly.
 						break
@@ -968,8 +1019,16 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 					return
 				}
 				if handled {
+					entry.clearQueryCancel()
+					queryCancel()
 					break
 				}
+				// Fall through to the regular SQL path with the live
+				// queryCtx still intact — PG's libpqrcv issues plain
+				// SELECTs (pg_publication probes during CREATE
+				// SUBSCRIPTION) on the same replication=database
+				// connection and the cancellation must not fire until
+				// handleQueryOrCopy completes.
 			}
 			nextCopyIn, err := s.handleQueryOrCopy(queryCtx, w, sess, f.Payload, connTx, prepStmts)
 			entry.clearQueryCancel()

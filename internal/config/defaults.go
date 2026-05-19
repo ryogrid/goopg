@@ -91,6 +91,35 @@ func BuildDefaultRegistry() *Registry {
 		Context:     ContextUserset,
 		Scope:       ScopeSession | ScopeTransaction,
 	}))
+	// SSI predicate-lock sizing (M0104-0003). Names, defaults, and
+	// ranges mirror postgres/src/backend/utils/misc/guc_tables.c so
+	// existing tooling (postgresql.conf templates, parameter probes,
+	// pgbench setups) keeps working unchanged.
+	//
+	// Upstream encodes the per-relation default as -2 (and per-xact-
+	// coarsened-from-per-relation as a negative fraction). goopg
+	// surfaces the GUC values verbatim here so the server-side
+	// bridge into `mvcc.Manager.SetPredicateLockLimits` is the
+	// only place that resolves the negative shorthand into positive
+	// coarsening thresholds.
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_predicate_locks_per_xact", Type: TypeInt, BootVal: "64",
+		MinVal: 10, MaxVal: 1 << 30,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_predicate_locks_per_relation", Type: TypeInt, BootVal: "-2",
+		MinVal: -1 << 30, MaxVal: 1 << 30,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_predicate_locks_per_page", Type: TypeInt, BootVal: "2",
+		MinVal: 0, MaxVal: 1 << 16,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 
 	// connection-level GUCs that goopg actually honours today.
 	r.MustRegister(NewVariable(Variable{
@@ -107,6 +136,27 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "max_connections", Type: TypeInt, BootVal: "100",
 		MinVal: 1, MaxVal: 262143,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	// Resource-sizing GUCs echoed into global/pg_control by InitControlFile
+	// (xlog.c:4223-4227) so a standby's CheckRequiredParameterValues can
+	// verify it has at least as many resources as the primary.
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_worker_processes", Type: TypeInt, BootVal: "8",
+		MinVal: 0, MaxVal: 262143,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_prepared_transactions", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: 262143,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "max_locks_per_transaction", Type: TypeInt, BootVal: "64",
+		MinVal: 10, MaxVal: 2147483647,
 		Context: ContextPostmaster,
 		Scope:   ScopeServer,
 	}))
@@ -230,10 +280,30 @@ func BuildDefaultRegistry() *Registry {
 	// faster commits at the cost of losing recent committed transactions
 	// on a server crash (up to wal_writer_delay latency). See
 	// docs/design/0042-0003-wal-buffer-and-writer-alignment.md.
+	//
+	// M0102-0005: upstream extends this GUC beyond a plain on/off boolean
+	// to a 5-level enum (off / local / remote_write / on=remote_flush /
+	// remote_apply). goopg accepts the enum spellings via TypeString so a
+	// session can set `SET synchronous_commit = remote_apply` without a
+	// parse error; the actual wait semantics live in
+	// `internal/wal/syncrep.go`. `on` is the boot default, matching upstream.
 	r.MustRegister(NewVariable(Variable{
-		Name: "synchronous_commit", Type: TypeBool, BootVal: "on",
+		Name: "synchronous_commit", Type: TypeString, BootVal: "on",
 		Context: ContextUserset,
 		Scope:   ScopeSession,
+	}))
+
+	// synchronous_standby_names selects which standbys must acknowledge a
+	// COMMIT before the primary releases its waiter. Grammar mirrors
+	// upstream: empty = async (no wait); 'name' or 'a, b' = wait for any
+	// listed (PG-pre-9.6 form, now == FIRST 1); 'FIRST n (a, b, c)' = wait
+	// for the first n in list order; 'ANY n (a, b, c)' = wait for any n
+	// of the listed names. A standby is identified by its
+	// application_name. See docs/design/0102-0005-synchronous-replication.md.
+	r.MustRegister(NewVariable(Variable{
+		Name: "synchronous_standby_names", Type: TypeString, BootVal: "",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
 	}))
 
 	// wal_writer_delay sets the period (in milliseconds) of the
@@ -478,6 +548,46 @@ func BuildDefaultRegistry() *Registry {
 	// Streaming-replication GUCs (milestone 0005). Names, units,
 	// ranges, and defaults mirror upstream's
 	// postgres/src/backend/utils/misc/guc_tables.c entries.
+
+	// data_directory_mode is reported by upstream as the permission
+	// mask of the data directory; pg_basebackup issues `SHOW
+	// data_directory_mode` early in its replication handshake to
+	// preserve permissions on the cloned cluster. v0 always uses
+	// 0700 (group read/write disallowed); see upstream guc_tables.c
+	// "data_directory_mode" entry.
+	// wal_segment_size reports the WAL segment size the primary
+	// writes. pg_basebackup issues `SHOW wal_segment_size` to size
+	// its WAL streaming buffers and align the backup stream with
+	// segment boundaries; upstream's parser (sscanf "%d%s") expects
+	// the value to carry a unit suffix ("16MB"), so we report it as
+	// a pre-formatted string. goopg v0 always uses 16 MiB segments
+	// (wal.DefaultSegmentSize); see upstream guc_tables.c
+	// "wal_segment_size".
+	r.MustRegister(NewVariable(Variable{
+		Name: "wal_segment_size", Type: TypeString, BootVal: "16MB",
+		Context: ContextInternal,
+		Flags:   FlagDisallowInFile,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "data_directory_mode", Type: TypeInt, BootVal: "448",
+		MinVal:  0,
+		MaxVal:  511,
+		Context: ContextInternal,
+		Flags:   FlagDisallowInFile,
+		Scope:   ScopeServer,
+	}))
+
+	// summarize_wal toggles the WAL-summarizer background worker (PG17+).
+	// pg_basebackup issues `SHOW summarize_wal` during option negotiation
+	// to decide whether incremental backups are available; goopg v0 has
+	// no summarizer so the value is always off. Full implementation
+	// tracked in M0095-0002.
+	r.MustRegister(NewVariable(Variable{
+		Name: "summarize_wal", Type: TypeBool, BootVal: "off",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 
 	// Primary-side: how many concurrent replication connections /
 	// slots / how long the walsender waits for client status

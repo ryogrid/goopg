@@ -144,8 +144,25 @@ While using PostgreSQL as the oracle, always account for:
 
 ## LSP
 
-`gopls` is the recommended LSP for navigating `goopg`'s own code. Use it for
-"go to definition", references, and rename refactors.
+Use Serena as the first-choice code intelligence layer for Go work in this
+repository. When Serena is connected, prefer Serena symbol tools for
+definition/reference/rename/refactor flows over broad file scanning.
+
+Serena is project-scoped via `.mcp.json` and should start from the local clone
+under `serena/` using:
+
+`uv run --directory /home/ryo/work/goopg/goopg/serena serena start-mcp-server --context=claude-code --project /home/ryo/work/goopg/goopg`
+
+`gopls` is still required as the underlying Go language server for Serena's Go
+support. If missing, install it with:
+
+`go install golang.org/x/tools/gopls@latest`
+
+If Go symbol operations fail:
+1. Verify Serena is connected in Claude (`/mcp`) and reconnect if needed.
+2. Ensure the active Serena project is `/home/ryo/work/goopg/goopg`.
+3. If `gopls` was installed or settings changed, restart Serena (or restart the
+  language server from the client) before retrying.
 
 ## Runtime expectations
 
@@ -197,4 +214,21 @@ While using PostgreSQL as the oracle, always account for:
   origin is chosen later).
 - Reported `server_version` is tracked in design doc `root-0001-architecture-overview.md`
   so client gating (`pgx`, JDBC, `psql`) behaves predictably.
+
+## Vanilla PG Compatibility (ABSOLUTE)
+
+The entire purpose is compativility with a **vanilla, unmodified PostgreSQL**.
+If something doesn't work, the fix belongs in **goopg**, not in PG.
+
+**Permitted PG interactions**:
+- Adding `elog(DEBUG1, ...)` calls for diagnostic purposes (must be reverted
+  after the investigation concludes).
+- Reading PG source code to understand wire format, catalog layout, and
+  expected invariants.
+- Running `make install` to rebuild PG after adding/removing debug logging.
+
+Absolutely forbidden:
+- Changing PG function signatures, struct layouts, or logic.
+- Adding `if (goopg_compat) {...}` branches or similar workarounds.
+- Any change that would make PG behave differently from upstream release.
 

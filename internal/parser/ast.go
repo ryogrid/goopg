@@ -664,8 +664,14 @@ type InsertStmt struct {
 	With       *WithClause
 	Target     RangeVar
 	Columns    []string // empty when no column list — INSERT defaults to declared order
-	Rows       [][]Expr // each row is a parenthesised tuple; nil when Select != nil
+	Rows       [][]Expr // each row is a parenthesised tuple; nil when Select != nil or DefaultValues
 	Select     *SelectStmt // INSERT … SELECT support (M0096-0006); nil when Rows != nil
+	// DefaultValues is true for `INSERT INTO t DEFAULT VALUES` — the
+	// all-defaults form. Mutually exclusive with Rows/Select; Rows stays
+	// nil at parse time. The planner expands this into a single row of
+	// DefaultMarkers sized to the target's insertable columns. M0103-0007
+	// rung 17.
+	DefaultValues bool
 	OnConflict *OnConflictClause
 	Returning  []ResTarget
 }
@@ -807,6 +813,11 @@ type ColumnDef struct {
 	// GeneratedExpr holds the raw SQL expression text (without surrounding parens)
 	// for a stored generated column. Empty for ordinary columns.
 	GeneratedExpr string
+
+	// DefaultExpr holds the parsed AST of the column's DEFAULT clause when
+	// one was given (`col INT DEFAULT 0`). nil for columns without a DEFAULT.
+	// M0103-0007 rung 13.
+	DefaultExpr Expr
 
 	// FK fields — populated when the column has an inline REFERENCES clause.
 	// M0096-0011.

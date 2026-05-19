@@ -44,6 +44,16 @@ const (
 	pgoInsert   = 'I'
 	pgoDelete   = 'D'
 	pgoUpdate   = 'U'
+	pgoTruncate = 'T'
+)
+
+// pgoutput TRUNCATE option-bit constants. Mirror upstream's
+// `TRUNCATE_CASCADE` / `TRUNCATE_RESTART_SEQS` in
+// postgres/src/include/replication/logicalproto.h. The byte is a
+// bitmask: bit 0 = CASCADE, bit 1 = RESTART IDENTITY.
+const (
+	pgoTruncateCascade        byte = 0x01
+	pgoTruncateRestartSeqs    byte = 0x02
 )
 
 // pgoutput tuple-column status bytes. Mirror upstream's
@@ -241,7 +251,15 @@ func (p *PgOutput) writeDelete(rel *RelationDef, oldTuple []byte) error {
 }
 
 func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) error {
-	// 'U' | rel_oid(4) | 'O' | OldTupleData | 'N' | NewTupleData
+	// 'U' | rel_oid(4) | ['K'|'O' + OldTupleData]? | 'N' | NewTupleData
+	//
+	// Upstream `logicalrep_write_update` (proto.c) emits the K/O block
+	// only when the old slot is non-NULL. With REPLICA IDENTITY DEFAULT
+	// and no replica-identity column modified, the byte after rel_oid
+	// is 'N' directly — there is NO 'K' + natts=0 placeholder. Emitting
+	// one (the goopg pre-2026-05-14 behaviour) was rejected by libpq
+	// subscribers as malformed since natts=0 violates the relation's
+	// declared column count.
 	newBody, err := encodePgoTuple(rel.Columns, newTuple)
 	if err != nil {
 		return fmt.Errorf("pgoutput: encode update new-tuple for %q: %w", rel.Name, err)
@@ -256,9 +274,6 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 		}
 		buf = append(buf, 'O')
 		buf = append(buf, oldBody...)
-	} else {
-		buf = append(buf, 'K')
-		buf = appendUint16(buf, 0)
 	}
 	buf = append(buf, 'N')
 	buf = append(buf, newBody...)

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -385,6 +388,35 @@ const (
 	//   numHeapTuples(8) | lastCleanupNumDeletedTuples(8)
 	RecordKindBtreeMetaCleanup byte = 31
 
+	// RecordKindXactCommitInval is a commit record that additionally signals
+	// relcache-init-file invalidation (M0106-0010 batched-31). Emitted when a
+	// committed transaction wrote to a nailed catalog relation (pg_class,
+	// pg_attribute, pg_proc, or pg_type). On the standby, the replay path
+	// calls ProcessCommittedInvalidationMessages to unlink both
+	// pg_internal.init files so the next backend recreates them. Format is
+	// identical to RecordKindXactCommit: "kind(1) | xid(4)" = 5 bytes; the
+	// invalidation is implicit in the kind byte rather than encoded as a flag.
+	RecordKindXactCommitInval byte = 32
+
+	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
+	// references + main data) so a PG18 standby can replay catalog heap and
+	// btree insertions that goopg performs during DDL. The 7-byte envelope
+	// header carries the rmgr/info/xid for the XLogRecord; the body follows.
+	// When the WAL writer is in PageHeaders mode, classifyXLogRecord (format.go)
+	// extracts these fields and wrapXLogMainData passes the body through
+	// unchanged, producing a correct PG-canonical XLogRecord on disk.
+	// Goopg's own crash recovery replays these records via replayDecodedXLogRecord
+	// (since nativeApplyRecordKindKnown returns false for this byte), which
+	// uses the FPI in the block reference to restore the catalog page.
+	// M0106-0010 batched-32.
+	RecordKindCanonical byte = 0xFE
+
+	// defaultRecoveryDBOid is the database OID used by
+	// ProcessCommittedInvalidationMessages when unlinking the per-database
+	// pg_internal.init. Matches catalog.DefaultDBOid = 1 (v0 single-database
+	// cluster). Kept as a local constant to avoid a circular import.
+	defaultRecoveryDBOid uint32 = 1
+
 	// btreeMetaCleanupSize: kind(1)+DBOid(4)+RelOid(4)+Fork(1)
 	// +numHeapTuples(8)+lastCleanupNumDeletedTuples(8) = 26.
 	btreeMetaCleanupSize = 26
@@ -730,6 +762,41 @@ func EncodeXactAbort(xid storage.TransactionID) []byte {
 	return out
 }
 
+// EncodeXactCommitInval returns a 5-byte commit-with-relcache-invalidation
+// WAL payload. It is used instead of EncodeXactCommit when the committing
+// transaction wrote to a nailed catalog relation. On the standby, the replay
+// path calls ProcessCommittedInvalidationMessages before delivering the commit.
+func EncodeXactCommitInval(xid storage.TransactionID) []byte {
+	out := make([]byte, xactRecordSize)
+	out[0] = RecordKindXactCommitInval
+	binary.LittleEndian.PutUint32(out[1:5], uint32(xid))
+	return out
+}
+
+// ProcessCommittedInvalidationMessages unlinks both pg_internal.init files
+// (global/pg_internal.init and base/<dboid>/pg_internal.init) so the next
+// backend reloads fresh relcache descriptors. ENOENT is silently ignored.
+//
+// On the primary, this is called by the xact-marker hook inside open.go.
+// On the standby, this is called by ApplyRecord when it processes a
+// RecordKindXactCommitInval WAL record. Mirrors PG's
+// inval.c:ProcessCommittedInvalidationMessages (standby-side redo path).
+func ProcessCommittedInvalidationMessages(dataDir string, dboid uint32) error {
+	paths := [2]string{
+		filepath.Join(dataDir, "global", "pg_internal.init"),
+		filepath.Join(dataDir, "base", fmt.Sprintf("%d", dboid), "pg_internal.init"),
+	}
+	var firstErr error
+	for _, p := range paths {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("relcache init unlink %s: %w", p, err)
+			}
+		}
+	}
+	return firstErr
+}
+
 // DecodeXactMarker returns the xid carried by a commit or abort
 // marker payload. The caller already knows the kind from the
 // payload's first byte; this helper just unpacks the xid.
@@ -737,7 +804,10 @@ func DecodeXactMarker(payload []byte) (storage.TransactionID, error) {
 	if len(payload) != xactRecordSize {
 		return 0, fmt.Errorf("wal: invalid xact-marker payload len %d (want %d)", len(payload), xactRecordSize)
 	}
-	if payload[0] != RecordKindXactCommit && payload[0] != RecordKindXactAbort {
+	switch payload[0] {
+	case RecordKindXactCommit, RecordKindXactAbort, RecordKindXactCommitInval:
+		// valid xact-marker kinds
+	default:
 		return 0, fmt.Errorf("wal: record kind %d is not an xact marker", payload[0])
 	}
 	return storage.TransactionID(binary.LittleEndian.Uint32(payload[1:5])), nil
@@ -753,6 +823,81 @@ type ReplayStats struct {
 // EncodeCheckpoint encodes a checkpoint marker record payload.
 func EncodeCheckpoint() []byte {
 	return []byte{RecordKindCheckpoint}
+}
+
+// EncodeCheckpointCompat encodes a PG-compatible CheckPoint struct
+// for emission as an XLogRecord payload. The resulting record will be
+// classified as RmgrXLog + XLOG_CHECKPOINT_ONLINE so a PG standby can
+// recognise it during recovery (M0102-0007).
+//
+// redoLSN0 is the 0-based byte position of the first byte of the
+// checkpoint record in the WAL stream. It must match the record's
+// actual start position exactly — PG's xlogreader validates
+// checkPoint.redo against ReadRecPtr.
+func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64) []byte {
+	// Encode a minimal PG18 CheckPoint struct (sizeof=88).
+	// Offsets verified against compiled PG18 binary (DWARF):
+	//   redo           XLogRecPtr  8  (offset 0)
+	//   ThisTimeLineID TimeLineID  4  (offset 8)
+	//   PrevTimeLineID TimeLineID  4  (offset 12)
+	//   fullPageWrites bool       1  (offset 16)
+	//   [pad]                     3  (offset 17)
+	//   wal_level      int        4  (offset 20)
+	//   nextXid        FullTxnId  8  (offset 24)
+	//   nextOid        Oid        4  (offset 32)
+	//   nextMulti      MultiXact  4  (offset 36)
+	//   nextMultiOff   MultiXOff  4  (offset 40)
+	//   oldestXid      TxnId      4  (offset 44)
+	//   oldestXidDB    Oid        4  (offset 48)
+	//   oldestMulti    MultiXact  4  (offset 52)
+	//   oldestMultiDB  Oid        4  (offset 56)
+	//   [pad 4]                   —  (offset 60; pg_time_t alignment)
+	//   time           pg_time_t  8  (offset 64)
+	//   oldestCommitTsXid TxnId   4  (offset 72)
+	//   newestCommitTsXid TxnId   4  (offset 76)
+	//   oldestActiveXid TxnId     4  (offset 80)
+	//   [trailing pad 4]          —  (offset 84; struct 8-byte align)
+	//
+	// M0106-0010 batched-47: nextXid is now parameterised (was hardcoded
+	// to 3 = FirstNormalTransactionId). PG's InitWalRecovery decodes the
+	// checkpoint record from the basebackup-shipped WAL and seeds
+	// ShmemVariableCache->nextXid + latestCompletedXid from it. With the
+	// old hardcoded 3, every tuple goopg wrote with xmin >= 3 was
+	// invisible to the standby's recovery snapshot (snapshot.Xmax =
+	// latestCompletedXid + 1 = 3, so xid 3 was treated as "future" and
+	// pg_class scans returned no row → 42P01). The runtime checkpointer
+	// now passes mvcc.Manager.NextXID() through.
+	// oldestActiveXid mirrors nextXid because the IMMEDIATE checkpoint
+	// runs while no user xact is in-flight (CheckpointNow blocks
+	// dirty-page flush; the prior xact-marker WAL is already durable).
+	const checkPointSize = 88
+	if nextXid < 3 {
+		nextXid = 3
+	}
+	payload := make([]byte, checkPointSize)
+	le := binary.LittleEndian
+	now := time.Now()
+
+	le.PutUint64(payload[0:8], redoLSN0)             // redo
+	le.PutUint32(payload[8:12], tli)                 // ThisTimeLineID
+	le.PutUint32(payload[20:24], 1)                  // wal_level (replica)
+	le.PutUint64(payload[24:32], nextXid)            // nextXid (>= FirstNormalTxnId)
+	le.PutUint32(payload[32:36], 16384)              // nextOid
+	le.PutUint32(payload[36:40], 1)                  // nextMulti
+	le.PutUint32(payload[44:48], 3)                  // oldestXid
+	le.PutUint32(payload[52:56], 1)                  // oldestMulti
+	// time (pg_time_t=int64, 8-byte aligned → starts at offset 64)
+	le.PutUint64(payload[64:72], uint64(now.Unix())) // time
+	// After time (offset 72): oldestCommitTsXid, newestCommitTsXid,
+	// oldestActiveXid. Each is TransactionId (uint32, 4 bytes).
+	// NOTE: pg_time_t alignment forces 4-byte pad before time, pushing
+	// offsets: time=64, oldestCommitTsXid=72, newestCommitTsXid=76,
+	// oldestActiveXid=80, sizeof(CheckPoint)=88.
+	le.PutUint32(payload[72:76], 3)                  // oldestCommitTsXid
+	le.PutUint32(payload[76:80], 3)                  // newestCommitTsXid
+	le.PutUint32(payload[80:84], uint32(nextXid))    // oldestActiveXid
+
+	return payload
 }
 
 // EncodePageImage encodes one full-page image record payload.
@@ -947,8 +1092,9 @@ const heapPruneOptHdrSize = 18
 //   - unused: slot numbers marked ItemIDUnused (HOT-only and standalone dead).
 //
 // Format:
-//   kind(1) | rel(9) | blk(4) | nRedirects(2) | nUnused(2) |
-//   redirects[nRedirects*4] | unusedSlots[nUnused*2]
+//
+//	kind(1) | rel(9) | blk(4) | nRedirects(2) | nUnused(2) |
+//	redirects[nRedirects*4] | unusedSlots[nUnused*2]
 func EncodeHeapPruneOpt(rel storage.RelFileNode, blk storage.BlockNumber, redirects [][2]uint16, unused []uint16) []byte {
 	sz := heapPruneOptHdrSize + 4*len(redirects) + 2*len(unused)
 	out := make([]byte, sz)
@@ -1354,9 +1500,9 @@ func DecodeBtreeNewRoot(payload []byte) (BtreeNewRootPayload, error) {
 // BtreeMarkHalfDeadPayload mirrors `EncodeBtreeMarkPageHalfDead`'s
 // on-wire fields. (M0079-0003.)
 type BtreeMarkHalfDeadPayload struct {
-	Rel         storage.RelFileNode
-	LeafBlk     storage.BlockNumber
-	FlagsAfter  uint16
+	Rel        storage.RelFileNode
+	LeafBlk    storage.BlockNumber
+	FlagsAfter uint16
 }
 
 // EncodeBtreeMarkPageHalfDead encodes the M0079-0003 leaf-only
@@ -1670,9 +1816,9 @@ func DecodeBtreeReusePage(payload []byte) (BtreeReusePagePayload, error) {
 // BtreeMetaCleanupPayload mirrors the M0080-0004 metapage
 // cleanup-XID record fields.
 type BtreeMetaCleanupPayload struct {
-	Rel                          storage.RelFileNode
-	NumHeapTuples                int64
-	LastCleanupNumDeletedTuples  int64
+	Rel                         storage.RelFileNode
+	NumHeapTuples               int64
+	LastCleanupNumDeletedTuples int64
 }
 
 // EncodeBtreeMetaCleanup encodes the M0080-0004 metapage
@@ -1861,6 +2007,24 @@ func ReplayRecords(mgr *storage.Manager, records []Record) (ReplayStats, error) 
 // crashed before the storage write is re-attempted on restart, and
 // one that finished both is silently skipped.
 func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
+	if r.XLog != nil {
+		if len(r.Payload) == 0 {
+			return replayDecodedXLogRecord(mgr, r)
+		}
+		if !nativeApplyRecordKindKnown(r.Payload[0]) {
+			return replayDecodedXLogRecord(mgr, r)
+		}
+		// (M0106-0011) The classifier identified this record as a
+		// structured PG-canonical record (e.g., an 88-byte
+		// XLOG_CHECKPOINT_SHUTDOWN whose redo-LSN low byte happened to
+		// collide with a goopg native RecordKind). Native goopg
+		// records always classify with `xlogInfoDefault` (0xF0); any
+		// other Info value means the structured PG classification
+		// must win over the payload[0] byte-collision.
+		if r.XLog.Header.Rmid != RmgrXLog || r.XLog.Header.Info != xlogInfoDefault {
+			return replayDecodedXLogRecord(mgr, r)
+		}
+	}
 	if len(r.Payload) == 0 {
 		return false, errors.New("wal: empty record payload")
 	}
@@ -1955,6 +2119,18 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// drive its reorder buffer. See
 		// docs/design/0008-0001-logical-decoding-pipeline.md.
 		return false, nil
+	case RecordKindXactCommitInval:
+		// Commit with relcache-init-file invalidation (M0106-0010
+		// batched-31). Mirrors ProcessCommittedInvalidationMessages
+		// in PG's inval.c standby-side redo path: unlink both
+		// pg_internal.init files before the transaction's heap writes
+		// become visible so no backend reads stale nailed-rel
+		// descriptors from cache. ENOENT is silently ignored.
+		// Physical replay of the heap/btree changes was already done
+		// by the earlier RecordKindHeapInsert/Update records in the
+		// same transaction; this record carries no additional data.
+		_ = ProcessCommittedInvalidationMessages(mgr.DataDir(), defaultRecoveryDBOid)
+		return false, nil
 	case RecordKindCreateDatabase, RecordKindDropDatabase:
 		// CREATE/DROP DATABASE records (M0054-0001) carry only a database
 		// name; goopg v0 has no per-database file namespacing, so the
@@ -1971,6 +2147,14 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// RecordKindSmgrCreate; the in-memory catalog state is
 		// reconstructed by `internal/initdb.replayIndexDDLRecords`
 		// after physical replay finishes.
+		return false, nil
+	case RecordKindCanonical:
+		// PG-canonical catalog WAL record (M0106-0010 batched-32).
+		// When r.XLog != nil (PageHeaders mode), nativeApplyRecordKindKnown
+		// returns false for this byte and the record is replayed via
+		// replayDecodedXLogRecord using the FPI in the block reference.
+		// In legacy mode (PageHeaders=false), canonical records are never
+		// emitted, so this case is a safety no-op.
 		return false, nil
 	case RecordKindXactAssignment, RecordKindXactRollbackTo, RecordKindXactSubAbort:
 		// Subxact markers (M0050-0003) — physical page recovery is
@@ -2003,6 +2187,337 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 	default:
 		return false, fmt.Errorf("unsupported kind %d", r.Payload[0])
 	}
+}
+
+func nativeApplyRecordKindKnown(kind byte) bool {
+	switch kind {
+	case RecordKindPageImage,
+		RecordKindBtreeSplit,
+		RecordKindHeapInsert,
+		RecordKindBtreeInsert,
+		RecordKindHeapDelete,
+		RecordKindHeapLock,
+		RecordKindHeapVacuum,
+		RecordKindBtreeVacuum,
+		RecordKindBtreeUnlinkPage,
+		RecordKindBtreeNewRoot,
+		RecordKindBtreeMarkPageHalfDead,
+		RecordKindHeapFreeze,
+		RecordKindHeapUpdate,
+		RecordKindHeapMultiInsert,
+		RecordKindHeapVisible,
+		RecordKindBtreeReusePage,
+		RecordKindBtreeMetaCleanup,
+		RecordKindCheckpoint,
+		RecordKindXactCommit,
+		RecordKindXactAbort,
+		RecordKindXactCommitInval,
+		RecordKindCreateDatabase,
+		RecordKindDropDatabase,
+		RecordKindCreateIndex,
+		RecordKindDropIndex,
+		RecordKindXactAssignment,
+		RecordKindXactRollbackTo,
+		RecordKindXactSubAbort,
+		RecordKindHeapHotUpdate,
+		RecordKindHeapPruneOpt,
+		RecordKindSmgrCreate,
+		RecordKindSmgrTruncate:
+		return true
+	default:
+		return false
+	}
+}
+
+func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
+	xlog := r.XLog
+	if xlog == nil {
+		return false, errors.New("wal: empty decoded xlog record")
+	}
+	switch xlog.Header.Rmid {
+	case RmgrXLog:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogXLogParameterChange:
+			return replayXLogParameterChange(mgr, xlog)
+		default:
+			// Other RmgrXLog opcodes (checkpoint, noop, switch, …) need no
+			// physical replay action on the standby.
+			return false, nil
+		}
+	case RmgrXact:
+		switch xlog.Header.Info & xlogXactOpMask {
+		case xlogXactCommit, xlogXactAbort:
+			return false, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrStandby:
+		switch xlog.Header.Info & XLRRmgrInfoMask {
+		case xlogStandbyRunningXacts:
+			// RUNNING_XACTS seeds standby snapshot/conflict state upstream.
+			// goopg's replay path has no consumer for that metadata yet, so
+			// treat the record as a recognised no-op and keep failing closed
+			// on any other Standby opcode.
+			return false, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrHeap:
+		switch xlog.Header.Info & xlogHeapOpMask {
+		case xlogHeapInsert:
+			if err := replayDecodedXLogHeapInsert(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		case xlogHeapDelete, xlogHeapUpdate, xlogHeapHotUpdate:
+			// All three record types are emitted with full-page images
+			// (HasImage+ImageApply on every referenced block). Restore each
+			// block from its FPI; tuple-level main-data parsing is not needed
+			// because the FPI already captures the post-mutation page state.
+			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
+		default:
+			return false, unsupportedDecodedXLogRecord(r)
+		}
+	case RmgrBtree:
+		// Canonical XLOG_BTREE_INSERT_LEAF (M0106-0010 batched-36 loop 9):
+		// emitted from `internal/executor/sys_catalog_index_insert.go` with
+		// a full-page image of the updated leaf-root page on every record.
+		// The FPI carries the entire post-insert page so no main-data
+		// parsing of the IndexTuple is required for replay.
+		if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
+			return false, err
+		}
+		return true, nil
+	default:
+		return false, unsupportedDecodedXLogRecord(r)
+	}
+}
+
+// replayDecodedXLogHeapFPIBlocks restores all block references that carry a
+// full-page image with ImageApply set. Used for XLOG_HEAP_DELETE,
+// XLOG_HEAP_UPDATE, and XLOG_HEAP_HOT_UPDATE records emitted with FPI on
+// every modified block (canonical mode). The FPI already encodes the complete
+// post-mutation page state, so no tuple-level main-data parsing is required.
+func replayDecodedXLogHeapFPIBlocks(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	for i, block := range xlog.Blocks {
+		if !block.HasImage || !block.ImageApply {
+			continue
+		}
+		if err := restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN)); err != nil {
+			return fmt.Errorf("wal: xlog heap FPI block %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// replayXLogParameterChange applies an XLOG_PARAMETER_CHANGE record on the
+// standby, mirroring upstream xlog_redo (xlog.c:8558-8620).
+//
+// The primary emits this record whenever the 8 GUC echo fields diverge from
+// what is stored in pg_control.  On replay we decode the 28-byte
+// xl_parameter_change payload and write the updated values back to pg_control
+// so a PG18 standby's CheckRequiredParameterValues sees consistent values.
+//
+// Payload layout (little-endian, matching xl_parameter_change in
+// src/include/access/xlog_internal.h:273):
+//
+//	offset 0:  MaxConnections        int32
+//	offset 4:  max_worker_processes  int32
+//	offset 8:  max_wal_senders       int32
+//	offset 12: max_prepared_xacts    int32
+//	offset 16: max_locks_per_xact    int32
+//	offset 20: wal_level             int32
+//	offset 24: wal_log_hints         bool (1 byte)
+//	offset 25: track_commit_ts       bool (1 byte)
+//	offset 26: padding               2 bytes
+func replayXLogParameterChange(mgr *storage.Manager, xlog *XLogDecodedRecord) (bool, error) {
+	const minPayload = 26 // 6 × int32 + 2 × bool
+	data := xlog.MainData
+	if len(data) < minPayload {
+		return false, fmt.Errorf("wal: XLOG_PARAMETER_CHANGE payload too short: %d bytes", len(data))
+	}
+	if mgr == nil {
+		// No storage manager means no pg_control to update (e.g. test stubs).
+		return false, nil
+	}
+	dataDir := mgr.DataDir()
+	if dataDir == "" {
+		return false, nil
+	}
+	le := binary.LittleEndian
+	maxConn := le.Uint32(data[0:])
+	maxWorker := le.Uint32(data[4:])
+	maxWalSnd := le.Uint32(data[8:])
+	maxPrepared := le.Uint32(data[12:])
+	maxLocks := le.Uint32(data[16:])
+	walLvl := le.Uint32(data[20:])
+	walLogHints := data[24] != 0
+	trackCommitTS := data[25] != 0
+	if err := control.UpdateControlFile(dataDir, func(cd *control.ControlFileData) {
+		cd.WalLevel = walLvl
+		cd.WalLogHints = walLogHints
+		cd.MaxConnections = maxConn
+		cd.MaxWorkerProcesses = maxWorker
+		cd.MaxWalSenders = maxWalSnd
+		cd.MaxPreparedXacts = maxPrepared
+		cd.MaxLocksPerXact = maxLocks
+		cd.TrackCommitTimestamp = trackCommitTS
+	}); err != nil {
+		return false, fmt.Errorf("wal: XLOG_PARAMETER_CHANGE: %w", err)
+	}
+	return true, nil
+}
+
+func unsupportedDecodedXLogRecord(r Record) error {
+	if r.XLog == nil {
+		return errors.New("wal: empty decoded xlog record")
+	}
+	return fmt.Errorf("wal: unsupported xlog record rmid=%d info=0x%02x lsn[%d,%d]",
+		r.XLog.Header.Rmid,
+		r.XLog.Header.Info&XLRRmgrInfoMask,
+		r.StartLSN,
+		r.EndLSN,
+	)
+}
+
+func replayDecodedXLogHeapInsert(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	block, ok := xlogBlockRefByID(xlog, 0)
+	if !ok {
+		return fmt.Errorf("wal: xlog heap-insert missing block 0")
+	}
+	if block.Rel.Fork != storage.MainFork {
+		return fmt.Errorf("wal: xlog heap-insert fork=%d, want main fork", block.Rel.Fork)
+	}
+	if block.HasImage && block.ImageApply {
+		return restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN))
+	}
+	offnum, err := decodeXLogHeapInsertMainData(xlog.MainData)
+	if err != nil {
+		return err
+	}
+	tupleRaw, err := decodeXLogHeapInsertTuple(block, storage.TransactionID(xlog.Header.XID), offnum)
+	if err != nil {
+		return err
+	}
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return err
+	}
+	page := make(storage.Page, storage.BlockSize)
+	switch {
+	case block.Block < nblocks:
+		if err := mgr.ReadBlock(block.Rel, block.Block, page); err != nil {
+			return err
+		}
+		if !storage.IsNew(page) && storage.MustHeader(page).LSN() >= storage.LSN(r.EndLSN) {
+			return nil
+		}
+		if block.WillInit || xlog.Header.Info&xlogHeapInit != 0 || storage.IsNew(page) {
+			if err := storage.InitPage(page); err != nil {
+				return err
+			}
+		}
+	case block.Block == nblocks:
+		if err := storage.InitPage(page); err != nil {
+			return err
+		}
+		got, err := mgr.Extend(block.Rel, page)
+		if err != nil {
+			return err
+		}
+		if got != block.Block {
+			return fmt.Errorf("wal: xlog heap-insert extend returned block %d, want %d", got, block.Block)
+		}
+	default:
+		return fmt.Errorf("wal: xlog heap-insert replay gap block=%d nblocks=%d", block.Block, nblocks)
+	}
+	got, err := storage.PageInsertItemRawAt(page, offnum, tupleRaw)
+	if err != nil {
+		return fmt.Errorf("wal: xlog heap-insert apply: %w", err)
+	}
+	if got != offnum {
+		return fmt.Errorf("wal: xlog heap-insert replay slot drift: got %d, want %d (block %d)", got, offnum, block.Block)
+	}
+	storage.MustHeader(page).SetLSN(storage.LSN(r.EndLSN))
+	return mgr.WriteBlock(block.Rel, block.Block, page)
+}
+
+func xlogBlockRefByID(xlog *XLogDecodedRecord, id byte) (XLogBlockRef, bool) {
+	if xlog == nil {
+		return XLogBlockRef{}, false
+	}
+	for _, block := range xlog.Blocks {
+		if block.ID == id {
+			return block, true
+		}
+	}
+	return XLogBlockRef{}, false
+}
+
+func restoreDecodedXLogBlockImage(mgr *storage.Manager, block XLogBlockRef, lsn storage.LSN) error {
+	if len(block.Image) != storage.BlockSize {
+		return fmt.Errorf("wal: xlog block image is %d bytes, want %d", len(block.Image), storage.BlockSize)
+	}
+	nblocks, err := mgr.NBlocks(block.Rel)
+	if err != nil {
+		return err
+	}
+	if block.Block < nblocks {
+		existing := make(storage.Page, storage.BlockSize)
+		if err := mgr.ReadBlock(block.Rel, block.Block, existing); err != nil {
+			return err
+		}
+		if !storage.IsNew(existing) && storage.MustHeader(existing).LSN() >= lsn {
+			return nil
+		}
+	}
+	page := make(storage.Page, storage.BlockSize)
+	copy(page, block.Image)
+	storage.MustHeader(page).SetLSN(lsn)
+	return writeBlockOrExtend(mgr, block.Rel, block.Block, page)
+}
+
+func decodeXLogHeapInsertMainData(mainData []byte) (uint16, error) {
+	if len(mainData) < sizeOfXLogHeapInsertData {
+		return 0, fmt.Errorf("wal: invalid xlog heap-insert main-data len %d (want >= %d)", len(mainData), sizeOfXLogHeapInsertData)
+	}
+	return binary.LittleEndian.Uint16(mainData[0:2]), nil
+}
+
+func decodeXLogHeapInsertTuple(block XLogBlockRef, xid storage.TransactionID, offnum uint16) ([]byte, error) {
+	if len(block.Data) < sizeOfXLogHeapHeaderData {
+		return nil, fmt.Errorf("wal: invalid xlog heap-insert block-data len %d (want >= %d)", len(block.Data), sizeOfXLogHeapHeaderData)
+	}
+	hoff := block.Data[4]
+	tupleData := append([]byte(nil), block.Data[sizeOfXLogHeapHeaderData:]...)
+	prefixLen := int(hoff) - storage.SizeOfHeapTupleHeaderData
+	if prefixLen > 0 {
+		if prefixLen > len(tupleData) {
+			return nil, fmt.Errorf("wal: xlog heap-insert tuple prefix len %d exceeds payload len %d", prefixLen, len(tupleData))
+		}
+		for _, b := range tupleData[:prefixLen] {
+			if b != 0 {
+				return nil, fmt.Errorf("wal: xlog heap-insert tuple prefix len %d not yet supported", prefixLen)
+			}
+		}
+		tupleData = tupleData[prefixLen:]
+	}
+	tuple := storage.HeapTuple{
+		Header: storage.HeapTupleHeader{
+			Xmin:      xid,
+			Xmax:      storage.InvalidTransactionID,
+			Xvac:      storage.InvalidTransactionID,
+			CTID:      storage.ItemPointer{Block: block.Block, Offset: offnum},
+			Infomask2: binary.LittleEndian.Uint16(block.Data[0:2]),
+			Infomask:  binary.LittleEndian.Uint16(block.Data[2:4]),
+			Hoff:      hoff,
+		},
+		Data: tupleData,
+	}
+	return tuple.MarshalBinary()
 }
 
 // ReplayFromDir reads records from <dataDir>/pg_wal and replays them.
@@ -2812,4 +3327,71 @@ func replaySmgrTruncate(mgr *storage.Manager, payload []byte) error {
 		return nil // already empty — idempotent
 	}
 	return mgr.TruncateRelation(rel)
+}
+
+// DiscoverLastWALTLI returns the highest timeline ID found in PG-compat
+// WAL segment filenames (format: <TLI:8hex><LogNo:8hex><SegNo:8hex>) under
+// walDir. Returns 0 if walDir is empty, does not exist, or contains only
+// legacy (non-PG-compat) segment files.
+func DiscoverLastWALTLI(walDir string) (uint32, error) {
+	entries, err := os.ReadDir(walDir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("wal: list %s: %w", walDir, err)
+	}
+	var maxTLI uint32
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		tli, _, ok := ParseXLogFileName(e.Name(), 0)
+		if !ok {
+			continue
+		}
+		if tli > maxTLI {
+			maxTLI = tli
+		}
+	}
+	return maxTLI, nil
+}
+
+// WriteHistoryAfterRecovery checks whether the WAL directory contains
+// segments on a timeline higher than persistedTLI and, if so, writes the
+// missing <newTLI>.history file.  switchLSN is used as the end-of-life LSN
+// for the old timeline entry (0 is valid — means "unknown at crash time").
+//
+// Returns (persistedTLI, false, nil) when no bump is needed (walTLI ≤
+// persistedTLI or walDir is empty).  Returns (newTLI, true, nil) when a
+// history file was written.
+//
+// Callers should update the persisted timeline_id to newTLI after a
+// successful bump (wrote == true).
+func WriteHistoryAfterRecovery(walDir string, persistedTLI uint32, switchLSN uint64) (newTLI uint32, wrote bool, err error) {
+	walTLI, err := DiscoverLastWALTLI(walDir)
+	if err != nil {
+		return persistedTLI, false, err
+	}
+	if walTLI == 0 || walTLI <= persistedTLI {
+		return persistedTLI, false, nil
+	}
+	// WAL segments carry a higher TLI than the timeline_id file. This
+	// can happen when the server crashed after receiving a streaming
+	// timeline switch but before the timeline_id file was updated (e.g.
+	// crash between WriteHistory and WriteTimelineID in finalizePromotion).
+	// Reconstruct the history chain and write the missing file.
+	prev, err := ReadHistory(walDir, persistedTLI)
+	if err != nil {
+		return persistedTLI, false, fmt.Errorf("wal: read history for TLI %d: %w", persistedTLI, err)
+	}
+	entries := append(prev, TimelineHistoryEntry{
+		TLI:       persistedTLI,
+		SwitchLSN: switchLSN,
+		Reason:    "recovered after primary promotion",
+	})
+	if werr := WriteHistory(walDir, walTLI, entries); werr != nil {
+		return persistedTLI, false, fmt.Errorf("wal: write history for TLI %d: %w", walTLI, werr)
+	}
+	return walTLI, true, nil
 }

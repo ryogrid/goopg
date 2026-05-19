@@ -40,6 +40,15 @@ type DecodedMessage struct {
 	RelOID   uint32
 	NewTuple []DecodedColumn // populated for 'I'
 	OldTuple []DecodedColumn // populated for 'D' / 'U'
+
+	// Truncate fields — populated for kind == 'T'. TruncateRels
+	// holds the publisher OIDs of every relation in the TRUNCATE
+	// statement (a single TRUNCATE may target many tables);
+	// TruncateOption is the upstream option-bit byte (bit 0
+	// CASCADE, bit 1 RESTART IDENTITY) — the apply worker uses
+	// this to mirror upstream's `apply_handle_truncate` policy.
+	TruncateRels   []uint32
+	TruncateOption byte
 }
 
 // DecodedRelation is the parsed `R` message body.
@@ -165,30 +174,35 @@ func DecodeMessage(payload []byte) (*DecodedMessage, error) {
 		out.OldTuple = cols
 		return out, nil
 	case pgoUpdate:
-		// 'U' | rel_oid(4) | old_tuple_type(1) | OldTupleData | 'N' | NewTupleData
+		// 'U' | rel_oid(4) | ['K'|'O' + OldTupleData]? | 'N' | NewTupleData
+		//
+		// Upstream omits the old-tuple section entirely when the
+		// row's REPLICA IDENTITY is DEFAULT and no replica-identity
+		// columns were changed by the update (logicalrep_write_update
+		// in proto.c: writes 'O' only for REPLICA IDENTITY FULL, 'K'
+		// only when key columns were modified, neither otherwise).
+		// In that case the byte after rel_oid is 'N' directly.
 		oid, err := r.u32()
 		if err != nil {
 			return nil, err
 		}
-		oldAction, err := r.u8()
+		marker, err := r.u8()
 		if err != nil {
 			return nil, err
 		}
 		var oldCols []DecodedColumn
-		if oldAction == 'K' || oldAction == 'O' {
+		if marker == 'K' || marker == 'O' {
 			oldCols, err = decodeTupleBody(r)
 			if err != nil {
 				return nil, err
 			}
-		} else {
-			return nil, fmt.Errorf("pgoutput: update old-tuple type=%q want K or O", oldAction)
+			marker, err = r.u8()
+			if err != nil {
+				return nil, err
+			}
 		}
-		newAction, err := r.u8()
-		if err != nil {
-			return nil, err
-		}
-		if newAction != 'N' {
-			return nil, fmt.Errorf("pgoutput: update new-tuple type=%q want N", newAction)
+		if marker != 'N' {
+			return nil, fmt.Errorf("pgoutput: update new-tuple type=%q want N (after optional K/O)", marker)
 		}
 		newCols, err := decodeTupleBody(r)
 		if err != nil {
@@ -197,6 +211,32 @@ func DecodeMessage(payload []byte) (*DecodedMessage, error) {
 		out.RelOID = oid
 		out.OldTuple = oldCols
 		out.NewTuple = newCols
+		return out, nil
+	case pgoTruncate:
+		// 'T' | nrelids(4) | option_bits(1) | relids(4*nrelids)
+		// See upstream `logicalrep_write_truncate` in proto.c.
+		// nrelids must be > 0 in well-formed messages (the publisher
+		// only emits 'T' when at least one published relation is
+		// affected) but the apply worker tolerates an empty list as
+		// a no-op rather than rejecting the frame.
+		nrelids, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		option, err := r.u8()
+		if err != nil {
+			return nil, err
+		}
+		rels := make([]uint32, 0, nrelids)
+		for i := uint32(0); i < nrelids; i++ {
+			rel, err := r.u32()
+			if err != nil {
+				return nil, err
+			}
+			rels = append(rels, rel)
+		}
+		out.TruncateRels = rels
+		out.TruncateOption = option
 		return out, nil
 	}
 	return nil, fmt.Errorf("pgoutput: unknown message kind %q", kind)

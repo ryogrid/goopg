@@ -150,22 +150,74 @@ func (o *explainOp) Close() error { return nil }
 // When opts.Verbose is set, an extra `Output: (col, ...)` line
 // is emitted under each node listing its schema columns —
 // mirrors upstream's `EXPLAIN VERBOSE` output (M0018-0002).
+//
+// M0100-0005i: wrapper nodes that PG does not surface as their
+// own plan node are skipped:
+//   - Project nodes always fold into the child (PG renders the
+//     projection inline as part of the parent / scan label;
+//     there is no "Projection" plan node in upstream EXPLAIN).
+//   - Filter nodes fold into the child when the child is a scan
+//     (the predicate surfaces as `Filter: (<pred>)` under the
+//     scan label, matching upstream).
+//
+// PG-style detail lines are emitted under the rendered node:
+//   - Sort → `Sort Key: <expr_csv>`
+//   - IndexScan → `Index Cond: (<col> = <key>)` (single-col eq)
+//   - SeqScan with attached Filter → `Filter: (<pred>)`
+//
+// `(rows=N)` is only appended when opts.Costs is true (the PG
+// default). `EXPLAIN (COSTS OFF) ...` therefore renders bare
+// node labels, matching upstream `COSTS OFF` output.
 func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions) {
+	walkPlanFiltered(n, depth, rows, opts, nil)
+}
+
+// walkPlanFiltered is the inner driver for walkPlan. attachedFilter
+// is a Filter.Predicate carried down from a Filter wrapper that
+// was skipped above us — it is rendered as `Filter:` detail under
+// the next scan-like node we render.
+func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, attachedFilter planner.Expr) {
+	// Skip Project wrappers: PG has no "Projection" plan node;
+	// the projection is part of the parent / scan's render.
+	if p, ok := n.(*planner.Project); ok {
+		walkPlanFiltered(p.Child, depth, rows, opts, attachedFilter)
+		return
+	}
+	// Skip Filter wrappers and push their predicate down to be
+	// rendered as `Filter:` detail under the next scan node.
+	if f, ok := n.(*planner.Filter); ok {
+		next := f.Predicate
+		// If multiple Filter wrappers stack, render only the
+		// outermost predicate to keep the detail line readable.
+		// Inner Filter predicates collapse with the outer via
+		// short-circuit AND — but PG's Filter detail is a single
+		// expression line; chaining is uncommon so prefer the
+		// outermost predicate for v0.
+		if attachedFilter != nil {
+			next = attachedFilter
+		}
+		walkPlanFiltered(f.Child, depth, rows, opts, next)
+		return
+	}
+
 	indent := strings.Repeat("  ", depth)
 	prefix := indent
 	if depth > 0 {
 		prefix = indent + "->  "
 	}
 	label := prefix + describePlan(n)
-	// Append `(rows=N)` when the planner has a non-zero
-	// estimate. Zero means "no statistics yet" — leave it out
-	// rather than printing a misleading `(rows=0)` for tables
-	// that haven't been ANALYZE'd. Matches upstream's
-	// "EXPLAIN doesn't show costs without ANALYZE" behaviour.
-	if est := planner.EstimateRows(n); est > 0 {
-		label += fmt.Sprintf(" (rows=%d)", est)
+	if opts.Costs {
+		if est := planner.EstimateRows(n); est > 0 {
+			label += fmt.Sprintf(" (rows=%d)", est)
+		}
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
+
+	// Detail indent: matches the content column of the node
+	// label plus 2 spaces, mirroring PG's `Sort Key:` / `Index
+	// Cond:` / `Filter:` indent convention.
+	detailIndent := strings.Repeat(" ", len(prefix)+2)
+	emitNodeDetailLines(n, detailIndent, rows, attachedFilter)
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
@@ -175,8 +227,161 @@ func walkPlan(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts p
 	}
 
 	for _, c := range planChildren(n) {
-		walkPlan(b, c, depth+1, rows, opts)
+		walkPlanFiltered(c, depth+1, rows, opts, nil)
 	}
+}
+
+// emitNodeDetailLines writes the PG-style detail lines that
+// belong under n (Sort Key / Index Cond / Filter). attachedFilter
+// is a Filter.Predicate from a Filter wrapper above n that was
+// skipped — it surfaces as `Filter:` when n is a scan-like node.
+func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFilter planner.Expr) {
+	switch p := n.(type) {
+	case *planner.Sort:
+		if len(p.Keys) > 0 {
+			parts := make([]string, 0, len(p.Keys))
+			for _, k := range p.Keys {
+				s := formatExprPG(k.Expr)
+				if k.Desc {
+					s += " DESC"
+				}
+				parts = append(parts, s)
+			}
+			*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(parts, ", "))})
+		}
+	case *planner.IndexScan:
+		if cond := formatIndexCond(p); cond != "" {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Index Cond: " + cond)})
+		}
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPG(attachedFilter)))})
+		}
+	case *planner.SeqScan:
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPG(attachedFilter)))})
+		}
+	default:
+		// Non-scan nodes keep an attached Filter alive — render it
+		// here so the predicate is not silently dropped when our
+		// planner places a Filter above a non-scan (e.g. an
+		// Aggregate). Matches PG's behaviour of rendering Filter on
+		// the node it most directly applies to.
+		if attachedFilter != nil {
+			*rows = append(*rows, Row{NewStringDatum(indent + "Filter: " + wrapParen(formatExprPG(attachedFilter)))})
+		}
+	}
+}
+
+// formatIndexCond renders the equality / range condition of an
+// IndexScan node as a PG-style `(col = key)` (or range) expression.
+// Empty when the scan has no bound (full-range probe).
+func formatIndexCond(p *planner.IndexScan) string {
+	if p == nil || p.Index == nil {
+		return ""
+	}
+	cols := p.Index.Columns
+	// Multi-column equality probe.
+	if len(p.Keys) > 0 && len(cols) >= len(p.Keys) {
+		if len(p.Keys) == 1 {
+			return wrapParen(cols[0] + " = " + formatExprPG(p.Keys[0]))
+		}
+		parts := make([]string, len(p.Keys))
+		for i, k := range p.Keys {
+			parts[i] = cols[i] + " = " + formatExprPG(k)
+		}
+		return wrapParen(strings.Join(parts, " AND "))
+	}
+	// Single-column equality.
+	if p.Key != nil && len(cols) > 0 {
+		return wrapParen(cols[0] + " = " + formatExprPG(p.Key))
+	}
+	// Range scan.
+	if (p.LowKey != nil || p.HighKey != nil) && len(cols) > 0 {
+		col := cols[0]
+		var parts []string
+		if p.LowKey != nil {
+			parts = append(parts, col+" >= "+formatExprPG(p.LowKey))
+		}
+		if p.HighKey != nil {
+			parts = append(parts, col+" <= "+formatExprPG(p.HighKey))
+		}
+		if len(parts) > 0 {
+			return wrapParen(strings.Join(parts, " AND "))
+		}
+	}
+	return ""
+}
+
+// wrapParen wraps s in parentheses unless it already is parenthesised.
+func wrapParen(s string) string {
+	if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+		// Heuristic: avoid double-wrap when the whole expression
+		// is already a single parenthesised group.
+		depth := 0
+		for i, r := range s {
+			switch r {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 && i < len(s)-1 {
+					// Closing paren before end → not a single
+					// wrapping group; needs outer parens.
+					return "(" + s + ")"
+				}
+			}
+		}
+		return s
+	}
+	return "(" + s + ")"
+}
+
+// formatExprPG renders a planner expression in upstream PG's
+// EXPLAIN style: column names, integer/string/numeric literals,
+// and infix operators. Falls back to a compact `<type>` token
+// for expression kinds we don't yet render (sufficient for the
+// isolation specs that pass through `EXPLAIN (COSTS OFF)`; the
+// detail line is informational).
+func formatExprPG(e planner.Expr) string {
+	if e == nil {
+		return ""
+	}
+	switch x := e.(type) {
+	case *planner.ColumnRef:
+		return x.Name
+	case *planner.OuterColumnRef:
+		return x.Name
+	case *planner.IntegerConst:
+		return fmt.Sprintf("%d", x.Value)
+	case *planner.NumericConst:
+		return x.Value
+	case *planner.StringConst:
+		// PG renders string literals as single-quoted; escape
+		// embedded single quotes per SQL convention.
+		return "'" + strings.ReplaceAll(x.Value, "'", "''") + "'"
+	case *planner.BooleanConst:
+		if x.Value {
+			return "true"
+		}
+		return "false"
+	case *planner.NullConst:
+		return "NULL"
+	case *planner.BinaryOp:
+		return "(" + formatExprPG(x.Left) + " " + x.Op.String() + " " + formatExprPG(x.Right) + ")"
+	case *planner.UnaryOp:
+		return "(" + x.Op.String() + " " + formatExprPG(x.Operand) + ")"
+	case *planner.CastExpr:
+		return formatExprPG(x.Operand)
+	case *planner.FuncCall:
+		args := make([]string, len(x.Args))
+		for i, a := range x.Args {
+			args[i] = formatExprPG(a)
+		}
+		return x.Name + "(" + strings.Join(args, ", ") + ")"
+	case *planner.ParamRef:
+		return fmt.Sprintf("$%d", x.Number)
+	}
+	return fmt.Sprintf("<%T>", e)
 }
 
 // schemaColumnNames returns the names of n's output columns,
@@ -200,14 +405,33 @@ func schemaColumnNames(n planner.Node) []string {
 // from the instrumentation table. Loops > 0 means the operator
 // ran at least once. Total time is in milliseconds.
 func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable) {
+	walkPlanAnalyzeFiltered(n, depth, rows, opts, stats, nil)
+}
+
+func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser.ExplainOptions, stats nodeStatsTable, attachedFilter planner.Expr) {
+	if p, ok := n.(*planner.Project); ok {
+		walkPlanAnalyzeFiltered(p.Child, depth, rows, opts, stats, attachedFilter)
+		return
+	}
+	if f, ok := n.(*planner.Filter); ok {
+		next := f.Predicate
+		if attachedFilter != nil {
+			next = attachedFilter
+		}
+		walkPlanAnalyzeFiltered(f.Child, depth, rows, opts, stats, next)
+		return
+	}
+
 	indent := strings.Repeat("  ", depth)
 	prefix := indent
 	if depth > 0 {
 		prefix = indent + "->  "
 	}
 	label := prefix + describePlan(n)
-	if est := planner.EstimateRows(n); est > 0 {
-		label += fmt.Sprintf(" (rows=%d)", est)
+	if opts.Costs {
+		if est := planner.EstimateRows(n); est > 0 {
+			label += fmt.Sprintf(" (rows=%d)", est)
+		}
 	}
 	if s, ok := stats[n]; ok && s != nil {
 		if s.timing {
@@ -219,6 +443,9 @@ func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row,
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
+	detailIndent := strings.Repeat(" ", len(prefix)+2)
+	emitNodeDetailLines(n, detailIndent, rows, attachedFilter)
+
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
 			outline := indent + "  Output: (" + strings.Join(cols, ", ") + ")"
@@ -227,7 +454,7 @@ func walkPlanAnalyze(b *strings.Builder, n planner.Node, depth int, rows *[]Row,
 	}
 
 	for _, c := range planChildren(n) {
-		walkPlanAnalyze(b, c, depth+1, rows, opts, stats)
+		walkPlanAnalyzeFiltered(c, depth+1, rows, opts, stats, nil)
 	}
 }
 

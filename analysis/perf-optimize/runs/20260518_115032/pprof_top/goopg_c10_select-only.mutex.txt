@@ -1,0 +1,92 @@
+# go tool pprof -top -nodecount=40 -cum  /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_select-only.mutex.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 11:54:36 JST
+Showing nodes accounting for 64.55s, 98.99% of 65.21s total
+Dropped 351 nodes (cum <= 0.33s)
+Showing top 40 nodes out of 79
+      flat  flat%   sum%        cum   cum%
+    33.61s 51.53% 51.53%     33.61s 51.53%  runtime.unlock (partial-inline)
+    13.55s 20.78% 72.32%     25.25s 38.72%  sync.(*RWMutex).Unlock
+         0     0% 72.32%     23.03s 35.31%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0% 72.32%     23.03s 35.31%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0% 72.32%     23.03s 35.31%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0% 72.32%     20.82s 31.92%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0% 72.32%     20.82s 31.92%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0% 72.32%     20.82s 31.92%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0% 72.32%     18.64s 28.58%  runtime.mcall
+         0     0% 72.32%     18.47s 28.32%  runtime.schedule
+         0     0% 72.32%     18.14s 27.82%  runtime.findRunnable
+         0     0% 72.32%     16.98s 26.03%  runtime.gcstopm
+         0     0% 72.32%     16.60s 25.46%  runtime.park_m
+         0     0% 72.32%     16.43s 25.20%  github.com/goopg/goopg/internal/storage.(*Bgwriter).run
+         0     0% 72.32%     16.43s 25.20%  github.com/goopg/goopg/internal/storage.(*Pool).WriteDirtyPages
+         0     0% 72.32%     16.43s 25.19%  github.com/goopg/goopg/internal/storage.(*Bgwriter).Start.gowrap1
+    13.95s 21.39% 93.71%     13.96s 21.41%  sync.(*Mutex).Unlock (partial-inline)
+         0     0% 93.71%      8.70s 13.34%  runtime.systemstack
+         0     0% 93.71%      8.08s 12.38%  github.com/goopg/goopg/internal/server.maybeForceGCAfterCommit
+         0     0% 93.71%      7.76s 11.91%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 93.71%      7.35s 11.26%  runtime.ReadMemStats
+         0     0% 93.71%      7.33s 11.23%  runtime.stopTheWorldWithSema
+         0     0% 93.71%      7.03s 10.78%  runtime.stopTheWorld
+         0     0% 93.71%      7.03s 10.78%  runtime.stopTheWorld.func1
+         0     0% 93.71%      5.88s  9.02%  github.com/goopg/goopg/internal/storage.(*Pool).Pin
+         0     0% 93.71%      4.76s  7.30%  runtime.stopm
+         0     0% 93.71%      4.22s  6.47%  runtime.goschedImpl
+         0     0% 93.71%      4.18s  6.41%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart
+         0     0% 93.71%      4.18s  6.40%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart.deferwrap1
+         0     0% 93.71%      4.17s  6.39%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteFrame
+         0     0% 93.71%      4.07s  6.24%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func6
+         0     0% 93.71%      3.93s  6.03%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteReadyForQuery
+         0     0% 93.71%      3.73s  5.71%  github.com/goopg/goopg/internal/executor.(*projectOp).Open
+         0     0% 93.71%      3.60s  5.51%  github.com/goopg/goopg/internal/executor.(*indexScanOp).Open
+         0     0% 93.71%      3.51s  5.39%  runtime.mstart
+         0     0% 93.71%      3.51s  5.39%  runtime.mstart0
+         0     0% 93.71%      3.51s  5.39%  runtime.mstart1
+         0     0% 93.71%      3.51s  5.39%  runtime.sysmon
+     3.44s  5.28% 98.99%      3.45s  5.29%  sync.(*RWMutex).RUnlock (inline)
+         0     0% 98.99%      3.34s  5.13%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd
+
+# top symbols (-list) — top 8 hot functions, flat order
+## -list cum%
+no matches found for regexp: cum%
+
+## -list runtime.unlock
+Total: 65.21s
+ROUTINE ======================== runtime.unlock in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/lock_spinbit.go
+    33.61s     33.61s (flat, cum) 51.53% of Total
+         .          .    260:func unlock(l *mutex) {
+    33.61s     33.61s    261:	unlockWithRank(l)
+         .          .    262:}
+         .          .    263:
+         .          .    264:// We might not be holding a p in this code.
+         .          .    265://
+         .          .    266://go:nowritebarrier
+
+## -list (partial-inline)
+no matches found for regexp: (partial-inline)
+
+## -list sync.(*RWMutex).Unlock
+parsing argument regexp sync.(*RWMutex).Unlock: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list (inline)
+no matches found for regexp: (inline)
+
+## -list runtime._LostContendedRuntimeLock
+Total: 65.21s
+ROUTINE ======================== runtime._LostContendedRuntimeLock in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/proc.go
+  661.29ms   661.29ms (flat, cum)  1.01% of Total
+  661.29ms   661.29ms   5571:func _LostContendedRuntimeLock()  { _LostContendedRuntimeLock() }
+         .          .   5572:func _VDSO()                      { _VDSO() }
+         .          .   5573:
+         .          .   5574:// Called if we receive a SIGPROF signal.
+         .          .   5575:// Called by the signal handler, may run during STW.
+         .          .   5576://
+
+## -list github.com/goopg/goopg/internal/access/btree.(*BTree).RangeScan
+parsing argument regexp github.com/goopg/goopg/internal/access/btree.(*BTree).RangeScan: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/access/btree.(*BTree).descendToLeaf
+parsing argument regexp github.com/goopg/goopg/internal/access/btree.(*BTree).descendToLeaf: error parsing regexp: missing argument to repetition operator: `*`
+

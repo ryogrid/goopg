@@ -1,0 +1,155 @@
+package initdb
+
+import "testing"
+
+// TestPgIndexInitialEntriesIndkeyMatchesPG18 pins the M0106-0010 Step 3n
+// fix: every pgIndexInitialEntries row's IndKey must list the PG18 heap
+// attnums of the indexed columns, because PG's
+// systable_beginscan() (postgres/src/backend/access/index/genam.c:437–446)
+// walks irel->rd_index->indkey searching for the caller's sk_attno (a
+// heap attnum derived from Anum_pg_*_* constants) and FATALs with
+// "column is not in index" on mismatch. Before Step 3n four entries had
+// stale legacy attnums:
+//
+//	2659 pg_attribute_relid_attnum_index : [1,6] → [1,5]  (PG18 attnum=col 5)
+//	2693 pg_rewrite_rel_rulename_index   : [2,7] → [3,2]  (ev_class=3, rulename=2)
+//	2701 pg_trigger_tgrelid_tgname_index : [2,3] → [2,4]  (tgname=col 4)
+//	3593 pg_shseclabel_object_index      : [3,2,5] → [1,2,3] (objoid,classoid,provider)
+//
+// Each expected vector below is the authoritative PG18 layout taken
+// from postgres/src/include/catalog/pg_*.h. Add new pinned indexes here
+// whenever pgIndexInitialEntries grows.
+func TestPgIndexInitialEntriesIndkeyMatchesPG18(t *testing.T) {
+	want := map[uint32][]int16{
+		// Shared catalogs.
+		2671: {2},       // pg_database_datname_index  : btree(datname)
+		2672: {1},       // pg_database_oid_index      : btree(oid)
+		2676: {2},       // pg_authid_rolname_index    : btree(rolname)
+		2677: {1},       // pg_authid_oid_index        : btree(oid)
+		2694: {2, 3, 4}, // pg_auth_members_role_member_index : btree(roleid, member, grantor) UNIQUE ← Step 3z
+		2695: {3, 2, 4}, // pg_auth_members_member_role_index : btree(member, roleid, grantor)
+		6303: {1},       // pg_auth_members_oid_index : btree(oid) UNIQUE PRIMARY ← batched-13
+		6302: {4},       // pg_auth_members_grantor_index : btree(grantor) non-unique ← batched-13
+		3593: {1, 2, 3}, // pg_shseclabel_object_index : btree(objoid, classoid, provider)
+		// Local catalogs.
+		2703: {1},        // pg_type_oid_index
+		2704: {2, 3},     // pg_type_typname_nsp_index    : btree(typname, typnamespace)
+		2658: {1, 2},     // pg_attribute_relid_attnam_index
+		2659: {1, 5},     // pg_attribute_relid_attnum_index : btree(attrelid, attnum)  ← Step 3n
+		2662: {1},        // pg_class_oid_index
+		2663: {2, 3},     // pg_class_relname_nsp_index
+		2690: {1},        // pg_proc_oid_index
+		2691: {2, 20, 3}, // pg_proc_proname_args_nsp_index : btree(proname, proargtypes, pronamespace)
+		2678: {2},        // pg_index_indrelid_index   : btree(indrelid)     NON-UNIQUE      ← Step 3r
+		2679: {1},        // pg_index_indexrelid_index : btree(indexrelid)   UNIQUE PRIMARY ← Step 3r
+		2687: {1},        // pg_opclass_oid_index
+		2655: {2, 3, 4, 5}, // pg_amproc_fam_proc_index : btree(amprocfamily, lefttype, righttype, amprocnum)
+		2693: {3, 2},     // pg_rewrite_rel_rulename_index : btree(ev_class, rulename)  ← Step 3n
+		2692: {1},        // pg_rewrite_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3dm phase B
+		2701: {2, 4},     // pg_trigger_tgrelid_tgname_index : btree(tgrelid, tgname)   ← Step 3n
+		2667: {1},        // pg_constraint_oid_index
+		2665: {9, 10, 2}, // pg_constraint_conrelid_contypid_conname_index : btree(conrelid, contypid, conname)  ← batched-48
+		2688: {1},        // pg_operator_oid_index
+		2680: {1, 3},     // pg_inherits_relid_seqno_index : btree(inhrelid, inhseqno)
+		2684: {2},        // pg_namespace_nspname_index : btree(nspname name_ops)            ← Step 3t
+		2685: {1},        // pg_namespace_oid_index     : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3t
+		2654: {7, 6, 2},  // pg_amop_opr_fam_index : btree(amopopr, amoppurpose, amopfamily)
+		2650: {1},        // pg_aggregate_fnoid_index : btree(aggfnoid oid_ops) UNIQUE PRIMARY ← Step 3x
+		2653: {2, 3, 4, 5}, // pg_amop_fam_strat_index : btree(amopfamily, amoplefttype, amoprighttype, amopstrategy) UNIQUE ← Step 3y
+		2660: {1},        // pg_cast_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ab
+		2661: {2, 3},     // pg_cast_source_target_index : btree(castsource oid_ops, casttarget oid_ops) UNIQUE ← Step 3ac
+		2686: {2, 3, 4}, // pg_opclass_am_name_nsp_index : btree(opcmethod oid_ops, opcname name_ops, opcnamespace oid_ops) UNIQUE ← Step 3ad
+		3164: {2, 7, 3}, // pg_collation_name_enc_nsp_index : btree(collname name_ops, collencoding int4_ops, collnamespace oid_ops) UNIQUE ← Step 3ae
+		3085: {1},       // pg_collation_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3af
+		2668: {3, 5, 6, 1}, // pg_conversion_default_index : btree(connamespace oid_ops, conforencoding int4_ops, contoencoding int4_ops, oid oid_ops) UNIQUE ← Step 3ah
+		2670: {1},          // pg_conversion_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ai
+		2669: {2, 3},       // pg_conversion_name_nsp_index : btree(conname name_ops, connamespace oid_ops) UNIQUE ← Step 3aj
+		827: {2, 3, 4},    // pg_default_acl_role_nsp_obj_index : btree(defaclrole oid_ops, defaclnamespace oid_ops, defaclobjtype char_ops) UNIQUE ← Step 3al
+		828: {1},          // pg_default_acl_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3am
+		3502: {1},         // pg_enum_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ao
+		3503: {2, 4},      // pg_enum_typid_label_index : btree(enumtypid oid_ops, enumlabel name_ops) UNIQUE ← Step 3ap
+		3534: {2, 3},      // pg_enum_typid_sortorder_index : btree(enumtypid oid_ops, enumsortorder float4_ops) UNIQUE ← Step 3aq
+		3467: {2},         // pg_event_trigger_evtname_index : btree(evtname name_ops) UNIQUE ← Step 3as
+		3468: {1},         // pg_event_trigger_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3at
+		3080: {1},         // pg_extension_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ax
+		3081: {2},         // pg_extension_name_index : btree(extname name_ops) UNIQUE ← Step 3ay
+		548:  {2},         // pg_foreign_data_wrapper_name_index : btree(fdwname name_ops) UNIQUE ← Step 3bc
+		112:  {1},         // pg_foreign_data_wrapper_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3bd
+		549:  {2},         // pg_foreign_server_name_index : btree(srvname name_ops) UNIQUE ← Step 3bf
+		113:  {1},         // pg_foreign_server_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3bg
+		3119: {1},         // pg_foreign_table_relid_index : btree(ftrelid oid_ops) UNIQUE PRIMARY ← Step 3bi
+		2681: {2},         // pg_language_name_index : btree(lanname name_ops) UNIQUE ← Step 3bj
+		2682: {1},         // pg_language_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3bk
+		2689: {2, 8, 9, 3}, // pg_operator_oprname_l_r_n_index : btree(oprname name_ops, oprleft oid_ops, oprright oid_ops, oprnamespace oid_ops) UNIQUE ← Step 3bl
+		2754: {2, 3, 4},   // pg_opfamily_am_name_nsp_index : btree(opfmethod oid_ops, opfname name_ops, opfnamespace oid_ops) UNIQUE ← Step 3bn
+		2755: {1},         // pg_opfamily_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3bo
+		6246: {2},         // pg_parameter_acl_parname_index : btree(parname text_ops) UNIQUE (SHARED) ← Step 3bq
+		6247: {1},         // pg_parameter_acl_oid_index : btree(oid oid_ops) UNIQUE PRIMARY (SHARED) ← Step 3br
+		3351: {1},         // pg_partitioned_table_partrelid_index : btree(partrelid oid_ops) UNIQUE PRIMARY ← Step 3bt
+		6111: {2},         // pg_publication_pubname_index : btree(pubname name_ops) UNIQUE ← Step 3bv
+		6110: {1},         // pg_publication_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3bw
+		6238: {1},         // pg_publication_namespace_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3bx
+		6239: {3, 2},      // pg_publication_namespace_pnnspid_pnpubid_index : btree(pnnspid oid_ops, pnpubid oid_ops) UNIQUE ← Step 3bx
+		6112: {1},         // pg_publication_rel_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3by
+		6113: {3, 2},      // pg_publication_rel_prrelid_prpubid_index : btree(prrelid oid_ops, prpubid oid_ops) UNIQUE ← Step 3by
+		6116: {2},         // pg_publication_rel_prpubid_index : btree(prpubid oid_ops) (non-UNIQUE) ← Step 3by
+		3542: {1},         // pg_range_rngtypid_index : btree(rngtypid oid_ops) UNIQUE PRIMARY ← Step 3bz
+		2228: {3},         // pg_range_rngmultitypid_index : btree(rngmultitypid oid_ops) UNIQUE ← Step 3bz
+		6001: {1},         // pg_replication_origin_roiident_index : btree(roident oid_ops) UNIQUE PRIMARY ← Step 3ca
+		6002: {2},         // pg_replication_origin_roname_index : btree(roname text_ops) UNIQUE ← Step 3ca
+		5002: {1},         // pg_sequence_seqrelid_index : btree(seqrelid oid_ops) UNIQUE PRIMARY ← Step 3cb
+		3433: {1, 2},      // pg_statistic_ext_data_stxoid_inh_index : btree(stxoid oid_ops, stxdinherit bool_ops) UNIQUE PRIMARY ← Step 3cc
+		3380: {1},         // pg_statistic_ext_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3cd
+		3997: {3, 4},      // pg_statistic_ext_name_index : btree(stxname name_ops, stxnamespace oid_ops) UNIQUE ← Step 3cd
+		3379: {2},         // pg_statistic_ext_relid_index : btree(stxrelid oid_ops) NON-UNIQUE ← Step 3cd
+		2696: {1, 2, 3},   // pg_statistic_relid_att_inh_index : btree(starelid oid_ops, staattnum int2_ops, stainherit bool_ops) UNIQUE PRIMARY ← Step 3ce
+		6114: {1},         // pg_subscription_oid_index : btree(oid oid_ops) UNIQUE PRIMARY (SHARED) ← Step 3cf
+		6115: {2, 4},      // pg_subscription_subname_index : btree(subdbid oid_ops, subname name_ops) UNIQUE (SHARED) ← Step 3cf
+		6117: {2, 1},      // pg_subscription_rel_srrelid_srsubid_index : btree(srrelid oid_ops, srsubid oid_ops) UNIQUE PRIMARY ← Step 3cg
+		2697: {1},         // pg_tablespace_oid_index : btree(oid oid_ops) UNIQUE PRIMARY (SHARED) ← Step 3ch
+		2698: {2},         // pg_tablespace_spcname_index : btree(spcname name_ops) UNIQUE (SHARED) ← Step 3ch
+		3574: {1},         // pg_transform_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ci
+		3575: {2, 3},      // pg_transform_type_lang_index : btree(trftype oid_ops, trflang oid_ops) UNIQUE ← Step 3ci
+		3609: {1, 2, 3},   // pg_ts_config_map_index : btree(mapcfg oid_ops, maptokentype int4_ops, mapseqno int4_ops) UNIQUE PRIMARY ← Step 3cj
+		3608: {2, 3},      // pg_ts_config_cfgname_index : btree(cfgname name_ops, cfgnamespace oid_ops) UNIQUE ← Step 3ck
+		3712: {1},         // pg_ts_config_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3ck
+		3604: {2, 3},      // pg_ts_dict_dictname_index : btree(dictname name_ops, dictnamespace oid_ops) UNIQUE ← Step 3cm
+		3605: {1},         // pg_ts_dict_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3cm
+		3606: {2, 3},      // pg_ts_parser_prsname_index : btree(prsname name_ops, prsnamespace oid_ops) UNIQUE ← Step 3cn
+		3607: {1},         // pg_ts_parser_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3cn
+		3766: {2, 3},      // pg_ts_template_tmplname_index : btree(tmplname name_ops, tmplnamespace oid_ops) UNIQUE ← Step 3co
+		3767: {1},         // pg_ts_template_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3co
+		174:  {1},         // pg_user_mapping_oid_index : btree(oid oid_ops) UNIQUE PRIMARY ← Step 3cp
+		175:  {2, 3},      // pg_user_mapping_user_server_index : btree(umuser oid_ops, umserver oid_ops) UNIQUE ← Step 3cp
+		2965: {1, 2},      // pg_db_role_setting_databaseid_rol_index : btree(setdatabase oid_ops, setrole oid_ops) UNIQUE PRIMARY (SHARED) ← Step 3cu
+	}
+	got := make(map[uint32][]int16, len(want))
+	for _, e := range pgIndexInitialEntries() {
+		got[e.IndexRelid] = e.IndKey
+	}
+	if len(got) != len(want) {
+		t.Fatalf("pgIndexInitialEntries: %d entries, want %d (extend the pinned map below to cover new indexes)", len(got), len(want))
+	}
+	for oid, expect := range want {
+		actual, ok := got[oid]
+		if !ok {
+			t.Errorf("index OID %d: missing from pgIndexInitialEntries", oid)
+			continue
+		}
+		if !int16SliceEqual(actual, expect) {
+			t.Errorf("index OID %d: indkey=%v, want %v (PG18 heap attnums)", oid, actual, expect)
+		}
+	}
+}
+
+func int16SliceEqual(a, b []int16) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

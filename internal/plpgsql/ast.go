@@ -215,6 +215,18 @@ type ExceptionBlock struct {
 func (e *ExceptionBlock) Pos() int         { return e.pos }
 func (e *ExceptionBlock) plpgsqlStmtNode() {}
 
+// ExecuteStmt is `EXECUTE expr [INTO var] [USING expr, ...]`.
+// Executes a dynamically-constructed SQL string. M0100-0005.
+type ExecuteStmt struct {
+	pos     int
+	Query   parser.Expr   // expression producing the SQL string
+	IntoVar string        // target variable name (empty if no INTO clause)
+	Using   []parser.Expr // USING argument expressions (may be nil)
+}
+
+func (e *ExecuteStmt) Pos() int          { return e.pos }
+func (e *ExecuteStmt) plpgsqlStmtNode() {}
+
 // RaiseStmt is `RAISE [level] 'message'`. Level is "notice",
 // "warning", "exception" / "error" (default). NOTICE and WARNING are
 // silently discarded; ERROR/EXCEPTION surfaces an ExecError.

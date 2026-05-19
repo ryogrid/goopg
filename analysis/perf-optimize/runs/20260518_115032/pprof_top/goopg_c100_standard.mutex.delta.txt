@@ -1,0 +1,14 @@
+# go tool pprof -top -nodecount=40 -cum -base /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_standard.mutex_base.pb.gz /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_standard.mutex.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 13:07:31 JST
+Showing nodes accounting for 6.14us, 100% of 6.14us total
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%     6.14us   100%  runtime.findRunnable
+         0     0%     0%     6.14us   100%  runtime.goschedImpl
+         0     0%     0%     6.14us   100%  runtime.gosched_m
+         0     0%     0%     6.14us   100%  runtime.mcall
+         0     0%     0%     6.14us   100%  runtime.runSafePointFn
+         0     0%     0%     6.14us   100%  runtime.schedule
+    6.14us   100%   100%     6.14us   100%  runtime.unlock (inline)

@@ -389,9 +389,6 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 	if err != nil {
 		return err
 	}
-	if len(s.Returning) > 0 {
-		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
-	}
 	// INSERT … SELECT: analyze the SELECT sub-statement and skip VALUES checks.
 	if s.Select != nil {
 		return analyzeSelectWithParent(s.Select, cat, nil)
@@ -538,9 +535,6 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 	if err != nil {
 		return err
 	}
-	if len(s.Returning) > 0 {
-		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
-	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
 	if s.With != nil {
 		if err := analyzeWith(s.With, ctx); err != nil {
@@ -570,9 +564,6 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 	tbl, err := lookupTable(cat, s.Target)
 	if err != nil {
 		return err
-	}
-	if len(s.Returning) > 0 {
-		return analyzeError(s.Pos(), "0A000", "RETURNING is not supported in v0 planner")
 	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
 	if s.With != nil {
@@ -928,6 +919,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{}, err
 		}
 		return catalog.Type{Name: "text"}, nil
+	case *parser.IndirectionStar:
+		// `(expr).*` — record/composite star expansion. The planner
+		// rewrites this into a FROM-clause SRF; the analyzer only
+		// needs to type-walk the source so downstream errors surface
+		// here. Returns a synthetic "record" type. M0103-0008.
+		if _, err := analyzeExpr(x.Source, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "record"}, nil
 	default:
 		return catalog.Type{}, analyzeError(e.Pos(), "0A000", fmt.Sprintf("unsupported expression %T", e))
 	}
@@ -1046,6 +1046,10 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 		}
 		col, ok := lookupColumn(matches[0].table, x.Column)
 		if !ok {
+			// `<rel>.tableoid` system-column resolution. M0100-0005y.
+			if strings.EqualFold(x.Column, "tableoid") {
+				return catalog.Type{Name: "oid"}, true, nil
+			}
 			return catalog.Type{}, false, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
 		}
 		return col.Type, true, nil
@@ -1078,6 +1082,25 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 		found = &t
 	}
 	if found == nil {
+		// Unqualified `tableoid` system column. PG raises ambiguous
+		// when more than one binding could supply it; for a single
+		// non-qualified rel we resolve it to that binding's tableoid.
+		// M0100-0005y.
+		if strings.EqualFold(x.Column, "tableoid") {
+			var match *scopeRel
+			for i := range ctx.rels {
+				if ctx.rels[i].qualifiedOnly {
+					continue
+				}
+				if match != nil {
+					return catalog.Type{}, false, analyzeError(x.Pos(), "42702", fmt.Sprintf("column reference %q is ambiguous", x.Column))
+				}
+				match = &ctx.rels[i]
+			}
+			if match != nil {
+				return catalog.Type{Name: "oid"}, true, nil
+			}
+		}
 		return catalog.Type{}, false, nil
 	}
 	return *found, true, nil
@@ -1104,27 +1127,96 @@ func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error
 		return synthesizeSubqueryTable(cat, rv)
 	}
 	// Table-valued function (M0096-0006): produce a synthetic table.
+	// The planner is the source of truth for SRF return shapes; this
+	// analyzer-side helper mirrors the planner's per-function dispatch
+	// (see planTableFuncRangeVar in internal/planner/planner.go) so a
+	// derived subquery wrapping an SRF — e.g.
+	// `( SELECT (pg_get_publication_tables('p')).* ) AS gpt` —
+	// surfaces the real column list (relid/attrs/qual) to the outer
+	// scope rather than the generate_series-shaped single-int8-column
+	// default. M0103-0008 (IndirectionStar derived-subquery propagation).
 	if rv.TableFunc != nil {
 		alias := rv.Alias
 		if alias == "" {
 			alias = rv.TableFunc.Name
 		}
-		colName := alias
-		if len(rv.Columns) > 0 {
-			colName = rv.Columns[0]
-		}
-		return &catalog.Table{
-			Name: alias,
-			Columns: []catalog.Column{
-				{Name: colName, Type: catalog.Type{Name: "int8"}, Ordinal: 0},
-			},
-		}, nil
+		cols := tableFuncColumns(rv.TableFunc.Name, alias, rv.Columns)
+		return &catalog.Table{Name: alias, Columns: cols}, nil
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
 	if !ok {
 		return nil, analyzeError(rv.Pos(), "42P01", fmt.Sprintf("relation %q does not exist", rv.Name))
 	}
 	return tbl, nil
+}
+
+// tableFuncColumns returns the column list for a FROM-clause table-valued
+// function. Mirrors the planner's planTableFuncRangeVar dispatch so the
+// analyzer's synthesizeSubqueryTable can hand the outer scope the same
+// column list the planner will produce at execution time. Unknown
+// functions fall back to a single column named after the alias (the
+// pre-M0103-0008 behaviour, sufficient for generate_series).
+func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Column {
+	switch strings.ToLower(funcName) {
+	case "pg_get_publication_tables":
+		names := []string{"relid", "attrs", "qual"}
+		types := []string{"oid", "text", "text"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
+	case "pg_input_error_info":
+		names := []string{"message", "detail", "hint", "sql_error_code"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: "text"}, Ordinal: i}
+		}
+		return cols
+	case "parse_ident":
+		colName := alias
+		if len(colAliases) > 0 && colAliases[0] != "" {
+			colName = colAliases[0]
+		}
+		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "text[]"}, Ordinal: 0}}
+	default:
+		// generate_series and unknown SRFs: 1 int8 column named after
+		// the alias. Preserves pre-M0103-0008 behaviour.
+		colName := alias
+		if len(colAliases) > 0 && colAliases[0] != "" {
+			colName = colAliases[0]
+		}
+		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "int8"}, Ordinal: 0}}
+	}
+}
+
+// compositeFuncColumns returns the composite return-column shape for a
+// SRF that is known to expand into multiple columns via `(srf(...)).*`
+// in target-list position. Returns nil for SRFs without a composite
+// return type (the caller falls back to the generic analyzeExpr path).
+// Mirrors planner.projectSetCompositeSchema so the analyzer's
+// derived-subquery synthesis sees the same columns the planner will
+// produce at execution time. M0103-0008 rung 7.
+func compositeFuncColumns(funcName string) []catalog.Column {
+	switch strings.ToLower(funcName) {
+	case "pg_get_publication_tables":
+		return []catalog.Column{
+			{Name: "relid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
+			{Name: "attrs", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+			{Name: "qual", Type: catalog.Type{Name: "text"}, Ordinal: 2},
+		}
+	}
+	return nil
 }
 
 // resolveTable is the scope-aware variant of lookupTable used by
@@ -1426,6 +1518,23 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.
 				}
 			}
 			continue
+		}
+		// `(srf(...)).*` inside a derived subquery — expand to the SRF's
+		// composite columns so outer-scope references resolve. Mirrors
+		// the planner's ProjectSet lowering
+		// (planner.projectSetCompositeSchema). Currently only
+		// pg_get_publication_tables is recognised as composite; other
+		// IndirectionStar sources fall through to the generic
+		// analyzeExpr path. M0103-0008 rung 7.
+		if is, ok := tgt.Expr.(*parser.IndirectionStar); ok {
+			if fc, ok2 := is.Source.(*parser.FuncCall); ok2 {
+				if comp := compositeFuncColumns(fc.Name.Name); comp != nil {
+					for _, c := range comp {
+						cols = append(cols, catalog.Column{Name: c.Name, Type: c.Type})
+					}
+					continue
+				}
+			}
 		}
 		name := tgt.Alias
 		if name == "" {

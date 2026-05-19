@@ -82,6 +82,11 @@ type lockRowsOp struct {
 	pending []pendingLockedRow
 	pos     int
 	drained bool
+
+	// maxDrain, when > 0, limits drainAndStamp to at most maxDrain rows.
+	// Used by EXISTS (SELECT ... FOR UPDATE) to stop after the first match
+	// instead of scanning the full inner table. M0100-0005.
+	maxDrain int
 }
 
 type pendingLockedRow struct {
@@ -229,7 +234,12 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 // and emits the row-lock WAL record.
 func (o *lockRowsOp) drainAndStamp() error {
 	o.drained = true
+	hitLimit := false
 	for {
+		if o.maxDrain > 0 && len(o.pending) >= o.maxDrain {
+			hitLimit = true
+			break
+		}
 		slot, err := o.child.Next()
 		if err == EOF {
 			break
@@ -250,6 +260,12 @@ func (o *lockRowsOp) drainAndStamp() error {
 			}
 		}
 		o.pending = append(o.pending, entry)
+	}
+	// When we stopped early (maxDrain limit hit), the child scan still holds
+	// its page RLock. Close the child to release it before the stamp pass
+	// acquires exclusive page locks — otherwise we deadlock. M0100-0005.
+	if hitLimit {
+		_ = o.child.Close()
 	}
 	for i := range o.pending {
 		e := &o.pending[i]
@@ -301,6 +317,29 @@ func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer)
 		return err
 	}
 	slot.Lock()
+	// M0100-0005f: if xmax is already a real (non-lock-only) updater
+	// from a different transaction, do NOT overwrite it with our
+	// lock-only stamp. Upstream represents "row has an updater AND
+	// concurrent KEY SHARE/SHARE lock holders" via MultiXact; v0
+	// goopg lacks MultiXact infrastructure, so the safe approximation
+	// is to keep the original updater's deletion stamp on the page
+	// and rely on the lockmgr tuple-tag lock (already acquired above)
+	// to enforce row-level locking semantics for our holder.
+	// Without this guard, the next session that takes FOR KEY SHARE
+	// over a row whose UPDATE is still in flight would erase the
+	// updater's xmax — after the updater commits, the dead old
+	// version would remain visible (the lock-only branch in
+	// TupleVisible short-circuits the xmax check). Reproduces as
+	// the s1hint dead-tuple bug in lock-committed-update.
+	tup, gerr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+	if gerr == nil &&
+		tup.Header.Xmax != storage.InvalidTransactionID &&
+		!storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
+		tup.Header.Xmax != o.ctx.Tx.XID {
+		slot.Unlock()
+		o.ctx.Pool.Unpin(slot)
+		return nil
+	}
 	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, o.ctx.Tx.XID, o.lockStrength); err != nil {
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)

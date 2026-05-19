@@ -87,6 +87,16 @@ const (
 	// inserted as the successor in a HOT update chain and has no direct
 	// index entry. Mirrors PostgreSQL's HEAP_ONLY_TUPLE (0x8000).
 	HeapOnlyTuple uint16 = 0x8000
+
+	// HEAP_HASNULL indicates the tuple contains NULL values (null bitmap
+	// present in t_hoff). Mirrors PG's HEAP_HASNULL (0x0001).
+	HeapHasNull uint16 = 0x0001
+	// HEAP_HASVARWIDTH indicates the tuple has variable-width columns.
+	// Mirrors PG's HEAP_HASVARWIDTH (0x0002).
+	HeapHasVarWidth uint16 = 0x0002
+	// HEAP_NATTS_MASK is the bit mask for number of attributes in
+	// t_infomask2 (bits 0-10). Mirrors PG's HEAP_NATTS_MASK (0x07FF).
+	HeapNattsMask uint16 = 0x07FF
 )
 
 // IsHeapTupleLockOnly reports whether `infomask` indicates the
@@ -96,10 +106,28 @@ func IsHeapTupleLockOnly(infomask uint16) bool {
 	return infomask&HeapXmaxLockOnly != 0
 }
 
+// MovedPartitionsOffsetNumber is the special t_ctid.ip_posid value
+// PostgreSQL stamps on a tuple whose UPDATE moved the row to a
+// different partition (the old version's CTID can't point to the new
+// version because it lives in another relation entirely). Combined
+// with InvalidBlockNumber it marks a "moved to another partition"
+// tombstone; EPQ retries that follow xmax to this sentinel must raise
+// `tuple to be locked was already moved to another partition due to
+// concurrent update`. Mirrors upstream's `MovedPartitionsOffsetNumber`
+// (`postgres/src/include/storage/itemptr.h`).
+const MovedPartitionsOffsetNumber uint16 = 0xFFFD
+
 // ItemPointer identifies a tuple location (block, line-pointer slot).
 type ItemPointer struct {
 	Block  BlockNumber
 	Offset uint16
+}
+
+// IsMovedToAnotherPartition reports whether `ctid` carries the
+// upstream "moved to another partition" sentinel (block ==
+// InvalidBlockNumber, offset == MovedPartitionsOffsetNumber).
+func IsMovedToAnotherPartition(ctid ItemPointer) bool {
+	return ctid.Block == InvalidBlockNumber && ctid.Offset == MovedPartitionsOffsetNumber
 }
 
 // HeapTupleHeader is the fixed tuple header subset used in milestone 5.
@@ -115,12 +143,26 @@ type HeapTupleHeader struct {
 }
 
 // HeapTuple is one on-page tuple body.
+//
+// Bitmap is the PG null bitmap (bit=1 means NOT NULL, matching PG's
+// heap_fill_tuple), nil when the tuple has no nulls. Data is the column
+// data area only — the bitmap is stored separately so MarshalBinary can
+// place it at the canonical PG location (right after the fixed header,
+// before the t_hoff-aligned data region).
 type HeapTuple struct {
 	Header HeapTupleHeader
+	Bitmap []byte
 	Data   []byte
 }
 
 // NewHeapTuple constructs a tuple with v0 defaults.
+// SetNatts sets t_infomask2 to the given number of attributes,
+// mirroring PG's HeapTupleHeaderSetNatts. Caller must also set
+// HeapHasNull in infomask if the null bitmap is present.
+func (h *HeapTupleHeader) SetNatts(natts int) {
+	h.Infomask2 = (h.Infomask2 &^ HeapNattsMask) | (uint16(natts) & HeapNattsMask)
+}
+
 func NewHeapTuple(xmin, xmax TransactionID, data []byte) HeapTuple {
 	out := make([]byte, len(data))
 	copy(out, data)
@@ -136,7 +178,44 @@ func NewHeapTuple(xmin, xmax TransactionID, data []byte) HeapTuple {
 	}
 }
 
-// MarshalBinary encodes the tuple into the on-page layout.
+// maxAlign8 rounds n up to the nearest multiple of 8 (PG's MAXALIGN on
+// 64-bit platforms).
+func maxAlign8(n int) int {
+	return (n + 7) &^ 7
+}
+
+// NewHeapTupleWithNulls constructs a tuple whose payload includes a PG
+// null bitmap (bit=1 means NOT NULL, matching PG's heap_fill_tuple).
+// data is the column-data area only — without a bitmap and without
+// header-to-data alignment padding. The constructor stamps HEAP_HASNULL
+// in infomask and computes t_hoff = MAXALIGN(SizeofHeapTupleHeader +
+// len(bitmap)) so PG's heap_deform_tuple finds the column data at the
+// expected offset.
+func NewHeapTupleWithNulls(xmin, xmax TransactionID, bitmap, data []byte) HeapTuple {
+	hoff := maxAlign8(SizeOfHeapTupleHeaderData + len(bitmap))
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	bitmapCopy := make([]byte, len(bitmap))
+	copy(bitmapCopy, bitmap)
+	return HeapTuple{
+		Header: HeapTupleHeader{
+			Xmin:     xmin,
+			Xmax:     xmax,
+			Xvac:     InvalidTransactionID,
+			CTID:     ItemPointer{Block: InvalidBlockNumber, Offset: 0},
+			Infomask: HeapHasNull,
+			Hoff:     uint8(hoff),
+		},
+		Bitmap: bitmapCopy,
+		Data:   dataCopy,
+	}
+}
+
+// MarshalBinary encodes the tuple into the on-page layout. When Bitmap
+// is non-nil, it is written immediately after the fixed header (byte
+// SizeOfHeapTupleHeaderData..SizeOfHeapTupleHeaderData+len(Bitmap));
+// the gap between the bitmap and Data (starting at byte t_hoff) is
+// alignment padding required by PG.
 func (t HeapTuple) MarshalBinary() ([]byte, error) {
 	hoff := int(t.Header.Hoff)
 	if hoff == 0 {
@@ -144,6 +223,9 @@ func (t HeapTuple) MarshalBinary() ([]byte, error) {
 	}
 	if hoff < SizeOfHeapTupleHeaderData || hoff > 255 {
 		return nil, fmt.Errorf("invalid t_hoff=%d", hoff)
+	}
+	if len(t.Bitmap) > 0 && SizeOfHeapTupleHeaderData+len(t.Bitmap) > hoff {
+		return nil, fmt.Errorf("null bitmap of %d bytes does not fit under t_hoff=%d", len(t.Bitmap), hoff)
 	}
 	out := make([]byte, hoff+len(t.Data))
 	binary.LittleEndian.PutUint32(out[0:4], uint32(t.Header.Xmin))
@@ -154,6 +236,9 @@ func (t HeapTuple) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint16(out[18:20], t.Header.Infomask2)
 	binary.LittleEndian.PutUint16(out[20:22], t.Header.Infomask)
 	out[22] = byte(hoff)
+	if len(t.Bitmap) > 0 {
+		copy(out[SizeOfHeapTupleHeaderData:SizeOfHeapTupleHeaderData+len(t.Bitmap)], t.Bitmap)
+	}
 	copy(out[hoff:], t.Data)
 	return out, nil
 }
@@ -166,6 +251,9 @@ func ParseHeapTuple(raw []byte) (HeapTuple, error) {
 		return HeapTuple{}, err
 	}
 	t.Data = append([]byte(nil), t.Data...)
+	if len(t.Bitmap) > 0 {
+		t.Bitmap = append([]byte(nil), t.Bitmap...)
+	}
 	return t, nil
 }
 
@@ -181,17 +269,29 @@ func parseHeapTupleAlias(raw []byte) (HeapTuple, error) {
 	if hoff < SizeOfHeapTupleHeaderData || hoff > len(raw) {
 		return HeapTuple{}, fmt.Errorf("%w: invalid t_hoff=%d len=%d", ErrCorruptTuple, hoff, len(raw))
 	}
+	infomask := binary.LittleEndian.Uint16(raw[20:22])
+	infomask2 := binary.LittleEndian.Uint16(raw[18:20])
+	var bitmap []byte
+	if infomask&HeapHasNull != 0 {
+		natts := int(infomask2 & HeapNattsMask)
+		bmLen := (natts + 7) / 8
+		if SizeOfHeapTupleHeaderData+bmLen > hoff {
+			return HeapTuple{}, fmt.Errorf("%w: null bitmap of %d bytes overruns t_hoff=%d", ErrCorruptTuple, bmLen, hoff)
+		}
+		bitmap = raw[SizeOfHeapTupleHeaderData : SizeOfHeapTupleHeaderData+bmLen]
+	}
 	return HeapTuple{
 		Header: HeapTupleHeader{
 			Xmin:      TransactionID(binary.LittleEndian.Uint32(raw[0:4])),
 			Xmax:      TransactionID(binary.LittleEndian.Uint32(raw[4:8])),
 			Xvac:      TransactionID(binary.LittleEndian.Uint32(raw[8:12])),
 			CTID:      ItemPointer{Block: BlockNumber(binary.LittleEndian.Uint32(raw[12:16])), Offset: binary.LittleEndian.Uint16(raw[16:18])},
-			Infomask2: binary.LittleEndian.Uint16(raw[18:20]),
-			Infomask:  binary.LittleEndian.Uint16(raw[20:22]),
+			Infomask2: infomask2,
+			Infomask:  infomask,
 			Hoff:      uint8(hoff),
 		},
-		Data: raw[hoff:],
+		Bitmap: bitmap,
+		Data:   raw[hoff:],
 	}, nil
 }
 
@@ -268,13 +368,22 @@ func PageAddHeapTuple(p Page, t HeapTuple) (uint16, error) {
 	}
 	lower := int(h.Lower())
 	upper := int(h.Upper())
-	needed := itemIDSize + len(raw)
+	// PG MAXALIGNs the tuple offset (PageAddItemExtended: alignedSize =
+	// MAXALIGN(size); upper -= alignedSize). On a PG18 standby, a tuple
+	// whose offset is not 8-byte aligned causes the backend's
+	// heap_deform_tuple to dereference alignment-sensitive offsets at
+	// the wrong base, segfaulting on the first SELECT. The line-pointer
+	// Length still reports the actual tuple length so ParseHeapTuple
+	// reads exactly the tuple bytes; the trailing 0..7 bytes are
+	// padding (zero from InitPage). M0106-0010 batched-36.
+	alignedSize := maxAlign8(len(raw))
+	needed := itemIDSize + alignedSize
 	if upper-lower < needed {
 		return 0, ErrNoSpaceInPage
 	}
 
-	newUpper := upper - len(raw)
-	copy(p[newUpper:upper], raw)
+	newUpper := upper - alignedSize
+	copy(p[newUpper:newUpper+len(raw)], raw)
 
 	count, err := PageLinePointerCount(p)
 	if err != nil {
@@ -727,6 +836,92 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
 		MustHeader(p).SetPruneXID(uint32(xmax))
 	}
+	return nil
+}
+
+// PageSetHeapTupleMovedPartition stamps xmax on the tuple at
+// `slot` and writes the upstream "moved to another partition"
+// sentinel (block=InvalidBlockNumber, offset=MovedPartitionsOffsetNumber)
+// into its t_ctid. Used by cross-partition UPDATE: the old version is
+// deleted in the source partition and the new version lives in a
+// different relation entirely, so the CTID can't carry a successor
+// pointer. EPQ retries that hit this sentinel raise the upstream
+// `tuple to be locked was already moved to another partition due to
+// concurrent update` error rather than silently skipping the row.
+//
+// Like PageSetHeapTupleXmax it clears HeapXmaxLockOnly/Mask bits so
+// readers see the xmax as a real delete (not a lingering row lock).
+// Returns ErrUnsupportedItem if the slot isn't LP_NORMAL,
+// ErrInvalidSlot for out-of-range slot numbers.
+func PageSetHeapTupleMovedPartition(p Page, slot uint16, xmax TransactionID) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(xmax))
+	// t_ctid sits at off+12 (block, 4 bytes) and off+16 (offset, 2 bytes).
+	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(InvalidBlockNumber))
+	binary.LittleEndian.PutUint16(p[off+16:off+18], MovedPartitionsOffsetNumber)
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
+		MustHeader(p).SetPruneXID(uint32(xmax))
+	}
+	return nil
+}
+
+
+// PageSetHeapTupleCtid overwrites only the t_ctid field of the heap tuple
+// at the given 1-based slot. Used by non-HOT cross-page UPDATE: after the
+// new tuple version is written elsewhere (different page or a different
+// relfile entirely), the old tuple's t_ctid is updated to point at the
+// successor so that EvalPlanQual chain followers can locate the latest
+// version. Visibility (xmin/xmax) is untouched. Caller must hold the
+// page write lock.
+func PageSetHeapTupleCtid(p Page, slot uint16, ctid ItemPointer) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+18 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(ctid.Block))
+	binary.LittleEndian.PutUint16(p[off+16:off+18], ctid.Offset)
 	return nil
 }
 

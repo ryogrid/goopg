@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
@@ -66,8 +67,14 @@ type upsertOp struct {
 	// arbiterTree is opened lazily on first conflict probe (or
 	// first row insert when ArbiterIndex != nil) and kept across
 	// the statement for cheap reuse. nil when ArbiterIndex is nil
-	// (the bare DO NOTHING form).
+	// (the bare DO NOTHING form). For partitioned targets, this
+	// is swapped per-row to point at the routed leaf partition's
+	// matching arbiter index (M0100-0005t).
 	arbiterTree *btree.BTree
+	// leafTrees caches per-leaf-partition arbiter btree handles so
+	// multi-row UPSERTs over the same partition reuse a single
+	// open tree.  Keyed by leaf table OID.  M0100-0005t.
+	leafTrees map[uint32]*btree.BTree
 }
 
 // RowsAffected satisfies executor.RowCounter — for UPSERT, the
@@ -138,8 +145,10 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		return nil, EOF
 	}
 	o.done = true
-	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
-	cols := o.plan.Table.Columns
+	parentRel := o.ctx.Catalog.RelFileNode(o.plan.Table)
+	parentCols := o.plan.Table.Columns
+	parentTree := o.arbiterTree
+	isPartitioned := len(o.plan.Table.PartitionKey) > 0
 	for {
 		srcSlot, err := o.child.Next()
 		if err == EOF {
@@ -150,12 +159,35 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		}
 		src := slotRow(srcSlot)
 		// Reorder source row → target column order via plan.ColumnIndex.
-		inserted := make(Row, len(cols))
-		for i := range cols {
+		inserted := make(Row, len(parentCols))
+		for i := range parentCols {
 			inserted[i] = NullDatum
 		}
 		for srcIdx, tgtIdx := range o.plan.ColumnIndex {
 			inserted[tgtIdx] = src[srcIdx]
+		}
+
+		// M0100-0005t: partition routing for INSERT … ON CONFLICT.  When
+		// the target is partitioned, route the row to a leaf and swap
+		// the arbiter tree to the leaf's matching unique/PK index.  The
+		// parent's arbiter index is empty (writes go to leaves), so
+		// probing it would miss every live duplicate.
+		rel := parentRel
+		cols := parentCols
+		writeTbl := o.plan.Table
+		if isPartitioned {
+			leaf, leafTree, ferr := o.routeAndOpenLeaf(inserted)
+			if ferr != nil {
+				return nil, ferr
+			}
+			if leaf == nil {
+				return nil, &ExecError{Code: "23514", Pos: o.plan.Pos(),
+					Message: fmt.Sprintf("no partition of relation %q found for row", o.plan.Table.Name)}
+			}
+			rel = o.ctx.Catalog.RelFileNode(leaf)
+			cols = leaf.Columns
+			writeTbl = leaf
+			o.arbiterTree = leafTree
 		}
 
 		conflictPtr, conflictRow, conflicted, err := o.probeArbiterWaiting(rel, cols, inserted)
@@ -167,6 +199,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				return nil, err
 			}
 			o.rowsAffected++
+			_ = writeTbl
 			continue
 		}
 		switch o.plan.OnConflict.Action {
@@ -188,7 +221,78 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("unexpected OnConflictAction %d", o.plan.OnConflict.Action)}
 		}
 	}
+	// Restore parent's tree handle so Close() releases a stable resource.
+	o.arbiterTree = parentTree
 	return nil, EOF
+}
+
+// routeAndOpenLeaf finds the partition leaf that the row maps to and
+// returns the leaf table plus a cached btree handle for the leaf's
+// arbiter index (the unique/primary index whose column list matches
+// o.plan.OnConflict.ArbiterIndex).  Returns (nil, nil, nil) when the
+// row does not map to any partition.  M0100-0005t.
+func (o *upsertOp) routeAndOpenLeaf(inserted Row) (*catalog.Table, *btree.BTree, error) {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil, nil, nil
+	}
+	leaf := routeToPartition(o.plan.Table, inserted, im)
+	if leaf == nil {
+		return nil, nil, nil
+	}
+	if o.leafTrees == nil {
+		o.leafTrees = make(map[uint32]*btree.BTree)
+	}
+	if tree, hit := o.leafTrees[leaf.OID]; hit {
+		return leaf, tree, nil
+	}
+	leafIdx := o.resolveLeafArbiter(leaf)
+	if leafIdx == nil {
+		// No matching arbiter on the leaf — leave tree nil so probe
+		// short-circuits as "no entries"; applyInsert falls through
+		// to writeHeapRowReturning + index maintenance no-op.
+		o.leafTrees[leaf.OID] = nil
+		return leaf, nil, nil
+	}
+	idxRel := o.ctx.Catalog.IndexRelFileNode(leafIdx)
+	tree, err := btree.Open(o.ctx.Pool, idxRel)
+	if err != nil {
+		return nil, nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+	}
+	o.leafTrees[leaf.OID] = tree
+	return leaf, tree, nil
+}
+
+// resolveLeafArbiter finds the leaf-partition index whose column list
+// (and primary/unique flag) matches the parent's planner-resolved
+// arbiter index.  M0100-0005t.
+func (o *upsertOp) resolveLeafArbiter(leaf *catalog.Table) *catalog.Index {
+	parentIdx := o.plan.OnConflict.ArbiterIndex
+	if parentIdx == nil || o.ctx.Catalog == nil {
+		return nil
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(leaf) {
+		if parentIdx.Primary && !idx.Primary {
+			continue
+		}
+		if !parentIdx.Primary && !idx.Unique {
+			continue
+		}
+		if len(idx.Columns) != len(parentIdx.Columns) {
+			continue
+		}
+		ok := true
+		for i := range idx.Columns {
+			if !strings.EqualFold(idx.Columns[i], parentIdx.Columns[i]) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return idx
+		}
+	}
+	return nil
 }
 
 // probeArbiter looks up the inserted row's conflict key in the
@@ -237,7 +341,18 @@ func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, 
 			}
 			return false, err
 		}
-		if !mvcc.TupleVisible(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID) {
+		// M0100-0005x: upstream `_bt_check_unique` probes with
+		// HeapTupleSatisfiesDirty, which sees committed-after-snapshot
+		// commits and aborted deletes.  isLiveForUniqueCheck implements
+		// that subset: xmin live iff not aborted (committed-after counts
+		// as live); xmax dead iff committed (regardless of whether our
+		// frozen RR snapshot still thinks the deleter is in-progress).
+		// This is required so a wait-then-recheck on Case 2 (in-flight
+		// delete that commits during wait) clears the apparent conflict
+		// and lets the INSERT proceed — partition-key-update-3.spec
+		// permutations 1/5.  TupleVisible would still report the dead
+		// row as visible under RR's frozen snapshot.
+		if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
 			return true, nil
 		}
 		row, err := DecodeRow(cols, tuple.Data)
@@ -263,17 +378,14 @@ func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, 
 // concurrent isolation tests.
 func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.Column, inserted Row) (storage.ItemPointer, Row, bool, error) {
 	for {
-		ptr, row, found, err := o.probeArbiter(rel, cols, inserted)
-		if err != nil || found {
-			return ptr, row, found, err
-		}
-		// No visible conflict. Check for in-progress tuples that
-		// could become conflicts once the other transaction finishes.
-		inProgressXID, hasInProgress := o.findInProgressConflict(rel, cols, inserted)
+		// First look for an in-progress transaction that could change
+		// the probe outcome (in-flight insert with our key, or
+		// in-flight delete of a visible match). If one exists, wait
+		// for it to settle and re-probe under a fresh snapshot.
+		inProgressXID, isInFlightInsert, hasInProgress := o.findInProgressConflict(rel, cols, inserted)
 		if !hasInProgress {
-			return storage.ItemPointer{}, nil, false, nil
+			return o.probeArbiter(rel, cols, inserted)
 		}
-		// Wait for the in-progress transaction to complete.
 		qctx := o.ctx.Ctx
 		if qctx == nil {
 			qctx = context.Background()
@@ -284,7 +396,23 @@ func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.C
 				return storage.ItemPointer{}, nil, false, nil
 			}
 		}
-		// After the other transaction ended, refresh the snapshot and re-probe.
+		// M0100-0005x: under RR / SERIALIZABLE, if the in-flight conflict
+		// was an INSERT (Case 1 — xmin in-progress) and the inserter
+		// committed, the resulting unique conflict is invisible to our
+		// frozen snapshot.  Upstream `_bt_check_unique` (via DirtySnapshot)
+		// sees the row and aborts the inserter with 40001 rather than
+		// silently proceeding with a duplicate or silently skipping.
+		// Case 2 (in-flight delete on a visible row) does NOT raise —
+		// the deletion clears the apparent conflict, INSERT proceeds.
+		if isInFlightInsert && o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+			if o.ctx.TxnMgr != nil && !o.ctx.TxnMgr.HasAbortedXID(inProgressXID) {
+				return storage.ItemPointer{}, nil, false, &ExecError{
+					Code:    "40001",
+					Pos:     o.plan.Pos(),
+					Message: "could not serialize access due to concurrent update",
+				}
+			}
+		}
 		if o.ctx.TxnMgr != nil && o.ctx.Tx.Handle != 0 {
 			if snap, serr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); serr == nil {
 				o.ctx.Snap = snap.Clone()
@@ -296,15 +424,19 @@ func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.C
 // findInProgressConflict scans the arbiter index for a tuple whose xmin
 // is from a currently in-progress transaction (not yet committed/aborted).
 // Returns the in-progress XID and true if found; (0, false) otherwise.
-func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalog.Column, inserted Row) (storage.TransactionID, bool) {
+func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalog.Column, inserted Row) (xid storage.TransactionID, isInFlightInsert bool, found bool) {
 	if o.arbiterTree == nil || o.ctx == nil {
-		return 0, false
+		return 0, false, false
 	}
 	key, err := encodeArbiterKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
 	if err != nil || key == nil {
-		return 0, false
+		return 0, false, false
 	}
-	var foundXID storage.TransactionID
+	selfXID := o.ctx.Tx.XID
+	var (
+		foundXID storage.TransactionID
+		case1    bool
+	)
 	_ = o.arbiterTree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 		if err != nil {
@@ -318,13 +450,33 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalo
 			return true, nil
 		}
 		xmin := tuple.Header.Xmin
-		if xmin != storage.InvalidTransactionID && o.ctx.Snap.HasInProgress(xmin) {
+		xmax := tuple.Header.Xmax
+		// Case 1: in-flight insert (xmin still active, not us). Use the live
+		// manager active-set (not the snapshot InProgress list) so we also
+		// catch XIDs that were materialised after this session's snapshot
+		// was taken (M0100-0002).
+		if xmin != storage.InvalidTransactionID && xmin != selfXID && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmin) {
 			foundXID = xmin
-			return false, nil // stop scanning
+			case1 = true
+			return false, nil
+		}
+		// Case 2: visible-being-deleted. The tuple's xmin is already settled
+		// from this snapshot's view (committed or our own xact), and xmax is
+		// a non-lock-only in-flight non-self xact — i.e. someone is in the
+		// middle of deleting (or cross-partition-moving) what would otherwise
+		// be a real arbiter conflict. Upstream `_bt_check_unique` waits on
+		// this xmax to determine whether the apparent conflict survives.
+		if xmax != storage.InvalidTransactionID && xmax != selfXID && !storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
+			xminSettled := xmin == selfXID || (o.ctx.Snap.SeesCommittedXID(xmin))
+			if xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
+				foundXID = xmax
+				case1 = false
+				return false, nil
+			}
 		}
 		return true, nil
 	})
-	return foundXID, foundXID != 0
+	return foundXID, case1, foundXID != 0
 }
 
 // applyInsert is the no-conflict happy path. Writes the heap row
@@ -345,6 +497,12 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, cols []catalog.Column, i
 // place — visibility filtering at the next probe will skip it
 // because the tuple's xmax now blocks it.
 func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, oldPtr storage.ItemPointer, updated Row) error {
+	// Materialise the XID BEFORE stamping xmax so the old tuple gets a
+	// real delete stamp (not InvalidTransactionID). Without this, the old
+	// tuple's xmax=0 would make it appear still-live to subsequent scans.
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
 	pinned, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: oldPtr.Block})
 	if err != nil {
 		return err

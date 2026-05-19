@@ -32,7 +32,7 @@ func (p *parser) parseInsert() (Stmt, error) {
 			return nil, p.errAtCur("expected ')'")
 		}
 	}
-	// INSERT … SELECT or INSERT … VALUES
+	// INSERT … SELECT | INSERT … VALUES | INSERT … DEFAULT VALUES
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
 		sel, err := p.parseSelect()
 		if err != nil {
@@ -43,6 +43,19 @@ func (p *parser) parseInsert() (Stmt, error) {
 		} else {
 			return nil, p.errAtCur("expected SELECT statement")
 		}
+	} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+		// M0103-0007 rung 17: `INSERT INTO t DEFAULT VALUES` — the
+		// all-defaults form. The keyword pair is parsed here; the
+		// planner's rewriteInsertDefaultMarkers expands it into a
+		// single row of DefaultMarkers sized to the table's insertable
+		// columns. A column list before DEFAULT VALUES is rejected by
+		// upstream PG, but we silently accept it for forward-compat —
+		// the planner will arity-check after expansion.
+		p.advance() // consume DEFAULT
+		if _, err := p.expectKeyword(KwValues); err != nil {
+			return nil, err
+		}
+		stmt.DefaultValues = true
 	} else {
 		if _, err := p.expectKeyword(KwValues); err != nil {
 			return nil, err
@@ -265,14 +278,25 @@ func (p *parser) parseValuesRow() ([]Expr, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '('")
 	}
+	parseCell := func() (Expr, error) {
+		// rung 15 (M0103-0007): bare DEFAULT keyword in a VALUES row.
+		// Substituted by planInsert with the target column's catalog
+		// DefaultExpr (or NULL) — never reaches the executor.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+			t := p.cur()
+			p.advance()
+			return &DefaultMarker{pos: t.Pos}, nil
+		}
+		return p.parseExpr()
+	}
 	var row []Expr
-	first, err := p.parseExpr()
+	first, err := parseCell()
 	if err != nil {
 		return nil, err
 	}
 	row = append(row, first)
 	for p.acceptSymbol(",") {
-		next, err := p.parseExpr()
+		next, err := parseCell()
 		if err != nil {
 			return nil, err
 		}
@@ -352,6 +376,15 @@ func (p *parser) parseAssign() (UpdateAssign, error) {
 		return UpdateAssign{}, p.errAtCur("expected '='")
 	}
 	p.advance()
+	// rung 16 (M0103-0007): bare DEFAULT keyword on the RHS of an UPDATE
+	// SET assignment. Substituted by Plan() with the target column's
+	// catalog DefaultExpr (or NULL) before the analyzer runs — never
+	// reaches the executor. Mirrors rung 15's INSERT VALUES handling.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+		t := p.cur()
+		p.advance()
+		return UpdateAssign{pos: pos, Column: identText(col), Expr: &DefaultMarker{pos: t.Pos}}, nil
+	}
 	expr, err := p.parseExpr()
 	if err != nil {
 		return UpdateAssign{}, err

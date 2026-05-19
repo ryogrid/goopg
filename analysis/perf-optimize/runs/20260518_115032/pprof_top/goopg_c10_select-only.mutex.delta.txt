@@ -1,0 +1,49 @@
+# go tool pprof -top -nodecount=40 -cum -base /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_select-only.mutex_base.pb.gz /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_select-only.mutex.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 11:52:29 JST
+Showing nodes accounting for 48.81s, 99.11% of 49.25s total
+Dropped 313 nodes (cum <= 0.25s)
+Showing top 40 nodes out of 75
+      flat  flat%   sum%        cum   cum%
+    24.46s 49.66% 49.66%     24.46s 49.66%  runtime.unlock (partial-inline)
+    12.55s 25.47% 75.13%     20.18s 40.97%  sync.(*RWMutex).Unlock
+         0     0% 75.13%     16.39s 33.28%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0% 75.13%     16.39s 33.28%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0% 75.13%     16.39s 33.28%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0% 75.13%     14.68s 29.79%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0% 75.13%     14.68s 29.79%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0% 75.13%     14.68s 29.79%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0% 75.13%     13.86s 28.15%  github.com/goopg/goopg/internal/storage.(*Bgwriter).run
+         0     0% 75.13%     13.86s 28.15%  github.com/goopg/goopg/internal/storage.(*Pool).WriteDirtyPages
+         0     0% 75.13%     13.86s 28.14%  github.com/goopg/goopg/internal/storage.(*Bgwriter).Start.gowrap1
+         0     0% 75.13%     13.64s 27.70%  runtime.mcall
+         0     0% 75.13%     13.50s 27.42%  runtime.schedule
+         0     0% 75.13%     13.32s 27.04%  runtime.findRunnable
+         0     0% 75.13%     12.38s 25.13%  runtime.gcstopm
+         0     0% 75.13%     12.04s 24.45%  runtime.park_m
+     8.71s 17.67% 92.81%      8.71s 17.69%  sync.(*Mutex).Unlock (partial-inline)
+         0     0% 92.81%      5.95s 12.08%  runtime.systemstack
+         0     0% 92.81%      5.67s 11.50%  github.com/goopg/goopg/internal/server.maybeForceGCAfterCommit
+         0     0% 92.81%      5.06s 10.27%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 92.81%      5.05s 10.25%  runtime.stopTheWorldWithSema
+         0     0% 92.81%      5.04s 10.22%  runtime.ReadMemStats
+         0     0% 92.81%      4.80s  9.74%  runtime.stopTheWorld
+         0     0% 92.81%      4.80s  9.74%  runtime.stopTheWorld.func1
+         0     0% 92.81%      3.62s  7.36%  github.com/goopg/goopg/internal/storage.(*Pool).Pin
+         0     0% 92.81%      3.40s  6.91%  runtime.stopm
+         0     0% 92.81%      3.30s  6.70%  runtime.goschedImpl
+         0     0% 92.81%      3.23s  6.56%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart
+         0     0% 92.81%      3.23s  6.55%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart.deferwrap1
+         0     0% 92.81%      3.21s  6.52%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteFrame
+         0     0% 92.81%      3.15s  6.39%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func6
+         0     0% 92.81%      3.11s  6.31%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteReadyForQuery
+     3.10s  6.30% 99.11%      3.11s  6.31%  sync.(*RWMutex).RUnlock (inline)
+         0     0% 99.11%      2.95s  5.99%  github.com/goopg/goopg/internal/executor.(*projectOp).Open
+         0     0% 99.11%      2.84s  5.76%  github.com/goopg/goopg/internal/executor.(*indexScanOp).Open
+         0     0% 99.11%      2.70s  5.47%  runtime.mstart
+         0     0% 99.11%      2.70s  5.47%  runtime.mstart0
+         0     0% 99.11%      2.70s  5.47%  runtime.mstart1
+         0     0% 99.11%      2.70s  5.47%  runtime.sysmon
+         0     0% 99.11%      2.62s  5.31%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd

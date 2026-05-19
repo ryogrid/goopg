@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // Context carries per-statement runtime state into every operator's
@@ -150,6 +151,12 @@ type Context struct {
 	// messages to the client. M0097-0008.
 	Notices []string
 
+	// NoticeFlush, when non-nil, is called for each NOTICE as it is generated
+	// so the server can send it to the client in real-time (before CommandComplete).
+	// This matches PostgreSQL's behavior where NOTICE messages arrive before
+	// any blocking point. M0100-0005.
+	NoticeFlush func(string)
+
 	// Sequence session state — maps sequence key → last nextval result
 	// for currval(); LastSeqVal/LastSeqSet track the lastval() return. M0097-0009.
 	CurrSeqVals map[string]int64
@@ -160,11 +167,66 @@ type Context struct {
 	// TEMP TABLE shadowing. Populated by execCreateTable when a TEMP TABLE
 	// shadows a permanent one; used by execDropTable to restore it. M0097-0003.
 	TempTableShadows map[string]*catalog.Table
+
+	// WAL exposes the cluster's WAL writer so execCommit can read the
+	// WrittenLSN after a local flush to bound the SyncRep wait. nil
+	// disables the bound and the wait reverts to async behaviour
+	// (commit returns immediately). M0102-0005.
+	WAL *wal.Writer
+
+	// SyncRep is the synchronous-replication wait primitive. execCommit
+	// calls SyncRep.WaitForLSN(commitLSN, mode) after local flush when
+	// SyncCommitMode is anything other than SyncRepOff and the configured
+	// `synchronous_standby_names` rule is non-empty. nil disables
+	// sync replication (async — upstream default). M0102-0005.
+	SyncRep *wal.SyncRep
+
+	// SyncCommitMode is the session-effective `synchronous_commit` GUC
+	// level. SyncRepOff means commit returns immediately after local
+	// flush; remote_* levels block until configured standbys ack.
+	// M0102-0005.
+	SyncCommitMode wal.SyncRepMode
+
+	// OnSubscriptionChange is invoked after a successful
+	// CREATE / DROP SUBSCRIPTION (and, when it lands, ALTER
+	// SUBSCRIPTION). The server wires this to ApplyLauncher.Wake so
+	// the launcher rescans within milliseconds rather than waiting
+	// for its periodic poll. nil disables the wakeup (the launcher
+	// still converges via the timer). M0103-0002.
+	OnSubscriptionChange func()
+
+	// DataDir is the cluster's data directory, used by DDL operators that
+	// write to nailed catalog relations (pg_class, pg_attribute, pg_proc,
+	// pg_type) to call catalog.RelcacheInitFileUnlink at commit time via
+	// TxnMgr.SetRelcacheInvalPending. Empty means the DDL runs without
+	// relcache-init-file invalidation (tests that don't set up a full
+	// cluster). M0106-0010 batched-31.
+	DataDir string
+
+	// LogCanonical, when non-nil, emits a PG-canonical WAL record (XLOG_HEAP_INSERT,
+	// XLOG_BTREE_INSERT_LEAF, …) so a vanilla PG18 standby can replay catalog DDL
+	// mutations. Set only when the WAL writer is in PageHeaders mode (PG-compat WAL);
+	// nil in tests and legacy-WAL configurations. M0106-0010 batched-32.
+	LogCanonical catalog.LogCanonicalFunc
+
+	// Promote, when non-nil, is invoked by pg_promote() to trigger the
+	// standby-to-primary promotion sequence. nil means the server is not
+	// a standby (or pg_promote is not yet wired) — pg_promote() returns
+	// false without error. M0106-0010 batched-34.
+	Promote func() error
+
+	// IsStandby reflects whether the server is currently acting as a hot
+	// standby. pg_is_in_recovery() returns this value. M0106-0010 batched-34.
+	IsStandby bool
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.
-// Callers: DDL operators that use IF EXISTS on non-existent objects.
+// If NoticeFlush is set, the message is also flushed to the client immediately
+// (matching PostgreSQL's real-time notice delivery). M0100-0005.
 func (c *Context) AddNotice(msg string) {
+	if c.NoticeFlush != nil {
+		c.NoticeFlush(msg)
+	}
 	c.Notices = append(c.Notices, msg)
 }
 
@@ -308,6 +370,7 @@ func (c *Context) tryAcquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) 
 // server.Config; production servers use a *wal.Checkpointer.
 type Checkpointer interface {
 	CheckpointNow() error
+	CheckpointRedoLSN() uint64
 }
 
 // NewContext builds a Context with sensible defaults: a fresh

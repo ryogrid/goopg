@@ -19,6 +19,7 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // queryHeapHighWaterMark is the per-query peak HeapInuse seen at
@@ -197,6 +198,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	ectx.PubSub = s.cfg.PubSub
 	ectx.LockMgr = s.cfg.LockMgr
 	ectx.BackendID = backendID
+	ectx.WAL = s.cfg.WAL
+	ectx.LogCanonical = s.cfg.LogCanonical
+	ectx.SyncRep = s.cfg.SyncRep
+	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
+	if s.applyLauncher != nil {
+		ectx.OnSubscriptionChange = s.applyLauncher.Wake
+	}
+	ectx.DataDir = s.cfg.DataDir
+	ectx.Promote = s.cfg.Promote
+	if s.cfg.IsStandby != nil {
+		ectx.IsStandby = s.cfg.IsStandby()
+	}
 
 	// Update pg_stat_activity before dispatching.
 	if reg := s.cfg.Activity; reg != nil {
@@ -210,6 +223,43 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	}
 
 	for _, stmt := range stmts {
+		// EXPLAIN EXECUTE <name> (M0100-0005h): the planner wraps an
+		// `ExecuteStmt` Inner as a `Utility` node and EXPLAIN renders
+		// it as the placeholder `Utility *parser.ExecuteStmt`.  PG
+		// instead expands the prepared statement and renders its
+		// actual plan tree.  We replay that here by looking up the
+		// stored PREPARE SQL, re-parsing it, and substituting the
+		// prepared `Query` Stmt for the `ExecuteStmt` before the rest
+		// of the loop falls into `planner.Plan(stmt, …)`.  The
+		// re-parse is cheap for the EXPLAIN-only path and keeps the
+		// registry interface (raw-SQL store/lookup) unchanged.
+		//
+		// `rewroteExplainExecute` disables the plan cache for this
+		// statement so a later re-PREPARE of the same name (which
+		// does not invalidate the cache) cannot serve the stale plan.
+		rewroteExplainExecute := false
+		if es, ok := stmt.(*parser.ExplainStmt); ok {
+			if ex, exok := es.Inner.(*parser.ExecuteStmt); exok {
+				if prepStmts == nil {
+					return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", ex.Name))
+				}
+				prepSQL, found := prepStmts.Lookup(ex.Name)
+				if !found {
+					return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", ex.Name))
+				}
+				prepParsed, perr := parser.Parse(prepSQL)
+				if perr != nil || len(prepParsed) == 0 {
+					return s.writeQueryError(w, sqlstate.SyntaxError, "could not parse prepared statement for EXPLAIN")
+				}
+				ps, ok := prepParsed[0].(*parser.PrepareStmt)
+				if !ok || ps.Query == nil {
+					return s.writeQueryError(w, sqlstate.SystemError, fmt.Sprintf("prepared statement %q has no body", ex.Name))
+				}
+				es.Inner = ps.Query
+				rewroteExplainExecute = true
+				// fall through to executeOneSimpleStmt below
+			}
+		}
 		// Handle PREPARE / EXECUTE / DEALLOCATE inline (M0096-0006).
 		// These require per-connection state not available in the executor.
 		if ps, ok := stmt.(*parser.PrepareStmt); ok {
@@ -292,19 +342,24 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 			continue
 		}
 
-		// Refresh snapshot per statement for ReadCommitted parity.
-		snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
-		if err != nil {
-			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+		// PG-parity: RC refreshes snapshot per statement; RR/SSI hold the
+		// BEGIN-time snapshot for the whole transaction (M0100-0001).
+		// Use ectx.Tx.Isolation (not the outer tx) so execBegin's
+		// promotion of the implicit RC tx to an explicit RR tx is visible.
+		if ectx.Tx.Isolation == mvcc.IsolationReadCommitted {
+			snap2, err := s.cfg.TxnMgr.SnapshotFor(tx)
+			if err != nil {
+				return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+			}
+			ectx.Snap = snap2
 		}
-		ectx.Snap = snap2
 
 		// M0098-0005: plan cache for single-statement queries (the
 		// common OLTP case). On hit: skip planner.Plan. On miss:
 		// plan, cache, then execute.
 		var precached planner.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 {
+		if s.pc != nil && len(stmts) == 1 && !rewroteExplainExecute {
 			cacheKey = normalizeCompatSQL(sql)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -392,6 +447,21 @@ func sessionFreezeMinAge(sess *config.SessionRegistry) int64 {
 		return 50_000_000
 	}
 	return v
+}
+
+// sessionSyncCommitMode reads the effective `synchronous_commit` GUC from
+// the session registry and maps it to a SyncRepMode. Empty or unknown values
+// fall back to SyncRepRemoteFlush (treat as "on"), matching upstream.
+// M0102-0005.
+func sessionSyncCommitMode(sess *config.SessionRegistry) wal.SyncRepMode {
+	if sess == nil {
+		return wal.SyncRepRemoteFlush
+	}
+	_, eff, ok := sess.Get("synchronous_commit")
+	if !ok {
+		return wal.SyncRepRemoteFlush
+	}
+	return wal.ParseSyncCommitLevel(strings.ToLower(strings.TrimSpace(eff)))
 }
 
 func sessionOpportunisticPrune(sess *config.SessionRegistry) bool {
@@ -543,12 +613,58 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			if connTx != nil && !connTx.InExplicit() && autoCommitPtr != nil {
 				// Promote the current auto-commit transaction to explicit.
 				*autoCommitPtr = false
+				// M0104-0008: honour `BEGIN ISOLATION LEVEL <level>`. The
+				// auto-commit tx allocated at dispatch entry was created at
+				// the session default (typically READ COMMITTED); when the
+				// BEGIN carries an explicit isolation level we must replace
+				// it with a fresh tx at the requested level so SSI hooks
+				// (`ssiActive` predicates on `tx.Isolation`) fire correctly
+				// for the remainder of the explicit block.
+				if txNode.IsolationLevel != "" {
+					parsedLvl, perr := mvcc.ParseIsolationLevel(txNode.IsolationLevel)
+					if perr != nil {
+						return s.writeQueryError(w, sqlstate.SyntaxError, perr.Error())
+					}
+					if parsedLvl != ctx.Tx.Isolation {
+						// Roll back the placeholder auto-commit tx so it does
+						// not consume an XID / leak SSI bookkeeping.
+						_ = s.cfg.TxnMgr.Rollback(ctx.Tx)
+						newTx, berr := s.cfg.TxnMgr.Begin(parsedLvl)
+						if berr != nil {
+							return s.writeQueryError(w, sqlstate.SystemError, berr.Error())
+						}
+						snap, serr := s.cfg.TxnMgr.SnapshotFor(newTx)
+						if serr != nil {
+							_ = s.cfg.TxnMgr.Rollback(newTx)
+							return s.writeQueryError(w, sqlstate.SystemError, serr.Error())
+						}
+						ctx.Tx = newTx
+						ctx.Snap = snap
+					}
+				}
 				connTx.Begin(ctx.Tx)
 			}
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		case planner.TxCommit:
 			if connTx != nil && connTx.InExplicit() {
-				if err := s.cfg.TxnMgr.Commit(connTx.Tx()); err != nil {
+				explicitTx := connTx.Tx()
+				// M0104-0008: SSI pre-commit dangerous-structure check.
+				// The executor's transactionOp.execCommit invokes this for
+				// COMMIT routed through the executor; the simple-query
+				// dispatch bypasses execCommit and goes straight to
+				// TxnMgr.Commit, so the check must be re-invoked here for
+				// `BEGIN ISOLATION LEVEL SERIALIZABLE ... COMMIT` to abort
+				// with SQLSTATE 40001 when a dangerous rw-structure is
+				// detected. Returns nil for RC/RR / write-less SERIALIZABLE.
+				if explicitTx.Isolation == mvcc.IsolationSerializable && explicitTx.Handle != 0 {
+					if ssiErr := s.cfg.TxnMgr.PreCommitCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
+						_ = s.cfg.TxnMgr.Rollback(explicitTx)
+						connTx.End()
+						return s.writeQueryError(w, "40001",
+							"could not serialize access due to read/write dependencies among transactions: "+ssiErr.Error())
+					}
+				}
+				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
 					connTx.End()
 					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 				}

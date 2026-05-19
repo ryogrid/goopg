@@ -1,0 +1,3 @@
+pgbench (18.3)
+pgbench: error: could not count number of branches: ERROR:  relation "pgbench_branches" does not exist
+pgbench: hint: Perhaps you need to do initialization ("pgbench -i") in database "postgres".

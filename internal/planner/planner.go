@@ -33,16 +33,39 @@ func (e *PlanError) Error() string {
 func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
+		// Rewrite `(srf(...)).*` target-list indirection-stars into
+		// FROM-clause SRF references before the analyzer runs. The
+		// analyzer has no IndirectionStar handler — moving the
+		// rewrite here keeps the downstream pipeline free of the new
+		// AST node. M0103-0008 probe-survival.
+		if err := rewriteIndirectionStarTargets(s); err != nil {
+			return nil, err
+		}
 		if err := analyzer.Analyze(s, cat); err != nil {
 			return nil, toPlanError(err)
 		}
 		return planSelect(s, cat)
 	case *parser.InsertStmt:
+		// M0103-0007 rung 15: substitute bare DEFAULT cells in VALUES rows
+		// with the target column's catalog DefaultExpr (or NULL) before the
+		// analyzer runs — the analyzer has no DefaultMarker handler and the
+		// substituted expression flows through cleanly. Mirrors upstream's
+		// rewriteValuesRTE pass.
+		if err := rewriteInsertDefaultMarkers(s, cat); err != nil {
+			return nil, err
+		}
 		if err := analyzer.Analyze(s, cat); err != nil {
 			return nil, toPlanError(err)
 		}
 		return planInsert(s, cat)
 	case *parser.UpdateStmt:
+		// M0103-0007 rung 16: substitute bare DEFAULT cells on the RHS of
+		// SET assignments with the target column's catalog DefaultExpr (or
+		// NULL) before the analyzer runs — symmetric to rung 15's INSERT
+		// VALUES handling.
+		if err := rewriteUpdateDefaultMarkers(s, cat); err != nil {
+			return nil, err
+		}
 		if err := analyzer.Analyze(s, cat); err != nil {
 			return nil, toPlanError(err)
 		}
@@ -193,6 +216,17 @@ type rangeBinding struct {
 	// assigned" (CTE / subquery-only / ON CONFLICT excluded) and
 	// falls back to Name-only matching in downstream rebinds.
 	sourceIdx int16
+	// tableOidColIdx, when > 0, holds the relative offset within
+	// this binding's row of the synthetic `tableoid` column. Set
+	// by the planner-side per-leaf Project wrapping in partition
+	// (and inheritance) unions to len(b.table.Columns), so a
+	// partitioned-table query like `SELECT tableoid::regclass FROM
+	// foo` reports the actual leaf relname (e.g. `foo2`). Zero
+	// means "not present"; resolveColumnRefAt then synthesises a
+	// constant `&TableOidExpr{TableOID: b.table.OID}` for the
+	// `tableoid` reference instead — correct for non-partitioned
+	// base relations. M0100-0005y.
+	tableOidColIdx int
 }
 
 func tableSchema(t *catalog.Table) Schema {
@@ -204,6 +238,27 @@ func tableSchema(t *catalog.Table) Schema {
 }
 
 // tableSchemaWithSource (M0071-0009) is tableSchema's variant
+
+// wrapWithTableoid wraps `child` in a Project that copies the child's
+// schema 1:1 and adds a trailing `tableoid` column populated with the
+// constant `oid` of `tableOID`. Used by the per-leaf SeqScan wrapping
+// in partition (and inheritance) unions so a `tableoid::regclass`
+// reference reports the actual leaf relname (e.g. `foo2` rather than
+// the partitioned-parent `foo`). The binding's `tableOidColIdx` is set
+// to len(b.table.Columns) at the call site so resolveColumnRefAt
+// resolves `tableoid` to the trailing slot. M0100-0005y.
+func wrapWithTableoid(child Node, tableOID uint32, sourceIdx int16, pos int) Node {
+	in := child.Output()
+	targets := make([]Expr, len(in)+1)
+	for i, c := range in {
+		targets[i] = &ColumnRef{pos: pos, Index: i, Name: c.Name, Type: c.Type, SourceTableIdx: c.SourceTableIdx}
+	}
+	targets[len(in)] = &IntegerConst{pos: pos, Value: int64(tableOID)}
+	out := make(Schema, len(in)+1)
+	copy(out, in)
+	out[len(in)] = SchemaColumn{Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: sourceIdx}
+	return &Project{pos: pos, Child: child, Targets: targets, schema: out}
+}
 // that stamps each produced SchemaColumn with the given
 // SourceTableIdx. Callers building rangeBindings thread their
 // per-FROM monotonic source identifier in here; legacy callers
@@ -223,6 +278,29 @@ func newResolveContext(bindings []rangeBinding, schema Schema) *resolveContext {
 		ctx.alias = ctx.bindings[0].alias
 	}
 	return ctx
+}
+
+// mergeResolveContexts concatenates outer and inner into a single ctx
+// whose bindings/schema are outer-then-inner. Used to thread LATERAL
+// FROM bindings into a JOIN's right side: the right SRF arg must see
+// the cross-FROM-item siblings (outer) *and* the same FROM item's
+// left side of the JOIN (inner). Either side may be nil. M0103-0008.
+func mergeResolveContexts(outer, inner *resolveContext) *resolveContext {
+	if outer == nil {
+		return inner
+	}
+	if inner == nil {
+		return outer
+	}
+	bindings := make([]rangeBinding, 0, len(outer.bindings)+len(inner.bindings))
+	bindings = append(bindings, outer.bindings...)
+	shift := len(outer.schema)
+	for _, b := range inner.bindings {
+		b.offset += shift
+		bindings = append(bindings, b)
+	}
+	schema := appendSchema(outer.schema, inner.schema)
+	return newResolveContext(bindings, schema)
 }
 
 func singleBindingContext(table *catalog.Table, alias string) *resolveContext {
@@ -251,6 +329,14 @@ func hasJoinClauses(items []parser.FromExpr) bool {
 }
 
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+	// M0103-0008: indirection-star rewrite runs at Plan() entry
+	// before the analyzer; nested-SELECT planning paths (subqueries,
+	// UNION branches) call planSelect directly without going through
+	// Plan, so we re-run the rewrite here as an idempotent pass.
+	if err := rewriteIndirectionStarTargets(s); err != nil {
+		return nil, err
+	}
+
 	// Pre-plan WITH-list CTEs so FROM-clause references can
 	// substitute them in. Restorer pops the CTE scope back to
 	// the caller's view when this Plan call returns. nil-WITH
@@ -284,8 +370,16 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 		return &SetOp{pos: s.Pos(), Left: left, Right: right, All: true}, nil
 	}
-	// s.Distinct is handled by wrapping the final plan with a Distinct node
-	// after all other processing. See the wrapping below. M0097-0005.
+	// s.Distinct with empty target list is invalid in PostgreSQL (syntax error).
+	// With targets it is handled by wrapping the final plan with a Distinct node.
+	// See the wrapping below. M0097-0005.
+	if s.Distinct && len(s.Targets) == 0 {
+		return nil, &PlanError{
+			Pos:     s.Pos(),
+			Code:    "42601",
+			Message: "syntax error at or near \"from\"",
+		}
+	}
 
 	isSimpleSingle := len(s.From) == 1 && (len(s.FromExprs) == 0 || (len(s.FromExprs) == 1 && len(s.FromExprs[0].Joins) == 0))
 
@@ -308,7 +402,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		// dispatch live in one place. SourceTableIdx 1 — only
 		// one binding ever in this branch (0 is the
 		// "unknown / derived" sentinel).
-		nrv, b, err := planScanRangeVar(rv, cat, 1)
+		nrv, b, err := planScanRangeVar(rv, cat, 1, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -470,6 +564,56 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 
+	// M0103-0008 final sub-step: lower target-list IndirectionStar with
+	// aggregate args (e.g. `(srf(array_agg(...))).*`) into a ProjectSet
+	// wrapper sitting above the Aggregate node. The libpqrcv
+	// `fetch_table_list` probe against a goopg publisher hits exactly
+	// this shape.
+	var ps *ProjectSet
+	if agg != nil {
+		for _, t := range s.Targets {
+			is, ok := t.Expr.(*parser.IndirectionStar)
+			if !ok {
+				continue
+			}
+			fc, ok := is.Source.(*parser.FuncCall)
+			if !ok {
+				return nil, &PlanError{Pos: is.Pos(), Code: "0A000",
+					Message: "(expr).* requires a function-call source"}
+			}
+			compName := strings.ToLower(fc.Name.Name)
+			compSchema := projectSetCompositeSchema(compName)
+			if compSchema == nil {
+				return nil, &PlanError{Pos: fc.Pos(), Code: "0A000",
+					Message: fmt.Sprintf("set-returning function %q is not supported in ProjectSet", compName)}
+			}
+			args := make([]Expr, 0, len(fc.Args))
+			for _, a := range fc.Args {
+				pa, err := resolveExprAfterAggregate(a, agg)
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, pa)
+			}
+			ps = &ProjectSet{
+				pos:     is.Pos(),
+				Child:   node,
+				SrfName: compName,
+				SrfArgs: args,
+				schema:  compSchema,
+			}
+			node = ps
+			// Downstream resolution (ORDER BY, LIMIT, target list)
+			// reads from the ProjectSet's expanded output, not the
+			// aggregate. Reset ctx + agg so the existing branches
+			// hit the non-aggregate path.
+			ctx = newResolveContext(nil, ps.Output())
+			ctx.cat = cat
+			agg = nil
+			break
+		}
+	}
+
 	var win *windowSurface
 	if needsWindowStage(s) {
 		var err error
@@ -530,7 +674,17 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		targets []Expr
 		schema  Schema
 	)
-	if win != nil {
+	if ps != nil {
+		// Identity passthrough over the ProjectSet's expanded composite.
+		// The IndirectionStar in s.Targets is consumed by the ProjectSet;
+		// the wrapping Project becomes a no-op identity that surfaces the
+		// expanded columns.
+		schema = ps.Output()
+		targets = make([]Expr, len(schema))
+		for i, sc := range schema {
+			targets[i] = &ColumnRef{pos: ps.pos, Index: i, Name: sc.Name, Type: sc.Type}
+		}
+	} else if win != nil {
 		targets, schema, err = resolveTargetsAfterWindow(s.Targets, win)
 	} else if agg == nil {
 		targets, schema, err = resolveTargets(s.Targets, ctx)
@@ -732,7 +886,14 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 	// derived" sentinel for SchemaColumn.SourceTableIdx.
 	nextSourceIdx := int16(1)
 	for _, item := range s.FromExprs {
-		itemNode, itemBindings, err := planFromItem(item, cat, &nextSourceIdx)
+		// LATERAL semantics for FROM-clause SRFs (M0103-0008):
+		// the partial FROM-list context is threaded down so each
+		// item's SRF args see siblings to its left.
+		var lateralCtx *resolveContext
+		if len(bindings) > 0 {
+			lateralCtx = newResolveContext(bindings, root.Output())
+		}
+		itemNode, itemBindings, err := planFromItem(item, cat, &nextSourceIdx, lateralCtx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -748,11 +909,12 @@ func planFromClause(s *parser.SelectStmt, cat catalog.Catalog) (Node, *resolveCo
 			shifted[i].offset += shift
 		}
 		root = &Join{
-			pos:    item.Pos(),
-			Type:   JoinTypeCross,
-			Left:   root,
-			Right:  itemNode,
-			schema: appendSchema(root.Output(), itemNode.Output()),
+			pos:     item.Pos(),
+			Type:    JoinTypeCross,
+			Left:    root,
+			Right:   itemNode,
+			schema:  appendSchema(root.Output(), itemNode.Output()),
+			Lateral: nodeReferencesOuter(itemNode),
 		}
 		bindings = append(bindings, shifted...)
 	}
@@ -769,7 +931,15 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 	// derived" sentinel for SchemaColumn.SourceTableIdx.
 	nextSourceIdx := int16(1)
 	for _, rv := range from {
-		n, b, err := planScanRangeVar(rv, cat, nextSourceIdx)
+		// LATERAL semantics for FROM-clause SRFs (M0103-0008): pass
+		// the accumulated bindings/schema as the resolution scope so
+		// `pg_get_publication_tables(p.pubname)` resolves p.pubname
+		// against earlier FROM items. nil for the first item.
+		var lateralCtx *resolveContext
+		if len(bindings) > 0 {
+			lateralCtx = newResolveContext(bindings, root.Output())
+		}
+		n, b, err := planScanRangeVar(rv, cat, nextSourceIdx, lateralCtx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -781,11 +951,12 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 		}
 		b.offset += len(root.Output())
 		root = &Join{
-			pos:    rv.Pos(),
-			Type:   JoinTypeCross,
-			Left:   root,
-			Right:  n,
-			schema: appendSchema(root.Output(), n.Output()),
+			pos:     rv.Pos(),
+			Type:    JoinTypeCross,
+			Left:    root,
+			Right:   n,
+			schema:  appendSchema(root.Output(), n.Output()),
+			Lateral: nodeReferencesOuter(n),
 		}
 		bindings = append(bindings, b)
 	}
@@ -795,15 +966,59 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 	return root, newResolveContext(bindings, root.Output()), nil
 }
 
-func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16) (Node, []rangeBinding, error) {
-	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat, *nextSourceIdx)
+
+// nodeReferencesOuter reports whether the planned right-side FROM item
+// resolved any expression against the lateral outer context — i.e. the
+// item's evaluation depends on the row produced by the left siblings.
+// The executor uses this to switch the wrapping Join to its per-outer-
+// row lateral driver instead of the materialise-both-sides default.
+//
+// Today only the pg_get_publication_tables FROM-clause SRF gets routed
+// through `lateralCtx`, so the only positive case is a
+// *PgGetPublicationTables whose argument list contains a *ColumnRef.
+// Generic LATERAL subqueries / table funcs would extend this helper
+// with their own walker.
+func nodeReferencesOuter(n Node) bool {
+	switch x := n.(type) {
+	case *PgGetPublicationTables:
+		for _, a := range x.Args {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func exprContainsColumnRef(e Expr) bool {
+	if e == nil {
+		return false
+	}
+	found := false
+	walkExprTree(e, func(node Expr) {
+		if found {
+			return
+		}
+		if _, ok := node.(*ColumnRef); ok {
+			found = true
+		}
+	})
+	return found
+}
+
+func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int16, lateralCtx *resolveContext) (Node, []rangeBinding, error) {
+	leftNode, leftBinding, err := planScanRangeVar(item.Base, cat, *nextSourceIdx, lateralCtx)
 	if err != nil {
 		return nil, nil, err
 	}
 	*nextSourceIdx++
 	leftCtx := newResolveContext([]rangeBinding{leftBinding}, leftNode.Output())
 	for _, j := range item.Joins {
-		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx)
+		// LATERAL on the right side of a JOIN can reference the
+		// left side. Merge the outer lateralCtx with the current
+		// leftCtx so SRF args on the right see both. M0103-0008.
+		joinLateralCtx := mergeResolveContexts(lateralCtx, leftCtx)
+		rightNode, rightBinding, err := planScanRangeVar(j.Right, cat, *nextSourceIdx, joinLateralCtx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -893,6 +1108,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			Right:     rightNode,
 			Predicate: pred,
 			schema:    mergedSchema,
+			Lateral:   nodeReferencesOuter(rightNode),
 		}
 		// Pick a specialised equality join algorithm when the
 		// predicate decomposes into disjoint-side keys:
@@ -937,12 +1153,12 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 	return leftNode, leftCtx.bindings, nil
 }
 
-func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
+func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	if rv.Subquery != nil {
 		return planSubqueryRangeVar(rv, cat, sourceIdx)
 	}
 	if rv.TableFunc != nil {
-		return planTableFuncRangeVar(rv, cat, sourceIdx)
+		return planTableFuncRangeVar(rv, cat, sourceIdx, lateralCtx)
 	}
 	// CTE substitution (M0016-0002): an unschemed name takes the
 	// CTE before falling through to the catalog. CTE names are
@@ -1058,22 +1274,28 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) 
 			children := im.PartitionChildren(tbl.OID)
 			if len(children) > 0 {
 				// Build a UNION ALL of SeqScans over all children.
+				// Per-leaf wrap with a Project that adds `tableoid`
+				// as the trailing slot so a `tableoid::regclass`
+				// reference reports the actual leaf relname (M0100-0005y).
 				var root Node
 				for _, child := range children {
 					childSchema := tableSchemaWithSource(b.table, sourceIdx)
 					childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childSchema}
+					wrapped := wrapWithTableoid(childScan, child.OID, sourceIdx, rv.Pos())
 					if root == nil {
-						root = childScan
+						root = wrapped
 					} else {
 						root = &SetOp{
 							pos:   rv.Pos(),
 							Left:  root,
-							Right: childScan,
+							Right: wrapped,
 							All:   true,
 						}
 					}
 				}
 				if root != nil {
+					b.tableOidColIdx = len(b.table.Columns)
+					ctx.schema = root.Output()
 					return root, b, nil
 				}
 			}
@@ -1127,7 +1349,10 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 			rows[i] = cells
 		}
 	}
-	return &Values{pos: pos, Rows: rows, schema: schema}
+	// VirtualSource is preserved so the executor can re-materialise
+	// rows at run time (the plan cache may otherwise serve a stale
+	// snapshot — see M0094-0005).
+	return &Values{pos: pos, Rows: rows, schema: schema, VirtualSource: tbl}
 }
 
 // planValuesSubquery plans a `(VALUES (r1), (r2), ...) AS alias (col1, col2)`
@@ -1227,28 +1452,25 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		return nil, rangeBinding{}, err
 	}
 	innerSchema := inner.Output()
-	// Use explicit column-alias list when provided: (SELECT …) AS t (c1, c2).
-	// This overrides the target-list aliases from the inner SELECT.
-	cols := make([]catalog.Column, 0, len(rv.Subquery.Targets))
-	schema := make(Schema, 0, len(rv.Subquery.Targets))
-	for i, tgt := range rv.Subquery.Targets {
-		var name string
+	// Use the inner plan's output schema as the source of truth for the
+	// derived table's columns: it already accounts for star-expansion
+	// (e.g. an inner `SELECT __irs_0.*` over a FROM-clause SRF expands
+	// into one schema entry per SRF return column), which a target-list
+	// walk would miss because the target list still holds the single
+	// StarExpr. M0103-0008 (IndirectionStar derived-subquery propagation).
+	// Explicit column-alias list (SELECT …) AS t (c1, c2) overrides the
+	// inner schema's names.
+	cols := make([]catalog.Column, 0, len(innerSchema))
+	schema := make(Schema, 0, len(innerSchema))
+	for i, sc := range innerSchema {
+		name := sc.Name
 		if i < len(rv.Columns) && rv.Columns[i] != "" {
-			name = rv.Columns[i] // explicit column alias from (SELECT …) AS t (col_alias)
-		} else {
-			name = tgt.Alias
-			if name == "" {
-				name = deriveSubqueryTargetName(tgt.Expr)
-			}
-			if name == "" {
-				name = fmt.Sprintf("?column?%d", i+1)
-			}
+			name = rv.Columns[i]
 		}
-		var typ catalog.Type
-		if i < len(innerSchema) {
-			typ = innerSchema[i].Type
+		if name == "" {
+			name = fmt.Sprintf("?column?%d", i+1)
 		}
-		cols = append(cols, catalog.Column{Name: name, Type: typ})
+		cols = append(cols, catalog.Column{Name: name, Type: sc.Type})
 		// Subquery columns are derived (an inner SELECT's
 		// computed targets); they have no base-table identity at
 		// the outer scope. The binding's sourceIdx still gets the
@@ -1256,23 +1478,58 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// references can be disambiguated against sibling
 		// bindings, but the columns themselves stay at 0
 		// (Go zero-value = unknown).
-		schema = append(schema, SchemaColumn{Name: name, Type: typ})
+		schema = append(schema, SchemaColumn{Name: name, Type: sc.Type})
 	}
 	tbl := &catalog.Table{Name: rv.Alias, Columns: cols}
 	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
 	return inner, b, nil
 }
 
+// rewriteIndirectionStarTargets is a thin adapter that delegates to the
+// parser-level rewrite helper. M0103-0008 probe-survival: the rewrite
+// lives in the parser so every parsed SelectStmt (including nested
+// subqueries) gets the rewrite, while the aggregate-arg rejection (which
+// uses planner-side aggregate semantics) is surfaced here as a clean
+// PlanError.
+func rewriteIndirectionStarTargets(s *parser.SelectStmt) error {
+	// Pass nil for onAggregate so aggregate-arg IndirectionStars stay in place;
+	// planSelect detects and lowers them into ProjectSet (M0103-0008 final
+	// sub-step). Non-aggregate IndirectionStars are still rewritten into
+	// FROM-clause SRF references.
+	return parser.RewriteIndirectionStarTargets(s, nil)
+}
+
+
+// projectSetCompositeSchema returns the expanded composite-row schema for a
+// supported set-returning function. nil means the SRF cannot be lowered into
+// ProjectSet from a `(srf(<agg>)).*` shape — currently only
+// pg_get_publication_tables is supported, matching the libpqrcv
+// fetch_table_list probe shape. M0103-0008.
+func projectSetCompositeSchema(name string) Schema {
+	switch name {
+	case "pg_get_publication_tables":
+		return Schema{
+			SchemaColumn{Name: "relid", Type: catalog.Type{Name: "oid"}},
+			SchemaColumn{Name: "attrs", Type: catalog.Type{Name: "text"}},
+			SchemaColumn{Name: "qual", Type: catalog.Type{Name: "text"}},
+		}
+	}
+	return nil
+}
+
 // planTableFuncRangeVar plans a table-valued function in the FROM clause.
 // Currently only generate_series(start, stop[, step]) and pg_input_error_info(value, type)
 // are supported.
-func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
+func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
 	if strings.EqualFold(tf.Name, "pg_input_error_info") {
 		return planPgInputErrorInfo(rv, sourceIdx)
 	}
 	if strings.EqualFold(tf.Name, "parse_ident") {
 		return planScalarFuncScan(rv, sourceIdx, "text[]")
+	}
+	if strings.EqualFold(tf.Name, "pg_get_publication_tables") {
+		return planPgGetPublicationTables(rv, sourceIdx, lateralCtx)
 	}
 	if !strings.EqualFold(tf.Name, "generate_series") {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
@@ -1388,6 +1645,52 @@ func planPgInputErrorInfo(rv parser.RangeVar, sourceIdx int16) (Node, rangeBindi
 		},
 	}
 	node := &PgInputErrorInfo{pos: tf.Pos(), Value: val, Type: typ, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+
+// planPgGetPublicationTables routes a FROM-clause invocation of
+// `pg_get_publication_tables(VARIADIC text[])` into a `PgGetPublicationTables`
+// plan node. The publication-name argument is resolved as a regular expression;
+// the VARIADIC marker is recorded at parse time but ignored here — the runtime
+// operator accepts either a text[] (the VARIADIC spread shape) or any number
+// of plain text arguments. M0103-0008 probe-survival.
+func planPgGetPublicationTables(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
+	args := make([]Expr, 0, len(tf.Args))
+	for _, a := range tf.Args {
+		resolved, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		args = append(args, resolved)
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_get_publication_tables"
+	}
+	colNames := []string{"relid", "attrs", "qual"}
+	if len(rv.Columns) > 0 {
+		for i := range colNames {
+			if i < len(rv.Columns) {
+				colNames[i] = rv.Columns[i]
+			}
+		}
+	}
+	colTypes := []string{"oid", "text", "text"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgGetPublicationTables{pos: tf.Pos(), Args: args, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -2481,6 +2784,8 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 				return err
 			}
 		}
+	case *parser.IndirectionStar:
+		return walkExpr(x.Source, fn)
 	}
 	return nil
 }
@@ -2670,6 +2975,12 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		return nil, false, nil
 	}
 	tbl := ctx.bindings[0].table
+	// Partitioned parent tables store no rows themselves; all data is in
+	// partition children. Skip IndexScan and fall through to Filter+UNION ALL
+	// which correctly scans the children via planScanRangeVar. M0100-0005.
+	if len(tbl.PartitionKey) > 0 {
+		return nil, false, nil
+	}
 	b, ok := where.(*parser.BinaryOp)
 	if !ok || b.Op != parser.OpEq {
 		// Not an equality predicate — try range index scan.
@@ -2846,6 +3157,10 @@ func flipRangeOp(op parser.OpCode) parser.OpCode {
 // on a single B-tree-indexed column. Returns (nil, false, nil) when no range
 // index is applicable.
 func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
+	// Partitioned parent tables store no rows; skip index scan. M0100-0005.
+	if len(tbl.PartitionKey) > 0 {
+		return nil, false, nil
+	}
 	conjuncts := collectAndConjuncts(where)
 
 	var chosenColName string
@@ -2963,6 +3278,122 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 	return &Filter{pos: where.Pos(), Child: scan, Predicate: fullPred}, true, nil
 }
 
+// rewriteInsertDefaultMarkers substitutes `*parser.DefaultMarker` cells
+// in an INSERT's VALUES rows with the target column's catalog
+// `DefaultExpr` (or `*parser.NullConst` when the column has no
+// DEFAULT). Runs in Plan() BEFORE the analyzer so the analyzer never
+// observes the marker — mirrors upstream's rewriteValuesRTE pass.
+// Silently no-ops for INSERT…SELECT (s.Select != nil) and when the
+// target table can't be resolved (planInsert raises the canonical
+// 42P01 error later).
+func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) error {
+	if s.Select != nil {
+		return nil
+	}
+	if !s.DefaultValues && len(s.Rows) == 0 {
+		return nil
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
+	if !ok {
+		return nil
+	}
+	// Per-cell target column ordinal: mirrors planInsert's colIndex
+	// derivation so DEFAULT substitution sees the same mapping the
+	// planner will use.
+	var colIndex []int
+	if len(s.Columns) == 0 {
+		colIndex = make([]int, 0, len(tbl.Columns))
+		for i, col := range tbl.Columns {
+			if col.GeneratedAlways {
+				continue
+			}
+			colIndex = append(colIndex, i)
+		}
+	} else {
+		colIndex = make([]int, 0, len(s.Columns))
+		for _, name := range s.Columns {
+			col, ok := cat.LookupColumn(tbl, name)
+			if !ok {
+				// planInsert raises 42703; let it own the error.
+				return nil
+			}
+			colIndex = append(colIndex, col.Ordinal)
+		}
+	}
+	// M0103-0007 rung 17: expand `INSERT … DEFAULT VALUES` into a
+	// single row of DefaultMarkers sized to colIndex so the existing
+	// substitution loop below handles it uniformly with the explicit
+	// VALUES (DEFAULT, …, DEFAULT) shape.
+	if s.DefaultValues {
+		row := make([]parser.Expr, len(colIndex))
+		for i := range row {
+			row[i] = &parser.DefaultMarker{}
+		}
+		s.Rows = [][]parser.Expr{row}
+		s.DefaultValues = false
+	}
+	for _, r := range s.Rows {
+		if len(r) != len(colIndex) {
+			// planInsert raises the arity error; skip rewriting and let
+			// it surface uniformly.
+			return nil
+		}
+		for i, e := range r {
+			if _, ok := e.(*parser.DefaultMarker); !ok {
+				continue
+			}
+			tgt := colIndex[i]
+			if tgt < 0 || tgt >= len(tbl.Columns) {
+				r[i] = &parser.NullConst{}
+				continue
+			}
+			if def := tbl.Columns[tgt].DefaultExpr; def != nil {
+				r[i] = def
+			} else {
+				r[i] = &parser.NullConst{}
+			}
+		}
+	}
+	return nil
+}
+
+
+// rewriteUpdateDefaultMarkers substitutes `*parser.DefaultMarker`
+// expressions on the RHS of UPDATE SET assignments with the target
+// column's catalog DefaultExpr (or *parser.NullConst when the column
+// has no DEFAULT). Mirrors rung 15's rewriteInsertDefaultMarkers — the
+// analyzer never observes the sentinel because the substitution runs
+// before analyzer.Analyze. M0103-0007 rung 16.
+func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) error {
+	if len(s.Set) == 0 {
+		return nil
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
+	if !ok {
+		// planUpdate will raise the missing-relation error; leave the
+		// marker in place so the error surfaces uniformly.
+		return nil
+	}
+	for i := range s.Set {
+		if _, ok := s.Set[i].Expr.(*parser.DefaultMarker); !ok {
+			continue
+		}
+		col, ok := cat.LookupColumn(tbl, s.Set[i].Column)
+		if !ok {
+			// planUpdate / analyzer will raise 42703 for unknown
+			// columns; leave the marker so the error path stays
+			// uniform.
+			return nil
+		}
+		if def := tbl.Columns[col.Ordinal].DefaultExpr; def != nil {
+			s.Set[i].Expr = def
+		} else {
+			s.Set[i].Expr = &parser.NullConst{}
+		}
+	}
+	return nil
+}
+
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 	restore, err := preplanWithClause(s.With, cat)
 	if err != nil {
@@ -3049,6 +3480,16 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		}
 		insert.OnConflict = oc
 	}
+	if len(s.Returning) > 0 {
+		retCtx := singleBindingContext(tbl, s.Target.Alias)
+		retCtx.cat = cat
+		retExprs, retSchema, err := resolveTargets(s.Returning, retCtx)
+		if err != nil {
+			return nil, err
+		}
+		insert.Returning = retExprs
+		insert.ReturningSchema = retSchema
+	}
 	return insert, nil
 }
 
@@ -3068,10 +3509,10 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 		return nil, &PlanError{Pos: oc.Pos(), Code: "XX000", Message: fmt.Sprintf("unexpected ON CONFLICT action %d", oc.Action)}
 	}
 
-	// Arbiter-index selection. For the no-target form (DO NOTHING
-	// only — analyzer rejects DO UPDATE without a target),
-	// ArbiterIndex stays nil; the executor checks every unique
-	// index when the row hits.
+	// Arbiter-index selection. With a target, resolve explicitly.
+	// For the bare DO NOTHING form (no target), fall back to the
+	// primary key index so probeArbiterWaiting can detect
+	// in-progress conflicts (M0100-0002).
 	if oc.Target != nil {
 		idx, ords, err := resolveArbiterIndex(oc.Target, tbl, cat)
 		if err != nil {
@@ -3079,6 +3520,25 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 		}
 		out.ArbiterIndex = idx
 		out.ArbiterColumns = ords
+	} else if out.Action == OnConflictActionNothing && cat != nil {
+		// Auto-detect primary key as arbiter for bare ON CONFLICT DO NOTHING.
+		for _, idx := range cat.IndexesOnTable(tbl) {
+			if !idx.Primary {
+				continue
+			}
+			out.ArbiterIndex = idx
+			ords := make([]int, 0, len(idx.Columns))
+			for _, colName := range idx.Columns {
+				for i, col := range tbl.Columns {
+					if strings.EqualFold(col.Name, colName) {
+						ords = append(ords, i)
+						break
+					}
+				}
+			}
+			out.ArbiterColumns = ords
+			break
+		}
 	}
 
 	if out.Action != OnConflictActionUpdate {
@@ -3268,7 +3728,16 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		}
 		set[col.Ordinal] = expr
 	}
-	return &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set}, nil
+	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set}
+	if len(s.Returning) > 0 {
+		retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
+		if err != nil {
+			return nil, err
+		}
+		upd.Returning = retExprs
+		upd.ReturningSchema = retSchema
+	}
+	return upd, nil
 }
 
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
@@ -3305,7 +3774,16 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
 		}
 	}
-	return &Delete{pos: s.Pos(), Table: tbl, Child: node}, nil
+	del := &Delete{pos: s.Pos(), Table: tbl, Child: node}
+	if len(s.Returning) > 0 {
+		retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
+		if err != nil {
+			return nil, err
+		}
+		del.Returning = retExprs
+		del.ReturningSchema = retSchema
+	}
+	return del, nil
 }
 
 // planMerge converts a MERGE INTO statement into a Merge plan node.
@@ -3319,7 +3797,7 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
 
 	// Plan the USING source.
 	var srcIdx int16 = 2
-	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx)
+	sourceNode, sourceBinding, err := planScanRangeVar(s.Source, cat, srcIdx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -3529,6 +4007,14 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 			innerName, _ := targetMeta(cast.Operand, t)
 			return innerName, exprType(e)
 		}
+		// `tableoid::regclass` from a non-partitioned base relation
+		// resolves to TableOidExpr; preserve the system-column label so
+		// `SELECT tableoid::regclass FROM t` reports the column name as
+		// `tableoid` (matches PG `FigureColname` for system columns).
+		// M0100-0005y.
+		if _, isTOID := cast.Operand.(*TableOidExpr); isTOID {
+			return "tableoid", exprType(e)
+		}
 		// For function-call casts (e.g. parse_ident(...)::name[]), propagate the
 		// function name as the column label (matches PostgreSQL's FigureColname). M0097-0003.
 		if _, isFuncCall := cast.Operand.(*FuncCall); isFuncCall {
@@ -3592,6 +4078,8 @@ func exprType(e Expr) catalog.Type {
 		return catalog.Type{Name: "numeric"}
 	case *IntegerConst:
 		return catalog.Type{Name: "int8"}
+	case *TableOidExpr:
+		return catalog.Type{Name: "oid"}
 	case *StringConst:
 		return catalog.Type{Name: "text"}
 	case *BooleanConst:
@@ -4142,6 +4630,10 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 				return &OuterColumnRef{pos: x.Pos(), Level: level, Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}, true, nil
 			}
 		}
+		// `<rel>.tableoid` system-column resolution. M0100-0005y.
+		if strings.EqualFold(x.Column, "tableoid") {
+			return resolveTableoidForBinding(b, level, x.Pos()), true, nil
+		}
 		// The qualifier matched a binding at this level but the
 		// column didn't — that's a hard error (no point walking
 		// up; an outer-scope `t.c` for a different `t` would be
@@ -4155,6 +4647,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			continue
 		}
 		for i, c := range b.table.Columns {
+
 			if !strings.EqualFold(c.Name, x.Column) {
 				continue
 			}
@@ -4181,10 +4674,51 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			}
 		}
 	}
+	// Unqualified `tableoid` system-column resolution. PG raises
+	// "column reference is ambiguous" when more than one binding
+	// could supply it; for a single-binding scope it resolves to
+	// that binding's `tableoid`. M0100-0005y.
+	if found == nil && strings.EqualFold(x.Column, "tableoid") {
+		var matchB *rangeBinding
+		for i := range ctx.bindings {
+			if ctx.bindings[i].qualifiedOnly {
+				continue
+			}
+			if matchB != nil {
+				return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
+			}
+			matchB = &ctx.bindings[i]
+		}
+		if matchB != nil {
+			return resolveTableoidForBinding(*matchB, level, x.Pos()), true, nil
+		}
+	}
 	if found != nil {
 		return found, true, nil
 	}
 	return nil, false, nil
+}
+
+// resolveTableoidForBinding builds the planner expression for a
+// `tableoid` reference against a single binding. When the binding
+// carries a per-leaf `tableoid` slot (set by the partition / inheritance
+// union wrapper in planFromTable), the result is an ordinary
+// (Outer)ColumnRef into that slot — so partitioned-table queries report
+// the actual leaf relname (e.g. `foo2`) rather than the parent. For a
+// non-partitioned base relation the binding's table OID is fixed at
+// plan time, so the result is a constant TableOidExpr; the executor
+// (evalExprSlot) emits an `oid` Datum and a downstream
+// `tableoid::regclass` cast (evalCast → "regclass" arm) renders it as
+// the table's relname. M0100-0005y.
+func resolveTableoidForBinding(b rangeBinding, level, pos int) Expr {
+	if b.tableOidColIdx > 0 {
+		idx := b.offset + b.tableOidColIdx
+		if level == 0 {
+			return &ColumnRef{pos: pos, Index: idx, Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: b.sourceIdx}
+		}
+		return &OuterColumnRef{pos: pos, Level: level, Index: idx, Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: b.sourceIdx}
+	}
+	return &TableOidExpr{pos: pos, TableOID: b.table.OID}
 }
 
 func bindingMatchesRelation(b rangeBinding, table, schema string) bool {

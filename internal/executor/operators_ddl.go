@@ -148,9 +148,24 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 			}
 		}
 	}
+	// Canonicalise each table reference to the qualified form the
+	// walsender's publication filter compares against
+	// (`wal.RelationDef.Schema + "." + Name`). Upstream PG resolves
+	// the OID at DDL time and stores `pg_publication_rel.prrelid`;
+	// goopg's PubSub keys by string, so the qualified name produced
+	// here must match what `relQualifiedName` (server) returns at
+	// decode time. Unqualified names fall back to `public` to mirror
+	// PG's default search_path. See 0103-0015.
 	tables := make([]string, 0, len(s.Tables))
 	for _, t := range s.Tables {
-		tables = append(tables, qualifiedTableName(t))
+		tbl, ok := o.ctx.Catalog.LookupTable(t)
+		if !ok && t.Schema == "" {
+			tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: "public", Name: t.Name})
+		}
+		if !ok {
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", qualifiedTableName(t))}
+		}
+		tables = append(tables, tbl.QualifiedName())
 	}
 	if _, err := o.ctx.PubSub.CreatePublication(s.Name, tables, opts); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
@@ -183,6 +198,9 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 	if _, err := o.ctx.PubSub.CreateSubscription(s.Name, s.Conninfo, s.Publications, slotName, enabled); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	if o.ctx.OnSubscriptionChange != nil {
+		o.ctx.OnSubscriptionChange()
+	}
 	return nil
 }
 
@@ -195,6 +213,9 @@ func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
 			return nil
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	if o.ctx.OnSubscriptionChange != nil {
+		o.ctx.OnSubscriptionChange()
 	}
 	return nil
 }
@@ -354,6 +375,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			NotNull:         c.NotNull,
 			GeneratedExpr:   c.GeneratedExpr,
 			GeneratedAlways: c.GeneratedAlways,
+			DefaultExpr:     c.DefaultExpr,
 		})
 	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
@@ -597,9 +619,33 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
-	// Create primary key index if parent has one (inherit constraint).
-	if len(parent.PartitionKey) > 0 {
-		// No automatic PK on partition children by default in v0.
+	// Inherit parent's primary key / unique indexes onto the partition
+	// child (M0100-0005t).  Without these, INSERTs that route to a leaf
+	// never populate any unique index (the parent's index has no entries
+	// because writes go to leaves; the leaf had no indexes pre-fix), so
+	// upsertOp's arbiter probe and insertOp's runtime unique-constraint
+	// check both miss live duplicates on partitioned tables.  We mirror
+	// upstream PG's behaviour of materialising a matching index on each
+	// child partition.  Naming uses the standard auto-generated form
+	// (`<child>_pkey` for PRIMARY, `<child>_<col>_key` for UNIQUE) so
+	// adjacency between catalog/btree state and pg_class is predictable.
+	for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(parent) {
+		if parentIdx.Method != "btree" || (!parentIdx.Primary && !parentIdx.Unique) {
+			continue
+		}
+		var childIdxName parser.ObjectName
+		if parentIdx.Primary {
+			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_pkey"}
+		} else {
+			suffix := "_key"
+			if len(parentIdx.Columns) == 1 {
+				suffix = "_" + parentIdx.Columns[0] + "_key"
+			}
+			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + suffix}
+		}
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, parentIdx.Unique, parentIdx.Primary); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -708,44 +754,67 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 			}
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("table %q does not exist", name.String())}
 		}
-		idxs := o.ctx.Catalog.IndexesOnTable(tbl)
-		idxRels := make([]storage.RelFileNode, 0, len(idxs))
-		for _, idx := range idxs {
-			idxRels = append(idxRels, o.ctx.Catalog.IndexRelFileNode(idx))
-		}
-		rel := o.ctx.Catalog.RelFileNode(tbl)
-		if err := o.ctx.Catalog.DropTable(name); err != nil {
-			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
-		}
-		// If this table was shadowing a permanent one, restore it. M0097-0003.
-		if o.ctx.TempTableShadows != nil {
-			key := strings.ToLower(name.Name)
-			if permTbl, hasShadow := o.ctx.TempTableShadows[key]; hasShadow && permTbl != nil {
-				if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-					im.RegisterTable(permTbl)
+		// Drop dependent tables before dropping the parent:
+		// - Partition children: ALWAYS (they can't exist without the parent).
+		// - Inheritance children: only with CASCADE (M0100-0004).
+		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+			for _, child := range im.PartitionChildren(tbl.OID) {
+				childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+				if err := o.dropTableByRef(childName, child); err != nil {
+					return err
 				}
-				delete(o.ctx.TempTableShadows, key)
+			}
+			if s.Behavior == parser.DropCascade {
+				for _, child := range im.InheritanceChildren(tbl.OID) {
+					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+					if err := o.dropTableByRef(childName, child); err != nil {
+						return err
+					}
+				}
 			}
 		}
-		o.ctx.Pool.InvalidateRel(rel)
-		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
-			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+		if err := o.dropTableByRef(name, tbl); err != nil {
+			return err
 		}
-		// M0090-0001: clear FSM + VM entries for the dropped
-		// heap. Same rationale as execTruncate — without this,
-		// a future CREATE TABLE that lands on the same oid would
-		// inherit stale FSM/VM bits from the dropped relation.
-		if o.ctx.FSM != nil {
-			o.ctx.FSM.DropRelation(rel)
-		}
-		if o.ctx.VM != nil {
-			o.ctx.VM.DropRelation(rel)
-		}
-		for _, idxRel := range idxRels {
-			o.ctx.Pool.InvalidateRel(idxRel)
-			if err := o.ctx.Pool.Manager().DropRelation(idxRel); err != nil {
-				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// dropTableByRef drops a single table by its catalog.Table reference.
+func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error {
+	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
+	idxRels := make([]storage.RelFileNode, 0, len(idxs))
+	for _, idx := range idxs {
+		idxRels = append(idxRels, o.ctx.Catalog.IndexRelFileNode(idx))
+	}
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	if err := o.ctx.Catalog.DropTable(name); err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	// If this table was shadowing a permanent one, restore it. M0097-0003.
+	if o.ctx.TempTableShadows != nil {
+		key := strings.ToLower(name.Name)
+		if permTbl, hasShadow := o.ctx.TempTableShadows[key]; hasShadow && permTbl != nil {
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				im.RegisterTable(permTbl)
 			}
+			delete(o.ctx.TempTableShadows, key)
+		}
+	}
+	o.ctx.Pool.InvalidateRel(rel)
+	if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	if o.ctx.FSM != nil {
+		o.ctx.FSM.DropRelation(rel)
+	}
+	if o.ctx.VM != nil {
+		o.ctx.VM.DropRelation(rel)
+	}
+	for _, idxRel := range idxRels {
+		o.ctx.Pool.InvalidateRel(idxRel)
+		if err := o.ctx.Pool.Manager().DropRelation(idxRel); err != nil {
+			return &ExecError{Code: "XX000", Message: err.Error()}
 		}
 	}
 	return nil
@@ -776,6 +845,14 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	}
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
+	}
+	// Skip expression indexes (column name "" means functional expression
+	// like lower(col)) — goopg does not yet support expression indexes.
+	// The index creation is silently ignored to let setup SQL proceed.
+	for _, c := range s.Columns {
+		if c == "" {
+			return nil
+		}
 	}
 	return o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.Unique, false)
 }
@@ -854,8 +931,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableAttachPartition:
 			// ATTACH PARTITION child FOR VALUES … (M0096-0007)
-			if act.AttachPartitionOf == nil || act.AttachPartitionOf.Default {
-				break // detach or default partition, ignore for now
+			if act.AttachPartitionOf == nil {
+				break
+			}
+			// Handle DEFAULT partition — same as regular partition attachment
+			// for catalog purposes (partition child must be registered so DROP
+			// TABLE parent CASCADE can find and drop it). M0100-0005.
+			if act.AttachPartitionOf.Default {
+				childTbl, ok := o.ctx.Catalog.LookupTable(act.AttachPartitionOf.Parent)
+				if ok {
+					childTbl.PartitionParentOID = tbl.OID
+					if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+						im.RegisterPartitionChild(tbl.OID, childTbl.OID)
+					}
+				}
+				break
 			}
 			poc := act.AttachPartitionOf
 			// poc.Parent contains the child table name here (set in parser).
@@ -1735,24 +1825,29 @@ func namespaceOIDForSchema(schema string) uint32 {
 
 // syncTableToCatalogHeap writes one pg_class row and one pg_attribute row per
 // column for tbl. Called by execCreateTable after in-memory catalog is updated.
+//
+// The rows are emitted in PG18-canonical layout (34-column pg_class,
+// 25-column pg_attribute) so that a PostgreSQL 18 standby attaching to a
+// goopg basebackup can deform the tuple with its native tupdesc and locate
+// the user table by name. The historical goopg-native short-row layout
+// blocked PG-standby parse-analyze at `relation public.bench_log does not
+// exist` (M0106-0010 batched-36 loop 7 → loop 8).
 func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	classRel := storage.RelFileNode{
 		DBOid:  catalog.DefaultDBOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classRow := Row{
-		{Kind: KindInt, Int: int64(tbl.OID)},
-		NewStringDatum(tbl.Name),
-		{Kind: KindInt, Int: int64(namespaceOIDForSchema(tbl.Schema))},
-		NewStringDatum("r"),
-		{Kind: KindInt, Int: int64(len(tbl.Columns))},
-		{Kind: KindInt, Int: int64(tbl.OID)},
-		NewStringDatum("p"),
-		NewBoolDatum(false),
-	}
-	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(tbl))
+	if err != nil {
 		return fmt.Errorf("pg_class: %w", err)
+	}
+	relnamespace := namespaceOIDForSchema(tbl.Schema)
+	if err := insertPgClassOidIndexEntry(ctx, tbl.OID, classTID); err != nil {
+		return fmt.Errorf("pg_class_oid_index: %w", err)
+	}
+	if err := insertPgClassRelnameNspIndexEntry(ctx, tbl.Name, relnamespace, classTID); err != nil {
+		return fmt.Errorf("pg_class_relname_nsp_index: %w", err)
 	}
 
 	attrRel := storage.RelFileNode{
@@ -1761,44 +1856,106 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		Fork:   storage.MainFork,
 	}
 	for _, col := range tbl.Columns {
-		typOID := catalog.TypeNameToOID(col.Type.Name)
-		attrRow := Row{
-			{Kind: KindInt, Int: int64(tbl.OID)},
-			NewStringDatum(col.Name),
-			{Kind: KindInt, Int: int64(typOID)},
-			{Kind: KindInt, Int: int64(col.Ordinal + 1)},
-			NewBoolDatum(col.NotNull),
-			NewBoolDatum(false),
-		}
-		if err := writeHeapRow(ctx, attrRel, catalog.PGAttributeColumns(), attrRow); err != nil {
+		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRow(tbl, col))
+		if err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
 		}
+		// attnum is the 1-based ordinal of the column in PG18.
+		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, tbl.OID, int16(col.Ordinal+1), attrTID); err != nil {
+			return fmt.Errorf("pg_attribute_relid_attnum_index col %q: %w", col.Name, err)
+		}
 	}
+
+	// Signal that this transaction wrote to nailed catalog relations (pg_class
+	// and pg_attribute). The xact-marker hook in open.go reads this flag at
+	// commit time to emit RecordKindXactCommitInval and unlink both
+	// pg_internal.init files so the next backend reloads fresh descriptors.
+	if ctx.TxnMgr != nil {
+		ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+
+	// M0106-0010 batched-41: mirror catalog pages updated by this DDL into
+	// the `postgres` database (DBOid=5) so a PG18 standby connecting via
+	// `dbname=postgres` reads the runtime-written pg_class /
+	// pg_attribute rows. batched-41's multi-level descend + rebuild path
+	// keeps the source layout consistent, so the mirror's page-by-page
+	// copy now lands a well-formed btree in base/5/.
+	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
+		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+	}
+
 	return nil
 }
 
 // syncIndexToCatalogHeap writes a pg_class row for idx. Called by
-// createBTreeIndex after the full index build succeeds.
+// createBTreeIndex after the full index build succeeds. The row layout
+// matches PG18's 34-column pg_class so the index is visible to an attaching
+// PG18 standby (see syncTableToCatalogHeap for context).
 func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	classRel := storage.RelFileNode{
 		DBOid:  catalog.DefaultDBOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classRow := Row{
-		{Kind: KindInt, Int: int64(idx.OID)},
-		NewStringDatum(idx.Name),
-		{Kind: KindInt, Int: int64(namespaceOIDForSchema(idx.Schema))},
-		NewStringDatum("i"),
-		{Kind: KindInt, Int: 0},
-		{Kind: KindInt, Int: int64(idx.OID)},
-		NewStringDatum("p"),
-		NewBoolDatum(false),
-	}
-	if err := writeHeapRow(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(idx))
+	if err != nil {
 		return fmt.Errorf("pg_class for index: %w", err)
 	}
+	relnamespace := namespaceOIDForSchema(idx.Schema)
+	if err := insertPgClassOidIndexEntry(ctx, idx.OID, classTID); err != nil {
+		return fmt.Errorf("pg_class_oid_index for index: %w", err)
+	}
+	if err := insertPgClassRelnameNspIndexEntry(ctx, idx.Name, relnamespace, classTID); err != nil {
+		return fmt.Errorf("pg_class_relname_nsp_index for index: %w", err)
+	}
+	// M0106-0010 batched-41: mirror catalog pages to DBOid=5 (the `postgres`
+	// database) so a PG18 standby connecting via `dbname=postgres` reads
+	// the runtime-written rows. Multi-level descent+rebuild in
+	// `insertCanonicalSysBtreeLeaf` keeps the source layout consistent.
+	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
+		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+	}
 	return nil
+}
+
+// writeHeapRowCanonical writes a heap row to a catalog relation and, when
+// ctx.LogCanonical is set, emits a PG-canonical XLOG_HEAP_INSERT WAL record
+// (with full-page image) so a vanilla PG18 standby can replay the catalog
+// insertion. The FPI approach ensures the standby can restore the page without
+// parsing heap-tuple internals. M0106-0010 batched-32.
+func writeHeapRowCanonical(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
+	ptr, err := writeHeapRowReturningPG(ctx, rel, cols, row)
+	if err != nil {
+		return ptr, err
+	}
+	if ctx.LogCanonical == nil || ctx.Pool == nil {
+		return ptr, nil
+	}
+	// Re-pin the page to capture a stable FPI after the insert.
+	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+	if err != nil {
+		return ptr, fmt.Errorf("canonical WAL pin: %w", err)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	slot.Lock()
+	copy(page, slot.Page())
+	xid := uint32(ctx.Tx.XID)
+	endLSN, emitErr := catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset, xid, ctx.LogCanonical)
+	if emitErr == nil && endLSN != 0 {
+		// M0106-0010 batched-42 H1: stamp pd_lsn so a PG18 standby's recovery
+		// can detect "already applied" via the lsn comparison in
+		// XLogReadBufferForRedo (xlogutils.c). Without this, the basebackup
+		// snapshot's pd_lsn=0 page is unconditionally clobbered by the WAL
+		// FPI on every replay pass.
+		storage.MustHeader(slot.Page()).SetLSN(storage.LSN(endLSN))
+		ctx.Pool.MarkDirty(slot)
+	}
+	slot.Unlock()
+	ctx.Pool.Unpin(slot)
+	if emitErr != nil {
+		return ptr, emitErr
+	}
+	return ptr, nil
 }
 
 // execCreateTrigger registers a trigger on a table. M0096-0012.

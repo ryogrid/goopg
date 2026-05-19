@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/wal"
 )
 
@@ -104,5 +106,77 @@ func TestWalReceiverStreamsRecordsToLocalWAL(t *testing.T) {
 	// ApplyLSN must equal the standby writer's WrittenLSN by now.
 	if rec.ApplyLSN() != standbyWAL.WrittenLSN() {
 		t.Errorf("ApplyLSN = %d, want %d", rec.ApplyLSN(), standbyWAL.WrittenLSN())
+	}
+}
+
+func TestWalReceiverTrimsOverlappingRawWALData(t *testing.T) {
+	srcDir := filepath.Join(t.TempDir(), "src_pg_wal")
+	srcWAL, err := wal.NewWriter(wal.Config{
+		WALDir:             srcDir,
+		SegmentSize:        wal.DefaultSegmentSize,
+		PageHeaders:        true,
+		SystemID:           1,
+		TimelineID:         1,
+		SenderMemoryBuffer: 32,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter src: %v", err)
+	}
+	defer func() { _ = srcWAL.Close() }()
+
+	if _, _, err := srcWAL.Append([]byte("alpha")); err != nil {
+		t.Fatalf("src Append alpha: %v", err)
+	}
+	_, end, err := srcWAL.Append([]byte("beta"))
+	if err != nil {
+		t.Fatalf("src Append beta: %v", err)
+	}
+	if err := srcWAL.FlushUpTo(end); err != nil {
+		t.Fatalf("src FlushUpTo: %v", err)
+	}
+	rawPath := filepath.Join(srcDir, wal.XLogFileName(1, 0, wal.DefaultSegmentSize))
+	raw, err := os.ReadFile(rawPath)
+	if err != nil {
+		t.Fatalf("ReadFile raw WAL: %v", err)
+	}
+	raw = raw[:srcWAL.WrittenLSN()]
+	split := len(raw) / 2
+	overlapOff := split / 2
+
+	dstDir := filepath.Join(t.TempDir(), "dst_pg_wal")
+	dstWAL, err := wal.NewWriter(wal.Config{
+		WALDir:             dstDir,
+		SegmentSize:        wal.DefaultSegmentSize,
+		PageHeaders:        true,
+		SystemID:           1,
+		TimelineID:         1,
+		WALBuffers:         256,
+		SenderMemoryBuffer: 32,
+	})
+	if err != nil {
+		t.Fatalf("NewWriter dst: %v", err)
+	}
+	defer func() { _ = dstWAL.Close() }()
+
+	rec := &WalReceiver{cfg: WalReceiverConfig{WAL: dstWAL}}
+	if err := rec.handleCopyData(protocol.EncodeWALData(0, uint64(split), time.Now(), raw[:split])); err != nil {
+		t.Fatalf("handleCopyData first frame: %v", err)
+	}
+	if err := rec.handleCopyData(protocol.EncodeWALData(uint64(overlapOff), uint64(len(raw)), time.Now(), raw[overlapOff:])); err != nil {
+		t.Fatalf("handleCopyData overlapping frame: %v", err)
+	}
+	if got := dstWAL.WrittenLSN(); got != uint64(len(raw)) {
+		t.Fatalf("dst WrittenLSN = %d, want %d", got, len(raw))
+	}
+	if err := dstWAL.FlushUpTo(dstWAL.WrittenLSN()); err != nil {
+		t.Fatalf("dst FlushUpTo: %v", err)
+	}
+	gotRaw, err := os.ReadFile(filepath.Join(dstDir, wal.XLogFileName(1, 0, wal.DefaultSegmentSize)))
+	if err != nil {
+		t.Fatalf("ReadFile dst WAL: %v", err)
+	}
+	gotRaw = gotRaw[:len(raw)]
+	if string(gotRaw) != string(raw) {
+		t.Fatalf("dst raw WAL differs from source after overlap trimming")
 	}
 }

@@ -1,0 +1,24 @@
+pgbench (18.3)
+starting vacuum...end.
+progress: 30.0 s, 462.5 tps, lat 215.200 ms stddev 100.893, 0 failed
+pgbench: error: client 18 script 0 aborted in command 7 query 0: ERROR:  storage: invalid tuple slot
+progress: 60.0 s, 485.3 tps, lat 205.273 ms stddev 40.093, 0 failed
+pgbench: error: client 93 script 0 aborted in command 7 query 0: ERROR:  storage: invalid tuple slot
+progress: 90.0 s, 481.2 tps, lat 204.983 ms stddev 40.513, 0 failed
+progress: 120.0 s, 468.9 tps, lat 208.982 ms stddev 42.761, 0 failed
+progress: 150.0 s, 445.5 tps, lat 219.909 ms stddev 46.433, 0 failed
+progress: 180.0 s, 409.9 tps, lat 239.124 ms stddev 50.458, 0 failed
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 100
+query mode: simple
+number of clients: 100
+number of threads: 100
+maximum number of tries: 1
+duration: 180 s
+number of transactions actually processed: 82695
+number of failed transactions: 0 (0.000%)
+latency average = 214.942 ms
+latency stddev = 58.714 ms
+initial connection time = 40.172 ms
+tps = 458.969938 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.

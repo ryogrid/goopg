@@ -1,0 +1,10 @@
+pgbench (18.3)
+starting vacuum...end.
+progress: 10.0 s, 6948.4 tps, lat 14.371 ms stddev 8.205, 0 failed
+progress: 20.0 s, 7041.1 tps, lat 14.202 ms stddev 8.091, 0 failed
+progress: 30.0 s, 7019.7 tps, lat 14.246 ms stddev 8.257, 0 failed
+progress: 40.0 s, 6943.5 tps, lat 14.407 ms stddev 8.180, 0 failed
+progress: 50.0 s, 6965.2 tps, lat 14.351 ms stddev 8.169, 0 failed
+progress: 60.0 s, 7025.1 tps, lat 14.242 ms stddev 8.244, 0 failed
+progress: 70.0 s, 7054.1 tps, lat 14.173 ms stddev 8.064, 0 failed
+progress: 80.0 s, 6811.8 tps, lat 14.669 ms stddev 8.504, 0 failed

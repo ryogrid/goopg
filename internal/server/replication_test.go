@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
@@ -27,6 +28,15 @@ func startReplicationTestServer(t *testing.T) (string, *wal.Slots, func()) {
 // listen address, the slot registry, the live writer, and a stop
 // func.
 func startReplicationTestServerFull(t *testing.T) (string, *wal.Slots, *wal.Writer, func()) {
+	t.Helper()
+	addr, slots, writer, _, stop := startReplicationTestServerWithDir(t)
+	return addr, slots, writer, stop
+}
+
+// startReplicationTestServerWithDir is the M0102-0003 variant that
+// also exposes the walDir so TIMELINE_HISTORY tests can seed a
+// `<NN>.history` file in the spot the server reads from.
+func startReplicationTestServerWithDir(t *testing.T) (string, *wal.Slots, *wal.Writer, string, func()) {
 	t.Helper()
 	dataDir := t.TempDir()
 	slots, err := wal.OpenSlots(dataDir)
@@ -63,7 +73,7 @@ func startReplicationTestServerFull(t *testing.T) (string, *wal.Slots, *wal.Writ
 		}
 		_ = walWriter.Close()
 	}
-	return addr, slots, walWriter, stop
+	return addr, slots, walWriter, walDir, stop
 }
 
 // dialReplication completes the startup handshake with replication=true
@@ -216,6 +226,172 @@ func TestReplicationCreateAndDropSlot(t *testing.T) {
 	}
 }
 
+// TestReplicationCreateLogicalSlot covers CREATE_REPLICATION_SLOT
+// name LOGICAL pgoutput (M0103-0004): a libpq subscriber sends this
+// immediately after the startup handshake when CREATE SUBSCRIPTION
+// runs against goopg-as-publisher. The reply must include the
+// `output_plugin` column populated with "pgoutput" (PHYSICAL returns
+// NULL there); `snapshot_name` is NULL in v0.
+func TestReplicationCreateLogicalSlot(t *testing.T) {
+	addr, slots, stop := startReplicationTestServer(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT sub_a LOGICAL pgoutput NOEXPORT_SNAPSHOT`)
+	frames := readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgRowDescription {
+		t.Fatalf("CREATE_REPLICATION_SLOT first frame = %c, want T", frames[0].Type)
+	}
+	if frames[1].Type != protocol.MsgDataRow {
+		t.Fatalf("CREATE_REPLICATION_SLOT second frame = %c, want D", frames[1].Type)
+	}
+	cells := decodeDataRow(t, frames[1].Payload)
+	if len(cells) != 4 {
+		t.Fatalf("LOGICAL CREATE row col count = %d, want 4", len(cells))
+	}
+	if string(cells[0]) != "sub_a" {
+		t.Errorf("slot_name = %q, want sub_a", cells[0])
+	}
+	if cells[2] != nil {
+		t.Errorf("snapshot_name = %q, want NULL (v0 has no snapshot exporter)", cells[2])
+	}
+	if string(cells[3]) != "pgoutput" {
+		t.Errorf("output_plugin = %q, want pgoutput", cells[3])
+	}
+	// Backing store must show a LOGICAL slot.
+	slot, err := slots.Get("sub_a")
+	if err != nil {
+		t.Fatalf("slots.Get(sub_a): %v", err)
+	}
+	if slot.Kind != wal.SlotLogical {
+		t.Errorf("slot.Kind = %v, want SlotLogical", slot.Kind)
+	}
+}
+
+// TestReplicationCreateLogicalSlotWithOptionsList covers the PG14+
+// CREATE_REPLICATION_SLOT shape libpqwalreceiver uses today:
+//
+//	CREATE_REPLICATION_SLOT "<name>" LOGICAL pgoutput (SNAPSHOT 'nothing')
+//
+// Before M0103-0008 rung 8 the server tokenised args via strings.Fields
+// and rejected the parenthesised options list with
+// `unexpected token "(SNAPSHOT" after LOGICAL pgoutput`, which broke
+// CREATE SUBSCRIPTION against a goopg publisher (see
+// docs/design/0103-0013-create-replication-slot-options-list.md).
+// The fix splits off the `(...)` block before whitespace-tokenising
+// and acknowledges all known options as no-ops.
+func TestReplicationCreateLogicalSlotWithOptionsList(t *testing.T) {
+	addr, slots, stop := startReplicationTestServer(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT "sub_paren" LOGICAL pgoutput (SNAPSHOT 'nothing')`)
+	frames := readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgRowDescription {
+		t.Fatalf("CREATE_REPLICATION_SLOT first frame = %c, want T", frames[0].Type)
+	}
+	if frames[1].Type != protocol.MsgDataRow {
+		t.Fatalf("CREATE_REPLICATION_SLOT second frame = %c, want D", frames[1].Type)
+	}
+	cells := decodeDataRow(t, frames[1].Payload)
+	if string(cells[0]) != "sub_paren" {
+		t.Errorf("slot_name = %q, want sub_paren", cells[0])
+	}
+	if cells[2] != nil {
+		t.Errorf("snapshot_name = %q, want NULL (SNAPSHOT 'nothing' is no-op in v0)", cells[2])
+	}
+	if string(cells[3]) != "pgoutput" {
+		t.Errorf("output_plugin = %q, want pgoutput", cells[3])
+	}
+	if slot, err := slots.Get("sub_paren"); err != nil || slot.Kind != wal.SlotLogical {
+		t.Fatalf("slot lookup: err=%v kind=%v", err, slot.Kind)
+	}
+}
+
+// TestReplicationCreateLogicalSlotRestartLSNIsNextRecord pins the
+// M0103-0008 rung-9 off-by-one fix. Slot RestartLSN must be set to
+// `WrittenLSN()+1` — the LSN of the first byte of the *next* record —
+// not `WrittenLSN()` (the last byte of the previous record). Without
+// the +1, the slot decoder's iterator (`pos = startLSN-1`) lands inside
+// the previous record and the very first readOneAt() decodes garbage
+// bytes as a record header, returning errors like "unknown rmid=240".
+// Same off-by-one M0094-0005 fixed for startStandbyReplayer.
+func TestReplicationCreateLogicalSlotRestartLSNIsNextRecord(t *testing.T) {
+	addr, slots, writer, stop := startReplicationTestServerFull(t)
+	defer stop()
+
+	// Append a record so WrittenLSN advances past 0 and the +1
+	// vs no-+1 distinction is observable. Without prior WAL the
+	// off-by-one wouldn't be visible (both 0 and 1 land at the
+	// start of the stream).
+	if _, _, err := writer.Append([]byte("seed-record")); err != nil {
+		t.Fatalf("seed wal append: %v", err)
+	}
+	wrote := writer.WrittenLSN()
+	if wrote == 0 {
+		t.Fatal("seed record did not advance WrittenLSN")
+	}
+
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT "rung9_slot" LOGICAL pgoutput (SNAPSHOT 'nothing')`)
+	_ = readUntilReadyForQuery(t, r)
+
+	slot, err := slots.Get("rung9_slot")
+	if err != nil {
+		t.Fatalf("slots.Get: %v", err)
+	}
+	want := wrote + 1
+	if slot.RestartLSN != want {
+		t.Errorf("slot.RestartLSN = %d, want %d (= WrittenLSN+1, the next-record start LSN)",
+			slot.RestartLSN, want)
+	}
+}
+
+// TestReplicationCreateLogicalSlotOptionsListMultiple — the parser must
+// handle comma-separated option lists and reject unknown options with a
+// syntax error so future probe rungs surface loudly.
+func TestReplicationCreateLogicalSlotOptionsListMultiple(t *testing.T) {
+	addr, _, stop := startReplicationTestServer(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	// Multi-option success path: SNAPSHOT + TWO_PHASE are both no-ops
+	// but the parser must accept the combination.
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT "sub_multi" LOGICAL pgoutput (SNAPSHOT 'use', TWO_PHASE)`)
+	frames := readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgRowDescription {
+		t.Fatalf("multi-option first frame = %c, want T", frames[0].Type)
+	}
+
+	// Unknown option must error so unimplemented probe rungs surface
+	// instead of being silently dropped.
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT "sub_bad" LOGICAL pgoutput (FROBNITZ true)`)
+	frames = readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgErrorResponse {
+		t.Fatalf("unknown option first frame = %c, want E", frames[0].Type)
+	}
+}
+
+// TestReplicationCreateLogicalSlotRejectsUnknownPlugin: only `pgoutput`
+// is accepted; other plugin names land with feature_not_supported so
+// the libpq client gets a deterministic error rather than a hang.
+func TestReplicationCreateLogicalSlotRejectsUnknownPlugin(t *testing.T) {
+	addr, _, stop := startReplicationTestServer(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT sub_b LOGICAL test_decoding`)
+	frames := readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgErrorResponse {
+		t.Fatalf("unknown plugin first frame = %c, want E", frames[0].Type)
+	}
+}
+
 // TestReplicationSlotInvalidName: server must reject CREATE with a
 // non-conforming name via ErrorResponse, then continue serving.
 func TestReplicationSlotInvalidName(t *testing.T) {
@@ -339,12 +515,13 @@ func TestReplicationStartReplicationStreamsRecord(t *testing.T) {
 			continue
 		}
 		m := parsed.(*protocol.WALDataMessage)
-		if string(m.WALBytes) != string(want) {
-			t.Fatalf("WAL-data payload = %q, want %q", m.WALBytes, want)
+		if !bytes.Contains(m.WALBytes, want) {
+			t.Fatalf("WAL-data payload missing appended record: got=%x want_substr=%x", m.WALBytes, want)
 		}
-		// StartLSN / EndLSN must match what the writer reported.
-		if m.StartLSN == 0 || m.EndLSN <= m.StartLSN {
-			t.Errorf("LSN range = (%d, %d), want non-trivial", m.StartLSN, m.EndLSN)
+		// Physical streaming now forwards raw WAL bytes, so a stream that
+		// starts at 0/0 must begin at segment offset 0.
+		if m.StartLSN != 0 || m.EndLSN <= m.StartLSN {
+			t.Errorf("LSN range = (%d, %d), want start 0 and non-trivial end", m.StartLSN, m.EndLSN)
 		}
 		return
 	}
@@ -370,6 +547,158 @@ func TestReplicationStartReplicationRejectsLogical(t *testing.T) {
 	if frames[0].Type != protocol.MsgRowDescription {
 		t.Errorf("post-error IDENTIFY_SYSTEM = %c, want T", frames[0].Type)
 	}
+}
+
+// TestReplicationTimelineHistoryReturnsFile verifies the
+// M0102-0003 TIMELINE_HISTORY <tli> wire path: the server reads
+// `<WALDirPath>/<tli>.history` and returns a single (filename text,
+// content bytea) row. A request for a TLI without a history file
+// (e.g. TLI=1 on a fresh primary) returns the empty content bytes
+// rather than an error — matching upstream's walreceiver contract.
+func TestReplicationTimelineHistoryReturnsFile(t *testing.T) {
+	addr, _, _, walDir, stop := startReplicationTestServerWithDir(t)
+	defer stop()
+
+	// Seed a TLI=2 history file in the test server's WAL dir.
+	want := []wal.TimelineHistoryEntry{
+		{TLI: 1, SwitchLSN: 0x0000000016000000, Reason: "no recovery target specified"},
+	}
+	if err := wal.WriteHistory(walDir, 2, want); err != nil {
+		t.Fatalf("seed history: %v", err)
+	}
+
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, "TIMELINE_HISTORY 2")
+	frames := readUntilReadyForQuery(t, r)
+	if len(frames) != 4 {
+		t.Fatalf("frame count = %d, want 4 (got types %s)", len(frames), replicationFrameTypes(frames))
+	}
+	if frames[0].Type != protocol.MsgRowDescription {
+		t.Errorf("frame[0] = %c, want T", frames[0].Type)
+	}
+	if frames[1].Type != protocol.MsgDataRow {
+		t.Fatalf("frame[1] = %c, want D", frames[1].Type)
+	}
+	cells := decodeDataRow(t, frames[1].Payload)
+	if len(cells) != 2 {
+		t.Fatalf("DataRow columns = %d, want 2", len(cells))
+	}
+	if string(cells[0]) != "00000002.history" {
+		t.Errorf("filename = %q, want 00000002.history", cells[0])
+	}
+	wantBody := "1\t0/16000000\tno recovery target specified\n"
+	if string(cells[1]) != wantBody {
+		t.Errorf("content = %q, want %q", cells[1], wantBody)
+	}
+	if frames[2].Type != protocol.MsgCommandComplete ||
+		!hasCommandTag(frames[2].Payload, "TIMELINE_HISTORY") {
+		t.Errorf("CommandComplete tag mismatch: %q", frames[2].Payload)
+	}
+	if frames[3].Type != protocol.MsgReadyForQuery {
+		t.Errorf("frame[3] = %c, want Z", frames[3].Type)
+	}
+}
+
+// TestReplicationTimelineHistoryMissingReturnsEmptyContent: per the
+// upstream walreceiver contract, requesting a TLI whose .history
+// file does not exist (typically TLI=1 on a primary that has never
+// promoted) returns a row with the synthesised filename and a NULL
+// content bytea, not an error frame.
+func TestReplicationTimelineHistoryMissingReturnsEmptyContent(t *testing.T) {
+	addr, _, _, stop := startReplicationTestServerFull(t)
+	defer stop()
+
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, "TIMELINE_HISTORY 1")
+	frames := readUntilReadyForQuery(t, r)
+	if len(frames) != 4 {
+		t.Fatalf("frame count = %d, want 4 (got types %s)", len(frames), replicationFrameTypes(frames))
+	}
+	cells := decodeDataRow(t, frames[1].Payload)
+	if len(cells) != 2 {
+		t.Fatalf("DataRow columns = %d, want 2", len(cells))
+	}
+	if string(cells[0]) != "00000001.history" {
+		t.Errorf("filename = %q, want 00000001.history", cells[0])
+	}
+	if cells[1] != nil {
+		t.Errorf("content = %q, want NULL for missing TLI", cells[1])
+	}
+}
+
+// TestReplicationFallthroughQueryNotCancelled regresses a bug where
+// replication-mode connections falling through to the regular SQL
+// dispatcher (for queries like libpqrcv's pg_publication probes that
+// PG's CREATE SUBSCRIPTION issues before START_REPLICATION) received
+// an immediate SQLSTATE 57014 ("canceling statement due to user
+// request") because `runPostStartupLoop` was cancelling the per-query
+// context before it ever reached `handleQueryOrCopy`.
+//
+// The repro: send a plain SQL query on a `replication=true`
+// connection. With the bug, the response carried 57014; with the
+// fix, it carries whatever SQLSTATE the SQL path naturally produces
+// (e.g. an unknown-relation error). What matters is that 57014 is
+// NOT served, because that was the goopg-side symptom that broke
+// PG's CREATE SUBSCRIPTION bring-up in the M0103-0004(b) interop
+// test.
+func TestReplicationFallthroughQueryNotCancelled(t *testing.T) {
+	addr, _, stop := startReplicationTestServer(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	// A plain SELECT — the bare test server has no catalog wired, so
+	// the SQL path produces some kind of error (relation/schema does
+	// not exist, or feature_not_supported). Either way, the
+	// per-query context must still be live so the response is the
+	// SQL path's natural error rather than the cancellation
+	// shortcut.
+	sendQuery(t, w, "SELECT pubname FROM pg_catalog.pg_publication WHERE pubname IN ('p')")
+	frames := readUntilReadyForQuery(t, r)
+	if len(frames) == 0 {
+		t.Fatalf("no frames received")
+	}
+	if frames[0].Type != protocol.MsgErrorResponse {
+		// Unlikely on the bare server, but if the SQL path ever
+		// grows pg_publication support without the catalog we'd
+		// land on a RowDescription. Either way, 57014 must not
+		// appear.
+		return
+	}
+	// Decode the error fields and assert the SQLSTATE is not 57014.
+	fields := decodeErrorFields(frames[0].Payload)
+	if got := fields["C"]; got == "57014" {
+		t.Fatalf("replication-mode SQL fallthrough returned SQLSTATE 57014 (canceling statement); the per-query context was cancelled before dispatch. Full error: %v", fields)
+	}
+}
+
+// decodeErrorFields walks an ErrorResponse payload and returns the
+// per-field map. Each field is a one-byte type code followed by a
+// NUL-terminated value; the message ends with a zero byte for the
+// type code.
+func decodeErrorFields(payload []byte) map[string]string {
+	out := map[string]string{}
+	i := 0
+	for i < len(payload) {
+		code := payload[i]
+		i++
+		if code == 0 {
+			break
+		}
+		start := i
+		for i < len(payload) && payload[i] != 0 {
+			i++
+		}
+		out[string(code)] = string(payload[start:i])
+		if i < len(payload) {
+			i++ // skip terminator
+		}
+	}
+	return out
 }
 
 func replicationFrameTypes(frames []protocol.Frame) string {

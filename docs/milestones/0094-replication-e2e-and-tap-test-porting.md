@@ -1,6 +1,6 @@
 # Milestone 0094 — Replication E2E Completion & TAP Test Porting (D-003 / D-004)
 
-**Status:** in-progress
+**Status:** complete (2026-05-14: all sub-milestones [x]; E2E + 9 ported TAP tests PASS; M0005/M0008 marked complete)
 **Depends on:** M0005 (streaming replication), M0008 (logical replication)
 **Blocks:** D-003 (recovery TAP suite), D-004 (subscription TAP suite)
 

@@ -23,6 +23,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -39,7 +42,7 @@ import (
 // take it. Errors are write errors on the wire (the connection is
 // likely dead); SQLSTATE-level command failures are reported via
 // ErrorResponse and still return (true, nil).
-func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, payload []byte) (bool, error) {
+func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, payload []byte, appName string) (bool, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		return false, nil // let the regular handler emit the error
@@ -54,9 +57,71 @@ func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.Frame
 	case strings.HasPrefix(upper, "DROP_REPLICATION_SLOT "):
 		return true, s.replyDropReplicationSlot(w, trimmed[len("DROP_REPLICATION_SLOT "):])
 	case strings.HasPrefix(upper, "START_REPLICATION"):
-		return true, s.replyStartReplication(ctx, r, w, trimmed)
+		return true, s.replyStartReplication(ctx, r, w, trimmed, appName)
+	case strings.HasPrefix(upper, "TIMELINE_HISTORY "):
+		return true, s.replyTimelineHistory(w, trimmed[len("TIMELINE_HISTORY "):])
+	case upper == "BASE_BACKUP" || strings.HasPrefix(upper, "BASE_BACKUP "):
+		args := ""
+		if len(trimmed) > len("BASE_BACKUP") {
+			args = strings.TrimSpace(trimmed[len("BASE_BACKUP"):])
+		}
+		return true, s.replyBaseBackup(ctx, w, args)
 	}
 	return false, nil
+}
+
+// replyTimelineHistory serves the upstream TIMELINE_HISTORY <tli> command.
+// Argument is a single decimal TLI; the server replies with a 1-row,
+// 2-column result-set (filename text, content bytea) holding the raw
+// `<tli>.history` bytes from `pg_wal/`. A missing file (e.g. TLI=1
+// on a freshly initialised primary) returns an empty content row —
+// upstream's walreceiver treats that as "no history yet" rather than
+// an error. Mirrors `postgres/src/backend/replication/walsender.c`'s
+// SendTimeLineHistory branch.
+func (s *Server) replyTimelineHistory(w *protocol.FrameWriter, args string) error {
+	tok := strings.Fields(strings.TrimSpace(args))
+	if len(tok) == 0 {
+		return s.writeQueryError(w, sqlstate.SyntaxError,
+			"TIMELINE_HISTORY requires a timeline ID")
+	}
+	tli64, err := strconv.ParseUint(tok[0], 10, 32)
+	if err != nil {
+		return s.writeQueryError(w, sqlstate.SyntaxError,
+			fmt.Sprintf("TIMELINE_HISTORY: invalid TLI %q", tok[0]))
+	}
+	tli := uint32(tli64)
+	walDir := s.cfg.WALDirPath
+	if walDir == "" {
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+			"TIMELINE_HISTORY requires Config.WALDirPath to be set")
+	}
+
+	name := wal.TimelineHistoryFileName(tli)
+	path := filepath.Join(walDir, name)
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return s.writeQueryError(w, sqlstate.InternalError, err.Error())
+		}
+		// Upstream parity: TLI without a history file (typically TLI=1)
+		// returns an empty content blob rather than an error.
+		content = nil
+	}
+
+	if err := w.WriteRowDescription([]protocol.FieldDescription{
+		{Name: "filename", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
+		{Name: "content", TypeOID: oidBytea, TypeSize: -1, TypeModifier: -1, Format: 0},
+	}); err != nil {
+		return err
+	}
+	row := [][]byte{[]byte(name), content}
+	if err := w.WriteDataRow(row); err != nil {
+		return err
+	}
+	if err := w.WriteCommandComplete("TIMELINE_HISTORY"); err != nil {
+		return err
+	}
+	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
 // replyIdentifySystem emits the four-column / one-row reply upstream's
@@ -64,10 +129,10 @@ func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.Frame
 // follow upstream so a libpq client (and the future goopg-side
 // walreceiver) parse it transparently:
 //
-//   systemid  : text   — pg_control identifier
-//   timeline  : int4   — current timeline; v0 is single-timeline
-//   xlogpos   : text   — current write LSN as `X/X` hex pair
-//   dbname    : text   — empty for physical replication
+//	systemid  : text   — pg_control identifier
+//	timeline  : int4   — current timeline; v0 is single-timeline
+//	xlogpos   : text   — current write LSN as `X/X` hex pair
+//	dbname    : text   — empty for physical replication
 func (s *Server) replyIdentifySystem(w *protocol.FrameWriter) error {
 	systemID := s.cfg.SystemID
 	if systemID == "" {
@@ -104,37 +169,120 @@ func (s *Server) replyIdentifySystem(w *protocol.FrameWriter) error {
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
-// replyCreateReplicationSlot parses `name PHYSICAL [...]` (the v0
-// subset) and creates a slot. Other variants (LOGICAL, EXPORT_SNAPSHOT,
-// RESERVE_WAL options) return feature_not_supported.
+// replyCreateReplicationSlot parses the upstream CREATE_REPLICATION_SLOT
+// grammar and creates a slot. The v0 subset acknowledges:
+//
+//	CREATE_REPLICATION_SLOT slot_name [TEMPORARY]
+//	  { PHYSICAL | LOGICAL output_plugin }
+//	  [ ( option [value] [, ...] ) ]
+//
+// Legacy positional trailing keywords (EXPORT_SNAPSHOT, NOEXPORT_SNAPSHOT,
+// USE_SNAPSHOT, TWO_PHASE, RESERVE_WAL) are still accepted for
+// backwards-compatibility. The parenthesised options list is the
+// PG14+ shape libpqwalreceiver uses: SNAPSHOT 'export'|'use'|'nothing',
+// TWO_PHASE [bool], RESERVE_WAL [bool], FAILOVER [bool]. All known
+// options are no-ops in v0 because goopg does not yet ship a snapshot
+// exporter; snapshot_name is always returned NULL.
 func (s *Server) replyCreateReplicationSlot(w *protocol.FrameWriter, args string) error {
 	if s.cfg.Slots == nil {
 		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
 			"replication slots are not configured on this server")
 	}
-	tokens := strings.Fields(args)
+	// Split off any trailing parenthesised options list before
+	// whitespace-tokenising the rest. The options block is parsed
+	// separately because its values can be single-quoted strings
+	// containing whitespace.
+	prefix, optsBlock, hasOpts, err := splitReplicationSlotOptionsBlock(args)
+	if err != nil {
+		return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
+	}
+	tokens := strings.Fields(prefix)
 	if len(tokens) < 2 {
 		return s.writeQueryError(w, sqlstate.SyntaxError,
 			"CREATE_REPLICATION_SLOT requires a slot name and a kind")
 	}
 	name := unquoteIdent(tokens[0])
-	kind := strings.ToUpper(tokens[1])
-	if kind != "PHYSICAL" {
-		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
-			fmt.Sprintf("CREATE_REPLICATION_SLOT %s is not supported in v0 (PHYSICAL only)", kind))
+
+	idx := 1
+	if strings.EqualFold(tokens[idx], "TEMPORARY") {
+		idx++
+		if idx >= len(tokens) {
+			return s.writeQueryError(w, sqlstate.SyntaxError,
+				"CREATE_REPLICATION_SLOT TEMPORARY requires PHYSICAL or LOGICAL")
+		}
 	}
+	kind := strings.ToUpper(tokens[idx])
+	idx++
+
+	var slotKind wal.SlotKind
+	var plugin string
+	switch kind {
+	case "PHYSICAL":
+		slotKind = wal.SlotPhysical
+		// Tolerate trailing RESERVE_WAL (no-op).
+		for idx < len(tokens) {
+			if !strings.EqualFold(tokens[idx], "RESERVE_WAL") {
+				return s.writeQueryError(w, sqlstate.SyntaxError,
+					fmt.Sprintf("unexpected token %q after PHYSICAL", tokens[idx]))
+			}
+			idx++
+		}
+	case "LOGICAL":
+		slotKind = wal.SlotLogical
+		if idx >= len(tokens) {
+			return s.writeQueryError(w, sqlstate.SyntaxError,
+				"CREATE_REPLICATION_SLOT LOGICAL requires an output plugin name")
+		}
+		plugin = unquoteIdent(tokens[idx])
+		idx++
+		if !strings.EqualFold(plugin, "pgoutput") {
+			return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+				fmt.Sprintf("logical output plugin %q is not supported (pgoutput only)", plugin))
+		}
+		// Legacy positional trailing keywords (pre-PG14 grammar):
+		// EXPORT_SNAPSHOT | NOEXPORT_SNAPSHOT | USE_SNAPSHOT | TWO_PHASE.
+		for idx < len(tokens) {
+			opt := strings.ToUpper(tokens[idx])
+			switch opt {
+			case "EXPORT_SNAPSHOT", "NOEXPORT_SNAPSHOT", "USE_SNAPSHOT", "TWO_PHASE":
+				idx++
+			default:
+				return s.writeQueryError(w, sqlstate.SyntaxError,
+					fmt.Sprintf("unexpected token %q after LOGICAL pgoutput", tokens[idx]))
+			}
+		}
+	default:
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+			fmt.Sprintf("CREATE_REPLICATION_SLOT %s is not supported (PHYSICAL or LOGICAL pgoutput)", kind))
+	}
+
+	if hasOpts {
+		if err := parseReplicationSlotOptions(optsBlock, slotKind); err != nil {
+			return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
+		}
+	}
+
+	// Slot RestartLSN is the LSN at which the consumer will resume
+	// reading WAL — the *first byte of the next record*, not the
+	// last byte of the current one. WrittenLSN() returns the last
+	// appended byte's LSN, so the next record begins at +1. Without
+	// the +1, NewRecordIterator's `pos = startLSN-1` would land on
+	// the last byte of the previous record and the very first
+	// readOneAt() would decode garbage (e.g., rmid=240 from random
+	// payload bytes). Same off-by-one M0094-0005 fixed for
+	// startStandbyReplayer / startWalreceiver.
 	var startLSN uint64
 	if s.cfg.WAL != nil {
-		startLSN = s.cfg.WAL.WrittenLSN()
+		startLSN = s.cfg.WAL.WrittenLSN() + 1
 	}
-	slot, err := s.cfg.Slots.Create(name, wal.SlotPhysical, startLSN)
+	slot, err := s.cfg.Slots.Create(name, slotKind, startLSN)
 	if err != nil {
 		return s.writeQueryError(w, replicationSlotErrCode(err), err.Error())
 	}
 	// Upstream replies with (slot_name, consistent_point, snapshot_name,
 	// output_plugin). For PHYSICAL, snapshot_name and output_plugin
-	// are NULL; consistent_point is the LSN at which the slot was
-	// reserved.
+	// are NULL. For LOGICAL, snapshot_name is NULL in v0 and
+	// output_plugin echoes the requested plugin.
 	if err := w.WriteRowDescription([]protocol.FieldDescription{
 		{Name: "slot_name", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
 		{Name: "consistent_point", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
@@ -143,11 +291,15 @@ func (s *Server) replyCreateReplicationSlot(w *protocol.FrameWriter, args string
 	}); err != nil {
 		return err
 	}
+	var pluginCol []byte
+	if slotKind == wal.SlotLogical {
+		pluginCol = []byte(plugin)
+	}
 	row := [][]byte{
 		[]byte(slot.Name),
 		[]byte(formatLSN(slot.RestartLSN)),
 		nil,
-		nil,
+		pluginCol,
 	}
 	if err := w.WriteDataRow(row); err != nil {
 		return err
@@ -199,7 +351,7 @@ func (s *Server) replyDropReplicationSlot(w *protocol.FrameWriter, args string) 
 // arrive. When absent the walsender streams without slot-backed WAL
 // retention — fine for one-shot test traffic, dangerous in
 // production. Upstream behaves identically.
-func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, raw string) error {
+func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, raw string, appName string) error {
 	if s.cfg.WAL == nil {
 		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
 			"START_REPLICATION requires a configured WAL writer")
@@ -236,7 +388,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 	// pgoutput messages through `'w'` CopyData frames. See
 	// docs/design/0008-0004-apply-worker-and-tablesync.md.
 	if args.Mode == "LOGICAL" {
-		return s.runLogicalWalsender(ctx, r, w, args)
+		return s.runLogicalWalsender(ctx, r, w, args, appName)
 	}
 
 	walDir := s.cfg.WALDirPath
@@ -267,11 +419,19 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 	var senderHandle *wal.Sender
 	if s.cfg.WalSenders != nil {
 		senderHandle = s.cfg.WalSenders.Register(wal.SenderState{
-			SlotName:   args.SlotName,
-			ClientAddr: walsenderClientAddr(r),
-			SentLSN:    args.StartLSN,
+			SlotName:        args.SlotName,
+			ClientAddr:      walsenderClientAddr(r),
+			SentLSN:         args.StartLSN,
+			ApplicationName: appName,
 		})
 		defer s.cfg.WalSenders.Unregister(senderHandle)
+	}
+	// M0102-0005: forget the standby's last reported progress when the
+	// connection drops so a disconnected standby no longer counts toward
+	// the FIRST/ANY quorum. Empty appName is harmless (ForgetStandby
+	// removes the "" key, which never matches any rule entry).
+	if s.cfg.SyncRep != nil && appName != "" {
+		defer s.cfg.SyncRep.ForgetStandby(appName)
 	}
 	defer func() {
 		if s.cfg.Logger == nil {
@@ -288,10 +448,21 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
 
+	// handleStandbyCopyData also dispatches into SyncRep when configured;
+	// pass appName so the dispatcher can update the per-standby progress
+	// row keyed by application_name.
+	syncRep := s.cfg.SyncRep
+
 	// Receive-side goroutine: consume CopyData / CopyDone frames from
 	// the standby and apply standby-status updates to the slot. The
 	// goroutine ends naturally when the connection closes (ReadFrame
 	// returns an error) or the streaming context is cancelled.
+	// clientSentCopyDone tracks whether the client gracefully ended
+	// the stream (e.g. pg_basebackup sending CopyDone); the send loop
+	// responds with its own CopyDone+CommandComplete+ReadyForQuery.
+	// For continuous streaming (PG standby), the client never sends
+	// CopyDone, so no response is sent and the stream stays open.
+	clientSentCopyDone := false
 	receiveDone := make(chan struct{})
 	go func() {
 		defer close(receiveDone)
@@ -302,8 +473,9 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 			}
 			switch f.Type {
 			case protocol.MsgCopyData:
-				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, senderHandle)
+				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, senderHandle, syncRep, appName)
 			case protocol.MsgCopyDone:
+				clientSentCopyDone = true
 				streamCancel()
 				return
 			case protocol.MsgTerminate:
@@ -316,24 +488,24 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 		}
 	}()
 
-	// Send-side loop: forward each WAL record as a 'w' WAL-data frame,
-	// emit periodic keepalives so the standby can advance its
+	// Send-side loop: forward contiguous raw WAL chunks as 'w'
+	// WAL-data frames, emit periodic keepalives so the standby can advance its
 	// progress reporting even when the primary is idle.
 	const keepaliveInterval = 10 * time.Second
 	keepaliveTimer := time.NewTimer(keepaliveInterval)
 	defer keepaliveTimer.Stop()
 
-	recCh := make(chan wal.Record, 1)
+	chunkCh := make(chan wal.RawChunk, 1)
 	recErrCh := make(chan error, 1)
 	go func() {
 		for {
-			rec, err := it.Next(streamCtx)
+			chunk, err := it.NextRaw(streamCtx, wal.XLOGBlockSize)
 			if err != nil {
 				recErrCh <- err
 				return
 			}
 			select {
-			case recCh <- rec:
+			case chunkCh <- chunk:
 			case <-streamCtx.Done():
 				recErrCh <- streamCtx.Err()
 				return
@@ -345,11 +517,21 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 		select {
 		case <-streamCtx.Done():
 			<-receiveDone
+			if clientSentCopyDone {
+				_ = w.WriteCopyDone()
+				_ = w.WriteCommandComplete("START_REPLICATION")
+				_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+			}
 			return nil
 		case <-receiveDone:
+			if clientSentCopyDone {
+				_ = w.WriteCopyDone()
+				_ = w.WriteCommandComplete("START_REPLICATION")
+				_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+			}
 			return nil
-		case rec := <-recCh:
-			frame := protocol.EncodeWALData(rec.StartLSN, rec.EndLSN, time.Now().UTC(), rec.Payload)
+		case chunk := <-chunkCh:
+			frame := protocol.EncodeWALData(chunk.StartLSN, chunk.EndLSN, time.Now().UTC(), chunk.Payload)
 			if err := w.WriteCopyData(frame); err != nil {
 				streamCancel()
 				return err
@@ -359,7 +541,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 				return err
 			}
 			if senderHandle != nil {
-				senderHandle.SetSentLSN(rec.EndLSN)
+				senderHandle.SetSentLSN(chunk.EndLSN)
 			}
 			// Reset the keepalive timer — fresh WAL implies the
 			// standby has just heard from us.
@@ -384,10 +566,23 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 		case err := <-recErrCh:
 			if errors.Is(err, context.Canceled) || errors.Is(err, wal.ErrClosed) {
 				<-receiveDone
+				if clientSentCopyDone {
+					_ = w.WriteCopyDone()
+					_ = w.WriteCommandComplete("START_REPLICATION")
+					_ = w.WriteReadyForQuery(protocol.TxStatusIdle)
+				}
 				return nil
 			}
 			streamCancel()
-			<-receiveDone
+			// Do NOT block on <-receiveDone here. The receiver goroutine is
+			// blocked inside r.ReadFrame() — a blocking network read that
+			// cannot be interrupted by context cancellation. Waiting for it
+			// while the WAL iterator has already failed creates a livelock:
+			// the receiver waits for the client to send CopyDone, the client
+			// waits for the server to send keepalives or data, and the server
+			// (this goroutine) never sends them because it exited the select.
+			// Instead, return immediately and let the deferred connection close
+			// (when handleConn exits) unblock the receiver via an EOF read.
 			return s.writeStreamingError(w, sqlstate.InternalError, err.Error())
 		}
 	}
@@ -399,7 +594,7 @@ func (s *Server) replyStartReplication(ctx context.Context, r *protocol.FrameRea
 // stream. When a senderHandle is supplied the standby-reported LSNs
 // are also pushed into the observability registry so
 // pg_stat_replication renders write_lsn / flush_lsn / replay_lsn.
-func (s *Server) handleStandbyCopyData(slotName string, payload []byte, senderHandle *wal.Sender) error {
+func (s *Server) handleStandbyCopyData(slotName string, payload []byte, senderHandle *wal.Sender, syncRep *wal.SyncRep, appName string) error {
 	parsed, kind, err := protocol.DecodeReplicationMessage(payload)
 	if err != nil {
 		return err
@@ -411,6 +606,12 @@ func (s *Server) handleStandbyCopyData(slotName string, payload []byte, senderHa
 		}
 		if senderHandle != nil {
 			senderHandle.ApplyStandbyStatus(st.WriteLSN, st.FlushLSN, st.ApplyLSN)
+		}
+		// M0102-0005: feed the SyncRep wait primitive so any commit
+		// blocking on this standby gets released as soon as the
+		// acknowledged LSN reaches the commit target.
+		if syncRep != nil && appName != "" {
+			syncRep.UpdateStandbyProgress(appName, st.WriteLSN, st.FlushLSN, st.ApplyLSN)
 		}
 	}
 	return nil
@@ -488,6 +689,7 @@ func parseStartReplicationArgs(raw string) (startReplicationArgs, error) {
 	if len(tokens) == 0 {
 		return startReplicationArgs{}, errors.New("START_REPLICATION: missing PHYSICAL/LOGICAL keyword")
 	}
+	modeKeywordPresent := true
 	switch {
 	case strings.EqualFold(tokens[0], "PHYSICAL"):
 		out.Mode = "PHYSICAL"
@@ -496,10 +698,15 @@ func parseStartReplicationArgs(raw string) (startReplicationArgs, error) {
 		if out.SlotName == "" {
 			return startReplicationArgs{}, errors.New("START_REPLICATION LOGICAL requires SLOT name")
 		}
+	case isLSNToken(tokens[0]):
+		out.Mode = "PHYSICAL"
+		modeKeywordPresent = false
 	default:
 		return startReplicationArgs{}, fmt.Errorf("START_REPLICATION: unknown mode %q", tokens[0])
 	}
-	tokens = tokens[1:]
+	if modeKeywordPresent {
+		tokens = tokens[1:]
+	}
 	if len(tokens) == 0 {
 		return startReplicationArgs{}, errors.New("START_REPLICATION: missing start LSN")
 	}
@@ -524,6 +731,11 @@ func parseStartReplicationArgs(raw string) (startReplicationArgs, error) {
 		out.Options = opts
 	}
 	return out, nil
+}
+
+func isLSNToken(token string) bool {
+	_, err := parseLSN(token)
+	return err == nil
 }
 
 // parseStartReplicationOptions parses libpq's pgoutput-style
@@ -572,6 +784,129 @@ func splitStartReplicationOptionList(raw string) []string {
 	}
 	out = append(out, raw[start:])
 	return out
+}
+
+// splitReplicationSlotOptionsBlock locates an optional trailing
+// parenthesised options list in a CREATE_REPLICATION_SLOT args string.
+// Returns the prefix (everything before the `(`), the content between
+// the parens (excluding the parens themselves), and whether an options
+// list was present. The opening paren must appear outside any
+// single-quoted string and only after the slot-kind keywords (the
+// prefix tokens never contain `(` or `'` so the scan can be linear).
+// An unbalanced or mid-string paren returns an error.
+func splitReplicationSlotOptionsBlock(args string) (prefix, opts string, has bool, err error) {
+	depth := 0
+	inQuote := false
+	openIdx := -1
+	for i := 0; i < len(args); i++ {
+		c := args[i]
+		switch c {
+		case '\'':
+			if !inQuote {
+				inQuote = true
+			} else if i+1 < len(args) && args[i+1] == '\'' {
+				// SQL doubled single-quote escape inside a string.
+				i++
+			} else {
+				inQuote = false
+			}
+		case '(':
+			if inQuote {
+				continue
+			}
+			if depth == 0 {
+				openIdx = i
+			}
+			depth++
+		case ')':
+			if inQuote {
+				continue
+			}
+			if depth == 0 {
+				return "", "", false, fmt.Errorf("CREATE_REPLICATION_SLOT: unmatched ')' in options")
+			}
+			depth--
+			if depth == 0 {
+				tail := strings.TrimSpace(args[i+1:])
+				if tail != "" {
+					return "", "", false, fmt.Errorf("CREATE_REPLICATION_SLOT: unexpected trailing tokens %q after options", tail)
+				}
+				return strings.TrimSpace(args[:openIdx]), args[openIdx+1 : i], true, nil
+			}
+		}
+	}
+	if depth != 0 {
+		return "", "", false, fmt.Errorf("CREATE_REPLICATION_SLOT: options list missing closing ')'")
+	}
+	if inQuote {
+		return "", "", false, fmt.Errorf("CREATE_REPLICATION_SLOT: unterminated single-quoted string")
+	}
+	return args, "", false, nil
+}
+
+// parseReplicationSlotOptions parses the comma-separated option list
+// from the parenthesised form of CREATE_REPLICATION_SLOT (PG14+ shape):
+//
+//	(option [value] [, ...])
+//
+// Each option is a single keyword followed optionally by a value. The
+// value can be a single-quoted string, an unquoted identifier
+// (typically `true`/`false`), or an integer. Recognised options:
+//
+//	SNAPSHOT { 'export' | 'use' | 'nothing' } — snapshot disposition.
+//	  goopg has no snapshot exporter yet, so all three values are
+//	  no-ops and snapshot_name is returned NULL regardless.
+//	TWO_PHASE [ boolean ]   — two-phase commit decoding (no-op).
+//	RESERVE_WAL [ boolean ] — PHYSICAL only (no-op).
+//	FAILOVER [ boolean ]    — PG17+ failover slots (no-op).
+//
+// Unknown options return a syntax error so future probe rungs surface
+// loudly. RESERVE_WAL is rejected on LOGICAL slots and FAILOVER on
+// PHYSICAL — both match upstream's parse_create_replication_slot.
+func parseReplicationSlotOptions(raw string, kind wal.SlotKind) error {
+	parts := splitStartReplicationOptionList(raw)
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// Split into name + optional value. The name is a single
+		// keyword (no whitespace, no quotes); the value, if present,
+		// follows after whitespace.
+		name := p
+		val := ""
+		if i := strings.IndexAny(p, " \t"); i >= 0 {
+			name = strings.TrimSpace(p[:i])
+			val = strings.TrimSpace(p[i+1:])
+		}
+		key := strings.ToUpper(name)
+		switch key {
+		case "SNAPSHOT":
+			if val == "" {
+				return fmt.Errorf("CREATE_REPLICATION_SLOT: SNAPSHOT requires a value")
+			}
+			v := strings.ToLower(strings.Trim(val, "'"))
+			switch v {
+			case "export", "use", "nothing":
+				// no-op
+			default:
+				return fmt.Errorf("CREATE_REPLICATION_SLOT: SNAPSHOT %q not recognised (export|use|nothing)", v)
+			}
+		case "TWO_PHASE":
+			// boolean or no value (presence implies true) — no-op.
+		case "RESERVE_WAL":
+			if kind == wal.SlotLogical {
+				return fmt.Errorf("CREATE_REPLICATION_SLOT: RESERVE_WAL is not valid for LOGICAL slots")
+			}
+		case "FAILOVER":
+			if kind == wal.SlotPhysical {
+				return fmt.Errorf("CREATE_REPLICATION_SLOT: FAILOVER is not valid for PHYSICAL slots")
+			}
+		default:
+			return fmt.Errorf("CREATE_REPLICATION_SLOT: unrecognised option %q", name)
+		}
+	}
+	return nil
 }
 
 // parseLSN parses upstream's `X/X` hex notation back into a uint64.

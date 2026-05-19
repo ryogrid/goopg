@@ -1,6 +1,7 @@
 package planner
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -632,6 +633,215 @@ func TestPlanInsertResolvesColumns(t *testing.T) {
 	}
 }
 
+
+// TestPlanInsertValuesDefaultSubstitutesColumnDefault: rung 15 — a bare
+// DEFAULT cell in a VALUES row is substituted at plan time by the
+// target column's catalog DefaultExpr. The executor never observes a
+// DefaultMarker, so a Values row that parsed as `(1, DEFAULT)` against
+// `(id int, note text DEFAULT 'auto')` plans into a row whose second
+// cell evaluates to the literal `'auto'`.
+func TestPlanInsertValuesDefaultSubstitutesColumnDefault(t *testing.T) {
+	c := catalog.NewInMemory()
+	// DefaultExpr on the catalog column models what execCreateTable
+	// would have populated from `CREATE TABLE t (id int, note text
+	// DEFAULT 'auto')`.
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "note", Type: catalog.Type{Name: "text"}, DefaultExpr: &parser.StringConst{Value: "auto"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t (id, note) VALUES (1, DEFAULT)"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins, ok := node.(*Insert)
+	if !ok {
+		t.Fatalf("got %T", node)
+	}
+	values, ok := ins.Source.(*Values)
+	if !ok {
+		t.Fatalf("ins.Source=%T", ins.Source)
+	}
+	if len(values.Rows) != 1 || len(values.Rows[0]) != 2 {
+		t.Fatalf("values shape=%v", values.Rows)
+	}
+	// Cell 0: explicit integer.
+	if _, ok := values.Rows[0][0].(*IntegerConst); !ok {
+		t.Errorf("row[0][0]=%T want *IntegerConst", values.Rows[0][0])
+	}
+	// Cell 1: substituted from column's DefaultExpr — a planner StringConst
+	// resolved from the catalog's parser.StringConst.
+	sc, ok := values.Rows[0][1].(*StringConst)
+	if !ok {
+		t.Fatalf("row[0][1]=%T want *StringConst (the substituted DEFAULT)", values.Rows[0][1])
+	}
+	if sc.Value != "auto" {
+		t.Errorf("row[0][1].Value=%q want %q", sc.Value, "auto")
+	}
+}
+
+// TestPlanInsertValuesDefaultColumnWithoutDefaultGivesNull: rung 15 —
+// DEFAULT against a column without a DefaultExpr plans to NULL (matches
+// upstream PG: DEFAULT for a column with no default is NULL).
+func TestPlanInsertValuesDefaultColumnWithoutDefaultGivesNull(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "bare", Type: catalog.Type{Name: "text"}}, // no DefaultExpr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t (id, bare) VALUES (1, DEFAULT)"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	values := node.(*Insert).Source.(*Values)
+	if _, ok := values.Rows[0][1].(*NullConst); !ok {
+		t.Errorf("row[0][1]=%T want *NullConst", values.Rows[0][1])
+	}
+}
+
+
+// TestPlanUpdateSetDefaultSubstitutesColumnDefault: rung 16 — a bare
+// DEFAULT on the RHS of an UPDATE SET assignment is substituted at plan
+// time by the target column's catalog DefaultExpr. The executor never
+// observes a DefaultMarker; the resolved Set slot at the column's
+// ordinal holds the substituted constant. Symmetric with rung 15.
+func TestPlanUpdateSetDefaultSubstitutesColumnDefault(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "note", Type: catalog.Type{Name: "text"}, DefaultExpr: &parser.StringConst{Value: "auto"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "UPDATE t SET note = DEFAULT WHERE id = 1"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	upd, ok := node.(*Update)
+	if !ok {
+		t.Fatalf("got %T", node)
+	}
+	if len(upd.Set) != 2 {
+		t.Fatalf("Set len=%d want 2", len(upd.Set))
+	}
+	// Set[0] (id) should be untouched (nil — UPDATE preserves the row's
+	// existing value for columns not named in SET).
+	if upd.Set[0] != nil {
+		t.Errorf("Set[0]=%T want nil", upd.Set[0])
+	}
+	// Set[1] (note) is the substituted DEFAULT — a planner StringConst
+	// resolved from the catalog's parser.StringConst.
+	sc, ok := upd.Set[1].(*StringConst)
+	if !ok {
+		t.Fatalf("Set[1]=%T want *StringConst (the substituted DEFAULT)", upd.Set[1])
+	}
+	if sc.Value != "auto" {
+		t.Errorf("Set[1].Value=%q want %q", sc.Value, "auto")
+	}
+}
+
+// TestPlanUpdateSetDefaultColumnWithoutDefaultGivesNull: rung 16 —
+// DEFAULT against a column without a DefaultExpr plans to NULL. Mirrors
+// upstream PG semantics ("DEFAULT for a column with no default is
+// NULL") and rung 15's INSERT VALUES path.
+func TestPlanUpdateSetDefaultColumnWithoutDefaultGivesNull(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "bare", Type: catalog.Type{Name: "text"}}, // no DefaultExpr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "UPDATE t SET bare = DEFAULT WHERE id = 1"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	upd := node.(*Update)
+	if _, ok := upd.Set[1].(*NullConst); !ok {
+		t.Errorf("Set[1]=%T want *NullConst", upd.Set[1])
+	}
+}
+
+
+// TestPlanInsertDefaultValuesExpandsToColumnDefaults: rung 17 — the
+// all-defaults `INSERT INTO t DEFAULT VALUES` form is expanded by
+// rewriteInsertDefaultMarkers into a single VALUES row whose cells
+// are each the corresponding column's DefaultExpr (or NULL for
+// columns without a DEFAULT). Generated columns are skipped (same
+// rule planInsert uses for the implicit-column-list case).
+func TestPlanInsertDefaultValuesExpandsToColumnDefaults(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, DefaultExpr: &parser.IntegerConst{Value: 7}},
+		{Name: "note", Type: catalog.Type{Name: "text"}, DefaultExpr: &parser.StringConst{Value: "auto"}},
+		{Name: "bare", Type: catalog.Type{Name: "text"}}, // no DEFAULT
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t DEFAULT VALUES"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins, ok := node.(*Insert)
+	if !ok {
+		t.Fatalf("got %T", node)
+	}
+	values, ok := ins.Source.(*Values)
+	if !ok {
+		t.Fatalf("ins.Source=%T", ins.Source)
+	}
+	if len(values.Rows) != 1 || len(values.Rows[0]) != 3 {
+		t.Fatalf("values shape=%v", values.Rows)
+	}
+	// Cell 0: id's IntegerConst DEFAULT.
+	if ic, ok := values.Rows[0][0].(*IntegerConst); !ok || ic.Value != 7 {
+		t.Errorf("row[0][0]=%v want IntegerConst{Value: 7}", values.Rows[0][0])
+	}
+	// Cell 1: note's StringConst DEFAULT.
+	if sc, ok := values.Rows[0][1].(*StringConst); !ok || sc.Value != "auto" {
+		t.Errorf("row[0][1]=%v want StringConst{Value: \"auto\"}", values.Rows[0][1])
+	}
+	// Cell 2: bare has no DefaultExpr → substituted as NullConst.
+	if _, ok := values.Rows[0][2].(*NullConst); !ok {
+		t.Errorf("row[0][2]=%T want *NullConst", values.Rows[0][2])
+	}
+	// ColumnIndex covers all three columns in declared order (no
+	// generated columns in this fixture).
+	if got, want := ins.ColumnIndex, []int{0, 1, 2}; len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Errorf("ColumnIndex=%v want %v", got, want)
+	}
+}
+
+// TestPlanInsertDefaultValuesSkipsGeneratedColumns: rung 17 — generated
+// columns are excluded from the expansion, matching planInsert's
+// implicit-column-list rule. The Insert's source then has arity one
+// less than len(tbl.Columns); the executor populates the generated
+// column via computeGeneratedColumns.
+func TestPlanInsertDefaultValuesSkipsGeneratedColumns(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, DefaultExpr: &parser.IntegerConst{Value: 1}},
+		{Name: "g", Type: catalog.Type{Name: "int4"}, GeneratedAlways: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t DEFAULT VALUES"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins := node.(*Insert)
+	values := ins.Source.(*Values)
+	if len(values.Rows[0]) != 1 {
+		t.Fatalf("expansion size=%d want 1 (generated col excluded)", len(values.Rows[0]))
+	}
+	if len(ins.ColumnIndex) != 1 || ins.ColumnIndex[0] != 0 {
+		t.Errorf("ColumnIndex=%v want [0]", ins.ColumnIndex)
+	}
+}
+
 // TestPlanUpdate: pgbench's abalance UPDATE plans into
 // Update(Filter(SeqScan)) with Set[2] populated.
 func TestPlanUpdate(t *testing.T) {
@@ -704,7 +914,6 @@ func TestPlanResolutionErrors(t *testing.T) {
 		{"UPDATE pgbench_accounts SET nope = 1 WHERE aid = $1", "42703"}, // undefined_column
 		{"INSERT INTO pgbench_history VALUES (1, 2, 3)", "42601"},        // arity mismatch
 		{"SELECT 1 UNION SELECT 2", "0A000"},                             // set op unsupported
-		{"INSERT INTO pgbench_history (tid) VALUES (1) RETURNING tid", "0A000"},
 		{"SELECT aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", "42702"},
 		{"SELECT aid FROM pgbench_accounts HAVING aid > 0", "42803"},
 	}
@@ -722,5 +931,85 @@ func TestPlanResolutionErrors(t *testing.T) {
 		if pe.Code != c.code {
 			t.Errorf("Plan(%q) code=%s want %s", c.sql, pe.Code, c.code)
 		}
+	}
+}
+
+// TestPlanLateralSrfArgResolvesAgainstLeftFromItem pins the LATERAL
+// FROM-clause SRF resolution path (M0103-0008). The libpqrcv
+// column-list probe ships
+//
+//	SELECT ... FROM pg_publication p,
+//	  LATERAL pg_get_publication_tables(p.pubname) gpt,
+//	  pg_class c WHERE gpt.relid = ... AND c.oid = gpt.relid
+//
+// against the goopg publisher during CREATE SUBSCRIPTION. The SRF arg
+// `p.pubname` is an outer column reference from the FROM list's left
+// sibling — the planner threads the partial FROM context as a LATERAL
+// scope so the arg resolves and `gpt.attrs` (the SRF's static column)
+// is reachable at the top-level target list.
+func TestPlanLateralSrfArgResolvesAgainstLeftFromItem(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "pg_publication"}, []catalog.Column{
+		{Name: "pubname", Type: catalog.Type{Name: "text"}, Ordinal: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT gpt.attrs FROM pg_publication p, LATERAL pg_get_publication_tables(p.pubname) gpt`
+	plan, err := Plan(parseOne(t, sql), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	out := plan.Output()
+	if len(out) != 1 {
+		t.Fatalf("output cols = %d, want 1", len(out))
+	}
+	if got := out[0].Name; got != "attrs" {
+		t.Errorf("output col name = %q, want %q", got, "attrs")
+	}
+}
+
+
+// TestPlanFetchTableListAggDerivedSubquery pins the M0103-0008 rung-7
+// gap surfaced by dropping the t.Skip on
+// `internal/testport/pgoutput_interop_test.go::TestPort_PgoutputInteropGoopgToPG`.
+//
+// libpqrcv's `fetch_table_list` ships the same SRF call wrapped in a
+// derived subquery whose argument list is an aggregate:
+//
+//	SELECT … gpt.attrs FROM …
+//	  JOIN ( SELECT (pg_get_publication_tables(VARIADIC
+//	         array_agg(pubname::text))).*
+//	         FROM pg_publication WHERE pubname IN (…)) AS gpt …
+//
+// The non-aggregate IndirectionStar variant is rewritten at parse time
+// into a FROM-clause TableFuncRef + `__irs_0.*` target — the analyzer's
+// `tableFuncColumns` (loop 4) hands the outer scope the SRF's static
+// three-column shape and outer references resolve. The aggregate-arg
+// variant skips the parse-time rewrite (parser passes nil
+// `onAggregate`) and the planner lowers it via `ProjectSet` (loop 5).
+// `synthesizeSubqueryTable` does not yet expand `*parser.IndirectionStar`
+// targets — it falls back to `?column?1` so outer references like
+// `gpt.attrs` raise `42703: column "attrs" does not exist`.
+//
+// The Skip stays until the analyzer expansion lands; flip it to a
+// positive plan-and-output assertion in the next M0103-0008 loop.
+func TestPlanFetchTableListAggDerivedSubquery(t *testing.T) {
+	// M0103-0008 rung 7: synthesizeSubqueryTable expands
+	// `(srf(<agg>)).*` derived-subquery targets so outer references like
+	// `gpt.attrs` resolve.
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "pg_publication"}, []catalog.Column{
+		{Name: "pubname", Type: catalog.Type{Name: "text"}, Ordinal: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT gpt.attrs FROM ( SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).* FROM pg_publication WHERE pubname IN ('p')) AS gpt`
+	plan, err := Plan(parseOne(t, sql), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	out := plan.Output()
+	if len(out) != 1 || !strings.EqualFold(out[0].Name, "attrs") {
+		t.Fatalf("expected single output column 'attrs', got %+v", out)
 	}
 }

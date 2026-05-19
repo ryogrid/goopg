@@ -29,7 +29,7 @@ import (
 // builds a SlotDecoder over the slot, plumbs its OutputPlugin into
 // a PgOutput writing through `walsenderPgoutputAdapter`, and runs
 // until the standby disconnects or ctx is cancelled.
-func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, args startReplicationArgs) error {
+func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, args startReplicationArgs, appName string) error {
 	if s.cfg.WAL == nil {
 		return s.writeStreamingError(w, sqlstate.FeatureNotSupported,
 			"START_REPLICATION LOGICAL requires a configured WAL writer")
@@ -51,6 +51,15 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 	segSize := s.cfg.WALSegmentSize
 	if segSize <= 0 {
 		segSize = wal.DefaultSegmentSize
+	}
+
+	// M0103-0005: forget the subscriber's last reported progress when the
+	// connection drops so a disconnected subscriber no longer counts toward
+	// the FIRST/ANY quorum. Mirrors the physical-walsender path in
+	// replyStartReplication. Empty appName is harmless (ForgetStandby
+	// removes the "" key, which never matches any rule entry).
+	if s.cfg.SyncRep != nil && appName != "" {
+		defer s.cfg.SyncRep.ForgetStandby(appName)
 	}
 
 	// Snapshot the catalog at session start so the pgoutput
@@ -88,6 +97,13 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 	// path also advances it on each commit; the standby-status
 	// path mirrors what walreceiver/PHYSICAL slots do so the
 	// subscriber ack drives retention.
+	//
+	// M0103-0005: handleStandbyCopyData also dispatches the parsed
+	// progress into SyncRep when configured; the appName carried
+	// through from the START_REPLICATION handshake keys each
+	// per-subscriber row in the wait registry, so a publisher
+	// COMMIT blocking on synchronous_standby_names = '<appName>'
+	// releases as soon as the subscriber reports apply ≥ commit LSN.
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	defer streamCancel()
 
@@ -101,7 +117,7 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 			}
 			switch f.Type {
 			case protocol.MsgCopyData:
-				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, nil)
+				_ = s.handleStandbyCopyData(args.SlotName, f.Payload, nil, s.cfg.SyncRep, appName)
 			case protocol.MsgCopyDone, protocol.MsgTerminate:
 				streamCancel()
 				return
@@ -112,14 +128,43 @@ func (s *Server) runLogicalWalsender(ctx context.Context, r *protocol.FrameReade
 	runErr := make(chan error, 1)
 	go func() { runErr <- dec.Run(streamCtx) }()
 
+	// Periodic keepalive emission. Without it, PG's apply worker
+	// terminates the connection after `wal_receiver_timeout` (default
+	// 60 s) when no pgoutput frame has crossed the wire — which is the
+	// common case during a quiet workload. The physical walsender path
+	// in replyStartReplication runs the same 10 s cadence; the LOGICAL
+	// path needs symmetric behaviour. The keepalive's walEnd advertises
+	// the adapter's last-emitted synthetic LSN so the subscriber's
+	// progress reporting matches the byte-stream LSNs it has seen.
+	const keepaliveInterval = 10 * time.Second
+	keepaliveDone := make(chan struct{})
+	go func() {
+		defer close(keepaliveDone)
+		ticker := time.NewTicker(keepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-streamCtx.Done():
+				return
+			case <-ticker.C:
+				if err := adapter.WriteKeepalive(time.Now().UTC()); err != nil {
+					streamCancel()
+					return
+				}
+			}
+		}
+	}()
+
 	select {
 	case <-streamCtx.Done():
 		<-receiveDone
 		<-runErr
+		<-keepaliveDone
 		return nil
 	case err := <-runErr:
 		streamCancel()
 		<-receiveDone
+		<-keepaliveDone
 		if errors.Is(err, context.Canceled) || errors.Is(err, wal.ErrClosed) {
 			return nil
 		}
@@ -161,6 +206,29 @@ func (a *walsenderPgoutputAdapter) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("walsender pgoutput flush: %w", err)
 	}
 	return len(p), nil
+}
+
+// WriteKeepalive emits a primary-keepalive (`'k'`) frame through the
+// same FrameWriter the pgoutput Write path uses, sharing the adapter's
+// mutex so the bytes never interleave with an in-flight `'w'` frame.
+// walEnd is advertised as the last-emitted synthetic LSN; subscribers
+// use it only as a status anchor (they ack against received-LSN, not
+// walEnd) so a never-advanced value is safe on a quiet publisher.
+func (a *walsenderPgoutputAdapter) WriteKeepalive(sendTime time.Time) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	walEnd := a.nextLSN
+	if walEnd > 0 {
+		walEnd--
+	}
+	frame := protocol.EncodeKeepalive(walEnd, sendTime, false)
+	if err := a.w.WriteCopyData(frame); err != nil {
+		return fmt.Errorf("walsender pgoutput keepalive write: %w", err)
+	}
+	if err := a.w.Flush(); err != nil {
+		return fmt.Errorf("walsender pgoutput keepalive flush: %w", err)
+	}
+	return nil
 }
 
 // guard the unused-import warning in some build configurations.
@@ -267,20 +335,102 @@ func relQualifiedName(rel *wal.RelationDef) string {
 }
 
 // splitPublicationNames parses the `publication_names` option
-// value libpq sends as 'p1,p2,p3' into a clean slice of names.
-// Empty / whitespace entries are dropped; surrounding spaces
-// trimmed.
+// value libpq's logical-replication client embeds as the raw
+// argument to START_REPLICATION. The shape mirrors upstream
+// PG's `SplitIdentifierString(rawstring, ',', ...)` semantics
+// (postgres/src/backend/utils/adt/varlena.c): each comma-
+// separated entry may be a double-quoted identifier (with
+// doubled `""` collapsing to a single `"` inside) or an
+// unquoted identifier (lowercased to match `downcase_truncate_identifier`).
+// libpqwalreceiver always emits quoted names (one per
+// publication), so without unquoting here the lookup keys
+// don't match what `execCreatePublication` stored. Whitespace
+// around each entry is tolerated. Returns nil on syntax error
+// so START_REPLICATION proceeds with an empty filter (the
+// caller logs and proceeds as for "no publications matched"
+// rather than tearing the connection down — upstream rejects
+// at SUBSCRIPTION DDL time, well before the wire-level slot
+// is started). See 0103-0016.
 func splitPublicationNames(raw string) []string {
 	if raw == "" {
 		return nil
 	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
+	var out []string
+	r := []rune(raw)
+	i := 0
+	skipSpace := func() {
+		for i < len(r) && unicodeIsSpace(r[i]) {
+			i++
 		}
 	}
-	return out
+	for {
+		skipSpace()
+		if i >= len(r) {
+			return out
+		}
+		// Lenient: empty entries between commas (e.g. `p1,,p2`)
+		// drop silently. Upstream's SplitIdentifierString treats
+		// these as a syntax error, but the existing goopg
+		// behaviour was permissive and the wire libpq actually
+		// emits never produces them — so the lenient path keeps
+		// the legacy contract intact without weakening the
+		// quoted-identifier handling that 0103-0016 adds.
+		if r[i] == ',' {
+			i++
+			continue
+		}
+		var name strings.Builder
+		if r[i] == '"' {
+			i++ // consume opening quote
+			for {
+				if i >= len(r) {
+					return nil // unterminated quoted identifier
+				}
+				if r[i] == '"' {
+					if i+1 < len(r) && r[i+1] == '"' {
+						name.WriteRune('"')
+						i += 2
+						continue
+					}
+					i++ // consume closing quote
+					break
+				}
+				name.WriteRune(r[i])
+				i++
+			}
+		} else {
+			start := i
+			for i < len(r) && r[i] != ',' && !unicodeIsSpace(r[i]) {
+				i++
+			}
+			if i == start {
+				return nil // empty unquoted identifier (shouldn't reach)
+			}
+			name.WriteString(strings.ToLower(string(r[start:i])))
+		}
+		if s := name.String(); s != "" {
+			out = append(out, s)
+		}
+		skipSpace()
+		if i >= len(r) {
+			return out
+		}
+		if r[i] != ',' {
+			return nil // syntax error: junk after identifier
+		}
+		i++ // consume comma
+	}
+}
+
+// unicodeIsSpace mirrors PG's scanner_isspace — only ASCII
+// whitespace characters that the SQL scanner treats as token
+// separators (space, tab, newline, carriage-return, form-feed,
+// vertical-tab). Avoids unicode.IsSpace's broader definition so
+// the split behaviour matches upstream byte-for-byte.
+func unicodeIsSpace(r rune) bool {
+	switch r {
+	case ' ', '\t', '\n', '\r', '\f', '\v':
+		return true
+	}
+	return false
 }

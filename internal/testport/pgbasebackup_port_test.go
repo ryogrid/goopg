@@ -19,8 +19,15 @@ package testport
 // (via clientToolBin in client_tools_port_test.go).
 
 import (
+	"context"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/testutil/cluster"
 )
 
 // TestPort_PgBasebackup010 ports postgres/src/bin/pg_basebackup/t/010_pg_basebackup.pl.
@@ -95,11 +102,97 @@ func TestPort_PgBasebackup010(t *testing.T) {
 		t.Fatalf("expected 'none' in --compress=none+ error; got %q", res.Stdout+res.Stderr)
 	}
 
-	// Backup execution sub-cases deferred: goopg v0 does not implement the
-	// pg_basebackup physical streaming protocol (BASE_BACKUP replication command).
-	// Remove this Skip when goopg supports BASE_BACKUP streaming.
-	t.Skip("pg_basebackup backup execution requires physical streaming protocol " +
-		"not yet implemented in goopg v0")
+	// Backup execution sub-case: now exercised end-to-end via
+	// TestPort_PgBasebackup010BackupExecution. See M0102-0002 for the
+	// BASE_BACKUP wire-protocol implementation and M0095-0003 for the
+	// test-suite progression.
+}
+
+// TestPort_PgBasebackup010BackupExecution exercises the upstream
+// "actual backup" sub-case of 010_pg_basebackup.pl against a live
+// goopg cluster: connect via the replication protocol, issue
+// BASE_BACKUP, and unpack the resulting tar into a fresh data
+// directory. Verification mirrors upstream's "real backup" assertion
+// — backup_label and global/pg_control are present in the extracted
+// directory. WAL streaming (`-X stream`) and backup manifests are
+// left disabled (`-X none --no-manifest`) until START_REPLICATION and
+// `bbsink_manifest` parity ship under M0095-0003 follow-ups.
+//
+// Implementation notes:
+//
+//   - The cluster.RunClientTool helper requires the binary on $PATH;
+//     pg_basebackup ships in postgres/local_install/bin which is not
+//     necessarily on the test runner's PATH, so we resolve the
+//     absolute path via clientToolBin and invoke it directly with the
+//     cluster's listen address.
+//
+//   - Required server-side GUCs: SHOW data_directory_mode, SHOW
+//     wal_segment_size, and SHOW summarize_wal are issued by
+//     pg_basebackup before BASE_BACKUP; defaults registered in
+//     internal/config/defaults.go.
+//
+//   - Required wire-protocol parity for BASE_BACKUP: the trailing
+//     `CommandComplete("BASE_BACKUP")` emitted by
+//     internal/server/basebackup.go matches upstream's
+//     EndReplicationCommand wrap so pg_basebackup's final
+//     PQgetResult observes PGRES_COMMAND_OK instead of failing with
+//     "final receive failed: " (empty error).
+func TestPort_PgBasebackup010BackupExecution(t *testing.T) {
+	bin := clientToolBin(t, "pg_basebackup")
+	if bin == "" {
+		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
+	}
+	c := newCluster(t, "pgbasebackup010_exec")
+	if err := c.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	// Seed a small table so the backup includes non-empty heap pages.
+	if _, err := c.Query(context.Background(),
+		`CREATE TABLE pgbb_seed (a int)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := c.Query(context.Background(),
+		`INSERT INTO pgbb_seed VALUES (1), (2), (3)`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	host, port, err := net.SplitHostPort(c.ListenAddr())
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "backup")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cmd := exec.Command(bin,
+		"-h", host,
+		"-p", port,
+		"-U", "postgres",
+		"-D", out,
+		// -X none avoids the START_REPLICATION + walreceiver path
+		// (M0102-0006 follow-up). --no-sync + --no-manifest match the
+		// minimum pg_basebackup options that the BASE_BACKUP wire
+		// currently supports.
+		"-X", "none",
+		"--no-sync",
+		"--no-manifest",
+		"-l", "TestPort_PgBasebackup010BackupExecution")
+	cmd.Env = append(os.Environ(), "PGPASSWORD=")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pg_basebackup failed: %v\ncombined output:\n%s", err, string(output))
+	}
+
+	for _, rel := range []string{"backup_label", "global/pg_control", "PG_VERSION"} {
+		if _, err := os.Stat(filepath.Join(out, rel)); err != nil {
+			t.Errorf("missing %s in extracted backup: %v", rel, err)
+		}
+	}
 }
 
 // TestPort_PgBasebackup011InPlaceTablespace ports

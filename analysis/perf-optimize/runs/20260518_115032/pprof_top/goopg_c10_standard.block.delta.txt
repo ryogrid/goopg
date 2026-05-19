@@ -1,0 +1,49 @@
+# go tool pprof -top -nodecount=40 -cum -base /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_standard.block_base.pb.gz /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c10_standard.block.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 12:05:10 JST
+Showing nodes accounting for 2123.17s, 100% of 2123.61s total
+Dropped 115 nodes (cum <= 10.62s)
+Showing top 40 nodes out of 45
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%   1046.83s 49.29%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0%     0%   1046.83s 49.29%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0%     0%   1046.83s 49.29%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0%     0%   1046.52s 49.28%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0%     0%   1046.52s 49.28%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0%     0%   1046.52s 49.28%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+   964.15s 45.40% 45.40%    964.15s 45.40%  sync.(*Mutex).Lock (inline)
+         0     0% 45.40%    840.17s 39.56%  github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor
+   739.62s 34.83% 80.23%    739.62s 34.83%  runtime.selectgo
+         0     0% 80.23%    356.92s 16.81%  github.com/goopg/goopg/internal/aio.(*methodWorker).run
+         0     0% 80.23%    356.92s 16.81%  github.com/goopg/goopg/internal/aio.newMethodWorker.gowrap1
+   356.92s 16.81% 97.04%    356.92s 16.81%  runtime.chanrecv2
+         0     0% 97.04%    149.91s  7.06%  net/http.(*Server).Serve.gowrap3
+         0     0% 97.04%    149.91s  7.06%  net/http.(*conn).serve
+         0     0% 97.04%    149.91s  7.06%  net/http.(*ServeMux).ServeHTTP
+         0     0% 97.04%    149.91s  7.06%  net/http.HandlerFunc.ServeHTTP
+         0     0% 97.04%    149.91s  7.06%  net/http.serverHandler.ServeHTTP
+         0     0% 97.04%    149.70s  7.05%  net/http/pprof.sleep
+         0     0% 97.04%    127.71s  6.01%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 97.04%    119.96s  5.65%  net/http/pprof.Profile
+         0     0% 97.04%    119.90s  5.65%  github.com/goopg/goopg/internal/initdb.Open.func37
+         0     0% 97.04%    119.75s  5.64%  github.com/goopg/goopg/internal/server.(*ApplyLauncher).Run
+         0     0% 97.04%    119.75s  5.64%  github.com/goopg/goopg/internal/server.(*Server).Run.gowrap2
+         0     0% 97.04%    119.74s  5.64%  github.com/goopg/goopg/internal/wal.(*Checkpointer).Run
+         0     0% 97.04%    119.74s  5.64%  main.runStart.func4
+         0     0% 97.04%    113.55s  5.35%  github.com/goopg/goopg/internal/storage.(*Bgwriter).Start.gowrap1
+         0     0% 97.04%    113.55s  5.35%  github.com/goopg/goopg/internal/storage.(*Bgwriter).run
+         0     0% 97.04%     96.47s  4.54%  github.com/goopg/goopg/internal/wal.(*Writer).FlushUpTo
+         0     0% 97.04%     87.75s  4.13%  github.com/goopg/goopg/internal/mvcc.(*Manager).Commit (inline)
+         0     0% 97.04%     87.75s  4.13%  github.com/goopg/goopg/internal/mvcc.(*Manager).finish
+         0     0% 97.04%     82.44s  3.88%  github.com/goopg/goopg/internal/initdb.Open.func24
+         0     0% 97.04%     78.28s  3.69%  github.com/goopg/goopg/internal/mvcc.(*Manager).Begin
+    62.48s  2.94%   100%     62.48s  2.94%  runtime.chanrecv1
+         0     0%   100%     59.59s  2.81%  runtime.(*wakeableSleep).sleep
+         0     0%   100%     38.80s  1.83%  github.com/goopg/goopg/internal/executor.(*updateOp).Next
+         0     0%   100%     37.43s  1.76%  github.com/goopg/goopg/internal/wal.(*state).loop
+         0     0%   100%     37.43s  1.76%  github.com/goopg/goopg/internal/wal.NewWriter.gowrap1
+         0     0%   100%     29.96s  1.41%  github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex
+         0     0%   100%     29.95s  1.41%  net/http/pprof.Trace
+         0     0%   100%     29.95s  1.41%  runtime.traceStartReadCPU.func1

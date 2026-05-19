@@ -49,9 +49,9 @@ func fireTriggers(ctx *Context, tbl *catalog.Table, timing, event string, oldRow
 			NewRow:  newRow,
 			Cols:    tbl.Columns,
 			TGName:  trig.Name,
-			TGWhen:  timingLow,
-			TGOp:    eventLow,
-			TGLevel: "row",
+			TGWhen:  strings.ToUpper(timing),  // PostgreSQL uses uppercase BEFORE/AFTER
+			TGOp:    strings.ToUpper(event),   // PostgreSQL uses uppercase INSERT/UPDATE/DELETE
+			TGLevel: "ROW",                     // PostgreSQL uses uppercase ROW/STATEMENT
 			TGTable: tbl.Name,
 		}
 		retRow, ok, err := executePLpgSQLTriggerBody(r, trigCtx, ctx)

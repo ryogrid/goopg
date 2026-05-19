@@ -34,6 +34,13 @@ const StandbySignalFile = "standby.signal"
 // the recovery flow.
 const RecoverySignalFile = "recovery.signal"
 
+// PromoteSignalFile is the upstream-compatible trigger file used by
+// `pg_ctl promote` to convert a running standby into a primary.
+// Polled by the standby controller every promoteSignalPollInterval;
+// presence drives Promote(). Mirrors upstream
+// `postgres/src/include/access/xlog.h` PROMOTE_SIGNAL_FILE.
+const PromoteSignalFile = "promote.signal"
+
 // IsStandby reports whether `<dataDir>/standby.signal` is present.
 // A missing data directory or unreadable file returns (false, nil) —
 // callers reading the flag at boot want a "not standby" answer in

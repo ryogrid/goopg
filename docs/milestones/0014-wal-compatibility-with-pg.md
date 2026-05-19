@@ -102,3 +102,14 @@ Upstream sources to consult:
 8. Legacy WAL-format detection and guardrail messages are implemented and documented.
 9. Runtime observability exposes WAL format mode/version and compatibility diagnostics.
 10. All required design docs (0014-0001 through 0014-0004) are merged with status accepted.
+
+---
+
+**Implementation note (2026-05-13):** M0101 implemented the default-on activation of the
+PG-compatible WAL format (`PageHeaders=true`, `SystemID` generated/persisted in
+`global/system_identifier`). The full Rmgr payload mapping and recovery/streaming
+integration for all record kinds remain planned in M0014's broader scope. As of M0101,
+new goopg clusters write WAL that `pg_waldump` can parse, and crash-recovery round-trips
+with PG-compatible format have been verified by test. See
+`docs/milestones/0101-wal-pg-waldump-compatibility.md` for the focused activation
+sub-milestone.

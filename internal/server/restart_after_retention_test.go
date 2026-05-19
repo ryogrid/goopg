@@ -200,7 +200,7 @@ func retCountRows(t *testing.T, addr string) int {
 // exercised.
 func requireSeg0Missing(t *testing.T, dir string) {
 	t.Helper()
-	seg0 := filepath.Join(dir, "pg_wal", "000000000000000000000000")
+	seg0 := filepath.Join(dir, "pg_wal", wal.XLogFileName(1, 0, wal.DefaultSegmentSize))
 	if _, err := os.Stat(seg0); err == nil {
 		t.Fatal("WAL segment 0 still present; retention has not fired — " +
 			"M0045 code path will not be exercised")

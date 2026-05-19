@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -76,14 +77,38 @@ type Manager struct {
 	active     map[TxnHandle]*txState
 	xactMarker func(storage.TransactionID, XactMarker) error
 
+	// relcacheInvalPending is set by DDL that writes to nailed catalog
+	// relations (pg_class, pg_attribute, pg_proc, pg_type) so the
+	// xact-marker hook can emit RecordKindXactCommitInval and unlink
+	// both pg_internal.init files at commit time.
+	relcacheInvalPending atomic.Bool
+
 	// commitCond is broadcast whenever a transaction commits or aborts.
 	// Used by WaitForXID to block until a specific XID finishes.
 	commitCond *sync.Cond
+
+	// abortedXIDs tracks XIDs whose transactions were rolled back.
+	// Populated by finish() on rollback; included in every snapshot's
+	// Aborted field so rolled-back rows remain invisible even after
+	// their xmin falls below the snapshot's Xmin. This is a lightweight
+	// substitute for a full clog (M0100-0002). Sorted ascending.
+	abortedXIDs []storage.TransactionID
 
 	// subxact tracking (M0050-0002): maps subxact XIDs to their parent
 	// XIDs, and records individually-aborted subxact XIDs. Lazily
 	// initialised on first use. Protected by subxactMu.
 	subxactFields
+
+	// ssiState is the SERIALIZABLE-transaction bookkeeping registry
+	// (M0104-0002). Lazily initialised when the first serializable
+	// transaction Begins; protected by Manager.mu. See ssi.go.
+	ssiState ssiState
+
+	// predicateLocks is the SIREAD predicate-lock registry
+	// (M0104-0003). Lazy-initialised on first AcquirePredicateLock;
+	// protected by Manager.mu. RC/RR workloads never allocate it.
+	// See predlock.go.
+	predicateLocks predicateLocksRegistry
 }
 
 // NewManager returns a fresh manager whose first assigned xid is 3,
@@ -113,6 +138,34 @@ func (m *Manager) SetNextXID(x storage.TransactionID) {
 	}
 }
 
+// ReplayXactCommit is called by the standby's StreamReplayer when it applies
+// a RecordKindXactCommit from the primary. It advances nextXID past xid so
+// that snapshots taken on the standby see the replayed tuples as committed
+// (xmin < snap.Xmax). Without this call, the snapshot's Xmax equals the
+// committed XID, causing "xid >= Xmax → invisible" for every replayed tuple.
+func (m *Manager) ReplayXactCommit(xid storage.TransactionID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := xid + 1
+	if next > m.nextXID {
+		m.nextXID = next
+	}
+}
+
+// ReplayXactAbort is called by the standby's StreamReplayer when it applies a
+// RecordKindXactAbort from the primary. It advances nextXID past xid (so the
+// aborted transaction is not treated as "future") and records it in abortedXIDs
+// (so its heap tuples remain invisible to queries on the standby).
+func (m *Manager) ReplayXactAbort(xid storage.TransactionID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := xid + 1
+	if next > m.nextXID {
+		m.nextXID = next
+	}
+	m.abortedXIDs = insertSortedXID(m.abortedXIDs, xid)
+}
+
 // NextXID returns the value the next Begin will allocate. Used by
 // the bootstrap path to snapshot transaction state across restarts.
 func (m *Manager) NextXID() storage.TransactionID {
@@ -137,7 +190,9 @@ const xidMaxSafe = ^storage.TransactionID(0) - xidStopAge
 // to materialise one. Returns a Transaction with Handle != 0 and
 // XID == storage.InvalidTransactionID.
 func (m *Manager) Begin(iso IsolationLevel) (Transaction, error) {
-	if iso != IsolationReadCommitted && iso != IsolationRepeatableRead {
+	switch iso {
+	case IsolationReadCommitted, IsolationRepeatableRead, IsolationSerializable:
+	default:
 		return Transaction{}, fmt.Errorf("mvcc: unsupported isolation level %v", iso)
 	}
 	m.mu.Lock()
@@ -148,6 +203,14 @@ func (m *Manager) Begin(iso IsolationLevel) (Transaction, error) {
 		isolation:    iso,
 		xid:          storage.InvalidTransactionID,
 		snapshotXmin: ^storage.TransactionID(0), // sentinel: no snapshot yet
+	}
+	// M0104-0002: allocate per-txn SSI bookkeeping for SERIALIZABLE
+	// transactions. RC/RR never register; the registry stays nil
+	// for those workloads. Subsequent slices (predicate locks,
+	// rw-conflict tracking, pre-commit failure) attach to the
+	// SerializableXact returned here.
+	if iso == IsolationSerializable {
+		m.registerSerializableLocked(handle)
 	}
 	return Transaction{Handle: handle, XID: storage.InvalidTransactionID, Isolation: iso}, nil
 }
@@ -183,6 +246,16 @@ func (m *Manager) AssignXID(tx Transaction) (storage.TransactionID, error) {
 	}
 	state.xid = m.nextXID
 	m.nextXID++
+	// M0104-0002: stamp the new top-level XID onto the SSI
+	// bookkeeping object so future slices that key conflict
+	// records by XID can find the SerializableXact. Read-only
+	// SERIALIZABLE transactions never reach this branch and keep
+	// SerializableXact.XID == InvalidTransactionID.
+	if state.isolation == IsolationSerializable && m.ssiState.xacts != nil {
+		if sx, ok := m.ssiState.xacts[tx.Handle]; ok {
+			sx.XID = state.xid
+		}
+	}
 	return state.xid, nil
 }
 
@@ -211,7 +284,10 @@ func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 			state.snapshotXmin = s.Xmin
 		}
 		return s, nil
-	case IsolationRepeatableRead:
+	case IsolationRepeatableRead, IsolationSerializable:
+		// SERIALIZABLE shares snapshot acquisition with RR pending the
+		// predicate-lock substrate (M0104-0003); conflict detection
+		// will overlay on top of the pinned snapshot, not replace it.
 		if state.firstSnapshot == nil {
 			s := m.captureSnapshotLocked()
 			state.firstSnapshot = &s
@@ -312,6 +388,24 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 	if state.isolation != tx.Isolation {
 		return fmt.Errorf("mvcc: transaction isolation mismatch handle=%d", tx.Handle)
 	}
+	// M0104-0006: run the pre-commit dangerous-structure scan before
+	// any side effects. On detection, return a typed
+	// *SerializationFailureError so the executor can surface
+	// SQLSTATE 40001 and call Rollback to perform the actual
+	// cleanup. The transaction remains in m.active until the caller
+	// rolls back, mirroring upstream's `ereport(ERROR, ...)` flow
+	// out of `PreCommit_CheckForSerializationFailure`.
+	//
+	// Pre-commit also runs the doom-the-pivot scan that may transition
+	// peers into the doomed state; this MUST happen while the
+	// committing xact is still addressable through ssiState.xacts and
+	// BEFORE releaseSerializableLocked scrubs its edges from peers,
+	// because the scan walks `me.inConflicts -> pivot.inConflicts`.
+	if state.isolation == IsolationSerializable && kind == XactCommit {
+		if err := m.preCommitCheckForSerializationFailureLocked(tx.Handle); err != nil {
+			return err
+		}
+	}
 	// M0093: invoke the xactMarker hook only when the transaction
 	// was assigned a real XID. Read-only commits skip the hook
 	// entirely — no WAL XactCommit record, no fsync, no clog
@@ -320,6 +414,18 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 		if err := m.xactMarker(state.xid, kind); err != nil {
 			return fmt.Errorf("mvcc: xact-marker hook (xid=%d, kind=%v): %w", state.xid, kind, err)
 		}
+	}
+	// M0100-0002: track rolled-back XIDs so their rows stay invisible
+	// even after the XID falls below future snapshots' Xmin.
+	if kind == XactAbort && state.xid != storage.InvalidTransactionID {
+		m.abortedXIDs = insertSortedXID(m.abortedXIDs, state.xid)
+	}
+	// M0104-0002: release SSI bookkeeping for SERIALIZABLE
+	// transactions (commit or abort). Stamps FinishedAt with the
+	// next CommitSeqNo and deletes the entry from the registry.
+	// RC/RR transactions skip this branch.
+	if state.isolation == IsolationSerializable {
+		m.releaseSerializableLocked(tx.Handle)
 	}
 	delete(m.active, tx.Handle)
 	// Broadcast to unblock any goroutine waiting in WaitForXID.
@@ -369,6 +475,43 @@ func (m *Manager) xidInProgress(xid storage.TransactionID) bool {
 	return false
 }
 
+// IsXIDActive reports whether xid belongs to a currently-running
+// transaction. Safe to call from any goroutine; acquires m.mu
+// internally. Used by upsertOp.findInProgressConflict to detect
+// heap tuples whose xmin was materialised after the caller's snapshot
+// was captured (M0100-0002).
+func (m *Manager) IsXIDActive(xid storage.TransactionID) bool {
+	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.xidInProgress(xid)
+}
+
+
+// HasAbortedXID reports whether xid is recorded in the manager's aborted
+// set (transactions that ran Rollback). Lives next to IsXIDActive because
+// callers typically pair the two: WaitForXID returns once the xact is
+// settled, and the caller then asks "did it commit or abort?" — committed
+// is "not active AND not aborted"; aborted is HasAbortedXID. Used by the
+// FK-on-delete wait path to translate "in-flight child INSERT settled" into
+// the correct post-wait action: commit → raise 40001 in RR/Serializable,
+// abort → no FK conflict.
+func (m *Manager) HasAbortedXID(xid storage.TransactionID) bool {
+	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := len(m.abortedXIDs)
+	if n == 0 {
+		return false
+	}
+	idx := sort.Search(n, func(i int) bool { return m.abortedXIDs[i] >= xid })
+	return idx < n && m.abortedXIDs[idx] == xid
+}
+
 // XactMarker discriminates the two transaction-end markers fed to
 // the M0008 logical decoder via SetXactMarkerLogger. Mirrors the
 // upstream xact-end records.
@@ -407,6 +550,22 @@ func (m *Manager) SetXactMarkerLogger(fn func(storage.TransactionID, XactMarker)
 	m.xactMarker = fn
 }
 
+// SetRelcacheInvalPending marks the current transaction as having written to
+// a nailed catalog relation (pg_class, pg_attribute, pg_proc, or pg_type).
+// The xact-marker hook reads this flag at commit time to choose between
+// EncodeXactCommit and EncodeXactCommitInval and to unlink both
+// pg_internal.init files so the next backend reloads fresh descriptors.
+func (m *Manager) SetRelcacheInvalPending() {
+	m.relcacheInvalPending.Store(true)
+}
+
+// TakeRelcacheInvalPending atomically reads and clears the relcache-inval
+// pending flag. Returns true if the flag was set, meaning the committing
+// transaction touched a nailed catalog relation.
+func (m *Manager) TakeRelcacheInvalPending() bool {
+	return m.relcacheInvalPending.Swap(false)
+}
+
 func (m *Manager) captureSnapshotLocked() Snapshot {
 	// M0093: iterate values (not keys) and include only states
 	// whose xid has been materialised. Read-only txns contribute
@@ -427,9 +586,33 @@ func (m *Manager) captureSnapshotLocked() Snapshot {
 		xmin = m.nextXID
 	}
 	sort.Slice(inProgress, func(i, j int) bool { return inProgress[i] < inProgress[j] })
+
+	// M0100-0002: include ALL aborted XIDs in the snapshot so rolled-back
+	// rows remain invisible even when their xmin falls below Xmin.
+	// GC is deferred — the set is bounded by the number of rollbacks
+	// during the server's lifetime, which is small in practice.
+	var aborted []storage.TransactionID
+	if len(m.abortedXIDs) > 0 {
+		aborted = make([]storage.TransactionID, len(m.abortedXIDs))
+		copy(aborted, m.abortedXIDs)
+	}
+
 	return Snapshot{
 		Xmin:       xmin,
 		Xmax:       m.nextXID,
 		InProgress: inProgress,
+		Aborted:    aborted,
 	}
+}
+
+// insertSortedXID inserts xid into a sorted slice of XIDs (ascending).
+func insertSortedXID(s []storage.TransactionID, xid storage.TransactionID) []storage.TransactionID {
+	idx := sort.Search(len(s), func(i int) bool { return s[i] >= xid })
+	if idx < len(s) && s[idx] == xid {
+		return s // already present
+	}
+	s = append(s, 0)
+	copy(s[idx+1:], s[idx:])
+	s[idx] = xid
+	return s
 }

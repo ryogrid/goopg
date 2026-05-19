@@ -198,6 +198,17 @@ func (*CaseExpr) exprNode()  {}
 // NullConst is the SQL NULL literal.
 type NullConst struct{ pos int }
 
+// DefaultMarker is the row-cell sentinel for `INSERT … VALUES (…,
+// DEFAULT, …)`. It is produced by parseValuesRow when a cell is the
+// bare DEFAULT keyword; the planner's planInsert substitutes it for
+// the target column's catalog DefaultExpr (or NullConst when the
+// column has no DEFAULT). Mirrors upstream's rewriteValuesRTE pass —
+// it never reaches the executor.
+type DefaultMarker struct{ pos int }
+
+func (e *DefaultMarker) Pos() int { return e.pos }
+func (*DefaultMarker) exprNode()  {}
+
 func (e *NullConst) Pos() int { return e.pos }
 func (*NullConst) exprNode()  {}
 
@@ -242,6 +253,22 @@ type StarExpr struct {
 
 func (e *StarExpr) Pos() int { return e.pos }
 func (*StarExpr) exprNode()  {}
+
+// IndirectionStar represents the postfix `(expr).*` form: a parenthesised
+// source expression followed by `.*` indirection that expands a composite
+// (record) return value into its constituent columns. Upstream PG's
+// libpqrcv `fetch_table_list` probe uses this shape to flatten a
+// set-returning function whose return type is a composite (relid, attrs,
+// qual) tuple into three regular target-list columns. Pure parser-level
+// node; the planner is responsible for routing it into a set-expanding
+// plan (FROM-clause SRF rewrite). M0103-0008 probe-survival.
+type IndirectionStar struct {
+	pos    int
+	Source Expr
+}
+
+func (e *IndirectionStar) Pos() int { return e.pos }
+func (*IndirectionStar) exprNode()  {}
 
 // BinaryOp is `Left Op Right` for the arithmetic, string-concat,
 // comparison, and boolean operators v0 recognises.
@@ -305,10 +332,18 @@ type FuncCall struct {
 	Over     *WindowDef
 	// Filter is the optional FILTER (WHERE condition) clause (M0097-0007).
 	// Non-nil only for aggregate function calls with FILTER.
-	Filter   Expr
+	Filter Expr
 	// OrderBy is the optional ORDER BY within the aggregate argument list
 	// (M0097-0007), e.g. string_agg(x, ',' ORDER BY x).
 	OrderBy []SortBy
+	// Variadic is a parallel slice to Args. When Variadic[i] is true, the i-th
+	// argument was prefixed with the VARIADIC keyword (M0103-0008 probe-
+	// survival: libpqrcv fetch_table_list emits
+	// `pg_get_publication_tables(VARIADIC array_agg(...))`). The flag is
+	// recorded but treated as a no-op marker by callees that expect an array
+	// argument; the actual spread-to-varargs semantics is deferred until a
+	// caller needs it.
+	Variadic []bool
 }
 
 func (e *FuncCall) Pos() int { return e.pos }

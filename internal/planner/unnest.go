@@ -326,6 +326,10 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 	case *PgInputErrorInfo:
 		walkExprTree(n.Value, visit)
 		walkExprTree(n.Type, visit)
+	case *PgGetPublicationTables:
+		for _, a := range n.Args {
+			walkExprTree(a, visit)
+		}
 	case *MultiHashJoin:
 		for _, tbl := range n.Tables {
 			walkPlanExprs(tbl, visit)

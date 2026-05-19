@@ -1,0 +1,49 @@
+# go tool pprof -top -nodecount=40 -cum -base /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_select-only.mutex_base.pb.gz /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_select-only.mutex.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 12:30:43 JST
+Showing nodes accounting for 2380.82s, 99.59% of 2390.59s total
+Dropped 448 nodes (cum <= 11.95s)
+Showing top 40 nodes out of 45
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%   2282.46s 95.48%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0%     0%   2282.46s 95.48%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0%     0%   2282.46s 95.48%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+  2260.50s 94.56% 94.56%   2261.38s 94.60%  sync.(*Mutex).Unlock (partial-inline)
+    62.27s  2.60% 97.16%   2239.88s 93.70%  sync.(*RWMutex).Unlock
+         0     0% 97.16%   1761.45s 73.68%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0% 97.16%   1761.45s 73.68%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0% 97.16%   1761.45s 73.68%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0% 97.16%   1387.95s 58.06%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteFrame
+         0     0% 97.16%   1283.70s 53.70%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart
+         0     0% 97.16%   1283.21s 53.68%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart.deferwrap1
+         0     0% 97.16%   1231.12s 51.50%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func6
+         0     0% 97.16%   1101.12s 46.06%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteReadyForQuery
+         0     0% 97.16%    893.40s 37.37%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd
+         0     0% 97.16%    892.98s 37.35%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventEnd.deferwrap1
+         0     0% 97.16%    584.87s 24.47%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func7
+         0     0% 97.16%    563.51s 23.57%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 97.16%    428.52s 17.93%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).Flush
+         0     0% 97.16%    361.93s 15.14%  github.com/goopg/goopg/internal/protocol.(*FrameReader).ReadFrame
+         0     0% 97.16%    326.89s 13.67%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteFrame.func1
+         0     0% 97.16%    308.26s 12.89%  github.com/goopg/goopg/internal/protocol.(*FrameReader).ReadFrame.func1
+         0     0% 97.16%    308.26s 12.89%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func5
+         0     0% 97.16%    280.92s 11.75%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteRowDescription
+         0     0% 97.16%    152.74s  6.39%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).PutDataRowScratch
+         0     0% 97.16%    152.74s  6.39%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteDataRowReuse
+         0     0% 97.16%    122.60s  5.13%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteCommandComplete
+         0     0% 97.16%     62.29s  2.61%  github.com/goopg/goopg/internal/storage.(*Bgwriter).run
+         0     0% 97.16%     62.29s  2.61%  github.com/goopg/goopg/internal/storage.(*Pool).WriteDirtyPages
+         0     0% 97.16%     62.27s  2.60%  github.com/goopg/goopg/internal/storage.(*Bgwriter).Start.gowrap1
+    58.05s  2.43% 99.59%     58.05s  2.43%  runtime.unlock (partial-inline)
+         0     0% 99.59%     52.27s  2.19%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func4
+         0     0% 99.59%     39.40s  1.65%  github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor
+         0     0% 99.59%     24.82s  1.04%  runtime.schedule
+         0     0% 99.59%     24.34s  1.02%  runtime.findRunnable
+         0     0% 99.59%     24.22s  1.01%  github.com/goopg/goopg/internal/mvcc.(*Manager).Begin
+         0     0% 99.59%     24.01s  1.00%  runtime.mcall
+         0     0% 99.59%     21.41s   0.9%  runtime.gcstopm
+         0     0% 99.59%     19.36s  0.81%  github.com/goopg/goopg/internal/mvcc.(*Manager).Commit (inline)
+         0     0% 99.59%     19.36s  0.81%  github.com/goopg/goopg/internal/mvcc.(*Manager).finish
+         0     0% 99.59%     17.86s  0.75%  runtime.park_m

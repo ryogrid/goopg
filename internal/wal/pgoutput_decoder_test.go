@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bytes"
+	"encoding/binary"
 	"reflect"
 	"testing"
 
@@ -160,6 +161,86 @@ func TestPgoutputDecoderRejectsTruncated(t *testing.T) {
 	if _, err := DecodeMessage([]byte{pgoBegin}); err == nil {
 		t.Errorf("kind-only payload accepted")
 	}
+}
+
+
+// TestPgoutputDecoderTruncateMessage hand-crafts a pgoutput 'T'
+// frame and pins the parsed fields. M0103-0007 rung 9: goopg's
+// PgOutput encoder does not (yet) emit TRUNCATE, so we synthesise
+// the upstream wire shape directly. The byte layout mirrors
+// `logicalrep_write_truncate` in
+// postgres/src/backend/replication/logical/proto.c:
+//   'T' | nrelids(4 BE) | option_bits(1) | relid_1(4 BE) … relid_n(4 BE)
+//
+// The option_bits byte is the bitwise OR of TRUNCATE_CASCADE (0x01)
+// and TRUNCATE_RESTART_SEQS (0x02); we exercise both so the round
+// trip pins both bit positions independently.
+func TestPgoutputDecoderTruncateMessage(t *testing.T) {
+	build := func(opt byte, oids []uint32) []byte {
+		out := []byte{pgoTruncate}
+		var n [4]byte
+		binary.BigEndian.PutUint32(n[:], uint32(len(oids)))
+		out = append(out, n[:]...)
+		out = append(out, opt)
+		for _, oid := range oids {
+			var b [4]byte
+			binary.BigEndian.PutUint32(b[:], oid)
+			out = append(out, b[:]...)
+		}
+		return out
+	}
+
+	t.Run("single_relation_no_flags", func(t *testing.T) {
+		m, err := DecodeMessage(build(0, []uint32{16384}))
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if m.Kind != pgoTruncate {
+			t.Errorf("Kind=%q want T", m.Kind)
+		}
+		if got := m.TruncateRels; len(got) != 1 || got[0] != 16384 {
+			t.Errorf("TruncateRels=%v want [16384]", got)
+		}
+		if m.TruncateOption != 0 {
+			t.Errorf("TruncateOption=%d want 0", m.TruncateOption)
+		}
+	})
+
+	t.Run("multi_relation_cascade_restart", func(t *testing.T) {
+		opts := pgoTruncateCascade | pgoTruncateRestartSeqs
+		m, err := DecodeMessage(build(opts, []uint32{16384, 16385, 16386}))
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if got := m.TruncateRels; len(got) != 3 ||
+			got[0] != 16384 || got[1] != 16385 || got[2] != 16386 {
+			t.Errorf("TruncateRels=%v want [16384 16385 16386]", got)
+		}
+		if m.TruncateOption != opts {
+			t.Errorf("TruncateOption=0x%x want 0x%x", m.TruncateOption, opts)
+		}
+	})
+
+	t.Run("empty_relid_list", func(t *testing.T) {
+		// Defensive: nrelids=0 must not crash the decoder.
+		// The publisher never emits this in practice but the
+		// apply worker tolerates it as a no-op.
+		m, err := DecodeMessage(build(0, nil))
+		if err != nil {
+			t.Fatalf("decode empty: %v", err)
+		}
+		if len(m.TruncateRels) != 0 {
+			t.Errorf("TruncateRels=%v want empty", m.TruncateRels)
+		}
+	})
+
+	t.Run("truncated_after_option", func(t *testing.T) {
+		// nrelids=2 but only one relid follows — must error.
+		payload := []byte{pgoTruncate, 0, 0, 0, 2, 0, 0, 0, 0, 16}
+		if _, err := DecodeMessage(payload); err == nil {
+			t.Errorf("decode short payload: nil err want error")
+		}
+	})
 }
 
 // decodeOne parses one message off the head of *stream and

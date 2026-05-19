@@ -40,6 +40,13 @@ import (
 type StreamReplayer struct {
 	mgr *storage.Manager
 
+	// onXactReplay is an optional hook called for every commit/abort
+	// record the replayer processes. The first argument is the
+	// transaction's XID; the second is true for commit, false for
+	// abort. Used by the standby to advance the local MVCC manager's
+	// nextXID so replayed tuples become visible to queries.
+	onXactReplay func(xid storage.TransactionID, committed bool)
+
 	mu       sync.Mutex
 	applyLSN uint64
 	records  uint64
@@ -55,6 +62,17 @@ func NewStreamReplayer(mgr *storage.Manager, baselineLSN uint64) *StreamReplayer
 		panic("wal: NewStreamReplayer: nil storage manager")
 	}
 	return &StreamReplayer{mgr: mgr, applyLSN: baselineLSN}
+}
+
+// SetXactReplayHook installs a callback that is invoked for every
+// commit or abort record the replayer encounters. fn(xid, true)
+// signals a commit; fn(xid, false) signals an abort. The typical
+// standby use-case wires this to mvcc.Manager.ReplayXactCommit /
+// ReplayXactAbort so queries on the standby see replayed tuples as
+// committed (xmin < snap.Xmax) rather than as "future" XIDs.
+// Must be called before Run.
+func (sr *StreamReplayer) SetXactReplayHook(fn func(xid storage.TransactionID, committed bool)) {
+	sr.onXactReplay = fn
 }
 
 // ApplyLSN returns the LSN of the most recently applied record (or
@@ -105,6 +123,16 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 		if err != nil {
 			return fmt.Errorf("wal: stream replay record lsn[%d,%d]: %w", rec.StartLSN, rec.EndLSN, err)
 		}
+		// Notify the standby MVCC manager about commit/abort so that
+		// replayed tuples become visible to queries (standby hot-read
+		// visibility). The hook is called outside the replayer's mutex
+		// because the mvcc.Manager has its own lock; holding both would
+		// risk a deadlock with concurrent snapshot takers.
+		if sr.onXactReplay != nil {
+			if xid, committed, ok := replayedXactInfo(rec); ok {
+				sr.onXactReplay(xid, committed)
+			}
+		}
 		sr.mu.Lock()
 		sr.records++
 		if applied {
@@ -114,5 +142,29 @@ func (sr *StreamReplayer) Run(ctx context.Context, iter *RecordIterator) error {
 			sr.applyLSN = rec.EndLSN
 		}
 		sr.mu.Unlock()
+	}
+}
+
+func replayedXactInfo(rec Record) (storage.TransactionID, bool, bool) {
+	if len(rec.Payload) > 0 {
+		switch rec.Payload[0] {
+		case RecordKindXactCommit:
+			xid, err := DecodeXactMarker(rec.Payload)
+			return xid, true, err == nil
+		case RecordKindXactAbort:
+			xid, err := DecodeXactMarker(rec.Payload)
+			return xid, false, err == nil
+		}
+	}
+	if rec.XLog == nil || rec.XLog.Header.Rmid != RmgrXact {
+		return 0, false, false
+	}
+	switch rec.XLog.Header.Info & xlogXactOpMask {
+	case xlogXactCommit:
+		return storage.TransactionID(rec.XLog.Header.XID), true, true
+	case xlogXactAbort:
+		return storage.TransactionID(rec.XLog.Header.XID), false, true
+	default:
+		return 0, false, false
 	}
 }

@@ -32,7 +32,8 @@ Thumbs.db
 # Go build artifacts
 /bin/
 /dist/
-/goopg            # stray binary `go build ./...` drops at repo root
+# Stray binary that `go build ./...` drops at repo root.
+/goopg
 *.test
 *.out
 coverage.txt
@@ -75,3 +76,10 @@ pprof-data/
 
 config.json
 create_pg_super_document/
+serena/
+
+# Serena MCP tooling state (project metadata + per-project memories).
+.serena/
+
+# Scratch tree-dump from exploration tools.
+code_tree.txt

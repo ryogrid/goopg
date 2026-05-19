@@ -67,11 +67,19 @@ func (c *connTxState) InExplicit() bool {
 	return c.active
 }
 
-// Tx returns the active explicit TxnMgr transaction.
-// Only valid when InExplicit() is true.
+// Tx returns the active explicit TxnMgr transaction. When an XID was
+// materialised during the transaction (e.g. by a write), the session's
+// up-to-date Transaction (with the assigned XID) is returned so that
+// subsequent statements in the same session correctly self-see their
+// own writes (M0100-0002).
 func (c *connTxState) Tx() mvcc.Transaction {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.sess != nil {
+		if tx, _, ok := c.sess.CurrentTransaction(); ok {
+			return tx
+		}
+	}
 	return c.tx
 }
 

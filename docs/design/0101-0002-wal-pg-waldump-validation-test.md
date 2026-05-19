@@ -1,6 +1,6 @@
 # 0101-0002 — WAL pg_waldump Validation Test
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-05-13
 **Milestone:** M0101-0003
 

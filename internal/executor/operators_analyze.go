@@ -182,7 +182,7 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 		for s := uint16(1); s <= uint16(count); s++ {
 			t, perr := storage.PageGetHeapTuple(page, s)
 			if perr != nil {
-				if errors.Is(perr, storage.ErrUnsupportedItem) {
+				if errors.Is(perr, storage.ErrUnsupportedItem) || errors.Is(perr, storage.ErrInvalidSlot) {
 					continue
 				}
 				pool.Unpin(slot)

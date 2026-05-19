@@ -1,6 +1,6 @@
 # 0100-0003 — Row-Level Wait on In-Progress xmax for UPDATE/DELETE
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-05-13
 **Milestone:** M0100-0003
 **Closes:** M0096-0013 (one of the documented remaining blockers)

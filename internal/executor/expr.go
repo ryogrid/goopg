@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
@@ -115,6 +116,14 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		return evalExtract(x, slotToRow(slot), ctx)
 	case *planner.IntegerConst:
 		return Datum{Kind: KindInt, Int: x.Value}, nil
+	case *planner.TableOidExpr:
+		// `tableoid` system column for a non-partitioned base
+		// relation: the binding's table OID is fixed at plan time
+		// (resolveTableoidForBinding). Partitioned bindings instead
+		// resolve through a real ColumnRef into the per-leaf
+		// `tableoid` slot added by the partition-union wrapper.
+		// M0100-0005y.
+		return Datum{Kind: KindInt, Int: int64(x.TableOID)}, nil
 	case *planner.NumericConst:
 		m, s, err := parseNumeric(x.Value)
 		if err != nil {
@@ -144,11 +153,42 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
+		// `::regclass` is catalog-aware in both directions:
+		//   - `<oid>::regclass` renders as the relation name (PG's regclassout)
+		//   - `<text>::regclass` resolves the relation name to its numeric OID
+		// The latter is the exact pgbench probe shape:
+		//   `... WHERE oid = $1::pg_catalog.regclass`.
+		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
+			switch v.Kind {
+			case KindInt:
+				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+					if tbl, found := im.LookupTableByOID(uint32(v.Int)); found && tbl != nil {
+						return NewStringDatum(tbl.Name), nil
+					}
+				}
+			case KindString, KindStringArena:
+				schema, rel := splitQualifiedTable(v.StringValue())
+				if tbl, found := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel}); found && tbl != nil {
+					return NewIntDatum(int64(tbl.OID)), nil
+				}
+			}
+		}
 		return evalCastTyped(v, x.TargetType, x.SourceType, x.Pos())
 	case *planner.BinaryOp:
 		left, err := evalExprSlot(x.Left, slot, ctx)
 		if err != nil {
 			return Datum{}, err
+		}
+		// Short-circuit: AND returns FALSE immediately when left is FALSE;
+		// OR returns TRUE immediately when left is TRUE. Matches PostgreSQL.
+		if x.Op == parser.OpAnd {
+			if left.Kind == KindBool && !left.BoolValue() {
+				return left, nil // FALSE AND _ = FALSE
+			}
+		} else if x.Op == parser.OpOr {
+			if left.Kind == KindBool && left.BoolValue() {
+				return left, nil // TRUE OR _ = TRUE
+			}
 		}
 		right, err := evalExprSlot(x.Right, slot, ctx)
 		if err != nil {
@@ -332,12 +372,12 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		// scale-aligning helpers.  Also try to parse string
 		// operands as numeric (columns loaded via INSERT may be
 		// stored as strings before the type system enforces types).
-		if (left.Kind == KindString || left.Kind == KindStringArena) {
+		if left.Kind == KindString || left.Kind == KindStringArena {
 			if m, s, err := parseNumeric(left.StringValue()); err == nil {
 				left = newNumeric(m, int(s))
 			}
 		}
-		if (right.Kind == KindString || right.Kind == KindStringArena) {
+		if right.Kind == KindString || right.Kind == KindStringArena {
 			if m, s, err := parseNumeric(right.StringValue()); err == nil {
 				right = newNumeric(m, int(s))
 			}
@@ -1198,6 +1238,27 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		default:
 			return d, nil
 		}
+	case "regclass":
+		// `oid::regclass` renders as the relation name (matches PG's
+		// regclassout). The catalog lookup happens at evalFuncCall's
+		// `regclass` arm for string→OID; here we cover the
+		// CastExpr path used by `tableoid::regclass` for the
+		// `tableoid` system column. KindInt input is the OID; we
+		// resolve via the executor's catalog (see CastExpr eval-site
+		// note below) and emit the qualified relname as a string.
+		// String input (e.g. `'pg_class'::regclass`) is delegated to
+		// the function-call path which already handles it.
+		// M0100-0005y.
+		if d.Kind == KindInt {
+			// The catalog isn't reachable from evalCast's signature;
+			// stash the OID as KindRegClass so the wire formatter (or
+			// upstream evalCastTyped wrapper) can render it. Until
+			// formatter support lands, return the raw integer — the
+			// CastExpr operand path in evalExprSlot will route through
+			// evalRegclassCast for the tableoid OID lookup.
+			return d, nil
+		}
+		return d, nil
 	case "date":
 		// Cast to date: truncate KindTime to midnight UTC, parse strings as dates. M0097-0004.
 		if d.Kind == KindString || d.Kind == KindStringArena {
@@ -1698,55 +1759,55 @@ func evalToChar(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 func pgToCharToGoFormat(pg string) string {
 	replacer := strings.NewReplacer(
 		"YYYY", "2006",
-		"YYY",  "006",
-		"YY",   "06",
-		"Y",    "6",
+		"YYY", "006",
+		"YY", "06",
+		"Y", "6",
 		"IYYY", "2006", // ISO year — approximate
-		"IYY",  "006",
-		"IY",   "06",
-		"I",    "6",
-		"MM",   "01",
-		"MON",  "Jan",
-		"Mon",  "Jan",
-		"mon",  "jan",
-		"MONTH","January",
-		"Month","January",
-		"month","january",
-		"DD",   "02",
-		"D",    "1",    // day of week 1=Sun PostgreSQL, Go: Mon=1
-		"DAY",  "Monday",
-		"Day",  "Monday",
-		"day",  "monday",
-		"DY",   "Mon",
-		"Dy",   "Mon",
-		"dy",   "mon",
+		"IYY", "006",
+		"IY", "06",
+		"I", "6",
+		"MM", "01",
+		"MON", "Jan",
+		"Mon", "Jan",
+		"mon", "jan",
+		"MONTH", "January",
+		"Month", "January",
+		"month", "january",
+		"DD", "02",
+		"D", "1", // day of week 1=Sun PostgreSQL, Go: Mon=1
+		"DAY", "Monday",
+		"Day", "Monday",
+		"day", "monday",
+		"DY", "Mon",
+		"Dy", "Mon",
+		"dy", "mon",
 		"HH24", "15",
 		"HH12", "03",
-		"HH",   "03",
-		"MI",   "04",
-		"SS",   "05",
-		"MS",   "000",  // milliseconds
-		"US",   "000000", // microseconds
-		"TZ",   "UTC",  // always UTC in v0
-		"tz",   "utc",
-		"TZH",  "-07",
-		"TZM",  "00",
-		"AM",   "PM",
-		"PM",   "PM",
-		"am",   "pm",
-		"pm",   "pm",
+		"HH", "03",
+		"MI", "04",
+		"SS", "05",
+		"MS", "000", // milliseconds
+		"US", "000000", // microseconds
+		"TZ", "UTC", // always UTC in v0
+		"tz", "utc",
+		"TZH", "-07",
+		"TZM", "00",
+		"AM", "PM",
+		"PM", "PM",
+		"am", "pm",
+		"pm", "pm",
 		"A.M.", "PM",
 		"P.M.", "PM",
-		"Q",    "",     // quarter — not supported in Go format
-		"WW",   "",     // week of year — not directly supported
-		"IW",   "",     // ISO week
-		"CC",   "",     // century
-		"J",    "",     // Julian day
-		"SSSSS","",     // seconds past midnight
+		"Q", "", // quarter — not supported in Go format
+		"WW", "", // week of year — not directly supported
+		"IW", "", // ISO week
+		"CC", "", // century
+		"J", "", // Julian day
+		"SSSSS", "", // seconds past midnight
 		"SSSS", "",
-		"Y,YYY","",     // year with comma
-		"OF",   "-07:00",
-		"TZO",  "-07:00",
+		"Y,YYY", "", // year with comma
+		"OF", "-07:00",
+		"TZO", "-07:00",
 	)
 	return replacer.Replace(pg)
 }
@@ -2203,6 +2264,11 @@ func existsImpl(x *planner.ExistsExpr, ctx *Context) (Datum, error) {
 	op, err := Build(x.Plan)
 	if err != nil {
 		return Datum{}, err
+	}
+	// EXISTS only needs the first row — limit lockRowsOp drain to 1 so
+	// it does not scan the full inner table (matching PostgreSQL). M0100-0005.
+	if lop, ok := op.(*lockRowsOp); ok {
+		lop.maxDrain = 1
 	}
 	if err := op.Open(ctx); err != nil {
 		_ = op.Close()
@@ -2970,11 +3036,28 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_proc":
 		return NullDatum, nil
 	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace":
-		// Type cast functions — return the argument as-is (stub).
-		if len(x.Args) == 1 {
-			return evalExpr(x.Args[0], row, ctx)
+		// Type cast functions. For regclass specifically, resolve a
+		// text relation name to the table's numeric OID via the
+		// catalog (matches PG semantics post M0103-0008 rung 16,
+		// after pg_class.oid was flipped from text-name to numeric).
+		// Numeric inputs pass through. Other reg* casts remain
+		// stubs returning the argument as-is.
+		if len(x.Args) != 1 {
+			return NullDatum, nil
 		}
-		return NullDatum, nil
+		v, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || v.IsNull() {
+			return v, err
+		}
+		if name == "regclass" && v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
+			s := v.StringValue()
+			schema, rel := splitQualifiedTable(s)
+			tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel})
+			if ok && tbl != nil {
+				return NewIntDatum(int64(tbl.OID)), nil
+			}
+		}
+		return v, nil
 
 	// ── String functions (M0097-0005) ─────────────────────────────────────
 	case "repeat":
@@ -3794,6 +3877,23 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
 	case "localtimestamp":
 		return NewTimeDatum(ctx.Now), nil
+	case "pg_is_in_recovery":
+		return NewBoolDatum(ctx.IsStandby), nil
+	case "pg_promote":
+		// pg_promote(wait boolean DEFAULT true, wait_seconds integer DEFAULT 60)
+		// Returns true if this server is a standby and promotion was triggered.
+		// Returns false without error when not a standby (mirrors upstream).
+		if ctx.Promote == nil {
+			return NewBoolDatum(false), nil
+		}
+		if err := ctx.Promote(); err != nil {
+			return Datum{}, &ExecError{
+				Code:    "XX000",
+				Pos:     x.Pos(),
+				Message: "pg_promote: " + err.Error(),
+			}
+		}
+		return NewBoolDatum(true), nil
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.

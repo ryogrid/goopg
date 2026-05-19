@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -112,6 +114,603 @@ func TestApplyWorkerInsertsRowFromPgoutputStream(t *testing.T) {
 	}
 	if rows[0][1].StringValue() != "alpha" {
 		t.Errorf("col[1]=%q want alpha", rows[0][1].StringValue())
+	}
+}
+
+
+// TestPrimaryKeyOnlyRow pins the partial-key helper that applyUpdate
+// falls back on when pgoutput omits OldTuple (REPLICA IDENTITY DEFAULT
+// + key columns unchanged): the synthesised key row carries PK column
+// values from `full`, with NullDatum in every non-PK position so
+// rowMatchesKey ignores non-PK cells.
+//
+// Design doc: docs/design/0103-0025-m0103-0007-rung-2-pg-to-goopg-full-dml.md.
+func TestPrimaryKeyOnlyRow(t *testing.T) {
+	cat := catalog.NewInMemory()
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No PK yet → helper returns nil so callers fall back to
+	// "cannot synthesise a key, skip the UPDATE".
+	if got := primaryKeyOnlyRow(cat, tbl, Row{NewIntDatum(7), NewStringDatum("alpha")}); got != nil {
+		t.Errorf("no-PK case: got %v want nil", got)
+	}
+
+	if _, err := cat.CreateIndex(parser.ObjectName{Name: "t_pkey"}, tbl,
+		[]string{"id"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+
+	key := primaryKeyOnlyRow(cat, tbl, Row{NewIntDatum(7), NewStringDatum("alpha")})
+	if key == nil {
+		t.Fatal("PK present: got nil key")
+	}
+	if got := key[0].Int; got != 7 {
+		t.Errorf("key[0].Int = %d want 7", got)
+	}
+	if !key[1].IsNull() {
+		t.Errorf("key[1] = %v want NullDatum (non-PK position must be NULL)", key[1])
+	}
+}
+
+// TestReplicaIdentityKeyRow pins the rung-12 (M0103-0007) helper that
+// supersedes `primaryKeyOnlyRow` in `applyUpdate`'s no-OldTuple branch.
+// `replicaIdentityKeyRow` consults the publisher's per-column identity
+// flags (`Flags & 0x01 == LOGICALREP_IS_REPLICA_IDENTITY`) rather than
+// the subscriber-side catalog, so REPLICA IDENTITY USING INDEX on a
+// non-PK unique index resolves to the right row-locator key regardless
+// of whether the subscriber declares a PK.
+//
+// Design doc:
+// docs/design/0103-0035-m0103-0007-rung-12-pg-to-goopg-replica-identity-index.md.
+func TestReplicaIdentityKeyRow(t *testing.T) {
+	localCols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+	}
+	newRow := Row{NewIntDatum(7), NewIntDatum(42), NewStringDatum("alpha")}
+
+	t.Run("pk_columns_flagged", func(t *testing.T) {
+		remoteCols := []wal.DecodedAttr{
+			{Name: "id", TypeOID: 23, Flags: 0x01}, // PK column
+			{Name: "a", TypeOID: 23, Flags: 0x00},
+			{Name: "v", TypeOID: 25, Flags: 0x00},
+		}
+		key := replicaIdentityKeyRow(remoteCols, localCols, newRow)
+		if key == nil {
+			t.Fatal("got nil, want non-nil key (PK flag set)")
+		}
+		if key[0].Int != 7 {
+			t.Errorf("key[0].Int = %d want 7 (id)", key[0].Int)
+		}
+		if !key[1].IsNull() {
+			t.Errorf("key[1] = %v want NullDatum (a is non-identity)", key[1])
+		}
+		if !key[2].IsNull() {
+			t.Errorf("key[2] = %v want NullDatum (v is non-identity)", key[2])
+		}
+	})
+
+	t.Run("non_pk_unique_index_columns_flagged", func(t *testing.T) {
+		// REPLICA IDENTITY USING INDEX on a composite unique (a, v).
+		// `id` is NOT flagged — even if the subscriber declares it as
+		// PRIMARY KEY, the key row must restrict to (a, v).
+		remoteCols := []wal.DecodedAttr{
+			{Name: "id", TypeOID: 23, Flags: 0x00},
+			{Name: "a", TypeOID: 23, Flags: 0x01},
+			{Name: "v", TypeOID: 25, Flags: 0x01},
+		}
+		key := replicaIdentityKeyRow(remoteCols, localCols, newRow)
+		if key == nil {
+			t.Fatal("got nil, want non-nil key (non-PK identity flags set)")
+		}
+		if !key[0].IsNull() {
+			t.Errorf("key[0] = %v want NullDatum (id is non-identity in USING INDEX)", key[0])
+		}
+		if key[1].Int != 42 {
+			t.Errorf("key[1].Int = %d want 42 (a is identity)", key[1].Int)
+		}
+		if key[2].StringValue() != "alpha" {
+			t.Errorf("key[2] = %q want \"alpha\" (v is identity)", key[2].StringValue())
+		}
+	})
+
+	t.Run("no_flags_returns_nil", func(t *testing.T) {
+		remoteCols := []wal.DecodedAttr{
+			{Name: "id", TypeOID: 23, Flags: 0x00},
+			{Name: "a", TypeOID: 23, Flags: 0x00},
+			{Name: "v", TypeOID: 25, Flags: 0x00},
+		}
+		// All-zero Flags is the "REPLICA IDENTITY NOTHING" / corrupt
+		// stream case; applyUpdate falls back to primaryKeyOnlyRow.
+		if got := replicaIdentityKeyRow(remoteCols, localCols, newRow); got != nil {
+			t.Errorf("no-flags case: got %v want nil", got)
+		}
+	})
+
+	t.Run("row_length_mismatch_returns_nil", func(t *testing.T) {
+		remoteCols := []wal.DecodedAttr{
+			{Name: "id", TypeOID: 23, Flags: 0x01},
+		}
+		// newRow shorter than localCols — defensive guard against
+		// callers passing partially-built rows.
+		short := Row{NewIntDatum(7)}
+		if got := replicaIdentityKeyRow(remoteCols, localCols, short); got != nil {
+			t.Errorf("row-length mismatch: got %v want nil", got)
+		}
+	})
+}
+
+// TestApplyWorkerDecodeReturnsUnchangedMask pins the rung-5 contract:
+// `decodePgoutputTupleAsRow` accepts the upstream `'u'` (unchanged
+// TOAST) per-column status code, returns NullDatum for that slot, and
+// reports the slot in the parallel `unchanged` mask so a downstream
+// UPDATE apply can fill the cell from the matched heap row before
+// insert. The earlier rungs only exercised `'t'` and `'n'`.
+//
+// Design doc: docs/design/0103-0028-m0103-0007-rung-5-pg-to-goopg-toast-unchanged.md.
+func TestApplyWorkerDecodeReturnsUnchangedMask(t *testing.T) {
+	remoteCols := []wal.DecodedAttr{
+		{Name: "id", TypeOID: 23},      // int4
+		{Name: "name", TypeOID: 25},    // text
+		{Name: "payload", TypeOID: 25}, // text
+	}
+	localCols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "name", Type: catalog.Type{Name: "text"}},
+		{Name: "payload", Type: catalog.Type{Name: "text"}},
+	}
+	tup := []wal.DecodedColumn{
+		{Status: 't', Bytes: []byte("42")},
+		{Status: 'n', Bytes: nil},
+		{Status: 'u', Bytes: nil},
+	}
+	row, unchanged, missing, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(row) != 3 || len(unchanged) != 3 || len(missing) != 3 {
+		t.Fatalf("row=%d unchanged=%d missing=%d want all 3", len(row), len(unchanged), len(missing))
+	}
+	if row[0].Int != 42 {
+		t.Errorf("row[0].Int=%d want 42", row[0].Int)
+	}
+	if !row[1].IsNull() {
+		t.Errorf("row[1] should be NullDatum (status 'n'), got %v", row[1])
+	}
+	if !row[2].IsNull() {
+		t.Errorf("row[2] should be NullDatum (status 'u'), got %v", row[2])
+	}
+	if got := []bool{unchanged[0], unchanged[1], unchanged[2]}; got[0] || got[1] || !got[2] {
+		t.Errorf("unchanged=%v want [false false true]", got)
+	}
+	// Every local column was claimed by a remote attribute, so
+	// missing[] is all-false. The subscriber-extra case is exercised
+	// by TestApplyWorkerDecodeMarksSubscriberExtraAsMissing below.
+	if missing[0] || missing[1] || missing[2] {
+		t.Errorf("missing=%v want [false false false]", missing)
+	}
+
+	// Unknown status still errors.
+	tupBad := []wal.DecodedColumn{
+		{Status: 'x', Bytes: nil},
+	}
+	if _, _, _, err := decodePgoutputTupleAsRow(remoteCols[:1], localCols[:1], tupBad); err == nil {
+		t.Errorf("unknown status: expected error, got nil")
+	}
+}
+
+
+// TestApplyWorkerDecodeRemapsReorderedColumns pins M0103-0007 rung 10:
+// when publisher and subscriber declare the same columns in a different
+// physical order, decodePgoutputTupleAsRow must look up local positions
+// by name (matching PG's apply worker behaviour) rather than blindly
+// copying remote ordinal i → local ordinal i. Without the fix the int4
+// 'id' value would land in the local text 'v' slot and parsePgoutputText
+// would parse "alice" as int4, returning an error.
+func TestApplyWorkerDecodeRemapsReorderedColumns(t *testing.T) {
+	remoteCols := []wal.DecodedAttr{
+		{Name: "id", TypeOID: 23},
+		{Name: "v", TypeOID: 25},
+	}
+	// Local table declares v BEFORE id — different physical order.
+	localCols := []catalog.Column{
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	}
+	tup := []wal.DecodedColumn{
+		{Status: 't', Bytes: []byte("7")},
+		{Status: 't', Bytes: []byte("alice")},
+	}
+	row, _, _, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(row) != 2 {
+		t.Fatalf("row len=%d want 2", len(row))
+	}
+	// Row is indexed by LOCAL position: row[0] holds v (text "alice"),
+	// row[1] holds id (int 7).
+	if row[0].IsNull() || string(row[0].Buf) != "alice" {
+		t.Errorf("row[0] (local v) = %#v, want text \"alice\"", row[0])
+	}
+	if row[1].Int != 7 {
+		t.Errorf("row[1] (local id) = %#v, want int 7", row[1])
+	}
+}
+
+// TestApplyWorkerDecodeRejectsUnmatchedRemoteCol guards the symmetric
+// error path: if the publisher carries a column the subscriber's table
+// doesn't have, the decoder must refuse rather than silently dropping
+// the wire byte. PG's apply worker raises the same error condition.
+func TestApplyWorkerDecodeRejectsUnmatchedRemoteCol(t *testing.T) {
+	remoteCols := []wal.DecodedAttr{
+		{Name: "id", TypeOID: 23},
+		{Name: "extra_on_publisher", TypeOID: 25},
+	}
+	localCols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+	}
+	tup := []wal.DecodedColumn{
+		{Status: 't', Bytes: []byte("1")},
+		{Status: 't', Bytes: []byte("x")},
+	}
+	_, _, _, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
+	if err == nil {
+		t.Fatalf("expected error for unmatched remote col, got nil")
+	}
+	if !strings.Contains(err.Error(), "extra_on_publisher") {
+		t.Errorf("error %q must mention the unmatched col name", err.Error())
+	}
+}
+
+
+// TestApplyWorkerDecodeMarksSubscriberExtraAsMissing pins M0103-0007 rung 11:
+// when the subscriber declares a column the publisher does not include in its
+// Relation message, the decoder must mark that local position as missing[]
+// (and leave the row cell NullDatum). applyUpdateByKey uses the mask to
+// preserve the subscriber-only value across replicated UPDATEs.
+func TestApplyWorkerDecodeMarksSubscriberExtraAsMissing(t *testing.T) {
+	remoteCols := []wal.DecodedAttr{
+		{Name: "id", TypeOID: 23},
+		{Name: "v", TypeOID: 25},
+	}
+	// Subscriber declares an extra `note` column the publisher knows
+	// nothing about.
+	localCols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+		{Name: "note", Type: catalog.Type{Name: "text"}},
+	}
+	tup := []wal.DecodedColumn{
+		{Status: 't', Bytes: []byte("1")},
+		{Status: 't', Bytes: []byte("hello")},
+	}
+	row, unchanged, missing, err := decodePgoutputTupleAsRow(remoteCols, localCols, tup)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(row) != 3 || len(unchanged) != 3 || len(missing) != 3 {
+		t.Fatalf("row=%d unchanged=%d missing=%d want all 3", len(row), len(unchanged), len(missing))
+	}
+	if row[0].Int != 1 {
+		t.Errorf("row[0].Int=%d want 1", row[0].Int)
+	}
+	if string(row[1].Buf) != "hello" {
+		t.Errorf("row[1] = %q want \"hello\"", string(row[1].Buf))
+	}
+	if !row[2].IsNull() {
+		t.Errorf("row[2] (subscriber-extra note) should be NullDatum, got %v", row[2])
+	}
+	if unchanged[0] || unchanged[1] || unchanged[2] {
+		t.Errorf("unchanged=%v want all-false (no 'u' status cells)", unchanged)
+	}
+	if missing[0] || missing[1] {
+		t.Errorf("missing[0]/[1] should be false (claimed by remote), got missing=%v", missing)
+	}
+	if !missing[2] {
+		t.Errorf("missing[2] (subscriber-extra note) should be true, got missing=%v", missing)
+	}
+}
+
+// TestApplyUpdateByKeyPreservesSubscriberExtraColumn pins M0103-0007 rung 11
+// end-to-end against the executor's heap path: a row with a subscriber-only
+// column populated, then a publisher UPDATE arrives carrying only the
+// publisher-known columns. applyUpdateByKey must scan for the matched row,
+// copy the subscriber-only value into newRow before delete+insert, and the
+// post-update heap state must preserve the subscriber-only value.
+func TestApplyUpdateByKeyPreservesSubscriberExtraColumn(t *testing.T) {
+	// Build a subscriber-side storage fixture and create a table whose
+	// shape includes a subscriber-only `note` column the publisher will
+	// never describe in its Relation message.
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 16})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	// Cleanup order matters: Pool.Close flushes dirty pages through the
+	// Manager, so it must run BEFORE Manager.Close (deferred LIFO).
+	t.Cleanup(func() {
+		_ = pool.Close()
+		_ = mgr.Close()
+	})
+	cat := catalog.NewInMemory()
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true, Ordinal: 0},
+		{Name: "v", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+		{Name: "note", Type: catalog.Type{Name: "text"}, Ordinal: 2},
+	})
+	if err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	mgrMVCC := mvcc.NewManager()
+
+	// Seed an initial row with all three columns populated (id=1, v="hello",
+	// note="kept"). This is the pre-image the publisher UPDATE will replace.
+	seedTx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		t.Fatalf("begin seed: %v", err)
+	}
+	ctx := NewContext()
+	ctx.Pool = pool
+	ctx.Catalog = cat
+	ctx.TxnMgr = mgrMVCC
+	ctx.Tx = seedTx
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		t.Fatalf("materialize seed xid: %v", err)
+	}
+	rel := cat.RelFileNode(tbl)
+	seed := Row{NewIntDatum(1), NewStringDatum("hello"), NewStringDatum("kept")}
+	if _, err := writeHeapRowReturning(ctx, rel, tbl.Columns, seed); err != nil {
+		t.Fatalf("seed writeHeapRow: %v", err)
+	}
+	if err := mgrMVCC.Commit(seedTx); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	// Apply path: publisher knows (id, v) only. newRow has the new v at
+	// position 1 and NullDatum at note's local position; newMissing[2]
+	// flags note as a subscriber-extra column that must survive the UPDATE.
+	applyTx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		t.Fatalf("begin apply: %v", err)
+	}
+	ctx2 := NewContext()
+	ctx2.Pool = pool
+	ctx2.Catalog = cat
+	ctx2.TxnMgr = mgrMVCC
+	ctx2.Tx = applyTx
+	if err := ctx2.MaterializeWriterXID(); err != nil {
+		t.Fatalf("materialize apply xid: %v", err)
+	}
+	snap, _ := mgrMVCC.SnapshotFor(ctx2.Tx)
+	ctx2.Snap = snap
+
+	oldKey := Row{NewIntDatum(1), NullDatum, NullDatum}
+	newRow := Row{NewIntDatum(1), NewStringDatum("updated"), NullDatum}
+	newUnchanged := []bool{false, false, false}
+	newMissing := []bool{false, false, true}
+
+	if err := applyUpdateByKey(ctx2, rel, tbl, tbl.Columns, oldKey, newRow, newUnchanged, newMissing); err != nil {
+		t.Fatalf("applyUpdateByKey: %v", err)
+	}
+	if err := mgrMVCC.Commit(applyTx); err != nil {
+		t.Fatalf("commit apply: %v", err)
+	}
+
+	// Inspect via a fresh read-only transaction.
+	readTx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		t.Fatalf("begin read: %v", err)
+	}
+	defer mgrMVCC.Rollback(readTx)
+	rsnap, _ := mgrMVCC.SnapshotFor(readTx)
+	scanCtx := NewContext()
+	scanCtx.Pool = pool
+	scanCtx.Catalog = cat
+	scanCtx.TxnMgr = mgrMVCC
+	scanCtx.Tx = readTx
+	scanCtx.Snap = rsnap
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(scanCtx); err != nil {
+		t.Fatalf("seqscan open: %v", err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("visible rows=%d want 1: %#v", len(rows), rows)
+	}
+	r := rows[0]
+	if r[0].Int != 1 {
+		t.Errorf("row id=%d want 1", r[0].Int)
+	}
+	if r[1].StringValue() != "updated" {
+		t.Errorf("row v=%q want \"updated\"", r[1].StringValue())
+	}
+	if r[2].StringValue() != "kept" {
+		t.Errorf("row note=%q want \"kept\" (subscriber-only column must survive UPDATE)", r[2].StringValue())
+	}
+}
+
+// TestApplyWorkerInsertRejectsUnchangedToast pins the defensive
+// rejection at the INSERT path. pgoutput's encoder never emits 'u'
+// for INSERT (there is no pre-image to inherit from); a corrupt
+// stream that did so must not silently install a NULL.
+//
+// Design doc: docs/design/0103-0028-m0103-0007-rung-5-pg-to-goopg-toast-unchanged.md.
+func TestApplyWorkerInsertRejectsUnchangedToast(t *testing.T) {
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+	subTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "items"})
+	rel := subCat.RelFileNode(subTbl)
+
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	defer w.SafeRollback()
+
+	// Drive Begin → Relation → Insert directly via synthesized
+	// DecodedMessage values; no wire-encoder helper required.
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'B', XID: 99, CommitLSN: 0xBEEF,
+	}); err != nil {
+		t.Fatalf("Begin apply: %v", err)
+	}
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'R',
+		Relation: &wal.DecodedRelation{
+			OID:    rel.RelOid,
+			Schema: "public",
+			Name:   "items",
+			Columns: []wal.DecodedAttr{
+				{Name: "id", TypeOID: 23},
+				{Name: "label", TypeOID: 25},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Relation apply: %v", err)
+	}
+	// INSERT with a 'u' cell — encoder would never emit this; we
+	// build it by hand to confirm the apply-side defensive check.
+	insertMsg := &wal.DecodedMessage{
+		Kind:   'I',
+		RelOID: rel.RelOid,
+		NewTuple: []wal.DecodedColumn{
+			{Status: 't', Bytes: []byte("1")},
+			{Status: 'u', Bytes: nil},
+		},
+	}
+	if _, err := w.ApplyMessage(insertMsg); err == nil {
+		t.Errorf("expected INSERT-with-'u' to be rejected, got nil error")
+	}
+}
+
+
+// TestApplyWorkerTruncate pins M0103-0007 rung 9: the apply worker
+// handles pgoutput 'T' (TRUNCATE) frames by stamping xmax on every
+// visible tuple in each named relation, transactional with the
+// surrounding apply xact. After Begin → Relation → Insert(x2) →
+// Truncate → Commit, a fresh-snapshot SeqScan must observe zero
+// rows.
+//
+// The 'T' message is synthesised directly because goopg's PgOutput
+// encoder does not (yet) emit TRUNCATE; we only consume the wire
+// shape on the apply side.
+func TestApplyWorkerTruncate(t *testing.T) {
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+	subTbl, _ := subCat.LookupTable(parser.ObjectName{Name: "items"})
+	rel := subCat.RelFileNode(subTbl)
+
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	defer w.SafeRollback()
+
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'B', XID: 100, CommitLSN: 0xD00D,
+	}); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'R',
+		Relation: &wal.DecodedRelation{
+			// Schema left empty to match the fixture's unqualified
+			// table — LookupTable falls back to the default schema
+			// when Schema is "".
+			OID: rel.RelOid, Name: "items",
+			Columns: []wal.DecodedAttr{
+				{Name: "id", TypeOID: 23},
+				{Name: "label", TypeOID: 25},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("Relation: %v", err)
+	}
+	for _, pair := range [][2]string{{"1", "alpha"}, {"2", "beta"}} {
+		if _, err := w.ApplyMessage(&wal.DecodedMessage{
+			Kind: 'I', RelOID: rel.RelOid,
+			NewTuple: []wal.DecodedColumn{
+				{Status: 't', Bytes: []byte(pair[0])},
+				{Status: 't', Bytes: []byte(pair[1])},
+			},
+		}); err != nil {
+			t.Fatalf("Insert(%s): %v", pair[0], err)
+		}
+	}
+
+	// TRUNCATE message naming the same relation. CASCADE bit set
+	// to exercise the option-byte plumbing (the apply worker
+	// records the option but takes no extra action — CASCADE
+	// resolution happens publisher-side).
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind:           'T',
+		TruncateRels:   []uint32{rel.RelOid},
+		TruncateOption: 0x01,
+	}); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'C', CommitLSN: 0xD00D, EndLSN: 0xD00D,
+	}); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	// Fresh snapshot — the just-committed xact's xmax stamps
+	// must mark both rows dead.
+	tx, _ := subCtx.TxnMgr.Begin(0)
+	defer subCtx.TxnMgr.Rollback(tx)
+	snap2, _ := subCtx.TxnMgr.SnapshotFor(tx)
+	scanCtx := NewContext()
+	scanCtx.Pool = subCtx.Pool
+	scanCtx.Catalog = subCat
+	scanCtx.TxnMgr = subCtx.TxnMgr
+	scanCtx.Tx = tx
+	scanCtx.Snap = snap2
+	scan := newSeqScanOp(&planner.SeqScan{Table: subTbl})
+	if err := scan.Open(scanCtx); err != nil {
+		t.Fatalf("scan open: %v", err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatalf("drainScan: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("post-TRUNCATE scan returned %d rows want 0", len(rows))
+	}
+}
+
+// TestApplyWorkerTruncateUnknownRelOid pins the apply-time rejection
+// path: a 'T' message naming an OID for which no prior 'R' was seen
+// must error instead of silently no-oping. This is the same policy
+// applyDelete / applyUpdate take and protects against
+// publisher/subscriber catalog drift hiding a data-loss outcome.
+func TestApplyWorkerTruncateUnknownRelOid(t *testing.T) {
+	subCtx, subCat, subCleanup := newStorageFixture(t)
+	defer subCleanup()
+
+	w := NewApplyWorker(subCat, subCtx.Pool, subCtx.TxnMgr)
+	defer w.SafeRollback()
+
+	if _, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind: 'B', XID: 101, CommitLSN: 0xBEEF,
+	}); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	// No 'R' for OID 99999 — the TRUNCATE handler must reject.
+	_, err := w.ApplyMessage(&wal.DecodedMessage{
+		Kind:         'T',
+		TruncateRels: []uint32{99999},
+	})
+	if err == nil {
+		t.Errorf("expected error for unknown rel_oid, got nil")
 	}
 }
 
@@ -617,4 +1216,56 @@ func TestApplyWorkerCommitWithoutPromotionLeavesUncrossedRelAtS(t *testing.T) {
 		t.Errorf("state=%q want s (commit below sync-end LSN must not promote)", got.State)
 	}
 	_ = subTbl // silence unused if scan removed
+}
+
+// TestApplyDefaultsForMissingFillsSlots pins M0103-0007 rung 13's helper.
+// Subscriber-extra columns flagged missing[i]=true should be filled by
+// evaluating the column's DefaultExpr; columns without a DEFAULT stay at
+// their incoming value (typically NullDatum from the pgoutput decoder).
+func TestApplyDefaultsForMissingFillsSlots(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "v", Type: catalog.Type{Name: "text"}},
+		// Subscriber-extra: has a DEFAULT we'll evaluate.
+		{Name: "note", Type: catalog.Type{Name: "text"},
+			DefaultExpr: &parser.StringConst{Value: "kept"}},
+		// Subscriber-extra: NO DEFAULT — stays NullDatum.
+		{Name: "n", Type: catalog.Type{Name: "int4"}},
+	}
+	row := Row{NewIntDatum(1), NewStringDatum("hello"), NullDatum, NullDatum}
+	missing := []bool{false, false, true, true}
+
+	applyDefaultsForMissing(cols, row, missing)
+
+	if row[0].Int != 1 {
+		t.Errorf("row[0] mutated: got %v want 1", row[0])
+	}
+	if string(row[1].Buf) != "hello" {
+		t.Errorf("row[1] mutated: got %q want \"hello\"", row[1].Buf)
+	}
+	if string(row[2].Buf) != "kept" {
+		t.Errorf("row[2] not filled: got %v want \"kept\"", row[2])
+	}
+	if !row[3].IsNull() {
+		t.Errorf("row[3] (no DEFAULT) should stay NullDatum, got %v", row[3])
+	}
+}
+
+// TestApplyDefaultsForMissingIgnoresFalseMask: a slot that is NOT missing
+// is NEVER overwritten, even when the column carries a DEFAULT (the
+// publisher's value wins).
+func TestApplyDefaultsForMissingIgnoresFalseMask(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "v", Type: catalog.Type{Name: "text"},
+			DefaultExpr: &parser.StringConst{Value: "DEFAULT-VALUE"}},
+	}
+	row := Row{NewIntDatum(1), NewStringDatum("publisher-value")}
+	missing := []bool{false, false}
+
+	applyDefaultsForMissing(cols, row, missing)
+
+	if string(row[1].Buf) != "publisher-value" {
+		t.Errorf("row[1] overwritten despite missing[1]=false: got %q", row[1].Buf)
+	}
 }

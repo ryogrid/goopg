@@ -1,0 +1,234 @@
+# go tool pprof -top -nodecount=40 -cum  /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c50_standard.allocs.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: alloc_space
+Time: 2026-05-18 12:26:26 JST
+Showing nodes accounting for 14927.68MB, 67.58% of 22089.79MB total
+Dropped 309 nodes (cum <= 110.45MB)
+Showing top 40 nodes out of 120
+      flat  flat%   sum%        cum   cum%
+         0     0%     0% 18676.82MB 84.55%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+       1MB 0.0045% 0.0045% 18676.82MB 84.55%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0% 0.0045% 18671.32MB 84.52%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0% 0.0045% 18329.80MB 82.98%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0% 0.0045% 18151.29MB 82.17%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+      22MB   0.1%   0.1% 17955.28MB 81.28%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+      54MB  0.24%  0.35% 11605.66MB 52.54%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0%  0.35%  9596.72MB 43.44%  github.com/goopg/goopg/internal/executor.(*updateOp).Next
+         0     0%  0.35%  9596.72MB 43.44%  github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex
+         0     0%  0.35%  9032.51MB 40.89%  github.com/goopg/goopg/internal/executor.tryApplyHOTUpdate
+         0     0%  0.35%  5737.97MB 25.98%  github.com/goopg/goopg/internal/executor.markHeapPruneOptDirty
+  868.25MB  3.93%  4.28%  5737.97MB 25.98%  github.com/goopg/goopg/internal/storage.(*Pool).MarkDirtyChangeRecord
+         0     0%  4.28%  5270.32MB 23.86%  github.com/goopg/goopg/internal/initdb.Open.func4
+         0     0%  4.28%  4367.25MB 19.77%  github.com/goopg/goopg/internal/wal.(*Writer).Append
+         0     0%  4.28%  4367.25MB 19.77%  github.com/goopg/goopg/internal/wal.(*state).tryAppend
+    1.50MB 0.0068%  4.29%  3224.51MB 14.60%  github.com/goopg/goopg/internal/storage.PagePruneOpt
+         0     0%  4.29%  2982.40MB 13.50%  runtime.main
+         0     0%  4.29%  2981.89MB 13.50%  github.com/goopg/goopg/internal/initdb.Open
+         0     0%  4.29%  2981.89MB 13.50%  main.main
+         0     0%  4.29%  2981.89MB 13.50%  main.run
+         0     0%  4.29%  2981.89MB 13.50%  main.runStart
+      11MB  0.05%  4.34%  2849.95MB 12.90%  github.com/goopg/goopg/internal/planner.Plan
+ 2814.50MB 12.74% 17.08%  2814.50MB 12.74%  github.com/goopg/goopg/internal/storage.VacuumHeapPageBySlots
+   36.29MB  0.16% 17.24%  2596.30MB 11.75%  github.com/goopg/goopg/internal/storage.NewPool
+ 2560.01MB 11.59% 28.83%  2560.01MB 11.59%  github.com/goopg/goopg/internal/storage.newArena
+   70.51MB  0.32% 29.15%  2204.36MB  9.98%  github.com/goopg/goopg/internal/planner.planSelect
+ 1094.60MB  4.96% 34.10%  2189.73MB  9.91%  github.com/goopg/goopg/internal/wal.encodeRecordXLog
+   36.50MB  0.17% 34.27%  2020.24MB  9.15%  github.com/goopg/goopg/internal/parser.Parse
+         0     0% 34.27%  1430.43MB  6.48%  sync.(*Pool).Get
+ 1110.61MB  5.03% 39.30%  1112.11MB  5.03%  github.com/goopg/goopg/internal/wal.emitWithPageHeaders
+ 1095.12MB  4.96% 44.26%  1095.12MB  4.96%  github.com/goopg/goopg/internal/wal.wrapXLogMainData (inline)
+ 1064.92MB  4.82% 49.08%  1064.92MB  4.82%  github.com/goopg/goopg/internal/wal.encodeRecord
+ 1011.58MB  4.58% 53.66%  1011.58MB  4.58%  github.com/goopg/goopg/internal/wal.EncodePageImage
+         0     0% 53.66%  1006.14MB  4.55%  github.com/goopg/goopg/internal/parser.(*parser).parseStatement
+  765.17MB  3.46% 57.12%   819.67MB  3.71%  github.com/goopg/goopg/internal/planner.buildBindingsPosMap
+  271.07MB  1.23% 58.35%   814.12MB  3.69%  github.com/goopg/goopg/internal/parser.(*parser).parseSelect
+  726.70MB  3.29% 61.64%   726.70MB  3.29%  github.com/goopg/goopg/internal/parser.init.func1
+  697.32MB  3.16% 64.79%   697.32MB  3.16%  github.com/goopg/goopg/internal/executor.NewContext (inline)
+         0     0% 64.79%   638.67MB  2.89%  github.com/goopg/goopg/internal/executor.(*projectOp).Open
+  615.02MB  2.78% 67.58%   615.02MB  2.78%  time.Time.Format
+
+# top symbols (-list) — top 8 hot functions, flat order
+## -list cum%
+no matches found for regexp: cum%
+
+## -list github.com/goopg/goopg/internal/storage.VacuumHeapPageBySlots
+Total: 21.57GB
+ROUTINE ======================== github.com/goopg/goopg/internal/storage.VacuumHeapPageBySlots in /home/ryo/work/goopg/goopg/internal/storage/heap.go
+    2.75GB     2.75GB (flat, cum) 12.74% of Total
+         .          .    708:func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, error) {
+         .          .    709:	h, err := Header(p)
+         .          .    710:	if err != nil {
+         .          .    711:		return HeapPageVacuumStats{}, err
+         .          .    712:	}
+         .          .    713:	count, err := PageLinePointerCount(p)
+         .          .    714:	if err != nil {
+         .          .    715:		return HeapPageVacuumStats{}, err
+         .          .    716:	}
+         .          .    717:	deadSet := make(map[int]struct{}, len(deadSlots))
+         .          .    718:	for _, s := range deadSlots {
+         .          .    719:		if s == 0 || int(s) > count {
+         .          .    720:			return HeapPageVacuumStats{}, fmt.Errorf("%w: dead slot %d out of range (count=%d)", ErrInvalidSlot, s, count)
+         .          .    721:		}
+         .          .    722:		deadSet[int(s)-1] = struct{}{}
+         .          .    723:	}
+         .          .    724:	type live struct {
+         .          .    725:		idx  int
+         .          .    726:		body []byte
+         .          .    727:	}
+         .          .    728:	var survivors []live
+         .          .    729:	stats := HeapPageVacuumStats{}
+         .          .    730:	for idx := 0; idx < count; idx++ {
+         .          .    731:		item, err := readItemID(p, idx)
+         .          .    732:		if err != nil {
+         .          .    733:			return HeapPageVacuumStats{}, err
+         .          .    734:		}
+         .          .    735:		if item.Flags != ItemIDNormal {
+         .          .    736:			continue
+         .          .    737:		}
+         .          .    738:		off := int(item.Offset)
+         .          .    739:		ln := int(item.Length)
+         .          .    740:		if off < 0 || ln < 0 || off+ln > len(p) {
+         .          .    741:			return HeapPageVacuumStats{}, fmt.Errorf("%w: slot=%d off=%d len=%d", ErrCorruptTuple, idx+1, off, ln)
+         .          .    742:		}
+         .          .    743:		if _, isDead := deadSet[idx]; isDead {
+         .          .    744:			if err := writeItemID(p, idx, ItemID{Flags: ItemIDUnused}); err != nil {
+
+## -list github.com/goopg/goopg/internal/storage.newArena
+Total: 21.57GB
+ROUTINE ======================== github.com/goopg/goopg/internal/storage.newArena in /home/ryo/work/goopg/goopg/internal/storage/arena.go
+    2.50GB     2.50GB (flat, cum) 11.59% of Total
+         .          .     18:func newArena(nslots int) (*arena, error) {
+         .          .     19:	if nslots <= 0 {
+         .          .     20:		return nil, fmt.Errorf("arena: nslots must be > 0, got %d", nslots)
+         .          .     21:	}
+         .          .     22:	size := nslots * BlockSize
+         .          .     23:	const align = 4096
+    2.50GB     2.50GB     24:	raw := make([]byte, size+align)
+         .          .     25:	off := align - (int(uintptrOf(raw[:1])) % align)
+         .          .     26:	if off == align {
+         .          .     27:		off = 0
+         .          .     28:	}
+         .          .     29:	return &arena{mem: raw[off : off+size]}, nil
+
+## -list github.com/goopg/goopg/internal/wal.emitWithPageHeaders
+Total: 21.57GB
+ROUTINE ======================== github.com/goopg/goopg/internal/wal.emitWithPageHeaders in /home/ryo/work/goopg/goopg/internal/wal/xlog_emit.go
+    1.08GB     1.09GB (flat, cum)  5.03% of Total
+         .          .     62:func emitWithPageHeaders(record []byte, realRecLen int, startPos int64, segSize int64, sysID uint64, tli uint32) (out []byte, leading int) {
+    1.08GB     1.08GB     63:	out = make([]byte, 0, len(record)+SizeOfXLogShortPHD)
+         .          .     64:	pos := startPos
+         .          .     65:
+         .          .     66:	// Optional leading page header at startPos (writer landed on a
+         .          .     67:	// page boundary).
+         .          .     68:	if pos%XLOGBlockSize == 0 {
+         .          .     69:		hdr := buildPageHeader(pos, segSize, sysID, tli, false, 0)
+         .          .     70:		out = append(out, hdr...)
+         .          .     71:		leading = len(hdr)
+         .          .     72:		pos += int64(len(hdr))
+         .          .     73:	}
+         .          .     74:
+         .          .     75:	consumed := 0
+         .          .     76:	for consumed < len(record) {
+         .          .     77:		// Compute remaining space in the current page.
+         .          .     78:		space := XLOGBlockSize - int(pos%XLOGBlockSize)
+         .          .     79:		// pos can never sit at a page boundary inside this loop
+         .          .     80:		// — we always emit at least one record byte before
+         .          .     81:		// crossing, and the cross-boundary path inserts the
+         .          .     82:		// next page's header inline below.
+         .          .     83:		chunk := len(record) - consumed
+         .          .     84:		if chunk > space {
+         .          .     85:			chunk = space
+         .          .     86:		}
+    7.58MB     7.58MB     87:		out = append(out, record[consumed:consumed+chunk]...)
+         .          .     88:		pos += int64(chunk)
+         .          .     89:		consumed += chunk
+         .          .     90:
+         .          .     91:		// If we still have record bytes and we just landed on a
+         .          .     92:		// page boundary, emit the contrecord page header for the
+         .          .     93:		// next page.
+         .          .     94:		if consumed < len(record) && pos%XLOGBlockSize == 0 {
+         .          .     95:			// xlp_rem_len upstream-semantic: bytes-still-to-go
+         .          .     96:			// of the record INCLUDING MAXALIGN trailing pad.
+         .          .     97:			// PG's XLogReader uses RemLen to skip to the next
+         .          .     98:			// record header; undercounting (without padding)
+
+## -list (inline)
+no matches found for regexp: (inline)
+
+## -list github.com/goopg/goopg/internal/wal.encodeRecordXLog
+Total: 21.57GB
+ROUTINE ======================== github.com/goopg/goopg/internal/wal.encodeRecordXLog in /home/ryo/work/goopg/goopg/internal/wal/format.go
+    1.07GB     2.14GB (flat, cum)  9.91% of Total
+         .          .    247:func encodeRecordXLog(payload []byte, prev uint64) ([]byte, int, error) {
+         .     1.07GB    248:	wrapped := wrapXLogMainData(payload)
+         .          .    249:	rmgr, info, xid := classifyXLogRecord(payload)
+         .          .    250:	realLen := xlogRecordHeaderSize + len(wrapped)
+         .          .    251:	header := XLogRecord{
+         .          .    252:		TotLen: uint32(realLen),
+         .          .    253:		XID:    xid,
+         .          .    254:		Prev:   prev,
+         .          .    255:		Info:   info,
+         .          .    256:		Rmid:   rmgr,
+         .          .    257:	}
+         .          .    258:	// out is zero-filled to MAXALIGN — the trailing pad bytes are
+         .          .    259:	// the upstream record-alignment requirement so pg_waldump's
+         .          .    260:	// nextRecord = MAXALIGN(xl_tot_len) advance lands on the next
+         .          .    261:	// header.
+    1.07GB     1.07GB    262:	out := make([]byte, maxAlignXLog(realLen))
+         .          .    263:	if err := EncodeXLogRecordHeader(out[:xlogRecordHeaderSize], header, wrapped); err != nil {
+         .          .    264:		return nil, 0, err
+         .          .    265:	}
+         .          .    266:	copy(out[xlogRecordHeaderSize:realLen], wrapped)
+         .          .    267:	return out, realLen, nil
+
+## -list github.com/goopg/goopg/internal/wal.encodeRecord
+Total: 21.57GB
+ROUTINE ======================== github.com/goopg/goopg/internal/wal.encodeRecord in /home/ryo/work/goopg/goopg/internal/wal/format.go
+    1.04GB     1.04GB (flat, cum)  4.82% of Total
+         .          .    109:func encodeRecord(payload []byte) []byte {
+    1.04GB     1.04GB    110:	buf := make([]byte, recordHeaderSize+len(payload))
+         .          .    111:	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(payload)))
+         .          .    112:	binary.LittleEndian.PutUint32(buf[4:8], cachedCRC(payload))
+         .          .    113:	copy(buf[recordHeaderSize:], payload)
+         .          .    114:	return buf
+         .          .    115:}
+ROUTINE ======================== github.com/goopg/goopg/internal/wal.encodeRecordXLog in /home/ryo/work/goopg/goopg/internal/wal/format.go
+    1.07GB     2.14GB (flat, cum)  9.91% of Total
+         .          .    247:func encodeRecordXLog(payload []byte, prev uint64) ([]byte, int, error) {
+         .     1.07GB    248:	wrapped := wrapXLogMainData(payload)
+         .          .    249:	rmgr, info, xid := classifyXLogRecord(payload)
+         .          .    250:	realLen := xlogRecordHeaderSize + len(wrapped)
+         .          .    251:	header := XLogRecord{
+         .          .    252:		TotLen: uint32(realLen),
+         .          .    253:		XID:    xid,
+         .          .    254:		Prev:   prev,
+         .          .    255:		Info:   info,
+         .          .    256:		Rmid:   rmgr,
+         .          .    257:	}
+         .          .    258:	// out is zero-filled to MAXALIGN — the trailing pad bytes are
+         .          .    259:	// the upstream record-alignment requirement so pg_waldump's
+         .          .    260:	// nextRecord = MAXALIGN(xl_tot_len) advance lands on the next
+         .          .    261:	// header.
+    1.07GB     1.07GB    262:	out := make([]byte, maxAlignXLog(realLen))
+         .          .    263:	if err := EncodeXLogRecordHeader(out[:xlogRecordHeaderSize], header, wrapped); err != nil {
+         .          .    264:		return nil, 0, err
+         .          .    265:	}
+         .          .    266:	copy(out[xlogRecordHeaderSize:realLen], wrapped)
+         .          .    267:	return out, realLen, nil
+
+## -list github.com/goopg/goopg/internal/wal.EncodePageImage
+Total: 21.57GB
+ROUTINE ======================== github.com/goopg/goopg/internal/wal.EncodePageImage in /home/ryo/work/goopg/goopg/internal/wal/recovery.go
+ 1011.58MB  1011.58MB (flat, cum)  4.58% of Total
+         .          .    819:func EncodePageImage(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) ([]byte, error) {
+         .          .    820:	if len(page) != storage.BlockSize {
+         .          .    821:		return nil, fmt.Errorf("wal: page image is %d bytes, want %d", len(page), storage.BlockSize)
+         .          .    822:	}
+ 1011.58MB  1011.58MB    823:	out := make([]byte, pageImageHeaderSize+storage.BlockSize)
+         .          .    824:	out[0] = RecordKindPageImage
+         .          .    825:	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
+         .          .    826:	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
+         .          .    827:	out[9] = byte(rel.Fork)
+         .          .    828:	binary.LittleEndian.PutUint32(out[10:14], uint32(blk))
+

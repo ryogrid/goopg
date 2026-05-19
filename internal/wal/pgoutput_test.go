@@ -446,3 +446,60 @@ func TestPgoutputDeleteWithOldTupleEmitsO(t *testing.T) {
 		t.Errorf("OldTuple[0] val=%q want '42'", msg.OldTuple[0].Bytes)
 	}
 }
+
+
+// TestPgoutputUpdateWithoutOldTupleGoesDirectlyToN pins M0103-0004:
+// when REPLICA IDENTITY DEFAULT applies and no replica-identity column
+// was modified, upstream `logicalrep_write_update` skips the K/O block
+// entirely and emits 'U' | rel_oid(4) | 'N' | new_tuple. A real libpq
+// subscriber relies on this exact shape — a 'K' marker with natts=0
+// (the goopg pre-2026-05-14 behaviour) is malformed because natts must
+// equal the relation's column count.
+func TestPgoutputUpdateWithoutOldTupleGoesDirectlyToN(t *testing.T) {
+	cols := []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "val", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+	}
+	snap, rel := snapshotForRel(t, "items", cols)
+
+	newBody := encodeBodyV0([]any{7, "after"}, []string{"int4", "text"})
+	newTuple := wrapAsHeapTuple(t, newBody)
+
+	var buf bytes.Buffer
+	po := NewPgOutput(snap, &buf)
+	if err := po.Change(Change{Kind: ChangeUpdate, Rel: rel, NewTuple: newTuple}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := buf.Bytes()
+	uIdx := bytes.IndexByte(raw, 'U')
+	if uIdx < 0 {
+		t.Fatalf("no U message in output: %x", raw)
+	}
+	// Wire shape: U(1) | rel_oid(4) | 'N'(1) | <new tuple body>.
+	// Byte at uIdx+5 must be 'N' directly — no 'K'/'O' marker.
+	if uIdx+5 >= len(raw) {
+		t.Fatalf("U message too short: %x", raw[uIdx:])
+	}
+	if got := raw[uIdx+5]; got != 'N' {
+		t.Errorf("byte after rel_oid = %q want 'N' (no K/O block expected)", got)
+	}
+
+	// Round-trip through DecodeMessage: must succeed with empty OldTuple.
+	msg, err := DecodeMessage(raw[uIdx:])
+	if err != nil {
+		t.Fatalf("DecodeMessage U: %v", err)
+	}
+	if msg.Kind != 'U' {
+		t.Errorf("decoded kind=%q want U", msg.Kind)
+	}
+	if len(msg.OldTuple) != 0 {
+		t.Errorf("OldTuple len=%d want 0 (no K/O block expected)", len(msg.OldTuple))
+	}
+	if len(msg.NewTuple) != 2 {
+		t.Fatalf("NewTuple len=%d want 2", len(msg.NewTuple))
+	}
+	if string(msg.NewTuple[1].Bytes) != "after" {
+		t.Errorf("NewTuple[1] val=%q want 'after'", msg.NewTuple[1].Bytes)
+	}
+}

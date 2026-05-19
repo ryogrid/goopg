@@ -93,12 +93,18 @@ func emitWithPageHeaders(record []byte, realRecLen int, startPos int64, segSize 
 		// next page.
 		if consumed < len(record) && pos%XLOGBlockSize == 0 {
 			// xlp_rem_len upstream-semantic: bytes-still-to-go
-			// of the *actual* record (xl_tot_len), not the
-			// MAXALIGN trailing pad.
-			remaining := uint32(0)
-			if consumed < realRecLen {
-				remaining = uint32(realRecLen - consumed)
-			}
+			// of the record INCLUDING MAXALIGN trailing pad.
+			// PG's XLogReader uses RemLen to skip to the next
+			// record header; undercounting (without padding)
+			// makes PG read padding as a record header and
+			// raise "invalid record length".
+			// PG's CopyXLogRecordToWAL computes xlp_rem_len as
+			// (xl_tot_len - written), which is the UNPADDED
+			// remaining bytes. realRecLen is goopg's xl_tot_len
+			// (without MAXALIGN pad). Using len(record) which
+			// includes padding causes PG to report
+			// "invalid contrecord length".
+			remaining := uint32(realRecLen - consumed)
 			hdr := buildPageHeader(pos, segSize, sysID, tli, true, remaining)
 			out = append(out, hdr...)
 			pos += int64(len(hdr))

@@ -8,6 +8,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // transactionOp is a one-shot operator that mutates explicit
@@ -113,8 +114,33 @@ func (o *transactionOp) execCommit() error {
 			}
 		}
 	}
+	// M0104-0007: SSI pre-commit dangerous-structure check for SERIALIZABLE.
+	// Runs BEFORE TxnMgr.Commit so a detected rw-cycle can be translated to
+	// SQLSTATE 40001 and rolled back here without burning a commit record.
+	// Helper returns nil for RC/RR and write-less SERIALIZABLE xacts.
+	if ssiErr := ssiPreCommitCheck(o.ctx, tx); ssiErr != nil {
+		_ = o.ctx.TxnMgr.Rollback(tx)
+		o.ctx.Session.EndExplicitTransaction()
+		o.clearCtxTransaction()
+		if ee, ok := ssiErr.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return ssiErr
+	}
 	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+	}
+	// M0102-0005: synchronous-replication wait. The xactMarker hook
+	// in initdb.Open writes the commit WAL record and flushes locally
+	// before TxnMgr.Commit returns; if SyncRep is configured and the
+	// session-effective synchronous_commit level is remote_*, block
+	// here until enough standbys have acknowledged the commit's LSN.
+	// WrittenLSN reads the position just past the commit record (the
+	// hook always advances it). NeedsWait short-circuits the cheap
+	// path when synchronous_standby_names is empty.
+	if o.ctx.SyncRep != nil && o.ctx.WAL != nil &&
+		o.ctx.SyncCommitMode != wal.SyncRepOff && o.ctx.SyncRep.NeedsWait() {
+		_ = o.ctx.SyncRep.WaitForLSN(o.ctx.Ctx, o.ctx.WAL.WrittenLSN(), o.ctx.SyncCommitMode)
 	}
 	o.ctx.Session.EndExplicitTransaction()
 	o.clearCtxTransaction()

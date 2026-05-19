@@ -472,7 +472,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 					_ = p.acceptSymbol(",")
 				}
-			} else if p.acceptIdentKeyword("from") {
+			} else if p.acceptKeyword(KwFrom) || p.acceptIdentKeyword("from") {
 				if !p.acceptSymbol("(") {
 					return nil, p.errAtCur("expected '(' after FROM")
 				}
@@ -515,7 +515,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		return stmt, nil
 	}
 	for {
-		// Table-level constraint: PRIMARY KEY ( cols ).
+		// Table-level constraint: PRIMARY KEY ( cols ) [INCLUDE ( cols )].
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary {
 			p.advance()
 			if _, err := p.expectKeyword(KwKey); err != nil {
@@ -532,6 +532,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				return nil, p.errAtCur("expected ')'")
 			}
 			stmt.PrimaryKey = cols
+			// Optional INCLUDE (col, …) — accept and discard for compat.
+			if p.acceptIdentKeyword("include") {
+				if p.acceptSymbol("(") {
+					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+						p.advance()
+					}
+				}
+			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
 			// Table-level UNIQUE (cols) — accept as no-op for now.
 			p.advance()
@@ -575,6 +583,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					return nil, p.errAtCur("expected ')'")
 				}
 				stmt.PrimaryKey = cols
+				// Optional INCLUDE (col, …) — accept and discard for compat.
+				if p.acceptIdentKeyword("include") {
+					if p.acceptSymbol("(") {
+						for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+							p.advance()
+						}
+					}
+				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 				p.advance()
 				if p.acceptSymbol("(") {
@@ -849,25 +865,17 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			if p.acceptIdentKeyword("options") {
 				// Re-enter constraint parsing for the column override.
 			}
-		// DEFAULT clause — skip for generated columns context
+		// DEFAULT clause — capture the expression AST so the apply worker
+		// can evaluate it when filling subscriber-extra columns at
+		// INSERT time (M0103-0007 rung 13). Generated columns don't
+		// take DEFAULT; the GENERATED ALWAYS arm above runs first.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault:
 			p.advance()
-			// Skip the default expression (consume tokens until ',', ')', or ';')
-			depth := 0
-			for p.cur().Kind != TokenEOF {
-				t := p.cur()
-				if t.Kind == TokenSymbol && t.Value == "(" {
-					depth++
-				} else if t.Kind == TokenSymbol && t.Value == ")" {
-					if depth == 0 {
-						break
-					}
-					depth--
-				} else if t.Kind == TokenSymbol && (t.Value == "," || t.Value == ";") && depth == 0 {
-					break
-				}
-				p.advance()
+			expr, err := p.parseExpr()
+			if err != nil {
+				return ColumnDef{}, err
 			}
+			col.DefaultExpr = expr
 		// REFERENCES — parse FK constraint and populate col FK fields. M0096-0011.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
 			p.advance()
@@ -1928,7 +1936,7 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				if !p.acceptSymbol(")") {
 					return AlterTableAction{}, p.errAtCur("expected ')'")
 				}
-			} else if p.acceptIdentKeyword("from") {
+			} else if p.acceptKeyword(KwFrom) || p.acceptIdentKeyword("from") {
 				if !p.acceptSymbol("(") {
 					return AlterTableAction{}, p.errAtCur("expected '('")
 				}

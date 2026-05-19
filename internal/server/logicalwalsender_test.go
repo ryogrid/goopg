@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/protocol"
@@ -72,6 +74,35 @@ func TestParseStartReplicationArgsPhysicalStillWorks(t *testing.T) {
 	}
 }
 
+func TestParseStartReplicationArgsPhysicalKeywordOptional(t *testing.T) {
+	args, err := parseStartReplicationArgs(`START_REPLICATION SLOT primary 1/2 TIMELINE 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.Mode != "PHYSICAL" {
+		t.Errorf("Mode=%q", args.Mode)
+	}
+	if args.SlotName != "primary" {
+		t.Errorf("SlotName=%q", args.SlotName)
+	}
+	if args.StartLSN != (uint64(1)<<32)|2 {
+		t.Errorf("StartLSN=%x", args.StartLSN)
+	}
+	if args.Timeline != 1 {
+		t.Errorf("Timeline=%d", args.Timeline)
+	}
+	args, err = parseStartReplicationArgs(`START_REPLICATION 0/0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if args.Mode != "PHYSICAL" {
+		t.Errorf("Mode=%q", args.Mode)
+	}
+	if args.StartLSN != 0 {
+		t.Errorf("StartLSN=%x", args.StartLSN)
+	}
+}
+
 // TestWalsenderPgoutputAdapterWrapsAsCopyData pins the wire-
 // format invariant: every Write call from a PgOutput plugin
 // becomes one `'w'` CopyData frame on the wire, with monotonic
@@ -127,6 +158,88 @@ func TestWalsenderPgoutputAdapterWrapsAsCopyData(t *testing.T) {
 	}
 	if string(m2.WALBytes) != "second" {
 		t.Errorf("frame[1] body=%q", m2.WALBytes)
+	}
+}
+
+// TestWalsenderPgoutputAdapterKeepalive pins the rung-9 fix
+// (M0103-0008): the LOGICAL walsender path must emit periodic
+// keepalive frames so PG's apply worker doesn't trip
+// `wal_receiver_timeout` (default 60 s) during quiet periods. The
+// adapter's WriteKeepalive method must wrap the keepalive in the same
+// `'w'`-style CopyData frame the standby's libpqrcv consumes and
+// advertise walEnd = last-emitted synthetic LSN.
+func TestWalsenderPgoutputAdapterKeepalive(t *testing.T) {
+	var buf bytes.Buffer
+	fw := protocol.NewFrameWriter(&buf)
+
+	a := &walsenderPgoutputAdapter{w: fw, nextLSN: 200}
+	// Ship a regular message first so nextLSN advances.
+	if _, err := a.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	wantEnd := uint64(200 + len("data") - 1)
+
+	now := time.Unix(1_700_000_000, 0).UTC()
+	if err := a.WriteKeepalive(now); err != nil {
+		t.Fatal(err)
+	}
+
+	fr := protocol.NewFrameReader(&buf)
+	// Skip the data frame.
+	if _, err := fr.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+
+	kf, err := fr.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kf.Type != protocol.MsgCopyData {
+		t.Fatalf("keepalive frame Type=%q want CopyData", kf.Type)
+	}
+	parsed, kind, err := protocol.DecodeReplicationMessage(kf.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != protocol.ReplMsgKeepalive {
+		t.Fatalf("inner kind=%q want k", kind)
+	}
+	k := parsed.(*protocol.KeepaliveMessage)
+	if k.WALEnd != wantEnd {
+		t.Errorf("WALEnd=%d want %d (last-emitted synthetic LSN)", k.WALEnd, wantEnd)
+	}
+	if k.ReplyRequested {
+		t.Errorf("ReplyRequested=true want false (idle keepalive)")
+	}
+}
+
+// TestWalsenderPgoutputAdapterKeepaliveBeforeFirstWrite pins the
+// no-messages-yet behaviour: an adapter with nextLSN=0 must still
+// emit a well-formed keepalive without underflowing walEnd.
+func TestWalsenderPgoutputAdapterKeepaliveBeforeFirstWrite(t *testing.T) {
+	var buf bytes.Buffer
+	fw := protocol.NewFrameWriter(&buf)
+	a := &walsenderPgoutputAdapter{w: fw, nextLSN: 0}
+
+	if err := a.WriteKeepalive(time.Unix(1_700_000_000, 0).UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	fr := protocol.NewFrameReader(&buf)
+	kf, err := fr.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, kind, err := protocol.DecodeReplicationMessage(kf.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kind != protocol.ReplMsgKeepalive {
+		t.Fatalf("inner kind=%q want k", kind)
+	}
+	k := parsed.(*protocol.KeepaliveMessage)
+	if k.WALEnd != 0 {
+		t.Errorf("WALEnd=%d want 0 (no underflow on empty adapter)", k.WALEnd)
 	}
 }
 
@@ -252,5 +365,168 @@ func TestSplitPublicationNamesTrimsAndDropsEmpty(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("got[%d]=%q want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// TestSplitPublicationNamesQuotedIdentifiers pins the
+// `SplitIdentifierString`-equivalent semantics 0103-0016 adds for
+// the libpq logical-replication wire shape `publication_names '"p"'`.
+// Each name inside the option value is double-quote-wrapped so
+// names containing commas remain safe to split; without quoted-
+// identifier unquoting the lookup keys never matched the stored
+// publication names and every decoded change was silently
+// rejected (rung 11 of M0103-0008).
+func TestSplitPublicationNamesQuotedIdentifiers(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{name: "single quoted", raw: `"p"`, want: []string{"p"}},
+		{name: "multiple quoted", raw: `"p","q"`, want: []string{"p", "q"}},
+		{name: "doubled-quote escape", raw: `"a""b"`, want: []string{`a"b`}},
+		{name: "unquoted lowercased", raw: `Foo`, want: []string{"foo"}},
+		{name: "unquoted preserves case after lowering", raw: `FOO,BAR`, want: []string{"foo", "bar"}},
+		{name: "quoted preserves case", raw: `"Foo"`, want: []string{"Foo"}},
+		{name: "whitespace tolerance",
+			raw:  `  "p"  ,  "q"  `,
+			want: []string{"p", "q"}},
+		{name: "empty input", raw: ``, want: nil},
+		{name: "all whitespace", raw: `   `, want: nil},
+		{name: "trailing comma allowed", raw: `"p",`, want: []string{"p"}},
+		{name: "mixed quoted and unquoted", raw: `"p",q`, want: []string{"p", "q"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := splitPublicationNames(tc.raw)
+			if len(got) != len(tc.want) {
+				t.Fatalf("len(splitPublicationNames(%q)) = %d, want %d (%v)",
+					tc.raw, len(got), len(tc.want), got)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("splitPublicationNames(%q)[%d] = %q, want %q",
+						tc.raw, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestSplitPublicationNamesSyntaxErrorsReturnNil pins the explicit
+// "return nil on syntax error" contract callers rely on to fall back
+// to the v0 "no filter ⇒ pass everything" behaviour (see
+// 0103-0016). Upstream rejects malformed `publication_names` at
+// SUBSCRIPTION DDL time, well before the wire-level slot is started.
+func TestSplitPublicationNamesSyntaxErrorsReturnNil(t *testing.T) {
+	cases := []string{
+		`"unterminated`,
+		`"p" junk`,
+	}
+	for _, raw := range cases {
+		if got := splitPublicationNames(raw); got != nil {
+			t.Errorf("splitPublicationNames(%q) = %v, want nil", raw, got)
+		}
+	}
+}
+
+// TestLogicalSyncRepDispatchUnblocksOnApplyCatchup is the M0103-0005
+// integration test for the logical walsender → SyncRep wait queue.
+//
+// It pins the round-trip the real publisher takes: the subscriber emits
+// a Standby Status Update CopyData frame on the START_REPLICATION
+// LOGICAL stream, the walsender's receive-side goroutine calls
+// handleStandbyCopyData, that dispatcher decodes the 'r' message and
+// feeds SyncRep.UpdateStandbyProgress keyed on the application_name
+// from the START_REPLICATION handshake. A publisher COMMIT blocked on
+// remote_apply must release as soon as the subscriber's apply_lsn
+// crosses the commit target.
+//
+// Race-tested: run with `-race`. The test fans out two goroutines
+// (waiter + feeder) that share the SyncRep instance.
+func TestLogicalSyncRepDispatchUnblocksOnApplyCatchup(t *testing.T) {
+	t.Parallel()
+
+	syncRep := wal.NewSyncRep()
+	if err := syncRep.SetStandbyNames("goopg_sub"); err != nil {
+		t.Fatalf("SetStandbyNames: %v", err)
+	}
+
+	s := &Server{cfg: Config{SyncRep: syncRep}}
+
+	const commitLSN uint64 = 0x1000
+
+	// Initial subscriber report: write/flush ahead, apply still behind.
+	// This is what an apply worker that has buffered the txn but not yet
+	// committed locally looks like.
+	lagPayload := protocol.EncodeStandbyStatusUpdate(
+		commitLSN+0x100, commitLSN+0x100, commitLSN-1,
+		time.Unix(0, 0).UTC(), false,
+	)
+	if err := s.handleStandbyCopyData("", lagPayload, nil, syncRep, "goopg_sub"); err != nil {
+		t.Fatalf("dispatch lag report: %v", err)
+	}
+	write, flush, apply := syncRep.StandbyProgress("goopg_sub")
+	if write != commitLSN+0x100 || flush != commitLSN+0x100 || apply != commitLSN-1 {
+		t.Fatalf("lag progress: write=%x flush=%x apply=%x want %x/%x/%x",
+			write, flush, apply,
+			commitLSN+0x100, commitLSN+0x100, commitLSN-1)
+	}
+
+	// Start a publisher-side COMMIT waiter on remote_apply.
+	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- syncRep.WaitForLSN(waitCtx, commitLSN, wal.SyncRepRemoteApply)
+	}()
+
+	// The waiter must still be blocked: apply < commitLSN.
+	select {
+	case err := <-done:
+		t.Fatalf("WaitForLSN released early (apply=%x < target=%x): %v", apply, commitLSN, err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Subscriber now reports apply at the commit target — this is the
+	// post-apply ack and should release the COMMIT.
+	catchupPayload := protocol.EncodeStandbyStatusUpdate(
+		commitLSN+0x100, commitLSN+0x100, commitLSN,
+		time.Unix(0, 0).UTC(), false,
+	)
+	if err := s.handleStandbyCopyData("", catchupPayload, nil, syncRep, "goopg_sub"); err != nil {
+		t.Fatalf("dispatch catchup report: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitForLSN: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForLSN did not release after apply_lsn caught up via logical-walsender dispatch")
+	}
+}
+
+// TestLogicalSyncRepDispatchEmptyAppNameIsNoop pins the safety
+// invariant that a START_REPLICATION LOGICAL connection without an
+// `application_name` startup parameter does NOT pollute the SyncRep
+// registry with an empty-string entry. Otherwise a stray
+// SetStandbyNames('"".*') or a default rule could accidentally match.
+func TestLogicalSyncRepDispatchEmptyAppNameIsNoop(t *testing.T) {
+	t.Parallel()
+
+	syncRep := wal.NewSyncRep()
+	s := &Server{cfg: Config{SyncRep: syncRep}}
+
+	payload := protocol.EncodeStandbyStatusUpdate(0x500, 0x500, 0x500,
+		time.Unix(0, 0).UTC(), false)
+	if err := s.handleStandbyCopyData("", payload, nil, syncRep, ""); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	write, flush, apply := syncRep.StandbyProgress("")
+	if write != 0 || flush != 0 || apply != 0 {
+		t.Fatalf("empty appName progress was recorded: write=%x flush=%x apply=%x",
+			write, flush, apply)
 	}
 }

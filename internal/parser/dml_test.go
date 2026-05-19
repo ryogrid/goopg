@@ -153,3 +153,170 @@ func TestParseDMLSyntaxErrors(t *testing.T) {
 		}
 	}
 }
+
+
+// TestParseInsertValuesAcceptsDefaultKeyword: rung 15 — VALUES rows
+// accept the bare DEFAULT keyword. The cell becomes a *DefaultMarker
+// AST node; planInsert substitutes the column's catalog DefaultExpr
+// (or NULL) before resolveExpr runs.
+func TestParseInsertValuesAcceptsDefaultKeyword(t *testing.T) {
+	stmts, err := Parse("INSERT INTO t (a, b) VALUES (1, DEFAULT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins, ok := stmts[0].(*InsertStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(ins.Rows) != 1 || len(ins.Rows[0]) != 2 {
+		t.Fatalf("rows shape=%v", ins.Rows)
+	}
+	if _, ok := ins.Rows[0][0].(*IntegerConst); !ok {
+		t.Errorf("row[0][0]=%T want *IntegerConst", ins.Rows[0][0])
+	}
+	if _, ok := ins.Rows[0][1].(*DefaultMarker); !ok {
+		t.Errorf("row[0][1]=%T want *DefaultMarker", ins.Rows[0][1])
+	}
+}
+
+// TestParseInsertValuesDefaultInMultipleRows: rung 15 — DEFAULT works
+// across multiple rows and at any cell position.
+func TestParseInsertValuesDefaultInMultipleRows(t *testing.T) {
+	stmts, err := Parse("INSERT INTO t (a, b, c) VALUES (DEFAULT, 2, 'x'), (1, DEFAULT, DEFAULT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins := stmts[0].(*InsertStmt)
+	if len(ins.Rows) != 2 {
+		t.Fatalf("rows=%d want 2", len(ins.Rows))
+	}
+	if _, ok := ins.Rows[0][0].(*DefaultMarker); !ok {
+		t.Errorf("row[0][0]=%T", ins.Rows[0][0])
+	}
+	if _, ok := ins.Rows[1][1].(*DefaultMarker); !ok {
+		t.Errorf("row[1][1]=%T", ins.Rows[1][1])
+	}
+	if _, ok := ins.Rows[1][2].(*DefaultMarker); !ok {
+		t.Errorf("row[1][2]=%T", ins.Rows[1][2])
+	}
+}
+
+// TestParseInsertValuesRejectsBareDefaultInExpression: rung 15 — DEFAULT
+// is only accepted as a complete cell, not as a sub-expression. Matches
+// upstream PG behaviour.
+func TestParseInsertValuesRejectsBareDefaultInExpression(t *testing.T) {
+	_, err := Parse("INSERT INTO t (a) VALUES (DEFAULT + 1)")
+	if err == nil {
+		t.Fatal("expected syntax error, got nil")
+	}
+}
+
+
+// TestParseUpdateSetDefaultKeyword: rung 16 — the bare DEFAULT keyword
+// is accepted on the RHS of an UPDATE SET assignment and parsed as a
+// *DefaultMarker sentinel. Plan() substitutes the marker with the
+// column's catalog DefaultExpr (or NULL) before the analyzer runs.
+func TestParseUpdateSetDefaultKeyword(t *testing.T) {
+	stmts, err := Parse("UPDATE t SET v = DEFAULT WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upd, ok := stmts[0].(*UpdateStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(upd.Set) != 1 {
+		t.Fatalf("set len=%d want 1", len(upd.Set))
+	}
+	if upd.Set[0].Column != "v" {
+		t.Errorf("set[0].Column=%q want v", upd.Set[0].Column)
+	}
+	if _, ok := upd.Set[0].Expr.(*DefaultMarker); !ok {
+		t.Errorf("set[0].Expr=%T want *DefaultMarker", upd.Set[0].Expr)
+	}
+}
+
+// TestParseUpdateSetDefaultMultiAssign: rung 16 — DEFAULT on a subset
+// of comma-separated SET pairs, with plain expressions in the others.
+func TestParseUpdateSetDefaultMultiAssign(t *testing.T) {
+	stmts, err := Parse("UPDATE t SET v = DEFAULT, n = 42, w = DEFAULT WHERE id = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upd := stmts[0].(*UpdateStmt)
+	if len(upd.Set) != 3 {
+		t.Fatalf("set len=%d want 3", len(upd.Set))
+	}
+	if _, ok := upd.Set[0].Expr.(*DefaultMarker); !ok {
+		t.Errorf("set[0].Expr=%T want *DefaultMarker", upd.Set[0].Expr)
+	}
+	if _, ok := upd.Set[1].Expr.(*IntegerConst); !ok {
+		t.Errorf("set[1].Expr=%T want *IntegerConst", upd.Set[1].Expr)
+	}
+	if _, ok := upd.Set[2].Expr.(*DefaultMarker); !ok {
+		t.Errorf("set[2].Expr=%T want *DefaultMarker", upd.Set[2].Expr)
+	}
+}
+
+// TestParseUpdateSetRejectsBareDefaultInExpression: rung 16 — DEFAULT
+// is accepted only as a complete RHS, not as a sub-expression. Matches
+// upstream PG behaviour and rung 15's INSERT VALUES symmetry.
+func TestParseUpdateSetRejectsBareDefaultInExpression(t *testing.T) {
+	_, err := Parse("UPDATE t SET v = DEFAULT + 1 WHERE id = 1")
+	if err == nil {
+		t.Fatal("expected syntax error, got nil")
+	}
+}
+
+
+// TestParseInsertDefaultValues: rung 17 — `INSERT INTO t DEFAULT VALUES`
+// parses as an InsertStmt with DefaultValues=true, empty Rows, and no
+// SELECT. The planner expands it into a row of DefaultMarkers sized to
+// the target's insertable columns.
+func TestParseInsertDefaultValues(t *testing.T) {
+	stmts, err := Parse("INSERT INTO t DEFAULT VALUES")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins, ok := stmts[0].(*InsertStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if !ins.DefaultValues {
+		t.Errorf("DefaultValues=false want true")
+	}
+	if len(ins.Rows) != 0 {
+		t.Errorf("Rows len=%d want 0", len(ins.Rows))
+	}
+	if ins.Select != nil {
+		t.Errorf("Select set unexpectedly")
+	}
+	if len(ins.Columns) != 0 {
+		t.Errorf("Columns set unexpectedly: %v", ins.Columns)
+	}
+}
+
+// TestParseInsertDefaultValuesWithReturning: rung 17 — RETURNING after
+// DEFAULT VALUES is parsed normally.
+func TestParseInsertDefaultValuesWithReturning(t *testing.T) {
+	stmts, err := Parse("INSERT INTO t DEFAULT VALUES RETURNING id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins := stmts[0].(*InsertStmt)
+	if !ins.DefaultValues {
+		t.Errorf("DefaultValues=false want true")
+	}
+	if len(ins.Returning) != 1 {
+		t.Errorf("Returning len=%d want 1", len(ins.Returning))
+	}
+}
+
+// TestParseInsertDefaultValuesRejectsExtraValues: rung 17 — DEFAULT
+// must be followed by VALUES; any other token raises a syntax error.
+func TestParseInsertDefaultValuesRejectsExtraValues(t *testing.T) {
+	_, err := Parse("INSERT INTO t DEFAULT (1)")
+	if err == nil {
+		t.Fatal("expected syntax error, got nil")
+	}
+}

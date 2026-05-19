@@ -148,6 +148,9 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 	if ctx != nil {
 		*child = *ctx
 	}
+	// Reset notices so TakeNotices propagates only new ones from this call,
+	// not the parent's accumulated notices. M0100-0005.
+	child.Notices = nil
 	child.Params = make([]Datum, len(args))
 	frame := newPLpgSQLFrame()
 	for i, arg := range args {
@@ -184,6 +187,12 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 		}
 	}
 	res, flow, err := executePLpgSQLStmtList(block.Statements, r, frame, child)
+	// Propagate NOTICE messages from function body back to caller. M0100-0005.
+	if ctx != nil {
+		for _, n := range child.TakeNotices() {
+			ctx.AddNotice(n)
+		}
+	}
 	if err != nil {
 		return Datum{}, err
 	}
@@ -222,8 +231,8 @@ func executePLpgSQLStmtList(stmts []plpgsql.Stmt, r *catalog.Routine, frame *plp
 func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFrame, ctx *Context) (Datum, controlFlow, error) {
 	switch s := stmt.(type) {
 	case *plpgsql.AssignStmt:
-		// _plpgsql_noop is the silent discard target for trigger OLD.b = ...
-		// expressions. M0096-0012.
+		// _plpgsql_noop is the silent discard target for unrecognised
+		// dotted-expression statements. M0096-0012.
 		if s.Target == "_plpgsql_noop" {
 			return Datum{}, flowNone, nil
 		}
@@ -240,6 +249,28 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			return Datum{}, flowNone, err
 		}
 		frame.values[idx] = v
+		// Propagate OLD.<col>/NEW.<col> writes back to the trigger row so
+		// embedded SQL (substituteTriggerRefs in execPLpgSQLEmbeddedSQL)
+		// observes the mutation within the trigger body. M0100-0005aa.
+		if frame.trig != nil {
+			if strings.HasPrefix(s.Target, "_old_") && frame.trig.OldRow != nil {
+				col := s.Target[len("_old_"):]
+				for i, c := range frame.trig.Cols {
+					if strings.ToLower(c.Name) == col && i < len(frame.trig.OldRow) {
+						frame.trig.OldRow[i] = v
+						break
+					}
+				}
+			} else if strings.HasPrefix(s.Target, "_new_") && frame.trig.NewRow != nil {
+				col := s.Target[len("_new_"):]
+				for i, c := range frame.trig.Cols {
+					if strings.ToLower(c.Name) == col && i < len(frame.trig.NewRow) {
+						frame.trig.NewRow[i] = v
+						break
+					}
+				}
+			}
+		}
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.IfStmt:
@@ -469,7 +500,68 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			return Datum{}, flowNone, &ExecError{Code: "P0001", Pos: s.Pos(), Message: raiseMsgEval()}
 		}
 		if ctx != nil {
-			ctx.AddNotice(raiseMsgEval())
+			msg := raiseMsgEval()
+			ctx.AddNotice(msg)
+		}
+		return Datum{}, flowNone, nil
+
+	case *plpgsql.ExecuteStmt:
+		// EXECUTE expr [INTO var] [USING ...] — dynamic SQL. M0100-0005.
+		// 1. Evaluate the SQL expression.
+		sqlDatum, err := evalPLpgSQLExpr(s.Query, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		dynSQL := sqlDatum.StringValue()
+
+		// 2. Evaluate USING parameters and substitute $N placeholders.
+		for i, argExpr := range s.Using {
+			argDatum, perr := evalPLpgSQLExpr(argExpr, frame, ctx)
+			if perr != nil {
+				return Datum{}, flowNone, perr
+			}
+			placeholder := fmt.Sprintf("$%d", i+1)
+			dynSQL = strings.ReplaceAll(dynSQL, placeholder, plpgsqlFormatDynArg(argDatum))
+		}
+
+		// 3. Execute the dynamic SQL and optionally capture INTO var.
+		stmts, perr := parser.Parse(dynSQL)
+		if perr != nil || len(stmts) == 0 {
+			if s.IntoVar == "" {
+				return Datum{}, flowNone, nil // best-effort; ignore parse failures for side-effect EXECUTE
+			}
+			return Datum{}, flowNone, nil
+		}
+		plan, perr := planner.Plan(stmts[0], ctx.Catalog)
+		if perr != nil {
+			return Datum{}, flowNone, perr
+		}
+		op, perr := Build(plan)
+		if perr != nil {
+			return Datum{}, flowNone, perr
+		}
+		if perr := op.Open(ctx); perr != nil {
+			op.Close()
+			return Datum{}, flowNone, perr
+		}
+		slot, perr := op.Next()
+		// Copy the INTO result datum before Close() so releaseRow() does not
+		// zero it out underneath us. M0100-0005 fix: slot row is pooled.
+		var intoVal Datum
+		if s.IntoVar != "" && slot != nil && (perr == nil || perr == EOF) {
+			row := slot.Row()
+			if len(row) > 0 {
+				intoVal = row[0]
+			}
+		}
+		op.Close()
+		if perr != nil && perr != EOF {
+			return Datum{}, flowNone, perr
+		}
+		if s.IntoVar != "" {
+			if idx, ok := frame.lookup(s.IntoVar); ok {
+				frame.values[idx] = intoVal
+			}
 		}
 		return Datum{}, flowNone, nil
 
@@ -1008,6 +1100,13 @@ func injectTriggerVars(frame *plpgsqlFrame, trig *plpgsqlTrigCtx) {
 	_ = frame.add("tg_op", strType, NewStringDatum(trig.TGOp))
 	_ = frame.add("tg_table_name", strType, NewStringDatum(trig.TGTable))
 	_ = frame.add("tg_relname", strType, NewStringDatum(trig.TGTable))
+	// Inject OLD/NEW as composite-text row variables so RAISE NOTICE '%', OLD works.
+	if trig.OldRow != nil {
+		_ = frame.add("old", strType, NewStringDatum(rowToCompositeText(trig.Cols, trig.OldRow)))
+	}
+	if trig.NewRow != nil {
+		_ = frame.add("new", strType, NewStringDatum(rowToCompositeText(trig.Cols, trig.NewRow)))
+	}
 }
 
 // executePLpgSQLTriggerBody executes a trigger function body with the given
@@ -1062,7 +1161,7 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 	case flowReturnTriggerOld:
 		return trig.OldRow, true, nil
 	case flowReturnTriggerNew:
-		return trig.NewRow, true, nil
+		return rebuildNewRowFromFrame(frame, trig), true, nil
 	case flowReturnTriggerNull:
 		return nil, true, nil // NULL = skip the row
 	default:
@@ -1070,13 +1169,58 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 		if strings.ToLower(trig.TGOp) == "delete" {
 			return trig.OldRow, true, nil
 		}
-		return trig.NewRow, true, nil
+		return rebuildNewRowFromFrame(frame, trig), true, nil
 	}
+}
+
+// rebuildNewRowFromFrame reconstructs the trigger's NEW row from the
+// frame's `_new_<colname>` slots after the trigger body has run.
+// BEFORE triggers in PG can rewrite NEW.* (e.g. partition-key-update-1's
+// `func_footrg_mod_a` does `NEW.a := 2`); without rebuilding the row
+// from the frame, those rewrites would never reach the downstream
+// partition routing / heap-write code. M0100-0005p.
+func rebuildNewRowFromFrame(frame *plpgsqlFrame, trig *plpgsqlTrigCtx) Row {
+	if trig == nil || trig.NewRow == nil {
+		return nil
+	}
+	out := make(Row, len(trig.NewRow))
+	copy(out, trig.NewRow)
+	for i, col := range trig.Cols {
+		idx, ok := frame.lookup("_new_" + strings.ToLower(col.Name))
+		if !ok {
+			continue
+		}
+		if i < len(out) {
+			out[i] = frame.values[idx]
+		}
+	}
+	return out
 }
 
 // execPLpgSQLEmbeddedSQL executes an embedded SQL statement from a PL/pgSQL
 // body. Trigger OLD.* / NEW.* references are substituted with literal values
 // before parsing. M0096-0012.
+// plpgsqlFormatDynArg formats a Datum as a SQL literal for substitution
+// into EXECUTE ... USING $N parameters. M0100-0005.
+func plpgsqlFormatDynArg(d Datum) string {
+	switch d.Kind {
+	case KindNull:
+		return "NULL"
+	case KindInt:
+		return strconv.FormatInt(d.Int, 10)
+	case KindBool:
+		if d.BoolValue() {
+			return "true"
+		}
+		return "false"
+	case KindNumeric:
+		return numericText(d)
+	default:
+		s := d.StringValue()
+		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	}
+}
+
 func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error {
 	// Substitute OLD.* → VALUES(v1, v2, ...) and OLD.col → literal.
 	if frame.trig != nil {
@@ -1210,13 +1354,13 @@ func datumToSQLLiteral(d Datum) string {
 // is not yet implemented — the format-template text is returned as-is.
 // M0096-0012.
 // evalRaiseMsg evaluates a RAISE statement's message field in the plpgsql context.
-// Handles format args: `'%', expr` → evaluates expr, substitutes into format. M0097-0003.
+// Handles format args: `'fmt %', arg1, arg2` → evaluates each arg, substitutes
+// left-to-right into format (one % per arg; %% → literal %). M0097-0003.
 func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 	rawMsg = strings.TrimSpace(rawMsg)
 	if len(rawMsg) == 0 {
 		return rawMsg
 	}
-	// Try to split: 'format_template' , arg1, arg2, ...
 	if rawMsg[0] != '\'' {
 		return rawMsg // no format template
 	}
@@ -1237,31 +1381,97 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 	if argsText == "" || !strings.HasPrefix(argsText, ",") {
 		return fmtTemplate // no args
 	}
-	argsText = strings.TrimSpace(argsText[1:]) // skip comma
+	argsText = strings.TrimSpace(argsText[1:]) // skip leading comma
 
-	// Evaluate the args expression in the plpgsql frame.
-	// Preprocess: replace variable array subscripts like r[N] with literal values.
-	argsText = substitutePlpgsqlArraySubscripts(argsText, frame)
+	// Split into individual arg expressions on top-level commas.
+	argExprs := splitTopLevelCommas(argsText)
 
-	// Parse and evaluate the args expression as SQL.
-	argsExpr, err := parser.ParseExpr(argsText)
-	if err != nil {
-		return fmtTemplate // fallback
+	// Evaluate each arg expression.
+	argVals := make([]string, 0, len(argExprs))
+	for _, ae := range argExprs {
+		ae = strings.TrimSpace(ae)
+		ae = substitutePlpgsqlArraySubscripts(ae, frame)
+		parsed, err := parser.ParseExpr(ae)
+		if err != nil {
+			argVals = append(argVals, "")
+			continue
+		}
+		lowered, err := lowerPLpgSQLExpr(parsed, frame)
+		if err != nil {
+			argVals = append(argVals, "")
+			continue
+		}
+		val, err := evalExpr(lowered, frame.values, ctx)
+		if err != nil {
+			argVals = append(argVals, "")
+			continue
+		}
+		if val.IsNull() {
+			argVals = append(argVals, "")
+		} else {
+			argVals = append(argVals, val.Format())
+		}
 	}
-	lowered, err := lowerPLpgSQLExpr(argsExpr, frame)
-	if err != nil {
-		return fmtTemplate
+
+	// Substitute: each % (not %%) is replaced by the next arg in order.
+	argIdx := 0
+	var result strings.Builder
+	for i := 0; i < len(fmtTemplate); i++ {
+		if fmtTemplate[i] != '%' {
+			result.WriteByte(fmtTemplate[i])
+			continue
+		}
+		if i+1 < len(fmtTemplate) && fmtTemplate[i+1] == '%' {
+			result.WriteByte('%')
+			i++ // consume second %
+			continue
+		}
+		if argIdx < len(argVals) {
+			result.WriteString(argVals[argIdx])
+			argIdx++
+		} else {
+			result.WriteByte('%') // no more args
+		}
 	}
-	val, err := evalExpr(lowered, frame.values, ctx)
-	if err != nil || val.IsNull() {
-		return fmtTemplate
+	return result.String()
+}
+
+// splitTopLevelCommas splits s on commas not inside parentheses, brackets, or quotes.
+func splitTopLevelCommas(s string) []string {
+	var parts []string
+	depth := 0
+	inSingle := false
+	start := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inSingle {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++ // escaped ''
+				} else {
+					inSingle = false
+				}
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inSingle = true
+		case '(', '[':
+			depth++
+		case ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
 	}
-	// Apply format substitution: replace % with the evaluated arg value.
-	// Use Format() rather than StringValue() so non-string kinds (int, float, etc.)
-	// are converted to their text representation. M0097-0003.
-	argStr := val.Format()
-	result := strings.ReplaceAll(fmtTemplate, "%", argStr)
-	return result
+	parts = append(parts, s[start:])
+	return parts
 }
 
 // substitutePlpgsqlArraySubscripts replaces `varname[N]` patterns in a SQL expression
@@ -1347,4 +1557,48 @@ func plpgsqlExtractMsgText(msg string) string {
 		return strings.ReplaceAll(inner, "''", "'")
 	}
 	return msg
+}
+
+// rowToCompositeText formats a row as PostgreSQL composite type text notation:
+// "(val1,val2,...)" with double-quoting for values that contain special characters.
+// Used for RAISE NOTICE '... %', OLD / NEW substitution. M0100-0005.
+func rowToCompositeText(cols []catalog.Column, row Row) string {
+	var sb strings.Builder
+	sb.WriteByte('(')
+	for i, d := range row {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		if i >= len(cols) {
+			break
+		}
+		if d.IsNull() {
+			// NULL renders as empty (no quotes)
+			continue
+		}
+		s := d.Format() // Format() returns correct representation for all kinds (int, float, text)
+		// Quote if the value contains comma, parens, whitespace, double-quote,
+		// backslash, or is empty — matching PostgreSQL's composite output rules.
+		needsQuote := len(s) == 0
+		for _, c := range s {
+			if c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == ' ' || c == '\t' || c == '\n' {
+				needsQuote = true
+				break
+			}
+		}
+		if needsQuote {
+			sb.WriteByte('"')
+			for _, c := range s {
+				if c == '"' || c == '\\' {
+					sb.WriteByte('\\')
+				}
+				sb.WriteRune(c)
+			}
+			sb.WriteByte('"')
+		} else {
+			sb.WriteString(s)
+		}
+	}
+	sb.WriteByte(')')
+	return sb.String()
 }

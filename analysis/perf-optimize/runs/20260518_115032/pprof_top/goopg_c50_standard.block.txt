@@ -1,0 +1,131 @@
+# go tool pprof -top -nodecount=40 -cum  /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c50_standard.block.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 12:26:26 JST
+Showing nodes accounting for 42196.82s, 99.45% of 42431.29s total
+Dropped 164 nodes (cum <= 212.16s)
+Showing top 40 nodes out of 46
+      flat  flat%   sum%        cum   cum%
+ 22803.15s 53.74% 53.74%  22803.15s 53.74%  runtime.selectgo
+         0     0% 53.74%  18050.94s 42.54%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func2
+         0     0% 53.74%  17055.81s 40.20%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0% 53.74%  17055.81s 40.20%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0% 53.74%  17055.79s 40.20%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0% 53.74%  16926.41s 39.89%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0% 53.74%  16926.41s 39.89%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0% 53.74%  16926.41s 39.89%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+ 16776.32s 39.54% 93.28%  16776.32s 39.54%  sync.(*Mutex).Lock (inline)
+         0     0% 93.28%  12420.98s 29.27%  github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor
+         0     0% 93.28%   2642.07s  6.23%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 93.28%   2611.27s  6.15%  github.com/goopg/goopg/internal/aio.(*methodWorker).run
+         0     0% 93.28%   2611.27s  6.15%  github.com/goopg/goopg/internal/aio.newMethodWorker.gowrap1
+  2611.27s  6.15% 99.43%   2611.27s  6.15%  runtime.chanrecv2
+         0     0% 99.43%   1428.22s  3.37%  github.com/goopg/goopg/internal/executor.(*updateOp).Next
+         0     0% 99.43%   1186.53s  2.80%  github.com/goopg/goopg/internal/mvcc.(*Manager).Begin
+         0     0% 99.43%   1065.02s  2.51%  github.com/goopg/goopg/internal/mvcc.(*Manager).Commit (inline)
+         0     0% 99.43%   1065.02s  2.51%  github.com/goopg/goopg/internal/mvcc.(*Manager).finish
+     6.08s 0.014% 99.45%    910.38s  2.15%  sync.(*RWMutex).Lock
+         0     0% 99.45%    872.66s  2.06%  github.com/goopg/goopg/internal/wal.(*Checkpointer).Run
+         0     0% 99.45%    872.66s  2.06%  main.runStart.func4
+         0     0% 99.45%    872.62s  2.06%  github.com/goopg/goopg/internal/initdb.Open.func37
+         0     0% 99.45%    871.78s  2.05%  github.com/goopg/goopg/internal/server.(*ApplyLauncher).Run
+         0     0% 99.45%    871.78s  2.05%  github.com/goopg/goopg/internal/server.(*Server).Run.gowrap2
+         0     0% 99.45%    825.15s  1.94%  github.com/goopg/goopg/internal/storage.(*Bgwriter).Start.gowrap1
+         0     0% 99.45%    825.15s  1.94%  github.com/goopg/goopg/internal/storage.(*Bgwriter).run
+         0     0% 99.45%    720.49s  1.70%  github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex
+         0     0% 99.45%    719.25s  1.70%  github.com/goopg/goopg/internal/executor.tryApplyHOTUpdate
+         0     0% 99.45%    718.51s  1.69%  github.com/goopg/goopg/internal/mvcc.(*Manager).OldestXmin
+         0     0% 99.45%    707.73s  1.67%  github.com/goopg/goopg/internal/executor.(*Context).MaterializeWriterXID
+         0     0% 99.45%    707.73s  1.67%  github.com/goopg/goopg/internal/mvcc.(*Manager).AssignXID
+         0     0% 99.45%    704.07s  1.66%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteFrame
+         0     0% 99.45%    693.14s  1.63%  github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart
+         0     0% 99.45%    687.12s  1.62%  github.com/goopg/goopg/internal/server.(*Server).serveConn.func6
+         0     0% 99.45%    664.36s  1.57%  github.com/goopg/goopg/internal/protocol.(*FrameWriter).WriteReadyForQuery
+         0     0% 99.45%    642.36s  1.51%  github.com/goopg/goopg/internal/wal.(*state).loop
+         0     0% 99.45%    642.36s  1.51%  github.com/goopg/goopg/internal/wal.NewWriter.gowrap1
+         0     0% 99.45%    451.41s  1.06%  net/http.(*Server).Serve.gowrap3
+         0     0% 99.45%    451.41s  1.06%  net/http.(*conn).serve
+         0     0% 99.45%    451.41s  1.06%  net/http.(*ServeMux).ServeHTTP
+
+# top symbols (-list) — top 8 hot functions, flat order
+## -list cum%
+no matches found for regexp: cum%
+
+## -list runtime.selectgo
+Total: 11.79hrs
+ROUTINE ======================== runtime.selectgo in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/select.go
+   6.33hrs    6.33hrs (flat, cum) 53.74% of Total
+         .          .    122:func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, block bool) (int, bool) {
+         .          .    123:	gp := getg()
+         .          .    124:	if debugSelect {
+         .          .    125:		print("select: cas0=", cas0, "\n")
+         .          .    126:	}
+         .          .    127:
+         .          .    128:	// NOTE: In order to maintain a lean stack size, the number of scases
+         .          .    129:	// is capped at 65536.
+         .          .    130:	cas1 := (*[1 << 16]scase)(unsafe.Pointer(cas0))
+         .          .    131:	order1 := (*[1 << 17]uint16)(unsafe.Pointer(order0))
+         .          .    132:
+         .          .    133:	ncases := nsends + nrecvs
+         .          .    134:	scases := cas1[:ncases:ncases]
+         .          .    135:	pollorder := order1[:ncases:ncases]
+         .          .    136:	lockorder := order1[ncases:][:ncases:ncases]
+         .          .    137:	// NOTE: pollorder/lockorder's underlying array was not zero-initialized by compiler.
+         .          .    138:
+         .          .    139:	// Even when raceenabled is true, there might be select
+         .          .    140:	// statements in packages compiled without -race (e.g.,
+         .          .    141:	// ensureSigM in runtime/signal_unix.go).
+         .          .    142:	var pcs []uintptr
+         .          .    143:	if raceenabled && pc0 != nil {
+         .          .    144:		pc1 := (*[1 << 16]uintptr)(unsafe.Pointer(pc0))
+         .          .    145:		pcs = pc1[:ncases:ncases]
+         .          .    146:	}
+         .          .    147:	casePC := func(casi int) uintptr {
+         .          .    148:		if pcs == nil {
+         .          .    149:			return 0
+         .          .    150:		}
+         .          .    151:		return pcs[casi]
+         .          .    152:	}
+         .          .    153:
+         .          .    154:	var t0 int64
+         .          .    155:	if blockprofilerate > 0 {
+         .          .    156:		t0 = cputicks()
+         .          .    157:	}
+         .          .    158:
+
+## -list (inline)
+no matches found for regexp: (inline)
+
+## -list runtime.chanrecv2
+Total: 11.79hrs
+ROUTINE ======================== runtime.chanrecv2 in /home/ryo/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.25.0.linux-amd64/src/runtime/chan.go
+  2611.27s   2611.27s (flat, cum)  6.15% of Total
+         .          .    513:func chanrecv2(c *hchan, elem unsafe.Pointer) (received bool) {
+  2611.27s   2611.27s    514:	_, received = chanrecv(c, elem, true)
+         .          .    515:	return
+         .          .    516:}
+         .          .    517:
+         .          .    518:// chanrecv receives on channel c and writes the received data to ep.
+         .          .    519:// ep may be nil, in which case received data is ignored.
+
+## -list sync.(*RWMutex).Lock
+parsing argument regexp sync.(*RWMutex).Lock: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart
+parsing argument regexp github.com/goopg/goopg/internal/activity.(*Registry).WaitEventStart: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/aio.(*methodWorker).run
+parsing argument regexp github.com/goopg/goopg/internal/aio.(*methodWorker).run: error parsing regexp: missing argument to repetition operator: `*`
+
+## -list github.com/goopg/goopg/internal/aio.newMethodWorker.gowrap1
+Total: 11.79hrs
+ROUTINE ======================== github.com/goopg/goopg/internal/aio.newMethodWorker.gowrap1 in /home/ryo/work/goopg/goopg/internal/aio/method_worker.go
+         0   2611.27s (flat, cum)  6.15% of Total
+         .   2611.27s     41:		go m.run()
+         .          .     42:	}
+         .          .     43:	return m
+         .          .     44:}
+         .          .     45:
+         .          .     46:func (m *methodWorker) Name() string { return MethodWorker }
+

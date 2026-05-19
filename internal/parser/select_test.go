@@ -210,6 +210,223 @@ func TestParseSelectFunctionCall(t *testing.T) {
 	}
 }
 
+
+// TestParseFuncCallVariadicArgument pins parser acceptance of the VARIADIC
+// keyword as a prefix on a function-call argument. libpqrcv's
+// fetch_table_list probe emits this shape against
+// `pg_get_publication_tables`; the previous parser rejected it with a
+// "syntax error at or near 'variadic'" before reaching the planner.
+// M0103-0008.
+func TestParseFuncCallVariadicArgument(t *testing.T) {
+	stmts, err := Parse("SELECT pg_get_publication_tables(VARIADIC array_agg(x))")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s := stmts[0].(*SelectStmt)
+	fc, ok := s.Targets[0].Expr.(*FuncCall)
+	if !ok {
+		t.Fatalf("expected FuncCall, got %T", s.Targets[0].Expr)
+	}
+	if fc.Name.Name != "pg_get_publication_tables" {
+		t.Fatalf("function name = %q, want pg_get_publication_tables", fc.Name.Name)
+	}
+	if len(fc.Args) != 1 || len(fc.Variadic) != 1 {
+		t.Fatalf("args=%d variadic=%d, want 1/1", len(fc.Args), len(fc.Variadic))
+	}
+	if !fc.Variadic[0] {
+		t.Fatalf("expected VARIADIC flag on arg 0, got false")
+	}
+}
+
+
+// TestParseLateralPgCatalogQualifiedSRF pins M0103-0008 rung 13: the
+// parser's FROM-clause TVF dispatch must accept both unqualified and
+// `pg_catalog`-qualified spellings of the v0 SRF whitelist. Without
+// this, PG's `fetch_table_list_from_publisher` probe (which uses
+// `LATERAL pg_catalog.pg_get_publication_tables(...)`) hits
+// "expected ')' after subquery in FROM (got ()" at the function's
+// opening paren and CREATE SUBSCRIPTION registers zero tables in
+// `pg_subscription_rel`, which causes the apply worker to silently
+// skip every Insert/Update/Delete via `should_apply_changes_for_rel`.
+// See docs/design/0103-0019-lateral-pg-catalog-qualified-srf.md.
+func TestParseLateralPgCatalogQualifiedSRF(t *testing.T) {
+	// Canonical libpqwalreceiver shape: cross-FROM with LATERAL +
+	// schema-qualified SRF. The arg references the left FROM item's
+	// column so the planner threads the lateralCtx through (closed
+	// in rung 6/7). The parser side only needs to accept the
+	// pg_catalog.<name>(...) spelling as an SRF instead of falling
+	// into the derived-subquery branch.
+	stmts, err := Parse(`SELECT gpt.relid FROM pg_publication t, LATERAL pg_catalog.pg_get_publication_tables(t.pubname) AS gpt`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	sel, ok := stmts[0].(*SelectStmt)
+	if !ok {
+		t.Fatalf("expected *SelectStmt, got %T", stmts[0])
+	}
+	if len(sel.From) != 2 {
+		t.Fatalf("expected 2 FROM items (t, gpt), got %d", len(sel.From))
+	}
+	// The lateral SRF should land as a RangeVar whose TableFunc is
+	// the `pg_get_publication_tables` SRF — the `pg_catalog.` prefix
+	// is discarded once dispatch fires.
+	gpt := sel.From[1]
+	if gpt.TableFunc == nil {
+		t.Fatalf("expected From[1] to be a TableFuncRef, got Schema=%q Name=%q Subquery=%v",
+			gpt.Schema, gpt.Name, gpt.Subquery != nil)
+	}
+	if gpt.TableFunc.Name != "pg_get_publication_tables" {
+		t.Fatalf("From[1].TableFunc.Name = %q, want pg_get_publication_tables",
+			gpt.TableFunc.Name)
+	}
+	if gpt.Alias != "gpt" {
+		t.Fatalf("From[1].Alias = %q, want gpt", gpt.Alias)
+	}
+}
+
+// TestParseLateralPgCatalogQualifiedSRFCaseInsensitive checks that
+// the `pg_catalog` schema-qualifier match is case-insensitive (the
+// upstream probe always uses lowercase, but goopg's identifier
+// downcasing happens earlier; this test pins the EqualFold guard
+// against accidental tightening).
+func TestParseLateralPgCatalogQualifiedSRFCaseInsensitive(t *testing.T) {
+	stmts, err := Parse(`SELECT 1 FROM pg_publication t, LATERAL PG_CATALOG.pg_get_publication_tables(t.pubname) AS gpt`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	sel := stmts[0].(*SelectStmt)
+	gpt := sel.From[1]
+	if gpt.TableFunc == nil || gpt.TableFunc.Name != "pg_get_publication_tables" {
+		t.Fatalf("PG_CATALOG-prefix did not dispatch SRF; From[1].TableFunc=%v", gpt.TableFunc)
+	}
+}
+
+
+// TestParseRangeVarBareAliasWithColumnList pins the
+// `tablename alias (col1, col2, ...)` shape — column-alias list
+// after a bare (no-AS) alias.  Used by upstream's MERGE JOIN
+// isolation spec for `INSERT INTO src SELECT x, x*10 FROM
+// generate_series(1,3) g(x);` and by the long-tail of regression
+// tests that omit AS.
+func TestParseRangeVarBareAliasWithColumnList(t *testing.T) {
+	stmts, err := Parse(`SELECT g.x FROM generate_series(1,3) g(x)`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	sel := stmts[0].(*SelectStmt)
+	if len(sel.From) != 1 {
+		t.Fatalf("expected 1 FROM item, got %d", len(sel.From))
+	}
+	rv := sel.From[0]
+	if rv.TableFunc == nil || rv.TableFunc.Name != "generate_series" {
+		t.Fatalf("expected generate_series TableFunc, got %+v", rv)
+	}
+	if rv.Alias != "g" {
+		t.Fatalf("Alias=%q, want g", rv.Alias)
+	}
+	if len(rv.Columns) != 1 || rv.Columns[0] != "x" {
+		t.Fatalf("Columns=%v, want [x]", rv.Columns)
+	}
+}
+
+// TestParseRangeVarBareAliasMultiColumnList covers a multi-column
+// alias list on a bare alias (no AS keyword).
+func TestParseRangeVarBareAliasMultiColumnList(t *testing.T) {
+	stmts, err := Parse(`SELECT t.a, t.b FROM mytable t (a, b)`)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	sel := stmts[0].(*SelectStmt)
+	rv := sel.From[0]
+	if rv.Name != "mytable" {
+		t.Fatalf("Name=%q, want mytable", rv.Name)
+	}
+	if rv.Alias != "t" {
+		t.Fatalf("Alias=%q, want t", rv.Alias)
+	}
+	if len(rv.Columns) != 2 || rv.Columns[0] != "a" || rv.Columns[1] != "b" {
+		t.Fatalf("Columns=%v, want [a b]", rv.Columns)
+	}
+}
+
+
+// TestParseIndirectionStarFuncCall — `(srf(args)).*` in target list emits
+// an IndirectionStar AST node wrapping the inner FuncCall. M0103-0008
+// probe-survival foundation.
+func TestParseIndirectionStarFuncCall(t *testing.T) {
+	// parseSelect runs RewriteIndirectionStarTargets at the end of the
+	// parse so non-aggregate (srf(consts)).* shapes are turned into a
+	// FROM-clause SRF reference plus a qualified `__irs_0.*` target.
+	// The IndirectionStar AST node only persists in the parse tree
+	// when the SRF arguments contain aggregates (aggregate-arg path is
+	// rejected by the planner pending ProjectSet support).
+	stmts, err := Parse("SELECT (pg_get_publication_tables('p')).*")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s := stmts[0].(*SelectStmt)
+	star, ok := s.Targets[0].Expr.(*StarExpr)
+	if !ok {
+		t.Fatalf("after rewrite, target = %T, want *StarExpr", s.Targets[0].Expr)
+	}
+	if star.Table != "__irs_0" {
+		t.Fatalf("after rewrite, target qualifier = %q, want __irs_0", star.Table)
+	}
+	if len(s.From) != 1 {
+		t.Fatalf("after rewrite, len(From) = %d, want 1", len(s.From))
+	}
+	tf := s.From[0].TableFunc
+	if tf == nil {
+		t.Fatalf("after rewrite, From[0].TableFunc is nil")
+	}
+	if tf.Name != "pg_get_publication_tables" {
+		t.Fatalf("rewritten SRF name = %q", tf.Name)
+	}
+	if s.From[0].Alias != "__irs_0" {
+		t.Fatalf("rewritten SRF alias = %q, want __irs_0", s.From[0].Alias)
+	}
+}
+
+// TestParseIndirectionStarFetchTableList — pins parse of the upstream
+// libpqrcv fetch_table_list shape end-to-end (subquery with VARIADIC
+// array_agg + composite expansion). M0103-0008 probe-survival.
+func TestParseIndirectionStarFetchTableList(t *testing.T) {
+	q := `SELECT DISTINCT n.nspname, c.relname, gpt.attrs
+  FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN ( SELECT (pg_get_publication_tables(VARIADIC array_agg(pubname::text))).*
+           FROM pg_publication
+           WHERE pubname IN ('p') ) AS gpt
+    ON gpt.relid = c.oid`
+	if _, err := Parse(q); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+}
+
+// TestParseFuncCallVariadicMixed pins parser acceptance of VARIADIC on the
+// trailing argument of a multi-argument call. Non-VARIADIC arguments must
+// retain Variadic[i]=false.
+func TestParseFuncCallVariadicMixed(t *testing.T) {
+	stmts, err := Parse("SELECT f(1, VARIADIC x)")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	s := stmts[0].(*SelectStmt)
+	fc, ok := s.Targets[0].Expr.(*FuncCall)
+	if !ok {
+		t.Fatalf("expected FuncCall, got %T", s.Targets[0].Expr)
+	}
+	if len(fc.Args) != 2 || len(fc.Variadic) != 2 {
+		t.Fatalf("args=%d variadic=%d, want 2/2", len(fc.Args), len(fc.Variadic))
+	}
+	if fc.Variadic[0] {
+		t.Fatalf("arg 0 unexpectedly marked VARIADIC")
+	}
+	if !fc.Variadic[1] {
+		t.Fatalf("arg 1 expected VARIADIC, got false")
+	}
+}
+
 // TestParseSelectSyntaxErrors pins error positions for the canonical
 // "missing piece" cases.
 func TestParseSelectSyntaxErrors(t *testing.T) {

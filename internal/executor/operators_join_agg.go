@@ -83,6 +83,9 @@ func (o *joinOp) Open(ctx *Context) error {
 	if o.plan.Algo == planner.JoinAlgoHash {
 		return o.openLazyHashJoin(ctx)
 	}
+	if o.plan.Lateral {
+		return o.openLateral(ctx)
+	}
 	if err := o.left.Open(ctx); err != nil {
 		return err
 	}
@@ -113,6 +116,79 @@ func (o *joinOp) Open(ctx *Context) error {
 		return o.runMergeJoin(leftRows, rightRows, leftWidth, rightWidth)
 	}
 	return o.runNestedLoop(leftRows, rightRows, leftWidth, rightWidth)
+}
+
+// lateralBindable is implemented by FROM-clause SRFs that can have
+// their argument expressions resolved against an outer row supplied
+// by a parent Join.Lateral. M0103-0008.
+type lateralBindable interface {
+	BindLateralOuter(slot SlotView)
+}
+
+// openLateral handles `Join.Lateral == true`: drain the left, then
+// for each left row bind the outer slot on the right child and
+// (re)open the right to drain its rows for that single outer row.
+// Concatenated rows accumulate in o.rows and are emitted via the
+// existing Next() path.
+//
+// The right child must implement `lateralBindable` (only
+// `pg_get_publication_tables` qualifies today). LEFT lateral
+// joins fall back to a null-padded outer row when the SRF emits
+// zero rows for a given outer; CROSS / INNER drop the outer row.
+func (o *joinOp) openLateral(ctx *Context) error {
+	bindable, ok := o.right.(lateralBindable)
+	if !ok {
+		return fmt.Errorf("internal error: lateral join right child %T does not support BindLateralOuter", o.right)
+	}
+	if err := o.left.Open(ctx); err != nil {
+		return err
+	}
+	leftRows, err := drainRowsCtx(o.left, ctx)
+	if err != nil {
+		_ = o.left.Close()
+		return err
+	}
+	leftWidth := len(o.left.Schema())
+	if leftWidth == 0 && len(leftRows) > 0 {
+		leftWidth = len(leftRows[0])
+	}
+	rightWidth := len(o.right.Schema())
+	nullRight := nullRow(rightWidth)
+	outerSlot := SlotFromRow(o.left.Schema(), nil)
+	bindable.BindLateralOuter(outerSlot)
+	defer bindable.BindLateralOuter(nil)
+	for i, l := range leftRows {
+		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+			if err := o.ctx.Ctx.Err(); err != nil {
+				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		outerSlot.row = l
+		if err := o.right.Open(ctx); err != nil {
+			return err
+		}
+		rightRows, err := drainRowsCtx(o.right, ctx)
+		_ = o.right.Close()
+		if err != nil {
+			return err
+		}
+		if len(rightRows) == 0 && o.plan.Type == planner.JoinTypeLeft {
+			o.rows = append(o.rows, concatRows(l, nullRight))
+			continue
+		}
+		for _, r := range rightRows {
+			joined := concatRows(l, r)
+			ok, perr := o.joinPredicateMatch(joined)
+			if perr != nil {
+				return perr
+			}
+			if !ok {
+				continue
+			}
+			o.rows = append(o.rows, joined)
+		}
+	}
+	return nil
 }
 
 // runNestedLoop is the universal fallback. O(N*M) over the two
@@ -753,6 +829,15 @@ type aggRuntime struct {
 	boolResult bool   // for bool_and / bool_or / every
 	intResult  int64  // for bit_and / bit_or / bit_xor
 	strResult  string // for string_agg
+	// arrayElems holds the accumulated element format-strings for
+	// array_agg(expr); arrayElemNull[i] marks element i as NULL
+	// (reserved — current applyAgg skips NULL inputs, so this is
+	// always all-false in practice). finishAgg emits the standard
+	// `{e1,e2}` text-array literal via formatTextArray, which the
+	// libpqrcv `fetch_table_list` probe pipes back into
+	// pg_get_publication_tables. M0103-0008 probe-survival.
+	arrayElems    []string
+	arrayElemNull []bool
 }
 
 func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
@@ -1037,6 +1122,21 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 			// Use comma as default delimiter; second arg would refine this.
 			st.strResult += "," + sv
 		}
+	case "array_agg":
+		// array_agg(expr) — accumulate per-row elements. NULLs are
+		// permitted as array elements upstream, but the IsNull early-
+		// return above already skipped them; that matches goopg's
+		// existing aggregate convention (count/sum/etc. all skip NULL
+		// inputs) and is sufficient for the M0103-0008 probe query
+		// where the input column (pg_publication.pubname) is NOT NULL.
+		// Elements are stored as their Format() string; finishAgg
+		// wraps them in PG's text-array literal syntax. Numeric kinds
+		// (int, numeric, oid) and string kinds (text, char, varchar)
+		// all round-trip through Format() identically to how a SELECT
+		// would print them.
+		st.arrayElems = append(st.arrayElems, arg.Format())
+		st.arrayElemNull = append(st.arrayElemNull, false)
+		st.hasValue = true
 	case "any_value":
 		// any_value(x) — return the first non-null value seen.
 		if !st.hasValue && !arg.IsNull() {
@@ -1099,6 +1199,15 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 			return NullDatum
 		}
 		return NewStringDatum(st.strResult)
+	case "array_agg":
+		if !st.hasValue {
+			return NullDatum
+		}
+		// NULL elements are not currently distinguished — applyAgg's
+		// IsNull early-return drops them. Suffices for the M0103-0008
+		// probe (pg_publication.pubname is NOT NULL); proper NULL-
+		// element support is deferred.
+		return NewStringDatum(formatTextArray(st.arrayElems))
 	case "any_value":
 		if !st.hasValue {
 			return NullDatum

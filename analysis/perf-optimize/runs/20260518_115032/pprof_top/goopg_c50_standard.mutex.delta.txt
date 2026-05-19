@@ -1,0 +1,24 @@
+# go tool pprof -top -nodecount=40 -cum -base /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c50_standard.mutex_base.pb.gz /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c50_standard.mutex.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 12:24:19 JST
+Showing nodes accounting for 5400.35s, 99.76% of 5413.39s total
+Dropped 535 nodes (cum <= 27.07s)
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%   5401.34s 99.78%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0%     0%   5401.34s 99.78%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0%     0%   5401.34s 99.78%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0%     0%   5400.79s 99.77%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+         0     0%     0%   5400.79s 99.77%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0%     0%   5400.79s 99.77%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+  5400.35s 99.76% 99.76%   5400.38s 99.76%  sync.(*Mutex).Unlock
+         0     0% 99.76%   4969.36s 91.80%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+         0     0% 99.76%   4915.58s 90.80%  github.com/goopg/goopg/internal/mvcc.(*Manager).Commit (inline)
+         0     0% 99.76%   4915.58s 90.80%  github.com/goopg/goopg/internal/mvcc.(*Manager).finish
+         0     0% 99.76%    402.27s  7.43%  github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor
+         0     0% 99.76%     51.49s  0.95%  github.com/goopg/goopg/internal/executor.(*updateOp).Next
+         0     0% 99.76%     28.47s  0.53%  github.com/goopg/goopg/internal/mvcc.(*Manager).Begin
+         0     0% 99.76%     27.66s  0.51%  github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex
+         0     0% 99.76%     27.38s  0.51%  github.com/goopg/goopg/internal/executor.tryApplyHOTUpdate
+         0     0% 99.76%     27.19s   0.5%  github.com/goopg/goopg/internal/mvcc.(*Manager).OldestXmin

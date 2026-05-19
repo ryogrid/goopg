@@ -1,0 +1,49 @@
+# go tool pprof -top -nodecount=40 -cum -base /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_simple-update.block_base.pb.gz /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/profiles/goopg_c100_simple-update.block.pb.gz
+File: goopg.bin
+Build ID: 595402bf1044e083633b4bc806628a762cf4a1d4
+Type: delay
+Time: 2026-05-18 12:37:05 JST
+Showing nodes accounting for 1.73hrs, 100% of 1.73hrs total
+Dropped 116 nodes (cum <= 0.01hrs)
+Showing top 40 nodes out of 42
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%    1.49hrs 86.06%  github.com/goopg/goopg/internal/server.(*Server).acceptLoop.func1
+         0     0%     0%    1.49hrs 86.06%  github.com/goopg/goopg/internal/server.(*Server).runPostStartupLoop
+         0     0%     0%    1.49hrs 86.06%  github.com/goopg/goopg/internal/server.(*Server).serveConn
+         0     0%     0%    1.49hrs 86.05%  github.com/goopg/goopg/internal/server.(*Server).dispatchSimpleQueryViaExecutor
+         0     0%     0%    1.49hrs 86.05%  github.com/goopg/goopg/internal/server.(*Server).handleQuery
+         0     0%     0%    1.49hrs 86.05%  github.com/goopg/goopg/internal/server.(*Server).handleQueryOrCopy
+   1.48hrs 85.45% 85.45%    1.48hrs 85.45%  sync.(*Mutex).Lock (inline)
+         0     0% 85.45%    1.11hrs 64.30%  github.com/goopg/goopg/internal/mvcc.(*Manager).SnapshotFor
+         0     0% 85.45%    0.26hrs 14.80%  github.com/goopg/goopg/internal/server.(*Server).executeOneSimpleStmt
+   0.19hrs 10.98% 96.42%    0.19hrs 10.98%  runtime.selectgo
+         0     0% 96.42%    0.15hrs  8.93%  github.com/goopg/goopg/internal/executor.(*updateOp).Next
+         0     0% 96.42%    0.12hrs  6.95%  github.com/goopg/goopg/internal/mvcc.(*Manager).Begin
+         0     0% 96.42%    0.10hrs  5.87%  github.com/goopg/goopg/internal/mvcc.(*Manager).Commit (inline)
+         0     0% 96.42%    0.10hrs  5.87%  github.com/goopg/goopg/internal/mvcc.(*Manager).finish
+         0     0% 96.42%    0.08hrs  4.61%  github.com/goopg/goopg/internal/executor.(*Context).MaterializeWriterXID
+         0     0% 96.42%    0.08hrs  4.61%  github.com/goopg/goopg/internal/mvcc.(*Manager).AssignXID
+         0     0% 96.42%    0.07hrs  4.32%  github.com/goopg/goopg/internal/executor.(*updateOp).updateViaIndex
+         0     0% 96.42%    0.07hrs  4.32%  github.com/goopg/goopg/internal/executor.tryApplyHOTUpdate
+         0     0% 96.42%    0.07hrs  4.31%  github.com/goopg/goopg/internal/mvcc.(*Manager).OldestXmin
+         0     0% 96.42%    0.04hrs  2.59%  github.com/goopg/goopg/internal/aio.(*methodWorker).run
+         0     0% 96.42%    0.04hrs  2.59%  github.com/goopg/goopg/internal/aio.newMethodWorker.gowrap1
+   0.04hrs  2.59% 99.01%    0.04hrs  2.59%  runtime.chanrecv2
+         0     0% 99.01%    0.04hrs  2.42%  net/http.(*Server).Serve.gowrap3
+         0     0% 99.01%    0.04hrs  2.42%  net/http.(*conn).serve
+         0     0% 99.01%    0.04hrs  2.42%  net/http.(*ServeMux).ServeHTTP
+         0     0% 99.01%    0.04hrs  2.42%  net/http.HandlerFunc.ServeHTTP
+         0     0% 99.01%    0.04hrs  2.42%  net/http.serverHandler.ServeHTTP
+         0     0% 99.01%    0.04hrs  2.42%  net/http/pprof.sleep
+         0     0% 99.01%    0.03hrs  1.94%  net/http/pprof.Profile
+         0     0% 99.01%    0.03hrs  1.94%  github.com/goopg/goopg/internal/wal.(*Checkpointer).Run
+         0     0% 99.01%    0.03hrs  1.94%  main.runStart.func4
+         0     0% 99.01%    0.03hrs  1.94%  github.com/goopg/goopg/internal/server.(*ApplyLauncher).Run
+         0     0% 99.01%    0.03hrs  1.94%  github.com/goopg/goopg/internal/server.(*Server).Run.gowrap2
+         0     0% 99.01%    0.03hrs  1.94%  github.com/goopg/goopg/internal/initdb.Open.func37
+         0     0% 99.01%    0.02hrs  1.33%  github.com/goopg/goopg/internal/wal.(*state).loop
+         0     0% 99.01%    0.02hrs  1.33%  github.com/goopg/goopg/internal/wal.NewWriter.gowrap1
+   0.02hrs  0.98%   100%    0.02hrs  0.98%  runtime.chanrecv1
+         0     0%   100%    0.02hrs  0.96%  runtime.(*wakeableSleep).sleep
+         0     0%   100%    0.01hrs  0.83%  github.com/goopg/goopg/internal/storage.(*Bgwriter).Start.gowrap1
+         0     0%   100%    0.01hrs  0.83%  github.com/goopg/goopg/internal/storage.(*Bgwriter).run

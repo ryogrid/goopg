@@ -1,6 +1,6 @@
 # 0100-0001 — Isolation-Level Snapshot Semantics (RR/Serializable BEGIN-time snapshot)
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-05-13
 **Milestone:** M0100-0001
 **Closes:** M0096-0013 (one of the documented remaining blockers)

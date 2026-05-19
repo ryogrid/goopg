@@ -1,0 +1,114 @@
+[11:50:32] RUN_ID=20260518_115032
+[11:50:32] DATA_ROOT=/home/ryo/work/goopg/goopg/tmp/perf-optimize/20260518_115032
+[11:50:32] RUN_DIR=/home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032
+[11:50:32] GOOPG_PORT=5533  PG_PORT=5534  PPROF_PORT=6160
+[11:50:32] DURATION=180s  CLIENT_COUNTS=10 50 100  SCALE=100
+[11:50:32] free RAM (available): 25 GiB
+[11:50:32] disk: Filesystem     1G-blocks  Used Available Use% Mounted on
+/dev/sdd           1007G  132G      825G  14% /
+[11:50:32] ralph status (no edit): 2026-05-18 11:45:56.566105675 +0900
+[11:50:32] goopg sha256: 2d1beac83c693811930fae4a3cc47f4b1610b7f8c4f9c17f9d773951bd597183
+[11:50:32] pgbench: pgbench (PostgreSQL) 18.3
+[11:50:32] psql:    psql (PostgreSQL) 18.3
+[11:50:32] init goopg cluster at /home/ryo/work/goopg/goopg/tmp/perf-optimize/20260518_115032/goopg-data
+goopg init: created data directory at /home/ryo/work/goopg/goopg/tmp/perf-optimize/20260518_115032/goopg-data
+[11:50:32] init PG cluster at /home/ryo/work/goopg/goopg/tmp/perf-optimize/20260518_115032/pg-data
+The files belonging to this database system will be owned by user "ryo".
+This user must also own the server process.
+
+The database cluster will be initialized with locale "C".
+The default text search configuration will be set to "english".
+
+Data page checksums are enabled.
+
+creating directory /home/ryo/work/goopg/goopg/tmp/perf-optimize/20260518_115032/pg-data ... ok
+creating subdirectories ... ok
+selecting dynamic shared memory implementation ... posix
+selecting default "max_connections" ... 100
+selecting default "shared_buffers" ... 128MB
+selecting default time zone ... Asia/Tokyo
+creating configuration files ... ok
+running bootstrap script ... ok
+performing post-bootstrap initialization ... ok
+syncing data to disk ... ok
+
+initdb: warning: enabling "trust" authentication for local connections
+initdb: hint: You can change this by editing pg_hba.conf or using the option -A, or --auth-local and --auth-host, the next time you run initdb.
+
+Success. You can now start the database server using:
+
+    /home/ryo/work/goopg/goopg/postgres/local_install/bin/pg_ctl -D /home/ryo/work/goopg/goopg/tmp/perf-optimize/20260518_115032/pg-data -l logfile start
+
+[11:50:35] archived goopg binary to /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032/goopg.bin
+[11:50:35] starting goopg (GOMEMLIMIT=18GiB, mutex_rate=1, block_rate=1)
+[11:50:35] goopg ready on port 5533 (after 2 tries)
+[11:50:36] pprof endpoint OK on :6160
+[11:50:36] starting PG on port 5534
+waiting for server to start.... done
+server started
+[11:50:37] postgres ready on port 5534 (after 1 tries)
+[11:50:37] pgbench -i -s 100 against goopg (port 5533)
+[11:51:24] pgbench -i -s 100 against pg (port 5534)
+[11:51:53] restart goopg (clears mutex/block sampling history)
+[11:51:53] stopping goopg (pid=492822)
+goopg stop: server stopped
+[11:51:55] starting goopg (GOMEMLIMIT=18GiB, mutex_rate=1, block_rate=1)
+[11:51:56] goopg ready on port 5533 (after 2 tries)
+[11:51:57] pprof endpoint OK on :6160
+[11:51:57] RUN goopg_c10_select-only  -c 10 -j 10 -T 180 -S
+[11:55:08]   → TPS=2307.739126
+[11:55:08] RUN pg_c10_select-only  -c 10 -j 10 -T 180 -S
+[11:58:18]   → TPS=37062.323774
+[11:58:18] RUN goopg_c10_simple-update  -c 10 -j 10 -T 180 -N
+[12:01:29]   → TPS=410.491713
+[12:01:29] RUN pg_c10_simple-update  -c 10 -j 10 -T 180 -N
+[12:04:38]   → TPS=3355.169027
+[12:04:38] RUN goopg_c10_standard  -c 10 -j 10 -T 180 
+[12:07:49]   → TPS=349.291649
+[12:07:49] RUN pg_c10_standard  -c 10 -j 10 -T 180 
+[12:11:00]   → TPS=2332.807396
+[12:11:00] restart goopg (clears mutex/block sampling history)
+[12:11:00] stopping goopg (pid=497740)
+goopg stop: server stopped
+[12:11:02] starting goopg (GOMEMLIMIT=18GiB, mutex_rate=1, block_rate=1)
+[12:11:02] goopg ready on port 5533 (after 2 tries)
+[12:11:03] pprof endpoint OK on :6160
+[12:11:03] RUN goopg_c50_select-only  -c 50 -j 50 -T 180 -S
+[12:14:13]   → TPS=5033.853897
+[12:14:13] RUN pg_c50_select-only  -c 50 -j 50 -T 180 -S
+[12:17:25]   → TPS=62455.122752
+[12:17:25] RUN goopg_c50_simple-update  -c 50 -j 50 -T 180 -N
+[12:20:35]   → TPS=347.255900
+[12:20:35] RUN pg_c50_simple-update  -c 50 -j 50 -T 180 -N
+[12:23:47]   → TPS=10166.490048
+[12:23:47] RUN goopg_c50_standard  -c 50 -j 50 -T 180 
+[12:26:58]   → TPS=338.477521
+[12:26:58] RUN pg_c50_standard  -c 50 -j 50 -T 180 
+[12:30:08]   → TPS=7111.979894
+[12:30:08] restart goopg (clears mutex/block sampling history)
+[12:30:08] stopping goopg (pid=546296)
+goopg stop: server stopped
+[12:30:09] starting goopg (GOMEMLIMIT=18GiB, mutex_rate=1, block_rate=1)
+[12:30:10] goopg ready on port 5533 (after 2 tries)
+[12:30:11] pprof endpoint OK on :6160
+[12:30:11] RUN goopg_c100_select-only  -c 100 -j 100 -T 180 -S
+[12:33:23]   → TPS=6399.644590
+[12:33:23] RUN pg_c100_select-only  -c 100 -j 100 -T 180 -S
+[12:36:32]   → TPS=45769.870275
+[12:36:33] RUN goopg_c100_simple-update  -c 100 -j 100 -T 180 -N
+[13:03:47]   → exit=143
+[13:03:47]   → c=100 failure on goopg — marking SKIPPED, continuing per plan
+[13:03:47] RUN pg_c100_simple-update  -c 100 -j 100 -T 180 -N
+[13:06:59]   → TPS=9658.302452
+[13:06:59] RUN goopg_c100_standard  -c 100 -j 100 -T 180 
+[13:11:16]   → exit=143
+[13:11:16]   → c=100 failure on goopg — marking SKIPPED, continuing per plan
+[13:11:16] RUN pg_c100_standard  -c 100 -j 100 -T 180 
+[13:14:29]   → TPS=6470.468231
+[13:14:29] all patterns complete
+[13:14:29] artefacts under /home/ryo/work/goopg/goopg/analysis/perf-optimize/runs/20260518_115032
+[13:14:29] stopping goopg (pid=575065)
+goopg stop: server did not exit within 30s
+[13:15:16] stopping PG
+waiting for server to shut down....... done
+server stopped

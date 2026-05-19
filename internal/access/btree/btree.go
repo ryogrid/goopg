@@ -687,6 +687,14 @@ func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
 func CreateWithOptions(pool *storage.Pool, rel storage.RelFileNode, opts Options) (*BTree, error) {
 	bt := &BTree{pool: pool, rel: rel, logSplit: opts.LogSplit}
 
+	// Ensure the relation file starts at block 0 (see
+	// BulkCreateWithOptions for rationale).
+	mgr := pool.Manager()
+	if err := mgr.TruncateRelation(rel); err != nil {
+		return nil, fmt.Errorf("btree: truncate relation: %w", err)
+	}
+	pool.InvalidateRel(rel)
+
 	// Block 0: metapage.
 	metaSlot, metaBlk, err := pool.PinNew(rel)
 	if err != nil {

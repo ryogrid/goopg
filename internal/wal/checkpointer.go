@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"time"
+
+	"github.com/goopg/goopg/internal/control"
 )
 
 // DirtyPageFlusher is the buffer-pool contract used by the checkpointer.
@@ -76,6 +78,30 @@ type CheckpointerConfig struct {
 	// always run at IMMEDIATE speed and ignore this knob.
 	CompletionTarget float64
 	Logger           *slog.Logger
+	// SegmentSize is the WAL segment size (default 16 MiB). Only used
+	// by EncodeCheckpointCompat to compute the correct first-page
+	// header size when encoding a PG-compatible checkpoint record.
+	SegmentSize int64
+	// DataDir, when non-empty, causes each successful checkpoint to
+	// update <DataDir>/global/pg_control via control.UpdateControlFile.
+	// When empty the pg_control update is skipped (tests that don't
+	// write a real data directory leave this blank).
+	DataDir string
+
+	// GUCParams holds the 8 GUC echo fields that are written into pg_control
+	// at each checkpoint so a PG standby always reads consistent values.
+	// Populated by initdb.Open from DefaultGUCParameters() at server start.
+	// M0106-0010 batched-33.
+	GUCParams GUCParameters
+
+	// NextXIDFn, when non-nil, is invoked at each checkpoint to read the
+	// live "next-to-assign" XID from the MVCC manager so the
+	// checkpointCopy.nextXid field in pg_control reflects current XID
+	// consumption. Without this hook the field stays at the bootstrap
+	// value (FirstNormalTransactionId = 3) and a PG standby attached via
+	// basebackup boots with snapshot xmax=3, hiding every tuple created
+	// after initdb. M0106-0010 batched-45.
+	NextXIDFn func() uint64
 }
 
 func (c *CheckpointerConfig) withDefaults() {
@@ -105,6 +131,7 @@ type Checkpointer struct {
 	retainer Retainer
 
 	lastCheckpointLSN atomic.Uint64
+	lastCheckpointRedoLSN atomic.Uint64
 
 	// Aggregate counters surfaced through pg_stat_checkpointer.
 	// Mirror the upstream PG 18 view's counter shape:
@@ -156,6 +183,19 @@ func NewCheckpointer(flusher DirtyPageFlusher, wal checkpointWAL, cfg Checkpoint
 // LastCheckpointLSN returns the most recent successful checkpoint marker LSN.
 func (c *Checkpointer) LastCheckpointLSN() uint64 {
 	return c.lastCheckpointLSN.Load()
+}
+
+// LastCheckpointRedoLSN returns the REDO LSN (start byte of the checkpoint
+// record) for the most recent successful checkpoint. This is the position
+// from which crash recovery must replay. Exported for BASE_BACKUP's
+// pg_control update path (M0102-0007).
+func (c *Checkpointer) LastCheckpointRedoLSN() uint64 {
+	return c.lastCheckpointRedoLSN.Load()
+}
+
+// CheckpointRedoLSN is the executor.Checkpointer interface method.
+func (c *Checkpointer) CheckpointRedoLSN() uint64 {
+	return c.lastCheckpointRedoLSN.Load()
 }
 
 // SetInterval updates the periodic checkpoint cadence. Call before
@@ -305,14 +345,88 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 		}
 	}
 	c.writeTimeMs.Add(uint64(time.Since(flushStart).Milliseconds()))
-	_, endLSN, err := c.wal.Append(EncodeCheckpoint())
+	// M0102-0007: pre-compute the 0-based redo LSN so the
+	// PG-compatible checkpoint record carries the correct
+	// checkPoint.redo — PG's xlogreader validates it.
+	pos := int64(uint64(0))
+	if vr, ok := c.wal.(volumeReporter); ok {
+		pos = int64(vr.WrittenLSN())
+	}
+	segSize := c.cfg.SegmentSize
+	if segSize <= 0 {
+		segSize = DefaultSegmentSize
+	}
+	leading := 0
+	if pos%XLOGBlockSize == 0 {
+		leading = SizeOfXLogShortPHD
+		if segSize > 0 && pos%segSize == 0 {
+			leading = SizeOfXLogLongPHD
+		}
+	}
+	redoLSN0 := uint64(pos + int64(leading))
+	// M0106-0010 batched-47: sample nextXid from the mvcc manager
+	// BEFORE appending the checkpoint record so the on-wire CheckPoint
+	// payload carries the live value. The standby reads nextXid out of
+	// this record to initialise ShmemVariableCache->nextXid and
+	// latestCompletedXid; if the value lags goopg's real allocator, the
+	// standby's recovery snapshots treat post-initdb tuples as "future"
+	// and 42P01s every user table on the first SELECT.
+	var nextXid uint64
+	if c.cfg.NextXIDFn != nil {
+		nextXid = c.cfg.NextXIDFn()
+	}
+	startLSN, endLSN, err := c.wal.Append(EncodeCheckpointCompat(redoLSN0, 1, nextXid))
 	if err != nil {
 		return fmt.Errorf("append checkpoint marker: %w", err)
 	}
 	if err := c.wal.FlushUpTo(endLSN); err != nil {
 		return fmt.Errorf("flush checkpoint marker up to lsn %d: %w", endLSN, err)
 	}
+	// M0102-0007: store REDO LSN (start of checkpoint record) for
+	// BASE_BACKUP so pg_control carries a valid redo point.
+	c.lastCheckpointRedoLSN.Store(startLSN)
 	c.lastCheckpointLSN.Store(endLSN)
+	// Update pg_control on disk so pg_controldata and standbys see the
+	// current checkpoint location. Mirrors CreateCheckPoint (post-flush)
+	// in upstream's UpdateControlFile call (xlog.c:7306).
+	if c.cfg.DataDir != "" {
+		checkLSN0 := startLSN - 1 // convert 1-based internal to 0-based PG LSN
+		now := time.Now().Unix()
+		guc := c.cfg.GUCParams
+		if err := control.UpdateControlFile(c.cfg.DataDir, func(cd *control.ControlFileData) {
+			cd.State = control.DBStateInProduction
+			cd.Time = now
+			cd.CheckPoint = checkLSN0
+			cd.CheckPointCopyRedo = redoLSN0
+			cd.CheckPointCopyTime = now
+			cd.CheckPointCopyThisTLI = 1
+			cd.CheckPointCopyPrevTLI = 1
+			cd.CheckPointCopyFullPageWrites = true
+			// M0106-0010 batched-45: refresh checkPointCopy.nextXid so a
+			// PG standby attached after this checkpoint sees the right
+			// snapshot xmax instead of the bootstrap FirstNormalXID=3.
+			// Only update when the hook is wired and the value advances —
+			// nextXid in pg_control must be monotonic.
+			if nextXid > cd.CheckPointCopyNextXid {
+				cd.CheckPointCopyNextXid = nextXid
+			}
+			cd.MinRecoveryPoint = 0
+			cd.MinRecoveryPointTLI = 0
+			// Refresh GUC echo fields at every checkpoint so a standby that
+			// attaches after the checkpoint record always sees consistent values.
+			// Mirrors CreateCheckPoint's ControlFile copy in xlog.c. M0106-0010.
+			cd.WalLevel = uint32(guc.WalLevel)
+			cd.WalLogHints = guc.WalLogHints
+			cd.MaxConnections = uint32(guc.MaxConnections)
+			cd.MaxWorkerProcesses = uint32(guc.MaxWorkerProcesses)
+			cd.MaxWalSenders = uint32(guc.MaxWalSenders)
+			cd.MaxPreparedXacts = uint32(guc.MaxPreparedXacts)
+			cd.MaxLocksPerXact = uint32(guc.MaxLocksPerXact)
+			cd.TrackCommitTimestamp = guc.TrackCommitTimestamp
+		}); err != nil {
+			c.cfg.Logger.Warn("pg_control update failed after checkpoint", "err", err)
+		}
+	}
 	if spread {
 		c.numTimed.Add(1)
 	} else {

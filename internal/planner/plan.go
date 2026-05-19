@@ -59,6 +59,23 @@ type IntegerConst struct {
 func (e *IntegerConst) Pos() int { return e.pos }
 func (*IntegerConst) exprNode()  {}
 
+// TableOidExpr is the per-binding `tableoid` system column for a
+// non-partitioned base relation. resolveColumnRefAt synthesises this
+// when the binding is bound to a single concrete table whose OID is
+// known at plan time (i.e. the `tableoid::regclass` value is a
+// constant). Partition-aware unions instead emit a real per-leaf
+// `tableoid` column via the per-leaf Project wrapping (see
+// planFromTable's partition arm + rangeBinding.tableOidColIdx) so the
+// outer `tableoid` reference becomes an ordinary ColumnRef into the
+// trailing slot. (M0100-0005y)
+type TableOidExpr struct {
+	pos      int
+	TableOID uint32
+}
+
+func (e *TableOidExpr) Pos() int { return e.pos }
+func (*TableOidExpr) exprNode()  {}
+
 // StringConst — string literal.
 type StringConst struct {
 	pos   int
@@ -512,17 +529,23 @@ const (
 // their keys and merges the two ordered streams, preserving
 // RIGHT/FULL outer-row semantics.
 type Join struct {
-	pos       int
-	Type      JoinType
-	Algo      JoinAlgo
-	Left      Node
-	Right     Node
-	Predicate Expr
-	LeftKey   Expr // populated when Algo == JoinAlgoHash
-	RightKey  Expr
-	BuildLeft bool // hash join: build on left input instead of right
-	schema    Schema
-}
+		pos       int
+		Type      JoinType
+		Algo      JoinAlgo
+		Left      Node
+		Right     Node
+		Predicate Expr
+		LeftKey   Expr // populated when Algo == JoinAlgoHash
+		RightKey  Expr
+		BuildLeft bool // hash join: build on left input instead of right
+		// Lateral marks the right child as referencing the left
+		// child's columns through a FROM-clause LATERAL SRF (M0103-0008).
+		// The executor must drive the right per-outer-row, binding the
+		// left row as the lateral outer slot (BindLateralOuter contract)
+		// instead of materialising both sides up front.
+		Lateral bool
+		schema  Schema
+	}
 
 func (n *Join) Pos() int       { return n.pos }
 func (n *Join) Output() Schema { return n.schema }
@@ -695,11 +718,18 @@ type Limit struct {
 func (n *Limit) Pos() int       { return n.pos }
 func (n *Limit) Output() Schema { return n.Child.Output() }
 
-// Values — produces literal rows for INSERT.
+// Values — produces literal rows for INSERT, or rematerialises a
+// virtual catalog table's current row set at execute time when
+// VirtualSource is non-nil. The Rows slice is the snapshot captured
+// at plan time; when VirtualSource is set, the executor refreshes it
+// by calling VirtualSource.VirtualRows() on Open so the cross-session
+// plan cache cannot serve a stale snapshot of a dynamic view
+// (M0094-0005).
 type Values struct {
-	pos    int
-	Rows   [][]Expr
-	schema Schema
+	pos           int
+	Rows          [][]Expr
+	schema        Schema
+	VirtualSource *catalog.Table
 }
 
 func (n *Values) Pos() int       { return n.pos }
@@ -730,6 +760,46 @@ type PgInputErrorInfo struct {
 	schema Schema
 }
 
+
+// PgGetPublicationTables implements pg_get_publication_tables(VARIADIC text[])
+// as a FROM-clause SRF. It walks the PubSub registry, filtering by the supplied
+// publication-name list, and returns one row per (publication, table) pair.
+// Used by libpqrcv's CREATE SUBSCRIPTION fetch_table_list probe (M0103-0008
+// probe-survival). Composite-expansion of `(srf()).*` in scalar position is
+// out of scope for this loop; callers must invoke this function from the FROM
+// clause. The output schema mirrors upstream's return type as closely as
+// possible without composite-type support: `(relid oid, attrs text, qual text)`.
+type PgGetPublicationTables struct {
+	pos    int
+	Args   []Expr // raw VARIADIC argument list (text[] or text values)
+	schema Schema
+}
+
+
+// ProjectSet evaluates a single set-returning function call per Child row
+// and emits each row of its composite result as one output row.
+//
+// Currently implemented only for `pg_get_publication_tables`; SrfArgs are
+// resolved Exprs whose ColumnRefs index into Child.Output(), so an
+// `Aggregate → ProjectSet(srf(<agg-output-col>))` plan can spread the
+// SRF's expansion of an aggregated text[] back over multiple rows.
+//
+// The output schema is the SRF's expanded composite (relid, attrs, qual
+// for pg_get_publication_tables). M0103-0008 final sub-step.
+type ProjectSet struct {
+	pos     int
+	Child   Node
+	SrfName string
+	SrfArgs []Expr
+	schema  Schema
+}
+
+func (n *ProjectSet) Pos() int       { return n.pos }
+func (n *ProjectSet) Output() Schema { return n.schema }
+
+func (n *PgGetPublicationTables) Pos() int       { return n.pos }
+func (n *PgGetPublicationTables) Output() Schema { return n.schema }
+
 func (n *PgInputErrorInfo) Pos() int       { return n.pos }
 func (n *PgInputErrorInfo) Output() Schema { return n.schema }
 
@@ -753,11 +823,13 @@ func (n *ScalarFuncScan) Output() Schema { return n.schema }
 // nil for a plain INSERT — every existing test path keeps that
 // nil-default. Non-nil for the upstream-compatible UPSERT shape.
 type Insert struct {
-	pos         int
-	Table       *catalog.Table
-	Source      Node
-	ColumnIndex []int
-	OnConflict  *OnConflictPlan
+	pos             int
+	Table           *catalog.Table
+	Source          Node
+	ColumnIndex     []int
+	OnConflict      *OnConflictPlan
+	Returning       []Expr // per-target RETURNING expressions (nil = no RETURNING)
+	ReturningSchema Schema // output schema when Returning is non-nil
 }
 
 func (n *Insert) Pos() int       { return n.pos }
@@ -890,25 +962,29 @@ type OnConflictPlan struct {
 // existing value alone; non-nil entries are evaluated against the
 // child's rows.
 type Update struct {
-	pos   int
-	Table *catalog.Table
-	Child Node
-	Set   []Expr // len == len(Table.Columns)
+	pos             int
+	Table           *catalog.Table
+	Child           Node
+	Set             []Expr // len == len(Table.Columns)
+	Returning       []Expr // per-target RETURNING expressions (nil = no RETURNING)
+	ReturningSchema Schema // output schema when Returning is non-nil
 }
 
 func (n *Update) Pos() int       { return n.pos }
-func (n *Update) Output() Schema { return nil }
+func (n *Update) Output() Schema { return n.ReturningSchema }
 
 // Delete — marks the visible rows of Table that survive the child's
 // filter as dead.
 type Delete struct {
-	pos   int
-	Table *catalog.Table
-	Child Node
+	pos             int
+	Table           *catalog.Table
+	Child           Node
+	Returning       []Expr
+	ReturningSchema Schema
 }
 
 func (n *Delete) Pos() int       { return n.pos }
-func (n *Delete) Output() Schema { return nil }
+func (n *Delete) Output() Schema { return n.ReturningSchema }
 
 // ── Merge plan node (M0096-0010) ─────────────────────────────────────────────
 

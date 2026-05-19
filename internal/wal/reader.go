@@ -13,6 +13,7 @@ type Record struct {
 	StartLSN uint64
 	EndLSN   uint64
 	Payload  []byte
+	XLog     *XLogDecodedRecord
 }
 
 // ReadAll decodes every record found under walDir across ordered
@@ -171,7 +172,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 		if len(fullBytes) < total {
 			break
 		}
-		payload, n, err := decodeRecordXLog(fullBytes)
+		decoded, err := decodeRecordXLogDetailed(fullBytes)
 		if err != nil {
 			tailStart := off + consumed
 			if tailStart > len(stream) {
@@ -185,7 +186,7 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			}
 			return nil, fmt.Errorf("wal: decode at offset %d: %w", off, err)
 		}
-		if n != len(fullBytes) {
+		if decoded.Consumed != len(fullBytes) {
 			tailStart := off + consumed
 			if tailStart > len(stream) {
 				tailStart = len(stream)
@@ -196,11 +197,11 @@ func readAllPageAware(stream []byte, segSize int64, baseOffset uint64) ([]Record
 			if int64(len(stream)-off) <= segSize {
 				break
 			}
-			return nil, fmt.Errorf("wal: decode size mismatch at offset %d: %d vs %d", off, n, len(fullBytes))
+			return nil, fmt.Errorf("wal: decode size mismatch at offset %d: %d vs %d", off, decoded.Consumed, len(fullBytes))
 		}
 		start := baseOffset + uint64(off) + 1
 		end := baseOffset + uint64(off) + uint64(consumed)
-		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: payload})
+		records = append(records, Record{StartLSN: start, EndLSN: end, Payload: decoded.Payload, XLog: decoded.XLog})
 		off += consumed
 	}
 	return records, nil

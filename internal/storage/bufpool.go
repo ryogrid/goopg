@@ -192,7 +192,7 @@ type Pool struct {
 	//
 	// Lock ordering: always acquire evictMu (Lock or RLock) before any
 	// partition lock.
-	evictMu sync.RWMutex
+	evictMu   sync.RWMutex
 	clockHand int
 
 	// OnPinWait is an optional hook called when Pool.Pin performs an
@@ -492,27 +492,27 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logger = slog.Default()
 	}
 	p := &Pool{
-		mgr:            mgr,
-		arena:          a,
-		slots:          make([]*Slot, cfg.Slots),
-		wal:            cfg.WAL,
-		logFPI:         cfg.LogPageImage,
-		logBtreeSplit:  cfg.LogBtreeSplit,
-		logHeapInsert:  cfg.LogHeapInsert,
-		logBtreeInsert: cfg.LogBtreeInsert,
-		logHeapDelete:    cfg.LogHeapDelete,
-		logHeapLock:      cfg.LogHeapLock,
-		logHeapVacuum:    cfg.LogHeapVacuum,
+		mgr:                      mgr,
+		arena:                    a,
+		slots:                    make([]*Slot, cfg.Slots),
+		wal:                      cfg.WAL,
+		logFPI:                   cfg.LogPageImage,
+		logBtreeSplit:            cfg.LogBtreeSplit,
+		logHeapInsert:            cfg.LogHeapInsert,
+		logBtreeInsert:           cfg.LogBtreeInsert,
+		logHeapDelete:            cfg.LogHeapDelete,
+		logHeapLock:              cfg.LogHeapLock,
+		logHeapVacuum:            cfg.LogHeapVacuum,
 		logBtreeVacuum:           cfg.LogBtreeVacuum,
 		logBtreeUnlinkPage:       cfg.LogBtreeUnlinkPage,
 		logBtreeNewRoot:          cfg.LogBtreeNewRoot,
 		logBtreeMarkPageHalfDead: cfg.LogBtreeMarkPageHalfDead,
 		logHeapFreeze:            cfg.LogHeapFreeze,
-		logHeapHotUpdate: cfg.LogHeapHotUpdate,
-		logHeapPruneOpt:  cfg.LogHeapPruneOpt,
-		logSmgrCreate:    cfg.LogSmgrCreate,
-		logChangeRecord:  cfg.LogChangeRecord,
-		logger:         logger,
+		logHeapHotUpdate:         cfg.LogHeapHotUpdate,
+		logHeapPruneOpt:          cfg.LogHeapPruneOpt,
+		logSmgrCreate:            cfg.LogSmgrCreate,
+		logChangeRecord:          cfg.LogChangeRecord,
+		logger:                   logger,
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
 	// M0098-0003: initialize 128 partitions.
@@ -769,6 +769,25 @@ func (p *Pool) InvalidateRel(rel RelFileNode) {
 	}
 }
 
+func (p *Pool) InvalidateBlock(tag BufferTag) {
+	p.evictMu.Lock()
+	defer p.evictMu.Unlock()
+	part := &p.partitions[tagPartition(tag)]
+	part.mu.Lock()
+	defer part.mu.Unlock()
+	idx, ok := part.byTag[tag]
+	if !ok {
+		return
+	}
+	s := p.slots[idx]
+	if s.pinCount.Load() > 0 {
+		return
+	}
+	s.valid = false
+	s.dirty = false
+	delete(part.byTag, tag)
+}
+
 // ErrNoBuffer is returned when every slot is pinned and the clock
 // sweep can't find a victim.
 var ErrNoBuffer = errors.New("no available buffer (all pinned)")
@@ -788,22 +807,23 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	needFlush := s.valid && s.dirty
 	oldTag := s.tag
 
-	if !needFlush {
-		// Remove from old partition byTag while holding evictMu.
-		oldPart := &p.partitions[tagPartition(oldTag)]
-		oldPart.mu.Lock()
-		delete(oldPart.byTag, oldTag)
-		oldPart.mu.Unlock()
-	}
-
 	// M0056-0001: reserve the slot BEFORE releasing evictMu so a
-	// concurrent Pin's evictLocked skips it.
+	// concurrent Pin's evictLocked skips it.  M0099-0004: partition
+	// cleanup (oldPart.mu) happens after releasing evictMu to avoid
+	// holding evictMu while waiting for a contended partition lock.
 	s.valid = false
 	s.dirty = false
 	s.tag = BufferTag{}
 	s.pinCount.Store(1)
 	s.usageCount.Store(1)
 	p.evictMu.Unlock()
+
+	if !needFlush {
+		oldPart := &p.partitions[tagPartition(oldTag)]
+		oldPart.mu.Lock()
+		delete(oldPart.byTag, oldTag)
+		oldPart.mu.Unlock()
+	}
 
 	if needFlush {
 		s.contentMu.Lock()
@@ -976,21 +996,24 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 	needFlush := s.valid && s.dirty
 	oldTag := s.tag
 
-	if !needFlush {
-		// Remove from old partition byTag while holding evictMu.
-		// Lock ordering: evictMu (held) → old partition lock.
-		oldPart := &p.partitions[tagPartition(oldTag)]
-		oldPart.mu.Lock()
-		delete(oldPart.byTag, oldTag)
-		oldPart.mu.Unlock()
-	}
-	// Reserve this slot while I/O runs outside evictMu.
+	// Reserve the slot before releasing evictMu so evictLocked skips it.
+	// M0099-0004: partition cleanup (oldPart.mu) now happens AFTER
+	// releasing evictMu to avoid holding evictMu while waiting for a
+	// contended partition lock.  Reservation makes the slot invisible
+	// to evictLocked; the old tag will be removed from byTag below.
 	s.valid = false
 	s.dirty = false
 	s.tag = BufferTag{}
 	s.pinCount.Store(1)
 	s.usageCount.Store(1)
 	p.evictMu.Unlock()
+
+	if !needFlush {
+		oldPart := &p.partitions[tagPartition(oldTag)]
+		oldPart.mu.Lock()
+		delete(oldPart.byTag, oldTag)
+		oldPart.mu.Unlock()
+	}
 
 	if needFlush {
 		s.contentMu.Lock()
@@ -1024,12 +1047,15 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 	}
 	s.contentMu.Unlock()
 
-	// Re-lock partition to publish (or handle concurrent publish).
-	// Remove from ioByTag and wake waiters regardless of success or
-	// failure so they can either pick up the cached page or retry.
+	// Re-lock partition to remove ioByTag and wake waiters.
+	// M0099-0004: Release part.mu before acquiring evictMu to
+	// respect lock ordering (evictMu before partition lock).
+	// Holding part.mu while waiting for evictMu can deadlock
+	// with the Pin→evictMu→oldPart.mu path above.
 	part.mu.Lock()
 	delete(part.ioByTag, tag)
 	part.ioCond.Broadcast()
+	part.mu.Unlock()
 
 	if err != nil {
 		p.evictMu.Lock()
@@ -1039,14 +1065,19 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 		s.valid = false
 		s.dirty = false
 		p.evictMu.Unlock()
-		part.mu.Unlock()
 		return nil, err
 	}
+
+	p.evictMu.Lock()
+
+	// Re-check for duplicate publish. Another goroutine may have
+	// published the same tag after we released part.mu above.
+	part.mu.Lock()
 	if idx, ok := part.byTag[tag]; ok {
+		part.mu.Unlock()
 		// Another goroutine published this tag while we were reading
 		// (e.g. via PinNew). Use that slot and release ours.
 		existing := p.slots[idx]
-		p.evictMu.Lock()
 		existing.pinCount.Add(1)
 		if existing.usageCount.Load() < maxUsageCount {
 			existing.usageCount.Add(1)
@@ -1057,14 +1088,14 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 		s.valid = false
 		s.dirty = false
 		p.evictMu.Unlock()
-		part.mu.Unlock()
 		return existing, nil
 	}
-	p.evictMu.Lock()
+
 	s.tag = tag
 	s.valid = true
 	s.dirty = false
 	p.evictMu.Unlock()
+
 	part.byTag[tag] = slotIdx
 	part.mu.Unlock()
 	return s, nil
@@ -1214,6 +1245,70 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 			return err
 		}
 		MustHeader(s.page).SetLSN(lsn)
+	}
+
+	p.evictMu.Lock()
+	s.dirty = true
+	s.fpiSinceCheckpoint = true
+	p.evictMu.Unlock()
+	return nil
+}
+
+// MarkDirtyLogicalChange is the logical-decoding-aware variant of
+// MarkDirtyChangeRecord. The caller's `emitter` is ALWAYS run, so
+// the WAL stream always carries the logical change record — this
+// is what the M0008 logical-decoding pipeline classifies into
+// per-row Insert/Update/Delete events. On first-dirty-in-epoch a
+// full-page image is ALSO emitted, BEFORE the logical record (lower
+// LSN), preserving upstream PG's "FPI then change records" replay
+// invariant for torn-page protection. pd_lsn is stamped from the
+// logical record's LSN so per-page idempotency continues to work.
+//
+// Use this instead of MarkDirtyChangeRecord on heap mutation paths
+// (HeapInsert/HeapDelete/HeapHotUpdate). MarkDirtyChangeRecord's
+// "FPI alone replaces the change record" optimisation silently
+// drops the logical event from the decoder's view — fine for redo,
+// fatal for logical replication.
+//
+// Caller must hold s.contentMu exclusive (the page bytes that will
+// be snapshotted into the FPI must not move under us).
+func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) error {
+	if emitter == nil {
+		return fmt.Errorf("MarkDirtyLogicalChange: emitter required")
+	}
+	p.evictMu.Lock()
+	needFPI := !s.fpiSinceCheckpoint
+	tag := s.tag
+	p.evictMu.Unlock()
+
+	// Emit the logical record FIRST so on physical replay it lands
+	// against the page's prior state (blank-after-extend, or the
+	// previous epoch's tail). The page mutation already happened
+	// in-memory before this call; the in-memory pd_lsn updates to
+	// the record's end LSN so any subsequent FPI snapshot below
+	// captures the same pd_lsn the standby will arrive at after
+	// applying the logical record.
+	lsn, err := emitter()
+	if err != nil {
+		return err
+	}
+	MustHeader(s.page).SetLSN(lsn)
+
+	// On first-dirty-in-epoch, also emit the FPI for torn-page
+	// protection. The FPI lands at a HIGHER LSN than the logical
+	// record above, so per-page replay sees them in order:
+	//   1. logical record at LSN_log → modifies the page from the
+	//      prior epoch's state into the post-mutation state.
+	//   2. PageImage at LSN_fpi (> LSN_log) → overwrites with the
+	//      authoritative bytes (idempotent against step 1).
+	if needFPI && p.logFPI != nil && p.fullPageWrites.Load() {
+		pageCopy := make(Page, BlockSize)
+		copy(pageCopy, s.page)
+		fpiLSN, fpiErr := p.logFPI(tag.Rel, tag.Block, pageCopy)
+		if fpiErr != nil {
+			return fpiErr
+		}
+		MustHeader(s.page).SetLSN(fpiLSN)
 	}
 
 	p.evictMu.Lock()
