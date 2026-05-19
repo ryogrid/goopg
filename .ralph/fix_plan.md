@@ -11719,7 +11719,7 @@ Operational policy (2026-05-20):
 
 ### Sub-milestones
 
- - [ ] **M0107-0001 — Phase A: `mctx` memory-context substrate**
+ - [x] **M0107-0001 — Phase A: `mctx` memory-context substrate**
       - Summary: Land `internal/mctx` package (hierarchical palloc-style
         allocator: Session → Txn → Stmt → Expr); delete
         `internal/executor/arena.go` and `internal/executor/arena_registry.go`;
@@ -11735,6 +11735,15 @@ Operational policy (2026-05-20):
       - Verification: `go test ./...` PASS; TPC-H q1..q22 wall-clock within
         ±5 % of `ab1b955` baseline; pgbench c=10 SO TPS within ±5 % of
         baseline; `TestE2E_FailoverGoopgToPG/async` PASS; `make ralph-state-guard` PASS.
+      - COMPLETE 2026-05-20 (loop 8): `internal/mctx` package created;
+        `executor.Arena` deleted (`arena.go`, `arena_registry.go`, tests
+        updated); `Datum.arena *Arena` → `Datum.mctx *mctx.Context`;
+        `DecodeRowIntoArena` → `DecodeRowIntoMctx`; `seqScanOp.arena` →
+        `seqScanOp.sctx`; two DDL local arenas ported; `executor.Context.Mctx`
+        added; serveConn acquires `sessCtx`; dispatchSimpleQueryViaExecutor
+        acquires/defers `stmtCtx`. 9 modified packages pass `-race`.
+        Design: `docs/design/0107-0001-mctx-memory-context-substrate.md`.
+        `make ralph-state-guard` PASS.
 
  - [ ] **M0107-0002 — Phase B: pointer-free `Datum` (24 B)**
       - Summary: Reformat `Datum` from 64 B (3 GC-traced fields:

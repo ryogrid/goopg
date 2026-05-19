@@ -11,6 +11,7 @@ import (
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -1202,14 +1203,13 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 	var entries []btree.BulkEntry
 	var scanRow Row                                  // M0054-0005c: reusable decode buffer (see comment below).
 	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
-	// M0074-0004: per-page arena for projected varchar / char /
-	// numeric payloads. Reset on page advance; Drop on return.
-	// Datum lifetime ends at encodeBTreeKeyForColumn — the
-	// encoded BulkEntry.Key is an explicit append-copy
-	// (entries[].Key, line below), so retention beyond Reset
-	// is not a concern.
-	arena := NewArena(0)
-	defer arena.Drop()
+	// M0074-0004 / M0107-0001: per-page mctx for projected varchar /
+	// char / text payloads. Reset on page advance; Release on return.
+	// Datum lifetime ends at encodeBTreeKeyForColumn — the encoded
+	// BulkEntry.Key is an explicit append-copy, so no Datum reference
+	// outlives the Reset boundary.
+	sctxDDL := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	defer sctxDDL.Release()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -1249,7 +1249,7 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			// Other columns must still be size-scanned to advance
 			// the offset (variable-length codec) but their string/
 			// numeric payloads are not materialised.
-			if err := DecodeRowProjectionIntoArena(scanRow, tbl.Columns, tuple.Data, keep, arena); err != nil {
+			if err := DecodeRowProjectionIntoArena(scanRow, tbl.Columns, tuple.Data, keep, sctxDDL); err != nil {
 				continue
 			}
 			row := scanRow
@@ -1260,11 +1260,11 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			}
 			entries = append(entries, btree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}})
 		}
-		// M0074-0004: page boundary — reset arena. All Datums
-		// from this page were consumed by encodeBTreeKeyForColumn
-		// and the resulting BulkEntry.Key is an explicit append-
-		// copy, so no Datum reference outlives this point.
-		arena.Reset()
+		// M0074-0004 / M0107-0001: page boundary — reset sctx. All
+		// Datums from this page were consumed by encodeBTreeKeyForColumn
+		// and the resulting BulkEntry.Key is an explicit append-copy,
+		// so no Datum reference outlives this point.
+		sctxDDL.Reset()
 		o.ctx.Pool.Unpin(slot)
 	}
 	// M0055-0006 Phase E: sorted-stream uniqueness check. The
@@ -1333,12 +1333,12 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 	seen := map[string]struct{}{}
 	var scanRow Row                                  // M0054-0005c: reusable decode buffer.
 	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
-	// M0074-0004: per-page arena. Datums consumed by
-	// encodeBTreeKeyForColumn; resulting key is copied (line below
-	// `seen[string(key)]` allocates a Go string from the bytes,
-	// and `tree.Insert` copies into btree pages).
-	arena := NewArena(0)
-	defer arena.Drop()
+	// M0074-0004 / M0107-0001: per-page mctx for projected varchar /
+	// char / text payloads. Resulting key is copied by caller
+	// (`seen[string(key)]` and `tree.Insert`), so Datums need not
+	// outlive the per-page Reset boundary.
+	sctxDDL := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	defer sctxDDL.Release()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -1370,7 +1370,7 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			if err := DecodeRowProjectionIntoArena(scanRow, tbl.Columns, tuple.Data, keep, arena); err != nil {
+			if err := DecodeRowProjectionIntoArena(scanRow, tbl.Columns, tuple.Data, keep, sctxDDL); err != nil {
 				continue
 			}
 			row := scanRow
@@ -1391,8 +1391,8 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 				return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 			}
 		}
-		// M0074-0004: page boundary — reset arena.
-		arena.Reset()
+		// M0074-0004 / M0107-0001: page boundary — reset sctx.
+		sctxDDL.Reset()
 		o.ctx.Pool.Unpin(slot)
 	}
 	return nil

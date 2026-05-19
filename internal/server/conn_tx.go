@@ -25,6 +25,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 )
 
@@ -35,6 +36,10 @@ type connTxState struct {
 	active      bool
 	tx          mvcc.Transaction
 	sess        *executor.BasicSession // session state, non-nil when active
+	// SessCtx is the per-connection session-level mctx (M0107-0001).
+	// Wired by serveConn after creating the session context; stmt-level
+	// contexts are acquired as children in dispatchSimpleQueryViaExecutor.
+	SessCtx *mctx.Context
 	// TempTableShadows maps table name → original permanent *catalog.Table.
 	// Populated when CREATE TEMP TABLE shadows a permanent table. M0097-0003.
 	TempTableShadows map[string]*catalog.Table

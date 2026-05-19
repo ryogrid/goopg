@@ -7,6 +7,7 @@ import (
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
@@ -31,6 +32,12 @@ type Context struct {
 	// means unlimited. The extended-query protocol's Execute message
 	// passes through here.
 	MaxRows int
+
+	// Mctx is the statement-level memory context (M0107-0001).
+	// Operators acquire child ExprContexts from it for per-row
+	// scratch; nil disables mctx-backed arena Datums (tests that
+	// don't wire a full server still work via GC-heap fallback).
+	Mctx *mctx.Context
 
 	// Storage handles. Heap-touching operators (SeqScan/Insert/
 	// Update/Delete) require all four to be set; pure-compute

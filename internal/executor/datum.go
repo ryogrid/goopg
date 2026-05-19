@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"time"
 	"unsafe"
+
+	"github.com/goopg/goopg/internal/mctx"
 )
 
 // DatumKind discriminates the value carrier in a Datum.
@@ -104,14 +106,15 @@ type Datum struct {
 	Buf   []byte    // 24B (slice header; nil for arena variants)
 	Big   *big.Int  // 8B
 	Scale int16     // 2B
-	// arena is non-nil only when Kind is KindStringArena /
+	// mctx is non-nil only when Kind is KindStringArena /
 	// KindBytesArena. Datum.Int packs the (offset, length) into
-	// the arena's byte stream; StringValue() / BytesValue() resolve
-	// via arena.Bytes(offset, length). For all other Kinds, arena
+	// the mctx's byte stream; StringValue() / BytesValue() resolve
+	// via mctx.Bytes(offset, length). For all other Kinds, mctx
 	// is nil and the legacy Buf-based path applies.
 	//
 	// M0073-0001 — see docs/design/0073-0001-datum-arena-field.md.
-	arena *Arena // 8B
+	// M0107-0001: arena *Arena renamed to mctx *mctx.Context.
+	mctx *mctx.Context // 8B
 	// 6B padding → 64B exact.
 }
 
@@ -141,7 +144,7 @@ func (d Datum) BoolValue() bool { return d.Int != 0 }
 // arena-backed Datum (M0073-0001).
 func (d Datum) StringValue() string {
 	if d.Kind == KindStringArena {
-		buf := d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))
+		buf := d.mctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))
 		if len(buf) == 0 {
 			return ""
 		}
@@ -160,7 +163,7 @@ func (d Datum) StringValue() string {
 // past the arena's next Reset().
 func (d Datum) BytesValue() []byte {
 	if d.Kind == KindBytesArena {
-		return d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))
+		return d.mctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))
 	}
 	return d.Buf
 }
@@ -231,20 +234,20 @@ func NewBytesDatum(b []byte) Datum {
 // newStringArenaDatum constructs a KindStringArena Datum encoding
 // the (offset, length) pair into the Int field. Used by the
 // arena-aware decode path (M0073-0002 wires this through).
-func newStringArenaDatum(arena *Arena, offset, length int) Datum {
+func newStringArenaDatum(sctx *mctx.Context, offset, length uint32) Datum {
 	return Datum{
-		Kind:  KindStringArena,
-		Int:   int64(offset)<<32 | int64(length)&0xFFFFFFFF,
-		arena: arena,
+		Kind: KindStringArena,
+		Int:  int64(offset)<<32 | int64(length)&0xFFFFFFFF,
+		mctx: sctx,
 	}
 }
 
 // newBytesArenaDatum constructs a KindBytesArena Datum.
-func newBytesArenaDatum(arena *Arena, offset, length int) Datum {
+func newBytesArenaDatum(sctx *mctx.Context, offset, length uint32) Datum {
 	return Datum{
-		Kind:  KindBytesArena,
-		Int:   int64(offset)<<32 | int64(length)&0xFFFFFFFF,
-		arena: arena,
+		Kind: KindBytesArena,
+		Int:  int64(offset)<<32 | int64(length)&0xFFFFFFFF,
+		mctx: sctx,
 	}
 }
 
@@ -260,22 +263,22 @@ func newBytesArenaDatum(arena *Arena, offset, length int) Datum {
 func (d Datum) MaterializeArena() Datum {
 	switch d.Kind {
 	case KindStringArena:
-		length := int(d.Int & 0xFFFFFFFF)
-		if length == 0 || d.arena == nil {
+		length := uint32(d.Int & 0xFFFFFFFF)
+		if length == 0 || d.mctx == nil {
 			return Datum{Kind: KindString}
 		}
-		offset := int(d.Int >> 32)
-		src := d.arena.Bytes(offset, length)
+		offset := uint32(d.Int >> 32)
+		src := d.mctx.Bytes(offset, length)
 		buf := make([]byte, length)
 		copy(buf, src)
 		return Datum{Kind: KindString, Buf: buf}
 	case KindBytesArena:
-		length := int(d.Int & 0xFFFFFFFF)
-		if length == 0 || d.arena == nil {
+		length := uint32(d.Int & 0xFFFFFFFF)
+		if length == 0 || d.mctx == nil {
 			return Datum{Kind: KindBytes}
 		}
-		offset := int(d.Int >> 32)
-		src := d.arena.Bytes(offset, length)
+		offset := uint32(d.Int >> 32)
+		src := d.mctx.Bytes(offset, length)
 		buf := make([]byte, length)
 		copy(buf, src)
 		return Datum{Kind: KindBytes, Buf: buf}
@@ -312,26 +315,26 @@ func cloneRowOwned(src Row) Row {
 	for i, d := range src {
 		switch d.Kind {
 		case KindStringArena:
-			length := int(d.Int & 0xFFFFFFFF)
-			if length == 0 || d.arena == nil {
+			length := uint32(d.Int & 0xFFFFFFFF)
+			if length == 0 || d.mctx == nil {
 				dst[i] = Datum{Kind: KindString}
 				continue
 			}
-			offset := int(d.Int >> 32)
-			src := d.arena.Bytes(offset, length)
+			offset := uint32(d.Int >> 32)
+			s := d.mctx.Bytes(offset, length)
 			buf := make([]byte, length)
-			copy(buf, src)
+			copy(buf, s)
 			dst[i] = Datum{Kind: KindString, Buf: buf}
 		case KindBytesArena:
-			length := int(d.Int & 0xFFFFFFFF)
-			if length == 0 || d.arena == nil {
+			length := uint32(d.Int & 0xFFFFFFFF)
+			if length == 0 || d.mctx == nil {
 				dst[i] = Datum{Kind: KindBytes}
 				continue
 			}
-			offset := int(d.Int >> 32)
-			src := d.arena.Bytes(offset, length)
+			offset := uint32(d.Int >> 32)
+			s := d.mctx.Bytes(offset, length)
 			buf := make([]byte, length)
-			copy(buf, src)
+			copy(buf, s)
 			dst[i] = Datum{Kind: KindBytes, Buf: buf}
 		default:
 			dst[i] = d
@@ -399,11 +402,11 @@ func (d Datum) AppendValueText(dst []byte) []byte {
 	case KindString:
 		return append(dst, d.Buf...)
 	case KindStringArena:
-		return append(dst, d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))...)
+		return append(dst, d.mctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))...)
 	case KindBytes:
 		return append(dst, d.Buf...)
 	case KindBytesArena:
-		return append(dst, d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))...)
+		return append(dst, d.mctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))...)
 	case KindTime:
 		return d.TimeValue().AppendFormat(dst, "2006-01-02 15:04:05.000000")
 	}

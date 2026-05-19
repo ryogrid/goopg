@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -447,14 +448,13 @@ type seqScanOp struct {
 	// flagged as `runtime.findObject` flat 29.30 % under Q9.
 	scanRow Row
 
-	// arena is the per-page byte allocator backing varchar / char
-	// / text / bytea Datums emitted by DecodeRowIntoArena.
-	// Reset() at the per-block boundary (when curBlock advances)
-	// frees all variable-length payload allocated for the
-	// previous page's tuples; consumers that retain rows past
-	// the boundary must call slot.Materialize() to deep-copy.
-	// (M0073-0004.)
-	arena *Arena
+	// sctx is the per-page mctx backing varchar / char / text /
+	// bytea Datums emitted by DecodeRowIntoMctx. Reset() at
+	// the per-block boundary frees all variable-length payload
+	// allocated for the previous page's tuples; consumers that
+	// retain rows past the boundary must call slot.Materialize()
+	// to deep-copy. (M0073-0004; M0107-0001: arena→sctx.)
+	sctx *mctx.Context
 
 	// M0092-0007: embedded slot reused across every Next() call.
 	// The returned `&o.slot` pointer is stable across calls; its
@@ -497,10 +497,9 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	o.curSlot = 0
 	o.slotMax = 0
 	o.prefetchedThru = 0
-	// M0073-0004: per-page byte arena for varchar / char / text /
-	// bytea payload. Reset on block-advance below. Lifetime tied
-	// to the operator; Close drops the pages.
-	o.arena = NewArena(0)
+	// M0073-0004 / M0107-0001: per-operator mctx for varchar / char /
+	// text / bytea payload. Reset on block-advance; Release on Close.
+	o.sctx = mctx.Acquire(ctx.Mctx, mctx.KindExpr)
 	// Activate the ring strategy when the relation is large enough that a
 	// full sequential scan would evict most hot pages from the shared pool.
 	// Threshold: pool capacity / 4, matching upstream's heuristic.
@@ -548,9 +547,9 @@ func (o *seqScanOp) Close() error {
 		releaseRow(o.scanRow)
 		o.scanRow = nil
 	}
-	if o.arena != nil {
-		o.arena.Drop()
-		o.arena = nil
+	if o.sctx != nil {
+		o.sctx.Release()
+		o.sctx = nil
 	}
 	return nil
 }
@@ -667,7 +666,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			if o.scanRow == nil || len(o.scanRow) != len(o.cols) {
 				o.scanRow = acquireRow(len(o.cols))
 			}
-			if err := DecodeRowIntoArena(o.scanRow, o.cols, tuple.Data, o.arena); err != nil {
+			if err := DecodeRowIntoMctx(o.scanRow, o.cols, tuple.Data, o.sctx); err != nil {
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}
@@ -717,11 +716,11 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 		// retention boundary (sortOp.Open / windowOp.Open /
 		// lockRowsOp.drainAndStamp / executor.Run; aggregateOp's
 		// targeted MaterializeArena in evalGroupKey + applyAgg).
-		// Reset rewinds page len to 0 but keeps capacity, so the
+		// Reset rewinds chunk len to 0 but keeps capacity, so the
 		// next page's decode reuses the same backing bytes — no
 		// per-page allocation in steady state.
-		if o.arena != nil {
-			o.arena.Reset()
+		if o.sctx != nil {
+			o.sctx.Reset()
 		}
 		// As the scan walks forward, top up the prefetch window
 		// so the next-but-one block is being read by the AIO

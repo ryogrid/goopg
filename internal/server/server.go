@@ -51,6 +51,7 @@ import (
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
@@ -660,6 +661,11 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}
 	logger.Info("connection established")
 
+	// M0107-0001: session-level memory context. Acquired here and released
+	// on connection teardown; stmt-level children are managed in dispatch.go.
+	sessCtx := mctx.Acquire(nil, mctx.KindSession)
+	defer sessCtx.Release()
+
 	// Register backend in the pg_stat_activity registry.
 	pidStr := activity.PID(pid)
 	reg := s.cfg.Activity
@@ -761,7 +767,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app)
+	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app, sessCtx)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -939,9 +945,9 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // simple Query messages into handleQuery; Terminate closes the connection
 // cleanly; anything else is an "unsupported" ErrorResponse followed by
 // another ReadyForQuery so the client can keep going.
-func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName string) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName string, sessCtx *mctx.Context) {
 	extended := newExtendedState()
-	connTx := &connTxState{}         // per-connection explicit transaction state (M0096-0005)
+	connTx := &connTxState{SessCtx: sessCtx} // per-connection explicit transaction state (M0096-0005)
 	prepStmts := newPreparedStatements() // per-connection prepared statements (M0096-0006)
 	var copyIn *copyInState
 	for {

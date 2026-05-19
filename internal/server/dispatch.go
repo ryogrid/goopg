@@ -14,6 +14,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -171,7 +172,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 	}
+	// M0107-0001: per-statement mctx. Parent is the session mctx
+	// threaded from serveConn via connTx.SessCtx (nil for tests
+	// that don't wire a full server).
+	var sessCtxForStmt *mctx.Context
+	if connTx != nil {
+		sessCtxForStmt = connTx.SessCtx
+	}
+	stmtCtx := mctx.Acquire(sessCtxForStmt, mctx.KindStmt)
+	defer stmtCtx.Release()
+
 	ectx := executor.NewContext()
+	ectx.Mctx = stmtCtx
 	ectx.Ctx = ctx
 	ectx.Pool = s.cfg.Pool
 	ectx.Catalog = s.cfg.Catalog

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mctx"
 )
 
 // EncodeRow serialises a Datum row into the heap-tuple data area.
@@ -406,7 +407,7 @@ func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
 // arena == nil falls back to the legacy `make([]byte)` path —
 // behaviour byte-for-byte identical regardless of caller.
 func DecodeRowProjection(dst Row, cols []catalog.Column, data []byte, keep []bool) error {
-	return decodeRowProjectionArena(dst, cols, data, keep, nil)
+	return decodeRowProjectionMctx(dst, cols, data, keep, nil)
 }
 
 // DecodeRowProjectionIntoArena is the arena-aware sibling of
@@ -429,11 +430,11 @@ func DecodeRowProjection(dst Row, cols []catalog.Column, data []byte, keep []boo
 // behaviour byte-for-byte identical to DecodeRowProjection.
 //
 // M0074-0004 — see docs/design/0074-0004-decode-row-projection-arena.md.
-func DecodeRowProjectionIntoArena(dst Row, cols []catalog.Column, data []byte, keep []bool, arena *Arena) error {
-	return decodeRowProjectionArena(dst, cols, data, keep, arena)
+func DecodeRowProjectionIntoArena(dst Row, cols []catalog.Column, data []byte, keep []bool, sctx *mctx.Context) error {
+	return decodeRowProjectionMctx(dst, cols, data, keep, sctx)
 }
 
-func decodeRowProjectionArena(dst Row, cols []catalog.Column, data []byte, keep []bool, arena *Arena) error {
+func decodeRowProjectionMctx(dst Row, cols []catalog.Column, data []byte, keep []bool, sctx *mctx.Context) error {
 	off := 0
 	for i, c := range cols {
 		if off >= len(data) {
@@ -453,9 +454,8 @@ func decodeRowProjectionArena(dst Row, cols []catalog.Column, data []byte, keep 
 			}
 			if keep[i] {
 				// TOAST pointer: always Buf-backed regardless
-				// of arena (mirrors DecodeRowIntoArena's flag==2
-				// path). Detoast may run later and needs the
-				// pointer to outlive arena Reset.
+				// of sctx binding — detoasted bytes need to
+				// outlive the sctx Reset cycle.
 				dst[i] = NewToastPointerDatum(append([]byte(nil), data[off:off+toastPtrSize]...))
 			} else {
 				dst[i] = NullDatum
@@ -469,8 +469,8 @@ func decodeRowProjectionArena(dst Row, cols []catalog.Column, data []byte, keep 
 				n   int
 				err error
 			)
-			if arena != nil {
-				v, n, err = decodeValueArena(c.Type, data[off:], arena)
+			if sctx != nil {
+				v, n, err = decodeValueMctx(c.Type, data[off:], sctx)
 			} else {
 				v, n, err = decodeValue(c.Type, data[off:])
 			}
@@ -548,7 +548,7 @@ func decodeValueSize(t catalog.Type, data []byte) (int, error) {
 // The arena variant emits KindStringArena / KindBytesArena Datums
 // whose payload lives in the arena's pages until Reset().
 func DecodeRowInto(dst Row, cols []catalog.Column, data []byte) error {
-	return decodeRowIntoArena(dst, cols, data, nil)
+	return decodeRowIntoMctx(dst, cols, data, nil)
 }
 
 // DecodeRowIntoArena is the arena-aware sibling of DecodeRowInto.
@@ -572,23 +572,34 @@ func DecodeRowInto(dst Row, cols []catalog.Column, data []byte) error {
 // behaviour byte-for-byte identical to DecodeRowInto.
 //
 // M0073-0002 — see docs/design/0073-0002-decode-arena-binding.md.
-func DecodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
-	return decodeRowIntoArena(dst, cols, data, arena)
+// DecodeRowIntoMctx is the mctx-aware sibling of DecodeRowInto.
+// Variable-length columns (varchar, char, text, bytea) are backed by sctx;
+// callers must not access those Datums after sctx.Reset() or sctx.Release().
+func DecodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.Context) error {
+	return decodeRowIntoMctx(dst, cols, data, sctx)
 }
 
-func decodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
+// DecodeRowIntoArena is the legacy alias kept for call-site compatibility
+// during the M0107-0001 migration. Delegates to DecodeRowIntoMctx.
+//
+// Deprecated: use DecodeRowIntoMctx directly.
+func DecodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *mctx.Context) error {
+	return decodeRowIntoMctx(dst, cols, data, arena)
+}
+
+func decodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.Context) error {
 	// Try goopg legacy format first (backward compatible).
 	// Fall back to PG-native physical format for M0105-0010 encoded data.
-	if err := decodeGoopgRowIntoArena(dst, cols, data, arena); err == nil {
+	if err := decodeGoopgRowIntoMctx(dst, cols, data, sctx); err == nil {
 		return nil
-	} else if err := decodePhysicalPGRowIntoArena(dst, cols, data, arena); err == nil {
+	} else if err := decodePhysicalPGRowIntoMctx(dst, cols, data, sctx); err == nil {
 		return nil
 	} else {
 		return err
 	}
 }
 
-func decodeGoopgRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
+func decodeGoopgRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.Context) error {
 	off := 0
 	for i, c := range cols {
 		if off >= len(data) {
@@ -602,9 +613,9 @@ func decodeGoopgRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena 
 			continue
 		}
 		// TOAST pointer: 12 bytes following the 0x02 flag byte.
-		// Always Buf-backed regardless of arena binding —
+		// Always Buf-backed regardless of sctx binding —
 		// detoasted bytes (when DetoastRow runs later) need to
-		// outlive the arena's Reset cycle.
+		// outlive the sctx's Reset cycle.
 		if flag == 2 {
 			const toastPtrSize = 12
 			if off+toastPtrSize > len(data) {
@@ -619,8 +630,8 @@ func decodeGoopgRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena 
 			n   int
 			err error
 		)
-		if arena != nil {
-			v, n, err = decodeValueArena(c.Type, data[off:], arena)
+		if sctx != nil {
+			v, n, err = decodeValueMctx(c.Type, data[off:], sctx)
 		} else {
 			v, n, err = decodeValue(c.Type, data[off:])
 		}
@@ -633,14 +644,14 @@ func decodeGoopgRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena 
 	return nil
 }
 
-func decodePhysicalPGRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *Arena) error {
+func decodePhysicalPGRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.Context) error {
 	off := 0
 	for i, c := range cols {
 		off = alignPhysicalPGOffset(off, physicalPGTypeAlign(c.Type))
 		if off > len(data) {
 			return fmt.Errorf("DecodePhysicalPGRow: %s: truncated at offset %d", c.Name, off)
 		}
-		v, n, err := decodePhysicalPGValueArena(c.Type, data[off:], arena)
+		v, n, err := decodePhysicalPGValueMctx(c.Type, data[off:], sctx)
 		if err != nil {
 			return fmt.Errorf("DecodePhysicalPGRow: %s: %w", c.Name, err)
 		}
@@ -738,7 +749,7 @@ func pgRowHasVarWidth(cols []catalog.Column, row Row) bool {
 	return false
 }
 
-func decodePhysicalPGValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, error) {
+func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) (Datum, int, error) {
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":
 		if len(data) < 1 {
@@ -765,10 +776,9 @@ func decodePhysicalPGValueArena(t catalog.Type, data []byte, arena *Arena) (Datu
 		if err != nil {
 			return Datum{}, 0, err
 		}
-		if arena != nil {
-			buf, offset := arena.Allocate(len(payload))
-			copy(buf, payload)
-			return newStringArenaDatum(arena, offset, len(payload)), n, nil
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(payload)
+			return newStringArenaDatum(sctx, moff, mlen), n, nil
 		}
 		return NewStringDatum(string(payload)), n, nil
 	case "bytea":
@@ -776,10 +786,9 @@ func decodePhysicalPGValueArena(t catalog.Type, data []byte, arena *Arena) (Datu
 		if err != nil {
 			return Datum{}, 0, err
 		}
-		if arena != nil {
-			buf, offset := arena.Allocate(len(payload))
-			copy(buf, payload)
-			return newBytesArenaDatum(arena, offset, len(payload)), n, nil
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(payload)
+			return newBytesArenaDatum(sctx, moff, mlen), n, nil
 		}
 		return NewBytesDatum(append([]byte(nil), payload...)), n, nil
 	default:
@@ -1372,7 +1381,7 @@ func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
 // keeps the legacy callers (DecodeRow, DecodeRowProjection, toast
 // resolution, ANALYZE) byte-for-byte unchanged — only the
 // per-page seqScan / per-Rescan indexScan path opts in.
-func decodeValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, error) {
+func decodeValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) (Datum, int, error) {
 	switch t.Name {
 	case "int2", "smallint":
 		if len(data) < 2 {
@@ -1448,7 +1457,7 @@ func decodeValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, er
 		}
 		return newNumeric(m, int(s)), 4 + n, nil
 	default:
-		// varchar / char / text / bytea: arena-backed.
+		// varchar / char / text / bytea: mctx-backed.
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated varlen header")
 		}
@@ -1457,10 +1466,9 @@ func decodeValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, er
 			return Datum{}, 0, fmt.Errorf("truncated varlen body")
 		}
 		if n == 0 {
-			return Datum{Kind: KindStringArena, arena: arena}, 4, nil
+			return Datum{Kind: KindStringArena, mctx: sctx}, 4, nil
 		}
-		buf, offset := arena.Allocate(n)
-		copy(buf, data[4:4+n])
-		return newStringArenaDatum(arena, offset, n), 4 + n, nil
+		moff, mlen := sctx.AllocBytes(data[4 : 4+n])
+		return newStringArenaDatum(sctx, moff, mlen), 4 + n, nil
 	}
 }
