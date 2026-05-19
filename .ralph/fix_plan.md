@@ -11166,6 +11166,95 @@ relcache init → replication readiness) and intra-package grouped.
       2650) is bootstrapped with a populated btree (same family as
       batched-50 fix for OID 2691). If not, mirror batched-50's
       8-column FormData_pg_aggregate + populated-btree pattern.
+    - PARTIAL PROGRESS 2026-05-19 (loop 23, batched-52): the 42809
+      "count(*) specified, but count is not an aggregate function"
+      residual is CLOSED. New residual surfaced and isolated.
+      Root cause of the new residual ("ERROR XX000: cache lookup
+      failed for aggregate 2803" at `parse_func.c:369`): the
+      placeholder pass `bootstrapMappedLocalCatalogHeaps` in
+      `internal/initdb/initdb.go` ran AFTER every catalog-specific
+      bootstrap and silently overwrote `base/{1,5}/<oid>` with a
+      zero-row 8 KiB InitPage for six OIDs whose heaps had just
+      been populated by dedicated bootstrappers:
+        - 2600 pg_aggregate  (bootstrapPgAggregateTuples)
+        - 2605 pg_cast       (bootstrapPgCastTuples)
+        - 2607 pg_conversion (bootstrapPgConversionTuples)
+        - 2617 pg_operator   (bootstrapPgOperatorTuples)
+        - 2753 pg_opfamily   (bootstrapPgOpfamilyTuples)
+        - 3541 pg_range      (bootstrapPgRangeTuples)
+      The bug was invisible until batched-51 closed 42809 and the
+      next code path needed a pg_aggregate heap row to satisfy
+      `SearchSysCache1(AGGFNOID, …)`. pg_proc / pg_type / pg_class
+      / pg_namespace / pg_rewrite / pg_language escaped the same
+      bug because they were already commented out of the inline
+      `oids` list with explicit "dedicated bootstrapper" notes.
+      Fix landed (two structural edits in
+      `internal/initdb/initdb.go`):
+      (1) Extract the inline `oids := []uint32{…}` literal in
+          `bootstrapMappedLocalCatalogHeaps` into a new package-
+          level `mappedLocalCatalogPlaceholderOIDs() []uint32`
+          helper whose doc comment enumerates every local-catalog
+          OID with a dedicated bootstrapper and explicitly states
+          they MUST NOT appear in the returned slice. Single
+          source of truth.
+      (2) Drop OIDs 2600, 2605, 2607, 2617, 2753, 3541 from the
+          returned slice; the rest of the entries stay verbatim.
+      Regression pins:
+        - `internal/initdb/mapped_local_catalog_placeholder_oids_test.go`
+          (new):
+            * `TestMappedLocalCatalogPlaceholderOIDsOmitsDedicatedBootstrappers`
+              walks the helper's return slice and asserts none of
+              the 19 OIDs with dedicated bootstrappers appear (1247
+              pg_type, 1249 pg_attribute, 1255 pg_proc, 1259
+              pg_class, 2600 pg_aggregate, 2601 pg_am, 2602
+              pg_amop, 2603 pg_amproc, 2605 pg_cast, 2607
+              pg_conversion, 2610 pg_index, 2612 pg_language, 2615
+              pg_namespace, 2616 pg_opclass, 2617 pg_operator,
+              2618 pg_rewrite, 2753 pg_opfamily, 3456 pg_collation,
+              3541 pg_range).
+            * `TestBootstrapMappedLocalCatalogHeapsPreservesPopulatedFiles`
+              behavioural: seeds 16 KiB signature at
+              `base/{1,5}/{2600,2605,2607,2617,2753,3541}`, calls
+              the placeholder pass, asserts every byte unchanged.
+        - `internal/initdb/pg_mapped_local_catalog_heap_test.go::
+          TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages`
+          — `wantOIDs` trimmed to the placeholder-only set; new
+          tail asserts the six dedicated-bootstrapper OIDs do
+          NOT exist after the placeholder pass.
+        - `internal/initdb/pg_range_nailed_test.go` and
+          `internal/initdb/pg_opfamily_nailed_test.go` — the
+          stale `TestBootstrapMappedLocalCatalogHeapsIncludesPg
+          {Range,Opfamily}` tests (which pinned the BUG)
+          renamed to `TestBootstrapPg{Range,Opfamily}Tuples
+          SurvivesMappedLocalCatalogPlaceholderPass` and
+          reshaped: call dedicated bootstrapper → snapshot size
+          → call placeholder pass → assert size unchanged.
+      Verified: `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+      'TestE2E_FailoverGoopgToPG/async' ./internal/testport/` —
+      XX000 aggregate lookup failure CLOSED. PG standby now
+      reaches the next residual on the same test:
+        ERROR: 42P22: could not determine which collation to use
+        for string comparison
+        LOCATION: check_collation_set, varlena.c:1645
+        STATEMENT: SELECT count(*) FROM public.bench_log WHERE src = 'pre'
+      `go test ./internal/executor/ ./internal/storage/
+      ./internal/server/ ./internal/mvcc/ ./internal/catalog/`
+      — all PASS. `./internal/initdb/` carries the same 17
+      pre-existing baseline failures (none touch the
+      placeholder-list path).
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 23 (batched-52)" section).
+      Next loop (batched-53): diagnose 42P22 on
+      `WHERE src = 'pre'`. Two leading hypotheses:
+      (a) goopg's `pg_class.relcollation` (Anum 26) is 0 for the
+          user table `bench_log`, leaving the text column with no
+          default collation;
+      (b) `pg_attribute.attcollation` is 0 for `bench_log.src`,
+          which PG's expression-typing path needs to resolve.
+      Audit the runtime DDL writer's encoding of `relcollation`
+      and `attcollation` against PG18's
+      `DEFAULT_COLLATION_OID = 100` for text columns and patch
+      whichever site is emitting zero.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

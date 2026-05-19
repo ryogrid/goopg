@@ -67,31 +67,52 @@ func TestNailedLocalRelsContainsPgRange(t *testing.T) {
 	}
 }
 
-// TestBootstrapMappedLocalCatalogHeapsIncludesPgRange pins that the
-// step 3bz seed wires pg_range (OID 3541) into the empty-heap
-// placeholder list so PG's mdopen finds a valid 8-KiB heap file at
-// base/{1,5}/3541 once the pg_class row resolves the relation.
-func TestBootstrapMappedLocalCatalogHeapsIncludesPgRange(t *testing.T) {
+// TestBootstrapPgRangeTuplesSurvivesMappedLocalCatalogPlaceholderPass
+// pins that the populated pg_range heap (base/{1,5}/3541) written by
+// bootstrapPgRangeTuples is NOT clobbered by the subsequent
+// bootstrapMappedLocalCatalogHeaps pass. M0106-0010 batched-52
+// surfaced the inverse regression for pg_aggregate (OID 2600) as
+// `cache lookup failed for aggregate 2803`; the placeholder list
+// must omit pg_range for the same reason.
+func TestBootstrapPgRangeTuplesSurvivesMappedLocalCatalogPlaceholderPass(t *testing.T) {
 	dir := t.TempDir()
 	for _, db := range []string{"base/1", "base/5"} {
 		if err := os.MkdirAll(filepath.Join(dir, db), 0o700); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
 	}
+	if _, err := bootstrapPgRangeTuples(dir); err != nil {
+		t.Fatalf("bootstrapPgRangeTuples: %v", err)
+	}
+	preSize := make(map[string]int64)
+	for _, db := range []string{"base/1", "base/5"} {
+		path := filepath.Join(dir, db, "3541")
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("populated %s missing after bootstrapPgRangeTuples: %v", path, err)
+		}
+		preSize[path] = info.Size()
+	}
 	if err := bootstrapMappedLocalCatalogHeaps(dir); err != nil {
 		t.Fatalf("bootstrapMappedLocalCatalogHeaps: %v", err)
 	}
-	for _, db := range []string{"base/1", "base/5"} {
-		path := filepath.Join(dir, db, "3541")
+	for path, want := range preSize {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if info.Size() != want {
+			t.Errorf("%s clobbered: size now %d, want %d (populated bytes overwritten)", path, info.Size(), want)
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatalf("missing %s: %v (step 3bz regression)", path, err)
+			t.Fatalf("read %s: %v", path, err)
 		}
-		if len(data) != storage.BlockSize {
-			t.Fatalf("%s: len=%d, want %d", path, len(data), storage.BlockSize)
+		if len(data) < int(storage.BlockSize) {
+			t.Fatalf("%s: len=%d, want >= %d", path, len(data), storage.BlockSize)
 		}
 		if isAllZero(data) {
-			t.Fatalf("%s: page is all zero — InitPage was not applied", path)
+			t.Fatalf("%s: page is all zero", path)
 		}
 	}
 }

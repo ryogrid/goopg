@@ -2273,3 +2273,134 @@ not, file batched-52 work analogous to batched-50: build the
 8-column FormData_pg_aggregate rows, write to base/{1,5}/2600 and
 the global/ shadow, and bootstrap a populated 2650 btree keyed on
 aggfnoid (oid_ops).
+
+## 2026-05-19 loop 23 (batched-52)
+
+### Outcome
+
+`TestE2E_FailoverGoopgToPG/async` advanced past the 42809 "count is
+not an aggregate function" residual: the prokind plumbing from
+batched-51 took effect, `ParseFuncOrColumn` accepted `count(*)` as
+an aggregate, and execution reached `SearchSysCache1(AGGFNOID, …)`.
+The new failure mode was `ERROR XX000: cache lookup failed for
+aggregate 2803` — emitted from `parse_func.c:369` — even though
+`bootstrapPgAggregateTuples` (batched-23) already populates the
+161-row pg_aggregate heap and `bootstrapPgAggregateFnoidIndex`
+populates the OID-2650 btree.
+
+### Root cause: placeholder-pass clobber of populated catalog heaps
+
+`internal/initdb/initdb.go::bootstrapMappedLocalCatalogHeaps` runs
+later in `Init()` than every catalog-specific bootstrap and writes a
+zero-row 8 KiB `InitPage` to `base/{1,5}/<oid>` for every entry in
+its inline `oids` list. The list still carried OIDs whose heaps are
+now populated by dedicated bootstrappers, so it silently overwrote
+the seeded rows:
+
+| OID | catalog | dedicated bootstrapper (writes base/{1,5}/<oid>) |
+|-----|---------|-------------------------------------------------|
+| 2600 | pg_aggregate | `bootstrapPgAggregateTuples` |
+| 2605 | pg_cast | `bootstrapPgCastTuples` |
+| 2607 | pg_conversion | `bootstrapPgConversionTuples` |
+| 2617 | pg_operator | `bootstrapPgOperatorTuples` |
+| 2753 | pg_opfamily | `bootstrapPgOpfamilyTuples` |
+| 3541 | pg_range | `bootstrapPgRangeTuples` |
+
+The bug had been invisible because nothing in the failover test
+exercised pg_cast / pg_conversion / pg_operator / pg_opfamily /
+pg_range *via heap content* — until batched-51 closed 42809 and the
+next code path (`SearchSysCache1(AGGFNOID, …)` on pg_aggregate)
+needed the heap row.
+
+`pg_proc` (1255), `pg_type` (1247), and `pg_class` (1259) escaped
+the bug because they were already commented out of the `oids` list
+with explicit "dedicated bootstrapper" notes when their own
+bootstrappers landed; the recently-added catalogs above were not.
+
+### Fix
+
+Two structural edits in `internal/initdb/initdb.go`:
+
+1. Extract the inline `oids := []uint32{…}` literal in
+   `bootstrapMappedLocalCatalogHeaps` into a new package-level
+   `mappedLocalCatalogPlaceholderOIDs() []uint32` helper. The doc
+   comment enumerates every local-catalog OID with a dedicated
+   bootstrapper and explicitly states they MUST NOT appear in the
+   returned slice. The function becomes the single source of truth
+   for "catalogs whose heap is left as an empty placeholder".
+2. Drop the six clobbered OIDs (2600, 2605, 2607, 2617, 2753, 3541)
+   from the returned slice; keep the rest verbatim.
+
+### Regression pins
+
+`internal/initdb/mapped_local_catalog_placeholder_oids_test.go`
+(new):
+
+- `TestMappedLocalCatalogPlaceholderOIDsOmitsDedicatedBootstrappers`
+  — walks `mappedLocalCatalogPlaceholderOIDs()` and asserts that
+  none of the 19 OIDs with dedicated bootstrappers (pg_type / 1247,
+  pg_attribute / 1249, pg_proc / 1255, pg_class / 1259, pg_aggregate
+  / 2600, pg_am / 2601, pg_amop / 2602, pg_amproc / 2603, pg_cast /
+  2605, pg_conversion / 2607, pg_index / 2610, pg_language / 2612,
+  pg_namespace / 2615, pg_opclass / 2616, pg_operator / 2617,
+  pg_rewrite / 2618, pg_opfamily / 2753, pg_collation / 3456,
+  pg_range / 3541) appear in the placeholder list. Future additions
+  to the seed-row catalogs will trip this test if the matching OID
+  is not also removed from the placeholder list.
+- `TestBootstrapMappedLocalCatalogHeapsPreservesPopulatedFiles` —
+  behavioural test: seeds a 16 KiB signature at
+  `base/{1,5}/{2600,2605,2607,2617,2753,3541}`, calls
+  `bootstrapMappedLocalCatalogHeaps`, asserts every signature byte
+  is intact afterward. This catches the regression even if a
+  future refactor moves the OID list out of the helper above.
+
+`internal/initdb/pg_mapped_local_catalog_heap_test.go::TestBootstrap
+MappedLocalCatalogHeapsWritesEmptyHeapPages` — `wantOIDs` slice
+trimmed to the placeholder-only set; new tail asserts that
+`base/{1,5}/{2600,2605,2607,2617,2753,3541}` are *absent* after the
+call (the dedicated bootstrappers are responsible).
+
+`internal/initdb/pg_range_nailed_test.go` and
+`internal/initdb/pg_opfamily_nailed_test.go` —
+`TestBootstrapMappedLocalCatalogHeapsIncludesPg{Range,Opfamily}`
+renamed to
+`TestBootstrapPg{Range,Opfamily}TuplesSurvivesMappedLocalCatalogPlace
+holderPass` and reshaped: call the dedicated bootstrapper, snapshot
+file size, call the placeholder pass, assert size unchanged. The
+original "include in placeholder list" semantics were the bug being
+removed.
+
+### Verification
+
+`GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+'TestE2E_FailoverGoopgToPG/async' ./internal/testport/` — XX000
+"cache lookup failed for aggregate 2803" is CLOSED. The standby
+now reaches the next residual,
+
+> ERROR: 42P22: could not determine which collation to use for
+> string comparison
+> LOCATION: check_collation_set, varlena.c:1645
+> STATEMENT: SELECT count(*) FROM public.bench_log WHERE src = 'pre'
+
+so the test exercises a different query (`WHERE src = 'pre'` vs.
+`WHERE client = -999`) once the aggregate resolves. `count(*)` and
+its pg_aggregate row are no longer a blocker.
+
+`go test ./internal/executor/ ./internal/storage/ ./internal/server/
+ ./internal/mvcc/ ./internal/catalog/` — all PASS.
+`./internal/initdb/` — 17 pre-existing baseline failures inherited
+from prior loops (none touch the placeholder-list path); the three
+tests above that initially failed under my edit (the OIDs they
+pinned were the OIDs being removed) were rewritten in the same
+commit and now PASS.
+
+### Next loop (batched-53)
+
+Diagnose `42P22: could not determine which collation to use for
+string comparison` on `WHERE src = 'pre'`. Two leading hypotheses:
+(a) goopg's `pg_class.relcollation` (Anum 26) is 0 for `bench_log`
+so PG's deformer sees no default collation on the `src` text
+column; (b) `pg_attribute.attcollation` for `bench_log.src` is 0.
+Audit the heap row goopg writes for bench_log against PG18's
+expected `attcollation = 100` (DEFAULT_COLLATION_OID) for text
+columns, fix the encoder if needed, and re-run the failover test.

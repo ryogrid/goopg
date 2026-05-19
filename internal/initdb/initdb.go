@@ -692,71 +692,89 @@ func bootstrapSharedCatalogPlaceholders(dataDir string) error {
 // PG actually reads during boot (pg_class, pg_attribute, pg_am, …) are
 // still produced by the dedicated bootstrappers; this function only fills
 // the leftover OIDs so `BasicOpenFile` never returns ENOENT.
-func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
-	heapPage := make(storage.Page, storage.BlockSize)
-	if err := storage.InitPage(heapPage); err != nil {
-		return err
-	}
-	// Local catalogs whose heap file is NOT written by a dedicated
-	// bootstrapper. Keep in sync with `localRelMap` in
-	// `bootstrapPostgresDatabase`; pg_authid (6239) is omitted because it
-	// is fundamentally shared and already has a populated `global/1260`
-	// heap via `bootstrapPostgresRole`.
-	oids := []uint32{
-		// 1247 pg_type is bootstrapped by bootstrapSystemCatalogs in
-		// goopg's internal row format — do NOT overwrite it.
+// mappedLocalCatalogPlaceholderOIDs returns the local-catalog relfilenodes
+// whose heap files are written as 8 KiB empty placeholders by
+// bootstrapMappedLocalCatalogHeaps. The list intentionally OMITS catalogs
+// that have a dedicated populating bootstrapper — overwriting their heap
+// with an empty page would wipe out the seeded rows.
+//
+// Dedicated bootstrappers exist for the following local-catalog OIDs and
+// MUST NOT appear here (regression: M0106-0010 batched-52 surfaced
+// `cache lookup failed for aggregate 2803` after 2600 was clobbered to
+// an empty page):
+//
+//	1247 pg_type            (pg_type_bootstrap.go)
+//	1249 pg_attribute       (bootstrapPgAttributeTuples)
+//	1255 pg_proc            (bootstrapPgProcTuples)
+//	1259 pg_class           (bootstrapPgClassTuples)
+//	2600 pg_aggregate       (bootstrapPgAggregateTuples)
+//	2601 pg_am              (bootstrapPgAmTuples)
+//	2602 pg_amop            (bootstrapPgAmopTuples)
+//	2603 pg_amproc          (bootstrapPgAmprocTuples)
+//	2605 pg_cast            (bootstrapPgCastTuples)
+//	2610 pg_index           (bootstrapPgIndexTuples)
+//	2612 pg_language        (bootstrapPgLanguageTuples)
+//	2615 pg_namespace       (bootstrapPgNamespaceTuples)
+//	2616 pg_opclass         (bootstrapPgOpclassTuples)
+//	2617 pg_operator        (bootstrapPgOperatorTuples)
+//	2618 pg_rewrite         (bootstrapPgRewriteTuples)
+//	2607 pg_conversion      (bootstrapPgConversionTuples)
+//	2753 pg_opfamily        (bootstrapPgOpfamilyTuples)
+//	3456 pg_collation       (bootstrapPgCollationTuples)
+//	3541 pg_range           (bootstrapPgRangeTuples)
+func mappedLocalCatalogPlaceholderOIDs() []uint32 {
+	return []uint32{
 		826,  // pg_default_acl (M0106-0010 step 3ak)
-		2600, // pg_aggregate
 		2604, // pg_attrdef
-		2605, // pg_cast
 		2606, // pg_constraint
-		2607, // pg_conversion
 		2608, // pg_depend
 		2609, // pg_description
 		2611, // pg_inherits
-		// 2612 pg_language: dedicated bootstrapper (bootstrapPgLanguageTuples)
 		2613, // pg_largeobject
 		2614, // pg_largeobject_metadata
-		// 2615 pg_namespace: dedicated bootstrapper (bootstrapPgNamespaceTuples)
-		2617, // pg_operator
-		// 2618 pg_rewrite: dedicated bootstrapper (bootstrapPgRewriteTuples)
 		2619, // pg_statistic
 		2620, // pg_trigger
 		3381, // pg_statistic_ext
 		3501, // pg_enum (M0106-0010 step 3an)
 		3596, // pg_seclabel
-		3602, // pg_ts_config (M0106-0010 step 3ck) — authoritative OID per pg_ts_config.h:30
-		3764, // pg_ts_config (stale — true pg_ts_config OID is 3602, seeded above; placeholder retained as no-op empty heap)
-		3603, // pg_ts_config_map (M0106-0010 step 3cj) — authoritative OID per pg_ts_config_map.h:30
-		3765, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603, seeded above; placeholder retained as no-op empty heap)
-		3600, // pg_ts_dict (M0106-0010 step 3cm) — authoritative OID per pg_ts_dict.h:29
-		3766, // pg_ts_template_tmplname_index (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:48; heap-placeholder page is overwritten with a btree root page in the critical-index block below.
-		3601, // pg_ts_parser (M0106-0010 step 3cn) — authoritative OID per pg_ts_parser.h:29
-		3767, // pg_ts_template_oid_index (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:49; heap-placeholder page is overwritten with a btree root page in the critical-index block below.
-		3764, // pg_ts_template (M0106-0010 step 3co) — authoritative OID per pg_ts_template.h:29
-		3768, // pg_ts_template (stale — true pg_ts_template OID is 3764, seeded above; 3768 has no upstream catalog assignment; placeholder retained as no-op empty heap)
+		3602, // pg_ts_config (M0106-0010 step 3ck)
+		3764, // pg_ts_config (stale — true pg_ts_config OID is 3602)
+		3603, // pg_ts_config_map (M0106-0010 step 3cj)
+		3765, // pg_ts_config_map (stale — true pg_ts_config_map OID is 3603)
+		3600, // pg_ts_dict (M0106-0010 step 3cm)
+		3766, // pg_ts_template_tmplname_index — overwritten with btree root below
+		3601, // pg_ts_parser (M0106-0010 step 3cn)
+		3767, // pg_ts_template_oid_index — overwritten with btree root below
+		3764, // pg_ts_template (M0106-0010 step 3co)
+		3768, // pg_ts_template (stale — true pg_ts_template OID is 3764)
 		3466, // pg_event_trigger (M0106-0010 step 3ar)
 		3079, // pg_extension (M0106-0010 step 3aw)
 		2328, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
 		1417, // pg_foreign_server (M0106-0010 step 3be)
-		1418, // pg_user_mapping (M0106-0010 step 3cp) — authoritative OID per pg_user_mapping.h:28
+		1418, // pg_user_mapping (M0106-0010 step 3cp)
 		3118, // pg_foreign_table (M0106-0010 step 3bh)
-		2753, // pg_opfamily (M0106-0010 step 3bm)
 		3350, // pg_partitioned_table (M0106-0010 step 3bs)
 		6104, // pg_publication (M0106-0010 step 3bu)
 		6237, // pg_publication_namespace (M0106-0010 step 3bx)
 		6106, // pg_publication_rel (M0106-0010 step 3by)
-		3541, // pg_range (M0106-0010 step 3bz)
 		2224, // pg_sequence (M0106-0010 step 3cb)
 		3429, // pg_statistic_ext_data (M0106-0010 step 3cc)
-		3576, // pg_transform (M0106-0010 step 3ci) — authoritative OID per pg_transform.h
-		6003, // pg_publication (stale comment — OID 6003 has no upstream catalog assignment)
+		3576, // pg_transform (M0106-0010 step 3ci)
+		6003, // pg_publication (stale — no upstream catalog at OID 6003)
 		6101, // pg_publication_rel
-		6102, // pg_subscription_rel (stale comment was "pg_sequence" — true pg_sequence OID is 2224, seeded above)
-		6137, // pg_transform (stale — true pg_transform OID is 3576, seeded above; placeholder retained as no-op empty heap)
+		6102, // pg_subscription_rel
+		6137, // pg_transform (stale — true pg_transform OID is 3576)
 		6245, // pg_statistic_ext_data
 		9400, // pg_db_role_setting
 	}
+}
+
+func bootstrapMappedLocalCatalogHeaps(dataDir string) error {
+	heapPage := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(heapPage); err != nil {
+		return err
+	}
+	oids := mappedLocalCatalogPlaceholderOIDs()
 	for _, dbOid := range []uint32{1, 5} {
 		dbDir := filepath.Join(dataDir, "base", strconv.FormatUint(uint64(dbOid), 10))
 		if err := os.MkdirAll(dbDir, 0o700); err != nil {

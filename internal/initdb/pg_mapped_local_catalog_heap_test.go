@@ -9,16 +9,18 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages verifies
-// M0106-0010 step 3w: every mapped local catalog OID that lacks a dedicated
-// bootstrapper receives a heap-initialised 8 KiB placeholder under both
-// base/1/<oid> and base/5/<oid>. Without these files PG's InitPostgres FATALs
-// with `could not open relation with OID 2600` (pg_aggregate) and the same
-// blocker would resurface in turn for every other unmapped catalog.
+// TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages verifies that
+// every mapped local-catalog OID lacking a dedicated bootstrapper receives
+// a heap-initialised 8 KiB placeholder under both base/1/<oid> and
+// base/5/<oid>. Without these files PG's InitPostgres FATALs with
+// `could not open relation with OID NNNN`.
 //
-// Pinning the canonical OID list (rather than just spot-checking 2600) catches
-// the case where a future refactor silently drops one of the catalogs — that
-// would re-introduce the FATAL on whichever catalog PG happens to probe first.
+// M0106-0010 batched-52: catalogs that NOW have dedicated populating
+// bootstrappers (pg_aggregate 2600, pg_cast 2605, pg_conversion 2607,
+// pg_operator 2617, pg_opfamily 2753, pg_range 3541) are intentionally
+// omitted — overwriting their seeded heaps with empty pages would wipe
+// real rows and reintroduce blockers like
+// `cache lookup failed for aggregate 2803`.
 func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 	dir := t.TempDir()
 	for _, db := range []string{"base/1", "base/5"} {
@@ -31,24 +33,17 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 		t.Fatalf("bootstrapMappedLocalCatalogHeaps: %v", err)
 	}
 
-	// Mirror the canonical list embedded in the bootstrapper. Keep in sync.
-	// 1247 pg_type is intentionally absent — bootstrapSystemCatalogs already
-	// seeds it in goopg's internal format and overwriting would wipe the
-	// rows TestBootstrappedPGTypeRowsReadable depends on.
-	// 2612 pg_language: dedicated bootstrapper (bootstrapPgLanguageTuples).
-	// 2615 pg_namespace: dedicated bootstrapper (bootstrapPgNamespaceTuples).
-	// 2618 pg_rewrite: dedicated bootstrapper (bootstrapPgRewriteTuples).
+	// Catalogs with no dedicated bootstrapper — keep in sync with
+	// mappedLocalCatalogPlaceholderOIDs.
 	wantOIDs := []uint32{
 		826,  // pg_default_acl (M0106-0010 step 3ak)
 		1417, // pg_foreign_server (M0106-0010 step 3be)
 		1418, // pg_user_mapping (M0106-0010 step 3cp)
 		2224, // pg_sequence (M0106-0010 step 3cb)
 		2328, // pg_foreign_data_wrapper (M0106-0010 step 3bb)
-		2600, 2604, 2605, 2606, 2607, 2608, 2609, 2611,
+		2604, 2606, 2608, 2609, 2611,
 		2613, 2614,
-		2617,
 		2619, 2620,
-		2753, // pg_opfamily (M0106-0010 step 3bm)
 		3079, // pg_extension (M0106-0010 step 3aw)
 		3118, // pg_foreign_table (M0106-0010 step 3bh)
 		3350, // pg_partitioned_table (M0106-0010 step 3bs)
@@ -56,7 +51,6 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 		3429, // pg_statistic_ext_data (M0106-0010 step 3cc)
 		3466, // pg_event_trigger (M0106-0010 step 3ar)
 		3501, // pg_enum (M0106-0010 step 3an)
-		3541, // pg_range (M0106-0010 step 3bz)
 		3576, // pg_transform (M0106-0010 step 3ci)
 		3596,
 		3600, // pg_ts_dict (M0106-0010 step 3cm)
@@ -66,19 +60,6 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 		3764, 3765, 3766, 3767, 3768,
 		6003, 6101, 6102, 6104, 6106, 6137, 6237,
 		6245, 9400,
-	}
-
-	// pg_aggregate (2600) is the specific blocker Step 3w closes — guard
-	// it explicitly so a future re-order can't silently drop it.
-	saw2600 := false
-	for _, oid := range wantOIDs {
-		if oid == 2600 {
-			saw2600 = true
-			break
-		}
-	}
-	if !saw2600 {
-		t.Fatalf("wantOIDs missing 2600 (pg_aggregate) — Step 3w must seed it")
 	}
 
 	for _, db := range []string{"base/1", "base/5"} {
@@ -96,6 +77,18 @@ func TestBootstrapMappedLocalCatalogHeapsWritesEmptyHeapPages(t *testing.T) {
 			// zeroed page would trip PageIsVerified.
 			if isAllZero(data) {
 				t.Fatalf("%s: page is all zero — InitPage was not applied", path)
+			}
+		}
+	}
+
+	// Catalogs that now have dedicated bootstrappers MUST be skipped
+	// by bootstrapMappedLocalCatalogHeaps; their files should not be
+	// created by this call. The dedicated bootstrapper is responsible.
+	for _, db := range []string{"base/1", "base/5"} {
+		for _, oid := range []uint32{2600, 2605, 2607, 2617, 2753, 3541} {
+			path := filepath.Join(dir, db, strconv.FormatUint(uint64(oid), 10))
+			if _, err := os.Stat(path); err == nil {
+				t.Errorf("OID %d in %s exists after bootstrapMappedLocalCatalogHeaps — must be omitted (clobbers dedicated bootstrapper)", oid, db)
 			}
 		}
 	}
