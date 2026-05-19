@@ -932,3 +932,160 @@ Hypotheses for the residual failure (to investigate in batched-40):
   `TestSyncTableSplitsSysIndexLeafRootWhenFull`; four new helpers
   (`readPage`, `readBTreeOpaque`, `readMetapageRootAndLevel`,
   `pageLineCount`, `pageHasHighKey`).
+
+## 2026-05-19 loop 11 (batched-40) — dual blocker discovered: wrong DBOid + multi-level-btree split
+
+This loop ran `TestE2E_FailoverGoopgToPG/async` after batched-39 and
+attempted to close the residual `pq: relation "public.bench_log" does
+not exist (42P01)` failure. Hypotheses (H1) "metapage FPI rejected", (H2)
+"second leaf-root packing full", (H3) "missing index in
+pg_namespace_nspname_index" turned out to be wrong — the true root cause
+is a pair of independent bugs unmasked by adding a disk-level diagnostic.
+
+### Diagnostic test landed
+
+`internal/testport/m0106_create_table_persists_to_disk_test.go`
+(`TestE2E_CreateTablePersistsRelnameIndexEntryOnDisk`) starts a goopg
+primary, runs `CREATE TABLE public.bench_log`, performs a clean stop
+(forcing a shutdown checkpoint), then reads `base/1/2663` and
+`base/5/2663` (pg_class_relname_nsp_index) from disk and dumps every
+8 KiB page's btree opaque (`btpo_prev`, `btpo_next`, `btpo_level`,
+`btpo_flags`) along with the first three and last NameData keys per
+leaf. The test asserts `bench_log` appears in `base/5/2663`.
+
+The diagnostic is gated behind `GOOPG_RUN_BLOCKED_M0102_E2E=1` (the
+same gate as the e2e test it diagnoses) so default `go test ./...` is
+not affected. It will flip to PASS in batched-41 once the underlying
+fixes land.
+
+### Finding D1 — runtime sys-btree writes go to base/1/ only
+
+`internal/executor/operators_ddl.go` (lines 1785, 1794, 1837, 1854,
+1886) and `internal/executor/sys_catalog_index_insert.go:183` all
+hard-code `DBOid: catalog.DefaultDBOid` (= 1, the "template1" OID) on
+their `RelFileNode` literals. The bootstrap (`internal/initdb/initdb.go`,
+`internal/initdb/btree_index_bootstrap.go`) mirrors every nailed-rel
+file to `base/1/`, `base/5/`, AND `global/`, so a fresh cluster's
+`base/5/<oid>` files are byte-identical to their `base/1/` siblings —
+but ONLY at bootstrap time. The runtime DDL path
+(`syncTableToCatalogHeap`, `syncIndexToCatalogHeap`) only updates
+`base/1/`.
+
+PG18 backend connecting with `dbname=postgres` (`OID = 5`) reads
+catalog rows from `base/5/...`. So after `CREATE TABLE public.bench_log`
+the user-table catalog entries land in `base/1/{1259,1249,2659,2662,
+2663}` but `base/5/...` stays at the bootstrap snapshot — PG can't
+find the relation.
+
+Diagnostic confirms:
+
+```
+=== POST-CREATE-TABLE base/1/2663 layout ===
+file size = 49152 bytes (= 6 pages)
+page 0: META … btm_root=5 btm_level=1
+page 1: LEAF lpc=50 prev=0 next=4 level=0 firsts=[pg_enum_typid_label_index bench_log pg_publication_pubname_index]
+…
+bench_log present in base/1/2663: true
+
+=== POST-CREATE-TABLE base/5/2663 layout ===
+file size = 32768 bytes (= 4 pages)              ← bootstrap state, untouched
+page 0: META … btm_root=3 btm_level=1
+page 1: LEAF lpc=97 …
+page 2: LEAF lpc=64 …
+page 3: INTROOT lpc=2 …
+bench_log NOT found in base/5/2663
+```
+
+### Finding D2 — runtime split corrupts multi-level btrees
+
+`splitLeafRootAndInsert` (batched-39) was written assuming block 1 is
+the SINGLE leaf-root of an otherwise-empty btree (block 0 = empty
+metapage). Production bootstrap of `pg_class_relname_nsp_index` already
+emits 4 pages (meta + 2 leaves + 1 internal root) because
+`pgBuildBtreeBulkLoadSized` exceeds the single-leaf cap at ~97
+entries × 80 B/tuple and goopg bootstraps 161 entries
+(`nailedSharedRels` + `nailedLocalRels`).
+
+When `insertCanonicalSysBtreeLeaf` then tries to insert
+`bench_log` and block 1 (the leftmost LEAF, NOT the root) has no
+space, `splitLeafRootAndInsert` runs anyway:
+
+- Block 1 is rewritten as a leaf with a P_HIKEY taken from one of
+  the merged tuples and `btpo_next` → freshly allocated block 4.
+- Block 4 is the new "right" leaf.
+- Block 5 is a new internal root carrying two downlinks: block 1 and
+  block 4.
+- The metapage's `btm_root` jumps from 3 → 5.
+
+But the **original** internal root (block 3) and **original sibling
+leaf** (block 2, which still carries the rightmost 64 entries of the
+btree) are NOT updated. The new internal root at block 5 has no
+downlink to block 2, so PG navigating from `btm_root=5` can never
+reach block 2 — its 64 entries become unreachable.
+
+This breaks not only `pg_class_relname_nsp_index` itself but every
+`pg_attribute_relid_attnum_index` etc. that was already multi-level.
+After mirroring the corrupted base/1 layout into base/5, PG-standby
+boot fails with `FATAL: pg_attribute catalog is missing 3 attribute(s)
+for relation OID 2695` (`pg_auth_members_member_role_index`) at
+`RelationCacheInitializePhase3`.
+
+### What landed (un-wired)
+
+- `internal/catalog/catalog.go`: new
+  `PostgresDBOid uint32 = 5` constant.
+- `internal/executor/sys_catalog_postgres_db_mirror.go`: new file with
+  `mirrorCatalogRelToPostgresDB(ctx, relOID)` (copy every block of
+  `(DBOid=1, RelOid)` into `(DBOid=5, RelOid)` through the buffer pool)
+  and `mirrorTouchedCatalogsToPostgresDB(ctx)` (covers
+  1259/1249/2659/2662/2663).
+- `internal/executor/operators_ddl.go::syncTableToCatalogHeap` and
+  `::syncIndexToCatalogHeap` reference the helper but with
+  `_ = mirrorTouchedCatalogsToPostgresDB` so it does NOT execute. The
+  rationale (Finding D2) and the batched-41 plan are documented in a
+  block comment at each call site.
+
+The mirror is correct as written; it cannot ship until the multi-level
+split is fixed.
+
+### Next loop (batched-41)
+
+`insertCanonicalSysBtreeLeaf` must learn the canonical PG18 btree
+insert algorithm:
+
+1. Open the relfile and read block 0's `btm_root` / `btm_level`.
+2. Pin the root block. If `btm_level == 0` the root IS the leaf
+   (current single-page case) — fall through.
+3. Otherwise descend through internal pages: at each internal page,
+   binary-search the downlinks for the largest key ≤ `newKey`, pin
+   the child block, repeat until level reaches 0.
+4. Insert `newKey` into the leaf. If `PageInsertItemRawAt` returns
+   `ErrNoSpaceInPage`, split the leaf:
+   - Allocate a new right leaf via `Pool.PinNew`.
+   - Redistribute keys; left leaf carries a P_HIKEY taken from the
+     right leaf's first key.
+   - Walk up the parent chain. For each parent: try to insert the
+     new downlink at the slot just after the descended-through slot.
+     If that parent has no room, split it the same way, walking up.
+   - If we reach the root and it overflows, create a new internal
+     root via `Pool.PinNew`, populate it with two downlinks, and
+     update the metapage's `btm_root` and `btm_level`.
+5. WAL: emit one canonical `XLOG_BTREE_INSERT_LEAF` FPI per modified
+   block, then `XLOG_BTREE_NEWROOT` if a new root was created.
+
+Once that lands, re-wire `mirrorTouchedCatalogsToPostgresDB` at both
+DDL sync sites and re-run `TestE2E_FailoverGoopgToPG/async`. The
+diagnostic test should flip to PASS.
+
+### Files touched this loop
+
+- `internal/catalog/catalog.go` — new `PostgresDBOid` constant.
+- `internal/executor/sys_catalog_postgres_db_mirror.go` — NEW (105
+  lines: page-level mirror + per-DDL convenience wrapper).
+- `internal/executor/operators_ddl.go` — reference to the helper in
+  `syncTableToCatalogHeap` and `syncIndexToCatalogHeap` with
+  block-comment rationale; helper itself is currently un-wired
+  (`_ = mirrorTouchedCatalogsToPostgresDB`).
+- `internal/testport/m0106_create_table_persists_to_disk_test.go` —
+  NEW (~220 lines: cluster setup + disk-level dump + pinned
+  assertions for both base/1/2663 and base/5/2663).

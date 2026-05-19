@@ -10533,6 +10533,96 @@ relcache init → replication readiness) and intra-package grouped.
            since `public` namespace exists at bootstrap, but rule out.
       Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
       ("2026-05-19 loop 10 (batched-39)" section).
+    - PARTIAL PROGRESS 2026-05-19 (loop 11, batched-40 DIAGNOSIS): the
+      root cause for the residual `relation "public.bench_log" does not
+      exist (42P01)` PG-standby failure is **dual**:
+      (D1) The runtime sys-btree insert path writes only to
+           `base/1/...` (catalog.DefaultDBOid=1, "template1") because
+           every catalog `RelFileNode` literal in
+           `internal/executor/operators_ddl.go` and
+           `internal/executor/sys_catalog_index_insert.go` hard-codes
+           `DBOid: catalog.DefaultDBOid`. A PG18 backend connecting with
+           `dbname=postgres` (`DBOid=5`) reads catalog rows from
+           `base/5/...`, where bootstrap put a snapshot but no runtime
+           write has ever landed. New diagnostic
+           `TestE2E_CreateTablePersistsRelnameIndexEntryOnDisk` in
+           `internal/testport/m0106_create_table_persists_to_disk_test.go`
+           pins this with disk-level reads of base/{1,5}/2663 before and
+           after `CREATE TABLE public.bench_log`:
+           - `base/1/2663` grows from 4 → 6 pages and contains
+             `bench_log` at block 1 slot 2 ("present in base/1/2663: true").
+           - `base/5/2663` is byte-identical to its 4-page bootstrap
+             state; `bench_log NOT found in base/5/2663 after CREATE TABLE`.
+      (D2) The runtime split path (`splitLeafRootAndInsert` in
+           `internal/executor/sys_catalog_btree_split.go`) is correct
+           ONLY for the single-leaf-root case (block 1 = the only data
+           page; block 0 = empty metapage). Production bootstrap of
+           `pg_class_relname_nsp_index` (OID 2663) already produces a
+           **multi-level** btree (meta + 2 leaves + internal root) because
+           `pgBuildBtreeBulkLoadSized` overflows the single-leaf cap at
+           ~97 entries × 80 B/tuple and goopg bootstraps 161 entries
+           (`nailedSharedRels` + `nailedLocalRels`). `insertCanonicalSysBtreeLeaf`
+           still operates on block 1 unconditionally, so when block 1 is
+           one of the leaves of a multi-level tree and full, the split
+           ORPHANS the original sibling leaf (block 2) and the original
+           internal root (block 3): the post-split metapage's `btm_root`
+           jumps to block 5 (the new internal root) whose only downlinks
+           are block 1 and block 4, leaving block 2's 64 entries
+           unreachable. Confirmed by the diagnostic dump — page 1's new
+           high key reads `pg_enum_typid_label_index`, but page 4 (the
+           new sibling) starts at `pg_enum_typid_label_index` too while
+           page 2 (orphaned) still carries `pg_publication_pubname_index`
+           …  `pg_user_mapping_user_server_index`.
+      Verification that the mirror is the right architecture but blocked
+      on (D2): the helper `mirrorTouchedCatalogsToPostgresDB` (new file
+      `internal/executor/sys_catalog_postgres_db_mirror.go`) was wired
+      into `syncTableToCatalogHeap` end-to-end, then UN-WIRED for this
+      loop because mirroring the corrupt base/1/2663 into base/5/2663
+      replaces the bootstrap-valid base/5/2663 with the corrupt post-split
+      layout, regressing PG-standby boot from "fails to find bench_log"
+      to "FATAL: pg_attribute catalog is missing 3 attribute(s) for
+      relation OID 2695 (pg_auth_members_member_role_index) at
+      RelationCacheInitializePhase3" — because PG can no longer find any
+      relation whose pg_class row was on the orphaned block 2.
+      Landed code:
+      - `internal/catalog/catalog.go`: new `PostgresDBOid uint32 = 5`
+        constant with PG18-traceability comment.
+      - `internal/executor/sys_catalog_postgres_db_mirror.go`: new file
+        with `mirrorCatalogRelToPostgresDB(ctx, relOID)` (page-by-page
+        copy from DBOid=1 to DBOid=5 through the buffer pool) and
+        `mirrorTouchedCatalogsToPostgresDB(ctx)` (covers the five rels
+        touched by `syncTableToCatalogHeap`: 1259/1249/2659/2662/2663).
+        Implementation is correct but call sites are intentionally
+        un-wired (`_ = mirrorTouchedCatalogsToPostgresDB`) pending the
+        multi-level-btree fix in batched-41.
+      - `internal/testport/m0106_create_table_persists_to_disk_test.go`:
+        new diagnostic regression test (gated on
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1`) that creates a goopg primary,
+        runs `CREATE TABLE public.bench_log`, stops cleanly (forcing a
+        shutdown checkpoint), then reads base/1/2663 and base/5/2663 from
+        disk and asserts `bench_log` appears in base/5/2663. Currently
+        FAILS — flips to PASS once batched-41 wires the mirror after
+        fixing the multi-level split.
+      Verified: `go build ./...` clean; `go test -count=1 -run
+      'TestSyncTable|TestBuildIndexTupleOidKey|TestUserCreateTable'
+      ./internal/executor/` PASS (existing single-leaf-root unit tests
+      still cover the split logic). `internal/executor`,
+      `internal/catalog`, `internal/storage` unchanged at the regression
+      baseline.
+      Next loop (batched-41): implement proper multi-level btree insert
+      in `insertCanonicalSysBtreeLeaf`. Concretely:
+      (a) read the metapage's `btm_root` and `btm_level`,
+      (b) descend through internal pages by binary-searching downlinks
+          on the new key,
+      (c) reach the target leaf,
+      (d) on split, propagate up the parent chain — insert a downlink
+          in the parent, splitting the parent if necessary, recursing to
+          the root and creating a new root only when the existing one
+          overflows.
+      Then re-wire `mirrorTouchedCatalogsToPostgresDB` at both DDL sync
+      sites and re-run `TestE2E_FailoverGoopgToPG/async`. The
+      `TestE2E_CreateTablePersistsRelnameIndexEntryOnDisk` diagnostic
+      should flip to PASS at that point.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

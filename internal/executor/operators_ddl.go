@@ -1874,6 +1874,21 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		ctx.TxnMgr.SetRelcacheInvalPending()
 	}
 
+	// M0106-0010 batched-40 (DIAGNOSIS): the runtime sys-btree insert path
+	// writes to base/1/ (DefaultDBOid=1), but a PG18 standby cloning via
+	// pg_basebackup reads catalog rows through `dbname=postgres`
+	// (DBOid=5). The natural fix is `mirrorTouchedCatalogsToPostgresDB(ctx)`
+	// here — but the call is intentionally *not* wired yet because the
+	// underlying `insertCanonicalSysBtreeLeaf` + `splitLeafRootAndInsert`
+	// path corrupts multi-level btrees (production bootstrap of OID 2663
+	// already produces meta+2leaves+root). Mirroring that corruption to
+	// base/5/ trips PG's `pg_attribute catalog is missing N attribute(s)`
+	// FATAL in RelationCacheInitializePhase3.
+	// Follow-up M0106-0010 batched-41: implement proper multi-level btree
+	// navigation (read metapage btm_root, walk downlinks to target leaf,
+	// split + propagate to parent) and then re-enable the mirror.
+	_ = mirrorTouchedCatalogsToPostgresDB
+
 	return nil
 }
 
@@ -1898,6 +1913,10 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	if err := insertPgClassRelnameNspIndexEntry(ctx, idx.Name, relnamespace, classTID); err != nil {
 		return fmt.Errorf("pg_class_relname_nsp_index for index: %w", err)
 	}
+	// M0106-0010 batched-40: same diagnostic-only no-op as
+	// syncTableToCatalogHeap — mirror is implemented but un-wired pending
+	// proper multi-level btree split (M0106-0010 batched-41).
+	_ = mirrorTouchedCatalogsToPostgresDB
 	return nil
 }
 

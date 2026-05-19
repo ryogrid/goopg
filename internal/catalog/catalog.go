@@ -377,6 +377,16 @@ func IsSystemRelation(oid uint32) bool {
 // catalog entry lives in this database.
 const DefaultDBOid uint32 = 1
 
+// PostgresDBOid is the PG-canonical OID for the "postgres" database
+// (template_pg_database.h: Template1ObjectId=1, PostgresObjectId=5).
+// A PG18 client backend connecting with `dbname=postgres` sysscan'd
+// every catalog lookup at `base/5/...`. M0106-0010 bootstrap mirrors
+// every nailed catalog file (heap + index) to both base/1/ and
+// base/5/; runtime catalog writes (M0106-0010 batched-40) must do
+// the same so a PG-standby clone of a goopg primary that ran any
+// CREATE TABLE sees the user-table row through its postgres-DB lens.
+const PostgresDBOid uint32 = 5
+
 // NewInMemory returns a catalog seeded with the v0 pg_catalog
 // virtual views.
 func NewInMemory() *InMemory {
