@@ -103,6 +103,13 @@ var excludeFiles = []struct {
 	{"tablespace_map", false},
 	{"backup_manifest", false},
 	{"pg_internal.init", true}, // relcache init file — standby rebuilds on first access
+	// M0106-0010 batched-44: drop the legacy goopg "global/pg_xact" flat
+	// file (1-byte-per-XID) from the basebackup payload. PG standby reads
+	// commit status from the PG-canonical "pg_xact/" SLRU directory at the
+	// data-dir root, which IS shipped. The directory check above uses
+	// IsDir() before this list, so the top-level "pg_xact" directory is
+	// unaffected — this entry only matches the regular file in global/.
+	{"pg_xact", false},
 }
 
 // excludeDirContents lists directory base names whose contents are never

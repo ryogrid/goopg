@@ -1434,6 +1434,124 @@ init and maintain it during normal operation:
    shipping the legacy goopg blob — PG never reads it, but its
    presence is a maintenance hazard.
 
+## 2026-05-19 loop 15 (batched-44) — pg_xact SLRU mirror LANDED; new residual is pg_control nextXid
+
+### Outcome
+
+Implemented the PG-canonical `pg_xact/` SLRU mirror per batched-43's plan
+and re-ran `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+'TestE2E_FailoverGoopgToPG/async' ./internal/testport/`.  The test still
+fails with 42P01, but the failure mode has shifted: the SLRU bits are
+now correctly stamped, yet PG's snapshot-mvcc check treats `xmin=3` as
+"in the future" because `CheckPoint.nextXid` in `global/pg_control`
+is still the initdb-time `FirstNormalTransactionId=3`.
+
+### What landed
+
+- `internal/mvcc/clog.go`: added `EnablePGSLRUMirror(dir)` and the
+  `mirrorToSLRULocked(xid, status)` projection. Layout constants
+  match PG18 exactly (`CLOG_BITS_PER_XACT=2`, 4 lanes per byte,
+  `BLCKSZ*4=32768` XIDs per page, 32 pages per `%04X` segment).  The
+  mirror is enabled at the canonical post-`OpenCLog` points and is a
+  no-op for `xid < FirstNormalTransactionId`, so byte 0 of segment 0
+  matches PG's initdb output exactly (`BootStrapCLOG` calls
+  `SimpleLruZeroPage(0)` and never stamps the bootstrap/frozen lanes).
+- `internal/initdb/initdb.go::bootstrapCLog`: bootstrap now also
+  creates the `pg_xact/` directory + a zeroed BLCKSZ page in
+  `pg_xact/0000`, mirroring PG's `BootStrapCLOG → SimpleLruZeroPage(0)
+  → SimpleLruWritePage` sequence.
+- `internal/initdb/open.go`: every server start (initdb path AND
+  recovery path) calls `EnablePGSLRUMirror`, which also backfills
+  the SLRU from already-loaded flat-file entries so a cluster
+  upgraded from before this change is healed on first open.
+- `internal/server/basebackup.go::excludeFiles`: legacy goopg
+  `global/pg_xact` flat file is dropped from the basebackup stream.
+  The basename filter does NOT match the top-level `pg_xact/`
+  directory because the `IsDir()` check happens first in the Walk
+  callback.
+- `internal/initdb/pg_xact_slru_test.go`: new pinning tests for the
+  byte layout, page extension behavior, segment rollover at XID
+  1 048 576, and the BootstrapXid/FrozenXid invariant
+  (lanes 1 and 2 of byte 0 must remain zero).
+
+### Verification
+
+- Inspected the post-test standby `pg_xact/0000`:
+  `byte 0 = 0x40` (only lane 3 / XID 3 set = COMMITTED).
+- Inspected the post-test primary `pg_xact/0000`:
+  `byte 0 = 0x40` (XID 3), `byte 1 = 0x01` (XID 4).
+  The standby is missing XID 4 because pg_basebackup snapshotted the
+  SLRU before the INSERT; this is expected and is supposed to be
+  reconciled via WAL replay (next section).
+- Legacy `global/pg_xact` is absent on standby; goopg-side primary
+  still has it (kept for M0030-0007 internal startup until M0106-0013).
+- Unit tests pass:
+  - `go test -count=1 -run TestCLog ./internal/mvcc/` — green
+  - `go test -count=1 -run TestBootstrapCLog_WritesPGCanonicalSLRU
+    -run 'TestCLog_SLRUMirror_.*' ./internal/initdb/` — green
+- `TestE2E_FailoverGoopgToPG/async` — still FAIL but at a different
+  layer.
+
+### Why the test still fails: nextXid stale
+
+The standby log line `next transaction ID: 3` is the smoking gun.
+`StartupXLOG` initialised `TransamVariables->nextXid` from
+`CheckPoint.nextXid` in pg_control, which goopg writes at initdb time
+in `internal/initdb/pgcontrol.go:198`:
+
+```go
+le.PutUint64(hdr[64:], pgFirstNormalXID)  // = 3
+```
+
+There is no code path that updates this field at runtime — neither
+`mvcc.Manager.allocateXID` nor the checkpointer touches pg_control.
+At basebackup time the primary has already consumed XID 3 (the CREATE
+TABLE bench_log), but the shipped `pg_control` still reports nextXid=3.
+
+The PG standby therefore sees:
+
+1. `TransamVariables->nextXid = 3`
+2. First snapshot taken on the standby: `snapshot->xmax = 3`.
+3. The bench_log heap row in `pg_class` has `xmin = 3`.
+4. `XidInMVCCSnapshot(3, snapshot)` short-circuits at
+   `TransactionIdFollowsOrEquals(xid, snapshot->xmax)` (line 1884 of
+   `snapmgr.c`) and returns `true` (still in progress).
+5. `HeapTupleSatisfiesMVCC` discards the tuple as not-yet-committed.
+6. `SearchSysCache2(RELNAMENSP, ...)` returns 0 →
+   `RangeVarGetRelidExtended → 42P01`.
+
+The SLRU lane is never even consulted on the visibility path — the
+range check eliminates it first.  That is why batched-43's "stamp the
+SLRU bits" hypothesis was necessary-but-not-sufficient: the bits exist
+now, but PG's snapshot doesn't include them in its visible window.
+
+### Next loop (batched-45): advance pg_control.nextXid
+
+Two complementary changes are needed; both must land for the test to
+pass:
+
+1. **At checkpoint time**, update `CheckPoint.nextXid` in pg_control
+   to `mvcc.Manager.NextXID()` so a basebackup snapshot of pg_control
+   reflects current XID consumption.  Hook the checkpointer (see
+   `internal/wal/checkpointer.go`) to call back into pg_control
+   serialization with the live nextXid value.
+2. **At commit time**, emit a PG-canonical `XLOG_XACT_COMMIT` record
+   (RmgrXact, info `XLOG_XACT_COMMIT`, payload `xl_xact_commit`)
+   alongside the goopg-native `RecordKindXactCommit` so PG standby's
+   `xact_redo_commit` advances `latestObservedXid` and stamps the
+   SLRU during streaming replay.  Without this, only the
+   basebackup-snapshot XIDs are visible on the standby and any commit
+   that happens after basebackup is invisible until the next
+   basebackup cycle.
+
+Step 1 alone fixes the bench_log lookup for the CREATE TABLE which
+happens before basebackup.  Step 2 fixes the subsequent INSERTs and
+brings the standby into true streaming-replicated state.  H1 (pd_lsn
+stamping, batched-42) and the SLRU mirror (this loop) remain
+necessary prerequisites for step 2 to work end-to-end.
+
+## Original batched-44 plan (superseded by the loop 15 outcome above)
+
 ### Test that pins the gap
 
 Add a focused test under `internal/initdb/` that calls

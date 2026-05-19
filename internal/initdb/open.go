@@ -638,6 +638,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: open clog: %w", err)
 	}
+	// M0106-0010 batched-44: wire the PG-canonical pg_xact/ SLRU mirror so
+	// every commit/abort updates the SLRU segment that the basebackup-shipped
+	// standby reads via SimpleLruReadPage_ReadOnly. EnablePGSLRUMirror also
+	// backfills the SLRU from already-loaded flat-file entries on the recovery
+	// path (in case the SLRU was missing or stale on disk).
+	if err := clog.EnablePGSLRUMirror(filepath.Join(abs, "pg_xact")); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: enable pg_xact slru mirror: %w", err)
+	}
 	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker) error {
 		var payload []byte
 		switch kind {

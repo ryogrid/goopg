@@ -5481,6 +5481,18 @@ func bootstrapCLog(dataDir string) error {
 	if err != nil {
 		return err
 	}
+	// M0106-0010 batched-44: bootstrap a PG-canonical pg_xact/ SLRU directory
+	// alongside the legacy goopg flat file. A PG18 standby attached via
+	// basebackup reads commit status through SimpleLruReadPage_ReadOnly, which
+	// requires segment files named %04X with at least one BLCKSZ-aligned page.
+	// BootstrapTransactionID (1) and FrozenTransactionID (2) are NOT normal
+	// XIDs — TransactionLogFetch short-circuits them to COMMITTED without
+	// consulting the SLRU — so we don't need to stamp their lanes; we just
+	// need the segment file to exist so the first runtime SetCommitted
+	// (xid >= 3) can extend it.
+	if err := c.EnablePGSLRUMirror(filepath.Join(dataDir, "pg_xact")); err != nil {
+		return fmt.Errorf("enable pg_xact slru mirror: %w", err)
+	}
 	if err := c.SetCommitted(mvcc.BootstrapTransactionID); err != nil {
 		return fmt.Errorf("mark bootstrap xid: %w", err)
 	}

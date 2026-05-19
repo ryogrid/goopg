@@ -10767,6 +10767,52 @@ relcache init → replication readiness) and intra-package grouped.
           / first user-DDL XID;
       (d) re-run `TestE2E_FailoverGoopgToPG/async` and capture the
           next residual.
+    - PARTIAL PROGRESS 2026-05-19 (loop 15, batched-44): SLRU mirror
+      LANDED; new residual identified as stale `CheckPoint.nextXid` in
+      `global/pg_control`. Implemented `mvcc.CLog.EnablePGSLRUMirror`
+      (`internal/mvcc/clog.go`) with PG18-canonical 2-bit-per-XID,
+      4-lane-per-byte, BLCKSZ-page, 32-pages-per-segment layout; wired
+      it from `bootstrapCLog` (initdb path) and from `Open`
+      (recovery path, with a backfill loop so legacy clusters heal on
+      first open); added `pg_xact` to `excludeFiles` so the legacy
+      `global/pg_xact` flat file is dropped from the basebackup
+      payload (the `IsDir()` short-circuit in the Walk callback
+      protects the top-level `pg_xact/` directory). Pinning tests
+      added in `internal/initdb/pg_xact_slru_test.go`
+      (`TestBootstrapCLog_WritesPGCanonicalSLRU`,
+      `TestCLog_SLRUMirror_StatusBitLayout`,
+      `TestCLog_SLRUMirror_ExtendsSegmentFile`,
+      `TestCLog_SLRUMirror_SegmentRollover`). Inspected the post-test
+      standby `pg_xact/0000`: byte 0 = 0x40 (XID 3 COMMITTED at lane
+      3) as expected; lanes 1 and 2 (Bootstrap/Frozen) remain zero per
+      PG initdb invariant. Re-ran
+      `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+      'TestE2E_FailoverGoopgToPG/async' ./internal/testport/`: still
+      42P01, but smoking gun shifted to the standby log line
+      `next transaction ID: 3`. `pg_control` writer
+      (`internal/initdb/pgcontrol.go:198`) hard-codes
+      `pgFirstNormalXID=3` at initdb and there is no runtime path that
+      advances it. On the standby, `StartupXLOG` initialises
+      `TransamVariables->nextXid=3`, so the first snapshot has
+      `xmax=3`; the bench_log pg_class row's xmin=3 triggers
+      `XidInMVCCSnapshot`'s
+      `TransactionIdFollowsOrEquals(xid, snapshot->xmax)` short-circuit
+      (`postgres/src/backend/utils/time/snapmgr.c:1884`), returns true,
+      and `HeapTupleSatisfiesMVCC` discards the tuple before even
+      consulting the SLRU. Design:
+      `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      (section "2026-05-19 loop 15 (batched-44)").
+      Next loop (batched-45): two complementary fixes.
+      (a) Wire the checkpointer (`internal/wal/checkpointer.go`) to
+          rewrite `global/pg_control` with the live
+          `mvcc.Manager.NextXID()` at every checkpoint so a
+          basebackup of pg_control reflects current XID consumption.
+      (b) Emit a PG-canonical `XLOG_XACT_COMMIT` record (RmgrXact,
+          `xl_xact_commit` payload) alongside the goopg-native
+          `RecordKindXactCommit` so PG standby's `xact_redo_commit`
+          advances `latestObservedXid`, updates `KnownAssignedXids`,
+          and stamps the SLRU during streaming replay. Without (b)
+          only basebackup-snapshot XIDs are visible on the standby.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
