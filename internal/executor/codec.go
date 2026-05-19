@@ -641,6 +641,14 @@ func decodeGoopgRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *m
 		dst[i] = v
 		off += n
 	}
+	// If bytes remain after decoding all columns, this is not goopg format
+	// (e.g. PG physical little-endian layout where the first byte happened to
+	// match a null/TOAST flag).  Return an error so the caller falls through to
+	// decodePhysicalPGRowIntoMctx.  M0107: fixes FK scan false-null on clusters
+	// that use EncodeRowPG (PageHeaders=true) for heap writes.
+	if off < len(data) {
+		return fmt.Errorf("DecodeRow: goopg format: %d trailing bytes", len(data)-off)
+	}
 	return nil
 }
 
