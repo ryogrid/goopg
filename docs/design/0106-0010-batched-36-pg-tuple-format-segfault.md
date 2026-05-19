@@ -787,3 +787,148 @@ split — promote the leaf-root to an internal root, allocate two leaf
 children, redistribute the items, emit `XLOG_BTREE_SPLIT_L` /
 `XLOG_BTREE_NEWROOT` WAL records — is the next blocker on the
 `TestE2E_FailoverGoopgToPG/async` path.
+
+## 2026-05-19 loop 10 (batched-39) — leaf-root → 2-leaf + new-root split on runtime sys-btree insert
+
+### Where loop 9 left off
+
+Loop 9 wired the runtime IndexTuple-insert path for the three system btrees
+probed by parse-analyze of user-table SELECTs (`pg_class_oid_index` 2662,
+`pg_class_relname_nsp_index` 2663, `pg_attribute_relid_attnum_index` 2659).
+The wiring landed cleanly for 2662 and 2659 (single new entry per
+CREATE TABLE; leaf-root has headroom). For 2663 the bootstrap packed the
+leaf-root to within ~4 bytes of the page budget, so
+`PageInsertItemRawAt` returned `ErrNoSpaceInPage` and the runtime helper
+took the silent-skip branch — leaving the PG-standby unable to resolve
+`public.bench_log` by name.
+
+### What landed this loop
+
+1. **New file** `internal/executor/sys_catalog_btree_split.go`:
+   - Layout metadata for each supported system btree (`keyMetaForSysBtree`
+     returns `(tupleSize, nkeyatts)` for the three indexes registered in
+     the runtime insert path).
+   - `buildSysBtreeLeafPage`, `buildSysBtreeInternalRootPage`,
+     `buildSysBtreeMinusInfDownlink`, `buildSysBtreeInternalDownlink`,
+     `buildSysBtreeLeafHighKey`, `writeSysBtreeMetapageInPlace` —
+     duplicate the corresponding helpers in
+     `internal/initdb/btree_index_bootstrap.go` (duplication is forced by
+     the `initdb → executor` package dependency; executor cannot import
+     initdb).
+   - `mergeSortedSlice(existing, newTuple, cmp)` — splices the new
+     tuple into the already-sorted leaf-root entries, returning the
+     merged slice + the 0-based insertion index.
+   - `splitLeafRootAndInsert(ctx, indexOID, rel, leafSlot, indexTuple, cmp)`
+     — the orchestration:
+     1. Read every entry from the locked block-1 (`leafSlot`).
+     2. Merge in `indexTuple`.
+     3. Pick a 50/50 split at `len(merged)/2`.
+     4. `Pool.PinNew` ×2 → fresh blocks for the right leaf and the new
+        internal root.
+     5. `Pool.Pin` block 0 (metapage); lock it.
+     6. Build new page bytes: rewrite block 1 as leaf-only with a P_HIKEY
+        pivot at slot 1; build block `rightBlk` as a rightmost leaf; build
+        block `rootBlk` as an internal BTP_ROOT with two downlinks
+        (minus-infinity → 1, full → `rightBlk`); rewrite the metapage
+        with `btm_root=rootBlk`, `btm_level=1`.
+     7. Install the new bytes into each pinned buffer, mark all four
+        slots dirty, then unpin (the leaf slot is returned still
+        pinned+locked so the caller's existing cleanup runs).
+     8. Emit **four** canonical `XLOG_BTREE_INSERT_LEAF` records (one per
+        modified block) with FPI = the post-mutation page bytes. PG18's
+        `btree_xlog_insert` returns `BLK_RESTORED` from
+        `XLogReadBufferForRedo` on every record and the per-tuple logic
+        never runs, so the rmgr/info combo "insert leaf at block 0
+        (metapage)" is benign — the FPI restoration happens before redo
+        and the metapage bytes are correct after restoration.
+
+2. **`insertCanonicalSysBtreeLeaf` no longer silently skips on
+   `ErrNoSpaceInPage`**: it dispatches to `splitLeafRootAndInsert` and
+   propagates any error. The previous silent-skip branch is removed.
+
+### WAL design choice — XLOG_BTREE_INSERT_LEAF + FPI for every block, not
+SPLIT_L/NEWROOT
+
+The PG-canonical `XLOG_BTREE_SPLIT_L` / `XLOG_BTREE_NEWROOT` records
+carry per-tuple metadata (firstright key, downlink composition,
+metapage delta) that requires faithful tracking of the split's
+internal state on the redo side. With FPI=apply set on every block
+reference, PG's redo path restores the page from FPI before invoking
+the rmgr handler; the handler's tuple-level logic detects
+`BLK_RESTORED` and short-circuits. Emitting **four** independent
+`XLOG_BTREE_INSERT_LEAF` records — one per modified block, each with
+FPI=apply — produces a sequence whose post-replay byte state is
+identical to a real split's, while sidestepping the SPLIT_L/NEWROOT
+encoding work. The penalty is record-volume (~4 × 8KiB FPIs per
+split); this is acceptable because user CREATE TABLE is rare and the
+leaf-root for the 3 critical indexes splits at most once per
+bootstrap.
+
+### Result
+
+`TestE2E_PhysicalReplication` — STILL PASSES (regression-clean
+against `internal/executor`, `internal/catalog`, `internal/storage`,
+`internal/wal`, `internal/mvcc`, `internal/initdb`).
+
+New regression test in
+`internal/executor/sys_catalog_index_insert_test.go`:
+`TestSyncTableSplitsSysIndexLeafRootWhenFull` — pre-fills 2663 with 97
+80-byte tuples (the exact bootstrap saturation), runs
+`syncTableToCatalogHeap` for a `public.bench_log` table, then pins:
+- NBlocks = 4 (meta + left leaf + right leaf + new root).
+- Metapage `btm_root = 3`, `btm_level = 1`.
+- Block 1 is BTP_LEAF only (no BTP_ROOT), `btpo_next = 2`,
+  `btpo_prev = P_NONE`, `btpo_level = 0`; a P_HIKEY pivot occupies
+  slot 1.
+- Block 2 is rightmost BTP_LEAF only, `btpo_prev = 1`,
+  `btpo_next = P_NONE`.
+- Block 3 is BTP_ROOT only, `btpo_level = 1`, two downlinks.
+- Combined data-tuple count across both leaves = 98 (97 + 1 new).
+- "bench_log" appears in exactly one of the two leaves.
+
+The pre-existing skip-test (`TestSyncTableSkipsSysIndexInsertWhenLeafRootFull`)
+is replaced by the split-test above.
+
+### Still failing → next loop (batched-40 candidate)
+
+`TestE2E_FailoverGoopgToPG/async` — STILL FAILS with the same
+`pq: relation "public.bench_log" does not exist (42P01)` symptom and
+no PG-standby SIGSEGV (the test now reaches the
+`waitForPGCount` timeout after ~30s rather than the previous 180s,
+suggesting the standby is alive and re-running the SELECT cleanly).
+Hypotheses for the residual failure (to investigate in batched-40):
+
+- **(H1)** The standby may not be applying the new 4-record FPI burst
+  because some other invariant of `XLOG_BTREE_INSERT_LEAF` is now
+  violated for the metapage block (PG may decline to apply FPI on a
+  metapage when the record's `info` says "insert leaf"). Solution: use
+  PG's `XLOG_FPI` (rmgr=RM_XLOG_ID, info=0xA0) for the metapage record
+  specifically — a record-type-agnostic FPI carrier.
+
+- **(H2)** A SECOND leaf-root may also be packing-full at bootstrap and
+  the runtime insert there is now erroring out (the new split path is
+  not yet a no-op for indexes whose tuple size is unknown to
+  `keyMetaForSysBtree`). The new code returns an error for any
+  unsupported index OID, which could surface as a `CREATE TABLE`
+  failure on goopg's primary — to be verified by re-reading the goopg
+  primary log around the bench_log DDL.
+
+- **(H3)** A different system btree on the parse-analyze path — e.g.,
+  `pg_namespace_nspname_index` (2684) — does not yet receive a
+  user-table entry from the runtime insert path. The current wiring
+  covers 2662/2663/2659; it does NOT touch 2684. `public` namespace's
+  pg_namespace row exists at bootstrap so this is unlikely to be the
+  issue for `bench_log`, but it should be ruled out.
+
+### Files touched this loop
+
+- `internal/executor/sys_catalog_btree_split.go` — NEW (page builders +
+  split orchestration; ~340 lines).
+- `internal/executor/sys_catalog_index_insert.go` — `insertCanonicalSysBtreeLeaf`
+  dispatches to the split path on `ErrNoSpaceInPage`; the silent-skip
+  branch is removed.
+- `internal/executor/sys_catalog_index_insert_test.go` —
+  `TestSyncTableSkipsSysIndexInsertWhenLeafRootFull` replaced by
+  `TestSyncTableSplitsSysIndexLeafRootWhenFull`; four new helpers
+  (`readPage`, `readBTreeOpaque`, `readMetapageRootAndLevel`,
+  `pageLineCount`, `pageHasHighKey`).

@@ -232,19 +232,21 @@ func insertCanonicalSysBtreeLeaf(ctx *Context, indexOID uint32, indexTuple []byt
 	}
 
 	if _, err := storage.PageInsertItemRawAt(page, insertSlot, indexTuple); err != nil {
-		slot.Unlock()
-		ctx.Pool.Unpin(slot)
 		if errors.Is(err, storage.ErrNoSpaceInPage) {
-			// The bootstrap leaf-root for several system btrees (notably
-			// pg_class_relname_nsp_index, 2663) is filled to within a few
-			// bytes of the page budget. Inserting a new user-table entry
-			// requires splitting the leaf-root into a fresh leaf + new
-			// internal root — a substantial chunk of work that is tracked
-			// as a follow-on to M0106-0010 batched-36 loop 9. For now,
-			// skip the insert so DDL does not fail; the standby will not
-			// see the new index entry until split-time WAL is emitted.
+			// Bootstrap leaf-root is packed near full (notably 2663). Split
+			// the leaf-root into two leaves + a new internal root in place.
+			// `splitLeafRootAndInsert` keeps slot pinned+locked on entry.
+			if splitErr := splitLeafRootAndInsert(ctx, indexOID, rel, slot, indexTuple, cmp); splitErr != nil {
+				slot.Unlock()
+				ctx.Pool.Unpin(slot)
+				return fmt.Errorf("split sys btree %d: %w", indexOID, splitErr)
+			}
+			slot.Unlock()
+			ctx.Pool.Unpin(slot)
 			return nil
 		}
+		slot.Unlock()
+		ctx.Pool.Unpin(slot)
 		return fmt.Errorf("insert sys btree %d slot %d: %w", indexOID, insertSlot, err)
 	}
 

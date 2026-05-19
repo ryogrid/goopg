@@ -90,13 +90,23 @@ func TestSyncTableInsertsSysCatalogIndexEntries(t *testing.T) {
 	}
 }
 
-// TestSyncTableSkipsSysIndexInsertWhenLeafRootFull verifies that a full
-// leaf-root page (mirroring the bootstrap state of pg_class_relname_nsp_index
-// after a heavy initdb) causes the runtime insert to silently skip rather
-// than fail the CREATE TABLE. The skip path is required to keep
-// `TestRestartAfterRetention` and other server-level CREATE TABLE tests
-// green until btree page splits land in a follow-on loop.
-func TestSyncTableSkipsSysIndexInsertWhenLeafRootFull(t *testing.T) {
+// TestSyncTableSplitsSysIndexLeafRootWhenFull verifies the M0106-0010
+// batched-39 leaf-root split: when the leaf-root for
+// pg_class_relname_nsp_index has no room for a new entry, the runtime insert
+// path splits block 1 into a 2-leaf + new-internal-root layout in place.
+// Post-split invariants checked:
+//   - The metapage at block 0 points at the new root (btm_root != 1,
+//     btm_level == 1).
+//   - The new root is an internal page (BTP_ROOT, btpo_level=1) with 2
+//     downlinks: minus-infinity → block 1, normal → new right leaf.
+//   - Block 1 is now BTP_LEAF only (no BTP_ROOT) with btpo_next pointing
+//     at the new right leaf and carries a P_HIKEY at slot 1.
+//   - The new right leaf is BTP_LEAF only, btpo_prev = 1, btpo_next = P_NONE,
+//     and starts with data tuples at slot 1.
+//   - The merged entry count across both leaves is 98 (97 pre-existing + 1
+//     newly inserted "bench_log").
+//   - "bench_log" is present in exactly one of the two leaves.
+func TestSyncTableSplitsSysIndexLeafRootWhenFull(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 
@@ -108,14 +118,16 @@ func TestSyncTableSkipsSysIndexInsertWhenLeafRootFull(t *testing.T) {
 	if err := setupStubSysBtree(ctx, pgAttributeRelidAttnumIndexOID, nil); err != nil {
 		t.Fatalf("stub pg_attribute_relid_attnum_index: %v", err)
 	}
-	// pg_class_relname_nsp_index: pack the leaf-root to ~full so the next
-	// insert has no room. 80-byte tuple + 4-byte line pointer = 84 bytes
-	// per slot; (8192 - 24 - 16) / 84 = 97.
+	// pg_class_relname_nsp_index: pack the leaf-root with 97 sorted entries
+	// using "aaa_AA".."aaa_FE" — all < "bench_log" so the new insert lands
+	// at sort position 98.
 	preFull := make([][]byte, 97)
 	for i := range preFull {
-		// Names that all sort before "bench_log" so the new insert would
-		// land at the end (slot 98) if space allowed.
-		name := "aaa_" + string(rune('A'+i%26))
+		// Two-letter suffix keeps every name unique and lexicographically
+		// ordered ("aaa_AA","aaa_AB",..., wrapping after Z).
+		hi := byte('A' + (i / 26))
+		lo := byte('A' + (i % 26))
+		name := "aaa_" + string([]byte{hi, lo})
 		preFull[i] = buildIndexTupleNameOidKey(0, uint16(i+1), name, catalog.PublicNamespaceOID)
 	}
 	if err := setupStubSysBtree(ctx, pgClassRelnameNspIndexOID, preFull); err != nil {
@@ -131,19 +143,171 @@ func TestSyncTableSkipsSysIndexInsertWhenLeafRootFull(t *testing.T) {
 		},
 	}
 	if err := syncTableToCatalogHeap(ctx, tbl); err != nil {
-		t.Fatalf("syncTableToCatalogHeap should not error on full leaf-root: %v", err)
+		t.Fatalf("syncTableToCatalogHeap should not error after split: %v", err)
 	}
 
-	// pg_class_relname_nsp_index leaf-root: still 97 entries (skip path).
-	got := len(readSysBtreeLeaf(t, ctx, pgClassRelnameNspIndexOID))
-	if got != 97 {
-		t.Errorf("pg_class_relname_nsp_index: got %d tuples, want 97 (insert should have been skipped)", got)
+	rel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: pgClassRelnameNspIndexOID,
+		Fork:   storage.MainFork,
 	}
-	// pg_class_oid_index leaf-root: 1 entry (insert succeeded — page had room).
-	got = len(readSysBtreeLeaf(t, ctx, pgClassOidIndexOID))
-	if got != 1 {
-		t.Errorf("pg_class_oid_index: got %d tuples, want 1", got)
+
+	// NBlocks should now be 4: meta(0), left leaf(1), right leaf(2), root(3).
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		t.Fatalf("NBlocks: %v", err)
 	}
+	if nBlocks != 4 {
+		t.Fatalf("post-split NBlocks = %d, want 4", nBlocks)
+	}
+
+	// Metapage: btm_root must point at block 3, btm_level=1.
+	rootBlk, level := readMetapageRootAndLevel(t, ctx, rel)
+	if rootBlk != 3 {
+		t.Errorf("metapage btm_root = %d, want 3", rootBlk)
+	}
+	if level != 1 {
+		t.Errorf("metapage btm_level = %d, want 1", level)
+	}
+
+	// Block 1: leaf-only, btpo_next=2, slot 1 is P_HIKEY pivot.
+	page1 := readPage(t, ctx, rel, 1)
+	prev1, next1, lvl1, flags1 := readBTreeOpaque(page1)
+	if flags1&btpRootFlag != 0 {
+		t.Errorf("block 1 flags = %#x still has BTP_ROOT", flags1)
+	}
+	if flags1&btpLeafFlag == 0 {
+		t.Errorf("block 1 flags = %#x missing BTP_LEAF", flags1)
+	}
+	if next1 != 2 {
+		t.Errorf("block 1 btpo_next = %d, want 2", next1)
+	}
+	if prev1 != 0 /* P_NONE */ {
+		t.Errorf("block 1 btpo_prev = %d, want P_NONE (0)", prev1)
+	}
+	if lvl1 != 0 {
+		t.Errorf("block 1 btpo_level = %d, want 0 (leaf)", lvl1)
+	}
+
+	// Block 2: rightmost leaf, btpo_prev=1, btpo_next=P_NONE.
+	page2 := readPage(t, ctx, rel, 2)
+	prev2, next2, lvl2, flags2 := readBTreeOpaque(page2)
+	if flags2 != btpLeafFlag {
+		t.Errorf("block 2 flags = %#x, want BTP_LEAF only", flags2)
+	}
+	if prev2 != 1 {
+		t.Errorf("block 2 btpo_prev = %d, want 1", prev2)
+	}
+	if next2 != 0 {
+		t.Errorf("block 2 btpo_next = %d, want P_NONE (0)", next2)
+	}
+	if lvl2 != 0 {
+		t.Errorf("block 2 btpo_level = %d, want 0", lvl2)
+	}
+
+	// Block 3: new internal root, btpo_level=1, 2 downlinks.
+	page3 := readPage(t, ctx, rel, 3)
+	_, _, lvl3, flags3 := readBTreeOpaque(page3)
+	if flags3 != btpRootFlag {
+		t.Errorf("block 3 flags = %#x, want BTP_ROOT only", flags3)
+	}
+	if lvl3 != 1 {
+		t.Errorf("block 3 btpo_level = %d, want 1", lvl3)
+	}
+	rootCount, err := storage.PageLinePointerCount(page3)
+	if err != nil {
+		t.Fatalf("root line pointer count: %v", err)
+	}
+	if rootCount != 2 {
+		t.Errorf("root downlink count = %d, want 2", rootCount)
+	}
+
+	// Verify the merged data-tuple count across both leaves equals 98
+	// (97 pre-existing + 1 new). Block 1 holds a P_HIKEY at slot 1 (pivot,
+	// not a data tuple); block 2 is rightmost (no high key).
+	left := pageLineCount(t, page1)
+	right := pageLineCount(t, page2)
+	dataTuples := (left - 1) + right // subtract block-1 high key
+	if dataTuples != 98 {
+		t.Errorf("post-split data tuple total = %d, want 98", dataTuples)
+	}
+
+	// "bench_log" must appear on exactly one leaf.
+	found := 0
+	for _, page := range [][]byte{page1, page2} {
+		count, _ := storage.PageLinePointerCount(page)
+		startSlot := uint16(1)
+		// Block 1 carries a high key at slot 1; data starts at slot 2.
+		if page[0] != 0 && pageHasHighKey(page) {
+			startSlot = 2
+		}
+		for slot := startSlot; slot <= uint16(count); slot++ {
+			raw, err := storage.PageGetItemRaw(page, slot)
+			if err != nil {
+				continue
+			}
+			if len(raw) < sysIndexTupleHoff+64 {
+				continue
+			}
+			if trimNameDataBytes(raw[sysIndexTupleHoff:sysIndexTupleHoff+64]) == "bench_log" {
+				found++
+			}
+		}
+	}
+	if found != 1 {
+		t.Errorf("bench_log occurrences across leaves = %d, want 1", found)
+	}
+}
+
+// readPage pins block `blk` of `rel`, copies its bytes, and unpins.
+func readPage(t *testing.T, ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber) []byte {
+	t.Helper()
+	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+	if err != nil {
+		t.Fatalf("pin block %d: %v", blk, err)
+	}
+	defer ctx.Pool.Unpin(slot)
+	out := make([]byte, storage.BlockSize)
+	copy(out, slot.Page())
+	return out
+}
+
+// readBTreeOpaque decodes the 16-byte BTPageOpaqueData trailer at the end of
+// the supplied page: (btpo_prev, btpo_next, btpo_level, btpo_flags).
+func readBTreeOpaque(page []byte) (prev, next, level uint32, flags uint16) {
+	off := storage.BlockSize - sizeOfBTPageOpaque
+	prev = binary.LittleEndian.Uint32(page[off+0 : off+4])
+	next = binary.LittleEndian.Uint32(page[off+4 : off+8])
+	level = binary.LittleEndian.Uint32(page[off+8 : off+12])
+	flags = binary.LittleEndian.Uint16(page[off+12 : off+14])
+	return
+}
+
+// readMetapageRootAndLevel returns (btm_root, btm_level) from the metapage
+// at block 0 of rel.
+func readMetapageRootAndLevel(t *testing.T, ctx *Context, rel storage.RelFileNode) (uint32, uint32) {
+	t.Helper()
+	page := readPage(t, ctx, rel, 0)
+	base := storage.SizeOfPageHeaderData
+	rootBlk := binary.LittleEndian.Uint32(page[base+8 : base+12])
+	level := binary.LittleEndian.Uint32(page[base+12 : base+16])
+	return rootBlk, level
+}
+
+func pageLineCount(t *testing.T, page []byte) int {
+	t.Helper()
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		t.Fatalf("line pointer count: %v", err)
+	}
+	return count
+}
+
+// pageHasHighKey heuristic: a leaf page that is non-rightmost (i.e., has a
+// high key) is identified by having btpo_next != P_NONE in the opaque area.
+func pageHasHighKey(page []byte) bool {
+	_, next, _, _ := readBTreeOpaque(page)
+	return next != 0
 }
 
 // TestBuildIndexTupleOidKeyByteLayout pins the on-disk byte layout of a

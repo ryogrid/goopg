@@ -10474,6 +10474,65 @@ relcache init → replication readiness) and intra-package grouped.
       children, redistribute, emit `XLOG_BTREE_SPLIT_L` /
       `XLOG_BTREE_NEWROOT` WAL records — to unblock the
       `TestE2E_FailoverGoopgToPG/async` path.
+    - PARTIAL PROGRESS 2026-05-19 (loop 10, batched-39): leaf-root
+      split landed for the runtime sys-btree insert path. When
+      `PageInsertItemRawAt` returns `ErrNoSpaceInPage` on block 1, the
+      new `splitLeafRootAndInsert` orchestrator (in
+      `internal/executor/sys_catalog_btree_split.go`) splits the
+      leaf-root into two leaves + a fresh internal root in place:
+      block 1 is rewritten as BTP_LEAF (no longer root, P_HIKEY pivot
+      at slot 1, `btpo_next` → fresh right leaf); right leaf is
+      allocated via `Pool.PinNew` (rightmost, no high key); a new
+      internal root is allocated via a second `PinNew` (BTP_ROOT,
+      `btpo_level=1`, minus-infinity downlink → block 1, full
+      downlink → right leaf); metapage at block 0 rewritten to
+      `btm_root=rootBlk`, `btm_level=1`, `btm_fastroot=rootBlk`.
+      Four canonical `XLOG_BTREE_INSERT_LEAF` records — one per
+      modified block (1, rightBlk, rootBlk, 0/metapage) — emit with
+      FPI=apply so PG18's `btree_xlog_insert` returns `BLK_RESTORED`
+      from `XLogReadBufferForRedo` and the per-tuple logic never runs.
+      Helper functions duplicated from `internal/initdb/btree_index_bootstrap.go`
+      because `initdb → executor` package dependency prevents the
+      reverse import. `keyMetaForSysBtree` maps each supported index
+      OID to its on-disk `(tupleSize, nkeyatts)` for 2659/2662/2663.
+      The previous silent-skip branch in
+      `insertCanonicalSysBtreeLeaf` is removed; the split is the new
+      no-space handler. Regression test:
+      `TestSyncTableSplitsSysIndexLeafRootWhenFull` replaces the
+      former skip test; pins post-split invariants:
+      - NBlocks = 4 (meta + left leaf + right leaf + new root).
+      - Metapage `btm_root=3`, `btm_level=1`.
+      - Block 1: BTP_LEAF only (no BTP_ROOT), `btpo_next=2`,
+        `btpo_prev=P_NONE`, `btpo_level=0`; P_HIKEY at slot 1.
+      - Block 2: rightmost BTP_LEAF only, `btpo_prev=1`,
+        `btpo_next=P_NONE`.
+      - Block 3: BTP_ROOT only, `btpo_level=1`, two downlinks.
+      - Combined data-tuple count = 98 (97 pre-existing + 1 new).
+      - "bench_log" appears in exactly one of the two leaves.
+      All affected packages pass: `internal/executor`,
+      `internal/catalog`, `internal/storage`. `internal/wal`: same
+      2 pre-existing failures (`TestCheckpointerWritesCheckpointMarkers`,
+      `TestEncodeRecordXLogClassifiesXactCommitXID`). `internal/initdb`:
+      same 19 pre-existing failures. `TestE2E_PhysicalReplication` PASS.
+      `TestCanonicalUserRowOnEmptyPageM0106_0010_36` PASS.
+      `TestE2E_FailoverGoopgToPG/async` — STILL FAILS but failure now
+      reaches the `waitForPGCount` 30s deadline (vs. previous 180s),
+      with the same `pq: relation "public.bench_log" does not exist
+      (42P01)` symptom and no PG-standby SIGSEGV. Hypotheses for the
+      residual failure (batched-40):
+      (H1) PG may decline to apply FPI on a metapage when the record's
+           info says "insert leaf"; switch the metapage record to
+           PG's record-type-agnostic `XLOG_FPI` (rmgr=RM_XLOG_ID,
+           info=0xA0).
+      (H2) A second packing-full leaf-root might be erroring out under
+           the new split path; verify by reading the goopg primary log
+           around the bench_log DDL.
+      (H3) A different system btree on the parse-analyze path (e.g.,
+           `pg_namespace_nspname_index` 2684) does not yet receive a
+           user-table entry from the runtime insert path. Less likely
+           since `public` namespace exists at bootstrap, but rule out.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 10 (batched-39)" section).
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
