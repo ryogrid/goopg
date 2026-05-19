@@ -10961,6 +10961,62 @@ relcache init → replication readiness) and intra-package grouped.
       already on, then triage whether bench_log resolves through
       the heap pages OR is short-circuited by relcache/init-file
       resolution.
+    - PARTIAL PROGRESS 2026-05-19 (loop 19, batched-48): OID 2665
+      identified — NOT `pg_largeobject_loid_pn_index` (stale note
+      in batched-47) but `pg_constraint_conrelid_contypid_conname_index`
+      (`ConstraintRelidTypidNameIndexId`), declared in
+      `postgres/src/include/catalog/pg_constraint.h:180`:
+        DECLARE_UNIQUE_INDEX(pg_constraint_conrelid_contypid_conname_index,
+          2665, ..., pg_constraint,
+          btree(conrelid oid_ops, contypid oid_ops, conname name_ops));
+      Failure path: parser opens `public.bench_log` →
+      `parserOpenTable` → `RelationIdGetRelation` → relcache build
+      calls `CheckNNConstraintFetch` (relcache.c:4615) which
+      `systable_beginscan(pg_constraint, ConstraintRelidTypidNameIndexId, …)`.
+      PG18 stores user NOT NULL constraints as pg_constraint rows,
+      so this index is on the relcache-build hot path for every
+      user table — not only those with CHECK constraints.
+      Fix landed (3 layers):
+      (1) `internal/initdb/relcache_init.go` adds
+          `{OID: 2665, Name: "pg_constraint_conrelid_contypid_conname_index"}`
+          to the idxSpec list. flattenRels auto-derives indnatts=3
+          and per-column attr shapes (oid_ops/oid_ops/name_ops)
+          from pg_constraint's pgConstraintAttrs(), so the name-typed
+          third key inherits attlen=64/attbyval=false and dodges
+          the strncmp-over-inline-bytes SIGSEGV class (batched-36
+          loops 4–6).
+      (2) `internal/initdb/initdb.go::pgIndexInitialEntries` adds
+          `entry(2665, 2606, []int16{9, 10, 2}, …, true, false)` —
+          UNIQUE not PKEY (2667 owns that role).
+      (3) Three OID lists in `initdb.go` (base/1/, perDBIndexOIDs,
+          global/) gain `2665` so an empty metapage file is written
+          to every PG-required path. Empty metapage is sufficient:
+          pg_constraint heap on the standby has no rows for user
+          tables (M0106-0011 territory), so `systable_beginscan`
+          returns no rows, CheckNNConstraintFetch completes, and
+          relcache build for bench_log succeeds.
+      Tests added/updated:
+      `pg_index_indkey_test.go` pinned map gains `2665: {9, 10, 2}`;
+      `btree_index_bootstrap_test.go::mustHave` gains 2665.
+      Verified: `TestE2E_FailoverGoopgToPG/async` no longer logs
+      `XX000: could not open relation with OID 2665`. Standby
+      reaches the next residual:
+        TRAP: failed Assert("j > attnum"), File: "heaptuple.c", Line: 642
+        backtrace: nocachegetattr → extractRelOptions →
+                   RelationIdGetRelation → relation_open →
+                   parserOpenTable → addRangeTableEntry
+      Pre-existing baseline failures unchanged (17 in
+      ./internal/initdb/, 2 in ./internal/wal/).
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 19 (batched-48)" section).
+      Next loop (batched-49): diagnose the `j > attnum` heaptuple
+      assertion in `extractRelOptions` reading pg_class.reloptions
+      (Anum=33) on the standby's bench_log row. Capture the heap
+      tuple bytes off the standby's `base/5/1259` page and walk
+      them through PG18's heap_form_tuple/nocachegetattr prefix to
+      localise the bad attnum (likely an attcacheoff violation
+      from a varlena/NULL pattern in goopg's runtime sys-btree
+      pg_class emit from batched-36 loop 9).
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

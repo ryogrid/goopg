@@ -1101,7 +1101,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2654, 2655, 2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
-		2662, 2663, 2667,
+		2662, 2663,
+		2665, // pg_constraint_conrelid_contypid_conname_index (batched-48)
+		2667,
 		2668, // pg_conversion_default_index (Step 3ah)
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
 		2670, // pg_conversion_oid_index (Step 3ai)
@@ -1239,7 +1241,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2654, 2655, 2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
-		2662, 2663, 2667,
+		2662, 2663,
+		2665, // pg_constraint_conrelid_contypid_conname_index (batched-48)
+		2667,
 		2668, // pg_conversion_default_index (Step 3ah)
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
 		2670, // pg_conversion_oid_index (Step 3ai)
@@ -1330,7 +1334,9 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		2654, 2655, 2658, 2659,
 		2660, // pg_cast_oid_index (Step 3ab)
 		2661, // pg_cast_source_target_index (Step 3ac)
-		2662, 2663, 2667,
+		2662, 2663,
+		2665, // pg_constraint_conrelid_contypid_conname_index (batched-48)
+		2667,
 		2668, // pg_conversion_default_index (Step 3ah)
 		2669, // pg_conversion_name_nsp_index (Step 3aj)
 		2670, // pg_conversion_oid_index (Step 3ai)
@@ -4015,6 +4021,11 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
 		entry(2701, 2620, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_trigger_tgrelid_tgname_index
 		entry(2667, 2606, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_constraint_oid_index
+		// M0106-0010 batched-48: pg_constraint_conrelid_contypid_conname_index
+		// (OID 2665, ConstraintRelidTypidNameIndexId). pg_constraint attnums
+		// (pg_constraint.h): 2=conname (name), 9=conrelid (oid),
+		// 10=contypid (oid). PG declares UNIQUE not PKEY.
+		entry(2665, 2606, []int16{9, 10, 2}, []uint32{oidOps, oidOps, nameOps}, []uint32{0, 0, cCollation}, true, false), // pg_constraint_conrelid_contypid_conname_index
 		entry(2688, 2617, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_operator_oid_index
 		entry(2680, 2611, []int16{1, 3}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true),                        // pg_inherits_relid_seqno_index
 		// pg_namespace columns (PG18, pg_namespace.h): 1=oid, 2=nspname,

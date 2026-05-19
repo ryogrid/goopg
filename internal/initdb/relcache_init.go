@@ -711,6 +711,18 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{OID: 2693, Name: "pg_rewrite_rel_rulename_index"},
 	{OID: 2701, Name: "pg_trigger_tgrelid_tgname_index"},
 	{OID: 2667, Name: "pg_constraint_oid_index"},
+	// M0106-0010 batched-48: pg_constraint_conrelid_contypid_conname_index
+	// (OID 2665, ConstraintRelidTypidNameIndexId). PG18's relcache build
+	// path for any user table that may have NOT NULL constraints calls
+	// CheckNNConstraintFetch (relcache.c:4615) which opens pg_constraint
+	// via this composite UNIQUE index. Without a bootstrapped pg_class /
+	// pg_attribute / pg_index entry the standby FATALs with
+	//   "could not open relation with OID 2665"
+	// the first time a backend parses a user table with NOT NULL columns
+	// (e.g. TestE2E_FailoverGoopgToPG/async's bench_log).
+	// btree(conrelid oid_ops, contypid oid_ops, conname name_ops),
+	// indnatts=3, UNIQUE not PKEY.
+	{OID: 2665, Name: "pg_constraint_conrelid_contypid_conname_index"},
 	{OID: 2688, Name: "pg_operator_oid_index"},
 	{OID: 2680, Name: "pg_inherits_relid_seqno_index"},
 	// M0106-0010 batched-36 loop 5: pg_namespace_nspname_index (OID 2684)

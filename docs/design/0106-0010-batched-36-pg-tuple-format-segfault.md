@@ -1893,3 +1893,121 @@ relation goopg's basebackup payload did not seed. Re-run with
 `log_min_messages=debug5` already enabled and capture the failing
 backend's stack frame around `relation_open` /
 `index_open`.
+
+## 2026-05-19 loop 19 (batched-48) — bootstrap pg_constraint_conrelid_contypid_conname_index (OID 2665)
+
+### Diagnosis (corrects batched-47's "next loop" hypothesis)
+
+OID 2665 is NOT `pg_largeobject_loid_pn_index` — that was a stale
+note in the batched-47 follow-up. The authoritative declaration is
+`postgres/src/include/catalog/pg_constraint.h:180`:
+
+    DECLARE_UNIQUE_INDEX(pg_constraint_conrelid_contypid_conname_index,
+                         2665, ConstraintRelidTypidNameIndexId,
+                         pg_constraint,
+                         btree(conrelid oid_ops, contypid oid_ops,
+                               conname name_ops));
+
+The standby's failure path:
+
+1. Client issues `SELECT count(*) FROM public.bench_log WHERE client = -999`.
+2. Parser/analyser opens `public.bench_log` (`parserOpenTable` →
+   `relation_open` → `RelationIdGetRelation`).
+3. Relcache build for any user table that may carry NOT NULL
+   constraints calls `CheckNNConstraintFetch` (relcache.c:4615)
+   which opens pg_constraint via
+   `systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, …)`.
+4. With OID 2665 missing from goopg's bootstrap, the index relcache
+   probe fails and PG raises `XX000: could not open relation with
+   OID 2665 at character 22` (character 22 = the `p` in `public.bench_log`,
+   the FROM-clause relation).
+
+PG18 promoted user NOT NULL constraints into actual pg_constraint
+rows, so `CheckNNConstraintFetch` is now on the hot path for every
+user table relcache build — not only tables with CHECK constraints
+as in earlier majors.
+
+### Fix
+
+Bootstrap a metapage-only btree for OID 2665 in three layers,
+mirroring the existing pattern for `pg_constraint_oid_index`
+(OID 2667):
+
+1. `internal/initdb/relcache_init.go` — append
+   `{OID: 2665, Name: "pg_constraint_conrelid_contypid_conname_index"}`
+   to the idxSpec list passed to `flattenRels`. The seed indkey,
+   attr shape, and `IsShared=false` propagate automatically:
+   - `pgIndexNattsByOID()` derives indnatts=3 from the pg_index seed.
+   - `deriveIndexAttrsFromHeap` infers per-column descriptors from
+     pg_constraint's pg_attribute rows (conrelid attnum=9 oid_ops,
+     contypid attnum=10 oid_ops, conname attnum=2 name_ops). The
+     name-typed third key picks up attlen=64/attbyval=false from
+     `pgConstraintAttrs()` so `_bt_compare` reads the inline
+     NameData by reference and avoids the strncmp-over-inline-bytes
+     SIGSEGV class fixed in batched-36 loops 4–6.
+2. `internal/initdb/initdb.go::pgIndexInitialEntries` — append
+   `entry(2665, 2606, []int16{9, 10, 2}, []uint32{oidOps, oidOps, nameOps},
+   []uint32{0, 0, cCollation}, true, false)`. UNIQUE (not PKEY)
+   because pg_constraint's declaration is `DECLARE_UNIQUE_INDEX`,
+   not `DECLARE_UNIQUE_INDEX_PKEY` (2667 owns that role).
+3. `internal/initdb/initdb.go` — three OID lists at lines ~1097,
+   ~1242, ~1333 (the `base/1/`, `perDBIndexOIDs`, and global/
+   empty-btree placeholders) gain `2665` so an empty metapage file
+   exists at every required path. PG's `load_critical_index` (via
+   the relcache init-file replay path) PANICs if any of the listed
+   files is absent.
+
+Empty metapage suffices because pg_constraint on the standby has
+no rows for user tables (the primary's CREATE TABLE on goopg emits
+goopg-native catalog rows, which are not replicated as pg_constraint
+heap tuples — that gap is M0106-0011 territory). `systable_beginscan`
+returns no rows, `CheckNNConstraintFetch` completes, and the
+relcache entry for bench_log finishes loading. Treating the standby
+as not knowing about NOT NULL is acceptable for read-only queries;
+the source of truth is the primary.
+
+### Verification
+
+- `go test -run 'TestPgIndexInitialEntriesIndkeyMatchesPG18' ./internal/initdb/`
+  PASS (after extending the pinned indkey map with `2665: {9, 10, 2}`).
+- `go test -run 'TestBootstrapPgIndexIndexrelidIndexWritesPopulatedBtree'
+  ./internal/initdb/` PASS (mustHave list gains 2665).
+- `TestE2E_FailoverGoopgToPG/async`: the XX000 error on OID 2665 no
+  longer appears in the standby log. The standby reaches the next
+  residual (see below).
+- Pre-existing baseline failures unchanged: 17 tests in
+  `./internal/initdb/` (M0030 migration + M0106-0012 sync-commit
+  flush family) and 2 in `./internal/wal/`
+  (TestCheckpointerWritesCheckpointMarkers,
+  TestEncodeRecordXLogClassifiesXactCommitXID). All reproduce on
+  master HEAD `6665f91` before this loop's diff.
+
+### Next residual (batched-49)
+
+Standby backends now abort on the same SELECT with:
+
+    TRAP: failed Assert("j > attnum"), File: "heaptuple.c", Line: 642
+    backtrace:
+      ExceptionalCondition
+      nocachegetattr+0x2be
+      extractRelOptions+0x40
+      RelationIdGetRelation+0x122
+      relation_open+0x5b
+      parserOpenTable+0x56
+      addRangeTableEntry+0xce
+
+`extractRelOptions` calls `fastgetattr(pg_class_tuple,
+Anum_pg_class_reloptions=33, …)`. `nocachegetattr` walks the
+TupleDesc forward from the last cached "natts so far" position; the
+`j > attnum` assert fires when the cached fast-path exceeded the
+column being requested — typically because the tuple's `t_natts`
+disagrees with the TupleDesc, or because attcacheoff was poisoned
+on a NULL column earlier in the row.
+
+Hypothesis: bench_log's pg_class row was written by goopg's runtime
+sys-btree path (batched-36 loop 9) without re-populating
+attcacheoff or with a varlena/NULL pattern that violates PG's
+fastgetattr invariants for column 33 (`reloptions text[]`). Next
+loop captures the bench_log pg_class tuple bytes off the standby's
+heap page and walks them through PG18's heap_form_tuple/nocachegetattr
+prefix to localise the bad attnum.
