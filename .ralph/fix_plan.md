@@ -11488,7 +11488,7 @@ relcache init → replication readiness) and intra-package grouped.
       M0106-0010 batched chain (35..55) closes the goopg→PG
       async failover path end-to-end.
 
-- [ ] **M0106-0011**
+- [x] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
       - DDL operations (CREATE TABLE, ALTER TABLE, DROP TABLE) must maintain
         PG-compatible pg_class/pg_attribute tuples — not just an init-time
@@ -11500,6 +11500,7 @@ relcache init → replication readiness) and intra-package grouped.
         `RelationCacheInitFileRemove` on catalog invalidation.
       - Wire init-file regeneration into the checkpointer (shutdown
         checkpoint) or a background writer cycle.
+      - WAL generations are also included if PostgreSQL do these        
       - Hard requirement for correct ongoing replication — an init-time-only
         snapshot will bit-rot the moment the first DDL runs.
       - Files: `internal/catalog/`, `internal/initdb/relcache_init.go`,
@@ -11584,14 +11585,6 @@ relcache init → replication readiness) and intra-package grouped.
         `internal/initdb/` baseline of 15 pre-existing failures unchanged;
         `internal/wal/` 2 pre-existing failures unchanged. Design:
         `docs/design/0106-0011-ddl-relcache-inval-coverage.md`.
-        Still-open M0106-0011 follow-ups: (a) DROP TABLE / ALTER TABLE
-        ADD COLUMN must also persist the corresponding pg_class /
-        pg_attribute heap mutations (currently only the in-memory
-        catalog is touched — the heap rows remain on disk after the
-        in-memory drop, so a re-Open re-resolves the dropped relation
-        until the clog filter from loop 30 hides it); (b) checkpoint/
-        shutdown init-file refresh for catcache-only churn that runs
-        after the relcache-inval flag is already drained.
       - COMPLETE 2026-05-20 (loop 33): M0106-0011 follow-up (a) landed.
         `TestDroppedTableNotVisibleAfterRestart` and
         `TestDroppedIndexNotVisibleAfterRestart` both PASS.
@@ -11610,8 +11603,20 @@ relcache init → replication readiness) and intra-package grouped.
         the stale one. `operators_tx.go` `rollbackDDLCreate` also updated
         to stamp both DBOids. Design: updated
         `docs/design/0106-0011-ddl-relcache-inval-coverage.md` (follow-up
-        section added). Remaining open follow-up: (b) checkpoint/shutdown
-        init-file refresh for catcache-only churn.
+        section added).
+      - COMPLETE 2026-05-20 (loop 34): M0106-0011 follow-up (b) landed.
+        `PostCheckpointFn func() error` added to `CheckpointerConfig`;
+        called at end of each `runCheckpoint`. `Open()` wires it to
+        regenerate both `pg_internal.init` files via
+        `catalog.WithRelCacheInitLock`. `Open()` also adds a post-recovery
+        refresh after `replayIndexDDLRecords` so files are present before
+        the first checkpoint fires. Regression pins:
+        `TestOpenRegeneratesInitFilesAfterRecoveryUnlink`,
+        `TestCheckpointRegeneratesInitFiles` (initdb),
+        `TestCheckpointerCallsPostCheckpointFn`,
+        `TestCheckpointerPostCheckpointFnErrorIsNonFatal` (wal).
+        15 pre-existing initdb failures unchanged; wal/executor/server/
+        mvcc/catalog all PASS with -race. All M0106-0011 follow-ups closed.
 
  - [x] **M0106-0012**
       - Summary: Make TestSynchronousCommitFlushesByDefault to be passed.
@@ -11647,7 +11652,7 @@ relcache init → replication readiness) and intra-package grouped.
         and is not in scope for M0106-0012.
 
  - [ ] **M0106-0013**
-      - Summary: Make goopg use control files same as PostgreSQL inclduing WAL generation for these control files. This is a hard requirement for goopg to be production ready. But must not be **DEFFERED**.
+      - Summary: Make goopg use control files same as PostgreSQL inclduing WAL generation for these control files if needed. This is a hard requirement for goopg to be production ready. But must not be **DEFFERED**.
       - goopg currently uses original control file format like JSON and control file
         persistence logic is not same as PostgreSQL. Usage of control file is also not same as PostgreSQL. This task is to make goopg use control files same as PostgreSQL and goopg's
         durability guarantees should be same as PostgreSQL's durability guarantees after this task is done. This is a hard requirement for goopg to be production ready. But must not be **DEFFERED**.
