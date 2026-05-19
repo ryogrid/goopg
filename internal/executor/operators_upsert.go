@@ -474,6 +474,21 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalo
 				return false, nil
 			}
 		}
+		// Case 3: lock-only xmax (SELECT FOR UPDATE/SHARE) from a live
+		// transaction. Upstream _bt_check_unique blocks via
+		// ConditionalLockTuple until the lock holder releases, then
+		// re-probes. The row is still live (xmin settled, xmax is only a
+		// lock stamp) — we must wait because the lock holder may
+		// subsequently UPDATE or DELETE the conflicting row before
+		// committing, changing the arbiter outcome.
+		if xmax != storage.InvalidTransactionID && xmax != selfXID && storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
+			xminSettled := xmin == selfXID || o.ctx.Snap.SeesCommittedXID(xmin)
+			if xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
+				foundXID = xmax
+				case1 = false
+				return false, nil
+			}
+		}
 		return true, nil
 	})
 	return foundXID, case1, foundXID != 0
@@ -607,3 +622,4 @@ func encodeArbiterKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, p
 	}
 	return out, nil
 }
+ 
