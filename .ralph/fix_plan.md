@@ -10298,6 +10298,63 @@ relcache init → replication readiness) and intra-package grouped.
       against PG18 expected values; also consider widening the audit
       to oid composite indexes on the SELECT path where the backing
       heap's pg_attribute may disagree on attnum ordering.
+    - PARTIAL PROGRESS 2026-05-19 (loop 7): SIGSEGV in PG client backend
+      is **GONE**. Loop-4 audit items (2) and (3) closed in this loop:
+      `pg_index` row for `indexrelid=2684` already carries
+      PG18-canonical `indkey={2}, indclass={1986 name_ops},
+      indcollation={950 C_COLLATION_OID}` per `pgIndexInitialEntries`
+      (initdb.go:4026), and OID 2684 is intentionally **not** in
+      `criticalLocalIndexOIDs`, so PG rebuilds the relcache entry via
+      catalog scans (the on-disk `pg_attribute` row is the
+      authoritative tupdesc source — loop-5's override fixes that).
+      The residual SEGV in loop 6 was actually on a *different* index
+      on the parse-analyze path: `pg_class_relname_nsp_index` (2663)
+      and friends — composite indexes whose leading or middle key is
+      name-typed, but whose idxSpec lacked an explicit `Attrs`
+      override. `flattenRels` was emitting `indexKeyAttrs(N)`'s all-OID
+      descriptor (attlen=4 / attbyval=true) for those name columns,
+      reproducing the exact SIGSEGV class loop 5 fixed for 2684.
+      Fix: extend `flattenRels` to auto-derive index Attrs from the
+      parent heap's `nailedAttr` map via
+      `pgIndexInitialEntries[idxSpec.OID].IndKey`. Explicit overrides
+      (loop 5 / loop 6) still take precedence; the new path covers
+      every other simple-column index on a nailed heap. Helper
+      `deriveIndexAttrsFromHeap` is the single resolution point;
+      it bails to the historical `indexKeyAttrs(natts)` for
+      expressional indexes (indkey=0), unknown heaps, and
+      natts/indkey-length mismatches. New regression tests:
+      `TestNailedCompositeNameIndexesAutoDerivedFromHeap` pins ten
+      composite name-typed indexes (2663, 2658, 2691, 2704, 2693,
+      2686, 2754, 2689, 3164, 2669) at attlen=64/attbyval=false/
+      attalign='c' on the name column; `TestFlattenRelsDeriveIndex
+      AttrsFromHeap` exercises the helper's no-match paths.
+      `TestE2E_FailoverGoopgToPG/async` — STILL FAILS but with a
+      fundamentally different error class:
+      `pq: relation "public.bench_log" does not exist (42P01)`. PG
+      standby boots cleanly, no `signal 11`, no crash-recovery loop,
+      `public` resolves; the parse-analyzer just cannot find
+      `bench_log` in pg_class. Next blocker is WAL-replay completeness
+      for user-table DDL/DML on the standby — separate from the
+      tupdesc class. Caveat documented: 2701 (pg_trigger_tgrelid_
+      tgname_index) is intentionally NOT covered by the new test
+      because `pgIndexInitialEntries.indkey={2,4}` (PG18's 23-column
+      schema) disagrees with goopg's reduced 8-column
+      `pgTriggerAttrs()` where `tgname` is attnum 3. Auto-derivation
+      correctly resolves heap attnum 4 → `tgfoid` (the goopg-consistent
+      shape, masked previously by the OID default). Empty index ⇒ no
+      crash, but a future loop should reconcile the two definitions.
+      All affected packages pass (initdb regression-clean against my
+      changes — 19 pre-existing failures unchanged; wal/mvcc/executor/
+      server/catalog all PASS; TestE2E_PhysicalReplication PASS).
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 7" section).
+      Next loop (batched-38 candidate): investigate why
+      `public.bench_log` does not appear in the standby's pg_class
+      after the goopg primary's CREATE TABLE WAL is applied —
+      candidates: (a) `StreamReplayer` filters CREATE TABLE records,
+      (b) the resulting pg_class row is written but not visible to
+      hot-standby snapshot, (c) the canonical XLOG_RELMAP / DDL WAL
+      records are not yet emitted by goopg for user-table CREATE.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

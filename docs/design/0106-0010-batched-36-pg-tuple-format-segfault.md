@@ -453,3 +453,98 @@ Files touched this loop:
   six idxSpec entries listed above.
 - `internal/initdb/nailed_name_typed_indexes_test.go` — new
   regression test pinning all six descriptors + pg_attribute rows.
+
+## 2026-05-19 loop 7 — auto-derive index Attrs from heap pg_attribute
+
+Loop 4 audit items (2) and (3) are now closed by the parallel investigation in
+this loop:
+
+  - (2) `pg_index` row for `indexrelid=2684` carries the PG18-canonical
+    values: `indkey={2}` (nspname is attnum 2 of pg_namespace), `indclass={1986}`
+    (`name_ops`), `indcollation={950}` (`C_COLLATION_OID`). All produced by
+    `pgIndexInitialEntries()` in `internal/initdb/initdb.go:4026`. No fix needed.
+  - (3) OID 2684 is intentionally **not** in `criticalLocalIndexOIDs`, so no
+    entry is written to `pg_internal.init`. PG18's
+    `RelationCacheInitializePhase3` constructs the relcache entry on demand
+    via catalog scans (`pg_class_oid_index` → `pg_attribute_relid_attnum_index`).
+    The on-disk `pg_attribute` row for `(attrelid=2684, attnum=1)` is the
+    authoritative tupdesc source — the loop-5 override controls that.
+
+The residual SIGSEGV in loop 6 was on a *different* index than 2684. The
+parse-analyze path for `SELECT count(*) FROM public.bench_log WHERE
+client = -999` traverses 2684 (resolved `public`), then `pg_class_relname_
+nsp_index` (2663) to resolve `bench_log` in namespace 2200, then
+`pg_attribute_relid_attnam_index` (2658) for column lookups. Each of those
+is a composite index with a name-typed key column lacking an explicit
+`Attrs` override, so `flattenRels` was emitting `indexKeyAttrs(N)`'s
+all-OID descriptor (attlen=4, attbyval=true) for the name column. PG's
+`_bt_compare → index_getattr → fetchatt` then loaded the first 4 inline
+NameData bytes of the leaf IndexTuple as a by-val Datum and passed the
+bogus pointer to `btnamecmp` → SIGSEGV.
+
+### Fix: auto-derive index Attrs from the parent heap relation
+
+Rather than hand-edit `Attrs: []nailedAttr{...}` overrides on 18 more
+`idxSpec` entries, `flattenRels` now resolves each `idxSpec`'s key
+descriptors against the parent heap's `Attrs` via the `pgIndexInitialEntries()`
+`IndRelid` / `IndKey` map. The flow:
+
+  1. Build `heapAttrByOID: map[uint32]map[attnum→nailedAttr]` from the
+     `heaps` slice (the same slice that owns the `nailedRel` for each
+     parent catalog).
+  2. Build `indexSeedByOID: map[uint32]pgIndexEntry` from
+     `pgIndexInitialEntries()`.
+  3. For each idxSpec without an explicit `Attrs` override, resolve
+     each `IndKey[i]` against the heap map. If every key column resolves
+     (i.e. simple-column index on a nailed heap, no expressional
+     indkey=0), use the derived `[]nailedAttr`. Otherwise fall back to
+     the existing `indexKeyAttrs(natts)` default.
+  4. Explicit overrides on the idxSpec (loop 5 / loop 6) take precedence —
+     they bypass the auto-derivation entirely.
+
+`deriveIndexAttrsFromHeap` is a small helper in the same file. The
+new `TestNailedCompositeNameIndexesAutoDerivedFromHeap` test pins ten
+representative composite indexes (2663, 2658, 2691, 2704, 2693, 2686,
+2754, 2689, 3164, 2669) to assert their leading or trailing name-typed
+column emits `attlen=64 / attbyval=false / attalign='c'`.
+`TestFlattenRelsDeriveIndexAttrsFromHeap` exercises the helper directly:
+happy path, expressional-column (indkey=0), unknown heap, natts/indkey
+mismatch.
+
+### Result
+
+`TestE2E_FailoverGoopgToPG/async` — SEGV gone. PG standby boot completes;
+client backends connect and exit cleanly (no `signal 11`, no crash-recovery
+restart loop in `pg.log`). The test fails 31 s into the 180 s wait with a
+*different* error class:
+
+    pq: relation "public.bench_log" does not exist at column 22 (42P01)
+
+i.e. the parse-analyzer fully resolves `public`, then asks the relcache
+for `public.bench_log` and gets a clean miss. The CREATE TABLE for
+`bench_log` is either (a) not present in the WAL the standby applied
+before the SELECT fired, (b) present but skipped by `StreamReplayer`'s
+filter set, or (c) replayed but the resulting `pg_class` heap row /
+`pg_class_relname_nsp_index` IndexTuple is not visible to a hot-standby
+read. That investigation is the next-loop scope (batched-37 candidate).
+
+### Caveats / known follow-on item
+
+`TestNailedCompositeNameIndexesAutoDerivedFromHeap` intentionally omits
+`pg_trigger_tgrelid_tgname_index` (OID 2701). `pgIndexInitialEntries`
+says `indkey={2, 4}` matching PG18's 23-column `pg_trigger`, but goopg's
+`pgTriggerAttrs()` uses an 8-column reduced schema where `tgname` is at
+attnum 3 (attnum 4 is `tgfoid`). Auto-derivation correctly resolves heap
+attnum 4 → `tgfoid` (oid_ops shape), exposing this pre-existing PG18-vs-
+goopg schema mismatch. The previous OID-default behavior masked it.
+Since the index is empty in the test scenario, no crash results, but a
+future loop should reconcile `pgTriggerAttrs` with `pgIndexInitialEntries`.
+
+Files touched this loop:
+
+- `internal/initdb/relcache_init.go` — extend `flattenRels` with the
+  `deriveIndexAttrsFromHeap` helper; idxSpec override semantics unchanged
+  (explicit `Attrs` still takes precedence).
+- `internal/initdb/nailed_composite_name_indexes_test.go` — new
+  regression test for the ten composite name-typed indexes on the SELECT
+  parse-analyze path, plus a helper-direct test for the no-match paths.

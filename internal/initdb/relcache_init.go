@@ -1448,6 +1448,40 @@ func flattenRels(heaps []nailedRel, idxs []idxSpec) []nailedRel {
 	//   could not open file "base/5/2672": No such file or directory
 	// after Step 3cq let them past InitPostgres.
 	isShared := len(heaps) > 0 && heaps[0].IsShared
+
+	// M0106-0010 batched-36 loop 7: build a heap-attribute lookup table
+	// so an idxSpec without an explicit Attrs override gets its key-
+	// column descriptors *derived from the heap rel's pg_attribute
+	// shape* rather than the all-OID `indexKeyAttrs(natts)` fallback.
+	// Without this, every composite index whose indkey references a
+	// `name`/`text`/`bytea` column (e.g. 2663 pg_class_relname_nsp_index,
+	// 2658 pg_attribute_relid_attnam_index, 2691 pg_proc_proname_args_
+	// nsp_index, 2686 pg_opclass_am_name_nsp_index, 3164 pg_collation_
+	// name_enc_nsp_index, …) writes attlen=4 / attbyval=true into
+	// pg_attribute for the FIRST non-oid key column. PG's
+	// RelationCacheInitializePhase3 then builds a TupleDesc with the
+	// wrong shape; _bt_compare → index_getattr → fetchatt returns the
+	// first 4 inline NameData bytes of the indexed value as a by-val
+	// Datum and passes that "pointer" to btnamecmp/byteacmp/textcmp →
+	// SIGSEGV on the parse-analyze path of any user-table query (the
+	// failure mode that has blocked TestE2E_FailoverGoopgToPG/async
+	// across loops 4–6 of this batched task). The explicit overrides on
+	// e.g. OID 2684 (loop 5) and the six name-typed UNIQUE entries from
+	// loop 6 take precedence; this auto-derivation supplies the same
+	// fix for every remaining idxSpec without requiring 18+ hand-edits.
+	heapAttrByOID := make(map[uint32]map[int16]nailedAttr, len(heaps))
+	for _, h := range heaps {
+		m := make(map[int16]nailedAttr, len(h.Attrs))
+		for _, a := range h.Attrs {
+			m[a.Num] = a
+		}
+		heapAttrByOID[h.OID] = m
+	}
+	indexSeedByOID := make(map[uint32]pgIndexEntry)
+	for _, e := range pgIndexInitialEntries() {
+		indexSeedByOID[e.IndexRelid] = e
+	}
+
 	for _, idx := range idxs {
 		// Each index's natts MUST equal its pg_index.indnatts; PG's
 		// RelationInitIndexAccessInfo asserts relnatts == indnatts and
@@ -1460,11 +1494,58 @@ func flattenRels(heaps []nailedRel, idxs []idxSpec) []nailedRel {
 			// for OID-keyed unique indexes.
 			n = 1
 		}
-		ix := indexNailed(idx.OID, idx.Name, n, idx.Attrs)
+		attrs := idx.Attrs
+		if attrs == nil {
+			if derived, ok := deriveIndexAttrsFromHeap(idx.OID, n, indexSeedByOID, heapAttrByOID); ok {
+				attrs = derived
+			}
+		}
+		ix := indexNailed(idx.OID, idx.Name, n, attrs)
 		ix.IsShared = isShared
 		out = append(out, ix)
 	}
 	return out
+}
+
+// deriveIndexAttrsFromHeap looks up the pg_index seed row for idxOID
+// and resolves each indkey entry against the heap relation's Attrs map.
+// Returns (attrs, true) iff every key column resolves (i.e. the index
+// is a simple-column index — not expressional — on a heap that is
+// itself nailed in the same flattenRels call). On any miss the caller
+// is expected to fall back to indexKeyAttrs(natts), preserving prior
+// behavior for indexes whose heap is not part of the nailed set.
+func deriveIndexAttrsFromHeap(idxOID uint32, natts int16, seedByOID map[uint32]pgIndexEntry, heapAttrByOID map[uint32]map[int16]nailedAttr) ([]nailedAttr, bool) {
+	seed, ok := seedByOID[idxOID]
+	if !ok {
+		return nil, false
+	}
+	if int16(len(seed.IndKey)) != natts {
+		return nil, false
+	}
+	heapMap, ok := heapAttrByOID[seed.IndRelid]
+	if !ok {
+		return nil, false
+	}
+	out := make([]nailedAttr, 0, len(seed.IndKey))
+	for i, k := range seed.IndKey {
+		if k <= 0 {
+			// Expressional index column (indkey=0): no heap attribute
+			// to derive from. Caller falls back to indexKeyAttrs.
+			return nil, false
+		}
+		ha, ok := heapMap[k]
+		if !ok {
+			return nil, false
+		}
+		out = append(out, nailedAttr{
+			Name:    ha.Name,
+			TypeOID: ha.TypeOID,
+			Num:     int16(i + 1),
+			Len:     ha.Len,
+			NotNull: true,
+		})
+	}
+	return out, true
 }
 
 func indexKeyAttrs(natts int16) []nailedAttr {
