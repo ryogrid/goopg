@@ -10422,6 +10422,58 @@ relcache init → replication readiness) and intra-package grouped.
       user CREATE TABLE. Heap-side row layout is now correct and
       pinned — the next loop only needs to chain the system-btree
       insertions on top.
+    - PARTIAL PROGRESS 2026-05-19 (loop 9): runtime IndexTuple
+      insertion path landed for the 3 critical PG18 system btrees
+      probed by parse-analyze of user-table SELECTs
+      (`pg_class_oid_index` 2662, `pg_class_relname_nsp_index` 2663,
+      `pg_attribute_relid_attnum_index` 2659).
+      New file `internal/executor/sys_catalog_index_insert.go`
+      adds three IndexTuple builders (`buildIndexTupleOidKey`,
+      `buildIndexTupleNameOidKey`, `buildIndexTupleOidInt2Key` —
+      mirrors the initdb builders) and a generic
+      `insertCanonicalSysBtreeLeaf(ctx, indexOID, indexTuple, cmp)`
+      that pins block 1 of the index file (the bootstrap-written
+      leaf-root), finds the sorted insert slot via the supplied key
+      comparator, calls `storage.PageInsertItemRawAt`, snapshots the
+      updated page, and emits a canonical `XLOG_BTREE_INSERT_LEAF`
+      via `catalog.PgCanonicalBtreeInsert` when LogCanonical is set.
+      `syncTableToCatalogHeap` / `syncIndexToCatalogHeap` now chain
+      three index inserts after every heap row write;
+      `writeHeapRowCanonical` returns the heap TID so the inserts
+      land on the real `(block, offset)`. Bootstrap-filled leaf-root
+      pages (notably 2663 is packed to ~97 of ~97-entry capacity)
+      cause `ErrNoSpaceInPage` on insert — handled as a silent skip
+      so `CREATE TABLE` does not fail; page-split for the leaf-root
+      is deferred to the next loop. `internal/wal/recovery.go` gains
+      an `RmgrBtree` case in `replayDecodedXLogRecord` so goopg's
+      own crash recovery (and clean-restart WAL drain) can replay
+      the canonical XLOG_BTREE_INSERT_LEAF records — without this
+      the primary fails to restart with `wal: unsupported xlog
+      record rmid=11 info=0x00` and `TestE2E_PhysicalReplication`
+      breaks. Three new regression tests:
+      `TestSyncTableInsertsSysCatalogIndexEntries` (sort-correct
+      insert into pre-populated leaf-root for all 3 indexes),
+      `TestSyncTableSkipsSysIndexInsertWhenLeafRootFull` (silent
+      skip when the leaf-root is full), and
+      `TestBuildIndexTupleOidKeyByteLayout` (pinned 16-byte byte
+      layout for the OID-keyed IndexTuple). All affected packages
+      pass: `internal/executor`, `internal/catalog`,
+      `internal/storage`, `internal/server`, `internal/mvcc` — clean
+      against master; `internal/wal` — same 2 pre-existing failures;
+      `internal/initdb` — same 19 pre-existing failures.
+      `TestE2E_PhysicalReplication` — PASS.
+      `TestE2E_FailoverGoopgToPG/async` — STILL FAILS, blocked on
+      leaf-root page splits: the bootstrap fills 2663 to within ~4
+      bytes of the page budget so the runtime insert silently skips,
+      and the PG standby cannot resolve `public.bench_log` by name
+      until split-side WAL is emitted (M0106-0010 batched-39).
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 9 (batched-38)" section).
+      Next loop (batched-39): implement PG-canonical leaf-root split
+      — promote the leaf-root to internal-root, allocate two leaf
+      children, redistribute, emit `XLOG_BTREE_SPLIT_L` /
+      `XLOG_BTREE_NEWROOT` WAL records — to unblock the
+      `TestE2E_FailoverGoopgToPG/async` path.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

@@ -1838,8 +1838,16 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	if err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(tbl)); err != nil {
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(tbl))
+	if err != nil {
 		return fmt.Errorf("pg_class: %w", err)
+	}
+	relnamespace := namespaceOIDForSchema(tbl.Schema)
+	if err := insertPgClassOidIndexEntry(ctx, tbl.OID, classTID); err != nil {
+		return fmt.Errorf("pg_class_oid_index: %w", err)
+	}
+	if err := insertPgClassRelnameNspIndexEntry(ctx, tbl.Name, relnamespace, classTID); err != nil {
+		return fmt.Errorf("pg_class_relname_nsp_index: %w", err)
 	}
 
 	attrRel := storage.RelFileNode{
@@ -1848,8 +1856,13 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		Fork:   storage.MainFork,
 	}
 	for _, col := range tbl.Columns {
-		if err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRow(tbl, col)); err != nil {
+		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRow(tbl, col))
+		if err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
+		}
+		// attnum is the 1-based ordinal of the column in PG18.
+		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, tbl.OID, int16(col.Ordinal+1), attrTID); err != nil {
+			return fmt.Errorf("pg_attribute_relid_attnum_index col %q: %w", col.Name, err)
 		}
 	}
 
@@ -1874,8 +1887,16 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	if err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(idx)); err != nil {
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(idx))
+	if err != nil {
 		return fmt.Errorf("pg_class for index: %w", err)
+	}
+	relnamespace := namespaceOIDForSchema(idx.Schema)
+	if err := insertPgClassOidIndexEntry(ctx, idx.OID, classTID); err != nil {
+		return fmt.Errorf("pg_class_oid_index for index: %w", err)
+	}
+	if err := insertPgClassRelnameNspIndexEntry(ctx, idx.Name, relnamespace, classTID); err != nil {
+		return fmt.Errorf("pg_class_relname_nsp_index for index: %w", err)
 	}
 	return nil
 }
@@ -1885,25 +1906,28 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 // (with full-page image) so a vanilla PG18 standby can replay the catalog
 // insertion. The FPI approach ensures the standby can restore the page without
 // parsing heap-tuple internals. M0106-0010 batched-32.
-func writeHeapRowCanonical(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) error {
+func writeHeapRowCanonical(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) (storage.ItemPointer, error) {
 	ptr, err := writeHeapRowReturningPG(ctx, rel, cols, row)
 	if err != nil {
-		return err
+		return ptr, err
 	}
 	if ctx.LogCanonical == nil || ctx.Pool == nil {
-		return nil
+		return ptr, nil
 	}
 	// Re-pin the page to capture a stable FPI after the insert.
 	slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 	if err != nil {
-		return fmt.Errorf("canonical WAL pin: %w", err)
+		return ptr, fmt.Errorf("canonical WAL pin: %w", err)
 	}
 	page := make(storage.Page, storage.BlockSize)
 	copy(page, slot.Page())
 	ctx.Pool.Unpin(slot)
 
 	xid := uint32(ctx.Tx.XID)
-	return catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset, xid, ctx.LogCanonical)
+	if err := catalog.PgCanonicalHeapInsert(rel, ptr.Block, page, ptr.Offset, xid, ctx.LogCanonical); err != nil {
+		return ptr, err
+	}
+	return ptr, nil
 }
 
 // execCreateTrigger registers a trigger on a table. M0096-0012.

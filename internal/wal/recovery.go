@@ -2255,6 +2255,16 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
+	case RmgrBtree:
+		// Canonical XLOG_BTREE_INSERT_LEAF (M0106-0010 batched-36 loop 9):
+		// emitted from `internal/executor/sys_catalog_index_insert.go` with
+		// a full-page image of the updated leaf-root page on every record.
+		// The FPI carries the entire post-insert page so no main-data
+		// parsing of the IndexTuple is required for replay.
+		if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
+			return false, err
+		}
+		return true, nil
 	default:
 		return false, unsupportedDecodedXLogRecord(r)
 	}

@@ -679,3 +679,111 @@ Files touched this loop:
   row construction removed at those two call sites.
 - `internal/executor/pg18_user_catalog_rows_test.go` — NEW. Three
   regression tests pinning the new byte layout.
+
+## 2026-05-19 loop 9 (batched-38) — runtime sys-btree insert on user CREATE TABLE
+
+### Where loop 8 left off
+
+Loop 8 fixed the on-disk heap row layout for user `CREATE TABLE`:
+`syncTableToCatalogHeap` now writes the PG18-canonical 34-column pg_class
+row and 25-column pg_attribute rows. The heap byte-decode is correct.
+But the residual `relation "public.bench_log" does not exist (42P01)`
+remained, because PG18's `RangeVarGetRelidExtended` →
+`SearchSysCache2(RELNAMENSP)` resolves a relname → OID via the system
+btree `pg_class_relname_nsp_index` (2663), and `syncTableToCatalogHeap`
+never inserts into that index.
+
+### What landed this loop
+
+1. **New file** `internal/executor/sys_catalog_index_insert.go` — runtime
+   IndexTuple builders + a generic leaf-root inserter:
+   - `buildIndexTupleOidKey(heapBlk, heapOff, oid)` →
+     16-byte IndexTuple for the single-uint32-key indexes
+     (`pg_class_oid_index`, 2662).
+   - `buildIndexTupleNameOidKey(heapBlk, heapOff, name, oid)` →
+     80-byte IndexTuple for `(NameData[64], uint32)` composite-key
+     indexes (`pg_class_relname_nsp_index`, 2663).
+   - `buildIndexTupleOidInt2Key(heapBlk, heapOff, attrelid, attnum)` →
+     16-byte IndexTuple for `(uint32, int16)` composite-key indexes
+     (`pg_attribute_relid_attnum_index`, 2659).
+   - `insertCanonicalSysBtreeLeaf(ctx, indexOID, indexTuple, cmp)` —
+     pins block 1 of the index file (the leaf-root page initdb wrote);
+     walks line pointers comparing the new key against existing keys
+     via `cmp(a, b []byte) int` to find the sorted insert slot; calls
+     `storage.PageInsertItemRawAt`; snapshots the updated page for the
+     WAL FPI; emits a canonical `XLOG_BTREE_INSERT_LEAF` via
+     `catalog.PgCanonicalBtreeInsert` when `ctx.LogCanonical != nil`.
+   - Three wrappers (`insertPgClassOidIndexEntry`,
+     `insertPgClassRelnameNspIndexEntry`,
+     `insertPgAttributeRelidAttnumIndexEntry`) plug the three indexes
+     into `syncTableToCatalogHeap` / `syncIndexToCatalogHeap`.
+
+2. **No-space-skip path**: bootstrap fills several leaf-root pages
+   (notably 2663) to within a few bytes of the page budget. When
+   `PageInsertItemRawAt` returns `ErrNoSpaceInPage`, the inserter
+   silently returns `nil` rather than failing the parent DDL. The
+   parent `CREATE TABLE` completes successfully; the leaf-root remains
+   in its bootstrap state. Page-split implementation is deferred to a
+   follow-on loop; until then a goopg primary with a "full" 2663 will
+   continue to fail the PG-standby probe.
+
+3. **`writeHeapRowCanonical` now returns the heap TID**
+   (`storage.ItemPointer`) so the sync helpers can chain the index
+   insertions on the heap row's actual `(block, offset)`.
+
+4. **`replayDecodedXLogRecord` learns to handle `RmgrBtree`**
+   (`internal/wal/recovery.go`). The previous case-switch only knew
+   `RmgrXLog`, `RmgrXact`, `RmgrStandby`, and `RmgrHeap`; an emitted
+   `XLOG_BTREE_INSERT_LEAF` would crash goopg's own replay path on the
+   next primary restart with `wal: unsupported xlog record rmid=11
+   info=0x00`. The new `RmgrBtree` branch reuses
+   `replayDecodedXLogHeapFPIBlocks` (the function is FPI-generic; the
+   `Heap` suffix is historical) to restore the leaf-root page from
+   the FPI carried by every canonical btree-insert record.
+
+### Result
+
+`TestE2E_PhysicalReplication` — STILL PASSES (regression-clean after
+the recovery-path fix above). All `internal/executor`,
+`internal/catalog`, `internal/storage`, `internal/server`,
+`internal/mvcc`, `internal/wal` packages pass (modulo the same 2
+pre-existing `internal/wal` failures and 19 pre-existing `internal/initdb`
+failures unrelated to this loop). New regression tests:
+
+- `TestSyncTableInsertsSysCatalogIndexEntries` — pins that
+  `syncTableToCatalogHeap` writes one entry into pg_class_oid_index,
+  one entry into pg_class_relname_nsp_index (in correct sorted
+  position relative to pre-existing entries on the leaf-root), and one
+  entry per column into pg_attribute_relid_attnum_index.
+- `TestSyncTableSkipsSysIndexInsertWhenLeafRootFull` — pins the
+  no-space-skip path: a leaf-root packed to 97 80-byte tuples causes
+  the relname_nsp insert to be skipped silently while the other two
+  indexes' inserts succeed.
+- `TestBuildIndexTupleOidKeyByteLayout` — pins the 16-byte byte
+  layout of the OID-keyed IndexTuple (ItemPointerData / t_info / key
+  data, all little-endian).
+
+### Files touched this loop
+
+- `internal/executor/sys_catalog_index_insert.go` — NEW (insert
+  helpers + key compare functions + WAL emission).
+- `internal/executor/sys_catalog_index_insert_test.go` — NEW (3 tests
+  + 2 helper functions).
+- `internal/executor/operators_ddl.go` — `syncTableToCatalogHeap` and
+  `syncIndexToCatalogHeap` now chain index inserts after each heap
+  row write; `writeHeapRowCanonical` returns `(ItemPointer, error)`.
+- `internal/wal/recovery.go` — `replayDecodedXLogRecord` learns
+  `RmgrBtree` case.
+
+### Still failing → next loop (batched-39 candidate)
+
+`TestE2E_FailoverGoopgToPG/async` — STILL FAILS. The bootstrap-filled
+leaf-root of `pg_class_relname_nsp_index` (and probably 2659 too,
+since pg_attribute has ~60 nailed relations × ~5 attrs each) leaves no
+room for a user CREATE TABLE entry, so the no-space-skip path silently
+discards the insert and the PG standby cannot resolve
+`public.bench_log` by name. Implementing a PG-canonical leaf-root
+split — promote the leaf-root to an internal root, allocate two leaf
+children, redistribute the items, emit `XLOG_BTREE_SPLIT_L` /
+`XLOG_BTREE_NEWROOT` WAL records — is the next blocker on the
+`TestE2E_FailoverGoopgToPG/async` path.
