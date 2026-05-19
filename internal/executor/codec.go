@@ -682,6 +682,62 @@ func physicalPGTypeAlign(t catalog.Type) int {
 	}
 }
 
+// pgPhysicalTypeIsVarlena reports whether the PG18 on-disk representation
+// for t uses the varlena (variable-length) layout — i.e. PG's TupleDesc
+// for the catalog stores attlen == -1 for the column. It must agree with
+// the varlena branches of encodeValuePG; the fast-path attcacheoff
+// walker in PG18 nocachegetattr (heaptuple.c:642 — `Assert(j > attnum)`)
+// will trip if HEAP_HASVARWIDTH is unset and any column on the
+// fixed-prefix path turns out to be varlena per the TupleDesc. M0106-0010
+// batched-49.
+func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
+	switch strings.ToLower(t.Name) {
+	case "bool", "boolean", "char",
+		"int2", "smallint",
+		"int4", "integer", "int", "serial",
+		"int8", "bigint", "bigserial",
+		"oid", "regproc",
+		"timestamp", "timestamptz", "date", "time", "timetz",
+		"name",
+		"float4", "real",
+		"float8", "double precision", "double",
+		"xid", "xid8":
+		return false
+	default:
+		// text, varchar, bpchar, numeric, unknown, and all varlena
+		// arrays / oidvector / int2vector / pg_node_tree fall through
+		// to varlena. Mirrors the default branch of encodeValuePG.
+		return true
+	}
+}
+
+// pgRowHasVarWidth reports whether row, encoded with cols via
+// EncodeRowPG, contains at least one non-null varlena value. Used to
+// drive the HEAP_HASVARWIDTH bit on heap tuples written in the
+// PG18-canonical layout. Mirrors PG's heap_fill_tuple which sets the
+// flag only for non-null varlena values
+// (postgres/src/backend/access/common/heaptuple.c:326). M0106-0010
+// batched-49.
+func pgRowHasVarWidth(cols []catalog.Column, row Row) bool {
+	n := len(cols)
+	if len(row) < n {
+		n = len(row)
+	}
+	for i := 0; i < n; i++ {
+		d := row[i]
+		if d.IsNull() {
+			continue
+		}
+		if d.Kind == KindToastPointer {
+			return true
+		}
+		if pgPhysicalTypeIsVarlena(cols[i].Type) {
+			return true
+		}
+	}
+	return false
+}
+
 func decodePhysicalPGValueArena(t catalog.Type, data []byte, arena *Arena) (Datum, int, error) {
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":

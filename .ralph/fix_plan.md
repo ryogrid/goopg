@@ -11017,6 +11017,46 @@ relcache init → replication readiness) and intra-package grouped.
       localise the bad attnum (likely an attcacheoff violation
       from a varlena/NULL pattern in goopg's runtime sys-btree
       pg_class emit from batched-36 loop 9).
+    - PARTIAL PROGRESS 2026-05-19 (loop 20, batched-49): root cause
+      identified — `writeHeapRowReturningPG` was the missing
+      stamper of `HEAP_HASVARWIDTH` on runtime PG-canonical heap
+      writes. PG18 `nocachegetattr` short-circuits the
+      varlena-prefix `slow=true` guard at heaptuple.c:590 when
+      that bit is unset, falls into the fast-path offset-init
+      loop, breaks at the first varlena column (relacl, idx 31),
+      and `Assert(31 > 32)` fires for the reloptions read.
+      Same hole as initdb's batched-25 / Step 3ct fix; the
+      runtime DDL path simply inherited the omission.
+      Fix landed:
+      (1) `internal/executor/codec.go` adds
+          `pgPhysicalTypeIsVarlena(catalog.Type) bool` and
+          `pgRowHasVarWidth(cols, row) bool` — mirrors the
+          varlena branches of `encodeValuePG` and PG's
+          `heap_fill_tuple` (heaptuple.c:326).
+      (2) `internal/executor/operators_storage.go::writeHeapRowReturningPG`
+          stamps `tuple.Header.Infomask |= storage.HeapHasVarWidth`
+          when `pgRowHasVarWidth(cols, row)` is true.
+      Tests added:
+      `TestSyncTableStampsHeapHasVarWidthOnPGClassRow` and
+      `TestPgRowHasVarWidthDetectsVarlenaCols` (covers null-varlena
+      semantics).
+      Verified: `TestE2E_FailoverGoopgToPG/async` no longer trips
+      `Assert("j > attnum")`. PG18 standby completes parse-analyze
+      of `SELECT count(*) FROM public.bench_log` —
+      `relation_open(public.bench_log)`, `extractRelOptions`, and
+      rangetable construction succeed. New residual on the same
+      query:
+        ERROR: 42883: function count() does not exist at character 8
+      Pre-existing baseline failures unchanged (17 in
+      ./internal/initdb/, 2 in ./internal/wal/).
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 20 (batched-49)" section).
+      Next loop (batched-50): diagnose `LookupFuncName(count)`
+      failure on the standby. Confirm goopg's basebackup payload
+      contains `pg_proc` rows for `count(*)` / `count("any")` and
+      that `pg_proc_proname_args_nsp_index` (OID 2691) is
+      bootstrapped with at least an empty metapage (same family
+      as batched-48's OID 2665 fix).
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

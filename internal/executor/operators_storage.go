@@ -2949,6 +2949,16 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 	// M0106-0010 batched-36.
 	tuple.Header.SetNatts(len(cols))
 	tuple.Header.Infomask |= storage.HeapXmaxInvalid
+	// HEAP_HASVARWIDTH: mirrors PG's heap_fill_tuple — set when the
+	// tuple contains at least one non-null varlena value. PG18's
+	// nocachegetattr fast path (heaptuple.c:642 — `Assert(j > attnum)`)
+	// crashes if the bit is missing while the TupleDesc still
+	// considers the catalog to have varlena attrs on the prefix
+	// leading to the target attnum (e.g. relacl/reloptions/relpartbound
+	// on pg_class). M0106-0010 batched-49.
+	if pgRowHasVarWidth(cols, row) {
+		tuple.Header.Infomask |= storage.HeapHasVarWidth
+	}
 	tupleBytes, err := tuple.MarshalBinary()
 	if err != nil {
 		return ptr, err

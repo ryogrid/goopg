@@ -2011,3 +2011,97 @@ fastgetattr invariants for column 33 (`reloptions text[]`). Next
 loop captures the bench_log pg_class tuple bytes off the standby's
 heap page and walks them through PG18's heap_form_tuple/nocachegetattr
 prefix to localise the bad attnum.
+
+## 2026-05-19 loop 20 (batched-49) — HEAP_HASVARWIDTH on PG-canonical writeHeapRowReturningPG
+
+### Root cause (corrects batched-48's "next loop" hypothesis)
+
+The assert is **not** an attcacheoff poisoning bug. PG18
+`nocachegetattr(attnum=33)` for `Anum_pg_class_reloptions` walks
+this exact path when `slow == false`:
+
+1. Line 542 — `HeapTupleNoNulls(tup)` is TRUE for goopg's pg_class
+   row (`relacl="{}"`, `reloptions="{}"`, `relpartbound=""` are
+   *non-null* varlena values, so `NullBitmapPG` returns nil and
+   `HEAP_HASNULL` is unset). slow stays false.
+2. Line 590 — `if (HeapTupleHasVarWidth(tup))` gates the
+   varlena-prefix check that would otherwise set `slow = true`.
+   goopg's runtime heap-row writer (`writeHeapRowReturningPG`)
+   never stamped `HEAP_HASVARWIDTH`, so this branch is **skipped**.
+3. Line 605 — the fast-path offset-init loop runs. It walks the
+   TupleDesc forward starting from j=1, computing per-attribute
+   offsets for fixed-width columns, breaking on the first column
+   with `att->attlen <= 0` (line 633).
+4. pg_class has its first varlena attribute (`relacl`) at TupleDesc
+   index 31 (0-based). The loop breaks at j=31. attnum=32 (0-based,
+   reloptions). Line 642 `Assert(j > attnum)` → `Assert(31 > 32)`
+   → false → SIGABRT.
+
+The same hole already burned us during initdb in batched-25 /
+Step 3ct, which is why `bootstrapPostgresDatabase` in
+`internal/initdb/initdb.go:1073` and two other init-time writers
+explicitly `tuple.Header.Infomask |= storage.HeapHasVarWidth`. The
+runtime DDL path (`syncTableToCatalogHeap`) re-used the generic
+`writeHeapRowReturningPG` helper which inherited the same omission.
+
+### What landed this loop
+
+1. **`internal/executor/codec.go`** gains two helpers:
+   - `pgPhysicalTypeIsVarlena(t catalog.Type) bool` — mirrors the
+     varlena branches of `encodeValuePG` (returns true for text,
+     varchar, bpchar, numeric, unknown, and all varlena array /
+     oidvector / int2vector / pg_node_tree types).
+   - `pgRowHasVarWidth(cols, row) bool` — returns true iff at least
+     one non-null column in row maps to a varlena type. Mirrors PG's
+     `heap_fill_tuple` which sets `HEAP_HASVARWIDTH` only on
+     non-null varlena values
+     (`postgres/src/backend/access/common/heaptuple.c:326`).
+2. **`internal/executor/operators_storage.go::writeHeapRowReturningPG`**
+   stamps `tuple.Header.Infomask |= storage.HeapHasVarWidth` when
+   `pgRowHasVarWidth(cols, row)` is true, right after
+   `HeapXmaxInvalid`. This affects every runtime PG-canonical heap
+   write — `syncTableToCatalogHeap`, `syncIndexToCatalogHeap`, and
+   any future PG18 catalog write path.
+
+### Tests added
+
+- `TestSyncTableStampsHeapHasVarWidthOnPGClassRow` — pins that the
+  pg_class row written by `syncTableToCatalogHeap` for a user
+  CREATE TABLE carries `HEAP_HASVARWIDTH` (and `HEAP_XMAX_INVALID`)
+  in t_infomask.
+- `TestPgRowHasVarWidthDetectsVarlenaCols` — direct unit coverage of
+  the helper, including the null-varlena edge case (PG semantics:
+  null varlena does *not* set the flag).
+
+### Result
+
+`TestE2E_FailoverGoopgToPG/async` no longer aborts in
+nocachegetattr. PG18 standby completes parse-analyze of
+`SELECT count(*) FROM public.bench_log WHERE client = -999`:
+`relation_open(public.bench_log)` succeeds, `extractRelOptions`
+reads `reloptions` cleanly, the rangetable entry is built.
+
+New residual on the same query:
+
+    ERROR: 42883: function count() does not exist at character 8
+
+`pg_proc` lookup for `count(*)` fails on the standby. Probable
+cause: goopg's basebackup payload includes a slim pg_proc that is
+missing or misordered for the `count(int4)` / `count(*)`
+overload — `LookupFuncName` returns no match. This is the new
+blocker for batched-50.
+
+Pre-existing baseline failures unchanged: 17 in `./internal/initdb/`,
+2 in `./internal/wal/`. New tests above pass.
+
+### Next loop (batched-50)
+
+Diagnose the `function count() does not exist` error.
+1. Confirm whether goopg's basebackup-time `pg_proc` heap contains
+   the `count` rows (`count()`, `count("any")`).
+2. If rows are present, check `pg_proc_proname_args_nsp_index`
+   (2691) bootstrap — same family of "system btree empty / page
+   not seeded" bugs that batched-48 closed for pg_constraint
+   (OID 2665).
+3. Re-run `TestE2E_FailoverGoopgToPG/async` until the standby
+   completes the SELECT and reports a row count ≥ 1.
