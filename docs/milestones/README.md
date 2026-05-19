@@ -133,3 +133,4 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0104 | SERIALIZABLE isolation via SSI anomaly prevention | planned | `0104-serializable-ssi-anomaly-prevention.md` |
 | 0105 | goopg→PG data-file format parity (heap page, tuple header, catalog) | accepted | `0105-goopg-to-pg-heap-page-and-tuple-format-parity.md` |
 | 0106 | PG relcache init file compatibility (backend startup from goopg backup) | planned | `0106-pg-relcache-init-file-compat.md` |
+| 0107 | Performance optimization refactor (mctx + pointer-free Datum + concrete executor + MVCC/activity/bufpool/WAL/runtime contention fixes; keeps M0105/M0106 PG-compat invariants) | planned | `0107-performance-optimization-refactor.md` |

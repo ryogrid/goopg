@@ -11598,6 +11598,208 @@ relcache init → replication readiness) and intra-package grouped.
         durability guarantees should be same as PostgreSQL's durability guarantees after this task is done. This is a hard requirement for goopg to be production ready. But must not be **DEFFERED**.
       - Files: `internal/storage/`, `internal/server/`
 
+## M0107 — Performance Optimization Refactor (filed 2026-05-20)
+
+Milestone doc: `docs/milestones/0107-performance-optimization-refactor.md`
+Design series: `docs/design/perf-optimize/00-overview.md` … `09-migration-and-rollout.md` (10 chapters, accepted)
+PG-compat invariants: `docs/design/0107-0001-m0106-pg-compat-invariants.md`
+
+Goal: lift pgbench from c=10 SO 2 307 → ≥ 8 000 TPS, c=50 SU 347 → ≥ 2 000 TPS,
+c=100 SU SKIP → ≥ 500 TPS; `gcBgMarkWorker` 63 % → < 15 %; `runtime.futex`
+23 % → < 8 %; eliminate the `Manager.mu` / `Registry.mu` / `bufferPartition.mu`
+hot mutexes from the top-20. All changes are in-memory or internal-Go-API only.
+
+Operational policy (2026-05-20):
+- **PG18 byte-compat is a hard invariant.** Every sub-milestone must verify that
+  no on-disk file format, WAL record format, catalog heap-tuple row layout, or
+  byte-equivalent Go struct enumerated in
+  [`docs/design/0107-0001-m0106-pg-compat-invariants.md`](../docs/design/0107-0001-m0106-pg-compat-invariants.md)
+  is silently modified. `TestE2E_FailoverGoopgToPG/async` is the integration
+  gate; `internal/initdb/...`, `internal/control/...`, `internal/wal/...`,
+  `internal/access/heap/...`, `internal/access/btree/...` byte-layout tests are
+  the unit gates.
+- Items must NOT be **DEFERRED**. M0106-style discipline applies: either land
+  the phase with full DoD or keep it unchecked.
+- M0106's open items (M0106-0007, M0106-0011 follow-ups, M0106-0013) remain
+  ahead of M0107 in priority order until they close.
+- Each sub-milestone is independently shippable and revertible per
+  `docs/design/perf-optimize/09-migration-and-rollout.md` §9 rollback rules.
+
+### Sub-milestones
+
+ - [ ] **M0107-0001 — Phase A: `mctx` memory-context substrate**
+      - Summary: Land `internal/mctx` package (hierarchical palloc-style
+        allocator: Session → Txn → Stmt → Expr); delete
+        `internal/executor/arena.go` and `internal/executor/arena_registry.go`;
+        port existing arena callers in `internal/executor/operators_storage.go`
+        (`seqScanOp`, `indexScanOp`, others) to `mctx.Context`; wire lifecycle
+        through `internal/server/server.go::serveConn` and
+        `internal/server/dispatch.go::executeOneSimpleStmt`.
+      - Design: `docs/design/perf-optimize/01-memory-context.md`
+      - PG-compat gate: `docs/design/0107-0001-m0106-pg-compat-invariants.md`
+        §6 (Phase A risk callout) — byte-emitter sites at
+        `internal/executor/codec.go`, `internal/initdb/relcache_init.go`,
+        `internal/wal/...` must not change output bytes.
+      - Verification: `go test ./...` PASS; TPC-H q1..q22 wall-clock within
+        ±5 % of `ab1b955` baseline; pgbench c=10 SO TPS within ±5 % of
+        baseline; `TestE2E_FailoverGoopgToPG/async` PASS; `make ralph-state-guard` PASS.
+
+ - [ ] **M0107-0002 — Phase B: pointer-free `Datum` (24 B)**
+      - Summary: Reformat `Datum` from 64 B (3 GC-traced fields:
+        `Buf []byte`, `Big *big.Int`, `arena *Arena`) to 24 B (zero
+        GC-traced fields; tagged-union with `(ArenaID, offset, length)`
+        triples resolved through `mctx`). Stage under `//go:build datumv2`
+        tag; migrate ~225 call sites across `internal/executor`, `internal/wal`,
+        `internal/access/heap`, `internal/planner`, `internal/initdb`,
+        `internal/protocol`, `internal/server`; drop the tag and delete old
+        fields when all packages green. Add
+        `unsafe.Sizeof(Datum{}) == 24` compile-time assert.
+      - Design: `docs/design/perf-optimize/02-datum-pointer-free.md`
+      - PG-compat gate: invariants §6 (Phase B) — wire format unchanged;
+        emitted heap-tuple bytes via `internal/executor/codec.go` must remain
+        byte-identical. Add varlena / integer / numeric goldens if missing.
+      - Verification: `go test ./...` PASS; pgbench c=10 SO TPS ≥ 5 000 (vs
+        2 307); `gcBgMarkWorker` cum% at c=10 SO < 35 % (was 63 %); TPC-H
+        numeric queries (q1, q4, q5) within ±10 %; `TestE2E_FailoverGoopgToPG/async`
+        PASS; `make ralph-state-guard` PASS.
+
+ - [ ] **M0107-0003 — Phase C: concrete-type Volcano executor**
+      - Summary: Replace `Operator` interface (4 methods, 36 impls) +
+        `TupleSlot` interface with concrete `OpNode` / `Slot` sum-types per
+        `03-executor-concrete.md`. Land `PlanNode` / `ExprNode` sum-types
+        (delete plan-node interfaces). Migrate hot-path operators
+        (scan/filter/project/limit/sort/join/insert/update/delete) to
+        concrete types; keep cold paths (vacuum/cluster/analyze/ddl/explain)
+        on `opAdapter` shim. Migrate parser AST to `mctx`; delete
+        `tokenSlicePool` / `parserPool`. Split into C.1 (`OpNode` + hot-path
+        operators), C.2 (`Slot` struct + consumers), C.3 (`PlanNode` /
+        `ExprNode` + parser) for independent revertibility.
+      - Design: `docs/design/perf-optimize/03-executor-concrete.md`
+      - PG-compat gate: invariants §6 (Phase C) — in-memory refactor only;
+        WAL bytes + heap-page mutations remain byte-identical.
+      - Verification: `go test ./...` PASS; pgbench c=10 SO TPS ≥ 8 000;
+        c=50 SO TPS ≥ 18 000; `gcBgMarkWorker` cum% at c=10 SO < 15 %;
+        `dispatchSimpleQueryViaExecutor` cum% < 10 %; `runtime.itabHashFunc`
+        out of top-40; TPC-H all queries within ±10 % (extra attention to
+        q5, q9); `TestE2E_FailoverGoopgToPG/async` PASS;
+        `make ralph-state-guard` PASS.
+
+ - [ ] **M0107-0004 — Phase D1: ProcArray + atomic XidGen + CLOG bank locks**
+      - Summary: Replace `mvcc.Manager.mu` (gates Begin/SnapshotFor/Commit/
+        OldestXmin/finish; 92 % write delay) with three systems per
+        `04-mvcc-procarray.md`: (a) `ProcArray` with per-slot 64 B
+        cache-line-aligned `procSlot` (atomic state packing pinned flags,
+        xid, xmin, procNum, pointer-free snapshot cache); (b) atomic
+        `XidGen` (`atomic.Uint64` counter; `Allocate()` / `Peek()`);
+        (c) bank-locked CLOG (per-bank `RWMutex` SLRU pattern,
+        `SetStatus(xid, status)` / `GetStatus(xid)` with bank-level
+        locking). Share `procNum` index with M0107-0005.
+      - Design: `docs/design/perf-optimize/04-mvcc-procarray.md`
+      - PG-compat gate: invariants §6 (Phase D1) — CLOG on-disk page format
+        (`pg_xact/`) unchanged; only in-memory bank-lock geometry changes.
+        XACT_COMMIT / XACT_ABORT WAL bytes unchanged.
+      - Verification: `go test ./internal/mvcc/...` PASS;
+        `go test -race ./internal/mvcc/...` PASS; pgbench c=50 SU TPS
+        ≥ 2 000 (vs 347); `mvcc.Manager.*` absent from mutex top-20;
+        `TestE2E_FailoverGoopgToPG/async` PASS; `make ralph-state-guard` PASS.
+      - Co-lands with M0107-0005 (shared `procNum` identity).
+
+ - [ ] **M0107-0005 — Phase D2: per-backend `wait_event_info`**
+      - Summary: Replace `activity.Registry` single `RWMutex` +
+        `map[string]*Backend` (95 % c=100 SO delay) with per-backend
+        64 B cache-line-aligned `ActivitySlot` per `05-activity-perbackend.md`.
+        Hot path: atomic uint32 packed `(type<<16)|event` store on
+        `WaitEventStart/End`. Cold path: `Snapshot()` walks slots with
+        per-slot `RWMutex` over cold fields. Thread `procNum` through
+        `executor.Context.ProcNum`, `storage.Pool.Pin/Read(tag, procNum)`,
+        `wal.Writer.FlushUpTo(lsn, procNum)`. Delete M0091-0001 goroutine→PID
+        indirection.
+      - Design: `docs/design/perf-optimize/05-activity-perbackend.md`
+      - PG-compat gate: invariants §6 (Phase D2) — pure in-memory;
+        `pg_stat_activity` is a runtime view, no on-disk effect.
+      - Verification: `go test ./internal/activity/...` PASS;
+        `go test -race ./internal/activity/...` PASS; pgbench c=100 SO TPS
+        ≥ 10 000 (vs 6 400); `activity.Registry.*` absent from mutex top-20;
+        `TestE2E_FailoverGoopgToPG/async` PASS; `make ralph-state-guard` PASS.
+      - Co-lands with M0107-0004 (shared `procNum` identity).
+
+ - [ ] **M0107-0006 — Phase D3: lock-free buffer pool**
+      - Summary: Delete 128-partition `sync.Mutex` buf-mapping (cause of
+        c=100 SU livelock); replace with pointer-free `bufmap` (open-addressing
+        Robin-Hood hash: `mask uint64`, `keys []BufferTag`, `vals []uint64`
+        packed `slotIdx<<32 | gen`; MurmurHash3 over all 16 B of `BufferTag`).
+        Pin fast path: single-word CAS on `slotState` (64-bit atomic packing
+        pinCount, usageCount, dirty, valid, ioInflight, gen). Per
+        `06-bufpool-lockfree.md`. Retires M0098-0003 (128-partition mutexes)
+        and M0099-0002 (atomic pin/usage counts) design docs (mark SUPERSEDED).
+      - Design: `docs/design/perf-optimize/06-bufpool-lockfree.md`
+      - PG-compat gate: invariants §6 (Phase D3) — page bytes served by
+        bufpool unchanged; only lookup/eviction protocol changes.
+      - Verification: `go test ./internal/storage/...` PASS;
+        `go test -race ./internal/storage/...` with 1 000 goroutines
+        Pin/Unpin/evict for 30 s PASS; `runtime.futex` cum% at c=100 SO
+        < 8 % (vs 23 %); `bufferPartition.mu` absent from mutex top-20;
+        `TestE2E_FailoverGoopgToPG/async` PASS; `make ralph-state-guard` PASS.
+
+ - [ ] **M0107-0007 — Phase D4: WAL insert striping + FSM page distribution**
+      - Summary: Replace single `wal.Writer.appendMu` lock + tail-page-targeting
+        insert logic with 8-stripe `appendLocks [8]paddedMutex` (stripe
+        selection `procNum & 0x7`) per `07-wal-fsm-insert.md`. Atomic
+        `nextLSN`; `rotateMu sync.Mutex` for segment-boundary CAS retry.
+        Heap-insert flow `writeHeapRowReturning`: (1) FSM query, (2) on miss,
+        consult `bufmap.Lookup` for tail-page pin count, (3) batch-extend
+        N pages at once if needed. Depends on M0107-0006 (`bufmap` consultation)
+        and M0107-0004 (shared `procNum` for stripe selection).
+      - Design: `docs/design/perf-optimize/07-wal-fsm-insert.md`
+      - PG-compat gate: **HIGHEST byte-regression risk.** invariants §6
+        (Phase D4) — WAL record framing / CRC / page header / per-record
+        block-reference frames must remain byte-identical. Add integration
+        test diffing pre/post-D4 WAL segment bytes for a fixed pgbench
+        workload (modulo timestamps). Per-relation heap-tuple bytes
+        unchanged.
+      - Verification: `go test ./internal/wal/...` PASS;
+        `go test -race ./internal/wal/...` PASS; pgbench c=100 SU TPS ≥ 500
+        (was SKIPPED/DEADLOCK); pgbench c=100 standard TPS ≥ 500;
+        `TestE2E_FailoverGoopgToPG/async` PASS; pre/post-D4 WAL byte-diff
+        test PASS; `make ralph-state-guard` PASS.
+
+ - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
+      - Summary: Add `internal/runtimeshim` package with bounded
+        `//go:linkname` access to (a) `runtime.nanotime()` (~5 ns vs
+        `time.Now()` ~50 ns; used at ~30 K/s by D2's WaitEvent*); (b) per-P
+        xid cache (`runtime_procPin` / `runtime_procUnpin` for batch refill
+        from atomic global); (c) `runtime.semacquire` / `semrelease` for
+        per-slot bufpool I/O-inflight wait. Build-tag fallbacks per Go minor
+        version. Per `08-runtime-internals.md`.
+      - Design: `docs/design/perf-optimize/08-runtime-internals.md`
+      - PG-compat gate: invariants §6 (Phase D5) — linkname targets only
+        touch scheduling/timing; no on-disk effect.
+      - Verification: `go test ./internal/runtimeshim/...` PASS for the
+        current Go minor; bench shows `nanotime()` ~5 ns; per-Go-minor build
+        matrix green; combined with D3 the `runtime.futex` drop is realised;
+        `TestE2E_FailoverGoopgToPG/async` PASS; `make ralph-state-guard` PASS.
+
+### Milestone-close gates (after all 8 sub-milestones)
+
+ - [ ] **M0107 — milestone-close performance suite**
+      - Run `bash analysis/perf-optimize/scripts/run_perf_suite.sh` (~60 min)
+        and confirm the integrated bands from
+        `docs/design/perf-optimize/09-migration-and-rollout.md` §5 table:
+        c=10 SO ≥ 8 000; c=50 SU ≥ 2 000; c=50 SO ≥ 18 000;
+        c=100 SO ≥ 12 000; c=100 SU ≥ 500; c=100 standard ≥ 500;
+        `gcBgMarkWorker` < 15 %; `runtime.futex` < 8 %; `mvcc.Manager.*`,
+        `activity.Registry.*`, `bufferPartition.mu` all absent from mutex
+        top-20; `Datum` sizeof == 24 B.
+      - Mark superseded design docs per `09-migration-and-rollout.md` §6:
+        M0068-0003 (batch-string-arena), M0073-0001 (datum-arena-field),
+        M0074-0003 (arena-registry-forward-compat), M0098-0003
+        (bufpool-partitioning), M0099-0002 (pin-fastpath), M0091-0001
+        (activity goroutine cache). Add `Status: SUPERSEDED-BY: docs/design/
+        perf-optimize/<chapter>` headers; do not delete.
+      - Update milestone status in
+        `docs/milestones/0107-performance-optimization-refactor.md` and
+        `docs/milestones/README.md` to `accepted`.
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
