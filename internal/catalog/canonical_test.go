@@ -93,31 +93,34 @@ func TestBuildCanonicalHeapInsertPayload(t *testing.T) {
 		t.Errorf("blockNum = %d, want %d", bn, blk)
 	}
 
-	// FPI bytes.
-	fpi := body[25 : 25+storage.BlockSize]
+	// Main data header comes BEFORE the FPI (correct PG XLog format):
+	// body[25]=xlrBlockIDDataShort, body[26]=len(3).
+	if body[25] != canonicalXlogDataShort {
+		t.Errorf("body[25] (main data tag) = 0x%02x, want xlrBlockIDDataShort (0x%02x)", body[25], canonicalXlogDataShort)
+	}
+	if body[26] != 3 {
+		t.Errorf("body[26] (main data len) = %d, want 3", body[26])
+	}
+
+	// FPI bytes are in the data section AFTER the main data header.
+	fpi := body[27 : 27+storage.BlockSize]
 	for i, b := range fpi {
 		if b != page[i] {
 			t.Fatalf("FPI mismatch at byte %d: got 0x%02x, want 0x%02x", i, b, page[i])
 		}
 	}
 
-	// Main data.
-	md := body[25+storage.BlockSize:]
-	if len(md) != 5 {
-		t.Fatalf("main data len = %d, want 5", len(md))
+	// Main data content follows the FPI.
+	mdContent := body[27+storage.BlockSize:]
+	if len(mdContent) != 3 {
+		t.Fatalf("main data content len = %d, want 3", len(mdContent))
 	}
-	if md[0] != canonicalXlogDataShort {
-		t.Errorf("main data tag = 0x%02x, want xlrBlockIDDataShort (0x%02x)", md[0], canonicalXlogDataShort)
-	}
-	if md[1] != 3 {
-		t.Errorf("main data length byte = %d, want 3", md[1])
-	}
-	gotOffnum := binary.LittleEndian.Uint16(md[2:4])
+	gotOffnum := binary.LittleEndian.Uint16(mdContent[0:2])
 	if gotOffnum != offnum {
 		t.Errorf("main data offnum = %d, want %d", gotOffnum, offnum)
 	}
-	if md[4] != 0 {
-		t.Errorf("main data flags = 0x%02x, want 0", md[4])
+	if mdContent[2] != 0 {
+		t.Errorf("main data flags = 0x%02x, want 0", mdContent[2])
 	}
 }
 
@@ -148,14 +151,17 @@ func TestBuildCanonicalBtreeInsertPayload(t *testing.T) {
 		t.Fatalf("len(payload) = %d, want %d", len(payload), wantLen)
 	}
 
-	md := payload[canonicalHeaderSize+25+storage.BlockSize:]
-	if md[0] != canonicalXlogDataShort {
-		t.Errorf("main data tag = 0x%02x", md[0])
+	// In the correct PG XLog body format, the main data header (tag+len) comes
+	// at body[25:27], the FPI at body[27:27+BlockSize], and content after that.
+	body := payload[canonicalHeaderSize:]
+	if body[25] != canonicalXlogDataShort {
+		t.Errorf("main data tag = 0x%02x, want xlrBlockIDDataShort", body[25])
 	}
-	if md[1] != 2 {
-		t.Errorf("main data len = %d, want 2", md[1])
+	if body[26] != 2 {
+		t.Errorf("main data len = %d, want 2", body[26])
 	}
-	gotOffnum := binary.LittleEndian.Uint16(md[2:4])
+	mdContent := body[27+storage.BlockSize:]
+	gotOffnum := binary.LittleEndian.Uint16(mdContent[0:2])
 	if gotOffnum != offnum {
 		t.Errorf("offnum = %d, want %d", gotOffnum, offnum)
 	}

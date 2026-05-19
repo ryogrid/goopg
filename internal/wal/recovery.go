@@ -2243,12 +2243,38 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
+		case xlogHeapDelete, xlogHeapUpdate, xlogHeapHotUpdate:
+			// All three record types are emitted with full-page images
+			// (HasImage+ImageApply on every referenced block). Restore each
+			// block from its FPI; tuple-level main-data parsing is not needed
+			// because the FPI already captures the post-mutation page state.
+			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
+				return false, err
+			}
+			return true, nil
 		default:
 			return false, unsupportedDecodedXLogRecord(r)
 		}
 	default:
 		return false, unsupportedDecodedXLogRecord(r)
 	}
+}
+
+// replayDecodedXLogHeapFPIBlocks restores all block references that carry a
+// full-page image with ImageApply set. Used for XLOG_HEAP_DELETE,
+// XLOG_HEAP_UPDATE, and XLOG_HEAP_HOT_UPDATE records emitted with FPI on
+// every modified block (canonical mode). The FPI already encodes the complete
+// post-mutation page state, so no tuple-level main-data parsing is required.
+func replayDecodedXLogHeapFPIBlocks(mgr *storage.Manager, r Record, xlog *XLogDecodedRecord) error {
+	for i, block := range xlog.Blocks {
+		if !block.HasImage || !block.ImageApply {
+			continue
+		}
+		if err := restoreDecodedXLogBlockImage(mgr, block, storage.LSN(r.EndLSN)); err != nil {
+			return fmt.Errorf("wal: xlog heap FPI block %d: %w", i, err)
+		}
+	}
+	return nil
 }
 
 // replayXLogParameterChange applies an XLOG_PARAMETER_CHANGE record on the

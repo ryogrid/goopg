@@ -23,6 +23,7 @@ const (
 // PG info byte opcodes for catalog WAL records.
 const (
 	canonicalInfoHeapInsert  uint8 = 0x00 // XLOG_HEAP_INSERT
+	canonicalInfoHeapDelete  uint8 = 0x10 // XLOG_HEAP_DELETE
 	canonicalInfoBtreeInsert uint8 = 0x00 // XLOG_BTREE_INSERT_LEAF
 )
 
@@ -76,6 +77,11 @@ func PgCanonicalHeapInsert(
 
 // BuildCanonicalHeapInsertPayload builds the full canonical payload for
 // PgCanonicalHeapInsert. Exposed for unit testing.
+// BuildCanonicalHeapInsertPayload encodes a XLOG_HEAP_INSERT payload with a
+// full-page image. xl_heap_insert struct layout (heapam_xlog.h):
+//
+//	offnum  uint16  (2 bytes)
+//	flags   uint8   (1 byte) — total 3 bytes of main-data content
 func BuildCanonicalHeapInsertPayload(
 	rel storage.RelFileNode,
 	blk storage.BlockNumber,
@@ -83,16 +89,13 @@ func BuildCanonicalHeapInsertPayload(
 	offnum uint16,
 	xid uint32,
 ) []byte {
-	body := buildCanonicalBlockRefFPI(rel, blk, page)
-
-	// Main data: xlrBlockIDDataShort(1) + length(1) + offnum(2) + flags(1) = 5 bytes.
-	// xl_heap_insert.flags = 0 (FPI path; XLH_INSERT_CONTAINS_NEW_TUPLE not needed).
-	mainData := [5]byte{canonicalXlogDataShort, 3}
-	binary.LittleEndian.PutUint16(mainData[2:4], offnum)
-	mainData[4] = 0
-
-	return buildCanonicalPayload(canonicalRmgrHeap, canonicalInfoHeapInsert, xid,
-		append(body, mainData[:]...))
+	// xl_heap_insert: offnum(2) + flags(1) = 3 bytes.
+	// flags=0: XLH_INSERT_CONTAINS_NEW_TUPLE not needed when FPI restores the page.
+	var mainData [3]byte
+	binary.LittleEndian.PutUint16(mainData[0:2], offnum)
+	// mainData[2] = 0 (flags)
+	body := buildCanonicalSingleFPIBody(rel, blk, page, mainData[:])
+	return buildCanonicalPayload(canonicalRmgrHeap, canonicalInfoHeapInsert, xid, body)
 }
 
 // PgCanonicalBtreeInsert encodes a PG-canonical XLOG_BTREE_INSERT_LEAF WAL
@@ -122,6 +125,10 @@ func PgCanonicalBtreeInsert(
 
 // BuildCanonicalBtreeInsertPayload builds the full canonical payload for
 // PgCanonicalBtreeInsert. Exposed for unit testing.
+// BuildCanonicalBtreeInsertPayload encodes a XLOG_BTREE_INSERT_LEAF payload
+// with a full-page image. xl_btree_insert struct layout (nbtxlog.h):
+//
+//	offnum  uint16  (2 bytes) — total 2 bytes of main-data content
 func BuildCanonicalBtreeInsertPayload(
 	rel storage.RelFileNode,
 	blk storage.BlockNumber,
@@ -129,16 +136,13 @@ func BuildCanonicalBtreeInsertPayload(
 	offnum uint16,
 	xid uint32,
 ) []byte {
-	body := buildCanonicalBlockRefFPI(rel, blk, page)
-
-	// Main data: xlrBlockIDDataShort(1) + length(1) + xl_btree_insert.offnum(2) = 4 bytes.
+	// xl_btree_insert: offnum(2) = 2 bytes.
 	// With FPI, PG's btree_xlog_insert restores the page directly and ignores offnum;
 	// we still include it for correctness with non-FPI recovery paths.
-	mainData := [4]byte{canonicalXlogDataShort, 2}
-	binary.LittleEndian.PutUint16(mainData[2:4], offnum)
-
-	return buildCanonicalPayload(canonicalRmgrBtree, canonicalInfoBtreeInsert, xid,
-		append(body, mainData[:]...))
+	var mainData [2]byte
+	binary.LittleEndian.PutUint16(mainData[0:2], offnum)
+	body := buildCanonicalSingleFPIBody(rel, blk, page, mainData[:])
+	return buildCanonicalPayload(canonicalRmgrBtree, canonicalInfoBtreeInsert, xid, body)
 }
 
 // RelationMapUpdateMap is a stub for emitting XLOG_RELMAP_UPDATE WAL records.
@@ -152,6 +156,59 @@ func BuildCanonicalBtreeInsertPayload(
 //   - shared: true when updating the global shared relmap
 func RelationMapUpdateMap(_ uint32, _ uint32, _ uint32, _ bool, _ LogCanonicalFunc) error {
 	return nil
+}
+
+// PgCanonicalHeapDelete emits a PG-canonical XLOG_HEAP_DELETE record with a
+// full-page image so a vanilla PG18 standby can replay user-table DELETEs and
+// the xmax-stamp step of UPDATEs. With HasImage+ImageApply the standby's
+// heap_xlog_delete restores the page from the FPI directly; the xl_heap_delete
+// main-data struct is still present but not used for tuple-level logic.
+func PgCanonicalHeapDelete(
+	rel storage.RelFileNode,
+	blk storage.BlockNumber,
+	page storage.Page,
+	offnum uint16,
+	xid uint32,
+	xmax uint32,
+	logFn LogCanonicalFunc,
+) error {
+	if logFn == nil {
+		return nil
+	}
+	return logFn(BuildCanonicalHeapDeletePayload(rel, blk, page, offnum, xid, xmax))
+}
+
+// BuildCanonicalHeapDeletePayload encodes a XLOG_HEAP_DELETE payload with a
+// full-page image. xl_heap_delete struct layout (heapam_xlog.h):
+//
+//	xmax         uint32   (4 bytes)
+//	offnum       uint16   (2 bytes)
+//	infobits_set uint8    (1 byte)
+//	flags        uint8    (1 byte) — total 8 bytes of main-data content
+// BuildCanonicalHeapDeletePayload encodes a XLOG_HEAP_DELETE payload with a
+// full-page image. xl_heap_delete struct layout (heapam_xlog.h):
+//
+//	xmax         uint32   (4 bytes)
+//	offnum       uint16   (2 bytes)
+//	infobits_set uint8    (1 byte)
+//	flags        uint8    (1 byte) — total 8 bytes of main-data content
+func BuildCanonicalHeapDeletePayload(
+	rel storage.RelFileNode,
+	blk storage.BlockNumber,
+	page storage.Page,
+	offnum uint16,
+	xid uint32,
+	xmax uint32,
+) []byte {
+	// xl_heap_delete: xmax(4) + offnum(2) + infobits_set(1) + flags(1) = 8 bytes.
+	// infobits_set=0, flags=0: not used when FPI restores the page.
+	var mainData [8]byte
+	binary.LittleEndian.PutUint32(mainData[0:4], xmax)
+	binary.LittleEndian.PutUint16(mainData[4:6], offnum)
+	// mainData[6] = 0 (infobits_set)
+	// mainData[7] = 0 (flags)
+	body := buildCanonicalSingleFPIBody(rel, blk, page, mainData[:])
+	return buildCanonicalPayload(canonicalRmgrHeap, canonicalInfoHeapDelete, xid, body)
 }
 
 // buildCanonicalBlockRefFPI encodes a single PG XLogRecord block reference
@@ -181,32 +238,49 @@ func RelationMapUpdateMap(_ uint32, _ uint32, _ uint32, _ bool, _ LogCanonicalFu
 //	  [25..8216] full page content
 //
 // Total: 25 + 8192 = 8217 bytes.
-func buildCanonicalBlockRefFPI(rel storage.RelFileNode, blk storage.BlockNumber, page storage.Page) []byte {
-	const blockRefSize = 25 // header(4) + image header(5) + relfilelocator(12) + blocknum(4)
-	buf := make([]byte, blockRefSize+storage.BlockSize)
+// buildCanonicalSingleFPIBody builds the PG XLogRecord body for a single
+// block reference with a full-page image. The layout mirrors PG's
+// XLogRecordAssemble format (xloginsert.c):
+//
+//	[block_ref_header(25)] [main_data_tag+len(2)] [FPI(BlockSize)] [main_data_content(N)]
+//
+// The block ref header and main_data_tag+len form the "header section";
+// the FPI and main_data_content form the "data section". The decoder
+// (parseXLogRecordData in pg_xlog_decode.go) reads them in this order:
+// first all block/main-data headers, then the data section.
+//
+// mainDataContent must be ≤ 255 bytes (short-form main-data tag).
+func buildCanonicalSingleFPIBody(
+	rel storage.RelFileNode,
+	blk storage.BlockNumber,
+	page storage.Page,
+	mainDataContent []byte,
+) []byte {
+	n := len(mainDataContent)
+	// blockRefHdr(25) + mainDataHdr(2) + FPI(BlockSize) + mainDataContent(n)
+	body := make([]byte, 25+2+storage.BlockSize+n)
 
-	// Block reference header.
-	buf[0] = 0 // block ID 0
-	buf[1] = canonicalBkpBlockHasImage | 0x00 // forkFlags: HasImage + MainFork
-	binary.LittleEndian.PutUint16(buf[2:4], 0)                           // data_len = 0
+	// Block reference header (4 base + 5 image + 12 locator + 4 blocknum = 25).
+	body[0] = 0                               // block ID 0
+	body[1] = canonicalBkpBlockHasImage | 0x00 // forkFlags: HasImage + MainFork
+	binary.LittleEndian.PutUint16(body[2:4], 0) // data_len = 0
+	binary.LittleEndian.PutUint16(body[4:6], uint16(storage.BlockSize)) // imgLen
+	binary.LittleEndian.PutUint16(body[6:8], 0) // holeOffset = 0 (no hole)
+	body[8] = canonicalBkpImageApply             // bimgInfo
+	binary.LittleEndian.PutUint32(body[9:13], canonicalDefaultTablespaceOID)
+	binary.LittleEndian.PutUint32(body[13:17], rel.DBOid)
+	binary.LittleEndian.PutUint32(body[17:21], rel.RelOid)
+	binary.LittleEndian.PutUint32(body[21:25], uint32(blk))
 
-	// Block image header.
-	binary.LittleEndian.PutUint16(buf[4:6], uint16(storage.BlockSize)) // imgLen
-	binary.LittleEndian.PutUint16(buf[6:8], 0)                         // holeOffset
-	buf[8] = canonicalBkpImageApply                                     // bimgInfo
+	// Main data header (short form): [xlrBlockIDDataShort(1)][len(1)]
+	body[25] = canonicalXlogDataShort
+	body[26] = byte(n)
 
-	// RelFileLocator.
-	binary.LittleEndian.PutUint32(buf[9:13], canonicalDefaultTablespaceOID)
-	binary.LittleEndian.PutUint32(buf[13:17], rel.DBOid)
-	binary.LittleEndian.PutUint32(buf[17:21], rel.RelOid)
+	// Data section: FPI then main data content.
+	copy(body[27:27+storage.BlockSize], page)
+	copy(body[27+storage.BlockSize:], mainDataContent)
 
-	// Block number.
-	binary.LittleEndian.PutUint32(buf[21:25], uint32(blk))
-
-	// Full page image.
-	copy(buf[25:], page)
-
-	return buf
+	return body
 }
 
 // buildCanonicalPayload wraps the PG-canonical record body in the goopg
