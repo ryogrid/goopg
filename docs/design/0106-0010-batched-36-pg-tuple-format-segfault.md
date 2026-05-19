@@ -2,7 +2,12 @@
 
 ## Status
 
-PARTIAL — root cause identified, partial fixes landed; PG still segfaults on `SELECT`.
+PARTIAL (loop 3, 2026-05-19) — heap-tuple MAXALIGN bug identified and
+fixed in `PageAddHeapTuple`. User-table heap bytes now match PG's
+expected layout byte-for-byte (offset MAXALIGN'd, header fields
+correct: Infomask2=natts, Infomask|=HEAP_XMAX_INVALID, Hoff=24,
+varlena header 0x15 for "bootstrap"). PG still segfaults on the SELECT
+— the residual cause is elsewhere; see "What's next" below.
 
 ## TL;DR
 
@@ -108,6 +113,74 @@ the goopg primary's data directory, run it through `pg_filedump` from
    on the streaming side rather than the user-page read side.
 3. Then handle the second wave of segfaults the moment a real concurrent
    workload starts (`waitForPGCount("...WHERE src = 'pre'", 1, 30s)`).
+
+## 2026-05-19 loop 3 — MAXALIGN fix landed
+
+Findings from the byte-level audit (manual via xxd, not pg_filedump):
+
+* Before fix: the goopg primary's `base/5/16400` (bench_log heap) had
+  `pd_upper = 8154` (i.e. NOT 8-byte aligned). PG18 requires every
+  tuple offset to be MAXALIGN'd; `heap_deform_tuple` dereferences
+  alignment-sensitive offsets at the tuple base, so a misaligned
+  base segfaults on the first SELECT.
+* Root cause: `storage.PageAddHeapTuple` allocated a slot of exactly
+  `len(raw)` bytes (`newUpper = upper - len(raw)`) rather than PG's
+  `alignedSize = MAXALIGN(size); newUpper = upper - alignedSize`.
+* Fix: `PageAddHeapTuple` now subtracts `MAXALIGN(len(raw))` from
+  `pd_upper` and writes the actual tuple bytes at the slot's low
+  end; padding bytes (0..7) at the slot's high end stay zero from
+  `InitPage`. The line-pointer `Length` still reports the real
+  tuple length so `ParseHeapTuple` reads exactly the tuple bytes.
+
+Verification:
+
+* `internal/executor/canonical_tuple_bytes_test.go` — new unit test
+  that builds the bench_log canonical tuple bytes and asserts
+  byte-exact PG layout + page-level MAXALIGN. PASS.
+* On-disk verification: `base/5/16400` now has `pd_upper = 8152`
+  (MAXALIGN'd) and the inserted tuple matches PG's expected
+  HeapTupleHeaderData layout byte-for-byte:
+  Xmin=4, Xmax=0, t_field3=0, t_ctid=(0xFFFFFFFF,0),
+  t_infomask2=2, t_infomask=0x0800, t_hoff=24,
+  body=`19 fc ff ff 15 'bootstrap'`.
+* Catalog files (pg_class 1259, pg_attribute 1247, pg_namespace 2615)
+  inspected at block 0 — all already have MAXALIGN'd `pd_upper`
+  values (288, 280, 7856 respectively).
+
+PG STILL SEGFAULTS on the SELECT. The residual defect is NOT in the
+bench_log user-table tuple bytes. Hypotheses for batched-37:
+
+* **(H3) Index pages.** No index is created on `bench_log` in the test,
+  but the planner reads pg_class indexes (e.g.
+  `pg_class_relname_nsp_index`) which goopg builds via
+  `internal/access/btree`. The btree's `PageAddItemRaw` /
+  `PageInsertItemRawAt` were initially MAXALIGN'd in this loop but
+  reverted to keep btree space-fit consistent (page panics on
+  boundary cases otherwise); those paths still emit non-MAXALIGN'd
+  item offsets, which a PG18 backend reading the index will
+  dereference.
+* **(H4) Wrong relation lookup.** The "at character 22" log marker
+  places the segfault near the FROM clause in
+  `SELECT count(*) FROM public.bench_log WHERE client = -999`. PG
+  is in the parser/analyzer reading `pg_class` / `pg_namespace`
+  catalogs. Even though those catalog pages are MAXALIGN'd, a
+  per-row corruption (e.g. wrong `relfilenode` OID, wrong
+  `attlen`/`atttypid` for bench_log's columns) could still drive
+  the planner into a bad memory dereference. A targeted
+  `pg_filedump` on `base/5/1259` (pg_class) restricted to bench_log
+  would localise this.
+* **(H5) `pg_internal.init`.** The test copies goopg-generated
+  relcache init files to the standby. If those still describe
+  bench_log's columns with attrlen/attbyval/attalign values that
+  disagree with what `pg_attribute` says, PG's `formrdesc` or
+  `RelationCacheInitializePhase3` would build a wrong TupleDesc,
+  and `heap_deform_tuple` would dereference at a wrong offset.
+
+Files touched this loop:
+
+- `internal/storage/heap.go` — `PageAddHeapTuple` MAXALIGNs.
+- `internal/executor/canonical_tuple_bytes_test.go` — new test
+  pinning the byte layout.
 
 ## Files touched
 

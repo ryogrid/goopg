@@ -10175,6 +10175,35 @@ relcache init → replication readiness) and intra-package grouped.
       `t_hoff` / null-bitmap MAXALIGN for the variable-length `text`
       column. Once page bytes match, re-run TestE2E_FailoverGoopgToPG/
       async and surface the next blocker.
+    - PARTIAL PROGRESS 2026-05-19 (loop 3): heap-tuple MAXALIGN bug
+      found and fixed. Pre-fix `base/5/16400` had `pd_upper=8154` (not
+      8-byte aligned); PG18 `heap_deform_tuple` segfaults on a
+      misaligned tuple base. `storage.PageAddHeapTuple` now MAXALIGNs
+      the per-tuple slot the way `PageAddItemExtended` does in PG —
+      `alignedSize = MAXALIGN(len(raw)); upper -= alignedSize`. The
+      line-pointer `Length` still reports the real tuple length so
+      `ParseHeapTuple` reads exactly the tuple bytes; padding bytes
+      stay zero from `InitPage`. New regression test
+      `TestCanonicalUserRowOnEmptyPageM0106_0010_36` in
+      `internal/executor/canonical_tuple_bytes_test.go` pins the
+      MAXALIGN'd page layout. On-disk verification: `base/5/16400`
+      now has `pd_upper=8152` and the bench_log tuple matches PG's
+      HeapTupleHeaderData byte-for-byte. Catalog tables
+      (pg_class 1259, pg_attribute 1247, pg_namespace 2615) already
+      have MAXALIGN'd page headers. TestE2E_PhysicalReplication +
+      executor/storage/server/mvcc/catalog/access unit suites — all
+      pass under the new alignment. The btree-related raw insertion
+      paths (`PageAddItemRaw`, `PageInsertItemRawAt`,
+      `PageReplaceItemRaw`) were NOT changed — initial MAXALIGN
+      attempt cascaded into btree space-fit panics; left for a
+      follow-on after the heap-side path is fully stable.
+      TestE2E_FailoverGoopgToPG/async — STILL FAILS: PG client
+      backend continues to segfault on the same SELECT, so the
+      residual cause is elsewhere. Hypotheses (H3..H5) captured in
+      the design doc: index pages still emit non-MAXALIGN'd offsets;
+      catalog row content (attlen/attbyval/atttypid for bench_log
+      columns) may be wrong; or pg_internal.init may describe
+      bench_log with an inconsistent TupleDesc.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

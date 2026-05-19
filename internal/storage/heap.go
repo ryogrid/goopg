@@ -368,13 +368,22 @@ func PageAddHeapTuple(p Page, t HeapTuple) (uint16, error) {
 	}
 	lower := int(h.Lower())
 	upper := int(h.Upper())
-	needed := itemIDSize + len(raw)
+	// PG MAXALIGNs the tuple offset (PageAddItemExtended: alignedSize =
+	// MAXALIGN(size); upper -= alignedSize). On a PG18 standby, a tuple
+	// whose offset is not 8-byte aligned causes the backend's
+	// heap_deform_tuple to dereference alignment-sensitive offsets at
+	// the wrong base, segfaulting on the first SELECT. The line-pointer
+	// Length still reports the actual tuple length so ParseHeapTuple
+	// reads exactly the tuple bytes; the trailing 0..7 bytes are
+	// padding (zero from InitPage). M0106-0010 batched-36.
+	alignedSize := maxAlign8(len(raw))
+	needed := itemIDSize + alignedSize
 	if upper-lower < needed {
 		return 0, ErrNoSpaceInPage
 	}
 
-	newUpper := upper - len(raw)
-	copy(p[newUpper:upper], raw)
+	newUpper := upper - alignedSize
+	copy(p[newUpper:newUpper+len(raw)], raw)
 
 	count, err := PageLinePointerCount(p)
 	if err != nil {
