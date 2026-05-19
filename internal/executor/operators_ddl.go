@@ -1825,23 +1825,20 @@ func namespaceOIDForSchema(schema string) uint32 {
 
 // syncTableToCatalogHeap writes one pg_class row and one pg_attribute row per
 // column for tbl. Called by execCreateTable after in-memory catalog is updated.
+//
+// The rows are emitted in PG18-canonical layout (34-column pg_class,
+// 25-column pg_attribute) so that a PostgreSQL 18 standby attaching to a
+// goopg basebackup can deform the tuple with its native tupdesc and locate
+// the user table by name. The historical goopg-native short-row layout
+// blocked PG-standby parse-analyze at `relation public.bench_log does not
+// exist` (M0106-0010 batched-36 loop 7 → loop 8).
 func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	classRel := storage.RelFileNode{
 		DBOid:  catalog.DefaultDBOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classRow := Row{
-		{Kind: KindInt, Int: int64(tbl.OID)},
-		NewStringDatum(tbl.Name),
-		{Kind: KindInt, Int: int64(namespaceOIDForSchema(tbl.Schema))},
-		NewStringDatum("r"),
-		{Kind: KindInt, Int: int64(len(tbl.Columns))},
-		{Kind: KindInt, Int: int64(tbl.OID)},
-		NewStringDatum("p"),
-		NewBoolDatum(false),
-	}
-	if err := writeHeapRowCanonical(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
+	if err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(tbl)); err != nil {
 		return fmt.Errorf("pg_class: %w", err)
 	}
 
@@ -1851,16 +1848,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		Fork:   storage.MainFork,
 	}
 	for _, col := range tbl.Columns {
-		typOID := catalog.TypeNameToOID(col.Type.Name)
-		attrRow := Row{
-			{Kind: KindInt, Int: int64(tbl.OID)},
-			NewStringDatum(col.Name),
-			{Kind: KindInt, Int: int64(typOID)},
-			{Kind: KindInt, Int: int64(col.Ordinal + 1)},
-			NewBoolDatum(col.NotNull),
-			NewBoolDatum(false),
-		}
-		if err := writeHeapRowCanonical(ctx, attrRel, catalog.PGAttributeColumns(), attrRow); err != nil {
+		if err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRow(tbl, col)); err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
 		}
 	}
@@ -1877,24 +1865,16 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 }
 
 // syncIndexToCatalogHeap writes a pg_class row for idx. Called by
-// createBTreeIndex after the full index build succeeds.
+// createBTreeIndex after the full index build succeeds. The row layout
+// matches PG18's 34-column pg_class so the index is visible to an attaching
+// PG18 standby (see syncTableToCatalogHeap for context).
 func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	classRel := storage.RelFileNode{
 		DBOid:  catalog.DefaultDBOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classRow := Row{
-		{Kind: KindInt, Int: int64(idx.OID)},
-		NewStringDatum(idx.Name),
-		{Kind: KindInt, Int: int64(namespaceOIDForSchema(idx.Schema))},
-		NewStringDatum("i"),
-		{Kind: KindInt, Int: 0},
-		{Kind: KindInt, Int: int64(idx.OID)},
-		NewStringDatum("p"),
-		NewBoolDatum(false),
-	}
-	if err := writeHeapRowCanonical(ctx, classRel, catalog.PGClassColumns(), classRow); err != nil {
+	if err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(idx)); err != nil {
 		return fmt.Errorf("pg_class for index: %w", err)
 	}
 	return nil

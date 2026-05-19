@@ -10355,6 +10355,73 @@ relcache init → replication readiness) and intra-package grouped.
       (b) the resulting pg_class row is written but not visible to
       hot-standby snapshot, (c) the canonical XLOG_RELMAP / DDL WAL
       records are not yet emitted by goopg for user-table CREATE.
+    - PARTIAL PROGRESS 2026-05-19 (loop 8): user CREATE TABLE now
+      writes PG18-canonical 34-column pg_class rows and 25-column
+      pg_attribute rows. Previously `syncTableToCatalogHeap` in
+      `internal/executor/operators_ddl.go` constructed an 8-column
+      pg_class row in goopg-native order
+      (oid/relname/relnamespace/relkind/relnatts/relfilenode/
+      relpersistence/relisshared) and a 6-column pg_attribute row.
+      PG18 deformed the on-disk row with its 34-column tupdesc and
+      read garbage from offset 68 onward (the goopg `relkind` byte
+      landed in the slot PG reads as `reltype`, etc.), so the
+      relcache built a malformed `Form_pg_class` and the relname
+      lookup ultimately missed.
+      Fix landed: new `internal/executor/pg18_user_catalog_rows.go`
+      mirrors initdb's `pgClassColDefs/pgAttrColDefs` canonical
+      layout as `pgClassColumnsPG18()` / `pgAttributeColumnsPG18()`,
+      plus builders `buildUserPGClassRow(tbl)`,
+      `buildUserPGClassRowForIndex(idx)`, and
+      `buildUserPGAttributeRow(tbl, col)`. The new
+      `userTypeAttrsForOID(oid)` translates int*/text/varchar/
+      bpchar/bool/bytea/date/time/timestamp/timestamptz/numeric/
+      oid/float4/float8/name/char into the four pg_type-derived
+      attributes (attlen, attbyval, attalign, attstorage) PG18's
+      `heap_deform_tuple` consults via the relcache tupdesc.
+      `syncTableToCatalogHeap` and `syncIndexToCatalogHeap` switched
+      to the new helpers; the four nullable trailing varlenas on
+      pg_attribute (attacl/attoptions/attfdwoptions/attmissingval)
+      emit `NullDatum`, matching the loop-3u PANIC-recursion fix
+      already shipped for nailed catalogs.
+      Verification: three new regression tests in
+      `internal/executor/pg18_user_catalog_rows_test.go` —
+      `TestUserCreateTableEmitsPG18CanonicalPgClassRow` (decodes the
+      written pg_class tuple via `catalog.DecodePGClassPhysicalRow`
+      and pins relname/relnamespace/relkind/relnatts/relfilenode/
+      relpersistence/relisshared), `Test...PgAttributeRows` (same
+      shape for both pg_attribute rows), `TestUserPGClassRowFixedFieldsOID`
+      (encoded byte layout: 4-byte OID + 64-byte NameData NUL-pad).
+      All `internal/executor`, `internal/catalog`, `internal/storage`,
+      `internal/server`, `internal/mvcc` packages PASS. `internal/wal`:
+      same 2 pre-existing failures unrelated to this loop. `internal/initdb`:
+      same 19 pre-existing failures (M0030 migration / M0106-0012),
+      diff-clean vs master. `TestE2E_PhysicalReplication`,
+      `TestCanonicalHeapInsertWALRoundTrip`,
+      `TestCanonicalUserRowOnEmptyPageM0106_0010_36` PASS.
+      `TestE2E_FailoverGoopgToPG/async` — STILL FAILS with the same
+      `pq: relation "public.bench_log" does not exist (42P01)` string
+      but a different root cause: the heap row is now byte-correct,
+      yet PG18's name→OID lookup probes `pg_class_relname_nsp_index`
+      (system btree OID 2663) and finds nothing because
+      `syncTableToCatalogHeap` writes heap rows only — it does not
+      insert matching IndexTuples into the user catalog's
+      `pg_class_oid_index` (2662) /
+      `pg_class_relname_nsp_index` (2663) /
+      `pg_attribute_relid_attnum_index` (2659) etc. SearchSysCache2(
+      RELNAMENSP) → systable_getnext → btree probe → InvalidOid →
+      `ereport(42P01)`. The heap-side work landed this loop is a
+      prerequisite (index leaf TIDs point back at the heap row which
+      must already decode under PG18's tupdesc).
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 8" section).
+      Next loop (batched-38): extend `syncTableToCatalogHeap` /
+      `syncIndexToCatalogHeap` to also emit btree IndexTuples into
+      `pg_class_oid_index`, `pg_class_relname_nsp_index`,
+      `pg_attribute_relid_attnum_index`, and the corresponding
+      pg_type / pg_namespace / pg_index family indexes touched by
+      user CREATE TABLE. Heap-side row layout is now correct and
+      pinned — the next loop only needs to chain the system-btree
+      insertions on top.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

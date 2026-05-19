@@ -548,3 +548,134 @@ Files touched this loop:
 - `internal/initdb/nailed_composite_name_indexes_test.go` — new
   regression test for the ten composite name-typed indexes on the SELECT
   parse-analyze path, plus a helper-direct test for the no-match paths.
+
+## 2026-05-19 loop 8 — user CREATE TABLE writes PG18-canonical pg_class / pg_attribute rows
+
+### Discovery
+
+After loop 7's auto-derivation fix the standby boots cleanly but
+`TestE2E_FailoverGoopgToPG/async` still reports
+
+    pq: relation "public.bench_log" does not exist at column 22 (42P01)
+
+— same string, no SEGV, no crash-recovery restart loop. Reading the
+write path revealed the root cause: `syncTableToCatalogHeap` in
+`internal/executor/operators_ddl.go` builds an 8-column pg_class row in
+goopg-native ordering (`{oid, relname, relnamespace, relkind, relnatts,
+relfilenode, relpersistence, relisshared}`) and a 6-column pg_attribute
+row. PG18's pg_class has 34 columns in a totally different order
+(`oid, relname, relnamespace, reltype, reloftype, relowner, relam,
+relfilenode, …, relkind`); pg_attribute has 25. When PG18 deforms the
+on-disk row with its own tupdesc, `relname` decodes (NameData(64) at
+offset 4 still works) but every column after offset 68 lands in the
+wrong slot — `reltype` reads the goopg row's `relkind` byte and friends
+— so the relcache builds a garbage `Form_pg_class`, and the
+relname/namespace cache lookup that drives
+`RangeVarGetRelidExtended → get_relname_relid` ultimately misses.
+
+The nailed system catalogs already work because
+`internal/initdb/initdb.go::pgClassRow` / `pgAttributeRow` emit the full
+34-/25-column PG18 layout at initdb time. User CREATE TABLE was the only
+code path still emitting the goopg-native short row.
+
+### Fix
+
+- Added `internal/executor/pg18_user_catalog_rows.go`. Mirrors
+  initdb's `pgClassColDefs` / `pgAttrColDefs` schema as
+  `pgClassColumnsPG18()` / `pgAttributeColumnsPG18()`, and exposes
+  builders that turn a `catalog.Table` (or `catalog.Index`) plus a
+  `catalog.Column` into the canonical 34-/25-column PG18 row.
+  `userTypeAttrsForOID` translates the limited set of OIDs user
+  CREATE TABLE produces (int*, text, varchar, bpchar, bool, bytea,
+  date, time, timestamp, timestamptz, numeric, oid, float4, float8,
+  name, char) into the four pg_type-derived attributes
+  `(attlen, attbyval, attalign, attstorage)` that PG's
+  `heap_deform_tuple` consults via the relcache tupdesc.
+- `syncTableToCatalogHeap` and `syncIndexToCatalogHeap` (same file)
+  now call `pgClassColumnsPG18()` + `buildUserPGClassRow(tbl)` /
+  `buildUserPGClassRowForIndex(idx)` and
+  `pgAttributeColumnsPG18()` + `buildUserPGAttributeRow(tbl, col)`.
+  `writeHeapRowCanonical` then routes through `EncodeRowPG`, which
+  already knows how to encode each PG18 column type (and produces a
+  binary empty `aclitem[]` / `text[]` ArrayType for `relacl` /
+  `reloptions`, matching loop-5 work for nailed catalogs).
+- The four nullable trailing varlena columns on pg_attribute
+  (`attacl, attoptions, attfdwoptions, attmissingval`) emit
+  `NullDatum`, matching initdb's loop-3u fix that prevented a
+  PANIC recursion in PG's `RelationGetIndexAttOptions`.
+
+### Verification
+
+New focused regression tests in
+`internal/executor/pg18_user_catalog_rows_test.go`:
+
+- `TestUserCreateTableEmitsPG18CanonicalPgClassRow` — drives
+  `syncTableToCatalogHeap` against the existing DDL fixture for a
+  `bench_log (client int NOT NULL, src text NOT NULL)` schema, scans
+  the pg_class heap, and decodes the resulting tuple via
+  `catalog.DecodePGClassPhysicalRow` (the fixed-offset PG18 decoder).
+  Asserts `relname='bench_log'`, `relnamespace=PublicNamespaceOID`,
+  `relkind='r'`, `relnatts=2`, `relfilenode=tbl.OID`,
+  `relpersistence='p'`, `relisshared=false`.
+- `TestUserCreateTableEmitsPG18CanonicalPgAttributeRows` — same shape
+  for the two pg_attribute rows; asserts `(attname, atttypid,
+  attnotnull)` at attnum 1 / 2.
+- `TestUserPGClassRowFixedFieldsOID` — encodes via `EncodeRowPG`
+  directly and reads the leading 4-byte OID + 64-byte NameData,
+  pinning the on-disk byte layout PG18's `pg_class_oid_index`
+  consumes.
+
+Regression suite results (this loop's tree vs. master):
+
+- `internal/executor` — clean, including the new tests.
+- `internal/catalog`, `internal/storage`, `internal/server`,
+  `internal/mvcc` — clean.
+- `internal/wal` — two pre-existing failures
+  (`TestCheckpointerWritesCheckpointMarkers`,
+  `TestEncodeRecordXLogClassifiesXactCommitXID`) reproduce on
+  unmodified master, unaffected by this loop.
+- `internal/initdb` — 19 pre-existing failures (M0030 migration /
+  M0106-0012 `TestSynchronousCommitFlushesByDefault`); identical set
+  before/after this loop's change.
+- `TestE2E_PhysicalReplication`, `TestCanonicalHeapInsertWALRoundTrip`,
+  `TestCanonicalUserRowOnEmptyPageM0106_0010_36` all PASS.
+
+`TestE2E_FailoverGoopgToPG/async` (under
+`GOOPG_RUN_BLOCKED_M0102_E2E=1`) — STILL FAILS but with progress: PG
+standby boots cleanly, walreceiver streams, no SEGV, no crash-recovery
+restart. The 30 s `waitForPGCount` deadline elapses because every
+client backend reports `relation "public.bench_log" does not exist`.
+
+### Why the same error string persists — and what's left
+
+The pg_class heap row is now byte-correct (DecodePGClassPhysicalRow
+agrees), but PG18's name → OID lookup goes through
+`pg_class_relname_nsp_index` (a system btree). `syncTableToCatalogHeap`
+writes the heap rows but does **not** insert matching entries into
+the system btrees `pg_class_oid_index` (2662) or
+`pg_class_relname_nsp_index` (2663). On PG18:
+
+  RangeVarGetRelidExtended
+    → SearchSysCache2(RELNAMENSP, …)
+      → systable_getnext (uses pg_class_relname_nsp_index)
+        → btree probe → not found → InvalidOid
+    → ereport ERROR (42P01) "relation … does not exist"
+
+Same applies to `pg_attribute_relid_attnum_index` (2659) and friends.
+initdb seeds these nailed indexes at bootstrap, but user CREATE TABLE
+omits them. Loop 9 (batched-37 candidate) should extend
+`syncTableToCatalogHeap` to emit canonical btree IndexTuples (or to
+walk PG18's `index_insert` path) into pg_class_relname_nsp_index and
+pg_class_oid_index — the heap-side work landed this loop is a
+prerequisite (the index leaf TID points back at the heap row that
+must already decode correctly under PG18's tupdesc).
+
+Files touched this loop:
+
+- `internal/executor/pg18_user_catalog_rows.go` — NEW. 34-/25-column
+  PG18-canonical row builders + the limited pg_type attribute map.
+- `internal/executor/operators_ddl.go` — `syncTableToCatalogHeap` and
+  `syncIndexToCatalogHeap` switched to the new helpers; goopg-native
+  row construction removed at those two call sites.
+- `internal/executor/pg18_user_catalog_rows_test.go` — NEW. Three
+  regression tests pinning the new byte layout.
