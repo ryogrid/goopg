@@ -227,6 +227,42 @@ func TestApplyRecordPrefersDecodedXLogForUnknownPayloadKind(t *testing.T) {
 	}
 }
 
+// TestApplyRecordPrefersDecodedXLogForStructuredInfo pins the M0106-0011
+// fix: when a record's XLog header carries a structured PG-canonical info
+// code (anything other than xlogInfoDefault), ApplyRecord must route via
+// the decoded-xlog path even if payload[0] happens to collide with a
+// known goopg-native record kind. The trigger in production is an
+// 88-byte XLOG_CHECKPOINT_SHUTDOWN whose redo-LSN low byte equals
+// RecordKindBtreeNewRoot (0x18) — the byte collision used to misdispatch
+// the CheckPoint as a btree-newroot decode and surface as
+// "wal: btree-newroot trailing bytes (68 remaining)" during crash
+// recovery (TestCrashMidTransactionTableNotVisibleAfterRestart).
+func TestApplyRecordPrefersDecodedXLogForStructuredInfo(t *testing.T) {
+	// 88-byte payload whose first byte is RecordKindBtreeNewRoot.
+	payload := make([]byte, 88)
+	payload[0] = RecordKindBtreeNewRoot
+
+	rec := Record{
+		StartLSN: 100,
+		EndLSN:   200,
+		Payload:  payload,
+		XLog: &XLogDecodedRecord{
+			Header: XLogRecord{
+				Rmid: RmgrXLog,
+				Info: xlogCheckpointShutdown,
+			},
+		},
+	}
+
+	applied, err := ApplyRecord(nil, rec)
+	if err != nil {
+		t.Fatalf("ApplyRecord: %v (want nil — structured CHECKPOINT_SHUTDOWN routes as no-op)", err)
+	}
+	if applied {
+		t.Fatal("ApplyRecord applied=true, want false (CHECKPOINT_SHUTDOWN is a no-op on standby)")
+	}
+}
+
 func TestDecodedXLogHeapInsertVisibleThroughPreloadedBufferPoolAfterCommit(t *testing.T) {
 	dataDir := t.TempDir()
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})

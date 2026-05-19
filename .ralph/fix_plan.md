@@ -11525,6 +11525,38 @@ relcache init → replication readiness) and intra-package grouped.
         regeneration on DDL invalidation; checkpoint/shutdown init-file
         refresh; `TestCrashMidTransactionTableNotVisibleAfterRestart`
         (implicit-abort sibling of the rollback path).
+      - PROGRESS 2026-05-20 (loop 31): `TestCrashMidTransactionTableNotVisibleAfterRestart`
+        flipped FAIL → PASS. Two distinct root causes addressed in one slice:
+        (a) WAL classifier byte-collision misroute: `internal/wal/recovery.go`
+        `ApplyRecord` was routing any 88-byte PG-canonical
+        `XLOG_CHECKPOINT_SHUTDOWN` record whose redo-LSN low byte happened
+        to equal `RecordKindBtreeNewRoot=0x18` into the btree-newroot
+        decoder, surfacing as "wal: btree-newroot trailing bytes (68
+        remaining)" during crash WAL replay. Fix: prefer
+        `replayDecodedXLogRecord` whenever `r.XLog.Header.Rmid/Info`
+        carries a non-`xlogInfoDefault` (i.e. structured PG) classification.
+        (b) Implicit-abort path was missing: loop 30's filter only
+        excluded `TxnStatusAborted` xmins, but a crashed-in-progress xid
+        leaves the clog slot at `TxnStatusUnknown`. Fix: new
+        `mvcc.CLog.MarkUnknownAsAborted(highXID)` stamps every still-Unknown
+        slot in `[1, highXID)` as Aborted (PG's "non-Committed CLOG slot ⇒
+        not committed" semantics); `Open()` adds a `highestCatalogXID(mgr,
+        cat)` scan of `pg_class`/`pg_attribute` heap pages so the sweep
+        bound is the actual on-disk max xmin (not the stale snapshot
+        NextXID, which is only saved on clean shutdown). Regression tests:
+        `internal/wal/.../TestApplyRecordPrefersDecodedXLogForStructuredInfo`
+        (pins the byte-collision fix using an 88-byte payload with first
+        byte == `RecordKindBtreeNewRoot`),
+        `internal/mvcc/.../TestCLogMarkUnknownAsAborted{,ZeroBound}`
+        (sweep semantics + persistence across reopen). Design:
+        `docs/design/0106-0011-crash-mid-tx-clog-implicit-abort.md`.
+        Verified: `internal/initdb/` baseline now 15 pre-existing failures
+        (was 16; the implicit-abort test flipped FAIL→PASS); `executor`,
+        `catalog`, `mvcc`, `server` all PASS; `wal` 2 pre-existing failures
+        unchanged.
+        Open follow-ups still under M0106-0011: relcache init-file
+        regeneration on DDL invalidation; checkpoint/shutdown init-file
+        refresh.
 
  - [x] **M0106-0012**
       - Summary: Make TestSynchronousCommitFlushesByDefault to be passed.

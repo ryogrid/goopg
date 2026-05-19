@@ -2014,6 +2014,16 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		if !nativeApplyRecordKindKnown(r.Payload[0]) {
 			return replayDecodedXLogRecord(mgr, r)
 		}
+		// (M0106-0011) The classifier identified this record as a
+		// structured PG-canonical record (e.g., an 88-byte
+		// XLOG_CHECKPOINT_SHUTDOWN whose redo-LSN low byte happened to
+		// collide with a goopg native RecordKind). Native goopg
+		// records always classify with `xlogInfoDefault` (0xF0); any
+		// other Info value means the structured PG classification
+		// must win over the payload[0] byte-collision.
+		if r.XLog.Header.Rmid != RmgrXLog || r.XLog.Header.Info != xlogInfoDefault {
+			return replayDecodedXLogRecord(mgr, r)
+		}
 	}
 	if len(r.Payload) == 0 {
 		return false, errors.New("wal: empty record payload")

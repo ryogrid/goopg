@@ -163,6 +163,80 @@ func TestCLogInitializeDoesNotOverwriteNonZero(t *testing.T) {
 	}
 }
 
+// TestCLogMarkUnknownAsAborted verifies that MarkUnknownAsAborted stamps
+// every still-Unknown xid in [1, highXID) as Aborted while leaving
+// Committed/Aborted entries untouched. Backs the M0106-0011 crash-recovery
+// implicit-abort sweep — any xid that wrote heap rows but never reached
+// commit/abort must be Aborted-stamped so the visibility filter excludes
+// its rows.
+func TestCLogMarkUnknownAsAborted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pg_xact")
+	c, err := OpenCLog(path)
+	if err != nil {
+		t.Fatalf("OpenCLog: %v", err)
+	}
+	// Pre-seed: 1=Committed, 3=Aborted explicitly. 2 and 4 stay Unknown.
+	if err := c.SetCommitted(storage.TransactionID(1)); err != nil {
+		t.Fatalf("SetCommitted(1): %v", err)
+	}
+	if err := c.SetAborted(storage.TransactionID(3)); err != nil {
+		t.Fatalf("SetAborted(3): %v", err)
+	}
+
+	const highXID = storage.TransactionID(7)
+	if err := c.MarkUnknownAsAborted(highXID); err != nil {
+		t.Fatalf("MarkUnknownAsAborted(%d): %v", highXID, err)
+	}
+
+	cases := []struct {
+		xid  uint32
+		want TxnStatus
+	}{
+		{1, TxnStatusCommitted}, // pre-existing Committed preserved
+		{2, TxnStatusAborted},   // was Unknown → stamped Aborted
+		{3, TxnStatusAborted},   // pre-existing Aborted preserved
+		{4, TxnStatusAborted},   // was Unknown → stamped Aborted
+		{5, TxnStatusAborted},   // grown + stamped
+		{6, TxnStatusAborted},   // grown + stamped
+	}
+	for _, tc := range cases {
+		if got := c.GetStatus(storage.TransactionID(tc.xid)); got != tc.want {
+			t.Errorf("GetStatus(%d) = %d, want %d", tc.xid, got, tc.want)
+		}
+	}
+	// XID 7 (== highXID) and beyond stay Unknown — sweep is half-open.
+	if got := c.GetStatus(highXID); got != TxnStatusUnknown {
+		t.Errorf("GetStatus(%d) = %d, want Unknown", highXID, got)
+	}
+
+	// Persistence: re-open the clog and re-verify.
+	c2, err := OpenCLog(path)
+	if err != nil {
+		t.Fatalf("re-OpenCLog: %v", err)
+	}
+	for _, tc := range cases {
+		if got := c2.GetStatus(storage.TransactionID(tc.xid)); got != tc.want {
+			t.Errorf("after reopen GetStatus(%d) = %d, want %d", tc.xid, got, tc.want)
+		}
+	}
+}
+
+// TestCLogMarkUnknownAsAbortedZeroBound is a no-op when highXID==0.
+func TestCLogMarkUnknownAsAbortedZeroBound(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pg_xact")
+	c, err := OpenCLog(path)
+	if err != nil {
+		t.Fatalf("OpenCLog: %v", err)
+	}
+	if err := c.MarkUnknownAsAborted(0); err != nil {
+		t.Fatalf("MarkUnknownAsAborted(0): %v", err)
+	}
+	// No file write should have grown anything.
+	if got := c.GetStatus(storage.TransactionID(1)); got != TxnStatusUnknown {
+		t.Errorf("GetStatus(1) = %d, want Unknown", got)
+	}
+}
+
 // TestCLogIdempotent verifies that writing the same status twice doesn't
 // corrupt the file (and doesn't return an error).
 func TestCLogIdempotent(t *testing.T) {

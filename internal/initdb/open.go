@@ -766,6 +766,40 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			_ = mgr.Close()
 			return nil, fmt.Errorf("goopg: clog upgrade: %w", uerr)
 		}
+	} else {
+		// (M0106-0011) Crash-recovery implicit abort: WAL replay
+		// restored the on-disk pg_class / pg_attribute heap pages,
+		// but the JSON catalog snapshot at last clean shutdown does
+		// not necessarily cover xids that were allocated after it,
+		// so txnMgr.NextXID() alone is not a reliable upper bound.
+		// Scan the catalog heap relfiles for the highest xmin/xmax
+		// actually present on disk and mirror PG's CLOG semantics:
+		// any of those xids whose clog slot is still TxnStatusUnknown
+		// must have crashed in progress (no commit/abort marker ever
+		// reached the clog), so stamp them Aborted before
+		// loadUserTablesFromHeap runs. This is the implicit-abort
+		// counterpart to the explicit-rollback filter added in
+		// M0106-0011 loop 30.
+		//
+		// Basebackup-attached clusters must call InitializeAsCommitted
+		// with the upstream nextXid before this point so upstream xids
+		// stay Committed (see CLog.MarkUnknownAsAborted comment).
+		highXID, herr := highestCatalogXID(mgr, cat)
+		if herr != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: scan catalog xids: %w", herr)
+		}
+		if highXID >= txnMgr.NextXID() {
+			txnMgr.SetNextXID(highXID + 1)
+		}
+		if aerr := clog.MarkUnknownAsAborted(txnMgr.NextXID()); aerr != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: clog implicit-abort sweep: %w", aerr)
+		}
 	}
 	// One-shot migration: if this is a legacy JSON-only cluster whose
 	// pg_class has no user-table rows, write all in-memory user tables to
@@ -1585,6 +1619,55 @@ func appendCatalogRows(mgr *storage.Manager, rel storage.RelFileNode, tuples []s
 // The scan is safe on old clusters (pre-M0030-0001) that have no pg_class relfile
 // and is idempotent with the JSON snapshot path (tables already loaded from JSON
 // are skipped via TryRegisterUserTable's exists-check).
+// highestCatalogXID scans the on-disk pg_class and pg_attribute heap pages
+// and returns the highest xmin/xmax found across all live tuples. Used by
+// Open()'s implicit-abort sweep (M0106-0011) to size the clog so xids
+// allocated after the last clean catalog-snapshot save (and therefore not
+// covered by the snapshot's NextXID) are still seen and Aborted-stamped if
+// they never reached commit. Returns 0 when the catalog heap is empty or
+// absent (fresh initdb).
+func highestCatalogXID(mgr *storage.Manager, cat *catalog.InMemory) (storage.TransactionID, error) {
+	var maxXID storage.TransactionID
+	observe := func(xid storage.TransactionID) {
+		if xid != storage.InvalidTransactionID && xid > maxXID {
+			maxXID = xid
+		}
+	}
+	scan := func(relOID uint32) error {
+		rel := storage.RelFileNode{DBOid: cat.DBOID(), RelOid: relOID, Fork: storage.MainFork}
+		nblocks, err := mgr.NBlocks(rel)
+		if err != nil || nblocks == 0 {
+			return nil
+		}
+		page := make(storage.Page, storage.BlockSize)
+		for blk := storage.BlockNumber(0); blk < nblocks; blk++ {
+			if err := mgr.ReadBlock(rel, blk, page); err != nil {
+				return fmt.Errorf("highestCatalogXID: read rel %d blk %d: %w", relOID, blk, err)
+			}
+			count, err := storage.PageLinePointerCount(page)
+			if err != nil {
+				continue
+			}
+			for slot := uint16(1); slot <= uint16(count); slot++ {
+				ht, err := storage.PageGetHeapTuple(page, slot)
+				if err != nil {
+					continue
+				}
+				observe(ht.Header.Xmin)
+				observe(ht.Header.Xmax)
+			}
+		}
+		return nil
+	}
+	if err := scan(catalog.RelationRelationId); err != nil {
+		return 0, err
+	}
+	if err := scan(catalog.AttributeRelationId); err != nil {
+		return 0, err
+	}
+	return maxXID, nil
+}
+
 func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
 	classRel := storage.RelFileNode{
 		DBOid:  cat.DBOID(),

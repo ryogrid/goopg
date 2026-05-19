@@ -105,6 +105,51 @@ func (c *CLog) InitializeAsCommitted(highXID storage.TransactionID) error {
 	return os.WriteFile(c.path, c.data, 0600)
 }
 
+// MarkUnknownAsAborted marks every XID in the range [1, highXID) whose current
+// status is TxnStatusUnknown as TxnStatusAborted, leaving Committed/Aborted
+// entries unchanged. Called by Open() after WAL replay finishes to implement
+// crash-recovery's "any xid not explicitly Committed is treated as Aborted"
+// semantics (M0106-0011): a transaction that wrote heap rows but crashed
+// before its commit/abort marker reached disk leaves its xid as Unknown in
+// the local clog, and downstream visibility filters need an explicit Aborted
+// stamp to exclude its rows. Mirrors PostgreSQL's recovery-time treatment of
+// TRANSACTION_STATUS_IN_PROGRESS CLOG slots.
+//
+// CAUTION for basebackup-attached clusters: upstream xids that pre-date the
+// attach are not present in our local clog and would be incorrectly marked
+// Aborted by this sweep. Such clusters MUST call InitializeAsCommitted with
+// the upstream cluster's nextXid BEFORE this sweep runs so the upstream
+// range is already Committed.
+func (c *CLog) MarkUnknownAsAborted(highXID storage.TransactionID) error {
+	if highXID == 0 {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	top := int(highXID)
+	// Grow data to include the full sweep range. Newly-appended slots
+	// default to TxnStatusUnknown and will be stamped Aborted below
+	// (these correspond to xids that were allocated but whose status
+	// was never written, e.g. crashed in progress).
+	for len(c.data) < top {
+		c.data = append(c.data, byte(TxnStatusUnknown))
+	}
+	dirty := false
+	for i := 1; i < top; i++ {
+		if c.data[i] == byte(TxnStatusUnknown) {
+			c.data[i] = byte(TxnStatusAborted)
+			dirty = true
+			if err := c.mirrorToSLRULocked(storage.TransactionID(i), TxnStatusAborted); err != nil {
+				return err
+			}
+		}
+	}
+	if !dirty {
+		return nil
+	}
+	return os.WriteFile(c.path, c.data, 0600)
+}
+
 // setStatus updates data[xid] = status and rewrites the file. When a PG SLRU
 // directory has been wired (see EnablePGSLRUMirror), the matching 2-bit lane
 // of <slruDir>/<segno>:<page>:<byte> is also updated so a PG standby reading
