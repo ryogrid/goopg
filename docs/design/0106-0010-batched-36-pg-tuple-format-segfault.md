@@ -202,3 +202,85 @@ Files touched this loop:
   introduced by this loop.
 - `internal/initdb` — `TestSynchronousCommitFlushesByDefault` continues to
   fail (M0106-0012, pre-existing).
+
+## 2026-05-19 loop 4 — segfault localised to pg_namespace_nspname_index
+
+PROGRESS (no new fix landed): the LD_PRELOAD SIGSEGV shim
+(`GOOPG_TEST_SEGV_BACKTRACE=1`) plus `addr2line` on
+`postgres/local_install/bin/postgres` pinpoint the crash to the
+`name` btree key comparator on `pg_namespace_nspname_index`:
+
+```
+RDI=0x00000000745f6770  RSI=0x00005af83a977190  RDX=0x40 (NAMEDATALEN)
+RIP=0x0000702f4ad8c8c1  (libc strncmp / __strncmp_evex)
+postgres/utils/adt/name.c:139   namecmp -> strncmp(arg1, arg2, 64)
+postgres/access/nbtree/nbtsearch.c:402  _bt_binsrch -> _bt_compare ->
+  FunctionCall2Coll -> btnamecmp -> namecmp
+postgres/backend/parser/parse_clause.c:399  transformTableEntry ->
+  RangeVarGetRelidExtended -> LookupExplicitNamespace("public") ->
+  GetSysCacheOid1(NAMESPACENAME, …) -> SearchCatCache ->
+  systable_getnext (pg_namespace_nspname_index)
+```
+
+The first 4 IO_READV ops that precede the SIGV all return 8192 bytes
+(one block each), which is consistent with PG loading
+`pg_namespace_nspname_index` blocks 0+1 + adjacent catalog reads,
+then immediately segfaulting on the first `strncmp` invocation.
+
+**Btree byte audit — clean.** Manual decode of
+`base/5/2684` (16 KiB = 2 blocks):
+
+* Block 0 (metapage): `pd_lower=72 pd_upper=8176 pd_special=8176
+  pd_pagesize_version=0x2004`. BTMetaPageData:
+  `btm_magic=0x053162  btm_version=4  btm_root=1  btm_level=0
+  btm_fastroot=1  btm_fastlevel=0  btm_last_cleanup_num_delpages=0
+  btm_last_cleanup_num_heap_tuples=-1.0  btm_allequalimage=true`.
+* Block 1 (root+leaf): `pd_lower=36 pd_upper=7960 pd_special=8176`.
+  Three line pointers (NORMAL flag, lp_len=72) at offsets 8104 →
+  "pg_catalog", 8032 → "pg_toast", 7960 → "public" — all in ascending
+  alphabetical order.  Tuple headers: `t_tid=(0,offnum)  t_info=0x0048`
+  (size=72, no nulls, no varlen, no INDEX_ALT_TID).  Data starts at
+  tuple+8, 64 bytes of NameData, NUL-padded.
+* `BTPageOpaqueData` at block-1 byte 8176:
+  `btpo_prev=0  btpo_next=0  btpo.level=0  btpo_flags=0x0003`
+  = `BTP_LEAF | BTP_ROOT`.  `btpo_prev=btpo_next=0` is CORRECT —
+  PG defines `P_NONE = 0` (verified against
+  `postgres/src/include/access/nbtree.h:213`), so this root-leaf is
+  marked both leftmost and rightmost as expected.
+
+So the bytes on disk and the bytes in the standby's mirrored file
+match each other and match PG's expected layout.  Hypotheses H1
+(t_ctid encoding) and the "btpo_next sentinel" sub-flavour of H3 are
+falsified.
+
+**Live hypothesis (H4'):** PG's `RelationCacheInitializePhase3`
+either (a) builds a `tupdesc` for `pg_namespace_nspname_index` with
+`attlen`/`attbyval` that disagrees with `name` (NAMEDATALEN=64,
+attbyval=false), causing `fetchatt` in `index_getattr` to return a
+spurious Datum instead of `PointerGetDatum(tup + 8)`; or (b) reads
+the wrong `relfilenode` for OID 2684 and ends up scanning some other
+file whose bytes happen to look like an IndexTuple to the line-pointer
+decoder but whose data offset is bogus.  The 4-IO sequence rules
+against (b) — only 2 blocks of 2684 should be touched on this path,
+which matches what we see.
+
+**Next-loop action plan (batched-38 candidate):**
+
+1. Dump goopg's `pg_attribute` row for `(attrelid=2684, attnum=1)` from
+   the primary's `base/5/1249` via a Go inspection helper.  Compare
+   `attlen / attbyval / attalign / atttypid` against PG's expected
+   `(64, false, 'c', 19=NAMEOID)`.
+2. Dump goopg's `pg_index` row for `(indexrelid=2684)` from
+   `base/5/2610` — verify `indnatts=1`, `indkey={2}`, `indclass={1986}`
+   (name_ops).
+3. Dump goopg's `pg_internal.init` for the entry describing OID 2684 —
+   compare the in-memory `tupdesc` it expands to against (1).
+4. Once the offending row is found, regenerate it correctly and re-run
+   `TestE2E_FailoverGoopgToPG/async`.
+
+The 1247/2610 dump should take one inspection script (decoding heap
+tuples for the pg_attribute / pg_index TupleDesc).  All three audits
+are pure byte inspection — no PG round-trip required, which keeps the
+loop tight.
+
+Files touched this loop: none (diagnostic-only).

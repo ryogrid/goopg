@@ -10204,6 +10204,37 @@ relcache init → replication readiness) and intra-package grouped.
       catalog row content (attlen/attbyval/atttypid for bench_log
       columns) may be wrong; or pg_internal.init may describe
       bench_log with an inconsistent TupleDesc.
+    - PARTIAL PROGRESS 2026-05-19 (loop 4): residual segfault
+      localised via the LD_PRELOAD SIGSEGV shim
+      (`GOOPG_TEST_SEGV_BACKTRACE=1`). Stack trace + `addr2line`
+      pin the crash to `btnamecmp → namecmp → strncmp(arg1, arg2, 64)`
+      called from `_bt_binsrch → _bt_compare → FunctionCall2Coll`
+      while scanning `pg_namespace_nspname_index` (OID 2684) to
+      resolve the `public` namespace in `RangeVarGetRelidExtended`
+      during `parse_analyze` of the bench_log SELECT.  RDI (arg1) is
+      a bogus pointer 0x745f6770.  Manual byte-level decode of
+      `base/5/2684` shows the metapage (BTREE_MAGIC,
+      btm_root=1, btm_level=0, btm_fastroot=1) and the root-leaf
+      (3 line pointers NORMAL/72-byte to "pg_catalog"/"pg_toast"/
+      "public" in ascending order; t_info=0x0048; NameData 64-byte
+      payload NUL-padded) are byte-correct; BTPageOpaqueData has
+      `btpo_prev=btpo_next=0 = P_NONE` (verified vs
+      `postgres/src/include/access/nbtree.h:213`) and
+      `btpo_flags=BTP_LEAF|BTP_ROOT`.  So the on-disk bytes are
+      not the bug.  Live hypothesis (H4'): PG's
+      `RelationCacheInitializePhase3` is building a `tupdesc` for
+      OID 2684 whose `attlen/attbyval/attalign/atttypid` for the
+      indexed column disagrees with `name` (64, false, 'c',
+      NAMEOID=19), causing `index_getattr`'s `fetchatt` to return
+      a spurious Datum instead of `PointerGetDatum(tup+8)`.  Design
+      doc updated:
+      `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 4" section) with the next-loop audit plan:
+      dump `pg_attribute` row for (attrelid=2684, attnum=1) from
+      `base/5/1249`, `pg_index` row for indexrelid=2684 from
+      `base/5/2610`, and the relcache init-file entry for OID 2684;
+      compare against canonical PG18 values; regenerate the
+      offending row.  No code changes landed this loop.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
