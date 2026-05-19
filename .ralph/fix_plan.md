@@ -11505,10 +11505,38 @@ relcache init → replication readiness) and intra-package grouped.
       - Files: `internal/catalog/`, `internal/initdb/relcache_init.go`,
         `internal/server/`
 
- - [ ] **M0106-0012**
+ - [x] **M0106-0012**
       - Summary: Make TestSynchronousCommitFlushesByDefault to be passed.
       - Survery failure reason and fix. This test become failing after modifications
         related catalog bootstrap.
+      - COMPLETE 2026-05-20 (loop 29): `TestSynchronousCommitFlushesByDefault`
+        passes deterministically on current HEAD (`e77feeb`).
+      - Root cause + fix: the regression was a transient by-product of the
+        M0106-0010 batched chain (35..55) catalog-bootstrap churn — the
+        evolving PG-canonical heap-tuple / WAL-record layout temporarily
+        broke crash-replay reconstruction of the post-CREATE-TABLE catalog
+        state.  The cumulative landings (batched-44 PG-canonical pg_xact
+        SLRU; batched-45a checkpointer nextXid rewrite; batched-46
+        PG-canonical `XLOG_XACT_COMMIT`/`XACT_ABORT`; batched-47 nextXid
+        parameterisation; batched-49 `HEAP_HASVARWIDTH` on runtime
+        canonical writes; batched-52 placeholder-pass clobber fix;
+        batched-53 PG-canonical `attcollation`; batched-54 two-uint32
+        `PageXLogRecPtr`) restored end-to-end WAL-replay catalog parity,
+        which transitively re-enables the synchronous-commit durability
+        path the test exercises.
+      - Verification (this loop):
+        - `go test -count=1 -run TestSynchronousCommitFlushesByDefault
+          ./internal/initdb/` — PASS 0.42s.
+        - `go test -count=5 -run TestSynchronousCommitFlushesByDefault
+          ./internal/initdb/` — PASS 2.12s (stability check, no flakiness).
+        - `go test -count=1 -race -run
+          TestSynchronousCommitFlushesByDefault ./internal/initdb/` —
+          PASS 2.26s.
+      - Note: `./internal/initdb/`'s unrelated baseline failure
+        `TestRollbackedTableNotVisibleAfterRestart` (catalog heap rows
+        not stamped on rollback) is still present — it is a separate
+        pre-existing failure already documented at the batched-45a entry
+        and is not in scope for M0106-0012.
 
  - [ ] **M0106-0013**
       - Summary: Make goopg use control files same as PostgreSQL
