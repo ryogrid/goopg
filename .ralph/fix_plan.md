@@ -2479,8 +2479,21 @@ Design doc: `docs/design/0106-0001-relcache-init-file-format.md`
         Tracked in M0106-0010.
       - Files: `internal/executor/codec.go`
 
-- [ ] **M0106-0010**
+- [x] **M0106-0010**
       - Summary: Resolve array assertion and bootstrap pg_am(+related) tuples.
+      - COMPLETE 2026-05-20 (loop 27): acceptance criterion satisfied by
+        batched-55 (`TestE2E_FailoverGoopgToPG/async` PASS). Final cleanup
+        landed this loop: reverted all `goopg-diag` `elog(LOG, ...)` calls
+        the batched-36 investigation added to
+        `postgres/src/backend/tcop/postgres.c` and
+        `postgres/src/backend/utils/init/postinit.c` (per the batched-36
+        permission "diagnostic elog must be reverted after investigation
+        concludes"), rebuilt PG (`make install` under `postgres/`), and
+        re-verified `TestE2E_FailoverGoopgToPG/async` — PASS 1.71s under
+        the unmodified PG binary. The batched chain (35..55) closes the
+        goopg→PG async failover path end-to-end; remaining ongoing-
+        maintenance work (DDL/checkpoint/promotion catalog upkeep) is
+        tracked separately under M0106-0011.
       - M0106-0009 resolved the nocachegetattr assertion, but surfaced a new
         blocker: `deconstruct_array` assertion (`ARR_ELEMTYPE`, arrayfuncs.c)
         because PG casts stored varlena text `{}` as binary `ArrayType*`.
