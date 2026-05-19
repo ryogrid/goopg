@@ -713,7 +713,28 @@ var nailedLocalRels = flattenRels([]nailedRel{
 	{OID: 2667, Name: "pg_constraint_oid_index"},
 	{OID: 2688, Name: "pg_operator_oid_index"},
 	{OID: 2680, Name: "pg_inherits_relid_seqno_index"},
-	{OID: 2684, Name: "pg_namespace_nspname_index"},
+	// M0106-0010 batched-36 loop 5: pg_namespace_nspname_index (OID 2684)
+	// is a 1-column UNIQUE btree on pg_namespace.nspname (name_ops) — same
+	// shape as pg_authid_rolname_index (Step 3dg) and pg_database_datname_index
+	// (Step 3dh). Without this override flattenRels falls back to the
+	// oid-stamped descriptor in indexKeyAttrs (attlen=4, attbyval=true),
+	// which is written verbatim into pg_attribute (attrelid=2684, attnum=1)
+	// by bootstrapPgAttributeTuples. RelationCacheInitializePhase3 then
+	// builds a TupleDesc whose first key descriptor says attlen=4 /
+	// attbyval=true. _bt_compare → index_getattr → fetchatt reads the first
+	// 4 inline NameData bytes of the leaf IndexTuple as a by-val Datum and
+	// passes them as a pointer to btnamecmp → strncmp(arg1, …) → SIGSEGV
+	// (RDI=0x00000000745f6770 = LE "pg_t" — the leading bytes of either
+	// "pg_catalog" or "pg_toast" in the root-leaf scanned for `public`).
+	// The crash fires during parser/analyzer `RangeVarGetRelidExtended` →
+	// `LookupExplicitNamespace("public")` → `SearchCatCache(NAMESPACENAME)`
+	// when a PG18 standby promoted from a goopg basebackup runs the first
+	// SELECT after recovery. The name-typed override below makes
+	// bootstrapPgAttributeTuples emit attlen=64 / attbyval=false (NAMEOID),
+	// which matches PG's expected ScanKey shape for name_ops.
+	{OID: 2684, Name: "pg_namespace_nspname_index", Attrs: []nailedAttr{
+		{Name: "nspname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
+	}},
 	{OID: 2685, Name: "pg_namespace_oid_index"},
 	{OID: 2654, Name: "pg_amop_opr_fam_index"},
 	// M0106-0010 Step 3x: pg_aggregate_fnoid_index. PG18

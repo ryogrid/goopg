@@ -10204,6 +10204,36 @@ relcache init → replication readiness) and intra-package grouped.
       catalog row content (attlen/attbyval/atttypid for bench_log
       columns) may be wrong; or pg_internal.init may describe
       bench_log with an inconsistent TupleDesc.
+    - PARTIAL PROGRESS 2026-05-19 (loop 5): pg_namespace_nspname_index
+      Attrs override landed; SEGV root cause for OID 2684 closed.
+      `internal/initdb/relcache_init.go` now stamps the
+      `pg_namespace_nspname_index` `idxSpec` with the name-typed
+      descriptor (`TypeOID=19`, `Len=64`, `Name="nspname"`), so
+      `bootstrapPgAttributeTuples` writes the on-disk
+      `(attrelid=2684, attnum=1)` row with the correct
+      `(atttypid=19, attlen=64, attbyval=false, attalign='c')`
+      shape instead of the oid-stamped
+      `(26, 4, true, 'i')` fallback from `indexKeyAttrs(1)`. The
+      Datum 0x00000000745f6770 captured in loop 4 was a textbook
+      "first 4 inline NameData bytes loaded as by-val Datum" —
+      LE `"pg_t"` for the ascending leaf entries `"pg_catalog"` /
+      `"pg_toast"`. Companion fix in `internal/initdb/initdb.go::
+      pgTypeAlignChar` adds NAMEOID (19) → `'c'` to match PG18's
+      `pg_type.dat` (`typalign => 'c'` for `name`). Regression
+      test `TestNailedPgNamespaceNspnameIndexHasNameDescriptor`
+      pins the override + the heap row Datum shape.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 5" section).
+      TestE2E_FailoverGoopgToPG/async — STILL FAILS: PG standby
+      log shows the same `client backend ... signal 11`
+      pattern on the same `SELECT count(*) FROM public.bench_log
+      WHERE client = -999` query. At least one more wrong-tupdesc
+      index sits on the same parse-analyze path. Loop-4 audit
+      items (2) `pg_index` row for indexrelid=2684 and (3)
+      `pg_internal.init` for OID 2684 are still the right next
+      step, plus a bulk audit pass on the other name-typed UNIQUE
+      single-column indexes lacking `Attrs` overrides (3467, 3081,
+      548, 549, 2681, 3997).
     - PARTIAL PROGRESS 2026-05-19 (loop 4): residual segfault
       localised via the LD_PRELOAD SIGSEGV shim
       (`GOOPG_TEST_SEGV_BACKTRACE=1`). Stack trace + `addr2line`

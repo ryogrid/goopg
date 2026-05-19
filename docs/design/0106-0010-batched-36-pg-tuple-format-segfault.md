@@ -284,3 +284,116 @@ are pure byte inspection — no PG round-trip required, which keeps the
 loop tight.
 
 Files touched this loop: none (diagnostic-only).
+
+## 2026-05-19 loop 5 — pg_namespace_nspname_index Attrs override
+
+PROGRESS: closed loop 4's audit item (1) via a code-path reading
+instead of an on-disk byte dump. The `pg_attribute` row for
+`(attrelid=2684, attnum=1)` was emitted with the wrong
+`(atttypid, attlen, attbyval, attalign)` because
+`internal/initdb/relcache_init.go` had no `Attrs` override on the
+`pg_namespace_nspname_index` `idxSpec`. Without it `flattenRels`
+fell back to `indexKeyAttrs(1)`, which stamps a 1-column
+`(oid, attlen=4, attbyval=true)` descriptor — verbatim what
+loop 4 hypothesised (H4') and identical to the bug pattern
+fixed for `pg_authid_rolname_index` (Step 3dg) and
+`pg_database_datname_index` (Step 3dh).
+
+The Datum 0x00000000745f6770 captured in loop 4 decodes as LE
+`"pg_t"` = the first 4 bytes of either `"pg_catalog"` or
+`"pg_toast"` (the two ascending leaf entries scanned before
+`"public"`). When `bootstrapPgAttributeTuples` writes that wrong
+descriptor into `base/5/1249`, the PG18 standby reads it during
+`RelationCacheInitializePhase3` and builds a TupleDesc whose
+first key descriptor says `attlen=4 / attbyval=true`. PG's
+`_bt_compare → index_getattr → fetchatt` then reads the first 4
+inline NameData bytes as a by-val Datum and passes them as a
+pointer to `btnamecmp → strncmp(arg1, …)` → SIGSEGV.
+
+Fix:
+
+```go
+{OID: 2684, Name: "pg_namespace_nspname_index", Attrs: []nailedAttr{
+    {Name: "nspname", TypeOID: 19, Num: 1, Len: 64, NotNull: true},
+}},
+```
+
+Companion fix in `internal/initdb/initdb.go::pgTypeAlignChar`: add
+NAMEOID (19) to the `'c'`-aligned switch arm. PG18's
+`pg_type.dat` says `name` has `typalign => 'c'`; goopg's helper
+fell through to the default `"i"` which made every name column's
+on-disk `attalign` byte = `'i'`. Not the SEGV trigger (the first
+attribute in an index tuple lands at offset 0 either way) but a
+latent bug whose first symptom would be a name column at a
+non-first position in any multi-column heap or composite-key
+index.
+
+Regression test (new): `TestNailedPgNamespaceNspnameIndexHasNameDescriptor`
+in `internal/initdb/pg_namespace_index_test.go` pins:
+
+1. `nailedLocalRels` entry for OID 2684 carries the name-typed
+   override (`TypeOID=19`, `Len=64`, `Name="nspname"`).
+2. `buildPgAttributeBlob(a)` emits `attbyval=0`, `attalign='c'`,
+   `attlen=64` (relcache init parity even though 2684 is not in
+   `criticalLocalIndexOIDs`).
+3. `pgAttributeRow(2684, a)` emits `atttypid=19`, `attlen=64`,
+   `attbyval=false`, `attalign='c'`.
+
+### Test results
+
+* All initdb unit tests pass (only pre-existing failure
+  `TestSynchronousCommitFlushesByDefault` from M0106-0012, unchanged).
+* `TestE2E_FailoverGoopgToPG/async` STILL FAILS. Latest PG standby
+  log (`/tmp/TestE2E_FailoverGoopgToPGasync375676194/001/pg.log`)
+  shows the same `client backend was terminated by signal 11`
+  pattern, same `DETAIL: SELECT count(*) FROM public.bench_log
+  WHERE client = -999` query, fired during the post-connect
+  parse/analyze stage. The pg_namespace_nspname_index fix is
+  necessary but not sufficient — at least one more wrong-tupdesc
+  index sits on the same lookup path.
+
+### Likely-next sites (batched-37 candidate)
+
+Other name-typed UNIQUE single-column indexes in
+`internal/initdb/relcache_init.go` that still lack an `Attrs`
+override and would crash via the same fetchatt → btnamecmp path:
+
+* OID 3467 — `pg_event_trigger_evtname_index`
+* OID 3081 — `pg_extension_name_index`
+* OID 548  — `pg_foreign_data_wrapper_name_index`
+* OID 549  — `pg_foreign_server_name_index`
+* OID 2681 — `pg_language_name_index`
+* OID 3997 — `pg_statistic_ext_name_index`
+
+These do not crash today because the failing query never resolves
+them — they are not on the parse-analyze path for
+`public.bench_log`. But once the residual blocker is fixed, any
+ALTER / EXTENSION / event-trigger statement against the standby
+will surface them. Worth a bulk audit pass before the next E2E
+attempt.
+
+The post-attrs-fix residual SEGV cannot be the indexed column
+descriptor of 2684 itself — that path is now byte-correct. The
+new suspect surface is one of (a) the IndexTuple `t_info` /
+header on the 2684 leaf page (loop 4's manual decode verified
+the on-disk bytes there but did so against PG's expected layout
+post-MAXALIGN — could still differ from what `_bt_compare` parses
+in flight), (b) the `pg_index` row for `indexrelid=2684` carrying
+the wrong `indclass[0]` / `indcollation[0]` (loop 4 audit item 2,
+still not run), or (c) `pg_class.relam=403` + `pg_index.indkey={2}`
+disagreement against the pg_namespace heap tupdesc (the column
+attnum lookup must resolve to nspname; if `pg_class.relnatts=1`
+but PG re-reads `pg_attribute` for attnum=2 on the parent heap
+relation 2615 and gets a different shape, the same Datum
+miscount can recur). Audit items (2) and (3) from loop 4 remain
+the right next step.
+
+Files touched this loop:
+
+- `internal/initdb/relcache_init.go` — added `Attrs` override on
+  the `pg_namespace_nspname_index` `idxSpec` plus surrounding
+  comment block.
+- `internal/initdb/initdb.go::pgTypeAlignChar` — NAMEOID (19)
+  added to the `'c'`-aligned switch arm.
+- `internal/initdb/pg_namespace_index_test.go` — new regression
+  test pinning the descriptor + relcache blob + heap row.

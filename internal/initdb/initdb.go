@@ -5430,7 +5430,15 @@ func pgTypeByVal(oid uint32) bool {
 
 func pgTypeAlignChar(oid uint32) string {
 	switch oid {
-	case 16, 18:
+	case 16, 18, 19:
+		// M0106-0010 batched-36 loop 5: NAMEOID (19) has typalign='c'
+		// per PG18 `postgres/src/include/catalog/pg_type.dat` (`name`
+		// entry: `typalign => 'c'`). Without this, pgAttributeRow
+		// writes attalign='i' (4-byte) for every name column. The
+		// immediate consumer that surfaced this was the test pinning
+		// pg_namespace_nspname_index's pg_attribute row alignment; a
+		// latent multi-column-name-typed offset miscount would have
+		// followed.
 		return "c"
 	case 21:
 		return "s"
