@@ -11341,6 +11341,72 @@ relcache init → replication readiness) and intra-package grouped.
       `pg_basebackup` semantics (checkpoint LSN first, then
       walk data files) and `internal/storage/` for the
       page-LSN stamping path.
+    - PARTIAL PROGRESS 2026-05-20 (loop 25, batched-54): the
+      `XX000 xlog flush request 10307B0/0 is not satisfied`
+      residual is CLOSED. Neither hypothesis (a) nor (b) was
+      load-bearing — the bug was in the on-disk byte layout of
+      `pd_lsn`.
+      Root cause: `internal/storage/page.go::SetLSN` wrote pd_lsn
+      as a single LE uint64; PG18's `PageXLogRecPtr`
+      (postgres/src/include/storage/bufpage.h:100) is two
+      uint32 halves: `xlogid` (high 32 bits) at offset 0 as
+      LE uint32, then `xrecoff` (low 32 bits) at offset 4 as
+      LE uint32. For LSN = `0x010307B0` (PG notation `0/10307B0`),
+      goopg's u64-LE encoding wrote bytes
+      `B0 07 03 01 00 00 00 00`; PG read xlogid=`0x010307B0`,
+      xrecoff=`0`, decoded LSN=`0x010307B0_00000000` printed as
+      `10307B0/0` — exactly the error message.
+      Fix landed in one file (`internal/storage/page.go`):
+      `LSN()` reads `LE u32 @0` and `LE u32 @4`, combines as
+      `(uint64(hi)<<32)|uint64(lo)`. `SetLSN(v)` writes the
+      high 32 bits at offset 0 (LE u32) and low 32 bits at
+      offset 4 (LE u32). Doc comments cite the upstream
+      `PageXLogRecPtrSet` / `PageXLogRecPtrGet` macros.
+      Symmetric encode/decode preserves goopg's internal LSN
+      roundtrip (every caller uses the methods exclusively;
+      `Page[0:8]` is not touched elsewhere). On-disk pages
+      from older goopg builds are not re-readable across the
+      swap; the E2E tests are unaffected (fresh datadir per
+      run); production in-place upgrade is out of scope.
+      Regression pins added in
+      `internal/storage/page_test.go`:
+      `TestLSNOnDiskLayoutMatchesPG18` constructs an LSN with
+      differentiable halves (0x12345678CAFEBABE) and asserts
+      bytes 0..3 = `78 56 34 12` (LE high), bytes 4..7 =
+      `BE BA FE CA` (LE low), plus roundtrip via `LSN()`.
+      `TestLSNLowOnlyValueLandsAtOffset4` reproduces the
+      batched-54 smoking-gun LSN (`0x010307B0`) and asserts
+      the high four bytes are zero (the previous u64-LE
+      encoding put `B0 07 03 01` there).
+      Verified: `go test -count=1 ./internal/storage/
+      ./internal/catalog/ ./internal/executor/ ./internal/mvcc/
+      ./internal/server/ ./internal/access/btree/` — all PASS.
+      `./internal/wal/` carries the same 2 pre-existing
+      baseline failures unchanged
+      (`TestCheckpointerWritesCheckpointMarkers`,
+      `TestEncodeRecordXLogClassifiesXactCommitXID`).
+      `TestE2E_FailoverGoopgToPG/async` — STILL FAILS but
+      `XX000 xlog flush` is gone; the standby's pg.log shows 12
+      successful `goopg-diag: exec_simple_query` rounds on
+      `SELECT count(*) FROM public.bench_log WHERE src = 'pre'`
+      (no XX000, no 42P22, no signal 11, no crash-recovery
+      loop). New residual: post-failover assertion
+      `pgScalar(SELECT src ... WHERE client = -1)` returns no
+      rows (`e2e_failover_goopg_to_pg_test.go:290`); the
+      multi-host post-failover INSERT routed through psql with
+      `target_session_attrs=read-write` either never reached
+      the promoted PG standby or its row is not yet visible.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-20 loop 25 (batched-54)" section).
+      Next loop (batched-55): diagnose the post-failover
+      INSERT/SELECT visibility gap. Two leading hypotheses:
+      (a) timing — standby may not have reached PM_RUNNING
+          before the multi-host INSERT lands (capture psql
+          exit code + standby pg.log around the promote event);
+      (b) standby XID-advance after promotion — the runtime
+          XID-advance path on the promoted standby may need
+          additional plumbing beyond batched-44/45a's
+          basebackup-side fix.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

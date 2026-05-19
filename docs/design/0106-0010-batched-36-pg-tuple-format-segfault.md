@@ -2518,3 +2518,143 @@ after taking the checkpoint LSN?  PG's `pg_basebackup` snapshots
 the checkpoint LSN first, then walks data files; goopg's
 implementation in `internal/server/basebackup/` should mirror
 that.
+
+## 2026-05-20 loop 25 (batched-54)
+
+The `XX000 xlog flush request 10307B0/0 is not satisfied --- flushed
+only to 0/1091DA0` residual is **CLOSED**.  Neither hypothesis (a)
+nor (b) above turned out to be load-bearing — the bug was actually
+in the on-disk byte layout of `pd_lsn`.
+
+### Root cause
+
+The error message had the smoking gun: `10307B0/0` decomposes as
+high=`0x010307B0`, low=`0x00000000`.  Swapping the two halves
+yields `0/10307B0` = 17,000,880 bytes, which is *behind* the
+flushedUpto `0/1091DA0` = 17,374,624 bytes — i.e. the page LSN
+would satisfy the flush requirement if its halves were read in
+the correct order.  Classic PG `PageXLogRecPtr` vs single-u64-LE
+mismatch.
+
+PG18's `PageXLogRecPtr` (`postgres/src/include/storage/bufpage.h:100`):
+
+    typedef struct {
+        uint32 xlogid;    /* high bits, offset 0 */
+        uint32 xrecoff;   /* low bits,  offset 4 */
+    } PageXLogRecPtr;
+
+    #define PageXLogRecPtrSet(ptr, lsn) \
+        ((ptr).xlogid = (uint32)((lsn) >> 32), \
+         (ptr).xrecoff = (uint32)(lsn))
+
+Each half is then written as little-endian uint32, giving the
+on-disk byte order [LE(high) | LE(low)].
+
+goopg's `internal/storage/page.go::SetLSN` was instead writing the
+whole 8 bytes as `binary.LittleEndian.PutUint64(h.Page[0:8],
+uint64(v))`.  For an LSN whose high half is zero and low half is
+`0x010307B0`, that produces bytes `B0 07 03 01 00 00 00 00`.  When
+PG decodes those bytes via `PageGetLSN` it reads:
+
+* `xlogid` = LE u32 of bytes 0..3 = `0x010307B0`
+* `xrecoff` = LE u32 of bytes 4..7 = `0x00000000`
+* `PageGetLSN` returns `(uint64)0x010307B0 << 32 | 0` =
+  `0x010307B0_00000000` → printed as `10307B0/0`.
+
+Exactly the error message.
+
+### Fix
+
+`internal/storage/page.go`:
+
+```go
+func (h PageHeader) LSN() LSN {
+    hi := binary.LittleEndian.Uint32(h.Page[0:4])
+    lo := binary.LittleEndian.Uint32(h.Page[4:8])
+    return LSN(uint64(hi)<<32 | uint64(lo))
+}
+
+func (h PageHeader) SetLSN(v LSN) {
+    binary.LittleEndian.PutUint32(h.Page[0:4], uint32(uint64(v)>>32))
+    binary.LittleEndian.PutUint32(h.Page[4:8], uint32(uint64(v)))
+}
+```
+
+Symmetric encode/decode preserves goopg's internal LSN semantics
+(every existing internal call site uses the `LSN()`/`SetLSN()`
+methods exclusively; only one site —
+`internal/storage/page.go`itself — touched `Page[0:8]` directly
+before this loop).  On-disk pages produced by older goopg builds
+are not re-readable across the swap; for the E2E tests this is
+fine since they always start from a fresh datadir, but production
+clusters would need a one-shot migration if upgraded in place.
+That migration is out of scope for batched-54 — none of the
+existing M0106-0010 baseline tests exercise carry-over from a
+pre-fix on-disk corpus.
+
+### Regression pins
+
+`internal/storage/page_test.go`:
+
+* `TestLSNOnDiskLayoutMatchesPG18` constructs an LSN with
+  differentiable halves (`0x12345678CAFEBABE`), calls `SetLSN`,
+  and asserts the on-disk byte pattern matches PG's
+  `PageXLogRecPtrSet` semantics exactly:
+  `bytes[0..3] = LE(high)` = `78 56 34 12`,
+  `bytes[4..7] = LE(low)`  = `BE BA FE CA`.
+  Also asserts roundtrip via `LSN()` returns the original value.
+* `TestLSNLowOnlyValueLandsAtOffset4` reproduces the batched-54
+  smoking-gun value (`0x010307B0`) and asserts the high four
+  bytes are zero (the previous u64-LE encoding put `B0 07 03 01`
+  there, causing the PG-side `10307B0/0` misread).
+
+### Verification
+
+* `go test -count=1 ./internal/storage/` — PASS (including the
+  two new pin tests above).
+* `go test -count=1 ./internal/catalog/ ./internal/executor/
+  ./internal/mvcc/ ./internal/server/ ./internal/access/btree/`
+  — all PASS.  Symmetric encode/decode means every internal
+  consumer of `LSN()`/`SetLSN()` continues to roundtrip.
+* `./internal/wal/` — same two pre-existing baseline failures
+  carried through unchanged
+  (`TestCheckpointerWritesCheckpointMarkers`,
+  `TestEncodeRecordXLogClassifiesXactCommitXID`).
+* `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+  'TestE2E_FailoverGoopgToPG/async' ./internal/testport/` — the
+  `XX000 xlog flush request` residual is gone; PG-side
+  `goopg-diag: exec_simple_query start: SELECT count(*) FROM
+  public.bench_log WHERE src = 'pre'` traces show the standby
+  reaching the executor on the workload queries (12 successful
+  `exec_simple_query` rounds, no `XX000`, no `42P22`, no signal
+  11, no crash-recovery loop).  Test still FAILS, on a
+  fundamentally different post-failover residual at the
+  `pgScalar(SELECT src ... WHERE client = -1)` assertion
+  (`e2e_failover_goopg_to_pg_test.go:290`): the multi-host
+  post-failover INSERT routed through psql with
+  `target_session_attrs=read-write` either never reached the
+  promoted PG standby or its row is not yet visible to the
+  follow-up SELECT.  Tracked as batched-55.
+
+### Next loop (batched-55)
+
+Diagnose the post-failover INSERT/SELECT visibility gap.
+Two leading hypotheses:
+
+(a) `runGoopgToPGMultiHostInsert` (`e2e_failover_goopg_to_pg_test.go:438`)
+    uses psql with `host=127.0.0.1,STANDBY_HOST port=GOOPG,PG
+    target_session_attrs=read-write`.  Since the goopg primary
+    is killed first, psql should fall through to the PG standby.
+    Verify whether the standby has reached PM_RUNNING (promotion
+    complete) before the INSERT lands, and whether the INSERT
+    actually committed (psql exit code, server log).
+
+(b) The PG standby's heap visibility for the post-failover row may
+    still be limited by a stale `pg_xact` or `nextXid` view —
+    even though batched-44/45a addressed the basebackup-side
+    state, the runtime XID-advance path on the standby after
+    promotion may need additional plumbing.
+
+Capture the standby pg.log around the promote event and the
+`client = -1` INSERT to localise whether (a) or (b) is the
+load-bearing failure.

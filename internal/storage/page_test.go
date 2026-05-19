@@ -132,6 +132,67 @@ func TestLSNSetGet(t *testing.T) {
 	}
 }
 
+// TestLSNOnDiskLayoutMatchesPG18 pins the byte layout of pd_lsn to
+// PG18's two-uint32 PageXLogRecPtr (high at offset 0, low at offset 4,
+// each LE), so a basebackup-shipped page is readable by PG's
+// PageGetLSN.  Regression for M0106-0010 batched-54: the previous u64-LE
+// encoding shipped LSN 0/0x010307B0 with bytes [B0 07 03 01 00 00 00 00],
+// which PG read as 0x010307B0/0 — far past flushedUpto — triggering
+// XX000 "xlog flush request <high>/0 is not satisfied".
+func TestLSNOnDiskLayoutMatchesPG18(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	h := MustHeader(p)
+
+	// Value chosen to differentiate the two halves: high = 0x12345678,
+	// low = 0xCAFEBABE.  PG's PageXLogRecPtrSet writes:
+	//   bytes[0..3] = LE(high) = 78 56 34 12
+	//   bytes[4..7] = LE(low)  = BE BA FE CA
+	const v LSN = 0x12345678CAFEBABE
+	h.SetLSN(v)
+
+	want := [8]byte{0x78, 0x56, 0x34, 0x12, 0xBE, 0xBA, 0xFE, 0xCA}
+	var got [8]byte
+	copy(got[:], h.Page[0:8])
+	if got != want {
+		t.Errorf("pd_lsn bytes = % x, want % x", got, want)
+	}
+
+	if rt := h.LSN(); rt != v {
+		t.Errorf("LSN()=%#x, want %#x", uint64(rt), uint64(v))
+	}
+}
+
+// TestLSNLowOnlyValueLandsAtOffset4 exercises the M0106-0010
+// batched-54 smoking-gun value: an LSN whose high 32 bits are zero
+// must serialise as [00 00 00 00 ... LE(low)] so PG reads it back at
+// the same numeric value rather than as <low>/0.
+func TestLSNLowOnlyValueLandsAtOffset4(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	h := MustHeader(p)
+
+	const v LSN = 0x010307B0 // upstream notation: 0/10307B0
+	h.SetLSN(v)
+
+	for i := 0; i < 4; i++ {
+		if h.Page[i] != 0 {
+			t.Errorf("offset %d = %#x, want 0 (high half is zero)", i, h.Page[i])
+		}
+	}
+	want := [4]byte{0xB0, 0x07, 0x03, 0x01}
+	var got [4]byte
+	copy(got[:], h.Page[4:8])
+	if got != want {
+		t.Errorf("low-half bytes = % x, want % x (LE of 0x010307B0)", got, want)
+	}
+}
+
+
 // TestPageFlagAccessors verifies SetFlags / Flags round-trip.
 func TestPageFlagAccessors(t *testing.T) {
 	p := make(Page, BlockSize)
