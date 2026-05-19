@@ -10693,8 +10693,7 @@ relcache init → replication readiness) and intra-package grouped.
       M0106-0010 complete. Otherwise, the disk-byte-compare experiment
       of H2 (bootstrap-built vs. rebuild-built page via
       `dumpRelnameNspIndexLayout`) is the next-cheapest probe.
-
-      Original batched-42 hypothesis (kept for reference):
+    - Original batched-42 hypothesis (kept for reference):
       (H1) Rebuild path leaves `pd_lsn=0` on rewritten pages — when
            PG replays the streamed WAL it may apply a *stale* FPI
            over the basebackup-correct page. Set `pd_lsn` from the
@@ -10716,6 +10715,58 @@ relcache init → replication readiness) and intra-package grouped.
            invalidation. If H1–H3 do not explain the failure,
            investigate whether the standby needs a different
            cache-invalidation signal in the WAL stream.
+    - PARTIAL PROGRESS 2026-05-19 (loop 14, batched-43): H1 verified
+      necessary-but-not-sufficient; root cause shifted to a
+      pg_xact SLRU format mismatch on the basebackup-shipped clog.
+      Ran `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+      'TestE2E_FailoverGoopgToPG/async' ./internal/testport/` at
+      HEAD `0e5a891` (batched-42). PG standby boots cleanly to
+      `PM_HOT_STANDBY` (`next transaction ID: 3`,
+      `0 KnownAssignedXids`, walreceiver streams to `0/1060F58`),
+      and every client backend issuing
+      `SELECT count(*) FROM public.bench_log WHERE client = -999`
+      returns `42P01` until the 30 s deadline — no SIGSEGV, no
+      crash-recovery loop, no `pg_attribute catalog is missing`
+      FATAL. The test's inline diagnostic confirms `bench_log` IS on
+      disk in both `base/{1,5}/2663` (`hasBenchLog=true`) and
+      `base/{1,5}/1259` (`hasBenchLog=true`). Smoking gun:
+      inspection of the post-test standby data directory
+      (`/tmp/TestE2E_FailoverGoopgToPGasync*/001/pg-standby/`)
+      shows `pg_xact/` is an **empty directory** (no SLRU segment
+      files) while a 4-byte goopg-legacy `global/pg_xact` file got
+      shipped instead.  PG18 expects `pg_xact/0000`,
+      `pg_xact/0001`, … (one BLCKSZ page = `CLOG_XACTS_PER_BYTE` *
+      32 KiB worth of XIDs, 2 bits per XID per
+      `postgres/src/include/access/clog.h:13`) and reads them via
+      `SimpleLruReadPage_ReadOnly`. With no segment files,
+      `TransactionIdDidCommit(xmin)` returns false for every XID,
+      so `HeapTupleSatisfiesMVCC` rejects the bench_log heap row
+      even though `SearchSysCache2(RELNAMENSP, ...)` finds the
+      index entry. H2/H3/H4 are de-prioritised by this finding (the
+      visibility miss subsumes them). pd_lsn stamping from
+      batched-42 must STAY landed — it is the only thing
+      preventing a stale streamed FPI from overwriting the
+      basebackup-correct page during recovery. No new code landed
+      this loop; the work is pure diagnosis.
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-19 loop 14 (batched-43)" section).
+      Next loop (batched-44): bootstrap and runtime-maintain a
+      PG-canonical `pg_xact/` SLRU directory.  Concrete TODOs:
+      (a) rework `internal/initdb/initdb.go::bootstrapCLog` (and
+          remove `global/pg_xact` from the basebackup payload via
+          `isExcludedFile`); write `pg_xact/0000` with 2-bit per-XID
+          encoding (`COMMITTED=0x01`, `ABORTED=0x02`, packed 4 per
+          byte) covering at least the bootstrap XIDs;
+      (b) translate `internal/mvcc/clog.go` writes through a new
+          PG-shape encoder so every `SetCommitted` / `SetAborted`
+          updates the matching `pg_xact/NNNN` byte alongside the
+          legacy flat-file write (keep the flat file for M0030-0007
+          goopg-side startup until M0106-0013 lands);
+      (c) add `internal/initdb/pg_xact_slru_test.go` pinning the
+          on-disk byte layout for `BootstrapXid (1)` / `FrozenXid (2)`
+          / first user-DDL XID;
+      (d) re-run `TestE2E_FailoverGoopgToPG/async` and capture the
+          next residual.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).

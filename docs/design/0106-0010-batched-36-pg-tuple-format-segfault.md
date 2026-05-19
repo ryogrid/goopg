@@ -1280,3 +1280,181 @@ batched-42 changes; if H1 alone closes it, mark M0106-0010 complete.
 If 42P01 persists, the disk-byte-compare experiment of H2 (a
 bootstrap-built page vs. a rebuild-built page using the
 `dumpRelnameNspIndexLayout` diagnostic) is the next-cheapest probe.
+
+## 2026-05-19 loop 14 (batched-43): H1 verified, root cause shifts to pg_xact SLRU format mismatch
+
+### What was run
+
+Ran `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+'TestE2E_FailoverGoopgToPG/async' ./internal/testport/` with the
+batched-42 pd_lsn-stamping commit (`0e5a891`) at HEAD.  Goal: see
+whether H1 alone (FPI pages now carry a non-zero `pd_lsn`) closes the
+residual `42P01: relation "public.bench_log" does not exist`.
+
+### Result
+
+H1 alone did **not** close it.  The PG standby boots cleanly to
+`PM_HOT_STANDBY`, the walreceiver connects at `0/1000000` and streams
+up to `0/1060F58`, and the client backend issuing
+`SELECT count(*) FROM public.bench_log WHERE client = -999` returns
+`ERROR: 42P01` repeatedly until the 30 s deadline.  Crucially, no
+SIGSEGV, no `pg_attribute catalog is missing N attribute(s)`, no
+crash-recovery loop — the failure mode is purely a name-lookup miss.
+
+### The smoking gun
+
+The test's inline disk-state diagnostic (`e2e_failover_goopg_to_pg_test.go:67`)
+prints (from this run):
+
+| Path                                              | Size  | hasBenchLog |
+|---------------------------------------------------|-------|-------------|
+| `base/1/2663` (pg_class_relname_nsp_index)        | 32768 | true        |
+| `base/1/2662` (pg_class_oid_index)                | 16384 | false (OID-keyed) |
+| `base/1/1259` (pg_class_heap)                     | 40960 | true        |
+| `base/1/1249` (pg_attribute_heap)                 | 106496| false (attname-only payload) |
+| `base/1/2659` (pg_attribute_relid_attnum_index)   | 32768 | false (int-keyed) |
+| `base/5/2663`                                     | 32768 | true        |
+| `base/5/2662`                                     | 16384 | false       |
+| `base/5/1259`                                     | 40960 | true        |
+| `base/5/1249`                                     | 106496| false       |
+| `base/5/2659`                                     | 32768 | false       |
+
+So **bench_log IS on disk** in both DB oids' name-typed pg_class
+index (the only one whose payload contains the literal string
+"bench_log") and in pg_class heap.  Loop 12's mirror is working.
+Loop 13's pd_lsn stamp is on the pages.  PG simply cannot make the
+row **visible**.
+
+Direct inspection of the post-test standby data directory pinned the
+cause:
+
+```
+$ STBY=/tmp/TestE2E_FailoverGoopgToPGasync.../001/pg-standby
+$ ls -la "$STBY/pg_xact"
+total 8
+drwx------  2 ryo ryo 4096 May 19 20:09 .
+drwx------ 19 ryo ryo 4096 May 19 20:10 ..
+
+$ ls -la "$STBY/global/pg_xact"
+-rw------- 1 ryo ryo 4 May 19 20:09 ...
+```
+
+The standby has:
+
+1. An **empty** `pg_xact/` directory — no SLRU segment files
+   (`pg_xact/0000`, `pg_xact/0001`, ...) at all.  Upstream PG18 stores
+   one segment file per `BLCKSZ * CLOG_XACTS_PER_BYTE` block of XIDs
+   (`postgres/src/backend/access/transam/clog.c:48`) and treats every
+   XID lookup as an `SimpleLruReadPage_ReadOnly` against those files.
+2. A bogus 4-byte `global/pg_xact` **file** — goopg's flat clog
+   (`internal/mvcc/clog.go:24`).  PG never reads that path; it expects
+   `pg_xact/` to be a directory.
+
+PG's hot-standby snapshot considers a tuple visible only if its xmin
+is `< xmax_snapshot` AND `TransactionIdDidCommit(xmin)` returns true,
+which routes through `TransactionLogFetch` →
+`SimpleLruReadPage_ReadOnly`.  With no segment files, the SLRU
+returns nothing for any XID, so every tuple's xmin appears
+not-committed and every row that requires a non-bootstrap commit
+proof is invisible.  That is why `bench_log` is on disk yet
+unreachable by name lookup: PG's
+`SearchSysCache2(RELNAMENSP, "bench_log", ...)` traverses
+`pg_class_relname_nsp_index` 2663, finds the leaf entry, fetches the
+heap tuple via the entry's `t_tid`, and then rejects the heap row's
+xmin in `HeapTupleSatisfiesMVCC`.
+
+The standby log corroborates this: `next transaction ID: 3`,
+`0 KnownAssignedXids (num=0 tail=0 head=0)`, and
+`xmin required by slots: data 0, catalog 0` — i.e. the standby has
+no committed-XID information whatsoever.  Even bench_log's xmin (the
+exec-time XID, likely 2) shows up as "not committed" because there's
+no pg_xact byte to prove otherwise.
+
+### Why H1 was still load-bearing
+
+H1 (pd_lsn stamping) remains a correctness fix and must stay landed:
+without it a streamed FPI WAL record could overwrite a freshly
+basebackup-ed catalog page with a stale full-page-image on the
+standby.  The fact that no SIGSEGV occurred and that
+`hasBenchLog=true` survived the basebackup → recovery → streaming
+sequence implies pd_lsn is preventing exactly that class of corruption.
+Loop 14 confirms H1 is necessary but not sufficient.
+
+### Why H2/H3/H4 are now de-prioritised
+
+- H2 (bootstrap-built vs. rebuild-built page byte-compare): the
+  disk-state diagnostic already shows the right tuple lands in the
+  index; the post-rebuild page byte layout cannot be the cause of an
+  MVCC-visibility miss.
+- H3 (comment out copyInitFiles): the init file does not contain user
+  relations; bench_log discovery goes through the catalog scan path,
+  not the init file.  Independent of the residual.
+- H4 (RelcacheInvalPending in xact commit): the standby doesn't need a
+  cache invalidation if it can't read the row in the first place.
+  Subordinate to the pg_xact gap.
+
+The new root cause supersedes all three.
+
+### What batched-44 must do
+
+Generate a PG18-compatible `pg_xact/` SLRU directory during goopg
+init and maintain it during normal operation:
+
+1. **Directory + segment files.**  `bootstrapCLog` (initdb.go:5479)
+   currently writes a single flat file `global/pg_xact`.  Rework it
+   to instead create `pg_xact/0000` (and later segments as XIDs
+   grow), each `BLCKSZ * CLOG_XACTS_PER_PAGE` bytes covering 32 768
+   pages × 8 192 XIDs = 268 435 456 XIDs per file in upstream — for
+   bootstrap the first segment of `BLCKSZ` (one page = 8 KiB) is
+   plenty.
+2. **2-bit-per-XID encoding.**  PG18 uses
+   `TRANSACTION_STATUS_IN_PROGRESS=0x00`, `COMMITTED=0x01`,
+   `ABORTED=0x02`, `SUB_COMMITTED=0x03` packed 4 per byte
+   (`postgres/src/include/access/clog.h:13`).  The goopg flat-file
+   encoding is 1 byte per XID with a different mapping
+   (`Unknown=0, Committed=1, Aborted=2`).  Translate at write time.
+3. **Marker XIDs.**  After bootstrap and after each
+   `bootstrapCLog`-equivalent point, mark `FrozenTransactionId (2)`,
+   `BootstrapTransactionId (1)` and every XID used by the bootstrap
+   catalog inserts as COMMITTED so PG's `TransactionIdDidCommit`
+   answers truthfully.  PG18 sets the BootstrapXid commit bit
+   implicitly via `BootstrapTransactionIdDidCommit`, but for any XID
+   that issued a real heap insert (including the CREATE TABLE
+   DDL transaction's XID), the bit must be set in `pg_xact/0000`.
+4. **Runtime maintenance.**  Wire `mvcc.Manager.commitTxn` /
+   `abortTxn` to also write the PG-style 2-bit entry, in addition to
+   (or instead of) the current flat-file write.  Keep the flat file
+   for now if goopg's own startup depends on it (M0030-0007); the PG
+   directory must coexist.
+5. **basebackup inclusion.**  `internal/server/basebackup.go`'s
+   `filepath.Walk` already ships every directory under `dataDir`
+   verbatim, so the PG-compatible `pg_xact/0000` will be picked up
+   automatically once it exists.  The vestigial `global/pg_xact`
+   file should be excluded (`isExcludedFile` filter) to avoid
+   shipping the legacy goopg blob — PG never reads it, but its
+   presence is a maintenance hazard.
+
+### Test that pins the gap
+
+Add a focused test under `internal/initdb/` that calls
+`bootstrapCLog` (post-rework) and asserts:
+
+- `pg_xact/0000` exists, is 8192 bytes, and starts with the
+  `COMMITTED` 2-bit code for XIDs `BootstrapXid (1)`,
+  `FrozenXid (2)`, and any bootstrap-allocated XID.
+- `global/pg_xact` is **not** present, or is empty if kept for
+  back-compat.
+
+Then re-run `TestE2E_FailoverGoopgToPG/async`.  If pg_xact is the
+last load-bearing gap, the test will flip to PASS and M0106-0010 can
+be marked complete.  If 42P01 persists, the next probe is the standby's
+`pg_xact_status('xid')` output (or equivalent shimmed via the
+test's psql harness) to confirm whether PG sees the bench_log xmin as
+COMMITTED after the new SLRU is in place.
+
+### Permitted/forbidden interactions for batched-44
+
+Unchanged from M0106 milestone preamble: no PG-source edits beyond
+diagnostic `elog(DEBUG1, ...)` calls; no `if (goopg_compat)`
+branches.  The work is entirely on the goopg side: implement
+`pg_xact/` SLRU directly so PG sees a stock-shaped clog.
