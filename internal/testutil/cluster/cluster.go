@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"syscall"
+
 	_ "github.com/lib/pq"
 
 	"github.com/goopg/goopg/internal/testutil/util"
@@ -172,6 +174,14 @@ func (c *Cluster) Start() error {
 	cmd.Dir = c.repoRoot
 	cmd.Stdout = f
 	cmd.Stderr = f
+	// M0106-0010 batched-55: put the goopg server (and any subprocesses such
+	// as the `go run` wrapper's child binary, walwriter, checkpointer, …)
+	// into a dedicated process group so Kill() can SIGKILL the whole group
+	// at once. Without this, `go run` exits but the spawned binary keeps
+	// listening on the goopg port and silently absorbs post-failover
+	// INSERTs that should have been routed to the promoted PG standby
+	// (see TestE2E_FailoverGoopgToPG/async).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// DEBUG: also tee to a fixed log
 	_ = os.MkdirAll("/tmp/goopg_cluster_debug", 0755)
 	debugF, _ := os.OpenFile("/tmp/goopg_cluster_debug/"+c.name+".log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
@@ -235,8 +245,21 @@ func (c *Cluster) Kill() error {
 	if c.cmd == nil || c.cmd.Process == nil {
 		return errors.New("cluster not running")
 	}
-	if err := c.cmd.Process.Kill(); err != nil {
-		return fmt.Errorf("kill: %w", err)
+	// M0106-0010 batched-55: SIGKILL the entire process group so the
+	// actual goopg server (spawned as a child of the `go run` wrapper)
+	// dies too. `cmd.Process.Kill()` only signals the wrapper PID; the
+	// orphaned server keeps listening on the goopg port and accepts
+	// connections (including post-failover INSERTs that should go to the
+	// promoted PG standby). Start() puts the wrapper in its own process
+	// group via Setpgid so negative-PID-to-pgrp signalling is safe.
+	pgid, err := syscall.Getpgid(c.cmd.Process.Pid)
+	if err != nil {
+		// Fallback: kill only the wrapper if pgid is unobtainable
+		// (the process may already be gone).
+		pgid = c.cmd.Process.Pid
+	}
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
+		return fmt.Errorf("kill pgrp -%d: %w", pgid, err)
 	}
 	c.cmd = nil
 	return nil

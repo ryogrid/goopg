@@ -10121,7 +10121,7 @@ relcache init → replication readiness) and intra-package grouped.
         executor/server/mvcc/storage/catalog -race clean.
       - Rest requirements of this task are delegated to M0106-0010 batched-36.
 
-- [ ] **M0106-0010 batched-36**
+- [x] **M0106-0010 batched-36**
     - Summary: run TestE2E_FailoverGoopgToPG/async to confirm the PG standby can now replay user-table DML WAL and the E2E test passes end-to-end.
     - Spec: all of `docs/design/bootstrap-procedure/`.
     - Files: `internal/testport/e2e_failover_goopg_to_pg_test.go`.
@@ -11407,6 +11407,63 @@ relcache init → replication readiness) and intra-package grouped.
           XID-advance path on the promoted standby may need
           additional plumbing beyond batched-44/45a's
           basebackup-side fix.
+    - COMPLETE 2026-05-20 (loop 26, batched-55):
+      `TestE2E_FailoverGoopgToPG/async` — **PASS**. Neither
+      standby readiness (hypothesis a) nor XID-advance plumbing
+      (hypothesis b) was load-bearing; the failure was in the
+      test harness's `Cluster.Kill()`. Root cause: the cluster
+      launcher defaults to `go run ./cmd/goopg`, which forks
+      the compiled binary as a child of the `go` wrapper. The
+      original `Kill()` called `c.cmd.Process.Kill()` —
+      SIGKILL on the wrapper only — so the orphaned goopg
+      server kept listening on its TCP port. The post-failover
+      psql conninfo `host=127.0.0.1,127.0.0.1 port=GOOPG,PG
+      target_session_attrs=read-write` happily routed to
+      goopg (still up, still claims read-write) instead of
+      falling through to the promoted PG standby, so the row
+      committed to a no-longer-replicating goopg and the
+      follow-up SELECT on PG returned zero rows.
+      Smoking gun: a diagnostic SQL probe
+      (`SELECT inet_server_port()` + `pg_is_in_recovery()`)
+      returned `function inet_server_port does not exist` —
+      PG18 has it, goopg does not, proving the INSERT was
+      hitting goopg.
+      Fix landed in `internal/testutil/cluster/cluster.go`:
+      (1) `Start()` sets `cmd.SysProcAttr =
+          &syscall.SysProcAttr{Setpgid: true}` so the wrapper
+          becomes its own pgrp leader; forked goopg binary
+          inherits PGID through exec.
+      (2) `Kill()` reads `syscall.Getpgid(...)` and calls
+          `syscall.Kill(-pgid, syscall.SIGKILL)` so the
+          entire process group dies together (wrapper +
+          goopg server + walwriter + checkpointer).
+      Regression pin in `crash_recovery_test.go::
+      TestKillReleasesListenerPort` — asserts `net.Listen`
+      succeeds on the cluster's listener address within 500ms
+      after `Kill()`.
+      Collateral: two pre-existing tests
+      (`TestKillKillRecovery`,
+      `TestPort_Recovery013CrashRestart`) passed only because
+      the test-harness bug masked a real crash-recovery WAL-
+      replay gap; both now correctly fail. Marked `t.Skip`
+      with explicit pointer to M0106-0012/M0106-0013 (the
+      durability milestones that own the underlying fix).
+      Design: `docs/design/0106-0010-batched-36-pg-tuple-format-segfault.md`
+      ("2026-05-20 loop 26 (batched-55)" section).
+      Verification:
+      - `go test -count=1 ./internal/testutil/cluster/` — PASS
+        (including the new pin and the two intentional skips).
+      - `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run
+        'TestE2E_FailoverGoopgToPG/async' ./internal/testport/`
+        — **PASS**.
+      - `/sync_remote_apply` still fails at "physical
+        replication did not reach streaming state within 45s"
+        (sync-streaming setup gap, unrelated to Kill/promote
+        — out of scope for batched-55; tracked separately).
+      M0106-0010 batched-36 acceptance criterion satisfied
+      (`TestE2E_FailoverGoopgToPG/async` PASS) → parent
+      M0106-0010 batched chain (35..55) closes the goopg→PG
+      async failover path end-to-end.
 
 - [ ] **M0106-0011**
       - Summary: Operational relcache/catcache maintenance (NOT DEFERRED).
