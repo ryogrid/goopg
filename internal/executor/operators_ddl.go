@@ -784,10 +784,13 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error {
 	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
 	idxRels := make([]storage.RelFileNode, 0, len(idxs))
+	idxOIDs := make([]uint32, 0, len(idxs))
 	for _, idx := range idxs {
 		idxRels = append(idxRels, o.ctx.Catalog.IndexRelFileNode(idx))
+		idxOIDs = append(idxOIDs, idx.OID)
 	}
 	rel := o.ctx.Catalog.RelFileNode(tbl)
+	relOID := tbl.OID
 	if err := o.ctx.Catalog.DropTable(name); err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
@@ -815,6 +818,37 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error
 		o.ctx.Pool.InvalidateRel(idxRel)
 		if err := o.ctx.Pool.Manager().DropRelation(idxRel); err != nil {
 			return &ExecError{Code: "XX000", Message: err.Error()}
+		}
+	}
+	// M0106-0011: DROP TABLE removes pg_class / pg_attribute / pg_index rows
+	// for the relation. Flag the txn so the commit-time xact-marker hook
+	// (open.go) emits RecordKindXactCommitInval and unlinks + regenerates
+	// both pg_internal.init files; without this a PG18 standby reconnecting
+	// after the DDL keeps a stale relcache entry for the dropped relation.
+	if o.ctx.TxnMgr != nil {
+		o.ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+	// M0106-0011 follow-up (a): persist the catalog heap mutation by
+	// stamping xmax on the on-disk pg_class / pg_attribute rows for the
+	// dropped table and its indexes. Without this, the in-memory drop is
+	// not reflected in the heap, and a subsequent re-Open (after clean
+	// shutdown or WAL replay) re-resolves the dropped relation through the
+	// loadUserTablesFromHeap scan. `markHeapDeleteDirty` (inside
+	// `stampCatalogRows`) WAL-logs the xmax bump so the stamp survives a
+	// crash. Gated on `catalogHeapSyncAvailable` to skip pre-M0030-0001
+	// fixtures (and the in-memory test fixture in newDDLFixture).
+	// MaterializeWriterXID ensures the transaction has a real XID before
+	// stamping xmax; DROP TABLE itself never calls writeHeapRowReturningPG
+	// so the XID would otherwise remain InvalidTransactionID (0).
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range catalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, relOID, xmax)
+				for _, idxOID := range idxOIDs {
+					deleteCatalogRowsForOID(o.ctx, dbOid, idxOID, xmax)
+				}
+			}
 		}
 	}
 	return nil
@@ -861,6 +895,8 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP INDEX requires Pool in Context"}
 	}
+	flagInval := false
+	droppedOIDs := make([]uint32, 0, len(s.Names))
 	for _, name := range s.Names {
 		idx, ok := o.ctx.Catalog.LookupIndex(name)
 		if !ok {
@@ -877,6 +913,8 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		if err := o.ctx.Catalog.DropIndex(name); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
+		flagInval = true
+		droppedOIDs = append(droppedOIDs, dropOID)
 		o.ctx.Pool.InvalidateRel(rel)
 		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
@@ -895,6 +933,31 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 			})
 			if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: fmt.Sprintf("drop-index WAL append: %v", err)}
+			}
+		}
+	}
+	// M0106-0011: DROP INDEX removes the index's pg_class row. Flag the txn
+	// so the commit-time xact-marker hook emits RecordKindXactCommitInval
+	// and refreshes pg_internal.init; without this a PG18 standby keeps a
+	// stale relcache entry for the dropped index.
+	if flagInval && o.ctx.TxnMgr != nil {
+		o.ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+	// M0106-0011 follow-up (a): stamp xmax on the on-disk pg_class row for
+	// the dropped index so a re-Open does not re-resolve the now-deleted
+	// index from `loadUserIndexesFromHeap`. `deleteCatalogRowsForOID` also
+	// touches pg_attribute (a no-op for indexes — indexes don't have
+	// pg_attribute rows in goopg's runtime layout). WAL-logged via
+	// markHeapDeleteDirty inside stampCatalogRows.
+	// MaterializeWriterXID ensures a real XID for the xmax stamp; DROP INDEX
+	// never calls writeHeapRowReturningPG so the XID would otherwise remain 0.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range catalogDBOids(o.ctx) {
+				for _, oid := range droppedOIDs {
+					deleteCatalogRowsForOID(o.ctx, dbOid, oid, xmax)
+				}
 			}
 		}
 	}
@@ -1006,6 +1069,14 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 		NotNull: col.NotNull,
 	})
 	if err == nil {
+		// M0106-0011: ALTER TABLE ADD COLUMN mutates the relation's
+		// pg_attribute row set and bumps pg_class.relnatts. Flag the txn
+		// so the commit-time xact-marker hook unlinks + regenerates
+		// pg_internal.init; a stale init file would keep a PG18 standby
+		// reading the pre-ALTER attribute count.
+		if o.ctx.TxnMgr != nil {
+			o.ctx.TxnMgr.SetRelcacheInvalPending()
+		}
 		return nil
 	}
 	if strings.Contains(strings.ToLower(err.Error()), "already exists") {
@@ -1769,7 +1840,19 @@ func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.Transa
 				if err := storage.PageSetHeapTupleXmax(page, lineNo, xmax); err != nil {
 					continue
 				}
-				_ = markHeapDeleteDirty(ctx.Pool, pinned, rel, blk, lineNo, xmax, nil)
+				// Use MarkDirtyForceFPI to emit a fresh full-page image of
+				// the post-stamp page. This overrides any stale FPI that
+				// was captured before the row existed (e.g. the mirror
+				// pg_class FPI taken at CREATE TABLE time for DBOid=5
+				// does not contain the index row added later). Without
+				// a fresh FPI, WAL replay would restore the pre-index
+				// state and the subsequent xmax stamp (if WAL-logged)
+				// would reference an invalid slot. Catalog xmax stamps
+				// survive crash recovery via the DDL WAL replay path
+				// (replayDatabaseDDLRecords / replayIndexDDLRecords);
+				// the FPI here is only needed for the heap-based catalog
+				// loader (loadUserTablesFromHeap / loadUserIndexesFromHeap).
+				ctx.Pool.MarkDirtyForceFPI(pinned)
 			}
 		}
 		pinned.Unlock()
@@ -1780,23 +1863,32 @@ func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.Transa
 // deleteCatalogRowsForOID stamps xmax on all live pg_class and pg_attribute
 // rows for relOID. Called from rollbackDDLCreate so that after a crash+restart
 // the startup catalog loader's xmax==0 filter skips the rolled-back rows.
-func deleteCatalogRowsForOID(ctx *Context, relOID uint32, xmax storage.TransactionID) {
+func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax storage.TransactionID) {
 	classRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  dbOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
 	stampCatalogRows(ctx, classRel, xmax, func(data []byte) bool {
+		// Try native format first, then PG18-canonical physical format.
+		// syncTableToCatalogHeap writes physical rows; loadUserTablesFromHeap
+		// also handles both, so we must mirror that here.
 		row, err := catalog.DecodePGClassRow(data)
+		if err != nil {
+			row, err = catalog.DecodePGClassPhysicalRow(data)
+		}
 		return err == nil && row.OID == relOID
 	})
 	attrRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  dbOid,
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
 	stampCatalogRows(ctx, attrRel, xmax, func(data []byte) bool {
 		row, err := catalog.DecodePGAttributeRow(data)
+		if err != nil {
+			row, err = catalog.DecodePGAttributePhysicalRow(data)
+		}
 		return err == nil && row.AttRelID == relOID
 	})
 }
@@ -1813,6 +1905,23 @@ func catalogHeapSyncAvailable(ctx *Context) bool {
 	pgAttr, ok := ctx.Catalog.LookupTable(
 		parser.ObjectName{Schema: "pg_catalog", Name: "pg_attribute"})
 	return ok && !pgAttr.Virtual
+}
+
+
+// catalogDBOids returns the set of database OIDs that hold catalog heap
+// pages for user relations. syncTableToCatalogHeap writes to DefaultDBOid
+// (1) and mirrors to the catalog's actual DBOID (e.g. 5 for "postgres").
+// DROP TABLE / DROP INDEX must stamp xmax in both so loadUserTablesFromHeap
+// (which reads from cat.DBOID()) does not re-resolve the dropped relation
+// after restart. Deduplication ensures DefaultDBOid is never stamped twice.
+func catalogDBOids(ctx *Context) []uint32 {
+	oids := []uint32{catalog.DefaultDBOid}
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		if dbOid := im.DBOID(); dbOid != catalog.DefaultDBOid {
+			oids = append(oids, dbOid)
+		}
+	}
+	return oids
 }
 
 // namespaceOIDForSchema maps a schema name to its pg_catalog namespace OID.
@@ -1907,6 +2016,14 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	}
 	if err := insertPgClassRelnameNspIndexEntry(ctx, idx.Name, relnamespace, classTID); err != nil {
 		return fmt.Errorf("pg_class_relname_nsp_index for index: %w", err)
+	}
+	// M0106-0011: CREATE INDEX (and ALTER TABLE ADD PRIMARY KEY) writes a
+	// pg_class row for the new index relation. Flag the txn so the commit
+	// hook emits RecordKindXactCommitInval and refreshes pg_internal.init;
+	// without this the relcache on a PG18 standby misses the new index when
+	// re-opening the parent table.
+	if ctx.TxnMgr != nil {
+		ctx.TxnMgr.SetRelcacheInvalPending()
 	}
 	// M0106-0010 batched-41: mirror catalog pages to DBOid=5 (the `postgres`
 	// database) so a PG18 standby connecting via `dbname=postgres` reads

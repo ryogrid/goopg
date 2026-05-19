@@ -192,8 +192,12 @@ func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
 	// Stamp xmax on the pg_class / pg_attribute rows so that after a
 	// crash+restart the heap loader's xmax==0 filter skips them. Without this,
 	// WAL replay restores the HeapInsert records and the table reappears.
+	// Stamp in all catalog DBOids (DefaultDBOid + mirror DBOID) so
+	// loadUserTablesFromHeap (which reads from cat.DBOID()) also sees xmax.
 	if catalogHeapSyncAvailable(ctx) && ctx.Tx.XID != storage.InvalidTransactionID {
-		deleteCatalogRowsForOID(ctx, entry.RelOID, ctx.Tx.XID)
+		for _, dbOid := range catalogDBOids(ctx) {
+			deleteCatalogRowsForOID(ctx, dbOid, entry.RelOID, ctx.Tx.XID)
+		}
 	}
 }
 

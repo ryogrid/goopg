@@ -11557,6 +11557,61 @@ relcache init → replication readiness) and intra-package grouped.
         Open follow-ups still under M0106-0011: relcache init-file
         regeneration on DDL invalidation; checkpoint/shutdown init-file
         refresh.
+      - PROGRESS 2026-05-20 (loop 32): DDL relcache-inval-pending coverage
+        widened. Before this loop, only CREATE TABLE (via
+        `syncTableToCatalogHeap`) and the VACUUM nailed-catalog path
+        flagged `mvcc.Manager.relcacheInvalPending`; DROP TABLE,
+        ALTER TABLE ADD COLUMN, CREATE INDEX, and DROP INDEX silently
+        committed without emitting `RecordKindXactCommitInval`, so a PG18
+        standby reconnecting after those DDL paths kept stale relcache
+        entries (dropped relation still resolved, ADD COLUMN off-by-one,
+        CREATE INDEX invisible on the parent). Four call-sites in
+        `internal/executor/operators_ddl.go` now flag after a successful
+        catalog mutation: `dropTableByRef`, `execAlterTableAddColumn`,
+        `syncIndexToCatalogHeap` (covers CREATE INDEX + ALTER TABLE ADD
+        PRIMARY KEY), and `execDropIndex` (gated on a per-call `flagInval`
+        so `IF EXISTS no_such_idx` stays a no-op). The commit-time hook
+        in `internal/initdb/open.go` already unlinks + regenerates both
+        `global/pg_internal.init` and `base/<dboid>/pg_internal.init`
+        whenever `TakeRelcacheInvalPending()` reports true. Regression
+        pin: `TestDDLPathsFlagRelcacheInvalPending` in
+        `internal/executor/operators_ddl_relcache_inval_test.go` with 4
+        subtests (DropTable, AlterTableAddColumn, DropIndex,
+        DropIndexIfExistsMiss — the last asserts the IF-EXISTS no-op
+        path does NOT flag, preventing spurious commit-inval records).
+        Verified: `internal/executor/` PASS 1.2s (no regressions);
+        `internal/mvcc/`/`internal/catalog/`/`internal/server/` PASS;
+        `internal/initdb/` baseline of 15 pre-existing failures unchanged;
+        `internal/wal/` 2 pre-existing failures unchanged. Design:
+        `docs/design/0106-0011-ddl-relcache-inval-coverage.md`.
+        Still-open M0106-0011 follow-ups: (a) DROP TABLE / ALTER TABLE
+        ADD COLUMN must also persist the corresponding pg_class /
+        pg_attribute heap mutations (currently only the in-memory
+        catalog is touched — the heap rows remain on disk after the
+        in-memory drop, so a re-Open re-resolves the dropped relation
+        until the clog filter from loop 30 hides it); (b) checkpoint/
+        shutdown init-file refresh for catcache-only churn that runs
+        after the relcache-inval flag is already drained.
+      - COMPLETE 2026-05-20 (loop 33): M0106-0011 follow-up (a) landed.
+        `TestDroppedTableNotVisibleAfterRestart` and
+        `TestDroppedIndexNotVisibleAfterRestart` both PASS.
+        Root-cause chain: (1) format mismatch — `deleteCatalogRowsForOID`
+        used only native-format decoder; fixed to try both native +
+        physical (same as `loadUserTablesFromHeap`). (2) XID not
+        materialized — DROP TABLE/INDEX never call `MaterializeWriterXID`,
+        so `ctx.Tx.XID == 0` skipped the stamp; fixed by materializing
+        before stamping. (3) DBOid mismatch — `loadUserTablesFromHeap`
+        reads from `cat.DBOID()`=5 but stamp only touched DefaultDBOid=1;
+        fixed via `catalogDBOids()` helper that stamps both. (4) WAL replay
+        FPI override — using WAL heap-delete records caused the stale
+        DBOid=5 FPI (captured at CREATE TABLE time, before the index row)
+        to restore the page without the index slot; fixed via new
+        `Pool.MarkDirtyForceFPI` that emits a post-stamp FPI overriding
+        the stale one. `operators_tx.go` `rollbackDDLCreate` also updated
+        to stamp both DBOids. Design: updated
+        `docs/design/0106-0011-ddl-relcache-inval-coverage.md` (follow-up
+        section added). Remaining open follow-up: (b) checkpoint/shutdown
+        init-file refresh for catcache-only churn.
 
  - [x] **M0106-0012**
       - Summary: Make TestSynchronousCommitFlushesByDefault to be passed.
@@ -11592,7 +11647,7 @@ relcache init → replication readiness) and intra-package grouped.
         and is not in scope for M0106-0012.
 
  - [ ] **M0106-0013**
-      - Summary: Make goopg use control files same as PostgreSQL
+      - Summary: Make goopg use control files same as PostgreSQL inclduing WAL generation for these control files. This is a hard requirement for goopg to be production ready. But must not be **DEFFERED**.
       - goopg currently uses original control file format like JSON and control file
         persistence logic is not same as PostgreSQL. Usage of control file is also not same as PostgreSQL. This task is to make goopg use control files same as PostgreSQL and goopg's
         durability guarantees should be same as PostgreSQL's durability guarantees after this task is done. This is a hard requirement for goopg to be production ready. But must not be **DEFFERED**.

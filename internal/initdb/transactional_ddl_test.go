@@ -281,3 +281,86 @@ func TestRollbackedTableNotVisibleAfterRestart(t *testing.T) {
 		t.Error("rollback_ghost reappeared after restart — catalog heap rows not stamped on rollback")
 	}
 }
+
+// TestDroppedTableNotVisibleAfterRestart pins M0106-0011 follow-up (a):
+// a committed DROP TABLE must stamp xmax on the on-disk pg_class /
+// pg_attribute rows so the relation does not reappear after the runtime
+// is closed and re-opened. Before the fix, `dropTableByRef` only updated
+// the in-memory catalog; the heap rows survived (xmin Committed, xmax 0)
+// and `loadUserTablesFromHeap` re-resolved the dropped relation on the
+// next Open, leaving the catalog out of sync with itself across restart.
+func TestDroppedTableNotVisibleAfterRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Phase 1: CREATE then COMMIT-ed DROP. No explicit BEGIN — both
+	// statements auto-commit through txnConn's implicit-tx path so the
+	// drop hits the real catalog-heap stamp branch (gated on a non-zero
+	// XID and catalogHeapSyncAvailable).
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := newTxnConn(rt1, t)
+	conn.run("CREATE TABLE drop_ghost (id int4, val text)")
+	if _, ok := rt1.Catalog.LookupTable(parser.ObjectName{Name: "drop_ghost"}); !ok {
+		t.Fatal("drop_ghost missing immediately after CREATE")
+	}
+	conn.run("DROP TABLE drop_ghost")
+	if _, ok := rt1.Catalog.LookupTable(parser.ObjectName{Name: "drop_ghost"}); ok {
+		t.Error("drop_ghost still in in-memory catalog after DROP")
+	}
+	rt1.Close()
+
+	// Phase 2: re-open (clean reboot + WAL replay).
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatalf("re-open after drop: %v", err)
+	}
+	defer rt2.Close()
+
+	// Phase 3: dropped table must NOT reappear.
+	if _, ok := rt2.Catalog.LookupTable(parser.ObjectName{Name: "drop_ghost"}); ok {
+		t.Error("drop_ghost reappeared after restart — DROP TABLE did not persist catalog heap stamp")
+	}
+}
+
+// TestDroppedIndexNotVisibleAfterRestart pins M0106-0011 follow-up (a):
+// a committed DROP INDEX must stamp xmax on the on-disk pg_class row for
+// the index so the index does not reappear after re-Open. Same mechanism
+// as TestDroppedTableNotVisibleAfterRestart but for the index branch of
+// `execDropIndex`.
+func TestDroppedIndexNotVisibleAfterRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := newTxnConn(rt1, t)
+	conn.run("CREATE TABLE idx_host (id int4, val text)")
+	conn.run("CREATE INDEX idx_host_id_idx ON idx_host (id)")
+	if _, ok := rt1.Catalog.LookupIndex(parser.ObjectName{Name: "idx_host_id_idx"}); !ok {
+		t.Fatal("idx_host_id_idx missing immediately after CREATE")
+	}
+	conn.run("DROP INDEX idx_host_id_idx")
+	if _, ok := rt1.Catalog.LookupIndex(parser.ObjectName{Name: "idx_host_id_idx"}); ok {
+		t.Error("idx_host_id_idx still in in-memory catalog after DROP")
+	}
+	rt1.Close()
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatalf("re-open after drop: %v", err)
+	}
+	defer rt2.Close()
+
+	if _, ok := rt2.Catalog.LookupIndex(parser.ObjectName{Name: "idx_host_id_idx"}); ok {
+		t.Error("idx_host_id_idx reappeared after restart — DROP INDEX did not persist catalog heap stamp")
+	}
+}

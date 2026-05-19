@@ -1195,6 +1195,43 @@ func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
 	p.evictMu.Unlock()
 }
 
+// MarkDirtyForceFPI emits a fresh full-page image of the current
+// slot contents, overriding any stale FPI from earlier in the same
+// checkpoint epoch. Use this when a page has been logically modified
+// (e.g. xmax stamp for a mirror catalog) after an earlier FPI was
+// captured that pre-dates the mutation. The new FPI ensures WAL
+// replay restores the post-mutation state. Caller must hold
+// s.contentMu exclusive.
+func (p *Pool) MarkDirtyForceFPI(s *Slot) {
+	if p.logFPI == nil || !p.fullPageWrites.Load() {
+		// No FPI infrastructure — plain dirty is the best we can do.
+		p.evictMu.Lock()
+		s.dirty = true
+		p.evictMu.Unlock()
+		return
+	}
+	p.evictMu.Lock()
+	tag := s.tag
+	p.evictMu.Unlock()
+
+	pageCopy := make(Page, BlockSize)
+	copy(pageCopy, s.page)
+	lsn, err := p.logFPI(tag.Rel, tag.Block, pageCopy)
+	if err != nil {
+		// Best-effort: fall back to plain dirty.
+		p.evictMu.Lock()
+		s.dirty = true
+		p.evictMu.Unlock()
+		return
+	}
+	// Set page LSN while holding content lock (caller responsibility).
+	MustHeader(s.page).SetLSN(lsn)
+	p.evictMu.Lock()
+	s.dirty = true
+	s.fpiSinceCheckpoint = true
+	p.evictMu.Unlock()
+}
+
 // MarkDirtyChangeRecord is the change-record-aware variant of
 // MarkDirty. The first dirty in each checkpoint epoch emits an
 // FPI as the baseline (and ignores `emitter`); subsequent dirties
