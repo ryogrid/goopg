@@ -829,7 +829,15 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	// since-superseded SELECT FOR UPDATE. No-op when no bits
 	// were set (the pre-M0021 case).
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
-	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask
+	// Clear lock-only bits AND HeapXmaxInvalid so isConcurrentlyUpdated
+	// sees a real delete/update stamp. HeapXmaxInvalid is set by canonical-WAL
+	// inserts (writeHeapRowReturningPG / writeHeapRowReturning when
+	// ctx.LogCanonical != nil) to signal "xmax is not a deleter" on fresh rows.
+	// Failing to clear it here causes isConcurrentlyUpdated to return false
+	// for any tuple written via the canonical path, silently skipping the EPQ
+	// wait loop on concurrent DELETE/UPDATE. Mirrors PG's heap_update /
+	// heap_delete which clear HEAP_XMAX_INVALID before re-stamping xmax.
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	// Advance pd_prune_xid so opportunistic pruning knows when
 	// this page first became prunable (M0046-0002).
@@ -881,7 +889,11 @@ func PageSetHeapTupleMovedPartition(p Page, slot uint16, xmax TransactionID) err
 	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(InvalidBlockNumber))
 	binary.LittleEndian.PutUint16(p[off+16:off+18], MovedPartitionsOffsetNumber)
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
-	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask
+	// Also clear HeapXmaxInvalid — canonical-WAL inserts set it to mark
+	// "xmax is not a deleter"; a moved-partition stamp IS a real xmax and
+	// must clear the flag so isConcurrentlyUpdated detects the concurrent
+	// update. Mirrors PageSetHeapTupleXmax and PG's heap_update behaviour.
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
 		MustHeader(p).SetPruneXID(uint32(xmax))
