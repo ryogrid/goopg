@@ -2161,7 +2161,7 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         `sync_on` sibling scenario was added in the same file and also passes;
         that is extra coverage beyond the original two-subtest DoD.
 
-- [ ] **M0102-0007**
+- [x] **M0102-0007**
       - Summary: Scenario B E2E test: goopg primary + PG standby.
       - Design doc: `docs/design/0102-0003-heterogeneous-failover-e2e-harness.md`.
       - File: `internal/testport/e2e_failover_goopg_to_pg_test.go`. Same two
@@ -2184,13 +2184,11 @@ Depends on: M0005, M0094 (M0094-0005 written_lsn fix), M0101.
         (2) goopg's replication parser rejected upstream physical
         `START_REPLICATION 0/0` syntax with the optional `PHYSICAL` keyword
         omitted; `parseStartReplicationArgs` now accepts that upstream form.
-      - Current status: Scenario B is still NOT green. `pg_basebackup -X stream`
-        exposed a sender-side physical-WAL interoperability gap, so the tree
-        now contains an in-progress raw-WAL sender path (`internal/wal/iterator.go`
-        `NextRaw`, plus physical walsender changes). There is still no passing
-        end-to-end validation for `TestE2E_FailoverGoopgToPG/async`, and the
-        sync sibling has not been attempted yet. Treat M0102-0007 as the active
-        open task.
+      - COMPLETE 2026-05-20: Both `async` and `sync_remote_apply` subtests pass.
+        Async: confirmed via M0106-0006 (2026-05-20). Sync: fixed via M0105-0008
+        (`pg_stat_replication.sync_state` now reflects the SyncRep rule).
+        Verified: `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -run TestE2E_FailoverGoopgToPG
+        ./internal/testport/` → async PASS (1.81s) + sync_remote_apply PASS (1.59s).
 
 - [ ] **M0102-0008**
       - Summary: Close milestone.
@@ -2292,16 +2290,25 @@ Design doc: `docs/design/0105-0001-heap-page-and-tuple-format-parity.md`
         this, the E2E async test times out at 15 minutes.
       - File: `internal/server/replication.go`, `internal/wal/`
 
-- [ ] **M0105-0008**
+- [x] **M0105-0008**
       - Summary: Complete goopg→PG E2E failover test run.
-      - After M0105-0007 WAL sender fix, run `TestE2E_FailoverGoopgToPG`
-        through to completion:
-        `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -v -run TestE2E_FailoverGoopgToPG -timeout 15m ./internal/testport/`
-        Both `async` and `sync_remote_apply` subtests must pass:
-        pg_basebackup completes, PG standby starts, WAL streams, data
-        replicates, SIGKILL + promote works, post-failover INSERT succeeds,
-        zero-loss invariant holds for sync mode.
-      - Depends on: M0105-0007, M0105-0009, M0105-0010.
+      - COMPLETE 2026-05-20: Both `async` and `sync_remote_apply` subtests
+        pass end-to-end.
+      - Root cause of sync_remote_apply failure: `pg_stat_replication.sync_state`
+        was hard-coded to `"async"` in `registerStatReplicationView`; the test
+        waited for `sync_state = 'sync'` on `pg_standby`.
+      - Fix: added `SyncStateFor(appName) string` and `SyncPriorityFor(appName) int`
+        public methods on `*wal.SyncRep` (backed by `syncRepRule.syncStateFor` /
+        `syncRepRule.syncPriorityFor` helpers — FIRST n semantics: first n listed
+        are "sync", rest "potential"; ANY n: all listed are "sync").
+        `registerStatReplicationView` gains a `*wal.SyncRep` parameter so the
+        VirtualRows closure can call `syncState(syncRep, s.ApplicationName)`.
+        Call site in `open.go` passes `syncRep`. Unit tests in `syncrep_test.go`:
+        `TestSyncStateForFirstMode`, `TestSyncStateForAnyMode`,
+        `TestSyncPriorityFor`, `TestSyncStateForBareList`.
+      - Design: `docs/design/0105-0008-sync-state-pg-stat-replication.md`.
+      - Verified: `go test -race ./internal/wal/ ./internal/initdb/ ./internal/server/` PASS;
+        `GOOPG_RUN_BLOCKED_M0102_E2E=1 go test -run TestE2E_FailoverGoopgToPG ./internal/testport/` → async PASS + sync_remote_apply PASS.
 
 - [x] **M0105-0009**
       - Summary: Fix PG standby hot standby readiness (pg_ctl timeout).

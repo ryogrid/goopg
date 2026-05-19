@@ -354,3 +354,78 @@ func TestSyncRepSetStandbyNamesReleasesOnRelaxation(t *testing.T) {
 		t.Fatalf("WaitForLSN did not return after rule relaxation")
 	}
 }
+
+func TestSyncStateForFirstMode(t *testing.T) {
+	s := NewSyncRep()
+	// No rule: all async.
+	if got := s.SyncStateFor("any"); got != "async" {
+		t.Fatalf("no-rule: got %q want async", got)
+	}
+	// FIRST 1 (a, b): a=sync, b=potential, c=async.
+	if err := s.SetStandbyNames("FIRST 1 (a, b)"); err != nil {
+		t.Fatalf("SetStandbyNames: %v", err)
+	}
+	cases := []struct {
+		name string
+		want string
+	}{
+		{"a", "sync"},
+		{"b", "potential"},
+		{"c", "async"},
+	}
+	for _, tc := range cases {
+		if got := s.SyncStateFor(tc.name); got != tc.want {
+			t.Errorf("SyncStateFor(%q) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestSyncStateForAnyMode(t *testing.T) {
+	s := NewSyncRep()
+	if err := s.SetStandbyNames("ANY 1 (a, b)"); err != nil {
+		t.Fatalf("SetStandbyNames: %v", err)
+	}
+	if got := s.SyncStateFor("a"); got != "sync" {
+		t.Errorf("ANY: a = %q, want sync", got)
+	}
+	if got := s.SyncStateFor("b"); got != "sync" {
+		t.Errorf("ANY: b = %q, want sync", got)
+	}
+	if got := s.SyncStateFor("c"); got != "async" {
+		t.Errorf("ANY: c = %q, want async", got)
+	}
+}
+
+func TestSyncPriorityFor(t *testing.T) {
+	s := NewSyncRep()
+	if err := s.SetStandbyNames("FIRST 1 (a, b)"); err != nil {
+		t.Fatalf("SetStandbyNames: %v", err)
+	}
+	cases := []struct {
+		name string
+		want int
+	}{
+		{"a", 1},
+		{"b", 2},
+		{"c", 0},
+	}
+	for _, tc := range cases {
+		if got := s.SyncPriorityFor(tc.name); got != tc.want {
+			t.Errorf("SyncPriorityFor(%q) = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestSyncStateForBareList(t *testing.T) {
+	// Bare list "pg_standby" parses as FIRST 1 ['pg_standby'].
+	s := NewSyncRep()
+	if err := s.SetStandbyNames("pg_standby"); err != nil {
+		t.Fatalf("SetStandbyNames: %v", err)
+	}
+	if got := s.SyncStateFor("pg_standby"); got != "sync" {
+		t.Errorf("bare-list pg_standby = %q, want sync", got)
+	}
+	if got := s.SyncStateFor("other"); got != "async" {
+		t.Errorf("bare-list other = %q, want async", got)
+	}
+}

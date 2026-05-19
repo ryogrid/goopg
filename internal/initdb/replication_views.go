@@ -31,7 +31,7 @@ import (
 // counters live alongside the per-sender LSN fields here so an
 // operator's `\watch pg_stat_replication` shows ring health in
 // the same query.
-func registerStatReplicationView(cat *catalog.InMemory, senders *wal.Senders, writer *wal.Writer) error {
+func registerStatReplicationView(cat *catalog.InMemory, senders *wal.Senders, writer *wal.Writer, syncRep *wal.SyncRep) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
 		Name:   "pg_stat_replication",
@@ -105,8 +105,8 @@ func registerStatReplicationView(cat *catalog.InMemory, senders *wal.Senders, wr
 				"00:00:00", // write_lag: lag intervals not wired in v0
 				"00:00:00", // flush_lag
 				"00:00:00", // replay_lag
-				"0",        // sync_priority: no synchronous replication in v0
-				"async",    // sync_state: hard-coded to async in v0
+				syncPriority(syncRep, s.ApplicationName), // sync_priority
+				syncState(syncRep, s.ApplicationName),    // sync_state
 				"",         // reply_time: not tracked per-message in v0
 				s.SlotName, // slot_name
 				hitsStr,
@@ -117,6 +117,24 @@ func registerStatReplicationView(cat *catalog.InMemory, senders *wal.Senders, wr
 		return out
 	}
 	return cat.RegisterVirtualTable(tbl)
+}
+
+// syncState returns the pg_stat_replication.sync_state string for appName.
+// Returns "async" when syncRep is nil (no synchronous replication configured).
+func syncState(syncRep *wal.SyncRep, appName string) string {
+	if syncRep == nil {
+		return "async"
+	}
+	return syncRep.SyncStateFor(appName)
+}
+
+// syncPriority returns the pg_stat_replication.sync_priority integer string
+// for appName. Returns "0" when syncRep is nil.
+func syncPriority(syncRep *wal.SyncRep, appName string) string {
+	if syncRep == nil {
+		return "0"
+	}
+	return fmt.Sprintf("%d", syncRep.SyncPriorityFor(appName))
 }
 
 // registerStatWalReceiverView installs `pg_catalog.pg_stat_wal_receiver`

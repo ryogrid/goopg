@@ -16,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/aio"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
@@ -755,6 +756,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// M0106-0013: advance the catalog OID counter to match pg_control's
+	// checkPointCopy.nextOid from the most recent checkpoint. This ensures
+	// the OID counter survives a crash (pg_control is durably updated at
+	// every checkpoint) even when pg_catalog.json is absent or stale.
+	// We take the max of the JSON-loaded value and the pg_control value
+	// so both sources contribute to a monotonically advancing counter.
+	if pgCtrl, pce := control.ReadControlFile(abs); pce == nil && pgCtrl != nil {
+		cat.AdvanceNextOIDPast(pgCtrl.CheckPointCopyNextOid)
+	}
 	cat.SetDBOID(detectCatalogDBOID(abs))
 	// Upgrade path: if the clog is empty (old cluster started before M0030-0007
 	// landed), initialize all prior XIDs as committed so loadUserTablesFromHeap
@@ -834,6 +844,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: user table heap load: %w", err)
+	}
+
+	// M0106-0013: after loading user tables from heap, advance the OID
+	// counter past every OID seen in the heap pages. This ensures the
+	// counter never re-uses an OID already present on disk even when
+	// pg_catalog.json is absent (e.g. after a crash before SaveCatalog
+	// ran). The pg_control read earlier covers the checkpoint-based
+	// advance; this covers the residual gap between the last checkpoint
+	// and the crash.
+	for _, tbl := range cat.AllTables() {
+		if tbl.OID >= catalog.FirstUserOID {
+			cat.AdvanceNextOIDPast(tbl.OID)
+		}
 	}
 
 	// M0054-0001: replay CREATE/DROP DATABASE WAL records into the
@@ -921,6 +944,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// after the basebackup hid every user tuple created by goopg
 		// after initdb.
 		NextXIDFn: func() uint64 { return uint64(txnMgr.NextXID()) },
+		// M0106-0013: wire the catalog's OID counter so each checkpoint
+		// embeds the live nextOid into pg_control and the WAL record.
+		// A crashed cluster can then recover nextOid from pg_control
+		// without depending on pg_catalog.json.
+		NextOIDFn: cat.NextOID,
 		// M0106-0011 follow-up (b): regenerate pg_internal.init after
 		// each checkpoint so PG standbys can always attach. Uses
 		// WithRelCacheInitLock to prevent TOCTOU races with concurrent
@@ -950,7 +978,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// pg_stat_replication: one row per active walsender. Backed by
 	// the in-process Senders registry — walsender goroutines
 	// register themselves on entry and unregister on exit.
-	if err := registerStatReplicationView(cat, walSenders, walWriter); err != nil {
+	if err := registerStatReplicationView(cat, walSenders, walWriter, syncRep); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
@@ -1986,6 +2014,23 @@ func (r *Runtime) SaveCatalog() error {
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("goopg: rename catalog snapshot: %w", err)
+	}
+	// M0106-0013: also persist nextOid in pg_control so a subsequent
+	// crash-recovery startup can recover the OID counter without relying
+	// on pg_catalog.json alone. This is a belt-and-suspenders write on
+	// top of the checkpoint-time update (NextOIDFn in CheckpointerConfig);
+	// during a clean shutdown the checkpointer may not have fired since
+	// the last OID allocation.
+	if r.DataDir != "" {
+		nextOid := cat.NextOID()
+		if werr := control.UpdateControlFile(r.DataDir, func(cd *control.ControlFileData) {
+			if nextOid > cd.CheckPointCopyNextOid {
+				cd.CheckPointCopyNextOid = nextOid
+			}
+		}); werr != nil {
+			// Non-fatal: the JSON snapshot is already written; log and continue.
+			slog.Warn("SaveCatalog: pg_control nextOid update failed", "err", werr)
+		}
 	}
 	return nil
 }
