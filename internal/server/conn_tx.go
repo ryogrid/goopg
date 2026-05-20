@@ -41,6 +41,10 @@ type connTxState struct {
 	// Wired by serveConn after creating the session context; stmt-level
 	// contexts are acquired as children in dispatchSimpleQueryViaExecutor.
 	SessCtx *mctx.Context
+	// ProcNum is the backend's slot index in the Manager's ProcArray.
+	// Assigned once at connection start in serveConn; used to pass an
+	// explicit procNum to Manager.Begin on every statement.
+	ProcNum int32
 	// TempTableShadows maps table name → original permanent *catalog.Table.
 	// Populated when CREATE TEMP TABLE shadows a permanent table. M0097-0003.
 	TempTableShadows map[string]*catalog.Table

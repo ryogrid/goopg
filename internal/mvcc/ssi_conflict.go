@@ -42,8 +42,8 @@ import (
 // of R), which is bounded by the small number of concurrent
 // SERIALIZABLE writers in practice.
 func (m *Manager) CheckForSerializableConflictOut(readerHandle TxnHandle, writerXID storage.TransactionID) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	return m.checkForSerializableConflictOutLocked(readerHandle, writerXID)
 }
 
@@ -92,7 +92,7 @@ func (m *Manager) checkForSerializableConflictOutLocked(readerHandle TxnHandle, 
 // max_connections) that a linear scan is well under the cost of an
 // extra map.
 //
-// Callers must hold m.mu.
+// Callers must hold m.ssiMu.
 func (m *Manager) serializableXactByXIDLocked(xid storage.TransactionID) *SerializableXact {
 	if xid == storage.InvalidTransactionID || m.ssiState.xacts == nil {
 		return nil
@@ -110,8 +110,8 @@ func (m *Manager) serializableXactByXIDLocked(xid storage.TransactionID) *Serial
 // gains from. Returns true iff the edge was new; an existing edge is
 // a no-op (idempotent).
 //
-// Caller must hold m.mu (the slices are not goroutine-safe — they're
-// embedded in SerializableXact, which is only mutated under m.mu).
+// Caller must hold m.ssiMu (the slices are not goroutine-safe — they're
+// embedded in SerializableXact, which is only mutated under m.ssiMu).
 func registerRWConflictLocked(from, to *SerializableXact) bool {
 	for _, peer := range from.outConflicts {
 		if peer == to {
@@ -129,7 +129,7 @@ func registerRWConflictLocked(from, to *SerializableXact) bool {
 // not retain dangling pointers once dying is removed from
 // ssiState.xacts.
 //
-// Caller must hold m.mu.
+// Caller must hold m.ssiMu.
 func removeSerializableXactFromPeersLocked(dying *SerializableXact) {
 	for _, peer := range dying.outConflicts {
 		peer.inConflicts = removeSerializableXactFromSlice(peer.inConflicts, dying)
@@ -164,8 +164,8 @@ func removeSerializableXactFromSlice(slice []*SerializableXact, target *Serializ
 // pre-commit dangerous-structure check (M0104-0006) walks the slices
 // directly. Returns 0 for non-SERIALIZABLE or unknown handles.
 func (m *Manager) OutConflictCount(handle TxnHandle) int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	if m.ssiState.xacts == nil {
 		return 0
 	}
@@ -180,8 +180,8 @@ func (m *Manager) OutConflictCount(handle TxnHandle) int {
 // handle. Mirror of OutConflictCount on the receiving side. Returns 0
 // for non-SERIALIZABLE or unknown handles.
 func (m *Manager) InConflictCount(handle TxnHandle) int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	if m.ssiState.xacts == nil {
 		return 0
 	}
@@ -226,8 +226,8 @@ func (m *Manager) InConflictCount(handle TxnHandle) int {
 // reader), bounded by the small number of concurrent SERIALIZABLE
 // writers in practice.
 func (m *Manager) CheckForSerializableConflictIn(writerHandle TxnHandle, tag PredicateLockTag) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	return m.checkForSerializableConflictInLocked(writerHandle, tag)
 }
 
@@ -312,8 +312,8 @@ func coveringPredicateLockTags(tag PredicateLockTag) []PredicateLockTag {
 // should not consult this number directly (use the conflict-graph
 // walker that lands with M0104-0006).
 func (m *Manager) HasRWConflict(from, to TxnHandle) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	if m.ssiState.xacts == nil {
 		return false
 	}

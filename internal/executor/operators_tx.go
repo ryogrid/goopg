@@ -79,7 +79,7 @@ func (o *transactionOp) execBegin() error {
 		_ = o.ctx.Session.SetIsolationLevel(parsed)
 		level = parsed
 	}
-	tx, err := o.ctx.TxnMgr.Begin(level)
+	tx, err := o.ctx.TxnMgr.Begin(level, o.ctx.ProcNum)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}

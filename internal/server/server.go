@@ -767,7 +767,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app, sessCtx)
+	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app, sessCtx, pid)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -945,9 +945,13 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // simple Query messages into handleQuery; Terminate closes the connection
 // cleanly; anything else is an "unsupported" ErrorResponse followed by
 // another ReadyForQuery so the client can keep going.
-func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName string, sessCtx *mctx.Context) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName string, sessCtx *mctx.Context, pid uint32) {
 	extended := newExtendedState()
-	connTx := &connTxState{SessCtx: sessCtx} // per-connection explicit transaction state (M0096-0005)
+	// Assign a ProcArray slot for this backend (M0107-0004). The slot is
+	// reused across all transactions on this connection; Begin clears and
+	// re-initialises it on each new transaction.
+	procNum := int32((pid-1) % uint32(mvcc.DefaultProcArraySize))
+	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum} // per-connection explicit transaction state (M0096-0005)
 	prepStmts := newPreparedStatements() // per-connection prepared statements (M0096-0006)
 	var copyIn *copyInState
 	for {

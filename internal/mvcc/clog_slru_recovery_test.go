@@ -69,8 +69,9 @@ func TestEnablePGSLRUMirrorFlatFileWinsIfNewer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pre-populate c.data from "flat file" with XID=3 committed.
-	c := &CLog{path: flatPath, data: []byte{0, byte(TxnStatusUnknown), byte(TxnStatusUnknown), byte(TxnStatusCommitted)}}
+	// Pre-populate banks from "flat file" with XID=3 committed.
+	c := &CLog{path: flatPath}
+	c.distributeToBanks([]byte{0, byte(TxnStatusUnknown), byte(TxnStatusUnknown), byte(TxnStatusCommitted)})
 
 	if err := c.EnablePGSLRUMirror(slruDir); err != nil {
 		t.Fatalf("EnablePGSLRUMirror: %v", err)
@@ -86,11 +87,12 @@ func TestEnablePGSLRUMirrorFlatFileWinsIfNewer(t *testing.T) {
 // the highest XID that has a non-Unknown status in the clog.
 func TestHighestKnownXIDReturnsMaxTerminalXID(t *testing.T) {
 	c := &CLog{}
-	c.data = make([]byte, 10)
-	c.data[3] = byte(TxnStatusCommitted)
-	c.data[5] = byte(TxnStatusAborted)
-	c.data[7] = byte(TxnStatusCommitted)
-	// c.data[8], [9] remain Unknown.
+	flat := make([]byte, 10)
+	flat[3] = byte(TxnStatusCommitted)
+	flat[5] = byte(TxnStatusAborted)
+	flat[7] = byte(TxnStatusCommitted)
+	// flat[8], [9] remain Unknown.
+	c.distributeToBanks(flat)
 
 	got := c.HighestKnownXID()
 	if got != storage.TransactionID(7) {
@@ -123,8 +125,8 @@ func TestLoadFromSLRU_SegFileNotMultipleOfBlockSize(t *testing.T) {
 	}
 
 	c := &CLog{}
-	if err := c.loadFromSLRULocked(slruDir); err != nil {
-		t.Fatalf("loadFromSLRULocked: %v", err)
+	if err := c.loadFromSLRU(slruDir); err != nil {
+		t.Fatalf("loadFromSLRU: %v", err)
 	}
 	if got := c.GetStatus(3); got != TxnStatusCommitted {
 		t.Errorf("XID 3: got %v want TxnStatusCommitted", got)

@@ -122,6 +122,11 @@ type Context struct {
 	// policy from M0012-0002 relies on the monotonic shape.
 	BackendID lockmgr.BackendID
 
+	// ProcNum is the backend's slot index in the Manager's ProcArray.
+	// Set once per connection in serveConn and carried on every ectx so
+	// operators that call TxnMgr.Begin (e.g. execBegin) can supply it.
+	ProcNum int32
+
 	// WorkTableRows is set by RecursiveUnionOp during fixpoint
 	// iteration and read by WorkTableScanOp to produce rows from
 	// the current working table. M0016-0004 (recursive CTE).

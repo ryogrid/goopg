@@ -2333,7 +2333,7 @@ Operational policy (2026-05-20):
         All 9 affected packages pass -race. Design doc updated.
         M0107-0003 Phase C code work COMPLETE. TPS gates require D1+D2.
 
- - [ ] **M0107-0004 — Phase D1: ProcArray + atomic XidGen + CLOG bank locks**
+ - [x] **M0107-0004 — Phase D1: ProcArray + atomic XidGen + CLOG bank locks**
       - Summary: Replace `mvcc.Manager.mu` (gates Begin/SnapshotFor/Commit/
         OldestXmin/finish; 92 % write delay) with three systems per
         `04-mvcc-procarray.md`: (a) `ProcArray` with per-slot 64 B
@@ -2352,6 +2352,17 @@ Operational policy (2026-05-20):
         ≥ 2 000 (vs 347); `mvcc.Manager.*` absent from mutex top-20;
         `TestE2E_FailoverGoopgToPG/async` PASS; `make ralph-state-guard` PASS.
       - Co-lands with M0107-0005 (shared `procNum` identity).
+      - COMPLETE 2026-05-21 (loop 9): ProcArray + XidGen + CLOG bank locks landed.
+        New files: `internal/mvcc/procarray.go` (64B procSlot + ProcArray), `xidgen.go`
+        (atomic pre-increment XidGen). `manager.go` refactored: `mu` removed from hot path;
+        `SnapshotFor` now lock-free ProcArray walk; `Begin`/`Commit`/`Rollback` use atomic
+        slot ops + dedicated sub-mutexes (`abortedMu`, `ssiMu`, `waitMu`). Variadic
+        `Begin(iso, procNums ...int32)` preserves backward compat for all existing test
+        call sites. `clog.go` rewritten with per-bank `RWMutex` (128K xids/bank). Key
+        bug fixed: `OldestXmin()` must skip idle slots (zero xmin would anchor vacuum at 0).
+        `executor.Context.ProcNum` added; `connTxState.ProcNum` threaded from `serveConn`.
+        Design: `docs/design/0107-0004-procarray-xidgen-clog-bank-locks.md`.
+        All 11 key packages pass with -race.
 
  - [ ] **M0107-0005 — Phase D2: per-backend `wait_event_info`**
       - Summary: Replace `activity.Registry` single `RWMutex` +

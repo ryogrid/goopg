@@ -192,9 +192,9 @@ func TestSerializableXact_PeerEdgesScrubbedOnCommit(t *testing.T) {
 		t.Fatalf("Commit writer: %v", err)
 	}
 
-	m.mu.Lock()
+	m.ssiMu.Lock()
 	got := len(readerSX.outConflicts)
-	m.mu.Unlock()
+	m.ssiMu.Unlock()
 	if got != 0 {
 		t.Fatalf("readerSX.outConflicts after writer Commit = %d, want 0 (peer scrub)", got)
 	}
@@ -220,9 +220,9 @@ func TestSerializableXact_PeerEdgesScrubbedOnAbort(t *testing.T) {
 		t.Fatalf("Rollback reader: %v", err)
 	}
 
-	m.mu.Lock()
+	m.ssiMu.Lock()
 	got := len(writerSX.inConflicts)
-	m.mu.Unlock()
+	m.ssiMu.Unlock()
 	if got != 0 {
 		t.Fatalf("writerSX.inConflicts after reader Rollback = %d, want 0 (peer scrub)", got)
 	}
@@ -512,9 +512,9 @@ func TestCheckForSerializableConflictIn_PeerEdgesScrubbedOnReaderCommit(t *testi
 		t.Fatalf("Commit reader: %v", err)
 	}
 
-	m.mu.Lock()
+	m.ssiMu.Lock()
 	got := len(writerSX.inConflicts)
-	m.mu.Unlock()
+	m.ssiMu.Unlock()
 	if got != 0 {
 		t.Fatalf("writerSX.inConflicts after reader Commit = %d, want 0 (peer scrub)", got)
 	}

@@ -24,15 +24,73 @@ const (
 	TxnStatusAborted TxnStatus = 2
 )
 
+// xidsPerBank is the number of XIDs managed by a single clogBank. 128K XIDs
+// per bank gives fine-grained locking: concurrent commits on different banks
+// never contend on the same mutex.
+const xidsPerBank = 128 * 1024
+
+// clogBank holds the per-bank lock and XID status bytes.
+type clogBank struct {
+	mu   sync.RWMutex
+	data []byte // len == xidsPerBank slots; grown on first write
+}
+
 // CLog is a flat-file persistent commit log that maps transaction IDs to their
 // terminal status. One byte per XID; stored at <DataDir>/global/pg_xact.
 //
-// Thread-safe: all public methods hold mu for the duration of the operation.
+// Thread-safe: GetStatus and setStatus contend only on the relevant bank's
+// mutex. Concurrent commits hitting different XID banks proceed in parallel.
+// banksMu is held (write) only when the banks slice itself must grow.
 type CLog struct {
-	mu      sync.RWMutex
 	path    string
-	data    []byte // data[xid] = TxnStatus; grows on demand
-	slruDir string // optional: PG-canonical pg_xact/ SLRU directory; empty = mirror disabled
+	banks   []*clogBank  // indexed by xid/xidsPerBank; grows on demand
+	banksMu sync.RWMutex // protects banks slice growth only
+	slruDir string       // optional: PG-canonical pg_xact/ SLRU directory; empty = mirror disabled
+}
+
+// bankIdx returns the bank index for xid.
+func bankIdx(xid storage.TransactionID) int {
+	return int(xid) / xidsPerBank
+}
+
+// byteIdx returns the byte offset within its bank for xid.
+func byteIdx(xid storage.TransactionID) int {
+	return int(xid) % xidsPerBank
+}
+
+// getOrCreateBank returns the bank for the given index, creating it (and any
+// intermediate banks) if needed. Acquires banksMu.Lock() only when the slice
+// must grow.
+func (c *CLog) getOrCreateBank(idx int) *clogBank {
+	c.banksMu.RLock()
+	if idx < len(c.banks) && c.banks[idx] != nil {
+		b := c.banks[idx]
+		c.banksMu.RUnlock()
+		return b
+	}
+	c.banksMu.RUnlock()
+
+	c.banksMu.Lock()
+	defer c.banksMu.Unlock()
+	// Grow slice to hold idx.
+	for len(c.banks) <= idx {
+		c.banks = append(c.banks, nil)
+	}
+	if c.banks[idx] == nil {
+		c.banks[idx] = &clogBank{}
+	}
+	return c.banks[idx]
+}
+
+// getBank returns the bank for the given index if it exists, or nil. Does not
+// create a new bank. Used for read-only lookups.
+func (c *CLog) getBank(idx int) *clogBank {
+	c.banksMu.RLock()
+	defer c.banksMu.RUnlock()
+	if idx < len(c.banks) {
+		return c.banks[idx]
+	}
+	return nil
 }
 
 // OpenCLog opens (or creates) the commit log at path. If the file exists its
@@ -42,7 +100,8 @@ func OpenCLog(path string) (*CLog, error) {
 	c := &CLog{path: path}
 	raw, err := os.ReadFile(path)
 	if err == nil {
-		c.data = raw
+		// Distribute loaded bytes to banks by XID range.
+		c.distributeToBanks(raw)
 		return c, nil
 	}
 	if os.IsNotExist(err) {
@@ -51,24 +110,80 @@ func OpenCLog(path string) (*CLog, error) {
 	return nil, fmt.Errorf("clog: read %q: %w", path, err)
 }
 
+// distributeToBanks populates banks from a flat byte slice (as read from disk).
+// Each byte at index i represents XID i.
+func (c *CLog) distributeToBanks(raw []byte) {
+	if len(raw) == 0 {
+		return
+	}
+	// Calculate how many banks are needed.
+	lastXID := len(raw) - 1
+	maxBankIdx := lastXID / xidsPerBank
+
+	c.banksMu.Lock()
+	for len(c.banks) <= maxBankIdx {
+		c.banks = append(c.banks, nil)
+	}
+	c.banksMu.Unlock()
+
+	for bi := 0; bi <= maxBankIdx; bi++ {
+		start := bi * xidsPerBank
+		end := start + xidsPerBank
+		if end > len(raw) {
+			end = len(raw)
+		}
+		chunk := make([]byte, end-start)
+		copy(chunk, raw[start:end])
+
+		c.banksMu.Lock()
+		if c.banks[bi] == nil {
+			c.banks[bi] = &clogBank{}
+		}
+		c.banks[bi].data = chunk
+		c.banksMu.Unlock()
+	}
+}
+
 // IsEmpty reports whether the clog has no entries yet (file was absent or the
 // on-disk data is zero-length). Used by Open to detect the upgrade case.
 func (c *CLog) IsEmpty() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.data) == 0
+	c.banksMu.RLock()
+	nBanks := len(c.banks)
+	c.banksMu.RUnlock()
+	if nBanks == 0 {
+		return true
+	}
+	// Check if any bank has data.
+	for bi := 0; bi < nBanks; bi++ {
+		b := c.getBank(bi)
+		if b == nil {
+			continue
+		}
+		b.mu.RLock()
+		n := len(b.data)
+		b.mu.RUnlock()
+		if n > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // GetStatus returns the recorded status for xid. Returns TxnStatusUnknown if
 // xid has no entry (transaction never finished or XID is out of range).
 func (c *CLog) GetStatus(xid storage.TransactionID) TxnStatus {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	idx := int(xid)
-	if idx >= len(c.data) {
+	bi := bankIdx(xid)
+	byt := byteIdx(xid)
+	b := c.getBank(bi)
+	if b == nil {
 		return TxnStatusUnknown
 	}
-	return TxnStatus(c.data[idx])
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if byt >= len(b.data) {
+		return TxnStatusUnknown
+	}
+	return TxnStatus(b.data[byt])
 }
 
 // SetCommitted marks xid as committed and persists the change to disk.
@@ -89,20 +204,24 @@ func (c *CLog) InitializeAsCommitted(highXID storage.TransactionID) error {
 	if highXID == 0 {
 		return nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	top := int(highXID)
-	// Grow if needed.
-	for len(c.data) < top {
-		c.data = append(c.data, byte(TxnStatusUnknown))
-	}
-	// Mark [1, top) as committed, preserving any entries already set.
+	// Mark [1, top) as committed per bank, preserving any entries already set.
 	for i := 1; i < top; i++ {
-		if c.data[i] == byte(TxnStatusUnknown) {
-			c.data[i] = byte(TxnStatusCommitted)
+		xid := storage.TransactionID(i)
+		bi := bankIdx(xid)
+		byt := byteIdx(xid)
+		b := c.getOrCreateBank(bi)
+		b.mu.Lock()
+		// Grow bank data if needed.
+		for len(b.data) <= byt {
+			b.data = append(b.data, byte(TxnStatusUnknown))
 		}
+		if b.data[byt] == byte(TxnStatusUnknown) {
+			b.data[byt] = byte(TxnStatusCommitted)
+		}
+		b.mu.Unlock()
 	}
-	return os.WriteFile(c.path, c.data, 0600)
+	return c.flush()
 }
 
 // MarkUnknownAsAborted marks every XID in the range [1, highXID) whose current
@@ -124,30 +243,33 @@ func (c *CLog) MarkUnknownAsAborted(highXID storage.TransactionID) error {
 	if highXID == 0 {
 		return nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	top := int(highXID)
-	// Grow data to include the full sweep range. Newly-appended slots
-	// default to TxnStatusUnknown and will be stamped Aborted below
-	// (these correspond to xids that were allocated but whose status
-	// was never written, e.g. crashed in progress).
-	for len(c.data) < top {
-		c.data = append(c.data, byte(TxnStatusUnknown))
-	}
 	dirty := false
 	for i := 1; i < top; i++ {
-		if c.data[i] == byte(TxnStatusUnknown) {
-			c.data[i] = byte(TxnStatusAborted)
+		xid := storage.TransactionID(i)
+		bi := bankIdx(xid)
+		byt := byteIdx(xid)
+		b := c.getOrCreateBank(bi)
+		b.mu.Lock()
+		// Grow bank data if needed; newly-appended slots default to Unknown
+		// and will be stamped Aborted (crashed-in-progress xids).
+		for len(b.data) <= byt {
+			b.data = append(b.data, byte(TxnStatusUnknown))
+		}
+		if b.data[byt] == byte(TxnStatusUnknown) {
+			b.data[byt] = byte(TxnStatusAborted)
 			dirty = true
-			if err := c.mirrorToSLRULocked(storage.TransactionID(i), TxnStatusAborted); err != nil {
+			if err := c.mirrorToSLRUUnlocked(xid, TxnStatusAborted); err != nil {
+				b.mu.Unlock()
 				return err
 			}
 		}
+		b.mu.Unlock()
 	}
 	if !dirty {
 		return nil
 	}
-	return os.WriteFile(c.path, c.data, 0600)
+	return c.flush()
 }
 
 // setStatus updates data[xid] = status and rewrites the file. When a PG SLRU
@@ -156,21 +278,76 @@ func (c *CLog) MarkUnknownAsAborted(highXID storage.TransactionID) error {
 // the basebackup-shipped pg_xact/ via SimpleLruReadPage_ReadOnly observes the
 // correct status. M0106-0010 batched-44.
 func (c *CLog) setStatus(xid storage.TransactionID, status TxnStatus) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	idx := int(xid)
+	bi := bankIdx(xid)
+	byt := byteIdx(xid)
+	b := c.getOrCreateBank(bi)
+
+	b.mu.Lock()
 	// Grow buffer to accommodate xid.
-	for len(c.data) <= idx {
-		c.data = append(c.data, byte(TxnStatusUnknown))
+	for len(b.data) <= byt {
+		b.data = append(b.data, byte(TxnStatusUnknown))
 	}
-	if TxnStatus(c.data[idx]) == status {
+	if TxnStatus(b.data[byt]) == status {
+		b.mu.Unlock()
 		return nil // idempotent — no write needed
 	}
-	c.data[idx] = byte(status)
-	if err := os.WriteFile(c.path, c.data, 0600); err != nil {
+	b.data[byt] = byte(status)
+	b.mu.Unlock()
+
+	if err := c.flush(); err != nil {
 		return err
 	}
-	return c.mirrorToSLRULocked(xid, status)
+	return c.mirrorToSLRUUnlocked(xid, status)
+}
+
+// flush collects all bank data into a single flat slice and writes it to the
+// clog file. Acquires banksMu.RLock() and per-bank mu.RLock() to read data.
+func (c *CLog) flush() error {
+	c.banksMu.RLock()
+	nBanks := len(c.banks)
+	c.banksMu.RUnlock()
+
+	if nBanks == 0 {
+		return os.WriteFile(c.path, nil, 0600)
+	}
+
+	// Find the last bank that has data to determine total byte count.
+	lastUsedBank := -1
+	lastUsedLen := 0
+	for bi := nBanks - 1; bi >= 0; bi-- {
+		b := c.getBank(bi)
+		if b == nil {
+			continue
+		}
+		b.mu.RLock()
+		n := len(b.data)
+		b.mu.RUnlock()
+		if n > 0 {
+			lastUsedBank = bi
+			lastUsedLen = n
+			break
+		}
+	}
+	if lastUsedBank < 0 {
+		return os.WriteFile(c.path, nil, 0600)
+	}
+
+	totalLen := lastUsedBank*xidsPerBank + lastUsedLen
+	out := make([]byte, totalLen)
+
+	for bi := 0; bi <= lastUsedBank; bi++ {
+		b := c.getBank(bi)
+		if b == nil {
+			// Absent bank → all-Unknown slots; already zero in out.
+			continue
+		}
+		b.mu.RLock()
+		start := bi * xidsPerBank
+		copy(out[start:start+len(b.data)], b.data)
+		b.mu.RUnlock()
+	}
+
+	return os.WriteFile(c.path, out, 0600)
 }
 
 // PG SLRU CLOG layout constants. PG18 packs 2 bits per XID into bytes ordered
@@ -199,8 +376,6 @@ const (
 // without trying to extend a missing first page. Idempotent. M0106-0010
 // batched-44.
 func (c *CLog) EnablePGSLRUMirror(dir string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("clog slru: mkdir %q: %w", dir, err)
 	}
@@ -212,43 +387,67 @@ func (c *CLog) EnablePGSLRUMirror(dir string) error {
 	} else if err != nil {
 		return fmt.Errorf("clog slru: stat %q: %w", seg0, err)
 	}
+
+	// Set slruDir before loading so mirrorToSLRUUnlocked can see it.
+	// Use banksMu as a convenient global lock for this field assignment.
+	c.banksMu.Lock()
 	c.slruDir = dir
+	c.banksMu.Unlock()
 
 	// M0106-0013: load committed/aborted entries from the on-disk SLRU
-	// files into c.data BEFORE the backfill below. The SLRU is fsynced on
-	// every commit (mirrorToSLRULocked calls f.Sync()), making it the most
-	// durable source of truth after a crash. The flat-file (c.data loaded
-	// by OpenCLog) is written without fsync and may be stale or truncated
+	// files into the banks BEFORE the backfill below. The SLRU is fsynced on
+	// every commit (mirrorToSLRUUnlocked calls f.Sync()), making it the most
+	// durable source of truth after a crash. The flat-file (loaded by
+	// OpenCLog) is written without fsync and may be stale or truncated
 	// (os.WriteFile uses O_TRUNC; a crash between truncate and write leaves
 	// a zero-length file). By loading SLRU first, crash-recovery sees the
 	// correct committed/aborted status even when the flat-file is missing.
-	if err := c.loadFromSLRULocked(dir); err != nil {
+	if err := c.loadFromSLRU(dir); err != nil {
 		return err
 	}
 
 	// Backfill any in-memory committed/aborted entries so an opened clog
 	// (which loaded data from the flat file but had no SLRU mirror) is
-	// projected to the SLRU on first enable. mirrorToSLRULocked uses OR so
-	// it never clears bits already set by loadFromSLRULocked above.
-	for i := 1; i < len(c.data); i++ {
-		st := TxnStatus(c.data[i])
-		if st == TxnStatusCommitted || st == TxnStatusAborted {
-			if err := c.mirrorToSLRULocked(storage.TransactionID(i), st); err != nil {
-				return err
+	// projected to the SLRU on first enable. mirrorToSLRUUnlocked uses OR so
+	// it never clears bits already set by loadFromSLRU above.
+	c.banksMu.RLock()
+	nBanks := len(c.banks)
+	c.banksMu.RUnlock()
+
+	for bi := 0; bi < nBanks; bi++ {
+		b := c.getBank(bi)
+		if b == nil {
+			continue
+		}
+		b.mu.RLock()
+		data := make([]byte, len(b.data))
+		copy(data, b.data)
+		b.mu.RUnlock()
+
+		for byt, v := range data {
+			st := TxnStatus(v)
+			if st == TxnStatusCommitted || st == TxnStatusAborted {
+				xid := storage.TransactionID(bi*xidsPerBank + byt)
+				if xid == 0 {
+					continue
+				}
+				if err := c.mirrorToSLRUUnlocked(xid, st); err != nil {
+					return err
+				}
 			}
 		}
 	}
 	return nil
 }
 
-// loadFromSLRULocked reads committed/aborted entries from existing SLRU
-// segment files under dir and merges them into c.data. Called by
-// EnablePGSLRUMirror before the backfill pass so the on-disk SLRU state
-// (fsynced at every commit) wins over a potentially stale flat-file. mu
-// must be held. Best-effort: segment files that cannot be read are skipped
-// rather than returning an error — a missing or corrupt segment means the
-// affected XIDs remain as Unknown and are handled by MarkUnknownAsAborted.
-func (c *CLog) loadFromSLRULocked(dir string) error {
+// loadFromSLRU reads committed/aborted entries from existing SLRU segment
+// files under dir and merges them into the banks. Called by EnablePGSLRUMirror
+// before the backfill pass so the on-disk SLRU state (fsynced at every commit)
+// wins over a potentially stale flat-file. Best-effort: segment files that
+// cannot be read are skipped rather than returning an error — a missing or
+// corrupt segment means the affected XIDs remain as Unknown and are handled by
+// MarkUnknownAsAborted.
+func (c *CLog) loadFromSLRU(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -319,13 +518,18 @@ func (c *CLog) loadFromSLRULocked(dir string) error {
 				if xid == 0 || xid > uint64(^storage.TransactionID(0)) {
 					continue
 				}
-				idx := int(xid)
-				for len(c.data) <= idx {
-					c.data = append(c.data, byte(TxnStatusUnknown))
+				txid := storage.TransactionID(xid)
+				bi := bankIdx(txid)
+				byt := byteIdx(txid)
+				bank := c.getOrCreateBank(bi)
+				bank.mu.Lock()
+				for len(bank.data) <= byt {
+					bank.data = append(bank.data, byte(TxnStatusUnknown))
 				}
 				// SLRU is the authoritative source (fsynced); overwrite
 				// whatever the flat-file had for this slot.
-				c.data[idx] = byte(status)
+				bank.data[byt] = byte(status)
+				bank.mu.Unlock()
 			}
 		}
 	}
@@ -337,12 +541,30 @@ func (c *CLog) loadFromSLRULocked(dir string) error {
 // startup to advance txnMgr.NextXID past all previously committed XIDs so
 // new snapshots have a high enough Xmax to see pre-crash rows. (M0106-0013)
 func (c *CLog) HighestKnownXID() storage.TransactionID {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	for i := len(c.data) - 1; i >= 1; i-- {
-		if TxnStatus(c.data[i]) != TxnStatusUnknown {
-			return storage.TransactionID(i)
+	c.banksMu.RLock()
+	nBanks := len(c.banks)
+	c.banksMu.RUnlock()
+
+	for bi := nBanks - 1; bi >= 0; bi-- {
+		b := c.getBank(bi)
+		if b == nil {
+			continue
 		}
+		b.mu.RLock()
+		// For bank 0, XID 0 is invalid — stop at byt=1.
+		// For all other banks, byt=0 maps to a valid non-zero XID.
+		minByt := 0
+		if bi == 0 {
+			minByt = 1
+		}
+		for byt := len(b.data) - 1; byt >= minByt; byt-- {
+			if TxnStatus(b.data[byt]) != TxnStatusUnknown {
+				xid := storage.TransactionID(bi*xidsPerBank + byt)
+				b.mu.RUnlock()
+				return xid
+			}
+		}
+		b.mu.RUnlock()
 	}
 	return 0
 }
@@ -350,18 +572,23 @@ func (c *CLog) HighestKnownXID() storage.TransactionID {
 // SLRUDir returns the PG-canonical pg_xact/ directory, or "" if the mirror is
 // disabled. Intended for tests.
 func (c *CLog) SLRUDir() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.banksMu.RLock()
+	defer c.banksMu.RUnlock()
 	return c.slruDir
 }
 
-// mirrorToSLRULocked writes the 2-bit lane for xid into the matching
-// pg_xact/<segno> segment file. Caller must hold c.mu. No-op if the mirror is
-// disabled or status is not a terminal committed/aborted code. Extends the
-// segment file in BLCKSZ-page units so SimpleLruReadPage_ReadOnly sees a
-// complete page.
-func (c *CLog) mirrorToSLRULocked(xid storage.TransactionID, status TxnStatus) error {
-	if c.slruDir == "" {
+// mirrorToSLRUUnlocked writes the 2-bit lane for xid into the matching
+// pg_xact/<segno> segment file. Does not require any CLog-level lock; the
+// caller is responsible for ensuring slruDir is set before calling. No-op if
+// the mirror is disabled or status is not a terminal committed/aborted code.
+// Extends the segment file in BLCKSZ-page units so SimpleLruReadPage_ReadOnly
+// sees a complete page.
+func (c *CLog) mirrorToSLRUUnlocked(xid storage.TransactionID, status TxnStatus) error {
+	c.banksMu.RLock()
+	dir := c.slruDir
+	c.banksMu.RUnlock()
+
+	if dir == "" {
 		return nil
 	}
 	// PG's TransactionLogFetch short-circuits BootstrapTransactionId (1) and
@@ -390,7 +617,7 @@ func (c *CLog) mirrorToSLRULocked(xid storage.TransactionID, status TxnStatus) e
 	bShift := uint((xidInPage % clogXactsPerByte) * clogBitsPerXact)
 
 	name := fmt.Sprintf("%04X", segNo)
-	segPath := filepath.Join(c.slruDir, name)
+	segPath := filepath.Join(dir, name)
 	f, err := os.OpenFile(segPath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return fmt.Errorf("clog slru: open %q: %w", segPath, err)
@@ -406,14 +633,14 @@ func (c *CLog) mirrorToSLRULocked(xid storage.TransactionID, status TxnStatus) e
 			return fmt.Errorf("clog slru: extend %q: %w", segPath, err)
 		}
 	}
-	var b [1]byte
-	if _, err := f.ReadAt(b[:], byteOffset); err != nil && !errors.Is(err, io.EOF) {
+	var bBuf [1]byte
+	if _, err := f.ReadAt(bBuf[:], byteOffset); err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("clog slru: read %q@%d: %w", segPath, byteOffset, err)
 	}
 	// Strict OR mirrors PG's TransactionIdSetStatusBit: lanes only advance
 	// from in-progress to terminal. We never need to clear bits.
-	b[0] |= bits << bShift
-	if _, err := f.WriteAt(b[:], byteOffset); err != nil {
+	bBuf[0] |= bits << bShift
+	if _, err := f.WriteAt(bBuf[:], byteOffset); err != nil {
 		return fmt.Errorf("clog slru: write %q@%d: %w", segPath, byteOffset, err)
 	}
 	return f.Sync()

@@ -226,8 +226,8 @@ func (r *predicateLocksRegistry) ensureInit() {
 // ignored field-by-field so callers can override only the dimensions
 // they care about (tests).
 func (m *Manager) SetPredicateLockLimits(limits PredicateLockLimits) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	m.predicateLocks.ensureInit()
 	if limits.PerXact > 0 {
 		m.predicateLocks.limits.PerXact = limits.PerXact
@@ -242,8 +242,8 @@ func (m *Manager) SetPredicateLockLimits(limits PredicateLockLimits) {
 
 // PredicateLockLimits returns the active coarsening thresholds.
 func (m *Manager) PredicateLockLimits() PredicateLockLimits {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	m.predicateLocks.ensureInit()
 	return m.predicateLocks.limits
 }
@@ -267,8 +267,8 @@ func (m *Manager) PredicateLockLimits() PredicateLockLimits {
 // Cleanup is automatic on Manager.finish via releaseSerializableLocked,
 // so callers do not need to release locks explicitly.
 func (m *Manager) AcquirePredicateLock(handle TxnHandle, tag PredicateLockTag) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	return m.acquirePredicateLockLocked(handle, tag)
 }
 
@@ -310,8 +310,8 @@ func (m *Manager) acquirePredicateLockLocked(handle TxnHandle, tag PredicateLock
 // coverage on tag, either by holding it directly or by holding a
 // coarser lock that covers it.
 func (m *Manager) HoldsPredicateLock(handle TxnHandle, tag PredicateLockTag) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	if m.ssiState.xacts == nil {
 		return false
 	}
@@ -331,8 +331,8 @@ func (m *Manager) HoldsPredicateLock(handle TxnHandle, tag PredicateLockTag) boo
 // targets held by handle. Diagnostic helper for tests; production
 // callers should not depend on this number directly.
 func (m *Manager) PredicateLockCount(handle TxnHandle) int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	if m.ssiState.xacts == nil {
 		return 0
 	}
@@ -348,8 +348,8 @@ func (m *Manager) PredicateLockCount(handle TxnHandle) int {
 // substrate stores each tag in its own target slot). Diagnostic
 // helper used by tests and the M0104-0005 conflict-out hook.
 func (m *Manager) PredicateLockTargetHolderCount(tag PredicateLockTag) int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	if m.predicateLocks.targets == nil {
 		return 0
 	}

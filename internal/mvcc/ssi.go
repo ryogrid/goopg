@@ -36,7 +36,7 @@ const (
 // API or callers that already register/observe SerializableXact.
 //
 // SerializableXact must be accessed through Manager.SerializableXact
-// (or under m.mu when called from inside Manager). Direct field
+// (or under m.ssiMu when called from inside Manager). Direct field
 // mutation from outside the mvcc package is not supported.
 type SerializableXact struct {
 	// Handle is the owning transaction's manager-internal handle.
@@ -123,7 +123,7 @@ func (s *ssiState) ensureInit() {
 
 // registerSerializableLocked allocates and registers the
 // SerializableXact for handle. Called from Manager.Begin under
-// m.mu when iso == IsolationSerializable.
+// m.ssiMu when iso == IsolationSerializable.
 func (m *Manager) registerSerializableLocked(handle TxnHandle) *SerializableXact {
 	m.ssiState.ensureInit()
 	sx := &SerializableXact{
@@ -137,7 +137,7 @@ func (m *Manager) registerSerializableLocked(handle TxnHandle) *SerializableXact
 // releaseSerializableLocked stamps the FinishedAt commit sequence
 // number, removes the SerializableXact from the registry, and
 // returns it for callers that want to observe the cleared state
-// (tests, future logging). Called from Manager.finish under m.mu
+// (tests, future logging). Called from Manager.finish under m.ssiMu
 // for every SERIALIZABLE transaction that reached the active set,
 // regardless of commit vs abort outcome.
 //
@@ -177,15 +177,15 @@ func (m *Manager) releaseSerializableLocked(handle TxnHandle) *SerializableXact 
 
 // SerializableXact returns the live SSI bookkeeping object for the
 // given handle, or nil if none is registered. Safe for concurrent
-// use; takes m.mu internally.
+// use; takes m.ssiMu internally.
 //
 // The returned pointer is stable for the SerializableXact's
 // lifetime (until finish releases it). Callers MUST NOT mutate
 // fields directly — future slices (M0104-0004..0006) will expose
 // dedicated mutator methods that handle locking and edge fixup.
 func (m *Manager) SerializableXact(handle TxnHandle) *SerializableXact {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	if m.ssiState.xacts == nil {
 		return nil
 	}
@@ -196,8 +196,8 @@ func (m *Manager) SerializableXact(handle TxnHandle) *SerializableXact {
 // SerializableXact bookkeeping objects. Diagnostic and test helper;
 // production callers should not depend on this number.
 func (m *Manager) SerializableXactCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	if m.ssiState.xacts == nil {
 		return 0
 	}

@@ -157,7 +157,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		autoCommit = false
 	} else {
 		var err error
-		tx, err = s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+		var pn int32
+		if connTx != nil {
+			pn = connTx.ProcNum
+		}
+		tx, err = s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, pn)
 		if err != nil {
 			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 		}
@@ -220,6 +224,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	ectx.PubSub = s.cfg.PubSub
 	ectx.LockMgr = s.cfg.LockMgr
 	ectx.BackendID = backendID
+	if connTx != nil {
+		ectx.ProcNum = connTx.ProcNum
+	}
 	ectx.WAL = s.cfg.WAL
 	ectx.LogCanonical = s.cfg.LogCanonical
 	ectx.SyncRep = s.cfg.SyncRep
@@ -694,7 +701,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						// Roll back the placeholder auto-commit tx so it does
 						// not consume an XID / leak SSI bookkeeping.
 						_ = s.cfg.TxnMgr.Rollback(ctx.Tx)
-						newTx, berr := s.cfg.TxnMgr.Begin(parsedLvl)
+						newTx, berr := s.cfg.TxnMgr.Begin(parsedLvl, ctx.ProcNum)
 						if berr != nil {
 							return s.writeQueryError(w, sqlstate.SystemError, berr.Error())
 						}
