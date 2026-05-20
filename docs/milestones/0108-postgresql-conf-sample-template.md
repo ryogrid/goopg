@@ -1,7 +1,8 @@
 # Milestone 0108 — `postgresql.conf.sample` Template + Registry-Sync Rule
 
-**Status:** planned
+**Status:** accepted
 **Filed:** 2026-05-20
+**Accepted:** 2026-05-21
 **Depends on:** none (uses existing `internal/config` GUC registry and `internal/initdb` file-writer)
 **Reference plan:** `.ralph/fix_plan.md` (M0108 section)
 

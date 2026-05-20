@@ -3427,7 +3427,7 @@ Operational policy (2026-05-20):
 
 ### Milestone-close gates (after all 3 sub-milestones)
 
- - [ ] **M0108 — milestone-close verification**
+ - [x] **M0108 — milestone-close verification**
       - Confirm `internal/config/postgresql.conf.sample` contains a
         commented entry for every file-settable GUC in
         `BuildDefaultRegistry()`; confirm `TestSampleConfigCoversRegistry`
@@ -3437,6 +3437,30 @@ Operational policy (2026-05-20):
       - Update milestone status in
         `docs/milestones/0108-postgresql-conf-sample-template.md` and
         `docs/milestones/README.md` to `accepted`.
+      - COMPLETE 2026-05-21 (M0108-close loop): all four invariants
+        verified mechanically. (1) Sample-vs-registry coverage:
+        `go test -run TestSampleConfigCoversRegistry ./internal/config/`
+        PASS (0.002 s) — the test enforces both directions of the
+        registry↔template map plus raw-string BootVal equality over
+        the 79 file-settable GUCs (87 registered − 8 `FlagDisallowInFile`
+        internals). (2) AGENT.md "GUC sample-file discipline" section
+        present at `.ralph/AGENT.md:211-241`; references
+        `TestSampleConfigCoversRegistry` by name at `:234-235` ("the
+        unit test ... is the mechanical enforcement gate; it MUST pass
+        before the commit is opened") and points at the design doc at
+        `:215-216`. (3) `goopg init <dir>` byte-equality:
+        `go test -run TestInitWritesEmbeddedSampleAsPostgresqlConf
+        ./internal/initdb/` PASS (0.119 s) — the regression test
+        from M0108-0002 asserts `bytes.Equal(os.ReadFile(<datadir>/
+        postgresql.conf), config.SampleConfig())` after a full
+        `Init(Options{DataDir: tmpDir})` run. (4) Milestone status:
+        `docs/milestones/0108-postgresql-conf-sample-template.md`
+        front-matter updated `Status: planned` → `Status: accepted`
+        + added `Accepted: 2026-05-21` line; `docs/milestones/README.md`
+        row for M0108 updated `planned` → `accepted`. No code touched
+        this loop — verification is purely about reading and asserting
+        the M0108-0001/-0002/-0003 deliverables that landed in commits
+        `f7eb1e1` / `163e478` / `3a8ddea`. `make ralph-state-guard` PASS.
 
 ## Completed
 
