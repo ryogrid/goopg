@@ -3241,6 +3241,120 @@ Operational policy (2026-05-20):
         writes; deciding whether `lsnAllocator` becomes
         dead-code-removed once the call-site converges on
         `insertPosTracker`.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 6 of N —
+        `insertionTracker` per-stripe insertion-in-progress LSN
+        slot): added `insertionTracker` to new file
+        `internal/wal/insertion_tracker.go`. Per-stripe slot array
+        `inserting [appendLockStripes]atomic.Int64` plus two
+        sentinels — `lsnIdle = 0` (exploits the zero value of
+        `atomic.Int64` so the constructor is no-state-init) and
+        `lsnNoActive = math.MaxInt64` (composes with
+        `safeTail = min(upperBound, lowestActiveLSN())` so the
+        publication-walker hot path needs no "all idle" branch).
+        API: `newInsertionTracker()`, `setInsertingAt(stripe int,
+        lsn int64)`, `insertingAt(stripe int) int64`,
+        `lowestActiveLSN() int64`. PG counterpart:
+        `WALInsertLock[i].insertingAt` field + the
+        `WaitXLogInsertionsToFinish` walker in
+        `postgres/src/backend/access/transam/xlog.c` — each stripe
+        publishes its current insert start LSN under the stripe
+        lock; the flush coordinator computes a publication
+        watermark from the per-stripe slots. goopg lands the slot
+        machinery here so it can be exercised in isolation; the
+        publication walker itself (computing `safeTail` and
+        advancing `walBuffer.tail`) lands in its own later
+        foundation once the wait-vs-poll policy is settled. The
+        tracker takes no locks: each stripe writes only to its
+        own slot, publication walkers Load-only across all slots.
+        Per-stripe contract: stripe takes
+        `appendLockSet.lockByProcNum(procNum)` →
+        `insertPosTracker.reserve(size)` →
+        `setInsertingAt(stripe, start)` (publish active LSN,
+        sequenced-before the byte write) →
+        `walBuffer.writeReserved(start, bytes)` →
+        `setInsertingAt(stripe, lsnIdle)` (publish idle,
+        sequenced-after byte write) → drop stripe lock. Per-slot
+        `atomic.Int64.Store/.Load` gives the happens-before
+        pairing Go's memory model requires (sequential-
+        consistency on amd64/arm64). Known pre-reserve race
+        between `insertPosTracker.reserve` returning and
+        `setInsertingAt` publishing — documented in design doc
+        §"Pre-reserve race (future-loop concern)" with two
+        closures (pre-reserve marker writing floor LSN before
+        reserve and refining after; reserve-and-publish hook
+        firing under `posMu`). Both are forward-compatible with
+        this foundation; the call-site rewrite picks one. Why
+        not couple this into `insertPosTracker`: that primitive
+        is a single-writer abstraction over the LSN axis; stripe
+        identity is a separate concern owned by `appendLockSet`.
+        Keeping them split lets each be unit-tested in isolation
+        and lets future call-site rewrites compose them
+        differently. Out-of-range stripe panics on both Set and
+        Get — silent neighbour-slot corruption is a worse
+        failure mode than a fast crash at the bad index. Dead
+        code until slice B's call-site rewrite mounts the
+        tracker on `Writer`; foundation-first pattern matches
+        slice C ([[0107-0007b]] / [[0107-0007c]] / [[0107-0007d]]
+        before [[0107-0007e]] / [[0107-0007f]] / [[0107-0007g]])
+        and the five earlier slice B foundations ([[0107-0007h]] /
+        [[0107-0007i]] / [[0107-0007j]] / [[0107-0007k]] /
+        [[0107-0007l]]). Ten regression tests in
+        `internal/wal/insertion_tracker_test.go`:
+        `TestInsertionTrackerNewIsAllIdle` (fresh tracker has
+        every slot at `lsnIdle` and `lowestActiveLSN ==
+        lsnNoActive`; sentinel matches `math.MaxInt64`);
+        `TestInsertionTrackerSetReadback` (single-slot publish
+        then read returns the published value; other slots
+        untouched); `TestInsertionTrackerSetThenIdleClears`
+        (round-trip publish→idle on every stripe;
+        `lowestActiveLSN` returns to sentinel after all idle);
+        `TestInsertionTrackerLowestActiveLSNAcrossStripes` (three
+        active stripes; `lowestActiveLSN` returns the min;
+        clearing the lowest shifts the answer; clearing all
+        returns the sentinel);
+        `TestInsertionTrackerLowestActiveSentinelComposesWithMin`
+        (pins the publication formula `safeTail = min(upperBound,
+        lowestActiveLSN())` works without "all idle" branch);
+        `TestInsertionTrackerSetInsertingAtPanicsOutOfRange` (bad
+        stripe indices on write path panic — covers both endpoints
+        and negative values);
+        `TestInsertionTrackerInsertingAtPanicsOutOfRange` (same
+        on read path);
+        `TestInsertionTrackerConcurrentStripeOwnership` (8
+        stripes × 5000 iterations each writing only to its own
+        slot; per-stripe reads stay within stripe's emission
+        range; race-clean under `-race`);
+        `TestInsertionTrackerConcurrentPublicationReader` (8
+        writer stripes oscillating active↔idle while a
+        publication-walker reader observes `lowestActiveLSN`;
+        every non-sentinel observation falls inside some
+        stripe's emission range — pins no torn reads, no
+        zero-on-idle bug; uses two WaitGroups + stop atomic so
+        writers finish, reader is signalled to stop, then
+        reader joins — avoids the circular wait that a single
+        WaitGroup would create);
+        `TestInsertionTrackerSentinelConstants` (pins
+        `lsnIdle == 0` and `lsnNoActive == math.MaxInt64` — both
+        load-bearing for constructor's zero-cost path and
+        publication-side `min` composition respectively).
+        Verified: `go test -race -count=1 -run
+        'TestInsertionTracker' ./internal/wal/` PASS (1.02 s);
+        `go test -race -count=1 ./internal/wal/` PASS (3.15 s).
+        Design:
+        `docs/design/0107-0007m-wal-insertion-tracker.md`
+        (indexed in `docs/design/README.md`). Out of scope
+        (future slice B foundations): the publication walker
+        itself (computing `safeTail` and advancing
+        `walBuffer.tail`); the pre-reserve race closure
+        (pre-reserve marker vs reserve-and-publish hook —
+        owned by call-site rewrite); mounting
+        `insertionTracker` on `Writer` and wiring the begin/end
+        pair around the byte write (multi-loop scope); `memRing`
+        mirror handling under stripe-concurrent writes; drain
+        coordination with concurrent stripe writes; deciding
+        whether `lsnAllocator` ([[0107-0007h]]) becomes
+        dead-code-removed once the call-site converges on
+        `insertPosTracker` + `insertionTracker`.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
