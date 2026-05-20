@@ -1925,6 +1925,27 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           FkSnapshot, PartitionKeyUpdate{1,2,3,4}, InsertConflictDoUpdate4,
           ReadWriteUnique, LockCommittedKeyupdate.
           Design: `docs/design/0100-0005-lockrows-committed-update-chain-follow.md`.
+        - **Loop-17 MERGE + failed-transaction fixes (2026-05-20)**:
+          (A) MERGE NOT MATCHED INSERT path now mirrors insertOp: partition
+          routing, BEFORE INSERT trigger firing, unique-constraint check with
+          wait semantics (checkUniqueIndexesForInsert → uniqueCheckWithWait),
+          index maintenance via maintainUniqueIndexesForInsert.
+          (B) MERGE MATCHED UPDATE EPQ "row gone" now returns errMergeSourceUnmatched,
+          outer loop resets srcRows[mod.srcIdx].matched=false → NOT MATCHED INSERT
+          path fires. srcIdx added to mergePendingMod.
+          (C) isLiveForUniqueCheck: TxnMgr.HasAbortedXID(xmin) arm added before
+          default so xacts that aborted after our snapshot are correctly not-live.
+          (D) failed-transaction state (25P02): connTxState gains Fail()/IsFailed();
+          any errQueryErrorSent inside explicit tx calls Fail(); subsequent stmts
+          return 25P02; COMMIT on failed tx → ROLLBACK silently.
+          TestPort_IsolationMergeInsertUpdate flips from SKIP to PASS.
+          **PASS count = 12**: adds MergeInsertUpdate.
+          LockCommittedUpdate, InsertConflictDoUpdate, InsertConflictDoNothing,
+          FkSnapshot, PartitionKeyUpdate{1,2,3,4}, InsertConflictDoUpdate4,
+          ReadWriteUnique, LockCommittedKeyupdate, MergeInsertUpdate.
+          Design: `docs/design/0100-0005-loop17-merge-not-matched-insert-and-failed-tx.md`.
+          MergeDelete advances to 234/236 matching lines (trigger/concurrency
+          NOTICEs in perms 17+19 still missing; root cause TBD).
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
