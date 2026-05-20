@@ -1886,6 +1886,29 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           393 lines cover permutations 1–15 and now match). Still deferred on
           remaining concurrent-wait permutations.
           PASS count unchanged at 9.
+        - **Loop-15 isolation spec + snapshot + unique-wait fixes (2026-05-20)**:
+          (A) Isolation spec parser: blank lines within multi-line permutation
+          blocks now skipped (not treated as terminators) — fixes
+          insert-conflict-specconflict.spec's 5th permutation which had a blank
+          line before the first step name. Parenthesised annotations like
+          `(s1_upsert notices 10)` now stripped from permutation token lists.
+          Design: `docs/design/0100-0005-loop15-isolation-spec-parser-fixes.md`
+          (informal, captured in commit 2da50e3).
+          (B) `uniqueCheckWithWait`: when `checkUniqueIndexesForInsert` finds a
+          tuple with an in-flight other-xact xmin, waits via `WaitForXID` and
+          re-scans. For SERIALIZABLE/RR: raises 40001 SSI error. For RC: raises
+          23505. Produces the `<waiting ...>` interleaving for read-write-unique
+          perm 1 (r1 r2 w1 w2 c1 c2).
+          (C) First-statement RR/SSI snapshot: dispatch.go's direct TxBegin
+          handler no longer calls `SnapshotFor(newTx)` for RR/SSI — fixes the
+          root cause of read-write-unique perm 2 (r1 w1 c1 r2 w2 c2) returning
+          0 rows. `state.firstSnapshot` is now captured at the FIRST REAL
+          STATEMENT after BEGIN, matching PostgreSQL semantics.
+          TestPort_IsolationReadWriteUnique flips from SKIP to PASS.
+          **PASS count = 10**: adds ReadWriteUnique.
+          LockCommittedUpdate, InsertConflictDoUpdate, InsertConflictDoNothing,
+          FkSnapshot, PartitionKeyUpdate{1,2,3,4}, InsertConflictDoUpdate4,
+          ReadWriteUnique.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
