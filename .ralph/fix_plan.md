@@ -2786,6 +2786,37 @@ Operational policy (2026-05-20):
         consumer migrations (executor row counters, bufpool hit/miss
         after the lockfree rewrite, WAL byte counters) as separate
         loops; per-Go-minor CI matrix.
+      - PARTIAL PROGRESS 2026-05-21 (loop 8): second concrete `stats.Counter`
+        consumer migration landed — `MemRing.hits` and `.misses` in
+        `internal/wal/mem_ring.go` moved from `atomic.Uint64` to
+        `stats.Counter`. Hot path is `(*MemRing).ReadAt`, bumped once per
+        record by every active walsender goroutine; multi-P contention
+        when ≥2 subscribers stream (M0094-0005 hot-read E2E, M0102
+        heterogeneous-replication failover, any cascading-replica
+        deployment). Public API (`Hits() uint64`, `Misses() uint64`)
+        preserved verbatim via a single `uint64(.Sum())` cast at the
+        boundary; `pg_stat_wal_io` / `pg_stat_replication.send_buffer_*`
+        view callers (`internal/initdb/wal_io_views.go`,
+        `internal/initdb/replication_views.go`) unaffected. The two
+        `.Add(1)` call sites in `ReadAt` are byte-identical (untyped
+        constant `1` accepted by both old `atomic.Uint64.Add(uint64)` and
+        new `stats.Counter.Add(int64)`). No `Reset()` exposed on
+        `MemRing` (counters read-only-after-construction in production),
+        so `stats.Counter.Reset()` is unused. Memory cost: 32 KiB per
+        server (one MemRing × 2 × 16 KiB Counter), flat. No new tests
+        — existing `internal/wal/mem_ring_test.go` already covers the
+        counter contract end-to-end through the public API
+        (hit-simple, miss-after-eviction, partial-overlap, nil-safe,
+        plus the walsender-integration test at line 202 that asserts
+        the bump through the full `Writer → ReadAt → walsender` path).
+        Verified: `go test -race -count=1 ./internal/wal/` (3.10 s) +
+        `go test -race -count=1 ./internal/stats/` (1.02 s) both PASS.
+        Design: `docs/design/0107-0008h-memring-stats-counter-wiring.md`
+        (indexed in `docs/design/README.md`).
+        Remaining work for this sub-milestone: bufpool per-slot Sema
+        wait caller (consumes [[0107-0008c]]); AIO Engine
+        submitted/completed counter family (coupled to wider
+        `pg_stat_io` view-shape unification); per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
