@@ -2528,6 +2528,30 @@ Operational policy (2026-05-20):
         current Go minor; bench shows `nanotime()` ~5 ns; per-Go-minor build
         matrix green; combined with D3 the `runtime.futex` drop is realised;
         `TestE2E_FailoverGoopgToPG/async` PASS; `make ralph-state-guard` PASS.
+      - PARTIAL PROGRESS 2026-05-21 (loop 1): introduced `internal/runtimeshim`
+        with the first shim, `Nanotime() int64`.
+        - `internal/runtimeshim/nanotime_linkname.go` (build tag
+          `go1.24 && !go1.27`) binds `nanotimeRuntime → runtime.nanotime`
+          via `//go:linkname` and exposes `Nanotime()`.
+        - `internal/runtimeshim/nanotime_fallback.go` (inverse tag) uses
+          `time.Now().UnixNano()`. Same public signature.
+        - `internal/runtimeshim/doc.go` codifies the package-level
+          discipline from `08-runtime-internals.md` §2 (one package,
+          paired tags, no `//go:nosplit`, race-clean).
+        - `nanotime_test.go`: monotonicity over `1 << 16` reads,
+          wall-elapsed sanity (50 ms sleep ∈ [25 ms, 500 ms]), non-zero
+          smoke, plus `BenchmarkNanotime`. PASS under `-race` (1.06 s)
+          and bare (0.054 s). `BenchmarkNanotime-16 12245396 20.54 ns/op`
+          on Linux/amd64 Go 1.25 (vs ~50 ns for `time.Now()`).
+        - Call-site wiring (activity registry uses) is deliberately NOT
+          in this loop; it lands separately so the shim's race-clean
+          test suite can be evaluated standalone.
+        - Design: `docs/design/0107-0008-runtimeshim-nanotime.md`
+          (indexed in `docs/design/README.md`).
+        - Remaining work for this sub-milestone: `PinP`/`UnpinP` shim
+          + per-P xid cache caller; `SemaAcquire`/`SemaRelease` shim +
+          bufpool wait-coordination caller; activity-registry rewrite
+          to consume `runtimeshim.Nanotime`; per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
