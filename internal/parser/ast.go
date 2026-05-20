@@ -527,6 +527,7 @@ type CommonTableExpr struct {
 	Name    string
 	Columns []string // optional column-alias list; nil when absent
 	Query   *SelectStmt
+	DMLBody Stmt // INSERT/UPDATE/DELETE/MERGE CTE body (nil for SELECT CTEs)
 }
 
 // Pos returns the position of the CTE's declaring identifier.

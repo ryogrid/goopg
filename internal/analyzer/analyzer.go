@@ -1365,6 +1365,18 @@ func analyzeWith(with *parser.WithClause, ctx *scope) error {
 			continue
 		}
 
+		if cte.DMLBody != nil {
+			// Data-modifying CTE (INSERT/UPDATE/DELETE/MERGE).
+			// Analysis is handled by the DML-specific planner when
+			// the CTE is planned; register with an empty table so
+			// the outer query knows the name exists.
+			if ctx.ctes == nil {
+				ctx.ctes = make(map[string]*catalog.Table)
+			}
+			ctx.ctes[strings.ToLower(cte.Name)] = &catalog.Table{Name: cte.Name}
+			continue
+		}
+
 		// Recurse into the CTE's inner SELECT under the current
 		// scope so an earlier CTE in the same WITH list is
 		// visible to a later one. The inner SELECT can also have

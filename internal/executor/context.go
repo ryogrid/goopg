@@ -225,6 +225,11 @@ type Context struct {
 	// IsStandby reflects whether the server is currently acting as a hot
 	// standby. pg_is_in_recovery() returns this value. M0106-0010 batched-34.
 	IsStandby bool
+
+	// MaterializedCTEs holds rows from data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE
+	// with RETURNING). Populated by cteDMLPrefixOp before the outer query runs.
+	// Key is the lowercase CTE name; value is the materialized RETURNING rows.
+	MaterializedCTEs map[string][][]Datum
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.

@@ -45,6 +45,10 @@ func Build(plan planner.Node) (Operator, error) {
 		// child, so the CTEScan layer doesn't need its own
 		// instrumented row.
 		return Build(p.Child)
+	case *planner.CTEDMLPrefix:
+		return newCTEDMLPrefixOp(p), nil
+	case *planner.MaterializedCTEScan:
+		return newMaterializedCTEScanOp(p), nil
 	case *planner.Project:
 		child, err := Build(p.Child)
 		if err != nil {

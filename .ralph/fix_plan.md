@@ -1972,6 +1972,23 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           terminating the previously-infinite `isConcurrentlyUpdated` retry (no more
           spurious 40001). Fixes `TestNoticeCaptureUpdateTrigger` regression.
           **PASS count = 14**: adds InsertConflictDoUpdate2, MergeDelete.
+        - **Loop-20 DML CTEs (WITH MERGE RETURNING) (2026-05-20)**:
+          Parser: allow INSERT/UPDATE/DELETE/MERGE as CTE bodies (DMLBody field on
+          CommonTableExpr; Stage-A SELECT restriction removed). Analyzer: skip DML
+          body analysis (registers empty catalog.Table for name resolution).
+          Planner: CTEDMLPrefix + MaterializedCTEScan plan nodes; preplanWithClause
+          returns DML plans; wrapDMLCTEPrefix wraps outer query. MERGE RETURNING:
+          Merge.Returning/ReturningSchema; mergeOp.collectReturningRow + retRows
+          yield RETURNING rows via Next(). Executor: cteDMLPrefixOp executes DML
+          CTEs in sequence (materialising into ctx.MaterializedCTEs); materializedCTEScanOp
+          reads them. mergeApplyUpdate: moved-partition sentinel check added (before
+          and after epqFollowChain). Design:
+          `docs/design/0100-0005-dml-cte-with-merge-returning.md`.
+          MergeMatchRecheck: 489/503 → 501/503 lines (2 wrong-data lines from CTE
+          MERGE not detecting concurrent update in test; 2 missing lines from
+          moved-partition error not triggering — both require further investigation).
+          **PASS count = 14** (unchanged — MergeMatchRecheck still SKIP).
+
         - **Loop-19 partition EPQ recheck + EXPLAIN Merge format (2026-05-20)**:
           (A) `mergeApplyUpdate`/`mergeApplyDelete` lacked `epqFollowChain`
           fallback for non-HOT cross-page updates. `updateOp.Next()` skips

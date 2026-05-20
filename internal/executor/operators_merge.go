@@ -27,6 +27,8 @@ type mergeOp struct {
 	ctx          *Context
 	rowsAffected int64
 	done         bool
+	retRows      [][]Datum // collected RETURNING rows
+	retIdx       int       // next retRows index to yield
 }
 
 // mergePendingMod records a single MERGE modification to apply after the
@@ -61,7 +63,7 @@ type mergeEPQError struct {
 
 func (e *mergeEPQError) Error() string { return "merge EPQ recheck" }
 
-func (o *mergeOp) Schema() planner.Schema { return nil }
+func (o *mergeOp) Schema() planner.Schema { return o.plan.ReturningSchema }
 func (o *mergeOp) RowsAffected() int64   { return o.rowsAffected }
 
 func (o *mergeOp) Open(ctx *Context) error {
@@ -71,8 +73,28 @@ func (o *mergeOp) Open(ctx *Context) error {
 
 func (o *mergeOp) Close() error { return nil }
 
+// collectReturningRow evaluates the RETURNING expressions against row and
+// appends the result to o.retRows. No-op when plan has no RETURNING clause.
+func (o *mergeOp) collectReturningRow(row Row) {
+	if len(o.plan.Returning) == 0 {
+		return
+	}
+	retRow := make([]Datum, len(o.plan.Returning))
+	for i, expr := range o.plan.Returning {
+		val, _ := evalExpr(expr, row, o.ctx)
+		retRow[i] = val
+	}
+	o.retRows = append(o.retRows, retRow)
+}
+
 func (o *mergeOp) Next() (TupleSlot, error) {
+	// Yield pre-collected RETURNING rows on subsequent calls.
 	if o.done {
+		if o.retIdx < len(o.retRows) {
+			row := o.retRows[o.retIdx]
+			o.retIdx++
+			return SlotFromRow(o.plan.ReturningSchema, row), nil
+		}
 		return nil, EOF
 	}
 	o.done = true
@@ -268,6 +290,12 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 		}
 		if applied {
 			o.rowsAffected++
+			// Collect RETURNING row for UPDATE actions (newRow is post-trigger value).
+			if mod.action == planner.MergeActionUpdate {
+				o.collectReturningRow(mod.newRow)
+			} else if mod.action == planner.MergeActionDelete {
+				o.collectReturningRow(mod.tgtRow)
+			}
 		}
 	}
 
@@ -347,8 +375,15 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			}
 			maintainUniqueIndexesForInsert(o.ctx, insertTbl, insertTbl.Columns, row, ptr)
 			o.rowsAffected++
+			o.collectReturningRow(row)
 			break // first matching clause wins
 		}
+	}
+	// Yield first RETURNING row (if any); subsequent rows via retIdx.
+	if len(o.plan.Returning) > 0 && len(o.retRows) > 0 {
+		row := o.retRows[0]
+		o.retIdx = 1
+		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
 	return nil, EOF
 }
@@ -494,6 +529,10 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		// For RC: refresh snapshot so committed xmax is visible as "deleted"
 		// (frozen snapshot keeps xmax in InProgress, making the tuple appear live).
 		mergeEPQRefreshSnap(ctx)
+		// Check for moved-partition sentinel (cross-partition UPDATE) before chain follow.
+		if epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
+			return errMovedToAnotherPartition(pos)
+		}
 		// Follow HOT chain to find the current live tuple.
 		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
 		if found {
@@ -505,6 +544,13 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		// puRel != rel): fall back to raw t_ctid chain, same pattern as updateOp.Next().
 		if cBlk, cSlot, cRow, cFound := epqFollowChain(ctx, rel, blk, slot, cols, nil); cFound {
 			return &mergeEPQError{newBlk: cBlk, newSlot: cSlot, newTgtRow: cRow}
+		}
+		// If the chain ended without finding a successor, check whether the row
+		// was moved to another partition (sentinel CTID). epqFollowChain returns
+		// not-found when the CTID is the moved-partition sentinel, so we must
+		// check explicitly here as well.
+		if epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
+			return errMovedToAnotherPartition(pos)
 		}
 		return errMergeSourceUnmatched // row deleted; caller retries as NOT MATCHED
 	}

@@ -341,7 +341,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// substitute them in. Restorer pops the CTE scope back to
 	// the caller's view when this Plan call returns. nil-WITH
 	// returns a no-op restorer.
-	restore, err := preplanWithClause(s.With, cat)
+	restore, dmlPlans, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -798,7 +798,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if s.Distinct {
 		out = &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
 	}
-	return out, nil
+	return wrapDMLCTEPrefix(out, dmlPlans), nil
 }
 
 // resolveLockedRels walks the parsed locking clauses and
@@ -1173,6 +1173,17 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				alias = ce.name
 			}
 			b := rangeBinding{table: ce.table, alias: alias, offset: 0, sourceIdx: sourceIdx}
+			if ce.isDML {
+				// DML CTE: rows are materialized at runtime in
+				// ctx.MaterializedCTEs; use MaterializedCTEScan.
+				scan := &MaterializedCTEScan{
+					pos:    rv.Pos(),
+					Name:   ce.name,
+					Alias:  alias,
+					schema: ce.schema,
+				}
+				return scan, b, nil
+			}
 			scan := &CTEScan{
 				pos:    rv.Pos(),
 				Name:   ce.name,
@@ -3395,7 +3406,7 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 }
 
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
-	restore, err := preplanWithClause(s.With, cat)
+	restore, _, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -3741,7 +3752,7 @@ func insertValuesSchema(tbl *catalog.Table, colIndex []int) Schema {
 }
 
 func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
-	restore, err := preplanWithClause(s.With, cat)
+	restore, _, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -3795,7 +3806,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 }
 
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
-	restore, err := preplanWithClause(s.With, cat)
+	restore, _, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -3941,7 +3952,22 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
 		}
 		clauses = append(clauses, pc)
 	}
-	return &Merge{pos: s.Pos(), Target: tbl, Source: sourceNode, On: onExpr, Clauses: clauses}, nil
+	m := &Merge{pos: s.Pos(), Target: tbl, Source: sourceNode, On: onExpr, Clauses: clauses}
+
+	// RETURNING clause (M0100 DML-CTE): resolve against target-table binding.
+	if len(s.Returning) > 0 {
+		retCtx := newResolveContext([]rangeBinding{
+			{table: tbl, alias: targetAlias, offset: 0, sourceIdx: 1},
+		}, tableSchemaWithSource(tbl, 1))
+		retCtx.cat = cat
+		exprs, schema, err := resolveTargets(s.Returning, retCtx)
+		if err != nil {
+			return nil, err
+		}
+		m.Returning = exprs
+		m.ReturningSchema = schema
+	}
+	return m, nil
 }
 
 // buildInsertColIdx returns column ordinals for a MERGE NOT MATCHED INSERT.

@@ -86,30 +86,18 @@ func (p *parser) parseCTE() (*CommonTableExpr, error) {
 		return nil, p.errAtCur("expected '(' after AS in CTE")
 	}
 
-	// Stage A: only SELECT bodies are supported. Reject INSERT /
-	// UPDATE / DELETE bodies cleanly at the parser level so
-	// downstream code never has to consider data-modifying CTE
-	// chains.
-	body := p.cur()
-	if body.Kind == TokenKeyword {
-		switch body.Keyword {
-		case KwSelect, KwWith:
-			// OK — Stage A allows nested WITH inside a CTE body
-			// (e.g. `WITH a AS (WITH b AS (SELECT 1) SELECT * FROM b) ...`).
-		case KwInsert, KwUpdate, KwDelete:
-			return nil, &SyntaxError{Pos: body.Pos, Message: "data-modifying CTE bodies are not supported in v0 (Stage A only allows SELECT)"}
-		}
-	}
-
 	inner, err := p.parseStatement()
 	if err != nil {
 		return nil, err
 	}
-	sel, ok := inner.(*SelectStmt)
-	if !ok {
-		return nil, &SyntaxError{Pos: body.Pos, Message: "CTE body must be a SELECT"}
+	switch s := inner.(type) {
+	case *SelectStmt:
+		cte.Query = s
+	case *InsertStmt, *UpdateStmt, *DeleteStmt, *MergeStmt:
+		cte.DMLBody = inner.(Stmt)
+	default:
+		return nil, &SyntaxError{Pos: p.cur().Pos, Message: "CTE body must be a SELECT or data-modifying statement"}
 	}
-	cte.Query = sel
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("expected ')' after CTE body")
 	}
