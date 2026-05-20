@@ -645,13 +645,21 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						if berr != nil {
 							return s.writeQueryError(w, sqlstate.SystemError, berr.Error())
 						}
-						snap, serr := s.cfg.TxnMgr.SnapshotFor(newTx)
-						if serr != nil {
-							_ = s.cfg.TxnMgr.Rollback(newTx)
-							return s.writeQueryError(w, sqlstate.SystemError, serr.Error())
-						}
 						ctx.Tx = newTx
-						ctx.Snap = snap
+						// PG-parity: for RR/SSI the snapshot is captured at the FIRST
+						// real statement after BEGIN, not at BEGIN time. For RC, the
+						// snapshot is refreshed per-statement anyway, so timing does
+						// not matter. Leaving state.firstSnapshot unset here allows
+						// the per-dispatch SnapshotFor call at line 171 to capture it
+						// at first-statement time. M0100-0001.
+						if parsedLvl == mvcc.IsolationReadCommitted {
+							snap, serr := s.cfg.TxnMgr.SnapshotFor(newTx)
+							if serr != nil {
+								_ = s.cfg.TxnMgr.Rollback(newTx)
+								return s.writeQueryError(w, sqlstate.SystemError, serr.Error())
+							}
+							ctx.Snap = snap
+						}
 					}
 				}
 				connTx.Begin(ctx.Tx)
