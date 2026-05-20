@@ -2597,6 +2597,52 @@ Operational policy (2026-05-20):
         slice. Slice B (WAL insert striping per parent §2) remains
         deferred — splitting `state.appendMu`'s four invariants is
         multi-loop scope.
+      - PARTIAL PROGRESS 2026-05-21 (slice C foundation 2 of 3 —
+        `Pool.ExtendRelationBatch` batched page-append primitive):
+        added `Pool.ExtendRelationBatch(rel, n) (firstBlk, error)` to
+        `internal/storage/bufpool.go`, backed by new
+        `Manager.ExtendBatch(rel, buf, n)` in `internal/storage/smgr.go`
+        and `relFile.extendBatch(buf, n)`. The batched primitive
+        appends `n` empty `InitPage`-initialized blocks in one
+        smgr-level lock acquire and one `WriteAt(n*BlockSize)`,
+        returning the first new block number; subsequent blocks occupy
+        firstBlk+1 .. firstBlk+n-1. Unlike `PinNew`, no buffer slot is
+        pinned and no `bufmap` entry is published — pages live on disk
+        only; the parent §3 heap-insert caller registers the extras
+        via FSM `RecordFreeSpace` and uses firstBlk for its own insert.
+        The `SmgrCreate` WAL record fires exactly once on the
+        firstBlk==0 batch, matching `PinNew`'s invariant (one
+        `p.logSmgrCreate(rel)` call per relation, never on subsequent
+        batches). The smgr-level batching is the dominant disk-side
+        improvement: replacing eight single-page `Extend` syscalls per
+        8-stripe burst with one `WriteAt(8*BlockSize)` per burst
+        removes per-syscall overhead from the heap-extend hot path.
+        `Manager.ExtendBatch` calls `OnExtendWait` / `OnExtendDone`
+        exactly once per batch (matches `Extend`'s single-event
+        semantics so the activity-registry observer sees one
+        DataFileExtend wait event per batch, not N). Four regression
+        tests in `internal/storage/storage_test.go`:
+        `TestExtendRelationBatchAppendsContiguousBlocks` (8-block
+        batch → firstBlk=0 + per-block bytewise equality vs.
+        `InitPage(buf)` + follow-up 4-block batch starts at 8);
+        `TestExtendRelationBatchEmitsSmgrCreateOnceOnFirstBatch`
+        (first batch emits exactly one `LogSmgrCreate`, second batch
+        emits nothing); `TestExtendRelationBatchInteropWithPinAndExtend`
+        (interleaves `PinNew → ExtendRelationBatch → PinNew`; batch-
+        added blocks Pin cleanly with `Lower=SizeOfPageHeaderData` +
+        `Upper=BlockSize` headers);
+        `TestExtendRelationBatchRejectsNonPositiveN` (n ∈ {0, -1, -8}
+        returns error, NBlocks unchanged). Verified: `go test -race
+        -count=1 -run 'TestExtendRelationBatch' ./internal/storage/`
+        PASS (1.02 s); `go test -race -count=1 ./internal/storage/`
+        PASS (5.36 s). Design:
+        `docs/design/0107-0007c-pool-extend-relation-batch.md`
+        (indexed in `docs/design/README.md`). Remaining slice C
+        foundation before the executor consumer can land: (iii)
+        `Pool.SlotPinCount(tag)` — blocked on M0107-0006 lock-free
+        bufmap. Slice B (WAL insert striping per parent §2) remains
+        deferred — splitting `state.appendMu`'s four invariants is
+        multi-loop scope.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded

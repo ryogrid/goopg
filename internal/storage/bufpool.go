@@ -708,6 +708,45 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 	return s, blk, nil
 }
 
+
+// ExtendRelationBatch appends n empty, initialized blocks to rel as a
+// single batched smgr write, and returns the block number of the first
+// new block; subsequent blocks occupy firstBlk+1 .. firstBlk+n-1.
+//
+// Unlike PinNew, no buffer slot is pinned and no bufmap entry is
+// published — the new pages live on disk only. Subsequent heap-insert
+// calls find them via FSM (the caller registers FSM entries for the
+// added blocks per
+// `docs/design/perf-optimize/07-wal-fsm-insert.md` §3).
+//
+// If the relation transitions from empty to non-empty (firstBlk == 0)
+// the SmgrCreate WAL record is emitted exactly once, matching the
+// invariant pinned by PinNew. Foundation 2 of 3 for M0107-0007 slice C;
+// the executor consumer (`selectInsertPage`) lands after the third
+// foundation (`Pool.SlotPinCount`, blocked on M0107-0006).
+func (p *Pool) ExtendRelationBatch(rel RelFileNode, n int) (BlockNumber, error) {
+	if n <= 0 {
+		return InvalidBlockNumber, fmt.Errorf("ExtendRelationBatch: n=%d must be > 0", n)
+	}
+	// One zero-initialized page is reused for every block; the heap-insert
+	// caller fills the headers and tuples on the next Pin+MarkDirty cycle.
+	page := make([]byte, BlockSize)
+	if err := InitPage(page); err != nil {
+		return InvalidBlockNumber, err
+	}
+	first, err := p.mgr.ExtendBatch(rel, page, n)
+	if err != nil {
+		return InvalidBlockNumber, err
+	}
+	if first == 0 && p.logSmgrCreate != nil {
+		if emitErr := p.logSmgrCreate(rel); emitErr != nil {
+			p.logger.Error("SmgrCreate WAL emission failed",
+				"rel", rel, "err", emitErr)
+		}
+	}
+	return first, nil
+}
+
 // Pin returns the slot holding tag, reading from disk if necessary.
 // The slot's pinCount is incremented; the caller MUST call Unpin.
 //

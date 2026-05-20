@@ -1298,3 +1298,176 @@ func TestPinNewEmitsSmgrCreateOnFirstBlock(t *testing.T) {
 		t.Errorf("SmgrCreate calls after block 1 = %d, want still 1", len(emitted))
 	}
 }
+
+
+func TestExtendRelationBatchAppendsContiguousBlocks(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 90001, Fork: MainFork}
+
+	pool, err := NewPool(mgr, PoolConfig{Slots: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	first, err := pool.ExtendRelationBatch(rel, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 0 {
+		t.Errorf("first new block = %d, want 0", first)
+	}
+	if got, _ := mgr.NBlocks(rel); got != 8 {
+		t.Errorf("NBlocks after batch = %d, want 8", got)
+	}
+
+	// Each new block must be readable and equal to an InitPage-initialized
+	// empty page (no tuples, full free space).
+	want := make([]byte, BlockSize)
+	if err := InitPage(want); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, BlockSize)
+	for blk := BlockNumber(0); blk < 8; blk++ {
+		if err := mgr.ReadBlock(rel, blk, got); err != nil {
+			t.Fatalf("ReadBlock blk=%d: %v", blk, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("blk=%d content mismatch", blk)
+		}
+	}
+
+	// A second batch starts after the first.
+	second, err := pool.ExtendRelationBatch(rel, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != 8 {
+		t.Errorf("second batch start = %d, want 8", second)
+	}
+	if got, _ := mgr.NBlocks(rel); got != 12 {
+		t.Errorf("NBlocks after two batches = %d, want 12", got)
+	}
+}
+
+func TestExtendRelationBatchEmitsSmgrCreateOnceOnFirstBatch(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 90002, Fork: MainFork}
+
+	var emitted []RelFileNode
+	pool, err := NewPool(mgr, PoolConfig{
+		Slots: 8,
+		LogSmgrCreate: func(r RelFileNode) error {
+			emitted = append(emitted, r)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	// First batch (firstBlk == 0): SmgrCreate must fire exactly once.
+	if _, err := pool.ExtendRelationBatch(rel, 8); err != nil {
+		t.Fatal(err)
+	}
+	if len(emitted) != 1 || emitted[0] != rel {
+		t.Errorf("SmgrCreate after first batch = %v, want [%+v]", emitted, rel)
+	}
+
+	// Second batch (firstBlk > 0): SmgrCreate must NOT fire again.
+	if _, err := pool.ExtendRelationBatch(rel, 4); err != nil {
+		t.Fatal(err)
+	}
+	if len(emitted) != 1 {
+		t.Errorf("SmgrCreate after second batch = %v, want unchanged ([%+v])", emitted, rel)
+	}
+}
+
+func TestExtendRelationBatchInteropWithPinAndExtend(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 90003, Fork: MainFork}
+
+	pool, err := NewPool(mgr, PoolConfig{Slots: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	// PinNew → block 0 (pinned, dirty).
+	s0, blk0, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blk0 != 0 {
+		t.Fatalf("PinNew blk=%d, want 0", blk0)
+	}
+	pool.MarkDirty(s0)
+	pool.Unpin(s0)
+
+	// ExtendRelationBatch should continue from block 1.
+	first, err := pool.ExtendRelationBatch(rel, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 1 {
+		t.Errorf("batch firstBlk = %d, want 1", first)
+	}
+	if got, _ := mgr.NBlocks(rel); got != 4 {
+		t.Errorf("NBlocks = %d, want 4", got)
+	}
+
+	// A subsequent PinNew should land on block 4.
+	s4, blk4, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blk4 != 4 {
+		t.Errorf("PinNew after batch: blk=%d, want 4", blk4)
+	}
+	pool.MarkDirty(s4)
+	pool.Unpin(s4)
+
+	// Each block added by the batch must Pin cleanly and be a valid
+	// empty page (an inserter using FSM would find them this way).
+	for blk := BlockNumber(1); blk <= 3; blk++ {
+		s, err := pool.Pin(BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			t.Fatalf("Pin blk=%d: %v", blk, err)
+		}
+		hdr := MustHeader(s.Page())
+		if int(hdr.Upper()) != BlockSize || int(hdr.Lower()) != SizeOfPageHeaderData {
+			t.Errorf("blk=%d header: lower=%d upper=%d, want lower=%d upper=%d",
+				blk, hdr.Lower(), hdr.Upper(), SizeOfPageHeaderData, BlockSize)
+		}
+		pool.Unpin(s)
+	}
+}
+
+func TestExtendRelationBatchRejectsNonPositiveN(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 90004, Fork: MainFork}
+
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	for _, n := range []int{0, -1, -8} {
+		if _, err := pool.ExtendRelationBatch(rel, n); err == nil {
+			t.Errorf("ExtendRelationBatch(n=%d): want error, got nil", n)
+		}
+	}
+	if got, _ := mgr.NBlocks(rel); got != 0 {
+		t.Errorf("NBlocks after rejected calls = %d, want 0", got)
+	}
+}
