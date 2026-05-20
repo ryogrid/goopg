@@ -2658,6 +2658,39 @@ Operational policy (2026-05-20):
           consume `runtimeshim.Nanotime` (requires monotonic→wall
           conversion in `Snapshot()`); bufpool per-slot Sema wait
           caller; per-Go-minor CI matrix.
+      - PARTIAL FINDING 2026-05-21 (loop 4): the per-P xid cache caller
+        was attempted and rolled back in the same loop. `internal/mvcc/
+        XidGen` was rewritten to add a `caches [256]perPXidCache` with
+        `runtimeshim.PinP`/`UnpinP`-guarded refill of 32-xid windows
+        from the global atomic. The change passed all `internal/mvcc/`
+        and `internal/runtimeshim/` tests (including a 32-goroutine
+        × 4 K-allocation uniqueness stress) but deterministically broke
+        `internal/server.TestUpsertDoNothing_WaitsForInFlightDelete`
+        (an M0100-0005s pin) on the first run.
+        Root cause (full write-up in
+        `docs/design/0107-0008d-perp-xidcache-snapshot-incompat.md`):
+        per-P caching breaks two invariants `Manager.captureSnapshot`
+        relies on — (1) monotonic xid assignment across backends, and
+        (2) `Snapshot.Xmax`-as-an-upper-bound-of-all-issued-xids.
+        Both candidate `Peek` definitions break a different visibility
+        invariant: `Peek = min(cache.next ∀ active, global)` excludes
+        currently-issued xids from `InProgress`, mis-classifying live
+        in-flight transactions as "future"; `Peek = global.Load()`
+        re-includes them but then mis-classifies later-issued cached
+        xids as "committed before snapshot". The design doc's
+        correctness argument ("cached xids are invisible by default
+        via CLOG") only covers xids that are *never* issued, not the
+        normal case where a cached xid is later handed out.
+        The XID-cache caller is removed from M0107-0008 scope. The
+        three shim primitives themselves remain accepted (loops 1-3).
+        Remaining callers in scope: activity-registry Nanotime,
+        bufpool per-slot Sema wait, per-P stats counters; the next
+        loop should pick one of these (recommended: activity-registry
+        Nanotime, the smallest with no snapshot interaction).
+        Verification on revert: `go test -race -count=1
+        ./internal/mvcc/ ./internal/server/ ./internal/executor/
+        ./internal/wal/ ./internal/storage/ ./internal/runtimeshim/`
+        all PASS.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
