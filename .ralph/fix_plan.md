@@ -3265,7 +3265,7 @@ Operational policy (2026-05-20):
 
 ### Sub-milestones
 
- - [ ] **M0108-0001 — Initial template body + `config.SampleConfig()` accessor**
+ - [x] **M0108-0001 — Initial template body + `config.SampleConfig()` accessor**
       - Summary: Add `internal/config/postgresql.conf.sample` (hand-maintained,
         PG-style sections: FILE LOCATIONS / CONNECTIONS AND AUTHENTICATION /
         RESOURCE USAGE / WRITE-AHEAD LOG / REPLICATION / QUERY TUNING /
@@ -3284,6 +3284,51 @@ Operational policy (2026-05-20):
         `go vet ./...` clean; `gofmt -l .` empty; `make ralph-state-guard` PASS.
         Manual: `cat internal/config/postgresql.conf.sample | head -40`
         shows PG-style banner + commented-out `#listen_addresses`, `#port`.
+      - COMPLETE 2026-05-21 (M0108-0001 loop 1): template lands with **79**
+        commented-out entries (the 87-GUC registry minus 8 `FlagDisallowInFile`
+        internals — `server_version`, `server_version_num`, `server_encoding`,
+        `integer_datetimes`, `is_superuser`, `in_hot_standby`, `wal_segment_size`,
+        `data_directory_mode`). The 79/79 count was verified against
+        `BuildDefaultRegistry().All()` filtered by `Flags&FlagDisallowInFile == 0`
+        using the design doc's `^#?\s*(\w+)\s*=` parse (extended from the
+        spec's `[a-z_]` first-char form to `\w` so capitalised registry names
+        — `DateStyle`, `TimeZone`, `IntervalStyle` — are not silently dropped;
+        the M0108-0003 sync test will need the same widening or a
+        case-insensitive lookup pass). Sections used (subset of PG 18.3's
+        14-section template — empty sections elided since none of our GUCs
+        target them): CONNECTIONS AND AUTHENTICATION (Connection Settings
+        + Authentication), RESOURCE USAGE (Memory, Background Writer,
+        Asynchronous Behavior), WRITE-AHEAD LOG (Settings, Checkpoints,
+        Archive Recovery), REPLICATION (Sending Servers, Standby Servers),
+        QUERY TUNING (Planner Method Configuration with the two
+        goopg-specific toggles `enable_nestloop_index` /
+        `enable_opportunistic_prune` flagged in their inline comments,
+        Planner Cost Constants), REPORTING AND LOGGING (When To Log,
+        Process Title / I/O Timing), AUTOVACUUM, CLIENT CONNECTION DEFAULTS
+        (Statement Behavior, Locale and Formatting, Other Defaults), LOCK
+        MANAGEMENT, CONFIG FILE INCLUDES, CUSTOMIZED OPTIONS. Each entry
+        carries unit-range-restart-class-enum hints inline. Defaults
+        rendered using human-readable forms where the registry's BootVal
+        is human-readable (`shared_buffers = 128MB`,
+        `effective_cache_size = 4GB`, `work_mem = 512MB`); bare-integer
+        BootVals stay bare (`wal_buffers = 16777216`,
+        `wal_writer_flush_after = 1048576`) so a future M0108-0003
+        BootVal-equality check can compare raw strings before the
+        registry's `parseIntWithUnit` normalises both sides.
+        Header units block restructured from `B  = bytes / kB = kilobytes
+        / ...` (which the design's regex would capture as bogus GUC names
+        `B`/`kB`/`...` once the wider `\w+` parse is used) into
+        non-`name = value` prose (`Memory units: B / kB / MB / ...`).
+        Likewise the `#   name = value` line in the syntax preamble
+        was replaced with prose. `cmd/goopg`-side wiring deliberately
+        deferred to M0108-0002; the new accessor is therefore unconsumed
+        in this loop (verified callable via standalone `go run` against
+        the package's public API). Verified: `go test ./internal/config/...`
+        PASS (0.004 s); `go vet ./internal/config/... ./internal/initdb/...`
+        clean; `gofmt -l internal/config/sample.go` empty (pre-existing
+        formatting drift in `defaults.go` / `guc_test.go` unrelated to
+        this loop). Files: `internal/config/postgresql.conf.sample` (new,
+        260+ lines), `internal/config/sample.go` (new, 17 lines).
 
  - [ ] **M0108-0002 — initdb wiring + retire `defaultPostgresqlConf`**
       - Summary: In `internal/initdb/initdb.go::SampleFiles()`, switch the

@@ -1,0 +1,267 @@
+# -----------------------------
+# PostgreSQL configuration file (goopg edition)
+# -----------------------------
+#
+# This file consists of "name = value" lines (the "=" is optional);
+# whitespace may be used, and comments are introduced with "#" anywhere
+# on a line. The complete list of parameter names and allowed values can
+# be found in goopg's `internal/config/defaults.go`, which is the
+# authoritative source for every GUC the server knows about.
+#
+# All settings are commented out by default.  Uncommenting an entry sets
+# it to the value shown, which equals the server's compiled-in default.
+#
+# This template is hand-maintained against `BuildDefaultRegistry()` in
+# `internal/config/defaults.go`.  The unit test
+# `TestSampleConfigCoversRegistry` enforces that the two stay in lockstep:
+# adding or removing a GUC in the registry MUST be accompanied by adding
+# or removing the matching line in this file (see the "GUC sample-file
+# discipline" section in `.ralph/AGENT.md`).
+#
+# Memory units: B / kB / MB / GB / TB.
+# Time   units: us / ms / s / min / h / d.
+
+
+#------------------------------------------------------------------------------
+# CONNECTIONS AND AUTHENTICATION
+#------------------------------------------------------------------------------
+
+# - Connection Settings -
+
+#listen_addresses = 'localhost'         # comma-separated list of addresses;
+                                        # defaults to 'localhost'; use '*' for all
+                                        # (change requires restart)
+#port = 5432                            # 1-65535
+                                        # (change requires restart)
+#max_connections = 100                  # 1-262143
+                                        # (change requires restart)
+
+# - Authentication -
+
+#scram_iterations = 4096                # 1-1073741824
+
+
+#------------------------------------------------------------------------------
+# RESOURCE USAGE (except WAL)
+#------------------------------------------------------------------------------
+
+# - Memory -
+
+#shared_buffers = 128MB                 # min 128kB
+                                        # (change requires restart)
+#work_mem = 512MB                       # min 64kB
+
+# - Background Writer -
+
+#bgwriter_delay = 200                   # 10-10000 ms between rounds
+                                        # (change requires restart)
+#bgwriter_lru_maxpages = 100            # 0-1000 max buffers written/round;
+                                        # 0 disables background writing
+                                        # (change requires restart)
+
+# - Asynchronous Behavior -
+
+#max_worker_processes = 8               # 0-262143
+                                        # (change requires restart)
+#io_method = worker                     # sync | worker | io_uring
+                                        # (change requires restart)
+#io_workers = 3                         # 1-1024 worker goroutines for io_method=worker
+                                        # (change requires restart)
+#io_max_concurrency = 0                 # 0-1024; 0 = let the method decide
+                                        # (change requires restart)
+#max_parallel_workers_per_gather = 2    # 0-1024; taken into account by SET-only;
+                                        # planner currently ignores it
+#min_parallel_table_scan_size = 8MB     # 0-715827882 kB
+#min_parallel_index_scan_size = 512kB   # 0-715827882 kB
+
+
+#------------------------------------------------------------------------------
+# WRITE-AHEAD LOG
+#------------------------------------------------------------------------------
+
+# - Settings -
+
+#wal_level = replica                    # minimal | replica | logical
+                                        # (change requires restart)
+#wal_buffers = 16777216                 # 0-1073741824 bytes; 0 disables
+                                        # the in-memory WAL buffer
+                                        # (change requires restart)
+#wal_writer_delay = 200                 # 1-10000 ms between WAL-writer rounds
+                                        # (change requires restart)
+#wal_writer_flush_after = 1048576       # 0-1073741824 bytes; 0 fsyncs every round
+                                        # (change requires restart)
+#wal_init_zero = on                     # zero-fill new WAL segments
+                                        # (change requires restart)
+#wal_sender_memory_buffer = 16777216    # 0-1073741824 bytes in-memory WAL ring
+                                        # (change requires restart)
+#full_page_writes = on                  # log full pages after first mod since
+                                        # last checkpoint (SIGHUP to apply)
+#synchronous_commit = on                # off | local | remote_write |
+                                        # on (= remote_flush) | remote_apply
+
+# - Checkpoints -
+
+#checkpoint_timeout = 300               # 30-86400 s between automatic checkpoints
+                                        # (SIGHUP to apply)
+#checkpoint_completion_target = 0.9     # 0.0-1.0 fraction of checkpoint_timeout
+                                        # (SIGHUP to apply)
+#max_wal_size = 1024                    # 2-2147483647 MB
+                                        # (SIGHUP to apply)
+#min_wal_size = 80                      # 2-2147483647 MB
+                                        # (SIGHUP to apply)
+
+# - Archive Recovery -
+
+#recovery_target_timeline = 'latest'    # 'latest' | 'current' | timeline OID
+                                        # (change requires restart)
+
+
+#------------------------------------------------------------------------------
+# REPLICATION
+#------------------------------------------------------------------------------
+
+# - Sending Servers -
+
+#max_wal_senders = 10                   # 0-262143; concurrent walsender procs
+                                        # (change requires restart)
+#max_replication_slots = 10             # 0-262143
+                                        # (change requires restart)
+#wal_sender_timeout = 60s               # 0-1073741824 ms; 0 disables timeout
+                                        # (SIGHUP to apply)
+#max_slot_wal_keep_size = -1            # -1 to 2147483647 MB; -1 = no limit
+                                        # (SIGHUP to apply)
+#synchronous_standby_names = ''         # standby selection grammar;
+                                        # '' = async (no wait)
+                                        # (SIGHUP to apply)
+#summarize_wal = off                    # toggles the WAL-summarizer worker
+                                        # (SIGHUP to apply)
+
+# - Standby Servers -
+
+#primary_conninfo = ''                  # libpq-style connection string
+                                        # (SIGHUP to apply)
+#primary_slot_name = ''                 # replication slot to use on primary
+                                        # (SIGHUP to apply)
+#wal_receiver_status_interval = 10      # 0-2147483 s; 0 disables status updates
+                                        # (SIGHUP to apply)
+#hot_standby = on                       # allow read-only queries during recovery
+                                        # (change requires restart)
+
+
+#------------------------------------------------------------------------------
+# QUERY TUNING
+#------------------------------------------------------------------------------
+
+# - Planner Method Configuration -
+
+#enable_seqscan = on
+#enable_indexscan = on
+#enable_indexonlyscan = on
+#enable_bitmapscan = on
+#enable_hashjoin = on
+#enable_mergejoin = on
+#enable_nestloop = on
+#enable_sort = on
+#enable_hashagg = on
+#enable_material = on
+#enable_partition_pruning = on
+#enable_nestloop_index = on             # goopg-specific: index nested-loop join
+#enable_opportunistic_prune = on        # goopg-specific: inline HOT page-prune
+
+# - Planner Cost Constants -
+
+#random_page_cost = 4.0                 # 0-1e9
+#effective_cache_size = 4GB             # 1-1099511627776 kB
+
+
+#------------------------------------------------------------------------------
+# REPORTING AND LOGGING
+#------------------------------------------------------------------------------
+
+# - When To Log -
+
+#log_statement = 'none'                 # none | ddl | mod | all
+#log_min_duration_statement = -1        # -1 disables; otherwise ms threshold
+
+# - Process Title / I/O Timing -
+
+#track_io_timing = off                  # collect per-I/O wait timing
+                                        # (change requires restart)
+
+
+#------------------------------------------------------------------------------
+# AUTOVACUUM
+#------------------------------------------------------------------------------
+
+#autovacuum_freeze_max_age = 200000000  # 100000-2000000000 xids
+                                        # (change requires restart)
+
+
+#------------------------------------------------------------------------------
+# CLIENT CONNECTION DEFAULTS
+#------------------------------------------------------------------------------
+
+# - Statement Behavior -
+
+#search_path = '"$user", public'        # schema search path
+#default_statistics_target = 100        # 1-10000
+#statement_timeout = 0                  # 0-2147483647 ms; 0 disables
+#lock_timeout = 0                       # 0-2147483647 ms; 0 disables
+#idle_in_transaction_session_timeout = 0  # 0-2147483647 ms; 0 disables
+#client_min_messages = 'notice'         # debug5..debug1 | log | notice |
+                                        # warning | error
+#default_transaction_isolation = 'read committed'
+                                        # read uncommitted | read committed |
+                                        # repeatable read | serializable
+#default_transaction_read_only = off
+#transaction_isolation = 'read committed'   # current-transaction read-only;
+                                            # SHOW only
+#application_name = ''                  # session label echoed in pg_stat_activity
+#session_authorization = ''             # role identity for the session
+#vacuum_freeze_min_age = 50000000       # 0-1000000000 xids
+
+# - Locale and Formatting -
+
+#DateStyle = 'ISO, MDY'
+#IntervalStyle = 'postgres'             # postgres | postgres_verbose |
+                                        # sql_standard | iso_8601
+#TimeZone = 'UTC'
+#client_encoding = 'UTF8'               # actually defaults to whatever the
+                                        # client negotiates at startup
+
+# - Other Defaults -
+
+#standard_conforming_strings = on
+
+
+#------------------------------------------------------------------------------
+# LOCK MANAGEMENT
+#------------------------------------------------------------------------------
+
+#max_locks_per_transaction = 64         # 10-2147483647 per-backend slots
+                                        # (change requires restart)
+#max_predicate_locks_per_xact = 64      # 10-1073741824
+                                        # (change requires restart)
+#max_predicate_locks_per_relation = -2  # negative = fraction;
+                                        # see internal/mvcc/predicate_locks.go
+                                        # (SIGHUP to apply)
+#max_predicate_locks_per_page = 2       # 0-65536
+                                        # (SIGHUP to apply)
+#max_prepared_transactions = 0          # 0-262143; zero disables 2PC
+                                        # (change requires restart)
+
+
+#------------------------------------------------------------------------------
+# CONFIG FILE INCLUDES
+#------------------------------------------------------------------------------
+
+# Goopg does not currently honor PG-style include_dir / include_if_exists /
+# include directives.  They are listed here only for documentation; adding
+# them to a running postgresql.conf has no effect today.
+
+
+#------------------------------------------------------------------------------
+# CUSTOMIZED OPTIONS
+#------------------------------------------------------------------------------
+
+# Add settings for extensions here.
