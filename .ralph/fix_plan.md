@@ -2549,6 +2549,54 @@ Operational policy (2026-05-20):
           extension per parent §3. Requires `Pool.SlotPinCount(tag)`
           ([[0107-0006]] consumer), `FSM.GetCandidates(rel, minBytes, n)`,
           and `Pool.ExtendRelationBatch(rel, n)`.
+      - PARTIAL PROGRESS 2026-05-21 (slice C foundation 1 of 3 —
+        `FSM.GetCandidates` top-K query): added
+        `(*FSM).GetCandidates(rel, minFreeBytes, n) []BlockNumber` to
+        `internal/storage/fsm.go`. Returns up to N block numbers whose
+        registered free-space estimate is ≥ minFreeBytes, ordered by
+        free-space descending; ties (equal estimates) resolve to lowest
+        block number first (deterministic for reproducible plans).
+        Algorithm is `O(blocks · log K)` worst case via a small
+        insertion-sort buffer of length `K = n` (n is typically 4 per
+        the parent design's `candidatesPerInsert`); the strict `>`
+        comparison preserves first-seen order among ties, and FSM
+        iteration is ascending block number, so the tie-break to lowest
+        block number falls out for free. Lock discipline mirrors the
+        existing `GetPageWithFreeSpace`: `f.mu.RLock` held for the entire
+        scan; the returned slice is freshly allocated and caller-owned,
+        so no further coordination is required to read it after the
+        method returns. Like `GetPageWithFreeSpace`, returned blocks
+        may be stale — callers handle a failed `PageAddItem` by
+        invalidating the FSM entry (`f.RecordFreeSpace(rel, blk, 0)`)
+        and retrying against another candidate or extending. Dead code
+        until the parent §3 executor consumer (`selectInsertPage`)
+        lands, which in turn waits for the other two foundations
+        (`Pool.SlotPinCount(tag)` blocked on M0107-0006; batched
+        `Pool.ExtendRelationBatch(rel, n)` as a separate slice). The
+        foundation-first pattern matches M0107-0008's shim primitives
+        ([[0107-0008]] / [[0107-0008b]] / [[0107-0008c]]) landing before
+        their callers. Four regression tests in
+        `internal/storage/fsm_test.go`:
+        `TestFSMGetCandidatesBasic` (5-block input → known top-3
+        ordering, then top-10 capped to 3 qualifying, then floor too
+        high → nil); `TestFSMGetCandidatesEdgeCases` (nil receiver,
+        n=0, n<0, minFreeBytes=0, empty relation, tie-break to lowest
+        block); `TestFSMGetCandidatesLargeRelation` (1000-block scan
+        with deterministic distribution + known top-4 outliers at
+        950-953, asserts insertion-sort window correctness);
+        `TestFSMGetCandidatesDoesNotMutateState` (read-only invariant
+        pinned against a subsequent `GetPageWithFreeSpace` call).
+        Verified: `go test -race -count=1 -run 'TestFSMGetCandidates'
+        ./internal/storage/` PASS (1.03 s); `go test -race -count=1
+        ./internal/storage/` PASS (5.35 s). Design:
+        `docs/design/0107-0007b-fsm-get-candidates.md` (indexed in
+        `docs/design/README.md`). Remaining slice C foundations
+        before the executor consumer can land: (i)
+        `Pool.SlotPinCount(tag)` — blocked on M0107-0006 lock-free
+        bufmap; (ii) `Pool.ExtendRelationBatch(rel, n)` — independent
+        slice. Slice B (WAL insert striping per parent §2) remains
+        deferred — splitting `state.appendMu`'s four invariants is
+        multi-loop scope.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
