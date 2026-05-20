@@ -3095,22 +3095,24 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return false, nil
 	}
 
-	// FSM consultation (M0046-0003): if a page freed by a previous
-	// VACUUM has enough room, use it before trying the last block or
-	// extending the relation.
+	// FSM consultation: ask the FSM for up to candidatesPerInsert pages
+	// with enough room and pick the one with the lowest live pin count
+	// (M0107-0007 slice C — pin-aware page selection per
+	// docs/design/perf-optimize/07-wal-fsm-insert.md §3). Returns
+	// (0, false) when every candidate is at or above hotPinThreshold,
+	// signalling the caller to fall through to extension instead of
+	// converging on a hot tail page.
 	minFreeBytes := uint16(len(tupleBytes) + 4) // 4 = itemIDSize (line pointer size)
-	if ctx.FSM != nil {
-		if fsmBlk, ok := ctx.FSM.GetPageWithFreeSpace(rel, minFreeBytes); ok {
-			appended, err := tryAppendToBlock(fsmBlk)
-			if err != nil {
-				return ptr, err
-			}
-			if appended {
-				return ptr, nil
-			}
-			// Stale FSM entry — invalidation was already done in
-			// tryAppendToBlock above; fall through to normal path.
+	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
+		appended, err := tryAppendToBlock(fsmBlk)
+		if err != nil {
+			return ptr, err
 		}
+		if appended {
+			return ptr, nil
+		}
+		// Stale FSM entry — invalidation was already done in
+		// tryAppendToBlock above; fall through to normal path.
 	}
 
 	// Try the last existing block first.
@@ -3266,16 +3268,17 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		return false, nil
 	}
 
+	// FSM consultation with pin-aware ranking (M0107-0007 slice C); same
+	// rewrite as writeHeapRowReturning above, applied to the PG-canonical
+	// path. See docs/design/perf-optimize/07-wal-fsm-insert.md §3.
 	minFreeBytes := uint16(len(tupleBytes) + 4)
-	if ctx.FSM != nil {
-		if fsmBlk, ok := ctx.FSM.GetPageWithFreeSpace(rel, minFreeBytes); ok {
-			appended, err := tryAppendToBlock(fsmBlk)
-			if err != nil {
-				return ptr, err
-			}
-			if appended {
-				return ptr, nil
-			}
+	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
+		appended, err := tryAppendToBlock(fsmBlk)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
 		}
 	}
 

@@ -2744,6 +2744,46 @@ Operational policy (2026-05-20):
         in `docs/design/README.md`). Next slice for this milestone is
         the call-site rewrite that consumes `selectFSMCandidatePage` +
         `Pool.ExtendRelationBatch` and clears the WAL byte-diff gate.
+      - PARTIAL PROGRESS 2026-05-21 (slice C call-site rewrite part 1
+        of 2 — pin-aware FSM consultation in heap-insert hot path):
+        `writeHeapRowReturning` and `writeHeapRowReturningPG` in
+        `internal/executor/operators_storage.go` now consult the
+        slice-C executor helper `selectFSMCandidatePage(ctx.FSM,
+        ctx.Pool, rel, minFreeBytes)` from [[0107-0007e]] instead of
+        the single-block `ctx.FSM.GetPageWithFreeSpace(rel,
+        minFreeBytes)`. Matching `(BlockNumber, bool)` signature
+        makes the change a one-liner per call site; the surrounding
+        `if ctx.FSM != nil` wrapper is removed because the helper
+        returns `(0, false)` on nil-FSM or nil-Pool itself. Under low
+        concurrency the selected block is unchanged
+        (`FSM.GetCandidates` returns blocks in free-space-desc with
+        lowest-block tie-break, matching `GetPageWithFreeSpace`'s
+        scan order; the first pin-0 short-circuit picks the same
+        candidate). Under high concurrency every backend's
+        `Pool.SlotPinCount` probe biases it away from the hot tail
+        page so backends spread across cold FSM candidates instead
+        of converging on one slot's content lock. Per-record WAL
+        emission is byte-identical — only the block-reference number
+        embedded in `XLOG_HEAP_INSERT` for a given workload changes
+        under contention, which PG standby replay handles per-record
+        (no "expected next block" invariant). The batched-extend
+        half of slice C (replacing `PinNew` with
+        `Pool.ExtendRelationBatch` per [[0107-0007c]] + FSM
+        registration for the extras) plus slice B (8-stripe
+        `wal.Writer.appendLocks` per parent §2) both stay deferred —
+        those need the parent milestone's WAL byte-diff integration
+        gate. Verified: `go test -race -count=1 ./internal/executor/`
+        PASS (2.76 s); `go test -race -count=1 ./internal/storage/`
+        PASS (5.38 s); `go test -race -count=1 ./internal/wal/` PASS
+        (3.26 s); `go test -race -count=1 ./internal/server/` PASS
+        (5.83 s). The six existing `TestSelectFSMCandidatePage*`
+        helper tests in `internal/executor/heap_insert_select_test.go`
+        exercise the pin-aware ranking; the broader executor/server
+        suites exercise the wiring end-to-end through every existing
+        `writeHeapRowReturning` caller (planner integration,
+        lockrows, upsert, merge, apply-worker, partition tests).
+        Design: `docs/design/0107-0007f-heap-insert-fsm-pin-aware.md`
+        (indexed in `docs/design/README.md`).
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
