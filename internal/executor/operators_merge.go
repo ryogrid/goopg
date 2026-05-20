@@ -54,6 +54,7 @@ var errMergeSourceUnmatched = errors.New("merge: source row unmatched (target ro
 // target row was concurrently updated. The caller must re-evaluate WHEN
 // MATCHED conditions against the new live row (EPQ recheck). M0100-0005.
 type mergeEPQError struct {
+	newBlk    storage.BlockNumber // same as caller's blk for HOT; may differ for non-HOT
 	newSlot   uint16
 	newTgtRow Row
 }
@@ -407,12 +408,14 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 					newRow[i] = val
 				}
 				_ = computeGeneratedColumns(tbl.Columns, newRow)
+				mod.blk = epqErr.newBlk
 				mod.slot = epqErr.newSlot
 				mod.tgtRow = epqErr.newTgtRow // update for trigger firing in next iteration
 				mod.newRow = newRow
 				mod.action = planner.MergeActionUpdate
 				reMatched = true
 			case planner.MergeActionDelete:
+				mod.blk = epqErr.newBlk
 				mod.slot = epqErr.newSlot
 				mod.tgtRow = epqErr.newTgtRow
 				mod.action = planner.MergeActionDelete
@@ -493,12 +496,17 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		mergeEPQRefreshSnap(ctx)
 		// Follow HOT chain to find the current live tuple.
 		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
-		if !found {
-			return errMergeSourceUnmatched // row deleted; caller retries as NOT MATCHED
+		if found {
+			// Signal the caller to re-evaluate WHEN MATCHED conditions with the new row.
+			// Trigger will fire on the NEXT call with the correct live row. M0100-0005.
+			return &mergeEPQError{newBlk: blk, newSlot: newSlot, newTgtRow: newTgtRow}
 		}
-		// Signal the caller to re-evaluate WHEN MATCHED conditions with the new row.
-		// Trigger will fire on the NEXT call with the correct live row. M0100-0005.
-		return &mergeEPQError{newSlot: newSlot, newTgtRow: newTgtRow}
+		// Non-HOT cross-page update (partition children skip HOT in updateOp because
+		// puRel != rel): fall back to raw t_ctid chain, same pattern as updateOp.Next().
+		if cBlk, cSlot, cRow, cFound := epqFollowChain(ctx, rel, blk, slot, cols, nil); cFound {
+			return &mergeEPQError{newBlk: cBlk, newSlot: cSlot, newTgtRow: cRow}
+		}
+		return errMergeSourceUnmatched // row deleted; caller retries as NOT MATCHED
 	}
 	// No concurrent update: safe to write. Release lock, fire BEFORE trigger, re-pin, write.
 	s.Unlock()
@@ -561,10 +569,13 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 			return errMergeSourceUnmatched
 		}
 		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
-		if !found {
-			return errMergeSourceUnmatched // row deleted by concurrent tx; caller retries as NOT MATCHED
+		if found {
+			return &mergeEPQError{newBlk: blk, newSlot: newSlot, newTgtRow: newTgtRow}
 		}
-		return &mergeEPQError{newSlot: newSlot, newTgtRow: newTgtRow}
+		if cBlk, cSlot, cRow, cFound := epqFollowChain(ctx, rel, blk, slot, cols, nil); cFound {
+			return &mergeEPQError{newBlk: cBlk, newSlot: cSlot, newTgtRow: cRow}
+		}
+		return errMergeSourceUnmatched // row deleted by concurrent tx; caller retries as NOT MATCHED
 	}
 	s.Unlock()
 	ctx.Pool.Unpin(s)

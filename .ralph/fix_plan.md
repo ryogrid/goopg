@@ -845,6 +845,7 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
 - [ ] **M0100-0005**
       - Summary: E2E pass confirmation: all 21 dedicated RC isolation
         tests pass. **Closes M0096-0005 and M0096-0013 via cross-reference.**
+      - Depends: Close of M0107
       - Run: `go test -v -run TestPort_Isolation -timeout 30m ./internal/testport/`.
       - DoD: every `TestPort_Isolation*` listed in M0096-0001 reports `pass`
         (none `defer`, none `excluded`). On completion:
@@ -1971,6 +1972,25 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           terminating the previously-infinite `isConcurrentlyUpdated` retry (no more
           spurious 40001). Fixes `TestNoticeCaptureUpdateTrigger` regression.
           **PASS count = 14**: adds InsertConflictDoUpdate2, MergeDelete.
+        - **Loop-19 partition EPQ recheck + EXPLAIN Merge format (2026-05-20)**:
+          (A) `mergeApplyUpdate`/`mergeApplyDelete` lacked `epqFollowChain`
+          fallback for non-HOT cross-page updates. `updateOp.Next()` skips
+          `tryApplyHOTUpdate` for partition children (`puRel != rel`), so
+          child-partition updates set xmax+CTID but leave `HeapHotUpdated=0`.
+          `epqFollowHOT` terminates immediately; added `epqFollowChain` as
+          fallback (mirrors the same two-step pattern in `updateViaIndex` and
+          `updateOp.Next()`). `mergeEPQError` gains `newBlk` field; `applyMod`
+          now updates both `mod.blk` and `mod.slot` from the EPQ result.
+          `MergeMatchRecheck` advances from L234 to L257 first-divergence
+          (256/551 lines now match; `target_pa` permutations pass).
+          (B) `describePlan` now returns `"Merge on <table>"` for `*planner.Merge`
+          (was `"*planner.Merge"`). `planChildren` returns `[p.Source]` for
+          Merge so EXPLAIN shows the source scan as child node. MergeJoin
+          EXPLAIN now shows `Merge on tgt` (structural mismatch with PG's
+          join plan remains; test still SKIP).
+          **PASS count = 14** (unchanged — MergeMatchRecheck still fails on
+          CTE-with-MERGE-RETURNING at L257+; MergeJoin fails on EXPLAIN join
+          tree structure).
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
