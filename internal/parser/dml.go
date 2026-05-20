@@ -116,7 +116,7 @@ func (p *parser) parseOnConflict() (*OnConflictClause, error) {
 	switch {
 	case p.acceptSymbol("("):
 		tgtPos := p.cur().Pos
-		cols, err := p.parseConflictTargetColumnList()
+		cols, colExprs, err := p.parseConflictTargetColumnList()
 		if err != nil {
 			return nil, err
 		}
@@ -131,7 +131,7 @@ func (p *parser) parseOnConflict() (*OnConflictClause, error) {
 				return nil, werr
 			}
 		}
-		clause.Target = &OnConflictTarget{pos: tgtPos, Columns: cols}
+		clause.Target = &OnConflictTarget{pos: tgtPos, Columns: cols, Exprs: colExprs}
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn:
 		tgtPos := p.cur().Pos
 		p.advance()
@@ -200,26 +200,31 @@ func (p *parser) parseColumnNameList() ([]string, error) {
 
 // parseConflictTargetColumnList parses the column list inside ON CONFLICT (…).
 // Unlike parseColumnNameList it handles:
-//   - expression columns: lower(col) — stored as ""
+//   - expression columns: lower(col) — stored as "" in cols with the parsed
+//     expression in the parallel exprs slice
 //   - optional COLLATE "…" or COLLATE ident after each column/expression
 //   - optional opclass name (bare ident) after the collation
 //
 // The stop condition is ')' or a keyword like DO/WHERE.
-func (p *parser) parseConflictTargetColumnList() ([]string, error) {
+func (p *parser) parseConflictTargetColumnList() ([]string, []Expr, error) {
 	var cols []string
+	var exprs []Expr
 	for {
 		var colName string
+		var colExpr Expr
 		// Expression column: ident followed by '(' e.g. lower(fruit)
 		if p.cur().Kind == TokenIdent && p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
-			// Parse and discard the expression.
-			if _, err := p.parseExpr(); err != nil {
-				return nil, err
+			// Parse and capture the expression.
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, nil, err
 			}
 			colName = ""
+			colExpr = e
 		} else {
 			tok, err := p.parseIdent()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			colName = identText(tok)
 		}
@@ -240,6 +245,7 @@ func (p *parser) parseConflictTargetColumnList() ([]string, error) {
 		}
 
 		cols = append(cols, colName)
+		exprs = append(exprs, colExpr)
 		if !p.acceptSymbol(",") {
 			break
 		}
@@ -254,7 +260,7 @@ func (p *parser) parseConflictTargetColumnList() ([]string, error) {
 			}
 		}
 	}
-	return cols, nil
+	return cols, exprs, nil
 }
 
 func (p *parser) parseValuesRows() ([][]Expr, error) {

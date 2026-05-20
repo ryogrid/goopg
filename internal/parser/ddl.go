@@ -1176,11 +1176,12 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '('")
 	}
-	cols, err := p.parseIndexColumnList()
+	cols, colExprs, err := p.parseIndexColumnList()
 	if err != nil {
 		return nil, err
 	}
 	stmt.Columns = cols
+	stmt.ColExprs = colExprs
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("expected ')'")
 	}
@@ -1239,33 +1240,37 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 //   - optional opclass name (bare ident) after the collation
 //   - optional ASC/DESC and NULLS FIRST/LAST modifiers
 //
-// For expression entries the column name is stored as "" (the important
-// thing is the parser doesn't crash). Simple column names are stored
-// verbatim.
-func (p *parser) parseIndexColumnList() ([]string, error) {
+// For expression entries the column name is stored as "" and the parsed
+// expression is returned in the parallel exprs slice. Simple column names
+// are stored verbatim with nil in exprs.
+func (p *parser) parseIndexColumnList() ([]string, []Expr, error) {
 	var cols []string
+	var exprs []Expr
 	for {
 		var colName string
+		var colExpr Expr
 		// Expression column: starts with ident followed by '('
 		// e.g. lower(fruit)
 		if p.cur().Kind == TokenIdent && p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
-			// Parse and discard the expression.
-			_, err := p.parseExpr()
+			// Parse and capture the expression.
+			e, err := p.parseExpr()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			colName = "" // expression — no simple column name
+			colExpr = e
 		} else if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 			// Parenthesised expression: (expr)
-			_, err := p.parseExpr()
+			e, err := p.parseExpr()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			colName = ""
+			colExpr = e
 		} else {
 			tok, err := p.parseIdent()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			colName = identText(tok)
 		}
@@ -1298,6 +1303,7 @@ func (p *parser) parseIndexColumnList() ([]string, error) {
 		}
 
 		cols = append(cols, colName)
+		exprs = append(exprs, colExpr)
 		if !p.acceptSymbol(",") {
 			break
 		}
@@ -1307,7 +1313,7 @@ func (p *parser) parseIndexColumnList() ([]string, error) {
 			break
 		}
 	}
-	return cols, nil
+	return cols, exprs, nil
 }
 
 // parseDrop dispatches on the next keyword after DROP.

@@ -478,6 +478,12 @@ func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat cata
 					"ON CONFLICT target requires at least one column")
 			}
 			for _, col := range oc.Target.Columns {
+				if col == "" {
+					// Expression column (e.g. lower(key)) — existence
+					// check deferred to the planner's arbiter-index
+					// resolution.
+					continue
+				}
 				if _, ok := lookupColumn(tbl, col); !ok {
 					return analyzeError(oc.Target.Pos(), "42703",
 						fmt.Sprintf("column %q of relation %q does not exist", col, tbl.Name))

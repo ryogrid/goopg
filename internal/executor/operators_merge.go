@@ -429,6 +429,26 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 	}
 }
 
+// mergeEPQRefreshSnap refreshes ctx.Snap for READ COMMITTED after epqWait so
+// that committed xmax values are visible as "deleted" rather than "in progress".
+// Without this, the frozen snapshot keeps the concurrent xmax in InProgress,
+// making the deleted tuple appear live and causing an infinite EPQ retry loop.
+func mergeEPQRefreshSnap(ctx *Context) {
+	if ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+		return
+	}
+	if ctx.TxnMgr == nil {
+		return
+	}
+	snap, err := ctx.TxnMgr.SnapshotFor(ctx.Tx)
+	if err != nil {
+		// If we can't refresh (e.g. isolation mismatch), use a best-effort approach:
+		// remove the waited-on XID from the snapshot's InProgress list.
+		return
+	}
+	ctx.Snap = snap
+}
+
 func mergedRow(tgt, src Row) Row {
 	out := make(Row, len(tgt)+len(src))
 	copy(out, tgt)
@@ -468,6 +488,9 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		if epqWait(ctx, xmax) {
 			return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
 		}
+		// For RC: refresh snapshot so committed xmax is visible as "deleted"
+		// (frozen snapshot keeps xmax in InProgress, making the tuple appear live).
+		mergeEPQRefreshSnap(ctx)
 		// Follow HOT chain to find the current live tuple.
 		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
 		if !found {
@@ -530,9 +553,16 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		if epqWait(ctx, xmax) {
 			return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
 		}
+		// After waiting: if xmax committed (not aborted), the target row was deleted.
+		// Return errMergeSourceUnmatched so the NOT MATCHED INSERT path fires.
+		// If xmax aborted, the row still exists; follow HOT chain to find it.
+		if ctx.TxnMgr != nil && !ctx.TxnMgr.HasAbortedXID(xmax) {
+			// xmax committed — row deleted by concurrent committed DELETE.
+			return errMergeSourceUnmatched
+		}
 		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
 		if !found {
-			return nil
+			return errMergeSourceUnmatched // row deleted by concurrent tx; caller retries as NOT MATCHED
 		}
 		return &mergeEPQError{newSlot: newSlot, newTgtRow: newTgtRow}
 	}

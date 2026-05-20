@@ -245,6 +245,11 @@ type Index struct {
 	Method  string
 	Primary bool
 	OID     uint32
+	// ColExprs holds the parsed expression AST for expression-based index
+	// columns (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil
+	// when Columns[i] == "" (expression column); nil for plain column names.
+	// Not persisted to JSON (parser.Expr is not JSON-serializable).
+	ColExprs []*parser.Expr
 }
 
 // QualifiedName renders the table's name in the canonical

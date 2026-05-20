@@ -1946,6 +1946,28 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           Design: `docs/design/0100-0005-loop17-merge-not-matched-insert-and-failed-tx.md`.
           MergeDelete advances to 234/236 matching lines (trigger/concurrency
           NOTICEs in perms 17+19 still missing; root cause TBD).
+        - **Loop-18 expression-based unique index + MERGE/UPDATE correctness (2026-05-20)**:
+          (A) Expression-based unique indexes (`ON CONFLICT (lower(key))`):
+          `parseIndexColumnList` / `parseConflictTargetColumnList` now capture
+          and return `[]parser.Expr` alongside column names; `OnConflictTarget.Exprs`
+          and `CreateIndexStmt.ColExprs` store them. `execCreateIndex` no longer
+          silently skips expression indexes. `resolveArbiterIndex` handles `""` columns
+          with sentinel -1; `planOnConflict` resolves `ArbiterExprs`; `encodeArbiterKey`
+          evaluates expressions via `evalExprSlot`. `analyzeOnConflict` skips column-
+          existence check for expression columns. `catalog.Index.ColExprs` stores
+          parsed expressions. `TestPort_IsolationInsertConflictDoUpdate2` flips PASS.
+          (B) `mergeApplyDelete` now returns `errMergeSourceUnmatched` (was `nil`) when
+          `epqFollowHOT` finds no successor — row deleted by concurrent committed tx.
+          `mergeEPQRefreshSnap` refreshes ctx.Snap for RC after `epqWait` so the
+          committed delete is visible. `HasAbortedXID` check for immediate return when
+          xmax committed. `TestPort_IsolationMergeDelete` flips PASS.
+          (C) `updateViaIndex` trigger + EPQ fixes: BEFORE UPDATE trigger now uses
+          `idxRowHasConcurrentXmax` pre-check — fires immediately only when no
+          concurrent xmax present; defers to EPQ loop otherwise. RC snapshot refresh
+          added after `epqWait` in EPQ loop so committed deletes are visible,
+          terminating the previously-infinite `isConcurrentlyUpdated` retry (no more
+          spurious 40001). Fixes `TestNoticeCaptureUpdateTrigger` regression.
+          **PASS count = 14**: adds InsertConflictDoUpdate2, MergeDelete.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 

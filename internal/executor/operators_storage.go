@@ -1193,6 +1193,26 @@ func indexScanPredicate(ix *planner.IndexScan) planner.Expr {
 // skip any index inserts. If no indexes exist, all updates are
 // HOT-eligible (the same-page placement is still beneficial for
 // space reuse even without an index-cost saving).
+// idxRowHasConcurrentXmax peeks at the page under a brief RLock to check
+// whether the tuple at (blk, slot) has a concurrent (non-self) xmax stamp.
+// This is used before firing a BEFORE UPDATE trigger: if a concurrent xmax is
+// present (DELETE or UPDATE in flight), we defer the trigger to the EPQ loop
+// so it only fires when EPQ confirms the row will actually be written.
+func idxRowHasConcurrentXmax(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16) bool {
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+	if err != nil {
+		return false
+	}
+	s.RLock()
+	t, gerr := storage.PageGetHeapTuple(s.Page(), slot)
+	s.RUnlock()
+	ctx.Pool.Unpin(s)
+	if gerr != nil {
+		return false
+	}
+	return isConcurrentlyUpdated(t.Header, ctx.Tx.XID, &ctx.Snap)
+}
+
 func hotUpdateEligible(plan *planner.Update, ctx *Context) bool {
 	indexes := ctx.Catalog.IndexesOnTable(plan.Table)
 	for _, idx := range indexes {
@@ -1610,13 +1630,19 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
 	idxTbl := o.plan.Table
 	for _, pu := range pending {
-		// Fire BEFORE UPDATE triggers (e.g. RAISE NOTICE) before writing.
-		if len(idxTbl.Triggers) > 0 {
+		// Fire BEFORE UPDATE trigger if the row has no concurrent xmax (i.e. a
+		// HOT-eligible write or a plain non-concurrent update). When a concurrent
+		// xmax is present (concurrent DELETE / UPDATE in progress), defer the
+		// trigger to the EPQ loop so it only fires when EPQ confirms the row will
+		// actually be written. M0100-0005-merge-delete-fix.
+		trigFiredViaIdx := false
+		if len(idxTbl.Triggers) > 0 && !idxRowHasConcurrentXmax(o.ctx, rel, pu.blk, pu.slot) {
 			retRow, ok := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
 			if !ok {
 				continue // RETURN NULL — skip this row
 			}
 			pu.newRow = retRow
+			trigFiredViaIdx = true
 		}
 		used := false
 		if hotEligible {
@@ -1660,6 +1686,16 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							Code:    "40001",
 							Pos:     o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update (deadlock)",
+						}
+					}
+					// RC: refresh snapshot so committed deletes/updates are
+					// visible without relying on the frozen BEGIN-time snapshot.
+					// Without this, the committed xmax stays in snap.InProgress
+					// and epqRecheckVisible returns true indefinitely (tight loop
+					// until maxEPQRetries → spurious 40001). M0100-0005-merge-delete.
+					if o.ctx.Tx.Isolation == mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+						if newSnap, snapErr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); snapErr == nil {
+							o.ctx.Snap = newSnap
 						}
 					}
 					// M0100-0004: EPQ chain-following for RC; 40001 for RR.
@@ -1731,6 +1767,44 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					o.ctx.Pool.Unpin(s)
 					epqSkip = true
 					break
+				}
+				// Fire BEFORE UPDATE trigger after EPQ validation confirms the row
+				// will be updated. Fires at most once per pending update. Unlock
+				// the page first so trigger SQL can proceed safely.
+				if !trigFiredViaIdx && len(idxTbl.Triggers) > 0 {
+					trigFiredViaIdx = true
+					s.Unlock()
+					o.ctx.Pool.Unpin(s)
+					retRow, trigOK := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+					if !trigOK {
+						// RETURN NULL — skip this row
+						epqSkip = true
+						break
+					}
+					pu.newRow = retRow
+					// Re-pin for the write.
+					var rerr error
+					s, rerr = o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
+					if rerr != nil {
+						return nil, rerr
+					}
+					s.Lock()
+					// Re-check for concurrent modification during trigger execution.
+					freshTup, freshErr := storage.PageGetHeapTuple(s.Page(), pu.slot)
+					if freshErr != nil || isConcurrentlyUpdated(freshTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+						s.Unlock()
+						o.ctx.Pool.Unpin(s)
+						if freshErr != nil {
+							epqSkip = true
+							break
+						}
+						// Concurrent update during trigger — EPQ-retry with same trigger skip.
+						continue
+					}
+					// Refresh oldTupleBytes from re-pinned page.
+					if freshErr == nil {
+						oldTupleBytes, _ = freshTup.MarshalBinary()
+					}
 				}
 				if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
 					s.Unlock()

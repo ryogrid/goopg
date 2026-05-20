@@ -474,7 +474,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	if len(pkCols) > 0 {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_pkey"}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, true, true); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, nil, true, true); err != nil {
 			// Propagate B-tree index errors (e.g. unsupported key type).
 			// This makes CREATE TABLE fail cleanly rather than silently creating
 			// a table without its primary key constraint.
@@ -644,7 +644,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			}
 			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + suffix}
 		}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, parentIdx.Unique, parentIdx.Primary); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary); err != nil {
 			return err
 		}
 	}
@@ -881,15 +881,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
 	}
-	// Skip expression indexes (column name "" means functional expression
-	// like lower(col)) — goopg does not yet support expression indexes.
-	// The index creation is silently ignored to let setup SQL proceed.
-	for _, c := range s.Columns {
-		if c == "" {
-			return nil
-		}
-	}
-	return o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.Unique, false)
+	return o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false)
 }
 
 func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
@@ -1098,15 +1090,21 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		name = tbl.Name + "_pkey"
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	return o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, true, true)
+	return o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true)
 }
 
-func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, unique bool, primary bool) error {
+func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool) error {
 	if len(columns) == 0 {
 		return &ExecError{Code: "42601", Pos: pos, Message: "index must have at least one key column"}
 	}
 	cols := make([]*catalog.Column, len(columns))
 	for i, name := range columns {
+		if name == "" {
+			// Expression column (e.g. lower(col)) — no catalog column to look up.
+			// cols[i] remains nil; bulkBuildBTree skips expression columns when
+			// there are no existing rows.
+			continue
+		}
 		col, ok := o.ctx.Catalog.LookupColumn(tbl, name)
 		if !ok {
 			return &ExecError{Code: "42703", Pos: pos, Message: fmt.Sprintf("column %q of relation %q does not exist", name, tbl.Name)}
@@ -1122,6 +1120,17 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			return &ExecError{Code: "42P07", Pos: pos, Message: err.Error()}
 		}
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	}
+	// Store parsed expressions for expression-based index columns so the
+	// planner and executor can evaluate them at conflict-detection time.
+	if len(colExprs) > 0 {
+		idx.ColExprs = make([]*parser.Expr, len(colExprs))
+		for i, e := range colExprs {
+			if e != nil {
+				ec := e // take address of loop copy
+				idx.ColExprs[i] = &ec
+			}
+		}
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	if err := o.bulkBuildBTree(idxRel, tbl, cols, unique, idxName.String(), pos); err != nil {
@@ -1310,9 +1319,13 @@ func bytesEqual(a, b []byte) bool {
 // `i`-th entry is true iff `tableCols[i]` is referenced by `indexCols`.
 // Used by `DecodeRowProjection` to skip per-column heap allocations
 // for columns the index does not need. (M0054-0005c-followup.)
+// nil entries in indexCols (expression index columns) are skipped.
 func buildKeepMaskForIndex(tableCols []catalog.Column, indexCols []*catalog.Column) []bool {
 	want := make(map[string]struct{}, len(indexCols))
 	for _, ic := range indexCols {
+		if ic == nil {
+			continue // expression column — no catalog column
+		}
 		want[ic.Name] = struct{}{}
 	}
 	keep := make([]bool, len(tableCols))
@@ -1404,9 +1417,16 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 // col2, ...). Each column's encoding is self-terminating (fixed-length
 // for int4/int8, terminator byte for numeric), so concatenation is
 // unambiguous without a separator.
+// nil entries in cols (expression index columns) are skipped — expression
+// columns must be evaluated separately via encodeArbiterKey.
 func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) ([]byte, *ExecError) {
 	var out []byte
 	for _, col := range cols {
+		if col == nil {
+			// Expression column — cannot encode from raw row during bulk build.
+			// Callers building expression indexes must handle this separately.
+			continue
+		}
 		v := row[col.Ordinal]
 		if v.IsNull() {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is null and cannot be indexed", col.Name)}

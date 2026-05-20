@@ -106,6 +106,11 @@ func (o *upsertOp) Open(ctx *Context) error {
 	// index.
 	if o.plan.OnConflict.Action == planner.OnConflictActionUpdate {
 		for _, ord := range o.plan.OnConflict.ArbiterColumns {
+			if ord == -1 {
+				// Expression-based arbiter column — no single catalog column
+				// to check; the expression result is the conflict key.
+				continue
+			}
 			if o.plan.OnConflict.UpdateSet[ord] != nil {
 				col := o.plan.Table.Columns[ord]
 				return &ExecError{
@@ -311,7 +316,7 @@ func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, 
 	if o.arbiterTree == nil {
 		return storage.ItemPointer{}, nil, false, nil
 	}
-	key, err := encodeArbiterKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
+	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
 	if err != nil {
 		return storage.ItemPointer{}, nil, false, err
 	}
@@ -428,7 +433,7 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalo
 	if o.arbiterTree == nil || o.ctx == nil {
 		return 0, false, false
 	}
-	key, err := encodeArbiterKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
+	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
 	if err != nil || key == nil {
 		return 0, false, false
 	}
@@ -549,7 +554,7 @@ func (o *upsertOp) maintainArbiter(row Row, ptr storage.ItemPointer) error {
 	if o.arbiterTree == nil {
 		return nil
 	}
-	key, err := encodeArbiterKey(o.plan.OnConflict, o.plan.Table, row, o.plan.Pos())
+	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, row, o.plan.Pos())
 	if err != nil {
 		return err
 	}
@@ -602,13 +607,40 @@ func (o *upsertOp) evalUpdate(existing Row, inserted Row) (Row, bool, error) {
 // maintenance" to the caller (matches upstream's NULL-never-
 // matches semantics for unique-constraint inference). Multi-column
 // arbiters are supported by concatenating per-column encodings.
-func encodeArbiterKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, pos int) ([]byte, error) {
+// For expression-based arbiter columns (ArbiterColumns[i] == -1),
+// the expression in ArbiterExprs[i] is evaluated against row.
+func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, pos int) ([]byte, error) {
 	if oc.ArbiterIndex == nil || len(oc.ArbiterColumns) == 0 {
 		return nil, nil
 	}
 	var out []byte
-	for _, ord := range oc.ArbiterColumns {
-		v := row[ord]
+	slot := rowSlotView(row)
+	for i, ord := range oc.ArbiterColumns {
+		var v Datum
+		if ord == -1 {
+			// Expression-based arbiter column — evaluate the expression.
+			if len(oc.ArbiterExprs) <= i || oc.ArbiterExprs[i] == nil {
+				// No expression available (e.g. after catalog restore). Skip.
+				return nil, nil
+			}
+			var err error
+			v, err = evalExprSlot(oc.ArbiterExprs[i], slot, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if v.IsNull() {
+				// NULL expression result never conflicts.
+				return nil, nil
+			}
+			// Encode the expression result as a text/varchar key.
+			k := encodeArbiterExprKey(v, pos)
+			if k == nil {
+				return nil, &ExecError{Code: "42804", Pos: pos, Message: "expression-based arbiter column produced unsupported datum type"}
+			}
+			out = append(out, k...)
+			continue
+		}
+		v = row[ord]
 		if v.IsNull() {
 			// NULL never conflicts per upstream semantics.
 			return nil, nil
@@ -621,5 +653,18 @@ func encodeArbiterKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, p
 		out = append(out, k...)
 	}
 	return out, nil
+}
+
+// encodeArbiterExprKey encodes a Datum produced by an expression-based
+// arbiter column into BTree key bytes. Supports text/string and integer
+// datums (the most common expression result types).
+func encodeArbiterExprKey(v Datum, pos int) []byte {
+	switch v.Kind {
+	case KindString:
+		return btree.EncodeVarchar([]byte(v.StringValue()))
+	case KindInt:
+		return btree.EncodeInt8(v.Int)
+	}
+	return nil
 }
  

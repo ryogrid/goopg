@@ -940,8 +940,15 @@ type OnConflictPlan struct {
 	// ArbiterIndex.Columns when ArbiterIndex != nil; nil otherwise.
 	// Useful at runtime so the executor can extract the conflict
 	// key from the inserted-row tuple without re-doing a name
-	// lookup.
+	// lookup. For expression-based index columns, the corresponding
+	// entry is -1 and ArbiterExprs[i] holds the expression to evaluate.
 	ArbiterColumns []int
+
+	// ArbiterExprs is parallel to ArbiterColumns. For expression-based
+	// arbiter columns (ArbiterColumns[i] == -1), ArbiterExprs[i] is the
+	// resolved planner expression to evaluate against the inserted row.
+	// nil for plain column-reference arbiter columns.
+	ArbiterExprs []Expr
 
 	// UpdateSet is parallel to Table.Columns: nil means "leave the
 	// existing value alone", non-nil is an Expr to evaluate

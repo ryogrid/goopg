@@ -3520,6 +3520,33 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 		}
 		out.ArbiterIndex = idx
 		out.ArbiterColumns = ords
+		// Build ArbiterExprs for expression-based arbiter columns
+		// (where ords[i] == -1 and oc.Target.Exprs[i] != nil).
+		if len(oc.Target.Exprs) > 0 {
+			hasExpr := false
+			for _, o2 := range ords {
+				if o2 == -1 {
+					hasExpr = true
+					break
+				}
+			}
+			if hasExpr {
+				// Build a single-binding resolve context for the target table
+				// so expression ColumnRefs resolve against the insert row.
+				exprCtx := singleBindingContext(tbl, targetAlias)
+				exprCtx.cat = cat
+				out.ArbiterExprs = make([]Expr, len(ords))
+				for i, o2 := range ords {
+					if o2 == -1 && i < len(oc.Target.Exprs) && oc.Target.Exprs[i] != nil {
+						resolved, rerr := resolveExpr(oc.Target.Exprs[i], exprCtx)
+						if rerr != nil {
+							return nil, rerr
+						}
+						out.ArbiterExprs[i] = resolved
+					}
+				}
+			}
+		}
 	} else if out.Action == OnConflictActionNothing && cat != nil {
 		// Auto-detect primary key as arbiter for bare ON CONFLICT DO NOTHING.
 		for _, idx := range cat.IndexesOnTable(tbl) {
@@ -3636,9 +3663,18 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 	if len(target.Columns) == 0 {
 		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42601", Message: "ON CONFLICT target requires at least one column"}
 	}
+	// Build a set of wanted column names. Expression columns (name=="") are
+	// represented by a unique sentinel key per position so the set-size
+	// check correctly detects duplicate plain column names.
 	wanted := make(map[string]struct{}, len(target.Columns))
-	for _, c := range target.Columns {
-		wanted[strings.ToLower(c)] = struct{}{}
+	for i, c := range target.Columns {
+		if c == "" {
+			// Expression column — use a unique sentinel per position so each
+			// expression gets its own slot in the wanted set.
+			wanted[fmt.Sprintf("__expr_%d__", i)] = struct{}{}
+		} else {
+			wanted[strings.ToLower(c)] = struct{}{}
+		}
 	}
 	if len(wanted) != len(target.Columns) {
 		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: "ON CONFLICT target list contains duplicate columns"}
@@ -3650,11 +3686,24 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 		if len(idx.Columns) != len(target.Columns) {
 			continue
 		}
+		// Match: for each index column position, check that the target has
+		// the same kind of column (plain name or expression). Expression
+		// columns in the index (ic=="") match expression columns in the
+		// target at the same position.
 		match := true
-		for _, ic := range idx.Columns {
-			if _, ok := wanted[strings.ToLower(ic)]; !ok {
-				match = false
-				break
+		for j, ic := range idx.Columns {
+			if ic == "" {
+				// Expression index column — must match expression target column
+				// at same position.
+				if j >= len(target.Columns) || target.Columns[j] != "" {
+					match = false
+					break
+				}
+			} else {
+				if _, ok := wanted[strings.ToLower(ic)]; !ok {
+					match = false
+					break
+				}
 			}
 		}
 		if !match {
@@ -3662,6 +3711,11 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 		}
 		ords := make([]int, 0, len(idx.Columns))
 		for _, ic := range idx.Columns {
+			if ic == "" {
+				// Expression index column — use sentinel -1.
+				ords = append(ords, -1)
+				continue
+			}
 			col, ok := cat.LookupColumn(tbl, ic)
 			if !ok {
 				// Catalog inconsistency — index references a
