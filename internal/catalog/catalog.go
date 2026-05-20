@@ -735,6 +735,26 @@ func (c *InMemory) advanceNextOIDLocked(oid uint32) {
 	}
 }
 
+// NextOID returns the current next-OID counter value. Used by the
+// checkpointer (M0106-0013) to embed the live counter into each
+// checkpoint WAL record and pg_control so a crashed cluster can
+// recover the OID counter without relying on pg_catalog.json.
+func (c *InMemory) NextOID() uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.nextOID
+}
+
+// AdvanceNextOIDPast ensures the next-OID counter is strictly greater
+// than oid. Called during startup after tables are loaded from heap
+// pages so the counter never re-uses an OID already present on disk.
+// M0106-0013.
+func (c *InMemory) AdvanceNextOIDPast(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.advanceNextOIDLocked(oid)
+}
+
 // ListDatabases returns the registered database names in
 // deterministic (lexicographic) order. Backs the `pg_database`
 // virtual table.

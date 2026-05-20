@@ -103,6 +103,16 @@ type CheckpointerConfig struct {
 	// after initdb. M0106-0010 batched-45.
 	NextXIDFn func() uint64
 
+	// NextOIDFn, when non-nil, is invoked at each checkpoint to read the
+	// live "next-to-assign" OID from the catalog so the
+	// checkpointCopy.nextOid field in pg_control and the checkpoint WAL
+	// record reflect current OID consumption. Without this hook the
+	// field stays at the hardcoded bootstrap value (FirstNormalObjectId =
+	// 16384) and a crashed cluster that had allocated OIDs above 16384
+	// cannot recover the OID counter from pg_control alone, requiring
+	// pg_catalog.json. M0106-0013.
+	NextOIDFn func() uint32
+
 	// PostCheckpointFn, when non-nil, is called at the end of each
 	// successful checkpoint (timed, volume-triggered, or on-demand).
 	// initdb.Open wires this to regenerate pg_internal.init files so PG
@@ -392,9 +402,18 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 	if c.cfg.NextXIDFn != nil {
 		nextXid = c.cfg.NextXIDFn()
 	}
+	// M0106-0013: sample nextOid from the catalog BEFORE appending the
+	// checkpoint record so the on-wire CheckPoint payload carries the
+	// live OID counter. PG's InitWalRecovery seeds
+	// ShmemVariableCache->nextOid from this field on recovery, eliminating
+	// the need for pg_catalog.json to survive a crash.
+	var nextOid uint32
+	if c.cfg.NextOIDFn != nil {
+		nextOid = c.cfg.NextOIDFn()
+	}
 	var checkpointPayload []byte
 	if c.cfg.PGCompatCheckpoints {
-		checkpointPayload = EncodeCheckpointCompat(redoLSN0, 1, nextXid)
+		checkpointPayload = EncodeCheckpointCompat(redoLSN0, 1, nextXid, nextOid)
 	} else {
 		checkpointPayload = EncodeCheckpoint()
 	}
@@ -432,6 +451,13 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 			// nextXid in pg_control must be monotonic.
 			if nextXid > cd.CheckPointCopyNextXid {
 				cd.CheckPointCopyNextXid = nextXid
+			}
+			// M0106-0013: refresh checkPointCopy.nextOid so a crashed cluster
+			// can recover the OID counter from pg_control rather than from
+			// pg_catalog.json. Only update when the hook is wired and the
+			// value advances — nextOid must be monotonic.
+			if nextOid > cd.CheckPointCopyNextOid {
+				cd.CheckPointCopyNextOid = nextOid
 			}
 			cd.MinRecoveryPoint = 0
 			cd.MinRecoveryPointTLI = 0

@@ -66,6 +66,11 @@ type ControlFileData struct {
 	// this from mvcc.Manager.NextXID() at every checkpoint so a
 	// basebackup taken after user DDL carries the right starting XID.
 	CheckPointCopyNextXid uint64
+	// offset 72: checkPointCopy.nextOid (Oid = uint32).
+	// Refreshed at every checkpoint from catalog.InMemory.NextOID()
+	// so a crashed cluster can recover the OID counter from pg_control
+	// without relying on pg_catalog.json. M0106-0013.
+	CheckPointCopyNextOid uint32
 	// offset 104: checkPointCopy.time (pg_time_t / int64)
 	CheckPointCopyTime int64
 	// offset 128: XLogRecPtr — fake LSN counter for unlogged relations
@@ -114,6 +119,7 @@ func decodeControlFileData(buf []byte) *ControlFileData {
 		CheckPointCopyFullPageWrites: buf[56] != 0,
 		CheckPointCopyWalLevel:       le.Uint32(buf[60:]),
 		CheckPointCopyNextXid:        le.Uint64(buf[64:]),
+		CheckPointCopyNextOid:        le.Uint32(buf[72:]),
 		CheckPointCopyTime:           int64(le.Uint64(buf[104:])),
 		UnloggedLSN:                  le.Uint64(buf[128:]),
 		MinRecoveryPoint:             le.Uint64(buf[136:]),
@@ -149,6 +155,7 @@ func encodeControlFileData(buf []byte, cd *ControlFileData) {
 	}
 	le.PutUint32(buf[60:], cd.CheckPointCopyWalLevel)
 	le.PutUint64(buf[64:], cd.CheckPointCopyNextXid)
+	le.PutUint32(buf[72:], cd.CheckPointCopyNextOid)
 	le.PutUint64(buf[104:], uint64(cd.CheckPointCopyTime))
 	le.PutUint64(buf[128:], cd.UnloggedLSN)
 	le.PutUint64(buf[136:], cd.MinRecoveryPoint)
