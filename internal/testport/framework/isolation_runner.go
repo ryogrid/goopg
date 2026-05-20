@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -73,12 +74,19 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 	}
 
 	// Print "unused step name: X" for any declared step not in any permutation,
-	// in definition order. Matches PostgreSQL isolationtester.c output. M0100-0005.
-	var sb strings.Builder
+	// in alphabetical order. PostgreSQL isolationtester.c outputs them via
+	// a hash table enumerated in sorted order (not definition order).
+	// M0100-0005 (eval-plan-qual-trigger has s3_del_a before s3_r).
+	var unusedNames []string
 	for _, sname := range spec.StepOrder {
 		if !usedSteps[sname] {
-			fmt.Fprintf(&sb, "unused step name: %s\n", sname)
+			unusedNames = append(unusedNames, sname)
 		}
+	}
+	sort.Strings(unusedNames)
+	var sb strings.Builder
+	for _, sname := range unusedNames {
+		fmt.Fprintf(&sb, "unused step name: %s\n", sname)
 	}
 	fmt.Fprintf(&sb, "Parsed test spec with %d sessions\n", nSessions)
 
@@ -454,14 +462,15 @@ func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Du
 
 // execStepFromQueue executes sqlText on conn and attaches any NOTICE messages
 // collected in queue (populated by the session's connector notice handler).
-func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session string, queue *sessionNoticeQueue) stepOutcome {
-	if queue != nil {
-		queue.drain() // clear any stale notices from previous steps
-	}
+func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session string, _ *sessionNoticeQueue) stepOutcome {
+	// Do NOT drain the notice queue here. With inline NoticeFlush, notices
+	// from a concurrent pending step (e.g. wnested2's re-evaluation after c1
+	// commits) may already be in the queue when a later step on the same
+	// session (e.g. c2) starts. Draining here would discard those notices
+	// before the main goroutine can assign them to the correct pending step's
+	// output. The main goroutine is responsible for all queue drains at the
+	// correct moments. M0100-0005 (eval-plan-qual inline-notice race).
 	o := execStep(ctx, conn, sqlText, "")
-	// Notices are drained by the main goroutine so that pre-wait notices
-	// (generated before a row-level wait) and post-wait notices (from EPQ
-	// recheck) can be printed at the correct positions in the output.
 	o.session = session
 	return o
 }

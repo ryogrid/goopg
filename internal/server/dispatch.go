@@ -222,6 +222,22 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	if s.cfg.IsStandby != nil {
 		ectx.IsStandby = s.cfg.IsStandby()
 	}
+	// Wire inline-NOTICE delivery so RAISE NOTICE emitted before a row-level
+	// lock wait (e.g. from noisy_oper() in eval-plan-qual) reaches the client
+	// before blockDetectWait fires in the isolation runner.  Without this,
+	// notices are buffered in ctx.Notices and only sent at CommandComplete
+	// time — AFTER the wait resolves — causing the isolation runner to print
+	// them after <waiting ...> instead of before the step header.
+	// M0100-0005 (eval-plan-qual / eval-plan-qual-trigger).
+	ectx.NoticeFlush = func(msg string) {
+		_ = w.WriteNoticeResponse([]protocol.ErrorField{
+			{Code: protocol.FieldSeverity, Value: "NOTICE"},
+			{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: protocol.FieldSQLState, Value: "00000"},
+			{Code: protocol.FieldMessage, Value: msg},
+		})
+		_ = w.Flush()
+	}
 
 	// Update pg_stat_activity before dispatching.
 	if reg := s.cfg.Activity; reg != nil {

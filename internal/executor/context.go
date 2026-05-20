@@ -237,7 +237,12 @@ type Context struct {
 // (matching PostgreSQL's real-time notice delivery). M0100-0005.
 func (c *Context) AddNotice(msg string) {
 	if c.NoticeFlush != nil {
+		// Inline flush: send the notice to the client immediately so it
+		// arrives before any row-level lock wait. When NoticeFlush is wired
+		// (server path), the notice is NOT additionally buffered in Notices
+		// to avoid double-delivery at CommandComplete time.
 		c.NoticeFlush(msg)
+		return
 	}
 	c.Notices = append(c.Notices, msg)
 }

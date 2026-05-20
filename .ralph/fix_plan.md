@@ -1972,6 +1972,21 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           terminating the previously-infinite `isConcurrentlyUpdated` retry (no more
           spurious 40001). Fixes `TestNoticeCaptureUpdateTrigger` regression.
           **PASS count = 14**: adds InsertConflictDoUpdate2, MergeDelete.
+        - **Loop-21 Inline NOTICE delivery via NoticeFlush (2026-05-20)**:
+          `executor.Context.AddNotice` now calls `ctx.NoticeFlush(msg)` and
+          returns early (no buffering) when `NoticeFlush` is wired. In
+          `server/dispatch.go`, `ectx.NoticeFlush` is set to immediately
+          write+flush `NoticeResponse` to the wire, so RAISE NOTICE emitted
+          before a lock-wait reaches the pq client before `blockDetectWait`
+          fires. `execStepFromQueue` no longer calls `queue.drain()` (which
+          cleared in-flight re-evaluation notices from concurrent pending
+          steps). Unused-step-name output now alphabetically sorted (matches
+          PostgreSQL isolationtester). eval-plan-qual first divergence moves
+          L394→L411; eval-plan-qual-trigger L4→L38. Remaining gaps:
+          eval-plan-qual needs EPQ noisy_oper call-count parity; trigger test
+          needs BEFORE-trigger mid-scan interleaving (separate scope).
+          Design: `docs/design/0100-0005-loop21-notice-flush-inline-delivery.md`.
+          **PASS count = 14** (unchanged).
         - **Loop-20 DML CTEs (WITH MERGE RETURNING) (2026-05-20)**:
           Parser: allow INSERT/UPDATE/DELETE/MERGE as CTE bodies (DMLBody field on
           CommonTableExpr; Stage-A SELECT restriction removed). Analyzer: skip DML
