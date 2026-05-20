@@ -71,8 +71,8 @@
                                         # (change requires restart)
 #max_parallel_workers_per_gather = 2    # 0-1024; taken into account by SET-only;
                                         # planner currently ignores it
-#min_parallel_table_scan_size = 8MB     # 0-715827882 kB
-#min_parallel_index_scan_size = 512kB   # 0-715827882 kB
+#min_parallel_table_scan_size = 8388608 # 0-715827882 kB
+#min_parallel_index_scan_size = 524288  # 0-715827882 kB
 
 
 #------------------------------------------------------------------------------

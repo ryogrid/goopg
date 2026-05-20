@@ -3378,7 +3378,7 @@ Operational policy (2026-05-20):
         loop's file-content-only change. `go build`/`go vet` over
         `./internal/initdb/... ./internal/config/...` clean.
 
- - [ ] **M0108-0003 — Registry↔template sync test**
+ - [x] **M0108-0003 — Registry↔template sync test**
       - Summary: Add `internal/config/sample_test.go::TestSampleConfigCoversRegistry`.
         Implementation: regex `^#?\s*([a-z_][a-z0-9_]*)\s*=` over each line
         of `SampleConfig()`; collect names into `sampleEntries`; iterate
@@ -3396,6 +3396,34 @@ Operational policy (2026-05-20):
         a temporary new GUC without updating the sample and confirm the
         test fails with a clear message identifying the missing name;
         then revert the experiment. `make ralph-state-guard` PASS.
+      - COMPLETE 2026-05-21 (M0108-0003 loop 1): test added at
+        `internal/config/sample_test.go` (84 lines). Regex widened from
+        the spec's `[a-z_][a-z0-9_]*` to `\w+` so capitalised registry
+        names (`DateStyle`, `TimeZone`, `IntervalStyle`) are not silently
+        dropped — matches the wider parse the M0108-0001 loop already
+        applied to verify the template's 79-entry coverage. Value match
+        uses raw-string compare (single-quote enclosures stripped first)
+        per the M0108-0001 author's note that defaults were rendered to
+        match BootVal raw bytes ahead of this test. Initial run surfaced
+        two genuine mismatches that the loop fixed in the sample file:
+        `min_parallel_table_scan_size` was rendered as `8MB` but the
+        registry BootVal is `8388608` (raw kB units); same shape for
+        `min_parallel_index_scan_size` (`512kB` → `524288`). Both were
+        relics of the M0108-0001 human-readable rendering policy
+        being applied to GUCs whose BootVal stays in raw bytes — the
+        registry BootVal itself is likely wrong (8388608 kB = 8 GB,
+        whereas upstream PG default is 8 MB), but fixing that is a
+        registry change out of M0108 scope; the sample-side fix
+        preserves the milestone invariant (template equals BootVal) and
+        the registry's existing behaviour. Verified: `go test
+        ./internal/config/...` PASS (0.004 s); the targeted
+        `TestSampleConfigCoversRegistry` PASS; the M0108-0002
+        regression test `TestInitWritesEmbeddedSampleAsPostgresqlConf`
+        in `./internal/initdb/` continues to PASS (the sample-file
+        byte change flows through `config.SampleConfig()` so the
+        embedded-bytes equality still holds). `go vet
+        ./internal/config/... ./internal/initdb/...` clean; `gofmt -l
+        internal/config/sample_test.go` empty.
 
 ### Milestone-close gates (after all 3 sub-milestones)
 
