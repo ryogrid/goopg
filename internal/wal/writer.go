@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/goopg/goopg/internal/stats"
 )
 
 // groupFlushReq represents a single caller's flush request in the
@@ -391,15 +393,19 @@ type state struct {
 	fg *flushGroup
 }
 
-// walBufferCounters holds the atomic lifetime counters that
+// walBufferCounters holds the lifetime drain counters that
 // pg_stat_wal_io's M0013-0003 columns surface. The two drain
 // buckets are kept separate so an operator can tell a sizing
 // problem (high overflowDrainBytes) from natural commit /
 // eviction durability cost (high flushDrainBytes). Single
 // allocation owned by Writer; shared with state via pointer.
+// Counters are per-P sharded via stats.Counter (M0107-0008
+// loop 11) so the lines do not bounce across cores even when
+// multiple backend goroutines drive the drain serially under
+// state.appendMu.
 type walBufferCounters struct {
-	overflowDrainBytes atomic.Uint64
-	flushDrainBytes    atomic.Uint64
+	overflowDrainBytes stats.Counter
+	flushDrainBytes    stats.Counter
 }
 
 // drainReason classifies which counter a drainBufferBytes call
@@ -512,7 +518,7 @@ func (w *Writer) WALBuffersOverflowDrainBytes() uint64 {
 	if w.walBufferCounters == nil {
 		return 0
 	}
-	return w.walBufferCounters.overflowDrainBytes.Load()
+	return uint64(w.walBufferCounters.overflowDrainBytes.Sum())
 }
 
 // WALBuffersFlushDrainBytes returns the lifetime total bytes
@@ -523,7 +529,7 @@ func (w *Writer) WALBuffersFlushDrainBytes() uint64 {
 	if w.walBufferCounters == nil {
 		return 0
 	}
-	return w.walBufferCounters.flushDrainBytes.Load()
+	return uint64(w.walBufferCounters.flushDrainBytes.Sum())
 }
 
 // WrittenLSN returns the LSN of the last byte the writer has
@@ -1381,9 +1387,9 @@ func (s *state) drainBufferBytes(n int64, reason drainReason) error {
 	if c := s.walBufferCounters; c != nil {
 		switch reason {
 		case drainReasonOverflow:
-			c.overflowDrainBytes.Add(uint64(n))
+			c.overflowDrainBytes.Add(n)
 		case drainReasonFlush:
-			c.flushDrainBytes.Add(uint64(n))
+			c.flushDrainBytes.Add(n)
 		}
 	}
 	return nil

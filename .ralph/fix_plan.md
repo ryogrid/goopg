@@ -2916,11 +2916,52 @@ Operational policy (2026-05-20):
         all PASS. Design:
         `docs/design/0107-0008j-aio-per-direction-stats-counter-wiring.md`
         (indexed in `docs/design/README.md`).
+      - PARTIAL PROGRESS 2026-05-21 (loop 11): fifth concrete `stats.Counter`
+        consumer migration landed — `walBufferCounters.overflowDrainBytes`
+        and `.flushDrainBytes` in `internal/wal/writer.go` moved from
+        `atomic.Uint64` to `stats.Counter`. The two write sites in
+        `state.drainBufferBytes` execute under `state.appendMu` (single
+        writer at a time) but the writer P rotates with whichever client
+        backend acquires the mutex next — so the previously-shared
+        `atomic.Uint64` line bounced on every cross-backend handoff. Per-P
+        sharding via `stats.Counter` keeps each backend's write on its
+        current P's shard line. Public accessors
+        (`Writer.WALBuffersOverflowDrainBytes()` /
+        `.WALBuffersFlushDrainBytes()`, both `uint64`) preserved via
+        `uint64(.Sum())` boundary casts; nil-safe guards retained
+        verbatim. The two `.Add(uint64(n))` call sites simplified to
+        `.Add(n)` (the local `n` is already `int64`; the `uint64` cast
+        was only for the old `atomic.Uint64.Add`'s unsigned argument).
+        `internal/initdb/wal_io_views.go` view caller
+        (`pg_stat_wal_io.wal_buffers_overflow_drain_bytes` /
+        `wal_buffers_flush_drain_bytes` columns) reads through the
+        public accessors and observes identical types and values.
+        Memory cost: 32 KiB per server (2 × 16 KiB Counter; one
+        walBufferCounters per Writer per server), flat. No new tests —
+        existing
+        `internal/wal/wal_buffer_test.go::TestWALBufferCountersTrackDrains`
+        already covers both counters end-to-end through the public API
+        (initial 0, advance-on-overflow, advance-on-flush). Closes the
+        loop-8 caveat that earlier deferred this migration on
+        single-writer grounds — the appendMu-serialised hot path still
+        had cross-P cache-line bouncing on the counter line. The WAL
+        package is now uniformly on `stats.Counter` for all additive
+        observability counters (matching MemRing per [[0107-0008h]]).
+        Verified: `go test -race -count=1 ./internal/wal/` (3.09 s) +
+        `go test -race -count=1 ./internal/stats/` (1.02 s) +
+        cross-package smoke `./internal/storage/ ./internal/aio/
+        ./internal/runtimeshim/` all PASS. `internal/initdb/...` shows
+        pre-existing failures unrelated to this change (verified by
+        stashing the diff and reproducing them on the loop-10 tip).
+        Design:
+        `docs/design/0107-0008k-wal-buffer-drain-stats-counter-wiring.md`
+        (indexed in `docs/design/README.md`).
         Remaining work for this sub-milestone: bufpool per-slot Sema
         wait caller (consumes [[0107-0008c]]; blocked on M0107-0006
-        lockfree bufpool); per-target AIO migration decision
-        (cost vs. benefit given per-target memory amplification);
-        per-Go-minor CI matrix.
+        lockfree bufpool); per-target AIO migration formally closed as
+        *do not migrate* per [[0107-0008j]] (per-target memory
+        amplification ~80 MiB worst case, no contention benefit because
+        targets are naturally identity-sharded); per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
