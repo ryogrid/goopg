@@ -2282,8 +2282,48 @@ Operational policy (2026-05-20):
         pin the behavior. Design doc `0107-0003-phase-c1-opnode-concrete-executor.md` updated.
         `go test -race ./internal/parser/ ./internal/server/ ./internal/executor/
         ./internal/planner/ ./internal/analyzer/ ./internal/plpgsql/` PASS.
-      - Remaining: PlanNode sum-type. TPS and gcBgMarkWorker gates require perf run
-        after all hot-path ops and plan-tree allocation migrated.
+      - **Loop-16 Phase C.3 PlanNode sum-type foundation (2026-05-21)**:
+        (A) `filterState.pred planner.Expr` removed — exprTreeSlab ExprAdapter.orig
+        already roots the original predicate; `pred` was a redundant GC-traced pointer
+        with zero use in `filterOpNext` or `opOpen`.
+        (B) `projectState.plan *planner.Project` removed — `opOpen` used it only for
+        `len(p.Targets)`; replaced by `len(s.targExprs)` which was already available.
+        (C) `limitState.plan *planner.Limit` removed — LIMIT/OFFSET expressions are
+        now compiled into the exprTreeSlab during `buildRec` (new `limitExprIdx`,
+        `offsetExprIdx int32` fields); `opOpen` uses `evalFastExpr` via integer-dispatch
+        instead of `evalExpr` via interface.
+        (D) `internal/executor/plannode.go` (new): `PlanKind` enum, `PlanNode` struct
+        with `payload [planPayloadSize]byte`, `planTreeSlab` type, builder/accessor
+        helpers for PlanFilter and PlanLimit.
+        (E) `opTreeSlab.plans planTreeSlab` field added; initialized in `BuildFast`.
+        Net GC impact: 3 GC-traced plan references eliminated from the 4 concrete
+        operator state structs on the hot pgbench path.
+        New tests: TestPlanNodePlanFilterPayload, TestPlanNodePlanLimitPayload,
+        TestPlanNodeRoundtripNegativeOne, TestLimitStateExprIdx,
+        TestLimitOffsetStateExprIdx, TestFilterStateNoPredField, TestLimitOffsetExecution.
+        `go test -race ./internal/executor/ ./internal/server/ ./internal/planner/
+        ./internal/parser/ ./internal/analyzer/ ./internal/mvcc/ ./internal/storage/
+        ./internal/wal/ ./internal/mctx/` PASS.
+        Remaining: migrate SeqScan (seqScanOp.plan *planner.SeqScan → PlanNode raw bytes)
+        and Project (projectState schema allocation). TPS and gcBgMarkWorker gates require
+        perf run after SeqScan migration and ProcArray/ActivitySlot phases land.
+      - **Loop-17 SeqScan migration (2026-05-21)**:
+        `seqScanOp.plan *planner.SeqScan` removed. `seqScanOp` now holds `schema
+        planner.Schema`, `tbl *catalog.Table`, `pos int` (extracted at construction)
+        and `rel storage.RelFileNode` (cached once in Open — eliminates catalog
+        RLock per Next() call). `newSeqScanOp` sets fields directly from plan;
+        `Open()` computes and caches `o.rel`; `Next()` uses `o.rel` directly;
+        `currentTID()` returns `o.rel` directly. `plannode.go` PlanSeqScan
+        comment updated to "concrete — no GC-traced plan reference in seqScanOp".
+        Regression pins: `TestSeqScanOpNoPlanPointer` (verifies schema/tbl/pos
+        populated; rel zero pre-Open) and `TestSeqScanOpRelCachedAfterOpen`
+        (verifies rel populated post-Open) in `internal/executor/phase_c_test.go`.
+        `go test -race -count=1 ./internal/executor/ ./internal/server/
+        ./internal/planner/ ./internal/parser/ ./internal/analyzer/ ./internal/mvcc/
+        ./internal/storage/ ./internal/wal/ ./internal/mctx/` — all 9 PASS.
+        Design doc updated: `docs/design/0107-0003-phase-c1-opnode-concrete-executor.md`.
+        Remaining: Project (projectState schema allocation); perf gates require
+        ProcArray/ActivitySlot phases.
 
  - [ ] **M0107-0004 — Phase D1: ProcArray + atomic XidGen + CLOG bank locks**
       - Summary: Replace `mvcc.Manager.mu` (gates Begin/SnapshotFor/Commit/

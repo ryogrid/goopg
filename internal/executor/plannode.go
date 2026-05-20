@@ -15,10 +15,11 @@
 //
 // Migration status (Phase C.3):
 //   fully concrete (no planner.Node reference after buildRec):
-//     PlanFilter — predIdx int32 (indexes exprTreeSlab)
-//     PlanLimit  — limitExprIdx, offsetExprIdx int32
+//     PlanFilter  — predIdx int32 (indexes exprTreeSlab)
+//     PlanLimit   — limitExprIdx, offsetExprIdx int32
+//     PlanSeqScan — seqScanOp holds schema/tbl/pos/rel directly; no orig pointer
 //   adapter (keeps orig planner.Node for future migration):
-//     PlanSeqScan, PlanProject, PlanAdapter (generic)
+//     PlanProject, PlanAdapter (generic)
 
 package executor
 
@@ -35,7 +36,7 @@ const (
 	PlanInvalid PlanKind = iota
 	PlanFilter           // payload[0:4] = predIdx int32
 	PlanLimit            // payload[0:4] = limitExprIdx, payload[4:8] = offsetExprIdx
-	PlanSeqScan          // orig = *planner.SeqScan (future: raw bytes)
+	PlanSeqScan          // seqScanOp is concrete; PlanNode not used in buildRec for SeqScan
 	PlanProject          // orig = *planner.Project (future: raw bytes)
 	PlanAdapter          // orig = generic planner.Node
 )

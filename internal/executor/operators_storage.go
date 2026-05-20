@@ -427,7 +427,14 @@ func lockHeapExtend(rel storage.RelFileNode) func() {
 // checked against ctx.Snap; tuples whose xmin/xmax are outside the
 // snapshot's horizon are skipped.
 type seqScanOp struct {
-	plan *planner.SeqScan
+	// schema/tbl/pos/rel are extracted from *planner.SeqScan at construction
+	// time (Phase C.3 migration: seqScanOp no longer holds a GC-traced
+	// *planner.SeqScan pointer; the planner struct can be freed after Open).
+	schema planner.Schema
+	tbl    *catalog.Table
+	pos    int
+	rel    storage.RelFileNode // cached once in Open; avoids catalog lock per Next call
+
 	ctx  *Context
 	cols []catalog.Column
 
@@ -488,24 +495,30 @@ type seqScanOp struct {
 const seqScanLookahead storage.BlockNumber = 4
 
 func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
-	return &seqScanOp{plan: p, cols: p.Table.Columns}
+	return &seqScanOp{
+		schema: p.Output(),
+		tbl:    p.Table,
+		pos:    p.Pos(),
+		cols:   p.Table.Columns,
+	}
 }
 
-func (o *seqScanOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *seqScanOp) Schema() planner.Schema { return o.schema }
 
 func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "SeqScan requires storage handles in Context"}
+		return &ExecError{Code: "XX000", Pos: o.pos, Message: "SeqScan requires storage handles in Context"}
 	}
 	o.ctx = ctx
-	rel := ctx.Catalog.RelFileNode(o.plan.Table)
-	if err := ctx.acquireRelLock(rel, lockmgr.AccessShareLock); err != nil {
+	// Cache rel once — avoids the catalog RLock on every Next() call.
+	o.rel = ctx.Catalog.RelFileNode(o.tbl)
+	if err := ctx.acquireRelLock(o.rel, lockmgr.AccessShareLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
-			ee.Pos = o.plan.Pos()
+			ee.Pos = o.pos
 		}
 		return err
 	}
-	n, err := ctx.Pool.NBlocks(rel)
+	n, err := ctx.Pool.NBlocks(o.rel)
 	if err != nil {
 		return err
 	}
@@ -521,9 +534,9 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	// full sequential scan would evict most hot pages from the shared pool.
 	// Threshold: pool capacity / 4, matching upstream's heuristic.
 	if ctx.Pool != nil && int(n) > ctx.Pool.Capacity()/4 {
-		o.ring = storage.NewScanRing(ctx.Pool, rel)
+		o.ring = storage.NewScanRing(ctx.Pool, o.rel)
 	}
-	o.refillPrefetchWindow(rel)
+	o.refillPrefetchWindow(o.rel)
 	return nil
 }
 
@@ -574,7 +587,7 @@ func (o *seqScanOp) Close() error {
 // nextVisible advances through (block, slot) pairs and returns the
 // next tuple visible to the snapshot, or EOF.
 func (o *seqScanOp) Next() (TupleSlot, error) {
-	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
+	rel := o.rel
 	for {
 		if o.pinned == nil && o.activePage == nil {
 			if o.curBlock >= o.nBlocks {
@@ -735,7 +748,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// scanRow is reused across the per-page tuple
 			// loop; rows that need retention go through
 			// slot.Materialize().
-			o.slot.schema = o.Schema()
+			o.slot.schema = o.schema
 			o.slot.row = row
 			return &o.slot, nil
 		}
@@ -773,8 +786,7 @@ func (o *seqScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool
 	if o.pinned == nil || o.curSlot == 0 {
 		return storage.RelFileNode{}, storage.ItemPointer{}, false
 	}
-	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
-	return rel, storage.ItemPointer{Block: o.curBlock, Offset: o.curSlot - 1}, true
+	return o.rel, storage.ItemPointer{Block: o.curBlock, Offset: o.curSlot - 1}, true
 }
 
 func (o *seqScanOp) releasePinned() {

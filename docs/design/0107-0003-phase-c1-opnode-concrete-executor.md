@@ -340,3 +340,49 @@ the stack; pooling it adds overhead without meaningful benefit.
   released immediately after.
 - `internal/parser/mctx_parse_test.go` (new) — `TestParseMctxPath` and
   `TestParseExprMctxPath` verify mctx and pool paths produce equivalent ASTs.
+
+### Phase C.3 (loop 17) — SeqScan migration: remove `*planner.SeqScan` from seqScanOp
+
+**Problem**: `seqScanOp` held a `plan *planner.SeqScan` field — a GC-traced pointer to the
+planner struct. Every GC cycle traced `seqScanOp → planner.SeqScan → catalog.Table` and
+`seqScanOp → planner.SeqScan → planner.Schema ([]SchemaCol slice)`. Additionally, `Next()`
+called `ctx.Catalog.RelFileNode(o.plan.Table)` on every invocation, acquiring and releasing
+the catalog `RWMutex.RLock` for each row — a hot-path lock bottleneck on wide relations.
+
+**Changes**:
+
+1. **`seqScanOp` struct**: `plan *planner.SeqScan` removed; replaced with:
+   - `schema planner.Schema` — output schema (copied from `p.Output()` at construction)
+   - `tbl *catalog.Table` — table reference (copied from `p.Table`; keeps catalog.Table alive)
+   - `pos int` — parser position for error messages (copied from `p.Pos()`)
+   - `rel storage.RelFileNode` — relation file node, cached once in `Open()` (zero before Open)
+
+2. **`newSeqScanOp(p)`**: now sets `schema`, `tbl`, `pos`, `cols` from the plan; does NOT hold
+   a reference to the `*planner.SeqScan` struct after construction.
+
+3. **`seqScanOp.Open()`**: computes `o.rel = ctx.Catalog.RelFileNode(o.tbl)` once and caches it.
+   All subsequent `Next()` and `currentTID()` calls use `o.rel` directly — zero catalog
+   RLock acquisitions per row.
+
+4. **`seqScanOp.Schema()`**: returns `o.schema` directly (was `o.plan.Output()`).
+
+5. **`seqScanOp.Next()`**: `rel := o.rel` (was `rel := o.ctx.Catalog.RelFileNode(o.plan.Table)`).
+   Slot schema set via `o.slot.schema = o.schema` (was `o.Schema()`).
+
+6. **`seqScanOp.currentTID()`**: returns `o.rel` directly (was re-computed from catalog).
+
+7. **`plannode.go`**: `PlanSeqScan` comment updated to reflect concrete migration status.
+   Migration status section updated (PlanSeqScan moved from "adapter" to "fully concrete").
+
+**Net GC impact**: One `*planner.SeqScan` heap object eliminated from the GC-traced set per
+statement, plus one indirection removed from the hot-path operator tree. For a full table scan,
+the catalog `RLock` + `RUnlock` cycle that previously fired on every `Next()` call is replaced
+by a single acquisition in `Open()`.
+
+**Files changed** (loop 17):
+- `internal/executor/operators_storage.go` — seqScanOp struct rewritten; newSeqScanOp/Schema/
+  Open/Next/currentTID updated
+- `internal/executor/plannode.go` — PlanSeqScan comment + migration status updated
+- `internal/executor/phase_c_test.go` — imports storage; new
+  `TestSeqScanOpNoPlanPointer` (verifies schema/tbl/pos populated, rel zero pre-Open) and
+  `TestSeqScanOpRelCachedAfterOpen` (verifies rel populated post-Open)

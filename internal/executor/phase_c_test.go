@@ -16,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // ---------------------------------------------------------------------------
@@ -1097,4 +1098,86 @@ func TestLimitOffsetExecution(t *testing.T) {
 	runBothAndCompare(t, planOne(t, "SELECT id FROM items ORDER BY id LIMIT 1", cat), ctx)
 	// LIMIT 2 OFFSET 1: skip first, return next two.
 	runBothAndCompare(t, planOne(t, "SELECT id FROM items ORDER BY id LIMIT 2 OFFSET 1", cat), ctx)
+}
+
+
+// TestSeqScanOpNoPlanPointer verifies the Phase C.3 SeqScan migration:
+// seqScanOp must not hold a *planner.SeqScan; instead it stores schema,
+// tbl, pos, and cols extracted at construction time.
+func TestSeqScanOpNoPlanPointer(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "items"})
+	if !ok {
+		t.Fatal("items table not found")
+	}
+	seedItems(t, ctx, tbl)
+
+	tree, rootIdx, err := BuildFast(planOne(t, "SELECT id, label FROM items", cat))
+	if err != nil {
+		t.Fatalf("BuildFast: %v", err)
+	}
+	// Walk to the OpSeqScan node.
+	nIdx := rootIdx
+	for nIdx != noChild && tree.ops[nIdx].Kind != OpSeqScan {
+		nIdx = tree.ops[nIdx].childA
+	}
+	if nIdx == noChild || tree.ops[nIdx].Kind != OpSeqScan {
+		t.Fatal("no OpSeqScan node found in plan")
+	}
+	op := tree.ops[nIdx].state.(*seqScanOp)
+	if op.tbl == nil {
+		t.Error("seqScanOp.tbl must not be nil after construction")
+	}
+	if op.tbl.Name != "items" {
+		t.Errorf("seqScanOp.tbl.Name = %q, want %q", op.tbl.Name, "items")
+	}
+	if len(op.schema) == 0 {
+		t.Error("seqScanOp.schema must not be empty after construction")
+	}
+	if len(op.cols) == 0 {
+		t.Error("seqScanOp.cols must not be empty after construction")
+	}
+	// rel is zero until Open() is called.
+	var zeroRel storage.RelFileNode
+	if op.rel != zeroRel {
+		t.Error("seqScanOp.rel must be zero before Open()")
+	}
+}
+
+// TestSeqScanOpRelCachedAfterOpen verifies that Open() populates seqScanOp.rel
+// so Next() calls never re-acquire the catalog lock.
+func TestSeqScanOpRelCachedAfterOpen(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "items"})
+	if !ok {
+		t.Fatal("items table not found")
+	}
+	seedItems(t, ctx, tbl)
+
+	tree, rootIdx, err := BuildFast(planOne(t, "SELECT id FROM items", cat))
+	if err != nil {
+		t.Fatalf("BuildFast: %v", err)
+	}
+	nIdx := rootIdx
+	for nIdx != noChild && tree.ops[nIdx].Kind != OpSeqScan {
+		nIdx = tree.ops[nIdx].childA
+	}
+	if nIdx == noChild {
+		t.Fatal("no OpSeqScan node found")
+	}
+	op := tree.ops[nIdx].state.(*seqScanOp)
+
+	if err := opOpen(tree.ops, tree.exprs, nIdx, ctx); err != nil {
+		t.Fatalf("opOpen: %v", err)
+	}
+	defer opClose(tree.ops, nIdx)
+
+	var zeroRel storage.RelFileNode
+	if op.rel == zeroRel {
+		t.Error("seqScanOp.rel must be populated after Open()")
+	}
 }
