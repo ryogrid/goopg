@@ -2324,6 +2324,14 @@ Operational policy (2026-05-20):
         Design doc updated: `docs/design/0107-0003-phase-c1-opnode-concrete-executor.md`.
         Remaining: Project (projectState schema allocation); perf gates require
         ProcArray/ActivitySlot phases.
+      - **Loop-18 projectState schema allocation (2026-05-21)**:
+        `projectState.schema planner.Schema` removed; schema pooled in
+        `opTreeSlab.schemas []planner.Schema`; `projectState.schemaIdx int32`
+        replaces it. `opOpen`/`opNext`/`opClose` now take `*opTreeSlab`
+        (removing redundant `ops []OpNode`+`exprs exprTreeSlab` params).
+        `TestProjectStateNoSchemaField` regression pin added.
+        All 9 affected packages pass -race. Design doc updated.
+        M0107-0003 Phase C code work COMPLETE. TPS gates require D1+D2.
 
  - [ ] **M0107-0004 — Phase D1: ProcArray + atomic XidGen + CLOG bank locks**
       - Summary: Replace `mvcc.Manager.mu` (gates Begin/SnapshotFor/Commit/
