@@ -2845,6 +2845,65 @@ Operational policy (2026-05-20):
         remains the last outstanding piece of M0107-0007 before the
         pgbench c=100 SU TPS ≥ 500 gate can be evaluated; splitting
         `state.appendMu`'s four invariants is multi-loop scope.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 1 of N —
+        `lsnAllocator` atomic LSN reserve + segment-boundary
+        `rotateMu`): added `internal/wal/lsn_alloc.go` with
+        `lsnAllocator` (`atomic.Uint64 next` + `sync.Mutex rotateMu`
+        + immutable `segSize` + optional
+        `onCrossSegment(start, boundary)` callback) and a
+        `reserve(size)` method. Fast path: single CAS on `next` when
+        the reservation stays in-segment (wait-free per goroutine,
+        progress monotonic across retries). Slow path: cross-segment
+        reservations take `rotateMu`, recheck `next`, drop back to
+        the fast path if a peer already rotated, otherwise invoke
+        `onCrossSegment` exactly once and advance `next` to
+        `boundary + size` so the new reservation lands at the start
+        of the new segment (records do not straddle boundaries; the
+        gap `[oldNext, boundary)` is what the hook pads as
+        XLOG_NOOP). Strict contract: `0 < size <= segSize`;
+        oversized records are out of scope (PG's `XLogInsertRecord`
+        rejects them upstream of `ReserveXLogInsertLocation`).
+        PG counterpart:
+        `postgres/src/backend/access/transam/xlog.c`
+        `ReserveXLogInsertLocation` (line numbers drift between
+        minors; the symbol is the anchor). Eight regression tests
+        in `internal/wal/lsn_alloc_test.go`:
+        `TestLSNAllocatorReserveContiguousMonotonic` (10/20/30 →
+        0/10/30, load=60); `TestLSNAllocatorReserveStartLSN`
+        (non-zero start for recovery resume);
+        `TestLSNAllocatorCrossSegmentInvokesHook` (1024-byte
+        segment, 1000+50 fires hook once with `(1000, 1024)`,
+        reservation at 1024);
+        `TestLSNAllocatorReserveAtExactBoundaryNoHook`
+        (next == boundary exactly → fast path, no hook);
+        `TestLSNAllocatorReserveInvalidSizePanics` (size 0,
+        size > segSize); `TestLSNAllocatorNewRejectsZeroSegSize`;
+        `TestLSNAllocatorConcurrentReservesDisjoint`
+        (32 × 100 × 16 B within a 1 MiB segment → perfect permutation
+        of `[0, 51200)`; rotation hook wired to `t.Errorf` to flag
+        spurious crossings);
+        `TestLSNAllocatorConcurrentCrossSegmentHookOncePerBoundary`
+        (16 goroutines race across the same boundary at next=230 of
+        a 256-byte segment, 40-byte records; final crossing-count
+        equals `(lastSeg − firstSeg)`, no record straddles a
+        boundary, sorted starts disjoint by ≥ sz);
+        `TestLSNAllocatorReserveAcrossTwoBoundaries` (walks two
+        crossings, hook payloads `[{80,100}, {195,200}]`).
+        Verified: `go test -race -count=1 -run 'TestLSNAllocator'
+        ./internal/wal/` PASS (1.02 s); `go test -race -count=1
+        ./internal/wal/` PASS (3.09 s). Dead code until slice B's
+        call-site rewrite consumes it; foundation-first pattern
+        matches slice C ([[0107-0007b]] / [[0107-0007c]] /
+        [[0107-0007d]] all landed before [[0107-0007e]] /
+        [[0107-0007f]] / [[0107-0007g]] consumed them). Design:
+        `docs/design/0107-0007h-wal-lsn-allocator.md` (indexed in
+        `docs/design/README.md`). Out of scope: wiring into
+        `Writer.Append` / `state.append` (call-site rewrite that
+        splits `state.appendMu`'s four invariants is multi-loop
+        scope); `paddedMutex` introduction in `internal/wal` for
+        the stripe array (separate slice B foundation);
+        `prevRecPtr` chain integrity under per-stripe locks
+        (call-site rewrite).
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
