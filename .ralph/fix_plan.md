@@ -1909,6 +1909,22 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           LockCommittedUpdate, InsertConflictDoUpdate, InsertConflictDoNothing,
           FkSnapshot, PartitionKeyUpdate{1,2,3,4}, InsertConflictDoUpdate4,
           ReadWriteUnique.
+        - **Loop-16 lockRowsOp committed-update chain follow (2026-05-20)**:
+          `stampLockInner` now waits for in-progress xmax (`WaitForXID`),
+          follows the CTID chain to the live successor (RC), or raises 40001
+          (RR/SER). Only applies when the xmax is from a key-column update
+          (new `HeapKeysUpdated` bit in infomask2, set by `updateViaIndex`
+          when `!hotEligible`) or when lock strength is FOR UPDATE. FOR KEY
+          SHARE on non-key updates reverts to the M0100-0005f skip.
+          `drainAndStamp` records the successor ptr; `lockRowsOp.Next()`
+          refetches the row via `refetchRow`. `TestForKeyShare_PreservesReal-
+          UpdaterXmax` unaffected (non-key update, HeapKeysUpdated not set).
+          TestPort_IsolationLockCommittedKeyupdate flips from SKIP to PASS.
+          **PASS count = 11**: adds LockCommittedKeyupdate.
+          LockCommittedUpdate, InsertConflictDoUpdate, InsertConflictDoNothing,
+          FkSnapshot, PartitionKeyUpdate{1,2,3,4}, InsertConflictDoUpdate4,
+          ReadWriteUnique, LockCommittedKeyupdate.
+          Design: `docs/design/0100-0005-lockrows-committed-update-chain-follow.md`.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 

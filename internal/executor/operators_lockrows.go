@@ -1,7 +1,11 @@
 package executor
 
 import (
+	"context"
+
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -98,6 +102,11 @@ type pendingLockedRow struct {
 	// (IndexScan, Values) get haveTID=false and skip the
 	// stamp pass — only the relation-level lock applies.
 	haveTID bool
+	// newPtr/newPtrValid: set when stampLock followed a committed-update
+	// CTID chain to a live successor. lockRowsOp.Next() refetches the
+	// row from newPtr so callers see the post-update values.
+	newPtr      storage.ItemPointer
+	newPtrValid bool
 }
 
 func newLockRowsOp(p *planner.LockRows, child Operator) *lockRowsOp {
@@ -225,9 +234,18 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 	if o.pos >= len(o.pending) {
 		return nil, EOF
 	}
-	row := o.pending[o.pos].row
+	entry := o.pending[o.pos]
 	o.pos++
-	return asSlot(o.Schema(), row), nil
+	// When stampLock followed a committed-update chain, refetch the row
+	// from the live successor slot so callers see updated values.
+	if entry.newPtrValid {
+		if row, err := o.refetchRow(entry.rel, entry.newPtr); err != nil {
+			return nil, err
+		} else if row != nil {
+			return asSlot(o.Schema(), row), nil
+		}
+	}
+	return asSlot(o.Schema(), entry.row), nil
 }
 
 // drainAndStamp runs phases 1 and 2 of the two-pass protocol:
@@ -277,83 +295,212 @@ func (o *lockRowsOp) drainAndStamp() error {
 		if !e.haveTID {
 			continue
 		}
-		if err := o.stampLock(e.rel, e.ptr); err != nil {
+		successor, followed, err := o.stampLock(e.rel, e.ptr)
+		if err != nil {
 			return err
+		}
+		if followed {
+			e.newPtr = successor
+			e.newPtrValid = true
 		}
 	}
 	return nil
 }
 
-// stampLock pins the page exclusively, calls
-// PageSetHeapTupleLockOnly, marks dirty through the LogHeapLock
-// change-record hook (or falls back to MarkDirty when the
-// pool's hook isn't configured — preserves crash safety via
-// FPI emission), and unpins. Mirrors writeHeapRow's
-// markHeapInsertDirty pattern.
+// stampLock acquires a tuple-level lock and stamps the lock-only xmax on the
+// heap tuple at ptr. Returns (successorPtr, followed, err):
+//   - followed=false: stamped at ptr (or nothing stamped for dead-end cases)
+//   - followed=true: followed a committed-update CTID chain; successorPtr is the
+//     live tuple that was stamped. Caller should update entry.newPtr.
 //
-// Also acquires a tuple-level lock via the lockmgr's
-// (DB, Rel, Block+1, Offset+1) tag (M0021 step 2b). The mode
-// depends on the lock strength (M0021 step 4): FOR UPDATE
-// takes ExclusiveLock (single writer / blocks all other
-// holders); FOR SHARE takes RowShareLock (compatible with
-// other RowShareLock holders so multiple FOR SHARE sessions
-// proceed concurrently, conflicts with ExclusiveLock so a
-// UPDATE / DELETE / FOR UPDATE waits until all FOR SHARE
-// holders release). The lockmgr's existing conflict matrix
-// already implements the upstream multi-holder semantics
-// without MultiXact infrastructure — transaction-scoped
-// ReleaseAll on commit/abort cleans every holder up.
-func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer) error {
+// When a real non-lock-only xmax from another xact is present:
+//   - If the xmax is still in-progress: waits for it (produces <waiting ...>
+//     in isolation tests) and then checks the final state.
+//   - If the xmax committed: follows the CTID chain to the live successor.
+//   - If the xmax aborted: the row is live; re-stamps at original ptr.
+func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer) (storage.ItemPointer, bool, error) {
 	// M0093: SELECT FOR UPDATE/SHARE stamps lock-only xmax with the
 	// transaction's XID; materialise it BEFORE acquiring the tuple
 	// lock so the lock holder's identity is the real XID (mismatched
 	// holder identity breaks UPDATE's blocks-on-foreign-lock check).
 	if err := o.ctx.MaterializeWriterXID(); err != nil {
-		return err
+		return storage.ItemPointer{}, false, err
 	}
 	// Acquire the tuple-level lock first so a concurrent UPDATE
 	// that races with us can't slip through between the xmax
 	// stamp and the lock registration.
 	if err := o.ctx.acquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
-		return err
+		return storage.ItemPointer{}, false, err
+	}
+	return o.stampLockInner(rel, ptr, 0)
+}
+
+// stampLockInner is the recursive inner loop for stampLock, bounded by depth
+// to prevent infinite chains. depth=0 on first call.
+func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPointer, depth int) (storage.ItemPointer, bool, error) {
+	if depth > 16 {
+		return storage.ItemPointer{}, false, nil // chain too deep
 	}
 	slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 	if err != nil {
-		return err
+		return storage.ItemPointer{}, false, err
 	}
 	slot.Lock()
-	// M0100-0005f: if xmax is already a real (non-lock-only) updater
-	// from a different transaction, do NOT overwrite it with our
-	// lock-only stamp. Upstream represents "row has an updater AND
-	// concurrent KEY SHARE/SHARE lock holders" via MultiXact; v0
-	// goopg lacks MultiXact infrastructure, so the safe approximation
-	// is to keep the original updater's deletion stamp on the page
-	// and rely on the lockmgr tuple-tag lock (already acquired above)
-	// to enforce row-level locking semantics for our holder.
-	// Without this guard, the next session that takes FOR KEY SHARE
-	// over a row whose UPDATE is still in flight would erase the
-	// updater's xmax — after the updater commits, the dead old
-	// version would remain visible (the lock-only branch in
-	// TupleVisible short-circuits the xmax check). Reproduces as
-	// the s1hint dead-tuple bug in lock-committed-update.
+	// M0100-0005f + M0100-0005-lcku: handle real non-lock-only xmax from
+	// another transaction. Two cases:
+	// (a) Non-key update (HeapKeysUpdated not set) AND our lock is FOR KEY SHARE:
+	//     preserve M0100-0005f semantics — skip stamping without waiting.
+	//     FOR KEY SHARE does not conflict with non-key-column updates.
+	// (b) Key-column update (HeapKeysUpdated set) OR our lock is FOR UPDATE:
+	//     wait for the updater, then follow the CTID chain (RC) or raise 40001 (RR/SER).
 	tup, gerr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
 	if gerr == nil &&
 		tup.Header.Xmax != storage.InvalidTransactionID &&
 		!storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
 		tup.Header.Xmax != o.ctx.Tx.XID {
+
+		keysUpdated := (tup.Header.Infomask2 & storage.HeapKeysUpdated) != 0
+		keyConflict := o.lockStrength == storage.HeapXmaxExclLock || keysUpdated
+		if !keyConflict {
+			// Non-key update with FOR KEY SHARE: no conflict.
+			// Preserve M0100-0005f: do not overwrite real updater's xmax.
+			slot.Unlock()
+			o.ctx.Pool.Unpin(slot)
+			return storage.ItemPointer{}, false, nil
+		}
+
+		xmax := tup.Header.Xmax
+		ctid := tup.Header.CTID
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
-		return nil
+
+		// Wait for in-progress updater to commit or abort.
+		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
+			qctx := o.ctx.Ctx
+			if qctx == nil {
+				qctx = context.Background()
+			}
+			if werr := o.ctx.TxnMgr.WaitForXID(qctx, xmax); werr != nil {
+				// Context cancelled — skip this row silently.
+				return storage.ItemPointer{}, false, nil
+			}
+		}
+
+		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
+			// Updater rolled back: row is live at original ptr. Stamp it.
+			return o.stampAtPtr(rel, ptr)
+		}
+
+		// Updater committed: under RR/SER raise a serialization error.
+		// Under RC: follow CTID chain to find the live successor.
+		if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+			return storage.ItemPointer{}, false, &ExecError{
+				Code:    "40001",
+				Message: "could not serialize access due to concurrent update",
+			}
+		}
+		next := ctid
+		if next.Block == ptr.Block && next.Offset == ptr.Offset {
+			// CTID points to self — deleted row, no live successor.
+			return storage.ItemPointer{}, false, nil
+		}
+		// Acquire lockmgr lock on the successor before reading it.
+		if err := o.ctx.acquireTupleLock(rel, next, o.tupleLockMode()); err != nil {
+			return storage.ItemPointer{}, false, err
+		}
+		succ, _, err := o.stampLockInner(rel, next, depth+1)
+		if err != nil {
+			return storage.ItemPointer{}, false, err
+		}
+		if succ == (storage.ItemPointer{}) {
+			return storage.ItemPointer{}, false, nil
+		}
+		// Indicate that the entry's row data should be refetched.
+		return succ, true, nil
+	}
+
+	// Tuple is live (no real updater xmax from another xact). Stamp it.
+	if gerr != nil {
+		slot.Unlock()
+		o.ctx.Pool.Unpin(slot)
+		return storage.ItemPointer{}, false, nil
 	}
 	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, o.ctx.Tx.XID, o.lockStrength); err != nil {
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
-		return err
+		return storage.ItemPointer{}, false, err
 	}
 	derr := markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, o.lockStrength)
 	slot.Unlock()
 	o.ctx.Pool.Unpin(slot)
-	return derr
+	return ptr, false, derr
+}
+
+// stampAtPtr stamps a lock-only xmax at ptr. Used when the original updater's
+// xmax was aborted and the row is live (lockmgr lock already acquired by caller).
+func (o *lockRowsOp) stampAtPtr(rel storage.RelFileNode, ptr storage.ItemPointer) (storage.ItemPointer, bool, error) {
+	slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+	if err != nil {
+		return storage.ItemPointer{}, false, err
+	}
+	slot.Lock()
+	tup, gerr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+	if gerr == nil &&
+		tup.Header.Xmax != storage.InvalidTransactionID &&
+		!storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
+		tup.Header.Xmax != o.ctx.Tx.XID {
+		// Another real updater arrived while we waited — skip.
+		slot.Unlock()
+		o.ctx.Pool.Unpin(slot)
+		return storage.ItemPointer{}, false, nil
+	}
+	if gerr != nil {
+		slot.Unlock()
+		o.ctx.Pool.Unpin(slot)
+		return storage.ItemPointer{}, false, nil
+	}
+	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, o.ctx.Tx.XID, o.lockStrength); err != nil {
+		slot.Unlock()
+		o.ctx.Pool.Unpin(slot)
+		return storage.ItemPointer{}, false, err
+	}
+	derr := markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, o.lockStrength)
+	slot.Unlock()
+	o.ctx.Pool.Unpin(slot)
+	return ptr, false, derr
+}
+
+// refetchRow reads and decodes the heap tuple at (rel, ptr) using the table
+// columns from o.plan.Locks. Returns nil when the relation is not in the lock
+// list or the tuple cannot be decoded.
+func (o *lockRowsOp) refetchRow(rel storage.RelFileNode, ptr storage.ItemPointer) (Row, error) {
+	var cols []catalog.Column
+	for i := range o.plan.Locks {
+		if o.ctx.Catalog.RelFileNode(o.plan.Locks[i].Table) == rel {
+			cols = o.plan.Locks[i].Table.Columns
+			break
+		}
+	}
+	if cols == nil {
+		return nil, nil
+	}
+	slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+	if err != nil {
+		return nil, err
+	}
+	slot.RLock()
+	tup, gerr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+	slot.RUnlock()
+	o.ctx.Pool.Unpin(slot)
+	if gerr != nil {
+		return nil, nil
+	}
+	row := make(Row, len(cols))
+	natts := int(tup.Header.Infomask2 & 0x07FF)
+	if err := DecodeRowIntoMctxPGTuple(row, cols, tup.Data, tup.Bitmap, natts, nil); err != nil {
+		return nil, err
+	}
+	return cloneRowOwned(row), nil
 }
 
 // tupleLockMode picks the lockmgr Mode used for the tuple-tag

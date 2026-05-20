@@ -1759,6 +1759,18 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				if cerr := stampOldCtid(o.ctx, rel, pu.blk, pu.slot, newPtr); cerr != nil {
 					return nil, cerr
 				}
+				// Mark HeapKeysUpdated when an indexed column changed (HOT was
+				// not eligible). FOR KEY SHARE uses this bit to decide whether to
+				// wait on this xmax. Mirrors upstream heap_update's HEAP_KEYS_UPDATED
+				// stamping via PageSetHeapTupleKeysUpdated.
+				if !hotEligible {
+					if s2, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk}); perr == nil {
+						s2.Lock()
+						_ = storage.PageSetHeapTupleKeysUpdated(s2.Page(), pu.slot)
+						s2.Unlock()
+						o.ctx.Pool.Unpin(s2)
+					}
+				}
 				// Emit canonical WAL for this UPDATE: DELETE of old page
 				// (post xmax+ctid stamp) then INSERT of new page.
 				if o.ctx.LogCanonical != nil {

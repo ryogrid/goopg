@@ -94,6 +94,10 @@ const (
 	// HEAP_HASVARWIDTH indicates the tuple has variable-width columns.
 	// Mirrors PG's HEAP_HASVARWIDTH (0x0002).
 	HeapHasVarWidth uint16 = 0x0002
+	// HeapKeysUpdated is set in t_infomask2 when an UPDATE changes an indexed
+	// (key) column. FOR KEY SHARE only conflicts with xmax that has this bit
+	// set. Mirrors PostgreSQL's HEAP_KEYS_UPDATED (0x2000).
+	HeapKeysUpdated uint16 = 0x2000
 	// HEAP_NATTS_MASK is the bit mask for number of attributes in
 	// t_infomask2 (bits 0-10). Mirrors PG's HEAP_NATTS_MASK (0x07FF).
 	HeapNattsMask uint16 = 0x07FF
@@ -844,6 +848,38 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
 		MustHeader(p).SetPruneXID(uint32(xmax))
 	}
+	return nil
+}
+
+// PageSetHeapTupleKeysUpdated sets the HeapKeysUpdated bit in t_infomask2 of
+// the tuple at slot. Called by updateViaIndex when at least one indexed (key)
+// column is being modified, so FOR KEY SHARE knows it must conflict.
+func PageSetHeapTupleKeysUpdated(p Page, slot uint16) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+20 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
+	infomask2 |= HeapKeysUpdated
+	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
 	return nil
 }
 
