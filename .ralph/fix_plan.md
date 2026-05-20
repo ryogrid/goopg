@@ -2904,6 +2904,69 @@ Operational policy (2026-05-20):
         the stripe array (separate slice B foundation);
         `prevRecPtr` chain integrity under per-stripe locks
         (call-site rewrite).
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 2 of N —
+        `paddedMutex` + `appendLockSet` in `internal/wal`): added
+        new file `internal/wal/padded_mutex.go` with `paddedMutex`
+        (`sync.Mutex` + `[56]byte` = 64 B = one cache line so the 8
+        stripes in an `[8]paddedMutex` array occupy distinct cache
+        lines and contending writers do not pay coherence traffic
+        on a stripe they did not intend to lock); `const
+        appendLockStripes = 8` (matches PG's
+        `NUM_XLOGINSERT_LOCKS = 8` in
+        `postgres/src/include/access/xlog.h`); `type appendLockSet
+        struct { locks [appendLockStripes]paddedMutex }`;
+        `stripeForProcNum(procNum int32) int` (uses
+        `uint32(procNum) & (appendLockStripes-1)` so the full int32
+        range including the wraparound point and INT32_MIN map
+        cleanly into `[0, 8)`); `appendLockSet.lockByProcNum(procNum
+        int32) (unlock func())` returns the bare `sync.Mutex.Unlock`
+        method value (no closure allocation). Duplicated from the
+        executor's `paddedMutex` (slice A, [[0107-0007a]]) rather
+        than lifted to a shared package — the two stripe arrays sit
+        in different lock-ordering tiers (heap extend vs. WAL
+        append) and a shared alias would invite accidental
+        cross-tier coupling. Lock ordering for the future call-site
+        rewrite: `appendLockSet.lockByProcNum → (rare)
+        lsnAllocator.rotateMu`; the [[0107-0007h]] `rotateMu` sits
+        below the stripe lock so an append holds the stripe, may
+        dip into `rotateMu` to cross a segment boundary, then
+        releases both. Flush coordination is unchanged (parent §2)
+        — flush operates on cumulative buffer content,
+        group-commit waiter chain merges across all stripes
+        because LSNs are globally ordered. Dead code until slice
+        B's `Writer.Append` rewrite mounts the `appendLockSet` and
+        consumes `lsnAllocator`; foundation-first pattern matches
+        slice C ([[0107-0007b]] / [[0107-0007c]] / [[0107-0007d]]
+        before [[0107-0007e]] / [[0107-0007f]] / [[0107-0007g]]).
+        Five regression tests in
+        `internal/wal/padded_mutex_test.go`:
+        `TestPaddedMutexSize` pins `unsafe.Sizeof(paddedMutex{})
+        == 64` and `unsafe.Sizeof(appendLockSet{}) ==
+        64*appendLockStripes` (without this assertion a shrunk
+        `paddedMutex` would silently reintroduce false-sharing);
+        `TestStripeForProcNumMaskedByStripes` table-driven across
+        `{0, 1, 7, 8, 15, 16, -1, -8, INT32_MAX, INT32_MIN}` pins
+        the `& 0x7` formula and the uint32 cast;
+        `TestAppendLockSetStripesByProcNum` drives 8 goroutines on
+        procNums 0..7 and observes peak in-CS concurrency == 8
+        (single-mutex baseline caps peak at 1);
+        `TestAppendLockSetCollidesOnSameStripe` confirms procNum 3
+        vs procNum 11 (both stripe 3) serialise (peak == 1) —
+        without modulo, any per-backend lock would trivially pass
+        `…StripesByProcNum`;
+        `TestAppendLockSetUnlockClosureReleasesStripe` pins
+        single-shot unlock semantics via a peer re-acquire with a
+        500 ms watchdog. Verified: `go test -race -count=1 -run
+        'TestPaddedMutex|TestStripeForProcNum|TestAppendLockSet'
+        ./internal/wal/` PASS (1.05 s); `go test -race -count=1
+        ./internal/wal/` PASS (3.11 s). Design:
+        `docs/design/0107-0007i-wal-padded-mutex.md` (indexed in
+        `docs/design/README.md`). Out of scope: mounting
+        `appendLockSet` on `Writer` + rewriting `Append` to take
+        a stripe lock + `lsnAllocator.reserve` (separate slice B
+        work); splitting `state.appendMu`'s four invariants
+        (writePos / walBuf / memRing / writeLSN); `prevRecPtr`
+        chain integrity under per-stripe locks.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
