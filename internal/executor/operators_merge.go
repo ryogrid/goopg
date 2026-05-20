@@ -269,7 +269,8 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 	} // end for scanTbl
 
 	// Apply pending modifications (with EPQ retry loop for concurrent updates).
-	for _, mod := range mods {
+	for i := range mods {
+		mod := &mods[i]
 		modTbl := mod.tblRef
 		if modTbl == nil {
 			modTbl = tbl
@@ -290,7 +291,8 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 		}
 		if applied {
 			o.rowsAffected++
-			// Collect RETURNING row for UPDATE actions (newRow is post-trigger value).
+			// Collect RETURNING row using post-EPQ values (mod is a pointer so
+			// applyMod's EPQ re-evaluation of mod.newRow propagates here).
 			if mod.action == planner.MergeActionUpdate {
 				o.collectReturningRow(mod.newRow)
 			} else if mod.action == planner.MergeActionDelete {
@@ -393,7 +395,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 // applyMod applies a single pending MERGE modification with EPQ retry loop.
 // Returns (true, nil) on success, (false, nil) if skipped (row gone or
 // conditions no longer match), (false, err) on fatal error.
-func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, mod mergePendingMod) (applied bool, _ error) {
+func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, mod *mergePendingMod) (applied bool, _ error) {
 	for {
 		// Triggers are fired inside mergeApplyUpdate/Delete after EPQ resolves,
 		// so they fire exactly once per successful write. M0100-0005.
@@ -607,12 +609,17 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		if epqWait(ctx, xmax) {
 			return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
 		}
-		// After waiting: if xmax committed (not aborted), the target row was deleted.
-		// Return errMergeSourceUnmatched so the NOT MATCHED INSERT path fires.
-		// If xmax aborted, the row still exists; follow HOT chain to find it.
-		if ctx.TxnMgr != nil && !ctx.TxnMgr.HasAbortedXID(xmax) {
-			// xmax committed — row deleted by concurrent committed DELETE.
-			return errMergeSourceUnmatched
+		// Refresh snapshot (RC) so the committed xmax is visible as "deleted".
+		// Mirrors mergeApplyUpdate — required so epqFollowHOT/epqFollowChain
+		// can correctly classify the old tuple as dead and follow to the
+		// live successor.
+		mergeEPQRefreshSnap(ctx)
+		// Follow HOT/non-HOT chain to find the live successor. If the
+		// concurrent tx was an UPDATE the chain points to the new version
+		// and we re-evaluate WHEN conditions via mergeEPQError. If it was
+		// a DELETE (or cross-partition move) no successor exists.
+		if epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
+			return errMovedToAnotherPartition(pos)
 		}
 		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
 		if found {
@@ -621,7 +628,10 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		if cBlk, cSlot, cRow, cFound := epqFollowChain(ctx, rel, blk, slot, cols, nil); cFound {
 			return &mergeEPQError{newBlk: cBlk, newSlot: cSlot, newTgtRow: cRow}
 		}
-		return errMergeSourceUnmatched // row deleted by concurrent tx; caller retries as NOT MATCHED
+		if epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
+			return errMovedToAnotherPartition(pos)
+		}
+		return errMergeSourceUnmatched // row truly deleted; caller retries as NOT MATCHED
 	}
 	s.Unlock()
 	ctx.Pool.Unpin(s)

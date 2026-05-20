@@ -845,7 +845,7 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
 - [ ] **M0100-0005**
       - Summary: E2E pass confirmation: all 21 dedicated RC isolation
         tests pass. **Closes M0096-0005 and M0096-0013 via cross-reference.**
-      - Depends: Close of M0107
+      - **Depends**: Close of M0107
       - Run: `go test -v -run TestPort_Isolation -timeout 30m ./internal/testport/`.
       - DoD: every `TestPort_Isolation*` listed in M0096-0001 reports `pass`
         (none `defer`, none `excluded`). On completion:
@@ -1972,6 +1972,30 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           terminating the previously-infinite `isConcurrentlyUpdated` retry (no more
           spurious 40001). Fixes `TestNoticeCaptureUpdateTrigger` regression.
           **PASS count = 14**: adds InsertConflictDoUpdate2, MergeDelete.
+        - **Loop-22 MERGE EPQ delete/update chain follow (2026-05-20)**:
+          Two coupled fixes in `internal/executor/operators_merge.go`:
+          (A) `mergeApplyDelete` incorrectly returned `errMergeSourceUnmatched` for
+          any committed xmax (treating UPDATE the same as DELETE). Fixed to call
+          `mergeEPQRefreshSnap(ctx)` after `epqWait`, then follow HOT/non-HOT chain
+          to find the live successor: `mergeEPQError` when update found, only
+          `errMergeSourceUnmatched` when no successor (true delete). Symmetric with
+          `mergeApplyUpdate`. Fixes `update1 merge_delete` permutation: row now
+          correctly deleted (0 rows) after concurrent UPDATE raises balance 160→170.
+          (B) `applyMod` received `mergePendingMod` by value, so the EPQ-corrected
+          `mod.newRow` (e.g. balance=100 after recheck) did not propagate back to
+          `collectReturningRow(mod.newRow)` in `mergeOp.Next()` — which used the
+          original WHEN-clause-computed `newRow` (balance=640). Changed signature to
+          `*mergePendingMod`; outer loop uses `&mods[i]`. All EPQ-recheck WHEN
+          re-evaluations now propagate to the RETURNING output.
+          MergeMatchRecheck: first divergence moves from L262 to L416 (415/503
+          lines now match). Remaining gap: moved-partition sentinel not stamped when
+          cross-partition UPDATE uses `updateViaIndex` path (separate scope).
+          `go test -count=1 -race -timeout 240s ./internal/executor/ ./internal/storage/
+          ./internal/server/ ./internal/mvcc/ ./internal/planner/ ./internal/parser/
+          ./internal/analyzer/` PASS; all 14 existing isolation PASS tests unchanged.
+          Design: `docs/design/0100-0005-loop22-merge-epq-delete-chain-and-returning.md`.
+          **PASS count = 14** (unchanged — MergeMatchRecheck still SKIP at L416).
+
         - **Loop-21 Inline NOTICE delivery via NoticeFlush (2026-05-20)**:
           `executor.Context.AddNotice` now calls `ctx.NoticeFlush(msg)` and
           returns early (no buffering) when `NoticeFlush` is wired. In
@@ -2023,6 +2047,8 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           **PASS count = 14** (unchanged — MergeMatchRecheck still fails on
           CTE-with-MERGE-RETURNING at L257+; MergeJoin fails on EXPLAIN join
           tree structure).
+        
+        - Next: **Go to M0107 (because this milestone depends on M0107)**
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
