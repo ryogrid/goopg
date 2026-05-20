@@ -131,6 +131,11 @@ func findScanLeaf(op Operator) currentTIDProvider {
 			op = v.child
 		case *filterOp:
 			op = v.child
+		case *setOp:
+			// Partition UNION ALL: setOp implements currentTIDProvider and
+			// delegates to whichever child is currently active (left while
+			// !leftDone, right once leftDone). M0100-0005 follow-up.
+			return v
 		default:
 			return nil
 		}

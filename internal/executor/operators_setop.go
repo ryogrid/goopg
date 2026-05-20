@@ -2,6 +2,7 @@ package executor
 
 import (
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // setOp executes UNION ALL by draining the left side then the right.
@@ -72,4 +73,23 @@ func (o *setOp) Next() (TupleSlot, error) {
 		}
 	}
 	return nil, EOF
+}
+
+// currentTID implements currentTIDProvider for partition UNION ALL scans
+// (M0100-0005 follow-up). After each setOp.Next() call, the just-yielded
+// row came from the left child while !leftDone, and from the right child
+// once leftDone is true. Delegating to findScanLeaf on the active child
+// lets lockRowsOp.drainAndStamp stamp the correct per-row xmax on the
+// leaf partition's heap tuple for SELECT … FOR UPDATE / FOR SHARE.
+func (o *setOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool) {
+	var active Operator
+	if !o.leftDone {
+		active = o.left
+	} else {
+		active = o.right
+	}
+	if src := findScanLeaf(active); src != nil {
+		return src.currentTID()
+	}
+	return storage.RelFileNode{}, storage.ItemPointer{}, false
 }

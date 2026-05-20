@@ -1855,6 +1855,20 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           After this fix: **PASS count = 8** (was 6 before HeapXmaxInvalid
           regression): LockCommittedUpdate, InsertConflictDoUpdate,
           InsertConflictDoNothing, FkSnapshot, PartitionKeyUpdate{1,2,3,4}.
+        - **lockRowsOp partition TID stamp (2026-05-20 loop 13)**:
+          `findScanLeaf` returned nil for `setOp` (the UNION ALL used for
+          partitioned-table scans), so `drainAndStamp` never stamped
+          per-row lock-only xmax on leaf partition tuples.
+          `upsertOp.findInProgressConflict` Case 3 then missed the FOR
+          UPDATE lock and the upsert proceeded without blocking.  Fix:
+          add `case *setOp: return v` in `findScanLeaf`; `setOp` now
+          implements `currentTIDProvider` by delegating to the active
+          child.  Flips `TestPort_IsolationInsertConflictDoUpdate4` from
+          SKIP to PASS.  Design:
+          `docs/design/0100-0005-lockrows-partition-tid-stamp.md`.
+          After this fix: **PASS count = 9**: LockCommittedUpdate,
+          InsertConflictDoUpdate, InsertConflictDoNothing, FkSnapshot,
+          PartitionKeyUpdate{1,2,3,4}, InsertConflictDoUpdate4.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
