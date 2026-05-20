@@ -2687,6 +2687,63 @@ Operational policy (2026-05-20):
         Slice B (8-stripe `wal.Writer.appendLocks` per parent §2)
         remains deferred — splitting `state.appendMu`'s four invariants
         is multi-loop scope.
+      - PARTIAL PROGRESS 2026-05-21 (slice C executor consumer
+        foundation — `selectFSMCandidatePage` page-selection helper):
+        added `selectFSMCandidatePage(fsm, pool, rel, minFreeBytes)
+        (storage.BlockNumber, bool)` plus two policy constants
+        (`candidatesPerInsert = 4`, `hotPinThreshold = 4`) in new file
+        `internal/executor/heap_insert_select.go`. Combines slice C
+        foundations 1 + 3 into the read-only selection step of parent
+        chapter §3's `selectInsertPage`: queries the FSM for up to four
+        candidate pages with at least `minFreeBytes` free, walks them
+        probing `Pool.SlotPinCount`, returns the candidate with the
+        lowest live pin count (short-circuits on the first pin-0 hit so
+        the common case is one `bufmap.Lookup`), and returns
+        `(0, false)` to signal "fall through to extension" when no
+        candidate qualifies or every candidate is at or above
+        `hotPinThreshold`. No locks held across the body —
+        `FSM.GetCandidates` takes its own RLock for the scan; the
+        per-candidate `SlotPinCount` probe is the lock-free seqlock
+        `bufmap.Lookup` + `state.Load` landed in foundation 3
+        ([[0107-0007d]]). Nil-safe (`fsm == nil || pool == nil
+        → (0, false)`) so the heap-insert path can call it before FSM
+        is initialised (catalog bootstrap before `pg_init`).
+        Decoupling selection (pure, unit-testable, no on-disk effect)
+        from the call-site rewrite is deliberate: the rewrite of
+        `writeHeapRowReturning` / `writeHeapRowReturningPG` —
+        replacing the current FSM/tail/extend cascade with
+        `selectFSMCandidatePage` + `Pool.ExtendRelationBatch` + FSM
+        `RecordFreeSpace` per added page — lands in the next loop with
+        the PG-compat WAL byte-diff gate from the parent milestone.
+        Slice B (parent §2 WAL insert striping) remains deferred —
+        multi-loop scope. Five regression tests in
+        `internal/executor/heap_insert_select_test.go`, all against a
+        real `storage.Manager`+`storage.Pool`+`storage.FSM` fixture (no
+        mocks): `TestSelectFSMCandidatePageNilInputs` (nil-safe early
+        returns under both nil FSM and nil pool);
+        `TestSelectFSMCandidatePageEmptyFSM` (no FSM page ≥
+        minFreeBytes returns `(0, false)`);
+        `TestSelectFSMCandidatePageRanksByPinCount` (three candidates,
+        pin counts 2/0/1 → returns block 1; without ranking it would
+        return the first candidate);
+        `TestSelectFSMCandidatePageShortCircuitsOnPinZero` (block 0
+        unpinned, block 1 pinned five times over `hotPinThreshold`;
+        helper deterministically returns block 0 — the first pin-0 hit
+        by lowest-block tie-break);
+        `TestSelectFSMCandidatePageRejectsHotCandidates` (all four
+        candidates pinned `hotPinThreshold` times → `(0, false)` so the
+        caller falls through to extension);
+        `TestSelectFSMCandidatePagePicksAmongModeratelyPinned` (pin
+        counts 3/1/2, all below threshold → returns the pin=1 block,
+        pinning the "lower is better" ranking independent of the pin=0
+        short-circuit). Verified: `go test -race -count=1 -run
+        'TestSelectFSMCandidatePage' ./internal/executor/` PASS
+        (1.03 s); `go test -race -count=1 ./internal/executor/` PASS
+        (2.79 s). Design:
+        `docs/design/0107-0007e-select-fsm-candidate-page.md` (indexed
+        in `docs/design/README.md`). Next slice for this milestone is
+        the call-site rewrite that consumes `selectFSMCandidatePage` +
+        `Pool.ExtendRelationBatch` and clears the WAL byte-diff gate.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
