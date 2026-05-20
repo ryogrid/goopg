@@ -2967,6 +2967,76 @@ Operational policy (2026-05-20):
         work); splitting `state.appendMu`'s four invariants
         (writePos / walBuf / memRing / writeLSN); `prevRecPtr`
         chain integrity under per-stripe locks.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 3 of N —
+        `buildSegmentPadRecord` XLOG_NOOP byte-builder): added
+        `buildSegmentPadRecord(padLen int, prev uint64) ([]byte,
+        error)` to new file `internal/wal/segment_pad.go`. Pure
+        byte-builder that constructs a single `RmgrXLog`/`XLOG_NOOP`
+        record of exactly padLen bytes with `prev` stamped into
+        `xl_prev` and an all-zero body wrapped in the standard
+        `xlrBlockIDDataShort` (padLen ≤ 281) or `xlrBlockIDDataLong`
+        (padLen ≥ 282) chunk header; padLen == 24 is the empty-body
+        branch (header only, no chunk header — parser's headerLoop
+        exits when `len(wrapped)-off (=0) <= datatotal (=0)`). The
+        `lsnAllocator` ([[0107-0007h]]) onCrossSegment hook will call
+        this builder to fill the `[start, boundary)` gap that opens
+        when a cross-segment reservation hops to the next segment;
+        parent §2 "cross-segment slow path" pairs this with the lock
+        ordering `appendLockSet.lockByProcNum → (rare)
+        lsnAllocator.rotateMu → buildSegmentPadRecord → buffer
+        write`. xlogInfoNoop = 0x20 matches PG's
+        `postgres/src/include/catalog/pg_control.h:70` `#define
+        XLOG_NOOP 0x20`; PG18 `xlog_redo` at `xlog.c:8508` dispatches
+        the value through a `/* nothing to do here */` branch, so a
+        PG18 standby replaying a goopg stream containing this record
+        skips it without on-disk effect — preserving the parent
+        milestone's §6 "WAL record format guarantee". The 25-byte
+        padLen is rejected explicitly: a 1-byte body cannot carry
+        the 2-byte short chunk header (let alone the 5-byte long
+        header). `maxAlignXLog` (records aligned to 8 B on disk)
+        guarantees real reservations produce padLen ∈ {24, 32, 40,
+        ...} — every such value is encodable; the explicit error is
+        defence-in-depth for any future caller that bypasses the
+        alignment rule. Body bytes past the chunk-header prefix are
+        all zero, which is what the byte-diff replay invariant for
+        the parent milestone requires. Dead code until the slice B
+        call-site rewrite installs the hook; foundation-first pattern
+        matches slice C ([[0107-0007b]] / [[0107-0007c]] /
+        [[0107-0007d]] before [[0107-0007e]] / [[0107-0007f]] /
+        [[0107-0007g]]). Eight regression tests in
+        `internal/wal/segment_pad_test.go`:
+        `TestBuildSegmentPadRecordMinSize` (padLen=24; all header
+        fields + CRC valid);
+        `TestBuildSegmentPadRecordRoundTripSizes` (table-driven
+        across `{24, 26, 100, 281, 282, 1024, 64 KiB}` — byte length,
+        header rmid/info, CRC validation, full structured-decoder
+        round-trip via `decodeRecordXLogDetailed` confirming
+        `MainData` length and all-zero contents);
+        `TestBuildSegmentPadRecordRejectsTooSmall` (`{0, 1, 8, 16,
+        23}` → error "below minimum");
+        `TestBuildSegmentPadRecordRejects1ByteBody` (padLen=25 →
+        error "1-byte body");
+        `TestBuildSegmentPadRecordPrevPropagated` (prev ∈ `{0, 1,
+        0xDEAD_BEEF, max}` round-trips through xl_prev);
+        `TestBuildSegmentPadRecordBodyAllZeroAfterChunkHeader` (every
+        tail byte zero for both short and long chunks);
+        `TestBuildSegmentPadRecordCRCDeterministic` (two builds with
+        identical `(padLen, prev)` produce byte-identical output
+        including CRC);
+        `TestBuildSegmentPadRecordCRCDetectsCorruption` (single-bit
+        flip in body invalidates CRC, pinning that the CRC pre-image
+        covers `(body || header[:20])`). Verified: `go test -race
+        -count=1 -run 'TestBuildSegmentPadRecord' ./internal/wal/`
+        PASS (1.02 s); `go test -race -count=1 ./internal/wal/` PASS
+        (3.13 s). Design:
+        `docs/design/0107-0007j-wal-segment-pad-record.md` (indexed
+        in `docs/design/README.md`). Out of scope: mounting
+        `lsnAllocator` + `appendLockSet` on `Writer` + rewriting
+        `Append` (call-site rewrite, multi-loop scope); splitting
+        `state.appendMu`'s four invariants; `prevRecPtr` chain
+        integrity under per-stripe locks (the pad record's xl_prev
+        slot is filled by the caller; this foundation only consumes
+        the value).
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
