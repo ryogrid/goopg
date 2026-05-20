@@ -2512,6 +2512,43 @@ Operational policy (2026-05-20):
         (was SKIPPED/DEADLOCK); pgbench c=100 standard TPS ≥ 500;
         `TestE2E_FailoverGoopgToPG/async` PASS; pre/post-D4 WAL byte-diff
         test PASS; `make ralph-state-guard` PASS.
+      - PARTIAL PROGRESS 2026-05-21 (slice A — heap-extend lock striping):
+        replaced `heapExtendLocks sync.Map → *sync.Mutex` (single
+        per-relation mutex) with `heapExtendLocks sync.Map →
+        *heapExtendLockSet`, an 8-stripe `[8]paddedMutex` set. A backend
+        extending a relation picks `set.locks[procNum & 0x7]`, allowing
+        up to 8 parallel extenders per relation — parent chapter §4.
+        `paddedMutex` is `sync.Mutex` + `[56]byte` to 64 B so adjacent
+        stripes occupy distinct cache lines (pinned at compile time via
+        `unsafe.Sizeof`). Both call sites in
+        `internal/executor/operators_storage.go` (`writeHeapRowReturning`,
+        `writeHeapRowReturningPG`) already had `ctx *Context` in scope
+        and now pass `ctx.ProcNum` (plumbed end-to-end by M0107-0004).
+        Correctness argument: `storage.Pool.PinNew`
+        (`internal/storage/bufpool.go:638`) holds `pinMu` over victim
+        claim + bufmap publish, and `storage.Manager.Extend` allocates
+        distinct block numbers per call — so concurrent extension from
+        different stripes is safe; the single mutex previously existed
+        to reduce wasted PinNew churn under load, not for correctness.
+        New regression file `internal/executor/extend_lock_stripe_test.go`:
+        `TestPaddedMutexSize` (64 B layout assertion);
+        `TestLockHeapExtendStripesByProcNum` (8 goroutines on procNums
+        0..7 reach peak-concurrency 8, would hang under a single mutex);
+        `TestLockHeapExtendCollidesOnSameStripe` (procNum 0 vs procNum 8
+        — same stripe — correctly serialise within a bounded window).
+        Verified: `go test -race -count=1 ./internal/executor/` PASS
+        (2.7 s). Design: `docs/design/0107-0007a-heap-extend-lock-striping.md`
+        (indexed in `docs/design/README.md`).
+        Out of scope (deferred to slice B and slice C):
+        - Slice B — 8-stripe `wal.Writer.appendLocks` per parent §2.
+          Needs splitting `state.appendMu`'s four invariants (writePos,
+          walBuf state, memRing append, writeLSN advance) into per-stripe
+          local state vs. shared state, plus atomic `nextLSN.Add` and
+          segment-boundary `rotateMu`.
+        - Slice C — FSM-driven pin-count-aware page ranking + batched
+          extension per parent §3. Requires `Pool.SlotPinCount(tag)`
+          ([[0107-0006]] consumer), `FSM.GetCandidates(rel, minBytes, n)`,
+          and `Pool.ExtendRelationBatch(rel, n)`.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
