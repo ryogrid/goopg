@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+
+	"github.com/goopg/goopg/internal/stats"
 )
 
 // Slot state bit layout (single 64-bit atomic word):
@@ -185,9 +187,11 @@ type Pool struct {
 	OnFlushAll func()
 
 	// Dirty-victim instrumentation (M0048-0003).
-	// Atomic counters (no lock needed post-refactor).
-	dirtyVictimCount atomic.Int64
-	totalVictimCount atomic.Int64
+	// Per-P sharded counters (no cache-line bouncing under concurrent
+	// foreground eviction); cold-path Sum reads only feed the bgwriter
+	// DoD ratio and ResetVictimStats.
+	dirtyVictimCount stats.Counter
+	totalVictimCount stats.Counter
 }
 
 // PoolConfig controls Pool sizing.
@@ -1245,17 +1249,17 @@ func (p *Pool) maybeCompact() {
 // DirtyVictimRate returns the fraction of foreground evictions that
 // encountered a dirty page.
 func (p *Pool) DirtyVictimRate() float64 {
-	total := p.totalVictimCount.Load()
+	total := p.totalVictimCount.Sum()
 	if total == 0 {
 		return 0
 	}
-	return float64(p.dirtyVictimCount.Load()) / float64(total)
+	return float64(p.dirtyVictimCount.Sum()) / float64(total)
 }
 
 // ResetVictimStats resets the dirty-victim counters to zero.
 func (p *Pool) ResetVictimStats() {
-	p.dirtyVictimCount.Store(0)
-	p.totalVictimCount.Store(0)
+	p.dirtyVictimCount.Reset()
+	p.totalVictimCount.Reset()
 }
 
 // WriteDirtyPages proactively flushes up to maxPages dirty slots.

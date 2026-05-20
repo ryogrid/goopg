@@ -3021,6 +3021,52 @@ Operational policy (2026-05-20):
         wait caller (consumes [[0107-0008c]]; blocked on M0107-0006
         lockfree bufpool); per-target AIO migration formally closed
         as *do not migrate* per [[0107-0008j]]; per-Go-minor CI matrix.
+      - PARTIAL PROGRESS 2026-05-21 (loop 13): seventh concrete `stats.Counter`
+        consumer migration landed — the buffer pool's dirty-victim
+        instrumentation pair (`dirtyVictimCount`, `totalVictimCount`)
+        in `internal/storage/bufpool.go` moved from `atomic.Int64` to
+        `stats.Counter`. Hot path is `chooseVictimSlot`'s valid-page
+        eviction branch, called on every foreground cache miss against
+        a cold data page. Under a c=100 pgbench-standard load with
+        shared_buffers smaller than the active set, evictions reach
+        hundreds of thousands per second; the previously-shared
+        `totalVictimCount` cache line bounced on every cross-backend
+        miss (every valid-page eviction bumps it). Per-P sharding via
+        `stats.Counter` keeps each backend's bump on its current P's
+        shard line. The two `.Add(1)` call sites in the `wasValid`
+        branch stay byte-identical (untyped const `1` accepted by both
+        `atomic.Int64.Add(int64)` and `stats.Counter.Add(int64)`).
+        Cold-path readers are the bgwriter goroutine via
+        `Pool.DirtyVictimRate() float64` (~once per `bgwriter_delay =
+        200 ms` tick) and the DoD test via `ResetVictimStats()` +
+        `DirtyVictimRate()`. `DirtyVictimRate()` reads switch from
+        `.Load()` to `.Sum()`; `ResetVictimStats()` switches from
+        `.Store(0)` to `.Reset()`. Other bufpool atomics
+        (`Slot.state` packed bitfield with pin/usage/dirty/valid/IO/gen
+        fields, `Pool.clockHand` clock-sweep cursor, `Pool.tombstones`
+        compaction-trigger gauge, `bufmap` `key0`/`key1`/`val` triplet
+        per cell) stay on `atomic.*` — they are not additive counters
+        (the state word is CAS-mutated bitfields; the cursor reads need
+        the latest value not the cross-shard sum; the gauge is
+        Store-reset; the bufmap cell payload uses CAS-with-retry).
+        Memory cost: 32 KiB per server (2 × 16 KiB Counter; one Pool
+        per server), flat. Cumulative singleton-consumer cost across
+        the seven landed migrations is now 320 KiB per server. No new
+        tests added — existing
+        `internal/storage/bgwriter_test.go::TestBgwriterDoDDirtyVictimRate`
+        is the end-to-end assertion that bgwriter holds the dirty-
+        victim ratio ≤ 5 % under load (i.e. exactly the callers that
+        touch both counters in the hot path); `stats.Counter`'s own
+        race-clean suite covers the primitive directly. Verified:
+        `go test -race -count=1 ./internal/storage/` (5.37 s) +
+        `go test -race -count=1 ./internal/stats/` (1.02 s) PASS.
+        Design:
+        `docs/design/0107-0008m-bufpool-victim-stats-counter-wiring.md`
+        (indexed in `docs/design/README.md`).
+        Remaining work for this sub-milestone: bufpool per-slot Sema
+        wait caller (consumes [[0107-0008c]]; blocked on M0107-0006
+        lockfree bufpool); per-target AIO migration formally closed
+        as *do not migrate* per [[0107-0008j]]; per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
