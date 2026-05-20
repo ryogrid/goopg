@@ -127,14 +127,73 @@ Phase C.1 verification gates:
 - Legacy `Run` path unchanged; `RunFast` produces bit-identical rows
 - `BuildFast` wraps non-migrated operators in `OpAdapter` transparently
 
+## Phase C.1 follow-up (loop 11) — dispatch wiring + OpUpdate/OpDelete/OpSort
+
+### What changed
+
+**`OpUpdate`, `OpDelete`** (new concrete kinds, no Operator child):
+
+`updateOp` and `deleteOp` use `extractScan` to drive storage directly, so
+they have no `Operator` child. Adding `OpUpdate`/`OpDelete` kinds eliminates
+one itab dispatch per DML row:
+- Before: `adapterOpNext` → 1 itab call (`opAdapterState.op.Next()`)
+- After: `updateOpKernelNext`/`deleteOpKernelNext` → 0 itab calls (direct
+  concrete method call on the concrete type produced by the type-assert)
+
+**`OpSort`** (new kind, child bridged via `opNodeOperator`):
+
+`sortOp.Open()` drains the child in a tight loop; each child row previously
+cost one itab dispatch. The `opNodeOperator` bridge wraps an `*OpNode` as
+an `Operator`, adding one function call per child row at the bridge but
+enabling the child subtree to run on concrete switch dispatch. For
+`Sort(Filter(SeqScan))`, the bridge adds one call but removes two itab
+dispatches (Filter→SeqScan chain). Net win for plans with ≥2-level children.
+
+**`OpIterator` + `BuildFastIterator`** (drop-in replacement for `executor.Build`):
+
+`OpIterator` wraps `*OpNode` as an `Operator`, enabling backward-compatible
+wiring into the server dispatch loop without structural changes. Key methods:
+- `Schema()`: returns `plan.Output()` first; falls back to adapter's `Schema()`
+  for dynamic-schema operators (CALL, INSERT with RETURNING).
+- `RowsAffected()`: delegates to `updateOpState.op`, `deleteOpState.op`, or
+  the adapter's underlying operator for INSERT.
+- `Next()`: calls `opNext(it.node, &it.dst)` and returns `nil` for DML nil-rows
+  (preserving the legacy nil-slot convention checked by the dispatch loop).
+
+**`dispatch.go`** wired:
+
+Both `executor.Build` calls in `executeOneSimpleStmt` (line 777) and
+`executeFetchAll` (line 1188) replaced with `executor.BuildFastIterator`.
+The dispatch loop is unchanged; `*OpIterator` implements `Operator` and
+`RowCounter` transparently.
+
+### Operator migration status after loop 11
+
+| OpKind     | Status  | Dispatch              |
+|------------|---------|-----------------------|
+| OpSeqScan  | migrated | concrete *seqScanOp  |
+| OpFilter   | migrated | concrete switch arm   |
+| OpProject  | migrated | concrete switch arm   |
+| OpLimit    | migrated | concrete switch arm   |
+| OpUpdate   | migrated | concrete *updateOp   |
+| OpDelete   | migrated | concrete *deleteOp   |
+| OpSort     | migrated | concrete *sortOp (child via opNodeOperator bridge) |
+| OpAdapter  | shim     | legacy Operator interface |
+
+### What's NOT yet concrete
+
+`OpInsert` (insertOp has a VALUES child; requires opNodeOperator bridge or
+insertOp changes), `OpJoin`/`OpHashJoin` (multi-child, complex), `OpAggregate`,
+`OpDistinct`, `OpValues`. These remain in `OpAdapter`.
+
 ## Remaining scope (Phase C.1 follow-up loops)
 
-- **Migrate remaining hot-path operators**: `sortOp`, `joinOp` / `hashJoinOp`,
-  `insertOp`, `updateOp`, `deleteOp`
+- **Migrate remaining hot-path operators**: `insertOp`, `joinOp`/`hashJoinOp`
+  (with opNodeOperator bridges for left/right children)
 - **Phase C.2**: replace `*OpNode` children with slab indices; add per-statement
-  `[]OpNode` slab in `stmtCtx`
-- **Phase C.3**: move plan tree into mctx; replace `state any` with raw bytes;
-  delete parser/planner GC-heap allocations
+  `[]OpNode` slab in `stmtCtx`; eliminate the `any` state field in favour of
+  raw bytes (`unsafe.Pointer` cast, sized by `opStateSize`)
+- **Phase C.3**: move plan tree into mctx; delete parser/planner GC-heap alloc
 - **`Slot.CopyTo` API**: thread through sort/hash-join/aggregate to eliminate
   `Materialize()` deep-copy at retention boundaries
 - **Performance gate**: verify `runtime.itabHashFunc` drops from top-40 once
@@ -142,7 +201,13 @@ Phase C.1 verification gates:
 
 ## Files changed
 
-- `internal/executor/opnode.go` (new) — Slot, OpKind, OpNode, state types,
-  opOpen/opNext/opClose, per-kind kernels
-- `internal/executor/executor.go` (modified) — BuildFast, RunFast
-- `internal/executor/phase_c_test.go` (new) — regression tests
+- `internal/executor/opnode.go` (modified) — added OpUpdate, OpDelete, OpSort
+  kinds; updateOpState, deleteOpState, sortOpState, opNodeOperator, OpIterator,
+  BuildFastIterator; updated opOpen/opClose/opNext switches; new kernels
+- `internal/executor/executor.go` (modified) — BuildFast cases for Sort/Update/Delete;
+  BuildFastIterator alias (delegates to opnode.go)
+- `internal/executor/phase_c_test.go` (modified) — TestBuildFastNodeKinds updated;
+  new TestRunFastSort, TestBuildFastIteratorSchema, TestBuildFastIteratorRowsAffected,
+  TestOpIteratorNilSlotForDMLNoRow
+- `internal/server/dispatch.go` (modified) — executor.Build → BuildFastIterator
+  in executeOneSimpleStmt and executeFetchAll (2 sites)

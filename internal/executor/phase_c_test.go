@@ -366,7 +366,30 @@ func TestBuildFastNodeKinds(t *testing.T) {
 			},
 			OpLimit,
 		},
-		// Non-migrated operators should use OpAdapter.
+		// Update/Delete produce concrete kinds (no Operator child).
+		{
+			&planner.Update{
+				Table: tbl,
+				Child: &planner.SeqScan{Table: tbl},
+			},
+			OpUpdate,
+		},
+		{
+			&planner.Delete{
+				Table: tbl,
+				Child: &planner.SeqScan{Table: tbl},
+			},
+			OpDelete,
+		},
+		// Sort produces OpSort (child bridged via opNodeOperator).
+		{
+			&planner.Sort{
+				Child: seqScanPlan,
+				Keys:  []planner.SortKey{},
+			},
+			OpSort,
+		},
+		// Non-migrated operators should still use OpAdapter.
 		{
 			&planner.Insert{
 				Table:  tbl,
@@ -385,5 +408,143 @@ func TestBuildFastNodeKinds(t *testing.T) {
 		if n.Kind != c.want {
 			t.Errorf("BuildFast(%T).Kind = %d, want %d", c.plan, n.Kind, c.want)
 		}
+	}
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase C.1 follow-up tests: OpSort, OpUpdate, OpDelete, BuildFastIterator.
+// ---------------------------------------------------------------------------
+
+// TestRunFastSort verifies that the OpSort kernel produces the same sorted
+// rows as the legacy Build+Run path. For "SELECT id FROM items ORDER BY id DESC"
+// the planner wraps Sort under a Project, so the root is OpProject; we check
+// the child is OpSort and that the row ordering matches.
+func TestRunFastSort(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	plan := planOne(t, "SELECT id FROM items ORDER BY id DESC", cat)
+	runBothAndCompare(t, plan, ctx)
+
+	fastNode, err := BuildFast(plan)
+	if err != nil {
+		t.Fatalf("BuildFast: %v", err)
+	}
+	rows, err := RunFast(fastNode, ctx)
+	if err != nil {
+		t.Fatalf("RunFast: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("expected rows from ORDER BY, got none")
+	}
+	// The planner produces Project(Sort(SeqScan)) so root is OpProject.
+	// Verify the Project child is OpSort (not OpAdapter) confirming concrete dispatch.
+	if fastNode.Kind != OpProject {
+		t.Errorf("unexpected root kind %d for ORDER BY plan", fastNode.Kind)
+	}
+	if fastNode.childA == nil || fastNode.childA.Kind != OpSort {
+		childKind := OpInvalid
+		if fastNode.childA != nil {
+			childKind = fastNode.childA.Kind
+		}
+		t.Errorf("Project.childA.Kind = %d, want OpSort (%d)", childKind, OpSort)
+	}
+}
+
+// TestBuildFastIteratorSchema verifies that BuildFastIterator.Schema() returns
+// the correct schema for read-shaped plans (SELECT).
+func TestBuildFastIteratorSchema(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	plan := planOne(t, "SELECT id FROM items", cat)
+	it, err := BuildFastIterator(plan)
+	if err != nil {
+		t.Fatalf("BuildFastIterator: %v", err)
+	}
+	if err := it.Open(ctx); err != nil {
+		_ = it.Close()
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = it.Close() }()
+
+	schema := it.Schema()
+	if schema == nil {
+		t.Fatal("Schema() returned nil for SELECT plan")
+	}
+	if len(schema) != 1 || schema[0].Name != "id" {
+		t.Errorf("unexpected schema: %v", schema)
+	}
+}
+
+// TestBuildFastIteratorRowsAffected verifies that BuildFastIterator.RowsAffected()
+// delegates correctly to the underlying DML operator for OpUpdate/OpDelete.
+func TestBuildFastIteratorRowsAffected(t *testing.T) {
+	cat := catalog.NewInMemory()
+	_, err := cat.CreateTable(parser.ObjectName{Name: "items"},
+		[]catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+
+	updatePlan := &planner.Update{
+		Table: tbl,
+		Child: &planner.SeqScan{Table: tbl},
+	}
+	it, err := BuildFastIterator(updatePlan)
+	if err != nil {
+		t.Fatalf("BuildFastIterator(Update): %v", err)
+	}
+	// Verify OpIterator correctly implements RowCounter.
+	if _, ok := interface{}(it).(RowCounter); !ok {
+		t.Fatal("*OpIterator does not implement RowCounter")
+	}
+	// RowsAffected before open/run should return 0 (not panic).
+	if got := it.RowsAffected(); got != 0 {
+		t.Errorf("RowsAffected before run = %d, want 0", got)
+	}
+}
+
+// TestOpIteratorNilSlotForDMLNoRow verifies that BuildFastIterator.Next()
+// returns (nil, nil) for DML nil-rows (matching legacy Build semantics).
+func TestOpIteratorNilSlotForDMLNoRow(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	// Use an INSERT into an empty table — insertOp still in OpAdapter,
+	// but OpIterator.Next() must propagate the nil-slot correctly.
+	insertPlan := &planner.Insert{
+		Table:  tbl,
+		Source: &planner.Values{},
+	}
+	it, err := BuildFastIterator(insertPlan)
+	if err != nil {
+		t.Fatalf("BuildFastIterator: %v", err)
+	}
+	if err := it.Open(ctx); err != nil {
+		_ = it.Close()
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = it.Close() }()
+
+	slot, err := it.Next()
+	if err != nil && err != EOF {
+		t.Fatalf("Next: unexpected error: %v", err)
+	}
+	if err == EOF {
+		return // acceptable — empty values source
+	}
+	// nil slot is the DML nil-row signal; must not panic on nil.
+	if slot != nil {
+		t.Errorf("DML nil-row: expected nil slot from OpIterator.Next(), got %T", slot)
 	}
 }

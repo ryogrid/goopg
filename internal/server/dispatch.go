@@ -774,7 +774,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		}
 	}
-	op, err := executor.Build(node)
+	op, err := executor.BuildFastIterator(node)
 	if err != nil {
 		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 	}
@@ -1185,7 +1185,7 @@ func (s *Server) executeFetchAll(_ context.Context, w *protocol.FrameWriter, ect
 		code, msg := planErrorFields(err)
 		return s.writeQueryError(w, code, msg)
 	}
-	op, buildErr := executor.Build(node)
+	op, buildErr := executor.BuildFastIterator(node)
 	if buildErr != nil {
 		return s.writeQueryError(w, execErrCode(buildErr), execErrMsg(buildErr))
 	}

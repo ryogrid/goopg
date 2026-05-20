@@ -349,6 +349,36 @@ func BuildFast(plan planner.Node) (*OpNode, error) {
 			state:  &limitState{plan: p, limitCount: -1},
 		}, nil
 
+	case *planner.Sort:
+		child, err := BuildFast(p.Child)
+		if err != nil {
+			return nil, err
+		}
+		// Bridge the *OpNode child into the Operator interface that sortOp
+		// expects. sortOp.Open() drains the child in a tight loop; the
+		// opNodeOperator hop adds one function call per row but the child
+		// subtree runs on concrete switch dispatch.
+		childOp := &opNodeOperator{node: child, schema: p.Child.Output()}
+		sortLegacy := newSortOp(p, childOp)
+		return &OpNode{
+			Kind:  OpSort,
+			state: &sortOpState{op: sortLegacy, schema: p.Output()},
+		}, nil
+
+	case *planner.Update:
+		op, err := newUpdateOp(p)
+		if err != nil {
+			return nil, err
+		}
+		return &OpNode{Kind: OpUpdate, state: &updateOpState{op: op}}, nil
+
+	case *planner.Delete:
+		op, err := newDeleteOp(p)
+		if err != nil {
+			return nil, err
+		}
+		return &OpNode{Kind: OpDelete, state: &deleteOpState{op: op}}, nil
+
 	default:
 		// For non-migrated operators, build the legacy Operator tree
 		// and wrap in an adapter. This path preserves the existing

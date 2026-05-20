@@ -139,6 +139,16 @@ const (
 	OpProject
 	OpLimit
 
+	// Phase C.1 follow-up: DML operators (no Operator child — they drive
+	// storage directly via extractScan).
+	OpUpdate
+	OpDelete
+
+	// Phase C.1 follow-up: Sort (uses opNodeOperator bridge for child so
+	// the child subtree runs on concrete dispatch while sortOp itself is
+	// unchanged).
+	OpSort
+
 	// Adapter — wraps a legacy Operator interface.
 	// All unmigrated operators use this until they are individually
 	// promoted to a concrete kind.
@@ -205,6 +215,138 @@ type opAdapterState struct {
 	op Operator
 }
 
+// updateOpState wraps a concrete *updateOp (no Operator child).
+type updateOpState struct {
+	op *updateOp
+}
+
+// deleteOpState wraps a concrete *deleteOp (no Operator child).
+type deleteOpState struct {
+	op *deleteOp
+}
+
+// sortOpState wraps a *sortOp whose child is an opNodeOperator bridge,
+// so the child subtree uses concrete dispatch while sortOp is unchanged.
+type sortOpState struct {
+	op     *sortOp
+	schema planner.Schema // pre-computed from *planner.Sort.Output()
+}
+
+// ---------------------------------------------------------------------------
+// opNodeOperator — bridges *OpNode into the Operator interface.
+//
+// Used when a legacy operator (sortOp, joinOp, …) needs an Operator child
+// but the child is actually an *OpNode tree. One extra function call per
+// child Next() at this boundary; the child subtree still uses concrete
+// switch dispatch.
+// ---------------------------------------------------------------------------
+
+type opNodeOperator struct {
+	node   *OpNode
+	schema planner.Schema
+	dst    Slot
+}
+
+func (w *opNodeOperator) Open(ctx *Context) error { return opOpen(w.node, ctx) }
+
+func (w *opNodeOperator) Next() (TupleSlot, error) {
+	w.dst.Reset()
+	if err := opNext(w.node, &w.dst); err != nil {
+		return nil, err
+	}
+	if !w.dst.HasRow {
+		return nil, nil // DML nil-row → propagate as nil TupleSlot
+	}
+	return &w.dst, nil
+}
+
+func (w *opNodeOperator) Close() error           { return opClose(w.node) }
+func (w *opNodeOperator) Schema() planner.Schema { return w.schema }
+
+// ---------------------------------------------------------------------------
+// OpIterator — wraps *OpNode as an Operator for backward-compatible wiring.
+//
+// OpIterator implements both Operator and RowCounter so it can replace
+// executor.Build in the server dispatch loop without changing the loop's
+// interface. BuildFastIterator is the drop-in replacement for Build.
+// ---------------------------------------------------------------------------
+
+// OpIterator wraps an *OpNode tree as an Operator so the server dispatch
+// loop can use concrete Phase C execution without structural changes.
+type OpIterator struct {
+	node *OpNode
+	plan planner.Node
+	dst  Slot
+}
+
+// BuildFastIterator builds an OpNode tree via BuildFast and wraps it in an
+// OpIterator. It is the drop-in replacement for executor.Build in dispatch.
+func BuildFastIterator(plan planner.Node) (*OpIterator, error) {
+	node, err := BuildFast(plan)
+	if err != nil {
+		return nil, err
+	}
+	return &OpIterator{node: node, plan: plan}, nil
+}
+
+// Open implements Operator.
+func (it *OpIterator) Open(ctx *Context) error { return opOpen(it.node, ctx) }
+
+// Next implements Operator. Returns nil TupleSlot for DML nil-rows (preserving
+// the legacy nil-slot convention that the dispatch loop checks with schema==nil).
+func (it *OpIterator) Next() (TupleSlot, error) {
+	it.dst.Reset()
+	if err := opNext(it.node, &it.dst); err != nil {
+		return nil, err
+	}
+	if !it.dst.HasRow {
+		return nil, nil
+	}
+	return &it.dst, nil
+}
+
+// Close implements Operator.
+func (it *OpIterator) Close() error { return opClose(it.node) }
+
+// Schema implements Operator. For read plans, returns plan.Output(). For DML
+// operators still in the adapter, delegates to the adapter's Schema() after
+// Open (e.g. CALL with dynamic OUT-param schema). For migrated DML (OpUpdate,
+// OpDelete), returns plan.Output() which carries the RETURNING schema or nil.
+func (it *OpIterator) Schema() planner.Schema {
+	if s := it.plan.Output(); s != nil {
+		return s
+	}
+	if it.node != nil && it.node.Kind == OpAdapter {
+		return it.node.state.(*opAdapterState).op.Schema()
+	}
+	return nil
+}
+
+// RowsAffected implements RowCounter for DML operators.
+func (it *OpIterator) RowsAffected() int64 {
+	if it.node == nil {
+		return 0
+	}
+	switch it.node.Kind {
+	case OpUpdate:
+		return it.node.state.(*updateOpState).op.RowsAffected()
+	case OpDelete:
+		return it.node.state.(*deleteOpState).op.RowsAffected()
+	case OpSort:
+		// sortOp is a pass-through; rows-affected comes from its underlying child.
+		// Sorts appear over DML in rare cases (RETURNING … ORDER BY); the child
+		// RowCounter is not accessible here, so return 0 (correct for SELECT-sort).
+		return 0
+	case OpAdapter:
+		if rc, ok := it.node.state.(*opAdapterState).op.(RowCounter); ok {
+			return rc.RowsAffected()
+		}
+	}
+	return 0
+}
+
+
+
 // ---------------------------------------------------------------------------
 // opOpen — recursive tree-open. Called once before the first opNext.
 // ---------------------------------------------------------------------------
@@ -269,6 +411,18 @@ func opOpen(n *OpNode, ctx *Context) error {
 		}
 		return nil
 
+	case OpUpdate:
+		s := n.state.(*updateOpState)
+		return s.op.Open(ctx)
+
+	case OpDelete:
+		s := n.state.(*deleteOpState)
+		return s.op.Open(ctx)
+
+	case OpSort:
+		s := n.state.(*sortOpState)
+		return s.op.Open(ctx)
+
 	case OpAdapter:
 		s := n.state.(*opAdapterState)
 		return s.op.Open(ctx)
@@ -307,6 +461,18 @@ func opClose(n *OpNode) error {
 	case OpLimit:
 		return opClose(n.childA)
 
+	case OpUpdate:
+		s := n.state.(*updateOpState)
+		return s.op.Close()
+
+	case OpDelete:
+		s := n.state.(*deleteOpState)
+		return s.op.Close()
+
+	case OpSort:
+		s := n.state.(*sortOpState)
+		return s.op.Close()
+
 	case OpAdapter:
 		s := n.state.(*opAdapterState)
 		return s.op.Close()
@@ -341,6 +507,12 @@ func opNext(n *OpNode, dst *Slot) error {
 		return projectOpNext(n, dst)
 	case OpLimit:
 		return limitOpNext(n, dst)
+	case OpUpdate:
+		return updateOpKernelNext(n, dst)
+	case OpDelete:
+		return deleteOpKernelNext(n, dst)
+	case OpSort:
+		return sortOpKernelNext(n, dst)
 	case OpAdapter:
 		return adapterOpNext(n, dst)
 	default:
@@ -465,5 +637,42 @@ func adapterOpNext(n *OpNode, dst *Slot) error {
 		return err
 	}
 	dst.fillFromTupleSlot(slot) // nil slot → HasRow=false; real slot → HasRow=true
+	return nil
+}
+
+// updateOpKernelNext drives a concrete *updateOp directly (no interface dispatch).
+// updateOp has no Operator child — it drives storage via extractScan internally.
+func updateOpKernelNext(n *OpNode, dst *Slot) error {
+	s := n.state.(*updateOpState)
+	slot, err := s.op.Next()
+	if err != nil {
+		return err
+	}
+	dst.fillFromTupleSlot(slot)
+	return nil
+}
+
+// deleteOpKernelNext drives a concrete *deleteOp directly (no interface dispatch).
+func deleteOpKernelNext(n *OpNode, dst *Slot) error {
+	s := n.state.(*deleteOpState)
+	slot, err := s.op.Next()
+	if err != nil {
+		return err
+	}
+	dst.fillFromTupleSlot(slot)
+	return nil
+}
+
+// sortOpKernelNext drives a concrete *sortOp directly. sortOp.Open() already
+// collected and sorted all rows from its child (an opNodeOperator bridging the
+// child *OpNode, so the child ran on concrete dispatch). sortOp.Next() returns
+// pre-sorted rows without calling child.Next() again.
+func sortOpKernelNext(n *OpNode, dst *Slot) error {
+	s := n.state.(*sortOpState)
+	slot, err := s.op.Next()
+	if err != nil {
+		return err
+	}
+	dst.fillFromTupleSlot(slot)
 	return nil
 }
