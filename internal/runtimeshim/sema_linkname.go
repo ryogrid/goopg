@@ -1,4 +1,4 @@
-//go:build go1.24 && !go1.27
+//go:build go1.24 && !go1.27 && !noLinkname
 
 package runtimeshim
 

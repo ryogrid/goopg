@@ -14,9 +14,15 @@
 // Discipline (per docs/design/perf-optimize/08-runtime-internals.md):
 //
 //   - One package holds every linkname site.
-//   - One build-tag pattern: `go1.X && !go1.Y` where Y is the first
-//     untested major. Bumping Y is the explicit "we tested it" gesture.
-//   - One fallback file per linkname site, selected by the inverse tag.
+//   - One build-tag pattern: `go1.X && !go1.Y && !noLinkname` where Y
+//     is the first untested major. Bumping Y is the explicit "we tested
+//     it" gesture; the `noLinkname` tag is an operator escape hatch
+//     that forces the fallback path on a supported toolchain without
+//     editing the tags. Use `go test -tags noLinkname ./...` to smoke
+//     the fallback build on every loop that touches the package, per
+//     chapter §10's verification gate.
+//   - One fallback file per linkname site, selected by the inverse tag
+//     (or by `noLinkname` on a supported toolchain).
 //   - Every site compiles cleanly under -race.
 //   - No //go:nosplit on linkname sites.
 package runtimeshim

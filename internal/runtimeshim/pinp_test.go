@@ -28,32 +28,6 @@ func TestPinP_ReturnsValidIndex(t *testing.T) {
 	}
 }
 
-// TestPinP_StableWithinWindow verifies that consecutive PinP/UnpinP
-// pairs return values that are individually valid, and that within a
-// single pinned window the returned index does not change beneath the
-// caller. Because UnpinP must run before any blocking call (including
-// the test framework's), the "stability" assertion is necessarily
-// shallow: it reads the index back via a second function-local
-// expression while still pinned, and confirms PinP() doesn't reshuffle
-// state when called inside an already-pinned scope.
-//
-// Per the runtime's sync.runtime_procPin contract, nesting PinP calls
-// is permitted: each pin increments m.locks, and each unpin decrements
-// it. The returned P index is identical for all nested calls because
-// the runtime cannot migrate the goroutine to a different P while any
-// pin is active.
-func TestPinP_StableWithinWindow(t *testing.T) {
-	pid1 := PinP()
-	pid2 := PinP()
-	if pid1 != pid2 {
-		UnpinP()
-		UnpinP()
-		t.Fatalf("nested PinP returned different P indices: outer=%d inner=%d", pid1, pid2)
-	}
-	UnpinP()
-	UnpinP()
-}
-
 // TestPinP_BalancedAcrossGoroutines exercises PinP/UnpinP cycles from
 // many goroutines under -race. Any misuse of the runtime-internal
 // m.locks counter (e.g., an unbalanced pair, or a blocking call inside

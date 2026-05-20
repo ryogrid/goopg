@@ -11,10 +11,18 @@
 # new file gated on the new minor if the runtime symbol moved).
 #
 # This script runs the per-primitive test suite under every Go toolchain
-# it can discover in PATH. It reports PASS/FAIL per toolchain and exits
-# non-zero if any toolchain fails. Both the linkname build (default) and
-# the public-API fallback build (`-tags noLinkname` if/when the fallback
-# files are tag-flipped) are exercised when supported.
+# it can discover in PATH. For each toolchain it exercises both build
+# variants in sequence:
+#
+#   (1) default tags — the //go:linkname path, what production runs;
+#   (2) `-tags noLinkname` — the public-API fallback path, satisfying
+#       chapter §10's "Fallback build" verification gate. The fallback
+#       must remain green on every supported Go minor so the escape
+#       hatch is one tag-flip away from being usable when a linkname
+#       target moves.
+#
+# The script reports PASS/FAIL per (toolchain, variant) pair and exits
+# non-zero if any pair fails.
 #
 # Discovery: looks for `go` plus every `go1.N` / `go1.N.M` binary in PATH
 # (these are installed via `go install golang.org/dl/go1.N@latest && go1.N
@@ -64,12 +72,20 @@ for tc in "${TOOLCHAINS[@]}"; do
     continue
   fi
   ver="$("$tc" version 2>/dev/null || echo "unknown")"
-  echo "=== $tc ($ver) ==="
+  echo "=== $tc ($ver) [linkname] ==="
 
   if "$tc" test -race -count=1 ./internal/runtimeshim/...; then
-    SUMMARY+=("$tc: PASS ($ver)")
+    SUMMARY+=("$tc linkname: PASS ($ver)")
   else
-    SUMMARY+=("$tc: FAIL ($ver)")
+    SUMMARY+=("$tc linkname: FAIL ($ver)")
+    FAILED+=1
+  fi
+
+  echo "=== $tc ($ver) [fallback -tags noLinkname] ==="
+  if "$tc" test -race -count=1 -tags noLinkname ./internal/runtimeshim/...; then
+    SUMMARY+=("$tc fallback: PASS ($ver)")
+  else
+    SUMMARY+=("$tc fallback: FAIL ($ver)")
     FAILED+=1
   fi
 done
@@ -86,4 +102,4 @@ if (( FAILED > 0 )); then
   exit 1
 fi
 echo
-echo "OK: all ${#TOOLCHAINS[@]} toolchain(s) passed"
+echo "OK: all ${#TOOLCHAINS[@]} toolchain(s) × 2 variant(s) passed"

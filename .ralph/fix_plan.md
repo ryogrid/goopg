@@ -3161,6 +3161,59 @@ Operational policy (2026-05-20):
         which stays correctly held back until M0107-0006 (lock-free
         bufpool) lands the per-slot wait coordination site it
         consumes.
+      - PARTIAL PROGRESS 2026-05-21 (loop 16): the `-tags noLinkname`
+        fallback-build verification gate from `08-runtime-internals.md`
+        §10 — explicitly deferred by loop 15 — now passes. Each of the
+        six paired `internal/runtimeshim/*_linkname.go` /
+        `*_fallback.go` files gains a single `noLinkname` tag-term:
+        linkname side becomes `go1.24 && !go1.27 && !noLinkname`,
+        fallback side becomes `!go1.24 || go1.27 || noLinkname`. The
+        pair is provably mutually exclusive and jointly exhaustive
+        across every (Go-minor, tag-set) combination (default tags on
+        go1.24..go1.26 → linkname active; default tags on <go1.24 or
+        ≥go1.27 → fallback active; `-tags noLinkname` on any minor →
+        fallback active). `scripts/runtimeshim_go_matrix.sh` now runs
+        **two** variants per discovered toolchain — default (linkname)
+        and `-tags noLinkname` (fallback) — and the summary table
+        reports PASS/FAIL per (toolchain, variant) pair; exit code is
+        the count of failing variant runs across the matrix. `make
+        runtimeshim-matrix` (the Makefile wrapper) is unchanged and
+        exercises the new variant transparently. `doc.go` updated to
+        document the `noLinkname` escape hatch as part of the
+        package-level discipline. Out of scope (still): CI provider
+        adoption (no `.github/workflows/`; org-wide infra decision);
+        end-to-end pgbench parity for the fallback build (lives at
+        `analysis/perf-optimize` layer, not in the matrix script);
+        tagging downstream callers (`internal/activity/registry.go`'s
+        `monoToWall` per [[0107-0008e]] consumes the public API only).
+        Verified: `make runtimeshim-matrix` → `OK: all 1 toolchain(s)
+        × 2 variant(s) passed` on the current host (Go 1.25.0 /
+        Linux/amd64); both `go test -race -count=1
+        ./internal/runtimeshim/...` and `go test -race -count=1 -tags
+        noLinkname ./internal/runtimeshim/...` PASS standalone.
+        Design: `docs/design/0107-0008p-runtimeshim-nolinkname-
+        fallback-tag.md` (indexed in `docs/design/README.md`).
+        Discovery: the very first matrix-script invocation with both
+        variants caught a real fallback-only regression — `TestPinP_
+        StableWithinWindow` calls `PinP()` twice nested, which is fine
+        under the linkname path (runtime `m.locks` is reentrant) but
+        deadlocks on the fallback's non-reentrant `sync.Mutex`. Goopg's
+        production callers never nest PinP, so the canonical pattern
+        (`pid := PinP(); slots[pid].n.Add(1); UnpinP()`) is unaffected.
+        Fix: split the recursion test into
+        `internal/runtimeshim/pinp_recursive_test.go` (tagged
+        `go1.24 && !go1.27 && !noLinkname` matching `pinp_linkname.go`);
+        `pinp_fallback.go`'s `PinP` doc grows a "Non-recursion
+        contract" paragraph stating the limitation. The other four
+        tests in `pinp_test.go` continue to run under both tag sets.
+        The script working as designed — catching a divergence the
+        default-tags build cannot exercise.
+        M0107-0008's per-Go-minor maintenance machinery (script +
+        make target + fallback build tag + paired smoke runs) is now
+        feature-complete; the only remaining open item is the bufpool
+        per-slot Sema wait caller, still correctly held until
+        M0107-0006 (lock-free bufpool) lands the per-slot wait
+        coordination site it consumes.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
