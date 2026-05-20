@@ -11972,6 +11972,107 @@ Operational policy (2026-05-20):
         `docs/milestones/0107-performance-optimization-refactor.md` and
         `docs/milestones/README.md` to `accepted`.
 
+## M0108 — `postgresql.conf.sample` Template + Registry-Sync Rule (filed 2026-05-20)
+
+Milestone doc: `docs/milestones/0108-postgresql-conf-sample-template.md`
+Design doc: `docs/design/0108-0001-postgresql-conf-sample-template.md`
+AGENT.md rule: already landed at filing time (see "GUC sample-file discipline"
+section in `.ralph/AGENT.md`).
+
+Goal: ship `internal/config/postgresql.conf.sample` — a hand-maintained,
+PG-style template listing every file-settable GUC in
+`config.BuildDefaultRegistry` (76 today), all commented out, with inline
+unit / range / restart-class / enum hints. `goopg init` writes its bytes
+verbatim to `<datadir>/postgresql.conf` (replacing the current 20-line
+embedded string in `internal/initdb/initdb.go::defaultPostgresqlConf`).
+A sync test enforces that the template and the registry stay in lockstep.
+
+Operational policy (2026-05-20):
+- Template is **hand-maintained** (per-GUC prose comments and section
+  grouping are not derivable from registry metadata — matches PG's own
+  approach for `postgresql.conf.sample`).
+- GUC names in the template MUST match PG's names exactly so operators
+  can lift tuned PG `postgresql.conf` files against goopg unchanged.
+- Defaults in the template MUST equal `BootVal` from the registry so a
+  freshly-initted cluster's behaviour is unaffected by the template's
+  presence (the sync test enforces this).
+- Items must NOT be **DEFERRED** — each sub-milestone is small,
+  self-contained, and unblocked by prior work.
+
+### Sub-milestones
+
+ - [ ] **M0108-0001 — Initial template body + `config.SampleConfig()` accessor**
+      - Summary: Add `internal/config/postgresql.conf.sample` (hand-maintained,
+        PG-style sections: FILE LOCATIONS / CONNECTIONS AND AUTHENTICATION /
+        RESOURCE USAGE / WRITE-AHEAD LOG / REPLICATION / QUERY TUNING /
+        REPORTING AND LOGGING / STATISTICS / AUTOVACUUM / CLIENT CONNECTION
+        DEFAULTS / LOCK MANAGEMENT / VERSION AND PLATFORM COMPATIBILITY /
+        ERROR HANDLING / CONFIG FILE INCLUDES / CUSTOMIZED OPTIONS). One
+        commented-out entry per file-settable GUC (~70 of the 76 currently
+        registered — those without `FlagDisallowInFile`), each carrying
+        inline unit/range/restart-class/enum hints in PG's `postgresql.conf.sample`
+        style. Add `internal/config/sample.go` exporting
+        `SampleConfig() []byte` via `//go:embed postgresql.conf.sample`.
+      - Design: `docs/design/0108-0001-postgresql-conf-sample-template.md`
+      - Files: `internal/config/postgresql.conf.sample` (new),
+        `internal/config/sample.go` (new).
+      - Verification: `go test ./internal/config/...` PASS;
+        `go vet ./...` clean; `gofmt -l .` empty; `make ralph-state-guard` PASS.
+        Manual: `cat internal/config/postgresql.conf.sample | head -40`
+        shows PG-style banner + commented-out `#listen_addresses`, `#port`.
+
+ - [ ] **M0108-0002 — initdb wiring + retire `defaultPostgresqlConf`**
+      - Summary: In `internal/initdb/initdb.go::SampleFiles()`, switch the
+        `postgresql.conf` entry's `Build` field to a thin shim that calls
+        `config.SampleConfig()`. Delete the embedded `defaultPostgresqlConf`
+        function (currently around `initdb.go:5656`) and its 20-line string
+        literal. Add a regression test in `internal/initdb/`
+        (`TestInitWritesEmbeddedSampleAsPostgresqlConf`) that runs
+        `Init(tmpDir)` and asserts `tmpDir/postgresql.conf` bytes equal
+        `config.SampleConfig()`.
+      - Design: same as M0108-0001.
+      - Files: `internal/initdb/initdb.go` (delete + reroute),
+        `internal/initdb/initdb_postgresql_conf_test.go` (new regression test).
+      - Verification: `go test ./internal/initdb/...` PASS (including
+        all M0105/M0106 byte-layout regression tests — the change is to
+        file content, not on-disk byte formats); `go test ./internal/config/...`
+        PASS; `make ralph-state-guard` PASS. Manual:
+        `go run ./cmd/goopg init /tmp/sanity-data && head -40
+        /tmp/sanity-data/postgresql.conf` shows the template's
+        FILE LOCATIONS banner and commented `#listen_addresses` entry.
+
+ - [ ] **M0108-0003 — Registry↔template sync test**
+      - Summary: Add `internal/config/sample_test.go::TestSampleConfigCoversRegistry`.
+        Implementation: regex `^#?\s*([a-z_][a-z0-9_]*)\s*=` over each line
+        of `SampleConfig()`; collect names into `sampleEntries`; iterate
+        `BuildDefaultRegistry().AllVariables()`. Fail if (a) a registered
+        Variable lacks `FlagDisallowInFile` AND is not in `sampleEntries`;
+        (b) a name in `sampleEntries` does not resolve via `Registry.Lookup`;
+        (c) the commented default in the sample does not match the
+        Variable's `BootVal` (formatted via the same emitter the registry
+        uses for its `SHOW` output, so units like `128MB` vs `134217728`
+        compare correctly).
+      - Design: same as M0108-0001 (§"Registry ↔ template sync test").
+      - Files: `internal/config/sample_test.go` (new).
+      - Verification: `go test ./internal/config/...` PASS — the test
+        passes on the freshly-landed template from M0108-0001. Hand-add
+        a temporary new GUC without updating the sample and confirm the
+        test fails with a clear message identifying the missing name;
+        then revert the experiment. `make ralph-state-guard` PASS.
+
+### Milestone-close gates (after all 3 sub-milestones)
+
+ - [ ] **M0108 — milestone-close verification**
+      - Confirm `internal/config/postgresql.conf.sample` contains a
+        commented entry for every file-settable GUC in
+        `BuildDefaultRegistry()`; confirm `TestSampleConfigCoversRegistry`
+        PASS in CI; confirm `.ralph/AGENT.md` "GUC sample-file discipline"
+        section is present and references the test by name; confirm
+        `goopg init <dir>` writes bytes equal to `config.SampleConfig()`.
+      - Update milestone status in
+        `docs/milestones/0108-postgresql-conf-sample-template.md` and
+        `docs/milestones/README.md` to `accepted`.
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).

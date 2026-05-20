@@ -208,6 +208,38 @@ If Go symbol operations fail:
 - "Partially complete" is still incomplete. Never mark partial completion as
   done.
 
+## GUC sample-file discipline
+
+`internal/config/postgresql.conf.sample` is the operator-facing template
+for every supported GUC. `goopg init` writes its bytes verbatim to
+`<datadir>/postgresql.conf` (see M0108 + design doc
+`docs/design/0108-0001-postgresql-conf-sample-template.md`). It is
+hand-maintained, mirroring PG 18.3's section structure.
+
+When you register a new GUC under
+`internal/config/defaults.go::BuildDefaultRegistry` (or remove an existing
+one), you MUST update `internal/config/postgresql.conf.sample` in the
+same commit:
+
+- Add a commented-out entry under the appropriate PG-style section,
+  matching the template's existing formatting (unit / range / enum hint
+  inline, restart-class annotation when `Context == ContextPostmaster` /
+  `ContextSighup`, default value equal to the GUC's `BootVal` so the
+  file remains a usable no-op when copied verbatim).
+- For removals, delete the corresponding line and re-flow surrounding
+  whitespace.
+- GUC names must match PG's names exactly — operators rely on lifting
+  tuned PG `postgresql.conf` files against goopg.
+
+The unit test `TestSampleConfigCoversRegistry` in `internal/config/sample_test.go`
+is the mechanical enforcement gate; it MUST pass before the commit is
+opened. Letting the sample drift from the registry is a regression on
+usability and on PG-operator-mental-model compatibility.
+
+If a GUC must NOT appear in the template (internal-only, not file-settable),
+mark it `FlagDisallowInFile` in its registration so the sync test
+recognises the exemption.
+
 ## Key Learnings
 
 - Go module path is `github.com/goopg/goopg` (placeholder; rename if a real
