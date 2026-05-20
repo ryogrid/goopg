@@ -186,6 +186,7 @@ const noChild int32 = -1
 type opTreeSlab struct {
 	ops   []OpNode
 	exprs exprTreeSlab // expression-tree slab (Phase C.3); immutable after BuildFast
+	plans planTreeSlab // plan-tree slab (Phase C.3); immutable after BuildFast
 }
 
 // add appends n to the slab and returns its index.
@@ -223,7 +224,6 @@ type OpNode struct {
 
 // filterState is the per-node state for OpFilter.
 type filterState struct {
-	pred    planner.Expr // kept as ExprAdapter fallback origin; evalFastExpr uses predIdx
 	predIdx int32        // root index into exprs slab (noExpr for nil predicate)
 	exprs   exprTreeSlab // set at Open time from the shared opTreeSlab.exprs
 	ctx     *Context
@@ -231,22 +231,22 @@ type filterState struct {
 
 // projectState is the per-node state for OpProject.
 type projectState struct {
-	plan      *planner.Project
 	schema    planner.Schema
 	ctx       *Context
-	srcSlot   Slot     // temp slot for the child's output
-	outCells  []Datum  // persistent output buffer, reused across Next calls
-	targExprs []int32  // root indices into exprs slab (one per target)
+	srcSlot   Slot         // temp slot for the child's output
+	outCells  []Datum      // persistent output buffer, reused across Next calls
+	targExprs []int32      // root indices into exprs slab (one per target)
 	exprs     exprTreeSlab // set at Open time from the shared opTreeSlab.exprs
 }
 
 // limitState is the per-node state for OpLimit.
 type limitState struct {
-	plan        *planner.Limit
-	limitCount  int64 // -1 means unlimited
-	offsetCount int64
-	emitted     int64
-	skipped     int64
+	limitExprIdx  int32 // exprTreeSlab index for LIMIT expr (noExpr = unlimited)
+	offsetExprIdx int32 // exprTreeSlab index for OFFSET expr (noExpr = no offset)
+	limitCount    int64 // -1 means unlimited (resolved at Open time)
+	offsetCount   int64
+	emitted       int64
+	skipped       int64
 }
 
 // opAdapterState wraps a legacy Operator for non-migrated operators.
@@ -430,7 +430,7 @@ func opOpen(ops []OpNode, exprs exprTreeSlab, idx int32, ctx *Context) error {
 		s := n.state.(*projectState)
 		s.ctx = ctx
 		s.exprs = exprs // wire in the shared slab for evalFastExpr
-		ntargets := len(s.plan.Targets)
+		ntargets := len(s.targExprs)
 		if ntargets > 0 {
 			if cap(s.outCells) < ntargets {
 				s.outCells = make([]Datum, ntargets)
@@ -448,25 +448,23 @@ func opOpen(ops []OpNode, exprs exprTreeSlab, idx int32, ctx *Context) error {
 		if err := opOpen(ops, exprs, n.childA, ctx); err != nil {
 			return err
 		}
-		if s.plan.Limit != nil {
-			v, err := evalExpr(s.plan.Limit, nil, ctx)
+		if s.limitExprIdx != noExpr {
+			v, err := evalFastExpr(exprs, s.limitExprIdx, nil, ctx)
 			if err != nil {
 				return err
 			}
 			if v.Kind != KindInt {
-				return &ExecError{Code: "42804", Pos: s.plan.Pos(),
-					Message: "LIMIT must be integer"}
+				return &ExecError{Code: "42804", Message: "LIMIT must be integer"}
 			}
 			s.limitCount = v.Int
 		}
-		if s.plan.Offset != nil {
-			v, err := evalExpr(s.plan.Offset, nil, ctx)
+		if s.offsetExprIdx != noExpr {
+			v, err := evalFastExpr(exprs, s.offsetExprIdx, nil, ctx)
 			if err != nil {
 				return err
 			}
 			if v.Kind != KindInt {
-				return &ExecError{Code: "42804", Pos: s.plan.Pos(),
-					Message: "OFFSET must be integer"}
+				return &ExecError{Code: "42804", Message: "OFFSET must be integer"}
 			}
 			s.offsetCount = v.Int
 		}

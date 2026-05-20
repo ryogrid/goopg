@@ -247,6 +247,70 @@ The dispatch loop is unchanged; `*OpIterator` implements `Operator` and
 - `internal/executor/phase_c_test.go` (modified) — TestBuildExprSlabCommonKinds,
   TestEvalFastExprCommonKinds, TestRunFastFilterExprNodePopulated
 
+### Phase C.3 (loop 16) — PlanNode sum-type: eliminate planner.Node references from execution state
+
+**Problem**: After ExprNode (loop 14) and parser mctx (loop 15), three execution-state structs
+still held GC-traced references to planner.Node/Expr objects:
+
+- `filterState.pred planner.Expr` — kept as a "ExprAdapter fallback origin". Redundant: the
+  exprTreeSlab's `ExprAdapter.orig` field already roots the original `planner.Expr` for the
+  lifetime of the statement.
+- `projectState.plan *planner.Project` — used in `opOpen` only for `len(p.Targets)`. Redundant:
+  `len(s.targExprs)` gives the identical count; `targExprs` is already set at `buildRec` time.
+- `limitState.plan *planner.Limit` — used in `opOpen` to evaluate `p.Limit` and `p.Offset`
+  expressions via the old `evalExpr(s.plan.Limit, nil, ctx)` path. The expressions were not
+  pre-compiled into the exprTreeSlab, forcing the plan reference to be retained.
+
+**Changes** (Phase C.3 concrete-state cleanup):
+
+1. **`filterState.pred planner.Expr` removed**. `buildRec` no longer stores
+   `pred: p.Predicate` in the literal; the exprTreeSlab's `ExprAdapter.orig` provides the GC
+   root for the original predicate tree. `filterState` is now `{predIdx, exprs, ctx}` — no
+   interface-valued fields.
+
+2. **`projectState.plan *planner.Project` removed**. `opOpen` Project branch changed from
+   `len(s.plan.Targets)` to `len(s.targExprs)`. `projectState` no longer holds a pointer to
+   the planner node.
+
+3. **`limitState.plan *planner.Limit` removed; LIMIT/OFFSET expressions compiled into slab**.
+   `buildRec` Limit case now calls `tree.exprs.buildExpr(p.Limit)` and
+   `tree.exprs.buildExpr(p.Offset)` and stores the resulting indices in
+   `limitState.{limitExprIdx, offsetExprIdx}` (both `int32`; `noExpr = -1` when the clause is
+   absent). `opOpen` Limit branch replaced `evalExpr(s.plan.Limit/Offset, nil, ctx)` with
+   `evalFastExpr(exprs, s.limitExprIdx/offsetExprIdx, nil, ctx)` — routing through the
+   integer-dispatch expression evaluator, eliminating the last `planner.Limit` reference from
+   hot-path execution.
+
+4. **`plannode.go` (new)** — `PlanKind` enum, `PlanNode` struct with
+   `payload [planPayloadSize]byte` + `orig planner.Node` (for unmigrated nodes), `planTreeSlab`
+   type, and builder/accessor helpers:
+   - `buildPlanFilter(predIdx, childA) int32` + `PlanFilterPredIdx(*PlanNode) int32`
+   - `buildPlanLimit(limitExprIdx, offsetExprIdx, childA) int32` + `PlanLimitExprs(*PlanNode) (int32, int32)`
+   - `buildPlanAdapter(orig, childA) int32`
+   Foundation for future full migration of SeqScan and Project (where table/column metadata
+   will be stored as raw bytes, eliminating the last GC-traced plan pointers).
+
+5. **`opTreeSlab.plans planTreeSlab` added** — plan slab allocated alongside ops/exprs slabs
+   in `BuildFast`, immutable after `BuildFast` returns.
+
+**Net GC impact**: For a typical `SELECT id FROM t WHERE id > N LIMIT M` query, the hot-path
+operator tree (SeqScan → Filter → Project → Limit) now holds:
+- filterState: 0 planner.Expr references (was 1)
+- projectState: 0 planner.Node references (was 1)
+- limitState: 0 planner.Node references (was 1); 2 new int32 fields
+Total GC-traced plan references eliminated from the 4 concrete state structs: 3.
+
+**Files changed** (loop 16):
+- `internal/executor/plannode.go` (new) — PlanKind, PlanNode, planTreeSlab, builder/accessors
+- `internal/executor/opnode.go` (modified) — filterState drops pred; projectState drops plan;
+  limitState drops plan/adds limitExprIdx+offsetExprIdx; opTreeSlab gains plans field;
+  opOpen Limit/Project branches updated
+- `internal/executor/executor.go` (modified) — BuildFast initialises plans slab; buildRec
+  Filter/Limit/Project cases updated for new state layout
+- `internal/executor/phase_c_test.go` (modified) — TestPlanNodePlanFilterPayload,
+  TestPlanNodePlanLimitPayload, TestPlanNodeRoundtripNegativeOne, TestLimitStateExprIdx,
+  TestLimitOffsetStateExprIdx, TestFilterStateNoPredField, TestLimitOffsetExecution
+
 ### Phase C.3 (loop 15) — Parser mctx migration
 
 **Problem**: `internal/parser/parser.go` held two global `sync.Pool` objects:

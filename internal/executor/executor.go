@@ -318,30 +318,37 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		if err != nil {
 			return noChild, err
 		}
-		// Compile predicate into the expression slab (Phase C.3).
+		// Phase C.3: predicate compiled into exprTreeSlab; filterState holds
+		// only the predIdx — no GC-traced planner.Expr reference needed.
 		predIdx := tree.exprs.buildExpr(p.Predicate)
 		return tree.add(OpNode{Kind: OpFilter, childA: childIdx, childB: noChild,
-			state: &filterState{pred: p.Predicate, predIdx: predIdx}}), nil
+			state: &filterState{predIdx: predIdx}}), nil
 
 	case *planner.Project:
 		childIdx, err := tree.buildRec(p.Child)
 		if err != nil {
 			return noChild, err
 		}
-		// Compile each target expression into the slab (Phase C.3).
+		// Phase C.3: target expressions compiled into exprTreeSlab; projectState
+		// holds only the compiled indices — no GC-traced *planner.Project needed.
 		targExprs := make([]int32, len(p.Targets))
 		for i, t := range p.Targets {
 			targExprs[i] = tree.exprs.buildExpr(t)
 		}
 		return tree.add(OpNode{Kind: OpProject, childA: childIdx, childB: noChild,
-			state: &projectState{plan: p, schema: p.Output(), targExprs: targExprs}}), nil
+			state: &projectState{schema: p.Output(), targExprs: targExprs}}), nil
 
 	case *planner.Limit:
 		childIdx, err := tree.buildRec(p.Child)
 		if err != nil {
 			return noChild, err
 		}
-		return tree.add(OpNode{Kind: OpLimit, childA: childIdx, childB: noChild, state: &limitState{plan: p, limitCount: -1}}), nil
+		// Phase C.3: LIMIT and OFFSET expressions compiled into exprTreeSlab;
+		// limitState holds only the compiled indices — no *planner.Limit reference.
+		limitExprIdx := tree.exprs.buildExpr(p.Limit)
+		offsetExprIdx := tree.exprs.buildExpr(p.Offset)
+		return tree.add(OpNode{Kind: OpLimit, childA: childIdx, childB: noChild,
+			state: &limitState{limitExprIdx: limitExprIdx, offsetExprIdx: offsetExprIdx, limitCount: -1}}), nil
 
 	case *planner.Sort:
 		childIdx, err := tree.buildRec(p.Child)
@@ -413,7 +420,11 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 // the root index. Non-migrated operators are wrapped in an opAdapter that
 // drives the legacy Operator interface.
 func BuildFast(plan planner.Node) (*opTreeSlab, int32, error) {
-	tree := &opTreeSlab{ops: make([]OpNode, 0, 8), exprs: make(exprTreeSlab, 0, 16)}
+	tree := &opTreeSlab{
+		ops:   make([]OpNode, 0, 8),
+		exprs: make(exprTreeSlab, 0, 16),
+		plans: make(planTreeSlab, 0, 8),
+	}
 	rootIdx, err := tree.buildRec(plan)
 	if err != nil {
 		return nil, noChild, err

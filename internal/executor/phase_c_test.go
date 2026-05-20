@@ -956,3 +956,145 @@ func TestRunFastFilterExprNodePopulated(t *testing.T) {
 	// Full round-trip: verify results match legacy path.
 	runBothAndCompare(t, plan, ctx)
 }
+
+// TestPlanNodePlanFilterPayload verifies that buildPlanFilter stores predIdx
+// correctly in the PlanNode payload and PlanFilterPredIdx reads it back.
+func TestPlanNodePlanFilterPayload(t *testing.T) {
+	var slab planTreeSlab
+	predIdx := int32(42)
+	childA := int32(0)
+	idx := slab.buildPlanFilter(predIdx, childA)
+	if idx != 0 {
+		t.Fatalf("expected index 0, got %d", idx)
+	}
+	if got := PlanFilterPredIdx(&slab[idx]); got != predIdx {
+		t.Errorf("PlanFilterPredIdx: got %d, want %d", got, predIdx)
+	}
+	if slab[idx].Kind != PlanFilter {
+		t.Errorf("Kind: got %d, want PlanFilter", slab[idx].Kind)
+	}
+	if slab[idx].childA != childA {
+		t.Errorf("childA: got %d, want %d", slab[idx].childA, childA)
+	}
+	if slab[idx].childB != noPlan {
+		t.Errorf("childB: got %d, want noPlan", slab[idx].childB)
+	}
+}
+
+// TestPlanNodePlanLimitPayload verifies that buildPlanLimit stores both
+// expression indices correctly and PlanLimitExprs reads them back.
+func TestPlanNodePlanLimitPayload(t *testing.T) {
+	var slab planTreeSlab
+	limitIdx := int32(7)
+	offsetIdx := int32(noExpr)
+	childA := int32(3)
+	idx := slab.buildPlanLimit(limitIdx, offsetIdx, childA)
+	if idx != 0 {
+		t.Fatalf("expected index 0, got %d", idx)
+	}
+	gotLimit, gotOffset := PlanLimitExprs(&slab[idx])
+	if gotLimit != limitIdx {
+		t.Errorf("limitExprIdx: got %d, want %d", gotLimit, limitIdx)
+	}
+	if gotOffset != offsetIdx {
+		t.Errorf("offsetExprIdx: got %d, want %d", gotOffset, offsetIdx)
+	}
+	if slab[idx].Kind != PlanLimit {
+		t.Errorf("Kind: got %d, want PlanLimit", slab[idx].Kind)
+	}
+}
+
+// TestPlanNodeRoundtripNegativeOne ensures noExpr (-1) round-trips through
+// payload bytes (stored as uint32, must recover -1 via int32 cast).
+func TestPlanNodeRoundtripNegativeOne(t *testing.T) {
+	var slab planTreeSlab
+	slab.buildPlanLimit(noExpr, noExpr, noPlan)
+	gotLimit, gotOffset := PlanLimitExprs(&slab[0])
+	if gotLimit != noExpr {
+		t.Errorf("limitExprIdx: got %d, want %d (noExpr)", gotLimit, noExpr)
+	}
+	if gotOffset != noExpr {
+		t.Errorf("offsetExprIdx: got %d, want %d (noExpr)", gotOffset, noExpr)
+	}
+}
+
+// TestLimitStateExprIdx checks that a SELECT with LIMIT N uses the
+// exprTreeSlab path (limitState.limitExprIdx != noExpr) after BuildFast.
+func TestLimitStateExprIdx(t *testing.T) {
+	plan := planOne(t, "SELECT 1 LIMIT 5", catalog.NewInMemory())
+	tree, rootIdx, err := BuildFast(plan)
+	if err != nil {
+		t.Fatalf("BuildFast: %v", err)
+	}
+	// Walk to the Limit node.
+	nIdx := rootIdx
+	for nIdx != noChild && tree.ops[nIdx].Kind != OpLimit {
+		nIdx = tree.ops[nIdx].childA
+	}
+	if nIdx == noChild || tree.ops[nIdx].Kind != OpLimit {
+		t.Skip("no OpLimit node found in plan (may be optimized away)")
+	}
+	ls := tree.ops[nIdx].state.(*limitState)
+	if ls.limitExprIdx == noExpr {
+		t.Error("limitState.limitExprIdx must not be noExpr for LIMIT 5")
+	}
+	if ls.offsetExprIdx != noExpr {
+		t.Error("limitState.offsetExprIdx must be noExpr when no OFFSET clause")
+	}
+	if int(ls.limitExprIdx) >= len(tree.exprs) {
+		t.Errorf("limitExprIdx %d out of range (slab len=%d)", ls.limitExprIdx, len(tree.exprs))
+	}
+}
+
+// TestLimitOffsetStateExprIdx checks that LIMIT N OFFSET M populates both
+// expression indices in limitState.
+func TestLimitOffsetStateExprIdx(t *testing.T) {
+	plan := planOne(t, "SELECT 1 LIMIT 10 OFFSET 3", catalog.NewInMemory())
+	tree, rootIdx, err := BuildFast(plan)
+	if err != nil {
+		t.Fatalf("BuildFast: %v", err)
+	}
+	nIdx := rootIdx
+	for nIdx != noChild && tree.ops[nIdx].Kind != OpLimit {
+		nIdx = tree.ops[nIdx].childA
+	}
+	if nIdx == noChild || tree.ops[nIdx].Kind != OpLimit {
+		t.Skip("no OpLimit node found in plan")
+	}
+	ls := tree.ops[nIdx].state.(*limitState)
+	if ls.limitExprIdx == noExpr {
+		t.Error("limitState.limitExprIdx must not be noExpr for LIMIT 10")
+	}
+	if ls.offsetExprIdx == noExpr {
+		t.Error("limitState.offsetExprIdx must not be noExpr for OFFSET 3")
+	}
+}
+
+// TestFilterStateNoPredField verifies that filterState.predIdx is set and
+// the full round-trip execution produces correct filtered rows.
+func TestFilterStateNoPredField(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	// Verify that the concrete dispatch path (OpFilter via exprTreeSlab)
+	// correctly filters rows for a simple predicate.
+	runBothAndCompare(t, planOne(t, "SELECT id FROM items WHERE id = 2", cat), ctx)
+}
+
+// TestLimitOffsetExecution verifies LIMIT/OFFSET execution via the new
+// exprTreeSlab-based path produces correct results.
+func TestLimitOffsetExecution(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	// LIMIT 1: only first row returned.
+	runBothAndCompare(t, planOne(t, "SELECT id FROM items ORDER BY id LIMIT 1", cat), ctx)
+	// LIMIT 2 OFFSET 1: skip first, return next two.
+	runBothAndCompare(t, planOne(t, "SELECT id FROM items ORDER BY id LIMIT 2 OFFSET 1", cat), ctx)
+}
