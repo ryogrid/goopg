@@ -1,18 +1,27 @@
-// Package executor opnode.go — Phase C.1 concrete-type Volcano executor.
+// Package executor opnode.go — Phase C.2 concrete-type Volcano executor.
 //
 // This file implements the OpNode sum-type infrastructure described in
 // docs/design/perf-optimize/03-executor-concrete.md §3–7. The design
 // uses concrete state structs behind an `any` field (GC-safe) instead of
-// the raw-byte approach sketched in the design doc, so that Phase C.1
+// the raw-byte approach sketched in the design doc, so that Phase C.2
 // can land before Phase D3 (pointer-free Pin) and Phase C.3 (plan-tree
 // mctx). When those phases land, the `any` field can be replaced with
 // the raw-bytes layout at the same API boundary.
 //
-// Migration status (Phase C.1):
+// Migration status (Phase C.2):
 //   migrated (full concrete dispatch, no interface per row):
 //     OpSeqScan, OpFilter, OpProject, OpLimit
 //   adapter (legacy Operator interface, one type-assert per Next call):
 //     all other operator kinds
+//
+// Phase C.2 changes from C.1:
+//   - OpNode children are now int32 slab indices (noChild = -1) instead of
+//     *OpNode pointers, eliminating GC-scanned pointers in the hot tree.
+//   - opTreeSlab holds the backing []OpNode slice; all nodes are appended
+//     during BuildFast and the slab is immutable after BuildFast returns.
+//   - opNodeOperator and OpIterator hold *opTreeSlab + int32 index instead
+//     of *OpNode.
+//   - CopyInto renamed to CopyTo (Phase C.3 will add mctx parameter).
 //
 // The split means: for query paths that only touch the four migrated
 // operators (e.g. SELECT with a predicate and column list), every call
@@ -38,7 +47,7 @@ import (
 // Slot is a concrete, stack-allocatable row vessel. Phase C callers
 // preallocate one Slot per goroutine and reuse it across opNext calls.
 // Cells is overwritten each call; consumers that need to retain rows
-// past the next opNext call must copy via CopyInto.
+// past the next opNext call must copy via CopyTo.
 //
 // HasRow distinguishes two zero-Cells cases:
 //   - HasRow=false, Cells=[] → DML nil-row (INSERT/UPDATE/DELETE produced
@@ -62,9 +71,9 @@ func (s *Slot) Reset() {
 	s.HasRow = false
 }
 
-// CopyInto deep-copies s into dst, making dst independent of s.
+// CopyTo deep-copies s into dst, making dst independent of s.
 // Used by sort, hash-join build, aggregate, and the Run boundary.
-func (s *Slot) CopyInto(dst *Slot) {
+func (s *Slot) CopyTo(dst *Slot) {
 	dst.schema = s.schema
 	if cap(dst.Cells) < len(s.Cells) {
 		dst.Cells = make([]Datum, len(s.Cells))
@@ -164,24 +173,41 @@ const (
 )
 
 // ---------------------------------------------------------------------------
+// opTreeSlab — backing store for an OpNode tree.
+// ---------------------------------------------------------------------------
+
+// noChild is the sentinel index meaning "no child in this slot".
+const noChild int32 = -1
+
+// opTreeSlab is the backing store for an OpNode tree. All nodes are
+// appended during BuildFast; the slab is immutable after BuildFast returns.
+// opNodeOperator and OpIterator hold a *opTreeSlab pointer so they always
+// see the final slice, even if append relocated the backing array during build.
+type opTreeSlab struct {
+	ops []OpNode
+}
+
+// add appends n to the slab and returns its index.
+func (tree *opTreeSlab) add(n OpNode) int32 {
+	idx := int32(len(tree.ops))
+	tree.ops = append(tree.ops, n)
+	return idx
+}
+
+// ---------------------------------------------------------------------------
 // OpNode — the tagged-union operator node.
 // ---------------------------------------------------------------------------
 
 // OpNode is the central node type for the Phase C execution engine.
-// Each query plan corresponds to a tree of OpNodes rooted at one
-// OpNode. The tree is built by BuildFast and driven by RunFast.
-//
-// children: childA is the primary child (left for joins, inner scan,
-// etc.); childB is the secondary child (right for joins, etc.).
-// nil means "no child". The slab/index encoding from the design doc
-// (§3) is deferred to Phase C.2; pointer-based children are used
-// here for simplicity and will be refactored once all hot-path
-// operators are migrated.
+// Each query plan corresponds to a tree of OpNodes stored in an opTreeSlab.
+// The tree is built by BuildFast (which populates the slab) and driven by
+// RunFast. Children are encoded as int32 indices into the slab; noChild (-1)
+// means "no child". This eliminates GC-scanned pointers in the hot tree.
 type OpNode struct {
 	Kind   OpKind
-	childA *OpNode // primary child; nil if none
-	childB *OpNode // secondary child; nil if none
-	state  any     // concrete per-Kind state struct (GC-safe)
+	childA int32 // index into ops slab; noChild (-1) if none
+	childB int32 // index into ops slab; noChild (-1) if none
+	state  any   // concrete per-Kind state struct (GC-safe)
 }
 
 // ---------------------------------------------------------------------------
@@ -250,25 +276,26 @@ type joinOpState struct {
 }
 
 // ---------------------------------------------------------------------------
-// opNodeOperator — bridges *OpNode into the Operator interface.
+// opNodeOperator — bridges a slab node into the Operator interface.
 //
 // Used when a legacy operator (sortOp, joinOp, …) needs an Operator child
-// but the child is actually an *OpNode tree. One extra function call per
+// but the child is actually an OpNode in a slab. One extra function call per
 // child Next() at this boundary; the child subtree still uses concrete
 // switch dispatch.
 // ---------------------------------------------------------------------------
 
 type opNodeOperator struct {
-	node   *OpNode
+	tree   *opTreeSlab // shared slab; valid after BuildFast returns
+	idx    int32
 	schema planner.Schema
 	dst    Slot
 }
 
-func (w *opNodeOperator) Open(ctx *Context) error { return opOpen(w.node, ctx) }
+func (w *opNodeOperator) Open(ctx *Context) error { return opOpen(w.tree.ops, w.idx, ctx) }
 
 func (w *opNodeOperator) Next() (TupleSlot, error) {
 	w.dst.Reset()
-	if err := opNext(w.node, &w.dst); err != nil {
+	if err := opNext(w.tree.ops, w.idx, &w.dst); err != nil {
 		return nil, err
 	}
 	if !w.dst.HasRow {
@@ -277,43 +304,44 @@ func (w *opNodeOperator) Next() (TupleSlot, error) {
 	return &w.dst, nil
 }
 
-func (w *opNodeOperator) Close() error           { return opClose(w.node) }
+func (w *opNodeOperator) Close() error           { return opClose(w.tree.ops, w.idx) }
 func (w *opNodeOperator) Schema() planner.Schema { return w.schema }
 
 // ---------------------------------------------------------------------------
-// OpIterator — wraps *OpNode as an Operator for backward-compatible wiring.
+// OpIterator — wraps an opTreeSlab as an Operator for backward-compatible wiring.
 //
 // OpIterator implements both Operator and RowCounter so it can replace
 // executor.Build in the server dispatch loop without changing the loop's
 // interface. BuildFastIterator is the drop-in replacement for Build.
 // ---------------------------------------------------------------------------
 
-// OpIterator wraps an *OpNode tree as an Operator so the server dispatch
+// OpIterator wraps an opTreeSlab as an Operator so the server dispatch
 // loop can use concrete Phase C execution without structural changes.
 type OpIterator struct {
-	node *OpNode
-	plan planner.Node
-	dst  Slot
+	tree    *opTreeSlab
+	rootIdx int32
+	plan    planner.Node
+	dst     Slot
 }
 
 // BuildFastIterator builds an OpNode tree via BuildFast and wraps it in an
 // OpIterator. It is the drop-in replacement for executor.Build in dispatch.
 func BuildFastIterator(plan planner.Node) (*OpIterator, error) {
-	node, err := BuildFast(plan)
+	tree, rootIdx, err := BuildFast(plan)
 	if err != nil {
 		return nil, err
 	}
-	return &OpIterator{node: node, plan: plan}, nil
+	return &OpIterator{tree: tree, rootIdx: rootIdx, plan: plan}, nil
 }
 
 // Open implements Operator.
-func (it *OpIterator) Open(ctx *Context) error { return opOpen(it.node, ctx) }
+func (it *OpIterator) Open(ctx *Context) error { return opOpen(it.tree.ops, it.rootIdx, ctx) }
 
 // Next implements Operator. Returns nil TupleSlot for DML nil-rows (preserving
 // the legacy nil-slot convention that the dispatch loop checks with schema==nil).
 func (it *OpIterator) Next() (TupleSlot, error) {
 	it.dst.Reset()
-	if err := opNext(it.node, &it.dst); err != nil {
+	if err := opNext(it.tree.ops, it.rootIdx, &it.dst); err != nil {
 		return nil, err
 	}
 	if !it.dst.HasRow {
@@ -323,7 +351,7 @@ func (it *OpIterator) Next() (TupleSlot, error) {
 }
 
 // Close implements Operator.
-func (it *OpIterator) Close() error { return opClose(it.node) }
+func (it *OpIterator) Close() error { return opClose(it.tree.ops, it.rootIdx) }
 
 // Schema implements Operator. For read plans, returns plan.Output(). For DML
 // operators still in the adapter, delegates to the adapter's Schema() after
@@ -333,49 +361,49 @@ func (it *OpIterator) Schema() planner.Schema {
 	if s := it.plan.Output(); s != nil {
 		return s
 	}
-	if it.node != nil && it.node.Kind == OpAdapter {
-		return it.node.state.(*opAdapterState).op.Schema()
+	if it.tree != nil && it.tree.ops[it.rootIdx].Kind == OpAdapter {
+		return it.tree.ops[it.rootIdx].state.(*opAdapterState).op.Schema()
 	}
 	return nil
 }
 
 // RowsAffected implements RowCounter for DML operators.
 func (it *OpIterator) RowsAffected() int64 {
-	if it.node == nil {
+	if it.tree == nil {
 		return 0
 	}
-	switch it.node.Kind {
+	n := &it.tree.ops[it.rootIdx]
+	switch n.Kind {
 	case OpUpdate:
-		return it.node.state.(*updateOpState).op.RowsAffected()
+		return n.state.(*updateOpState).op.RowsAffected()
 	case OpDelete:
-		return it.node.state.(*deleteOpState).op.RowsAffected()
+		return n.state.(*deleteOpState).op.RowsAffected()
 	case OpInsert:
-		return it.node.state.(*insertOpState).op.RowsAffected()
+		return n.state.(*insertOpState).op.RowsAffected()
 	case OpSort:
 		// sortOp is a pass-through; rows-affected comes from its underlying child.
 		// Sorts appear over DML in rare cases (RETURNING … ORDER BY); the child
 		// RowCounter is not accessible here, so return 0 (correct for SELECT-sort).
 		return 0
 	case OpAdapter:
-		if rc, ok := it.node.state.(*opAdapterState).op.(RowCounter); ok {
+		if rc, ok := n.state.(*opAdapterState).op.(RowCounter); ok {
 			return rc.RowsAffected()
 		}
 	}
 	return 0
 }
 
-
-
 // ---------------------------------------------------------------------------
 // opOpen — recursive tree-open. Called once before the first opNext.
 // ---------------------------------------------------------------------------
 
-// opOpen opens the op-tree rooted at n. ctx is the execution context
+// opOpen opens the op-tree node at ops[idx]. ctx is the execution context
 // for the statement; all operators in the tree receive it.
-func opOpen(n *OpNode, ctx *Context) error {
-	if n == nil {
+func opOpen(ops []OpNode, idx int32, ctx *Context) error {
+	if idx == noChild {
 		return nil
 	}
+	n := &ops[idx]
 	switch n.Kind {
 	case OpSeqScan:
 		op := n.state.(*seqScanOp)
@@ -384,7 +412,7 @@ func opOpen(n *OpNode, ctx *Context) error {
 	case OpFilter:
 		s := n.state.(*filterState)
 		s.ctx = ctx
-		return opOpen(n.childA, ctx)
+		return opOpen(ops, n.childA, ctx)
 
 	case OpProject:
 		s := n.state.(*projectState)
@@ -395,7 +423,7 @@ func opOpen(n *OpNode, ctx *Context) error {
 			}
 			s.outCells = s.outCells[:len(s.plan.Targets)]
 		}
-		return opOpen(n.childA, ctx)
+		return opOpen(ops, n.childA, ctx)
 
 	case OpLimit:
 		s := n.state.(*limitState)
@@ -403,7 +431,7 @@ func opOpen(n *OpNode, ctx *Context) error {
 		s.skipped = 0
 		s.limitCount = -1
 		s.offsetCount = 0
-		if err := opOpen(n.childA, ctx); err != nil {
+		if err := opOpen(ops, n.childA, ctx); err != nil {
 			return err
 		}
 		if s.plan.Limit != nil {
@@ -464,29 +492,30 @@ func opOpen(n *OpNode, ctx *Context) error {
 // opClose — recursive tree-close. Called after iteration ends.
 // ---------------------------------------------------------------------------
 
-// opClose closes the op-tree rooted at n, releasing resources.
+// opClose closes the op-tree node at ops[idx], releasing resources.
 // Returns the first error encountered but continues closing remaining
 // nodes.
-func opClose(n *OpNode) error {
-	if n == nil {
+func opClose(ops []OpNode, idx int32) error {
+	if idx == noChild {
 		return nil
 	}
+	n := &ops[idx]
 	switch n.Kind {
 	case OpSeqScan:
 		op := n.state.(*seqScanOp)
 		return op.Close()
 
 	case OpFilter:
-		return opClose(n.childA)
+		return opClose(ops, n.childA)
 
 	case OpProject:
 		s := n.state.(*projectState)
 		s.outCells = nil
 		s.srcSlot.Reset()
-		return opClose(n.childA)
+		return opClose(ops, n.childA)
 
 	case OpLimit:
-		return opClose(n.childA)
+		return opClose(ops, n.childA)
 
 	case OpUpdate:
 		s := n.state.(*updateOpState)
@@ -528,20 +557,21 @@ func opClose(n *OpNode) error {
 // dst.Cells with a nil error (callers should check len(dst.Cells)==0).
 //
 // dst is reused across calls; consumers that need to retain the row
-// past the next opNext call must copy via dst.CopyInto.
-func opNext(n *OpNode, dst *Slot) error {
-	if n == nil {
+// past the next opNext call must copy via dst.CopyTo.
+func opNext(ops []OpNode, idx int32, dst *Slot) error {
+	if idx == noChild {
 		return EOF
 	}
+	n := &ops[idx]
 	switch n.Kind {
 	case OpSeqScan:
 		return seqScanOpNext(n, dst)
 	case OpFilter:
-		return filterOpNext(n, dst)
+		return filterOpNext(ops, n, dst)
 	case OpProject:
-		return projectOpNext(n, dst)
+		return projectOpNext(ops, n, dst)
 	case OpLimit:
-		return limitOpNext(n, dst)
+		return limitOpNext(ops, n, dst)
 	case OpUpdate:
 		return updateOpKernelNext(n, dst)
 	case OpDelete:
@@ -581,7 +611,7 @@ func seqScanOpNext(n *OpNode, dst *Slot) error {
 // filterOpNext applies the predicate and passes matching rows from
 // childA into dst. Mirrors filterOp.Next() but calls opNext on the
 // child (switch dispatch) instead of child.Next() (interface dispatch).
-func filterOpNext(n *OpNode, dst *Slot) error {
+func filterOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
 	s := n.state.(*filterState)
 	rejected := 0
 	for {
@@ -592,7 +622,7 @@ func filterOpNext(n *OpNode, dst *Slot) error {
 					Message: "canceling statement due to user request"}
 			}
 		}
-		if err := opNext(n.childA, dst); err != nil {
+		if err := opNext(ops, n.childA, dst); err != nil {
 			return err
 		}
 		// DML / utility ops surface nil-row (HasRow=false).
@@ -614,10 +644,10 @@ func filterOpNext(n *OpNode, dst *Slot) error {
 // projectOpNext evaluates the target-list expressions against the
 // child's output and writes the projected columns into dst.
 // Mirrors projectOp.Next() but uses opNext for the child call.
-func projectOpNext(n *OpNode, dst *Slot) error {
+func projectOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
 	s := n.state.(*projectState)
 	s.srcSlot.Reset()
-	if err := opNext(n.childA, &s.srcSlot); err != nil {
+	if err := opNext(ops, n.childA, &s.srcSlot); err != nil {
 		return err
 	}
 	// DML / utility ops surface nil-row (HasRow=false).
@@ -647,10 +677,10 @@ func projectOpNext(n *OpNode, dst *Slot) error {
 
 // limitOpNext enforces LIMIT / OFFSET by skipping and counting rows
 // from childA. Mirrors limitOp.Next() but uses opNext for the child.
-func limitOpNext(n *OpNode, dst *Slot) error {
+func limitOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
 	s := n.state.(*limitState)
 	for s.skipped < s.offsetCount {
-		if err := opNext(n.childA, dst); err != nil {
+		if err := opNext(ops, n.childA, dst); err != nil {
 			return err
 		}
 		s.skipped++
@@ -658,7 +688,7 @@ func limitOpNext(n *OpNode, dst *Slot) error {
 	if s.limitCount >= 0 && s.emitted >= s.limitCount {
 		return EOF
 	}
-	if err := opNext(n.childA, dst); err != nil {
+	if err := opNext(ops, n.childA, dst); err != nil {
 		return err
 	}
 	s.emitted++
@@ -704,7 +734,7 @@ func deleteOpKernelNext(n *OpNode, dst *Slot) error {
 
 // sortOpKernelNext drives a concrete *sortOp directly. sortOp.Open() already
 // collected and sorted all rows from its child (an opNodeOperator bridging the
-// child *OpNode, so the child ran on concrete dispatch). sortOp.Next() returns
+// child OpNode, so the child ran on concrete dispatch). sortOp.Next() returns
 // pre-sorted rows without calling child.Next() again.
 func sortOpKernelNext(n *OpNode, dst *Slot) error {
 	s := n.state.(*sortOpState)

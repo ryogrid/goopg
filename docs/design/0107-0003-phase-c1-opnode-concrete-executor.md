@@ -192,12 +192,17 @@ The dispatch loop is unchanged; `*OpIterator` implements `Operator` and
 - **Phase C.1 complete** (loop 12): `OpInsert` and `OpJoin` landed with
   `opNodeOperator` bridges; `RowsAffected()` updated for `OpInsert`;
   5 new / updated regression tests in `phase_c_test.go`.
-- **Phase C.2**: replace `*OpNode` children with slab indices; add per-statement
-  `[]OpNode` slab in `stmtCtx`; eliminate the `any` state field in favour of
-  raw bytes (`unsafe.Pointer` cast, sized by `opStateSize`)
-- **Phase C.3**: move plan tree into mctx; delete parser/planner GC-heap alloc
-- **`Slot.CopyTo` API**: thread through sort/hash-join/aggregate to eliminate
-  `Materialize()` deep-copy at retention boundaries
+- **Phase C.2 COMPLETE** (loop 13): slab indices + `Slot.CopyTo` landed.
+  `OpNode.childA/childB` changed from `*OpNode` to `int32` slab indices
+  (`noChild = -1` sentinel). New `opTreeSlab` type holds the `[]OpNode`
+  backing store; `opNodeOperator` and `OpIterator` hold `*opTreeSlab` +
+  `int32` root index. `opOpen/opNext/opClose` now take `(ops []OpNode, idx
+  int32, ...)` instead of `(n *OpNode, ...)`. `CopyInto` renamed to `CopyTo`.
+  `BuildFast` returns `(*opTreeSlab, int32, error)`; `RunFast` takes
+  `(*opTreeSlab, int32, *Context)`. All executor/server/planner/parser tests
+  pass with `-race`.
+- **Phase C.3**: move plan tree into mctx; delete parser/planner GC-heap alloc;
+  add `Slot.CopyTo(dst *Slot, dstCtx *mctx.Context)` with mctx-backed allocation
 - **Performance gate**: verify `runtime.itabHashFunc` drops from top-40 once
   all hot-path operators are migrated
 

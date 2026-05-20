@@ -2253,9 +2253,16 @@ Operational policy (2026-05-20):
         and merge/NL paths (joinOp.Open dispatches internally). 5 new/updated
         regression tests. `go test -race -count=1 ./internal/executor/
         ./internal/server/` PASS.
-      - Remaining: Phase C.2: slab indices + Slot.CopyTo. Phase C.3:
-        PlanNode/ExprNode sum-types + parser mctx. TPS and gcBgMarkWorker
-        gates require perf run after all hot-path ops migrated.
+      - **Loop-13 Phase C.2 (2026-05-20)**: slab indices + Slot.CopyTo landed.
+        `OpNode.childA/childB` changed from `*OpNode` to `int32` indices into
+        a per-statement `opTreeSlab`. `noChild = -1` sentinel. New `opTreeSlab`
+        type; `opNodeOperator` and `OpIterator` hold `*opTreeSlab + int32`
+        instead of `*OpNode`. `opOpen/opNext/opClose` take `(ops []OpNode, idx
+        int32, ...)`. `CopyInto` renamed to `CopyTo`. `BuildFast` returns
+        `(*opTreeSlab, int32, error)`; `RunFast` takes same. All executor/server
+        tests pass with `-race`. Design doc updated.
+      - Remaining: Phase C.3: PlanNode/ExprNode sum-types + parser mctx.
+        TPS and gcBgMarkWorker gates require perf run after all hot-path ops migrated.
 
  - [ ] **M0107-0004 — Phase D1: ProcArray + atomic XidGen + CLOG bank locks**
       - Summary: Replace `mvcc.Manager.mu` (gates Begin/SnapshotFor/Commit/

@@ -37,11 +37,11 @@ func runBothAndCompare(t *testing.T, plan planner.Node, ctx *Context) {
 	}
 
 	// BuildFast + RunFast (Phase C path).
-	fastNode, err := BuildFast(plan)
+	tree, rootIdx, err := BuildFast(plan)
 	if err != nil {
 		t.Fatalf("BuildFast: %v", err)
 	}
-	fastRows, err := RunFast(fastNode, ctx)
+	fastRows, err := RunFast(tree, rootIdx, ctx)
 	if err != nil {
 		t.Fatalf("RunFast: %v", err)
 	}
@@ -134,18 +134,18 @@ func TestSlotReset(t *testing.T) {
 	}
 }
 
-// TestSlotCopyInto checks that CopyInto produces an independent copy.
-func TestSlotCopyInto(t *testing.T) {
+// TestSlotCopyTo checks that CopyTo produces an independent copy.
+func TestSlotCopyTo(t *testing.T) {
 	src := &Slot{Cells: []Datum{NewIntDatum(7), NewIntDatum(9)}}
 	var dst Slot
-	src.CopyInto(&dst)
+	src.CopyTo(&dst)
 	if len(dst.Cells) != 2 {
 		t.Fatalf("dst.Cells len=%d want 2", len(dst.Cells))
 	}
 	// Mutating src should not affect dst.
 	src.Cells[0] = NewIntDatum(999)
 	if dst.Cells[0].Int != 7 {
-		t.Error("CopyInto should produce an independent copy")
+		t.Error("CopyTo should produce an independent copy")
 	}
 }
 
@@ -175,11 +175,11 @@ func TestRunFastSelectLimit(t *testing.T) {
 // TestRunFastSelectLimitZero verifies SELECT 1 LIMIT 0 returns no rows.
 func TestRunFastSelectLimitZero(t *testing.T) {
 	plan := planOne(t, "SELECT 1 LIMIT 0", catalog.NewInMemory())
-	fastNode, err := BuildFast(plan)
+	tree, rootIdx, err := BuildFast(plan)
 	if err != nil {
 		t.Fatalf("BuildFast: %v", err)
 	}
-	rows, err := RunFast(fastNode, NewContext())
+	rows, err := RunFast(tree, rootIdx, NewContext())
 	if err != nil {
 		t.Fatalf("RunFast: %v", err)
 	}
@@ -192,11 +192,11 @@ func TestRunFastSelectLimitZero(t *testing.T) {
 // (one row produced, offset skips it).
 func TestRunFastSelectOffset(t *testing.T) {
 	plan := planOne(t, "SELECT 1 OFFSET 1", catalog.NewInMemory())
-	fastNode, err := BuildFast(plan)
+	tree, rootIdx, err := BuildFast(plan)
 	if err != nil {
 		t.Fatalf("BuildFast: %v", err)
 	}
-	rows, err := RunFast(fastNode, NewContext())
+	rows, err := RunFast(tree, rootIdx, NewContext())
 	if err != nil {
 		t.Fatalf("RunFast: %v", err)
 	}
@@ -235,11 +235,11 @@ func TestRunFastSeqScanWithFilter(t *testing.T) {
 	runBothAndCompare(t, plan, ctx)
 
 	// Also verify the fast path returns exactly 1 row with id=2.
-	fastNode, err := BuildFast(plan)
+	tree, rootIdx, err := BuildFast(plan)
 	if err != nil {
 		t.Fatalf("BuildFast: %v", err)
 	}
-	rows, err := RunFast(fastNode, ctx)
+	rows, err := RunFast(tree, rootIdx, ctx)
 	if err != nil {
 		t.Fatalf("RunFast: %v", err)
 	}
@@ -262,11 +262,11 @@ func TestRunFastSeqScanWithLimit(t *testing.T) {
 	plan := planOne(t, "SELECT id FROM items LIMIT 2", cat)
 	runBothAndCompare(t, plan, ctx)
 
-	fastNode, err := BuildFast(plan)
+	tree, rootIdx, err := BuildFast(plan)
 	if err != nil {
 		t.Fatalf("BuildFast: %v", err)
 	}
-	rows, err := RunFast(fastNode, ctx)
+	rows, err := RunFast(tree, rootIdx, ctx)
 	if err != nil {
 		t.Fatalf("RunFast: %v", err)
 	}
@@ -298,25 +298,25 @@ func TestRunFastInsert(t *testing.T) {
 		ColumnIndex: []int{0, 1},
 	}
 
-	fastNode, err := BuildFast(insertPlan)
+	insertTree, insertRootIdx, err := BuildFast(insertPlan)
 	if err != nil {
 		t.Fatalf("BuildFast: %v", err)
 	}
-	if fastNode.Kind != OpInsert {
-		t.Errorf("INSERT should use OpInsert, got Kind=%d", fastNode.Kind)
+	if insertTree.ops[insertRootIdx].Kind != OpInsert {
+		t.Errorf("INSERT should use OpInsert, got Kind=%d", insertTree.ops[insertRootIdx].Kind)
 	}
-	_, err = RunFast(fastNode, ctx)
+	_, err = RunFast(insertTree, insertRootIdx, ctx)
 	if err != nil {
 		t.Fatalf("RunFast INSERT: %v", err)
 	}
 
 	// Verify the row was actually inserted by reading it back.
 	scanPlan := planOne(t, "SELECT id, label FROM items WHERE id = 99", cat)
-	scanNode, err := BuildFast(scanPlan)
+	scanTree, scanRootIdx, err := BuildFast(scanPlan)
 	if err != nil {
 		t.Fatalf("BuildFast scan: %v", err)
 	}
-	rows, err := RunFast(scanNode, ctx)
+	rows, err := RunFast(scanTree, scanRootIdx, ctx)
 	if err != nil {
 		t.Fatalf("RunFast scan: %v", err)
 	}
@@ -411,13 +411,13 @@ func TestBuildFastNodeKinds(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		n, err := BuildFast(c.plan)
+		tree, rootIdx, err := BuildFast(c.plan)
 		if err != nil {
 			t.Errorf("BuildFast(%T): %v", c.plan, err)
 			continue
 		}
-		if n.Kind != c.want {
-			t.Errorf("BuildFast(%T).Kind = %d, want %d", c.plan, n.Kind, c.want)
+		if tree.ops[rootIdx].Kind != c.want {
+			t.Errorf("BuildFast(%T).Kind = %d, want %d", c.plan, tree.ops[rootIdx].Kind, c.want)
 		}
 	}
 }
@@ -441,11 +441,11 @@ func TestRunFastSort(t *testing.T) {
 	plan := planOne(t, "SELECT id FROM items ORDER BY id DESC", cat)
 	runBothAndCompare(t, plan, ctx)
 
-	fastNode, err := BuildFast(plan)
+	tree, rootIdx, err := BuildFast(plan)
 	if err != nil {
 		t.Fatalf("BuildFast: %v", err)
 	}
-	rows, err := RunFast(fastNode, ctx)
+	rows, err := RunFast(tree, rootIdx, ctx)
 	if err != nil {
 		t.Fatalf("RunFast: %v", err)
 	}
@@ -454,13 +454,14 @@ func TestRunFastSort(t *testing.T) {
 	}
 	// The planner produces Project(Sort(SeqScan)) so root is OpProject.
 	// Verify the Project child is OpSort (not OpAdapter) confirming concrete dispatch.
-	if fastNode.Kind != OpProject {
-		t.Errorf("unexpected root kind %d for ORDER BY plan", fastNode.Kind)
+	if tree.ops[rootIdx].Kind != OpProject {
+		t.Errorf("unexpected root kind %d for ORDER BY plan", tree.ops[rootIdx].Kind)
 	}
-	if fastNode.childA == nil || fastNode.childA.Kind != OpSort {
+	childA := tree.ops[rootIdx].childA
+	if childA == noChild || tree.ops[childA].Kind != OpSort {
 		childKind := OpInvalid
-		if fastNode.childA != nil {
-			childKind = fastNode.childA.Kind
+		if childA != noChild {
+			childKind = tree.ops[childA].Kind
 		}
 		t.Errorf("Project.childA.Kind = %d, want OpSort (%d)", childKind, OpSort)
 	}
@@ -586,8 +587,8 @@ func TestRunFastInsertRowsAffected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildFastIterator: %v", err)
 	}
-	if it.node.Kind != OpInsert {
-		t.Fatalf("expected OpInsert, got %d", it.node.Kind)
+	if it.tree.ops[it.rootIdx].Kind != OpInsert {
+		t.Fatalf("expected OpInsert, got %d", it.tree.ops[it.rootIdx].Kind)
 	}
 	if err := it.Open(ctx); err != nil {
 		_ = it.Close()
@@ -628,16 +629,16 @@ func TestRunFastJoinConcrete(t *testing.T) {
 
 	// Also verify that the concrete OpNode root kind is OpJoin or wraps
 	// one (planner may add a Project on top).
-	fastNode, err := BuildFast(plan)
+	tree, rootIdx, err := BuildFast(plan)
 	if err != nil {
 		t.Fatalf("BuildFast: %v", err)
 	}
 	// Walk past an optional Project wrapper.
-	n := fastNode
-	if n.Kind == OpProject {
-		n = n.childA
+	nIdx := rootIdx
+	if tree.ops[nIdx].Kind == OpProject {
+		nIdx = tree.ops[nIdx].childA
 	}
-	if n.Kind != OpJoin {
-		t.Errorf("expected OpJoin below top-level node, got Kind=%d", n.Kind)
+	if tree.ops[nIdx].Kind != OpJoin {
+		t.Errorf("expected OpJoin below top-level node, got Kind=%d", tree.ops[nIdx].Kind)
 	}
 }
