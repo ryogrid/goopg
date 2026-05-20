@@ -47,14 +47,13 @@ func TestBgwriterFlushesPages(t *testing.T) {
 	}
 
 	// Verify all are dirty before bgwriter runs.
-	pool.evictMu.Lock()
 	dirty := 0
-	for _, s := range pool.slots {
-		if s.valid && s.dirty {
+	for i := range pool.slots {
+		s := &pool.slots[i]
+		if s.isValid() && s.isDirty() {
 			dirty++
 		}
 	}
-	pool.evictMu.Unlock()
 	if dirty == 0 {
 		t.Fatal("expected dirty pages before bgwriter flush")
 	}
@@ -66,14 +65,13 @@ func TestBgwriterFlushesPages(t *testing.T) {
 	}
 
 	// Pages should now be clean.
-	pool.evictMu.Lock()
 	dirtyAfter := 0
-	for _, s := range pool.slots {
-		if s.valid && s.dirty {
+	for i := range pool.slots {
+		s := &pool.slots[i]
+		if s.isValid() && s.isDirty() {
 			dirtyAfter++
 		}
 	}
-	pool.evictMu.Unlock()
 	if dirtyAfter != 0 {
 		t.Errorf("expected 0 dirty pages after flush, got %d", dirtyAfter)
 	}
@@ -116,14 +114,13 @@ func TestBgwriterGoroutine(t *testing.T) {
 	bg.Stop()
 
 	// Verify pages were cleaned.
-	pool.evictMu.Lock()
 	remaining := 0
-	for _, s := range pool.slots {
-		if s.valid && s.dirty {
+	for i := range pool.slots {
+		s := &pool.slots[i]
+		if s.isValid() && s.isDirty() {
 			remaining++
 		}
 	}
-	pool.evictMu.Unlock()
 	if remaining != 0 {
 		t.Errorf("bgwriter did not flush all pages; %d dirty pages remain", remaining)
 	}

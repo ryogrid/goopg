@@ -158,7 +158,7 @@ func TestPoolPinReadsThroughSMGR(t *testing.T) {
 	if s1.Page()[100] != 0x42 {
 		t.Errorf("page[100] = %#x, want 0x42", s1.Page()[100])
 	}
-	if !s1.valid {
+	if !s1.isValid() {
 		t.Errorf("slot not marked valid after read")
 	}
 
@@ -170,7 +170,7 @@ func TestPoolPinReadsThroughSMGR(t *testing.T) {
 	if s1 != s2 {
 		t.Errorf("second Pin returned different slot")
 	}
-	if got := s2.pinCount.Load(); got != 2 {
+	if got := s2.getPinCount(); got != 2 {
 		t.Errorf("pinCount = %d, want 2", got)
 	}
 	pool.Unpin(s1)
@@ -338,8 +338,8 @@ func TestPoolFlushAllClearsDirty(t *testing.T) {
 	if err := pool.FlushAll(); err != nil {
 		t.Fatal(err)
 	}
-	for i, slot := range pool.slots {
-		if slot.dirty {
+	for i := range pool.slots {
+		if pool.slots[i].isDirty() {
 			t.Errorf("slot %d still dirty after FlushAll", i)
 		}
 	}

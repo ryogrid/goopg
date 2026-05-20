@@ -2411,6 +2411,33 @@ Operational policy (2026-05-20):
         Pin/Unpin/evict for 30 s PASS; `runtime.futex` cum% at c=100 SO
         < 8 % (vs 23 %); `bufferPartition.mu` absent from mutex top-20;
         `TestE2E_FailoverGoopgToPG/async` PASS; `make ralph-state-guard` PASS.
+      - PARTIAL PROGRESS 2026-05-21 (loop 1): three correctness bugs in
+        the partially-landed `bufmap` / new `bufpool.go` rewrite fixed so
+        storage tests pass with `-race`. (a) `bufmap.packVal` collided
+        with `bufmapTombstone=1` whenever `(slotIdx, gen) == (0, 1)`; the
+        legacy `val |= 2` workaround corrupted the gen field, which then
+        never matched the slot's true gen — `pinSlow` looped forever
+        under `pinMu` on the very first re-pin (caught by
+        `TestBgwriterDoDDirtyVictimRate`). Fix: shift `slotIdx` by +1
+        inside packVal so live values exceed UINT32_MAX. (b) `Lookup`
+        used a Robin-Hood "dist > residentDist" early-exit but `Insert`
+        does plain linear probing without displacement; under collision
+        sequences `Lookup` returned "not found" for entries that were
+        present (`TestScanRingCacheMissNoEviction` got 86/90). Fix: drop
+        the early-exit; rely on the empty-bucket terminator + table-size
+        safety bound. (c) `slot.fpiSinceCheckpoint` was guarded by
+        `contentMu`, but `MarkDirty` callers hold `s.Lock()` for their
+        page-byte writes — re-entering the non-reentrant `sync.RWMutex`
+        deadlocked (`TestPoolFPIEmittedOncePerEpoch`). Fix:
+        `fpiSinceCheckpoint atomic.Bool` everywhere; contentMu drops from
+        the FPI flag path entirely. Regression tests added in
+        `bufmap_test.go`. `go test -race ./internal/storage/` PASS;
+        `go test -race ./internal/mvcc/ ./internal/wal/
+        ./internal/executor/ ./internal/access/btree/` PASS.
+        Design: `docs/design/0107-0006-bufpool-bufmap-correctness.md`.
+        Action: run the 1 000-goroutine Pin/Unpin/evict stress, validate
+        the pgbench TPS / runtime.futex / mutex-top-20 gates, and
+        `TestE2E_FailoverGoopgToPG/async` in subsequent loops.
 
  - [ ] **M0107-0007 — Phase D4: WAL insert striping + FSM page distribution**
       - Summary: Replace single `wal.Writer.appendMu` lock + tail-page-targeting
