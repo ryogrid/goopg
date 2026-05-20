@@ -343,8 +343,8 @@ func TestParseIsolationSpecMultiLinePermutation(t *testing.T) {
 		"   a\n" +
 		"   # mid-block comment, indented\n" +
 		"   b c\n" +
-		"\n" + // blank line terminates the block
-		"permutation \"a\" \"c\"\n" // back to single-line form on a new block
+		"\n" + // blank line within permutation is skipped; keyword below terminates
+		"permutation \"a\" \"c\"\n" // non-indented keyword terminates the first block
 	path := filepath.Join(t.TempDir(), "multi.spec")
 	if err := os.WriteFile(path, []byte(spec), 0o644); err != nil {
 		t.Fatal(err)
@@ -376,4 +376,66 @@ func equalSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestParseIsolationSpecBlankLineWithinPermutation pins that a blank line
+// inside a multi-line permutation is treated as whitespace (skipped), not
+// as a terminator. Regression for insert-conflict-specconflict.spec whose
+// 5th permutation has a blank line between comment blocks. M0100-0005.
+func TestParseIsolationSpecBlankLineWithinPermutation(t *testing.T) {
+	spec := "session \"s1\"\n" +
+		"step \"a\" { SELECT 1; }\n" +
+		"step \"b\" { SELECT 2; }\n" +
+		"step \"c\" { SELECT 3; }\n" +
+		"permutation\n" +
+		"   # first comment group\n" +
+		"   a\n" +
+		"\n" + // blank line within permutation — must NOT terminate the block
+		"   # second comment group after blank\n" +
+		"   b c\n" +
+		"permutation \"a\"\n" // non-indented keyword terminates first block
+	path := filepath.Join(t.TempDir(), "blank.spec")
+	if err := os.WriteFile(path, []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseIsolationSpec(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Permutations) != 2 {
+		t.Fatalf("Permutations len = %d (%v), want 2", len(parsed.Permutations), parsed.Permutations)
+	}
+	want0 := []string{"a", "b", "c"}
+	if !equalSlices(parsed.Permutations[0], want0) {
+		t.Errorf("Permutations[0] = %v, want %v (blank line must not truncate permutation)", parsed.Permutations[0], want0)
+	}
+}
+
+// TestParseIsolationSpecNoticesAnnotationStripped pins that parenthesised
+// annotations like (step notices N) in a permutation line are stripped so
+// only actual step names are collected. Regression for
+// insert-conflict-specconflict.spec which uses (s1_upsert notices 10). M0100-0005.
+func TestParseIsolationSpecNoticesAnnotationStripped(t *testing.T) {
+	spec := "session \"s1\"\n" +
+		"step \"s1_upsert\" { SELECT 1; }\n" +
+		"step \"s2_upsert\" { SELECT 2; }\n" +
+		"step \"next\" { SELECT 3; }\n" +
+		"permutation\n" +
+		"   s1_upsert s2_upsert (s1_upsert notices 10)\n" +
+		"   next\n"
+	path := filepath.Join(t.TempDir(), "ann.spec")
+	if err := os.WriteFile(path, []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseIsolationSpec(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Permutations) != 1 {
+		t.Fatalf("Permutations len = %d, want 1", len(parsed.Permutations))
+	}
+	want := []string{"s1_upsert", "s2_upsert", "next"}
+	if !equalSlices(parsed.Permutations[0], want) {
+		t.Errorf("Permutations[0] = %v, want %v (annotation must be stripped)", parsed.Permutations[0], want)
+	}
 }

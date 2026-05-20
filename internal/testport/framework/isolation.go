@@ -233,18 +233,18 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 				if idx := strings.Index(stripped, "#"); idx >= 0 {
 					stripped = strings.TrimSpace(stripped[:idx])
 				}
-				if !isIndented {
-					// Not a continuation — push back and stop. Blank
-					// (zero-length) lines are also non-indented; they
-					// terminate the permutation block.
+				// Blank lines (isIndented=false, stripped="") within a
+				// multi-line permutation are treated as whitespace and
+				// skipped — upstream specscanner.l tokenises blank lines
+				// inside a permutation block as whitespace, not terminators.
+				// Only a non-blank, non-indented line terminates the block.
+				if !isIndented && stripped != "" {
+					// Non-blank, non-indented line — not a continuation.
 					pendingLine = nextRaw
 					break
 				}
 				if stripped == "" {
-					// Indented comment-only line inside a multi-line
-					// permutation block — skip and keep reading. Upstream
-					// specs (e.g. insert-conflict-specconflict.spec) embed
-					// explanatory '#' comments between continuation tokens.
+					// Blank line or indented comment-only line — skip.
 					continue
 				}
 				tokens = append(tokens, parsePermutationTokens(stripped)...)
@@ -398,11 +398,26 @@ func parsePermutationTokens(raw string) []string {
 	}
 	fields := strings.Fields(raw)
 	out := make([]string, 0, len(fields))
+	inAnnotation := false
 	for _, f := range fields {
 		f = strings.TrimSpace(strings.Trim(f, `"`))
-		if f != "" {
-			out = append(out, f)
+		if f == "" {
+			continue
 		}
+		// Skip (step notices N) and other parenthesised annotations.
+		// An annotation begins when a token starts with '(' and ends
+		// when a token ends with ')'. PG isolationtester ignores these
+		// annotations (they control the test harness, not the runner).
+		if strings.HasPrefix(f, "(") {
+			inAnnotation = true
+		}
+		if inAnnotation {
+			if strings.HasSuffix(f, ")") {
+				inAnnotation = false
+			}
+			continue
+		}
+		out = append(out, f)
 	}
 	return out
 }
