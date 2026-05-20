@@ -2722,6 +2722,41 @@ Operational policy (2026-05-20):
         Remaining work for this sub-milestone: bufpool per-slot Sema
         wait caller (consumes [[0107-0008c]]); per-P stats counter
         caller (consumes [[0107-0008b]]); per-Go-minor CI matrix.
+      - PARTIAL PROGRESS 2026-05-21 (loop 6): second `PinP` consumer landed —
+        new `internal/stats` package with a single public type `Counter`,
+        an additive `int64` counter sharded across `maxShards = 256`
+        cache-line-padded `atomic.Int64` slots via
+        `runtimeshim.PinP`/`UnpinP`. `Add(delta)` is two function calls
+        plus an atomic add inside the pinned window; `Sum()` does 256
+        atomic loads on the cold path; `Reset()` does 256 atomic stores.
+        `atomic.Int64` (not plain `int64`) inside the pin so a concurrent
+        `Sum` reader on a different P sees a well-defined value. Five
+        race-clean tests cover single-goroutine round trip, `Reset`,
+        concurrent-Add total-exact (32 g × 16 K = 524 288 Adds, final
+        Sum equals exactly the issued total), per-shard write
+        distribution (GOMAXPROCS≥2 sanity that sharding actually
+        fans out), and Sum-vs-Add no-torn-read invariant — the
+        Sum-vs-Add test was rewritten this loop to use separate
+        producer/reader WaitGroups so the reader-stop signal fires
+        after producers complete (the originally-drafted version
+        deadlocked because `wg.Wait()` blocked on the reader, which in
+        turn blocked on `stop` that was never set). `BenchmarkCounterAdd-16`
+        0.8054 ns/op (Linux/amd64, Go 1.25, 16 cores) on the parallel
+        path. Migration of specific global atomic counters to
+        `stats.Counter` is deliberately deferred per-consumer-family to
+        subsequent loops so each consumer migration can be reviewed and
+        reverted independently. This finishes the parent chapter's
+        two viable `PinP` consumers (the per-P xid cache was ruled
+        out in [[0107-0008d]]). Design:
+        `docs/design/0107-0008f-perp-stats-counter.md` (indexed in
+        `docs/design/README.md`). Verified:
+        `go test -race -count=1 ./internal/stats/...` PASS (1.02 s);
+        `go test -bench=BenchmarkCounterAdd ./internal/stats/` runs
+        clean.
+        Remaining work for this sub-milestone: bufpool per-slot Sema
+        wait caller (consumes [[0107-0008c]]); first concrete
+        `stats.Counter` consumer migration (e.g. heap rows-scanned,
+        buffers-hit, tuples-returned); per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
