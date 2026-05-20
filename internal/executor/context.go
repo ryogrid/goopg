@@ -230,6 +230,16 @@ type Context struct {
 	// with RETURNING). Populated by cteDMLPrefixOp before the outer query runs.
 	// Key is the lowercase CTE name; value is the materialized RETURNING rows.
 	MaterializedCTEs map[string][][]Datum
+
+	// CTEWriteFence, when non-nil, is a set of row pointers written by DML
+	// CTEs during their execution phase. The outer query's seqScanOp skips
+	// these tuples to implement CTE snapshot isolation: DML-CTE writes must
+	// not be visible to the outer SELECT. Cleared between statements.
+	CTEWriteFence map[storage.ItemPointer]struct{}
+
+	// InDMLCTE is true while cteDMLPrefixOp is executing its DML sub-plans.
+	// Write operators register their output pointers in CTEWriteFence when this is set.
+	InDMLCTE bool
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.

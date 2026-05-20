@@ -398,6 +398,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 			}
 			ectx.Snap = snap2
 		}
+		// Per-statement reset: clear the DML-CTE write fence from any previous
+		// statement so subsequent SELECTs don't accidentally skip rows that were
+		// inserted/updated by a prior DML CTE in the same transaction.
+		ectx.CTEWriteFence = nil
+		ectx.InDMLCTE = false
 
 		// M0098-0005: plan cache for single-statement queries (the
 		// common OLTP case). On hit: skip planner.Plan. On miss:

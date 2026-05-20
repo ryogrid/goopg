@@ -649,6 +649,16 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				}
 				continue
 			}
+			// CTE snapshot isolation: skip rows written by DML CTEs so the
+			// outer SELECT sees the pre-CTE state (PostgreSQL semantics).
+			if o.ctx.CTEWriteFence != nil {
+				if _, inFence := o.ctx.CTEWriteFence[storage.ItemPointer{Block: o.curBlock, Offset: o.curSlot - 1}]; inFence {
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					continue
+				}
+			}
 			// M0104-0007: SSI read-path hook. Tuple is visible to this
 			// reader — install a tuple-grain SIREAD predicate lock and an
 			// rw-conflict edge to the producing writer (xmin). Helper
@@ -1828,6 +1838,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				if werr != nil {
 					return nil, werr
 				}
+				// Non-partition in-place UPDATE via index: maintain unique/PK
+				// btree entries for the new row version so ON CONFLICT arbiters
+				// and unique-constraint checks can find the live committed row
+				// after a concurrent UPDATE. M0100-0005 (Bug A fix).
+				maintainUniqueIndexesForInsert(o.ctx, idxTbl, cols, pu.newRow, newPtr)
 				// M0100-0005z: link old tuple to new version via t_ctid for
 				// EPQ chain followers.
 				if cerr := stampOldCtid(o.ctx, rel, pu.blk, pu.slot, newPtr); cerr != nil {
@@ -2157,6 +2172,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			}
 			if destPart != nil {
 				maintainUniqueIndexesForInsert(o.ctx, destPart, targetWriteCols, pu.newRow, newPtr)
+			} else if pu.scanTbl != nil {
+				// Non-partition in-place UPDATE: maintain unique/PK btree entries for
+				// the new row version. Enables ON CONFLICT arbiters and unique-constraint
+				// checks to find the live committed row after a concurrent UPDATE.
+				maintainUniqueIndexesForInsert(o.ctx, pu.scanTbl, targetWriteCols, pu.newRow, newPtr)
 			}
 			// M0100-0005z: link the old tuple to the new version via t_ctid
 			// for in-place (non-cross-partition) updates so EPQ chain

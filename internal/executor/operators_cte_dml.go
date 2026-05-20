@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // cteDMLPrefixOp executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
@@ -30,13 +31,25 @@ func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 		ctx.MaterializedCTEs = make(map[string][][]Datum)
 	}
 
+	// CTE snapshot isolation: save the statement-start snapshot and
+	// initialise the write fence. The outer query will restore the
+	// snapshot and skip any rows written by the DML CTEs so that
+	// PostgreSQL CTE semantics hold (outer SELECT sees pre-CTE state).
+	savedSnap := ctx.Snap
+	ctx.CTEWriteFence = make(map[storage.ItemPointer]struct{})
+	ctx.InDMLCTE = true
+
 	// Execute each DML CTE in order, collecting RETURNING rows.
 	for i, dml := range o.plan.DMls {
 		op, err := Build(dml)
 		if err != nil {
+			ctx.InDMLCTE = false
+			ctx.Snap = savedSnap
 			return err
 		}
 		if err := op.Open(ctx); err != nil {
+			ctx.InDMLCTE = false
+			ctx.Snap = savedSnap
 			return err
 		}
 		var rows [][]Datum
@@ -47,6 +60,8 @@ func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 			}
 			if err != nil {
 				op.Close()
+				ctx.InDMLCTE = false
+				ctx.Snap = savedSnap
 				return err
 			}
 			// Materialize the row so it survives after op.Close().
@@ -59,6 +74,12 @@ func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 		key := strings.ToLower(o.plan.Names[i])
 		ctx.MaterializedCTEs[key] = rows
 	}
+
+	// Restore snapshot and clear InDMLCTE before running the outer query.
+	// The outer SELECT uses the statement-start snapshot (pre-CTE state)
+	// and the CTEWriteFence skips any rows written by the DML CTEs above.
+	ctx.InDMLCTE = false
+	ctx.Snap = savedSnap
 
 	// Now build and open the outer query plan.
 	inner, err := Build(o.plan.Body)

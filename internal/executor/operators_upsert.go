@@ -358,6 +358,29 @@ func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, 
 		// permutations 1/5.  TupleVisible would still report the dead
 		// row as visible under RR's frozen snapshot.
 		if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
+			// HOT chain follow: if this dead tuple has a HeapHotUpdated flag,
+			// the CTID chain on the same page leads to the live successor.
+			// Re-pin the page and follow the chain so a concurrent HOT update
+			// doesn't leave the arbiter probe without a conflict match.
+			// M0100-0005 (Bug A — HOT path).
+			if tuple.Header.Infomask&storage.HeapHotUpdated != 0 && o.ctx.Pool != nil {
+				hotBuf, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+				if perr == nil {
+					hotBuf.RLock()
+					liveTuple, liveSlot, liveFound := followHOTChain(hotBuf.Page(), tuple.Header.CTID.Offset, o.ctx.Snap, o.ctx.Tx.XID)
+					hotBuf.RUnlock()
+					o.ctx.Pool.Unpin(hotBuf)
+					if liveFound && isLiveForUniqueCheck(o.ctx, liveTuple.Header.Xmin, liveTuple.Header.Xmax) {
+						row, rerr := DecodeRow(cols, liveTuple.Data)
+						if rerr == nil {
+							foundPtr = storage.ItemPointer{Block: ptr.Block, Offset: liveSlot}
+							foundRow = row
+							found = true
+							return false, nil
+						}
+					}
+				}
+			}
 			return true, nil
 		}
 		row, err := DecodeRow(cols, tuple.Data)
@@ -508,6 +531,9 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, cols []catalog.Column, i
 	if err != nil {
 		return err
 	}
+	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
+		o.ctx.CTEWriteFence[ptr] = struct{}{}
+	}
 	return o.maintainArbiter(inserted, ptr)
 }
 
@@ -542,6 +568,9 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, o
 	newPtr, err := writeHeapRowReturning(o.ctx, rel, cols, updated)
 	if err != nil {
 		return err
+	}
+	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
+		o.ctx.CTEWriteFence[newPtr] = struct{}{}
 	}
 	return o.maintainArbiter(updated, newPtr)
 }
