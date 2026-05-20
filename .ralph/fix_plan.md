@@ -3037,6 +3037,110 @@ Operational policy (2026-05-20):
         integrity under per-stripe locks (the pad record's xl_prev
         slot is filled by the caller; this foundation only consumes
         the value).
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 4 of N —
+        `insertPosTracker` PG-compat prevRecPtr chain): added
+        `insertPosTracker` to new file `internal/wal/insert_pos.go`.
+        Tracks `(curr, prev)` under a single `sync.Mutex posMu` —
+        mirrors PG's `ReserveXLogInsertLocation` in
+        `postgres/src/backend/access/transam/xlog.c` which advances
+        `XLogCtl->Insert.CurrBytePos` and `Insert->PrevBytePos`
+        under one `insertpos_lck` spinlock. `reserve(size)
+        (start, prev uint64)` returns both fields as a joint
+        snapshot so the caller can stamp `prev` verbatim into the
+        next record's `xl_prev` header field. Segment crossings
+        fire `onCrossSegment(gapStart, boundary, gapPrev)`
+        synchronously under `posMu`: the gap `[gapStart, boundary)`
+        is intended for an XLOG_NOOP pad record (built by
+        [[0107-0007j]] `buildSegmentPadRecord`) and the reservation
+        that triggered the crossing lands at `boundary` with
+        `prev=gapStart` (the pad record's start), so the xl_prev
+        chain remains unbroken across the boundary.
+        Why a mutex instead of CAS: two `atomic.Uint64`s cannot be
+        CAS-updated together, and the joint atomicity of (curr,
+        prev) is *required* for chain correctness — a peer must
+        never observe `curr` past LSN X without `prev` set to the
+        start of the record that reserved X. The alternatives are
+        128-bit CAS (non-portable in Go) or sequencing the prev
+        swap after the curr CAS (race-prone: reservations A and B
+        with starts 100 and 124 could observe each other's prev in
+        either order, producing a chain that violates the
+        `prev < start` invariant). PG faces the identical
+        constraint and picks a spinlock; we follow with
+        `sync.Mutex` for the same reason. Uncontended cost ~10 ns
+        vs ~2 ns for atomic CAS, but at the per-stripe rate
+        (≤ 8 backends ever race here because the 8 stripe locks
+        above this primitive cap concurrency) contention is
+        bounded.
+        Lock-ordering tier for the future call-site rewrite:
+        `appendLockSet.lockByProcNum` (one of 8 stripes) →
+        `insertPosTracker.reserve` (briefly under `posMu`) →
+        (rare, only on crossings) `onCrossSegment` hook → e.g.
+        `buildSegmentPadRecord` + WAL-buffer write. Coexists with
+        [[0107-0007h]] `lsnAllocator`: that primitive is a
+        CAS-fast-path reserve *without* prev tracking, suitable
+        for callers that don't need the xl_prev chain; the WAL
+        append path needs the chain so it consumes
+        `insertPosTracker`. Whether `lsnAllocator` eventually
+        becomes dead-code-removed is an independent decision left
+        to a later loop. Dead code until the slice B call-site
+        rewrite mounts `insertPosTracker` on `Writer`;
+        foundation-first pattern matches slice C ([[0107-0007b]] /
+        [[0107-0007c]] / [[0107-0007d]] all landed before
+        [[0107-0007e]] / [[0107-0007f]] / [[0107-0007g]] consumed
+        them). Nine regression tests in
+        `internal/wal/insert_pos_test.go`:
+        `TestInsertPosTrackerReserveContiguousMonotonic` (10/20/30
+        → starts 0/10/30 and prevs 0/0/10);
+        `TestInsertPosTrackerReserveStartCurrPrev` (non-zero
+        recovery resume — `startCurr=0xDEAD_BEEF00`,
+        `startPrev=0xDEAD_BEEFF0` flow through);
+        `TestInsertPosTrackerCrossSegmentInvokesHook` (single
+        crossing fires hook once with
+        `(gapStart=1000, boundary=1024, gapPrev=990)`; the
+        reservation lands at 1024 with `prev=1000`);
+        `TestInsertPosTrackerReserveAtExactBoundaryNoHook` (off-
+        by-one: a reservation that ends *exactly* at the boundary
+        stays in the fast path — `oldSeg == endSeg` because the
+        last reserved byte is `boundary - 1`);
+        `TestInsertPosTrackerReserveInvalidSizePanics` (size ∈
+        `{0, segSize+1, 2·segSize}` all panic);
+        `TestInsertPosTrackerNewRejectsZeroSegSize` (constructor
+        rejects `segSize=0`);
+        `TestInsertPosTrackerConcurrentReservesFormChain` (32
+        goroutines × 100 × 16-byte reservations in a 1 MiB
+        segment → starts form a contiguous permutation of
+        `{0, 16, …, 51184}`, chain walk from the largest start
+        through prev pointers reaches the root visiting every
+        reservation exactly once, `prev < start` strict-less-than
+        invariant held at every step; rotation hook wired to
+        `t.Errorf` to flag spurious crossings — a 1 MiB segment is
+        far larger than the 51 200-byte workload);
+        `TestInsertPosTrackerConcurrentCrossSegmentHookOncePerBoundary`
+        (16 goroutines race 40-byte reservations across the same
+        256-byte segment starting at `curr=200` — no reservation
+        straddles a boundary, hook fires exactly
+        `(lastSeg − firstSeg)` times);
+        `TestInsertPosTrackerCrossSegmentPrevIsCrossingStart`
+        (three 40-byte reservations against a 100-byte segment
+        force a crossing — the pad record at `[80, 100)` inherits
+        `prev=40` while the reservation triggering the crossing
+        receives `prev=80`, pinning the across-boundary chain
+        linkage);
+        `TestInsertPosTrackerLoadSnapshotConsistent` (reader-vs-
+        writer race confirms `load()` returns
+        `prev + size ≤ curr` for every snapshot — the joint-
+        atomicity invariant from PG's spinlock).
+        Verified: `go test -race -count=1 -run 'TestInsertPosTracker'
+        ./internal/wal/` PASS (1.02 s); `go test -race -count=1
+        ./internal/wal/` PASS (3.13 s). Design:
+        `docs/design/0107-0007k-wal-insert-pos-tracker.md`
+        (indexed in `docs/design/README.md`). Out of scope:
+        mounting `insertPosTracker` on `Writer` + rewriting
+        `Append` to take a stripe lock + reserve here (call-site
+        rewrite, multi-loop scope); splitting `state.appendMu`'s
+        four invariants (writePos / walBuf / memRing / writeLSN);
+        deciding whether `lsnAllocator` becomes dead-code-removed
+        once the call-site converges on `insertPosTracker`.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
