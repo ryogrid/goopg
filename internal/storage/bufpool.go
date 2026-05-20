@@ -930,6 +930,25 @@ func (p *Pool) TryPin(tag BufferTag) (*Slot, bool) {
 	}
 }
 
+// SlotPinCount returns the current pin count for tag's slot, or 0 if
+// tag is not currently mapped. Lock-free; safe for concurrent use.
+//
+// Consumers outside the Pin/Unpin core (e.g. M0107-0007 FSM hot-page
+// avoidance in selectInsertPage) use this helper to avoid inlining
+// slotState bit-mask arithmetic.
+func (p *Pool) SlotPinCount(tag BufferTag) int32 {
+	slotIdx, gen := p.bm.Lookup(tag)
+	if slotIdx < 0 {
+		return 0
+	}
+	s := &p.slots[slotIdx]
+	st := s.state.Load()
+	if !stateValid(st) || stateGen(st) != gen {
+		return 0
+	}
+	return int32(statePin(st))
+}
+
 // Unpin decrements the slot's pin count via CAS.
 func (p *Pool) Unpin(s *Slot) {
 	for {

@@ -2643,6 +2643,50 @@ Operational policy (2026-05-20):
         bufmap. Slice B (WAL insert striping per parent §2) remains
         deferred — splitting `state.appendMu`'s four invariants is
         multi-loop scope.
+      - PARTIAL PROGRESS 2026-05-21 (slice C foundation 3 of 3 —
+        `Pool.SlotPinCount` lock-free pin-count probe): added
+        `Pool.SlotPinCount(tag BufferTag) int32` to
+        `internal/storage/bufpool.go` per the helper spec from
+        `docs/design/perf-optimize/06-bufpool-lockfree.md` §4. The
+        lock-free bufmap that this primitive depends on already
+        landed in M0107-0006 loops 1-3, so the "blocked on
+        M0107-0006" gate from foundation 2's PARTIAL note was a
+        misread of the dependency graph — the only remaining
+        M0107-0006 work is pgbench TPS validation, not the bufmap
+        rewrite itself. Single `bufmap.Lookup` (seqlock-protected)
+        + one `state.Load`; no `pinMu`, no mutation. Returns 0 for
+        unmapped tags, stale-gen snapshots (slot re-used for a
+        different tag between Lookup and Load), and invalid slots
+        (eviction window). The `!stateValid` guard is the cheaper
+        primary catch; the `stateGen != gen` comparison is defence
+        in depth for the (rare) case where a slot has been
+        re-validated for a different tag between our `Lookup` and
+        our `state.Load`. Isolates `slotPinMask`/`slotGenShift`/
+        `slotValidBit` bit-layout behind a method so future
+        slotState reshuffles don't ripple into FSM ranking code.
+        Four regression tests in `internal/storage/storage_test.go`:
+        `TestSlotPinCountUnmappedTag` (never-pinned tag → 0 via
+        early `slotIdx < 0` return); `TestSlotPinCountReflectsPinUnpin`
+        (Pin → 1; second Pin → 2; Unpin → 1; final Unpin → 0 — the
+        slot remains mapped after full unpin so the final assertion
+        exercises the `bm.Lookup → state.Load` path, not the early
+        return); `TestSlotPinCountAfterEviction` (after
+        `InvalidateRel` the mapping is cleared and the probe returns
+        0 via the `slotIdx < 0` path); `TestSlotPinCountIsolatesByTag`
+        (three tags at pin counts 3/1/0, no cross-tag bleed; unpinned
+        but mapped tag returns 0). Verified: `go test -race -count=1
+        -run 'TestSlotPinCount' ./internal/storage/` PASS (1.02 s);
+        `go test -race -count=1 ./internal/storage/` PASS (5.38 s).
+        Design: `docs/design/0107-0007d-pool-slot-pin-count.md`
+        (indexed in `docs/design/README.md`). With all three slice C
+        foundations landed (`FSM.GetCandidates`, `Pool.ExtendRelationBatch`,
+        `Pool.SlotPinCount`), the parent §3 executor consumer
+        (`selectInsertPage` in `internal/executor/operators_storage.go`)
+        is now unblocked — that work will land in its own loop with
+        the PG-compat WAL byte-diff gate from the parent milestone.
+        Slice B (8-stripe `wal.Writer.appendLocks` per parent §2)
+        remains deferred — splitting `state.appendMu`'s four invariants
+        is multi-loop scope.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded

@@ -1471,3 +1471,162 @@ func TestExtendRelationBatchRejectsNonPositiveN(t *testing.T) {
 		t.Errorf("NBlocks after rejected calls = %d, want 0", got)
 	}
 }
+
+
+// TestSlotPinCountUnmappedTag verifies SlotPinCount returns 0 when the
+// tag is not currently mapped (never pinned, or already evicted).
+func TestSlotPinCountUnmappedTag(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 91001, Fork: MainFork}
+
+	// Never-pinned tag: returns 0.
+	tag := BufferTag{Rel: rel, Block: 42}
+	if got := pool.SlotPinCount(tag); got != 0 {
+		t.Errorf("SlotPinCount(unmapped) = %d, want 0", got)
+	}
+}
+
+// TestSlotPinCountReflectsPinUnpin verifies SlotPinCount tracks pin and
+// unpin transitions on a mapped slot.
+func TestSlotPinCountReflectsPinUnpin(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 91002, Fork: MainFork}
+
+	src := make(Page, BlockSize)
+	if err := InitPage(src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, src); err != nil {
+		t.Fatal(err)
+	}
+
+	tag := BufferTag{Rel: rel, Block: 0}
+	s1, err := pool.Pin(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pool.SlotPinCount(tag); got != 1 {
+		t.Errorf("SlotPinCount after 1 Pin = %d, want 1", got)
+	}
+
+	s2, err := pool.Pin(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pool.SlotPinCount(tag); got != 2 {
+		t.Errorf("SlotPinCount after 2 Pins = %d, want 2", got)
+	}
+
+	pool.Unpin(s2)
+	if got := pool.SlotPinCount(tag); got != 1 {
+		t.Errorf("SlotPinCount after 1 Unpin = %d, want 1", got)
+	}
+
+	pool.Unpin(s1)
+	// After full unpin the slot is still mapped (no eviction), but
+	// pin count is 0. SlotPinCount returns 0 as well.
+	if got := pool.SlotPinCount(tag); got != 0 {
+		t.Errorf("SlotPinCount after 2 Unpins = %d, want 0", got)
+	}
+}
+
+// TestSlotPinCountAfterEviction verifies SlotPinCount returns 0 once
+// the tag has been forcibly evicted (mapping cleared by InvalidateRel).
+func TestSlotPinCountAfterEviction(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 91003, Fork: MainFork}
+
+	src := make(Page, BlockSize)
+	if err := InitPage(src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, src); err != nil {
+		t.Fatal(err)
+	}
+
+	tag := BufferTag{Rel: rel, Block: 0}
+	s, err := pool.Pin(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Unpin(s)
+
+	if got := pool.SlotPinCount(tag); got != 0 {
+		t.Errorf("SlotPinCount of unpinned-but-mapped slot = %d, want 0", got)
+	}
+
+	pool.InvalidateRel(rel)
+	if got := pool.SlotPinCount(tag); got != 0 {
+		t.Errorf("SlotPinCount after InvalidateRel = %d, want 0", got)
+	}
+}
+
+// TestSlotPinCountIsolatesByTag verifies SlotPinCount does not bleed
+// pin counts across distinct tags that occupy different slots.
+func TestSlotPinCountIsolatesByTag(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 91004, Fork: MainFork}
+
+	src := make(Page, BlockSize)
+	if err := InitPage(src); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := mgr.Extend(rel, src); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tag0 := BufferTag{Rel: rel, Block: 0}
+	tag1 := BufferTag{Rel: rel, Block: 1}
+	tag2 := BufferTag{Rel: rel, Block: 2}
+
+	s0a, _ := pool.Pin(tag0)
+	s0b, _ := pool.Pin(tag0)
+	s0c, _ := pool.Pin(tag0)
+	s1a, _ := pool.Pin(tag1)
+	// tag2 left unpinned
+
+	if got := pool.SlotPinCount(tag0); got != 3 {
+		t.Errorf("SlotPinCount(tag0) = %d, want 3", got)
+	}
+	if got := pool.SlotPinCount(tag1); got != 1 {
+		t.Errorf("SlotPinCount(tag1) = %d, want 1", got)
+	}
+	if got := pool.SlotPinCount(tag2); got != 0 {
+		t.Errorf("SlotPinCount(tag2 unpinned) = %d, want 0", got)
+	}
+
+	pool.Unpin(s0a)
+	pool.Unpin(s0b)
+	pool.Unpin(s0c)
+	pool.Unpin(s1a)
+}
