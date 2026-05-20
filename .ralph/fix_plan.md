@@ -3117,6 +3117,50 @@ Operational policy (2026-05-20):
         — no further in-scope `stats.Counter` consumers exist absent
         new counter sites created by sibling sub-milestones (e.g.
         bufpool hit/miss from M0107-0006).
+      - PARTIAL PROGRESS 2026-05-21 (loop 15): the per-Go-minor CI
+        matrix item from `08-runtime-internals.md` §8 lands as a
+        local maintenance script + make target (no CI provider
+        adopted — goopg has no `.github/workflows/`; adopting one is
+        an org-wide infra decision outside M0107-0008's scope).
+        `scripts/runtimeshim_go_matrix.sh` discovers Go toolchains in
+        `PATH` — the default `go` plus every `go1.N`-prefixed binary
+        installed via `go install golang.org/dl/go1.N@latest && go1.N
+        download` — and runs `<tc> test -race -count=1
+        ./internal/runtimeshim/...` against each. The output is a
+        PASS / FAIL / NOT-FOUND summary table per toolchain; the
+        exit code is the count of failing toolchains so any future
+        shell-out caller can branch on it directly. Explicit args
+        override discovery (`scripts/runtimeshim_go_matrix.sh
+        go1.24 go` runs only those two). `make
+        runtimeshim-matrix` is the Makefile wrapper, registered in
+        `.PHONY` and documented in `make help`. The maintenance
+        recipe from `08-runtime-internals.md` §8 now reads:
+        `go install golang.org/dl/go1.27@latest && go1.27 download
+        && make runtimeshim-matrix` → if green, bump every
+        `internal/runtimeshim/*_linkname.go` file's build tag from
+        `go1.24 && !go1.27` to `go1.24 && !go1.28` → re-run `make
+        runtimeshim-matrix` to confirm. The script is the unit of
+        work; the project can shell out to it from any future CI
+        runner verbatim. Out of scope: `-tags noLinkname` fallback
+        smoke (the current `*_fallback.go` files use the inverse
+        of the linkname tag, not a hand-written `noLinkname` tag —
+        flipping that to a hand-written tag is a separate intentional
+        refactor decision; the inverse-tag pattern is cleaner today
+        and `-tags noLinkname` only becomes useful once a Go minor
+        is known to need it); per-toolchain pgbench c=10 SO sanity
+        (lives at `analysis/perf-optimize/scripts` layer, not at
+        `make runtimeshim-matrix`; the maintenance recipe invokes it
+        as a separate manual step). Verified:
+        `bash scripts/runtimeshim_go_matrix.sh` on the current host
+        (Go 1.25.0 / Linux/amd64) → 1 toolchain exercised, PASS;
+        `make runtimeshim-matrix` → PASS via the wrapper. Design:
+        `docs/design/0107-0008o-runtimeshim-go-matrix.md` (indexed
+        in `docs/design/README.md`). The parent sub-milestone's
+        "per-Go-minor CI matrix" line item is now closed; the only
+        remaining open item is the bufpool per-slot Sema wait caller,
+        which stays correctly held back until M0107-0006 (lock-free
+        bufpool) lands the per-slot wait coordination site it
+        consumes.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
