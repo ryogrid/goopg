@@ -49,7 +49,7 @@ func TestLockHeapExtendStripesByProcNum(t *testing.T) {
 		procNum := int32(i)
 		go func() {
 			defer wg.Done()
-			unlock := lockHeapExtend(rel, procNum)
+			unlock, _ := lockHeapExtend(rel, procNum)
 			defer unlock()
 			cur := inFlight.Add(1)
 			for {
@@ -86,10 +86,15 @@ func TestLockHeapExtendCollidesOnSameStripe(t *testing.T) {
 	t.Cleanup(func() { heapExtendLocks.Delete(rel) })
 
 	// procNum 0 and procNum 8 both map to stripe 0 (8 & 7 == 0).
-	first := lockHeapExtend(rel, 0)
+	first, contendedFirst := lockHeapExtend(rel, 0)
+	if contendedFirst {
+		t.Fatalf("first acquirer must observe contended == false (got true)")
+	}
+	gotContended := make(chan bool, 1)
 	done := make(chan struct{})
 	go func() {
-		unlock := lockHeapExtend(rel, 8)
+		unlock, contended := lockHeapExtend(rel, 8)
+		gotContended <- contended
 		unlock()
 		close(done)
 	}()
@@ -108,5 +113,8 @@ func TestLockHeapExtendCollidesOnSameStripe(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("second lockHeapExtend never acquired after first released")
+	}
+	if !<-gotContended {
+		t.Errorf("second acquirer must observe contended == true (TryLock failed); got false")
 	}
 }

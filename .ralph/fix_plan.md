@@ -2784,6 +2784,67 @@ Operational policy (2026-05-20):
         lockrows, upsert, merge, apply-worker, partition tests).
         Design: `docs/design/0107-0007f-heap-insert-fsm-pin-aware.md`
         (indexed in `docs/design/README.md`).
+      - PARTIAL PROGRESS 2026-05-21 (slice C call-site rewrite part 2
+        of 2 — adaptive batched-extend tail): closed parent §3 steps
+        5–6 in `internal/executor/operators_storage.go`. New constant
+        `extendBatchSize = 8` and helper
+        `batchExtendAndRegisterFSM(pool, fsm, rel)` in
+        `heap_insert_select.go`: one `Pool.ExtendRelationBatch`
+        ([[0107-0007c]]) call appends eight empty pages in one syscall
+        and FSM-registers blocks `[firstBlk+1 .. firstBlk+7]` at
+        empty-page free space; `firstBlk` is intentionally left out of
+        the FSM — the caller's normal `markHeapInsertDirty →
+        FSM.RecordFreeSpaceForPage` path records the post-insert
+        remainder, matching the existing single-page semantics.
+        `lockHeapExtend(rel, procNum)` signature changed from `unlock`
+        to `(unlock, contended bool)`: `TryLock` first, fall through to
+        blocking `Lock()` on failure with `contended=true`. Both
+        `writeHeapRowReturning` and `writeHeapRowReturningPG` now (a)
+        re-consult the FSM via `selectFSMCandidatePage` after taking
+        the extend lock (cross-stripe pickup of fresh candidates
+        registered by a sibling stripe's just-completed batch), then
+        (b) re-check the tail block, then (c) branch on `contended` —
+        `true` → `batchExtendAndRegisterFSM` + `tryAppendToBlock`;
+        `false` → original `Pool.PinNew` fast path. The adaptive
+        gating preserves the single-INSERT-grows-by-one-page
+        invariants every HOT-update / VACUUM-VM / LockRows /
+        partition-routing test was written against, and mirrors PG's
+        `RelationExtensionLockWaiterCount`-driven `extraBlocks`
+        heuristic in `RelationGetBufferForTuple` (`hio.c`); the
+        TryLock probe is one atomic CAS on the success path, so the
+        uncontended fast path's latency is untouched. Three new tests
+        in `internal/executor/heap_insert_select_test.go`:
+        `TestBatchExtendAndRegisterFSMAppendsAndRegistersExtras`
+        (empty rel → NBlocks=8, FSM-drained set equals `{1..7}`,
+        `firstBlk` not registered);
+        `TestBatchExtendAndRegisterFSMNilFSM` (nil-safety; extension
+        still runs);
+        `TestBatchExtendAndRegisterFSMSecondCallContinuesAndRegisters`
+        (two batches stay disjoint, second `firstBlk=8`,
+        NBlocks=16, FSM accumulates both batches' extras — 14
+        entries, no overlap, neither `firstBlk` leaked).
+        `extend_lock_stripe_test.go`: two new assertions pin the
+        contended/uncontended contract (first acquirer of a stripe
+        observes `false`; a peer who had to wait observes `true`).
+        Verified: `go test -race -count=1 ./internal/executor/` PASS
+        (2.76 s); `go test -race -count=1 ./internal/storage/` PASS
+        (5.37 s); `go test -race -count=1 ./internal/wal/` PASS
+        (3.23 s); `go test -race -count=1 ./internal/server/` PASS
+        (5.83 s). PG-compat: per-record WAL bytes unchanged; only
+        on-disk relation growth diverges in the contended path (8
+        blocks per extend event vs. 1) — empty pre-extended extras
+        that never receive a tuple are never WAL-touched, so PG
+        standby replay only extends to cover blocks referenced by
+        replayed records, identical to PG's own batched-extend
+        recovery model. Design:
+        `docs/design/0107-0007g-heap-insert-batched-extend.md`
+        (indexed in `docs/design/README.md`). Slice C is now
+        FUNCTIONALLY COMPLETE (all six sub-pieces — three foundations
+        + selection helper + call-site parts 1 and 2 — landed).
+        Slice B (8-stripe `wal.Writer.appendLocks` per parent §2)
+        remains the last outstanding piece of M0107-0007 before the
+        pgbench c=100 SU TPS ≥ 500 gate can be evaluated; splitting
+        `state.appendMu`'s four invariants is multi-loop scope.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded

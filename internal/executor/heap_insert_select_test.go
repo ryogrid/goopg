@@ -209,3 +209,154 @@ func TestSelectFSMCandidatePagePicksAmongModeratelyPinned(t *testing.T) {
 		t.Errorf("got %d, want 1 (only pin=1 candidate; all are below hotPinThreshold)", blk)
 	}
 }
+
+
+// newBatchExtendFixture is a thinner variant of newSelectFixture for tests
+// that exercise the extension tail of the heap-insert hot path. The
+// relation is left zero-length so the helper under test owns the very
+// first extension event.
+func newBatchExtendFixture(t *testing.T) (*storage.Manager, *storage.Pool, *storage.FSM, storage.RelFileNode) {
+	t.Helper()
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	t.Cleanup(func() { mgr.Close() })
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pool.Close() })
+	fsm := storage.NewFSM()
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 0xC0FFEE11, Fork: storage.MainFork}
+	return mgr, pool, fsm, rel
+}
+
+// TestBatchExtendAndRegisterFSMAppendsAndRegistersExtras pins the core
+// contract of the batched-extend tail: extendBatchSize pages land on
+// disk in one shot, the first block is returned for the caller's own
+// insert, and the remaining (extendBatchSize-1) blocks are FSM-
+// registered at empty-page free space so the next FSM consultation
+// from a sibling stripe finds them. M0107-0007 slice C part 2.
+func TestBatchExtendAndRegisterFSMAppendsAndRegistersExtras(t *testing.T) {
+	mgr, pool, fsm, rel := newBatchExtendFixture(t)
+
+	first, err := batchExtendAndRegisterFSM(pool, fsm, rel)
+	if err != nil {
+		t.Fatalf("batchExtendAndRegisterFSM: %v", err)
+	}
+	if first != 0 {
+		t.Errorf("firstBlk = %d, want 0 (empty relation)", first)
+	}
+	if got, err := mgr.NBlocks(rel); err != nil || got != storage.BlockNumber(extendBatchSize) {
+		t.Errorf("NBlocks = %d (err=%v), want %d", got, err, extendBatchSize)
+	}
+
+	// Drain the FSM: every block returned by GetPageWithFreeSpace must
+	// be an "extra" (i.e. NOT firstBlk), and the drained set must equal
+	// exactly {firstBlk+1 .. firstBlk+extendBatchSize-1}. Map-iteration
+	// inside GetPageWithFreeSpace is non-deterministic, so we accumulate
+	// the set rather than asserting a specific call's return value.
+	emptyFree := uint16(storage.BlockSize - storage.SizeOfPageHeaderData)
+	seen := make(map[storage.BlockNumber]bool)
+	for {
+		blk, ok := fsm.GetPageWithFreeSpace(rel, emptyFree)
+		if !ok {
+			break
+		}
+		if seen[blk] {
+			t.Fatalf("FSM returned blk=%d twice", blk)
+		}
+		seen[blk] = true
+		// Drain this candidate so the next GetPageWithFreeSpace
+		// returns a different block.
+		fsm.RecordFreeSpace(rel, blk, 0)
+	}
+	// firstBlk must NOT be in the FSM: the caller inserts into it and
+	// records the post-insert free space via the normal
+	// markHeapInsertDirty → FSM.RecordFreeSpaceForPage path. A spurious
+	// pre-registration here would mislead a concurrent inserter into
+	// landing on a page we are actively writing.
+	if seen[first] {
+		t.Errorf("firstBlk=%d must not be FSM-registered (caller owns it)", first)
+	}
+	for blk := storage.BlockNumber(1); blk < storage.BlockNumber(extendBatchSize); blk++ {
+		if !seen[blk] {
+			t.Errorf("extra block %d not FSM-registered", blk)
+		}
+	}
+	if len(seen) != extendBatchSize-1 {
+		t.Errorf("FSM-registered count = %d, want %d", len(seen), extendBatchSize-1)
+	}
+}
+
+// TestBatchExtendAndRegisterFSMNilFSM verifies the helper survives a nil
+// FSM (callers' nil-guard contract): extension still happens, no panic,
+// and no registration side effect.
+func TestBatchExtendAndRegisterFSMNilFSM(t *testing.T) {
+	mgr, pool, _, rel := newBatchExtendFixture(t)
+
+	first, err := batchExtendAndRegisterFSM(pool, nil, rel)
+	if err != nil {
+		t.Fatalf("batchExtendAndRegisterFSM(nil FSM): %v", err)
+	}
+	if first != 0 {
+		t.Errorf("firstBlk = %d, want 0", first)
+	}
+	if got, _ := mgr.NBlocks(rel); got != storage.BlockNumber(extendBatchSize) {
+		t.Errorf("NBlocks = %d, want %d", got, extendBatchSize)
+	}
+}
+
+// TestBatchExtendAndRegisterFSMSecondCallContinuesAndRegisters verifies
+// that successive batch-extend events stay disjoint: the second call
+// hands out blocks [extendBatchSize .. 2*extendBatchSize-1], the second
+// firstBlk is left out of the FSM, and the FSM accumulates both batches'
+// extras (no entries dropped, no entries overlapping).
+func TestBatchExtendAndRegisterFSMSecondCallContinuesAndRegisters(t *testing.T) {
+	mgr, pool, fsm, rel := newBatchExtendFixture(t)
+
+	if _, err := batchExtendAndRegisterFSM(pool, fsm, rel); err != nil {
+		t.Fatalf("first batch: %v", err)
+	}
+	second, err := batchExtendAndRegisterFSM(pool, fsm, rel)
+	if err != nil {
+		t.Fatalf("second batch: %v", err)
+	}
+	if second != storage.BlockNumber(extendBatchSize) {
+		t.Errorf("second firstBlk = %d, want %d", second, extendBatchSize)
+	}
+	if got, _ := mgr.NBlocks(rel); got != storage.BlockNumber(2*extendBatchSize) {
+		t.Errorf("NBlocks after two batches = %d, want %d", got, 2*extendBatchSize)
+	}
+
+	// Both batches' extras (block 1..7 and block 9..15) should be
+	// FSM-registered — 2*(extendBatchSize-1) entries total. Drain to
+	// confirm.
+	emptyFree := uint16(storage.BlockSize - storage.SizeOfPageHeaderData)
+	got := make(map[storage.BlockNumber]bool)
+	for {
+		blk, ok := fsm.GetPageWithFreeSpace(rel, emptyFree)
+		if !ok {
+			break
+		}
+		got[blk] = true
+		fsm.RecordFreeSpace(rel, blk, 0)
+	}
+	want := map[storage.BlockNumber]bool{}
+	for i := storage.BlockNumber(1); i < storage.BlockNumber(extendBatchSize); i++ {
+		want[i] = true
+		want[storage.BlockNumber(extendBatchSize)+i] = true
+	}
+	if len(got) != len(want) {
+		t.Errorf("registered extras count = %d, want %d", len(got), len(want))
+	}
+	for blk := range want {
+		if !got[blk] {
+			t.Errorf("expected extra block %d, not registered", blk)
+		}
+	}
+	for blk := range got {
+		if !want[blk] {
+			t.Errorf("unexpected registered block %d (firstBlk leaked into FSM?)", blk)
+		}
+	}
+}

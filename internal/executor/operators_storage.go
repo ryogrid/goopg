@@ -443,12 +443,26 @@ var heapExtendLocks sync.Map // map[storage.RelFileNode]*heapExtendLockSet
 // chosen by `procNum & 0x7`. Returns the unlock closure. Pass
 // `ctx.ProcNum` from `executor.Context` at call sites; non-backend
 // callers (tests, background workers) may pass 0.
-func lockHeapExtend(rel storage.RelFileNode, procNum int32) func() {
+// lockHeapExtend acquires the per-relation heap-extension lock for the
+// stripe selected by procNum (M0107-0007 slice A — 8-way striped). It
+// returns the unlock callback and a contention flag: contended == true
+// means the lock was already held by another stripe-mate when we
+// arrived (TryLock failed), which the caller uses as the proxy for
+// "extend by extendBatchSize and FSM-register the extras"; contended ==
+// false means the uncontended fast path can keep extending one page at
+// a time. The PG counterpart is the
+// `RelationExtensionLockWaiterCount`-driven `extraBlocks` heuristic in
+// `RelationGetBufferForTuple` — see
+// `docs/design/perf-optimize/07-wal-fsm-insert.md` §3.
+func lockHeapExtend(rel storage.RelFileNode, procNum int32) (release func(), contended bool) {
 	v, _ := heapExtendLocks.LoadOrStore(rel, &heapExtendLockSet{})
 	set := v.(*heapExtendLockSet)
 	mu := &set.locks[uint32(procNum)&(heapExtendLockStripes-1)].mu
+	if mu.TryLock() {
+		return mu.Unlock, false
+	}
 	mu.Lock()
-	return mu.Unlock
+	return mu.Unlock, true
 }
 
 // seqScanOp walks every block of a heap relation, yielding visible
@@ -3132,11 +3146,30 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 
 	// Extend. Serialise relation extension so concurrent writers don't
 	// race on PinNew and corrupt pin accounting for the freshly-grown
-	// tail block under heavy insert workloads.
-	unlock := lockHeapExtend(rel, ctx.ProcNum)
+	// tail block under heavy insert workloads. Striped 8-way by procNum
+	// per M0107-0007 slice A so up to 8 stripes can extend in parallel;
+	// `contended` is set when our TryLock failed, the proxy for "another
+	// stripe-mate is already extending" that gates batched-extend per
+	// M0107-0007 slice C ([[0107-0007g]] §3).
+	unlock, contended := lockHeapExtend(rel, ctx.ProcNum)
 	defer unlock()
 
-	// Re-check after taking the extension lock; another writer may
+	// Re-consult the FSM after taking the extend lock — a concurrent
+	// stripe may have just batch-extended and registered fresh
+	// candidates ([[0107-0007g]] §3 step 5). Picking one of those
+	// extras here is the cross-stripe distribution mechanism: without
+	// it we would extend again and converge on a new tail page.
+	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
+		appended, err := tryAppendToBlock(fsmBlk)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
+		}
+	}
+
+	// Tail-block re-check after taking the lock; another writer may
 	// already have extended and/or inserted into the new tail block.
 	nBlocks, err = ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -3152,6 +3185,36 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		}
 	}
 
+	if contended {
+		// Batch-extend: under contention, append extendBatchSize empty
+		// pages in one syscall and FSM-register the extras so
+		// subsequent inserters spread across them (M0107-0007 slice C
+		// — [[0107-0007g]]). One disk-side syscall covers the burst
+		// instead of one per stripe; the extras prime the cross-stripe
+		// FSM re-check above.
+		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel)
+		if err != nil {
+			return ptr, err
+		}
+		appended, err := tryAppendToBlock(firstBlk)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
+		}
+		// Unreachable: ExtendRelationBatch pre-inits every page with
+		// max free space, so PageAddHeapTuple cannot return
+		// ErrNoSpaceInPage on the first insert. A non-nil err would
+		// have been returned by tryAppendToBlock above.
+		return ptr, &ExecError{Code: "XX000", Message: "freshly batch-extended page did not accept tuple"}
+	}
+
+	// Uncontended single-extender path: PinNew avoids the post-extend
+	// disk read of the batched primitive (the slot is pinned + dirty
+	// in-memory before we ever touch the disk for content) and adds
+	// only one page, matching the test-fixture invariant that a single
+	// INSERT into a fresh relation grows it by exactly one page.
 	slot, blk, err := ctx.Pool.PinNew(rel)
 	if err != nil {
 		return ptr, err
@@ -3296,8 +3359,22 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		}
 	}
 
-	unlock := lockHeapExtend(rel, ctx.ProcNum)
+	// Striped extend lock (M0107-0007 slice A) + cross-stripe FSM
+	// re-check + adaptive single-vs-batched extend tail, mirroring the
+	// canonical writeHeapRowReturning above. See [[0107-0007g]] for the
+	// rationale.
+	unlock, contended := lockHeapExtend(rel, ctx.ProcNum)
 	defer unlock()
+
+	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
+		appended, err := tryAppendToBlock(fsmBlk)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
+		}
+	}
 
 	nBlocks, err = ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -3311,6 +3388,21 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		if appended {
 			return ptr, nil
 		}
+	}
+
+	if contended {
+		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel)
+		if err != nil {
+			return ptr, err
+		}
+		appended, err := tryAppendToBlock(firstBlk)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
+		}
+		return ptr, &ExecError{Code: "XX000", Message: "freshly batch-extended page did not accept tuple"}
 	}
 
 	slot, blk, err := ctx.Pool.PinNew(rel)
