@@ -11,19 +11,48 @@ const (
 	bufmapTombstone uint64 = 1
 )
 
+// bufmapBucket is one slot of the open-addressing hash table. Every
+// field is mutated only via atomic operations so concurrent lock-free
+// Lookups never observe a torn key or val.
+//
+// Layout encoding for key:
+//
+//	key0 = uint64(DBOid)<<32 | uint64(RelOid)
+//	key1 = uint64(Block)<<32 | uint64(uint8(Fork))
+//
+// val:
+//
+//	0  = empty   (sentinel; treat as "not present, terminate probe")
+//	1  = tombstone (sentinel; continue probing past)
+//	>1 = packVal(slotIdx, gen) = ((slotIdx+1)<<32) | gen
+//	    — biased by +1 so the live range never collides with sentinels.
+type bufmapBucket struct {
+	key0 atomic.Uint64
+	key1 atomic.Uint64
+	val  atomic.Uint64
+}
+
+// bufmapInner is the backing store of a bufmap. Insert/Delete mutate
+// individual buckets in place under bufmap.mu; compact() never mutates
+// an inner that is concurrently visible to readers — it builds a fresh
+// inner and publishes it via bufmap.inner.Store, so each Lookup observes
+// a single, self-consistent snapshot.
+type bufmapInner struct {
+	mask    uint64
+	buckets []bufmapBucket // len == mask+1
+}
+
 // bufmap is an open-addressing hash table mapping BufferTag to a packed
 // (slotIdx<<32 | gen) value.
 //
-// Lookup is lock-free (only atomic loads). Insert and Delete take mu
-// (write operations that touch both keys[] and vals[] must be serialized
-// to prevent partial-write races on the 16-byte BufferTag key).
+// Lookup is lock-free (atomic loads only). Insert and Delete take mu
+// (release-ordered with readers via the atomic store on val).
 //
-// The table size is always a power of two at load factor ≤ 50%.
+// compact() replaces the entire inner atomically so that no concurrent
+// reader observes a partially-rewritten bucket array.
 type bufmap struct {
-	mu   sync.Mutex
-	mask uint64
-	keys []BufferTag // len == size
-	vals []uint64    // len == size; 0=empty, 1=tombstone, else (slotIdx<<32)|gen
+	mu    sync.Mutex
+	inner atomic.Pointer[bufmapInner]
 }
 
 // newBufmap constructs a table sized for nSlots active entries at ≤50%
@@ -33,11 +62,12 @@ func newBufmap(nSlots int) *bufmap {
 	for size < uint64(nSlots)*2 {
 		size <<= 1
 	}
-	return &bufmap{
-		mask: size - 1,
-		keys: make([]BufferTag, size),
-		vals: make([]uint64, size),
-	}
+	bm := &bufmap{}
+	bm.inner.Store(&bufmapInner{
+		mask:    size - 1,
+		buckets: make([]bufmapBucket, size),
+	})
+	return bm
 }
 
 // bufTagHash computes a 64-bit hash for t, mixing every byte of BufferTag
@@ -70,39 +100,61 @@ func unpackVal(v uint64) (int32, uint32) {
 	return int32(v>>32) - 1, uint32(v)
 }
 
+// packKey encodes a BufferTag into the (key0, key1) pair stored in a
+// bufmapBucket. The encoding is unique per tag.
+func packKey(t BufferTag) (uint64, uint64) {
+	key0 := uint64(t.Rel.DBOid) | uint64(t.Rel.RelOid)<<32
+	// Fork is int8; cast through uint8 to avoid sign extension into the
+	// upper bits of key1.
+	key1 := uint64(t.Block)<<32 | uint64(uint8(t.Rel.Fork))
+	return key0, key1
+}
+
 // Lookup returns (slotIdx, gen) for tag, or (-1, 0) if absent. Lock-free.
 // Tombstones do NOT terminate probing; only true-empty buckets do.
 //
 // Note: Insert uses plain linear probing (no Robin-Hood displacement), so
 // Lookup cannot use the Robin-Hood "dist > residentDist" early-exit
 // optimisation here — that would only be correct if Insert also reordered
-// entries by probe distance.  We rely on the empty-bucket terminator plus
+// entries by probe distance. We rely on the empty-bucket terminator plus
 // the table-size safety bound.
+//
+// Each bucket is read with a seqlock-style snapshot: load val, load key0
+// and key1, then re-load val. If val is unchanged across the read, the
+// snapshot is self-consistent (no Insert/Delete tore the key mid-read).
+// If val changed, retry the same bucket.
 func (m *bufmap) Lookup(tag BufferTag) (int32, uint32) {
-	h := bufTagHash(tag) & m.mask
+	in := m.inner.Load()
+	wantKey0, wantKey1 := packKey(tag)
+	h := bufTagHash(tag) & in.mask
+	size := in.mask + 1
 	dist := uint64(0)
 	// Safety bound: probe at most table_size times before giving up.
 	// Prevents infinite loops if the table is fully occupied by
-	// tombstones or under concurrent insert/compact races.
-	size := m.mask + 1
+	// tombstones under concurrent insert/compact races.
 	for dist <= size {
-		v := atomic.LoadUint64(&m.vals[h])
+		b := &in.buckets[h]
+		// Seqlock snapshot of (val, key0, key1).
+		v1 := b.val.Load()
 		switch {
-		case v == bufmapEmpty:
-			// True empty bucket: tag is not present.
+		case v1 == bufmapEmpty:
 			return -1, 0
-		case v == bufmapTombstone:
-			// Tombstone: continue probing (entry may be beyond).
-			h = (h + 1) & m.mask
+		case v1 == bufmapTombstone:
+			h = (h + 1) & in.mask
 			dist++
 			continue
 		}
-		// Live entry. Under Go's memory model, the atomic load on vals[h]
-		// observing a live value implies seeing the prior keys[h] write.
-		if m.keys[h] == tag {
-			return unpackVal(v)
+		k0 := b.key0.Load()
+		k1 := b.key1.Load()
+		v2 := b.val.Load()
+		if v1 != v2 {
+			// Bucket mutated mid-read — retry the same slot.
+			continue
 		}
-		h = (h + 1) & m.mask
+		if k0 == wantKey0 && k1 == wantKey1 {
+			return unpackVal(v1)
+		}
+		h = (h + 1) & in.mask
 		dist++
 	}
 	return -1, 0
@@ -113,24 +165,38 @@ func (m *bufmap) Lookup(tag BufferTag) (int32, uint32) {
 // Lookup first (lock-free) to avoid unnecessary lock acquisition.
 func (m *bufmap) Insert(tag BufferTag, slotIdx int32, gen uint32) bool {
 	val := packVal(slotIdx, gen)
+	wantKey0, wantKey1 := packKey(tag)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	h := bufTagHash(tag) & m.mask
-	size := m.mask + 1
+	in := m.inner.Load()
+	h := bufTagHash(tag) & in.mask
+	size := in.mask + 1
 	for i := uint64(0); i < size; i++ {
-		v := m.vals[h]
+		b := &in.buckets[h]
+		v := b.val.Load()
 		switch {
 		case v == bufmapEmpty || v == bufmapTombstone:
-			m.keys[h] = tag
-			// Atomic store so concurrent lock-free Lookups see the
-			// key before the live value (release semantics).
-			atomic.StoreUint64(&m.vals[h], val)
+			// Park val at tombstone first (we already aren't "empty
+			// terminator" to readers, since v was empty/tombstone — but
+			// we want to be explicit about the protocol). Writing keys
+			// while val is tombstone is safe because Lookup skips
+			// tombstone buckets without reading keys.
+			b.val.Store(bufmapTombstone)
+			b.key0.Store(wantKey0)
+			b.key1.Store(wantKey1)
+			// Release-store the live val. Concurrent readers that
+			// observe `live` will retry their snapshot if they raced
+			// the key write, and on the retry will see val == live
+			// alongside the new keys.
+			b.val.Store(val)
 			return true
 		default:
-			if m.keys[h] == tag {
+			k0 := b.key0.Load()
+			k1 := b.key1.Load()
+			if k0 == wantKey0 && k1 == wantKey1 {
 				return false // already present
 			}
-			h = (h + 1) & m.mask
+			h = (h + 1) & in.mask
 		}
 	}
 	// Table full — should not happen at ≤50% load.
@@ -139,59 +205,86 @@ func (m *bufmap) Insert(tag BufferTag, slotIdx int32, gen uint32) bool {
 
 // Delete marks the entry for (tag, slotIdx) as tombstone under mu.
 func (m *bufmap) Delete(tag BufferTag, slotIdx int32) {
+	wantKey0, wantKey1 := packKey(tag)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	h := bufTagHash(tag) & m.mask
-	size := m.mask + 1
+	in := m.inner.Load()
+	h := bufTagHash(tag) & in.mask
+	size := in.mask + 1
 	for i := uint64(0); i < size; i++ {
-		v := m.vals[h]
+		b := &in.buckets[h]
+		v := b.val.Load()
 		switch {
 		case v == bufmapEmpty:
 			return // not present
 		case v == bufmapTombstone:
-			h = (h + 1) & m.mask
+			h = (h + 1) & in.mask
 			continue
 		}
 		existingSlotIdx, _ := unpackVal(v)
-		if m.keys[h] == tag && existingSlotIdx == slotIdx {
-			atomic.StoreUint64(&m.vals[h], bufmapTombstone)
+		k0 := b.key0.Load()
+		k1 := b.key1.Load()
+		if k0 == wantKey0 && k1 == wantKey1 && existingSlotIdx == slotIdx {
+			b.val.Store(bufmapTombstone)
 			return
 		}
-		h = (h + 1) & m.mask
+		h = (h + 1) & in.mask
 	}
 }
 
-// compact rebuilds the table in place eliminating all tombstones.
-// Called under compactMu (cold path, rare). Takes mu internally.
+// compact builds a fresh inner with all tombstones eliminated and
+// atomically publishes it. The old inner remains live (immutable from
+// now on) until in-flight lock-free Lookups release their references
+// and the GC reclaims it.
+//
+// Concurrent Insert/Delete are blocked by mu. Concurrent Lookups on the
+// old inner are safe because (a) compact only reads the old inner via
+// atomic loads, never mutates it, and (b) the inner pointer swap
+// publishes the new inner atomically, so a Lookup observes one
+// self-consistent snapshot.
 func (m *bufmap) compact() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	size := m.mask + 1
-	// Build a clean copy.
-	newKeys := make([]BufferTag, size)
-	newVals := make([]uint64, size)
-
+	cur := m.inner.Load()
+	size := cur.mask + 1
+	newInner := &bufmapInner{
+		mask:    cur.mask,
+		buckets: make([]bufmapBucket, size),
+	}
 	for i := uint64(0); i < size; i++ {
-		v := m.vals[i]
+		b := &cur.buckets[i]
+		v := b.val.Load()
 		if v == bufmapEmpty || v == bufmapTombstone {
 			continue
 		}
-		tag := m.keys[i]
-		// Re-insert into new table.
-		h := bufTagHash(tag) & m.mask
+		k0 := b.key0.Load()
+		k1 := b.key1.Load()
+		// Re-derive the hash from the unpacked tag bits.
+		tag := unpackKey(k0, k1)
+		h := bufTagHash(tag) & cur.mask
 		for {
-			if newVals[h] == bufmapEmpty {
-				newKeys[h] = tag
-				newVals[h] = v
+			nb := &newInner.buckets[h]
+			if nb.val.Load() == bufmapEmpty {
+				nb.key0.Store(k0)
+				nb.key1.Store(k1)
+				nb.val.Store(v)
 				break
 			}
-			h = (h + 1) & m.mask
+			h = (h + 1) & cur.mask
 		}
 	}
+	m.inner.Store(newInner)
+}
 
-	// Overwrite in place with atomic stores (allow readers to transition).
-	for i := uint64(0); i < size; i++ {
-		m.keys[i] = newKeys[i]
-		atomic.StoreUint64(&m.vals[i], newVals[i])
+// unpackKey reverses packKey. Used by compact() to re-hash live entries
+// into the new inner.
+func unpackKey(k0, k1 uint64) BufferTag {
+	return BufferTag{
+		Rel: RelFileNode{
+			DBOid:  uint32(k0),
+			RelOid: uint32(k0 >> 32),
+			Fork:   ForkNumber(int8(uint8(k1))),
+		},
+		Block: BlockNumber(k1 >> 32),
 	}
 }

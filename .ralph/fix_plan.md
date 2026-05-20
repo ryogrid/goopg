@@ -2435,9 +2435,32 @@ Operational policy (2026-05-20):
         `go test -race ./internal/mvcc/ ./internal/wal/
         ./internal/executor/ ./internal/access/btree/` PASS.
         Design: `docs/design/0107-0006-bufpool-bufmap-correctness.md`.
-        Action: run the 1 000-goroutine Pin/Unpin/evict stress, validate
-        the pgbench TPS / runtime.futex / mutex-top-20 gates, and
-        `TestE2E_FailoverGoopgToPG/async` in subsequent loops.
+      - PARTIAL PROGRESS 2026-05-21 (loop 2): added the missing
+        1 000-goroutine `TestPoolHighConcurrencyPinUnpinStress`
+        (`internal/storage/bufpool_stress_test.go`; env-var-tunable via
+        `GOOPG_BUFPOOL_STRESS_GOROUTINES` / `GOOPG_BUFPOOL_STRESS_SECONDS`).
+        The new test caught two real data races the loop-1 bufmap had not
+        addressed: (a) `compact()` rewriting `keys[i]` non-atomically
+        while concurrent lock-free `Lookup` reads the same memory; (b)
+        ABA on `Insert(tombstone → live₂)` racing a `Lookup` that read
+        `keys[h]` after observing the previous `live₁`. Fix: full
+        rewrite of `bufmap.go` around `bufmapBucket{key0, key1, val
+        atomic.Uint64}` with `inner atomic.Pointer[bufmapInner]` swap
+        on compact and seqlock-style Lookup (re-load val after key
+        reads to detect torn snapshots). `Insert` parks val at
+        tombstone before rewriting keys. `go test -race
+        ./internal/storage/` PASS (3.4 s);
+        `GOOPG_BUFPOOL_STRESS_GOROUTINES=1000
+        GOOPG_BUFPOOL_STRESS_SECONDS=5 go test -race
+        -run TestPoolHighConcurrencyPinUnpinStress
+        ./internal/storage/` PASS;
+        `go test -race ./internal/mvcc/ ./internal/wal/
+        ./internal/access/btree/` PASS. Design:
+        `docs/design/0107-0006-bufmap-keys-atomic.md`.
+        Action: validate pgbench c=100 SU TPS ≥ 500, runtime.futex
+        cum% < 8% at c=100 SO, `bufferPartition.mu` absence from
+        mutex top-20, and `TestE2E_FailoverGoopgToPG/async` PASS in
+        subsequent loops.
 
  - [ ] **M0107-0007 — Phase D4: WAL insert striping + FSM page distribution**
       - Summary: Replace single `wal.Writer.appendMu` lock + tail-page-targeting
