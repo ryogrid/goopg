@@ -2272,8 +2272,18 @@ Operational policy (2026-05-20):
         ExprAdapter fallback for all other kinds (correctness preserved). 10 new
         regression tests. All executor/server/planner/parser/mvcc/storage tests
         PASS -race. Design doc updated.
-      - Remaining: PlanNode/ExprNode sum-types (PlanNode + parser mctx pieces).
-        TPS and gcBgMarkWorker gates require perf run after all hot-path ops migrated.
+      - **Loop-15 Parser mctx migration (2026-05-20)**: `parserPool` deleted;
+        `Parse()`/`ParseExpr()` accept optional `*mctx.Context` (variadic, backward-compat);
+        hot path in `dispatch.go` creates ephemeral `mctx.KindExpr` parseCtx from
+        `connTx.SessCtx` before calling `parser.Parse()`, passes it, releases immediately.
+        Token backing allocated via `mctx.AllocSlice[Token](mc, 64)[:0]` on hot path
+        (single bump-pointer op, no GC heap object). Pool fallback retained for tests
+        and non-dispatch callers (nil mc). `TestParseMctxPath` + `TestParseExprMctxPath`
+        pin the behavior. Design doc `0107-0003-phase-c1-opnode-concrete-executor.md` updated.
+        `go test -race ./internal/parser/ ./internal/server/ ./internal/executor/
+        ./internal/planner/ ./internal/analyzer/ ./internal/plpgsql/` PASS.
+      - Remaining: PlanNode sum-type. TPS and gcBgMarkWorker gates require perf run
+        after all hot-path ops and plan-tree allocation migrated.
 
  - [ ] **M0107-0004 — Phase D1: ProcArray + atomic XidGen + CLOG bank locks**
       - Summary: Replace `mvcc.Manager.mu` (gates Begin/SnapshotFor/Commit/

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	"github.com/goopg/goopg/internal/mctx"
 )
 
 // tokenSlicePool recycles []Token backing arrays between calls to Parse.
@@ -17,11 +19,6 @@ var tokenSlicePool = sync.Pool{
 	},
 }
 
-// parserPool recycles the 32-byte parser struct (tokens slice header + idx).
-// M0098-0006.
-var parserPool = sync.Pool{
-	New: func() any { return &parser{} },
-}
 
 // SyntaxError is the parser's structured error. Message mirrors
 // upstream's `syntax error at or near "TOKEN"` shape so psql users
@@ -46,30 +43,53 @@ func (e *SyntaxError) Error() string {
 // bodies. Trailing tokens after the expression surface a syntax
 // error so a caller passing `1 + 2; garbage` gets a clean
 // diagnostic.
-func ParseExpr(input string) (Expr, error) {
-	// Use pooled token slice to avoid per-call allocation. M0098-0006.
-	sp := tokenSlicePool.Get().(*[]Token)
-	toks, err := lexInto((*sp)[:0], input)
-	if err != nil {
+// ParseExpr parses a single SQL expression and returns its AST.
+// Used by the PL/pgSQL body parser (M0015 Stage A step 4) to
+// translate RETURN / assignment / IF-condition expressions into
+// the same AST nodes a SELECT target list would produce — keeps
+// the type-checker / planner / executor reusable for routine
+// bodies. Trailing tokens after the expression surface a syntax
+// error so a caller passing `1 + 2; garbage` gets a clean
+// diagnostic.
+//
+// mc follows the same contract as Parse (M0107-0003 Phase C.3).
+func ParseExpr(input string, mc ...*mctx.Context) (Expr, error) {
+	var sctx *mctx.Context
+	if len(mc) > 0 {
+		sctx = mc[0]
+	}
+
+	var toks []Token
+	var sp *[]Token
+	var err error
+	if sctx != nil {
+		toks, err = lexInto(mctx.AllocSlice[Token](sctx, 64)[:0], input)
+	} else {
+		sp = tokenSlicePool.Get().(*[]Token)
+		toks, err = lexInto((*sp)[:0], input)
 		*sp = toks
-		tokenSlicePool.Put(sp)
+	}
+	if err != nil {
+		if sp != nil {
+			tokenSlicePool.Put(sp)
+		}
 		return nil, err
 	}
-	*sp = toks
 
-	p := parserPool.Get().(*parser)
+	// parser struct is 32 bytes; stack allocation is free. M0107-0003.
+	var p parser
 	p.tokens = toks
 	p.idx = 0
 
 	expr, err := p.parseExpr()
-	// Check trailing tokens BEFORE returning p to pool.
+	// Check trailing tokens BEFORE returning to pool.
 	var trailingErr error
 	if err == nil && p.cur().Kind != TokenEOF {
 		trailingErr = p.errAtCur("unexpected trailing tokens after expression")
 	}
-	p.tokens = nil
-	parserPool.Put(p)
-	tokenSlicePool.Put(sp)
+	if sp != nil {
+		tokenSlicePool.Put(sp)
+	}
 
 	if err != nil {
 		return nil, err
@@ -80,21 +100,43 @@ func ParseExpr(input string) (Expr, error) {
 	return expr, nil
 }
 
-func Parse(input string) ([]Stmt, error) {
-	// Use pooled token slice to eliminate per-call []Token allocation.
-	// The token slice backing array is reused across calls; its lifetime
-	// ends when Parse returns (callers receive []Stmt, not []Token).
-	// M0098-0006.
-	sp := tokenSlicePool.Get().(*[]Token)
-	toks, err := lexInto((*sp)[:0], input)
-	if err != nil {
+// Parse splits input on statement boundaries and returns one Stmt per
+// non-empty statement. A trailing semicolon is allowed; an empty input
+// returns an empty slice and no error.
+//
+// mc is an optional mctx.Context for token-backing allocation (M0107-0003
+// Phase C.3). When provided, the token slice is allocated from mc's arena
+// and bulk-freed via mc.Release() without touching the GC heap.
+// When nil, the global tokenSlicePool is used (backward-compatible path
+// for tests and callers without a statement context).
+func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
+	var sctx *mctx.Context
+	if len(mc) > 0 {
+		sctx = mc[0]
+	}
+
+	var toks []Token
+	var sp *[]Token
+	var err error
+	if sctx != nil {
+		// M0107-0003 Phase C.3: allocate token backing from mctx arena.
+		// AllocSlice returns a slice of length 64; [:0] resets length while
+		// keeping the arena-backed capacity so lexInto appends in place.
+		toks, err = lexInto(mctx.AllocSlice[Token](sctx, 64)[:0], input)
+	} else {
+		sp = tokenSlicePool.Get().(*[]Token)
+		toks, err = lexInto((*sp)[:0], input)
 		*sp = toks
-		tokenSlicePool.Put(sp)
+	}
+	if err != nil {
+		if sp != nil {
+			tokenSlicePool.Put(sp)
+		}
 		return nil, err
 	}
-	*sp = toks
 
-	p := parserPool.Get().(*parser)
+	// parser struct is 32 bytes; stack allocation is free. M0107-0003.
+	var p parser
 	p.tokens = toks
 	p.idx = 0
 
@@ -107,9 +149,9 @@ func Parse(input string) ([]Stmt, error) {
 		}
 		stmt, err := p.parseStatement()
 		if err != nil {
-			p.tokens = nil
-			parserPool.Put(p)
-			tokenSlicePool.Put(sp)
+			if sp != nil {
+				tokenSlicePool.Put(sp)
+			}
 			return nil, err
 		}
 		out = append(out, stmt)
@@ -121,15 +163,15 @@ func Parse(input string) ([]Stmt, error) {
 		}
 		if p.cur().Kind != TokenEOF {
 			err := p.errAtCur("expected ';' or end of input")
-			p.tokens = nil
-			parserPool.Put(p)
-			tokenSlicePool.Put(sp)
+			if sp != nil {
+				tokenSlicePool.Put(sp)
+			}
 			return nil, err
 		}
 	}
-	p.tokens = nil // clear reference before returning to pool
-	parserPool.Put(p)
-	tokenSlicePool.Put(sp)
+	if sp != nil {
+		tokenSlicePool.Put(sp)
+	}
 	return out, nil
 }
 

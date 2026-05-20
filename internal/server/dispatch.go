@@ -85,7 +85,17 @@ func maybeForceGCAfterCommit() {
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
 func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string, connTx *connTxState, prepStmts *preparedStatements) error {
-	stmts, err := parser.Parse(sql)
+	// M0107-0003 Phase C.3: allocate token backing from an ephemeral mctx
+	// child to avoid sync.Pool overhead on the hot parse path.
+	var parseCtx *mctx.Context
+	if connTx != nil && connTx.SessCtx != nil {
+		parseCtx = mctx.Acquire(connTx.SessCtx, mctx.KindExpr)
+	}
+	stmts, err := parser.Parse(sql, parseCtx)
+	if parseCtx != nil {
+		parseCtx.Release() // tokens only needed during parsing
+		parseCtx = nil
+	}
 	if err != nil {
 		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
 		// here (the parser doesn't recognise them yet) so we can

@@ -246,3 +246,33 @@ The dispatch loop is unchanged; `*OpIterator` implements `Operator` and
   buildRec Filter/Project cases compile expressions; RunFast passes tree.exprs
 - `internal/executor/phase_c_test.go` (modified) — TestBuildExprSlabCommonKinds,
   TestEvalFastExprCommonKinds, TestRunFastFilterExprNodePopulated
+
+### Phase C.3 (loop 15) — Parser mctx migration
+
+**Problem**: `internal/parser/parser.go` held two global `sync.Pool` objects:
+- `tokenSlicePool` — recycles `[]Token` backing arrays (~64 tokens × 40 B/token per call)
+- `parserPool` — recycles the 32-byte `parser` struct
+
+Each call to `Parse()` or `ParseExpr()` incurred two `sync.Pool.Get()` + `Put()` round-trips
+(~40–80 ns on contended paths). The `parser` struct is 32 bytes and perfectly allocatable on
+the stack; pooling it adds overhead without meaningful benefit.
+
+**Change**:
+1. `parserPool` deleted. `Parse()` and `ParseExpr()` now use `var p parser` (stack allocation).
+2. `Parse()` and `ParseExpr()` accept an optional `*mctx.Context` parameter (variadic, backward-
+   compatible). When non-nil, token backing is allocated from the arena via
+   `mctx.AllocSlice[Token](mc, 64)[:0]` — a single bump-pointer operation, no GC-heap object
+   created, freed in bulk when `mc.Release()` fires.
+3. When `mc` is nil (all existing test callers and plpgsql), the `tokenSlicePool` pool path
+   is used unchanged (no regression for non-hot callers).
+4. `internal/server/dispatch.go::dispatchSimpleQueryViaExecutor` creates an ephemeral
+   `mctx.KindExpr` child of `connTx.SessCtx` before calling `parser.Parse()`, passes it,
+   and releases it immediately after parsing completes (tokens are only needed during parsing).
+
+**Files changed**:
+- `internal/parser/parser.go` — `parserPool` deleted; `Parse`/`ParseExpr` signatures widened
+  with variadic `mc ...*mctx.Context`; mctx allocation path added.
+- `internal/server/dispatch.go` — parseCtx created from `connTx.SessCtx` before Parse call;
+  released immediately after.
+- `internal/parser/mctx_parse_test.go` (new) — `TestParseMctxPath` and
+  `TestParseExprMctxPath` verify mctx and pool paths produce equivalent ASTs.
