@@ -2593,6 +2593,71 @@ Operational policy (2026-05-20):
           `runtimeshim.Nanotime` (requires a monotonic→wall conversion
           layer in `Snapshot()` — separate design decision);
           per-Go-minor CI matrix.
+      - PARTIAL PROGRESS 2026-05-21 (loop 3): added the third shim,
+        `SemaAcquire(*uint32)` / `SemaRelease(*uint32)`, completing the
+        three-primitive trio specified by the parent chapter §5.
+        - `internal/runtimeshim/sema_linkname.go` (build tag
+          `go1.24 && !go1.27`) binds `runtime_Semacquire →
+          sync.runtime_Semacquire` and `runtime_Semrelease →
+          sync.runtime_Semrelease`. The linkname targets are the
+          `sync`-package-internal aliases (not the runtime-internal
+          `runtime.semacquire` / `semrelease` names) because the
+          `sync.runtime_*` symbols are the de-facto stable external
+          API that `sync.Mutex`, `sync.WaitGroup`, `sync.Cond`,
+          `sync.Once` etc. depend on, and have therefore tracked the
+          runtime's internal renames across Go versions without
+          breaking those callers.
+        - `SemaRelease` calls the underlying primitive with
+          `handoff=false, skipframes=0`. Non-handoff matches
+          `sync.Mutex.Unlock`'s call site and is the right default for
+          the bufpool's per-slot "I/O finished; any pending Pin caller
+          may proceed" wake pattern, where every waiter is equally
+          eligible to take ownership of the freed unit. Handoff mode
+          would force the released unit to a specific waiter — wrong
+          semantics for buffer-slot wakeups and additional overhead
+          besides.
+        - `internal/runtimeshim/sema_fallback.go` (inverse tag) uses a
+          global `sync.Mutex` plus a lazily-populated
+          `map[*uint32]*sync.Cond`. Correct (canonical
+          "block-while-zero, decrement-on-positive, signal-on-release"
+          semantics preserved) but contention-bound across all cells.
+          Map grows monotonically because the linkname path's
+          address-keyed wait list has no destruction hook either; we
+          keep the externally-observable contract identical.
+        - Pin/Sema relationship documented in the design doc and at
+          the call site: `SemaAcquire` may park the calling goroutine
+          and is therefore NOT safe inside a `PinP`/`UnpinP` window
+          (a parked pinned goroutine stalls the runtime's preemption
+          logic and breaks the `m.locks > 0` invariant).
+        - `sema_test.go` — four contract-anchored tests:
+          (a) `TestSema_PreReleasedAcquireReturns` confirms a positive
+          cell decrements without blocking;
+          (b) `TestSema_BlocksUntilRelease` confirms acquire-on-zero
+          parks and a subsequent Release on the same cell wakes
+          exactly one waiter;
+          (c) `TestSema_BalancedManyProducersConsumers` runs 8
+          producers × 4 K Releases and 8 consumers × (totalOps/8)
+          Acquires, asserts every Acquire pairs with exactly one
+          Release and final `*s == 0`;
+          (d) `TestSema_DistinctCellsIndependent` confirms Releases on
+          cell B never wake an Acquire parked on cell A (per-cell
+          wait queues are address-keyed — critical for the bufpool's
+          per-slot wait model).
+        - `BenchmarkSemaAcquireRelease-16 215598763 5.601 ns/op` on
+          Linux/amd64 Go 1.25 (cell stays positive throughout the
+          loop; no goroutine park). Full suite PASS under `-race`
+          (1.22 s).
+        - Caller wiring (bufpool per-slot wait coordination per
+          [[06-bufpool-lockfree]]) deliberately NOT in this loop;
+          lands separately so the shim's contract is validated
+          standalone.
+        - Design: `docs/design/0107-0008c-runtimeshim-sema.md`
+          (indexed in `docs/design/README.md`).
+        - Remaining work for this sub-milestone: per-P xid cache
+          caller (mvcc/xidgen.go); activity-registry rewrite to
+          consume `runtimeshim.Nanotime` (requires monotonic→wall
+          conversion in `Snapshot()`); bufpool per-slot Sema wait
+          caller; per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
