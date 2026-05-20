@@ -666,7 +666,12 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			if o.scanRow == nil || len(o.scanRow) != len(o.cols) {
 				o.scanRow = acquireRow(len(o.cols))
 			}
-			if err := DecodeRowIntoMctx(o.scanRow, o.cols, tuple.Data, o.sctx); err != nil {
+			// Use bitmap + natts to correctly decode rows that have NULL
+			// columns or were stored before ALTER TABLE ADD COLUMN expanded
+			// the schema. HeapNattsMask = 0x07FF; storedNatts==0 means natts
+			// was not explicitly set (legacy goopg rows without PG format).
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			if err := DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, tuple.Data, tuple.Bitmap, storedNatts, o.sctx); err != nil {
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}
@@ -1566,10 +1571,13 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				return true, nil
 			}
 		}
-		row, err := DecodeRow(cols, tuple.Data)
-		if err != nil {
-			return false, err
+		var decRow Row
+		decRow, err = make(Row, len(cols)), nil
+		decNatts := int(tuple.Header.Infomask2 & 0x07FF)
+		if decErr := DecodeRowIntoMctxPGTuple(decRow, cols, tuple.Data, tuple.Bitmap, decNatts, nil); decErr != nil {
+			return false, decErr
 		}
+		row := decRow
 
 		// Build new row from SET expressions.
 		newRow := make(Row, len(cols))
@@ -2445,10 +2453,9 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			// xmin (visible writer) and xmax (concurrent overwriter
 			// hidden by snapshot).
 			ssiRecordTupleRead(ctx, rel, blk, slot, tuple.Header.Xmin, tuple.Header.Xmax)
-			if err := DecodeRowInto(scanRow, cols, tuple.Data); err != nil {
-				s.RUnlock()
-				ctx.Pool.Unpin(s)
-				return err
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			if err := DecodeRowIntoMctxPGTuple(scanRow, cols, tuple.Data, tuple.Bitmap, storedNatts, nil); err != nil {
+				continue // skip undecodable tuples (e.g. schema mismatch)
 			}
 			if pred != nil {
 				v, err := evalExpr(pred, scanRow, ctx)

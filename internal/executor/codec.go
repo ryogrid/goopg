@@ -259,6 +259,11 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], v)
 		return buf[:], nil
+	case "numeric", "decimal":
+		// encodeValuePG default calls StringValue() which returns "" for
+		// KindNumeric (Int/M fields, not Buf). Use numericText to get the
+		// decimal string representation, then store as PG varlena-text.
+		return varlenaTextBytes(numericText(d)), nil
 	case "aclitem[]", "_aclitem":
 		// PG binary empty ArrayType, elemtype = aclitem (1033).
 		// PG's deconstruct_array asserts on ARR_ELEMTYPE; a text varlena
@@ -579,6 +584,59 @@ func DecodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.C
 	return decodeRowIntoMctx(dst, cols, data, sctx)
 }
 
+// DecodeRowIntoMctxPGTuple decodes a PG heap tuple's body using both the null
+// bitmap and storedNatts to correctly handle NULL columns and ALTER TABLE ADD
+// COLUMN. It is the preferred decoder for seqScanOp when tuple.Bitmap is
+// available. bitmap may be nil (all columns non-null). storedNatts == 0 means
+// "no information" (fall back to len(cols)).
+func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mctx.Context) error {
+	n := len(cols)
+	if storedNatts == 0 {
+		storedNatts = n
+	}
+
+	// Fast path: no nulls and stored natts == schema → existing decoder.
+	if len(bitmap) == 0 && storedNatts >= n {
+		return decodeRowIntoMctx(dst, cols, data, sctx)
+	}
+
+	// Try goopg legacy format first (if bitmap is non-empty this is unlikely
+	// to succeed, but we try for backward compat).
+	if len(bitmap) == 0 {
+		if err := decodeGoopgRowIntoMctx(dst, cols, data, sctx); err == nil {
+			return nil
+		}
+	}
+
+	// PG physical format decode with null bitmap and natts awareness.
+	off := 0
+	for i, c := range cols {
+		// Columns beyond stored natts were added via ALTER TABLE ADD COLUMN.
+		if i >= storedNatts {
+			dst[i] = NullDatum
+			continue
+		}
+		// Check null bitmap: bit i = 0 means column i is NULL.
+		if len(bitmap) > 0 && (bitmap[i/8]>>(uint(i)%8))&1 == 0 {
+			dst[i] = NullDatum
+			continue
+		}
+		off = alignPhysicalPGOffset(off, physicalPGTypeAlign(c.Type))
+		if off >= len(data) {
+			// Data exhausted — treat remaining columns as NULL.
+			dst[i] = NullDatum
+			continue
+		}
+		v, consumed, err := decodePhysicalPGValueMctx(c.Type, data[off:], sctx)
+		if err != nil {
+			return fmt.Errorf("DecodePhysicalPGRow: %s: %w", c.Name, err)
+		}
+		dst[i] = v
+		off += consumed
+	}
+	return nil
+}
+
 // DecodeRowIntoArena is the legacy alias kept for call-site compatibility
 // during the M0107-0001 migration. Delegates to DecodeRowIntoMctx.
 //
@@ -799,6 +857,23 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return newBytesArenaDatum(sctx, moff, mlen), n, nil
 		}
 		return NewBytesDatum(append([]byte(nil), payload...)), n, nil
+	case "numeric", "decimal":
+		// goopg encodes numeric as varlena-text (via the default encodeValuePG
+		// path which calls varlenaTextBytes). Decode: read the varlena payload
+		// as a plain text string and parse it back to KindNumeric.
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, err
+		}
+		text := string(payload)
+		if v, scale, ok := parseNumericFast(text); ok {
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, n, nil
+		}
+		m, s, err := parseNumeric(text)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode numeric %q: %w", text, err)
+		}
+		return newNumeric(m, int(s)), n, nil
 	default:
 		return Datum{}, 0, fmt.Errorf("unsupported PostgreSQL physical type %q", t.Name)
 	}

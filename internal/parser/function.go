@@ -84,6 +84,11 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 			}
 			stmt.Body = body
 			sawAs = true
+		case p.isFunctionAttribute():
+			// Consume IMMUTABLE/VOLATILE/STABLE/STRICT/SECURITY DEFINER
+			// and other function attributes; they have no runtime effect
+			// in goopg but must be parsed to reach the AS $$body$$ clause.
+			p.consumeFunctionAttribute()
 		default:
 			if !sawAs {
 				return nil, p.errAtCur("expected AS $$body$$ for CREATE FUNCTION")
@@ -413,6 +418,8 @@ func (p *parser) parseCreateProcedureTail(pos int, orReplace bool) (Stmt, error)
 			}
 			stmt.Body = body
 			sawAs = true
+		case p.isFunctionAttribute():
+			p.consumeFunctionAttribute()
 		default:
 			if !sawAs {
 				return nil, p.errAtCur("expected AS $$body$$ for CREATE PROCEDURE")
@@ -456,6 +463,94 @@ func (p *parser) parseCallStatement(pos int) (Stmt, error) {
 		stmt.Args = args
 	}
 	return stmt, nil
+}
+
+// isFunctionAttribute reports whether the current token starts a CREATE
+// FUNCTION / CREATE PROCEDURE attribute clause (IMMUTABLE, VOLATILE, STABLE,
+// STRICT, SECURITY DEFINER, PARALLEL, COST, ROWS, etc.).
+func (p *parser) isFunctionAttribute() bool {
+	cur := p.cur()
+	if cur.Kind == TokenKeyword {
+		switch cur.Keyword {
+		case KwNot, KwParallel:
+			return true
+		}
+	}
+	if cur.Kind == TokenIdent {
+		switch strings.ToLower(cur.Value) {
+		case "immutable", "volatile", "stable", "strict",
+			"security", "external", "leakproof", "window",
+			"called", "returns", "cost", "rows", "support", "set":
+			return true
+		}
+	}
+	return false
+}
+
+// consumeFunctionAttribute advances past a single function attribute token or
+// clause (e.g. "IMMUTABLE", "SECURITY DEFINER", "PARALLEL SAFE", "COST 100").
+func (p *parser) consumeFunctionAttribute() {
+	cur := p.cur()
+	switch {
+	case cur.Kind == TokenKeyword && cur.Keyword == KwNot:
+		p.advance()
+		p.acceptIdentKeyword("leakproof")
+	case cur.Kind == TokenKeyword && cur.Keyword == KwParallel:
+		p.advance()
+		p.acceptIdentKeyword("safe", "unsafe", "restricted")
+	case cur.Kind == TokenIdent:
+		switch strings.ToLower(cur.Value) {
+		case "immutable", "volatile", "stable", "strict", "leakproof", "window":
+			p.advance()
+		case "security":
+			p.advance()
+			p.acceptIdentKeyword("definer", "invoker")
+		case "external":
+			p.advance()
+			p.acceptIdentKeyword("security")
+			p.acceptIdentKeyword("definer", "invoker")
+		case "called":
+			// CALLED ON NULL INPUT
+			p.advance()
+			p.acceptIdentKeyword("on")
+			p.acceptIdentKeyword("null")
+			p.acceptIdentKeyword("input")
+		case "returns":
+			// RETURNS NULL ON NULL INPUT
+			p.advance()
+			p.acceptIdentKeyword("null")
+			p.acceptIdentKeyword("on")
+			p.acceptIdentKeyword("null")
+			p.acceptIdentKeyword("input")
+		case "cost", "rows":
+			p.advance()
+			// consume the numeric argument
+			if p.cur().Kind == TokenIntLit || p.cur().Kind == TokenNumericLit {
+				p.advance()
+			}
+		case "support":
+			p.advance()
+			// consume the support function name
+			_, _ = p.parseObjectName()
+		case "set":
+			// SET guc TO value — skip to end of clause
+			p.advance()
+			_, _ = p.parseObjectName()
+			if p.acceptKeyword(KwTo) || (p.cur().Kind == TokenOperator && p.cur().Value == "=") {
+				if p.cur().Kind == TokenOperator {
+					p.advance()
+				}
+				for !(p.cur().Kind == TokenSymbol && p.cur().Value == ";") && p.cur().Kind != TokenEOF &&
+					!(p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwAs || p.cur().Keyword == KwLanguage)) {
+					p.advance()
+				}
+			}
+		default:
+			p.advance()
+		}
+	default:
+		p.advance()
+	}
 }
 
 // parseDropProcedureTail picks up after DROP PROCEDURE and returns

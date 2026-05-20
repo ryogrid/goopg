@@ -1869,6 +1869,23 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           After this fix: **PASS count = 9**: LockCommittedUpdate,
           InsertConflictDoUpdate, InsertConflictDoNothing, FkSnapshot,
           PartitionKeyUpdate{1,2,3,4}, InsertConflictDoUpdate4.
+        - **Loop-14 PG physical format fixes (2026-05-20)**:
+          Three correctness fixes:
+          (A) `encodeValuePG`/`decodePhysicalPGValueMctx` numeric case —
+          stored empty varlena for KindNumeric (StringValue() returns "" for
+          numeric), causing numeric columns to be silently skipped in seqScan.
+          (B) CREATE FUNCTION/PROCEDURE attribute parsing — `isFunctionAttribute()`
+          + `consumeFunctionAttribute()` in parser/function.go handle IMMUTABLE/
+          VOLATILE/STABLE/STRICT/SECURITY DEFINER/etc. before AS $$body$$.
+          (C) `DecodeRowIntoMctxPGTuple(dst, cols, data, bitmap, storedNatts, sctx)` —
+          bitmap+natts-aware decoder for seqScanOp and updateViaIndex; handles
+          ALTER TABLE ADD COLUMN (old rows with fewer physical attrs than schema)
+          and NULL columns (skipped in PG body encoding). Design:
+          `docs/design/0100-0005-loop14-pg-physical-format-fixes.md`.
+          eval-plan-qual progresses from 1199→1257/1494 matching lines (first
+          393 lines cover permutations 1–15 and now match). Still deferred on
+          remaining concurrent-wait permutations.
+          PASS count unchanged at 9.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
