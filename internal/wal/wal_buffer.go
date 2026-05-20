@@ -1,5 +1,7 @@
 package wal
 
+import "errors"
+
 // walBuffer is the bounded in-memory WAL buffer introduced by
 // M0013-0001 (see docs/design/0013-0001-wal-buffers-architecture.md).
 // It sits between state.append and state.writeAt: appended records
@@ -130,4 +132,78 @@ func (b *walBuffer) readAt(pos int64, out []byte) int {
 		copy(out[first:avail], b.buf[:int64(avail)-first])
 	}
 	return avail
+}
+
+
+// errWALBufferNil is returned by writeReserved when invoked on a nil
+// receiver — callers normally guard with `s.walBuf != nil` (the
+// state.append fast-path does so), but the explicit error keeps the
+// 8-stripe slice B call-site rewrite from segfaulting if the buffer
+// happens to be disabled (Config.WALBuffers == 0).
+var errWALBufferNil = errors.New("wal: writeReserved on nil buffer")
+
+// errWALBufferReservedOutOfRange is returned by writeReserved when
+// the requested LSN range [lsn, lsn+len(record)) falls outside the
+// ring's currently-mapped LSN window [base, base+cap). The caller's
+// LSN reserve (insert_pos.go's insertPosTracker.reserve) is supposed
+// to keep reservations inside the window — this error catches a
+// contract violation rather than handling overflow gracefully.
+var errWALBufferReservedOutOfRange = errors.New("wal: writeReserved range outside buffer window")
+
+// writeReserved copies `record` into the ring at the offset
+// corresponding to absolute byte LSN `lsn`, without mutating head,
+// tail, or base. This is the bytes-write counterpart to the
+// 8-stripe slice B path's LSN reserve ([[0107-0007k]]
+// insertPosTracker): a stripe holds appendLocks[i], reserves
+// [lsn, lsn+n) atomically, then lands bytes here while peer
+// stripes write into disjoint ranges in parallel.
+//
+// PG counterpart: CopyXLogRecordToWAL (xlog.c) writes into the
+// shared XLogCtl->pages buffer at the offset reserved by the
+// preceding ReserveXLogInsertLocation call. PG's WALInsertLocks
+// serialise writes WITHIN a stripe's LSN range; ACROSS stripes
+// the writes proceed concurrently because the LSN reservations
+// are disjoint.
+//
+// Errors:
+//   - errWALBufferNil if the receiver is nil.
+//   - errWALBufferReservedOutOfRange if [lsn, lsn+len(record))
+//     extends below base or past base+cap.
+//
+// Empty record is a no-op (returns nil without touching the
+// ring) — this matches state.appendRaw's len==0 short-circuit.
+//
+// Concurrent safety: two writers writing into disjoint LSN
+// ranges of the same walBuffer are safe — Go's memory model
+// permits concurrent writes to disjoint byte slice regions.
+// Two writers writing into overlapping ranges is a contract
+// violation by the caller (insertPosTracker guarantees disjoint
+// reservations) and produces undefined byte contents.
+//
+// The caller is responsible for advancing `tail` (separately)
+// only after every reservation strictly below the new tail has
+// actually been written by its owning stripe — otherwise
+// readers (readForDrain, readAt) would observe uninitialised
+// bytes in the gap. That tail-publication step is a separate
+// slice B foundation; this primitive only writes bytes.
+func (b *walBuffer) writeReserved(lsn int64, record []byte) error {
+	if b == nil {
+		return errWALBufferNil
+	}
+	if len(record) == 0 {
+		return nil
+	}
+	n := int64(len(record))
+	if lsn < b.base || lsn+n > b.base+b.cap {
+		return errWALBufferReservedOutOfRange
+	}
+	off := (lsn - b.base) % b.cap
+	first := b.cap - off
+	if first >= n {
+		copy(b.buf[off:off+n], record)
+	} else {
+		copy(b.buf[off:b.cap], record[:first])
+		copy(b.buf[0:n-first], record[first:])
+	}
+	return nil
 }

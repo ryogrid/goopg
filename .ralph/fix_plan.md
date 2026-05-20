@@ -3141,6 +3141,106 @@ Operational policy (2026-05-20):
         four invariants (writePos / walBuf / memRing / writeLSN);
         deciding whether `lsnAllocator` becomes dead-code-removed
         once the call-site converges on `insertPosTracker`.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 5 of N —
+        `walBuffer.writeReserved` concurrent-stripe bytes-write
+        primitive): added `(*walBuffer).writeReserved(lsn int64,
+        record []byte) error` to `internal/wal/wal_buffer.go`.
+        Copies `record` into the ring at the offset corresponding
+        to absolute byte LSN `lsn` without mutating `head`,
+        `tail`, or `base`. This is the bytes-write counterpart to
+        [[0107-0007k]]'s LSN reserve: a stripe holds
+        `appendLocks[i]` (from [[0107-0007i]]), reserves
+        `[lsn, lsn+n)` atomically via `insertPosTracker.reserve`,
+        then lands bytes here while peer stripes write into
+        disjoint LSN ranges in parallel. PG counterpart:
+        `CopyXLogRecordToWAL` in
+        `postgres/src/backend/access/transam/xlog.c` writes into
+        the shared `XLogCtl->pages` buffer at the previously-
+        reserved offset; PG's `WALInsertLocks` serialise writes
+        WITHIN a stripe's LSN range, ACROSS stripes the writes
+        proceed concurrently because the LSN reservations are
+        disjoint. Errors: `errWALBufferNil` if receiver is nil
+        (matches the `s.walBuf != nil` guard pattern in
+        `state.append`, makes the 8-stripe call-site rewrite
+        safe against `Config.WALBuffers == 0`);
+        `errWALBufferReservedOutOfRange` if `[lsn, lsn+len(record))`
+        extends below `base` or past `base+cap` (catches caller
+        contract violation; `insertPosTracker` is supposed to
+        keep reservations inside the window). Empty record is a
+        no-op (matches `state.appendRaw`'s `len == 0`
+        short-circuit) — runs before the range check so a
+        zero-length out-of-range reservation is still a no-op.
+        Concurrent safety: two writers writing into disjoint LSN
+        ranges of the same buffer are safe under Go's memory
+        model (`copy` on disjoint byte slice regions is
+        data-race free); overlapping ranges is a contract
+        violation that produces undefined byte contents (not
+        detected — would need a per-byte ownership map).
+        Tail publication (advancing `tail` so resident bytes
+        become visible to drain/readers) is deliberately a
+        separate slice B foundation: it can't advance past LSN X
+        until *every* reservation strictly below X has had its
+        bytes written by its owning stripe (needs either a
+        `publishedLSN` atomic walking `prev` chains, or PG-style
+        `WaitXLogInsertionsToFinish(LSN)`). Wrap branch mirrors
+        `walBuffer.append`'s wrap-aware copy verbatim; under the
+        current contract (`lsn+len ≤ base+cap`, `cap == len(buf)`)
+        the wrap branch is structurally unreachable from valid
+        callers — the LSN window equals the ring capacity — but
+        is retained for symmetry with `append`/`readAt` and
+        robustness against future contract changes. Lock-ordering
+        tier for the future call-site rewrite:
+        `appendLockSet.lockByProcNum` → `insertPosTracker.reserve`
+        (briefly under `posMu`) → (rare on segment crossings)
+        `buildSegmentPadRecord` → `walBuffer.writeReserved` (no
+        lock; leaf of chain). Dead code until the slice B
+        call-site rewrite mounts these primitives on `Writer`;
+        foundation-first pattern matches slice C and the four
+        earlier slice B foundations. Nine regression tests in
+        `internal/wal/wal_buffer_write_reserved_test.go`:
+        `TestWALBufferWriteReservedAtBaseNoWrap` (write at
+        `lsn==base`, bytes at `buf[0..n]`, head/tail/base
+        unchanged); `TestWALBufferWriteReservedAtNonZeroOffset`
+        (LSN→ring-offset arithmetic at non-zero offset;
+        neighbouring bytes untouched);
+        `TestWALBufferWriteReservedRejectsBelowBase` (`lsn<base`
+        rejected); `TestWALBufferWriteReservedRejectsPastEnd`
+        (`lsn+n>base+cap` and `lsn=base+cap` both rejected;
+        `lsn+n==base+cap` exactly accepted);
+        `TestWALBufferWriteReservedEmptyIsNoop`
+        (`nil`/`[]byte{}` short-circuit before range check;
+        head/tail/base unmodified);
+        `TestWALBufferWriteReservedNilReceiver` (nil receiver
+        returns `errWALBufferNil`);
+        `TestWALBufferWriteReservedConcurrentDisjoint` (8
+        goroutines × 50 records × 16 bytes in disjoint LSN
+        ranges; race-clean under `-race`; `readAt` confirms every
+        stripe's marker bytes land in the right slot after
+        manual tail publication);
+        `TestWALBufferWriteReservedReadbackViaReadAt` (bytes
+        written at LSN X read back identically via `readAt(X)`);
+        `TestWALBufferWriteReservedDoesNotMutateTailHeadBase`
+        (series of writes leaves `base`/`head`/`tail` exactly as
+        before — pins the publication-is-separate contract).
+        Verified: `go test -race -count=1 -run
+        'TestWALBufferWriteReserved' ./internal/wal/` PASS
+        (1.02 s); `go test -race -count=1 ./internal/wal/` PASS
+        (3.12 s). Design:
+        `docs/design/0107-0007l-wal-buffer-write-reserved.md`
+        (indexed in `docs/design/README.md`). Out of scope
+        (later slice B foundations): tail publication
+        primitive; mounting `appendLockSet` +
+        `insertPosTracker` + `writeReserved` on `Writer` and
+        rewriting `state.append` / `state.appendRaw` (the full
+        call-site rewrite splits `state.appendMu`'s four
+        invariants — writePos / walBuf / memRing / writeLSN —
+        into per-stripe local state vs. shared state);
+        `prevRecPtr` chain integrity under per-stripe writers;
+        `memRing` mirror handling under stripe-concurrent
+        writes; drain coordination with concurrent stripe
+        writes; deciding whether `lsnAllocator` becomes
+        dead-code-removed once the call-site converges on
+        `insertPosTracker`.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
