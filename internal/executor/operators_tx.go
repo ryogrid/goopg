@@ -83,10 +83,19 @@ func (o *transactionOp) execBegin() error {
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
-	snap, err := o.ctx.TxnMgr.SnapshotFor(tx)
-	if err != nil {
-		_ = o.ctx.TxnMgr.Rollback(tx)
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+	// PG-parity: for RR/SERIALIZABLE, the snapshot is captured at the first
+	// non-BEGIN statement, NOT at BEGIN time. We leave firstSnapshot unset
+	// here; dispatchSimpleQueryViaExecutor's SnapshotFor call at the start of
+	// each query sets it on the first real statement after BEGIN. For RC, the
+	// snapshot is refreshed per-statement anyway, so the timing doesn't matter.
+	// M0100-0001 (first-statement snapshot semantics for read-write-unique).
+	var snap mvcc.Snapshot
+	if level == mvcc.IsolationReadCommitted {
+		snap, err = o.ctx.TxnMgr.SnapshotFor(tx)
+		if err != nil {
+			_ = o.ctx.TxnMgr.Rollback(tx)
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
 	}
 	o.ctx.Session.BeginExplicitTransaction(tx, snap)
 	o.ctx.Tx = tx

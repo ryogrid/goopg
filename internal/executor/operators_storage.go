@@ -2609,7 +2609,29 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		if err != nil || key == nil {
 			continue
 		}
-		var conflict bool
+		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, pos); raiseErr != nil {
+			return raiseErr
+		}
+	}
+	return nil
+}
+
+// uniqueCheckWithWait probes a unique btree for a conflicting live tuple.
+// If the conflict row was inserted by another in-flight xact (xmin is active
+// and not ours), it waits for that xact to commit or abort then re-checks:
+//   - Committed + SERIALIZABLE/RR → 40001 serialization failure
+//   - Committed + RC              → 23505 unique violation
+//   - Aborted                     → no conflict, continue
+//
+// Mirrors upstream heap_check_unique's WaitForLockersMultiple path that
+// produces the <waiting ...> interleaving seen in read-write-unique.spec.
+func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTree, key []byte, idxName string, pos int) error {
+	var inflightXmin storage.TransactionID
+	var liveConflict bool
+
+	scanOnce := func() {
+		inflightXmin = storage.InvalidTransactionID
+		liveConflict = false
 		_ = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 			slot, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 			if perr != nil {
@@ -2622,21 +2644,55 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 			if terr != nil {
 				return true, nil
 			}
-			if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
-				conflict = true
+			xmin := tuple.Header.Xmin
+			selfXID := ctx.Tx.XID
+			// In-flight other-xact insert: must wait.
+			if ctx.TxnMgr != nil && xmin != storage.InvalidTransactionID &&
+				(selfXID == storage.InvalidTransactionID || xmin != selfXID) &&
+				ctx.TxnMgr.IsXIDActive(xmin) {
+				inflightXmin = xmin
+				return false, nil
+			}
+			if isLiveForUniqueCheck(ctx, xmin, tuple.Header.Xmax) {
+				liveConflict = true
 				return false, nil
 			}
 			return true, nil
 		})
-		if conflict {
-			return &ExecError{
-				Code: "23505",
-				Pos:  pos,
-				Message: fmt.Sprintf(
-					"duplicate key value violates unique constraint %q",
-					idx.Name,
-				),
+	}
+
+	scanOnce()
+	if inflightXmin != storage.InvalidTransactionID {
+		// Block until the other transaction commits or rolls back.
+		_ = ctx.TxnMgr.WaitForXID(ctx.Ctx, inflightXmin)
+		// Re-scan to check whether the row survived.
+		scanOnce()
+		// If another in-flight xact is holding the slot, treat as live.
+		if inflightXmin != storage.InvalidTransactionID {
+			liveConflict = true
+		}
+		if liveConflict {
+			if ctx.Tx.Isolation == mvcc.IsolationSerializable || ctx.Tx.Isolation == mvcc.IsolationRepeatableRead {
+				return &ExecError{
+					Code:    "40001",
+					Pos:     pos,
+					Message: "could not serialize access due to read/write dependencies among transactions",
+					Detail:  "Reason code: Canceled on identification as a pivot, during write.",
+					Hint:    "The transaction might succeed if retried.",
+				}
 			}
+			// RC: fall through to 23505 below.
+		} else {
+			// Other xact rolled back — no conflict.
+			return nil
+		}
+	}
+
+	if liveConflict {
+		return &ExecError{
+			Code:    "23505",
+			Pos:     pos,
+			Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idxName),
 		}
 	}
 	return nil
