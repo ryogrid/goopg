@@ -205,8 +205,22 @@ type Method interface {
 // counter) so the future observability slice has counters to
 // surface without touching every method.
 type Engine struct {
-	method    Method
-	inFlight  atomic.Int64
+	method Method
+	// inFlight is the current count of outstanding I/Os —
+	// incremented in each Method's Submit (`+1`) and decremented
+	// in finishHandle (`-1`). It is the only stats.Counter consumer
+	// in this engine that takes signed deltas; the cross-shard sum
+	// still equals (#submits − #completions) at any consistent point,
+	// matching the gauge value previously held in a single
+	// `atomic.Int64`. The hot path is identical to the per-direction
+	// completion counters migrated in
+	// `0107-0008j`/`0107-0008i`: every Submit and every completion
+	// pays a previously-shared cache-line hop on this field; per-P
+	// sharding via stats.Counter scatters those bumps across 256
+	// shards. Reader is `Stats()` (cold path); the sharded Sum
+	// reading is eventual-consistent which matches the observability
+	// contract documented at line 632 below.
+	inFlight  stats.Counter
 	submitted stats.Counter
 	completed stats.Counter
 	errored   stats.Counter
@@ -637,7 +651,7 @@ func (e *Engine) Stats() Stats {
 		Submitted:      uint64(e.submitted.Sum()),
 		Completed:      uint64(e.completed.Sum()),
 		Errored:        uint64(e.errored.Sum()),
-		InFlight:       e.inFlight.Load(),
+		InFlight:       e.inFlight.Sum(),
 		ReadSubmitted:         uint64(e.readSubmitted.Sum()),
 		ReadCompleted:         uint64(e.readCompleted.Sum()),
 		ReadErrored:           uint64(e.readErrored.Sum()),

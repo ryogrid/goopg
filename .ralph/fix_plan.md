@@ -3063,10 +3063,60 @@ Operational policy (2026-05-20):
         Design:
         `docs/design/0107-0008m-bufpool-victim-stats-counter-wiring.md`
         (indexed in `docs/design/README.md`).
+      - PARTIAL PROGRESS 2026-05-21 (loop 14): eighth concrete `stats.Counter`
+        consumer migration landed and the first signed-delta (gauge-
+        shape) consumer — `Engine.inFlight` in `internal/aio/aio.go`
+        moved from `atomic.Int64` to `stats.Counter`. Hot path is each
+        Method's Submit (`method_iouring_linux.go:352`,
+        `method_sync.go:56`, `method_worker.go:50`) issuing
+        `m.engine.inFlight.Add(1)` and `finishHandle`'s
+        `e.inFlight.Add(-1)` (`aio.go:524`). Under `method=worker`
+        these are multi-P call sites — every Submit and every
+        completion paid a previously-shared cache-line hop on the
+        single `atomic.Int64` field. Validity argument for the
+        gauge-shape use of `stats.Counter` (Add takes signed
+        deltas): the cross-shard sum still equals `(#Add(+1)) −
+        (#Add(−1))` = current gauge value at any consistent point;
+        each shard's `atomic.Int64.LoadInt64` in `Sum()` returns a
+        well-defined value under the Go memory model despite
+        concurrent signed deltas on other shards; the eventual-
+        consistency property is the same one all the prior migrated
+        monotonic counters already accept. The four call sites are
+        syntactically unchanged (untyped `1` and `-1` accepted by both
+        `atomic.Int64.Add(int64)` and `stats.Counter.Add(int64)`).
+        Single cold-path read in `Engine.Stats()` swaps `.Load()` for
+        `.Sum()`; `Stats.InFlight int64` field type and `pg_aios`-
+        summary column-render path preserved verbatim. Closes the last
+        remaining hot-path additive site on `Engine`: every `Engine`
+        field is now either `stats.Counter` (counters & gauges) or
+        `atomic.*` for explicit semantic reasons (`nextID` is an ID
+        allocator whose Add return is the new ID; `*latencyMaxMicros`
+        needs CAS-clamping). Closes the M0107-0008 in-scope migration
+        shopping list — the design doc's "Migration shopping list —
+        status" section formalises the closure conditions on the
+        remaining atomics (last-write-wins state, monotonic ID
+        allocators, CAS-clamped max values, compare-after-add state
+        machines, per-target stats per [[0107-0008j]], bufpool
+        hit/miss counters that arrive with [[0107-0006]]). Memory
+        cost: 16 KiB per server (1 × 16 KiB Counter; cumulative
+        singleton-consumer cost across the eight landed migrations is
+        now 336 KiB). No new tests added — existing
+        `internal/aio/aio_test.go` covers `Stats.InFlight` via Submit/
+        Wait round trips; `stats.Counter`'s own race-clean suite
+        covers the primitive directly. Verified: `go test -race
+        -count=1 ./internal/aio/` (1.04 s) + `./internal/stats/`
+        (1.02 s) + cross-package smoke `./internal/storage/`
+        (5.35 s) + `./internal/wal/` (3.19 s) + `./internal/runtimeshim/`
+        (1.22 s) all PASS. Design:
+        `docs/design/0107-0008n-aio-inflight-stats-counter-gauge-wiring.md`
+        (indexed in `docs/design/README.md`).
         Remaining work for this sub-milestone: bufpool per-slot Sema
         wait caller (consumes [[0107-0008c]]; blocked on M0107-0006
-        lockfree bufpool); per-target AIO migration formally closed
-        as *do not migrate* per [[0107-0008j]]; per-Go-minor CI matrix.
+        lockfree bufpool); per-Go-minor CI matrix (`08-runtime-
+        internals.md` §2); migration shopping list now formally closed
+        — no further in-scope `stats.Counter` consumers exist absent
+        new counter sites created by sibling sub-milestones (e.g.
+        bufpool hit/miss from M0107-0006).
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
