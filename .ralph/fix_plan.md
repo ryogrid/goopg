@@ -2863,6 +2863,64 @@ Operational policy (2026-05-20):
         (per-direction + per-target + latency SumMicros families,
         coupled to `pg_stat_io` view-shape unification);
         per-Go-minor CI matrix.
+      - PARTIAL PROGRESS 2026-05-21 (loop 10): fourth concrete `stats.Counter`
+        consumer migration landed — AIO `Engine`'s per-direction submit/
+        complete/error trio (`readSubmitted` / `readCompleted` /
+        `readErrored` / `writeSubmitted` / `writeCompleted` /
+        `writeErrored`) and per-direction latency-sum counters
+        (`readLatencySumMicros`, `writeLatencySumMicros`) in
+        `internal/aio/aio.go` moved from `atomic.Uint64` to
+        `stats.Counter`. Hot paths are unchanged: `(*Engine).Submit` bumps
+        the appropriate `read|write` Submitted on every I/O, and
+        `(*Engine).finishHandle` bumps the appropriate
+        `read|write` Completed (+ conditional Errored) and
+        `read|write` LatencySumMicros once per completion. Under
+        `method=worker` these are multi-P call sites; the previously
+        shared `read*` / `write*` cache lines now scatter across 256
+        shards per counter. Closes the consistency-shape asymmetry
+        loop 9 introduced: `Stats.Submitted == Stats.ReadSubmitted +
+        Stats.WriteSubmitted` is now eventual-consistent on both
+        sides (no longer one side `stats.Counter`-sharded and the
+        other side `atomic.Uint64`-seq-consistent on a single line).
+        `readLatencyMaxMicros` / `writeLatencyMaxMicros` stay
+        `atomic.Uint64` — `advanceMax` is CAS-clamped to
+        monotonic-forward and `stats.Counter` does not expose CAS
+        (per-shard max is meaningless for monotonic-forward
+        clamping). Per-target `*targetStats` records remain
+        `atomic.Uint64`: they are naturally sharded by target
+        identity (the type comment cites "thousands of distinct
+        targets"; migrating each to 5 × 16 KiB Counter would
+        inflate each record from ~48 B to ~80 KiB, ballooning worst-
+        case memory by ~80 MiB), and view-shape `pg_stat_io` /
+        `pg_stat_aio_targets` row-shape invariants are unaffected
+        by storage choice. The two `.Add(elapsedMicros)` call sites
+        in `finishHandle` switch to `.Add(int64(elapsedMicros))`
+        (stats.Counter.Add takes int64; original uint64 cast was
+        only to give advanceMax an unsigned argument).
+        `Stats()` boundary uses `uint64(.Sum())` casts so all eight
+        `Stats.{Read,Write}{Submitted,Completed,Errored,LatencySumMicros}`
+        uint64 field types and positions are preserved verbatim;
+        `internal/initdb/aio_views.go` view binding observes
+        identical column types and values. Memory cost: 128 KiB
+        per server (8 × 16 KiB Counter; on top of [[0107-0008i]]'s
+        48 KiB = 176 KiB total per server), flat. No new tests —
+        existing `internal/aio/aio_test.go` covers all eight
+        migrated counters end-to-end through the public `Stats()`
+        API (Submit-direction tests, Wait-completion tests, latency-
+        sum/max assertion tests); `stats.Counter`'s own race-clean
+        suite covers the primitive directly. Verified:
+        `go test -race -count=1 ./internal/aio/` (1.04 s) +
+        `go test -race -count=1 ./internal/stats/` (1.02 s) +
+        cross-package smoke `./internal/storage/ ./internal/wal/
+        ./internal/aio/ ./internal/stats/ ./internal/runtimeshim/`
+        all PASS. Design:
+        `docs/design/0107-0008j-aio-per-direction-stats-counter-wiring.md`
+        (indexed in `docs/design/README.md`).
+        Remaining work for this sub-milestone: bufpool per-slot Sema
+        wait caller (consumes [[0107-0008c]]; blocked on M0107-0006
+        lockfree bufpool); per-target AIO migration decision
+        (cost vs. benefit given per-target memory amplification);
+        per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
