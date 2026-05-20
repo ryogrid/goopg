@@ -277,7 +277,9 @@ func TestRunFastSeqScanWithLimit(t *testing.T) {
 
 // TestRunFastOpAdapterFallback verifies that a non-migrated operator
 // (INSERT) is correctly wrapped in opAdapter and functions via RunFast.
-func TestRunFastOpAdapterFallback(t *testing.T) {
+// TestRunFastInsert verifies that BuildFast produces OpInsert for a plain
+// INSERT (no ON CONFLICT) and that the row is actually written to storage.
+func TestRunFastInsert(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
 
@@ -300,8 +302,8 @@ func TestRunFastOpAdapterFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildFast: %v", err)
 	}
-	if fastNode.Kind != OpAdapter {
-		t.Errorf("INSERT should use OpAdapter, got Kind=%d", fastNode.Kind)
+	if fastNode.Kind != OpInsert {
+		t.Errorf("INSERT should use OpInsert, got Kind=%d", fastNode.Kind)
 	}
 	_, err = RunFast(fastNode, ctx)
 	if err != nil {
@@ -389,13 +391,22 @@ func TestBuildFastNodeKinds(t *testing.T) {
 			},
 			OpSort,
 		},
-		// Non-migrated operators should still use OpAdapter.
+		// Insert (no ON CONFLICT) migrated to concrete OpInsert kind.
 		{
 			&planner.Insert{
 				Table:  tbl,
 				Source: &planner.Values{},
 			},
-			OpAdapter,
+			OpInsert,
+		},
+		// Join (children bridged via opNodeOperator) migrated to OpJoin.
+		{
+			&planner.Join{
+				Left:  seqScanPlan,
+				Right: seqScanPlan,
+				Algo:  planner.JoinAlgoHash,
+			},
+			OpJoin,
 		},
 	}
 
@@ -520,8 +531,8 @@ func TestOpIteratorNilSlotForDMLNoRow(t *testing.T) {
 	defer cleanup()
 
 	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
-	// Use an INSERT into an empty table — insertOp still in OpAdapter,
-	// but OpIterator.Next() must propagate the nil-slot correctly.
+	// Use an INSERT into an empty table — OpInsert concrete kind;
+	// OpIterator.Next() must propagate the nil-slot correctly.
 	insertPlan := &planner.Insert{
 		Table:  tbl,
 		Source: &planner.Values{},
@@ -546,5 +557,87 @@ func TestOpIteratorNilSlotForDMLNoRow(t *testing.T) {
 	// nil slot is the DML nil-row signal; must not panic on nil.
 	if slot != nil {
 		t.Errorf("DML nil-row: expected nil slot from OpIterator.Next(), got %T", slot)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase C.1 follow-up: OpInsert and OpJoin concrete kinds.
+// ---------------------------------------------------------------------------
+
+// TestRunFastInsertRowsAffected verifies that RowsAffected is correctly
+// reported via the OpInsert concrete kind path.
+func TestRunFastInsertRowsAffected(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	insertPlan := &planner.Insert{
+		Table: tbl,
+		Source: &planner.Values{
+			Rows: [][]planner.Expr{
+				{&planner.IntegerConst{Value: 200}, &planner.StringConst{Value: "ra"}},
+				{&planner.IntegerConst{Value: 201}, &planner.StringConst{Value: "rb"}},
+			},
+		},
+		ColumnIndex: []int{0, 1},
+	}
+
+	it, err := BuildFastIterator(insertPlan)
+	if err != nil {
+		t.Fatalf("BuildFastIterator: %v", err)
+	}
+	if it.node.Kind != OpInsert {
+		t.Fatalf("expected OpInsert, got %d", it.node.Kind)
+	}
+	if err := it.Open(ctx); err != nil {
+		_ = it.Close()
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = it.Close() }()
+
+	// Drain the iterator (one nil-slot DML row then EOF).
+	for {
+		_, err := it.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+	}
+
+	if got := it.RowsAffected(); got != 2 {
+		t.Errorf("RowsAffected = %d, want 2", got)
+	}
+}
+
+// TestRunFastJoinConcrete verifies that BuildFast wraps joinOp children in
+// opNodeOperator bridges, producing an OpJoin root whose output matches the
+// legacy Build path.
+func TestRunFastJoinConcrete(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	// "SELECT a.id, b.id FROM items a JOIN items b ON a.id = b.id"
+	// The planner produces a hash join; compare fast vs. legacy output.
+	plan := planOne(t, "SELECT a.id, b.id FROM items a JOIN items b ON a.id = b.id", cat)
+	runBothAndCompare(t, plan, ctx)
+
+	// Also verify that the concrete OpNode root kind is OpJoin or wraps
+	// one (planner may add a Project on top).
+	fastNode, err := BuildFast(plan)
+	if err != nil {
+		t.Fatalf("BuildFast: %v", err)
+	}
+	// Walk past an optional Project wrapper.
+	n := fastNode
+	if n.Kind == OpProject {
+		n = n.childA
+	}
+	if n.Kind != OpJoin {
+		t.Errorf("expected OpJoin below top-level node, got Kind=%d", n.Kind)
 	}
 }

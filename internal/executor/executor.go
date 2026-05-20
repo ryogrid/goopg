@@ -379,6 +379,33 @@ func BuildFast(plan planner.Node) (*OpNode, error) {
 		}
 		return &OpNode{Kind: OpDelete, state: &deleteOpState{op: op}}, nil
 
+	case *planner.Insert:
+		childNode, err := BuildFast(p.Source)
+		if err != nil {
+			return nil, err
+		}
+		childOp := &opNodeOperator{node: childNode, schema: p.Source.Output()}
+		if p.OnConflict != nil {
+			// upsertOp has complex conflict-resolution logic; keep on adapter.
+			uop := newUpsertOp(p, childOp)
+			return &OpNode{Kind: OpAdapter, state: &opAdapterState{op: uop}}, nil
+		}
+		return &OpNode{Kind: OpInsert, state: &insertOpState{op: newInsertOp(p, childOp)}}, nil
+
+	case *planner.Join:
+		leftNode, err := BuildFast(p.Left)
+		if err != nil {
+			return nil, err
+		}
+		rightNode, err := BuildFast(p.Right)
+		if err != nil {
+			return nil, err
+		}
+		leftOp := &opNodeOperator{node: leftNode, schema: p.Left.Output()}
+		rightOp := &opNodeOperator{node: rightNode, schema: p.Right.Output()}
+		op := newJoinOp(p, leftOp, rightOp)
+		return &OpNode{Kind: OpJoin, state: &joinOpState{op: op, schema: p.Output()}}, nil
+
 	default:
 		// For non-migrated operators, build the legacy Operator tree
 		// and wrap in an adapter. This path preserves the existing

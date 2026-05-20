@@ -2096,11 +2096,25 @@ if 21-spec pass surfaces a real divergence:
   `//go:build ignore` to each. (Note: tmp/ is in .gitignore; change is local.)
 
 ## M0102 — Heterogeneous Streaming-Replication + SIGKILL-Failover E2E (filed 2026-05-13)
- - [ ] **M0102-0014**
+
+  - [x] **M0102-0008**
+      - Summary: Close milestone.
+      - Add four rows to `docs/test-port/postgres-oracle-port-status.csv`:
+        `e2e-failover-pg-to-goopg-async`, `e2e-failover-pg-to-goopg-sync`,
+        `e2e-failover-goopg-to-pg-async`, `e2e-failover-goopg-to-pg-sync` — all
+        at `status=port`, `pass_required=yes`. Regenerate the `.md` via
+        `go run ./cmd/gen-oracle-port-status`. Flip
+        `docs/milestones/0102-heterogeneous-replication-failover-e2e.md` status
+        to `accepted` and update the `docs/milestones/README.md` index row.
+      - Mark all 5 design docs (`0102-0001..-0005`) as `accepted`. Run the
+        regression suites listed in the milestone DoD and confirm zero
+        regressions.
+
+ - [ ] **M0102-0009** (follow-up to M0102-0008)
       - Summary: `/sync_remote_apply` still fails at "physical
         replication did not reach streaming state within 45s"
 
- - [ ] **M0102-0015**
+ - [ ] **M0102-0010** (follow-up to M0102-0008)
       - Summary: 15 initdb test failures
 
 ## M0107 — Performance Optimization Refactor (filed 2026-05-20)
@@ -2231,11 +2245,17 @@ Operational policy (2026-05-20):
         MergeMatchRecheck) unchanged — 16/21 still PASS. Design doc updated:
         `docs/design/0107-0003-phase-c1-opnode-concrete-executor.md`.
         4 new regression tests in `phase_c_test.go`.
-      - Remaining (Phase C.1 follow-up): migrate insertOp (opNodeOperator bridge
-        for VALUES child), joinOp/hashJoinOp (bridges for left/right children).
-        Phase C.2: slab indices + Slot.CopyTo. Phase C.3: PlanNode/ExprNode
-        sum-types + parser mctx. TPS and gcBgMarkWorker gates require all
-        hot-path ops migrated.
+      - **Loop-12 OpInsert + OpJoin (2026-05-20)**:
+        (A) `OpInsert`: concrete kind with `opNodeOperator` bridge for VALUES
+        child; `ON CONFLICT` path falls back to `OpAdapter` (upsertOp is
+        complex). `RowsAffected()` updated. (B) `OpJoin`: concrete kind with
+        `opNodeOperator` bridges for left/right children; covers both hash-join
+        and merge/NL paths (joinOp.Open dispatches internally). 5 new/updated
+        regression tests. `go test -race -count=1 ./internal/executor/
+        ./internal/server/` PASS.
+      - Remaining: Phase C.2: slab indices + Slot.CopyTo. Phase C.3:
+        PlanNode/ExprNode sum-types + parser mctx. TPS and gcBgMarkWorker
+        gates require perf run after all hot-path ops migrated.
 
  - [ ] **M0107-0004 — Phase D1: ProcArray + atomic XidGen + CLOG bank locks**
       - Summary: Replace `mvcc.Manager.mu` (gates Begin/SnapshotFor/Commit/

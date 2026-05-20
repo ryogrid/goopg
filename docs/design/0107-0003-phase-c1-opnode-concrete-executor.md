@@ -178,18 +178,20 @@ The dispatch loop is unchanged; `*OpIterator` implements `Operator` and
 | OpUpdate   | migrated | concrete *updateOp   |
 | OpDelete   | migrated | concrete *deleteOp   |
 | OpSort     | migrated | concrete *sortOp (child via opNodeOperator bridge) |
+| OpInsert   | migrated | concrete *insertOp (VALUES child via opNodeOperator bridge; ON CONFLICT falls back to OpAdapter) |
+| OpJoin     | migrated | concrete *joinOp (left/right via opNodeOperator bridges) |
 | OpAdapter  | shim     | legacy Operator interface |
 
 ### What's NOT yet concrete
 
-`OpInsert` (insertOp has a VALUES child; requires opNodeOperator bridge or
-insertOp changes), `OpJoin`/`OpHashJoin` (multi-child, complex), `OpAggregate`,
-`OpDistinct`, `OpValues`. These remain in `OpAdapter`.
+`OpAggregate`, `OpDistinct`, `OpValues`, `OpNestedLoopIndexJoin`, `OpSetOp`,
+`OpRecursiveUnion`, `OpWindow`, and cold-path ops. These remain in `OpAdapter`.
 
 ## Remaining scope (Phase C.1 follow-up loops)
 
-- **Migrate remaining hot-path operators**: `insertOp`, `joinOp`/`hashJoinOp`
-  (with opNodeOperator bridges for left/right children)
+- **Phase C.1 complete** (loop 12): `OpInsert` and `OpJoin` landed with
+  `opNodeOperator` bridges; `RowsAffected()` updated for `OpInsert`;
+  5 new / updated regression tests in `phase_c_test.go`.
 - **Phase C.2**: replace `*OpNode` children with slab indices; add per-statement
   `[]OpNode` slab in `stmtCtx`; eliminate the `any` state field in favour of
   raw bytes (`unsafe.Pointer` cast, sized by `opStateSize`)
@@ -208,6 +210,8 @@ insertOp changes), `OpJoin`/`OpHashJoin` (multi-child, complex), `OpAggregate`,
   BuildFastIterator alias (delegates to opnode.go)
 - `internal/executor/phase_c_test.go` (modified) — TestBuildFastNodeKinds updated;
   new TestRunFastSort, TestBuildFastIteratorSchema, TestBuildFastIteratorRowsAffected,
-  TestOpIteratorNilSlotForDMLNoRow
+  TestOpIteratorNilSlotForDMLNoRow; loop-12 additions: TestRunFastInsert (renamed
+  from TestRunFastOpAdapterFallback), TestRunFastInsertRowsAffected,
+  TestRunFastJoinConcrete, OpInsert+OpJoin cases in TestBuildFastNodeKinds
 - `internal/server/dispatch.go` (modified) — executor.Build → BuildFastIterator
   in executeOneSimpleStmt and executeFetchAll (2 sites)

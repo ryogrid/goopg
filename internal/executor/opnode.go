@@ -149,6 +149,14 @@ const (
 	// unchanged).
 	OpSort
 
+	// Phase C.1 follow-up: Insert (opNodeOperator bridge for the VALUES
+	// child; ON CONFLICT path still uses OpAdapter).
+	OpInsert
+
+	// Phase C.1 follow-up: Join (opNodeOperator bridges for left/right
+	// children; the joinOp itself is unchanged).
+	OpJoin
+
 	// Adapter — wraps a legacy Operator interface.
 	// All unmigrated operators use this until they are individually
 	// promoted to a concrete kind.
@@ -230,6 +238,15 @@ type deleteOpState struct {
 type sortOpState struct {
 	op     *sortOp
 	schema planner.Schema // pre-computed from *planner.Sort.Output()
+}
+
+type insertOpState struct {
+	op *insertOp
+}
+
+type joinOpState struct {
+	op     *joinOp
+	schema planner.Schema // pre-computed from *planner.Join.Output()
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +349,8 @@ func (it *OpIterator) RowsAffected() int64 {
 		return it.node.state.(*updateOpState).op.RowsAffected()
 	case OpDelete:
 		return it.node.state.(*deleteOpState).op.RowsAffected()
+	case OpInsert:
+		return it.node.state.(*insertOpState).op.RowsAffected()
 	case OpSort:
 		// sortOp is a pass-through; rows-affected comes from its underlying child.
 		// Sorts appear over DML in rare cases (RETURNING … ORDER BY); the child
@@ -423,6 +442,14 @@ func opOpen(n *OpNode, ctx *Context) error {
 		s := n.state.(*sortOpState)
 		return s.op.Open(ctx)
 
+	case OpInsert:
+		s := n.state.(*insertOpState)
+		return s.op.Open(ctx)
+
+	case OpJoin:
+		s := n.state.(*joinOpState)
+		return s.op.Open(ctx)
+
 	case OpAdapter:
 		s := n.state.(*opAdapterState)
 		return s.op.Open(ctx)
@@ -473,6 +500,14 @@ func opClose(n *OpNode) error {
 		s := n.state.(*sortOpState)
 		return s.op.Close()
 
+	case OpInsert:
+		s := n.state.(*insertOpState)
+		return s.op.Close()
+
+	case OpJoin:
+		s := n.state.(*joinOpState)
+		return s.op.Close()
+
 	case OpAdapter:
 		s := n.state.(*opAdapterState)
 		return s.op.Close()
@@ -513,6 +548,10 @@ func opNext(n *OpNode, dst *Slot) error {
 		return deleteOpKernelNext(n, dst)
 	case OpSort:
 		return sortOpKernelNext(n, dst)
+	case OpInsert:
+		return insertOpKernelNext(n, dst)
+	case OpJoin:
+		return joinOpKernelNext(n, dst)
 	case OpAdapter:
 		return adapterOpNext(n, dst)
 	default:
@@ -669,6 +708,26 @@ func deleteOpKernelNext(n *OpNode, dst *Slot) error {
 // pre-sorted rows without calling child.Next() again.
 func sortOpKernelNext(n *OpNode, dst *Slot) error {
 	s := n.state.(*sortOpState)
+	slot, err := s.op.Next()
+	if err != nil {
+		return err
+	}
+	dst.fillFromTupleSlot(slot)
+	return nil
+}
+
+func insertOpKernelNext(n *OpNode, dst *Slot) error {
+	s := n.state.(*insertOpState)
+	slot, err := s.op.Next()
+	if err != nil {
+		return err
+	}
+	dst.fillFromTupleSlot(slot)
+	return nil
+}
+
+func joinOpKernelNext(n *OpNode, dst *Slot) error {
+	s := n.state.(*joinOpState)
 	slot, err := s.op.Next()
 	if err != nil {
 		return err
