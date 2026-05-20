@@ -2055,6 +2055,17 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `seqScanOp` skips fenced rows (CTE snapshot isolation).
           `TestPort_IsolationInsertConflictDoUpdate3` flips from SKIP to PASS.
           **PASS count = 15**: adds InsertConflictDoUpdate3.
+        - **Loop-23b MergeMatchRecheck PASS (2026-05-20)**:
+          (A) `updateViaIndex` cross-partition UPDATE: stamp moved-partition sentinel
+          and route write to destination partition (same fix as seqScan path M0100-0005n).
+          Closes first permutation `update1_pa_move merge_bal_pa c2 c1`.
+          (B) `epqFollowChainFull`: when HOT chain ends because a successor slot has the
+          moved-partition sentinel (slot1→slot2[sentinel]), `chainHadSentinel=true` is
+          returned. `mergeApplyUpdate`/`mergeApplyDelete` raise `errMovedToAnotherPartition`
+          even when the starting slot's CTID is not the sentinel. Closes second permutation
+          `update1_pa update1_pa_move merge_bal_pa c2 c1`.
+          `TestPort_IsolationMergeMatchRecheck`: SKIP → PASS.
+          **PASS count = 16**: adds MergeMatchRecheck.
 
 
         - Next: **Go to M0107 (because this milestone depends on M0107)**
