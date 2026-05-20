@@ -330,13 +330,16 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 			return noChild, err
 		}
 		// Phase C.3: target expressions compiled into exprTreeSlab; projectState
-		// holds only the compiled indices — no GC-traced *planner.Project needed.
+		// holds only compiled indices — no GC-traced *planner.Project or schema slice.
+		// Schema is pooled in opTreeSlab.schemas; projectState stores an int32 index.
 		targExprs := make([]int32, len(p.Targets))
 		for i, t := range p.Targets {
 			targExprs[i] = tree.exprs.buildExpr(t)
 		}
+		schemaIdx := int32(len(tree.schemas))
+		tree.schemas = append(tree.schemas, p.Output())
 		return tree.add(OpNode{Kind: OpProject, childA: childIdx, childB: noChild,
-			state: &projectState{schema: p.Output(), targExprs: targExprs}}), nil
+			state: &projectState{schemaIdx: schemaIdx, targExprs: targExprs}}), nil
 
 	case *planner.Limit:
 		childIdx, err := tree.buildRec(p.Child)
@@ -421,9 +424,10 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 // drives the legacy Operator interface.
 func BuildFast(plan planner.Node) (*opTreeSlab, int32, error) {
 	tree := &opTreeSlab{
-		ops:   make([]OpNode, 0, 8),
-		exprs: make(exprTreeSlab, 0, 16),
-		plans: make(planTreeSlab, 0, 8),
+		ops:     make([]OpNode, 0, 8),
+		exprs:   make(exprTreeSlab, 0, 16),
+		plans:   make(planTreeSlab, 0, 8),
+		schemas: make([]planner.Schema, 0, 4),
 	}
 	rootIdx, err := tree.buildRec(plan)
 	if err != nil {
@@ -436,8 +440,8 @@ func BuildFast(plan planner.Node) (*opTreeSlab, int32, error) {
 // opNext, and returns all rows. Rows are deep-copied via cloneRowOwned
 // so callers receive independent storage (same invariant as Run).
 func RunFast(tree *opTreeSlab, rootIdx int32, ctx *Context) ([]Row, error) {
-	if err := opOpen(tree.ops, tree.exprs, rootIdx, ctx); err != nil {
-		_ = opClose(tree.ops, rootIdx)
+	if err := opOpen(tree, rootIdx, ctx); err != nil {
+		_ = opClose(tree, rootIdx)
 		return nil, err
 	}
 	var (
@@ -446,12 +450,12 @@ func RunFast(tree *opTreeSlab, rootIdx int32, ctx *Context) ([]Row, error) {
 	)
 	for {
 		dst.Reset()
-		err := opNext(tree.ops, rootIdx, &dst)
+		err := opNext(tree, rootIdx, &dst)
 		if err == EOF {
 			break
 		}
 		if err != nil {
-			_ = opClose(tree.ops, rootIdx)
+			_ = opClose(tree, rootIdx)
 			return nil, err
 		}
 		// DML / utility ops surface nil-row (HasRow=false); skip.
@@ -461,7 +465,7 @@ func RunFast(tree *opTreeSlab, rootIdx int32, ctx *Context) ([]Row, error) {
 		// Deep-copy at the RunFast boundary so callers own independent rows.
 		out = append(out, cloneRowOwned(Row(dst.Cells)))
 	}
-	if err := opClose(tree.ops, rootIdx); err != nil {
+	if err := opClose(tree, rootIdx); err != nil {
 		return nil, err
 	}
 	return out, nil

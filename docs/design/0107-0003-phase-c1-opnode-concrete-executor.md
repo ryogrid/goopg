@@ -386,3 +386,32 @@ by a single acquisition in `Open()`.
 - `internal/executor/phase_c_test.go` — imports storage; new
   `TestSeqScanOpNoPlanPointer` (verifies schema/tbl/pos populated, rel zero pre-Open) and
   `TestSeqScanOpRelCachedAfterOpen` (verifies rel populated post-Open)
+
+## Loop-18 — projectState schema allocation (2026-05-21)
+
+**Phase C.3 completion**: `projectState.schema planner.Schema` removed. The output schema for
+`OpProject` nodes is now **pooled** in `opTreeSlab.schemas []planner.Schema` (one entry per
+project node, indexed by `projectState.schemaIdx int32`). This eliminates the last GC-traced
+plan reference from `projectState`, making it pointer-free with respect to planner schema objects.
+
+**Coupled change**: `opOpen`/`opNext`/`opClose` signatures changed from
+`(ops []OpNode, [exprs exprTreeSlab,] idx int32, ...)` to `(tree *opTreeSlab, idx int32, ...)`.
+Passing `*opTreeSlab` directly:
+1. gives all kernel functions access to `tree.schemas` for schema lookup, and
+2. eliminates the redundant `exprs exprTreeSlab` parameter (accessible as `tree.exprs`).
+
+All internal recursive calls and external callers (`OpIterator`, `opNodeOperator`, `RunFast`,
+tests) updated accordingly.
+
+**Key invariant**: `tree.schemas[ps.schemaIdx]` is the canonical output schema for the project
+node at `tree.ops[nodeIdx]`. The schema slice is appended to `tree.schemas` in `buildRec` for
+`*planner.Project` and is immutable after `BuildFast` returns.
+
+**Files changed** (loop 18):
+- `internal/executor/opnode.go` — `opTreeSlab` gains `schemas`; `projectState` loses `schema`,
+  gains `schemaIdx`; `opOpen`/`opNext`/`opClose`/`filterOpNext`/`projectOpNext`/`limitOpNext`
+  signatures and bodies updated; `OpIterator`/`opNodeOperator` call sites updated
+- `internal/executor/executor.go` — `BuildFast` initialises `schemas` pool; `buildRec` Project
+  case stores schemaIdx; `RunFast` passes `tree` directly
+- `internal/executor/phase_c_test.go` — `TestSeqScanOpRelCachedAfterOpen` updated (opOpen/Close
+  call sites); new `TestProjectStateNoSchemaField` regression pin

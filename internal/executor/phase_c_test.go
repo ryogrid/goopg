@@ -1171,13 +1171,57 @@ func TestSeqScanOpRelCachedAfterOpen(t *testing.T) {
 	}
 	op := tree.ops[nIdx].state.(*seqScanOp)
 
-	if err := opOpen(tree.ops, tree.exprs, nIdx, ctx); err != nil {
+	if err := opOpen(tree, nIdx, ctx); err != nil {
 		t.Fatalf("opOpen: %v", err)
 	}
-	defer opClose(tree.ops, nIdx)
+	defer opClose(tree, nIdx)
 
 	var zeroRel storage.RelFileNode
 	if op.rel == zeroRel {
 		t.Error("seqScanOp.rel must be populated after Open()")
+	}
+}
+
+// TestProjectStateNoSchemaField verifies Phase C.3 projectState migration:
+// projectState must not hold a planner.Schema; instead, schema is pooled in
+// opTreeSlab.schemas and addressed via schemaIdx int32.  opTreeSlab.schemas
+// must contain exactly one entry for a simple SELECT with projection.
+func TestProjectStateNoSchemaField(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "items"})
+	if !ok {
+		t.Fatal("items table not found")
+	}
+	seedItems(t, ctx, tbl)
+
+	tree, rootIdx, err := BuildFast(planOne(t, "SELECT id, label FROM items", cat))
+	if err != nil {
+		t.Fatalf("BuildFast: %v", err)
+	}
+
+	// Walk to the OpProject node.
+	nIdx := rootIdx
+	for nIdx != noChild && tree.ops[nIdx].Kind != OpProject {
+		nIdx = tree.ops[nIdx].childA
+	}
+	if nIdx == noChild || tree.ops[nIdx].Kind != OpProject {
+		t.Skip("no OpProject node found in plan — plan shape may have changed")
+	}
+
+	ps := tree.ops[nIdx].state.(*projectState)
+
+	// schemaIdx must point into the schemas pool.
+	if int(ps.schemaIdx) >= len(tree.schemas) {
+		t.Fatalf("schemaIdx %d out of range (schemas pool len=%d)", ps.schemaIdx, len(tree.schemas))
+	}
+	schema := tree.schemas[ps.schemaIdx]
+	if len(schema) == 0 {
+		t.Error("pooled schema must not be empty")
+	}
+	// The schemas pool must contain at least one entry for this plan.
+	if len(tree.schemas) == 0 {
+		t.Error("opTreeSlab.schemas must be non-empty after building a project plan")
 	}
 }

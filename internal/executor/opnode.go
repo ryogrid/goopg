@@ -184,9 +184,10 @@ const noChild int32 = -1
 // opNodeOperator and OpIterator hold a *opTreeSlab pointer so they always
 // see the final slice, even if append relocated the backing array during build.
 type opTreeSlab struct {
-	ops   []OpNode
-	exprs exprTreeSlab // expression-tree slab (Phase C.3); immutable after BuildFast
-	plans planTreeSlab // plan-tree slab (Phase C.3); immutable after BuildFast
+	ops     []OpNode
+	exprs   exprTreeSlab     // expression-tree slab (Phase C.3); immutable after BuildFast
+	plans   planTreeSlab     // plan-tree slab (Phase C.3); immutable after BuildFast
+	schemas []planner.Schema // output-schema pool for OpProject nodes; indexed by schemaIdx
 }
 
 // add appends n to the slab and returns its index.
@@ -231,7 +232,7 @@ type filterState struct {
 
 // projectState is the per-node state for OpProject.
 type projectState struct {
-	schema    planner.Schema
+	schemaIdx int32        // index into opTreeSlab.schemas; no GC-traced schema pointer here
 	ctx       *Context
 	srcSlot   Slot         // temp slot for the child's output
 	outCells  []Datum      // persistent output buffer, reused across Next calls
@@ -297,12 +298,12 @@ type opNodeOperator struct {
 }
 
 func (w *opNodeOperator) Open(ctx *Context) error {
-	return opOpen(w.tree.ops, w.tree.exprs, w.idx, ctx)
+	return opOpen(w.tree, w.idx, ctx)
 }
 
 func (w *opNodeOperator) Next() (TupleSlot, error) {
 	w.dst.Reset()
-	if err := opNext(w.tree.ops, w.idx, &w.dst); err != nil {
+	if err := opNext(w.tree, w.idx, &w.dst); err != nil {
 		return nil, err
 	}
 	if !w.dst.HasRow {
@@ -311,7 +312,7 @@ func (w *opNodeOperator) Next() (TupleSlot, error) {
 	return &w.dst, nil
 }
 
-func (w *opNodeOperator) Close() error           { return opClose(w.tree.ops, w.idx) }
+func (w *opNodeOperator) Close() error           { return opClose(w.tree, w.idx) }
 func (w *opNodeOperator) Schema() planner.Schema { return w.schema }
 
 // ---------------------------------------------------------------------------
@@ -343,14 +344,14 @@ func BuildFastIterator(plan planner.Node) (*OpIterator, error) {
 
 // Open implements Operator.
 func (it *OpIterator) Open(ctx *Context) error {
-	return opOpen(it.tree.ops, it.tree.exprs, it.rootIdx, ctx)
+	return opOpen(it.tree, it.rootIdx, ctx)
 }
 
 // Next implements Operator. Returns nil TupleSlot for DML nil-rows (preserving
 // the legacy nil-slot convention that the dispatch loop checks with schema==nil).
 func (it *OpIterator) Next() (TupleSlot, error) {
 	it.dst.Reset()
-	if err := opNext(it.tree.ops, it.rootIdx, &it.dst); err != nil {
+	if err := opNext(it.tree, it.rootIdx, &it.dst); err != nil {
 		return nil, err
 	}
 	if !it.dst.HasRow {
@@ -360,7 +361,7 @@ func (it *OpIterator) Next() (TupleSlot, error) {
 }
 
 // Close implements Operator.
-func (it *OpIterator) Close() error { return opClose(it.tree.ops, it.rootIdx) }
+func (it *OpIterator) Close() error { return opClose(it.tree, it.rootIdx) }
 
 // Schema implements Operator. For read plans, returns plan.Output(). For DML
 // operators still in the adapter, delegates to the adapter's Schema() after
@@ -410,11 +411,11 @@ func (it *OpIterator) RowsAffected() int64 {
 // for the statement; all operators in the tree receive it.
 // exprs is the shared expression-tree slab; filter and project nodes
 // store it at Open time so filterOpNext / projectOpNext can call evalFastExpr.
-func opOpen(ops []OpNode, exprs exprTreeSlab, idx int32, ctx *Context) error {
+func opOpen(tree *opTreeSlab, idx int32, ctx *Context) error {
 	if idx == noChild {
 		return nil
 	}
-	n := &ops[idx]
+	n := &tree.ops[idx]
 	switch n.Kind {
 	case OpSeqScan:
 		op := n.state.(*seqScanOp)
@@ -423,13 +424,13 @@ func opOpen(ops []OpNode, exprs exprTreeSlab, idx int32, ctx *Context) error {
 	case OpFilter:
 		s := n.state.(*filterState)
 		s.ctx = ctx
-		s.exprs = exprs // wire in the shared slab for evalFastExpr
-		return opOpen(ops, exprs, n.childA, ctx)
+		s.exprs = tree.exprs // wire in the shared slab for evalFastExpr
+		return opOpen(tree, n.childA, ctx)
 
 	case OpProject:
 		s := n.state.(*projectState)
 		s.ctx = ctx
-		s.exprs = exprs // wire in the shared slab for evalFastExpr
+		s.exprs = tree.exprs // wire in the shared slab for evalFastExpr
 		ntargets := len(s.targExprs)
 		if ntargets > 0 {
 			if cap(s.outCells) < ntargets {
@@ -437,7 +438,7 @@ func opOpen(ops []OpNode, exprs exprTreeSlab, idx int32, ctx *Context) error {
 			}
 			s.outCells = s.outCells[:ntargets]
 		}
-		return opOpen(ops, exprs, n.childA, ctx)
+		return opOpen(tree, n.childA, ctx)
 
 	case OpLimit:
 		s := n.state.(*limitState)
@@ -445,11 +446,11 @@ func opOpen(ops []OpNode, exprs exprTreeSlab, idx int32, ctx *Context) error {
 		s.skipped = 0
 		s.limitCount = -1
 		s.offsetCount = 0
-		if err := opOpen(ops, exprs, n.childA, ctx); err != nil {
+		if err := opOpen(tree, n.childA, ctx); err != nil {
 			return err
 		}
 		if s.limitExprIdx != noExpr {
-			v, err := evalFastExpr(exprs, s.limitExprIdx, nil, ctx)
+			v, err := evalFastExpr(tree.exprs, s.limitExprIdx, nil, ctx)
 			if err != nil {
 				return err
 			}
@@ -459,7 +460,7 @@ func opOpen(ops []OpNode, exprs exprTreeSlab, idx int32, ctx *Context) error {
 			s.limitCount = v.Int
 		}
 		if s.offsetExprIdx != noExpr {
-			v, err := evalFastExpr(exprs, s.offsetExprIdx, nil, ctx)
+			v, err := evalFastExpr(tree.exprs, s.offsetExprIdx, nil, ctx)
 			if err != nil {
 				return err
 			}
@@ -507,27 +508,27 @@ func opOpen(ops []OpNode, exprs exprTreeSlab, idx int32, ctx *Context) error {
 // opClose closes the op-tree node at ops[idx], releasing resources.
 // Returns the first error encountered but continues closing remaining
 // nodes.
-func opClose(ops []OpNode, idx int32) error {
+func opClose(tree *opTreeSlab, idx int32) error {
 	if idx == noChild {
 		return nil
 	}
-	n := &ops[idx]
+	n := &tree.ops[idx]
 	switch n.Kind {
 	case OpSeqScan:
 		op := n.state.(*seqScanOp)
 		return op.Close()
 
 	case OpFilter:
-		return opClose(ops, n.childA)
+		return opClose(tree, n.childA)
 
 	case OpProject:
 		s := n.state.(*projectState)
 		s.outCells = nil
 		s.srcSlot.Reset()
-		return opClose(ops, n.childA)
+		return opClose(tree, n.childA)
 
 	case OpLimit:
-		return opClose(ops, n.childA)
+		return opClose(tree, n.childA)
 
 	case OpUpdate:
 		s := n.state.(*updateOpState)
@@ -570,20 +571,20 @@ func opClose(ops []OpNode, idx int32) error {
 //
 // dst is reused across calls; consumers that need to retain the row
 // past the next opNext call must copy via dst.CopyTo.
-func opNext(ops []OpNode, idx int32, dst *Slot) error {
+func opNext(tree *opTreeSlab, idx int32, dst *Slot) error {
 	if idx == noChild {
 		return EOF
 	}
-	n := &ops[idx]
+	n := &tree.ops[idx]
 	switch n.Kind {
 	case OpSeqScan:
 		return seqScanOpNext(n, dst)
 	case OpFilter:
-		return filterOpNext(ops, n, dst)
+		return filterOpNext(tree, n, dst)
 	case OpProject:
-		return projectOpNext(ops, n, dst)
+		return projectOpNext(tree, n, dst)
 	case OpLimit:
-		return limitOpNext(ops, n, dst)
+		return limitOpNext(tree, n, dst)
 	case OpUpdate:
 		return updateOpKernelNext(n, dst)
 	case OpDelete:
@@ -623,7 +624,7 @@ func seqScanOpNext(n *OpNode, dst *Slot) error {
 // filterOpNext applies the predicate and passes matching rows from
 // childA into dst. Mirrors filterOp.Next() but calls opNext on the
 // child (switch dispatch) instead of child.Next() (interface dispatch).
-func filterOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
+func filterOpNext(tree *opTreeSlab, n *OpNode, dst *Slot) error {
 	s := n.state.(*filterState)
 	rejected := 0
 	for {
@@ -634,7 +635,7 @@ func filterOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
 					Message: "canceling statement due to user request"}
 			}
 		}
-		if err := opNext(ops, n.childA, dst); err != nil {
+		if err := opNext(tree, n.childA, dst); err != nil {
 			return err
 		}
 		// DML / utility ops surface nil-row (HasRow=false).
@@ -656,10 +657,10 @@ func filterOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
 // projectOpNext evaluates the target-list expressions against the
 // child's output and writes the projected columns into dst.
 // Mirrors projectOp.Next() but uses opNext for the child call.
-func projectOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
+func projectOpNext(tree *opTreeSlab, n *OpNode, dst *Slot) error {
 	s := n.state.(*projectState)
 	s.srcSlot.Reset()
-	if err := opNext(ops, n.childA, &s.srcSlot); err != nil {
+	if err := opNext(tree, n.childA, &s.srcSlot); err != nil {
 		return err
 	}
 	// DML / utility ops surface nil-row (HasRow=false).
@@ -681,17 +682,17 @@ func projectOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
 		s.outCells[i] = v
 	}
 	dst.Cells = s.outCells
-	dst.schema = s.schema
-	dst.HasRow = true // always a real row when we reach here
+	dst.schema = tree.schemas[s.schemaIdx] // pool lookup — no GC-traced pointer in projectState
+	dst.HasRow = true                      // always a real row when we reach here
 	return nil
 }
 
 // limitOpNext enforces LIMIT / OFFSET by skipping and counting rows
 // from childA. Mirrors limitOp.Next() but uses opNext for the child.
-func limitOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
+func limitOpNext(tree *opTreeSlab, n *OpNode, dst *Slot) error {
 	s := n.state.(*limitState)
 	for s.skipped < s.offsetCount {
-		if err := opNext(ops, n.childA, dst); err != nil {
+		if err := opNext(tree, n.childA, dst); err != nil {
 			return err
 		}
 		s.skipped++
@@ -699,7 +700,7 @@ func limitOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
 	if s.limitCount >= 0 && s.emitted >= s.limitCount {
 		return EOF
 	}
-	if err := opNext(ops, n.childA, dst); err != nil {
+	if err := opNext(tree, n.childA, dst); err != nil {
 		return err
 	}
 	s.emitted++
