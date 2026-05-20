@@ -2962,6 +2962,65 @@ Operational policy (2026-05-20):
         *do not migrate* per [[0107-0008j]] (per-target memory
         amplification ~80 MiB worst case, no contention benefit because
         targets are naturally identity-sharded); per-Go-minor CI matrix.
+      - PARTIAL PROGRESS 2026-05-21 (loop 12): sixth concrete `stats.Counter`
+        consumer migration landed — the `Checkpointer`'s three aggregate
+        counters (`numTimed` timer-driven cycles, `numRequested` SQL-
+        CHECKPOINT/CLI/volume-driven cycles, `writeTimeMs` cumulative
+        `flushDirty` wall time in ms) in `internal/wal/checkpointer.go`
+        moved from `atomic.Uint64` to `stats.Counter`. The Checkpointer
+        is single-goroutine on the write side (the `Run`/`runOnce` loop
+        owns all three counters), so cross-P contention is not the
+        dominant motivation. The migration is motivated by (a)
+        uniformity of storage shape across the WAL package's
+        observability surface — `MemRing` per [[0107-0008h]] and the
+        WAL writer drain bytes per [[0107-0008k]] already use
+        `stats.Counter`; mixing seq-consistent `atomic.Uint64` with
+        eventual-consistent `stats.Counter` inside the same view
+        layer (`pg_stat_wal_io` + `pg_stat_checkpointer` rendered
+        side-by-side) would burden every reader with remembering
+        which counter has which guarantee — and (b) future-proofing
+        against a multi-writer Run loop. The two `.Add(1)` call sites
+        in `runOnce`'s spread branch stay byte-identical (untyped
+        const `1` accepted by both `atomic.Uint64.Add(uint64)` and
+        `stats.Counter.Add(int64)`); the single
+        `.Add(uint64(time.Since(flushStart).Milliseconds()))` site in
+        `flushDirty` simplifies to `.Add(time.Since(flushStart).Milliseconds())`
+        directly (`time.Duration.Milliseconds()` already returns
+        `int64`; the `uint64` cast was only for `atomic.Uint64.Add`'s
+        unsigned argument). `Stats()` reads switch from `.Load()` to
+        `uint64(.Sum())` at the boundary so the
+        `Stats.{NumTimed,NumRequested,WriteTimeMs} uint64` field types
+        and the `pg_stat_checkpointer` column-render path in
+        `internal/initdb/open.go` are preserved verbatim.
+        `lastCheckpointLSN` / `lastCheckpointRedoLSN` stay on
+        `atomic.Uint64` (LSN values, last-write-wins via `Store` — not
+        additive counters; sharding is meaningless because the
+        cross-shard sum of a stream of monotonic LSNs is not the
+        latest LSN). `statsResetAt` stays on `atomic.Int64` (set once
+        at `NewCheckpointer`; single-writer-then-read-only).
+        Memory cost: 48 KiB per server (3 × 16 KiB Counter; exactly
+        one Checkpointer per server), flat. No new tests added —
+        existing `internal/initdb/open_test.go::TestOpenRegistersStatCheckpointerView`
+        covers the three migrated counters end-to-end through the
+        public `pg_stat_checkpointer` view path (calls `CheckpointNow`,
+        scans the virtual table, observes the bumped counter values);
+        `stats.Counter`'s own race-clean suite covers the primitive
+        directly. Verified: `go test -race -count=1
+        ./internal/wal/ ./internal/stats/` (3.10s + 1.02s) PASS;
+        cross-package smoke `./internal/storage/ ./internal/aio/
+        ./internal/runtimeshim/` (5.37s + 1.04s + 1.22s) PASS.
+        `internal/initdb/...` shows pre-existing failures unrelated
+        to this change (verified by stashing the diff and reproducing
+        them on the loop-11 tip). Design:
+        `docs/design/0107-0008l-checkpointer-stats-counter-wiring.md`
+        (indexed in `docs/design/README.md`). The WAL package is now
+        fully uniform on `stats.Counter` for every additive
+        observability counter (MemRing + WAL writer drain bytes +
+        Checkpointer trio).
+        Remaining work for this sub-milestone: bufpool per-slot Sema
+        wait caller (consumes [[0107-0008c]]; blocked on M0107-0006
+        lockfree bufpool); per-target AIO migration formally closed
+        as *do not migrate* per [[0107-0008j]]; per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 

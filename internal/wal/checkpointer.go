@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/stats"
 )
 
 // DirtyPageFlusher is the buffer-pool contract used by the checkpointer.
@@ -167,9 +168,9 @@ type Checkpointer struct {
 	// write_time_ms — cumulative wall time inside flushDirty
 	// statsResetAt  — timestamp of the last counter reset
 	//                 (currently only set at construction)
-	numTimed     atomic.Uint64
-	numRequested atomic.Uint64
-	writeTimeMs  atomic.Uint64
+	numTimed     stats.Counter
+	numRequested stats.Counter
+	writeTimeMs  stats.Counter
 	statsResetAt atomic.Int64 // unix nanos
 }
 
@@ -187,9 +188,9 @@ type Stats struct {
 // pg_stat_checkpointer virtual table.
 func (c *Checkpointer) Stats() Stats {
 	return Stats{
-		NumTimed:          c.numTimed.Load(),
-		NumRequested:      c.numRequested.Load(),
-		WriteTimeMs:       c.writeTimeMs.Load(),
+		NumTimed:          uint64(c.numTimed.Sum()),
+		NumRequested:      uint64(c.numRequested.Sum()),
+		WriteTimeMs:       uint64(c.writeTimeMs.Sum()),
 		LastCheckpointLSN: c.lastCheckpointLSN.Load(),
 		StatsResetAt:      time.Unix(0, c.statsResetAt.Load()),
 	}
@@ -371,7 +372,7 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 			return fmt.Errorf("sync data files: %w", err)
 		}
 	}
-	c.writeTimeMs.Add(uint64(time.Since(flushStart).Milliseconds()))
+	c.writeTimeMs.Add(time.Since(flushStart).Milliseconds())
 	// M0102-0007: pre-compute the 0-based redo LSN so the
 	// PG-compatible checkpoint record carries the correct
 	// checkPoint.redo — PG's xlogreader validates it.
