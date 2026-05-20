@@ -1943,6 +1943,9 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           LockCommittedUpdate, InsertConflictDoUpdate, InsertConflictDoNothing,
           FkSnapshot, PartitionKeyUpdate{1,2,3,4}, InsertConflictDoUpdate4,
           ReadWriteUnique, LockCommittedKeyupdate, MergeInsertUpdate.
+          LockCommittedUpdate, InsertConflictDoUpdate, InsertConflictDoNothing,
+          FkSnapshot, PartitionKeyUpdate{1,2,3,4}, InsertConflictDoUpdate4,
+          ReadWriteUnique, LockCommittedKeyupdate, MergeInsertUpdate.
           Design: `docs/design/0100-0005-loop17-merge-not-matched-insert-and-failed-tx.md`.
           MergeDelete advances to 234/236 matching lines (trigger/concurrency
           NOTICEs in perms 17+19 still missing; root cause TBD).
