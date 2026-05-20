@@ -2261,7 +2261,18 @@ Operational policy (2026-05-20):
         int32, ...)`. `CopyInto` renamed to `CopyTo`. `BuildFast` returns
         `(*opTreeSlab, int32, error)`; `RunFast` takes same. All executor/server
         tests pass with `-race`. Design doc updated.
-      - Remaining: Phase C.3: PlanNode/ExprNode sum-types + parser mctx.
+      - **Loop-14 Phase C.3 ExprNode (partial, 2026-05-20)**: ExprNode sum-type
+        for expression evaluation. New `internal/executor/exprnode.go`: `ExprKind`
+        enum, `ExprNode` struct, `exprTreeSlab`, `buildExpr(planner.Expr) int32`,
+        `evalFastExpr(slab, idx, slot, ctx)`. `opTreeSlab` gains `exprs exprTreeSlab`
+        field; `buildRec` compiles Filter predicates and Project targets into the
+        slab. `opOpen` gains `exprs` parameter; Filter/Project states receive it at
+        Open time. `filterOpNext` and `projectOpNext` dispatch via `evalFastExpr`
+        (integer kind-switch) for ColumnRef, Int/Bool/NullConst, BinaryOp, UnaryOp;
+        ExprAdapter fallback for all other kinds (correctness preserved). 10 new
+        regression tests. All executor/server/planner/parser/mvcc/storage tests
+        PASS -race. Design doc updated.
+      - Remaining: PlanNode/ExprNode sum-types (PlanNode + parser mctx pieces).
         TPS and gcBgMarkWorker gates require perf run after all hot-path ops migrated.
 
  - [ ] **M0107-0004 — Phase D1: ProcArray + atomic XidGen + CLOG bank locks**

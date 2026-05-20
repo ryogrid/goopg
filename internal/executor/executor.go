@@ -318,14 +318,23 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		if err != nil {
 			return noChild, err
 		}
-		return tree.add(OpNode{Kind: OpFilter, childA: childIdx, childB: noChild, state: &filterState{pred: p.Predicate}}), nil
+		// Compile predicate into the expression slab (Phase C.3).
+		predIdx := tree.exprs.buildExpr(p.Predicate)
+		return tree.add(OpNode{Kind: OpFilter, childA: childIdx, childB: noChild,
+			state: &filterState{pred: p.Predicate, predIdx: predIdx}}), nil
 
 	case *planner.Project:
 		childIdx, err := tree.buildRec(p.Child)
 		if err != nil {
 			return noChild, err
 		}
-		return tree.add(OpNode{Kind: OpProject, childA: childIdx, childB: noChild, state: &projectState{plan: p, schema: p.Output()}}), nil
+		// Compile each target expression into the slab (Phase C.3).
+		targExprs := make([]int32, len(p.Targets))
+		for i, t := range p.Targets {
+			targExprs[i] = tree.exprs.buildExpr(t)
+		}
+		return tree.add(OpNode{Kind: OpProject, childA: childIdx, childB: noChild,
+			state: &projectState{plan: p, schema: p.Output(), targExprs: targExprs}}), nil
 
 	case *planner.Limit:
 		childIdx, err := tree.buildRec(p.Child)
@@ -404,7 +413,7 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 // the root index. Non-migrated operators are wrapped in an opAdapter that
 // drives the legacy Operator interface.
 func BuildFast(plan planner.Node) (*opTreeSlab, int32, error) {
-	tree := &opTreeSlab{ops: make([]OpNode, 0, 8)}
+	tree := &opTreeSlab{ops: make([]OpNode, 0, 8), exprs: make(exprTreeSlab, 0, 16)}
 	rootIdx, err := tree.buildRec(plan)
 	if err != nil {
 		return nil, noChild, err
@@ -416,7 +425,7 @@ func BuildFast(plan planner.Node) (*opTreeSlab, int32, error) {
 // opNext, and returns all rows. Rows are deep-copied via cloneRowOwned
 // so callers receive independent storage (same invariant as Run).
 func RunFast(tree *opTreeSlab, rootIdx int32, ctx *Context) ([]Row, error) {
-	if err := opOpen(tree.ops, rootIdx, ctx); err != nil {
+	if err := opOpen(tree.ops, tree.exprs, rootIdx, ctx); err != nil {
 		_ = opClose(tree.ops, rootIdx)
 		return nil, err
 	}

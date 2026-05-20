@@ -10,6 +10,7 @@
 package executor
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -641,4 +642,317 @@ func TestRunFastJoinConcrete(t *testing.T) {
 	if tree.ops[nIdx].Kind != OpJoin {
 		t.Errorf("expected OpJoin below top-level node, got Kind=%d", tree.ops[nIdx].Kind)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase C.3 — ExprNode sum-type tests.
+// ---------------------------------------------------------------------------
+
+// TestBuildExprSlabCommonKinds verifies that buildExpr compiles common
+// expression kinds into the correct ExprNode representations.
+func TestBuildExprSlabCommonKinds(t *testing.T) {
+	t.Run("ColumnRef", func(t *testing.T) {
+		var slab exprTreeSlab
+		e := &planner.ColumnRef{Index: 3}
+		idx := slab.buildExpr(e)
+		if idx != 0 {
+			t.Fatalf("expected root index 0, got %d", idx)
+		}
+		if slab[idx].Kind != ExprColumnRef {
+			t.Fatalf("expected ExprColumnRef, got %d", slab[idx].Kind)
+		}
+		// Verify column index is encoded in payload.
+		got := int(int32(binary.LittleEndian.Uint32(slab[idx].payload[:])))
+		if got != 3 {
+			t.Errorf("payload colIdx: want 3, got %d", got)
+		}
+	})
+
+	t.Run("IntegerConst", func(t *testing.T) {
+		var slab exprTreeSlab
+		e := &planner.IntegerConst{Value: 42}
+		idx := slab.buildExpr(e)
+		if slab[idx].Kind != ExprIntConst {
+			t.Fatalf("expected ExprIntConst, got %d", slab[idx].Kind)
+		}
+		got := int64(binary.LittleEndian.Uint64(slab[idx].payload[:]))
+		if got != 42 {
+			t.Errorf("payload value: want 42, got %d", got)
+		}
+	})
+
+	t.Run("BooleanConst_true", func(t *testing.T) {
+		var slab exprTreeSlab
+		e := &planner.BooleanConst{Value: true}
+		idx := slab.buildExpr(e)
+		if slab[idx].Kind != ExprBoolConst {
+			t.Fatalf("expected ExprBoolConst, got %d", slab[idx].Kind)
+		}
+		if slab[idx].payload[0] != 1 {
+			t.Errorf("expected payload[0]=1 for true, got %d", slab[idx].payload[0])
+		}
+	})
+
+	t.Run("BooleanConst_false", func(t *testing.T) {
+		var slab exprTreeSlab
+		e := &planner.BooleanConst{Value: false}
+		idx := slab.buildExpr(e)
+		if slab[idx].payload[0] != 0 {
+			t.Errorf("expected payload[0]=0 for false, got %d", slab[idx].payload[0])
+		}
+	})
+
+	t.Run("NullConst", func(t *testing.T) {
+		var slab exprTreeSlab
+		e := &planner.NullConst{}
+		idx := slab.buildExpr(e)
+		if slab[idx].Kind != ExprNullConst {
+			t.Fatalf("expected ExprNullConst, got %d", slab[idx].Kind)
+		}
+	})
+
+	t.Run("NilExpr", func(t *testing.T) {
+		var slab exprTreeSlab
+		idx := slab.buildExpr(nil)
+		if idx != noExpr {
+			t.Errorf("nil expr: want noExpr, got %d", idx)
+		}
+		if len(slab) != 0 {
+			t.Errorf("nil expr must not append nodes; len=%d", len(slab))
+		}
+	})
+
+	t.Run("BinaryOp_reserves_before_children", func(t *testing.T) {
+		var slab exprTreeSlab
+		e := &planner.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &planner.ColumnRef{Index: 0},
+			Right: &planner.IntegerConst{Value: 7},
+		}
+		rootIdx := slab.buildExpr(e)
+		// Root must be index 0 (BinaryOp reserved first).
+		if rootIdx != 0 {
+			t.Fatalf("root index: want 0, got %d", rootIdx)
+		}
+		if slab[0].Kind != ExprBinaryOp {
+			t.Fatalf("slab[0] kind: want ExprBinaryOp, got %d", slab[0].Kind)
+		}
+		if slab[0].payload[0] != uint8(parser.OpEq) {
+			t.Errorf("op code: want %d, got %d", uint8(parser.OpEq), slab[0].payload[0])
+		}
+		// Children must be at indices 1 and 2.
+		if slab[0].childA != 1 {
+			t.Errorf("childA: want 1, got %d", slab[0].childA)
+		}
+		if slab[0].childB != 2 {
+			t.Errorf("childB: want 2, got %d", slab[0].childB)
+		}
+		if slab[1].Kind != ExprColumnRef {
+			t.Errorf("childA kind: want ExprColumnRef, got %d", slab[1].Kind)
+		}
+		if slab[2].Kind != ExprIntConst {
+			t.Errorf("childB kind: want ExprIntConst, got %d", slab[2].Kind)
+		}
+	})
+
+	t.Run("UnknownKind_falls_back_to_adapter", func(t *testing.T) {
+		var slab exprTreeSlab
+		// StringConst is not handled natively → ExprAdapter.
+		e := &planner.StringConst{Value: "hello"}
+		idx := slab.buildExpr(e)
+		if slab[idx].Kind != ExprAdapter {
+			t.Fatalf("expected ExprAdapter for StringConst, got %d", slab[idx].Kind)
+		}
+		if slab[idx].orig == nil {
+			t.Error("ExprAdapter.orig must be non-nil")
+		}
+	})
+}
+
+// TestEvalFastExprCommonKinds verifies evalFastExpr returns the expected Datum
+// for each natively-handled expression kind.
+func TestEvalFastExprCommonKinds(t *testing.T) {
+	// Build a simple 3-column slot: [int(10), bool(true), null].
+	slot := &Slot{
+		Cells:  []Datum{NewIntDatum(10), NewBoolDatum(true), NullDatum},
+		HasRow: true,
+	}
+
+	t.Run("noExpr_returns_null", func(t *testing.T) {
+		var slab exprTreeSlab
+		d, err := evalFastExpr(slab, noExpr, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !d.IsNull() {
+			t.Errorf("noExpr: want NullDatum, got Kind=%d", d.Kind)
+		}
+	})
+
+	t.Run("ColumnRef_reads_slot", func(t *testing.T) {
+		var slab exprTreeSlab
+		idx := slab.buildExpr(&planner.ColumnRef{Index: 0})
+		d, err := evalFastExpr(slab, idx, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Kind != KindInt || d.Int != 10 {
+			t.Errorf("ColumnRef[0]: want KindInt(10), got %v/%v", d.Kind, d.Int)
+		}
+	})
+
+	t.Run("ColumnRef_null_column", func(t *testing.T) {
+		var slab exprTreeSlab
+		idx := slab.buildExpr(&planner.ColumnRef{Index: 2})
+		d, err := evalFastExpr(slab, idx, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !d.IsNull() {
+			t.Errorf("ColumnRef[2]: want NullDatum, got Kind=%d", d.Kind)
+		}
+	})
+
+	t.Run("IntConst", func(t *testing.T) {
+		var slab exprTreeSlab
+		idx := slab.buildExpr(&planner.IntegerConst{Value: 99})
+		d, err := evalFastExpr(slab, idx, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Kind != KindInt || d.Int != 99 {
+			t.Errorf("IntConst: want 99, got %v/%v", d.Kind, d.Int)
+		}
+	})
+
+	t.Run("BoolConst_true", func(t *testing.T) {
+		var slab exprTreeSlab
+		idx := slab.buildExpr(&planner.BooleanConst{Value: true})
+		d, err := evalFastExpr(slab, idx, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Kind != KindBool || !d.BoolValue() {
+			t.Errorf("BoolConst(true): want true, got Kind=%d val=%v", d.Kind, d.BoolValue())
+		}
+	})
+
+	t.Run("NullConst", func(t *testing.T) {
+		var slab exprTreeSlab
+		idx := slab.buildExpr(&planner.NullConst{})
+		d, err := evalFastExpr(slab, idx, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !d.IsNull() {
+			t.Errorf("NullConst: want null, got Kind=%d", d.Kind)
+		}
+	})
+
+	t.Run("BinaryOp_eq_true", func(t *testing.T) {
+		var slab exprTreeSlab
+		e := &planner.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &planner.ColumnRef{Index: 0}, // 10
+			Right: &planner.IntegerConst{Value: 10},
+		}
+		idx := slab.buildExpr(e)
+		d, err := evalFastExpr(slab, idx, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Kind != KindBool || !d.BoolValue() {
+			t.Errorf("10=10: expected true, got Kind=%d val=%v", d.Kind, d.BoolValue())
+		}
+	})
+
+	t.Run("BinaryOp_eq_false", func(t *testing.T) {
+		var slab exprTreeSlab
+		e := &planner.BinaryOp{
+			Op:    parser.OpEq,
+			Left:  &planner.ColumnRef{Index: 0}, // 10
+			Right: &planner.IntegerConst{Value: 5},
+		}
+		idx := slab.buildExpr(e)
+		d, err := evalFastExpr(slab, idx, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Kind != KindBool || d.BoolValue() {
+			t.Errorf("10=5: expected false, got Kind=%d val=%v", d.Kind, d.BoolValue())
+		}
+	})
+
+	t.Run("BinaryOp_and_short_circuit", func(t *testing.T) {
+		var slab exprTreeSlab
+		// FALSE AND <anything> → FALSE without evaluating right.
+		// Right side has an out-of-bounds ColumnRef that would panic if evaluated.
+		e := &planner.BinaryOp{
+			Op:    parser.OpAnd,
+			Left:  &planner.BooleanConst{Value: false},
+			Right: &planner.ColumnRef{Index: 999}, // would panic if reached
+		}
+		idx := slab.buildExpr(e)
+		d, err := evalFastExpr(slab, idx, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Kind != KindBool || d.BoolValue() {
+			t.Errorf("FALSE AND ...: expected false, got %v", d)
+		}
+	})
+
+	t.Run("ExprAdapter_delegates_to_evalExprSlot", func(t *testing.T) {
+		var slab exprTreeSlab
+		// StringConst → ExprAdapter → evalExprSlot.
+		e := &planner.StringConst{Value: "hello"}
+		idx := slab.buildExpr(e)
+		d, err := evalFastExpr(slab, idx, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Kind != KindString || d.StringValue() != "hello" {
+			t.Errorf("ExprAdapter(StringConst): want 'hello', got Kind=%d val=%q", d.Kind, d.StringValue())
+		}
+	})
+}
+
+// TestRunFastFilterExprNodePopulated verifies that after BuildFast the
+// expression slab is non-empty for a plan with a filter predicate, and that
+// the filter operator's state references it correctly.
+func TestRunFastFilterExprNodePopulated(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	plan := planOne(t, "SELECT id FROM items WHERE id > 1", cat)
+	tree, rootIdx, err := BuildFast(plan)
+	if err != nil {
+		t.Fatalf("BuildFast: %v", err)
+	}
+	if len(tree.exprs) == 0 {
+		t.Error("exprTreeSlab is empty after BuildFast with filter predicate")
+	}
+
+	// Walk to the Filter node (may be under a Project).
+	nIdx := rootIdx
+	if tree.ops[nIdx].Kind == OpProject {
+		nIdx = tree.ops[nIdx].childA
+	}
+	if tree.ops[nIdx].Kind != OpFilter {
+		t.Fatalf("expected OpFilter below top-level node, got Kind=%d", tree.ops[nIdx].Kind)
+	}
+	fs := tree.ops[nIdx].state.(*filterState)
+	if fs.predIdx == noExpr {
+		t.Error("filterState.predIdx must not be noExpr for a non-nil predicate")
+	}
+	// exprs not set yet (set at Open time); predIdx must reference a valid node.
+	if int(fs.predIdx) >= len(tree.exprs) {
+		t.Errorf("predIdx %d out of range (slab len=%d)", fs.predIdx, len(tree.exprs))
+	}
+
+	// Full round-trip: verify results match legacy path.
+	runBothAndCompare(t, plan, ctx)
 }

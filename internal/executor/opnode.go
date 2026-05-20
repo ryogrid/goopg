@@ -184,7 +184,8 @@ const noChild int32 = -1
 // opNodeOperator and OpIterator hold a *opTreeSlab pointer so they always
 // see the final slice, even if append relocated the backing array during build.
 type opTreeSlab struct {
-	ops []OpNode
+	ops   []OpNode
+	exprs exprTreeSlab // expression-tree slab (Phase C.3); immutable after BuildFast
 }
 
 // add appends n to the slab and returns its index.
@@ -222,17 +223,21 @@ type OpNode struct {
 
 // filterState is the per-node state for OpFilter.
 type filterState struct {
-	pred planner.Expr
-	ctx  *Context
+	pred    planner.Expr // kept as ExprAdapter fallback origin; evalFastExpr uses predIdx
+	predIdx int32        // root index into exprs slab (noExpr for nil predicate)
+	exprs   exprTreeSlab // set at Open time from the shared opTreeSlab.exprs
+	ctx     *Context
 }
 
 // projectState is the per-node state for OpProject.
 type projectState struct {
-	plan     *planner.Project
-	schema   planner.Schema
-	ctx      *Context
-	srcSlot  Slot    // temp slot for the child's output
-	outCells []Datum // persistent output buffer, reused across Next calls
+	plan      *planner.Project
+	schema    planner.Schema
+	ctx       *Context
+	srcSlot   Slot     // temp slot for the child's output
+	outCells  []Datum  // persistent output buffer, reused across Next calls
+	targExprs []int32  // root indices into exprs slab (one per target)
+	exprs     exprTreeSlab // set at Open time from the shared opTreeSlab.exprs
 }
 
 // limitState is the per-node state for OpLimit.
@@ -291,7 +296,9 @@ type opNodeOperator struct {
 	dst    Slot
 }
 
-func (w *opNodeOperator) Open(ctx *Context) error { return opOpen(w.tree.ops, w.idx, ctx) }
+func (w *opNodeOperator) Open(ctx *Context) error {
+	return opOpen(w.tree.ops, w.tree.exprs, w.idx, ctx)
+}
 
 func (w *opNodeOperator) Next() (TupleSlot, error) {
 	w.dst.Reset()
@@ -335,7 +342,9 @@ func BuildFastIterator(plan planner.Node) (*OpIterator, error) {
 }
 
 // Open implements Operator.
-func (it *OpIterator) Open(ctx *Context) error { return opOpen(it.tree.ops, it.rootIdx, ctx) }
+func (it *OpIterator) Open(ctx *Context) error {
+	return opOpen(it.tree.ops, it.tree.exprs, it.rootIdx, ctx)
+}
 
 // Next implements Operator. Returns nil TupleSlot for DML nil-rows (preserving
 // the legacy nil-slot convention that the dispatch loop checks with schema==nil).
@@ -399,7 +408,9 @@ func (it *OpIterator) RowsAffected() int64 {
 
 // opOpen opens the op-tree node at ops[idx]. ctx is the execution context
 // for the statement; all operators in the tree receive it.
-func opOpen(ops []OpNode, idx int32, ctx *Context) error {
+// exprs is the shared expression-tree slab; filter and project nodes
+// store it at Open time so filterOpNext / projectOpNext can call evalFastExpr.
+func opOpen(ops []OpNode, exprs exprTreeSlab, idx int32, ctx *Context) error {
 	if idx == noChild {
 		return nil
 	}
@@ -412,18 +423,21 @@ func opOpen(ops []OpNode, idx int32, ctx *Context) error {
 	case OpFilter:
 		s := n.state.(*filterState)
 		s.ctx = ctx
-		return opOpen(ops, n.childA, ctx)
+		s.exprs = exprs // wire in the shared slab for evalFastExpr
+		return opOpen(ops, exprs, n.childA, ctx)
 
 	case OpProject:
 		s := n.state.(*projectState)
 		s.ctx = ctx
-		if len(s.plan.Targets) > 0 {
-			if cap(s.outCells) < len(s.plan.Targets) {
-				s.outCells = make([]Datum, len(s.plan.Targets))
+		s.exprs = exprs // wire in the shared slab for evalFastExpr
+		ntargets := len(s.plan.Targets)
+		if ntargets > 0 {
+			if cap(s.outCells) < ntargets {
+				s.outCells = make([]Datum, ntargets)
 			}
-			s.outCells = s.outCells[:len(s.plan.Targets)]
+			s.outCells = s.outCells[:ntargets]
 		}
-		return opOpen(ops, n.childA, ctx)
+		return opOpen(ops, exprs, n.childA, ctx)
 
 	case OpLimit:
 		s := n.state.(*limitState)
@@ -431,7 +445,7 @@ func opOpen(ops []OpNode, idx int32, ctx *Context) error {
 		s.skipped = 0
 		s.limitCount = -1
 		s.offsetCount = 0
-		if err := opOpen(ops, n.childA, ctx); err != nil {
+		if err := opOpen(ops, exprs, n.childA, ctx); err != nil {
 			return err
 		}
 		if s.plan.Limit != nil {
@@ -630,7 +644,7 @@ func filterOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
 		if !dst.HasRow {
 			return nil
 		}
-		v, err := evalExprSlot(s.pred, dst, s.ctx)
+		v, err := evalFastExpr(s.exprs, s.predIdx, dst, s.ctx)
 		if err != nil {
 			return err
 		}
@@ -656,14 +670,13 @@ func projectOpNext(ops []OpNode, n *OpNode, dst *Slot) error {
 		dst.Reset()
 		return nil
 	}
-	inRow := Row(s.srcSlot.Cells)
-	targets := s.plan.Targets
-	if cap(s.outCells) < len(targets) {
-		s.outCells = make([]Datum, len(targets))
+	ntargets := len(s.targExprs)
+	if cap(s.outCells) < ntargets {
+		s.outCells = make([]Datum, ntargets)
 	}
-	s.outCells = s.outCells[:len(targets)]
-	for i, t := range targets {
-		v, err := evalExpr(t, inRow, s.ctx)
+	s.outCells = s.outCells[:ntargets]
+	for i, predIdx := range s.targExprs {
+		v, err := evalFastExpr(s.exprs, predIdx, &s.srcSlot, s.ctx)
 		if err != nil {
 			return err
 		}

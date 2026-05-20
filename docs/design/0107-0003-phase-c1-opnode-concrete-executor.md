@@ -201,8 +201,21 @@ The dispatch loop is unchanged; `*OpIterator` implements `Operator` and
   `BuildFast` returns `(*opTreeSlab, int32, error)`; `RunFast` takes
   `(*opTreeSlab, int32, *Context)`. All executor/server/planner/parser tests
   pass with `-race`.
-- **Phase C.3**: move plan tree into mctx; delete parser/planner GC-heap alloc;
-  add `Slot.CopyTo(dst *Slot, dstCtx *mctx.Context)` with mctx-backed allocation
+- **Phase C.3 PARTIAL** (loop 14): ExprNode sum-type for expression evaluation
+  landed. New `internal/executor/exprnode.go` adds `ExprKind` enum, `ExprNode`
+  tagged-union struct, `exprTreeSlab` type with `buildExpr(planner.Expr) int32`,
+  and `evalFastExpr(slab, idx, slot, ctx)` dispatcher. `opTreeSlab` gains an
+  `exprs exprTreeSlab` field; `buildRec` compiles Filter predicates and Project
+  target expressions into the slab at plan-build time. `opOpen` gains an
+  `exprs exprTreeSlab` parameter so Filter/Project states receive the slab at
+  open time. `filterOpNext` and `projectOpNext` now call `evalFastExpr` instead
+  of `evalExprSlot`/`evalExpr`, eliminating interface type assertions for
+  `ColumnRef`, `IntegerConst`, `BooleanConst`, `NullConst`, `BinaryOp`, and
+  `UnaryOp`. All other expression kinds fall back to `ExprAdapter`
+  (delegates to `evalExprSlot`), preserving correctness. 10 new regression
+  tests in `phase_c_test.go`. All executor/server tests pass `-race`.
+  **Remaining C.3 work**: PlanNode sum-type, parser mctx (delete `tokenSlicePool`
+  / `parserPool`), and `OpNode.state any` → raw bytes (requires mctx for plan tree).
 - **Performance gate**: verify `runtime.itabHashFunc` drops from top-40 once
   all hot-path operators are migrated
 
@@ -220,3 +233,16 @@ The dispatch loop is unchanged; `*OpIterator` implements `Operator` and
   TestRunFastJoinConcrete, OpInsert+OpJoin cases in TestBuildFastNodeKinds
 - `internal/server/dispatch.go` (modified) — executor.Build → BuildFastIterator
   in executeOneSimpleStmt and executeFetchAll (2 sites)
+
+### Phase C.3 (loop 14) — ExprNode sum-type
+
+- `internal/executor/exprnode.go` (new) — ExprKind enum, ExprNode struct,
+  exprTreeSlab type, buildExpr(), evalFastExpr()
+- `internal/executor/opnode.go` (modified) — opTreeSlab.exprs field;
+  filterState.{predIdx, exprs}; projectState.{targExprs, exprs};
+  opOpen signature adds exprs; Filter/Project Open wires exprs;
+  filterOpNext/projectOpNext use evalFastExpr
+- `internal/executor/executor.go` (modified) — BuildFast initialises exprs slab;
+  buildRec Filter/Project cases compile expressions; RunFast passes tree.exprs
+- `internal/executor/phase_c_test.go` (modified) — TestBuildExprSlabCommonKinds,
+  TestEvalFastExprCommonKinds, TestRunFastFilterExprNodePopulated
