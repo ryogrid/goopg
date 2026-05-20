@@ -2757,6 +2757,35 @@ Operational policy (2026-05-20):
         wait caller (consumes [[0107-0008c]]); first concrete
         `stats.Counter` consumer migration (e.g. heap rows-scanned,
         buffers-hit, tuples-returned); per-Go-minor CI matrix.
+      - PARTIAL PROGRESS 2026-05-21 (loop 7): first concrete `stats.Counter`
+        consumer migration landed — `(*BTree).Inserts` and `.Splits` write-
+        path counters in `internal/access/btree/btree.go` moved from
+        `atomic.AddUint64` / `LoadUint64` / `StoreUint64` against a shared
+        `BTreeStats` field to a private `btreeStatsCounters{ inserts,
+        splits stats.Counter }`. Hot path (`Insert`, ~22.7 K/s at the M0055
+        baseline bench, ≥10 K writers in the M0055 multi-writer stress)
+        now bumps the local P's shard with no cross-core cache-line
+        invalidation. Public `BTreeStats` snapshot type unchanged (same
+        field set, same `uint64` types, same zero value); `Stats()` returns
+        `BTreeStats{Inserts: uint64(.Sum()), Splits: uint64(.Sum())}` so
+        every existing reader compiles and observes the same value
+        (M0055-baseline-summary verified: 100 000 inserts in → 100 000
+        reported by Stats out, splits = 352). `ResetStats()` calls
+        `.Reset()` on each. Memory cost: 32 KiB per BTree (2 × 16 KiB
+        Counter) — bounded by index count, not row count. Verified:
+        `go test -race -count=1 ./internal/access/btree/...` (13.4 s) +
+        `go test -race -count=1 ./internal/stats/...` (1.0 s) both PASS.
+        No new tests added — the existing M0055 baseline / Phase-B benches
+        already assert exact counter totals end-to-end through the new
+        code path; the `stats.Counter` package's own race-clean suite
+        covers the primitive directly. Design:
+        `docs/design/0107-0008g-btree-stats-counter-wiring.md` (indexed in
+        `docs/design/README.md`).
+        Remaining work for this sub-milestone: bufpool per-slot Sema
+        wait caller (consumes [[0107-0008c]]); further `stats.Counter`
+        consumer migrations (executor row counters, bufpool hit/miss
+        after the lockfree rewrite, WAL byte counters) as separate
+        loops; per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 

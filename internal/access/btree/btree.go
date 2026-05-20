@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/goopg/goopg/internal/stats"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -518,10 +519,11 @@ type BTree struct {
 	splitMu sync.Mutex
 
 	// M0055-0001: write-path counters used by the baseline
-	// harness and Phase A/B regression tests. All atomic so they
-	// can be read concurrently without locking. Reset by
-	// `(*BTree).ResetStats`.
-	stats BTreeStats
+	// harness and Phase A/B regression tests. Backed by per-P
+	// sharded counters (M0107-0008 loop 7) so the Insert/Split
+	// hot path does not contend on a single cache line; Stats
+	// reads them via Counter.Sum, ResetStats via Counter.Reset.
+	stats btreeStatsCounters
 
 	// M0055-0002-followup-rightmost-cache: cached rightmost leaf
 	// pointer for append-shaped workloads. Written by the insert
@@ -608,20 +610,29 @@ type BTreeStats struct {
 	Splits  uint64 // total leaf+internal page splits
 }
 
+// btreeStatsCounters is the on-tree storage backing BTreeStats.
+// Each counter is a per-P sharded stats.Counter so the Insert /
+// split hot paths bump local shards without cross-core cache-line
+// invalidation. (M0107-0008 loop 7.)
+type btreeStatsCounters struct {
+	inserts stats.Counter
+	splits  stats.Counter
+}
+
 // Stats returns a snapshot of the BTree's write-path counters.
 // Snapshot is best-effort — concurrent inserts may make the
 // returned numbers stale by the time the caller reads them.
 func (bt *BTree) Stats() BTreeStats {
 	return BTreeStats{
-		Inserts: atomic.LoadUint64(&bt.stats.Inserts),
-		Splits:  atomic.LoadUint64(&bt.stats.Splits),
+		Inserts: uint64(bt.stats.inserts.Sum()),
+		Splits:  uint64(bt.stats.splits.Sum()),
 	}
 }
 
 // ResetStats clears the BTree's write-path counters.
 func (bt *BTree) ResetStats() {
-	atomic.StoreUint64(&bt.stats.Inserts, 0)
-	atomic.StoreUint64(&bt.stats.Splits, 0)
+	bt.stats.inserts.Reset()
+	bt.stats.splits.Reset()
 }
 
 // LogSplitFunc emits the atomic page-split WAL record described in
@@ -1064,7 +1075,7 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 // Insert places (key, ptr) into the leaf where it belongs, splitting
 // pages on the way up if needed.
 func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
-	atomic.AddUint64(&bt.stats.Inserts, 1) // M0055-0001
+	bt.stats.inserts.Add(1) // M0055-0001 (per-P via M0107-0008 loop 7)
 	it := item{
 		keyLen: uint16(len(key)),
 		ptr:    ptr,
@@ -1086,7 +1097,7 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 	// work beyond M0055's scope. The race-safe createNewRoot
 	// in this commit handles concurrent root-lifts; the rest
 	// of the structural-update path remains under splitMu.)
-	atomic.AddUint64(&bt.stats.Splits, 1) // M0055-0001 — counts insert calls that take the split-path retry.
+	bt.stats.splits.Add(1) // M0055-0001 (per-P via M0107-0008 loop 7) — counts insert calls that take the split-path retry.
 	bt.splitMu.Lock()
 	defer bt.splitMu.Unlock()
 
