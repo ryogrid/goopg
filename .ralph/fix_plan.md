@@ -2817,6 +2817,52 @@ Operational policy (2026-05-20):
         wait caller (consumes [[0107-0008c]]); AIO Engine
         submitted/completed counter family (coupled to wider
         `pg_stat_io` view-shape unification); per-Go-minor CI matrix.
+      - PARTIAL PROGRESS 2026-05-21 (loop 9): third concrete `stats.Counter`
+        consumer migration landed — AIO `Engine`'s three aggregate
+        totals (`submitted`, `completed`, `errored`) in
+        `internal/aio/aio.go` moved from `atomic.Uint64` to
+        `stats.Counter`. Hot path is `(*Engine).Submit` (one bump per
+        I/O) and `(*Engine).finishHandle` (one bump per completion +
+        conditional error bump) — called on every buffer-pool/WAL/
+        walsender/checkpointer I/O. Under `method=worker` the bumps
+        come from multiple worker goroutines concurrently; the shared
+        cache line for `completed` previously hopped between cores on
+        every completion. Cold-path reader is `Engine.Stats()` only,
+        feeding goopg's `pg_stat_io` view; uses `uint64(.Sum())` casts
+        at the boundary so `Stats.Submitted/Completed/Errored uint64`
+        field types and observed numbers are preserved verbatim. The
+        three `.Add(1)` call sites are byte-identical (untyped const
+        `1` accepted by both `atomic.Uint64.Add(uint64)` and
+        `stats.Counter.Add(int64)`). Per-direction (`readSubmitted`,
+        `writeSubmitted`, `readCompleted`, `writeCompleted`,
+        `readErrored`, `writeErrored`), per-target (`*targetStats`),
+        and latency `SumMicros`/`MaxMicros` fields are explicitly out
+        of scope this loop — they couple to a wider `pg_stat_io`
+        view-shape unification and migrate together in a later loop
+        per [[0107-0008h]]'s "Why not a smaller change" decision.
+        `inFlight`, `nextID`, and latency-Max fields remain `atomic.*`
+        (Max needs CAS; inFlight is a signed gauge against the
+        inflight map; nextID is a monotonic id allocator, not a
+        counter). Memory cost: 48 KiB per server (3 × 16 KiB Counter;
+        exactly one Engine per server). No new tests added — existing
+        `internal/aio/aio_test.go` already covers the three migrated
+        counters via the public `Stats()` API end-to-end; the
+        `stats.Counter` package's own race-clean suite covers the
+        primitive directly. Verified: `go test -race -count=1
+        ./internal/aio/` (1.03 s) + `go test -race -count=1
+        ./internal/stats/` (1.02 s) + cross-package smoke
+        `./internal/storage/ ./internal/wal/ ./internal/aio/
+        ./internal/stats/ ./internal/runtimeshim/` all PASS.
+        `internal/initdb/...` shows pre-existing failures unrelated to
+        this change (same set as loop 5; reproduced on `master` by
+        stashing the diff). Design:
+        `docs/design/0107-0008i-aio-engine-totals-stats-counter-wiring.md`
+        (indexed in `docs/design/README.md`).
+        Remaining work for this sub-milestone: bufpool per-slot Sema
+        wait caller (consumes [[0107-0008c]]); wider AIO migration
+        (per-direction + per-target + latency SumMicros families,
+        coupled to `pg_stat_io` view-shape unification);
+        per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 

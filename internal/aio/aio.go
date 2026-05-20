@@ -46,6 +46,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/goopg/goopg/internal/stats"
 )
 
 // Direction is the read-vs-write flavour of an Op.
@@ -205,9 +207,9 @@ type Method interface {
 type Engine struct {
 	method    Method
 	inFlight  atomic.Int64
-	submitted atomic.Uint64
-	completed atomic.Uint64
-	errored   atomic.Uint64
+	submitted stats.Counter
+	completed stats.Counter
+	errored   stats.Counter
 
 	// Per-direction breakdown of the same counters above.
 	// `submitted` / `completed` / `errored` are the totals;
@@ -622,9 +624,9 @@ func (e *Engine) InFlight() []InFlightInfo {
 func (e *Engine) Stats() Stats {
 	return Stats{
 		Method:         e.method.Name(),
-		Submitted:      e.submitted.Load(),
-		Completed:      e.completed.Load(),
-		Errored:        e.errored.Load(),
+		Submitted:      uint64(e.submitted.Sum()),
+		Completed:      uint64(e.completed.Sum()),
+		Errored:        uint64(e.errored.Sum()),
 		InFlight:       e.inFlight.Load(),
 		ReadSubmitted:         e.readSubmitted.Load(),
 		ReadCompleted:         e.readCompleted.Load(),
