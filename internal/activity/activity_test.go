@@ -4,6 +4,12 @@ import (
 	"testing"
 )
 
+// procNumOf returns the expected procNum for a numeric PID string.
+// Mirrors ActivityRegistry.procNumForPID logic.
+func procNumOf(pid uint32) int32 {
+	return int32((uint64(pid) - 1) % 1024)
+}
+
 func TestRegisterAndUnregister(t *testing.T) {
 	r := NewRegistry()
 	r.Register(&Backend{
@@ -27,7 +33,8 @@ func TestRegisterAndUnregister(t *testing.T) {
 func TestUpdateState(t *testing.T) {
 	r := NewRegistry()
 	r.Register(&Backend{PID: "1", State: "active"})
-	r.UpdateState("1", "idle", "SELECT 1")
+	// PID "1" → procNum 0.
+	r.UpdateState(procNumOf(1), "idle", "SELECT 1")
 	snap := r.Snapshot()
 	if snap[0].State != "idle" {
 		t.Errorf("state = %q, want idle", snap[0].State)
@@ -39,8 +46,8 @@ func TestUpdateState(t *testing.T) {
 
 func TestUpdateStateNonExistent(t *testing.T) {
 	r := NewRegistry()
-	// Must not panic or error.
-	r.UpdateState("999", "idle", "SELECT 1")
+	// Unregistered procNum — must not panic or error.
+	r.UpdateState(procNumOf(999), "idle", "SELECT 1")
 }
 
 func TestBeginEndTransaction(t *testing.T) {
@@ -67,7 +74,9 @@ func TestBeginEndTransaction(t *testing.T) {
 func TestWaitEventStartEnd(t *testing.T) {
 	r := NewRegistry()
 	r.Register(&Backend{PID: "1", State: "active"})
-	r.WaitEventStart("1", "IO", "AIO")
+	// PID "1" → procNum 0; WaitEventStart is now an atomic store.
+	pn := procNumOf(1)
+	r.WaitEventStart(pn, "IO", "AIO")
 	snap := r.Snapshot()
 	if snap[0].WaitEventType != "IO" {
 		t.Errorf("wait_event_type = %q, want IO", snap[0].WaitEventType)
@@ -75,7 +84,7 @@ func TestWaitEventStartEnd(t *testing.T) {
 	if snap[0].WaitEvent != "AIO" {
 		t.Errorf("wait_event = %q, want AIO", snap[0].WaitEvent)
 	}
-	r.WaitEventEnd("1")
+	r.WaitEventEnd(pn)
 	snap = r.Snapshot()
 	if snap[0].WaitEventType != "" {
 		t.Errorf("wait_event_type = %q, want empty after end", snap[0].WaitEventType)
@@ -87,9 +96,11 @@ func TestWaitEventStartEnd(t *testing.T) {
 
 func TestWaitEventNonExistent(t *testing.T) {
 	r := NewRegistry()
-	// Must not panic or error.
-	r.WaitEventStart("999", "IO", "test")
-	r.WaitEventEnd("999")
+	// Unregistered procNum — must not panic or error.
+	// cold == nil at this slot, so WaitEventStart just does an atomic store
+	// and the wait event is ignored by Snapshot (slot has no cold).
+	r.WaitEventStart(procNumOf(999), "IO", "test")
+	r.WaitEventEnd(procNumOf(999))
 }
 
 // TestGoroutineIDProducesDistinctValues verifies the M0053-0006 fix to
@@ -122,17 +133,18 @@ func TestGoroutineIDProducesDistinctValues(t *testing.T) {
 
 // TestRegisterCurrentGoroutineIsolatesPerGoroutine confirms that
 // concurrent goroutines do not stomp on each other's
-// RegisterCurrentGoroutine entries — the pre-M0053-0006 bug let the
+// SetCurrentGoroutine entries — the pre-M0053-0006 bug let the
 // last writer win and shadowed the checkpointer registration.
 func TestRegisterCurrentGoroutineIsolatesPerGoroutine(t *testing.T) {
 	reg := NewRegistry()
-	reg.Register(&Backend{PID: "checkpointer-pid", BackendType: "checkpointer", State: "active"})
-	reg.Register(&Backend{PID: "client-pid", BackendType: "client_backend", State: "active"})
+	// Use RegisterBackground for non-numeric PIDs to guarantee distinct slots.
+	cpProcNum := reg.RegisterBackground(0, &Backend{PID: "checkpointer-pid", BackendType: "checkpointer", State: "active"})
+	clProcNum := reg.RegisterBackground(1, &Backend{PID: "client-pid", BackendType: "client_backend", State: "active"})
 
 	// Goroutine A pretends to be the checkpointer.
 	doneA := make(chan string, 1)
 	go func() {
-		RegisterCurrentGoroutine(reg, "checkpointer-pid")
+		SetCurrentGoroutine(reg, cpProcNum)
 		// Don't clear — the checkpointer registration must persist for
 		// the entire goroutine lifetime in production.
 		_, pid := LookupGoroutine()
@@ -142,7 +154,7 @@ func TestRegisterCurrentGoroutineIsolatesPerGoroutine(t *testing.T) {
 	// Goroutine B pretends to be a connection handler.
 	doneB := make(chan string, 1)
 	go func() {
-		RegisterCurrentGoroutine(reg, "client-pid")
+		SetCurrentGoroutine(reg, clProcNum)
 		defer ClearCurrentGoroutine()
 		_, pid := LookupGoroutine()
 		doneB <- pid

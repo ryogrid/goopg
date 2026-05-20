@@ -37,14 +37,14 @@ func (w *spillWriter) WriteRow(row Row) error {
 	// Prefix with total length for framing.
 	lenBuf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBuf, uint32(len(w.buf)))
-	reg, pid := activity.LookupGoroutine()
-	if reg != nil {
-		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileWrite)
+	reg, procNum, okReg := activity.LookupCurrentGoroutine()
+	if okReg {
+		reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitBuffileWrite)
 	}
 	_, err1 := w.f.Write(lenBuf)
 	_, err2 := w.f.Write(w.buf)
-	if reg != nil {
-		reg.WaitEventEnd(pid)
+	if okReg {
+		reg.WaitEventEnd(procNum)
 	}
 	if err1 != nil {
 		return err1
@@ -101,13 +101,13 @@ func (r *spillReader) ReadRow() (Row, error) {
 // across calls.
 func (r *spillReader) ReadRowInto(dst Row) (Row, error) {
 	var lenBuf [4]byte
-	reg, pid := activity.LookupGoroutine()
-	if reg != nil {
-		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileRead)
+	reg, procNum, okReg := activity.LookupCurrentGoroutine()
+	if okReg {
+		reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitBuffileRead)
 	}
 	_, errLen := io.ReadFull(r.f, lenBuf[:])
-	if reg != nil {
-		reg.WaitEventEnd(pid)
+	if okReg {
+		reg.WaitEventEnd(procNum)
 	}
 	if errLen != nil {
 		return nil, errLen
@@ -121,12 +121,12 @@ func (r *spillReader) ReadRowInto(dst Row) (Row, error) {
 		r.dataBuf = r.dataBuf[:dataLen]
 	}
 	data := r.dataBuf
-	if reg != nil {
-		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileRead)
+	if okReg {
+		reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitBuffileRead)
 	}
 	_, errData := io.ReadFull(r.f, data)
-	if reg != nil {
-		reg.WaitEventEnd(pid)
+	if okReg {
+		reg.WaitEventEnd(procNum)
 	}
 	if errData != nil {
 		return nil, fmt.Errorf("spillReader: truncated row: %w", errData)

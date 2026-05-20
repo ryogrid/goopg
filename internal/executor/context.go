@@ -106,7 +106,8 @@ type Context struct {
 	// pg_catalog.pg_stat_activity. nil disables tracking.
 	Activity *activity.Registry
 
-	// ActivityPID identifies this backend in the activity registry.
+	// ActivityPID is kept for backward compat but unused; use ProcNum + Activity instead.
+	// Deprecated: will be removed in a future cleanup pass.
 	ActivityPID string
 
 	// LockMgr, when set, is consulted by SQL-touching operators
@@ -284,9 +285,9 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	if c.LockMgr == nil {
 		return nil
 	}
-	// Record wait event for lock waits.
-	if c.Activity != nil && c.ActivityPID != "" {
-		c.Activity.WaitEventStart(c.ActivityPID, activity.WaitTypeLock, activity.WaitRelationLock)
+	// Record wait event for lock waits using the atomic hot path (M0107-0005).
+	if c.Activity != nil {
+		c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitRelationLock)
 	}
 	lockCtx := context.Background()
 	if c.Ctx != nil {
@@ -294,8 +295,8 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	}
 	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
 	err := c.LockMgr.Acquire(lockCtx, c.BackendID, tag, mode)
-	if c.Activity != nil && c.ActivityPID != "" {
-		c.Activity.WaitEventEnd(c.ActivityPID)
+	if c.Activity != nil {
+		c.Activity.WaitEventEnd(c.ProcNum)
 	}
 	if err == nil {
 		return nil

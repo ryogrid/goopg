@@ -667,7 +667,11 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	defer sessCtx.Release()
 
 	// Register backend in the pg_stat_activity registry.
+	// M0107-0005: compute procNum here so the client-I/O hot-path closures
+	// can call WaitEventStart(procNum, ...) atomically instead of acquiring
+	// the old Registry.mu on every wire frame.
 	pidStr := activity.PID(pid)
+	procNum := int32((pid - 1) % uint32(mvcc.DefaultProcArraySize))
 	reg := s.cfg.Activity
 	if reg != nil {
 		clientAddr := raw.RemoteAddr().String()
@@ -687,9 +691,11 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 			State:           "active",
 			BackendType:     "client_backend",
 		})
-		// Register this goroutine so AIO / lock / client-I/O wait-event
-		// hooks can find the correct backend via activity.LookupGoroutine.
-		activity.RegisterCurrentGoroutine(reg, pidStr)
+		// Register this goroutine so pool / AIO / spill wait-event hooks
+		// can find the correct procNum via activity.LookupCurrentGoroutine.
+		// Hot-path client-I/O closures (below) capture procNum directly
+		// and do not touch the goroutine map.
+		activity.SetCurrentGoroutine(reg, procNum)
 	}
 	defer func() {
 		if reg != nil {
@@ -699,30 +705,27 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}()
 
 	// Wire client-I/O wait-event hooks on the frame reader/writer.
-	// These fire before and after every blocking read/write on the wire.
-	//
-	// M0091-0001: closure-capture `reg` + `pidStr` (already in scope
-	// above) instead of calling activity.LookupGoroutine each fire.
-	// LookupGoroutine internally invokes runtime.Stack which dominated
-	// ~11 % of CPU during pgbench select-only.
+	// M0107-0005: capture reg + procNum (int32); WaitEventStart/End are
+	// now O(1) atomic stores with no global mutex (vs Registry.mu.Lock
+	// which accounted for ~53% of all mutex delay at c=100 SO).
 	r.OnBeforeRead = func() {
 		if reg != nil {
-			reg.WaitEventStart(pidStr, activity.WaitTypeClient, activity.WaitClientRead)
+			reg.WaitEventStart(procNum, activity.WaitTypeClient, activity.WaitClientRead)
 		}
 	}
 	r.OnAfterRead = func() {
 		if reg != nil {
-			reg.WaitEventEnd(pidStr)
+			reg.WaitEventEnd(procNum)
 		}
 	}
 	w.OnBeforeWrite = func() {
 		if reg != nil {
-			reg.WaitEventStart(pidStr, activity.WaitTypeClient, activity.WaitClientWrite)
+			reg.WaitEventStart(procNum, activity.WaitTypeClient, activity.WaitClientWrite)
 		}
 	}
 	w.OnAfterWrite = func() {
 		if reg != nil {
-			reg.WaitEventEnd(pidStr)
+			reg.WaitEventEnd(procNum)
 		}
 	}
 

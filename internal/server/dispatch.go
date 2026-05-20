@@ -257,14 +257,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	}
 
 	// Update pg_stat_activity before dispatching.
-	if reg := s.cfg.Activity; reg != nil {
-		if _, pid, _ := sess.Get("goopg.backend_pid"); pid != "" {
-			q := sql
-			if len(q) > 1024 {
-				q = q[:1024]
-			}
-			reg.UpdateState(pid, "active", q)
+	// M0107-0005: use procNum (int32) for the atomic hot path.
+	if reg := s.cfg.Activity; reg != nil && connTx != nil {
+		q := sql
+		if len(q) > 1024 {
+			q = q[:1024]
 		}
+		reg.UpdateState(connTx.ProcNum, "active", q)
 	}
 
 	for _, stmt := range stmts {
@@ -464,10 +463,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		}
 	}
 	// Update pg_stat_activity to idle after successful execution.
-	if reg := s.cfg.Activity; reg != nil {
-		if _, pid, _ := sess.Get("goopg.backend_pid"); pid != "" {
-			reg.UpdateState(pid, "idle", "")
-		}
+	if reg := s.cfg.Activity; reg != nil && connTx != nil {
+		reg.UpdateState(connTx.ProcNum, "idle", "")
 	}
 	if autoCommit {
 		if err := s.cfg.TxnMgr.Commit(tx); err != nil {

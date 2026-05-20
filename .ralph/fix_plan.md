@@ -2353,6 +2353,7 @@ Operational policy (2026-05-20):
         `TestE2E_FailoverGoopgToPG/async` PASS; `make ralph-state-guard` PASS.
       - Co-lands with M0107-0005 (shared `procNum` identity).
       - COMPLETE 2026-05-21 (loop 9): ProcArray + XidGen + CLOG bank locks landed.
+      - Design: `docs/design/0107-0004-procarray-xidgen-clog-bank-locks.md`.
         New files: `internal/mvcc/procarray.go` (64B procSlot + ProcArray), `xidgen.go`
         (atomic pre-increment XidGen). `manager.go` refactored: `mu` removed from hot path;
         `SnapshotFor` now lock-free ProcArray walk; `Begin`/`Commit`/`Rollback` use atomic
@@ -2364,7 +2365,7 @@ Operational policy (2026-05-20):
         Design: `docs/design/0107-0004-procarray-xidgen-clog-bank-locks.md`.
         All 11 key packages pass with -race.
 
- - [ ] **M0107-0005 — Phase D2: per-backend `wait_event_info`**
+ - [x] **M0107-0005 — Phase D2: per-backend `wait_event_info`**
       - Summary: Replace `activity.Registry` single `RWMutex` +
         `map[string]*Backend` (95 % c=100 SO delay) with per-backend
         64 B cache-line-aligned `ActivitySlot` per `05-activity-perbackend.md`.
@@ -2382,6 +2383,16 @@ Operational policy (2026-05-20):
         ≥ 10 000 (vs 6 400); `activity.Registry.*` absent from mutex top-20;
         `TestE2E_FailoverGoopgToPG/async` PASS; `make ralph-state-guard` PASS.
       - Co-lands with M0107-0004 (shared `procNum` identity).
+      - COMPLETE 2026-05-21 (loop 10): Per-backend ActivityRegistry with atomic hot path landed.
+        `ActivityRegistry` (64 B `activitySlot` array) replaces `Registry` single `RWMutex`.
+        `WaitEventStart`/`WaitEventEnd` become O(1) atomic `uint32` stores. `type Registry =
+        ActivityRegistry` alias for full backward compat. Background workers use `RegisterBackground`.
+        Goroutine map updated: stores `(reg *ActivityRegistry, procNum int32)`.
+        All callers updated: server.go hot-path closures use procNum; dispatch.go uses connTx.ProcNum;
+        context.go acquireRelLock uses c.ProcNum; spill.go uses LookupCurrentGoroutine;
+        open.go WAL/pool/AIO hooks use LookupCurrentGoroutine + procNum.
+        Design: `docs/design/0107-0005-activity-registry-per-backend-slots.md`.
+        All activity/executor/server/mvcc/storage/wal packages pass with -race.
 
  - [ ] **M0107-0006 — Phase D3: lock-free buffer pool**
       - Summary: Delete 128-partition `sync.Mutex` buf-mapping (cause of

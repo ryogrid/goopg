@@ -214,11 +214,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		DataDir: abs,
 	})
 
-	// Activity registry (M0022): must be created early so WAL writer,
-	// AIO engine, and Manager hooks can register their goroutines via
-	// activity.RegisterCurrentGoroutine. The pg_stat_activity virtual
-	// view is registered later, after the catalog is fully set up.
-	act := activity.NewRegistry()
+	// Activity registry (M0022 / M0107-0005): per-backend slot array with
+	// atomic WaitEventStart/WaitEventEnd.  Background workers (WAL writer,
+	// etc.) are assigned slots in the background-worker range above the
+	// regular backend range.
+	act := activity.NewActivityRegistry(mvcc.DefaultProcArraySize)
+	// Pre-register the WAL writer background slot so the OnWALWrite closure
+	// can call WaitEventStart(walProcNum, ...) without a goroutine map lookup.
+	walProcNum := act.RegisterBackground(activity.WalWriterIdx, &activity.Backend{
+		PID:         "wal-writer-0",
+		BackendType: "walwriter",
+		State:       "active",
+	})
 
 	// AIO engine: optional. With opts.AIOMethod=="" no engine is
 	// constructed and storage Manager.PrefetchBlock falls back to
@@ -306,23 +313,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		SystemID:    systemID,
 		TimelineID:  tli,
 		OnLoopStart: func() {
-			pid := "wal-writer-0"
-			act.Register(&activity.Backend{
-				PID:         pid,
-				BackendType: "walwriter",
-				State:       "active",
-			})
-			activity.RegisterCurrentGoroutine(act, pid)
+			// Register this goroutine so pool/AIO hooks can find procNum
+			// via LookupCurrentGoroutine (M0107-0005).
+			activity.SetCurrentGoroutine(act, walProcNum)
 		},
 		OnLoopEnd: func() {
 			activity.ClearCurrentGoroutine()
 		},
-		// M0091-0001: OnWALWrite always runs on the WAL writer
-		// goroutine, so we can closure-capture `act` and the
-		// literal PID. No runtime.Stack on the hot path.
+		// M0107-0005: closure-captures walProcNum (int32) for the atomic
+		// hot path; no goroutine map lookup and no mutex.
 		OnWALWrite: func() {
 			if act != nil {
-				act.WaitEventStart("wal-writer-0", activity.WaitTypeIO, activity.WaitWALWrite)
+				act.WaitEventStart(walProcNum, activity.WaitTypeIO, activity.WaitWALWrite)
 			}
 		},
 	}
@@ -570,14 +572,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// TrackIOTiming. Default off — saves the per-Pin
 	// runtime.Stack lookup on the hot read path.
 	if opts.TrackIOTiming {
+		// M0107-0005: use LookupCurrentGoroutine (procNum) instead of
+		// LookupGoroutine (Registry+pid) so WaitEventStart is atomic.
 		pool.OnPinWait = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeBufferPin, activity.WaitBufferPin)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeBufferPin, activity.WaitBufferPin)
 			}
 		}
 		pool.OnPinDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
 			}
 		}
 	}
@@ -590,11 +594,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// "autovacuum" nor "" (unregistered / Pool.Close), we panic with a
 	// clear message so the invariant violation surfaces immediately in dev.
 	pool.OnFlushAll = func() {
-		reg, pid := activity.LookupGoroutine()
-		if reg == nil {
+		reg, procNum, ok := activity.LookupCurrentGoroutine()
+		if !ok {
 			return // unregistered goroutine — Pool.Close or tests, OK
 		}
-		bt := reg.GetBackendType(pid)
+		bt := reg.GetBackendType(procNum)
 		switch bt {
 		case "checkpointer", "autovacuum", "walwriter", "":
 			// expected callers
@@ -1131,77 +1135,75 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// Wire AIO + data-file I/O wait-event hooks so pg_stat_activity
-	// can report blocking reasons. M0092-0005: gated by
-	// TrackIOTiming (default off — saves the per-Read/Write/Sync/
-	// Extend/AIO `runtime.Stack` LookupGoroutine call on the hot
-	// path). Each Wait/Done pair is balanced (M0058-0006).
+	// can report blocking reasons. M0092-0005: gated by TrackIOTiming
+	// (default off). M0107-0005: use LookupCurrentGoroutine (procNum)
+	// for atomic WaitEventStart instead of LookupGoroutine (mutex).
 	if opts.TrackIOTiming {
 		if aioEngine != nil {
 			aioEngine.OnWaitStart = func() {
-				if reg, pid := activity.LookupGoroutine(); reg != nil {
-					reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitAIO)
+				if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+					reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitAIO)
 				}
 			}
 			aioEngine.OnWaitEnd = func() {
-				if reg, pid := activity.LookupGoroutine(); reg != nil {
-					reg.WaitEventEnd(pid)
+				if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+					reg.WaitEventEnd(procNum)
 				}
 			}
 		}
 		mgr.OnReadWait = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileRead)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileRead)
 			}
 		}
 		mgr.OnReadDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
 			}
 		}
 		mgr.OnWriteWait = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileWrite)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 			}
 		}
 		mgr.OnWriteDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
 			}
 		}
 		mgr.OnExtendWait = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileExtend)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
 			}
 		}
 		mgr.OnExtendDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
 			}
 		}
 		mgr.OnSyncWait = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileSync)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileSync)
 			}
 		}
 		mgr.OnSyncDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
 			}
 		}
 	}
 
 	// Wire WAL I/O wait-event hooks.
-	// M0091-0001: WAL sync runs on the WAL writer goroutine; use
-	// the captured `act` + literal PID instead of LookupGoroutine.
+	// M0107-0005: capture walProcNum (int32) for atomic WaitEventStart.
 	if walWriter != nil {
 		walWriter.OnWALSync = func() {
 			if act != nil {
-				act.WaitEventStart("wal-writer-0", activity.WaitTypeIO, activity.WaitWALSync)
+				act.WaitEventStart(walProcNum, activity.WaitTypeIO, activity.WaitWALSync)
 			}
 		}
 		walWriter.OnWALSyncDone = func() {
 			if act != nil {
-				act.WaitEventEnd("wal-writer-0")
+				act.WaitEventEnd(walProcNum)
 			}
 		}
 	}
