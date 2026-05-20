@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
+
+	"github.com/goopg/goopg/internal/runtimeshim"
 )
 
 // BackgroundWorkerSlots is the number of extra slots reserved beyond the
@@ -126,6 +128,22 @@ type ActivityRegistry struct {
 	// Hot-path WaitEventStart callers that already hold procNum bypass this.
 	pidMu  sync.RWMutex
 	pidMap map[string]int32
+
+	// Monotonic↔wall conversion epoch. All slot timestamps
+	// (stateChange, XactStart, QueryStart) are stored as
+	// runtimeshim.Nanotime() readings — monotonic since the
+	// runtime started, which is ~10× cheaper than time.Now() on the
+	// per-frame WaitEvent path. Snapshot() converts each stored
+	// reading to a wall-clock nanos value via wallEpoch + (mono - monoEpoch)
+	// for wire-format output (pg_stat_activity expects wall-clock
+	// timestamps).
+	//
+	// The two epochs are captured atomically-as-possible in
+	// NewActivityRegistry. Sub-microsecond skew between the two reads
+	// is acceptable: pg_stat_activity timestamps are intended for
+	// human consumption at second/millisecond resolution.
+	monoEpoch int64
+	wallEpoch int64
 }
 
 // NewActivityRegistry creates an ActivityRegistry with nRegular slots for
@@ -133,11 +151,19 @@ type ActivityRegistry struct {
 // nRegular should equal mvcc.DefaultProcArraySize (1024).
 func NewActivityRegistry(nRegular int) *ActivityRegistry {
 	total := nRegular + BackgroundWorkerSlots
+	// Capture the mono↔wall epoch as tightly as possible. Any skew
+	// between the two reads (typically tens of nanoseconds) shifts
+	// every subsequent Snapshot timestamp by the same constant
+	// amount — irrelevant for pg_stat_activity consumers.
+	monoEpoch := runtimeshim.Nanotime()
+	wallEpoch := time.Now().UnixNano()
 	return &ActivityRegistry{
-		slots:  make([]activitySlot, total),
-		nReg:   nRegular,
-		bgBase: int32(nRegular),
-		pidMap: make(map[string]int32),
+		slots:     make([]activitySlot, total),
+		nReg:      nRegular,
+		bgBase:    int32(nRegular),
+		pidMap:    make(map[string]int32),
+		monoEpoch: monoEpoch,
+		wallEpoch: wallEpoch,
 	}
 }
 
@@ -200,7 +226,7 @@ func (r *ActivityRegistry) WaitEventStart(procNum int32, waitTypeStr, waitEventS
 	}
 	s := &r.slots[procNum]
 	s.waitInfo.Store(packWaitStrings(waitTypeStr, waitEventStr))
-	s.stateChange.Store(time.Now().UnixNano())
+	s.stateChange.Store(runtimeshim.Nanotime())
 }
 
 // WaitEventEnd clears the wait event for procNum.
@@ -211,7 +237,7 @@ func (r *ActivityRegistry) WaitEventEnd(procNum int32) {
 	}
 	s := &r.slots[procNum]
 	s.waitInfo.Store(0)
-	s.stateChange.Store(time.Now().UnixNano())
+	s.stateChange.Store(runtimeshim.Nanotime())
 }
 
 // ——— Cold-path update methods ————————————————————————————————————————————
@@ -226,7 +252,7 @@ func (r *ActivityRegistry) UpdateState(procNum int32, state, query string) {
 	if c == nil {
 		return
 	}
-	now := time.Now().UnixNano()
+	now := runtimeshim.Nanotime()
 	r.slots[procNum].stateChange.Store(now)
 	if state != "" {
 		c.State.Store(uint32(parseBackendState(state)))
@@ -265,7 +291,7 @@ func (r *ActivityRegistry) BeginTransaction(pid string) {
 	if c == nil {
 		return
 	}
-	now := time.Now().UnixNano()
+	now := runtimeshim.Nanotime()
 	c.XactStart.Store(now)
 	c.State.Store(uint32(bsIdleInTxn))
 	r.slots[procNum].stateChange.Store(now)
@@ -286,7 +312,7 @@ func (r *ActivityRegistry) EndTransaction(pid string) {
 	if c == nil {
 		return
 	}
-	now := time.Now().UnixNano()
+	now := runtimeshim.Nanotime()
 	c.XactStart.Store(0)
 	c.BackendXID.Store(0)
 	c.State.Store(uint32(bsIdle))
@@ -339,13 +365,13 @@ func (r *ActivityRegistry) Snapshot() []Backend {
 			BackendStart:    formatNanos(c.BackendStart),
 			BackendType:     c.BackendType,
 			State:           backendStateCode(c.State.Load()).String(),
-			StateChange:     formatNanos(sc),
+			StateChange:     formatNanos(r.monoToWall(sc)),
 		}
 		if xs := c.XactStart.Load(); xs != 0 {
-			b.XactStart = formatNanos(xs)
+			b.XactStart = formatNanos(r.monoToWall(xs))
 		}
 		if qs := c.QueryStart.Load(); qs != 0 {
-			b.QueryStart = formatNanos(qs)
+			b.QueryStart = formatNanos(r.monoToWall(qs))
 		}
 		if xid := c.BackendXID.Load(); xid != 0 {
 			b.BackendXID = fmt.Sprintf("%d", xid)
@@ -362,6 +388,17 @@ func (r *ActivityRegistry) Snapshot() []Backend {
 	return out
 }
 
+// monoToWall converts a runtimeshim.Nanotime() reading taken via this
+// registry into a wall-clock nanos value suitable for time.Unix.
+// Readings of 0 (uninitialised cold-field XactStart/QueryStart) pass
+// through unchanged so formatNanos still emits the empty string.
+func (r *ActivityRegistry) monoToWall(mono int64) int64 {
+	if mono == 0 {
+		return 0
+	}
+	return r.wallEpoch + (mono - r.monoEpoch)
+}
+
 // ——— Internal helpers ——————————————————————————————————————————————————
 
 func (r *ActivityRegistry) acquire(procNum int32, cold *coldActivity) {
@@ -371,7 +408,7 @@ func (r *ActivityRegistry) acquire(procNum int32, cold *coldActivity) {
 	s := &r.slots[procNum]
 	s.cold = cold
 	s.waitInfo.Store(0)
-	s.stateChange.Store(time.Now().UnixNano())
+	s.stateChange.Store(runtimeshim.Nanotime())
 }
 
 func (r *ActivityRegistry) release(procNum int32) {

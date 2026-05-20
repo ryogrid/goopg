@@ -2,6 +2,7 @@ package activity
 
 import (
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -113,4 +114,54 @@ func TestActivityRegistrySetCurrentGoroutine(t *testing.T) {
 	// After ClearCurrentGoroutine, the goroutine's entry is gone.
 	// (We can't easily test this from outside the goroutine, but the
 	// goroutine itself calls ClearCurrentGoroutine via defer.)
+}
+
+
+// TestActivityRegistryStateChangeIsWallClock verifies that the monotonic
+// nanos written by hot-path WaitEvent / Update paths are converted back
+// into a wall-clock RFC3339Nano timestamp by Snapshot — runtimeshim.Nanotime
+// returns monotonic-since-runtime-start, so a naive formatNanos would
+// emit a year like 1970/2001 in the wire output of pg_stat_activity.
+//
+// Regression for M0107-0008 loop 5 (activity-registry Nanotime wiring).
+func TestActivityRegistryStateChangeIsWallClock(t *testing.T) {
+	r := NewActivityRegistry(16)
+	r.Register(&Backend{PID: "1", State: "active"})
+	pn := int32(0)
+
+	before := time.Now().UTC()
+	r.WaitEventStart(pn, WaitTypeIO, WaitWALWrite)
+	snap := r.Snapshot()
+	after := time.Now().UTC()
+
+	if len(snap) != 1 {
+		t.Fatalf("snapshot len = %d, want 1", len(snap))
+	}
+	sc := snap[0].StateChange
+	if sc == "" {
+		t.Fatalf("StateChange is empty; mono→wall conversion failed")
+	}
+	got, err := time.Parse(time.RFC3339Nano, sc)
+	if err != nil {
+		t.Fatalf("StateChange %q not RFC3339Nano: %v", sc, err)
+	}
+	// Allow ±2s of slack (mono/wall epochs are captured separately).
+	lo, hi := before.Add(-2*time.Second), after.Add(2*time.Second)
+	if got.Before(lo) || got.After(hi) {
+		t.Errorf("StateChange %v outside [%v, %v]", got, lo, hi)
+	}
+
+	// XactStart should round-trip through the same conversion.
+	r.BeginTransaction("1")
+	snap = r.Snapshot()
+	if snap[0].XactStart == "" {
+		t.Fatalf("XactStart empty after BeginTransaction")
+	}
+	xs, err := time.Parse(time.RFC3339Nano, snap[0].XactStart)
+	if err != nil {
+		t.Fatalf("XactStart %q not RFC3339Nano: %v", snap[0].XactStart, err)
+	}
+	if xs.Before(lo) || xs.After(time.Now().UTC().Add(2*time.Second)) {
+		t.Errorf("XactStart %v out of plausible range", xs)
+	}
 }

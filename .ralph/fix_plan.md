@@ -2691,6 +2691,37 @@ Operational policy (2026-05-20):
         ./internal/mvcc/ ./internal/server/ ./internal/executor/
         ./internal/wal/ ./internal/storage/ ./internal/runtimeshim/`
         all PASS.
+      - PARTIAL PROGRESS 2026-05-21 (loop 5): first Phase-D5 caller wired —
+        `ActivityRegistry` now reads time via `runtimeshim.Nanotime()` on
+        every hot path. Five call sites in `internal/activity/registry.go`
+        (WaitEventStart, WaitEventEnd, UpdateState, BeginTransaction,
+        EndTransaction, acquire) were switched from `time.Now().UnixNano()`
+        (~50 ns/op) to `runtimeshim.Nanotime()` (~20 ns/op). At the
+        observed protocol-frame density (~c × 30 k/s WaitEvent calls on
+        c=100 SU pgbench) this is the highest-volume timekeeping site in
+        the server. Stored fields (`activitySlot.stateChange`,
+        `coldActivity.XactStart`, `coldActivity.QueryStart`) now hold
+        monotonic-since-runtime-start nanos. `Snapshot()` converts back
+        to wall-clock via a once-at-construction `(monoEpoch, wallEpoch)`
+        pair using a new private helper `monoToWall(mono int64) int64 =
+        wallEpoch + (mono - monoEpoch)` (with the `mono == 0 → 0` guard
+        preserving cold-field empty-string semantics). `pg_stat_activity`
+        wire timestamps remain RFC3339Nano-formatted; consumers see no
+        format change. New regression
+        `TestActivityRegistryStateChangeIsWallClock` (registry_test.go)
+        asserts the converted timestamp parses as RFC3339Nano within
+        ±2 s of `time.Now()`. Design:
+        `docs/design/0107-0008e-activity-registry-nanotime-wiring.md`
+        (indexed in `docs/design/README.md`). Verified:
+        `go test -race -count=1 ./internal/activity/...
+        ./internal/runtimeshim/... ./internal/mvcc/... ./internal/server/...
+        ./internal/executor/... ./internal/wal/... ./internal/storage/...`
+        all PASS. `internal/initdb/...` shows pre-existing failures
+        unrelated to this change (verified by stashing the diff and
+        reproducing them on `master`).
+        Remaining work for this sub-milestone: bufpool per-slot Sema
+        wait caller (consumes [[0107-0008c]]); per-P stats counter
+        caller (consumes [[0107-0008b]]); per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
