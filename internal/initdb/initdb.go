@@ -126,7 +126,7 @@ type FileSpec struct {
 func SampleFiles() []FileSpec {
 	return []FileSpec{
 		{Path: "PG_VERSION", Build: func() []byte { return []byte(CatalogVersion + "\n") }, Mode: 0o600},
-		{Path: "postgresql.conf", Build: defaultPostgresqlConf, Mode: 0o600},
+		{Path: "postgresql.conf", Build: func() []byte { return config.SampleConfig() }, Mode: 0o600},
 		{Path: "postgresql.auto.conf", Build: defaultPostgresqlAutoConf, Mode: 0o600},
 		{Path: "pg_hba.conf", Build: defaultPgHBAConf, Mode: 0o600},
 		{Path: "pg_ident.conf", Build: defaultPgIdentConf, Mode: 0o600},
@@ -5652,27 +5652,6 @@ func ensureEmptyDir(dir string) error {
 		return fmt.Errorf("goopg init: directory %q already exists and is not empty", dir)
 	}
 	return nil
-}
-
-func defaultPostgresqlConf() []byte {
-	return []byte(`# goopg postgresql.conf — defaults written by 'goopg init'.
-#
-# This file uses the same key=value syntax as upstream
-# PostgreSQL's postgresql.conf. Lines beginning with '#' are
-# comments; settings reflect goopg's v0 surface.
-
-#listen_addresses = '127.0.0.1'
-#port = 5432
-
-# Encoding is fixed at UTF-8 for the wire protocol.
-#server_encoding = 'UTF8'
-#client_encoding = 'UTF8'
-
-# DateStyle and TimeZone use the same values goopg advertises in
-# the startup ParameterStatus block.
-#DateStyle = 'ISO, MDY'
-#TimeZone = 'UTC'
-`)
 }
 
 func defaultPostgresqlAutoConf() []byte {

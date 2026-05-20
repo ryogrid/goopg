@@ -3330,7 +3330,7 @@ Operational policy (2026-05-20):
         this loop). Files: `internal/config/postgresql.conf.sample` (new,
         260+ lines), `internal/config/sample.go` (new, 17 lines).
 
- - [ ] **M0108-0002 — initdb wiring + retire `defaultPostgresqlConf`**
+ - [x] **M0108-0002 — initdb wiring + retire `defaultPostgresqlConf`**
       - Summary: In `internal/initdb/initdb.go::SampleFiles()`, switch the
         `postgresql.conf` entry's `Build` field to a thin shim that calls
         `config.SampleConfig()`. Delete the embedded `defaultPostgresqlConf`
@@ -3349,6 +3349,34 @@ Operational policy (2026-05-20):
         `go run ./cmd/goopg init /tmp/sanity-data && head -40
         /tmp/sanity-data/postgresql.conf` shows the template's
         FILE LOCATIONS banner and commented `#listen_addresses` entry.
+      - COMPLETE 2026-05-21 (M0108-0002 loop 1): `SampleFiles()` in
+        `internal/initdb/initdb.go` now routes the `postgresql.conf` entry
+        through `func() []byte { return config.SampleConfig() }` (the
+        `config` import was already present from M0106 work, so no new
+        imports). The 20-line `defaultPostgresqlConf` literal at the
+        previous `initdb.go:5657` was deleted in full; its content has
+        been superseded by the 267-line embedded template that M0108-0001
+        landed at `internal/config/postgresql.conf.sample`.
+        Regression test `TestInitWritesEmbeddedSampleAsPostgresqlConf`
+        added in `internal/initdb/initdb_postgresql_conf_test.go` —
+        runs `Init(Options{DataDir: tmpDir})` and asserts
+        `bytes.Equal(os.ReadFile(<datadir>/postgresql.conf),
+        config.SampleConfig())`. Test passes locally
+        (`go test -run TestInitWritesEmbeddedSampleAsPostgresqlConf
+        ./internal/initdb/` — `ok 0.127s`). Manual sanity:
+        `rm -rf /tmp/sanity-data && go run ./cmd/goopg init
+        -D /tmp/sanity-data && head -10 /tmp/sanity-data/postgresql.conf`
+        prints the template's `PostgreSQL configuration file
+        (goopg edition)` banner instead of the old `goopg postgresql.conf
+        — defaults written by 'goopg init'.` banner; full file is 267
+        lines with two commented entries beginning `^#listen_addresses`
+        / `^#port `. Pre-existing M0096/M0105/M0106 failures in
+        `./internal/initdb/` (`TestMigrationFromLegacyJSONCluster`,
+        `TestSystemCatalogRelfilesAreValidHeapPages`,
+        `TestBootstrappedPGTypeRowsReadable`, etc.) reproduce on a clean
+        stash of the parent commit `f7eb1e1` and are unaffected by this
+        loop's file-content-only change. `go build`/`go vet` over
+        `./internal/initdb/... ./internal/config/...` clean.
 
  - [ ] **M0108-0003 — Registry↔template sync test**
       - Summary: Add `internal/config/sample_test.go::TestSampleConfigCoversRegistry`.
