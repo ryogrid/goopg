@@ -2548,10 +2548,51 @@ Operational policy (2026-05-20):
           test suite can be evaluated standalone.
         - Design: `docs/design/0107-0008-runtimeshim-nanotime.md`
           (indexed in `docs/design/README.md`).
-        - Remaining work for this sub-milestone: `PinP`/`UnpinP` shim
-          + per-P xid cache caller; `SemaAcquire`/`SemaRelease` shim +
-          bufpool wait-coordination caller; activity-registry rewrite
-          to consume `runtimeshim.Nanotime`; per-Go-minor CI matrix.
+      - PARTIAL PROGRESS 2026-05-21 (loop 2): added the second shim,
+        `PinP() int` / `UnpinP()`.
+        - `internal/runtimeshim/pinp_linkname.go` (build tag
+          `go1.24 && !go1.27`) binds `runtime_procPin → runtime.procPin`
+          and `runtime_procUnpin → runtime.procUnpin`. These are the
+          same primitives `sync.Pool` uses for its per-P caches:
+          while pinned, `m.locks` is incremented so the goroutine
+          cannot be preempted or migrated to another P, enabling
+          atomic-free per-P sharded mutation inside the pinned window.
+        - `internal/runtimeshim/pinp_fallback.go` (inverse tag) uses a
+          global `sync.Mutex`: `PinP()` locks and returns 0; `UnpinP()`
+          unlocks. Correct (mutual exclusion preserves the
+          no-concurrent-mutation invariant callers depend on) but
+          contention-bound; the fallback's job is correctness, not
+          parity. The "always return 0" semantics oblige callers to
+          size per-P arrays to length ≥ 1 unconditionally.
+        - `pinp_test.go` — four contract-anchored tests:
+          (a) `TestPinP_ReturnsValidIndex` confirms the returned index
+          lives in `[0, GOMAXPROCS)`;
+          (b) `TestPinP_StableWithinWindow` confirms nested
+          `PinP`/`UnpinP` returns the same P index for inner and outer
+          calls (no-migration-while-pinned invariant);
+          (c) `TestPinP_BalancedAcrossGoroutines` exercises 32
+          goroutines × 4 K iterations of bare cycles under `-race` to
+          surface any unbalanced pairs as a runtime fatal;
+          (d) `TestPinP_PerPCounterCorrectness` runs the canonical
+          caller pattern — 16 goroutines × 16 K iterations of
+          `pid := PinP(); slots[pid].n.Add(1); UnpinP()` — and asserts
+          the final cross-slot sum equals `16 × 16384`. A single
+          dropped increment under a broken pin window would fail here.
+        - `BenchmarkPinUnpin-16 581692220 2.067 ns/op` on Linux/amd64
+          Go 1.25 — below the parent design's ~3 ns/op target.
+          Full suite PASS under `-race` (1.07 s).
+        - Caller wiring (per-P xid cache in `internal/mvcc/xidgen.go`,
+          per-P stats counters) is deliberately NOT in this loop;
+          each caller lands in its own loop so the shim has a clean
+          standalone landing.
+        - Design: `docs/design/0107-0008b-runtimeshim-pinp.md`
+          (indexed in `docs/design/README.md`).
+        - Remaining work for this sub-milestone: `SemaAcquire` /
+          `SemaRelease` shim + bufpool wait-coordination caller;
+          per-P xid cache caller; activity-registry rewrite to consume
+          `runtimeshim.Nanotime` (requires a monotonic→wall conversion
+          layer in `Snapshot()` — separate design decision);
+          per-Go-minor CI matrix.
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
