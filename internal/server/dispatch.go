@@ -235,6 +235,23 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	}
 
 	for _, stmt := range stmts {
+		// Check for failed transaction state (25P02) — reject all statements
+		// except COMMIT/ROLLBACK/ABORT/END that clear the failed state.
+		// PostgreSQL semantics: an error inside an explicit transaction block
+		// marks the block as aborted; all subsequent statements get 25P02
+		// until the client issues ROLLBACK. M0100-0005.
+		if connTx != nil && connTx.IsFailed() {
+			_, isCommit := stmt.(*parser.CommitStmt)
+			_, isRollback := stmt.(*parser.RollbackStmt)
+			if !isCommit && !isRollback {
+				return s.writeQueryError(w, "25P02",
+					"current transaction is aborted, commands ignored until end of transaction block")
+			}
+			// COMMIT/ROLLBACK clears the failed state — handled below in
+			// executeOneSimpleStmt → TxCommit/TxRollback path, which calls
+			// connTx.End() (resetting failed=false). Fall through.
+		}
+
 		// EXPLAIN EXECUTE <name> (M0100-0005h): the planner wraps an
 		// `ExecuteStmt` Inner as a `Utility` node and EXPLAIN renders
 		// it as the placeholder `Utility *parser.ExecuteStmt`.  PG
@@ -394,6 +411,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 				// Do NOT send another ReadyForQuery — that would produce a double
 				// RFQ that causes psql to print "message type 0x5a arrived from
 				// server while idle". Just return nil so the connection stays alive.
+				// Mark the explicit transaction as failed so subsequent statements
+				// in the same transaction block get 25P02 (M0100-0005).
+				if !autoCommit && connTx != nil && connTx.InExplicit() {
+					connTx.Fail()
+				}
 				return nil
 			}
 			return err
@@ -667,6 +689,14 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		case planner.TxCommit:
 			if connTx != nil && connTx.InExplicit() {
+				// COMMIT in a failed transaction → PostgreSQL semantics: issue
+				// a WARNING and ROLLBACK instead of committing. M0100-0005.
+				if connTx.IsFailed() {
+					// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
+					_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
+					connTx.End()
+					return w.WriteCommandComplete("ROLLBACK")
+				}
 				explicitTx := connTx.Tx()
 				// M0104-0008: SSI pre-commit dangerous-structure check.
 				// The executor's transactionOp.execCommit invokes this for

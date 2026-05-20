@@ -2735,6 +2735,12 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 			xminLive = true
 		case ctx.Snap.HasAborted(xmin):
 			xminLive = false
+		case ctx.TxnMgr.HasAbortedXID(xmin):
+			// Aborted after our snapshot was taken — not a live duplicate.
+			// Without this arm the xid falls to `default` (live) and a MERGE
+			// NOT MATCHED INSERT that waited for a concurrent aborter would
+			// raise a spurious 23505. M0100-0005.
+			xminLive = false
 		default:
 			// Unknown xmin (committed before snapshot start, or a
 			// session-self insert that has not yet been added to the

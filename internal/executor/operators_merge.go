@@ -40,9 +40,15 @@ type mergePendingMod struct {
 	newRow Row // for UPDATE
 	srcRow Row // source row for EPQ re-evaluation
 	tgtRow Row // target old row for BEFORE trigger firing
+	srcIdx int // index into srcRows for EPQ-delete fallback to NOT MATCHED
 }
 
 func newMergeOp(p *planner.Merge) *mergeOp { return &mergeOp{plan: p} }
+
+// errMergeSourceUnmatched is returned by applyMod when the target row was
+// deleted by a concurrent committed transaction during EPQ. The outer loop
+// must reset the source row's matched flag and retry via NOT MATCHED clauses.
+var errMergeSourceUnmatched = errors.New("merge: source row unmatched (target row deleted)")
 
 // mergeEPQError is returned by mergeApplyUpdate/mergeApplyDelete when the
 // target row was concurrently updated. The caller must re-evaluate WHEN
@@ -223,11 +229,11 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 						_ = computeGeneratedColumns(scanTbl.Columns, newRow)
 						mods = append(mods, mergePendingMod{rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx,
 							action: planner.MergeActionUpdate, newRow: newRow,
-							srcRow: cloneRow(srcRows[si].row), tgtRow: cloneRow(vt.tgtRow)})
+							srcRow: cloneRow(srcRows[si].row), tgtRow: cloneRow(vt.tgtRow), srcIdx: si})
 					case planner.MergeActionDelete:
 						mods = append(mods, mergePendingMod{rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx,
 							action: planner.MergeActionDelete, srcRow: cloneRow(srcRows[si].row),
-							tgtRow: cloneRow(vt.tgtRow)})
+							tgtRow: cloneRow(vt.tgtRow), srcIdx: si})
 					case planner.MergeActionDoNothing:
 						// DO NOTHING — skip this row. M0097-0016.
 					}
@@ -250,6 +256,12 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			modRel = rel
 		}
 		applied, err := o.applyMod(modRel, modTbl, n, mod)
+		if errors.Is(err, errMergeSourceUnmatched) {
+			// The target row was deleted by a concurrent committed transaction.
+			// Unmark the source row so step 3 can attempt NOT MATCHED INSERT.
+			srcRows[mod.srcIdx].matched = false
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -298,9 +310,41 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				}
 			}
 			_ = computeGeneratedColumns(tbl.Columns, row)
-			if err := writeHeapRow(o.ctx, rel, tbl.Columns, row); err != nil {
-				return nil, err
+
+			// Partition routing: route the row to the correct leaf partition.
+			insertTbl := tbl
+			insertRel := rel
+			if len(tbl.PartitionKey) > 0 {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					if part := routeToPartition(tbl, row, im); part != nil {
+						insertTbl = part
+						insertRel = o.ctx.Catalog.RelFileNode(part)
+						row = remapRowForPartition(tbl.Columns, part.Columns, row)
+						_ = computeGeneratedColumns(part.Columns, row)
+					}
+				}
 			}
+
+			// BEFORE INSERT triggers (mirrors insertOp path). M0100-0005.
+			if len(insertTbl.Triggers) > 0 {
+				newRow, ok := fireTriggers(o.ctx, insertTbl, "before", "insert", nil, row)
+				if !ok {
+					break // trigger returned NULL — suppress insert
+				}
+				row = newRow
+			}
+
+			// Unique constraint check with wait semantics — mirrors insertOp so
+			// concurrent INSERT / MERGE NOT MATCHED on the same key causes the
+			// correct wait → 23505 (committed) or retry (aborted) behaviour.
+			if uerr := checkUniqueIndexesForInsert(o.ctx, insertTbl, insertTbl.Columns, row, o.plan.Pos()); uerr != nil {
+				return nil, uerr
+			}
+			ptr, werr := writeHeapRowReturning(o.ctx, insertRel, insertTbl.Columns, row)
+			if werr != nil {
+				return nil, werr
+			}
+			maintainUniqueIndexesForInsert(o.ctx, insertTbl, insertTbl.Columns, row, ptr)
 			o.rowsAffected++
 			break // first matching clause wins
 		}
@@ -328,6 +372,9 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 		}
 		if err == nil {
 			return true, nil
+		}
+		if errors.Is(err, errMergeSourceUnmatched) {
+			return false, errMergeSourceUnmatched
 		}
 		epqErr, isEPQ := err.(*mergeEPQError)
 		if !isEPQ {
@@ -424,7 +471,7 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		// Follow HOT chain to find the current live tuple.
 		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
 		if !found {
-			return nil // row deleted by concurrent txn, skip this MERGE action
+			return errMergeSourceUnmatched // row deleted; caller retries as NOT MATCHED
 		}
 		// Signal the caller to re-evaluate WHEN MATCHED conditions with the new row.
 		// Trigger will fire on the NEXT call with the correct live row. M0100-0005.
