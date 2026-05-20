@@ -2435,6 +2435,35 @@ Operational policy (2026-05-20):
         `go test -race ./internal/mvcc/ ./internal/wal/
         ./internal/executor/ ./internal/access/btree/` PASS.
         Design: `docs/design/0107-0006-bufpool-bufmap-correctness.md`.
+      - PARTIAL PROGRESS 2026-05-21 (loop 3): added
+        `TestPoolPinNewVsPinStress` in
+        `internal/storage/bufpool_stress_test.go` to close the coverage
+        gap left by loops 1-2 — the heap-extension path
+        (`Pool.PinNew → Manager.Extend → bm.Insert`) is now exercised
+        concurrently with cache-hit `Pin`/`Unpin` against an
+        over-subscribed 32-slot pool. 4 writer goroutines drive PinNew
+        while N readers (default 32; gate-tunable via
+        `GOOPG_BUFPOOL_STRESS_GOROUTINES`) Pin random blocks from
+        `[0, highestBlock)`. This exercises the seqlock
+        publish→observe window of `bm.Insert` under tighter timing
+        than `Pin.pinLoad` (no synchronous disk read), the
+        `claimVictim` reclaim of a freshly-extended slot, and the
+        `s.contentMu`-held `Extend` region that M0107-0007 will touch.
+        Pure regression-pin work; no production-code changes. PASS
+        under `-race` at default scale (3.0 s),
+        `GOOPG_BUFPOOL_STRESS_GOROUTINES=500
+        GOOPG_BUFPOOL_STRESS_SECONDS=10` (logs `pinNewOK=347
+        pinNewErr=2182 pinOK=22318 pinErr=273458` — `pinErr` is
+        expected `ErrNoBuffer` under heavy oversubscription, not
+        livelock), full `./internal/storage/` suite (5.4 s), and
+        `./internal/mvcc/` / `./internal/wal/` /
+        `./internal/access/btree/` regression. Loop-2 stress test
+        re-verified at 2 000 goroutines × 20 s clean under `-race`.
+        Design: `docs/design/0107-0006-pinnew-stress-coverage.md`.
+        Action: validate pgbench c=100 SU TPS ≥ 500, runtime.futex
+        cum% < 8% at c=100 SO, `bufferPartition.mu` absence from
+        mutex top-20, and `TestE2E_FailoverGoopgToPG/async` PASS in
+        subsequent loops.
       - PARTIAL PROGRESS 2026-05-21 (loop 2): added the missing
         1 000-goroutine `TestPoolHighConcurrencyPinUnpinStress`
         (`internal/storage/bufpool_stress_test.go`; env-var-tunable via
