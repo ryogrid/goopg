@@ -544,14 +544,15 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		}
 		// Non-HOT cross-page update (partition children skip HOT in updateOp because
 		// puRel != rel): fall back to raw t_ctid chain, same pattern as updateOp.Next().
-		if cBlk, cSlot, cRow, cFound := epqFollowChain(ctx, rel, blk, slot, cols, nil); cFound {
-			return &mergeEPQError{newBlk: cBlk, newSlot: cSlot, newTgtRow: cRow}
+		// Use epqFollowChainFull to detect when the chain ended due to a moved-partition
+		// sentinel (e.g. HOT chain where the live successor was itself cross-partition moved).
+		_, cRes, chainHadSentinel := epqFollowChainFull(ctx, rel, blk, slot, cols, nil)
+		if cRes.ok {
+			return &mergeEPQError{newBlk: cRes.blk, newSlot: cRes.slot, newTgtRow: cRes.row}
 		}
-		// If the chain ended without finding a successor, check whether the row
-		// was moved to another partition (sentinel CTID). epqFollowChain returns
-		// not-found when the CTID is the moved-partition sentinel, so we must
-		// check explicitly here as well.
-		if epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
+		// If the chain ended because of a sentinel anywhere along the chain (at the
+		// starting slot or at any HOT-chain successor), raise the partition-moved error.
+		if chainHadSentinel || epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
 			return errMovedToAnotherPartition(pos)
 		}
 		return errMergeSourceUnmatched // row deleted; caller retries as NOT MATCHED
@@ -625,10 +626,11 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		if found {
 			return &mergeEPQError{newBlk: blk, newSlot: newSlot, newTgtRow: newTgtRow}
 		}
-		if cBlk, cSlot, cRow, cFound := epqFollowChain(ctx, rel, blk, slot, cols, nil); cFound {
-			return &mergeEPQError{newBlk: cBlk, newSlot: cSlot, newTgtRow: cRow}
+		_, cRes2, chainHadSentinel2 := epqFollowChainFull(ctx, rel, blk, slot, cols, nil)
+		if cRes2.ok {
+			return &mergeEPQError{newBlk: cRes2.blk, newSlot: cRes2.slot, newTgtRow: cRes2.row}
 		}
-		if epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
+		if chainHadSentinel2 || epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
 			return errMovedToAnotherPartition(pos)
 		}
 		return errMergeSourceUnmatched // row truly deleted; caller retries as NOT MATCHED

@@ -1972,6 +1972,56 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           terminating the previously-infinite `isConcurrentlyUpdated` retry (no more
           spurious 40001). Fixes `TestNoticeCaptureUpdateTrigger` regression.
           **PASS count = 14**: adds InsertConflictDoUpdate2, MergeDelete.
+        - **Loop-19 partition EPQ recheck + EXPLAIN Merge format (2026-05-20)**:
+          (A) `mergeApplyUpdate`/`mergeApplyDelete` lacked `epqFollowChain`
+          fallback for non-HOT cross-page updates. `updateOp.Next()` skips
+          `tryApplyHOTUpdate` for partition children (`puRel != rel`), so
+          child-partition updates set xmax+CTID but leave `HeapHotUpdated=0`.
+          `epqFollowHOT` terminates immediately; added `epqFollowChain` as
+          fallback (mirrors the same two-step pattern in `updateViaIndex` and
+          `updateOp.Next()`). `mergeEPQError` gains `newBlk` field; `applyMod`
+          now updates both `mod.blk` and `mod.slot` from the EPQ result.
+          `MergeMatchRecheck` advances from L234 to L257 first-divergence
+          (256/551 lines now match; `target_pa` permutations pass).
+          (B) `describePlan` now returns `"Merge on <table>"` for `*planner.Merge`
+          (was `"*planner.Merge"`). `planChildren` returns `[p.Source]` for
+          Merge so EXPLAIN shows the source scan as child node. MergeJoin
+          EXPLAIN now shows `Merge on tgt` (structural mismatch with PG's
+          join plan remains; test still SKIP).
+          **PASS count = 14** (unchanged — MergeMatchRecheck still fails on
+          CTE-with-MERGE-RETURNING at L257+; MergeJoin fails on EXPLAIN join
+          tree structure).          
+        - **Loop-20 DML CTEs (WITH MERGE RETURNING) (2026-05-20)**:
+          Parser: allow INSERT/UPDATE/DELETE/MERGE as CTE bodies (DMLBody field on
+          CommonTableExpr; Stage-A SELECT restriction removed). Analyzer: skip DML
+          body analysis (registers empty catalog.Table for name resolution).
+          Planner: CTEDMLPrefix + MaterializedCTEScan plan nodes; preplanWithClause
+          returns DML plans; wrapDMLCTEPrefix wraps outer query. MERGE RETURNING:
+          Merge.Returning/ReturningSchema; mergeOp.collectReturningRow + retRows
+          yield RETURNING rows via Next(). Executor: cteDMLPrefixOp executes DML
+          CTEs in sequence (materialising into ctx.MaterializedCTEs); materializedCTEScanOp
+          reads them. mergeApplyUpdate: moved-partition sentinel check added (before
+          and after epqFollowChain). Design:
+          `docs/design/0100-0005-dml-cte-with-merge-returning.md`.
+          MergeMatchRecheck: 489/503 → 501/503 lines (2 wrong-data lines from CTE
+          MERGE not detecting concurrent update in test; 2 missing lines from
+          moved-partition error not triggering — both require further investigation).
+          **PASS count = 14** (unchanged — MergeMatchRecheck still SKIP).
+        - **Loop-21 Inline NOTICE delivery via NoticeFlush (2026-05-20)**:
+          `executor.Context.AddNotice` now calls `ctx.NoticeFlush(msg)` and
+          returns early (no buffering) when `NoticeFlush` is wired. In
+          `server/dispatch.go`, `ectx.NoticeFlush` is set to immediately
+          write+flush `NoticeResponse` to the wire, so RAISE NOTICE emitted
+          before a lock-wait reaches the pq client before `blockDetectWait`
+          fires. `execStepFromQueue` no longer calls `queue.drain()` (which
+          cleared in-flight re-evaluation notices from concurrent pending
+          steps). Unused-step-name output now alphabetically sorted (matches
+          PostgreSQL isolationtester). eval-plan-qual first divergence moves
+          L394→L411; eval-plan-qual-trigger L4→L38. Remaining gaps:
+          eval-plan-qual needs EPQ noisy_oper call-count parity; trigger test
+          needs BEFORE-trigger mid-scan interleaving (separate scope).
+          Design: `docs/design/0100-0005-loop21-notice-flush-inline-delivery.md`.
+          **PASS count = 14** (unchanged).            
         - **Loop-22 MERGE EPQ delete/update chain follow (2026-05-20)**:
           Two coupled fixes in `internal/executor/operators_merge.go`:
           (A) `mergeApplyDelete` incorrectly returned `errMergeSourceUnmatched` for
@@ -1995,59 +2045,18 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           ./internal/analyzer/` PASS; all 14 existing isolation PASS tests unchanged.
           Design: `docs/design/0100-0005-loop22-merge-epq-delete-chain-and-returning.md`.
           **PASS count = 14** (unchanged — MergeMatchRecheck still SKIP at L416).
+        - **Loop-23 CTE snapshot isolation + UPDATE btree maintenance (2026-05-20)**:
+          (A) Non-partition updateOp/updateViaIndex did NOT call
+          `maintainUniqueIndexesForInsert` after writing the new row version.
+          `probeArbiter` now follows HOT chains (HeapHotUpdated bit) from dead
+          index entries to find live successor tuples.
+          (B) `cteDMLPrefixOp.Open()` now saves/restores `ctx.Snap` around DML
+          CTE execution and tracks written row pointers in `ctx.CTEWriteFence`.
+          `seqScanOp` skips fenced rows (CTE snapshot isolation).
+          `TestPort_IsolationInsertConflictDoUpdate3` flips from SKIP to PASS.
+          **PASS count = 15**: adds InsertConflictDoUpdate3.
 
-        - **Loop-21 Inline NOTICE delivery via NoticeFlush (2026-05-20)**:
-          `executor.Context.AddNotice` now calls `ctx.NoticeFlush(msg)` and
-          returns early (no buffering) when `NoticeFlush` is wired. In
-          `server/dispatch.go`, `ectx.NoticeFlush` is set to immediately
-          write+flush `NoticeResponse` to the wire, so RAISE NOTICE emitted
-          before a lock-wait reaches the pq client before `blockDetectWait`
-          fires. `execStepFromQueue` no longer calls `queue.drain()` (which
-          cleared in-flight re-evaluation notices from concurrent pending
-          steps). Unused-step-name output now alphabetically sorted (matches
-          PostgreSQL isolationtester). eval-plan-qual first divergence moves
-          L394→L411; eval-plan-qual-trigger L4→L38. Remaining gaps:
-          eval-plan-qual needs EPQ noisy_oper call-count parity; trigger test
-          needs BEFORE-trigger mid-scan interleaving (separate scope).
-          Design: `docs/design/0100-0005-loop21-notice-flush-inline-delivery.md`.
-          **PASS count = 14** (unchanged).
-        - **Loop-20 DML CTEs (WITH MERGE RETURNING) (2026-05-20)**:
-          Parser: allow INSERT/UPDATE/DELETE/MERGE as CTE bodies (DMLBody field on
-          CommonTableExpr; Stage-A SELECT restriction removed). Analyzer: skip DML
-          body analysis (registers empty catalog.Table for name resolution).
-          Planner: CTEDMLPrefix + MaterializedCTEScan plan nodes; preplanWithClause
-          returns DML plans; wrapDMLCTEPrefix wraps outer query. MERGE RETURNING:
-          Merge.Returning/ReturningSchema; mergeOp.collectReturningRow + retRows
-          yield RETURNING rows via Next(). Executor: cteDMLPrefixOp executes DML
-          CTEs in sequence (materialising into ctx.MaterializedCTEs); materializedCTEScanOp
-          reads them. mergeApplyUpdate: moved-partition sentinel check added (before
-          and after epqFollowChain). Design:
-          `docs/design/0100-0005-dml-cte-with-merge-returning.md`.
-          MergeMatchRecheck: 489/503 → 501/503 lines (2 wrong-data lines from CTE
-          MERGE not detecting concurrent update in test; 2 missing lines from
-          moved-partition error not triggering — both require further investigation).
-          **PASS count = 14** (unchanged — MergeMatchRecheck still SKIP).
 
-        - **Loop-19 partition EPQ recheck + EXPLAIN Merge format (2026-05-20)**:
-          (A) `mergeApplyUpdate`/`mergeApplyDelete` lacked `epqFollowChain`
-          fallback for non-HOT cross-page updates. `updateOp.Next()` skips
-          `tryApplyHOTUpdate` for partition children (`puRel != rel`), so
-          child-partition updates set xmax+CTID but leave `HeapHotUpdated=0`.
-          `epqFollowHOT` terminates immediately; added `epqFollowChain` as
-          fallback (mirrors the same two-step pattern in `updateViaIndex` and
-          `updateOp.Next()`). `mergeEPQError` gains `newBlk` field; `applyMod`
-          now updates both `mod.blk` and `mod.slot` from the EPQ result.
-          `MergeMatchRecheck` advances from L234 to L257 first-divergence
-          (256/551 lines now match; `target_pa` permutations pass).
-          (B) `describePlan` now returns `"Merge on <table>"` for `*planner.Merge`
-          (was `"*planner.Merge"`). `planChildren` returns `[p.Source]` for
-          Merge so EXPLAIN shows the source scan as child node. MergeJoin
-          EXPLAIN now shows `Merge on tgt` (structural mismatch with PG's
-          join plan remains; test still SKIP).
-          **PASS count = 14** (unchanged — MergeMatchRecheck still fails on
-          CTE-with-MERGE-RETURNING at L257+; MergeJoin fails on EXPLAIN join
-          tree structure).
-        
         - Next: **Go to M0107 (because this milestone depends on M0107)**
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)

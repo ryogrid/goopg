@@ -308,25 +308,42 @@ func epqChainCheckMovedPartition(ctx *Context, rel storage.RelFileNode,
 // updater proceeds against it; otherwise the row is skipped.
 func epqFollowChain(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
 	slot uint16, cols []catalog.Column, pred planner.Expr) (storage.BlockNumber, uint16, Row, bool) {
+	_, found, movedPart := epqFollowChainFull(ctx, rel, blk, slot, cols, pred)
+	if movedPart {
+		return 0, 0, nil, false
+	}
+	return found.blk, found.slot, found.row, found.ok
+}
+
+type epqChainResult struct {
+	blk  storage.BlockNumber
+	slot uint16
+	row  Row
+	ok   bool
+}
+
+// epqFollowChainFull walks the t_ctid chain and returns the live successor row.
+// movedPart is true if the chain ended because of a moved-partition sentinel.
+func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
+	slot uint16, cols []catalog.Column, pred planner.Expr) (relNode storage.RelFileNode, found epqChainResult, movedPart bool) {
 	const maxChain = 64
 	curBlk, curSlot := blk, slot
 	for i := 0; i < maxChain; i++ {
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
 		if err != nil {
-			return 0, 0, nil, false
+			return rel, epqChainResult{}, false
 		}
 		s.RLock()
 		tup, gerr := storage.PageGetHeapTuple(s.Page(), curSlot)
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
 		if gerr != nil {
-			return 0, 0, nil, false
+			return rel, epqChainResult{}, false
 		}
-		// Sentinel: row was moved to another partition — caller should
-		// have already detected via epqSlotMovedToAnotherPartition or
-		// epqChainCheckMovedPartition; treat as chain end here.
+		// Sentinel: row was moved to another partition.
+		// Report this to the caller so it can raise the appropriate error.
 		if storage.IsMovedToAnotherPartition(tup.Header.CTID) {
-			return 0, 0, nil, false
+			return rel, epqChainResult{}, true
 		}
 		ctid := tup.Header.CTID
 		// Chain terminates when CTID is invalid (no successor stamped) or
@@ -336,25 +353,25 @@ func epqFollowChain(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumb
 			(ctid.Block == curBlk && ctid.Offset == curSlot)
 		if atTail {
 			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID) {
-				return 0, 0, nil, false
+				return rel, epqChainResult{}, false
 			}
 			row, decErr := DecodeRow(cols, tup.Data)
 			if decErr != nil {
-				return 0, 0, nil, false
+				return rel, epqChainResult{}, false
 			}
 			if pred != nil {
 				pv, perr := evalExpr(pred, row, ctx)
 				if perr != nil || pv.IsNull() || pv.Kind != KindBool || !pv.BoolValue() {
-					return 0, 0, nil, false
+					return rel, epqChainResult{}, false
 				}
 			}
-			return curBlk, curSlot, row, true
+			return rel, epqChainResult{blk: curBlk, slot: curSlot, row: row, ok: true}, false
 		}
 		// Follow the link to the next version.
 		curBlk = ctid.Block
 		curSlot = ctid.Offset
 	}
-	return 0, 0, nil, false
+	return rel, epqChainResult{}, false
 }
 
 // stampOldCtid updates the t_ctid field of the tuple at (rel, blk, slot)
@@ -1816,17 +1833,42 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						oldTupleBytes, _ = freshTup.MarshalBinary()
 					}
 				}
-				if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
+				// Determine if this UPDATE is a cross-partition move so we
+				// can stamp the moved-partition sentinel (M0100-0005n) and route
+				// the write to the correct destination partition.
+				targetWriteRel := rel
+				targetWriteCols := cols
+				var destPartIdx *catalog.Table
+				isCrossPartitionMoveIdx := false
+				if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(idxTbl.PartitionKey) > 0 {
+					if dp := routeToPartition(idxTbl, pu.newRow, imW); dp != nil {
+						dpRel := o.ctx.Catalog.RelFileNode(dp)
+						if dpRel != rel {
+							isCrossPartitionMoveIdx = true
+						}
+						targetWriteRel = dpRel
+						targetWriteCols = dp.Columns
+						destPartIdx = dp
+						_ = computeGeneratedColumns(dp.Columns, pu.newRow)
+					}
+				}
+				var stampIdxErr error
+				if isCrossPartitionMoveIdx {
+					stampIdxErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, o.ctx.Tx.XID)
+				} else {
+					stampIdxErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
+				}
+				if stampIdxErr != nil {
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					if errors.Is(err, storage.ErrUnsupportedItem) || errors.Is(err, storage.ErrInvalidSlot) {
+					if errors.Is(stampIdxErr, storage.ErrUnsupportedItem) || errors.Is(stampIdxErr, storage.ErrInvalidSlot) {
 						// Concurrent UPDATE/DELETE or opportunistic
 						// prune flipped this slot out of LP_NORMAL
 						// after scan-time. Skip the row.
 						epqSkip = true
 						break
 					}
-					return nil, err
+					return nil, stampIdxErr
 				}
 				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
 				s.Unlock()
@@ -1834,25 +1876,28 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				if derr != nil {
 					return nil, derr
 				}
-				newPtr, werr := writeHeapRowReturning(o.ctx, rel, cols, pu.newRow)
+				newPtr, werr := writeHeapRowReturning(o.ctx, targetWriteRel, targetWriteCols, pu.newRow)
 				if werr != nil {
 					return nil, werr
 				}
-				// Non-partition in-place UPDATE via index: maintain unique/PK
-				// btree entries for the new row version so ON CONFLICT arbiters
-				// and unique-constraint checks can find the live committed row
-				// after a concurrent UPDATE. M0100-0005 (Bug A fix).
-				maintainUniqueIndexesForInsert(o.ctx, idxTbl, cols, pu.newRow, newPtr)
+				// Maintain unique/PK btree entries for the new row version.
+				if destPartIdx != nil {
+					maintainUniqueIndexesForInsert(o.ctx, destPartIdx, targetWriteCols, pu.newRow, newPtr)
+				} else {
+					maintainUniqueIndexesForInsert(o.ctx, idxTbl, cols, pu.newRow, newPtr)
+				}
 				// M0100-0005z: link old tuple to new version via t_ctid for
-				// EPQ chain followers.
-				if cerr := stampOldCtid(o.ctx, rel, pu.blk, pu.slot, newPtr); cerr != nil {
-					return nil, cerr
+				// EPQ chain followers (non-cross-partition only).
+				if !isCrossPartitionMoveIdx {
+					if cerr := stampOldCtid(o.ctx, rel, pu.blk, pu.slot, newPtr); cerr != nil {
+						return nil, cerr
+					}
 				}
 				// Mark HeapKeysUpdated when an indexed column changed (HOT was
 				// not eligible). FOR KEY SHARE uses this bit to decide whether to
 				// wait on this xmax. Mirrors upstream heap_update's HEAP_KEYS_UPDATED
 				// stamping via PageSetHeapTupleKeysUpdated.
-				if !hotEligible {
+				if !hotEligible && !isCrossPartitionMoveIdx {
 					if s2, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk}); perr == nil {
 						s2.Lock()
 						_ = storage.PageSetHeapTupleKeysUpdated(s2.Page(), pu.slot)
@@ -1860,13 +1905,12 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						o.ctx.Pool.Unpin(s2)
 					}
 				}
-				// Emit canonical WAL for this UPDATE: DELETE of old page
-				// (post xmax+ctid stamp) then INSERT of new page.
+				// Emit canonical WAL for this UPDATE.
 				if o.ctx.LogCanonical != nil {
 					if derr := emitCanonicalHeapDelete(o.ctx, rel, pu.blk, pu.slot); derr != nil {
 						return nil, derr
 					}
-					if ierr := emitCanonicalHeapInsert(o.ctx, rel, newPtr); ierr != nil {
+					if ierr := emitCanonicalHeapInsert(o.ctx, targetWriteRel, newPtr); ierr != nil {
 						return nil, ierr
 					}
 				}
