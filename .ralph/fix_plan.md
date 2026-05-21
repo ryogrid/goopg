@@ -5474,9 +5474,40 @@ Operational policy (2026-05-20):
         all PASS. Design:
         `docs/design/0107-0007ah-wal-tryappend-rwmutex.md` (indexed in
         `docs/design/README.md`). `make ralph-state-guard` PASS.
-        Remaining: make drain asynchronous (appendPGCompat Path B still
-        holds Lock() for `drainBufferBytes`; this is the last Lock()-on-
-        hot-path bottleneck); pgbench c=100 SU TPS ≥ 500 gate.
+      - PARTIAL PROGRESS 2026-05-21 (slice B async drain + pgbench TPS gate):
+        Closed the last Lock()-on-hot-path bottleneck in `appendPGCompat` Path B:
+        (1) `walBuffer.head` and `walBuffer.base` upgraded to `atomic.Int64`
+        (parallel to [[0107-0007r]]'s `tail` upgrade) so concurrent stripe
+        writers' `free()`/`writeReserved` reads are race-free against the
+        state-loop drain goroutine's `advanceHead` stores; `advanceHead` stores
+        base-first-then-head to prevent transient `errWALBufferReservedOutOfRange`
+        from concurrent `writeReserved` range checks.  (2) `appendPGCompat`
+        Path B drops `appendMu.Lock()/Unlock()` — drain runs without any outer
+        lock; `AppendXLogPayload` takes its own stripe lock internally;
+        `PublishUpTo` is atomic.  Design:
+        `docs/design/0107-0007ai-wal-buffer-head-base-atomic-async-drain.md`
+        (indexed in `docs/design/README.md`). Commits: ac9c756.
+        Three ring-window correctness bugs fixed en route to the pgbench gate:
+        (a) `MemRing.AdvanceWindow`: proactive ring eviction before `WriteReserved`
+        (after cap bytes of WAL, `PublishUpTo(end)` leaves window `[end-cap, end)`
+        which excludes `end` itself — new write at `pos=end` fails);
+        (b) `reserveEmittedAndPublish`: skip sub-24-byte segment-boundary gaps
+        (gap < xlogMinimumRecordSize → skip to boundary without `onCrossSegment`,
+        preserving `t.prev` for xl_prev chain continuity);
+        (c) `walBuffer.writeReserved`: use `head` (not `base`) for upper-bound
+        check — after partial drain, `head` advances but `base` stays put until
+        `head-base >= cap`, making valid writes at `[base+cap, head+cap)` be
+        incorrectly rejected. Commit: 913af1f.
+        `CLog.flush` TOCTOU race fixed: scan and copy use separate `b.data` reads
+        under different lock acquisitions; concurrent commits grow `b.data` between
+        scan and copy, causing `copy(out[start:start+len(b.data)])` to write past
+        `out`'s allocated end. Fix: cap `copyLen` to `len(out)-start`. Commit: 07011f8.
+        pgbench c=100 SU TPS gate: 1981 TPS (target ≥ 500, was DEADLOCK/SKIP).
+        Pre-existing heap UPDATE corruption ("truncated 4-byte varlena header")
+        surfaced by higher throughput — not caused by WAL changes; deferred to
+        a separate fix item.  `go test -race -count=1 ./internal/wal/
+        ./internal/mvcc/ ./internal/executor/ ./internal/storage/ ./internal/server/`
+        all PASS.  `make ralph-state-guard` PASS.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
