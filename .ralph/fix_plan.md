@@ -5379,6 +5379,26 @@ Operational policy (2026-05-20):
         earlier slice B foundations ([[0107-0007i]] through
         [[0107-0007ae]] minus the dead-code-removed
         [[0107-0007h]] / [[0107-0007x]]).
+      - **prev-RecPtr fix + parity gate activation (2026-05-21)**:
+        `reserveEmittedAndPublish` now stores `t.prev = start +
+        uint64(leading)` (record-CONTENT start) instead of `t.prev =
+        start` (reservation start). Legacy `state.append` stores
+        `s.prevRecPtr = writePos + leading`; both paths now agree.
+        Three previously t.Skip-deferred parity tests activated:
+        `TestAppendXLogPayloadParityWithLegacyEncodeEmit`,
+        `TestAppendXLogPayloadParityShortRecordsSingleStripe`,
+        `TestAppendXLogPayloadParityEmptyBodyRecords`. Updated tests:
+        `TestReserveEmittedAndPublishCrossSegmentEmitsPadAndRePredicts`,
+        `TestAppendXLogPayloadTwoRecordsFormChain`,
+        `TestStripeAppendBuiltEmittedHappyPathReceivesPrevAndTotal`.
+        `go test -race -count=1 ./internal/wal/` PASS (4.1s).
+        `go test -race ./internal/executor/ ./internal/server/
+        ./internal/mvcc/ ./internal/storage/ ./internal/access/btree/`
+        PASS. `make ralph-state-guard` PASS. Commit: e5801db.
+        Slice B's parity gate is now fully active — all three
+        multi-record byte-identical assertions pass, confirming that
+        `core.AppendXLogPayload` is ready for the call-site rewrite
+        at `state.append`'s PG-compat write entry points.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
