@@ -4218,6 +4218,176 @@ Operational policy (2026-05-20):
         `insertionTracker` + `tailPublisher` +
         `reserveAndPublish` + `publishTail` + `emitSegmentPad` +
         `publishVisibility`.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 14 of N —
+        `stripeAppend` writer-side composer): added
+        `stripeAppend(locks, posTracker, insertTracker, walBuf,
+        memRing, procNum, record) (start, prev uint64, err error)`
+        in new file `internal/wal/stripe_append.go`. Performs one
+        stripe-locked WAL append by composing seven writer-side
+        primitives in the exact order the slice B contract
+        requires: (1) [[0107-0007i]] `appendLockSet.lockByProcNum`
+        acquires one of eight stripe mutexes selected by
+        `procNum & 0x7`; (2) [[0107-0007p]]
+        `insertPosTracker.reserveAndPublish` jointly advances
+        `(curr, prev)` and publishes the stripe's active LSN
+        under `posMu` (closes the pre-reserve race from
+        [[0107-0007m]] §"Pre-reserve race"); (3) [[0107-0007l]]
+        `walBuffer.writeReserved` lands bytes into the bytes-side
+        ring; (4) [[0107-0007o]] `MemRing.WriteReserved` lands
+        bytes into the walsender mirror; (5) [[0107-0007m]]
+        `insertionTracker.setInsertingAt(stripe, lsnIdle)`
+        publishes the END marker so the drain-side
+        [[0107-0007n]] `tailPublisher` stops capping `safeTail`
+        at this stripe's start LSN; (6) the stripe mutex
+        releases. Steps (5) and (6) are deferred so LIFO
+        ordering runs END-marker → unlock, matching the
+        lock-ordering tier documented at the end of
+        [[0107-0007t]]. Symmetric counterpart of [[0107-0007t]]
+        `publishVisibility` (drain-side composer): stripeAppend
+        writes bytes without advancing visibility;
+        publishVisibility advances visibility without writing
+        bytes. The two composers together cover the full slice
+        B write/publish lifecycle so the call-site rewrite can
+        install each as a one-liner at its natural site
+        (stripeAppend at the per-record write entry point;
+        publishVisibility inside the drain goroutine's
+        per-tick loop). Cross-segment crossings handled by
+        `insertPosTracker.onCrossSegment` fired under `posMu`
+        inside step (2); the slice B call-site rewrite will
+        install [[0107-0007s]] `emitSegmentPad` as that hook so
+        a reservation that straddles a segment boundary
+        automatically gets a well-formed XLOG_NOOP pad record
+        dropped into the gap with the xl_prev chain preserved.
+        Error handling and END marker. If `walBuf.writeReserved`
+        or `memRing.WriteReserved` returns an error (e.g.
+        `errWALBufferReservedOutOfRange` from a caller-side
+        range bug), the composer still publishes the END marker
+        before unlocking the stripe so the drain's
+        `tailPublisher` is not frozen — leaving the stripe slot
+        stuck at the failed reservation's start LSN would
+        permanently cap `safeTail`. Error returned verbatim from
+        the failing primitive so callers can pattern-match
+        (`errors.Is(err, errWALBufferReservedOutOfRange)`);
+        `start, prev` returned even on error for forensic
+        logging. Nil-safety contract: `locks` / `posTracker` /
+        `insertTracker` are required (nil → structured errors
+        `errStripeAppendNilLocks` /
+        `errStripeAppendNilPosTracker` /
+        `errStripeAppendNilInsertTracker` before any side effect;
+        nil insertTracker would re-open the pre-reserve race);
+        `walBuf` / `memRing` individually nil-safe (skip the
+        corresponding `writeReserved` so the composer works
+        under `Config.WALBuffers == 0` and/or
+        `wal_sender_memory_buffer == 0`). Empty record rejected
+        with `errStripeAppendEmptyRecord` — `reserveAndPublish(0,
+        …)` panics on size == 0 by design, we want a structured
+        error instead; the slice B caller has no useful "empty
+        WAL insert" semantics; early rejection avoids acquiring
+        the stripe lock for a no-op call. Concurrency: two
+        `stripeAppend` calls with procNums hashing to different
+        stripes proceed fully in parallel — only the per-stripe
+        mutex serialises within a stripe. PG counterpart:
+        `XLogInsertRecord` in
+        `postgres/src/backend/access/transam/xlog.c` calls
+        `WALInsertLockAcquire(MyProcNumber %
+        NUM_XLOGINSERT_LOCKS)` → `ReserveXLogInsertLocation`
+        (with `WALInsertLockUpdateInsertingAt` under the same
+        insert lock) → `CopyXLogRecordToWAL` (into
+        `XLogCtl->pages`) → `WALInsertLockRelease` (which
+        resets `insertingAt` to `InvalidXLogRecPtr`). goopg's
+        `stripeAppend` fuses the equivalent five steps into one
+        composer so the call-site rewrite stays a one-liner.
+        Lock-ordering tier: `stripeAppend →
+        appendLockSet.lockByProcNum →
+        insertPosTracker.reserveAndPublish (posMu held:
+        reserveLocked + insertionTracker.setInsertingAt(start);
+        posMu released, with rare cross-segment
+        onCrossSegment hook → emitSegmentPad) →
+        walBuffer.writeReserved (no lock; leaf) →
+        MemRing.WriteReserved (memRing.mu read-lock) →
+        insertionTracker.setInsertingAt(stripe, lsnIdle) →
+        drop stripe lock`. Dead code until the slice B
+        call-site rewrite mounts `appendLockSet` +
+        `insertPosTracker` + `insertionTracker` on `Writer`
+        and switches `state.append`'s body to call
+        `stripeAppend`; foundation-first pattern matches slice
+        C ([[0107-0007b]] / [[0107-0007c]] / [[0107-0007d]]
+        before [[0107-0007e]] / [[0107-0007f]] /
+        [[0107-0007g]]) and the thirteen earlier slice B
+        foundations ([[0107-0007h]] / [[0107-0007i]] /
+        [[0107-0007j]] / [[0107-0007k]] / [[0107-0007l]] /
+        [[0107-0007m]] / [[0107-0007n]] / [[0107-0007o]] /
+        [[0107-0007p]] / [[0107-0007q]] / [[0107-0007r]] /
+        [[0107-0007s]] / [[0107-0007t]]). Fifteen regression
+        tests in `internal/wal/stripe_append_test.go`:
+        `TestStripeAppendHappyPathWritesBothRings` (single
+        insert, both rings get bytes, END marker fires,
+        publishVisibility makes them visible);
+        `TestStripeAppendNilLocksReturnsError` /
+        `TestStripeAppendNilPosTrackerReturnsError` /
+        `TestStripeAppendNilInsertTrackerReturnsError`
+        (defensive nil-guards return structured errors);
+        `TestStripeAppendEmptyRecordReturnsError` (empty / nil
+        record rejected before any side effect, pos tracker /
+        insertion tracker untouched);
+        `TestStripeAppendNilWalBufStillWritesMemRing`
+        (`Config.WALBuffers == 0` path);
+        `TestStripeAppendNilMemRingStillWritesWalBuf`
+        (`wal_sender_memory_buffer == 0` path);
+        `TestStripeAppendWalBufOutOfWindowReturnsErrorAndClearsStripe`
+        (walBuf range violation surfaces error AND END marker
+        fires so drain is not frozen);
+        `TestStripeAppendMemRingOutOfWindowReturnsErrorAndClearsStripe`
+        (symmetric for memring);
+        `TestStripeAppendSelectsStripeByProcNum` (procNum & 0x7
+        stripe selection; per-stripe slot back to idle after
+        every call);
+        `TestStripeAppendCrossSegmentEmitsPadAndChainsPrev`
+        (segSize=200 + 80-byte records; third reservation
+        crosses boundary 200 → onCrossSegment fires
+        emitSegmentPad → pad at [160, 200) with xl_prev=80,
+        reservation lands at 200 with prev=160);
+        `TestStripeAppendConcurrentDisjointStripesProgressInParallel`
+        (8 procNums × 200 records × 16 bytes = 25 600 bytes;
+        race-clean under `-race`; per-stripe payload byte
+        landed at every per-stripe start LSN; final starts
+        form a permutation of `{0, 16, …, 25584}`);
+        `TestStripeAppendConcurrentSameStripeSerialise`
+        (procNum 3 and 11 both hash to stripe 3; 500 records
+        each; race-clean; final reservation count 16 000
+        bytes);
+        `TestStripeAppendConcurrentDrainConsistency` (16
+        producers × 200 records + drain-style goroutine
+        continuously calling
+        `publishVisibility(posTracker.load())`; final
+        publication brings safe tail to 51 200; race-clean);
+        `TestStripeAppendWatchdog` (5-second watchdog around
+        the drain-consistency scenario — surfaces deadlock
+        regressions before the package-level timeout).
+        Verified: `go test -race -count=1 -run
+        'TestStripeAppend' ./internal/wal/` PASS (1.03 s);
+        `go test -race -count=1 ./internal/wal/` PASS
+        (3.18 s). Design:
+        `docs/design/0107-0007u-wal-stripe-append.md`
+        (indexed in `docs/design/README.md`). Out of scope
+        (call-site rewrite): mounting `appendLockSet` +
+        `insertPosTracker` + `insertionTracker` + `walBuf` +
+        `memRing` on `Writer` and switching `state.append` to
+        call `stripeAppend` (multi-loop because
+        `state.appendMu`'s four invariants — writePos /
+        walBuf / memRing / writeLSN — split into per-stripe
+        local state vs. shared state); drain coordination
+        with concurrent stripe writes (`drainBufferBytes`
+        currently runs under `appendMu` — the rewrite must
+        let drain run concurrently with stripe writers by
+        consuming `publishVisibility`'s return as the drain
+        ceiling); deciding whether [[0107-0007h]]
+        `lsnAllocator` becomes dead-code-removed once the
+        call-site converges on `insertPosTracker` +
+        `insertionTracker` + `tailPublisher` +
+        `reserveAndPublish` + `publishTail` +
+        `emitSegmentPad` + `publishVisibility` +
+        `stripeAppend`.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
