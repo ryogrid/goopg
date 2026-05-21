@@ -3753,6 +3753,160 @@ Operational policy (2026-05-20):
         `insertPosTracker` + `insertionTracker` + `tailPublisher`
         + `reserveAndPublish` — `reserve` remains in the API as
         a callable primitive without a tracker.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 10 of N —
+        `walBuffer.publishTail` bytes-side tail-publication primitive):
+        added `(*walBuffer).publishTail(safeTail int64) int64` in new
+        file `internal/wal/wal_buffer_publish_tail.go`. Bytes-side
+        mirror of [[0107-0007o]] `MemRing.PublishUpTo`: under the
+        slice B 8-stripe writer model a stripe lands bytes via
+        [[0107-0007l]] `walBuffer.writeReserved` without touching
+        `tail`; the drain goroutine — after consulting
+        [[0107-0007n]] `tailPublisher` for the safe watermark —
+        calls `publishTail` to monotonically advance `tail` so the
+        freshly-published bytes become drainable (visible to
+        `resident` / `readForDrain` / `readAt`). Without this
+        primitive the call-site rewrite cannot promote bytes from
+        "written but invisible" to "drainable" without holding the
+        global `state.appendMu` that slice B is trying to retire.
+        Contract: nil-safe (`b == nil` returns 0, matching
+        [[0107-0007l]] / [[0107-0007o]]'s nil-safe convention for
+        `Config.WALBuffers == 0`); monotonic store (`safeTail <=
+        b.tail` short-circuits as a no-op — regressing values from a
+        stale `tailPublisher` snapshot are silently ignored);
+        returns the resulting tail value (post-update). Does NOT
+        mutate `head` or `base` — drain remains solely responsible
+        for head/base advances via `advanceHead` after `writeAt`
+        confirms bytes are persisted.
+        No head-eviction. Unlike `MemRing.PublishUpTo` (which
+        auto-evicts oldest residents when `safeTail - head > cap`),
+        `walBuffer.publishTail` must NOT auto-advance head when
+        resident exceeds cap — pending writes are not yet on disk,
+        so silently evicting them would lose data. The contract
+        instead requires the caller (drain) to keep resident ≤ cap
+        by `advanceHead`-after-`writeAt`; today's Path A satisfies
+        this via overflow-drain-then-append in `state.append`, and
+        the slice B call-site rewrite satisfies it by running drain
+        on a dedicated goroutine and pausing publication when the
+        ring is full. `TestWALBufferPublishTailDoesNotEvictPendingWrites`
+        pins this contract: a deliberate caller-side overflow
+        (`publishTail(96)` on a cap-64 buffer with head=0) leaves
+        head at 0 — the primitive does not paper over the caller's
+        bug by data-losing eviction.
+        Concurrency. This foundation lands the API surface only.
+        `b.tail` remains a plain `int64` for now; the eventual
+        atomicity upgrade (so a drain goroutine's `publishTail` and
+        stripe writers' tail readers — via `resident`,
+        `readForDrain`, `readAt` — can coexist without a data race)
+        is a separate follow-on foundation, deliberately decoupled
+        so the call-site rewrite can wire `publishTail` in lock-step
+        with the atomic upgrade. Under today's single-goroutine
+        usage (`state.append` holding `appendMu`), `publishTail` is
+        trivially safe — every call is on the writer goroutine that
+        holds the lock. The concurrent-scenario test drives 8 stripe
+        writers + a publisher goroutine serialising `publishTail`
+        calls under -race so the API surface is exercised under the
+        stripe-concurrent pattern without yet asserting field-level
+        atomicity.
+        PG counterpart: `XLogCtl->LogwrtResult.Write` advance in
+        `postgres/src/backend/access/transam/xlog.c` after
+        `WaitXLogInsertionsToFinish` returns; downstream readers
+        consult the published watermark before issuing reads.
+        Lock-ordering tier after foundation 10:
+            (stripe writer):
+              appendLockSet.lockByProcNum
+                → insertPosTracker.reserveAndPublish
+                → walBuffer.writeReserved
+                → MemRing.WriteReserved
+                → insertionTracker.setInsertingAt(stripe, lsnIdle)
+              → drop stripe lock
+            (drain goroutine, separately):
+              safeTail := tailPublisher.publishUpTo(upperBound,
+                                                    insertionTracker)
+              walBuffer.publishTail(safeTail)
+              walBuffer.advanceHead(safeTail - prior)
+              MemRing.PublishUpTo(safeTail)
+        `publishTail` sits immediately before `advanceHead` in the
+        drain chain because `resident()` derives from `tail - head`
+        and drain wants to see all newly-published bytes before
+        issuing the write batch.
+        Dead code until the slice B call-site rewrite consumes it;
+        foundation-first pattern matches slice C ([[0107-0007b]] /
+        [[0107-0007c]] / [[0107-0007d]] before [[0107-0007e]] /
+        [[0107-0007f]] / [[0107-0007g]]) and the nine earlier slice
+        B foundations ([[0107-0007h]] / [[0107-0007i]] /
+        [[0107-0007j]] / [[0107-0007k]] / [[0107-0007l]] /
+        [[0107-0007m]] / [[0107-0007n]] / [[0107-0007o]] /
+        [[0107-0007p]]). Eleven regression tests in
+        `internal/wal/wal_buffer_publish_tail_test.go`:
+        `TestWALBufferPublishTailAdvancesFromBase` (first publish on
+        a freshly-reset buffer advances tail and returns it;
+        head/base untouched);
+        `TestWALBufferPublishTailMonotonicIgnoresRegression` (second
+        publish with a lower value is a no-op; return value is the
+        existing tail);
+        `TestWALBufferPublishTailEqualIsNoop` (boundary case
+        `safeTail == tail` is a no-op; the `<=` guard matches
+        `MemRing.PublishUpTo`);
+        `TestWALBufferPublishTailDoesNotMutateHeadBase` (series of
+        monotonic publications leaves head/base untouched);
+        `TestWALBufferPublishTailNilReceiver` (nil-safe convention;
+        returns 0);
+        `TestWALBufferPublishTailExposesWriteReservedBytesToReadAt`
+        (end-to-end pairing: bytes written via `writeReserved` are
+        invisible to `readAt` until `publishTail` covers them —
+        pins the publication-is-the-visibility-edge invariant);
+        `TestWALBufferPublishTailMakesResidentTrackTailMinusHead`
+        (`resident()` reflects only published bytes; an unpublished
+        `writeReserved` leaves `resident()` at zero);
+        `TestWALBufferPublishTailComposesWithAdvanceHead` (drain
+        pattern `publishTail → readForDrain → advanceHead`
+        interleaves correctly; a second cycle confirms
+        `publishTail` extends from the post-advance tail);
+        `TestWALBufferPublishTailDoesNotEvictPendingWrites`
+        (deliberate caller-side overflow leaves head at 0; the
+        primitive does not auto-evict — matches the no-data-loss
+        contract that differs from `MemRing.PublishUpTo`);
+        `TestWALBufferPublishTailMonotonicUnderSerialisedAdvances`
+        (scripted sequence of monotonic/regressing requests; tail
+        follows the cumulative max);
+        `TestWALBufferPublishTailRaceFreeWithDisjointWriters` (8
+        writers × 50 records × 16 bytes via `writeReserved`; a
+        serialiser goroutine forwards max-LSN requests to
+        `publishTail`; race-clean under `-race`; final `readAt`
+        confirms every record landed in the right slot; body
+        extracted to `runPublishTailDisjointWritersScenario` so the
+        watchdog can re-run it);
+        `TestWALBufferPublishTailWatchdog` (5-second watchdog on
+        the concurrent scenario — surfaces deadlock regressions
+        before the package-level timeout; mirrors foundation 7 / 9's
+        pattern). Verified: `go test -race -count=1 -run
+        'TestWALBufferPublishTail' ./internal/wal/` PASS (1.02 s);
+        `go test -race -count=1 ./internal/wal/` PASS (3.12 s).
+        Design: `docs/design/0107-0007q-wal-buffer-publish-tail.md`
+        (indexed in `docs/design/README.md`). Out of scope (later
+        slice B foundations and call-site rewrite): upgrading
+        `b.tail` to `atomic.Int64` so a single drain goroutine's
+        `publishTail` and stripe writers' tail readers can coexist
+        without a data race (mechanical but ripples to 5 production
+        sites + the existing test that pokes `b.tail` directly;
+        lands in its own loop so this foundation's footprint stays
+        minimal); mounting `publishTail` on `Writer` and consuming
+        it from the drain/flush goroutine (multi-loop because
+        `state.append` currently advances `walBuf.tail` and
+        `memRing.tail` synchronously inside `appendMu`; the rewrite
+        splits the four invariants — writePos / walBuf / memRing /
+        writeLSN — into per-stripe local state vs. shared state);
+        drain coordination with concurrent stripe writes
+        (`drainBufferBytes` currently runs under `appendMu` — the
+        rewrite must let drain run concurrently with stripe writes
+        by consuming `tailPublisher.publishUpTo`'s return as drain
+        ceiling for `walBuffer.publishTail` /
+        `walBuffer.advanceHead` / `MemRing.PublishUpTo`); deciding
+        whether `lsnAllocator` ([[0107-0007h]]) becomes
+        dead-code-removed once the call-site converges on
+        `insertPosTracker` + `insertionTracker` + `tailPublisher` +
+        `reserveAndPublish` + `publishTail` — `reserve` remains in
+        the API as a callable primitive without a tracker.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
