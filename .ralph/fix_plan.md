@@ -4941,6 +4941,111 @@ Operational policy (2026-05-20):
         `reserveEmittedAndPublish` + `build(prev)` + ring writes +
         END marker (foundation 19 candidate — keeps the call-site
         rewrite a one-liner).
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 19 of N —
+        `stripeAppendBuiltEmitted` joint composer): closed the
+        foundation-19 candidate from [[0107-0007aa]]'s "Out of scope".
+        Added `stripeAppendBuiltEmitted(locks, posTracker, insertTracker,
+        walBuf, memRing, procNum, recordLen, build) (start, prev uint64,
+        total, leading int, err error)` in new file
+        `internal/wal/stripe_append_emitted.go` plus
+        `(*stripeWriterCore).AppendBuiltEmitted(procNum, recordLen,
+        build)` wrapper on `stripe_writer_core.go`. Bundles foundation
+        18 ([[0107-0007aa]] `reserveEmittedAndPublish`) with the build
+        closure and ring writes so the slice B call-site rewrite lands
+        one PG-compat record per call without exposing predict/reserve
+        sequencing to callers. The build closure receives the triple
+        `(prev, total, leading)` so the caller can call
+        `emitWithPageHeaders` (which needs total=predicted emit size,
+        leading=page-header byte count) with the same triple the
+        reservation computed under posMu — eliminates the second
+        `predictEmittedSize` call on the hot path and pins the contract
+        that `len(out) == total` (mis-size → structured
+        `errStripeAppendBuildSizeMismatch`). Distinct from
+        [[0107-0007y]] `stripeAppendBuild`: that composer's `size`
+        argument is the wire byte count including page headers (callers
+        must compute via [[0107-0007z]] `predictEmittedSize` against
+        current `posTracker.curr`, admitting the peer-race that
+        foundation 18 closed). Cross-segment crossings handled
+        transparently inside `reserveEmittedAndPublish`; the build
+        closure observes post-boundary prev (the pad's start LSN) and a
+        re-predicted (total, leading) pair so page headers stamp the
+        boundary's long PHD instead of mid-page short PHD. Error
+        handling matches [[0107-0007y]] / [[0107-0007u]]: build errors
+        and ring-write errors propagate verbatim, END marker fires via
+        defer (LIFO before unlock) so the drain's `tailPublisher` is
+        never frozen by a failed append. Reservation cannot be unwound
+        (peer stripes may have advanced past). Nil-checks: `locks` /
+        `posTracker` / `insertTracker` / `build` required (structured
+        sentinels); `walBuf` / `memRing` individually nil-safe.
+        `recordLen <= 0` → `errStripeAppendEmptyRecord` (same sentinel
+        as stripeAppend/stripeAppendBuild).
+        Twelve regression tests in
+        `internal/wal/stripe_append_emitted_test.go`:
+        `TestStripeAppendBuiltEmittedHappyPathReceivesPrevAndTotal`
+        (two-reservation prev chain; first lands at LSN 0 with long
+        PHD, second mid-page with leading=0; END marker landed; publish
+        + read-back confirms stamped xl_prev);
+        `TestStripeAppendBuiltEmittedNilLocksReturnsError` /
+        `…NilPosTrackerReturnsError` /
+        `…NilInsertTrackerReturnsError` /
+        `…NilBuildReturnsError` (defensive nil-guards);
+        `TestStripeAppendBuiltEmittedEmptyRecordReturnsError`
+        (recordLen ∈ {0, -1, -100} rejected before any side effect;
+        posTracker untouched);
+        `TestStripeAppendBuiltEmittedBuildErrorPropagatesAndClearsStripe`
+        (build returning sentinel error propagates with END marker
+        fired; curr advances — reservation lost);
+        `TestStripeAppendBuiltEmittedSizeMismatchReturnsError`
+        (under and over-size both → `errStripeAppendBuildSizeMismatch`;
+        END marker fires);
+        `TestStripeAppendBuiltEmittedNilWalBufStillWritesMemRing` /
+        `…NilMemRingStillWritesWalBuf` (per-ring nil-safety;
+        end-to-end read-back through the surviving ring);
+        `TestStripeAppendBuiltEmittedCrossSegmentEmitsPadAndRePredicts`
+        (segSize=2 pages; curr burned to segSize-50; reservation
+        cross-segment shifts to boundary with long PHD; pad lands at
+        [segSize-50, segSize); stamped prev=segSize-50 = pad's start
+        LSN);
+        `TestStripeAppendBuiltEmittedConcurrentDisjointStripesProgressInParallel`
+        (8 stripes × 50 reservations; all 400 starts distinct; sorted
+        starts disjoint by ≥ recordLen; tracker idle at end);
+        `TestStripeWriterCoreAppendBuiltEmittedDelegatesToStripeAppendBuiltEmitted`
+        (end-to-end through the core wrapper: reserve → build →
+        PublishUpTo → walBuf.readAt with stamped prev=0);
+        `TestStripeWriterCoreAppendBuiltEmittedNilReceiverReturnsError`
+        (nil core → `errStripeWriterCoreNil`);
+        `TestStripeAppendBuiltEmittedWatchdog` (5-second deadlock
+        watchdog mirroring foundations 7 / 9 / 11 / 15 / 17). Verified:
+        `go test -race -count=1 -run
+        'TestStripeAppendBuiltEmitted|TestStripeWriterCoreAppendBuiltEmitted'
+        ./internal/wal/` PASS (1.04 s); `go test -race -count=1
+        ./internal/wal/` PASS (4.16 s); `go vet ./internal/wal/`
+        clean. Design:
+        `docs/design/0107-0007ab-wal-stripe-append-built-emitted.md`
+        (indexed in `docs/design/README.md`). PG-compat — none
+        (in-memory composer; byte stream identical to legacy
+        `state.append` flow, only under per-stripe locking instead of
+        global appendMu). Dead code until the slice B call-site rewrite
+        mounts `core.AppendBuiltEmitted` at the PG-compat write entry
+        points; foundation-first pattern matches slice C
+        ([[0107-0007b]] / [[0107-0007c]] / [[0107-0007d]] before
+        [[0107-0007e]] / [[0107-0007f]] / [[0107-0007g]]) and the
+        eighteen earlier slice B foundations ([[0107-0007i]] through
+        [[0107-0007aa]] minus the dead-code-removed [[0107-0007h]]).
+        Out of scope (deferred to call-site rewrite parts 2/3):
+        mounting `core.AppendBuiltEmitted` as the body of
+        `state.append` / `state.appendTryEnqueue` / `state.appendBatch`
+        for the PG-compat path (multi-loop because `state.appendMu`'s
+        four invariants — writePos / walBuf / memRing / writeLSN —
+        split into per-stripe local state vs. shared state); mounting
+        `core.PublishUpTo` in the drain goroutine's prelude (`drainBufferBytes`
+        currently runs under `appendMu` — rewrite must let drain run
+        concurrently with stripe writes by consuming the publisher's
+        return as drain ceiling); walreceiver replay (`appendRaw`)
+        does not use page-header insertion — bytes arrive pre-encoded
+        from the primary — so that path will continue to consume the
+        size-explicit [[0107-0007p]] `reserveAndPublish` /
+        [[0107-0007u]] `stripeAppend` instead.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded

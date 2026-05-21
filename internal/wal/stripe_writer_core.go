@@ -203,6 +203,36 @@ func (c *stripeWriterCore) AppendBuilt(procNum int32, size int, build func(prev 
 	return stripeAppendBuild(c.locks, c.posTracker, c.inserting, c.walBuf, c.memRing, procNum, size, build)
 }
 
+// AppendBuiltEmitted performs one stripe-locked WAL append where both the
+// record's byte length (after page-header insertion) and the prev LSN
+// must be resolved by the reservation itself. Delegates to foundation 19
+// ([[0107-0007ab]]) stripeAppendBuiltEmitted with the core's bundled
+// primitives. Returns the reservation's start LSN, the prev LSN that was
+// passed into `build`, the total emitted byte count (page headers +
+// record body), the leading page-header byte count (0 if start is not
+// page-aligned), and any error from reservation, build, or the byte
+// writes.
+//
+// Use AppendBuiltEmitted for PG-compat records whose on-the-wire size
+// includes page headers stamped by emitWithPageHeaders — the build
+// closure receives the post-reservation prev plus the (total, leading)
+// pair pre-computed under posMu, and must return exactly `total` bytes
+// of page-headered output. Use [[0107-0007y]] AppendBuilt for records
+// whose page-header schedule is the caller's responsibility (currently
+// no such site exists in goopg — kept as the size-explicit primitive
+// for tests and future flexibility). Use Append for records that are
+// already fully encoded without prev linkage.
+//
+// nil receiver returns errStripeWriterCoreNil so the call-site rewrite
+// can detect a mis-wired Writer without a nil-pointer panic — same
+// contract as Append and AppendBuilt.
+func (c *stripeWriterCore) AppendBuiltEmitted(procNum int32, recordLen int, build func(prev uint64, total, leading int) ([]byte, error)) (start, prev uint64, total, leading int, err error) {
+	if c == nil {
+		return 0, 0, 0, 0, errStripeWriterCoreNil
+	}
+	return stripeAppendBuiltEmitted(c.locks, c.posTracker, c.inserting, c.walBuf, c.memRing, procNum, recordLen, build)
+}
+
 // PublishUpTo advances both ring tails to the safe-tail watermark
 // derived from upperBound and the core's insertion tracker, by
 // delegating to [[0107-0007t]] publishVisibility. Returns the
