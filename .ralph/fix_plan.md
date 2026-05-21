@@ -4388,6 +4388,138 @@ Operational policy (2026-05-20):
         `reserveAndPublish` + `publishTail` +
         `emitSegmentPad` + `publishVisibility` +
         `stripeAppend`.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 15 of N —
+        `stripeWriterCore` packaging struct): added
+        `stripeWriterCore` in new file
+        `internal/wal/stripe_writer_core.go` — a six-field struct
+        that bundles the four owned slice B primitives
+        ([[0107-0007i]] `appendLockSet`, [[0107-0007k]]
+        `insertPosTracker`, [[0107-0007m]] `insertionTracker`,
+        [[0107-0007n]] `tailPublisher`) and borrows two ring
+        pointers ([[0107-0007l]] `walBuffer`, [[0107-0007o]]
+        `MemRing`) from the lifetime owner (`Writer`). Single
+        constructor
+        `newStripeWriterCore(segSize, startCurr, startPrev, walBuf, memRing)`
+        installs an `onCrossSegment` closure that captures the
+        borrowed rings and invokes [[0107-0007s]] `emitSegmentPad`
+        so cross-segment reservations automatically stamp
+        XLOG_NOOP pad records into the gap with the xl_prev chain
+        preserved. emitSegmentPad errors panic — the
+        `onCrossSegment` signature has no error return and
+        [[0107-0007s]]'s design requires fatal escalation; sub-
+        24-byte gaps and the 25-byte gap-anomaly are real corner
+        cases the call-site rewrite forecloses via 8-byte
+        MAXALIGN. Four methods:
+            `Append(procNum, record) (start, prev, err)`  →
+                delegates to [[0107-0007u]] `stripeAppend`;
+            `PublishUpTo(upperBound) int64`                →
+                delegates to [[0107-0007t]] `publishVisibility`;
+            `Load() (curr, prev)`                          →
+                posTracker.load (drain-side upperBound input +
+                diagnostics);
+            `PublishedTail() int64`                        →
+                publisher.load (raw watermark for diagnostics).
+        Each method is nil-safe on the receiver so transitional
+        call-site states (core unset, fixtures) are benign;
+        `Append` on nil returns `errStripeWriterCoreNil`, the
+        other three return zero values. Owned-vs-borrowed split
+        rationale: the four owned primitives are exclusive to
+        slice B's insert path; the two ring buffers are also
+        referenced by legacy `state.append` and the walsender —
+        the rewrite borrows them so the on-disk visibility stays
+        unified across both paths (duplication would either fork
+        what readers see or require expensive cross-ring
+        synchronisation). Lock-ordering tier combines
+        [[0107-0007u]]'s writer chain with [[0107-0007t]]'s drain
+        chain — see design doc §"Lock-ordering tier" for the full
+        diagram. Dead code until the slice B call-site rewrite
+        mounts `*stripeWriterCore` on `Writer` and switches
+        `state.append`'s body to `s.core.Append`; foundation-first
+        pattern matches slice C ([[0107-0007e]]
+        `selectFSMCandidatePage` packaged the slice C foundations
+        before [[0107-0007f]] / [[0107-0007g]] consumed them) and
+        the fourteen earlier slice B foundations ([[0107-0007h]] /
+        [[0107-0007i]] / [[0107-0007j]] / [[0107-0007k]] /
+        [[0107-0007l]] / [[0107-0007m]] / [[0107-0007n]] /
+        [[0107-0007o]] / [[0107-0007p]] / [[0107-0007q]] /
+        [[0107-0007r]] / [[0107-0007s]] / [[0107-0007t]] /
+        [[0107-0007u]]). With this packaging foundation in place,
+        the eventual call-site rewrite's site footprint is: one
+        new field on `Writer` (`core *stripeWriterCore`); one
+        constructor call in `NewWriter` after the rings are built;
+        one call in `state.append`'s body
+        (`s.core.Append(procNum, encoded)`); one call in the
+        drain goroutine (`s.core.PublishUpTo(...)` before
+        readForDrain/writeAt/advanceHead). Ten regression tests
+        in `internal/wal/stripe_writer_core_test.go`:
+        `TestStripeWriterCoreAppendHappyPath` (single Append +
+        PublishUpTo; pre-publish reads miss, post-publish reads
+        hit byte-identical bytes in both rings; Load reflects
+        post-reservation position);
+        `TestStripeWriterCoreNilReceiverGuards` (methods on `nil`
+        return structured errors / zeros);
+        `TestStripeWriterCoreNilRingsStillProgress` (three sub-
+        cases — walBuf nil, memRing nil, both nil — each routes
+        correctly via per-primitive nil-safety propagation);
+        `TestStripeWriterCoreRejectsZeroSegSize` (constructor
+        invariant via newInsertPosTracker's panic);
+        `TestStripeWriterCoreRecoveryResume` (non-zero startCurr
+        = 0x100 + startPrev = 0x80 propagate; first append lands
+        at startCurr with prev=startPrev — covers the recovery-
+        resume scenario);
+        `TestStripeWriterCoreCrossSegmentEmitsPad` (segSize=200 +
+        three 80-byte reservations; third crosses boundary 200 →
+        pad lands at [160, 200) in both rings; triggering
+        reservation lands at LSN 200 with prev=160 — full
+        emitSegmentPad wire-through);
+        `TestStripeWriterCorePublishUpToCapsAtActiveStripe`
+        (direct slot manipulation pins drain-side cap behaviour
+        — active stripe at LSN 600 caps publish at 600 even with
+        upperBound 1000; after idle, publish advances to 1000);
+        `TestStripeWriterCorePublishedTailReflectsInternalState`
+        (raw watermark accessor; regressing upperBound does NOT
+        roll watermark back — monotonic invariant pinned at the
+        accessor layer);
+        `TestStripeWriterCoreConcurrentAppendsAndPublish` (8
+        writers × 200 records × 16 bytes + continuous drain
+        goroutine calling PublishUpTo; race-clean under `-race`;
+        final watermark matches expected total 25 600 bytes);
+        `TestStripeWriterCoreConcurrentCompletesUnderWatchdog`
+        (5-second watchdog around the concurrent scenario,
+        surfaces deadlock regressions before the package timeout
+        — mirrors foundations 7 / 9 / 11);
+        `TestStripeWriterCoreAppendEmptyRecord` (empty/nil
+        record rejected before any side effect via
+        `errStripeAppendEmptyRecord` pass-through; tracker state
+        untouched).
+        Verified: `go test -race -count=1 -run
+        'TestStripeWriterCore' ./internal/wal/` PASS (1.02 s);
+        `go test -race -count=1 ./internal/wal/` PASS (3.17 s).
+        Design: `docs/design/0107-0007v-wal-stripe-writer-core.md`
+        (indexed in `docs/design/README.md`). PG-compat — none
+        (in-memory packaging struct; WAL record / file format /
+        catalog / wire all unchanged; the composed chain mirrors
+        PG's `WALInsertLockAcquire + ReserveXLogInsertLocation +
+        CopyXLogRecordToWAL + WALInsertLockRelease` writer chain
+        and `WaitXLogInsertionsToFinish + LogwrtResult.Write`
+        advance for publication). Out of scope (call-site
+        rewrite): mounting `*stripeWriterCore` as a field on
+        `Writer` and rewriting `state.append` /
+        `drainBufferBytes` to call `core.Append` / `core.PublishUpTo`
+        respectively (multi-loop because `state.appendMu`'s four
+        invariants — writePos / walBuf / memRing / writeLSN —
+        split into per-stripe local state vs. shared state);
+        drain goroutine restructuring (currently runs under
+        `appendMu` — rewrite must let drain run concurrently
+        with stripe writers); 8-byte MAXALIGN of record sizes to
+        guarantee valid pad gaps (the call-site rewrite's
+        pre-Append step); deciding whether [[0107-0007h]]
+        `lsnAllocator` becomes dead-code-removed once the
+        call-site converges on `insertPosTracker` +
+        `insertionTracker` + `tailPublisher` +
+        `reserveAndPublish` + `publishTail` + `emitSegmentPad` +
+        `publishVisibility` + `stripeAppend` +
+        `stripeWriterCore`.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
