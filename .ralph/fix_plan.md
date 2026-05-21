@@ -2394,7 +2394,7 @@ Operational policy (2026-05-20):
         Design: `docs/design/0107-0005-activity-registry-per-backend-slots.md`.
         All activity/executor/server/mvcc/storage/wal packages pass with -race.
 
- - [ ] **M0107-0006 — Phase D3: lock-free buffer pool**
+ - [x] **M0107-0006 — Phase D3: lock-free buffer pool**
       - Summary: Delete 128-partition `sync.Mutex` buf-mapping (cause of
         c=100 SU livelock); replace with pointer-free `bufmap` (open-addressing
         Robin-Hood hash: `mask uint64`, `keys []BufferTag`, `vals []uint64`
@@ -2490,6 +2490,25 @@ Operational policy (2026-05-20):
         cum% < 8% at c=100 SO, `bufferPartition.mu` absence from
         mutex top-20, and `TestE2E_FailoverGoopgToPG/async` PASS in
         subsequent loops.
+      - COMPLETE 2026-05-21 (loop 8): All verification gates passed.
+        - `go test -race ./internal/storage/` PASS (5.39 s).
+        - `TestPoolHighConcurrencyPinUnpinStress` (1000-goroutine × 3 s)
+          PASS; `TestPoolPinNewVsPinStress` (concurrent PinNew + cache-hit)
+          PASS.
+        - `runtime.futex` cum% = 3.27% at c=100 SO pprof measurement
+          (well below 8% gate). The old 128-partition `bufferPartition.mu`
+          is structurally absent from the code (`internal/storage/bufpool.go`
+          holds `pinMu` + `bgwriterMu` + `compactMu` + `contentMu` only;
+          no `bufferPartition` struct exists) — confirmed absent from mutex
+          top-20 profiler output.
+        - `pgbench c=100 SU TPS ≥ 500`: satisfied via M0107-0007's
+          integrated verification (1981 TPS, loop 7, which ran with
+          M0107-0006 already in place from loops 1-3).
+        - `TestE2E_FailoverGoopgToPG/async` PASS (re-verified this loop;
+          1.63 s). `make ralph-state-guard` PASS. Design docs:
+          `docs/design/0107-0006-bufpool-bufmap-correctness.md`,
+          `docs/design/0107-0006-bufmap-keys-atomic.md`,
+          `docs/design/0107-0006-pinnew-stress-coverage.md`.
 
  - [x] **M0107-0007 — Phase D4: WAL insert striping + FSM page distribution**
       - Summary: Replace single `wal.Writer.appendMu` lock + tail-page-targeting
