@@ -5399,6 +5399,47 @@ Operational policy (2026-05-20):
         multi-record byte-identical assertions pass, confirming that
         `core.AppendXLogPayload` is ready for the call-site rewrite
         at `state.append`'s PG-compat write entry points.
+      - PARTIAL PROGRESS 2026-05-21 (slice B call-site rewrite part 2 of N —
+        mount `core.AppendXLogPayload` in `state.append` + `state.tryAppend`):
+        Wired `stripeWriterCore.AppendXLogPayload` + `PublishUpTo` into
+        both Path B of `state.append` (the state-loop slow path) and
+        Path B of `state.tryAppend` (the fast concurrent path) for
+        the PG-compat (`pageHeaders == true`) path. Key changes:
+        (1) `state.core *stripeWriterCore` field added — shares the
+        same pointer as `Writer.core`, set in `NewWriter` before
+        launching `state.loop`. (2) `state.stripeNum()` helper uses
+        `activity.LookupCurrentGoroutine()` to return the caller's
+        `procNum` for stripe selection; falls back to 0 for unregistered
+        goroutines (initdb, checkpointer, walreceiver, tests). (3)
+        `state.appendPGCompat()` new method: Path A (walBuf nil or
+        too small) keeps the old `encodeRecordXLog + emitWithPageHeaders
+        + writeAt` sequence and resyncs `core.posTracker` via the new
+        `(*insertPosTracker).resetPosition` + `(*stripeWriterCore).resetPosition`
+        primitives; Path B calls `core.AppendXLogPayload(procNum, ...)` +
+        `core.PublishUpTo(end)` (synchronous under `appendMu` in the
+        transitional state) and updates `writePos` / `writeLSN` /
+        `writeLSNMirror` / `prevRecPtr` from the returned values. All
+        four `TestAppendXLogPayloadParity*` tests now PASS without any
+        `t.Skip` (the three multi-record tests were the key gate):
+        `go test -race -count=1 -run 'TestAppendXLogPayloadParity'
+        ./internal/wal/` PASS (1.02 s). Full suite: `go test -race
+        -count=1 ./internal/wal/` PASS (4.09 s); `go test -race
+        ./internal/executor/ ./internal/storage/ ./internal/mvcc/
+        ./internal/server/ ./internal/access/btree/` PASS. `make
+        ralph-state-guard` PASS. Commit: 644af04. Design:
+        `docs/design/0107-0007ag-wal-stripe-call-site-rewrite-part2.md`
+        (indexed in `docs/design/README.md`).
+        Remaining slice B work (deferred to subsequent loops):
+        - Remove `appendMu` from `tryAppend` so concurrent callers
+          use different stripes truly in parallel (the main TPS-improvement
+          step; requires atomic updates to `writeLSN` / `writePos`).
+        - Make drain asynchronous (`drainBufferBytes` currently runs
+          under `appendMu`; the rewrite lets drain run concurrently
+          by consuming `PublishUpTo`'s return as the drain ceiling).
+        - pgbench c=100 SU TPS ≥ 500 gate: run after `appendMu` is
+          removed from `tryAppend`.
+        - `appendRaw` (walreceiver replay): unchanged (pre-encoded bytes
+          from primary; uses size-explicit `appendMu` path).
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
