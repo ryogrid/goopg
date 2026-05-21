@@ -3975,6 +3975,123 @@ Operational policy (2026-05-20):
         `insertPosTracker` + `insertionTracker` + `tailPublisher` +
         `reserveAndPublish` + `publishTail` — `reserve` remains in
         the API as a callable primitive without a tracker.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 12 of N —
+        `emitSegmentPad` cross-segment composer): added
+        `emitSegmentPad(walBuf, memRing, gapStart, boundary, gapPrev)
+        error` in new file `internal/wal/segment_pad_emit.go`.
+        Composes [[0107-0007j]] `buildSegmentPadRecord` +
+        [[0107-0007l]] `walBuffer.writeReserved` + [[0107-0007o]]
+        `MemRing.WriteReserved` into the single action that
+        [[0107-0007k]] `insertPosTracker`'s `onCrossSegment` hook
+        (sealed under posMu via [[0107-0007p]] `reserveAndPublish`)
+        must fire whenever a stripe reservation crosses a segment
+        boundary. The hook produces a `[gapStart, boundary)` gap
+        which the composer fills with an XLOG_NOOP record whose
+        xl_prev is `gapPrev`, stamping both the bytes-side ring
+        (`walBuffer`) and the walsender mirror (`MemRing`) at LSN
+        `gapStart` so the gap is no longer uninitialised. Without
+        the composer the call-site rewrite would have to duplicate
+        the boundary check, the nil-guards, and the error
+        propagation at every cross-segment site; foundation 12
+        lifts the composition into one place.
+        Nil-safety: `walBuf` and `memRing` are independently nil-safe
+        so the composer works under `Config.WALBuffers == 0` (no
+        walBuf) or `wal_sender_memory_buffer == 0` (no memRing). Both
+        nil → no-op *after* the builder runs (the builder still
+        catches malformed padLen regardless of ring presence — a
+        deliberate departure from [[0107-0007l]]'s
+        `errWALBufferNil` convention because the composer is a
+        single call-site and a per-composer nil-guard is cheaper
+        than a per-caller guard).
+        Tail publication intentionally NOT advanced — the drain
+        goroutine's `tailPublisher` chain (via [[0107-0007n]] /
+        [[0107-0007q]] / `MemRing.PublishUpTo`) remains the sole
+        authority on visibility, so pad bytes only become readable
+        when the drain consumes a `safeTail` past `boundary`. A
+        pad-side publication advance ahead of the drain would let
+        `readAt` / `MemRing.ReadAt` see pad bytes before the
+        stripe reservation that triggered the crossing has finished
+        its own `writeReserved` — the same hazard that prompted
+        [[0107-0007l]] / [[0107-0007o]] to leave tail untouched in
+        the first place.
+        Errors propagate verbatim from `buildSegmentPadRecord`
+        (padLen < 24, padLen == 25), `walBuf.writeReserved` (LSN
+        out of `[base, base+cap)`), and `memRing.WriteReserved`
+        (LSN out of `[head, head+cap)`); any error under posMu is
+        fatal — the hook fires exactly once per crossing and a
+        failed pad write breaks the xl_prev chain (the next stripe
+        reservation receives `prev=gapStart` pointing at
+        non-existent bytes).
+        PG counterpart: `AdvanceXLInsertBuffer` +
+        `XLogInsertRecord` in `postgres/src/backend/access/transam/
+        xlog.c` together emit the pad record into the shared WAL
+        buffer + walsender snapshot under the WAL insert lock.
+        goopg's composer matches that single-call shape so the
+        `insertPosTracker.onCrossSegment` hook stays a one-liner
+        in the future call-site rewrite.
+        Lock-ordering tier (when invoked from the planned call-site
+        rewrite):
+            appendLockSet.lockByProcNum
+              → insertPosTracker.reserveAndPublish     (posMu held)
+                  → (cross-segment slow path) emitSegmentPad
+                      → buildSegmentPadRecord
+                      → walBuffer.writeReserved
+                      → MemRing.WriteReserved
+                  → tracker.setInsertingAt(stripe, start)
+                (posMu released)
+              → walBuffer.writeReserved (triggering reservation)
+              → MemRing.WriteReserved
+              → insertionTracker.setInsertingAt(stripe, lsnIdle)
+            → drop stripe lock
+        Dead code until the slice B call-site rewrite installs the
+        composer as `insertPosTracker.onCrossSegment`;
+        foundation-first pattern matches slice C ([[0107-0007b]] /
+        [[0107-0007c]] / [[0107-0007d]] before [[0107-0007e]] /
+        [[0107-0007f]] / [[0107-0007g]]) and the eleven earlier
+        slice B foundations ([[0107-0007h]] / [[0107-0007i]] /
+        [[0107-0007j]] / [[0107-0007k]] / [[0107-0007l]] /
+        [[0107-0007m]] / [[0107-0007n]] / [[0107-0007o]] /
+        [[0107-0007p]] / [[0107-0007q]] / [[0107-0007r]]).
+        Ten regression tests in
+        `internal/wal/segment_pad_emit_test.go`:
+        `TestEmitSegmentPadWritesIntoBothRings` (happy path; pad
+        bytes byte-identical between rings, decode to well-formed
+        XLOG_NOOP with `Prev == gapPrev`, neither watermark
+        advances); `TestEmitSegmentPadNilWalBufOnlyMemRing` and
+        `TestEmitSegmentPadNilMemRingOnlyWalBuf` (partial-ring
+        paths); `TestEmitSegmentPadBothNilIsNoop` (both nil succeed;
+        malformed padLen still surfaces builder error);
+        `TestEmitSegmentPadRejectsNonPositiveGap`
+        (composer-level defence-in-depth for `boundary <=
+        gapStart`); `TestEmitSegmentPadPropagatesBuilderErrors`
+        (table-driven `{8, 23, 25}` confirms "below minimum" and
+        "1-byte body" pass through);
+        `TestEmitSegmentPadPropagatesWalBufOutOfWindow` (gapStart
+        below `walBuf.base` surfaces
+        `errWALBufferReservedOutOfRange`);
+        `TestEmitSegmentPadPropagatesMemRingOutOfWindow` (gapStart
+        below `memRing.head` surfaces
+        `errMemRingReservedOutOfRange`);
+        `TestEmitSegmentPadDoesNotPublishViaWalBuf` (tail/head
+        unchanged; readAt of unpublished pad returns 0 bytes);
+        `TestEmitSegmentPadDoesNotPublishViaMemRing` (symmetric
+        MemRing contract); `TestEmitSegmentPadAcrossPadLengths`
+        (table-driven `{24, 32, 281, 282, 1024}` — header-only /
+        short-chunk / long-chunk paths byte-identical between
+        rings). Verified: `go test -race -count=1 -run
+        'TestEmitSegmentPad' ./internal/wal/` PASS (1.02 s);
+        `go test -race -count=1 ./internal/wal/` PASS (3.15 s).
+        Design: `docs/design/0107-0007s-wal-segment-pad-emit.md`
+        (indexed in `docs/design/README.md`). Out of scope (call-
+        site rewrite): mounting `emitSegmentPad` as
+        `insertPosTracker.onCrossSegment` on `Writer`; splitting
+        `state.appendMu`'s four invariants (writePos / walBuf /
+        memRing / writeLSN) into per-stripe local state vs. shared
+        state; drain coordination with concurrent stripe writes;
+        deciding whether [[0107-0007h]] `lsnAllocator` becomes
+        dead-code-removed once the call-site converges on
+        `insertPosTracker` + `insertionTracker` + `tailPublisher` +
+        `reserveAndPublish` + `publishTail` + `emitSegmentPad`.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
