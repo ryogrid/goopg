@@ -954,6 +954,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 	// reused across all transactions on this connection; Begin clears and
 	// re-initialises it on each new transaction.
 	procNum := int32((pid-1) % uint32(mvcc.DefaultProcArraySize))
+	extended.ProcNum = procNum // thread through to executeExtendedQueryViaExecutor
 	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum} // per-connection explicit transaction state (M0096-0005)
 	prepStmts := newPreparedStatements() // per-connection prepared statements (M0096-0006)
 	var copyIn *copyInState

@@ -57,7 +57,7 @@ func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter,
 	// (42P01, 42703, 42601, 0A000); the wire layer just forwards
 	// them.
 	if s.cfg.hasStorage() {
-		st, err := s.dispatchCopyViaExecutor(ctx, w, matchable)
+		st, err := s.dispatchCopyViaExecutor(ctx, w, matchable, connTx)
 		if err != nil {
 			return nil, err
 		}
@@ -87,8 +87,11 @@ func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter,
 
 // dispatchCopyViaExecutor parses + plans the COPY statement and
 // either streams rows out (CopyTo) or arms the connection's CopyIn
-// frame consumer (CopyFrom).
-func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameWriter, sql string) (*copyInState, error) {
+// frame consumer (CopyFrom). connTx is the connection's explicit
+// transaction state (may be nil); its ProcNum is forwarded to the
+// COPY-internal transaction so it does not collide with the
+// connection's own ProcArray slot.
+func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameWriter, sql string, connTx *connTxState) (*copyInState, error) {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		if err := s.writeQueryError(w, sqlstate.SyntaxError, err.Error()); err != nil {
@@ -122,7 +125,17 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 		return nil, nil
 	}
 
-	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	// Use a dedicated procNum for the COPY-internal transaction so it
+	// does not overwrite the connection's own ProcArray slot. The COPY
+	// always runs in its own auto-commit transaction regardless of
+	// whether the client has opened an explicit BEGIN block.
+	// Offset by half the ProcArray to avoid the typical connection range.
+	var copyProcNum int32
+	if connTx != nil {
+		const halfSize = mvcc.DefaultProcArraySize / 2
+		copyProcNum = (connTx.ProcNum + halfSize) % mvcc.DefaultProcArraySize
+	}
+	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, copyProcNum)
 	if err != nil {
 		if err := s.writeQueryError(w, sqlstate.SystemError, err.Error()); err != nil {
 			return nil, err

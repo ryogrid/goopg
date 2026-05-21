@@ -211,18 +211,26 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		copy(buf, s)
 		return buf, nil
 	case "char":
-		// PG "char" type: single byte
-		if d.Kind == KindString {
-			s := d.StringValue()
-			if len(s) > 0 {
-				return []byte{s[0]}, nil
+		// Without a length modifier, "char" is PG's internal single-byte
+		// "char" type (OID 18, typalign='c', typlen=1).
+		// With a length modifier (e.g. char(84) = character(84) = bpchar):
+		// encode as a PG varlena, same as "character"/"bpchar".
+		if len(t.Args) == 0 {
+			// Single-byte internal "char" type.
+			if d.Kind == KindString {
+				s := d.StringValue()
+				if len(s) > 0 {
+					return []byte{s[0]}, nil
+				}
+				return []byte{0}, nil
 			}
-			return []byte{0}, nil
+			if d.Kind == KindInt {
+				return []byte{byte(d.Int)}, nil
+			}
+			return nil, fmt.Errorf("expected string or int for char, got kind %d", d.Kind)
 		}
-		if d.Kind == KindInt {
-			return []byte{byte(d.Int)}, nil
-		}
-		return nil, fmt.Errorf("expected string or int for char, got kind %d", d.Kind)
+		// char(N) = character(N) = bpchar: PG varlena (same as "character").
+		return varlenaTextBytes(d.StringValue()), nil
 	case "float4", "real":
 		// PG float4: 4-byte IEEE 754 little-endian
 		var v float32
@@ -752,8 +760,15 @@ func alignPhysicalPGOffset(off, align int) int {
 
 func physicalPGTypeAlign(t catalog.Type) int {
 	switch strings.ToLower(t.Name) {
-	case "bool", "boolean", "char":
+	case "bool", "boolean":
 		return 1
+	case "char":
+		// Single-byte internal "char" type: alignment 1.
+		// char(N) with length modifier is bpchar (varlena): alignment 4.
+		if len(t.Args) == 0 {
+			return 1
+		}
+		return 4
 	case "int2", "smallint":
 		return 2
 	case "int4", "integer", "int", "serial", "oid", "regproc", "float4", "real", "date", "xid":
@@ -779,7 +794,11 @@ func physicalPGTypeAlign(t catalog.Type) int {
 // batched-49.
 func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
 	switch strings.ToLower(t.Name) {
-	case "bool", "boolean", "char",
+	case "char":
+		// Single-byte internal "char": fixed-length (not varlena).
+		// char(N) with length modifier = bpchar (varlena).
+		return len(t.Args) > 0
+	case "bool", "boolean",
 		"int2", "smallint",
 		"int4", "integer", "int", "serial",
 		"int8", "bigint", "bigserial",

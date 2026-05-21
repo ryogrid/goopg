@@ -18,6 +18,7 @@ type extendedState struct {
 	statements   map[string]*preparedStatement
 	portals      map[string]*portalState
 	syncRequired bool
+	ProcNum      int32 // backend's ProcArray slot; forwarded to Begin calls
 }
 
 type preparedStatement struct {
@@ -312,7 +313,7 @@ func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, p
 	}
 
 	if portal.Result == nil {
-		res, qerr := s.executeExtendedQuery(ctx, sess, portal.Statement.Query, portal.Params)
+		res, qerr := s.executeExtendedQuery(ctx, sess, portal.Statement.Query, portal.Params, state.ProcNum)
 		if qerr != nil {
 			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Position: qerr.Position, Routine: "server.handleExecuteFrame"}, nil
 		}
@@ -401,7 +402,7 @@ func (s *Server) handleCloseFrame(state *extendedState, payload []byte) *extende
 	}
 }
 
-func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32) (*extendedQueryResult, *extendedQueryError) {
 	trimmed, matchable, upper, empty := normalizeSimpleQuery(query)
 	if empty {
 		return &extendedQueryResult{Empty: true}, nil
@@ -503,7 +504,7 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 		}
 	}
 	if s.cfg.hasStorage() {
-		return s.executeExtendedQueryViaExecutor(ctx, sess, trimmed, params)
+		return s.executeExtendedQueryViaExecutor(ctx, sess, trimmed, params, procNum)
 	}
 
 	if len(params) > 0 {

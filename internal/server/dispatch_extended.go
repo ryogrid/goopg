@@ -25,7 +25,7 @@ import (
 // are rejected at Bind time); we feed them through to
 // executor.Context.Params and let the executor's expression
 // evaluator coerce inside ParamRef.
-func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32) (*extendedQueryResult, *extendedQueryError) {
 	stmts, err := parser.Parse(query)
 	if err != nil {
 		msg, extra := syntaxErrorMsg(err)
@@ -78,7 +78,12 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		return &extendedQueryResult{CommandTag: transactionTag(tx.Verb)}, nil
 	}
 
-	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	// Use an offset procNum to avoid overwriting the connection's own
+	// ProcArray slot when an explicit transaction is active. The offset
+	// mirrors the COPY transaction strategy in copy.go.
+	const halfSize = mvcc.DefaultProcArraySize / 2
+	autoCommitProcNum := (procNum + halfSize) % mvcc.DefaultProcArraySize
+	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, autoCommitProcNum)
 	if err != nil {
 		return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
 	}
