@@ -4804,6 +4804,143 @@ Operational policy (2026-05-20):
         walreceiver replay (`appendRaw`) does not use page-header
         insertion — incoming bytes already carry headers stamped by
         the primary — so `predictEmittedSize` is not on that path.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 18 of N —
+        `reserveEmittedAndPublish` joint-atomic predict + reserve +
+        publish): added `(*insertPosTracker).reserveEmittedAndPublish(
+        recordLen int, stripe int, tracker *insertionTracker) (start,
+        prev uint64, total, leading int)` in new file
+        `internal/wal/reserve_emitted.go`. Closes the predict-vs-
+        reserve race left open by [[0107-0007z]] §"Out of scope":
+        foundation 17 made size prediction available as a pure
+        helper, but the call-site sequence `core.Load() →
+        predictEmittedSize(recordLen, curr, segSize) →
+        core.AppendBuilt(procNum, total, build)` admitted a peer
+        stripe landing between the predict and AppendBuilt that
+        advances `curr` and invalidates `total`. The
+        `errStripeAppendBuildSizeMismatch` defence in [[0107-0007y]]
+        catches the mismatch loudly, but retry-on-mismatch is not
+        free — the build closure has to be re-run (typically
+        `encodeRecordXLog`), which on the hot path costs ~2× under
+        high concurrency.
+        The fix threads the prediction INTO `reserveAndPublish` under
+        the same `posMu` critical section: predict at t.curr, decide
+        cross-segment vs. fast path, reserve atomically, publish the
+        stripe slot — all under one posMu Lock/Unlock pair. PG
+        counterpart: `XLogInsertRecord` in
+        `postgres/src/backend/access/transam/xlog.c` computes
+        `actualBytes` for header insertion and calls
+        `ReserveXLogInsertLocation` under the same WAL insert lock,
+        so the race is structurally impossible in PG too.
+        Cross-segment slow path is mandatory-re-predict: if predict-
+        at-curr `(t.curr+total) > boundary`, fire `onCrossSegment(
+        t.curr, boundary, t.prev)` to fill the gap (slice B installs
+        [[0107-0007s]] `emitSegmentPad` as the hook), shift to
+        boundary, re-predict so the returned `leading` matches the
+        actual start LSN's page-header schedule (long PHD at boundary
+        vs. zero at mid-page). The total often coincides numerically
+        between the two predicts — both pay one long-header tax — but
+        `leading` deterministically differs (0 vs. 40) and is load-
+        bearing for the slice B caller's emit-headers-before-record
+        sequencing.
+        Contract: `recordLen > 0`, `tracker != nil`, `0 ≤ stripe <
+        appendLockStripes`; emitted total must fit in `segSize`
+        (panics otherwise — PG enforces the same upstream of its
+        reserve via `XLOG_BLCKSZ` and `XLogRecMaxBytes`). Cost: one
+        `predictEmittedSize` call per reservation (~tens of
+        nanoseconds; pure arithmetic), one extra
+        `atomic.Int64.Store` under existing posMu; no new locks.
+        Cross-segment reservations pay a second predict call but
+        that path is ~once per 16 MiB of WAL, dominated by segment-
+        rotation fsync cost.
+        Test-segSize choice: foundation tests use segSize values that
+        are multiples of XLOGBlockSize (8192) so the predict helper
+        observes the long page header at segment boundaries
+        (`pageHeaderSizeAt`'s long-PHD branch fires only when
+        `pos % XLOGBlockSize == 0`); real PG always satisfies this
+        (production goopg defaults to 16 MiB segments). The cross-
+        segment tests use `segSize = 2 * XLOGBlockSize` (16 KiB) so
+        a few hundred bytes of startPos offset reach the boundary,
+        keeping the test fixtures small while exercising the real
+        long-PHD code path.
+        Thirteen regression tests in
+        `internal/wal/reserve_emitted_test.go`:
+        `TestReserveEmittedAndPublishHappyPathMatchesStandalonePredict`
+        (returned `(total, leading)` equals a standalone
+        `predictEmittedSize` call at the resulting `start`; stripe
+        slot published; other stripes untouched);
+        `TestReserveEmittedAndPublishPageBoundaryGetsShortHeader`
+        (start at `XLOGBlockSize` → leading=short PHD, total = short
+        PHD + recordLen);
+        `TestReserveEmittedAndPublishSegmentBoundaryGetsLongHeader`
+        (start at `segSize` → leading=long PHD);
+        `TestReserveEmittedAndPublishCrossSegmentEmitsPadAndRePredicts`
+        (`onCrossSegment` fires once with `(startPos, boundary,
+        oldPrev)`; reservation lands at boundary with `prev =
+        startPos` and re-predicted `(leading=long, total=long+100)`;
+        stripe slot reflects post-boundary start, NOT pad start);
+        `TestReserveEmittedAndPublishCrossSegmentNoHookSkipsNotify`
+        (cross-segment shift still happens when hook is nil);
+        `TestReserveEmittedAndPublishInvalidRecordLenPanics`
+        (`{0, -1, -100}` all panic);
+        `TestReserveEmittedAndPublishNilTrackerPanics` (nil tracker
+        panics — no silent skip of publication);
+        `TestReserveEmittedAndPublishInvalidStripePanics`
+        (`{-1, appendLockStripes, +1, MaxInt32}` all panic);
+        `TestReserveEmittedAndPublishConcurrentNoRaceMatchesPredictAtStart`
+        (8 stripes × 200 reservations: every returned `(total,
+        leading)` matches a standalone predict at the returned
+        `start` — pins race closure under contention; no duplicate
+        starts);
+        `TestReserveEmittedAndPublishConcurrentChainAndStripePublishConsistent`
+        (the keystone race-closure test — a reader takes `posMu`
+        directly and asserts every non-idle stripe slot `v <
+        curr`; the old uncoupled reserve + setInsertingAt admitted
+        a window where curr advanced but the slot still read idle;
+        observed-snapshots counter pinned non-zero so the assertion
+        is not vacuously true; 8 stripes × 500 reservations);
+        `TestReserveEmittedAndPublishCrossSegmentChainIntegrity`
+        (multi-record sequence with curr landing exactly at
+        boundary; rec2 starts at boundary with long PHD; no
+        spurious cross-segment fires when curr == boundary —
+        straddle check is strict `>`, not `≥`);
+        `TestReserveEmittedAndPublishCrossSegmentLeadingDiffersFromPredictAtCurr`
+        (load-bearing: predict-at-mid-page yields leading=0;
+        predict-at-boundary yields leading=long; the foundation
+        returns the boundary value, NOT the curr value); and
+        `TestReserveEmittedAndPublishWatchdog` (5-second deadlock
+        watchdog mirroring foundation 7 / 9 / 11 / 15 / 17 pattern).
+        Verified: `go test -race -count=1 -run
+        'TestReserveEmittedAndPublish' ./internal/wal/` PASS
+        (1.02 s); `go test -race -count=1 ./internal/wal/` PASS
+        (4.05 s); `go vet ./internal/wal/` clean. Design:
+        `docs/design/0107-0007aa-wal-reserve-emitted.md` (indexed in
+        `docs/design/README.md`). Dead code until the slice B
+        call-site rewrite consumes it; foundation-first pattern
+        matches slice C ([[0107-0007b]] / [[0107-0007c]] /
+        [[0107-0007d]] before [[0107-0007e]] / [[0107-0007f]] /
+        [[0107-0007g]]) and the seventeen earlier slice B
+        foundations ([[0107-0007i]] through [[0107-0007z]] minus
+        the dead-code-removed [[0107-0007h]]). PG-compat — none
+        (pure in-memory primitive; produces no on-disk bytes, does
+        not interact with WAL record format, file format, catalog,
+        or wire protocol; the byte-stream emission still flows
+        through `emitWithPageHeaders`, unchanged).
+        Out of scope (deferred to call-site rewrite + foundation
+        19 candidate): mounting `reserveEmittedAndPublish` on
+        `Writer` and switching `state.append` / `state.tryAppend`
+        to call it (multi-loop scope — `state.appendMu`'s four
+        invariants split into per-stripe local state vs. shared
+        state); mounting `core.PublishUpTo` in the drain
+        goroutine's prelude; walreceiver replay (`appendRaw`) does
+        not use page-header insertion — incoming bytes already
+        carry headers stamped by the primary — so `appendRaw` will
+        continue to consume the size-explicit [[0107-0007p]]
+        `reserveAndPublish` instead; adding a
+        `core.AppendBuiltEmitted(procNum, recordLen, build)`
+        wrapper on `stripeWriterCore` that bundles
+        `reserveEmittedAndPublish` + `build(prev)` + ring writes +
+        END marker (foundation 19 candidate — keeps the call-site
+        rewrite a one-liner).
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
