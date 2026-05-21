@@ -2491,7 +2491,7 @@ Operational policy (2026-05-20):
         mutex top-20, and `TestE2E_FailoverGoopgToPG/async` PASS in
         subsequent loops.
 
- - [ ] **M0107-0007 — Phase D4: WAL insert striping + FSM page distribution**
+ - [x] **M0107-0007 — Phase D4: WAL insert striping + FSM page distribution**
       - Summary: Replace single `wal.Writer.appendMu` lock + tail-page-targeting
         insert logic with 8-stripe `appendLocks [8]paddedMutex` (stripe
         selection `procNum & 0x7`) per `07-wal-fsm-insert.md`. Atomic
@@ -5545,6 +5545,31 @@ Operational policy (2026-05-20):
           ./internal/parser/ ./internal/analyzer/ ./internal/access/btree/` PASS.
           Design: `docs/design/0107-0009-hot-update-encoding-parity.md`
           (indexed in `docs/design/README.md`). `make ralph-state-guard` PASS.
+        - **MemRing zero-read walsender fix (M0107-0010, 2026-05-21 loop 7)**:
+          `MemRing` in `loadState` was created with `head=tail=0`. After the first
+          Path B append advanced `tail` past an old segment boundary (e.g. `0x105CF00`),
+          `ReadAt(0x1000000)` returned true-with-zeros because the ring was
+          never populated at that offset. Walsender served those zeros to a PG
+          standby, which reported "invalid magic number 0000 at 0/1000000 offset 0".
+          Fix: `MemRing.ResetToPos(pos)` sets `head=tail=pos` under the write lock;
+          `loadState` calls `st.memRing.ResetToPos(writePos)` so the ring is
+          anchored at `writePos`. `ReadAt` then returns false for any position before
+          `writePos` (pre-existing on-disk WAL from initdb/prior session), and the
+          walsender correctly falls back to disk for those positions.
+          Regression pins: `TestMemRingResetToPos`, `TestMemRingResetToPosNilSafe`,
+          `TestMemRingZeroReadAfterTailAdvance`, `TestMemRingLoadStateAnchorPreventsZeroRead`
+          in `internal/wal/mem_ring_test.go`.
+          `TestE2E_FailoverGoopgToPG/async` — PASS (was: "invalid magic number 0000").
+          `go test -race -count=1 ./internal/wal/ ./internal/executor/ ./internal/server/
+          ./internal/mvcc/ ./internal/storage/ ./internal/access/btree/` PASS.
+          Design: `docs/design/0107-0010-memring-reset-to-pos-zero-read-fix.md`
+          (indexed in `docs/design/README.md`). `make ralph-state-guard` PASS.
+        - **M0107-0007 COMPLETE**: All verification gates passed:
+          - `go test -race ./internal/wal/ ./internal/executor/ ./internal/server/
+            ./internal/mvcc/ ./internal/storage/ ./internal/access/btree/` PASS.
+          - pgbench c=100 SU TPS = 1981 (gate ≥ 500) PASS.
+          - `TestE2E_FailoverGoopgToPG/async` PASS.
+          - `make ralph-state-guard` PASS.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded

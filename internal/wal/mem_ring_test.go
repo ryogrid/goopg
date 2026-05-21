@@ -240,3 +240,153 @@ func TestIteratorFallsBackToDiskWithoutRing(t *testing.T) {
 		t.Errorf("payload = %q, want %q", rec.Payload, want)
 	}
 }
+
+// TestMemRingResetToPos verifies that after ResetToPos(pos), ReadAt returns
+// false for positions before pos (and for stale positions that would yield
+// zeros in the ring buffer), and true only after new data is appended.
+func TestMemRingResetToPos(t *testing.T) {
+	cap := int64(4096)
+	r := NewMemRing(cap)
+
+	// Populate position 0..16 so tail advances past 0.
+	r.Append(0, make([]byte, 16))
+	if _, ok := r.ReadAt(0, make([]byte, 1)); !ok {
+		t.Fatal("expected ReadAt(0) true before reset")
+	}
+
+	// Reset to pos=8192. Now positions <8192 must return false.
+	anchor := int64(8192)
+	r.ResetToPos(anchor)
+
+	if _, ok := r.ReadAt(0, make([]byte, 1)); ok {
+		t.Error("ReadAt(0) should return false after ResetToPos(8192)")
+	}
+	if _, ok := r.ReadAt(anchor-1, make([]byte, 1)); ok {
+		t.Error("ReadAt(anchor-1) should return false after ResetToPos(8192)")
+	}
+
+	// Write new data at anchor; it should be readable.
+	data := []byte("hello-from-new-segment")
+	r.Append(anchor, data)
+	dst := make([]byte, len(data))
+	if _, ok := r.ReadAt(anchor, dst); !ok {
+		t.Fatal("ReadAt(anchor) should succeed after Append at anchor")
+	}
+	if string(dst) != string(data) {
+		t.Errorf("ReadAt returned %q, want %q", dst, data)
+	}
+
+	// Positions within the old range (0 to anchor-1) still miss.
+	if _, ok := r.ReadAt(4096, make([]byte, 1)); ok {
+		t.Error("ReadAt(4096) (< anchor) should still return false")
+	}
+}
+
+// TestMemRingResetToPosNilSafe verifies that ResetToPos on a nil ring is a no-op.
+func TestMemRingResetToPosNilSafe(t *testing.T) {
+	var r *MemRing
+	r.ResetToPos(12345) // must not panic
+}
+
+// TestMemRingZeroReadAfterTailAdvance is a regression test for the
+// walsender-serves-zeros bug. Path B (async drain) writes WAL via
+// AdvanceWindow + WriteReserved + PublishUpTo rather than Append.
+// Without ResetToPos in loadState, a fresh ring (head=tail=0) whose tail
+// is advanced past lowLSN by a high-LSN write can answer ReadAt(lowLSN)
+// with true-and-zeros, because the ring was never populated there.
+// After the fix (head=tail=writePos via ResetToPos), ReadAt(lowLSN) returns
+// false when lowLSN < writePos.
+func TestMemRingZeroReadAfterTailAdvance(t *testing.T) {
+	const cap = 1 << 20 // 1 MiB
+
+	// --- Buggy scenario (no ResetToPos): head=tail=0 from NewMemRing ---
+	buggy := NewMemRing(cap)
+	highLSN := int64(0x105CEA0)
+	total := int64(200)
+	highEnd := highLSN + total
+	lowLSN := int64(0x1000000)
+
+	buggy.AdvanceWindow(highEnd)
+	_ = buggy.WriteReserved(highLSN, make([]byte, total))
+	buggy.PublishUpTo(highEnd)
+
+	if _, ok := buggy.ReadAt(lowLSN, make([]byte, 8)); !ok {
+		t.Log("buggy ring: ReadAt(lowLSN) returned false — scenario may not reproduce (cap too small?)")
+	} else {
+		t.Log("buggy ring: ReadAt(lowLSN) returned true-with-zeros as expected (bug confirmed)")
+	}
+
+	// --- Fixed scenario: ResetToPos(highLSN) before any writes ---
+	fixed := NewMemRing(cap)
+	fixed.ResetToPos(highLSN) // the fix
+	fixed.AdvanceWindow(highEnd)
+	_ = fixed.WriteReserved(highLSN, make([]byte, total))
+	fixed.PublishUpTo(highEnd)
+
+	if _, ok := fixed.ReadAt(lowLSN, make([]byte, 8)); ok {
+		t.Error("fixed ring: ReadAt(lowLSN) returned true — ResetToPos(highLSN) should prevent access at lowLSN < highLSN")
+	}
+}
+
+func TestMemRingLoadStateAnchorPreventsZeroRead(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	const segSize = 16384 // small segment
+	const ringSize = segSize * 4
+
+	// Phase 1: write WAL with writer1 (simulating initdb).
+	w1, err := NewWriter(Config{
+		WALDir:             walDir,
+		SegmentSize:        segSize,
+		SenderMemoryBuffer: ringSize,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Write enough to cross at least one segment boundary.
+	var lastEnd uint64
+	for i := 0; i < 40; i++ {
+		_, end, werr := w1.Append(make([]byte, 200))
+		if werr != nil {
+			t.Fatalf("phase1 Append %d: %v", i, werr)
+		}
+		lastEnd = end
+	}
+	if err := w1.FlushUpTo(lastEnd); err != nil {
+		t.Fatalf("phase1 FlushUpTo: %v", err)
+	}
+	w1.Close()
+
+	// Phase 2: re-open the same walDir (simulating server restart after initdb).
+	w2, err := NewWriter(Config{
+		WALDir:             walDir,
+		SegmentSize:        segSize,
+		SenderMemoryBuffer: ringSize,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+
+	ring := w2.MemRing()
+	if ring == nil {
+		t.Skip("no MemRing configured")
+	}
+
+	// Write one more record so the MemRing tail advances past position 0.
+	_, end2, err := w2.Append(make([]byte, 50))
+	if err != nil {
+		t.Fatalf("phase2 Append: %v", err)
+	}
+	if err := w2.FlushUpTo(end2); err != nil {
+		t.Fatalf("phase2 FlushUpTo: %v", err)
+	}
+
+	// ReadAt(0) must return false: position 0 was never written to this ring
+	// instance. Without ResetToPos(writePos) in loadState, tail would be past
+	// 0 and head=0, making ReadAt(0) succeed with zeros — the bug.
+	if _, ok := ring.ReadAt(0, make([]byte, 8)); ok {
+		t.Error("ring.ReadAt(0) returned true — ring would serve zeros at WAL start (restart scenario)")
+	}
+}
+
+

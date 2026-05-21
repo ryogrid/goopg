@@ -78,6 +78,21 @@ func (r *MemRing) Cap() int64 {
 	return r.cap
 }
 
+// ResetToPos sets head = tail = pos under the write lock, making the ring
+// appear empty at the given LSN anchor. ReadAt will return false for any
+// position before pos, and new Append/WriteReserved calls fill the ring
+// starting from pos. Called from loadState to prevent the ring from serving
+// zeros for WAL positions written to disk by a prior run (e.g. initdb).
+func (r *MemRing) ResetToPos(pos int64) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.head = pos
+	r.tail = pos
+	r.mu.Unlock()
+}
+
 // Append captures len(data) bytes at byte position pos. pos must
 // equal r.tail (writes are sequential and gap-free). When the
 // ring is full, oldest bytes are evicted to make room — eviction

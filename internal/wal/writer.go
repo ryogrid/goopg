@@ -820,6 +820,15 @@ func loadState(cfg Config) (*state, error) {
 	if st.walBuf != nil {
 		st.walBuf.reset(writePos)
 	}
+	// Anchor the MemRing at writePos so ReadAt never returns zeros for WAL
+	// positions written to disk by a prior session (e.g. initdb). Without this,
+	// after the first Path-B append advances tail past an old segment boundary,
+	// ReadAt(oldPos) returns true but yields zeros — the ring was never written
+	// at that offset — causing the walsender to serve an all-zero page to PG
+	// standbys ("invalid magic number 0000").
+	if st.memRing != nil {
+		st.memRing.ResetToPos(writePos)
+	}
 	return st, nil
 }
 
