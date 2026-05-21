@@ -367,10 +367,17 @@ type state struct {
 	// (legacy / no-engine deployments).
 	aio AIOEngine
 
-	// appendMu serialises access to walBuf / memRing / writePos /
-	// writeLSN / drainedLSN so that Writer.Append (M0026 concurrent
-	// append) and the state loop's drain path do not race.
-	appendMu sync.Mutex
+	// appendMu coordinates access between concurrent tryAppend goroutines
+	// and the state-loop's exclusive drain/Path-A paths.
+	//
+	// RLock (multiple holders OK): tryAppend PG-compat Path B — stripe
+	//   writes are internally serialised by per-stripe locks; walBuf
+	//   bytes are written to disjoint LSN ranges; head/base are stable.
+	// Lock (exclusive): appendPGCompat Path A (direct disk write +
+	//   resetPosition), appendPGCompat Path B (may drain walBuf),
+	//   appendRaw (may drain + resetPosition), append non-pageHeaders,
+	//   DrainedLSN/readBufferedAt readers that observe drainedLSN.
+	appendMu sync.RWMutex
 
 	// memRing mirrors recently-written WAL bytes in RAM so
 	// walsender's RecordIterator can stream without paying for
@@ -1238,8 +1245,12 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 				return 0, 0, err
 			}
 		}
-		writePos := s.writePos
-		record, realRecLen, err := encodeRecordXLog(payload, s.prevRecPtr)
+		// Derive writePos and prevRecPtr from the tracker so that
+		// concurrent tryAppend goroutines (under RLock) that advanced
+		// the tracker before we acquired Lock are accounted for.
+		trackerCurr, trackerPrev := s.core.Load()
+		writePos := int64(trackerCurr)
+		record, realRecLen, err := encodeRecordXLog(payload, trackerPrev)
 		if err != nil {
 			s.appendMu.Unlock()
 			return 0, 0, err
@@ -1269,8 +1280,9 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 		if s.writeLSNMirror != nil {
 			s.writeLSNMirror.Store(end)
 		}
-		s.prevRecPtr = start - 1 // 0-based record-content start
-		// Resync core posTracker so Path B picks up the correct chain position.
+		// Resync core posTracker so subsequent stripe Path B appends and
+		// concurrent tryAppend goroutines start at the correct position.
+		// prevRecPtr field update dropped: tracker prev is authoritative.
 		s.core.resetPosition(end, start-1)
 		s.appendMu.Unlock()
 		return start, end, nil
@@ -1301,15 +1313,16 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 	// memRing.tail so subsequent drain reads see the freshly-written bytes.
 	s.core.PublishUpTo(int64(start0) + int64(total))
 
-	// Update legacy state fields (still used by Path A encode and drain logic).
+	// Update state-loop fields. writePos/writeLSN keep the state loop's
+	// internal view consistent; writeLSNMirror is the atomic external view.
+	// s.prevRecPtr is no longer maintained: Path A reads prev from core.Load().
 	s.writePos = int64(start0) + int64(total)
 	end := uint64(s.writePos)
 	s.writeLSN = end
 	if s.writeLSNMirror != nil {
 		s.writeLSNMirror.Store(end)
 	}
-	s.prevRecPtr = start0 + uint64(leading) // record-content start (0-based)
-	start := start0 + uint64(leading) + 1   // 1-based record start (goopg convention)
+	start := start0 + uint64(leading) + 1 // 1-based record start (goopg convention)
 	return start, end, nil
 }
 
@@ -1326,7 +1339,10 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 				return 0, 0, err
 			}
 		}
-		writePos := s.writePos
+		// Read writePos from the tracker so concurrent tryAppend goroutines
+		// (under RLock) that advanced it before we acquired Lock are accounted for.
+		trackerCurr, trackerPrev := s.core.Load()
+		writePos := int64(trackerCurr)
 		start := uint64(writePos) + 1
 		s.writePos = writePos + int64(len(stream))
 		end := uint64(s.writePos)
@@ -1351,6 +1367,11 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 		if s.writeLSNMirror != nil {
 			s.writeLSNMirror.Store(end)
 		}
+		// Sync the stripe tracker so subsequent tryAppend/AppendXLogPayload
+		// calls start at the correct position. Use the pre-write tracker prev
+		// (appendRaw bytes are pre-encoded from the primary and bypass the
+		// regular xl_prev chain tracking).
+		s.core.resetPosition(end, trackerPrev)
 		s.appendMu.Unlock()
 		return start, end, nil
 	}
@@ -1358,7 +1379,10 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
 
-	writePos := s.writePos
+	// Read writePos from the tracker; concurrent tryAppend goroutines under
+	// RLock may have advanced it beyond s.writePos since the last Lock path.
+	trackerCurr, trackerPrev := s.core.Load()
+	writePos := int64(trackerCurr)
 	start := uint64(writePos) + 1
 	need := int64(len(stream)) - s.walBuf.free()
 	if need > 0 {
@@ -1374,6 +1398,8 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 	if s.writeLSNMirror != nil {
 		s.writeLSNMirror.Store(end)
 	}
+	// Sync the stripe tracker (same reasoning as Path A above).
+	s.core.resetPosition(end, trackerPrev)
 	return start, end, nil
 }
 
@@ -1394,10 +1420,14 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 			return 0, 0, false, nil // Path A territory; let slow path handle I/O
 		}
 
-		s.appendMu.Lock()
-		defer s.appendMu.Unlock()
+		// RLock allows multiple concurrent stripe writers in parallel.
+		// Lock() paths (Path A, appendRaw) are exclusive and wait for
+		// all RLock holders to complete before running.
+		s.appendMu.RLock()
+		defer s.appendMu.RUnlock()
 
-		// Re-check with current free space under appendMu.
+		// Re-check with current free space under the read lock.
+		// head is stable (only mutated under Lock by advanceHead).
 		if int64(conservativeSize) > s.walBuf.free() {
 			return 0, 0, false, nil // overflow; slow path drains then appends
 		}
@@ -1411,17 +1441,21 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		}
 
 		// Synchronous publish: advance walBuf.tail and memRing.tail so
-		// the next overflow-drain or flushUpTo sees these bytes.
+		// drain goroutine and flushUpTo see these bytes.
 		s.core.PublishUpTo(int64(start0) + int64(total))
 
-		s.writePos = int64(start0) + int64(total)
-		end = uint64(s.writePos)
-		s.writeLSN = end
+		end = uint64(int64(start0) + int64(total))
+		// CAS-max: multiple concurrent RLock holders may call this
+		// simultaneously; we want the highest end value to persist.
 		if s.writeLSNMirror != nil {
-			s.writeLSNMirror.Store(end)
+			storeMaxLSN(s.writeLSNMirror, end)
 		}
-		s.prevRecPtr = start0 + uint64(leading) // record-content start (0-based)
-		start = start0 + uint64(leading) + 1    // 1-based record start
+		// s.writePos and s.prevRecPtr are NOT updated here: Lock() paths
+		// (appendPGCompat Path A, appendRaw) derive them from core.Load()
+		// after all RLock holders have released. s.writeLSN is left for
+		// the state loop's own Lock-path tracking (flushUpTo reads the
+		// atomic writeLSNMirror instead of s.writeLSN).
+		start = start0 + uint64(leading) + 1 // 1-based record start
 		if s.onAppend != nil {
 			s.onAppend()
 		}
@@ -1536,8 +1570,16 @@ func (s *state) flushUpTo(lsn uint64) error {
 	if lsn == 0 {
 		return nil
 	}
-	if lsn > s.writeLSN {
-		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, s.writeLSN, lsn)
+	// Use writeLSNMirror (atomic) so LSNs written by concurrent
+	// tryAppend goroutines under RLock are visible here without holding appendMu.
+	writtenLSN := s.writeLSN
+	if s.writeLSNMirror != nil {
+		if m := s.writeLSNMirror.Load(); m > writtenLSN {
+			writtenLSN = m
+		}
+	}
+	if lsn > writtenLSN {
+		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, writtenLSN, lsn)
 	}
 	if lsn <= s.flushedLSN {
 		return nil
@@ -1760,10 +1802,32 @@ func preallocateSegment(f *os.File, size int64) error {
 	return nil
 }
 
+// storeMaxLSN atomically advances *ptr to val if val > ptr.Load().
+// Required when multiple goroutines holding RLock concurrently update
+// writeLSNMirror — plain Store would let a goroutine with a lower LSN
+// overwrite a higher one written by a peer that finished first.
+func storeMaxLSN(ptr *atomic.Uint64, val uint64) {
+	for {
+		cur := ptr.Load()
+		if val <= cur {
+			return
+		}
+		if ptr.CompareAndSwap(cur, val) {
+			return
+		}
+	}
+}
+
 func (s *state) close() error {
 	var firstErr error
-	if s.writeLSN > 0 {
-		if err := s.flushUpTo(s.writeLSN); err != nil {
+	closeLSN := s.writeLSN
+	if s.writeLSNMirror != nil {
+		if m := s.writeLSNMirror.Load(); m > closeLSN {
+			closeLSN = m
+		}
+	}
+	if closeLSN > 0 {
+		if err := s.flushUpTo(closeLSN); err != nil {
 			firstErr = err
 		}
 	}

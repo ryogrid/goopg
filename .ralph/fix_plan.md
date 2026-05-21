@@ -5429,17 +5429,54 @@ Operational policy (2026-05-20):
         ralph-state-guard` PASS. Commit: 644af04. Design:
         `docs/design/0107-0007ag-wal-stripe-call-site-rewrite-part2.md`
         (indexed in `docs/design/README.md`).
-        Remaining slice B work (deferred to subsequent loops):
-        - Remove `appendMu` from `tryAppend` so concurrent callers
-          use different stripes truly in parallel (the main TPS-improvement
-          step; requires atomic updates to `writeLSN` / `writePos`).
+        Remaining slice B work after part 2 (parts 2/3 now DONE):
+        - Remove `appendMu` from `tryAppend` — DONE in loop 3 (part 3;
+          see PARTIAL PROGRESS below).
         - Make drain asynchronous (`drainBufferBytes` currently runs
           under `appendMu`; the rewrite lets drain run concurrently
           by consuming `PublishUpTo`'s return as the drain ceiling).
-        - pgbench c=100 SU TPS ≥ 500 gate: run after `appendMu` is
-          removed from `tryAppend`.
-        - `appendRaw` (walreceiver replay): unchanged (pre-encoded bytes
-          from primary; uses size-explicit `appendMu` path).
+        - pgbench c=100 SU TPS ≥ 500 gate: run after drain decoupling lands.
+        - `appendRaw` (walreceiver replay): tracker `resetPosition` fix
+          landed in part 3 (pre-existing latent bug fixed as side-effect).
+      - PARTIAL PROGRESS 2026-05-21 (slice B call-site rewrite part 3 of N —
+        `appendMu` → `sync.RWMutex` + parallel tryAppend):
+        Changed `state.appendMu sync.Mutex` to `sync.RWMutex`. Switched
+        `tryAppend` PG-compat Path B from `Lock()/Unlock()` to
+        `RLock()/RUnlock()`: multiple concurrent backend goroutines now hold
+        RLock simultaneously and proceed on different stripes in parallel;
+        the old serialisation-to-one disappears on the hot path. Supporting
+        changes: (a) `tryAppend` drops `s.writePos`/`s.writeLSN`/
+        `s.prevRecPtr` updates (Lock() paths derive them from
+        `core.Load()` after all RLock holders finish); uses CAS-max
+        `storeMaxLSN` for `writeLSNMirror` so multiple concurrent writers
+        don't regress the watermark. (b) `appendPGCompat` Path A reads
+        `writePos` and `prevRecPtr` from `s.core.Load()` under Lock()
+        to account for tryAppend goroutines that advanced the tracker
+        before Lock() was acquired; drops `s.prevRecPtr = start-1`
+        (tracker `resetPosition` is authoritative). (c) `appendRaw`
+        reads writePos from `core.Load()` and calls `core.resetPosition(end,
+        trackerPrev)` — fixes a pre-existing latent bug where the tracker
+        stayed at the pre-raw position, causing the next `Append` to
+        overwrite raw bytes. (d) `flushUpTo` and `close()` use
+        `max(s.writeLSN, writeLSNMirror.Load())` so tryAppend-written
+        LSNs are visible without holding appendMu. Five regression tests
+        in `internal/wal/tryappend_rwmutex_test.go`:
+        `TestAppendMuIsRWMutex` (compile-time pin);
+        `TestConcurrentTryAppendProceedsInParallel` (8-goroutine peak
+        concurrency > 1 — falsified under old Mutex);
+        `TestFlushUpToSeesLSNFromConcurrentTryAppend` (FlushUpTo sees
+        tryAppend LSNs); `TestAppendRawResetsTrackerSoSubsequentAppendDoesNotOverwrite`
+        (no overwrite after AppendRaw);
+        `TestTryAppendRLockDoesNotBlockSiblings` (concurrent RLock
+        acquisition is non-blocking). `go test -race -count=1
+        ./internal/wal/ ./internal/executor/ ./internal/server/
+        ./internal/mvcc/ ./internal/storage/ ./internal/access/btree/`
+        all PASS. Design:
+        `docs/design/0107-0007ah-wal-tryappend-rwmutex.md` (indexed in
+        `docs/design/README.md`). `make ralph-state-guard` PASS.
+        Remaining: make drain asynchronous (appendPGCompat Path B still
+        holds Lock() for `drainBufferBytes`; this is the last Lock()-on-
+        hot-path bottleneck); pgbench c=100 SU TPS ≥ 500 gate.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
