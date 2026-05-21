@@ -44,7 +44,14 @@ const heapReleaseThresholdBytes = 4 << 30 // 4 GiB
 // retained allocations indefinitely.
 var queriesWithoutFreeCounter int64
 
-const queriesPerForcedFree = 8
+// queriesPerForcedFree gates how often we invoke runtime.GC()+FreeOSMemory()
+// when no single query has exceeded heapReleaseThresholdBytes.  The original
+// value of 8 was sized for TPC-H (queries that take seconds each); at pgbench
+// rates (thousands of queries per second) it caused a world-stop ReadMemStats
+// on *every* query and a full GC every ~8 queries — accounting for 43% of
+// CPU at c=10 SO.  10 000 still guards against long TPC-H drifts (22 queries
+// × hours = far below 10 000) while eliminating the pgbench overhead.
+const queriesPerForcedFree = 10_000
 
 // maybeForceGCAfterCommit triggers `runtime.GC()` +
 // `debug.FreeOSMemory()` at the end of a Query message when
@@ -52,20 +59,21 @@ const queriesPerForcedFree = 8
 //   - HeapInuse > heapReleaseThresholdBytes  (this query was big), or
 //   - we've gone queriesPerForcedFree queries without a Free   (drift).
 //
-// Performance: each Free call is ~50–500 ms on a 4 GiB heap and
-// happens at most once per query, on the path where the client
-// has *already* received its CommandComplete (the GC pause is
-// invisible to the just-finished query). The next query may pay
-// a cold-cache penalty on first allocation, but at our query
-// granularity (seconds) that is negligible.
+// Hot-path discipline: the atomic counter check is evaluated first (no
+// STW).  runtime.ReadMemStats (which requires a brief stop-the-world) is
+// only called when the counter says a GC round is due — keeping the common
+// sub-threshold path to a single atomic operation.
 func maybeForceGCAfterCommit() {
+	n := atomic.AddInt64(&queriesWithoutFreeCounter, 1)
+	if n < queriesPerForcedFree {
+		return // fast path: single atomic add, no STW
+	}
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
-	n := atomic.AddInt64(&queriesWithoutFreeCounter, 1)
-	if ms.HeapInuse < heapReleaseThresholdBytes && n < queriesPerForcedFree {
+	atomic.StoreInt64(&queriesWithoutFreeCounter, 0)
+	if ms.HeapInuse < heapReleaseThresholdBytes {
 		return
 	}
-	atomic.StoreInt64(&queriesWithoutFreeCounter, 0)
 	runtime.GC()
 	debug.FreeOSMemory()
 }

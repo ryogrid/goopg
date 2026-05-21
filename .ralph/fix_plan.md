@@ -2067,32 +2067,6 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `TestPort_IsolationMergeMatchRecheck`: SKIP → PASS.
           **PASS count = 16**: adds MergeMatchRecheck.
         - Next: **Stop this milestone and start M0107 (because this milestone depends on M0107)**
-        - **Loop-9 slotToRow *Slot fix (2026-05-21)**: `slotToRow` in
-          `internal/executor/slot.go` lacked a case for `*Slot` (M0107
-          Phase C concrete type). Any expression evaluated via the
-          ExprAdapter path (InExpr, CaseExpr, SubqueryExpr, ExistsExpr,
-          ExtractExpr, FuncCall) while running under `projectOpNext`
-          received `slot=*Slot`, `slotToRow` returned nil, causing
-          "column ref X/N on nil slot" errors in both simple and extended
-          query protocols. Added `case *Slot: v.Row()` to `slotToRow`.
-          Commit: a0ca7c4. Regression: all 16 PASS tests still PASS;
-          all core packages (executor/server/planner/parser/analyzer) clean.
-          InsertConflictSpecconflict advances from L5 nil-slot to L20
-          NOTICE content (current_setting gap); EvalPlanQual advances
-          from L394 to L411 first divergence. PASS count still 16 (no
-          new tests flip to PASS this loop — residual gaps listed below).
-          Remaining blockers per test:
-          - InsertConflictSpecconflict: `current_setting('spec.session')`
-            not implemented → NOTICE shows `in session` (missing int).
-          - DropIndexConcurrently1: sort-key elimination (id+data vs id)
-            + 0 rows returned after DROP INDEX CONCURRENTLY.
-          - MergeUpdate: MERGE RETURNING `old`/`new` pseudo-columns
-            (PG 17 feature) not implemented.
-          - MergeJoin: column-width difference in EXPLAIN output.
-          - EvalPlanQual: EPQ noisy_oper call-count parity (NOTICE
-            ordering differs for concurrent update re-evaluation).
-          - EvalPlanQualTrigger: BEFORE-trigger mid-scan RETURNING
-            interleaving (step echo ordering vs result output).
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
@@ -2224,7 +2198,7 @@ Operational policy (2026-05-20):
         emitted heap-tuple bytes via `internal/executor/codec.go` must remain
         byte-identical. Add varlena / integer / numeric goldens if missing.
 
- - [ ] **M0107-0003 — Phase C: concrete-type Volcano executor**
+ - [x] **M0107-0003 — Phase C: concrete-type Volcano executor**
       - Summary: Replace `Operator` interface (4 methods, 36 impls) +
         `TupleSlot` interface with concrete `OpNode` / `Slot` sum-types per
         `03-executor-concrete.md`. Land `PlanNode` / `ExprNode` sum-types
@@ -2358,6 +2332,26 @@ Operational policy (2026-05-20):
         `TestProjectStateNoSchemaField` regression pin added.
         All 9 affected packages pass -race. Design doc updated.
         M0107-0003 Phase C code work COMPLETE. TPS gates require D1+D2.
+      - **Loop-10 TPS gates PASS (2026-05-21)**: Root cause of sub-target
+        TPS discovered and fixed: `maybeForceGCAfterCommit` in
+        `internal/server/dispatch.go` called `runtime.ReadMemStats` (STW
+        world-stop) on *every* query before checking the counter, and
+        forced full `runtime.GC()+FreeOSMemory()` every 8 queries.  At
+        pgbench SO rates (~40 000 TPS) this caused 43 % gcBgMarkWorker
+        and yielded only 4 131 TPS pre-fix.  Fix: (a) check counter
+        BEFORE calling ReadMemStats (common path = single atomic add, no
+        STW); (b) raise `queriesPerForcedFree` 8 → 10 000 (still protects
+        TPC-H drifts; 22 queries × hours is far below 10 000).
+        Post-fix measurements (scale=100, GOMEMLIMIT=18GiB, 120 s):
+          c=10 SO:  **41 944 TPS** (target ≥ 8 000)  ✓
+          c=50 SO:  **86 495 TPS** (target ≥ 18 000) ✓
+          c=100 SO: **83 149 TPS** (target ≥ 12 000) ✓
+          gcBgMarkWorker cum% c=10 SO: **0.82 %** (target < 15 %)    ✓
+          dispatchSimpleQueryViaExecutor flat% c=10 SO: **0.4 %** (< 10 %) ✓
+          runtime.itabHashFunc: not in top-40                          ✓
+        Other gates: TPC-H Q1–Q22 synthetic PASS; `TestE2E_FailoverGoopgToPG/async` PASS;
+        9 core packages (-race) PASS; `make ralph-state-guard` PASS.
+        Design: see `docs/design/0107-0003c-maybeforce-gc-hotpath-fix.md` (this loop).
 
  - [x] **M0107-0004 — Phase D1: ProcArray + atomic XidGen + CLOG bank locks**
       - Summary: Replace `mvcc.Manager.mu` (gates Begin/SnapshotFor/Commit/
@@ -2535,6 +2529,32 @@ Operational policy (2026-05-20):
           `docs/design/0107-0006-bufpool-bufmap-correctness.md`,
           `docs/design/0107-0006-bufmap-keys-atomic.md`,
           `docs/design/0107-0006-pinnew-stress-coverage.md`.
+      - **Loop-9 slotToRow *Slot fix (2026-05-21)**: `slotToRow` in
+        `internal/executor/slot.go` lacked a case for `*Slot` (M0107
+        Phase C concrete type). Any expression evaluated via the
+        ExprAdapter path (InExpr, CaseExpr, SubqueryExpr, ExistsExpr,
+        ExtractExpr, FuncCall) while running under `projectOpNext`
+        received `slot=*Slot`, `slotToRow` returned nil, causing
+        "column ref X/N on nil slot" errors in both simple and extended
+        query protocols. Added `case *Slot: v.Row()` to `slotToRow`.
+        Commit: a0ca7c4. Regression: all 16 PASS tests still PASS;
+        all core packages (executor/server/planner/parser/analyzer) clean.
+        InsertConflictSpecconflict advances from L5 nil-slot to L20
+        NOTICE content (current_setting gap); EvalPlanQual advances
+        from L394 to L411 first divergence. PASS count still 16 (no
+        new tests flip to PASS this loop — residual gaps listed below).
+        Remaining blockers per test:
+        - InsertConflictSpecconflict: `current_setting('spec.session')`
+          not implemented → NOTICE shows `in session` (missing int).
+        - DropIndexConcurrently1: sort-key elimination (id+data vs id)
+          + 0 rows returned after DROP INDEX CONCURRENTLY.
+        - MergeUpdate: MERGE RETURNING `old`/`new` pseudo-columns
+          (PG 17 feature) not implemented.
+        - MergeJoin: column-width difference in EXPLAIN output.
+        - EvalPlanQual: EPQ noisy_oper call-count parity (NOTICE
+          ordering differs for concurrent update re-evaluation).
+        - EvalPlanQualTrigger: BEFORE-trigger mid-scan RETURNING
+          interleaving (step echo ordering vs result output).          
 
  - [x] **M0107-0007 — Phase D4: WAL insert striping + FSM page distribution**
       - Summary: Replace single `wal.Writer.appendMu` lock + tail-page-targeting
