@@ -215,18 +215,19 @@ func (c *stripeWriterCore) AppendBuilt(procNum int32, size int, build func(prev 
 //
 // Use AppendBuiltEmitted for PG-compat records whose on-the-wire size
 // includes page headers stamped by emitWithPageHeaders — the build
-// closure receives the post-reservation prev plus the (total, leading)
-// pair pre-computed under posMu, and must return exactly `total` bytes
-// of page-headered output. Use [[0107-0007y]] AppendBuilt for records
-// whose page-header schedule is the caller's responsibility (currently
-// no such site exists in goopg — kept as the size-explicit primitive
-// for tests and future flexibility). Use Append for records that are
-// already fully encoded without prev linkage.
+// closure receives the post-reservation (start, prev, total, leading)
+// tuple pre-computed under posMu — start is needed by emitWithPageHeaders
+// to stamp page headers at the correct LSN — and must return exactly
+// `total` bytes of page-headered output. Use [[0107-0007y]] AppendBuilt
+// for records whose page-header schedule is the caller's responsibility
+// (currently no such site exists in goopg — kept as the size-explicit
+// primitive for tests and future flexibility). Use Append for records
+// that are already fully encoded without prev linkage.
 //
 // nil receiver returns errStripeWriterCoreNil so the call-site rewrite
 // can detect a mis-wired Writer without a nil-pointer panic — same
 // contract as Append and AppendBuilt.
-func (c *stripeWriterCore) AppendBuiltEmitted(procNum int32, recordLen int, build func(prev uint64, total, leading int) ([]byte, error)) (start, prev uint64, total, leading int, err error) {
+func (c *stripeWriterCore) AppendBuiltEmitted(procNum int32, recordLen int, build func(start, prev uint64, total, leading int) ([]byte, error)) (start, prev uint64, total, leading int, err error) {
 	if c == nil {
 		return 0, 0, 0, 0, errStripeWriterCoreNil
 	}

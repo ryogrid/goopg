@@ -28,14 +28,19 @@ package wal
 // output (typically by calling `emitWithPageHeaders` with the prev
 // stamped into the record's xl_prev field).
 //
-// Why the build closure receives the (total, leading) pair. Page-header
-// emission depends on the reservation's start LSN, which is known only
-// inside `reserveEmittedAndPublish` under posMu. The caller could in
-// principle recompute it from `start` returned by the composer, but
-// passing it directly avoids the second `predictEmittedSize` call on
-// the hot path and pins the contract: the bytes the build closure
-// returns MUST be exactly `total` bytes long, of which the first
-// `leading` are a page header (or zero if start is not page-aligned).
+// Why the build closure receives the (start, prev, total, leading) tuple.
+// Page-header emission via `emitWithPageHeaders` needs (a) the reservation's
+// start LSN to compute page boundaries, contrecord splits, and the system
+// ID / timeline stamped into each header; (b) the total reserved length so
+// the closure validates its own output against the contract; (c) the
+// leading-header byte count so the closure can stamp a long PHD vs short
+// PHD vs no leading PHD without re-running `predictEmittedSize`. start,
+// total, and leading are all known inside `reserveEmittedAndPublish` under
+// posMu (including the cross-segment re-prediction at boundary), so
+// threading them through avoids a duplicate post-reservation predict on
+// the hot path. The build closure's output MUST be exactly `total` bytes
+// long, of which the first `leading` are a page header (or zero if start
+// is not page-aligned).
 //
 // Lock-ordering tier — extends [[0107-0007u]] stripeAppend with the
 // joint-atomic predict step inside `reserveAndPublish`:
@@ -51,7 +56,7 @@ package wal
 //	        → predictEmittedSize @ boundary       (cross-seg re-predict)
 //	        → insertionTracker.setInsertingAt(stripe, start)
 //	      (posMu released)
-//	    → build(prev, total, leading)            (caller's encoder + page headers)
+//	    → build(start, prev, total, leading)     (caller's encoder + page headers)
 //	    → walBuffer.writeReserved                (no lock; leaf)
 //	    → MemRing.WriteReserved                  (memRing.mu read-lock)
 //	    → insertionTracker.setInsertingAt(stripe, lsnIdle)
@@ -65,8 +70,8 @@ package wal
 // leaves a published LSN range that no bytes will ever cover. The slice B
 // caller treats build errors as fatal at the WAL append boundary.
 //
-// Size-mismatch contract. `build(prev, total, leading)` MUST return a
-// slice of length exactly `total`. The composer validates this before
+// Size-mismatch contract. `build(start, prev, total, leading)` MUST return
+// a slice of length exactly `total`. The composer validates this before
 // the ring writes; mis-size → `errStripeAppendBuildSizeMismatch` with
 // END marker fired. Mismatch is a programmer bug in the build closure
 // (e.g. forgot to call emitWithPageHeaders, or computed total
@@ -103,7 +108,7 @@ func stripeAppendBuiltEmitted(
 	memRing *MemRing,
 	procNum int32,
 	recordLen int,
-	build func(prev uint64, total, leading int) ([]byte, error),
+	build func(start, prev uint64, total, leading int) ([]byte, error),
 ) (start, prev uint64, total, leading int, err error) {
 	if locks == nil {
 		return 0, 0, 0, 0, errStripeAppendNilLocks
@@ -132,7 +137,7 @@ func stripeAppendBuiltEmitted(
 
 	start, prev, total, leading = posTracker.reserveEmittedAndPublish(recordLen, stripe, insertTracker)
 
-	out, berr := build(prev, total, leading)
+	out, berr := build(start, prev, total, leading)
 	if berr != nil {
 		return start, prev, total, leading, berr
 	}

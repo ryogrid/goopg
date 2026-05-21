@@ -5046,6 +5046,71 @@ Operational policy (2026-05-20):
         from the primary — so that path will continue to consume the
         size-explicit [[0107-0007p]] `reserveAndPublish` /
         [[0107-0007u]] `stripeAppend` instead.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 20 of N —
+        `stripeAppendBuiltEmitted` build closure receives `start`):
+        extended the build-closure signature in
+        `internal/wal/stripe_append_emitted.go` from
+        `func(prev uint64, total, leading int) ([]byte, error)` to
+        `func(start, prev uint64, total, leading int) ([]byte, error)`
+        and propagated the change through
+        `(*stripeWriterCore).AppendBuiltEmitted` in
+        `internal/wal/stripe_writer_core.go`. The new `start` argument
+        is the post-reservation LSN; without it, the slice B call-site
+        rewrite cannot call `emitWithPageHeaders(record, realRecLen,
+        startPos, segSize, sysID, tli)` from inside the closure —
+        `emitWithPageHeaders` needs `startPos` to compute page
+        boundaries, contrecord splits, and the system-ID/timeline
+        stamped into each header. The two pre-existing workarounds
+        (predict the start outside the composer via `core.Load`, or
+        reach into `posTracker.curr` under `posMu`) both re-open the
+        predict-vs-reserve race that [[0107-0007aa]] foundation 18
+        closed, so threading `start` through the closure is the only
+        clean fix. Cross-segment crossings: the closure receives the
+        POST-boundary start (the LSN where the triggering reservation
+        lands, NOT the pad record's start LSN) — the pad bytes were
+        emitted synchronously by [[0107-0007s]] `emitSegmentPad` under
+        `posMu` during the `onCrossSegment` hook, before the closure
+        even runs. Test coverage: the happy-path test now captures
+        `start` from the closure and asserts (a) start=0 on
+        reservation #1 (segment-aligned long PHD) and (b) start=total1
+        on reservation #2 (mid-page short body); the cross-segment
+        test asserts the closure observes `start == segSize` (the
+        post-boundary value), pinning the contract that the closure
+        NEVER sees the pre-shift candidate start (`segSize - 50` in
+        the test). Other existing tests use placeholder `_` for the
+        new `start` arg. All 12 `TestStripeAppendBuiltEmitted` tests
+        plus 2 `TestStripeWriterCoreAppendBuiltEmitted` wrapper tests
+        continue to pass. Verified: `go test -race -count=1 -run
+        'TestStripeAppendBuiltEmitted|TestStripeWriterCoreAppendBuiltEmitted'
+        ./internal/wal/` PASS (1.04 s); `go test -race -count=1
+        ./internal/wal/` PASS (4.09 s); `go vet ./internal/wal/`
+        clean. Design:
+        `docs/design/0107-0007ac-wal-stripe-append-built-emitted-start.md`
+        (indexed in `docs/design/README.md`). PG-compat — none
+        (in-memory composer signature change; byte stream identical
+        to legacy `state.append` flow). Dead code until the slice B
+        call-site rewrite mounts `core.AppendBuiltEmitted` at the
+        PG-compat write entry points; foundation-first pattern
+        matches slice C ([[0107-0007b]] / [[0107-0007c]] /
+        [[0107-0007d]] before [[0107-0007e]] / [[0107-0007f]] /
+        [[0107-0007g]]) and the nineteen earlier slice B foundations
+        ([[0107-0007i]] through [[0107-0007ab]] minus the
+        dead-code-removed [[0107-0007h]]). Out of scope (deferred to
+        call-site rewrite parts 2/3): mounting `core.AppendBuiltEmitted`
+        as the body of `state.append` / `state.appendTryEnqueue` /
+        `state.appendBatch` for the PG-compat path (multi-loop because
+        `state.appendMu`'s four invariants — writePos / walBuf /
+        memRing / writeLSN — split into per-stripe local state vs.
+        shared state); mounting `core.PublishUpTo` in the drain
+        goroutine's prelude (`drainBufferBytes` currently runs under
+        `appendMu`); 8-byte MAXALIGN of record sizes in the Append
+        pre-amble (`encodeRecordXLog` already produces MAXALIGN-padded
+        records, so the rewrite will assert the invariant at the
+        boundary); walreceiver replay (`appendRaw`) does not use
+        page-header insertion — bytes arrive pre-encoded from the
+        primary — so that path will continue to consume the
+        size-explicit [[0107-0007p]] `reserveAndPublish` /
+        [[0107-0007u]] `stripeAppend` instead.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded

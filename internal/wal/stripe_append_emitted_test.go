@@ -37,12 +37,14 @@ func TestStripeAppendBuiltEmittedHappyPathReceivesPrevAndTotal(t *testing.T) {
 	locks, posTracker, insertTracker, walBuf, memRing, publisher := makeStripeAppendFixture(t, 4096)
 
 	const recordLen1 = 24
-	var gotPrev1, gotTotal1, gotLeading1 uint64
+	var gotStart1, gotPrev1, gotTotal1, gotLeading1 uint64
+	gotStart1 = ^uint64(0)
 	gotPrev1 = ^uint64(0)
 	start1, prev1, total1, leading1, err := stripeAppendBuiltEmitted(
 		locks, posTracker, insertTracker, walBuf, memRing,
 		/*procNum*/ 0, recordLen1,
-		func(p uint64, total, leading int) ([]byte, error) {
+		func(s, p uint64, total, leading int) ([]byte, error) {
+			gotStart1 = s
 			gotPrev1 = p
 			gotTotal1 = uint64(total)
 			gotLeading1 = uint64(leading)
@@ -64,17 +66,20 @@ func TestStripeAppendBuiltEmittedHappyPathReceivesPrevAndTotal(t *testing.T) {
 	if total1 != SizeOfXLogLongPHD+recordLen1 {
 		t.Fatalf("total #1 = %d, want %d", total1, SizeOfXLogLongPHD+recordLen1)
 	}
-	if gotPrev1 != 0 || gotTotal1 != uint64(total1) || gotLeading1 != uint64(leading1) {
-		t.Fatalf("build closure #1 args: prev=%d total=%d leading=%d, want 0/%d/%d",
-			gotPrev1, gotTotal1, gotLeading1, total1, leading1)
+	if gotStart1 != start1 || gotPrev1 != 0 || gotTotal1 != uint64(total1) || gotLeading1 != uint64(leading1) {
+		t.Fatalf("build closure #1 args: start=%d prev=%d total=%d leading=%d, want %d/0/%d/%d",
+			gotStart1, gotPrev1, gotTotal1, gotLeading1, start1, total1, leading1)
 	}
 
 	// Second record: posTracker.curr is now total1; mid-page so
 	// leading=0, total=recordLen2.
 	const recordLen2 = 16
+	var gotStart2 uint64
+	gotStart2 = ^uint64(0)
 	start2, prev2, total2, leading2, err := stripeAppendBuiltEmitted(
 		locks, posTracker, insertTracker, walBuf, memRing, 0, recordLen2,
-		func(p uint64, total, leading int) ([]byte, error) {
+		func(s, p uint64, total, leading int) ([]byte, error) {
+			gotStart2 = s
 			return emittedBuild(p, total, leading, recordLen2), nil
 		},
 	)
@@ -87,6 +92,9 @@ func TestStripeAppendBuiltEmittedHappyPathReceivesPrevAndTotal(t *testing.T) {
 	}
 	if leading2 != 0 || total2 != recordLen2 {
 		t.Fatalf("size #2: total=%d leading=%d, want %d/0", total2, leading2, recordLen2)
+	}
+	if gotStart2 != start2 {
+		t.Fatalf("build closure #2 start arg: got=%d, want %d", gotStart2, start2)
 	}
 
 	// END marker landed for both inserts.
@@ -113,7 +121,7 @@ func TestStripeAppendBuiltEmittedNilLocksReturnsError(t *testing.T) {
 	t.Parallel()
 	_, posTracker, insertTracker, walBuf, memRing, _ := makeStripeAppendFixture(t, 4096)
 	_, _, _, _, err := stripeAppendBuiltEmitted(nil, posTracker, insertTracker, walBuf, memRing, 0, 16,
-		func(uint64, int, int) ([]byte, error) { return make([]byte, 56), nil })
+		func(uint64, uint64, int, int) ([]byte, error) { return make([]byte, 56), nil })
 	if !errors.Is(err, errStripeAppendNilLocks) {
 		t.Fatalf("err=%v, want errStripeAppendNilLocks", err)
 	}
@@ -123,7 +131,7 @@ func TestStripeAppendBuiltEmittedNilPosTrackerReturnsError(t *testing.T) {
 	t.Parallel()
 	locks, _, insertTracker, walBuf, memRing, _ := makeStripeAppendFixture(t, 4096)
 	_, _, _, _, err := stripeAppendBuiltEmitted(locks, nil, insertTracker, walBuf, memRing, 0, 16,
-		func(uint64, int, int) ([]byte, error) { return make([]byte, 56), nil })
+		func(uint64, uint64, int, int) ([]byte, error) { return make([]byte, 56), nil })
 	if !errors.Is(err, errStripeAppendNilPosTracker) {
 		t.Fatalf("err=%v, want errStripeAppendNilPosTracker", err)
 	}
@@ -133,7 +141,7 @@ func TestStripeAppendBuiltEmittedNilInsertTrackerReturnsError(t *testing.T) {
 	t.Parallel()
 	locks, posTracker, _, walBuf, memRing, _ := makeStripeAppendFixture(t, 4096)
 	_, _, _, _, err := stripeAppendBuiltEmitted(locks, posTracker, nil, walBuf, memRing, 0, 16,
-		func(uint64, int, int) ([]byte, error) { return make([]byte, 56), nil })
+		func(uint64, uint64, int, int) ([]byte, error) { return make([]byte, 56), nil })
 	if !errors.Is(err, errStripeAppendNilInsertTracker) {
 		t.Fatalf("err=%v, want errStripeAppendNilInsertTracker", err)
 	}
@@ -153,7 +161,7 @@ func TestStripeAppendBuiltEmittedEmptyRecordReturnsError(t *testing.T) {
 	locks, posTracker, insertTracker, walBuf, memRing, _ := makeStripeAppendFixture(t, 4096)
 	for _, n := range []int{0, -1, -100} {
 		_, _, _, _, err := stripeAppendBuiltEmitted(locks, posTracker, insertTracker, walBuf, memRing, 0, n,
-			func(uint64, int, int) ([]byte, error) { return nil, nil })
+			func(uint64, uint64, int, int) ([]byte, error) { return nil, nil })
 		if !errors.Is(err, errStripeAppendEmptyRecord) {
 			t.Fatalf("recordLen=%d: err=%v, want errStripeAppendEmptyRecord", n, err)
 		}
@@ -170,7 +178,7 @@ func TestStripeAppendBuiltEmittedBuildErrorPropagatesAndClearsStripe(t *testing.
 	locks, posTracker, insertTracker, walBuf, memRing, _ := makeStripeAppendFixture(t, 4096)
 	sentinel := errors.New("encoder explosion")
 	_, _, _, _, err := stripeAppendBuiltEmitted(locks, posTracker, insertTracker, walBuf, memRing, 3, 16,
-		func(uint64, int, int) ([]byte, error) { return nil, sentinel })
+		func(uint64, uint64, int, int) ([]byte, error) { return nil, sentinel })
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("err=%v, want sentinel", err)
 	}
@@ -191,7 +199,7 @@ func TestStripeAppendBuiltEmittedSizeMismatchReturnsError(t *testing.T) {
 	const recordLen = 16
 	// First call: under-size.
 	_, _, _, _, err := stripeAppendBuiltEmitted(locks, posTracker, insertTracker, walBuf, memRing, 0, recordLen,
-		func(_ uint64, total, _ int) ([]byte, error) { return make([]byte, total-1), nil })
+		func(_, _ uint64, total, _ int) ([]byte, error) { return make([]byte, total-1), nil })
 	if !errors.Is(err, errStripeAppendBuildSizeMismatch) {
 		t.Fatalf("under-size: err=%v, want errStripeAppendBuildSizeMismatch", err)
 	}
@@ -201,7 +209,7 @@ func TestStripeAppendBuiltEmittedSizeMismatchReturnsError(t *testing.T) {
 	// Second call: over-size on a different stripe (so the first
 	// reservation's published curr does not interfere).
 	_, _, _, _, err = stripeAppendBuiltEmitted(locks, posTracker, insertTracker, walBuf, memRing, 1, recordLen,
-		func(_ uint64, total, _ int) ([]byte, error) { return make([]byte, total+1), nil })
+		func(_, _ uint64, total, _ int) ([]byte, error) { return make([]byte, total+1), nil })
 	if !errors.Is(err, errStripeAppendBuildSizeMismatch) {
 		t.Fatalf("over-size: err=%v, want errStripeAppendBuildSizeMismatch", err)
 	}
@@ -213,7 +221,7 @@ func TestStripeAppendBuiltEmittedNilWalBufStillWritesMemRing(t *testing.T) {
 	locks := &appendLockSet{}
 	const recordLen = 24
 	start, _, total, leading, err := stripeAppendBuiltEmitted(locks, posTracker, insertTracker, /*walBuf*/ nil, memRing, 0, recordLen,
-		func(p uint64, total, leading int) ([]byte, error) {
+		func(_, p uint64, total, leading int) ([]byte, error) {
 			return emittedBuild(p, total, leading, recordLen), nil
 		})
 	if err != nil {
@@ -240,7 +248,7 @@ func TestStripeAppendBuiltEmittedNilMemRingStillWritesWalBuf(t *testing.T) {
 	locks, posTracker, insertTracker, walBuf, _, publisher := makeStripeAppendFixture(t, 4096)
 	const recordLen = 24
 	start, _, total, leading, err := stripeAppendBuiltEmitted(locks, posTracker, insertTracker, walBuf, /*memRing*/ nil, 0, recordLen,
-		func(p uint64, total, leading int) ([]byte, error) {
+		func(_, p uint64, total, leading int) ([]byte, error) {
 			return emittedBuild(p, total, leading, recordLen), nil
 		})
 	if err != nil {
@@ -278,9 +286,11 @@ func TestStripeAppendBuiltEmittedCrossSegmentEmitsPadAndRePredicts(t *testing.T)
 	prevBeforeCross := uint64(segSize - 50)
 
 	const recordLen = 100
+	gotClosureStart := ^uint64(0)
 	start, prev, total, leading, err := stripeAppendBuiltEmitted(
 		locks, posTracker, insertTracker, walBuf, memRing, 0, recordLen,
-		func(p uint64, total, leading int) ([]byte, error) {
+		func(s, p uint64, total, leading int) ([]byte, error) {
+			gotClosureStart = s
 			return emittedBuild(p, total, leading, recordLen), nil
 		})
 	if err != nil {
@@ -290,6 +300,12 @@ func TestStripeAppendBuiltEmittedCrossSegmentEmitsPadAndRePredicts(t *testing.T)
 	// with leading=long PHD.
 	if start != segSize {
 		t.Fatalf("post-cross start=%d, want %d", start, segSize)
+	}
+	// Build closure must observe the POST-boundary start (so
+	// emitWithPageHeaders stamps the long PHD at the boundary), NOT the
+	// pre-shift candidate start that triggered the crossing.
+	if gotClosureStart != start {
+		t.Fatalf("build closure start arg: got=%d, want %d (post-boundary)", gotClosureStart, start)
 	}
 	if prev != prevBeforeCross {
 		t.Fatalf("prev=%d, want %d (pad's start LSN)", prev, prevBeforeCross)
@@ -345,7 +361,7 @@ func TestStripeAppendBuiltEmittedConcurrentDisjointStripesProgressInParallel(t *
 				start, _, _, _, err := stripeAppendBuiltEmitted(
 					locks, posTracker, insertTracker, walBuf, memRing,
 					int32(s), recordLen,
-					func(p uint64, total, leading int) ([]byte, error) {
+					func(_, p uint64, total, leading int) ([]byte, error) {
 						return emittedBuild(p, total, leading, recordLen), nil
 					})
 				if err != nil {
@@ -397,7 +413,7 @@ func TestStripeWriterCoreAppendBuiltEmittedDelegatesToStripeAppendBuiltEmitted(t
 
 	const recordLen = 24
 	start, prev, total, leading, err := core.AppendBuiltEmitted(0, recordLen,
-		func(p uint64, total, leading int) ([]byte, error) {
+		func(_, p uint64, total, leading int) ([]byte, error) {
 			return emittedBuild(p, total, leading, recordLen), nil
 		})
 	if err != nil {
@@ -432,7 +448,7 @@ func TestStripeWriterCoreAppendBuiltEmittedNilReceiverReturnsError(t *testing.T)
 	t.Parallel()
 	var core *stripeWriterCore
 	_, _, _, _, err := core.AppendBuiltEmitted(0, 16,
-		func(uint64, int, int) ([]byte, error) { return nil, nil })
+		func(uint64, uint64, int, int) ([]byte, error) { return nil, nil })
 	if !errors.Is(err, errStripeWriterCoreNil) {
 		t.Fatalf("err=%v, want errStripeWriterCoreNil", err)
 	}
@@ -454,7 +470,7 @@ func TestStripeAppendBuiltEmittedWatchdog(t *testing.T) {
 			_, _, _, _, err := stripeAppendBuiltEmitted(
 				locks, posTracker, insertTracker, walBuf, memRing,
 				int32(i%appendLockStripes), recordLen,
-				func(p uint64, total, leading int) ([]byte, error) {
+				func(_, p uint64, total, leading int) ([]byte, error) {
 					return emittedBuild(p, total, leading, recordLen), nil
 				})
 			if err != nil {
