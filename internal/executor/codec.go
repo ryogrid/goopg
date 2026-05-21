@@ -699,13 +699,23 @@ func decodeGoopgRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *m
 		dst[i] = v
 		off += n
 	}
-	// If bytes remain after decoding all columns, this is not goopg format
-	// (e.g. PG physical little-endian layout where the first byte happened to
-	// match a null/TOAST flag).  Return an error so the caller falls through to
-	// decodePhysicalPGRowIntoMctx.  M0107: fixes FK scan false-null on clusters
-	// that use EncodeRowPG (PageHeaders=true) for heap writes.
-	if off < len(data) {
-		return fmt.Errorf("DecodeRow: goopg format: %d trailing bytes", len(data)-off)
+	// Decoder must consume exactly len(data) bytes.  Two failure modes indicate
+	// this is not goopg format:
+	//   off < len(data): trailing bytes remain (PG physical layout whose first
+	//                    byte happened to match a null/TOAST flag).
+	//   off > len(data): the loop guard (off >= len → NullDatum, no off advance)
+	//                    let off coast past the end, silently yielding wrong
+	//                    values without consuming the right number of bytes.
+	//                    Catching this prevents silent data corruption when the
+	//                    PG-encoded tuple is accidentally "decoded" by the goopg
+	//                    path (M0107: HOT-update encoding parity fix).
+	// In either case return an error so the caller falls through to
+	// decodePhysicalPGRowIntoMctx.
+	if off != len(data) {
+		if off < len(data) {
+			return fmt.Errorf("DecodeRow: goopg format: %d trailing bytes", len(data)-off)
+		}
+		return fmt.Errorf("DecodeRow: goopg format: overread by %d bytes (off=%d len=%d)", off-len(data), off, len(data))
 	}
 	return nil
 }

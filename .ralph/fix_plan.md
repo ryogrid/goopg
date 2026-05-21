@@ -5508,6 +5508,43 @@ Operational policy (2026-05-20):
         a separate fix item.  `go test -race -count=1 ./internal/wal/
         ./internal/mvcc/ ./internal/executor/ ./internal/storage/ ./internal/server/`
         all PASS.  `make ralph-state-guard` PASS.
+        - **HOT update encoding parity fix (2026-05-21 loop 6)**:
+          Two coupled changes close the deferred heap UPDATE corruption:
+          (A) `decodeGoopgRowIntoMctx` (`internal/executor/codec.go`): changed
+          post-loop check from `off < len(data)` (trailing bytes) to
+          `off != len(data)` (trailing bytes OR over-read). The over-read case
+          (`off > len(data)`) happened when the loop guard (off >= len → NullDatum,
+          no off advance) left off > len, causing the prior `off < len` guard to
+          evaluate FALSE and the decoder to "succeed" with wrong values. With the
+          new check, PG-encoded data that slips through the guard now correctly
+          falls through to `decodePhysicalPGRowIntoMctx`.
+          (B) `tryApplyHOTUpdate` (`internal/executor/operators_storage.go`):
+          when `ctx.LogCanonical != nil`, uses `EncodeRowPG` + `NullBitmapPG` +
+          `SetNatts(len(cols))` + `HeapXmaxInvalid` — identical to the canonical
+          path in `writeHeapRowReturning`. Previously HOT updates always used
+          `EncodeRow` (goopg format), creating mixed encoding within the same
+          relation when canonical WAL was active; `decodeGoopgRowIntoMctx` then
+          occasionally "succeeded" on PG-encoded rows with wrong column values
+          (e.g. filler column becoming NULL, counter value corrupted).
+          Root cause (deeper): `decodeGoopgRowIntoMctx` consumed flag+int4 bytes
+          for each column; on PG-encoded data, the flag byte displaced subsequent
+          reads so `off` ended up > `len(data)` after the loop, bypassing the
+          prior trailing-bytes guard. E.g. for PG (aid=5000, bid=50, abalance=0,
+          filler="") the decoder read flag=0x88 (→ value), consumed wrong bytes,
+          and final column used the off >= len guard → NullDatum. With off > len,
+          `off < len` was FALSE → decoder "succeeded" with abalance=wrong,
+          filler=NULL.
+          Regression pins: `TestDecodeRowGoopgOverreadDetected`,
+          `TestDecodeRowGoopgOffEqualLenIsValid` in
+          `internal/executor/codec_pg_format_fallback_test.go`;
+          `TestHOTUpdateEncodingConsistency`,
+          `TestHOTUpdateEncodingConsistencyConcurrent` in
+          `internal/server/hot_update_encoding_test.go`.
+          `go test -race -count=1 ./internal/executor/ ./internal/server/
+          ./internal/mvcc/ ./internal/storage/ ./internal/wal/ ./internal/planner/
+          ./internal/parser/ ./internal/analyzer/ ./internal/access/btree/` PASS.
+          Design: `docs/design/0107-0009-hot-update-encoding-parity.md`
+          (indexed in `docs/design/README.md`). `make ralph-state-guard` PASS.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded

@@ -1428,12 +1428,42 @@ func tryApplyHOTUpdate(
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return false, err
 	}
-	body, err := EncodeRow(cols, newRow)
-	if err != nil {
-		return false, &ExecError{Code: "XX000", Message: err.Error()}
+	// When canonical WAL is active, encode HOT-update tuples in PG-native
+	// physical format so they are consistent with non-HOT updates written by
+	// writeHeapRowReturning/writeHeapRowReturningPG.  Mixed encoding (goopg
+	// for HOT, PG for non-HOT) causes decodeGoopgRowIntoMctx to sometimes
+	// "accidentally succeed" on PG-encoded rows with wrong values when the
+	// over-read case slips through the off < len(data) trailing-bytes check.
+	// M0107: HOT-update encoding parity fix.
+	var (
+		body   []byte
+		bitmap []byte
+	)
+	if ctx.LogCanonical != nil {
+		var encErr error
+		body, encErr = EncodeRowPG(cols, newRow)
+		if encErr != nil {
+			return false, &ExecError{Code: "XX000", Message: encErr.Error()}
+		}
+		bitmap = NullBitmapPG(newRow)
+	} else {
+		var encErr error
+		body, encErr = EncodeRow(cols, newRow)
+		if encErr != nil {
+			return false, &ExecError{Code: "XX000", Message: encErr.Error()}
+		}
 	}
-	tup := storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+	var tup storage.HeapTuple
+	if len(bitmap) > 0 {
+		tup = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
+	} else {
+		tup = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+	}
 	tup.Header.Infomask |= storage.HeapOnlyTuple
+	if ctx.LogCanonical != nil {
+		tup.Header.SetNatts(len(cols))
+		tup.Header.Infomask |= storage.HeapXmaxInvalid
+	}
 	tupleBytes, err := tup.MarshalBinary()
 	if err != nil {
 		return false, err
