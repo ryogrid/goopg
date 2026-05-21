@@ -294,6 +294,21 @@ type Writer struct {
 	// from a short-form one without having to thread cfg in.
 	segmentSize int64
 
+	// core is the M0107-0007 slice B WAL-insert striping packaging
+	// struct (`docs/design/0107-0007v-wal-stripe-writer-core.md`).
+	// Mounted here so the eventual call-site rewrite can replace
+	// `state.append`'s body with `s.core.Append(procNum, encoded)`
+	// and the drain goroutine's per-tick prelude with
+	// `s.core.PublishUpTo(...)` — see
+	// `docs/design/0107-0007w-wal-stripe-writer-core-mount.md`. The
+	// core is constructed in `NewWriter` after `loadState` so it
+	// borrows the same `walBuf` / `memRing` rings as the legacy path
+	// (one allocation, two consumers — duplicating the rings would
+	// fork on-disk visibility). Dead code until the call-site
+	// rewrite consumes it; access in tests is guarded by the
+	// `stripeCore()` accessor below.
+	core *stripeWriterCore
+
 	// OnWALWrite and OnWALSync are optional hooks called before
 	// blocking WAL write / fdatasync operations.  The caller
 	// (initdb.Open) sets them via activity.LookupGoroutine so
@@ -453,6 +468,13 @@ func NewWriter(cfg Config) (*Writer, error) {
 	st.onLoopEnd = cfg.OnLoopEnd
 	st.onWALWrite = cfg.OnWALWrite
 	st.fg = fg
+	w.core = newStripeWriterCore(
+		uint64(cfg.SegmentSize),
+		uint64(st.writePos),
+		st.prevRecPtr,
+		st.walBuf,
+		st.memRing,
+	)
 	go st.loop(w.ops, w.done)
 	return w, nil
 }

@@ -4520,6 +4520,61 @@ Operational policy (2026-05-20):
         `reserveAndPublish` + `publishTail` + `emitSegmentPad` +
         `publishVisibility` + `stripeAppend` +
         `stripeWriterCore`.
+      - PARTIAL PROGRESS 2026-05-21 (slice B call-site rewrite part
+        1 of N — mount `*stripeWriterCore` on `Writer`): added
+        `core *stripeWriterCore` field to `Writer` in
+        `internal/wal/writer.go` and instantiated it in `NewWriter`
+        after `loadState` via
+        `newStripeWriterCore(uint64(cfg.SegmentSize),
+        uint64(st.writePos), st.prevRecPtr, st.walBuf, st.memRing)`.
+        Pins the slice C-style mount-point ([[0107-0007v]]
+        §"Why this is dead code") so the next loops are mechanical
+        body rewrites against an established field name rather than
+        field-introduction + body-rewrite combined diffs. Core
+        borrows the same `walBuf` / `memRing` rings as the legacy
+        `state.append` path (one allocation, two consumers —
+        duplicating rings would fork on-disk visibility per
+        [[0107-0007v]] §"Borrowed vs owned"). Construction is
+        unconditional: `cfg.SegmentSize` is normalised non-zero by
+        `cfg.withDefaults` so `newInsertPosTracker`'s `segSize > 0`
+        invariant holds; `st.walBuf` propagates `nil` verbatim
+        under `Config.WALBuffers == 0` and per-foundation nil-safety
+        covers every ring matrix (4 cells: WALBuffers ∈ {0, >0} ×
+        SenderMemoryBuffer ∈ {0, >0}). Dead code for production
+        WAL flow — `state.append` continues to drive the legacy
+        single-mutex insert path; the mount only becomes hot under
+        subsequent call-site rewrite parts 2/3 (replacing
+        `state.append`'s body with `s.core.Append(procNum, encoded)`
+        and the drain prelude with `s.core.PublishUpTo(...)`),
+        both of which require the parent milestone's PG-compat WAL
+        byte-diff integration gate. Two regression tests in
+        `internal/wal/stripe_writer_core_mount_test.go`:
+        `TestStripeWriterCoreMountedAfterNewWriter` (non-nil core
+        after `NewWriter`; `core.memRing == w.memRing` and
+        `core.walBuf == w.stateRef.walBuf` pointer-identity;
+        `core.Load() == (uint64(writePos), prevRecPtr)` recovery-
+        resume contract holds on construction; all four owned
+        primitives `core.locks` / `core.posTracker` /
+        `core.inserting` / `core.publisher` wired non-nil);
+        `TestStripeWriterCoreMountedAcceptsBareConfig`
+        (`WALBuffers=0, SenderMemoryBuffer=0` corner — both rings
+        propagate nil; `core.Load() == (0, 0)`;
+        `core.PublishedTail() == 0`). Verified: `go test -race
+        -count=1 -run 'TestStripeWriterCore' ./internal/wal/` PASS
+        (1.03 s); `go test -race -count=1 ./internal/wal/` PASS
+        (3.18 s). Design:
+        `docs/design/0107-0007w-wal-stripe-writer-core-mount.md`
+        (indexed in `docs/design/README.md`). PG-compat — none
+        (in-memory struct field; no byte-emission change). Out of
+        scope (deferred to call-site rewrite parts 2/3): rewriting
+        `state.append`'s body to call `core.Append`; rewriting
+        `drainBufferBytes`' prelude to call `core.PublishUpTo`;
+        8-byte MAXALIGN of record sizes in the Append pre-amble
+        (avoids the [[0107-0007s]] `padLen < 24` and `padLen == 25`
+        corner cases); decision on dead-code-removing
+        [[0107-0007h]] `lsnAllocator` once the call-site converges
+        on the `insertPosTracker` + `insertionTracker` +
+        `tailPublisher` trio.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
