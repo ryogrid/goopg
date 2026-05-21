@@ -1288,11 +1288,19 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 		return start, end, nil
 	}
 
-	// Path B: stripe-B buffered append.
-	s.appendMu.Lock()
-	defer s.appendMu.Unlock()
+	// Path B: stripe-B buffered append. No outer lock needed.
+	//
+	// drain runs lock-free: the state-loop goroutine is the sole caller of
+	// drainBufferBytes → advanceHead (single writer of head/base, now atomic).
+	// Concurrent tryAppend goroutines under RLock write to LSN ranges strictly
+	// above tail (checked under RLock), which are disjoint from the drain
+	// window [head, head+need). The safety argument is in
+	// docs/design/0107-0007ai-wal-buffer-head-base-atomic-async-drain.md.
+	//
+	// AppendXLogPayload acquires its own stripe lock internally (no outer lock).
+	// PublishUpTo is an atomic tail advance (no lock).
 
-	// Pre-drain if the conservative size won't fit.
+	// Phase 1: drain if needed (lock-free).
 	need := int64(conservativeSize) - s.walBuf.free()
 	if need > 0 {
 		// Publish pending bytes before draining so drain can read them.
@@ -1303,24 +1311,25 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 		}
 	}
 
+	// Phase 2: stripe-locked append (AppendXLogPayload takes its own stripe lock).
 	procNum := s.stripeNum()
 	start0, _, total, leading, err := s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	// Synchronous publish (transitional state): advance walBuf.tail and
-	// memRing.tail so subsequent drain reads see the freshly-written bytes.
+	// Phase 3: publish (atomic tail advance; no lock).
 	s.core.PublishUpTo(int64(start0) + int64(total))
 
-	// Update state-loop fields. writePos/writeLSN keep the state loop's
-	// internal view consistent; writeLSNMirror is the atomic external view.
-	// s.prevRecPtr is no longer maintained: Path A reads prev from core.Load().
+	// Update state-loop bookkeeping. writePos/writeLSN are state-loop-only
+	// fields (plain assignment is safe — no concurrent writes from the state
+	// loop). writeLSNMirror uses storeMaxLSN because concurrent tryAppend
+	// goroutines under RLock may update it simultaneously.
 	s.writePos = int64(start0) + int64(total)
 	end := uint64(s.writePos)
 	s.writeLSN = end
 	if s.writeLSNMirror != nil {
-		s.writeLSNMirror.Store(end)
+		storeMaxLSN(s.writeLSNMirror, end)
 	}
 	start := start0 + uint64(leading) + 1 // 1-based record start (goopg convention)
 	return start, end, nil

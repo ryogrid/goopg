@@ -22,8 +22,8 @@ func TestWALBufferWriteReservedAtBaseNoWrap(t *testing.T) {
 	if got := string(b.buf[0:len(rec)]); got != string(rec) {
 		t.Fatalf("buf contents = %q, want %q", got, string(rec))
 	}
-	if b.base != 100 || b.head != 100 || b.tail.Load() != 100 {
-		t.Fatalf("head/tail/base mutated: base=%d head=%d tail=%d", b.base, b.head, b.tail.Load())
+	if b.base.Load() != 100 || b.head.Load() != 100 || b.tail.Load() != 100 {
+		t.Fatalf("head/tail/base mutated: base=%d head=%d tail=%d", b.base.Load(), b.head.Load(), b.tail.Load())
 	}
 }
 
@@ -104,7 +104,7 @@ func TestWALBufferWriteReservedEmptyIsNoop(t *testing.T) {
 			t.Fatalf("buf mutated at i=%d: %02x → %02x", i, c, b.buf[i])
 		}
 	}
-	if b.base != 50 || b.head != 50 || b.tail.Load() != 50 {
+	if b.base.Load() != 50 || b.head.Load() != 50 || b.tail.Load() != 50 {
 		t.Fatalf("head/tail/base mutated by empty write")
 	}
 }
@@ -219,15 +219,15 @@ func TestWALBufferWriteReservedDoesNotMutateTailHeadBase(t *testing.T) {
 	b.reset(1000)
 	// Make tail and head non-equal so we can detect any spurious bump.
 	b.tail.Store(1010)
-	b.head = 1005
+	b.head.Store(1005)
 	rec := []byte{1, 2, 3, 4, 5}
 	for lsn := int64(1000); lsn+int64(len(rec)) <= 1000+64; lsn += 7 {
 		if err := b.writeReserved(lsn, rec); err != nil {
 			t.Fatalf("writeReserved lsn=%d: %v", lsn, err)
 		}
-		if b.base != 1000 || b.head != 1005 || b.tail.Load() != 1010 {
+		if b.base.Load() != 1000 || b.head.Load() != 1005 || b.tail.Load() != 1010 {
 			t.Fatalf("position mutated after lsn=%d: base=%d head=%d tail=%d",
-				lsn, b.base, b.head, b.tail.Load())
+				lsn, b.base.Load(), b.head.Load(), b.tail.Load())
 		}
 	}
 }

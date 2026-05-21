@@ -18,14 +18,34 @@ import (
 // matches the buffer's logical head so a flushUpTo can compute "how
 // much do I need to drain" by `targetLSN - drainedLSN`.
 //
-// All methods run on the writer goroutine — no locking. The
-// walsender-side MemRing (M0010-0002) is a separate, concurrent
+// Concurrency model (post slice B, M0107-0007):
+//
+//   Writer (drain/state-loop goroutine): calls reset, append, readForDrain,
+//   advanceHead — sole modifier of head and base.
+//
+//   Stripe writers (concurrent tryAppend goroutines under appendMu.RLock):
+//   call writeReserved (disjoint LSN ranges) and publishTail — read head/base
+//   for range checks.
+//
+//   head and base are atomic.Int64 so stripe writers' reads are race-free
+//   against the drain goroutine's stores. tail was upgraded in
+//   [[0107-0007r]]; head/base upgraded in [[0107-0007ai]].
+//
+// The walsender-side MemRing (M0010-0002) is a separate, concurrent
 // data structure that mirrors every successful append.
 type walBuffer struct {
 	cap  int64        // fixed at construction; equals Config.WALBuffers
 	buf  []byte       // ring backing storage; len == cap
-	base int64        // LSN that buf[0] currently represents (in bytes)
-	head int64        // first un-drained byte LSN; head ≥ base
+	base atomic.Int64 // LSN that buf[0] currently represents (in bytes).
+	// Atomic so concurrent stripe writers' writeReserved range checks and
+	// ring-offset arithmetic can read it race-free while the state-loop
+	// drain goroutine slides it forward under advanceHead. Only advanceHead
+	// writes base (single writer: the drain/state-loop goroutine).
+	// See docs/design/0107-0007ai-wal-buffer-head-base-atomic-async-drain.md.
+	head atomic.Int64 // first un-drained byte LSN; head ≥ base. Atomic so
+	// concurrent tryAppend goroutines' free() / resident() reads are
+	// race-free while the state-loop drain goroutine advances it.
+	// Only advanceHead writes head (single writer). See design doc above.
 	tail atomic.Int64 // first unwritten byte LSN; tail ≥ head. Atomic so a
 	// single drain goroutine's publishTail can advance the watermark while
 	// concurrent stripe writers' readers (resident / readForDrain / readAt)
@@ -46,14 +66,14 @@ func newWALBuffer(cap int64) *walBuffer {
 // startup when detectWritePos discovers we're restarting partway
 // through a segment — the buffer is empty, head=tail=base=startLSN.
 func (b *walBuffer) reset(startLSN int64) {
-	b.base = startLSN
-	b.head = startLSN
+	b.base.Store(startLSN)
+	b.head.Store(startLSN)
 	b.tail.Store(startLSN)
 }
 
 // resident returns the number of bytes currently held in the
 // buffer (waiting to be drained to segments).
-func (b *walBuffer) resident() int64 { return b.tail.Load() - b.head }
+func (b *walBuffer) resident() int64 { return b.tail.Load() - b.head.Load() }
 
 // free returns the number of bytes that could be appended
 // without forcing a drain.
@@ -69,7 +89,7 @@ func (b *walBuffer) canHold(n int) bool { return int64(n) <= b.cap }
 // byte-wise.
 func (b *walBuffer) append(record []byte) {
 	tail := b.tail.Load()
-	off := (tail - b.base) % b.cap
+	off := (tail - b.base.Load()) % b.cap
 	n := int64(len(record))
 	first := b.cap - off
 	if first >= n {
@@ -93,10 +113,13 @@ func (b *walBuffer) readForDrain(n int64) (a, c []byte) {
 	if n <= 0 {
 		return nil, nil
 	}
-	if n > b.resident() {
-		n = b.resident()
+	head := b.head.Load()
+	resident := b.tail.Load() - head
+	if n > resident {
+		n = resident
 	}
-	off := (b.head - b.base) % b.cap
+	base := b.base.Load()
+	off := (head - base) % b.cap
 	first := b.cap - off
 	if first >= n {
 		return b.buf[off : off+n], nil
@@ -109,21 +132,24 @@ func (b *walBuffer) readForDrain(n int64) (a, c []byte) {
 // head crosses a buffer-cap boundary, slides base forward so the
 // modulo arithmetic stays well-defined.
 func (b *walBuffer) advanceHead(n int64) {
-	b.head += n
-	// Slide base forward by full-cap multiples so head ∈
-	// [base, base+cap]. Avoids unbounded modulo growth on
-	// long-running writers.
-	if b.head-b.base >= b.cap {
-		k := (b.head - b.base) / b.cap
-		b.base += k * b.cap
+	newHead := b.head.Load() + n
+	// Slide base forward by full-cap multiples so head ∈ [base, base+cap].
+	// Update base BEFORE head so concurrent readers that observe the new base
+	// but the old head see a valid (conservative) free() estimate rather than
+	// an out-of-range writeReserved failure.
+	base := b.base.Load()
+	if newHead-base >= b.cap {
+		k := (newHead - base) / b.cap
+		b.base.Store(base + k*b.cap)
 	}
+	b.head.Store(newHead)
 }
 
 // readAt copies up to len(out) bytes starting at absolute byte position pos
 // from the resident [head, tail) range and returns the number of bytes copied.
 // Caller is responsible for synchronization.
 func (b *walBuffer) readAt(pos int64, out []byte) int {
-	if b == nil || len(out) == 0 || pos < b.head {
+	if b == nil || len(out) == 0 || pos < b.head.Load() {
 		return 0
 	}
 	tail := b.tail.Load()
@@ -134,7 +160,8 @@ func (b *walBuffer) readAt(pos int64, out []byte) int {
 	if avail > len(out) {
 		avail = len(out)
 	}
-	off := (pos - b.base) % b.cap
+	base := b.base.Load()
+	off := (pos - base) % b.cap
 	first := b.cap - off
 	if first >= int64(avail) {
 		copy(out[:avail], b.buf[off:off+int64(avail)])
@@ -205,10 +232,11 @@ func (b *walBuffer) writeReserved(lsn int64, record []byte) error {
 		return nil
 	}
 	n := int64(len(record))
-	if lsn < b.base || lsn+n > b.base+b.cap {
+	base := b.base.Load()
+	if lsn < base || lsn+n > base+b.cap {
 		return errWALBufferReservedOutOfRange
 	}
-	off := (lsn - b.base) % b.cap
+	off := (lsn - base) % b.cap
 	first := b.cap - off
 	if first >= n {
 		copy(b.buf[off:off+n], record)

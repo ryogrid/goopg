@@ -23,8 +23,8 @@ func TestWALBufferPublishTailAdvancesFromBase(t *testing.T) {
 	if b.tail.Load() != 140 {
 		t.Fatalf("b.tail = %d, want 140", b.tail.Load())
 	}
-	if b.head != 100 || b.base != 100 {
-		t.Fatalf("head/base mutated: head=%d base=%d, want both 100", b.head, b.base)
+	if b.head.Load() != 100 || b.base.Load() != 100 {
+		t.Fatalf("head/base mutated: head=%d base=%d, want both 100", b.head.Load(), b.base.Load())
 	}
 }
 
@@ -60,8 +60,8 @@ func TestWALBufferPublishTailEqualIsNoop(t *testing.T) {
 	if got != 50 {
 		t.Fatalf("equal publishTail return = %d, want 50", got)
 	}
-	if b.tail.Load() != 50 || b.head != 0 || b.base != 0 {
-		t.Fatalf("state changed under equal publish: tail=%d head=%d base=%d", b.tail.Load(), b.head, b.base)
+	if b.tail.Load() != 50 || b.head.Load() != 0 || b.base.Load() != 0 {
+		t.Fatalf("state changed under equal publish: tail=%d head=%d base=%d", b.tail.Load(), b.head.Load(), b.base.Load())
 	}
 }
 
@@ -76,8 +76,8 @@ func TestWALBufferPublishTailDoesNotMutateHeadBase(t *testing.T) {
 
 	for _, v := range []int64{1010, 1050, 1100, 1200, 1255} {
 		b.publishTail(v)
-		if b.head != 1000 || b.base != 1000 {
-			t.Fatalf("publishTail(%d) mutated head=%d base=%d", v, b.head, b.base)
+		if b.head.Load() != 1000 || b.base.Load() != 1000 {
+			t.Fatalf("publishTail(%d) mutated head=%d base=%d", v, b.head.Load(), b.base.Load())
 		}
 	}
 	if b.tail.Load() != 1255 {
@@ -200,8 +200,8 @@ func TestWALBufferPublishTailComposesWithAdvanceHead(t *testing.T) {
 	if got := b.resident(); got != 0 {
 		t.Fatalf("resident after drain = %d, want 0", got)
 	}
-	if b.head != 40 || b.tail.Load() != 40 {
-		t.Fatalf("head/tail after drain: head=%d tail=%d, want 40/40", b.head, b.tail.Load())
+	if b.head.Load() != 40 || b.tail.Load() != 40 {
+		t.Fatalf("head/tail after drain: head=%d tail=%d, want 40/40", b.head.Load(), b.tail.Load())
 	}
 
 	// Another write+publish cycle confirms publishTail extends tail
@@ -213,8 +213,8 @@ func TestWALBufferPublishTailComposesWithAdvanceHead(t *testing.T) {
 	if got != 80 {
 		t.Fatalf("publishTail second return = %d, want 80", got)
 	}
-	if b.tail.Load() != 80 || b.head != 40 {
-		t.Fatalf("after second publish: tail=%d head=%d, want 80/40", b.tail.Load(), b.head)
+	if b.tail.Load() != 80 || b.head.Load() != 40 {
+		t.Fatalf("after second publish: tail=%d head=%d, want 80/40", b.tail.Load(), b.head.Load())
 	}
 	if got := b.resident(); got != 40 {
 		t.Fatalf("resident after second publish = %d, want 40", got)
@@ -237,8 +237,8 @@ func TestWALBufferPublishTailDoesNotEvictPendingWrites(t *testing.T) {
 	b.reset(0)
 
 	b.publishTail(96) // 96 > cap=64 — contract violation by caller
-	if b.head != 0 {
-		t.Fatalf("publishTail evicted head: head=%d, want 0 (no auto-eviction)", b.head)
+	if b.head.Load() != 0 {
+		t.Fatalf("publishTail evicted head: head=%d, want 0 (no auto-eviction)", b.head.Load())
 	}
 	if b.tail.Load() != 96 {
 		t.Fatalf("publishTail did not advance tail: tail=%d, want 96", b.tail.Load())

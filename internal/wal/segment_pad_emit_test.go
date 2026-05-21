@@ -21,8 +21,8 @@ func TestEmitSegmentPadWritesIntoBothRings(t *testing.T) {
 	walBuf := newWALBuffer(1024)
 	walBuf.reset(int64(gapStart))
 	priorTail := walBuf.tail.Load()
-	priorHead := walBuf.head
-	priorBase := walBuf.base
+	priorHead := walBuf.head.Load()
+	priorBase := walBuf.base.Load()
 
 	memRing := NewMemRing(1024)
 
@@ -33,11 +33,11 @@ func TestEmitSegmentPadWritesIntoBothRings(t *testing.T) {
 	if got := walBuf.tail.Load(); got != priorTail {
 		t.Fatalf("walBuf.tail moved from %d → %d", priorTail, got)
 	}
-	if walBuf.head != priorHead {
-		t.Fatalf("walBuf.head moved from %d → %d", priorHead, walBuf.head)
+	if walBuf.head.Load() != priorHead {
+		t.Fatalf("walBuf.head moved from %d → %d", priorHead, walBuf.head.Load())
 	}
-	if walBuf.base != priorBase {
-		t.Fatalf("walBuf.base moved from %d → %d", priorBase, walBuf.base)
+	if walBuf.base.Load() != priorBase {
+		t.Fatalf("walBuf.base moved from %d → %d", priorBase, walBuf.base.Load())
 	}
 
 	walBuf.tail.Store(int64(boundary))
