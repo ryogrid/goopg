@@ -86,9 +86,11 @@ func TestStripeAppendBuiltEmittedHappyPathReceivesPrevAndTotal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stripeAppendBuiltEmitted #2: %v", err)
 	}
-	if start2 != uint64(total1) || prev2 != start1 {
+	// prev2 = record-CONTENT start of #1 = start1 + leading1 (SizeOfXLogLongPHD,
+	// because #1 lands at 0 which is segment-aligned).
+	if start2 != uint64(total1) || prev2 != start1+uint64(SizeOfXLogLongPHD) {
 		t.Fatalf("reservation #2: start=%d prev=%d, want %d/%d",
-			start2, prev2, total1, start1)
+			start2, prev2, total1, start1+uint64(SizeOfXLogLongPHD))
 	}
 	if leading2 != 0 || total2 != recordLen2 {
 		t.Fatalf("size #2: total=%d leading=%d, want %d/0", total2, leading2, recordLen2)
@@ -112,8 +114,9 @@ func TestStripeAppendBuiltEmittedHappyPathReceivesPrevAndTotal(t *testing.T) {
 		t.Fatalf("walBuf.readAt: n=%d want=%d", n, total2)
 	}
 	gotStamped := binary.LittleEndian.Uint64(out[leading2 : leading2+8])
-	if gotStamped != start1 {
-		t.Fatalf("record #2 xl_prev=%d, want %d", gotStamped, start1)
+	wantXLPrev := start1 + uint64(SizeOfXLogLongPHD) // content start of #1
+	if gotStamped != wantXLPrev {
+		t.Fatalf("record #2 xl_prev=%d, want %d (content start of #1)", gotStamped, wantXLPrev)
 	}
 }
 

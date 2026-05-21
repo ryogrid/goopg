@@ -154,7 +154,7 @@ func (t *insertPosTracker) reserveEmittedAndPublish(
 	start = startCandidate
 	prev = t.prev
 	t.curr = start + uint64(total)
-	t.prev = start
+	t.prev = start + uint64(leading) // record-CONTENT start: skip leading PHD bytes
 
 	tracker.setInsertingAt(stripe, int64(start))
 

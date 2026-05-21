@@ -76,11 +76,13 @@ func TestAppendXLogPayloadTwoRecordsFormChain(t *testing.T) {
 		t.Fatalf("start2=%d, want total1=%d (contiguous reservation)",
 			start2, total1)
 	}
-	// xl_prev linkage: #2's prev field must equal #1's start (the
-	// post-reservation prev returned by reserveEmittedAndPublish is
-	// the prior record's start).
-	if prev2 != start1 {
-		t.Fatalf("prev2=%d, want start1=%d (xl_prev chain)", prev2, start1)
+	// xl_prev linkage: #2's prev field must equal #1's record-CONTENT start
+	// (reserveEmittedAndPublish now stores t.prev = start + leading so the
+	// chain points at the XLogRecord header, not the preceding page header).
+	// #1 lands at start1=0 (segment-aligned) with leading=SizeOfXLogLongPHD.
+	if prev2 != start1+uint64(SizeOfXLogLongPHD) {
+		t.Fatalf("prev2=%d, want start1+SizeOfXLogLongPHD=%d (xl_prev content start)",
+			prev2, start1+uint64(SizeOfXLogLongPHD))
 	}
 	// Mid-page second reservation gets no leading PHD.
 	if leading2 != 0 {

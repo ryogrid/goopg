@@ -52,71 +52,26 @@ import (
 // large-payload cases below.
 //
 // ============================================================
-// DISCOVERY — DEFERRED GATE (t.Skip, awaiting design resolution)
+// PARITY GATE (resolved in foundation 23 follow-up)
 // ============================================================
 //
-// Running the parity tests below against the current implementation
-// surfaces a real prev-RecPtr convention divergence between the two
-// paths:
+// The prev-RecPtr convention divergence discovered during foundation 23
+// has been resolved by changing reserveEmittedAndPublish to store
+// `t.prev = start + uint64(leading)` (record-CONTENT start) instead of
+// `t.prev = start` (reservation start). Both paths now agree on the
+// xl_prev convention:
 //
-//   - state.append (legacy): after emitting a record at writePos with
-//     leading-PHD = L, sets `s.prevRecPtr = (writePos + L + 1) - 1 =
-//     writePos + L`. The stored value is the 0-based RecPtr / LSN of
-//     THIS record's CONTENT start (after any leading page header) —
-//     matching PG's xl_prev semantics ("LSN of previous record's
-//     header start", where 'header start' is the XLogRecord header
-//     immediately after any page header). This is what
-//     `encodeRecordXLog(payload, s.prevRecPtr)` stamps into the next
-//     record's `xl_prev` field, and what pg_waldump expects.
+//   - legacy state.append: s.prevRecPtr = writePos + leading (content start)
+//   - core reserveEmittedAndPublish: t.prev = start + leading (content start)
 //
-//   - core path (insertPosTracker.reserveLocked /
-//     reserveEmittedAndPublish): sets `t.prev = start` where `start`
-//     is the RESERVATION start (== the page header byte if one
-//     precedes the record). The post-reservation `prev` returned to
-//     the build closure is therefore OFF BY `leading` bytes whenever
-//     the previous reservation carried a leading PHD. The on-wire
-//     xl_prev stamped by the build closure differs from the legacy
-//     path's, and a pg_waldump reader walking the chain will land on
-//     a page-header byte instead of an XLogRecord header.
+// The three multi-record parity tests are now active (t.Skip removed).
+// The first-record test (prev=0 on both sides) remains the always-on
+// single-record regression guard.
 //
-// Concretely, for two records back-to-back at segment 0 (long PHD at
-// offset 0):
-//
-//                     legacy state.append          core foundation 22
-//   record 1 start    LSN 40 (after long PHD)      LSN 0  (reservation)
-//   record 2 xl_prev  40 (record 1's content)      0  (record 1's reservation)
-//
-// Foundation 22's design doc (`docs/design/0107-0007ae-wal-append-xlog-
-// payload.md` §"PG-compat contract") claims "byte-identical to today's
-// `state.append` PG-compat path"; this parity gate empirically falsifies
-// that claim for multi-record chains where any previous reservation
-// crossed a page or segment boundary.
-//
-// Resolution path. Either (a) insertPosTracker stores `t.prev` in
-// record-CONTENT space (i.e., `t.prev = start + leading` inside
-// reserveEmittedAndPublish, with parallel translation in reserveLocked
-// for any future PG-compat consumer of the size-explicit primitive),
-// or (b) the build closure translates `prev` (reservation start) into
-// the RecPtr-after-PHD value before passing to encodeRecordXLog. (a)
-// is cleaner because the translation only depends on data already in
-// scope under posMu (the predictEmittedSize-returned `leading`); (b)
-// would require the closure to recompute / consult the leading-PHD
-// schedule a second time.
-//
-// Until that resolution lands, the parity tests below are kept in the
-// codebase as t.Skip-with-explanation so future loops on the call-site
-// rewrite cannot miss the gap. Removing t.Skip is the gate the
-// resolution must pass to declare the slice B call-site rewrite ready
-// for PG-compat traffic.
-//
-// PG-compat — none (test only; no on-the-wire change). Design:
+// PG-compat — none (test only). Design:
 // docs/design/0107-0007af-wal-append-parity-gate.md.
 
-const parityDeferredReason = "" +
-	"Parity vs state.append's PG-compat path is currently broken by " +
-	"insertPosTracker's prev-RecPtr convention (tracks reservation " +
-	"start, not record-content start). Fix is in slice B call-site " +
-	"rewrite scope. See `docs/design/0107-0007af-wal-append-parity-gate.md`."
+
 
 // emitLegacyPGCompatRecord replays the exact sequence state.append's
 // PG-compat Path B runs after acquiring appendMu (writer.go lines
@@ -143,7 +98,6 @@ func emitLegacyPGCompatRecord(walBuf *walBuffer, payload []byte, prev uint64, wr
 }
 
 func TestAppendXLogPayloadParityWithLegacyEncodeEmit(t *testing.T) {
-	t.Skip(parityDeferredReason)
 	t.Parallel()
 	// 1 MiB segment so no payload below crosses a segment boundary;
 	// the 4-page boundary-crossing payload exercises the in-segment
@@ -192,11 +146,13 @@ func TestAppendXLogPayloadParityWithLegacyEncodeEmit(t *testing.T) {
 	coreStarts := make([]uint64, 0, len(payloads))
 	corePrevs := make([]uint64, 0, len(payloads))
 	for i, p := range payloads {
-		start, prev, _, _, err := c.AppendXLogPayload(int32(i%appendLockStripes), p, segSize, sysID, tli)
+		start, prev, _, leading, err := c.AppendXLogPayload(int32(i%appendLockStripes), p, segSize, sysID, tli)
 		if err != nil {
 			t.Fatalf("core AppendXLogPayload #%d (payload len %d): %v", i, len(p), err)
 		}
-		coreStarts = append(coreStarts, start)
+		// Store content start (start + leading) to match legacy emitLegacyPGCompatRecord's
+		// return value (writePos + leading). Both paths yield the XLogRecord header address.
+		coreStarts = append(coreStarts, start+uint64(leading))
 		corePrevs = append(corePrevs, prev)
 	}
 	// Publish so walBuf.readAt is permitted to surface every reserved
@@ -262,7 +218,6 @@ func TestAppendXLogPayloadParityWithLegacyEncodeEmit(t *testing.T) {
 // and isolates parity failures caused by anything other than stripe
 // distribution.
 func TestAppendXLogPayloadParityShortRecordsSingleStripe(t *testing.T) {
-	t.Skip(parityDeferredReason)
 	t.Parallel()
 	const segSize = int64(1 << 20)
 	const sysID = uint64(0x12345)
@@ -309,7 +264,6 @@ func TestAppendXLogPayloadParityShortRecordsSingleStripe(t *testing.T) {
 // smallest legitimate PG-compat record. Both paths must emit the
 // same 32-byte body-less record sequence.
 func TestAppendXLogPayloadParityEmptyBodyRecords(t *testing.T) {
-	t.Skip(parityDeferredReason)
 	t.Parallel()
 	const segSize = int64(1 << 20)
 	const sysID = uint64(7)

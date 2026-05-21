@@ -146,9 +146,10 @@ func TestReserveEmittedAndPublishCrossSegmentEmitsPadAndRePredicts(t *testing.T)
 			total, SizeOfXLogLongPHD+recordLen)
 	}
 	gotCurr, gotPrev := pos.load()
-	if gotCurr != expectedBoundary+uint64(total) || gotPrev != expectedBoundary {
+	wantStoredPrev := expectedBoundary + uint64(SizeOfXLogLongPHD) // content start of the triggering record
+	if gotCurr != expectedBoundary+uint64(total) || gotPrev != wantStoredPrev {
 		t.Fatalf("post-cross load: got (curr=%d, prev=%d), want (%d, %d)",
-			gotCurr, gotPrev, expectedBoundary+uint64(total), expectedBoundary)
+			gotCurr, gotPrev, expectedBoundary+uint64(total), wantStoredPrev)
 	}
 	if got := tr.insertingAt(1); got != int64(expectedBoundary) {
 		t.Fatalf("stripe 1 insertingAt = %d, want %d (post-boundary start)",
