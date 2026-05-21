@@ -5111,6 +5111,89 @@ Operational policy (2026-05-20):
         primary — so that path will continue to consume the
         size-explicit [[0107-0007p]] `reserveAndPublish` /
         [[0107-0007u]] `stripeAppend` instead.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 21 of N —
+        `predictXLogRecordLen` pure encodeRecordXLog size mirror): added
+        `predictXLogRecordLen(payload []byte) (realRecLen, paddedLen int)`
+        to new file `internal/wal/predict_xlog_record_len.go`. Pure mirror
+        of `wrapXLogMainData` + `encodeRecordXLog`'s byte arithmetic that
+        returns the un-padded `XLogRecord.TotLen` value plus the
+        MAXALIGN-padded length `encodeRecordXLog` actually allocates,
+        without producing any bytes. Closes the call-site-rewrite gap:
+        [[0107-0007ab]] `core.AppendBuiltEmitted(procNum, recordLen,
+        build)` consumes `recordLen` BEFORE the build closure runs (the
+        reservation under posMu computes total/leading from this argument
+        via [[0107-0007aa]] `reserveEmittedAndPublish`), and `recordLen`
+        MUST equal `len(encodeRecordXLog(payload, prev))`. Two prior
+        approaches fail: (a) encode-then-reserve costs a throwaway encode
+        with prev=0 outside the closure plus a real encode inside with
+        the assigned prev — 2× allocation tax on the hot path; (b)
+        stash-and-patch requires recomputing the CRC after patching
+        `xl_prev` post-encode, defeating the helper's point. Predict-
+        then-reserve is the only zero-cost path. Pairing:
+            realRecLen, paddedLen := predictXLogRecordLen(payload)
+            core.AppendBuiltEmitted(procNum, paddedLen,
+                func(start, prev uint64, total, leading int) ([]byte, error) {
+                    record, _, err := encodeRecordXLog(payload, prev)
+                    if err != nil { return nil, err }
+                    out, _ := emitWithPageHeaders(record, realRecLen,
+                        int64(start), s.cfg.SegmentSize, s.sysID, s.tli)
+                    return out, nil
+                })
+        Branches mirror `wrapXLogMainData` exactly: M0106-0010 canonical
+        envelope (0xFE + ≥ 7 bytes → wrappedLen = len-7), short wrap
+        (≤ 0xFF → wrappedLen = 2+len), long wrap (> 0xFF → wrappedLen
+        = 5+len). Nil payload returns (0, 0) defensively — the slice B
+        caller catches the zero-size reservation as a structured
+        `errStripeAppendEmptyRecord` from `AppendBuiltEmitted` rather
+        than producing one. Six regression tests in
+        `internal/wal/predict_xlog_record_len_test.go`:
+        `TestPredictXLogRecordLenMatchesEncodeRecordXLog` keystone runs
+        a 12-case payload matrix (empty, odd lengths exercising MAXALIGN,
+        0xFF/0x100 short→long switchover, canonical envelope branches)
+        and asserts byte-for-byte agreement with the actual encoder —
+        the two share zero implementation surface so agreement detects
+        drift in either direction;
+        `TestPredictXLogRecordLenPaddedIsMaxAlignOfReal` pins `paddedLen
+        == maxAlignXLog(realRecLen)` for all sizes 0..64 so future
+        alignment-rule changes ripple atomically;
+        `TestPredictXLogRecordLenCanonicalShortCircuitsFirstByte` pins
+        the three-way branch dispatch including the too-short-for-
+        canonical (len < 7) fall-through to short-wrap;
+        `TestPredictXLogRecordLenShortLongBoundary` explicit 0xFF vs
+        0x100 case pinning the 4-byte delta between short-wrap (2-byte
+        header) and long-wrap (5-byte header);
+        `TestPredictXLogRecordLenNilPayloadReturnsZero` defensive
+        short-circuit; `TestPredictXLogRecordLenIsPureNoSideEffects`
+        pins no mutation of the payload arg (the slice B call site
+        holds the payload across the reservation→build closure
+        boundary). Verified: `go test -race -count=1 -run
+        'TestPredictXLogRecordLen' ./internal/wal/` PASS (1.02 s);
+        `go test -race -count=1 ./internal/wal/` PASS (4.12 s);
+        `go vet ./internal/wal/` clean. Design:
+        `docs/design/0107-0007ad-wal-predict-xlog-record-len.md`
+        (indexed in `docs/design/README.md`). PG-compat — none (pure
+        size-prediction mirror; produces no bytes, does not interact
+        with on-disk WAL record format / file format / catalog /
+        wire). Dead code until the slice B call-site rewrite consumes
+        it; foundation-first pattern matches slice C ([[0107-0007b]] /
+        [[0107-0007c]] / [[0107-0007d]] before [[0107-0007e]] /
+        [[0107-0007f]] / [[0107-0007g]]) and the twenty earlier slice
+        B foundations ([[0107-0007i]] through [[0107-0007ac]] minus the
+        dead-code-removed [[0107-0007h]]). Out of scope (deferred to
+        call-site rewrite parts 2/3): mounting at the
+        `state.append` / `state.tryAppend` / `state.appendBatch`
+        PG-compat write entry points (multi-loop because
+        `state.appendMu`'s four invariants — writePos / walBuf /
+        memRing / writeLSN — split into per-stripe local state vs.
+        shared state); mounting `core.PublishUpTo` in the drain
+        goroutine's prelude (`drainBufferBytes` currently runs under
+        `appendMu` — rewrite must let drain run concurrently with
+        stripe writes by consuming the publisher's return as drain
+        ceiling); walreceiver replay (`appendRaw`) does not use
+        page-header insertion — bytes arrive pre-encoded from the
+        primary — so that path will continue to consume the
+        size-explicit [[0107-0007p]] `reserveAndPublish` /
+        [[0107-0007u]] `stripeAppend` instead.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
