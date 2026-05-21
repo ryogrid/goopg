@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/goopg/goopg/internal/runtimeshim"
 	"github.com/goopg/goopg/internal/stats"
 )
 
@@ -39,12 +40,6 @@ func stateGen(st uint64) uint32    { return uint32((st & slotGenMask) >> slotGen
 func stateValid(st uint64) bool    { return st&slotValidBit != 0 }
 func stateDirty(st uint64) bool    { return st&slotDirtyBit != 0 }
 func stateIO(st uint64) bool       { return st&slotIOBit != 0 }
-
-// slotIOCond is a per-slot condition variable for waiting on ioInflight.
-type slotIOCond struct {
-	mu   sync.Mutex
-	cond *sync.Cond
-}
 
 // Slot is one buffer-pool entry holding one Page. Callers receive
 // *Slot from Pin and return it via Unpin. Direct field access is
@@ -170,9 +165,16 @@ type Pool struct {
 	// tombstones counts tombstone entries in bm; used to trigger compaction.
 	tombstones atomic.Int64
 
-	// pinCond is the condition variable for waiting on IO-in-progress.
-	// Signalled whenever any slot transitions out of ioInflight.
-	pinCond *sync.Cond
+	// slotSema is a parallel []uint32 array (len == len(slots)) used as
+	// per-slot runtime semaphores for IO-in-progress waits.
+	// A goroutine waiting for slot i's IO calls runtimeshim.SemaAcquire(&slotSema[i]).
+	// The loader releases slotWaiters[i] times when IO completes.
+	slotSema []uint32
+
+	// slotWaiters tracks the number of goroutines currently waiting on
+	// each slot's IO via SemaAcquire. Written under pinMu so the loader
+	// can read an exact count before releasing the sema.
+	slotWaiters []atomic.Int32
 
 	// OnPinWait is called when Pool.Pin issues a disk read.
 	OnPinWait func()
@@ -327,8 +329,9 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logChangeRecord:          cfg.LogChangeRecord,
 		logger:                   logger,
 		bm:                       newBufmap(cfg.Slots),
+		slotSema:                 make([]uint32, cfg.Slots),
+		slotWaiters:              make([]atomic.Int32, cfg.Slots),
 	}
-	p.pinCond = sync.NewCond(&p.pinMu)
 	p.fullPageWrites.Store(cfg.FullPageWrites)
 	// Initialise per-slot page pointers.
 	for i := range p.slots {
@@ -546,11 +549,14 @@ func (p *Pool) tryPinSlot(slotIdx int32, gen uint32) *Slot {
 
 // releaseVictimSlot returns a victim slot back to the free pool when we
 // decide not to use it (e.g., because we found the tag already published
-// by another goroutine). Called with pinMu held. Signals pinCond.
-// MUST be called with pinMu held.
+// by another goroutine). MUST be called with pinMu held.
+// Wakes any goroutines waiting on this slot's IO via per-slot semaphore.
 func (p *Pool) releaseVictimSlot(victimIdx int) {
+	n := p.slotWaiters[victimIdx].Load()
 	p.slots[victimIdx].state.Store(0)
-	p.pinCond.Broadcast()
+	for i := int32(0); i < n; i++ {
+		runtimeshim.SemaRelease(&p.slotSema[victimIdx])
+	}
 }
 
 // claimVictim finds a victim slot using clock-sweep and atomically sets
@@ -695,7 +701,6 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 			if existing := p.tryPinSlot(existingIdx, existingGen); existing != nil {
 				s.tag = BufferTag{}
 				s.state.Store(0)
-				p.pinCond.Broadcast()
 				p.pinMu.Unlock()
 				return existing, blk, nil
 			}
@@ -703,7 +708,6 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 		// Fall through: keep our publication.
 	}
 
-	p.pinCond.Broadcast()
 	p.pinMu.Unlock()
 	return s, blk, nil
 }
@@ -752,7 +756,7 @@ func (p *Pool) ExtendRelationBatch(rel RelFileNode, n int) (BlockNumber, error) 
 //
 // BM_IO_IN_PROGRESS: when multiple goroutines miss the cache for the same
 // tag simultaneously, only one issues a disk read (the winner). The others
-// wait on pinCond under pinMu until the IO completes, then find the slot valid.
+// wait via per-slot semaphore until the IO completes, then find the slot valid.
 //
 // Fast path (cache hit): lock-free Lookup + CAS, no mutex.
 // Slow path (cache miss / IO wait): acquires pinMu.
@@ -807,12 +811,17 @@ func (p *Pool) pinSlow(tag BufferTag) (*Slot, error) {
 			old := s.state.Load()
 
 			if stateIO(old) {
-				// IO in flight: wait for it to complete.
+				// IO in flight: wait for it to complete via per-slot semaphore.
+				// Increment waiter count under pinMu so the loader sees us.
+				p.slotWaiters[slotIdx].Add(1)
+				p.pinMu.Unlock()
 				if p.OnBufferIOWait != nil {
 					p.OnBufferIOWait()
 				}
-				p.pinCond.Wait() // releases pinMu, sleeps, re-acquires
-				continue         // re-check after wakeup
+				runtimeshim.SemaAcquire(&p.slotSema[slotIdx])
+				p.slotWaiters[slotIdx].Add(-1)
+				p.pinMu.Lock()
+				continue // re-check after wakeup
 			}
 
 			if stateValid(old) && stateGen(old) == gen {
@@ -885,14 +894,18 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 		p.bm.Delete(tag, int32(victimIdx))
 		p.tombstones.Add(1)
 		s.tag = BufferTag{}
-		p.releaseVictimSlot(victimIdx) // also broadcasts
+		p.releaseVictimSlot(victimIdx) // also wakes per-slot sema waiters
 		return nil, ioErr
 	}
 
-	// Transition to valid+pinned. Under pinMu nobody else can modify this slot.
+	// Transition to valid+pinned. Read waiter count under pinMu before
+	// clearing ioInflight so no new waiters can arrive between read and wake.
+	n := p.slotWaiters[victimIdx].Load()
 	newSt := slotValidBit | uint64(1) | (uint64(1) << slotUsageShift) | (uint64(gen) << slotGenShift)
 	s.state.Store(newSt)
-	p.pinCond.Broadcast() // wake goroutines waiting on this IO
+	for i := int32(0); i < n; i++ {
+		runtimeshim.SemaRelease(&p.slotSema[victimIdx])
+	}
 	return s, nil
 }
 

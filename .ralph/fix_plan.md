@@ -5590,7 +5590,7 @@ Operational policy (2026-05-20):
           - `TestE2E_FailoverGoopgToPG/async` PASS.
           - `make ralph-state-guard` PASS.
 
- - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
+ - [x] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
         `//go:linkname` access to (a) `runtime.nanotime()` (~5 ns vs
         `time.Now()` ~50 ns; used at ~30 K/s by D2's WaitEvent*); (b) per-P
@@ -6291,6 +6291,27 @@ Operational policy (2026-05-20):
         per-slot Sema wait caller, still correctly held until
         M0107-0006 (lock-free bufpool) lands the per-slot wait
         coordination site it consumes.
+      - COMPLETE 2026-05-21 (loop 17): bufpool per-slot Sema wait caller landed.
+        Replaces pool-wide `pinCond *sync.Cond` (thundering-herd Broadcast)
+        with `slotSema []uint32` + `slotWaiters []atomic.Int32` parallel
+        arrays (len = cfg.Slots). Protocol: waiter increments `slotWaiters[i]`
+        under pinMu, releases pinMu, calls `runtimeshim.SemaAcquire(&slotSema[i])`,
+        decrements on wake. Loader (pinLoad success + releaseVictimSlot error
+        path) reads exact count under pinMu before clearing `ioInflightBit`,
+        then releases sema exactly N times — no thundering herd, no cross-slot
+        wakeups. `slotIOCond` struct, `pinCond` field, and all `pinCond.Broadcast()`
+        call sites removed. M0107-0008 is now feature-complete: all three
+        runtimeshim primitives (Nanotime via [[0107-0008e]], PinP via
+        [[0107-0008f]], SemaAcquire via [[0107-0008q]]) are wired to their
+        production callers (ActivityRegistry, stats.Counter, Pool per-slot IO
+        wait). Regression pins: `TestSlotSemaArraysInitializedCorrectly`,
+        `TestSlotSemaConcurrentPinSameBlock` (8-goroutine deadlock gate),
+        `TestSlotSemaWaiterCountReturnsToZero`, `TestSlotSemaNoPinCondInPool`.
+        `go test -race -count=1 ./internal/storage/ ./internal/mvcc/
+        ./internal/wal/ ./internal/executor/ ./internal/server/
+        ./internal/access/btree/` all PASS. `make ralph-state-guard` PASS.
+        Design: `docs/design/0107-0008q-bufpool-slot-sema-wait.md`
+        (indexed in `docs/design/README.md`).
 
 ### Milestone-close gates (after all 8 sub-milestones)
 
