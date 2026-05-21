@@ -109,6 +109,11 @@ package wal
 //	          40 if at a segment boundary). Caller uses this to
 //	          drive the first chunk-header emit before the record
 //	          body.
+// xlogMinimumRecordSize is the smallest valid WAL record: SizeOfXLogRecord
+// (24 bytes) with no payload and no chunk header. A gap before a segment
+// boundary must be ≥ this value to fit a well-formed XLOG_NOOP pad record.
+const xlogMinimumRecordSize = SizeOfXLogRecord // 24 bytes
+
 func (t *insertPosTracker) reserveEmittedAndPublish(
 	recordLen int, stripe int, tracker *insertionTracker,
 ) (start, prev uint64, total, leading int) {
@@ -135,15 +140,27 @@ func (t *insertPosTracker) reserveEmittedAndPublish(
 	}
 
 	if startCandidate+uint64(total) > boundary {
-		// Cross-segment slow path: pad the gap [startCandidate, boundary)
-		// via the onCrossSegment hook (matches reserveLocked's semantics),
-		// then re-predict at boundary so the reservation lands with a
-		// boundary-correct header schedule.
+		gapLen := boundary - startCandidate
 		gapPrev := t.prev
-		if t.onCrossSegment != nil {
-			t.onCrossSegment(startCandidate, boundary, gapPrev)
+		if gapLen < xlogMinimumRecordSize {
+			// Gap is too small to fit a valid XLOG_NOOP record (minimum
+			// xlogMinimumRecordSize bytes). Skip the gap silently — those
+			// bytes remain zeroed in the pre-allocated segment file and WAL
+			// recovery treats them as end-of-segment. The xl_prev chain is
+			// preserved by keeping t.prev unchanged so the new record at
+			// boundary links directly to the last valid record before the gap.
+			// PG avoids this case via page-alignment invariants on record sizes;
+			// goopg handles it here as defence-in-depth.
+		} else {
+			// Normal cross-segment slow path: pad the gap [startCandidate, boundary)
+			// via the onCrossSegment hook (matches reserveLocked's semantics),
+			// then re-predict at boundary so the reservation lands with a
+			// boundary-correct header schedule.
+			if t.onCrossSegment != nil {
+				t.onCrossSegment(startCandidate, boundary, gapPrev)
+			}
+			t.prev = startCandidate
 		}
-		t.prev = startCandidate
 		startCandidate = boundary
 		total, leading = predictEmittedSize(recordLen, int64(startCandidate), int64(segSize))
 		if uint64(total) > segSize {

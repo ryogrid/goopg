@@ -145,12 +145,18 @@ func stripeAppendBuiltEmitted(
 		return start, prev, total, leading, errStripeAppendBuildSizeMismatch
 	}
 
+	end := int64(start) + int64(total)
 	if walBuf != nil {
 		if werr := walBuf.writeReserved(int64(start), out); werr != nil {
 			return start, prev, total, leading, werr
 		}
 	}
 	if memRing != nil {
+		// Advance the MemRing window to accommodate [start, end) before writing.
+		// Without this, once total WAL written exceeds ring capacity, PublishUpTo
+		// has already set head = tail - cap, leaving the window boundary at tail
+		// which excludes the next write's start LSN.
+		memRing.AdvanceWindow(end)
 		if merr := memRing.WriteReserved(int64(start), out); merr != nil {
 			return start, prev, total, leading, merr
 		}

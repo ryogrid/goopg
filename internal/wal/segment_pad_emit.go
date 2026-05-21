@@ -118,6 +118,8 @@ func emitSegmentPad(walBuf *walBuffer, memRing *MemRing, gapStart, boundary, gap
 		}
 	}
 	if memRing != nil {
+		// Advance ring window to accommodate the pad at [gapStart, boundary).
+		memRing.AdvanceWindow(int64(boundary))
 		if err := memRing.WriteReserved(int64(gapStart), pad); err != nil {
 			return err
 		}

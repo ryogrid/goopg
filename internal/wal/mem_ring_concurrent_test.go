@@ -390,3 +390,58 @@ func TestMemRingPublishUpToAndWriteReservedSerialise(t *testing.T) {
 		}
 	}
 }
+
+// TestMemRingAdvanceWindowMakesRoomForNextWrite verifies the fix for the
+// "WriteReserved range outside ring window" failure that occurred once total
+// WAL written exceeded ring capacity. After cap bytes of PublishUpTo calls,
+// head == tail - cap, leaving the window [tail-cap, tail). The next write at
+// pos = tail fails because pos >= head+cap. AdvanceWindow(pos+len) slides head
+// to max(head, pos+len-cap), making [pos+len-cap, pos+len) the new window, so
+// the write at pos succeeds.
+func TestMemRingAdvanceWindowMakesRoomForNextWrite(t *testing.T) {
+	t.Parallel()
+	const cap = 128
+	r := NewMemRing(cap)
+
+	// Fill the ring: write cap bytes in two chunks and publish.
+	data1 := make([]byte, cap/2)
+	data2 := make([]byte, cap/2)
+	r.WriteReserved(0, data1)
+	r.WriteReserved(int64(cap/2), data2)
+	r.PublishUpTo(int64(cap))
+	// Now head == 0, tail == cap (ring exactly full).
+
+	// WITHOUT AdvanceWindow, writing at pos=cap would fail (pos >= head+cap=cap).
+	if err := r.WriteReserved(int64(cap), make([]byte, 1)); err == nil {
+		t.Fatal("expected WriteReserved to fail before AdvanceWindow, but it succeeded")
+	}
+
+	// WITH AdvanceWindow(cap+1), head advances to 1, head+cap=cap+1 > cap.
+	r.AdvanceWindow(int64(cap) + 1)
+	if err := r.WriteReserved(int64(cap), make([]byte, 1)); err != nil {
+		t.Fatalf("WriteReserved after AdvanceWindow: %v", err)
+	}
+}
+
+// TestMemRingAdvanceWindowIsNilSafe ensures AdvanceWindow on nil receiver is a no-op.
+func TestMemRingAdvanceWindowIsNilSafe(t *testing.T) {
+	t.Parallel()
+	var r *MemRing
+	r.AdvanceWindow(1000) // must not panic
+}
+
+// TestMemRingAdvanceWindowDoesNotRollBackHead confirms that AdvanceWindow
+// with a value smaller than the current head+cap leaves head unchanged.
+func TestMemRingAdvanceWindowDoesNotRollBackHead(t *testing.T) {
+	t.Parallel()
+	const cap = 64
+	r := NewMemRing(cap)
+	r.AdvanceWindow(64)  // head → 0 (64-64=0); no change since 0 ≤ head=0
+	r.AdvanceWindow(128) // head → 64
+	r.AdvanceWindow(80)  // 80-64=16 < 64; no change
+	r.WriteReserved(64, make([]byte, 32))
+	// If head were rolled back to 16, pos+len=96 > 80=head+cap would fail.
+	if err := r.WriteReserved(64, make([]byte, 32)); err != nil {
+		t.Fatalf("WriteReserved after non-advancing AdvanceWindow: %v", err)
+	}
+}

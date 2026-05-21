@@ -217,11 +217,15 @@ func TestWALBufferWriteReservedDoesNotMutateTailHeadBase(t *testing.T) {
 	t.Parallel()
 	b := newWALBuffer(64)
 	b.reset(1000)
-	// Make tail and head non-equal so we can detect any spurious bump.
+	// Set tail and head to non-base values to verify writeReserved does not
+	// mutate them. head must not exceed base+cap (1064) so the valid write
+	// window [head, head+cap) starts inside the ring.
 	b.tail.Store(1010)
-	b.head.Store(1005)
+	b.head.Store(1005) // head > base: 5 bytes already drained
 	rec := []byte{1, 2, 3, 4, 5}
-	for lsn := int64(1000); lsn+int64(len(rec)) <= 1000+64; lsn += 7 {
+	// Write within [head, head+cap) = [1005, 1069) to avoid writing at
+	// positions before head (those have been drained and are no longer valid).
+	for lsn := int64(1005); lsn+int64(len(rec)) <= 1005+64; lsn += 7 {
 		if err := b.writeReserved(lsn, rec); err != nil {
 			t.Fatalf("writeReserved lsn=%d: %v", lsn, err)
 		}

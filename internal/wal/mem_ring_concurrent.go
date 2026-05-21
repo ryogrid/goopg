@@ -173,3 +173,26 @@ func (r *MemRing) PublishUpTo(safeTail int64) {
 		r.head = r.tail - r.cap
 	}
 }
+
+// AdvanceWindow slides the ring's readable window forward so that a
+// subsequent WriteReserved call ending at `upTo` will fit within
+// [head, head+cap).  Specifically it advances head to max(head, upTo-cap),
+// evicting old ring data that walsenders can no longer reach without a
+// disk fallback.
+//
+// Must be called BEFORE WriteReserved whenever a new stripe-B record is
+// about to be written.  Without it, the first write past the ring's initial
+// window (total WAL written > cap) fails: PublishUpTo(end) sets tail=end and
+// head=end-cap, leaving the window [end-cap, end) which excludes end itself
+// (strict less-than in WriteReserved), so writes at end always fail.
+func (r *MemRing) AdvanceWindow(upTo int64) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	needed := upTo - r.cap
+	if needed > r.head {
+		r.head = needed
+	}
+}

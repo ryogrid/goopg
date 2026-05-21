@@ -122,6 +122,41 @@ func TestWALBufferAdvanceHeadConcurrentWithFreeReads(t *testing.T) {
 	}
 }
 
+// TestWALBufferWriteReservedUsesHeadNotBaseForBounds verifies the fix for
+// "writeReserved range outside buffer window" that occurred after partial
+// drain: head advances (bytes drained to disk) but base lags behind until
+// head - base >= cap. Using base for the upper-bound check rejects valid
+// writes at [base+cap, head+cap). The fix uses head for the bounds check
+// so writes at [head, head+cap) are always accepted.
+func TestWALBufferWriteReservedUsesHeadNotBaseForBounds(t *testing.T) {
+	const cap = 64
+	b := newWALBuffer(cap)
+	b.reset(0)
+
+	// Write cap/2 bytes and publish tail.
+	b.append(make([]byte, cap/2))
+	// Drain cap/2 bytes — head advances to cap/2, base stays 0.
+	b.advanceHead(cap / 2)
+	// Confirm base did NOT slide (head - base < cap).
+	if b.base.Load() != 0 {
+		t.Fatalf("base unexpectedly slid to %d, want 0", b.base.Load())
+	}
+	if b.head.Load() != cap/2 {
+		t.Fatalf("head = %d, want %d", b.head.Load(), cap/2)
+	}
+
+	// Now: base=0, head=cap/2, cap=64. head+cap = cap/2+64.
+	// Write at lsn = cap/2+32 = 48: lsn+8 = 56 <= head+cap = 96. Valid.
+	// Old base-based check: lsn+8 = 56 <= base+cap = 64. Also valid. OK.
+	// Write at lsn = cap/2+cap = 96: lsn+8 = 104 > head+cap = 96. Invalid.
+	// Write at lsn = cap = 64:
+	//   Old base check: 64+8=72 > base+cap=64. Would FAIL (the bug).
+	//   New head check: 64+8=72 <= head+cap=96. Should PASS (the fix).
+	if err := b.writeReserved(int64(cap), make([]byte, 8)); err != nil {
+		t.Fatalf("writeReserved at base+cap (lsn=%d) failed with head-based check: %v", cap, err)
+	}
+}
+
 // TestWALBufferWriteReservedConcurrentWithAdvanceHead exercises writeReserved
 // from N stripe-writer goroutines while a drain goroutine concurrently advances
 // head — the canonical slice B concurrent drain scenario. Under -race this

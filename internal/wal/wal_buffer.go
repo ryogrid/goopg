@@ -232,10 +232,19 @@ func (b *walBuffer) writeReserved(lsn int64, record []byte) error {
 		return nil
 	}
 	n := int64(len(record))
-	base := b.base.Load()
-	if lsn < base || lsn+n > base+b.cap {
+	// Bounds check uses head (the drain watermark), not base.
+	// base can lag head when the ring has been partially drained without
+	// crossing a cap-aligned boundary: head advances but base stays put
+	// until head - base >= cap. Using base for the bounds check would
+	// reject writes at [base+cap, head+cap) that are physically valid
+	// (those ring slots have been freed by advanceHead).
+	head := b.head.Load()
+	if lsn < head || lsn+n > head+b.cap {
 		return errWALBufferReservedOutOfRange
 	}
+	// Ring offset still uses base: the physical layout is (lsn - base) % cap.
+	// lsn >= head >= base (head is always in [base, base+cap] by advanceHead).
+	base := b.base.Load()
 	off := (lsn - base) % b.cap
 	first := b.cap - off
 	if first >= n {

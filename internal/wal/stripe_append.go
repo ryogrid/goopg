@@ -150,12 +150,14 @@ func stripeAppend(
 
 	start, prev = posTracker.reserveAndPublish(uint64(len(record)), stripe, insertTracker)
 
+	end := int64(start) + int64(len(record))
 	if walBuf != nil {
 		if werr := walBuf.writeReserved(int64(start), record); werr != nil {
 			return start, prev, werr
 		}
 	}
 	if memRing != nil {
+		memRing.AdvanceWindow(end)
 		if merr := memRing.WriteReserved(int64(start), record); merr != nil {
 			return start, prev, merr
 		}

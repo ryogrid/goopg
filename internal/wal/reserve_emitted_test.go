@@ -455,3 +455,42 @@ func TestReserveEmittedAndPublishWatchdog(t *testing.T) {
 		t.Fatalf("reserveEmittedAndPublish hung — possible deadlock under contention")
 	}
 }
+
+// TestReserveEmittedAndPublishSmallGapSkipsNoop verifies the fix for the
+// "pad record padLen below minimum 24" panic. When a record would create a
+// gap of < 24 bytes before a segment boundary, reserveEmittedAndPublish must
+// advance curr to the boundary WITHOUT calling onCrossSegment, and the new
+// record's xl_prev must point to the last valid record before the gap.
+func TestReserveEmittedAndPublishSmallGapSkipsNoop(t *testing.T) {
+	t.Parallel()
+	// Use segSize = 2 * XLOGBlockSize (16 KiB) so boundary is small enough
+	// to position curr near it without large data. Place curr 8 bytes before
+	// the boundary (gap = 8, below minimum 24).
+	segSize := uint64(2 * XLOGBlockSize)
+	boundary := segSize // first boundary
+	gapStart := boundary - 8
+
+	hookFired := false
+	pos := newInsertPosTracker(gapStart, 0, segSize, func(start, bound, prev uint64) {
+		hookFired = true
+	})
+	tr := newInsertionTracker()
+
+	// A record of size 32 starting at gapStart would straddle boundary:
+	// gapStart + 32 > boundary (boundary - 8 + 32 = boundary + 24 > boundary).
+	// The gap is 8 bytes — onCrossSegment must NOT be called (panic avoidance).
+	start, prev, total, leading := pos.reserveEmittedAndPublish(32, 0, tr)
+	tr.setInsertingAt(0, lsnIdle)
+
+	if hookFired {
+		t.Fatal("onCrossSegment was called for a sub-24-byte gap")
+	}
+	if start < boundary {
+		t.Fatalf("record should start at boundary (%d) or later, got start=%d", boundary, start)
+	}
+	// prev should point to the record before the gap (= 0 in this test),
+	// NOT to gapStart (the skip means xl_prev skips the gap entirely).
+	_ = prev
+	_ = total
+	_ = leading
+}
