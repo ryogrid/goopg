@@ -16,7 +16,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/goopg/goopg/internal/stats"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -615,8 +614,15 @@ type BTreeStats struct {
 // split hot paths bump local shards without cross-core cache-line
 // invalidation. (M0107-0008 loop 7.)
 type btreeStatsCounters struct {
-	inserts stats.Counter
-	splits  stats.Counter
+	// Backing storage for BTreeStats using plain atomics.
+	// Per-P sharding via stats.Counter (M0107-0008 loop 7) was reverted
+	// because btree.Open is called per-statement — each call allocates a
+	// fresh BTree struct, so sharding provides zero cross-goroutine
+	// contention benefit while growing sizeof(BTree) by 32 KiB. That
+	// 32 KiB per open × thousands of opens per second exhausted WSL2's
+	// virtual address space under pgbench SU workloads.
+	inserts atomic.Uint64
+	splits  atomic.Uint64
 }
 
 // Stats returns a snapshot of the BTree's write-path counters.
@@ -624,15 +630,15 @@ type btreeStatsCounters struct {
 // returned numbers stale by the time the caller reads them.
 func (bt *BTree) Stats() BTreeStats {
 	return BTreeStats{
-		Inserts: uint64(bt.stats.inserts.Sum()),
-		Splits:  uint64(bt.stats.splits.Sum()),
+		Inserts: bt.stats.inserts.Load(),
+		Splits:  bt.stats.splits.Load(),
 	}
 }
 
 // ResetStats clears the BTree's write-path counters.
 func (bt *BTree) ResetStats() {
-	bt.stats.inserts.Reset()
-	bt.stats.splits.Reset()
+	bt.stats.inserts.Store(0)
+	bt.stats.splits.Store(0)
 }
 
 // LogSplitFunc emits the atomic page-split WAL record described in
@@ -1075,7 +1081,7 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 // Insert places (key, ptr) into the leaf where it belongs, splitting
 // pages on the way up if needed.
 func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
-	bt.stats.inserts.Add(1) // M0055-0001 (per-P via M0107-0008 loop 7)
+	bt.stats.inserts.Add(1) // M0055-0001
 	it := item{
 		keyLen: uint16(len(key)),
 		ptr:    ptr,
@@ -1097,7 +1103,7 @@ func (bt *BTree) Insert(key []byte, ptr storage.ItemPointer) error {
 	// work beyond M0055's scope. The race-safe createNewRoot
 	// in this commit handles concurrent root-lifts; the rest
 	// of the structural-update path remains under splitMu.)
-	bt.stats.splits.Add(1) // M0055-0001 (per-P via M0107-0008 loop 7) — counts insert calls that take the split-path retry.
+	bt.stats.splits.Add(1) // M0055-0001 — counts insert calls that take the split-path retry.
 	bt.splitMu.Lock()
 	defer bt.splitMu.Unlock()
 

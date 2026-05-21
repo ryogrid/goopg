@@ -687,6 +687,22 @@ func decodeGoopgRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *m
 			if off+toastPtrSize > len(data) {
 				return fmt.Errorf("DecodeRow: %s: truncated TOAST pointer", c.Name)
 			}
+			// Sanity-check numChunks (pointer[8:12]) before accepting this
+			// as a genuine TOAST pointer. PG-physical rows can accidentally
+			// parse as flag==2 when the first LE byte of an int4 column (e.g.
+			// aid=2) equals 0x02 and the remaining bytes happen to fill
+			// exactly len(data) bytes. Without this check, the accidental
+			// "TOAST pointer" carries numChunks from unrelated bytes (e.g.
+			// high abalance bits) which can be ~4 billion, causing DetoastValue
+			// to attempt a 96 GB allocation and panic with "runtime: out of memory".
+			// A real TOAST chunk sequence is bounded by maxToastSize/chunkSize.
+			// We use 1<<20 (≈1M chunks × 2KB each = 2 GB) as a loose upper bound
+			// that rejects corrupted/accidental pointers while accepting any real TOAST.
+			const maxToastChunks = 1 << 20
+			numChunks := int(binary.BigEndian.Uint32(data[off+8 : off+toastPtrSize]))
+			if numChunks < 0 || numChunks > maxToastChunks {
+				return fmt.Errorf("DecodeRow: %s: implausible TOAST numChunks %d (not goopg format)", c.Name, numChunks)
+			}
 			dst[i] = NewToastPointerDatum(append([]byte(nil), data[off:off+toastPtrSize]...))
 			off += toastPtrSize
 			continue

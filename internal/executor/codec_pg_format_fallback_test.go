@@ -157,3 +157,65 @@ func TestDecodeRowGoopgOffEqualLenIsValid(t *testing.T) {
 		t.Fatalf("col b: got %v, want NULL", dst[1])
 	}
 }
+
+// TestDecodeRowGoopgImplausibleToastChunksSanityCheck pins the fix for the
+// "accidental PG-physical TOAST" OOM bug. After the char(N) varlena encoding
+// fix (commit 47f6c5b), an updated pgbench_accounts row with aid=2 is stored
+// in PG physical format as 13 bytes: 4(aid LE)+4(bid LE)+4(abalance LE)+1(varlena).
+// The first byte of aid=2 is 0x02, which the goopg decoder reads as "TOAST pointer"
+// flag. It then reads 12 bytes and — because 1+12=13==len(data) — "succeeds"
+// with a TOAST pointer whose numChunks comes from abalance's high bytes. If
+// abalance has a large magnitude (e.g. -124 → 0xFFFFFF84), numChunks can
+// reach ~4 billion, causing DetoastValue to attempt a 96 GB make([][]byte, N)
+// and panic with "runtime: out of memory".
+//
+// The fix: decodeGoopgRowIntoMctx rejects TOAST pointers with numChunks > 1<<20,
+// returning an error so the caller falls through to decodePhysicalPGRowIntoMctx.
+func TestDecodeRowGoopgImplausibleToastChunksSanityCheck(t *testing.T) {
+	// Construct a 13-byte PG-physical row for pgbench_accounts:
+	//   aid=2 (LE: 02 00 00 00), bid=1 (LE: 01 00 00 00),
+	//   abalance=-124 (LE: 84 FF FF FF), filler=""  (1-byte varlena 0x03)
+	// Without the sanity check, the goopg decoder reads data[0]=0x02 as TOAST,
+	// then data[1:13] as 12-byte pointer, and data[9:13]=[FF FF FF 03]=0xFFFFFF03
+	// as numChunks ≈ 4.2 billion → 96 GB allocation.
+	pgPhysicalRow := []byte{
+		0x02, 0x00, 0x00, 0x00, // aid=2 (LE int4)
+		0x01, 0x00, 0x00, 0x00, // bid=1 (LE int4)
+		0x84, 0xFF, 0xFF, 0xFF, // abalance=-124 (LE int4)
+		0x03,                   // filler: 1-byte varlena (empty payload)
+	}
+	cols := []catalog.Column{
+		{Name: "aid", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "bid", Type: catalog.Type{Name: "int4"}, Ordinal: 1},
+		{Name: "abalance", Type: catalog.Type{Name: "int4"}, Ordinal: 2},
+		{Name: "filler", Type: catalog.Type{Name: "char", Args: []int64{84}}, Ordinal: 3},
+	}
+	dst := make(Row, 4)
+
+	// The goopg decoder must FAIL (implausible TOAST numChunks) so the caller
+	// can fall through to decodePhysicalPGRowIntoMctx.
+	err := decodeGoopgRowIntoMctx(dst, cols, pgPhysicalRow, nil)
+	if err == nil {
+		t.Fatal("goopg decoder should have rejected the PG-physical row as implausible TOAST")
+	}
+
+	// After the fix, the full decodeRowIntoMctx (which tries goopg then PG)
+	// should correctly decode the row.
+	dstFull := make(Row, 4)
+	if err := decodeRowIntoMctx(dstFull, cols, pgPhysicalRow, nil); err != nil {
+		t.Fatalf("decodeRowIntoMctx should succeed via PG fallback: %v", err)
+	}
+	if dstFull[0].Kind != KindInt || dstFull[0].Int != 2 {
+		t.Errorf("aid: got %v, want KindInt{2}", dstFull[0])
+	}
+	if dstFull[1].Kind != KindInt || dstFull[1].Int != 1 {
+		t.Errorf("bid: got %v, want KindInt{1}", dstFull[1])
+	}
+	if dstFull[2].Kind != KindInt || dstFull[2].Int != -124 {
+		t.Errorf("abalance: got %v, want KindInt{-124}", dstFull[2])
+	}
+	// filler decoded as empty string (empty 1-byte varlena payload)
+	if dstFull[3].Kind != KindString || dstFull[3].StringValue() != "" {
+		t.Errorf("filler: got %v, want empty string", dstFull[3])
+	}
+}
