@@ -95,6 +95,17 @@ func (t *insertPosTracker) load() (curr, prev uint64) {
 	return curr, prev
 }
 
+// resetPosition force-sets (curr, prev) under posMu. Called by Path A
+// of state.append after a direct-to-disk write bypasses stripe B so
+// subsequent stripe-B Path B appends resume from the correct position.
+// Must not be called while any stripe reservation is in flight.
+func (t *insertPosTracker) resetPosition(curr, prev uint64) {
+	t.posMu.Lock()
+	t.curr = curr
+	t.prev = prev
+	t.posMu.Unlock()
+}
+
 // reserve atomically claims `size` bytes of LSN space and returns the
 // starting LSN of the new reservation together with the prev pointer
 // the caller must stamp into the record's xl_prev header field. The

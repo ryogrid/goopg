@@ -287,6 +287,18 @@ func (c *stripeWriterCore) Load() (curr, prev uint64) {
 	return c.posTracker.load()
 }
 
+// resetPosition force-advances posTracker to (curr, prev). Used by
+// state.append's Path A (direct disk write) to resync the core after a
+// write that bypasses stripe B. Must not be called while any stripe
+// reservation is in flight (no concurrent AppendXLogPayload callers).
+// nil receiver is a no-op.
+func (c *stripeWriterCore) resetPosition(curr, prev uint64) {
+	if c == nil {
+		return
+	}
+	c.posTracker.resetPosition(curr, prev)
+}
+
 // PublishedTail returns the publisher's current watermark without
 // re-computing it. Useful for diagnostics and assertions
 // (`PublishUpTo`'s return value is the published-then-capped
