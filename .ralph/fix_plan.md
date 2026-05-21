@@ -3636,6 +3636,123 @@ Operational policy (2026-05-20):
         deciding whether `lsnAllocator` ([[0107-0007h]]) becomes
         dead-code-removed once the call-site converges on
         `insertPosTracker` + `insertionTracker` + `tailPublisher`.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 9 of N —
+        `insertPosTracker.reserveAndPublish` joint-atomic reserve +
+        stripe-publish): added
+        `(*insertPosTracker).reserveAndPublish(size uint64, stripe
+        int, tracker *insertionTracker) (start, prev uint64)` in
+        new file `internal/wal/insert_pos_publish.go`, and refactored
+        `insert_pos.go`'s `reserve` to share a private
+        `reserveLocked(size)` helper so the (curr, prev) update
+        logic lives in exactly one place. Closes the pre-reserve
+        race documented in [[0107-0007m]] §"Pre-reserve race" and
+        re-cited in [[0107-0007n]] / [[0107-0007o]]'s "out of
+        scope" notes. Under the existing slice B contract a drain
+        reader that calls `tailPublisher.publishUpTo(upperBound,
+        tracker)` between `insertPosTracker.reserve` returning and
+        the matching `insertionTracker.setInsertingAt(stripe, start)`
+        observes `lowestActiveLSN == lsnNoActive` for the
+        in-flight reservation and may advance the published
+        watermark past still-being-written bytes — a soundness
+        bug that would let `walBuffer.advanceHead` or
+        `MemRing.PublishUpTo` reclaim ring slots an unfinished
+        `writeReserved` is still memcpying into. Closure (option A
+        from [[0107-0007m]]'s alternatives — option B was rejected
+        because it requires the caller to know `curr` ahead of
+        time, defeating the point of having `posMu` be
+        authoritative over `curr`): move both updates under a
+        single `posMu` critical section so they appear to all
+        observers as one indivisible action. Any thread that
+        subsequently acquires `posMu` (notably
+        `insertPosTracker.load`, used by a drain reader to obtain
+        `upperBound`) observes both the advanced `curr` and the
+        published `insertionTracker[stripe]` together. PG
+        implements the same pattern:
+        `postgres/src/backend/access/transam/xlog.c`'s
+        `ReserveXLogInsertLocation` is followed inside the same
+        WAL insert lock by `WALInsertLockUpdateInsertingAt`.
+        Contract: `0 < size <= segSize` (matches `reserve`);
+        `tracker` MUST be non-nil — panics rather than silently
+        skipping publication, because silent degradation would
+        defeat the foundation's purpose (use `reserve` instead);
+        `0 <= stripe < appendLockStripes` (matches
+        `insertionTracker.setInsertingAt`). Cross-segment crossings
+        publish the **new reservation's start** (post-boundary
+        LSN), NOT the gap's start — the pad record at
+        `[gap, boundary)` is a gap-fill emitted synchronously
+        under `posMu` via the `onCrossSegment` hook, not a stripe
+        reservation. The END `setInsertingAt(stripe, lsnIdle)` is
+        deliberately NOT part of this primitive — it remains a
+        separate call by the caller, sequenced after the byte
+        write; closing the race only requires sealing the BEGIN
+        side under `posMu` because the publication-walker
+        invariant the END must respect ("no observation of
+        lsnIdle without observing the preceding byte writes") is
+        already provided by the atomic Load on the slot under
+        Go's memory model. Cost: one additional
+        `atomic.Int64.Store` under the existing posMu critical
+        section; cost dominated by existing `posMu` Lock/Unlock
+        pair; no new locks. Lock-ordering tier after foundation
+        9: `appendLockSet.lockByProcNum →
+        insertPosTracker.reserveAndPublish (posMu held:
+        reserveLocked + tracker.setInsertingAt(start); posMu
+        released) → walBuffer.writeReserved → MemRing.WriteReserved
+        → insertionTracker.setInsertingAt(stripe, lsnIdle) → drop
+        stripe lock`. Dead code until the slice B call-site
+        rewrite consumes it; foundation-first pattern matches
+        slice C and the eight earlier slice B foundations. Ten
+        regression tests in `internal/wal/insert_pos_publish_test.go`:
+        `TestInsertPosTrackerReserveAndPublishBasic` (startCurr=1
+        avoids the lsnIdle=0 sentinel collision);
+        `TestInsertPosTrackerReserveAndPublishMultiStripe`
+        (independent slots; `lowestActiveLSN` returns the min);
+        `TestInsertPosTrackerReserveAndPublishCrossSegmentPublishesNewStart`
+        (post-boundary start published, not pad-record start);
+        `TestInsertPosTrackerReserveAndPublishInvalidSizePanics`
+        (`{0, segSize+1, 2·segSize}`);
+        `TestInsertPosTrackerReserveAndPublishNilTrackerPanics`
+        (no silent degradation);
+        `TestInsertPosTrackerReserveAndPublishInvalidStripePanics`
+        (`{-1, appendLockStripes, …, MaxInt32}`);
+        `TestInsertPosTrackerReserveAndPublishInteropWithReserve`
+        (mixing `reserve` and `reserveAndPublish` preserves
+        chain; tracker only reflects `reserveAndPublish`);
+        `TestInsertPosTrackerReserveAndPublishConcurrentChain`
+        (32 × 100 × 16 B; chain permutation + tracker idle at
+        end);
+        `TestInsertPosTrackerReserveAndPublishConsistentSnapshot`
+        (the main race-closure test — 8 writers × 2000
+        reservations; reader takes `posMu` directly, reads
+        `curr` and every stripe slot inside the critical
+        section, asserts every non-idle slot v satisfies `v <
+        curr` and `(v - startCurr) % size == 0`; under the old
+        un-coupled reserve + setInsertingAt the reader would
+        observe `curr advanced + stripe still idle` for an
+        in-flight reservation; with `reserveAndPublish` the
+        BEGIN edge is sealed so the snapshot is consistent);
+        `TestInsertPosTrackerReserveAndPublishWatchdog` (5-second
+        watchdog on the concurrent scenario — surfaces deadlock
+        regressions before the package-level timeout). Verified:
+        `go test -race -count=1 -run 'TestInsertPosTracker'
+        ./internal/wal/` PASS (1.04 s); `go test -race -count=1
+        ./internal/wal/` PASS (3.15 s). Design:
+        `docs/design/0107-0007p-wal-reserve-and-publish.md`
+        (indexed in `docs/design/README.md`). Out of scope (later
+        slice B foundations and call-site rewrite): mounting
+        `reserveAndPublish` on `Writer` and rewriting
+        `state.append` to consume it (multi-loop scope —
+        `state.appendMu`'s four invariants split into per-stripe
+        local vs. shared state); drain coordination with
+        concurrent stripe writes (`drainBufferBytes` currently
+        runs under `appendMu` — must let drain run concurrently
+        with stripe writes by consuming
+        `tailPublisher.publishUpTo`'s return as drain ceiling for
+        both `walBuffer.advanceHead` and `MemRing.PublishUpTo`);
+        deciding whether `lsnAllocator` ([[0107-0007h]]) becomes
+        dead-code-removed once the call-site converges on
+        `insertPosTracker` + `insertionTracker` + `tailPublisher`
+        + `reserveAndPublish` — `reserve` remains in the API as
+        a callable primitive without a tracker.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded

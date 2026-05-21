@@ -112,7 +112,14 @@ func (t *insertPosTracker) reserve(size uint64) (start, prev uint64) {
 	}
 	t.posMu.Lock()
 	defer t.posMu.Unlock()
+	return t.reserveLocked(size)
+}
 
+// reserveLocked is the body of reserve, assuming posMu is held. Shared
+// by reserve and reserveAndPublish so the joint-atomicity rule (the
+// (curr, prev) update happens together) lives in exactly one place.
+// Callers MUST hold posMu.
+func (t *insertPosTracker) reserveLocked(size uint64) (start, prev uint64) {
 	old := t.curr
 	end := old + size
 	oldSeg := old / t.segSize
