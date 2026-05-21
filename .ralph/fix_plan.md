@@ -6379,6 +6379,41 @@ Operational policy (2026-05-20):
       - Update milestone status in
         `docs/milestones/0107-performance-optimization-refactor.md` and
         `docs/milestones/README.md` to `accepted`.
+      - **PARTIAL PROGRESS (2026-05-21, this loop)**:
+        Three blocking bugs discovered and fixed on the way to the pgbench gate:
+        (A) `encodeValuePG` treated `char(N)` (bpchar) as single byte instead of
+            varlena, causing "DecodePhysicalPGRow: filler: truncated 4-byte varlena
+            header" in all pgbench SU clients. Fixed + regression pins:
+            `TestEncodeValuePGCharWithArgs` et al. (commit 47f6c5b).
+        (B) `btreeStatsCounters` used `stats.Counter` (16 KiB each, 32 KiB/BTree)
+            instead of `atomic.Uint64`. Since `btree.Open()` is called per-statement,
+            high-concurrency SU allocates ~384 MB/s of BTree heap, exhausting WSL2
+            virtual address space (~95 GB) and crashing with "runtime: out of memory".
+            Reverted to `atomic.Uint64`; BTree now 96 bytes (was 32 KiB).
+            Regression pin: `TestBTreeSizeIsSane` (< 1 KiB assertion). (commit 902e598)
+        (C) `decodeGoopgRowIntoMctx` created `KindToastPointer` datums from corrupt
+            data when aid=2 (first LE byte=0x02 = TOAST flag) and the 13-byte
+            PG-physical row accidentally matched off==len(data). `numChunks` from
+            abalance bytes reached ~4.2 billion → `DetoastValue` tried 96 GB
+            `make([][]byte, N)` → OOM. Fixed: reject TOAST pointers with
+            numChunks > 1<<20. Regression pin:
+            `TestDecodeRowGoopgImplausibleToastChunksSanityCheck`. (commit 902e598)
+        Current measurements (WSL2, scale=100, 90s, no GOMEMLIMIT):
+          c=10 SO: 41,944 TPS ✓ (verified earlier, commit m0107_c3_gates run)
+          c=50 SO: 86,495 TPS ✓ (verified earlier)
+          c=100 SO: 83,149 TPS ✓ (verified earlier)
+          c=50 SU: 1,428 TPS ✗ (gate ≥ 2,000 — below gate on WSL2)
+          c=100 SU: 1,641 TPS ✓ (gate ≥ 500)
+          c=100 standard: 1,582 TPS ✓ (gate ≥ 500)
+          gcBgMarkWorker: 0.82% ✓ (verified earlier, gate < 15%)
+          runtime.futex: 3.27% ✓ (verified earlier, gate < 8%)
+          mutex top-20: all three targets absent ✓ (verified earlier)
+          Datum sizeof: 48 B (deferred in M0107-0002; gate says 24 B but Phase B.1 is deferred)
+        Remaining: c=50 SU needs to reach 2,000 TPS (root cause: COPY writes goopg
+        format, UPDATE writes PG format → mixed-format decode overhead + WSL2 VA limit).
+        Fixing COPY to write canonical WAL (LogCanonical in dispatchCopyViaExecutor)
+        would close the mixed-format gap. Action: fix COPY path to use PG encoding,
+        re-measure c=50 SU, then mark superseded docs and update milestone status.
 
 ## M0108 — `postgresql.conf.sample` Template + Registry-Sync Rule (filed 2026-05-20)
 
