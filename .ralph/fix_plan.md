@@ -3355,6 +3355,141 @@ Operational policy (2026-05-20):
         whether `lsnAllocator` ([[0107-0007h]]) becomes
         dead-code-removed once the call-site converges on
         `insertPosTracker` + `insertionTracker`.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 7 of N —
+        `tailPublisher` publication watermark): added
+        `tailPublisher` to new file `internal/wal/tail_publisher.go`
+        with `newTailPublisher()`, `load() int64`, and
+        `publishUpTo(upperBound int64, tracker *insertionTracker)
+        int64`. Computes `candidate = min(upperBound,
+        tracker.lowestActiveLSN())` and CAS-loops a monotonically
+        advancing `atomic.Int64 published`; returns `min(currentPublished,
+        upperBound)` so a peer that pushed the internal watermark
+        past the caller's request does not leak a drain-eligible LSN
+        beyond the caller's view — matches PG's
+        `WaitXLogInsertionsToFinish(upTo)` return contract.
+        PG counterpart: PG splits the role across
+        `WaitXLogInsertionsToFinish` (walks
+        `WALInsertLock[i].insertingAt` and busy-waits) +
+        `XLogCtl->LogwrtRqst.Write` (monotonic watermark) in
+        `postgres/src/backend/access/transam/xlog.c`; goopg merges
+        them because `atomic.Int64.CompareAndSwap` makes the
+        monotonic-publish loop trivial and the wait-vs-poll policy
+        belongs to the caller — the publisher is non-blocking by
+        construction (if a caller needs wait semantics it loops on
+        publishUpTo itself).
+        Why monotonic publication: two concurrent calls may observe
+        different `lowestActiveLSN` depending on which stripes
+        happen to be idle when each call reads the tracker; without
+        monotonicity a published value could regress, racing
+        readers (drain, walsender, `readAt`) against fresh inserts
+        below the prior watermark — exactly the hazard that prompted
+        [[0107-0007l]] `walBuffer.writeReserved` to leave `tail`
+        untouched. The CAS loop early-returns on `candidate ≤ cur`
+        so a transient drop in `lowestActiveLSN` (a new stripe
+        entering at a low LSN after watermark advanced past it)
+        cannot cause regression.
+        Sentinel composition: when every stripe is idle,
+        `lowestActiveLSN == lsnNoActive == math.MaxInt64` and the
+        min collapses to `upperBound`; the sentinel cannot leak
+        into the published value because only `candidate` (≤
+        upperBound) is ever stored, and real callers bound
+        upperBound by the actual reserved-LSN window.
+        Cap-at-upperBound return contract: PG's
+        `WaitXLogInsertionsToFinish` returns a value ≤ upTo even if
+        the underlying watermark has advanced past it; goopg matches
+        because the drain goroutine uses the return value to bound
+        `walBuffer.advanceHead(n)` — an uncapped return could ask
+        drain to advance past the reservation window the caller had
+        in scope.
+        nil-safety: nil receiver returns 0; nil tracker behaves as
+        "all idle" (safeTail = upperBound). Mirrors foundation-level
+        nil-safety from [[0107-0007h]] / [[0107-0007l]] and lets a
+        future `Writer` constructor leave the publisher unset under
+        `Config.WALBuffers == 0`.
+        Lock-ordering tier (leaf reader; the publisher takes no
+        locks):
+            appendLockSet.lockByProcNum  (one of 8 stripes)
+              → insertPosTracker.reserve  (briefly under posMu)
+                → insertionTracker.setInsertingAt(stripe, start)
+                  → walBuffer.writeReserved
+                → insertionTracker.setInsertingAt(stripe, lsnIdle)
+              → drop stripe lock
+            (separately, on the drain goroutine, after the above:)
+              tailPublisher.publishUpTo(upperBound, insertionTracker)
+              walBuffer.advanceHead(published - prior)
+        Pre-reserve race carry-over from [[0107-0007m]]: between
+        `insertPosTracker.reserve` returning and the matching
+        `setInsertingAt(stripe, start)` the observed
+        `lowestActiveLSN` can temporarily exceed the true minimum
+        (the reservation has advanced `curr` but the stripe slot
+        is still `lsnIdle`). The publisher cannot close this race
+        by itself — it is the call-site rewrite's responsibility
+        to either (option A) move `setInsertingAt` under `posMu`
+        so it is sequenced with the reserve, or (option B) emit a
+        pre-reserve marker. The publisher's contract is "given an
+        honest `(upperBound, tracker)` pair, compute and
+        monotonically publish the safe tail."
+        Dead code until slice B's call-site rewrite mounts the
+        publisher on `Writer` and drives it from the drain/flush
+        goroutine; foundation-first pattern matches slice C
+        ([[0107-0007b]] / [[0107-0007c]] / [[0107-0007d]] before
+        [[0107-0007e]] / [[0107-0007f]] / [[0107-0007g]]) and the
+        six earlier slice B foundations ([[0107-0007h]] /
+        [[0107-0007i]] / [[0107-0007j]] / [[0107-0007k]] /
+        [[0107-0007l]] / [[0107-0007m]]). Twelve regression tests
+        in `internal/wal/tail_publisher_test.go`:
+        `TestTailPublisherNewIsZero` (fresh load = 0; no-op publish
+        stays at 0); `TestTailPublisherIdleTrackerPublishesUpperBound`
+        (sentinel composition); `TestTailPublisherActiveStripeCapsSafeTail`
+        (stripe@600 caps safeTail at 600 with upperBound=1000;
+        after idle next publish advances to 1000);
+        `TestTailPublisherTakesMinAcrossStripes` (three active
+        stripes 500/300/700 → safeTail=300);
+        `TestTailPublisherMonotonicNeverRegresses` (advance to 1000,
+        then publish with active stripe@200 still returns 1000);
+        `TestTailPublisherReturnsCurrentWhenCandidateLower` (return-
+        value contract: candidate ≤ cur returns capped current);
+        `TestTailPublisherNilReceiverReturnsZero` (defensive);
+        `TestTailPublisherNilTrackerActsAsAllIdle` (transitional);
+        `TestTailPublisherAdvancesAcrossSequentialPublishes`
+        (steady-state drain: 5 strictly-increasing upperBounds
+        advance in lock-step);
+        `TestTailPublisherConcurrentPublishesAreMonotonic` (16 ×
+        1000 goroutines + per-worker monotonicity + final load
+        equals largest upperBound);
+        `TestTailPublisherConcurrentWithActiveStripes` (8 stripe
+        workers oscillating active/idle + 4 publish workers;
+        per-worker returns capped at upperBound and never regress;
+        post-stop final publish reaches 1_000_000);
+        `TestTailPublisherSentinelDoesNotLeakIntoPublishedValue`
+        (at upperBound=MaxInt64-1 with idle tracker, published is
+        MaxInt64-1 not MaxInt64); `TestTailPublisherConcurrentCompletesUnderWatchdog`
+        (5-second watchdog on the lock-free design — surfaces
+        live-lock well before default `go test` timeout).
+        Verified: `go test -race -count=1 -run 'TestTailPublisher'
+        ./internal/wal/` PASS (1.02 s); `go test -race -count=1
+        ./internal/wal/` PASS (3.14 s). Design:
+        `docs/design/0107-0007n-wal-tail-publisher.md` (indexed in
+        `docs/design/README.md`). Out of scope (later slice B
+        foundations and call-site rewrite): mounting
+        `tailPublisher` on `Writer` and consuming it from the
+        drain/flush goroutine (multi-loop work because
+        `state.append` currently advances `walBuf.tail`
+        synchronously inside the `appendMu` critical section;
+        switching requires reordering against existing
+        `drainBufferBytes` / `flushUpTo` invariants); closing the
+        pre-reserve race ([[0107-0007m]] §"Pre-reserve race") —
+        owned by call-site rewrite; `memRing` mirror handling
+        under stripe-concurrent writes (mirror is currently
+        maintained by `state.append` inside `appendMu` — under
+        stripe writers needs either a parallel publication
+        watermark or batching); drain coordination with concurrent
+        stripe writes (`drainBufferBytes` currently runs under
+        `appendMu` — rewrite must let drain run concurrently with
+        stripe writes by consuming `published` as drain ceiling);
+        deciding whether `lsnAllocator` ([[0107-0007h]]) becomes
+        dead-code-removed once the call-site converges on
+        `insertPosTracker` + `insertionTracker` + `tailPublisher`.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
