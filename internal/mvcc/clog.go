@@ -343,7 +343,14 @@ func (c *CLog) flush() error {
 		}
 		b.mu.RLock()
 		start := bi * xidsPerBank
-		copy(out[start:start+len(b.data)], b.data)
+		// Cap copyLen to what fits in out: the last bank may have grown
+		// between the scan above (which set lastUsedLen) and this copy, so
+		// start+len(b.data) might exceed len(out). Limit defensively.
+		copyLen := len(b.data)
+		if start+copyLen > len(out) {
+			copyLen = len(out) - start
+		}
+		copy(out[start:start+copyLen], b.data[:copyLen])
 		b.mu.RUnlock()
 	}
 
