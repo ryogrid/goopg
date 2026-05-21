@@ -4092,6 +4092,132 @@ Operational policy (2026-05-20):
         dead-code-removed once the call-site converges on
         `insertPosTracker` + `insertionTracker` + `tailPublisher` +
         `reserveAndPublish` + `publishTail` + `emitSegmentPad`.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 13 of N —
+        `publishVisibility` drain-side composer): added
+        `publishVisibility(publisher, walBuf, memRing, tracker,
+        upperBound) int64` in new file
+        `internal/wal/publish_visibility.go`. Composes
+        [[0107-0007n]] `tailPublisher.publishUpTo` +
+        [[0107-0007q]] `walBuffer.publishTail` + [[0107-0007o]]
+        `MemRing.PublishUpTo` into the single action the drain
+        goroutine performs every tick to make stripe-written bytes
+        visible to readers. Symmetric counterpart of
+        [[0107-0007s]] `emitSegmentPad` (writer-side composer):
+        emitSegmentPad lands cross-segment pad bytes into both
+        rings without advancing visibility; publishVisibility
+        advances visibility for both rings without writing bytes.
+        Returns the safeTail value published to both rings —
+        callers consume it as the new drain ceiling for the
+        subsequent `walBuffer.readForDrain` / `writeAt` /
+        `walBuffer.advanceHead` chain. `advanceHead` is
+        intentionally NOT in the composer because reclaiming ring
+        slots before disk-flush would let stripe writers overwrite
+        still-pending bytes; the IO scheduling boundary stays
+        explicit in the drain loop. Nil-safety: each composed
+        primitive is independently nil-safe so the composer works
+        under `Config.WALBuffers == 0`, `wal_sender_memory_buffer
+        == 0`, and during transitional call-site rewrite states
+        (nil tracker → safeTail collapses to upperBound; nil
+        publisher → returns 0, rings not advanced). No error
+        return — the three composed primitives are infallible by
+        construction (publishUpTo is a CAS loop; publishTail is a
+        monotonic atomic store; PublishUpTo is a monotonic store
+        under a write lock with internal head-clamp). PG
+        counterpart: PG distributes the role across
+        `WaitXLogInsertionsToFinish` + `XLogCtl->LogwrtResult.
+        Write` advance + walsender snapshot view in
+        `postgres/src/backend/access/transam/xlog.c`. goopg
+        composes them into one function because the slice B
+        call-site rewrite needs the chain at multiple drain entry
+        points (periodic tick, group-commit, fsync deadline,
+        shutdown drain). Lock-ordering tier (drain goroutine,
+        separately from stripe-writer chain):
+            publishVisibility(publisher, walBuf, memRing, tracker,
+                              upperBound)
+              → tailPublisher.publishUpTo  (lock-free)
+              → walBuffer.publishTail      (atomic store)
+              → MemRing.PublishUpTo        (memRing.mu write)
+            walBuffer.readForDrain(safeTail - head, dst)
+            writeAt(...)
+            walBuffer.advanceHead(safeTail - head)
+        The composer takes no locks itself. Dead code until the
+        slice B call-site rewrite consumes it; foundation-first
+        pattern matches slice C ([[0107-0007b]] / [[0107-0007c]] /
+        [[0107-0007d]] before [[0107-0007e]] / [[0107-0007f]] /
+        [[0107-0007g]]) and the twelve earlier slice B
+        foundations ([[0107-0007h]] / [[0107-0007i]] /
+        [[0107-0007j]] / [[0107-0007k]] / [[0107-0007l]] /
+        [[0107-0007m]] / [[0107-0007n]] / [[0107-0007o]] /
+        [[0107-0007p]] / [[0107-0007q]] / [[0107-0007r]] /
+        [[0107-0007s]]). Eleven regression tests in
+        `internal/wal/publish_visibility_test.go`:
+        `TestPublishVisibilityIdleTrackerAdvancesBothRings`
+        (happy path; idle tracker → both rings advance to
+        upperBound; publisher.load reflects);
+        `TestPublishVisibilityActiveStripeCapsBothRings`
+        (active stripe@600 caps both rings at 600 with
+        upperBound=1000; after stripe goes idle, second publish
+        advances both to 1000);
+        `TestPublishVisibilityMonotonicAcrossCalls` (six-step
+        monotonic sequence with repeated upperBound values; rings
+        track publisher lock-step);
+        `TestPublishVisibilityRegressingUpperBoundDoesNotRegressRings`
+        (publisher's return value caps at lower upperBound but
+        neither ring's tail regresses — the publishTail /
+        PublishUpTo monotonic stores defend against stale
+        snapshots);
+        `TestPublishVisibilityNilWalBufStillAdvancesMemRing`
+        (`Config.WALBuffers == 0` path);
+        `TestPublishVisibilityNilMemRingStillAdvancesWalBuf`
+        (`wal_sender_memory_buffer == 0` path);
+        `TestPublishVisibilityBothRingsNil` (publisher-only
+        degenerate case; publisher still advances; useful for
+        tests and transitional call-site states);
+        `TestPublishVisibilityNilPublisherReturnsZero` (defensive
+        nil-safety; rings not advanced past 0);
+        `TestPublishVisibilityNilTrackerActsAsAllIdle`
+        (transitional contract; safeTail collapses to
+        upperBound);
+        `TestPublishVisibilityExposesWriteReservedBytesEndToEnd`
+        (end-to-end: writeReserved 32-byte payload into both
+        rings at LSN 64 → walBuf.readAt and memRing.ReadAt both
+        miss → publishVisibility(upperBound=96) → both rings hit
+        with byte-identical payload);
+        `TestPublishVisibilitySentinelComposesWithMin`
+        (upperBound=math.MaxInt64-1 with idle tracker; rings
+        receive the value without the sentinel leaking into
+        either tail);
+        `TestPublishVisibilityConcurrentWithStripeWriters` (8
+        stripe writers × 5000 active/idle oscillations + a
+        publisher goroutine continuously advancing upperBound;
+        pins (a) publisher's return never regresses across calls,
+        (b) walBuf.tail == memRing.tail after every
+        publishVisibility call — cross-ring consistency
+        invariant; 5-second watchdog).
+        Verified: `go test -race -count=1 -run
+        'TestPublishVisibility' ./internal/wal/` PASS (1.02 s);
+        `go test -race -count=1 ./internal/wal/` PASS (3.16 s).
+        Design:
+        `docs/design/0107-0007t-wal-publish-visibility.md`
+        (indexed in `docs/design/README.md`). Out of scope
+        (call-site rewrite): mounting `publishVisibility` on
+        `Writer` and consuming it from the drain/flush goroutine
+        (multi-loop because `state.append` currently advances
+        `walBuf.tail` and `memRing.tail` synchronously inside
+        `appendMu`; the rewrite splits the four invariants —
+        writePos / walBuf / memRing / writeLSN — into per-stripe
+        local state vs. shared state); drain coordination with
+        concurrent stripe writes (`drainBufferBytes` currently
+        runs under `appendMu` — the rewrite must let drain run
+        concurrently with stripe writes by consuming
+        publishVisibility's return as the drain ceiling for
+        `walBuffer.readForDrain` / `writeAt` /
+        `walBuffer.advanceHead`); deciding whether
+        [[0107-0007h]] `lsnAllocator` becomes dead-code-removed
+        once the call-site converges on `insertPosTracker` +
+        `insertionTracker` + `tailPublisher` +
+        `reserveAndPublish` + `publishTail` + `emitSegmentPad` +
+        `publishVisibility`.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
