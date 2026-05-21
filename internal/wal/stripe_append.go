@@ -110,8 +110,8 @@ import "errors"
 // `state.append`'s body to call `stripeAppend`; foundation-first
 // pattern matches slice C ([[0107-0007b]] / [[0107-0007c]] /
 // [[0107-0007d]] before [[0107-0007e]] / [[0107-0007f]] /
-// [[0107-0007g]]) and the thirteen earlier slice B foundations
-// ([[0107-0007h]] / [[0107-0007i]] / [[0107-0007j]] / [[0107-0007k]] /
+// [[0107-0007g]]) and the twelve earlier slice B foundations
+// ([[0107-0007i]] / [[0107-0007j]] / [[0107-0007k]] /
 // [[0107-0007l]] / [[0107-0007m]] / [[0107-0007n]] / [[0107-0007o]] /
 // [[0107-0007p]] / [[0107-0007q]] / [[0107-0007r]] / [[0107-0007s]] /
 // [[0107-0007t]]).

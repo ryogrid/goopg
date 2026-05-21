@@ -30,8 +30,8 @@ const lsnNoActive = int64(math.MaxInt64)
 //
 // Foundation 6 for M0107-0007 slice B (Phase D4 — 8-stripe WAL insert
 // locks per `docs/design/perf-optimize/07-wal-fsm-insert.md` §2).
-// Foundations 1–5 — [[0107-0007h]] lsnAllocator, [[0107-0007i]]
-// appendLockSet, [[0107-0007j]] buildSegmentPadRecord, [[0107-0007k]]
+// Earlier foundations — [[0107-0007i]] appendLockSet,
+// [[0107-0007j]] buildSegmentPadRecord, [[0107-0007k]]
 // insertPosTracker, [[0107-0007l]] walBuffer.writeReserved — landed
 // first per the foundation-first pattern. The call-site rewrite that
 // consumes this primitive (advancing the walBuffer.tail watermark

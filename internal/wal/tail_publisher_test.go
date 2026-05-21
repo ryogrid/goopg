@@ -133,9 +133,8 @@ func TestTailPublisherReturnsCurrentWhenCandidateLower(t *testing.T) {
 }
 
 // nil receiver returns 0. Pins the defensive contract used by other
-// foundation primitives (lsnAllocator's nil-safety arguments) so a
-// future Writer with Config.WALBuffers == 0 can leave the publisher
-// unset without segfaulting.
+// foundation primitives so a future Writer with Config.WALBuffers == 0
+// can leave the publisher unset without segfaulting.
 func TestTailPublisherNilReceiverReturnsZero(t *testing.T) {
 	t.Parallel()
 	var p *tailPublisher

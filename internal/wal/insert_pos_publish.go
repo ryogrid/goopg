@@ -8,8 +8,8 @@ package wal
 //
 // Foundation 9 for M0107-0007 slice B (Phase D4 — 8-stripe WAL insert
 // locks per `docs/design/perf-optimize/07-wal-fsm-insert.md` §2).
-// Foundations 1–8 — [[0107-0007h]] lsnAllocator, [[0107-0007i]]
-// appendLockSet, [[0107-0007j]] buildSegmentPadRecord, [[0107-0007k]]
+// Earlier foundations — [[0107-0007i]] appendLockSet,
+// [[0107-0007j]] buildSegmentPadRecord, [[0107-0007k]]
 // insertPosTracker, [[0107-0007l]] walBuffer.writeReserved,
 // [[0107-0007m]] insertionTracker, [[0107-0007n]] tailPublisher,
 // [[0107-0007o]] MemRing.WriteReserved/PublishUpTo — landed first

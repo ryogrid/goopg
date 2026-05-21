@@ -25,10 +25,11 @@ const xlogInfoNoop uint8 = 0x20
 //
 // Foundation for M0107-0007 slice B (Phase D4 — 8-stripe WAL insert
 // locks per docs/design/perf-optimize/07-wal-fsm-insert.md §2). The
-// lsnAllocator ([[0107-0007h]]) onCrossSegment hook calls this builder
-// to fill the `[start, boundary)` gap left when a cross-segment
-// reservation hops to the start of the new segment. Dead code until
-// the slice B call-site rewrite wires it in; foundation-first pattern
+// [[0107-0007k]] insertPosTracker onCrossSegment hook calls this
+// builder (via the [[0107-0007s]] emitSegmentPad composer) to fill
+// the `[start, boundary)` gap left when a cross-segment reservation
+// hops to the start of the new segment. Dead code until the slice B
+// call-site rewrite wires it in; foundation-first pattern
 // matches slice C ([[0107-0007b]] / [[0107-0007c]] / [[0107-0007d]]
 // landed before [[0107-0007e]] / [[0107-0007f]] / [[0107-0007g]]
 // consumed them).
@@ -41,7 +42,7 @@ const xlogInfoNoop uint8 = 0x20
 //   - padLen of exactly 25 is not encodable: an XLogRecord with a
 //     1-byte body cannot carry the 2-byte short main-data chunk
 //     header (let alone a long chunk header). Returns ErrPadLen1ByteBody.
-//     In practice the LSN allocator's reservations are 8-byte aligned
+//     In practice insertPosTracker reservations are 8-byte aligned
 //     (maxAlignXLog) so padLen is always 24 or a multiple of 8 — every
 //     such value is encodable.
 //

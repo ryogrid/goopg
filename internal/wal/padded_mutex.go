@@ -27,7 +27,7 @@ type paddedMutex struct {
 // NUM_XLOGINSERT_LOCKS = 8 (see `postgres/src/include/access/xlog.h` and
 // `xlog.c` ReserveXLogInsertLocation / WALInsertLockAcquire). Eight
 // distinct backends can append into the WAL buffer in parallel as long
-// as they hash to different stripes; the lsnAllocator ([[0107-0007h]])
+// as they hash to different stripes; [[0107-0007k]] insertPosTracker
 // handles disjoint LSN reservation and rotateMu serialises the (rare)
 // segment-boundary crossings.
 const appendLockStripes = 8
@@ -52,8 +52,8 @@ func stripeForProcNum(procNum int32) int {
 
 // lockByProcNum acquires the stripe selected by procNum and returns the
 // unlock callback. The stripe lock guards the WAL buffer write for one
-// record append; LSN reservation happens outside the stripe lock via
-// lsnAllocator.reserve so two stripes can be writing into disjoint
+// record append; LSN reservation happens via [[0107-0007k]]
+// insertPosTracker.reserve so two stripes can be writing into disjoint
 // ranges of the buffer at the same time.
 //
 // Per the design (§2 "Flush coordination"), flush is unchanged — it

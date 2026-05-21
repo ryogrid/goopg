@@ -12,9 +12,9 @@ import "sync"
 //
 // Foundation 4 for M0107-0007 slice B (Phase D4 — 8-stripe WAL insert
 // locks per `docs/design/perf-optimize/07-wal-fsm-insert.md` §2).
-// Foundations 1–3 — [[0107-0007h]] lsnAllocator, [[0107-0007i]]
-// appendLockSet, [[0107-0007j]] buildSegmentPadRecord — landed first
-// per the foundation-first pattern. The call-site rewrite that
+// Earlier foundations — [[0107-0007i]] appendLockSet,
+// [[0107-0007j]] buildSegmentPadRecord — landed first per the
+// foundation-first pattern. The call-site rewrite that
 // consumes this primitive (lifting `state.appendMu`'s four invariants
 // into per-stripe local state) is multi-loop scope and is NOT in this
 // loop.
@@ -48,8 +48,7 @@ import "sync"
 //	        Stamped verbatim into the new record's `xl_prev`
 //	        header field by the caller.
 //
-// Segment-crossing semantics match [[0107-0007h]] lsnAllocator's
-// `reserve`: a reservation that would straddle the next segment
+// Segment-crossing semantics: a reservation that would straddle the next segment
 // boundary is bumped to the start of the new segment; the gap
 // `[oldCurr, boundary)` is reported to `onCrossSegment` so the caller
 // can pad it with an XLOG_NOOP record (the gap's prev pointer is the

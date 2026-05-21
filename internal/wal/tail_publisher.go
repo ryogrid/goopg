@@ -11,8 +11,8 @@ import "sync/atomic"
 //
 // Foundation 7 for M0107-0007 slice B (Phase D4 — 8-stripe WAL insert
 // locks per `docs/design/perf-optimize/07-wal-fsm-insert.md` §2).
-// Foundations 1–6 — [[0107-0007h]] lsnAllocator, [[0107-0007i]]
-// appendLockSet, [[0107-0007j]] buildSegmentPadRecord, [[0107-0007k]]
+// Earlier foundations — [[0107-0007i]] appendLockSet,
+// [[0107-0007j]] buildSegmentPadRecord, [[0107-0007k]]
 // insertPosTracker, [[0107-0007l]] walBuffer.writeReserved, and
 // [[0107-0007m]] insertionTracker — landed first per the
 // foundation-first pattern. The call-site rewrite that mounts this
@@ -138,9 +138,8 @@ func (p *tailPublisher) load() int64 {
 //
 // nil receiver is safe: returns 0 (no watermark established). This
 // matches the defensive contract used elsewhere in foundation code
-// (lsnAllocator's nil-safety arguments) and lets future Writer
-// constructors leave `tailPublisher` unset under
-// `Config.WALBuffers == 0`.
+// and lets future Writer constructors leave `tailPublisher` unset
+// under `Config.WALBuffers == 0`.
 //
 // nil tracker is safe: behaves as if every stripe were idle, so
 // `safeTail = upperBound`. Useful for tests and for transitional

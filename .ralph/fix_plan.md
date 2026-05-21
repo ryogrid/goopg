@@ -4575,6 +4575,58 @@ Operational policy (2026-05-20):
         [[0107-0007h]] `lsnAllocator` once the call-site converges
         on the `insertPosTracker` + `insertionTracker` +
         `tailPublisher` trio.
+      - PARTIAL PROGRESS 2026-05-21 (slice B follow-up — remove
+        `lsnAllocator` as dead code): closed the dead-code-removal
+        decision that was carried as "out of scope" by every slice B
+        foundation note from [[0107-0007k]] through [[0107-0007w]].
+        The `lsnAllocator` primitive (slice B foundation 1, formerly
+        indexed as [[0107-0007h]]) landed as a CAS-fast-path LSN
+        reserve with `rotateMu` segment-crossing serialisation. Its
+        contract was structurally subsumed by [[0107-0007k]]
+        `insertPosTracker`, which offers the same segment-crossing
+        reserve semantics PLUS joint-atomic `(curr, prev)` chain
+        tracking required by the WAL append path. No production call
+        site ever consumed `lsnAllocator` — only its own
+        `internal/wal/lsn_alloc_test.go` referenced it; the slice B
+        call-site rewrite (`stripeWriterCore` packaging in
+        [[0107-0007v]] / mount in [[0107-0007w]]) converges
+        exclusively on `insertPosTracker`. Deleted three files:
+        `internal/wal/lsn_alloc.go`, `internal/wal/lsn_alloc_test.go`,
+        and `docs/design/0107-0007h-wal-lsn-allocator.md`.
+        Comment references cleaned up in ten source/test files
+        (`padded_mutex.go`, `segment_pad.go`, `insert_pos.go`,
+        `insert_pos_publish.go`, `insertion_tracker.go`,
+        `tail_publisher.go`, `tail_publisher_test.go`,
+        `stripe_append.go`, `stripe_writer_core.go`,
+        `publish_visibility.go`) — each occurrence of
+        `[[0107-0007h]]` / `lsnAllocator` rewritten to point at
+        `[[0107-0007k]]` `insertPosTracker` (the load-bearing
+        successor) or stripped from foundation-chain reference
+        lists. Slice B foundation count decremented accordingly
+        (e.g. `stripeWriterCore` preamble now reads "thirteen
+        earlier slice B foundations" instead of fourteen).
+        `docs/design/README.md`: row for `0107-0007h` removed;
+        rows for `0107-0007i` and `0107-0007j` rewritten to drop
+        their `[[0107-0007h]]` references in favour of
+        `insertPosTracker` (lock-ordering tier now reads
+        `appendLockSet.lockByProcNum → (rare) insertPosTracker.posMu`
+        instead of `lsnAllocator.rotateMu`); new row for the
+        deletion design doc added. Stale `[[0107-0007h]]` references
+        in older slice B foundation design docs (0107-0007i through
+        0107-0007w) and earlier fix_plan loop entries are left
+        verbatim as point-in-time historical record — those are
+        append-only loop notes / decision narratives, not
+        load-bearing design index entries. Verified: `go test
+        -race -count=1 ./internal/wal/` PASS (3.18 s);
+        `go vet ./internal/wal/` clean. Design:
+        `docs/design/0107-0007x-lsn-allocator-removed.md` (indexed
+        in `docs/design/README.md`). PG-compat — none (deletion of
+        dead in-memory primitive; WAL record / file format /
+        catalog / wire all unchanged). Out of scope (call-site
+        rewrite): rewriting `state.append` body to call
+        `core.Append` (parts 2/3 of slice B); rewriting
+        `drainBufferBytes` prelude to call `core.PublishUpTo`;
+        8-byte MAXALIGN of record sizes in the Append pre-amble.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
