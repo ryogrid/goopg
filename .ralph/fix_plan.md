@@ -4724,6 +4724,86 @@ Operational policy (2026-05-20):
         from the primary with the xl_prev chain already stamped,
         so plain `core.Append` (foundation 14) is the right
         primitive for that site.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 17 of N —
+        `predictEmittedSize` pure size-prediction helper): added
+        `predictEmittedSize(recordLen, startPos, segSize) (total,
+        leading int)` in new file `internal/wal/predict_emitted_size.go`.
+        Pure mirror of `emitWithPageHeaders`' byte arithmetic — does
+        no I/O, no allocation, no locks. Reuses the existing
+        `pageHeaderSizeAt(pos, segSize)` helper from `xlog_emit.go`
+        so any future header-layout change applies everywhere
+        atomically. Closes the second chicken-and-egg behind the
+        slice B call-site rewrite: [[0107-0007y]] `stripeAppendBuild`
+        takes a known `size` and a `build(prev)` closure, but
+        PG-compat records need page headers inserted by
+        `emitWithPageHeaders` whose byte count depends on the
+        reservation's start position (24 B short headers at
+        page-aligned positions, 40 B long headers at segment
+        boundaries, plus contrecord headers at every page crossing).
+        The call-site rewrite will read `posTracker.curr` for the
+        candidate startPos, call `predictEmittedSize` to learn the
+        exact emitted size at that position, then call
+        `core.AppendBuilt(procNum, size, build)` to reserve and
+        encode atomically. Invalid inputs (recordLen ≤ 0,
+        segSize ≤ 0, startPos < 0) return (0, 0) — defence-in-depth
+        for inputs real callers never produce (encodeRecordXLog
+        always produces > 0 bytes; Config.SegmentSize is > 0 after
+        withDefaults; startPos is a non-negative LSN). Subtle race
+        documented in the design doc: between `core.Load` and the
+        matching `core.AppendBuilt`, a peer stripe could advance
+        `curr` and invalidate the prediction; the fix is to thread
+        the prediction INTO `reserveAndPublish` under `posMu`
+        (foundation 18 candidate or call-site rewrite). The current
+        `core.AppendBuilt` rejects size-mismatched build closures
+        with `errStripeAppendBuildSizeMismatch`, so the failure mode
+        is loud, not silent corruption. Five regression tests in
+        `internal/wal/predict_emitted_size_test.go` totalling ~170
+        lines: the keystone is
+        `TestPredictEmittedSizeMatchesEmitWithPageHeaders`, a
+        16-startPos × 10-recordLen byte-for-byte round-trip against
+        the actual `emitWithPageHeaders` function (covering
+        page-aligned, segment-aligned, mid-page, just-before/at/
+        after boundary positions and 1-byte through segment-
+        spanning record sizes — 160 cases total; the two share zero
+        implementation surface so agreement across the matrix pins
+        the arithmetic in one direction and detects drift in the
+        other);
+        `TestPredictEmittedSizeLeadingHeader` (mid-page → 0,
+        page-boundary → short, segment-boundary → long, higher
+        segment-boundary → long);
+        `TestPredictEmittedSizeShortContrecord` (one-page-cross →
+        recordLen + short header);
+        `TestPredictEmittedSizeLongContrecordAtSegmentBoundary`
+        (200-byte record straddling a segment boundary → recordLen +
+        long header);
+        `TestPredictEmittedSizeMultipleContrecordCrossings` (3-page
+        span starting at segment boundary 0 → long leading + 2
+        short contrecord headers + recordLen);
+        `TestPredictEmittedSizeInvalidInputsReturnZero` (all five
+        invalid-input cases → (0, 0)). Verified: `go test -race
+        -count=1 -run 'TestPredictEmittedSize' ./internal/wal/`
+        PASS (1.96 s); `go test -race -count=1 ./internal/wal/`
+        PASS (4.11 s); `go vet ./internal/wal/` clean. Design:
+        `docs/design/0107-0007z-wal-predict-emitted-size.md`
+        (indexed in `docs/design/README.md`). Dead code until the
+        slice B call-site rewrite consumes it; foundation-first
+        pattern matches slice C ([[0107-0007b]] / [[0107-0007c]] /
+        [[0107-0007d]] before [[0107-0007e]] / [[0107-0007f]] /
+        [[0107-0007g]]) and the sixteen earlier slice B foundations
+        ([[0107-0007i]] through [[0107-0007y]] minus the
+        dead-code-removed [[0107-0007h]]). PG-compat — none (pure
+        size-prediction mirror; produces no bytes, does not
+        interact with on-disk WAL).
+        Out of scope (deferred to call-site rewrite + later
+        foundations): threading the prediction under `posMu` so a
+        peer reservation cannot land between size-prediction and
+        reserve (foundation 18 candidate); mounting
+        `core.AppendBuilt` as the body of `state.append` /
+        `state.tryAppend` for the PG-compat path; mounting
+        `core.PublishUpTo` in the drain goroutine's prelude;
+        walreceiver replay (`appendRaw`) does not use page-header
+        insertion — incoming bytes already carry headers stamped by
+        the primary — so `predictEmittedSize` is not on that path.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
