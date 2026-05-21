@@ -5194,6 +5194,114 @@ Operational policy (2026-05-20):
         primary — so that path will continue to consume the
         size-explicit [[0107-0007p]] `reserveAndPublish` /
         [[0107-0007u]] `stripeAppend` instead.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 22 of N —
+        `(*stripeWriterCore).AppendXLogPayload` top-level PG-compat
+        composer): closes the slice B foundation chain by packaging
+        [[0107-0007ad]] `predictXLogRecordLen` + [[0107-0007ab]]
+        `AppendBuiltEmitted` + `encodeRecordXLog` +
+        `emitWithPageHeaders` into a single method on
+        `stripeWriterCore` plus standalone `appendXLogPayload(c,
+        procNum, payload, segSize, sysID, tli)` (new file
+        `internal/wal/append_xlog_payload.go`). The composer is a
+        4-line delegation:
+            _, paddedLen := predictXLogRecordLen(payload)
+            return c.AppendBuiltEmitted(procNum, paddedLen,
+                func(start, prev uint64, total, leading int) ([]byte, error) {
+                    record, realRecLen, eerr := encodeRecordXLog(payload, prev)
+                    if eerr != nil {
+                        return nil, eerr
+                    }
+                    out, _ := emitWithPageHeaders(record, realRecLen,
+                        int64(start), segSize, sysID, tli)
+                    return out, nil
+                })
+        This is the mount-point the slice B call-site rewrite will
+        install at `state.append`'s PG-compat write path — one method
+        call replacing today's roughly 10 lines of inline encode +
+        emit at each of the three PG-compat call sites
+        (`state.append`, `state.tryAppend`, `state.appendBatch`).
+        Byte-stream identical to today's `state.append` PG-compat
+        path: `encodeRecordXLog` produces a MAXALIGN-padded
+        `XLogRecord` with the post-reservation `prev` stamped into
+        `xl_prev`; `emitWithPageHeaders` stamps standard/long page
+        headers at `start`-relative page boundaries with the
+        cluster's `sysID` + `tli`; cross-segment crossings emit an
+        XLOG_NOOP pad record (built by [[0107-0007j]]
+        `buildSegmentPadRecord`, dropped under `posMu` by
+        [[0107-0007s]] `emitSegmentPad` in the `onCrossSegment`
+        hook of [[0107-0007k]] `insertPosTracker`) at the gap, and
+        the triggering reservation lands at the boundary with a
+        long PHD. The contract pins that `paddedLen ==
+        len(encodeRecordXLog(payload, prev))` for ANY value of
+        `prev` — `encodeRecordXLog`'s output length is
+        `maxAlignXLog(xlogRecordHeaderSize + wrappedLen)`,
+        independent of `prev`. The `len(out) == total` assertion
+        inside `stripeAppendBuiltEmitted` (foundation 19) catches
+        any drift between the predict path and the encode path.
+        Nil-safety: nil receiver → `errStripeWriterCoreNil`; nil
+        payload → `errStripeAppendEmptyRecord`
+        (`predictXLogRecordLen(nil) == (0, 0)` →
+        `AppendBuiltEmitted` rejects `recordLen<=0`); empty-but-
+        non-nil `[]byte{}` proceeds normally with `paddedLen=32`
+        (a legitimate body-less record). Lock-ordering tier
+        inherits [[0107-0007ab]] `AppendBuiltEmitted`'s chain
+        verbatim; no new locks taken. Eight regression tests in
+        `internal/wal/append_xlog_payload_test.go`:
+        `TestAppendXLogPayloadHappyPathReturnsPredictedSizes`
+        (first reservation start=0, long PHD, total matches
+        `predictEmittedSize`);
+        `TestAppendXLogPayloadTwoRecordsFormChain` (two
+        contiguous reservations; second's prev field equals
+        first's start; on-wire `xl_prev` byte field decoded from
+        walBuf confirms the build closure stamped the value);
+        `TestAppendXLogPayloadBytesLandInWalBuf` (composer output
+        byte-identical to direct `encodeRecordXLog` +
+        `emitWithPageHeaders` for the same `(payload, start, prev)`
+        tuple); `TestAppendXLogPayloadNilReceiverReturnsError`
+        (errStripeWriterCoreNil);
+        `TestAppendXLogPayloadNilPayloadReturnsEmptyRecordError`
+        (errStripeAppendEmptyRecord);
+        `TestAppendXLogPayloadEmptyByteSliceProceeds` (empty non-
+        nil payload produces a 32-byte record);
+        `TestAppendXLogPayloadCrossSegmentBoundary`
+        (`segSize = 2*XLOGBlockSize` so the segment boundary
+        coincides with a page boundary; reservation crosses,
+        post-boundary start=segSize with long PHD on the new
+        segment-aligned page);
+        `TestAppendXLogPayloadEncodeAndEmitSizesAgree` (7-case
+        payload matrix — empty, 1 byte, 8 bytes, 100 bytes,
+        0xFF / 0x100 switchover, full block — pins composer
+        `total == predictEmittedSize(paddedLen, 0, segSize)`).
+        Verified: `go test -race -count=1 -run
+        'TestAppendXLogPayload' ./internal/wal/` PASS (1.03 s);
+        `go test -race -count=1 ./internal/wal/` PASS (4.11 s);
+        `go vet ./internal/wal/` clean. Design:
+        `docs/design/0107-0007ae-wal-append-xlog-payload.md`
+        (indexed in `docs/design/README.md`). PG-compat — none
+        (in-memory composer; byte stream identical to legacy
+        `state.append` flow). Dead code until the slice B
+        call-site rewrite mounts `core.AppendXLogPayload` at the
+        PG-compat write entry points; foundation-first pattern
+        matches slice C ([[0107-0007b]] / [[0107-0007c]] /
+        [[0107-0007d]] before [[0107-0007e]] / [[0107-0007f]] /
+        [[0107-0007g]]) and the twenty-one earlier slice B
+        foundations ([[0107-0007i]] through [[0107-0007ad]]
+        minus the dead-code-removed [[0107-0007h]] /
+        [[0107-0007x]]). Out of scope (deferred to call-site
+        rewrite): mounting at the `state.append` /
+        `state.tryAppend` / `state.appendBatch` PG-compat write
+        entry points (multi-loop because `state.appendMu`'s four
+        invariants — writePos / walBuf / memRing / writeLSN —
+        split into per-stripe local state vs. shared state);
+        mounting `core.PublishUpTo` in the drain goroutine's
+        prelude (`drainBufferBytes` currently runs under
+        `appendMu` — rewrite must let drain run concurrently with
+        stripe writes by consuming the publisher's return as
+        drain ceiling); walreceiver replay (`appendRaw`) does not
+        use page-header insertion — bytes arrive pre-encoded from
+        the primary — so that path will continue to consume the
+        size-explicit [[0107-0007p]] `reserveAndPublish` /
+        [[0107-0007u]] `stripeAppend` instead.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded

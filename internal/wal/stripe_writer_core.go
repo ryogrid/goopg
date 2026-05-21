@@ -234,6 +234,29 @@ func (c *stripeWriterCore) AppendBuiltEmitted(procNum int32, recordLen int, buil
 	return stripeAppendBuiltEmitted(c.locks, c.posTracker, c.inserting, c.walBuf, c.memRing, procNum, recordLen, build)
 }
 
+
+// AppendXLogPayload is the top-level PG-compat WAL append composer.
+// Closes the foundation chain by delegating to foundation 22
+// ([[0107-0007ae]]) appendXLogPayload, which wraps predictXLogRecordLen
+// + AppendBuiltEmitted + encodeRecordXLog + emitWithPageHeaders into
+// a single call. Returns the reservation's start LSN, the prev LSN
+// stamped into xl_prev, the total emitted byte count (page headers
+// + record body), the leading page-header byte count (0 if start is
+// not page-aligned), and any error from reservation, encode, or the
+// byte writes.
+//
+// This is the mount-point the slice B call-site rewrite will install
+// at `state.append`'s PG-compat write path; the byte stream produced
+// is identical to today's `state.append` PG-compat path (encodeRecordXLog
+// + emitWithPageHeaders under appendMu), only under per-stripe locking.
+//
+// nil receiver returns errStripeWriterCoreNil so the call-site rewrite
+// can detect a mis-wired Writer without a nil-pointer panic — same
+// contract as Append / AppendBuilt / AppendBuiltEmitted.
+func (c *stripeWriterCore) AppendXLogPayload(procNum int32, payload []byte, segSize int64, sysID uint64, tli uint32) (start, prev uint64, total, leading int, err error) {
+	return appendXLogPayload(c, procNum, payload, segSize, sysID, tli)
+}
+
 // PublishUpTo advances both ring tails to the safe-tail watermark
 // derived from upperBound and the core's insertion tracker, by
 // delegating to [[0107-0007t]] publishVisibility. Returns the
