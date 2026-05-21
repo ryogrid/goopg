@@ -1,6 +1,9 @@
 package wal
 
-import "errors"
+import (
+	"errors"
+	"sync/atomic"
+)
 
 // walBuffer is the bounded in-memory WAL buffer introduced by
 // M0013-0001 (see docs/design/0013-0001-wal-buffers-architecture.md).
@@ -19,11 +22,14 @@ import "errors"
 // walsender-side MemRing (M0010-0002) is a separate, concurrent
 // data structure that mirrors every successful append.
 type walBuffer struct {
-	cap  int64  // fixed at construction; equals Config.WALBuffers
-	buf  []byte // ring backing storage; len == cap
-	base int64  // LSN that buf[0] currently represents (in bytes)
-	head int64  // first un-drained byte LSN; head ≥ base
-	tail int64  // first unwritten byte LSN; tail ≥ head
+	cap  int64        // fixed at construction; equals Config.WALBuffers
+	buf  []byte       // ring backing storage; len == cap
+	base int64        // LSN that buf[0] currently represents (in bytes)
+	head int64        // first un-drained byte LSN; head ≥ base
+	tail atomic.Int64 // first unwritten byte LSN; tail ≥ head. Atomic so a
+	// single drain goroutine's publishTail can advance the watermark while
+	// concurrent stripe writers' readers (resident / readForDrain / readAt)
+	// observe it race-free. See docs/design/0107-0007r-wal-buffer-tail-atomic.md.
 }
 
 // newWALBuffer returns a new buffer with the given capacity.
@@ -42,12 +48,12 @@ func newWALBuffer(cap int64) *walBuffer {
 func (b *walBuffer) reset(startLSN int64) {
 	b.base = startLSN
 	b.head = startLSN
-	b.tail = startLSN
+	b.tail.Store(startLSN)
 }
 
 // resident returns the number of bytes currently held in the
 // buffer (waiting to be drained to segments).
-func (b *walBuffer) resident() int64 { return b.tail - b.head }
+func (b *walBuffer) resident() int64 { return b.tail.Load() - b.head }
 
 // free returns the number of bytes that could be appended
 // without forcing a drain.
@@ -62,7 +68,8 @@ func (b *walBuffer) canHold(n int) bool { return int64(n) <= b.cap }
 // (i.e. drained any overflow first). Wraparound is handled
 // byte-wise.
 func (b *walBuffer) append(record []byte) {
-	off := (b.tail - b.base) % b.cap
+	tail := b.tail.Load()
+	off := (tail - b.base) % b.cap
 	n := int64(len(record))
 	first := b.cap - off
 	if first >= n {
@@ -71,7 +78,7 @@ func (b *walBuffer) append(record []byte) {
 		copy(b.buf[off:b.cap], record[:first])
 		copy(b.buf[0:n-first], record[first:])
 	}
-	b.tail += n
+	b.tail.Store(tail + n)
 }
 
 // readForDrain returns up to `n` bytes of the head of the buffer
@@ -116,10 +123,14 @@ func (b *walBuffer) advanceHead(n int64) {
 // from the resident [head, tail) range and returns the number of bytes copied.
 // Caller is responsible for synchronization.
 func (b *walBuffer) readAt(pos int64, out []byte) int {
-	if b == nil || len(out) == 0 || pos < b.head || pos >= b.tail {
+	if b == nil || len(out) == 0 || pos < b.head {
 		return 0
 	}
-	avail := int(b.tail - pos)
+	tail := b.tail.Load()
+	if pos >= tail {
+		return 0
+	}
+	avail := int(tail - pos)
 	if avail > len(out) {
 		avail = len(out)
 	}

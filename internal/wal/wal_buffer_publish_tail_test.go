@@ -20,8 +20,8 @@ func TestWALBufferPublishTailAdvancesFromBase(t *testing.T) {
 	if got != 140 {
 		t.Fatalf("publishTail return = %d, want 140", got)
 	}
-	if b.tail != 140 {
-		t.Fatalf("b.tail = %d, want 140", b.tail)
+	if b.tail.Load() != 140 {
+		t.Fatalf("b.tail = %d, want 140", b.tail.Load())
 	}
 	if b.head != 100 || b.base != 100 {
 		t.Fatalf("head/base mutated: head=%d base=%d, want both 100", b.head, b.base)
@@ -42,8 +42,8 @@ func TestWALBufferPublishTailMonotonicIgnoresRegression(t *testing.T) {
 	if got != 64 {
 		t.Fatalf("regressing publishTail return = %d, want 64", got)
 	}
-	if b.tail != 64 {
-		t.Fatalf("b.tail = %d, want 64 (must not regress)", b.tail)
+	if b.tail.Load() != 64 {
+		t.Fatalf("b.tail = %d, want 64 (must not regress)", b.tail.Load())
 	}
 }
 
@@ -60,8 +60,8 @@ func TestWALBufferPublishTailEqualIsNoop(t *testing.T) {
 	if got != 50 {
 		t.Fatalf("equal publishTail return = %d, want 50", got)
 	}
-	if b.tail != 50 || b.head != 0 || b.base != 0 {
-		t.Fatalf("state changed under equal publish: tail=%d head=%d base=%d", b.tail, b.head, b.base)
+	if b.tail.Load() != 50 || b.head != 0 || b.base != 0 {
+		t.Fatalf("state changed under equal publish: tail=%d head=%d base=%d", b.tail.Load(), b.head, b.base)
 	}
 }
 
@@ -80,8 +80,8 @@ func TestWALBufferPublishTailDoesNotMutateHeadBase(t *testing.T) {
 			t.Fatalf("publishTail(%d) mutated head=%d base=%d", v, b.head, b.base)
 		}
 	}
-	if b.tail != 1255 {
-		t.Fatalf("final tail = %d, want 1255", b.tail)
+	if b.tail.Load() != 1255 {
+		t.Fatalf("final tail = %d, want 1255", b.tail.Load())
 	}
 }
 
@@ -200,8 +200,8 @@ func TestWALBufferPublishTailComposesWithAdvanceHead(t *testing.T) {
 	if got := b.resident(); got != 0 {
 		t.Fatalf("resident after drain = %d, want 0", got)
 	}
-	if b.head != 40 || b.tail != 40 {
-		t.Fatalf("head/tail after drain: head=%d tail=%d, want 40/40", b.head, b.tail)
+	if b.head != 40 || b.tail.Load() != 40 {
+		t.Fatalf("head/tail after drain: head=%d tail=%d, want 40/40", b.head, b.tail.Load())
 	}
 
 	// Another write+publish cycle confirms publishTail extends tail
@@ -213,8 +213,8 @@ func TestWALBufferPublishTailComposesWithAdvanceHead(t *testing.T) {
 	if got != 80 {
 		t.Fatalf("publishTail second return = %d, want 80", got)
 	}
-	if b.tail != 80 || b.head != 40 {
-		t.Fatalf("after second publish: tail=%d head=%d, want 80/40", b.tail, b.head)
+	if b.tail.Load() != 80 || b.head != 40 {
+		t.Fatalf("after second publish: tail=%d head=%d, want 80/40", b.tail.Load(), b.head)
 	}
 	if got := b.resident(); got != 40 {
 		t.Fatalf("resident after second publish = %d, want 40", got)
@@ -240,8 +240,8 @@ func TestWALBufferPublishTailDoesNotEvictPendingWrites(t *testing.T) {
 	if b.head != 0 {
 		t.Fatalf("publishTail evicted head: head=%d, want 0 (no auto-eviction)", b.head)
 	}
-	if b.tail != 96 {
-		t.Fatalf("publishTail did not advance tail: tail=%d, want 96", b.tail)
+	if b.tail.Load() != 96 {
+		t.Fatalf("publishTail did not advance tail: tail=%d, want 96", b.tail.Load())
 	}
 	// resident now reports 96 (caller's responsibility to drain).
 	if got := b.resident(); got != 96 {
@@ -266,8 +266,8 @@ func TestWALBufferPublishTailMonotonicUnderSerialisedAdvances(t *testing.T) {
 	want := []int64{100, 200, 200, 300, 300, 400, 400, 401}
 	for i, v := range vals {
 		b.publishTail(v)
-		if b.tail != want[i] {
-			t.Fatalf("step %d: after publishTail(%d) tail=%d, want %d", i, v, b.tail, want[i])
+		if b.tail.Load() != want[i] {
+			t.Fatalf("step %d: after publishTail(%d) tail=%d, want %d", i, v, b.tail.Load(), want[i])
 		}
 	}
 }
@@ -282,12 +282,10 @@ func TestWALBufferPublishTailMonotonicUnderSerialisedAdvances(t *testing.T) {
 // covers the entire written range, readAt confirms every record
 // landed in the right place.
 //
-// Note: walBuffer.tail is still a plain int64 (the atomic upgrade is
-// a follow-on foundation per [[0107-0007]] slice B "Out of scope").
-// The test runs the publisher in a goroutine and drives publishTail
-// from a single thread via a serialisation channel so we exercise the
-// API surface under -race without prematurely asserting field-level
-// atomicity.
+// walBuffer.tail is atomic.Int64 (see
+// docs/design/0107-0007r-wal-buffer-tail-atomic.md); the publisher
+// goroutine and writer goroutines coexist without a data race
+// because every read uses Load and every write uses Store.
 func TestWALBufferPublishTailRaceFreeWithDisjointWriters(t *testing.T) {
 	t.Parallel()
 	runPublishTailDisjointWritersScenario(t)
@@ -350,8 +348,8 @@ func runPublishTailDisjointWritersScenario(t *testing.T) {
 	<-publisherDone
 
 	b.publishTail(totalBytes)
-	if b.tail != totalBytes {
-		t.Fatalf("final tail = %d, want %d", b.tail, totalBytes)
+	if b.tail.Load() != totalBytes {
+		t.Fatalf("final tail = %d, want %d", b.tail.Load(), totalBytes)
 	}
 
 	out := make([]byte, recordLen)
@@ -389,5 +387,71 @@ func TestWALBufferPublishTailWatchdog(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("publishTail concurrent scenario exceeded 5 s — possible deadlock")
+	}
+}
+
+// TestWALBufferTailIsAtomicInt64 is a compile-time pin on the type
+// of walBuffer.tail. The slice B call-site rewrite (8-stripe writers
+// + dedicated drain goroutine) requires tail to be atomic.Int64 so
+// concurrent readers (resident / readForDrain / readAt) and the
+// single drain publisher observe a race-free monotonic watermark.
+// Anyone shrinking this back to a plain int64 trips the type
+// assertion at compile time.
+func TestWALBufferTailIsAtomicInt64(t *testing.T) {
+	t.Parallel()
+	var b walBuffer
+	// Take the address — atomic.Int64 has noCopy, so a value
+	// assignment trips vet. The pointer form is the canonical
+	// way to assert a field's atomic type.
+	var _ *atomic.Int64 = &b.tail
+}
+
+// TestWALBufferPublishTailObservedByConcurrentReader pins that a
+// reader goroutine observing b.tail via .Load() during a writer
+// goroutine's Store loop never sees a value that exceeds the
+// writer's highest stored value, and never observes a regression
+// across two successive Loads — i.e. atomic semantics hold under
+// concurrent access. The previous int64 field could in principle
+// be sliced into torn reads on 32-bit; the atomic.Int64 upgrade
+// guarantees this never happens regardless of platform.
+//
+// Race-detector also catches the data race on a plain int64 field
+// when this test runs under `go test -race`; the explicit
+// monotonicity assertion is defence in depth so a CI run without
+// -race still catches a regression that re-introduces a torn-read
+// hazard.
+func TestWALBufferPublishTailObservedByConcurrentReader(t *testing.T) {
+	t.Parallel()
+	const iters = 100_000
+	b := newWALBuffer(int64(iters) + 64)
+	b.reset(0)
+
+	var done atomic.Bool
+	var stored atomic.Int64
+
+	go func() {
+		for i := int64(1); i <= iters; i++ {
+			b.publishTail(i)
+			stored.Store(i)
+		}
+		done.Store(true)
+	}()
+
+	var lastSeen int64
+	for !done.Load() {
+		v := b.tail.Load()
+		if v < lastSeen {
+			t.Fatalf("tail regressed: lastSeen=%d, current=%d", lastSeen, v)
+		}
+		if v > stored.Load()+1 {
+			// stored is set AFTER publishTail returns; v may be
+			// the very latest store that hasn't yet propagated to
+			// `stored`. Allow a +1 slack.
+			t.Fatalf("tail %d exceeded stored ceiling %d", v, stored.Load()+1)
+		}
+		lastSeen = v
+	}
+	if got := b.tail.Load(); got != iters {
+		t.Fatalf("final tail = %d, want %d", got, iters)
 	}
 }

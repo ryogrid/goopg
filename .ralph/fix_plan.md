@@ -3907,6 +3907,74 @@ Operational policy (2026-05-20):
         `insertPosTracker` + `insertionTracker` + `tailPublisher` +
         `reserveAndPublish` + `publishTail` — `reserve` remains in
         the API as a callable primitive without a tracker.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 11 of N —
+        `walBuffer.tail` upgraded to `atomic.Int64`): closed the
+        "Out of scope" item from [[0107-0007q]] that left the
+        field-level atomicity upgrade as a follow-on. `walBuffer.tail`
+        in `internal/wal/wal_buffer.go` is now `atomic.Int64` (was
+        plain `int64`). Five production sites rewritten: `reset`
+        (`b.tail.Store(startLSN)`); `resident` (`b.tail.Load() -
+        b.head`); `append` (single `Load` captures start, final
+        `Store(tail+n)` publishes — single-goroutine usage under
+        `appendMu` so a plain Load+Store is correct, no CAS); `readAt`
+        (single-`Load` snapshot stored in local `tail` so the
+        `pos >= tail` guard and the `tail - pos` avail computation
+        see a coherent value); `publishTail` (`Load → if safeTail >
+        cur → Store(safeTail)`, monotonic by construction).
+        Concurrency model under the planned slice B call-site
+        rewrite: stripe writers never touch `b.tail` (they use
+        `writeReserved` which only writes `b.buf`); the drain
+        goroutine is the sole writer to `b.tail` via `publishTail`;
+        readers (`resident` / `readForDrain` / `readAt`) Load
+        race-free against that Store. CAS is unnecessary because
+        there is no writer-vs-writer race in the planned model;
+        documented at the call site so a future multi-publisher
+        caller can promote to a CAS loop if needed. `b.head` and
+        `b.base` stay plain `int64` — both mutated only by
+        `advanceHead` on the drain goroutine and read only from the
+        same goroutine in the planned model. Test updates: 11 reads
+        in `wal_buffer_publish_tail_test.go` and 5 reads in
+        `wal_buffer_write_reserved_test.go` rewritten to `.Load()`;
+        3 direct writes (`b.tail = totalBytes` / `216` / `1010`) to
+        `.Store(...)`. Two new regression tests in
+        `wal_buffer_publish_tail_test.go`:
+        `TestWALBufferTailIsAtomicInt64` (compile-time pin via
+        `*atomic.Int64 = &b.tail`; pointer form sidesteps the
+        `atomic.noCopy` vet check that the value-assignment form
+        would trip — anyone shrinking the field back to a plain
+        `int64` trips a compile error);
+        `TestWALBufferPublishTailObservedByConcurrentReader` (100 K
+        iterations: a writer goroutine alternates `publishTail(i)`
+        with `stored.Store(i)`; the main goroutine reads
+        `b.tail.Load()` and asserts (a) the observed value never
+        regresses across successive Loads — monotonic snapshot —
+        and (b) the observed value never exceeds the writer's
+        last-Stored ceiling by more than 1, since `stored.Store(i)`
+        runs *after* `publishTail(i)` returns and may briefly lag).
+        Under `-race`, any data race on a plain `int64` field would
+        be flagged; the monotonicity assertions are defence in depth
+        for non-race CI runs. PG counterpart:
+        `XLogCtl->LogwrtResult.Write` accessed via
+        `pg_atomic_read_u64` on platforms with native 8-byte
+        atomics, or via `info_lck` spinlock otherwise. goopg's
+        `atomic.Int64` is the direct equivalent of the former.
+        Verified: `go test -race -count=1 ./internal/wal/` PASS
+        (3.18 s); `go vet ./internal/wal/` clean. Design:
+        `docs/design/0107-0007r-wal-buffer-tail-atomic.md` (indexed
+        in `docs/design/README.md`). Dead code until the slice B
+        call-site rewrite — atomicity becomes load-bearing once the
+        drain goroutine begins calling `publishTail` outside any
+        global lock. Out of scope (later foundations and call-site
+        rewrite): upgrading `b.head` / `b.base` to atomics (single-
+        goroutine under the planned model); mounting `publishTail`
+        on `Writer` and consuming it from the drain/flush goroutine
+        (multi-loop because `state.append` currently advances
+        `walBuf.tail` and `memRing.tail` synchronously inside
+        `appendMu`); deciding whether `lsnAllocator` ([[0107-0007h]])
+        becomes dead-code-removed once the call-site converges on
+        `insertPosTracker` + `insertionTracker` + `tailPublisher` +
+        `reserveAndPublish` + `publishTail` — `reserve` remains in
+        the API as a callable primitive without a tracker.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded

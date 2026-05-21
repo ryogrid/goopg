@@ -43,17 +43,17 @@ package wal
 // the buffer unset under `Config.WALBuffers == 0` without per-call
 // guards at the publication call site.
 //
-// Concurrent safety. Like the rest of walBuffer today, this
-// primitive does NOT take a lock; the caller is responsible for
-// synchronisation. Under the slice B call-site rewrite, tail will
-// be upgraded to `atomic.Int64` so a single drain goroutine's
-// publishTail and concurrent stripe writers' readers (resident /
-// readForDrain / readAt) coexist without a data race. That
-// atomicity upgrade is a separate follow-on foundation; this
-// primitive lands the API first so the call-site rewrite can wire
-// it in alongside the upgrade. Under today's single-goroutine
-// usage (state.append holding appendMu), publishTail is trivially
-// safe.
+// Concurrent safety. b.tail is `atomic.Int64` (see
+// docs/design/0107-0007r-wal-buffer-tail-atomic.md). publishTail
+// reads it with Load and writes it with Store; resident /
+// readForDrain / readAt read it with Load. A single drain
+// goroutine's publishTail can therefore advance the watermark
+// while concurrent stripe writers' readers observe it without a
+// data race. publishTail itself takes no lock — it is intended to
+// run on a single drain goroutine; concurrent publishers would
+// still be monotonic-by-Load+Store but would lose updates under
+// CAS races (acceptable only if the caller subsumes that into the
+// "monotonic snapshot" contract).
 //
 // Lock-ordering tier (leaf publisher; the publisher never reaches
 // back up the chain):
@@ -67,9 +67,10 @@ func (b *walBuffer) publishTail(safeTail int64) int64 {
 	if b == nil {
 		return 0
 	}
-	if safeTail <= b.tail {
-		return b.tail
+	cur := b.tail.Load()
+	if safeTail <= cur {
+		return cur
 	}
-	b.tail = safeTail
-	return b.tail
+	b.tail.Store(safeTail)
+	return safeTail
 }
