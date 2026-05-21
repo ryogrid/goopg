@@ -2067,6 +2067,32 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `TestPort_IsolationMergeMatchRecheck`: SKIP → PASS.
           **PASS count = 16**: adds MergeMatchRecheck.
         - Next: **Stop this milestone and start M0107 (because this milestone depends on M0107)**
+        - **Loop-9 slotToRow *Slot fix (2026-05-21)**: `slotToRow` in
+          `internal/executor/slot.go` lacked a case for `*Slot` (M0107
+          Phase C concrete type). Any expression evaluated via the
+          ExprAdapter path (InExpr, CaseExpr, SubqueryExpr, ExistsExpr,
+          ExtractExpr, FuncCall) while running under `projectOpNext`
+          received `slot=*Slot`, `slotToRow` returned nil, causing
+          "column ref X/N on nil slot" errors in both simple and extended
+          query protocols. Added `case *Slot: v.Row()` to `slotToRow`.
+          Commit: a0ca7c4. Regression: all 16 PASS tests still PASS;
+          all core packages (executor/server/planner/parser/analyzer) clean.
+          InsertConflictSpecconflict advances from L5 nil-slot to L20
+          NOTICE content (current_setting gap); EvalPlanQual advances
+          from L394 to L411 first divergence. PASS count still 16 (no
+          new tests flip to PASS this loop — residual gaps listed below).
+          Remaining blockers per test:
+          - InsertConflictSpecconflict: `current_setting('spec.session')`
+            not implemented → NOTICE shows `in session` (missing int).
+          - DropIndexConcurrently1: sort-key elimination (id+data vs id)
+            + 0 rows returned after DROP INDEX CONCURRENTLY.
+          - MergeUpdate: MERGE RETURNING `old`/`new` pseudo-columns
+            (PG 17 feature) not implemented.
+          - MergeJoin: column-width difference in EXPLAIN output.
+          - EvalPlanQual: EPQ noisy_oper call-count parity (NOTICE
+            ordering differs for concurrent update re-evaluation).
+          - EvalPlanQualTrigger: BEFORE-trigger mid-scan RETURNING
+            interleaving (step echo ordering vs result output).
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
