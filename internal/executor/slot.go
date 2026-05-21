@@ -214,6 +214,16 @@ func slotToRow(view SlotView) Row {
 			return nil
 		}
 		return v.Row()
+	case *Slot:
+		// Phase C concrete slot (M0107-0003): used by evalFastExpr's ExprAdapter
+		// path when evalExprSlot is called with a *Slot from projectOpNext /
+		// filterOpNext. Without this case, expressions that convert the slot to a
+		// Row (InExpr, CaseExpr, SubqueryExpr, ExistsExpr, ExtractExpr, FuncCall)
+		// fall to default and return nil, causing spurious "nil slot" errors.
+		if v == nil {
+			return nil
+		}
+		return v.Row()
 	default:
 		return nil
 	}
