@@ -3490,6 +3490,152 @@ Operational policy (2026-05-20):
         deciding whether `lsnAllocator` ([[0107-0007h]]) becomes
         dead-code-removed once the call-site converges on
         `insertPosTracker` + `insertionTracker` + `tailPublisher`.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 8 of N —
+        `MemRing.WriteReserved` + `MemRing.PublishUpTo` stripe-
+        concurrent in-memory mirror): added two methods on the
+        existing `MemRing` (`internal/wal/mem_ring.go`, M0010-0002
+        walsender in-memory mirror) plus sentinel error
+        `errMemRingReservedOutOfRange`, all in new file
+        `internal/wal/mem_ring_concurrent.go`.
+        `WriteReserved(pos int64, data []byte) error` writes
+        `len(data)` bytes at LSN byte position `pos` without
+        advancing head or tail; bytes become readable via `ReadAt`
+        only after a subsequent `PublishUpTo` advances tail past
+        `pos+len(data)`. `PublishUpTo(safeTail int64)` advances tail
+        monotonically to `safeTail`, evicting oldest residents
+        (advancing head) when `safeTail - head > cap`. Problem
+        addressed: the existing `MemRing.Append(pos, data)` resets
+        the ring on non-`tail` `pos` ("the existing residence is no
+        longer trustworthy"). Under the slice B 8-stripe writer
+        model, peer stripes write disjoint LSN ranges out-of-order —
+        feeding such writes through `Append` would reset the ring on
+        every other call, destroying the walsender RAM cache. This
+        foundation provides the [[0107-0007l]]
+        `walBuffer.writeReserved`-shaped primitive: disjoint-LSN
+        writes with no implicit tail advance, plus a separate
+        publication step driven by [[0107-0007n]] `tailPublisher`.
+        Errors: `errMemRingReservedOutOfRange` if
+        `[pos, pos+len(data))` escapes the ring's currently-
+        allocated `[head, head+cap)` window — covers both
+        `pos<head` (already evicted by prior `PublishUpTo`) and
+        `pos+n>head+cap` (write target outside ring's address range);
+        exact boundary `pos+n==head+cap` accepted. Empty data is a
+        no-op returning nil; runs *before* the range check so a
+        zero-length write with out-of-window `pos` is benign. Nil
+        receiver is a no-op returning nil for both methods (matches
+        MemRing's nil-safe convention so call-site rewrite can leave
+        the ring unset under `wal_sender_memory_buffer == 0`
+        without per-write-site guards). Concurrency: `WriteReserved`
+        holds the read lock for the memcpy duration; multiple
+        `WriteReserved`s at disjoint LSN ranges run in parallel
+        under the read lock. `PublishUpTo` takes the write lock and
+        excludes everything — required because head advance reclaims
+        ring slots that an in-flight low-LSN `WriteReserved` might
+        still be mid-memcpy on. The slice B call site further
+        constrains: `tailPublisher`'s `safeTail` can never exceed
+        any stripe's active reservation LSN, so a well-behaved
+        drain never advances past an active write; the lock is
+        defence in depth. Overlapping LSN ranges from two concurrent
+        `WriteReserved`s are a contract violation producing
+        undefined ring contents; the slice B call site makes this
+        structurally impossible via [[0107-0007k]]
+        `insertPosTracker`'s joint-atomicity of `(curr, prev)`
+        under `posMu`. PG counterpart: PG has no separate
+        "memring" — its equivalent is the shared WAL buffer
+        `XLogCtl->pages` (`CopyXLogRecordToWAL` writes there under
+        WAL insert locks) plus `XLogCtl->LogwrtResult.Write` as the
+        published watermark. The reserve/publish split is identical;
+        goopg's MemRing exists for a different reason (M0010-0001's
+        direct-IO write path bypasses the OS page cache), but under
+        stripe-concurrent writers both rings need identical
+        publication discipline. Lock-ordering tier (leaf reader on
+        write side; leaf publisher on drain side): writer chain
+        `appendLockSet.lockByProcNum → insertPosTracker.reserve →
+        insertionTracker.setInsertingAt(start) →
+        walBuffer.writeReserved → MemRing.WriteReserved →
+        insertionTracker.setInsertingAt(idle) → drop stripe lock`;
+        drain `tailPublisher.publishUpTo(upperBound,
+        insertionTracker) → walBuffer.advanceHead(published - prior)
+        → MemRing.PublishUpTo(published)`. Pre-reserve race
+        carry-over from [[0107-0007m]] and [[0107-0007n]]: the
+        observed `lowestActiveLSN` (which `tailPublisher` consumes
+        and feeds to `MemRing.PublishUpTo`) can temporarily exceed
+        the true minimum; closing this race is the call-site
+        rewrite's job (option A: move `setInsertingAt` under
+        `posMu`; option B: emit a pre-reserve marker), not this
+        foundation's. Coexistence: `Append` and `WriteReserved`+
+        `PublishUpTo` describe two writer modes that take the same
+        `mu` correctly so coexistence is mechanically safe, but in
+        practice a given `Writer` will use one or the other after
+        the call-site rewrite. Dead code until slice B's call-site
+        rewrite mounts these methods on `Writer` and consumes them
+        from `state.append` + the drain/flush goroutine;
+        foundation-first pattern matches slice C ([[0107-0007b]] /
+        [[0107-0007c]] / [[0107-0007d]] before [[0107-0007e]] /
+        [[0107-0007f]] / [[0107-0007g]]) and the seven earlier
+        slice B foundations ([[0107-0007h]] / [[0107-0007i]] /
+        [[0107-0007j]] / [[0107-0007k]] / [[0107-0007l]] /
+        [[0107-0007m]] / [[0107-0007n]]). Fifteen regression tests
+        in `internal/wal/mem_ring_concurrent_test.go`:
+        `TestMemRingWriteReservedAtHeadNoWrap` (write at
+        `pos==head==0`; head/tail untouched; bytes at `buf[:5]`);
+        `TestMemRingWriteReservedAtNonZeroOffset` (LSN→slot
+        arithmetic; pre-marker fill detects any leakage outside
+        target range); `TestMemRingWriteReservedWrapsAcrossRingBoundary`
+        (write straddles cap boundary, split across
+        `[pos%cap, cap)` + `[0, n-first)`);
+        `TestMemRingWriteReservedRejectsBelowHead` (after head
+        advance, pre-head pos rejected);
+        `TestMemRingWriteReservedRejectsPastWindow` (exact boundary
+        `pos+n==head+cap` accepted; `pos+n>head+cap` and
+        `pos==head+cap` rejected);
+        `TestMemRingWriteReservedEmptyIsNoop` (nil/empty data
+        short-circuit *before* range check; out-of-window empty
+        write still returns nil; head/tail untouched);
+        `TestMemRingWriteReservedNilReceiver` (nil receiver returns
+        nil for both methods);
+        `TestMemRingWriteReservedDoesNotMutateHeadTail` (8 writes
+        leave head/tail exactly as before);
+        `TestMemRingPublishUpToAdvancesTail` (tail tracks
+        `safeTail`; head stays at 0 when residency fits in cap);
+        `TestMemRingPublishUpToMonotonic` (regressing or equal
+        `safeTail` is a no-op);
+        `TestMemRingPublishUpToEvictsWhenOverCap` (`safeTail-head>cap`
+        advances head; pinned across two evictions);
+        `TestMemRingPublishUpToNilReceiver` (defensive nil-safety
+        on publisher side);
+        `TestMemRingWriteReservedReadbackViaReadAt` (end-to-end:
+        ReadAt misses before publication, hits after with same
+        bytes); `TestMemRingWriteReservedConcurrentDisjoint` (8
+        goroutines × 50 records × 16 bytes in disjoint LSN ranges;
+        race-clean under `-race`; every stripe's marker bytes land
+        in right slot after final `PublishUpTo`);
+        `TestMemRingPublishUpToAndWriteReservedSerialise` (8
+        writers × 100 records race while publisher goroutine
+        continuously advances tail using min-across-writers progress
+        to mimic `tailPublisher`'s discipline; final ReadAt of
+        every written LSN range succeeds with right bytes).
+        Verified: `go test -race -count=1 -run 'TestMemRing'
+        ./internal/wal/` PASS (1.02 s); `go test -race -count=1
+        ./internal/wal/` PASS (3.13 s). Design:
+        `docs/design/0107-0007o-wal-mem-ring-write-reserved.md`
+        (indexed in `docs/design/README.md`). Out of scope (later
+        slice B foundations and call-site rewrite): mounting
+        `MemRing.WriteReserved` + `PublishUpTo` on `Writer` and
+        rewriting `state.append`'s current `MemRing.Append` call
+        (multi-loop work because `state.append` currently advances
+        `walBuf.tail` and `memRing.tail` jointly inside `appendMu`;
+        rewrite splits the two and lets drain run concurrently);
+        closing the pre-reserve race ([[0107-0007m]] §"Pre-reserve
+        race") — owned by call-site rewrite; drain coordination
+        with concurrent stripe writes (`drainBufferBytes` currently
+        runs under `appendMu` — rewrite must let drain run
+        concurrently with stripe writes by consuming
+        `tailPublisher.publishUpTo`'s return as drain ceiling for
+        both `walBuffer.advanceHead` and `MemRing.PublishUpTo`);
+        deciding whether `lsnAllocator` ([[0107-0007h]]) becomes
+        dead-code-removed once the call-site converges on
+        `insertPosTracker` + `insertionTracker` + `tailPublisher`.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
