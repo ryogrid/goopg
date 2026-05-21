@@ -5302,6 +5302,83 @@ Operational policy (2026-05-20):
         the primary — so that path will continue to consume the
         size-explicit [[0107-0007p]] `reserveAndPublish` /
         [[0107-0007u]] `stripeAppend` instead.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 23 of N —
+        WAL append parity gate + prev-RecPtr divergence discovery):
+        added `internal/wal/append_xlog_payload_parity_test.go` with
+        four side-by-side tests comparing the legacy
+        `encodeRecordXLog + emitWithPageHeaders + walBuf.append`
+        sequence (`state.append`'s PG-compat Path B today) against
+        the [[0107-0007ae]] `stripeWriterCore.AppendXLogPayload`
+        composer the call-site rewrite will mount. Helper
+        `emitLegacyPGCompatRecord(walBuf, payload, prev, writePos,
+        segSize, sysID, tli) → (start0Based, advance, err)` factors
+        the legacy emission so the parity comparison reads as a
+        clean A/B.
+        **Discovery — prev-RecPtr convention divergence (deferred to
+        call-site rewrite)**: running the multi-record tests against
+        the current implementation surfaced a real semantic gap.
+        Legacy `state.append` stores `s.prevRecPtr = writePos +
+        leading` (record-CONTENT start LSN, after any leading PHD —
+        matches PG's xl_prev convention). Slice B's
+        `insertPosTracker.reserveLocked` /
+        `reserveEmittedAndPublish` stores `t.prev = start`
+        (reservation start, INCLUDES leading PHD). For records
+        preceded by a page header the on-wire `xl_prev` stamped by
+        the build closure differs by `leading` bytes; a
+        `pg_waldump` reader would land on a page-header byte
+        instead of an XLogRecord header. Concretely for two records
+        back-to-back at segment 0 (long PHD at offset 0): legacy
+        record 1 start = LSN 40, record 2 xl_prev = 40; core record
+        1 start = LSN 0, record 2 xl_prev = 0. Foundation 22's
+        design doc's "byte-identical to today's `state.append`
+        PG-compat path" claim is empirically falsified for
+        multi-record chains where any previous reservation crossed
+        a page or segment boundary. Resolution path documented in
+        `docs/design/0107-0007af-wal-append-parity-gate.md`:
+        option (a) — store `t.prev` in record-CONTENT space inside
+        `reserveEmittedAndPublish` as `t.prev = start +
+        uint64(leading)`. Translation depends only on data already
+        in scope under posMu via the `predictEmittedSize`-returned
+        `leading`; cleaner than option (b) of translating in the
+        build closure. Updating slice B foundation tests that pin
+        the reservation-start convention
+        (`TestAppendXLogPayloadTwoRecordsFormChain`,
+        `TestReserveEmittedAndPublishCrossSegmentChainIntegrity`,
+        et al.) is part of the resolution scope. Cross-segment
+        XLOG_NOOP pad path also needs review (the triggering
+        reservation's prev after the pad is currently the pad's
+        reservation start = `gapStart`, would need translation if
+        the post-boundary record gets a long PHD).
+        Four regression tests:
+        `TestAppendXLogPayloadParityFirstRecordAlwaysAgrees`
+        (single-record case, prev=0 on both sides — the only
+        chain where both paths currently agree; ACTIVE regression
+        guard against future single-record breakage);
+        `TestAppendXLogPayloadParityWithLegacyEncodeEmit` (8-record
+        chain spanning multiple page crossings; `t.Skip` with
+        `parityDeferredReason`);
+        `TestAppendXLogPayloadParityShortRecordsSingleStripe` (64
+        records single-stripe; `t.Skip`);
+        `TestAppendXLogPayloadParityEmptyBodyRecords` (body-less
+        `[]byte{}` chain; `t.Skip`). All three deferred tests cite
+        the same `parityDeferredReason` constant so a single
+        future loop removes all three Skips together — removing
+        them is the gate the prev-RecPtr resolution must pass to
+        declare the slice B call-site rewrite ready for PG-compat
+        traffic. Verified: `go test -race -count=1 -run
+        'TestAppendXLogPayloadParity' ./internal/wal/` PASS
+        (1.02 s, 3 SKIP); `go test -race -count=1 ./internal/wal/`
+        PASS. Design:
+        `docs/design/0107-0007af-wal-append-parity-gate.md`
+        (indexed in `docs/design/README.md`). PG-compat — none
+        (test only; the discovered gap is what THIS gate exists
+        to defend against on the call-site rewrite). Foundation-
+        first pattern matches slice C ([[0107-0007b]] /
+        [[0107-0007c]] / [[0107-0007d]] before [[0107-0007e]] /
+        [[0107-0007f]] / [[0107-0007g]]) and the twenty-two
+        earlier slice B foundations ([[0107-0007i]] through
+        [[0107-0007ae]] minus the dead-code-removed
+        [[0107-0007h]] / [[0107-0007x]]).
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
