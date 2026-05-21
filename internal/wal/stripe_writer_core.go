@@ -179,6 +179,30 @@ func (c *stripeWriterCore) Append(procNum int32, record []byte) (start, prev uin
 	return stripeAppend(c.locks, c.posTracker, c.inserting, c.walBuf, c.memRing, procNum, record)
 }
 
+
+// AppendBuilt performs one stripe-locked WAL append where the record's
+// bytes can only be materialised AFTER the LSN reservation grants a
+// stable `prev` LSN. Delegates to [[0107-0007y]] stripeAppendBuild with
+// the core's bundled primitives. Returns the reservation's start LSN,
+// the prev LSN that was passed into `build`, and any error from build
+// or the byte writes. Per stripeAppendBuild's contract, the END marker
+// fires before unlock regardless of outcome.
+//
+// Use AppendBuilt for PG-compat records whose xl_prev field
+// (`XLogRecord.Prev`) must reflect the joint-atomic prev returned by
+// the reservation; use Append when the caller has already encoded the
+// bytes without prev linkage (e.g., legacy goopg-internal records).
+//
+// nil receiver returns errStripeWriterCoreNil so the call-site rewrite
+// can detect a mis-wired Writer (core unset before append path
+// reached) without a nil-pointer panic — same contract as Append.
+func (c *stripeWriterCore) AppendBuilt(procNum int32, size int, build func(prev uint64) ([]byte, error)) (start, prev uint64, err error) {
+	if c == nil {
+		return 0, 0, errStripeWriterCoreNil
+	}
+	return stripeAppendBuild(c.locks, c.posTracker, c.inserting, c.walBuf, c.memRing, procNum, size, build)
+}
+
 // PublishUpTo advances both ring tails to the safe-tail watermark
 // derived from upperBound and the core's insertion tracker, by
 // delegating to [[0107-0007t]] publishVisibility. Returns the

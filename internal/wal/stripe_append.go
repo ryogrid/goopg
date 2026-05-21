@@ -163,6 +163,156 @@ func stripeAppend(
 	return start, prev, nil
 }
 
+
+// stripeAppendBuild is the encode-after-reserve variant of [[0107-0007u]]
+// stripeAppend. It exists because the slice B call-site rewrite cannot
+// reuse stripeAppend verbatim for PG-compat records: a record's xl_prev
+// field (`XLogRecord.Prev`, [[encodeRecordXLog]]) depends on the prev
+// LSN that becomes known only after the LSN reservation. Pre-encoding
+// with a stale prev breaks the xl_prev chain across stripes; passing
+// an unencoded record into stripeAppend skips the encoding entirely.
+//
+// stripeAppendBuild closes that chicken-and-egg by reserving `size`
+// LSN bytes first, then invoking `build(prev)` under the stripe lock
+// so the caller can encode the record with the post-reservation prev,
+// then writes the returned bytes into both rings. The reservation
+// granted by reserveAndPublish dictates `size`; build MUST return a
+// byte slice of exactly that length so the ring writes line up with
+// the reserved LSN range. Returning a mis-sized slice is a structured
+// error (`errStripeAppendBuildSizeMismatch`) — not a panic — so a
+// regression in the encoder is caught with a structured error and
+// the END marker still fires (publication never freezes).
+//
+// Foundation 16 for M0107-0007 slice B. Closes the deferred decision
+// noted in foundation 14 ([[0107-0007u]] §"Empty record contract") and
+// foundation 15 ([[0107-0007v]] §"Out of scope — call-site rewrite")
+// about the pre-reservation encoding gap. The next call-site rewrite
+// part (slice B part 2 — `state.append` body rewrite) consumes this
+// composer for the PG-compat write entry point; the legacy non-PG
+// encoder (`encodeRecord`, no xl_prev linkage) can continue to use
+// stripeAppend with a pre-encoded record.
+//
+// Lock-ordering tier — matches [[0107-0007u]] stripeAppend's chain
+// with `build(prev)` slotted between reserveAndPublish and the byte
+// writes:
+//
+//	stripeAppendBuild(locks, posTracker, insertTracker, walBuf, memRing, procNum, size, build)
+//	  → appendLockSet.lockByProcNum               (one of 8 stripes)
+//	    → insertPosTracker.reserveAndPublish      (posMu held)
+//	        → (rare) onCrossSegment(start, boundary, gapPrev)
+//	            → emitSegmentPad → buildSegmentPadRecord +
+//	              walBuffer.writeReserved + MemRing.WriteReserved
+//	    → build(prev)                             (caller's encoder; no lock acquired)
+//	    → walBuffer.writeReserved                 (no lock; leaf)
+//	    → MemRing.WriteReserved                   (memRing.mu read-lock)
+//	    → insertionTracker.setInsertingAt(stripe, lsnIdle)
+//	  → drop stripe lock
+//
+// Build error handling. If `build(prev)` returns a non-nil error,
+// stripeAppendBuild returns that error and the END marker still fires
+// via defer (LIFO ordering same as stripeAppend). The LSN reservation
+// itself cannot be unwound — peer stripes may have already advanced
+// past it — so a failed build leaves a published LSN range that no
+// bytes will ever cover. The slice B caller treats build errors as
+// fatal at the WAL append boundary (the only realistic source is
+// EncodeXLogRecordHeader, whose failure modes are all programmer bugs
+// downstream of input validation that the caller already performed).
+//
+// Size-mismatch contract. `build(prev)` MUST return a slice of length
+// exactly `size`. The composer validates this before the ring writes
+// because writeReserved would write past the reserved window
+// (corrupting peer-stripe data) or short of it (publishing zeros into
+// the WAL stream). Mis-size → `errStripeAppendBuildSizeMismatch` with
+// END marker fired; caller's reservation is lost in the same way as a
+// build error.
+//
+// Nil-checks. Same contract as stripeAppend, plus `build` itself:
+// nil build → `errStripeAppendNilBuild` before any side effect.
+//
+// Empty-size contract. `size == 0` is rejected with
+// `errStripeAppendEmptyRecord` (same sentinel as stripeAppend's empty
+// record case; reserveAndPublish would panic on size == 0 by design).
+//
+// Concurrency. Identical to stripeAppend — two calls with procNums
+// that hash to different stripes proceed in parallel; only the
+// per-stripe mutex serialises within a stripe. PG's
+// `postgres/src/backend/access/transam/xlog.c` again is the model: the
+// encode step (CopyXLogRecordToWAL) happens under WALInsertLockAcquire
+// after ReserveXLogInsertLocation — same ordering.
+//
+// Dead code until the slice B call-site rewrite mounts this composer
+// at the PG-compat write entry point; foundation-first pattern matches
+// slice C ([[0107-0007b]] / [[0107-0007c]] / [[0107-0007d]] before
+// [[0107-0007e]] / [[0107-0007f]] / [[0107-0007g]]) and the fifteen
+// earlier slice B foundations ([[0107-0007i]] through [[0107-0007w]]
+// minus the dead-code-removed [[0107-0007h]]).
+func stripeAppendBuild(
+	locks *appendLockSet,
+	posTracker *insertPosTracker,
+	insertTracker *insertionTracker,
+	walBuf *walBuffer,
+	memRing *MemRing,
+	procNum int32,
+	size int,
+	build func(prev uint64) ([]byte, error),
+) (start, prev uint64, err error) {
+	if locks == nil {
+		return 0, 0, errStripeAppendNilLocks
+	}
+	if posTracker == nil {
+		return 0, 0, errStripeAppendNilPosTracker
+	}
+	if insertTracker == nil {
+		return 0, 0, errStripeAppendNilInsertTracker
+	}
+	if build == nil {
+		return 0, 0, errStripeAppendNilBuild
+	}
+	if size <= 0 {
+		return 0, 0, errStripeAppendEmptyRecord
+	}
+
+	stripe := stripeForProcNum(procNum)
+	locks.locks[stripe].mu.Lock()
+	defer locks.locks[stripe].mu.Unlock()
+	// END marker before unlock (LIFO defer order) — same contract as
+	// stripeAppend: drain-side tailPublisher must be unblocked even
+	// if build or the ring writes fail, otherwise publication freezes.
+	defer insertTracker.setInsertingAt(stripe, lsnIdle)
+
+	start, prev = posTracker.reserveAndPublish(uint64(size), stripe, insertTracker)
+
+	record, berr := build(prev)
+	if berr != nil {
+		return start, prev, berr
+	}
+	if len(record) != size {
+		return start, prev, errStripeAppendBuildSizeMismatch
+	}
+
+	if walBuf != nil {
+		if werr := walBuf.writeReserved(int64(start), record); werr != nil {
+			return start, prev, werr
+		}
+	}
+	if memRing != nil {
+		if merr := memRing.WriteReserved(int64(start), record); merr != nil {
+			return start, prev, merr
+		}
+	}
+	return start, prev, nil
+}
+
+// errStripeAppendNilBuild is returned when stripeAppendBuild is invoked
+// with a nil build closure.
+var errStripeAppendNilBuild = errors.New("wal: stripeAppendBuild: nil build closure")
+
+// errStripeAppendBuildSizeMismatch is returned when stripeAppendBuild's
+// build closure returns a slice whose length does not match the
+// reserved size. Mis-sized writes would either corrupt peer-stripe
+// data (over) or publish zeros into the WAL stream (under).
+var errStripeAppendBuildSizeMismatch = errors.New("wal: stripeAppendBuild: build returned wrong size")
+
 // errStripeAppendNilLocks is returned when stripeAppend is invoked with
 // a nil appendLockSet. The composer rejects rather than panicking so
 // callers can pattern-match programmatically.

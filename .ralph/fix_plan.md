@@ -4627,6 +4627,103 @@ Operational policy (2026-05-20):
         `core.Append` (parts 2/3 of slice B); rewriting
         `drainBufferBytes` prelude to call `core.PublishUpTo`;
         8-byte MAXALIGN of record sizes in the Append pre-amble.
+      - PARTIAL PROGRESS 2026-05-21 (slice B foundation 16 of N —
+        `stripeAppendBuild` encode-after-reserve composer): added
+        the encode-after-reserve sibling of [[0107-0007u]]
+        `stripeAppend` to `internal/wal/stripe_append.go` so the
+        call-site rewrite can materialise PG-compat record bytes
+        using the prev LSN that [[0107-0007k]]
+        `insertPosTracker.reserveAndPublish` returns. Closes the
+        chicken-and-egg: stripeAppend takes a pre-encoded `record
+        []byte`, but `XLogRecord.Prev` (`xl_prev`) carries the
+        immediately-preceding record's start LSN — known only AFTER
+        the reservation. Pre-encoding with a stale prev breaks the
+        chain under concurrent stripe writers; patching the encoded
+        record in place after reservation forces cross-stripe
+        coupling that slice B is eliminating. The clean fix is to
+        invert the order: reserve first, then encode with the
+        assigned prev, then write. New function
+        `stripeAppendBuild(locks, posTracker, insertTracker, walBuf,
+        memRing, procNum, size, build func(prev uint64) ([]byte,
+        error)) (start, prev uint64, err error)` slots `build(prev)`
+        between `reserveAndPublish` and the byte writes, all under
+        the stripe lock — `build` runs after posMu is released so
+        multi-stripe encoders cannot serialise on the same posMu.
+        Contracts: `size > 0` (zero panics inside
+        reserveAndPublish), `build != nil`, `len(build(prev)) ==
+        size` (mismatch corrupts peer stripes — over — or publishes
+        zeros — under), build errors propagate verbatim and END
+        marker fires via defer (publication never freezes). New
+        `(*stripeWriterCore).AppendBuilt(procNum, size, build)`
+        wraps it. Cross-segment crossings are transparent: build
+        observes the prev that points at the pad record, not the
+        pre-pad record (the `posTracker.onCrossSegment` hook fires
+        synchronously inside reserveAndPublish under posMu, so the
+        pad is published before build receives prev). Eleven
+        regression tests in
+        `internal/wal/stripe_append_build_test.go`:
+        `TestStripeAppendBuildHappyPathReceivesPrev` pins a
+        two-record sequence with prev=0 → prev=start1;
+        `TestStripeAppendBuildNilLocksReturnsError` /
+        `TestStripeAppendBuildNilPosTrackerReturnsError` /
+        `TestStripeAppendBuildNilInsertTrackerReturnsError` /
+        `TestStripeAppendBuildNilBuildReturnsError` cover the
+        nil-guard surface (shared error sentinels with stripeAppend
+        plus a new `errStripeAppendNilBuild`);
+        `TestStripeAppendBuildZeroSizeReturnsError` covers `size ∈
+        {0, -1}`;
+        `TestStripeAppendBuildBuildErrorPropagatesAndClearsStripe`
+        confirms build returning a sentinel error propagates AND
+        leaves the insertion tracker idle (END marker fired);
+        `TestStripeAppendBuildSizeMismatchReturnsError` covers
+        15-byte and 17-byte builds against a 16-byte reservation →
+        new `errStripeAppendBuildSizeMismatch`;
+        `TestStripeAppendBuildNilWalBufStillWritesMemRing` /
+        `TestStripeAppendBuildNilMemRingStillWritesWalBuf` pin the
+        per-ring nil-safety;
+        `TestStripeAppendBuildCrossSegmentChainsPrevAcrossPad` uses
+        a 128-byte segment with two 80-byte records — rec #2 crosses
+        the boundary, build receives prev=80 (the pad's start LSN),
+        and rec #2 lands at LSN 128;
+        `TestStripeAppendBuildConcurrentDisjointStripesProgressInParallel`
+        runs 8 stripes × 50 records each and confirms all 400
+        starts are distinct and tracker idle at end;
+        `TestStripeWriterCoreAppendBuiltDelegatesToStripeAppendBuild`
+        exercises the wrapper end-to-end through reserve → build →
+        publish → read-back;
+        `TestStripeWriterCoreAppendBuiltNilReceiverReturnsError`
+        pins the nil-receiver guard. Verified: `go test -race
+        -count=1 -run 'TestStripeAppendBuild|TestStripeWriterCoreAppendBuilt'
+        ./internal/wal/` PASS (1.04 s); `go test -race -count=1
+        ./internal/wal/` PASS (3.18 s); `go vet ./internal/wal/`
+        clean. Design:
+        `docs/design/0107-0007y-stripe-append-build.md` (indexed in
+        `docs/design/README.md`). PG-compat — none (in-memory
+        composer; the encoded record bytes the build closure
+        returns are identical to what the legacy `state.append`
+        path emits via `encodeRecordXLog`, just produced under a
+        stripe lock instead of `state.appendMu`). Dead code until
+        the slice B call-site rewrite mounts `core.AppendBuilt` at
+        the PG-compat write entry point; foundation-first pattern
+        matches slice C ([[0107-0007b]] / [[0107-0007c]] /
+        [[0107-0007d]] before [[0107-0007e]] / [[0107-0007f]] /
+        [[0107-0007g]]) and the fifteen earlier slice B foundations
+        ([[0107-0007i]] through [[0107-0007w]] minus the
+        dead-code-removed [[0107-0007h]]). Out of scope (deferred to
+        call-site rewrite parts 2/3): mounting `core.AppendBuilt`
+        as the body of `state.append` for the PG-compat path
+        (rewriting the appendMu-protected reserve+encode block to
+        use the stripe lock); mounting `core.PublishUpTo` in the
+        drain goroutine's prelude; 8-byte MAXALIGN of record sizes
+        in the Append pre-amble (already satisfied by
+        `encodeRecordXLog`'s `maxAlignXLog(realLen)` padding —
+        the call-site rewrite will assert the invariant at the
+        boundary); group-commit fast path (`tryAppend`) reroute
+        through the core; walreceiver replay (`appendRaw`) does not
+        need `stripeAppendBuild` — its bytes arrive pre-encoded
+        from the primary with the xl_prev chain already stamped,
+        so plain `core.Append` (foundation 14) is the right
+        primitive for that site.
 
  - [ ] **M0107-0008 — Phase D5: runtime internals (`//go:linkname` shims)**
       - Summary: Add `internal/runtimeshim` package with bounded
