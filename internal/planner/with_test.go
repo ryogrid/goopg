@@ -243,3 +243,28 @@ func TestPlanInsertOnConflictDoNothingNoTarget(t *testing.T) {
 		t.Errorf("ArbiterIndex = %+v, want nil for no-target form", ins.OnConflict.ArbiterIndex)
 	}
 }
+
+func TestPlanInsertOnConflictDoNothingNoTargetUsesUniqueIndex(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "pgbench_accounts"})
+	idx, err := cat.CreateIndex(parser.ObjectName{Name: "pgbench_accounts_aid_key"}, tbl, []string{"aid"}, true, "btree", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stmt := parseOne(t,
+		"INSERT INTO pgbench_accounts (aid, abalance) VALUES (1, 0) ON CONFLICT DO NOTHING")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins := node.(*Insert)
+	if ins.OnConflict == nil {
+		t.Fatal("OnConflict nil")
+	}
+	if ins.OnConflict.ArbiterIndex != idx {
+		t.Fatalf("ArbiterIndex = %+v, want %+v", ins.OnConflict.ArbiterIndex, idx)
+	}
+	if len(ins.OnConflict.ArbiterColumns) != 1 || ins.OnConflict.ArbiterColumns[0] != 0 {
+		t.Fatalf("ArbiterColumns = %v, want [0]", ins.OnConflict.ArbiterColumns)
+	}
+}

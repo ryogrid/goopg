@@ -1240,10 +1240,13 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 	_, paddedLen := predictXLogRecordLen(payload)
 	conservativeSize := paddedLen + 64
 
-	// Path A: walBuf disabled or record physically won't fit in ring.
-	// Use old encode path (encodeRecordXLog + emitWithPageHeaders + writeAt),
-	// then resetPosition so subsequent Path B appends start at the right LSN.
-	if s.walBuf == nil || !s.walBuf.canHold(conservativeSize) {
+	// Path A: walBuf disabled, record physically won't fit in ring, OR the
+	// buffer needs draining. The drain case falls here (rather than Path B)
+	// so that appendMu.Lock() is held across drain + write: concurrent
+	// tryAppend goroutines (RLock) are frozen and cannot consume the freed
+	// space between the drain and the write, avoiding errWALBufferReservedOutOfRange.
+	needsDrain := s.walBuf != nil && int64(conservativeSize) > s.walBuf.free()-s.walBuf.reservedBytes.Load()
+	if s.walBuf == nil || !s.walBuf.canHold(conservativeSize) || needsDrain {
 		s.appendMu.Lock()
 		// Publish + drain any buffered bytes before the direct write.
 		if s.walBuf != nil && s.walBuf.resident() > 0 {
@@ -1444,9 +1447,15 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		s.appendMu.RLock()
 		defer s.appendMu.RUnlock()
 
-		// Re-check with current free space under the read lock.
-		// head is stable (only mutated under Lock by advanceHead).
-		if int64(conservativeSize) > s.walBuf.free() {
+		// Atomically claim conservativeSize bytes in the WAL buffer before
+		// reserving LSN space. Multiple concurrent stripe writers under
+		// RLock could each see free() > 0 and all proceed to reserve LSN
+		// space, collectively overflowing the buffer and causing
+		// walBuffer.writeReserved to return errWALBufferReservedOutOfRange.
+		// tryReserve uses a CAS loop so that the check-and-claim is
+		// atomic: only writers whose combined reservations stay within cap
+		// proceed to AppendXLogPayload.
+		if rerr := s.walBuf.tryReserve(int64(conservativeSize)); rerr != nil {
 			return 0, 0, false, nil // overflow; slow path drains then appends
 		}
 
@@ -1455,12 +1464,18 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		var total, leading int
 		start0, _, total, leading, err = s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli)
 		if err != nil {
+			// LSN reservation failed or encoding error; release the buffer
+			// reservation so capacity is not permanently consumed.
+			s.walBuf.releaseReservation(int64(conservativeSize))
 			return 0, 0, false, err
 		}
 
 		// Synchronous publish: advance walBuf.tail and memRing.tail so
 		// drain goroutine and flushUpTo see these bytes.
 		s.core.PublishUpTo(int64(start0) + int64(total))
+		// Release the reservation now that tail has advanced: the bytes are
+		// now counted in resident() rather than reservedBytes.
+		s.walBuf.releaseReservation(int64(conservativeSize))
 
 		end = uint64(int64(start0) + int64(total))
 		// CAS-max: multiple concurrent RLock holders may call this

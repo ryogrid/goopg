@@ -2782,6 +2782,8 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 		return walkExpr(x.Right, fn)
 	case *parser.UnaryOp:
 		return walkExpr(x.Operand, fn)
+	case *parser.CastExpr:
+		return walkExpr(x.Operand, fn)
 	case *parser.IsNullExpr:
 		return walkExpr(x.Operand, fn)
 	case *parser.IsBoolExpr:
@@ -3559,24 +3561,13 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 			}
 		}
 	} else if out.Action == OnConflictActionNothing && cat != nil {
-		// Auto-detect primary key as arbiter for bare ON CONFLICT DO NOTHING.
-		for _, idx := range cat.IndexesOnTable(tbl) {
-			if !idx.Primary {
-				continue
-			}
-			out.ArbiterIndex = idx
-			ords := make([]int, 0, len(idx.Columns))
-			for _, colName := range idx.Columns {
-				for i, col := range tbl.Columns {
-					if strings.EqualFold(col.Name, colName) {
-						ords = append(ords, i)
-						break
-					}
-				}
-			}
-			out.ArbiterColumns = ords
-			break
+		idx, ords, exprs, err := resolveDefaultDoNothingArbiter(tbl, targetAlias, cat)
+		if err != nil {
+			return nil, err
 		}
+		out.ArbiterIndex = idx
+		out.ArbiterColumns = ords
+		out.ArbiterExprs = exprs
 	}
 
 	if out.Action != OnConflictActionUpdate {
@@ -3630,6 +3621,55 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 		out.UpdateWhere = pred
 	}
 	return out, nil
+}
+
+func resolveDefaultDoNothingArbiter(tbl *catalog.Table, targetAlias string, cat catalog.Catalog) (*catalog.Index, []int, []Expr, error) {
+	if cat == nil {
+		return nil, nil, nil, nil
+	}
+	var chosen *catalog.Index
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if !idx.Unique {
+			continue
+		}
+		if chosen == nil || idx.Primary {
+			chosen = idx
+			if idx.Primary {
+				break
+			}
+		}
+	}
+	if chosen == nil {
+		return nil, nil, nil, nil
+	}
+	ords := make([]int, 0, len(chosen.Columns))
+	var exprs []Expr
+	var exprCtx *resolveContext
+	for i, colName := range chosen.Columns {
+		if colName == "" {
+			ords = append(ords, -1)
+			if exprCtx == nil {
+				exprCtx = singleBindingContext(tbl, targetAlias)
+				exprCtx.cat = cat
+				exprs = make([]Expr, len(chosen.Columns))
+			}
+			if chosen.ColExprs == nil || i >= len(chosen.ColExprs) || chosen.ColExprs[i] == nil {
+				return nil, nil, nil, &PlanError{Code: "XX000", Message: fmt.Sprintf("index %q is missing expression metadata for ON CONFLICT DO NOTHING", chosen.Name)}
+			}
+			resolved, err := resolveExpr(*chosen.ColExprs[i], exprCtx)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			exprs[i] = resolved
+			continue
+		}
+		col, ok := cat.LookupColumn(tbl, colName)
+		if !ok {
+			return nil, nil, nil, &PlanError{Code: "XX000", Message: fmt.Sprintf("index %q column %q not found on table %q", chosen.Name, colName, tbl.Name)}
+		}
+		ords = append(ords, col.Ordinal)
+	}
+	return chosen, ords, exprs, nil
 }
 
 // resolveArbiterIndex matches the parsed conflict-target columns

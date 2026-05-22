@@ -5,6 +5,11 @@ import (
 	"sync/atomic"
 )
 
+// walBufferCapacityExceeded is returned by tryReserve when the
+// requested reservation would push (resident + reservedBytes) past cap.
+// Callers should fall back to the slow path (drain then append).
+var walBufferCapacityExceeded = errors.New("wal: buffer capacity exceeded")
+
 // walBuffer is the bounded in-memory WAL buffer introduced by
 // M0013-0001 (see docs/design/0013-0001-wal-buffers-architecture.md).
 // It sits between state.append and state.writeAt: appended records
@@ -50,6 +55,15 @@ type walBuffer struct {
 	// single drain goroutine's publishTail can advance the watermark while
 	// concurrent stripe writers' readers (resident / readForDrain / readAt)
 	// observe it race-free. See docs/design/0107-0007r-wal-buffer-tail-atomic.md.
+	reservedBytes atomic.Int64 // bytes claimed by concurrent stripe writers that
+	// have passed the free()-space check and hold appendMu.RLock() but have not
+	// yet called PublishUpTo (so tail has not yet advanced to cover them).
+	// Invariant: resident() + reservedBytes ≤ cap at all times.
+	// tryReserve atomically increments this under a CAS loop; releaseReservation
+	// decrements it after PublishUpTo advances tail. This prevents multiple
+	// concurrent stripe writers from each seeing "enough free space" and all
+	// proceeding to reserve LSN space that collectively overflows the buffer,
+	// which would cause walBuffer.writeReserved to return errWALBufferReservedOutOfRange.
 }
 
 // newWALBuffer returns a new buffer with the given capacity.
@@ -69,6 +83,7 @@ func (b *walBuffer) reset(startLSN int64) {
 	b.base.Store(startLSN)
 	b.head.Store(startLSN)
 	b.tail.Store(startLSN)
+	b.reservedBytes.Store(0)
 }
 
 // resident returns the number of bytes currently held in the
@@ -82,6 +97,45 @@ func (b *walBuffer) free() int64 { return b.cap - b.resident() }
 // canHold reports whether `n` bytes fit in the buffer at all
 // (independent of whether a drain would be needed first).
 func (b *walBuffer) canHold(n int) bool { return int64(n) <= b.cap }
+
+// tryReserve atomically claims n bytes of reservation space in the
+// buffer, ensuring that resident() + reservedBytes + n ≤ cap. Returns
+// nil on success; walBufferCapacityExceeded if the buffer (including
+// already-claimed-but-not-yet-tailed bytes) has insufficient free space.
+//
+// On success the caller MUST eventually call releaseReservation(n) after
+// PublishUpTo advances tail to cover the reserved bytes. Failure to do
+// so permanently reduces the effective buffer capacity.
+//
+// The CAS loop guarantees that multiple concurrent stripe writers each
+// claiming n bytes cannot collectively overflow the buffer: if N writers
+// each see free()-reservedBytes >= n, only ⌊cap/n⌋ of them succeed.
+//
+// Concurrent safety: reservedBytes is atomic.Int64; the CAS loop is
+// lock-free and wait-free in the absence of contention. Under heavy
+// contention (8 stripes simultaneously hitting the same boundary) the
+// loop retries at most 8 times per call.
+func (b *walBuffer) tryReserve(n int64) error {
+	for {
+		reserved := b.reservedBytes.Load()
+		resident := b.resident()
+		if resident+reserved+n > b.cap {
+			return walBufferCapacityExceeded
+		}
+		if b.reservedBytes.CompareAndSwap(reserved, reserved+n) {
+			return nil
+		}
+		// CAS lost to a concurrent tryReserve or releaseReservation; retry.
+	}
+}
+
+// releaseReservation decrements reservedBytes by n. Called after
+// PublishUpTo has advanced tail to cover the previously reserved bytes,
+// so that the capacity formerly tracked by reservedBytes is now
+// accounted for by resident() instead.
+func (b *walBuffer) releaseReservation(n int64) {
+	b.reservedBytes.Add(-n)
+}
 
 // append copies `record` into the buffer at position `tail` and
 // advances tail. The caller must guarantee free() ≥ len(record)

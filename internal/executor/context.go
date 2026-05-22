@@ -56,6 +56,11 @@ type Context struct {
 	// need it.
 	Session Session
 
+	// AdvisorySessionIdentity is a stable per-connection token used by
+	// advisory-lock functions when Session is nil (e.g. auto-commit
+	// statements outside an explicit BEGIN/COMMIT block).
+	AdvisorySessionIdentity any
+
 	// Checkpointer, when set, is invoked by the Checkpoint operator
 	// to drive a synchronous checkpoint (see milestone 0002). nil
 	// means the SQL CHECKPOINT verb fails with feature_not_supported
@@ -137,6 +142,25 @@ type Context struct {
 	// spill-to-disk. Zero means unlimited (no spill). Defaults to
 	// 512 MiB when the GUC is active. See milestone 0037.
 	WorkMem int64
+
+	// GetSetting returns the effective session GUC value for the given
+	// name. Wired by the server from the per-connection SessionRegistry;
+	// nil means SQL built-ins like current_setting() cannot resolve
+	// session state in this context.
+	GetSetting func(name string) (string, bool)
+
+	// SetSetting applies a session or transaction-local GUC mutation.
+	// Wired by the server so SQL built-ins like set_config() can mutate
+	// the same SessionRegistry as SET / SET LOCAL.
+	SetSetting func(name, value string, isLocal bool) error
+
+	// AllSettings returns the effective SHOW ALL view for this session.
+	AllSettings func() []SettingValue
+
+	// ResetSetting and ResetAllSettings expose RESET name / RESET ALL to
+	// executor-run utility statements.
+	ResetSetting     func(name string) error
+	ResetAllSettings func()
 
 	// EnableOpportunisticPrune mirrors the enable_opportunistic_prune
 	// GUC (M0046-0002). When true, the HOT-update path calls
@@ -246,6 +270,12 @@ type Context struct {
 	// InDMLCTE is true while cteDMLPrefixOp is executing its DML sub-plans.
 	// Write operators register their output pointers in CTEWriteFence when this is set.
 	InDMLCTE bool
+}
+
+// SettingValue is one effective session setting exposed to SHOW ALL.
+type SettingValue struct {
+	Name  string
+	Value string
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.

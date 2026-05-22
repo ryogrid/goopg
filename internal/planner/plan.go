@@ -1108,7 +1108,19 @@ type Utility struct {
 }
 
 func (n *Utility) Pos() int       { return n.pos }
-func (n *Utility) Output() Schema { return nil }
+func (n *Utility) Output() Schema {
+	switch stmt := n.Stmt.(type) {
+	case *parser.ShowStmt:
+		if stmt.All {
+			return Schema{
+				{Name: "name", Type: catalog.Type{Name: "text"}},
+				{Name: "setting", Type: catalog.Type{Name: "text"}},
+			}
+		}
+		return Schema{{Name: stmt.Name, Type: catalog.Type{Name: "text"}}}
+	}
+	return nil
+}
 
 // Checkpoint — `CHECKPOINT`. Distinct from Utility because it has
 // real side-effects (synchronous flush + WAL marker), wired through

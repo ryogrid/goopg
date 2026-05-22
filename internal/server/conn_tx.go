@@ -122,6 +122,7 @@ func (c *connTxState) Session() *executor.BasicSession {
 func (c *connTxState) End() {
 	c.mu.Lock()
 	if c.sess != nil {
+		executor.ReleaseAdvisoryTransactionLocks(c.sess)
 		c.sess.EndExplicitTransaction()
 	}
 	c.active = false

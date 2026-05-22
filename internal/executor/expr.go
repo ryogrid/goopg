@@ -169,8 +169,15 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 			case KindString:
 				schema, rel := splitQualifiedTable(v.StringValue())
-				if tbl, found := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel}); found && tbl != nil {
+				objName := parser.ObjectName{Schema: schema, Name: rel}
+				if tbl, found := ctx.Catalog.LookupTable(objName); found && tbl != nil {
 					return NewIntDatum(int64(tbl.OID)), nil
+				}
+				// Also resolve index names: 'idx_name'::regclass returns the index OID.
+				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+					if idx, found := im.LookupIndex(objName); found && idx != nil {
+						return NewIntDatum(int64(idx.OID)), nil
+					}
 				}
 			}
 		}
@@ -2490,6 +2497,34 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), ns, time.UTC)), nil
 	case "current_catalog":
 		return NewStringDatum("postgres"), nil
+	case "current_setting":
+		if len(x.Args) >= 1 {
+			nameArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || nameArg.IsNull() {
+				return NullDatum, nil
+			}
+			missingOK := false
+			if len(x.Args) >= 2 {
+				missingArg, err := evalExpr(x.Args[1], row, ctx)
+				if err == nil && !missingArg.IsNull() {
+					missingOK = missingArg.BoolValue()
+				}
+			}
+			if ctx != nil && ctx.GetSetting != nil {
+				if value, ok := ctx.GetSetting(nameArg.StringValue()); ok {
+					return NewStringDatum(value), nil
+				}
+			}
+			if missingOK {
+				return NullDatum, nil
+			}
+			return Datum{}, &ExecError{
+				Code:    "42704",
+				Pos:     x.Pos(),
+				Message: fmt.Sprintf("unrecognized configuration parameter %q", nameArg.StringValue()),
+			}
+		}
+		return NullDatum, nil
 	case "pg_sleep":
 		return evalPgSleep(x, row, ctx)
 	case "to_timestamp":
@@ -2523,9 +2558,30 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// vacuumdb calls SELECT pg_catalog.set_config('search_path', '', false)
 		// to restrict the search path for security. Accept and return new_value.
 		if len(x.Args) >= 2 {
+			nameArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || nameArg.IsNull() {
+				return NullDatum, nil
+			}
 			newVal, err := evalExpr(x.Args[1], row, ctx)
 			if err != nil {
 				return NullDatum, nil
+			}
+			isLocal := false
+			if len(x.Args) >= 3 {
+				localArg, err := evalExpr(x.Args[2], row, ctx)
+				if err == nil && !localArg.IsNull() {
+					isLocal = localArg.BoolValue()
+				}
+			}
+			if ctx != nil && ctx.SetSetting != nil {
+				if err := ctx.SetSetting(nameArg.StringValue(), newVal.Format(), isLocal); err != nil {
+					return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(), Message: err.Error()}
+				}
+				if ctx.GetSetting != nil {
+					if value, ok := ctx.GetSetting(nameArg.StringValue()); ok {
+						return NewStringDatum(value), nil
+					}
+				}
 			}
 			return newVal, nil
 		}
@@ -2570,12 +2626,11 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 	case "pg_advisory_xact_lock":
 		// pg_advisory_xact_lock(int4, int4) → void  (xact-scoped)
-		// Treated as session-scoped for v0; released by pg_advisory_unlock_all.
-		return evalAdvisoryLock(x, row, ctx, false, false)
+		return evalAdvisoryLock(x, row, ctx, false, true)
 
 	case "pg_try_advisory_xact_lock":
 		// pg_try_advisory_xact_lock(int4, int4) → boolean  (non-blocking)
-		return evalAdvisoryLock(x, row, ctx, true, false)
+		return evalAdvisoryLock(x, row, ctx, true, true)
 
 	case "pg_try_advisory_lock":
 		// pg_try_advisory_lock(bigint) → boolean  (non-blocking)
@@ -4033,7 +4088,7 @@ func parseNumericOrZero(s string) *big.Int {
 //
 //	(bigint)        → key = bigint
 //	(int4, int4)    → key = (classid, objid)
-func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, _ bool) (Datum, error) {
+func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, xactScoped bool) (Datum, error) {
 	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
@@ -4065,7 +4120,7 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 	}
 
 	if tryOnly {
-		ok := globalAdvisoryMgr.tryAcquire(key, sess)
+		ok := globalAdvisoryMgr.tryAcquire(key, sess, xactScoped)
 		return NewBoolDatum(ok), nil
 	}
 
@@ -4074,7 +4129,7 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 	if qctx == nil {
 		qctx = context.Background()
 	}
-	if err := globalAdvisoryMgr.acquire(qctx, key, sess); err != nil {
+	if err := globalAdvisoryMgr.acquire(qctx, key, sess, xactScoped); err != nil {
 		// Context cancelled (step timed out or runner aborted).
 		return NullDatum, nil
 	}
@@ -4118,12 +4173,12 @@ func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context) (Datum, erro
 }
 
 // evalAdvisoryUnlockAll implements pg_advisory_unlock_all(). Releases every
-// advisory lock held by this session and returns NULL (void-like).
+// session-scoped advisory lock held by this session and returns NULL (void-like).
 func evalAdvisoryUnlockAll(ctx *Context) (Datum, error) {
 	if ctx == nil {
 		return NullDatum, nil
 	}
-	globalAdvisoryMgr.releaseAll(advisorySessionIDFromContext(ctx))
+	globalAdvisoryMgr.releaseAllSession(advisorySessionIDFromContext(ctx))
 	return NullDatum, nil
 }
 

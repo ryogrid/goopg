@@ -179,9 +179,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	// relies on monotonic IDs.
 	backendID := lockmgr.BackendID(s.nextBackendID.Add(1))
 	commit := false
+	var advisoryReleaseTarget any
 	defer func() {
 		if autoCommit && !commit {
 			_ = s.cfg.TxnMgr.Rollback(tx)
+			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		}
 		// Always drop locks at txn end so a leftover holder
 		// can't outlive the connection. ReleaseAll is a no-op
@@ -225,6 +227,31 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	ectx.Checkpointer = s.cfg.Checkpointer
 	ectx.StatsTarget = sessionStatsTarget(sess)
 	ectx.WorkMem = sessionWorkMem(sess)
+	if sess != nil {
+		ectx.AdvisorySessionIdentity = sess
+		ectx.GetSetting = func(name string) (string, bool) {
+			_, eff, ok := sess.Get(name)
+			return eff, ok
+		}
+		ectx.SetSetting = func(name, value string, isLocal bool) error {
+			return sess.Set(name, value, isLocal)
+		}
+		ectx.AllSettings = func() []executor.SettingValue {
+			all := sess.All()
+			out := make([]executor.SettingValue, 0, len(all))
+			for _, kv := range all {
+				out = append(out, executor.SettingValue{Name: kv.Name, Value: kv.Value})
+			}
+			return out
+		}
+		ectx.ResetSetting = sess.Reset
+		ectx.ResetAllSettings = sess.ResetAll
+	}
+	if ectx.Session != nil {
+		advisoryReleaseTarget = ectx.Session
+	} else if ectx.AdvisorySessionIdentity != nil {
+		advisoryReleaseTarget = ectx.AdvisorySessionIdentity
+	}
 	ectx.EnableOpportunisticPrune = sessionOpportunisticPrune(sess)
 	ectx.FSM = s.cfg.FSM
 	ectx.VM = s.cfg.VM
@@ -478,6 +505,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		if err := s.cfg.TxnMgr.Commit(tx); err != nil {
 			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 		}
+		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		commit = true
 		maybeForceGCAfterCommit()
 	}
@@ -1031,6 +1059,12 @@ func utilityTag(stmt parser.Stmt) string {
 		return "VACUUM"
 	case *parser.AnalyzeStmt:
 		return "ANALYZE"
+	case *parser.ShowStmt:
+		return "SHOW"
+	case *parser.SetStmt:
+		return "SET"
+	case *parser.ResetStmt:
+		return "RESET"
 	}
 	return "OK"
 }

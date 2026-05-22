@@ -87,6 +87,34 @@ func TestSetThenShowSeesNewValue(t *testing.T) {
 	}
 }
 
+// TestCustomGUCVisibleViaShow pins custom dotted-GUC support at the
+// lightweight query-handler layer. Full current_setting() coverage lives
+// under internal/testport where queries route through the executor.
+func TestCustomGUCVisibleViaShow(t *testing.T) {
+	addr, stop := startTestServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "SET spec.session = 1")
+	frames := readUntilReady(t, conn)
+	if len(frames) == 0 || frames[0].Type == protocol.MsgErrorResponse {
+		t.Fatalf("SET spec.session failed, frames=%+v", frames)
+	}
+
+	writeQuery(t, conn, "SHOW spec.session")
+	frames = readUntilReady(t, conn)
+	if len(frames) < 2 || frames[0].Type != protocol.MsgRowDescription || frames[1].Type != protocol.MsgDataRow {
+		t.Fatalf("unexpected frames for SHOW spec.session: %+v", frames)
+	}
+	dr := frames[1].Payload
+	colLen := int(dr[2])<<24 | int(dr[3])<<16 | int(dr[4])<<8 | int(dr[5])
+	value := string(dr[6 : 6+colLen])
+	if value != "1" {
+		t.Fatalf("SHOW spec.session = %q, want %q", value, "1")
+	}
+}
+
 // TestSetRejectsPostmasterContextVar ensures a SET against a
 // non-userset variable returns ErrorResponse but keeps the connection
 // alive.

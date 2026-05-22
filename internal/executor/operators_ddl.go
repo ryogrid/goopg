@@ -1210,10 +1210,9 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 		return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	var entries []btree.BulkEntry
-	var scanRow Row                                  // M0054-0005c: reusable decode buffer (see comment below).
-	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
-	// M0074-0004 / M0107-0001: per-page mctx for projected varchar /
-	// char / text payloads. Reset on page advance; Release on return.
+	var scanRow Row // M0054-0005c: reusable decode buffer (see comment below).
+	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
+	// Reset on page advance; Release on return.
 	// Datum lifetime ends at encodeBTreeKeyForColumn — the encoded
 	// BulkEntry.Key is an explicit append-copy, so no Datum reference
 	// outlives the Reset boundary.
@@ -1245,20 +1244,26 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			// M0054-0005c: reuse a per-CREATE-INDEX decode buffer to
 			// avoid the per-row `make(Row, len(tbl.Columns))` that
 			// the M0054-0004 idx-window pprof showed at 39 % cum.
-			// True column projection is not feasible here because
-			// the on-disk row encoding is variable-length, so each
-			// column must be decoded sequentially to determine the
-			// next one's offset; the win is the slice-allocation
-			// removal, not the per-column work.
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			// M0054-0005c-followup: skip per-column heap
-			// allocations for columns the index doesn't reference.
-			// Other columns must still be size-scanned to advance
-			// the offset (variable-length codec) but their string/
-			// numeric payloads are not materialised.
-			if err := DecodeRowProjectionIntoArena(scanRow, tbl.Columns, tuple.Data, keep, sctxDDL); err != nil {
+			// Decode using the format indicated by the tuple header's natts
+			// field (Infomask2 low 11 bits). When natts > 0 the row was
+			// written by writeHeapRowReturning with ctx.LogCanonical != nil
+			// (PG physical layout, EncodeRowPG). When natts == 0 the row
+			// uses the legacy goopg layout (EncodeRow). Using the wrong
+			// decoder on PG-format data can produce plausible-looking
+			// but incorrect Datums (e.g. the 0x02 first byte of a LE int4=2
+			// is misread as a TOAST pointer flag and accidentally passes
+			// the sanity check if numChunks happens to be small).
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			var decErr error
+			if storedNatts > 0 {
+				decErr = decodePhysicalPGRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
+			} else {
+				decErr = decodeGoopgRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
+			}
+			if decErr != nil {
 				continue
 			}
 			row := scanRow
@@ -1344,12 +1349,10 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	seen := map[string]struct{}{}
-	var scanRow Row                                  // M0054-0005c: reusable decode buffer.
-	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
-	// M0074-0004 / M0107-0001: per-page mctx for projected varchar /
-	// char / text payloads. Resulting key is copied by caller
-	// (`seen[string(key)]` and `tree.Insert`), so Datums need not
-	// outlive the per-page Reset boundary.
+	var scanRow Row // M0054-0005c: reusable decode buffer.
+	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
+	// Resulting key is copied by caller (`seen[string(key)]` and `tree.Insert`),
+	// so Datums need not outlive the per-page Reset boundary.
 	sctxDDL := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
 	defer sctxDDL.Release()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
@@ -1379,11 +1382,14 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 				continue
 			}
 			// M0054-0005c: reuse the decode buffer.
-			// M0054-0005c-followup: skip non-index column payloads.
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			if err := DecodeRowProjectionIntoArena(scanRow, tbl.Columns, tuple.Data, keep, sctxDDL); err != nil {
+			// Use the format-agnostic decoder (handles both goopg and PG
+			// physical format) so rows written via COPY with LogCanonical
+			// wired (EncodeRowPG) are correctly decoded.
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			if err := DecodeRowIntoMctxPGTuple(scanRow, tbl.Columns, tuple.Data, tuple.Bitmap, storedNatts, sctxDDL); err != nil {
 				continue
 			}
 			row := scanRow

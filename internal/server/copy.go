@@ -157,6 +157,7 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 	ectx.TxnMgr = s.cfg.TxnMgr
 	ectx.Tx = tx
 	ectx.Snap = snap
+	ectx.LogCanonical = s.cfg.LogCanonical
 
 	switch plan.Direction {
 	case planner.CopyTo:

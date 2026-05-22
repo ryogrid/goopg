@@ -3010,8 +3010,11 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 // page in a checkpoint epoch emit a small logical record instead
 // of a full FPI. See docs/design/0002-0003-redo-records.md.
 func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) error {
-	_, err := writeHeapRowReturning(ctx, rel, cols, row)
-	return err
+	ptr, err := writeHeapRowReturning(ctx, rel, cols, row)
+	if err != nil {
+		return err
+	}
+	return emitCanonicalHeapInsert(ctx, rel, ptr)
 }
 
 // writeHeapRowReturning is writeHeapRow's variant that surfaces the

@@ -18,6 +18,10 @@ const (
 	// blockDetectWait is how long a step must run before we assume it is
 	// blocked waiting for a lock.
 	blockDetectWait = 300 * time.Millisecond
+	// postStepDrainWait is how long we wait after a regular step completes for
+	// recently unblocked pending steps to either finish or emit follow-up
+	// notices before advancing to the next regular step.
+	postStepDrainWait = 200 * time.Millisecond
 	// drainWindow is how long we wait for a pending (blocked) step to
 	// unblock after all steps in a permutation have been submitted.
 	drainWindow = 5 * time.Second
@@ -335,7 +339,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			// window to complete (matching PostgreSQL isolationtester order:
 			// unblocked waiting steps appear before the next regular step).
 			sb.WriteString(formatStepOutput(step.Name, step.SQL, outcome, false))
-			pending = drainWithTimeout(&sb, pending, 50*time.Millisecond)
+			pending = drainWithTimeout(&sb, pending, postStepDrainWait)
 
 		case <-time.After(blockDetectWait):
 			// Step appears blocked.  Drain notices that arrived before the
@@ -417,6 +421,15 @@ func writeCompletedStep(sb *strings.Builder, name, sql string, o stepOutcome) {
 	}, true))
 }
 
+func drainPendingStepNotices(sb *strings.Builder, p pendingStep) {
+	if p.queue == nil || p.session == "" {
+		return
+	}
+	for _, notice := range p.queue.drain() {
+		fmt.Fprintf(sb, "%s: NOTICE:  %s\n", p.session, notice)
+	}
+}
+
 // drainCompleted checks each pending step non-blockingly; completed results
 // are appended to sb and removed from the returned slice.
 func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
@@ -429,6 +442,7 @@ func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
 			}
 			writeCompletedStep(sb, p.name, p.sql, o)
 		default:
+			drainPendingStepNotices(sb, p)
 			remaining = append(remaining, p)
 		}
 	}
@@ -454,6 +468,7 @@ func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Du
 			}
 			writeCompletedStep(sb, p.name, p.sql, o)
 		case <-time.After(window):
+			drainPendingStepNotices(sb, p)
 			remaining = append(remaining, p)
 		}
 	}
@@ -795,6 +810,9 @@ func (r *IsolationRunner) RunAndCompare(ctx context.Context, repoRoot string, sp
 		return IsolationSpecResult{SpecPath: specRelPath, Status: "defer",
 			Diff: fmt.Sprintf("run error: %v", err)}
 	}
+
+	// Debug: write actual output to a temp file for analysis.
+	_ = os.WriteFile("/tmp/iso_actual_out.txt", []byte(normalizeIsoOutput(actual)), 0644)
 
 	if normalizeIsoOutput(actual) == normalizeIsoOutput(string(expectedBytes)) {
 		return IsolationSpecResult{SpecPath: specRelPath, Status: "pass"}

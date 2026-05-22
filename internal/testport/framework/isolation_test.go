@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lib/pq"
 )
@@ -111,6 +112,50 @@ func TestNormalizeBoolWireText(t *testing.T) {
 		if got != c.want {
 			t.Errorf("normalizeBoolWireText(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+func TestDrainCompleted_EmitsPendingStepNotices(t *testing.T) {
+	var sb strings.Builder
+	q := &sessionNoticeQueue{}
+	q.push("hello from pending step")
+	pending := []pendingStep{{
+		session: "s1",
+		outCh:   make(chan stepOutcome),
+		queue:   q,
+	}}
+
+	remaining := drainCompleted(&sb, pending)
+	if got, want := sb.String(), "s1: NOTICE:  hello from pending step\n"; got != want {
+		t.Fatalf("drainCompleted output = %q, want %q", got, want)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("remaining steps = %d, want 1", len(remaining))
+	}
+	if got := q.drain(); len(got) != 0 {
+		t.Fatalf("notice queue not drained: %v", got)
+	}
+}
+
+func TestDrainWithTimeout_EmitsPendingStepNotices(t *testing.T) {
+	var sb strings.Builder
+	q := &sessionNoticeQueue{}
+	q.push("hello after unblock")
+	pending := []pendingStep{{
+		session: "s2",
+		outCh:   make(chan stepOutcome),
+		queue:   q,
+	}}
+
+	remaining := drainWithTimeout(&sb, pending, time.Millisecond)
+	if got, want := sb.String(), "s2: NOTICE:  hello after unblock\n"; got != want {
+		t.Fatalf("drainWithTimeout output = %q, want %q", got, want)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("remaining steps = %d, want 1", len(remaining))
+	}
+	if got := q.drain(); len(got) != 0 {
+		t.Fatalf("notice queue not drained: %v", got)
 	}
 }
 

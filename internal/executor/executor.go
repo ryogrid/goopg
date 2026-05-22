@@ -214,8 +214,18 @@ func Build(plan planner.Node) (Operator, error) {
 	case *planner.Utility:
 		// VACUUM / ANALYZE / SHOW / SET / RESET are utility statements.
 		// VACUUM runs the heap page-prune and updates the FSM (M0046-0003).
-		// ANALYZE drives the catalog-stats collector. SHOW/SET/RESET are
-		// handled by the wire layer and shouldn't reach here in practice.
+		// ANALYZE drives the catalog-stats collector. SHOW/SET/RESET also
+		// need executor support for multi-statement simple-query batches and
+		// extended-query execution.
+		if _, ok := p.Stmt.(*parser.ShowStmt); ok {
+			return newUtilitySettingsOp(p), nil
+		}
+		if _, ok := p.Stmt.(*parser.SetStmt); ok {
+			return newUtilitySettingsOp(p), nil
+		}
+		if _, ok := p.Stmt.(*parser.ResetStmt); ok {
+			return newUtilitySettingsOp(p), nil
+		}
 		if _, ok := p.Stmt.(*parser.VacuumStmt); ok {
 			return newVacuumOp(p), nil
 		}
