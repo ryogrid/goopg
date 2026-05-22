@@ -152,34 +152,79 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		}
 		return []byte{0}, nil
 	case "int2", "smallint":
-		if d.Kind != KindInt {
+		var v int64
+		switch d.Kind {
+		case KindInt:
+			v = d.Int
+		case KindString:
+			var err error
+			v, err = coerceStringToInt64(d.StringValue(), "smallint")
+			if err != nil {
+				return nil, err
+			}
+		default:
 			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
 		}
-		v := int16(d.Int)
+		if v < -32768 || v > 32767 {
+			return nil, fmt.Errorf("smallint out of range")
+		}
 		var buf [2]byte
-		binary.LittleEndian.PutUint16(buf[:], uint16(v))
+		binary.LittleEndian.PutUint16(buf[:], uint16(int16(v)))
 		return buf[:], nil
 	case "int4", "integer", "int", "serial":
-		if d.Kind != KindInt {
+		var v int64
+		switch d.Kind {
+		case KindInt:
+			v = d.Int
+		case KindString:
+			var err error
+			v, err = coerceStringToInt64(d.StringValue(), "integer")
+			if err != nil {
+				return nil, err
+			}
+		default:
 			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
 		}
-		v := int32(d.Int)
+		if v < -2147483648 || v > 2147483647 {
+			return nil, &ExecError{Code: "22003",
+				Message: fmt.Sprintf("value %q is out of range for type integer", strings.TrimSpace(d.StringValue()))}
+		}
 		var buf [4]byte
-		binary.LittleEndian.PutUint32(buf[:], uint32(v))
+		binary.LittleEndian.PutUint32(buf[:], uint32(int32(v)))
 		return buf[:], nil
 	case "int8", "bigint", "bigserial":
-		if d.Kind != KindInt {
+		var v int64
+		switch d.Kind {
+		case KindInt:
+			v = d.Int
+		case KindString:
+			var err error
+			v, err = coerceStringToInt64(d.StringValue(), "bigint")
+			if err != nil {
+				return nil, err
+			}
+		default:
 			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
 		}
 		var buf [8]byte
-		binary.LittleEndian.PutUint64(buf[:], uint64(d.Int))
+		binary.LittleEndian.PutUint64(buf[:], uint64(v))
 		return buf[:], nil
 	case "oid", "regproc":
-		if d.Kind != KindInt {
+		var v int64
+		switch d.Kind {
+		case KindInt:
+			v = d.Int
+		case KindString:
+			var err error
+			v, err = coerceStringToInt64(d.StringValue(), "oid")
+			if err != nil {
+				return nil, err
+			}
+		default:
 			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
 		}
 		var buf [4]byte
-		binary.LittleEndian.PutUint32(buf[:], uint32(d.Int))
+		binary.LittleEndian.PutUint32(buf[:], uint32(v))
 		return buf[:], nil
 	case "timestamp", "timestamptz":
 		if d.Kind != KindTime {
@@ -237,6 +282,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			v = float32(d.Int)
+		case KindString, KindNumeric:
+			f, err := strconv.ParseFloat(strings.TrimSpace(d.StringValue()), 32)
+			if err != nil {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type real: %q", d.StringValue())}
+			}
+			v = float32(f)
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as float4", d.Kind)
 		}
@@ -249,6 +301,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			v = float64(d.Int)
+		case KindString, KindNumeric:
+			f, err := strconv.ParseFloat(strings.TrimSpace(d.StringValue()), 64)
+			if err != nil {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type double precision: %q", d.StringValue())}
+			}
+			v = f
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as float8", d.Kind)
 		}
