@@ -3,7 +3,6 @@ package executor
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -277,43 +276,49 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// char(N) = character(N) = bpchar: PG varlena (same as "character").
 		return varlenaTextBytes(d.StringValue()), nil
 	case "float4", "real":
-		// PG float4: 4-byte IEEE 754 little-endian
-		var v float32
+		// goopg stores float4 as varlena text for v0 compatibility (same as
+		// goopg-format encodeValue).  PG binary float4 (4-byte IEEE 754 LE)
+		// is deferred until the decode path also supports binary float.
+		// M0111-0002.
+		var s string
 		switch d.Kind {
 		case KindInt:
-			v = float32(d.Int)
-		case KindString, KindNumeric:
-			f, err := strconv.ParseFloat(strings.TrimSpace(d.StringValue()), 32)
-			if err != nil {
+			s = strconv.FormatInt(d.Int, 10)
+		case KindString:
+			raw := strings.TrimSpace(d.StringValue())
+			if _, err := strconv.ParseFloat(raw, 32); err != nil {
 				return nil, &ExecError{Code: "22P02",
 					Message: fmt.Sprintf("invalid input syntax for type real: %q", d.StringValue())}
 			}
-			v = float32(f)
+			s = raw
+		case KindNumeric:
+			s = numericText(d)
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as float4", d.Kind)
 		}
-		var buf [4]byte
-		binary.LittleEndian.PutUint32(buf[:], math.Float32bits(v))
-		return buf[:], nil
+		return varlenaTextBytes(s), nil
 	case "float8", "double precision", "double":
-		// PG float8: 8-byte IEEE 754 little-endian
-		var v float64
+		// goopg stores float8 as varlena text for v0 compatibility (same as
+		// goopg-format encodeValue).  PG binary float8 (8-byte IEEE 754 LE)
+		// is deferred until the decode path also supports binary float.
+		// M0111-0002.
+		var s string
 		switch d.Kind {
 		case KindInt:
-			v = float64(d.Int)
-		case KindString, KindNumeric:
-			f, err := strconv.ParseFloat(strings.TrimSpace(d.StringValue()), 64)
-			if err != nil {
+			s = strconv.FormatInt(d.Int, 10)
+		case KindString:
+			raw := strings.TrimSpace(d.StringValue())
+			if _, err := strconv.ParseFloat(raw, 64); err != nil {
 				return nil, &ExecError{Code: "22P02",
 					Message: fmt.Sprintf("invalid input syntax for type double precision: %q", d.StringValue())}
 			}
-			v = f
+			s = raw
+		case KindNumeric:
+			s = numericText(d)
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as float8", d.Kind)
 		}
-		var buf [8]byte
-		binary.LittleEndian.PutUint64(buf[:], math.Float64bits(v))
-		return buf[:], nil
+		return varlenaTextBytes(s), nil
 	case "xid", "xid8":
 		// PG TransactionId: 4-byte unsigned LE
 		var v uint32
@@ -941,7 +946,11 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("truncated oid")
 		}
 		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
-	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown":
+	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown",
+		"float4", "real", "float8", "double precision", "double":
+		// goopg stores float4/float8 as varlena text for v0 compatibility.
+		// PG-native binary float decode (4/8-byte IEEE 754 LE) is deferred
+		// to a follow-up.  M0111-0002.
 		payload, n, err := decodePhysicalPGVarlena(data)
 		if err != nil {
 			return Datum{}, 0, err
