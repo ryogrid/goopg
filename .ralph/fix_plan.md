@@ -2067,6 +2067,99 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           `TestPort_IsolationMergeMatchRecheck`: SKIP → PASS.
           **PASS count = 16**: adds MergeMatchRecheck.
 
+        - **Remaining gaps (2026-05-22)**: 16 PASS, 6 SKIP. Each remaining test
+          requires a design doc under `docs/design/` before implementation
+          begins. Follow the pattern `0100-NNNN-<slug>.md` and update
+          `docs/design/README.md` in the same commit.
+
+        - [ ] **M0100-0006 — InsertConflictSpecconflict: speculative insertion for ON CONFLICT**
+              - Summary: `TestPort_IsolationInsertConflictSpecconflict` SKIP —
+                first divergence at L49 after UPSERT NOTICE-count fixes.
+              - Root cause: goopg writes btree index entries only after the
+                arbiter expression returns (`applyInsert`), so concurrent
+                sessions that wake from an advisory-lock wait do not see each
+                other's unconfirmed entries. PostgreSQL's "speculative
+                insertion" writes the index entry *before* evaluating the
+                arbiter expression, so waiters find in-progress conflicts.
+                Without this, s1's upsert completes immediately after
+                controller_unlock_1_3 (no conflict found) instead of waiting
+                for s2's in-progress xact. This also causes missing NOTICE
+                lines at L49–L50 (s1 arbiter re-evaluation after wake).
+              - Required: restructure upsertOp to insert a speculative btree
+                entry before arbiter evaluation, and either confirm it on
+                success or remove it on conflict. Write a design doc first.
+
+        - [ ] **M0100-0007 — MergeUpdate: MERGE RETURNING old/new aliases + merge_action()**
+              - Summary: `TestPort_IsolationMergeUpdate` SKIP — `ERROR: column
+                "old" does not exist`.
+              - Root cause: MERGE RETURNING supports `old` and `new` as
+                implicit composite aliases for the pre-action and post-action
+                row, plus `merge_action()` to return the action kind
+                (`INSERT`/`UPDATE`/`DELETE`). Neither is implemented.
+              - Required: (a) parser recognition of `old`/`new` in MERGE
+                RETURNING context, (b) planner resolution mapping them to the
+                target-table column set with old/new semantics, (c) executor
+                population of old/new values in `mergeOp.collectReturningRow`,
+                (d) `merge_action()` function. Write a design doc first.
+
+        - [ ] **M0100-0008 — MergeJoin: MERGE EXPLAIN plan-tree parity**
+              - Summary: `TestPort_IsolationMergeJoin` SKIP — EXPLAIN output
+                shows `Merge on tgt` (unqualified) vs PG's
+                `Merge on public.tgt`, and a Seq Scan plan where PG uses a
+                Hash Left Join plan tree. Output: 3 rows vs 11 rows.
+              - Root cause: (a) EXPLAIN formatter does not schema-qualify
+                table names in `Merge on` labels, (b) the planner chooses a
+                different join strategy (seq scan vs hash join) for the MERGE
+                source, leading to structurally different plan output.
+              - Required: fix EXPLAIN formatting for schema qualification, then
+                investigate planner join selection for MERGE USING sources.
+                Write a design doc first.
+
+        - [ ] **M0100-0009 — DropIndexConcurrently1: CONCURRENTLY two-phase wait semantics**
+              - Summary: `TestPort_IsolationDropIndexConcurrently1` SKIP —
+                missing `<waiting ...>` on the DROP step; subsequent SELECT
+                returns 0 rows instead of 2.
+              - Root cause: `execDropIndex` does not implement CONCURRENTLY
+                semantics. `DROP INDEX CONCURRENTLY` must (1) wait for all
+                pre-existing transactions that could see the index, (2) mark
+                the index as invalid in the catalog, (3) wait for all
+                transactions that could see the invalid index, (4) physically
+                drop the index. Goopg drops the index immediately without any
+                wait, so a concurrent prepared statement loses access to the
+                index mid-execution.
+              - Required: implement two-phase drop with transaction-wait
+                semantics. Additional planner gap: redundant sort-key
+                elimination (`Sort Key: id, data` vs `Sort Key: id`).
+                Write a design doc first.
+
+        - [ ] **M0100-0010 — EvalPlanQual: EPQ recheck NOTICE parity**
+              - Summary: `TestPort_IsolationEvalPlanQual` SKIP — first
+                divergence at L411: NOTICE content differs (`lock_id: text
+                checking = text checking: t` vs `upid: text savings = text
+                checking: f`). Output: 1281 lines vs 1494 expected.
+              - Root cause: the EPQ re-evaluation path in UPDATE/DELETE
+                produces different comparison results from PostgreSQL. The
+                `noisy_oper` PL/pgSQL function's side effects diverge,
+                suggesting the EPQ chain-following, snapshot refresh, or
+                trigger evaluation differs from upstream semantics.
+              - Required: trace the EPQ code paths in goopg against PG's
+                `ExecUpdate`/`ExecDelete` EPQ loops, align NOTICE output
+                ordering and content. Write a design doc first.
+
+        - [ ] **M0100-0011 — EvalPlanQualTrigger: EPQ trigger output parity**
+              - Summary: `TestPort_IsolationEvalPlanQualTrigger` SKIP — first
+                divergence at L13: expected column headers `key|data` but
+                got `step s1_ins_b: INSERT INTO trigtest ...`. Output: 2185
+                lines vs 2733 expected (548 missing).
+              - Root cause: trigger bodies in EPQ-rechecked UPDATE/DELETE
+                paths either do not fire or produce output at different
+                points in the execution flow. BEFORE/AFTER trigger NOTICE
+                emission and step-header ordering differ from PG.
+              - Required: trace trigger execution during EPQ rechecks,
+                ensure BEFORE/AFTER triggers fire at correct points and
+                output appears at the expected positions. Write a design
+                doc first.
+
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
 The following two residuals were verified non-gaps during M0100 planning;
