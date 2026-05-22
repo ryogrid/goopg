@@ -733,14 +733,25 @@ M0097-0001 wires it up.
       - Removed incorrect pg_type virtual table (heap-backed in initdb)
 
 - [x] **M0097-0019 — Regress baseline audit: run full suite, capture diff-line counts**
-      - Summary: Run `go test -v -run TestPort_RegressSuite -timeout 30m
-        ./internal/testport/` and record the normalized diff-line count
-        for every "failed" entry.  Update
-        `docs/test-port/upstream-regress-coverage.md` with a
-        `diff_lines` column via `go run ./cmd/gen-regress-coverage`.
-      - DoD: every "failed" entry has a current diff-line count;
-        sorting by count identifies the easiest wins.  Regenerate
-        the markdown and commit.
+      - Summary: Ran `go test -v -run TestPort_RegressSuite -timeout 30m
+        ./internal/testport/` with `GOOPG_REGRESS_DIFF_DIR` set.  Captured
+        normalized diff-line counts for all 126 cases that have expected
+        output files.
+      - Baseline: **`docs/test-port/regress-diff-baseline.csv`** (126 rows;
+        `name,diff_lines,status`).  Sorted by `diff_lines` ascending so the
+        closest tests sort first.  Companion to
+        `docs/test-port/upstream-regress-coverage.md`.
+      - **Updating the baseline**: After any loop that changes executor,
+        planner, parser, or normalization logic, re-run the suite and
+        update the CSV.  When a test flips from `failed` to `pass`, change
+        its `status` column to `pass` and set `diff_lines` to `0`.  When a
+        test's diff count changes (progress or regression), update
+        `diff_lines` to the new value.  Re-sort by `diff_lines` after every
+        update so the next loop can always pick the easiest remaining win.
+        Use `go run ./cmd/gen-regress-coverage` to regenerate
+        `upstream-regress-coverage.md` after any status transition.
+      - DoD: committed baseline CSV; M0097-0020..0036 tasks are prioritized
+        by diff count.
 
 - [ ] **M0097-0020 — Port SELECT / DML / JOIN / subquery / CTE regress tests**
       - Summary: Make these 15 tests reach `pass` status:
