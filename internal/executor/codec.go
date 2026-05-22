@@ -718,11 +718,18 @@ func DecodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *mctx
 }
 
 func decodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.Context) error {
-	// Try goopg legacy format first (backward compatible).
-	// Fall back to PG-native physical format for M0105-0010 encoded data.
-	if err := decodeGoopgRowIntoMctx(dst, cols, data, sctx); err == nil {
+	// Try PG-native physical format first — all new data written via
+	// EncodeRowPG since M0106-0010 uses this format.  Fall back to
+	// goopg legacy format for cold-storage tuples that predate M0106.
+	// M0111-0001: the old "legacy first" order caused the legacy
+	// decoder to accidentally accept PG-format bytes as valid legacy
+	// data (e.g. interpreting a PG varlena header as a legacy flag
+	// byte), silently returning wrong data.  When both decoders
+	// failed the PG-format error was returned, producing the
+	// "DecodePhysicalPGRow: filler: truncated varlena" symptom.
+	if err := decodePhysicalPGRowIntoMctx(dst, cols, data, sctx); err == nil {
 		return nil
-	} else if err := decodePhysicalPGRowIntoMctx(dst, cols, data, sctx); err == nil {
+	} else if err := decodeGoopgRowIntoMctx(dst, cols, data, sctx); err == nil {
 		return nil
 	} else {
 		return err
