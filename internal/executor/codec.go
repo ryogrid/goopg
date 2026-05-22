@@ -115,15 +115,23 @@ func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 		if d.IsNull() {
 			continue
 		}
-		if d.Kind == KindToastPointer {
-			off = alignPhysicalPGOffset(off, 4)
-			for len(out) < off+12 {
-				out = append(out, 0)
+			if d.Kind == KindToastPointer {
+				// Encode as PG external/on-disk TOAST reference:
+				// short varlena header (1 byte) + 12-byte pointer = 13 bytes.
+				// Header: (13 << 1) | 1 = 0x1B (VARATT_IS_EXTERNAL_ONDISK).
+				// Aligned to 4 bytes (PG TOAST pointers are int-aligned).
+				off = alignPhysicalPGOffset(off, 4)
+				ptr := d.BytesValue()
+				buf := make([]byte, 13)
+				buf[0] = 0x1B // short varlena: len=13, external
+				copy(buf[1:], ptr)
+				for len(out) < off+13 {
+					out = append(out, 0)
+				}
+				copy(out[off:off+13], buf)
+				off += 13
+				continue
 			}
-			copy(out[off:off+12], d.BytesValue())
-			off += 12
-			continue
-		}
 		align := physicalPGTypeAlign(c.Type)
 		off = alignPhysicalPGOffset(off, align)
 		buf, err := encodeValuePG(c.Type, d)
@@ -955,6 +963,17 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
 	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown",
 		"float4", "real", "float8", "double precision", "double":
+		// PG external/on-disk TOAST reference: short varlena header 0x1B
+		// (VARATT_IS_EXTERNAL_ONDISK) followed by a 12-byte pointer.
+		// Recognise it before the general varlena decode so the Datum
+		// carries KindToastPointer, which needsDetoast / DetoastRow
+		// will resolve to the original value.  M0111-0003.
+		if len(data) >= 13 && data[0] == 0x1B {
+			ptr := make([]byte, 12)
+			copy(ptr, data[1:13])
+			return NewToastPointerDatum(ptr), 13, nil
+		}
+
 		// goopg stores float4/float8 as varlena text for v0 compatibility.
 		// PG-native binary float decode (4/8-byte IEEE 754 LE) is deferred
 		// to a follow-up.  M0111-0002.
