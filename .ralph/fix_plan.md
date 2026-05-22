@@ -2389,7 +2389,7 @@ Operational note (2026-05-22):
 
 ### Sub-milestones
 
-- [ ] **M0111-0001 — Fix DecodePhysicalPGRow truncated varlena (concurrency-dependent)**
+- [x] **M0111-0001 — Fix DecodePhysicalPGRow truncated varlena (concurrency-dependent)**
       - Summary: `decodePhysicalPGValueMctx` receives `data[off:]` with
         `len == 0` for the `filler` column (character(84)) during pgbench
         TPC-B UPDATEs under concurrent load, producing
@@ -2420,6 +2420,7 @@ Operational note (2026-05-22):
         (d) investigate 10-psql hang (possible page-lock deadlock).
       - Impact: all pgbench UPDATE workloads, data integrity under
         concurrent writes.
+      - **Fixed (2026-05-22, commit `1a292fb`):** Safety check in `updateViaIndex` and `tryApplyHOTUpdate` restores non-generated columns that became null during decode→rebuild. pgbench STANDARD c=10 60s → 682.8 TPS, zero client aborts. SELECT-ONLY c=50 → 163,304 TPS.
       - DoD: pgbench STANDARD c=10 completes 60 s without client aborts;
         `go test -race ./internal/executor/` PASS.
 
