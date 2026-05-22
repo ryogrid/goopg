@@ -2376,6 +2376,127 @@ if 21-spec pass surfaces a real divergence:
  - [ ] **M0102-0010** (follow-up to M0102-0008)
       - Summary: 15 initdb test failures
 
+
+## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
+
+Operational note (2026-05-22):
+- This milestone covers TAP tests listed in
+  `docs/test-port/upstream-tap-coverage.md` that are **not** in scope for
+  M0094 (recovery + subscription) or M0095 (basebackup / checksums /
+  controldata / pg_ctl / walsummary / scripts).
+- Already-ported families (psql, pgbench, initdb) are listed for
+  completeness at the bottom; no new work is needed.
+- Excluded tests that exercise a PG client tool against a goopg server
+  are included because they validate the wire-protocol and SQL
+  compatibility surface.  Tests for tools that do not connect to a
+  server (pg_config, pg_test_fsync, pg_test_timing) or that require
+  multi-server orchestration (pg_rewind, pg_upgrade, pg_combinebackup)
+  remain excluded.
+- Each test is tagged with one of:
+  - **SHOULD_PASS** — goopg feature is implemented; test is expected to
+    pass once ported to Go and any remaining normalization is applied.
+  - **BUG_FIX** — feature is implemented but has known bugs that would
+    prevent the test from passing.
+  - **UNIMPLEMENTED** — required feature is not yet implemented.
+
+### pg_dump (6 tests — excluded → candidate)
+
+pg_dump connects to a live server and issues SQL queries to extract
+schema and data.  Porting these tests validates goopg's catalog views,
+information_schema, pg_depend, extension infrastructure, and large-
+object support.
+
+- [ ] **M0110-0001 — Port pg_dump TAP tests**
+      - Target tests:
+        | Test | Status | Rationale |
+        |------|--------|-----------|
+        | `postgres/src/bin/pg_dump/t/001_basic.pl` | UNIMPLEMENTED | Requires pg_dump binary; tests --help/--version and basic dump of a running server. |
+        | `postgres/src/bin/pg_dump/t/002_pg_dump.pl` | UNIMPLEMENTED | Comprehensive schema/object dump; requires full catalog parity (pg_class, pg_attribute, pg_type, pg_proc, pg_depend, pg_extension, etc.). |
+        | `postgres/src/bin/pg_dump/t/003_pg_dump_with_server.pl` | UNIMPLEMENTED | Dump+restore round-trip against a live server; exercises SQL-level object creation and data restoration. |
+        | `postgres/src/bin/pg_dump/t/004_pg_dump_parallel.pl` | UNIMPLEMENTED | Parallel dump; additionally requires multi-connection catalog snapshot consistency. |
+        | `postgres/src/bin/pg_dump/t/005_pg_dump_filterfile.pl` | UNIMPLEMENTED | Filter-file support in pg_dump. |
+        | `postgres/src/bin/pg_dump/t/010_dump_connstr.pl` | UNIMPLEMENTED | Connection-string handling in pg_dump. |
+      - Action: design doc first; estimate the catalog surface required per
+        test; start with 001 and 003 (basic server round-trip).  Most tests
+        are blocked on catalog-view coverage (pg_class, pg_attribute,
+        pg_type, pg_proc, pg_depend, pg_extension).
+
+### pg_waldump (2 tests — excluded → candidate)
+
+pg_waldump reads WAL segment files directly (no server connection).
+Porting validates goopg's WAL record format compatibility with upstream.
+
+- [ ] **M0110-0002 — Port pg_waldump TAP tests**
+      - Target tests:
+        | Test | Status | Rationale |
+        |------|--------|-----------|
+        | `postgres/src/bin/pg_waldump/t/001_basic.pl` | BUG_FIX | goopg WAL format is PG-compatible (M0014, M0101), but edge cases (record alignment, continuation records, cross-segment records) may differ. |
+        | `postgres/src/bin/pg_waldump/t/002_save_fullpage.pl` | UNIMPLEMENTED | `pg_waldump --save-fullpage` requires full-page-image extraction; goopg may not emit FPI in all the same places as PG. |
+      - Action: port 001 first; triage against a fresh goopg WAL segment;
+        fix WAL format gaps discovered.
+
+### pg_amcheck (5 tests — excluded → candidate)
+
+pg_amcheck connects to a server and runs heap/btree corruption checks.
+Porting validates goopg's heap page and btree index integrity
+functions (e.g. `bt_index_parent_check`, `verify_heapam`).
+
+- [ ] **M0110-0003 — Port pg_amcheck TAP tests**
+      - Target tests:
+        | Test | Status | Rationale |
+        |------|--------|-----------|
+        | `postgres/src/bin/pg_amcheck/t/001_basic.pl` | UNIMPLEMENTED | Basic --help/--version + connection check. |
+        | `postgres/src/bin/pg_amcheck/t/002_nonesuch.pl` | UNIMPLEMENTED | Handles non-existent database/relation. |
+        | `postgres/src/bin/pg_amcheck/t/003_check.pl` | UNIMPLEMENTED | Runs actual heap/btree corruption checks against a server. |
+        | `postgres/src/bin/pg_amcheck/t/004_verify_heapam.pl` | UNIMPLEMENTED | `verify_heapam()` function required (not in goopg). |
+        | `postgres/src/bin/pg_amcheck/t/005_opclass_damage.pl` | UNIMPLEMENTED | Operator-class damage detection; requires opclass system catalog parity. |
+      - Action: all blocked on `verify_heapam()` SRF + opclass catalog
+        coverage.  Low priority; revisit when system catalog maturity
+        increases and the pg_dump tests pass.
+
+### pg_resetwal (2 tests — excluded → candidate)
+
+pg_resetwal resets the WAL and control file of a non-running cluster.
+Porting validates goopg's pg_control and WAL segment layout on disk.
+
+- [ ] **M0110-0004 — Port pg_resetwal TAP tests**
+      - Target tests:
+        | Test | Status | Rationale |
+        |------|--------|-----------|
+        | `postgres/src/bin/pg_resetwal/t/001_basic.pl` | UNIMPLEMENTED | Requires pg_resetwal binary; validates control-file reading and WAL reset. |
+        | `postgres/src/bin/pg_resetwal/t/002_corrupted.pl` | UNIMPLEMENTED | Simulates corrupted WAL and verifies pg_resetwal recovery behaviour. |
+      - Action: depends on pg_control byte-level compatibility (M0106).
+        Port 001 to validate goopg's control file can be parsed by upstream
+        pg_resetwal.
+
+### pg_verifybackup (10 tests — excluded → no action)
+
+pg_verifybackup validates a base backup's manifest and file integrity.
+These tests are NOT included because they depend on pg_basebackup
+output, which is already covered by M0095-0003.  Once M0095-0003 is
+complete, these can be re-evaluated.
+
+### Already ported (not in M0094/M0095 — listed for completeness)
+
+| Family | Tests | Port location | Status |
+|--------|-------|--------------|--------|
+| `initdb` | 1 (`001_initdb.pl`) | `internal/testport/tap_port_test.go` | port |
+| `psql` | 3 (`001_basic.pl`, `010_tab_completion.pl`, `020_cancel.pl`) | `internal/testport/tap_port_test.go` | port |
+| `pgbench` | 2 (`001_pgbench_with_server.pl`, `002_pgbench_no_server.pl`) | `internal/testport/tap_port_test.go` | port |
+
+### Excluded with no action (not meaningful for goopg)
+
+| Tool | Reason |
+|------|--------|
+| `pg_config` | Queries pg_config binary; no server interaction. |
+| `pg_combinebackup` | Multi-server orchestration; requires pg_basebackup chains. |
+| `pg_archivecleanup` | No server interaction. |
+| `pg_rewind` | Requires standby/failover multi-server setup. |
+| `pg_test_fsync` | No server interaction; filesystem benchmark. |
+| `pg_test_timing` | No server interaction; timing benchmark. |
+| `pg_upgrade` | Multi-server orchestration; pg_upgrade binary. |
+
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
