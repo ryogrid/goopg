@@ -158,7 +158,7 @@ func TestPoolPinReadsThroughSMGR(t *testing.T) {
 	if s1.Page()[100] != 0x42 {
 		t.Errorf("page[100] = %#x, want 0x42", s1.Page()[100])
 	}
-	if !s1.valid {
+	if !s1.isValid() {
 		t.Errorf("slot not marked valid after read")
 	}
 
@@ -170,7 +170,7 @@ func TestPoolPinReadsThroughSMGR(t *testing.T) {
 	if s1 != s2 {
 		t.Errorf("second Pin returned different slot")
 	}
-	if got := s2.pinCount.Load(); got != 2 {
+	if got := s2.getPinCount(); got != 2 {
 		t.Errorf("pinCount = %d, want 2", got)
 	}
 	pool.Unpin(s1)
@@ -338,8 +338,8 @@ func TestPoolFlushAllClearsDirty(t *testing.T) {
 	if err := pool.FlushAll(); err != nil {
 		t.Fatal(err)
 	}
-	for i, slot := range pool.slots {
-		if slot.dirty {
+	for i := range pool.slots {
+		if pool.slots[i].isDirty() {
 			t.Errorf("slot %d still dirty after FlushAll", i)
 		}
 	}
@@ -1297,4 +1297,336 @@ func TestPinNewEmitsSmgrCreateOnFirstBlock(t *testing.T) {
 	if len(emitted) != 1 {
 		t.Errorf("SmgrCreate calls after block 1 = %d, want still 1", len(emitted))
 	}
+}
+
+
+func TestExtendRelationBatchAppendsContiguousBlocks(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 90001, Fork: MainFork}
+
+	pool, err := NewPool(mgr, PoolConfig{Slots: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	first, err := pool.ExtendRelationBatch(rel, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 0 {
+		t.Errorf("first new block = %d, want 0", first)
+	}
+	if got, _ := mgr.NBlocks(rel); got != 8 {
+		t.Errorf("NBlocks after batch = %d, want 8", got)
+	}
+
+	// Each new block must be readable and equal to an InitPage-initialized
+	// empty page (no tuples, full free space).
+	want := make([]byte, BlockSize)
+	if err := InitPage(want); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, BlockSize)
+	for blk := BlockNumber(0); blk < 8; blk++ {
+		if err := mgr.ReadBlock(rel, blk, got); err != nil {
+			t.Fatalf("ReadBlock blk=%d: %v", blk, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("blk=%d content mismatch", blk)
+		}
+	}
+
+	// A second batch starts after the first.
+	second, err := pool.ExtendRelationBatch(rel, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != 8 {
+		t.Errorf("second batch start = %d, want 8", second)
+	}
+	if got, _ := mgr.NBlocks(rel); got != 12 {
+		t.Errorf("NBlocks after two batches = %d, want 12", got)
+	}
+}
+
+func TestExtendRelationBatchEmitsSmgrCreateOnceOnFirstBatch(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 90002, Fork: MainFork}
+
+	var emitted []RelFileNode
+	pool, err := NewPool(mgr, PoolConfig{
+		Slots: 8,
+		LogSmgrCreate: func(r RelFileNode) error {
+			emitted = append(emitted, r)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	// First batch (firstBlk == 0): SmgrCreate must fire exactly once.
+	if _, err := pool.ExtendRelationBatch(rel, 8); err != nil {
+		t.Fatal(err)
+	}
+	if len(emitted) != 1 || emitted[0] != rel {
+		t.Errorf("SmgrCreate after first batch = %v, want [%+v]", emitted, rel)
+	}
+
+	// Second batch (firstBlk > 0): SmgrCreate must NOT fire again.
+	if _, err := pool.ExtendRelationBatch(rel, 4); err != nil {
+		t.Fatal(err)
+	}
+	if len(emitted) != 1 {
+		t.Errorf("SmgrCreate after second batch = %v, want unchanged ([%+v])", emitted, rel)
+	}
+}
+
+func TestExtendRelationBatchInteropWithPinAndExtend(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 90003, Fork: MainFork}
+
+	pool, err := NewPool(mgr, PoolConfig{Slots: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	// PinNew → block 0 (pinned, dirty).
+	s0, blk0, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blk0 != 0 {
+		t.Fatalf("PinNew blk=%d, want 0", blk0)
+	}
+	pool.MarkDirty(s0)
+	pool.Unpin(s0)
+
+	// ExtendRelationBatch should continue from block 1.
+	first, err := pool.ExtendRelationBatch(rel, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 1 {
+		t.Errorf("batch firstBlk = %d, want 1", first)
+	}
+	if got, _ := mgr.NBlocks(rel); got != 4 {
+		t.Errorf("NBlocks = %d, want 4", got)
+	}
+
+	// A subsequent PinNew should land on block 4.
+	s4, blk4, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blk4 != 4 {
+		t.Errorf("PinNew after batch: blk=%d, want 4", blk4)
+	}
+	pool.MarkDirty(s4)
+	pool.Unpin(s4)
+
+	// Each block added by the batch must Pin cleanly and be a valid
+	// empty page (an inserter using FSM would find them this way).
+	for blk := BlockNumber(1); blk <= 3; blk++ {
+		s, err := pool.Pin(BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			t.Fatalf("Pin blk=%d: %v", blk, err)
+		}
+		hdr := MustHeader(s.Page())
+		if int(hdr.Upper()) != BlockSize || int(hdr.Lower()) != SizeOfPageHeaderData {
+			t.Errorf("blk=%d header: lower=%d upper=%d, want lower=%d upper=%d",
+				blk, hdr.Lower(), hdr.Upper(), SizeOfPageHeaderData, BlockSize)
+		}
+		pool.Unpin(s)
+	}
+}
+
+func TestExtendRelationBatchRejectsNonPositiveN(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 90004, Fork: MainFork}
+
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	for _, n := range []int{0, -1, -8} {
+		if _, err := pool.ExtendRelationBatch(rel, n); err == nil {
+			t.Errorf("ExtendRelationBatch(n=%d): want error, got nil", n)
+		}
+	}
+	if got, _ := mgr.NBlocks(rel); got != 0 {
+		t.Errorf("NBlocks after rejected calls = %d, want 0", got)
+	}
+}
+
+
+// TestSlotPinCountUnmappedTag verifies SlotPinCount returns 0 when the
+// tag is not currently mapped (never pinned, or already evicted).
+func TestSlotPinCountUnmappedTag(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 91001, Fork: MainFork}
+
+	// Never-pinned tag: returns 0.
+	tag := BufferTag{Rel: rel, Block: 42}
+	if got := pool.SlotPinCount(tag); got != 0 {
+		t.Errorf("SlotPinCount(unmapped) = %d, want 0", got)
+	}
+}
+
+// TestSlotPinCountReflectsPinUnpin verifies SlotPinCount tracks pin and
+// unpin transitions on a mapped slot.
+func TestSlotPinCountReflectsPinUnpin(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 91002, Fork: MainFork}
+
+	src := make(Page, BlockSize)
+	if err := InitPage(src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, src); err != nil {
+		t.Fatal(err)
+	}
+
+	tag := BufferTag{Rel: rel, Block: 0}
+	s1, err := pool.Pin(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pool.SlotPinCount(tag); got != 1 {
+		t.Errorf("SlotPinCount after 1 Pin = %d, want 1", got)
+	}
+
+	s2, err := pool.Pin(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pool.SlotPinCount(tag); got != 2 {
+		t.Errorf("SlotPinCount after 2 Pins = %d, want 2", got)
+	}
+
+	pool.Unpin(s2)
+	if got := pool.SlotPinCount(tag); got != 1 {
+		t.Errorf("SlotPinCount after 1 Unpin = %d, want 1", got)
+	}
+
+	pool.Unpin(s1)
+	// After full unpin the slot is still mapped (no eviction), but
+	// pin count is 0. SlotPinCount returns 0 as well.
+	if got := pool.SlotPinCount(tag); got != 0 {
+		t.Errorf("SlotPinCount after 2 Unpins = %d, want 0", got)
+	}
+}
+
+// TestSlotPinCountAfterEviction verifies SlotPinCount returns 0 once
+// the tag has been forcibly evicted (mapping cleared by InvalidateRel).
+func TestSlotPinCountAfterEviction(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 91003, Fork: MainFork}
+
+	src := make(Page, BlockSize)
+	if err := InitPage(src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Extend(rel, src); err != nil {
+		t.Fatal(err)
+	}
+
+	tag := BufferTag{Rel: rel, Block: 0}
+	s, err := pool.Pin(tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Unpin(s)
+
+	if got := pool.SlotPinCount(tag); got != 0 {
+		t.Errorf("SlotPinCount of unpinned-but-mapped slot = %d, want 0", got)
+	}
+
+	pool.InvalidateRel(rel)
+	if got := pool.SlotPinCount(tag); got != 0 {
+		t.Errorf("SlotPinCount after InvalidateRel = %d, want 0", got)
+	}
+}
+
+// TestSlotPinCountIsolatesByTag verifies SlotPinCount does not bleed
+// pin counts across distinct tags that occupy different slots.
+func TestSlotPinCountIsolatesByTag(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+	pool, err := NewPool(mgr, PoolConfig{Slots: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	rel := RelFileNode{DBOid: 1, RelOid: 91004, Fork: MainFork}
+
+	src := make(Page, BlockSize)
+	if err := InitPage(src); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := mgr.Extend(rel, src); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tag0 := BufferTag{Rel: rel, Block: 0}
+	tag1 := BufferTag{Rel: rel, Block: 1}
+	tag2 := BufferTag{Rel: rel, Block: 2}
+
+	s0a, _ := pool.Pin(tag0)
+	s0b, _ := pool.Pin(tag0)
+	s0c, _ := pool.Pin(tag0)
+	s1a, _ := pool.Pin(tag1)
+	// tag2 left unpinned
+
+	if got := pool.SlotPinCount(tag0); got != 3 {
+		t.Errorf("SlotPinCount(tag0) = %d, want 3", got)
+	}
+	if got := pool.SlotPinCount(tag1); got != 1 {
+		t.Errorf("SlotPinCount(tag1) = %d, want 1", got)
+	}
+	if got := pool.SlotPinCount(tag2); got != 0 {
+		t.Errorf("SlotPinCount(tag2 unpinned) = %d, want 0", got)
+	}
+
+	pool.Unpin(s0a)
+	pool.Unpin(s0b)
+	pool.Unpin(s0c)
+	pool.Unpin(s1a)
 }

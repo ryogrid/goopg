@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -87,23 +86,35 @@ func TestParseWithColumnAliases(t *testing.T) {
 	}
 }
 
-// TestParseWithRejectsDataModifyingBody pins the Stage A
-// restriction: INSERT / UPDATE / DELETE bodies are not supported
-// and surface as a parse error pointed at the inner-statement
-// keyword, not a generic syntax error.
-func TestParseWithRejectsDataModifyingBody(t *testing.T) {
+// TestParseWithAllowsDataModifyingBody confirms that INSERT/UPDATE/DELETE/MERGE
+// are accepted as CTE bodies (data-modifying CTE bodies are supported).
+func TestParseWithAllowsDataModifyingBody(t *testing.T) {
 	for _, sql := range []string{
 		"WITH a AS (INSERT INTO t VALUES (1)) SELECT * FROM a",
 		"WITH a AS (UPDATE t SET x = 1) SELECT * FROM a",
 		"WITH a AS (DELETE FROM t) SELECT * FROM a",
 	} {
-		_, err := Parse(sql)
-		if err == nil {
-			t.Errorf("Parse(%q) returned nil error; want data-modifying-body rejection", sql)
+		stmts, err := Parse(sql)
+		if err != nil {
+			t.Errorf("Parse(%q) returned unexpected error: %v", sql, err)
 			continue
 		}
-		if !strings.Contains(err.Error(), "data-modifying CTE bodies") {
-			t.Errorf("Parse(%q) err = %v; want mention of data-modifying CTE bodies", sql, err)
+		if len(stmts) == 0 {
+			t.Errorf("Parse(%q) returned no statements", sql)
+			continue
+		}
+		sel, ok := stmts[0].(*SelectStmt)
+		if !ok {
+			t.Errorf("Parse(%q) top-level statement is %T, want *SelectStmt", sql, stmts[0])
+			continue
+		}
+		if sel.With == nil || len(sel.With.CTEs) == 0 {
+			t.Errorf("Parse(%q) no CTEs found", sql)
+			continue
+		}
+		cte := sel.With.CTEs[0]
+		if cte.DMLBody == nil {
+			t.Errorf("Parse(%q) CTE.DMLBody is nil, want DML statement", sql)
 		}
 	}
 }

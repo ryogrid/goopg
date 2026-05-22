@@ -158,8 +158,8 @@ func TestNumericCmpInt64FastVsBigPath(t *testing.T) {
 			t.Fatalf("fast path error: %v", err)
 		}
 		// Forced big path: convert to *big.Int operands first.
-		aBig := Datum{Kind: KindNumeric, Big: big.NewInt(am), Scale: ascale}
-		bBig := Datum{Kind: KindNumeric, Big: big.NewInt(bm), Scale: bscale}
+		aBig := NewNumericBigDatum(big.NewInt(am), ascale)
+		bBig := NewNumericBigDatum(big.NewInt(bm), bscale)
 		slow, err := numericCmp(aBig, bBig)
 		if err != nil {
 			t.Fatalf("slow path error: %v", err)
@@ -239,8 +239,8 @@ func TestNumericArithInt64FastVsBigPath(t *testing.T) {
 		bscale := int16([]int{0, 2, 4, 6}[rng.Intn(4)])
 		a := Datum{Kind: KindNumeric, Int: am, Scale: ascale}
 		b := Datum{Kind: KindNumeric, Int: bm, Scale: bscale}
-		aBig := Datum{Kind: KindNumeric, Big: big.NewInt(am), Scale: ascale}
-		bBig := Datum{Kind: KindNumeric, Big: big.NewInt(bm), Scale: bscale}
+		aBig := NewNumericBigDatum(big.NewInt(am), ascale)
+		bBig := NewNumericBigDatum(big.NewInt(bm), bscale)
 
 		// Add
 		fastAdd, err := numericAdd(a, b)
@@ -291,7 +291,7 @@ func TestNumericArithInt64FastVsBigPath(t *testing.T) {
 func TestNumericArithBigOperandStillCorrect(t *testing.T) {
 	// 5 + (big.Int 7) at scale 0 = 12
 	a := Datum{Kind: KindNumeric, Int: 5, Scale: 0}
-	b := Datum{Kind: KindNumeric, Big: big.NewInt(7), Scale: 0}
+	b := NewNumericBigDatum(big.NewInt(7), 0)
 	r, err := numericAdd(a, b)
 	if err != nil {
 		t.Fatalf("add error: %v", err)

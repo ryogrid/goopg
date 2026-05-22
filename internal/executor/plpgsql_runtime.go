@@ -83,7 +83,84 @@ func evalStoredRoutineFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datu
 	if err != nil {
 		return Datum{}, err
 	}
-	return executePLpgSQLRoutine(r, args, ctx, x.Pos())
+	return executeStoredRoutine(r, args, ctx, x.Pos())
+}
+
+func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
+	switch strings.ToLower(r.Language) {
+	case "plpgsql":
+		return executePLpgSQLRoutine(r, args, ctx, pos)
+	case "sql":
+		return executeSQLRoutine(r, args, ctx, pos)
+	default:
+		return Datum{}, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("function language %q is not executable in v0", r.Language)}
+	}
+}
+
+func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
+	stmts, err := parser.Parse(r.Body)
+	if err != nil {
+		return Datum{}, &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for function %s: %v", r.QualifiedName(), err)}
+	}
+	if len(stmts) != 1 {
+		return Datum{}, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("SQL function %s must contain exactly one statement in v0", r.QualifiedName())}
+	}
+	child := NewContext()
+	if ctx != nil {
+		*child = *ctx
+	}
+	child.Notices = nil
+	child.Params = make([]Datum, len(args))
+	for i, arg := range args {
+		declared := catalog.Type{Name: "unknown"}
+		if i < len(r.ArgTypes) {
+			declared = normalizeCatalogType(r.ArgTypes[i])
+		}
+		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
+		if err != nil {
+			return Datum{}, err
+		}
+		child.Params[i] = coerced
+	}
+	node, err := planner.Plan(stmts[0], child.Catalog)
+	if err != nil {
+		return Datum{}, err
+	}
+	op, err := Build(node)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := op.Open(child); err != nil {
+		_ = op.Close()
+		return Datum{}, err
+	}
+	defer op.Close()
+	out := NullDatum
+	if slot, err := op.Next(); err != EOF {
+		if err != nil {
+			return Datum{}, err
+		}
+		row := slotRow(slot)
+		if len(row) > 0 {
+			out = row[0]
+		}
+		if _, err := op.Next(); err != EOF {
+			if err != nil {
+				return Datum{}, err
+			}
+			return Datum{}, &ExecError{Code: "21000", Pos: pos, Message: fmt.Sprintf("SQL function %s returned more than one row", r.QualifiedName())}
+		}
+	}
+	if ctx != nil {
+		for _, n := range child.TakeNotices() {
+			ctx.AddNotice(n)
+		}
+	}
+	coerced, err := coerceDatumToType(out, normalizeCatalogType(r.ReturnType), pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
+	if err != nil {
+		return Datum{}, err
+	}
+	return coerced, nil
 }
 
 func routineRegistry(ctx *Context) *catalog.Routines {
@@ -982,9 +1059,9 @@ func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datu
 		}
 	case isTextTypeName(tn):
 		switch v.Kind {
-		case KindString, KindStringArena:
+		case KindString:
 			return v, nil
-		case KindBytes, KindBytesArena:
+		case KindBytes:
 			return NewStringDatum(string(v.BytesValue())), nil
 		}
 	case isBoolTypeName(tn):
@@ -1015,9 +1092,9 @@ func datumKindName(v Datum) string {
 		return "boolean"
 	case KindInt:
 		return "integer"
-	case KindString, KindStringArena:
+	case KindString:
 		return "text"
-	case KindBytes, KindBytesArena:
+	case KindBytes:
 		return "bytea"
 	case KindTime:
 		return "timestamp"

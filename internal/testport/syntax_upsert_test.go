@@ -48,3 +48,23 @@ func TestSyntax_UPSERT_DoUpdate(t *testing.T) {
 
 	runSQL(t, c, "DROP TABLE t")
 }
+
+func TestSyntax_UPSERT_DoNothing_ExpressionUniqueIndex(t *testing.T) {
+	c := newCluster(t, "syntax_up_nothing_expr")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	runSQL(t, c, "CREATE TABLE t (key text, val text)")
+	runSQL(t, c, "CREATE FUNCTION idx_key(text) RETURNS text IMMUTABLE LANGUAGE plpgsql AS $$ BEGIN RETURN $1; END $$")
+	runSQL(t, c, "CREATE UNIQUE INDEX t_key_expr_idx ON t ((idx_key(key)))")
+	runSQL(t, c, "INSERT INTO t VALUES ('k1', 'v1') ON CONFLICT DO NOTHING")
+	runSQL(t, c, "INSERT INTO t VALUES ('k1', 'v2') ON CONFLICT DO NOTHING")
+
+	rows := runSQL(t, c, "SELECT COUNT(*), MIN(val), MAX(val) FROM t")
+	if len(rows) != 1 || len(rows[0]) != 3 || rows[0][0] != "1" || rows[0][1] != "v1" || rows[0][2] != "v1" {
+		t.Fatalf("expression-index DO NOTHING result = %v, want [[1 v1 v1]]", rows)
+	}
+
+	runSQL(t, c, "DROP TABLE t")
+	runSQL(t, c, "DROP FUNCTION idx_key")
+}

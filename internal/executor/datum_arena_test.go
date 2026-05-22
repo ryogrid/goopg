@@ -4,50 +4,57 @@ import (
 	"bytes"
 	"testing"
 	"unsafe"
+
+	"github.com/goopg/goopg/internal/mctx"
 )
 
-// TestM0073DatumStructSize pins the post-M0073-0001 Datum
-// layout: 64 B exact (was 56 B with 8 B padding pre-M0073;
-// the +arena *Arena field consumed all the headroom). Future
-// field additions will trigger the M0074 packed-layout work.
-func TestM0073DatumStructSize(t *testing.T) {
-	const want = 64
+// TestM0107DatumStructSize pins the post-M0107-0002 Datum layout:
+// 48 B exact (was 64 B / 3 GC pointers). DatumKind → uint8,
+// mctx *mctx.Context → ArenaID uint16, Big *big.Int removed.
+func TestM0107DatumStructSize(t *testing.T) {
+	const want = 48
 	got := unsafe.Sizeof(Datum{})
 	if got != want {
-		t.Errorf("unsafe.Sizeof(Datum{}) = %d, want %d (M0073-0001 must keep struct exactly 64 B)", got, want)
+		t.Errorf("unsafe.Sizeof(Datum{}) = %d, want %d (M0107-0002 must be exactly 48 B)", got, want)
 	}
 }
 
-// TestM0073DatumStringArenaRoundTrip pins the new accessor
-// contract: a KindStringArena Datum encoding (offset, length)
-// in Int returns the original payload via StringValue() that
-// resolves through arena.Bytes(...).
+// TestM0073DatumStringArenaRoundTrip pins the accessor contract:
+// a mctx-backed KindString Datum (ArenaID≠0) returns the original
+// payload via StringValue() through mctx.Bytes(). M0107-0002: merged
+// KindStringArena into KindString (ArenaID field distinguishes).
 func TestM0073DatumStringArenaRoundTrip(t *testing.T) {
-	a := NewArena(0)
+	a := mctx.Acquire(nil, mctx.KindStmt)
+	defer a.Release()
 	payload := "hello world"
-	buf, offset := a.Allocate(len(payload))
-	copy(buf, payload)
+	offset, length := a.AllocString(payload)
 
-	d := newStringArenaDatum(a, offset, len(payload))
-	if d.Kind != KindStringArena {
-		t.Errorf("Kind = %d, want KindStringArena", d.Kind)
+	d := newStringArenaDatum(a, offset, length)
+	if d.Kind != KindString {
+		t.Errorf("Kind = %d, want KindString (arena-backed, M0107-0002)", d.Kind)
+	}
+	if d.ArenaID == 0 {
+		t.Errorf("ArenaID = 0, want non-zero for arena-backed Datum")
 	}
 	if got := d.StringValue(); got != payload {
 		t.Errorf("StringValue() = %q, want %q", got, payload)
 	}
 }
 
-// TestM0073DatumBytesArenaRoundTrip mirrors the StringArena
-// test for KindBytesArena.
+// TestM0073DatumBytesArenaRoundTrip mirrors the string arena
+// test for bytes (M0107-0002: KindBytesArena merged into KindBytes).
 func TestM0073DatumBytesArenaRoundTrip(t *testing.T) {
-	a := NewArena(0)
+	a := mctx.Acquire(nil, mctx.KindStmt)
+	defer a.Release()
 	payload := []byte{0x01, 0x02, 0x03, 0xFF, 0xFE}
-	buf, offset := a.Allocate(len(payload))
-	copy(buf, payload)
+	offset, length := a.AllocBytes(payload)
 
-	d := newBytesArenaDatum(a, offset, len(payload))
-	if d.Kind != KindBytesArena {
-		t.Errorf("Kind = %d, want KindBytesArena", d.Kind)
+	d := newBytesArenaDatum(a, offset, length)
+	if d.Kind != KindBytes {
+		t.Errorf("Kind = %d, want KindBytes (arena-backed, M0107-0002)", d.Kind)
+	}
+	if d.ArenaID == 0 {
+		t.Errorf("ArenaID = 0, want non-zero for arena-backed Datum")
 	}
 	if got := d.BytesValue(); !bytes.Equal(got, payload) {
 		t.Errorf("BytesValue() = %v, want %v", got, payload)
@@ -56,16 +63,16 @@ func TestM0073DatumBytesArenaRoundTrip(t *testing.T) {
 
 // TestM0073DatumNonArenaPathUnchanged pins the backward-compat
 // invariant: KindString / KindBytes Datums with a Buf payload
-// continue to work via the legacy unsafe.String / Buf path.
-// arena field is nil for these; the dispatch in StringValue /
-// BytesValue takes the non-arena branch.
+// continue to work via the unsafe.String / Buf path.
+// ArenaID=0 for these; the dispatch in StringValue/BytesValue
+// takes the Buf branch. M0107-0002: mctx field removed; use ArenaID.
 func TestM0073DatumNonArenaPathUnchanged(t *testing.T) {
 	d := NewStringDatum("legacy")
 	if d.Kind != KindString {
 		t.Fatalf("NewStringDatum: Kind = %d, want KindString", d.Kind)
 	}
-	if d.arena != nil {
-		t.Errorf("NewStringDatum: arena should be nil; got %p", d.arena)
+	if d.ArenaID != 0 {
+		t.Errorf("NewStringDatum: ArenaID should be 0 (Buf-backed); got %d", d.ArenaID)
 	}
 	if got := d.StringValue(); got != "legacy" {
 		t.Errorf("StringValue() = %q, want %q", got, "legacy")
@@ -75,8 +82,8 @@ func TestM0073DatumNonArenaPathUnchanged(t *testing.T) {
 	if bd.Kind != KindBytes {
 		t.Fatalf("NewBytesDatum: Kind = %d, want KindBytes", bd.Kind)
 	}
-	if bd.arena != nil {
-		t.Errorf("NewBytesDatum: arena should be nil")
+	if bd.ArenaID != 0 {
+		t.Errorf("NewBytesDatum: ArenaID should be 0 (Buf-backed)")
 	}
 	if got := bd.BytesValue(); !bytes.Equal(got, []byte{0x10, 0x20}) {
 		t.Errorf("BytesValue() = %v, want [16 32]", got)
@@ -86,9 +93,9 @@ func TestM0073DatumNonArenaPathUnchanged(t *testing.T) {
 // TestM0073RowHasArena pins the fast-path skip predicate used
 // by Materialize.
 func TestM0073RowHasArena(t *testing.T) {
-	a := NewArena(0)
-	buf, off := a.Allocate(4)
-	copy(buf, []byte("abcd"))
+	a := mctx.Acquire(nil, mctx.KindStmt)
+	defer a.Release()
+	off, l := a.AllocBytes([]byte("abcd"))
 
 	plain := Row{NewIntDatum(1), NewStringDatum("x")}
 	if rowHasArena(plain) {
@@ -96,7 +103,7 @@ func TestM0073RowHasArena(t *testing.T) {
 	}
 	mixed := Row{
 		NewIntDatum(1),
-		newStringArenaDatum(a, off, 4),
+		newStringArenaDatum(a, off, l),
 		NewStringDatum("y"),
 	}
 	if !rowHasArena(mixed) {
@@ -105,21 +112,20 @@ func TestM0073RowHasArena(t *testing.T) {
 }
 
 // TestM0073CloneRowOwnedPromotesArenaDatums pins the deep-copy
-// contract: cloneRowOwned converts arena-backed Datums into
+// contract: cloneRowOwned converts mctx-backed Datums into
 // regular KindString / KindBytes Datums whose Buf is independent
-// of the source arena. After arena.Reset(), the cloned bytes
+// of the source context. After mctx.Reset(), the cloned bytes
 // must still read correctly.
 func TestM0073CloneRowOwnedPromotesArenaDatums(t *testing.T) {
-	a := NewArena(0)
-	sBuf, sOff := a.Allocate(5)
-	copy(sBuf, []byte("hello"))
-	bBuf, bOff := a.Allocate(3)
-	copy(bBuf, []byte{0xAA, 0xBB, 0xCC})
+	a := mctx.Acquire(nil, mctx.KindStmt)
+	defer a.Release()
+	sOff, sLen := a.AllocBytes([]byte("hello"))
+	bOff, bLen := a.AllocBytes([]byte{0xAA, 0xBB, 0xCC})
 
 	src := Row{
 		NewIntDatum(7),
-		newStringArenaDatum(a, sOff, 5),
-		newBytesArenaDatum(a, bOff, 3),
+		newStringArenaDatum(a, sOff, sLen),
+		newBytesArenaDatum(a, bOff, bLen),
 	}
 
 	dst := cloneRowOwned(src)
@@ -131,8 +137,8 @@ func TestM0073CloneRowOwnedPromotesArenaDatums(t *testing.T) {
 	if dst[1].Kind != KindString {
 		t.Errorf("dst[1].Kind = %d, want KindString (promoted)", dst[1].Kind)
 	}
-	if dst[1].arena != nil {
-		t.Errorf("dst[1].arena = %p, want nil after promotion", dst[1].arena)
+	if dst[1].ArenaID != 0 {
+		t.Errorf("dst[1].ArenaID = %d, want 0 after promotion (Buf-backed)", dst[1].ArenaID)
 	}
 	if got := dst[1].StringValue(); got != "hello" {
 		t.Errorf("dst[1].StringValue() = %q, want %q", got, "hello")
@@ -144,13 +150,14 @@ func TestM0073CloneRowOwnedPromotesArenaDatums(t *testing.T) {
 		t.Errorf("dst[2].BytesValue() = %v, want [170 187 204]", got)
 	}
 
-	// Reset the arena. The cloned dst must keep working.
+	// Reset the context. The cloned dst must keep working.
 	a.Reset()
-	// Re-allocate to overwrite the underlying page bytes (worst-
-	// case scenario: post-Reset the same page is reused for new
+	// Re-allocate to overwrite the underlying chunk bytes (worst-
+	// case scenario: post-Reset the same chunk is reused for new
 	// data; the cloned Datum must NOT point into it).
-	overwrite, _ := a.Allocate(8)
-	copy(overwrite, []byte("OVERWRTE"))
+	overOff, overLen := a.AllocBytes([]byte("OVERWRTE"))
+	_ = overOff
+	_ = overLen
 
 	if got := dst[1].StringValue(); got != "hello" {
 		t.Errorf("after Reset: dst[1].StringValue() = %q, want %q (cloneRowOwned must deep-copy)", got, "hello")
@@ -161,16 +168,16 @@ func TestM0073CloneRowOwnedPromotesArenaDatums(t *testing.T) {
 }
 
 // TestM0073MaterializePromotesArenaDatum pins the integration:
-// a MaterializedSlot wrapping a row with arena Datums returns
+// a MaterializedSlot wrapping a row with mctx Datums returns
 // itself with promoted (Buf-backed) values when Materialize()
-// is called. The arena's Reset cycle then doesn't corrupt the
+// is called. The mctx Reset cycle then doesn't corrupt the
 // retained slot.
 func TestM0073MaterializePromotesArenaDatum(t *testing.T) {
-	a := NewArena(0)
-	buf, off := a.Allocate(4)
-	copy(buf, []byte("payl"))
+	a := mctx.Acquire(nil, mctx.KindStmt)
+	defer a.Release()
+	off, l := a.AllocBytes([]byte("payl"))
 
-	row := Row{newStringArenaDatum(a, off, 4)}
+	row := Row{newStringArenaDatum(a, off, l)}
 	slot := SlotFromRow(nil, row)
 
 	mat := slot.Materialize()
@@ -179,8 +186,9 @@ func TestM0073MaterializePromotesArenaDatum(t *testing.T) {
 	}
 
 	a.Reset()
-	overwrite, _ := a.Allocate(8)
-	copy(overwrite, []byte("OVERWRTE"))
+	overOff, overLen := a.AllocBytes([]byte("OVERWRTE"))
+	_ = overOff
+	_ = overLen
 
 	if got := mat.row[0].StringValue(); got != "payl" {
 		t.Errorf("after Reset: StringValue() = %q, want %q (Materialize must promote)", got, "payl")
@@ -190,7 +198,7 @@ func TestM0073MaterializePromotesArenaDatum(t *testing.T) {
 // TestM0092MaterializeAlwaysDeepCopies pins the M0092-0002
 // contract change: Materialize must ALWAYS produce a row
 // independent of the producer's internal buffers, including
-// when no Datums are arena-backed. Pre-M0092 the no-arena
+// when no Datums are mctx-backed. Pre-M0092 the no-arena
 // path was a no-op; post-M0092 producers (projectOp,
 // indexScanOp) may return slots aliasing internal buffers
 // that get overwritten on the next Next() call, so the slice

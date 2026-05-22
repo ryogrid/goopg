@@ -106,6 +106,11 @@ func (o *upsertOp) Open(ctx *Context) error {
 	// index.
 	if o.plan.OnConflict.Action == planner.OnConflictActionUpdate {
 		for _, ord := range o.plan.OnConflict.ArbiterColumns {
+			if ord == -1 {
+				// Expression-based arbiter column — no single catalog column
+				// to check; the expression result is the conflict key.
+				continue
+			}
 			if o.plan.OnConflict.UpdateSet[ord] != nil {
 				col := o.plan.Table.Columns[ord]
 				return &ExecError{
@@ -149,6 +154,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 	parentCols := o.plan.Table.Columns
 	parentTree := o.arbiterTree
 	isPartitioned := len(o.plan.Table.PartitionKey) > 0
+	nextSourceRow:
 	for {
 		srcSlot, err := o.child.Next()
 		if err == EOF {
@@ -190,12 +196,12 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			o.arbiterTree = leafTree
 		}
 
-		conflictPtr, conflictRow, conflicted, err := o.probeArbiterWaiting(rel, cols, inserted)
+		arbiterKey, conflictPtr, conflictRow, conflicted, err := o.probeArbiterWaiting(rel, cols, inserted)
 		if err != nil {
 			return nil, err
 		}
 		if !conflicted {
-			if err := o.applyInsert(rel, cols, inserted); err != nil {
+			if err := o.applyInsert(rel, cols, inserted, arbiterKey); err != nil {
 				return nil, err
 			}
 			o.rowsAffected++
@@ -204,19 +210,75 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		}
 		switch o.plan.OnConflict.Action {
 		case planner.OnConflictActionNothing:
+			// PostgreSQL's conflict-nothing path re-runs the arbiter expression
+			// once before discarding the row. The probe already evaluated it
+			// during key formation; this single extra call mirrors the PG
+			// re-evaluation for side-effectful arbiter helpers like
+			// blurt_and_lock_*.
+			if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+				return nil, err
+			}
 			// Skip silently — RowsAffected does NOT bump.
 		case planner.OnConflictActionUpdate:
-			updated, skip, err := o.evalUpdate(conflictRow, inserted)
-			if err != nil {
-				return nil, err
+			for {
+				updated, skip, err := o.evalUpdate(conflictRow, inserted)
+				if err != nil {
+					return nil, err
+				}
+				if skip {
+					continue nextSourceRow
+				}
+				inProgressXID, isInFlightInsert, hasInProgress := o.findInProgressConflictKey(rel, arbiterKey)
+				if hasInProgress {
+					// The conflicting tuple is still owned by another live xact. Re-run
+					// the arbiter expression once more, then wait and re-probe with the
+					// already-computed key so completion stays blocked until the other
+					// transaction settles.
+					if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+						return nil, err
+					}
+					qctx := o.ctx.Ctx
+					if qctx == nil {
+						qctx = context.Background()
+					}
+					if o.ctx.TxnMgr != nil {
+						if werr := o.ctx.TxnMgr.WaitForXID(qctx, inProgressXID); werr != nil {
+							return nil, werr
+						}
+					}
+					if isInFlightInsert && o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+						if o.ctx.TxnMgr != nil && !o.ctx.TxnMgr.HasAbortedXID(inProgressXID) {
+							return nil, &ExecError{
+								Code:    "40001",
+								Pos:     o.plan.Pos(),
+								Message: "could not serialize access due to concurrent update",
+							}
+						}
+					}
+					if o.ctx.TxnMgr != nil && o.ctx.Tx.Handle != 0 {
+						if snap, serr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); serr == nil {
+							o.ctx.Snap = snap.Clone()
+						}
+					}
+					conflictPtr, conflictRow, conflicted, err = o.probeArbiterByKey(rel, cols, arbiterKey)
+					if err != nil {
+						return nil, err
+					}
+					if !conflicted {
+						if err := o.applyInsert(rel, cols, inserted, arbiterKey); err != nil {
+							return nil, err
+						}
+						o.rowsAffected++
+						continue nextSourceRow
+					}
+					continue
+				}
+				if err := o.applyUpdate(rel, cols, conflictPtr, updated); err != nil {
+					return nil, err
+				}
+				o.rowsAffected++
+				continue nextSourceRow
 			}
-			if skip {
-				continue
-			}
-			if err := o.applyUpdate(rel, cols, conflictPtr, updated); err != nil {
-				return nil, err
-			}
-			o.rowsAffected++
 		default:
 			return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: fmt.Sprintf("unexpected OnConflictAction %d", o.plan.OnConflict.Action)}
 		}
@@ -307,18 +369,29 @@ func (o *upsertOp) resolveLeafArbiter(leaf *catalog.Table) *catalog.Index {
 // are skipped — this is essential because UPSERT writes new
 // tuples and inserts duplicate index entries, so historical dead
 // versions may still be reachable via the same key.
-func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, inserted Row) (storage.ItemPointer, Row, bool, error) {
+func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, inserted Row) ([]byte, storage.ItemPointer, Row, bool, error) {
 	if o.arbiterTree == nil {
-		return storage.ItemPointer{}, nil, false, nil
+		return nil, storage.ItemPointer{}, nil, false, nil
 	}
-	key, err := encodeArbiterKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
+	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
 	if err != nil {
-		return storage.ItemPointer{}, nil, false, err
+		return nil, storage.ItemPointer{}, nil, false, err
 	}
 	if key == nil {
 		// NULLs in conflict-key columns never collide per
 		// upstream semantics — DO NOTHING / DO UPDATE both fall
 		// through to a plain insert.
+		return nil, storage.ItemPointer{}, nil, false, nil
+	}
+	ptr, row, found, err := o.probeArbiterByKey(rel, cols, key)
+	if err != nil {
+		return nil, storage.ItemPointer{}, nil, false, err
+	}
+	return key, ptr, row, found, nil
+}
+
+func (o *upsertOp) probeArbiterByKey(rel storage.RelFileNode, cols []catalog.Column, key []byte) (storage.ItemPointer, Row, bool, error) {
+	if o.arbiterTree == nil || key == nil {
 		return storage.ItemPointer{}, nil, false, nil
 	}
 	var (
@@ -353,6 +426,29 @@ func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, 
 		// permutations 1/5.  TupleVisible would still report the dead
 		// row as visible under RR's frozen snapshot.
 		if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
+			// HOT chain follow: if this dead tuple has a HeapHotUpdated flag,
+			// the CTID chain on the same page leads to the live successor.
+			// Re-pin the page and follow the chain so a concurrent HOT update
+			// doesn't leave the arbiter probe without a conflict match.
+			// M0100-0005 (Bug A — HOT path).
+			if tuple.Header.Infomask&storage.HeapHotUpdated != 0 && o.ctx.Pool != nil {
+				hotBuf, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+				if perr == nil {
+					hotBuf.RLock()
+					liveTuple, liveSlot, liveFound := followHOTChain(hotBuf.Page(), tuple.Header.CTID.Offset, o.ctx.Snap, o.ctx.Tx.XID)
+					hotBuf.RUnlock()
+					o.ctx.Pool.Unpin(hotBuf)
+					if liveFound && isLiveForUniqueCheck(o.ctx, liveTuple.Header.Xmin, liveTuple.Header.Xmax) {
+						row, rerr := DecodeRow(cols, liveTuple.Data)
+						if rerr == nil {
+							foundPtr = storage.ItemPointer{Block: ptr.Block, Offset: liveSlot}
+							foundRow = row
+							found = true
+							return false, nil
+						}
+					}
+				}
+			}
 			return true, nil
 		}
 		row, err := DecodeRow(cols, tuple.Data)
@@ -376,15 +472,15 @@ func (o *upsertOp) probeArbiter(rel storage.RelFileNode, cols []catalog.Column, 
 // This implements the "speculative insert" blocking that makes
 // INSERT … ON CONFLICT produce correct <waiting ...> output in
 // concurrent isolation tests.
-func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.Column, inserted Row) (storage.ItemPointer, Row, bool, error) {
+func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.Column, inserted Row) ([]byte, storage.ItemPointer, Row, bool, error) {
 	for {
 		// First look for an in-progress transaction that could change
 		// the probe outcome (in-flight insert with our key, or
 		// in-flight delete of a visible match). If one exists, wait
 		// for it to settle and re-probe under a fresh snapshot.
-		inProgressXID, isInFlightInsert, hasInProgress := o.findInProgressConflict(rel, cols, inserted)
+		inProgressXID, isInFlightInsert, hasInProgress, arbKey := o.findInProgressConflict(rel, inserted)
 		if !hasInProgress {
-			return o.probeArbiter(rel, cols, inserted)
+			ptr, row, found, err := o.probeArbiterByKey(rel, cols, arbKey); return arbKey, ptr, row, found, err
 		}
 		qctx := o.ctx.Ctx
 		if qctx == nil {
@@ -393,7 +489,7 @@ func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.C
 		if o.ctx.TxnMgr != nil {
 			if werr := o.ctx.TxnMgr.WaitForXID(qctx, inProgressXID); werr != nil {
 				// Context cancelled (e.g. IsolationRunner drain timeout).
-				return storage.ItemPointer{}, nil, false, nil
+				return nil, storage.ItemPointer{}, nil, false, nil
 			}
 		}
 		// M0100-0005x: under RR / SERIALIZABLE, if the in-flight conflict
@@ -406,7 +502,7 @@ func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.C
 		// the deletion clears the apparent conflict, INSERT proceeds.
 		if isInFlightInsert && o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
 			if o.ctx.TxnMgr != nil && !o.ctx.TxnMgr.HasAbortedXID(inProgressXID) {
-				return storage.ItemPointer{}, nil, false, &ExecError{
+				return nil, storage.ItemPointer{}, nil, false, &ExecError{
 					Code:    "40001",
 					Pos:     o.plan.Pos(),
 					Message: "could not serialize access due to concurrent update",
@@ -423,13 +519,25 @@ func (o *upsertOp) probeArbiterWaiting(rel storage.RelFileNode, cols []catalog.C
 
 // findInProgressConflict scans the arbiter index for a tuple whose xmin
 // is from a currently in-progress transaction (not yet committed/aborted).
-// Returns the in-progress XID and true if found; (0, false) otherwise.
-func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalog.Column, inserted Row) (xid storage.TransactionID, isInFlightInsert bool, found bool) {
+// Returns the in-progress XID, whether it's a Case 1 insert, and true if
+// found; (0, false, false) otherwise.  The pre-computed arbiter key is also
+// returned so callers can reuse it in probeArbiterByKey without a second
+// encodeArbiterKey evaluation (important for side-effectful arbiter
+// expressions like blurt_and_lock_*).
+func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, inserted Row) (xid storage.TransactionID, isInFlightInsert bool, found bool, arbiterKey []byte) {
 	if o.arbiterTree == nil || o.ctx == nil {
-		return 0, false, false
+		return 0, false, false, nil
 	}
-	key, err := encodeArbiterKey(o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
+	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos())
 	if err != nil || key == nil {
+		return 0, false, false, nil
+	}
+	xid, isInsert, ok := o.findInProgressConflictKey(rel, key)
+	return xid, isInsert, ok, key
+}
+
+func (o *upsertOp) findInProgressConflictKey(rel storage.RelFileNode, key []byte) (xid storage.TransactionID, isInFlightInsert bool, found bool) {
+	if o.arbiterTree == nil || o.ctx == nil || key == nil {
 		return 0, false, false
 	}
 	selfXID := o.ctx.Tx.XID
@@ -474,6 +582,21 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalo
 				return false, nil
 			}
 		}
+		// Case 3: lock-only xmax (SELECT FOR UPDATE/SHARE) from a live
+		// transaction. Upstream _bt_check_unique blocks via
+		// ConditionalLockTuple until the lock holder releases, then
+		// re-probes. The row is still live (xmin settled, xmax is only a
+		// lock stamp) — we must wait because the lock holder may
+		// subsequently UPDATE or DELETE the conflicting row before
+		// committing, changing the arbiter outcome.
+		if xmax != storage.InvalidTransactionID && xmax != selfXID && storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
+			xminSettled := xmin == selfXID || o.ctx.Snap.SeesCommittedXID(xmin)
+			if xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
+				foundXID = xmax
+				case1 = false
+				return false, nil
+			}
+		}
 		return true, nil
 	})
 	return foundXID, case1, foundXID != 0
@@ -483,12 +606,15 @@ func (o *upsertOp) findInProgressConflict(rel storage.RelFileNode, cols []catalo
 // and stitches a new (key → ItemPointer) entry into the arbiter
 // index so subsequent rows in the same statement (multi-row
 // VALUES, CTE-fed INSERT, etc.) see it.
-func (o *upsertOp) applyInsert(rel storage.RelFileNode, cols []catalog.Column, inserted Row) error {
+func (o *upsertOp) applyInsert(rel storage.RelFileNode, cols []catalog.Column, inserted Row, arbiterKey []byte) error {
 	ptr, err := writeHeapRowReturning(o.ctx, rel, cols, inserted)
 	if err != nil {
 		return err
 	}
-	return o.maintainArbiter(inserted, ptr)
+	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
+		o.ctx.CTEWriteFence[ptr] = struct{}{}
+	}
+	return o.maintainArbiter(arbiterKey, ptr)
 }
 
 // applyUpdate stamps xmax on the conflicting tuple and writes the
@@ -523,20 +649,18 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, o
 	if err != nil {
 		return err
 	}
-	return o.maintainArbiter(updated, newPtr)
+	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
+		o.ctx.CTEWriteFence[newPtr] = struct{}{}
+	}
+	return o.maintainArbiterRow(updated, newPtr)
 }
 
-// maintainArbiter inserts (conflict-key → ptr) into the arbiter
-// index. NULL keys (any conflict-key column is null) are skipped —
-// upstream's IS NULL doesn't participate in unique-constraint
-// equality.
-func (o *upsertOp) maintainArbiter(row Row, ptr storage.ItemPointer) error {
+// maintainArbiter inserts a precomputed (conflict-key → ptr) entry into the
+// arbiter index. NULL keys (any conflict-key column is null) are skipped —
+// upstream's IS NULL doesn't participate in unique-constraint equality.
+func (o *upsertOp) maintainArbiter(key []byte, ptr storage.ItemPointer) error {
 	if o.arbiterTree == nil {
 		return nil
-	}
-	key, err := encodeArbiterKey(o.plan.OnConflict, o.plan.Table, row, o.plan.Pos())
-	if err != nil {
-		return err
 	}
 	if key == nil {
 		return nil
@@ -545,6 +669,14 @@ func (o *upsertOp) maintainArbiter(row Row, ptr storage.ItemPointer) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	return nil
+}
+
+func (o *upsertOp) maintainArbiterRow(row Row, ptr storage.ItemPointer) error {
+	key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, row, o.plan.Pos())
+	if err != nil {
+		return err
+	}
+	return o.maintainArbiter(key, ptr)
 }
 
 // evalUpdate builds the merged 2N-wide row (existing || inserted)
@@ -587,13 +719,40 @@ func (o *upsertOp) evalUpdate(existing Row, inserted Row) (Row, bool, error) {
 // maintenance" to the caller (matches upstream's NULL-never-
 // matches semantics for unique-constraint inference). Multi-column
 // arbiters are supported by concatenating per-column encodings.
-func encodeArbiterKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, pos int) ([]byte, error) {
+// For expression-based arbiter columns (ArbiterColumns[i] == -1),
+// the expression in ArbiterExprs[i] is evaluated against row.
+func encodeArbiterKey(ctx *Context, oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, pos int) ([]byte, error) {
 	if oc.ArbiterIndex == nil || len(oc.ArbiterColumns) == 0 {
 		return nil, nil
 	}
 	var out []byte
-	for _, ord := range oc.ArbiterColumns {
-		v := row[ord]
+	slot := rowSlotView(row)
+	for i, ord := range oc.ArbiterColumns {
+		var v Datum
+		if ord == -1 {
+			// Expression-based arbiter column — evaluate the expression.
+			if len(oc.ArbiterExprs) <= i || oc.ArbiterExprs[i] == nil {
+				// No expression available (e.g. after catalog restore). Skip.
+				return nil, nil
+			}
+			var err error
+			v, err = evalExprSlot(oc.ArbiterExprs[i], slot, ctx)
+			if err != nil {
+				return nil, err
+			}
+			if v.IsNull() {
+				// NULL expression result never conflicts.
+				return nil, nil
+			}
+			// Encode the expression result as a text/varchar key.
+			k := encodeArbiterExprKey(v, pos)
+			if k == nil {
+				return nil, &ExecError{Code: "42804", Pos: pos, Message: "expression-based arbiter column produced unsupported datum type"}
+			}
+			out = append(out, k...)
+			continue
+		}
+		v = row[ord]
 		if v.IsNull() {
 			// NULL never conflicts per upstream semantics.
 			return nil, nil
@@ -607,3 +766,17 @@ func encodeArbiterKey(oc *planner.OnConflictPlan, tbl *catalog.Table, row Row, p
 	}
 	return out, nil
 }
+
+// encodeArbiterExprKey encodes a Datum produced by an expression-based
+// arbiter column into BTree key bytes. Supports text/string and integer
+// datums (the most common expression result types).
+func encodeArbiterExprKey(v Datum, pos int) []byte {
+	switch v.Kind {
+	case KindString:
+		return btree.EncodeVarchar([]byte(v.StringValue()))
+	case KindInt:
+		return btree.EncodeInt8(v.Int)
+	}
+	return nil
+}
+ 

@@ -14,6 +14,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -43,7 +44,14 @@ const heapReleaseThresholdBytes = 4 << 30 // 4 GiB
 // retained allocations indefinitely.
 var queriesWithoutFreeCounter int64
 
-const queriesPerForcedFree = 8
+// queriesPerForcedFree gates how often we invoke runtime.GC()+FreeOSMemory()
+// when no single query has exceeded heapReleaseThresholdBytes.  The original
+// value of 8 was sized for TPC-H (queries that take seconds each); at pgbench
+// rates (thousands of queries per second) it caused a world-stop ReadMemStats
+// on *every* query and a full GC every ~8 queries — accounting for 43% of
+// CPU at c=10 SO.  10 000 still guards against long TPC-H drifts (22 queries
+// × hours = far below 10 000) while eliminating the pgbench overhead.
+const queriesPerForcedFree = 10_000
 
 // maybeForceGCAfterCommit triggers `runtime.GC()` +
 // `debug.FreeOSMemory()` at the end of a Query message when
@@ -51,20 +59,21 @@ const queriesPerForcedFree = 8
 //   - HeapInuse > heapReleaseThresholdBytes  (this query was big), or
 //   - we've gone queriesPerForcedFree queries without a Free   (drift).
 //
-// Performance: each Free call is ~50–500 ms on a 4 GiB heap and
-// happens at most once per query, on the path where the client
-// has *already* received its CommandComplete (the GC pause is
-// invisible to the just-finished query). The next query may pay
-// a cold-cache penalty on first allocation, but at our query
-// granularity (seconds) that is negligible.
+// Hot-path discipline: the atomic counter check is evaluated first (no
+// STW).  runtime.ReadMemStats (which requires a brief stop-the-world) is
+// only called when the counter says a GC round is due — keeping the common
+// sub-threshold path to a single atomic operation.
 func maybeForceGCAfterCommit() {
+	n := atomic.AddInt64(&queriesWithoutFreeCounter, 1)
+	if n < queriesPerForcedFree {
+		return // fast path: single atomic add, no STW
+	}
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
-	n := atomic.AddInt64(&queriesWithoutFreeCounter, 1)
-	if ms.HeapInuse < heapReleaseThresholdBytes && n < queriesPerForcedFree {
+	atomic.StoreInt64(&queriesWithoutFreeCounter, 0)
+	if ms.HeapInuse < heapReleaseThresholdBytes {
 		return
 	}
-	atomic.StoreInt64(&queriesWithoutFreeCounter, 0)
 	runtime.GC()
 	debug.FreeOSMemory()
 }
@@ -84,7 +93,17 @@ func maybeForceGCAfterCommit() {
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
 func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string, connTx *connTxState, prepStmts *preparedStatements) error {
-	stmts, err := parser.Parse(sql)
+	// M0107-0003 Phase C.3: allocate token backing from an ephemeral mctx
+	// child to avoid sync.Pool overhead on the hot parse path.
+	var parseCtx *mctx.Context
+	if connTx != nil && connTx.SessCtx != nil {
+		parseCtx = mctx.Acquire(connTx.SessCtx, mctx.KindExpr)
+	}
+	stmts, err := parser.Parse(sql, parseCtx)
+	if parseCtx != nil {
+		parseCtx.Release() // tokens only needed during parsing
+		parseCtx = nil
+	}
 	if err != nil {
 		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
 		// here (the parser doesn't recognise them yet) so we can
@@ -146,7 +165,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		autoCommit = false
 	} else {
 		var err error
-		tx, err = s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+		var pn int32
+		if connTx != nil {
+			pn = connTx.ProcNum
+		}
+		tx, err = s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, pn)
 		if err != nil {
 			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 		}
@@ -156,9 +179,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	// relies on monotonic IDs.
 	backendID := lockmgr.BackendID(s.nextBackendID.Add(1))
 	commit := false
+	var advisoryReleaseTarget any
 	defer func() {
 		if autoCommit && !commit {
 			_ = s.cfg.TxnMgr.Rollback(tx)
+			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		}
 		// Always drop locks at txn end so a leftover holder
 		// can't outlive the connection. ReleaseAll is a no-op
@@ -171,7 +196,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 	}
+	// M0107-0001: per-statement mctx. Parent is the session mctx
+	// threaded from serveConn via connTx.SessCtx (nil for tests
+	// that don't wire a full server).
+	var sessCtxForStmt *mctx.Context
+	if connTx != nil {
+		sessCtxForStmt = connTx.SessCtx
+	}
+	stmtCtx := mctx.Acquire(sessCtxForStmt, mctx.KindStmt)
+	defer stmtCtx.Release()
+
 	ectx := executor.NewContext()
+	ectx.Mctx = stmtCtx
 	ectx.Ctx = ctx
 	ectx.Pool = s.cfg.Pool
 	ectx.Catalog = s.cfg.Catalog
@@ -191,6 +227,31 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	ectx.Checkpointer = s.cfg.Checkpointer
 	ectx.StatsTarget = sessionStatsTarget(sess)
 	ectx.WorkMem = sessionWorkMem(sess)
+	if sess != nil {
+		ectx.AdvisorySessionIdentity = sess
+		ectx.GetSetting = func(name string) (string, bool) {
+			_, eff, ok := sess.Get(name)
+			return eff, ok
+		}
+		ectx.SetSetting = func(name, value string, isLocal bool) error {
+			return sess.Set(name, value, isLocal)
+		}
+		ectx.AllSettings = func() []executor.SettingValue {
+			all := sess.All()
+			out := make([]executor.SettingValue, 0, len(all))
+			for _, kv := range all {
+				out = append(out, executor.SettingValue{Name: kv.Name, Value: kv.Value})
+			}
+			return out
+		}
+		ectx.ResetSetting = sess.Reset
+		ectx.ResetAllSettings = sess.ResetAll
+	}
+	if ectx.Session != nil {
+		advisoryReleaseTarget = ectx.Session
+	} else if ectx.AdvisorySessionIdentity != nil {
+		advisoryReleaseTarget = ectx.AdvisorySessionIdentity
+	}
 	ectx.EnableOpportunisticPrune = sessionOpportunisticPrune(sess)
 	ectx.FSM = s.cfg.FSM
 	ectx.VM = s.cfg.VM
@@ -198,6 +259,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	ectx.PubSub = s.cfg.PubSub
 	ectx.LockMgr = s.cfg.LockMgr
 	ectx.BackendID = backendID
+	if connTx != nil {
+		ectx.ProcNum = connTx.ProcNum
+	}
 	ectx.WAL = s.cfg.WAL
 	ectx.LogCanonical = s.cfg.LogCanonical
 	ectx.SyncRep = s.cfg.SyncRep
@@ -210,19 +274,51 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 	if s.cfg.IsStandby != nil {
 		ectx.IsStandby = s.cfg.IsStandby()
 	}
+	// Wire inline-NOTICE delivery so RAISE NOTICE emitted before a row-level
+	// lock wait (e.g. from noisy_oper() in eval-plan-qual) reaches the client
+	// before blockDetectWait fires in the isolation runner.  Without this,
+	// notices are buffered in ctx.Notices and only sent at CommandComplete
+	// time — AFTER the wait resolves — causing the isolation runner to print
+	// them after <waiting ...> instead of before the step header.
+	// M0100-0005 (eval-plan-qual / eval-plan-qual-trigger).
+	ectx.NoticeFlush = func(msg string) {
+		_ = w.WriteNoticeResponse([]protocol.ErrorField{
+			{Code: protocol.FieldSeverity, Value: "NOTICE"},
+			{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: protocol.FieldSQLState, Value: "00000"},
+			{Code: protocol.FieldMessage, Value: msg},
+		})
+		_ = w.Flush()
+	}
 
 	// Update pg_stat_activity before dispatching.
-	if reg := s.cfg.Activity; reg != nil {
-		if _, pid, _ := sess.Get("goopg.backend_pid"); pid != "" {
-			q := sql
-			if len(q) > 1024 {
-				q = q[:1024]
-			}
-			reg.UpdateState(pid, "active", q)
+	// M0107-0005: use procNum (int32) for the atomic hot path.
+	if reg := s.cfg.Activity; reg != nil && connTx != nil {
+		q := sql
+		if len(q) > 1024 {
+			q = q[:1024]
 		}
+		reg.UpdateState(connTx.ProcNum, "active", q)
 	}
 
 	for _, stmt := range stmts {
+		// Check for failed transaction state (25P02) — reject all statements
+		// except COMMIT/ROLLBACK/ABORT/END that clear the failed state.
+		// PostgreSQL semantics: an error inside an explicit transaction block
+		// marks the block as aborted; all subsequent statements get 25P02
+		// until the client issues ROLLBACK. M0100-0005.
+		if connTx != nil && connTx.IsFailed() {
+			_, isCommit := stmt.(*parser.CommitStmt)
+			_, isRollback := stmt.(*parser.RollbackStmt)
+			if !isCommit && !isRollback {
+				return s.writeQueryError(w, "25P02",
+					"current transaction is aborted, commands ignored until end of transaction block")
+			}
+			// COMMIT/ROLLBACK clears the failed state — handled below in
+			// executeOneSimpleStmt → TxCommit/TxRollback path, which calls
+			// connTx.End() (resetting failed=false). Fall through.
+		}
+
 		// EXPLAIN EXECUTE <name> (M0100-0005h): the planner wraps an
 		// `ExecuteStmt` Inner as a `Utility` node and EXPLAIN renders
 		// it as the placeholder `Utility *parser.ExecuteStmt`.  PG
@@ -353,6 +449,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 			}
 			ectx.Snap = snap2
 		}
+		// Per-statement reset: clear the DML-CTE write fence from any previous
+		// statement so subsequent SELECTs don't accidentally skip rows that were
+		// inserted/updated by a prior DML CTE in the same transaction.
+		ectx.CTEWriteFence = nil
+		ectx.InDMLCTE = false
 
 		// M0098-0005: plan cache for single-statement queries (the
 		// common OLTP case). On hit: skip planner.Plan. On miss:
@@ -382,6 +483,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 				// Do NOT send another ReadyForQuery — that would produce a double
 				// RFQ that causes psql to print "message type 0x5a arrived from
 				// server while idle". Just return nil so the connection stays alive.
+				// Mark the explicit transaction as failed so subsequent statements
+				// in the same transaction block get 25P02 (M0100-0005).
+				if !autoCommit && connTx != nil && connTx.InExplicit() {
+					connTx.Fail()
+				}
 				return nil
 			}
 			return err
@@ -392,15 +498,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		}
 	}
 	// Update pg_stat_activity to idle after successful execution.
-	if reg := s.cfg.Activity; reg != nil {
-		if _, pid, _ := sess.Get("goopg.backend_pid"); pid != "" {
-			reg.UpdateState(pid, "idle", "")
-		}
+	if reg := s.cfg.Activity; reg != nil && connTx != nil {
+		reg.UpdateState(connTx.ProcNum, "idle", "")
 	}
 	if autoCommit {
 		if err := s.cfg.TxnMgr.Commit(tx); err != nil {
 			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 		}
+		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		commit = true
 		maybeForceGCAfterCommit()
 	}
@@ -629,17 +734,25 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						// Roll back the placeholder auto-commit tx so it does
 						// not consume an XID / leak SSI bookkeeping.
 						_ = s.cfg.TxnMgr.Rollback(ctx.Tx)
-						newTx, berr := s.cfg.TxnMgr.Begin(parsedLvl)
+						newTx, berr := s.cfg.TxnMgr.Begin(parsedLvl, ctx.ProcNum)
 						if berr != nil {
 							return s.writeQueryError(w, sqlstate.SystemError, berr.Error())
 						}
-						snap, serr := s.cfg.TxnMgr.SnapshotFor(newTx)
-						if serr != nil {
-							_ = s.cfg.TxnMgr.Rollback(newTx)
-							return s.writeQueryError(w, sqlstate.SystemError, serr.Error())
-						}
 						ctx.Tx = newTx
-						ctx.Snap = snap
+						// PG-parity: for RR/SSI the snapshot is captured at the FIRST
+						// real statement after BEGIN, not at BEGIN time. For RC, the
+						// snapshot is refreshed per-statement anyway, so timing does
+						// not matter. Leaving state.firstSnapshot unset here allows
+						// the per-dispatch SnapshotFor call at line 171 to capture it
+						// at first-statement time. M0100-0001.
+						if parsedLvl == mvcc.IsolationReadCommitted {
+							snap, serr := s.cfg.TxnMgr.SnapshotFor(newTx)
+							if serr != nil {
+								_ = s.cfg.TxnMgr.Rollback(newTx)
+								return s.writeQueryError(w, sqlstate.SystemError, serr.Error())
+							}
+							ctx.Snap = snap
+						}
 					}
 				}
 				connTx.Begin(ctx.Tx)
@@ -647,6 +760,14 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		case planner.TxCommit:
 			if connTx != nil && connTx.InExplicit() {
+				// COMMIT in a failed transaction → PostgreSQL semantics: issue
+				// a WARNING and ROLLBACK instead of committing. M0100-0005.
+				if connTx.IsFailed() {
+					// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
+					_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
+					connTx.End()
+					return w.WriteCommandComplete("ROLLBACK")
+				}
 				explicitTx := connTx.Tx()
 				// M0104-0008: SSI pre-commit dangerous-structure check.
 				// The executor's transactionOp.execCommit invokes this for
@@ -703,7 +824,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		}
 	}
-	op, err := executor.Build(node)
+	op, err := executor.BuildFastIterator(node)
 	if err != nil {
 		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 	}
@@ -938,6 +1059,12 @@ func utilityTag(stmt parser.Stmt) string {
 		return "VACUUM"
 	case *parser.AnalyzeStmt:
 		return "ANALYZE"
+	case *parser.ShowStmt:
+		return "SHOW"
+	case *parser.SetStmt:
+		return "SET"
+	case *parser.ResetStmt:
+		return "RESET"
 	}
 	return "OK"
 }
@@ -961,7 +1088,7 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 	switch d.Kind {
 	case executor.KindInt:
 		f = float64(d.Int)
-	case executor.KindString, executor.KindStringArena:
+	case executor.KindString:
 		s := d.StringValue()
 		if parsed, err := strconv.ParseFloat(s, 64); err == nil {
 			f = parsed
@@ -1114,7 +1241,7 @@ func (s *Server) executeFetchAll(_ context.Context, w *protocol.FrameWriter, ect
 		code, msg := planErrorFields(err)
 		return s.writeQueryError(w, code, msg)
 	}
-	op, buildErr := executor.Build(node)
+	op, buildErr := executor.BuildFastIterator(node)
 	if buildErr != nil {
 		return s.writeQueryError(w, execErrCode(buildErr), execErrMsg(buildErr))
 	}

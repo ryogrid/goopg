@@ -743,3 +743,83 @@ func TestLockRowsBlocksOnExclusiveLock(t *testing.T) {
 		t.Fatal("goroutine did not unblock after lock release")
 	}
 }
+
+// TestLockRowsStampsXmaxOnPartitionedTableLeaf verifies that a FOR UPDATE
+// on a partitioned parent table correctly stamps the lock-only xmax on the
+// heap tuple in the leaf partition, not just on the parent.
+//
+// Before the M0100-0005 follow-up fix, findScanLeaf returned nil for setOp
+// (the UNION ALL that scans leaf partitions), so drainAndStamp skipped the
+// per-row stamp pass — leaving the leaf tuple's xmax at InvalidTransactionID.
+// findInProgressConflict Case 3 then missed the FOR UPDATE lock, causing a
+// concurrent INSERT ON CONFLICT to proceed without waiting (as observed in
+// TestPort_IsolationInsertConflictDoUpdate4).
+func TestLockRowsStampsXmaxOnPartitionedTableLeaf(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.LockMgr = lockmgr.New()
+	ctx.BackendID = 1
+
+	im := cat.(*catalog.InMemory)
+
+	// Create parent partitioned table and a single leaf partition.
+	parent, err := im.CreateTable(parser.ObjectName{Name: "part"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "val", Type: catalog.Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateTable parent: %v", err)
+	}
+	parent.PartitionKey = []string{"id"}
+
+	leaf, err := im.CreateTable(parser.ObjectName{Name: "part_1"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "val", Type: catalog.Type{Name: "text"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateTable leaf: %v", err)
+	}
+	im.RegisterPartitionChild(parent.OID, leaf.OID)
+
+	// Insert a row into the leaf partition.
+	leafRel := cat.RelFileNode(leaf)
+	ptr, err := writeHeapRowReturning(ctx, leafRel, leaf.Columns, Row{
+		{Kind: KindInt, Int: 1},
+		{Kind: KindString, Buf: []byte("hello")},
+	})
+	if err != nil {
+		t.Fatalf("writeHeapRowReturning: %v", err)
+	}
+	_ = ptr
+
+	// Run SELECT * FROM part FOR UPDATE.
+	rows, err := runForUpdate(t, ctx, "SELECT * FROM part FOR UPDATE")
+	if err != nil {
+		t.Fatalf("runForUpdate: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row from FOR UPDATE, got %d", len(rows))
+	}
+
+	// Verify the leaf tuple has HeapXmaxLockOnly stamped.
+	pinned, err := ctx.Pool.Pin(storage.BufferTag{Rel: leafRel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned.RLock()
+	tuple, err := storage.PageGetHeapTuple(pinned.Page(), 1)
+	pinned.RUnlock()
+	ctx.Pool.Unpin(pinned)
+	if err != nil {
+		t.Fatalf("PageGetHeapTuple: %v", err)
+	}
+	if tuple.Header.Xmax == storage.InvalidTransactionID {
+		t.Error("leaf tuple xmax is still InvalidTransactionID — FOR UPDATE did not stamp the leaf")
+	}
+	if tuple.Header.Xmax != ctx.Tx.XID {
+		t.Errorf("leaf tuple xmax=%d, want our XID=%d", tuple.Header.Xmax, ctx.Tx.XID)
+	}
+	if tuple.Header.Infomask&storage.HeapXmaxLockOnly == 0 {
+		t.Errorf("HeapXmaxLockOnly not set on leaf tuple (Infomask=%#x)", tuple.Header.Infomask)
+	}
+}

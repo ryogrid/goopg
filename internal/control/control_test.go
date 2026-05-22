@@ -328,3 +328,59 @@ func TestUpdateControlFileMissingDir(t *testing.T) {
 		t.Errorf("got %v, want error wrapping os.ErrNotExist", err)
 	}
 }
+
+
+// TestUpdateControlFileNextOidRoundTrip verifies that CheckPointCopyNextOid
+// survives an UpdateControlFile round-trip (M0106-0013). Parallel to
+// TestUpdateControlFileNextXidRoundTrip at offset 64.
+func TestUpdateControlFileNextOidRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, pgControlFileSize)
+	le := binary.LittleEndian
+	// Seed bootstrap-style pg_control with nextOid = 10000 at offset 72.
+	le.PutUint64(buf[0:], 0xABCDEF0123456789) // system_identifier
+	le.PutUint32(buf[8:], 1800)               // pg_control_version
+	le.PutUint32(buf[16:], DBStateShutdowned) // state
+	le.PutUint32(buf[72:], 10000)             // nextOid
+	crc := crc32.Checksum(buf[:pgControlCRCOffset], pgCRCTable)
+	le.PutUint32(buf[pgControlCRCOffset:], crc)
+	path := filepath.Join(dir, pgControlFilePath)
+	if err := os.WriteFile(path, buf, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// First update: advance nextOid to 20000.
+	if err := UpdateControlFile(dir, func(cd *ControlFileData) {
+		if cd.CheckPointCopyNextOid != 10000 {
+			t.Fatalf("decoded nextOid: got %d want 10000", cd.CheckPointCopyNextOid)
+		}
+		cd.CheckPointCopyNextOid = 20000
+	}); err != nil {
+		t.Fatalf("UpdateControlFile: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nx := le.Uint32(got[72:]); nx != 20000 {
+		t.Errorf("nextOid after first update: got %d want 20000", nx)
+	}
+
+	// Second update: a no-op callback must not zero out nextOid.
+	if err := UpdateControlFile(dir, func(cd *ControlFileData) {
+		cd.State = DBStateInProduction
+	}); err != nil {
+		t.Fatalf("UpdateControlFile (no-op nextOid): %v", err)
+	}
+	got, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nx := le.Uint32(got[72:]); nx != 20000 {
+		t.Errorf("nextOid after no-op update: got %d want 20000 (encode must preserve nextOid)", nx)
+	}
+}

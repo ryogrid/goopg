@@ -527,6 +527,7 @@ type CommonTableExpr struct {
 	Name    string
 	Columns []string // optional column-alias list; nil when absent
 	Query   *SelectStmt
+	DMLBody Stmt // INSERT/UPDATE/DELETE/MERGE CTE body (nil for SELECT CTEs)
 }
 
 // Pos returns the position of the CTE's declaring identifier.
@@ -705,6 +706,10 @@ const (
 type OnConflictTarget struct {
 	pos        int
 	Columns    []string // populated for `ON CONFLICT (col [, col, …])`
+	// Exprs holds the parsed expression for expression-based conflict columns
+	// (e.g. lower(key)). Parallel to Columns: Exprs[i] is non-nil when
+	// Columns[i] == "" (expression column); nil for plain column names.
+	Exprs      []Expr
 	Constraint string   // populated for `ON CONFLICT ON CONSTRAINT name`
 }
 
@@ -915,6 +920,10 @@ type CreateIndexStmt struct {
 	Table       ObjectName
 	Method      string // empty defaults to "btree" downstream
 	Columns     []string
+	// ColExprs holds the parsed expression for expression-based index columns
+	// (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil when
+	// Columns[i] == "" (expression column); nil for plain column names.
+	ColExprs    []Expr
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }

@@ -46,6 +46,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/goopg/goopg/internal/stats"
 )
 
 // Direction is the read-vs-write flavour of an Op.
@@ -203,22 +205,41 @@ type Method interface {
 // counter) so the future observability slice has counters to
 // surface without touching every method.
 type Engine struct {
-	method    Method
-	inFlight  atomic.Int64
-	submitted atomic.Uint64
-	completed atomic.Uint64
-	errored   atomic.Uint64
+	method Method
+	// inFlight is the current count of outstanding I/Os —
+	// incremented in each Method's Submit (`+1`) and decremented
+	// in finishHandle (`-1`). It is the only stats.Counter consumer
+	// in this engine that takes signed deltas; the cross-shard sum
+	// still equals (#submits − #completions) at any consistent point,
+	// matching the gauge value previously held in a single
+	// `atomic.Int64`. The hot path is identical to the per-direction
+	// completion counters migrated in
+	// `0107-0008j`/`0107-0008i`: every Submit and every completion
+	// pays a previously-shared cache-line hop on this field; per-P
+	// sharding via stats.Counter scatters those bumps across 256
+	// shards. Reader is `Stats()` (cold path); the sharded Sum
+	// reading is eventual-consistent which matches the observability
+	// contract documented at line 632 below.
+	inFlight  stats.Counter
+	submitted stats.Counter
+	completed stats.Counter
+	errored   stats.Counter
 
 	// Per-direction breakdown of the same counters above.
 	// `submitted` / `completed` / `errored` are the totals;
 	// these are the read / write split. Mirrors upstream's
 	// pg_stat_io row shape, which splits by operation.
-	readSubmitted  atomic.Uint64
-	readCompleted  atomic.Uint64
-	readErrored    atomic.Uint64
-	writeSubmitted atomic.Uint64
-	writeCompleted atomic.Uint64
-	writeErrored   atomic.Uint64
+	//
+	// Per-P sharded via stats.Counter so the four read/write
+	// submit/complete bumps in the I/O hot path don't bounce
+	// a shared cache line across cores. See
+	// docs/design/0107-0008j-aio-per-direction-stats-counter-wiring.md.
+	readSubmitted  stats.Counter
+	readCompleted  stats.Counter
+	readErrored    stats.Counter
+	writeSubmitted stats.Counter
+	writeCompleted stats.Counter
+	writeErrored   stats.Counter
 
 	// Per-direction latency observability. SumMicros tracks
 	// the cumulative observed latency (now - submittedAt at
@@ -227,9 +248,14 @@ type Engine struct {
 	// worst-case sample observed so far, CAS-clamped to
 	// monotonic-forward. Both are micros (not nanos) to
 	// fit comfortably in uint64 even at high I/O rates.
-	readLatencySumMicros  atomic.Uint64
+	//
+	// SumMicros sharded via stats.Counter (same hot-path
+	// completion bump as the per-direction completed counters).
+	// MaxMicros stays atomic.Uint64 because advanceMax requires
+	// CompareAndSwap semantics that stats.Counter doesn't model.
+	readLatencySumMicros  stats.Counter
 	readLatencyMaxMicros  atomic.Uint64
-	writeLatencySumMicros atomic.Uint64
+	writeLatencySumMicros stats.Counter
 	writeLatencyMaxMicros atomic.Uint64
 
 	// Per-target breakdown: maps Op.Target → *targetStats.
@@ -486,14 +512,14 @@ func (e *Engine) finishHandle(h *Handle, r Result) {
 		if isErr {
 			e.readErrored.Add(1)
 		}
-		e.readLatencySumMicros.Add(elapsedMicros)
+		e.readLatencySumMicros.Add(int64(elapsedMicros))
 		advanceMax(&e.readLatencyMaxMicros, elapsedMicros)
 	case DirWrite:
 		e.writeCompleted.Add(1)
 		if isErr {
 			e.writeErrored.Add(1)
 		}
-		e.writeLatencySumMicros.Add(elapsedMicros)
+		e.writeLatencySumMicros.Add(int64(elapsedMicros))
 		advanceMax(&e.writeLatencyMaxMicros, elapsedMicros)
 	}
 	if ts := e.loadOrCreateTarget(h.op.Target); ts != nil {
@@ -622,19 +648,19 @@ func (e *Engine) InFlight() []InFlightInfo {
 func (e *Engine) Stats() Stats {
 	return Stats{
 		Method:         e.method.Name(),
-		Submitted:      e.submitted.Load(),
-		Completed:      e.completed.Load(),
-		Errored:        e.errored.Load(),
-		InFlight:       e.inFlight.Load(),
-		ReadSubmitted:         e.readSubmitted.Load(),
-		ReadCompleted:         e.readCompleted.Load(),
-		ReadErrored:           e.readErrored.Load(),
-		WriteSubmitted:        e.writeSubmitted.Load(),
-		WriteCompleted:        e.writeCompleted.Load(),
-		WriteErrored:          e.writeErrored.Load(),
-		ReadLatencySumMicros:  e.readLatencySumMicros.Load(),
+		Submitted:      uint64(e.submitted.Sum()),
+		Completed:      uint64(e.completed.Sum()),
+		Errored:        uint64(e.errored.Sum()),
+		InFlight:       e.inFlight.Sum(),
+		ReadSubmitted:         uint64(e.readSubmitted.Sum()),
+		ReadCompleted:         uint64(e.readCompleted.Sum()),
+		ReadErrored:           uint64(e.readErrored.Sum()),
+		WriteSubmitted:        uint64(e.writeSubmitted.Sum()),
+		WriteCompleted:        uint64(e.writeCompleted.Sum()),
+		WriteErrored:          uint64(e.writeErrored.Sum()),
+		ReadLatencySumMicros:  uint64(e.readLatencySumMicros.Sum()),
 		ReadLatencyMaxMicros:  e.readLatencyMaxMicros.Load(),
-		WriteLatencySumMicros: e.writeLatencySumMicros.Load(),
+		WriteLatencySumMicros: uint64(e.writeLatencySumMicros.Sum()),
 		WriteLatencyMaxMicros: e.writeLatencyMaxMicros.Load(),
 	}
 }

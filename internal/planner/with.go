@@ -30,6 +30,7 @@ type plannedCTE struct {
 	body   Node
 	schema Schema
 	table  *catalog.Table
+	isDML  bool // data-modifying CTE; body is an INSERT/UPDATE/DELETE/MERGE plan
 }
 
 // planCTEs is the goroutine-thread-unsafe "current WITH-list"
@@ -52,9 +53,9 @@ var planCTEs map[string]*plannedCTE
 //
 // Returns nil restorer when with is nil so the caller can defer
 // unconditionally with `defer restore()` and a no-op stub.
-func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (func(), error) {
+func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore func(), dmlPlans []dmlCTEPlan, err error) {
 	if with == nil {
-		return func() {}, nil
+		return func() {}, nil, nil
 	}
 	if with.Recursive {
 		// WITH RECURSIVE: each CTE body must be a UNION ALL.
@@ -66,19 +67,19 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (func(), er
 			cur[k] = v
 		}
 		planCTEs = cur
-		restore := func() { planCTEs = prev }
+		restore = func() { planCTEs = prev }
 
 		for _, cte := range with.CTEs {
 			body, err := planRecursiveCTE(cte, cat)
 			if err != nil {
 				restore()
-				return nil, err
+				return nil, nil, err
 			}
 			schema := body.Output()
 			if len(cte.Columns) > 0 {
 				if len(cte.Columns) != len(schema) {
 					restore()
-					return nil, &PlanError{
+					return nil, nil, &PlanError{
 						Pos:     cte.Pos(),
 						Code:    "42P10",
 						Message: fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(schema)),
@@ -101,7 +102,7 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (func(), er
 				table:  &catalog.Table{Name: cte.Name, Columns: cols},
 			}
 		}
-		return restore, nil
+		return restore, nil, nil
 	}
 	prev := planCTEs
 	cur := make(map[string]*plannedCTE, len(with.CTEs))
@@ -111,9 +112,40 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (func(), er
 		cur[k] = v
 	}
 	planCTEs = cur
-	restore := func() { planCTEs = prev }
+	restore = func() { planCTEs = prev }
 
 	for _, cte := range with.CTEs {
+		// Data-modifying CTE (INSERT/UPDATE/DELETE/MERGE body).
+		if cte.DMLBody != nil {
+			body, dmlErr := planDMLCTEBody(cte.DMLBody, cat)
+			if dmlErr != nil {
+				restore()
+				return nil, nil, dmlErr
+			}
+			schema := body.Output()
+			if len(cte.Columns) > 0 && len(cte.Columns) == len(schema) {
+				renamed := make(Schema, len(schema))
+				for i, c := range schema {
+					renamed[i] = SchemaColumn{Name: cte.Columns[i], Type: c.Type}
+				}
+				schema = renamed
+			}
+			cols := make([]catalog.Column, len(schema))
+			for i, c := range schema {
+				cols[i] = catalog.Column{Name: c.Name, Type: c.Type}
+			}
+			entry := &plannedCTE{
+				name:   cte.Name,
+				body:   body,
+				schema: schema,
+				table:  &catalog.Table{Name: cte.Name, Columns: cols},
+				isDML:  true,
+			}
+			cur[strings.ToLower(cte.Name)] = entry
+			dmlPlans = append(dmlPlans, dmlCTEPlan{name: cte.Name, plan: body, schema: schema})
+			continue
+		}
+
 		// Bypass Plan() entry's Analyze pass: the outer statement's
 		// Plan call already analyzed the whole tree (including this
 		// CTE body — analyzer.analyzeWith recurses into each CTE
@@ -127,13 +159,13 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (func(), er
 		body, err := planSelect(cte.Query, cat)
 		if err != nil {
 			restore()
-			return nil, err
+			return nil, nil, err
 		}
 		schema := body.Output()
 		if len(cte.Columns) > 0 {
 			if len(cte.Columns) != len(schema) {
 				restore()
-				return nil, &PlanError{
+				return nil, nil, &PlanError{
 					Pos:     cte.Pos(),
 					Code:    "42P10",
 					Message: fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(schema)),
@@ -157,7 +189,7 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (func(), er
 		}
 		cur[strings.ToLower(cte.Name)] = entry
 	}
-	return restore, nil
+	return restore, dmlPlans, nil
 }
 
 // planRecursiveCTE plans a WITH RECURSIVE CTE body as a RecursiveUnion.
@@ -234,4 +266,46 @@ func lookupPlannedCTE(name string) *plannedCTE {
 		return nil
 	}
 	return planCTEs[strings.ToLower(name)]
+}
+
+
+// dmlCTEPlan holds a single data-modifying CTE plan and its output schema.
+type dmlCTEPlan struct {
+	name   string
+	plan   Node
+	schema Schema
+}
+
+// planDMLCTEBody plans an INSERT/UPDATE/DELETE/MERGE statement that
+// appears as a CTE body. The plan's Output() schema reflects the
+// RETURNING columns (empty if no RETURNING clause).
+func planDMLCTEBody(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
+	switch s := stmt.(type) {
+	case *parser.InsertStmt:
+		return planInsert(s, cat)
+	case *parser.UpdateStmt:
+		return planUpdate(s, cat)
+	case *parser.DeleteStmt:
+		return planDelete(s, cat)
+	case *parser.MergeStmt:
+		return planMerge(s, cat)
+	default:
+		return nil, &PlanError{Code: "0A000", Message: "unsupported DML statement in CTE body"}
+	}
+}
+
+// wrapDMLCTEPrefix wraps outerPlan in a CTEDMLPrefix node when there
+// are data-modifying CTEs. If dmlPlans is empty the outer plan is
+// returned unchanged.
+func wrapDMLCTEPrefix(outerPlan Node, dmlPlans []dmlCTEPlan) Node {
+	if len(dmlPlans) == 0 {
+		return outerPlan
+	}
+	names := make([]string, len(dmlPlans))
+	plans := make([]Node, len(dmlPlans))
+	for i, d := range dmlPlans {
+		names[i] = d.name
+		plans[i] = d.plan
+	}
+	return &CTEDMLPrefix{Names: names, DMls: plans, Body: outerPlan}
 }

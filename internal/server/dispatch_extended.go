@@ -25,7 +25,7 @@ import (
 // are rejected at Bind time); we feed them through to
 // executor.Context.Params and let the executor's expression
 // evaluator coerce inside ParamRef.
-func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32) (*extendedQueryResult, *extendedQueryError) {
 	stmts, err := parser.Parse(query)
 	if err != nil {
 		msg, extra := syntaxErrorMsg(err)
@@ -78,14 +78,21 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		return &extendedQueryResult{CommandTag: transactionTag(tx.Verb)}, nil
 	}
 
-	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted)
+	// Use an offset procNum to avoid overwriting the connection's own
+	// ProcArray slot when an explicit transaction is active. The offset
+	// mirrors the COPY transaction strategy in copy.go.
+	const halfSize = mvcc.DefaultProcArraySize / 2
+	autoCommitProcNum := (procNum + halfSize) % mvcc.DefaultProcArraySize
+	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, autoCommitProcNum)
 	if err != nil {
 		return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
 	}
 	commit := false
+	var advisoryReleaseTarget any
 	defer func() {
 		if !commit {
 			_ = s.cfg.TxnMgr.Rollback(tx)
+			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		}
 	}()
 	snap, err := s.cfg.TxnMgr.SnapshotFor(tx)
@@ -109,6 +116,31 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.Checkpointer = s.cfg.Checkpointer
 	ectx.StatsTarget = sessionStatsTarget(sess)
 	ectx.WorkMem = sessionWorkMem(sess)
+	if sess != nil {
+		ectx.AdvisorySessionIdentity = sess
+		ectx.GetSetting = func(name string) (string, bool) {
+			_, eff, ok := sess.Get(name)
+			return eff, ok
+		}
+		ectx.SetSetting = func(name, value string, isLocal bool) error {
+			return sess.Set(name, value, isLocal)
+		}
+		ectx.AllSettings = func() []executor.SettingValue {
+			all := sess.All()
+			out := make([]executor.SettingValue, 0, len(all))
+			for _, kv := range all {
+				out = append(out, executor.SettingValue{Name: kv.Name, Value: kv.Value})
+			}
+			return out
+		}
+		ectx.ResetSetting = sess.Reset
+		ectx.ResetAllSettings = sess.ResetAll
+	}
+	if ectx.Session != nil {
+		advisoryReleaseTarget = ectx.Session
+	} else if ectx.AdvisorySessionIdentity != nil {
+		advisoryReleaseTarget = ectx.AdvisorySessionIdentity
+	}
 	ectx.PubSub = s.cfg.PubSub
 	ectx.WAL = s.cfg.WAL
 	ectx.LogCanonical = s.cfg.LogCanonical
@@ -174,6 +206,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
 		return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
 	}
+	executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 	commit = true
 
 	res.CommandTag = commandTagFor(node, op, rowCount)

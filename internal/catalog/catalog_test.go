@@ -396,3 +396,33 @@ func TestSystemRelationOIDsBelowFirstUserOID(t *testing.T) {
 		}
 	}
 }
+
+// TestNextOIDAndAdvanceNextOIDPast verifies the M0106-0013 helpers:
+// NextOID() reads the current counter; AdvanceNextOIDPast(oid) ensures
+// the counter is strictly above oid.
+func TestNextOIDAndAdvanceNextOIDPast(t *testing.T) {
+	c := NewInMemory()
+	initial := c.NextOID()
+	if initial < FirstUserOID {
+		t.Fatalf("initial nextOID %d < FirstUserOID %d", initial, FirstUserOID)
+	}
+
+	// Advance to a value already below the counter — must be a no-op.
+	c.AdvanceNextOIDPast(initial - 1)
+	if got := c.NextOID(); got != initial {
+		t.Errorf("advance below current: got %d want %d (no-op)", got, initial)
+	}
+
+	// Advance to a value above the counter — must set counter to oid+1.
+	above := initial + 500
+	c.AdvanceNextOIDPast(above)
+	if got := c.NextOID(); got != above+1 {
+		t.Errorf("advance above current: got %d want %d", got, above+1)
+	}
+
+	// Advancing to current counter value − 1 again must still be a no-op.
+	c.AdvanceNextOIDPast(above - 1)
+	if got := c.NextOID(); got != above+1 {
+		t.Errorf("advance below (after larger advance): got %d want %d", got, above+1)
+	}
+}

@@ -4,10 +4,11 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mctx"
 )
 
 // TestDecodeRowProjectionArenaProjectedKindArena pins
-// that projected varchar columns emit KindStringArena
+// that projected varchar columns emit mctx-backed KindString (ArenaID≠0)
 // when arena != nil. (M0074-0004.)
 func TestDecodeRowProjectionArenaProjectedKindArena(t *testing.T) {
 	cols := []catalog.Column{
@@ -27,9 +28,9 @@ func TestDecodeRowProjectionArenaProjectedKindArena(t *testing.T) {
 
 	keep := []bool{false, true, false} // only "name" is projected
 	dst := make(Row, len(cols))
-	arena := NewArena(0)
-	defer arena.Drop()
-	if err := DecodeRowProjectionIntoArena(dst, cols, data, keep, arena); err != nil {
+	sctx := mctx.Acquire(nil, mctx.KindStmt)
+	defer sctx.Release()
+	if err := DecodeRowProjectionIntoArena(dst, cols, data, keep, sctx); err != nil {
 		t.Fatalf("DecodeRowProjectionIntoArena: %v", err)
 	}
 	// Skipped columns get NullDatum (marker, not SQL NULL).
@@ -39,10 +40,10 @@ func TestDecodeRowProjectionArenaProjectedKindArena(t *testing.T) {
 	if dst[2].Kind != KindNull {
 		t.Errorf("col 2 (skipped) Kind = %v, want KindNull", dst[2].Kind)
 	}
-	// Projected varchar must be KindStringArena (the arena-bound
+	// Projected varchar must be mctx-backed KindString (ArenaID≠0, M0107-0002).
 	// payload variant from M0073-0001).
-	if dst[1].Kind != KindStringArena {
-		t.Errorf("col 1 (projected varchar) Kind = %v, want KindStringArena", dst[1].Kind)
+	if dst[1].Kind != KindString || dst[1].ArenaID == 0 {
+		t.Errorf("col 1 (projected varchar) Kind = %v ArenaID = %d, want KindString+ArenaID≠0", dst[1].Kind, dst[1].ArenaID)
 	}
 	if dst[1].StringValue() != "hello" {
 		t.Errorf("col 1 StringValue = %q, want %q", dst[1].StringValue(), "hello")
@@ -109,9 +110,9 @@ func TestDecodeRowProjectionArenaSkippedColumnsNullDatum(t *testing.T) {
 	}
 	keep := []bool{false, false} // skip both
 	dst := make(Row, len(cols))
-	arena := NewArena(0)
-	defer arena.Drop()
-	if err := DecodeRowProjectionIntoArena(dst, cols, data, keep, arena); err != nil {
+	sctx := mctx.Acquire(nil, mctx.KindStmt)
+	defer sctx.Release()
+	if err := DecodeRowProjectionIntoArena(dst, cols, data, keep, sctx); err != nil {
 		t.Fatalf("decode error: %v", err)
 	}
 	for i := range dst {
@@ -142,12 +143,12 @@ func TestDecodeRowProjectionArenaResetThenReuse(t *testing.T) {
 	}
 
 	keep := []bool{true}
-	arena := NewArena(0)
-	defer arena.Drop()
+	sctx := mctx.Acquire(nil, mctx.KindStmt)
+	defer sctx.Release()
 
 	// Decode row1, materialise its string, then Reset.
 	dst1 := make(Row, 1)
-	if err := DecodeRowProjectionIntoArena(dst1, cols, data1, keep, arena); err != nil {
+	if err := DecodeRowProjectionIntoArena(dst1, cols, data1, keep, sctx); err != nil {
 		t.Fatalf("decode row1: %v", err)
 	}
 	v1 := dst1[0].StringValue()
@@ -156,11 +157,11 @@ func TestDecodeRowProjectionArenaResetThenReuse(t *testing.T) {
 	}
 	// Materialise into a Go string (copy off arena) before Reset.
 	v1Copy := string([]byte(v1))
-	arena.Reset()
+	sctx.Reset()
 
-	// Decode row2 into the same arena.
+	// Decode row2 into the same mctx.
 	dst2 := make(Row, 1)
-	if err := DecodeRowProjectionIntoArena(dst2, cols, data2, keep, arena); err != nil {
+	if err := DecodeRowProjectionIntoArena(dst2, cols, data2, keep, sctx); err != nil {
 		t.Fatalf("decode row2: %v", err)
 	}
 	if dst2[0].StringValue() != "second" {

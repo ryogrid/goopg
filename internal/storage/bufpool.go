@@ -6,7 +6,40 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+
+	"github.com/goopg/goopg/internal/runtimeshim"
+	"github.com/goopg/goopg/internal/stats"
 )
+
+// Slot state bit layout (single 64-bit atomic word):
+//
+//	bits  0..21  pinCount    (22 bits → 4 M concurrent pins max)
+//	bits 22..29  usageCount  (8 bits, saturating clock-sweep counter)
+//	bit      30  dirty       (page has been mutated since last flush)
+//	bit      31  valid       (slot holds a valid page for its tag)
+//	bit      32  ioInflight  (a disk read is in progress for this slot)
+//	bits 33..47  gen         (15 bits, bumped on eviction; ABA guard)
+//	bits 48..63  reserved
+const (
+	slotPinMask    = uint64((1 << 22) - 1) // bits 0..21
+	slotUsageShift = 22
+	slotUsageMask  = uint64(((1 << 8) - 1) << slotUsageShift)
+	slotDirtyBit   = uint64(1 << 30)
+	slotValidBit   = uint64(1 << 31)
+	slotIOBit      = uint64(1 << 32)
+	slotGenShift   = 33
+	slotGenMask    = uint64(((1 << 15) - 1) << slotGenShift)
+	maxUsageCount  = 5
+	maxPinCount    = (1 << 22) - 1
+)
+
+// slotState helpers — extract fields from a packed state word.
+func statePin(st uint64) uint64    { return st & slotPinMask }
+func stateUsage(st uint64) uint64  { return (st & slotUsageMask) >> slotUsageShift }
+func stateGen(st uint64) uint32    { return uint32((st & slotGenMask) >> slotGenShift) }
+func stateValid(st uint64) bool    { return st&slotValidBit != 0 }
+func stateDirty(st uint64) bool    { return st&slotDirtyBit != 0 }
+func stateIO(st uint64) bool       { return st&slotIOBit != 0 }
 
 // Slot is one buffer-pool entry holding one Page. Callers receive
 // *Slot from Pin and return it via Unpin. Direct field access is
@@ -16,38 +49,24 @@ type Slot struct {
 	page Page // alias into the arena
 
 	// Tag identifies the (rel, fork, block) the slot currently holds.
-	// Mutated only with the pool mutex held.
+	// Written only while ioInflight is set in state; readable once valid.
 	tag BufferTag
 
-	// valid means the slot's page bytes correspond to disk content.
-	// false during eviction, between the moment we drop the lookup
-	// and the moment we finish reading from disk.
-	valid bool
-
-	// dirty means the page bytes have been mutated and must be
-	// written out before reassignment.
-	dirty bool
-
-	// pinCount is incremented on Pin, decremented on Unpin.
-	// M0099-0002: atomic so Pin fast path (RLock) can increment without
-	// exclusive evictMu and concurrent Pins on different pages don't
-	// serialise through a single mutex.
-	pinCount atomic.Int32
-
-	// usageCount is the clock-sweep "second chance" counter.
-	// M0099-0002: atomic so it can be read/updated under RLock alongside
-	// pinCount without a second exclusive acquisition.
-	usageCount atomic.Int32
+	// state packs pinCount, usageCount, dirty, valid, ioInflight, gen
+	// into a single 64-bit atomic word for lock-free Pin/Unpin.
+	state atomic.Uint64
 
 	// fpiSinceCheckpoint records whether a full-page-image WAL
 	// record has already been emitted for this page in the current
-	// checkpoint epoch. Mutated only with the pool mutex held.
-	// The checkpointer clears it across all slots after a
-	// successful checkpoint via Pool.ResetCheckpointEpoch.
-	fpiSinceCheckpoint bool
+	// checkpoint epoch. It is read/written atomically so that the FPI
+	// path is safe to call while the caller already holds contentMu
+	// (e.g. test pattern: s.Lock(); s.Page()[i] = b; MarkDirty(s);
+	// s.Unlock()).  The checkpointer clears it across all slots after
+	// a successful checkpoint via Pool.ResetCheckpointEpoch.
+	fpiSinceCheckpoint atomic.Bool
 
-	// contentMu guards the Page bytes for read/write. The pool mutex
-	// is dropped before we acquire this so I/O doesn't block lookups.
+	// contentMu guards the Page bytes for read/write. The pool does
+	// not hold any global lock while this is taken.
 	contentMu sync.RWMutex
 }
 
@@ -58,182 +77,123 @@ func (s *Slot) Page() Page { return s.page }
 // Tag returns the (rel, fork, block) the slot currently holds.
 func (s *Slot) Tag() BufferTag { return s.tag }
 
-// Lock acquires the page's exclusive content lock. Callers that
-// mutate the page bytes (e.g. PageAddHeapTuple, PageSetHeapTupleXmax)
-// must hold this between the start of the modification and the
-// MarkDirty/Unlock sequence. Without it, two concurrent writers can
-// race on the same line-pointer / upper-region update and produce
-// corrupted tuples (upstream PostgreSQL holds a buffer content
-// lock for the same window — see postgres/src/backend/storage/buffer/
-// bufmgr.c LockBuffer(BUFFER_LOCK_EXCLUSIVE)).
+// Lock acquires the page's exclusive content lock.
 func (s *Slot) Lock()    { s.contentMu.Lock() }
 func (s *Slot) Unlock()  { s.contentMu.Unlock() }
 func (s *Slot) RLock()   { s.contentMu.RLock() }
 func (s *Slot) RUnlock() { s.contentMu.RUnlock() }
 
-// bufferPartition holds one hash-partition of the buffer pool's tag table.
-// M0098-0003: 128 partitions replace the single poolMu + byTag.
-// Each partition guards its own byTag and ioByTag maps so concurrent
-// goroutines requesting different pages contend on different mutexes.
-type bufferPartition struct {
-	mu      sync.Mutex
-	byTag   map[BufferTag]int      // tag → slot index
-	ioByTag map[BufferTag]struct{} // tags with in-flight I/O
-	ioCond  *sync.Cond             // wait here for in-flight I/O on this partition
-}
+// valid is a read helper for tests/internal callers.
+func (s *Slot) isValid() bool { return stateValid(s.state.Load()) }
+
+// dirty is a read helper for tests/internal callers.
+func (s *Slot) isDirty() bool { return stateDirty(s.state.Load()) }
+
+// getPinCount returns the current pin count.
+func (s *Slot) getPinCount() int32 { return int32(statePin(s.state.Load())) }
 
 // Pool is the buffer manager. It is goroutine-safe.
 type Pool struct {
 	mgr   *Manager
 	arena *arena
-	slots []*Slot
+	slots []Slot
 	wal   WALFlusher
 	// logFPI emits a full-page-image WAL record and returns the
-	// record's end LSN. nil disables FPI emission. Set via
-	// PoolConfig.LogPageImage.
+	// record's end LSN. nil disables FPI emission.
 	logFPI func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error)
-	// logBtreeSplit emits an atomic B-tree split WAL record
-	// covering both halves of a split. Pulled out via
-	// LogBtreeSplit() for the btree access method.
+	// logBtreeSplit emits an atomic B-tree split WAL record.
 	logBtreeSplit LogBtreeSplitFunc
 	// logHeapInsert emits a logical heap-insert WAL record.
-	// Pulled out via LogHeapInsert() for the executor's
-	// writeHeapRow path. nil disables the optimisation —
-	// MarkDirtyChangeRecord falls back to FPI emission.
 	logHeapInsert LogHeapInsertFunc
-	// logBtreeInsert emits a logical B-tree non-split insert
-	// WAL record. Pulled out via LogBtreeInsert() for the btree
-	// access method. nil disables the optimisation.
+	// logBtreeInsert emits a logical B-tree non-split insert WAL record.
 	logBtreeInsert LogBtreeInsertFunc
-	// logHeapDelete emits a logical heap-delete (xmax stamp)
-	// WAL record. Used by the executor's UPDATE / DELETE paths.
+	// logHeapDelete emits a logical heap-delete WAL record.
 	logHeapDelete LogHeapDeleteFunc
-	// logHeapLock emits a logical heap-lock (lock-only xmax +
-	// lock-strength) WAL record. Used by the SELECT FOR
-	// UPDATE / FOR SHARE executor (M0021 tuple-level locking
-	// step 2). nil disables the optimisation —
-	// MarkDirtyChangeRecord falls back to FPI emission.
+	// logHeapLock emits a logical heap-lock WAL record.
 	logHeapLock LogHeapLockFunc
-	// logHeapVacuum emits a logical heap-vacuum (page prune) WAL
-	// record. Used by VACUUM to capture the dead-slot list rather
-	// than a full-page image on each pruned page.
+	// logHeapVacuum emits a logical heap-vacuum WAL record.
 	logHeapVacuum LogHeapVacuumFunc
-	// logBtreeVacuum emits a logical btree-vacuum (kept-items)
-	// WAL record. Used by `btree.VacuumIndexPages` to avoid
-	// FPI per pruned leaf. (M0079-0002.)
+	// logBtreeVacuum emits a logical btree-vacuum WAL record.
 	logBtreeVacuum LogBtreeVacuumFunc
-	// M0079-0003 logical records for the remaining FPI fallback
-	// paths in btree page deletion + root replacement.
+	// M0079-0003 logical records.
 	logBtreeUnlinkPage       LogBtreeUnlinkPageFunc
 	logBtreeNewRoot          LogBtreeNewRootFunc
 	logBtreeMarkPageHalfDead LogBtreeMarkPageHalfDeadFunc
 	// M0080-0001 logical record for VACUUM FREEZE.
 	logHeapFreeze LogHeapFreezeFunc
-	// logHeapHotUpdate emits an atomic HOT-update WAL record
-	// (M0046-0001): old-slot xmax stamp + new tuple insert on the
-	// same page in one record. nil disables the optimisation and
-	// the executor falls back to separate delete+insert FPIs.
+	// logHeapHotUpdate emits an atomic HOT-update WAL record.
 	logHeapHotUpdate LogHeapHotUpdateFunc
-	// logHeapPruneOpt emits an opportunistic page-pruning WAL record
-	// (M0046-0002). nil disables the optimisation (FPI fallback).
+	// logHeapPruneOpt emits an opportunistic page-pruning WAL record.
 	logHeapPruneOpt LogHeapPruneOptFunc
-	// logSmgrCreate emits a relation-file creation WAL record
-	// (RecordKindSmgrCreate) when Pool.PinNew creates block 0 of
-	// a new relation. Set via PoolConfig.LogSmgrCreate.
+	// logSmgrCreate emits a relation-file creation WAL record.
 	logSmgrCreate func(rel RelFileNode) error
-	// logChangeRecord emits a pre-encoded change record (e.g.
-	// RecordKindCreateIndex) on behalf of the executor without
-	// requiring an executor → wal direct dependency. Set via
-	// PoolConfig.LogChangeRecord. Exposed via
-	// Pool.LogChangeRecord. (M0079-0001.)
+	// logChangeRecord emits a pre-encoded change record.
 	logChangeRecord func(payload []byte) (LSN, error)
-	// fullPageWrites gates FPI emission. The wire/admin layer can
-	// flip it at runtime to mirror upstream's full_page_writes
-	// SIGHUP-context GUC.
+	// fullPageWrites gates FPI emission.
 	fullPageWrites atomic.Bool
-	// logger is used to surface non-fatal FPI emission failures
-	// without changing MarkDirty's signature.
+	// logger surfaces non-fatal FPI failures.
 	logger *slog.Logger
 
-	// prefetchEnabled gates Pool.Prefetch. When false (the
-	// default), Prefetch is a fast no-op so the synchronous
-	// fallback path doesn't pay for an inline pread we'd have
-	// to repeat on the subsequent Pin. The lifecycle owner
-	// (initdb.Open) flips it on after attaching an AIO engine
-	// to the storage Manager, since only then does Prefetch
-	// run async.
+	// prefetchEnabled gates Pool.Prefetch.
 	prefetchEnabled atomic.Bool
 
-	// asyncFlushBatchSize controls FlushAllPaced's batching.
-	// 0 / 1 reduces to the legacy per-slot serial loop. >1
-	// batches the WAL flush + the AIO write submissions
-	// across that many dirty slots so the engine's worker
-	// pool pipelines the writes. The lifecycle owner sets
-	// this after attaching an AIO engine; values are clamped
-	// in flushBatchSize.
+	// asyncFlushBatchSize controls FlushAllPaced batching.
 	asyncFlushBatchSize atomic.Int32
 
-	// M0098-0003: 128 partition mutexes replace the single poolMu + byTag.
-	// Each partition guards byTag and ioByTag for the 1/128 of the tag space
-	// that hashes to it (via tagPartition). Concurrent goroutines pinning
-	// different pages contend on different partitions.
-	partitions [128]bufferPartition
+	// bm is the lock-free buffer-tag → slot-index hash table.
+	// Fast path (cache hit): lock-free Lookup + CAS on slot state.
+	// Slow path (cache miss / IO-inflight wait): must hold pinMu.
+	bm *bufmap
 
-	// evictMu guards clock-sweep state (clockHand, bgwriterHand,
-	// dirtyVictimCount, totalVictimCount) and per-slot metadata that
-	// evictLocked or flush paths write exclusively (valid, dirty, tag,
-	// fpiSinceCheckpoint). It does NOT guard page bytes (Slot.contentMu).
-	//
-	// M0099-0002: promoted to RWMutex. The Pin fast path (cache hit) takes
-	// RLock so N concurrent Pins can proceed in parallel — eviction and flush
-	// take Lock (exclusive) as before. pinCount and usageCount are now
-	// atomic.Int32 so they can be updated under RLock without a second
-	// exclusive acquisition.
-	//
-	// Lock ordering: always acquire evictMu (Lock or RLock) before any
-	// partition lock.
-	evictMu   sync.RWMutex
-	clockHand int
+	// pinMu serialises the slow path: cache-miss eviction + insert.
+	// The fast path (pin of a valid cached slot) never acquires this.
+	// pinMu also serialises waits on IO-in-progress so only the right
+	// goroutines get woken and re-check the correct slot.
+	pinMu sync.Mutex
 
-	// OnPinWait is an optional hook called when Pool.Pin performs an
-	// actual disk read (the one goroutine that wins the I/O race).
-	// initdb.Open sets this via activity.LookupGoroutine to record
-	// BufferPin wait events in pg_stat_activity.
+	// clockHand is the atomic clock-sweep hand for victim selection.
+	clockHand atomic.Int64
+
+	// bgwriterHand is the bgwriter's independent scan cursor.
+	// Protected by bgwriterMu.
+	bgwriterMu   sync.Mutex
+	bgwriterHand int
+
+	// compactMu serialises the rare tombstone-compaction rebuild.
+	compactMu sync.Mutex
+
+	// tombstones counts tombstone entries in bm; used to trigger compaction.
+	tombstones atomic.Int64
+
+	// slotSema is a parallel []uint32 array (len == len(slots)) used as
+	// per-slot runtime semaphores for IO-in-progress waits.
+	// A goroutine waiting for slot i's IO calls runtimeshim.SemaAcquire(&slotSema[i]).
+	// The loader releases slotWaiters[i] times when IO completes.
+	slotSema []uint32
+
+	// slotWaiters tracks the number of goroutines currently waiting on
+	// each slot's IO via SemaAcquire. Written under pinMu so the loader
+	// can read an exact count before releasing the sema.
+	slotWaiters []atomic.Int32
+
+	// OnPinWait is called when Pool.Pin issues a disk read.
 	OnPinWait func()
 
-	// OnPinDone pairs with OnPinWait — called immediately after the
-	// disk-read finishes so observability code can balance every
-	// WaitEventStart with a WaitEventEnd. (M0058-0006.)
+	// OnPinDone is called after the disk read finishes.
 	OnPinDone func()
 
-	// OnBufferIOWait is an optional hook called when a goroutine must
-	// wait for an in-flight read issued by another goroutine to complete
-	// (BM_IO_IN_PROGRESS, M0048-0001). Fires once per waiting goroutine
-	// before it blocks on ioCond. initdb.Open can set this to record
-	// BufferIO wait events in pg_stat_activity.
+	// OnBufferIOWait is called when a goroutine waits for an in-flight read.
 	OnBufferIOWait func()
 
-	// OnFlushAll is an optional hook called at the start of FlushAll
-	// and FlushAllPaced before any I/O.  initdb.Open wires an
-	// assertion that these callers are checkpointer or walwriter
-	// goroutines — never client-backend goroutines (M0042-0004).
-	// nil disables the check (tests that don't set up activity
-	// goroutine registration).
+	// OnFlushAll is called at the start of FlushAll/FlushAllPaced.
 	OnFlushAll func()
 
-	// Dirty-victim instrumentation (M0048-0003): counts how many times
-	// the foreground victim-search (evictLocked) encounters a dirty page
-	// that must be flushed synchronously, vs. total victims processed.
-	// Used to measure bgwriter effectiveness (DoD: dirty rate ≤ 5%).
-	// Protected by evictMu.
-	dirtyVictimCount int64
-	totalVictimCount int64
-
-	// bgwriterHand is the clock-hand position for the bgwriter's
-	// independent pass through the slot array (M0048-0003). Separate from
-	// clockHand so the bgwriter doesn't interfere with the eviction sweep.
-	// Guarded by evictMu.
-	bgwriterHand int
+	// Dirty-victim instrumentation (M0048-0003).
+	// Per-P sharded counters (no cache-line bouncing under concurrent
+	// foreground eviction); cold-path Sum reads only feed the bgwriter
+	// DoD ratio and ResetVictimStats.
+	dirtyVictimCount stats.Counter
+	totalVictimCount stats.Counter
 }
 
 // PoolConfig controls Pool sizing.
@@ -246,123 +206,29 @@ type PoolConfig struct {
 
 	// LogPageImage, when non-nil, is invoked by MarkDirty on the
 	// first mutation of each page after every checkpoint to emit
-	// a full-page-image WAL record. The returned LSN is stamped
-	// into the page header so the existing flush-before-write
-	// ordering covers it. Failures are logged but not propagated
-	// to the mutation site (matches upstream's PANIC stance only
-	// in spirit; v0 logs and continues — see milestone 0002).
+	// a full-page-image WAL record.
 	LogPageImage func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error)
 
-	// FullPageWrites mirrors upstream's full_page_writes GUC. When
-	// false, no FPI is emitted regardless of LogPageImage.
+	// FullPageWrites mirrors upstream's full_page_writes GUC.
 	FullPageWrites bool
 
-	// LogBtreeSplit, when non-nil, is exposed via Pool.LogBtreeSplit
-	// so the B-tree access method can emit an atomic split record
-	// (Landing 3a of milestone 0002 — see
-	// docs/design/0002-0002-btree-concurrency.md). nil disables the
-	// hook and the btree falls back to per-page FPI on splits.
-	LogBtreeSplit LogBtreeSplitFunc
-
-	// LogHeapInsert, when non-nil, is exposed via
-	// Pool.LogHeapInsert so the executor's heap-insert path can
-	// emit a logical change record instead of a full FPI on
-	// every dirty (see docs/design/0002-0003-redo-records.md).
-	LogHeapInsert LogHeapInsertFunc
-
-	// LogBtreeInsert, when non-nil, is exposed via
-	// Pool.LogBtreeInsert so the B-tree access method's
-	// non-split insert path can emit a logical change record.
-	LogBtreeInsert LogBtreeInsertFunc
-
-	// LogHeapDelete, when non-nil, is exposed via
-	// Pool.LogHeapDelete so the executor's UPDATE / DELETE
-	// xmax-stamp paths can emit a logical change record.
-	LogHeapDelete LogHeapDeleteFunc
-
-	// LogHeapLock, when non-nil, is exposed via
-	// Pool.LogHeapLock so the SELECT FOR UPDATE / FOR SHARE
-	// executor can emit a row-lock change record (M0021
-	// tuple-level locking step 2 — producer wiring).
-	LogHeapLock LogHeapLockFunc
-
-	// LogHeapVacuum, when non-nil, is exposed via
-	// Pool.LogHeapVacuum so the VACUUM path can emit a
-	// dead-slot-list change record instead of a full FPI on
-	// each pruned page.
-	LogHeapVacuum LogHeapVacuumFunc
-
-	// LogBtreeVacuum, when non-nil, is exposed via
-	// Pool.LogBtreeVacuum so the btree VACUUM path can emit a
-	// kept-items + opaque-flags change record instead of a full
-	// FPI on each pruned leaf. The kept-items list carries each
-	// surviving item's raw bytes (the same blob
-	// `pageAddItemRaw` writes); replay rebuilds the page's
-	// kept-items projection. (M0079-0002.)
-	LogBtreeVacuum LogBtreeVacuumFunc
-
-	// LogBtreeUnlinkPage, when non-nil, is exposed via
-	// Pool.LogBtreeUnlinkPage so the btree page-deletion path
-	// can emit a single atomic record covering the four
-	// page mutations (prev sibling Next, right sibling Prev,
-	// leaf flags after, parent downlink removal) instead of
-	// 4 separate FPIs. (M0079-0003.)
-	LogBtreeUnlinkPage LogBtreeUnlinkPageFunc
-
-	// LogBtreeNewRoot, when non-nil, is exposed via
-	// Pool.LogBtreeNewRoot so the btree root-replacement path
-	// (post-split bubbling + post-full-vacuum empty reset)
-	// can emit a control-only record carrying the new root's
-	// items + level instead of FPIs. (M0079-0003.)
-	LogBtreeNewRoot LogBtreeNewRootFunc
-
-	// LogBtreeMarkPageHalfDead, when non-nil, is exposed via
-	// Pool.LogBtreeMarkPageHalfDead so the leaf-only flags
-	// transition (when a leaf's already empty before vacuum)
-	// can emit a 16-byte record instead of an FPI. Most
-	// half-dead transitions are bundled into BtreeVacuum's
-	// OpaqueFlags trailer; this hook covers the residual
-	// "already-empty" path. (M0079-0003.)
+	LogBtreeSplit            LogBtreeSplitFunc
+	LogHeapInsert            LogHeapInsertFunc
+	LogBtreeInsert           LogBtreeInsertFunc
+	LogHeapDelete            LogHeapDeleteFunc
+	LogHeapLock              LogHeapLockFunc
+	LogHeapVacuum            LogHeapVacuumFunc
+	LogBtreeVacuum           LogBtreeVacuumFunc
+	LogBtreeUnlinkPage       LogBtreeUnlinkPageFunc
+	LogBtreeNewRoot          LogBtreeNewRootFunc
 	LogBtreeMarkPageHalfDead LogBtreeMarkPageHalfDeadFunc
+	LogHeapFreeze            LogHeapFreezeFunc
+	LogHeapHotUpdate         LogHeapHotUpdateFunc
+	LogHeapPruneOpt          LogHeapPruneOptFunc
+	LogSmgrCreate            func(rel RelFileNode) error
+	LogChangeRecord          func(payload []byte) (LSN, error)
 
-	// LogHeapFreeze, when non-nil, is exposed via
-	// Pool.LogHeapFreeze so the VACUUM FREEZE path can emit
-	// a logical record carrying the frozen-tuple slot list
-	// instead of an FPI for each frozen page. The hook lives
-	// in storage so internal/vacuum can consume it without
-	// importing internal/wal. (M0080-0001.)
-	LogHeapFreeze LogHeapFreezeFunc
-
-	// LogHeapHotUpdate, when non-nil, is exposed via
-	// Pool.LogHeapHotUpdate so the executor's HOT-update path can
-	// emit a single atomic change record (old-stamp + new-insert on
-	// the same page) instead of separate delete+insert FPIs.
-	LogHeapHotUpdate LogHeapHotUpdateFunc
-
-	// LogHeapPruneOpt, when non-nil, is exposed via
-	// Pool.LogHeapPruneOpt so the opportunistic pruning path can
-	// emit a logical prune record instead of a full FPI.
-	LogHeapPruneOpt LogHeapPruneOptFunc
-
-	// LogSmgrCreate, when non-nil, is called by PinNew when it
-	// creates block 0 of a relation (the first Extend). The hook
-	// should emit a RecordKindSmgrCreate WAL record so crash
-	// recovery can recreate the relfile before replaying data pages.
-	// Failures are logged but not propagated, matching the FPI hook
-	// behaviour. See docs/design/0030-0002-ddl-wal-records.md.
-	LogSmgrCreate func(rel RelFileNode) error
-
-	// LogChangeRecord, when non-nil, is exposed via
-	// Pool.LogChangeRecord so DDL-emitting executors can append a
-	// pre-encoded WAL record (e.g. RecordKindCreateIndex) without
-	// importing the wal package. The function returns the record's
-	// end LSN; failures are propagated so the executor can roll back
-	// the in-memory catalog mutation that produced the record.
-	// (M0079-0001 / pgbench recovery fix.)
-	LogChangeRecord func(payload []byte) (LSN, error)
-
-	// Logger receives FPI emission failures. nil means
-	// slog.Default().
+	// Logger receives FPI emission failures. nil means slog.Default().
 	Logger *slog.Logger
 }
 
@@ -372,61 +238,28 @@ type WALFlusher interface {
 	FlushUpTo(lsn uint64) error
 }
 
-// LogBtreeSplitFunc emits one atomic WAL record covering a B-tree
-// page split (left's post-image + right's full image) and returns
-// the record's end LSN. The signature lives in storage so packages
-// like internal/access/btree can consume it without an import
-// cycle through internal/wal.
+// LogBtreeSplitFunc emits one atomic WAL record covering a B-tree page split.
 type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, leftPage, rightPage Page) (LSN, error)
 
-// LogHeapInsertFunc emits one logical heap-insert redo record and
-// returns its end LSN. Used by the executor's writeHeapRow path
-// (and exposed via Pool.LogHeapInsert) to bypass full-page-image
-// emission on subsequent dirties of the same page in an epoch.
-// See docs/design/0002-0003-redo-records.md.
+// LogHeapInsertFunc emits one logical heap-insert redo record.
 type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, tuple []byte) (LSN, error)
 
-// LogBtreeInsertFunc emits one logical B-tree non-split insert
-// redo record. The `item` payload is the raw bytes the caller
-// stored on the page — for v0's btree, internal/access/btree's
-// item.marshal output. See docs/design/0002-0003-redo-records.md.
+// LogBtreeInsertFunc emits one logical B-tree non-split insert redo record.
 type LogBtreeInsertFunc func(rel RelFileNode, blk BlockNumber, item []byte) (LSN, error)
 
-// LogHeapDeleteFunc emits one logical heap-delete (xmax stamp)
-// redo record. oldTuple carries the pre-delete heap tuple bytes
-// (optional; nil is accepted and omits the old-tuple extension
-// from the WAL record). See docs/design/0002-0003-redo-records.md.
+// LogHeapDeleteFunc emits one logical heap-delete (xmax stamp) redo record.
 type LogHeapDeleteFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID, oldTuple []byte) (LSN, error)
 
-// LogHeapLockFunc emits one row-lock WAL record (M0021 tuple-
-// level locking step 3) and returns the record's end LSN. Used
-// by the SELECT FOR UPDATE / FOR SHARE executor to capture
-// the lock-only xmax + lock-strength infomask change in WAL
-// so crash recovery can re-stamp the affected tuple. Mirrors
-// upstream's xl_heap_lock emission point inside heap_lock_tuple.
+// LogHeapLockFunc emits one row-lock WAL record.
 type LogHeapLockFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, xmax TransactionID, lockStrength uint16) (LSN, error)
 
-// LogHeapVacuumFunc emits one logical heap-vacuum (page prune)
-// redo record carrying the 1-based LP_NORMAL slot numbers being
-// reclaimed. Replay calls VacuumHeapPageBySlots with the same
-// list, so the prune is bit-exact whether it's the original
-// write or recovery. See docs/design/0002-0003-redo-records.md.
+// LogHeapVacuumFunc emits one logical heap-vacuum (page prune) redo record.
 type LogHeapVacuumFunc func(rel RelFileNode, blk BlockNumber, deadSlots []uint16) (LSN, error)
 
-// LogBtreeVacuumFunc emits one logical btree-vacuum redo
-// record carrying the kept-items projection and post-vacuum
-// opaque flags for a pruned leaf page. Mirrors the producer-
-// side of `btree.ReplayVacuumPage`. The signature lives in
-// storage so the btree access method can consume it without
-// importing internal/wal. (M0079-0002.)
+// LogBtreeVacuumFunc emits one logical btree-vacuum redo record.
 type LogBtreeVacuumFunc func(rel RelFileNode, blk BlockNumber, keptItems [][]byte, opaqueFlags uint16) (LSN, error)
 
-// BtreeUnlinkPageRequest collects the 4-page mutation control
-// info that `RecordKindBtreeUnlinkPage` carries. Mirrors the
-// producer arguments `unlinkEmptyLeaf` would pass after
-// M0079-0003 wiring. The signature lives in storage so the
-// btree access method can consume it without importing
-// internal/wal.
+// BtreeUnlinkPageRequest collects the 4-page mutation control info.
 type BtreeUnlinkPageRequest struct {
 	LeafBlk          BlockNumber
 	LeafFlagsAfter   uint16
@@ -441,44 +274,26 @@ type BtreeUnlinkPageRequest struct {
 	ParentRemoveSlot uint16
 }
 
-// LogBtreeUnlinkPageFunc emits the M0079-0003 atomic
-// page-deletion redo record. Returns the record's end LSN so
-// callers can SetPageLSN on each of the 4 dirtied pages.
+// LogBtreeUnlinkPageFunc emits the M0079-0003 atomic page-deletion redo record.
 type LogBtreeUnlinkPageFunc func(rel RelFileNode, req BtreeUnlinkPageRequest) (LSN, error)
 
-// LogBtreeNewRootFunc emits the M0079-0003 root-replacement
-// record. `items` carries each new-root entry's raw bytes
-// (the same blob pageAddItemRaw writes); empty slice indicates
-// a reset-to-empty-root.
+// LogBtreeNewRootFunc emits the M0079-0003 root-replacement record.
 type LogBtreeNewRootFunc func(rel RelFileNode, rootBlk BlockNumber, level uint32, items [][]byte) (LSN, error)
 
-// LogBtreeMarkPageHalfDeadFunc emits the M0079-0003 leaf-only
-// half-dead transition record.
+// LogBtreeMarkPageHalfDeadFunc emits the M0079-0003 leaf-only half-dead transition record.
 type LogBtreeMarkPageHalfDeadFunc func(rel RelFileNode, leafBlk BlockNumber, flagsAfter uint16) (LSN, error)
 
-// LogHeapFreezeFunc emits the M0080-0001 heap-freeze redo record
-// carrying the 1-based ascending list of LP_NORMAL slot numbers
-// whose tuple xmin was rewritten to FrozenTransactionID.
+// LogHeapFreezeFunc emits the M0080-0001 heap-freeze redo record.
 type LogHeapFreezeFunc func(rel RelFileNode, blk BlockNumber, frozenSlots []uint16) (LSN, error)
 
-// LogHeapHotUpdateFunc emits one atomic HOT-update redo record
-// (M0046-0001). The record encodes the old-slot xmax stamp +
-// HeapHotUpdated infomask + CTID chain + the new tuple bytes (which
-// carry HeapOnlyTuple in their infomask) — all on the same heap page.
-// Replay inserts the new tuple, derives newSlot, then stamps the old
-// slot. See docs/design/0046-0001-hot-updates.md.
+// LogHeapHotUpdateFunc emits one atomic HOT-update redo record.
 type LogHeapHotUpdateFunc func(rel RelFileNode, blk BlockNumber, oldSlot uint16, xmax TransactionID, tupleBytes []byte) (LSN, error)
 
-// LogHeapPruneOptFunc emits one opportunistic page-pruning redo record
-// (M0046-0002, RecordKindHeapPruneOpt). Carries redirect pairs (for HOT
-// chain roots converted to ItemIDRedirect) and unused slot numbers (for
-// HOT-only and standalone dead tuples). Replay applies both operations to
-// bring the page back to the pruned state.
+// LogHeapPruneOptFunc emits one opportunistic page-pruning redo record.
 type LogHeapPruneOptFunc func(rel RelFileNode, blk BlockNumber, redirects [][2]uint16, unused []uint16) (LSN, error)
 
 // NewPool allocates a Pool of cfg.Slots fixed buffers backed by a
-// Go-heap arena. Returns an error if slots <= 0 or the arena alloc
-// fails.
+// Go-heap arena.
 func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 	if cfg.Slots <= 0 {
 		return nil, fmt.Errorf("pool: Slots must be > 0, got %d", cfg.Slots)
@@ -494,7 +309,7 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 	p := &Pool{
 		mgr:                      mgr,
 		arena:                    a,
-		slots:                    make([]*Slot, cfg.Slots),
+		slots:                    make([]Slot, cfg.Slots),
 		wal:                      cfg.WAL,
 		logFPI:                   cfg.LogPageImage,
 		logBtreeSplit:            cfg.LogBtreeSplit,
@@ -513,42 +328,30 @@ func NewPool(mgr *Manager, cfg PoolConfig) (*Pool, error) {
 		logSmgrCreate:            cfg.LogSmgrCreate,
 		logChangeRecord:          cfg.LogChangeRecord,
 		logger:                   logger,
+		bm:                       newBufmap(cfg.Slots),
+		slotSema:                 make([]uint32, cfg.Slots),
+		slotWaiters:              make([]atomic.Int32, cfg.Slots),
 	}
 	p.fullPageWrites.Store(cfg.FullPageWrites)
-	// M0098-0003: initialize 128 partitions.
-	for i := range p.partitions {
-		p.partitions[i].byTag = make(map[BufferTag]int, cfg.Slots/128+1)
-		p.partitions[i].ioByTag = make(map[BufferTag]struct{})
-		p.partitions[i].ioCond = sync.NewCond(&p.partitions[i].mu)
-	}
+	// Initialise per-slot page pointers.
 	for i := range p.slots {
-		p.slots[i] = &Slot{page: a.slot(i)}
+		p.slots[i].page = a.slot(i)
 	}
 	return p, nil
 }
 
-// LogBtreeSplit returns the configured atomic split-record hook,
-// or nil if none was wired. Callers (the B-tree access method)
-// are expected to fall back to per-page FPI when nil.
+// LogBtreeSplit returns the configured atomic split-record hook.
 func (p *Pool) LogBtreeSplit() LogBtreeSplitFunc { return p.logBtreeSplit }
 
-// LogPageImage returns the configured full-page-image hook,
-// or nil if none was wired.
+// LogPageImage returns the configured full-page-image hook.
 func (p *Pool) LogPageImage() func(rel RelFileNode, blk BlockNumber, page Page) (LSN, error) {
 	return p.logFPI
 }
 
-// LogHeapInsert returns the configured heap-insert change-record
-// hook, or nil if none was wired. Callers fall back to per-page
-// FPI via MarkDirty when nil.
+// LogHeapInsert returns the configured heap-insert change-record hook.
 func (p *Pool) LogHeapInsert() LogHeapInsertFunc { return p.logHeapInsert }
 
-// LogChangeRecord appends a pre-encoded WAL change record. Used
-// by DDL paths in the executor (CREATE / DROP INDEX) to emit
-// catalog-only records without an executor → wal hard
-// dependency. Returns 0 / nil when no hook is wired (the
-// executor's caller-side check decides whether to roll back the
-// in-memory mutation). (M0079-0001.)
+// LogChangeRecord appends a pre-encoded WAL change record.
 func (p *Pool) LogChangeRecord(payload []byte) (LSN, error) {
 	if p == nil || p.logChangeRecord == nil {
 		return 0, nil
@@ -556,84 +359,56 @@ func (p *Pool) LogChangeRecord(payload []byte) (LSN, error) {
 	return p.logChangeRecord(payload)
 }
 
-// LogBtreeInsert returns the configured btree non-split insert
-// change-record hook, or nil if none was wired. Callers fall
-// back to per-page FPI via MarkDirty when nil.
+// LogBtreeInsert returns the configured btree non-split insert change-record hook.
 func (p *Pool) LogBtreeInsert() LogBtreeInsertFunc { return p.logBtreeInsert }
 
-// LogHeapDelete returns the configured heap-delete change-record
-// hook, or nil if none was wired. Callers fall back to per-page
-// FPI via MarkDirty when nil.
+// LogHeapDelete returns the configured heap-delete change-record hook.
 func (p *Pool) LogHeapDelete() LogHeapDeleteFunc { return p.logHeapDelete }
 
-// LogHeapLock returns the configured row-lock change-record
-// emitter (M0021 tuple-level locking step 2). nil disables the
-// optimisation; the executor falls back to MarkDirty + FPI
-// emission for crash safety.
+// LogHeapLock returns the configured row-lock change-record emitter.
 func (p *Pool) LogHeapLock() LogHeapLockFunc { return p.logHeapLock }
 
-// LogHeapVacuum returns the configured heap-vacuum change-record
-// hook, or nil if none was wired. Callers fall back to per-page
-// FPI via MarkDirty when nil.
+// LogHeapVacuum returns the configured heap-vacuum change-record hook.
 func (p *Pool) LogHeapVacuum() LogHeapVacuumFunc { return p.logHeapVacuum }
 
-// LogBtreeVacuum returns the configured btree-vacuum
-// kept-items change-record emitter (M0079-0002). Callers
-// (btree.VacuumIndexPages) fall back to FPI via
-// MarkDirtyChangeRecord when nil.
+// LogBtreeVacuum returns the configured btree-vacuum kept-items change-record emitter.
 func (p *Pool) LogBtreeVacuum() LogBtreeVacuumFunc { return p.logBtreeVacuum }
 
-// LogBtreeUnlinkPage returns the configured atomic
-// page-deletion change-record emitter (M0079-0003). Callers
-// fall back to per-page FPIs via markDirtyWithPageRecord when nil.
+// LogBtreeUnlinkPage returns the configured atomic page-deletion change-record emitter.
 func (p *Pool) LogBtreeUnlinkPage() LogBtreeUnlinkPageFunc { return p.logBtreeUnlinkPage }
 
-// LogBtreeNewRoot returns the configured root-replacement
-// change-record emitter (M0079-0003).
+// LogBtreeNewRoot returns the configured root-replacement change-record emitter.
 func (p *Pool) LogBtreeNewRoot() LogBtreeNewRootFunc { return p.logBtreeNewRoot }
 
-// LogBtreeMarkPageHalfDead returns the configured leaf-only
-// half-dead transition change-record emitter (M0079-0003).
+// LogBtreeMarkPageHalfDead returns the configured leaf-only half-dead transition emitter.
 func (p *Pool) LogBtreeMarkPageHalfDead() LogBtreeMarkPageHalfDeadFunc {
 	return p.logBtreeMarkPageHalfDead
 }
 
-// LogHeapFreeze returns the configured heap-freeze
-// change-record emitter (M0080-0001). Callers fall back to
-// MarkDirty (FPI) when nil.
+// LogHeapFreeze returns the configured heap-freeze change-record emitter.
 func (p *Pool) LogHeapFreeze() LogHeapFreezeFunc { return p.logHeapFreeze }
 
-// LogHeapHotUpdate returns the configured HOT-update change-record
-// hook (M0046-0001), or nil if none was wired. Callers fall back to
-// per-page FPI via MarkDirty when nil.
+// LogHeapHotUpdate returns the configured HOT-update change-record hook.
 func (p *Pool) LogHeapHotUpdate() LogHeapHotUpdateFunc { return p.logHeapHotUpdate }
 
-// LogHeapPruneOpt returns the configured opportunistic-pruning
-// change-record hook (M0046-0002), or nil if none was wired.
+// LogHeapPruneOpt returns the configured opportunistic-pruning change-record hook.
 func (p *Pool) LogHeapPruneOpt() LogHeapPruneOptFunc { return p.logHeapPruneOpt }
 
 // SetFullPageWrites toggles full-page-image emission at runtime.
-// Mirrors upstream's full_page_writes SIGHUP-context GUC.
 func (p *Pool) SetFullPageWrites(on bool) { p.fullPageWrites.Store(on) }
 
 // FullPageWrites reports the current setting.
 func (p *Pool) FullPageWrites() bool { return p.fullPageWrites.Load() }
 
 // ResetCheckpointEpoch clears the per-slot "FPI emitted" flag.
-// The checkpointer calls this after a successful checkpoint so
-// the next mutation of each page emits a fresh full-page image.
+// The checkpointer calls this after a successful checkpoint.
 func (p *Pool) ResetCheckpointEpoch() {
-	p.evictMu.Lock()
-	defer p.evictMu.Unlock()
-	for _, s := range p.slots {
-		s.fpiSinceCheckpoint = false
+	for i := range p.slots {
+		p.slots[i].fpiSinceCheckpoint.Store(false)
 	}
 }
 
-// Close flushes every dirty slot through smgr and releases the
-// page-aligned arena. Dirty pages must reach disk before the
-// process exits or callers see data loss across restarts; the
-// storage manager itself is closed separately by the caller.
+// Close flushes every dirty slot through smgr and releases the arena.
 func (p *Pool) Close() error {
 	flushErr := p.FlushAll()
 	closeErr := p.arena.close()
@@ -643,21 +418,15 @@ func (p *Pool) Close() error {
 	return closeErr
 }
 
-// NBlocks reports the number of blocks currently in rel. Pass-through
-// to the underlying smgr; callers (e.g. vacuum) need this to drive a
-// full-relation walk.
+// NBlocks reports the number of blocks currently in rel.
 func (p *Pool) NBlocks(rel RelFileNode) (BlockNumber, error) {
 	return p.mgr.NBlocks(rel)
 }
 
-// Manager exposes the underlying storage manager so DDL operators can
-// drop or truncate relation files. Pinning still flows through Pool.
+// Manager exposes the underlying storage manager.
 func (p *Pool) Manager() *Manager { return p.mgr }
 
-// SyncAllDataFiles fdatasyncs every open data file. Implements the
-// `dataFileSyncer` interface that internal/wal/checkpointer.go uses
-// after the dirty-page flush, so checkpoint completion is durable
-// against host crash. M0089-0001.
+// SyncAllDataFiles fdatasyncs every open data file.
 func (p *Pool) SyncAllDataFiles() error {
 	if p.mgr == nil {
 		return nil
@@ -665,20 +434,10 @@ func (p *Pool) SyncAllDataFiles() error {
 	return p.mgr.SyncAll()
 }
 
-// SetPrefetchEnabled toggles Pool.Prefetch's behaviour. When
-// false, Prefetch is a no-op. Idempotent. The wiring layer
-// (initdb.Open) sets this true once an AIO engine is attached
-// to the storage Manager — only then does Prefetch run on a
-// background goroutine rather than blocking the caller with
-// an inline pread.
+// SetPrefetchEnabled toggles Pool.Prefetch's behaviour.
 func (p *Pool) SetPrefetchEnabled(on bool) { p.prefetchEnabled.Store(on) }
 
-// SetAsyncFlushBatchSize controls how many dirty slots
-// FlushAllPaced batches per WAL-flush + AIO-submit + Wait
-// cycle. 0 or 1 means the legacy per-slot serial loop. Larger
-// values pipeline writes through the AIO worker pool — the
-// caller (initdb.Open) sets this after attaching an AIO
-// engine. Values >MaxFlushBatchSize are clamped.
+// SetAsyncFlushBatchSize controls how many dirty slots FlushAllPaced batches.
 func (p *Pool) SetAsyncFlushBatchSize(n int) {
 	if n > MaxFlushBatchSize {
 		n = MaxFlushBatchSize
@@ -689,17 +448,10 @@ func (p *Pool) SetAsyncFlushBatchSize(n int) {
 	p.asyncFlushBatchSize.Store(int32(n))
 }
 
-// MaxFlushBatchSize caps the per-batch dirty-slot count so a
-// pathologically large config can't allocate unbounded handle
-// arrays or hold too many contentMu read locks at once.
-// Independent of the engine's global MaxConcurrency cap (which
-// still applies on top via Engine.Submit's queue-fullness
-// backpressure).
+// MaxFlushBatchSize caps the per-batch dirty-slot count.
 const MaxFlushBatchSize = 256
 
-// flushBatchSize returns the effective batch size for
-// FlushAllPaced. Treats 0 as 1 (serial), so callers that
-// haven't opted in see the legacy behaviour.
+// flushBatchSize returns the effective batch size for FlushAllPaced.
 func (p *Pool) flushBatchSize() int {
 	n := int(p.asyncFlushBatchSize.Load())
 	if n < 1 {
@@ -708,469 +460,539 @@ func (p *Pool) flushBatchSize() int {
 	return n
 }
 
-// Prefetch is a hint that the caller is about to Pin tag. When
-// prefetching is enabled and tag isn't already cached, the page
-// is read on the AIO engine's background workers so the
-// kernel page cache is warm by the time Pin's synchronous read
-// runs. Buffer-pool slot allocation still happens at Pin time;
-// Prefetch only warms the kernel side.
-//
-// Drops the AIO handle on the floor — the engine's worker
-// goroutine completes the read in the background; the throwaway
-// buffer warms the page cache and is then GC'd.
-//
-// Errors are intentionally swallowed: a failed prefetch must
-// not impact correctness. The subsequent Pin will surface any
-// real I/O error.
+// Prefetch is a hint that the caller is about to Pin tag.
 func (p *Pool) Prefetch(tag BufferTag) {
 	if !p.prefetchEnabled.Load() {
 		return
 	}
-	part := &p.partitions[tagPartition(tag)]
-	part.mu.Lock()
-	_, cached := part.byTag[tag]
-	part.mu.Unlock()
-	if cached {
+	// Fast check: already cached?
+	if slotIdx, _ := p.bm.Lookup(tag); slotIdx >= 0 {
 		return
 	}
 	buf := make([]byte, BlockSize)
 	_, _ = p.mgr.PrefetchBlock(tag.Rel, tag.Block, buf)
 }
 
-// InvalidateRel evicts every slot currently bound to a buffer of rel.
-// DROP TABLE / TRUNCATE TABLE call this after committing the
-// catalog-level change so a subsequent Pin returns a fresh page
-// rather than a stale cached one. Pinned slots are skipped — v0
-// requires DDL to run without concurrent pinning of the dropped
-// relation, matching upstream's AccessExclusiveLock requirement.
+// InvalidateRel evicts every slot currently bound to rel.
 func (p *Pool) InvalidateRel(rel RelFileNode) {
-	// M0098-0003: lock each partition independently to allow concurrent
-	// InvalidateRel calls on different relations to proceed in parallel.
-	// We must acquire evictMu first to safely modify slot metadata
-	// (valid, dirty, pinCount) per the lock ordering invariant.
-	p.evictMu.Lock()
-	defer p.evictMu.Unlock()
-	for i := range p.partitions {
-		part := &p.partitions[i]
-		part.mu.Lock()
-		for tag, idx := range part.byTag {
-			if tag.Rel != rel {
-				continue
-			}
-			s := p.slots[idx]
-			if s.pinCount.Load() > 0 {
-				continue
-			}
-			s.valid = false
-			s.dirty = false
-			delete(part.byTag, tag)
+	for i := range p.slots {
+		s := &p.slots[i]
+		st := s.state.Load()
+		if !stateValid(st) {
+			continue
 		}
-		part.mu.Unlock()
+		if s.tag.Rel != rel {
+			continue
+		}
+		if statePin(st) > 0 {
+			continue
+		}
+		// Try to atomically clear valid+dirty bits.
+		// We only clear if the slot is still valid+unpinned.
+		newSt := st &^ (slotValidBit | slotDirtyBit)
+		if s.state.CompareAndSwap(st, newSt) {
+			p.bm.Delete(s.tag, int32(i))
+			p.tombstones.Add(1)
+		}
 	}
 }
 
+// InvalidateBlock evicts the slot bound to tag if it exists and is unpinned.
 func (p *Pool) InvalidateBlock(tag BufferTag) {
-	p.evictMu.Lock()
-	defer p.evictMu.Unlock()
-	part := &p.partitions[tagPartition(tag)]
-	part.mu.Lock()
-	defer part.mu.Unlock()
-	idx, ok := part.byTag[tag]
-	if !ok {
+	slotIdx, _ := p.bm.Lookup(tag)
+	if slotIdx < 0 {
 		return
 	}
-	s := p.slots[idx]
-	if s.pinCount.Load() > 0 {
+	s := &p.slots[slotIdx]
+	st := s.state.Load()
+	if !stateValid(st) || statePin(st) > 0 {
 		return
 	}
-	s.valid = false
-	s.dirty = false
-	delete(part.byTag, tag)
+	newSt := st &^ (slotValidBit | slotDirtyBit)
+	if s.state.CompareAndSwap(st, newSt) {
+		p.bm.Delete(tag, slotIdx)
+		p.tombstones.Add(1)
+	}
 }
 
 // ErrNoBuffer is returned when every slot is pinned and the clock
 // sweep can't find a victim.
 var ErrNoBuffer = errors.New("no available buffer (all pinned)")
 
-// PinNew pins the next-after-end block of rel for writing without
-// reading from disk. Used by relation extension. Returns the block
-// number that the slot now represents.
-func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
-	// M0098-0003: acquire evictMu to find and reserve a victim slot.
-	p.evictMu.Lock()
-	slotIdx, err := p.evictLocked()
-	if err != nil {
-		p.evictMu.Unlock()
-		return nil, InvalidBlockNumber, err
+// tryPinSlot attempts to increment the pin count on slotIdx atomically,
+// verifying the slot is valid, not in IO, and has the expected generation.
+// Returns the slot on success, or nil on failure (caller should retry/fallback).
+func (p *Pool) tryPinSlot(slotIdx int32, gen uint32) *Slot {
+	s := &p.slots[slotIdx]
+	for {
+		old := s.state.Load()
+		if !stateValid(old) || stateIO(old) {
+			return nil
+		}
+		if stateGen(old) != gen {
+			return nil // ABA
+		}
+		pinCount := statePin(old)
+		if pinCount >= maxPinCount {
+			return nil
+		}
+		usage := stateUsage(old)
+		if usage < maxUsageCount {
+			usage++
+		}
+		newSt := (old &^ (slotPinMask | slotUsageMask)) | (pinCount + 1) | (usage << slotUsageShift)
+		if s.state.CompareAndSwap(old, newSt) {
+			return s
+		}
 	}
-	s := p.slots[slotIdx]
-	needFlush := s.valid && s.dirty
-	oldTag := s.tag
+}
 
-	// M0056-0001: reserve the slot BEFORE releasing evictMu so a
-	// concurrent Pin's evictLocked skips it.  M0099-0004: partition
-	// cleanup (oldPart.mu) happens after releasing evictMu to avoid
-	// holding evictMu while waiting for a contended partition lock.
-	s.valid = false
-	s.dirty = false
-	s.tag = BufferTag{}
-	s.pinCount.Store(1)
-	s.usageCount.Store(1)
-	p.evictMu.Unlock()
-
-	if !needFlush {
-		oldPart := &p.partitions[tagPartition(oldTag)]
-		oldPart.mu.Lock()
-		delete(oldPart.byTag, oldTag)
-		oldPart.mu.Unlock()
+// releaseVictimSlot returns a victim slot back to the free pool when we
+// decide not to use it (e.g., because we found the tag already published
+// by another goroutine). MUST be called with pinMu held.
+// Wakes any goroutines waiting on this slot's IO via per-slot semaphore.
+func (p *Pool) releaseVictimSlot(victimIdx int) {
+	n := p.slotWaiters[victimIdx].Load()
+	p.slots[victimIdx].state.Store(0)
+	for i := int32(0); i < n; i++ {
+		runtimeshim.SemaRelease(&p.slotSema[victimIdx])
 	}
+}
 
-	if needFlush {
+// claimVictim finds a victim slot using clock-sweep and atomically sets
+// ioInflight, clearing valid+dirty. Returns (idx, wasDirty, oldTag).
+// MUST be called with pinMu held.
+func (p *Pool) claimVictim() (victimIdx int, wasDirty bool, oldTag BufferTag, err error) {
+	n := len(p.slots)
+	if n == 0 {
+		return 0, false, BufferTag{}, ErrNoBuffer
+	}
+	maxProbes := n * (maxUsageCount + 2)
+	for probe := 0; probe < maxProbes; probe++ {
+		i := int(p.clockHand.Add(1)-1) % n
+		s := &p.slots[i]
+		old := s.state.Load()
+
+		if statePin(old) != 0 {
+			continue // pinned
+		}
+		if stateIO(old) {
+			continue // another goroutine is evicting this slot
+		}
+
+		usage := stateUsage(old)
+		if usage > 0 {
+			// Decrement usage (second-chance). Best-effort.
+			newSt := (old &^ slotUsageMask) | ((usage - 1) << slotUsageShift)
+			s.state.CompareAndSwap(old, newSt)
+			continue
+		}
+
+		wasValid := stateValid(old)
+		dirty := stateDirty(old)
+
+		// Track dirty-victim stats.
+		if wasValid {
+			p.totalVictimCount.Add(1)
+			if dirty {
+				p.dirtyVictimCount.Add(1)
+			}
+		}
+
+		// Claim: set ioInflight, bump gen to invalidate in-flight fast-path CAS.
+		curGen := stateGen(old)
+		newGen := (curGen + 1) & 0x7FFF
+		newSt := slotIOBit | (uint64(newGen) << slotGenShift)
+		if s.state.CompareAndSwap(old, newSt) {
+			tag := s.tag
+			if !wasValid {
+				tag = BufferTag{}
+			}
+			return i, wasValid && dirty, tag, nil
+		}
+		// Another goroutine modified this slot concurrently; try next.
+	}
+	return 0, false, BufferTag{}, ErrNoBuffer
+}
+
+// evictVictim flushes (if dirty) and removes the old tag from bufmap.
+// MUST be called with pinMu held.
+func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error {
+	if oldTag == (BufferTag{}) {
+		return nil // slot was free
+	}
+	// Delete from bufmap BEFORE flushing to ensure no stale lookups.
+	p.bm.Delete(oldTag, int32(victimIdx))
+	p.tombstones.Add(1)
+	p.maybeCompact()
+	if wasDirty {
+		s := &p.slots[victimIdx]
+		// Release pinMu while doing IO so other goroutines can proceed.
+		p.pinMu.Unlock()
 		s.contentMu.Lock()
 		flushErr := p.flushSlot(oldTag, s.page)
 		s.contentMu.Unlock()
+		p.pinMu.Lock()
 		if flushErr != nil {
-			p.evictMu.Lock()
-			s.pinCount.Store(0)
-			s.usageCount.Store(0)
-			p.evictMu.Unlock()
-			return nil, InvalidBlockNumber, fmt.Errorf("flush victim: %w", flushErr)
+			return flushErr
 		}
-		// Remove from old partition byTag after successful flush.
-		oldPart := &p.partitions[tagPartition(oldTag)]
-		oldPart.mu.Lock()
-		delete(oldPart.byTag, oldTag)
-		oldPart.mu.Unlock()
+	}
+	return nil
+}
+
+// PinNew pins the next-after-end block of rel for writing without
+// reading from disk. Returns the block number the slot represents.
+func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
+	p.pinMu.Lock()
+
+	victimIdx, wasDirty, oldTag, err := p.claimVictim()
+	if err != nil {
+		p.pinMu.Unlock()
+		return nil, InvalidBlockNumber, err
+	}
+	s := &p.slots[victimIdx]
+
+	if err := p.evictVictim(victimIdx, wasDirty, oldTag); err != nil {
+		p.releaseVictimSlot(victimIdx)
+		p.pinMu.Unlock()
+		return nil, InvalidBlockNumber, fmt.Errorf("flush victim: %w", err)
 	}
 
+	// Initialize page and extend the relation. Release pinMu during IO.
+	p.pinMu.Unlock()
 	s.contentMu.Lock()
 	if err := InitPage(s.page); err != nil {
 		s.contentMu.Unlock()
-		// Roll back the reservation — slot returns to the free
-		// pool with pinCount=0.
-		p.evictMu.Lock()
-		s.pinCount.Store(0)
-		s.usageCount.Store(0)
-		p.evictMu.Unlock()
+		p.pinMu.Lock()
+		p.releaseVictimSlot(victimIdx)
+		p.pinMu.Unlock()
 		return nil, InvalidBlockNumber, err
 	}
 	blk, err := p.mgr.Extend(rel, s.page)
 	s.contentMu.Unlock()
 	if err != nil {
-		p.evictMu.Lock()
-		s.pinCount.Store(0)
-		s.usageCount.Store(0)
-		p.evictMu.Unlock()
+		p.pinMu.Lock()
+		p.releaseVictimSlot(victimIdx)
+		p.pinMu.Unlock()
 		return nil, InvalidBlockNumber, err
 	}
-	// Emit SmgrCreate WAL record on first block creation so crash
-	// recovery can recreate the relfile before replaying data pages.
+	p.pinMu.Lock()
+
+	// Emit SmgrCreate WAL record on first block creation.
 	if blk == 0 && p.logSmgrCreate != nil {
 		if emitErr := p.logSmgrCreate(rel); emitErr != nil {
 			p.logger.Error("SmgrCreate WAL emission failed", "rel", rel, "err", emitErr)
-			// Don't propagate — storage mutation already committed.
 		}
 	}
+
 	tag := BufferTag{Rel: rel, Block: blk}
 
-	// Publish under the partition lock for the new tag.
-	part := &p.partitions[tagPartition(tag)]
-	part.mu.Lock()
-	if idx, ok := part.byTag[tag]; ok {
-		// Another goroutine already loaded/published this freshly
-		// extended block while we were outside the locks. Reuse that
-		// slot and release ours back to the free pool. Our
-		// reserved pinCount=1 from the I/O window is decremented
-		// to 0 here; the existing slot's pinCount is incremented.
-		existing := p.slots[idx]
-		p.evictMu.Lock()
-		existing.pinCount.Add(1)
-		if existing.usageCount.Load() < maxUsageCount {
-			existing.usageCount.Add(1)
-		}
-		s.tag = BufferTag{}
-		s.valid = false
-		s.dirty = false
-		s.pinCount.Store(0)
-		s.usageCount.Store(0)
-		p.evictMu.Unlock()
-		part.mu.Unlock()
-		return existing, blk, nil
-	}
-	p.evictMu.Lock()
+	// Publish this slot as valid+dirty+pinned.
+	gen := stateGen(s.state.Load())
 	s.tag = tag
-	s.valid = true
-	s.dirty = true // Extend wrote it but the in-memory page was just initialised; flag dirty so any subsequent mutation flushes
-	// M0056-0001: pinCount/usageCount were already set to 1 as
-	// the reservation before we released evictMu. Don't overwrite
-	// them here; the caller's first Unpin will balance the reservation.
-	p.evictMu.Unlock()
-	part.byTag[tag] = slotIdx
-	part.mu.Unlock()
+	newSt := slotValidBit | slotDirtyBit | uint64(1) | (uint64(1) << slotUsageShift) | (uint64(gen) << slotGenShift)
+	s.state.Store(newSt)
+
+	// Insert into bufmap. Under pinMu, no other goroutine can insert the same tag.
+	if !p.bm.Insert(tag, int32(victimIdx), gen) {
+		// Another goroutine published this block while we were in Extend.
+		// Use their slot and release ours.
+		if existingIdx, existingGen := p.bm.Lookup(tag); existingIdx >= 0 {
+			if existing := p.tryPinSlot(existingIdx, existingGen); existing != nil {
+				s.tag = BufferTag{}
+				s.state.Store(0)
+				p.pinMu.Unlock()
+				return existing, blk, nil
+			}
+		}
+		// Fall through: keep our publication.
+	}
+
+	p.pinMu.Unlock()
 	return s, blk, nil
+}
+
+
+// ExtendRelationBatch appends n empty, initialized blocks to rel as a
+// single batched smgr write, and returns the block number of the first
+// new block; subsequent blocks occupy firstBlk+1 .. firstBlk+n-1.
+//
+// Unlike PinNew, no buffer slot is pinned and no bufmap entry is
+// published — the new pages live on disk only. Subsequent heap-insert
+// calls find them via FSM (the caller registers FSM entries for the
+// added blocks per
+// `docs/design/perf-optimize/07-wal-fsm-insert.md` §3).
+//
+// If the relation transitions from empty to non-empty (firstBlk == 0)
+// the SmgrCreate WAL record is emitted exactly once, matching the
+// invariant pinned by PinNew. Foundation 2 of 3 for M0107-0007 slice C;
+// the executor consumer (`selectInsertPage`) lands after the third
+// foundation (`Pool.SlotPinCount`, blocked on M0107-0006).
+func (p *Pool) ExtendRelationBatch(rel RelFileNode, n int) (BlockNumber, error) {
+	if n <= 0 {
+		return InvalidBlockNumber, fmt.Errorf("ExtendRelationBatch: n=%d must be > 0", n)
+	}
+	// One zero-initialized page is reused for every block; the heap-insert
+	// caller fills the headers and tuples on the next Pin+MarkDirty cycle.
+	page := make([]byte, BlockSize)
+	if err := InitPage(page); err != nil {
+		return InvalidBlockNumber, err
+	}
+	first, err := p.mgr.ExtendBatch(rel, page, n)
+	if err != nil {
+		return InvalidBlockNumber, err
+	}
+	if first == 0 && p.logSmgrCreate != nil {
+		if emitErr := p.logSmgrCreate(rel); emitErr != nil {
+			p.logger.Error("SmgrCreate WAL emission failed",
+				"rel", rel, "err", emitErr)
+		}
+	}
+	return first, nil
 }
 
 // Pin returns the slot holding tag, reading from disk if necessary.
 // The slot's pinCount is incremented; the caller MUST call Unpin.
 //
-// BM_IO_IN_PROGRESS (M0048-0001): when two goroutines miss the cache for
-// the same tag simultaneously, only the first one issues a disk read.
-// The others wait on part.ioCond until the read completes, then pick up the
-// cached result. This guarantees smgr.ReadBlock is called exactly once
-// per cache miss regardless of concurrency.
+// BM_IO_IN_PROGRESS: when multiple goroutines miss the cache for the same
+// tag simultaneously, only one issues a disk read (the winner). The others
+// wait via per-slot semaphore until the IO completes, then find the slot valid.
 //
-// M0098-0003 lock ordering: partition lock (acquire/release) → evictMu
-// (for victim selection) → old-partition lock (to remove old tag).
+// Fast path (cache hit): lock-free Lookup + CAS, no mutex.
+// Slow path (cache miss / IO wait): acquires pinMu.
 func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
-	part := &p.partitions[tagPartition(tag)]
-
-	part.mu.Lock()
-	// Outer loop: a goroutine may need to wait multiple times if spurious
-	// wakeups occur or if ioCond is signalled before the tag is published.
 	for {
-		// Fast path: tag is already cached.
-		if idx, ok := part.byTag[tag]; ok {
-			s := p.slots[idx]
-			// M0098-0003 deadlock fix: release part.mu BEFORE acquiring evictMu
-			// to maintain the invariant "evictMu before any partition lock".
-			// Eviction (under evictMu) removes old tags from partition byTag
-			// under oldPart.mu — if we held part.mu while acquiring evictMu
-			// and part == oldPart, we deadlock with the eviction path.
-			//
-			// After releasing part.mu, the slot may be evicted before we
-			// acquire evictMu. We verify s.tag == tag under evictMu; on
-			// mismatch, retry the whole Pin (the page was evicted, will be
-			// reloaded by the cache-miss path).
-			part.mu.Unlock()
-			// M0099-0002: RLock allows concurrent cache-hit Pins to proceed
-			// in parallel. eviction (Lock) still serialises with us — it
-			// cannot modify tag/valid while we hold RLock, so the tag check
-			// and pinCount increment are safe without further exclusive locking.
-			p.evictMu.RLock()
-			if s.tag != tag {
-				// Slot was evicted between part.mu release and evictMu RLock.
-				// Restart Pin so the miss path reloads the page.
-				p.evictMu.RUnlock()
-				return p.Pin(tag)
+		// Fast path: tag is cached and valid (no IO in flight).
+		slotIdx, gen := p.bm.Lookup(tag)
+		if slotIdx >= 0 {
+			s := &p.slots[slotIdx]
+			old := s.state.Load()
+
+			if stateValid(old) && !stateIO(old) && stateGen(old) == gen {
+				// Slot is valid and ready: try CAS to increment pin.
+				pinCount := statePin(old)
+				if pinCount >= maxPinCount {
+					return nil, ErrNoBuffer
+				}
+				usage := stateUsage(old)
+				if usage < maxUsageCount {
+					usage++
+				}
+				newSt := (old &^ (slotPinMask | slotUsageMask)) | (pinCount + 1) | (usage << slotUsageShift)
+				if s.state.CompareAndSwap(old, newSt) {
+					return s, nil
+				}
+				// CAS failed (concurrent pin/unpin); retry fast path.
+				continue
 			}
-			s.pinCount.Add(1)
-			if s.usageCount.Load() < maxUsageCount {
-				s.usageCount.Add(1)
-			}
-			p.evictMu.RUnlock()
-			return s, nil
 		}
 
-		// If another goroutine is already reading this exact tag from disk,
-		// wait for it to finish rather than issuing a duplicate read.
-		if _, inFlight := part.ioByTag[tag]; inFlight {
-			if p.OnBufferIOWait != nil {
-				p.OnBufferIOWait()
-			}
-			part.ioCond.Wait() // atomically releases part.mu and sleeps
-			continue           // re-check cache hit and in-flight status
+		// Slow path: cache miss, IO in flight, or transient state.
+		if s, err := p.pinSlow(tag); s != nil || err != nil {
+			return s, err
 		}
-
-		// No in-flight read for this tag — we win the I/O race.
-		break
+		// pinSlow returned nil,nil: spurious wakeup or ABA; retry from top.
 	}
+}
 
-	// Mark this tag as in-flight BEFORE evicting a victim slot or
-	// releasing part.mu. Subsequent goroutines requesting the same tag
-	// will see ioByTag[tag] and wait instead of starting a duplicate read.
-	part.ioByTag[tag] = struct{}{}
-	part.mu.Unlock()
+// pinSlow is the slow path for Pin: acquires pinMu, re-checks the bufmap,
+// waits for in-flight IO to complete, or performs a full cache-miss eviction+read.
+//
+// Returns (slot, nil) on success, (nil, err) on hard error,
+// (nil, nil) to signal the caller to retry the fast path.
+func (p *Pool) pinSlow(tag BufferTag) (*Slot, error) {
+	p.pinMu.Lock()
+	defer p.pinMu.Unlock()
 
-	// Acquire evictMu to select a victim slot.
-	p.evictMu.Lock()
-	slotIdx, err := p.evictLocked()
+	for {
+		slotIdx, gen := p.bm.Lookup(tag)
+		if slotIdx >= 0 {
+			s := &p.slots[slotIdx]
+			old := s.state.Load()
+
+			if stateIO(old) {
+				// IO in flight: wait for it to complete via per-slot semaphore.
+				// Increment waiter count under pinMu so the loader sees us.
+				p.slotWaiters[slotIdx].Add(1)
+				p.pinMu.Unlock()
+				if p.OnBufferIOWait != nil {
+					p.OnBufferIOWait()
+				}
+				runtimeshim.SemaAcquire(&p.slotSema[slotIdx])
+				p.slotWaiters[slotIdx].Add(-1)
+				p.pinMu.Lock()
+				continue // re-check after wakeup
+			}
+
+			if stateValid(old) && stateGen(old) == gen {
+				// Valid: try to pin.
+				if s2 := p.tryPinSlot(slotIdx, gen); s2 != nil {
+					return s2, nil
+				}
+				// tryPinSlot failed (race): retry
+				continue
+			}
+
+			// Slot in unexpected state (just evicted?): retry Lookup.
+			continue
+		}
+
+		// Cache miss: load the page from disk.
+		return p.pinLoad(tag)
+	}
+}
+
+// pinLoad loads tag from disk into a victim slot. Called under pinMu.
+// Returns (slot, nil) on success, (nil, err) on error.
+func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
+	// Find a victim.
+	victimIdx, wasDirty, oldTag, err := p.claimVictim()
 	if err != nil {
-		p.evictMu.Unlock()
-		part.mu.Lock()
-		delete(part.ioByTag, tag)
-		part.ioCond.Broadcast()
-		part.mu.Unlock()
 		return nil, err
 	}
-	s := p.slots[slotIdx]
-	needFlush := s.valid && s.dirty
-	oldTag := s.tag
+	s := &p.slots[victimIdx]
 
-	// Reserve the slot before releasing evictMu so evictLocked skips it.
-	// M0099-0004: partition cleanup (oldPart.mu) now happens AFTER
-	// releasing evictMu to avoid holding evictMu while waiting for a
-	// contended partition lock.  Reservation makes the slot invisible
-	// to evictLocked; the old tag will be removed from byTag below.
-	s.valid = false
-	s.dirty = false
-	s.tag = BufferTag{}
-	s.pinCount.Store(1)
-	s.usageCount.Store(1)
-	p.evictMu.Unlock()
-
-	if !needFlush {
-		oldPart := &p.partitions[tagPartition(oldTag)]
-		oldPart.mu.Lock()
-		delete(oldPart.byTag, oldTag)
-		oldPart.mu.Unlock()
+	// Evict the old contents.
+	if err := p.evictVictim(victimIdx, wasDirty, oldTag); err != nil {
+		p.releaseVictimSlot(victimIdx)
+		return nil, fmt.Errorf("flush victim: %w", err)
 	}
 
-	if needFlush {
-		s.contentMu.Lock()
-		flushErr := p.flushSlot(oldTag, s.page)
-		s.contentMu.Unlock()
-		if flushErr != nil {
-			p.evictMu.Lock()
-			s.pinCount.Store(0)
-			s.usageCount.Store(0)
-			p.evictMu.Unlock()
-			part.mu.Lock()
-			delete(part.ioByTag, tag)
-			part.ioCond.Broadcast()
-			part.mu.Unlock()
-			return nil, fmt.Errorf("flush victim: %w", flushErr)
+	// Re-check after eviction in case another goroutine already loaded this tag.
+	if existingIdx, existingGen := p.bm.Lookup(tag); existingIdx >= 0 {
+		if existing := p.tryPinSlot(existingIdx, existingGen); existing != nil {
+			p.releaseVictimSlot(victimIdx)
+			return existing, nil
 		}
-		// Remove from old partition byTag after successful flush.
-		oldPart := &p.partitions[tagPartition(oldTag)]
-		oldPart.mu.Lock()
-		delete(oldPart.byTag, oldTag)
-		oldPart.mu.Unlock()
 	}
 
+	// Publish tag in bufmap with ioInflight set. Any concurrent Lookup will
+	// see the slot and wait in the "stateIO" branch above.
+	gen := stateGen(s.state.Load())
+	s.tag = tag
+	if !p.bm.Insert(tag, int32(victimIdx), gen) {
+		// Another goroutine (in a concurrent PinNew?) published this tag.
+		s.tag = BufferTag{}
+		p.releaseVictimSlot(victimIdx)
+		return nil, nil // caller retries
+	}
+
+	// Release pinMu during the disk read so other goroutines can proceed.
+	p.pinMu.Unlock()
 	s.contentMu.Lock()
 	if p.OnPinWait != nil {
 		p.OnPinWait()
 	}
-	err = p.mgr.ReadBlock(tag.Rel, tag.Block, s.page)
+	ioErr := p.mgr.ReadBlock(tag.Rel, tag.Block, s.page)
 	if p.OnPinDone != nil {
 		p.OnPinDone()
 	}
 	s.contentMu.Unlock()
+	p.pinMu.Lock()
 
-	// Re-lock partition to remove ioByTag and wake waiters.
-	// M0099-0004: Release part.mu before acquiring evictMu to
-	// respect lock ordering (evictMu before partition lock).
-	// Holding part.mu while waiting for evictMu can deadlock
-	// with the Pin→evictMu→oldPart.mu path above.
-	part.mu.Lock()
-	delete(part.ioByTag, tag)
-	part.ioCond.Broadcast()
-	part.mu.Unlock()
-
-	if err != nil {
-		p.evictMu.Lock()
+	if ioErr != nil {
+		p.bm.Delete(tag, int32(victimIdx))
+		p.tombstones.Add(1)
 		s.tag = BufferTag{}
-		s.pinCount.Store(0)
-		s.usageCount.Store(0)
-		s.valid = false
-		s.dirty = false
-		p.evictMu.Unlock()
-		return nil, err
+		p.releaseVictimSlot(victimIdx) // also wakes per-slot sema waiters
+		return nil, ioErr
 	}
 
-	p.evictMu.Lock()
-
-	// Re-check for duplicate publish. Another goroutine may have
-	// published the same tag after we released part.mu above.
-	part.mu.Lock()
-	if idx, ok := part.byTag[tag]; ok {
-		part.mu.Unlock()
-		// Another goroutine published this tag while we were reading
-		// (e.g. via PinNew). Use that slot and release ours.
-		existing := p.slots[idx]
-		existing.pinCount.Add(1)
-		if existing.usageCount.Load() < maxUsageCount {
-			existing.usageCount.Add(1)
-		}
-		s.tag = BufferTag{}
-		s.pinCount.Store(0)
-		s.usageCount.Store(0)
-		s.valid = false
-		s.dirty = false
-		p.evictMu.Unlock()
-		return existing, nil
+	// Transition to valid+pinned. Read waiter count under pinMu before
+	// clearing ioInflight so no new waiters can arrive between read and wake.
+	n := p.slotWaiters[victimIdx].Load()
+	newSt := slotValidBit | uint64(1) | (uint64(1) << slotUsageShift) | (uint64(gen) << slotGenShift)
+	s.state.Store(newSt)
+	for i := int32(0); i < n; i++ {
+		runtimeshim.SemaRelease(&p.slotSema[victimIdx])
 	}
-
-	s.tag = tag
-	s.valid = true
-	s.dirty = false
-	p.evictMu.Unlock()
-
-	part.byTag[tag] = slotIdx
-	part.mu.Unlock()
 	return s, nil
 }
 
 // Capacity returns the total number of buffer slots in the pool.
-// Used by scan strategies to decide whether to activate a ring buffer.
 func (p *Pool) Capacity() int { return len(p.slots) }
 
-// TryPin returns the pool slot for tag if it is already cached,
-// incrementing pinCount. Returns (nil, false) when the tag is not in
-// the pool — no disk read is attempted. Used by ScanRing to detect
-// cache hits without evicting other pages on misses (M0048-0002).
+// TryPin returns the pool slot for tag if it is already cached.
+// Returns (nil, false) when the tag is not in the pool.
 func (p *Pool) TryPin(tag BufferTag) (*Slot, bool) {
-	part := &p.partitions[tagPartition(tag)]
-	part.mu.Lock()
-	idx, ok := part.byTag[tag]
-	if !ok {
-		part.mu.Unlock()
+	slotIdx, gen := p.bm.Lookup(tag)
+	if slotIdx < 0 {
 		return nil, false
 	}
-	s := p.slots[idx]
-	// M0099-0002: RLock allows concurrent cache-hit TryPins to proceed
-	// in parallel (same rationale as Pin fast path).
-	part.mu.Unlock()
-	p.evictMu.RLock()
-	if s.tag != tag {
-		// Slot evicted between part.mu release and evictMu RLock.
-		p.evictMu.RUnlock()
-		return nil, false // not in cache
-	}
-	s.pinCount.Add(1)
-	if s.usageCount.Load() < maxUsageCount {
-		s.usageCount.Add(1)
-	}
-	p.evictMu.RUnlock()
-	return s, true
-}
-
-// Unpin decrements the slot's pin count. No lock is required because
-// pinCount is atomic and evictLocked checks it under exclusive evictMu.Lock
-// — a decrement from N to N-1 is safe to race with the eviction Lock pass.
-func (p *Pool) Unpin(s *Slot) {
-	if s.pinCount.Add(-1) < 0 {
-		panic(fmt.Sprintf("unpin underflow on tag %v", s.tag))
+	s := &p.slots[slotIdx]
+	for {
+		old := s.state.Load()
+		if !stateValid(old) || stateIO(old) {
+			return nil, false
+		}
+		if stateGen(old) != gen {
+			return nil, false
+		}
+		pinCount := statePin(old)
+		if pinCount >= maxPinCount {
+			return nil, false
+		}
+		usage := stateUsage(old)
+		if usage < maxUsageCount {
+			usage++
+		}
+		newSt := (old &^ (slotPinMask | slotUsageMask)) | (pinCount + 1) | (usage << slotUsageShift)
+		if s.state.CompareAndSwap(old, newSt) {
+			return s, true
+		}
 	}
 }
 
-// MarkDirty flags the slot as having been mutated. Caller must hold
-// a pin and (for write paths) the slot's exclusive content lock so
-// a full-page-image snapshot taken below sees a stable image.
+// SlotPinCount returns the current pin count for tag's slot, or 0 if
+// tag is not currently mapped. Lock-free; safe for concurrent use.
 //
-// When full_page_writes is on and this is the first mutation since
-// the last checkpoint, an FPI record is emitted via the configured
-// LogPageImage callback and the resulting LSN is stamped into the
-// page header so the existing flush-before-write ordering
-// (`flushSlot` -> `wal.FlushUpTo(pd_lsn)`) covers it.
+// Consumers outside the Pin/Unpin core (e.g. M0107-0007 FSM hot-page
+// avoidance in selectInsertPage) use this helper to avoid inlining
+// slotState bit-mask arithmetic.
+func (p *Pool) SlotPinCount(tag BufferTag) int32 {
+	slotIdx, gen := p.bm.Lookup(tag)
+	if slotIdx < 0 {
+		return 0
+	}
+	s := &p.slots[slotIdx]
+	st := s.state.Load()
+	if !stateValid(st) || stateGen(st) != gen {
+		return 0
+	}
+	return int32(statePin(st))
+}
+
+// Unpin decrements the slot's pin count via CAS.
+func (p *Pool) Unpin(s *Slot) {
+	for {
+		old := s.state.Load()
+		pinCount := statePin(old)
+		if pinCount == 0 {
+			panic(fmt.Sprintf("unpin underflow on tag %v", s.tag))
+		}
+		newSt := (old &^ slotPinMask) | (pinCount - 1)
+		if s.state.CompareAndSwap(old, newSt) {
+			return
+		}
+	}
+}
+
+// MarkDirty flags the slot as having been mutated.
 func (p *Pool) MarkDirty(s *Slot) {
 	p.maybeEmitFPI(s)
-	p.evictMu.Lock()
-	s.dirty = true
-	p.evictMu.Unlock()
+	// Atomically set dirty bit.
+	for {
+		old := s.state.Load()
+		if old&slotDirtyBit != 0 {
+			return // already dirty
+		}
+		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			return
+		}
+	}
 }
 
-// MarkDirtyWithLSN records an explicit page LSN and marks the slot
-// dirty. Used when the caller has already issued a WAL record and
-// wants the buffer pool to track its LSN for the flush ordering.
-// FPI emission is skipped — the caller's record is the durability
-// anchor.
-//
-// Callers that DON'T already hold s.contentMu (e.g. test code that
-// pins the slot but never explicitly latches it) should use this
-// entry point. Callers that ARE in the middle of an exclusive
-// content-latch hold (e.g. the B-tree split path) must use
-// MarkDirtyWithLSNLocked to avoid the obvious self-deadlock.
+// MarkDirtyWithLSN records an explicit page LSN and marks the slot dirty.
 func (p *Pool) MarkDirtyWithLSN(s *Slot, lsn LSN) {
 	s.contentMu.Lock()
 	MustHeader(s.page).SetLSN(lsn)
@@ -1178,45 +1000,75 @@ func (p *Pool) MarkDirtyWithLSN(s *Slot, lsn LSN) {
 	p.markDirtyWithLSNCommon(s)
 }
 
-// MarkDirtyWithLSNLocked is the variant for callers that already
-// hold s.contentMu in exclusive mode. The page-header LSN write
-// happens without re-taking the latch.
+// MarkDirtyWithLSNLocked is the variant for callers that already hold s.contentMu.
 func (p *Pool) MarkDirtyWithLSNLocked(s *Slot, lsn LSN) {
 	MustHeader(s.page).SetLSN(lsn)
 	p.markDirtyWithLSNCommon(s)
 }
 
 func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
-	p.evictMu.Lock()
-	s.dirty = true
-	// Stamping our own LSN supersedes any prior FPI for this
-	// epoch — the WAL record at this LSN is what redo will pick up.
-	s.fpiSinceCheckpoint = true
-	p.evictMu.Unlock()
+	// Set dirty bit and mark fpiSinceCheckpoint.
+	for {
+		old := s.state.Load()
+		if old&slotDirtyBit != 0 {
+			// Already dirty; still need to update fpiSinceCheckpoint.
+			break
+		}
+		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			break
+		}
+	}
+	s.fpiSinceCheckpoint.Store(true)
 }
 
-// MarkDirtyChangeRecord is the change-record-aware variant of
-// MarkDirty. The first dirty in each checkpoint epoch emits an
-// FPI as the baseline (and ignores `emitter`); subsequent dirties
-// in the same epoch invoke `emitter` to append the caller's
-// logical change record and stamp its end LSN onto pd_lsn. This
-// gives upstream's "FPI then change records" replay invariant
-// while keeping the once-per-epoch FPI optimisation alive for
-// migrated paths. Caller must hold s.contentMu exclusive.
-//
-// Paths that haven't been migrated to logical records can still
-// use MarkDirty for one-off page initialisation writes; hot
-// paths that may dirty the same page repeatedly in one checkpoint
-// epoch should use this API so subsequent mutations are logged.
-// See docs/design/0002-0003-redo-records.md.
-func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error {
-	p.evictMu.Lock()
-	needFPI := !s.fpiSinceCheckpoint
+// MarkDirtyForceFPI emits a fresh full-page image, overriding any stale FPI.
+func (p *Pool) MarkDirtyForceFPI(s *Slot) {
+	if p.logFPI == nil || !p.fullPageWrites.Load() {
+		for {
+			old := s.state.Load()
+			if old&slotDirtyBit != 0 {
+				return
+			}
+			if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+				return
+			}
+		}
+	}
 	tag := s.tag
-	p.evictMu.Unlock()
+
+	pageCopy := make(Page, BlockSize)
+	copy(pageCopy, s.page)
+	lsn, err := p.logFPI(tag.Rel, tag.Block, pageCopy)
+	if err != nil {
+		for {
+			old := s.state.Load()
+			if old&slotDirtyBit != 0 {
+				return
+			}
+			if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+				return
+			}
+		}
+	}
+	MustHeader(s.page).SetLSN(lsn)
+	for {
+		old := s.state.Load()
+		if old&slotDirtyBit != 0 {
+			break
+		}
+		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			break
+		}
+	}
+	s.fpiSinceCheckpoint.Store(true)
+}
+
+// MarkDirtyChangeRecord is the change-record-aware variant of MarkDirty.
+func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error {
+	needFPI := !s.fpiSinceCheckpoint.Load()
+	tag := s.tag
 
 	if needFPI {
-		// Baseline: emit the post-mutation page image.
 		if p.logFPI != nil && p.fullPageWrites.Load() {
 			pageCopy := make(Page, BlockSize)
 			copy(pageCopy, s.page)
@@ -1226,9 +1078,6 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 			}
 			MustHeader(s.page).SetLSN(lsn)
 		} else if emitter != nil {
-			// No FPI hook (or full_page_writes off): fall back
-			// to the logical record so the change is at least
-			// captured in WAL.
 			lsn, err := emitter()
 			if err != nil {
 				return err
@@ -1236,7 +1085,6 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 			MustHeader(s.page).SetLSN(lsn)
 		}
 	} else {
-		// Already FPI'd this epoch — emit logical record only.
 		if emitter == nil {
 			return fmt.Errorf("MarkDirtyChangeRecord: emitter required after first dirty")
 		}
@@ -1247,60 +1095,33 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 		MustHeader(s.page).SetLSN(lsn)
 	}
 
-	p.evictMu.Lock()
-	s.dirty = true
-	s.fpiSinceCheckpoint = true
-	p.evictMu.Unlock()
+	for {
+		old := s.state.Load()
+		if old&slotDirtyBit != 0 {
+			break
+		}
+		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			break
+		}
+	}
+	s.fpiSinceCheckpoint.Store(true)
 	return nil
 }
 
-// MarkDirtyLogicalChange is the logical-decoding-aware variant of
-// MarkDirtyChangeRecord. The caller's `emitter` is ALWAYS run, so
-// the WAL stream always carries the logical change record — this
-// is what the M0008 logical-decoding pipeline classifies into
-// per-row Insert/Update/Delete events. On first-dirty-in-epoch a
-// full-page image is ALSO emitted, BEFORE the logical record (lower
-// LSN), preserving upstream PG's "FPI then change records" replay
-// invariant for torn-page protection. pd_lsn is stamped from the
-// logical record's LSN so per-page idempotency continues to work.
-//
-// Use this instead of MarkDirtyChangeRecord on heap mutation paths
-// (HeapInsert/HeapDelete/HeapHotUpdate). MarkDirtyChangeRecord's
-// "FPI alone replaces the change record" optimisation silently
-// drops the logical event from the decoder's view — fine for redo,
-// fatal for logical replication.
-//
-// Caller must hold s.contentMu exclusive (the page bytes that will
-// be snapshotted into the FPI must not move under us).
+// MarkDirtyLogicalChange is the logical-decoding-aware variant of MarkDirtyChangeRecord.
 func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) error {
 	if emitter == nil {
 		return fmt.Errorf("MarkDirtyLogicalChange: emitter required")
 	}
-	p.evictMu.Lock()
-	needFPI := !s.fpiSinceCheckpoint
+	needFPI := !s.fpiSinceCheckpoint.Load()
 	tag := s.tag
-	p.evictMu.Unlock()
 
-	// Emit the logical record FIRST so on physical replay it lands
-	// against the page's prior state (blank-after-extend, or the
-	// previous epoch's tail). The page mutation already happened
-	// in-memory before this call; the in-memory pd_lsn updates to
-	// the record's end LSN so any subsequent FPI snapshot below
-	// captures the same pd_lsn the standby will arrive at after
-	// applying the logical record.
 	lsn, err := emitter()
 	if err != nil {
 		return err
 	}
 	MustHeader(s.page).SetLSN(lsn)
 
-	// On first-dirty-in-epoch, also emit the FPI for torn-page
-	// protection. The FPI lands at a HIGHER LSN than the logical
-	// record above, so per-page replay sees them in order:
-	//   1. logical record at LSN_log → modifies the page from the
-	//      prior epoch's state into the post-mutation state.
-	//   2. PageImage at LSN_fpi (> LSN_log) → overwrites with the
-	//      authoritative bytes (idempotent against step 1).
 	if needFPI && p.logFPI != nil && p.fullPageWrites.Load() {
 		pageCopy := make(Page, BlockSize)
 		copy(pageCopy, s.page)
@@ -1311,53 +1132,44 @@ func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) erro
 		MustHeader(s.page).SetLSN(fpiLSN)
 	}
 
-	p.evictMu.Lock()
-	s.dirty = true
-	s.fpiSinceCheckpoint = true
-	p.evictMu.Unlock()
+	for {
+		old := s.state.Load()
+		if old&slotDirtyBit != 0 {
+			break
+		}
+		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			break
+		}
+	}
+	s.fpiSinceCheckpoint.Store(true)
 	return nil
 }
 
-// maybeEmitFPI runs the FPI side-effect of MarkDirty for the
-// first mutation in each checkpoint epoch. Caller must hold
-// Slot.contentMu exclusive so the page bytes are stable.
+// maybeEmitFPI runs the FPI side-effect of MarkDirty for the first
+// mutation in each checkpoint epoch.
 func (p *Pool) maybeEmitFPI(s *Slot) {
 	if p.logFPI == nil || !p.fullPageWrites.Load() {
 		return
 	}
-	p.evictMu.Lock()
-	if s.fpiSinceCheckpoint {
-		p.evictMu.Unlock()
+	if s.fpiSinceCheckpoint.Load() {
 		return
 	}
+
 	tag := s.tag
-	p.evictMu.Unlock()
 
 	pageCopy := make(Page, BlockSize)
 	copy(pageCopy, s.page)
 	lsn, err := p.logFPI(tag.Rel, tag.Block, pageCopy)
 	if err != nil {
-		// Best-effort in v0: log and continue. Upstream PANICs
-		// here; surfacing that requires changing MarkDirty's
-		// signature, which is a follow-up loop's task.
 		p.logger.Warn("full-page-image WAL emit failed",
 			"rel", tag.Rel, "block", tag.Block, "err", err)
 		return
 	}
 	MustHeader(s.page).SetLSN(lsn)
-	p.evictMu.Lock()
-	s.fpiSinceCheckpoint = true
-	p.evictMu.Unlock()
+	s.fpiSinceCheckpoint.Store(true)
 }
 
-// FlushAll writes every dirty slot through smgr and clears the dirty
-// bit. Equivalent to FlushAllPaced with a no-op pacer; convenient
-// for callers that don't want to spread the work over time
-// (CheckpointNow, Pool.Close).
-//
-// FlushAll is reserved for the checkpointer goroutine. Client-backend
-// goroutines must never call it (M0042-0004 invariant). The OnFlushAll
-// hook fires here for assertions; see Pool.OnFlushAll.
+// FlushAll writes every dirty slot and clears the dirty bit.
 func (p *Pool) FlushAll() error {
 	if p.OnFlushAll != nil {
 		p.OnFlushAll()
@@ -1365,41 +1177,22 @@ func (p *Pool) FlushAll() error {
 	return p.FlushAllPaced(nil)
 }
 
-// FlushAllPaced writes every dirty slot through smgr and invokes
-// `pacer(progress)` after each batch, where progress is the
-// fraction of work already completed in [0, 1]. The pacer can
-// sleep to spread the I/O over a target wall-clock window — this
-// is the path the spread checkpoint writes (milestone 0002) take.
-// A nil pacer behaves like FlushAll.
-//
-// The dirty set is snapshotted at entry; pages dirtied after the
-// snapshot are not flushed in this pass and stay dirty for the
-// next checkpoint.
-//
-// When SetAsyncFlushBatchSize is >1 and an AIO engine is
-// attached to the storage Manager, dirty slots are flushed in
-// batches: one combined wal.FlushUpTo for the batch's max
-// pd_lsn, then parallel AIO writes via Manager.WriteBlockAIO,
-// then waits on every handle. The contentMu RLock is held for
-// the full batch so writers can't tear the bytes the engine is
-// pwrite-ing. With batch=1 the loop is bit-identical to the
-// legacy per-slot serial flush.
+// FlushAllPaced writes every dirty slot and invokes pacer after each batch.
 func (p *Pool) FlushAllPaced(pacer func(progress float64) error) error {
 	if p.OnFlushAll != nil {
 		p.OnFlushAll()
 	}
-	p.evictMu.Lock()
 	type pending struct {
 		idx int
 		tag BufferTag
 	}
 	var todo []pending
-	for i, s := range p.slots {
-		if s.valid && s.dirty {
-			todo = append(todo, pending{i, s.tag})
+	for i := range p.slots {
+		st := p.slots[i].state.Load()
+		if stateValid(st) && stateDirty(st) {
+			todo = append(todo, pending{i, p.slots[i].tag})
 		}
 	}
-	p.evictMu.Unlock()
 
 	total := len(todo)
 	if total == 0 {
@@ -1411,13 +1204,10 @@ func (p *Pool) FlushAllPaced(pacer func(progress float64) error) error {
 		if end > total {
 			end = total
 		}
-		// Per-batch flush: WAL barrier first, then AIO writes.
-		// Build a parallel slice of slots so the helper doesn't
-		// need to re-resolve idx → *Slot.
 		batchSlots := make([]*Slot, 0, end-start)
 		batchTags := make([]BufferTag, 0, end-start)
 		for _, t := range todo[start:end] {
-			batchSlots = append(batchSlots, p.slots[t.idx])
+			batchSlots = append(batchSlots, &p.slots[t.idx])
 			batchTags = append(batchTags, t.tag)
 		}
 		if err := p.flushBatch(batchSlots, batchTags); err != nil {
@@ -1433,16 +1223,8 @@ func (p *Pool) FlushAllPaced(pacer func(progress float64) error) error {
 	return nil
 }
 
-// flushBatch flushes a batch of dirty slots: takes contentMu
-// read-locks across the batch, runs one combined WAL flush at
-// the batch's max pd_lsn, submits all AIO writes in parallel
-// via Manager.WriteBlockAIO, waits on every handle, then
-// clears dirty bits for slots whose tag still matches.
-//
-// At batch size 1 this reduces to the legacy per-slot serial
-// flush (one RLock, one WAL FlushUpTo, one Submit+Wait).
+// flushBatch flushes a batch of dirty slots.
 func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
-	// Phase 1: lock + compute max LSN.
 	for _, s := range slots {
 		s.contentMu.RLock()
 	}
@@ -1459,25 +1241,16 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 		}
 	}
 
-	// Phase 2: single WAL flush for the batch. WAL-before-data
-	// is preserved: every page in the batch has pd_lsn ≤ maxLSN,
-	// and the durability barrier covers all of them.
 	if p.wal != nil && maxLSN != 0 {
 		if err := p.wal.FlushUpTo(uint64(maxLSN)); err != nil {
 			return fmt.Errorf("flush wal up to %d: %w", maxLSN, err)
 		}
 	}
 
-	// Phase 3: submit every data write through the AIO engine.
-	// With no engine attached, WriteBlockAIO returns a
-	// pre-completed handle synchronously — the loop below then
-	// runs writes serially, matching the legacy behaviour.
 	handles := make([]AIOHandle, len(slots))
 	for i, s := range slots {
 		h, err := p.mgr.WriteBlockAIO(tags[i].Rel, tags[i].Block, s.page)
 		if err != nil {
-			// Wait on whatever has already been submitted so
-			// the engine's InFlight counter doesn't leak.
 			for j := 0; j < i; j++ {
 				_, _ = handles[j].Wait()
 			}
@@ -1486,9 +1259,6 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 		handles[i] = h
 	}
 
-	// Phase 4: wait for every write to land. Surface the first
-	// error, but always drain the rest so the engine's
-	// bookkeeping stays coherent.
 	var firstErr error
 	for _, h := range handles {
 		if _, err := h.Wait(); err != nil && firstErr == nil {
@@ -1499,16 +1269,20 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 		return firstErr
 	}
 
-	// Phase 5: clear dirty bits where the tag still matches.
-	// Only clear dirty if the tag hasn't been reassigned and
-	// nothing else has marked it dirty since the flush started.
-	p.evictMu.Lock()
+	// Clear dirty bits where tag still matches.
 	for i, s := range slots {
 		if s.tag == tags[i] {
-			s.dirty = false
+			for {
+				old := s.state.Load()
+				if old&slotDirtyBit == 0 {
+					break
+				}
+				if s.state.CompareAndSwap(old, old&^slotDirtyBit) {
+					break
+				}
+			}
 		}
 	}
-	p.evictMu.Unlock()
 	return nil
 }
 
@@ -1527,134 +1301,89 @@ func (p *Pool) flushSlot(tag BufferTag, page Page) error {
 	return nil
 }
 
-// maxUsageCount caps usageCount; matches upstream's BM_MAX_USAGE_COUNT
-// (postgres/src/backend/storage/buffer/freelist.c) at 5.
-const maxUsageCount = 5
 
-// evictLocked finds a victim slot. evictMu must be held by the caller.
-// Returns the slot index, or ErrNoBuffer if every slot is pinned.
-//
-// Algorithm: clock sweep. In the worst case every unpinned slot starts
-// at usageCount==maxUsageCount, so finding a victim can require one full
-// sweep per decrement plus one final sweep to observe a zero.
-// Bound probes at N*(maxUsageCount+1).
-func (p *Pool) evictLocked() (int, error) {
-	n := len(p.slots)
-	if n == 0 {
-		return 0, ErrNoBuffer
+// maybeCompact triggers a tombstone compaction if the tombstone ratio exceeds 25%.
+func (p *Pool) maybeCompact() {
+	n := int64(len(p.slots))
+	ts := p.tombstones.Load()
+	if ts*4 < n {
+		return
 	}
-	maxPasses := n * (int(maxUsageCount) + 1)
-	for i := 0; i < maxPasses; i++ {
-		idx := p.clockHand
-		p.clockHand = (p.clockHand + 1) % n
-		s := p.slots[idx]
-		if s.pinCount.Load() > 0 {
-			continue
-		}
-		if s.usageCount.Load() > 0 {
-			s.usageCount.Add(-1)
-			continue
-		}
-		// Track dirty-victim rate for bgwriter effectiveness (M0048-0003).
-		p.totalVictimCount++
-		if s.dirty {
-			p.dirtyVictimCount++
-		}
-		return idx, nil
+	if !p.compactMu.TryLock() {
+		return // another goroutine is already compacting
 	}
-	return 0, ErrNoBuffer
+	defer p.compactMu.Unlock()
+	p.bm.compact()
+	p.tombstones.Store(0)
 }
 
 // DirtyVictimRate returns the fraction of foreground evictions that
-// encountered a dirty page and had to flush it synchronously. Used to
-// measure bgwriter effectiveness (DoD: rate ≤ 5%). Acquires evictMu.
+// encountered a dirty page.
 func (p *Pool) DirtyVictimRate() float64 {
-	p.evictMu.Lock()
-	defer p.evictMu.Unlock()
-	if p.totalVictimCount == 0 {
+	total := p.totalVictimCount.Sum()
+	if total == 0 {
 		return 0
 	}
-	return float64(p.dirtyVictimCount) / float64(p.totalVictimCount)
+	return float64(p.dirtyVictimCount.Sum()) / float64(total)
 }
 
 // ResetVictimStats resets the dirty-victim counters to zero.
 func (p *Pool) ResetVictimStats() {
-	p.evictMu.Lock()
-	defer p.evictMu.Unlock()
-	p.dirtyVictimCount = 0
-	p.totalVictimCount = 0
+	p.dirtyVictimCount.Reset()
+	p.totalVictimCount.Reset()
 }
 
-// WriteDirtyPages proactively flushes up to maxPages dirty slots in one
-// bgwriter tick. It scans from p.bgwriterHand (independent from the
-// eviction clockHand), flushes WAL-before-data ordering, and writes each
-// dirty page to disk without fsync — the checkpointer handles durability.
-// Returns the number of pages flushed.
-//
-// Called only by the bgwriter goroutine; must NOT be called by client
-// backends (use FlushAll/FlushAllPaced for checkpoint-level flushes).
+// WriteDirtyPages proactively flushes up to maxPages dirty slots.
+// Called only by the bgwriter goroutine.
 func (p *Pool) WriteDirtyPages(maxPages int) int {
 	if maxPages <= 0 {
 		return 0
 	}
 
-	// M0070-0002: bgwriter dominated mutex contention on Q9
-	// (M0070 baseline pprof: ~93 % of contention coming from
-	// this loop holding poolMu across all `n` slots while
-	// foreground Pin / Unpin callers blocked). Snapshot
-	// candidates by acquiring poolMu briefly per scanned slot
-	// instead of holding the lock for the entire scan window.
-	// Each slot's read is consistent (the brief acquire / release
-	// pair sees the slot's metadata atomically) and the
-	// per-victim re-validation at line ~1250 below catches any
-	// staleness introduced between slots in the snapshot pass.
 	type victim struct {
 		idx int
 		tag BufferTag
 	}
 	n := len(p.slots)
-	p.evictMu.Lock()
+
+	p.bgwriterMu.Lock()
 	start := p.bgwriterHand
 	p.bgwriterHand = (start + n) % n
-	p.evictMu.Unlock()
+	p.bgwriterMu.Unlock()
+
 	victims := make([]victim, 0, maxPages)
 	for i := 0; i < n && len(victims) < maxPages; i++ {
 		idx := (start + i) % n
-		s := p.slots[idx]
-		p.evictMu.Lock()
-		ok := s.valid && s.dirty && s.pinCount.Load() == 0
-		var tag BufferTag
-		if ok {
-			tag = s.tag
-		}
-		p.evictMu.Unlock()
-		if ok {
-			victims = append(victims, victim{idx: idx, tag: tag})
+		s := &p.slots[idx]
+		st := s.state.Load()
+		if stateValid(st) && stateDirty(st) && statePin(st) == 0 {
+			victims = append(victims, victim{idx: idx, tag: s.tag})
 		}
 	}
 
-	// Flush each victim under its shared content lock (read lock is
-	// sufficient — we only need stable page bytes, not exclusive access).
 	written := 0
 	for _, v := range victims {
-		s := p.slots[v.idx]
+		s := &p.slots[v.idx]
 		s.contentMu.RLock()
 
-		// Re-check under evictMu that the slot is still the same dirty page.
-		p.evictMu.Lock()
-		stillValid := s.valid && s.tag == v.tag && s.dirty && s.pinCount.Load() == 0
-		p.evictMu.Unlock()
+		// Re-check under RLock that the slot is still dirty with same tag.
+		st := s.state.Load()
+		stillValid := stateValid(st) && s.tag == v.tag && stateDirty(st) && statePin(st) == 0
 
 		if stillValid {
 			if err := p.flushSlot(v.tag, s.page); err == nil {
-				// Clear dirty flag under evictMu; re-check tag to avoid
-				// a race where the slot was reused for a different block.
-				p.evictMu.Lock()
 				if s.tag == v.tag {
-					s.dirty = false
+					for {
+						old := s.state.Load()
+						if old&slotDirtyBit == 0 {
+							break
+						}
+						if s.state.CompareAndSwap(old, old&^slotDirtyBit) {
+							break
+						}
+					}
+					written++
 				}
-				p.evictMu.Unlock()
-				written++
 			}
 		}
 		s.contentMu.RUnlock()

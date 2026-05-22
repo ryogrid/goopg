@@ -71,6 +71,44 @@ func TestSyntax_Select_Basic(t *testing.T) {
 	runSQL(t, c, "DROP TABLE t")
 }
 
+// TestSyntax_Select_CurrentSetting exercises executor-side lookup of a
+// session-scoped custom GUC across a multi-statement simple query, which
+// is exactly the path isolation session setup blocks use.
+func TestSyntax_Select_CurrentSetting(t *testing.T) {
+	c := newCluster(t, "syntax_sel_current_setting")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	rows := runSQL(t, c, "SET spec.session = 1; SELECT current_setting('spec.session')")
+	if len(rows) != 1 || len(rows[0]) != 1 || rows[0][0] != "1" {
+		t.Fatalf("SET+current_setting(spec.session) = %v, want [[1]]", rows)
+	}
+}
+
+func TestSyntax_Select_SQLFunction(t *testing.T) {
+	c := newCluster(t, "syntax_sel_sql_function")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	runSQL(t, c, "CREATE FUNCTION sql_answer() RETURNS int LANGUAGE SQL AS $$ SELECT 42 $$")
+	rows := runSQL(t, c, "SELECT sql_answer()")
+	if len(rows) != 1 || len(rows[0]) != 1 || rows[0][0] != "42" {
+		t.Fatalf("SELECT sql_answer() = %v, want [[42]]", rows)
+	}
+	runSQL(t, c, "DROP FUNCTION sql_answer")
+}
+
+func TestSyntax_Select_StringAggGenerateSeries(t *testing.T) {
+	c := newCluster(t, "syntax_sel_string_agg")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	rows := runSQL(t, c, "SELECT string_agg(encode(sha256(g::text::bytea), 'hex'), '')::text FROM generate_series(1, 3) g")
+	if len(rows) != 1 || len(rows[0]) != 1 {
+		t.Fatalf("SELECT string_agg(...) rows = %v, want one scalar row", rows)
+	}
+}
+
 // TestSyntax_Select_Join exercises JOIN operations.
 func TestSyntax_Select_Join(t *testing.T) {
 	c := newCluster(t, "syntax_sel_join")

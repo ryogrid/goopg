@@ -318,6 +318,35 @@ func (m *Manager) Extend(rel RelFileNode, buf []byte) (BlockNumber, error) {
 	return f.extend(buf)
 }
 
+// ExtendBatch appends n contiguous new blocks (each filled with buf) and
+// returns the block number of the first new block; subsequent blocks
+// occupy firstBlk+1 .. firstBlk+n-1. One smgr-level lock and one WriteAt
+// covers the whole batch.
+//
+// FSM bookkeeping for the new blocks is the caller's responsibility — the
+// heap-insert path documented in
+// `docs/design/perf-optimize/07-wal-fsm-insert.md` §3 registers blocks
+// firstBlk+1 .. firstBlk+n-1 in FSM and uses firstBlk for its own insert.
+func (m *Manager) ExtendBatch(rel RelFileNode, buf []byte, n int) (BlockNumber, error) {
+	if n <= 0 {
+		return InvalidBlockNumber, fmt.Errorf("ExtendBatch: n=%d must be > 0", n)
+	}
+	if len(buf) != BlockSize {
+		return InvalidBlockNumber, fmt.Errorf("ExtendBatch: buf is %d bytes, want %d", len(buf), BlockSize)
+	}
+	if m.OnExtendWait != nil {
+		m.OnExtendWait()
+	}
+	if m.OnExtendDone != nil {
+		defer m.OnExtendDone()
+	}
+	f, err := m.relFile(rel)
+	if err != nil {
+		return InvalidBlockNumber, err
+	}
+	return f.extendBatch(buf, n)
+}
+
 // NBlocks returns the current size of rel in blocks.
 func (m *Manager) NBlocks(rel RelFileNode) (BlockNumber, error) {
 	f, err := m.relFile(rel)
@@ -540,6 +569,40 @@ func (r *relFile) extend(buf []byte) (BlockNumber, error) {
 	}
 	r.nblocks++
 	return blk, nil
+}
+
+// extendBatch appends n copies of buf as contiguous new blocks at the end
+// of the relation in a single locked WriteAt. Returns the block number of
+// the first new block; the remaining blocks occupy firstBlk+1 .. firstBlk+n-1.
+// buf must be exactly BlockSize bytes (the same initialized page content is
+// written for every block — the heap-insert caller relies on FSM to allocate
+// tuples into these pages on subsequent inserts).
+func (r *relFile) extendBatch(buf []byte, n int) (BlockNumber, error) {
+	if n <= 0 {
+		return InvalidBlockNumber, fmt.Errorf("extendBatch: n=%d must be > 0", n)
+	}
+	if len(buf) != BlockSize {
+		return InvalidBlockNumber, fmt.Errorf("extendBatch: buf is %d bytes, want %d", len(buf), BlockSize)
+	}
+	// Build the batched write buffer once: n copies of the empty page.
+	// Typical n=8 → 64 KiB; large bulk-insert callers may pass more.
+	big := make([]byte, n*BlockSize)
+	for i := 0; i < n; i++ {
+		copy(big[i*BlockSize:(i+1)*BlockSize], buf)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	first := r.nblocks
+	off := int64(first) * BlockSize
+	w, err := r.f.WriteAt(big, off)
+	if err != nil {
+		return InvalidBlockNumber, fmt.Errorf("extendBatch %s: %w", r.path, err)
+	}
+	if w != len(big) {
+		return InvalidBlockNumber, fmt.Errorf("extendBatch %s: short %d of %d", r.path, w, len(big))
+	}
+	r.nblocks += BlockNumber(n)
+	return first, nil
 }
 
 func (r *relFile) nBlocks() BlockNumber {

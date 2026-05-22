@@ -1,6 +1,6 @@
 # Bootstrap & Standby-Startup Procedure for goopg
 
-**Status:** draft
+**Status:** accepted
 **Date:** 2026-05-19
 **Milestone:** M0106 (PG Relcache Init File Compatibility) and follow-ups
 **Audience:** Claude Code (coding agent) implementing the remaining

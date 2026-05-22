@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,10 @@ const (
 	// blockDetectWait is how long a step must run before we assume it is
 	// blocked waiting for a lock.
 	blockDetectWait = 300 * time.Millisecond
+	// postStepDrainWait is how long we wait after a regular step completes for
+	// recently unblocked pending steps to either finish or emit follow-up
+	// notices before advancing to the next regular step.
+	postStepDrainWait = 200 * time.Millisecond
 	// drainWindow is how long we wait for a pending (blocked) step to
 	// unblock after all steps in a permutation have been submitted.
 	drainWindow = 5 * time.Second
@@ -34,11 +39,12 @@ type stepOutcome struct {
 // pendingStep tracks a step goroutine that has been submitted but has not yet
 // completed (i.e., is blocked on a lock).
 type pendingStep struct {
-	name    string
-	sql     string
-	session string // which session this step belongs to
-	outCh   chan stepOutcome
-	queue   *sessionNoticeQueue // nil for non-blocking steps; set for blocked steps
+	name     string
+	sql      string
+	session  string // which session this step belongs to
+	outCh    chan stepOutcome
+	queue    *sessionNoticeQueue // nil for non-blocking steps; set for blocked steps
+	cancelFn context.CancelFunc  // cancels this step's context; nil for non-blocking steps
 }
 
 // IsolationRunner executes an IsolationSpec against a live database.
@@ -72,12 +78,19 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 	}
 
 	// Print "unused step name: X" for any declared step not in any permutation,
-	// in definition order. Matches PostgreSQL isolationtester.c output. M0100-0005.
-	var sb strings.Builder
+	// in alphabetical order. PostgreSQL isolationtester.c outputs them via
+	// a hash table enumerated in sorted order (not definition order).
+	// M0100-0005 (eval-plan-qual-trigger has s3_del_a before s3_r).
+	var unusedNames []string
 	for _, sname := range spec.StepOrder {
 		if !usedSteps[sname] {
-			fmt.Fprintf(&sb, "unused step name: %s\n", sname)
+			unusedNames = append(unusedNames, sname)
 		}
+	}
+	sort.Strings(unusedNames)
+	var sb strings.Builder
+	for _, sname := range unusedNames {
+		fmt.Fprintf(&sb, "unused step name: %s\n", sname)
 	}
 	fmt.Fprintf(&sb, "Parsed test spec with %d sessions\n", nSessions)
 
@@ -187,9 +200,45 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		}
 		conns[sname] = conn
 	}
+	// activeSteps tracks the cancel function and result channel for the
+	// most recently launched goroutine on each session's connection. The
+	// deferred cleanup cancels outstanding goroutines and closes
+	// connections without blocking — if a goroutine is stuck in IO wait
+	// (e.g. lib/pq doesn't interrupt pending reads on context cancel),
+	// we close the connections in a background goroutine so the
+	// permutation loop can advance to teardown.
+	type activeStep struct {
+		cancel context.CancelFunc
+		outCh  chan stepOutcome
+	}
+	activeSteps := make(map[string]*activeStep, len(sessionNames))
 	defer func() {
+		// Cancel all outstanding step goroutines.
+		for _, a := range activeSteps {
+			if a != nil && a.cancel != nil {
+				a.cancel()
+			}
+		}
+		// Close connections in a background goroutine with a 3-second
+		// deadline. If a goroutine is stuck in IO wait (lib/pq pending
+		// read) the Close() will block; the background goroutine lets
+		// us time-bound that wait so the permutation loop can proceed.
+		closeDone := make(chan struct{})
+		connsCopy := make([]*sql.Conn, 0, len(conns))
 		for _, c := range conns {
-			_ = c.Close()
+			connsCopy = append(connsCopy, c)
+		}
+		go func() {
+			for _, c := range connsCopy {
+				_ = c.Close()
+			}
+			close(closeDone)
+		}()
+		select {
+		case <-closeDone:
+		case <-time.After(3 * time.Second):
+			// Connection close timed out; background goroutine will
+			// eventually finish when the server-side query completes.
 		}
 	}()
 
@@ -228,6 +277,12 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		// step to the same session. Each session connection can only
 		// process one query at a time; running a second query on a busy
 		// connection would block indefinitely.
+		//
+		// When the drainWindow expires, we cancel the pending goroutine's
+		// context (causing conn.QueryContext to return) and drain the
+		// goroutine result before reusing the connection. Without this,
+		// sending the next step while the previous goroutine still holds
+		// the connection causes a lib/pq RWMutex deadlock.
 		for i, p := range pending {
 			if p.session == step.Session {
 				select {
@@ -239,6 +294,20 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 					pending = append(pending[:i], pending[i+1:]...)
 				case <-time.After(drainWindow):
 					fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
+					// Cancel the goroutine's context so conn.QueryContext
+					// returns promptly (lib/pq sends a CancelRequest),
+					// freeing the connection before we reuse it.
+					if p.cancelFn != nil {
+						p.cancelFn()
+						// Drain the goroutine with a short timeout. If the
+						// CancelRequest doesn't propagate within 2s, proceed
+						// anyway; the old goroutine may still be running but
+						// the context cancellation will eventually unblock it.
+						select {
+						case <-p.outCh:
+						case <-time.After(2 * time.Second):
+						}
+					}
 					pending = append(pending[:i], pending[i+1:]...)
 				}
 				break
@@ -247,12 +316,21 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 
 		outCh := make(chan stepOutcome, 1)
 		q := sessionQueues[step.Session]
-		go func(c *sql.Conn, sqlText, sess string, queue *sessionNoticeQueue, ch chan<- stepOutcome) {
-			ch <- execStepFromQueue(ctx, c, sqlText, sess, queue)
-		}(conn, step.SQL, step.Session, q, outCh)
+		// Use a per-step cancellable context so timed-out goroutines can
+		// be promptly cancelled rather than holding the connection open.
+		stepCtx, stepCancel := context.WithCancel(ctx)
+		// Register the cancel so the deferred cleanup can cancel any
+		// still-running goroutine before closing the connection.
+		activeSteps[step.Session] = &activeStep{cancel: stepCancel, outCh: outCh}
+		go func(sctx context.Context, c *sql.Conn, sqlText, sess string, queue *sessionNoticeQueue, ch chan<- stepOutcome) {
+			ch <- execStepFromQueue(sctx, c, sqlText, sess, queue)
+		}(stepCtx, conn, step.SQL, step.Session, q, outCh)
 
 		select {
 		case outcome := <-outCh:
+			// Step completed immediately — release its context.
+			stepCancel()
+			activeSteps[step.Session] = nil
 			// Drain notices generated during this non-blocking step.
 			if q != nil {
 				outcome.notices = q.drain()
@@ -261,7 +339,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			// window to complete (matching PostgreSQL isolationtester order:
 			// unblocked waiting steps appear before the next regular step).
 			sb.WriteString(formatStepOutput(step.Name, step.SQL, outcome, false))
-			pending = drainWithTimeout(&sb, pending, 50*time.Millisecond)
+			pending = drainWithTimeout(&sb, pending, postStepDrainWait)
 
 		case <-time.After(blockDetectWait):
 			// Step appears blocked.  Drain notices that arrived before the
@@ -283,7 +361,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			// leading newline in step.SQL, which renders as `step name: \n
 			// <body> <waiting ...>` — same single format.
 			sb.WriteString(formatWaitingStepHeader(step.Name, step.SQL))
-			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh, queue: q})
+			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh, queue: q, cancelFn: stepCancel})
 		}
 	}
 
@@ -293,12 +371,22 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		pending = pending[1:]
 		select {
 		case outcome := <-p.outCh:
+			if p.cancelFn != nil {
+				p.cancelFn()
+			}
 			if p.queue != nil {
 				outcome.notices = p.queue.drain()
 			}
 			writeCompletedStep(&sb, p.name, p.sql, outcome)
 		case <-time.After(drainWindow):
 			fmt.Fprintf(&sb, "step %s: <... timed out waiting>\n", p.name)
+			if p.cancelFn != nil {
+				p.cancelFn()
+				select {
+				case <-p.outCh:
+				case <-time.After(2 * time.Second):
+				}
+			}
 		}
 	}
 
@@ -333,6 +421,15 @@ func writeCompletedStep(sb *strings.Builder, name, sql string, o stepOutcome) {
 	}, true))
 }
 
+func drainPendingStepNotices(sb *strings.Builder, p pendingStep) {
+	if p.queue == nil || p.session == "" {
+		return
+	}
+	for _, notice := range p.queue.drain() {
+		fmt.Fprintf(sb, "%s: NOTICE:  %s\n", p.session, notice)
+	}
+}
+
 // drainCompleted checks each pending step non-blockingly; completed results
 // are appended to sb and removed from the returned slice.
 func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
@@ -345,6 +442,7 @@ func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
 			}
 			writeCompletedStep(sb, p.name, p.sql, o)
 		default:
+			drainPendingStepNotices(sb, p)
 			remaining = append(remaining, p)
 		}
 	}
@@ -362,11 +460,15 @@ func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Du
 	for _, p := range pending {
 		select {
 		case o := <-p.outCh:
+			if p.cancelFn != nil {
+				p.cancelFn()
+			}
 			if p.queue != nil {
 				o.notices = p.queue.drain()
 			}
 			writeCompletedStep(sb, p.name, p.sql, o)
 		case <-time.After(window):
+			drainPendingStepNotices(sb, p)
 			remaining = append(remaining, p)
 		}
 	}
@@ -375,14 +477,15 @@ func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Du
 
 // execStepFromQueue executes sqlText on conn and attaches any NOTICE messages
 // collected in queue (populated by the session's connector notice handler).
-func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session string, queue *sessionNoticeQueue) stepOutcome {
-	if queue != nil {
-		queue.drain() // clear any stale notices from previous steps
-	}
+func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session string, _ *sessionNoticeQueue) stepOutcome {
+	// Do NOT drain the notice queue here. With inline NoticeFlush, notices
+	// from a concurrent pending step (e.g. wnested2's re-evaluation after c1
+	// commits) may already be in the queue when a later step on the same
+	// session (e.g. c2) starts. Draining here would discard those notices
+	// before the main goroutine can assign them to the correct pending step's
+	// output. The main goroutine is responsible for all queue drains at the
+	// correct moments. M0100-0005 (eval-plan-qual inline-notice race).
 	o := execStep(ctx, conn, sqlText, "")
-	// Notices are drained by the main goroutine so that pre-wait notices
-	// (generated before a row-level wait) and post-wait notices (from EPQ
-	// recheck) can be printed at the correct positions in the output.
 	o.session = session
 	return o
 }
@@ -707,6 +810,9 @@ func (r *IsolationRunner) RunAndCompare(ctx context.Context, repoRoot string, sp
 		return IsolationSpecResult{SpecPath: specRelPath, Status: "defer",
 			Diff: fmt.Sprintf("run error: %v", err)}
 	}
+
+	// Debug: write actual output to a temp file for analysis.
+	_ = os.WriteFile("/tmp/iso_actual_out.txt", []byte(normalizeIsoOutput(actual)), 0644)
 
 	if normalizeIsoOutput(actual) == normalizeIsoOutput(string(expectedBytes)) {
 		return IsolationSpecResult{SpecPath: specRelPath, Status: "pass"}

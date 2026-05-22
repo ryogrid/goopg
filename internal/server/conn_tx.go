@@ -25,6 +25,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 )
 
@@ -33,8 +34,17 @@ import (
 type connTxState struct {
 	mu          sync.Mutex
 	active      bool
+	failed      bool              // 25P02: in_failed_sql_transaction
 	tx          mvcc.Transaction
 	sess        *executor.BasicSession // session state, non-nil when active
+	// SessCtx is the per-connection session-level mctx (M0107-0001).
+	// Wired by serveConn after creating the session context; stmt-level
+	// contexts are acquired as children in dispatchSimpleQueryViaExecutor.
+	SessCtx *mctx.Context
+	// ProcNum is the backend's slot index in the Manager's ProcArray.
+	// Assigned once at connection start in serveConn; used to pass an
+	// explicit procNum to Manager.Begin on every statement.
+	ProcNum int32
 	// TempTableShadows maps table name → original permanent *catalog.Table.
 	// Populated when CREATE TEMP TABLE shadows a permanent table. M0097-0003.
 	TempTableShadows map[string]*catalog.Table
@@ -46,9 +56,25 @@ type connTxState struct {
 // Begin marks an explicit transaction as active. tx is the TxnMgr
 // transaction that was just started; sess is the session state object
 // that tracks isolation level, savepoints, etc.
+// Fail marks the current explicit transaction as failed (25P02). Subsequent
+// statements are rejected until COMMIT or ROLLBACK clears the state.
+func (c *connTxState) Fail() {
+	c.mu.Lock()
+	c.failed = true
+	c.mu.Unlock()
+}
+
+// IsFailed reports whether the transaction is in the failed state (25P02).
+func (c *connTxState) IsFailed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failed
+}
+
 func (c *connTxState) Begin(tx mvcc.Transaction) {
 	c.mu.Lock()
 	c.active = true
+	c.failed = false
 	c.tx = tx
 	if c.sess == nil {
 		c.sess = executor.NewBasicSession()
@@ -96,9 +122,11 @@ func (c *connTxState) Session() *executor.BasicSession {
 func (c *connTxState) End() {
 	c.mu.Lock()
 	if c.sess != nil {
+		executor.ReleaseAdvisoryTransactionLocks(c.sess)
 		c.sess.EndExplicitTransaction()
 	}
 	c.active = false
+	c.failed = false
 	c.tx = mvcc.Transaction{}
 	c.mu.Unlock()
 }

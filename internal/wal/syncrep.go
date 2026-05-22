@@ -231,6 +231,29 @@ func (s *SyncRep) StandbyProgress(appName string) (write, flush, apply uint64) {
 	return p.WriteLSN, p.FlushLSN, p.ApplyLSN
 }
 
+// SyncStateFor returns the pg_stat_replication.sync_state string ("sync",
+// "potential", or "async") for the standby identified by appName. Called by
+// the pg_stat_replication virtual view row-builder.
+func (s *SyncRep) SyncStateFor(appName string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rule.empty() {
+		return "async"
+	}
+	return s.rule.syncStateFor(appName)
+}
+
+// SyncPriorityFor returns the pg_stat_replication.sync_priority integer for
+// the standby identified by appName (0 for async standbys).
+func (s *SyncRep) SyncPriorityFor(appName string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rule.empty() {
+		return 0
+	}
+	return s.rule.syncPriorityFor(appName)
+}
+
 // releaseWaitersLocked walks the waiter list and closes the release channel
 // for every waiter whose target LSN ≤ the rule's "enough" LSN at the
 // waiter's mode. Caller must hold s.mu.
@@ -342,4 +365,52 @@ func (r syncRepRule) satisfied(standbys map[string]standbyProgress, targetLSN ui
 		return vals[r.count-1] >= targetLSN
 	}
 	return true
+}
+
+// syncStateFor returns the pg_stat_replication.sync_state string for the
+// given application_name: "sync", "potential", or "async".
+//
+//   - FIRST n: names[0..n-1] are "sync"; names[n..] are "potential".
+//   - ANY n: all listed names are "sync" (any can fulfil the quorum).
+//   - Off / empty: all are "async".
+func (r syncRepRule) syncStateFor(appName string) string {
+	switch r.mode {
+	case syncRepRuleFirst:
+		for i, name := range r.names {
+			if name == appName {
+				if i < r.count {
+					return "sync"
+				}
+				return "potential"
+			}
+		}
+	case syncRepRuleAny:
+		for _, name := range r.names {
+			if name == appName {
+				return "sync"
+			}
+		}
+	}
+	return "async"
+}
+
+// syncPriorityFor returns the pg_stat_replication.sync_priority integer for
+// the given application_name (1-indexed position for FIRST, 1 for any listed
+// standby in ANY mode, 0 if not in the rule).
+func (r syncRepRule) syncPriorityFor(appName string) int {
+	switch r.mode {
+	case syncRepRuleFirst:
+		for i, name := range r.names {
+			if name == appName {
+				return i + 1
+			}
+		}
+	case syncRepRuleAny:
+		for _, name := range r.names {
+			if name == appName {
+				return 1
+			}
+		}
+	}
+	return 0
 }

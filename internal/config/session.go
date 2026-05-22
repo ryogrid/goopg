@@ -17,6 +17,7 @@ type SessionRegistry struct {
 	global  *Registry
 	session map[string]string // session-scoped values, canonicalised
 	local   map[string]string // transaction-scoped values, canonicalised
+	custom  map[string]*Variable
 	inTx    bool
 
 	// onReportableChange, if non-nil, is called whenever a Report-flagged
@@ -32,6 +33,7 @@ func NewSessionRegistry(global *Registry) *SessionRegistry {
 		global:  global,
 		session: map[string]string{},
 		local:   map[string]string{},
+		custom:  map[string]*Variable{},
 	}
 }
 
@@ -44,7 +46,7 @@ func (s *SessionRegistry) SetReportableHook(fn func(name, value string)) {
 // Get returns the (variable, effective-value, ok) triple. The variable
 // pointer is the global registry entry — callers should not mutate it.
 func (s *SessionRegistry) Get(name string) (*Variable, string, bool) {
-	v, ok := s.global.Get(name)
+	v, ok := s.lookupVariable(name)
 	if !ok {
 		return nil, "", false
 	}
@@ -62,9 +64,20 @@ func (s *SessionRegistry) Get(name string) (*Variable, string, bool) {
 // the variable doesn't exist, the value fails validation, or the
 // variable's Context forbids SQL-driven changes.
 func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
-	v, ok := s.global.Get(name)
+	v, ok := s.lookupVariable(name)
 	if !ok {
-		return fmt.Errorf("unrecognized configuration parameter %q", name)
+		if !isCustomGUCName(name) {
+			return fmt.Errorf("unrecognized configuration parameter %q", name)
+		}
+		v = NewVariable(Variable{
+			Name:    name,
+			Type:    TypeString,
+			BootVal: "",
+			Context: ContextUserset,
+			Scope:   ScopeSession | ScopeTransaction,
+			Flags:   FlagCustom | FlagDisallowInFile | FlagNotInSample,
+		})
+		s.custom[strings.ToLower(name)] = v
 	}
 	if v.Context < ContextSuset {
 		// Postmaster / SigHup / Internal contexts cannot be SET.
@@ -106,7 +119,7 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 // Reset drops session and transaction overrides for the named variable
 // so it falls through to the global value.
 func (s *SessionRegistry) Reset(name string) error {
-	v, ok := s.global.Get(name)
+	v, ok := s.lookupVariable(name)
 	if !ok {
 		return fmt.Errorf("unrecognized configuration parameter %q", name)
 	}
@@ -120,6 +133,41 @@ func (s *SessionRegistry) Reset(name string) error {
 	// callback for the post-Reset value (which is the global default).
 	s.global.invokeOnChange(v.Name, v.Value)
 	return nil
+}
+
+func (s *SessionRegistry) lookupVariable(name string) (*Variable, bool) {
+	if s == nil {
+		return nil, false
+	}
+	if v, ok := s.global.Get(name); ok {
+		return v, true
+	}
+	v, ok := s.custom[strings.ToLower(name)]
+	return v, ok
+}
+
+func isCustomGUCName(name string) bool {
+	parts := strings.Split(name, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for i := 0; i < len(part); i++ {
+			ch := part[i]
+			switch {
+			case ch >= 'a' && ch <= 'z':
+			case ch >= 'A' && ch <= 'Z':
+			case ch == '_':
+			case i > 0 && ch >= '0' && ch <= '9':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ResetAll resets every session-scoped and transaction-scoped override.

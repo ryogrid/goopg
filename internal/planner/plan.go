@@ -665,6 +665,36 @@ type CTEScan struct {
 	schema Schema
 }
 
+
+// CTEDMLPrefix executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
+// before the outer query. DMls are executed in order; each plan's RETURNING
+// rows are collected into ctx.MaterializedCTEs[Names[i]] for CTEScan
+// (IsDML=true) consumers.
+type CTEDMLPrefix struct {
+	pos   int
+	Names []string // CTE name for each DML plan
+	DMls  []Node   // DML plans to execute first
+	Body  Node     // outer query plan
+}
+
+func (n *CTEDMLPrefix) Pos() int      { return n.pos }
+func (n *CTEDMLPrefix) nodeTag()      {}
+func (n *CTEDMLPrefix) Output() Schema { return n.Body.Output() }
+
+// MaterializedCTEScan reads rows from a pre-executed DML CTE stored in
+// ctx.MaterializedCTEs[Name]. Used when a DML CTE body's RETURNING rows
+// are consumed by the outer SELECT.
+type MaterializedCTEScan struct {
+	pos    int
+	Name   string // CTE name (key into ctx.MaterializedCTEs)
+	Alias  string
+	schema Schema
+}
+
+func (n *MaterializedCTEScan) Pos() int      { return n.pos }
+func (n *MaterializedCTEScan) nodeTag()      {}
+func (n *MaterializedCTEScan) Output() Schema { return n.schema }
+
 func (n *CTEScan) Pos() int       { return n.pos }
 func (n *CTEScan) Output() Schema { return n.schema }
 
@@ -940,8 +970,15 @@ type OnConflictPlan struct {
 	// ArbiterIndex.Columns when ArbiterIndex != nil; nil otherwise.
 	// Useful at runtime so the executor can extract the conflict
 	// key from the inserted-row tuple without re-doing a name
-	// lookup.
+	// lookup. For expression-based index columns, the corresponding
+	// entry is -1 and ArbiterExprs[i] holds the expression to evaluate.
 	ArbiterColumns []int
+
+	// ArbiterExprs is parallel to ArbiterColumns. For expression-based
+	// arbiter columns (ArbiterColumns[i] == -1), ArbiterExprs[i] is the
+	// resolved planner expression to evaluate against the inserted row.
+	// nil for plain column-reference arbiter columns.
+	ArbiterExprs []Expr
 
 	// UpdateSet is parallel to Table.Columns: nil means "leave the
 	// existing value alone", non-nil is an Expr to evaluate
@@ -1018,15 +1055,17 @@ type MergeWhenClause struct {
 // Merge is the plan node for MERGE INTO target USING source ON cond WHEN ….
 // Source is the planned USING clause. Target is the merge-target table.
 type Merge struct {
-	pos     int
-	Target  *catalog.Table
-	Source  Node            // USING clause scan
-	On      Expr            // join condition (source cols at offset len(Target.Columns))
-	Clauses []*MergeWhenClause
+	pos             int
+	Target          *catalog.Table
+	Source          Node            // USING clause scan
+	On              Expr            // join condition (source cols at offset len(Target.Columns))
+	Clauses         []*MergeWhenClause
+	Returning       []Expr          // RETURNING expressions (nil if absent)
+	ReturningSchema Schema          // output schema when Returning != nil
 }
 
 func (n *Merge) Pos() int       { return n.pos }
-func (n *Merge) Output() Schema { return nil }
+func (n *Merge) Output() Schema { return n.ReturningSchema }
 
 // DDL — passes the original parser DDL statement through to the
 // executor's DDL path. The planner doesn't decompose DDL further in
@@ -1069,7 +1108,19 @@ type Utility struct {
 }
 
 func (n *Utility) Pos() int       { return n.pos }
-func (n *Utility) Output() Schema { return nil }
+func (n *Utility) Output() Schema {
+	switch stmt := n.Stmt.(type) {
+	case *parser.ShowStmt:
+		if stmt.All {
+			return Schema{
+				{Name: "name", Type: catalog.Type{Name: "text"}},
+				{Name: "setting", Type: catalog.Type{Name: "text"}},
+			}
+		}
+		return Schema{{Name: stmt.Name, Type: catalog.Type{Name: "text"}}}
+	}
+	return nil
+}
 
 // Checkpoint — `CHECKPOINT`. Distinct from Utility because it has
 // real side-effects (synchronous flush + WAL marker), wired through

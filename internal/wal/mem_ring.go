@@ -2,7 +2,8 @@ package wal
 
 import (
 	"sync"
-	"sync/atomic"
+
+	"github.com/goopg/goopg/internal/stats"
 )
 
 // MemRing is the bounded in-memory mirror of recently-written WAL
@@ -45,9 +46,13 @@ type MemRing struct {
 	// hits / misses are observability counters surfaced via
 	// Hits()/Misses() so M0010-0003's `pg_stat_wal_io` /
 	// `pg_stat_replication.send_buffer_*` surface can read them
-	// without taking the mutex. Atomic loads / stores by design.
-	hits   atomic.Uint64
-	misses atomic.Uint64
+	// without taking the mutex. Per-P sharded via stats.Counter
+	// so concurrent walsender ReadAt callers (one goroutine per
+	// active replication connection) don't contend on a single
+	// cache line — eliminates cross-core invalidation on the
+	// streaming hot path. See M0107-0008 loop 8.
+	hits   stats.Counter
+	misses stats.Counter
 }
 
 // NewMemRing constructs a ring with the given capacity in bytes.
@@ -71,6 +76,21 @@ func (r *MemRing) Cap() int64 {
 		return 0
 	}
 	return r.cap
+}
+
+// ResetToPos sets head = tail = pos under the write lock, making the ring
+// appear empty at the given LSN anchor. ReadAt will return false for any
+// position before pos, and new Append/WriteReserved calls fill the ring
+// starting from pos. Called from loadState to prevent the ring from serving
+// zeros for WAL positions written to disk by a prior run (e.g. initdb).
+func (r *MemRing) ResetToPos(pos int64) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.head = pos
+	r.tail = pos
+	r.mu.Unlock()
 }
 
 // Append captures len(data) bytes at byte position pos. pos must
@@ -207,7 +227,7 @@ func (r *MemRing) Hits() uint64 {
 	if r == nil {
 		return 0
 	}
-	return r.hits.Load()
+	return uint64(r.hits.Sum())
 }
 
 // Misses returns the lifetime miss counter. M0010-0003's
@@ -216,5 +236,5 @@ func (r *MemRing) Misses() uint64 {
 	if r == nil {
 		return 0
 	}
-	return r.misses.Load()
+	return uint64(r.misses.Sum())
 }

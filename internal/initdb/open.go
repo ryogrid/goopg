@@ -16,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/aio"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
@@ -213,11 +214,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		DataDir: abs,
 	})
 
-	// Activity registry (M0022): must be created early so WAL writer,
-	// AIO engine, and Manager hooks can register their goroutines via
-	// activity.RegisterCurrentGoroutine. The pg_stat_activity virtual
-	// view is registered later, after the catalog is fully set up.
-	act := activity.NewRegistry()
+	// Activity registry (M0022 / M0107-0005): per-backend slot array with
+	// atomic WaitEventStart/WaitEventEnd.  Background workers (WAL writer,
+	// etc.) are assigned slots in the background-worker range above the
+	// regular backend range.
+	act := activity.NewActivityRegistry(mvcc.DefaultProcArraySize)
+	// Pre-register the WAL writer background slot so the OnWALWrite closure
+	// can call WaitEventStart(walProcNum, ...) without a goroutine map lookup.
+	walProcNum := act.RegisterBackground(activity.WalWriterIdx, &activity.Backend{
+		PID:         "wal-writer-0",
+		BackendType: "walwriter",
+		State:       "active",
+	})
 
 	// AIO engine: optional. With opts.AIOMethod=="" no engine is
 	// constructed and storage Manager.PrefetchBlock falls back to
@@ -305,23 +313,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		SystemID:    systemID,
 		TimelineID:  tli,
 		OnLoopStart: func() {
-			pid := "wal-writer-0"
-			act.Register(&activity.Backend{
-				PID:         pid,
-				BackendType: "walwriter",
-				State:       "active",
-			})
-			activity.RegisterCurrentGoroutine(act, pid)
+			// Register this goroutine so pool/AIO hooks can find procNum
+			// via LookupCurrentGoroutine (M0107-0005).
+			activity.SetCurrentGoroutine(act, walProcNum)
 		},
 		OnLoopEnd: func() {
 			activity.ClearCurrentGoroutine()
 		},
-		// M0091-0001: OnWALWrite always runs on the WAL writer
-		// goroutine, so we can closure-capture `act` and the
-		// literal PID. No runtime.Stack on the hot path.
+		// M0107-0005: closure-captures walProcNum (int32) for the atomic
+		// hot path; no goroutine map lookup and no mutex.
 		OnWALWrite: func() {
 			if act != nil {
-				act.WaitEventStart("wal-writer-0", activity.WaitTypeIO, activity.WaitWALWrite)
+				act.WaitEventStart(walProcNum, activity.WaitTypeIO, activity.WaitWALWrite)
 			}
 		},
 	}
@@ -569,14 +572,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// TrackIOTiming. Default off — saves the per-Pin
 	// runtime.Stack lookup on the hot read path.
 	if opts.TrackIOTiming {
+		// M0107-0005: use LookupCurrentGoroutine (procNum) instead of
+		// LookupGoroutine (Registry+pid) so WaitEventStart is atomic.
 		pool.OnPinWait = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeBufferPin, activity.WaitBufferPin)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeBufferPin, activity.WaitBufferPin)
 			}
 		}
 		pool.OnPinDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
 			}
 		}
 	}
@@ -589,11 +594,11 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// "autovacuum" nor "" (unregistered / Pool.Close), we panic with a
 	// clear message so the invariant violation surfaces immediately in dev.
 	pool.OnFlushAll = func() {
-		reg, pid := activity.LookupGoroutine()
-		if reg == nil {
+		reg, procNum, ok := activity.LookupCurrentGoroutine()
+		if !ok {
 			return // unregistered goroutine — Pool.Close or tests, OK
 		}
-		bt := reg.GetBackendType(pid)
+		bt := reg.GetBackendType(procNum)
 		switch bt {
 		case "checkpointer", "autovacuum", "walwriter", "":
 			// expected callers
@@ -755,6 +760,24 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// M0106-0013: advance the catalog OID counter to match pg_control's
+	// checkPointCopy.nextOid from the most recent checkpoint. This ensures
+	// the OID counter survives a crash (pg_control is durably updated at
+	// every checkpoint) even when pg_catalog.json is absent or stale.
+	// We take the max of the JSON-loaded value and the pg_control value
+	// so both sources contribute to a monotonically advancing counter.
+	if pgCtrl, pce := control.ReadControlFile(abs); pce == nil && pgCtrl != nil {
+		cat.AdvanceNextOIDPast(pgCtrl.CheckPointCopyNextOid)
+		// M0106-0013: also advance txnMgr.NextXID from the checkpoint's
+		// nextXid so snapshots taken after restart have Xmax >= the
+		// last-checkpointed NextXID. The low 32 bits of the FullTransactionId
+		// field hold the raw XID (epoch is in the high 32 bits; epoch ≠ 0
+		// is not yet used in goopg v0).
+		if pgCtrl.CheckPointCopyNextXid != 0 {
+			checkpointNextXid := storage.TransactionID(uint32(pgCtrl.CheckPointCopyNextXid))
+			txnMgr.SetNextXID(checkpointNextXid)
+		}
+	}
 	cat.SetDBOID(detectCatalogDBOID(abs))
 	// Upgrade path: if the clog is empty (old cluster started before M0030-0007
 	// landed), initialize all prior XIDs as committed so loadUserTablesFromHeap
@@ -801,6 +824,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			return nil, fmt.Errorf("goopg: clog implicit-abort sweep: %w", aerr)
 		}
 	}
+	// M0106-0013: advance NextXID past the highest committed/aborted XID
+	// recorded in the clog (loaded from SLRU above via EnablePGSLRUMirror
+	// or stamped by replayCLogFromWAL below). This ensures that any
+	// snapshot taken by the first post-restart session has Xmax large
+	// enough to see all pre-crash committed rows — even when the catalog
+	// heap (highestCatalogXID) only covers DDL transactions and not
+	// user-table INSERT XIDs.
+	if highClogXID := clog.HighestKnownXID(); highClogXID > 0 {
+		txnMgr.SetNextXID(highClogXID + 1)
+	}
 	// One-shot migration: if this is a legacy JSON-only cluster whose
 	// pg_class has no user-table rows, write all in-memory user tables to
 	// the pg_class/pg_attribute heap relfiles so future startups use the
@@ -836,6 +869,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: user table heap load: %w", err)
 	}
 
+	// M0106-0013: after loading user tables from heap, advance the OID
+	// counter past every OID seen in the heap pages. This ensures the
+	// counter never re-uses an OID already present on disk even when
+	// pg_catalog.json is absent (e.g. after a crash before SaveCatalog
+	// ran). The pg_control read earlier covers the checkpoint-based
+	// advance; this covers the residual gap between the last checkpoint
+	// and the crash.
+	for _, tbl := range cat.AllTables() {
+		if tbl.OID >= catalog.FirstUserOID {
+			cat.AdvanceNextOIDPast(tbl.OID)
+		}
+	}
+
 	// M0054-0001: replay CREATE/DROP DATABASE WAL records into the
 	// catalog's database registry. Physical WAL replay (line ~212
 	// above) ignored these records because they don't touch on-disk
@@ -867,6 +913,39 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: index DDL replay: %w", err)
 	}
 
+	// M0106-0013: stamp the clog from WAL commit/abort records and advance
+	// txnMgr.NextXID past any XIDs recorded in WAL but not yet in the
+	// SLRU/flat-file (the narrow window between WAL fsync and clog writes).
+	// This is the authoritative clog-from-WAL path that mirrors PG's
+	// StartupXLOG xact_redo_commit behaviour. Non-fatal: physical replay
+	// already succeeded; a clog-stamp failure only affects visibility of
+	// some committed rows, which will surface as a user error rather than
+	// a startup error.
+	if abs != "" {
+		if err := replayCLogFromWAL(filepath.Join(abs, "pg_wal"), clog, txnMgr); err != nil {
+			slog.Default().Warn("replayCLogFromWAL failed", "err", err)
+		}
+		// Re-advance NextXID after replayCLogFromWAL may have stamped more
+		// XIDs into the clog.
+		if highClogXID := clog.HighestKnownXID(); highClogXID > 0 {
+			txnMgr.SetNextXID(highClogXID + 1)
+		}
+	}
+
+	// M0106-0011 follow-up (b): regenerate pg_internal.init files after
+	// WAL recovery completes. Crash recovery replays
+	// RecordKindXactCommitInval records which UNLINK the init files
+	// (mirrors PG's standby-side redo) but does not regenerate them.
+	// Without this, PG standbys that attach via pg_basebackup after a
+	// crash restart would find missing init files until the first DDL
+	// commit. Non-fatal: the PostCheckpointFn hook regenerates on the
+	// next checkpoint as a belt-and-suspenders fallback.
+	if abs != "" {
+		if err := bootstrapRelcacheInitFiles(abs); err != nil {
+			slog.Default().Warn("post-recovery relcache init file regeneration failed", "err", err)
+		}
+	}
+
 	// Replication-slot registry. The retention path on the
 	// checkpointer (wired below in cmd/goopg start once the GUC
 	// values are known) consults this to decide which WAL
@@ -893,9 +972,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	defaultGUC := wal.DefaultGUCParameters()
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{
-		DataDir:     abs,
-		SegmentSize: walCfg.SegmentSize,
-		GUCParams:   defaultGUC,
+		DataDir:             abs,
+		SegmentSize:         walCfg.SegmentSize,
+		GUCParams:           defaultGUC,
+		PGCompatCheckpoints: true,
 		// M0106-0010 batched-45: refresh checkPointCopy.nextXid into
 		// pg_control at every checkpoint from the live mvcc manager.
 		// batched-47: DataDir above was previously unset on the runtime
@@ -906,6 +986,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// after the basebackup hid every user tuple created by goopg
 		// after initdb.
 		NextXIDFn: func() uint64 { return uint64(txnMgr.NextXID()) },
+		// M0106-0013: wire the catalog's OID counter so each checkpoint
+		// embeds the live nextOid into pg_control and the WAL record.
+		// A crashed cluster can then recover nextOid from pg_control
+		// without depending on pg_catalog.json.
+		NextOIDFn: cat.NextOID,
+		// M0106-0011 follow-up (b): regenerate pg_internal.init after
+		// each checkpoint so PG standbys can always attach. Uses
+		// WithRelCacheInitLock to prevent TOCTOU races with concurrent
+		// backend startup reading the init files.
+		PostCheckpointFn: func() error {
+			if abs == "" {
+				return nil
+			}
+			return catalog.WithRelCacheInitLock(func() error {
+				return bootstrapRelcacheInitFiles(abs)
+			})
+		},
 	})
 
 	// Surface the M0002 checkpointer counters as the
@@ -923,7 +1020,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// pg_stat_replication: one row per active walsender. Backed by
 	// the in-process Senders registry — walsender goroutines
 	// register themselves on entry and unregister on exit.
-	if err := registerStatReplicationView(cat, walSenders, walWriter); err != nil {
+	if err := registerStatReplicationView(cat, walSenders, walWriter, syncRep); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
@@ -1038,77 +1135,75 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	}
 
 	// Wire AIO + data-file I/O wait-event hooks so pg_stat_activity
-	// can report blocking reasons. M0092-0005: gated by
-	// TrackIOTiming (default off — saves the per-Read/Write/Sync/
-	// Extend/AIO `runtime.Stack` LookupGoroutine call on the hot
-	// path). Each Wait/Done pair is balanced (M0058-0006).
+	// can report blocking reasons. M0092-0005: gated by TrackIOTiming
+	// (default off). M0107-0005: use LookupCurrentGoroutine (procNum)
+	// for atomic WaitEventStart instead of LookupGoroutine (mutex).
 	if opts.TrackIOTiming {
 		if aioEngine != nil {
 			aioEngine.OnWaitStart = func() {
-				if reg, pid := activity.LookupGoroutine(); reg != nil {
-					reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitAIO)
+				if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+					reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitAIO)
 				}
 			}
 			aioEngine.OnWaitEnd = func() {
-				if reg, pid := activity.LookupGoroutine(); reg != nil {
-					reg.WaitEventEnd(pid)
+				if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+					reg.WaitEventEnd(procNum)
 				}
 			}
 		}
 		mgr.OnReadWait = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileRead)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileRead)
 			}
 		}
 		mgr.OnReadDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
 			}
 		}
 		mgr.OnWriteWait = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileWrite)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 			}
 		}
 		mgr.OnWriteDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
 			}
 		}
 		mgr.OnExtendWait = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileExtend)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
 			}
 		}
 		mgr.OnExtendDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
 			}
 		}
 		mgr.OnSyncWait = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitDataFileSync)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileSync)
 			}
 		}
 		mgr.OnSyncDone = func() {
-			if reg, pid := activity.LookupGoroutine(); reg != nil {
-				reg.WaitEventEnd(pid)
+			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+				reg.WaitEventEnd(procNum)
 			}
 		}
 	}
 
 	// Wire WAL I/O wait-event hooks.
-	// M0091-0001: WAL sync runs on the WAL writer goroutine; use
-	// the captured `act` + literal PID instead of LookupGoroutine.
+	// M0107-0005: capture walProcNum (int32) for atomic WaitEventStart.
 	if walWriter != nil {
 		walWriter.OnWALSync = func() {
 			if act != nil {
-				act.WaitEventStart("wal-writer-0", activity.WaitTypeIO, activity.WaitWALSync)
+				act.WaitEventStart(walProcNum, activity.WaitTypeIO, activity.WaitWALSync)
 			}
 		}
 		walWriter.OnWALSyncDone = func() {
 			if act != nil {
-				act.WaitEventEnd("wal-writer-0")
+				act.WaitEventEnd(walProcNum)
 			}
 		}
 	}
@@ -1959,6 +2054,23 @@ func (r *Runtime) SaveCatalog() error {
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("goopg: rename catalog snapshot: %w", err)
+	}
+	// M0106-0013: also persist nextOid in pg_control so a subsequent
+	// crash-recovery startup can recover the OID counter without relying
+	// on pg_catalog.json alone. This is a belt-and-suspenders write on
+	// top of the checkpoint-time update (NextOIDFn in CheckpointerConfig);
+	// during a clean shutdown the checkpointer may not have fired since
+	// the last OID allocation.
+	if r.DataDir != "" {
+		nextOid := cat.NextOID()
+		if werr := control.UpdateControlFile(r.DataDir, func(cd *control.ControlFileData) {
+			if nextOid > cd.CheckPointCopyNextOid {
+				cd.CheckPointCopyNextOid = nextOid
+			}
+		}); werr != nil {
+			// Non-fatal: the JSON snapshot is already written; log and continue.
+			slog.Warn("SaveCatalog: pg_control nextOid update failed", "err", werr)
+		}
 	}
 	return nil
 }

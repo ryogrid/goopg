@@ -16,6 +16,7 @@ import (
 	"unicode"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
@@ -166,10 +167,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 						return NewStringDatum(tbl.Name), nil
 					}
 				}
-			case KindString, KindStringArena:
+			case KindString:
 				schema, rel := splitQualifiedTable(v.StringValue())
-				if tbl, found := ctx.Catalog.LookupTable(parser.ObjectName{Schema: schema, Name: rel}); found && tbl != nil {
+				objName := parser.ObjectName{Schema: schema, Name: rel}
+				if tbl, found := ctx.Catalog.LookupTable(objName); found && tbl != nil {
 					return NewIntDatum(int64(tbl.OID)), nil
+				}
+				// Also resolve index names: 'idx_name'::regclass returns the index OID.
+				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+					if idx, found := im.LookupIndex(objName); found && idx != nil {
+						return NewIntDatum(int64(idx.OID)), nil
+					}
 				}
 			}
 		}
@@ -314,9 +322,9 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 			return Datum{Kind: KindInt, Int: -d.Int}, nil
 		case KindNumeric:
 			// Negate a numeric/float value. M0097-0003.
-			if d.Big != nil {
-				neg := new(big.Int).Neg(d.Big)
-				return Datum{Kind: KindNumeric, Big: neg, Scale: d.Scale}, nil
+			if d.Flags&flagBigNumeric != 0 {
+				neg := new(big.Int).Neg(d.NumericBigValue())
+				return newBigNumericInCtx(mctx.Perm(), neg, d.Scale), nil
 			}
 			return Datum{Kind: KindNumeric, Int: -d.Int, Scale: d.Scale}, nil
 		default:
@@ -372,12 +380,12 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		// scale-aligning helpers.  Also try to parse string
 		// operands as numeric (columns loaded via INSERT may be
 		// stored as strings before the type system enforces types).
-		if left.Kind == KindString || left.Kind == KindStringArena {
+		if left.Kind == KindString {
 			if m, s, err := parseNumeric(left.StringValue()); err == nil {
 				left = newNumeric(m, int(s))
 			}
 		}
-		if right.Kind == KindString || right.Kind == KindStringArena {
+		if right.Kind == KindString {
 			if m, s, err := parseNumeric(right.StringValue()); err == nil {
 				right = newNumeric(m, int(s))
 			}
@@ -412,7 +420,7 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		}
 		return arithmetic(op, left.Int, right.Int, pos)
 	case parser.OpConcat:
-		if (left.Kind != KindString && left.Kind != KindStringArena) || (right.Kind != KindString && right.Kind != KindStringArena) {
+		if (left.Kind != KindString) || (right.Kind != KindString) {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator || requires string operands"}
 		}
 		return NewStringDatum(left.StringValue() + right.StringValue()), nil
@@ -482,9 +490,9 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 // data.
 func datumAsString(d Datum) (string, bool) {
 	switch d.Kind {
-	case KindString, KindStringArena:
+	case KindString:
 		return d.StringValue(), true
-	case KindBytes, KindBytesArena:
+	case KindBytes:
 		return string(d.BytesValue()), true
 	}
 	return "", false
@@ -604,8 +612,8 @@ func promoteCrossKind(a, b Datum) (Datum, Datum) {
 	}
 	// M0073-0001: treat KindString / KindStringArena uniformly
 	// as "string" for the cross-kind parse-and-compare path.
-	aIsString := a.Kind == KindString || a.Kind == KindStringArena
-	bIsString := b.Kind == KindString || b.Kind == KindStringArena
+	aIsString := a.Kind == KindString
+	bIsString := b.Kind == KindString
 	// One side is string — try to parse it as the other's type.
 	if aIsString && !bIsString {
 		a = tryParseStringAs(b.Kind, a.StringValue())
@@ -675,8 +683,8 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		// Treat KindString ↔ KindStringArena and KindBytes ↔
 		// KindBytesArena as same-kind so the per-kind switch
 		// below dispatches correctly.
-		aIsString := a.Kind == KindString || a.Kind == KindStringArena
-		bIsString := b.Kind == KindString || b.Kind == KindStringArena
+		aIsString := a.Kind == KindString
+		bIsString := b.Kind == KindString
 		if aIsString && bIsString {
 			as, bs := a.StringValue(), b.StringValue()
 			// UUID cross-format comparison: if either looks like a UUID in any format,
@@ -691,8 +699,8 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 			}
 			return strings.Compare(as, bs), nil
 		}
-		aIsBytes := a.Kind == KindBytes || a.Kind == KindBytesArena
-		bIsBytes := b.Kind == KindBytes || b.Kind == KindBytesArena
+		aIsBytes := a.Kind == KindBytes
+		bIsBytes := b.Kind == KindBytes
 		if aIsBytes && bIsBytes {
 			return strings.Compare(string(a.BytesValue()), string(b.BytesValue())), nil
 		}
@@ -718,7 +726,7 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 			return 1, nil
 		}
 		return 0, nil
-	case KindString, KindStringArena:
+	case KindString:
 		as, bs := a.StringValue(), b.StringValue()
 		// UUID cross-format comparison: normalize both if either is a valid UUID. M0097-0003.
 		if isValidUUIDStr(as) || isValidUUIDStr(bs) {
@@ -1052,7 +1060,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		switch d.Kind {
 		case KindBool:
 			return d, nil
-		case KindString, KindStringArena:
+		case KindString:
 			v := strings.TrimSpace(strings.ToLower(d.StringValue()))
 			switch v {
 			case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1":
@@ -1075,7 +1083,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "smallint out of range"}
 			}
 			return d, nil
-		case KindString, KindStringArena:
+		case KindString:
 			n, err := parseIntegerInput(d.StringValue(), "smallint", 16)
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
@@ -1104,7 +1112,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "integer out of range"}
 			}
 			return d, nil
-		case KindString, KindStringArena:
+		case KindString:
 			n, err := parseIntegerInput(d.StringValue(), "integer", 32)
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
@@ -1129,7 +1137,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		switch d.Kind {
 		case KindInt:
 			return d, nil
-		case KindString, KindStringArena:
+		case KindString:
 			n, err := parseIntegerInput(d.StringValue(), "bigint", 64)
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
@@ -1151,7 +1159,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		// name type truncates to NAMEDATALEN-1 = 63 bytes.
 		// For text[] values (e.g. from parse_ident()), truncate each array element. M0097-0003.
 		switch d.Kind {
-		case KindString, KindStringArena:
+		case KindString:
 			s := d.StringValue()
 			// If the value looks like a PostgreSQL array ({elem1,elem2,...}), process as array.
 			if len(s) > 0 && s[0] == '{' && s[len(s)-1] == '}' {
@@ -1180,7 +1188,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return NewStringDatum("false"), nil
 		case KindInt:
 			return NewStringDatum(strconv.FormatInt(d.Int, 10)), nil
-		case KindString, KindStringArena:
+		case KindString:
 			s := d.StringValue()
 			// For "char" (internal 1-byte type), interpret backslash-octal escapes
 			// and return the charout display form. PostgreSQL's charin() accepts
@@ -1222,7 +1230,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "value out of range for type oid"}
 			}
 			return d, nil
-		case KindString, KindStringArena:
+		case KindString:
 			n, err := parseIntegerInput(d.StringValue(), "oid", 64)
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
@@ -1261,7 +1269,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		return d, nil
 	case "date":
 		// Cast to date: truncate KindTime to midnight UTC, parse strings as dates. M0097-0004.
-		if d.Kind == KindString || d.Kind == KindStringArena {
+		if d.Kind == KindString {
 			s := d.StringValue()
 			if t, err := parseCopyTimestamp(s); err == nil {
 				t2 := t.UTC()
@@ -1277,7 +1285,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		return d, nil
 	case "time", "timetz":
 		// Cast to time: extract time-of-day from KindTime, parse strings. M0097-0004.
-		if d.Kind == KindString || d.Kind == KindStringArena {
+		if d.Kind == KindString {
 			ts, err := parseTimeString(d.StringValue())
 			if err != nil {
 				return Datum{}, err
@@ -1292,7 +1300,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		return d, nil
 	case "timestamp", "timestamptz":
 		// Cast to timestamp: parse strings, keep KindTime as-is. M0097-0004.
-		if d.Kind == KindString || d.Kind == KindStringArena {
+		if d.Kind == KindString {
 			ts, err := parseCopyTimestamp(d.StringValue())
 			if err != nil {
 				return Datum{}, &ExecError{Code: "22007", Pos: pos,
@@ -1827,7 +1835,7 @@ func evalDateTrunc(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 	if src.Kind != KindTime {
-		if src.Kind == KindString || src.Kind == KindStringArena {
+		if src.Kind == KindString {
 			if parsed, perr := parseCopyTimestamp(src.StringValue()); perr == nil {
 				src = NewTimeDatum(parsed)
 			}
@@ -2435,8 +2443,8 @@ func compareEq(a, b Datum) (Datum, error) {
 	// equivalent for equality (likewise KindBytes /
 	// KindBytesArena). The arena variant is a storage detail;
 	// the logical Kind is "string" / "bytes".
-	aIsString := a.Kind == KindString || a.Kind == KindStringArena
-	bIsString := b.Kind == KindString || b.Kind == KindStringArena
+	aIsString := a.Kind == KindString
+	bIsString := b.Kind == KindString
 	switch {
 	case a.Kind == KindInt && b.Kind == KindInt:
 		return NewBoolDatum(a.Int == b.Int), nil
@@ -2489,6 +2497,34 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), ns, time.UTC)), nil
 	case "current_catalog":
 		return NewStringDatum("postgres"), nil
+	case "current_setting":
+		if len(x.Args) >= 1 {
+			nameArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || nameArg.IsNull() {
+				return NullDatum, nil
+			}
+			missingOK := false
+			if len(x.Args) >= 2 {
+				missingArg, err := evalExpr(x.Args[1], row, ctx)
+				if err == nil && !missingArg.IsNull() {
+					missingOK = missingArg.BoolValue()
+				}
+			}
+			if ctx != nil && ctx.GetSetting != nil {
+				if value, ok := ctx.GetSetting(nameArg.StringValue()); ok {
+					return NewStringDatum(value), nil
+				}
+			}
+			if missingOK {
+				return NullDatum, nil
+			}
+			return Datum{}, &ExecError{
+				Code:    "42704",
+				Pos:     x.Pos(),
+				Message: fmt.Sprintf("unrecognized configuration parameter %q", nameArg.StringValue()),
+			}
+		}
+		return NullDatum, nil
 	case "pg_sleep":
 		return evalPgSleep(x, row, ctx)
 	case "to_timestamp":
@@ -2522,9 +2558,30 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// vacuumdb calls SELECT pg_catalog.set_config('search_path', '', false)
 		// to restrict the search path for security. Accept and return new_value.
 		if len(x.Args) >= 2 {
+			nameArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || nameArg.IsNull() {
+				return NullDatum, nil
+			}
 			newVal, err := evalExpr(x.Args[1], row, ctx)
 			if err != nil {
 				return NullDatum, nil
+			}
+			isLocal := false
+			if len(x.Args) >= 3 {
+				localArg, err := evalExpr(x.Args[2], row, ctx)
+				if err == nil && !localArg.IsNull() {
+					isLocal = localArg.BoolValue()
+				}
+			}
+			if ctx != nil && ctx.SetSetting != nil {
+				if err := ctx.SetSetting(nameArg.StringValue(), newVal.Format(), isLocal); err != nil {
+					return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(), Message: err.Error()}
+				}
+				if ctx.GetSetting != nil {
+					if value, ok := ctx.GetSetting(nameArg.StringValue()); ok {
+						return NewStringDatum(value), nil
+					}
+				}
 			}
 			return newVal, nil
 		}
@@ -2569,12 +2626,11 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 	case "pg_advisory_xact_lock":
 		// pg_advisory_xact_lock(int4, int4) → void  (xact-scoped)
-		// Treated as session-scoped for v0; released by pg_advisory_unlock_all.
-		return evalAdvisoryLock(x, row, ctx, false, false)
+		return evalAdvisoryLock(x, row, ctx, false, true)
 
 	case "pg_try_advisory_xact_lock":
 		// pg_try_advisory_xact_lock(int4, int4) → boolean  (non-blocking)
-		return evalAdvisoryLock(x, row, ctx, true, false)
+		return evalAdvisoryLock(x, row, ctx, true, true)
 
 	case "pg_try_advisory_lock":
 		// pg_try_advisory_lock(bigint) → boolean  (non-blocking)
@@ -4032,7 +4088,7 @@ func parseNumericOrZero(s string) *big.Int {
 //
 //	(bigint)        → key = bigint
 //	(int4, int4)    → key = (classid, objid)
-func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, _ bool) (Datum, error) {
+func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, xactScoped bool) (Datum, error) {
 	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
@@ -4064,7 +4120,7 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 	}
 
 	if tryOnly {
-		ok := globalAdvisoryMgr.tryAcquire(key, sess)
+		ok := globalAdvisoryMgr.tryAcquire(key, sess, xactScoped)
 		return NewBoolDatum(ok), nil
 	}
 
@@ -4073,7 +4129,7 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 	if qctx == nil {
 		qctx = context.Background()
 	}
-	if err := globalAdvisoryMgr.acquire(qctx, key, sess); err != nil {
+	if err := globalAdvisoryMgr.acquire(qctx, key, sess, xactScoped); err != nil {
 		// Context cancelled (step timed out or runner aborted).
 		return NullDatum, nil
 	}
@@ -4117,12 +4173,12 @@ func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context) (Datum, erro
 }
 
 // evalAdvisoryUnlockAll implements pg_advisory_unlock_all(). Releases every
-// advisory lock held by this session and returns NULL (void-like).
+// session-scoped advisory lock held by this session and returns NULL (void-like).
 func evalAdvisoryUnlockAll(ctx *Context) (Datum, error) {
 	if ctx == nil {
 		return NullDatum, nil
 	}
-	globalAdvisoryMgr.releaseAll(advisorySessionIDFromContext(ctx))
+	globalAdvisoryMgr.releaseAllSession(advisorySessionIDFromContext(ctx))
 	return NullDatum, nil
 }
 
@@ -4164,7 +4220,7 @@ func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.IsNull() || fmtArg.IsNull() {
 		return NullDatum, nil
 	}
-	if (src.Kind != KindString && src.Kind != KindStringArena) || (fmtArg.Kind != KindString && fmtArg.Kind != KindStringArena) {
+	if (src.Kind != KindString) || (fmtArg.Kind != KindString) {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_date arguments must be text"}
 	}
 	goLayout := pgFormatToGoLayout(fmtArg.StringValue())
@@ -4244,7 +4300,7 @@ func evalSubstr(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if src.IsNull() || fromArg.IsNull() {
 		return NullDatum, nil
 	}
-	if src.Kind != KindString && src.Kind != KindStringArena {
+	if src.Kind != KindString {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "substr first argument must be text"}
 	}
 	if fromArg.Kind != KindInt {
@@ -4320,7 +4376,7 @@ func evalToTimestamp(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) 
 	if src.IsNull() || fmtArg.IsNull() {
 		return NullDatum, nil
 	}
-	if (src.Kind != KindString && src.Kind != KindStringArena) || (fmtArg.Kind != KindString && fmtArg.Kind != KindStringArena) {
+	if (src.Kind != KindString) || (fmtArg.Kind != KindString) {
 		return Datum{}, &ExecError{Code: "42883", Pos: x.Pos(), Message: "to_timestamp arguments must be text"}
 	}
 	goLayout := pgFormatToGoLayout(fmtArg.StringValue())

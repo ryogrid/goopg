@@ -608,6 +608,12 @@ func describePlan(n planner.Node) string {
 		// IndexScan side. The inner IndexScan node renders its
 		// own label (`Index Scan using <idx> on <table>`) below.
 		return fmt.Sprintf("Nested Loop (%s)", joinTypeName(p.Type))
+	case *planner.Merge:
+		return fmt.Sprintf("Merge on %s", p.Target.QualifiedName())
+	case *planner.CTEDMLPrefix:
+		return "CTE DML"
+	case *planner.MaterializedCTEScan:
+		return fmt.Sprintf("CTE %s", p.Name)
 	}
 	return fmt.Sprintf("%T", n)
 }
@@ -668,6 +674,13 @@ func planChildren(n planner.Node) []planner.Node {
 	case *planner.NestedLoopIndexJoin:
 		// M0054-0006: render outer driver and inner index probe.
 		return []planner.Node{p.Outer, p.Inner}
+	case *planner.Merge:
+		return []planner.Node{p.Source}
+	case *planner.CTEDMLPrefix:
+		out := make([]planner.Node, 0, len(p.DMls)+1)
+		out = append(out, p.DMls...)
+		out = append(out, p.Body)
+		return out
 	}
 	return nil
 }

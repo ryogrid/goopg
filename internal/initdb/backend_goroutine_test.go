@@ -37,29 +37,33 @@ func TestBackendGoroutineDoesNotFsync(t *testing.T) {
 
 	// Override the assertion hook with one that records instead of panicking,
 	// so the test can report details rather than crashing.
+	// M0107-0005: use LookupCurrentGoroutine (procNum) + GetBackendType (int32).
 	rt.Pool.OnFlushAll = func() {
-		reg, pid := activity.LookupGoroutine()
+		reg, procNum, ok := activity.LookupCurrentGoroutine()
 		bt := ""
-		if reg != nil {
-			bt = reg.GetBackendType(pid)
+		if ok {
+			bt = reg.GetBackendType(procNum)
 		}
 		calls = append(calls, flushCall{backendType: bt})
 	}
 
 	// Register the current goroutine as a "client" backend so the activity
 	// registry identifies it properly.
+	// M0107-0005: use RegisterBackground with idx=2 (beyond WalWriter=0,
+	// Checkpointer=1) so this test backend gets a distinct slot.
 	act := rt.Activity
 	clientPID := "test-client-0"
+	var testProcNum int32 = -1
 	if act != nil {
-		act.Register(&activity.Backend{
+		testProcNum = act.RegisterBackground(2, &activity.Backend{
 			PID:         clientPID,
 			BackendType: "client backend",
 			State:       "active",
 		})
-		activity.RegisterCurrentGoroutine(act, clientPID)
+		activity.SetCurrentGoroutine(act, testProcNum)
 		defer func() {
 			activity.ClearCurrentGoroutine()
-			act.Unregister(clientPID)
+			act.ReleaseBackground(2, clientPID)
 		}()
 	}
 
@@ -92,19 +96,19 @@ func TestCheckpointerFlushAllIsAllowed(t *testing.T) {
 	defer rt.Close()
 
 	// Register the current goroutine as a "checkpointer" so it's an
-	// allowed caller.
+	// allowed caller. M0107-0005: use RegisterBackground(CheckpointerIdx=1).
 	act := rt.Activity
 	cpPID := "test-checkpointer-0"
 	if act != nil {
-		act.Register(&activity.Backend{
+		cpProcNum := act.RegisterBackground(activity.CheckpointerIdx, &activity.Backend{
 			PID:         cpPID,
 			BackendType: "checkpointer",
 			State:       "active",
 		})
-		activity.RegisterCurrentGoroutine(act, cpPID)
+		activity.SetCurrentGoroutine(act, cpProcNum)
 		defer func() {
 			activity.ClearCurrentGoroutine()
-			act.Unregister(cpPID)
+			act.ReleaseBackground(activity.CheckpointerIdx, cpPID)
 		}()
 	}
 

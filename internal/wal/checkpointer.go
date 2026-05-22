@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/stats"
 )
 
 // DirtyPageFlusher is the buffer-pool contract used by the checkpointer.
@@ -102,6 +103,33 @@ type CheckpointerConfig struct {
 	// basebackup boots with snapshot xmax=3, hiding every tuple created
 	// after initdb. M0106-0010 batched-45.
 	NextXIDFn func() uint64
+
+	// NextOIDFn, when non-nil, is invoked at each checkpoint to read the
+	// live "next-to-assign" OID from the catalog so the
+	// checkpointCopy.nextOid field in pg_control and the checkpoint WAL
+	// record reflect current OID consumption. Without this hook the
+	// field stays at the hardcoded bootstrap value (FirstNormalObjectId =
+	// 16384) and a crashed cluster that had allocated OIDs above 16384
+	// cannot recover the OID counter from pg_control alone, requiring
+	// pg_catalog.json. M0106-0013.
+	NextOIDFn func() uint32
+
+	// PostCheckpointFn, when non-nil, is called at the end of each
+	// successful checkpoint (timed, volume-triggered, or on-demand).
+	// initdb.Open wires this to regenerate pg_internal.init files so PG
+	// standbys can always attach: crash-recovery WAL replay of
+	// RecordKindXactCommitInval unlinks the init files, and the commit-
+	// time hook may not run before the next pg_basebackup attempt.
+	// Errors are logged as warnings and do not fail the checkpoint.
+	// M0106-0011 follow-up (b).
+	PostCheckpointFn func() error
+
+	// PGCompatCheckpoints, when true, writes an 88-byte PG18 CheckPoint
+	// struct (EncodeCheckpointCompat) so PG standbys can parse the
+	// record. When false (default), the legacy 1-byte RecordKindCheckpoint
+	// marker is used. Set to true by initdb.Open; tests that do not need
+	// PG compatibility leave this false so legacy detection code works.
+	PGCompatCheckpoints bool
 }
 
 func (c *CheckpointerConfig) withDefaults() {
@@ -140,9 +168,9 @@ type Checkpointer struct {
 	// write_time_ms — cumulative wall time inside flushDirty
 	// statsResetAt  — timestamp of the last counter reset
 	//                 (currently only set at construction)
-	numTimed     atomic.Uint64
-	numRequested atomic.Uint64
-	writeTimeMs  atomic.Uint64
+	numTimed     stats.Counter
+	numRequested stats.Counter
+	writeTimeMs  stats.Counter
 	statsResetAt atomic.Int64 // unix nanos
 }
 
@@ -160,9 +188,9 @@ type Stats struct {
 // pg_stat_checkpointer virtual table.
 func (c *Checkpointer) Stats() Stats {
 	return Stats{
-		NumTimed:          c.numTimed.Load(),
-		NumRequested:      c.numRequested.Load(),
-		WriteTimeMs:       c.writeTimeMs.Load(),
+		NumTimed:          uint64(c.numTimed.Sum()),
+		NumRequested:      uint64(c.numRequested.Sum()),
+		WriteTimeMs:       uint64(c.writeTimeMs.Sum()),
 		LastCheckpointLSN: c.lastCheckpointLSN.Load(),
 		StatsResetAt:      time.Unix(0, c.statsResetAt.Load()),
 	}
@@ -344,7 +372,7 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 			return fmt.Errorf("sync data files: %w", err)
 		}
 	}
-	c.writeTimeMs.Add(uint64(time.Since(flushStart).Milliseconds()))
+	c.writeTimeMs.Add(time.Since(flushStart).Milliseconds())
 	// M0102-0007: pre-compute the 0-based redo LSN so the
 	// PG-compatible checkpoint record carries the correct
 	// checkPoint.redo — PG's xlogreader validates it.
@@ -375,7 +403,22 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 	if c.cfg.NextXIDFn != nil {
 		nextXid = c.cfg.NextXIDFn()
 	}
-	startLSN, endLSN, err := c.wal.Append(EncodeCheckpointCompat(redoLSN0, 1, nextXid))
+	// M0106-0013: sample nextOid from the catalog BEFORE appending the
+	// checkpoint record so the on-wire CheckPoint payload carries the
+	// live OID counter. PG's InitWalRecovery seeds
+	// ShmemVariableCache->nextOid from this field on recovery, eliminating
+	// the need for pg_catalog.json to survive a crash.
+	var nextOid uint32
+	if c.cfg.NextOIDFn != nil {
+		nextOid = c.cfg.NextOIDFn()
+	}
+	var checkpointPayload []byte
+	if c.cfg.PGCompatCheckpoints {
+		checkpointPayload = EncodeCheckpointCompat(redoLSN0, 1, nextXid, nextOid)
+	} else {
+		checkpointPayload = EncodeCheckpoint()
+	}
+	startLSN, endLSN, err := c.wal.Append(checkpointPayload)
 	if err != nil {
 		return fmt.Errorf("append checkpoint marker: %w", err)
 	}
@@ -409,6 +452,13 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 			// nextXid in pg_control must be monotonic.
 			if nextXid > cd.CheckPointCopyNextXid {
 				cd.CheckPointCopyNextXid = nextXid
+			}
+			// M0106-0013: refresh checkPointCopy.nextOid so a crashed cluster
+			// can recover the OID counter from pg_control rather than from
+			// pg_catalog.json. Only update when the hook is wired and the
+			// value advances — nextOid must be monotonic.
+			if nextOid > cd.CheckPointCopyNextOid {
+				cd.CheckPointCopyNextOid = nextOid
 			}
 			cd.MinRecoveryPoint = 0
 			cd.MinRecoveryPointTLI = 0
@@ -447,6 +497,14 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 	if c.retainer != nil {
 		if err := c.retainer.Retain(endLSN); err != nil {
 			c.cfg.Logger.Warn("wal retention failed", "err", err)
+		}
+	}
+	// M0106-0011 follow-up (b): call the post-checkpoint hook (when wired)
+	// to regenerate pg_internal.init after crash-recovery WAL replay may
+	// have unlinked it via RecordKindXactCommitInval. Non-fatal.
+	if c.cfg.PostCheckpointFn != nil {
+		if err := c.cfg.PostCheckpointFn(); err != nil {
+			c.cfg.Logger.Warn("post-checkpoint init file refresh failed", "err", err)
 		}
 	}
 	// M0057-0001: log checkpoint complete so benchmark runs can see

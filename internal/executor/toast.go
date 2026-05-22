@@ -100,9 +100,9 @@ func ToastLargeColumnsIfNeeded(ctx *Context, rel storage.RelFileNode, cols []cat
 		}
 		var data []byte
 		switch d.Kind {
-		case KindString, KindStringArena:
+		case KindString:
 			data = []byte(d.StringValue())
-		case KindBytes, KindBytesArena:
+		case KindBytes:
 			data = d.BytesValue()
 		default:
 			continue
@@ -278,9 +278,9 @@ func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([
 			// types (even bytea). Accept both kinds so chunk data
 			// stored as either bytes or string is correctly captured.
 			switch row[2].Kind {
-			case KindBytes, KindBytesArena:
+			case KindBytes:
 				chunks[seq] = row[2].BytesValue()
-			case KindString, KindStringArena:
+			case KindString:
 				chunks[seq] = []byte(row[2].StringValue())
 			}
 		}

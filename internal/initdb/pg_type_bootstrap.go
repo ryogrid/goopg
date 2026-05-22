@@ -136,6 +136,10 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 		return pgTypeEntry{700, "float4", 4, true, 'b', 'N', 'i', 'p', 200, 201, 2424, 2425}, true
 	case 701:
 		return pgTypeEntry{701, "float8", 8, true, 'b', 'N', 'd', 'p', 214, 215, 2426, 2427}, true
+	case 869:
+		// inet: variable-length IP-address type; typcategory='I', typstorage='m'.
+		// inet_in=910, inet_out=911, inet_recv=2496, inet_send=2497.
+		return pgTypeEntry{869, "inet", -1, false, 'b', 'I', 'i', 'm', 910, 911, 2496, 2497}, true
 	case 1002:
 		return pgTypeEntry{1002, "_char", -1, false, 'b', 'A', 'i', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
 	case 1021:
@@ -157,6 +161,10 @@ func pgTypeCanonical(oid uint32) (pgTypeEntry, bool) {
 		return pgTypeEntry{1184, "timestamptz", 8, true, 'b', 'D', 'd', 'p', 1150, 1151, 2476, 2477}, true
 	case 1185:
 		return pgTypeEntry{1185, "_timestamptz", -1, false, 'b', 'A', 'd', 'x', arrayIn, arrayOut, arrayRecv, arraySend}, true
+	case 1186:
+		// interval: 16-byte fixed time interval; typcategory='T', typalign='d'.
+		// interval_in=1160, interval_out=1161, interval_recv=2478, interval_send=2479.
+		return pgTypeEntry{1186, "interval", 16, false, 'b', 'T', 'd', 'p', 1160, 1161, 2478, 2479}, true
 	case 2277:
 		return pgTypeEntry{2277, "anyarray", -1, false, 'p', 'P', 'i', 'x', 2296, 2297, 2502, 2503}, true
 	case 2281:

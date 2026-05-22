@@ -1,6 +1,6 @@
 # Milestone 0106 — PG Relcache Init File Compatibility
 
-**Status:** planned
+**Status:** accepted
 **Filed:** 2026-05-17
 **Depends on:** M0105 (heap page and tuple format parity)
 **Reference plan:** `.ralph/fix_plan.md` (M0106 section)

@@ -97,8 +97,8 @@ func TestNumericDivInt64FastBasic(t *testing.T) {
 			continue
 		}
 		// Force big.Int path
-		aBig := Datum{Kind: KindNumeric, Big: big.NewInt(tc.am), Scale: tc.ascale}
-		bBig := Datum{Kind: KindNumeric, Big: big.NewInt(tc.bm), Scale: tc.bscale}
+		aBig := NewNumericBigDatum(big.NewInt(tc.am), tc.ascale)
+		bBig := NewNumericBigDatum(big.NewInt(tc.bm), tc.bscale)
 		slow, err := numericDiv(aBig, bBig, 0)
 		if err != nil {
 			t.Errorf("slow(%d/%d, %d/%d) error: %v", tc.am, tc.ascale, tc.bm, tc.bscale, err)
@@ -131,8 +131,8 @@ func TestNumericDivInt64FastVsBigPath(t *testing.T) {
 
 		a := Datum{Kind: KindNumeric, Int: am, Scale: ascale}
 		b := Datum{Kind: KindNumeric, Int: bm, Scale: bscale}
-		aBig := Datum{Kind: KindNumeric, Big: big.NewInt(am), Scale: ascale}
-		bBig := Datum{Kind: KindNumeric, Big: big.NewInt(bm), Scale: bscale}
+		aBig := NewNumericBigDatum(big.NewInt(am), ascale)
+		bBig := NewNumericBigDatum(big.NewInt(bm), bscale)
 
 		fast, err := numericDiv(a, b, 0)
 		if err != nil {
@@ -239,8 +239,8 @@ func TestNumericDivInt64FastQEqualsZeroSignHandling(t *testing.T) {
 	for _, tc := range cases {
 		a := Datum{Kind: KindNumeric, Int: tc.am, Scale: tc.ascale}
 		b := Datum{Kind: KindNumeric, Int: tc.bm, Scale: tc.bscale}
-		aBig := Datum{Kind: KindNumeric, Big: big.NewInt(tc.am), Scale: tc.ascale}
-		bBig := Datum{Kind: KindNumeric, Big: big.NewInt(tc.bm), Scale: tc.bscale}
+		aBig := NewNumericBigDatum(big.NewInt(tc.am), tc.ascale)
+		bBig := NewNumericBigDatum(big.NewInt(tc.bm), tc.bscale)
 		fast, err := numericDiv(a, b, 0)
 		if err != nil {
 			t.Fatalf("fast %d/%d ÷ %d/%d error: %v", tc.am, tc.ascale, tc.bm, tc.bscale, err)
@@ -262,7 +262,7 @@ func TestNumericDivInt64FastQEqualsZeroSignHandling(t *testing.T) {
 // `Big == nil && Big == nil` gate). (M0075-0005.)
 func TestNumericDivBigOperandStillCorrect(t *testing.T) {
 	// 6 / 2 = 3 (ints in big lane)
-	a := Datum{Kind: KindNumeric, Big: big.NewInt(6), Scale: 0}
+	a := NewNumericBigDatum(big.NewInt(6), 0)
 	b := Datum{Kind: KindNumeric, Int: 2, Scale: 0}
 	r, err := numericDiv(a, b, 0)
 	if err != nil {

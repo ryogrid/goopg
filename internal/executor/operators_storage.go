@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -291,7 +292,6 @@ func epqChainCheckMovedPartition(ctx *Context, rel storage.RelFileNode,
 	return false
 }
 
-
 // epqFollowChain walks the cross-page t_ctid chain starting at (rel, blk,
 // slot) to find the latest tuple version that is visible to ctx.Snap and
 // matches pred. Used as a fallback when epqFollowHOT (HOT same-page chain)
@@ -307,25 +307,42 @@ func epqChainCheckMovedPartition(ctx *Context, rel storage.RelFileNode,
 // updater proceeds against it; otherwise the row is skipped.
 func epqFollowChain(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
 	slot uint16, cols []catalog.Column, pred planner.Expr) (storage.BlockNumber, uint16, Row, bool) {
+	_, found, movedPart := epqFollowChainFull(ctx, rel, blk, slot, cols, pred)
+	if movedPart {
+		return 0, 0, nil, false
+	}
+	return found.blk, found.slot, found.row, found.ok
+}
+
+type epqChainResult struct {
+	blk  storage.BlockNumber
+	slot uint16
+	row  Row
+	ok   bool
+}
+
+// epqFollowChainFull walks the t_ctid chain and returns the live successor row.
+// movedPart is true if the chain ended because of a moved-partition sentinel.
+func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
+	slot uint16, cols []catalog.Column, pred planner.Expr) (relNode storage.RelFileNode, found epqChainResult, movedPart bool) {
 	const maxChain = 64
 	curBlk, curSlot := blk, slot
 	for i := 0; i < maxChain; i++ {
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: curBlk})
 		if err != nil {
-			return 0, 0, nil, false
+			return rel, epqChainResult{}, false
 		}
 		s.RLock()
 		tup, gerr := storage.PageGetHeapTuple(s.Page(), curSlot)
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
 		if gerr != nil {
-			return 0, 0, nil, false
+			return rel, epqChainResult{}, false
 		}
-		// Sentinel: row was moved to another partition — caller should
-		// have already detected via epqSlotMovedToAnotherPartition or
-		// epqChainCheckMovedPartition; treat as chain end here.
+		// Sentinel: row was moved to another partition.
+		// Report this to the caller so it can raise the appropriate error.
 		if storage.IsMovedToAnotherPartition(tup.Header.CTID) {
-			return 0, 0, nil, false
+			return rel, epqChainResult{}, true
 		}
 		ctid := tup.Header.CTID
 		// Chain terminates when CTID is invalid (no successor stamped) or
@@ -335,25 +352,25 @@ func epqFollowChain(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumb
 			(ctid.Block == curBlk && ctid.Offset == curSlot)
 		if atTail {
 			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID) {
-				return 0, 0, nil, false
+				return rel, epqChainResult{}, false
 			}
 			row, decErr := DecodeRow(cols, tup.Data)
 			if decErr != nil {
-				return 0, 0, nil, false
+				return rel, epqChainResult{}, false
 			}
 			if pred != nil {
 				pv, perr := evalExpr(pred, row, ctx)
 				if perr != nil || pv.IsNull() || pv.Kind != KindBool || !pv.BoolValue() {
-					return 0, 0, nil, false
+					return rel, epqChainResult{}, false
 				}
 			}
-			return curBlk, curSlot, row, true
+			return rel, epqChainResult{blk: curBlk, slot: curSlot, row: row, ok: true}, false
 		}
 		// Follow the link to the next version.
 		curBlk = ctid.Block
 		curSlot = ctid.Offset
 	}
-	return 0, 0, nil, false
+	return rel, epqChainResult{}, false
 }
 
 // stampOldCtid updates the t_ctid field of the tuple at (rel, blk, slot)
@@ -395,13 +412,57 @@ func errMovedToAnotherPartition(pos int) *ExecError {
 	}
 }
 
-var heapExtendLocks sync.Map // map[storage.RelFileNode]*sync.Mutex
+// paddedMutex is a 64-byte cache-line-padded mutex. Lined up in an array,
+// adjacent stripes occupy distinct cache lines so contending writers do
+// not pay coherence traffic on a stripe they did not intend to lock.
+// M0107-0007a (Phase D4 — heap-extend-lock striping).
+type paddedMutex struct {
+	mu sync.Mutex
+	_  [56]byte // pad sync.Mutex (8 B) to 64 B (one cache line)
+}
 
-func lockHeapExtend(rel storage.RelFileNode) func() {
-	v, _ := heapExtendLocks.LoadOrStore(rel, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
+// heapExtendLockStripes is the number of stripes per relation extend
+// lock set. Matches PG's `NUM_XLOGINSERT_LOCKS = 8` and the design's
+// extend-lock plan in `docs/design/perf-optimize/07-wal-fsm-insert.md`.
+const heapExtendLockStripes = 8
+
+// heapExtendLockSet is a per-relation set of 8 stripe mutexes. A backend
+// extending `rel` picks `locks[procNum & 0x7]`, allowing up to 8 parallel
+// extenders per relation. PinNew already serialises on the bufpool's
+// `pinMu` for victim claim + bufmap publish, and storage.Manager.Extend
+// hands out distinct block numbers per call — so concurrent extension
+// from different stripes is safe; the prior single-mutex existed only to
+// avoid wasted PinNew churn, not for correctness.
+type heapExtendLockSet struct {
+	locks [heapExtendLockStripes]paddedMutex
+}
+
+var heapExtendLocks sync.Map // map[storage.RelFileNode]*heapExtendLockSet
+
+// lockHeapExtend acquires one of the relation's 8 extend-lock stripes,
+// chosen by `procNum & 0x7`. Returns the unlock closure. Pass
+// `ctx.ProcNum` from `executor.Context` at call sites; non-backend
+// callers (tests, background workers) may pass 0.
+// lockHeapExtend acquires the per-relation heap-extension lock for the
+// stripe selected by procNum (M0107-0007 slice A — 8-way striped). It
+// returns the unlock callback and a contention flag: contended == true
+// means the lock was already held by another stripe-mate when we
+// arrived (TryLock failed), which the caller uses as the proxy for
+// "extend by extendBatchSize and FSM-register the extras"; contended ==
+// false means the uncontended fast path can keep extending one page at
+// a time. The PG counterpart is the
+// `RelationExtensionLockWaiterCount`-driven `extraBlocks` heuristic in
+// `RelationGetBufferForTuple` — see
+// `docs/design/perf-optimize/07-wal-fsm-insert.md` §3.
+func lockHeapExtend(rel storage.RelFileNode, procNum int32) (release func(), contended bool) {
+	v, _ := heapExtendLocks.LoadOrStore(rel, &heapExtendLockSet{})
+	set := v.(*heapExtendLockSet)
+	mu := &set.locks[uint32(procNum)&(heapExtendLockStripes-1)].mu
+	if mu.TryLock() {
+		return mu.Unlock, false
+	}
 	mu.Lock()
-	return mu.Unlock
+	return mu.Unlock, true
 }
 
 // seqScanOp walks every block of a heap relation, yielding visible
@@ -409,7 +470,14 @@ func lockHeapExtend(rel storage.RelFileNode) func() {
 // checked against ctx.Snap; tuples whose xmin/xmax are outside the
 // snapshot's horizon are skipped.
 type seqScanOp struct {
-	plan *planner.SeqScan
+	// schema/tbl/pos/rel are extracted from *planner.SeqScan at construction
+	// time (Phase C.3 migration: seqScanOp no longer holds a GC-traced
+	// *planner.SeqScan pointer; the planner struct can be freed after Open).
+	schema planner.Schema
+	tbl    *catalog.Table
+	pos    int
+	rel    storage.RelFileNode // cached once in Open; avoids catalog lock per Next call
+
 	ctx  *Context
 	cols []catalog.Column
 
@@ -447,14 +515,13 @@ type seqScanOp struct {
 	// flagged as `runtime.findObject` flat 29.30 % under Q9.
 	scanRow Row
 
-	// arena is the per-page byte allocator backing varchar / char
-	// / text / bytea Datums emitted by DecodeRowIntoArena.
-	// Reset() at the per-block boundary (when curBlock advances)
-	// frees all variable-length payload allocated for the
-	// previous page's tuples; consumers that retain rows past
-	// the boundary must call slot.Materialize() to deep-copy.
-	// (M0073-0004.)
-	arena *Arena
+	// sctx is the per-page mctx backing varchar / char / text /
+	// bytea Datums emitted by DecodeRowIntoMctx. Reset() at
+	// the per-block boundary frees all variable-length payload
+	// allocated for the previous page's tuples; consumers that
+	// retain rows past the boundary must call slot.Materialize()
+	// to deep-copy. (M0073-0004; M0107-0001: arena→sctx.)
+	sctx *mctx.Context
 
 	// M0092-0007: embedded slot reused across every Next() call.
 	// The returned `&o.slot` pointer is stable across calls; its
@@ -471,24 +538,30 @@ type seqScanOp struct {
 const seqScanLookahead storage.BlockNumber = 4
 
 func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
-	return &seqScanOp{plan: p, cols: p.Table.Columns}
+	return &seqScanOp{
+		schema: p.Output(),
+		tbl:    p.Table,
+		pos:    p.Pos(),
+		cols:   p.Table.Columns,
+	}
 }
 
-func (o *seqScanOp) Schema() planner.Schema { return o.plan.Output() }
+func (o *seqScanOp) Schema() planner.Schema { return o.schema }
 
 func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "SeqScan requires storage handles in Context"}
+		return &ExecError{Code: "XX000", Pos: o.pos, Message: "SeqScan requires storage handles in Context"}
 	}
 	o.ctx = ctx
-	rel := ctx.Catalog.RelFileNode(o.plan.Table)
-	if err := ctx.acquireRelLock(rel, lockmgr.AccessShareLock); err != nil {
+	// Cache rel once — avoids the catalog RLock on every Next() call.
+	o.rel = ctx.Catalog.RelFileNode(o.tbl)
+	if err := ctx.acquireRelLock(o.rel, lockmgr.AccessShareLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
-			ee.Pos = o.plan.Pos()
+			ee.Pos = o.pos
 		}
 		return err
 	}
-	n, err := ctx.Pool.NBlocks(rel)
+	n, err := ctx.Pool.NBlocks(o.rel)
 	if err != nil {
 		return err
 	}
@@ -497,17 +570,16 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	o.curSlot = 0
 	o.slotMax = 0
 	o.prefetchedThru = 0
-	// M0073-0004: per-page byte arena for varchar / char / text /
-	// bytea payload. Reset on block-advance below. Lifetime tied
-	// to the operator; Close drops the pages.
-	o.arena = NewArena(0)
+	// M0073-0004 / M0107-0001: per-operator mctx for varchar / char /
+	// text / bytea payload. Reset on block-advance; Release on Close.
+	o.sctx = mctx.Acquire(ctx.Mctx, mctx.KindExpr)
 	// Activate the ring strategy when the relation is large enough that a
 	// full sequential scan would evict most hot pages from the shared pool.
 	// Threshold: pool capacity / 4, matching upstream's heuristic.
 	if ctx.Pool != nil && int(n) > ctx.Pool.Capacity()/4 {
-		o.ring = storage.NewScanRing(ctx.Pool, rel)
+		o.ring = storage.NewScanRing(ctx.Pool, o.rel)
 	}
-	o.refillPrefetchWindow(rel)
+	o.refillPrefetchWindow(o.rel)
 	return nil
 }
 
@@ -548,9 +620,9 @@ func (o *seqScanOp) Close() error {
 		releaseRow(o.scanRow)
 		o.scanRow = nil
 	}
-	if o.arena != nil {
-		o.arena.Drop()
-		o.arena = nil
+	if o.sctx != nil {
+		o.sctx.Release()
+		o.sctx = nil
 	}
 	return nil
 }
@@ -558,7 +630,7 @@ func (o *seqScanOp) Close() error {
 // nextVisible advances through (block, slot) pairs and returns the
 // next tuple visible to the snapshot, or EOF.
 func (o *seqScanOp) Next() (TupleSlot, error) {
-	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
+	rel := o.rel
 	for {
 		if o.pinned == nil && o.activePage == nil {
 			if o.curBlock >= o.nBlocks {
@@ -650,6 +722,16 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				}
 				continue
 			}
+			// CTE snapshot isolation: skip rows written by DML CTEs so the
+			// outer SELECT sees the pre-CTE state (PostgreSQL semantics).
+			if o.ctx.CTEWriteFence != nil {
+				if _, inFence := o.ctx.CTEWriteFence[storage.ItemPointer{Block: o.curBlock, Offset: o.curSlot - 1}]; inFence {
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					continue
+				}
+			}
 			// M0104-0007: SSI read-path hook. Tuple is visible to this
 			// reader — install a tuple-grain SIREAD predicate lock and an
 			// rw-conflict edge to the producing writer (xmin). Helper
@@ -667,7 +749,12 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			if o.scanRow == nil || len(o.scanRow) != len(o.cols) {
 				o.scanRow = acquireRow(len(o.cols))
 			}
-			if err := DecodeRowIntoArena(o.scanRow, o.cols, tuple.Data, o.arena); err != nil {
+			// Use bitmap + natts to correctly decode rows that have NULL
+			// columns or were stored before ALTER TABLE ADD COLUMN expanded
+			// the schema. HeapNattsMask = 0x07FF; storedNatts==0 means natts
+			// was not explicitly set (legacy goopg rows without PG format).
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			if err := DecodeRowIntoMctxPGTuple(o.scanRow, o.cols, tuple.Data, tuple.Bitmap, storedNatts, o.sctx); err != nil {
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}
@@ -704,7 +791,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// scanRow is reused across the per-page tuple
 			// loop; rows that need retention go through
 			// slot.Materialize().
-			o.slot.schema = o.Schema()
+			o.slot.schema = o.schema
 			o.slot.row = row
 			return &o.slot, nil
 		}
@@ -717,11 +804,11 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 		// retention boundary (sortOp.Open / windowOp.Open /
 		// lockRowsOp.drainAndStamp / executor.Run; aggregateOp's
 		// targeted MaterializeArena in evalGroupKey + applyAgg).
-		// Reset rewinds page len to 0 but keeps capacity, so the
+		// Reset rewinds chunk len to 0 but keeps capacity, so the
 		// next page's decode reuses the same backing bytes — no
 		// per-page allocation in steady state.
-		if o.arena != nil {
-			o.arena.Reset()
+		if o.sctx != nil {
+			o.sctx.Reset()
 		}
 		// As the scan walks forward, top up the prefetch window
 		// so the next-but-one block is being read by the AIO
@@ -742,8 +829,7 @@ func (o *seqScanOp) currentTID() (storage.RelFileNode, storage.ItemPointer, bool
 	if o.pinned == nil || o.curSlot == 0 {
 		return storage.RelFileNode{}, storage.ItemPointer{}, false
 	}
-	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
-	return rel, storage.ItemPointer{Block: o.curBlock, Offset: o.curSlot - 1}, true
+	return o.rel, storage.ItemPointer{Block: o.curBlock, Offset: o.curSlot - 1}, true
 }
 
 func (o *seqScanOp) releasePinned() {
@@ -1189,6 +1275,26 @@ func indexScanPredicate(ix *planner.IndexScan) planner.Expr {
 // skip any index inserts. If no indexes exist, all updates are
 // HOT-eligible (the same-page placement is still beneficial for
 // space reuse even without an index-cost saving).
+// idxRowHasConcurrentXmax peeks at the page under a brief RLock to check
+// whether the tuple at (blk, slot) has a concurrent (non-self) xmax stamp.
+// This is used before firing a BEFORE UPDATE trigger: if a concurrent xmax is
+// present (DELETE or UPDATE in flight), we defer the trigger to the EPQ loop
+// so it only fires when EPQ confirms the row will actually be written.
+func idxRowHasConcurrentXmax(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16) bool {
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+	if err != nil {
+		return false
+	}
+	s.RLock()
+	t, gerr := storage.PageGetHeapTuple(s.Page(), slot)
+	s.RUnlock()
+	ctx.Pool.Unpin(s)
+	if gerr != nil {
+		return false
+	}
+	return isConcurrentlyUpdated(t.Header, ctx.Tx.XID, &ctx.Snap)
+}
+
 func hotUpdateEligible(plan *planner.Update, ctx *Context) bool {
 	indexes := ctx.Catalog.IndexesOnTable(plan.Table)
 	for _, idx := range indexes {
@@ -1322,12 +1428,42 @@ func tryApplyHOTUpdate(
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return false, err
 	}
-	body, err := EncodeRow(cols, newRow)
-	if err != nil {
-		return false, &ExecError{Code: "XX000", Message: err.Error()}
+	// When canonical WAL is active, encode HOT-update tuples in PG-native
+	// physical format so they are consistent with non-HOT updates written by
+	// writeHeapRowReturning/writeHeapRowReturningPG.  Mixed encoding (goopg
+	// for HOT, PG for non-HOT) causes decodeGoopgRowIntoMctx to sometimes
+	// "accidentally succeed" on PG-encoded rows with wrong values when the
+	// over-read case slips through the off < len(data) trailing-bytes check.
+	// M0107: HOT-update encoding parity fix.
+	var (
+		body   []byte
+		bitmap []byte
+	)
+	if ctx.LogCanonical != nil {
+		var encErr error
+		body, encErr = EncodeRowPG(cols, newRow)
+		if encErr != nil {
+			return false, &ExecError{Code: "XX000", Message: encErr.Error()}
+		}
+		bitmap = NullBitmapPG(newRow)
+	} else {
+		var encErr error
+		body, encErr = EncodeRow(cols, newRow)
+		if encErr != nil {
+			return false, &ExecError{Code: "XX000", Message: encErr.Error()}
+		}
 	}
-	tup := storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+	var tup storage.HeapTuple
+	if len(bitmap) > 0 {
+		tup = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
+	} else {
+		tup = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+	}
 	tup.Header.Infomask |= storage.HeapOnlyTuple
+	if ctx.LogCanonical != nil {
+		tup.Header.SetNatts(len(cols))
+		tup.Header.Infomask |= storage.HeapXmaxInvalid
+	}
 	tupleBytes, err := tup.MarshalBinary()
 	if err != nil {
 		return false, err
@@ -1567,10 +1703,13 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				return true, nil
 			}
 		}
-		row, err := DecodeRow(cols, tuple.Data)
-		if err != nil {
-			return false, err
+		var decRow Row
+		decRow, err = make(Row, len(cols)), nil
+		decNatts := int(tuple.Header.Infomask2 & 0x07FF)
+		if decErr := DecodeRowIntoMctxPGTuple(decRow, cols, tuple.Data, tuple.Bitmap, decNatts, nil); decErr != nil {
+			return false, decErr
 		}
+		row := decRow
 
 		// Build new row from SET expressions.
 		newRow := make(Row, len(cols))
@@ -1587,6 +1726,12 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		}
 		// Recompute GENERATED ALWAYS AS … STORED columns after SET. M0096-0008.
 		_ = computeGeneratedColumns(cols, newRow)
+		// M0111-0001: restore columns that became null during decode→rebuild.
+		for i, c := range cols {
+			if c.GeneratedExpr == "" && newRow[i].IsNull() && !row[i].IsNull() {
+				newRow[i] = row[i]
+			}
+		}
 		pending = append(pending, pendingUpdate{
 			blk:    ptr.Block,
 			slot:   actualSlot, // use live slot, not the index-pointed slot
@@ -1603,13 +1748,19 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
 	idxTbl := o.plan.Table
 	for _, pu := range pending {
-		// Fire BEFORE UPDATE triggers (e.g. RAISE NOTICE) before writing.
-		if len(idxTbl.Triggers) > 0 {
+		// Fire BEFORE UPDATE trigger if the row has no concurrent xmax (i.e. a
+		// HOT-eligible write or a plain non-concurrent update). When a concurrent
+		// xmax is present (concurrent DELETE / UPDATE in progress), defer the
+		// trigger to the EPQ loop so it only fires when EPQ confirms the row will
+		// actually be written. M0100-0005-merge-delete-fix.
+		trigFiredViaIdx := false
+		if len(idxTbl.Triggers) > 0 && !idxRowHasConcurrentXmax(o.ctx, rel, pu.blk, pu.slot) {
 			retRow, ok := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
 			if !ok {
 				continue // RETURN NULL — skip this row
 			}
 			pu.newRow = retRow
+			trigFiredViaIdx = true
 		}
 		used := false
 		if hotEligible {
@@ -1653,6 +1804,16 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							Code:    "40001",
 							Pos:     o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update (deadlock)",
+						}
+					}
+					// RC: refresh snapshot so committed deletes/updates are
+					// visible without relying on the frozen BEGIN-time snapshot.
+					// Without this, the committed xmax stays in snap.InProgress
+					// and epqRecheckVisible returns true indefinitely (tight loop
+					// until maxEPQRetries → spurious 40001). M0100-0005-merge-delete.
+					if o.ctx.Tx.Isolation == mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+						if newSnap, snapErr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); snapErr == nil {
+							o.ctx.Snap = newSnap
 						}
 					}
 					// M0100-0004: EPQ chain-following for RC; 40001 for RR.
@@ -1708,6 +1869,12 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						}
 					}
 					_ = computeGeneratedColumns(cols, pu.newRow)
+			// M0111-0001: restore columns that became null during decode→rebuild.
+			for i, c := range cols {
+				if c.GeneratedExpr == "" && pu.newRow[i].IsNull() && !pu.oldRow[i].IsNull() {
+					pu.newRow[i] = pu.oldRow[i]
+				}
+			}
 					pu.blk = newBlk
 					pu.slot = newSlot
 					continue // re-run loop to stamp xmax on new slot
@@ -1725,17 +1892,80 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					epqSkip = true
 					break
 				}
-				if err := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID); err != nil {
+				// Fire BEFORE UPDATE trigger after EPQ validation confirms the row
+				// will be updated. Fires at most once per pending update. Unlock
+				// the page first so trigger SQL can proceed safely.
+				if !trigFiredViaIdx && len(idxTbl.Triggers) > 0 {
+					trigFiredViaIdx = true
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					if errors.Is(err, storage.ErrUnsupportedItem) || errors.Is(err, storage.ErrInvalidSlot) {
+					retRow, trigOK := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+					if !trigOK {
+						// RETURN NULL — skip this row
+						epqSkip = true
+						break
+					}
+					pu.newRow = retRow
+					// Re-pin for the write.
+					var rerr error
+					s, rerr = o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
+					if rerr != nil {
+						return nil, rerr
+					}
+					s.Lock()
+					// Re-check for concurrent modification during trigger execution.
+					freshTup, freshErr := storage.PageGetHeapTuple(s.Page(), pu.slot)
+					if freshErr != nil || isConcurrentlyUpdated(freshTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+						s.Unlock()
+						o.ctx.Pool.Unpin(s)
+						if freshErr != nil {
+							epqSkip = true
+							break
+						}
+						// Concurrent update during trigger — EPQ-retry with same trigger skip.
+						continue
+					}
+					// Refresh oldTupleBytes from re-pinned page.
+					if freshErr == nil {
+						oldTupleBytes, _ = freshTup.MarshalBinary()
+					}
+				}
+				// Determine if this UPDATE is a cross-partition move so we
+				// can stamp the moved-partition sentinel (M0100-0005n) and route
+				// the write to the correct destination partition.
+				targetWriteRel := rel
+				targetWriteCols := cols
+				var destPartIdx *catalog.Table
+				isCrossPartitionMoveIdx := false
+				if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(idxTbl.PartitionKey) > 0 {
+					if dp := routeToPartition(idxTbl, pu.newRow, imW); dp != nil {
+						dpRel := o.ctx.Catalog.RelFileNode(dp)
+						if dpRel != rel {
+							isCrossPartitionMoveIdx = true
+						}
+						targetWriteRel = dpRel
+						targetWriteCols = dp.Columns
+						destPartIdx = dp
+						_ = computeGeneratedColumns(dp.Columns, pu.newRow)
+					}
+				}
+				var stampIdxErr error
+				if isCrossPartitionMoveIdx {
+					stampIdxErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, o.ctx.Tx.XID)
+				} else {
+					stampIdxErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
+				}
+				if stampIdxErr != nil {
+					s.Unlock()
+					o.ctx.Pool.Unpin(s)
+					if errors.Is(stampIdxErr, storage.ErrUnsupportedItem) || errors.Is(stampIdxErr, storage.ErrInvalidSlot) {
 						// Concurrent UPDATE/DELETE or opportunistic
 						// prune flipped this slot out of LP_NORMAL
 						// after scan-time. Skip the row.
 						epqSkip = true
 						break
 					}
-					return nil, err
+					return nil, stampIdxErr
 				}
 				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
 				s.Unlock()
@@ -1743,22 +1973,41 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				if derr != nil {
 					return nil, derr
 				}
-				newPtr, werr := writeHeapRowReturning(o.ctx, rel, cols, pu.newRow)
+				newPtr, werr := writeHeapRowReturning(o.ctx, targetWriteRel, targetWriteCols, pu.newRow)
 				if werr != nil {
 					return nil, werr
 				}
-				// M0100-0005z: link old tuple to new version via t_ctid for
-				// EPQ chain followers.
-				if cerr := stampOldCtid(o.ctx, rel, pu.blk, pu.slot, newPtr); cerr != nil {
-					return nil, cerr
+				// Maintain unique/PK btree entries for the new row version.
+				if destPartIdx != nil {
+					maintainUniqueIndexesForInsert(o.ctx, destPartIdx, targetWriteCols, pu.newRow, newPtr)
+				} else {
+					maintainUniqueIndexesForInsert(o.ctx, idxTbl, cols, pu.newRow, newPtr)
 				}
-				// Emit canonical WAL for this UPDATE: DELETE of old page
-				// (post xmax+ctid stamp) then INSERT of new page.
+				// M0100-0005z: link old tuple to new version via t_ctid for
+				// EPQ chain followers (non-cross-partition only).
+				if !isCrossPartitionMoveIdx {
+					if cerr := stampOldCtid(o.ctx, rel, pu.blk, pu.slot, newPtr); cerr != nil {
+						return nil, cerr
+					}
+				}
+				// Mark HeapKeysUpdated when an indexed column changed (HOT was
+				// not eligible). FOR KEY SHARE uses this bit to decide whether to
+				// wait on this xmax. Mirrors upstream heap_update's HEAP_KEYS_UPDATED
+				// stamping via PageSetHeapTupleKeysUpdated.
+				if !hotEligible && !isCrossPartitionMoveIdx {
+					if s2, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk}); perr == nil {
+						s2.Lock()
+						_ = storage.PageSetHeapTupleKeysUpdated(s2.Page(), pu.slot)
+						s2.Unlock()
+						o.ctx.Pool.Unpin(s2)
+					}
+				}
+				// Emit canonical WAL for this UPDATE.
 				if o.ctx.LogCanonical != nil {
 					if derr := emitCanonicalHeapDelete(o.ctx, rel, pu.blk, pu.slot); derr != nil {
 						return nil, derr
 					}
-					if ierr := emitCanonicalHeapInsert(o.ctx, rel, newPtr); ierr != nil {
+					if ierr := emitCanonicalHeapInsert(o.ctx, targetWriteRel, newPtr); ierr != nil {
 						return nil, ierr
 					}
 				}
@@ -1822,8 +2071,8 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		slot    uint16
 		cols    []catalog.Column // columns of the source relation
 		newRow  Row
-		oldRow  Row              // for BEFORE UPDATE trigger firing
-		scanTbl *catalog.Table   // table the row came from (M0100-0005o: partition-child triggers)
+		oldRow  Row            // for BEFORE UPDATE trigger firing
+		scanTbl *catalog.Table // table the row came from (M0100-0005o: partition-child triggers)
 	}
 	pending := make([]pendingUpdate, 0, 1)
 
@@ -1906,186 +2155,191 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			// EvalPlanQual retry loop (M0098-0004).
 			epqDoUpdateSeq := false // abort-confirmed bypass flag
 			for epqRetry := 0; ; epqRetry++ {
-			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: puRel, Block: pu.blk})
-			if err != nil {
-				return nil, err
-			}
-			s.Lock()
-			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
-			if !epqDoUpdateSeq && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
-				xmax := oldTup.Header.Xmax
-				s.Unlock()
-				o.ctx.Pool.Unpin(s)
-				if epqRetry >= maxEPQRetries {
-					return nil, &ExecError{
-						Code:    "40001",
-						Pos:     o.plan.Pos(),
-						Message: "could not serialize access due to concurrent update",
-					}
+				s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: puRel, Block: pu.blk})
+				if err != nil {
+					return nil, err
 				}
-				if epqWait(o.ctx, xmax) {
-					return nil, &ExecError{
-						Code:    "40001",
-						Pos:     o.plan.Pos(),
-						Message: "could not serialize access due to concurrent update (deadlock)",
-					}
-				}
-				// M0100-0004: EPQ chain-following for RC; 40001 for RR.
-				visible, _ := epqRecheckVisible(o.ctx, puRel, pu.blk, pu.slot)
-				if visible {
-					// xmax aborted; row still exists.
-					if !o.ctx.Snap.HasInProgress(xmax) {
-						epqDoUpdateSeq = true
-						continue // bypass EPQ on next iter; update code executes
-					}
-					continue // still in-progress; retry
-				}
-				// Concurrent tx committed — row was updated.
-				if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
-					return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
-						Message: "could not serialize access due to concurrent update"}
-				}
-				// RC: follow HOT chain and re-evaluate WHERE + SET.
-				// Cross-partition UPDATE sentinel check (see comment in the
-				// idxScan EPQ branch).
-				if epqSlotMovedToAnotherPartition(o.ctx, puRel, pu.blk, pu.slot) {
-					return nil, errMovedToAnotherPartition(o.plan.Pos())
-				}
-				newBlk := pu.blk
-				newSlot, baseRow, chainFound := epqFollowHOT(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred)
-				if !chainFound {
-					// Non-HOT cross-page chain (M0100-0005z): updates that
-					// land on a different page leave no HeapHotUpdated bit;
-					// followHOTChain terminates immediately. Walk the raw
-					// t_ctid chain instead.
-					if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred); cFound {
-						newBlk, newSlot, baseRow, chainFound = cBlk, cSlot, cRow, true
-					}
-				}
-				if !chainFound {
-					epqSkipSeq = true
-					break
-				}
-				// Re-bind SET expressions against the latest row.
-				for i := range puCols {
-					setIdx := i
-					if setIdx < len(o.plan.Set) && o.plan.Set[setIdx] != nil {
-						v, e := evalExpr(o.plan.Set[setIdx], baseRow, o.ctx)
-						if e != nil {
-							return nil, e
-						}
-						pu.newRow[i] = v
-					} else {
-						if i < len(baseRow) {
-							pu.newRow[i] = baseRow[i]
-						}
-					}
-				}
-				_ = computeGeneratedColumns(puCols, pu.newRow)
-				// M0100-0005aa: refresh OLD with the EPQ-refetched row so any
-				// BEFORE DELETE trigger fired later (cross-partition move) sees
-				// the concurrent updater's changes — partition-key-update-4.spec
-				// perm 2's BEFORE DELETE trigger reads OLD.b and inserts it into
-				// triglog; without the refresh OLD still reflects the row as it
-				// looked at scan-time, before s2's update2.
-				pu.oldRow = cloneRow(baseRow)
-				pu.blk = newBlk
-				pu.slot = newSlot
-				continue // re-run loop to stamp xmax on new slot
-			}
-			var oldTupleBytes []byte
-			if oldGerr == nil {
-				oldTupleBytes, _ = oldTup.MarshalBinary()
-			}
-			// For partition key UPDATE: route new row to correct partition.
-			// Compute the destination FIRST so we know whether to stamp
-			// the moved-partition sentinel on the old slot.
-			targetWriteRel := puRel
-			targetWriteCols := puCols
-			var destPart *catalog.Table
-			isCrossPartitionMove := false
-			if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(tbl.PartitionKey) > 0 {
-				destPart = routeToPartition(tbl, pu.newRow, imW)
-				if destPart != nil {
-					destRel := o.ctx.Catalog.RelFileNode(destPart)
-					if destRel != puRel {
-						isCrossPartitionMove = true
-					}
-					targetWriteRel = destRel
-					targetWriteCols = destPart.Columns
-					_ = computeGeneratedColumns(destPart.Columns, pu.newRow)
-				}
-			}
-			// M0100-0005aa: cross-partition UPDATE = DELETE + INSERT internally,
-			// so BEFORE DELETE triggers on the source partition must fire
-			// (matches upstream ExecCrossPartitionUpdate -> ExecDelete).
-			// partition-key-update-4.spec perm 2 has a BEFORE DELETE on the
-			// source leaf footrg1 that records OLD into triglog.  Fires AFTER
-			// the EPQ refetch so OLD reflects the concurrent updater's
-			// committed changes.
-			if isCrossPartitionMove && pu.scanTbl != nil && len(pu.scanTbl.Triggers) > 0 {
-				_, ok := fireTriggers(o.ctx, pu.scanTbl, "before", "delete", pu.oldRow, nil)
-				if !ok {
-					// RETURN NULL — suppress the row.
+				s.Lock()
+				oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
+				if !epqDoUpdateSeq && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+					xmax := oldTup.Header.Xmax
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					epqSkipSeq = true
-					break
+					if epqRetry >= maxEPQRetries {
+						return nil, &ExecError{
+							Code:    "40001",
+							Pos:     o.plan.Pos(),
+							Message: "could not serialize access due to concurrent update",
+						}
+					}
+					if epqWait(o.ctx, xmax) {
+						return nil, &ExecError{
+							Code:    "40001",
+							Pos:     o.plan.Pos(),
+							Message: "could not serialize access due to concurrent update (deadlock)",
+						}
+					}
+					// M0100-0004: EPQ chain-following for RC; 40001 for RR.
+					visible, _ := epqRecheckVisible(o.ctx, puRel, pu.blk, pu.slot)
+					if visible {
+						// xmax aborted; row still exists.
+						if !o.ctx.Snap.HasInProgress(xmax) {
+							epqDoUpdateSeq = true
+							continue // bypass EPQ on next iter; update code executes
+						}
+						continue // still in-progress; retry
+					}
+					// Concurrent tx committed — row was updated.
+					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+						return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
+							Message: "could not serialize access due to concurrent update"}
+					}
+					// RC: follow HOT chain and re-evaluate WHERE + SET.
+					// Cross-partition UPDATE sentinel check (see comment in the
+					// idxScan EPQ branch).
+					if epqSlotMovedToAnotherPartition(o.ctx, puRel, pu.blk, pu.slot) {
+						return nil, errMovedToAnotherPartition(o.plan.Pos())
+					}
+					newBlk := pu.blk
+					newSlot, baseRow, chainFound := epqFollowHOT(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred)
+					if !chainFound {
+						// Non-HOT cross-page chain (M0100-0005z): updates that
+						// land on a different page leave no HeapHotUpdated bit;
+						// followHOTChain terminates immediately. Walk the raw
+						// t_ctid chain instead.
+						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred); cFound {
+							newBlk, newSlot, baseRow, chainFound = cBlk, cSlot, cRow, true
+						}
+					}
+					if !chainFound {
+						epqSkipSeq = true
+						break
+					}
+					// Re-bind SET expressions against the latest row.
+					for i := range puCols {
+						setIdx := i
+						if setIdx < len(o.plan.Set) && o.plan.Set[setIdx] != nil {
+							v, e := evalExpr(o.plan.Set[setIdx], baseRow, o.ctx)
+							if e != nil {
+								return nil, e
+							}
+							pu.newRow[i] = v
+						} else {
+							if i < len(baseRow) {
+								pu.newRow[i] = baseRow[i]
+							}
+						}
+					}
+					_ = computeGeneratedColumns(puCols, pu.newRow)
+					// M0100-0005aa: refresh OLD with the EPQ-refetched row so any
+					// BEFORE DELETE trigger fired later (cross-partition move) sees
+					// the concurrent updater's changes — partition-key-update-4.spec
+					// perm 2's BEFORE DELETE trigger reads OLD.b and inserts it into
+					// triglog; without the refresh OLD still reflects the row as it
+					// looked at scan-time, before s2's update2.
+					pu.oldRow = cloneRow(baseRow)
+					pu.blk = newBlk
+					pu.slot = newSlot
+					continue // re-run loop to stamp xmax on new slot
 				}
-			}
-			var stampErr error
-			if isCrossPartitionMove {
-				stampErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, o.ctx.Tx.XID)
-			} else {
-				stampErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
-			}
-			if stampErr != nil {
+				var oldTupleBytes []byte
+				if oldGerr == nil {
+					oldTupleBytes, _ = oldTup.MarshalBinary()
+				}
+				// For partition key UPDATE: route new row to correct partition.
+				// Compute the destination FIRST so we know whether to stamp
+				// the moved-partition sentinel on the old slot.
+				targetWriteRel := puRel
+				targetWriteCols := puCols
+				var destPart *catalog.Table
+				isCrossPartitionMove := false
+				if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(tbl.PartitionKey) > 0 {
+					destPart = routeToPartition(tbl, pu.newRow, imW)
+					if destPart != nil {
+						destRel := o.ctx.Catalog.RelFileNode(destPart)
+						if destRel != puRel {
+							isCrossPartitionMove = true
+						}
+						targetWriteRel = destRel
+						targetWriteCols = destPart.Columns
+						_ = computeGeneratedColumns(destPart.Columns, pu.newRow)
+					}
+				}
+				// M0100-0005aa: cross-partition UPDATE = DELETE + INSERT internally,
+				// so BEFORE DELETE triggers on the source partition must fire
+				// (matches upstream ExecCrossPartitionUpdate -> ExecDelete).
+				// partition-key-update-4.spec perm 2 has a BEFORE DELETE on the
+				// source leaf footrg1 that records OLD into triglog.  Fires AFTER
+				// the EPQ refetch so OLD reflects the concurrent updater's
+				// committed changes.
+				if isCrossPartitionMove && pu.scanTbl != nil && len(pu.scanTbl.Triggers) > 0 {
+					_, ok := fireTriggers(o.ctx, pu.scanTbl, "before", "delete", pu.oldRow, nil)
+					if !ok {
+						// RETURN NULL — suppress the row.
+						s.Unlock()
+						o.ctx.Pool.Unpin(s)
+						epqSkipSeq = true
+						break
+					}
+				}
+				var stampErr error
+				if isCrossPartitionMove {
+					stampErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, o.ctx.Tx.XID)
+				} else {
+					stampErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
+				}
+				if stampErr != nil {
+					s.Unlock()
+					o.ctx.Pool.Unpin(s)
+					if errors.Is(stampErr, storage.ErrUnsupportedItem) {
+						continue
+					}
+					return nil, stampErr
+				}
+				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puRel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
-				if errors.Is(stampErr, storage.ErrUnsupportedItem) {
-					continue
-				}
-				return nil, stampErr
-			}
-			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puRel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
-			s.Unlock()
-			o.ctx.Pool.Unpin(s)
-			if derr != nil {
-				return nil, derr
-			}
-			// M0100-0005t: capture the new ItemPointer so we can maintain the
-			// destination partition's unique/PK indexes after a cross-partition
-			// (or in-place partition) UPDATE.  Without this, ON CONFLICT
-			// arbiters and the runtime unique-constraint check both miss the
-			// freshly-moved row on the destination leaf.
-			newPtr, werr := writeHeapRowReturning(o.ctx, targetWriteRel, targetWriteCols, pu.newRow)
-			if werr != nil {
-				return nil, werr
-			}
-			if destPart != nil {
-				maintainUniqueIndexesForInsert(o.ctx, destPart, targetWriteCols, pu.newRow, newPtr)
-			}
-			// M0100-0005z: link the old tuple to the new version via t_ctid
-			// for in-place (non-cross-partition) updates so EPQ chain
-			// followers can locate the latest version. Cross-partition
-			// moves stamp a sentinel into t_ctid above and must not be
-			// overwritten here.
-			if !isCrossPartitionMove {
-				if cerr := stampOldCtid(o.ctx, puRel, pu.blk, pu.slot, newPtr); cerr != nil {
-					return nil, cerr
-				}
-			}
-			// Emit canonical WAL for this UPDATE: DELETE of old page
-			// (post xmax+ctid stamp) then INSERT of new page.
-			if o.ctx.LogCanonical != nil {
-				if derr := emitCanonicalHeapDelete(o.ctx, puRel, pu.blk, pu.slot); derr != nil {
+				if derr != nil {
 					return nil, derr
 				}
-				if ierr := emitCanonicalHeapInsert(o.ctx, targetWriteRel, newPtr); ierr != nil {
-					return nil, ierr
+				// M0100-0005t: capture the new ItemPointer so we can maintain the
+				// destination partition's unique/PK indexes after a cross-partition
+				// (or in-place partition) UPDATE.  Without this, ON CONFLICT
+				// arbiters and the runtime unique-constraint check both miss the
+				// freshly-moved row on the destination leaf.
+				newPtr, werr := writeHeapRowReturning(o.ctx, targetWriteRel, targetWriteCols, pu.newRow)
+				if werr != nil {
+					return nil, werr
 				}
-			}
-			break // success — exit epq retry loop
+				if destPart != nil {
+					maintainUniqueIndexesForInsert(o.ctx, destPart, targetWriteCols, pu.newRow, newPtr)
+				} else if pu.scanTbl != nil {
+					// Non-partition in-place UPDATE: maintain unique/PK btree entries for
+					// the new row version. Enables ON CONFLICT arbiters and unique-constraint
+					// checks to find the live committed row after a concurrent UPDATE.
+					maintainUniqueIndexesForInsert(o.ctx, pu.scanTbl, targetWriteCols, pu.newRow, newPtr)
+				}
+				// M0100-0005z: link the old tuple to the new version via t_ctid
+				// for in-place (non-cross-partition) updates so EPQ chain
+				// followers can locate the latest version. Cross-partition
+				// moves stamp a sentinel into t_ctid above and must not be
+				// overwritten here.
+				if !isCrossPartitionMove {
+					if cerr := stampOldCtid(o.ctx, puRel, pu.blk, pu.slot, newPtr); cerr != nil {
+						return nil, cerr
+					}
+				}
+				// Emit canonical WAL for this UPDATE: DELETE of old page
+				// (post xmax+ctid stamp) then INSERT of new page.
+				if o.ctx.LogCanonical != nil {
+					if derr := emitCanonicalHeapDelete(o.ctx, puRel, pu.blk, pu.slot); derr != nil {
+						return nil, derr
+					}
+					if ierr := emitCanonicalHeapInsert(o.ctx, targetWriteRel, newPtr); ierr != nil {
+						return nil, ierr
+					}
+				}
+				break // success — exit epq retry loop
 			} // end epq retry loop
 		} // end if !used
 		if !epqSkipSeq {
@@ -2249,101 +2503,101 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		epqSkipDel := false
 		epqDoDelete := false // abort-confirmed bypass flag
 		for epqRetry := 0; ; epqRetry++ {
-		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: victimRel, Block: v.blk})
-		if err != nil {
-			return nil, err
-		}
-		s.Lock()
-		// M0090-0002: detect concurrent xmax-stamp under the
-		// exclusive Lock before our own stamp.
-		oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
-		if !epqDoDelete && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
-			xmax := oldTup.Header.Xmax
+			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: victimRel, Block: v.blk})
+			if err != nil {
+				return nil, err
+			}
+			s.Lock()
+			// M0090-0002: detect concurrent xmax-stamp under the
+			// exclusive Lock before our own stamp.
+			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
+			if !epqDoDelete && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+				xmax := oldTup.Header.Xmax
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				if epqRetry >= maxEPQRetries {
+					return nil, &ExecError{
+						Code:    "40001",
+						Pos:     o.plan.Pos(),
+						Message: "could not serialize access due to concurrent update",
+					}
+				}
+				if epqWait(o.ctx, xmax) {
+					return nil, &ExecError{
+						Code:    "40001",
+						Pos:     o.plan.Pos(),
+						Message: "could not serialize access due to concurrent update (deadlock)",
+					}
+				}
+				// M0100-0004: EPQ chain-following for RC; 40001 for RR.
+				visible, _ := epqRecheckVisible(o.ctx, victimRel, v.blk, v.slot)
+				if visible {
+					// xmax aborted; row still exists.
+					if !o.ctx.Snap.HasInProgress(xmax) {
+						epqDoDelete = true
+						continue // bypass EPQ on next iter; delete code executes
+					}
+					continue // still in-progress; retry
+				}
+				// Concurrent tx committed — row was updated.
+				if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+					return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
+						Message: "could not serialize access due to concurrent update"}
+				}
+				// RC: follow HOT chain and re-evaluate WHERE.
+				// Cross-partition UPDATE sentinel check: if the victim row was
+				// moved to a different partition by a concurrent committed UPDATE,
+				// raise the upstream "moved to another partition" error rather
+				// than silently skipping the row.
+				if epqSlotMovedToAnotherPartition(o.ctx, victimRel, v.blk, v.slot) {
+					return nil, errMovedToAnotherPartition(o.plan.Pos())
+				}
+				victimCols := v.cols
+				if victimCols == nil {
+					victimCols = tbl.Columns
+				}
+				newBlk := v.blk
+				newSlot, newRow, chainFound := epqFollowHOT(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred)
+				if !chainFound {
+					// Non-HOT cross-page chain (M0100-0005z).
+					if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred); cFound {
+						newBlk, newSlot, newRow, chainFound = cBlk, cSlot, cRow, true
+					}
+				}
+				if !chainFound {
+					epqSkipDel = true
+					break
+				}
+				v.blk = newBlk
+				v.slot = newSlot
+				if newRow != nil {
+					v.row = newRow // update for correct RETURNING after chain-follow
+				}
+				continue // re-run loop to stamp xmax on new slot
+			}
+			var oldTupleBytes []byte
+			if oldGerr == nil {
+				oldTupleBytes, _ = oldTup.MarshalBinary()
+			}
+			if err := storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID); err != nil {
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				if errors.Is(err, storage.ErrUnsupportedItem) {
+					epqSkipDel = true
+					break
+				}
+				return nil, err
+			}
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, victimRel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
-			if epqRetry >= maxEPQRetries {
-				return nil, &ExecError{
-					Code:    "40001",
-					Pos:     o.plan.Pos(),
-					Message: "could not serialize access due to concurrent update",
-				}
+			if derr != nil {
+				return nil, derr
 			}
-			if epqWait(o.ctx, xmax) {
-				return nil, &ExecError{
-					Code:    "40001",
-					Pos:     o.plan.Pos(),
-					Message: "could not serialize access due to concurrent update (deadlock)",
-				}
+			if cerr := emitCanonicalHeapDelete(o.ctx, victimRel, v.blk, v.slot); cerr != nil {
+				return nil, cerr
 			}
-			// M0100-0004: EPQ chain-following for RC; 40001 for RR.
-			visible, _ := epqRecheckVisible(o.ctx, victimRel, v.blk, v.slot)
-			if visible {
-				// xmax aborted; row still exists.
-				if !o.ctx.Snap.HasInProgress(xmax) {
-					epqDoDelete = true
-					continue // bypass EPQ on next iter; delete code executes
-				}
-				continue // still in-progress; retry
-			}
-			// Concurrent tx committed — row was updated.
-			if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
-				return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
-					Message: "could not serialize access due to concurrent update"}
-			}
-			// RC: follow HOT chain and re-evaluate WHERE.
-			// Cross-partition UPDATE sentinel check: if the victim row was
-			// moved to a different partition by a concurrent committed UPDATE,
-			// raise the upstream "moved to another partition" error rather
-			// than silently skipping the row.
-			if epqSlotMovedToAnotherPartition(o.ctx, victimRel, v.blk, v.slot) {
-				return nil, errMovedToAnotherPartition(o.plan.Pos())
-			}
-			victimCols := v.cols
-			if victimCols == nil {
-				victimCols = tbl.Columns
-			}
-			newBlk := v.blk
-			newSlot, newRow, chainFound := epqFollowHOT(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred)
-			if !chainFound {
-				// Non-HOT cross-page chain (M0100-0005z).
-				if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred); cFound {
-					newBlk, newSlot, newRow, chainFound = cBlk, cSlot, cRow, true
-				}
-			}
-			if !chainFound {
-				epqSkipDel = true
-				break
-			}
-			v.blk = newBlk
-			v.slot = newSlot
-			if newRow != nil {
-				v.row = newRow // update for correct RETURNING after chain-follow
-			}
-			continue // re-run loop to stamp xmax on new slot
-		}
-		var oldTupleBytes []byte
-		if oldGerr == nil {
-			oldTupleBytes, _ = oldTup.MarshalBinary()
-		}
-		if err := storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID); err != nil {
-			s.Unlock()
-			o.ctx.Pool.Unpin(s)
-			if errors.Is(err, storage.ErrUnsupportedItem) {
-				epqSkipDel = true
-				break
-			}
-			return nil, err
-		}
-		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, victimRel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
-		s.Unlock()
-		o.ctx.Pool.Unpin(s)
-		if derr != nil {
-			return nil, derr
-		}
-		if cerr := emitCanonicalHeapDelete(o.ctx, victimRel, v.blk, v.slot); cerr != nil {
-			return nil, cerr
-		}
-		break // success — exit epq retry loop
+			break // success — exit epq retry loop
 		} // end epq retry loop
 		if !epqSkipDel {
 			// M0104-0007: SSI write-path hook on the deleted tuple's slot.
@@ -2446,10 +2700,9 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			// xmin (visible writer) and xmax (concurrent overwriter
 			// hidden by snapshot).
 			ssiRecordTupleRead(ctx, rel, blk, slot, tuple.Header.Xmin, tuple.Header.Xmax)
-			if err := DecodeRowInto(scanRow, cols, tuple.Data); err != nil {
-				s.RUnlock()
-				ctx.Pool.Unpin(s)
-				return err
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			if err := DecodeRowIntoMctxPGTuple(scanRow, cols, tuple.Data, tuple.Bitmap, storedNatts, nil); err != nil {
+				continue // skip undecodable tuples (e.g. schema mismatch)
 			}
 			if pred != nil {
 				v, err := evalExpr(pred, scanRow, ctx)
@@ -2565,7 +2818,6 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 	}
 }
 
-
 // checkUniqueIndexesForInsert enforces unique-constraint violations at INSERT
 // time. For each unique/primary btree index on `tbl`, it computes the
 // candidate key from `row` and probes the index for a matching live entry.
@@ -2603,7 +2855,29 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		if err != nil || key == nil {
 			continue
 		}
-		var conflict bool
+		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, pos); raiseErr != nil {
+			return raiseErr
+		}
+	}
+	return nil
+}
+
+// uniqueCheckWithWait probes a unique btree for a conflicting live tuple.
+// If the conflict row was inserted by another in-flight xact (xmin is active
+// and not ours), it waits for that xact to commit or abort then re-checks:
+//   - Committed + SERIALIZABLE/RR → 40001 serialization failure
+//   - Committed + RC              → 23505 unique violation
+//   - Aborted                     → no conflict, continue
+//
+// Mirrors upstream heap_check_unique's WaitForLockersMultiple path that
+// produces the <waiting ...> interleaving seen in read-write-unique.spec.
+func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTree, key []byte, idxName string, pos int) error {
+	var inflightXmin storage.TransactionID
+	var liveConflict bool
+
+	scanOnce := func() {
+		inflightXmin = storage.InvalidTransactionID
+		liveConflict = false
 		_ = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 			slot, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 			if perr != nil {
@@ -2616,21 +2890,55 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 			if terr != nil {
 				return true, nil
 			}
-			if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
-				conflict = true
+			xmin := tuple.Header.Xmin
+			selfXID := ctx.Tx.XID
+			// In-flight other-xact insert: must wait.
+			if ctx.TxnMgr != nil && xmin != storage.InvalidTransactionID &&
+				(selfXID == storage.InvalidTransactionID || xmin != selfXID) &&
+				ctx.TxnMgr.IsXIDActive(xmin) {
+				inflightXmin = xmin
+				return false, nil
+			}
+			if isLiveForUniqueCheck(ctx, xmin, tuple.Header.Xmax) {
+				liveConflict = true
 				return false, nil
 			}
 			return true, nil
 		})
-		if conflict {
-			return &ExecError{
-				Code: "23505",
-				Pos:  pos,
-				Message: fmt.Sprintf(
-					"duplicate key value violates unique constraint %q",
-					idx.Name,
-				),
+	}
+
+	scanOnce()
+	if inflightXmin != storage.InvalidTransactionID {
+		// Block until the other transaction commits or rolls back.
+		_ = ctx.TxnMgr.WaitForXID(ctx.Ctx, inflightXmin)
+		// Re-scan to check whether the row survived.
+		scanOnce()
+		// If another in-flight xact is holding the slot, treat as live.
+		if inflightXmin != storage.InvalidTransactionID {
+			liveConflict = true
+		}
+		if liveConflict {
+			if ctx.Tx.Isolation == mvcc.IsolationSerializable || ctx.Tx.Isolation == mvcc.IsolationRepeatableRead {
+				return &ExecError{
+					Code:    "40001",
+					Pos:     pos,
+					Message: "could not serialize access due to read/write dependencies among transactions",
+					Detail:  "Reason code: Canceled on identification as a pivot, during write.",
+					Hint:    "The transaction might succeed if retried.",
+				}
 			}
+			// RC: fall through to 23505 below.
+		} else {
+			// Other xact rolled back — no conflict.
+			return nil
+		}
+	}
+
+	if liveConflict {
+		return &ExecError{
+			Code:    "23505",
+			Pos:     pos,
+			Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idxName),
 		}
 	}
 	return nil
@@ -2660,6 +2968,12 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 		case ctx.Snap.SeesCommittedXID(xmin):
 			xminLive = true
 		case ctx.Snap.HasAborted(xmin):
+			xminLive = false
+		case ctx.TxnMgr.HasAbortedXID(xmin):
+			// Aborted after our snapshot was taken — not a live duplicate.
+			// Without this arm the xid falls to `default` (live) and a MERGE
+			// NOT MATCHED INSERT that waited for a concurrent aborter would
+			// raise a spurious 23505. M0100-0005.
 			xminLive = false
 		default:
 			// Unknown xmin (committed before snapshot start, or a
@@ -2708,8 +3022,11 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 // page in a checkpoint epoch emit a small logical record instead
 // of a full FPI. See docs/design/0002-0003-redo-records.md.
 func writeHeapRow(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, row Row) error {
-	_, err := writeHeapRowReturning(ctx, rel, cols, row)
-	return err
+	ptr, err := writeHeapRowReturning(ctx, rel, cols, row)
+	if err != nil {
+		return err
+	}
+	return emitCanonicalHeapInsert(ctx, rel, ptr)
 }
 
 // writeHeapRowReturning is writeHeapRow's variant that surfaces the
@@ -2837,22 +3154,24 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return false, nil
 	}
 
-	// FSM consultation (M0046-0003): if a page freed by a previous
-	// VACUUM has enough room, use it before trying the last block or
-	// extending the relation.
+	// FSM consultation: ask the FSM for up to candidatesPerInsert pages
+	// with enough room and pick the one with the lowest live pin count
+	// (M0107-0007 slice C — pin-aware page selection per
+	// docs/design/perf-optimize/07-wal-fsm-insert.md §3). Returns
+	// (0, false) when every candidate is at or above hotPinThreshold,
+	// signalling the caller to fall through to extension instead of
+	// converging on a hot tail page.
 	minFreeBytes := uint16(len(tupleBytes) + 4) // 4 = itemIDSize (line pointer size)
-	if ctx.FSM != nil {
-		if fsmBlk, ok := ctx.FSM.GetPageWithFreeSpace(rel, minFreeBytes); ok {
-			appended, err := tryAppendToBlock(fsmBlk)
-			if err != nil {
-				return ptr, err
-			}
-			if appended {
-				return ptr, nil
-			}
-			// Stale FSM entry — invalidation was already done in
-			// tryAppendToBlock above; fall through to normal path.
+	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
+		appended, err := tryAppendToBlock(fsmBlk)
+		if err != nil {
+			return ptr, err
 		}
+		if appended {
+			return ptr, nil
+		}
+		// Stale FSM entry — invalidation was already done in
+		// tryAppendToBlock above; fall through to normal path.
 	}
 
 	// Try the last existing block first.
@@ -2872,11 +3191,30 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 
 	// Extend. Serialise relation extension so concurrent writers don't
 	// race on PinNew and corrupt pin accounting for the freshly-grown
-	// tail block under heavy insert workloads.
-	unlock := lockHeapExtend(rel)
+	// tail block under heavy insert workloads. Striped 8-way by procNum
+	// per M0107-0007 slice A so up to 8 stripes can extend in parallel;
+	// `contended` is set when our TryLock failed, the proxy for "another
+	// stripe-mate is already extending" that gates batched-extend per
+	// M0107-0007 slice C ([[0107-0007g]] §3).
+	unlock, contended := lockHeapExtend(rel, ctx.ProcNum)
 	defer unlock()
 
-	// Re-check after taking the extension lock; another writer may
+	// Re-consult the FSM after taking the extend lock — a concurrent
+	// stripe may have just batch-extended and registered fresh
+	// candidates ([[0107-0007g]] §3 step 5). Picking one of those
+	// extras here is the cross-stripe distribution mechanism: without
+	// it we would extend again and converge on a new tail page.
+	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
+		appended, err := tryAppendToBlock(fsmBlk)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
+		}
+	}
+
+	// Tail-block re-check after taking the lock; another writer may
 	// already have extended and/or inserted into the new tail block.
 	nBlocks, err = ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -2892,6 +3230,36 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		}
 	}
 
+	if contended {
+		// Batch-extend: under contention, append extendBatchSize empty
+		// pages in one syscall and FSM-register the extras so
+		// subsequent inserters spread across them (M0107-0007 slice C
+		// — [[0107-0007g]]). One disk-side syscall covers the burst
+		// instead of one per stripe; the extras prime the cross-stripe
+		// FSM re-check above.
+		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel)
+		if err != nil {
+			return ptr, err
+		}
+		appended, err := tryAppendToBlock(firstBlk)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
+		}
+		// Unreachable: ExtendRelationBatch pre-inits every page with
+		// max free space, so PageAddHeapTuple cannot return
+		// ErrNoSpaceInPage on the first insert. A non-nil err would
+		// have been returned by tryAppendToBlock above.
+		return ptr, &ExecError{Code: "XX000", Message: "freshly batch-extended page did not accept tuple"}
+	}
+
+	// Uncontended single-extender path: PinNew avoids the post-extend
+	// disk read of the batched primitive (the slot is pinned + dirty
+	// in-memory before we ever touch the disk for content) and adds
+	// only one page, matching the test-fixture invariant that a single
+	// INSERT into a fresh relation grows it by exactly one page.
 	slot, blk, err := ctx.Pool.PinNew(rel)
 	if err != nil {
 		return ptr, err
@@ -3008,16 +3376,17 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		return false, nil
 	}
 
+	// FSM consultation with pin-aware ranking (M0107-0007 slice C); same
+	// rewrite as writeHeapRowReturning above, applied to the PG-canonical
+	// path. See docs/design/perf-optimize/07-wal-fsm-insert.md §3.
 	minFreeBytes := uint16(len(tupleBytes) + 4)
-	if ctx.FSM != nil {
-		if fsmBlk, ok := ctx.FSM.GetPageWithFreeSpace(rel, minFreeBytes); ok {
-			appended, err := tryAppendToBlock(fsmBlk)
-			if err != nil {
-				return ptr, err
-			}
-			if appended {
-				return ptr, nil
-			}
+	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
+		appended, err := tryAppendToBlock(fsmBlk)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
 		}
 	}
 
@@ -3035,8 +3404,22 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		}
 	}
 
-	unlock := lockHeapExtend(rel)
+	// Striped extend lock (M0107-0007 slice A) + cross-stripe FSM
+	// re-check + adaptive single-vs-batched extend tail, mirroring the
+	// canonical writeHeapRowReturning above. See [[0107-0007g]] for the
+	// rationale.
+	unlock, contended := lockHeapExtend(rel, ctx.ProcNum)
 	defer unlock()
+
+	if fsmBlk, ok := selectFSMCandidatePage(ctx.FSM, ctx.Pool, rel, minFreeBytes); ok {
+		appended, err := tryAppendToBlock(fsmBlk)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
+		}
+	}
 
 	nBlocks, err = ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -3050,6 +3433,21 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		if appended {
 			return ptr, nil
 		}
+	}
+
+	if contended {
+		firstBlk, err := batchExtendAndRegisterFSM(ctx.Pool, ctx.FSM, rel)
+		if err != nil {
+			return ptr, err
+		}
+		appended, err := tryAppendToBlock(firstBlk)
+		if err != nil {
+			return ptr, err
+		}
+		if appended {
+			return ptr, nil
+		}
+		return ptr, &ExecError{Code: "XX000", Message: "freshly batch-extended page did not accept tuple"}
 	}
 
 	slot, blk, err := ctx.Pool.PinNew(rel)

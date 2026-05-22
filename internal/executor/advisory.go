@@ -1,6 +1,6 @@
 package executor
 
-// advisory.go — session-scoped advisory lock manager (M0096-0003).
+// advisory.go — advisory lock manager (M0096-0003).
 //
 // Implements the blocking/non-blocking variants of PostgreSQL's advisory
 // lock functions so isolation specs that use pg_advisory_lock as a step
@@ -8,7 +8,8 @@ package executor
 // as "<waiting ...>" when its query has not returned within 300 ms).
 //
 // Design: a single process-global Manager with a map of lock-key → holder
-// session ID plus per-key waiter queues implemented with channels.
+// session ID plus separate session-level and transaction-level hold counts,
+// and per-key waiter queues implemented with channels.
 // Blocking in Go happens naturally because each isolation-spec step runs in
 // its own goroutine; when that goroutine blocks inside acquire(), the
 // IsolationRunner's 300-ms timer fires and records the step as waiting.
@@ -43,36 +44,167 @@ type advisoryWaiter struct {
 	ready chan struct{} // closed by release() to wake this waiter
 }
 
+type advisoryHold struct {
+	owner        uintptr
+	sessionCount int
+	xactCount    int
+}
+
+type advisorySessionHolds struct {
+	session map[advisoryKey]int
+	xact    map[advisoryKey]int
+}
+
 // advisoryManager is the process-global advisory lock state.
 type advisoryManager struct {
 	mu        sync.Mutex
-	held      map[advisoryKey]uintptr            // key → session that holds it
+	held      map[advisoryKey]advisoryHold       // key → hold counts for one owner
 	waiters   map[advisoryKey][]*advisoryWaiter  // key → pending waiters
-	bySession map[uintptr][]advisoryKey          // session → keys it holds
+	bySession map[uintptr]*advisorySessionHolds  // session → held keys by scope
 }
 
 // globalAdvisoryMgr is the single advisory lock manager for this process.
 var globalAdvisoryMgr = &advisoryManager{
-	held:      make(map[advisoryKey]uintptr),
+	held:      make(map[advisoryKey]advisoryHold),
 	waiters:   make(map[advisoryKey][]*advisoryWaiter),
-	bySession: make(map[uintptr][]advisoryKey),
+	bySession: make(map[uintptr]*advisorySessionHolds),
+}
+
+func (m *advisoryManager) sessionStateLocked(sess uintptr) *advisorySessionHolds {
+	state := m.bySession[sess]
+	if state == nil {
+		state = &advisorySessionHolds{
+			session: make(map[advisoryKey]int),
+			xact:    make(map[advisoryKey]int),
+		}
+		m.bySession[sess] = state
+	}
+	return state
+}
+
+func (m *advisoryManager) cleanupSessionStateLocked(sess uintptr) {
+	state := m.bySession[sess]
+	if state == nil {
+		return
+	}
+	if len(state.session) == 0 && len(state.xact) == 0 {
+		delete(m.bySession, sess)
+	}
+}
+
+func (m *advisoryManager) addHoldLocked(key advisoryKey, sess uintptr, xactScoped bool) {
+	hold := m.held[key]
+	if hold.owner == 0 {
+		hold.owner = sess
+	}
+	state := m.sessionStateLocked(sess)
+	if xactScoped {
+		hold.xactCount++
+		state.xact[key]++
+	} else {
+		hold.sessionCount++
+		state.session[key]++
+	}
+	m.held[key] = hold
+}
+
+func (m *advisoryManager) wakeWaitersLocked(key advisoryKey) {
+	for _, w := range m.waiters[key] {
+		close(w.ready)
+	}
+	delete(m.waiters, key)
+}
+
+func (m *advisoryManager) releaseSessionLocked(key advisoryKey, sess uintptr) bool {
+	hold, held := m.held[key]
+	if !held || hold.owner != sess || hold.sessionCount == 0 {
+		return false
+	}
+
+	hold.sessionCount--
+	state := m.bySession[sess]
+	if state != nil {
+		if state.session[key] <= 1 {
+			delete(state.session, key)
+		} else {
+			state.session[key]--
+		}
+	}
+	if hold.sessionCount == 0 && hold.xactCount == 0 {
+		delete(m.held, key)
+		m.wakeWaitersLocked(key)
+	} else {
+		m.held[key] = hold
+	}
+	m.cleanupSessionStateLocked(sess)
+	return true
+}
+
+func (m *advisoryManager) releaseAllSessionLocked(sess uintptr) {
+	state := m.bySession[sess]
+	if state == nil {
+		return
+	}
+	for key, count := range state.session {
+		hold, held := m.held[key]
+		if !held || hold.owner != sess {
+			continue
+		}
+		hold.sessionCount -= count
+		if hold.sessionCount < 0 {
+			hold.sessionCount = 0
+		}
+		if hold.sessionCount == 0 && hold.xactCount == 0 {
+			delete(m.held, key)
+			m.wakeWaitersLocked(key)
+		} else {
+			m.held[key] = hold
+		}
+	}
+	state.session = make(map[advisoryKey]int)
+	m.cleanupSessionStateLocked(sess)
+}
+
+func (m *advisoryManager) releaseAllXactLocked(sess uintptr) {
+	state := m.bySession[sess]
+	if state == nil {
+		return
+	}
+	for key, count := range state.xact {
+		hold, held := m.held[key]
+		if !held || hold.owner != sess {
+			continue
+		}
+		hold.xactCount -= count
+		if hold.xactCount < 0 {
+			hold.xactCount = 0
+		}
+		if hold.sessionCount == 0 && hold.xactCount == 0 {
+			delete(m.held, key)
+			m.wakeWaitersLocked(key)
+		} else {
+			m.held[key] = hold
+		}
+	}
+	state.xact = make(map[advisoryKey]int)
+	m.cleanupSessionStateLocked(sess)
 }
 
 // acquire blocks until the lock is available for sess or ctx is cancelled.
 // Returns ctx.Err() if cancelled, nil on success.
-func (m *advisoryManager) acquire(ctx context.Context, key advisoryKey, sess uintptr) error {
+func (m *advisoryManager) acquire(ctx context.Context, key advisoryKey, sess uintptr, xactScoped bool) error {
 	m.mu.Lock()
 
 	holder, held := m.held[key]
 	if !held {
 		// Lock is free — acquire immediately.
-		m.held[key] = sess
-		m.bySession[sess] = append(m.bySession[sess], key)
+		m.addHoldLocked(key, sess, xactScoped)
 		m.mu.Unlock()
 		return nil
 	}
-	if holder == sess {
+	if holder.owner == sess {
 		// Same session already holds it — re-entrant, no-op.
+		m.addHoldLocked(key, sess, xactScoped)
 		m.mu.Unlock()
 		return nil
 	}
@@ -88,7 +220,7 @@ func (m *advisoryManager) acquire(ctx context.Context, key advisoryKey, sess uin
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return m.acquire(ctx, key, sess)
+		return m.acquire(ctx, key, sess, xactScoped)
 
 	case <-ctx.Done():
 		// Cancelled before we got the lock — remove our waiter entry.
@@ -107,18 +239,15 @@ func (m *advisoryManager) acquire(ctx context.Context, key advisoryKey, sess uin
 
 // tryAcquire is a non-blocking attempt to acquire the lock.
 // Returns true if acquired, false if already held by a different session.
-func (m *advisoryManager) tryAcquire(key advisoryKey, sess uintptr) bool {
+func (m *advisoryManager) tryAcquire(key advisoryKey, sess uintptr, xactScoped bool) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	holder, held := m.held[key]
-	if held && holder != sess {
+	if held && holder.owner != sess {
 		return false
 	}
-	m.held[key] = sess
-	if !held {
-		m.bySession[sess] = append(m.bySession[sess], key)
-	}
+	m.addHoldLocked(key, sess, xactScoped)
 	return true
 }
 
@@ -127,51 +256,30 @@ func (m *advisoryManager) tryAcquire(key advisoryKey, sess uintptr) bool {
 func (m *advisoryManager) release(key advisoryKey, sess uintptr) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	holder, held := m.held[key]
-	if !held || holder != sess {
-		return false
-	}
-
-	delete(m.held, key)
-
-	// Remove from session's held-key list.
-	list := m.bySession[sess]
-	for i, k := range list {
-		if k == key {
-			m.bySession[sess] = append(list[:i], list[i+1:]...)
-			break
-		}
-	}
-	if len(m.bySession[sess]) == 0 {
-		delete(m.bySession, sess)
-	}
-
-	// Wake all waiters for this key so they retry.
-	for _, w := range m.waiters[key] {
-		close(w.ready)
-	}
-	delete(m.waiters, key)
-
-	return true
+	return m.releaseSessionLocked(key, sess)
 }
 
-// releaseAll releases every lock held by sess and wakes associated waiters.
-// Called by pg_advisory_unlock_all() and implicitly at session teardown.
+// releaseAllSession releases every session-scoped advisory lock held by sess.
+// Transaction-scoped locks are unaffected.
+func (m *advisoryManager) releaseAllSession(sess uintptr) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseAllSessionLocked(sess)
+}
+
+// releaseAllXact releases every transaction-scoped advisory lock held by sess.
+func (m *advisoryManager) releaseAllXact(sess uintptr) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releaseAllXactLocked(sess)
+}
+
+// releaseAll releases every advisory lock held by sess, regardless of scope.
 func (m *advisoryManager) releaseAll(sess uintptr) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	for _, key := range m.bySession[sess] {
-		if holder := m.held[key]; holder == sess {
-			delete(m.held, key)
-			for _, w := range m.waiters[key] {
-				close(w.ready)
-			}
-			delete(m.waiters, key)
-		}
-	}
-	delete(m.bySession, sess)
+	m.releaseAllSessionLocked(sess)
+	m.releaseAllXactLocked(sess)
 }
 
 // advisorySessionID returns a stable uintptr identity for a Session, used
@@ -181,9 +289,16 @@ func advisorySessionID(sess Session) uintptr {
 	if sess == nil {
 		return 0
 	}
-	v := reflect.ValueOf(sess)
-	if v.Kind() == reflect.Ptr && !v.IsNil() {
-		return uintptr(v.Pointer())
+	return advisoryPointerID(sess)
+}
+
+func advisoryPointerID(v any) uintptr {
+	if v == nil {
+		return 0
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Ptr && !rv.IsNil() {
+		return uintptr(rv.Pointer())
 	}
 	return 0
 }
@@ -205,6 +320,19 @@ func advisorySessionIDFromContext(ctx *Context) uintptr {
 	if ctx.Session != nil {
 		return advisorySessionID(ctx.Session)
 	}
+	if ctx.AdvisorySessionIdentity != nil {
+		if id := advisoryPointerID(ctx.AdvisorySessionIdentity); id != 0 {
+			return id
+		}
+	}
 	// Fallback for contexts that have neither (e.g. unit tests with no Session).
 	return uintptr(ctx.BackendID)
+}
+
+// ReleaseAdvisoryTransactionLocks releases all xact-scoped advisory locks for
+// the given stable session identity. Used at transaction end.
+func ReleaseAdvisoryTransactionLocks(identity any) {
+	if id := advisoryPointerID(identity); id != 0 {
+		globalAdvisoryMgr.releaseAllXact(id)
+	}
 }

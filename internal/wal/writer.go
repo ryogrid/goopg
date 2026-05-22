@@ -11,6 +11,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/stats"
 )
 
 // groupFlushReq represents a single caller's flush request in the
@@ -292,6 +295,21 @@ type Writer struct {
 	// from a short-form one without having to thread cfg in.
 	segmentSize int64
 
+	// core is the M0107-0007 slice B WAL-insert striping packaging
+	// struct (`docs/design/0107-0007v-wal-stripe-writer-core.md`).
+	// Mounted here so the eventual call-site rewrite can replace
+	// `state.append`'s body with `s.core.Append(procNum, encoded)`
+	// and the drain goroutine's per-tick prelude with
+	// `s.core.PublishUpTo(...)` — see
+	// `docs/design/0107-0007w-wal-stripe-writer-core-mount.md`. The
+	// core is constructed in `NewWriter` after `loadState` so it
+	// borrows the same `walBuf` / `memRing` rings as the legacy path
+	// (one allocation, two consumers — duplicating the rings would
+	// fork on-disk visibility). Dead code until the call-site
+	// rewrite consumes it; access in tests is guarded by the
+	// `stripeCore()` accessor below.
+	core *stripeWriterCore
+
 	// OnWALWrite and OnWALSync are optional hooks called before
 	// blocking WAL write / fdatasync operations.  The caller
 	// (initdb.Open) sets them via activity.LookupGoroutine so
@@ -349,10 +367,17 @@ type state struct {
 	// (legacy / no-engine deployments).
 	aio AIOEngine
 
-	// appendMu serialises access to walBuf / memRing / writePos /
-	// writeLSN / drainedLSN so that Writer.Append (M0026 concurrent
-	// append) and the state loop's drain path do not race.
-	appendMu sync.Mutex
+	// appendMu coordinates access between concurrent tryAppend goroutines
+	// and the state-loop's exclusive drain/Path-A paths.
+	//
+	// RLock (multiple holders OK): tryAppend PG-compat Path B — stripe
+	//   writes are internally serialised by per-stripe locks; walBuf
+	//   bytes are written to disjoint LSN ranges; head/base are stable.
+	// Lock (exclusive): appendPGCompat Path A (direct disk write +
+	//   resetPosition), appendPGCompat Path B (may drain walBuf),
+	//   appendRaw (may drain + resetPosition), append non-pageHeaders,
+	//   DrainedLSN/readBufferedAt readers that observe drainedLSN.
+	appendMu sync.RWMutex
 
 	// memRing mirrors recently-written WAL bytes in RAM so
 	// walsender's RecordIterator can stream without paying for
@@ -387,19 +412,30 @@ type state struct {
 	// write in writeAt. Set by NewWriter from the Writer's OnWALWrite.
 	onWALWrite func()
 
+	// core is the slice B stripe writer core, mounted by NewWriter and
+	// shared with Writer.core (same pointer). state.append's PG-compat
+	// Path B calls core.AppendXLogPayload instead of the old
+	// encodeRecordXLog + emitWithPageHeaders + walBuf.append sequence.
+	// nil before NewWriter completes; nil-safe across all core methods.
+	core *stripeWriterCore
+
 	// fg is the group-commit flush queue, shared with Writer. M0098-0002.
 	fg *flushGroup
 }
 
-// walBufferCounters holds the atomic lifetime counters that
+// walBufferCounters holds the lifetime drain counters that
 // pg_stat_wal_io's M0013-0003 columns surface. The two drain
 // buckets are kept separate so an operator can tell a sizing
 // problem (high overflowDrainBytes) from natural commit /
 // eviction durability cost (high flushDrainBytes). Single
 // allocation owned by Writer; shared with state via pointer.
+// Counters are per-P sharded via stats.Counter (M0107-0008
+// loop 11) so the lines do not bounce across cores even when
+// multiple backend goroutines drive the drain serially under
+// state.appendMu.
 type walBufferCounters struct {
-	overflowDrainBytes atomic.Uint64
-	flushDrainBytes    atomic.Uint64
+	overflowDrainBytes stats.Counter
+	flushDrainBytes    stats.Counter
 }
 
 // drainReason classifies which counter a drainBufferBytes call
@@ -447,6 +483,14 @@ func NewWriter(cfg Config) (*Writer, error) {
 	st.onLoopEnd = cfg.OnLoopEnd
 	st.onWALWrite = cfg.OnWALWrite
 	st.fg = fg
+	w.core = newStripeWriterCore(
+		uint64(cfg.SegmentSize),
+		uint64(st.writePos),
+		st.prevRecPtr,
+		st.walBuf,
+		st.memRing,
+	)
+	st.core = w.core // share core pointer so state.append can call AppendXLogPayload
 	go st.loop(w.ops, w.done)
 	return w, nil
 }
@@ -512,7 +556,7 @@ func (w *Writer) WALBuffersOverflowDrainBytes() uint64 {
 	if w.walBufferCounters == nil {
 		return 0
 	}
-	return w.walBufferCounters.overflowDrainBytes.Load()
+	return uint64(w.walBufferCounters.overflowDrainBytes.Sum())
 }
 
 // WALBuffersFlushDrainBytes returns the lifetime total bytes
@@ -523,7 +567,7 @@ func (w *Writer) WALBuffersFlushDrainBytes() uint64 {
 	if w.walBufferCounters == nil {
 		return 0
 	}
-	return w.walBufferCounters.flushDrainBytes.Load()
+	return uint64(w.walBufferCounters.flushDrainBytes.Sum())
 }
 
 // WrittenLSN returns the LSN of the last byte the writer has
@@ -775,6 +819,15 @@ func loadState(cfg Config) (*state, error) {
 	}
 	if st.walBuf != nil {
 		st.walBuf.reset(writePos)
+	}
+	// Anchor the MemRing at writePos so ReadAt never returns zeros for WAL
+	// positions written to disk by a prior session (e.g. initdb). Without this,
+	// after the first Path-B append advances tail past an old segment boundary,
+	// ReadAt(oldPos) returns true but yields zeros — the ring was never written
+	// at that offset — causing the walsender to serve an all-zero page to PG
+	// standbys ("invalid magic number 0000").
+	if st.memRing != nil {
+		st.memRing.ResetToPos(writePos)
 	}
 	return st, nil
 }
@@ -1101,34 +1154,19 @@ func (s *state) handleGroupFlush() {
 }
 
 func (s *state) append(payload []byte) (uint64, uint64, error) {
+	// PG-compat (pageHeaders) path: use stripe B (core.AppendXLogPayload)
+	// for Path B, and the old encode path for Path A (direct disk write).
+	if s.pageHeaders {
+		return s.appendPGCompat(payload)
+	}
+
+	// Non-pageHeaders (legacy binary format): original encodeRecord path.
 	record := encodeRecord(payload)
 	realRecLen := len(record)
-	if s.pageHeaders {
-		var err error
-		record, realRecLen, err = encodeRecordXLog(payload, s.prevRecPtr)
-		if err != nil {
-			return 0, 0, err
-		}
-	}
 
 	// Path A: WAL buffer disabled, OR record larger than the
 	// entire buffer. Bypass and write straight to disk.
-	//
-	// M0099: The original code read s.writePos before acquiring appendMu,
-	// allowing concurrent tryAppend callers to advance s.writePos in the
-	// window between the read and the appendMu-protected update. Path A
-	// would then clobber s.writePos with a stale value, producing backwards
-	// LSN accounting and eventual FlushUpTo(uint64_max) errors.
-	//
-	// Fix: acquire appendMu first to read the authoritative writePos, then
-	// advance s.writePos as a reservation BEFORE releasing the lock (so
-	// concurrent tryAppend callers write their records AFTER this one),
-	// then do I/O outside the lock, then finalise under appendMu.
-	//
-	// Note: walBuf == nil check must be done before acquiring appendMu
-	// (walBuf is set once at init, immutable thereafter).
 	if s.walBuf == nil || !s.walBuf.canHold(len(record)) {
-		// Re-encode under appendMu so writePos is consistent with stream.
 		s.appendMu.Lock()
 		if s.walBuf != nil && s.walBuf.resident() > 0 {
 			if err := s.drainBufferBytes(s.walBuf.resident(), drainReasonOverflow); err != nil {
@@ -1136,23 +1174,106 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 				return 0, 0, err
 			}
 		}
-		writePos := s.writePos // authoritative read
-		stream := record
-		leading := 0
-		if s.pageHeaders {
-			stream, leading = emitWithPageHeaders(record, realRecLen, writePos, s.cfg.SegmentSize, s.sysID, s.tli)
+		writePos := s.writePos
+		start := uint64(writePos) + 1
+		s.writePos = writePos + int64(len(record))
+		end := uint64(s.writePos)
+		s.appendMu.Unlock()
+
+		if err := s.writeAt(writePos, record); err != nil {
+			s.appendMu.Lock()
+			if s.writePos == writePos+int64(len(record)) {
+				s.writePos = writePos
+			}
+			s.appendMu.Unlock()
+			return 0, 0, err
 		}
+
+		s.appendMu.Lock()
+		if s.walBuf != nil {
+			s.walBuf.reset(int64(end))
+		}
+		s.memRing.Append(writePos, record)
+		s.drainedLSN = end
+		s.writeLSN = end
+		if s.writeLSNMirror != nil {
+			s.writeLSNMirror.Store(end)
+		}
+		s.appendMu.Unlock()
+		return start, end, nil
+	}
+
+	// Path B: buffered append under appendMu.
+	s.appendMu.Lock()
+	defer s.appendMu.Unlock()
+
+	writePos := s.writePos
+	start := uint64(writePos) + 1
+
+	need := int64(realRecLen) - s.walBuf.free()
+	if need > 0 {
+		if err := s.drainBufferBytes(need, drainReasonOverflow); err != nil {
+			return 0, 0, err
+		}
+	}
+	s.walBuf.append(record)
+	s.memRing.Append(writePos, record)
+	s.writePos = writePos + int64(len(record))
+	end := uint64(s.writePos)
+	s.writeLSN = end
+	if s.writeLSNMirror != nil {
+		s.writeLSNMirror.Store(end)
+	}
+	return start, end, nil
+}
+
+// appendPGCompat implements state.append for the PG-compat pageHeaders path
+// using the slice B stripe writer core (core.AppendXLogPayload). Path A
+// (walBuf disabled or record too large) still uses the legacy encode path and
+// resyncs the core's posTracker afterwards. Path B uses core.AppendXLogPayload
+// and a synchronous PublishUpTo so walBuf.tail stays correct for drain.
+//
+// Called exclusively when s.pageHeaders == true.
+func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
+	// Conservative emitted size: paddedLen + max page-header overhead
+	// (40-byte long PHD at a segment boundary + 24-byte contrecord header).
+	_, paddedLen := predictXLogRecordLen(payload)
+	conservativeSize := paddedLen + 64
+
+	// Path A: walBuf disabled, record physically won't fit in ring, OR the
+	// buffer needs draining. The drain case falls here (rather than Path B)
+	// so that appendMu.Lock() is held across drain + write: concurrent
+	// tryAppend goroutines (RLock) are frozen and cannot consume the freed
+	// space between the drain and the write, avoiding errWALBufferReservedOutOfRange.
+	needsDrain := s.walBuf != nil && int64(conservativeSize) > s.walBuf.free()-s.walBuf.reservedBytes.Load()
+	if s.walBuf == nil || !s.walBuf.canHold(conservativeSize) || needsDrain {
+		s.appendMu.Lock()
+		// Publish + drain any buffered bytes before the direct write.
+		if s.walBuf != nil && s.walBuf.resident() > 0 {
+			curr, _ := s.core.Load()
+			s.core.PublishUpTo(int64(curr))
+			if err := s.drainBufferBytes(s.walBuf.resident(), drainReasonOverflow); err != nil {
+				s.appendMu.Unlock()
+				return 0, 0, err
+			}
+		}
+		// Derive writePos and prevRecPtr from the tracker so that
+		// concurrent tryAppend goroutines (under RLock) that advanced
+		// the tracker before we acquired Lock are accounted for.
+		trackerCurr, trackerPrev := s.core.Load()
+		writePos := int64(trackerCurr)
+		record, realRecLen, err := encodeRecordXLog(payload, trackerPrev)
+		if err != nil {
+			s.appendMu.Unlock()
+			return 0, 0, err
+		}
+		stream, leading := emitWithPageHeaders(record, realRecLen, writePos, s.cfg.SegmentSize, s.sysID, s.tli)
 		start := uint64(writePos) + uint64(leading) + 1
-		// Reserve the position: advance writePos so concurrent tryAppend
-		// callers write their records after this large record.
 		s.writePos = writePos + int64(len(stream))
 		end := uint64(s.writePos)
 		s.appendMu.Unlock()
 
 		if err := s.writeAt(writePos, stream); err != nil {
-			// Roll back the reservation on I/O error (rare; WAL errors
-			// are typically fatal, but restore state for callers that
-			// handle errors gracefully).
 			s.appendMu.Lock()
 			if s.writePos == writePos+int64(len(stream)) {
 				s.writePos = writePos
@@ -1171,54 +1292,58 @@ func (s *state) append(payload []byte) (uint64, uint64, error) {
 		if s.writeLSNMirror != nil {
 			s.writeLSNMirror.Store(end)
 		}
-		if s.pageHeaders {
-			s.prevRecPtr = start - 1
-		}
+		// Resync core posTracker so subsequent stripe Path B appends and
+		// concurrent tryAppend goroutines start at the correct position.
+		// prevRecPtr field update dropped: tracker prev is authoritative.
+		s.core.resetPosition(end, start-1)
 		s.appendMu.Unlock()
 		return start, end, nil
 	}
 
-	// Path B: buffered append. Acquire appendMu first to read writePos
-	// authoritatively (same reason as Path A fix above), then compute
-	// stream layout, drain if needed, and append to walBuf.
+	// Path B: stripe-B buffered append. No outer lock needed.
+	//
+	// drain runs lock-free: the state-loop goroutine is the sole caller of
+	// drainBufferBytes → advanceHead (single writer of head/base, now atomic).
+	// Concurrent tryAppend goroutines under RLock write to LSN ranges strictly
+	// above tail (checked under RLock), which are disjoint from the drain
+	// window [head, head+need). The safety argument is in
+	// docs/design/0107-0007ai-wal-buffer-head-base-atomic-async-drain.md.
+	//
+	// AppendXLogPayload acquires its own stripe lock internally (no outer lock).
+	// PublishUpTo is an atomic tail advance (no lock).
 
-	// Path B: buffered append. Serialise buffer access and LSN
-	// update under appendMu so we don't race with tryAppend.
-	s.appendMu.Lock()
-	defer s.appendMu.Unlock()
-
-	// Re-read writePos under appendMu to get the authoritative position.
-	writePos := s.writePos
-	stream := record
-	leading := 0
-	if s.pageHeaders {
-		stream, leading = emitWithPageHeaders(record, realRecLen, writePos, s.cfg.SegmentSize, s.sysID, s.tli)
-	}
-	start := uint64(writePos) + uint64(leading) + 1
-
-	need := int64(len(stream)) - s.walBuf.free()
+	// Phase 1: drain if needed (lock-free).
+	need := int64(conservativeSize) - s.walBuf.free()
 	if need > 0 {
+		// Publish pending bytes before draining so drain can read them.
+		curr, _ := s.core.Load()
+		s.core.PublishUpTo(int64(curr))
 		if err := s.drainBufferBytes(need, drainReasonOverflow); err != nil {
 			return 0, 0, err
 		}
 	}
-	s.walBuf.append(stream)
-	// Walsender's MemRing must see every record, regardless of
-	// whether it's in walBuf or already on a segment — keeps the
-	// streaming-from-RAM invariant unchanged from M0010-0002.
-	s.memRing.Append(writePos, stream)
-	s.writePos = writePos + int64(len(stream))
+
+	// Phase 2: stripe-locked append (AppendXLogPayload takes its own stripe lock).
+	procNum := s.stripeNum()
+	start0, _, total, leading, err := s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Phase 3: publish (atomic tail advance; no lock).
+	s.core.PublishUpTo(int64(start0) + int64(total))
+
+	// Update state-loop bookkeeping. writePos/writeLSN are state-loop-only
+	// fields (plain assignment is safe — no concurrent writes from the state
+	// loop). writeLSNMirror uses storeMaxLSN because concurrent tryAppend
+	// goroutines under RLock may update it simultaneously.
+	s.writePos = int64(start0) + int64(total)
 	end := uint64(s.writePos)
 	s.writeLSN = end
 	if s.writeLSNMirror != nil {
-		s.writeLSNMirror.Store(end)
+		storeMaxLSN(s.writeLSNMirror, end)
 	}
-	if s.pageHeaders {
-		// prevRecPtr tracks the 0-based PostgreSQL RecPtr of this record's
-		// start so the NEXT record's xl_prev field is filled correctly.
-		// start is 1-based (goopg convention), so RecPtr = start - 1.
-		s.prevRecPtr = start - 1
-	}
+	start := start0 + uint64(leading) + 1 // 1-based record start (goopg convention)
 	return start, end, nil
 }
 
@@ -1235,7 +1360,10 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 				return 0, 0, err
 			}
 		}
-		writePos := s.writePos
+		// Read writePos from the tracker so concurrent tryAppend goroutines
+		// (under RLock) that advanced it before we acquired Lock are accounted for.
+		trackerCurr, trackerPrev := s.core.Load()
+		writePos := int64(trackerCurr)
 		start := uint64(writePos) + 1
 		s.writePos = writePos + int64(len(stream))
 		end := uint64(s.writePos)
@@ -1260,6 +1388,11 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 		if s.writeLSNMirror != nil {
 			s.writeLSNMirror.Store(end)
 		}
+		// Sync the stripe tracker so subsequent tryAppend/AppendXLogPayload
+		// calls start at the correct position. Use the pre-write tracker prev
+		// (appendRaw bytes are pre-encoded from the primary and bypass the
+		// regular xl_prev chain tracking).
+		s.core.resetPosition(end, trackerPrev)
 		s.appendMu.Unlock()
 		return start, end, nil
 	}
@@ -1267,7 +1400,10 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
 
-	writePos := s.writePos
+	// Read writePos from the tracker; concurrent tryAppend goroutines under
+	// RLock may have advanced it beyond s.writePos since the last Lock path.
+	trackerCurr, trackerPrev := s.core.Load()
+	writePos := int64(trackerCurr)
 	start := uint64(writePos) + 1
 	need := int64(len(stream)) - s.walBuf.free()
 	if need > 0 {
@@ -1283,6 +1419,8 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 	if s.writeLSNMirror != nil {
 		s.writeLSNMirror.Store(end)
 	}
+	// Sync the stripe tracker (same reasoning as Path A above).
+	s.core.resetPosition(end, trackerPrev)
 	return start, end, nil
 }
 
@@ -1293,51 +1431,98 @@ func (s *state) appendRaw(stream []byte) (uint64, uint64, error) {
 // disk write).  M0026: this eliminates the state-loop round-trip
 // for the common case (buffer not full).
 func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error) {
-	record := encodeRecord(payload)
-	realRecLen := len(record)
+	// PG-compat path: use stripe B.
 	if s.pageHeaders {
-		record, realRecLen, err = encodeRecordXLog(payload, s.prevRecPtr)
+		// Conservative emitted-size check before acquiring appendMu or the
+		// stripe lock — avoids the lock round-trip when walBuf has no room.
+		_, paddedLen := predictXLogRecordLen(payload)
+		conservativeSize := paddedLen + 64 // max PHD + contrecord overhead
+		if s.walBuf == nil || !s.walBuf.canHold(conservativeSize) {
+			return 0, 0, false, nil // Path A territory; let slow path handle I/O
+		}
+
+		// RLock allows multiple concurrent stripe writers in parallel.
+		// Lock() paths (Path A, appendRaw) are exclusive and wait for
+		// all RLock holders to complete before running.
+		s.appendMu.RLock()
+		defer s.appendMu.RUnlock()
+
+		// Atomically claim conservativeSize bytes in the WAL buffer before
+		// reserving LSN space. Multiple concurrent stripe writers under
+		// RLock could each see free() > 0 and all proceed to reserve LSN
+		// space, collectively overflowing the buffer and causing
+		// walBuffer.writeReserved to return errWALBufferReservedOutOfRange.
+		// tryReserve uses a CAS loop so that the check-and-claim is
+		// atomic: only writers whose combined reservations stay within cap
+		// proceed to AppendXLogPayload.
+		if rerr := s.walBuf.tryReserve(int64(conservativeSize)); rerr != nil {
+			return 0, 0, false, nil // overflow; slow path drains then appends
+		}
+
+		procNum := s.stripeNum()
+		var start0 uint64
+		var total, leading int
+		start0, _, total, leading, err = s.core.AppendXLogPayload(procNum, payload, s.cfg.SegmentSize, s.sysID, s.tli)
 		if err != nil {
+			// LSN reservation failed or encoding error; release the buffer
+			// reservation so capacity is not permanently consumed.
+			s.walBuf.releaseReservation(int64(conservativeSize))
 			return 0, 0, false, err
 		}
+
+		// Synchronous publish: advance walBuf.tail and memRing.tail so
+		// drain goroutine and flushUpTo see these bytes.
+		s.core.PublishUpTo(int64(start0) + int64(total))
+		// Release the reservation now that tail has advanced: the bytes are
+		// now counted in resident() rather than reservedBytes.
+		s.walBuf.releaseReservation(int64(conservativeSize))
+
+		end = uint64(int64(start0) + int64(total))
+		// CAS-max: multiple concurrent RLock holders may call this
+		// simultaneously; we want the highest end value to persist.
+		if s.writeLSNMirror != nil {
+			storeMaxLSN(s.writeLSNMirror, end)
+		}
+		// s.writePos and s.prevRecPtr are NOT updated here: Lock() paths
+		// (appendPGCompat Path A, appendRaw) derive them from core.Load()
+		// after all RLock holders have released. s.writeLSN is left for
+		// the state loop's own Lock-path tracking (flushUpTo reads the
+		// atomic writeLSNMirror instead of s.writeLSN).
+		start = start0 + uint64(leading) + 1 // 1-based record start
+		if s.onAppend != nil {
+			s.onAppend()
+		}
+		return start, end, true, nil
 	}
+
+	// Non-pageHeaders (legacy binary format): original path.
+	record := encodeRecord(payload)
+	realRecLen := len(record)
 
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
 
 	writePos := s.writePos
-	stream := record
-	leading := 0
-	if s.pageHeaders {
-		stream, leading = emitWithPageHeaders(record, realRecLen,
-			writePos, s.cfg.SegmentSize, s.sysID, s.tli)
-	}
-	start = uint64(writePos) + uint64(leading) + 1
+	start = uint64(writePos) + 1
 
 	// Path A: record larger than the buffer — can't handle without I/O.
-	if !s.walBuf.canHold(len(stream)) {
+	if !s.walBuf.canHold(realRecLen) {
 		return 0, 0, false, nil
 	}
 
 	// Path B: buffered append.  If we'd overflow, fall back to the
 	// state loop (which will drain first).
-	if int64(len(stream)) > s.walBuf.free() {
+	if int64(realRecLen) > s.walBuf.free() {
 		return 0, 0, false, nil
 	}
 
-	s.walBuf.append(stream)
-	s.memRing.Append(writePos, stream)
-	s.writePos = writePos + int64(len(stream))
+	s.walBuf.append(record)
+	s.memRing.Append(writePos, record)
+	s.writePos = writePos + int64(len(record))
 	end = uint64(s.writePos)
 	s.writeLSN = end
 	if s.writeLSNMirror != nil {
 		s.writeLSNMirror.Store(end)
-	}
-	if s.pageHeaders {
-		// prevRecPtr tracks the 0-based PostgreSQL RecPtr of this record's
-		// start so the NEXT record's xl_prev field is filled correctly.
-		// start is 1-based (goopg convention), so RecPtr = start - 1.
-		s.prevRecPtr = start - 1
 	}
 	if s.onAppend != nil {
 		s.onAppend()
@@ -1381,12 +1566,24 @@ func (s *state) drainBufferBytes(n int64, reason drainReason) error {
 	if c := s.walBufferCounters; c != nil {
 		switch reason {
 		case drainReasonOverflow:
-			c.overflowDrainBytes.Add(uint64(n))
+			c.overflowDrainBytes.Add(n)
 		case drainReasonFlush:
-			c.flushDrainBytes.Add(uint64(n))
+			c.flushDrainBytes.Add(n)
 		}
 	}
 	return nil
+}
+
+// stripeNum returns the caller's process number for stripe selection in
+// core.AppendXLogPayload. Falls back to 0 for goroutines that are not
+// registered in the activity registry (initdb, checkpointer, walreceiver,
+// tests) — they all land on stripe 0, which is always valid.
+func (s *state) stripeNum() int32 {
+	_, procNum, ok := activity.LookupCurrentGoroutine()
+	if !ok {
+		return 0
+	}
+	return procNum
 }
 
 // drainBufferUpTo drains every byte from walBuf.head through (but
@@ -1406,8 +1603,16 @@ func (s *state) flushUpTo(lsn uint64) error {
 	if lsn == 0 {
 		return nil
 	}
-	if lsn > s.writeLSN {
-		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, s.writeLSN, lsn)
+	// Use writeLSNMirror (atomic) so LSNs written by concurrent
+	// tryAppend goroutines under RLock are visible here without holding appendMu.
+	writtenLSN := s.writeLSN
+	if s.writeLSNMirror != nil {
+		if m := s.writeLSNMirror.Load(); m > writtenLSN {
+			writtenLSN = m
+		}
+	}
+	if lsn > writtenLSN {
+		return fmt.Errorf("%w: have %d, need %d", ErrLSNNotWritten, writtenLSN, lsn)
 	}
 	if lsn <= s.flushedLSN {
 		return nil
@@ -1630,10 +1835,32 @@ func preallocateSegment(f *os.File, size int64) error {
 	return nil
 }
 
+// storeMaxLSN atomically advances *ptr to val if val > ptr.Load().
+// Required when multiple goroutines holding RLock concurrently update
+// writeLSNMirror — plain Store would let a goroutine with a lower LSN
+// overwrite a higher one written by a peer that finished first.
+func storeMaxLSN(ptr *atomic.Uint64, val uint64) {
+	for {
+		cur := ptr.Load()
+		if val <= cur {
+			return
+		}
+		if ptr.CompareAndSwap(cur, val) {
+			return
+		}
+	}
+}
+
 func (s *state) close() error {
 	var firstErr error
-	if s.writeLSN > 0 {
-		if err := s.flushUpTo(s.writeLSN); err != nil {
+	closeLSN := s.writeLSN
+	if s.writeLSNMirror != nil {
+		if m := s.writeLSNMirror.Load(); m > closeLSN {
+			closeLSN = m
+		}
+	}
+	if closeLSN > 0 {
+		if err := s.flushUpTo(closeLSN); err != nil {
 			firstErr = err
 		}
 	}

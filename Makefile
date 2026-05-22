@@ -32,7 +32,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff
+.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff runtimeshim-matrix
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -49,6 +49,7 @@ help:
 	@echo "  make ralph-state-check  Validate .ralph/status.json and .ralph/progress.json consistency."
 	@echo "  make ralph-state-repair Attempt safe auto-repair for .ralph/status.json and .ralph/progress.json."
 	@echo "  make ralph-state-guard  Check Ralph state, auto-repair if needed, then verify again."
+	@echo "  make runtimeshim-matrix Run internal/runtimeshim tests under every Go toolchain in PATH."
 	@echo "  make pgbench-compare    Run pgbench comparison between goopg and PostgreSQL."
 	@echo "  make pgbench-compare-matrix Run the full goopg pgbench matrix survey."
 	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
@@ -147,6 +148,14 @@ ralph-state-guard:
 		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json -fix; \
 		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json; \
 	fi
+
+# M0107-0008 per-Go-minor maintenance: verify //go:linkname targets in
+# internal/runtimeshim against every Go toolchain present in PATH (the
+# default `go` plus any `go1.N`-style binaries installed via
+# `go install golang.org/dl/go1.N@latest`). See
+# docs/design/perf-optimize/08-runtime-internals.md §8.
+runtimeshim-matrix:
+	@bash scripts/runtimeshim_go_matrix.sh
 
 # ---------------------------------------------------------------
 # M0075-0007: build-toolchain optimisation targets.

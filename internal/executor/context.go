@@ -7,6 +7,7 @@ import (
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
@@ -32,6 +33,12 @@ type Context struct {
 	// passes through here.
 	MaxRows int
 
+	// Mctx is the statement-level memory context (M0107-0001).
+	// Operators acquire child ExprContexts from it for per-row
+	// scratch; nil disables mctx-backed arena Datums (tests that
+	// don't wire a full server still work via GC-heap fallback).
+	Mctx *mctx.Context
+
 	// Storage handles. Heap-touching operators (SeqScan/Insert/
 	// Update/Delete) require all four to be set; pure-compute
 	// statements (SELECT 1, …) don't.
@@ -48,6 +55,11 @@ type Context struct {
 	// tests can leave it nil when the operator under test doesn't
 	// need it.
 	Session Session
+
+	// AdvisorySessionIdentity is a stable per-connection token used by
+	// advisory-lock functions when Session is nil (e.g. auto-commit
+	// statements outside an explicit BEGIN/COMMIT block).
+	AdvisorySessionIdentity any
 
 	// Checkpointer, when set, is invoked by the Checkpoint operator
 	// to drive a synchronous checkpoint (see milestone 0002). nil
@@ -99,7 +111,8 @@ type Context struct {
 	// pg_catalog.pg_stat_activity. nil disables tracking.
 	Activity *activity.Registry
 
-	// ActivityPID identifies this backend in the activity registry.
+	// ActivityPID is kept for backward compat but unused; use ProcNum + Activity instead.
+	// Deprecated: will be removed in a future cleanup pass.
 	ActivityPID string
 
 	// LockMgr, when set, is consulted by SQL-touching operators
@@ -115,6 +128,11 @@ type Context struct {
 	// policy from M0012-0002 relies on the monotonic shape.
 	BackendID lockmgr.BackendID
 
+	// ProcNum is the backend's slot index in the Manager's ProcArray.
+	// Set once per connection in serveConn and carried on every ectx so
+	// operators that call TxnMgr.Begin (e.g. execBegin) can supply it.
+	ProcNum int32
+
 	// WorkTableRows is set by RecursiveUnionOp during fixpoint
 	// iteration and read by WorkTableScanOp to produce rows from
 	// the current working table. M0016-0004 (recursive CTE).
@@ -124,6 +142,25 @@ type Context struct {
 	// spill-to-disk. Zero means unlimited (no spill). Defaults to
 	// 512 MiB when the GUC is active. See milestone 0037.
 	WorkMem int64
+
+	// GetSetting returns the effective session GUC value for the given
+	// name. Wired by the server from the per-connection SessionRegistry;
+	// nil means SQL built-ins like current_setting() cannot resolve
+	// session state in this context.
+	GetSetting func(name string) (string, bool)
+
+	// SetSetting applies a session or transaction-local GUC mutation.
+	// Wired by the server so SQL built-ins like set_config() can mutate
+	// the same SessionRegistry as SET / SET LOCAL.
+	SetSetting func(name, value string, isLocal bool) error
+
+	// AllSettings returns the effective SHOW ALL view for this session.
+	AllSettings func() []SettingValue
+
+	// ResetSetting and ResetAllSettings expose RESET name / RESET ALL to
+	// executor-run utility statements.
+	ResetSetting     func(name string) error
+	ResetAllSettings func()
 
 	// EnableOpportunisticPrune mirrors the enable_opportunistic_prune
 	// GUC (M0046-0002). When true, the HOT-update path calls
@@ -218,6 +255,27 @@ type Context struct {
 	// IsStandby reflects whether the server is currently acting as a hot
 	// standby. pg_is_in_recovery() returns this value. M0106-0010 batched-34.
 	IsStandby bool
+
+	// MaterializedCTEs holds rows from data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE
+	// with RETURNING). Populated by cteDMLPrefixOp before the outer query runs.
+	// Key is the lowercase CTE name; value is the materialized RETURNING rows.
+	MaterializedCTEs map[string][][]Datum
+
+	// CTEWriteFence, when non-nil, is a set of row pointers written by DML
+	// CTEs during their execution phase. The outer query's seqScanOp skips
+	// these tuples to implement CTE snapshot isolation: DML-CTE writes must
+	// not be visible to the outer SELECT. Cleared between statements.
+	CTEWriteFence map[storage.ItemPointer]struct{}
+
+	// InDMLCTE is true while cteDMLPrefixOp is executing its DML sub-plans.
+	// Write operators register their output pointers in CTEWriteFence when this is set.
+	InDMLCTE bool
+}
+
+// SettingValue is one effective session setting exposed to SHOW ALL.
+type SettingValue struct {
+	Name  string
+	Value string
 }
 
 // AddNotice appends a NOTICE-severity message to the context's notice queue.
@@ -225,7 +283,12 @@ type Context struct {
 // (matching PostgreSQL's real-time notice delivery). M0100-0005.
 func (c *Context) AddNotice(msg string) {
 	if c.NoticeFlush != nil {
+		// Inline flush: send the notice to the client immediately so it
+		// arrives before any row-level lock wait. When NoticeFlush is wired
+		// (server path), the notice is NOT additionally buffered in Notices
+		// to avoid double-delivery at CommandComplete time.
 		c.NoticeFlush(msg)
+		return
 	}
 	c.Notices = append(c.Notices, msg)
 }
@@ -252,9 +315,9 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	if c.LockMgr == nil {
 		return nil
 	}
-	// Record wait event for lock waits.
-	if c.Activity != nil && c.ActivityPID != "" {
-		c.Activity.WaitEventStart(c.ActivityPID, activity.WaitTypeLock, activity.WaitRelationLock)
+	// Record wait event for lock waits using the atomic hot path (M0107-0005).
+	if c.Activity != nil {
+		c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitRelationLock)
 	}
 	lockCtx := context.Background()
 	if c.Ctx != nil {
@@ -262,8 +325,8 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	}
 	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
 	err := c.LockMgr.Acquire(lockCtx, c.BackendID, tag, mode)
-	if c.Activity != nil && c.ActivityPID != "" {
-		c.Activity.WaitEventEnd(c.ActivityPID)
+	if c.Activity != nil {
+		c.Activity.WaitEventEnd(c.ProcNum)
 	}
 	if err == nil {
 		return nil

@@ -262,11 +262,11 @@ func TestPreCommitCheck_FinishedPivotIgnored(t *testing.T) {
 	}
 
 	// Manually mark pivot as if its FinishedAt had been stamped.
-	m.mu.Lock()
+	m.ssiMu.Lock()
 	if sx, ok := m.ssiState.xacts[pivot.Handle]; ok {
 		sx.FinishedAt = 99
 	}
-	m.mu.Unlock()
+	m.ssiMu.Unlock()
 
 	if err := m.PreCommitCheckForSerializationFailure(me.Handle); err != nil {
 		t.Fatalf("PreCommitCheck(me) = %v, want nil", err)
@@ -276,11 +276,11 @@ func TestPreCommitCheck_FinishedPivotIgnored(t *testing.T) {
 	}
 
 	// Reset for clean teardown.
-	m.mu.Lock()
+	m.ssiMu.Lock()
 	if sx, ok := m.ssiState.xacts[pivot.Handle]; ok {
 		sx.FinishedAt = InvalidCommitSeqNo
 	}
-	m.mu.Unlock()
+	m.ssiMu.Unlock()
 	_ = m.Rollback(me)
 	_ = m.Rollback(pivot)
 	_ = m.Rollback(tin)

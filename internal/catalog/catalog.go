@@ -245,6 +245,11 @@ type Index struct {
 	Method  string
 	Primary bool
 	OID     uint32
+	// ColExprs holds the parsed expression AST for expression-based index
+	// columns (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil
+	// when Columns[i] == "" (expression column); nil for plain column names.
+	// Not persisted to JSON (parser.Expr is not JSON-serializable).
+	ColExprs []*parser.Expr
 }
 
 // QualifiedName renders the table's name in the canonical
@@ -733,6 +738,26 @@ func (c *InMemory) advanceNextOIDLocked(oid uint32) {
 	if oid >= c.nextOID {
 		c.nextOID = oid + 1
 	}
+}
+
+// NextOID returns the current next-OID counter value. Used by the
+// checkpointer (M0106-0013) to embed the live counter into each
+// checkpoint WAL record and pg_control so a crashed cluster can
+// recover the OID counter without relying on pg_catalog.json.
+func (c *InMemory) NextOID() uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.nextOID
+}
+
+// AdvanceNextOIDPast ensures the next-OID counter is strictly greater
+// than oid. Called during startup after tables are loaded from heap
+// pages so the counter never re-uses an OID already present on disk.
+// M0106-0013.
+func (c *InMemory) AdvanceNextOIDPast(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.advanceNextOIDLocked(oid)
 }
 
 // ListDatabases returns the registered database names in

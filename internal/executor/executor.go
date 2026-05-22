@@ -45,6 +45,10 @@ func Build(plan planner.Node) (Operator, error) {
 		// child, so the CTEScan layer doesn't need its own
 		// instrumented row.
 		return Build(p.Child)
+	case *planner.CTEDMLPrefix:
+		return newCTEDMLPrefixOp(p), nil
+	case *planner.MaterializedCTEScan:
+		return newMaterializedCTEScanOp(p), nil
 	case *planner.Project:
 		child, err := Build(p.Child)
 		if err != nil {
@@ -210,8 +214,18 @@ func Build(plan planner.Node) (Operator, error) {
 	case *planner.Utility:
 		// VACUUM / ANALYZE / SHOW / SET / RESET are utility statements.
 		// VACUUM runs the heap page-prune and updates the FSM (M0046-0003).
-		// ANALYZE drives the catalog-stats collector. SHOW/SET/RESET are
-		// handled by the wire layer and shouldn't reach here in practice.
+		// ANALYZE drives the catalog-stats collector. SHOW/SET/RESET also
+		// need executor support for multi-statement simple-query batches and
+		// extended-query execution.
+		if _, ok := p.Stmt.(*parser.ShowStmt); ok {
+			return newUtilitySettingsOp(p), nil
+		}
+		if _, ok := p.Stmt.(*parser.SetStmt); ok {
+			return newUtilitySettingsOp(p), nil
+		}
+		if _, ok := p.Stmt.(*parser.ResetStmt); ok {
+			return newUtilitySettingsOp(p), nil
+		}
 		if _, ok := p.Stmt.(*parser.VacuumStmt); ok {
 			return newVacuumOp(p), nil
 		}
@@ -283,6 +297,185 @@ func Run(op Operator, ctx *Context) ([]Row, error) {
 		out = append(out, slot.Materialize().Row())
 	}
 	if err := op.Close(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Phase C.2 — BuildFast / RunFast
+//
+// BuildFast constructs an opTreeSlab from a plan, using concrete
+// dispatch for migrated operators (OpSeqScan, OpFilter, OpProject,
+// OpLimit, OpSort, OpUpdate, OpDelete, OpInsert, OpJoin) and opAdapter
+// for everything else. RunFast drives the tree via opNext. Both
+// functions are drop-in replacements for Build+Run; they produce
+// identical result rows.
+//
+// Phase C.2 change: children are int32 slab indices (noChild = -1)
+// instead of *OpNode pointers, eliminating GC-scanned pointers in the
+// hot tree. BuildFast now returns (*opTreeSlab, int32, error).
+// ---------------------------------------------------------------------------
+
+// buildRec is the recursive tree builder for BuildFast.
+func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
+	switch p := plan.(type) {
+	case *planner.SeqScan:
+		return tree.add(OpNode{Kind: OpSeqScan, childA: noChild, childB: noChild, state: newSeqScanOp(p)}), nil
+
+	case *planner.Filter:
+		childIdx, err := tree.buildRec(p.Child)
+		if err != nil {
+			return noChild, err
+		}
+		// Phase C.3: predicate compiled into exprTreeSlab; filterState holds
+		// only the predIdx — no GC-traced planner.Expr reference needed.
+		predIdx := tree.exprs.buildExpr(p.Predicate)
+		return tree.add(OpNode{Kind: OpFilter, childA: childIdx, childB: noChild,
+			state: &filterState{predIdx: predIdx}}), nil
+
+	case *planner.Project:
+		childIdx, err := tree.buildRec(p.Child)
+		if err != nil {
+			return noChild, err
+		}
+		// Phase C.3: target expressions compiled into exprTreeSlab; projectState
+		// holds only compiled indices — no GC-traced *planner.Project or schema slice.
+		// Schema is pooled in opTreeSlab.schemas; projectState stores an int32 index.
+		targExprs := make([]int32, len(p.Targets))
+		for i, t := range p.Targets {
+			targExprs[i] = tree.exprs.buildExpr(t)
+		}
+		schemaIdx := int32(len(tree.schemas))
+		tree.schemas = append(tree.schemas, p.Output())
+		return tree.add(OpNode{Kind: OpProject, childA: childIdx, childB: noChild,
+			state: &projectState{schemaIdx: schemaIdx, targExprs: targExprs}}), nil
+
+	case *planner.Limit:
+		childIdx, err := tree.buildRec(p.Child)
+		if err != nil {
+			return noChild, err
+		}
+		// Phase C.3: LIMIT and OFFSET expressions compiled into exprTreeSlab;
+		// limitState holds only the compiled indices — no *planner.Limit reference.
+		limitExprIdx := tree.exprs.buildExpr(p.Limit)
+		offsetExprIdx := tree.exprs.buildExpr(p.Offset)
+		return tree.add(OpNode{Kind: OpLimit, childA: childIdx, childB: noChild,
+			state: &limitState{limitExprIdx: limitExprIdx, offsetExprIdx: offsetExprIdx, limitCount: -1}}), nil
+
+	case *planner.Sort:
+		childIdx, err := tree.buildRec(p.Child)
+		if err != nil {
+			return noChild, err
+		}
+		// Bridge the child slab node into the Operator interface that sortOp
+		// expects. sortOp.Open() drains the child in a tight loop; the
+		// opNodeOperator hop adds one function call per row but the child
+		// subtree runs on concrete switch dispatch.
+		childOp := &opNodeOperator{tree: tree, idx: childIdx, schema: p.Child.Output()}
+		sortLegacy := newSortOp(p, childOp)
+		return tree.add(OpNode{Kind: OpSort, childA: noChild, childB: noChild, state: &sortOpState{op: sortLegacy, schema: p.Output()}}), nil
+
+	case *planner.Update:
+		op, err := newUpdateOp(p)
+		if err != nil {
+			return noChild, err
+		}
+		return tree.add(OpNode{Kind: OpUpdate, childA: noChild, childB: noChild, state: &updateOpState{op: op}}), nil
+
+	case *planner.Delete:
+		op, err := newDeleteOp(p)
+		if err != nil {
+			return noChild, err
+		}
+		return tree.add(OpNode{Kind: OpDelete, childA: noChild, childB: noChild, state: &deleteOpState{op: op}}), nil
+
+	case *planner.Insert:
+		childIdx, err := tree.buildRec(p.Source)
+		if err != nil {
+			return noChild, err
+		}
+		childOp := &opNodeOperator{tree: tree, idx: childIdx, schema: p.Source.Output()}
+		if p.OnConflict != nil {
+			// upsertOp has complex conflict-resolution logic; keep on adapter.
+			uop := newUpsertOp(p, childOp)
+			return tree.add(OpNode{Kind: OpAdapter, childA: noChild, childB: noChild, state: &opAdapterState{op: uop}}), nil
+		}
+		return tree.add(OpNode{Kind: OpInsert, childA: noChild, childB: noChild, state: &insertOpState{op: newInsertOp(p, childOp)}}), nil
+
+	case *planner.Join:
+		leftIdx, err := tree.buildRec(p.Left)
+		if err != nil {
+			return noChild, err
+		}
+		rightIdx, err := tree.buildRec(p.Right)
+		if err != nil {
+			return noChild, err
+		}
+		leftOp := &opNodeOperator{tree: tree, idx: leftIdx, schema: p.Left.Output()}
+		rightOp := &opNodeOperator{tree: tree, idx: rightIdx, schema: p.Right.Output()}
+		op := newJoinOp(p, leftOp, rightOp)
+		return tree.add(OpNode{Kind: OpJoin, childA: noChild, childB: noChild, state: &joinOpState{op: op, schema: p.Output()}}), nil
+
+	default:
+		// For non-migrated operators, build the legacy Operator tree
+		// and wrap in an adapter. This path preserves the existing
+		// operator semantics exactly — Open/Next/Close are forwarded.
+		legacyOp, err := Build(plan)
+		if err != nil {
+			return noChild, err
+		}
+		return tree.add(OpNode{Kind: OpAdapter, childA: noChild, childB: noChild, state: &opAdapterState{op: legacyOp}}), nil
+	}
+}
+
+// BuildFast constructs an op-tree slab from plan and returns the slab and
+// the root index. Non-migrated operators are wrapped in an opAdapter that
+// drives the legacy Operator interface.
+func BuildFast(plan planner.Node) (*opTreeSlab, int32, error) {
+	tree := &opTreeSlab{
+		ops:     make([]OpNode, 0, 8),
+		exprs:   make(exprTreeSlab, 0, 16),
+		plans:   make(planTreeSlab, 0, 8),
+		schemas: make([]planner.Schema, 0, 4),
+	}
+	rootIdx, err := tree.buildRec(plan)
+	if err != nil {
+		return nil, noChild, err
+	}
+	return tree, rootIdx, nil
+}
+
+// RunFast opens the op-tree rooted at rootIdx in tree, drains it via
+// opNext, and returns all rows. Rows are deep-copied via cloneRowOwned
+// so callers receive independent storage (same invariant as Run).
+func RunFast(tree *opTreeSlab, rootIdx int32, ctx *Context) ([]Row, error) {
+	if err := opOpen(tree, rootIdx, ctx); err != nil {
+		_ = opClose(tree, rootIdx)
+		return nil, err
+	}
+	var (
+		out []Row
+		dst Slot
+	)
+	for {
+		dst.Reset()
+		err := opNext(tree, rootIdx, &dst)
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			_ = opClose(tree, rootIdx)
+			return nil, err
+		}
+		// DML / utility ops surface nil-row (HasRow=false); skip.
+		if !dst.HasRow {
+			continue
+		}
+		// Deep-copy at the RunFast boundary so callers own independent rows.
+		out = append(out, cloneRowOwned(Row(dst.Cells)))
+	}
+	if err := opClose(tree, rootIdx); err != nil {
 		return nil, err
 	}
 	return out, nil

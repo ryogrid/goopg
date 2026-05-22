@@ -342,6 +342,68 @@ func TestPageSetHeapTupleMovedPartitionInvalidSlot(t *testing.T) {
 	}
 }
 
+// TestPageSetHeapTupleXmaxClearsHeapXmaxInvalid pins the fix for the
+// M0100-0005 regression: canonical-WAL inserts stamp HeapXmaxInvalid on
+// fresh tuples to mark "xmax is not a deleter". PageSetHeapTupleXmax MUST
+// clear that flag so isConcurrentlyUpdated returns true and the EPQ wait
+// fires on concurrent DELETE/UPDATE. Without the fix, external-cluster
+// isolation tests that use canonical WAL see the DELETE/UPDATE complete
+// immediately instead of blocking on the in-flight xmax.
+func TestPageSetHeapTupleXmaxClearsHeapXmaxInvalid(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a canonical-WAL insert: tuple with HeapXmaxInvalid set.
+	tuple := NewHeapTuple(TransactionID(10), InvalidTransactionID, []byte("row"))
+	tuple.Header.Infomask = HeapXmaxInvalid | HeapHasVarWidth
+	slot, err := PageAddHeapTuple(p, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := PageSetHeapTupleXmax(p, slot, TransactionID(99)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := PageGetHeapTuple(p, slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Header.Xmax != TransactionID(99) {
+		t.Errorf("Xmax = %d, want 99", got.Header.Xmax)
+	}
+	if got.Header.Infomask&HeapXmaxInvalid != 0 {
+		t.Errorf("Infomask = %#x: HeapXmaxInvalid should be cleared after xmax stamp", got.Header.Infomask)
+	}
+}
+
+// TestPageSetHeapTupleMovedPartitionClearsHeapXmaxInvalid is the
+// PageSetHeapTupleMovedPartition analogue of the above.
+func TestPageSetHeapTupleMovedPartitionClearsHeapXmaxInvalid(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	tuple := NewHeapTuple(TransactionID(10), InvalidTransactionID, []byte("moved"))
+	tuple.Header.Infomask = HeapXmaxInvalid | HeapHasVarWidth
+	slot, err := PageAddHeapTuple(p, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := PageSetHeapTupleMovedPartition(p, slot, TransactionID(42)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := PageGetHeapTuple(p, slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Header.Xmax != TransactionID(42) {
+		t.Errorf("Xmax = %d, want 42", got.Header.Xmax)
+	}
+	if got.Header.Infomask&HeapXmaxInvalid != 0 {
+		t.Errorf("Infomask = %#x: HeapXmaxInvalid should be cleared after moved-partition stamp", got.Header.Infomask)
+	}
+}
+
 // TestIsMovedToAnotherPartitionNegatives — the predicate must reject
 // "normal" CTIDs (any block≠Invalid or offset≠sentinel) so that
 // regular HOT chain pointers and zeroed CTIDs aren't misread as

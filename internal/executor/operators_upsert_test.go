@@ -157,6 +157,44 @@ func TestUpsertConflictDoNothing(t *testing.T) {
 	}
 }
 
+func TestPlanUpsertDoNothingNoTargetUsesExpressionUniqueIndex(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE items (key text, data text)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "CREATE OR REPLACE FUNCTION idx_key(text) RETURNS text IMMUTABLE LANGUAGE plpgsql AS $$ BEGIN RETURN $1; END $$"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "CREATE UNIQUE INDEX items_key_expr_idx ON items ((idx_key(key)))"); err != nil {
+		t.Fatal(err)
+	}
+	stmts, err := parser.Parse("INSERT INTO items VALUES ('k1', 'v1') ON CONFLICT DO NOTHING")
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins, ok := node.(*planner.Insert)
+	if !ok {
+		t.Fatalf("node = %T, want *planner.Insert", node)
+	}
+	if ins.OnConflict == nil || ins.OnConflict.ArbiterIndex == nil {
+		t.Fatalf("OnConflict arbiter missing: %+v", ins.OnConflict)
+	}
+	if ins.OnConflict.ArbiterIndex.Name != "items_key_expr_idx" {
+		t.Fatalf("ArbiterIndex = %q, want items_key_expr_idx", ins.OnConflict.ArbiterIndex.Name)
+	}
+	if len(ins.OnConflict.ArbiterColumns) != 1 || ins.OnConflict.ArbiterColumns[0] != -1 {
+		t.Fatalf("ArbiterColumns = %v, want [-1]", ins.OnConflict.ArbiterColumns)
+	}
+	if len(ins.OnConflict.ArbiterExprs) != 1 || ins.OnConflict.ArbiterExprs[0] == nil {
+		t.Fatalf("ArbiterExprs = %+v, want one resolved expression", ins.OnConflict.ArbiterExprs)
+	}
+}
+
 // TestUpsertDoUpdateMixingExistingAndExcluded — the SET expression
 // references both the target's column (bare `label`) and
 // `excluded.label`. Pins the planner-side merged 2N row layout:

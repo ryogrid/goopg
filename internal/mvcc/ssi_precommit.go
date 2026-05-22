@@ -93,10 +93,10 @@ func IsSerializationFailure(err error) bool {
 // committing xact is still in `ssiState.xacts` and BEFORE its peers
 // are scrubbed — exactly the window upstream uses.
 //
-// Safe for concurrent use; takes m.mu internally.
+// Safe for concurrent use; takes m.ssiMu internally.
 func (m *Manager) PreCommitCheckForSerializationFailure(handle TxnHandle) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	return m.preCommitCheckForSerializationFailureLocked(handle)
 }
 
@@ -163,8 +163,8 @@ func (m *Manager) preCommitCheckForSerializationFailureLocked(handle TxnHandle) 
 // registered. Not exported under a non-test name because production
 // callers must reach the Doomed bit through the pre-commit scan.
 func (m *Manager) MarkDoomedForTest(handle TxnHandle) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	if m.ssiState.xacts == nil {
 		return false
 	}
@@ -180,8 +180,8 @@ func (m *Manager) MarkDoomedForTest(handle TxnHandle) bool {
 // been doomed. Test-only diagnostic; production callers must consult
 // the pre-commit scan's return value rather than this flag directly.
 func (m *Manager) IsDoomedForTest(handle TxnHandle) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
 	if m.ssiState.xacts == nil {
 		return false
 	}

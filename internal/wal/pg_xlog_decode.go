@@ -21,6 +21,13 @@ const (
 	xlogXactCommit          uint8 = 0x00
 	xlogXactAbort           uint8 = 0x20
 	xlogXactOpMask          uint8 = 0x70
+
+	// XlogXactCommit and XlogXactAbort are exported for the crash-recovery
+	// xact-stamp pass in internal/initdb. (M0106-0013)
+	XlogXactCommit = xlogXactCommit
+	XlogXactAbort  = xlogXactAbort
+	// XlogXactOpMask masks the opcode bits from XLogRecord.Info for RmgrXact.
+	XlogXactOpMask = xlogXactOpMask
 	xlogStandbyRunningXacts uint8 = 0x10
 	// xlogXLogParameterChange is the xl_info opcode for XLOG_PARAMETER_CHANGE
 	// (pg_control.h:74). Emitted by the primary when GUC echo fields change;

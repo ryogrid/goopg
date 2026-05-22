@@ -11,6 +11,7 @@ import (
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -473,7 +474,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	if len(pkCols) > 0 {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_pkey"}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, true, true); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, nil, true, true); err != nil {
 			// Propagate B-tree index errors (e.g. unsupported key type).
 			// This makes CREATE TABLE fail cleanly rather than silently creating
 			// a table without its primary key constraint.
@@ -643,7 +644,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			}
 			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + suffix}
 		}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, parentIdx.Unique, parentIdx.Primary); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary); err != nil {
 			return err
 		}
 	}
@@ -784,10 +785,13 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error {
 	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
 	idxRels := make([]storage.RelFileNode, 0, len(idxs))
+	idxOIDs := make([]uint32, 0, len(idxs))
 	for _, idx := range idxs {
 		idxRels = append(idxRels, o.ctx.Catalog.IndexRelFileNode(idx))
+		idxOIDs = append(idxOIDs, idx.OID)
 	}
 	rel := o.ctx.Catalog.RelFileNode(tbl)
+	relOID := tbl.OID
 	if err := o.ctx.Catalog.DropTable(name); err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
@@ -815,6 +819,37 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error
 		o.ctx.Pool.InvalidateRel(idxRel)
 		if err := o.ctx.Pool.Manager().DropRelation(idxRel); err != nil {
 			return &ExecError{Code: "XX000", Message: err.Error()}
+		}
+	}
+	// M0106-0011: DROP TABLE removes pg_class / pg_attribute / pg_index rows
+	// for the relation. Flag the txn so the commit-time xact-marker hook
+	// (open.go) emits RecordKindXactCommitInval and unlinks + regenerates
+	// both pg_internal.init files; without this a PG18 standby reconnecting
+	// after the DDL keeps a stale relcache entry for the dropped relation.
+	if o.ctx.TxnMgr != nil {
+		o.ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+	// M0106-0011 follow-up (a): persist the catalog heap mutation by
+	// stamping xmax on the on-disk pg_class / pg_attribute rows for the
+	// dropped table and its indexes. Without this, the in-memory drop is
+	// not reflected in the heap, and a subsequent re-Open (after clean
+	// shutdown or WAL replay) re-resolves the dropped relation through the
+	// loadUserTablesFromHeap scan. `markHeapDeleteDirty` (inside
+	// `stampCatalogRows`) WAL-logs the xmax bump so the stamp survives a
+	// crash. Gated on `catalogHeapSyncAvailable` to skip pre-M0030-0001
+	// fixtures (and the in-memory test fixture in newDDLFixture).
+	// MaterializeWriterXID ensures the transaction has a real XID before
+	// stamping xmax; DROP TABLE itself never calls writeHeapRowReturningPG
+	// so the XID would otherwise remain InvalidTransactionID (0).
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range catalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, relOID, xmax)
+				for _, idxOID := range idxOIDs {
+					deleteCatalogRowsForOID(o.ctx, dbOid, idxOID, xmax)
+				}
+			}
 		}
 	}
 	return nil
@@ -846,21 +881,15 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
 	}
-	// Skip expression indexes (column name "" means functional expression
-	// like lower(col)) — goopg does not yet support expression indexes.
-	// The index creation is silently ignored to let setup SQL proceed.
-	for _, c := range s.Columns {
-		if c == "" {
-			return nil
-		}
-	}
-	return o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.Unique, false)
+	return o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false)
 }
 
 func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP INDEX requires Pool in Context"}
 	}
+	flagInval := false
+	droppedOIDs := make([]uint32, 0, len(s.Names))
 	for _, name := range s.Names {
 		idx, ok := o.ctx.Catalog.LookupIndex(name)
 		if !ok {
@@ -877,6 +906,8 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		if err := o.ctx.Catalog.DropIndex(name); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
+		flagInval = true
+		droppedOIDs = append(droppedOIDs, dropOID)
 		o.ctx.Pool.InvalidateRel(rel)
 		if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
@@ -895,6 +926,31 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 			})
 			if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: fmt.Sprintf("drop-index WAL append: %v", err)}
+			}
+		}
+	}
+	// M0106-0011: DROP INDEX removes the index's pg_class row. Flag the txn
+	// so the commit-time xact-marker hook emits RecordKindXactCommitInval
+	// and refreshes pg_internal.init; without this a PG18 standby keeps a
+	// stale relcache entry for the dropped index.
+	if flagInval && o.ctx.TxnMgr != nil {
+		o.ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+	// M0106-0011 follow-up (a): stamp xmax on the on-disk pg_class row for
+	// the dropped index so a re-Open does not re-resolve the now-deleted
+	// index from `loadUserIndexesFromHeap`. `deleteCatalogRowsForOID` also
+	// touches pg_attribute (a no-op for indexes — indexes don't have
+	// pg_attribute rows in goopg's runtime layout). WAL-logged via
+	// markHeapDeleteDirty inside stampCatalogRows.
+	// MaterializeWriterXID ensures a real XID for the xmax stamp; DROP INDEX
+	// never calls writeHeapRowReturningPG so the XID would otherwise remain 0.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range catalogDBOids(o.ctx) {
+				for _, oid := range droppedOIDs {
+					deleteCatalogRowsForOID(o.ctx, dbOid, oid, xmax)
+				}
 			}
 		}
 	}
@@ -1006,6 +1062,14 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 		NotNull: col.NotNull,
 	})
 	if err == nil {
+		// M0106-0011: ALTER TABLE ADD COLUMN mutates the relation's
+		// pg_attribute row set and bumps pg_class.relnatts. Flag the txn
+		// so the commit-time xact-marker hook unlinks + regenerates
+		// pg_internal.init; a stale init file would keep a PG18 standby
+		// reading the pre-ALTER attribute count.
+		if o.ctx.TxnMgr != nil {
+			o.ctx.TxnMgr.SetRelcacheInvalPending()
+		}
 		return nil
 	}
 	if strings.Contains(strings.ToLower(err.Error()), "already exists") {
@@ -1026,15 +1090,21 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		name = tbl.Name + "_pkey"
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	return o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, true, true)
+	return o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true)
 }
 
-func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, unique bool, primary bool) error {
+func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool) error {
 	if len(columns) == 0 {
 		return &ExecError{Code: "42601", Pos: pos, Message: "index must have at least one key column"}
 	}
 	cols := make([]*catalog.Column, len(columns))
 	for i, name := range columns {
+		if name == "" {
+			// Expression column (e.g. lower(col)) — no catalog column to look up.
+			// cols[i] remains nil; bulkBuildBTree skips expression columns when
+			// there are no existing rows.
+			continue
+		}
 		col, ok := o.ctx.Catalog.LookupColumn(tbl, name)
 		if !ok {
 			return &ExecError{Code: "42703", Pos: pos, Message: fmt.Sprintf("column %q of relation %q does not exist", name, tbl.Name)}
@@ -1050,6 +1120,17 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			return &ExecError{Code: "42P07", Pos: pos, Message: err.Error()}
 		}
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	}
+	// Store parsed expressions for expression-based index columns so the
+	// planner and executor can evaluate them at conflict-detection time.
+	if len(colExprs) > 0 {
+		idx.ColExprs = make([]*parser.Expr, len(colExprs))
+		for i, e := range colExprs {
+			if e != nil {
+				ec := e // take address of loop copy
+				idx.ColExprs[i] = &ec
+			}
+		}
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	if err := o.bulkBuildBTree(idxRel, tbl, cols, unique, idxName.String(), pos); err != nil {
@@ -1129,16 +1210,14 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 		return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	var entries []btree.BulkEntry
-	var scanRow Row                                  // M0054-0005c: reusable decode buffer (see comment below).
-	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
-	// M0074-0004: per-page arena for projected varchar / char /
-	// numeric payloads. Reset on page advance; Drop on return.
-	// Datum lifetime ends at encodeBTreeKeyForColumn — the
-	// encoded BulkEntry.Key is an explicit append-copy
-	// (entries[].Key, line below), so retention beyond Reset
-	// is not a concern.
-	arena := NewArena(0)
-	defer arena.Drop()
+	var scanRow Row // M0054-0005c: reusable decode buffer (see comment below).
+	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
+	// Reset on page advance; Release on return.
+	// Datum lifetime ends at encodeBTreeKeyForColumn — the encoded
+	// BulkEntry.Key is an explicit append-copy, so no Datum reference
+	// outlives the Reset boundary.
+	sctxDDL := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	defer sctxDDL.Release()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -1165,20 +1244,26 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			// M0054-0005c: reuse a per-CREATE-INDEX decode buffer to
 			// avoid the per-row `make(Row, len(tbl.Columns))` that
 			// the M0054-0004 idx-window pprof showed at 39 % cum.
-			// True column projection is not feasible here because
-			// the on-disk row encoding is variable-length, so each
-			// column must be decoded sequentially to determine the
-			// next one's offset; the win is the slice-allocation
-			// removal, not the per-column work.
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			// M0054-0005c-followup: skip per-column heap
-			// allocations for columns the index doesn't reference.
-			// Other columns must still be size-scanned to advance
-			// the offset (variable-length codec) but their string/
-			// numeric payloads are not materialised.
-			if err := DecodeRowProjectionIntoArena(scanRow, tbl.Columns, tuple.Data, keep, arena); err != nil {
+			// Decode using the format indicated by the tuple header's natts
+			// field (Infomask2 low 11 bits). When natts > 0 the row was
+			// written by writeHeapRowReturning with ctx.LogCanonical != nil
+			// (PG physical layout, EncodeRowPG). When natts == 0 the row
+			// uses the legacy goopg layout (EncodeRow). Using the wrong
+			// decoder on PG-format data can produce plausible-looking
+			// but incorrect Datums (e.g. the 0x02 first byte of a LE int4=2
+			// is misread as a TOAST pointer flag and accidentally passes
+			// the sanity check if numChunks happens to be small).
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			var decErr error
+			if storedNatts > 0 {
+				decErr = decodePhysicalPGRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
+			} else {
+				decErr = decodeGoopgRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
+			}
+			if decErr != nil {
 				continue
 			}
 			row := scanRow
@@ -1189,11 +1274,11 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			}
 			entries = append(entries, btree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}})
 		}
-		// M0074-0004: page boundary — reset arena. All Datums
-		// from this page were consumed by encodeBTreeKeyForColumn
-		// and the resulting BulkEntry.Key is an explicit append-
-		// copy, so no Datum reference outlives this point.
-		arena.Reset()
+		// M0074-0004 / M0107-0001: page boundary — reset sctx. All
+		// Datums from this page were consumed by encodeBTreeKeyForColumn
+		// and the resulting BulkEntry.Key is an explicit append-copy,
+		// so no Datum reference outlives this point.
+		sctxDDL.Reset()
 		o.ctx.Pool.Unpin(slot)
 	}
 	// M0055-0006 Phase E: sorted-stream uniqueness check. The
@@ -1239,9 +1324,13 @@ func bytesEqual(a, b []byte) bool {
 // `i`-th entry is true iff `tableCols[i]` is referenced by `indexCols`.
 // Used by `DecodeRowProjection` to skip per-column heap allocations
 // for columns the index does not need. (M0054-0005c-followup.)
+// nil entries in indexCols (expression index columns) are skipped.
 func buildKeepMaskForIndex(tableCols []catalog.Column, indexCols []*catalog.Column) []bool {
 	want := make(map[string]struct{}, len(indexCols))
 	for _, ic := range indexCols {
+		if ic == nil {
+			continue // expression column — no catalog column
+		}
 		want[ic.Name] = struct{}{}
 	}
 	keep := make([]bool, len(tableCols))
@@ -1260,14 +1349,12 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	seen := map[string]struct{}{}
-	var scanRow Row                                  // M0054-0005c: reusable decode buffer.
-	keep := buildKeepMaskForIndex(tbl.Columns, cols) // M0054-0005c-followup
-	// M0074-0004: per-page arena. Datums consumed by
-	// encodeBTreeKeyForColumn; resulting key is copied (line below
-	// `seen[string(key)]` allocates a Go string from the bytes,
-	// and `tree.Insert` copies into btree pages).
-	arena := NewArena(0)
-	defer arena.Drop()
+	var scanRow Row // M0054-0005c: reusable decode buffer.
+	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
+	// Resulting key is copied by caller (`seen[string(key)]` and `tree.Insert`),
+	// so Datums need not outlive the per-page Reset boundary.
+	sctxDDL := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	defer sctxDDL.Release()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -1295,11 +1382,14 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 				continue
 			}
 			// M0054-0005c: reuse the decode buffer.
-			// M0054-0005c-followup: skip non-index column payloads.
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			if err := DecodeRowProjectionIntoArena(scanRow, tbl.Columns, tuple.Data, keep, arena); err != nil {
+			// Use the format-agnostic decoder (handles both goopg and PG
+			// physical format) so rows written via COPY with LogCanonical
+			// wired (EncodeRowPG) are correctly decoded.
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			if err := DecodeRowIntoMctxPGTuple(scanRow, tbl.Columns, tuple.Data, tuple.Bitmap, storedNatts, sctxDDL); err != nil {
 				continue
 			}
 			row := scanRow
@@ -1320,8 +1410,8 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 				return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 			}
 		}
-		// M0074-0004: page boundary — reset arena.
-		arena.Reset()
+		// M0074-0004 / M0107-0001: page boundary — reset sctx.
+		sctxDDL.Reset()
 		o.ctx.Pool.Unpin(slot)
 	}
 	return nil
@@ -1333,9 +1423,16 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 // col2, ...). Each column's encoding is self-terminating (fixed-length
 // for int4/int8, terminator byte for numeric), so concatenation is
 // unambiguous without a separator.
+// nil entries in cols (expression index columns) are skipped — expression
+// columns must be evaluated separately via encodeArbiterKey.
 func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) ([]byte, *ExecError) {
 	var out []byte
 	for _, col := range cols {
+		if col == nil {
+			// Expression column — cannot encode from raw row during bulk build.
+			// Callers building expression indexes must handle this separately.
+			continue
+		}
 		v := row[col.Ordinal]
 		if v.IsNull() {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is null and cannot be indexed", col.Name)}
@@ -1387,12 +1484,12 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		}
 		return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not numeric at runtime", col.Name)}
 	case isVarcharType(col.Type.Name):
-		if v.Kind != KindString && v.Kind != KindStringArena {
+		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
 		return btree.EncodeVarchar([]byte(v.StringValue())), nil
 	case isCharType(col.Type.Name):
-		if v.Kind != KindString && v.Kind != KindStringArena {
+		if v.Kind != KindString {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
 		return btree.EncodeChar([]byte(v.StringValue())), nil
@@ -1406,7 +1503,7 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		// text type: encode as varchar bytes. M0096-0008.
 		var s string
 		switch v.Kind {
-		case KindString, KindStringArena:
+		case KindString:
 			s = v.StringValue()
 		case KindInt:
 			s = fmt.Sprintf("%d", v.Int)
@@ -1769,7 +1866,19 @@ func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.Transa
 				if err := storage.PageSetHeapTupleXmax(page, lineNo, xmax); err != nil {
 					continue
 				}
-				_ = markHeapDeleteDirty(ctx.Pool, pinned, rel, blk, lineNo, xmax, nil)
+				// Use MarkDirtyForceFPI to emit a fresh full-page image of
+				// the post-stamp page. This overrides any stale FPI that
+				// was captured before the row existed (e.g. the mirror
+				// pg_class FPI taken at CREATE TABLE time for DBOid=5
+				// does not contain the index row added later). Without
+				// a fresh FPI, WAL replay would restore the pre-index
+				// state and the subsequent xmax stamp (if WAL-logged)
+				// would reference an invalid slot. Catalog xmax stamps
+				// survive crash recovery via the DDL WAL replay path
+				// (replayDatabaseDDLRecords / replayIndexDDLRecords);
+				// the FPI here is only needed for the heap-based catalog
+				// loader (loadUserTablesFromHeap / loadUserIndexesFromHeap).
+				ctx.Pool.MarkDirtyForceFPI(pinned)
 			}
 		}
 		pinned.Unlock()
@@ -1780,23 +1889,32 @@ func stampCatalogRows(ctx *Context, rel storage.RelFileNode, xmax storage.Transa
 // deleteCatalogRowsForOID stamps xmax on all live pg_class and pg_attribute
 // rows for relOID. Called from rollbackDDLCreate so that after a crash+restart
 // the startup catalog loader's xmax==0 filter skips the rolled-back rows.
-func deleteCatalogRowsForOID(ctx *Context, relOID uint32, xmax storage.TransactionID) {
+func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax storage.TransactionID) {
 	classRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  dbOid,
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
 	stampCatalogRows(ctx, classRel, xmax, func(data []byte) bool {
+		// Try native format first, then PG18-canonical physical format.
+		// syncTableToCatalogHeap writes physical rows; loadUserTablesFromHeap
+		// also handles both, so we must mirror that here.
 		row, err := catalog.DecodePGClassRow(data)
+		if err != nil {
+			row, err = catalog.DecodePGClassPhysicalRow(data)
+		}
 		return err == nil && row.OID == relOID
 	})
 	attrRel := storage.RelFileNode{
-		DBOid:  catalog.DefaultDBOid,
+		DBOid:  dbOid,
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
 	stampCatalogRows(ctx, attrRel, xmax, func(data []byte) bool {
 		row, err := catalog.DecodePGAttributeRow(data)
+		if err != nil {
+			row, err = catalog.DecodePGAttributePhysicalRow(data)
+		}
 		return err == nil && row.AttRelID == relOID
 	})
 }
@@ -1813,6 +1931,23 @@ func catalogHeapSyncAvailable(ctx *Context) bool {
 	pgAttr, ok := ctx.Catalog.LookupTable(
 		parser.ObjectName{Schema: "pg_catalog", Name: "pg_attribute"})
 	return ok && !pgAttr.Virtual
+}
+
+
+// catalogDBOids returns the set of database OIDs that hold catalog heap
+// pages for user relations. syncTableToCatalogHeap writes to DefaultDBOid
+// (1) and mirrors to the catalog's actual DBOID (e.g. 5 for "postgres").
+// DROP TABLE / DROP INDEX must stamp xmax in both so loadUserTablesFromHeap
+// (which reads from cat.DBOID()) does not re-resolve the dropped relation
+// after restart. Deduplication ensures DefaultDBOid is never stamped twice.
+func catalogDBOids(ctx *Context) []uint32 {
+	oids := []uint32{catalog.DefaultDBOid}
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		if dbOid := im.DBOID(); dbOid != catalog.DefaultDBOid {
+			oids = append(oids, dbOid)
+		}
+	}
+	return oids
 }
 
 // namespaceOIDForSchema maps a schema name to its pg_catalog namespace OID.
@@ -1907,6 +2042,14 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	}
 	if err := insertPgClassRelnameNspIndexEntry(ctx, idx.Name, relnamespace, classTID); err != nil {
 		return fmt.Errorf("pg_class_relname_nsp_index for index: %w", err)
+	}
+	// M0106-0011: CREATE INDEX (and ALTER TABLE ADD PRIMARY KEY) writes a
+	// pg_class row for the new index relation. Flag the txn so the commit
+	// hook emits RecordKindXactCommitInval and refreshes pg_internal.init;
+	// without this the relcache on a PG18 standby misses the new index when
+	// re-opening the parent table.
+	if ctx.TxnMgr != nil {
+		ctx.TxnMgr.SetRelcacheInvalPending()
 	}
 	// M0106-0010 batched-41: mirror catalog pages to DBOid=5 (the `postgres`
 	// database) so a PG18 standby connecting via `dbname=postgres` reads

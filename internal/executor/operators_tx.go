@@ -79,14 +79,23 @@ func (o *transactionOp) execBegin() error {
 		_ = o.ctx.Session.SetIsolationLevel(parsed)
 		level = parsed
 	}
-	tx, err := o.ctx.TxnMgr.Begin(level)
+	tx, err := o.ctx.TxnMgr.Begin(level, o.ctx.ProcNum)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
-	snap, err := o.ctx.TxnMgr.SnapshotFor(tx)
-	if err != nil {
-		_ = o.ctx.TxnMgr.Rollback(tx)
-		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+	// PG-parity: for RR/SERIALIZABLE, the snapshot is captured at the first
+	// non-BEGIN statement, NOT at BEGIN time. We leave firstSnapshot unset
+	// here; dispatchSimpleQueryViaExecutor's SnapshotFor call at the start of
+	// each query sets it on the first real statement after BEGIN. For RC, the
+	// snapshot is refreshed per-statement anyway, so the timing doesn't matter.
+	// M0100-0001 (first-statement snapshot semantics for read-write-unique).
+	var snap mvcc.Snapshot
+	if level == mvcc.IsolationReadCommitted {
+		snap, err = o.ctx.TxnMgr.SnapshotFor(tx)
+		if err != nil {
+			_ = o.ctx.TxnMgr.Rollback(tx)
+			return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
+		}
 	}
 	o.ctx.Session.BeginExplicitTransaction(tx, snap)
 	o.ctx.Tx = tx
@@ -192,8 +201,12 @@ func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
 	// Stamp xmax on the pg_class / pg_attribute rows so that after a
 	// crash+restart the heap loader's xmax==0 filter skips them. Without this,
 	// WAL replay restores the HeapInsert records and the table reappears.
+	// Stamp in all catalog DBOids (DefaultDBOid + mirror DBOID) so
+	// loadUserTablesFromHeap (which reads from cat.DBOID()) also sees xmax.
 	if catalogHeapSyncAvailable(ctx) && ctx.Tx.XID != storage.InvalidTransactionID {
-		deleteCatalogRowsForOID(ctx, entry.RelOID, ctx.Tx.XID)
+		for _, dbOid := range catalogDBOids(ctx) {
+			deleteCatalogRowsForOID(ctx, dbOid, entry.RelOID, ctx.Tx.XID)
+		}
 	}
 }
 

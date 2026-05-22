@@ -182,17 +182,14 @@ func TestScanRingCacheMissNoEviction(t *testing.T) {
 }
 
 // countCachedBlocks reports how many of the first nBlocks blocks of rel
-// are currently in the pool's partition byTag maps.
+// are currently in the pool's bufmap.
 func countCachedBlocks(pool *Pool, rel RelFileNode, nBlocks int) int {
 	count := 0
 	for blk := 0; blk < nBlocks; blk++ {
 		tag := BufferTag{Rel: rel, Block: BlockNumber(blk)}
-		part := &pool.partitions[tagPartition(tag)]
-		part.mu.Lock()
-		if _, ok := part.byTag[tag]; ok {
+		if idx, _ := pool.bm.Lookup(tag); idx >= 0 {
 			count++
 		}
-		part.mu.Unlock()
 	}
 	return count
 }

@@ -9,10 +9,12 @@ import (
 	"strconv"
 	"time"
 	"unsafe"
+
+	"github.com/goopg/goopg/internal/mctx"
 )
 
 // DatumKind discriminates the value carrier in a Datum.
-type DatumKind int
+type DatumKind uint8
 
 const (
 	KindNull DatumKind = iota
@@ -38,10 +40,11 @@ const (
 	// Arithmetic uses int64 math after aligning scales —
 	// sufficient for TPC-H SF1 magnitudes (~10^17 worst-case
 	// accumulator) but bounded by int64 overflow; the rare
-	// big-number lane spills to Datum.Big (e.g. Q8's
-	// `1.00000000000000000000`). See
+	// big-number lane spills to flagBigNumeric in mctx
+	// (e.g. Q8's `1.00000000000000000000`). See
 	// docs/design/0003-0012-numeric-arithmetic.md and
 	// docs/design/0068-0001-datum-compact-layout.md.
+	// M0107-0002: Big *big.Int removed; big mantissa stored in mctx.
 	KindNumeric
 	// KindToastPointer is an unresolved TOAST reference (M0046-0006).
 	// Datum.Buf carries the 12-byte on-disk TOAST pointer:
@@ -51,75 +54,55 @@ const (
 	// raw decoded rows (e.g. UPDATE predicates) receive already-detoasted
 	// datums from the underlying scan.
 	KindToastPointer
-	// KindStringArena is an arena-backed string Datum (M0073-0001).
-	// Buf is unused; arena != nil. Datum.Int packs (offset << 32) |
-	// (length & 0xFFFFFFFF) — offset is the arena-relative byte
-	// offset returned by Arena.Allocate; length is the byte count.
-	// StringValue() resolves via arena.Bytes(offset, length).
-	//
-	// Lifetime: the underlying bytes are valid until the arena's
-	// next Reset() call. Callers that retain the Datum across a
-	// Reset MUST go through slot.Materialize(), which calls
-	// cloneRowOwned to deep-copy arena bytes into a regular
-	// KindString Datum (Buf-backed). See
-	// docs/design/0073-0001-datum-arena-field.md.
-	KindStringArena
-	// KindBytesArena mirrors KindStringArena for raw bytes payload.
-	// BytesValue() resolves via arena.Bytes(offset, length).
-	KindBytesArena
+)
+
+// Datum flag bits (Datum.Flags).
+const (
+	// flagBigNumeric indicates KindNumeric uses the mctx big-mantissa
+	// path: ArenaID + Int=(offset<<32|length) encode the sign+BE-bytes
+	// representation. When clear, Int holds the int64 fast-path mantissa.
+	flagBigNumeric uint8 = 1 << 0
 )
 
 // Datum is one column value flowing through the operator tree.
 //
-// M0068-0001 compact layout: ~48 bytes, ≤ 2 GC-traced pointers
-// (was ~120 bytes / 4 pointers). The compaction saves Q5 SF=1 ~96 M
-// Datums × 2 fewer pointers = ~192 M fewer pointer-field scans per
-// MHJ build. See docs/design/0068-0001-datum-compact-layout.md.
+// M0107-0002 layout: 48 B, ≤ 1 GC-traced field (Buf, nil for
+// arena-backed and numeric datums). Reduces from 64 B / 3 GC pointers.
+// Hot-path arena-backed KindString/KindBytes have Buf=nil → 0 GC
+// pointers per Datum. See docs/design/perf-optimize/02-datum-pointer-free.md.
 //
 // Field semantics by Kind:
 //
-//	KindNull             — all zero.
-//	KindBool             — Int = 1 for true, 0 for false.
-//	KindInt              — Int = the integer value.
-//	KindString           — Buf = UTF-8 bytes.
-//	KindBytes            — Buf = raw bytes (mutability semantics
-//	                       vary by producer; readers MUST treat
-//	                       Buf as read-only unless they own the
-//	                       slice).
-//	KindTime             — Int = Unix nanos (UTC).
-//	KindInterval         — Int = (int64(months) << 32) |
-//	                       (int64(days) & 0xFFFFFFFF) using
-//	                       signed semantics; v0 rejects sub-day.
-//	KindNumeric          — Big != nil → big.Int mantissa, else
-//	                       Int = int64 mantissa fast path.
-//	                       Scale = digits after decimal.
-//	KindToastPointer     — Buf = 12-byte TOAST pointer.
+//	KindNull         — all zero.
+//	KindBool         — Int = 1 for true, 0 for false.
+//	KindInt          — Int = the integer value (signed int64 semantics).
+//	KindString       — ArenaID=0: Buf = UTF-8 bytes (Buf-backed, cold path).
+//	                   ArenaID≠0: Int=(offset<<32|length) into mctx (hot path).
+//	KindBytes        — same encoding as KindString.
+//	KindTime         — Int = Unix nanoseconds (UTC).
+//	KindInterval     — Int = (int64(months)<<32)|(int64(days)&0xFFFFFFFF);
+//	                   v0 rejects sub-day precision.
+//	KindNumeric      — Flags&flagBigNumeric=0: Int = int64 fast-path mantissa.
+//	                   Flags&flagBigNumeric≠0: ArenaID+Int=(off<<32|len) encode
+//	                   sign+BE-magnitude bytes in mctx. Scale = digits after '.'.
+//	KindToastPointer — Buf = 12-byte on-disk TOAST pointer.
 //
-// Concurrency: a Datum is a value type; copying it is cheap. Buf
-// and Big are aliased on copy — readers must not mutate either
-// without owning the producer's storage.
+// Concurrency: Datum is a value type; copying it is a 48-byte memmove.
+// Buf (when non-nil) is aliased on copy — treat as read-only.
 type Datum struct {
-	Kind  DatumKind // 8B (Go int)
-	Int   int64     // 8B (arena-Datum: (offset<<32)|length)
-	Buf   []byte    // 24B (slice header; nil for arena variants)
-	Big   *big.Int  // 8B
-	Scale int16     // 2B
-	// arena is non-nil only when Kind is KindStringArena /
-	// KindBytesArena. Datum.Int packs the (offset, length) into
-	// the arena's byte stream; StringValue() / BytesValue() resolve
-	// via arena.Bytes(offset, length). For all other Kinds, arena
-	// is nil and the legacy Buf-based path applies.
-	//
-	// M0073-0001 — see docs/design/0073-0001-datum-arena-field.md.
-	arena *Arena // 8B
-	// 6B padding → 64B exact.
+	Kind    DatumKind      // 1B @ 0 (was int = 8B; M0107-0002)
+	Flags   uint8          // 1B @ 1 (flagBigNumeric; reserved others)
+	ArenaID mctx.ContextID // 2B @ 2 (replaces *mctx.Context; 0 = no mctx payload)
+	Scale   int16          // 2B @ 4
+	_pad0   [2]byte        // 2B @ 6 (alignment pad before Int)
+	Int     int64          // 8B @ 8
+	Buf     []byte         // 24B @ 16 (nil when arena-backed)
+	Hi      uint64         // 8B @ 40 (reserved; future UUID-hi / interval micros)
+	// Total: 48 B. GC-traced fields: Buf (nil for arena-backed rows → 0 scans).
 }
 
-// Compile-time assertion that Datum is exactly 64 bytes after
-// M0073-0001 added the arena pointer. Pre-M0073 the struct was
-// 56 B with 8 B padding; the new field consumed all the headroom.
-// Future field additions trigger the M0074 packed-layout work.
-const _ uintptr = 64 - unsafe.Sizeof(Datum{}) // compile error if > 64
+// M0107-0002: Datum is exactly 48 bytes.
+const _ uintptr = 48 - unsafe.Sizeof(Datum{})
 
 // NullDatum is the canonical null value. Any Kind with IsNull() true
 // is treated as SQL NULL.
@@ -140,13 +123,19 @@ func (d Datum) BoolValue() bool { return d.Int != 0 }
 // invalid past the arena's next Reset() when the source is an
 // arena-backed Datum (M0073-0001).
 func (d Datum) StringValue() string {
-	if d.Kind == KindStringArena {
-		buf := d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))
+	if d.ArenaID != 0 {
+		// mctx-backed (hot path from seqScan/indexScan decode).
+		ctx := mctx.Lookup(d.ArenaID)
+		if ctx == nil {
+			return ""
+		}
+		buf := ctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))
 		if len(buf) == 0 {
 			return ""
 		}
 		return unsafe.String(&buf[0], len(buf))
 	}
+	// Buf-backed (cold path: literal construction, catalog rows, etc.).
 	if len(d.Buf) == 0 {
 		return ""
 	}
@@ -159,8 +148,12 @@ func (d Datum) StringValue() string {
 // MUST NOT mutate it, and MUST treat arena-backed bytes as invalid
 // past the arena's next Reset().
 func (d Datum) BytesValue() []byte {
-	if d.Kind == KindBytesArena {
-		return d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))
+	if d.ArenaID != 0 {
+		ctx := mctx.Lookup(d.ArenaID)
+		if ctx == nil {
+			return nil
+		}
+		return ctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))
 	}
 	return d.Buf
 }
@@ -189,7 +182,25 @@ func (d Datum) NumericMantissaValue() int64 { return d.Int }
 
 // NumericBigValue is the big.Int overflow lane of KindNumeric, or
 // nil when the int64 fast path applies.
-func (d Datum) NumericBigValue() *big.Int { return d.Big }
+func (d Datum) NumericBigValue() *big.Int {
+	if d.Flags&flagBigNumeric == 0 {
+		return nil
+	}
+	ctx := mctx.Lookup(d.ArenaID)
+	if ctx == nil {
+		return new(big.Int)
+	}
+	buf := ctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))
+	if len(buf) == 0 {
+		return new(big.Int)
+	}
+	sign := buf[0] & 0x80
+	bi := new(big.Int).SetBytes(buf[1:])
+	if sign != 0 {
+		bi.Neg(bi)
+	}
+	return bi
+}
 
 // NumericScaleValue is the scale (digits after decimal) of KindNumeric.
 func (d Datum) NumericScaleValue() int16 { return d.Scale }
@@ -217,9 +228,6 @@ func NewStringDatum(s string) Datum {
 	if s == "" {
 		return Datum{Kind: KindString}
 	}
-	// unsafe.StringData is read-only; Datum.BytesValue / StringValue
-	// callers must treat Buf as read-only. The producer-mutates-shared-
-	// buffer pitfall is documented in the Datum struct comment.
 	return Datum{Kind: KindString, Buf: unsafe.Slice(unsafe.StringData(s), len(s))}
 }
 
@@ -231,20 +239,20 @@ func NewBytesDatum(b []byte) Datum {
 // newStringArenaDatum constructs a KindStringArena Datum encoding
 // the (offset, length) pair into the Int field. Used by the
 // arena-aware decode path (M0073-0002 wires this through).
-func newStringArenaDatum(arena *Arena, offset, length int) Datum {
+func newStringArenaDatum(sctx *mctx.Context, offset, length uint32) Datum {
 	return Datum{
-		Kind:  KindStringArena,
-		Int:   int64(offset)<<32 | int64(length)&0xFFFFFFFF,
-		arena: arena,
+		Kind:    KindString,
+		ArenaID: sctx.ID(),
+		Int:     int64(offset)<<32 | int64(length)&0xFFFFFFFF,
 	}
 }
 
 // newBytesArenaDatum constructs a KindBytesArena Datum.
-func newBytesArenaDatum(arena *Arena, offset, length int) Datum {
+func newBytesArenaDatum(sctx *mctx.Context, offset, length uint32) Datum {
 	return Datum{
-		Kind:  KindBytesArena,
-		Int:   int64(offset)<<32 | int64(length)&0xFFFFFFFF,
-		arena: arena,
+		Kind:    KindBytes,
+		ArenaID: sctx.ID(),
+		Int:     int64(offset)<<32 | int64(length)&0xFFFFFFFF,
 	}
 }
 
@@ -258,29 +266,22 @@ func newBytesArenaDatum(arena *Arena, offset, length int) Datum {
 //
 // M0073-0004.
 func (d Datum) MaterializeArena() Datum {
-	switch d.Kind {
-	case KindStringArena:
-		length := int(d.Int & 0xFFFFFFFF)
-		if length == 0 || d.arena == nil {
-			return Datum{Kind: KindString}
-		}
-		offset := int(d.Int >> 32)
-		src := d.arena.Bytes(offset, length)
-		buf := make([]byte, length)
-		copy(buf, src)
-		return Datum{Kind: KindString, Buf: buf}
-	case KindBytesArena:
-		length := int(d.Int & 0xFFFFFFFF)
-		if length == 0 || d.arena == nil {
-			return Datum{Kind: KindBytes}
-		}
-		offset := int(d.Int >> 32)
-		src := d.arena.Bytes(offset, length)
-		buf := make([]byte, length)
-		copy(buf, src)
-		return Datum{Kind: KindBytes, Buf: buf}
+	if d.ArenaID == 0 || (d.Kind != KindString && d.Kind != KindBytes) {
+		return d
 	}
-	return d
+	length := uint32(d.Int & 0xFFFFFFFF)
+	if length == 0 {
+		return Datum{Kind: d.Kind}
+	}
+	ctx := mctx.Lookup(d.ArenaID)
+	if ctx == nil {
+		return Datum{Kind: d.Kind}
+	}
+	offset := uint32(d.Int >> 32)
+	src := ctx.Bytes(offset, length)
+	buf := make([]byte, length)
+	copy(buf, src)
+	return Datum{Kind: d.Kind, Buf: buf}
 }
 
 // rowHasArena reports whether any Datum in r is arena-backed.
@@ -292,7 +293,7 @@ func (d Datum) MaterializeArena() Datum {
 // in production; the test surface exercises it directly.
 func rowHasArena(r Row) bool {
 	for _, d := range r {
-		if d.Kind == KindStringArena || d.Kind == KindBytesArena {
+		if d.ArenaID != 0 && (d.Kind == KindString || d.Kind == KindBytes) {
 			return true
 		}
 	}
@@ -310,30 +311,23 @@ func rowHasArena(r Row) bool {
 func cloneRowOwned(src Row) Row {
 	dst := acquireRow(len(src))
 	for i, d := range src {
-		switch d.Kind {
-		case KindStringArena:
-			length := int(d.Int & 0xFFFFFFFF)
-			if length == 0 || d.arena == nil {
-				dst[i] = Datum{Kind: KindString}
+		if d.ArenaID != 0 && (d.Kind == KindString || d.Kind == KindBytes) {
+			length := uint32(d.Int & 0xFFFFFFFF)
+			if length == 0 {
+				dst[i] = Datum{Kind: d.Kind}
 				continue
 			}
-			offset := int(d.Int >> 32)
-			src := d.arena.Bytes(offset, length)
-			buf := make([]byte, length)
-			copy(buf, src)
-			dst[i] = Datum{Kind: KindString, Buf: buf}
-		case KindBytesArena:
-			length := int(d.Int & 0xFFFFFFFF)
-			if length == 0 || d.arena == nil {
-				dst[i] = Datum{Kind: KindBytes}
+			ctx := mctx.Lookup(d.ArenaID)
+			if ctx == nil {
+				dst[i] = Datum{Kind: d.Kind}
 				continue
 			}
-			offset := int(d.Int >> 32)
-			src := d.arena.Bytes(offset, length)
+			offset := uint32(d.Int >> 32)
+			s := ctx.Bytes(offset, length)
 			buf := make([]byte, length)
-			copy(buf, src)
-			dst[i] = Datum{Kind: KindBytes, Buf: buf}
-		default:
+			copy(buf, s)
+			dst[i] = Datum{Kind: d.Kind, Buf: buf}
+		} else {
 			dst[i] = d
 		}
 	}
@@ -365,8 +359,29 @@ func NewNumericInt64Datum(mant int64, scale int16) Datum {
 // NewNumericBigDatum constructs a KindNumeric Datum on the big.Int
 // overflow lane (used when the result of arithmetic exceeds int64
 // range, e.g. TPC-H Q8's `1.00000000000000000000`).
-func NewNumericBigDatum(big *big.Int, scale int16) Datum {
-	return Datum{Kind: KindNumeric, Big: big, Scale: scale}
+func NewNumericBigDatum(bi *big.Int, scale int16) Datum {
+	return newBigNumericInCtx(mctx.Perm(), bi, scale)
+}
+
+// newBigNumericInCtx stores bi's sign+BE-magnitude in ctx and returns
+// a KindNumeric Datum with flagBigNumeric set. ctx must outlive the Datum.
+func newBigNumericInCtx(ctx *mctx.Context, bi *big.Int, scale int16) Datum {
+	mag := bi.Bytes() // big-endian magnitude; one alloc inside big.Int
+	sign := byte(0)
+	if bi.Sign() < 0 {
+		sign = 0x80
+	}
+	buf := make([]byte, 1+len(mag))
+	buf[0] = sign
+	copy(buf[1:], mag)
+	off, length := ctx.AllocBytes(buf)
+	return Datum{
+		Kind:    KindNumeric,
+		Flags:   flagBigNumeric,
+		ArenaID: ctx.ID(),
+		Scale:   scale,
+		Int:     int64(off)<<32 | int64(length)&0xFFFFFFFF,
+	}
 }
 
 // NewToastPointerDatum constructs a KindToastPointer Datum.
@@ -397,19 +412,27 @@ func (d Datum) AppendValueText(dst []byte) []byte {
 	case KindInt:
 		return strconv.AppendInt(dst, d.Int, 10)
 	case KindString:
+		if d.ArenaID != 0 {
+			ctx := mctx.Lookup(d.ArenaID)
+			if ctx != nil {
+				return append(dst, ctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))...)
+			}
+			return dst
+		}
 		return append(dst, d.Buf...)
-	case KindStringArena:
-		return append(dst, d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))...)
 	case KindBytes:
+		if d.ArenaID != 0 {
+			ctx := mctx.Lookup(d.ArenaID)
+			if ctx != nil {
+				return append(dst, ctx.Bytes(uint32(d.Int>>32), uint32(d.Int&0xFFFFFFFF))...)
+			}
+			return dst
+		}
 		return append(dst, d.Buf...)
-	case KindBytesArena:
-		return append(dst, d.arena.Bytes(int(d.Int>>32), int(d.Int&0xFFFFFFFF))...)
 	case KindTime:
 		return d.TimeValue().AppendFormat(dst, "2006-01-02 15:04:05.000000")
 	}
-	// Fallback for KindInterval / KindNumeric / unknown kinds —
-	// the slow lane allocates but is off the simple-query
-	// pgbench hot path (which only emits KindInt for abalance).
+	// Fallback for KindInterval / KindNumeric / unknown kinds.
 	return append(dst, d.Format()...)
 }
 
@@ -424,17 +447,17 @@ func (d Datum) Format() string {
 		return "f"
 	case KindInt:
 		return strconv.FormatInt(d.Int, 10)
-	case KindString, KindStringArena:
+	case KindString:
 		return d.StringValue()
-	case KindBytes, KindBytesArena:
+	case KindBytes:
 		return string(d.BytesValue())
 	case KindTime:
 		return d.TimeValue().Format("2006-01-02 15:04:05.000000")
 	case KindInterval:
 		return fmt.Sprintf("%d months %d days", d.IntervalMonthsValue(), d.IntervalDaysValue())
 	case KindNumeric:
-		if d.Big != nil {
-			return formatNumericBig(d.Big, d.Scale)
+		if d.Flags&flagBigNumeric != 0 {
+			return formatNumericBig(d.NumericBigValue(), d.Scale)
 		}
 		return formatNumeric(d.Int, d.Scale)
 	}
@@ -478,8 +501,8 @@ func formatNumeric(mantissa int64, scale int16) string {
 // transparently dispatching to formatNumericBig for the *big.Int
 // lane and formatNumeric for the int64 fast path.
 func numericText(d Datum) string {
-	if d.Big != nil {
-		return formatNumericBig(d.Big, d.Scale)
+	if d.Flags&flagBigNumeric != 0 {
+		return formatNumericBig(d.NumericBigValue(), d.Scale)
 	}
 	return formatNumeric(d.Int, d.Scale)
 }

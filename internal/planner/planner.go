@@ -341,7 +341,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// substitute them in. Restorer pops the CTE scope back to
 	// the caller's view when this Plan call returns. nil-WITH
 	// returns a no-op restorer.
-	restore, err := preplanWithClause(s.With, cat)
+	restore, dmlPlans, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -798,7 +798,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if s.Distinct {
 		out = &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
 	}
-	return out, nil
+	return wrapDMLCTEPrefix(out, dmlPlans), nil
 }
 
 // resolveLockedRels walks the parsed locking clauses and
@@ -1173,6 +1173,17 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				alias = ce.name
 			}
 			b := rangeBinding{table: ce.table, alias: alias, offset: 0, sourceIdx: sourceIdx}
+			if ce.isDML {
+				// DML CTE: rows are materialized at runtime in
+				// ctx.MaterializedCTEs; use MaterializedCTEScan.
+				scan := &MaterializedCTEScan{
+					pos:    rv.Pos(),
+					Name:   ce.name,
+					Alias:  alias,
+					schema: ce.schema,
+				}
+				return scan, b, nil
+			}
 			scan := &CTEScan{
 				pos:    rv.Pos(),
 				Name:   ce.name,
@@ -2771,6 +2782,8 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 		return walkExpr(x.Right, fn)
 	case *parser.UnaryOp:
 		return walkExpr(x.Operand, fn)
+	case *parser.CastExpr:
+		return walkExpr(x.Operand, fn)
 	case *parser.IsNullExpr:
 		return walkExpr(x.Operand, fn)
 	case *parser.IsBoolExpr:
@@ -3395,7 +3408,7 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 }
 
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
-	restore, err := preplanWithClause(s.With, cat)
+	restore, _, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -3520,25 +3533,41 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 		}
 		out.ArbiterIndex = idx
 		out.ArbiterColumns = ords
-	} else if out.Action == OnConflictActionNothing && cat != nil {
-		// Auto-detect primary key as arbiter for bare ON CONFLICT DO NOTHING.
-		for _, idx := range cat.IndexesOnTable(tbl) {
-			if !idx.Primary {
-				continue
+		// Build ArbiterExprs for expression-based arbiter columns
+		// (where ords[i] == -1 and oc.Target.Exprs[i] != nil).
+		if len(oc.Target.Exprs) > 0 {
+			hasExpr := false
+			for _, o2 := range ords {
+				if o2 == -1 {
+					hasExpr = true
+					break
+				}
 			}
-			out.ArbiterIndex = idx
-			ords := make([]int, 0, len(idx.Columns))
-			for _, colName := range idx.Columns {
-				for i, col := range tbl.Columns {
-					if strings.EqualFold(col.Name, colName) {
-						ords = append(ords, i)
-						break
+			if hasExpr {
+				// Build a single-binding resolve context for the target table
+				// so expression ColumnRefs resolve against the insert row.
+				exprCtx := singleBindingContext(tbl, targetAlias)
+				exprCtx.cat = cat
+				out.ArbiterExprs = make([]Expr, len(ords))
+				for i, o2 := range ords {
+					if o2 == -1 && i < len(oc.Target.Exprs) && oc.Target.Exprs[i] != nil {
+						resolved, rerr := resolveExpr(oc.Target.Exprs[i], exprCtx)
+						if rerr != nil {
+							return nil, rerr
+						}
+						out.ArbiterExprs[i] = resolved
 					}
 				}
 			}
-			out.ArbiterColumns = ords
-			break
 		}
+	} else if out.Action == OnConflictActionNothing && cat != nil {
+		idx, ords, exprs, err := resolveDefaultDoNothingArbiter(tbl, targetAlias, cat)
+		if err != nil {
+			return nil, err
+		}
+		out.ArbiterIndex = idx
+		out.ArbiterColumns = ords
+		out.ArbiterExprs = exprs
 	}
 
 	if out.Action != OnConflictActionUpdate {
@@ -3594,6 +3623,55 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 	return out, nil
 }
 
+func resolveDefaultDoNothingArbiter(tbl *catalog.Table, targetAlias string, cat catalog.Catalog) (*catalog.Index, []int, []Expr, error) {
+	if cat == nil {
+		return nil, nil, nil, nil
+	}
+	var chosen *catalog.Index
+	for _, idx := range cat.IndexesOnTable(tbl) {
+		if !idx.Unique {
+			continue
+		}
+		if chosen == nil || idx.Primary {
+			chosen = idx
+			if idx.Primary {
+				break
+			}
+		}
+	}
+	if chosen == nil {
+		return nil, nil, nil, nil
+	}
+	ords := make([]int, 0, len(chosen.Columns))
+	var exprs []Expr
+	var exprCtx *resolveContext
+	for i, colName := range chosen.Columns {
+		if colName == "" {
+			ords = append(ords, -1)
+			if exprCtx == nil {
+				exprCtx = singleBindingContext(tbl, targetAlias)
+				exprCtx.cat = cat
+				exprs = make([]Expr, len(chosen.Columns))
+			}
+			if chosen.ColExprs == nil || i >= len(chosen.ColExprs) || chosen.ColExprs[i] == nil {
+				return nil, nil, nil, &PlanError{Code: "XX000", Message: fmt.Sprintf("index %q is missing expression metadata for ON CONFLICT DO NOTHING", chosen.Name)}
+			}
+			resolved, err := resolveExpr(*chosen.ColExprs[i], exprCtx)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			exprs[i] = resolved
+			continue
+		}
+		col, ok := cat.LookupColumn(tbl, colName)
+		if !ok {
+			return nil, nil, nil, &PlanError{Code: "XX000", Message: fmt.Sprintf("index %q column %q not found on table %q", chosen.Name, colName, tbl.Name)}
+		}
+		ords = append(ords, col.Ordinal)
+	}
+	return chosen, ords, exprs, nil
+}
+
 // resolveArbiterIndex matches the parsed conflict-target columns
 // against tbl's catalog indexes. A unique index whose column set
 // equals the target column set (case-insensitive, order-insensitive)
@@ -3636,9 +3714,18 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 	if len(target.Columns) == 0 {
 		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42601", Message: "ON CONFLICT target requires at least one column"}
 	}
+	// Build a set of wanted column names. Expression columns (name=="") are
+	// represented by a unique sentinel key per position so the set-size
+	// check correctly detects duplicate plain column names.
 	wanted := make(map[string]struct{}, len(target.Columns))
-	for _, c := range target.Columns {
-		wanted[strings.ToLower(c)] = struct{}{}
+	for i, c := range target.Columns {
+		if c == "" {
+			// Expression column — use a unique sentinel per position so each
+			// expression gets its own slot in the wanted set.
+			wanted[fmt.Sprintf("__expr_%d__", i)] = struct{}{}
+		} else {
+			wanted[strings.ToLower(c)] = struct{}{}
+		}
 	}
 	if len(wanted) != len(target.Columns) {
 		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: "ON CONFLICT target list contains duplicate columns"}
@@ -3650,11 +3737,24 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 		if len(idx.Columns) != len(target.Columns) {
 			continue
 		}
+		// Match: for each index column position, check that the target has
+		// the same kind of column (plain name or expression). Expression
+		// columns in the index (ic=="") match expression columns in the
+		// target at the same position.
 		match := true
-		for _, ic := range idx.Columns {
-			if _, ok := wanted[strings.ToLower(ic)]; !ok {
-				match = false
-				break
+		for j, ic := range idx.Columns {
+			if ic == "" {
+				// Expression index column — must match expression target column
+				// at same position.
+				if j >= len(target.Columns) || target.Columns[j] != "" {
+					match = false
+					break
+				}
+			} else {
+				if _, ok := wanted[strings.ToLower(ic)]; !ok {
+					match = false
+					break
+				}
 			}
 		}
 		if !match {
@@ -3662,6 +3762,11 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 		}
 		ords := make([]int, 0, len(idx.Columns))
 		for _, ic := range idx.Columns {
+			if ic == "" {
+				// Expression index column — use sentinel -1.
+				ords = append(ords, -1)
+				continue
+			}
 			col, ok := cat.LookupColumn(tbl, ic)
 			if !ok {
 				// Catalog inconsistency — index references a
@@ -3687,7 +3792,7 @@ func insertValuesSchema(tbl *catalog.Table, colIndex []int) Schema {
 }
 
 func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
-	restore, err := preplanWithClause(s.With, cat)
+	restore, _, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -3741,7 +3846,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 }
 
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
-	restore, err := preplanWithClause(s.With, cat)
+	restore, _, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -3887,7 +3992,22 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
 		}
 		clauses = append(clauses, pc)
 	}
-	return &Merge{pos: s.Pos(), Target: tbl, Source: sourceNode, On: onExpr, Clauses: clauses}, nil
+	m := &Merge{pos: s.Pos(), Target: tbl, Source: sourceNode, On: onExpr, Clauses: clauses}
+
+	// RETURNING clause (M0100 DML-CTE): resolve against target-table binding.
+	if len(s.Returning) > 0 {
+		retCtx := newResolveContext([]rangeBinding{
+			{table: tbl, alias: targetAlias, offset: 0, sourceIdx: 1},
+		}, tableSchemaWithSource(tbl, 1))
+		retCtx.cat = cat
+		exprs, schema, err := resolveTargets(s.Returning, retCtx)
+		if err != nil {
+			return nil, err
+		}
+		m.Returning = exprs
+		m.ReturningSchema = schema
+	}
+	return m, nil
 }
 
 // buildInsertColIdx returns column ordinals for a MERGE NOT MATCHED INSERT.

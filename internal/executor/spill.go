@@ -37,14 +37,14 @@ func (w *spillWriter) WriteRow(row Row) error {
 	// Prefix with total length for framing.
 	lenBuf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lenBuf, uint32(len(w.buf)))
-	reg, pid := activity.LookupGoroutine()
-	if reg != nil {
-		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileWrite)
+	reg, procNum, okReg := activity.LookupCurrentGoroutine()
+	if okReg {
+		reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitBuffileWrite)
 	}
 	_, err1 := w.f.Write(lenBuf)
 	_, err2 := w.f.Write(w.buf)
-	if reg != nil {
-		reg.WaitEventEnd(pid)
+	if okReg {
+		reg.WaitEventEnd(procNum)
 	}
 	if err1 != nil {
 		return err1
@@ -101,13 +101,13 @@ func (r *spillReader) ReadRow() (Row, error) {
 // across calls.
 func (r *spillReader) ReadRowInto(dst Row) (Row, error) {
 	var lenBuf [4]byte
-	reg, pid := activity.LookupGoroutine()
-	if reg != nil {
-		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileRead)
+	reg, procNum, okReg := activity.LookupCurrentGoroutine()
+	if okReg {
+		reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitBuffileRead)
 	}
 	_, errLen := io.ReadFull(r.f, lenBuf[:])
-	if reg != nil {
-		reg.WaitEventEnd(pid)
+	if okReg {
+		reg.WaitEventEnd(procNum)
 	}
 	if errLen != nil {
 		return nil, errLen
@@ -121,12 +121,12 @@ func (r *spillReader) ReadRowInto(dst Row) (Row, error) {
 		r.dataBuf = r.dataBuf[:dataLen]
 	}
 	data := r.dataBuf
-	if reg != nil {
-		reg.WaitEventStart(pid, activity.WaitTypeIO, activity.WaitBuffileRead)
+	if okReg {
+		reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitBuffileRead)
 	}
 	_, errData := io.ReadFull(r.f, data)
-	if reg != nil {
-		reg.WaitEventEnd(pid)
+	if okReg {
+		reg.WaitEventEnd(procNum)
 	}
 	if errData != nil {
 		return nil, fmt.Errorf("spillReader: truncated row: %w", errData)
@@ -178,10 +178,10 @@ func encodeDatum(d Datum, buf []byte) []byte {
 		}
 	case KindInt:
 		buf = binary.LittleEndian.AppendUint64(buf, uint64(d.Int))
-	case KindString, KindStringArena:
+	case KindString:
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.StringValue())))
 		buf = append(buf, d.StringValue()...)
-	case KindBytes, KindBytesArena:
+	case KindBytes:
 		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(d.BytesValue())))
 		buf = append(buf, d.BytesValue()...)
 	case KindTime:
@@ -230,7 +230,7 @@ func decodeDatum(data []byte) (Datum, int, error) {
 			return Datum{}, 0, fmt.Errorf("truncated int at %d", pos)
 		}
 		return Datum{Kind: KindInt, Int: int64(binary.LittleEndian.Uint64(data[pos:]))}, pos + 8, nil
-	case KindString, KindStringArena:
+	case KindString:
 		if pos+4 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated string len at %d", pos)
 		}
@@ -241,7 +241,7 @@ func decodeDatum(data []byte) (Datum, int, error) {
 		}
 		s := string(data[pos : pos+int(slen)])
 		return NewStringDatum(s), pos + int(slen), nil
-	case KindBytes, KindBytesArena:
+	case KindBytes:
 		if pos+4 > len(data) {
 			return Datum{}, 0, fmt.Errorf("truncated bytes len at %d", pos)
 		}
@@ -295,9 +295,9 @@ func estimatedRowBytes(row Row) int64 {
 	n := int64(len(row) * 48) // Datum struct fixed overhead
 	for _, d := range row {
 		switch d.Kind {
-		case KindString, KindStringArena:
+		case KindString:
 			n += int64(len(d.StringValue()))
-		case KindBytes, KindBytesArena:
+		case KindBytes:
 			n += int64(len(d.BytesValue()))
 		}
 	}

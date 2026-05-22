@@ -27,6 +27,8 @@ type mergeOp struct {
 	ctx          *Context
 	rowsAffected int64
 	done         bool
+	retRows      [][]Datum // collected RETURNING rows
+	retIdx       int       // next retRows index to yield
 }
 
 // mergePendingMod records a single MERGE modification to apply after the
@@ -40,21 +42,28 @@ type mergePendingMod struct {
 	newRow Row // for UPDATE
 	srcRow Row // source row for EPQ re-evaluation
 	tgtRow Row // target old row for BEFORE trigger firing
+	srcIdx int // index into srcRows for EPQ-delete fallback to NOT MATCHED
 }
 
 func newMergeOp(p *planner.Merge) *mergeOp { return &mergeOp{plan: p} }
+
+// errMergeSourceUnmatched is returned by applyMod when the target row was
+// deleted by a concurrent committed transaction during EPQ. The outer loop
+// must reset the source row's matched flag and retry via NOT MATCHED clauses.
+var errMergeSourceUnmatched = errors.New("merge: source row unmatched (target row deleted)")
 
 // mergeEPQError is returned by mergeApplyUpdate/mergeApplyDelete when the
 // target row was concurrently updated. The caller must re-evaluate WHEN
 // MATCHED conditions against the new live row (EPQ recheck). M0100-0005.
 type mergeEPQError struct {
+	newBlk    storage.BlockNumber // same as caller's blk for HOT; may differ for non-HOT
 	newSlot   uint16
 	newTgtRow Row
 }
 
 func (e *mergeEPQError) Error() string { return "merge EPQ recheck" }
 
-func (o *mergeOp) Schema() planner.Schema { return nil }
+func (o *mergeOp) Schema() planner.Schema { return o.plan.ReturningSchema }
 func (o *mergeOp) RowsAffected() int64   { return o.rowsAffected }
 
 func (o *mergeOp) Open(ctx *Context) error {
@@ -64,8 +73,28 @@ func (o *mergeOp) Open(ctx *Context) error {
 
 func (o *mergeOp) Close() error { return nil }
 
+// collectReturningRow evaluates the RETURNING expressions against row and
+// appends the result to o.retRows. No-op when plan has no RETURNING clause.
+func (o *mergeOp) collectReturningRow(row Row) {
+	if len(o.plan.Returning) == 0 {
+		return
+	}
+	retRow := make([]Datum, len(o.plan.Returning))
+	for i, expr := range o.plan.Returning {
+		val, _ := evalExpr(expr, row, o.ctx)
+		retRow[i] = val
+	}
+	o.retRows = append(o.retRows, retRow)
+}
+
 func (o *mergeOp) Next() (TupleSlot, error) {
+	// Yield pre-collected RETURNING rows on subsequent calls.
 	if o.done {
+		if o.retIdx < len(o.retRows) {
+			row := o.retRows[o.retIdx]
+			o.retIdx++
+			return SlotFromRow(o.plan.ReturningSchema, row), nil
+		}
 		return nil, EOF
 	}
 	o.done = true
@@ -223,11 +252,11 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 						_ = computeGeneratedColumns(scanTbl.Columns, newRow)
 						mods = append(mods, mergePendingMod{rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx,
 							action: planner.MergeActionUpdate, newRow: newRow,
-							srcRow: cloneRow(srcRows[si].row), tgtRow: cloneRow(vt.tgtRow)})
+							srcRow: cloneRow(srcRows[si].row), tgtRow: cloneRow(vt.tgtRow), srcIdx: si})
 					case planner.MergeActionDelete:
 						mods = append(mods, mergePendingMod{rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx,
 							action: planner.MergeActionDelete, srcRow: cloneRow(srcRows[si].row),
-							tgtRow: cloneRow(vt.tgtRow)})
+							tgtRow: cloneRow(vt.tgtRow), srcIdx: si})
 					case planner.MergeActionDoNothing:
 						// DO NOTHING — skip this row. M0097-0016.
 					}
@@ -240,7 +269,8 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 	} // end for scanTbl
 
 	// Apply pending modifications (with EPQ retry loop for concurrent updates).
-	for _, mod := range mods {
+	for i := range mods {
+		mod := &mods[i]
 		modTbl := mod.tblRef
 		if modTbl == nil {
 			modTbl = tbl
@@ -250,11 +280,24 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			modRel = rel
 		}
 		applied, err := o.applyMod(modRel, modTbl, n, mod)
+		if errors.Is(err, errMergeSourceUnmatched) {
+			// The target row was deleted by a concurrent committed transaction.
+			// Unmark the source row so step 3 can attempt NOT MATCHED INSERT.
+			srcRows[mod.srcIdx].matched = false
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
 		if applied {
 			o.rowsAffected++
+			// Collect RETURNING row using post-EPQ values (mod is a pointer so
+			// applyMod's EPQ re-evaluation of mod.newRow propagates here).
+			if mod.action == planner.MergeActionUpdate {
+				o.collectReturningRow(mod.newRow)
+			} else if mod.action == planner.MergeActionDelete {
+				o.collectReturningRow(mod.tgtRow)
+			}
 		}
 	}
 
@@ -298,12 +341,51 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				}
 			}
 			_ = computeGeneratedColumns(tbl.Columns, row)
-			if err := writeHeapRow(o.ctx, rel, tbl.Columns, row); err != nil {
-				return nil, err
+
+			// Partition routing: route the row to the correct leaf partition.
+			insertTbl := tbl
+			insertRel := rel
+			if len(tbl.PartitionKey) > 0 {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					if part := routeToPartition(tbl, row, im); part != nil {
+						insertTbl = part
+						insertRel = o.ctx.Catalog.RelFileNode(part)
+						row = remapRowForPartition(tbl.Columns, part.Columns, row)
+						_ = computeGeneratedColumns(part.Columns, row)
+					}
+				}
 			}
+
+			// BEFORE INSERT triggers (mirrors insertOp path). M0100-0005.
+			if len(insertTbl.Triggers) > 0 {
+				newRow, ok := fireTriggers(o.ctx, insertTbl, "before", "insert", nil, row)
+				if !ok {
+					break // trigger returned NULL — suppress insert
+				}
+				row = newRow
+			}
+
+			// Unique constraint check with wait semantics — mirrors insertOp so
+			// concurrent INSERT / MERGE NOT MATCHED on the same key causes the
+			// correct wait → 23505 (committed) or retry (aborted) behaviour.
+			if uerr := checkUniqueIndexesForInsert(o.ctx, insertTbl, insertTbl.Columns, row, o.plan.Pos()); uerr != nil {
+				return nil, uerr
+			}
+			ptr, werr := writeHeapRowReturning(o.ctx, insertRel, insertTbl.Columns, row)
+			if werr != nil {
+				return nil, werr
+			}
+			maintainUniqueIndexesForInsert(o.ctx, insertTbl, insertTbl.Columns, row, ptr)
 			o.rowsAffected++
+			o.collectReturningRow(row)
 			break // first matching clause wins
 		}
+	}
+	// Yield first RETURNING row (if any); subsequent rows via retIdx.
+	if len(o.plan.Returning) > 0 && len(o.retRows) > 0 {
+		row := o.retRows[0]
+		o.retIdx = 1
+		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
 	return nil, EOF
 }
@@ -313,7 +395,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 // applyMod applies a single pending MERGE modification with EPQ retry loop.
 // Returns (true, nil) on success, (false, nil) if skipped (row gone or
 // conditions no longer match), (false, err) on fatal error.
-func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, mod mergePendingMod) (applied bool, _ error) {
+func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, mod *mergePendingMod) (applied bool, _ error) {
 	for {
 		// Triggers are fired inside mergeApplyUpdate/Delete after EPQ resolves,
 		// so they fire exactly once per successful write. M0100-0005.
@@ -328,6 +410,9 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 		}
 		if err == nil {
 			return true, nil
+		}
+		if errors.Is(err, errMergeSourceUnmatched) {
+			return false, errMergeSourceUnmatched
 		}
 		epqErr, isEPQ := err.(*mergeEPQError)
 		if !isEPQ {
@@ -360,12 +445,14 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 					newRow[i] = val
 				}
 				_ = computeGeneratedColumns(tbl.Columns, newRow)
+				mod.blk = epqErr.newBlk
 				mod.slot = epqErr.newSlot
 				mod.tgtRow = epqErr.newTgtRow // update for trigger firing in next iteration
 				mod.newRow = newRow
 				mod.action = planner.MergeActionUpdate
 				reMatched = true
 			case planner.MergeActionDelete:
+				mod.blk = epqErr.newBlk
 				mod.slot = epqErr.newSlot
 				mod.tgtRow = epqErr.newTgtRow
 				mod.action = planner.MergeActionDelete
@@ -380,6 +467,26 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 		}
 		// Loop back to retry with updated slot/newRow. mergeApplyUpdate/Delete fires trigger.
 	}
+}
+
+// mergeEPQRefreshSnap refreshes ctx.Snap for READ COMMITTED after epqWait so
+// that committed xmax values are visible as "deleted" rather than "in progress".
+// Without this, the frozen snapshot keeps the concurrent xmax in InProgress,
+// making the deleted tuple appear live and causing an infinite EPQ retry loop.
+func mergeEPQRefreshSnap(ctx *Context) {
+	if ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+		return
+	}
+	if ctx.TxnMgr == nil {
+		return
+	}
+	snap, err := ctx.TxnMgr.SnapshotFor(ctx.Tx)
+	if err != nil {
+		// If we can't refresh (e.g. isolation mismatch), use a best-effort approach:
+		// remove the waited-on XID from the snapshot's InProgress list.
+		return
+	}
+	ctx.Snap = snap
 }
 
 func mergedRow(tgt, src Row) Row {
@@ -421,14 +528,34 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		if epqWait(ctx, xmax) {
 			return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
 		}
+		// For RC: refresh snapshot so committed xmax is visible as "deleted"
+		// (frozen snapshot keeps xmax in InProgress, making the tuple appear live).
+		mergeEPQRefreshSnap(ctx)
+		// Check for moved-partition sentinel (cross-partition UPDATE) before chain follow.
+		if epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
+			return errMovedToAnotherPartition(pos)
+		}
 		// Follow HOT chain to find the current live tuple.
 		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
-		if !found {
-			return nil // row deleted by concurrent txn, skip this MERGE action
+		if found {
+			// Signal the caller to re-evaluate WHEN MATCHED conditions with the new row.
+			// Trigger will fire on the NEXT call with the correct live row. M0100-0005.
+			return &mergeEPQError{newBlk: blk, newSlot: newSlot, newTgtRow: newTgtRow}
 		}
-		// Signal the caller to re-evaluate WHEN MATCHED conditions with the new row.
-		// Trigger will fire on the NEXT call with the correct live row. M0100-0005.
-		return &mergeEPQError{newSlot: newSlot, newTgtRow: newTgtRow}
+		// Non-HOT cross-page update (partition children skip HOT in updateOp because
+		// puRel != rel): fall back to raw t_ctid chain, same pattern as updateOp.Next().
+		// Use epqFollowChainFull to detect when the chain ended due to a moved-partition
+		// sentinel (e.g. HOT chain where the live successor was itself cross-partition moved).
+		_, cRes, chainHadSentinel := epqFollowChainFull(ctx, rel, blk, slot, cols, nil)
+		if cRes.ok {
+			return &mergeEPQError{newBlk: cRes.blk, newSlot: cRes.slot, newTgtRow: cRes.row}
+		}
+		// If the chain ended because of a sentinel anywhere along the chain (at the
+		// starting slot or at any HOT-chain successor), raise the partition-moved error.
+		if chainHadSentinel || epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
+			return errMovedToAnotherPartition(pos)
+		}
+		return errMergeSourceUnmatched // row deleted; caller retries as NOT MATCHED
 	}
 	// No concurrent update: safe to write. Release lock, fire BEFORE trigger, re-pin, write.
 	s.Unlock()
@@ -483,11 +610,30 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		if epqWait(ctx, xmax) {
 			return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
 		}
-		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
-		if !found {
-			return nil
+		// Refresh snapshot (RC) so the committed xmax is visible as "deleted".
+		// Mirrors mergeApplyUpdate — required so epqFollowHOT/epqFollowChain
+		// can correctly classify the old tuple as dead and follow to the
+		// live successor.
+		mergeEPQRefreshSnap(ctx)
+		// Follow HOT/non-HOT chain to find the live successor. If the
+		// concurrent tx was an UPDATE the chain points to the new version
+		// and we re-evaluate WHEN conditions via mergeEPQError. If it was
+		// a DELETE (or cross-partition move) no successor exists.
+		if epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
+			return errMovedToAnotherPartition(pos)
 		}
-		return &mergeEPQError{newSlot: newSlot, newTgtRow: newTgtRow}
+		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
+		if found {
+			return &mergeEPQError{newBlk: blk, newSlot: newSlot, newTgtRow: newTgtRow}
+		}
+		_, cRes2, chainHadSentinel2 := epqFollowChainFull(ctx, rel, blk, slot, cols, nil)
+		if cRes2.ok {
+			return &mergeEPQError{newBlk: cRes2.blk, newSlot: cRes2.slot, newTgtRow: cRes2.row}
+		}
+		if chainHadSentinel2 || epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
+			return errMovedToAnotherPartition(pos)
+		}
+		return errMergeSourceUnmatched // row truly deleted; caller retries as NOT MATCHED
 	}
 	s.Unlock()
 	ctx.Pool.Unpin(s)
