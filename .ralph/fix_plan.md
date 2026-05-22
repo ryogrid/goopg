@@ -732,156 +732,169 @@ M0097-0001 wires it up.
       - pg_settings: updated with 21 enable_* parameters
       - Removed incorrect pg_type virtual table (heap-backed in initdb)
 
-- [ ] **M0097-0019 — Regress baseline audit (2026-05-22)**
-      - Summary: Run the full regress suite via
-        `go test -v -run TestPort_RegressSuite ./internal/testport/`
-        and capture per-test diff-line counts for all 112 "failed"
-        entries in `upstream-regress-coverage.md`.  Publish the counts
-        as a CSV column or a companion file so later loops can track
-        progress test-by-test without re-running the full suite.
-        Use `go run ./cmd/gen-regress-coverage` to regenerate the
-        markdown after any status transitions.
-      - Action: run the suite, add a `diff_lines` column with the
-        normalized diff count per case, regenerate the markdown.
+- [ ] **M0097-0019 — Regress baseline audit: run full suite, capture diff-line counts**
+      - Summary: Run `go test -v -run TestPort_RegressSuite -timeout 30m
+        ./internal/testport/` and record the normalized diff-line count
+        for every "failed" entry.  Update
+        `docs/test-port/upstream-regress-coverage.md` with a
+        `diff_lines` column via `go run ./cmd/gen-regress-coverage`.
+      - DoD: every "failed" entry has a current diff-line count;
+        sorting by count identifies the easiest wins.  Regenerate
+        the markdown and commit.
 
-- [ ] **M0097-0020 — Promote SELECT / DML / JOIN / subquery / CTE regress tests to PASS**
-      - Target tests: `select`, `select_distinct`, `select_distinct_on`,
+- [ ] **M0097-0020 — Port SELECT / DML / JOIN / subquery / CTE regress tests**
+      - Summary: Make these 15 tests reach `pass` status:
+        `select`, `select_distinct`, `select_distinct_on`,
         `select_into`, `insert`, `update`, `delete`, `returning`,
         `limit`, `union`, `errors`, `explain`,
         `join`, `subselect`, `with`.
-      - Additionally, when the remaining gaps in M0097-0006 and
-        M0097-0007 are closed, also cover: `join_hash`, `equivclass`,
-        `functional_deps`, `aggregates`, `case`, `window`,
-        `groupingsets`, `tuplesort`, `incremental_sort`.
-      - Mapped to M0097-0005 (Core SELECT + DML), M0097-0006 (JOIN /
-        subquery / CTE) [x], M0097-0007 (aggregate / window / CASE /
-        sort) [x].  The underlying features are implemented; remaining
-        gaps are expected to be output-format normalization.
-      - Action: for each test, run via ClusterRegressExecutor, triage
-        diffs, fix normalization in `NormalizeRegressOutput`, and
-        update status to `pass` when output matches.  Write a brief
-        design doc for any test requiring more than a one-line
-        normalizer change.
+      - Mapped to completed M0097-0005/0006/0007.  Features are
+        implemented; work is output normalization + edge-case fixes.
+      - DoD: `go test -v -run 'TestPort_RegressSuite/(select|...)'`
+        reports `pass` for every listed test.  Normalization rules
+        added to `NormalizeRegressOutput`.  Coverage doc regenerated.
 
-- [ ] **M0097-0021 — Promote transaction / locking regress tests to PASS**
-      - Target tests: `transactions`, `lock`, `prepare`, `plancache`,
+- [ ] **M0097-0021 — Port transaction / locking regress tests**
+      - Summary: Make these 10 tests reach `pass`:
+        `transactions`, `lock`, `prepare`, `plancache`,
         `prepared_xacts`, `portals`, `advisory_lock`, `tid`,
         `tidscan`, `tidrangescan`.
-      - Mapped to M0097-0010 (Transactions + PREPARE + locking) [x].
-      - Action: same triage-and-fix workflow as M0097-0020.
+      - Mapped to completed M0097-0010.
+      - DoD: same as M0097-0020.
 
-- [ ] **M0097-0022 — Promote function / PL/pgSQL regress tests to PASS**
-      - Target tests: `plpgsql`, `create_function_sql`,
-        `create_procedure`, `rangefuncs`, `expressions`, `strings`,
-        `regex`, `misc_functions`, `misc`, `random`.
-      - `random`: `random()` function is implemented at
-        `internal/executor/expr.go:3790` (returns float8 in [0,1)).
-        Also exercises `generate_series` which is implemented.
-      - Mapped to M0097-0011 (String functions + regex) [x] and
-        M0097-0012 (Functions + PL/pgSQL) [x].
-      - Action: same triage-and-fix workflow as M0097-0020.
+- [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
+      - Summary: Make these 10 tests reach `pass`:
+        `plpgsql`, `create_function_sql`, `create_procedure`,
+        `rangefuncs`, `expressions`, `strings`, `regex`,
+        `misc_functions`, `misc`, `random`.
+      - `random()` is at `internal/executor/expr.go:3790`;
+        `generate_series` is implemented.
+      - Mapped to completed M0097-0011/0012.
+      - DoD: same as M0097-0020.
 
-- [ ] **M0097-0023 — Promote DDL / index regress tests to PASS**
-      - Target tests: `create_table`, `create_table_like`,
-        `create_index`, `alter_table`, `drop_if_exists`, `truncate`,
-        `temp`, `btree_index`, `index_including`, `hash_index`,
+- [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
+      - Summary: Make these 13 tests reach `pass`:
+        `create_table`, `create_table_like`, `create_index`,
+        `alter_table`, `drop_if_exists`, `truncate`, `temp`,
+        `btree_index`, `index_including`, `hash_index`,
         `fast_default`, `cluster`, `vacuum`.
-      - `cluster`: CLUSTER statement implemented at
-        `internal/executor/operators_cluster.go`.  Exercises CREATE
-        TABLE, SERIAL, FOREIGN KEY, CREATE INDEX, INSERT, CLUSTER.
-      - `vacuum`: VACUUM FULL implemented at
-        `internal/executor/operators_vacuum.go`.  Exercises CREATE
-        TABLE, INSERT, DELETE, VACUUM FULL, UPDATE, SELECT.
-      - Mapped to M0097-0008 (Core DDL + index) [x].
-      - Action: same triage-and-fix workflow as M0097-0020.
+      - CLUSTER at `internal/executor/operators_cluster.go`;
+        VACUUM at `internal/executor/operators_vacuum.go`.
+      - Mapped to completed M0097-0008.
+      - DoD: same as M0097-0020.
 
-- [ ] **M0097-0024 — Promote COPY / sequence regress tests to PASS**
-      - Target tests: `copy`, `copy2`, `copydml`, `copyselect`,
-        `sequence`, `identity`, `generated_stored`, `generated_virtual`.
-      - Mapped to M0097-0009 (COPY + sequences + identity) [x].
-      - Action: same triage-and-fix workflow as M0097-0020.
+- [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
+      - Summary: Make these 9 tests reach `pass`:
+        `copy`, `copy2`, `copydml`, `copyselect`, `sequence`,
+        `identity`, `generated_stored`, `generated_virtual`.
+      - Mapped to completed M0097-0009.
+      - DoD: same as M0097-0020.
 
-- [ ] **M0097-0025 — Promote view / MV / rules regress tests to PASS**
-      - Target tests: `create_view`, `select_views`,
-        `updatable_views`, `rules`, `matview`.
-      - Mapped to M0097-0013 (Views + materialized views + rules) [x].
-      - Action: same triage-and-fix workflow as M0097-0020.
+- [ ] **M0097-0025 — Port view / MV / rules regress tests**
+      - Summary: Make these 5 tests reach `pass`:
+        `create_view`, `select_views`, `updatable_views`, `rules`,
+        `matview`.
+      - Mapped to completed M0097-0013.
+      - DoD: same as M0097-0020.
 
-- [ ] **M0097-0026 — Promote constraint / FK / trigger / inheritance regress tests to PASS**
-      - Target tests: `constraints`, `foreign_key`, `triggers`,
-        `inherit`, `indexing`.
-      - Mapped to M0097-0014 (Constraints + FK + triggers +
-        inheritance) [x].
-      - Action: same triage-and-fix workflow as M0097-0020.
+- [ ] **M0097-0026 — Port constraint / FK / trigger / inheritance regress tests**
+      - Summary: Make these 5 tests reach `pass`:
+        `constraints`, `foreign_key`, `triggers`, `inherit`,
+        `indexing`.
+      - Mapped to completed M0097-0014.
+      - DoD: same as M0097-0020.
 
-- [ ] **M0097-0027 — Promote partition regress tests to PASS**
-      - Target tests: `partition_prune`, `partition_join`,
-        `partition_aggregate`, `partition_info`, `hash_part`.
-      - Mapped to M0097-0015 (Partitioned tables) [x].
-      - Action: same triage-and-fix workflow as M0097-0020.
+- [ ] **M0097-0027 — Port partition regress tests**
+      - Summary: Make these 5 tests reach `pass`:
+        `partition_prune`, `partition_join`, `partition_aggregate`,
+        `partition_info`, `hash_part`.
+      - Mapped to completed M0097-0015.
+      - DoD: same as M0097-0020.
 
-- [ ] **M0097-0028 — Promote ON CONFLICT / MERGE regress tests to PASS**
-      - Target tests: `insert_conflict`, `merge`.
-      - Mapped to M0097-0016 (ON CONFLICT + MERGE) [x].
-      - Action: same triage-and-fix workflow as M0097-0020.
+- [ ] **M0097-0028 — Port ON CONFLICT / MERGE regress tests**
+      - Summary: Make these 2 tests reach `pass`:
+        `insert_conflict`, `merge`.
+      - Mapped to completed M0097-0016.
+      - DoD: same as M0097-0020.
 
-- [ ] **M0097-0029 — Promote extended-type regress tests to PASS**
-      - Target tests: `arrays`, `json`, `jsonb`, `jsonb_jsonpath`,
-        `jsonpath`, `enum`, `domain`, `rowtypes`, `uuid`,
-        `numeric`, `numeric_big`, `text`, `float4`, `float8`,
-        `int8`, `pg_lsn`, `txid`, `xid`, `rangetypes`,
-        `multirangetypes`, `dbsize`.
-      - `dbsize`: `pg_size_pretty()` at `internal/executor/expr.go:2812`,
-        `pg_database_size`/`pg_relation_size`/`pg_total_relation_size`/
-        `pg_indexes_size`/`pg_table_size` at lines 2858–2866.  Exercises
-        bigint/numeric formatting utilities.
-      - Mapped to M0097-0017 (Extended type parity) [x] and
-        M0097-0003 (scalar types).
-      - Action: same triage-and-fix workflow as M0097-0020.
+- [ ] **M0097-0029 — Port extended-type / dbsize regress tests**
+      - Summary: Make these 22 tests reach `pass`:
+        `arrays`, `json`, `jsonb`, `jsonb_jsonpath`, `jsonpath`,
+        `enum`, `domain`, `rowtypes`, `uuid`, `numeric`,
+        `numeric_big`, `text`, `float4`, `float8`, `int8`,
+        `pg_lsn`, `txid`, `xid`, `rangetypes`, `multirangetypes`,
+        `dbsize`.
+      - `pg_size_pretty` at `internal/executor/expr.go:2812`;
+        `pg_database_size`/`pg_relation_size` at lines 2858–2866.
+      - Mapped to completed M0097-0017 + M0097-0003 (scalar types).
+      - DoD: same as M0097-0020.
 
-- [ ] **M0097-0031 — Promote GUC regress test to PASS**
-      - Target test: `guc`.
-      - SHOW / SET / SET LOCAL / RESET implemented:
-        `internal/server/dispatch.go:232` (GetSetting/SetSetting hooks),
-        `internal/executor/operators_utility_settings.go` (executor
-        routing for SHOW/SET/RESET in multi-statement batches and
-        extended-query protocol).  BEGIN/COMMIT, `datestyle` GUC,
-        `vacuum_cost_delay` GUC, `intervalstyle` GUC may need stub
-        registrations.
-      - Action: add any missing GUC registrations, then triage output
-        diffs with the same workflow as M0097-0020.
+- [ ] **M0097-0031 — Port GUC regress test**
+      - Summary: Make `guc` reach `pass`.
+      - SHOW/SET/SET LOCAL/RESET are wired through the executor
+        (`operators_utility_settings.go` + `dispatch.go`).  May need
+        additional GUC stub registrations (`datestyle`,
+        `vacuum_cost_delay`, `intervalstyle`).
+      - DoD: `TestPort_RegressSuite/guc` reports `pass`.
 
-- [ ] **M0097-0032 — Promote sysviews regress test to PASS**
-      - Target test: `sysviews`.
-      - System-view SRFs partially implemented: `pg_available_extensions`,
-        `pg_available_extension_versions`, `pg_backend_memory_contexts`
-        (M0097-0018).  `pg_stat_activity` tracking wired at
-        `internal/server/server.go:169,669,756`.  Cursors (`DECLARE`,
-        `FETCH`) parsed (M0097-0003).
-      - Action: audit missing SRF stubs, add any needed for the test,
-        then triage output diffs with the same workflow as M0097-0020.
+- [ ] **M0097-0032 — Port sysviews regress test**
+      - Summary: Make `sysviews` reach `pass`.
+      - System-view SRFs (`pg_available_extensions` etc.) stubbed
+        in M0097-0018. `pg_stat_activity` wired at `server.go`.
+        Cursors (`DECLARE`/`FETCH`) parsed in M0097-0003.
+        May need additional SRF stubs and output normalization.
+      - DoD: `TestPort_RegressSuite/sysviews` reports `pass`.
 
-- [ ] **M0097-0033 — Promote test_setup regress test to PASS**
-      - Target test: `test_setup`.
-      - This is the prerequisite script that creates shared tables
-        (`INT2_TBL`, `INT4_TBL`, `FLOAT8_TBL`, etc.) and functions
-        used by most other regress tests.  Features exercised: SET,
-        GRANT, CREATE TABLESPACE, `pg_catalog` function references.
-      - Currently `ClusterRegressExecutor` runs this as best-effort
-        (M0097-0001).  Many individual statements may fail silently;
-        the test only "passes" when all statements succeed and output
-        matches the expected file.
-      - Action: work through `test_setup.sql` statement-by-statement,
-        fix failures, and verify the output normalizes cleanly.
+- [ ] **M0097-0033 — Port test_setup regress test**
+      - Summary: Make `test_setup` reach `pass`.
+      - This is the prerequisite script (INT2_TBL, INT4_TBL,
+        FLOAT8_TBL, etc.) run best-effort by ClusterRegressExecutor
+        before every other regress test.  Currently many statements
+        fail silently.  Needs statement-by-statement triage.
+      - DoD: `TestPort_RegressSuite/test_setup` reports `pass`.
+        All shared tables used by other regress tests are created
+        and populated correctly.
 
-- [x] **M0097-0034 — Regress task breakdown v2 (2026-05-22)**
-      - Summary: Decomposed M0097-0019 into per-feature-area promotion
-        tasks M0097-0020 through M0097-0033.  Sources checked:
-        `upstream-regress-coverage.md`, `fix_plan.md`, milestone docs
-        under `docs/milestones/`, and source code under `internal/`.
-      - All 112 "failed" tests are now accounted for in actionable
-        tasks.  The only deferred test is `index_including_gist`
-        (requires GIST index support, excluded per M0097-0002).
+- [ ] **M0097-0034 — Port remaining date/time regress tests (partial)**
+      - Summary: Make as many of these 7 tests pass as current
+        date/time type support permits:
+        `date`, `time`, `timestamp`, `timestamptz`, `timetz`,
+        `interval`, `horology`.
+      - Date/time types are partially implemented (M0097-0003 fix
+        #74–98); complete parity is M0097-0004 scope.  However
+        many individual statements within these tests may already
+        produce correct output.  Triage diffs and fix low-hanging
+        gaps only; defer remaining to M0097-0004.
+      - DoD: at least `date` and `time` (already partially verified
+        in earlier loops) reach `pass`; `timestamp`, `timestamptz`,
+        `timetz`, `interval`, `horology` diffs are documented.
+
+- [ ] **M0097-0035 — Port remaining aggregate / window / sort regress tests**
+      - Summary: Make these 7 tests pass when M0097-0007 gaps close:
+        `aggregates`, `case`, `window`, `groupingsets`,
+        `tuplesort`, `incremental_sort`, `join_hash`.
+      - These require M0097-0005 (SELECT/DML) fixes first,
+        particularly the `update` test hang (RANGE partition
+        row-movement).  Triage after M0097-0020 completes.
+      - DoD: same as M0097-0020.
+
+- [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
+      - Summary: Make `equivclass`, `functional_deps` reach `pass`.
+      - These depend on planner equivalence-class and functional-
+        dependency inference (M0097-0006 scope).  Triage after
+        M0097-0020 completes.
+      - DoD: same as M0097-0020.
+
+- [x] **M0097-0037 — Regress porting task breakdown (2026-05-22)**
+      - Summary: Replaced the "promote" tasks with concrete "port"
+        tasks (M0097-0019 through M0097-0036).  Each task lists
+        explicit tests, maps to completed milestones, references
+        source-code evidence, and defines a specific DoD.  All 112
+        "failed" entries in `upstream-regress-coverage.md` are
+        covered, plus 1 genuinely deferred (`index_including_gist`
+        — GIST excluded per M0097-0002).  Sources: source code
+        under `internal/`, `docs/milestones/README.md`, and
+        `fix_plan.md`.
 
 ## M0100 — RC Isolation Suite: Runtime Correctness Closure & 21-Spec Pass (filed 2026-05-13)
 
