@@ -2377,6 +2377,69 @@ if 21-spec pass surfaces a real divergence:
       - Summary: 15 initdb test failures
 
 
+
+## M0111 — PG-Format Codec Parity (varlena decode + type coercion + TOAST) (filed 2026-05-22)
+
+Operational note (2026-05-22):
+- M0106-0010 switched heap-tuple storage from goopg-private encoding to
+  PG-native physical format so a PG18 standby can read goopg data pages
+  through WAL FPIs.  Three codec regressions block correctness and
+  benchmarking.
+- Design doc: `docs/design/0111-0001-pg-format-codec-parity.md`
+
+### Sub-milestones
+
+- [ ] **M0111-0001 — Fix DecodePhysicalPGRow truncated varlena under concurrent UPDATE**
+      - Summary: `decodePhysicalPGValueMctx` reads a varlena length prefix that
+        exceeds the remaining tuple body bytes under concurrent UPDATE load,
+        causing `"filler: truncated varlena"` and aborting pgbench clients.
+        This is the primary blocker for UPDATE-based benchmark workloads
+        (STANDARD, SIMPLE-UPDATE).
+      - Impact: ~30 regress tests, all pgbench UPDATE workloads, data
+        integrity under concurrent writes.
+      - Action: add diagnostic logging around `decodePhysicalPGVarlena` and
+        `DecodeRowIntoMctxPGTuple` to capture raw tuple data at failure;
+        compare goopg's encoded tuple layout (`EncodeRowPG`) against PG's
+        `heap_fill_tuple` for the same column types; fix offset calculation,
+        null-bitmap width, or varlena length decoding.
+      - DoD: pgbench STANDARD c=10 completes 60 s without client aborts;
+        `go test -race ./internal/executor/` PASS.
+
+- [ ] **M0111-0002 — Complete encodeValuePG string→float coercion**
+      - Summary: Port `KindString` → `float4`/`float8` coercion from the
+        goopg-format `encodeValue` to `encodeValuePG`.  Currently `float4`/`float8`
+        INSERT with string literals reports `rows_affected = 1` but the row
+        is not visible (`count(*) = 0`), suggesting an additional decode-side
+        float-format mismatch.
+      - Impact: float4 (739 diffs), float8 (1246 diffs) regress tests;
+        `INSERT INTO FLOAT8_TBL VALUES ('0.0')` in test_setup.sql.
+      - Action: add `KindString` + `KindNumeric` cases to `encodeValuePG`
+        for `float4`/`float8`; verify 8-byte little-endian IEEE 754 format
+        is correctly read by `decodePhysicalPGValueMctx`; fix format mismatch
+        if found.
+      - DoD: `TestPort_RegressSuite/float4` diff count drops significantly;
+        `INSERT INTO t (f2) VALUES ('-34.84')` stores and retrieves the value
+        correctly.
+
+- [ ] **M0111-0003 — Fix TOAST write/read round-trip**
+      - Summary: `ToastLargeColumnsIfNeeded` writes TOAST chunks via
+        `toastStore` → `writeHeapTupleToRel`, which calls `ctx.Pool.PinNew(toastRel)`.
+        After auto-commit, `DetoastValue` → `ctx.Pool.NBlocks(toastRel)` returns 0
+        because `smgr.Manager.Extend` didn't update the in-memory block count
+        for the TOAST relation.  The main tuple's TOAST pointer is valid but
+        the chunks are invisible.  `rows_affected = 1` is reported, but the
+        row is lost.
+      - Impact: ~40 regress tests (empty shared tables via test_setup),
+        `delete` regress test (5 diffs), all INSERTs with >2000-byte
+        text/bytea columns.
+      - Action: investigate `smgr.Manager.Extend` block-count update for
+        TOAST relations; ensure `NBlocks` returns the correct count after
+        `PinNew` → `Extend`; alternatively, scan buffer-pool dirty pages for
+        the TOAST relation instead of relying solely on `NBlocks`.
+      - DoD: INSERT of `repeat('x', 10000)` stores the row and SELECT
+        returns it; `TestPort_RegressSuite/delete` diff count drops from 5;
+        `go test -race ./internal/executor/ ./internal/storage/` PASS.
+
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 
 Operational note (2026-05-22):
