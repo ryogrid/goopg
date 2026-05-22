@@ -2389,26 +2389,47 @@ Operational note (2026-05-22):
 
 ### Sub-milestones
 
-- [ ] **M0111-0001 — Fix DecodePhysicalPGRow truncated varlena under concurrent UPDATE**
-      - Summary: `decodePhysicalPGValueMctx` reads a varlena length prefix that
-        exceeds the remaining tuple body bytes under concurrent UPDATE load,
-        causing `"filler: truncated varlena"` and aborting pgbench clients.
-        This is the primary blocker for UPDATE-based benchmark workloads
-        (STANDARD, SIMPLE-UPDATE).
-      - Impact: ~30 regress tests, all pgbench UPDATE workloads, data
-        integrity under concurrent writes.
-      - Action: add diagnostic logging around `decodePhysicalPGVarlena` and
-        `DecodeRowIntoMctxPGTuple` to capture raw tuple data at failure;
-        compare goopg's encoded tuple layout (`EncodeRowPG`) against PG's
-        `heap_fill_tuple` for the same column types; fix offset calculation,
-        null-bitmap width, or varlena length decoding.
+- [ ] **M0111-0001 — Fix DecodePhysicalPGRow truncated varlena (NOT concurrency-dependent)**
+      - Summary: `decodePhysicalPGValueMctx` receives `data[off:]` with
+        `len == 0` for the `filler` column (character(84)) during pgbench
+        TPC-B UPDATEs, producing `"filler: truncated varlena"`.
+      - **Investigation findings (2026-05-22):**
+        * Occurs with a single client — NOT a concurrency race.
+        * 12 sequential UPDATEs on the same row work perfectly — the
+          encode/decode round-trip for char(N) filler is symmetric.
+        * pgbench TPC-B with 1 client fails after ~192 transactions,
+          suggesting the error triggers when pgbench re-visits a row that
+          was already UPDATEd (birthday-paradox collision).
+        * Individual UPDATEs via psql on the same row 1000+ times succeed
+          but pgbench's INSERT path may encode filler differently, or the
+          TPC-B multi-statement transaction (UPDATE accounts / UPDATE
+          tellers / UPDATE branches) leaves state that triggers the decode
+          failure on a subsequent pass.
+        * The filler values stored by pgbench `-i` appear to be empty
+          strings (octet_length=0 for all rows), yet the error still
+          occurs — suggesting either a page-level corruption or an
+          interaction with the tellers/branches filler columns.
+      - **Next steps:** (a) capture the raw tuple bytes at the point of
+        failure via a debug build, (b) check whether the error is on
+        accounts, tellers, or branches filler, (c) compare the tuple
+        layout after a pgbench INSERT vs. a psql INSERT for char(84).
+      - Impact: all pgbench UPDATE workloads, ~30 regress tests,
+        data integrity under concurrent writes.
       - DoD: pgbench STANDARD c=10 completes 60 s without client aborts;
         `go test -race ./internal/executor/` PASS.
 
-- [ ] **M0111-0002 — Complete encodeValuePG string→float coercion**
-      - Summary: Port `KindString` → `float4`/`float8` coercion from the
-        goopg-format `encodeValue` to `encodeValuePG`.  Currently `float4`/`float8`
-        INSERT with string literals reports `rows_affected = 1` but the row
+- [x] **M0111-0002 — Complete encodeValuePG string→float coercion**
+      - Summary: Ported `KindString` → `float4`/`float8` coercion from the
+        goopg-format `encodeValue` to `encodeValuePG`.  Changed
+        `encodeValuePG` float encoding from binary IEEE 754 to varlena
+        text (matching `encodeValue` and the decode path).  Added
+        `float4`/`float8`/`real`/`double` to the varlena text decode
+        case in `decodePhysicalPGValueMctx`.
+      - **Fixed (2026-05-22):** string→float4/float8 INSERT now stores
+        AND retrieves values correctly (was: rows_affected=1 but
+        count(*)=0 — row invisible due to decode failure).
+      - DoD: `INSERT INTO t (f2) VALUES ('-34.84')` → row visible;
+        `go test -race ./internal/executor/` PASS.
         is not visible (`count(*) = 0`), suggesting an additional decode-side
         float-format mismatch.
       - Impact: float4 (739 diffs), float8 (1246 diffs) regress tests;
