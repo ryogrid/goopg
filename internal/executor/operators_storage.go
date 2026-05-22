@@ -1726,6 +1726,12 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		}
 		// Recompute GENERATED ALWAYS AS … STORED columns after SET. M0096-0008.
 		_ = computeGeneratedColumns(cols, newRow)
+		// M0111-0001: restore columns that became null during decode→rebuild.
+		for i, c := range cols {
+			if c.GeneratedExpr == "" && newRow[i].IsNull() && !row[i].IsNull() {
+				newRow[i] = row[i]
+			}
+		}
 		pending = append(pending, pendingUpdate{
 			blk:    ptr.Block,
 			slot:   actualSlot, // use live slot, not the index-pointed slot
@@ -1863,6 +1869,12 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						}
 					}
 					_ = computeGeneratedColumns(cols, pu.newRow)
+			// M0111-0001: restore columns that became null during decode→rebuild.
+			for i, c := range cols {
+				if c.GeneratedExpr == "" && pu.newRow[i].IsNull() && !pu.oldRow[i].IsNull() {
+					pu.newRow[i] = pu.oldRow[i]
+				}
+			}
 					pu.blk = newBlk
 					pu.slot = newSlot
 					continue // re-run loop to stamp xmax on new slot
