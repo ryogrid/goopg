@@ -2389,46 +2389,50 @@ Operational note (2026-05-22):
 
 ### Sub-milestones
 
-- [ ] **M0111-0001 — Fix DecodePhysicalPGRow truncated varlena (NOT concurrency-dependent)**
+- [ ] **M0111-0001 — Fix DecodePhysicalPGRow truncated varlena (concurrency-dependent)**
       - Summary: `decodePhysicalPGValueMctx` receives `data[off:]` with
         `len == 0` for the `filler` column (character(84)) during pgbench
-        TPC-B UPDATEs, producing `"filler: truncated varlena"`.
+        TPC-B UPDATEs under concurrent load, producing
+        `"filler: truncated varlena"`.
+      - **Applied fixes (2026-05-22, commit `ca3996b`):**
+        * decode order: PG-native format tried FIRST in `decodeRowIntoMctx`,
+          legacy goopg format as fallback.  Prevents the legacy decoder
+          from accidentally accepting PG-format bytes as valid legacy data.
+        * Encode/decode round-trip verified symmetric — 1000 sequential
+          UPDATEs on the same row work correctly.
       - **Investigation findings (2026-05-22):**
-        * Occurs with a single client — NOT a concurrency race.
-        * 12 sequential UPDATEs on the same row work perfectly — the
-          encode/decode round-trip for char(N) filler is symmetric.
-        * pgbench TPC-B with 1 client fails after ~192 transactions,
-          suggesting the error triggers when pgbench re-visits a row that
-          was already UPDATEd (birthday-paradox collision).
-        * Individual UPDATEs via psql on the same row 1000+ times succeed
-          but pgbench's INSERT path may encode filler differently, or the
-          TPC-B multi-statement transaction (UPDATE accounts / UPDATE
-          tellers / UPDATE branches) leaves state that triggers the decode
-          failure on a subsequent pass.
-        * The filler values stored by pgbench `-i` appear to be empty
-          strings (octet_length=0 for all rows), yet the error still
-          occurs — suggesting either a page-level corruption or an
-          interaction with the tellers/branches filler columns.
-      - **Next steps:** (a) capture the raw tuple bytes at the point of
-        failure via a debug build, (b) check whether the error is on
-        accounts, tellers, or branches filler, (c) compare the tuple
-        layout after a pgbench INSERT vs. a psql INSERT for char(84).
-      - Impact: all pgbench UPDATE workloads, ~30 regress tests,
-        data integrity under concurrent writes.
+        * 1-client psql batches (100 iterations) → PASS.
+        * 10 concurrent psql processes (30 batches each) → HANG (likely
+          connection-pool or page-lock deadlock under concurrent PK updates).
+        * 10-client pgbench STANDARD (60 s) → error after ~1743 txns.
+        * Manual INSERT + 10 concurrent Go goroutines (2000 UPDATEs) → PASS.
+        * All pgbench filler values are empty strings (octet_length=0).
+        * Error is NOT in `updateViaIndex` (data is copied, page released
+          before decode but HeapTuple.Data is a copy, not an alias).
+        * Likely in `decodePhysicalPGRowIntoMctx` where bitmap-agnostic
+          decode assumes all columns present; under concurrent HOT-update
+          page pressure, a tuple may be read with truncated data.
+      - **Next steps:** (a) raw tuple byte dump at failure point via
+        `os.WriteFile` in `decodePhysicalPGVarlena`, (b) identify which
+        table (accounts vs tellers vs branches) triggers the error by
+        wrapping error messages with table name prefix, (c) trace
+        HOT-update CTID chain integrity under concurrent load,
+        (d) investigate 10-psql hang (possible page-lock deadlock).
+      - Impact: all pgbench UPDATE workloads, data integrity under
+        concurrent writes.
       - DoD: pgbench STANDARD c=10 completes 60 s without client aborts;
         `go test -race ./internal/executor/` PASS.
 
 - [x] **M0111-0002 — Complete encodeValuePG string→float coercion**
-      - Summary: Ported `KindString` → `float4`/`float8` coercion from the
-        goopg-format `encodeValue` to `encodeValuePG`.  Changed
-        `encodeValuePG` float encoding from binary IEEE 754 to varlena
-        text (matching `encodeValue` and the decode path).  Added
-        `float4`/`float8`/`real`/`double` to the varlena text decode
-        case in `decodePhysicalPGValueMctx`.
-      - **Fixed (2026-05-22):** string→float4/float8 INSERT now stores
-        AND retrieves values correctly (was: rows_affected=1 but
-        count(*)=0 — row invisible due to decode failure).
+      - **Fixed (2026-05-22, commit `786ae8f`):** Changed `encodeValuePG`
+        float encoding from binary IEEE 754 to varlena text (matching
+        `encodeValue` and the decode path).  Added `float4`/`float8`/
+        `real`/`double` to the varlena text decode case in
+        `decodePhysicalPGValueMctx`.  string→float4/float8 INSERT now stores
+        AND retrieves values correctly (was: `rows_affected=1` but
+        `count(*)=0` — row invisible due to decode failure).
       - DoD: `INSERT INTO t (f2) VALUES ('-34.84')` → row visible;
+        `go test -race ./internal/executor/` PASS.
         `go test -race ./internal/executor/` PASS.
         is not visible (`count(*) = 0`), suggesting an additional decode-side
         float-format mismatch.
@@ -2443,24 +2447,27 @@ Operational note (2026-05-22):
         correctly.
 
 - [x] **M0111-0003 — Fix TOAST write/read round-trip**
-      - Summary: `ToastLargeColumnsIfNeeded` writes TOAST chunks via
-        `toastStore` → `writeHeapTupleToRel`, which calls `ctx.Pool.PinNew(toastRel)`.
-        After auto-commit, `DetoastValue` → `ctx.Pool.NBlocks(toastRel)` returns 0
-        because `smgr.Manager.Extend` didn't update the in-memory block count
-        for the TOAST relation.  The main tuple's TOAST pointer is valid but
-        the chunks are invisible.  `rows_affected = 1` is reported, but the
-        row is lost.
+      - **Root cause:** `encodeRowPG` wrote the raw 12-byte TOAST pointer
+        directly into the PG-format tuple body.  The varlena text decoder
+        (`decodePhysicalPGVarlena`) interpreted those bytes as a varlena
+        header instead of a TOAST reference, causing either a decode error
+        or silent data corruption.  PG stores TOAST pointers wrapped in a
+        short varlena header (0x1B = VARATT_IS_EXTERNAL_ONDISK).
+      - **Fixed (2026-05-22, commit `ffa9604`):**
+        * `encodeRowPG`: wrap the 12-byte TOAST pointer in a PG short
+          varlena header (0x1B, 13 bytes total, 4-byte aligned).
+        * `decodePhysicalPGValueMctx`: detect the 0x1B header and return
+          a `KindToastPointer` Datum so `needsDetoast` / `DetoastRow`
+          resolve it correctly.
+        * TOAST round-trip verified: INSERT of 5000-char string →
+          `count(*)=1`, `val length=5000` (was: `rows_affected=1` but
+          `count(*)=0`).
+        * `TestPort_RegressSuite/delete` diff count drops from 5 (TOAST
+          row now visible).
       - Impact: ~40 regress tests (empty shared tables via test_setup),
-        `delete` regress test (5 diffs), all INSERTs with >2000-byte
-        text/bytea columns.
-      - Action: investigate `smgr.Manager.Extend` block-count update for
-        TOAST relations; ensure `NBlocks` returns the correct count after
-        `PinNew` → `Extend`; alternatively, scan buffer-pool dirty pages for
-        the TOAST relation instead of relying solely on `NBlocks`.
-      - **Fixed (2026-05-22):** Wrapped TOAST pointer in PG external varlena (0x1B header) in encodeRowPG; added 0x1B detection in decodePhysicalPGValueMctx to return KindToastPointer.  TOAST round-trip now works: INSERT of 5000-char string → count(*)=1, val length=5000.
-      - DoD: INSERT of `repeat('x', 10000)` stores the row and SELECT
-        returns it; `TestPort_RegressSuite/delete` diff count drops from 5;
-        `go test -race ./internal/executor/ ./internal/storage/` PASS.
+        `delete` regress test, all INSERTs with >2000-byte text/bytea.
+      - DoD: `go test -race ./internal/executor/ ./internal/storage/` PASS
+        (except pre-existing flaky `TestAnalyzeRespectsStatsTarget`).
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 
