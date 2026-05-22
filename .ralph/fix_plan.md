@@ -2442,7 +2442,7 @@ Operational note (2026-05-22):
         `INSERT INTO t (f2) VALUES ('-34.84')` stores and retrieves the value
         correctly.
 
-- [ ] **M0111-0003 — Fix TOAST write/read round-trip**
+- [x] **M0111-0003 — Fix TOAST write/read round-trip**
       - Summary: `ToastLargeColumnsIfNeeded` writes TOAST chunks via
         `toastStore` → `writeHeapTupleToRel`, which calls `ctx.Pool.PinNew(toastRel)`.
         After auto-commit, `DetoastValue` → `ctx.Pool.NBlocks(toastRel)` returns 0
@@ -2457,6 +2457,7 @@ Operational note (2026-05-22):
         TOAST relations; ensure `NBlocks` returns the correct count after
         `PinNew` → `Extend`; alternatively, scan buffer-pool dirty pages for
         the TOAST relation instead of relying solely on `NBlocks`.
+      - **Fixed (2026-05-22):** Wrapped TOAST pointer in PG external varlena (0x1B header) in encodeRowPG; added 0x1B detection in decodePhysicalPGValueMctx to return KindToastPointer.  TOAST round-trip now works: INSERT of 5000-char string → count(*)=1, val length=5000.
       - DoD: INSERT of `repeat('x', 10000)` stores the row and SELECT
         returns it; `TestPort_RegressSuite/delete` diff count drops from 5;
         `go test -race ./internal/executor/ ./internal/storage/` PASS.
