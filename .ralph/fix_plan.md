@@ -744,15 +744,19 @@ M0097-0001 wires it up.
       - Action: run the suite, add a `diff_lines` column with the
         normalized diff count per case, regenerate the markdown.
 
-- [ ] **M0097-0020 — Promote SELECT / DML regress tests to PASS**
+- [ ] **M0097-0020 — Promote SELECT / DML / JOIN / subquery / CTE regress tests to PASS**
       - Target tests: `select`, `select_distinct`, `select_distinct_on`,
         `select_into`, `insert`, `update`, `delete`, `returning`,
-        `limit`, `union`, `errors`, `explain`.
-      - These map to completed sub-milestones M0097-0005 (Core SELECT +
-        DML), M0097-0006 (JOIN/subquery/CTE), M0097-0007 (aggregate/
-        window/CASE/sort).  The underlying SQL features are implemented;
-        remaining gaps are expected to be output-format normalization
-        (column widths, error message wording, plan display).
+        `limit`, `union`, `errors`, `explain`,
+        `join`, `subselect`, `with`.
+      - Additionally, when the remaining gaps in M0097-0006 and
+        M0097-0007 are closed, also cover: `join_hash`, `equivclass`,
+        `functional_deps`, `aggregates`, `case`, `window`,
+        `groupingsets`, `tuplesort`, `incremental_sort`.
+      - Mapped to M0097-0005 (Core SELECT + DML), M0097-0006 (JOIN /
+        subquery / CTE) [x], M0097-0007 (aggregate / window / CASE /
+        sort) [x].  The underlying features are implemented; remaining
+        gaps are expected to be output-format normalization.
       - Action: for each test, run via ClusterRegressExecutor, triage
         diffs, fix normalization in `NormalizeRegressOutput`, and
         update status to `pass` when output matches.  Write a brief
@@ -764,8 +768,6 @@ M0097-0001 wires it up.
         `prepared_xacts`, `portals`, `advisory_lock`, `tid`,
         `tidscan`, `tidrangescan`.
       - Mapped to M0097-0010 (Transactions + PREPARE + locking) [x].
-        Covers BEGIN/COMMIT/ROLLBACK, PREPARE/EXECUTE/DEALLOCATE,
-        portals (cursors), advisory locks, TID scans.
       - Action: same triage-and-fix workflow as M0097-0020.
 
 - [ ] **M0097-0022 — Promote function / PL/pgSQL regress tests to PASS**
@@ -773,10 +775,7 @@ M0097-0001 wires it up.
         `create_procedure`, `rangefuncs`, `expressions`, `strings`,
         `regex`, `misc_functions`, `misc`.
       - Mapped to M0097-0011 (String functions + regex) [x] and
-        M0097-0012 (Functions + PL/pgSQL) [x].  Covers SQL-language
-        functions, stored procedures, PL/pgSQL control flow, RAISE,
-        exception handlers, string functions (overlay, substring,
-        replace, etc.), POSIX regex operators, hash functions.
+        M0097-0012 (Functions + PL/pgSQL) [x].
       - Action: same triage-and-fix workflow as M0097-0020.
 
 - [ ] **M0097-0023 — Promote DDL / index regress tests to PASS**
@@ -784,18 +783,13 @@ M0097-0001 wires it up.
         `create_index`, `alter_table`, `drop_if_exists`, `truncate`,
         `temp`, `btree_index`, `index_including`, `hash_index`,
         `fast_default`.
-      - Mapped to M0097-0008 (Core DDL + index) [x].  Covers CREATE/
-        DROP/ALTER TABLE, CREATE/DROP INDEX, TRUNCATE, TEMP TABLE,
-        btree/hash index, fast-default column optimisation.
+      - Mapped to M0097-0008 (Core DDL + index) [x].
       - Action: same triage-and-fix workflow as M0097-0020.
 
 - [ ] **M0097-0024 — Promote COPY / sequence regress tests to PASS**
       - Target tests: `copy`, `copy2`, `copydml`, `copyselect`,
         `sequence`, `identity`, `generated_stored`, `generated_virtual`.
       - Mapped to M0097-0009 (COPY + sequences + identity) [x].
-        Covers COPY FROM/TO, COPY with DML, sequence functions
-        (nextval/currval/setval), GENERATED ALWAYS AS IDENTITY,
-        generated stored/virtual columns.
       - Action: same triage-and-fix workflow as M0097-0020.
 
 - [ ] **M0097-0025 — Promote view / MV / rules regress tests to PASS**
@@ -829,24 +823,21 @@ M0097-0001 wires it up.
         `int8`, `pg_lsn`, `txid`, `xid`, `rangetypes`,
         `multirangetypes`.
       - Mapped to M0097-0017 (Extended type parity) [x] and
-        M0097-0003 (scalar types).  Covers array types, JSON/JSONB,
-        JSONPath, enum types, domains, composite types, UUID,
-        arbitrary-precision numeric, float4/float8, int8, pg_lsn,
-        transaction ID types, range/multirange types.
+        M0097-0003 (scalar types).
       - Action: same triage-and-fix workflow as M0097-0020.
 
 - [x] **M0097-0030 — Regress task breakdown (2026-05-22)**
       - Summary: Decomposed M0097-0019 into per-feature-area promotion
         tasks M0097-0020 through M0097-0029.  Together these cover
-        ~95 of the 112 "failed" regress tests; the remaining ~17
-        (`date`, `time`, `timestamp`, `timestamptz`, `timetz`,
-        `interval`, `horology`, `cluster`, `dbsize`, `guc`,
-        `sysviews`, `vacuum`, `random`, `test_setup`,
-        `index_including_gist`, `incremental_sort`, `window`,
-        `groupingsets`, `tuplesort`, `functional_deps`,
-        `equivclass`, `join_hash`, `aggregates`, `case`) are
-        covered by the still-open M0097-0003 (scalar types),
-        M0097-0004 (date/time), and M0097-0005 (SELECT/DML).
+        all 112 "failed" regress tests currently listed in
+        `upstream-regress-coverage.md` except for the date/time group
+        which is explicitly scoped to the still-open M0097-0003
+        (scalar types), M0097-0004 (date/time), and M0097-0005
+        (SELECT/DML): `date`, `time`, `timestamp`, `timestamptz`,
+        `timetz`, `interval`, `horology`, `cluster`, `dbsize`,
+        `guc`, `sysviews`, `vacuum`, `random`, `test_setup`,
+        `index_including_gist`.
+
 
 ## M0100 — RC Isolation Suite: Runtime Correctness Closure & 21-Spec Pass (filed 2026-05-13)
 
