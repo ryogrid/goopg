@@ -732,7 +732,7 @@ M0097-0001 wires it up.
       - pg_settings: updated with 21 enable_* parameters
       - Removed incorrect pg_type virtual table (heap-backed in initdb)
 
-- [ ] **M0097-0019 — Regress baseline audit: run full suite, capture diff-line counts**
+- [x] **M0097-0019 — Regress baseline audit: run full suite, capture diff-line counts**
       - Summary: Run `go test -v -run TestPort_RegressSuite -timeout 30m
         ./internal/testport/` and record the normalized diff-line count
         for every "failed" entry.  Update
