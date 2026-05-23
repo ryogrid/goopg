@@ -115,23 +115,23 @@ func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 		if d.IsNull() {
 			continue
 		}
-			if d.Kind == KindToastPointer {
-				// Encode as PG external/on-disk TOAST reference:
-				// short varlena header (1 byte) + 12-byte pointer = 13 bytes.
-				// Header: (13 << 1) | 1 = 0x1B (VARATT_IS_EXTERNAL_ONDISK).
-				// Aligned to 4 bytes (PG TOAST pointers are int-aligned).
-				off = alignPhysicalPGOffset(off, 4)
-				ptr := d.BytesValue()
-				buf := make([]byte, 13)
-				buf[0] = 0x1B // short varlena: len=13, external
-				copy(buf[1:], ptr)
-				for len(out) < off+13 {
-					out = append(out, 0)
-				}
-				copy(out[off:off+13], buf)
-				off += 13
-				continue
+		if d.Kind == KindToastPointer {
+			// Encode as PG external/on-disk TOAST reference:
+			// short varlena header (1 byte) + 12-byte pointer = 13 bytes.
+			// Header: (13 << 1) | 1 = 0x1B (VARATT_IS_EXTERNAL_ONDISK).
+			// Aligned to 4 bytes (PG TOAST pointers are int-aligned).
+			off = alignPhysicalPGOffset(off, 4)
+			ptr := d.BytesValue()
+			buf := make([]byte, 13)
+			buf[0] = 0x1B // short varlena: len=13, external
+			copy(buf[1:], ptr)
+			for len(out) < off+13 {
+				out = append(out, 0)
 			}
+			copy(out[off:off+13], buf)
+			off += 13
+			continue
+		}
 		align := physicalPGTypeAlign(c.Type)
 		off = alignPhysicalPGOffset(off, align)
 		buf, err := encodeValuePG(c.Type, d)
@@ -145,6 +145,47 @@ func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 		off += len(buf)
 	}
 	return out, nil
+}
+
+func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
+	var s string
+	switch d.Kind {
+	case KindString:
+		s = d.StringValue()
+	case KindBytes:
+		s = string(d.BytesValue())
+	case KindInt:
+		s = fmt.Sprintf("%d", d.Int)
+	case KindNumeric:
+		s = numericText(d)
+	default:
+		return "", fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
+	}
+
+	tname := strings.ToLower(t.Name)
+	if tname == "varchar" || tname == "character varying" {
+		if len(t.Args) > 0 {
+			n := int(t.Args[0])
+			stripped := strings.TrimRight(s, " ")
+			if len(stripped) > n {
+				return "", &ExecError{Code: "22001",
+					Message: fmt.Sprintf("value too long for type character varying(%d)", n)}
+			}
+			s = stripped
+		}
+	} else if tname == "char" || tname == "bpchar" || tname == "character" {
+		n := 1
+		if len(t.Args) > 0 {
+			n = int(t.Args[0])
+		}
+		stripped := strings.TrimRight(s, " ")
+		if len(stripped) > n {
+			return "", &ExecError{Code: "22001",
+				Message: fmt.Sprintf("value too long for type character(%d)", n)}
+		}
+		s = stripped
+	}
+	return s, nil
 }
 
 // encodeValuePG encodes a single datum in PG-native format.
@@ -256,6 +297,35 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], uint32(days))
 		return buf[:], nil
+	case "time":
+		if d.Kind == KindString {
+			ts, err := parseTimeString(d.StringValue())
+			if err != nil {
+				return nil, err
+			}
+			d = NewTimeDatum(ts)
+		}
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(pgTimeMicros(d.TimeValue())))
+		return buf[:], nil
+	case "timetz":
+		if d.Kind == KindString {
+			ts, err := parseTimeString(d.StringValue())
+			if err != nil {
+				return nil, err
+			}
+			d = NewTimeDatum(ts)
+		}
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		var buf [12]byte
+		binary.LittleEndian.PutUint64(buf[:8], uint64(pgTimeMicros(d.TimeValue())))
+		binary.LittleEndian.PutUint32(buf[8:], 0)
+		return buf[:], nil
 	case "name":
 		// PG NameData: fixed 64 bytes, '\0' padded
 		s := d.StringValue()
@@ -282,7 +352,11 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected string or int for char, got kind %d", d.Kind)
 		}
 		// char(N) = character(N) = bpchar: PG varlena (same as "character").
-		return varlenaTextBytes(d.StringValue()), nil
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		return varlenaTextBytes(s), nil
 	case "float4", "real":
 		// goopg stores float4 as varlena text for v0 compatibility (same as
 		// goopg-format encodeValue).  PG binary float4 (4-byte IEEE 754 LE)
@@ -415,7 +489,11 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// text, varchar, char, bpchar, unknown, numeric, etc.
 		// Use PG varlena format (LE): 1-byte header for short values,
 		// 4-byte header for longer ones.
-		return varlenaTextBytes(d.StringValue()), nil
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		return varlenaTextBytes(s), nil
 	}
 }
 
@@ -461,6 +539,18 @@ func varlenaTextBytes(s string) []byte {
 // pgEpochUnixMicros is 2000-01-01 UTC in Unix microseconds (used by
 // the PG timestamp encoding).
 var pgEpochUnixMicros = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
+
+func pgTimeMicros(t time.Time) int64 {
+	u := t.UTC()
+	return int64(u.Hour())*int64(time.Hour/time.Microsecond) +
+		int64(u.Minute())*int64(time.Minute/time.Microsecond) +
+		int64(u.Second())*int64(time.Second/time.Microsecond) +
+		int64(u.Nanosecond()/1000)
+}
+
+func pgTimeFromMicros(micros int64) time.Time {
+	return time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(micros) * time.Microsecond)
+}
 
 // DecodeRow inverts EncodeRow.
 func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
@@ -961,6 +1051,26 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("truncated oid")
 		}
 		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
+	case "time":
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated time")
+		}
+		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		const maxTimeMicros = int64(24 * time.Hour / time.Microsecond)
+		if micros < 0 || micros > maxTimeMicros {
+			return Datum{}, 0, fmt.Errorf("invalid time micros")
+		}
+		return NewTimeDatum(pgTimeFromMicros(micros)), 8, nil
+	case "timetz":
+		if len(data) < 12 {
+			return Datum{}, 0, fmt.Errorf("truncated timetz")
+		}
+		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		const maxTimeMicros = int64(24 * time.Hour / time.Microsecond)
+		if micros < 0 || micros > maxTimeMicros {
+			return Datum{}, 0, fmt.Errorf("invalid timetz micros")
+		}
+		return NewTimeDatum(pgTimeFromMicros(micros)), 12, nil
 	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown",
 		"float4", "real", "float8", "double precision", "double":
 		// PG external/on-disk TOAST reference: short varlena header 0x1B

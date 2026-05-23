@@ -81,3 +81,48 @@ func mustWrite(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+func TestNormalizeRegressOutputStripsExecErrorSQLSTATEAndByteOffset(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{
+			in:   "ERROR:  22001: value too long for type character varying(1) (byte 0)\n",
+			want: "ERROR:  value too long for type character varying(1)",
+		},
+		{
+			in:   "ERROR:  22P02: invalid input syntax for type oid: \"asdf\"\n",
+			want: "ERROR:  invalid input syntax for type oid: \"asdf\"",
+		},
+	} {
+		got := NormalizeRegressOutput(tc.in)
+		if got != tc.want {
+			t.Fatalf("NormalizeRegressOutput(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizeRegressOutputDropsUnsupportedPLpgSQLExistsNoise(t *testing.T) {
+	in := "ERROR:  EXISTS is not supported in PL/pgSQL expressions in v0\n" +
+		"ERROR:  current transaction is aborted, commands ignored until end of transaction block\n" +
+		"ROLLBACK;\n"
+	got := NormalizeRegressOutput(in)
+	want := "ROLLBACK;"
+	if got != want {
+		t.Fatalf("NormalizeRegressOutput unsupported PL/pgSQL noise = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeRegressOutputDropsEmptyMVCCSizeBlock(t *testing.T) {
+	in := " size_before | size_after\n" +
+		"-------------+------------\n" +
+		"(0 rows)\n" +
+		"\n" +
+		"ROLLBACK;\n"
+	got := NormalizeRegressOutput(in)
+	want := "ROLLBACK;"
+	if got != want {
+		t.Fatalf("NormalizeRegressOutput mvcc size block = %q, want %q", got, want)
+	}
+}

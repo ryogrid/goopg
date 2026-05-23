@@ -1188,6 +1188,11 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return NewStringDatum("false"), nil
 		case KindInt:
 			return NewStringDatum(strconv.FormatInt(d.Int, 10)), nil
+		case KindTime:
+			if isTimeOnlyValue(d.TimeValue()) {
+				return NewStringDatum(string(appendTimeOnlyValueText(nil, d.TimeValue()))), nil
+			}
+			return NewStringDatum(d.Format()), nil
 		case KindString:
 			s := d.StringValue()
 			// For "char" (internal 1-byte type), interpret backslash-octal escapes

@@ -125,7 +125,9 @@ func (p *parser) parseCreate() (Stmt, error) {
 
 // parseCreatePublicationTail picks up after CREATE PUBLICATION.
 // Grammar: `name [FOR ALL TABLES | FOR TABLE t1 [, t2 ...]]
-//           [WITH (option = value [, ...])]`.
+//
+//	[WITH (option = value [, ...])]`.
+//
 // See docs/design/0008-0003-publication-subscription-ddl.md.
 func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 	stmt := &CreatePublicationStmt{pos: pos}
@@ -162,7 +164,8 @@ func (p *parser) parseCreatePublicationTail(pos int) (Stmt, error) {
 
 // parseCreateSubscriptionTail picks up after CREATE SUBSCRIPTION.
 // Grammar: `name CONNECTION 'conninfo' PUBLICATION p [, p2 ...]
-//           [WITH (option = value [, ...])]`.
+//
+//	[WITH (option = value [, ...])]`.
 func (p *parser) parseCreateSubscriptionTail(pos int) (Stmt, error) {
 	stmt := &CreateSubscriptionStmt{pos: pos}
 	if p.cur().Kind != TokenIdent {
@@ -414,9 +417,15 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				// skip column defs inside partition OF for now
 				depth := 1
 				for depth > 0 && p.cur().Kind != TokenEOF {
-					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" { depth++ }
-					if p.cur().Kind == TokenSymbol && p.cur().Value == ")" { depth-- }
-					if depth > 0 { p.advance() }
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+						depth++
+					}
+					if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+						depth--
+					}
+					if depth > 0 {
+						p.advance()
+					}
 				}
 				if !p.acceptSymbol(")") {
 					return nil, p.errAtCur("expected ')'")
@@ -564,7 +573,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint {
 			// Table-level CONSTRAINT name (PRIMARY KEY | UNIQUE | CHECK | FOREIGN KEY).
-			p.advance() // CONSTRAINT
+			p.advance()           // CONSTRAINT
 			_, _ = p.parseIdent() // constraint name (ignore)
 			switch {
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
@@ -943,7 +952,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			}
 		// CONSTRAINT name CHECK/PRIMARY KEY/UNIQUE/... column constraint.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint:
-			p.advance() // CONSTRAINT
+			p.advance()           // CONSTRAINT
 			_, _ = p.parseIdent() // constraint name
 			switch {
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
@@ -1067,6 +1076,9 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 			}
 			break
 		}
+	}
+	if first.Kind != TokenQuotedIdent && strings.EqualFold(ct.Name, "char") && len(ct.Args) == 0 {
+		ct.Args = []int64{1}
 	}
 	return ct, nil
 }
@@ -1553,9 +1565,10 @@ func (p *parser) parseInt64() (int64, error) {
 	return n, nil
 }
 
-//   name BEFORE|AFTER|INSTEAD OF event[, ...] ON table
-//   FOR [EACH] {ROW|STATEMENT}
-//   EXECUTE {FUNCTION|PROCEDURE} funcname([]);
+//	name BEFORE|AFTER|INSTEAD OF event[, ...] ON table
+//	FOR [EACH] {ROW|STATEMENT}
+//	EXECUTE {FUNCTION|PROCEDURE} funcname([]);
+//
 // M0096-0012.
 func (p *parser) parseCreateTriggerTail(pos int) (Stmt, error) {
 	// Trigger name
@@ -1916,17 +1929,23 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 							if t := p.cur(); t.Kind == TokenIntLit {
 								p.advance()
 								n := int64(0)
-								for _, c := range t.Value { n = n*10 + int64(c-'0') }
+								for _, c := range t.Value {
+									n = n*10 + int64(c-'0')
+								}
 								poc.Modulus = n
 							}
 						} else if p.acceptIdentKeyword("remainder") {
 							if t := p.cur(); t.Kind == TokenIntLit {
 								p.advance()
 								n := int64(0)
-								for _, c := range t.Value { n = n*10 + int64(c-'0') }
+								for _, c := range t.Value {
+									n = n*10 + int64(c-'0')
+								}
 								poc.Remainder = n
 							}
-						} else { p.advance() }
+						} else {
+							p.advance()
+						}
 						_ = p.acceptSymbol(",")
 					}
 				}

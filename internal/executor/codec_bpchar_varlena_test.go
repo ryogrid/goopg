@@ -71,4 +71,43 @@ func TestEncodeValuePGCharAlignmentMatches(t *testing.T) {
 	}
 }
 
+func TestEncodeValuePGVarcharCoercesIntAndTrimsSpaces(t *testing.T) {
+	typ := catalog.Type{Name: "varchar", Args: []int64{1}}
+	out, err := encodeValuePG(typ, NewIntDatum(2))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := varlenaTextBytes("2"); !bytes.Equal(out, want) {
+		t.Fatalf("encoded bytes = %v, want %v", out, want)
+	}
 
+	out, err = encodeValuePG(typ, NewStringDatum("c     "))
+	if err != nil {
+		t.Fatalf("unexpected trim-space error: %v", err)
+	}
+	if want := varlenaTextBytes("c"); !bytes.Equal(out, want) {
+		t.Fatalf("trimmed bytes = %v, want %v", out, want)
+	}
+}
+
+func TestEncodeValuePGVarcharRejectsTooLongValue(t *testing.T) {
+	typ := catalog.Type{Name: "varchar", Args: []int64{1}}
+	if _, err := encodeValuePG(typ, NewStringDatum("cd")); err == nil {
+		t.Fatal("expected varchar(1) length error")
+	}
+}
+
+func TestEncodeValuePGCharWithArgsCoercesIntAndRejectsTooLongValue(t *testing.T) {
+	typ := catalog.Type{Name: "char", Args: []int64{1}}
+	out, err := encodeValuePG(typ, NewIntDatum(2))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := varlenaTextBytes("2"); !bytes.Equal(out, want) {
+		t.Fatalf("encoded bytes = %v, want %v", out, want)
+	}
+
+	if _, err := encodeValuePG(typ, NewStringDatum("cd")); err == nil {
+		t.Fatal("expected char(1) length error")
+	}
+}

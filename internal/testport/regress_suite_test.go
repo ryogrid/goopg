@@ -113,6 +113,8 @@ var regressExcluded = map[string]string{
 	// Full-text search
 	"tsdicts": "Full-text search; out of scope for goopg v0.", "tsearch": "Full-text search; out of scope for goopg v0.",
 	"tsrf": "Full-text search SRF; out of scope for goopg v0.", "tstypes": "Full-text search types; out of scope for goopg v0.",
+	// Shared bootstrap
+	"test_setup": "Executed once as shared regress fixture bootstrap; rerunning mutates seeded tables for later cases.",
 	// Advanced AM / exotic index
 	"amutils": "Advanced AM utilities; out of scope for goopg v0.", "brin": "BRIN index; out of scope for goopg v0.",
 	"brin_bloom": "BRIN bloom index; out of scope for goopg v0.", "brin_multi": "BRIN multi-range; out of scope for goopg v0.",

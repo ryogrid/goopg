@@ -27,7 +27,7 @@ import (
 type ExprKind uint8
 
 const (
-	ExprInvalid  ExprKind = iota
+	ExprInvalid   ExprKind = iota
 	ExprColumnRef          // payload[0:4] = int32 column index
 	ExprIntConst           // payload[0:8] = int64 value
 	ExprBoolConst          // payload[0] = 0 (false) or 1 (true)
@@ -50,9 +50,9 @@ const noExpr = int32(-1)
 type ExprNode struct {
 	Kind    ExprKind
 	_pad    [3]byte
-	childA  int32    // left/only child index; noExpr if none
-	childB  int32    // right child index; noExpr if none
-	payload [40]byte // per-Kind inline data (see constants above)
+	childA  int32        // left/only child index; noExpr if none
+	childB  int32        // right child index; noExpr if none
+	payload [40]byte     // per-Kind inline data (see constants above)
 	orig    planner.Expr // non-nil only for ExprAdapter
 }
 
@@ -163,7 +163,7 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		// matching evalExprSlot behaviour.
 		switch op {
 		case parser.OpAnd:
-			if left.IsNull() || !left.BoolValue() {
+			if !left.IsNull() && !left.BoolValue() {
 				return left, nil
 			}
 		case parser.OpOr:

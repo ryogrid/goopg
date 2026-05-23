@@ -88,6 +88,7 @@ func TestDDLDropTableRemovesCatalogAndFile(t *testing.T) {
 	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
 		t.Fatal(err)
 	}
+
 	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
 	rel := ctx.Catalog.RelFileNode(tbl)
 	// Force the relation file into existence.
@@ -108,6 +109,54 @@ func TestDDLDropTableRemovesCatalogAndFile(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("NBlocks=%d want 0", n)
+	}
+}
+
+func TestDDLCreateTempTableShadowsPermanentTable(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE shadow_t (v varchar(4))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO shadow_t (v) VALUES ('base')"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runDDL(t, ctx, "CREATE TEMP TABLE shadow_t (v varchar(1))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO shadow_t (v) VALUES ('x')"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := runQuery(t, ctx, "SELECT v FROM shadow_t")
+	if len(rows) != 1 || rows[0][0].StringValue() != "x" {
+		t.Fatalf("temp shadow rows=%v, want single temp row x", rows)
+	}
+
+	if err := runDDL(t, ctx, "DROP TABLE shadow_t"); err != nil {
+		t.Fatal(err)
+	}
+	rows = runQuery(t, ctx, "SELECT v FROM shadow_t")
+	if len(rows) != 1 || rows[0][0].StringValue() != "base" {
+		t.Fatalf("restored permanent rows=%v, want single base row", rows)
+	}
+}
+
+func TestDDLInsertIntIntoVarcharPreservesDigits(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE varchar_t (v varchar(1))"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO varchar_t (v) VALUES (2)"); err != nil {
+		t.Fatal(err)
+	}
+	rows := runQuery(t, ctx, "SELECT v FROM varchar_t")
+	if len(rows) != 1 || rows[0][0].StringValue() != "2" {
+		t.Fatalf("varchar rows=%v, want single row \"2\"", rows)
 	}
 }
 

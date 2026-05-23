@@ -424,7 +424,6 @@ func TestBuildFastNodeKinds(t *testing.T) {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // Phase C.1 follow-up tests: OpSort, OpUpdate, OpDelete, BuildFastIterator.
 // ---------------------------------------------------------------------------
@@ -903,6 +902,40 @@ func TestEvalFastExprCommonKinds(t *testing.T) {
 		}
 	})
 
+	t.Run("BinaryOp_and_null_false", func(t *testing.T) {
+		var slab exprTreeSlab
+		e := &planner.BinaryOp{
+			Op:    parser.OpAnd,
+			Left:  &planner.NullConst{},
+			Right: &planner.BooleanConst{Value: false},
+		}
+		idx := slab.buildExpr(e)
+		d, err := evalFastExpr(slab, idx, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Kind != KindBool || d.BoolValue() {
+			t.Errorf("NULL AND FALSE: expected false, got %v", d)
+		}
+	})
+
+	t.Run("BinaryOp_or_null_true", func(t *testing.T) {
+		var slab exprTreeSlab
+		e := &planner.BinaryOp{
+			Op:    parser.OpOr,
+			Left:  &planner.NullConst{},
+			Right: &planner.BooleanConst{Value: true},
+		}
+		idx := slab.buildExpr(e)
+		d, err := evalFastExpr(slab, idx, slot, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Kind != KindBool || !d.BoolValue() {
+			t.Errorf("NULL OR TRUE: expected true, got %v", d)
+		}
+	})
+
 	t.Run("ExprAdapter_delegates_to_evalExprSlot", func(t *testing.T) {
 		var slab exprTreeSlab
 		// StringConst → ExprAdapter → evalExprSlot.
@@ -1099,7 +1132,6 @@ func TestLimitOffsetExecution(t *testing.T) {
 	// LIMIT 2 OFFSET 1: skip first, return next two.
 	runBothAndCompare(t, planOne(t, "SELECT id FROM items ORDER BY id LIMIT 2 OFFSET 1", cat), ctx)
 }
-
 
 // TestSeqScanOpNoPlanPointer verifies the Phase C.3 SeqScan migration:
 // seqScanOp must not hold a *planner.SeqScan; instead it stores schema,
