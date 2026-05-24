@@ -18,11 +18,11 @@ test_setup,0,excluded
 time,0,pass
 varchar,0,pass
 functional_deps,21,failed
+sysviews,41,failed
 copydml,44,failed
 errors,60,failed
 copyselect,69,failed
 hash_part,73,failed
-sysviews,73,failed
 tid,81,failed
 hash_index,96,failed
 index_including_gist,112,failed

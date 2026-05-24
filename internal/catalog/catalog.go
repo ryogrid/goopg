@@ -1607,7 +1607,7 @@ func (c *InMemory) registerSystemTables() {
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {
-		return [][]string{
+		rows := [][]string{
 			{"default_transaction_isolation", "read committed", "", "Client Connection Defaults / Statement Behavior",
 				"Sets the transaction isolation level of each new transaction.", "",
 				"user", "enum", "default", "", "", "{\"serializable\",\"repeatable read\",\"read committed\",\"read uncommitted\"}",
@@ -1657,7 +1657,7 @@ func (c *InMemory) registerSystemTables() {
 			{"enable_parallel_append", "on", "", "Query Tuning / Planner Method Configuration",
 				"Enables the planner's use of parallel append plans.", "",
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
-			{"enable_gather_merge", "on", "", "Query Tuning / Planner Method Configuration",
+			{"enable_gathermerge", "on", "", "Query Tuning / Planner Method Configuration",
 				"Enables the planner's use of gather merge plans.", "",
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
 			{"enable_incremental_sort", "on", "", "Query Tuning / Planner Method Configuration",
@@ -1672,7 +1672,26 @@ func (c *InMemory) registerSystemTables() {
 			{"enable_presorted_aggregate", "on", "", "Query Tuning / Planner Method Configuration",
 				"Enables the planner's use of presorted aggregate plans.", "",
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_distinct_reordering", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables reordering of DISTINCT pathkeys.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_group_by_reordering", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables reordering of GROUP BY keys.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_self_join_elimination", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables removal of unique self-joins.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_tidscan", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of TID scan plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
 		}
+		// PostgreSQL's pg_settings view is backed by the alphabetically
+		// sorted GUC table, so callers that query it without ORDER BY (e.g.
+		// sysviews.sql's `... where name like 'enable%'`) still receive rows
+		// ordered by name. Sort here to match that contract regardless of the
+		// hand-coded literal order above.
+		sort.Slice(rows, func(i, j int) bool { return rows[i][0] < rows[j][0] })
+		return rows
 	}
 }
 

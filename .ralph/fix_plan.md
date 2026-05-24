@@ -991,6 +991,26 @@ M0097-0001 wires it up.
         Cursors (`DECLARE`/`FETCH`) parsed in M0097-0003.
         May need additional SRF stubs and output normalization.
       - DoD: `TestPort_RegressSuite/sysviews` reports `pass`.
+      - **Progress 2026-05-24 (loop):** Fixed the `pg_settings` `enable_*` GUC
+        list. `sysviews.sql` queries `select name, setting from pg_settings
+        where name like 'enable%'` (no ORDER BY) and expects PG 18's 24
+        alphabetically-sorted planner GUCs; goopg's `pg_settings` virtual table
+        (`internal/catalog/catalog.go`, `registerSystemTables`) hand-coded only
+        20 in registration order, with `enable_gather_merge` instead of PG's
+        `enable_gathermerge`. Renamed it, added the 4 missing
+        (`enable_distinct_reordering`, `enable_group_by_reordering`,
+        `enable_self_join_elimination`, `enable_tidscan`), and `sort.Slice` the
+        rows by name (matches PG's sorted-GUC-table contract for all
+        `pg_settings` consumers). `sysviews` diff 73 → 41 (verified end-to-end);
+        `guc` unchanged at 592 (no regression). Test:
+        `TestPgSettingsEnableGUCsCompleteAndSorted`. Design:
+        `docs/design/0097-0032-pg-settings-enable-guc-completeness.md`.
+      - **Remaining sysviews gaps (41 diff lines, separate subsystems):**
+        `pg_backend_memory_contexts` introspection (`ident`/Bump-context rows),
+        the `pg_wait_events` SRF (9 wait-event type rows), the
+        `timezone_abbreviations` GUC, and `pg_timezone_abbrevs`
+        interval/boolean output formatting (`utc_offset` as `@ 7 hours …`,
+        `is_dst` as `f`).
 
 - [ ] **M0097-0033 — Port test_setup regress test**
       - Summary: Make `test_setup` reach `pass`.

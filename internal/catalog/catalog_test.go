@@ -426,3 +426,53 @@ func TestNextOIDAndAdvanceNextOIDPast(t *testing.T) {
 		t.Errorf("advance below (after larger advance): got %d want %d", got, above+1)
 	}
 }
+
+// TestPgSettingsEnableGUCsCompleteAndSorted pins the pg_settings virtual
+// table's enable_* coverage and ordering. The sysviews regress test runs
+// `select name, setting from pg_settings where name like 'enable%'` WITHOUT
+// an ORDER BY and expects PostgreSQL 18's 24 alphabetically-sorted planner
+// enable_* GUCs. PostgreSQL's pg_settings is backed by the sorted GUC table,
+// so the virtual rows must (a) cover the exact set and (b) be name-sorted.
+// Regression guard for the M0097-0032 fix (was 20 GUCs, registration order,
+// with the mis-named enable_gather_merge instead of enable_gathermerge).
+func TestPgSettingsEnableGUCsCompleteAndSorted(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_settings"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_settings virtual table not registered")
+	}
+	want := []string{
+		"enable_async_append", "enable_bitmapscan", "enable_distinct_reordering",
+		"enable_gathermerge", "enable_group_by_reordering", "enable_hashagg",
+		"enable_hashjoin", "enable_incremental_sort", "enable_indexonlyscan",
+		"enable_indexscan", "enable_material", "enable_memoize", "enable_mergejoin",
+		"enable_nestloop", "enable_parallel_append", "enable_parallel_hash",
+		"enable_partition_pruning", "enable_partitionwise_aggregate",
+		"enable_partitionwise_join", "enable_presorted_aggregate",
+		"enable_self_join_elimination", "enable_seqscan", "enable_sort",
+		"enable_tidscan",
+	}
+
+	var got []string
+	var prevName string
+	for _, row := range tbl.VirtualRows() {
+		name := row[0]
+		// Overall name-sort contract (mirrors PG's sorted GUC table).
+		if prevName != "" && name < prevName {
+			t.Errorf("pg_settings rows not name-sorted: %q precedes %q", prevName, name)
+		}
+		prevName = name
+		if len(name) >= 7 && name[:7] == "enable_" {
+			got = append(got, name)
+		}
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("enable_* GUC count = %d, want %d\n got: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("enable_* GUC[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
