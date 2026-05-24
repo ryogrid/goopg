@@ -333,26 +333,21 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		// `rewroteExplainExecute` disables the plan cache for this
 		// statement so a later re-PREPARE of the same name (which
 		// does not invalidate the cache) cannot serve the stale plan.
-		rewroteExplainExecute := false
+		disablePlanCache := false
 		if es, ok := stmt.(*parser.ExplainStmt); ok {
 			if ex, exok := es.Inner.(*parser.ExecuteStmt); exok {
 				if prepStmts == nil {
 					return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", ex.Name))
 				}
-				prepSQL, found := prepStmts.Lookup(ex.Name)
+				prepDef, found := prepStmts.Lookup(ex.Name)
 				if !found {
 					return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", ex.Name))
 				}
-				prepParsed, perr := parser.Parse(prepSQL)
-				if perr != nil || len(prepParsed) == 0 {
-					return s.writeQueryError(w, sqlstate.SyntaxError, "could not parse prepared statement for EXPLAIN")
-				}
-				ps, ok := prepParsed[0].(*parser.PrepareStmt)
-				if !ok || ps.Query == nil {
+				if prepDef.stmt == nil {
 					return s.writeQueryError(w, sqlstate.SystemError, fmt.Sprintf("prepared statement %q has no body", ex.Name))
 				}
-				es.Inner = ps.Query
-				rewroteExplainExecute = true
+				es.Inner = prepDef.stmt
+				disablePlanCache = true
 				// fall through to executeOneSimpleStmt below
 			}
 		}
@@ -360,28 +355,35 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		// These require per-connection state not available in the executor.
 		if ps, ok := stmt.(*parser.PrepareStmt); ok {
 			tag := "PREPARE"
-			if prepStmts != nil && ps.Name != "" {
-				// Store the raw SQL for later EXECUTE.  We reconstruct it
-				// from the original batch since the parsed form may lose
-				// position information for non-SELECT queries.
-				prepStmts.Store(ps.Name, sql)
+			if prepStmts != nil && ps.Name != "" && ps.Query != nil {
+				prepStmts.Store(ps.Name, ps.Query)
 			}
 			if err := w.WriteCommandComplete(tag); err != nil {
 				return err
 			}
 			continue
 		}
+		restoreParams := ectx.Params
 		if es, ok := stmt.(*parser.ExecuteStmt); ok {
 			if prepStmts != nil {
-				if prepSQL, found := prepStmts.Lookup(es.Name); found {
-					// Re-dispatch the stored SQL as a fresh query.
-					if err := s.dispatchSimpleQueryViaExecutor(ctx, w, sess, prepSQL, connTx, prepStmts); err != nil {
-						return err
+				if prepDef, found := prepStmts.Lookup(es.Name); found {
+					if prepDef.stmt == nil {
+						return s.writeQueryError(w, sqlstate.SystemError, fmt.Sprintf("prepared statement %q has no body", es.Name))
 					}
-					continue
+					params, err := evalExecuteParams(es.Params)
+					if err != nil {
+						if ee, ok := err.(*executor.ExecError); ok {
+							return s.writeQueryError(w, sqlstate.Code(ee.Code), ee.Message)
+						}
+						return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
+					}
+					stmt = prepDef.stmt
+					ectx.Params = params
+					disablePlanCache = true
+				} else {
+					return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", es.Name))
 				}
 			}
-			return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", es.Name))
 		}
 		if ds, ok := stmt.(*parser.DeallocateStmt); ok {
 			if prepStmts != nil {
@@ -460,7 +462,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		// plan, cache, then execute.
 		var precached planner.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !rewroteExplainExecute {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache {
 			cacheKey = normalizeCompatSQL(sql)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -477,7 +479,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 				precached = freshNode
 			}
 		}
-		if err := s.executeOneSimpleStmt(w, ectx, stmt, connTx, &autoCommit, precached); err != nil {
+		err := s.executeOneSimpleStmt(w, ectx, stmt, connTx, &autoCommit, precached)
+		ectx.Params = restoreParams
+		if err != nil {
 			if errors.Is(err, errQueryErrorSent) {
 				// Error + ReadyForQuery already sent to the client (M0097-0003).
 				// Do NOT send another ReadyForQuery — that would produce a double
@@ -682,6 +686,32 @@ func normalizeSQLPreservingLiterals(s string) string {
 		}
 	}
 	return strings.TrimRight(b.String(), " ")
+}
+
+func evalExecuteParams(params []parser.Expr) ([]executor.Datum, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+	out := make([]executor.Datum, len(params))
+	for i, p := range params {
+		switch v := p.(type) {
+		case *parser.IntegerConst:
+			out[i] = executor.NewIntDatum(v.Value)
+		case *parser.StringConst:
+			out[i] = executor.NewStringDatum(v.Value)
+		case *parser.NumericConst:
+			out[i] = executor.NewStringDatum(v.Value)
+		case *parser.BooleanConst:
+			out[i] = executor.NewBoolDatum(v.Value)
+		case *parser.NullConst:
+			out[i] = executor.NullDatum
+		case *parser.TypedStringLit:
+			out[i] = executor.NewStringDatum(v.Value)
+		default:
+			return nil, fmt.Errorf("EXECUTE parameter type %T not supported", p)
+		}
+	}
+	return out, nil
 }
 
 // executeOneSimpleStmt plans and runs one statement, emitting the

@@ -27,16 +27,17 @@ import (
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // connTxState is the per-connection explicit-transaction holder.
 // Zero value means "no explicit transaction active" (auto-commit mode).
 type connTxState struct {
-	mu          sync.Mutex
-	active      bool
-	failed      bool              // 25P02: in_failed_sql_transaction
-	tx          mvcc.Transaction
-	sess        *executor.BasicSession // session state, non-nil when active
+	mu     sync.Mutex
+	active bool
+	failed bool // 25P02: in_failed_sql_transaction
+	tx     mvcc.Transaction
+	sess   *executor.BasicSession // session state, non-nil when active
 	// SessCtx is the per-connection session-level mctx (M0107-0001).
 	// Wired by serveConn after creating the session context; stmt-level
 	// contexts are acquired as children in dispatchSimpleQueryViaExecutor.
@@ -131,25 +132,29 @@ func (c *connTxState) End() {
 	c.mu.Unlock()
 }
 
+type preparedStatementDef struct {
+	stmt parser.Stmt
+}
+
 // preparedStatements stores named prepared SQL statements for this connection.
-// Keyed by statement name; value is the original SQL text.  Used to implement
+// Keyed by statement name; value is the parsed query body. Used to implement
 // PREPARE name AS … / EXECUTE name (M0096-0006).
 type preparedStatements struct {
 	mu    sync.Mutex
-	stmts map[string]string
+	stmts map[string]preparedStatementDef
 }
 
 func newPreparedStatements() *preparedStatements {
-	return &preparedStatements{stmts: make(map[string]string)}
+	return &preparedStatements{stmts: make(map[string]preparedStatementDef)}
 }
 
-func (ps *preparedStatements) Store(name, sql string) {
+func (ps *preparedStatements) Store(name string, stmt parser.Stmt) {
 	ps.mu.Lock()
-	ps.stmts[name] = sql
+	ps.stmts[name] = preparedStatementDef{stmt: stmt}
 	ps.mu.Unlock()
 }
 
-func (ps *preparedStatements) Lookup(name string) (string, bool) {
+func (ps *preparedStatements) Lookup(name string) (preparedStatementDef, bool) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	s, ok := ps.stmts[name]
@@ -164,7 +169,7 @@ func (ps *preparedStatements) Delete(name string) {
 
 func (ps *preparedStatements) DeleteAll() {
 	ps.mu.Lock()
-	ps.stmts = make(map[string]string)
+	ps.stmts = make(map[string]preparedStatementDef)
 	ps.mu.Unlock()
 }
 
