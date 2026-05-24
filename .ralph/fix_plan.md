@@ -770,6 +770,27 @@ M0097-0001 wires it up.
         and regenerated `upstream-regress-coverage.md` (now 11 pass / 6
         regressions visible). Easiest remaining wins per refreshed baseline:
         select_implicit (11), functional_deps (24), portals_p2 (39).
+      - **Recovery 2026-05-24 (M0111-0004):** Root-caused the regression to a
+        PG-physical *decode* gap, not a normalization issue.
+        `decodePhysicalPGValueMctx` (codec.go) had no `int8`/`bigint`/`name`
+        (and `regproc`/`xid`/`timestamp`/`date`) case even though
+        `encodeValuePG` writes them — the two switches drifted apart since
+        M0106-0010. An int8 value (every `count(*)`/`sum()` result, every
+        `bigint` column) encoded fine but failed both decoders, so the
+        seqscan *silently dropped the row*: plain `INSERT INTO t(bigint)
+        VALUES (5)` reported `INSERT 0 1` yet `SELECT *` returned 0 rows.
+        Added the missing fixed-width decode arms (each mirrors the encoder
+        byte-for-byte). **`select_implicit` and `portals_p2` → pass**; `name`
+        97 → 77 diff lines (remaining diffs unrelated). `int2`/`int4`/
+        `numerology` unchanged (their diffs are not int8/name-related — next
+        wins). Design: `docs/design/0111-0004-pg-format-decode-fixed-width-gap.md`.
+        Tests: `internal/executor/codec_int8_name_pg_test.go`. Baseline +
+        inventory CSVs updated, coverage md regenerated (13 pass now).
+        Lesson: after any codec change, audit that `encodeValuePG` and
+        `decodePhysicalPGValueMctx` cover the *same* type set — a missing
+        decode arm loses rows with NO error. Remaining int8 follow-ups:
+        `KindNumeric → int8` encode (huge literals) and string-literal INSERT
+        coercion for timestamp/date/xid columns.
 
 - [ ] **M0097-0020 — Port SELECT / DML / JOIN / subquery / CTE regress tests**
       - Summary: Make these 15 tests reach `pass` status:

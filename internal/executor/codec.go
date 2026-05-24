@@ -1046,11 +1046,61 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("truncated int4")
 		}
 		return NewIntDatum(int64(int32(binary.LittleEndian.Uint32(data[:4])))), 4, nil
-	case "oid":
+	case "int8", "bigint", "bigserial":
+		// Mirror encodeValuePG's 8-byte LE int8 encoding. Without this
+		// case, any int8/bigint value (including count(*)/sum() results
+		// stored via CTAS, and plain INSERTs into bigint columns) fell
+		// through to the default branch and errored with "unsupported
+		// PostgreSQL physical type", so the seqscan silently dropped the
+		// row. M0111-0004.
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated int8")
+		}
+		return NewIntDatum(int64(binary.LittleEndian.Uint64(data[:8]))), 8, nil
+	case "oid", "regproc":
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated oid")
 		}
 		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
+	case "xid", "xid8":
+		// encodeValuePG writes xid/xid8 as a 4-byte LE TransactionId.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated xid")
+		}
+		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
+	case "name":
+		// PG NameData: fixed 64 bytes, '\0'-padded (see encodeValuePG).
+		if len(data) < 64 {
+			return Datum{}, 0, fmt.Errorf("truncated name")
+		}
+		end := 64
+		for i := 0; i < 64; i++ {
+			if data[i] == 0 {
+				end = i
+				break
+			}
+		}
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(data[:end])
+			return newStringArenaDatum(sctx, moff, mlen), 64, nil
+		}
+		return NewStringDatum(string(data[:end])), 64, nil
+	case "timestamp", "timestamptz":
+		// encodeValuePG stores 8-byte LE microseconds since the PG epoch
+		// (2000-01-01 UTC). Reconstruct the absolute instant. M0111-0004.
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated timestamp")
+		}
+		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		return NewTimeDatum(time.UnixMicro(micros + pgEpochUnixMicros).UTC()), 8, nil
+	case "date":
+		// encodeValuePG stores 4-byte LE days since the PG epoch. M0111-0004.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated date")
+		}
+		days := int32(binary.LittleEndian.Uint32(data[:4]))
+		micros := int64(days)*24*3600*1000000 + pgEpochUnixMicros
+		return NewTimeDatum(time.UnixMicro(micros).UTC()), 4, nil
 	case "time":
 		if len(data) < 8 {
 			return Datum{}, 0, fmt.Errorf("truncated time")
