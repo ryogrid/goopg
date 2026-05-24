@@ -3,6 +3,9 @@ package planner
 import (
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestPlanCopyFromStdin pgbench-shaped:
@@ -207,6 +210,53 @@ func TestPlanCopyTableErrors(t *testing.T) {
 		}
 		if pe.Code != tc.code {
 			t.Errorf("for %q: code=%q want %q (msg %q)", tc.sql, pe.Code, tc.code, pe.Message)
+		}
+	}
+}
+
+// TestPlanCopyViewRejected pins PostgreSQL's relation-kind check for
+// table-form COPY: a plain view has no heap, so `COPY v TO` /
+// `COPY v FROM` must fail with ERRCODE_WRONG_OBJECT_TYPE (42809) and
+// the direction-specific hint. The `COPY (SELECT ...)` query form is
+// the supported way to dump a view. Regression for copyselect
+// (M0097-0009): goopg previously planned the view as if it were a heap
+// relation.
+func TestPlanCopyViewRejected(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	viewStmts, err := parser.Parse(`SELECT aid FROM pgbench_accounts`)
+	if err != nil {
+		t.Fatalf("parse view body: %v", err)
+	}
+	innerSel := viewStmts[0].(*parser.SelectStmt)
+	if _, err := cat.CreateView(parser.ObjectName{Name: "v_acc"},
+		[]catalog.Column{{Name: "aid", Type: catalog.Type{Name: "int4"}}},
+		[]string{"aid"}, innerSel, true); err != nil {
+		t.Fatalf("CreateView: %v", err)
+	}
+
+	cases := []struct {
+		sql      string
+		wantMsg  string
+		wantHint string
+	}{
+		{"COPY v_acc TO STDOUT", `cannot copy from view "v_acc"`, "Try the COPY (SELECT ...) TO variant."},
+		{"COPY v_acc FROM STDIN", `cannot copy to view "v_acc"`, "To enable inserting into the view, provide an INSTEAD OF INSERT trigger."},
+	}
+	for _, tc := range cases {
+		_, err := Plan(parseOne(t, tc.sql), cat)
+		pe, ok := err.(*PlanError)
+		if !ok {
+			t.Errorf("for %q: expected *PlanError, got %T (%v)", tc.sql, err, err)
+			continue
+		}
+		if pe.Code != "42809" {
+			t.Errorf("for %q: code=%q want 42809", tc.sql, pe.Code)
+		}
+		if pe.Message != tc.wantMsg {
+			t.Errorf("for %q: msg=%q want %q", tc.sql, pe.Message, tc.wantMsg)
+		}
+		if pe.Hint != tc.wantHint {
+			t.Errorf("for %q: hint=%q want %q", tc.sql, pe.Hint, tc.wantHint)
 		}
 	}
 }

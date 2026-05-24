@@ -108,7 +108,9 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 	node, err := planner.Plan(stmts[0], s.cfg.Catalog)
 	if err != nil {
 		code, msg := planErrorFields(err)
-		if err := s.writeQueryError(w, code, msg); err != nil {
+		// Carry any planner hint (e.g. "Try the COPY (SELECT ...) TO
+		// variant." for a COPY-from-view rejection) onto the wire.
+		if err := s.writeQueryError(w, code, msg, planErrorHintFields(err)...); err != nil {
 			return nil, err
 		}
 		return nil, nil

@@ -79,6 +79,30 @@ func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 
+	// Reject COPY against a plain view. PostgreSQL checks the relation
+	// kind before anything else: a view has no heap to stream from or
+	// load into, so `COPY v TO` / `COPY v FROM` fail with
+	// ERRCODE_WRONG_OBJECT_TYPE (42809). Materialised views are exempt —
+	// they store rows in the heap like a table. The `COPY (SELECT ...)`
+	// query form (handled above) is the supported way to dump a view.
+	// M0097-0009 (copyselect).
+	if tbl.View != nil && !tbl.IsMatView {
+		if s.Direction == parser.CopyTo {
+			return nil, &PlanError{
+				Pos:     s.Pos(),
+				Code:    "42809",
+				Message: fmt.Sprintf("cannot copy from view %q", tbl.Name),
+				Hint:    "Try the COPY (SELECT ...) TO variant.",
+			}
+		}
+		return nil, &PlanError{
+			Pos:     s.Pos(),
+			Code:    "42809",
+			Message: fmt.Sprintf("cannot copy to view %q", tbl.Name),
+			Hint:    "To enable inserting into the view, provide an INSTEAD OF INSERT trigger.",
+		}
+	}
+
 	// Resolve the column list. An empty list means "all declared
 	// columns in declared order" — same as INSERT.
 	var colIndex []int

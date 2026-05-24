@@ -998,6 +998,31 @@ M0097-0001 wires it up.
         `identity`, `generated_stored`, `generated_virtual`.
       - Mapped to completed M0097-0009.
       - DoD: same as M0097-0020.
+      - **Progress 2026-05-25 (loop — COPY-from-view rejection):** Closed
+        the `copyselect` view-rejection gap. Table-form `planCopy`
+        (`internal/planner/copy.go`) resolved the relation but never
+        checked its kind, so `COPY <view> {TO|FROM}` planned the view as a
+        heap relation instead of erroring. PostgreSQL rejects it first on
+        relation kind with `42809` (`ERRCODE_WRONG_OBJECT_TYPE`). Now
+        errors when `tbl.View != nil && !tbl.IsMatView` (materialised views
+        exempt — they have heap data), direction-specific: TO →
+        `cannot copy from view %q` + hint `Try the COPY (SELECT ...) TO
+        variant.`; FROM → `cannot copy to view %q` + INSTEAD-OF-trigger
+        hint. Sibling wire fix: `dispatchCopyViaExecutor`
+        (`internal/server/copy.go`) dropped the planner hint
+        (`writeQueryError(w, code, msg)`); now threads
+        `planErrorHintFields(err)...` so the HINT reaches the client (ERROR
+        matched but the 2 HINT lines stayed in the diff). Verified
+        end-to-end via `GOOPG_REGRESS_DIFF_DIR`: the 2 ERROR + 2 HINT
+        view-rejection lines are gone from `copyselect`. Test:
+        `TestPlanCopyViewRejected` (`internal/planner/copy_test.go`).
+        Design: `docs/design/0097-0009b-copy-from-view-rejection.md`.
+      - **Remaining copyselect gaps (independent larger features):**
+        `UNION`/set operations inside `COPY (SELECT …)` (v0 planner rejects
+        set ops), `COPY (SELECT … INTO …)` rejection, `COPY (query) FROM`
+        rejection wording, and psql multi-command `\;`/`\.` STDIN handling
+        (`expected exactly one COPY statement`; internal "planner.Copy has
+        no executor path yet" leak on `select 1/0\; copy …`).
 
 - [ ] **M0097-0025 — Port view / MV / rules regress tests**
       - Summary: Make these 5 tests reach `pass`:
