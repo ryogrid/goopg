@@ -752,6 +752,24 @@ M0097-0001 wires it up.
         `upstream-regress-coverage.md` after any status transition.
       - DoD: committed baseline CSV; M0097-0020..0036 tasks are prioritized
         by diff count.
+      - **Audit refresh 2026-05-24 (post-M0111):** Re-ran the full
+        `TestPort_RegressSuite` (232 cases) with `GOOPG_REGRESS_DIFF_DIR`.
+        Reconciled `regress-diff-baseline.csv` (was 126 rows all `failed`,
+        captured during the M0106-0010 codec regression window) to current
+        reality: **11 pass** (boolean, char, comments, delete, md5, mvcc,
+        oid, reindex_catalog, select_having, time, varchar), 117 failed,
+        1 excluded (test_setup); added comments/md5/reindex_catalog rows
+        that were previously untracked.
+      - **Regression found:** 6 cases marked `pass` in
+        `postgres-oracle-target-inventory.csv` (M0097-0003, 2026-05-13) now
+        fail — `int2` (44), `int4` (84), `name` (97), `numerology` (60),
+        `portals_p2` (39), `select_implicit` (11 diff lines). Root cause is
+        the M0106-0010 PG-format physical-tuple codec switch (see M0111);
+        the M0111-0001/0002/0003 fixes recovered some but not these 6.
+        Flipped them to `failed` in the inventory CSV with a dated rationale
+        and regenerated `upstream-regress-coverage.md` (now 11 pass / 6
+        regressions visible). Easiest remaining wins per refreshed baseline:
+        select_implicit (11), functional_deps (24), portals_p2 (39).
 
 - [ ] **M0097-0020 — Port SELECT / DML / JOIN / subquery / CTE regress tests**
       - Summary: Make these 15 tests reach `pass` status:

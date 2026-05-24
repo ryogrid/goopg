@@ -96,8 +96,8 @@ regress-sql,regress,postgres/src/test/regress/sql/inherit.sql,postgres/src/test/
 regress-sql,regress,postgres/src/test/regress/sql/init_privs.sql,postgres/src/test/regress/sql/init_privs.sql,excluded,Initial privileges; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/insert.sql,postgres/src/test/regress/sql/insert.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/insert_conflict.sql,postgres/src/test/regress/sql/insert_conflict.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-regress-sql,regress,postgres/src/test/regress/sql/int2.sql,postgres/src/test/regress/sql/int2.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
-regress-sql,regress,postgres/src/test/regress/sql/int4.sql,postgres/src/test/regress/sql/int4.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/int2.sql,postgres/src/test/regress/sql/int2.sql,failed,Regressed by M0106-0010 PG-format codec switch; 44 normalized diff lines as of 2026-05-24 audit (was pass M0097-0003)
+regress-sql,regress,postgres/src/test/regress/sql/int4.sql,postgres/src/test/regress/sql/int4.sql,failed,Regressed by M0106-0010 PG-format codec switch; 84 normalized diff lines as of 2026-05-24 audit (was pass M0097-0003)
 regress-sql,regress,postgres/src/test/regress/sql/int8.sql,postgres/src/test/regress/sql/int8.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/interval.sql,postgres/src/test/regress/sql/interval.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/join.sql,postgres/src/test/regress/sql/join.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
@@ -126,12 +126,12 @@ regress-sql,regress,postgres/src/test/regress/sql/misc_sanity.sql,postgres/src/t
 regress-sql,regress,postgres/src/test/regress/sql/money.sql,postgres/src/test/regress/sql/money.sql,excluded,Money type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/multirangetypes.sql,postgres/src/test/regress/sql/multirangetypes.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/mvcc.sql,postgres/src/test/regress/sql/mvcc.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
-regress-sql,regress,postgres/src/test/regress/sql/name.sql,postgres/src/test/regress/sql/name.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/name.sql,postgres/src/test/regress/sql/name.sql,failed,Regressed by M0106-0010 PG-format codec switch; 97 normalized diff lines as of 2026-05-24 audit (was pass M0097-0003)
 regress-sql,regress,postgres/src/test/regress/sql/namespace.sql,postgres/src/test/regress/sql/namespace.sql,excluded,pg_namespace catalog; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/numa.sql,postgres/src/test/regress/sql/numa.sql,excluded,NUMA topology; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/numeric.sql,postgres/src/test/regress/sql/numeric.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/numeric_big.sql,postgres/src/test/regress/sql/numeric_big.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-regress-sql,regress,postgres/src/test/regress/sql/numerology.sql,postgres/src/test/regress/sql/numerology.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/numerology.sql,postgres/src/test/regress/sql/numerology.sql,failed,Regressed by M0106-0010 PG-format codec switch; 60 normalized diff lines as of 2026-05-24 audit (was pass M0097-0003)
 regress-sql,regress,postgres/src/test/regress/sql/object_address.sql,postgres/src/test/regress/sql/object_address.sql,excluded,Object address; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/oid.sql,postgres/src/test/regress/sql/oid.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/oidjoins.sql,postgres/src/test/regress/sql/oidjoins.sql,excluded,OID join sanity; out of scope for goopg v0.
@@ -149,7 +149,7 @@ regress-sql,regress,postgres/src/test/regress/sql/point.sql,postgres/src/test/re
 regress-sql,regress,postgres/src/test/regress/sql/polygon.sql,postgres/src/test/regress/sql/polygon.sql,excluded,Geometric type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/polymorphism.sql,postgres/src/test/regress/sql/polymorphism.sql,excluded,Polymorphic functions; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/portals.sql,postgres/src/test/regress/sql/portals.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-regress-sql,regress,postgres/src/test/regress/sql/portals_p2.sql,postgres/src/test/regress/sql/portals_p2.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/portals_p2.sql,postgres/src/test/regress/sql/portals_p2.sql,failed,Regressed by M0106-0010 PG-format codec switch; 39 normalized diff lines as of 2026-05-24 audit (was pass M0097-0003)
 regress-sql,regress,postgres/src/test/regress/sql/predicate.sql,postgres/src/test/regress/sql/predicate.sql,excluded,Predicate locking / serializable; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/prepare.sql,postgres/src/test/regress/sql/prepare.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/prepared_xacts.sql,postgres/src/test/regress/sql/prepared_xacts.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
@@ -177,7 +177,7 @@ regress-sql,regress,postgres/src/test/regress/sql/select.sql,postgres/src/test/r
 regress-sql,regress,postgres/src/test/regress/sql/select_distinct.sql,postgres/src/test/regress/sql/select_distinct.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/select_distinct_on.sql,postgres/src/test/regress/sql/select_distinct_on.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/select_having.sql,postgres/src/test/regress/sql/select_having.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
-regress-sql,regress,postgres/src/test/regress/sql/select_implicit.sql,postgres/src/test/regress/sql/select_implicit.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
+regress-sql,regress,postgres/src/test/regress/sql/select_implicit.sql,postgres/src/test/regress/sql/select_implicit.sql,failed,Regressed by M0106-0010 PG-format codec switch; 11 normalized diff lines as of 2026-05-24 audit (was pass M0097-0003)
 regress-sql,regress,postgres/src/test/regress/sql/select_into.sql,postgres/src/test/regress/sql/select_into.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/select_parallel.sql,postgres/src/test/regress/sql/select_parallel.sql,excluded,Parallel query; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/select_views.sql,postgres/src/test/regress/sql/select_views.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
