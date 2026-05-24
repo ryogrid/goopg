@@ -20,8 +20,8 @@ varchar,0,pass
 functional_deps,21,failed
 sysviews,41,failed
 copydml,44,failed
+copyselect,59,failed
 errors,60,failed
-copyselect,69,failed
 hash_part,73,failed
 tid,81,failed
 hash_index,96,failed
@@ -127,4 +127,4 @@ jsonb_jsonpath,4214,failed
 partition_prune,4217,failed
 jsonb,4904,failed
 partition_join,5347,failed
-join,10246,failed
+join,9933,failed

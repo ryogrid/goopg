@@ -1075,10 +1075,35 @@ M0097-0001 wires it up.
         RESTRICT` pg_depend-style dependency tracking (the `cannot drop
         constraint … because other objects depend on it` ERROR/DETAIL/HINT
         block). Per `docs/test-port/regress-root-cause-analysis.md`.
-      - **Baseline note:** `regress-diff-baseline.csv` is stale (captured in
-        the M0106 codec window). `numerology` already reports `pass` (verified
-        this loop) but is still listed at 60 — a full `TestPort_RegressSuite`
-        refresh is overdue after the recent codec/fast-path commits.
+      - **Progress 2026-05-24 (loop — star/USING join):** Fixed an unqualified
+        `SELECT *` over `JOIN ... USING (cols)` / `NATURAL JOIN` emitting the
+        merged join column **twice** (`SELECT * FROM t1 JOIN t2 USING (id)` →
+        `id,t,id,t` instead of PG's `id,t,t`). `planFromItem` already set
+        `mergedRightBinding.usingHidden` to hide the right-side copy from
+        unqualified column *lookup* (M0097-0003/0006), but `expandStarTarget`
+        (`internal/planner/planner.go`) iterated every binding's full column
+        list with no `usingHidden` check — the lookup and star-expansion paths
+        had drifted. Now `expandStarTarget` skips `usingHidden` columns for an
+        unqualified `*` only (a table-qualified `t2.*` still expands to all of
+        that relation's columns, matching PG's `expandRTE`). Test:
+        `TestPlanSelectStarJoinUsingMergesColumn` (`internal/planner/
+        planner_test.go`). `copyselect` 69→59, `join` 10246→9933 normalized
+        diff; all 17 previously-passing regress cases re-verified PASS. Known
+        limitation: PG reorders merged USING cols to the front
+        (`using-cols, left-rest, right-rest`); goopg keeps left-table order,
+        which agrees whenever the USING col is the leading col of the left
+        table (every affected regress case). Design:
+        `docs/design/0097-0036b-star-using-join-merge.md`.
+      - **Baseline note (updated 2026-05-24):** `regress-diff-baseline.csv` now
+        reflects the M0111 codec recoveries (17 pass; `numerology` correctly
+        `pass`); this loop updated `copyselect` (69→59) and `join` (10246→9933).
+        A full `TestPort_RegressSuite` refresh of every row is still worthwhile
+        but no longer urgent — the closest-win ordering is accurate.
+      - **Pre-existing unrelated failure noted:** `TestAnalyzeRespectsStatsTarget`
+        (`internal/executor/operators_analyze_test.go:233`, NDistinct(id)=398
+        want 400) fails deterministically on clean HEAD (verified via
+        `git stash`), independent of this loop's planner change — needs its own
+        triage (ANALYZE sampling), not addressed here.
 
 - [x] **M0097-0037 — Regress porting task breakdown (2026-05-22)**
       - Summary: Replaced the "promote" tasks with concrete "port"

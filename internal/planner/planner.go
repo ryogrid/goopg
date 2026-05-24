@@ -259,6 +259,7 @@ func wrapWithTableoid(child Node, tableOID uint32, sourceIdx int16, pos int) Nod
 	out[len(in)] = SchemaColumn{Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: sourceIdx}
 	return &Project{pos: pos, Child: child, Targets: targets, schema: out}
 }
+
 // that stamps each produced SchemaColumn with the given
 // SourceTableIdx. Callers building rangeBindings thread their
 // per-FROM monotonic source identifier in here; legacy callers
@@ -966,7 +967,6 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 	return root, newResolveContext(bindings, root.Output()), nil
 }
 
-
 // nodeReferencesOuter reports whether the planned right-side FROM item
 // resolved any expression against the lateral outer context — i.e. the
 // item's evaluation depends on the row produced by the left siblings.
@@ -1510,7 +1510,6 @@ func rewriteIndirectionStarTargets(s *parser.SelectStmt) error {
 	return parser.RewriteIndirectionStarTargets(s, nil)
 }
 
-
 // projectSetCompositeSchema returns the expanded composite-row schema for a
 // supported set-returning function. nil means the SRF cannot be lowered into
 // ProjectSet from a `(srf(<agg>)).*` shape — currently only
@@ -1659,7 +1658,6 @@ func planPgInputErrorInfo(rv parser.RangeVar, sourceIdx int16) (Node, rangeBindi
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
-
 
 // planPgGetPublicationTables routes a FROM-clause invocation of
 // `pg_get_publication_tables(VARIADIC text[])` into a `PgGetPublicationTables`
@@ -3370,7 +3368,6 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 	return nil
 }
 
-
 // rewriteUpdateDefaultMarkers substitutes `*parser.DefaultMarker`
 // expressions on the RHS of UPDATE SET assignments with the target
 // column's catalog DefaultExpr (or *parser.NullConst when the column
@@ -4073,7 +4070,13 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 		return nil, nil, &PlanError{Pos: star.Pos(), Code: "42601", Message: "SELECT * with no FROM clause"}
 	}
 	bset := ctx.bindings
-	if star.Table != "" || star.Schema != "" {
+	// A table-qualified star (`t.*`) expands to ALL of that table's
+	// columns, including any JOIN USING / NATURAL join columns — only an
+	// unqualified `*` merges (hides the right-side copy of) USING columns.
+	// PostgreSQL's expandRTE applies the join's merged column list only for
+	// the whole-row case, not for a per-relation `rel.*`. M0097-0036.
+	qualified := star.Table != "" || star.Schema != ""
+	if qualified {
 		matches := make([]rangeBinding, 0, 1)
 		for _, b := range ctx.bindings {
 			if bindingMatchesRelation(b, star.Table, star.Schema) {
@@ -4092,6 +4095,27 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 	outSchema := make(Schema, 0)
 	for _, b := range bset {
 		for i, c := range b.table.Columns {
+			// For an unqualified `SELECT *` over a JOIN USING / NATURAL
+			// join, the right-side copy of each merged column is hidden:
+			// PostgreSQL emits the join column once (from the left side),
+			// so the output is `using-cols, left-rest, right-rest`. The
+			// right binding carries usingHidden (set in planFromItem); the
+			// left binding does not, so its copy survives. Without this
+			// skip, `SELECT * FROM t1 JOIN t2 USING (id)` wrongly produced
+			// a duplicate `id` column (`id|t|id|t` vs PG's `id|t|t`).
+			// M0097-0036.
+			if !qualified && len(b.usingHidden) > 0 {
+				hidden := false
+				for _, uh := range b.usingHidden {
+					if strings.EqualFold(uh, c.Name) {
+						hidden = true
+						break
+					}
+				}
+				if hidden {
+					continue
+				}
+			}
 			idx := b.offset + i
 			outExpr = append(outExpr, &ColumnRef{pos: star.Pos(), Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
 			outSchema = append(outSchema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
@@ -4856,7 +4880,6 @@ func bindingMatchesRelation(b rangeBinding, table, schema string) bool {
 	}
 	return false
 }
-
 
 // tryPromoteIndexOnlyScan examines a freshly-built Project node and promotes
 // it to an IndexOnlyScan (M0046-0004) when all of the following hold:

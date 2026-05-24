@@ -603,6 +603,68 @@ func TestPlanSelectStarExpansion(t *testing.T) {
 	}
 }
 
+// TestPlanSelectStarJoinUsingMergesColumn: an unqualified `SELECT *` over a
+// JOIN USING (or NATURAL join) emits each merged column once — the right-side
+// copy of the join column is hidden. Without this, `SELECT * FROM t1 JOIN t2
+// USING (id)` wrongly produced a duplicate `id` column (`id,t,id,t` vs PG's
+// `id,t,t`). A table-qualified star (`t2.*`) still expands to all of that
+// relation's columns, join column included. M0097-0036.
+func TestPlanSelectStarJoinUsingMergesColumn(t *testing.T) {
+	c := catalog.NewInMemory()
+	for _, name := range []string{"t1", "t2"} {
+		if _, err := c.CreateTable(parser.ObjectName{Name: name}, []catalog.Column{
+			{Name: "id", Type: catalog.Type{Name: "int4"}},
+			{Name: "t", Type: catalog.Type{Name: "text"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Unqualified star: join column merged → id, t (left), t (right).
+	node, err := Plan(parseOne(t, "SELECT * FROM t1 JOIN t2 USING (id)"), c)
+	if err != nil {
+		t.Fatalf("Plan unqualified: %v", err)
+	}
+	proj := node.(*Project)
+	gotNames := make([]string, 0, len(proj.Output()))
+	for _, col := range proj.Output() {
+		gotNames = append(gotNames, col.Name)
+	}
+	want := []string{"id", "t", "t"}
+	if len(gotNames) != len(want) {
+		t.Fatalf("unqualified star columns=%v want %v", gotNames, want)
+	}
+	for i := range want {
+		if gotNames[i] != want[i] {
+			t.Fatalf("unqualified star columns=%v want %v", gotNames, want)
+		}
+	}
+
+	// NATURAL join over both shared columns: id and t merged → id, t.
+	nnode, err := Plan(parseOne(t, "SELECT * FROM t1 NATURAL JOIN t2"), c)
+	if err != nil {
+		t.Fatalf("Plan natural: %v", err)
+	}
+	nproj := nnode.(*Project)
+	if got := len(nproj.Output()); got != 2 {
+		names := make([]string, 0, got)
+		for _, col := range nproj.Output() {
+			names = append(names, col.Name)
+		}
+		t.Fatalf("natural star columns=%v want [id t]", names)
+	}
+
+	// Table-qualified star is NOT merged: t2.* keeps the join column.
+	qnode, err := Plan(parseOne(t, "SELECT t2.* FROM t1 JOIN t2 USING (id)"), c)
+	if err != nil {
+		t.Fatalf("Plan qualified: %v", err)
+	}
+	qproj := qnode.(*Project)
+	if got := len(qproj.Output()); got != 2 {
+		t.Fatalf("qualified t2.* columns=%d want 2 (id,t)", got)
+	}
+}
+
 // TestPlanInsertResolvesColumns: pgbench's INSERT INTO pgbench_history
 // (tid, bid, aid, delta, mtime) ... resolves all five names and
 // builds a Values feeding an Insert.
@@ -632,7 +694,6 @@ func TestPlanInsertResolvesColumns(t *testing.T) {
 		t.Fatalf("values shape=%v", values.Rows)
 	}
 }
-
 
 // TestPlanInsertValuesDefaultSubstitutesColumnDefault: rung 15 — a bare
 // DEFAULT cell in a VALUES row is substituted at plan time by the
@@ -702,7 +763,6 @@ func TestPlanInsertValuesDefaultColumnWithoutDefaultGivesNull(t *testing.T) {
 	}
 }
 
-
 // TestPlanUpdateSetDefaultSubstitutesColumnDefault: rung 16 — a bare
 // DEFAULT on the RHS of an UPDATE SET assignment is substituted at plan
 // time by the target column's catalog DefaultExpr. The executor never
@@ -764,7 +824,6 @@ func TestPlanUpdateSetDefaultColumnWithoutDefaultGivesNull(t *testing.T) {
 		t.Errorf("Set[1]=%T want *NullConst", upd.Set[1])
 	}
 }
-
 
 // TestPlanInsertDefaultValuesExpandsToColumnDefaults: rung 17 — the
 // all-defaults `INSERT INTO t DEFAULT VALUES` form is expanded by
@@ -967,7 +1026,6 @@ func TestPlanLateralSrfArgResolvesAgainstLeftFromItem(t *testing.T) {
 		t.Errorf("output col name = %q, want %q", got, "attrs")
 	}
 }
-
 
 // TestPlanFetchTableListAggDerivedSubquery pins the M0103-0008 rung-7
 // gap surfaced by dropping the t.Skip on
