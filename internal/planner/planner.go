@@ -2866,11 +2866,33 @@ func aggregateCallKey(fc *parser.FuncCall) string {
 		b.WriteString(parserExprKey(a))
 		b.WriteString("|")
 	}
+	// FILTER (WHERE ...) must be part of the dedup key: `count(*)` and
+	// `count(*) FILTER (WHERE p)` are distinct aggregates. Omitting it
+	// collapsed them onto one slot, so the filtered count silently
+	// reported the unfiltered total (e.g. sysviews pg_hba_file_rules
+	// `count(*) FILTER (WHERE error IS NOT NULL)`). M0097-0032.
+	if fc.Filter != nil {
+		b.WriteString("filter|")
+		b.WriteString(parserExprKey(fc.Filter))
+		b.WriteString("|")
+	}
 	return b.String()
 }
 
 func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (AggregateCall, error) {
 	name := strings.ToLower(fc.Name.Name)
+	// Resolve the FILTER (WHERE ...) predicate up front so every return path
+	// below carries it — including count(*) and zero-arg aggregates, which
+	// otherwise silently dropped the filter (e.g. `count(*) FILTER (WHERE c)`
+	// counted every row). M0097-0007 / M0097-0032.
+	var filterExpr Expr
+	if fc.Filter != nil {
+		var ferr error
+		filterExpr, ferr = resolveExpr(fc.Filter, inputCtx)
+		if ferr != nil {
+			return AggregateCall{}, ferr
+		}
+	}
 	if fc.Star {
 		if name != "count" || len(fc.Args) != 0 {
 			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: "only count(*) is supported with * aggregate arguments"}
@@ -2881,6 +2903,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 			Star:     true,
 			Distinct: fc.Distinct,
 			Type:     catalog.Type{Name: "int8"},
+			Filter:   filterExpr,
 		}, nil
 	}
 	// Many aggregates accept 0 or more args; only enforce 1-arg for the
@@ -2889,7 +2912,8 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 		// Zero-arg aggregates like count(*) handled above; all others need args.
 		return AggregateCall{
 			pos: fc.Pos(), Name: name, Distinct: fc.Distinct,
-			Type: catalog.Type{Name: "numeric"},
+			Type:   catalog.Type{Name: "numeric"},
+			Filter: filterExpr,
 		}, nil
 	}
 	argExpr, err := resolveExpr(fc.Args[0], inputCtx)
@@ -2912,15 +2936,6 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 	default:
 		// Extended aggregates (M0097-0007): accept but return null/stub type.
 		outType = catalog.Type{Name: "numeric"}
-	}
-	// Resolve FILTER (WHERE ...) predicate if present.
-	var filterExpr Expr
-	if fc.Filter != nil {
-		var ferr error
-		filterExpr, ferr = resolveExpr(fc.Filter, inputCtx)
-		if ferr != nil {
-			return AggregateCall{}, ferr
-		}
 	}
 	return AggregateCall{
 		pos:      fc.Pos(),
@@ -2955,6 +2970,13 @@ func parserExprKey(e parser.Expr) string {
 		return "c:" + strings.ToLower(x.Column)
 	case *parser.UnaryOp:
 		return "u:" + x.Op.String() + ":" + parserExprKey(x.Operand)
+	case *parser.IsNullExpr:
+		// Distinguish IS NULL from IS NOT NULL so two FILTER predicates that
+		// differ only by negation get different aggregate dedup keys.
+		if x.Negated {
+			return "isnotnull:(" + parserExprKey(x.Operand) + ")"
+		}
+		return "isnull:(" + parserExprKey(x.Operand) + ")"
 	case *parser.BinaryOp:
 		return "b:" + x.Op.String() + ":(" + parserExprKey(x.Left) + "):(" + parserExprKey(x.Right) + ")"
 	case *parser.FuncCall:

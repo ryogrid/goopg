@@ -1117,11 +1117,38 @@ M0097-0001 wires it up.
         NOTE: `WITH RECURSIVE` bodies with `SELECT *` still error (separate
         `analyzeRecursiveCTE` path — anchor columns unknown pre-analysis; left
         as remaining `with`-test work).
-      - **Remaining sysviews gaps (separate subsystems):**
-        `pg_backend_memory_contexts` introspection (`TopMemoryContext
-        total_bytes >= free_bytes`, Bump-context + `CacheMemoryContext` child
-        rows — a Go-runtime design constraint), and `pg_hba_file_rules` /
-        `pg_ident_file_mappings` `no_err` FILTER (errors column non-null).
+      - **Progress 2026-05-25 (loop — count(\*) FILTER dedup + hba NULL):**
+        Closed the `pg_hba_file_rules`/`pg_ident_file_mappings` `no_err` gap and
+        fixed an **engine-wide aggregate bug** it exposed. The `no_err` query is
+        `count(*) > 0, count(*) FILTER (WHERE error IS NOT NULL) = 0` — two
+        `count(*)` aggregates. `aggregateCallKey` (`internal/planner/planner.go`)
+        omitted the FILTER predicate from the dedup key, so the bare `count(*)`
+        and the filtered one collapsed onto a single (unfiltered) slot and the
+        filtered count silently reported the unfiltered total. (Affected ANY
+        query with a bare aggregate + a filtered same-name/same-arg twin; a lone
+        `count(*) FILTER` worked, which masked it.) Fix: (a) fold
+        `filter|<parserExprKey(fc.Filter)>` into `aggregateCallKey` (same fn is
+        used build-side in `buildAggregateStage`/`collectAggregateCalls` and
+        resolve-side in `resolveExprAfterAggregate`, so keys stay consistent);
+        (b) add an `*parser.IsNullExpr` case to `parserExprKey` so
+        `IS NULL`/`IS NOT NULL` filters don't collide on the `expr:%T` fallback;
+        (c) `buildAggregateCall` now resolves `fc.Filter` once up front and
+        threads it through the `count(*)` + zero-arg early returns (previously
+        `Filter==nil`). Separately, `pg_hba_file_rules`'s canned row stored `""`
+        (NOT NULL) for `error`; dropped the trailing cell so both
+        `buildVirtualValues` and `rematerialiseVirtualRows` materialise it as SQL
+        NULL. Both `no_err` queries now → `t|t` (verified end-to-end on 5599).
+        `sysviews` diff **33 → 11** (via `GOOPG_REGRESS_DIFF_DIR`). Tests:
+        `TestAggregateFilterDistinguishedInDedupKey`
+        (`internal/planner/planner_test.go`), `TestPgHbaFileRulesErrorIsNull`
+        (`internal/catalog/catalog_test.go`). Design:
+        `docs/design/0097-0032d-count-star-filter-dedup-and-hba-null.md`.
+      - **Remaining sysviews gaps (single subsystem):** the entire residual 11
+        diff lines are `pg_backend_memory_contexts` introspection
+        (`TopMemoryContext total_bytes >= free_bytes`, the Bump-context
+        `Caller tuples` rows, and the `CacheMemoryContext` multi-child `path`
+        check) — a Go-runtime design constraint (no faithful equivalent of
+        PostgreSQL's C memory-context tree). No other subsystem blocks `sysviews`.
 
 - [ ] **M0097-0033 — Port test_setup regress test**
       - Summary: Make `test_setup` reach `pass`.

@@ -165,7 +165,6 @@ func TestPgCatalogBootstrapViews(t *testing.T) {
 	}
 }
 
-
 // TestPgClassExposesRelNatts pins the M0103-0008 rung-14 surface:
 // PG's CREATE SUBSCRIPTION column-list probe runs
 //
@@ -220,7 +219,6 @@ func TestPgClassExposesRelNatts(t *testing.T) {
 		t.Errorf("pg_class.t.relnatts=%q want %q (user column count)", row[natts.Ordinal], "2")
 	}
 }
-
 
 // TestPgClassExposesRelReplident pins rung 16 of M0103-0008: the
 // pg_catalog.pg_class virtual view must expose a `relreplident`
@@ -563,6 +561,40 @@ func TestPgWaitEventsCoversAllTypes(t *testing.T) {
 	for typ, present := range want {
 		if !present {
 			t.Errorf("pg_wait_events missing type %q", typ)
+		}
+	}
+}
+
+// TestPgHbaFileRulesErrorIsNull verifies the single canned pg_hba_file_rules
+// row leaves its trailing `error` column as SQL NULL. sysviews.sql asserts
+// `count(*) FILTER (WHERE error IS NOT NULL) = 0` (no_err = t); an empty
+// string would be NOT NULL and fail it. Both the planner and executor
+// materialise a missing trailing cell as NullConst, so the row must stop
+// before the last (`error`) column.
+func TestPgHbaFileRulesErrorIsNull(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_hba_file_rules"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_hba_file_rules virtual table not registered")
+	}
+	errorCol := -1
+	for i, col := range tbl.Columns {
+		if col.Name == "error" {
+			errorCol = i
+		}
+	}
+	if errorCol != len(tbl.Columns)-1 {
+		t.Fatalf("error column at ordinal %d; expected it to be the last column %d "+
+			"(NULL-via-truncation relies on this)", errorCol, len(tbl.Columns)-1)
+	}
+	rows := tbl.VirtualRows()
+	if len(rows) == 0 {
+		t.Fatal("pg_hba_file_rules must return at least one row (sysviews wants count(*) > 0)")
+	}
+	for i, row := range rows {
+		if len(row) > errorCol {
+			t.Errorf("row %d has %d cells, including the error column; the trailing "+
+				"error cell must be omitted so it materialises as NULL", i, len(row))
 		}
 	}
 }

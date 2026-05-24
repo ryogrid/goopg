@@ -1348,12 +1348,14 @@ func (c *InMemory) registerSystemTables() {
 	pgFileSettings.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_file_settings"] = pgFileSettings
 
-	// pg_hba_file_rules — needs count > 0 and no errors.
-	// The error column must be NULL. We use a sentinel "NULL" and rely on
-	// the executor treating absent values. For simplicity store it as empty
-	// string; the test checks error IS NOT NULL = 0, i.e. count of non-NULL
-	// errors = 0. An empty string is NOT NULL in our executor so we use a
-	// short array representation for the array columns.
+	// pg_hba_file_rules — sysviews.sql checks `count(*) > 0` and
+	// `count(*) FILTER (WHERE error IS NOT NULL) = 0`, so we must emit at
+	// least one row whose `error` column is SQL NULL (a parsed rule with no
+	// error). The error column is the last column, and both the planner
+	// (buildVirtualValues) and executor (rematerialiseVirtualRows) materialise
+	// a missing trailing cell as NullConst — so we omit the trailing `error`
+	// cell rather than storing "" (which is NOT NULL and would make `no_err`
+	// come out false).
 	pgHbaRules := &Table{
 		Schema: "pg_catalog", Name: "pg_hba_file_rules", Virtual: true,
 		Columns: []Column{
@@ -1373,7 +1375,8 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgHbaRules.VirtualRows = func() [][]string {
 		return [][]string{
-			{"1", "pg_hba.conf", "1", "local", "{all}", "{all}", "", "", "trust", "{}", ""},
+			// Trailing `error` cell omitted → materialised as SQL NULL.
+			{"1", "pg_hba.conf", "1", "local", "{all}", "{all}", "", "", "trust", "{}"},
 		}
 	}
 	c.tables["pg_catalog.pg_hba_file_rules"] = pgHbaRules

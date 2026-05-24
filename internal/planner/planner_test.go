@@ -1071,3 +1071,59 @@ func TestPlanFetchTableListAggDerivedSubquery(t *testing.T) {
 		t.Fatalf("expected single output column 'attrs', got %+v", out)
 	}
 }
+
+// TestAggregateFilterDistinguishedInDedupKey pins the M0097-0032 fix:
+// aggregateCallKey must fold the FILTER (WHERE ...) predicate into the
+// dedup key. Without it, `count(*)` and `count(*) FILTER (WHERE p)` (and two
+// filters differing only by IS NULL vs IS NOT NULL) collapsed onto a single
+// aggregate slot, so the filtered counts silently reported the unfiltered
+// total — the sysviews pg_hba_file_rules `no_err` query was the symptom.
+func TestAggregateFilterDistinguishedInDedupKey(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "e", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT count(*), ` +
+		`count(*) FILTER (WHERE id > 1), ` +
+		`count(*) FILTER (WHERE e IS NULL), ` +
+		`count(*) FILTER (WHERE e IS NOT NULL) FROM t`
+	plan, err := Plan(parseOne(t, sql), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	var agg *Aggregate
+	var find func(n Node)
+	find = func(n Node) {
+		switch x := n.(type) {
+		case *Aggregate:
+			agg = x
+		case *Project:
+			find(x.Child)
+		case *Filter:
+			find(x.Child)
+		case *Sort:
+			find(x.Child)
+		}
+	}
+	find(plan)
+	if agg == nil {
+		t.Fatalf("no Aggregate node in plan %T", plan)
+	}
+	// Four distinct count(*) aggregates: one bare + three differently
+	// filtered. A collapsed key would yield fewer slots.
+	if len(agg.Aggs) != 4 {
+		t.Fatalf("got %d aggregate slots, want 4 (bare + 3 distinct FILTERs): %+v", len(agg.Aggs), agg.Aggs)
+	}
+	nFiltered := 0
+	for _, a := range agg.Aggs {
+		if a.Filter != nil {
+			nFiltered++
+		}
+	}
+	if nFiltered != 3 {
+		t.Errorf("got %d filtered aggregates, want 3", nFiltered)
+	}
+}
