@@ -5039,9 +5039,16 @@ func isColumnFunctionallyDetermined(col *ColumnRef, agg *aggregateSurface) bool 
 			colByName[sc.Name] = i
 		}
 	}
-	// Check each primary key or unique index.
+	// Check each primary key. PostgreSQL's check_functional_grouping
+	// (src/backend/catalog/pg_constraint.c) recognises only PRIMARY KEY
+	// constraints for functional dependency — NOT unique constraints,
+	// since a unique constraint may be deferrable and (when nullable)
+	// permits multiple NULL rows that would not collapse under GROUP BY.
+	// The functional_deps regress test pins this: `GROUP BY title` on a
+	// UNIQUE NOT NULL column and `GROUP BY body` on a UNIQUE column both
+	// must fail, while `GROUP BY id` on the primary key succeeds.
 	for _, idx := range idxs {
-		if !idx.Primary && !idx.Unique {
+		if !idx.Primary {
 			continue
 		}
 		// Verify that all index columns are in the GROUP BY.

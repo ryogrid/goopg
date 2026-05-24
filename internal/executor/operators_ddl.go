@@ -674,6 +674,33 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	if s.Query == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE VIEW requires a SELECT body"}
 	}
+	// Validate the view's SELECT by planning it. PostgreSQL analyzes the view
+	// query at creation time, so semantic errors — e.g. a column that is
+	// neither in the GROUP BY nor wrapped in an aggregate — surface here rather
+	// than only at first reference. Without this, `CREATE VIEW v AS SELECT a
+	// FROM t GROUP BY b` was silently accepted, and a subsequent legal
+	// re-CREATE of the same name then failed with a spurious "already exists".
+	// v0-planner "feature not supported" (0A000) errors are ignored so the
+	// planner's incompleteness does not reject views upstream would accept;
+	// those still fail at reference time. M0097-0003 (functional_deps).
+	if _, err := planner.Plan(s.Query, o.ctx.Catalog); err != nil {
+		// Surface the validation failure as an *ExecError so the wire
+		// layer renders a clean "ERROR:  <message>" line. Returning the
+		// raw *planner.PlanError would let its Error() string —
+		// "<code>: <message> (byte <pos>)" — leak into the message
+		// field, which diverges from the direct-SELECT path (the simple
+		// query handler extracts Code/Message separately). v0-planner
+		// "feature not supported" (0A000) errors are still ignored so
+		// the planner's incompleteness does not reject views upstream
+		// would accept; those fail at reference time instead.
+		if pe, ok := err.(*planner.PlanError); ok {
+			if pe.Code != "0A000" {
+				return &ExecError{Code: pe.Code, Message: pe.Message, Hint: pe.Hint, Pos: pe.Pos}
+			}
+		} else {
+			return err
+		}
+	}
 	if !s.OrReplace {
 		if existing, ok := o.ctx.Catalog.LookupTable(s.Name); ok && existing.View == nil {
 			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
@@ -1932,7 +1959,6 @@ func catalogHeapSyncAvailable(ctx *Context) bool {
 		parser.ObjectName{Schema: "pg_catalog", Name: "pg_attribute"})
 	return ok && !pgAttr.Virtual
 }
-
 
 // catalogDBOids returns the set of database OIDs that hold catalog heap
 // pages for user relations. syncTableToCatalogHeap writes to DefaultDBOid

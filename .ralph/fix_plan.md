@@ -529,6 +529,37 @@ M0097-0001 wires it up.
       - 115. pg_size_pretty: sizePrettyFloat uses math.Round for half-up rounding.
       - 116. pg_size_pretty: overflow check for float64 inputs outside int64 range.
         dbsize: 142 → 128 diff lines (still far from passing; complex formatting issues remain).
+      - Loop additions (2026-05-25):
+        - 122. Functional-dependency GROUP BY: `isColumnFunctionallyDetermined`
+          (`internal/planner/planner.go`) now recognises only PRIMARY KEY indexes
+          (`if !idx.Primary { continue }`), not unique indexes — matching PG's
+          `check_functional_grouping` (only PK establishes a dependency; unique
+          constraints are deferrable / nullable). Fixes silently-wrong acceptance of
+          `GROUP BY <unique-non-PK-col>` (e.g. `GROUP BY body`/`GROUP BY title`),
+          which was state-dependent and caused a spurious `relation "fdv1" already
+          exists` in the shared-cluster regress run.
+        - 123. `execCreateView` (`internal/executor/operators_ddl.go`) now converts a
+          non-0A000 `*planner.PlanError` from view-body validation into an
+          `*ExecError{Code,Message,Hint,Pos}` so the wire layer renders a clean
+          `ERROR:  <message>` instead of the raw `Error()` string
+          `"42803: … (byte 32)"` (the simple-query path already extracts Code/Message
+          separately — sibling-path divergence).
+        - Tests: `internal/planner/functional_deps_test.go`
+          (`TestGroupByPrimaryKeyEstablishesFunctionalDependency`,
+          `TestGroupByUniqueColumnRejected`). Design:
+          `docs/design/0097-0003-functional-dep-pk-only-grouping.md`.
+        - `functional_deps` stays 21 normalized diff lines, but the residual is now
+          entirely ONE out-of-scope feature: `ALTER TABLE … DROP CONSTRAINT …
+          RESTRICT` view→constraint (`pg_depend`) dependency tracking — the 5
+          `cannot drop constraint … because other objects depend on it` ERRORs +
+          their `DETAIL: view … depends on constraint …` + 5 `HINT: Use DROP …
+          CASCADE` lines — plus prepared-plan re-validation on constraint drop
+          (`EXECUTE foo` must fail once the PK is gone). Needs a `pg_depend`-style
+          dependency registry; deferred.
+      - Action (functional_deps): implement `pg_depend`-style view→constraint
+        dependency tracking so `DROP CONSTRAINT … RESTRICT` is blocked while a view
+        references the constrained column, with the DETAIL/HINT lines and prepared
+        statement re-validation; that closes the last 21 diff lines.
 
 - [ ] **M0097-0004**
       - Summary: Date / time type parity.
