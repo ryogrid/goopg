@@ -157,3 +157,49 @@ func TestDecodePhysicalPGFloatKind(t *testing.T) {
 		t.Fatalf("compareDatum(-1234, -123456) = %d, want > 0 (lexicographic regression)", cmp)
 	}
 }
+
+// TestEncodePhysicalPGNameTruncation pins the M0111-0007 fix: the name type
+// silently truncates input to NAMEDATALEN-1 = 63 bytes. The PG-format encoder
+// previously copied the full string into the 64-byte NameData buffer with no
+// truncation, so a 64-char input filled all 64 bytes (no NUL terminator) and
+// decoded back as 64 chars — widening name columns by one and corrupting row
+// counts in the `name` regress test. Storage-encode already truncated to 63;
+// the PG-native path (primary since M0111-0001) had drifted.
+func TestEncodePhysicalPGNameTruncation(t *testing.T) {
+	typ := catalog.Type{Name: "name"}
+	// 64-char ASCII input → must round-trip as exactly 63 chars.
+	in64 := "1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890ABCDEFGHIJKLMNOPQR"
+	if len(in64) != 64 {
+		t.Fatalf("test input is %d chars, want 64", len(in64))
+	}
+	enc, err := encodeValuePG(typ, NewStringDatum(in64))
+	if err != nil {
+		t.Fatalf("encodeValuePG(name, 64-char): %v", err)
+	}
+	if len(enc) != 64 {
+		t.Fatalf("encoded NameData is %d bytes, want 64", len(enc))
+	}
+	got, _, err := decodePhysicalPGValueMctx(typ, enc, nil)
+	if err != nil {
+		t.Fatalf("decodePhysicalPGValueMctx(name): %v", err)
+	}
+	want := in64[:63]
+	if got.Kind != KindString || got.StringValue() != want {
+		t.Fatalf("name round-trip = %q (kind %v), want %q (truncated to 63)", got.StringValue(), got.Kind, want)
+	}
+
+	// Inputs of 63 bytes or fewer are preserved verbatim.
+	for _, s := range []string{"", "abc", in64[:63]} {
+		enc, err := encodeValuePG(typ, NewStringDatum(s))
+		if err != nil {
+			t.Fatalf("encodeValuePG(name, %q): %v", s, err)
+		}
+		got, _, err := decodePhysicalPGValueMctx(typ, enc, nil)
+		if err != nil {
+			t.Fatalf("decode(name, %q): %v", s, err)
+		}
+		if got.StringValue() != s {
+			t.Fatalf("name round-trip = %q, want %q", got.StringValue(), s)
+		}
+	}
+}

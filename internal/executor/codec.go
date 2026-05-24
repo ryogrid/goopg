@@ -333,8 +333,26 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		binary.LittleEndian.PutUint32(buf[8:], 0)
 		return buf[:], nil
 	case "name":
-		// PG NameData: fixed 64 bytes, '\0' padded
-		s := d.StringValue()
+		// PG NameData: fixed 64 bytes, '\0'-padded. The name type silently
+		// truncates input to NAMEDATALEN-1 = 63 bytes (one byte reserved for
+		// the NUL terminator), matching PostgreSQL's namein() and the
+		// storage-encode path below. Without the truncation a 64-char input
+		// fills all 64 bytes with no terminator and decodes back as 64 chars,
+		// widening name columns by one and breaking row counts (M0111-0007).
+		var s string
+		switch d.Kind {
+		case KindString:
+			s = d.StringValue()
+		case KindBytes:
+			s = string(d.BytesValue())
+		case KindInt:
+			s = fmt.Sprintf("%d", d.Int)
+		default:
+			s = d.StringValue()
+		}
+		if len(s) > 63 {
+			s = s[:63]
+		}
 		buf := make([]byte, 64)
 		copy(buf, s)
 		return buf, nil

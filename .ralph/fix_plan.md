@@ -859,6 +859,35 @@ M0097-0001 wires it up.
         EVERY post-arithmetic check in `evalExprSlot` (overflow, float
         formatting); a missing check is invisible to expression unit tests that
         use the interpreted path and only surfaces end-to-end.
+      - **Recovery 2026-05-24 (M0111-0007 — name, LAST codec regression):**
+        Recovered the `name` regress case (`failed`, 77 diff lines → **pass**),
+        the 6th and final M0106-0010 codec regression. The earlier note that
+        name's residual was "unrelated to codec" was WRONG — it was an
+        **encode-side** codec drift. `encodeValuePG`'s `name` arm
+        (`internal/executor/codec.go`) copied the full input string into the
+        fixed 64-byte `NameData` buffer with NO NAMEDATALEN-1 = 63 truncation,
+        so a 64-char input filled all 64 bytes (no NUL terminator) and
+        `decodePhysicalPGValueMctx` read it back as 64 chars. PostgreSQL's
+        `namein()` truncates `name` to 63 bytes; the sibling `encodeValueStorage`
+        path already did (`if len(s) > 63 { s = s[:63] }`, M0097-0003) but the
+        PG-native encoder — the primary heap path since M0111-0001 — had
+        drifted. The off-by-one widened name columns by one (64-dash header
+        underline), kept a trailing byte PG clipped, and corrupted `WHERE` row
+        counts (un-truncated stored values matched a different row set than the
+        63-char literals). Fix: clip to 63 before `copy`, mirroring
+        storage-encode (plus its KindBytes/KindInt handling). No
+        previously-passing case regressed (`int2`/`int4`/`numerology`/
+        `select_implicit`/`portals_p2`/`char`/`varchar` re-verified pass).
+        Test: `TestEncodePhysicalPGNameTruncation`
+        (`internal/executor/codec_int8_name_pg_test.go`). Design:
+        `docs/design/0111-0007-pg-format-name-encode-truncation.md`. Baseline +
+        inventory CSVs updated, coverage md regenerated (17 regress pass now).
+        **All 6 M0106-codec regressions are now recovered.** Lesson (encode
+        analogue of M0111-0004/0006): audit that `encodeValuePG` and
+        `encodeValueStorage` agree on type-specific normalization (length clip,
+        padding, error wording), not just round-trip bytes for short values — a
+        fixed-width type whose normalization is skipped diverges only at its
+        exact boundary length and escapes short-value round-trip tests.
 
 - [ ] **M0097-0020 — Port SELECT / DML / JOIN / subquery / CTE regress tests**
       - Summary: Make these 15 tests reach `pass` status:
