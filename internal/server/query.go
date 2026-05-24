@@ -30,7 +30,7 @@ const (
 // Everything else still returns a feature-not-supported ErrorResponse.
 // Each statement is terminated with ReadyForQuery('I') so the client
 // can keep going.
-func (s *Server) handleQuery(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte, connTx *connTxState, prepStmts *preparedStatements) error {
+func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte, connTx *connTxState, prepStmts *preparedStatements) error {
 	q, err := extractCString(payload)
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.ProtocolViolation,
@@ -52,7 +52,7 @@ func (s *Server) handleQuery(ctx context.Context, w *protocol.FrameWriter, sess 
 	// and executed individually. The string-matching path below only handles
 	// single statements correctly.
 	if strings.ContainsRune(matchable, ';') && s.cfg.hasStorage() {
-		return s.dispatchSimpleQueryViaExecutor(ctx, w, sess, trimmed, connTx, prepStmts)
+		return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
 	}
 
 	if strings.EqualFold(matchable, "SELECT 1") {
@@ -91,7 +91,7 @@ func (s *Server) handleQuery(ctx context.Context, w *protocol.FrameWriter, sess 
 	}
 
 	if s.cfg.hasStorage() {
-		return s.dispatchSimpleQueryViaExecutor(ctx, w, sess, trimmed, connTx, prepStmts)
+		return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
 	}
 
 	return s.writeQueryError(w, sqlstate.FeatureNotSupported,

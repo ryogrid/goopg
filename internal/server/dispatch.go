@@ -92,7 +92,7 @@ func maybeForceGCAfterCommit() {
 //
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
-func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string, connTx *connTxState, prepStmts *preparedStatements) error {
+func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string, connTx *connTxState, prepStmts *preparedStatements) error {
 	// M0107-0003 Phase C.3: allocate token backing from an ephemeral mctx
 	// child to avoid sync.Pool overhead on the hot parse path.
 	var parseCtx *mctx.Context
@@ -462,9 +462,10 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		// the executor has no COPY operator (COPY is driven from the wire
 		// layer). runInlineCopy streams within the batch's shared txn and
 		// writes only CommandComplete; the trailing ReadyForQuery below
-		// covers the whole Query message. M0097-0024.
+		// covers the whole Query message. COPY FROM STDIN reads its
+		// CopyData/CopyDone frames synchronously from r mid-batch. M0097-0024.
 		if cs, ok := stmt.(*parser.CopyStmt); ok {
-			if err := s.runInlineCopy(w, ectx, cs); err != nil {
+			if err := s.runInlineCopy(r, w, ectx, cs); err != nil {
 				if errors.Is(err, errQueryErrorSent) {
 					// ErrorResponse + RFQ already sent; abort the rest of
 					// the batch (PG aborts the whole message on error).

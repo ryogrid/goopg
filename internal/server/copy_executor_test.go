@@ -316,35 +316,130 @@ func TestCopyToBatchStopsOnError(t *testing.T) {
 // must surface a clean FeatureNotSupported ERROR — never the internal
 // "planner.Copy has no executor path yet" leak that the multi-statement
 // path produced before M0097-0024. Statements before the COPY still run.
-func TestCopyFromStdinInBatchDeferred(t *testing.T) {
+// TestCopyFromStdinInMultiStatementBatch: COPY FROM STDIN inside a psql
+// `\;`-joined batch now streams its CopyData/CopyDone frames synchronously
+// mid-batch. This is the copyselect
+// `select 0\; copy test3 from stdin\; copy test3 from stdin\; select 1`
+// shape (two STDIN data blocks, each `\.`-terminated). The server emits one
+// CopyInResponse per COPY, consumes the client's data, writes one
+// CommandComplete per statement, and a single trailing ReadyForQuery for the
+// whole Query message. M0097-0024.
+func TestCopyFromStdinInMultiStatementBatch(t *testing.T) {
 	addr, _, stop := startCopyExecServer(t)
 	defer stop()
 	conn := dialAndComplete(t, addr)
 	defer conn.Close()
 
-	writeQuery(t, conn, "select 0; copy items from stdin; select 1;")
-	frames := readUntilReady(t, conn)
-	// select 0 → T,D,C; then COPY FROM STDIN → ErrorResponse; then RFQ.
-	want := []byte{
-		protocol.MsgRowDescription, protocol.MsgDataRow, protocol.MsgCommandComplete,
-		protocol.MsgErrorResponse, protocol.MsgReadyForQuery,
+	r := protocol.NewFrameReader(conn)
+	next := func() protocol.Frame {
+		t.Helper()
+		f, err := r.ReadFrame()
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		return f
 	}
-	if len(frames) != len(want) {
-		t.Fatalf("frames=%d want=%d (%v)", len(frames), len(want), frameTypes(frames))
+	expect := func(want byte) protocol.Frame {
+		t.Helper()
+		f := next()
+		if f.Type != want {
+			t.Fatalf("frame=%q want %q", f.Type, want)
+		}
+		return f
 	}
-	for i, w := range want {
-		if frames[i].Type != w {
-			t.Fatalf("frame[%d]=%q want %q (%v)", i, frames[i].Type, w, frameTypes(frames))
+
+	writeQuery(t, conn, "select 0; copy items from stdin; copy items from stdin; select 1;")
+
+	// select 0 → T, D, C.
+	expect(protocol.MsgRowDescription)
+	expect(protocol.MsgDataRow)
+	expect(protocol.MsgCommandComplete)
+
+	// First COPY FROM STDIN: CopyInResponse, then we stream one row plus the
+	// deprecated `\.` end-of-data marker, then CopyDone.
+	expect(protocol.MsgCopyInResponse)
+	writeFrontendFrame(t, conn, protocol.MsgCopyData, []byte("1\talpha\n\\.\n"))
+	writeFrontendFrame(t, conn, protocol.MsgCopyDone, nil)
+	if cc := expect(protocol.MsgCommandComplete); strings.TrimSuffix(string(cc.Payload), "\x00") != "COPY 1" {
+		t.Errorf("first COPY tag=%q want COPY 1", strings.TrimSuffix(string(cc.Payload), "\x00"))
+	}
+
+	// Second COPY FROM STDIN.
+	expect(protocol.MsgCopyInResponse)
+	writeFrontendFrame(t, conn, protocol.MsgCopyData, []byte("2\tbeta\n"))
+	writeFrontendFrame(t, conn, protocol.MsgCopyDone, nil)
+	if cc := expect(protocol.MsgCommandComplete); strings.TrimSuffix(string(cc.Payload), "\x00") != "COPY 1" {
+		t.Errorf("second COPY tag=%q want COPY 1", strings.TrimSuffix(string(cc.Payload), "\x00"))
+	}
+
+	// select 1 → T, D, C; then the single trailing RFQ.
+	expect(protocol.MsgRowDescription)
+	expect(protocol.MsgDataRow)
+	expect(protocol.MsgCommandComplete)
+	expect(protocol.MsgReadyForQuery)
+
+	// Both rows must be committed and visible to the next command.
+	writeQuery(t, conn, "COPY items TO STDOUT")
+	var rows []string
+	for {
+		f := next()
+		if f.Type == protocol.MsgCopyData {
+			rows = append(rows, string(f.Payload))
+		}
+		if f.Type == protocol.MsgReadyForQuery {
+			break
 		}
 	}
-	got := parseErrorFields(t, frames[3].Payload)
-	if got[protocol.FieldSQLState] != "0A000" {
-		t.Errorf("sqlstate=%q want 0A000", got[protocol.FieldSQLState])
+	if len(rows) != 2 || rows[0] != "1\talpha\n" || rows[1] != "2\tbeta\n" {
+		t.Fatalf("after STDIN-in-batch, COPY TO sees %v want [\"1\\talpha\\n\" \"2\\tbeta\\n\"]", rows)
 	}
-	if strings.Contains(got[protocol.FieldMessage], "no executor path") {
-		t.Errorf("message leaked internal text: %q", got[protocol.FieldMessage])
+}
+
+// TestCopyFromStdinInBatchAbortsOnFail: a CopyFail mid-batch surfaces a clean
+// ERROR (57014) + ReadyForQuery and aborts the rest of the batch — no second
+// RFQ, no internal leak. M0097-0024.
+func TestCopyFromStdinInBatchAbortsOnFail(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	r := protocol.NewFrameReader(conn)
+	next := func() protocol.Frame {
+		t.Helper()
+		f, err := r.ReadFrame()
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		return f
 	}
-	if !strings.Contains(got[protocol.FieldMessage], "COPY FROM STDIN") {
-		t.Errorf("message=%q want COPY-FROM-STDIN deferral", got[protocol.FieldMessage])
+
+	writeQuery(t, conn, "select 0; copy items from stdin; select 1;")
+	// select 0 → T, D, C.
+	if f := next(); f.Type != protocol.MsgRowDescription {
+		t.Fatalf("frame=%q want T", f.Type)
+	}
+	if f := next(); f.Type != protocol.MsgDataRow {
+		t.Fatalf("frame=%q want D", f.Type)
+	}
+	if f := next(); f.Type != protocol.MsgCommandComplete {
+		t.Fatalf("frame=%q want C", f.Type)
+	}
+	if f := next(); f.Type != protocol.MsgCopyInResponse {
+		t.Fatalf("frame=%q want G", f.Type)
+	}
+	writeFrontendFrame(t, conn, protocol.MsgCopyFail, append([]byte("client gave up"), 0))
+
+	ef := next()
+	if ef.Type != protocol.MsgErrorResponse {
+		t.Fatalf("frame=%q want E", ef.Type)
+	}
+	got := parseErrorFields(t, ef.Payload)
+	if !strings.Contains(got[protocol.FieldMessage], "client gave up") {
+		t.Errorf("message=%q want CopyFail message", got[protocol.FieldMessage])
+	}
+	// The batch aborts: a single RFQ closes the message, and select 1 never runs.
+	if f := next(); f.Type != protocol.MsgReadyForQuery {
+		t.Fatalf("frame=%q want Z (single trailing RFQ, batch aborted)", f.Type)
 	}
 }

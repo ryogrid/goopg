@@ -1164,18 +1164,47 @@ M0097-0001 wires it up.
         copy(…)`, and `copy(…)\; copy(…)\; select 3\; select 4` match PG
         byte-for-byte. Design:
         `docs/design/0097-0024e-copy-in-multi-statement-batch.md`.
-      - **Remaining copyselect gap (one feature, next COPY wins):**
-        1. COPY FROM STDIN inside a multi-statement `\;` batch (the
-           `select 0\; copy test3 from stdin\; copy test3 from stdin\; select 1`
-           shape with `\.`-terminated data blocks). Now emits a clean
-           `0A000 "COPY FROM STDIN is not supported inside a multi-statement
-           query"` (no internal leak), but full support needs synchronous
-           CopyData reads interleaved with the statement loop: thread the
-           `FrameReader` down into `dispatchSimpleQueryViaExecutor` and add a
-           batch-aware CopyData/CopyDone path (the single-COPY route drives this
-           via the connection's `copyInState`, whose `handleCopyInFrame` writes
-           its own RFQ on CopyDone — incompatible with mid-batch). This is the
-           only remaining `copyselect` gap.
+      - **Progress 2026-05-25 (loop — COPY FROM STDIN in multi-statement
+        `\;` batch):** CLOSED the COPY-FROM-STDIN-in-batch gap (the
+        `select 0\; copy test3 from stdin\; copy test3 from stdin\; select 1`
+        shape with `\.`-terminated data blocks). The single-COPY path drives
+        CopyData/CopyDone via the connection's `copyInState` +
+        `handleCopyInFrame`, which writes its own RFQ on CopyDone —
+        incompatible with a mid-batch COPY that must write only
+        CommandComplete. Fix: thread the connection's `*protocol.FrameReader`
+        (`r`) down `handleQueryOrCopy → handleQuery →
+        dispatchSimpleQueryViaExecutor → runInlineCopy`; the STDIN branch calls
+        new `runInlineCopyFromStdin` (`internal/server/copy.go`) which writes
+        `CopyInResponse` + flush, then reads CopyData/CopyDone/CopyFail
+        synchronously from `r`, pushes text/binary rows through the
+        `CopyFromExecutor` (skipping the `\.` EOD marker), and writes only
+        `CommandComplete "COPY n"` — **no commit, no RFQ** (the COPY shares the
+        batch's shared txn `ectx.Tx`, committed once at the end of the dispatch
+        loop, which also emits the single trailing RFQ). CopyFail / decode
+        errors → `writeQueryError(57014/…)` + `errQueryErrorSent` aborts the
+        rest of the batch. Safe because the main read loop is parked in
+        `handleQueryOrCopy` for the batch's duration (no second consumer of
+        `r`). Tests: `TestCopyFromStdinInMultiStatementBatch`,
+        `TestCopyFromStdinInBatchAbortsOnFail`
+        (`internal/server/copy_executor_test.go`; replaces the old
+        `TestCopyFromStdinInBatchDeferred`). Verified end-to-end via
+        `GOOPG_REGRESS_DIFF_DIR`: the `copyselect` STDIN-batch block now matches
+        PG byte-for-byte (`select * from test3` → rows `1`, `2`). Design:
+        `docs/design/0097-0024f-copy-from-stdin-in-multi-statement-batch.md`.
+      - **Remaining copyselect gap (one feature, 2 diff lines — next COPY
+        wins):**
+        1. The parenthesised-query COPY form does not accept the bare
+           (non-`WITH`) legacy option trail. `copy (select t from test1 where
+           id = 1) to stdout csv header force quote t` fails in the parser (the
+           query form's trailing-clause handling stops at `csv` →
+           `expected ';' or end of input (got csv)`), so the CSV `t` header line
+           and the `"a"` force-quoted value are missing from the output (the
+           sole remaining 2-line `copyselect` diff). `COPY (query) TO STDOUT
+           WITH (format csv, header, force_quote (t))` parses fine. Closing this
+           needs (a) the parenthesised-query form to accept
+           `parseCopyLegacyTrail` plus the legacy `FORCE QUOTE <cols>` syntax,
+           and (b) CSV `HEADER` output + `FORCE_QUOTE` rendering in the COPY-TO
+           executor. This is the only remaining `copyselect` gap.
 
 - [ ] **M0097-0025 — Port view / MV / rules regress tests**
       - Summary: Make these 5 tests reach `pass`:
