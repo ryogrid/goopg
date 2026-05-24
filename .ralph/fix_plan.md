@@ -1050,13 +1050,27 @@ M0097-0001 wires it up.
         `guc` unchanged at 592. Tests: `TestVerboseIntervalOffset`,
         `TestPgTimezoneAbbrevsLMTRow`. Design:
         `docs/design/0097-0032b-timezone-abbreviations-guc-and-verbose-offset.md`.
-      - **Remaining sysviews gaps (33 diff lines, separate subsystems):**
+      - **Progress 2026-05-25 (loop — pg_wait_events + COLLATE):** Closed the
+        `pg_wait_events` query gap. Two defects: (1) the parser had no general
+        `a_expr COLLATE any_name` production, so `ORDER BY type COLLATE "C"`
+        raised `syntax error ... (got collate)` — `COLLATE` was only consumed
+        ad-hoc in DDL/`ON CONFLICT` target contexts. Fixed by adding a
+        high-precedence postfix in `parseExprPrec` (`internal/parser/select.go`,
+        alongside `::`/`[...]`) that consumes+discards the collation reference
+        (correct for `"C"`/`"POSIX"` == byte order == Go string comparison;
+        new helper `skipCollationName` handles qualified names — works in
+        ORDER BY, target list, WHERE). (2) goopg's `pg_wait_events` virtual
+        table (`internal/catalog/catalog.go`) listed only 6 types; PG 18 emits
+        9 — added `BufferPin`, `Extension`, `IPC` rows (canonical names from
+        `wait_event_names.txt`). Query now returns the exact 9 expected rows
+        (verified end-to-end on port 5533). Tests: `TestParseCollatePostfix`,
+        `TestPgWaitEventsCoversAllTypes`. Design:
+        `docs/design/0097-0032c-collate-postfix-and-wait-event-types.md`.
+      - **Remaining sysviews gaps (separate subsystems):**
         `pg_backend_memory_contexts` introspection (`TopMemoryContext
         total_bytes >= free_bytes`, Bump-context + `CacheMemoryContext` child
-        rows — a Go-runtime design constraint), `pg_hba_file_rules` `no_err`
-        FILTER (errors column non-null), and the `pg_wait_events`
-        `group by type order by type COLLATE "C"` SRF query (errors instead of
-        returning 9 wait-event-type rows).
+        rows — a Go-runtime design constraint), and `pg_hba_file_rules` `no_err`
+        FILTER (errors column non-null).
 
 - [ ] **M0097-0033 — Port test_setup regress test**
       - Summary: Make `test_setup` reach `pass`.

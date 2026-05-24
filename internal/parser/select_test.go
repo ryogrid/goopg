@@ -117,6 +117,26 @@ func TestParseSelectOrderLimitOffset(t *testing.T) {
 	}
 }
 
+// TestParseCollatePostfix: `COLLATE name` is a high-precedence postfix
+// valid anywhere an expression appears — ORDER BY, target list, and
+// WHERE. goopg discards the collation reference, so these must parse
+// without error (regression for the sysviews `order by type COLLATE "C"`
+// failure, M0097-0032). Covers quoted, qualified, and bare names.
+func TestParseCollatePostfix(t *testing.T) {
+	cases := []string{
+		`SELECT type FROM pg_wait_events ORDER BY type COLLATE "C"`,
+		`SELECT a COLLATE "C" AS x FROM t`,
+		`SELECT a FROM t WHERE a > 'A' COLLATE "C"`,
+		`SELECT a FROM t ORDER BY a COLLATE pg_catalog."C" DESC`,
+		`SELECT a FROM t ORDER BY a COLLATE en_US`,
+	}
+	for _, in := range cases {
+		if _, err := Parse(in); err != nil {
+			t.Errorf("Parse(%q) failed: %v", in, err)
+		}
+	}
+}
+
 func TestParseSelectJoins(t *testing.T) {
 	in := "SELECT a.id FROM t1 a INNER JOIN t2 b ON a.id = b.id LEFT JOIN t3 c USING (id) CROSS JOIN t4 d"
 	stmts, err := Parse(in)

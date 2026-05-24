@@ -536,3 +536,33 @@ func TestPgTimezoneAbbrevsLMTRow(t *testing.T) {
 		}
 	}
 }
+
+// TestPgWaitEventsCoversAllTypes guards the sysviews regress expectation:
+// `select type, count(*) > 0 ... from pg_wait_events group by type` must
+// return all nine non-InjectionPoint wait-event types PG 18 emits
+// (M0097-0032). goopg previously listed only six (missing BufferPin,
+// Extension, IPC), so the GROUP BY came up short.
+func TestPgWaitEventsCoversAllTypes(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_wait_events"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_wait_events virtual table not registered")
+	}
+	want := map[string]bool{
+		"Activity": false, "BufferPin": false, "Client": false,
+		"Extension": false, "IO": false, "IPC": false,
+		"LWLock": false, "Lock": false, "Timeout": false,
+	}
+	for _, row := range tbl.VirtualRows() {
+		typ := row[0]
+		if _, known := want[typ]; !known && typ != "InjectionPoint" {
+			t.Errorf("unexpected wait-event type %q (not in PG 18 sysviews set)", typ)
+		}
+		want[typ] = true
+	}
+	for typ, present := range want {
+		if !present {
+			t.Errorf("pg_wait_events missing type %q", typ)
+		}
+	}
+}

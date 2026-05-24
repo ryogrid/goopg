@@ -1561,6 +1561,12 @@ func (c *InMemory) registerSystemTables() {
 			{"Timeout", "SpinDelay", "Waiting while acquiring a contended spinlock."},
 			{"Timeout", "VacuumDelay", "Waiting in a cost-based vacuum delay point."},
 			{"Timeout", "VacuumTruncate", "Waiting to acquire an exclusive lock to truncate off any empty pages at the end of a table vacuumed."},
+			{"BufferPin", "BufferPin", "Waiting to acquire an exclusive pin on a buffer."},
+			{"Extension", "Extension", "Waiting in an extension."},
+			{"IPC", "AppendReady", "Waiting for subplan nodes of an Append plan node to be ready."},
+			{"IPC", "BackendTermination", "Waiting for the termination of another backend."},
+			{"IPC", "BgWorkerShutdown", "Waiting for background worker to shut down."},
+			{"IPC", "BgWorkerStartup", "Waiting for background worker to start up."},
 		}
 	}
 	c.tables["pg_catalog.pg_wait_events"] = pgWaitEvents

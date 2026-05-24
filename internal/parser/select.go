@@ -838,6 +838,22 @@ func (p *parser) parseSortList() ([]SortBy, error) {
 	return out, nil
 }
 
+// skipCollationName consumes a (possibly schema-qualified) collation
+// name following the COLLATE keyword, e.g. `"C"`, `pg_catalog."C"`, or
+// `en_US`. The reference is discarded — goopg has no non-default
+// collation support (see the COLLATE postfix in parseExprPrec).
+func (p *parser) skipCollationName() error {
+	if _, err := p.parseIdent(); err != nil {
+		return err
+	}
+	for p.acceptSymbol(".") {
+		if _, err := p.parseIdent(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (p *parser) parseSortItem() (SortBy, error) {
 	pos := p.cur().Pos
 	e, err := p.parseExpr()
@@ -909,6 +925,21 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				return nil, p.errAtCur("expected ']' after array subscript")
 			}
 			left = &ArraySubscriptExpr{pos: pos, Base: left, Index: idx}
+			continue
+		}
+		// `expr COLLATE collation_name` — a high-precedence postfix in
+		// PG's grammar (`a_expr COLLATE any_name`), valid anywhere an
+		// expression appears: target lists, WHERE, ORDER BY, etc. goopg
+		// has no non-default collation machinery, so we consume the
+		// collation reference and leave the operand unchanged. This is
+		// exactly correct for `"C"`/`"POSIX"` (byte order == Go's default
+		// string comparison) and matches the collation-skipping already
+		// done in DDL/conflict-target parsing.
+		if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "collate") {
+			p.advance() // consume COLLATE
+			if err := p.skipCollationName(); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		// `expr [NOT] IN (...)` is a postfix-style construct at
