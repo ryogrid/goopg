@@ -1281,6 +1281,31 @@ M0097-0001 wires it up.
         which agrees whenever the USING col is the leading col of the left
         table (every affected regress case). Design:
         `docs/design/0097-0036b-star-using-join-merge.md`.
+      - **Progress 2026-05-25 (loop — TID type input validation/output):**
+        Closed the entire TID *data-type* portion of the `tid` regress test.
+        goopg's `'…'::tid` cast was a no-op string passthrough (`evalCast`,
+        `internal/executor/expr.go`, fell through to the unknown-type return),
+        so `'(-1,0)'::tid` printed `(-1,0)` not PG's unsigned `(4294967295,0)`,
+        out-of-range `'(4294967296,1)'`/`'(1,65536)'` were silently accepted,
+        and `pg_input_is_valid`/`pg_input_error_info` reported `tid` as always
+        valid. Implemented faithful `tidin` semantics
+        (`postgres/src/backend/utils/adt/tid.c`): new `cStrtoul10Full` (C
+        `strtoul` base-10 + full-consumption + negative wrap) and
+        `parseTidInput` (block = `uint32` `BlockNumber` via the `SIZEOF_LONG > 4`
+        round-trip guard — `-1`→`4294967295`, `4294967296` rejected; offset =
+        `uint16` ≤ `USHRT_MAX`). The `::tid` cast, `pg_input_is_valid`, and
+        `pg_input_error_info` all route through the single `parseTidInput`
+        helper (sibling-paths-must-agree). Tests: `TestParseTidInput`,
+        `TestEvalCastTidNormalizesAndValidates`
+        (`internal/executor/tid_cast_test.go`). `tid` normalized diff **81 → 47
+        lines** (verified end-to-end via `GOOPG_REGRESS_DIFF_DIR`). Design:
+        `docs/design/0097-0036c-tid-input-validation.md`.
+      - **Remaining tid gaps (47 diff lines, separate features):** TID
+        *handling*, not type I/O — `min(ctid)`/`max(ctid)` aggregates over real
+        heap ctids, the `currtid2()` builtin (latest-visible-tid with
+        relkind-specific errors), and `ctid` system-column access on
+        views/indexes/sequences. Each is a distinct heap/relcache/builtin
+        feature.
       - **Baseline note (updated 2026-05-24):** `regress-diff-baseline.csv` now
         reflects the M0111 codec recoveries (17 pass; `numerology` correctly
         `pass`); this loop updated `copyselect` (69→59) and `join` (10246→9933).

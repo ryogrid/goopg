@@ -1314,8 +1314,103 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return NewTimeDatum(ts), nil
 		}
 		return d, nil
+	case "tid":
+		// Cast to tid: parse/validate "(block,offset)" and re-emit the
+		// canonical form. PostgreSQL's tidin treats block as an unsigned
+		// 32-bit BlockNumber (so '(-1,0)' normalises to '(4294967295,0)')
+		// and offset as an unsigned 16-bit OffsetNumber. M0097-0036.
+		if d.Kind == KindString {
+			block, offset, ok := parseTidInput(d.StringValue())
+			if !ok {
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type tid: %q", d.StringValue())}
+			}
+			return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
+		}
+		return d, nil
 	}
 	return d, nil // pass-through for unknown types
+}
+
+// cStrtoul10Full emulates C strtoul(s, &end, 10) followed by PostgreSQL's
+// "fully consumed" check used in tidin: it skips leading C whitespace, accepts
+// an optional +/- sign, then base-10 digits, and requires the digits to run to
+// the end of s (so any trailing junk before the delimiter is rejected, matching
+// "*badp != DELIM"). Negative inputs wrap modulo 2^64 like C unsigned
+// arithmetic. ok is false when no digits were present or trailing junk remains;
+// overflow is true when the magnitude exceeds 64 bits (C would set ERANGE).
+func cStrtoul10Full(s string) (val uint64, ok bool, overflow bool) {
+	i := 0
+	for i < len(s) {
+		switch s[i] {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
+			i++
+			continue
+		}
+		break
+	}
+	neg := false
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		neg = s[i] == '-'
+		i++
+	}
+	start := i
+	var v uint64
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		nv := v*10 + uint64(s[i]-'0')
+		if nv < v {
+			overflow = true
+		}
+		v = nv
+		i++
+	}
+	if i == start || i != len(s) {
+		return 0, false, false
+	}
+	if neg {
+		v = -v // two's-complement negation modulo 2^64
+	}
+	return v, true, overflow
+}
+
+// parseTidInput parses a tid external representation "(block,offset)" exactly
+// as PostgreSQL's tidin (src/backend/utils/adt/tid.c): block is a BlockNumber
+// (uint32) accepted via strtoul with the wider-than-32-bit round-trip guard
+// (so '-1' → 4294967295 but '4294967296' is rejected), and offset is an
+// OffsetNumber (uint16) bounded by USHRT_MAX. Returns ok=false on any malformed
+// or out-of-range input. M0097-0036.
+func parseTidInput(str string) (block uint32, offset uint16, ok bool) {
+	lp := strings.IndexByte(str, '(')
+	if lp < 0 {
+		return 0, 0, false
+	}
+	rest := str[lp+1:]
+	comma := strings.IndexByte(rest, ',')
+	if comma < 0 {
+		return 0, 0, false
+	}
+	offPart := rest[comma+1:]
+	rp := strings.IndexByte(offPart, ')')
+	if rp < 0 {
+		return 0, 0, false
+	}
+
+	bcvt, bok, bovf := cStrtoul10Full(rest[:comma])
+	if !bok || bovf {
+		return 0, 0, false
+	}
+	block = uint32(bcvt)
+	// PG's SIZEOF_LONG > 4 guard: accept only values that round-trip through
+	// either the unsigned or sign-extended 32-bit truncation.
+	if bcvt != uint64(block) && bcvt != uint64(int64(int32(block))) {
+		return 0, 0, false
+	}
+
+	ocvt, ook, oovf := cStrtoul10Full(offPart[:rp])
+	if !ook || oovf || ocvt > 65535 {
+		return 0, 0, false
+	}
+	return block, uint16(ocvt), true
 }
 
 // parseXid parses an xid value (unsigned 32-bit). Accepts decimal, octal (0NNN), hex (0xNNN).
@@ -2785,6 +2880,9 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewBoolDatum(msg == ""), nil
 			case "uuid":
 				return NewBoolDatum(isValidUUIDStr(v)), nil
+			case "tid":
+				_, _, ok := parseTidInput(v)
+				return NewBoolDatum(ok), nil
 			case "xid":
 				_, err := parseXid(v)
 				return NewBoolDatum(err == nil), nil
