@@ -7,6 +7,7 @@ int2,0,pass
 int4,0,pass
 md5,0,pass
 mvcc,0,pass
+numerology,0,pass
 oid,0,pass
 portals_p2,0,pass
 reindex_catalog,0,pass
@@ -18,7 +19,6 @@ varchar,0,pass
 functional_deps,24,failed
 copydml,44,failed
 errors,60,failed
-numerology,60,failed
 copyselect,69,failed
 hash_part,73,failed
 sysviews,73,failed
@@ -72,7 +72,7 @@ guc,592,failed
 update,596,failed
 misc_functions,602,failed
 identity,663,failed
-float4,680,failed
+float4,676,failed
 explain,696,failed
 insert,699,failed
 fast_default,729,failed
@@ -84,8 +84,8 @@ int8,919,failed
 domain,932,failed
 jsonpath,940,failed
 indexing,972,failed
+float8,1027,failed
 rowtypes,1030,failed
-float8,1031,failed
 constraints,1039,failed
 portals,1089,failed
 union,1097,failed

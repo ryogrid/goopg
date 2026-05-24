@@ -1127,8 +1127,7 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("invalid timetz micros")
 		}
 		return NewTimeDatum(pgTimeFromMicros(micros)), 12, nil
-	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown",
-		"float4", "real", "float8", "double precision", "double":
+	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown":
 		// PG external/on-disk TOAST reference: short varlena header 0x1B
 		// (VARATT_IS_EXTERNAL_ONDISK) followed by a 12-byte pointer.
 		// Recognise it before the general varlena decode so the Datum
@@ -1140,9 +1139,6 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return NewToastPointerDatum(ptr), 13, nil
 		}
 
-		// goopg stores float4/float8 as varlena text for v0 compatibility.
-		// PG-native binary float decode (4/8-byte IEEE 754 LE) is deferred
-		// to a follow-up.  M0111-0002.
 		payload, n, err := decodePhysicalPGVarlena(data)
 		if err != nil {
 			return Datum{}, 0, err
@@ -1152,6 +1148,28 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return newStringArenaDatum(sctx, moff, mlen), n, nil
 		}
 		return NewStringDatum(string(payload)), n, nil
+	case "float4", "real", "float8", "double precision", "double":
+		// goopg stores float4/float8 as varlena text for v0 compatibility.
+		// Decode the text payload back into KindNumeric (NaN/Inf fall back
+		// to KindString) so numeric ORDER BY and comparison behave
+		// correctly. Returning KindString here — as the shared text case
+		// used to — sorted float columns lexicographically; this mirrors
+		// the legacy decodeValue / arena decoders. M0111-0006: regression
+		// of the M0097-0003 KindNumeric decode, lost when M0111-0002
+		// switched float storage to varlena text in this PG-physical path.
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, err
+		}
+		text := string(payload)
+		if v, scale, ok := parseNumericFast(text); ok {
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, n, nil
+		}
+		if m, s, perr := parseNumeric(text); perr == nil {
+			return newNumeric(m, int(s)), n, nil
+		}
+		// NaN / Infinity / other non-decimal text falls back to string.
+		return NewStringDatum(text), n, nil
 	case "bytea":
 		payload, n, err := decodePhysicalPGVarlena(data)
 		if err != nil {

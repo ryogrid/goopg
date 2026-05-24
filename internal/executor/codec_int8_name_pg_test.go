@@ -106,3 +106,54 @@ func TestEncodeValuePGInt2OutOfRangeMessage(t *testing.T) {
 		t.Fatalf("encodeValuePG(int2, '32767'): unexpected error %v", err)
 	}
 }
+
+// TestDecodePhysicalPGFloatKind pins the M0111-0006 fix: float4/float8 values
+// stored as varlena text must decode back to KindNumeric (not KindString) so
+// that ORDER BY / comparison are numeric. Before the fix the PG-physical
+// decoder lumped floats in with the text case and returned KindString, so a
+// float8 column sorted lexicographically (e.g. -1234 ahead of -2147483647) —
+// the residual failure in the numerology regress case. The legacy decoders
+// already returned KindNumeric; this restores parity in the PG-native path
+// that became the primary read path in M0111-0001.
+func TestDecodePhysicalPGFloatKind(t *testing.T) {
+	for _, name := range []string{"float4", "real", "float8", "double precision", "double"} {
+		typ := catalog.Type{Name: name}
+		for _, v := range []int64{0, 1234, -2147483647, 123456, -32767} {
+			enc, err := encodeValuePG(typ, NewIntDatum(v))
+			if err != nil {
+				t.Fatalf("encodeValuePG(%s, %d): %v", name, v, err)
+			}
+			got, _, err := decodePhysicalPGValueMctx(typ, enc, nil)
+			if err != nil {
+				t.Fatalf("decodePhysicalPGValueMctx(%s, %d): %v", name, v, err)
+			}
+			if got.Kind != KindNumeric {
+				t.Fatalf("%s decode kind=%v, want KindNumeric (string sort regression)", name, got.Kind)
+			}
+		}
+	}
+
+	// Comparison proof: -1234 vs -123456 sort the wrong way under string
+	// comparison ("-1234" < "-123456") but correctly under numeric
+	// comparison (-1234 > -123456). Decode both as float8 and assert the
+	// numeric ordering holds.
+	typ := catalog.Type{Name: "float8"}
+	decode := func(v int64) Datum {
+		enc, err := encodeValuePG(typ, NewIntDatum(v))
+		if err != nil {
+			t.Fatalf("encodeValuePG(float8, %d): %v", v, err)
+		}
+		d, _, err := decodePhysicalPGValueMctx(typ, enc, nil)
+		if err != nil {
+			t.Fatalf("decodePhysicalPGValueMctx(float8, %d): %v", v, err)
+		}
+		return d
+	}
+	cmp, err := compareDatum(decode(-1234), decode(-123456), 0)
+	if err != nil {
+		t.Fatalf("compareDatum(-1234, -123456): %v", err)
+	}
+	if cmp <= 0 {
+		t.Fatalf("compareDatum(-1234, -123456) = %d, want > 0 (lexicographic regression)", cmp)
+	}
+}

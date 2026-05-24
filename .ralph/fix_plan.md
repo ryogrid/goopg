@@ -806,6 +806,32 @@ M0097-0001 wires it up.
         6 M0106-codec regressions, only `name` (77) and `numerology` (60) remain
         (their residual diffs are unrelated to int2/int4/int8/name-codec).
         Baseline + inventory CSVs updated, coverage md regenerated.
+      - **Recovery 2026-05-24 (M0111-0006 — numerology):** Recovered the
+        `numerology` regress case (`failed`, 60 diff lines → **pass**), the last
+        of the 6 M0106-codec regressions besides `name`. Root cause was NOT a
+        normalization issue but a `KindString`-vs-`KindNumeric` decode bug:
+        `decodePhysicalPGValueMctx` (`internal/executor/codec.go`) lumped
+        `float4`/`float8`/`real`/`double precision` into the shared
+        `text`/`varchar` decode case, which returns `KindString`. Because goopg
+        stores floats as varlena text (M0111-0002) and this PG-native decoder
+        is the *primary* heap-read path since M0111-0001, float columns sorted
+        **lexicographically** (`SELECT f1 FROM TEMP_FLOAT ORDER BY f1` put
+        `-1234` ahead of `-2147483647`). The legacy `decodeValue`/arena decoders
+        always parsed float text to `KindNumeric` (M0097-0003 "for correct
+        ORDER BY numeric sort"); the PG-native path lost it. Fix: dedicated float
+        case parsing the varlena-text payload to `KindNumeric` (NaN/Inf →
+        `KindString` fallback). Display unaffected — float8 output is keyed on
+        column type (`%.15g`), not Datum kind, so `1.2345678901234e+200`
+        round-trips. `float4` 680→676, `float8` 1031→1027; no regression in
+        int2/int4/etc. Test: `TestDecodePhysicalPGFloatKind`
+        (`internal/executor/codec_int8_name_pg_test.go`). Design:
+        `docs/design/0111-0006-pg-format-float-decode-kind.md`. Baseline +
+        inventory CSVs updated, coverage md regenerated (16 pass now). Lesson
+        (same class as M0111-0004): after a codec change, audit that each type's
+        decode produces the **Kind** the comparison/sort layer expects — a float
+        decoded as `KindString` round-trips and displays fine, so it's wrong
+        only for ordering and escapes round-trip tests. Remaining codec
+        regression: `name` (77 diff lines, unrelated to float/int codec).
       - **Recovery 2026-05-24 (M0097-0037 — int4 + int2):** Root-caused the
         remaining int2/int4 regression to the **M0107-0003 compiled fast-path
         expression evaluator**, not the codec (the M0106-0010 attribution above
