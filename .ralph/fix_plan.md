@@ -791,6 +791,33 @@ M0097-0001 wires it up.
         decode arm loses rows with NO error. Remaining int8 follow-ups:
         `KindNumeric → int8` encode (huge literals) and string-literal INSERT
         coercion for timestamp/date/xid columns.
+      - **Recovery 2026-05-24 (M0097-0037 — int4 + int2):** Root-caused the
+        remaining int2/int4 regression to the **M0107-0003 compiled fast-path
+        expression evaluator**, not the codec (the M0106-0010 attribution above
+        was wrong for these two). `evalFastExpr`'s `ExprBinaryOp` case
+        (`internal/executor/exprnode.go`) called `evalBinary` but omitted the
+        int2/int4 overflow range check that the interpreted `evalExprSlot`
+        applies — and the compiled node never stored `ResultType` — so a
+        *projected* `int2*int2` / `int4*int4` silently returned the
+        out-of-range value (e.g. `65534`) instead of raising `22003`. (The
+        interpreted path overflowed correctly, so `pg_typeof(expr)` — which
+        routes through `evalExprSlot` — masked the bug.) Fix: `ExprBinaryOp`
+        carries an overflow code in `payload[1]` (`overflowCodeForType`) and
+        `evalFastExpr` applies the same `smallint/integer out of range` check;
+        float-typed `BinaryOp`s now compile to `ExprAdapter` (float64 parity).
+        **`int4` → pass** (verified: fails at HEAD c64e5c2 without this change,
+        passes with it — independent of the codec fix). `int2` 44 → 4 diff
+        lines; residual 4 are a *separate pre-existing* bug: `INSERT INTO
+        INT2_TBL VALUES ('100000')` reports `smallint out of range` instead of
+        `value "100000" is out of range for type smallint` — next int2 win.
+        `int8` keeps the no-check fast path (matches `evalExprSlot`). Design:
+        `docs/design/0097-0037-fast-path-int-overflow.md`. Tests:
+        `TestEvalFastExprIntOverflow`, `TestBuildExprFloatFallsBackToAdapter`
+        in `internal/executor/phase_c_test.go`. Coverage md now 14 pass.
+        Lesson: the compiled fast-path evaluator (`evalFastExpr`) must mirror
+        EVERY post-arithmetic check in `evalExprSlot` (overflow, float
+        formatting); a missing check is invisible to expression unit tests that
+        use the interpreted path and only surfaces end-to-end.
 
 - [ ] **M0097-0020 — Port SELECT / DML / JOIN / subquery / CTE regress tests**
       - Summary: Make these 15 tests reach `pass` status:

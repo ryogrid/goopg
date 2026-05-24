@@ -1257,3 +1257,78 @@ func TestProjectStateNoSchemaField(t *testing.T) {
 		t.Error("opTreeSlab.schemas must be non-empty after building a project plan")
 	}
 }
+
+// TestEvalFastExprIntOverflow is a regression test for the M0107-0003 fast
+// expression evaluator silently skipping integer-overflow detection. The
+// compiled ExprBinaryOp path now carries an overflow code (payload[1]) and
+// applies the same int2/int4 range checks evalExprSlot does. Without the fix,
+// `int2 32767 * int2 2` returned 65534 instead of raising "smallint out of
+// range" — regressing the int2/int4 pg_regress cases.
+func TestEvalFastExprIntOverflow(t *testing.T) {
+	mkBinOp := func(op parser.OpCode, l, r int64, resultType string) *planner.BinaryOp {
+		return &planner.BinaryOp{
+			Op:         op,
+			Left:       &planner.IntegerConst{Value: l},
+			Right:      &planner.IntegerConst{Value: r},
+			ResultType: resultType,
+		}
+	}
+	emptySlot := &Slot{HasRow: true}
+
+	cases := []struct {
+		name       string
+		expr       *planner.BinaryOp
+		wantErr    bool
+		wantErrMsg string
+		wantVal    int64
+	}{
+		{"int2_mul_overflow", mkBinOp(parser.OpMul, 32767, 2, "int2"), true, "smallint out of range", 0},
+		{"int2_add_overflow", mkBinOp(parser.OpAdd, 32767, 2, "smallint"), true, "smallint out of range", 0},
+		{"int2_sub_overflow", mkBinOp(parser.OpSub, -32767, 2, "int2"), true, "smallint out of range", 0},
+		{"int2_in_range", mkBinOp(parser.OpMul, 100, 3, "int2"), false, "", 300},
+		{"int4_mul_overflow", mkBinOp(parser.OpMul, 2147483647, 2, "int4"), true, "integer out of range", 0},
+		{"int4_in_range", mkBinOp(parser.OpMul, 100000, 2, "integer"), false, "", 200000},
+		// No ResultType (e.g. int8 / unresolved): no range check, value passes through.
+		{"int8_no_check", mkBinOp(parser.OpMul, 2147483647, 2, "int8"), false, "", 4294967294},
+		{"untyped_no_check", mkBinOp(parser.OpMul, 32767, 2, ""), false, "", 65534},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var slab exprTreeSlab
+			idx := slab.buildExpr(tc.expr)
+			d, err := evalFastExpr(slab, idx, emptySlot, nil)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("%s: want error %q, got value %d", tc.name, tc.wantErrMsg, d.Int)
+				}
+				if ee, ok := err.(*ExecError); !ok || ee.Message != tc.wantErrMsg {
+					t.Fatalf("%s: want ExecError %q, got %v", tc.name, tc.wantErrMsg, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%s: unexpected error: %v", tc.name, err)
+			}
+			if d.Kind != KindInt || d.Int != tc.wantVal {
+				t.Fatalf("%s: want KindInt(%d), got Kind=%d val=%d", tc.name, tc.wantVal, d.Kind, d.Int)
+			}
+		})
+	}
+}
+
+// TestBuildExprFloatFallsBackToAdapter verifies float-typed BinaryOps are
+// compiled to ExprAdapter so evalExprSlot's float64 arithmetic path handles
+// them (the fast path's exact arithmetic diverges from PostgreSQL float8).
+func TestBuildExprFloatFallsBackToAdapter(t *testing.T) {
+	var slab exprTreeSlab
+	e := &planner.BinaryOp{
+		Op:         parser.OpAdd,
+		Left:       &planner.ColumnRef{Index: 0},
+		Right:      &planner.IntegerConst{Value: 1},
+		ResultType: "float8",
+	}
+	idx := slab.buildExpr(e)
+	if slab[idx].Kind != ExprAdapter {
+		t.Fatalf("float8 BinaryOp: want ExprAdapter, got Kind=%d", slab[idx].Kind)
+	}
+}

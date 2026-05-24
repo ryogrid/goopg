@@ -3,6 +3,7 @@ boolean,0,pass
 char,0,pass
 comments,0,pass
 delete,0,pass
+int4,0,pass
 md5,0,pass
 mvcc,0,pass
 oid,0,pass
@@ -13,9 +14,9 @@ select_implicit,0,pass
 test_setup,0,excluded
 time,0,pass
 varchar,0,pass
+int2,4,failed
 functional_deps,24,failed
 copydml,44,failed
-int2,44,failed
 errors,60,failed
 numerology,60,failed
 copyselect,69,failed
@@ -23,7 +24,6 @@ hash_part,73,failed
 sysviews,73,failed
 name,77,failed
 tid,81,failed
-int4,84,failed
 hash_index,96,failed
 index_including_gist,112,failed
 expressions,118,failed
