@@ -1203,14 +1203,20 @@ type Copy struct {
 func (n *Copy) Pos() int       { return n.pos }
 func (n *Copy) Output() Schema { return n.schema }
 
-// SetOp represents a UNION [ALL] set operation. v0 supports UNION ALL
-// only; UNION DISTINCT, INTERSECT, and EXCEPT are rejected by the
-// analyzer.
+// SetOp represents a UNION / INTERSECT / EXCEPT set operation, with an
+// optional ALL modifier. UNION ALL streams the two children back-to-back;
+// all other variants buffer and apply multiset semantics in the executor
+// (operators_setop.go). M0097-0024.
 type SetOp struct {
 	pos   int
 	Left  Node
 	Right Node
-	All   bool
+	// Op is the set-operation kind (UNION / INTERSECT / EXCEPT).
+	// The zero value (parser.SetOpUnion) keeps the implicit
+	// partition/inheritance UNION ALL construction sites working
+	// without an explicit Op assignment.
+	Op  parser.SetOpType
+	All bool
 }
 
 func (n *SetOp) Pos() int       { return n.pos }

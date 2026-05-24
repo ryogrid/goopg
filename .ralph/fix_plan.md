@@ -1017,12 +1017,36 @@ M0097-0001 wires it up.
         view-rejection lines are gone from `copyselect`. Test:
         `TestPlanCopyViewRejected` (`internal/planner/copy_test.go`).
         Design: `docs/design/0097-0009b-copy-from-view-rejection.md`.
-      - **Remaining copyselect gaps (independent larger features):**
-        `UNION`/set operations inside `COPY (SELECT …)` (v0 planner rejects
-        set ops), `COPY (SELECT … INTO …)` rejection, `COPY (query) FROM`
-        rejection wording, and psql multi-command `\;`/`\.` STDIN handling
-        (`expected exactly one COPY statement`; internal "planner.Copy has
-        no executor path yet" leak on `select 1/0\; copy …`).
+      - **Progress 2026-05-25 (loop — top-level set operations):**
+        Implemented `UNION`/`INTERSECT`/`EXCEPT` (with optional `ALL`); the
+        planner/analyzer previously accepted only `UNION ALL` (everything
+        else returned `0A000`). `SetOp` plan node gains `Op parser.SetOpType`
+        (zero value `SetOpUnion` keeps implicit partition/inheritance UNION
+        ALL sites untouched); `planSelect` validates equal column counts
+        (`42601`) and `wrapSetOpSortLimit` applies a trailing
+        `ORDER BY`/`LIMIT`/`OFFSET` resolved against the combined output
+        (positional → `ColumnRef`, out-of-range `42P10`; or output column
+        name) — the `copyselect` `… UNION … ORDER BY 1` shape. Executor
+        `setOp` keeps UNION ALL streaming (preserves `currentTID` for FOR
+        UPDATE partition scans) and buffers the rest with multiset semantics
+        keyed by `rowKey`. Tests: `TestSetOpMultisetSemantics`,
+        `TestSetOpOrderByPosition`; analyzer/planner reject-tests updated.
+        Verified live incl. `COPY (… UNION … ORDER BY 1) TO STDOUT`.
+        Design: `docs/design/0097-0024-setops-union-intersect-except.md`.
+      - **Remaining copyselect gaps (independent features, next COPY wins):**
+        1. **`SELECT *` inside a set-op branch** fails `42601 "'*' is not
+           allowed here"` (`internal/analyzer/analyzer.go:769`) even though
+           `SELECT * FROM v` works standalone — the star is not expanded when
+           the SELECT is a UNION/INTERSECT/EXCEPT branch. `copyselect`'s
+           `select t … UNION select * from v_test1` hits this. Likely the
+           analyzer/planner star-expansion does not recurse into the
+           set-op right branch's target list. **This is the top remaining
+           copyselect blocker.**
+        2. `COPY (SELECT … INTO …)` rejection (`ERROR: COPY (SELECT INTO) is
+           not supported`).
+        3. psql multi-command `\;`/`\.` STDIN handling
+           (`expected exactly one COPY statement`; internal "planner.Copy has
+           no executor path yet" leak on `select 1/0\; copy …`).
 
 - [ ] **M0097-0025 — Port view / MV / rules regress tests**
       - Summary: Make these 5 tests reach `pass`:

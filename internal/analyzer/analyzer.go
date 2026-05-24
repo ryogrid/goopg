@@ -198,12 +198,10 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *scope) error {
 	// s.Distinct is now supported via the planner's Distinct node. M0097-0005.
 	if s.SetOp != nil {
-		if s.SetOp.Type != parser.SetOpUnion || !s.SetOp.All {
-			return analyzeError(s.SetOp.Pos(), "0A000", "set operations are not supported in v0 planner")
-		}
-		// UNION ALL: analyze right side first (innermost first),
-		// then analyze left side with SetOp temporarily cleared
-		// to avoid infinite recursion.
+		// UNION / INTERSECT / EXCEPT (with optional ALL) are all
+		// supported. Analyze the right side first (innermost first),
+		// then the left side with SetOp temporarily cleared to avoid
+		// infinite recursion. M0097-0024.
 		if err := analyzeSelectWithParent(s.SetOp.Right, cat, parent); err != nil {
 			return err
 		}

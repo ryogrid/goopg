@@ -972,7 +972,7 @@ func TestPlanResolutionErrors(t *testing.T) {
 		{"INSERT INTO pgbench_history (nope) VALUES (1)", "42703"},       // undefined_column
 		{"UPDATE pgbench_accounts SET nope = 1 WHERE aid = $1", "42703"}, // undefined_column
 		{"INSERT INTO pgbench_history VALUES (1, 2, 3)", "42601"},        // arity mismatch
-		{"SELECT 1 UNION SELECT 2", "0A000"},                             // set op unsupported
+		{"SELECT 1 UNION SELECT 2, 3", "42601"},                          // set-op column-count mismatch
 		{"SELECT aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", "42702"},
 		{"SELECT aid FROM pgbench_accounts HAVING aid > 0", "42803"},
 	}

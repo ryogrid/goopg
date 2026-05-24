@@ -329,6 +329,76 @@ func hasJoinClauses(items []parser.FromExpr) bool {
 	return false
 }
 
+// setOpKeyword renders a set-operation type as its SQL keyword for error
+// messages (matching PostgreSQL's "each UNION query must have …"). M0097-0024.
+// wrapSetOpSortLimit applies a trailing ORDER BY / LIMIT / OFFSET to a set
+// operation. Per SQL, sort keys reference the combined result's output
+// columns only — by 1-based position or by output column name — not arbitrary
+// expressions over the input relations. M0097-0024.
+func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog) (Node, error) {
+	out := node.Output()
+	ctx := newResolveContext(nil, out)
+	ctx.cat = cat
+
+	if len(s.OrderBy) > 0 {
+		keys := make([]SortKey, 0, len(s.OrderBy))
+		for _, sb := range s.OrderBy {
+			if ic, ok := sb.Expr.(*parser.IntegerConst); ok {
+				idx := int(ic.Value) - 1
+				if idx < 0 || idx >= len(out) {
+					return nil, &PlanError{
+						Pos:     sb.Expr.Pos(),
+						Code:    "42P10",
+						Message: fmt.Sprintf("ORDER BY position %d is not in select list", ic.Value),
+					}
+				}
+				keys = append(keys, SortKey{
+					Expr: &ColumnRef{pos: sb.Expr.Pos(), Index: idx, Name: out[idx].Name, Type: out[idx].Type},
+					Desc: sb.Desc,
+				})
+				continue
+			}
+			e, err := resolveExpr(sb.Expr, ctx)
+			if err != nil {
+				return nil, err
+			}
+			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc})
+		}
+		node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
+	}
+
+	if s.Limit != nil || s.Offset != nil {
+		var lim, off Expr
+		if s.Limit != nil {
+			e, err := resolveExpr(s.Limit, ctx)
+			if err != nil {
+				return nil, err
+			}
+			lim = e
+		}
+		if s.Offset != nil {
+			e, err := resolveExpr(s.Offset, ctx)
+			if err != nil {
+				return nil, err
+			}
+			off = e
+		}
+		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off}
+	}
+	return node, nil
+}
+
+func setOpKeyword(t parser.SetOpType) string {
+	switch t {
+	case parser.SetOpIntersect:
+		return "INTERSECT"
+	case parser.SetOpExcept:
+		return "EXCEPT"
+	default:
+		return "UNION"
+	}
+}
+
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
@@ -349,27 +419,34 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	defer restore()
 
 	if s.SetOp != nil {
-		if !s.SetOp.All || s.SetOp.Type != parser.SetOpUnion {
-			return nil, &PlanError{
-				Pos:     s.SetOp.Pos(),
-				Code:    "0A000",
-				Message: "set operations are not supported in v0 planner",
-			}
-		}
-		// UNION ALL: plan right side first, then left side with
-		// SetOp temporarily cleared to avoid infinite recursion.
-		right, err := planSelect(s.SetOp.Right, cat)
+		// Plan the right branch first, then the left branch with the
+		// SetOp chain temporarily cleared to avoid infinite recursion.
+		setOp := s.SetOp
+		right, err := planSelect(setOp.Right, cat)
 		if err != nil {
 			return nil, err
 		}
-		saved := s.SetOp
 		s.SetOp = nil
 		left, err := planSelect(s, cat)
-		s.SetOp = saved
+		s.SetOp = setOp
 		if err != nil {
 			return nil, err
 		}
-		return &SetOp{pos: s.Pos(), Left: left, Right: right, All: true}, nil
+		// Each branch must project the same number of columns. PostgreSQL
+		// reports this at parse-analysis time (SQLSTATE 42601). M0097-0024.
+		if lc, rc := len(left.Output()), len(right.Output()); lc != rc {
+			return nil, &PlanError{
+				Pos:     setOp.Pos(),
+				Code:    "42601",
+				Message: fmt.Sprintf("each %s query must have the same number of columns", setOpKeyword(setOp.Type)),
+			}
+		}
+		var node Node = &SetOp{pos: s.Pos(), Left: left, Right: right, Op: setOp.Type, All: setOp.All}
+		// A trailing ORDER BY / LIMIT / OFFSET binds to the whole set
+		// operation and references the combined output columns by name
+		// or 1-based position (PostgreSQL §7.6). copyselect uses
+		// `… UNION … ORDER BY 1`. M0097-0024.
+		return wrapSetOpSortLimit(s, node, cat)
 	}
 	// s.Distinct with empty target list is invalid in PostgreSQL (syntax error).
 	// With targets it is handled by wrapping the final plan with a Distinct node.
