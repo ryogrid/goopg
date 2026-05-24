@@ -214,7 +214,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
 		}
 		if v < -32768 || v > 32767 {
-			return nil, fmt.Errorf("smallint out of range")
+			// Mirror PostgreSQL int2in: report the offending input string
+			// (e.g. INSERT INTO t(int2col) VALUES ('100000')). The bare
+			// "smallint out of range" wording is reserved for arithmetic
+			// overflow (int2pl/int2mul), which is raised in expr eval before
+			// this storage-encode path. Sibling to the int4 arm below.
+			return nil, &ExecError{Code: "22003",
+				Message: fmt.Sprintf("value %q is out of range for type smallint", strings.TrimSpace(d.StringValue()))}
 		}
 		var buf [2]byte
 		binary.LittleEndian.PutUint16(buf[:], uint16(int16(v)))

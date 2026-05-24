@@ -3,6 +3,7 @@ boolean,0,pass
 char,0,pass
 comments,0,pass
 delete,0,pass
+int2,0,pass
 int4,0,pass
 md5,0,pass
 mvcc,0,pass
@@ -14,7 +15,6 @@ select_implicit,0,pass
 test_setup,0,excluded
 time,0,pass
 varchar,0,pass
-int2,4,failed
 functional_deps,24,failed
 copydml,44,failed
 errors,60,failed

@@ -791,6 +791,21 @@ M0097-0001 wires it up.
         decode arm loses rows with NO error. Remaining int8 follow-ups:
         `KindNumeric → int8` encode (huge literals) and string-literal INSERT
         coercion for timestamp/date/xid columns.
+      - **Recovery 2026-05-24 (M0111-0005):** Recovered the `int2` regress case
+        (`failed`, 4 diff lines → **pass**). After M0097-0037's fast-path
+        overflow fix took int2 from 44 → 4 diff lines, the residual was a
+        storage-encode error-wording bug: `encodeValuePG`'s int2 arm
+        (`internal/executor/codec.go`) emitted the bare `smallint out of range`
+        (int2pl/int2mul *arithmetic* wording) when a string literal overflowed
+        on INSERT, e.g. `INSERT INTO INT2_TBL(f1) VALUES ('100000')`. PostgreSQL
+        reports the int2in input-function wording there:
+        `value "100000" is out of range for type smallint` (22003). The sibling
+        int4 arm directly below already did this — the two had drifted. Mirrored
+        int4. Test: `TestEncodeValuePGInt2OutOfRangeMessage`. Design:
+        `docs/design/0111-0005-int2-encode-out-of-range-message.md`. Of the
+        6 M0106-codec regressions, only `name` (77) and `numerology` (60) remain
+        (their residual diffs are unrelated to int2/int4/int8/name-codec).
+        Baseline + inventory CSVs updated, coverage md regenerated.
       - **Recovery 2026-05-24 (M0097-0037 — int4 + int2):** Root-caused the
         remaining int2/int4 regression to the **M0107-0003 compiled fast-path
         expression evaluator**, not the codec (the M0106-0010 attribution above
