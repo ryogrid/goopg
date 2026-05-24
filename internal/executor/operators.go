@@ -34,9 +34,9 @@ func newValuesOp(plan *planner.Values) *valuesOp {
 
 // rematerialiseVirtualRows rebuilds the row expressions for a Values
 // node whose source is a virtual catalog table. The text payload
-// returned by tbl.VirtualRows() is wrapped in StringConst expressions
-// matching what the planner produces in buildVirtualValues; the
-// returned slice replaces o.rows for this Open cycle.
+// returned by tbl.VirtualRows() is wrapped in typed constant expressions
+// (via planner.TypedVirtualCell) matching what the planner produces in
+// buildVirtualValues; the returned slice replaces o.rows for this Open cycle.
 func rematerialiseVirtualRows(plan *planner.Values) [][]planner.Expr {
 	tbl := plan.VirtualSource
 	raw := tbl.VirtualRows()
@@ -45,7 +45,10 @@ func rematerialiseVirtualRows(plan *planner.Values) [][]planner.Expr {
 		cells := make([]planner.Expr, len(tbl.Columns))
 		for j := range tbl.Columns {
 			if j < len(r) {
-				cells[j] = &planner.StringConst{Value: r[j]}
+				// Sibling of planner.buildVirtualValues — must use the same
+				// typed-cell helper so integer/bool virtual columns compare
+				// by value, not lexicographically (sysviews int8 compare).
+				cells[j] = planner.TypedVirtualCell(0, r[j], tbl.Columns[j].Type.Name)
 			} else {
 				cells[j] = &planner.NullConst{}
 			}

@@ -950,6 +950,29 @@ M0097-0001 wires it up.
         padding, error wording), not just round-trip bytes for short values — a
         fixed-width type whose normalization is skipped diverges only at its
         exact boundary length and escapes short-value round-trip tests.
+      - **Progress 2026-05-25 (M0097-0003c — virtual-cell numeric typing):**
+        `sysviews` 11 → 9 diff lines. Root cause: `catalog.Table.VirtualRows()`
+        returns rows as `[][]string`, and both `planner.buildVirtualValues` and
+        `executor.rematerialiseVirtualRows` wrapped every cell in a
+        `StringConst`, so `int8`/`int4`/`bool` virtual columns compared
+        **lexicographically**. `pg_backend_memory_contexts`'s
+        `total_bytes >= free_bytes` evaluated `"1048576" >= "524288"` →
+        `'1' < '5'` → wrongly `f`. Fix: new shared helper
+        `planner.TypedVirtualCell(pos, value, colType)` parses integer-family →
+        `IntegerConst` and bool → `BooleanConst` (StringConst fallback for
+        non-parsing values; display keyed on column wire type so typed cells
+        render identically). Both sibling paths route through it.
+        Test: `TestTypedVirtualCell`. Design:
+        `docs/design/0097-0003c-virtual-cell-numeric-typing.md`. No regression
+        across 13 int-heavy passing cases (int2/int4/numerology/name/char/
+        varchar/portals_p2/select_implicit/oid/reindex_catalog/select_having/
+        boolean). Baseline CSV refreshed (sysviews 33→9, copyselect 59→55,
+        tid 81→47 — stale rows reconciled to current). **Remaining sysviews
+        blockers (separate mechanisms, NOT this task):** a synthetic
+        `Caller tuples` Bump-context row, and `int[]` `path` array-subscripting
+        (no array type/subscript operator in goopg yet). Lesson: same
+        sibling-path class as [[pattern_sibling_paths_must_agree]] — the
+        plan-time and Open-time virtual-cell builders must use one helper.
 
 - [ ] **M0097-0020 — Port SELECT / DML / JOIN / subquery / CTE regress tests**
       - Summary: Make these 15 tests reach `pass` status:

@@ -2,6 +2,7 @@ package planner
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/analyzer"
@@ -1420,6 +1421,38 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 // each cell in a planner.StringConst so downstream Filter/Project
 // nodes can apply WHERE/SELECT predicates exactly as they do over a
 // SeqScan.
+// TypedVirtualCell returns a typed constant expression for a single virtual
+// catalog-table cell. The catalog supplies virtual rows as text; wrapping
+// every cell in a StringConst made integer-family and boolean columns compare
+// and aggregate *lexicographically* rather than by value — e.g. the
+// pg_backend_memory_contexts query `total_bytes >= free_bytes` evaluated
+// "1048576" >= "524288" as text (false) instead of 1048576 >= 524288 (true,
+// the sysviews-regress expectation). Integer-family and boolean column types
+// are now parsed to IntegerConst / BooleanConst so downstream Filter and
+// Aggregate nodes see the correct Datum kind. Any value that does not parse
+// for its declared type falls back to StringConst, preserving prior behavior
+// (and display is keyed on column type, so typed cells render identically).
+//
+// IMPORTANT: the executor's rematerialiseVirtualRows must call this same
+// helper — the two paths are siblings and must stay in sync (a virtual row
+// typed one way at plan time and another at Open would diverge silently).
+func TypedVirtualCell(pos int, value, colType string) Expr {
+	switch strings.ToLower(colType) {
+	case "int2", "int4", "int8", "integer", "bigint", "smallint":
+		if n, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return &IntegerConst{pos: pos, Value: n}
+		}
+	case "bool", "boolean":
+		switch value {
+		case "t", "true", "TRUE", "yes", "on", "1":
+			return &BooleanConst{pos: pos, Value: true}
+		case "f", "false", "FALSE", "no", "off", "0":
+			return &BooleanConst{pos: pos, Value: false}
+		}
+	}
+	return &StringConst{pos: pos, Value: value}
+}
+
 func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 	var rows [][]Expr
 	if tbl.VirtualRows != nil {
@@ -1429,7 +1462,7 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 			cells := make([]Expr, len(tbl.Columns))
 			for j := range tbl.Columns {
 				if j < len(r) {
-					cells[j] = &StringConst{pos: pos, Value: r[j]}
+					cells[j] = TypedVirtualCell(pos, r[j], tbl.Columns[j].Type.Name)
 				} else {
 					cells[j] = &NullConst{pos: pos}
 				}
