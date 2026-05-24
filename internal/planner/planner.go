@@ -4450,7 +4450,9 @@ func isNumericTypeName(name string) bool {
 // (int2, int4, int8) for the purpose of arithmetic type promotion.
 func isIntegerLikeType(name string) bool {
 	switch strings.ToLower(name) {
-	case "int2", "smallint", "int4", "integer", "int", "int8", "bigint":
+	case "int2", "smallint", "int4", "integer", "int", "int8", "bigint",
+		// SERIAL family resolve to int2/int4/int8 (see analyzer.isNumericTypeName).
+		"smallserial", "serial", "bigserial":
 		return true
 	}
 	return false
@@ -4463,12 +4465,13 @@ func isIntegerLikeType(name string) bool {
 func promoteIntType(a, b string) catalog.Type {
 	a = strings.ToLower(a)
 	b = strings.ToLower(b)
-	aIsSmall := a == "int2" || a == "smallint"
-	bIsSmall := b == "int2" || b == "smallint"
-	aIsInt4 := a == "int4" || a == "integer" || a == "int"
-	bIsInt4 := b == "int4" || b == "integer" || b == "int"
-	aIsInt8 := a == "int8" || a == "bigint"
-	bIsInt8 := b == "int8" || b == "bigint"
+	// SERIAL family promote as their integer base (serial→int4, etc.).
+	aIsSmall := a == "int2" || a == "smallint" || a == "smallserial"
+	bIsSmall := b == "int2" || b == "smallint" || b == "smallserial"
+	aIsInt4 := a == "int4" || a == "integer" || a == "int" || a == "serial"
+	bIsInt4 := b == "int4" || b == "integer" || b == "int" || b == "serial"
+	aIsInt8 := a == "int8" || a == "bigint" || a == "bigserial"
+	bIsInt8 := b == "int8" || b == "bigint" || b == "bigserial"
 	switch {
 	case aIsInt8 || bIsInt8:
 		return catalog.Type{Name: "int8"}

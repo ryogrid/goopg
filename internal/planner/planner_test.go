@@ -1127,3 +1127,33 @@ func TestAggregateFilterDistinguishedInDedupKey(t *testing.T) {
 		t.Errorf("got %d filtered aggregates, want 3", nFiltered)
 	}
 }
+
+// TestPromoteIntTypeSerialFamily verifies that the SERIAL pseudo-types promote
+// as their integer base in arithmetic result-type inference: serial→int4,
+// bigserial→int8, smallserial→int2. Regression for `serial_col + 1` producing
+// a wrong (or "unknown") result type because isIntegerLikeType / promoteIntType
+// did not recognise the SERIAL aliases.
+func TestPromoteIntTypeSerialFamily(t *testing.T) {
+	for _, name := range []string{"serial", "bigserial", "smallserial"} {
+		if !isIntegerLikeType(name) {
+			t.Errorf("isIntegerLikeType(%q) = false, want true", name)
+		}
+	}
+	cases := []struct {
+		a, b string
+		want string
+	}{
+		{"serial", "serial", "int4"},
+		{"serial", "int8", "int8"},
+		{"smallserial", "smallserial", "int2"},
+		{"smallserial", "serial", "int4"},
+		{"bigserial", "int4", "int8"},
+		{"bigserial", "serial", "int8"},
+		{"int2", "smallserial", "int2"},
+	}
+	for _, tc := range cases {
+		if got := promoteIntType(tc.a, tc.b); got.Name != tc.want {
+			t.Errorf("promoteIntType(%q, %q) = %q, want %q", tc.a, tc.b, got.Name, tc.want)
+		}
+	}
+}

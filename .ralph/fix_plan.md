@@ -1033,15 +1033,43 @@ M0097-0001 wires it up.
         `TestSetOpOrderByPosition`; analyzer/planner reject-tests updated.
         Verified live incl. `COPY (… UNION … ORDER BY 1) TO STDOUT`.
         Design: `docs/design/0097-0024-setops-union-intersect-except.md`.
+      - **Progress 2026-05-25 (loop — SERIAL pseudo-type type-checking):**
+        Closed the copyselect **left-branch** blocker (and an engine-wide bug).
+        `select t from test1 where id = 1` (id `serial`) raised `42804
+        "operator = has incompatible operand types \"serial\" and \"int8\""`,
+        and `id + 1` raised `"operator + requires numeric operands"`. SERIAL/
+        BIGSERIAL/SMALLSERIAL are not real types — PG resolves them to int4/
+        int8/int2 (`pg_typeof`=integer); goopg keeps `"serial"` as the catalog
+        type (INSERT auto-increment keys off it) and the codec aliases it to
+        int4, but the analyzer/planner type system did not. Fix (purely
+        additive, storage untouched): add the serial aliases to analyzer
+        `isNumericTypeName` (gates comparison via `isComparable` + arithmetic
+        via `isNumericLike`) and planner `isIntegerLikeType`/`promoteIntType`
+        (arithmetic result type). Affects ANY `serial_col <op> int_literal`
+        across the suite, not just copyselect. Tests:
+        `TestSerialPseudotypeIntegerTypeCheck` (`internal/analyzer/coerce_test.go`,
+        incl. serial-vs-text still-errors negative), `TestPromoteIntTypeSerialFamily`
+        (`internal/planner/planner_test.go`). Design:
+        `docs/design/0097-0003b-serial-pseudotype-integer-typecheck.md`. Verified
+        live on 5533.
       - **Remaining copyselect gaps (independent features, next COPY wins):**
-        1. **`SELECT *` inside a set-op branch** fails `42601 "'*' is not
-           allowed here"` (`internal/analyzer/analyzer.go:769`) even though
-           `SELECT * FROM v` works standalone — the star is not expanded when
-           the SELECT is a UNION/INTERSECT/EXCEPT branch. `copyselect`'s
-           `select t … UNION select * from v_test1` hits this. Likely the
-           analyzer/planner star-expansion does not recurse into the
-           set-op right branch's target list. **This is the top remaining
-           copyselect blocker.**
+        1. **Trailing `ORDER BY 1` greedily attached to the right set-op
+           branch** → `42601 "'*' is not allowed here"`. CORRECTED DIAGNOSIS
+           (verified live 2026-05-25): `select * from v_test1` works standalone;
+           the failure is `select * from v_test1 ORDER BY 1` where positional
+           `1` resolves to the `*` target (`orderBySubstitution` → `analyzeExpr`
+           on the StarExpr → `analyzer.go:769`). `parseSelect`
+           (`internal/parser/select.go`) parses `ORDER BY` (line ~130) BEFORE
+           `parseSetOpClause` (line ~188), and the set-op RHS is parsed via a
+           full recursive `parseSelect`, so `A UNION B ORDER BY 1` attaches the
+           ORDER BY to B (the right branch) instead of the whole set op. Per SQL
+           grammar a trailing ORDER BY/LIMIT/OFFSET binds to the entire set
+           operation. **Fix:** in `parseSelect`, after assigning `s.SetOp`, lift
+           the immediate `s.SetOp.Right`'s trailing OrderBy/Limit/Offset up to
+           `s` when `s` lacks them (chains lift bottom-up so the outermost
+           collects them); then `wrapSetOpSortLimit(s, …)` resolves positional 1
+           against the combined output and the right branch's `*` expands
+           cleanly. **This is the top remaining copyselect blocker.**
         2. `COPY (SELECT … INTO …)` rejection (`ERROR: COPY (SELECT INTO) is
            not supported`).
         3. psql multi-command `\;`/`\.` STDIN handling

@@ -1738,7 +1738,13 @@ func isIntegerLike(t catalog.Type) bool {
 func isNumericTypeName(name string) bool {
 	switch strings.ToLower(name) {
 	case "int", "int2", "int4", "int8", "integer", "smallint", "bigint", "numeric", "decimal",
-		"float4", "float8", "real", "double", "double precision":
+		"float4", "float8", "real", "double", "double precision",
+		// SERIAL family are not real types: PostgreSQL resolves them to
+		// int4/int8/int2 (pg_typeof reports "integer"). Treat them as their
+		// integer base so `serial_col = 1` / `serial_col + 1` type-check the
+		// same as int columns. The stored catalog type stays "serial" because
+		// the INSERT auto-increment path (operators_storage.go) keys off it.
+		"serial", "bigserial", "smallserial":
 		return true
 	}
 	return false
