@@ -1259,9 +1259,14 @@ type CopyStmt struct {
 	Columns   []string    // empty when no column list
 	Query     *SelectStmt // populated for COPY (SELECT …) TO …
 	QueryDML  Stmt        // populated for COPY (INSERT/UPDATE/DELETE … RETURNING) TO …
-	Endpoint  CopyEndpoint
-	Filename  string // filename or program command, when applicable
-	Options   []CopyOption
+	// SelectInto is set when the inner query is the deprecated
+	// `SELECT … INTO …` form. PostgreSQL's grammar accepts it inside
+	// COPY (...) but DoCopy rejects it; planCopy emits the matching
+	// "COPY (SELECT INTO) is not supported" (0A000). M0097-0024.
+	SelectInto bool
+	Endpoint   CopyEndpoint
+	Filename   string // filename or program command, when applicable
+	Options    []CopyOption
 }
 
 func (s *CopyStmt) Pos() int  { return s.pos }

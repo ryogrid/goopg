@@ -1097,9 +1097,32 @@ M0097-0001 wires it up.
         id = 1 UNION select * from v_test1 ORDER BY 1) to stdout` and the nested
         derived-table form both succeed; `'*' is not allowed here` gone. Design:
         `docs/design/0097-0024b-setop-trailing-orderby-binding.md`.
+      - **Progress 2026-05-25 (loop — COPY (SELECT INTO) rejection):** Closed
+        gap #1. `copy (select t into temp test3 from test1 where id=3) to
+        stdout` must fail with `ERROR:  COPY (SELECT INTO) is not supported`
+        (PG: grammar accepts SELECT INTO inside `COPY (...)`, then `DoCopy`
+        rejects it — `copyto.c`, `ERRCODE_FEATURE_NOT_SUPPORTED`). goopg has no
+        SELECT INTO support, so `parseSelect` stops at the reserved `INTO`
+        keyword; the dangling token tripped `parseCopy`'s `)` check into a
+        stray `expected ')'`. Fix mirrors PG's "grammar accepts, command
+        rejects" split: parser (`parseCopy`, `internal/parser/copy.go`) flags
+        `CopyStmt.SelectInto` and `skipInnerQueryRemainder` skips the unparsed
+        `INTO <target> FROM …` tail (paren-depth tracked) up to the matching
+        `)`; planner (`planCopy`, `internal/planner/copy.go`) returns `0A000
+        "COPY (SELECT INTO) is not supported"` at the top of the `s.Query !=
+        nil` branch before any catalog work. Wire rendering via the same
+        `dispatchCopyViaExecutor` path proven by the view-rejection work.
+        Tests: `TestParseCopySelectIntoFlagged` (parser),
+        `TestPlanCopySelectIntoRejected` (planner). Verified live on 5599:
+        exact ERROR line; plain `COPY (SELECT …)` still streams. Design:
+        `docs/design/0097-0024c-copy-select-into-rejection.md`.
       - **Remaining copyselect gaps (independent features, next COPY wins):**
-        1. `COPY (SELECT … INTO …)` rejection (`ERROR: COPY (SELECT INTO) is
-           not supported`).
+        1. `copy (select * from test1) from stdin` — PG: `syntax error at or
+           near "from"` (query form is TO-only in the grammar); goopg leaks its
+           own `COPY (query) is only valid with TO` message at byte 0. And
+           `copy (select * from test1) (t,id) to stdout` — PG: `syntax error at
+           or near "("` (no column list on the query form). Both need a syntax
+           error positioned at the offending token.
         2. psql multi-command `\;`/`\.` STDIN handling
            (`expected exactly one COPY statement`; internal "planner.Copy has
            no executor path yet" leak on `select 1/0\; copy …`).

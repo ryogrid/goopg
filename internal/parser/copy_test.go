@@ -88,6 +88,36 @@ func TestParseCopyQueryToStdout(t *testing.T) {
 	}
 }
 
+// TestParseCopySelectIntoFlagged: the deprecated `SELECT … INTO …` form
+// inside COPY (...) parses successfully (PG's grammar accepts it) with
+// SelectInto set, so planCopy can reject it with the PG-compatible
+// "COPY (SELECT INTO) is not supported". goopg's parseSelect stops at the
+// reserved INTO keyword, so the parser skips the unparsed tail. M0097-0024.
+func TestParseCopySelectIntoFlagged(t *testing.T) {
+	stmts, err := Parse("copy (select t into temp test3 from test1 where id=3) to stdout")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	c := stmts[0].(*CopyStmt)
+	if !c.SelectInto {
+		t.Error("SelectInto not set for COPY (SELECT … INTO …)")
+	}
+	if c.Query == nil {
+		t.Fatal("Query nil")
+	}
+	if c.Direction != CopyTo || c.Endpoint != CopyEndpointStdout {
+		t.Errorf("direction/endpoint = %v/%v", c.Direction, c.Endpoint)
+	}
+	// A plain COPY (SELECT …) without INTO must NOT be flagged.
+	stmts, err = Parse("COPY (SELECT 1) TO STDOUT")
+	if err != nil {
+		t.Fatalf("Parse plain: %v", err)
+	}
+	if stmts[0].(*CopyStmt).SelectInto {
+		t.Error("SelectInto wrongly set for plain COPY (SELECT …)")
+	}
+}
+
 // TestParseCopyDMLToStdout: COPY (INSERT/UPDATE/DELETE … RETURNING) TO
 // STDOUT parses into a CopyStmt with QueryDML set (not Query), so the
 // planner can stream the RETURNING rows. M0097-0009.

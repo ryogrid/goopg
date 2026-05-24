@@ -28,6 +28,21 @@ func (p *parser) parseCopy() (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
+		// PostgreSQL's grammar accepts the deprecated `SELECT … INTO …`
+		// form inside COPY (...), but DoCopy rejects it with a
+		// feature-not-supported error. goopg's parseSelect has no SELECT
+		// INTO support and stops at the reserved INTO keyword, leaving
+		// `INTO <target> FROM …` unconsumed here. Flag it and skip the
+		// rest of the inner query (up to the matching ')') so planCopy
+		// can emit the PG-compatible message rather than a stray
+		// "expected ')'" syntax error. M0097-0024.
+		if _, isSelect := inner.(*SelectStmt); isSelect &&
+			p.cur().Kind == TokenKeyword && p.cur().Keyword == KwInto {
+			stmt.SelectInto = true
+			if err := p.skipInnerQueryRemainder(); err != nil {
+				return nil, err
+			}
+		}
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
 		}
@@ -124,6 +139,35 @@ func (p *parser) parseCopyInnerQuery() (Stmt, error) {
 		}
 	}
 	return p.parseSelect()
+}
+
+// skipInnerQueryRemainder consumes the unparsed tail of a COPY (...) inner
+// query up to — but not including — the matching close parenthesis, so the
+// caller's `)` check still fires. It is used only for the rejected
+// `SELECT … INTO …` form, whose `INTO <target> FROM …` tail goopg's
+// parseSelect does not understand; the statement is rejected later, so the
+// tail's exact shape is irrelevant. Parenthesis depth is tracked to skip
+// over nested subqueries / function calls. M0097-0024.
+func (p *parser) skipInnerQueryRemainder() error {
+	depth := 0
+	for {
+		t := p.cur()
+		if t.Kind == TokenEOF {
+			return p.errAtCur("expected ')'")
+		}
+		if t.Kind == TokenSymbol {
+			switch t.Value {
+			case "(":
+				depth++
+			case ")":
+				if depth == 0 {
+					return nil
+				}
+				depth--
+			}
+		}
+		p.advance()
+	}
 }
 
 // parseCopyEndpoint reads the FROM/TO target. STDIN/STDOUT/PROGRAM are

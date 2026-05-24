@@ -22,6 +22,18 @@ import (
 // already enforces that.
 func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
 	if s.Query != nil {
+		// PostgreSQL's grammar accepts `SELECT … INTO …` inside
+		// COPY (...) but DoCopy rejects it (copyto.c: CreateTableAsStmt
+		// utility) with ERRCODE_FEATURE_NOT_SUPPORTED. Mirror that — the
+		// parser flags the form and stops before resolving the target.
+		// M0097-0024 (copyselect).
+		if s.SelectInto {
+			return nil, &PlanError{
+				Pos:     s.Pos(),
+				Code:    "0A000",
+				Message: "COPY (SELECT INTO) is not supported",
+			}
+		}
 		// Plan the inner SELECT just like a top-level one. The
 		// resulting Node tree's Output() schema is what the wire
 		// layer uses for the CopyOutResponse column list.

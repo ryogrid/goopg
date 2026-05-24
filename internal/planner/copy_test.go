@@ -261,6 +261,29 @@ func TestPlanCopyViewRejected(t *testing.T) {
 	}
 }
 
+// TestPlanCopySelectIntoRejected: COPY (SELECT … INTO …) is rejected with
+// the PG-compatible feature-not-supported error (copyto.c). The parser
+// flags it (SelectInto) and stops before resolving the INTO target, so
+// planCopy short-circuits before touching the catalog. M0097-0024.
+func TestPlanCopySelectIntoRejected(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t, "COPY (SELECT 1 INTO test3) TO STDOUT")
+	if !stmt.(*parser.CopyStmt).SelectInto {
+		t.Fatal("parser did not flag SelectInto")
+	}
+	_, err := Plan(stmt, cat)
+	pe, ok := err.(*PlanError)
+	if !ok {
+		t.Fatalf("expected *PlanError, got %T (%v)", err, err)
+	}
+	if pe.Code != "0A000" {
+		t.Errorf("code=%q want 0A000", pe.Code)
+	}
+	if pe.Message != "COPY (SELECT INTO) is not supported" {
+		t.Errorf("msg=%q want %q", pe.Message, "COPY (SELECT INTO) is not supported")
+	}
+}
+
 // TestPlanCopyFileEndpointPlans: file/PROGRAM endpoints plan
 // successfully (the executor will reject them later) and carry the
 // filename verbatim.
