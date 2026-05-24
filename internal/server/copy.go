@@ -45,7 +45,14 @@ func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter,
 		return nil, nil
 	}
 	_, matchable, upper, empty := normalizeSimpleQuery(q)
-	if empty || !strings.HasPrefix(upper, "COPY ") {
+	// Multi-statement simple-query batches (psql's `\;`-joined commands
+	// arrive as a single Query message with internal ';') must go through
+	// the multi-statement dispatcher even when the first statement is a
+	// COPY — otherwise dispatchCopyViaExecutor's single-statement guard
+	// rejects them with "expected exactly one COPY statement". The
+	// dispatcher runs each COPY inline via runInlineCopy. M0097-0024.
+	multiStatement := strings.ContainsRune(matchable, ';')
+	if empty || !strings.HasPrefix(upper, "COPY ") || multiStatement {
 		if err := s.handleQuery(ctx, w, sess, payload, connTx, prepStmts); err != nil {
 			return nil, err
 		}
@@ -241,6 +248,68 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 		return nil, err
 	}
 	return nil, nil
+}
+
+// runInlineCopy executes a COPY statement that appears inside a
+// multi-statement simple-query batch (psql's `\;`-joined commands, which
+// libpq delivers as a single Query message with internal ';'). Unlike
+// dispatchCopyViaExecutor — which runs the COPY in its own dedicated
+// auto-commit transaction and emits its own ReadyForQuery — this runs
+// within the batch's shared executor context (ectx, already carrying the
+// per-statement transaction and snapshot) and writes only CommandComplete
+// on success. The surrounding dispatch loop emits the single trailing
+// ReadyForQuery that covers the whole Query message, matching PostgreSQL's
+// exec_simple_query semantics (one RFQ per message, one CommandComplete
+// per statement).
+//
+// COPY ... TO STDOUT and server-side COPY ... FROM 'file' are supported
+// because neither needs client→server streaming mid-batch. COPY FROM STDIN
+// inside a batch is deferred: it would require synchronous CopyData reads
+// interleaved with the statement loop, whereas the single-COPY path drives
+// that through the connection's copyInState. The deferred case returns a
+// clean ERROR rather than leaking the internal "no executor path" message.
+//
+// On a handled error the relevant write helper has already emitted
+// ErrorResponse + ReadyForQuery, so this returns errQueryErrorSent and the
+// caller aborts the rest of the batch without emitting a second RFQ.
+func (s *Server) runInlineCopy(w *protocol.FrameWriter, ectx *executor.Context, cs *parser.CopyStmt) error {
+	node, perr := planner.Plan(cs, s.cfg.Catalog)
+	if perr != nil {
+		code, msg := planErrorFields(perr)
+		return s.writeQueryError(w, code, msg, planErrorHintFields(perr)...)
+	}
+	plan, ok := node.(*planner.Copy)
+	if !ok {
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported, "expected COPY statement")
+	}
+
+	switch plan.Direction {
+	case planner.CopyTo:
+		count, errorSent, err := s.runCopyToStream(w, ectx, plan)
+		if err != nil {
+			// runCopyToStream already wrote ErrorResponse + RFQ on a
+			// mid-stream executor error; propagate the sentinel so the
+			// batch aborts cleanly.
+			return err
+		}
+		if errorSent {
+			return errQueryErrorSent
+		}
+		return w.WriteCommandComplete(fmt.Sprintf("COPY %d", count))
+	case planner.CopyFrom:
+		if plan.Endpoint == planner.CopyEndpointFile {
+			// Server-side COPY FROM 'file' reads on the server with no
+			// wire interaction, so it works inline.
+			count, err := executor.RunCopyFromFile(ectx, plan)
+			if err != nil {
+				return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+			}
+			return w.WriteCommandComplete(fmt.Sprintf("COPY %d", count))
+		}
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+			"COPY FROM STDIN is not supported inside a multi-statement query")
+	}
+	return s.writeQueryError(w, sqlstate.FeatureNotSupported, "unknown COPY direction")
 }
 
 // runCopyToStream drives the CopyOutResponse / CopyData* / CopyDone

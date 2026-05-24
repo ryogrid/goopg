@@ -457,6 +457,27 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, w *protocol
 		ectx.CTEWriteFence = nil
 		ectx.InDMLCTE = false
 
+		// COPY inside a multi-statement simple-query batch (psql `\;`).
+		// Intercept before the plan-cache / executeOneSimpleStmt path —
+		// the executor has no COPY operator (COPY is driven from the wire
+		// layer). runInlineCopy streams within the batch's shared txn and
+		// writes only CommandComplete; the trailing ReadyForQuery below
+		// covers the whole Query message. M0097-0024.
+		if cs, ok := stmt.(*parser.CopyStmt); ok {
+			if err := s.runInlineCopy(w, ectx, cs); err != nil {
+				if errors.Is(err, errQueryErrorSent) {
+					// ErrorResponse + RFQ already sent; abort the rest of
+					// the batch (PG aborts the whole message on error).
+					if !autoCommit && connTx != nil && connTx.InExplicit() {
+						connTx.Fail()
+					}
+					return nil
+				}
+				return err
+			}
+			continue
+		}
+
 		// M0098-0005: plan cache for single-statement queries (the
 		// common OLTP case). On hit: skip planner.Plan. On miss:
 		// plan, cache, then execute.

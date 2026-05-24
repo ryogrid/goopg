@@ -238,3 +238,113 @@ func frameTypes(fs []protocol.Frame) []byte {
 	}
 	return out
 }
+
+// TestCopyToInMultiStatementBatch: a psql `\;`-joined batch that mixes
+// COPY (query) TO STDOUT statements with a regular SELECT executes each
+// statement in order, streaming the COPY rows inline and emitting one
+// CommandComplete per statement plus a single trailing ReadyForQuery for
+// the whole Query message. Before M0097-0024 this hit the single-COPY
+// guard "expected exactly one COPY statement". This is the copyselect
+// `copy (select 1) to stdout\; copy (select 2) to stdout\; select 3` shape.
+func TestCopyToInMultiStatementBatch(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "copy (select 1) to stdout; copy (select 2) to stdout; select 3;")
+	frames := readUntilReady(t, conn)
+	want := []byte{
+		protocol.MsgCopyOutResponse, protocol.MsgCopyData, protocol.MsgCopyDone, protocol.MsgCommandComplete,
+		protocol.MsgCopyOutResponse, protocol.MsgCopyData, protocol.MsgCopyDone, protocol.MsgCommandComplete,
+		protocol.MsgRowDescription, protocol.MsgDataRow, protocol.MsgCommandComplete,
+		protocol.MsgReadyForQuery,
+	}
+	if len(frames) != len(want) {
+		t.Fatalf("frames=%d want=%d (%v)", len(frames), len(want), frameTypes(frames))
+	}
+	for i, w := range want {
+		if frames[i].Type != w {
+			t.Fatalf("frame[%d]=%q want %q (%v)", i, frames[i].Type, w, frameTypes(frames))
+		}
+	}
+	if got := string(frames[1].Payload); got != "1\n" {
+		t.Errorf("first COPY data=%q want %q", got, "1\n")
+	}
+	if got := string(frames[5].Payload); got != "2\n" {
+		t.Errorf("second COPY data=%q want %q", got, "2\n")
+	}
+	if tag := strings.TrimSuffix(string(frames[3].Payload), "\x00"); tag != "COPY 1" {
+		t.Errorf("first tag=%q want COPY 1", tag)
+	}
+}
+
+// TestCopyToBatchStopsOnError: when a statement after an inline COPY TO
+// fails (`copy (select 1) to stdout\; select 1/0`), the COPY rows stream
+// out first, then the error aborts the rest of the batch with a single
+// ReadyForQuery — the copyselect "row, then error" case.
+func TestCopyToBatchStopsOnError(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "copy (select 1) to stdout; select 1/0;")
+	frames := readUntilReady(t, conn)
+	// select 1/0 emits RowDescription before the runtime division-by-zero
+	// error fires (PG sends 'T' then 'E').
+	want := []byte{
+		protocol.MsgCopyOutResponse, protocol.MsgCopyData, protocol.MsgCopyDone, protocol.MsgCommandComplete,
+		protocol.MsgRowDescription, protocol.MsgErrorResponse, protocol.MsgReadyForQuery,
+	}
+	if len(frames) != len(want) {
+		t.Fatalf("frames=%d want=%d (%v)", len(frames), len(want), frameTypes(frames))
+	}
+	for i, w := range want {
+		if frames[i].Type != w {
+			t.Fatalf("frame[%d]=%q want %q (%v)", i, frames[i].Type, w, frameTypes(frames))
+		}
+	}
+	got := parseErrorFields(t, frames[5].Payload)
+	if !strings.Contains(got[protocol.FieldMessage], "division by zero") {
+		t.Errorf("message=%q want division-by-zero error", got[protocol.FieldMessage])
+	}
+}
+
+// TestCopyFromStdinInBatchDeferred guards the documented deferral: COPY
+// FROM STDIN inside a multi-statement batch is not yet supported, but it
+// must surface a clean FeatureNotSupported ERROR — never the internal
+// "planner.Copy has no executor path yet" leak that the multi-statement
+// path produced before M0097-0024. Statements before the COPY still run.
+func TestCopyFromStdinInBatchDeferred(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "select 0; copy items from stdin; select 1;")
+	frames := readUntilReady(t, conn)
+	// select 0 → T,D,C; then COPY FROM STDIN → ErrorResponse; then RFQ.
+	want := []byte{
+		protocol.MsgRowDescription, protocol.MsgDataRow, protocol.MsgCommandComplete,
+		protocol.MsgErrorResponse, protocol.MsgReadyForQuery,
+	}
+	if len(frames) != len(want) {
+		t.Fatalf("frames=%d want=%d (%v)", len(frames), len(want), frameTypes(frames))
+	}
+	for i, w := range want {
+		if frames[i].Type != w {
+			t.Fatalf("frame[%d]=%q want %q (%v)", i, frames[i].Type, w, frameTypes(frames))
+		}
+	}
+	got := parseErrorFields(t, frames[3].Payload)
+	if got[protocol.FieldSQLState] != "0A000" {
+		t.Errorf("sqlstate=%q want 0A000", got[protocol.FieldSQLState])
+	}
+	if strings.Contains(got[protocol.FieldMessage], "no executor path") {
+		t.Errorf("message leaked internal text: %q", got[protocol.FieldMessage])
+	}
+	if !strings.Contains(got[protocol.FieldMessage], "COPY FROM STDIN") {
+		t.Errorf("message=%q want COPY-FROM-STDIN deferral", got[protocol.FieldMessage])
+	}
+}

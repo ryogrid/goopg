@@ -1138,10 +1138,43 @@ M0097-0001 wires it up.
         exact PG ERROR + LINE + caret; plain `copy (select …) to stdout` still
         streams; `copyselect` regress diff loses all four gap-#1 lines. Design:
         `docs/design/0097-0024d-copy-query-form-syntax-errors.md`.
-      - **Remaining copyselect gaps (independent features, next COPY wins):**
-        1. psql multi-command `\;`/`\.` STDIN handling
-           (`expected exactly one COPY statement`; internal "planner.Copy has
-           no executor path yet" leak on `select 1/0\; copy …`). This is the
+      - **Progress 2026-05-25 (loop — COPY in multi-statement `\;` batches):**
+        Closed the COPY-TO portion of the last `copyselect` gap. psql's `\;`
+        joins commands into ONE Query message (internal `;`); the server runs
+        them in order with one CommandComplete each + a single trailing RFQ.
+        goopg mishandled embedded COPY two ways: (a) `handleQueryOrCopy` routed
+        the WHOLE message to the single-COPY path whenever it started with
+        `COPY `, so a batch beginning with COPY hit `expected exactly one COPY
+        statement`; (b) a batch reaching a COPY via the multi-statement
+        dispatcher handed the `*planner.Copy` to the executor, leaking the
+        internal `planner.Copy has no executor path yet` (`0A000`). Fix
+        (`internal/server`): (1) `handleQueryOrCopy` routes any query with an
+        internal `;` to the multi-statement dispatcher even when it starts with
+        `COPY ` (single COPY keeps the `copyInState` fast path); (2) the
+        dispatch loop intercepts `*parser.CopyStmt` before the executor via new
+        `runInlineCopy` (`copy.go`), which streams COPY TO (and server-side
+        COPY FROM file) within the batch's SHARED txn — so COPY(DML RETURNING)
+        commits atomically with the batch — writing only CommandComplete; the
+        loop emits the single trailing RFQ; errors propagate the
+        `errQueryErrorSent` sentinel and abort the rest of the batch like a
+        failed `executeOneSimpleStmt`. Tests: `TestCopyToInMultiStatementBatch`,
+        `TestCopyToBatchStopsOnError`, `TestCopyFromStdinInBatchDeferred`
+        (`internal/server/copy_executor_test.go`). Verified live on 5599:
+        copyselect cases `copy(…)to stdout\; select 1/0`, `select 1/0\;
+        copy(…)`, and `copy(…)\; copy(…)\; select 3\; select 4` match PG
+        byte-for-byte. Design:
+        `docs/design/0097-0024e-copy-in-multi-statement-batch.md`.
+      - **Remaining copyselect gap (one feature, next COPY wins):**
+        1. COPY FROM STDIN inside a multi-statement `\;` batch (the
+           `select 0\; copy test3 from stdin\; copy test3 from stdin\; select 1`
+           shape with `\.`-terminated data blocks). Now emits a clean
+           `0A000 "COPY FROM STDIN is not supported inside a multi-statement
+           query"` (no internal leak), but full support needs synchronous
+           CopyData reads interleaved with the statement loop: thread the
+           `FrameReader` down into `dispatchSimpleQueryViaExecutor` and add a
+           batch-aware CopyData/CopyDone path (the single-COPY route drives this
+           via the connection's `copyInState`, whose `handleCopyInFrame` writes
+           its own RFQ on CopyDone — incompatible with mid-batch). This is the
            only remaining `copyselect` gap.
 
 - [ ] **M0097-0025 — Port view / MV / rules regress tests**
