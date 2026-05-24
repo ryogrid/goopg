@@ -55,6 +55,10 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 	}
 
 	binary = IsBinaryFormat(plan.Options)
+	var format copyToFormat
+	if !binary {
+		format = copyToFormatFromOptions(plan.Options)
+	}
 
 	src, cols, projection, buildErr := buildCopySource(plan)
 	if buildErr != nil {
@@ -70,6 +74,11 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 		hdr := CopyBinaryHeader()
 		if err := emit(hdr); err != nil {
 			return 0, true, err
+		}
+	} else if format.hasHeader() {
+		line := format.appendHeader(nil, cols)
+		if err := emit(line); err != nil {
+			return 0, false, err
 		}
 	}
 
@@ -92,9 +101,12 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 		}
 		buf = buf[:0]
 		var encErr error
-		if binary {
+		switch {
+		case binary:
 			buf, encErr = AppendCopyBinaryRow(buf, row, cols)
-		} else {
+		case format.csv:
+			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format)
+		default:
 			buf, encErr = EncodeCopyTextRow(buf, row, cols)
 		}
 		if encErr != nil {

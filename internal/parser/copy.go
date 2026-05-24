@@ -103,8 +103,15 @@ func (p *parser) parseCopy() (Stmt, error) {
 	stmt.Endpoint = endpoint
 	stmt.Filename = filename
 
-	// Optional [ WITH ] ( option [, …] ).
-	withConsumed := p.acceptKeyword(KwWith)
+	// Optional option trail. PostgreSQL's gram.y `copy_options` has two
+	// shapes plus an optional leading WITH (`opt_with`):
+	//   • [ WITH ] '(' generic-option-list ')'  — the modern form
+	//   • [ WITH ] legacy-option-list            — the deprecated bare
+	//     trail (e.g. `CSV HEADER FORCE QUOTE col`). The bare trail is
+	//     valid for BOTH the table form and the parenthesised-query form
+	//     (appended after STDOUT), so it is accepted with or without
+	//     WITH. M0097-0024.
+	p.acceptKeyword(KwWith)
 	if p.acceptSymbol("(") {
 		opts, err := p.parseCopyOptionList()
 		if err != nil {
@@ -114,11 +121,7 @@ func (p *parser) parseCopy() (Stmt, error) {
 			return nil, p.errAtCur("expected ')'")
 		}
 		stmt.Options = opts
-	} else if withConsumed {
-		// Bare `WITH` accepts the legacy syntax `WITH BINARY` /
-		// `WITH OIDS` etc. — accept the legacy single-word options
-		// (BINARY, CSV, HEADER) for pgbench-friendliness. Anything more
-		// elaborate must use the parenthesised form.
+	} else {
 		opts, err := p.parseCopyLegacyTrail()
 		if err != nil {
 			return nil, err
@@ -285,9 +288,12 @@ func (p *parser) parseCopyOption() (CopyOption, error) {
 }
 
 // parseCopyLegacyTrail covers the historical, parenthesis-free syntax
-// `COPY … WITH [BINARY] [HEADER]` etc. We accept BINARY, CSV, HEADER,
-// FREEZE, DELIMITER 'd', NULL 'n', QUOTE 'q', ESCAPE 'e' here so
-// pgbench-friendly tools survive.
+// `COPY … [WITH] [BINARY] [CSV] [HEADER] …` (PG gram.y `copy_opt_list`).
+// We accept BINARY, CSV, HEADER, FREEZE, DELIMITER 'd', NULL 'n',
+// QUOTE 'q', ESCAPE 'e', ENCODING 'enc', and the CSV column options
+// FORCE QUOTE / FORCE NOT NULL / FORCE NULL. Each option is normalised
+// to the same CopyOption shape the modern parenthesised form produces,
+// so the planner/executor interpret them identically. M0097-0024.
 func (p *parser) parseCopyLegacyTrail() ([]CopyOption, error) {
 	var out []CopyOption
 	for {
@@ -307,9 +313,65 @@ func (p *parser) parseCopyLegacyTrail() ([]CopyOption, error) {
 			}
 			p.advance()
 			out = append(out, CopyOption{pos: t.Pos, Name: t.Value, Value: s.Value})
+		case "force":
+			p.advance()
+			opt, err := p.parseCopyLegacyForce(t.Pos)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, opt)
 		default:
 			return out, nil
 		}
 	}
 	return out, nil
+}
+
+// parseCopyLegacyForce parses the legacy CSV column options that follow
+// the FORCE keyword (PG gram.y `copy_opt_item`):
+//
+//	FORCE QUOTE columnList | FORCE QUOTE '*'
+//	FORCE NOT NULL columnList
+//	FORCE NULL columnList
+//
+// The leading FORCE has already been consumed; pos anchors the option at
+// it. The result mirrors the modern parenthesised option (force_quote /
+// force_not_null / force_null with Star or Cols set). M0097-0024.
+func (p *parser) parseCopyLegacyForce(pos int) (CopyOption, error) {
+	nt := p.cur()
+	switch nt.Value {
+	case "quote":
+		p.advance()
+		opt := CopyOption{pos: pos, Name: "force_quote"}
+		if p.acceptSymbol("*") {
+			opt.Star = true
+			return opt, nil
+		}
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return CopyOption{}, err
+		}
+		opt.Cols = cols
+		return opt, nil
+	case "not":
+		p.advance()
+		if p.cur().Value != "null" {
+			return CopyOption{}, p.errAtCur("expected NULL after FORCE NOT")
+		}
+		p.advance()
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return CopyOption{}, err
+		}
+		return CopyOption{pos: pos, Name: "force_not_null", Cols: cols}, nil
+	case "null":
+		p.advance()
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return CopyOption{}, err
+		}
+		return CopyOption{pos: pos, Name: "force_null", Cols: cols}, nil
+	default:
+		return CopyOption{}, p.errAtCur("expected QUOTE, NOT NULL, or NULL after FORCE")
+	}
 }

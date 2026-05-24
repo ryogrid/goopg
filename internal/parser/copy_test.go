@@ -277,6 +277,79 @@ func TestParseCopyForceQuoteStarAndCols(t *testing.T) {
 	}
 }
 
+// TestParseCopyQueryLegacyForceQuoteTrail covers the sole remaining
+// copyselect shape: the parenthesised-query COPY form followed by the
+// deprecated, parenthesis-free legacy option trail including
+// FORCE QUOTE. PostgreSQL's gram.y allows `copy_opt_list` after STDOUT
+// for the query form too. M0097-0024.
+func TestParseCopyQueryLegacyForceQuoteTrail(t *testing.T) {
+	stmts, err := Parse("copy (select t from test1 where id = 1) to stdout csv header force quote t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := stmts[0].(*CopyStmt)
+	if c.Query == nil {
+		t.Fatalf("expected query-form COPY, got %+v", c)
+	}
+	got := map[string]CopyOption{}
+	for _, o := range c.Options {
+		got[o.Name] = o
+	}
+	if !got["csv"].Bool {
+		t.Errorf("csv flag missing: %+v", c.Options)
+	}
+	if !got["header"].Bool {
+		t.Errorf("header flag missing: %+v", c.Options)
+	}
+	fq, ok := got["force_quote"]
+	if !ok || fq.Star || len(fq.Cols) != 1 || fq.Cols[0] != "t" {
+		t.Errorf("force_quote want cols [t], got %+v", fq)
+	}
+}
+
+// TestParseCopyLegacyForceVariants pins the three legacy FORCE shapes,
+// each normalised to the modern option form. M0097-0024.
+func TestParseCopyLegacyForceVariants(t *testing.T) {
+	cases := []struct {
+		in       string
+		name     string
+		wantStar bool
+		wantCols []string
+	}{
+		{"COPY t TO STDOUT CSV FORCE QUOTE *", "force_quote", true, nil},
+		{"COPY t TO STDOUT CSV FORCE QUOTE a, b", "force_quote", false, []string{"a", "b"}},
+		{"COPY t FROM STDIN CSV FORCE NOT NULL a", "force_not_null", false, []string{"a"}},
+		{"COPY t FROM STDIN CSV FORCE NULL a, b", "force_null", false, []string{"a", "b"}},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.in)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.in, err)
+		}
+		c := stmts[0].(*CopyStmt)
+		var opt *CopyOption
+		for i := range c.Options {
+			if c.Options[i].Name == tc.name {
+				opt = &c.Options[i]
+			}
+		}
+		if opt == nil {
+			t.Fatalf("%q: %s option missing (%+v)", tc.in, tc.name, c.Options)
+		}
+		if opt.Star != tc.wantStar {
+			t.Errorf("%q: Star=%v want %v", tc.in, opt.Star, tc.wantStar)
+		}
+		if len(opt.Cols) != len(tc.wantCols) {
+			t.Fatalf("%q: cols=%v want %v", tc.in, opt.Cols, tc.wantCols)
+		}
+		for i := range tc.wantCols {
+			if opt.Cols[i] != tc.wantCols[i] {
+				t.Errorf("%q: cols[%d]=%q want %q", tc.in, i, opt.Cols[i], tc.wantCols[i])
+			}
+		}
+	}
+}
+
 // TestParseCopySyntaxErrors pins a few must-reject shapes.
 func TestParseCopySyntaxErrors(t *testing.T) {
 	cases := []string{

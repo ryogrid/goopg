@@ -1191,20 +1191,36 @@ M0097-0001 wires it up.
         `GOOPG_REGRESS_DIFF_DIR`: the `copyselect` STDIN-batch block now matches
         PG byte-for-byte (`select * from test3` → rows `1`, `2`). Design:
         `docs/design/0097-0024f-copy-from-stdin-in-multi-statement-batch.md`.
-      - **Remaining copyselect gap (one feature, 2 diff lines — next COPY
-        wins):**
-        1. The parenthesised-query COPY form does not accept the bare
-           (non-`WITH`) legacy option trail. `copy (select t from test1 where
-           id = 1) to stdout csv header force quote t` fails in the parser (the
-           query form's trailing-clause handling stops at `csv` →
-           `expected ';' or end of input (got csv)`), so the CSV `t` header line
-           and the `"a"` force-quoted value are missing from the output (the
-           sole remaining 2-line `copyselect` diff). `COPY (query) TO STDOUT
-           WITH (format csv, header, force_quote (t))` parses fine. Closing this
-           needs (a) the parenthesised-query form to accept
-           `parseCopyLegacyTrail` plus the legacy `FORCE QUOTE <cols>` syntax,
-           and (b) CSV `HEADER` output + `FORCE_QUOTE` rendering in the COPY-TO
-           executor. This is the only remaining `copyselect` gap.
+      - **Progress 2026-05-25 (loop — legacy CSV option trail + CSV TO
+        rendering):** CLOSED the last `copyselect` gap (2 diff lines).
+        `copy (select t from test1 where id = 1) to stdout csv header force
+        quote t` now emits `t` / `"a"` byte-for-byte. Two parts. (1) **Parser**
+        (`internal/parser/copy.go`): `parseCopy` accepts the parenthesis-free
+        legacy option trail with or without `WITH` and for BOTH the table form
+        and the parenthesised-query form (PG `gram.y` `[WITH] copy_opt_list`) —
+        the old `else if withConsumed` became an unconditional `else` calling
+        `parseCopyLegacyTrail` (empty list for a non-option lookahead, so
+        `COPY … TO STDOUT;` is unaffected). New `case "force"` /
+        `parseCopyLegacyForce` parses `FORCE QUOTE col|*`, `FORCE NOT NULL col`,
+        `FORCE NULL col`, normalised to the SAME `CopyOption` shape the modern
+        `WITH (...)` form produces (sibling-path:
+        [[pattern_sibling_paths_must_agree]]). (2) **Executor** (new
+        `internal/executor/copy_csv.go`): `copyToFormat` /
+        `copyToFormatFromOptions` interpret csv/header/delim/quote/escape/null/
+        force_quote (CSV flips defaults to comma + empty NULL); `EncodeCopyCsvRow`
+        + `appendCsvField` implement PG `CopyAttributeOutCSV` quoting (forced, or
+        contains delim/quote/CR/LF; doubled embedded quotes; NULL → unquoted null
+        string); `appendHeader` emits the column-name header (CSV-quoted for CSV,
+        text-escaped for TEXT; never force-quoted). `RunCopyTo` computes the
+        format once, emits the header line, and dispatches each row to the
+        binary/CSV/text encoder. The query form skips `validateCopyOptions`
+        (pre-existing; executor tolerates unknown opts). Tests:
+        `TestParseCopyQueryLegacyForceQuoteTrail`,
+        `TestParseCopyLegacyForceVariants` (parser);
+        `TestCopyCsvForceQuoteHeader`, `TestCopyCsvDefaultsAndQuoting`,
+        `TestCopyTextHeaderUnaffectedByCsv` (executor). Verified live on 5599.
+        Design: `docs/design/0097-0024g-copy-legacy-force-quote-csv-header.md`.
+        With this, `copyselect` has no remaining known feature gaps.
 
 - [ ] **M0097-0025 — Port view / MV / rules regress tests**
       - Summary: Make these 5 tests reach `pass`:
