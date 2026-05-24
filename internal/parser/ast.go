@@ -1002,6 +1002,7 @@ func (s *DropIndexStmt) stmtNode() {}
 type CreateViewStmt struct {
 	pos       int
 	OrReplace bool
+	Temporary bool // CREATE TEMP[ORARY] VIEW
 	Name      ObjectName
 	Columns   []string // optional explicit column-name list
 	Query     *SelectStmt

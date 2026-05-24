@@ -16,7 +16,7 @@ select_implicit,0,pass
 test_setup,0,excluded
 time,0,pass
 varchar,0,pass
-functional_deps,24,failed
+functional_deps,21,failed
 copydml,44,failed
 errors,60,failed
 copyselect,69,failed

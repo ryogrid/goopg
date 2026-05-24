@@ -22,20 +22,42 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		orReplace = true
 	}
-	// CREATE [GLOBAL|LOCAL] TEMP[ORARY] TABLE → treat as CREATE TABLE but mark as Temporary.
-	// Temporary flag enables shadow-on-conflict behavior in execCreateTable. M0097-0003.
-	_ = p.acceptIdentKeyword("global") || p.acceptIdentKeyword("local")
+	// CREATE [GLOBAL|LOCAL] TEMP[ORARY] <object> → dispatch on the object
+	// kind that follows TEMP/TEMPORARY. VIEW, MATERIALIZED VIEW and SEQUENCE
+	// must NOT fall through to the table parser, otherwise `CREATE TEMP VIEW`
+	// is silently mis-parsed as a table (M0097-0036). The TABLE/default arm
+	// preserves the shadow-on-conflict Temporary flag wired in M0097-0003.
+	// GLOBAL is an unreserved ident; LOCAL is a reserved keyword token.
+	_ = p.acceptIdentKeyword("global") || p.acceptIdentKeyword("local") || p.acceptKeyword(KwLocal)
 	if p.acceptIdentKeyword("temp") || p.acceptIdentKeyword("temporary") {
-		// Consume optional TABLE keyword that follows TEMP/TEMPORARY.
-		p.acceptKeyword(KwTable)
-		s, err := p.parseCreateTableTail(t.Pos, unlogged)
-		if err != nil {
-			return nil, err
+		switch {
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwView:
+			p.advance()
+			s, err := p.parseCreateViewTail(t.Pos, orReplace)
+			if err != nil {
+				return nil, err
+			}
+			if cv, ok := s.(*CreateViewStmt); ok {
+				cv.Temporary = true
+			}
+			return s, nil
+		case p.acceptIdentKeyword("materialized"):
+			_ = p.acceptKeyword(KwView) || p.acceptIdentKeyword("view")
+			return p.parseCreateMatViewTail(t.Pos)
+		case p.acceptIdentKeyword("sequence"):
+			return p.parseCreateSequenceTail(t.Pos, true)
+		default:
+			// Consume optional TABLE keyword that follows TEMP/TEMPORARY.
+			p.acceptKeyword(KwTable)
+			s, err := p.parseCreateTableTail(t.Pos, unlogged)
+			if err != nil {
+				return nil, err
+			}
+			if ct, ok := s.(*CreateTableStmt); ok {
+				ct.Temporary = true
+			}
+			return s, nil
 		}
-		if ct, ok := s.(*CreateTableStmt); ok {
-			ct.Temporary = true
-		}
-		return s, nil
 	}
 	switch {
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTable:

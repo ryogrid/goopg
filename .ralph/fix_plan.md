@@ -1002,6 +1002,34 @@ M0097-0001 wires it up.
         dependency inference (M0097-0006 scope).  Triage after
         M0097-0020 completes.
       - DoD: same as M0097-0020.
+      - **Progress 2026-05-24 (loop):** Fixed a `CREATE TEMP VIEW` parser
+        bug that blocked `functional_deps` (and any `CREATE TEMP VIEW/
+        SEQUENCE/MATERIALIZED VIEW`). `parseCreate` (`internal/parser/
+        ddl.go`) consumed the `TEMP`/`TEMPORARY` prefix then unconditionally
+        called `parseCreateTableTail`, so temp views were mis-parsed as
+        tables — no `*CreateViewStmt` was produced, no view landed in the
+        catalog, and a later `DROP VIEW` failed with "view does not exist".
+        Now dispatches on the object keyword after `TEMP` (VIEW →
+        `parseCreateViewTail` with `Temporary=true`; MATERIALIZED VIEW;
+        SEQUENCE → `temp=true`; else TABLE). Added `CreateViewStmt.Temporary`
+        and accepted the reserved `KwLocal` keyword in the GLOBAL/LOCAL prefix
+        (`CREATE LOCAL TEMP …` previously errored). Tests:
+        `TestParseCreateTempView`, `TestParseCreateTempSequence`
+        (`internal/parser/view_test.go`). `functional_deps` diff 24 → 21 lines
+        (verified end-to-end; views now created — the 2nd `CREATE TEMP VIEW
+        fdv1` now correctly reports `relation "fdv1" already exists`). Design:
+        `docs/design/0097-0036-create-temp-view-parser-dispatch.md`.
+      - **Remaining functional_deps gaps (21 diff lines, larger features):**
+        (a) view-body GROUP BY validation at CREATE time (goopg doesn't
+        plan/validate the view SELECT at creation, so an invalid `GROUP BY
+        body` view is accepted); (b) `ALTER TABLE … DROP CONSTRAINT …
+        RESTRICT` pg_depend-style dependency tracking (the `cannot drop
+        constraint … because other objects depend on it` ERROR/DETAIL/HINT
+        block). Per `docs/test-port/regress-root-cause-analysis.md`.
+      - **Baseline note:** `regress-diff-baseline.csv` is stale (captured in
+        the M0106 codec window). `numerology` already reports `pass` (verified
+        this loop) but is still listed at 60 — a full `TestPort_RegressSuite`
+        refresh is overdue after the recent codec/fast-path commits.
 
 - [x] **M0097-0037 — Regress porting task breakdown (2026-05-22)**
       - Summary: Replaced the "promote" tasks with concrete "port"
