@@ -1221,6 +1221,34 @@ M0097-0001 wires it up.
         `TestCopyTextHeaderUnaffectedByCsv` (executor). Verified live on 5599.
         Design: `docs/design/0097-0024g-copy-legacy-force-quote-csv-header.md`.
         With this, `copyselect` has no remaining known feature gaps.
+      - **Progress 2026-05-25 (loop — COPY option validation, copy2):**
+        `copyselect` now PASSES the regress suite. Advanced `copy2`'s
+        "incorrect options" block (the whole ~46-line option-error region
+        now matches PG). Rewrote planner `validateCopyOptions`
+        (`internal/planner/copy.go`) to mirror PG `ProcessCopyOptions`
+        (`copy.c`): a per-option pass recognising the full PG option set
+        (`on_error`, `log_verbosity`, `reject_limit`, `convert_selectively`,
+        `encoding`, plus the previously-known ones), reporting
+        `conflicting or redundant options` on duplicates and validating
+        values inline (`on_error` direction-check precedes value-check;
+        `COPY ON_ERROR/LOG_VERBOSITY "x" not recognized`; `REJECT_LIMIT (n)
+        must be greater than zero`), then an incompatible-combination pass
+        in PG's exact order (BINARY×DELIMITER/NULL/HEADER; `FORCE_*` require
+        CSV / wrong-direction; `only ON_ERROR STOP is allowed in BINARY
+        mode`; `REJECT_LIMIT requires ON_ERROR to be set to IGNORE`).
+        **Load-bearing fix:** these now fire at PLAN time, so a bad `COPY
+        FROM STDIN` is rejected before `CopyInResponse` — goopg previously
+        accepted the options, entered copy-in mode, and slurped the
+        following ~780 SQL lines as COPY data, desyncing the whole file.
+        The regress harness sorts ERROR text and strips LINE/caret, so only
+        message text is compared (codes set PG-faithfully for unit tests).
+        Tests: `TestPlanCopyIncorrectOptions` (33 PG-exact messages + 9
+        valid combos), updated `TestPlanCopyOptionsAcceptedAndRejected`.
+        Verified live on 5533 + via `GOOPG_REGRESS_DIFF_DIR`. Design:
+        `docs/design/0097-0024h-copy-option-validation.md`. **Remaining
+        copy2 gaps** (deeper, separate features): COPY error `CONTEXT`
+        lines, BEFORE-triggers firing on `COPY FROM`, custom single-byte
+        delimiter (`;`/`:`) data parsing.
 
 - [ ] **M0097-0025 — Port view / MV / rules regress tests**
       - Summary: Make these 5 tests reach `pass`:

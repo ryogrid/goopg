@@ -157,9 +157,9 @@ func TestPlanCopyOptionsAcceptedAndRejected(t *testing.T) {
 		code string
 	}{
 		{"COPY pgbench_accounts TO STDOUT WITH (FORMAT csv, FORMAT csv)", "42601"},
-		{"COPY pgbench_accounts TO STDOUT WITH (FORMAT bogus)", "0A000"},
-		{"COPY pgbench_accounts TO STDOUT WITH (UNKNOWNOPT)", "0A000"},
-		{"COPY pgbench_accounts TO STDOUT WITH (HEADER true)", ""}, // accepted
+		{"COPY pgbench_accounts TO STDOUT WITH (FORMAT bogus)", "22023"}, // PG: COPY format "bogus" not recognized
+		{"COPY pgbench_accounts TO STDOUT WITH (UNKNOWNOPT)", "42601"},   // PG: option "unknownopt" not recognized
+		{"COPY pgbench_accounts TO STDOUT WITH (HEADER true)", ""},       // accepted
 	}
 	for _, tc := range cases {
 		_, err := Plan(parseOne(t, tc.sql), cat)
@@ -180,6 +180,93 @@ func TestPlanCopyOptionsAcceptedAndRejected(t *testing.T) {
 		}
 		if pe.Code != tc.code {
 			t.Errorf("for %q: code=%q want %q", tc.sql, pe.Code, tc.code)
+		}
+	}
+}
+
+// TestPlanCopyIncorrectOptions pins the PostgreSQL-exact ERROR
+// messages for the copy2 "incorrect options" block. These must fire at
+// plan time so a COPY FROM STDIN with a bad option never enters
+// copy-in mode (otherwise the following statements get slurped as data
+// and the rest of the batch desyncs). Messages mirror
+// ProcessCopyOptions in src/backend/commands/copy.c byte-for-byte; the
+// regress diff compares the message text (psql does not print SQLSTATE).
+// M0097-0024 (copy2).
+func TestPlanCopyIncorrectOptions(t *testing.T) {
+	cat := pgbenchCatalog(t)
+
+	cases := []struct {
+		sql  string
+		want string
+	}{
+		// Redundant options → "conflicting or redundant options".
+		{"COPY pgbench_accounts FROM STDIN (format csv, FORMAT csv)", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (freeze off, freeze on)", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (delimiter ',', delimiter ',')", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (null ' ', null ' ')", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (header off, header on)", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (quote ':', quote ':')", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (escape ':', escape ':')", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (force_quote (aid), force_quote *)", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (force_not_null (aid), force_not_null (bid))", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (force_null (aid), force_null (bid))", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (convert_selectively (aid), convert_selectively (bid))", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (encoding 'sql_ascii', encoding 'sql_ascii')", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (on_error ignore, on_error ignore)", "conflicting or redundant options"},
+		{"COPY pgbench_accounts FROM STDIN (log_verbosity default, log_verbosity verbose)", "conflicting or redundant options"},
+		// Incompatible combinations.
+		{"COPY pgbench_accounts FROM STDIN (format BINARY, delimiter ',')", "cannot specify DELIMITER in BINARY mode"},
+		{"COPY pgbench_accounts FROM STDIN (format BINARY, null 'x')", "cannot specify NULL in BINARY mode"},
+		{"COPY pgbench_accounts FROM STDIN (format BINARY, on_error ignore)", "only ON_ERROR STOP is allowed in BINARY mode"},
+		{"COPY pgbench_accounts FROM STDIN (on_error unsupported)", "COPY ON_ERROR \"unsupported\" not recognized"},
+		{"COPY pgbench_accounts FROM STDIN (format TEXT, force_quote(aid))", "COPY FORCE_QUOTE requires CSV mode"},
+		{"COPY pgbench_accounts FROM STDIN (format TEXT, force_quote *)", "COPY FORCE_QUOTE requires CSV mode"},
+		{"COPY pgbench_accounts FROM STDIN (format CSV, force_quote(aid))", "COPY FORCE_QUOTE cannot be used with COPY FROM"},
+		{"COPY pgbench_accounts FROM STDIN (format CSV, force_quote *)", "COPY FORCE_QUOTE cannot be used with COPY FROM"},
+		{"COPY pgbench_accounts FROM STDIN (format TEXT, force_not_null(aid))", "COPY FORCE_NOT_NULL requires CSV mode"},
+		{"COPY pgbench_accounts FROM STDIN (format TEXT, force_not_null *)", "COPY FORCE_NOT_NULL requires CSV mode"},
+		{"COPY pgbench_accounts TO STDOUT (format CSV, force_not_null(aid))", "COPY FORCE_NOT_NULL cannot be used with COPY TO"},
+		{"COPY pgbench_accounts TO STDOUT (format CSV, force_not_null *)", "COPY FORCE_NOT_NULL cannot be used with COPY TO"},
+		{"COPY pgbench_accounts FROM STDIN (format TEXT, force_null(aid))", "COPY FORCE_NULL requires CSV mode"},
+		{"COPY pgbench_accounts FROM STDIN (format TEXT, force_null *)", "COPY FORCE_NULL requires CSV mode"},
+		{"COPY pgbench_accounts TO STDOUT (format CSV, force_null(aid))", "COPY FORCE_NULL cannot be used with COPY TO"},
+		{"COPY pgbench_accounts TO STDOUT (format CSV, force_null *)", "COPY FORCE_NULL cannot be used with COPY TO"},
+		{"COPY pgbench_accounts TO STDOUT (format BINARY, on_error unsupported)", "COPY ON_ERROR cannot be used with COPY TO"},
+		{"COPY pgbench_accounts FROM STDIN (log_verbosity unsupported)", "COPY LOG_VERBOSITY \"unsupported\" not recognized"},
+		{"COPY pgbench_accounts FROM STDIN with (reject_limit 1)", "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE"},
+		{"COPY pgbench_accounts FROM STDIN with (on_error ignore, reject_limit 0)", "REJECT_LIMIT (0) must be greater than zero"},
+	}
+	for _, tc := range cases {
+		_, err := Plan(parseOne(t, tc.sql), cat)
+		if err == nil {
+			t.Errorf("expected error for %q", tc.sql)
+			continue
+		}
+		pe, ok := err.(*PlanError)
+		if !ok {
+			t.Errorf("unexpected error type for %q: %T", tc.sql, err)
+			continue
+		}
+		if pe.Message != tc.want {
+			t.Errorf("for %q:\n got  %q\n want %q", tc.sql, pe.Message, tc.want)
+		}
+	}
+
+	// Valid combinations must still plan (no false positives).
+	ok := []string{
+		"COPY pgbench_accounts TO STDOUT (format CSV, force_quote *)",
+		"COPY pgbench_accounts TO STDOUT (format CSV, force_quote (aid))",
+		"COPY pgbench_accounts FROM STDIN (format CSV, force_not_null (aid))",
+		"COPY pgbench_accounts FROM STDIN (format CSV, force_null (aid))",
+		"COPY pgbench_accounts FROM STDIN (format BINARY)",
+		"COPY pgbench_accounts FROM STDIN (on_error ignore)",
+		"COPY pgbench_accounts FROM STDIN (on_error ignore, reject_limit 5)",
+		"COPY pgbench_accounts FROM STDIN (log_verbosity verbose)",
+		"COPY pgbench_accounts TO STDOUT (format CSV, header)",
+	}
+	for _, sql := range ok {
+		if _, err := Plan(parseOne(t, sql), cat); err != nil {
+			t.Errorf("expected accept for %q: %v", sql, err)
 		}
 	}
 }
