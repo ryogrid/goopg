@@ -1075,27 +1075,32 @@ M0097-0001 wires it up.
         (`internal/planner/planner_test.go`). Design:
         `docs/design/0097-0003b-serial-pseudotype-integer-typecheck.md`. Verified
         live on 5533.
+      - **Progress 2026-05-25 (loop — set-op trailing ORDER BY binding):**
+        CLOSED the top remaining `copyselect` blocker. `A UNION B ORDER BY 1`
+        parked the trailing `ORDER BY`/`LIMIT`/`OFFSET` on the RHS branch
+        (parsed via recursive `parseSelect`), so it applied to `B` alone and —
+        for `copyselect`'s `… UNION select * from v_test1 ORDER BY 1` — hit
+        `42601 "'*' is not allowed here"` (positional sort resolved against an
+        unexpanded star on the standalone branch). The planner's
+        `wrapSetOpSortLimit` already resolves these against the *combined*
+        set-op output but reads them from the outer `SelectStmt`, which was
+        empty. Fix (`internal/parser/select.go`, `parseSelect`): after
+        `s.SetOp = setOp`, lift the RHS branch's trailing
+        `OrderBy`/`Limit`/`Offset` up to `s` when `s` carries none of its own;
+        chains lift bottom-up (each recursive level lifts from its RHS) so the
+        outermost SELECT ends up owning them. Safe because a set-op operand
+        cannot legitimately carry its own trailing clause in this grammar
+        (parenthesised `(SELECT … ORDER BY …)` goes through the subquery path).
+        Tests: `TestParseSetOpTrailingOrderByBindsToWhole`,
+        `TestParseSetOpChainTrailingOrderBy` (`internal/parser/select_test.go`).
+        Verified end-to-end on port 5599: `copy (select t from test1 where
+        id = 1 UNION select * from v_test1 ORDER BY 1) to stdout` and the nested
+        derived-table form both succeed; `'*' is not allowed here` gone. Design:
+        `docs/design/0097-0024b-setop-trailing-orderby-binding.md`.
       - **Remaining copyselect gaps (independent features, next COPY wins):**
-        1. **Trailing `ORDER BY 1` greedily attached to the right set-op
-           branch** → `42601 "'*' is not allowed here"`. CORRECTED DIAGNOSIS
-           (verified live 2026-05-25): `select * from v_test1` works standalone;
-           the failure is `select * from v_test1 ORDER BY 1` where positional
-           `1` resolves to the `*` target (`orderBySubstitution` → `analyzeExpr`
-           on the StarExpr → `analyzer.go:769`). `parseSelect`
-           (`internal/parser/select.go`) parses `ORDER BY` (line ~130) BEFORE
-           `parseSetOpClause` (line ~188), and the set-op RHS is parsed via a
-           full recursive `parseSelect`, so `A UNION B ORDER BY 1` attaches the
-           ORDER BY to B (the right branch) instead of the whole set op. Per SQL
-           grammar a trailing ORDER BY/LIMIT/OFFSET binds to the entire set
-           operation. **Fix:** in `parseSelect`, after assigning `s.SetOp`, lift
-           the immediate `s.SetOp.Right`'s trailing OrderBy/Limit/Offset up to
-           `s` when `s` lacks them (chains lift bottom-up so the outermost
-           collects them); then `wrapSetOpSortLimit(s, …)` resolves positional 1
-           against the combined output and the right branch's `*` expands
-           cleanly. **This is the top remaining copyselect blocker.**
-        2. `COPY (SELECT … INTO …)` rejection (`ERROR: COPY (SELECT INTO) is
+        1. `COPY (SELECT … INTO …)` rejection (`ERROR: COPY (SELECT INTO) is
            not supported`).
-        3. psql multi-command `\;`/`\.` STDIN handling
+        2. psql multi-command `\;`/`\.` STDIN handling
            (`expected exactly one COPY statement`; internal "planner.Copy has
            no executor path yet" leak on `select 1/0\; copy …`).
 

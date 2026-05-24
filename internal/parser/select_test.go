@@ -198,6 +198,65 @@ func TestParseSelectSetOps(t *testing.T) {
 	}
 }
 
+// TestParseSetOpTrailingOrderByBindsToWhole verifies that a trailing
+// ORDER BY / LIMIT / OFFSET written after the final set-op branch binds to
+// the entire set operation, not the right branch alone. parseSetOpClause
+// parses the RHS recursively (which greedily attaches them), so parseSelect
+// must lift them up to the outermost SELECT. Regression for copyselect's
+// `… UNION … ORDER BY 1`. M0097-0024.
+func TestParseSetOpTrailingOrderByBindsToWhole(t *testing.T) {
+	stmts, err := Parse("SELECT a FROM t UNION SELECT b FROM u ORDER BY 1 LIMIT 5 OFFSET 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if s.SetOp == nil || s.SetOp.Type != SetOpUnion {
+		t.Fatalf("setop=%+v", s.SetOp)
+	}
+	// The trailing clauses must live on the outer SELECT, not the RHS.
+	if len(s.OrderBy) != 1 {
+		t.Fatalf("outer OrderBy=%+v, want 1 key", s.OrderBy)
+	}
+	if ic, ok := s.OrderBy[0].Expr.(*IntegerConst); !ok || ic.Value != 1 {
+		t.Errorf("outer OrderBy[0]=%+v, want positional 1", s.OrderBy[0].Expr)
+	}
+	if s.Limit == nil || s.Offset == nil {
+		t.Errorf("outer Limit=%v Offset=%v, want both set", s.Limit, s.Offset)
+	}
+	rhs := s.SetOp.Right
+	if rhs == nil {
+		t.Fatal("nil rhs")
+	}
+	if rhs.OrderBy != nil || rhs.Limit != nil || rhs.Offset != nil {
+		t.Errorf("rhs retained trailing clauses: OrderBy=%+v Limit=%v Offset=%v", rhs.OrderBy, rhs.Limit, rhs.Offset)
+	}
+}
+
+// TestParseSetOpChainTrailingOrderBy verifies the bottom-up lift for a
+// three-branch chain: `A UNION B UNION C ORDER BY 1` must land ORDER BY on
+// the outermost SELECT (A), with neither B nor C retaining it. M0097-0024.
+func TestParseSetOpChainTrailingOrderBy(t *testing.T) {
+	stmts, err := Parse("SELECT a FROM t UNION SELECT b FROM u UNION SELECT c FROM v ORDER BY 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if len(s.OrderBy) != 1 {
+		t.Fatalf("outer OrderBy=%+v, want 1 key", s.OrderBy)
+	}
+	b := s.SetOp.Right
+	if b == nil || b.SetOp == nil {
+		t.Fatalf("expected nested set op on rhs, got %+v", b)
+	}
+	if b.OrderBy != nil {
+		t.Errorf("middle branch retained OrderBy=%+v", b.OrderBy)
+	}
+	c := b.SetOp.Right
+	if c == nil || c.OrderBy != nil {
+		t.Errorf("last branch retained OrderBy=%+v", c)
+	}
+}
+
 func TestParseSelectNaturalJoin(t *testing.T) {
 	stmts, err := Parse("SELECT * FROM a NATURAL JOIN b")
 	if err != nil {
@@ -230,7 +289,6 @@ func TestParseSelectFunctionCall(t *testing.T) {
 	}
 }
 
-
 // TestParseFuncCallVariadicArgument pins parser acceptance of the VARIADIC
 // keyword as a prefix on a function-call argument. libpqrcv's
 // fetch_table_list probe emits this shape against
@@ -257,7 +315,6 @@ func TestParseFuncCallVariadicArgument(t *testing.T) {
 		t.Fatalf("expected VARIADIC flag on arg 0, got false")
 	}
 }
-
 
 // TestParseLateralPgCatalogQualifiedSRF pins M0103-0008 rung 13: the
 // parser's FROM-clause TVF dispatch must accept both unqualified and
@@ -321,7 +378,6 @@ func TestParseLateralPgCatalogQualifiedSRFCaseInsensitive(t *testing.T) {
 	}
 }
 
-
 // TestParseRangeVarBareAliasWithColumnList pins the
 // `tablename alias (col1, col2, ...)` shape — column-alias list
 // after a bare (no-AS) alias.  Used by upstream's MERGE JOIN
@@ -368,7 +424,6 @@ func TestParseRangeVarBareAliasMultiColumnList(t *testing.T) {
 		t.Fatalf("Columns=%v, want [a b]", rv.Columns)
 	}
 }
-
 
 // TestParseIndirectionStarFuncCall — `(srf(args)).*` in target list emits
 // an IndirectionStar AST node wrapping the inner FuncCall. M0103-0008

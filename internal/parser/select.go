@@ -65,9 +65,9 @@ func (p *parser) parseSelect() (Stmt, error) {
 		star := &StarExpr{pos: pos}
 		rv := RangeVar{pos: pos, Schema: tbl.Schema, Name: tbl.Name}
 		s := &SelectStmt{
-			pos:      pos,
-			Targets:  []ResTarget{{Expr: star}},
-			From:     []RangeVar{rv},
+			pos:       pos,
+			Targets:   []ResTarget{{Expr: star}},
+			From:      []RangeVar{rv},
 			FromExprs: []FromExpr{{pos: pos, Base: rv}},
 		}
 		return s, nil
@@ -189,6 +189,29 @@ func (p *parser) parseSelect() (Stmt, error) {
 		return nil, err
 	} else if ok {
 		s.SetOp = setOp
+		// A trailing ORDER BY / LIMIT / OFFSET written after the final
+		// set-op branch binds to the *entire* set operation (SQL §7.6),
+		// not the right branch alone. parseSetOpClause parses the RHS via
+		// a full recursive parseSelect, which greedily attaches them to
+		// that branch; lift them up to s when s carries none of its own.
+		// Chains lift bottom-up (each recursive level lifts from its RHS),
+		// so the outermost SELECT ends up owning them and the planner's
+		// wrapSetOpSortLimit resolves them against the combined output
+		// (e.g. copyselect's `… UNION … ORDER BY 1`). M0097-0024.
+		if right := setOp.Right; right != nil {
+			if s.OrderBy == nil && right.OrderBy != nil {
+				s.OrderBy = right.OrderBy
+				right.OrderBy = nil
+			}
+			if s.Limit == nil && right.Limit != nil {
+				s.Limit = right.Limit
+				right.Limit = nil
+			}
+			if s.Offset == nil && right.Offset != nil {
+				s.Offset = right.Offset
+				right.Offset = nil
+			}
+		}
 	}
 	// Trailing locking clause(s) — `FOR UPDATE / FOR SHARE [OF
 	// …] [NOWAIT | SKIP LOCKED]`. M0021-0001 step 1 (parser
@@ -874,19 +897,19 @@ func (p *parser) parseSortItem() (SortBy, error) {
 // Precedence levels (higher binds tighter), aligned with upstream's
 // gram.y operator precedence.
 const (
-	precOr         = 1
-	precAnd        = 2
-	precNot        = 3
-	precIs         = 4
-	precCompare    = 5 // = <> < > <= >=
-	precBitOr      = 5 // | (same as compare in PG)
-	precBitXor     = 5 // # (same as compare in PG)
-	precBitAnd     = 6 // & (higher than | in PG)
-	precBitShift   = 6 // << >> (same as & in PG)
-	precAddSub     = 7
-	precMulDiv     = 8
-	precConcat     = 9
-	precUnary      = 10
+	precOr       = 1
+	precAnd      = 2
+	precNot      = 3
+	precIs       = 4
+	precCompare  = 5 // = <> < > <= >=
+	precBitOr    = 5 // | (same as compare in PG)
+	precBitXor   = 5 // # (same as compare in PG)
+	precBitAnd   = 6 // & (higher than | in PG)
+	precBitShift = 6 // << >> (same as & in PG)
+	precAddSub   = 7
+	precMulDiv   = 8
+	precConcat   = 9
+	precUnary    = 10
 )
 
 // parseExpr drives the precedence-climbing loop.
