@@ -1116,16 +1116,33 @@ M0097-0001 wires it up.
         `TestPlanCopySelectIntoRejected` (planner). Verified live on 5599:
         exact ERROR line; plain `COPY (SELECT …)` still streams. Design:
         `docs/design/0097-0024c-copy-select-into-rejection.md`.
+      - **Progress 2026-05-25 (loop — query-form FROM / column-list syntax
+        errors):** Closed gap #1. The parenthesised-query form of COPY is
+        TO-only and column-list-free in PG's grammar (`gram.y`), so
+        `copy (select * from test1) from stdin` → `syntax error at or near
+        "from"` and `copy (select * from test1) (t,id) to stdout` → `… near
+        "("` — plain syntax errors anchored at the offending token. goopg
+        leaked a byte-0 `COPY (query) is only valid with TO` and a generic
+        `expected FROM or TO` message. Fix (`parseCopy`,
+        `internal/parser/copy.go`): split direction handling on source form —
+        the query form accepts only `TO`, otherwise returns
+        `p.errSyntaxAtCur()` (new bare `syntax error at or near "TOKEN"` helper
+        in `parser.go`, no `(got X)` suffix); removes the old post-hoc
+        TO-only check. **Sibling wire fix** (`dispatchCopyViaExecutor`,
+        `internal/server/copy.go`): the COPY parse-error arm rendered
+        `err.Error()` directly, leaking ` (byte N)` and dropping the caret —
+        now threads `syntaxErrorMsg(err)` (the same helper the main
+        simple-query path uses) so psql shows `LINE 1:` + `^`. Tests:
+        `TestParseCopyQueryFromRejected`, `TestParseCopyQueryColumnListRejected`
+        (`internal/parser/copy_test.go`). Verified live on 5599: both emit the
+        exact PG ERROR + LINE + caret; plain `copy (select …) to stdout` still
+        streams; `copyselect` regress diff loses all four gap-#1 lines. Design:
+        `docs/design/0097-0024d-copy-query-form-syntax-errors.md`.
       - **Remaining copyselect gaps (independent features, next COPY wins):**
-        1. `copy (select * from test1) from stdin` — PG: `syntax error at or
-           near "from"` (query form is TO-only in the grammar); goopg leaks its
-           own `COPY (query) is only valid with TO` message at byte 0. And
-           `copy (select * from test1) (t,id) to stdout` — PG: `syntax error at
-           or near "("` (no column list on the query form). Both need a syntax
-           error positioned at the offending token.
-        2. psql multi-command `\;`/`\.` STDIN handling
+        1. psql multi-command `\;`/`\.` STDIN handling
            (`expected exactly one COPY statement`; internal "planner.Copy has
-           no executor path yet" leak on `select 1/0\; copy …`).
+           no executor path yet" leak on `select 1/0\; copy …`). This is the
+           only remaining `copyselect` gap.
 
 - [ ] **M0097-0025 — Port view / MV / rules regress tests**
       - Summary: Make these 5 tests reach `pass`:

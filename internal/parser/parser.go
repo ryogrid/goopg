@@ -211,6 +211,21 @@ func (p *parser) errAtCur(msg string) error {
 	return &SyntaxError{Pos: t.Pos, Message: msg + " (got " + near + ")"}
 }
 
+// errSyntaxAtCur returns a bare PostgreSQL-style "syntax error at or
+// near \"TOKEN\"" anchored at the current token, with no explanatory
+// suffix. Used where upstream's grammar simply has no production for
+// what follows (e.g. a FROM or column list after the query form of
+// COPY), so the diagnostic should point at the offending token and
+// say nothing more.
+func (p *parser) errSyntaxAtCur() error {
+	t := p.cur()
+	near := t.Value
+	if t.Kind == TokenEOF {
+		near = "end of input"
+	}
+	return &SyntaxError{Pos: t.Pos, Message: near}
+}
+
 // expectKeyword consumes the current token if it's the named keyword;
 // otherwise it returns a syntax error.
 func (p *parser) expectKeyword(kw Keyword) (Token, error) {

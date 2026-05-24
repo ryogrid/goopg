@@ -72,17 +72,27 @@ func (p *parser) parseCopy() (Stmt, error) {
 		}
 	}
 
-	// Direction.
-	switch {
-	case p.acceptKeyword(KwFrom):
-		stmt.Direction = CopyFrom
-	case p.acceptKeyword(KwTo):
+	// Direction. The parenthesised-query form (`COPY (query) TO …`) is
+	// TO-only in PostgreSQL's grammar (gram.y has no FROM nor a
+	// column-list production for it), so a trailing FROM or `(col…)`
+	// must surface as a syntax error anchored at the offending token —
+	// e.g. `copy (select …) from stdin` → `syntax error at or near
+	// "from"`, and `copy (select …) (t,id) to stdout` → `… near "("`.
+	// M0097-0024.
+	if stmt.Query != nil || stmt.QueryDML != nil {
+		if !p.acceptKeyword(KwTo) {
+			return nil, p.errSyntaxAtCur()
+		}
 		stmt.Direction = CopyTo
-	default:
-		return nil, p.errAtCur("expected FROM or TO in COPY")
-	}
-	if (stmt.Query != nil || stmt.QueryDML != nil) && stmt.Direction != CopyTo {
-		return nil, &SyntaxError{Pos: t.Pos, Message: "COPY (query) is only valid with TO"}
+	} else {
+		switch {
+		case p.acceptKeyword(KwFrom):
+			stmt.Direction = CopyFrom
+		case p.acceptKeyword(KwTo):
+			stmt.Direction = CopyTo
+		default:
+			return nil, p.errAtCur("expected FROM or TO in COPY")
+		}
 	}
 
 	// Endpoint: STDIN / STDOUT / PROGRAM 'cmd' / 'file'.

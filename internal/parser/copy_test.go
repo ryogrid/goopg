@@ -168,6 +168,51 @@ func TestParseCopyDMLFromRejected(t *testing.T) {
 	}
 }
 
+// TestParseCopyQueryFromRejected: the parenthesised-query form of COPY
+// is TO-only in PostgreSQL's grammar, so a trailing FROM is a syntax
+// error anchored at the `from` token (not goopg's old byte-0
+// "COPY (query) is only valid with TO" leak). M0097-0024 / copyselect.
+func TestParseCopyQueryFromRejected(t *testing.T) {
+	src := "copy (select * from test1) from stdin"
+	_, err := Parse(src)
+	if err == nil {
+		t.Fatal("expected syntax error for COPY (query) FROM, got nil")
+	}
+	se, ok := err.(*SyntaxError)
+	if !ok {
+		t.Fatalf("got %T (%v), want *SyntaxError", err, err)
+	}
+	if se.Message != "from" {
+		t.Errorf("Message=%q, want %q", se.Message, "from")
+	}
+	// Pos must point at the *direction* FROM (the second "from"), not at
+	// the FROM inside the SELECT, so psql's caret lands correctly.
+	if want := len("copy (select * from test1) "); se.Pos != want {
+		t.Errorf("Pos=%d, want %d (the trailing FROM)", se.Pos, want)
+	}
+}
+
+// TestParseCopyQueryColumnListRejected: the query form takes no column
+// list; `copy (select …) (t,id) …` is a syntax error at the opening
+// paren. M0097-0024 / copyselect.
+func TestParseCopyQueryColumnListRejected(t *testing.T) {
+	src := "copy (select * from test1) (t,id) to stdout"
+	_, err := Parse(src)
+	if err == nil {
+		t.Fatal("expected syntax error for COPY (query) (cols), got nil")
+	}
+	se, ok := err.(*SyntaxError)
+	if !ok {
+		t.Fatalf("got %T (%v), want *SyntaxError", err, err)
+	}
+	if se.Message != "(" {
+		t.Errorf("Message=%q, want %q", se.Message, "(")
+	}
+	if want := len("copy (select * from test1) "); se.Pos != want {
+		t.Errorf("Pos=%d, want %d (the column-list paren)", se.Pos, want)
+	}
+}
+
 // TestParseCopyFileEndpoints: filename + PROGRAM. v0 parses these so
 // the analyzer/executor can return a stable "not supported" error
 // rather than a generic syntax error.

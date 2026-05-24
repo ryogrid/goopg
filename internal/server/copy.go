@@ -94,7 +94,13 @@ func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter,
 func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameWriter, sql string, connTx *connTxState) (*copyInState, error) {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
-		if err := s.writeQueryError(w, sqlstate.SyntaxError, err.Error()); err != nil {
+		// Render parser syntax errors the same way the main simple-query
+		// path does: strip the internal " (byte N)" suffix and attach the
+		// Position field so psql shows `LINE n:` with a caret. Without
+		// this the COPY path leaked e.g. `syntax error at or near "from"
+		// (byte 27)` and no caret. M0097-0024.
+		msg, extra := syntaxErrorMsg(err)
+		if err := s.writeQueryError(w, sqlstate.SyntaxError, msg, extra...); err != nil {
 			return nil, err
 		}
 		return nil, nil
