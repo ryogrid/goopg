@@ -1402,13 +1402,22 @@ func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		innerCtx.rels = rels
 	}
 	innerCols := make([]catalog.Column, 0, len(cte.Query.Targets))
-	for i, tgt := range cte.Query.Targets {
+	for _, tgt := range cte.Query.Targets {
+		// A top-level `*` / `t.*` in the CTE body must materialise into
+		// the inner scope's concrete columns — analyzeExpr rejects a
+		// bare StarExpr ("'*' is not allowed here"). Mirrors
+		// synthesizeSubqueryTable's derived-table star handling; keep
+		// the two in sync. M0097-0003.
+		if star, ok := tgt.Expr.(*parser.StarExpr); ok {
+			innerCols = append(innerCols, expandInnerStarColumns(star, innerCtx)...)
+			continue
+		}
 		name := tgt.Alias
 		if name == "" {
 			name = deriveAnalyzerTargetName(tgt.Expr)
 		}
 		if name == "" {
-			name = fmt.Sprintf("?column?%d", i+1)
+			name = fmt.Sprintf("?column?%d", len(innerCols)+1)
 		}
 		typ, err := analyzeExpr(tgt.Expr, innerCtx)
 		if err != nil {
@@ -1483,6 +1492,30 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 // fallback is safe for vacuumdb's CROSS JOIN LATERAL use case where the
 // produced column (inherited) is never referenced in the WHERE clause
 // for basic vacuum runs. See docs/design/0003-0014-derived-tables.md.
+// expandInnerStarColumns materialises a target-list StarExpr into the
+// concrete column list of an inner SELECT's FROM scope. The analyzer uses
+// this when synthesising the columns of a derived relation — a derived
+// table (subquery) or a CTE body — where a top-level `*` must become real
+// columns rather than be type-checked as a scalar (analyzeExpr rejects a
+// bare StarExpr). An unqualified `*` expands every in-scope relation; a
+// qualified `t.*` expands only the matching relation. M0097-0003.
+func expandInnerStarColumns(star *parser.StarExpr, innerCtx *scope) []catalog.Column {
+	if innerCtx == nil {
+		return nil
+	}
+	qualified := star.Table != "" || star.Schema != ""
+	var cols []catalog.Column
+	for _, rel := range innerCtx.rels {
+		if qualified && !scopeRelMatches(rel, star.Table, star.Schema) {
+			continue
+		}
+		for _, col := range rel.table.Columns {
+			cols = append(cols, catalog.Column{Name: col.Name, Type: col.Type})
+		}
+	}
+	return cols
+}
+
 func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
 	// VALUES subquery: FROM (VALUES (r1), ...) AS t(c1, c2).
 	// The inner SelectStmt has no Targets; build the column list from the
@@ -1529,12 +1562,8 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.
 	for _, tgt := range rv.Subquery.Targets {
 		// Star expression in inner SELECT (e.g. TABLE tablename → SELECT * FROM tablename).
 		// Expand to all columns from the inner scope. M0097-0003.
-		if _, ok := tgt.Expr.(*parser.StarExpr); ok {
-			for _, rel := range innerCtx.rels {
-				for _, col := range rel.table.Columns {
-					cols = append(cols, catalog.Column{Name: col.Name, Type: col.Type})
-				}
-			}
+		if star, ok := tgt.Expr.(*parser.StarExpr); ok {
+			cols = append(cols, expandInnerStarColumns(star, innerCtx)...)
 			continue
 		}
 		// `(srf(...)).*` inside a derived subquery — expand to the SRF's

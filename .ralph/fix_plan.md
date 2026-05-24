@@ -1066,11 +1066,31 @@ M0097-0001 wires it up.
         (verified end-to-end on port 5533). Tests: `TestParseCollatePostfix`,
         `TestPgWaitEventsCoversAllTypes`. Design:
         `docs/design/0097-0032c-collate-postfix-and-wait-event-types.md`.
+      - **Progress 2026-05-25 (loop — CTE `SELECT *` body expansion):** Fixed a
+        general analyzer defect that made `sysviews` emit a spurious trailing
+        `ERROR: '*' is not allowed here`. Root cause: `registerAnalyzedCTE`
+        (`internal/analyzer/analyzer.go`) fed each non-recursive CTE body target
+        straight into `analyzeExpr`, which rejects a bare `*parser.StarExpr`
+        (42601) — so any `WITH x AS (SELECT * FROM t) …` failed, not just the
+        sysviews `with contexts as (select * from pg_backend_memory_contexts)`
+        query. The sibling derived-table path (`synthesizeSubqueryTable`) already
+        expanded stars, so `FROM (SELECT * …) x` worked while the CTE form did
+        not. Fix: new shared helper `expandInnerStarColumns(star, innerCtx)`
+        materialises an unqualified `*` (all in-scope rels) or qualified `t.*`
+        (matching rel only) into concrete columns; both `registerAnalyzedCTE`
+        and `synthesizeSubqueryTable` now call it (kept in sync per the
+        sibling-paths rule). Regression tests: `TestAnalyzeWithCTEStarBodyExpands`,
+        `TestAnalyzeWithCTEStarBodyKnowsColumnSet`
+        (`internal/analyzer/analyzer_with_test.go`). Verified end-to-end on port
+        5599 + via `GOOPG_REGRESS_DIFF_DIR`: sysviews trailing star error gone.
+        NOTE: `WITH RECURSIVE` bodies with `SELECT *` still error (separate
+        `analyzeRecursiveCTE` path — anchor columns unknown pre-analysis; left
+        as remaining `with`-test work).
       - **Remaining sysviews gaps (separate subsystems):**
         `pg_backend_memory_contexts` introspection (`TopMemoryContext
         total_bytes >= free_bytes`, Bump-context + `CacheMemoryContext` child
-        rows — a Go-runtime design constraint), and `pg_hba_file_rules` `no_err`
-        FILTER (errors column non-null).
+        rows — a Go-runtime design constraint), and `pg_hba_file_rules` /
+        `pg_ident_file_mappings` `no_err` FILTER (errors column non-null).
 
 - [ ] **M0097-0033 — Port test_setup regress test**
       - Summary: Make `test_setup` reach `pass`.

@@ -119,6 +119,38 @@ func TestAnalyzeWithoutCTEUnchanged(t *testing.T) {
 	}
 }
 
+// TestAnalyzeWithCTEStarBodyExpands: a CTE whose body is
+// `SELECT *` must expand the star into the inner relation's
+// columns so the outer query can reference them by name.
+// Before the registerAnalyzedCTE star-handling fix this errored
+// with 42601 ("'*' is not allowed here") because the CTE body's
+// target list was fed straight into analyzeExpr, which rejects a
+// bare StarExpr. M0097-0003 regression guard.
+func TestAnalyzeWithCTEStarBodyExpands(t *testing.T) {
+	cat := analyzerCatalog(t)
+	for _, sql := range []string{
+		"WITH a AS (SELECT * FROM pgbench_accounts) SELECT aid FROM a",
+		"WITH a AS (SELECT * FROM pgbench_accounts) SELECT abalance FROM a",
+		"WITH a AS (SELECT pgbench_accounts.* FROM pgbench_accounts) SELECT aid FROM a",
+		"WITH a AS (SELECT * FROM pgbench_accounts) SELECT * FROM a",
+	} {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Errorf("Analyze(%q): %v", sql, err)
+		}
+	}
+}
+
+// TestAnalyzeWithCTEStarBodyKnowsColumnSet confirms the star
+// expanded to a concrete column set rather than a permissive
+// wildcard: a reference to a column the inner relation does not
+// have still fails with 42703. Pins the expansion's correctness.
+func TestAnalyzeWithCTEStarBodyKnowsColumnSet(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"WITH a AS (SELECT * FROM pgbench_accounts) SELECT no_such_col FROM a",
+		"42703")
+}
+
 // TestAnalyzeWithCTEErrorsBubbleUp: a type/column error inside
 // a CTE body must surface from Analyze (not silently be
 // ignored). Pins the recursion through analyzeSelectWithParent.
