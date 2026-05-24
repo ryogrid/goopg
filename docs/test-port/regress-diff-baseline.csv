@@ -19,7 +19,7 @@ time,0,pass
 varchar,0,pass
 functional_deps,21,failed
 sysviews,33,failed
-copydml,44,failed
+copydml,45,failed
 copyselect,59,failed
 errors,60,failed
 hash_part,73,failed

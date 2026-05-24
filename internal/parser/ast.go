@@ -101,7 +101,7 @@ func (s *RollbackToSavepointStmt) stmtNode() {}
 // at execution time; they exist so vacuumdb SQL round-trips without
 // a parser error.
 type VacuumStmt struct {
-	pos     int
+	pos int
 	// Options settable via both legacy and parenthesized syntax.
 	Verbose bool
 	Analyze bool
@@ -117,8 +117,8 @@ type VacuumStmt struct {
 	SkipDatabaseStats   bool
 	OnlyDatabaseStats   bool
 	SkipLocked          bool
-	ParallelWorkers     int    // -1 = not specified
-	BufferUsageLimit    string // "" = not specified
+	ParallelWorkers     int          // -1 = not specified
+	BufferUsageLimit    string       // "" = not specified
 	Targets             []ObjectName // empty -> all relations
 }
 
@@ -141,12 +141,12 @@ func (s *AnalyzeStmt) stmtNode() {}
 // M0095-0005: no-op executor stub; parser accepts the full syntax so
 // reindexdb can interact with goopg without syntax errors.
 type ReindexStmt struct {
-	pos         int
-	Verbose     bool
+	pos          int
+	Verbose      bool
 	Concurrently bool
 	// Object type: one of "INDEX", "TABLE", "DATABASE", "SCHEMA", "SYSTEM".
-	ObjectType  string
-	Name        string // qualified relation / database / schema name
+	ObjectType string
+	Name       string // qualified relation / database / schema name
 }
 
 func (s *ReindexStmt) Pos() int  { return s.pos }
@@ -232,13 +232,13 @@ const (
 
 // MergeWhenClause describes one WHEN MATCHED / WHEN NOT MATCHED arm.
 type MergeWhenClause struct {
-	pos       int
-	Matched   bool            // true = WHEN MATCHED, false = WHEN NOT MATCHED
+	pos     int
+	Matched bool // true = WHEN MATCHED, false = WHEN NOT MATCHED
 	// BySource is true for WHEN NOT MATCHED BY SOURCE. M0097-0016.
-	BySource  bool
+	BySource bool
 	// ByTarget is true for WHEN NOT MATCHED BY TARGET (same as NOT MATCHED). M0097-0016.
 	ByTarget  bool
-	Condition Expr            // optional AND condition; nil when absent
+	Condition Expr // optional AND condition; nil when absent
 	Action    MergeActionKind
 
 	// For UPDATE: set assignments and optional WHERE.
@@ -254,11 +254,11 @@ func (w *MergeWhenClause) Pos() int { return w.pos }
 // MergeStmt — `MERGE INTO target USING source ON cond WHEN … THEN …`.
 // M0096-0010.
 type MergeStmt struct {
-	pos      int
-	Target   RangeVar        // merge target table (with optional alias)
-	Source   RangeVar        // USING source (table or subquery, with alias)
-	On       Expr            // join condition
-	Clauses  []*MergeWhenClause
+	pos     int
+	Target  RangeVar // merge target table (with optional alias)
+	Source  RangeVar // USING source (table or subquery, with alias)
+	On      Expr     // join condition
+	Clauses []*MergeWhenClause
 	// Returning holds the RETURNING target list. M0097-0016.
 	// Parsed but not executed (v0 no-op).
 	Returning []ResTarget
@@ -278,18 +278,20 @@ const (
 )
 
 // CreateTriggerStmt — `CREATE [CONSTRAINT] TRIGGER name
-//   BEFORE|AFTER|INSTEAD OF {INSERT|UPDATE|DELETE[, ...]}
-//   ON table FOR [EACH] {ROW|STATEMENT}
-//   EXECUTE {FUNCTION|PROCEDURE} funcname()`.
+//
+//	BEFORE|AFTER|INSTEAD OF {INSERT|UPDATE|DELETE[, ...]}
+//	ON table FOR [EACH] {ROW|STATEMENT}
+//	EXECUTE {FUNCTION|PROCEDURE} funcname()`.
+//
 // M0096-0012.
 type CreateTriggerStmt struct {
-	pos      int
-	Name     string
-	Table    ObjectName
-	Timing   TriggerTiming
-	Events   []string // "insert", "update", "delete"
-	ForEachRow bool   // true = ROW, false = STATEMENT
-	FuncName ObjectName
+	pos        int
+	Name       string
+	Table      ObjectName
+	Timing     TriggerTiming
+	Events     []string // "insert", "update", "delete"
+	ForEachRow bool     // true = ROW, false = STATEMENT
+	FuncName   ObjectName
 	// IfNotExists: PostgreSQL 14+ only, not supported yet.
 }
 
@@ -312,10 +314,10 @@ func (s *DropTriggerStmt) stmtNode() {}
 // M0095-0008: no-op executor stub.  When a table name is provided the
 // executor verifies the table exists; without a table it always succeeds.
 type ClusterStmt struct {
-	pos        int
-	Verbose    bool
-	Target     *ObjectName // nil when CLUSTER is called with no table
-	IndexName  string      // optional USING clause
+	pos       int
+	Verbose   bool
+	Target    *ObjectName // nil when CLUSTER is called with no table
+	IndexName string      // optional USING clause
 }
 
 func (s *ClusterStmt) Pos() int  { return s.pos }
@@ -661,20 +663,20 @@ func (s *SelectStmt) stmtNode() {}
 // (M0017-0001) is nil when no ON CONFLICT clause is present —
 // existing INSERT call sites are byte-for-byte unchanged.
 type InsertStmt struct {
-	pos        int
-	With       *WithClause
-	Target     RangeVar
-	Columns    []string // empty when no column list — INSERT defaults to declared order
-	Rows       [][]Expr // each row is a parenthesised tuple; nil when Select != nil or DefaultValues
-	Select     *SelectStmt // INSERT … SELECT support (M0096-0006); nil when Rows != nil
+	pos     int
+	With    *WithClause
+	Target  RangeVar
+	Columns []string    // empty when no column list — INSERT defaults to declared order
+	Rows    [][]Expr    // each row is a parenthesised tuple; nil when Select != nil or DefaultValues
+	Select  *SelectStmt // INSERT … SELECT support (M0096-0006); nil when Rows != nil
 	// DefaultValues is true for `INSERT INTO t DEFAULT VALUES` — the
 	// all-defaults form. Mutually exclusive with Rows/Select; Rows stays
 	// nil at parse time. The planner expands this into a single row of
 	// DefaultMarkers sized to the target's insertable columns. M0103-0007
 	// rung 17.
 	DefaultValues bool
-	OnConflict *OnConflictClause
-	Returning  []ResTarget
+	OnConflict    *OnConflictClause
+	Returning     []ResTarget
 }
 
 // OnConflictAction enumerates the action the conflict resolver runs
@@ -704,13 +706,13 @@ const (
 // B in M0017; the parser already accepts it so the AST shape is
 // stable across stages.
 type OnConflictTarget struct {
-	pos        int
-	Columns    []string // populated for `ON CONFLICT (col [, col, …])`
+	pos     int
+	Columns []string // populated for `ON CONFLICT (col [, col, …])`
 	// Exprs holds the parsed expression for expression-based conflict columns
 	// (e.g. lower(key)). Parallel to Columns: Exprs[i] is non-nil when
 	// Columns[i] == "" (expression column); nil for plain column names.
 	Exprs      []Expr
-	Constraint string   // populated for `ON CONFLICT ON CONSTRAINT name`
+	Constraint string // populated for `ON CONFLICT ON CONSTRAINT name`
 }
 
 // Pos returns the position of the leading token of the target
@@ -799,11 +801,11 @@ func (c ColumnType) Pos() int { return c.pos }
 type FKAction int
 
 const (
-	FKActionNoAction  FKAction = iota // NO ACTION (default; deferrable)
-	FKActionRestrict                  // RESTRICT (always immediate)
-	FKActionCascade                   // CASCADE
-	FKActionSetNull                   // SET NULL
-	FKActionSetDefault                // SET DEFAULT
+	FKActionNoAction   FKAction = iota // NO ACTION (default; deferrable)
+	FKActionRestrict                   // RESTRICT (always immediate)
+	FKActionCascade                    // CASCADE
+	FKActionSetNull                    // SET NULL
+	FKActionSetDefault                 // SET DEFAULT
 )
 
 type ColumnDef struct {
@@ -826,11 +828,11 @@ type ColumnDef struct {
 
 	// FK fields — populated when the column has an inline REFERENCES clause.
 	// M0096-0011.
-	RefTable           ObjectName
-	RefColumns         []string // empty = use parent PK
-	OnDelete           FKAction
-	OnUpdate           FKAction
-	FKDeferrable       bool
+	RefTable            ObjectName
+	RefColumns          []string // empty = use parent PK
+	OnDelete            FKAction
+	OnUpdate            FKAction
+	FKDeferrable        bool
 	FKInitiallyDeferred bool
 
 	// CheckExpr holds the raw SQL expression for an inline CHECK constraint.
@@ -892,8 +894,8 @@ type PartitionByClause struct {
 // Only one of InValues, FromValues+ToValues, or Modulus+Remainder is populated.
 // M0096-0007; HASH bounds added M0097-0015.
 type PartitionOfClause struct {
-	pos      int
-	Parent   ObjectName
+	pos    int
+	Parent ObjectName
 	// LIST partitioning: FOR VALUES IN (v1, v2, …)
 	InValues []Expr
 	// RANGE partitioning: FOR VALUES FROM (lo) TO (hi)
@@ -923,7 +925,7 @@ type CreateIndexStmt struct {
 	// ColExprs holds the parsed expression for expression-based index columns
 	// (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil when
 	// Columns[i] == "" (expression column); nil for plain column names.
-	ColExprs    []Expr
+	ColExprs []Expr
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }
@@ -938,9 +940,10 @@ const (
 )
 
 // CreateSequenceStmt — `CREATE [TEMP] SEQUENCE [IF NOT EXISTS] name
-//   [AS datatype] [INCREMENT [BY] n] [MINVALUE n | NO MINVALUE]
-//   [MAXVALUE n | NO MAXVALUE] [START [WITH] n] [CACHE n]
-//   [NO CYCLE | CYCLE] [OWNED BY column]`. M0097-0009.
+//
+//	[AS datatype] [INCREMENT [BY] n] [MINVALUE n | NO MINVALUE]
+//	[MAXVALUE n | NO MAXVALUE] [START [WITH] n] [CACHE n]
+//	[NO CYCLE | CYCLE] [OWNED BY column]`. M0097-0009.
 type CreateSequenceStmt struct {
 	pos         int
 	Name        ObjectName
@@ -1038,10 +1041,10 @@ func (s *CreateMatViewStmt) stmtNode() {}
 // RefreshMatViewStmt — `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name
 // [WITH [NO] DATA]`. M0097-0013.
 type RefreshMatViewStmt struct {
-	pos         int
-	Name        ObjectName
+	pos          int
+	Name         ObjectName
 	Concurrently bool
-	WithNoData  bool
+	WithNoData   bool
 }
 
 func (s *RefreshMatViewStmt) Pos() int  { return s.pos }
@@ -1254,7 +1257,8 @@ type CopyStmt struct {
 	Direction CopyDirection
 	Table     ObjectName  // empty when Query is set
 	Columns   []string    // empty when no column list
-	Query     *SelectStmt // populated for COPY (query) TO …
+	Query     *SelectStmt // populated for COPY (SELECT …) TO …
+	QueryDML  Stmt        // populated for COPY (INSERT/UPDATE/DELETE … RETURNING) TO …
 	Endpoint  CopyEndpoint
 	Filename  string // filename or program command, when applicable
 	Options   []CopyOption
@@ -1319,13 +1323,13 @@ func (a FunctionArg) Pos() int { return a.pos }
 //
 // See docs/design/0015-0001-create-function-parser-and-ast.md.
 type CreateFunctionStmt struct {
-	pos       int
-	OrReplace bool
-	Name      ObjectName
-	Args      []FunctionArg
+	pos        int
+	OrReplace  bool
+	Name       ObjectName
+	Args       []FunctionArg
 	ReturnType ColumnType
-	Language  string // lower-cased, e.g. "plpgsql"
-	Body      string // raw source between the dollar-quote delimiters
+	Language   string // lower-cased, e.g. "plpgsql"
+	Body       string // raw source between the dollar-quote delimiters
 }
 
 func (s *CreateFunctionStmt) Pos() int  { return s.pos }

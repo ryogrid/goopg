@@ -141,6 +141,76 @@ func TestCopyToExecutorEndToEnd(t *testing.T) {
 	}
 }
 
+// TestCopyDMLReturningExecutorEndToEnd: COPY (INSERT … RETURNING) TO
+// STDOUT runs the INSERT, streams the RETURNING row as CopyData, and —
+// critically — commits BEFORE CommandComplete so the row is visible to
+// the very next command. A follow-up COPY items TO STDOUT must see it.
+// Regression for the commit-ordering bug where the client raced ahead
+// of the COPY transaction's commit. M0097-0009.
+func TestCopyDMLReturningExecutorEndToEnd(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "COPY (INSERT INTO items (id, label) VALUES (1, 'x') RETURNING id) TO STDOUT")
+	frames := readUntilReady(t, conn)
+	want := []byte{
+		protocol.MsgCopyOutResponse,
+		protocol.MsgCopyData,
+		protocol.MsgCopyDone,
+		protocol.MsgCommandComplete,
+		protocol.MsgReadyForQuery,
+	}
+	if len(frames) != len(want) {
+		t.Fatalf("frames=%d want=%d (%v)", len(frames), len(want), frameTypes(frames))
+	}
+	for i, w := range want {
+		if frames[i].Type != w {
+			t.Fatalf("frame[%d]=%q want %q", i, frames[i].Type, w)
+		}
+	}
+	if got := string(frames[1].Payload); got != "1\n" {
+		t.Errorf("RETURNING data=%q want %q", got, "1\n")
+	}
+	if tag := strings.TrimSuffix(string(frames[3].Payload), "\x00"); tag != "COPY 1" {
+		t.Errorf("command tag=%q want COPY 1", tag)
+	}
+
+	// The committed row must be visible to the next command.
+	writeQuery(t, conn, "COPY items TO STDOUT")
+	frames = readUntilReady(t, conn)
+	var dataRows []string
+	for _, f := range frames {
+		if f.Type == protocol.MsgCopyData {
+			dataRows = append(dataRows, string(f.Payload))
+		}
+	}
+	if len(dataRows) != 1 || dataRows[0] != "1\tx\n" {
+		t.Fatalf("after COPY(INSERT), COPY TO sees %v want [\"1\\tx\\n\"] (commit-ordering regression)", dataRows)
+	}
+}
+
+// TestCopyDMLNoReturningRejected: COPY (DML) without RETURNING has no
+// rows to copy; the planner rejects it before any CopyOutResponse.
+func TestCopyDMLNoReturningRejected(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	writeQuery(t, conn, "COPY (INSERT INTO items (id, label) VALUES (1, 'x')) TO STDOUT")
+	frames := readUntilReady(t, conn)
+	want := []byte{protocol.MsgErrorResponse, protocol.MsgReadyForQuery}
+	if len(frames) != len(want) {
+		t.Fatalf("frames=%d want=%d (%v)", len(frames), len(want), frameTypes(frames))
+	}
+	got := parseErrorFields(t, frames[0].Payload)
+	if !strings.Contains(got[protocol.FieldMessage], "RETURNING clause") {
+		t.Errorf("message=%q want RETURNING-clause error", got[protocol.FieldMessage])
+	}
+}
+
 // TestCopyExecutorUnknownTable: planner-stage 42P01 propagates as an
 // ErrorResponse without arming a CopyIn loop.
 func TestCopyExecutorUnknownTable(t *testing.T) {

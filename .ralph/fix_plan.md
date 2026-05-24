@@ -647,6 +647,37 @@ M0097-0001 wires it up.
         functions (`nextval`, `currval`, `setval`, `lastval`),
         `GENERATED ALWAYS AS IDENTITY`, `GENERATED ALWAYS AS (expr)
         STORED` and `VIRTUAL` column variants.
+      - Loop addition (2026-05-25): **COPY (INSERT/UPDATE/DELETE …
+        RETURNING) TO STDOUT**. `COPY (query) TO` previously accepted only
+        SELECT bodies (parse error `expected keyword select (got insert)`).
+        Now `CopyStmt.QueryDML Stmt` + `parseCopyInnerQuery`
+        (`internal/parser/copy.go`) dispatch INSERT/UPDATE/DELETE/WITH;
+        `planCopy` (`internal/planner/copy.go`) plans the DML through
+        `Plan`, requires RETURNING via `returningSchemaOf` (else
+        `0A000 "COPY query must have a RETURNING clause"`), and stashes
+        the RETURNING schema on the `Copy` node (`Insert.Output()` is nil).
+        `buildCopySource` (`internal/executor/copy.go`) now reads
+        `plan.Output()`. **Commit-ordering fix** in
+        `internal/server/copy.go`: old `runCopyTo` sent
+        `CommandComplete`+`ReadyForQuery` BEFORE the caller committed the
+        COPY-internal transaction, so COPY(DML) writes were invisible to
+        the client's next command (it raced the commit); split into
+        `runCopyToStream` + commit-before-complete, mirroring CopyFrom.
+        Verified end-to-end on a live server (RETURNING ids stream;
+        inserted row visible to next connection; no-RETURNING → correct
+        error). Tests: `TestParseCopyDMLToStdout`,
+        `TestParseCopyDMLFromRejected`, `TestPlanCopyDMLReturningToStdout`,
+        `TestPlanCopyDMLWithoutReturningRejected`,
+        `TestCopyDMLReturningExecutorEndToEnd` (asserts the visibility
+        fix), `TestCopyDMLNoReturningRejected`. Design:
+        `docs/design/0097-0009-copy-dml-returning-to-stdout.md`.
+        `copydml` regress 44→45 diff lines (count flat; the RETURNING
+        rows now match, but the residual is entirely `CREATE RULE`
+        rewrite rules + trigger `RAISE NOTICE` output — goopg has no
+        rewrite-rule system, so `copydml` cannot pass without those
+        larger features). `copyselect` confirmed to need top-level
+        `UNION`/INTERSECT/EXCEPT (set ops; only `UNION ALL` works today)
+        + multi-command `\;` COPY strings — next COPY-family wins.
 
 - [x] **M0097-0010**
       - Summary: Transactions + PREPARE + locking parity.

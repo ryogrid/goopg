@@ -91,6 +91,53 @@ func TestPlanCopyQueryToStdout(t *testing.T) {
 	}
 }
 
+// TestPlanCopyDMLReturningToStdout: COPY (INSERT … RETURNING) TO STDOUT
+// plans the DML through the normal entry point and carries its
+// RETURNING schema on the Copy node (Insert.Output() is nil, so the
+// schema must come from the RETURNING list). M0097-0009.
+func TestPlanCopyDMLReturningToStdout(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t, "COPY (INSERT INTO pgbench_accounts (aid) VALUES (1) RETURNING aid) TO STDOUT")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := node.(*Copy)
+	if c.Direction != CopyTo || c.Endpoint != CopyEndpointStdout {
+		t.Errorf("direction/endpoint=%v/%v", c.Direction, c.Endpoint)
+	}
+	if c.Query == nil {
+		t.Fatal("Query nil")
+	}
+	if _, ok := c.Query.(*Insert); !ok {
+		t.Errorf("Query=%T want *Insert", c.Query)
+	}
+	if len(c.schema) != 1 || c.schema[0].Name != "aid" {
+		t.Fatalf("schema=%+v want one RETURNING column 'aid'", c.schema)
+	}
+}
+
+// TestPlanCopyDMLWithoutReturningRejected: COPY (DML) with no RETURNING
+// clause has no rows to stream — PostgreSQL rejects it with
+// "COPY query must have a RETURNING clause".
+func TestPlanCopyDMLWithoutReturningRejected(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	for _, sql := range []string{
+		"COPY (INSERT INTO pgbench_accounts (aid) VALUES (1)) TO STDOUT",
+		"COPY (UPDATE pgbench_accounts SET abalance = 0) TO STDOUT",
+		"COPY (DELETE FROM pgbench_accounts) TO STDOUT",
+	} {
+		stmt := parseOne(t, sql)
+		_, err := Plan(stmt, cat)
+		if err == nil {
+			t.Fatalf("%q: expected error, got nil", sql)
+		}
+		if !strings.Contains(err.Error(), "must have a RETURNING clause") {
+			t.Errorf("%q: error=%q want RETURNING-clause message", sql, err.Error())
+		}
+	}
+}
+
 // TestPlanCopyOptionsAcceptedAndRejected: the plan-time validator
 // surfaces duplicate names, unknown FORMAT, and unknown options as
 // SQLSTATE-tagged errors so the wire layer doesn't have to guess.

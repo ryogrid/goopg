@@ -161,9 +161,28 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 
 	switch plan.Direction {
 	case planner.CopyTo:
-		err := s.runCopyTo(w, ectx, plan)
-		_ = s.cfg.TxnMgr.Commit(tx)
+		count, errorSent, err := s.runCopyToStream(w, ectx, plan)
 		if err != nil {
+			_ = s.cfg.TxnMgr.Rollback(tx)
+			return nil, err
+		}
+		if errorSent {
+			// runCopyToStream already wrote ErrorResponse + RFQ.
+			_ = s.cfg.TxnMgr.Rollback(tx)
+			return nil, nil
+		}
+		// Commit BEFORE CommandComplete so COPY (DML … RETURNING)
+		// writes are durable/visible by the time the client proceeds.
+		if cErr := s.cfg.TxnMgr.Commit(tx); cErr != nil {
+			if wErr := s.writeQueryError(w, sqlstate.SystemError, cErr.Error()); wErr != nil {
+				return nil, wErr
+			}
+			return nil, nil
+		}
+		if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", count)); err != nil {
+			return nil, err
+		}
+		if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -216,9 +235,20 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 	return nil, nil
 }
 
-// runCopyTo drives the CopyOutResponse / CopyData* / CopyDone /
-// CommandComplete / ReadyForQuery sequence for a CopyTo plan.
-func (s *Server) runCopyTo(w *protocol.FrameWriter, ctx *executor.Context, plan *planner.Copy) error {
+// runCopyToStream drives the CopyOutResponse / CopyData* / CopyDone
+// sequence for a CopyTo plan and returns the streamed row count. It
+// deliberately stops short of CommandComplete / ReadyForQuery so the
+// caller can commit the COPY-internal transaction *before* signalling
+// completion — critical for COPY (INSERT/UPDATE/DELETE … RETURNING),
+// whose mutations must be durable and visible by the time the client
+// is told the command finished. (Streaming a read-only SELECT/table is
+// unaffected by the ordering, but COPY(DML) loses visibility otherwise:
+// the client races ahead with its next query before the commit lands.)
+//
+// On a mid-stream executor error this writes the wire ErrorResponse +
+// ReadyForQuery itself and returns errorSent=true so the caller rolls
+// back and emits nothing further.
+func (s *Server) runCopyToStream(w *protocol.FrameWriter, ctx *executor.Context, plan *planner.Copy) (count int64, errorSent bool, err error) {
 	// Peek at the options to decide the wire format code before opening
 	// the operator — WriteCopyOutResponse must precede any CopyData frames.
 	binary := executor.IsBinaryFormat(plan.Options)
@@ -227,21 +257,21 @@ func (s *Server) runCopyTo(w *protocol.FrameWriter, ctx *executor.Context, plan 
 		fmtCode = 1
 	}
 	if err := w.WriteCopyOutResponse(fmtCode, nil); err != nil {
-		return err
+		return 0, false, err
 	}
-	count, _, err := executor.RunCopyTo(ctx, plan, func(line []byte) error {
+	count, _, execErr := executor.RunCopyTo(ctx, plan, func(line []byte) error {
 		return w.WriteCopyData(line)
 	})
-	if err != nil {
-		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+	if execErr != nil {
+		if wErr := s.writeQueryError(w, execErrCode(execErr), execErrMsg(execErr)); wErr != nil {
+			return count, true, wErr
+		}
+		return count, true, nil
 	}
 	if err := w.WriteCopyDone(); err != nil {
-		return err
+		return count, false, err
 	}
-	if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", count)); err != nil {
-		return err
-	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return count, false, nil
 }
 
 func (s *Server) handleCopyToStdoutQuery(w *protocol.FrameWriter, matchable string) (*copyInState, error) {

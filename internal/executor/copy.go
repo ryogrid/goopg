@@ -130,8 +130,8 @@ type CopyFromExecutor struct {
 	rowsIn int64
 
 	// binary path state
-	binaryBuf         []byte
-	binaryHeaderSeen  bool
+	binaryBuf        []byte
+	binaryHeaderSeen bool
 }
 
 // NewCopyFromExecutor binds a CopyFromExecutor to ctx and plan.
@@ -253,7 +253,15 @@ func buildCopySource(plan *planner.Copy) (Operator, []catalog.Column, []int, err
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		schema := plan.Query.Output()
+		// Prefer the Copy node's resolved schema: data-modifying inner
+		// plans (Insert/Update/Delete) report Output()==nil even with a
+		// RETURNING clause, so the planner stashes the RETURNING schema
+		// on the Copy node directly. SELECT inner plans carry the same
+		// schema, sourced from their own Output().
+		schema := plan.Output()
+		if schema == nil {
+			schema = plan.Query.Output()
+		}
 		cols := make([]catalog.Column, len(schema))
 		for i, sc := range schema {
 			cols[i] = catalog.Column{Name: sc.Name, Type: sc.Type, Ordinal: i}

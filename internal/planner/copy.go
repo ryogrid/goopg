@@ -40,6 +40,36 @@ func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
 		}, nil
 	}
 
+	if s.QueryDML != nil {
+		// COPY (INSERT/UPDATE/DELETE … RETURNING) TO. Plan the
+		// data-modifying statement through the normal entry point so
+		// it runs (and commits, in the wire layer's COPY transaction);
+		// the RETURNING rows are what gets streamed out. PostgreSQL
+		// requires the RETURNING clause — without it there are no rows
+		// to copy.
+		inner, err := Plan(s.QueryDML, cat)
+		if err != nil {
+			return nil, err
+		}
+		schema := returningSchemaOf(inner)
+		if schema == nil {
+			return nil, &PlanError{
+				Pos:     s.Pos(),
+				Code:    "0A000",
+				Message: "COPY query must have a RETURNING clause",
+			}
+		}
+		return &Copy{
+			pos:       s.Pos(),
+			Direction: CopyTo,
+			Query:     inner,
+			Endpoint:  toPlannerEndpoint(s.Endpoint),
+			Filename:  s.Filename,
+			Options:   s.Options,
+			schema:    schema,
+		}, nil
+	}
+
 	tbl, ok := cat.LookupTable(s.Table)
 	if !ok {
 		return nil, &PlanError{
@@ -106,6 +136,23 @@ func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
 		Options:     s.Options,
 		schema:      schema,
 	}, nil
+}
+
+// returningSchemaOf returns the RETURNING output schema of a
+// data-modifying plan node, or nil when the statement has no RETURNING
+// clause. Used to gate COPY (DML) TO, which streams the RETURNING rows.
+func returningSchemaOf(n Node) Schema {
+	switch d := n.(type) {
+	case *Insert:
+		return d.ReturningSchema
+	case *Update:
+		return d.ReturningSchema
+	case *Delete:
+		return d.ReturningSchema
+	case *Merge:
+		return d.ReturningSchema
+	}
+	return nil
 }
 
 func toPlannerEndpoint(e parser.CopyEndpoint) CopyEndpoint {

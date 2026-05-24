@@ -19,21 +19,26 @@ func (p *parser) parseCopy() (Stmt, error) {
 	}
 	stmt := &CopyStmt{pos: t.Pos}
 
-	// Source/target. Either `( select … )` or `relname [(cols)]`.
+	// Source/target. Either `( query )` or `relname [(cols)]`.
+	// The query form is only valid for COPY (query) TO …; PostgreSQL
+	// accepts SELECT/VALUES as well as INSERT/UPDATE/DELETE bodies that
+	// carry a RETURNING clause (checked by the planner).
 	if p.acceptSymbol("(") {
-		// Query form is only valid for COPY (query) TO …
-		sel, err := p.parseSelect()
+		inner, err := p.parseCopyInnerQuery()
 		if err != nil {
 			return nil, err
 		}
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
 		}
-		s, ok := sel.(*SelectStmt)
-		if !ok {
-			return nil, &SyntaxError{Pos: t.Pos, Message: "COPY (...) only supports SELECT"}
+		switch q := inner.(type) {
+		case *SelectStmt:
+			stmt.Query = q
+		case *InsertStmt, *UpdateStmt, *DeleteStmt:
+			stmt.QueryDML = inner
+		default:
+			return nil, &SyntaxError{Pos: t.Pos, Message: "COPY (...) only supports SELECT, INSERT, UPDATE, or DELETE"}
 		}
-		stmt.Query = s
 	} else {
 		name, err := p.parseObjectName()
 		if err != nil {
@@ -61,7 +66,7 @@ func (p *parser) parseCopy() (Stmt, error) {
 	default:
 		return nil, p.errAtCur("expected FROM or TO in COPY")
 	}
-	if stmt.Query != nil && stmt.Direction != CopyTo {
+	if (stmt.Query != nil || stmt.QueryDML != nil) && stmt.Direction != CopyTo {
 		return nil, &SyntaxError{Pos: t.Pos, Message: "COPY (query) is only valid with TO"}
 	}
 
@@ -97,6 +102,28 @@ func (p *parser) parseCopy() (Stmt, error) {
 	}
 
 	return stmt, nil
+}
+
+// parseCopyInnerQuery parses the statement inside COPY ( … ) TO. It
+// dispatches on the leading keyword: SELECT/VALUES/TABLE/WITH parse as
+// a query producing a *SelectStmt; INSERT/UPDATE/DELETE parse as the
+// data-modifying form (PostgreSQL requires a RETURNING clause, which
+// the planner enforces). Anything else is rejected by the caller.
+func (p *parser) parseCopyInnerQuery() (Stmt, error) {
+	t := p.cur()
+	if t.Kind == TokenKeyword {
+		switch t.Keyword {
+		case KwInsert:
+			return p.parseInsert()
+		case KwUpdate:
+			return p.parseUpdate()
+		case KwDelete:
+			return p.parseDelete()
+		case KwWith:
+			return p.parseStatementWithCTE()
+		}
+	}
+	return p.parseSelect()
 }
 
 // parseCopyEndpoint reads the FROM/TO target. STDIN/STDOUT/PROGRAM are

@@ -88,6 +88,56 @@ func TestParseCopyQueryToStdout(t *testing.T) {
 	}
 }
 
+// TestParseCopyDMLToStdout: COPY (INSERT/UPDATE/DELETE … RETURNING) TO
+// STDOUT parses into a CopyStmt with QueryDML set (not Query), so the
+// planner can stream the RETURNING rows. M0097-0009.
+func TestParseCopyDMLToStdout(t *testing.T) {
+	cases := []struct {
+		sql  string
+		kind string
+	}{
+		{"COPY (INSERT INTO t (a) VALUES (1) RETURNING a) TO STDOUT", "insert"},
+		{"COPY (UPDATE t SET a = 2 WHERE a = 1 RETURNING a) TO STDOUT", "update"},
+		{"COPY (DELETE FROM t WHERE a = 1 RETURNING a) TO STDOUT", "delete"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		c := stmts[0].(*CopyStmt)
+		if c.Query != nil {
+			t.Errorf("%q: Query should be nil for DML form", tc.sql)
+		}
+		if c.QueryDML == nil {
+			t.Fatalf("%q: QueryDML nil", tc.sql)
+		}
+		if c.Direction != CopyTo || c.Endpoint != CopyEndpointStdout {
+			t.Errorf("%q: direction/endpoint = %v/%v", tc.sql, c.Direction, c.Endpoint)
+		}
+		var ok bool
+		switch tc.kind {
+		case "insert":
+			_, ok = c.QueryDML.(*InsertStmt)
+		case "update":
+			_, ok = c.QueryDML.(*UpdateStmt)
+		case "delete":
+			_, ok = c.QueryDML.(*DeleteStmt)
+		}
+		if !ok {
+			t.Errorf("%q: QueryDML=%T want %s", tc.sql, c.QueryDML, tc.kind)
+		}
+	}
+}
+
+// TestParseCopyDMLFromRejected: COPY (DML) is only valid with TO.
+func TestParseCopyDMLFromRejected(t *testing.T) {
+	_, err := Parse("COPY (INSERT INTO t (a) VALUES (1) RETURNING a) FROM STDIN")
+	if err == nil {
+		t.Fatal("expected error for COPY (DML) FROM, got nil")
+	}
+}
+
 // TestParseCopyFileEndpoints: filename + PROGRAM. v0 parses these so
 // the analyzer/executor can return a stable "not supported" error
 // rather than a generic syntax error.
@@ -111,7 +161,7 @@ func TestParseCopyFileEndpoints(t *testing.T) {
 	}
 }
 
-// TestParseCopyLegacyTrail: pre-9.0 `WITH BINARY DELIMITER '|' NULL ''
+// TestParseCopyLegacyTrail: pre-9.0 `WITH BINARY DELIMITER '|' NULL ”
 // HEADER` syntax. We accept it because some clients still emit it.
 func TestParseCopyLegacyTrail(t *testing.T) {
 	stmts, err := Parse("COPY t TO STDOUT WITH BINARY DELIMITER '|' NULL '' HEADER")
