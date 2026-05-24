@@ -787,6 +787,45 @@ func (c *InMemory) Routines() *Routines { return c.routines }
 // by CREATE SUBSCRIPTION's fetch_remote_table_info probe (M0103-0008
 // rung 16). The regclass cast handles the legacy "name as OID"
 // shape by resolving the bound text parameter through the catalog.
+// verboseIntervalOffset renders a signed second count as a PostgreSQL
+// postgres_verbose interval string (e.g. -28378 → "@ 7 hours 52 mins 58 secs
+// ago", 3600 → "@ 1 hour", 0 → "@ 0"). The timezone system views store their
+// utc_offset column pre-rendered this way because pg_regress runs the suite
+// with intervalstyle=postgres_verbose and goopg's virtual tables emit stored
+// strings verbatim (no type-aware reformatting). Mirrors EncodeInterval's
+// INTSTYLE_POSTGRES_VERBOSE arm (postgres/src/backend/utils/adt/datetime.c).
+func verboseIntervalOffset(totalSecs int) string {
+	if totalSecs == 0 {
+		return "@ 0"
+	}
+	neg := totalSecs < 0
+	a := totalSecs
+	if neg {
+		a = -a
+	}
+	h := a / 3600
+	m := (a % 3600) / 60
+	s := a % 60
+	var b strings.Builder
+	b.WriteString("@")
+	addPart := func(v int, unit string) {
+		if v == 0 {
+			return
+		}
+		b.WriteString(fmt.Sprintf(" %d %s", v, unit))
+		if v != 1 {
+			b.WriteString("s")
+		}
+	}
+	addPart(h, "hour")
+	addPart(m, "min")
+	addPart(s, "sec")
+	if neg {
+		b.WriteString(" ago")
+	}
+	return b.String()
+}
+
 func (c *InMemory) registerSystemTables() {
 	pgClass := &Table{
 		Schema: "pg_catalog",
@@ -1540,29 +1579,26 @@ func (c *InMemory) registerSystemTables() {
 	pgTimezoneNames.VirtualRows = func() [][]string {
 		var rows [][]string
 		for i := -12; i <= 14; i++ {
-			var name, abbrev, offset string
+			var name, abbrev string
 			if i == 0 {
 				name = "UTC"
 				abbrev = "UTC"
-				offset = "00:00:00"
 			} else if i > 0 {
 				name = fmt.Sprintf("Etc/GMT-%d", i)
 				abbrev = fmt.Sprintf("GMT-%d", i)
-				offset = fmt.Sprintf("%02d:00:00", i)
 			} else {
 				name = fmt.Sprintf("Etc/GMT+%d", -i)
 				abbrev = fmt.Sprintf("GMT+%d", -i)
-				offset = fmt.Sprintf("-%02d:00:00", -i)
 			}
-			rows = append(rows, []string{name, abbrev, offset, "false"})
+			rows = append(rows, []string{name, abbrev, verboseIntervalOffset(i * 3600), "f"})
 		}
 		// Add fractional offsets for extra distinct utc_offsets.
-		rows = append(rows, []string{"Asia/Kolkata", "IST", "05:30:00", "false"})
-		rows = append(rows, []string{"Asia/Kathmandu", "NPT", "05:45:00", "false"})
-		rows = append(rows, []string{"Pacific/Marquesas", "MART", "-09:30:00", "false"})
-		rows = append(rows, []string{"Pacific/Chatham", "CHAST", "12:45:00", "false"})
+		rows = append(rows, []string{"Asia/Kolkata", "IST", verboseIntervalOffset(5*3600 + 30*60), "f"})
+		rows = append(rows, []string{"Asia/Kathmandu", "NPT", verboseIntervalOffset(5*3600 + 45*60), "f"})
+		rows = append(rows, []string{"Pacific/Marquesas", "MART", verboseIntervalOffset(-(9*3600 + 30*60)), "f"})
+		rows = append(rows, []string{"Pacific/Chatham", "CHAST", verboseIntervalOffset(12*3600 + 45*60), "f"})
 		// LMT historical local-mean-time for America/Los_Angeles.
-		rows = append(rows, []string{"America/Los_Angeles", "LMT", "-07:52:58", "false"})
+		rows = append(rows, []string{"America/Los_Angeles", "LMT", verboseIntervalOffset(-(7*3600 + 52*60 + 58)), "f"})
 		return rows
 	}
 	c.tables["pg_catalog.pg_timezone_names"] = pgTimezoneNames
@@ -1580,26 +1616,25 @@ func (c *InMemory) registerSystemTables() {
 	pgTimezoneAbbrevs.VirtualRows = func() [][]string {
 		var rows [][]string
 		for i := -12; i <= 14; i++ {
-			var abbrev, offset string
+			var abbrev string
 			if i == 0 {
 				abbrev = "UTC"
-				offset = "00:00:00"
 			} else if i > 0 {
 				abbrev = fmt.Sprintf("GMT-%d", i)
-				offset = fmt.Sprintf("%02d:00:00", i)
 			} else {
 				abbrev = fmt.Sprintf("GMT+%d", -i)
-				offset = fmt.Sprintf("-%02d:00:00", -i)
 			}
-			rows = append(rows, []string{abbrev, offset, "false"})
+			rows = append(rows, []string{abbrev, verboseIntervalOffset(i * 3600), "f"})
 		}
 		// Fractional offsets.
-		rows = append(rows, []string{"IST", "05:30:00", "false"})
-		rows = append(rows, []string{"NPT", "05:45:00", "false"})
-		rows = append(rows, []string{"MART", "-09:30:00", "false"})
-		rows = append(rows, []string{"CHAST", "12:45:00", "false"})
+		rows = append(rows, []string{"IST", verboseIntervalOffset(5*3600 + 30*60), "f"})
+		rows = append(rows, []string{"NPT", verboseIntervalOffset(5*3600 + 45*60), "f"})
+		rows = append(rows, []string{"MART", verboseIntervalOffset(-(9*3600 + 30*60)), "f"})
+		rows = append(rows, []string{"CHAST", verboseIntervalOffset(12*3600 + 45*60), "f"})
 		// LMT entry required by sysviews.sql: select * from pg_timezone_abbrevs where abbrev = 'LMT'.
-		rows = append(rows, []string{"LMT", "-07:52:58", "false"})
+		// PostgreSQL displays this offset as "@ 7 hours 52 mins 58 secs ago"
+		// because pg_regress forces intervalstyle=postgres_verbose.
+		rows = append(rows, []string{"LMT", verboseIntervalOffset(-(7*3600 + 52*60 + 58)), "f"})
 		return rows
 	}
 	c.tables["pg_catalog.pg_timezone_abbrevs"] = pgTimezoneAbbrevs

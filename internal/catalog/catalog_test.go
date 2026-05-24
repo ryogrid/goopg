@@ -476,3 +476,63 @@ func TestPgSettingsEnableGUCsCompleteAndSorted(t *testing.T) {
 		}
 	}
 }
+
+// TestVerboseIntervalOffset pins the postgres_verbose interval rendering used
+// by the timezone system views. pg_regress forces intervalstyle=
+// postgres_verbose, so the LMT row must read "@ 7 hours 52 mins 58 secs ago".
+func TestVerboseIntervalOffset(t *testing.T) {
+	cases := []struct {
+		secs int
+		want string
+	}{
+		{0, "@ 0"},
+		{3600, "@ 1 hour"},
+		{2 * 3600, "@ 2 hours"},
+		{-3600, "@ 1 hour ago"},
+		{5*3600 + 30*60, "@ 5 hours 30 mins"},
+		{-(9*3600 + 30*60), "@ 9 hours 30 mins ago"},
+		{-(7*3600 + 52*60 + 58), "@ 7 hours 52 mins 58 secs ago"},
+	}
+	for _, tc := range cases {
+		if got := verboseIntervalOffset(tc.secs); got != tc.want {
+			t.Errorf("verboseIntervalOffset(%d) = %q, want %q", tc.secs, got, tc.want)
+		}
+	}
+}
+
+// TestPgTimezoneAbbrevsLMTRow guards the sysviews regress expectation:
+// `select * from pg_timezone_abbrevs where abbrev = 'LMT'` must return the
+// verbose-interval offset and a "f" is_dst (not "false"/"-07:52:58").
+func TestPgTimezoneAbbrevsLMTRow(t *testing.T) {
+	c := NewInMemory()
+	for _, name := range []string{"pg_timezone_abbrevs", "pg_timezone_names"} {
+		tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: name})
+		if !ok || tbl.VirtualRows == nil {
+			t.Fatalf("%s virtual table not registered", name)
+		}
+		var found bool
+		for _, row := range tbl.VirtualRows() {
+			// abbrev is col 0 for abbrevs, col 1 for names.
+			abbrevIdx := 0
+			isDstIdx := len(row) - 1
+			offIdx := isDstIdx - 1
+			if row[abbrevIdx] != "LMT" && row[len(row)-3] != "LMT" {
+				continue
+			}
+			// Locate the LMT row regardless of table shape.
+			if !(row[0] == "LMT" || (len(row) >= 3 && row[len(row)-3] == "LMT")) {
+				continue
+			}
+			found = true
+			if row[offIdx] != "@ 7 hours 52 mins 58 secs ago" {
+				t.Errorf("%s LMT utc_offset = %q, want verbose interval", name, row[offIdx])
+			}
+			if row[isDstIdx] != "f" {
+				t.Errorf("%s LMT is_dst = %q, want \"f\"", name, row[isDstIdx])
+			}
+		}
+		if !found {
+			t.Errorf("%s: no LMT row found", name)
+		}
+	}
+}

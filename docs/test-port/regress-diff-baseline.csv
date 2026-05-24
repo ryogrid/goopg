@@ -18,7 +18,7 @@ test_setup,0,excluded
 time,0,pass
 varchar,0,pass
 functional_deps,21,failed
-sysviews,41,failed
+sysviews,33,failed
 copydml,44,failed
 copyselect,59,failed
 errors,60,failed

@@ -1005,12 +1005,27 @@ M0097-0001 wires it up.
         `guc` unchanged at 592 (no regression). Test:
         `TestPgSettingsEnableGUCsCompleteAndSorted`. Design:
         `docs/design/0097-0032-pg-settings-enable-guc-completeness.md`.
-      - **Remaining sysviews gaps (41 diff lines, separate subsystems):**
-        `pg_backend_memory_contexts` introspection (`ident`/Bump-context rows),
-        the `pg_wait_events` SRF (9 wait-event type rows), the
-        `timezone_abbreviations` GUC, and `pg_timezone_abbrevs`
-        interval/boolean output formatting (`utc_offset` as `@ 7 hours …`,
-        `is_dst` as `f`).
+      - **Progress 2026-05-25 (loop):** Closed the timezone gaps. Registered the
+        `timezone_abbreviations` GUC (`internal/config/defaults.go`, `TypeString`/
+        `ContextUserset`/BootVal `Default`, + `postgresql.conf.sample` entry) so
+        `SET timezone_abbreviations = 'Australia'`/`'India'` succeed silently
+        (were `unrecognized configuration parameter`). Fixed `pg_timezone_names`/
+        `pg_timezone_abbrevs` output: new `verboseIntervalOffset` helper
+        (`internal/catalog/catalog.go`, mirrors `EncodeInterval`
+        `INTSTYLE_POSTGRES_VERBOSE`) renders `utc_offset` as `@ 7 hours 52 mins
+        58 secs ago` (pg_regress forces `intervalstyle=postgres_verbose`;
+        goopg emits virtual-table strings verbatim), and `is_dst` stored as
+        `"f"` not `"false"`. `sysviews` diff 41 → 33 (verified end-to-end);
+        `guc` unchanged at 592. Tests: `TestVerboseIntervalOffset`,
+        `TestPgTimezoneAbbrevsLMTRow`. Design:
+        `docs/design/0097-0032b-timezone-abbreviations-guc-and-verbose-offset.md`.
+      - **Remaining sysviews gaps (33 diff lines, separate subsystems):**
+        `pg_backend_memory_contexts` introspection (`TopMemoryContext
+        total_bytes >= free_bytes`, Bump-context + `CacheMemoryContext` child
+        rows — a Go-runtime design constraint), `pg_hba_file_rules` `no_err`
+        FILTER (errors column non-null), and the `pg_wait_events`
+        `group by type order by type COLLATE "C"` SRF query (errors instead of
+        returning 9 wait-event-type rows).
 
 - [ ] **M0097-0033 — Port test_setup regress test**
       - Summary: Make `test_setup` reach `pass`.

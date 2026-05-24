@@ -226,6 +226,7 @@
 #IntervalStyle = 'postgres'             # postgres | postgres_verbose |
                                         # sql_standard | iso_8601
 #TimeZone = 'UTC'
+#timezone_abbreviations = 'Default'     # select timezone abbreviation set
 #client_encoding = 'UTF8'               # actually defaults to whatever the
                                         # client negotiates at startup
 
