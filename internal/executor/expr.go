@@ -3160,7 +3160,72 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	case "satisfies_hash_partition":
 		// satisfies_hash_partition(tableoid, modulus, remainder, val...) → bool
-		// Stub: return false. M0097-0015.
+		// M0097-0015: validate inputs; full hash computation not implemented.
+		if len(x.Args) < 3 || ctx == nil || ctx.Catalog == nil {
+			return NewBoolDatum(false), nil
+		}
+		modulusDatum, err := evalExpr(x.Args[1], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		remainderDatum, err := evalExpr(x.Args[2], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		// NULL modulus or NULL remainder → false (PG behavior)
+		if modulusDatum.IsNull() || remainderDatum.IsNull() {
+			return NewBoolDatum(false), nil
+		}
+		modulus := int(modulusDatum.Int)
+		remainder := int(remainderDatum.Int)
+		if modulus <= 0 {
+			return NullDatum, &ExecError{Code: "22023",
+				Message: "modulus for hash partition must be an integer value greater than zero"}
+		}
+		if remainder < 0 {
+			return NullDatum, &ExecError{Code: "22023",
+				Message: "remainder for hash partition must be an integer value greater than or equal to zero"}
+		}
+		if remainder >= modulus {
+			return NullDatum, &ExecError{Code: "22023",
+				Message: "remainder for hash partition must be less than modulus"}
+		}
+		tableoidDatum, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		if tableoidDatum.IsNull() {
+			return NewBoolDatum(false), nil
+		}
+		if tableoidDatum.Kind != KindInt {
+			return NullDatum, &ExecError{Code: "XX000",
+				Message: "could not open relation with OID 0"}
+		}
+		tableOID := uint32(tableoidDatum.Int)
+		if tableOID == 0 {
+			return NullDatum, &ExecError{Code: "XX000",
+				Message: "could not open relation with OID 0"}
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NewBoolDatum(false), nil
+		}
+		tbl, found := im.LookupTableByOID(tableOID)
+		if !found {
+			return NullDatum, &ExecError{Code: "XX000",
+				Message: fmt.Sprintf("could not open relation with OID %d", tableOID)}
+		}
+		if tbl.PartitionMethod != "HASH" || tbl.PartitionParentOID != 0 {
+			return NullDatum, &ExecError{Code: "42809",
+				Message: fmt.Sprintf("%q is not a hash partitioned table", tbl.Name)}
+		}
+		numKeys := len(tbl.PartitionKey)
+		numArgs := len(x.Args) - 3
+		if numArgs != numKeys {
+			return NullDatum, &ExecError{Code: "22023",
+				Message: fmt.Sprintf("number of partitioning columns (%d) does not match number of partition keys provided (%d)",
+					numKeys, numArgs)}
+		}
 		return NewBoolDatum(false), nil
 	case "merge_action":
 		// merge_action() → text — returns 'INSERT', 'UPDATE', or 'DELETE' within MERGE RETURNING.

@@ -23,7 +23,7 @@ functional_deps,0,pass
 copydml,45,failed
 tid,0,pass
 errors,8,failed
-hash_part,73,failed
+hash_part,32,failed
 hash_index,0,pass
 index_including_gist,112,failed
 expressions,118,failed
