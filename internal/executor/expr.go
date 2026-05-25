@@ -2696,7 +2696,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "current_database":
 		return NewStringDatum("postgres"), nil
 	case "current_schema", "current_schemas":
-		return NewStringDatum("public"), nil
+		return currentSchemaFromSearchPath(ctx)
 
 	// generate_series used as a scalar expression (not FROM clause).
 	// Returns the start value only — full SRF semantics require planner rework.
@@ -5021,6 +5021,42 @@ func charTypeDisplayForm(b byte) string {
 	}
 	// Non-printable: format as \NNN octal.
 	return fmt.Sprintf("\\%03o", b)
+}
+
+// currentSchemaFromSearchPath resolves current_schema by walking the effective
+// search_path and returning the first schema that exists. Built-in schemas
+// (pg_catalog, information_schema, public) are always considered present.
+// Returns NullDatum if no schema on the path exists.
+func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {
+	searchPath := `"$user", public` // default
+	if ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("search_path"); ok {
+			searchPath = v
+		}
+	}
+	user := "postgres"
+	for _, rawSchema := range strings.Split(searchPath, ",") {
+		s := strings.TrimSpace(rawSchema)
+		s = strings.Trim(s, `"'`)
+		if s == "$user" {
+			s = user
+		}
+		if s == "" {
+			continue
+		}
+		lc := strings.ToLower(s)
+		switch lc {
+		case "pg_catalog", "information_schema", "public":
+			return NewStringDatum(lc), nil
+		}
+		// User-created schemas: check if a table with this schema prefix exists.
+		if ctx.Catalog != nil {
+			if _, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: s}); ok {
+				return NewStringDatum(s), nil
+			}
+		}
+	}
+	return NullDatum, nil
 }
 
 func isValidBoolInput(v string) bool {

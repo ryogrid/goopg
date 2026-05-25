@@ -89,6 +89,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execDropProcedure(s)
 	case *parser.CreateTriggerStmt:
 		return nil, o.execCreateTrigger(s)
+	case *parser.DropRuleStmt:
+		return nil, o.execDropRule(s)
 	case *parser.DropTriggerStmt:
 		return nil, o.execDropTrigger(s)
 	case *parser.DropCompatStmt:
@@ -2419,6 +2421,38 @@ func (o *ddlOp) execDropTrigger(s *parser.DropTriggerStmt) error {
 			Message: fmt.Sprintf("trigger %q for table %q does not exist", s.Name, s.Table.Name)}
 	}
 	return nil
+}
+
+// execDropRule handles DROP RULE. Rules are not implemented; always reports
+// "rule does not exist".
+func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
+	_, tblOk := o.ctx.Catalog.LookupTable(s.Table)
+	if !tblOk {
+		// When the table is schema-qualified and the schema is not a built-in,
+		// PG emits "schema X does not exist" rather than a rule/relation error.
+		if sc := s.Table.Schema; sc != "" {
+			switch strings.ToLower(sc) {
+			case "public", "pg_catalog", "information_schema", "pg_toast":
+			default:
+				if s.IfExists {
+					o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", sc))
+					return nil
+				}
+				return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", sc)}
+			}
+		}
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("relation %q does not exist, skipping", s.Table.Name))
+			return nil
+		}
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
+	}
+	if s.IfExists {
+		o.ctx.AddNotice(fmt.Sprintf("rule %q for relation %q does not exist, skipping", s.Name, s.Table.Name))
+		return nil
+	}
+	return &ExecError{Code: "42704", Pos: s.Pos(),
+		Message: fmt.Sprintf("rule %q for relation %q does not exist", s.Name, s.Table.Name)}
 }
 
 // execCreateSequence registers a new sequence in the process-global registry.

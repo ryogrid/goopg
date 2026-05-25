@@ -22,9 +22,9 @@ varchar,0,pass
 functional_deps,0,pass
 copydml,45,failed
 tid,0,pass
-errors,60,failed
+errors,49,failed
 hash_part,73,failed
-hash_index,0,passed
+hash_index,0,pass
 index_including_gist,112,failed
 expressions,118,failed
 select_into,120,failed
@@ -32,7 +32,7 @@ prepare,0,pass
 dbsize,128,failed
 lock,131,failed
 prepared_xacts,132,failed
-drop_if_exists,141,failed
+drop_if_exists,130,failed
 advisory_lock,142,failed
 case,146,failed
 uuid,169,failed

@@ -299,6 +299,18 @@ type CreateTriggerStmt struct {
 func (s *CreateTriggerStmt) Pos() int  { return s.pos }
 func (s *CreateTriggerStmt) stmtNode() {}
 
+// DropRuleStmt — `DROP RULE [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
+// Rules are not implemented; the executor emits "rule does not exist" always.
+type DropRuleStmt struct {
+	pos      int
+	Name     string
+	Table    ObjectName
+	IfExists bool
+}
+
+func (s *DropRuleStmt) Pos() int  { return s.pos }
+func (s *DropRuleStmt) stmtNode() {}
+
 // DropTriggerStmt — `DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
 // M0096-0012.
 type DropTriggerStmt struct {

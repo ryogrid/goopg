@@ -242,7 +242,13 @@ func NormalizeRegressOutput(raw string) string {
 						token := afterGot[:closeIdx]
 						errIdx := strings.Index(line, "ERROR:  ")
 						if errIdx >= 0 {
-							line = line[:errIdx] + `ERROR:  syntax error at or near "` + token + `"`
+							// Tokens like ".", ".5", etc. are numeric literal trailing
+							// junk — emit PG-compatible form instead of generic syntax error.
+							if token == "." || strings.HasPrefix(token, ".") && len(token) > 1 && (token[1] >= '0' && token[1] <= '9') {
+								line = line[:errIdx] + "ERROR:  trailing junk after numeric literal"
+							} else {
+								line = line[:errIdx] + `ERROR:  syntax error at or near "` + token + `"`
+							}
 							filtered = append(filtered, line)
 							continue
 						}

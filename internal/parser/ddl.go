@@ -1442,11 +1442,21 @@ func (p *parser) parseDrop() (Stmt, error) {
 	if p.acceptIdentKeyword("domain") {
 		return p.parseDropDomain(t.Pos)
 	}
+	// DROP RULE [IF EXISTS] name ON table — real syntax.
+	if p.acceptIdentKeyword("rule") {
+		return p.parseDropRuleTail(t.Pos)
+	}
+	// Old DROP RULE aliases (tuple/instance/rewrite rule) — PG rejects with
+	// a syntax error at the alias keyword.
+	if cur := p.cur(); cur.Kind == TokenIdent &&
+		(cur.Value == "tuple" || cur.Value == "instance" || cur.Value == "rewrite") {
+		return nil, p.errSyntaxAtCur()
+	}
 	// Handle ident-based DROP targets as compatibility stubs. M0097-0008.
 	for _, objType := range []string{
 		"sequence", "schema",
 		"aggregate", "collation", "operator", "cast",
-		"materialized", "rule", "extension", "server",
+		"materialized", "extension", "server",
 		"language", "access", "event", "transform",
 		"group", "role", "user",
 	} {
@@ -1716,6 +1726,31 @@ func (p *parser) parseCreateTriggerTail(pos int) (Stmt, error) {
 		}
 	}
 	return stmt, nil
+}
+
+// parseDropRuleTail picks up after DROP RULE.
+// Grammar: [IF EXISTS] name ON table [CASCADE|RESTRICT].
+func (p *parser) parseDropRuleTail(pos int) (Stmt, error) {
+	ifExists := false
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	nameTok, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(KwOn); err != nil {
+		return nil, err
+	}
+	tbl, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	_ = p.acceptKeyword(KwCascade) || p.acceptKeyword(KwRestrict)
+	return &DropRuleStmt{pos: pos, Name: identText(nameTok), Table: tbl, IfExists: ifExists}, nil
 }
 
 // parseDropTriggerTail picks up after DROP TRIGGER.
