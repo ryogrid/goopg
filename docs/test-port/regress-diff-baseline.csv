@@ -42,11 +42,11 @@ timetz,209,failed
 pg_lsn,216,failed
 misc,230,failed
 tidscan,231,failed
-temp,238,failed
+temp,232,failed
 txid,254,failed
 index_including,257,failed
 tidrangescan,261,failed
-truncate,261,failed
+truncate,255,failed
 plancache,276,failed
 create_procedure,283,failed
 text,287,failed

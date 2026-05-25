@@ -549,6 +549,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			}
 		}
 		stmt.PartitionOf = poc
+		// ON COMMIT clause may follow FOR VALUES ... in partition tables.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
+			p.advance()
+			if p.acceptKeyword(KwCommit) {
+				_ = p.acceptIdentKeyword("preserve") || p.acceptIdentKeyword("delete")
+				_ = p.acceptIdentKeyword("rows") || p.acceptKeyword(KwDrop)
+			}
+		}
 		return stmt, nil
 	}
 
@@ -806,13 +814,20 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 				_, _ = p.parseColumnNameList()
 				_ = p.acceptSymbol(")")
 			}
-			return
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith:
 			p.advance()
 			_, _ = p.parseWithOptions()
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTablespace:
 			p.advance()
 			_, _ = p.parseIdent()
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn:
+			// ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } — temp table option.
+			p.advance()
+			if !p.acceptKeyword(KwCommit) {
+				return
+			}
+			_ = p.acceptIdentKeyword("preserve") || p.acceptIdentKeyword("delete")
+			_ = p.acceptIdentKeyword("rows") || p.acceptKeyword(KwDrop)
 		default:
 			return
 		}
