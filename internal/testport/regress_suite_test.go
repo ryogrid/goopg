@@ -202,18 +202,24 @@ func (e *ClusterRegressExecutor) psqlArgs(extraArgs ...string) []string {
 	return args
 }
 
-// psqlEnv returns the environment slice for psql with LD_LIBRARY_PATH set so
-// the in-tree psql binary resolves libpq symbols correctly.
+// psqlEnv returns the environment slice for psql with LD_LIBRARY_PATH and
+// PG_ABS_SRCDIR set so the in-tree psql binary resolves libpq symbols and
+// data file paths (e.g. \getenv abs_srcdir PG_ABS_SRCDIR in hash_index.sql).
 func (e *ClusterRegressExecutor) psqlEnv() []string {
 	prev := os.Getenv("LD_LIBRARY_PATH")
-	if e.LibDir == "" {
-		return []string{"PGPASSWORD="}
+	env := []string{"PGPASSWORD="}
+	if e.LibDir != "" {
+		ldPath := e.LibDir
+		if prev != "" {
+			ldPath += ":" + prev
+		}
+		env = append(env, "LD_LIBRARY_PATH="+ldPath)
 	}
-	ldPath := e.LibDir
-	if prev != "" {
-		ldPath += ":" + prev
+	if e.RepoRoot != "" {
+		absSrcDir := filepath.Join(e.RepoRoot, "postgres", "src", "test", "regress")
+		env = append(env, "PG_ABS_SRCDIR="+absSrcDir)
 	}
-	return []string{"PGPASSWORD=", "LD_LIBRARY_PATH=" + ldPath}
+	return env
 }
 
 // ExecuteSQL writes sql to a temporary file and runs it through psql.

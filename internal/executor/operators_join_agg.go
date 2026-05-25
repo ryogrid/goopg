@@ -881,9 +881,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		row := slotRow(slot)
-
-		key, groupValues, err := o.evalGroupKey(row)
+		key, groupValues, err := o.evalGroupKey(slot)
 		if err != nil {
 			return err
 		}
@@ -894,7 +892,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			if len(o.plan.Passthrough) > 0 {
 				ptVals = make(Row, len(o.plan.Passthrough))
 				for i, expr := range o.plan.Passthrough {
-					v, err := evalExpr(expr, row, ctx)
+					v, err := evalExprSlot(expr, slot, ctx)
 					if err != nil {
 						ptVals[i] = NullDatum
 					} else {
@@ -908,7 +906,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		}
 
 		for i, call := range o.plan.Aggs {
-			if err := o.applyAgg(&gr.aggs[i], call, row); err != nil {
+			if err := o.applyAgg(&gr.aggs[i], call, slot); err != nil {
 				return err
 			}
 		}
@@ -940,14 +938,14 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *aggregateOp) evalGroupKey(row Row) (string, Row, error) {
+func (o *aggregateOp) evalGroupKey(slot TupleSlot) (string, Row, error) {
 	if len(o.plan.GroupExprs) == 0 {
 		return "__all__", nil, nil
 	}
 	vals := make(Row, 0, len(o.plan.GroupExprs))
 	parts := make([]string, 0, len(o.plan.GroupExprs))
 	for _, g := range o.plan.GroupExprs {
-		v, err := evalExpr(g, row, o.ctx)
+		v, err := evalExprSlot(g, slot, o.ctx)
 		if err != nil {
 			return "", nil, err
 		}
@@ -964,11 +962,11 @@ func (o *aggregateOp) evalGroupKey(row Row) (string, Row, error) {
 	return strings.Join(parts, "|"), vals, nil
 }
 
-func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row Row) error {
+func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot TupleSlot) error {
 	// FILTER (WHERE condition): skip this row if the condition is false/null.
 	// M0097-0007.
 	if call.Filter != nil {
-		fv, ferr := evalExpr(call.Filter, row, o.ctx)
+		fv, ferr := evalExprSlot(call.Filter, slot, o.ctx)
 		if ferr != nil || fv.IsNull() || fv.Kind != KindBool || !fv.BoolValue() {
 			return nil // skip row — filter not satisfied
 		}
@@ -992,7 +990,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, row R
 		st.count++
 		return nil
 	}
-	arg, err := evalExpr(call.Arg, row, o.ctx)
+	arg, err := evalExprSlot(call.Arg, slot, o.ctx)
 	if err != nil {
 		return err
 	}

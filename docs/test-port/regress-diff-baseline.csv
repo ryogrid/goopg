@@ -21,14 +21,14 @@ time,0,pass
 varchar,0,pass
 functional_deps,0,pass
 copydml,45,failed
-tid,47,failed
+tid,0,pass
 errors,60,failed
 hash_part,73,failed
 hash_index,96,failed
 index_including_gist,112,failed
 expressions,118,failed
 select_into,120,failed
-prepare,122,failed
+prepare,0,pass
 dbsize,128,failed
 lock,131,failed
 prepared_xacts,132,failed

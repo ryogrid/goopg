@@ -89,10 +89,12 @@ func LookupSequence(name string) *seqState {
 	return v.(*seqState)
 }
 
-// DropSequence removes a sequence from the registry.
-func DropSequence(name string) {
-	seqRegistry.Delete(seqKey(name))
+// DropSequence removes a sequence from the registry. M0097-0038.
+func DropSequence(name string) bool {
+	_, loaded := seqRegistry.LoadAndDelete(seqKey(name))
+	return loaded
 }
+
 
 // evalNextval implements nextval(sequence_name text) → int8.
 // Advances the sequence and returns the new value. Also stores the

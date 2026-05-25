@@ -20,6 +20,7 @@ package server
 // is still open at the time the second session tries the same key.
 
 import (
+	"sort"
 	"strings"
 	"sync"
 
@@ -133,7 +134,10 @@ func (c *connTxState) End() {
 }
 
 type preparedStatementDef struct {
-	stmt parser.Stmt
+	stmt        parser.Stmt
+	sql         string   // original PREPARE … AS … text for pg_prepared_statements
+	paramTypes  []string // declared parameter types from PREPARE (…); nil = no declaration
+	resultTypes []string // inferred output column types; nil = unknown
 }
 
 // preparedStatements stores named prepared SQL statements for this connection.
@@ -148,10 +152,95 @@ func newPreparedStatements() *preparedStatements {
 	return &preparedStatements{stmts: make(map[string]preparedStatementDef)}
 }
 
-func (ps *preparedStatements) Store(name string, stmt parser.Stmt) {
+// Store saves the prepared statement. Returns false if a statement with that
+// name already exists (caller should return "already exists" error).
+func (ps *preparedStatements) Store(name string, stmt parser.Stmt, sql string, paramTypes []string) bool {
 	ps.mu.Lock()
-	ps.stmts[name] = preparedStatementDef{stmt: stmt}
+	defer ps.mu.Unlock()
+	if _, exists := ps.stmts[name]; exists {
+		return false
+	}
+	ps.stmts[name] = preparedStatementDef{stmt: stmt, sql: sql, paramTypes: paramTypes}
+	return true
+}
+
+// SetParamTypes updates the inferred parameter types for an existing prepared statement.
+func (ps *preparedStatements) SetParamTypes(name string, types []string) {
+	ps.mu.Lock()
+	if def, ok := ps.stmts[name]; ok {
+		def.paramTypes = types
+		ps.stmts[name] = def
+	}
 	ps.mu.Unlock()
+}
+
+// SetResultTypes updates the inferred result column types for an existing prepared statement.
+func (ps *preparedStatements) SetResultTypes(name string, types []string) {
+	ps.mu.Lock()
+	if def, ok := ps.stmts[name]; ok {
+		def.resultTypes = types
+		ps.stmts[name] = def
+	}
+	ps.mu.Unlock()
+}
+
+// normPrepParamType maps SQL type aliases to PostgreSQL canonical type names
+// as shown in pg_prepared_statements.parameter_types.
+func normPrepParamType(t string) string {
+	switch strings.ToLower(t) {
+	case "int", "int4", "integer":
+		return "integer"
+	case "int2":
+		return "smallint"
+	case "int8":
+		return "bigint"
+	case "float", "float8", "double precision", "double":
+		return `"double precision"`
+	case "float4":
+		return "real"
+	case "bool":
+		return "boolean"
+	default:
+		return t
+	}
+}
+
+// ListRows returns rows for the pg_prepared_statements virtual table.
+// Columns: name, statement, parameter_types, result_types.
+func (ps *preparedStatements) ListRows() [][]string {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	rows := make([][]string, 0, len(ps.stmts))
+	for name, def := range ps.stmts {
+		paramTypesArr := "{}"
+		if len(def.paramTypes) > 0 {
+			normalized := make([]string, len(def.paramTypes))
+			for i, pt := range def.paramTypes {
+				normalized[i] = normPrepParamType(pt)
+			}
+			paramTypesArr = "{" + strings.Join(normalized, ",") + "}"
+		}
+		// pg_prepared_statements column order (ordinals 0–7):
+		//   0:name, 1:statement, 2:prepare_time, 3:parameter_types,
+		//   4:result_types, 5:from_sql, 6:generic_plans, 7:custom_plans
+		resultTypesArr := ""
+		if len(def.resultTypes) > 0 {
+			resultTypesArr = "{" + strings.Join(def.resultTypes, ",") + "}"
+		}
+		rows = append(rows, []string{
+			name,           // 0: name
+			def.sql,        // 1: statement
+			"",             // 2: prepare_time (not tracked)
+			paramTypesArr,  // 3: parameter_types
+			resultTypesArr, // 4: result_types
+			"true",         // 5: from_sql
+			"0",            // 6: generic_plans
+			"0",            // 7: custom_plans
+		})
+	}
+	// Sort by name for deterministic output matching pg_prepared_statements ORDER BY name.
+	sort.Slice(rows, func(i, j int) bool { return rows[i][0] < rows[j][0] })
+	return rows
 }
 
 func (ps *preparedStatements) Lookup(name string) (preparedStatementDef, bool) {

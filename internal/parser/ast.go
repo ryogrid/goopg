@@ -155,9 +155,10 @@ func (s *ReindexStmt) stmtNode() {}
 // PrepareStmt — `PREPARE name [(param_type, …)] AS query`.
 // M0096-0006: executor stores the query text keyed by name for later EXECUTE.
 type PrepareStmt struct {
-	pos   int
-	Name  string
-	Query Stmt // the SELECT/INSERT/UPDATE/DELETE being prepared
+	pos        int
+	Name       string
+	ParamTypes []string // declared parameter types; nil if no list was given
+	Query      Stmt     // the SELECT/INSERT/UPDATE/DELETE being prepared
 }
 
 func (s *PrepareStmt) Pos() int  { return s.pos }
@@ -875,6 +876,10 @@ type CreateTableStmt struct {
 	// SelectSource is non-nil for `CREATE TABLE name AS SELECT …` (CTAS).
 	// The table is created with columns derived from the SELECT result. M0096-0008.
 	SelectSource *SelectStmt
+	// ExecuteSource is non-nil for `CREATE TABLE name AS EXECUTE name(params)`.
+	ExecuteSource *ExecuteStmt
+	// WithNoData is true for `CREATE TABLE … AS … WITH NO DATA`.
+	WithNoData bool
 	// TableChecks holds raw SQL expressions from table-level CHECK constraints.
 	// M0097-0014.
 	TableChecks []string

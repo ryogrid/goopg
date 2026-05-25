@@ -125,6 +125,13 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// `tableoid` slot added by the partition-union wrapper.
 		// M0100-0005y.
 		return Datum{Kind: KindInt, Int: int64(x.TableOID)}, nil
+	case *planner.CTIDExpr:
+		// `ctid` system column: per-row TID injected by seqScanOp
+		// into MaterializedSlot.hasCTID. M0097-0038.
+		if ms, ok := slot.(*MaterializedSlot); ok && ms.hasCTID {
+			return NewStringDatum(fmt.Sprintf("(%d,%d)", ms.ctidBlock, ms.ctidOff)), nil
+		}
+		return NullDatum, nil
 	case *planner.NumericConst:
 		m, s, err := parseNumeric(x.Value)
 		if err != nil {
@@ -4053,6 +4060,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 		}
 		return NewBoolDatum(true), nil
+	// currtid2(relname text, tid tid) → tid: returns the latest visible TID
+	// for a row in the named relation. M0097-0038.
+	case "currtid2":
+		return evalCurrtid2(x, row, ctx)
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.
@@ -4082,6 +4093,132 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 
 	return evalStoredRoutineFuncCall(x, row, ctx)
+}
+
+// evalCurrtid2 implements currtid2(relname text, tid tid) → tid.
+// Returns the latest visible TID for the named relation, or an error for
+// unsupported relation kinds (indexes, partitioned tables, views without ctid).
+// M0097-0038.
+func evalCurrtid2(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 2 {
+		return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(),
+			Message: fmt.Sprintf("function currtid2(unknown, unknown) does not exist")}
+	}
+	nameD, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	if nameD.IsNull() {
+		return NullDatum, nil
+	}
+	relname := strings.TrimSpace(nameD.StringValue())
+
+	tidD, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	if tidD.IsNull() {
+		return NullDatum, nil
+	}
+	tidStr := tidD.StringValue()
+	block, offset, ok := parseTidInput(tidStr)
+	if !ok {
+		return NullDatum, &ExecError{Code: "22P02", Pos: x.Pos(),
+			Message: fmt.Sprintf("invalid input syntax for type tid: %q", tidStr)}
+	}
+
+	// Sequence: in-memory only; treat TID as always valid. M0097-0038.
+	if LookupSequence(relname) != nil {
+		return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
+	}
+
+	if ctx.Catalog == nil {
+		return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(),
+			Message: "currtid2 requires a catalog"}
+	}
+
+	// Index: not supported.
+	if _, isIdx := ctx.Catalog.LookupIndex(parser.ObjectName{Name: relname}); isIdx {
+		return NullDatum, &ExecError{Code: "0A000", Pos: x.Pos(),
+			Message:  fmt.Sprintf("cannot open relation %q", relname),
+			Detail: "This operation is not supported for indexes."}
+	}
+
+	tbl, found := ctx.Catalog.LookupTable(parser.ObjectName{Name: relname})
+	if !found {
+		return NullDatum, &ExecError{Code: "42P01", Pos: x.Pos(),
+			Message: fmt.Sprintf("relation %q does not exist", relname)}
+	}
+
+	// Partitioned table: no storage.
+	if len(tbl.PartitionKey) > 0 {
+		schema := tbl.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		qualName := schema + "." + tbl.Name
+		return NullDatum, &ExecError{Code: "0A000", Pos: x.Pos(),
+			Message: fmt.Sprintf("cannot look at latest visible tid for relation %q", qualName)}
+	}
+
+	// View (non-matview): inspect for ctid column, resolve to base table.
+	if tbl.View != nil && !tbl.IsMatView {
+		return currtid2ViewCheck(tbl, block, offset, x.Pos(), ctx)
+	}
+
+	// Heap table or matview: check TID validity in storage.
+	return currtid2TIDCheck(tbl.Name, tbl, block, offset, x.Pos(), ctx)
+}
+
+// currtid2ViewCheck handles currtid2 for a SQL view. Checks that the view
+// has a ctid column of type tid, then delegates TID validity to the base table.
+func currtid2ViewCheck(viewTbl *catalog.Table, block uint32, offset uint16, pos int, ctx *Context) (Datum, error) {
+	var ctidTypeName string
+	for _, c := range viewTbl.Columns {
+		if strings.EqualFold(c.Name, "ctid") {
+			ctidTypeName = strings.ToLower(c.Type.Name)
+			break
+		}
+	}
+	if ctidTypeName == "" {
+		return NullDatum, &ExecError{Code: "0A000", Pos: pos,
+			Message: "currtid cannot handle views with no CTID"}
+	}
+	if ctidTypeName != "tid" {
+		return NullDatum, &ExecError{Code: "0A000", Pos: pos,
+			Message: "ctid isn't of type TID"}
+	}
+	// Resolve base table from view's FROM clause.
+	if viewTbl.View == nil || len(viewTbl.View.From) == 0 {
+		return NullDatum, &ExecError{Code: "0A000", Pos: pos,
+			Message: "currtid cannot handle views with no CTID"}
+	}
+	baseTableName := viewTbl.View.From[0].Name
+	if baseTableName == "" {
+		return NullDatum, &ExecError{Code: "0A000", Pos: pos,
+			Message: "currtid cannot handle views with no CTID"}
+	}
+	baseTbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: baseTableName})
+	if !ok {
+		return NullDatum, &ExecError{Code: "0A000", Pos: pos,
+			Message: "currtid cannot handle views with no CTID"}
+	}
+	return currtid2TIDCheck(baseTbl.Name, baseTbl, block, offset, pos, ctx)
+}
+
+// currtid2TIDCheck verifies that (block, offset) is a valid address in tbl's
+// heap storage and returns the tid on success.
+func currtid2TIDCheck(relname string, tbl *catalog.Table, block uint32, offset uint16, pos int, ctx *Context) (Datum, error) {
+	if ctx.Pool == nil || ctx.Catalog == nil {
+		return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
+	}
+	rel := ctx.Catalog.RelFileNode(tbl)
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil || uint32(nBlocks) <= block {
+		return NullDatum, &ExecError{Code: "22000", Pos: pos,
+			Message: fmt.Sprintf("tid (%d, %d) is not valid for relation %q", block, offset, relname)}
+	}
+	return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
 }
 
 // initCap returns s with the first letter of each word capitalized. M0097-0005.

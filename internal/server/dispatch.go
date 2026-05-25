@@ -291,6 +291,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		_ = w.Flush()
 	}
 
+	// Wire pg_prepared_statements session rows into the executor context.
+	if prepStmts != nil {
+		ectx.PrepStmtsRows = prepStmts.ListRows
+	}
+
 	// Update pg_stat_activity before dispatching.
 	// M0107-0005: use procNum (int32) for the atomic hot path.
 	if reg := s.cfg.Activity; reg != nil && connTx != nil {
@@ -301,7 +306,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		reg.UpdateState(connTx.ProcNum, "active", q)
 	}
 
-	for _, stmt := range stmts {
+	for i, stmt := range stmts {
 		// Check for failed transaction state (25P02) — reject all statements
 		// except COMMIT/ROLLBACK/ABORT/END that clear the failed state.
 		// PostgreSQL semantics: an error inside an explicit transaction block
@@ -354,11 +359,38 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Handle PREPARE / EXECUTE / DEALLOCATE inline (M0096-0006).
 		// These require per-connection state not available in the executor.
 		if ps, ok := stmt.(*parser.PrepareStmt); ok {
-			tag := "PREPARE"
 			if prepStmts != nil && ps.Name != "" && ps.Query != nil {
-				prepStmts.Store(ps.Name, ps.Query)
+				// Validate declared parameter types.
+				for _, pt := range ps.ParamTypes {
+					if !isValidSQLTypeName(pt) {
+						return s.writeQueryError(w, "42704",
+							fmt.Sprintf("type %q does not exist", pt))
+					}
+				}
+				if ok := prepStmts.Store(ps.Name, ps.Query, stmtSQL(sql, stmts, i), ps.ParamTypes); !ok {
+					return s.writeQueryError(w, "42P05",
+						fmt.Sprintf("prepared statement %q already exists", ps.Name))
+				}
+				// Infer result column types and undeclared parameter types by planning/walking.
+				if ectx.Catalog != nil {
+					if plan, planErr := planner.Plan(ps.Query, ectx.Catalog); planErr == nil {
+						schema := plan.Output()
+						if len(schema) > 0 {
+							resultTypes := make([]string, len(schema))
+							for k, col := range schema {
+								resultTypes[k] = normResultType(col.Type.Name)
+							}
+							prepStmts.SetResultTypes(ps.Name, resultTypes)
+						}
+					}
+					// Infer parameter types from comparison contexts.
+					inferred := inferParamTypesFromStmt(ps.Query, ectx.Catalog, ps.ParamTypes)
+					if inferred != nil {
+						prepStmts.SetParamTypes(ps.Name, inferred)
+					}
+				}
 			}
-			if err := w.WriteCommandComplete(tag); err != nil {
+			if err := w.WriteCommandComplete("PREPARE"); err != nil {
 				return err
 			}
 			continue
@@ -370,12 +402,34 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 					if prepDef.stmt == nil {
 						return s.writeQueryError(w, sqlstate.SystemError, fmt.Sprintf("prepared statement %q has no body", es.Name))
 					}
+					// Validate parameter count when the PREPARE declared a type list.
+					if prepDef.paramTypes != nil && len(es.Params) != len(prepDef.paramTypes) {
+						detail := fmt.Sprintf("Expected %d parameters but got %d.",
+							len(prepDef.paramTypes), len(es.Params))
+						return s.writeQueryError(w, "08P01",
+							fmt.Sprintf("wrong number of parameters for prepared statement %q", es.Name),
+							protocol.ErrorField{Code: protocol.FieldDetail, Value: detail})
+					}
 					params, err := evalExecuteParams(es.Params)
 					if err != nil {
 						if ee, ok := err.(*executor.ExecError); ok {
 							return s.writeQueryError(w, sqlstate.Code(ee.Code), ee.Message)
 						}
 						return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
+					}
+					// Validate type compatibility with declared parameter types.
+					for idx, param := range params {
+						if idx >= len(prepDef.paramTypes) {
+							break
+						}
+						target := strings.ToLower(prepDef.paramTypes[idx])
+						if execParamTypeIncompatible(param, target) {
+							srcName := execParamKindName(param)
+							dstName := strings.Trim(normPrepParamType(prepDef.paramTypes[idx]), `"`)
+							return s.writeQueryError(w, "42804",
+								fmt.Sprintf("parameter $%d of type %s cannot be coerced to the expected type %s", idx+1, srcName, dstName),
+								protocol.ErrorField{Code: protocol.FieldHint, Value: "You will need to rewrite or cast the expression."})
+						}
 					}
 					stmt = prepDef.stmt
 					ectx.Params = params
@@ -397,6 +451,34 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				return err
 			}
 			continue
+		}
+		// CREATE TABLE name AS EXECUTE name(params) [WITH NO DATA].
+		// Resolve the prepared statement to a SelectSource so execCreateTableAs
+		// can handle it without needing access to per-connection prepared statements.
+		if cs, ok := stmt.(*parser.CreateTableStmt); ok && cs.ExecuteSource != nil {
+			if prepStmts != nil {
+				es := cs.ExecuteSource
+				prepDef, found := prepStmts.Lookup(es.Name)
+				if !found {
+					return s.writeQueryError(w, "26000", fmt.Sprintf("prepared statement %q does not exist", es.Name))
+				}
+				selStmt, ok2 := prepDef.stmt.(*parser.SelectStmt)
+				if !ok2 {
+					return s.writeQueryError(w, "42601", "EXECUTE in CREATE TABLE AS must reference a SELECT prepared statement")
+				}
+				params, err := evalExecuteParams(es.Params)
+				if err != nil {
+					if ee, ok := err.(*executor.ExecError); ok {
+						return s.writeQueryError(w, sqlstate.Code(ee.Code), ee.Message)
+					}
+					return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
+				}
+				ectx.Params = params
+				disablePlanCache = true
+				cs.SelectSource = selStmt
+				cs.ExecuteSource = nil
+				stmt = cs
+			}
 		}
 		// DECLARE ... CURSOR FOR select (M0097-0003).
 		if dc, ok := stmt.(*parser.DeclareCursorStmt); ok {
@@ -710,30 +792,330 @@ func normalizeSQLPreservingLiterals(s string) string {
 	return strings.TrimRight(b.String(), " ")
 }
 
+// stmtSQL extracts the raw SQL text for stmts[idx] from the full batch sql.
+// Used to record the original PREPARE text in pg_prepared_statements.
+// inferParamTypesFromStmt walks the parsed statement to infer $N parameter
+// types from comparison contexts (column op $N, SET col = $N).
+// declared contains already-declared param types (nil if none).
+// Returns a slice of type names, or nil if nothing could be inferred.
+func inferParamTypesFromStmt(stmt parser.Stmt, cat catalog.Catalog, declared []string) []string {
+	if cat == nil {
+		return nil
+	}
+	// Collect target table name and WHERE/SET source.
+	var tblName parser.ObjectName
+	var whereExpr parser.Expr
+	var setAssigns []parser.UpdateAssign
+
+	switch s := stmt.(type) {
+	case *parser.SelectStmt:
+		if len(s.From) > 0 {
+			tblName = parser.ObjectName{Schema: s.From[0].Schema, Name: s.From[0].Name}
+		}
+		whereExpr = s.Where
+	case *parser.UpdateStmt:
+		tblName = parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name}
+		whereExpr = s.Where
+		setAssigns = s.Set
+	default:
+		return nil
+	}
+
+	// Build column type map from the primary table.
+	colType := map[string]string{}
+	if tbl, ok := cat.LookupTable(tblName); ok {
+		for _, col := range tbl.Columns {
+			colType[strings.ToLower(col.Name)] = col.Type.Name
+		}
+	}
+	if len(colType) == 0 {
+		return nil
+	}
+
+	// Find max param number.
+	maxParam := len(declared)
+	var walkCount func(e parser.Expr)
+	walkCount = func(e parser.Expr) {
+		if e == nil {
+			return
+		}
+		if pr, ok := e.(*parser.ParamRef); ok && pr.Number > maxParam {
+			maxParam = pr.Number
+		}
+		if bo, ok := e.(*parser.BinaryOp); ok {
+			walkCount(bo.Left)
+			walkCount(bo.Right)
+		}
+	}
+	walkCount(whereExpr)
+	for _, a := range setAssigns {
+		if pr, ok := a.Expr.(*parser.ParamRef); ok && pr.Number > maxParam {
+			maxParam = pr.Number
+		}
+	}
+	if maxParam == 0 {
+		return nil
+	}
+
+	// Initialize types from declared, defaulting to "".
+	types := make([]string, maxParam)
+	for i, dt := range declared {
+		if i < maxParam {
+			types[i] = strings.ToLower(dt)
+		}
+	}
+
+	// Infer from WHERE binary comparisons: column op $N.
+	var walkInfer func(e parser.Expr)
+	walkInfer = func(e parser.Expr) {
+		if e == nil {
+			return
+		}
+		bo, ok := e.(*parser.BinaryOp)
+		if !ok {
+			return
+		}
+		// Try column op $N or $N op column.
+		var colName string
+		var paramNum int
+		if cr, ok2 := bo.Left.(*parser.ColumnRef); ok2 {
+			if pr, ok3 := bo.Right.(*parser.ParamRef); ok3 {
+				colName = strings.ToLower(cr.Column)
+				paramNum = pr.Number
+			}
+		} else if cr, ok2 := bo.Right.(*parser.ColumnRef); ok2 {
+			if pr, ok3 := bo.Left.(*parser.ParamRef); ok3 {
+				colName = strings.ToLower(cr.Column)
+				paramNum = pr.Number
+			}
+		}
+		if colName != "" && paramNum >= 1 && paramNum <= maxParam {
+			if ct, ok := colType[colName]; ok && (types[paramNum-1] == "" || types[paramNum-1] == "unknown") {
+				types[paramNum-1] = normResultType(ct)
+			}
+		}
+		walkInfer(bo.Left)
+		walkInfer(bo.Right)
+	}
+	walkInfer(whereExpr)
+
+	// Infer from UPDATE SET col = $N.
+	for _, a := range setAssigns {
+		if pr, ok := a.Expr.(*parser.ParamRef); ok {
+			paramNum := pr.Number
+			if paramNum >= 1 && paramNum <= maxParam {
+				if ct, ok2 := colType[strings.ToLower(a.Column)]; ok2 && (types[paramNum-1] == "" || types[paramNum-1] == "unknown") {
+					types[paramNum-1] = normResultType(ct)
+				}
+			}
+		}
+	}
+
+	// Only return inferred types if we found something useful.
+	hasNew := false
+	for _, t := range types {
+		if t != "" && t != "unknown" {
+			hasNew = true
+			break
+		}
+	}
+	if !hasNew {
+		return nil
+	}
+	return types
+}
+
+// normResultType normalizes planner-internal type names to PostgreSQL canonical
+// names as shown in pg_prepared_statements.result_types.
+func normResultType(t string) string {
+	switch strings.ToLower(t) {
+	case "int4", "int8", "integer":
+		return "integer"
+	case "int2":
+		return "smallint"
+	case "bool":
+		return "boolean"
+	case "float4":
+		return "real"
+	case "float8":
+		return "double precision"
+	case "", "unknown":
+		return "text"
+	}
+	return strings.ToLower(t)
+}
+
+// isValidSQLTypeName reports whether t is a known built-in SQL type name.
+// Used to validate PREPARE parameter type declarations (SQLSTATE 42704).
+func isValidSQLTypeName(t string) bool {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "int", "int2", "int4", "int8", "integer", "smallint", "bigint",
+		"float", "float4", "float8", "real", "double", "double precision",
+		"bool", "boolean",
+		"text", "varchar", "char", "bpchar", "name",
+		"oid", "xid", "cid", "tid",
+		"date", "time", "timetz",
+		"time without time zone", "time with time zone",
+		"timestamp", "timestamptz",
+		"timestamp without time zone", "timestamp with time zone",
+		"interval",
+		"numeric", "decimal",
+		"bytea", "uuid",
+		"json", "jsonb",
+		"unknown", "void", "any", "anyarray", "anyelement", "record",
+		"pg_lsn", "txid_snapshot",
+		"path", "box", "circle", "line", "lseg", "polygon", "point":
+		return true
+	}
+	return false
+}
+
+// execParamTypeIncompatible returns true when datum d cannot be implicitly
+// coerced to targetType (lowercase). Boolean↔numeric is the main case PG rejects.
+func execParamTypeIncompatible(d executor.Datum, targetType string) bool {
+	isBool := d.Kind == executor.KindBool
+	isNumericTarget := func() bool {
+		switch targetType {
+		case "int", "int2", "int4", "int8", "integer", "smallint", "bigint",
+			"float", "float4", "float8", "real", "double", "double precision",
+			"numeric", "decimal":
+			return true
+		}
+		return false
+	}
+	if isBool && isNumericTarget() {
+		return true
+	}
+	return false
+}
+
+// execParamKindName returns the PostgreSQL type name for a datum's kind,
+// used in "parameter $N of type X cannot be coerced" error messages.
+func execParamKindName(d executor.Datum) string {
+	switch d.Kind {
+	case executor.KindBool:
+		return "boolean"
+	case executor.KindInt:
+		return "integer"
+	case executor.KindNumeric:
+		return "double precision"
+	case executor.KindString:
+		return "text"
+	default:
+		return "unknown"
+	}
+}
+
+func stmtSQL(sql string, stmts []parser.Stmt, idx int) string {
+	start := stmts[idx].Pos()
+	end := len(sql)
+	if idx+1 < len(stmts) {
+		end = stmts[idx+1].Pos()
+	}
+	if end > len(sql) {
+		end = len(sql)
+	}
+	raw := strings.TrimRight(sql[start:end], " \t\n\r")
+	// PostgreSQL's pg_prepared_statements always shows a trailing semicolon.
+	if !strings.HasSuffix(raw, ";") {
+		raw += ";"
+	}
+	return raw
+}
+
 func evalExecuteParams(params []parser.Expr) ([]executor.Datum, error) {
 	if len(params) == 0 {
 		return nil, nil
 	}
 	out := make([]executor.Datum, len(params))
 	for i, p := range params {
-		switch v := p.(type) {
-		case *parser.IntegerConst:
-			out[i] = executor.NewIntDatum(v.Value)
-		case *parser.StringConst:
-			out[i] = executor.NewStringDatum(v.Value)
-		case *parser.NumericConst:
-			out[i] = executor.NewStringDatum(v.Value)
-		case *parser.BooleanConst:
-			out[i] = executor.NewBoolDatum(v.Value)
-		case *parser.NullConst:
-			out[i] = executor.NullDatum
-		case *parser.TypedStringLit:
-			out[i] = executor.NewStringDatum(v.Value)
-		default:
-			return nil, fmt.Errorf("EXECUTE parameter type %T not supported", p)
+		d, err := evalConstExpr(p)
+		if err != nil {
+			return nil, err
 		}
+		out[i] = d
 	}
 	return out, nil
+}
+
+// evalConstExpr evaluates a constant expression (no column refs) to a Datum.
+// Used for EXECUTE parameter binding. Handles literals and casts.
+func evalConstExpr(e parser.Expr) (executor.Datum, error) {
+	switch v := e.(type) {
+	case *parser.IntegerConst:
+		return executor.NewIntDatum(v.Value), nil
+	case *parser.StringConst:
+		return executor.NewStringDatum(v.Value), nil
+	case *parser.NumericConst:
+		return executor.NewStringDatum(v.Value), nil
+	case *parser.BooleanConst:
+		return executor.NewBoolDatum(v.Value), nil
+	case *parser.NullConst:
+		return executor.NullDatum, nil
+	case *parser.TypedStringLit:
+		return executor.NewStringDatum(v.Value), nil
+	case *parser.UnaryOp:
+		// Handle unary minus on numeric literals: -5, -10.5
+		inner, err := evalConstExpr(v.Operand)
+		if err != nil {
+			return executor.NullDatum, err
+		}
+		if v.Op == parser.OpSub {
+			if inner.Kind == executor.KindInt {
+				return executor.NewIntDatum(-inner.Int), nil
+			}
+			// For string/numeric, prepend "-" and re-parse as string datum.
+			return executor.NewStringDatum("-" + inner.StringValue()), nil
+		}
+		return inner, nil
+	case *parser.CastExpr:
+		// ::type cast: evaluate operand then coerce kind for the target type.
+		inner, err := evalConstExpr(v.Operand)
+		if err != nil {
+			return executor.NullDatum, err
+		}
+		return coerceExecParam(inner, v.Type.Name), nil
+	default:
+		return executor.NullDatum, fmt.Errorf("EXECUTE parameter type %T not supported", e)
+	}
+}
+
+// coerceExecParam coerces a Datum to match the target type for EXECUTE parameters.
+// Integer and numeric types are kept as-is since the executor evaluates
+// predicates at runtime with the correct type comparison.
+func coerceExecParam(d executor.Datum, targetType string) executor.Datum {
+	switch strings.ToLower(targetType) {
+	case "int2", "smallint", "int4", "integer", "int", "int8", "bigint":
+		if d.Kind == executor.KindString {
+			if n, err := strconv.ParseInt(d.StringValue(), 10, 64); err == nil {
+				return executor.NewIntDatum(n)
+			}
+		}
+		if d.Kind == executor.KindNumeric {
+			return executor.NewIntDatum(d.NumericMantissaValue())
+		}
+		return d
+	case "float4", "real", "float8", "double precision", "float", "double":
+		if d.Kind == executor.KindString {
+			s := d.StringValue()
+			if f, err := strconv.ParseFloat(s, 64); err == nil {
+				// Store as KindNumeric so casts like $3::bigint in the prepared
+				// body hit the numeric→int path (roundNumericToInt) rather than
+				// the string→int path which rejects "10.5". M0097-0021.
+				formatted := strconv.FormatFloat(f, 'f', -1, 64)
+				if i := strings.IndexByte(formatted, '.'); i >= 0 {
+					frac := formatted[i+1:]
+					mant, _ := strconv.ParseInt(strings.ReplaceAll(formatted, ".", ""), 10, 64)
+					return executor.NewNumericInt64Datum(mant, int16(len(frac)))
+				}
+				mant, _ := strconv.ParseInt(formatted, 10, 64)
+				return executor.NewNumericInt64Datum(mant, 0)
+			}
+		}
+		return d
+	default:
+		return d
+	}
 }
 
 // executeOneSimpleStmt plans and runs one statement, emitting the

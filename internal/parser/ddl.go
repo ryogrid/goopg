@@ -409,15 +409,32 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 	}
 	stmt.Name = name
 
-	// CREATE TABLE name AS SELECT … (CTAS). M0096-0008.
+	// CREATE TABLE name AS SELECT/EXECUTE … [WITH NO DATA] (CTAS). M0096-0008.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
 		p.advance() // consume AS
-		sel, err := p.parseSelect()
-		if err != nil {
-			return nil, err
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwExecute {
+			ex, err := p.parseExecute()
+			if err != nil {
+				return nil, err
+			}
+			stmt.ExecuteSource = ex.(*ExecuteStmt)
+		} else {
+			sel, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			if ss, ok := sel.(*SelectStmt); ok {
+				stmt.SelectSource = ss
+			}
 		}
-		if ss, ok := sel.(*SelectStmt); ok {
-			stmt.SelectSource = ss
+		// Optional WITH [NO] DATA clause.
+		if p.acceptKeyword(KwWith) {
+			if p.acceptIdentKeyword("no") {
+				_ = p.acceptIdentKeyword("data")
+				stmt.WithNoData = true
+			} else {
+				_ = p.acceptIdentKeyword("data")
+			}
 		}
 		return stmt, nil
 	}
@@ -1422,9 +1439,11 @@ func (p *parser) parseDrop() (Stmt, error) {
 		"group", "role", "user",
 	} {
 		if p.acceptIdentKeyword(objType) {
-			// "materialized view" is two words
+			// "materialized view" is two words; VIEW is a keyword token, not ident. M0097-0038.
+			resolvedType := objType
 			if objType == "materialized" {
-				_ = p.acceptIdentKeyword("view")
+				_ = p.acceptIdentKeyword("view") || p.acceptKeyword(KwView)
+				resolvedType = "materialized view"
 			}
 			ifExists, names, behavior, err := p.parseDropTail()
 			if err != nil {
@@ -1432,7 +1451,7 @@ func (p *parser) parseDrop() (Stmt, error) {
 			}
 			return &DropCompatStmt{
 				pos:      t.Pos,
-				ObjType:  objType,
+				ObjType:  resolvedType,
 				IfExists: ifExists,
 				Names:    names,
 				Behavior: behavior,

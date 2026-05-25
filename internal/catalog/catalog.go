@@ -1004,12 +1004,14 @@ func (c *InMemory) registerSystemTables() {
 		Schema: "pg_catalog",
 		Name:   "pg_database",
 		Columns: []Column{
-			{Name: "datname", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 0},
 			{Name: "datdba", Type: Type{Name: "text"}, Ordinal: 1},
 			{Name: "encoding", Type: Type{Name: "text"}, Ordinal: 2},
 			// Additional columns for vacuumdb --all (M0095-0004).
-			{Name: "datallowconn", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "datallowconn", Type: Type{Name: "boolean"}, Ordinal: 3},
 			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 4},
+			// datistemplate: standard pg_database column; false for all live databases (M0097-0021).
+			{Name: "datistemplate", Type: Type{Name: "boolean"}, Ordinal: 5},
 		},
 		OID:     1262, // upstream's DatabaseRelationId
 		Virtual: true,
@@ -1023,10 +1025,11 @@ func (c *InMemory) registerSystemTables() {
 		for _, n := range names {
 			out = append(out, []string{
 				n,
-				"10",   // datdba: OID of owner (10 = postgres superuser)
-				"6",    // encoding: 6 = UTF8
-				"true", // datallowconn: allow connections
-				"0",    // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
+				"10",    // datdba: OID of owner (10 = postgres superuser)
+				"6",     // encoding: 6 = UTF8
+				"true",  // datallowconn: allow connections
+				"0",     // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
+				"false", // datistemplate: live databases are not templates
 			})
 		}
 		return out

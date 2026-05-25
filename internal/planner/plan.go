@@ -76,6 +76,16 @@ type TableOidExpr struct {
 func (e *TableOidExpr) Pos() int { return e.pos }
 func (*TableOidExpr) exprNode()  {}
 
+// CTIDExpr is the per-row `ctid` system column for a heap scan.
+// The block/offset pair is injected at runtime by seqScanOp via
+// MaterializedSlot.hasCTID. M0097-0038.
+type CTIDExpr struct {
+	pos int
+}
+
+func (e *CTIDExpr) Pos() int { return e.pos }
+func (*CTIDExpr) exprNode()  {}
+
 // StringConst — string literal.
 type StringConst struct {
 	pos   int

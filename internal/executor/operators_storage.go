@@ -793,6 +793,10 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// slot.Materialize().
 			o.slot.schema = o.schema
 			o.slot.row = row
+			// M0097-0038: inject current TID for CTIDExpr evaluation.
+			o.slot.hasCTID = true
+			o.slot.ctidBlock = uint32(o.curBlock)
+			o.slot.ctidOff = uint16(o.curSlot - 1)
 			return &o.slot, nil
 		}
 		o.releasePinned()

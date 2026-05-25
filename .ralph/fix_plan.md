@@ -993,6 +993,30 @@ M0097-0001 wires it up.
         `tidscan`, `tidrangescan`.
       - Mapped to completed M0097-0010.
       - DoD: same as M0097-0020.
+      - **Progress 2026-05-25 (M0097-0038 — tid → pass):** Implemented
+        `ctid` system-column support end-to-end. Features added:
+        (a) `CTIDExpr` plan node (`internal/planner/plan.go`);
+        `resolveColumnRefAt` handles qualified/unqualified `ctid` refs;
+        `resolveColumnRefTypeAt` returns `tid` type for ctid in both
+        paths; `exprType` / `targetMeta` dispatch `CTIDExpr`.
+        (b) `MaterializedSlot` (`internal/executor/slot.go`) gains
+        `ctidBlock`, `ctidOff`, `hasCTID` fields; `seqScanOp` populates
+        them; `evalExprSlot` returns `"(block,off)"` string for
+        `CTIDExpr`.
+        (c) `aggregateOp.Open/evalGroupKey/applyAgg` thread `TupleSlot`
+        instead of `Row` so `min(ctid)` / `max(ctid)` see TID info.
+        (d) `currtid2` built-in evaluates relations (heap/matview/seq),
+        returns error for unsupported kinds (index, partitioned table).
+        (e) View `ctid`-type detection: `execCreateView` re-plans the
+        query to get typed schema; `currtid2ViewCheck` uses real types.
+        (f) `DropSequence` (`operators_sequence.go`); `execDropCompat`
+        handles `"sequence"` and `"materialized view"` object types.
+        (g) Parser: `DROP MATERIALIZED VIEW` consumed `view` via
+        `acceptIdentKeyword("view")` which fails for keyword tokens;
+        fixed to `acceptIdentKeyword("view") || acceptKeyword(KwView)`
+        and `ObjType` set to `"materialized view"` (was `"materialized"`).
+        (h) Partitioned-table error includes `"public."` schema prefix.
+        `tid` → **pass** (0 diff lines). Baseline CSV updated.
 
 - [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
       - Summary: Make these 10 tests reach `pass`:

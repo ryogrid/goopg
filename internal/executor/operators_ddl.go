@@ -531,6 +531,10 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 			return fmt.Errorf("DDL catalog sync: %w", syncErr)
 		}
 	}
+	// WITH NO DATA: create table structure only, skip row insertion.
+	if s.WithNoData {
+		return nil
+	}
 	// Execute the SELECT and insert all rows.
 	op, buildErr := Build(selectNode)
 	if buildErr != nil {
@@ -711,6 +715,11 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// target shape — bare ColumnRef → its name, FuncCall →
 	// the function name (matches upstream's "sum" / "count"
 	// convention).
+	// Re-plan to get actual column types (e.g. `tid` for ctid). M0097-0038.
+	var planSchema planner.Schema
+	if viewPlan, planErr := planner.Plan(s.Query, o.ctx.Catalog); planErr == nil {
+		planSchema = viewPlan.Output()
+	}
 	cols := make([]catalog.Column, 0, len(s.Query.Targets))
 	for i, tgt := range s.Query.Targets {
 		name := ""
@@ -724,7 +733,11 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 		if name == "" {
 			name = fmt.Sprintf("?column?%d", i+1)
 		}
-		cols = append(cols, catalog.Column{Name: name, Type: catalog.Type{Name: "unknown"}})
+		typ := catalog.Type{Name: "unknown"}
+		if i < len(planSchema) && planSchema[i].Type.Name != "" {
+			typ = planSchema[i].Type
+		}
+		cols = append(cols, catalog.Column{Name: name, Type: typ})
 	}
 	if _, err := o.ctx.Catalog.CreateView(s.Name, cols, s.Columns, s.Query, s.OrReplace); err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
@@ -2559,6 +2572,28 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		// The test driver compares against expected NOTICEs.
 		for _, name := range s.Names {
 			o.ctx.AddNotice(fmt.Sprintf("%s %q does not exist, skipping", s.ObjType, name.String()))
+		}
+		return nil
+	}
+	// Handle sequence drops against the in-memory registry. M0097-0038.
+	if strings.ToLower(s.ObjType) == "sequence" {
+		for _, name := range s.Names {
+			if !DropSequence(name.String()) {
+				return &ExecError{
+					Code:    "42704",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("%s %q does not exist", s.ObjType, name.String()),
+				}
+			}
+		}
+		return nil
+	}
+	// Handle DROP MATERIALIZED VIEW via the catalog's DropView. M0097-0038.
+	if strings.ToLower(s.ObjType) == "materialized view" {
+		for _, name := range s.Names {
+			if err := o.ctx.Catalog.DropView(name, s.IfExists); err != nil {
+				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
+			}
 		}
 		return nil
 	}

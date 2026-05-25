@@ -4269,6 +4269,9 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if cr, ok := e.(*ColumnRef); ok {
 		return cr.Name, cr.Type
 	}
+	if _, ok := e.(*CTIDExpr); ok {
+		return "ctid", catalog.Type{Name: "tid"}
+	}
 	// TypedStringLit `int2 'value'`: column name is the type name.
 	// Matches PostgreSQL's FigureColname() for `type 'string'` syntax. M0097-0003.
 	if tsl, ok := e.(*TypedStringLit); ok {
@@ -4356,6 +4359,8 @@ func exprType(e Expr) catalog.Type {
 		return catalog.Type{Name: "int8"}
 	case *TableOidExpr:
 		return catalog.Type{Name: "oid"}
+	case *CTIDExpr:
+		return catalog.Type{Name: "tid"}
 	case *StringConst:
 		return catalog.Type{Name: "text"}
 	case *BooleanConst:
@@ -4913,6 +4918,10 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		if strings.EqualFold(x.Column, "tableoid") {
 			return resolveTableoidForBinding(b, level, x.Pos()), true, nil
 		}
+		// `<rel>.ctid` system-column resolution. M0097-0038.
+		if strings.EqualFold(x.Column, "ctid") {
+			return &CTIDExpr{pos: x.Pos()}, true, nil
+		}
 		// The qualifier matched a binding at this level but the
 		// column didn't — that's a hard error (no point walking
 		// up; an outer-scope `t.c` for a different `t` would be
@@ -4970,6 +4979,22 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		}
 		if matchB != nil {
 			return resolveTableoidForBinding(*matchB, level, x.Pos()), true, nil
+		}
+	}
+	// Unqualified `ctid` system-column resolution. M0097-0038.
+	if found == nil && strings.EqualFold(x.Column, "ctid") {
+		var matchB *rangeBinding
+		for i := range ctx.bindings {
+			if ctx.bindings[i].qualifiedOnly {
+				continue
+			}
+			if matchB != nil {
+				return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
+			}
+			matchB = &ctx.bindings[i]
+		}
+		if matchB != nil {
+			return &CTIDExpr{pos: x.Pos()}, true, nil
 		}
 	}
 	if found != nil {

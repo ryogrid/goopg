@@ -270,6 +270,12 @@ type Context struct {
 	// InDMLCTE is true while cteDMLPrefixOp is executing its DML sub-plans.
 	// Write operators register their output pointers in CTEWriteFence when this is set.
 	InDMLCTE bool
+
+	// PrepStmtsRows, when non-nil, is called by the valuesOp that backs
+	// pg_prepared_statements to return the session's current prepared
+	// statement rows (name, statement, parameter_types, result_types).
+	// Wired by the server from the per-connection preparedStatements store.
+	PrepStmtsRows func() [][]string
 }
 
 // SettingValue is one effective session setting exposed to SHOW ALL.

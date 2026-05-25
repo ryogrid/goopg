@@ -1267,17 +1267,24 @@ func (p *parser) parsePrepare() (Stmt, error) {
 		return nil, err
 	}
 	name := identText(nameIdent)
-	// Skip optional parameter type list: (type1, type2, …)
+	// Parse optional parameter type list: (type1, type2, …)
+	var paramTypes []string
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 		p.advance()
-		depth := 1
-		for depth > 0 && p.cur().Kind != TokenEOF {
-			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				depth++
-			} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
-				depth--
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				p.advance()
+				break
 			}
-			p.advance()
+			on, terr := p.parseTypeNameAfterCast()
+			if terr != nil {
+				paramTypes = append(paramTypes, "unknown")
+			} else {
+				paramTypes = append(paramTypes, on.Name)
+			}
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+				p.advance()
+			}
 		}
 	}
 	// Consume AS
@@ -1288,13 +1295,13 @@ func (p *parser) parsePrepare() (Stmt, error) {
 	}
 	// Parse the prepared query
 	if p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
-		return &PrepareStmt{pos: t.Pos, Name: name}, nil
+		return &PrepareStmt{pos: t.Pos, Name: name, ParamTypes: paramTypes}, nil
 	}
 	query, err := p.parseStatement()
 	if err != nil {
 		return nil, err
 	}
-	return &PrepareStmt{pos: t.Pos, Name: name, Query: query}, nil
+	return &PrepareStmt{pos: t.Pos, Name: name, ParamTypes: paramTypes, Query: query}, nil
 }
 
 // parseExecute: EXECUTE name [(param, …)] (M0096-0006)

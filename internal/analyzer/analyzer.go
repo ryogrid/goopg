@@ -1054,6 +1054,10 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 			if strings.EqualFold(x.Column, "tableoid") {
 				return catalog.Type{Name: "oid"}, true, nil
 			}
+			// `<rel>.ctid` system-column resolution. M0097-0038.
+			if strings.EqualFold(x.Column, "ctid") {
+				return catalog.Type{Name: "tid"}, true, nil
+			}
 			return catalog.Type{}, false, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
 		}
 		return col.Type, true, nil
@@ -1103,6 +1107,22 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 			}
 			if match != nil {
 				return catalog.Type{Name: "oid"}, true, nil
+			}
+		}
+		// Unqualified `ctid` system column. M0097-0038.
+		if strings.EqualFold(x.Column, "ctid") {
+			var match *scopeRel
+			for i := range ctx.rels {
+				if ctx.rels[i].qualifiedOnly {
+					continue
+				}
+				if match != nil {
+					return catalog.Type{}, false, analyzeError(x.Pos(), "42702", fmt.Sprintf("column reference %q is ambiguous", x.Column))
+				}
+				match = &ctx.rels[i]
+			}
+			if match != nil {
+				return catalog.Type{Name: "tid"}, true, nil
 			}
 		}
 		return catalog.Type{}, false, nil
