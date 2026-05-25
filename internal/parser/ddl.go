@@ -1254,7 +1254,7 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 			}
 		}
 	}
-	// Optional storage parameters WITH (…) — accept and discard.
+	// Optional storage parameters WITH (…) — extract fillfactor, discard rest.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith {
 		p.advance()
 		if p.acceptSymbol("(") {
@@ -1267,6 +1267,18 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 					if depth == 0 {
 						p.advance()
 						break
+					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "fillfactor" {
+					p.advance() // consume "fillfactor"
+					// '=' is TokenOperator in goopg's lexer, not TokenSymbol.
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if p.cur().Kind == TokenIntLit {
+							if v, err := p.parseIntLit(); err == nil {
+								stmt.Fillfactor = int(v)
+							}
+							continue
+						}
 					}
 				}
 				p.advance()

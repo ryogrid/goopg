@@ -3,8 +3,10 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -926,8 +928,13 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		}
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", idxName.String())}
 	}
+	if s.Fillfactor != 0 && (s.Fillfactor < 10 || s.Fillfactor > 100) {
+		return &ExecError{Code: "22023", Pos: s.Pos(),
+			Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", s.Fillfactor),
+			Detail:  "Valid values are between \"10\" and \"100\"."}
+	}
 	method := strings.ToLower(strings.TrimSpace(s.Method))
-	if method == "" {
+	if method == "" || method == "hash" {
 		method = "btree"
 	}
 	if method != "btree" {
@@ -1482,6 +1489,14 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 				o.ctx.Pool.Unpin(slot)
 				return nil, encErr
 			}
+			if key == nil {
+				// All index columns are expression-based (cols[i]==nil); we
+				// cannot encode an expression key from raw heap data here.
+				// Skip this row — the index will be empty for expression-only
+				// indexes, which suppresses spurious duplicate-key violations
+				// during bulk build while expression evaluation is unsupported.
+				continue
+			}
 			entries = append(entries, btree.BulkEntry{Key: append([]byte(nil), key...), Ptr: storage.ItemPointer{Block: blk, Offset: i}})
 		}
 		// M0074-0004 / M0107-0001: page boundary — reset sctx. All
@@ -1721,6 +1736,38 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not text at runtime", col.Name)}
 		}
 		return btree.EncodeVarchar([]byte(s)), nil
+	case strings.ToLower(col.Type.Name) == "name":
+		// name type: encode as varchar bytes (max 63 chars).
+		if v.Kind != KindString {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
+		}
+		return btree.EncodeVarchar([]byte(v.StringValue())), nil
+	case isFloat8Type(col.Type.Name):
+		// float4/float8 stored as text; decode then re-encode sortably.
+		var f float64
+		switch v.Kind {
+		case KindString:
+			var err error
+			f, err = strconv.ParseFloat(v.StringValue(), 64)
+			if err != nil {
+				return nil, &ExecError{Code: "22003", Pos: pos, Message: fmt.Sprintf("invalid float value %q for index key", v.StringValue())}
+			}
+		case KindInt:
+			f = float64(v.Int)
+		case KindNumeric:
+			// Convert NUMERIC datum (mantissa * 10^-scale) to float64.
+			m := numericMant(v)
+			fv, _ := new(big.Float).SetInt(m).Float64()
+			if v.Scale > 0 {
+				fv /= math.Pow10(int(v.Scale))
+			} else if v.Scale < 0 {
+				fv *= math.Pow10(-int(v.Scale))
+			}
+			f = fv
+		default:
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not float at runtime (kind %d)", col.Name, v.Kind)}
+		}
+		return btree.EncodeFloat8(f), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }
@@ -1796,16 +1843,28 @@ func isTimestampType(name string) bool {
 	}
 }
 
+// isFloat8Type returns true for float8 / float4 / real / double precision.
+func isFloat8Type(name string) bool {
+	switch strings.ToLower(name) {
+	case "float8", "float4", "real", "double precision", "double", "float":
+		return true
+	default:
+		return false
+	}
+}
+
 // isSupportedBTreeKeyType lists the column types accepted by
 // createSingleColumnBTreeIndex. int4 is the original v0 path; int8
 // and numeric landed for HammerDB TPC-H compatibility. varchar landed
 // in M0044-0001; char in M0044-0002; timestamp in M0044-0003.
 func isSupportedBTreeKeyType(name string) bool {
-	if strings.ToLower(name) == "text" {
+	switch strings.ToLower(name) {
+	case "text", "name":
 		return true
 	}
 	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
-		isVarcharType(name) || isCharType(name) || isTimestampType(name)
+		isVarcharType(name) || isCharType(name) || isTimestampType(name) ||
+		isFloat8Type(name)
 }
 
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {

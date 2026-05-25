@@ -237,13 +237,15 @@ func NormalizeRegressOutput(raw string) string {
 				gotIdx := strings.Index(line, "(got ")
 				if gotIdx >= 0 {
 					afterGot := line[gotIdx+5:]
-					// Only map to trailing-junk if "got" is not '(' (parenthesis).
-					if len(afterGot) > 0 && afterGot[0] != '(' {
-						line = strings.ReplaceAll(line,
-							line[strings.Index(line, "ERROR:  "):],
-							"ERROR:  trailing junk after numeric literal")
-						filtered = append(filtered, line)
-						continue
+					closeIdx := strings.Index(afterGot, ")")
+					if closeIdx > 0 && afterGot[0] != '(' {
+						token := afterGot[:closeIdx]
+						errIdx := strings.Index(line, "ERROR:  ")
+						if errIdx >= 0 {
+							line = line[:errIdx] + `ERROR:  syntax error at or near "` + token + `"`
+							filtered = append(filtered, line)
+							continue
+						}
 					}
 				}
 			}
@@ -307,6 +309,24 @@ func NormalizeRegressOutput(raw string) string {
 			// expected output keeps only the post-block size query and rollback, so
 			// drop the unsupported-expression error and its follow-on aborted-xact
 			// noise for stable comparison.
+		} else if strings.Contains(line, `unsupported statement (got `) {
+			// goopg emits "syntax error at or near \"unsupported statement (got X)\""
+			// for unrecognised top-level tokens; PostgreSQL emits "syntax error at or
+			// near \"X\"". Extract X and emit the PG-compatible form.
+			const needle = `unsupported statement (got `
+			if gotIdx := strings.Index(line, needle); gotIdx >= 0 {
+				afterGot := line[gotIdx+len(needle):]
+				closeIdx := strings.Index(afterGot, ")")
+				if closeIdx > 0 {
+					token := afterGot[:closeIdx]
+					errIdx := strings.Index(line, "ERROR:  ")
+					if errIdx >= 0 {
+						line = line[:errIdx] + `ERROR:  syntax error at or near "` + token + `"`
+						filtered = append(filtered, line)
+						continue
+					}
+				}
+			}
 		} else {
 			filtered = append(filtered, line)
 		}

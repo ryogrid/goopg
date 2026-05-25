@@ -930,7 +930,8 @@ type CreateIndexStmt struct {
 	// ColExprs holds the parsed expression for expression-based index columns
 	// (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil when
 	// Columns[i] == "" (expression column); nil for plain column names.
-	ColExprs []Expr
+	ColExprs   []Expr
+	Fillfactor int // 0 means unset; valid range 10–100
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }

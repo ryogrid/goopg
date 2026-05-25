@@ -355,6 +355,8 @@ identLedStatement:
 		switch strings.ToLower(t.Value) {
 		case "fetch":
 			return p.parseFetchCursor()
+		case "move":
+			return p.parseMoveCursor()
 		case "close":
 			return p.parseCloseCursor()
 		case "refresh":
@@ -1676,6 +1678,32 @@ func (p *parser) parseFetchCursor() (Stmt, error) {
 	p.advance()
 
 	return &FetchStmt{pos: pos, CursorName: cursorName, Count: count, Forward: forward}, nil
+}
+
+// parseMoveCursor parses MOVE [direction] [count] [FROM|IN] cursor_name.
+// MOVE repositions a cursor without returning rows; executed as a no-op.
+func (p *parser) parseMoveCursor() (Stmt, error) {
+	pos := p.cur().Pos
+	p.advance() // consume "move"
+	// Consume optional direction and count tokens.
+	p.acceptIdentKeyword("forward")
+	p.acceptIdentKeyword("backward")
+	p.acceptIdentKeyword("prior")
+	p.acceptKeyword(KwAll)
+	if p.cur().Kind == TokenIntLit {
+		if _, err := p.parseIntLit(); err != nil {
+			return nil, err
+		}
+	}
+	// Consume optional FROM or IN.
+	if !p.acceptKeyword(KwFrom) {
+		p.acceptKeyword(KwIn)
+	}
+	// Consume cursor name.
+	if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+		p.advance()
+	}
+	return &CompatNoopStmt{pos: pos, Tag: "MOVE"}, nil
 }
 
 // parseCloseCursor parses CLOSE {cursor_name|ALL}.

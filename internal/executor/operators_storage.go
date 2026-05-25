@@ -2806,9 +2806,6 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 		return
 	}
 	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
-		if !idx.Unique && !idx.Primary {
-			continue
-		}
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
 		tree, err := btree.Open(ctx.Pool, idxRel)
 		if err != nil {

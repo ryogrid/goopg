@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -433,6 +434,22 @@ func EncodeTimestamp(microsSince2000 int64) []byte {
 
 // DecodeTimestamp inverts EncodeTimestamp (identical to DecodeInt8).
 func DecodeTimestamp(b []byte) (int64, error) { return DecodeInt8(b) }
+
+// EncodeFloat8 encodes a float64 into a sortable 8-byte sequence.
+// IEEE 754 bit layout: flip sign bit for positives (so positives > negatives
+// under unsigned comparison), flip all bits for negatives (so more-negative
+// values sort smaller). NaN sorts above +Inf, which is acceptable.
+func EncodeFloat8(key float64) []byte {
+	bits := math.Float64bits(key)
+	if bits>>63 != 0 {
+		bits = ^bits
+	} else {
+		bits ^= 0x8000000000000000
+	}
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], bits)
+	return b[:]
+}
 
 // DecodeVarchar inverts EncodeVarchar: strips the 0x00 terminator and
 // unescapes 0x01-prefixed bytes. Used by index-only scan (M0046-0004)
