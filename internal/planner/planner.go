@@ -93,7 +93,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CompatNoopStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
 		*parser.CreateDomainStmt, *parser.DropDomainStmt,
-		*parser.CreateAggregateStmt:
+		*parser.CreateAggregateStmt,
+		*parser.CreateOpClassStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,
@@ -827,7 +828,9 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			}
 		}
 	}
+
 	proj := &Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema}
+
 	// Promote to IndexOnlyScan (M0046-0004) only when there are no locking
 	// clauses. FOR UPDATE / FOR SHARE rely on the IndexScan leaf being
 	// accessible via lockRowsOp's currentTIDProvider chain.
@@ -4847,7 +4850,14 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			}
 			args = append(args, pa)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}, nil
+		varExp := false
+		for _, v := range x.Variadic {
+			if v {
+				varExp = true
+				break
+			}
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp}, nil
 	case *parser.StarExpr:
 		return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
 	case *parser.CastExpr:
@@ -5196,7 +5206,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		for i, a := range x.Args {
 			args[i] = shiftColumnRefsBy(a, delta)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic}
 	case *CaseExpr:
 		whens := make([]CaseWhen, len(x.Whens))
 		for i, w := range x.Whens {

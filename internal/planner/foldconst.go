@@ -69,7 +69,7 @@ func FoldConstants(e Expr) Expr {
 		for i, a := range x.Args {
 			foldedArgs[i] = FoldConstants(a)
 		}
-		return &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star}
+		return &FuncCall{pos: x.pos, Name: x.Name, Args: foldedArgs, Star: x.Star, Variadic: x.Variadic}
 
 	// ── Non-foldable: return unchanged ─────────────────────────────────
 	default:

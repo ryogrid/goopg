@@ -3160,7 +3160,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	case "satisfies_hash_partition":
 		// satisfies_hash_partition(tableoid, modulus, remainder, val...) → bool
-		// M0097-0015: validate inputs; full hash computation not implemented.
+		// Full implementation: Jenkins Bob hash + hash_combine64. M0097-0027.
 		if len(x.Args) < 3 || ctx == nil || ctx.Catalog == nil {
 			return NewBoolDatum(false), nil
 		}
@@ -3226,7 +3226,93 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				Message: fmt.Sprintf("number of partitioning columns (%d) does not match number of partition keys provided (%d)",
 					numKeys, numArgs)}
 		}
-		return NewBoolDatum(false), nil
+		// Type-check args against partition key column types (PG behavior: check even for NULLs).
+		// Non-variadic: no quotes around type names; variadic: quoted type names.
+		for i := 0; i < numKeys; i++ {
+			colType := ""
+			for _, col := range tbl.Columns {
+				if strings.EqualFold(col.Name, tbl.PartitionKey[i]) {
+					colType = strings.ToLower(col.Type.Name)
+					break
+				}
+			}
+			argTypeName := hashPartTypeName(x.Args[3+i])
+			if argTypeName != "" {
+				colPGName := pgFormatTypeName(colType)
+				if !hashPartTypesCompatible(colType, argTypeName) {
+					if x.Variadic {
+						return NullDatum, &ExecError{Code: "22023",
+							Message: fmt.Sprintf("column %d of the partition key has type %q, but supplied value is of type %q",
+								i+1, colPGName, argTypeName)}
+					}
+					return NullDatum, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("column %d of the partition key has type %s, but supplied value is of type %s",
+							i+1, colPGName, argTypeName)}
+				}
+			}
+		}
+		// Compute hash: for each non-NULL key value, call the operator class hash
+		// function (or the built-in type default) and fold with hash_combine64.
+		var rowHash uint64
+		seedInt64 := int64(hashPartitionSeed)
+		for i := 0; i < numKeys; i++ {
+			valDatum, verr := evalExpr(x.Args[3+i], row, ctx)
+			if verr != nil {
+				return NullDatum, verr
+			}
+			if valDatum.IsNull() {
+				continue // NULL values are skipped (PG behavior)
+			}
+			opClass := ""
+			if i < len(tbl.PartitionKeyOpClasses) {
+				opClass = tbl.PartitionKeyOpClasses[i]
+			}
+			var h uint64
+			if opClass != "" {
+				// Custom operator class: look up FUNCTION 2 and call it(val, seed).
+				hashFuncName, hasFn := im.LookupOpClassHashFunc(opClass)
+				if hasFn {
+					routines := ctx.Catalog.Routines()
+					rs := routines.LookupByName(parser.ObjectName{Name: hashFuncName})
+					seedDatum := NewIntDatum(seedInt64)
+					var bestRoutine *catalog.Routine
+					for _, r := range rs {
+						if len(r.ArgTypes) == 2 {
+							bestRoutine = r
+							break
+						}
+					}
+					if bestRoutine != nil {
+						hResult, herr := executeStoredRoutine(bestRoutine, []Datum{valDatum, seedDatum}, ctx, x.Pos())
+						if herr != nil {
+							return NullDatum, herr
+						}
+						if !hResult.IsNull() {
+							h = uint64(hResult.Int)
+						}
+					}
+				}
+			} else {
+				// Default hash: type-based built-in hash functions.
+				colType := ""
+				for _, col := range tbl.Columns {
+					if strings.EqualFold(col.Name, tbl.PartitionKey[i]) {
+						colType = strings.ToLower(col.Type.Name)
+						break
+					}
+				}
+				switch {
+				case colType == "int4" || colType == "integer" || colType == "int" || valDatum.Kind == KindInt:
+					h = pgHashUint32Extended(uint32(valDatum.Int), hashPartitionSeed)
+				case colType == "text" || colType == "varchar" || colType == "bpchar" || valDatum.Kind == KindString:
+					h = pgHashBytesExtended([]byte(valDatum.StringValue()), hashPartitionSeed)
+				default:
+					h = pgHashUint32Extended(uint32(valDatum.Int), hashPartitionSeed)
+				}
+			}
+			rowHash = pgHashCombine64(rowHash, h)
+		}
+		return NewBoolDatum(uint64(rowHash)%uint64(modulus) == uint64(remainder)), nil
 	case "merge_action":
 		// merge_action() → text — returns 'INSERT', 'UPDATE', or 'DELETE' within MERGE RETURNING.
 		// Stub: return NULL (MERGE RETURNING is not yet executed). M0097-0016.
@@ -5131,4 +5217,84 @@ func isValidBoolInput(v string) bool {
 		return true
 	}
 	return false
+}
+
+// hashPartTypesCompatible returns true if the arg type is compatible with the column type
+// for satisfies_hash_partition type checking.
+func hashPartTypesCompatible(colType, argTypeName string) bool {
+	col := pgFormatTypeName(colType)
+	arg := strings.ToLower(argTypeName)
+	if col == arg {
+		return true
+	}
+	// Integer family compatibility
+	intFamily := map[string]bool{"integer": true, "smallint": true, "bigint": true, "int4": true, "int2": true, "int8": true}
+	if intFamily[col] && intFamily[arg] {
+		return true
+	}
+	return false
+}
+
+// hashPartTypeName returns the user-visible PG type name for a planner expression,
+// used to build satisfies_hash_partition type mismatch messages. Returns "" if unknown.
+func hashPartTypeName(e planner.Expr) string {
+	switch x := e.(type) {
+	case *planner.CastExpr:
+		return pgFormatTypeName(x.TargetType)
+	case *planner.IntegerConst:
+		return "integer"
+	case *planner.NumericConst:
+		return "numeric"
+	case *planner.StringConst:
+		return "text"
+	case *planner.BooleanConst:
+		return "boolean"
+	case *planner.FuncCall:
+		switch strings.ToLower(x.Name) {
+		case "now", "current_timestamp":
+			return "timestamp with time zone"
+		case "current_date":
+			return "date"
+		case "current_time":
+			return "time with time zone"
+		}
+	}
+	return ""
+}
+
+// pgFormatTypeName converts internal type names to PG user-visible names.
+func pgFormatTypeName(t string) string {
+	switch strings.ToLower(t) {
+	case "int4", "int", "integer":
+		return "integer"
+	case "int2", "smallint":
+		return "smallint"
+	case "int8", "bigint":
+		return "bigint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision":
+		return "double precision"
+	case "bool", "boolean":
+		return "boolean"
+	case "text":
+		return "text"
+	case "varchar", "character varying":
+		return "character varying"
+	case "bpchar", "character", "char":
+		return "character"
+	case "timestamptz", "timestamp with time zone":
+		return "timestamp with time zone"
+	case "timestamp", "timestamp without time zone":
+		return "timestamp without time zone"
+	case "date":
+		return "date"
+	case "time", "time without time zone":
+		return "time without time zone"
+	case "timetz", "time with time zone":
+		return "time with time zone"
+	case "numeric", "decimal":
+		return "numeric"
+	}
+	return t
 }

@@ -145,6 +145,13 @@ func (p *parser) parseCreate() (Stmt, error) {
 	// M0097-regress.
 	case p.acceptIdentKeyword("aggregate"):
 		return p.parseCreateAggregateTail(t.Pos)
+	// CREATE OPERATOR CLASS name FOR TYPE t USING hash AS … — register hash func. M0097-0027.
+	case p.acceptIdentKeyword("operator"):
+		if p.acceptIdentKeyword("class") {
+			return p.parseCreateOpClassTail(t.Pos)
+		}
+		// CREATE OPERATOR — accept and skip. M0097-regress.
+		return p.parseSkipToSemicolon(t.Pos)
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after CREATE")
 }
@@ -199,6 +206,125 @@ func (p *parser) parseCreateAggregateTail(pos int) (Stmt, error) {
 		p.advance() // consume ")"
 	}
 	return stmt, nil
+}
+
+// parseCreateOpClassTail picks up after "CREATE OPERATOR CLASS".
+// Captures just enough to register the FUNCTION 2 (hash extended support func)
+// for use in satisfies_hash_partition. Everything else is accepted and ignored.
+// M0097-0027.
+func (p *parser) parseCreateOpClassTail(pos int) (Stmt, error) {
+	stmt := &CreateOpClassStmt{pos: pos}
+	// Name.
+	nameTok := p.cur()
+	if nameTok.Kind != TokenIdent && nameTok.Kind != TokenQuotedIdent {
+		return nil, p.errAtCur("expected operator class name")
+	}
+	stmt.Name = nameTok.Value
+	p.advance()
+	// Skip optional DEFAULT (reserved keyword).
+	p.acceptKeyword(KwDefault)
+	// FOR TYPE typename.
+	if !p.acceptKeyword(KwFor) {
+		return parseSkipToSemicolonHelper(p, stmt)
+	}
+	// "type" is not in goopg's keyword map — arrives as TokenIdent.
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "type") {
+		p.advance()
+	} else {
+		return parseSkipToSemicolonHelper(p, stmt)
+	}
+	typeObj, _ := p.parseTypeNameAfterCast()
+	stmt.ForType = strings.ToLower(typeObj.String())
+	// USING hash (USING is a reserved keyword).
+	if !p.acceptKeyword(KwUsing) {
+		return parseSkipToSemicolonHelper(p, stmt)
+	}
+	p.advance() // access method name (e.g. "hash") — consume it
+	// AS list of entries (AS is a reserved keyword).
+	if !p.acceptKeyword(KwAs) {
+		return parseSkipToSemicolonHelper(p, stmt)
+	}
+	// Scan entries: OPERATOR n op [, FUNCTION n name(args) [, ...]]
+	for {
+		tok := p.cur()
+		if tok.Kind == TokenEOF {
+			break
+		}
+		// "operator" is not in goopg's keyword map → TokenIdent.
+		isOperator := tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "operator")
+		// "function" IS in the keyword map as KwCatUnreserved → TokenKeyword.
+		isFunction := tok.Kind == TokenKeyword && tok.Keyword == KwFunction
+		if isOperator {
+			p.advance() // consume "operator"
+			// Skip strategy number.
+			if p.cur().Kind == TokenIntLit {
+				p.advance()
+			}
+			// Skip operator name (may be =, <>, OPERATOR(...), or bare ident).
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				p.skipBalancedParens() // OPERATOR(schema.op) qualified form
+			} else if p.cur().Kind == TokenOperator {
+				p.advance() // simple operator like =, <, >, <=
+			} else if p.cur().Kind == TokenIdent {
+				p.advance() // bare identifier operator
+			}
+		} else if isFunction {
+			p.advance() // consume "function"
+			numTok := p.cur()
+			if numTok.Kind == TokenIntLit {
+				p.advance()
+			}
+			funcName, err := p.parseObjectName()
+			if err != nil {
+				return parseSkipToSemicolonHelper(p, stmt)
+			}
+			// Skip argument list.
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				p.skipBalancedParens()
+			}
+			// FUNCTION 2 is the hash extended support function.
+			if numTok.Value == "2" {
+				stmt.HashFuncName = strings.ToLower(funcName.String())
+			}
+		} else {
+			break
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return stmt, nil
+}
+
+func parseSkipToSemicolonHelper(p *parser, stmt Stmt) (Stmt, error) {
+	for {
+		tok := p.cur()
+		if tok.Kind == TokenEOF {
+			break
+		}
+		if tok.Kind == TokenSymbol && tok.Value == ";" {
+			break
+		}
+		p.advance()
+	}
+	return stmt, nil
+}
+
+// parseSkipToSemicolon advances past all tokens until ';' or EOF and returns a
+// no-op DoStmt so the caller has a valid non-nil Stmt. Used for DDL statements
+// that are syntactically accepted but semantically ignored. M0097-0027.
+func (p *parser) parseSkipToSemicolon(pos int) (Stmt, error) {
+	for {
+		tok := p.cur()
+		if tok.Kind == TokenEOF {
+			break
+		}
+		if tok.Kind == TokenSymbol && tok.Value == ";" {
+			break
+		}
+		p.advance()
+	}
+	return &DoStmt{pos: pos}, nil
 }
 
 // parseCreatePublicationTail picks up after CREATE PUBLICATION.
@@ -783,18 +909,21 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		if !p.acceptSymbol("(") {
 			return nil, p.errAtCur("expected '(' after partition method")
 		}
-		// Parse column names, skipping optional operator class names. M0097-0015.
-		var keyCols []string
+		// Parse column names with optional operator class names. M0097-0015/M0097-0027.
+		var keyCols, opClasses []string
 		for {
 			col, err := p.parseIdent()
 			if err != nil {
 				return nil, err
 			}
 			keyCols = append(keyCols, identText(col))
-			// Optional operator class name (e.g. part_test_int4_ops) — skip it.
+			// Optional operator class name (e.g. part_test_int4_ops). M0097-0027.
+			opClass := ""
 			if p.cur().Kind == TokenIdent {
-				p.advance() // operator class name
+				opClass = p.cur().Value
+				p.advance()
 			}
+			opClasses = append(opClasses, opClass)
 			if !p.acceptSymbol(",") {
 				break
 			}
@@ -802,7 +931,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
 		}
-		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, KeyCols: keyCols}
+		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, KeyCols: keyCols, OpClasses: opClasses}
 	}
 	if p.acceptKeyword(KwWith) {
 		opts, err := p.parseWithOptions()

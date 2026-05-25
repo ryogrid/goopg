@@ -105,6 +105,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execRefreshMatView(s)
 	case *parser.CreateAggregateStmt:
 		return nil, o.execCreateAggregate(s)
+	case *parser.CreateOpClassStmt:
+		return nil, o.execCreateOpClass(s)
 	case *parser.CompatNoopStmt:
 		return nil, nil // GRANT/REVOKE/COMMENT/etc — accepted, no-op. M0097-0016.
 	case *parser.DoStmt:
@@ -437,6 +439,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if s.PartitionBy != nil {
 		tbl.PartitionMethod = s.PartitionBy.Method
 		tbl.PartitionKey = s.PartitionBy.KeyCols
+		tbl.PartitionKeyOpClasses = s.PartitionBy.OpClasses
 		// Partitioned tables are "virtual" for storage purposes:
 		// they never hold rows directly — all data lives in children.
 		// But we still create a heap so the table exists for metadata.
@@ -2878,6 +2881,21 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 				Message: fmt.Sprintf("function %s(%s) does not exist", s.FinalFunc, stypeMsg)}
 		}
 	}
+	return nil
+}
+
+// execCreateOpClass registers the hash extended support function for an
+// operator class. Only the FUNCTION 2 entry is used; everything else is
+// silently accepted. M0097-0027.
+func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
+	if s.HashFuncName == "" {
+		return nil // no hash support function — nothing to register
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	im.RegisterOpClassHashFunc(s.Name, s.HashFuncName)
 	return nil
 }
 

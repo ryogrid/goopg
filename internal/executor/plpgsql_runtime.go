@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -10,6 +11,21 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/plpgsql"
 )
+
+// rewriteSQLNamedParams replaces named parameter references in a SQL function
+// body with positional $n references. This supports SQL functions that reference
+// their arguments by name (e.g. "select value + seed" → "select $1 + $2").
+func rewriteSQLNamedParams(body string, argNames []string) string {
+	for i, name := range argNames {
+		if name == "" {
+			continue
+		}
+		re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(name) + `\b`)
+		// Use $$ to produce a literal $ in the replacement (Go regexp convention).
+		body = re.ReplaceAllString(body, fmt.Sprintf("$$%d", i+1))
+	}
+	return body
+}
 
 // plpgsqlFrame is the local variable frame for one routine call.
 // Names are case-insensitive and map to row slots consumed by evalExpr.
@@ -98,7 +114,11 @@ func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos in
 }
 
 func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
-	stmts, err := parser.Parse(r.Body)
+	body := r.Body
+	if len(r.ArgNames) > 0 {
+		body = rewriteSQLNamedParams(body, r.ArgNames)
+	}
+	stmts, err := parser.Parse(body)
 	if err != nil {
 		return Datum{}, &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for function %s: %v", r.QualifiedName(), err)}
 	}

@@ -143,6 +143,9 @@ type Table struct {
 	// routing and display. For LIST: InValues strings; for RANGE: one
 	// PartitionBound with From/To strings.
 	PartitionBounds []PartitionBound
+	// PartitionKeyOpClasses is the operator class name per key column.
+	// Empty string means "use the default hash function". M0097-0027.
+	PartitionKeyOpClasses []string
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -342,6 +345,11 @@ type InMemory struct {
 	// views that rely on the constraint for GROUP BY functional dependency.
 	// Used to enforce DROP CONSTRAINT RESTRICT. M0097-0036 / functional_deps.
 	constraintViewDeps map[string][]string
+
+	// opClassHashFuncs maps operator class name → hash extended routine name.
+	// Only FUNCTION 2 (hash extended) entries are registered; used by
+	// satisfies_hash_partition. M0097-0027.
+	opClassHashFuncs map[string]string
 }
 
 // EnumType holds one user-defined enum type. M0097-0017.
@@ -413,6 +421,7 @@ func NewInMemory() *InMemory {
 		enumTypes:           make(map[string]*EnumType),
 		domains:             make(map[string]*Domain),
 		constraintViewDeps:  make(map[string][]string),
+		opClassHashFuncs:    make(map[string]string),
 	}
 	c.registerSystemTables()
 	return c
@@ -735,6 +744,23 @@ func (c *InMemory) LookupTableByOID(oid uint32) (*Table, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.tableByOID(oid)
+}
+
+// RegisterOpClassHashFunc records that opClassName uses routineName as its
+// FUNCTION 2 (hash extended support function). M0097-0027.
+func (c *InMemory) RegisterOpClassHashFunc(opClassName, routineName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.opClassHashFuncs[opClassName] = routineName
+}
+
+// LookupOpClassHashFunc returns the hash-extended routine name for an operator
+// class, and whether one was registered. M0097-0027.
+func (c *InMemory) LookupOpClassHashFunc(opClassName string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.opClassHashFuncs[opClassName]
+	return v, ok
 }
 
 // advanceNextOIDLocked nudges nextOID past `oid` so subsequent

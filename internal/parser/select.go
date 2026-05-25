@@ -2097,6 +2097,60 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 		// passes through unchanged, which is exactly the spread-equivalent
 		// shape variadic-callees expect).
 		variadic := p.acceptKeyword(KwVariadic)
+		// VARIADIC array[e1, e2, ...] — expand array constructor elements into
+		// individual args at parse time. Used by satisfies_hash_partition tests.
+		// M0097-0027.
+		if variadic && p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "array") &&
+			p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "[" {
+			expandStart := len(fc.Args) // index of first expanded element
+			p.advance() // array
+			p.advance() // [
+			if !(p.cur().Kind == TokenSymbol && p.cur().Value == "]") {
+				first, ferr := p.parseExpr()
+				if ferr != nil {
+					return nil, ferr
+				}
+				fc.Args = append(fc.Args, first)
+				fc.Variadic = append(fc.Variadic, true) // variadic-expanded
+				for p.acceptSymbol(",") {
+					elem, ferr := p.parseExpr()
+					if ferr != nil {
+						return nil, ferr
+					}
+					fc.Args = append(fc.Args, elem)
+					fc.Variadic = append(fc.Variadic, true) // variadic-expanded
+				}
+			}
+			if !p.acceptSymbol("]") {
+				return nil, p.errAtCur("expected ']' after VARIADIC array elements")
+			}
+			// Optional ::type[] cast on array — capture element type and apply to each element.
+			if p.cur().Kind == TokenOperator && p.cur().Value == "::" {
+				castPos := p.cur().Pos
+				p.advance() // ::
+				elemType, _ := p.parseTypeNameAfterCast()
+				// Skip optional [] array dimension suffixes
+				for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+					p.advance()
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+						p.advance()
+					}
+				}
+				// Wrap each expanded element with a CastExpr to propagate the element type.
+				if elemType.Name != "" {
+					for j := expandStart; j < len(fc.Args); j++ {
+						fc.Args[j] = &CastExpr{pos: castPos, Operand: fc.Args[j], Type: ObjectName{Name: elemType.Name}}
+					}
+				}
+			}
+			if p.acceptSymbol(",") {
+				continue
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ',' or ')'")
+			}
+			return p.maybeWindowTail(fc)
+		}
 		arg, err := p.parseExpr()
 		if err != nil {
 			return nil, err

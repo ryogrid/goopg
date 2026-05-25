@@ -392,10 +392,11 @@ func (*UnaryOp) exprNode()  {}
 // FuncCall — identified by its planner-resolved name. Argument
 // expressions live under Args; v0 doesn't yet resolve overloads.
 type FuncCall struct {
-	pos  int
-	Name string
-	Args []Expr
-	Star bool
+	pos      int
+	Name     string
+	Args     []Expr
+	Star     bool
+	Variadic bool // true when args were expanded from VARIADIC array syntax
 }
 
 func (e *FuncCall) Pos() int { return e.pos }

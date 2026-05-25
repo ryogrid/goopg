@@ -906,9 +906,10 @@ func (s *CreateTableStmt) stmtNode() {}
 
 // PartitionByClause describes a PARTITION BY … clause.  M0096-0007.
 type PartitionByClause struct {
-	pos     int
-	Method  string   // "LIST", "RANGE", or "HASH"
-	KeyCols []string // partition key column names
+	pos      int
+	Method   string   // "LIST", "RANGE", or "HASH"
+	KeyCols  []string // partition key column names
+	OpClasses []string // operator class per key col (empty string = default); M0097-0027
 }
 
 // PartitionOfClause describes a PARTITION OF parent FOR VALUES … clause.
@@ -1101,6 +1102,20 @@ type CreateAggregateStmt struct {
 
 func (s *CreateAggregateStmt) Pos() int  { return s.pos }
 func (s *CreateAggregateStmt) stmtNode() {}
+
+// CreateOpClassStmt is a minimal representation of CREATE OPERATOR CLASS used
+// to register custom hash support functions for hash partitioning. M0097-0027.
+// We only capture the FUNCTION 2 (hash extended) entry; everything else is
+// accepted-and-discarded so the statement doesn't produce a parse error.
+type CreateOpClassStmt struct {
+	pos          int
+	Name         string // operator class name
+	ForType      string // e.g. "int4", "text"
+	HashFuncName string // name of the FUNCTION 2 (hash extended) routine
+}
+
+func (s *CreateOpClassStmt) Pos() int  { return s.pos }
+func (s *CreateOpClassStmt) stmtNode() {}
 
 // DoStmt represents DO $$ body $$ — an anonymous PL/pgSQL block. M0097-0003.
 type DoStmt struct {
