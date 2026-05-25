@@ -22,7 +22,7 @@ varchar,0,pass
 functional_deps,0,pass
 copydml,45,failed
 tid,0,pass
-errors,35,failed
+errors,29,failed
 hash_part,73,failed
 hash_index,0,pass
 index_including_gist,112,failed

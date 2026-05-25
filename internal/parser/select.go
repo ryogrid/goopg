@@ -114,7 +114,7 @@ func (p *parser) parseSelect() (Stmt, error) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
 			return nil, err
 		}
-		list, err := p.parseExprList()
+		list, err := p.parseGroupByElems()
 		if err != nil {
 			return nil, err
 		}
@@ -423,6 +423,64 @@ func (p *parser) parseExprList() ([]Expr, error) {
 		out = append(out, next)
 	}
 	return out, nil
+}
+
+// parseGroupByElems parses one or more GROUP BY elements separated by commas.
+// It handles GROUPING SETS (...), ROLLUP (...), and CUBE (...) by consuming
+// them and injecting a sentinel IntegerConst(0) so that len(GroupBy) > 0 remains
+// true — allowing downstream FOR UPDATE / HAVING checks to fire correctly.
+// Regular expressions are returned normally.
+func (p *parser) parseGroupByElems() ([]Expr, error) {
+	var out []Expr
+	for {
+		// GROUPING SETS / ROLLUP / CUBE: consume the grouping element and add a
+		// sentinel so the GROUP BY list is never empty after them.
+		if p.acceptIdentKeyword("grouping") {
+			sentPos := p.cur().Pos
+			p.acceptIdentKeyword("sets")
+			p.skipBalancedParens()
+			out = append(out, &IntegerConst{pos: sentPos, Value: 0})
+		} else if p.acceptIdentKeyword("rollup") || p.acceptIdentKeyword("cube") {
+			sentPos := p.cur().Pos
+			p.skipBalancedParens()
+			out = append(out, &IntegerConst{pos: sentPos, Value: 0})
+		} else {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, expr)
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return out, nil
+}
+
+// skipBalancedParens consumes a parenthesised token sequence (including nested
+// parens) that starts with the current "(" token. Does nothing if the current
+// token is not "(". Used to skip unsupported grouping-set operands.
+func (p *parser) skipBalancedParens() {
+	if p.cur().Kind != TokenSymbol || p.cur().Value != "(" {
+		return
+	}
+	depth := 0
+	for p.cur().Kind != TokenEOF {
+		if p.cur().Kind == TokenSymbol {
+			switch p.cur().Value {
+			case "(":
+				depth++
+			case ")":
+				depth--
+				if depth == 0 {
+					p.advance()
+					return
+				}
+			}
+		}
+		p.advance()
+	}
 }
 
 func (p *parser) parseSetOpClause() (*SetOpClause, bool, error) {

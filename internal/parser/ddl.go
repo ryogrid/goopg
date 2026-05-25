@@ -1467,10 +1467,76 @@ func (p *parser) parseDrop() (Stmt, error) {
 		(cur.Value == "tuple" || cur.Value == "instance" || cur.Value == "rewrite") {
 		return nil, p.errSyntaxAtCur()
 	}
+	// DROP AGGREGATE [IF EXISTS] name ( argtype_list ) [CASCADE|RESTRICT]
+	// PG requires the parenthesised argument-type list; without it the grammar
+	// produces a syntax error at the token following the name.
+	if p.acceptIdentKeyword("aggregate") {
+		ifExists := false
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			ifExists = true
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		// Require "(" — anything else (including ";") is a syntax error.
+		if p.cur().Kind != TokenSymbol || p.cur().Value != "(" {
+			return nil, p.errSyntaxAtCur()
+		}
+		p.skipBalancedParens()
+		behavior := DropDefault
+		switch {
+		case p.acceptKeyword(KwCascade):
+			behavior = DropCascade
+		case p.acceptKeyword(KwRestrict):
+		}
+		return &DropCompatStmt{pos: t.Pos, ObjType: "aggregate", IfExists: ifExists,
+			Names: []ObjectName{name}, Behavior: behavior}, nil
+	}
+	// DROP OPERATOR [IF EXISTS] name ( left_type , right_type ) [CASCADE|RESTRICT]
+	// PG requires the parenthesised type list; without it (or with just a bare
+	// comma-separated identifier list) the grammar produces a syntax error.
+	if p.acceptIdentKeyword("operator") {
+		ifExists := false
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			ifExists = true
+		}
+		// Operator name: can be an identifier OR a symbol sequence. Consume all
+		// consecutive symbol tokens that form the operator name (e.g. "===").
+		// If the current token is "(", there is no name at all — syntax error.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			return nil, p.errSyntaxAtCur()
+		}
+		// Read the operator name as an object name (may be qualified or just an ident/symbol).
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		// After the name, "(" is required. "," means the caller wrote
+		// "DROP OPERATOR name, name" without the type list.
+		if p.cur().Kind != TokenSymbol || p.cur().Value != "(" {
+			return nil, p.errSyntaxAtCur()
+		}
+		p.skipBalancedParens()
+		behavior := DropDefault
+		switch {
+		case p.acceptKeyword(KwCascade):
+			behavior = DropCascade
+		case p.acceptKeyword(KwRestrict):
+		}
+		return &DropCompatStmt{pos: t.Pos, ObjType: "operator", IfExists: ifExists,
+			Names: []ObjectName{name}, Behavior: behavior}, nil
+	}
 	// Handle ident-based DROP targets as compatibility stubs. M0097-0008.
 	for _, objType := range []string{
 		"sequence", "schema",
-		"aggregate", "collation", "operator", "cast",
+		"collation", "cast",
 		"materialized", "extension", "server",
 		"language", "access", "event", "transform",
 		"group", "role", "user",
