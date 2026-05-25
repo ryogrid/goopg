@@ -1297,7 +1297,7 @@ M0097-0001 wires it up.
         `vacuum_cost_delay`, `intervalstyle`).
       - DoD: `TestPort_RegressSuite/guc` reports `pass`.
 
-- [ ] **M0097-0032 — Port sysviews regress test**
+- [x] **M0097-0032 — Port sysviews regress test**
       - Summary: Make `sysviews` reach `pass`.
       - System-view SRFs (`pg_available_extensions` etc.) stubbed
         in M0097-0018. `pg_stat_activity` wired at `server.go`.
@@ -1394,7 +1394,28 @@ M0097-0001 wires it up.
         (`internal/planner/planner_test.go`), `TestPgHbaFileRulesErrorIsNull`
         (`internal/catalog/catalog_test.go`). Design:
         `docs/design/0097-0032d-count-star-filter-dedup-and-hba-null.md`.
-      - **Remaining sysviews gaps (single subsystem):** the entire residual 11
+      - **COMPLETE 2026-05-25 (loop — Caller tuples row + path array):**
+        Closed the final 13 sysviews diff lines.  (1) The `where name='Caller
+        tuples'` query returned 0 rows — added a synthetic Bump-context row
+        (`type="Bump"`, `total_bytes=65536>0`, `total_nblocks=2`,
+        `free_bytes=32768>0`, `free_chunks=0`) to `pg_backend_memory_contexts`'s
+        VirtualRows.  (2) The CacheMemoryContext multi-child check
+        (`c1.path[c2.level]=c2.path[c2.level]`) returned `f` because all rows
+        had `path=""` — `parseTextArray("")` returned a single-element slice and
+        `arr[2]` was out-of-bounds (NULL), so the WHERE predicate never matched.
+        Fix: store PG array literal paths (`{1}`, `{1,2}`, `{1,2,3}`, `{1,4}`)
+        using sequential integer IDs; `path[2]="2"` for CacheMemoryContext and
+        its child, giving count=2>1→`t`.  `array_subscript` already called
+        `parseTextArray(arr.StringValue())` which handles `{1,2}` correctly.
+        "Caller tuples" uses `{1,4}` (different ID at level 2) so it is NOT
+        included in the CacheMemoryContext subtree count.  Tests:
+        `TestPgBackendMemoryContextsCallerTuplesRow`,
+        `TestPgBackendMemoryContextsPathArrayValues`
+        (`internal/catalog/catalog_test.go`). Design:
+        `docs/design/0097-0032e-pg-backend-memory-contexts-caller-tuples-and-path.md`.
+        `sysviews` → **PASS**.
+      - **Remaining sysviews gaps (single subsystem):** ~~the entire residual 11~~
+        NONE — `sysviews` now passes.
         diff lines are `pg_backend_memory_contexts` introspection
         (`TopMemoryContext total_bytes >= free_bytes`, the Bump-context
         `Caller tuples` rows, and the `CacheMemoryContext` multi-child `path`
@@ -1518,6 +1539,22 @@ M0097-0001 wires it up.
         want 400) fails deterministically on clean HEAD (verified via
         `git stash`), independent of this loop's planner change — needs its own
         triage (ANALYZE sampling), not addressed here.
+      - **Progress 2026-05-25 (loop — functional_deps PASS):** Implemented
+        view→constraint dependency tracking for `DROP CONSTRAINT RESTRICT`.
+        Parser: added `AlterTableDropConstraint` action kind + `Restrict bool`
+        to `AlterTableAction`; `KwDrop` branch now dispatches on CONSTRAINT vs
+        DROP COLUMN. Catalog: added `constraintViewDeps map[string][]string` to
+        `InMemory` + `RegisterViewConstraintDep`, `UnregisterViewConstraintDeps`,
+        `ViewsDependingOnConstraint`, `DropPrimaryKeyConstraint` methods.
+        Executor: `collectViewPKDeps` AST walker runs after CREATE VIEW and
+        registers each (tableOID, pkName) dependency; `execDropView` unregisters;
+        `execAlterTableDropConstraint` raises `2BP01` with DETAIL+HINT when
+        RESTRICT mode has dependents. EXECUTE re-plan after PK drop errors
+        naturally (`disablePlanCache=true`). Tests: `TestParseAlterTableDropConstraint`,
+        `TestViewConstraintDepTracking`, `TestDropPrimaryKeyConstraint`.
+        `functional_deps` → **PASS** (was 21 diff lines). `equivclass` still
+        320 diff lines — separate planner equivalence-class feature, not
+        addressed here. Design: `docs/design/0097-0036d-view-constraint-dep-tracking-drop-constraint-restrict.md`.
 
 - [x] **M0097-0037 — Regress porting task breakdown (2026-05-22)**
       - Summary: Replaced the "promote" tasks with concrete "port"

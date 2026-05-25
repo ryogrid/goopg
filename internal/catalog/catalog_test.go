@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -597,4 +598,205 @@ func TestPgHbaFileRulesErrorIsNull(t *testing.T) {
 				"error cell must be omitted so it materialises as NULL", i, len(row))
 		}
 	}
+}
+
+// TestPgBackendMemoryContextsCallerTuplesRow verifies the "Caller tuples" Bump context row
+// exists with the values required by the sysviews regress test:
+//
+//	type="Bump", total_bytes>0, total_nblocks=2, free_bytes>0, free_chunks=0
+func TestPgBackendMemoryContextsCallerTuplesRow(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_backend_memory_contexts"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_backend_memory_contexts virtual table not registered")
+	}
+	colIdx := map[string]int{}
+	for i, col := range tbl.Columns {
+		colIdx[col.Name] = i
+	}
+	rows := tbl.VirtualRows()
+	var found bool
+	for _, row := range rows {
+		if row[colIdx["name"]] != "Caller tuples" {
+			continue
+		}
+		found = true
+		if row[colIdx["type"]] != "Bump" {
+			t.Errorf("Caller tuples type = %q; want Bump", row[colIdx["type"]])
+		}
+		if row[colIdx["total_nblocks"]] != "2" {
+			t.Errorf("Caller tuples total_nblocks = %q; want 2", row[colIdx["total_nblocks"]])
+		}
+		if row[colIdx["free_chunks"]] != "0" {
+			t.Errorf("Caller tuples free_chunks = %q; want 0", row[colIdx["free_chunks"]])
+		}
+		if row[colIdx["total_bytes"]] == "0" || row[colIdx["total_bytes"]] == "" {
+			t.Errorf("Caller tuples total_bytes = %q; must be > 0", row[colIdx["total_bytes"]])
+		}
+		if row[colIdx["free_bytes"]] == "0" || row[colIdx["free_bytes"]] == "" {
+			t.Errorf("Caller tuples free_bytes = %q; must be > 0", row[colIdx["free_bytes"]])
+		}
+	}
+	if !found {
+		t.Fatal("pg_backend_memory_contexts: no 'Caller tuples' row found")
+	}
+}
+
+// TestPgBackendMemoryContextsPathArrayValues verifies that each row's path column
+// is a PG array literal (starts with '{') and that CacheMemoryContext has >= 2
+// sibling/child rows sharing the same element at its level index (the
+// sysviews CacheMemoryContext-multi-child query).
+func TestPgBackendMemoryContextsPathArrayValues(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_backend_memory_contexts"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_backend_memory_contexts not registered")
+	}
+	colIdx := map[string]int{}
+	for i, col := range tbl.Columns {
+		colIdx[col.Name] = i
+	}
+	rows := tbl.VirtualRows()
+	// All rows must have a non-empty path that starts with '{'.
+	for _, row := range rows {
+		p := row[colIdx["path"]]
+		if p == "" || p[0] != '{' {
+			t.Errorf("row %q: path=%q must be a PG array literal starting with '{'", row[colIdx["name"]], p)
+		}
+	}
+	// Find CacheMemoryContext and its level.
+	var cacheLevel int
+	var cachePath string
+	for _, row := range rows {
+		if row[colIdx["name"]] == "CacheMemoryContext" {
+			cachePath = row[colIdx["path"]]
+			for _, ch := range row[colIdx["level"]] {
+				if ch >= '0' && ch <= '9' {
+					cacheLevel = cacheLevel*10 + int(ch-'0')
+				}
+			}
+			break
+		}
+	}
+	if cachePath == "" {
+		t.Fatal("no CacheMemoryContext row")
+	}
+	cacheElem := pgPathElem(cachePath, cacheLevel)
+	count := 0
+	for _, row := range rows {
+		if pgPathElem(row[colIdx["path"]], cacheLevel) == cacheElem {
+			count++
+		}
+	}
+	if count < 2 {
+		t.Errorf("only %d rows share path[%d]=%q with CacheMemoryContext; sysviews needs >= 2",
+			count, cacheLevel, cacheElem)
+	}
+}
+
+
+// TestViewConstraintDepTracking verifies the RegisterViewConstraintDep,
+// ViewsDependingOnConstraint, UnregisterViewConstraintDeps, and
+// DropPrimaryKeyConstraint methods used for functional_deps regress test
+// DROP CONSTRAINT RESTRICT enforcement. M0097-0036.
+func TestViewConstraintDepTracking(t *testing.T) {
+	c := NewInMemory()
+
+	const tableOID uint32 = 99001
+	const constraint = "articles_pkey"
+	const view1 = "fdv1"
+	const view2 = "fdv2"
+
+	// Initially no deps.
+	if deps := c.ViewsDependingOnConstraint(tableOID, constraint); len(deps) != 0 {
+		t.Fatalf("expected 0 deps, got %v", deps)
+	}
+
+	// Register two views.
+	c.RegisterViewConstraintDep(view1, tableOID, constraint)
+	c.RegisterViewConstraintDep(view2, tableOID, constraint)
+
+	deps := c.ViewsDependingOnConstraint(tableOID, constraint)
+	if len(deps) != 2 {
+		t.Fatalf("expected 2 deps, got %v", deps)
+	}
+	found1, found2 := false, false
+	for _, d := range deps {
+		if d == view1 {
+			found1 = true
+		}
+		if d == view2 {
+			found2 = true
+		}
+	}
+	if !found1 || !found2 {
+		t.Errorf("missing view in deps: %v", deps)
+	}
+
+	// Idempotent register.
+	c.RegisterViewConstraintDep(view1, tableOID, constraint)
+	if got := len(c.ViewsDependingOnConstraint(tableOID, constraint)); got != 2 {
+		t.Fatalf("idempotent register: expected 2 deps, got %d", got)
+	}
+
+	// Unregister view1.
+	c.UnregisterViewConstraintDeps(view1)
+	deps = c.ViewsDependingOnConstraint(tableOID, constraint)
+	if len(deps) != 1 || deps[0] != view2 {
+		t.Errorf("after unregister view1: expected [%s], got %v", view2, deps)
+	}
+
+	// Unregister view2 — map should be empty.
+	c.UnregisterViewConstraintDeps(view2)
+	if deps := c.ViewsDependingOnConstraint(tableOID, constraint); len(deps) != 0 {
+		t.Fatalf("after unregister all: expected 0 deps, got %v", deps)
+	}
+}
+
+// TestDropPrimaryKeyConstraint verifies that DropPrimaryKeyConstraint removes
+// the PK index from the catalog. M0097-0036.
+func TestDropPrimaryKeyConstraint(t *testing.T) {
+	c := NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "articles"}, []Column{{Name: "id", Type: Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Create a PK index manually via the catalog's index registration path.
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "articles_pkey"}, tbl, []string{"id"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify it exists.
+	idxs := c.IndexesOnTable(tbl)
+	if len(idxs) != 1 || !idxs[0].Primary {
+		t.Fatalf("expected 1 primary index, got %v", idxs)
+	}
+
+	// Drop it.
+	if !c.DropPrimaryKeyConstraint(tbl.OID, "articles_pkey") {
+		t.Fatal("DropPrimaryKeyConstraint returned false")
+	}
+
+	// Verify it's gone.
+	if idxs = c.IndexesOnTable(tbl); len(idxs) != 0 {
+		t.Fatalf("expected 0 indexes after drop, got %v", idxs)
+	}
+
+	// Dropping again returns false (not found).
+	if c.DropPrimaryKeyConstraint(tbl.OID, "articles_pkey") {
+		t.Fatal("expected false on second drop")
+	}
+}
+
+// pgPathElem returns the n-th element (1-based) of a PG array literal like {1,2,3}.
+func pgPathElem(arr string, n int) string {
+	if len(arr) < 2 || arr[0] != '{' || arr[len(arr)-1] != '}' || n < 1 {
+		return ""
+	}
+	inner := arr[1 : len(arr)-1]
+	parts := strings.Split(inner, ",")
+	if n > len(parts) {
+		return ""
+	}
+	return parts[n-1]
 }

@@ -1162,6 +1162,10 @@ const (
 	// AlterTableAttachPartition — `ATTACH PARTITION child FOR VALUES …`.
 	// Registers an existing table as a partition of the parent. M0096-0007.
 	AlterTableAttachPartition
+	// AlterTableDropConstraint — `DROP CONSTRAINT name [RESTRICT|CASCADE]`.
+	// For PK constraints, checks view→constraint dependencies before dropping.
+	// M0097-0036 (functional_deps).
+	AlterTableDropConstraint
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1184,6 +1188,9 @@ type AlterTableAction struct {
 	// AttachPartitionOf is populated for AlterTableAttachPartition.
 	// It holds the child table name and partition bounds. M0096-0007.
 	AttachPartitionOf *PartitionOfClause
+	// Restrict is set for AlterTableDropConstraint: true means RESTRICT
+	// (default — error if dependents exist), false means CASCADE.
+	Restrict bool
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

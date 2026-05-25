@@ -2,6 +2,7 @@ name,diff_lines,status
 boolean,0,pass
 char,0,pass
 comments,0,pass
+copyselect,0,pass
 delete,0,pass
 int2,0,pass
 int4,0,pass
@@ -14,14 +15,13 @@ portals_p2,0,pass
 reindex_catalog,0,pass
 select_having,0,pass
 select_implicit,0,pass
+sysviews,0,pass
 test_setup,0,excluded
 time,0,pass
 varchar,0,pass
-sysviews,9,failed
-functional_deps,21,failed
+functional_deps,0,pass
 copydml,45,failed
 tid,47,failed
-copyselect,55,failed
 errors,60,failed
 hash_part,73,failed
 hash_index,96,failed

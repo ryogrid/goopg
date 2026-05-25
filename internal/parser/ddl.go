@@ -1885,9 +1885,31 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// DROP COLUMN — parse as no-op (consume rest).
+	// DROP CONSTRAINT name [RESTRICT|CASCADE] — real action (M0097-0036).
+	// DROP COLUMN, DROP DEFAULT, etc. — no-op (consume rest).
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDrop {
-		// consume rest of statement until ';' or EOF
+		p.advance() // consume DROP
+		if p.acceptKeyword(KwConstraint) {
+			nameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			restrict := true // RESTRICT is the PostgreSQL default
+			if p.acceptKeyword(KwCascade) {
+				restrict = false
+			} else {
+				_ = p.acceptKeyword(KwRestrict)
+			}
+			act := AlterTableAction{
+				pos:            nameTok.Pos,
+				Kind:           AlterTableDropConstraint,
+				ConstraintName: identText(nameTok),
+				Restrict:       restrict,
+			}
+			stmt.Actions = append(stmt.Actions, act)
+			return stmt, nil
+		}
+		// DROP COLUMN, DROP DEFAULT, etc. — consume rest as no-op.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break

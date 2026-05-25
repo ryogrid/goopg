@@ -337,6 +337,11 @@ type InMemory struct {
 	enumTypes map[string]*EnumType
 	// domains holds user-defined domain types. M0097-0017.
 	domains map[string]*Domain
+
+	// constraintViewDeps maps "tableOID:constraintName" → []viewName for
+	// views that rely on the constraint for GROUP BY functional dependency.
+	// Used to enforce DROP CONSTRAINT RESTRICT. M0097-0036 / functional_deps.
+	constraintViewDeps map[string][]string
 }
 
 // EnumType holds one user-defined enum type. M0097-0017.
@@ -407,6 +412,7 @@ func NewInMemory() *InMemory {
 		inheritanceChildren: make(map[uint32][]uint32),
 		enumTypes:           make(map[string]*EnumType),
 		domains:             make(map[string]*Domain),
+		constraintViewDeps:  make(map[string][]string),
 	}
 	c.registerSystemTables()
 	return c
@@ -1269,10 +1275,13 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3393,
 	}
 	pgBackendMemCtx.VirtualRows = func() [][]string {
+		// Path uses sequential integer IDs so that c1.path[c2.level]=c2.path[c2.level]
+		// correctly identifies rows within the same ancestor subtree (sysviews test).
 		return [][]string{
-			{"TopMemoryContext", "", "", "1", "1048576", "1", "524288", "0", "524288", "AllocSet", ""},
-			{"CacheMemoryContext", "", "TopMemoryContext", "2", "524288", "1", "262144", "0", "262144", "AllocSet", ""},
-			{"CacheMemoryContext_child1", "", "CacheMemoryContext", "3", "8192", "1", "4096", "0", "4096", "AllocSet", ""},
+			{"TopMemoryContext", "", "", "1", "1048576", "1", "524288", "0", "524288", "AllocSet", "{1}"},
+			{"CacheMemoryContext", "", "TopMemoryContext", "2", "524288", "1", "262144", "0", "262144", "AllocSet", "{1,2}"},
+			{"CacheMemoryContext_child1", "", "CacheMemoryContext", "3", "8192", "1", "4096", "0", "4096", "AllocSet", "{1,2,3}"},
+			{"Caller tuples", "", "TopMemoryContext", "2", "65536", "2", "32768", "0", "32768", "Bump", "{1,4}"},
 		}
 	}
 	c.tables["pg_catalog.pg_backend_memory_contexts"] = pgBackendMemCtx
@@ -2109,6 +2118,79 @@ func (c *InMemory) IndexesOnTable(table *Table) []*Index {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].QualifiedName() < out[j].QualifiedName() })
 	return out
+}
+
+// RegisterViewConstraintDep records that a view relies on a PK constraint for
+// GROUP BY functional dependency. Called by CREATE VIEW. M0097-0036.
+func (c *InMemory) RegisterViewConstraintDep(viewName string, tableOID uint32, constraintName string) {
+	key := fmt.Sprintf("%d:%s", tableOID, constraintName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, existing := range c.constraintViewDeps[key] {
+		if existing == viewName {
+			return
+		}
+	}
+	c.constraintViewDeps[key] = append(c.constraintViewDeps[key], viewName)
+}
+
+// UnregisterViewConstraintDeps removes all constraint dependencies recorded for
+// the given view name. Called by DROP VIEW. M0097-0036.
+func (c *InMemory) UnregisterViewConstraintDeps(viewName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, names := range c.constraintViewDeps {
+		var kept []string
+		for _, n := range names {
+			if n != viewName {
+				kept = append(kept, n)
+			}
+		}
+		if len(kept) == 0 {
+			delete(c.constraintViewDeps, key)
+		} else {
+			c.constraintViewDeps[key] = kept
+		}
+	}
+}
+
+// ViewsDependingOnConstraint returns the names of views that depend on the
+// given PK constraint via GROUP BY functional dependency. M0097-0036.
+func (c *InMemory) ViewsDependingOnConstraint(tableOID uint32, constraintName string) []string {
+	key := fmt.Sprintf("%d:%s", tableOID, constraintName)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	src := c.constraintViewDeps[key]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]string, len(src))
+	copy(out, src)
+	return out
+}
+
+// DropPrimaryKeyConstraint removes the named primary-key constraint (index)
+// from the table's index registries. Returns true if found and removed.
+// M0097-0036.
+func (c *InMemory) DropPrimaryKeyConstraint(tableOID uint32, constraintName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	inner, ok := c.byTable[tableOID]
+	if !ok {
+		return false
+	}
+	if _, exists := inner[constraintName]; !exists {
+		return false
+	}
+	delete(inner, constraintName)
+	// Also remove from the flat indexes map.
+	for k, idx := range c.indexes {
+		if idx.Table != nil && idx.Table.OID == tableOID && idx.Name == constraintName {
+			delete(c.indexes, k)
+			break
+		}
+	}
+	return true
 }
 
 // HasPrimaryKey reports whether table has a primary-key index.

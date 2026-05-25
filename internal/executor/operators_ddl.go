@@ -729,6 +729,14 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	if _, err := o.ctx.Catalog.CreateView(s.Name, cols, s.Columns, s.Query, s.OrReplace); err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	// Register view→PK-constraint dependencies so DROP CONSTRAINT RESTRICT
+	// can detect that this view relies on the constraint. M0097-0036.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		viewKey := s.Name.String()
+		for _, dep := range collectViewPKDeps(s.Query, o.ctx.Catalog) {
+			im.RegisterViewConstraintDep(viewKey, dep.tableOID, dep.constraintName)
+		}
+	}
 	return nil
 }
 
@@ -764,6 +772,10 @@ func (o *ddlOp) execDropView(s *parser.DropViewStmt) error {
 				continue
 			}
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
+		}
+		// Clean up constraint dependencies registered by CREATE VIEW. M0097-0036.
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			im.UnregisterViewConstraintDeps(name.String())
 		}
 	}
 	return nil
@@ -1012,6 +1024,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable); !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
 			}
+		case parser.AlterTableDropConstraint:
+			if err := o.execAlterTableDropConstraint(tbl, act); err != nil {
+				return err
+			}
 		case parser.AlterTableAttachPartition:
 			// ATTACH PARTITION child FOR VALUES … (M0096-0007)
 			if act.AttachPartitionOf == nil {
@@ -1118,6 +1134,160 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
 	return o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true)
+}
+
+// execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name [RESTRICT|CASCADE]`.
+// For PK constraints it enforces view→constraint dependencies (RESTRICT mode)
+// before removing the index. M0097-0036 / functional_deps.
+func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.AlterTableAction) error {
+	// Find the named constraint among this table's primary-key indexes.
+	var pkIdx *catalog.Index
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		if idx.Primary && strings.EqualFold(idx.Name, act.ConstraintName) {
+			pkIdx = idx
+			break
+		}
+	}
+	if pkIdx == nil {
+		return &ExecError{
+			Code:    "42704",
+			Pos:     act.Pos(),
+			Message: fmt.Sprintf("constraint %q of relation %q does not exist", act.ConstraintName, tbl.Name),
+		}
+	}
+	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
+	if isIM && act.Restrict {
+		deps := im.ViewsDependingOnConstraint(tbl.OID, act.ConstraintName)
+		if len(deps) > 0 {
+			viewName := deps[0]
+			return &ExecError{
+				Code: "2BP01",
+				Pos:  act.Pos(),
+				Message: fmt.Sprintf(
+					"cannot drop constraint %s on table %s because other objects depend on it",
+					act.ConstraintName, tbl.Name),
+				Detail: fmt.Sprintf(
+					"view %s depends on constraint %s on table %s",
+					viewName, act.ConstraintName, tbl.Name),
+				Hint: "Use DROP ... CASCADE to drop the dependent objects too.",
+			}
+		}
+	}
+	// No blocking dependencies (or CASCADE) — remove the PK index.
+	if isIM {
+		im.DropPrimaryKeyConstraint(tbl.OID, act.ConstraintName)
+	}
+	return nil
+}
+
+// pkConstraintRef is a (tableOID, constraintName, tableName) triple recording
+// a view's dependency on a PK constraint for GROUP BY functional dependency.
+type pkConstraintRef struct {
+	tableOID       uint32
+	constraintName string
+	tableName      string
+}
+
+// collectViewPKDeps scans a view's SELECT body AST and returns all PK constraints
+// that the view relies on via GROUP BY functional dependency. Used by CREATE VIEW
+// to register dependencies for DROP CONSTRAINT RESTRICT enforcement. M0097-0036.
+func collectViewPKDeps(sel *parser.SelectStmt, cat catalog.Catalog) []pkConstraintRef {
+	seen := make(map[string]bool)
+	var out []pkConstraintRef
+	walkSelectPKDeps(sel, cat, &out, seen)
+	return out
+}
+
+func walkSelectPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkConstraintRef, seen map[string]bool) {
+	if sel == nil {
+		return
+	}
+	// UNION/INTERSECT/EXCEPT: this SelectStmt is the left branch; recurse into right.
+	if sel.SetOp != nil {
+		walkSelectPKDeps(sel.SetOp.Right, cat, out, seen)
+	}
+	// Main SELECT body with GROUP BY.
+	if len(sel.GroupBy) > 0 {
+		addGroupByPKDeps(sel, cat, out, seen)
+	}
+	// Recurse into WHERE subqueries.
+	if sel.Where != nil {
+		walkExprPKDeps(sel.Where, cat, out, seen)
+	}
+}
+
+func walkExprPKDeps(e parser.Expr, cat catalog.Catalog, out *[]pkConstraintRef, seen map[string]bool) {
+	if e == nil {
+		return
+	}
+	switch v := e.(type) {
+	case *parser.InExpr:
+		if v.Subquery != nil {
+			walkSelectPKDeps(v.Subquery, cat, out, seen)
+		}
+	case *parser.SubqueryExpr:
+		walkSelectPKDeps(v.Inner, cat, out, seen)
+	case *parser.ExistsExpr:
+		walkSelectPKDeps(v.Subquery, cat, out, seen)
+	}
+}
+
+func addGroupByPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkConstraintRef, seen map[string]bool) {
+	// Build the set of column names present in GROUP BY (lower-cased).
+	groupBySet := make(map[string]bool)
+	for _, gb := range sel.GroupBy {
+		if cr, ok := gb.(*parser.ColumnRef); ok {
+			col := strings.ToLower(cr.Column)
+			groupBySet[col] = true
+			if cr.Table != "" {
+				groupBySet[strings.ToLower(cr.Table)+"."+col] = true
+			}
+		}
+	}
+	// For each table-valued FROM entry, check if its full PK is covered.
+	for _, rv := range sel.From {
+		if rv.Subquery != nil {
+			walkSelectPKDeps(rv.Subquery, cat, out, seen)
+			continue
+		}
+		if rv.Name == "" {
+			continue
+		}
+		tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
+		if !ok {
+			continue
+		}
+		alias := strings.ToLower(rv.Alias)
+		if alias == "" {
+			alias = strings.ToLower(rv.Name)
+		}
+		tblNameLower := strings.ToLower(rv.Name)
+		for _, idx := range cat.IndexesOnTable(tbl) {
+			if !idx.Primary {
+				continue
+			}
+			allCovered := true
+			for _, col := range idx.Columns {
+				c := strings.ToLower(col)
+				if !groupBySet[c] && !groupBySet[alias+"."+c] && !groupBySet[tblNameLower+"."+c] {
+					allCovered = false
+					break
+				}
+			}
+			if !allCovered {
+				continue
+			}
+			key := fmt.Sprintf("%d:%s", tbl.OID, idx.Name)
+			if !seen[key] {
+				seen[key] = true
+				*out = append(*out, pkConstraintRef{
+					tableOID:       tbl.OID,
+					constraintName: idx.Name,
+					tableName:      tbl.Name,
+				})
+			}
+		}
+	}
 }
 
 func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool) error {
