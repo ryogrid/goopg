@@ -79,6 +79,21 @@ func (p *parser) parseSelect() (Stmt, error) {
 	s := &SelectStmt{pos: t.Pos}
 	if p.acceptKeyword(KwDistinct) {
 		s.Distinct = true
+		// DISTINCT ON (expr [, ...]) — parse the expression list.
+		// The ON keyword is reserved (KwCatReserved) so we use acceptKeyword.
+		if p.acceptKeyword(KwOn) {
+			if !p.acceptSymbol("(") {
+				return nil, p.errAtCur("expected '(' after DISTINCT ON")
+			}
+			exprs, err := p.parseExprList()
+			if err != nil {
+				return nil, err
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')' after DISTINCT ON expression list")
+			}
+			s.DistinctOn = exprs
+		}
 	}
 	// Empty target list: `SELECT FROM <table>` is valid in upstream PG
 	// (returns one zero-column row per source row). HammerDB writes

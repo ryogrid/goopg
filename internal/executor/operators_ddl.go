@@ -1104,6 +1104,49 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				im.RegisterPartitionChild(tbl.OID, childTbl.OID)
 			}
+		case parser.AlterTableRenameTable:
+			newName := act.NewName
+			probe := parser.ObjectName{Schema: tbl.Schema, Name: newName}
+			if _, exists := o.ctx.Catalog.LookupTable(probe); exists {
+				return &ExecError{Code: "42P07", Pos: act.Pos(), Message: fmt.Sprintf("relation %q already exists", newName)}
+			}
+			// No actual rename implemented yet — just validate the conflict.
+		case parser.AlterTableRenameColumn:
+			oldColName := act.OldColumnName
+			newColName := act.NewName
+
+			// Check old column exists.
+			colExists := false
+			for _, col := range tbl.Columns {
+				if strings.EqualFold(col.Name, oldColName) {
+					colExists = true
+					break
+				}
+			}
+			if !colExists {
+				return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q does not exist", oldColName)}
+			}
+
+			// Check new name is not a system column name.
+			sysColumns := []string{"ctid", "tableoid", "xmin", "cmin", "xmax", "cmax", "oid"}
+			for _, sc := range sysColumns {
+				if strings.EqualFold(newColName, sc) {
+					return &ExecError{Code: "42P20", Pos: act.Pos(), Message: fmt.Sprintf("column name %q conflicts with a system column name", newColName)}
+				}
+			}
+
+			// Check inheritance children for name conflict.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				children := im.InheritanceChildren(tbl.OID)
+				for _, child := range children {
+					for _, col := range child.Columns {
+						if strings.EqualFold(col.Name, newColName) {
+							return &ExecError{Code: "42701", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q already exists", newColName, child.Name)}
+						}
+					}
+				}
+			}
+			// No actual rename implemented yet — just validate.
 		default:
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE action is not supported in v0"}
 		}
@@ -2766,12 +2809,6 @@ func dropCompatCanonicalType(typeName string) string {
 		return "smallint"
 	case "int8", "bigint", "bigserial":
 		return "bigint"
-	case "float4", "real":
-		return "real"
-	case "float8", "double precision", "double":
-		return "double precision"
-	case "float":
-		return "double precision"
 	case "bool", "boolean":
 		return "boolean"
 	case "text":
@@ -2794,6 +2831,10 @@ func dropCompatCanonicalType(typeName string) string {
 		return "timestamp with time zone"
 	case "interval":
 		return "interval"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision", "double":
+		return "double precision"
 	case "bytea":
 		return "bytea"
 	case "oid":
@@ -2806,15 +2847,63 @@ func dropCompatCanonicalType(typeName string) string {
 	return ""
 }
 
-// execCreateAggregate validates a CREATE AGGREGATE statement and rejects it
-// with the appropriate PG-compatible error if the basetype is missing.
-// Full aggregate implementation is out of scope for v0. M0097-regress.
+// execCreateAggregate validates a CREATE AGGREGATE statement. It rejects
+// missing basetype and also validates that the finalfunc(stype) exists when
+// a finalfunc is specified. M0097-regress.
 func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	if !s.HasBaseType {
 		return &ExecError{Code: "42P13", Pos: s.Pos(),
 			Message: "aggregate input type must be specified"}
 	}
+	// Validate finalfunc exists when specified. Map stype to the SQL type name
+	// used in error messages (e.g. int4 → integer). M0097-regress.
+	if s.FinalFunc != "" && s.SType != "" {
+		stypeMsg := aggregatePgTypeName(s.SType)
+		// Check user-defined routines first.
+		funcName := parser.ObjectName{Name: s.FinalFunc}
+		routines := o.ctx.Catalog.Routines().LookupByName(funcName)
+		found := false
+		for _, r := range routines {
+			if len(r.ArgTypes) == 1 {
+				argTypeName := r.ArgTypes[0].Name
+				if strings.EqualFold(argTypeName, s.SType) ||
+					strings.EqualFold(aggregatePgTypeName(argTypeName), stypeMsg) {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return &ExecError{Code: "42883", Pos: s.Pos(),
+				Message: fmt.Sprintf("function %s(%s) does not exist", s.FinalFunc, stypeMsg)}
+		}
+	}
 	return nil
+}
+
+// aggregatePgTypeName maps an internal type name to the SQL type name used
+// in PostgreSQL error messages (e.g. "int4" → "integer"). M0097-regress.
+func aggregatePgTypeName(t string) string {
+	switch strings.ToLower(t) {
+	case "int4", "integer", "int":
+		return "integer"
+	case "int2", "smallint":
+		return "smallint"
+	case "int8", "bigint":
+		return "bigint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision":
+		return "double precision"
+	case "bool", "boolean":
+		return "boolean"
+	case "text":
+		return "text"
+	case "numeric", "decimal":
+		return "numeric"
+	default:
+		return t
+	}
 }
 
 // ── Enum / Domain DDL executors ──────────────────────────────────────────────

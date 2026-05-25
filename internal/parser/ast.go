@@ -638,7 +638,11 @@ type SelectStmt struct {
 	pos      int
 	With     *WithClause
 	Distinct bool
-	Targets  []ResTarget
+	// DistinctOn holds the expression list from DISTINCT ON (expr [, ...]).
+	// When non-nil, s.Distinct is also true. The planner resolves these
+	// expressions to surface unknown-column errors. M0097-regress.
+	DistinctOn []Expr
+	Targets    []ResTarget
 	// From keeps a flattened range-var list for v0 planner
 	// compatibility.
 	From []RangeVar
@@ -1202,6 +1206,13 @@ const (
 	// For PK constraints, checks view→constraint dependencies before dropping.
 	// M0097-0036 (functional_deps).
 	AlterTableDropConstraint
+	// AlterTableRenameTable — `RENAME TO new_name`.
+	// Checks that the new name is not already taken. M0097-regress.
+	AlterTableRenameTable
+	// AlterTableRenameColumn — `RENAME COLUMN old TO new`.
+	// Validates old column exists, new name not a system column, and no
+	// inheritance child already has a column with the new name. M0097-regress.
+	AlterTableRenameColumn
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1227,6 +1238,13 @@ type AlterTableAction struct {
 	// Restrict is set for AlterTableDropConstraint: true means RESTRICT
 	// (default — error if dependents exist), false means CASCADE.
 	Restrict bool
+
+	// NewName is populated for AlterTableRenameTable and AlterTableRenameColumn.
+	// Holds the new relation or column name. M0097-regress.
+	NewName string
+	// OldColumnName is populated for AlterTableRenameColumn and holds the
+	// existing column name to be renamed. M0097-regress.
+	OldColumnName string
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

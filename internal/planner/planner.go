@@ -873,6 +873,25 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	}
 	// Collapse all-constant sub-expressions in the final plan tree.
 	foldPlanConstants(out)
+	// DISTINCT ON (expr [, ...]): resolve each expression to surface unknown-column
+	// errors (e.g. "column foobar does not exist"). We don't implement the full
+	// DISTINCT ON semantics (ordered deduplication per expression prefix); we
+	// fall back to plain DISTINCT after validation. M0097-regress.
+	if len(s.DistinctOn) > 0 {
+		for _, dexpr := range s.DistinctOn {
+			var resolveErr error
+			if win != nil {
+				_, resolveErr = resolveExprAfterWindow(dexpr, win)
+			} else if agg == nil {
+				_, resolveErr = resolveExpr(dexpr, ctx)
+			} else {
+				_, resolveErr = resolveExprAfterAggregate(dexpr, agg)
+			}
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+		}
+	}
 	// SELECT DISTINCT: wrap the full plan with a Distinct node that deduplicates
 	// on the projected output. Applied after sorting so ORDER BY is respected.
 	// M0097-0005.
@@ -4469,6 +4488,35 @@ func exprType(e Expr) catalog.Type {
 			"cardinality", "strpos", "position":
 			// String/array length functions return int4. M0097-0003.
 			return catalog.Type{Name: "int4"}
+		case "coalesce", "greatest", "least":
+			// Return the type of the first non-unknown argument (widest wins
+			// in practice since args are resolved before exprType is called).
+			for _, a := range x.Args {
+				t := exprType(a)
+				if t.Name != "unknown" && t.Name != "" {
+					return t
+				}
+			}
+		case "nullif":
+			// NULLIF returns the type of its first argument (nullable).
+			if len(x.Args) > 0 {
+				return exprType(x.Args[0])
+			}
+		case "pg_size_bytes",
+			"pg_database_size", "pg_relation_size", "pg_total_relation_size",
+			"pg_indexes_size", "pg_table_size":
+			return catalog.Type{Name: "int8"}
+		case "round", "ceil", "ceiling", "floor", "trunc", "sign":
+			// Preserve input numeric type; default to numeric when unknown.
+			if len(x.Args) > 0 {
+				t := exprType(x.Args[0])
+				if t.Name != "unknown" && t.Name != "" {
+					return t
+				}
+			}
+			return catalog.Type{Name: "numeric"}
+		case "power", "exp", "ln", "log", "sqrt":
+			return catalog.Type{Name: "float8"}
 		}
 		return catalog.Type{Name: "unknown"}
 	}

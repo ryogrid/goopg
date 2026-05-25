@@ -2121,12 +2121,52 @@ func (p *parser) parseAlter() (Stmt, error) {
 		// Return empty actions list — executor will skip it.
 		return stmt, nil
 	}
-	// RENAME TO new_name — parse as a no-op.
+	// RENAME COLUMN old TO new  |  RENAME TO new_name  |  RENAME VALUE 'old' TO 'new'.
 	if p.acceptIdentKeyword("rename") {
+		// RENAME COLUMN old_name TO new_name
+		if p.acceptKeyword(KwColumn) {
+			oldNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				pos:           oldNameTok.Pos,
+				Kind:          AlterTableRenameColumn,
+				OldColumnName: identText(oldNameTok),
+				NewName:       identText(newNameTok),
+			})
+			return stmt, nil
+		}
+		// RENAME VALUE 'old' TO 'new' (enum) — no-op: consume rest.
+		if p.acceptIdentKeyword("value") {
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return stmt, nil
+		}
+		// RENAME TO new_name
 		if _, err := p.expectKeyword(KwTo); err != nil {
 			return nil, err
 		}
-		_, _ = p.parseIdent()
+		newNameTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Actions = append(stmt.Actions, AlterTableAction{
+			pos:     newNameTok.Pos,
+			Kind:    AlterTableRenameTable,
+			NewName: identText(newNameTok),
+		})
 		return stmt, nil
 	}
 	// SET SCHEMA schema_name — parse as a no-op.

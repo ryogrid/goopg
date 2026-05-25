@@ -61,7 +61,7 @@ regress-sql,regress,postgres/src/test/regress/sql/drop_operator.sql,postgres/src
 regress-sql,regress,postgres/src/test/regress/sql/encoding.sql,postgres/src/test/regress/sql/encoding.sql,excluded,Server encoding; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/enum.sql,postgres/src/test/regress/sql/enum.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/equivclass.sql,postgres/src/test/regress/sql/equivclass.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-regress-sql,regress,postgres/src/test/regress/sql/errors.sql,postgres/src/test/regress/sql/errors.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/errors.sql,postgres/src/test/regress/sql/errors.sql,pass,Passes via TestPort_RegressSuite/errors; 0 diff lines
 regress-sql,regress,postgres/src/test/regress/sql/euc_kr.sql,postgres/src/test/regress/sql/euc_kr.sql,excluded,EUC-KR encoding; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/event_trigger.sql,postgres/src/test/regress/sql/event_trigger.sql,excluded,Event triggers; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/event_trigger_login.sql,postgres/src/test/regress/sql/event_trigger_login.sql,excluded,Login event trigger; out of scope for goopg v0.

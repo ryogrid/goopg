@@ -560,6 +560,30 @@ M0097-0001 wires it up.
         dependency tracking so `DROP CONSTRAINT … RESTRICT` is blocked while a view
         references the constrained column, with the DETAIL/HINT lines and prepared
         statement re-validation; that closes the last 21 diff lines.
+      - Loop additions (2026-05-26):
+        - 124. SELECT DISTINCT ON (expr-list): `DistinctOn []Expr` field added to
+          `SelectStmt` AST (`internal/parser/ast.go`); `parseSelect` checks for `KwOn`
+          after `KwDistinct` and parses the parenthesised expression list into
+          `DistinctOn`; planner `planSelect` resolves each expression so unknown columns
+          surface as `ERROR: column "X" does not exist` (matching PG).
+        - 125. ALTER TABLE … RENAME TO / RENAME COLUMN: parser dispatches on
+          `RENAME TO new_name` → `AlterTableRenameTable`, `RENAME COLUMN old TO new`
+          → `AlterTableRenameColumn`; `NewName`/`OldColumnName` fields added to
+          `AlterTableAction` AST; executor `execAlterTable` validates: new table name
+          not already in catalog (42P07), old column exists (42703), new column name
+          not a system column (42P20), inheritance children don't already have the new
+          column name (42701). Produces correct PG error codes + messages.
+        - 126. CREATE AGGREGATE finalfunc type check: `execCreateAggregate` validates
+          that the finalfunc exists for the aggregate's stype; helper
+          `aggregatePgTypeName` maps internal Go types to PG type names and
+          `isKnownAggregateFinalFunc` checks the func/type combination, returning
+          `function X(Y) does not exist` on mismatch.
+        - 127. `dropCompatCanonicalType`: added `float4`/`real` → `"real"` and
+          `float8`/`"double precision"` → `"double precision"` mappings so
+          `DROP AGGREGATE newcnt (float4)` generates the correct
+          `aggregate newcnt(real) does not exist` rather than
+          `type "float4" does not exist`.
+        - `errors` test: 8 diff lines → 0 diff lines → PASS. Total passing: 18.
 
 - [ ] **M0097-0004**
       - Summary: Date / time type parity.
