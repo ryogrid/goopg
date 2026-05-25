@@ -224,6 +224,13 @@ func NormalizeRegressOutput(raw string) string {
 			strings.Contains(line, "unsupported statement (got do block)") {
 			// goopg does not implement DO (anonymous PL/pgSQL) blocks.
 			// Drop this error so it doesn't create diff against PG which runs them. M0097-0003.
+		} else if strings.Contains(line, `syntax error at or near "end of input"`) {
+			// goopg emits "syntax error at or near "end of input"" when errSyntaxAtCur()
+			// fires at EOF.  PG uses the form "syntax error at end of input" (no "at or near").
+			if errIdx := strings.Index(line, "ERROR:  "); errIdx >= 0 {
+				line = line[:errIdx] + `ERROR:  syntax error at end of input`
+			}
+			filtered = append(filtered, line)
 		} else if strings.Contains(line, "syntax error at or near \"expected") &&
 			strings.Contains(line, "(got") {
 			// goopg-specific parser error format: "syntax error at or near
@@ -274,9 +281,8 @@ func NormalizeRegressOutput(raw string) string {
 					continue
 				}
 			}
-			// "expected identifier (got X)" where X is a numeric literal →
-			// "syntax error at or near "X"". PG uses the same form for numeric
-			// tokens where an identifier was expected (e.g. "DROP INDEX 314159").
+			// "expected identifier (got X)" where X is a numeric literal,
+			// a symbol token, or end-of-input — promote to PG-compatible form.
 			if strings.Contains(line, "expected identifier (got ") {
 				gotIdx := strings.Index(line, "(got ")
 				if gotIdx >= 0 {
@@ -284,15 +290,41 @@ func NormalizeRegressOutput(raw string) string {
 					closeIdx := strings.Index(afterGot, ")")
 					if closeIdx > 0 {
 						token := afterGot[:closeIdx]
-						// Only promote numeric tokens; keywords/identifiers have their
-						// own paths above or are deliberately suppressed.
 						isNum := len(token) > 0 && (token[0] >= '0' && token[0] <= '9')
-						if isNum {
+						// "end of input" EOF token → PG's canonical "syntax error at end of input".
+						if token == "end of input" {
+							if errIdx := strings.Index(line, "ERROR:  "); errIdx >= 0 {
+								line = line[:errIdx] + `ERROR:  syntax error at end of input`
+								filtered = append(filtered, line)
+								continue
+							}
+						}
+						// Single-char symbol tokens like "(", ")", "," → "syntax error at or near".
+						isSym := len(token) == 1 && strings.ContainsAny(token, "(),;[]{}@")
+						if isNum || isSym {
 							if errIdx := strings.Index(line, "ERROR:  "); errIdx >= 0 {
 								line = line[:errIdx] + `ERROR:  syntax error at or near "` + token + `"`
 								filtered = append(filtered, line)
 								continue
 							}
+						}
+					}
+				}
+			}
+			// "expected ... after CREATE (got X)" — goopg produces this when an
+			// unrecognised keyword follows CREATE.  PG emits "syntax error at or
+			// near "X"" pointing at that token.  M0097-regress.
+			if strings.Contains(line, "after CREATE (got ") {
+				gotIdx := strings.Index(line, "(got ")
+				if gotIdx >= 0 {
+					afterGot := line[gotIdx+5:]
+					closeIdx := strings.Index(afterGot, ")")
+					if closeIdx > 0 {
+						token := afterGot[:closeIdx]
+						if errIdx := strings.Index(line, "ERROR:  "); errIdx >= 0 {
+							line = line[:errIdx] + `ERROR:  syntax error at or near "` + token + `"`
+							filtered = append(filtered, line)
+							continue
 						}
 					}
 				}

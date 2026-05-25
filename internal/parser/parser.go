@@ -998,6 +998,49 @@ func (p *parser) parseObjectList() ([]ObjectName, error) {
 	return out, nil
 }
 
+// parseOperatorName parses a PostgreSQL operator name for DROP OPERATOR.
+// An operator name is either a plain identifier (like "equals"), a sequence of
+// operator characters ("=", "===", "||"), or schema-qualified ("pg_catalog.=").
+// Returns errSyntaxAtCur for tokens that cannot start an operator name. M0097-regress.
+func (p *parser) parseOperatorName() (ObjectName, error) {
+	t := p.cur()
+	switch t.Kind {
+	case TokenIdent, TokenQuotedIdent:
+		p.advance()
+		name := identText(t)
+		if p.acceptSymbol(".") {
+			// Schema-qualified: schema.op
+			pos := p.cur().Pos
+			opName := ""
+			for p.cur().Kind == TokenOperator {
+				opName += p.cur().Value
+				p.advance()
+			}
+			if opName == "" {
+				return ObjectName{}, p.errSyntaxAtCur()
+			}
+			return ObjectName{pos: pos, Schema: name, Name: opName}, nil
+		}
+		return ObjectName{pos: t.Pos, Name: name}, nil
+	case TokenKeyword:
+		if IsColNameKeyword(Keyword(t.Value)) {
+			p.advance()
+			return ObjectName{pos: t.Pos, Name: t.Value}, nil
+		}
+		return ObjectName{}, p.errSyntaxAtCur()
+	case TokenOperator:
+		// Accumulate consecutive operator chars (e.g. "===").
+		opName := ""
+		pos := t.Pos
+		for p.cur().Kind == TokenOperator {
+			opName += p.cur().Value
+			p.advance()
+		}
+		return ObjectName{pos: pos, Name: opName}, nil
+	}
+	return ObjectName{}, p.errSyntaxAtCur()
+}
+
 // parseObjectName parses [schema.]name where each part is an
 // identifier (possibly quoted).
 func (p *parser) parseObjectName() (ObjectName, error) {

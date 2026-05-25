@@ -103,6 +103,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateMatView(s)
 	case *parser.RefreshMatViewStmt:
 		return nil, o.execRefreshMatView(s)
+	case *parser.CreateAggregateStmt:
+		return nil, o.execCreateAggregate(s)
 	case *parser.CompatNoopStmt:
 		return nil, nil // GRANT/REVOKE/COMMENT/etc — accepted, no-op. M0097-0016.
 	case *parser.DoStmt:
@@ -2690,6 +2692,58 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		}
 		return nil
 	}
+	// DROP AGGREGATE: validate the arg type and emit PG-style error messages.
+	// PG format: "aggregate name(canonicaltype) does not exist". M0097-regress.
+	if strings.ToLower(s.ObjType) == "aggregate" && len(s.Names) > 0 && len(s.ArgTypes) > 0 {
+		argType := s.ArgTypes[0]
+		if argType != "" && argType != "*" {
+			canonical := dropCompatCanonicalType(argType)
+			if canonical == "" {
+				return &ExecError{Code: "42704", Pos: s.Pos(),
+					Message: fmt.Sprintf(`type %q does not exist`, argType)}
+			}
+			return &ExecError{Code: "42883", Pos: s.Pos(),
+				Message: fmt.Sprintf("aggregate %s(%s) does not exist", s.Names[0].String(), canonical)}
+		}
+	}
+	// DROP OPERATOR: validate types and emit PG-style error messages.
+	// ArgTypes = [leftType, rightType]; "" means single-arg (missing second arg). M0097-regress.
+	if strings.ToLower(s.ObjType) == "operator" && len(s.Names) > 0 && len(s.ArgTypes) == 2 {
+		leftType := s.ArgTypes[0]
+		rightType := s.ArgTypes[1]
+		// Single type argument (no comma) → PG reports "missing argument".
+		if rightType == "" && leftType != "none" {
+			return &ExecError{Code: "42P13", Pos: s.Pos(),
+				Message: "missing argument",
+				Hint:    "Use NONE to denote the missing argument of a unary operator."}
+		}
+		// Validate left type.
+		if leftType != "" && leftType != "none" {
+			if dropCompatCanonicalType(leftType) == "" {
+				return &ExecError{Code: "42704", Pos: s.Pos(),
+					Message: fmt.Sprintf(`type %q does not exist`, leftType)}
+			}
+		}
+		// Validate right type.
+		if rightType != "" && rightType != "none" {
+			if dropCompatCanonicalType(rightType) == "" {
+				return &ExecError{Code: "42704", Pos: s.Pos(),
+					Message: fmt.Sprintf(`type %q does not exist`, rightType)}
+			}
+		}
+		// Both types valid → operator does not exist.
+		leftCanon := dropCompatCanonicalType(leftType)
+		rightCanon := dropCompatCanonicalType(rightType)
+		if leftCanon == "" {
+			leftCanon = leftType
+		}
+		if rightCanon == "" {
+			rightCanon = rightType
+		}
+		opName := s.Names[0].String()
+		return &ExecError{Code: "42883", Pos: s.Pos(),
+			Message: fmt.Sprintf("operator does not exist: %s %s %s", leftCanon, opName, rightCanon)}
+	}
 	// Without IF EXISTS, pretend the first name doesn't exist (generates error).
 	if len(s.Names) > 0 {
 		return &ExecError{
@@ -2697,6 +2751,68 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			Pos:     s.Pos(),
 			Message: fmt.Sprintf("%s %q does not exist", s.ObjType, s.Names[0].String()),
 		}
+	}
+	return nil
+}
+
+// dropCompatCanonicalType maps PostgreSQL short type names to their canonical
+// names used in error messages (e.g. "int4" → "integer", "float4" → "real").
+// Returns "" for unknown/invalid type names.
+func dropCompatCanonicalType(typeName string) string {
+	switch strings.ToLower(typeName) {
+	case "int4", "integer", "int", "serial":
+		return "integer"
+	case "int2", "smallint", "smallserial":
+		return "smallint"
+	case "int8", "bigint", "bigserial":
+		return "bigint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision", "double":
+		return "double precision"
+	case "float":
+		return "double precision"
+	case "bool", "boolean":
+		return "boolean"
+	case "text":
+		return "text"
+	case "varchar", "character varying":
+		return "character varying"
+	case "char", "character", "bpchar":
+		return "character"
+	case "numeric", "decimal":
+		return "numeric"
+	case "date":
+		return "date"
+	case "time":
+		return "time without time zone"
+	case "timetz", "time with time zone":
+		return "time with time zone"
+	case "timestamp":
+		return "timestamp without time zone"
+	case "timestamptz", "timestamp with time zone":
+		return "timestamp with time zone"
+	case "interval":
+		return "interval"
+	case "bytea":
+		return "bytea"
+	case "oid":
+		return "oid"
+	case "name":
+		return "name"
+	case "none":
+		return "none"
+	}
+	return ""
+}
+
+// execCreateAggregate validates a CREATE AGGREGATE statement and rejects it
+// with the appropriate PG-compatible error if the basetype is missing.
+// Full aggregate implementation is out of scope for v0. M0097-regress.
+func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
+	if !s.HasBaseType {
+		return &ExecError{Code: "42P13", Pos: s.Pos(),
+			Message: "aggregate input type must be specified"}
 	}
 	return nil
 }

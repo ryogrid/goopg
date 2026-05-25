@@ -1078,7 +1078,25 @@ type DropCompatStmt struct {
 	IfExists bool
 	Names    []ObjectName
 	Behavior DropBehavior
+	// ArgTypes holds parsed argument types for AGGREGATE and OPERATOR.
+	// AGGREGATE: [argtype]; OPERATOR: [leftType, rightType] ("" = missing/NONE).
+	ArgTypes []string
 }
+
+// CreateAggregateStmt is a minimal representation of CREATE AGGREGATE used to
+// validate that the basetype (input type) is specified.  Full aggregate
+// implementation is out of scope; we just reject missing basetype. M0097-regress.
+type CreateAggregateStmt struct {
+	pos         int
+	Name        ObjectName
+	HasBaseType bool
+	BaseType    string // e.g. "int4"
+	SType       string // state type (e.g. "int4")
+	FinalFunc   string // final function name
+}
+
+func (s *CreateAggregateStmt) Pos() int  { return s.pos }
+func (s *CreateAggregateStmt) stmtNode() {}
 
 // DoStmt represents DO $$ body $$ — an anonymous PL/pgSQL block. M0097-0003.
 type DoStmt struct {

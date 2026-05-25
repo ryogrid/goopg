@@ -141,8 +141,64 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return p.parseCreateTriggerTail(t.Pos)
 		}
 		return nil, p.errAtCur("expected TRIGGER after CREATE CONSTRAINT")
+	// CREATE AGGREGATE name (sfunc=F, basetype=T, stype=S [, ...]) — validate basetype.
+	// M0097-regress.
+	case p.acceptIdentKeyword("aggregate"):
+		return p.parseCreateAggregateTail(t.Pos)
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after CREATE")
+}
+
+// parseCreateAggregateTail picks up after "CREATE AGGREGATE".  It parses just
+// enough of the aggregate definition to determine whether "basetype" is present.
+// Returns a CreateAggregateStmt that the executor validates. M0097-regress.
+func (p *parser) parseCreateAggregateTail(pos int) (Stmt, error) {
+	stmt := &CreateAggregateStmt{pos: pos}
+	// Name.
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+	// "(key = value, …)" option list.
+	if p.cur().Kind != TokenSymbol || p.cur().Value != "(" {
+		return nil, p.errSyntaxAtCur()
+	}
+	p.advance() // consume "("
+	for p.cur().Kind != TokenSymbol || p.cur().Value != ")" {
+		if p.cur().Kind == TokenEOF {
+			break
+		}
+		// Parse key = value pair.
+		keyTok := p.cur()
+		p.advance()
+		// "=" is TokenOperator in goopg's lexer (not TokenSymbol).
+		if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+			p.advance() // consume "="
+			valTok := p.cur()
+			if valTok.Kind != TokenEOF {
+				p.advance()
+			}
+			key := strings.ToLower(keyTok.Value)
+			switch key {
+			case "basetype":
+				stmt.HasBaseType = true
+				stmt.BaseType = strings.ToLower(valTok.Value)
+			case "stype":
+				stmt.SType = strings.ToLower(valTok.Value)
+			case "finalfunc":
+				stmt.FinalFunc = strings.ToLower(valTok.Value)
+			}
+		}
+		// Skip optional comma.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+			p.advance()
+		}
+	}
+	if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+		p.advance() // consume ")"
+	}
+	return stmt, nil
 }
 
 // parseCreatePublicationTail picks up after CREATE PUBLICATION.
@@ -1486,7 +1542,32 @@ func (p *parser) parseDrop() (Stmt, error) {
 		if p.cur().Kind != TokenSymbol || p.cur().Value != "(" {
 			return nil, p.errSyntaxAtCur()
 		}
-		p.skipBalancedParens()
+		p.advance() // consume "("
+		// Parse the argument type name (e.g. "int4", "*", "nonesuch").
+		var argType string
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+			argType = "*"
+			p.advance()
+		} else if tok, err2 := p.parseIdent(); err2 == nil {
+			argType = tok.Value
+		}
+		// Skip rest of arg list until matching ")".
+		depth := 1
+		for depth > 0 && p.cur().Kind != TokenEOF {
+			switch {
+			case p.cur().Kind == TokenSymbol && p.cur().Value == "(":
+				depth++
+			case p.cur().Kind == TokenSymbol && p.cur().Value == ")":
+				depth--
+				if depth == 0 {
+					continue
+				}
+			}
+			p.advance()
+		}
+		if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+			p.advance() // consume ")"
+		}
 		behavior := DropDefault
 		switch {
 		case p.acceptKeyword(KwCascade):
@@ -1494,7 +1575,7 @@ func (p *parser) parseDrop() (Stmt, error) {
 		case p.acceptKeyword(KwRestrict):
 		}
 		return &DropCompatStmt{pos: t.Pos, ObjType: "aggregate", IfExists: ifExists,
-			Names: []ObjectName{name}, Behavior: behavior}, nil
+			Names: []ObjectName{name}, Behavior: behavior, ArgTypes: []string{argType}}, nil
 	}
 	// DROP OPERATOR [IF EXISTS] name ( left_type , right_type ) [CASCADE|RESTRICT]
 	// PG requires the parenthesised type list; without it (or with just a bare
@@ -1507,14 +1588,13 @@ func (p *parser) parseDrop() (Stmt, error) {
 			}
 			ifExists = true
 		}
-		// Operator name: can be an identifier OR a symbol sequence. Consume all
-		// consecutive symbol tokens that form the operator name (e.g. "===").
+		// Operator name: can be an identifier OR a symbol sequence (e.g. "===", "=").
 		// If the current token is "(", there is no name at all — syntax error.
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 			return nil, p.errSyntaxAtCur()
 		}
-		// Read the operator name as an object name (may be qualified or just an ident/symbol).
-		name, err := p.parseObjectName()
+		// Parse the operator name — handles identifiers, operator symbols, and qualified names.
+		name, err := p.parseOperatorName()
 		if err != nil {
 			return nil, err
 		}
@@ -1523,7 +1603,44 @@ func (p *parser) parseDrop() (Stmt, error) {
 		if p.cur().Kind != TokenSymbol || p.cur().Value != "(" {
 			return nil, p.errSyntaxAtCur()
 		}
-		p.skipBalancedParens()
+		p.advance() // consume "("
+		// Parse the type list.  PG requires exactly two type specs (or NONE).
+		// Syntax errors: empty list "()", leading comma "( , t)", trailing comma "(t, )".
+		if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+			return nil, p.errSyntaxAtCur() // "drop operator === ()"
+		}
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+			return nil, p.errSyntaxAtCur() // "drop operator = ( , int4)"
+		}
+		// Parse left type (or NONE).
+		var leftType string
+		if p.acceptIdentKeyword("none") {
+			leftType = "none"
+		} else if tok, err2 := p.parseIdent(); err2 == nil {
+			leftType = tok.Value
+		}
+		var rightType string
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+			p.advance() // consume ","
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				return nil, p.errSyntaxAtCur() // "drop operator = (int4, )"
+			}
+			if p.acceptIdentKeyword("none") {
+				rightType = "none"
+			} else if tok, err2 := p.parseIdent(); err2 == nil {
+				rightType = tok.Value
+			}
+		}
+		// Skip to closing ")".
+		for p.cur().Kind != TokenSymbol || p.cur().Value != ")" {
+			if p.cur().Kind == TokenEOF {
+				break
+			}
+			p.advance()
+		}
+		if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+			p.advance() // consume ")"
+		}
 		behavior := DropDefault
 		switch {
 		case p.acceptKeyword(KwCascade):
@@ -1531,7 +1648,7 @@ func (p *parser) parseDrop() (Stmt, error) {
 		case p.acceptKeyword(KwRestrict):
 		}
 		return &DropCompatStmt{pos: t.Pos, ObjType: "operator", IfExists: ifExists,
-			Names: []ObjectName{name}, Behavior: behavior}, nil
+			Names: []ObjectName{name}, Behavior: behavior, ArgTypes: []string{leftType, rightType}}, nil
 	}
 	// Handle ident-based DROP targets as compatibility stubs. M0097-0008.
 	for _, objType := range []string{
