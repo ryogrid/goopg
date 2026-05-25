@@ -62,13 +62,14 @@ func ParseExpr(input string, mc ...*mctx.Context) (Expr, error) {
 	var toks []Token
 	var sp *[]Token
 	var err error
-	if sctx != nil {
-		toks, err = lexInto(mctx.AllocSlice[Token](sctx, 64)[:0], input)
-	} else {
-		sp = tokenSlicePool.Get().(*[]Token)
-		toks, err = lexInto((*sp)[:0], input)
-		*sp = toks
-	}
+	// Always use the heap-backed pool. Token.Value is a Go string (contains
+	// a GC pointer); storing Tokens in an mctx []byte arena hides those
+	// pointers from the GC and causes "found pointer to free object" crashes
+	// when the SQL-input backing bytes are collected. M0097-crash-fix.
+	_ = sctx // mctx path removed; sctx kept in API for callers that pass it
+	sp = tokenSlicePool.Get().(*[]Token)
+	toks, err = lexInto((*sp)[:0], input)
+	*sp = toks
 	if err != nil {
 		if sp != nil {
 			tokenSlicePool.Put(sp)
@@ -118,16 +119,14 @@ func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
 	var toks []Token
 	var sp *[]Token
 	var err error
-	if sctx != nil {
-		// M0107-0003 Phase C.3: allocate token backing from mctx arena.
-		// AllocSlice returns a slice of length 64; [:0] resets length while
-		// keeping the arena-backed capacity so lexInto appends in place.
-		toks, err = lexInto(mctx.AllocSlice[Token](sctx, 64)[:0], input)
-	} else {
-		sp = tokenSlicePool.Get().(*[]Token)
-		toks, err = lexInto((*sp)[:0], input)
-		*sp = toks
-	}
+	// Always use the heap-backed pool. Token.Value is a Go string (contains
+	// a GC pointer); storing Tokens in an mctx []byte arena hides those
+	// pointers from the GC and causes "found pointer to free object" crashes
+	// when the SQL-input backing bytes are collected. M0097-crash-fix.
+	_ = sctx // mctx path removed; sctx kept in API for callers that pass it
+	sp = tokenSlicePool.Get().(*[]Token)
+	toks, err = lexInto((*sp)[:0], input)
+	*sp = toks
 	if err != nil {
 		if sp != nil {
 			tokenSlicePool.Put(sp)

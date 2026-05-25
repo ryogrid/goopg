@@ -75,6 +75,23 @@ func TestPort_RegressSuite(t *testing.T) {
 				return
 			}
 
+			// Restart the cluster if it crashed during a previous test.
+			// The server process can crash with a GC memory error (pre-existing
+			// bug) after running heavy DDL workloads. We detect this by pinging
+			// the server; on failure we Kill (clears cmd state) then Start
+			// (WAL recovery restores a consistent DB state), then re-run
+			// test_setup.sql to restore shared fixture tables.
+			if !exec.isAlive() {
+				t.Log("server not responding; attempting crash recovery")
+				_ = c.Kill() // clear cmd so Start() doesn't return "already started"
+				if err := c.Start(); err != nil {
+					t.Skipf("deferred: cluster restart failed: %v", err)
+					return
+				}
+				runRegressSetup(t, root, psqlBin, c)
+				t.Log("cluster recovered")
+			}
+
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
 
@@ -220,6 +237,20 @@ func (e *ClusterRegressExecutor) psqlEnv() []string {
 		env = append(env, "PG_ABS_SRCDIR="+absSrcDir)
 	}
 	return env
+}
+
+// isAlive pings the cluster with a trivial SELECT; returns false if the server
+// is not reachable (crashed or not yet started).
+func (e *ClusterRegressExecutor) isAlive() bool {
+	args := e.psqlArgs("-X", "-q", "-c", "SELECT 1")
+	result, _ := util.RunCommand(util.CommandSpec{
+		Name:    e.PsqlBin,
+		Args:    args,
+		Dir:     e.RepoRoot,
+		Env:     e.psqlEnv(),
+		Timeout: 5 * time.Second,
+	})
+	return result.ExitCode == 0
 }
 
 // ExecuteSQL writes sql to a temporary file and runs it through psql.

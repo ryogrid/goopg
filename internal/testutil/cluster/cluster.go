@@ -259,6 +259,12 @@ func (c *Cluster) Kill() error {
 		pgid = c.cmd.Process.Pid
 	}
 	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
+		// ESRCH means the process group is already gone (crashed). Clear the
+		// cmd handle so Start() can restart the server for recovery flows.
+		if errors.Is(err, syscall.ESRCH) {
+			c.cmd = nil
+			return nil
+		}
 		return fmt.Errorf("kill pgrp -%d: %w", pgid, err)
 	}
 	c.cmd = nil
