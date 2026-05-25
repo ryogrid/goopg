@@ -1475,50 +1475,128 @@ func parsePgSnapshotValid(s string) bool {
 // sizePretty formats a byte count as a human-readable size string, matching
 // PostgreSQL's pg_size_pretty() output. Uses 1024-based units. M0097-0018.
 //
-// The unit is chosen by computing the ROUNDED value at each level:
-// if the rounded value >= 10240, promote to the next unit. This matches
-// PostgreSQL's actual behaviour where, e.g., 10485248 → "10 MB" because
-// round(10485248/1024) = 10240 kB ≥ 10240, so it's shown as 10 MB instead.
-func sizePretty(bytes int64) string {
-	neg := bytes < 0
-	if neg {
-		bytes = -bytes
+// sizePretty formats an integer byte count as a human-readable size string.
+// Replicates PostgreSQL's pg_size_pretty(bigint) iterative algorithm exactly,
+// using uint64 for the absolute-value check to handle INT64_MIN correctly.
+func sizePretty(size int64) string {
+	type szUnit struct {
+		name     string
+		limit    uint64
+		round    bool
+		unitbits int
 	}
-	const (
-		kBu = int64(1024)
-		MBu = int64(1024 * 1024)
-		GBu = int64(1024 * 1024 * 1024)
-		TBu = int64(1024 * 1024 * 1024 * 1024)
-		PBu = int64(1024 * 1024 * 1024 * 1024 * 1024)
-	)
-	// halfRound: integer division with round-half-up.
-	halfRound := func(n, unit int64) int64 { return (n + unit/2) / unit }
-	var result string
-	if bytes < 10*kBu {
-		if bytes == 1 {
-			result = "1 byte"
+	szUnits := []szUnit{
+		{"bytes", 10 * 1024, false, 0},
+		{"kB", 20*1024 - 1, true, 10},
+		{"MB", 20*1024 - 1, true, 20},
+		{"GB", 20*1024 - 1, true, 30},
+		{"TB", 20*1024 - 1, true, 40},
+		{"PB", 20*1024 - 1, true, 50},
+	}
+	cur := size
+	for i, u := range szUnits {
+		var absSize uint64
+		if cur < 0 {
+			absSize = 0 - uint64(cur) // handles INT64_MIN: 0-uint64(INT64_MIN)=2^63
 		} else {
-			result = fmt.Sprintf("%d bytes", bytes)
+			absSize = uint64(cur)
 		}
-	} else if kbVal := halfRound(bytes, kBu); kbVal < 10240 {
-		result = fmt.Sprintf("%d kB", kbVal)
-	} else if mbVal := halfRound(bytes, MBu); mbVal < 10240 {
-		result = fmt.Sprintf("%d MB", mbVal)
-	} else if gbVal := halfRound(bytes, GBu); gbVal < 10240 {
-		result = fmt.Sprintf("%d GB", gbVal)
-	} else if tbVal := halfRound(bytes, TBu); tbVal < 10240 {
-		result = fmt.Sprintf("%d TB", tbVal)
-	} else {
-		result = fmt.Sprintf("%d PB", halfRound(bytes, PBu))
+		nextIsLast := i+1 >= len(szUnits)
+		if nextIsLast || absSize < u.limit {
+			if u.round {
+				if cur > 0 {
+					cur = (cur + 1) / 2
+				} else {
+					cur = (cur - 1) / 2
+				}
+			}
+			return fmt.Sprintf("%d %s", cur, u.name)
+		}
+		next := szUnits[i+1]
+		bits := uint(next.unitbits - u.unitbits)
+		if next.round {
+			bits--
+		}
+		if u.round {
+			bits++
+		}
+		cur /= int64(1) << bits
 	}
-	if neg {
-		return "-" + result
-	}
-	return result
+	return fmt.Sprintf("%d PB", cur)
 }
 
-// sizePrettyFloat formats a fractional byte count as a human-readable size string.
-// Used for numeric (non-integer) inputs to pg_size_pretty. M0097-0018.
+// sizePrettyBig formats a numeric byte count (given as a decimal string) as a
+// human-readable size string. Uses exact big.Int/big.Rat arithmetic to replicate
+// PostgreSQL's pg_size_pretty(numeric) algorithm (avoids float64 precision loss
+// at the PB boundary).
+func sizePrettyBig(s string) string {
+	r, ok := new(big.Rat).SetString(s)
+	if !ok {
+		return s + " bytes"
+	}
+	type szUnit struct {
+		name     string
+		limit    int64
+		round    bool
+		unitbits int
+	}
+	szUnits := []szUnit{
+		{"bytes", 10 * 1024, false, 0},
+		{"kB", 20*1024 - 1, true, 10},
+		{"MB", 20*1024 - 1, true, 20},
+		{"GB", 20*1024 - 1, true, 30},
+		{"TB", 20*1024 - 1, true, 40},
+		{"PB", 20*1024 - 1, true, 50},
+	}
+	cur := new(big.Rat).Set(r)
+	for i, u := range szUnits {
+		absCur := new(big.Rat).Abs(cur)
+		limitR := new(big.Rat).SetInt64(u.limit)
+		nextIsLast := i+1 >= len(szUnits)
+		if nextIsLast || absCur.Cmp(limitR) < 0 {
+			if u.round {
+				// Truncate to integer, then half_rounded: (n±1)/2 toward zero.
+				curInt := bigRatTrunc(cur)
+				if curInt.Sign() >= 0 {
+					curInt.Add(curInt, big.NewInt(1))
+				} else {
+					curInt.Sub(curInt, big.NewInt(1))
+				}
+				curInt.Quo(curInt, big.NewInt(2))
+				return fmt.Sprintf("%s %s", curInt.String(), u.name)
+			}
+			// bytes: display exact value (preserve fractional part like PG).
+			if cur.IsInt() {
+				return fmt.Sprintf("%s %s", cur.Num().String(), u.name)
+			}
+			f, _ := strconv.ParseFloat(cur.FloatString(20), 64)
+			return fmt.Sprintf("%g %s", f, u.name)
+		}
+		next := szUnits[i+1]
+		bits := uint(next.unitbits - u.unitbits)
+		if next.round {
+			bits--
+		}
+		if u.round {
+			bits++
+		}
+		divisor := new(big.Rat).SetInt64(int64(1) << bits)
+		cur.Quo(cur, divisor)
+		// Truncate toward zero after each step (exact Numeric arithmetic).
+		curInt := bigRatTrunc(cur)
+		cur = new(big.Rat).SetInt(curInt)
+	}
+	return fmt.Sprintf("%s PB", bigRatTrunc(cur).String())
+}
+
+// bigRatTrunc truncates a big.Rat toward zero and returns the integer part.
+func bigRatTrunc(r *big.Rat) *big.Int {
+	q, _ := new(big.Int).QuoRem(r.Num(), r.Denom(), new(big.Int))
+	return q
+}
+
+// sizePrettyFloat formats a float64 byte count as a human-readable size string.
+// Used for KindFloat (float8) inputs to pg_size_pretty.
 func sizePrettyFloat(f float64) string {
 	neg := f < 0
 	if neg {
@@ -1532,20 +1610,13 @@ func sizePrettyFloat(f float64) string {
 		TB = float64(1024 * 1024 * 1024 * 1024)
 		PB = float64(1024 * 1024 * 1024 * 1024 * 1024)
 	)
-	// halfRoundF: round float64 to nearest integer (round half up), matching
-	// PostgreSQL's integer halfRound for consistent kB/MB/etc display. M0097-0018.
-	halfRoundF := func(n, unit float64) int64 { return int64(math.Round(n / unit)) }
+	halfRoundF := func(n, unit float64) int64 { return int64(n / unit) }
 	switch {
 	case f < 10*kB:
-		if f == 1 {
-			result = "1 byte"
+		if f == float64(int64(f)) {
+			result = fmt.Sprintf("%d bytes", int64(f))
 		} else {
-			// Format with decimal point only if fractional.
-			if f == float64(int64(f)) {
-				result = fmt.Sprintf("%d bytes", int64(f))
-			} else {
-				result = fmt.Sprintf("%g bytes", f)
-			}
+			result = fmt.Sprintf("%g bytes", f)
 		}
 	case f < 10*MB:
 		result = fmt.Sprintf("%d kB", halfRoundF(f, kB))
@@ -1567,27 +1638,57 @@ func sizePrettyFloat(f float64) string {
 // parseSizeBytes parses a human-readable size string into bytes.
 // Supports units: bytes/B, kB, MB, GB, TB, PB (case-insensitive).
 // Also accepts scientific notation (e.g. "1e6 MB"). M0097-0018.
+// Error messages and behaviour match PostgreSQL 17.
 func parseSizeBytes(s string) (int64, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, fmt.Errorf("invalid size: empty string")
+	// orig: preserve original input exactly for error messages (matches PG behaviour).
+	orig := s
+	ws := strings.TrimSpace(s)
+	if ws == "" {
+		return 0, fmt.Errorf("invalid size: %q", "")
 	}
 
-	// Find where the numeric part ends and the unit begins.
+	// Parse numeric part: optional sign, digits, optional '.'+digits, optional exponent.
 	i := 0
-	// Allow optional leading sign.
-	if i < len(s) && (s[i] == '-' || s[i] == '+') {
+	if i < len(ws) && (ws[i] == '-' || ws[i] == '+') {
 		i++
 	}
-	// Digits, dot, and exponent.
-	for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '-' || s[i] == '+') {
+	for i < len(ws) && ws[i] >= '0' && ws[i] <= '9' {
 		i++
 	}
-	numStr := strings.TrimSpace(s[:i])
-	unitStr := strings.TrimSpace(s[i:])
+	if i < len(ws) && ws[i] == '.' {
+		i++
+		for i < len(ws) && ws[i] >= '0' && ws[i] <= '9' {
+			i++
+		}
+	}
+	expStart := i
+	if i < len(ws) && (ws[i] == 'e' || ws[i] == 'E') {
+		j := i + 1
+		if j < len(ws) && (ws[j] == '-' || ws[j] == '+') {
+			j++
+		}
+		if j < len(ws) && ws[j] >= '0' && ws[j] <= '9' {
+			i = j
+			for i < len(ws) && ws[i] >= '0' && ws[i] <= '9' {
+				i++
+			}
+		} else {
+			i = expStart // no valid exponent; treat 'e' as start of unit
+		}
+	}
+	numStr := ws[:i]
+	unitStr := strings.TrimSpace(ws[i:])
 
-	if numStr == "" || numStr == "-" || numStr == "+" {
-		return 0, fmt.Errorf("invalid size: %q", s)
+	// Must have at least one digit.
+	hasDigit := false
+	for _, c := range numStr {
+		if c >= '0' && c <= '9' {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit {
+		return 0, fmt.Errorf("invalid size: %q", orig)
 	}
 
 	// Handle trailing decimal point: "1." → "1.0"
@@ -1595,43 +1696,48 @@ func parseSizeBytes(s string) (int64, error) {
 		numStr += "0"
 	}
 
-	val, err := strconv.ParseFloat(numStr, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid size: %q", s)
+	val, parseErr := strconv.ParseFloat(numStr, 64)
+	// ErrRange produces Inf — means exponent overflow, matching PG's "value overflows numeric format".
+	if math.IsInf(val, 0) {
+		return 0, fmt.Errorf("value overflows numeric format")
+	}
+	if parseErr != nil || math.IsNaN(val) {
+		return 0, fmt.Errorf("invalid size: %q", orig)
 	}
 
-	// Check for overflow or infinite.
-	if math.IsInf(val, 0) || math.IsNaN(val) {
-		return 0, fmt.Errorf("invalid size: %q", s)
-	}
-
+	const sizeHint = `Valid units are "bytes", "B", "kB", "MB", "GB", "TB", and "PB".`
 	var multiplier float64
 	switch strings.ToLower(unitStr) {
-	case "", "b", "byte", "bytes":
+	case "", "b", "bytes":
 		multiplier = 1
-	case "kb", "kib":
+	case "kb":
 		multiplier = 1024
-	case "mb", "mib":
+	case "mb":
 		multiplier = 1024 * 1024
-	case "gb", "gib":
+	case "gb":
 		multiplier = 1024 * 1024 * 1024
-	case "tb", "tib":
+	case "tb":
 		multiplier = 1024 * 1024 * 1024 * 1024
-	case "pb", "pib":
+	case "pb":
 		multiplier = 1024 * 1024 * 1024 * 1024 * 1024
 	default:
-		return 0, fmt.Errorf("invalid size unit: %q", unitStr)
+		return 0, &ExecError{
+			Code:    "22023",
+			Message: fmt.Sprintf("invalid size: %q", orig),
+			Detail:  fmt.Sprintf("Invalid size unit: %q.", unitStr),
+			Hint:    sizeHint,
+		}
 	}
 
 	result := val * multiplier
 	if math.IsInf(result, 0) || math.IsNaN(result) {
-		return 0, fmt.Errorf("size out of range: %q", s)
+		return 0, fmt.Errorf("bigint out of range")
 	}
 	// MaxInt64 as float64 rounds to 9.223372036854776e18; values strictly
 	// greater than that can't fit in int64.
 	const maxInt64Float = float64(1 << 63) // 9.223372036854776e18
 	if result >= maxInt64Float || result < -maxInt64Float {
-		return 0, fmt.Errorf("size out of range: %q", s)
+		return 0, fmt.Errorf("bigint out of range")
 	}
 	// Truncate toward zero, matching PostgreSQL behaviour (e.g. -.1 kB → -102).
 	return int64(result), nil
@@ -2925,31 +3031,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
-			// Accept both integer and numeric (string/KindNumeric) types.
-			var byteVal int64
-			var fracBytes float64
-			var hasFrac bool
 			if v.Kind == KindInt {
-				byteVal = v.Int
-			} else {
-				// Use Format() for KindNumeric (works for all non-string kinds).
-				// StringValue() only works for KindString/KindStringArena. M0097-0018.
-				s := strings.TrimSpace(v.Format())
-				if f, err2 := strconv.ParseFloat(s, 64); err2 == nil {
-					if f != float64(int64(f)) || f < -9223372036854775808.0 || f > 9223372036854775807.0 {
-						hasFrac = true
-						fracBytes = f
-					} else {
-						byteVal = int64(f)
-					}
-				} else {
-					return NullDatum, nil
-				}
+				return NewStringDatum(sizePretty(v.Int)), nil
 			}
-			if hasFrac {
-				return NewStringDatum(sizePrettyFloat(fracBytes)), nil
-			}
-			return NewStringDatum(sizePretty(byteVal)), nil
+			// KindNumeric and other: use exact big.Int/big.Rat arithmetic
+			// to match PG's pg_size_pretty(numeric) algorithm. M0097-0018.
+			return NewStringDatum(sizePrettyBig(strings.TrimSpace(v.Format()))), nil
 		}
 
 	case "pg_size_bytes":
@@ -2960,7 +3047,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			bytes, err2 := parseSizeBytes(s.StringValue())
 			if err2 != nil {
-				return Datum{}, &ExecError{Code: "22P02", Message: err2.Error()}
+				if ee, ok := err2.(*ExecError); ok {
+					return Datum{}, ee
+				}
+				return Datum{}, &ExecError{Code: "22023", Message: err2.Error()}
 			}
 			return Datum{Kind: KindInt, Int: bytes}, nil
 		}
