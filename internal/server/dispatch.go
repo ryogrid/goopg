@@ -93,17 +93,11 @@ func maybeForceGCAfterCommit() {
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
 func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string, connTx *connTxState, prepStmts *preparedStatements) error {
-	// M0107-0003 Phase C.3: allocate token backing from an ephemeral mctx
-	// child to avoid sync.Pool overhead on the hot parse path.
-	var parseCtx *mctx.Context
-	if connTx != nil && connTx.SessCtx != nil {
-		parseCtx = mctx.Acquire(connTx.SessCtx, mctx.KindExpr)
-	}
-	stmts, err := parser.Parse(sql, parseCtx)
-	if parseCtx != nil {
-		parseCtx.Release() // tokens only needed during parsing
-		parseCtx = nil
-	}
+	// Parse uses the heap-backed tokenSlicePool (allocation-free in steady
+	// state). The M0107-0003 Phase C.3 mctx token-arena fast path was retired
+	// as fundamentally GC-unsafe — see docs/design/0107-0003d-token-pool-gc-safety.md
+	// — so we no longer acquire a throwaway KindExpr child just to pass it in.
+	stmts, err := parser.Parse(sql)
 	if err != nil {
 		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
 		// here (the parser doesn't recognise them yet) so we can

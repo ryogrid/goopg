@@ -3298,6 +3298,42 @@ complete, these can be re-evaluated.
 | `pg_upgrade` | Multi-server orchestration; pg_upgrade binary. |
 
 
+## M0107-0003 Phase C.3 — Parser token-arena fast path: GC-safety closure (2026-05-26)
+
+- [x] **M0107-0003-C3-close — Resolve the parser token "fast path" correctly**
+      - Context: `adfb935` removed the M0107-0003 Phase C.3 mctx token-arena
+        fast path after it crashed the regress suite with `found pointer to
+        free object`. The follow-up question was whether that fast path could
+        be *made to work correctly* rather than left removed.
+      - Finding (design doc `docs/design/0107-0003d-token-pool-gc-safety.md`):
+        the arena fast path is **fundamentally** GC-unsafe, not merely buggy,
+        for two independent reasons:
+        1. an `mctx` slab is allocated as `[]byte` → a GC **noscan** span, so a
+           `Token.Value` Go-string pointer stored in an arena-backed `[]Token`
+           is invisible to the mark phase and is collected mid-parse;
+        2. the cross-session plan cache (`internal/server/plancache.go`) retains
+           some `Value` strings *by reference* (SELECT alias → `SchemaColumn.Name`,
+           `StringConst.Value`, `SeqScan.Alias`), so arena-backing `Value` would
+           dangle live cached plans on `stmtCtx.Release()`.
+      - Decision: keep the heap-backed `tokenSlicePool` as the canonical,
+        already-allocation-free fast path; permanently bar `parser.Token` (and
+        any pointer-bearing AST node) from mctx arenas. Guardrail added to
+        `mctx.AllocSlice` doc-comment + `Parse`/`ParseExpr` comments.
+      - Code (minimal, no perf regression): corrected the false comments in
+        `internal/parser/parser.go`; removed the dead throwaway `KindExpr`
+        acquire/release in `internal/server/dispatch.go` (it never reached
+        token storage — `Parse` ignores the arg). The vestigial
+        `mc ...*mctx.Context` parameter is retained for source compat; removing
+        it is a safe future cleanup.
+      - Verification: `go build ./...`, `go vet ./internal/parser/...
+        ./internal/mctx/... ./internal/server/...`, `gofmt -l`,
+        `go test ./internal/parser/... ./internal/mctx/...`, and
+        `make ralph-state-guard`.
+      - Alternatives rejected (in design doc §7): arena `[]Token` + `Value`
+        pinning, full arena + planner string interning, pointer-free `Token`,
+        GC-safe reusable per-connection buffer — all either reintroduce the
+        crash pattern or are out of proportion to a noise-level win.
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).

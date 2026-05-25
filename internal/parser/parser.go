@@ -19,7 +19,6 @@ var tokenSlicePool = sync.Pool{
 	},
 }
 
-
 // SyntaxError is the parser's structured error. Message mirrors
 // upstream's `syntax error at or near "TOKEN"` shape so psql users
 // can reason about it.
@@ -52,7 +51,7 @@ func (e *SyntaxError) Error() string {
 // error so a caller passing `1 + 2; garbage` gets a clean
 // diagnostic.
 //
-// mc follows the same contract as Parse (M0107-0003 Phase C.3).
+// mc follows the same contract as Parse: it is a retained no-op (see Parse).
 func ParseExpr(input string, mc ...*mctx.Context) (Expr, error) {
 	var sctx *mctx.Context
 	if len(mc) > 0 {
@@ -62,11 +61,14 @@ func ParseExpr(input string, mc ...*mctx.Context) (Expr, error) {
 	var toks []Token
 	var sp *[]Token
 	var err error
-	// Always use the heap-backed pool. Token.Value is a Go string (contains
-	// a GC pointer); storing Tokens in an mctx []byte arena hides those
-	// pointers from the GC and causes "found pointer to free object" crashes
-	// when the SQL-input backing bytes are collected. M0097-crash-fix.
-	_ = sctx // mctx path removed; sctx kept in API for callers that pass it
+	// Fast path: the heap-backed tokenSlicePool (allocation-free in steady
+	// state). Token.Value is a Go string, so []Token must NOT be stored in an
+	// mctx []byte arena: the slab is a GC noscan span that hides Value
+	// pointers from the mark phase, and the cross-session plan cache retains
+	// some Value strings by reference and would dangle on arena release.
+	// The arena fast path is therefore permanently unsafe.
+	// See docs/design/0107-0003d-token-pool-gc-safety.md.
+	_ = sctx // mc is never used for token storage; retained for API compat.
 	sp = tokenSlicePool.Get().(*[]Token)
 	toks, err = lexInto((*sp)[:0], input)
 	*sp = toks
@@ -105,11 +107,13 @@ func ParseExpr(input string, mc ...*mctx.Context) (Expr, error) {
 // non-empty statement. A trailing semicolon is allowed; an empty input
 // returns an empty slice and no error.
 //
-// mc is an optional mctx.Context for token-backing allocation (M0107-0003
-// Phase C.3). When provided, the token slice is allocated from mc's arena
-// and bulk-freed via mc.Release() without touching the GC heap.
-// When nil, the global tokenSlicePool is used (backward-compatible path
-// for tests and callers without a statement context).
+// mc was an optional mctx.Context for arena token-backing (M0107-0003 Phase
+// C.3). That fast path is permanently retired: []Token cannot live in an mctx
+// []byte arena because the slab is a GC noscan span (Token.Value pointers
+// become invisible to the collector) and the cross-session plan cache retains
+// some Value strings by reference (arena release would dangle them). mc is now
+// a no-op retained for source compatibility; tokens always come from the
+// heap-backed tokenSlicePool. See docs/design/0107-0003d-token-pool-gc-safety.md.
 func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
 	var sctx *mctx.Context
 	if len(mc) > 0 {
@@ -119,11 +123,11 @@ func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
 	var toks []Token
 	var sp *[]Token
 	var err error
-	// Always use the heap-backed pool. Token.Value is a Go string (contains
-	// a GC pointer); storing Tokens in an mctx []byte arena hides those
-	// pointers from the GC and causes "found pointer to free object" crashes
-	// when the SQL-input backing bytes are collected. M0097-crash-fix.
-	_ = sctx // mctx path removed; sctx kept in API for callers that pass it
+	// Fast path: the heap-backed tokenSlicePool (allocation-free in steady
+	// state; backing array is a GC scan span so Token.Value stays reachable).
+	// See the function doc and docs/design/0107-0003d-token-pool-gc-safety.md
+	// for why the mctx arena variant is unsafe and was removed.
+	_ = sctx // mc is never used for token storage; retained for API compat.
 	sp = tokenSlicePool.Get().(*[]Token)
 	toks, err = lexInto((*sp)[:0], input)
 	*sp = toks
@@ -1374,7 +1378,7 @@ func (p *parser) parseExecute() (Stmt, error) {
 
 // parseDeallocate: DEALLOCATE [PREPARE] {name | ALL} (M0096-0006)
 func (p *parser) parseDeallocate() (Stmt, error) {
-	t := p.advance() // DEALLOCATE
+	t := p.advance()               // DEALLOCATE
 	_ = p.acceptKeyword(KwPrepare) // optional PREPARE keyword
 	name := ""
 	if p.acceptKeyword(KwAll) {
