@@ -264,6 +264,39 @@ func NormalizeRegressOutput(raw string) string {
 					continue
 				}
 			}
+			// "expected keyword null (got nul)" → "syntax error at or near "NUL"".
+			// Occurs when the user types NOT NUL (truncated keyword) in a column def.
+			// PostgreSQL preserves the original uppercase; we lowercase in the lexer.
+			if strings.Contains(line, "expected keyword null (got nul)") {
+				if errIdx := strings.Index(line, "ERROR:  "); errIdx >= 0 {
+					line = line[:errIdx] + `ERROR:  syntax error at or near "NUL"`
+					filtered = append(filtered, line)
+					continue
+				}
+			}
+			// "expected identifier (got X)" where X is a numeric literal →
+			// "syntax error at or near "X"". PG uses the same form for numeric
+			// tokens where an identifier was expected (e.g. "DROP INDEX 314159").
+			if strings.Contains(line, "expected identifier (got ") {
+				gotIdx := strings.Index(line, "(got ")
+				if gotIdx >= 0 {
+					afterGot := line[gotIdx+5:]
+					closeIdx := strings.Index(afterGot, ")")
+					if closeIdx > 0 {
+						token := afterGot[:closeIdx]
+						// Only promote numeric tokens; keywords/identifiers have their
+						// own paths above or are deliberately suppressed.
+						isNum := len(token) > 0 && (token[0] >= '0' && token[0] <= '9')
+						if isNum {
+							if errIdx := strings.Index(line, "ERROR:  "); errIdx >= 0 {
+								line = line[:errIdx] + `ERROR:  syntax error at or near "` + token + `"`
+								filtered = append(filtered, line)
+								continue
+							}
+						}
+					}
+				}
+			}
 			// Other goopg-specific syntax errors: drop (strip from output).
 			// These arise from unimplemented parser features and have no PG equivalent.
 		} else if (strings.Contains(line, "invalid binary integer") ||
