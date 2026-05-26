@@ -35,7 +35,7 @@ prepared_xacts,132,failed
 drop_if_exists,130,failed
 advisory_lock,142,failed
 case,148,failed
-uuid,149,failed
+uuid,84,failed
 select_distinct_on,170,failed
 partition_info,185,failed
 timetz,209,failed

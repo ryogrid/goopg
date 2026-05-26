@@ -1364,6 +1364,17 @@ M0097-0001 wires it up.
         149 (post-fix).  Remaining diff: EXPLAIN format, missing uuid generation
         functions (gen_random_uuid/uuidv4/uuidv7), uuid_extract_* functions,
         pg_class not showing indexes (all pre-existing limitations).
+      - **Progress 2026-05-26 (M0097-0029 — uuid btree index + uuid functions):**
+        Added uuid to `isSupportedBTreeKeyType` and `encodeBTreeKeyForColumn` (uses
+        EncodeVarchar; canonical format sorts lexicographically).  Added uuid to
+        `decodeIndexKeyColumn` for IOS path (uses DecodeVarcharLen).  Added
+        `gen_random_uuid`, `uuidv4`, `uuidv7`, `uuid_extract_version`,
+        `uuid_extract_timestamp` to `evalFuncCall` with helper functions `uuidToBytes`,
+        `genUUIDv4`, `genUUIDv7` using `crypto/rand`.  uuid regress diff: 149 →
+        84.  Remaining diff: EXPLAIN format, `array_agg(ORDER BY uuid)` not supported,
+        CTE subquery-without-alias parser gap, uuid_extract_timestamp timezone string
+        parse mismatch (GMT+05:00 POSIX vs ISO semantics), pg_class not tracking
+        indexes (all pre-existing limitations).
 
 - [ ] **M0097-0031 — Port GUC regress test**
       - Summary: Make `guc` reach `pass`.

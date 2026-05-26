@@ -1738,6 +1738,12 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		}
 		micros := v.TimeValue().Sub(pgEpoch).Microseconds()
 		return btree.EncodeTimestamp(micros), nil
+	case strings.ToLower(col.Type.Name) == "uuid":
+		// uuid stored as canonical lowercase-dashes text; sort order matches byte order.
+		if v.Kind != KindString {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not uuid at runtime", col.Name)}
+		}
+		return btree.EncodeVarchar([]byte(v.StringValue())), nil
 	case strings.ToLower(col.Type.Name) == "text":
 		// text type: encode as varchar bytes. M0096-0008.
 		var s string
@@ -1885,7 +1891,7 @@ func isSupportedBTreeKeyType(name string) bool {
 	}
 	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
 		isVarcharType(name) || isCharType(name) || isTimestampType(name) ||
-		isFloat8Type(name)
+		isFloat8Type(name) || strings.ToLower(name) == "uuid"
 }
 
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {

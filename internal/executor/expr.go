@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
@@ -3248,6 +3249,69 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_input_error_info":
 		return NullDatum, nil
 
+	// ── UUID functions ─────────────────────────────────────────────────────
+	case "gen_random_uuid", "uuidv4":
+		u, genErr := genUUIDv4()
+		if genErr != nil {
+			return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: "gen_random_uuid: " + genErr.Error()}
+		}
+		return NewStringDatum(u), nil
+	case "uuidv7":
+		ts := ctx.Now
+		if len(x.Args) == 1 {
+			iv, ivErr := evalExpr(x.Args[0], row, ctx)
+			if ivErr != nil {
+				return NullDatum, ivErr
+			}
+			if iv.Kind == KindInterval {
+				ts = addTimeInterval(NewTimeDatum(ts), iv, false).TimeValue()
+			}
+		}
+		u, genErr := genUUIDv7(ts)
+		if genErr != nil {
+			return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: "uuidv7: " + genErr.Error()}
+		}
+		return NewStringDatum(u), nil
+	case "uuid_extract_version":
+		if len(x.Args) == 1 {
+			v, evalErr := evalExpr(x.Args[0], row, ctx)
+			if evalErr != nil || v.IsNull() {
+				return NullDatum, evalErr
+			}
+			b, ok := uuidToBytes(v.StringValue())
+			if !ok || b[8]&0xC0 != 0x80 {
+				return NullDatum, nil
+			}
+			return Datum{Kind: KindInt, Int: int64(b[6] >> 4)}, nil
+		}
+		return NullDatum, nil
+	case "uuid_extract_timestamp":
+		if len(x.Args) == 1 {
+			v, evalErr := evalExpr(x.Args[0], row, ctx)
+			if evalErr != nil || v.IsNull() {
+				return NullDatum, evalErr
+			}
+			b, ok := uuidToBytes(v.StringValue())
+			if !ok || b[8]&0xC0 != 0x80 {
+				return NullDatum, nil
+			}
+			switch b[6] >> 4 {
+			case 1:
+				timeLow := uint64(b[0])<<24 | uint64(b[1])<<16 | uint64(b[2])<<8 | uint64(b[3])
+				timeMid := uint64(b[4])<<8 | uint64(b[5])
+				timeHi := uint64(b[6]&0x0F)<<8 | uint64(b[7])
+				gregTicks := (timeHi << 48) | (timeMid << 32) | timeLow
+				const gregToUnix = uint64(0x01B21DD213814000)
+				unixNs := (int64(gregTicks) - int64(gregToUnix)) * 100
+				return NewTimeDatum(time.Unix(0, unixNs).UTC()), nil
+			case 7:
+				ms := int64(b[0])<<40 | int64(b[1])<<32 | int64(b[2])<<24 |
+					int64(b[3])<<16 | int64(b[4])<<8 | int64(b[5])
+				return NewTimeDatum(time.UnixMilli(ms).UTC()), nil
+			}
+		}
+		return NullDatum, nil
+
 	// ── Size functions (M0097-0018) ───────────────────────────────────────
 	case "pg_size_pretty":
 		if len(x.Args) == 1 {
@@ -5611,4 +5675,52 @@ func pgFormatTypeName(t string) string {
 		return "numeric"
 	}
 	return t
+}
+
+// uuidToBytes parses a UUID string (any PG-accepted format) into 16 bytes.
+func uuidToBytes(s string) ([16]byte, bool) {
+	s = strings.ToLower(s)
+	if len(s) == 38 && s[0] == '{' && s[37] == '}' {
+		s = s[1:37]
+	}
+	var clean string
+	if len(s) == 32 {
+		clean = s
+	} else if len(s) == 36 && s[8] == '-' && s[13] == '-' && s[18] == '-' && s[23] == '-' {
+		clean = s[0:8] + s[9:13] + s[14:18] + s[19:23] + s[24:36]
+	} else {
+		return [16]byte{}, false
+	}
+	var b [16]byte
+	_, err := hex.Decode(b[:], []byte(clean))
+	return b, err == nil
+}
+
+// genUUIDv4 generates a random RFC 4122 version-4 UUID.
+func genUUIDv4() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0F) | 0x40
+	b[8] = (b[8] & 0x3F) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// genUUIDv7 generates a UUIDv7 with millisecond-precision timestamp from ts.
+func genUUIDv7(ts time.Time) (string, error) {
+	ms := ts.UnixMilli()
+	var b [16]byte
+	b[0] = byte(ms >> 40)
+	b[1] = byte(ms >> 32)
+	b[2] = byte(ms >> 24)
+	b[3] = byte(ms >> 16)
+	b[4] = byte(ms >> 8)
+	b[5] = byte(ms)
+	if _, err := rand.Read(b[6:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0F) | 0x70
+	b[8] = (b[8] & 0x3F) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
