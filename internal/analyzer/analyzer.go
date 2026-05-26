@@ -1995,10 +1995,10 @@ func isAssignable(src, dst catalog.Type) bool {
 }
 
 // isOidOrUUIDTarget reports whether dst is a column type whose codec
-// accepts string values by parsing them at runtime (oid, uuid).
+// accepts string values by parsing them at runtime (oid, uuid, pg_lsn).
 func isOidOrUUIDTarget(name string) bool {
 	switch strings.ToLower(name) {
-	case "oid", "uuid":
+	case "oid", "uuid", "pg_lsn":
 		return true
 	}
 	return false

@@ -220,6 +220,23 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(v))
 		return buf[:], nil
+	case "pg_lsn":
+		var u uint64
+		switch d.Kind {
+		case KindInt:
+			u = uint64(d.Int)
+		case KindString:
+			var err error
+			u, err = parsePgLSN(strings.TrimSpace(d.StringValue()))
+			if err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("expected pg_lsn, got kind %d", d.Kind)
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], u)
+		return buf[:], nil
 	case "oid", "regproc":
 		var v int64
 		switch d.Kind {
@@ -713,7 +730,7 @@ func physicalPGTypeAlign(t catalog.Type) int {
 		return 2
 	case "int4", "integer", "int", "serial", "oid", "regproc", "float4", "real", "date", "xid":
 		return 4
-	case "int8", "bigint", "bigserial", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz":
+	case "int8", "bigint", "bigserial", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz":
 		return 8
 	case "name":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
@@ -742,6 +759,7 @@ func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
 		"int2", "smallint",
 		"int4", "integer", "int", "serial",
 		"int8", "bigint", "bigserial",
+		"pg_lsn",
 		"oid", "regproc",
 		"timestamp", "timestamptz", "date", "time", "timetz",
 		"name",
@@ -812,6 +830,11 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("truncated int8")
 		}
 		return NewIntDatum(int64(binary.LittleEndian.Uint64(data[:8]))), 8, nil
+	case "pg_lsn":
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated pg_lsn")
+		}
+		return NewStringDatum(formatPgLSN(binary.LittleEndian.Uint64(data[:8]))), 8, nil
 	case "oid", "regproc":
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated oid")
@@ -1066,6 +1089,38 @@ func parseIntegerInput(raw, typeName string, bitSize int) (int64, error) {
 // datum is being stored in an integer column. M0097-0003.
 func coerceStringToInt64(s, typeName string) (int64, error) {
 	return parseIntegerInput(s, typeName, 64)
+}
+
+// parsePgLSN parses a "X/Y" pg_lsn string into a uint64.
+// X and Y are 1–8 hex digits each, no leading spaces allowed.
+// Returns an error with "22P02" code on invalid input.
+func parsePgLSN(s string) (uint64, error) {
+	slash := strings.IndexByte(s, '/')
+	if slash < 1 || slash > 8 {
+		return 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type pg_lsn: %q", s)}
+	}
+	hexHigh := s[:slash]
+	hexLow := s[slash+1:]
+	if len(hexLow) < 1 || len(hexLow) > 8 || len(hexLow)+slash+1 != len(s) {
+		return 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type pg_lsn: %q", s)}
+	}
+	// Validate hex characters only
+	for _, c := range hexHigh + hexLow {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return 0, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type pg_lsn: %q", s)}
+		}
+	}
+	high, _ := strconv.ParseUint(hexHigh, 16, 32)
+	low, _ := strconv.ParseUint(hexLow, 16, 32)
+	return (high << 32) | low, nil
+}
+
+// formatPgLSN formats a uint64 WAL LSN as "X/Y" uppercase hex.
+func formatPgLSN(v uint64) string {
+	return fmt.Sprintf("%X/%X", v>>32, v&0xFFFFFFFF)
 }
 
 // isValidUUIDStr reports whether s is a valid UUID string in any of

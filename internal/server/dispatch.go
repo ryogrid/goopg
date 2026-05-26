@@ -1632,6 +1632,8 @@ func typeOIDFor(name string) uint32 {
 		return 1042
 	case "numeric", "decimal":
 		return 1700
+	case "pg_lsn":
+		return 3220
 	}
 	return 25
 }

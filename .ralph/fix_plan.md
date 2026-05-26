@@ -796,6 +796,15 @@ M0097-0001 wires it up.
       - pg_type virtual table: typname, typtype for enums/domains
       - evalTypedStringLit: unknown type fallback (enum/domain casts work)
       - Design doc: 0097-0017-0001-enum-domain-types.md
+      - pg_lsn type support added 2026-05-26 (branch align-data-structure-with-pg):
+        encodeValuePG (8-byte LE), decodePhysicalPGValueMctx, parsePgLSN/formatPgLSN helpers,
+        evalPgLSNBinary (comparison + arithmetic), looksLikePgLSN pattern check,
+        compareDatum uint64-based ordering, evalCast pg_lsn case,
+        isOidOrUUIDTarget extended to include pg_lsn for assignment coercion,
+        tryTypedLiteral + typeOIDFor (OID 3220).
+        Stash was originally created before M0111-0002 S3 (legacy codec deletion);
+        conflicts in encodeValue/decodeValueMctx (deleted) resolved by keeping only
+        PG-physical paths. Debug os.OpenFile logging removed.
 
 - [x] **M0097-0018**
       - Summary: System catalog + GUC + vacuum parity.  2026-05-12.
