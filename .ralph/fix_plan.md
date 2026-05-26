@@ -1353,6 +1353,17 @@ M0097-0001 wires it up.
         `pg_database_size`/`pg_relation_size` at lines 2858–2866.
       - Mapped to completed M0097-0017 + M0097-0003 (scalar types).
       - DoD: same as M0097-0020.
+      - **Progress 2026-05-26 (M0097-0029 — uuid encode/decode + KindTime text):**
+        Root cause of uuid INSERT silently failing: `coerceTextLikeDatum` did not
+        handle KindTime (kind 5), so `text_field TEXT DEFAULT(now())` caused the
+        entire INSERT to fail with "kind 5 cannot encode as text".  Fixed by adding
+        KindBool, KindTime, KindInterval cases to `coerceTextLikeDatum`.  Also added
+        explicit uuid encode (`encodeValuePG`) + decode (`decodePhysicalPGValueMctx`)
+        cases so UUID values are validated, normalized to lowercase-with-dashes, and
+        round-tripped as varlena-text.  uuid regress diff: 169 (old baseline) →
+        149 (post-fix).  Remaining diff: EXPLAIN format, missing uuid generation
+        functions (gen_random_uuid/uuidv4/uuidv7), uuid_extract_* functions,
+        pg_class not showing indexes (all pre-existing limitations).
 
 - [ ] **M0097-0031 — Port GUC regress test**
       - Summary: Make `guc` reach `pass`.

@@ -118,6 +118,19 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 		s = fmt.Sprintf("%d", d.Int)
 	case KindNumeric:
 		s = numericText(d)
+	case KindBool:
+		if d.BoolValue() {
+			s = "t"
+		} else {
+			s = "f"
+		}
+	case KindTime:
+		// KindTime → text: use goopg's standard timestamp text format.
+		// Covers DEFAULT(now()) and similar timestamp-valued expressions
+		// being stored in a text column. M0097-0029.
+		s = d.Format()
+	case KindInterval:
+		s = d.Format()
 	default:
 		return "", fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
 	}
@@ -498,6 +511,18 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected bytes for int2vector, got kind %d", d.Kind)
 		}
 		return d.BytesValue(), nil
+	case "uuid":
+		// Validate and normalize UUID to canonical lowercase-with-dashes format.
+		// M0097-0029.
+		if d.Kind != KindString {
+			return nil, fmt.Errorf("expected string for uuid, got kind %d", d.Kind)
+		}
+		s := d.StringValue()
+		if !isValidUUIDStr(s) {
+			return nil, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type uuid: %q", s)}
+		}
+		return varlenaTextBytes(normalizeUUIDStr(s)), nil
 	case "pg_node_tree":
 		// KindBytes passthrough: pre-encoded varlena bytes (e.g. PGLZ-compressed
 		// varlena produced by pglzVarlenaDatum in initdb bootstrap).
@@ -959,6 +984,21 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		}
 		// NaN / Infinity / other non-decimal text falls back to string.
 		return NewStringDatum(text), n, nil
+	case "uuid":
+		// goopg stores UUID as varlena-text (canonical lowercase-with-dashes
+		// format). Decode: read the varlena payload and return as KindString.
+		// UUID rows were previously silently dropped because this case was
+		// missing and the default returned "unsupported PostgreSQL physical
+		// type". M0097-0029.
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, err
+		}
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(payload)
+			return newStringArenaDatum(sctx, moff, mlen), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
 	case "bytea":
 		payload, n, err := decodePhysicalPGVarlena(data)
 		if err != nil {
