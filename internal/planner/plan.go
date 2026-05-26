@@ -372,6 +372,7 @@ type CastExpr struct {
 	Operand    Expr
 	TargetType string // normalized lowercase type name (e.g., "int2", "bool")
 	SourceType string // operand's declared type — used by executor to pick rounding mode. M0097-0003.
+	Typmod     int64  // optional precision/scale modifier (e.g., 4 for ::timetz(4)); 0 means no typmod.
 }
 
 func (e *CastExpr) Pos() int { return e.pos }

@@ -190,7 +190,30 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 			}
 		}
-		return evalCastTyped(v, x.TargetType, x.SourceType, x.Pos())
+		result, err := evalCastTyped(v, x.TargetType, x.SourceType, x.Pos())
+		if err != nil {
+			return Datum{}, err
+		}
+		// Apply typmod precision for time/timetz casts (e.g., ::timetz(4)).
+		// PostgreSQL truncates fractional seconds to the specified precision.
+		if x.Typmod > 0 && result.Kind == KindTime {
+			switch x.TargetType {
+			case "time", "timetz", "time with time zone":
+				prec := x.Typmod
+				if prec > 6 {
+					prec = 6 // PostgreSQL max precision for time types
+				}
+				t := result.TimeValue()
+				ns := int64(t.Nanosecond())
+				factor := int64(1)
+				for i := int64(0); i < 6-prec; i++ {
+					factor *= 10
+				}
+				ns = (ns / (factor * 1000)) * (factor * 1000)
+				result = NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), int(ns), t.Location()))
+			}
+		}
+		return result, nil
 	case *planner.BinaryOp:
 		left, err := evalExprSlot(x.Left, slot, ctx)
 		if err != nil {
@@ -4574,8 +4597,20 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NewStringDatum(ctx.Now.Format("Mon Jan 02 15:04:05.000000 2006 UTC")), nil
 	case "localtime":
 		// Returns time-of-day anchored at epoch (same storage convention as current_time).
+		// Accepts optional precision arg: localtime(N) truncates microseconds.
 		t := ctx.Now.UTC()
-		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
+		ns := t.Nanosecond()
+		if len(x.Args) > 0 {
+			prec, err := evalExpr(x.Args[0], row, ctx)
+			if err == nil && prec.Kind == KindInt && prec.Int < 6 {
+				factor := int64(1)
+				for i := int64(0); i < 6-prec.Int; i++ {
+					factor *= 10
+				}
+				ns = (ns / (int(factor) * 1000)) * (int(factor) * 1000)
+			}
+		}
+		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), ns, time.UTC)), nil
 	case "localtimestamp":
 		return NewTimeDatum(ctx.Now), nil
 	case "pg_is_in_recovery":

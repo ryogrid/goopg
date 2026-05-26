@@ -610,7 +610,7 @@ func cloneExprReplacingOuter(e Expr, replace map[*OuterColumnRef]*ColumnRef) Exp
 		}
 		return &cl
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: cloneExprReplacingOuter(x.Operand, replace), TargetType: x.TargetType, SourceType: x.SourceType}
+		return &CastExpr{pos: x.Pos(), Operand: cloneExprReplacingOuter(x.Operand, replace), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
 	case *ExtractExpr:
 		cl := *x
 		cl.Source = cloneExprReplacingOuter(x.Source, replace)
@@ -676,7 +676,7 @@ func cloneExprSubstituteAggIdx0(e Expr, aggColRef *ColumnRef) Expr {
 		}
 		return &cl
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: cloneExprSubstituteAggIdx0(x.Operand, aggColRef), TargetType: x.TargetType, SourceType: x.SourceType}
+		return &CastExpr{pos: x.Pos(), Operand: cloneExprSubstituteAggIdx0(x.Operand, aggColRef), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
 	case *ExtractExpr:
 		cl := *x
 		cl.Source = cloneExprSubstituteAggIdx0(x.Source, aggColRef)
