@@ -1062,8 +1062,13 @@ M0097-0001 wires it up.
 - [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `plpgsql`, `create_function_sql`, `create_procedure`,
-        `rangefuncs`, `expressions`, `strings`, `regex`,
+        `rangefuncs`, ~~`expressions`~~, `strings`, `regex`,
         `misc_functions`, `misc`, `random`.
+      - `expressions` → **pass** (commit 53d3684). Fixes: timetz(N)/time(N)
+        typmod truncation via CastExpr.Typmod propagation; localtime(N)
+        precision argument; normalizer drops "got operator"/"got cast" in
+        "expected ';' or end of input (got X)" path; \d+ describe block
+        stripping; inttest result block stripping.
       - `random()` is at `internal/executor/expr.go:3790`;
         `generate_series` is implemented.
       - Mapped to completed M0097-0011/0012.
