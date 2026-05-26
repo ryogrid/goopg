@@ -571,6 +571,9 @@ type AggregateCall struct {
 	Type     catalog.Type
 	// Filter is the resolved FILTER (WHERE ...) predicate. M0097-0007.
 	Filter Expr
+	// OrderBy is the ORDER BY clause inside the aggregate call, e.g.
+	// array_agg(x ORDER BY y). Only used for ordering-sensitive aggregates.
+	OrderBy []SortKey
 }
 
 func (a AggregateCall) Pos() int { return a.pos }

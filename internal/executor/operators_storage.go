@@ -2860,7 +2860,8 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		if err != nil || key == nil {
 			continue
 		}
-		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, pos); raiseErr != nil {
+		detail := buildUniqueConstraintDetail(idx, cols, row)
+		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
 			return raiseErr
 		}
 	}
@@ -2876,7 +2877,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 //
 // Mirrors upstream heap_check_unique's WaitForLockersMultiple path that
 // produces the <waiting ...> interleaving seen in read-write-unique.spec.
-func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTree, key []byte, idxName string, pos int) error {
+func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTree, key []byte, idxName, detail string, pos int) error {
 	var inflightXmin storage.TransactionID
 	var liveConflict bool
 
@@ -2944,9 +2945,31 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTre
 			Code:    "23505",
 			Pos:     pos,
 			Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idxName),
+			Detail:  detail,
 		}
 	}
 	return nil
+}
+
+// buildUniqueConstraintDetail builds the DETAIL string for a 23505 error:
+// "Key (col1, col2, ...)=(val1, val2, ...) already exists."
+func buildUniqueConstraintDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
+	colNames := make([]string, 0, len(idx.Columns))
+	colVals := make([]string, 0, len(idx.Columns))
+	for _, idxCol := range idx.Columns {
+		colNames = append(colNames, idxCol)
+		val := ""
+		for i, col := range cols {
+			if col.Name == idxCol && i < len(row) {
+				val = row[i].Format()
+				break
+			}
+		}
+		colVals = append(colVals, val)
+	}
+	return fmt.Sprintf("Key (%s)=(%s) already exists.",
+		strings.Join(colNames, ", "),
+		strings.Join(colVals, ", "))
 }
 
 // isLiveForUniqueCheck decides whether a tuple with the given xmin/xmax

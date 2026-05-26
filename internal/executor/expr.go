@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -3257,17 +3258,22 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NewStringDatum(u), nil
 	case "uuidv7":
-		ts := ctx.Now
+		var uuidV7Ns int64
 		if len(x.Args) == 1 {
 			iv, ivErr := evalExpr(x.Args[0], row, ctx)
 			if ivErr != nil {
 				return NullDatum, ivErr
 			}
 			if iv.Kind == KindInterval {
-				ts = addTimeInterval(NewTimeDatum(ts), iv, false).TimeValue()
+				ts := addTimeInterval(NewTimeDatum(ctx.Now), iv, false).TimeValue()
+				uuidV7Ns = ts.UnixNano()
+			} else {
+				uuidV7Ns = uuidV7RealTimeNs()
 			}
+		} else {
+			uuidV7Ns = uuidV7RealTimeNs()
 		}
-		u, genErr := genUUIDv7(ts)
+		u, genErr := genUUIDv7(uuidV7Ns)
 		if genErr != nil {
 			return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: "uuidv7: " + genErr.Error()}
 		}
@@ -5707,9 +5713,34 @@ func genUUIDv4() (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }
 
-// genUUIDv7 generates a UUIDv7 with millisecond-precision timestamp from ts.
-func genUUIDv7(ts time.Time) (string, error) {
-	ms := ts.UnixMilli()
+// uuidV7LastNs is a process-wide monotonic clock for UUIDv7 generation,
+// mirroring PostgreSQL's per-backend get_real_time_ns_ascending().
+var (
+	uuidV7Mu     sync.Mutex
+	uuidV7LastNs int64
+)
+
+// uuidV7RealTimeNs returns a nanosecond timestamp that is guaranteed to
+// advance by at least submsMinimalStepNs on every call.  This matches PG's
+// get_real_time_ns_ascending(): if wall-clock hasn't advanced enough, we
+// bump the virtual ns forward so that consecutive UUIDs are monotonic.
+func uuidV7RealTimeNs() int64 {
+	const submsMinimalStepNs = (1_000_000/4096 + 1) // 245 ns, matches PG SUBMS_MINIMAL_STEP_NS
+	uuidV7Mu.Lock()
+	defer uuidV7Mu.Unlock()
+	ns := time.Now().UnixNano()
+	if uuidV7LastNs+submsMinimalStepNs >= ns {
+		ns = uuidV7LastNs + submsMinimalStepNs
+	}
+	uuidV7LastNs = ns
+	return ns
+}
+
+// genUUIDv7 generates a UUIDv7 from the given nanosecond timestamp.
+// rand_a (bytes 6-7) carries 12 bits of sub-ms precision (RFC 9562 Method 3).
+func genUUIDv7(ns int64) (string, error) {
+	ms := ns / 1_000_000
+	subNs := ns % 1_000_000 // nanoseconds within the millisecond (0..999999)
 	var b [16]byte
 	b[0] = byte(ms >> 40)
 	b[1] = byte(ms >> 32)
@@ -5717,10 +5748,14 @@ func genUUIDv7(ts time.Time) (string, error) {
 	b[3] = byte(ms >> 16)
 	b[4] = byte(ms >> 8)
 	b[5] = byte(ms)
-	if _, err := rand.Read(b[6:]); err != nil {
+	// 12-bit sub-ms precision in rand_a field, matching PG's generate_uuidv7
+	subMsPrec := (subNs * 4096) / 1_000_000
+	b[6] = byte(subMsPrec >> 8)
+	b[7] = byte(subMsPrec)
+	if _, err := rand.Read(b[8:]); err != nil {
 		return "", err
 	}
-	b[6] = (b[6] & 0x0F) | 0x70
-	b[8] = (b[8] & 0x3F) | 0x80
+	b[6] = (b[6] & 0x0F) | 0x70 // version 7
+	b[8] = (b[8] & 0x3F) | 0x80 // variant
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
 }

@@ -838,6 +838,9 @@ type aggRuntime struct {
 	// pg_get_publication_tables. M0103-0008 probe-survival.
 	arrayElems    []string
 	arrayElemNull []bool
+	// arrayElemKeys stores ORDER BY key values for array_agg(x ORDER BY y).
+	// Each entry corresponds to arrayElems[i]; nil when no ORDER BY.
+	arrayElemKeys [][]Datum
 }
 
 func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
@@ -1121,8 +1124,8 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 			st.strResult += "," + sv
 		}
 	case "array_agg":
-		// array_agg(expr) — accumulate per-row elements. NULLs are
-		// permitted as array elements upstream, but the IsNull early-
+		// array_agg(expr [ORDER BY sort_list]) — accumulate per-row elements.
+		// NULLs are permitted as array elements upstream, but the IsNull early-
 		// return above already skipped them; that matches goopg's
 		// existing aggregate convention (count/sum/etc. all skip NULL
 		// inputs) and is sufficient for the M0103-0008 probe query
@@ -1134,6 +1137,18 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 		// would print them.
 		st.arrayElems = append(st.arrayElems, arg.Format())
 		st.arrayElemNull = append(st.arrayElemNull, false)
+		// Evaluate ORDER BY expressions for later sorting in finishAgg.
+		if len(call.OrderBy) > 0 {
+			keys := make([]Datum, 0, len(call.OrderBy))
+			for _, sk := range call.OrderBy {
+				kv, kerr := evalExprSlot(sk.Expr, slot, o.ctx)
+				if kerr != nil {
+					kv = NullDatum
+				}
+				keys = append(keys, kv.MaterializeArena())
+			}
+			st.arrayElemKeys = append(st.arrayElemKeys, keys)
+		}
 		st.hasValue = true
 	case "any_value":
 		// any_value(x) — return the first non-null value seen.
@@ -1200,6 +1215,40 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 	case "array_agg":
 		if !st.hasValue {
 			return NullDatum
+		}
+		// Sort elements by ORDER BY keys if present.
+		if len(st.arrayElemKeys) == len(st.arrayElems) && len(st.arrayElemKeys) > 0 {
+			// Build index slice and sort by keys.
+			idx := make([]int, len(st.arrayElems))
+			for i := range idx {
+				idx[i] = i
+			}
+			orderByDescs := make([]bool, len(call.OrderBy))
+			for i, sk := range call.OrderBy {
+				orderByDescs[i] = sk.Desc
+			}
+			sort.SliceStable(idx, func(a, b int) bool {
+				ka, kb := st.arrayElemKeys[idx[a]], st.arrayElemKeys[idx[b]]
+				for ki := range ka {
+					if ki >= len(kb) {
+						break
+					}
+					cmp, err := compareDatum(ka[ki], kb[ki], 0)
+					if err != nil || cmp == 0 {
+						continue
+					}
+					if ki < len(orderByDescs) && orderByDescs[ki] {
+						return cmp > 0
+					}
+					return cmp < 0
+				}
+				return false
+			})
+			sorted := make([]string, len(st.arrayElems))
+			for i, origIdx := range idx {
+				sorted[i] = st.arrayElems[origIdx]
+			}
+			return NewStringDatum(formatTextArray(sorted))
 		}
 		// NULL elements are not currently distinguished — applyAgg's
 		// IsNull early-return drops them. Suffices for the M0103-0008

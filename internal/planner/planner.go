@@ -3071,6 +3071,15 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 		// Extended aggregates (M0097-0007): accept but return null/stub type.
 		outType = catalog.Type{Name: "numeric"}
 	}
+	// Resolve ORDER BY inside the aggregate call (e.g. array_agg(x ORDER BY y)).
+	var orderByKeys []SortKey
+	for _, sb := range fc.OrderBy {
+		e, serr := resolveExpr(sb.Expr, inputCtx)
+		if serr != nil {
+			return AggregateCall{}, serr
+		}
+		orderByKeys = append(orderByKeys, SortKey{Expr: e, Desc: sb.Desc})
+	}
 	return AggregateCall{
 		pos:      fc.Pos(),
 		Name:     name,
@@ -3078,6 +3087,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 		Distinct: fc.Distinct,
 		Type:     outType,
 		Filter:   filterExpr,
+		OrderBy:  orderByKeys,
 	}, nil
 }
 

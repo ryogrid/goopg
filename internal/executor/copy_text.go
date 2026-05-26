@@ -515,5 +515,78 @@ func parseCopyTimestamp(s string) (time.Time, error) {
 			return ts.UTC(), nil
 		}
 	}
+	// Try verbose natural-language format used by PostgreSQL's datetime output
+	// e.g. "Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00".
+	if ts, err := parseFullTimestamp(s); err == nil {
+		return ts, nil
+	}
 	return time.Time{}, fmt.Errorf("invalid timestamp %q", s)
+}
+
+// parseFullTimestamp parses PostgreSQL verbose timestamp strings such as
+// "Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00".
+// Timezone offset follows ISO convention: +05:00 means UTC+5.
+func parseFullTimestamp(s string) (time.Time, error) {
+	// Strip optional leading day-of-week prefix "Monday, ".
+	if idx := strings.Index(s, ", "); idx > 0 && idx < 12 {
+		// Only strip if the text before the comma looks like a weekday name.
+		prefix := strings.TrimSpace(s[:idx])
+		weekdays := []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
+		for _, wd := range weekdays {
+			if strings.EqualFold(prefix, wd) {
+				s = strings.TrimSpace(s[idx+2:])
+				break
+			}
+		}
+	}
+	// Normalize timezone abbreviation+offset like "GMT+05:00" → "+05:00".
+	// GMT prefix is dropped; the +/-HH:MM offset is kept (ISO convention:
+	// +05:00 means UTC+5, consistent with PostgreSQL's timestamptz_in).
+	s = normalizeTimestampTZ(s)
+
+	// Try layouts for "Month D, YYYY H:MM:SS[.ff] AM/PM ±HH:MM" and variants.
+	layouts := []string{
+		"January 2, 2006 3:04:05.999 PM -07:00",
+		"January 2, 2006 3:04:05.99 PM -07:00",
+		"January 2, 2006 3:04:05.9 PM -07:00",
+		"January 2, 2006 3:04:05 PM -07:00",
+		"January 2, 2006 15:04:05.999 -07:00",
+		"January 2, 2006 15:04:05 -07:00",
+		"January 2, 2006 3:04:05.999 PM",
+		"January 2, 2006 3:04:05 PM",
+		"January 2, 2006 15:04:05.999",
+		"January 2, 2006 15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("parseFullTimestamp: cannot parse %q", s)
+}
+
+// normalizeTimestampTZ converts POSIX-style timezone names like "GMT+05:00" or
+// "UTC-08:00" into ISO-style numeric offsets that Go's time.Parse understands.
+// In POSIX convention, GMT+H means UTC-H (sign is inverted vs ISO 8601), so we
+// flip the sign when stripping the prefix.  A bare "GMT"/"UTC" maps to "+00:00".
+func normalizeTimestampTZ(s string) string {
+	for _, prefix := range []string{"GMT", "UTC"} {
+		upper := strings.ToUpper(s)
+		if idx := strings.Index(upper, prefix); idx >= 0 {
+			after := s[idx+len(prefix):]
+			if len(after) > 0 && (after[0] == '+' || after[0] == '-') {
+				// Flip sign: POSIX "GMT+5" = ISO "-05:00"
+				flipped := "-"
+				if after[0] == '-' {
+					flipped = "+"
+				}
+				s = s[:idx] + flipped + after[1:]
+				return strings.TrimSpace(s)
+			} else if len(after) == 0 || after[0] == ' ' {
+				s = s[:idx] + "+00:00" + after
+				return strings.TrimSpace(s)
+			}
+		}
+	}
+	return s
 }

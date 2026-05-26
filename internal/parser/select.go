@@ -2163,6 +2163,21 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 		if p.acceptSymbol(",") {
 			continue
 		}
+		// ORDER BY inside aggregate: func(expr ORDER BY sort_list)
+		if p.acceptKeyword(KwOrder) {
+			if !p.acceptKeyword(KwBy) {
+				return nil, p.errAtCur("expected BY after ORDER")
+			}
+			ob, oerr := p.parseSortList()
+			if oerr != nil {
+				return nil, oerr
+			}
+			fc.OrderBy = ob
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')'")
+			}
+			return p.maybeWindowTail(fc)
+		}
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ',' or ')'")
 		}

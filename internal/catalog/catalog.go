@@ -898,7 +898,7 @@ func (c *InMemory) registerSystemTables() {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		out := make([][]string, 0, len(c.tables))
+		out := make([][]string, 0, len(c.tables)+len(c.indexes))
 		for _, k := range keys {
 			t := c.tables[k]
 			if t.Virtual {
@@ -927,6 +927,27 @@ func (c *InMemory) registerSystemTables() {
 				populated,                    // relispopulated
 				strconv.Itoa(len(t.Columns)), // relnatts: number of user columns
 				"d",                          // relreplident: REPLICA_IDENTITY_DEFAULT
+			})
+		}
+		// Emit index rows (relkind='i') so pg_class can be used to count indexes.
+		idxKeys := make([]string, 0, len(c.indexes))
+		for k := range c.indexes {
+			idxKeys = append(idxKeys, k)
+		}
+		sort.Strings(idxKeys)
+		for _, k := range idxKeys {
+			idx := c.indexes[k]
+			out = append(out, []string{
+				strconv.Itoa(int(idx.OID)), // oid
+				idx.Name,                   // relname
+				"i",                        // relkind = index
+				"2200",                     // relnamespace
+				"p",                        // relpersistence
+				"0",                        // reltoastrelid
+				"0",                        // relpages
+				"t",                        // relispopulated
+				"0",                        // relnatts
+				"n",                        // relreplident: not applicable for indexes
 			})
 		}
 		return out
