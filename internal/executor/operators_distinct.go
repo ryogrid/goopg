@@ -70,3 +70,59 @@ func (o *distinctOp) Next() (TupleSlot, error) {
 }
 
 func (o *distinctOp) Close() error { return o.child.Close() }
+
+// distinctOnOp implements SELECT DISTINCT ON (key,...) by reading sorted input
+// and emitting only the first row per distinct key combination.
+// The child must be pre-sorted so rows with equal keys are contiguous.
+type distinctOnOp struct {
+	plan    *planner.DistinctOn
+	child   Operator
+	ctx     *Context
+	schema  planner.Schema
+	prevKey string
+	started bool
+}
+
+func newDistinctOnOp(p *planner.DistinctOn, child Operator) *distinctOnOp {
+	return &distinctOnOp{plan: p, child: child, schema: p.Output()}
+}
+
+func (o *distinctOnOp) Schema() planner.Schema { return o.schema }
+
+func (o *distinctOnOp) Open(ctx *Context) error {
+	o.ctx = ctx
+	o.started = false
+	o.prevKey = ""
+	return o.child.Open(ctx)
+}
+
+func (o *distinctOnOp) Next() (TupleSlot, error) {
+	keyCols := o.plan.KeyCols
+	for {
+		slot, err := o.child.Next()
+		if err != nil {
+			return nil, err
+		}
+		if slot == nil {
+			continue
+		}
+		row := slot.Row()
+		// Build a key from the DISTINCT ON columns.
+		var key string
+		for _, idx := range keyCols {
+			if idx >= 0 && idx < len(row) {
+				key += datumKey(row[idx]) + "\x00"
+			}
+		}
+		if !o.started || key != o.prevKey {
+			o.started = true
+			o.prevKey = key
+			return SlotFromRow(o.schema, cloneRow(row)), nil
+		}
+		// Duplicate key: skip this row.
+	}
+}
+
+func (o *distinctOnOp) Close() error { return o.child.Close() }
+
+

@@ -1248,6 +1248,21 @@ type Distinct struct {
 func (n *Distinct) Pos() int       { return n.pos }
 func (n *Distinct) Output() Schema { return n.schema }
 
+// DistinctOn implements SELECT DISTINCT ON (expr,...) semantics: the child
+// must already be sorted by the DISTINCT ON key columns (as a prefix);
+// this node emits only the first row per distinct combination of key values.
+// KeyCols holds the output column indices that form the DISTINCT ON key.
+// M0097-0005.
+type DistinctOn struct {
+	pos     int
+	Child   Node
+	KeyCols []int // indices into the output schema for DISTINCT ON keys
+	schema  Schema
+}
+
+func (n *DistinctOn) Pos() int       { return n.pos }
+func (n *DistinctOn) Output() Schema { return n.schema }
+
 // RecursiveUnion implements a WITH RECURSIVE fixpoint (M0016-0004).
 // Anchor is the non-recursive initial SELECT; Recursive is the
 // recursive member referencing the CTE name via WorkTableScans.

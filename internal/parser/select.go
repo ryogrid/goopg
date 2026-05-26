@@ -960,12 +960,63 @@ func (p *parser) parseSortItem() (SortBy, error) {
 		return SortBy{}, err
 	}
 	sb := SortBy{pos: pos, Expr: e}
-	if p.acceptKeyword(KwDesc) {
+	if p.acceptKeyword(KwUsing) {
+		// ORDER BY expr USING operator — parse the operator name and infer direction.
+		// Operators ending in ">" or the name "gt" substring → DESC; else ASC.
+		op := p.parseSortUsingOperator()
+		sb.UsingOp = op
+		sb.Desc = sortUsingIsDesc(op)
+	} else if p.acceptKeyword(KwDesc) {
 		sb.Desc = true
 	} else {
 		_ = p.acceptKeyword(KwAsc)
 	}
 	return sb, nil
+}
+
+// parseSortUsingOperator consumes the operator (or identifier/qualified name) that
+// follows ORDER BY expr USING.  Returns the raw operator string.
+func (p *parser) parseSortUsingOperator() string {
+	cur := p.cur()
+	switch cur.Kind {
+	case TokenOperator, TokenSymbol:
+		p.advance()
+		return cur.Value
+	case TokenIdent:
+		// Could be a simple name (varchar_lt) or schema-qualified (pg_catalog.int4lt).
+		name := cur.Value
+		p.advance()
+		for p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+			p.advance()
+			if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+				name += "." + p.cur().Value
+				p.advance()
+			}
+		}
+		return name
+	case TokenKeyword:
+		// Some operators overlap with keywords; consume the keyword token as a name.
+		name := string(cur.Keyword)
+		p.advance()
+		return name
+	}
+	return ""
+}
+
+// sortUsingIsDesc returns true when op is a "greater-than"-style operator,
+// meaning ORDER BY x USING op should sort descending.
+func sortUsingIsDesc(op string) bool {
+	// Symbol operators: > or >=
+	if op == ">" || op == ">=" {
+		return true
+	}
+	// Named operators: anything containing "gt" as a suffix or standalone.
+	lower := strings.ToLower(op)
+	// Strip schema prefix (pg_catalog.int4gt → int4gt).
+	if idx := strings.LastIndex(lower, "."); idx >= 0 {
+		lower = lower[idx+1:]
+	}
+	return strings.HasSuffix(lower, "gt") || strings.HasSuffix(lower, "greater") || strings.Contains(lower, "_gt_")
 }
 
 // --- Expression parsing (Pratt / precedence climbing) ---------------

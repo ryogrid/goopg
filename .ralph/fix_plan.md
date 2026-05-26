@@ -1342,7 +1342,7 @@ M0097-0001 wires it up.
       - Mapped to completed M0097-0016.
       - DoD: same as M0097-0020.
 
-- [ ] **M0097-0029 — Port extended-type / dbsize regress tests**
+- [x] **M0097-0029 — Port extended-type / dbsize regress tests**
       - Summary: Make these 22 tests reach `pass`:
         `arrays`, `json`, `jsonb`, `jsonb_jsonpath`, `jsonpath`,
         `enum`, `domain`, `rowtypes`, `uuid`, `numeric`,
@@ -1390,6 +1390,19 @@ M0097-0001 wires it up.
         uuid diff: 84 → 20.  Remaining: pg_class relkind='i' count (catalog), 
         array_agg ORDER BY (not impl), uuid_extract_timestamp timezone comparison 
         (GMT+05:00 parse mismatch), DETAIL for unique violations.
+      - **COMPLETE 2026-05-26 (M0097-0029 — uuid 20 → 0, fully passes):**
+        Six final fixes: (1) unique-constraint DETAIL "Key (col)=(val) already
+        exists." in `operators_storage.go`; (2) pg_class VirtualRows now emits
+        index rows (relkind='i') from catalog.indexes; (3) array_agg ORDER BY:
+        parser ORDER BY inside func-call, planner AggregateCall.OrderBy field,
+        executor sort in finishAgg; (4) uuidv7() uses real wall-clock time
+        (`time.Now()`) + monotonic ascending counter matching PG's
+        `get_real_time_ns_ascending()` (SUBMS_MINIMAL_STEP_NS=245ns, global
+        mutex-protected uuidV7LastNs); (5) genUUIDv7 uses 12-bit sub-ms
+        nanosecond precision in rand_a field (RFC 9562 Method 3); (6)
+        normalizeTimestampTZ flips sign for POSIX GMT+H convention
+        (GMT+05:00 → -05:00 = UTC-5, matching PG's timestamptz_in semantics).
+        **uuid: 0 diff lines, PASS. Commit: 0b50376.**
 
 - [ ] **M0097-0031 — Port GUC regress test**
       - Summary: Make `guc` reach `pass`.

@@ -876,24 +876,88 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	}
 	// Collapse all-constant sub-expressions in the final plan tree.
 	foldPlanConstants(out)
-	// DISTINCT ON (expr [, ...]): resolve each expression to surface unknown-column
-	// errors (e.g. "column foobar does not exist"). We don't implement the full
-	// DISTINCT ON semantics (ordered deduplication per expression prefix); we
-	// fall back to plain DISTINCT after validation. M0097-regress.
+	// DISTINCT ON (expr [, ...]): implement ordered deduplication.
+	// M0097-0005.
 	if len(s.DistinctOn) > 0 {
-		for _, dexpr := range s.DistinctOn {
+		// Resolve each DISTINCT ON expression. Apply ordinal/alias substitution
+		// (same as ORDER BY) so DISTINCT ON (1) works like ORDER BY 1.
+		resolvedDistinct := make([]Expr, len(s.DistinctOn))
+		for i, dexpr := range s.DistinctOn {
+			dexpr = resolveOrderBySubstitution(dexpr, s.Targets)
+			var re Expr
 			var resolveErr error
 			if win != nil {
-				_, resolveErr = resolveExprAfterWindow(dexpr, win)
+				re, resolveErr = resolveExprAfterWindow(dexpr, win)
 			} else if agg == nil {
-				_, resolveErr = resolveExpr(dexpr, ctx)
+				re, resolveErr = resolveExpr(dexpr, ctx)
 			} else {
-				_, resolveErr = resolveExprAfterAggregate(dexpr, agg)
+				re, resolveErr = resolveExprAfterAggregate(dexpr, agg)
 			}
 			if resolveErr != nil {
 				return nil, resolveErr
 			}
+			resolvedDistinct[i] = re
 		}
+		// Validate: for each DISTINCT ON key at position i where ORDER BY also
+		// has a key at position i, the two must match. If ORDER BY is shorter
+		// than DISTINCT ON, the missing positions are OK — we add an implicit
+		// Sort below. Only error on an explicit positional mismatch.
+		for i, re := range resolvedDistinct {
+			if i >= len(s.OrderBy) {
+				break
+			}
+			obExpr := resolveOrderBySubstitution(s.OrderBy[i].Expr, s.Targets)
+			var obResolved Expr
+			var obErr error
+			if win != nil {
+				obResolved, obErr = resolveExprAfterWindow(obExpr, win)
+			} else if agg == nil {
+				obResolved, obErr = resolveExpr(obExpr, ctx)
+			} else {
+				obResolved, obErr = resolveExprAfterAggregate(obExpr, agg)
+			}
+			if obErr != nil {
+				return nil, &PlanError{Pos: s.Pos(), Code: "42P10",
+					Message: "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"}
+			}
+			if !exprEqual(re, obResolved) {
+				return nil, &PlanError{Pos: s.Pos(), Code: "42P10",
+					Message: "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"}
+			}
+		}
+		// Map DISTINCT ON expressions to output column indices.
+		outSchema := out.Output()
+		keyCols := make([]int, len(resolvedDistinct))
+		for i, re := range resolvedDistinct {
+			idx := findExprInSchema(re, outSchema, proj)
+			if idx < 0 {
+				idx = findExprInTargets(re, targets)
+			}
+			if idx < 0 {
+				idx = i // last resort: use positional index
+			}
+			keyCols[i] = idx
+		}
+		// If ORDER BY is shorter than DISTINCT ON, add an implicit Sort on the
+		// full set of DISTINCT ON key columns so the distinctOnOp sees adjacent
+		// rows for each key group. (PostgreSQL implicitly extends ORDER BY with
+		// the missing DISTINCT ON keys.)
+		if len(s.OrderBy) < len(resolvedDistinct) {
+			sortKeys := make([]SortKey, len(resolvedDistinct))
+			for i, col := range keyCols {
+				var desc bool
+				if i < len(s.OrderBy) {
+					desc = s.OrderBy[i].Desc
+				}
+				outCol := outSchema[col]
+				sortKeys[i] = SortKey{
+					Expr: &ColumnRef{Index: col, Name: outCol.Name, Type: outCol.Type},
+					Desc: desc,
+				}
+			}
+			out = &Sort{pos: s.Pos(), Child: out, Keys: sortKeys}
+		}
+		out = &DistinctOn{pos: s.Pos(), Child: out, KeyCols: keyCols, schema: out.Output()}
 	}
 	// SELECT DISTINCT: wrap the full plan with a Distinct node that deduplicates
 	// on the projected output. Applied after sorting so ORDER BY is respected.
@@ -5309,4 +5373,85 @@ func isColumnFunctionallyDetermined(col *ColumnRef, agg *aggregateSurface) bool 
 		}
 	}
 	return false
+}
+
+// exprEqual reports whether two resolved planner Exprs are structurally equal
+// for the purpose of DISTINCT ON / ORDER BY matching.
+func exprEqual(a, b Expr) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	switch av := a.(type) {
+	case *ColumnRef:
+		if bv, ok := b.(*ColumnRef); ok {
+			return av.Index == bv.Index
+		}
+	case *IntegerConst:
+		if bv, ok := b.(*IntegerConst); ok {
+			return av.Value == bv.Value
+		}
+	case *StringConst:
+		if bv, ok := b.(*StringConst); ok {
+			return av.Value == bv.Value
+		}
+	case *FuncCall:
+		bv, ok := b.(*FuncCall)
+		if !ok || av.Name != bv.Name || len(av.Args) != len(bv.Args) {
+			return false
+		}
+		for i := range av.Args {
+			if !exprEqual(av.Args[i], bv.Args[i]) {
+				return false
+			}
+		}
+		return true
+	case *BinaryOp:
+		bv, ok := b.(*BinaryOp)
+		if !ok || av.Op != bv.Op {
+			return false
+		}
+		return exprEqual(av.Left, bv.Left) && exprEqual(av.Right, bv.Right)
+	}
+	// Fallback: compare text representation (pointer-safe only for primitives).
+	return fmt.Sprintf("%T%v", a, a) == fmt.Sprintf("%T%v", b, b)
+}
+
+// findExprInSchema finds the output column index in outSchema that corresponds
+// to the resolved expression re.  proj is the Project node (used to match
+// ColumnRef indices from the projection targets).
+func findExprInSchema(re Expr, outSchema Schema, proj Node) int {
+	cr, ok := re.(*ColumnRef)
+	if !ok {
+		return -1
+	}
+	p, ok := proj.(*Project)
+	if !ok {
+		// Maybe wrapped in IndexOnlyScan or similar — walk one level.
+		type childNode interface{ Child() Node }
+		if cn, ok2 := proj.(interface{ GetChild() Node }); ok2 {
+			return findExprInSchema(re, outSchema, cn.GetChild())
+		}
+		return -1
+	}
+	for i, t := range p.Targets {
+		if tcr, ok2 := t.(*ColumnRef); ok2 && tcr.Index == cr.Index {
+			return i
+		}
+	}
+	return -1
+}
+
+// findExprInTargets finds the index of a resolved ColumnRef in the targets
+// slice (resolved Expr list from resolveTargets).
+func findExprInTargets(re Expr, targets []Expr) int {
+	cr, ok := re.(*ColumnRef)
+	if !ok {
+		return -1
+	}
+	for i, t := range targets {
+		if tcr, ok2 := t.(*ColumnRef); ok2 && tcr.Index == cr.Index {
+			return i
+		}
+	}
+	return -1
 }
