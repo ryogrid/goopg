@@ -3187,6 +3187,52 @@ Operational note (2026-05-22):
       - DoD: `go test -race ./internal/executor/ ./internal/storage/` PASS
         (except pre-existing flaky `TestAnalyzeRespectsStatsTarget`).
 
+### TPC-H 22-query verification (2026-05-26)
+
+All 22 TPC-H SF=1 power-test queries passed on branch `align-data-structure-with-pg`
+at commit `26cf58d` (TOAST marker fix) + `40ed3a3` (JSON catalog removal).
+A full data-directory reset was required because M0111-0002 S2 changed the
+on-disk heap-tuple format and the TOAST marker byte changed from `0x1B` to `0x01`.
+
+**Root cause of prior failure (Q11 `column "inf" does not exist`):**
+`0x1B = (13<<1)|1` is a valid short-varlena header for any 12-char string.
+HammerDB `gen_phone` always produces 12-char phone numbers, so every `s_phone`
+and `c_phone` column value was misidentified as a TOAST pointer. `DetoastRow`
+failed silently; all supplier (10k rows) and customer (150k rows) tuples were
+dropped by the seqscan. Fixed by switching to `0x01` (VARATT_IS_1B_E), which
+is an impossible data-varlena header.
+
+**Per-query results (HammerDB execution order):**
+
+| Order | Query | Time (s) |
+|------:|------:|---------:|
+|  1 | Q14 |  20.728 |
+|  2 | Q2  |  59.078 |
+|  3 | Q9  |  56.059 |
+|  4 | Q20 |  19.451 |
+|  5 | Q6  |  13.116 |
+|  6 | Q17 |  45.209 |
+|  7 | Q18 |  36.773 |
+|  8 | Q8  | 171.430 |
+|  9 | Q21 | 295.057 |
+| 10 | Q13 |  84.864 |
+| 11 | Q3  |  16.789 |
+| 12 | Q22 |  84.918 |
+| 13 | Q16 |   2.904 |
+| 14 | Q4  | 217.190 |
+| 15 | Q11 |   2.409 |
+| 16 | Q15 |  36.701 |
+| 17 | Q1  |  20.036 |
+| 18 | Q10 |  18.524 |
+| 19 | Q19 |  24.503 |
+| 20 | Q5  |  18.603 |
+| 21 | Q7  | 122.899 |
+| 22 | Q12 | 100.535 |
+
+**Total elapsed:** 1469 s (~24.5 min)  
+**Geometric mean:** 36.30 s  
+**Full report:** `bench/tpch/logs/tpch_power_test_20260526.md`
+
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 
 Operational note (2026-05-22):
