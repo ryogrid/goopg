@@ -5122,13 +5122,6 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	if !ok {
 		return proj
 	}
-	// M0053-0001: composite indexes are now reachable via IndexScan
-	// (leading-column probe), but the IndexOnlyScan executor cannot
-	// decode multi-column keys back to row Datums yet. Skip promotion
-	// for composite indexes so the row is fetched from the heap path.
-	if len(idxScan.Index.Columns) != 1 {
-		return proj
-	}
 	// Check that every projected column is in the index key.
 	idxColSet := make(map[string]bool, len(idxScan.Index.Columns))
 	for _, c := range idxScan.Index.Columns {

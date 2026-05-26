@@ -1867,13 +1867,20 @@ func isFloat8Type(name string) bool {
 	}
 }
 
+func isTextType(name string) bool {
+	return strings.ToLower(name) == "text"
+}
+
+func isNameType(name string) bool {
+	return strings.ToLower(name) == "name"
+}
+
 // isSupportedBTreeKeyType lists the column types accepted by
 // createSingleColumnBTreeIndex. int4 is the original v0 path; int8
 // and numeric landed for HammerDB TPC-H compatibility. varchar landed
 // in M0044-0001; char in M0044-0002; timestamp in M0044-0003.
 func isSupportedBTreeKeyType(name string) bool {
-	switch strings.ToLower(name) {
-	case "text", "name":
+	if isTextType(name) || isNameType(name) {
 		return true
 	}
 	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||

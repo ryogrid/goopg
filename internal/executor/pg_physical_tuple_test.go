@@ -17,8 +17,8 @@ func TestSeqScanReadsPostgresPhysicalTuple(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	defer pool.Close()
 	defer mgr.Close()
+	defer pool.Close()
 
 	cat := catalog.NewInMemory()
 	tbl, err := cat.CreateTable(parser.ObjectName{Schema: "public", Name: "bench_log"}, []catalog.Column{

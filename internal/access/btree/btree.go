@@ -451,6 +451,44 @@ func EncodeFloat8(key float64) []byte {
 	return b[:]
 }
 
+// DecodeFloat8 inverts EncodeFloat8.
+func DecodeFloat8(b []byte) (float64, error) {
+	if len(b) < 8 {
+		return 0, fmt.Errorf("btree: float8 key truncated")
+	}
+	bits := binary.BigEndian.Uint64(b[:8])
+	if bits>>63 != 0 {
+		bits ^= 0x8000000000000000 // was positive float: undo sign-bit flip
+	} else {
+		bits = ^bits // was negative float: undo all-bits flip
+	}
+	return math.Float64frombits(bits), nil
+}
+
+// DecodeVarcharLen is like DecodeVarchar but also returns the number of bytes
+// consumed from b (including the 0x00 terminator). Used by the multi-column
+// index-only scan decoder to advance the key offset after variable-length fields.
+func DecodeVarcharLen(b []byte) ([]byte, int, error) {
+	// Find the unescaped 0x00 terminator.
+	n := 0
+	for i := 0; i < len(b); {
+		if b[i] == 0x01 {
+			i += 2
+			continue
+		}
+		if b[i] == 0x00 {
+			n = i + 1
+			break
+		}
+		i++
+	}
+	if n == 0 {
+		return nil, 0, fmt.Errorf("btree: varchar key missing 0x00 terminator")
+	}
+	decoded, err := DecodeVarchar(b[:n])
+	return decoded, n, err
+}
+
 // DecodeVarchar inverts EncodeVarchar: strips the 0x00 terminator and
 // unescapes 0x01-prefixed bytes. Used by index-only scan (M0046-0004)
 // to reconstruct string values from B-tree key bytes without a heap fetch.

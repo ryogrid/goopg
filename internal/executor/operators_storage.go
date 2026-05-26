@@ -722,6 +722,15 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				}
 				continue
 			}
+			// M0115-0004: lazily cache HeapXminCommitted in the on-page infomask
+			// after visibility is confirmed. Only cache when xmin was confirmed
+			// via the snapshot — NOT when visibility is due to the self-visible
+			// path (xmin == our own XID or sub-xact ancestor), because that
+			// tuple may still be rolled back via ROLLBACK TO SAVEPOINT.
+			needsXminHintBit := o.pinned != nil &&
+				tuple.Header.Infomask&storage.HeapXminCommitted == 0 &&
+				tuple.Header.Infomask&storage.HeapXminInvalid == 0 &&
+				!mvcc.IsSelfXID(tuple.Header.Xmin, o.ctx.Tx.XID, o.ctx.TxnMgr)
 			// CTE snapshot isolation: skip rows written by DML CTEs so the
 			// outer SELECT sees the pre-CTE state (PostgreSQL semantics).
 			if o.ctx.CTEWriteFence != nil {
@@ -784,6 +793,16 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			row = cloneRowOwned(row)
 			if o.pinned != nil {
 				o.pinned.RUnlock()
+			}
+			// M0115-0004: write HeapXminCommitted to the on-page infomask.
+			// Acquire WLock briefly; o.pinned pin prevents eviction between
+			// RUnlock and Lock. The write is not WAL-logged (re-derived on
+			// recovery from pg_xact).
+			if needsXminHintBit {
+				o.pinned.Lock()
+				storage.SetXminHintBit(o.activePage, o.curSlot-1, true)
+				o.pinned.Unlock()
+				o.ctx.Pool.MarkDirtyHintBit(o.pinned)
 			}
 			// M0092-0007: stack-aliased slot reused across
 			// Next() calls; matches the M0092-0002 contract

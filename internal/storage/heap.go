@@ -61,8 +61,10 @@ const (
 //     ExclLock) when MultiXact-aware multi-holder support
 //     lands. v0 only emits ExclLock.
 const (
-	HeapXmaxInvalid    uint16 = 0x0800
-	HeapXmaxCommitted  uint16 = 0x0400
+	HeapXminCommitted uint16 = 0x0100 // xmin is a committed transaction (cached hint)
+	HeapXminInvalid   uint16 = 0x0200 // xmin is invalid / rolled-back (cached hint)
+	HeapXmaxInvalid   uint16 = 0x0800
+	HeapXmaxCommitted uint16 = 0x0400
 	HeapXmaxLockOnly   uint16 = 0x0080
 	HeapXmaxKeyShrLock uint16 = 0x0010
 	HeapXmaxExclLock   uint16 = 0x0040
@@ -1078,7 +1080,7 @@ func PageStampHotOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockN
 	// Update infomask: clear lock-only bits (a delete supersedes any
 	// lingering row-lock), then set HeapHotUpdated.
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
-	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid
 	infomask |= HeapHotUpdated
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	// Advance pd_prune_xid (M0046-0002): the old HOT tuple is dead
@@ -1211,4 +1213,30 @@ func writeItemID(p Page, idx int, item ItemID) error {
 	}
 	binary.LittleEndian.PutUint32(p[off:off+itemIDSize], raw)
 	return nil
+}
+
+// heapTupleInfomaskOff is the byte offset of t_infomask within the on-page
+// heap tuple header. Layout: Xmin(4)+Xmax(4)+Xvac(4)+CTID(6)+Infomask2(2) = 20.
+const heapTupleInfomaskOff = 20
+
+// SetXminHintBit OR-s HeapXminCommitted (committed=true) or HeapXminInvalid
+// (committed=false) into the on-page infomask of the tuple at the given slot.
+// The caller must hold the page's content write lock.
+func SetXminHintBit(page Page, slot uint16, committed bool) {
+	item, err := PageGetItemID(page, slot)
+	if err != nil {
+		return
+	}
+	off := int(item.Offset) + heapTupleInfomaskOff
+	if off+2 > len(page) {
+		return
+	}
+	old := binary.LittleEndian.Uint16(page[off : off+2])
+	var bit uint16
+	if committed {
+		bit = HeapXminCommitted
+	} else {
+		bit = HeapXminInvalid
+	}
+	binary.LittleEndian.PutUint16(page[off:off+2], old|bit)
 }
