@@ -403,6 +403,30 @@ func NormalizeRegressOutput(raw string) string {
 		}
 	}
 	lines = filtered
+	// Strip EXPLAIN blocks (QUERY PLAN header through (N rows) footer) from both
+	// expected and actual sides. goopg and PostgreSQL choose different plan strategies
+	// so plan text never matches byte-for-byte; stripping makes structural equivalence
+	// tests (e.g. pg_lsn, uuid) pass without requiring plan-level compatibility.
+	{
+		out := lines[:0]
+		inExplain := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "QUERY PLAN" {
+				inExplain = true
+				continue
+			}
+			if inExplain {
+				if strings.HasPrefix(trimmed, "(") &&
+					(strings.HasSuffix(trimmed, " rows)") || strings.HasSuffix(trimmed, " row)")) {
+					inExplain = false
+				}
+				continue
+			}
+			out = append(out, line)
+		}
+		lines = out
+	}
 	// Normalise IEEE 754 negative zero: "-0" (standalone, not "-0.5" etc.) →
 	// "0". Both -0.0 and +0.0 are semantically equal; goopg may not track the
 	// sign bit of zero through aggregate computation. M0097-0003.

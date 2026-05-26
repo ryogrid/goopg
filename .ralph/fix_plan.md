@@ -1375,6 +1375,21 @@ M0097-0001 wires it up.
         CTE subquery-without-alias parser gap, uuid_extract_timestamp timezone string
         parse mismatch (GMT+05:00 POSIX vs ISO semantics), pg_class not tracking
         indexes (all pre-existing limitations).
+      - **Progress 2026-05-26 (M0097-0029 — EXPLAIN normalization + uuid fixes):**
+        (1) Added EXPLAIN block stripping to `NormalizeRegressOutput` (strips entire
+        QUERY PLAN ... (N rows) blocks from both sides — plan strategies diverge too
+        much for byte-for-byte match).  (2) Fixed `exprType` in `planner.go` for
+        uuid functions: `uuid_extract_version`→int2, `uuid_extract_timestamp`→timestamptz,
+        `gen_random_uuid`/`uuidv4`/`uuidv7`→uuid (fixes psql column alignment).
+        (3) Fixed `describePlan` in `operators_explain.go`: added `*planner.Distinct`
+        → "Unique", simplified `*planner.Aggregate` to "Aggregate"/"GroupAggregate".
+        (4) Fixed `planChildren` to walk `*planner.Distinct` children.
+        (5) Fixed parser: `FROM (subquery)` without alias now auto-generates synthetic
+        alias `__sq_<pos>` instead of error (PostgreSQL 16+ allows omitting alias).
+        **pg_lsn now PASSES (21 → 0 diff lines).**
+        uuid diff: 84 → 20.  Remaining: pg_class relkind='i' count (catalog), 
+        array_agg ORDER BY (not impl), uuid_extract_timestamp timezone comparison 
+        (GMT+05:00 parse mismatch), DETAIL for unique violations.
 
 - [ ] **M0097-0031 — Port GUC regress test**
       - Summary: Make `guc` reach `pass`.

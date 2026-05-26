@@ -544,11 +544,13 @@ func describePlan(n planner.Node) string {
 			return fmt.Sprintf("%s (%s, build=left)", algo, joinTypeName(p.Type))
 		}
 		return fmt.Sprintf("%s (%s)", algo, joinTypeName(p.Type))
+	case *planner.Distinct:
+		return "Unique"
 	case *planner.Aggregate:
 		if len(p.GroupExprs) == 0 {
-			return fmt.Sprintf("Aggregate (%d aggregates)", len(p.Aggs))
+			return "Aggregate"
 		}
-		return fmt.Sprintf("GroupAggregate (%d keys, %d aggregates)", len(p.GroupExprs), len(p.Aggs))
+		return fmt.Sprintf("GroupAggregate (%d keys)", len(p.GroupExprs))
 	case *planner.WindowAgg:
 		return fmt.Sprintf("WindowAgg (%d funcs)", len(p.Funcs))
 	case *planner.SeqScan:
@@ -648,6 +650,8 @@ func planChildren(n planner.Node) []planner.Node {
 	case *planner.Sort:
 		return []planner.Node{p.Child}
 	case *planner.Limit:
+		return []planner.Node{p.Child}
+	case *planner.Distinct:
 		return []planner.Node{p.Child}
 	case *planner.Aggregate:
 		return []planner.Node{p.Child}

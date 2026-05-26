@@ -35,11 +35,11 @@ prepared_xacts,132,failed
 drop_if_exists,130,failed
 advisory_lock,142,failed
 case,148,failed
-uuid,84,failed
+uuid,20,failed
 select_distinct_on,170,failed
 partition_info,185,failed
 timetz,209,failed
-pg_lsn,21,failed
+pg_lsn,0,pass
 misc,262,failed
 tidscan,295,failed
 temp,285,failed

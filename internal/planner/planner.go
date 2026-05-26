@@ -4531,6 +4531,12 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "numeric"}
 		case "power", "exp", "ln", "log", "sqrt":
 			return catalog.Type{Name: "float8"}
+		case "uuid_extract_version":
+			return catalog.Type{Name: "int2"}
+		case "uuid_extract_timestamp":
+			return catalog.Type{Name: "timestamptz"}
+		case "gen_random_uuid", "uuidv4", "uuidv7":
+			return catalog.Type{Name: "uuid"}
 		}
 		return catalog.Type{Name: "unknown"}
 	}

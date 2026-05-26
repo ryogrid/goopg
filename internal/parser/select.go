@@ -749,7 +749,10 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 			rv.Alias = identText(t)
 		}
 		if rv.Alias == "" {
-			return RangeVar{}, &SyntaxError{Pos: pos, Message: "subquery in FROM must have an alias"}
+			// PostgreSQL 16 allows omitting the alias for FROM subqueries when the
+			// subquery's columns are referenced directly (not by table-qualified name).
+			// Generate a synthetic alias so the planner can build a RangeVar node.
+			rv.Alias = fmt.Sprintf("__sq_%x", pos)
 		}
 		// Optional column-alias list: (SELECT …) AS t (col1, col2, …)
 		// Used by Q13-style derived tables that rename columns.
