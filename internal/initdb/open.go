@@ -3,7 +3,6 @@ package initdb
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,12 +20,6 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
-
-// CatalogSnapshotFile is the relative path inside the data
-// directory where the catalog snapshot lives. The file is JSON for
-// v0 — see internal/catalog/persist.go and
-// docs/design/0017-data-directory.md.
-const CatalogSnapshotFile = "global/pg_catalog.json"
 
 // pgEpoch2000 is PG's TimestampTz origin: 2000-01-01 00:00:00 UTC.
 // pgTimestampNowUsec returns the current wall-clock time as a
@@ -754,18 +747,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 		return nil
 	})
-	if err := loadCatalogSnapshot(abs, cat, txnMgr); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, err
-	}
 	// M0106-0013: advance the catalog OID counter to match pg_control's
 	// checkPointCopy.nextOid from the most recent checkpoint. This ensures
 	// the OID counter survives a crash (pg_control is durably updated at
-	// every checkpoint) even when pg_catalog.json is absent or stale.
-	// We take the max of the JSON-loaded value and the pg_control value
-	// so both sources contribute to a monotonically advancing counter.
+	// every checkpoint).
 	if pgCtrl, pce := control.ReadControlFile(abs); pce == nil && pgCtrl != nil {
 		cat.AdvanceNextOIDPast(pgCtrl.CheckPointCopyNextOid)
 		// M0106-0013: also advance txnMgr.NextXID from the checkpoint's
@@ -834,33 +819,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	if highClogXID := clog.HighestKnownXID(); highClogXID > 0 {
 		txnMgr.SetNextXID(highClogXID + 1)
 	}
-	// One-shot migration: if this is a legacy JSON-only cluster whose
-	// pg_class has no user-table rows, write all in-memory user tables to
-	// the pg_class/pg_attribute heap relfiles so future startups use the
-	// heap path (M0030-0004). Runs after loadCatalogSnapshot so the
-	// catalog is already populated from JSON; runs before
-	// loadSystemCatalogsIfPresent so system-catalog registration follows.
-	if err := maybeMigrateCatalogToHeap(mgr, cat); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: catalog migration: %w", err)
-	}
 	// Register system catalog heap tables (pg_type, pg_attribute) if their
-	// relfiles exist.  Must run after loadCatalogSnapshot / Restore so the
-	// registration survives the catalog reset that Restore() performs.
-	// Safe to skip on old clusters without the M0030-0001 relfiles.
+	// relfiles exist. Safe to skip on old clusters without the M0030-0001 relfiles.
 	if err := loadSystemCatalogsIfPresent(abs, cat); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: system catalog load: %w", err)
 	}
-	// Supplement the catalog with user tables found in the pg_class/pg_attribute
-	// heap files (M0030-0003). If a table was created after the last JSON
-	// snapshot (e.g. crash before SaveCatalog), this path recovers it from the
-	// WAL-replayed heap pages. Idempotent: tables already loaded from JSON are
-	// skipped. Safe on old clusters — skips if pg_class relfile is absent.
+	// Load user tables from the pg_class/pg_attribute heap files (M0030-0003).
+	// This is the sole catalog recovery path: DDL writes rows here via
+	// syncTableToCatalogHeap, and WAL replay restores them after a crash.
+	// Safe on old clusters — skips if pg_class relfile is absent.
 	// The clog is passed to filter rows whose xmin was never committed (M0030-0007).
 	if err := loadUserTablesFromHeap(mgr, cat, clog); err != nil {
 		_ = pool.Close()
@@ -871,11 +841,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// M0106-0013: after loading user tables from heap, advance the OID
 	// counter past every OID seen in the heap pages. This ensures the
-	// counter never re-uses an OID already present on disk even when
-	// pg_catalog.json is absent (e.g. after a crash before SaveCatalog
-	// ran). The pg_control read earlier covers the checkpoint-based
-	// advance; this covers the residual gap between the last checkpoint
-	// and the crash.
+	// counter never re-uses an OID already present on disk.
+	// The pg_control read earlier covers the checkpoint-based advance;
+	// this covers the residual gap between the last checkpoint and the crash.
 	for _, tbl := range cat.AllTables() {
 		if tbl.OID >= catalog.FirstUserOID {
 			cat.AdvanceNextOIDPast(tbl.OID)
@@ -898,7 +866,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 
 	// M0079-0001: replay CREATE/DROP INDEX WAL records into the
 	// in-memory catalog. Without this pass, indexes created
-	// after the last SaveCatalog snapshot would disappear from
+	// after the last checkpoint would disappear from
 	// the catalog after a non-graceful restart even though
 	// their relfiles and btree pages are restored by physical
 	// replay. The pgbench `pgbench_accounts.aid` PK was the
@@ -1537,117 +1505,6 @@ func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
 	return nil
 }
 
-// maybeMigrateCatalogToHeap implements the M0030-0004 one-shot migration
-// gate. It detects legacy JSON-only clusters (pg_class relfile present but
-// no user-table rows) and, when the in-memory catalog (loaded from JSON) has
-// user tables, writes them to pg_class/pg_attribute so future startups use
-// the heap path.
-//
-// Safe conditions:
-//   - No pg_class relfile: old cluster without M0030-0001 files → no-op.
-//   - pg_class has user rows (OID ≥ FirstUserOID): already migrated → no-op.
-//   - In-memory catalog has no user tables: nothing to migrate → no-op.
-//
-// Idempotent: if interrupted mid-way, the next startup sees some user rows
-// in pg_class and skips migration; the remaining tables are loaded from JSON
-// via TryRegisterUserTable's idempotency.
-func maybeMigrateCatalogToHeap(mgr *storage.Manager, cat *catalog.InMemory) error {
-	classRel := storage.RelFileNode{
-		DBOid:  cat.DBOID(),
-		RelOid: catalog.RelationRelationId,
-		Fork:   storage.MainFork,
-	}
-	nClassBlocks, err := mgr.NBlocks(classRel)
-	if err != nil || nClassBlocks == 0 {
-		return nil // no pg_class relfile — pre-M0030-0001 cluster
-	}
-
-	// Scan pg_class for any user-table row (fast early-exit).
-	page := make(storage.Page, storage.BlockSize)
-	for blk := storage.BlockNumber(0); blk < nClassBlocks; blk++ {
-		if err := mgr.ReadBlock(classRel, blk, page); err != nil {
-			return fmt.Errorf("maybeMigrate: scan pg_class blk %d: %w", blk, err)
-		}
-		count, _ := storage.PageLinePointerCount(page)
-		for slot := uint16(1); slot <= uint16(count); slot++ {
-			ht, err := storage.PageGetHeapTuple(page, slot)
-			if err != nil {
-				continue
-			}
-			if ht.Header.Xmin == storage.InvalidTransactionID {
-				continue
-			}
-			if ht.Header.Xmax != storage.InvalidTransactionID {
-				continue
-			}
-			row, err := catalog.DecodePGClassRow(ht.Data)
-			if err != nil {
-				continue
-			}
-			if row.OID >= catalog.FirstUserOID {
-				return nil // already has user rows — migration done
-			}
-		}
-	}
-
-	// pg_class has no user rows. Get user tables from the in-memory catalog.
-	userTables := cat.AllTables()
-	if len(userTables) == 0 {
-		return nil // nothing to migrate
-	}
-
-	// Build pg_class and pg_attribute tuples for all user tables.
-	xid := storage.TransactionID(bootstrapXID) // migration rows use bootstrap XID
-	var classTuples []storage.HeapTuple
-	var attrTuples []storage.HeapTuple
-
-	for _, tbl := range userTables {
-		ns := catalog.PublicNamespaceOID
-		if tbl.Schema == "pg_catalog" {
-			ns = catalog.PGCatalogNamespaceOID
-		}
-		classData := catalog.EncodePGClassRow(catalog.PGClassRow{
-			OID:            tbl.OID,
-			RelName:        tbl.Name,
-			RelNamespace:   uint32(ns),
-			RelKind:        "r",
-			RelNAtts:       int32(len(tbl.Columns)),
-			RelFileNode:    tbl.OID,
-			RelPersistence: "p",
-		})
-		classTuples = append(classTuples, storage.NewHeapTuple(xid, storage.InvalidTransactionID, classData))
-
-		for _, col := range tbl.Columns {
-			attrData := catalog.EncodePGAttributeRow(catalog.PGAttributeRow{
-				AttRelID:   tbl.OID,
-				AttName:    col.Name,
-				AttTypID:   catalog.TypeNameToOID(col.Type.Name),
-				AttNum:     int32(col.Ordinal + 1),
-				AttNotNull: col.NotNull,
-			})
-			attrTuples = append(attrTuples, storage.NewHeapTuple(xid, storage.InvalidTransactionID, attrData))
-		}
-	}
-
-	// Write pg_class rows.
-	if err := appendCatalogRows(mgr, classRel, classTuples); err != nil {
-		return fmt.Errorf("maybeMigrate: write pg_class: %w", err)
-	}
-
-	// Write pg_attribute rows.
-	attrRel := storage.RelFileNode{
-		DBOid:  cat.DBOID(),
-		RelOid: catalog.AttributeRelationId,
-		Fork:   storage.MainFork,
-	}
-	if nAttrBlocks, _ := mgr.NBlocks(attrRel); nAttrBlocks > 0 {
-		if err := appendCatalogRows(mgr, attrRel, attrTuples); err != nil {
-			return fmt.Errorf("maybeMigrate: write pg_attribute: %w", err)
-		}
-	}
-	return nil
-}
-
 // appendCatalogRows appends HeapTuples to the last page of a relfile,
 // extending to new pages when the current page is full. Used by the
 // catalog migration (M0030-0004) to backfill user-table rows into
@@ -1695,25 +1552,21 @@ func appendCatalogRows(mgr *storage.Manager, rel storage.RelFileNode, tuples []s
 	return mgr.WriteBlock(rel, curBlk, page)
 }
 
-// loadUserTablesFromHeap supplements the in-memory catalog with user tables
+// loadUserTablesFromHeap loads the in-memory catalog with user tables
 // found in the pg_class and pg_attribute heap relfiles (M0030-0003). It scans
 // all live (xmin≠0, xmax=0) pg_class rows with relkind='r' and OID ≥ FirstUserOID,
 // then collects their column definitions from pg_attribute rows, and calls
 // TryRegisterUserTable for each.
 //
-// This is the primary crash-recovery path for user tables: if the server crashes
-// after DDL-sync writes to the heap but before SaveCatalog() writes the JSON,
-// this scan recovers the new tables from the WAL-replayed heap pages on the
-// next startup.
+// This is the sole catalog recovery path: DDL writes rows to the heap via
+// syncTableToCatalogHeap, and WAL replay restores them after a crash.
 //
 // The clog parameter (M0030-0007) filters out rows whose xmin was never
 // committed — this handles tables created in transactions that crashed before
 // reaching COMMIT. If clog is nil (should not happen after M0030-0007 landed)
 // the scan falls back to the old xmax-only check.
 //
-// The scan is safe on old clusters (pre-M0030-0001) that have no pg_class relfile
-// and is idempotent with the JSON snapshot path (tables already loaded from JSON
-// are skipped via TryRegisterUserTable's exists-check).
+// The scan is safe on old clusters (pre-M0030-0001) that have no pg_class relfile.
 // highestCatalogXID scans the on-disk pg_class and pg_attribute heap pages
 // and returns the highest xmin/xmax found across all live tuples. Used by
 // Open()'s implicit-abort sweep (M0106-0011) to size the clog so xids
@@ -1914,10 +1767,11 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 		}
 
 		tbl := &catalog.Table{
-			Schema:  schema,
-			Name:    tr.RelName,
-			Columns: cols,
-			OID:     tr.OID,
+			Schema:         schema,
+			Name:           tr.RelName,
+			Columns:        cols,
+			OID:            tr.OID,
+			SmallDimension: tr.RelName == "region" || tr.RelName == "nation",
 		}
 		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {
 			tbl.RelFileNodeOID = tr.RelFileNode
@@ -1925,38 +1779,6 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 		if err := cat.TryRegisterUserTable(tbl); err != nil {
 			return fmt.Errorf("loadUserTablesFromHeap: register %q: %w", tr.RelName, err)
 		}
-	}
-	return nil
-}
-
-// loadCatalogSnapshot reads <dir>/global/pg_catalog.json (if
-// present) into cat. A missing file is fine — that's the
-// fresh-from-init case. Anything else (read error, JSON parse
-// error, Restore error) propagates: the operator is better off
-// seeing a startup failure than running with a half-loaded
-// schema.
-func loadCatalogSnapshot(dir string, cat *catalog.InMemory, txnMgr *mvcc.Manager) error {
-	path := filepath.Join(dir, CatalogSnapshotFile)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("goopg: read catalog snapshot %q: %w", path, err)
-	}
-	var snap catalog.Snapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return fmt.Errorf("goopg: parse catalog snapshot %q: %w", path, err)
-	}
-	if err := cat.Restore(snap); err != nil {
-		return fmt.Errorf("goopg: restore catalog snapshot %q: %w", path, err)
-	}
-	if snap.NextXID != 0 {
-		// Advance the in-memory transaction counter past the saved
-		// horizon so heap tuples from previous sessions appear
-		// committed (xmin < snap.Xmin) to the new session's
-		// snapshots.
-		txnMgr.SetNextXID(storage.TransactionID(snap.NextXID))
 	}
 	return nil
 }
@@ -2017,60 +1839,25 @@ func decodePGDatabasePhysicalRow(data []byte) (uint32, string, error) {
 	return binary.LittleEndian.Uint32(data[0:4]), name, nil
 }
 
-// SaveCatalog writes the in-memory catalog to disk so a subsequent
-// Open recovers the same schema. Callers (typically the goopg
-// start shutdown path) should call this before Close. Returns nil
-// when r is nil or the catalog isn't an *InMemory (i.e. someone
-// supplied a custom catalog implementation in tests).
-//
-// The write is atomic: data lands in <path>.tmp first, then
-// rename(2) makes it visible. A crash between the temp file and
-// the rename leaves the previous snapshot intact.
+// SaveCatalog persists catalog metadata needed to survive a restart.
+// The catalog schema is durably stored in the pg_class/pg_attribute heap
+// relfiles by syncTableToCatalogHeap on every DDL; this call only updates
+// pg_control's nextOid so the OID counter is not re-used after a restart.
 func (r *Runtime) SaveCatalog() error {
-	if r == nil || r.Catalog == nil {
+	if r == nil || r.Catalog == nil || r.DataDir == "" {
 		return nil
 	}
 	cat, ok := r.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
 	}
-	snap := cat.Snapshot()
-	if r.TxnMgr != nil {
-		snap.NextXID = uint32(r.TxnMgr.NextXID())
-	}
-	data, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return fmt.Errorf("goopg: marshal catalog snapshot: %w", err)
-	}
-	data = append(data, '\n')
-	path := filepath.Join(r.DataDir, CatalogSnapshotFile)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("goopg: mkdir for catalog snapshot: %w", err)
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("goopg: write catalog snapshot tempfile: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("goopg: rename catalog snapshot: %w", err)
-	}
-	// M0106-0013: also persist nextOid in pg_control so a subsequent
-	// crash-recovery startup can recover the OID counter without relying
-	// on pg_catalog.json alone. This is a belt-and-suspenders write on
-	// top of the checkpoint-time update (NextOIDFn in CheckpointerConfig);
-	// during a clean shutdown the checkpointer may not have fired since
-	// the last OID allocation.
-	if r.DataDir != "" {
-		nextOid := cat.NextOID()
-		if werr := control.UpdateControlFile(r.DataDir, func(cd *control.ControlFileData) {
-			if nextOid > cd.CheckPointCopyNextOid {
-				cd.CheckPointCopyNextOid = nextOid
-			}
-		}); werr != nil {
-			// Non-fatal: the JSON snapshot is already written; log and continue.
-			slog.Warn("SaveCatalog: pg_control nextOid update failed", "err", werr)
+	nextOid := cat.NextOID()
+	if werr := control.UpdateControlFile(r.DataDir, func(cd *control.ControlFileData) {
+		if nextOid > cd.CheckPointCopyNextOid {
+			cd.CheckPointCopyNextOid = nextOid
 		}
+	}); werr != nil {
+		slog.Warn("SaveCatalog: pg_control nextOid update failed", "err", werr)
 	}
 	return nil
 }
