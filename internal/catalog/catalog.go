@@ -143,6 +143,9 @@ type Table struct {
 	// routing and display. For LIST: InValues strings; for RANGE: one
 	// PartitionBound with From/To strings.
 	PartitionBounds []PartitionBound
+	// PartitionKeyOpClasses is the operator class name per key column.
+	// Empty string means "use the default hash function". M0097-0027.
+	PartitionKeyOpClasses []string
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -337,6 +340,16 @@ type InMemory struct {
 	enumTypes map[string]*EnumType
 	// domains holds user-defined domain types. M0097-0017.
 	domains map[string]*Domain
+
+	// constraintViewDeps maps "tableOID:constraintName" → []viewName for
+	// views that rely on the constraint for GROUP BY functional dependency.
+	// Used to enforce DROP CONSTRAINT RESTRICT. M0097-0036 / functional_deps.
+	constraintViewDeps map[string][]string
+
+	// opClassHashFuncs maps operator class name → hash extended routine name.
+	// Only FUNCTION 2 (hash extended) entries are registered; used by
+	// satisfies_hash_partition. M0097-0027.
+	opClassHashFuncs map[string]string
 }
 
 // EnumType holds one user-defined enum type. M0097-0017.
@@ -407,6 +420,8 @@ func NewInMemory() *InMemory {
 		inheritanceChildren: make(map[uint32][]uint32),
 		enumTypes:           make(map[string]*EnumType),
 		domains:             make(map[string]*Domain),
+		constraintViewDeps:  make(map[string][]string),
+		opClassHashFuncs:    make(map[string]string),
 	}
 	c.registerSystemTables()
 	return c
@@ -731,6 +746,23 @@ func (c *InMemory) LookupTableByOID(oid uint32) (*Table, bool) {
 	return c.tableByOID(oid)
 }
 
+// RegisterOpClassHashFunc records that opClassName uses routineName as its
+// FUNCTION 2 (hash extended support function). M0097-0027.
+func (c *InMemory) RegisterOpClassHashFunc(opClassName, routineName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.opClassHashFuncs[opClassName] = routineName
+}
+
+// LookupOpClassHashFunc returns the hash-extended routine name for an operator
+// class, and whether one was registered. M0097-0027.
+func (c *InMemory) LookupOpClassHashFunc(opClassName string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.opClassHashFuncs[opClassName]
+	return v, ok
+}
+
 // advanceNextOIDLocked nudges nextOID past `oid` so subsequent
 // allocations don't collide with the recovered identifier.
 // Caller must hold c.mu.
@@ -787,6 +819,45 @@ func (c *InMemory) Routines() *Routines { return c.routines }
 // by CREATE SUBSCRIPTION's fetch_remote_table_info probe (M0103-0008
 // rung 16). The regclass cast handles the legacy "name as OID"
 // shape by resolving the bound text parameter through the catalog.
+// verboseIntervalOffset renders a signed second count as a PostgreSQL
+// postgres_verbose interval string (e.g. -28378 → "@ 7 hours 52 mins 58 secs
+// ago", 3600 → "@ 1 hour", 0 → "@ 0"). The timezone system views store their
+// utc_offset column pre-rendered this way because pg_regress runs the suite
+// with intervalstyle=postgres_verbose and goopg's virtual tables emit stored
+// strings verbatim (no type-aware reformatting). Mirrors EncodeInterval's
+// INTSTYLE_POSTGRES_VERBOSE arm (postgres/src/backend/utils/adt/datetime.c).
+func verboseIntervalOffset(totalSecs int) string {
+	if totalSecs == 0 {
+		return "@ 0"
+	}
+	neg := totalSecs < 0
+	a := totalSecs
+	if neg {
+		a = -a
+	}
+	h := a / 3600
+	m := (a % 3600) / 60
+	s := a % 60
+	var b strings.Builder
+	b.WriteString("@")
+	addPart := func(v int, unit string) {
+		if v == 0 {
+			return
+		}
+		b.WriteString(fmt.Sprintf(" %d %s", v, unit))
+		if v != 1 {
+			b.WriteString("s")
+		}
+	}
+	addPart(h, "hour")
+	addPart(m, "min")
+	addPart(s, "sec")
+	if neg {
+		b.WriteString(" ago")
+	}
+	return b.String()
+}
+
 func (c *InMemory) registerSystemTables() {
 	pgClass := &Table{
 		Schema: "pg_catalog",
@@ -959,12 +1030,14 @@ func (c *InMemory) registerSystemTables() {
 		Schema: "pg_catalog",
 		Name:   "pg_database",
 		Columns: []Column{
-			{Name: "datname", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 0},
 			{Name: "datdba", Type: Type{Name: "text"}, Ordinal: 1},
 			{Name: "encoding", Type: Type{Name: "text"}, Ordinal: 2},
 			// Additional columns for vacuumdb --all (M0095-0004).
-			{Name: "datallowconn", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "datallowconn", Type: Type{Name: "boolean"}, Ordinal: 3},
 			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 4},
+			// datistemplate: standard pg_database column; false for all live databases (M0097-0021).
+			{Name: "datistemplate", Type: Type{Name: "boolean"}, Ordinal: 5},
 		},
 		OID:     1262, // upstream's DatabaseRelationId
 		Virtual: true,
@@ -978,10 +1051,11 @@ func (c *InMemory) registerSystemTables() {
 		for _, n := range names {
 			out = append(out, []string{
 				n,
-				"10",   // datdba: OID of owner (10 = postgres superuser)
-				"6",    // encoding: 6 = UTF8
-				"true", // datallowconn: allow connections
-				"0",    // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
+				"10",    // datdba: OID of owner (10 = postgres superuser)
+				"6",     // encoding: 6 = UTF8
+				"true",  // datallowconn: allow connections
+				"0",     // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
+				"false", // datistemplate: live databases are not templates
 			})
 		}
 		return out
@@ -1230,10 +1304,13 @@ func (c *InMemory) registerSystemTables() {
 		OID: 3393,
 	}
 	pgBackendMemCtx.VirtualRows = func() [][]string {
+		// Path uses sequential integer IDs so that c1.path[c2.level]=c2.path[c2.level]
+		// correctly identifies rows within the same ancestor subtree (sysviews test).
 		return [][]string{
-			{"TopMemoryContext", "", "", "1", "1048576", "1", "524288", "0", "524288", "AllocSet", ""},
-			{"CacheMemoryContext", "", "TopMemoryContext", "2", "524288", "1", "262144", "0", "262144", "AllocSet", ""},
-			{"CacheMemoryContext_child1", "", "CacheMemoryContext", "3", "8192", "1", "4096", "0", "4096", "AllocSet", ""},
+			{"TopMemoryContext", "", "", "1", "1048576", "1", "524288", "0", "524288", "AllocSet", "{1}"},
+			{"CacheMemoryContext", "", "TopMemoryContext", "2", "524288", "1", "262144", "0", "262144", "AllocSet", "{1,2}"},
+			{"CacheMemoryContext_child1", "", "CacheMemoryContext", "3", "8192", "1", "4096", "0", "4096", "AllocSet", "{1,2,3}"},
+			{"Caller tuples", "", "TopMemoryContext", "2", "65536", "2", "32768", "0", "32768", "Bump", "{1,4}"},
 		}
 	}
 	c.tables["pg_catalog.pg_backend_memory_contexts"] = pgBackendMemCtx
@@ -1309,12 +1386,14 @@ func (c *InMemory) registerSystemTables() {
 	pgFileSettings.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_file_settings"] = pgFileSettings
 
-	// pg_hba_file_rules — needs count > 0 and no errors.
-	// The error column must be NULL. We use a sentinel "NULL" and rely on
-	// the executor treating absent values. For simplicity store it as empty
-	// string; the test checks error IS NOT NULL = 0, i.e. count of non-NULL
-	// errors = 0. An empty string is NOT NULL in our executor so we use a
-	// short array representation for the array columns.
+	// pg_hba_file_rules — sysviews.sql checks `count(*) > 0` and
+	// `count(*) FILTER (WHERE error IS NOT NULL) = 0`, so we must emit at
+	// least one row whose `error` column is SQL NULL (a parsed rule with no
+	// error). The error column is the last column, and both the planner
+	// (buildVirtualValues) and executor (rematerialiseVirtualRows) materialise
+	// a missing trailing cell as NullConst — so we omit the trailing `error`
+	// cell rather than storing "" (which is NOT NULL and would make `no_err`
+	// come out false).
 	pgHbaRules := &Table{
 		Schema: "pg_catalog", Name: "pg_hba_file_rules", Virtual: true,
 		Columns: []Column{
@@ -1334,7 +1413,8 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgHbaRules.VirtualRows = func() [][]string {
 		return [][]string{
-			{"1", "pg_hba.conf", "1", "local", "{all}", "{all}", "", "", "trust", "{}", ""},
+			// Trailing `error` cell omitted → materialised as SQL NULL.
+			{"1", "pg_hba.conf", "1", "local", "{all}", "{all}", "", "", "trust", "{}"},
 		}
 	}
 	c.tables["pg_catalog.pg_hba_file_rules"] = pgHbaRules
@@ -1522,6 +1602,12 @@ func (c *InMemory) registerSystemTables() {
 			{"Timeout", "SpinDelay", "Waiting while acquiring a contended spinlock."},
 			{"Timeout", "VacuumDelay", "Waiting in a cost-based vacuum delay point."},
 			{"Timeout", "VacuumTruncate", "Waiting to acquire an exclusive lock to truncate off any empty pages at the end of a table vacuumed."},
+			{"BufferPin", "BufferPin", "Waiting to acquire an exclusive pin on a buffer."},
+			{"Extension", "Extension", "Waiting in an extension."},
+			{"IPC", "AppendReady", "Waiting for subplan nodes of an Append plan node to be ready."},
+			{"IPC", "BackendTermination", "Waiting for the termination of another backend."},
+			{"IPC", "BgWorkerShutdown", "Waiting for background worker to shut down."},
+			{"IPC", "BgWorkerStartup", "Waiting for background worker to start up."},
 		}
 	}
 	c.tables["pg_catalog.pg_wait_events"] = pgWaitEvents
@@ -1540,29 +1626,26 @@ func (c *InMemory) registerSystemTables() {
 	pgTimezoneNames.VirtualRows = func() [][]string {
 		var rows [][]string
 		for i := -12; i <= 14; i++ {
-			var name, abbrev, offset string
+			var name, abbrev string
 			if i == 0 {
 				name = "UTC"
 				abbrev = "UTC"
-				offset = "00:00:00"
 			} else if i > 0 {
 				name = fmt.Sprintf("Etc/GMT-%d", i)
 				abbrev = fmt.Sprintf("GMT-%d", i)
-				offset = fmt.Sprintf("%02d:00:00", i)
 			} else {
 				name = fmt.Sprintf("Etc/GMT+%d", -i)
 				abbrev = fmt.Sprintf("GMT+%d", -i)
-				offset = fmt.Sprintf("-%02d:00:00", -i)
 			}
-			rows = append(rows, []string{name, abbrev, offset, "false"})
+			rows = append(rows, []string{name, abbrev, verboseIntervalOffset(i * 3600), "f"})
 		}
 		// Add fractional offsets for extra distinct utc_offsets.
-		rows = append(rows, []string{"Asia/Kolkata", "IST", "05:30:00", "false"})
-		rows = append(rows, []string{"Asia/Kathmandu", "NPT", "05:45:00", "false"})
-		rows = append(rows, []string{"Pacific/Marquesas", "MART", "-09:30:00", "false"})
-		rows = append(rows, []string{"Pacific/Chatham", "CHAST", "12:45:00", "false"})
+		rows = append(rows, []string{"Asia/Kolkata", "IST", verboseIntervalOffset(5*3600 + 30*60), "f"})
+		rows = append(rows, []string{"Asia/Kathmandu", "NPT", verboseIntervalOffset(5*3600 + 45*60), "f"})
+		rows = append(rows, []string{"Pacific/Marquesas", "MART", verboseIntervalOffset(-(9*3600 + 30*60)), "f"})
+		rows = append(rows, []string{"Pacific/Chatham", "CHAST", verboseIntervalOffset(12*3600 + 45*60), "f"})
 		// LMT historical local-mean-time for America/Los_Angeles.
-		rows = append(rows, []string{"America/Los_Angeles", "LMT", "-07:52:58", "false"})
+		rows = append(rows, []string{"America/Los_Angeles", "LMT", verboseIntervalOffset(-(7*3600 + 52*60 + 58)), "f"})
 		return rows
 	}
 	c.tables["pg_catalog.pg_timezone_names"] = pgTimezoneNames
@@ -1580,26 +1663,25 @@ func (c *InMemory) registerSystemTables() {
 	pgTimezoneAbbrevs.VirtualRows = func() [][]string {
 		var rows [][]string
 		for i := -12; i <= 14; i++ {
-			var abbrev, offset string
+			var abbrev string
 			if i == 0 {
 				abbrev = "UTC"
-				offset = "00:00:00"
 			} else if i > 0 {
 				abbrev = fmt.Sprintf("GMT-%d", i)
-				offset = fmt.Sprintf("%02d:00:00", i)
 			} else {
 				abbrev = fmt.Sprintf("GMT+%d", -i)
-				offset = fmt.Sprintf("-%02d:00:00", -i)
 			}
-			rows = append(rows, []string{abbrev, offset, "false"})
+			rows = append(rows, []string{abbrev, verboseIntervalOffset(i * 3600), "f"})
 		}
 		// Fractional offsets.
-		rows = append(rows, []string{"IST", "05:30:00", "false"})
-		rows = append(rows, []string{"NPT", "05:45:00", "false"})
-		rows = append(rows, []string{"MART", "-09:30:00", "false"})
-		rows = append(rows, []string{"CHAST", "12:45:00", "false"})
+		rows = append(rows, []string{"IST", verboseIntervalOffset(5*3600 + 30*60), "f"})
+		rows = append(rows, []string{"NPT", verboseIntervalOffset(5*3600 + 45*60), "f"})
+		rows = append(rows, []string{"MART", verboseIntervalOffset(-(9*3600 + 30*60)), "f"})
+		rows = append(rows, []string{"CHAST", verboseIntervalOffset(12*3600 + 45*60), "f"})
 		// LMT entry required by sysviews.sql: select * from pg_timezone_abbrevs where abbrev = 'LMT'.
-		rows = append(rows, []string{"LMT", "-07:52:58", "false"})
+		// PostgreSQL displays this offset as "@ 7 hours 52 mins 58 secs ago"
+		// because pg_regress forces intervalstyle=postgres_verbose.
+		rows = append(rows, []string{"LMT", verboseIntervalOffset(-(7*3600 + 52*60 + 58)), "f"})
 		return rows
 	}
 	c.tables["pg_catalog.pg_timezone_abbrevs"] = pgTimezoneAbbrevs
@@ -1607,7 +1689,7 @@ func (c *InMemory) registerSystemTables() {
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {
-		return [][]string{
+		rows := [][]string{
 			{"default_transaction_isolation", "read committed", "", "Client Connection Defaults / Statement Behavior",
 				"Sets the transaction isolation level of each new transaction.", "",
 				"user", "enum", "default", "", "", "{\"serializable\",\"repeatable read\",\"read committed\",\"read uncommitted\"}",
@@ -1657,7 +1739,7 @@ func (c *InMemory) registerSystemTables() {
 			{"enable_parallel_append", "on", "", "Query Tuning / Planner Method Configuration",
 				"Enables the planner's use of parallel append plans.", "",
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
-			{"enable_gather_merge", "on", "", "Query Tuning / Planner Method Configuration",
+			{"enable_gathermerge", "on", "", "Query Tuning / Planner Method Configuration",
 				"Enables the planner's use of gather merge plans.", "",
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
 			{"enable_incremental_sort", "on", "", "Query Tuning / Planner Method Configuration",
@@ -1672,7 +1754,26 @@ func (c *InMemory) registerSystemTables() {
 			{"enable_presorted_aggregate", "on", "", "Query Tuning / Planner Method Configuration",
 				"Enables the planner's use of presorted aggregate plans.", "",
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_distinct_reordering", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables reordering of DISTINCT pathkeys.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_group_by_reordering", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables reordering of GROUP BY keys.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_self_join_elimination", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables removal of unique self-joins.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			{"enable_tidscan", "on", "", "Query Tuning / Planner Method Configuration",
+				"Enables the planner's use of TID scan plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
 		}
+		// PostgreSQL's pg_settings view is backed by the alphabetically
+		// sorted GUC table, so callers that query it without ORDER BY (e.g.
+		// sysviews.sql's `... where name like 'enable%'`) still receive rows
+		// ordered by name. Sort here to match that contract regardless of the
+		// hand-coded literal order above.
+		sort.Slice(rows, func(i, j int) bool { return rows[i][0] < rows[j][0] })
+		return rows
 	}
 }
 
@@ -2046,6 +2147,79 @@ func (c *InMemory) IndexesOnTable(table *Table) []*Index {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].QualifiedName() < out[j].QualifiedName() })
 	return out
+}
+
+// RegisterViewConstraintDep records that a view relies on a PK constraint for
+// GROUP BY functional dependency. Called by CREATE VIEW. M0097-0036.
+func (c *InMemory) RegisterViewConstraintDep(viewName string, tableOID uint32, constraintName string) {
+	key := fmt.Sprintf("%d:%s", tableOID, constraintName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, existing := range c.constraintViewDeps[key] {
+		if existing == viewName {
+			return
+		}
+	}
+	c.constraintViewDeps[key] = append(c.constraintViewDeps[key], viewName)
+}
+
+// UnregisterViewConstraintDeps removes all constraint dependencies recorded for
+// the given view name. Called by DROP VIEW. M0097-0036.
+func (c *InMemory) UnregisterViewConstraintDeps(viewName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, names := range c.constraintViewDeps {
+		var kept []string
+		for _, n := range names {
+			if n != viewName {
+				kept = append(kept, n)
+			}
+		}
+		if len(kept) == 0 {
+			delete(c.constraintViewDeps, key)
+		} else {
+			c.constraintViewDeps[key] = kept
+		}
+	}
+}
+
+// ViewsDependingOnConstraint returns the names of views that depend on the
+// given PK constraint via GROUP BY functional dependency. M0097-0036.
+func (c *InMemory) ViewsDependingOnConstraint(tableOID uint32, constraintName string) []string {
+	key := fmt.Sprintf("%d:%s", tableOID, constraintName)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	src := c.constraintViewDeps[key]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]string, len(src))
+	copy(out, src)
+	return out
+}
+
+// DropPrimaryKeyConstraint removes the named primary-key constraint (index)
+// from the table's index registries. Returns true if found and removed.
+// M0097-0036.
+func (c *InMemory) DropPrimaryKeyConstraint(tableOID uint32, constraintName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	inner, ok := c.byTable[tableOID]
+	if !ok {
+		return false
+	}
+	if _, exists := inner[constraintName]; !exists {
+		return false
+	}
+	delete(inner, constraintName)
+	// Also remove from the flat indexes map.
+	for k, idx := range c.indexes {
+		if idx.Table != nil && idx.Table.OID == tableOID && idx.Name == constraintName {
+			delete(c.indexes, k)
+			break
+		}
+	}
+	return true
 }
 
 // HasPrimaryKey reports whether table has a primary-key index.

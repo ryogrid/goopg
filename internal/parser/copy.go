@@ -19,21 +19,41 @@ func (p *parser) parseCopy() (Stmt, error) {
 	}
 	stmt := &CopyStmt{pos: t.Pos}
 
-	// Source/target. Either `( select … )` or `relname [(cols)]`.
+	// Source/target. Either `( query )` or `relname [(cols)]`.
+	// The query form is only valid for COPY (query) TO …; PostgreSQL
+	// accepts SELECT/VALUES as well as INSERT/UPDATE/DELETE bodies that
+	// carry a RETURNING clause (checked by the planner).
 	if p.acceptSymbol("(") {
-		// Query form is only valid for COPY (query) TO …
-		sel, err := p.parseSelect()
+		inner, err := p.parseCopyInnerQuery()
 		if err != nil {
 			return nil, err
+		}
+		// PostgreSQL's grammar accepts the deprecated `SELECT … INTO …`
+		// form inside COPY (...), but DoCopy rejects it with a
+		// feature-not-supported error. goopg's parseSelect has no SELECT
+		// INTO support and stops at the reserved INTO keyword, leaving
+		// `INTO <target> FROM …` unconsumed here. Flag it and skip the
+		// rest of the inner query (up to the matching ')') so planCopy
+		// can emit the PG-compatible message rather than a stray
+		// "expected ')'" syntax error. M0097-0024.
+		if _, isSelect := inner.(*SelectStmt); isSelect &&
+			p.cur().Kind == TokenKeyword && p.cur().Keyword == KwInto {
+			stmt.SelectInto = true
+			if err := p.skipInnerQueryRemainder(); err != nil {
+				return nil, err
+			}
 		}
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
 		}
-		s, ok := sel.(*SelectStmt)
-		if !ok {
-			return nil, &SyntaxError{Pos: t.Pos, Message: "COPY (...) only supports SELECT"}
+		switch q := inner.(type) {
+		case *SelectStmt:
+			stmt.Query = q
+		case *InsertStmt, *UpdateStmt, *DeleteStmt:
+			stmt.QueryDML = inner
+		default:
+			return nil, &SyntaxError{Pos: t.Pos, Message: "COPY (...) only supports SELECT, INSERT, UPDATE, or DELETE"}
 		}
-		stmt.Query = s
 	} else {
 		name, err := p.parseObjectName()
 		if err != nil {
@@ -52,17 +72,27 @@ func (p *parser) parseCopy() (Stmt, error) {
 		}
 	}
 
-	// Direction.
-	switch {
-	case p.acceptKeyword(KwFrom):
-		stmt.Direction = CopyFrom
-	case p.acceptKeyword(KwTo):
+	// Direction. The parenthesised-query form (`COPY (query) TO …`) is
+	// TO-only in PostgreSQL's grammar (gram.y has no FROM nor a
+	// column-list production for it), so a trailing FROM or `(col…)`
+	// must surface as a syntax error anchored at the offending token —
+	// e.g. `copy (select …) from stdin` → `syntax error at or near
+	// "from"`, and `copy (select …) (t,id) to stdout` → `… near "("`.
+	// M0097-0024.
+	if stmt.Query != nil || stmt.QueryDML != nil {
+		if !p.acceptKeyword(KwTo) {
+			return nil, p.errSyntaxAtCur()
+		}
 		stmt.Direction = CopyTo
-	default:
-		return nil, p.errAtCur("expected FROM or TO in COPY")
-	}
-	if stmt.Query != nil && stmt.Direction != CopyTo {
-		return nil, &SyntaxError{Pos: t.Pos, Message: "COPY (query) is only valid with TO"}
+	} else {
+		switch {
+		case p.acceptKeyword(KwFrom):
+			stmt.Direction = CopyFrom
+		case p.acceptKeyword(KwTo):
+			stmt.Direction = CopyTo
+		default:
+			return nil, p.errAtCur("expected FROM or TO in COPY")
+		}
 	}
 
 	// Endpoint: STDIN / STDOUT / PROGRAM 'cmd' / 'file'.
@@ -73,8 +103,15 @@ func (p *parser) parseCopy() (Stmt, error) {
 	stmt.Endpoint = endpoint
 	stmt.Filename = filename
 
-	// Optional [ WITH ] ( option [, …] ).
-	withConsumed := p.acceptKeyword(KwWith)
+	// Optional option trail. PostgreSQL's gram.y `copy_options` has two
+	// shapes plus an optional leading WITH (`opt_with`):
+	//   • [ WITH ] '(' generic-option-list ')'  — the modern form
+	//   • [ WITH ] legacy-option-list            — the deprecated bare
+	//     trail (e.g. `CSV HEADER FORCE QUOTE col`). The bare trail is
+	//     valid for BOTH the table form and the parenthesised-query form
+	//     (appended after STDOUT), so it is accepted with or without
+	//     WITH. M0097-0024.
+	p.acceptKeyword(KwWith)
 	if p.acceptSymbol("(") {
 		opts, err := p.parseCopyOptionList()
 		if err != nil {
@@ -84,11 +121,7 @@ func (p *parser) parseCopy() (Stmt, error) {
 			return nil, p.errAtCur("expected ')'")
 		}
 		stmt.Options = opts
-	} else if withConsumed {
-		// Bare `WITH` accepts the legacy syntax `WITH BINARY` /
-		// `WITH OIDS` etc. — accept the legacy single-word options
-		// (BINARY, CSV, HEADER) for pgbench-friendliness. Anything more
-		// elaborate must use the parenthesised form.
+	} else {
 		opts, err := p.parseCopyLegacyTrail()
 		if err != nil {
 			return nil, err
@@ -97,6 +130,57 @@ func (p *parser) parseCopy() (Stmt, error) {
 	}
 
 	return stmt, nil
+}
+
+// parseCopyInnerQuery parses the statement inside COPY ( … ) TO. It
+// dispatches on the leading keyword: SELECT/VALUES/TABLE/WITH parse as
+// a query producing a *SelectStmt; INSERT/UPDATE/DELETE parse as the
+// data-modifying form (PostgreSQL requires a RETURNING clause, which
+// the planner enforces). Anything else is rejected by the caller.
+func (p *parser) parseCopyInnerQuery() (Stmt, error) {
+	t := p.cur()
+	if t.Kind == TokenKeyword {
+		switch t.Keyword {
+		case KwInsert:
+			return p.parseInsert()
+		case KwUpdate:
+			return p.parseUpdate()
+		case KwDelete:
+			return p.parseDelete()
+		case KwWith:
+			return p.parseStatementWithCTE()
+		}
+	}
+	return p.parseSelect()
+}
+
+// skipInnerQueryRemainder consumes the unparsed tail of a COPY (...) inner
+// query up to — but not including — the matching close parenthesis, so the
+// caller's `)` check still fires. It is used only for the rejected
+// `SELECT … INTO …` form, whose `INTO <target> FROM …` tail goopg's
+// parseSelect does not understand; the statement is rejected later, so the
+// tail's exact shape is irrelevant. Parenthesis depth is tracked to skip
+// over nested subqueries / function calls. M0097-0024.
+func (p *parser) skipInnerQueryRemainder() error {
+	depth := 0
+	for {
+		t := p.cur()
+		if t.Kind == TokenEOF {
+			return p.errAtCur("expected ')'")
+		}
+		if t.Kind == TokenSymbol {
+			switch t.Value {
+			case "(":
+				depth++
+			case ")":
+				if depth == 0 {
+					return nil
+				}
+				depth--
+			}
+		}
+		p.advance()
+	}
 }
 
 // parseCopyEndpoint reads the FROM/TO target. STDIN/STDOUT/PROGRAM are
@@ -204,9 +288,12 @@ func (p *parser) parseCopyOption() (CopyOption, error) {
 }
 
 // parseCopyLegacyTrail covers the historical, parenthesis-free syntax
-// `COPY … WITH [BINARY] [HEADER]` etc. We accept BINARY, CSV, HEADER,
-// FREEZE, DELIMITER 'd', NULL 'n', QUOTE 'q', ESCAPE 'e' here so
-// pgbench-friendly tools survive.
+// `COPY … [WITH] [BINARY] [CSV] [HEADER] …` (PG gram.y `copy_opt_list`).
+// We accept BINARY, CSV, HEADER, FREEZE, DELIMITER 'd', NULL 'n',
+// QUOTE 'q', ESCAPE 'e', ENCODING 'enc', and the CSV column options
+// FORCE QUOTE / FORCE NOT NULL / FORCE NULL. Each option is normalised
+// to the same CopyOption shape the modern parenthesised form produces,
+// so the planner/executor interpret them identically. M0097-0024.
 func (p *parser) parseCopyLegacyTrail() ([]CopyOption, error) {
 	var out []CopyOption
 	for {
@@ -226,9 +313,65 @@ func (p *parser) parseCopyLegacyTrail() ([]CopyOption, error) {
 			}
 			p.advance()
 			out = append(out, CopyOption{pos: t.Pos, Name: t.Value, Value: s.Value})
+		case "force":
+			p.advance()
+			opt, err := p.parseCopyLegacyForce(t.Pos)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, opt)
 		default:
 			return out, nil
 		}
 	}
 	return out, nil
+}
+
+// parseCopyLegacyForce parses the legacy CSV column options that follow
+// the FORCE keyword (PG gram.y `copy_opt_item`):
+//
+//	FORCE QUOTE columnList | FORCE QUOTE '*'
+//	FORCE NOT NULL columnList
+//	FORCE NULL columnList
+//
+// The leading FORCE has already been consumed; pos anchors the option at
+// it. The result mirrors the modern parenthesised option (force_quote /
+// force_not_null / force_null with Star or Cols set). M0097-0024.
+func (p *parser) parseCopyLegacyForce(pos int) (CopyOption, error) {
+	nt := p.cur()
+	switch nt.Value {
+	case "quote":
+		p.advance()
+		opt := CopyOption{pos: pos, Name: "force_quote"}
+		if p.acceptSymbol("*") {
+			opt.Star = true
+			return opt, nil
+		}
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return CopyOption{}, err
+		}
+		opt.Cols = cols
+		return opt, nil
+	case "not":
+		p.advance()
+		if p.cur().Value != "null" {
+			return CopyOption{}, p.errAtCur("expected NULL after FORCE NOT")
+		}
+		p.advance()
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return CopyOption{}, err
+		}
+		return CopyOption{pos: pos, Name: "force_not_null", Cols: cols}, nil
+	case "null":
+		p.advance()
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return CopyOption{}, err
+		}
+		return CopyOption{pos: pos, Name: "force_null", Cols: cols}, nil
+	default:
+		return CopyOption{}, p.errAtCur("expected QUOTE, NOT NULL, or NULL after FORCE")
+	}
 }

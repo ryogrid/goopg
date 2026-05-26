@@ -21,6 +21,13 @@ const ToastThreshold = 2000
 // Each chunk carries at most this many bytes of the original value.
 const ToastMaxChunkSize = 1996
 
+// Detoast sanity bounds reject corrupted or accidental TOAST pointers before
+// they can trigger unbounded allocations during reassembly.
+const (
+	maxDetoastChunks   = 1 << 20
+	maxDetoastTotalLen = maxDetoastChunks * ToastMaxChunkSize
+)
+
 // toastOIDCounter is a process-global counter for assigning unique OIDs
 // to TOAST values. Not persisted; on restart the counter resets and old
 // TOAST tables are abandoned (the main heap is dropped simultaneously in
@@ -178,17 +185,20 @@ func writeHeapTupleToRel(ctx *Context, rel storage.RelFileNode, tuple storage.He
 		slot.Lock()
 		if storage.IsNew(slot.Page()) {
 			if err := storage.InitPage(slot.Page()); err != nil {
-				slot.Unlock(); ctx.Pool.Unpin(slot)
+				slot.Unlock()
+				ctx.Pool.Unpin(slot)
 				return false, err
 			}
 		}
 		_, addErr := storage.PageAddHeapTuple(slot.Page(), tuple)
 		if addErr == nil {
 			ctx.Pool.MarkDirty(slot)
-			slot.Unlock(); ctx.Pool.Unpin(slot)
+			slot.Unlock()
+			ctx.Pool.Unpin(slot)
 			return true, nil
 		}
-		slot.Unlock(); ctx.Pool.Unpin(slot)
+		slot.Unlock()
+		ctx.Pool.Unpin(slot)
 		if addErr.Error() == storage.ErrNoSpaceInPage.Error() {
 			return false, nil
 		}
@@ -215,7 +225,8 @@ func writeHeapTupleToRel(ctx *Context, rel storage.RelFileNode, tuple storage.He
 	slot.Lock()
 	_, err = storage.PageAddHeapTuple(slot.Page(), tuple)
 	if err != nil {
-		slot.Unlock(); ctx.Pool.Unpin(slot)
+		slot.Unlock()
+		ctx.Pool.Unpin(slot)
 		return err
 	}
 	ctx.Pool.MarkDirty(slot)
@@ -234,8 +245,20 @@ func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([
 	oid := binary.BigEndian.Uint32(pointer[0:4])
 	totalLen := int(binary.BigEndian.Uint32(pointer[4:8]))
 	numChunks := int(binary.BigEndian.Uint32(pointer[8:12]))
+	if totalLen < 0 || totalLen > maxDetoastTotalLen {
+		return nil, fmt.Errorf("invalid TOAST pointer: implausible total length %d", totalLen)
+	}
 	if numChunks <= 0 {
-		return []byte{}, nil
+		if totalLen == 0 {
+			return []byte{}, nil
+		}
+		return nil, fmt.Errorf("invalid TOAST pointer: total length %d with non-positive chunk count %d", totalLen, numChunks)
+	}
+	if numChunks > maxDetoastChunks {
+		return nil, fmt.Errorf("invalid TOAST pointer: implausible chunk count %d", numChunks)
+	}
+	if totalLen > numChunks*ToastMaxChunkSize {
+		return nil, fmt.Errorf("invalid TOAST pointer: total length %d exceeds %d chunks", totalLen, numChunks)
 	}
 	chunks := make([][]byte, numChunks)
 
@@ -251,7 +274,8 @@ func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([
 		slot.RLock()
 		page := slot.Page()
 		if storage.IsNew(page) {
-			slot.RUnlock(); ctx.Pool.Unpin(slot)
+			slot.RUnlock()
+			ctx.Pool.Unpin(slot)
 			continue
 		}
 		count, _ := storage.PageLinePointerCount(page)

@@ -75,6 +75,23 @@ func TestPort_RegressSuite(t *testing.T) {
 				return
 			}
 
+			// Restart the cluster if it crashed during a previous test.
+			// The server process can crash with a GC memory error (pre-existing
+			// bug) after running heavy DDL workloads. We detect this by pinging
+			// the server; on failure we Kill (clears cmd state) then Start
+			// (WAL recovery restores a consistent DB state), then re-run
+			// test_setup.sql to restore shared fixture tables.
+			if !exec.isAlive() {
+				t.Log("server not responding; attempting crash recovery")
+				_ = c.Kill() // clear cmd so Start() doesn't return "already started"
+				if err := c.Start(); err != nil {
+					t.Skipf("deferred: cluster restart failed: %v", err)
+					return
+				}
+				runRegressSetup(t, root, psqlBin, c)
+				t.Log("cluster recovered")
+			}
+
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
 
@@ -113,6 +130,8 @@ var regressExcluded = map[string]string{
 	// Full-text search
 	"tsdicts": "Full-text search; out of scope for goopg v0.", "tsearch": "Full-text search; out of scope for goopg v0.",
 	"tsrf": "Full-text search SRF; out of scope for goopg v0.", "tstypes": "Full-text search types; out of scope for goopg v0.",
+	// Shared bootstrap
+	"test_setup": "Executed once as shared regress fixture bootstrap; rerunning mutates seeded tables for later cases.",
 	// Advanced AM / exotic index
 	"amutils": "Advanced AM utilities; out of scope for goopg v0.", "brin": "BRIN index; out of scope for goopg v0.",
 	"brin_bloom": "BRIN bloom index; out of scope for goopg v0.", "brin_multi": "BRIN multi-range; out of scope for goopg v0.",
@@ -200,18 +219,38 @@ func (e *ClusterRegressExecutor) psqlArgs(extraArgs ...string) []string {
 	return args
 }
 
-// psqlEnv returns the environment slice for psql with LD_LIBRARY_PATH set so
-// the in-tree psql binary resolves libpq symbols correctly.
+// psqlEnv returns the environment slice for psql with LD_LIBRARY_PATH and
+// PG_ABS_SRCDIR set so the in-tree psql binary resolves libpq symbols and
+// data file paths (e.g. \getenv abs_srcdir PG_ABS_SRCDIR in hash_index.sql).
 func (e *ClusterRegressExecutor) psqlEnv() []string {
 	prev := os.Getenv("LD_LIBRARY_PATH")
-	if e.LibDir == "" {
-		return []string{"PGPASSWORD="}
+	env := []string{"PGPASSWORD="}
+	if e.LibDir != "" {
+		ldPath := e.LibDir
+		if prev != "" {
+			ldPath += ":" + prev
+		}
+		env = append(env, "LD_LIBRARY_PATH="+ldPath)
 	}
-	ldPath := e.LibDir
-	if prev != "" {
-		ldPath += ":" + prev
+	if e.RepoRoot != "" {
+		absSrcDir := filepath.Join(e.RepoRoot, "postgres", "src", "test", "regress")
+		env = append(env, "PG_ABS_SRCDIR="+absSrcDir)
 	}
-	return []string{"PGPASSWORD=", "LD_LIBRARY_PATH=" + ldPath}
+	return env
+}
+
+// isAlive pings the cluster with a trivial SELECT; returns false if the server
+// is not reachable (crashed or not yet started).
+func (e *ClusterRegressExecutor) isAlive() bool {
+	args := e.psqlArgs("-X", "-q", "-c", "SELECT 1")
+	result, _ := util.RunCommand(util.CommandSpec{
+		Name:    e.PsqlBin,
+		Args:    args,
+		Dir:     e.RepoRoot,
+		Env:     e.psqlEnv(),
+		Timeout: 5 * time.Second,
+	})
+	return result.ExitCode == 0
 }
 
 // ExecuteSQL writes sql to a temporary file and runs it through psql.

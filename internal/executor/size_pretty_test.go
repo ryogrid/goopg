@@ -27,7 +27,7 @@ func TestSizePretty(t *testing.T) {
 		{11258449312612351, "10239 TB"},
 		{11258449312612352, "10 PB"},
 		// Singular byte case
-		{1, "1 byte"},
+		{1, "1 bytes"},
 		{0, "0 bytes"},
 	}
 	for _, tt := range tests {

@@ -65,9 +65,9 @@ func (p *parser) parseSelect() (Stmt, error) {
 		star := &StarExpr{pos: pos}
 		rv := RangeVar{pos: pos, Schema: tbl.Schema, Name: tbl.Name}
 		s := &SelectStmt{
-			pos:      pos,
-			Targets:  []ResTarget{{Expr: star}},
-			From:     []RangeVar{rv},
+			pos:       pos,
+			Targets:   []ResTarget{{Expr: star}},
+			From:      []RangeVar{rv},
 			FromExprs: []FromExpr{{pos: pos, Base: rv}},
 		}
 		return s, nil
@@ -79,6 +79,21 @@ func (p *parser) parseSelect() (Stmt, error) {
 	s := &SelectStmt{pos: t.Pos}
 	if p.acceptKeyword(KwDistinct) {
 		s.Distinct = true
+		// DISTINCT ON (expr [, ...]) — parse the expression list.
+		// The ON keyword is reserved (KwCatReserved) so we use acceptKeyword.
+		if p.acceptKeyword(KwOn) {
+			if !p.acceptSymbol("(") {
+				return nil, p.errAtCur("expected '(' after DISTINCT ON")
+			}
+			exprs, err := p.parseExprList()
+			if err != nil {
+				return nil, err
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')' after DISTINCT ON expression list")
+			}
+			s.DistinctOn = exprs
+		}
 	}
 	// Empty target list: `SELECT FROM <table>` is valid in upstream PG
 	// (returns one zero-column row per source row). HammerDB writes
@@ -114,7 +129,7 @@ func (p *parser) parseSelect() (Stmt, error) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
 			return nil, err
 		}
-		list, err := p.parseExprList()
+		list, err := p.parseGroupByElems()
 		if err != nil {
 			return nil, err
 		}
@@ -189,6 +204,29 @@ func (p *parser) parseSelect() (Stmt, error) {
 		return nil, err
 	} else if ok {
 		s.SetOp = setOp
+		// A trailing ORDER BY / LIMIT / OFFSET written after the final
+		// set-op branch binds to the *entire* set operation (SQL §7.6),
+		// not the right branch alone. parseSetOpClause parses the RHS via
+		// a full recursive parseSelect, which greedily attaches them to
+		// that branch; lift them up to s when s carries none of its own.
+		// Chains lift bottom-up (each recursive level lifts from its RHS),
+		// so the outermost SELECT ends up owning them and the planner's
+		// wrapSetOpSortLimit resolves them against the combined output
+		// (e.g. copyselect's `… UNION … ORDER BY 1`). M0097-0024.
+		if right := setOp.Right; right != nil {
+			if s.OrderBy == nil && right.OrderBy != nil {
+				s.OrderBy = right.OrderBy
+				right.OrderBy = nil
+			}
+			if s.Limit == nil && right.Limit != nil {
+				s.Limit = right.Limit
+				right.Limit = nil
+			}
+			if s.Offset == nil && right.Offset != nil {
+				s.Offset = right.Offset
+				right.Offset = nil
+			}
+		}
 	}
 	// Trailing locking clause(s) — `FOR UPDATE / FOR SHARE [OF
 	// …] [NOWAIT | SKIP LOCKED]`. M0021-0001 step 1 (parser
@@ -400,6 +438,64 @@ func (p *parser) parseExprList() ([]Expr, error) {
 		out = append(out, next)
 	}
 	return out, nil
+}
+
+// parseGroupByElems parses one or more GROUP BY elements separated by commas.
+// It handles GROUPING SETS (...), ROLLUP (...), and CUBE (...) by consuming
+// them and injecting a sentinel IntegerConst(0) so that len(GroupBy) > 0 remains
+// true — allowing downstream FOR UPDATE / HAVING checks to fire correctly.
+// Regular expressions are returned normally.
+func (p *parser) parseGroupByElems() ([]Expr, error) {
+	var out []Expr
+	for {
+		// GROUPING SETS / ROLLUP / CUBE: consume the grouping element and add a
+		// sentinel so the GROUP BY list is never empty after them.
+		if p.acceptIdentKeyword("grouping") {
+			sentPos := p.cur().Pos
+			p.acceptIdentKeyword("sets")
+			p.skipBalancedParens()
+			out = append(out, &IntegerConst{pos: sentPos, Value: 0})
+		} else if p.acceptIdentKeyword("rollup") || p.acceptIdentKeyword("cube") {
+			sentPos := p.cur().Pos
+			p.skipBalancedParens()
+			out = append(out, &IntegerConst{pos: sentPos, Value: 0})
+		} else {
+			expr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, expr)
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return out, nil
+}
+
+// skipBalancedParens consumes a parenthesised token sequence (including nested
+// parens) that starts with the current "(" token. Does nothing if the current
+// token is not "(". Used to skip unsupported grouping-set operands.
+func (p *parser) skipBalancedParens() {
+	if p.cur().Kind != TokenSymbol || p.cur().Value != "(" {
+		return
+	}
+	depth := 0
+	for p.cur().Kind != TokenEOF {
+		if p.cur().Kind == TokenSymbol {
+			switch p.cur().Value {
+			case "(":
+				depth++
+			case ")":
+				depth--
+				if depth == 0 {
+					p.advance()
+					return
+				}
+			}
+		}
+		p.advance()
+	}
 }
 
 func (p *parser) parseSetOpClause() (*SetOpClause, bool, error) {
@@ -838,6 +934,22 @@ func (p *parser) parseSortList() ([]SortBy, error) {
 	return out, nil
 }
 
+// skipCollationName consumes a (possibly schema-qualified) collation
+// name following the COLLATE keyword, e.g. `"C"`, `pg_catalog."C"`, or
+// `en_US`. The reference is discarded — goopg has no non-default
+// collation support (see the COLLATE postfix in parseExprPrec).
+func (p *parser) skipCollationName() error {
+	if _, err := p.parseIdent(); err != nil {
+		return err
+	}
+	for p.acceptSymbol(".") {
+		if _, err := p.parseIdent(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (p *parser) parseSortItem() (SortBy, error) {
 	pos := p.cur().Pos
 	e, err := p.parseExpr()
@@ -858,19 +970,19 @@ func (p *parser) parseSortItem() (SortBy, error) {
 // Precedence levels (higher binds tighter), aligned with upstream's
 // gram.y operator precedence.
 const (
-	precOr         = 1
-	precAnd        = 2
-	precNot        = 3
-	precIs         = 4
-	precCompare    = 5 // = <> < > <= >=
-	precBitOr      = 5 // | (same as compare in PG)
-	precBitXor     = 5 // # (same as compare in PG)
-	precBitAnd     = 6 // & (higher than | in PG)
-	precBitShift   = 6 // << >> (same as & in PG)
-	precAddSub     = 7
-	precMulDiv     = 8
-	precConcat     = 9
-	precUnary      = 10
+	precOr       = 1
+	precAnd      = 2
+	precNot      = 3
+	precIs       = 4
+	precCompare  = 5 // = <> < > <= >=
+	precBitOr    = 5 // | (same as compare in PG)
+	precBitXor   = 5 // # (same as compare in PG)
+	precBitAnd   = 6 // & (higher than | in PG)
+	precBitShift = 6 // << >> (same as & in PG)
+	precAddSub   = 7
+	precMulDiv   = 8
+	precConcat   = 9
+	precUnary    = 10
 )
 
 // parseExpr drives the precedence-climbing loop.
@@ -909,6 +1021,21 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				return nil, p.errAtCur("expected ']' after array subscript")
 			}
 			left = &ArraySubscriptExpr{pos: pos, Base: left, Index: idx}
+			continue
+		}
+		// `expr COLLATE collation_name` — a high-precedence postfix in
+		// PG's grammar (`a_expr COLLATE any_name`), valid anywhere an
+		// expression appears: target lists, WHERE, ORDER BY, etc. goopg
+		// has no non-default collation machinery, so we consume the
+		// collation reference and leave the operand unchanged. This is
+		// exactly correct for `"C"`/`"POSIX"` (byte order == Go's default
+		// string comparison) and matches the collation-skipping already
+		// done in DDL/conflict-target parsing.
+		if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "collate") {
+			p.advance() // consume COLLATE
+			if err := p.skipCollationName(); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		// `expr [NOT] IN (...)` is a postfix-style construct at
@@ -1970,6 +2097,60 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 		// passes through unchanged, which is exactly the spread-equivalent
 		// shape variadic-callees expect).
 		variadic := p.acceptKeyword(KwVariadic)
+		// VARIADIC array[e1, e2, ...] — expand array constructor elements into
+		// individual args at parse time. Used by satisfies_hash_partition tests.
+		// M0097-0027.
+		if variadic && p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "array") &&
+			p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "[" {
+			expandStart := len(fc.Args) // index of first expanded element
+			p.advance() // array
+			p.advance() // [
+			if !(p.cur().Kind == TokenSymbol && p.cur().Value == "]") {
+				first, ferr := p.parseExpr()
+				if ferr != nil {
+					return nil, ferr
+				}
+				fc.Args = append(fc.Args, first)
+				fc.Variadic = append(fc.Variadic, true) // variadic-expanded
+				for p.acceptSymbol(",") {
+					elem, ferr := p.parseExpr()
+					if ferr != nil {
+						return nil, ferr
+					}
+					fc.Args = append(fc.Args, elem)
+					fc.Variadic = append(fc.Variadic, true) // variadic-expanded
+				}
+			}
+			if !p.acceptSymbol("]") {
+				return nil, p.errAtCur("expected ']' after VARIADIC array elements")
+			}
+			// Optional ::type[] cast on array — capture element type and apply to each element.
+			if p.cur().Kind == TokenOperator && p.cur().Value == "::" {
+				castPos := p.cur().Pos
+				p.advance() // ::
+				elemType, _ := p.parseTypeNameAfterCast()
+				// Skip optional [] array dimension suffixes
+				for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+					p.advance()
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+						p.advance()
+					}
+				}
+				// Wrap each expanded element with a CastExpr to propagate the element type.
+				if elemType.Name != "" {
+					for j := expandStart; j < len(fc.Args); j++ {
+						fc.Args[j] = &CastExpr{pos: castPos, Operand: fc.Args[j], Type: ObjectName{Name: elemType.Name}}
+					}
+				}
+			}
+			if p.acceptSymbol(",") {
+				continue
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ',' or ')'")
+			}
+			return p.maybeWindowTail(fc)
+		}
 		arg, err := p.parseExpr()
 		if err != nil {
 			return nil, err

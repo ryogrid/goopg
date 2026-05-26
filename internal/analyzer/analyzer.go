@@ -198,12 +198,10 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *scope) error {
 	// s.Distinct is now supported via the planner's Distinct node. M0097-0005.
 	if s.SetOp != nil {
-		if s.SetOp.Type != parser.SetOpUnion || !s.SetOp.All {
-			return analyzeError(s.SetOp.Pos(), "0A000", "set operations are not supported in v0 planner")
-		}
-		// UNION ALL: analyze right side first (innermost first),
-		// then analyze left side with SetOp temporarily cleared
-		// to avoid infinite recursion.
+		// UNION / INTERSECT / EXCEPT (with optional ALL) are all
+		// supported. Analyze the right side first (innermost first),
+		// then the left side with SetOp temporarily cleared to avoid
+		// infinite recursion. M0097-0024.
 		if err := analyzeSelectWithParent(s.SetOp.Right, cat, parent); err != nil {
 			return err
 		}
@@ -1056,6 +1054,10 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 			if strings.EqualFold(x.Column, "tableoid") {
 				return catalog.Type{Name: "oid"}, true, nil
 			}
+			// `<rel>.ctid` system-column resolution. M0097-0038.
+			if strings.EqualFold(x.Column, "ctid") {
+				return catalog.Type{Name: "tid"}, true, nil
+			}
 			return catalog.Type{}, false, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
 		}
 		return col.Type, true, nil
@@ -1105,6 +1107,22 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 			}
 			if match != nil {
 				return catalog.Type{Name: "oid"}, true, nil
+			}
+		}
+		// Unqualified `ctid` system column. M0097-0038.
+		if strings.EqualFold(x.Column, "ctid") {
+			var match *scopeRel
+			for i := range ctx.rels {
+				if ctx.rels[i].qualifiedOnly {
+					continue
+				}
+				if match != nil {
+					return catalog.Type{}, false, analyzeError(x.Pos(), "42702", fmt.Sprintf("column reference %q is ambiguous", x.Column))
+				}
+				match = &ctx.rels[i]
+			}
+			if match != nil {
+				return catalog.Type{Name: "tid"}, true, nil
 			}
 		}
 		return catalog.Type{}, false, nil
@@ -1402,13 +1420,22 @@ func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		innerCtx.rels = rels
 	}
 	innerCols := make([]catalog.Column, 0, len(cte.Query.Targets))
-	for i, tgt := range cte.Query.Targets {
+	for _, tgt := range cte.Query.Targets {
+		// A top-level `*` / `t.*` in the CTE body must materialise into
+		// the inner scope's concrete columns — analyzeExpr rejects a
+		// bare StarExpr ("'*' is not allowed here"). Mirrors
+		// synthesizeSubqueryTable's derived-table star handling; keep
+		// the two in sync. M0097-0003.
+		if star, ok := tgt.Expr.(*parser.StarExpr); ok {
+			innerCols = append(innerCols, expandInnerStarColumns(star, innerCtx)...)
+			continue
+		}
 		name := tgt.Alias
 		if name == "" {
 			name = deriveAnalyzerTargetName(tgt.Expr)
 		}
 		if name == "" {
-			name = fmt.Sprintf("?column?%d", i+1)
+			name = fmt.Sprintf("?column?%d", len(innerCols)+1)
 		}
 		typ, err := analyzeExpr(tgt.Expr, innerCtx)
 		if err != nil {
@@ -1483,6 +1510,30 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 // fallback is safe for vacuumdb's CROSS JOIN LATERAL use case where the
 // produced column (inherited) is never referenced in the WHERE clause
 // for basic vacuum runs. See docs/design/0003-0014-derived-tables.md.
+// expandInnerStarColumns materialises a target-list StarExpr into the
+// concrete column list of an inner SELECT's FROM scope. The analyzer uses
+// this when synthesising the columns of a derived relation — a derived
+// table (subquery) or a CTE body — where a top-level `*` must become real
+// columns rather than be type-checked as a scalar (analyzeExpr rejects a
+// bare StarExpr). An unqualified `*` expands every in-scope relation; a
+// qualified `t.*` expands only the matching relation. M0097-0003.
+func expandInnerStarColumns(star *parser.StarExpr, innerCtx *scope) []catalog.Column {
+	if innerCtx == nil {
+		return nil
+	}
+	qualified := star.Table != "" || star.Schema != ""
+	var cols []catalog.Column
+	for _, rel := range innerCtx.rels {
+		if qualified && !scopeRelMatches(rel, star.Table, star.Schema) {
+			continue
+		}
+		for _, col := range rel.table.Columns {
+			cols = append(cols, catalog.Column{Name: col.Name, Type: col.Type})
+		}
+	}
+	return cols
+}
+
 func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
 	// VALUES subquery: FROM (VALUES (r1), ...) AS t(c1, c2).
 	// The inner SelectStmt has no Targets; build the column list from the
@@ -1529,12 +1580,8 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.
 	for _, tgt := range rv.Subquery.Targets {
 		// Star expression in inner SELECT (e.g. TABLE tablename → SELECT * FROM tablename).
 		// Expand to all columns from the inner scope. M0097-0003.
-		if _, ok := tgt.Expr.(*parser.StarExpr); ok {
-			for _, rel := range innerCtx.rels {
-				for _, col := range rel.table.Columns {
-					cols = append(cols, catalog.Column{Name: col.Name, Type: col.Type})
-				}
-			}
+		if star, ok := tgt.Expr.(*parser.StarExpr); ok {
+			cols = append(cols, expandInnerStarColumns(star, innerCtx)...)
 			continue
 		}
 		// `(srf(...)).*` inside a derived subquery — expand to the SRF's
@@ -1711,7 +1758,13 @@ func isIntegerLike(t catalog.Type) bool {
 func isNumericTypeName(name string) bool {
 	switch strings.ToLower(name) {
 	case "int", "int2", "int4", "int8", "integer", "smallint", "bigint", "numeric", "decimal",
-		"float4", "float8", "real", "double", "double precision":
+		"float4", "float8", "real", "double", "double precision",
+		// SERIAL family are not real types: PostgreSQL resolves them to
+		// int4/int8/int2 (pg_typeof reports "integer"). Treat them as their
+		// integer base so `serial_col = 1` / `serial_col + 1` type-check the
+		// same as int columns. The stored catalog type stays "serial" because
+		// the INSERT auto-increment path (operators_storage.go) keys off it.
+		"serial", "bigserial", "smallserial":
 		return true
 	}
 	return false

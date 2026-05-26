@@ -2,6 +2,7 @@ package planner
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -22,6 +23,18 @@ import (
 // already enforces that.
 func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
 	if s.Query != nil {
+		// PostgreSQL's grammar accepts `SELECT … INTO …` inside
+		// COPY (...) but DoCopy rejects it (copyto.c: CreateTableAsStmt
+		// utility) with ERRCODE_FEATURE_NOT_SUPPORTED. Mirror that — the
+		// parser flags the form and stops before resolving the target.
+		// M0097-0024 (copyselect).
+		if s.SelectInto {
+			return nil, &PlanError{
+				Pos:     s.Pos(),
+				Code:    "0A000",
+				Message: "COPY (SELECT INTO) is not supported",
+			}
+		}
 		// Plan the inner SELECT just like a top-level one. The
 		// resulting Node tree's Output() schema is what the wire
 		// layer uses for the CopyOutResponse column list.
@@ -40,12 +53,66 @@ func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
 		}, nil
 	}
 
+	if s.QueryDML != nil {
+		// COPY (INSERT/UPDATE/DELETE … RETURNING) TO. Plan the
+		// data-modifying statement through the normal entry point so
+		// it runs (and commits, in the wire layer's COPY transaction);
+		// the RETURNING rows are what gets streamed out. PostgreSQL
+		// requires the RETURNING clause — without it there are no rows
+		// to copy.
+		inner, err := Plan(s.QueryDML, cat)
+		if err != nil {
+			return nil, err
+		}
+		schema := returningSchemaOf(inner)
+		if schema == nil {
+			return nil, &PlanError{
+				Pos:     s.Pos(),
+				Code:    "0A000",
+				Message: "COPY query must have a RETURNING clause",
+			}
+		}
+		return &Copy{
+			pos:       s.Pos(),
+			Direction: CopyTo,
+			Query:     inner,
+			Endpoint:  toPlannerEndpoint(s.Endpoint),
+			Filename:  s.Filename,
+			Options:   s.Options,
+			schema:    schema,
+		}, nil
+	}
+
 	tbl, ok := cat.LookupTable(s.Table)
 	if !ok {
 		return nil, &PlanError{
 			Pos:     s.Pos(),
 			Code:    "42P01",
 			Message: fmt.Sprintf("relation %q does not exist", s.Table.Name),
+		}
+	}
+
+	// Reject COPY against a plain view. PostgreSQL checks the relation
+	// kind before anything else: a view has no heap to stream from or
+	// load into, so `COPY v TO` / `COPY v FROM` fail with
+	// ERRCODE_WRONG_OBJECT_TYPE (42809). Materialised views are exempt —
+	// they store rows in the heap like a table. The `COPY (SELECT ...)`
+	// query form (handled above) is the supported way to dump a view.
+	// M0097-0009 (copyselect).
+	if tbl.View != nil && !tbl.IsMatView {
+		if s.Direction == parser.CopyTo {
+			return nil, &PlanError{
+				Pos:     s.Pos(),
+				Code:    "42809",
+				Message: fmt.Sprintf("cannot copy from view %q", tbl.Name),
+				Hint:    "Try the COPY (SELECT ...) TO variant.",
+			}
+		}
+		return nil, &PlanError{
+			Pos:     s.Pos(),
+			Code:    "42809",
+			Message: fmt.Sprintf("cannot copy to view %q", tbl.Name),
+			Hint:    "To enable inserting into the view, provide an INSTEAD OF INSERT trigger.",
 		}
 	}
 
@@ -108,6 +175,23 @@ func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
 	}, nil
 }
 
+// returningSchemaOf returns the RETURNING output schema of a
+// data-modifying plan node, or nil when the statement has no RETURNING
+// clause. Used to gate COPY (DML) TO, which streams the RETURNING rows.
+func returningSchemaOf(n Node) Schema {
+	switch d := n.(type) {
+	case *Insert:
+		return d.ReturningSchema
+	case *Update:
+		return d.ReturningSchema
+	case *Delete:
+		return d.ReturningSchema
+	case *Merge:
+		return d.ReturningSchema
+	}
+	return nil
+}
+
 func toPlannerEndpoint(e parser.CopyEndpoint) CopyEndpoint {
 	switch e {
 	case parser.CopyEndpointStdin:
@@ -122,55 +206,230 @@ func toPlannerEndpoint(e parser.CopyEndpoint) CopyEndpoint {
 	return CopyEndpointStdin
 }
 
-// validateCopyOptions surfaces the obvious shape errors at plan time
-// — duplicate option names, unknown FORMAT values, malformed
-// HEADER. Anything semantically deeper (FORCE_QUOTE references
-// columns that aren't in the column list, etc.) is the executor's
-// problem; pinning those needs the row formatter context.
+// validateCopyOptions mirrors PostgreSQL's ProcessCopyOptions
+// (src/backend/commands/copy.c): a per-option pass that detects
+// redundant options and validates each option's value, followed by a
+// pass that rejects incompatible combinations (BINARY vs DELIMITER,
+// FORCE_QUOTE outside CSV / on COPY FROM, …). Both passes run at plan
+// time so the wire layer rejects the command *before* entering
+// copy-in mode — otherwise a bad COPY FROM STDIN would slurp the
+// following statements as data and desync the rest of the batch
+// (copy2 regress). Messages and check ordering are kept byte-compatible
+// with PG; only the SQLSTATE codes are carried for unit tests since
+// psql does not print them in the regress diff. M0097-0024.
+//
+// Anything semantically deeper (FORCE_QUOTE references columns that
+// aren't in the column list, encoding-name validity, …) is the
+// executor's problem; pinning those needs the row formatter context.
 func validateCopyOptions(s *parser.CopyStmt) error {
-	seen := make(map[string]struct{}, len(s.Options))
+	isFrom := s.Direction != parser.CopyTo
+
+	var (
+		formatSpecified                                        bool
+		csvMode, binary                                        bool
+		haveDelim, haveNull, haveQuote, haveEscape, haveHeader bool
+		haveEncoding, haveConvertSel                           bool
+		haveForceQuote, haveForceNotNull, haveForceNull        bool
+		freezeSpecified, freezeVal                             bool
+		onErrorSpecified, onErrorIsStop                        bool
+		logVerbositySpecified                                  bool
+		rejectLimitSpecified                                   bool
+	)
+
+	conflict := func(o parser.CopyOption) error {
+		// PG errorConflictingDefElem — caret on the redundant option.
+		return &PlanError{Pos: o.Pos(), Code: "42601", Message: "conflicting or redundant options"}
+	}
+
 	for _, o := range s.Options {
 		name := strings.ToLower(o.Name)
-		if _, dup := seen[name]; dup {
-			return &PlanError{
-				Pos:     o.Pos(),
-				Code:    "42601",
-				Message: fmt.Sprintf("option %q specified more than once", name),
-			}
-		}
-		seen[name] = struct{}{}
 		switch name {
 		case "format":
+			if formatSpecified {
+				return conflict(o)
+			}
+			formatSpecified = true
 			switch strings.ToLower(o.Value) {
-			case "text", "csv", "binary":
+			case "text":
+			case "csv":
+				csvMode = true
+			case "binary":
+				binary = true
 			case "":
 				return &PlanError{Pos: o.Pos(), Code: "42601", Message: "FORMAT requires a value"}
 			default:
-				return &PlanError{Pos: o.Pos(), Code: "0A000", Message: fmt.Sprintf("COPY format %q is not supported", o.Value)}
+				return &PlanError{Pos: o.Pos(), Code: "22023", Message: fmt.Sprintf("COPY format \"%s\" not recognized", o.Value)}
 			}
-		case "freeze", "binary", "csv":
-			// bare flags — accepted, value-less
+		case "freeze":
+			if freezeSpecified {
+				return conflict(o)
+			}
+			freezeSpecified = true
+			freezeVal = o.Bool || copyOptionBoolValue(o.Value)
+		case "delimiter":
+			if haveDelim {
+				return conflict(o)
+			}
+			haveDelim = true
+		case "null":
+			if haveNull {
+				return conflict(o)
+			}
+			haveNull = true
 		case "header":
-			// bare flag, or text true/false/on/off
+			if haveHeader {
+				return conflict(o)
+			}
+			haveHeader = true
 			if o.Value != "" {
 				switch strings.ToLower(o.Value) {
-				case "true", "false", "on", "off", "match":
+				case "true", "false", "on", "off", "0", "1", "match":
 				default:
-					return &PlanError{Pos: o.Pos(), Code: "42601", Message: fmt.Sprintf("HEADER value %q is not valid", o.Value)}
+					return &PlanError{Pos: o.Pos(), Code: "22023", Message: "header requires a Boolean value or \"match\""}
 				}
 			}
-		case "delimiter", "null", "quote", "escape", "encoding":
-			// must have a value (string)
-			if o.Bool {
-				return &PlanError{Pos: o.Pos(), Code: "42601", Message: fmt.Sprintf("%s requires a value", strings.ToUpper(name))}
+		case "quote":
+			if haveQuote {
+				return conflict(o)
 			}
-		case "force_quote", "force_not_null", "force_null":
+			haveQuote = true
+		case "escape":
+			if haveEscape {
+				return conflict(o)
+			}
+			haveEscape = true
+		case "force_quote":
+			if haveForceQuote {
+				return conflict(o)
+			}
+			haveForceQuote = true
 			if !o.Star && len(o.Cols) == 0 {
-				return &PlanError{Pos: o.Pos(), Code: "42601", Message: fmt.Sprintf("%s requires '*' or a column list", strings.ToUpper(name))}
+				return &PlanError{Pos: o.Pos(), Code: "22023", Message: fmt.Sprintf("argument to option \"%s\" must be a list of column names", name)}
+			}
+		case "force_not_null":
+			if haveForceNotNull {
+				return conflict(o)
+			}
+			haveForceNotNull = true
+			if !o.Star && len(o.Cols) == 0 {
+				return &PlanError{Pos: o.Pos(), Code: "22023", Message: fmt.Sprintf("argument to option \"%s\" must be a list of column names", name)}
+			}
+		case "force_null":
+			if haveForceNull {
+				return conflict(o)
+			}
+			haveForceNull = true
+			if !o.Star && len(o.Cols) == 0 {
+				return &PlanError{Pos: o.Pos(), Code: "22023", Message: fmt.Sprintf("argument to option \"%s\" must be a list of column names", name)}
+			}
+		case "convert_selectively":
+			if haveConvertSel {
+				return conflict(o)
+			}
+			haveConvertSel = true
+		case "encoding":
+			if haveEncoding {
+				return conflict(o)
+			}
+			haveEncoding = true
+		case "on_error":
+			if onErrorSpecified {
+				return conflict(o)
+			}
+			onErrorSpecified = true
+			// PG defGetCopyOnErrorChoice: direction check precedes value.
+			if !isFrom {
+				return &PlanError{Pos: o.Pos(), Code: "22023", Message: "COPY ON_ERROR cannot be used with COPY TO"}
+			}
+			switch strings.ToLower(o.Value) {
+			case "stop":
+				onErrorIsStop = true
+			case "ignore":
+			default:
+				return &PlanError{Pos: o.Pos(), Code: "22023", Message: fmt.Sprintf("COPY ON_ERROR \"%s\" not recognized", o.Value)}
+			}
+		case "log_verbosity":
+			if logVerbositySpecified {
+				return conflict(o)
+			}
+			logVerbositySpecified = true
+			switch strings.ToLower(o.Value) {
+			case "silent", "default", "verbose":
+			default:
+				return &PlanError{Pos: o.Pos(), Code: "22023", Message: fmt.Sprintf("COPY LOG_VERBOSITY \"%s\" not recognized", o.Value)}
+			}
+		case "reject_limit":
+			if rejectLimitSpecified {
+				return conflict(o)
+			}
+			rejectLimitSpecified = true
+			n, err := strconv.ParseInt(strings.TrimSpace(o.Value), 10, 64)
+			if o.Value == "" || err != nil {
+				return &PlanError{Pos: o.Pos(), Code: "42601", Message: fmt.Sprintf("%s requires a numeric value", name)}
+			}
+			if n <= 0 {
+				return &PlanError{Pos: o.Pos(), Code: "22023", Message: fmt.Sprintf("REJECT_LIMIT (%d) must be greater than zero", n)}
 			}
 		default:
-			return &PlanError{Pos: o.Pos(), Code: "0A000", Message: fmt.Sprintf("COPY option %q is not supported", o.Name)}
+			return &PlanError{Pos: o.Pos(), Code: "42601", Message: fmt.Sprintf("option \"%s\" not recognized", name)}
 		}
 	}
+
+	// Incompatible-combination pass — PG ProcessCopyOptions ordering.
+	if binary && haveDelim {
+		return &PlanError{Pos: s.Pos(), Code: "42601", Message: "cannot specify DELIMITER in BINARY mode"}
+	}
+	if binary && haveNull {
+		return &PlanError{Pos: s.Pos(), Code: "42601", Message: "cannot specify NULL in BINARY mode"}
+	}
+	if binary && haveHeader {
+		return &PlanError{Pos: s.Pos(), Code: "0A000", Message: "cannot specify HEADER in BINARY mode"}
+	}
+	if !csvMode && haveQuote {
+		return &PlanError{Pos: s.Pos(), Code: "0A000", Message: "COPY QUOTE requires CSV mode"}
+	}
+	if !csvMode && haveEscape {
+		return &PlanError{Pos: s.Pos(), Code: "0A000", Message: "COPY ESCAPE requires CSV mode"}
+	}
+	if !csvMode && haveForceQuote {
+		return &PlanError{Pos: s.Pos(), Code: "0A000", Message: "COPY FORCE_QUOTE requires CSV mode"}
+	}
+	if haveForceQuote && isFrom {
+		return &PlanError{Pos: s.Pos(), Code: "0A000", Message: "COPY FORCE_QUOTE cannot be used with COPY FROM"}
+	}
+	if !csvMode && haveForceNotNull {
+		return &PlanError{Pos: s.Pos(), Code: "0A000", Message: "COPY FORCE_NOT_NULL requires CSV mode"}
+	}
+	if haveForceNotNull && !isFrom {
+		return &PlanError{Pos: s.Pos(), Code: "22023", Message: "COPY FORCE_NOT_NULL cannot be used with COPY TO"}
+	}
+	if !csvMode && haveForceNull {
+		return &PlanError{Pos: s.Pos(), Code: "0A000", Message: "COPY FORCE_NULL requires CSV mode"}
+	}
+	if haveForceNull && !isFrom {
+		return &PlanError{Pos: s.Pos(), Code: "22023", Message: "COPY FORCE_NULL cannot be used with COPY TO"}
+	}
+	if freezeVal && !isFrom {
+		return &PlanError{Pos: s.Pos(), Code: "22023", Message: "COPY FREEZE cannot be used with COPY TO"}
+	}
+	if binary && onErrorSpecified && !onErrorIsStop {
+		return &PlanError{Pos: s.Pos(), Code: "42601", Message: "only ON_ERROR STOP is allowed in BINARY mode"}
+	}
+	if rejectLimitSpecified && !onErrorSpecified {
+		return &PlanError{Pos: s.Pos(), Code: "22023", Message: "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE"}
+	}
 	return nil
+}
+
+// copyOptionBoolValue interprets a COPY flag option's textual value as a
+// boolean (PG defGetBoolean). A bare flag is handled by the caller via
+// CopyOption.Bool; this covers the explicit `freeze off` / `freeze on`
+// forms.
+func copyOptionBoolValue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "on", "true", "yes", "1":
+		return true
+	default:
+		return false
+	}
 }

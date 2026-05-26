@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/binary"
 	"strings"
 	"testing"
 
@@ -185,6 +186,36 @@ func TestToastPointerCodecRoundTrip(t *testing.T) {
 	}
 	if string(decoded[1].BytesValue()) != string(ptr) {
 		t.Errorf("pointer bytes mismatch")
+	}
+}
+
+func TestDetoastValueRejectsImplausibleChunkCount(t *testing.T) {
+	ctx, cleanup := newToastFixture(t)
+	defer cleanup()
+
+	ptr := make([]byte, 12)
+	binary.BigEndian.PutUint32(ptr[0:4], 1)
+	binary.BigEndian.PutUint32(ptr[4:8], 16)
+	binary.BigEndian.PutUint32(ptr[8:12], maxDetoastChunks+1)
+
+	_, err := DetoastValue(ctx, storage.RelFileNode{DBOid: 1, RelOid: 2, Fork: storage.MainFork}, ptr)
+	if err == nil || !strings.Contains(err.Error(), "implausible chunk count") {
+		t.Fatalf("expected implausible chunk count error, got %v", err)
+	}
+}
+
+func TestDetoastValueRejectsImplausibleTotalLength(t *testing.T) {
+	ctx, cleanup := newToastFixture(t)
+	defer cleanup()
+
+	ptr := make([]byte, 12)
+	binary.BigEndian.PutUint32(ptr[0:4], 1)
+	binary.BigEndian.PutUint32(ptr[4:8], maxDetoastTotalLen+1)
+	binary.BigEndian.PutUint32(ptr[8:12], 1)
+
+	_, err := DetoastValue(ctx, storage.RelFileNode{DBOid: 1, RelOid: 2, Fork: storage.MainFork}, ptr)
+	if err == nil || !strings.Contains(err.Error(), "implausible total length") {
+		t.Fatalf("expected implausible total length error, got %v", err)
 	}
 }
 

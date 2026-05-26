@@ -161,10 +161,39 @@ func (m *Manager) Begin(iso IsolationLevel, procNums ...int32) (Transaction, err
 	if len(procNums) > 0 {
 		procNum = procNums[0]
 	} else {
-		// Auto-assign slots starting at 1 so Handle = TxnHandle(procNum) != 0.
+		// Auto-assign: scan for a free slot (inTxn==0) starting from slot 1.
 		// Slot 0 is reserved for connections that supply explicit procNum=0.
-		sz := int32(len(m.procArray.slots))
-		procNum = 1 + (m.autoProcNum.Add(1)-1)%(sz-1)
+		// CAS-based scan avoids colliding with slots held by active connections
+		// that pass an explicit procNum — the old counter-based approach falsely
+		// allocated slot 1 on the very first call, clobbering a live connection.
+		found := false
+		sz := len(m.procArray.slots)
+		for i := 1; i < sz; i++ {
+			if m.procArray.slots[i].inTxn.CompareAndSwap(0, 1) {
+				procNum = int32(i)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return Transaction{}, fmt.Errorf("mvcc: no free process slots for internal transaction")
+		}
+		// Initialise the slot fields before returning — skip the later block
+		// that does the same for explicit-procNum callers.
+		s := &m.procArray.slots[procNum]
+		s.xid.Store(0)
+		s.xmin.Store(^uint64(0))
+		s.firstSnap = nil
+		s.snapshotXmin = ^uint32(0)
+		s.isolation = int32(iso)
+		// inTxn already set to 1 by CAS above.
+		handle := TxnHandle(procNum + 1)
+		if iso == IsolationSerializable {
+			m.ssiMu.Lock()
+			m.registerSerializableLocked(handle)
+			m.ssiMu.Unlock()
+		}
+		return Transaction{Handle: handle, XID: storage.InvalidTransactionID, Isolation: iso}, nil
 	}
 	switch iso {
 	case IsolationReadCommitted, IsolationRepeatableRead, IsolationSerializable:

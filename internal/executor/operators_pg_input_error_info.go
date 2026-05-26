@@ -138,6 +138,12 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 			message = "invalid input syntax for type uuid: \"" + v + "\""
 			sqlCode = "22P02"
 		}
+	case "tid":
+		// tid: validate "(block,offset)" via tidin semantics. M0097-0036.
+		if _, _, ok := parseTidInput(v); !ok {
+			message = "invalid input syntax for type tid: \"" + v + "\""
+			sqlCode = "22P02"
+		}
 	case "int2vector":
 		// int2vector: space-separated int2 values. Validate each.
 		message, sqlCode = validateInt2Vector(v)

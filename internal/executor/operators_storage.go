@@ -793,6 +793,10 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// slot.Materialize().
 			o.slot.schema = o.schema
 			o.slot.row = row
+			// M0097-0038: inject current TID for CTIDExpr evaluation.
+			o.slot.hasCTID = true
+			o.slot.ctidBlock = uint32(o.curBlock)
+			o.slot.ctidOff = uint16(o.curSlot - 1)
 			return &o.slot, nil
 		}
 		o.releasePinned()
@@ -2802,9 +2806,6 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 		return
 	}
 	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
-		if !idx.Unique && !idx.Primary {
-			continue
-		}
 		idxRel := ctx.Catalog.IndexRelFileNode(idx)
 		tree, err := btree.Open(ctx.Pool, idxRel)
 		if err != nil {

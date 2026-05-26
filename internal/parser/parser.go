@@ -19,7 +19,6 @@ var tokenSlicePool = sync.Pool{
 	},
 }
 
-
 // SyntaxError is the parser's structured error. Message mirrors
 // upstream's `syntax error at or near "TOKEN"` shape so psql users
 // can reason about it.
@@ -52,7 +51,7 @@ func (e *SyntaxError) Error() string {
 // error so a caller passing `1 + 2; garbage` gets a clean
 // diagnostic.
 //
-// mc follows the same contract as Parse (M0107-0003 Phase C.3).
+// mc follows the same contract as Parse: it is a retained no-op (see Parse).
 func ParseExpr(input string, mc ...*mctx.Context) (Expr, error) {
 	var sctx *mctx.Context
 	if len(mc) > 0 {
@@ -62,13 +61,17 @@ func ParseExpr(input string, mc ...*mctx.Context) (Expr, error) {
 	var toks []Token
 	var sp *[]Token
 	var err error
-	if sctx != nil {
-		toks, err = lexInto(mctx.AllocSlice[Token](sctx, 64)[:0], input)
-	} else {
-		sp = tokenSlicePool.Get().(*[]Token)
-		toks, err = lexInto((*sp)[:0], input)
-		*sp = toks
-	}
+	// Fast path: the heap-backed tokenSlicePool (allocation-free in steady
+	// state). Token.Value is a Go string, so []Token must NOT be stored in an
+	// mctx []byte arena: the slab is a GC noscan span that hides Value
+	// pointers from the mark phase, and the cross-session plan cache retains
+	// some Value strings by reference and would dangle on arena release.
+	// The arena fast path is therefore permanently unsafe.
+	// See docs/design/0107-0003d-token-pool-gc-safety.md.
+	_ = sctx // mc is never used for token storage; retained for API compat.
+	sp = tokenSlicePool.Get().(*[]Token)
+	toks, err = lexInto((*sp)[:0], input)
+	*sp = toks
 	if err != nil {
 		if sp != nil {
 			tokenSlicePool.Put(sp)
@@ -104,11 +107,13 @@ func ParseExpr(input string, mc ...*mctx.Context) (Expr, error) {
 // non-empty statement. A trailing semicolon is allowed; an empty input
 // returns an empty slice and no error.
 //
-// mc is an optional mctx.Context for token-backing allocation (M0107-0003
-// Phase C.3). When provided, the token slice is allocated from mc's arena
-// and bulk-freed via mc.Release() without touching the GC heap.
-// When nil, the global tokenSlicePool is used (backward-compatible path
-// for tests and callers without a statement context).
+// mc was an optional mctx.Context for arena token-backing (M0107-0003 Phase
+// C.3). That fast path is permanently retired: []Token cannot live in an mctx
+// []byte arena because the slab is a GC noscan span (Token.Value pointers
+// become invisible to the collector) and the cross-session plan cache retains
+// some Value strings by reference (arena release would dangle them). mc is now
+// a no-op retained for source compatibility; tokens always come from the
+// heap-backed tokenSlicePool. See docs/design/0107-0003d-token-pool-gc-safety.md.
 func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
 	var sctx *mctx.Context
 	if len(mc) > 0 {
@@ -118,16 +123,14 @@ func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
 	var toks []Token
 	var sp *[]Token
 	var err error
-	if sctx != nil {
-		// M0107-0003 Phase C.3: allocate token backing from mctx arena.
-		// AllocSlice returns a slice of length 64; [:0] resets length while
-		// keeping the arena-backed capacity so lexInto appends in place.
-		toks, err = lexInto(mctx.AllocSlice[Token](sctx, 64)[:0], input)
-	} else {
-		sp = tokenSlicePool.Get().(*[]Token)
-		toks, err = lexInto((*sp)[:0], input)
-		*sp = toks
-	}
+	// Fast path: the heap-backed tokenSlicePool (allocation-free in steady
+	// state; backing array is a GC scan span so Token.Value stays reachable).
+	// See the function doc and docs/design/0107-0003d-token-pool-gc-safety.md
+	// for why the mctx arena variant is unsafe and was removed.
+	_ = sctx // mc is never used for token storage; retained for API compat.
+	sp = tokenSlicePool.Get().(*[]Token)
+	toks, err = lexInto((*sp)[:0], input)
+	*sp = toks
 	if err != nil {
 		if sp != nil {
 			tokenSlicePool.Put(sp)
@@ -209,6 +212,21 @@ func (p *parser) errAtCur(msg string) error {
 		near = "end of input"
 	}
 	return &SyntaxError{Pos: t.Pos, Message: msg + " (got " + near + ")"}
+}
+
+// errSyntaxAtCur returns a bare PostgreSQL-style "syntax error at or
+// near \"TOKEN\"" anchored at the current token, with no explanatory
+// suffix. Used where upstream's grammar simply has no production for
+// what follows (e.g. a FROM or column list after the query form of
+// COPY), so the diagnostic should point at the offending token and
+// say nothing more.
+func (p *parser) errSyntaxAtCur() error {
+	t := p.cur()
+	near := t.Value
+	if t.Kind == TokenEOF {
+		near = "end of input"
+	}
+	return &SyntaxError{Pos: t.Pos, Message: near}
 }
 
 // expectKeyword consumes the current token if it's the named keyword;
@@ -340,6 +358,8 @@ identLedStatement:
 		switch strings.ToLower(t.Value) {
 		case "fetch":
 			return p.parseFetchCursor()
+		case "move":
+			return p.parseMoveCursor()
 		case "close":
 			return p.parseCloseCursor()
 		case "refresh":
@@ -981,6 +1001,49 @@ func (p *parser) parseObjectList() ([]ObjectName, error) {
 	return out, nil
 }
 
+// parseOperatorName parses a PostgreSQL operator name for DROP OPERATOR.
+// An operator name is either a plain identifier (like "equals"), a sequence of
+// operator characters ("=", "===", "||"), or schema-qualified ("pg_catalog.=").
+// Returns errSyntaxAtCur for tokens that cannot start an operator name. M0097-regress.
+func (p *parser) parseOperatorName() (ObjectName, error) {
+	t := p.cur()
+	switch t.Kind {
+	case TokenIdent, TokenQuotedIdent:
+		p.advance()
+		name := identText(t)
+		if p.acceptSymbol(".") {
+			// Schema-qualified: schema.op
+			pos := p.cur().Pos
+			opName := ""
+			for p.cur().Kind == TokenOperator {
+				opName += p.cur().Value
+				p.advance()
+			}
+			if opName == "" {
+				return ObjectName{}, p.errSyntaxAtCur()
+			}
+			return ObjectName{pos: pos, Schema: name, Name: opName}, nil
+		}
+		return ObjectName{pos: t.Pos, Name: name}, nil
+	case TokenKeyword:
+		if IsColNameKeyword(Keyword(t.Value)) {
+			p.advance()
+			return ObjectName{pos: t.Pos, Name: t.Value}, nil
+		}
+		return ObjectName{}, p.errSyntaxAtCur()
+	case TokenOperator:
+		// Accumulate consecutive operator chars (e.g. "===").
+		opName := ""
+		pos := t.Pos
+		for p.cur().Kind == TokenOperator {
+			opName += p.cur().Value
+			p.advance()
+		}
+		return ObjectName{pos: pos, Name: opName}, nil
+	}
+	return ObjectName{}, p.errSyntaxAtCur()
+}
+
 // parseObjectName parses [schema.]name where each part is an
 // identifier (possibly quoted).
 func (p *parser) parseObjectName() (ObjectName, error) {
@@ -1252,17 +1315,24 @@ func (p *parser) parsePrepare() (Stmt, error) {
 		return nil, err
 	}
 	name := identText(nameIdent)
-	// Skip optional parameter type list: (type1, type2, …)
+	// Parse optional parameter type list: (type1, type2, …)
+	var paramTypes []string
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 		p.advance()
-		depth := 1
-		for depth > 0 && p.cur().Kind != TokenEOF {
-			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				depth++
-			} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
-				depth--
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				p.advance()
+				break
 			}
-			p.advance()
+			on, terr := p.parseTypeNameAfterCast()
+			if terr != nil {
+				paramTypes = append(paramTypes, "unknown")
+			} else {
+				paramTypes = append(paramTypes, on.Name)
+			}
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+				p.advance()
+			}
 		}
 	}
 	// Consume AS
@@ -1273,13 +1343,13 @@ func (p *parser) parsePrepare() (Stmt, error) {
 	}
 	// Parse the prepared query
 	if p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
-		return &PrepareStmt{pos: t.Pos, Name: name}, nil
+		return &PrepareStmt{pos: t.Pos, Name: name, ParamTypes: paramTypes}, nil
 	}
 	query, err := p.parseStatement()
 	if err != nil {
 		return nil, err
 	}
-	return &PrepareStmt{pos: t.Pos, Name: name, Query: query}, nil
+	return &PrepareStmt{pos: t.Pos, Name: name, ParamTypes: paramTypes, Query: query}, nil
 }
 
 // parseExecute: EXECUTE name [(param, …)] (M0096-0006)
@@ -1308,7 +1378,7 @@ func (p *parser) parseExecute() (Stmt, error) {
 
 // parseDeallocate: DEALLOCATE [PREPARE] {name | ALL} (M0096-0006)
 func (p *parser) parseDeallocate() (Stmt, error) {
-	t := p.advance() // DEALLOCATE
+	t := p.advance()               // DEALLOCATE
 	_ = p.acceptKeyword(KwPrepare) // optional PREPARE keyword
 	name := ""
 	if p.acceptKeyword(KwAll) {
@@ -1654,6 +1724,32 @@ func (p *parser) parseFetchCursor() (Stmt, error) {
 	p.advance()
 
 	return &FetchStmt{pos: pos, CursorName: cursorName, Count: count, Forward: forward}, nil
+}
+
+// parseMoveCursor parses MOVE [direction] [count] [FROM|IN] cursor_name.
+// MOVE repositions a cursor without returning rows; executed as a no-op.
+func (p *parser) parseMoveCursor() (Stmt, error) {
+	pos := p.cur().Pos
+	p.advance() // consume "move"
+	// Consume optional direction and count tokens.
+	p.acceptIdentKeyword("forward")
+	p.acceptIdentKeyword("backward")
+	p.acceptIdentKeyword("prior")
+	p.acceptKeyword(KwAll)
+	if p.cur().Kind == TokenIntLit {
+		if _, err := p.parseIntLit(); err != nil {
+			return nil, err
+		}
+	}
+	// Consume optional FROM or IN.
+	if !p.acceptKeyword(KwFrom) {
+		p.acceptKeyword(KwIn)
+	}
+	// Consume cursor name.
+	if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+		p.advance()
+	}
+	return &CompatNoopStmt{pos: pos, Tag: "MOVE"}, nil
 }
 
 // parseCloseCursor parses CLOSE {cursor_name|ALL}.

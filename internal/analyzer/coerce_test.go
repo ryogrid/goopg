@@ -180,8 +180,8 @@ func TestBinaryOpCrossNumericArithmetic(t *testing.T) {
 // silently accept truly incompatible pairs (e.g. text + integer).
 func TestInvalidCrossTypesStillError(t *testing.T) {
 	cases := []string{
-		"SELECT * FROM t WHERE name + qty > 0",    // text + int → error
-		"SELECT * FROM t WHERE qty = name",         // int = text → error
+		"SELECT * FROM t WHERE name + qty > 0", // text + int → error
+		"SELECT * FROM t WHERE qty = name",     // int = text → error
 	}
 	cat := newTestCatalog(t, "t",
 		[]catalog.Column{
@@ -214,6 +214,55 @@ func TestStringConcatMixedTypes(t *testing.T) {
 	for _, sql := range cases {
 		if err := analyzeWithCat(t, sql, cat); err != nil {
 			t.Errorf("string concat %q: unexpected error: %v", sql, err)
+		}
+	}
+}
+
+// TestSerialPseudotypeIntegerTypeCheck verifies that SERIAL / BIGSERIAL /
+// SMALLSERIAL columns type-check like their integer base (int4 / int8 / int2)
+// for comparison and arithmetic against integer literals. PostgreSQL resolves
+// the SERIAL pseudo-types to integers at CREATE TABLE time (pg_typeof reports
+// "integer"); goopg keeps "serial" as the stored catalog type (the INSERT
+// auto-increment path keys off it) but must treat it as numeric in analysis.
+// Regression: previously `serial_col = 1` raised 42804 "operator = has
+// incompatible operand types \"serial\" and \"int8\"" and `serial_col + 1`
+// raised "operator + requires numeric operands".
+func TestSerialPseudotypeIntegerTypeCheck(t *testing.T) {
+	cat := newTestCatalog(t, "t",
+		[]catalog.Column{
+			{Name: "s", Type: catalog.Type{Name: "serial"}},
+			{Name: "bs", Type: catalog.Type{Name: "bigserial"}},
+			{Name: "ss", Type: catalog.Type{Name: "smallserial"}},
+			{Name: "name", Type: catalog.Type{Name: "text"}},
+		})
+	ok := []string{
+		// comparison against an integer literal (literal is int8)
+		"SELECT * FROM t WHERE s = 1",
+		"SELECT * FROM t WHERE bs > 2",
+		"SELECT * FROM t WHERE ss <= 3",
+		// comparison between serial columns of different widths
+		"SELECT * FROM t WHERE s = bs",
+		"SELECT * FROM t WHERE ss < s",
+		// arithmetic
+		"SELECT s + 1 FROM t",
+		"SELECT bs * 2 FROM t",
+		"SELECT ss - 1 FROM t",
+		"SELECT s + bs FROM t",
+	}
+	for _, sql := range ok {
+		if err := analyzeWithCat(t, sql, cat); err != nil {
+			t.Errorf("serial type-check %q: unexpected error: %v", sql, err)
+		}
+	}
+	// Negative: serial is integer-like, NOT string-like — comparing a serial
+	// column to a text column must still error (guards against over-broadening).
+	bad := []string{
+		"SELECT * FROM t WHERE s = name",
+		"SELECT s + name FROM t",
+	}
+	for _, sql := range bad {
+		if err := analyzeWithCat(t, sql, cat); err == nil {
+			t.Errorf("expected type error for %q, got nil", sql)
 		}
 	}
 }

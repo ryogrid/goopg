@@ -2,6 +2,7 @@ package planner
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/analyzer"
@@ -85,12 +86,15 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateFunctionStmt, *parser.DropFunctionStmt,
 		*parser.CreateProcedureStmt, *parser.DropProcedureStmt,
 		*parser.CreateTriggerStmt, *parser.DropTriggerStmt,
+		*parser.DropRuleStmt,
 		*parser.DropCompatStmt,
 		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt,
 		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt,
 		*parser.CompatNoopStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
-		*parser.CreateDomainStmt, *parser.DropDomainStmt:
+		*parser.CreateDomainStmt, *parser.DropDomainStmt,
+		*parser.CreateAggregateStmt,
+		*parser.CreateOpClassStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,
@@ -259,6 +263,7 @@ func wrapWithTableoid(child Node, tableOID uint32, sourceIdx int16, pos int) Nod
 	out[len(in)] = SchemaColumn{Name: "tableoid", Type: catalog.Type{Name: "oid"}, SourceTableIdx: sourceIdx}
 	return &Project{pos: pos, Child: child, Targets: targets, schema: out}
 }
+
 // that stamps each produced SchemaColumn with the given
 // SourceTableIdx. Callers building rangeBindings thread their
 // per-FROM monotonic source identifier in here; legacy callers
@@ -328,6 +333,76 @@ func hasJoinClauses(items []parser.FromExpr) bool {
 	return false
 }
 
+// setOpKeyword renders a set-operation type as its SQL keyword for error
+// messages (matching PostgreSQL's "each UNION query must have …"). M0097-0024.
+// wrapSetOpSortLimit applies a trailing ORDER BY / LIMIT / OFFSET to a set
+// operation. Per SQL, sort keys reference the combined result's output
+// columns only — by 1-based position or by output column name — not arbitrary
+// expressions over the input relations. M0097-0024.
+func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog) (Node, error) {
+	out := node.Output()
+	ctx := newResolveContext(nil, out)
+	ctx.cat = cat
+
+	if len(s.OrderBy) > 0 {
+		keys := make([]SortKey, 0, len(s.OrderBy))
+		for _, sb := range s.OrderBy {
+			if ic, ok := sb.Expr.(*parser.IntegerConst); ok {
+				idx := int(ic.Value) - 1
+				if idx < 0 || idx >= len(out) {
+					return nil, &PlanError{
+						Pos:     sb.Expr.Pos(),
+						Code:    "42P10",
+						Message: fmt.Sprintf("ORDER BY position %d is not in select list", ic.Value),
+					}
+				}
+				keys = append(keys, SortKey{
+					Expr: &ColumnRef{pos: sb.Expr.Pos(), Index: idx, Name: out[idx].Name, Type: out[idx].Type},
+					Desc: sb.Desc,
+				})
+				continue
+			}
+			e, err := resolveExpr(sb.Expr, ctx)
+			if err != nil {
+				return nil, err
+			}
+			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc})
+		}
+		node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
+	}
+
+	if s.Limit != nil || s.Offset != nil {
+		var lim, off Expr
+		if s.Limit != nil {
+			e, err := resolveExpr(s.Limit, ctx)
+			if err != nil {
+				return nil, err
+			}
+			lim = e
+		}
+		if s.Offset != nil {
+			e, err := resolveExpr(s.Offset, ctx)
+			if err != nil {
+				return nil, err
+			}
+			off = e
+		}
+		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off}
+	}
+	return node, nil
+}
+
+func setOpKeyword(t parser.SetOpType) string {
+	switch t {
+	case parser.SetOpIntersect:
+		return "INTERSECT"
+	case parser.SetOpExcept:
+		return "EXCEPT"
+	default:
+		return "UNION"
+	}
+}
+
 func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// M0103-0008: indirection-star rewrite runs at Plan() entry
 	// before the analyzer; nested-SELECT planning paths (subqueries,
@@ -348,27 +423,34 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	defer restore()
 
 	if s.SetOp != nil {
-		if !s.SetOp.All || s.SetOp.Type != parser.SetOpUnion {
-			return nil, &PlanError{
-				Pos:     s.SetOp.Pos(),
-				Code:    "0A000",
-				Message: "set operations are not supported in v0 planner",
-			}
-		}
-		// UNION ALL: plan right side first, then left side with
-		// SetOp temporarily cleared to avoid infinite recursion.
-		right, err := planSelect(s.SetOp.Right, cat)
+		// Plan the right branch first, then the left branch with the
+		// SetOp chain temporarily cleared to avoid infinite recursion.
+		setOp := s.SetOp
+		right, err := planSelect(setOp.Right, cat)
 		if err != nil {
 			return nil, err
 		}
-		saved := s.SetOp
 		s.SetOp = nil
 		left, err := planSelect(s, cat)
-		s.SetOp = saved
+		s.SetOp = setOp
 		if err != nil {
 			return nil, err
 		}
-		return &SetOp{pos: s.Pos(), Left: left, Right: right, All: true}, nil
+		// Each branch must project the same number of columns. PostgreSQL
+		// reports this at parse-analysis time (SQLSTATE 42601). M0097-0024.
+		if lc, rc := len(left.Output()), len(right.Output()); lc != rc {
+			return nil, &PlanError{
+				Pos:     setOp.Pos(),
+				Code:    "42601",
+				Message: fmt.Sprintf("each %s query must have the same number of columns", setOpKeyword(setOp.Type)),
+			}
+		}
+		var node Node = &SetOp{pos: s.Pos(), Left: left, Right: right, Op: setOp.Type, All: setOp.All}
+		// A trailing ORDER BY / LIMIT / OFFSET binds to the whole set
+		// operation and references the combined output columns by name
+		// or 1-based position (PostgreSQL §7.6). copyselect uses
+		// `… UNION … ORDER BY 1`. M0097-0024.
+		return wrapSetOpSortLimit(s, node, cat)
 	}
 	// s.Distinct with empty target list is invalid in PostgreSQL (syntax error).
 	// With targets it is handled by wrapping the final plan with a Distinct node.
@@ -746,7 +828,9 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			}
 		}
 	}
+
 	proj := &Project{pos: s.Pos(), Child: node, Targets: targets, schema: schema}
+
 	// Promote to IndexOnlyScan (M0046-0004) only when there are no locking
 	// clauses. FOR UPDATE / FOR SHARE rely on the IndexScan leaf being
 	// accessible via lockRowsOp's currentTIDProvider chain.
@@ -792,6 +876,25 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	}
 	// Collapse all-constant sub-expressions in the final plan tree.
 	foldPlanConstants(out)
+	// DISTINCT ON (expr [, ...]): resolve each expression to surface unknown-column
+	// errors (e.g. "column foobar does not exist"). We don't implement the full
+	// DISTINCT ON semantics (ordered deduplication per expression prefix); we
+	// fall back to plain DISTINCT after validation. M0097-regress.
+	if len(s.DistinctOn) > 0 {
+		for _, dexpr := range s.DistinctOn {
+			var resolveErr error
+			if win != nil {
+				_, resolveErr = resolveExprAfterWindow(dexpr, win)
+			} else if agg == nil {
+				_, resolveErr = resolveExpr(dexpr, ctx)
+			} else {
+				_, resolveErr = resolveExprAfterAggregate(dexpr, agg)
+			}
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+		}
+	}
 	// SELECT DISTINCT: wrap the full plan with a Distinct node that deduplicates
 	// on the projected output. Applied after sorting so ORDER BY is respected.
 	// M0097-0005.
@@ -965,7 +1068,6 @@ func planFromRangeVars(from []parser.RangeVar, cat catalog.Catalog) (Node, *reso
 	}
 	return root, newResolveContext(bindings, root.Output()), nil
 }
-
 
 // nodeReferencesOuter reports whether the planned right-side FROM item
 // resolved any expression against the lateral outer context — i.e. the
@@ -1343,6 +1445,38 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 // each cell in a planner.StringConst so downstream Filter/Project
 // nodes can apply WHERE/SELECT predicates exactly as they do over a
 // SeqScan.
+// TypedVirtualCell returns a typed constant expression for a single virtual
+// catalog-table cell. The catalog supplies virtual rows as text; wrapping
+// every cell in a StringConst made integer-family and boolean columns compare
+// and aggregate *lexicographically* rather than by value — e.g. the
+// pg_backend_memory_contexts query `total_bytes >= free_bytes` evaluated
+// "1048576" >= "524288" as text (false) instead of 1048576 >= 524288 (true,
+// the sysviews-regress expectation). Integer-family and boolean column types
+// are now parsed to IntegerConst / BooleanConst so downstream Filter and
+// Aggregate nodes see the correct Datum kind. Any value that does not parse
+// for its declared type falls back to StringConst, preserving prior behavior
+// (and display is keyed on column type, so typed cells render identically).
+//
+// IMPORTANT: the executor's rematerialiseVirtualRows must call this same
+// helper — the two paths are siblings and must stay in sync (a virtual row
+// typed one way at plan time and another at Open would diverge silently).
+func TypedVirtualCell(pos int, value, colType string) Expr {
+	switch strings.ToLower(colType) {
+	case "int2", "int4", "int8", "integer", "bigint", "smallint":
+		if n, err := strconv.ParseInt(value, 10, 64); err == nil {
+			return &IntegerConst{pos: pos, Value: n}
+		}
+	case "bool", "boolean":
+		switch value {
+		case "t", "true", "TRUE", "yes", "on", "1":
+			return &BooleanConst{pos: pos, Value: true}
+		case "f", "false", "FALSE", "no", "off", "0":
+			return &BooleanConst{pos: pos, Value: false}
+		}
+	}
+	return &StringConst{pos: pos, Value: value}
+}
+
 func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 	var rows [][]Expr
 	if tbl.VirtualRows != nil {
@@ -1352,7 +1486,7 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 			cells := make([]Expr, len(tbl.Columns))
 			for j := range tbl.Columns {
 				if j < len(r) {
-					cells[j] = &StringConst{pos: pos, Value: r[j]}
+					cells[j] = TypedVirtualCell(pos, r[j], tbl.Columns[j].Type.Name)
 				} else {
 					cells[j] = &NullConst{pos: pos}
 				}
@@ -1510,7 +1644,6 @@ func rewriteIndirectionStarTargets(s *parser.SelectStmt) error {
 	return parser.RewriteIndirectionStarTargets(s, nil)
 }
 
-
 // projectSetCompositeSchema returns the expanded composite-row schema for a
 // supported set-returning function. nil means the SRF cannot be lowered into
 // ProjectSet from a `(srf(<agg>)).*` shape — currently only
@@ -1659,7 +1792,6 @@ func planPgInputErrorInfo(rv parser.RangeVar, sourceIdx int16) (Node, rangeBindi
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
-
 
 // planPgGetPublicationTables routes a FROM-clause invocation of
 // `pg_get_publication_tables(VARIADIC text[])` into a `PgGetPublicationTables`
@@ -2868,11 +3000,33 @@ func aggregateCallKey(fc *parser.FuncCall) string {
 		b.WriteString(parserExprKey(a))
 		b.WriteString("|")
 	}
+	// FILTER (WHERE ...) must be part of the dedup key: `count(*)` and
+	// `count(*) FILTER (WHERE p)` are distinct aggregates. Omitting it
+	// collapsed them onto one slot, so the filtered count silently
+	// reported the unfiltered total (e.g. sysviews pg_hba_file_rules
+	// `count(*) FILTER (WHERE error IS NOT NULL)`). M0097-0032.
+	if fc.Filter != nil {
+		b.WriteString("filter|")
+		b.WriteString(parserExprKey(fc.Filter))
+		b.WriteString("|")
+	}
 	return b.String()
 }
 
 func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (AggregateCall, error) {
 	name := strings.ToLower(fc.Name.Name)
+	// Resolve the FILTER (WHERE ...) predicate up front so every return path
+	// below carries it — including count(*) and zero-arg aggregates, which
+	// otherwise silently dropped the filter (e.g. `count(*) FILTER (WHERE c)`
+	// counted every row). M0097-0007 / M0097-0032.
+	var filterExpr Expr
+	if fc.Filter != nil {
+		var ferr error
+		filterExpr, ferr = resolveExpr(fc.Filter, inputCtx)
+		if ferr != nil {
+			return AggregateCall{}, ferr
+		}
+	}
 	if fc.Star {
 		if name != "count" || len(fc.Args) != 0 {
 			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: "only count(*) is supported with * aggregate arguments"}
@@ -2883,6 +3037,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 			Star:     true,
 			Distinct: fc.Distinct,
 			Type:     catalog.Type{Name: "int8"},
+			Filter:   filterExpr,
 		}, nil
 	}
 	// Many aggregates accept 0 or more args; only enforce 1-arg for the
@@ -2891,7 +3046,8 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 		// Zero-arg aggregates like count(*) handled above; all others need args.
 		return AggregateCall{
 			pos: fc.Pos(), Name: name, Distinct: fc.Distinct,
-			Type: catalog.Type{Name: "numeric"},
+			Type:   catalog.Type{Name: "numeric"},
+			Filter: filterExpr,
 		}, nil
 	}
 	argExpr, err := resolveExpr(fc.Args[0], inputCtx)
@@ -2914,15 +3070,6 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 	default:
 		// Extended aggregates (M0097-0007): accept but return null/stub type.
 		outType = catalog.Type{Name: "numeric"}
-	}
-	// Resolve FILTER (WHERE ...) predicate if present.
-	var filterExpr Expr
-	if fc.Filter != nil {
-		var ferr error
-		filterExpr, ferr = resolveExpr(fc.Filter, inputCtx)
-		if ferr != nil {
-			return AggregateCall{}, ferr
-		}
 	}
 	return AggregateCall{
 		pos:      fc.Pos(),
@@ -2957,6 +3104,13 @@ func parserExprKey(e parser.Expr) string {
 		return "c:" + strings.ToLower(x.Column)
 	case *parser.UnaryOp:
 		return "u:" + x.Op.String() + ":" + parserExprKey(x.Operand)
+	case *parser.IsNullExpr:
+		// Distinguish IS NULL from IS NOT NULL so two FILTER predicates that
+		// differ only by negation get different aggregate dedup keys.
+		if x.Negated {
+			return "isnotnull:(" + parserExprKey(x.Operand) + ")"
+		}
+		return "isnull:(" + parserExprKey(x.Operand) + ")"
 	case *parser.BinaryOp:
 		return "b:" + x.Op.String() + ":(" + parserExprKey(x.Left) + "):(" + parserExprKey(x.Right) + ")"
 	case *parser.FuncCall:
@@ -3369,7 +3523,6 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 	}
 	return nil
 }
-
 
 // rewriteUpdateDefaultMarkers substitutes `*parser.DefaultMarker`
 // expressions on the RHS of UPDATE SET assignments with the target
@@ -4073,7 +4226,13 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 		return nil, nil, &PlanError{Pos: star.Pos(), Code: "42601", Message: "SELECT * with no FROM clause"}
 	}
 	bset := ctx.bindings
-	if star.Table != "" || star.Schema != "" {
+	// A table-qualified star (`t.*`) expands to ALL of that table's
+	// columns, including any JOIN USING / NATURAL join columns — only an
+	// unqualified `*` merges (hides the right-side copy of) USING columns.
+	// PostgreSQL's expandRTE applies the join's merged column list only for
+	// the whole-row case, not for a per-relation `rel.*`. M0097-0036.
+	qualified := star.Table != "" || star.Schema != ""
+	if qualified {
 		matches := make([]rangeBinding, 0, 1)
 		for _, b := range ctx.bindings {
 			if bindingMatchesRelation(b, star.Table, star.Schema) {
@@ -4092,6 +4251,27 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 	outSchema := make(Schema, 0)
 	for _, b := range bset {
 		for i, c := range b.table.Columns {
+			// For an unqualified `SELECT *` over a JOIN USING / NATURAL
+			// join, the right-side copy of each merged column is hidden:
+			// PostgreSQL emits the join column once (from the left side),
+			// so the output is `using-cols, left-rest, right-rest`. The
+			// right binding carries usingHidden (set in planFromItem); the
+			// left binding does not, so its copy survives. Without this
+			// skip, `SELECT * FROM t1 JOIN t2 USING (id)` wrongly produced
+			// a duplicate `id` column (`id|t|id|t` vs PG's `id|t|t`).
+			// M0097-0036.
+			if !qualified && len(b.usingHidden) > 0 {
+				hidden := false
+				for _, uh := range b.usingHidden {
+					if strings.EqualFold(uh, c.Name) {
+						hidden = true
+						break
+					}
+				}
+				if hidden {
+					continue
+				}
+			}
 			idx := b.offset + i
 			outExpr = append(outExpr, &ColumnRef{pos: star.Pos(), Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
 			outSchema = append(outSchema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
@@ -4112,6 +4292,9 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	}
 	if cr, ok := e.(*ColumnRef); ok {
 		return cr.Name, cr.Type
+	}
+	if _, ok := e.(*CTIDExpr); ok {
+		return "ctid", catalog.Type{Name: "tid"}
 	}
 	// TypedStringLit `int2 'value'`: column name is the type name.
 	// Matches PostgreSQL's FigureColname() for `type 'string'` syntax. M0097-0003.
@@ -4200,6 +4383,8 @@ func exprType(e Expr) catalog.Type {
 		return catalog.Type{Name: "int8"}
 	case *TableOidExpr:
 		return catalog.Type{Name: "oid"}
+	case *CTIDExpr:
+		return catalog.Type{Name: "tid"}
 	case *StringConst:
 		return catalog.Type{Name: "text"}
 	case *BooleanConst:
@@ -4306,6 +4491,35 @@ func exprType(e Expr) catalog.Type {
 			"cardinality", "strpos", "position":
 			// String/array length functions return int4. M0097-0003.
 			return catalog.Type{Name: "int4"}
+		case "coalesce", "greatest", "least":
+			// Return the type of the first non-unknown argument (widest wins
+			// in practice since args are resolved before exprType is called).
+			for _, a := range x.Args {
+				t := exprType(a)
+				if t.Name != "unknown" && t.Name != "" {
+					return t
+				}
+			}
+		case "nullif":
+			// NULLIF returns the type of its first argument (nullable).
+			if len(x.Args) > 0 {
+				return exprType(x.Args[0])
+			}
+		case "pg_size_bytes",
+			"pg_database_size", "pg_relation_size", "pg_total_relation_size",
+			"pg_indexes_size", "pg_table_size":
+			return catalog.Type{Name: "int8"}
+		case "round", "ceil", "ceiling", "floor", "trunc", "sign":
+			// Preserve input numeric type; default to numeric when unknown.
+			if len(x.Args) > 0 {
+				t := exprType(x.Args[0])
+				if t.Name != "unknown" && t.Name != "" {
+					return t
+				}
+			}
+			return catalog.Type{Name: "numeric"}
+		case "power", "exp", "ln", "log", "sqrt":
+			return catalog.Type{Name: "float8"}
 		}
 		return catalog.Type{Name: "unknown"}
 	}
@@ -4327,7 +4541,9 @@ func isNumericTypeName(name string) bool {
 // (int2, int4, int8) for the purpose of arithmetic type promotion.
 func isIntegerLikeType(name string) bool {
 	switch strings.ToLower(name) {
-	case "int2", "smallint", "int4", "integer", "int", "int8", "bigint":
+	case "int2", "smallint", "int4", "integer", "int", "int8", "bigint",
+		// SERIAL family resolve to int2/int4/int8 (see analyzer.isNumericTypeName).
+		"smallserial", "serial", "bigserial":
 		return true
 	}
 	return false
@@ -4340,12 +4556,13 @@ func isIntegerLikeType(name string) bool {
 func promoteIntType(a, b string) catalog.Type {
 	a = strings.ToLower(a)
 	b = strings.ToLower(b)
-	aIsSmall := a == "int2" || a == "smallint"
-	bIsSmall := b == "int2" || b == "smallint"
-	aIsInt4 := a == "int4" || a == "integer" || a == "int"
-	bIsInt4 := b == "int4" || b == "integer" || b == "int"
-	aIsInt8 := a == "int8" || a == "bigint"
-	bIsInt8 := b == "int8" || b == "bigint"
+	// SERIAL family promote as their integer base (serial→int4, etc.).
+	aIsSmall := a == "int2" || a == "smallint" || a == "smallserial"
+	bIsSmall := b == "int2" || b == "smallint" || b == "smallserial"
+	aIsInt4 := a == "int4" || a == "integer" || a == "int" || a == "serial"
+	bIsInt4 := b == "int4" || b == "integer" || b == "int" || b == "serial"
+	aIsInt8 := a == "int8" || a == "bigint" || a == "bigserial"
+	bIsInt8 := b == "int8" || b == "bigint" || b == "bigserial"
 	switch {
 	case aIsInt8 || bIsInt8:
 		return catalog.Type{Name: "int8"}
@@ -4633,7 +4850,14 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			}
 			args = append(args, pa)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}, nil
+		varExp := false
+		for _, v := range x.Variadic {
+			if v {
+				varExp = true
+				break
+			}
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp}, nil
 	case *parser.StarExpr:
 		return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
 	case *parser.CastExpr:
@@ -4754,6 +4978,10 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		if strings.EqualFold(x.Column, "tableoid") {
 			return resolveTableoidForBinding(b, level, x.Pos()), true, nil
 		}
+		// `<rel>.ctid` system-column resolution. M0097-0038.
+		if strings.EqualFold(x.Column, "ctid") {
+			return &CTIDExpr{pos: x.Pos()}, true, nil
+		}
 		// The qualifier matched a binding at this level but the
 		// column didn't — that's a hard error (no point walking
 		// up; an outer-scope `t.c` for a different `t` would be
@@ -4813,6 +5041,22 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			return resolveTableoidForBinding(*matchB, level, x.Pos()), true, nil
 		}
 	}
+	// Unqualified `ctid` system-column resolution. M0097-0038.
+	if found == nil && strings.EqualFold(x.Column, "ctid") {
+		var matchB *rangeBinding
+		for i := range ctx.bindings {
+			if ctx.bindings[i].qualifiedOnly {
+				continue
+			}
+			if matchB != nil {
+				return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("column reference %q is ambiguous", x.Column)}
+			}
+			matchB = &ctx.bindings[i]
+		}
+		if matchB != nil {
+			return &CTIDExpr{pos: x.Pos()}, true, nil
+		}
+	}
 	if found != nil {
 		return found, true, nil
 	}
@@ -4856,7 +5100,6 @@ func bindingMatchesRelation(b rangeBinding, table, schema string) bool {
 	}
 	return false
 }
-
 
 // tryPromoteIndexOnlyScan examines a freshly-built Project node and promotes
 // it to an IndexOnlyScan (M0046-0004) when all of the following hold:
@@ -4963,7 +5206,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		for i, a := range x.Args {
 			args[i] = shiftColumnRefsBy(a, delta)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic}
 	case *CaseExpr:
 		whens := make([]CaseWhen, len(x.Whens))
 		for i, w := range x.Whens {
@@ -5016,9 +5259,16 @@ func isColumnFunctionallyDetermined(col *ColumnRef, agg *aggregateSurface) bool 
 			colByName[sc.Name] = i
 		}
 	}
-	// Check each primary key or unique index.
+	// Check each primary key. PostgreSQL's check_functional_grouping
+	// (src/backend/catalog/pg_constraint.c) recognises only PRIMARY KEY
+	// constraints for functional dependency — NOT unique constraints,
+	// since a unique constraint may be deferrable and (when nullable)
+	// permits multiple NULL rows that would not collapse under GROUP BY.
+	// The functional_deps regress test pins this: `GROUP BY title` on a
+	// UNIQUE NOT NULL column and `GROUP BY body` on a UNIQUE column both
+	// must fail, while `GROUP BY id` on the primary key succeeds.
 	for _, idx := range idxs {
-		if !idx.Primary && !idx.Unique {
+		if !idx.Primary {
 			continue
 		}
 		// Verify that all index columns are in the GROUP BY.

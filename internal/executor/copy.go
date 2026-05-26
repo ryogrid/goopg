@@ -55,6 +55,10 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 	}
 
 	binary = IsBinaryFormat(plan.Options)
+	var format copyToFormat
+	if !binary {
+		format = copyToFormatFromOptions(plan.Options)
+	}
 
 	src, cols, projection, buildErr := buildCopySource(plan)
 	if buildErr != nil {
@@ -70,6 +74,11 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 		hdr := CopyBinaryHeader()
 		if err := emit(hdr); err != nil {
 			return 0, true, err
+		}
+	} else if format.hasHeader() {
+		line := format.appendHeader(nil, cols)
+		if err := emit(line); err != nil {
+			return 0, false, err
 		}
 	}
 
@@ -92,9 +101,12 @@ func RunCopyTo(ctx *Context, plan *planner.Copy, emit func([]byte) error) (count
 		}
 		buf = buf[:0]
 		var encErr error
-		if binary {
+		switch {
+		case binary:
 			buf, encErr = AppendCopyBinaryRow(buf, row, cols)
-		} else {
+		case format.csv:
+			buf, encErr = EncodeCopyCsvRow(buf, row, cols, format)
+		default:
 			buf, encErr = EncodeCopyTextRow(buf, row, cols)
 		}
 		if encErr != nil {
@@ -130,8 +142,8 @@ type CopyFromExecutor struct {
 	rowsIn int64
 
 	// binary path state
-	binaryBuf         []byte
-	binaryHeaderSeen  bool
+	binaryBuf        []byte
+	binaryHeaderSeen bool
 }
 
 // NewCopyFromExecutor binds a CopyFromExecutor to ctx and plan.
@@ -253,7 +265,15 @@ func buildCopySource(plan *planner.Copy) (Operator, []catalog.Column, []int, err
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		schema := plan.Query.Output()
+		// Prefer the Copy node's resolved schema: data-modifying inner
+		// plans (Insert/Update/Delete) report Output()==nil even with a
+		// RETURNING clause, so the planner stashes the RETURNING schema
+		// on the Copy node directly. SELECT inner plans carry the same
+		// schema, sourced from their own Output().
+		schema := plan.Output()
+		if schema == nil {
+			schema = plan.Query.Output()
+		}
 		cols := make([]catalog.Column, len(schema))
 		for i, sc := range schema {
 			cols[i] = catalog.Column{Name: sc.Name, Type: sc.Type, Ordinal: i}

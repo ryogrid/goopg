@@ -18,16 +18,53 @@ package executor
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
+// Integer-overflow codes carried inline in ExprBinaryOp.payload[1]. The
+// compiled fast path (evalFastExpr) must apply the same int2/int4 range
+// checks that evalExprSlot does after integer arithmetic; without this the
+// fast path silently returns out-of-range results instead of raising
+// "smallint/integer out of range" (regression from the M0107-0003 fast
+// expression evaluator — see docs/design/0097-0037-fast-path-int-overflow.md).
+const (
+	ovfNone uint8 = 0 // no range check (int8/text/bool/etc.)
+	ovfInt2 uint8 = 1 // result type int2/smallint
+	ovfInt4 uint8 = 2 // result type int4/integer
+)
+
+// overflowCodeForType maps a BinaryOp ResultType to its inline overflow code.
+// Mirrors the int2/int4 cases of the overflow switch in evalExprSlot.
+func overflowCodeForType(resultType string) uint8 {
+	switch strings.ToLower(resultType) {
+	case "int2", "smallint":
+		return ovfInt2
+	case "int4", "integer", "int":
+		return ovfInt4
+	}
+	return ovfNone
+}
+
+// isFloatResultType reports whether a BinaryOp ResultType denotes a
+// floating-point type. Float arithmetic needs evalExprSlot's float64 code
+// path (the fast path's exact integer/decimal arithmetic diverges from
+// PostgreSQL float8 semantics), so such BinaryOps fall back to ExprAdapter.
+func isFloatResultType(resultType string) bool {
+	switch strings.ToLower(resultType) {
+	case "float8", "double precision", "double", "float4", "real", "float":
+		return true
+	}
+	return false
+}
+
 // ExprKind discriminates ExprNode kinds in the expression-tree slab.
 type ExprKind uint8
 
 const (
-	ExprInvalid  ExprKind = iota
+	ExprInvalid   ExprKind = iota
 	ExprColumnRef          // payload[0:4] = int32 column index
 	ExprIntConst           // payload[0:8] = int64 value
 	ExprBoolConst          // payload[0] = 0 (false) or 1 (true)
@@ -50,9 +87,9 @@ const noExpr = int32(-1)
 type ExprNode struct {
 	Kind    ExprKind
 	_pad    [3]byte
-	childA  int32    // left/only child index; noExpr if none
-	childB  int32    // right child index; noExpr if none
-	payload [40]byte // per-Kind inline data (see constants above)
+	childA  int32        // left/only child index; noExpr if none
+	childB  int32        // right child index; noExpr if none
+	payload [40]byte     // per-Kind inline data (see constants above)
 	orig    planner.Expr // non-nil only for ExprAdapter
 }
 
@@ -96,6 +133,13 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		return idx
 
 	case *planner.BinaryOp:
+		// Float-typed arithmetic must use evalExprSlot's float64 path; the
+		// fast path's exact arithmetic diverges from PostgreSQL float8 output.
+		if isFloatResultType(t.ResultType) {
+			idx := int32(len(*s))
+			*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
+			return idx
+		}
 		// Reserve this node's slot BEFORE recursing into children so the
 		// index is stable even if subsequent appends reallocate the slab.
 		idx := int32(len(*s))
@@ -105,6 +149,9 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 		(*s)[idx].childA = childA
 		(*s)[idx].childB = childB
 		(*s)[idx].payload[0] = uint8(t.Op)
+		// payload[1] carries the int2/int4 overflow code so evalFastExpr can
+		// apply the same range check evalExprSlot does. M0097 regression fix.
+		(*s)[idx].payload[1] = overflowCodeForType(t.ResultType)
 		return idx
 
 	case *planner.UnaryOp:
@@ -163,7 +210,7 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		// matching evalExprSlot behaviour.
 		switch op {
 		case parser.OpAnd:
-			if left.IsNull() || !left.BoolValue() {
+			if !left.IsNull() && !left.BoolValue() {
 				return left, nil
 			}
 		case parser.OpOr:
@@ -175,7 +222,26 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		if err != nil {
 			return Datum{}, err
 		}
-		return evalBinary(op, left, right, 0)
+		result, err := evalBinary(op, left, right, 0)
+		if err != nil {
+			return Datum{}, err
+		}
+		// Integer-overflow check, mirroring evalExprSlot. The fast path
+		// previously skipped this, silently returning out-of-range int2/int4
+		// arithmetic results. M0097 regression fix.
+		if result.Kind == KindInt {
+			switch n.payload[1] {
+			case ovfInt2:
+				if result.Int < -32768 || result.Int > 32767 {
+					return Datum{}, &ExecError{Code: "22003", Message: "smallint out of range"}
+				}
+			case ovfInt4:
+				if result.Int < -2147483648 || result.Int > 2147483647 {
+					return Datum{}, &ExecError{Code: "22003", Message: "integer out of range"}
+				}
+			}
+		}
+		return result, nil
 
 	case ExprUnaryOp:
 		if n.childA == noExpr {

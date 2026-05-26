@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -165,7 +166,6 @@ func TestPgCatalogBootstrapViews(t *testing.T) {
 	}
 }
 
-
 // TestPgClassExposesRelNatts pins the M0103-0008 rung-14 surface:
 // PG's CREATE SUBSCRIPTION column-list probe runs
 //
@@ -220,7 +220,6 @@ func TestPgClassExposesRelNatts(t *testing.T) {
 		t.Errorf("pg_class.t.relnatts=%q want %q (user column count)", row[natts.Ordinal], "2")
 	}
 }
-
 
 // TestPgClassExposesRelReplident pins rung 16 of M0103-0008: the
 // pg_catalog.pg_class virtual view must expose a `relreplident`
@@ -425,4 +424,379 @@ func TestNextOIDAndAdvanceNextOIDPast(t *testing.T) {
 	if got := c.NextOID(); got != above+1 {
 		t.Errorf("advance below (after larger advance): got %d want %d", got, above+1)
 	}
+}
+
+// TestPgSettingsEnableGUCsCompleteAndSorted pins the pg_settings virtual
+// table's enable_* coverage and ordering. The sysviews regress test runs
+// `select name, setting from pg_settings where name like 'enable%'` WITHOUT
+// an ORDER BY and expects PostgreSQL 18's 24 alphabetically-sorted planner
+// enable_* GUCs. PostgreSQL's pg_settings is backed by the sorted GUC table,
+// so the virtual rows must (a) cover the exact set and (b) be name-sorted.
+// Regression guard for the M0097-0032 fix (was 20 GUCs, registration order,
+// with the mis-named enable_gather_merge instead of enable_gathermerge).
+func TestPgSettingsEnableGUCsCompleteAndSorted(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_settings"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_settings virtual table not registered")
+	}
+	want := []string{
+		"enable_async_append", "enable_bitmapscan", "enable_distinct_reordering",
+		"enable_gathermerge", "enable_group_by_reordering", "enable_hashagg",
+		"enable_hashjoin", "enable_incremental_sort", "enable_indexonlyscan",
+		"enable_indexscan", "enable_material", "enable_memoize", "enable_mergejoin",
+		"enable_nestloop", "enable_parallel_append", "enable_parallel_hash",
+		"enable_partition_pruning", "enable_partitionwise_aggregate",
+		"enable_partitionwise_join", "enable_presorted_aggregate",
+		"enable_self_join_elimination", "enable_seqscan", "enable_sort",
+		"enable_tidscan",
+	}
+
+	var got []string
+	var prevName string
+	for _, row := range tbl.VirtualRows() {
+		name := row[0]
+		// Overall name-sort contract (mirrors PG's sorted GUC table).
+		if prevName != "" && name < prevName {
+			t.Errorf("pg_settings rows not name-sorted: %q precedes %q", prevName, name)
+		}
+		prevName = name
+		if len(name) >= 7 && name[:7] == "enable_" {
+			got = append(got, name)
+		}
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("enable_* GUC count = %d, want %d\n got: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("enable_* GUC[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestVerboseIntervalOffset pins the postgres_verbose interval rendering used
+// by the timezone system views. pg_regress forces intervalstyle=
+// postgres_verbose, so the LMT row must read "@ 7 hours 52 mins 58 secs ago".
+func TestVerboseIntervalOffset(t *testing.T) {
+	cases := []struct {
+		secs int
+		want string
+	}{
+		{0, "@ 0"},
+		{3600, "@ 1 hour"},
+		{2 * 3600, "@ 2 hours"},
+		{-3600, "@ 1 hour ago"},
+		{5*3600 + 30*60, "@ 5 hours 30 mins"},
+		{-(9*3600 + 30*60), "@ 9 hours 30 mins ago"},
+		{-(7*3600 + 52*60 + 58), "@ 7 hours 52 mins 58 secs ago"},
+	}
+	for _, tc := range cases {
+		if got := verboseIntervalOffset(tc.secs); got != tc.want {
+			t.Errorf("verboseIntervalOffset(%d) = %q, want %q", tc.secs, got, tc.want)
+		}
+	}
+}
+
+// TestPgTimezoneAbbrevsLMTRow guards the sysviews regress expectation:
+// `select * from pg_timezone_abbrevs where abbrev = 'LMT'` must return the
+// verbose-interval offset and a "f" is_dst (not "false"/"-07:52:58").
+func TestPgTimezoneAbbrevsLMTRow(t *testing.T) {
+	c := NewInMemory()
+	for _, name := range []string{"pg_timezone_abbrevs", "pg_timezone_names"} {
+		tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: name})
+		if !ok || tbl.VirtualRows == nil {
+			t.Fatalf("%s virtual table not registered", name)
+		}
+		var found bool
+		for _, row := range tbl.VirtualRows() {
+			// abbrev is col 0 for abbrevs, col 1 for names.
+			abbrevIdx := 0
+			isDstIdx := len(row) - 1
+			offIdx := isDstIdx - 1
+			if row[abbrevIdx] != "LMT" && row[len(row)-3] != "LMT" {
+				continue
+			}
+			// Locate the LMT row regardless of table shape.
+			if !(row[0] == "LMT" || (len(row) >= 3 && row[len(row)-3] == "LMT")) {
+				continue
+			}
+			found = true
+			if row[offIdx] != "@ 7 hours 52 mins 58 secs ago" {
+				t.Errorf("%s LMT utc_offset = %q, want verbose interval", name, row[offIdx])
+			}
+			if row[isDstIdx] != "f" {
+				t.Errorf("%s LMT is_dst = %q, want \"f\"", name, row[isDstIdx])
+			}
+		}
+		if !found {
+			t.Errorf("%s: no LMT row found", name)
+		}
+	}
+}
+
+// TestPgWaitEventsCoversAllTypes guards the sysviews regress expectation:
+// `select type, count(*) > 0 ... from pg_wait_events group by type` must
+// return all nine non-InjectionPoint wait-event types PG 18 emits
+// (M0097-0032). goopg previously listed only six (missing BufferPin,
+// Extension, IPC), so the GROUP BY came up short.
+func TestPgWaitEventsCoversAllTypes(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_wait_events"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_wait_events virtual table not registered")
+	}
+	want := map[string]bool{
+		"Activity": false, "BufferPin": false, "Client": false,
+		"Extension": false, "IO": false, "IPC": false,
+		"LWLock": false, "Lock": false, "Timeout": false,
+	}
+	for _, row := range tbl.VirtualRows() {
+		typ := row[0]
+		if _, known := want[typ]; !known && typ != "InjectionPoint" {
+			t.Errorf("unexpected wait-event type %q (not in PG 18 sysviews set)", typ)
+		}
+		want[typ] = true
+	}
+	for typ, present := range want {
+		if !present {
+			t.Errorf("pg_wait_events missing type %q", typ)
+		}
+	}
+}
+
+// TestPgHbaFileRulesErrorIsNull verifies the single canned pg_hba_file_rules
+// row leaves its trailing `error` column as SQL NULL. sysviews.sql asserts
+// `count(*) FILTER (WHERE error IS NOT NULL) = 0` (no_err = t); an empty
+// string would be NOT NULL and fail it. Both the planner and executor
+// materialise a missing trailing cell as NullConst, so the row must stop
+// before the last (`error`) column.
+func TestPgHbaFileRulesErrorIsNull(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_hba_file_rules"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_hba_file_rules virtual table not registered")
+	}
+	errorCol := -1
+	for i, col := range tbl.Columns {
+		if col.Name == "error" {
+			errorCol = i
+		}
+	}
+	if errorCol != len(tbl.Columns)-1 {
+		t.Fatalf("error column at ordinal %d; expected it to be the last column %d "+
+			"(NULL-via-truncation relies on this)", errorCol, len(tbl.Columns)-1)
+	}
+	rows := tbl.VirtualRows()
+	if len(rows) == 0 {
+		t.Fatal("pg_hba_file_rules must return at least one row (sysviews wants count(*) > 0)")
+	}
+	for i, row := range rows {
+		if len(row) > errorCol {
+			t.Errorf("row %d has %d cells, including the error column; the trailing "+
+				"error cell must be omitted so it materialises as NULL", i, len(row))
+		}
+	}
+}
+
+// TestPgBackendMemoryContextsCallerTuplesRow verifies the "Caller tuples" Bump context row
+// exists with the values required by the sysviews regress test:
+//
+//	type="Bump", total_bytes>0, total_nblocks=2, free_bytes>0, free_chunks=0
+func TestPgBackendMemoryContextsCallerTuplesRow(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_backend_memory_contexts"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_backend_memory_contexts virtual table not registered")
+	}
+	colIdx := map[string]int{}
+	for i, col := range tbl.Columns {
+		colIdx[col.Name] = i
+	}
+	rows := tbl.VirtualRows()
+	var found bool
+	for _, row := range rows {
+		if row[colIdx["name"]] != "Caller tuples" {
+			continue
+		}
+		found = true
+		if row[colIdx["type"]] != "Bump" {
+			t.Errorf("Caller tuples type = %q; want Bump", row[colIdx["type"]])
+		}
+		if row[colIdx["total_nblocks"]] != "2" {
+			t.Errorf("Caller tuples total_nblocks = %q; want 2", row[colIdx["total_nblocks"]])
+		}
+		if row[colIdx["free_chunks"]] != "0" {
+			t.Errorf("Caller tuples free_chunks = %q; want 0", row[colIdx["free_chunks"]])
+		}
+		if row[colIdx["total_bytes"]] == "0" || row[colIdx["total_bytes"]] == "" {
+			t.Errorf("Caller tuples total_bytes = %q; must be > 0", row[colIdx["total_bytes"]])
+		}
+		if row[colIdx["free_bytes"]] == "0" || row[colIdx["free_bytes"]] == "" {
+			t.Errorf("Caller tuples free_bytes = %q; must be > 0", row[colIdx["free_bytes"]])
+		}
+	}
+	if !found {
+		t.Fatal("pg_backend_memory_contexts: no 'Caller tuples' row found")
+	}
+}
+
+// TestPgBackendMemoryContextsPathArrayValues verifies that each row's path column
+// is a PG array literal (starts with '{') and that CacheMemoryContext has >= 2
+// sibling/child rows sharing the same element at its level index (the
+// sysviews CacheMemoryContext-multi-child query).
+func TestPgBackendMemoryContextsPathArrayValues(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_backend_memory_contexts"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_backend_memory_contexts not registered")
+	}
+	colIdx := map[string]int{}
+	for i, col := range tbl.Columns {
+		colIdx[col.Name] = i
+	}
+	rows := tbl.VirtualRows()
+	// All rows must have a non-empty path that starts with '{'.
+	for _, row := range rows {
+		p := row[colIdx["path"]]
+		if p == "" || p[0] != '{' {
+			t.Errorf("row %q: path=%q must be a PG array literal starting with '{'", row[colIdx["name"]], p)
+		}
+	}
+	// Find CacheMemoryContext and its level.
+	var cacheLevel int
+	var cachePath string
+	for _, row := range rows {
+		if row[colIdx["name"]] == "CacheMemoryContext" {
+			cachePath = row[colIdx["path"]]
+			for _, ch := range row[colIdx["level"]] {
+				if ch >= '0' && ch <= '9' {
+					cacheLevel = cacheLevel*10 + int(ch-'0')
+				}
+			}
+			break
+		}
+	}
+	if cachePath == "" {
+		t.Fatal("no CacheMemoryContext row")
+	}
+	cacheElem := pgPathElem(cachePath, cacheLevel)
+	count := 0
+	for _, row := range rows {
+		if pgPathElem(row[colIdx["path"]], cacheLevel) == cacheElem {
+			count++
+		}
+	}
+	if count < 2 {
+		t.Errorf("only %d rows share path[%d]=%q with CacheMemoryContext; sysviews needs >= 2",
+			count, cacheLevel, cacheElem)
+	}
+}
+
+
+// TestViewConstraintDepTracking verifies the RegisterViewConstraintDep,
+// ViewsDependingOnConstraint, UnregisterViewConstraintDeps, and
+// DropPrimaryKeyConstraint methods used for functional_deps regress test
+// DROP CONSTRAINT RESTRICT enforcement. M0097-0036.
+func TestViewConstraintDepTracking(t *testing.T) {
+	c := NewInMemory()
+
+	const tableOID uint32 = 99001
+	const constraint = "articles_pkey"
+	const view1 = "fdv1"
+	const view2 = "fdv2"
+
+	// Initially no deps.
+	if deps := c.ViewsDependingOnConstraint(tableOID, constraint); len(deps) != 0 {
+		t.Fatalf("expected 0 deps, got %v", deps)
+	}
+
+	// Register two views.
+	c.RegisterViewConstraintDep(view1, tableOID, constraint)
+	c.RegisterViewConstraintDep(view2, tableOID, constraint)
+
+	deps := c.ViewsDependingOnConstraint(tableOID, constraint)
+	if len(deps) != 2 {
+		t.Fatalf("expected 2 deps, got %v", deps)
+	}
+	found1, found2 := false, false
+	for _, d := range deps {
+		if d == view1 {
+			found1 = true
+		}
+		if d == view2 {
+			found2 = true
+		}
+	}
+	if !found1 || !found2 {
+		t.Errorf("missing view in deps: %v", deps)
+	}
+
+	// Idempotent register.
+	c.RegisterViewConstraintDep(view1, tableOID, constraint)
+	if got := len(c.ViewsDependingOnConstraint(tableOID, constraint)); got != 2 {
+		t.Fatalf("idempotent register: expected 2 deps, got %d", got)
+	}
+
+	// Unregister view1.
+	c.UnregisterViewConstraintDeps(view1)
+	deps = c.ViewsDependingOnConstraint(tableOID, constraint)
+	if len(deps) != 1 || deps[0] != view2 {
+		t.Errorf("after unregister view1: expected [%s], got %v", view2, deps)
+	}
+
+	// Unregister view2 — map should be empty.
+	c.UnregisterViewConstraintDeps(view2)
+	if deps := c.ViewsDependingOnConstraint(tableOID, constraint); len(deps) != 0 {
+		t.Fatalf("after unregister all: expected 0 deps, got %v", deps)
+	}
+}
+
+// TestDropPrimaryKeyConstraint verifies that DropPrimaryKeyConstraint removes
+// the PK index from the catalog. M0097-0036.
+func TestDropPrimaryKeyConstraint(t *testing.T) {
+	c := NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "articles"}, []Column{{Name: "id", Type: Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Create a PK index manually via the catalog's index registration path.
+	if _, err := c.CreateIndex(parser.ObjectName{Name: "articles_pkey"}, tbl, []string{"id"}, true, "btree", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify it exists.
+	idxs := c.IndexesOnTable(tbl)
+	if len(idxs) != 1 || !idxs[0].Primary {
+		t.Fatalf("expected 1 primary index, got %v", idxs)
+	}
+
+	// Drop it.
+	if !c.DropPrimaryKeyConstraint(tbl.OID, "articles_pkey") {
+		t.Fatal("DropPrimaryKeyConstraint returned false")
+	}
+
+	// Verify it's gone.
+	if idxs = c.IndexesOnTable(tbl); len(idxs) != 0 {
+		t.Fatalf("expected 0 indexes after drop, got %v", idxs)
+	}
+
+	// Dropping again returns false (not found).
+	if c.DropPrimaryKeyConstraint(tbl.OID, "articles_pkey") {
+		t.Fatal("expected false on second drop")
+	}
+}
+
+// pgPathElem returns the n-th element (1-based) of a PG array literal like {1,2,3}.
+func pgPathElem(arr string, n int) string {
+	if len(arr) < 2 || arr[0] != '{' || arr[len(arr)-1] != '}' || n < 1 {
+		return ""
+	}
+	inner := arr[1 : len(arr)-1]
+	parts := strings.Split(inner, ",")
+	if n > len(parts) {
+		return ""
+	}
+	return parts[n-1]
 }

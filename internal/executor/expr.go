@@ -125,6 +125,13 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// `tableoid` slot added by the partition-union wrapper.
 		// M0100-0005y.
 		return Datum{Kind: KindInt, Int: int64(x.TableOID)}, nil
+	case *planner.CTIDExpr:
+		// `ctid` system column: per-row TID injected by seqScanOp
+		// into MaterializedSlot.hasCTID. M0097-0038.
+		if ms, ok := slot.(*MaterializedSlot); ok && ms.hasCTID {
+			return NewStringDatum(fmt.Sprintf("(%d,%d)", ms.ctidBlock, ms.ctidOff)), nil
+		}
+		return NullDatum, nil
 	case *planner.NumericConst:
 		m, s, err := parseNumeric(x.Value)
 		if err != nil {
@@ -1188,6 +1195,11 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return NewStringDatum("false"), nil
 		case KindInt:
 			return NewStringDatum(strconv.FormatInt(d.Int, 10)), nil
+		case KindTime:
+			if isTimeOnlyValue(d.TimeValue()) {
+				return NewStringDatum(string(appendTimeOnlyValueText(nil, d.TimeValue()))), nil
+			}
+			return NewStringDatum(d.Format()), nil
 		case KindString:
 			s := d.StringValue()
 			// For "char" (internal 1-byte type), interpret backslash-octal escapes
@@ -1309,8 +1321,103 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return NewTimeDatum(ts), nil
 		}
 		return d, nil
+	case "tid":
+		// Cast to tid: parse/validate "(block,offset)" and re-emit the
+		// canonical form. PostgreSQL's tidin treats block as an unsigned
+		// 32-bit BlockNumber (so '(-1,0)' normalises to '(4294967295,0)')
+		// and offset as an unsigned 16-bit OffsetNumber. M0097-0036.
+		if d.Kind == KindString {
+			block, offset, ok := parseTidInput(d.StringValue())
+			if !ok {
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type tid: %q", d.StringValue())}
+			}
+			return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
+		}
+		return d, nil
 	}
 	return d, nil // pass-through for unknown types
+}
+
+// cStrtoul10Full emulates C strtoul(s, &end, 10) followed by PostgreSQL's
+// "fully consumed" check used in tidin: it skips leading C whitespace, accepts
+// an optional +/- sign, then base-10 digits, and requires the digits to run to
+// the end of s (so any trailing junk before the delimiter is rejected, matching
+// "*badp != DELIM"). Negative inputs wrap modulo 2^64 like C unsigned
+// arithmetic. ok is false when no digits were present or trailing junk remains;
+// overflow is true when the magnitude exceeds 64 bits (C would set ERANGE).
+func cStrtoul10Full(s string) (val uint64, ok bool, overflow bool) {
+	i := 0
+	for i < len(s) {
+		switch s[i] {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
+			i++
+			continue
+		}
+		break
+	}
+	neg := false
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		neg = s[i] == '-'
+		i++
+	}
+	start := i
+	var v uint64
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		nv := v*10 + uint64(s[i]-'0')
+		if nv < v {
+			overflow = true
+		}
+		v = nv
+		i++
+	}
+	if i == start || i != len(s) {
+		return 0, false, false
+	}
+	if neg {
+		v = -v // two's-complement negation modulo 2^64
+	}
+	return v, true, overflow
+}
+
+// parseTidInput parses a tid external representation "(block,offset)" exactly
+// as PostgreSQL's tidin (src/backend/utils/adt/tid.c): block is a BlockNumber
+// (uint32) accepted via strtoul with the wider-than-32-bit round-trip guard
+// (so '-1' → 4294967295 but '4294967296' is rejected), and offset is an
+// OffsetNumber (uint16) bounded by USHRT_MAX. Returns ok=false on any malformed
+// or out-of-range input. M0097-0036.
+func parseTidInput(str string) (block uint32, offset uint16, ok bool) {
+	lp := strings.IndexByte(str, '(')
+	if lp < 0 {
+		return 0, 0, false
+	}
+	rest := str[lp+1:]
+	comma := strings.IndexByte(rest, ',')
+	if comma < 0 {
+		return 0, 0, false
+	}
+	offPart := rest[comma+1:]
+	rp := strings.IndexByte(offPart, ')')
+	if rp < 0 {
+		return 0, 0, false
+	}
+
+	bcvt, bok, bovf := cStrtoul10Full(rest[:comma])
+	if !bok || bovf {
+		return 0, 0, false
+	}
+	block = uint32(bcvt)
+	// PG's SIZEOF_LONG > 4 guard: accept only values that round-trip through
+	// either the unsigned or sign-extended 32-bit truncation.
+	if bcvt != uint64(block) && bcvt != uint64(int64(int32(block))) {
+		return 0, 0, false
+	}
+
+	ocvt, ook, oovf := cStrtoul10Full(offPart[:rp])
+	if !ook || oovf || ocvt > 65535 {
+		return 0, 0, false
+	}
+	return block, uint16(ocvt), true
 }
 
 // parseXid parses an xid value (unsigned 32-bit). Accepts decimal, octal (0NNN), hex (0xNNN).
@@ -1368,50 +1475,128 @@ func parsePgSnapshotValid(s string) bool {
 // sizePretty formats a byte count as a human-readable size string, matching
 // PostgreSQL's pg_size_pretty() output. Uses 1024-based units. M0097-0018.
 //
-// The unit is chosen by computing the ROUNDED value at each level:
-// if the rounded value >= 10240, promote to the next unit. This matches
-// PostgreSQL's actual behaviour where, e.g., 10485248 → "10 MB" because
-// round(10485248/1024) = 10240 kB ≥ 10240, so it's shown as 10 MB instead.
-func sizePretty(bytes int64) string {
-	neg := bytes < 0
-	if neg {
-		bytes = -bytes
+// sizePretty formats an integer byte count as a human-readable size string.
+// Replicates PostgreSQL's pg_size_pretty(bigint) iterative algorithm exactly,
+// using uint64 for the absolute-value check to handle INT64_MIN correctly.
+func sizePretty(size int64) string {
+	type szUnit struct {
+		name     string
+		limit    uint64
+		round    bool
+		unitbits int
 	}
-	const (
-		kBu = int64(1024)
-		MBu = int64(1024 * 1024)
-		GBu = int64(1024 * 1024 * 1024)
-		TBu = int64(1024 * 1024 * 1024 * 1024)
-		PBu = int64(1024 * 1024 * 1024 * 1024 * 1024)
-	)
-	// halfRound: integer division with round-half-up.
-	halfRound := func(n, unit int64) int64 { return (n + unit/2) / unit }
-	var result string
-	if bytes < 10*kBu {
-		if bytes == 1 {
-			result = "1 byte"
+	szUnits := []szUnit{
+		{"bytes", 10 * 1024, false, 0},
+		{"kB", 20*1024 - 1, true, 10},
+		{"MB", 20*1024 - 1, true, 20},
+		{"GB", 20*1024 - 1, true, 30},
+		{"TB", 20*1024 - 1, true, 40},
+		{"PB", 20*1024 - 1, true, 50},
+	}
+	cur := size
+	for i, u := range szUnits {
+		var absSize uint64
+		if cur < 0 {
+			absSize = 0 - uint64(cur) // handles INT64_MIN: 0-uint64(INT64_MIN)=2^63
 		} else {
-			result = fmt.Sprintf("%d bytes", bytes)
+			absSize = uint64(cur)
 		}
-	} else if kbVal := halfRound(bytes, kBu); kbVal < 10240 {
-		result = fmt.Sprintf("%d kB", kbVal)
-	} else if mbVal := halfRound(bytes, MBu); mbVal < 10240 {
-		result = fmt.Sprintf("%d MB", mbVal)
-	} else if gbVal := halfRound(bytes, GBu); gbVal < 10240 {
-		result = fmt.Sprintf("%d GB", gbVal)
-	} else if tbVal := halfRound(bytes, TBu); tbVal < 10240 {
-		result = fmt.Sprintf("%d TB", tbVal)
-	} else {
-		result = fmt.Sprintf("%d PB", halfRound(bytes, PBu))
+		nextIsLast := i+1 >= len(szUnits)
+		if nextIsLast || absSize < u.limit {
+			if u.round {
+				if cur > 0 {
+					cur = (cur + 1) / 2
+				} else {
+					cur = (cur - 1) / 2
+				}
+			}
+			return fmt.Sprintf("%d %s", cur, u.name)
+		}
+		next := szUnits[i+1]
+		bits := uint(next.unitbits - u.unitbits)
+		if next.round {
+			bits--
+		}
+		if u.round {
+			bits++
+		}
+		cur /= int64(1) << bits
 	}
-	if neg {
-		return "-" + result
-	}
-	return result
+	return fmt.Sprintf("%d PB", cur)
 }
 
-// sizePrettyFloat formats a fractional byte count as a human-readable size string.
-// Used for numeric (non-integer) inputs to pg_size_pretty. M0097-0018.
+// sizePrettyBig formats a numeric byte count (given as a decimal string) as a
+// human-readable size string. Uses exact big.Int/big.Rat arithmetic to replicate
+// PostgreSQL's pg_size_pretty(numeric) algorithm (avoids float64 precision loss
+// at the PB boundary).
+func sizePrettyBig(s string) string {
+	r, ok := new(big.Rat).SetString(s)
+	if !ok {
+		return s + " bytes"
+	}
+	type szUnit struct {
+		name     string
+		limit    int64
+		round    bool
+		unitbits int
+	}
+	szUnits := []szUnit{
+		{"bytes", 10 * 1024, false, 0},
+		{"kB", 20*1024 - 1, true, 10},
+		{"MB", 20*1024 - 1, true, 20},
+		{"GB", 20*1024 - 1, true, 30},
+		{"TB", 20*1024 - 1, true, 40},
+		{"PB", 20*1024 - 1, true, 50},
+	}
+	cur := new(big.Rat).Set(r)
+	for i, u := range szUnits {
+		absCur := new(big.Rat).Abs(cur)
+		limitR := new(big.Rat).SetInt64(u.limit)
+		nextIsLast := i+1 >= len(szUnits)
+		if nextIsLast || absCur.Cmp(limitR) < 0 {
+			if u.round {
+				// Truncate to integer, then half_rounded: (n±1)/2 toward zero.
+				curInt := bigRatTrunc(cur)
+				if curInt.Sign() >= 0 {
+					curInt.Add(curInt, big.NewInt(1))
+				} else {
+					curInt.Sub(curInt, big.NewInt(1))
+				}
+				curInt.Quo(curInt, big.NewInt(2))
+				return fmt.Sprintf("%s %s", curInt.String(), u.name)
+			}
+			// bytes: display exact value (preserve fractional part like PG).
+			if cur.IsInt() {
+				return fmt.Sprintf("%s %s", cur.Num().String(), u.name)
+			}
+			f, _ := strconv.ParseFloat(cur.FloatString(20), 64)
+			return fmt.Sprintf("%g %s", f, u.name)
+		}
+		next := szUnits[i+1]
+		bits := uint(next.unitbits - u.unitbits)
+		if next.round {
+			bits--
+		}
+		if u.round {
+			bits++
+		}
+		divisor := new(big.Rat).SetInt64(int64(1) << bits)
+		cur.Quo(cur, divisor)
+		// Truncate toward zero after each step (exact Numeric arithmetic).
+		curInt := bigRatTrunc(cur)
+		cur = new(big.Rat).SetInt(curInt)
+	}
+	return fmt.Sprintf("%s PB", bigRatTrunc(cur).String())
+}
+
+// bigRatTrunc truncates a big.Rat toward zero and returns the integer part.
+func bigRatTrunc(r *big.Rat) *big.Int {
+	q, _ := new(big.Int).QuoRem(r.Num(), r.Denom(), new(big.Int))
+	return q
+}
+
+// sizePrettyFloat formats a float64 byte count as a human-readable size string.
+// Used for KindFloat (float8) inputs to pg_size_pretty.
 func sizePrettyFloat(f float64) string {
 	neg := f < 0
 	if neg {
@@ -1425,20 +1610,13 @@ func sizePrettyFloat(f float64) string {
 		TB = float64(1024 * 1024 * 1024 * 1024)
 		PB = float64(1024 * 1024 * 1024 * 1024 * 1024)
 	)
-	// halfRoundF: round float64 to nearest integer (round half up), matching
-	// PostgreSQL's integer halfRound for consistent kB/MB/etc display. M0097-0018.
-	halfRoundF := func(n, unit float64) int64 { return int64(math.Round(n / unit)) }
+	halfRoundF := func(n, unit float64) int64 { return int64(n / unit) }
 	switch {
 	case f < 10*kB:
-		if f == 1 {
-			result = "1 byte"
+		if f == float64(int64(f)) {
+			result = fmt.Sprintf("%d bytes", int64(f))
 		} else {
-			// Format with decimal point only if fractional.
-			if f == float64(int64(f)) {
-				result = fmt.Sprintf("%d bytes", int64(f))
-			} else {
-				result = fmt.Sprintf("%g bytes", f)
-			}
+			result = fmt.Sprintf("%g bytes", f)
 		}
 	case f < 10*MB:
 		result = fmt.Sprintf("%d kB", halfRoundF(f, kB))
@@ -1460,27 +1638,57 @@ func sizePrettyFloat(f float64) string {
 // parseSizeBytes parses a human-readable size string into bytes.
 // Supports units: bytes/B, kB, MB, GB, TB, PB (case-insensitive).
 // Also accepts scientific notation (e.g. "1e6 MB"). M0097-0018.
+// Error messages and behaviour match PostgreSQL 17.
 func parseSizeBytes(s string) (int64, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0, fmt.Errorf("invalid size: empty string")
+	// orig: preserve original input exactly for error messages (matches PG behaviour).
+	orig := s
+	ws := strings.TrimSpace(s)
+	if ws == "" {
+		return 0, fmt.Errorf("invalid size: %q", "")
 	}
 
-	// Find where the numeric part ends and the unit begins.
+	// Parse numeric part: optional sign, digits, optional '.'+digits, optional exponent.
 	i := 0
-	// Allow optional leading sign.
-	if i < len(s) && (s[i] == '-' || s[i] == '+') {
+	if i < len(ws) && (ws[i] == '-' || ws[i] == '+') {
 		i++
 	}
-	// Digits, dot, and exponent.
-	for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '-' || s[i] == '+') {
+	for i < len(ws) && ws[i] >= '0' && ws[i] <= '9' {
 		i++
 	}
-	numStr := strings.TrimSpace(s[:i])
-	unitStr := strings.TrimSpace(s[i:])
+	if i < len(ws) && ws[i] == '.' {
+		i++
+		for i < len(ws) && ws[i] >= '0' && ws[i] <= '9' {
+			i++
+		}
+	}
+	expStart := i
+	if i < len(ws) && (ws[i] == 'e' || ws[i] == 'E') {
+		j := i + 1
+		if j < len(ws) && (ws[j] == '-' || ws[j] == '+') {
+			j++
+		}
+		if j < len(ws) && ws[j] >= '0' && ws[j] <= '9' {
+			i = j
+			for i < len(ws) && ws[i] >= '0' && ws[i] <= '9' {
+				i++
+			}
+		} else {
+			i = expStart // no valid exponent; treat 'e' as start of unit
+		}
+	}
+	numStr := ws[:i]
+	unitStr := strings.TrimSpace(ws[i:])
 
-	if numStr == "" || numStr == "-" || numStr == "+" {
-		return 0, fmt.Errorf("invalid size: %q", s)
+	// Must have at least one digit.
+	hasDigit := false
+	for _, c := range numStr {
+		if c >= '0' && c <= '9' {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit {
+		return 0, fmt.Errorf("invalid size: %q", orig)
 	}
 
 	// Handle trailing decimal point: "1." → "1.0"
@@ -1488,43 +1696,48 @@ func parseSizeBytes(s string) (int64, error) {
 		numStr += "0"
 	}
 
-	val, err := strconv.ParseFloat(numStr, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid size: %q", s)
+	val, parseErr := strconv.ParseFloat(numStr, 64)
+	// ErrRange produces Inf — means exponent overflow, matching PG's "value overflows numeric format".
+	if math.IsInf(val, 0) {
+		return 0, fmt.Errorf("value overflows numeric format")
+	}
+	if parseErr != nil || math.IsNaN(val) {
+		return 0, fmt.Errorf("invalid size: %q", orig)
 	}
 
-	// Check for overflow or infinite.
-	if math.IsInf(val, 0) || math.IsNaN(val) {
-		return 0, fmt.Errorf("invalid size: %q", s)
-	}
-
+	const sizeHint = `Valid units are "bytes", "B", "kB", "MB", "GB", "TB", and "PB".`
 	var multiplier float64
 	switch strings.ToLower(unitStr) {
-	case "", "b", "byte", "bytes":
+	case "", "b", "bytes":
 		multiplier = 1
-	case "kb", "kib":
+	case "kb":
 		multiplier = 1024
-	case "mb", "mib":
+	case "mb":
 		multiplier = 1024 * 1024
-	case "gb", "gib":
+	case "gb":
 		multiplier = 1024 * 1024 * 1024
-	case "tb", "tib":
+	case "tb":
 		multiplier = 1024 * 1024 * 1024 * 1024
-	case "pb", "pib":
+	case "pb":
 		multiplier = 1024 * 1024 * 1024 * 1024 * 1024
 	default:
-		return 0, fmt.Errorf("invalid size unit: %q", unitStr)
+		return 0, &ExecError{
+			Code:    "22023",
+			Message: fmt.Sprintf("invalid size: %q", orig),
+			Detail:  fmt.Sprintf("Invalid size unit: %q.", unitStr),
+			Hint:    sizeHint,
+		}
 	}
 
 	result := val * multiplier
 	if math.IsInf(result, 0) || math.IsNaN(result) {
-		return 0, fmt.Errorf("size out of range: %q", s)
+		return 0, fmt.Errorf("bigint out of range")
 	}
 	// MaxInt64 as float64 rounds to 9.223372036854776e18; values strictly
 	// greater than that can't fit in int64.
 	const maxInt64Float = float64(1 << 63) // 9.223372036854776e18
 	if result >= maxInt64Float || result < -maxInt64Float {
-		return 0, fmt.Errorf("size out of range: %q", s)
+		return 0, fmt.Errorf("bigint out of range")
 	}
 	// Truncate toward zero, matching PostgreSQL behaviour (e.g. -.1 kB → -102).
 	return int64(result), nil
@@ -2589,7 +2802,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "current_database":
 		return NewStringDatum("postgres"), nil
 	case "current_schema", "current_schemas":
-		return NewStringDatum("public"), nil
+		return currentSchemaFromSearchPath(ctx)
 
 	// generate_series used as a scalar expression (not FROM clause).
 	// Returns the start value only — full SRF semantics require planner rework.
@@ -2780,6 +2993,9 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewBoolDatum(msg == ""), nil
 			case "uuid":
 				return NewBoolDatum(isValidUUIDStr(v)), nil
+			case "tid":
+				_, _, ok := parseTidInput(v)
+				return NewBoolDatum(ok), nil
 			case "xid":
 				_, err := parseXid(v)
 				return NewBoolDatum(err == nil), nil
@@ -2815,31 +3031,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || v.IsNull() {
 				return NullDatum, nil
 			}
-			// Accept both integer and numeric (string/KindNumeric) types.
-			var byteVal int64
-			var fracBytes float64
-			var hasFrac bool
 			if v.Kind == KindInt {
-				byteVal = v.Int
-			} else {
-				// Use Format() for KindNumeric (works for all non-string kinds).
-				// StringValue() only works for KindString/KindStringArena. M0097-0018.
-				s := strings.TrimSpace(v.Format())
-				if f, err2 := strconv.ParseFloat(s, 64); err2 == nil {
-					if f != float64(int64(f)) || f < -9223372036854775808.0 || f > 9223372036854775807.0 {
-						hasFrac = true
-						fracBytes = f
-					} else {
-						byteVal = int64(f)
-					}
-				} else {
-					return NullDatum, nil
-				}
+				return NewStringDatum(sizePretty(v.Int)), nil
 			}
-			if hasFrac {
-				return NewStringDatum(sizePrettyFloat(fracBytes)), nil
-			}
-			return NewStringDatum(sizePretty(byteVal)), nil
+			// KindNumeric and other: use exact big.Int/big.Rat arithmetic
+			// to match PG's pg_size_pretty(numeric) algorithm. M0097-0018.
+			return NewStringDatum(sizePrettyBig(strings.TrimSpace(v.Format()))), nil
 		}
 
 	case "pg_size_bytes":
@@ -2850,7 +3047,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			bytes, err2 := parseSizeBytes(s.StringValue())
 			if err2 != nil {
-				return Datum{}, &ExecError{Code: "22P02", Message: err2.Error()}
+				if ee, ok := err2.(*ExecError); ok {
+					return Datum{}, ee
+				}
+				return Datum{}, &ExecError{Code: "22023", Message: err2.Error()}
 			}
 			return Datum{Kind: KindInt, Int: bytes}, nil
 		}
@@ -3050,8 +3250,159 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	case "satisfies_hash_partition":
 		// satisfies_hash_partition(tableoid, modulus, remainder, val...) → bool
-		// Stub: return false. M0097-0015.
-		return NewBoolDatum(false), nil
+		// Full implementation: Jenkins Bob hash + hash_combine64. M0097-0027.
+		if len(x.Args) < 3 || ctx == nil || ctx.Catalog == nil {
+			return NewBoolDatum(false), nil
+		}
+		modulusDatum, err := evalExpr(x.Args[1], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		remainderDatum, err := evalExpr(x.Args[2], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		// NULL modulus or NULL remainder → false (PG behavior)
+		if modulusDatum.IsNull() || remainderDatum.IsNull() {
+			return NewBoolDatum(false), nil
+		}
+		modulus := int(modulusDatum.Int)
+		remainder := int(remainderDatum.Int)
+		if modulus <= 0 {
+			return NullDatum, &ExecError{Code: "22023",
+				Message: "modulus for hash partition must be an integer value greater than zero"}
+		}
+		if remainder < 0 {
+			return NullDatum, &ExecError{Code: "22023",
+				Message: "remainder for hash partition must be an integer value greater than or equal to zero"}
+		}
+		if remainder >= modulus {
+			return NullDatum, &ExecError{Code: "22023",
+				Message: "remainder for hash partition must be less than modulus"}
+		}
+		tableoidDatum, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		if tableoidDatum.IsNull() {
+			return NewBoolDatum(false), nil
+		}
+		if tableoidDatum.Kind != KindInt {
+			return NullDatum, &ExecError{Code: "XX000",
+				Message: "could not open relation with OID 0"}
+		}
+		tableOID := uint32(tableoidDatum.Int)
+		if tableOID == 0 {
+			return NullDatum, &ExecError{Code: "XX000",
+				Message: "could not open relation with OID 0"}
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NewBoolDatum(false), nil
+		}
+		tbl, found := im.LookupTableByOID(tableOID)
+		if !found {
+			return NullDatum, &ExecError{Code: "XX000",
+				Message: fmt.Sprintf("could not open relation with OID %d", tableOID)}
+		}
+		if tbl.PartitionMethod != "HASH" || tbl.PartitionParentOID != 0 {
+			return NullDatum, &ExecError{Code: "42809",
+				Message: fmt.Sprintf("%q is not a hash partitioned table", tbl.Name)}
+		}
+		numKeys := len(tbl.PartitionKey)
+		numArgs := len(x.Args) - 3
+		if numArgs != numKeys {
+			return NullDatum, &ExecError{Code: "22023",
+				Message: fmt.Sprintf("number of partitioning columns (%d) does not match number of partition keys provided (%d)",
+					numKeys, numArgs)}
+		}
+		// Type-check args against partition key column types (PG behavior: check even for NULLs).
+		// Non-variadic: no quotes around type names; variadic: quoted type names.
+		for i := 0; i < numKeys; i++ {
+			colType := ""
+			for _, col := range tbl.Columns {
+				if strings.EqualFold(col.Name, tbl.PartitionKey[i]) {
+					colType = strings.ToLower(col.Type.Name)
+					break
+				}
+			}
+			argTypeName := hashPartTypeName(x.Args[3+i])
+			if argTypeName != "" {
+				colPGName := pgFormatTypeName(colType)
+				if !hashPartTypesCompatible(colType, argTypeName) {
+					if x.Variadic {
+						return NullDatum, &ExecError{Code: "22023",
+							Message: fmt.Sprintf("column %d of the partition key has type %q, but supplied value is of type %q",
+								i+1, colPGName, argTypeName)}
+					}
+					return NullDatum, &ExecError{Code: "22023",
+						Message: fmt.Sprintf("column %d of the partition key has type %s, but supplied value is of type %s",
+							i+1, colPGName, argTypeName)}
+				}
+			}
+		}
+		// Compute hash: for each non-NULL key value, call the operator class hash
+		// function (or the built-in type default) and fold with hash_combine64.
+		var rowHash uint64
+		seedInt64 := int64(hashPartitionSeed)
+		for i := 0; i < numKeys; i++ {
+			valDatum, verr := evalExpr(x.Args[3+i], row, ctx)
+			if verr != nil {
+				return NullDatum, verr
+			}
+			if valDatum.IsNull() {
+				continue // NULL values are skipped (PG behavior)
+			}
+			opClass := ""
+			if i < len(tbl.PartitionKeyOpClasses) {
+				opClass = tbl.PartitionKeyOpClasses[i]
+			}
+			var h uint64
+			if opClass != "" {
+				// Custom operator class: look up FUNCTION 2 and call it(val, seed).
+				hashFuncName, hasFn := im.LookupOpClassHashFunc(opClass)
+				if hasFn {
+					routines := ctx.Catalog.Routines()
+					rs := routines.LookupByName(parser.ObjectName{Name: hashFuncName})
+					seedDatum := NewIntDatum(seedInt64)
+					var bestRoutine *catalog.Routine
+					for _, r := range rs {
+						if len(r.ArgTypes) == 2 {
+							bestRoutine = r
+							break
+						}
+					}
+					if bestRoutine != nil {
+						hResult, herr := executeStoredRoutine(bestRoutine, []Datum{valDatum, seedDatum}, ctx, x.Pos())
+						if herr != nil {
+							return NullDatum, herr
+						}
+						if !hResult.IsNull() {
+							h = uint64(hResult.Int)
+						}
+					}
+				}
+			} else {
+				// Default hash: type-based built-in hash functions.
+				colType := ""
+				for _, col := range tbl.Columns {
+					if strings.EqualFold(col.Name, tbl.PartitionKey[i]) {
+						colType = strings.ToLower(col.Type.Name)
+						break
+					}
+				}
+				switch {
+				case colType == "int4" || colType == "integer" || colType == "int" || valDatum.Kind == KindInt:
+					h = pgHashUint32Extended(uint32(valDatum.Int), hashPartitionSeed)
+				case colType == "text" || colType == "varchar" || colType == "bpchar" || valDatum.Kind == KindString:
+					h = pgHashBytesExtended([]byte(valDatum.StringValue()), hashPartitionSeed)
+				default:
+					h = pgHashUint32Extended(uint32(valDatum.Int), hashPartitionSeed)
+				}
+			}
+			rowHash = pgHashCombine64(rowHash, h)
+		}
+		return NewBoolDatum(uint64(rowHash)%uint64(modulus) == uint64(remainder)), nil
 	case "merge_action":
 		// merge_action() → text — returns 'INSERT', 'UPDATE', or 'DELETE' within MERGE RETURNING.
 		// Stub: return NULL (MERGE RETURNING is not yet executed). M0097-0016.
@@ -3950,6 +4301,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 		}
 		return NewBoolDatum(true), nil
+	// currtid2(relname text, tid tid) → tid: returns the latest visible TID
+	// for a row in the named relation. M0097-0038.
+	case "currtid2":
+		return evalCurrtid2(x, row, ctx)
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.
@@ -3979,6 +4334,132 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 
 	return evalStoredRoutineFuncCall(x, row, ctx)
+}
+
+// evalCurrtid2 implements currtid2(relname text, tid tid) → tid.
+// Returns the latest visible TID for the named relation, or an error for
+// unsupported relation kinds (indexes, partitioned tables, views without ctid).
+// M0097-0038.
+func evalCurrtid2(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 2 {
+		return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(),
+			Message: fmt.Sprintf("function currtid2(unknown, unknown) does not exist")}
+	}
+	nameD, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	if nameD.IsNull() {
+		return NullDatum, nil
+	}
+	relname := strings.TrimSpace(nameD.StringValue())
+
+	tidD, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	if tidD.IsNull() {
+		return NullDatum, nil
+	}
+	tidStr := tidD.StringValue()
+	block, offset, ok := parseTidInput(tidStr)
+	if !ok {
+		return NullDatum, &ExecError{Code: "22P02", Pos: x.Pos(),
+			Message: fmt.Sprintf("invalid input syntax for type tid: %q", tidStr)}
+	}
+
+	// Sequence: in-memory only; treat TID as always valid. M0097-0038.
+	if LookupSequence(relname) != nil {
+		return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
+	}
+
+	if ctx.Catalog == nil {
+		return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(),
+			Message: "currtid2 requires a catalog"}
+	}
+
+	// Index: not supported.
+	if _, isIdx := ctx.Catalog.LookupIndex(parser.ObjectName{Name: relname}); isIdx {
+		return NullDatum, &ExecError{Code: "0A000", Pos: x.Pos(),
+			Message:  fmt.Sprintf("cannot open relation %q", relname),
+			Detail: "This operation is not supported for indexes."}
+	}
+
+	tbl, found := ctx.Catalog.LookupTable(parser.ObjectName{Name: relname})
+	if !found {
+		return NullDatum, &ExecError{Code: "42P01", Pos: x.Pos(),
+			Message: fmt.Sprintf("relation %q does not exist", relname)}
+	}
+
+	// Partitioned table: no storage.
+	if len(tbl.PartitionKey) > 0 {
+		schema := tbl.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		qualName := schema + "." + tbl.Name
+		return NullDatum, &ExecError{Code: "0A000", Pos: x.Pos(),
+			Message: fmt.Sprintf("cannot look at latest visible tid for relation %q", qualName)}
+	}
+
+	// View (non-matview): inspect for ctid column, resolve to base table.
+	if tbl.View != nil && !tbl.IsMatView {
+		return currtid2ViewCheck(tbl, block, offset, x.Pos(), ctx)
+	}
+
+	// Heap table or matview: check TID validity in storage.
+	return currtid2TIDCheck(tbl.Name, tbl, block, offset, x.Pos(), ctx)
+}
+
+// currtid2ViewCheck handles currtid2 for a SQL view. Checks that the view
+// has a ctid column of type tid, then delegates TID validity to the base table.
+func currtid2ViewCheck(viewTbl *catalog.Table, block uint32, offset uint16, pos int, ctx *Context) (Datum, error) {
+	var ctidTypeName string
+	for _, c := range viewTbl.Columns {
+		if strings.EqualFold(c.Name, "ctid") {
+			ctidTypeName = strings.ToLower(c.Type.Name)
+			break
+		}
+	}
+	if ctidTypeName == "" {
+		return NullDatum, &ExecError{Code: "0A000", Pos: pos,
+			Message: "currtid cannot handle views with no CTID"}
+	}
+	if ctidTypeName != "tid" {
+		return NullDatum, &ExecError{Code: "0A000", Pos: pos,
+			Message: "ctid isn't of type TID"}
+	}
+	// Resolve base table from view's FROM clause.
+	if viewTbl.View == nil || len(viewTbl.View.From) == 0 {
+		return NullDatum, &ExecError{Code: "0A000", Pos: pos,
+			Message: "currtid cannot handle views with no CTID"}
+	}
+	baseTableName := viewTbl.View.From[0].Name
+	if baseTableName == "" {
+		return NullDatum, &ExecError{Code: "0A000", Pos: pos,
+			Message: "currtid cannot handle views with no CTID"}
+	}
+	baseTbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: baseTableName})
+	if !ok {
+		return NullDatum, &ExecError{Code: "0A000", Pos: pos,
+			Message: "currtid cannot handle views with no CTID"}
+	}
+	return currtid2TIDCheck(baseTbl.Name, baseTbl, block, offset, pos, ctx)
+}
+
+// currtid2TIDCheck verifies that (block, offset) is a valid address in tbl's
+// heap storage and returns the tid on success.
+func currtid2TIDCheck(relname string, tbl *catalog.Table, block uint32, offset uint16, pos int, ctx *Context) (Datum, error) {
+	if ctx.Pool == nil || ctx.Catalog == nil {
+		return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
+	}
+	rel := ctx.Catalog.RelFileNode(tbl)
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil || uint32(nBlocks) <= block {
+		return NullDatum, &ExecError{Code: "22000", Pos: pos,
+			Message: fmt.Sprintf("tid (%d, %d) is not valid for relation %q", block, offset, relname)}
+	}
+	return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
 }
 
 // initCap returns s with the first letter of each word capitalized. M0097-0005.
@@ -4783,6 +5264,42 @@ func charTypeDisplayForm(b byte) string {
 	return fmt.Sprintf("\\%03o", b)
 }
 
+// currentSchemaFromSearchPath resolves current_schema by walking the effective
+// search_path and returning the first schema that exists. Built-in schemas
+// (pg_catalog, information_schema, public) are always considered present.
+// Returns NullDatum if no schema on the path exists.
+func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {
+	searchPath := `"$user", public` // default
+	if ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("search_path"); ok {
+			searchPath = v
+		}
+	}
+	user := "postgres"
+	for _, rawSchema := range strings.Split(searchPath, ",") {
+		s := strings.TrimSpace(rawSchema)
+		s = strings.Trim(s, `"'`)
+		if s == "$user" {
+			s = user
+		}
+		if s == "" {
+			continue
+		}
+		lc := strings.ToLower(s)
+		switch lc {
+		case "pg_catalog", "information_schema", "public":
+			return NewStringDatum(lc), nil
+		}
+		// User-created schemas: check if a table with this schema prefix exists.
+		if ctx.Catalog != nil {
+			if _, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: s}); ok {
+				return NewStringDatum(s), nil
+			}
+		}
+	}
+	return NullDatum, nil
+}
+
 func isValidBoolInput(v string) bool {
 	switch strings.TrimSpace(strings.ToLower(v)) {
 	case "t", "tr", "tru", "true", "y", "ye", "yes", "on", "1",
@@ -4790,4 +5307,84 @@ func isValidBoolInput(v string) bool {
 		return true
 	}
 	return false
+}
+
+// hashPartTypesCompatible returns true if the arg type is compatible with the column type
+// for satisfies_hash_partition type checking.
+func hashPartTypesCompatible(colType, argTypeName string) bool {
+	col := pgFormatTypeName(colType)
+	arg := strings.ToLower(argTypeName)
+	if col == arg {
+		return true
+	}
+	// Integer family compatibility
+	intFamily := map[string]bool{"integer": true, "smallint": true, "bigint": true, "int4": true, "int2": true, "int8": true}
+	if intFamily[col] && intFamily[arg] {
+		return true
+	}
+	return false
+}
+
+// hashPartTypeName returns the user-visible PG type name for a planner expression,
+// used to build satisfies_hash_partition type mismatch messages. Returns "" if unknown.
+func hashPartTypeName(e planner.Expr) string {
+	switch x := e.(type) {
+	case *planner.CastExpr:
+		return pgFormatTypeName(x.TargetType)
+	case *planner.IntegerConst:
+		return "integer"
+	case *planner.NumericConst:
+		return "numeric"
+	case *planner.StringConst:
+		return "text"
+	case *planner.BooleanConst:
+		return "boolean"
+	case *planner.FuncCall:
+		switch strings.ToLower(x.Name) {
+		case "now", "current_timestamp":
+			return "timestamp with time zone"
+		case "current_date":
+			return "date"
+		case "current_time":
+			return "time with time zone"
+		}
+	}
+	return ""
+}
+
+// pgFormatTypeName converts internal type names to PG user-visible names.
+func pgFormatTypeName(t string) string {
+	switch strings.ToLower(t) {
+	case "int4", "int", "integer":
+		return "integer"
+	case "int2", "smallint":
+		return "smallint"
+	case "int8", "bigint":
+		return "bigint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision":
+		return "double precision"
+	case "bool", "boolean":
+		return "boolean"
+	case "text":
+		return "text"
+	case "varchar", "character varying":
+		return "character varying"
+	case "bpchar", "character", "char":
+		return "character"
+	case "timestamptz", "timestamp with time zone":
+		return "timestamp with time zone"
+	case "timestamp", "timestamp without time zone":
+		return "timestamp without time zone"
+	case "date":
+		return "date"
+	case "time", "time without time zone":
+		return "time without time zone"
+	case "timetz", "time with time zone":
+		return "time with time zone"
+	case "numeric", "decimal":
+		return "numeric"
+	}
+	return t
 }

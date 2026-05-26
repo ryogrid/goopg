@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -34,9 +35,29 @@ func newValuesOp(plan *planner.Values) *valuesOp {
 
 // rematerialiseVirtualRows rebuilds the row expressions for a Values
 // node whose source is a virtual catalog table. The text payload
-// returned by tbl.VirtualRows() is wrapped in StringConst expressions
-// matching what the planner produces in buildVirtualValues; the
-// returned slice replaces o.rows for this Open cycle.
+// returned by tbl.VirtualRows() is wrapped in typed constant expressions
+// (via planner.TypedVirtualCell) matching what the planner produces in
+// buildVirtualValues; the returned slice replaces o.rows for this Open cycle.
+// rematerialiseVirtualRowsFromStrings converts [][]string rows into planner
+// expression rows for a virtual table, used for session-specific tables like
+// pg_prepared_statements where the data comes from the session rather than
+// the global VirtualRows callback.
+func rematerialiseVirtualRowsFromStrings(tbl *catalog.Table, raw [][]string) [][]planner.Expr {
+	out := make([][]planner.Expr, len(raw))
+	for i, r := range raw {
+		cells := make([]planner.Expr, len(tbl.Columns))
+		for j := range tbl.Columns {
+			if j < len(r) {
+				cells[j] = planner.TypedVirtualCell(0, r[j], tbl.Columns[j].Type.Name)
+			} else {
+				cells[j] = &planner.NullConst{}
+			}
+		}
+		out[i] = cells
+	}
+	return out
+}
+
 func rematerialiseVirtualRows(plan *planner.Values) [][]planner.Expr {
 	tbl := plan.VirtualSource
 	raw := tbl.VirtualRows()
@@ -45,7 +66,10 @@ func rematerialiseVirtualRows(plan *planner.Values) [][]planner.Expr {
 		cells := make([]planner.Expr, len(tbl.Columns))
 		for j := range tbl.Columns {
 			if j < len(r) {
-				cells[j] = &planner.StringConst{Value: r[j]}
+				// Sibling of planner.buildVirtualValues — must use the same
+				// typed-cell helper so integer/bool virtual columns compare
+				// by value, not lexicographically (sysviews int8 compare).
+				cells[j] = planner.TypedVirtualCell(0, r[j], tbl.Columns[j].Type.Name)
 			} else {
 				cells[j] = &planner.NullConst{}
 			}
@@ -58,8 +82,15 @@ func rematerialiseVirtualRows(plan *planner.Values) [][]planner.Expr {
 func (o *valuesOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	o.idx = 0
-	if o.plan != nil && o.plan.VirtualSource != nil && o.plan.VirtualSource.VirtualRows != nil {
-		o.rows = rematerialiseVirtualRows(o.plan)
+	if o.plan != nil && o.plan.VirtualSource != nil {
+		tbl := o.plan.VirtualSource
+		// pg_prepared_statements is session-specific: use the per-connection
+		// lister when available rather than the static empty VirtualRows.
+		if tbl.Name == "pg_prepared_statements" && ctx != nil && ctx.PrepStmtsRows != nil {
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PrepStmtsRows())
+		} else if tbl.VirtualRows != nil {
+			o.rows = rematerialiseVirtualRows(o.plan)
+		}
 	}
 	return nil
 }

@@ -1044,7 +1044,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 				// connection and the cancellation must not fire until
 				// handleQueryOrCopy completes.
 			}
-			nextCopyIn, err := s.handleQueryOrCopy(queryCtx, w, sess, f.Payload, connTx, prepStmts)
+			nextCopyIn, err := s.handleQueryOrCopy(queryCtx, r, w, sess, f.Payload, connTx, prepStmts)
 			entry.clearQueryCancel()
 			queryCancel()
 			if err != nil {

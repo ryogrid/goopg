@@ -115,23 +115,23 @@ func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 		if d.IsNull() {
 			continue
 		}
-			if d.Kind == KindToastPointer {
-				// Encode as PG external/on-disk TOAST reference:
-				// short varlena header (1 byte) + 12-byte pointer = 13 bytes.
-				// Header: (13 << 1) | 1 = 0x1B (VARATT_IS_EXTERNAL_ONDISK).
-				// Aligned to 4 bytes (PG TOAST pointers are int-aligned).
-				off = alignPhysicalPGOffset(off, 4)
-				ptr := d.BytesValue()
-				buf := make([]byte, 13)
-				buf[0] = 0x1B // short varlena: len=13, external
-				copy(buf[1:], ptr)
-				for len(out) < off+13 {
-					out = append(out, 0)
-				}
-				copy(out[off:off+13], buf)
-				off += 13
-				continue
+		if d.Kind == KindToastPointer {
+			// Encode as PG external/on-disk TOAST reference:
+			// short varlena header (1 byte) + 12-byte pointer = 13 bytes.
+			// Header: (13 << 1) | 1 = 0x1B (VARATT_IS_EXTERNAL_ONDISK).
+			// Aligned to 4 bytes (PG TOAST pointers are int-aligned).
+			off = alignPhysicalPGOffset(off, 4)
+			ptr := d.BytesValue()
+			buf := make([]byte, 13)
+			buf[0] = 0x1B // short varlena: len=13, external
+			copy(buf[1:], ptr)
+			for len(out) < off+13 {
+				out = append(out, 0)
 			}
+			copy(out[off:off+13], buf)
+			off += 13
+			continue
+		}
 		align := physicalPGTypeAlign(c.Type)
 		off = alignPhysicalPGOffset(off, align)
 		buf, err := encodeValuePG(c.Type, d)
@@ -145,6 +145,47 @@ func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 		off += len(buf)
 	}
 	return out, nil
+}
+
+func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
+	var s string
+	switch d.Kind {
+	case KindString:
+		s = d.StringValue()
+	case KindBytes:
+		s = string(d.BytesValue())
+	case KindInt:
+		s = fmt.Sprintf("%d", d.Int)
+	case KindNumeric:
+		s = numericText(d)
+	default:
+		return "", fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
+	}
+
+	tname := strings.ToLower(t.Name)
+	if tname == "varchar" || tname == "character varying" {
+		if len(t.Args) > 0 {
+			n := int(t.Args[0])
+			stripped := strings.TrimRight(s, " ")
+			if len(stripped) > n {
+				return "", &ExecError{Code: "22001",
+					Message: fmt.Sprintf("value too long for type character varying(%d)", n)}
+			}
+			s = stripped
+		}
+	} else if tname == "char" || tname == "bpchar" || tname == "character" {
+		n := 1
+		if len(t.Args) > 0 {
+			n = int(t.Args[0])
+		}
+		stripped := strings.TrimRight(s, " ")
+		if len(stripped) > n {
+			return "", &ExecError{Code: "22001",
+				Message: fmt.Sprintf("value too long for type character(%d)", n)}
+		}
+		s = stripped
+	}
+	return s, nil
 }
 
 // encodeValuePG encodes a single datum in PG-native format.
@@ -173,7 +214,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected int, got kind %d", d.Kind)
 		}
 		if v < -32768 || v > 32767 {
-			return nil, fmt.Errorf("smallint out of range")
+			// Mirror PostgreSQL int2in: report the offending input string
+			// (e.g. INSERT INTO t(int2col) VALUES ('100000')). The bare
+			// "smallint out of range" wording is reserved for arithmetic
+			// overflow (int2pl/int2mul), which is raised in expr eval before
+			// this storage-encode path. Sibling to the int4 arm below.
+			return nil, &ExecError{Code: "22003",
+				Message: fmt.Sprintf("value %q is out of range for type smallint", strings.TrimSpace(d.StringValue()))}
 		}
 		var buf [2]byte
 		binary.LittleEndian.PutUint16(buf[:], uint16(int16(v)))
@@ -256,9 +303,56 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		var buf [4]byte
 		binary.LittleEndian.PutUint32(buf[:], uint32(days))
 		return buf[:], nil
+	case "time":
+		if d.Kind == KindString {
+			ts, err := parseTimeString(d.StringValue())
+			if err != nil {
+				return nil, err
+			}
+			d = NewTimeDatum(ts)
+		}
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(pgTimeMicros(d.TimeValue())))
+		return buf[:], nil
+	case "timetz":
+		if d.Kind == KindString {
+			ts, err := parseTimeString(d.StringValue())
+			if err != nil {
+				return nil, err
+			}
+			d = NewTimeDatum(ts)
+		}
+		if d.Kind != KindTime {
+			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
+		}
+		var buf [12]byte
+		binary.LittleEndian.PutUint64(buf[:8], uint64(pgTimeMicros(d.TimeValue())))
+		binary.LittleEndian.PutUint32(buf[8:], 0)
+		return buf[:], nil
 	case "name":
-		// PG NameData: fixed 64 bytes, '\0' padded
-		s := d.StringValue()
+		// PG NameData: fixed 64 bytes, '\0'-padded. The name type silently
+		// truncates input to NAMEDATALEN-1 = 63 bytes (one byte reserved for
+		// the NUL terminator), matching PostgreSQL's namein() and the
+		// storage-encode path below. Without the truncation a 64-char input
+		// fills all 64 bytes with no terminator and decodes back as 64 chars,
+		// widening name columns by one and breaking row counts (M0111-0007).
+		var s string
+		switch d.Kind {
+		case KindString:
+			s = d.StringValue()
+		case KindBytes:
+			s = string(d.BytesValue())
+		case KindInt:
+			s = fmt.Sprintf("%d", d.Int)
+		default:
+			s = d.StringValue()
+		}
+		if len(s) > 63 {
+			s = s[:63]
+		}
 		buf := make([]byte, 64)
 		copy(buf, s)
 		return buf, nil
@@ -282,7 +376,11 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected string or int for char, got kind %d", d.Kind)
 		}
 		// char(N) = character(N) = bpchar: PG varlena (same as "character").
-		return varlenaTextBytes(d.StringValue()), nil
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		return varlenaTextBytes(s), nil
 	case "float4", "real":
 		// goopg stores float4 as varlena text for v0 compatibility (same as
 		// goopg-format encodeValue).  PG binary float4 (4-byte IEEE 754 LE)
@@ -415,7 +513,11 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		// text, varchar, char, bpchar, unknown, numeric, etc.
 		// Use PG varlena format (LE): 1-byte header for short values,
 		// 4-byte header for longer ones.
-		return varlenaTextBytes(d.StringValue()), nil
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		return varlenaTextBytes(s), nil
 	}
 }
 
@@ -461,6 +563,18 @@ func varlenaTextBytes(s string) []byte {
 // pgEpochUnixMicros is 2000-01-01 UTC in Unix microseconds (used by
 // the PG timestamp encoding).
 var pgEpochUnixMicros = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixMicro()
+
+func pgTimeMicros(t time.Time) int64 {
+	u := t.UTC()
+	return int64(u.Hour())*int64(time.Hour/time.Microsecond) +
+		int64(u.Minute())*int64(time.Minute/time.Microsecond) +
+		int64(u.Second())*int64(time.Second/time.Microsecond) +
+		int64(u.Nanosecond()/1000)
+}
+
+func pgTimeFromMicros(micros int64) time.Time {
+	return time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(micros) * time.Microsecond)
+}
 
 // DecodeRow inverts EncodeRow.
 func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
@@ -956,13 +1070,82 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("truncated int4")
 		}
 		return NewIntDatum(int64(int32(binary.LittleEndian.Uint32(data[:4])))), 4, nil
-	case "oid":
+	case "int8", "bigint", "bigserial":
+		// Mirror encodeValuePG's 8-byte LE int8 encoding. Without this
+		// case, any int8/bigint value (including count(*)/sum() results
+		// stored via CTAS, and plain INSERTs into bigint columns) fell
+		// through to the default branch and errored with "unsupported
+		// PostgreSQL physical type", so the seqscan silently dropped the
+		// row. M0111-0004.
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated int8")
+		}
+		return NewIntDatum(int64(binary.LittleEndian.Uint64(data[:8]))), 8, nil
+	case "oid", "regproc":
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated oid")
 		}
 		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
-	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown",
-		"float4", "real", "float8", "double precision", "double":
+	case "xid", "xid8":
+		// encodeValuePG writes xid/xid8 as a 4-byte LE TransactionId.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated xid")
+		}
+		return NewIntDatum(int64(binary.LittleEndian.Uint32(data[:4]))), 4, nil
+	case "name":
+		// PG NameData: fixed 64 bytes, '\0'-padded (see encodeValuePG).
+		if len(data) < 64 {
+			return Datum{}, 0, fmt.Errorf("truncated name")
+		}
+		end := 64
+		for i := 0; i < 64; i++ {
+			if data[i] == 0 {
+				end = i
+				break
+			}
+		}
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(data[:end])
+			return newStringArenaDatum(sctx, moff, mlen), 64, nil
+		}
+		return NewStringDatum(string(data[:end])), 64, nil
+	case "timestamp", "timestamptz":
+		// encodeValuePG stores 8-byte LE microseconds since the PG epoch
+		// (2000-01-01 UTC). Reconstruct the absolute instant. M0111-0004.
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated timestamp")
+		}
+		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		return NewTimeDatum(time.UnixMicro(micros + pgEpochUnixMicros).UTC()), 8, nil
+	case "date":
+		// encodeValuePG stores 4-byte LE days since the PG epoch. M0111-0004.
+		if len(data) < 4 {
+			return Datum{}, 0, fmt.Errorf("truncated date")
+		}
+		days := int32(binary.LittleEndian.Uint32(data[:4]))
+		micros := int64(days)*24*3600*1000000 + pgEpochUnixMicros
+		return NewTimeDatum(time.UnixMicro(micros).UTC()), 4, nil
+	case "time":
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated time")
+		}
+		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		const maxTimeMicros = int64(24 * time.Hour / time.Microsecond)
+		if micros < 0 || micros > maxTimeMicros {
+			return Datum{}, 0, fmt.Errorf("invalid time micros")
+		}
+		return NewTimeDatum(pgTimeFromMicros(micros)), 8, nil
+	case "timetz":
+		if len(data) < 12 {
+			return Datum{}, 0, fmt.Errorf("truncated timetz")
+		}
+		micros := int64(binary.LittleEndian.Uint64(data[:8]))
+		const maxTimeMicros = int64(24 * time.Hour / time.Microsecond)
+		if micros < 0 || micros > maxTimeMicros {
+			return Datum{}, 0, fmt.Errorf("invalid timetz micros")
+		}
+		return NewTimeDatum(pgTimeFromMicros(micros)), 12, nil
+	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown":
 		// PG external/on-disk TOAST reference: short varlena header 0x1B
 		// (VARATT_IS_EXTERNAL_ONDISK) followed by a 12-byte pointer.
 		// Recognise it before the general varlena decode so the Datum
@@ -974,9 +1157,6 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return NewToastPointerDatum(ptr), 13, nil
 		}
 
-		// goopg stores float4/float8 as varlena text for v0 compatibility.
-		// PG-native binary float decode (4/8-byte IEEE 754 LE) is deferred
-		// to a follow-up.  M0111-0002.
 		payload, n, err := decodePhysicalPGVarlena(data)
 		if err != nil {
 			return Datum{}, 0, err
@@ -986,6 +1166,28 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return newStringArenaDatum(sctx, moff, mlen), n, nil
 		}
 		return NewStringDatum(string(payload)), n, nil
+	case "float4", "real", "float8", "double precision", "double":
+		// goopg stores float4/float8 as varlena text for v0 compatibility.
+		// Decode the text payload back into KindNumeric (NaN/Inf fall back
+		// to KindString) so numeric ORDER BY and comparison behave
+		// correctly. Returning KindString here — as the shared text case
+		// used to — sorted float columns lexicographically; this mirrors
+		// the legacy decodeValue / arena decoders. M0111-0006: regression
+		// of the M0097-0003 KindNumeric decode, lost when M0111-0002
+		// switched float storage to varlena text in this PG-physical path.
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, err
+		}
+		text := string(payload)
+		if v, scale, ok := parseNumericFast(text); ok {
+			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, n, nil
+		}
+		if m, s, perr := parseNumeric(text); perr == nil {
+			return newNumeric(m, int(s)), n, nil
+		}
+		// NaN / Infinity / other non-decimal text falls back to string.
+		return NewStringDatum(text), n, nil
 	case "bytea":
 		payload, n, err := decodePhysicalPGVarlena(data)
 		if err != nil {

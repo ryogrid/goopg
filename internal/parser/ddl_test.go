@@ -54,6 +54,20 @@ func TestParseCreateTableConstraints(t *testing.T) {
 	}
 }
 
+func TestParseCreateTableBareCharDefaultsToCharacterOne(t *testing.T) {
+	stmts, err := Parse(`CREATE TABLE t (a char, b "char")`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if got := ct.Columns[0].Type; got.Name != "char" || len(got.Args) != 1 || got.Args[0] != 1 {
+		t.Fatalf("bare char type=%+v, want char(1)", got)
+	}
+	if got := ct.Columns[1].Type; got.Name != "char" || len(got.Args) != 0 {
+		t.Fatalf("quoted char type=%+v, want internal char", got)
+	}
+}
+
 // TestParseCreateTableTableLevelPrimaryKey: PK is declared as a
 // constraint at the end of the column list rather than inline.
 func TestParseCreateTableTableLevelPrimaryKey(t *testing.T) {

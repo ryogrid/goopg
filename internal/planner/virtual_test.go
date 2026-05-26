@@ -61,3 +61,51 @@ func TestPlanSelectFromVirtualPgClass(t *testing.T) {
 		}
 	}
 }
+
+// TestTypedVirtualCell verifies that virtual catalog-table cells are typed
+// per column kind so integer-family and boolean columns compare/aggregate by
+// value rather than lexicographically. Regression for the sysviews
+// pg_backend_memory_contexts `total_bytes >= free_bytes` case, where text
+// comparison of "1048576" >= "524288" wrongly yielded false. Both
+// planner.buildVirtualValues and executor.rematerialiseVirtualRows route
+// through this helper and must agree.
+func TestTypedVirtualCell(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		colType string
+		want    Expr
+	}{
+		{"int8 numeric", "1048576", "int8", &IntegerConst{Value: 1048576}},
+		{"int4 numeric", "-5", "int4", &IntegerConst{Value: -5}},
+		{"integer alias", "42", "integer", &IntegerConst{Value: 42}},
+		{"bigint alias", "9000000000", "bigint", &IntegerConst{Value: 9000000000}},
+		{"bool true", "t", "bool", &BooleanConst{Value: true}},
+		{"bool false", "f", "boolean", &BooleanConst{Value: false}},
+		{"text stays string", "TopMemoryContext", "text", &StringConst{Value: "TopMemoryContext"}},
+		{"non-numeric int falls back", "", "int8", &StringConst{Value: ""}},
+		{"non-bool bool falls back", "maybe", "bool", &StringConst{Value: "maybe"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := TypedVirtualCell(0, c.value, c.colType)
+			switch want := c.want.(type) {
+			case *IntegerConst:
+				g, ok := got.(*IntegerConst)
+				if !ok || g.Value != want.Value {
+					t.Fatalf("got %#v, want IntegerConst{%d}", got, want.Value)
+				}
+			case *BooleanConst:
+				g, ok := got.(*BooleanConst)
+				if !ok || g.Value != want.Value {
+					t.Fatalf("got %#v, want BooleanConst{%v}", got, want.Value)
+				}
+			case *StringConst:
+				g, ok := got.(*StringConst)
+				if !ok || g.Value != want.Value {
+					t.Fatalf("got %#v, want StringConst{%q}", got, want.Value)
+				}
+			}
+		})
+	}
+}

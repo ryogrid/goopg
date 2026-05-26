@@ -58,8 +58,11 @@ func (r rowSlotView) IsNull(col int) bool { return r[col].IsNull() }
 // at hash-table storage, sort buffer, aggregate group key, and
 // every other retention boundary.
 type MaterializedSlot struct {
-	schema planner.Schema
-	row    Row
+	schema    planner.Schema
+	row       Row
+	ctidBlock uint32 // injected by seqScanOp for CTIDExpr; valid when hasCTID=true. M0097-0038.
+	ctidOff   uint16
+	hasCTID   bool
 }
 
 // SlotFromRow wraps an existing Row in a MaterializedSlot. The

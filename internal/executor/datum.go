@@ -392,7 +392,9 @@ func NewToastPointerDatum(p []byte) Datum {
 // ---------- formatting ----------
 
 // Format renders the value the way text-mode wire protocol expects.
-// Time values use upstream's `2006-01-02 15:04:05.000000` layout.
+// Unqualified KindTime values default to PostgreSQL's timestamp text shape;
+// time-only datums are formatted by typed callers such as casts and the wire
+// protocol layer.
 // AppendValueText appends d's text-format wire representation
 // directly to dst and returns the extended slice. The protocol-
 // layer hot path uses this instead of Format() to avoid the
@@ -434,6 +436,41 @@ func (d Datum) AppendValueText(dst []byte) []byte {
 	}
 	// Fallback for KindInterval / KindNumeric / unknown kinds.
 	return append(dst, d.Format()...)
+}
+
+func isTimeOnlyValue(t time.Time) bool {
+	return (t.Year() == 1970 && t.Month() == time.January && t.Day() == 1) ||
+		(t.Year() == 1970 && t.Month() == time.January && t.Day() == 2 &&
+			t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0)
+}
+
+func appendTimeOnlyValueText(dst []byte, t time.Time) []byte {
+	h, m, s := t.Hour(), t.Minute(), t.Second()
+	ns := t.Nanosecond()
+	if t.Year() == 1970 && t.Month() == time.January && t.Day() == 2 && h == 0 && m == 0 && s == 0 && ns == 0 {
+		return append(dst, "24:00:00"...)
+	}
+	dst = append(dst, byte('0'+h/10), byte('0'+h%10), ':',
+		byte('0'+m/10), byte('0'+m%10), ':',
+		byte('0'+s/10), byte('0'+s%10))
+	if ns == 0 {
+		return dst
+	}
+	micro := ns / 1000
+	var frac [6]byte
+	for i := 5; i >= 0; i-- {
+		frac[i] = byte('0' + micro%10)
+		micro /= 10
+	}
+	end := len(frac)
+	for end > 0 && frac[end-1] == '0' {
+		end--
+	}
+	if end == 0 {
+		return dst
+	}
+	dst = append(dst, '.')
+	return append(dst, frac[:end]...)
 }
 
 func (d Datum) Format() string {

@@ -66,7 +66,7 @@ type Context struct {
 	parent   *Context
 	children []*Context
 	chunks   []chunk
-	head     int32  // index of current active chunk
+	head     int32 // index of current active chunk
 	id       ContextID
 	gen      uint32 // bumped on Reset; for debug use-after-Reset detection
 	kind     Kind
@@ -369,6 +369,13 @@ func AllocFor[T any](c *Context) *T {
 }
 
 // AllocSlice returns []T of length n allocated from c.
+//
+// T MUST be pointer-free. The backing slab is allocated as []byte, i.e. a GC
+// noscan span, so any Go pointer stored in a T placed here (e.g. a string
+// header) is invisible to the mark phase and will be collected out from under
+// you; arena memory is also explicitly recycled, so it cannot back any value
+// whose lifetime may exceed c. Storing parser.Token ([]Token) here is the
+// canonical violation — see docs/design/0107-0003d-token-pool-gc-safety.md.
 func AllocSlice[T any](c *Context, n int) []T {
 	if n <= 0 {
 		return nil

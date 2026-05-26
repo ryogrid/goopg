@@ -41,3 +41,50 @@ func TestParseDropViewIfExists(t *testing.T) {
 		t.Errorf("Names=%+v", dv.Names)
 	}
 }
+
+// TestParseCreateTempView pins M0097-0036: CREATE TEMP[ORARY] VIEW must
+// dispatch to the view parser and set Temporary, not be mis-parsed as a
+// CREATE TABLE. Regression for the functional_deps regress case, where
+// `CREATE TEMP VIEW … AS SELECT … GROUP BY …` previously produced no view
+// (a later DROP VIEW then failed with "view does not exist").
+func TestParseCreateTempView(t *testing.T) {
+	for _, src := range []string{
+		"CREATE TEMP VIEW fdv1 AS SELECT id FROM articles GROUP BY id",
+		"CREATE TEMPORARY VIEW fdv1 AS SELECT id FROM articles GROUP BY id",
+		"CREATE LOCAL TEMP VIEW fdv1 AS SELECT id FROM articles GROUP BY id",
+	} {
+		stmts, err := Parse(src)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", src, err)
+		}
+		cv, ok := stmts[0].(*CreateViewStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T, want *CreateViewStmt", src, stmts[0])
+		}
+		if !cv.Temporary {
+			t.Errorf("Parse(%q): Temporary=false want true", src)
+		}
+		if cv.Name.Name != "fdv1" {
+			t.Errorf("Parse(%q): Name=%q want fdv1", src, cv.Name.Name)
+		}
+		if cv.Query == nil {
+			t.Errorf("Parse(%q): Query nil", src)
+		}
+	}
+}
+
+// TestParseCreateTempSequence pins that CREATE TEMP SEQUENCE dispatches to
+// the sequence parser (Temporary=true) rather than the table parser.
+func TestParseCreateTempSequence(t *testing.T) {
+	stmts, err := Parse("CREATE TEMP SEQUENCE s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs, ok := stmts[0].(*CreateSequenceStmt)
+	if !ok {
+		t.Fatalf("got %T, want *CreateSequenceStmt", stmts[0])
+	}
+	if !cs.Temporary {
+		t.Errorf("Temporary=false want true")
+	}
+}

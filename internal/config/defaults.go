@@ -50,6 +50,17 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset, Flags: FlagReport,
 		Scope: ScopeSession | ScopeTransaction,
 	}))
+	// timezone_abbreviations selects the abbreviation set used when parsing
+	// timestamps (e.g. 'Default', 'Australia', 'India'). PostgreSQL validates
+	// the value against an abbreviation file; goopg accepts any string since
+	// pg_timezone_abbrevs is a static stub. Required by sysviews.sql, which
+	// issues `SET timezone_abbreviations = 'Australia'` / `'India'`. Not a
+	// GUC_REPORT parameter in upstream, so no FlagReport here. M0097-0032.
+	r.MustRegister(NewVariable(Variable{
+		Name: "timezone_abbreviations", Type: TypeString, BootVal: "Default",
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "integer_datetimes", Type: TypeBool, BootVal: "on",
 		Context: ContextInternal, Flags: FlagReport | FlagDisallowInFile,

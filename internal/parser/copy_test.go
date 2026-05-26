@@ -88,6 +88,131 @@ func TestParseCopyQueryToStdout(t *testing.T) {
 	}
 }
 
+// TestParseCopySelectIntoFlagged: the deprecated `SELECT … INTO …` form
+// inside COPY (...) parses successfully (PG's grammar accepts it) with
+// SelectInto set, so planCopy can reject it with the PG-compatible
+// "COPY (SELECT INTO) is not supported". goopg's parseSelect stops at the
+// reserved INTO keyword, so the parser skips the unparsed tail. M0097-0024.
+func TestParseCopySelectIntoFlagged(t *testing.T) {
+	stmts, err := Parse("copy (select t into temp test3 from test1 where id=3) to stdout")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	c := stmts[0].(*CopyStmt)
+	if !c.SelectInto {
+		t.Error("SelectInto not set for COPY (SELECT … INTO …)")
+	}
+	if c.Query == nil {
+		t.Fatal("Query nil")
+	}
+	if c.Direction != CopyTo || c.Endpoint != CopyEndpointStdout {
+		t.Errorf("direction/endpoint = %v/%v", c.Direction, c.Endpoint)
+	}
+	// A plain COPY (SELECT …) without INTO must NOT be flagged.
+	stmts, err = Parse("COPY (SELECT 1) TO STDOUT")
+	if err != nil {
+		t.Fatalf("Parse plain: %v", err)
+	}
+	if stmts[0].(*CopyStmt).SelectInto {
+		t.Error("SelectInto wrongly set for plain COPY (SELECT …)")
+	}
+}
+
+// TestParseCopyDMLToStdout: COPY (INSERT/UPDATE/DELETE … RETURNING) TO
+// STDOUT parses into a CopyStmt with QueryDML set (not Query), so the
+// planner can stream the RETURNING rows. M0097-0009.
+func TestParseCopyDMLToStdout(t *testing.T) {
+	cases := []struct {
+		sql  string
+		kind string
+	}{
+		{"COPY (INSERT INTO t (a) VALUES (1) RETURNING a) TO STDOUT", "insert"},
+		{"COPY (UPDATE t SET a = 2 WHERE a = 1 RETURNING a) TO STDOUT", "update"},
+		{"COPY (DELETE FROM t WHERE a = 1 RETURNING a) TO STDOUT", "delete"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		c := stmts[0].(*CopyStmt)
+		if c.Query != nil {
+			t.Errorf("%q: Query should be nil for DML form", tc.sql)
+		}
+		if c.QueryDML == nil {
+			t.Fatalf("%q: QueryDML nil", tc.sql)
+		}
+		if c.Direction != CopyTo || c.Endpoint != CopyEndpointStdout {
+			t.Errorf("%q: direction/endpoint = %v/%v", tc.sql, c.Direction, c.Endpoint)
+		}
+		var ok bool
+		switch tc.kind {
+		case "insert":
+			_, ok = c.QueryDML.(*InsertStmt)
+		case "update":
+			_, ok = c.QueryDML.(*UpdateStmt)
+		case "delete":
+			_, ok = c.QueryDML.(*DeleteStmt)
+		}
+		if !ok {
+			t.Errorf("%q: QueryDML=%T want %s", tc.sql, c.QueryDML, tc.kind)
+		}
+	}
+}
+
+// TestParseCopyDMLFromRejected: COPY (DML) is only valid with TO.
+func TestParseCopyDMLFromRejected(t *testing.T) {
+	_, err := Parse("COPY (INSERT INTO t (a) VALUES (1) RETURNING a) FROM STDIN")
+	if err == nil {
+		t.Fatal("expected error for COPY (DML) FROM, got nil")
+	}
+}
+
+// TestParseCopyQueryFromRejected: the parenthesised-query form of COPY
+// is TO-only in PostgreSQL's grammar, so a trailing FROM is a syntax
+// error anchored at the `from` token (not goopg's old byte-0
+// "COPY (query) is only valid with TO" leak). M0097-0024 / copyselect.
+func TestParseCopyQueryFromRejected(t *testing.T) {
+	src := "copy (select * from test1) from stdin"
+	_, err := Parse(src)
+	if err == nil {
+		t.Fatal("expected syntax error for COPY (query) FROM, got nil")
+	}
+	se, ok := err.(*SyntaxError)
+	if !ok {
+		t.Fatalf("got %T (%v), want *SyntaxError", err, err)
+	}
+	if se.Message != "from" {
+		t.Errorf("Message=%q, want %q", se.Message, "from")
+	}
+	// Pos must point at the *direction* FROM (the second "from"), not at
+	// the FROM inside the SELECT, so psql's caret lands correctly.
+	if want := len("copy (select * from test1) "); se.Pos != want {
+		t.Errorf("Pos=%d, want %d (the trailing FROM)", se.Pos, want)
+	}
+}
+
+// TestParseCopyQueryColumnListRejected: the query form takes no column
+// list; `copy (select …) (t,id) …` is a syntax error at the opening
+// paren. M0097-0024 / copyselect.
+func TestParseCopyQueryColumnListRejected(t *testing.T) {
+	src := "copy (select * from test1) (t,id) to stdout"
+	_, err := Parse(src)
+	if err == nil {
+		t.Fatal("expected syntax error for COPY (query) (cols), got nil")
+	}
+	se, ok := err.(*SyntaxError)
+	if !ok {
+		t.Fatalf("got %T (%v), want *SyntaxError", err, err)
+	}
+	if se.Message != "(" {
+		t.Errorf("Message=%q, want %q", se.Message, "(")
+	}
+	if want := len("copy (select * from test1) "); se.Pos != want {
+		t.Errorf("Pos=%d, want %d (the column-list paren)", se.Pos, want)
+	}
+}
+
 // TestParseCopyFileEndpoints: filename + PROGRAM. v0 parses these so
 // the analyzer/executor can return a stable "not supported" error
 // rather than a generic syntax error.
@@ -111,7 +236,7 @@ func TestParseCopyFileEndpoints(t *testing.T) {
 	}
 }
 
-// TestParseCopyLegacyTrail: pre-9.0 `WITH BINARY DELIMITER '|' NULL ''
+// TestParseCopyLegacyTrail: pre-9.0 `WITH BINARY DELIMITER '|' NULL ”
 // HEADER` syntax. We accept it because some clients still emit it.
 func TestParseCopyLegacyTrail(t *testing.T) {
 	stmts, err := Parse("COPY t TO STDOUT WITH BINARY DELIMITER '|' NULL '' HEADER")
@@ -149,6 +274,79 @@ func TestParseCopyForceQuoteStarAndCols(t *testing.T) {
 		len(got["force_not_null"].Cols) != 2 ||
 		got["force_not_null"].Cols[0] != "a" || got["force_not_null"].Cols[1] != "b" {
 		t.Errorf("force_not_null cols: %+v", got["force_not_null"])
+	}
+}
+
+// TestParseCopyQueryLegacyForceQuoteTrail covers the sole remaining
+// copyselect shape: the parenthesised-query COPY form followed by the
+// deprecated, parenthesis-free legacy option trail including
+// FORCE QUOTE. PostgreSQL's gram.y allows `copy_opt_list` after STDOUT
+// for the query form too. M0097-0024.
+func TestParseCopyQueryLegacyForceQuoteTrail(t *testing.T) {
+	stmts, err := Parse("copy (select t from test1 where id = 1) to stdout csv header force quote t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := stmts[0].(*CopyStmt)
+	if c.Query == nil {
+		t.Fatalf("expected query-form COPY, got %+v", c)
+	}
+	got := map[string]CopyOption{}
+	for _, o := range c.Options {
+		got[o.Name] = o
+	}
+	if !got["csv"].Bool {
+		t.Errorf("csv flag missing: %+v", c.Options)
+	}
+	if !got["header"].Bool {
+		t.Errorf("header flag missing: %+v", c.Options)
+	}
+	fq, ok := got["force_quote"]
+	if !ok || fq.Star || len(fq.Cols) != 1 || fq.Cols[0] != "t" {
+		t.Errorf("force_quote want cols [t], got %+v", fq)
+	}
+}
+
+// TestParseCopyLegacyForceVariants pins the three legacy FORCE shapes,
+// each normalised to the modern option form. M0097-0024.
+func TestParseCopyLegacyForceVariants(t *testing.T) {
+	cases := []struct {
+		in       string
+		name     string
+		wantStar bool
+		wantCols []string
+	}{
+		{"COPY t TO STDOUT CSV FORCE QUOTE *", "force_quote", true, nil},
+		{"COPY t TO STDOUT CSV FORCE QUOTE a, b", "force_quote", false, []string{"a", "b"}},
+		{"COPY t FROM STDIN CSV FORCE NOT NULL a", "force_not_null", false, []string{"a"}},
+		{"COPY t FROM STDIN CSV FORCE NULL a, b", "force_null", false, []string{"a", "b"}},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.in)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.in, err)
+		}
+		c := stmts[0].(*CopyStmt)
+		var opt *CopyOption
+		for i := range c.Options {
+			if c.Options[i].Name == tc.name {
+				opt = &c.Options[i]
+			}
+		}
+		if opt == nil {
+			t.Fatalf("%q: %s option missing (%+v)", tc.in, tc.name, c.Options)
+		}
+		if opt.Star != tc.wantStar {
+			t.Errorf("%q: Star=%v want %v", tc.in, opt.Star, tc.wantStar)
+		}
+		if len(opt.Cols) != len(tc.wantCols) {
+			t.Fatalf("%q: cols=%v want %v", tc.in, opt.Cols, tc.wantCols)
+		}
+		for i := range tc.wantCols {
+			if opt.Cols[i] != tc.wantCols[i] {
+				t.Errorf("%q: cols[%d]=%q want %q", tc.in, i, opt.Cols[i], tc.wantCols[i])
+			}
+		}
 	}
 }
 

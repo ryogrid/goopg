@@ -153,3 +153,48 @@ func TestParseAlterTableSyntaxErrors(t *testing.T) {
 		}
 	}
 }
+
+
+// TestParseAlterTableDropConstraint verifies that DROP CONSTRAINT name [RESTRICT|CASCADE]
+// is parsed into an AlterTableDropConstraint action. M0097-0036 / functional_deps.
+func TestParseAlterTableDropConstraint(t *testing.T) {
+	cases := []struct {
+		sql            string
+		wantConstraint string
+		wantRestrict   bool
+	}{
+		{"ALTER TABLE articles DROP CONSTRAINT articles_pkey RESTRICT", "articles_pkey", true},
+		{"ALTER TABLE articles DROP CONSTRAINT articles_pkey CASCADE", "articles_pkey", false},
+		{"ALTER TABLE articles DROP CONSTRAINT articles_pkey", "articles_pkey", true}, // default = RESTRICT
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("Parse(%q) unexpected error: %v", tc.sql, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("Parse(%q): got %d stmts, want 1", tc.sql, len(stmts))
+			continue
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Errorf("Parse(%q) got %T, want *AlterTableStmt", tc.sql, stmts[0])
+			continue
+		}
+		if len(at.Actions) != 1 {
+			t.Errorf("Parse(%q): got %d actions, want 1", tc.sql, len(at.Actions))
+			continue
+		}
+		act := at.Actions[0]
+		if act.Kind != AlterTableDropConstraint {
+			t.Errorf("Parse(%q): Kind=%v, want AlterTableDropConstraint", tc.sql, act.Kind)
+		}
+		if act.ConstraintName != tc.wantConstraint {
+			t.Errorf("Parse(%q): ConstraintName=%q, want %q", tc.sql, act.ConstraintName, tc.wantConstraint)
+		}
+		if act.Restrict != tc.wantRestrict {
+			t.Errorf("Parse(%q): Restrict=%v, want %v", tc.sql, act.Restrict, tc.wantRestrict)
+		}
+	}
+}

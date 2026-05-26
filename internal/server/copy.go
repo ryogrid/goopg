@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
@@ -35,7 +36,7 @@ type copyInState struct {
 	mgr      *mvcc.Manager
 }
 
-func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte, connTx *connTxState, prepStmts *preparedStatements) (*copyInState, error) {
+func (s *Server) handleQueryOrCopy(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte, connTx *connTxState, prepStmts *preparedStatements) (*copyInState, error) {
 	q, err := extractCString(payload)
 	if err != nil {
 		if err := s.writeQueryError(w, sqlstate.ProtocolViolation,
@@ -45,8 +46,15 @@ func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter,
 		return nil, nil
 	}
 	_, matchable, upper, empty := normalizeSimpleQuery(q)
-	if empty || !strings.HasPrefix(upper, "COPY ") {
-		if err := s.handleQuery(ctx, w, sess, payload, connTx, prepStmts); err != nil {
+	// Multi-statement simple-query batches (psql's `\;`-joined commands
+	// arrive as a single Query message with internal ';') must go through
+	// the multi-statement dispatcher even when the first statement is a
+	// COPY — otherwise dispatchCopyViaExecutor's single-statement guard
+	// rejects them with "expected exactly one COPY statement". The
+	// dispatcher runs each COPY inline via runInlineCopy. M0097-0024.
+	multiStatement := strings.ContainsRune(matchable, ';')
+	if empty || !strings.HasPrefix(upper, "COPY ") || multiStatement {
+		if err := s.handleQuery(ctx, r, w, sess, payload, connTx, prepStmts); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -94,7 +102,13 @@ func (s *Server) handleQueryOrCopy(ctx context.Context, w *protocol.FrameWriter,
 func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameWriter, sql string, connTx *connTxState) (*copyInState, error) {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
-		if err := s.writeQueryError(w, sqlstate.SyntaxError, err.Error()); err != nil {
+		// Render parser syntax errors the same way the main simple-query
+		// path does: strip the internal " (byte N)" suffix and attach the
+		// Position field so psql shows `LINE n:` with a caret. Without
+		// this the COPY path leaked e.g. `syntax error at or near "from"
+		// (byte 27)` and no caret. M0097-0024.
+		msg, extra := syntaxErrorMsg(err)
+		if err := s.writeQueryError(w, sqlstate.SyntaxError, msg, extra...); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -108,7 +122,9 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 	node, err := planner.Plan(stmts[0], s.cfg.Catalog)
 	if err != nil {
 		code, msg := planErrorFields(err)
-		if err := s.writeQueryError(w, code, msg); err != nil {
+		// Carry any planner hint (e.g. "Try the COPY (SELECT ...) TO
+		// variant." for a COPY-from-view rejection) onto the wire.
+		if err := s.writeQueryError(w, code, msg, planErrorHintFields(err)...); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -161,9 +177,28 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 
 	switch plan.Direction {
 	case planner.CopyTo:
-		err := s.runCopyTo(w, ectx, plan)
-		_ = s.cfg.TxnMgr.Commit(tx)
+		count, errorSent, err := s.runCopyToStream(w, ectx, plan)
 		if err != nil {
+			_ = s.cfg.TxnMgr.Rollback(tx)
+			return nil, err
+		}
+		if errorSent {
+			// runCopyToStream already wrote ErrorResponse + RFQ.
+			_ = s.cfg.TxnMgr.Rollback(tx)
+			return nil, nil
+		}
+		// Commit BEFORE CommandComplete so COPY (DML … RETURNING)
+		// writes are durable/visible by the time the client proceeds.
+		if cErr := s.cfg.TxnMgr.Commit(tx); cErr != nil {
+			if wErr := s.writeQueryError(w, sqlstate.SystemError, cErr.Error()); wErr != nil {
+				return nil, wErr
+			}
+			return nil, nil
+		}
+		if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", count)); err != nil {
+			return nil, err
+		}
+		if err := w.WriteReadyForQuery(protocol.TxStatusIdle); err != nil {
 			return nil, err
 		}
 		return nil, nil
@@ -216,9 +251,176 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 	return nil, nil
 }
 
-// runCopyTo drives the CopyOutResponse / CopyData* / CopyDone /
-// CommandComplete / ReadyForQuery sequence for a CopyTo plan.
-func (s *Server) runCopyTo(w *protocol.FrameWriter, ctx *executor.Context, plan *planner.Copy) error {
+// runInlineCopy executes a COPY statement that appears inside a
+// multi-statement simple-query batch (psql's `\;`-joined commands, which
+// libpq delivers as a single Query message with internal ';'). Unlike
+// dispatchCopyViaExecutor — which runs the COPY in its own dedicated
+// auto-commit transaction and emits its own ReadyForQuery — this runs
+// within the batch's shared executor context (ectx, already carrying the
+// per-statement transaction and snapshot) and writes only CommandComplete
+// on success. The surrounding dispatch loop emits the single trailing
+// ReadyForQuery that covers the whole Query message, matching PostgreSQL's
+// exec_simple_query semantics (one RFQ per message, one CommandComplete
+// per statement).
+//
+// COPY ... TO STDOUT and server-side COPY ... FROM 'file' are supported
+// because neither needs client→server streaming mid-batch. COPY FROM STDIN
+// inside a batch is handled by runInlineCopyFromStdin, which reads the
+// client's CopyData/CopyDone frames synchronously from r (the connection's
+// main read loop is parked until the batch finishes).
+//
+// On a handled error the relevant write helper has already emitted
+// ErrorResponse + ReadyForQuery, so this returns errQueryErrorSent and the
+// caller aborts the rest of the batch without emitting a second RFQ.
+func (s *Server) runInlineCopy(r *protocol.FrameReader, w *protocol.FrameWriter, ectx *executor.Context, cs *parser.CopyStmt) error {
+	node, perr := planner.Plan(cs, s.cfg.Catalog)
+	if perr != nil {
+		code, msg := planErrorFields(perr)
+		return s.writeQueryError(w, code, msg, planErrorHintFields(perr)...)
+	}
+	plan, ok := node.(*planner.Copy)
+	if !ok {
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported, "expected COPY statement")
+	}
+
+	switch plan.Direction {
+	case planner.CopyTo:
+		count, errorSent, err := s.runCopyToStream(w, ectx, plan)
+		if err != nil {
+			// runCopyToStream already wrote ErrorResponse + RFQ on a
+			// mid-stream executor error; propagate the sentinel so the
+			// batch aborts cleanly.
+			return err
+		}
+		if errorSent {
+			return errQueryErrorSent
+		}
+		return w.WriteCommandComplete(fmt.Sprintf("COPY %d", count))
+	case planner.CopyFrom:
+		if plan.Endpoint == planner.CopyEndpointFile {
+			// Server-side COPY FROM 'file' reads on the server with no
+			// wire interaction, so it works inline.
+			count, err := executor.RunCopyFromFile(ectx, plan)
+			if err != nil {
+				return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+			}
+			return w.WriteCommandComplete(fmt.Sprintf("COPY %d", count))
+		}
+		return s.runInlineCopyFromStdin(r, w, ectx, plan)
+	}
+	return s.writeQueryError(w, sqlstate.FeatureNotSupported, "unknown COPY direction")
+}
+
+// runInlineCopyFromStdin drives the CopyInResponse / CopyData* / CopyDone
+// handshake for a COPY FROM STDIN that appears inside a multi-statement
+// simple-query batch (psql's `\;`-joined commands). It reads the client's
+// CopyData/CopyDone/CopyFail frames synchronously from r — the connection's
+// main read loop is parked in handleQueryOrCopy until the whole batch
+// finishes, so consuming frames here is safe and keeps statement ordering.
+//
+// Unlike the single-COPY path (copyInState + handleCopyInFrame, driven by the
+// main loop), this neither commits nor emits ReadyForQuery: the COPY shares
+// the batch's transaction (ectx.Tx), which the dispatch loop commits once at
+// the end, and the dispatch loop emits the single trailing RFQ for the whole
+// Query message. On success it writes only CommandComplete "COPY n".
+//
+// A client COPY failure (CopyFail) or a decode/insert error writes
+// ErrorResponse + RFQ via writeQueryError and returns errQueryErrorSent so the
+// dispatch loop aborts the rest of the batch without a second RFQ. A frame
+// read error (or Terminate) returns a non-sentinel error so the connection
+// loop tears the connection down.
+func (s *Server) runInlineCopyFromStdin(r *protocol.FrameReader, w *protocol.FrameWriter, ectx *executor.Context, plan *planner.Copy) error {
+	from, err := executor.NewCopyFromExecutor(ectx, plan)
+	if err != nil {
+		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+	}
+	fmtCode := byte(0)
+	if executor.IsBinaryFormat(plan.Options) {
+		fmtCode = 1
+	}
+	if err := w.WriteCopyInResponse(fmtCode, nil); err != nil {
+		return err
+	}
+	// The client only sends CopyData after it has seen CopyInResponse, so the
+	// buffered frame must reach the wire before we block on ReadFrame.
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	var lineBuf []byte
+	for {
+		f, err := r.ReadFrame()
+		if err != nil {
+			return err
+		}
+		switch f.Type {
+		case protocol.MsgCopyData:
+			if from.IsBinary() {
+				done, perr := from.PushBinaryData(f.Payload)
+				if perr != nil {
+					return s.writeQueryError(w, execErrCode(perr), execErrMsg(perr))
+				}
+				if done {
+					// Binary trailer seen inside CopyData — same as CopyDone.
+					return w.WriteCommandComplete(fmt.Sprintf("COPY %d", from.RowsInserted()))
+				}
+				continue
+			}
+			lineBuf = append(lineBuf, f.Payload...)
+			for {
+				idx := bytes.IndexByte(lineBuf, '\n')
+				if idx < 0 {
+					break
+				}
+				line := lineBuf[:idx]
+				// `\.` end-of-data marker (deprecated in v3 but still sent by
+				// psql before CopyDone): skip it, matching upstream text COPY.
+				if !isCopyTextEOD(line) {
+					if perr := from.PushLine(line); perr != nil {
+						return s.writeQueryError(w, execErrCode(perr), execErrMsg(perr))
+					}
+				}
+				lineBuf = lineBuf[idx+1:]
+			}
+		case protocol.MsgCopyDone:
+			// Flush any partial trailing line (no terminating newline).
+			if !from.IsBinary() && len(lineBuf) > 0 && !isCopyTextEOD(lineBuf) {
+				if perr := from.PushLine(lineBuf); perr != nil {
+					return s.writeQueryError(w, execErrCode(perr), execErrMsg(perr))
+				}
+			}
+			return w.WriteCommandComplete(fmt.Sprintf("COPY %d", from.RowsInserted()))
+		case protocol.MsgCopyFail:
+			msg, merr := extractCString(f.Payload)
+			if merr != nil || msg == "" {
+				msg = "COPY from stdin aborted by frontend"
+			}
+			return s.writeQueryError(w, sqlstate.QueryCanceled, msg)
+		case protocol.MsgFlush:
+			// No-op: nothing buffered to push out mid-COPY.
+		case protocol.MsgTerminate:
+			return io.EOF
+		default:
+			return s.writeQueryError(w, sqlstate.ProtocolViolation,
+				fmt.Sprintf("unexpected message %q in COPY FROM STDIN", f.Type))
+		}
+	}
+}
+
+// runCopyToStream drives the CopyOutResponse / CopyData* / CopyDone
+// sequence for a CopyTo plan and returns the streamed row count. It
+// deliberately stops short of CommandComplete / ReadyForQuery so the
+// caller can commit the COPY-internal transaction *before* signalling
+// completion — critical for COPY (INSERT/UPDATE/DELETE … RETURNING),
+// whose mutations must be durable and visible by the time the client
+// is told the command finished. (Streaming a read-only SELECT/table is
+// unaffected by the ordering, but COPY(DML) loses visibility otherwise:
+// the client races ahead with its next query before the commit lands.)
+//
+// On a mid-stream executor error this writes the wire ErrorResponse +
+// ReadyForQuery itself and returns errorSent=true so the caller rolls
+// back and emits nothing further.
+func (s *Server) runCopyToStream(w *protocol.FrameWriter, ctx *executor.Context, plan *planner.Copy) (count int64, errorSent bool, err error) {
 	// Peek at the options to decide the wire format code before opening
 	// the operator — WriteCopyOutResponse must precede any CopyData frames.
 	binary := executor.IsBinaryFormat(plan.Options)
@@ -227,21 +429,21 @@ func (s *Server) runCopyTo(w *protocol.FrameWriter, ctx *executor.Context, plan 
 		fmtCode = 1
 	}
 	if err := w.WriteCopyOutResponse(fmtCode, nil); err != nil {
-		return err
+		return 0, false, err
 	}
-	count, _, err := executor.RunCopyTo(ctx, plan, func(line []byte) error {
+	count, _, execErr := executor.RunCopyTo(ctx, plan, func(line []byte) error {
 		return w.WriteCopyData(line)
 	})
-	if err != nil {
-		return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+	if execErr != nil {
+		if wErr := s.writeQueryError(w, execErrCode(execErr), execErrMsg(execErr)); wErr != nil {
+			return count, true, wErr
+		}
+		return count, true, nil
 	}
 	if err := w.WriteCopyDone(); err != nil {
-		return err
+		return count, false, err
 	}
-	if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", count)); err != nil {
-		return err
-	}
-	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	return count, false, nil
 }
 
 func (s *Server) handleCopyToStdoutQuery(w *protocol.FrameWriter, matchable string) (*copyInState, error) {

@@ -23,8 +23,8 @@ Root node: `Projection`
 |---|-----------|-------|-------|
 | 1 | Seq Scan | region | — |
 | 2 | Index Scan | nation | idx_nation_regionkey |
-| 3 | Seq Scan | partsupp | — |
-| 4 | Index Scan | supplier | supplier_pk |
+| 3 | Seq Scan | supplier | — |
+| 4 | Index Scan | partsupp | idx_partsupp_suppkey |
 | 5 | Index Scan | part | idx_part_size |
 | 6 | Seq Scan | region | — |
 | 7 | Seq Scan | nation | — |
@@ -56,12 +56,12 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | region | — |
-| 2 | Index Scan | nation | idx_nation_regionkey |
-| 3 | Index Scan | supplier | idx_supplier_nationkey |
-| 4 | Index Scan | lineitem | idx_lineitem_suppkey |
-| 5 | Index Scan | orders | idx_orders_orderdate |
-| 6 | Index Scan | customer | customer_pk |
+| 1 | Index Scan | orders | idx_orders_orderdate |
+| 2 | Index Scan | lineitem | idx_lineitem_orderkey |
+| 3 | Index Scan | supplier | supplier_pk |
+| 4 | Index Scan | customer | customer_pk |
+| 5 | Index Scan | nation | nation_pk |
+| 6 | Seq Scan | region | — |
 
 ### Q6
 
@@ -105,11 +105,11 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | nation | — |
-| 2 | Seq Scan | supplier | — |
-| 3 | Seq Scan | partsupp | — |
-| 4 | Index Scan | lineitem | idx_lineitem_suppkey |
-| 5 | Index Scan | orders | orders_pk |
+| 1 | Seq Scan | supplier | — |
+| 2 | Seq Scan | orders | — |
+| 3 | Seq Scan | lineitem | — |
+| 4 | Index Scan | partsupp | idx_partsupp_suppkey |
+| 5 | Index Scan | nation | nation_pk |
 | 6 | Seq Scan | part | — |
 
 ### Q10
@@ -259,11 +259,11 @@ for an M0054-0003 sub-task investigation.
 | Table | Seq Scan queries | Index Scan queries |
 |-------|------------------|--------------------|
 | customer | Q10, Q18, Q22, Q7 | Q13, Q3, Q5, Q8 |
-| lineitem | Q10, Q17, Q18, Q19, Q21, Q4 | Q1, Q12, Q14, Q15a, Q15b, Q20, Q21, Q3, Q5, Q6, Q7, Q8, Q9 |
-| nation | Q10, Q11, Q2, Q21, Q7, Q9 | Q2, Q20, Q5, Q7, Q8 |
-| orders | Q13, Q18, Q21, Q7 | Q10, Q12, Q22, Q3, Q4, Q5, Q8, Q9 |
+| lineitem | Q10, Q17, Q18, Q19, Q21, Q4, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q20, Q21, Q3, Q5, Q6, Q7, Q8 |
+| nation | Q10, Q11, Q2, Q21, Q7 | Q2, Q20, Q5, Q7, Q8, Q9 |
+| orders | Q13, Q18, Q21, Q7, Q9 | Q10, Q12, Q22, Q3, Q4, Q5, Q8 |
 | part | Q20, Q9 | Q14, Q16, Q17, Q19, Q2, Q8 |
-| partsupp | Q11, Q16, Q2, Q20, Q9 | — |
+| partsupp | Q11, Q16, Q2, Q20 | Q2, Q9 |
 | region | Q2, Q5, Q8 | — |
-| supplier | Q11, Q15b, Q2, Q20, Q21, Q9 | Q2, Q5, Q7, Q8 |
+| supplier | Q11, Q15b, Q2, Q20, Q21, Q9 | Q5, Q7, Q8 |
 

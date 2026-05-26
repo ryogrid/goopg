@@ -603,6 +603,68 @@ func TestPlanSelectStarExpansion(t *testing.T) {
 	}
 }
 
+// TestPlanSelectStarJoinUsingMergesColumn: an unqualified `SELECT *` over a
+// JOIN USING (or NATURAL join) emits each merged column once — the right-side
+// copy of the join column is hidden. Without this, `SELECT * FROM t1 JOIN t2
+// USING (id)` wrongly produced a duplicate `id` column (`id,t,id,t` vs PG's
+// `id,t,t`). A table-qualified star (`t2.*`) still expands to all of that
+// relation's columns, join column included. M0097-0036.
+func TestPlanSelectStarJoinUsingMergesColumn(t *testing.T) {
+	c := catalog.NewInMemory()
+	for _, name := range []string{"t1", "t2"} {
+		if _, err := c.CreateTable(parser.ObjectName{Name: name}, []catalog.Column{
+			{Name: "id", Type: catalog.Type{Name: "int4"}},
+			{Name: "t", Type: catalog.Type{Name: "text"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Unqualified star: join column merged → id, t (left), t (right).
+	node, err := Plan(parseOne(t, "SELECT * FROM t1 JOIN t2 USING (id)"), c)
+	if err != nil {
+		t.Fatalf("Plan unqualified: %v", err)
+	}
+	proj := node.(*Project)
+	gotNames := make([]string, 0, len(proj.Output()))
+	for _, col := range proj.Output() {
+		gotNames = append(gotNames, col.Name)
+	}
+	want := []string{"id", "t", "t"}
+	if len(gotNames) != len(want) {
+		t.Fatalf("unqualified star columns=%v want %v", gotNames, want)
+	}
+	for i := range want {
+		if gotNames[i] != want[i] {
+			t.Fatalf("unqualified star columns=%v want %v", gotNames, want)
+		}
+	}
+
+	// NATURAL join over both shared columns: id and t merged → id, t.
+	nnode, err := Plan(parseOne(t, "SELECT * FROM t1 NATURAL JOIN t2"), c)
+	if err != nil {
+		t.Fatalf("Plan natural: %v", err)
+	}
+	nproj := nnode.(*Project)
+	if got := len(nproj.Output()); got != 2 {
+		names := make([]string, 0, got)
+		for _, col := range nproj.Output() {
+			names = append(names, col.Name)
+		}
+		t.Fatalf("natural star columns=%v want [id t]", names)
+	}
+
+	// Table-qualified star is NOT merged: t2.* keeps the join column.
+	qnode, err := Plan(parseOne(t, "SELECT t2.* FROM t1 JOIN t2 USING (id)"), c)
+	if err != nil {
+		t.Fatalf("Plan qualified: %v", err)
+	}
+	qproj := qnode.(*Project)
+	if got := len(qproj.Output()); got != 2 {
+		t.Fatalf("qualified t2.* columns=%d want 2 (id,t)", got)
+	}
+}
+
 // TestPlanInsertResolvesColumns: pgbench's INSERT INTO pgbench_history
 // (tid, bid, aid, delta, mtime) ... resolves all five names and
 // builds a Values feeding an Insert.
@@ -632,7 +694,6 @@ func TestPlanInsertResolvesColumns(t *testing.T) {
 		t.Fatalf("values shape=%v", values.Rows)
 	}
 }
-
 
 // TestPlanInsertValuesDefaultSubstitutesColumnDefault: rung 15 — a bare
 // DEFAULT cell in a VALUES row is substituted at plan time by the
@@ -702,7 +763,6 @@ func TestPlanInsertValuesDefaultColumnWithoutDefaultGivesNull(t *testing.T) {
 	}
 }
 
-
 // TestPlanUpdateSetDefaultSubstitutesColumnDefault: rung 16 — a bare
 // DEFAULT on the RHS of an UPDATE SET assignment is substituted at plan
 // time by the target column's catalog DefaultExpr. The executor never
@@ -764,7 +824,6 @@ func TestPlanUpdateSetDefaultColumnWithoutDefaultGivesNull(t *testing.T) {
 		t.Errorf("Set[1]=%T want *NullConst", upd.Set[1])
 	}
 }
-
 
 // TestPlanInsertDefaultValuesExpandsToColumnDefaults: rung 17 — the
 // all-defaults `INSERT INTO t DEFAULT VALUES` form is expanded by
@@ -913,7 +972,7 @@ func TestPlanResolutionErrors(t *testing.T) {
 		{"INSERT INTO pgbench_history (nope) VALUES (1)", "42703"},       // undefined_column
 		{"UPDATE pgbench_accounts SET nope = 1 WHERE aid = $1", "42703"}, // undefined_column
 		{"INSERT INTO pgbench_history VALUES (1, 2, 3)", "42601"},        // arity mismatch
-		{"SELECT 1 UNION SELECT 2", "0A000"},                             // set op unsupported
+		{"SELECT 1 UNION SELECT 2, 3", "42601"},                          // set-op column-count mismatch
 		{"SELECT aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", "42702"},
 		{"SELECT aid FROM pgbench_accounts HAVING aid > 0", "42803"},
 	}
@@ -968,7 +1027,6 @@ func TestPlanLateralSrfArgResolvesAgainstLeftFromItem(t *testing.T) {
 	}
 }
 
-
 // TestPlanFetchTableListAggDerivedSubquery pins the M0103-0008 rung-7
 // gap surfaced by dropping the t.Skip on
 // `internal/testport/pgoutput_interop_test.go::TestPort_PgoutputInteropGoopgToPG`.
@@ -1011,5 +1069,91 @@ func TestPlanFetchTableListAggDerivedSubquery(t *testing.T) {
 	out := plan.Output()
 	if len(out) != 1 || !strings.EqualFold(out[0].Name, "attrs") {
 		t.Fatalf("expected single output column 'attrs', got %+v", out)
+	}
+}
+
+// TestAggregateFilterDistinguishedInDedupKey pins the M0097-0032 fix:
+// aggregateCallKey must fold the FILTER (WHERE ...) predicate into the
+// dedup key. Without it, `count(*)` and `count(*) FILTER (WHERE p)` (and two
+// filters differing only by IS NULL vs IS NOT NULL) collapsed onto a single
+// aggregate slot, so the filtered counts silently reported the unfiltered
+// total — the sysviews pg_hba_file_rules `no_err` query was the symptom.
+func TestAggregateFilterDistinguishedInDedupKey(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		{Name: "e", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT count(*), ` +
+		`count(*) FILTER (WHERE id > 1), ` +
+		`count(*) FILTER (WHERE e IS NULL), ` +
+		`count(*) FILTER (WHERE e IS NOT NULL) FROM t`
+	plan, err := Plan(parseOne(t, sql), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	var agg *Aggregate
+	var find func(n Node)
+	find = func(n Node) {
+		switch x := n.(type) {
+		case *Aggregate:
+			agg = x
+		case *Project:
+			find(x.Child)
+		case *Filter:
+			find(x.Child)
+		case *Sort:
+			find(x.Child)
+		}
+	}
+	find(plan)
+	if agg == nil {
+		t.Fatalf("no Aggregate node in plan %T", plan)
+	}
+	// Four distinct count(*) aggregates: one bare + three differently
+	// filtered. A collapsed key would yield fewer slots.
+	if len(agg.Aggs) != 4 {
+		t.Fatalf("got %d aggregate slots, want 4 (bare + 3 distinct FILTERs): %+v", len(agg.Aggs), agg.Aggs)
+	}
+	nFiltered := 0
+	for _, a := range agg.Aggs {
+		if a.Filter != nil {
+			nFiltered++
+		}
+	}
+	if nFiltered != 3 {
+		t.Errorf("got %d filtered aggregates, want 3", nFiltered)
+	}
+}
+
+// TestPromoteIntTypeSerialFamily verifies that the SERIAL pseudo-types promote
+// as their integer base in arithmetic result-type inference: serial→int4,
+// bigserial→int8, smallserial→int2. Regression for `serial_col + 1` producing
+// a wrong (or "unknown") result type because isIntegerLikeType / promoteIntType
+// did not recognise the SERIAL aliases.
+func TestPromoteIntTypeSerialFamily(t *testing.T) {
+	for _, name := range []string{"serial", "bigserial", "smallserial"} {
+		if !isIntegerLikeType(name) {
+			t.Errorf("isIntegerLikeType(%q) = false, want true", name)
+		}
+	}
+	cases := []struct {
+		a, b string
+		want string
+	}{
+		{"serial", "serial", "int4"},
+		{"serial", "int8", "int8"},
+		{"smallserial", "smallserial", "int2"},
+		{"smallserial", "serial", "int4"},
+		{"bigserial", "int4", "int8"},
+		{"bigserial", "serial", "int8"},
+		{"int2", "smallserial", "int2"},
+	}
+	for _, tc := range cases {
+		if got := promoteIntType(tc.a, tc.b); got.Name != tc.want {
+			t.Errorf("promoteIntType(%q, %q) = %q, want %q", tc.a, tc.b, got.Name, tc.want)
+		}
 	}
 }
