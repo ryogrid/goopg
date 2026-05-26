@@ -1,27 +1,111 @@
 # goopg
 
-goopg is an experimental project that explores whether a coding-agent-driven
-Go implementation can reproduce PostgreSQL behavior when PostgreSQL is treated
-as the oracle for correctness.
+goopg is an experimental PostgreSQL-compatible database server written in Go.
+It is driven entirely by coding agents as a study in agent-led implementation:
+can an AI agent build and evolve a meaningful PostgreSQL-like server while
+staying behaviourally aligned with upstream PostgreSQL?
 
-The project focuses on three validation themes:
+The project has three research axes:
 
-1. Feasibility of agent-driven implementation:
-	can coding agents build and evolve a meaningful PostgreSQL-like server in
-	Go while staying behaviorally aligned with upstream PostgreSQL?
-2. Performance characteristics under multithreading:
-	how do throughput and latency change as execution paths become more
-	concurrent?
-3. Effects of direct I/O:
-	what trade-offs appear when storage paths use direct I/O compared with
-	buffered I/O?
+1. **Agent-driven implementation** — can coding agents produce correct,
+   maintainable Go code for a complex stateful system, using PostgreSQL 18 as
+   the behavioural oracle?
+2. **Go concurrency characteristics** — how do throughput and latency scale as
+   execution paths become more concurrent?
+3. **Direct I/O trade-offs** — what happens when storage paths bypass the
+   OS page cache?
 
-This repository is research-oriented and intentionally iterative. It is meant
-for experimentation, measurement, and learning, rather than production use.
+This repository is research-oriented and intentionally iterative. It is not
+intended for production use.
 
-For oracle-based verification, this repository includes the upstream PostgreSQL
-repository as a submodule under postgres/. The current reference codebase is
-pinned to REL_18_3.
+The upstream PostgreSQL repository (REL_18_3) is included as a submodule
+under `postgres/` and is used as the reference for correctness.
+
+---
+
+## Implemented Features
+
+### Wire Protocol & Connection
+- PostgreSQL wire protocol v3 (simple and extended query modes)
+- `trust` and `reject` authentication (pg_hba.conf)
+- GUC / `postgresql.conf` parser with `SHOW`, `SET`, `RESET`
+- `pg_stat_activity` system view
+
+### Storage & MVCC
+- 8 KB heap pages in PG18-compatible on-disk format (PageHeaderData, ItemId,
+  HeapTupleHeaderData)
+- MVCC with snapshot isolation (READ COMMITTED and REPEATABLE READ)
+- HOT (Heap-Only Tuple) updates — avoids index updates when non-indexed columns change
+- Visibility Map — tracks all-visible pages for Index-Only Scan eligibility
+- Index-Only Scan (single-column B-tree)
+- Opportunistic page pruning — reclaims dead tuple chains inline during HOT updates
+- VACUUM with tuple freeze (prevents XID wraparound)
+- Autovacuum background worker
+- Free Space Map (FSM) — guides INSERT to pages with sufficient free space
+- Buffer pool with clock-sweep eviction
+- Async I/O engine (AIO) for prefetch and parallel page reads
+
+### Indexes
+- B-tree index on integer, numeric, text, date, timestamp, boolean columns
+- Unique constraint enforcement via B-tree
+- Primary key constraint
+- `CREATE INDEX`, `DROP INDEX`
+- Index scan, range scan, index-only scan
+
+### Query Engine
+- Full SQL parser (SELECT, INSERT, UPDATE, DELETE, COPY FROM)
+- Planner: sequential scan, index scan, index-only scan, hash join,
+  nested-loop join, sort, aggregate, limit, project
+- Multi-way bushy hash join (spill-to-disk for joins that exceed memory)
+- Correlated subquery optimization and IN-unnesting
+- Join-order reordering with cost-based cardinality estimates
+- MCV histograms and per-column statistics (ANALYZE)
+- Window functions: ROW_NUMBER, RANK, LAG, LEAD
+- CTEs (WITH clause, non-recursive)
+- Subqueries (EXISTS, NOT EXISTS, scalar, lateral)
+- UPSERT: `INSERT ... ON CONFLICT DO UPDATE`
+- SELECT FOR UPDATE / FOR SHARE (pessimistic row locking)
+- Aggregates: COUNT, SUM, AVG, MIN, MAX, ARRAY_AGG, STRING_AGG
+- Type coercions, CASE/WHEN, CAST, string/date/numeric operators
+- LIMIT / OFFSET / ORDER BY / GROUP BY / HAVING
+- EXPLAIN and EXPLAIN ANALYZE
+
+### Transactions & Concurrency
+- MVCC with per-backend ProcArray snapshot
+- SAVEPOINT / ROLLBACK TO SAVEPOINT
+- Deadlock detection
+- Serializable isolation (SSI anomaly prevention) — partial
+- Read-only commit skip (no WAL emit for SELECT-only transactions)
+
+### WAL & Durability
+- WAL writer with PG18-compatible on-disk format (pg_waldump-readable)
+- Checkpoint with fsync
+- Crash recovery from WAL
+- WAL segment preallocation
+- Concurrent WAL append (M0026)
+
+### Replication
+- **Physical (streaming) replication**: goopg→goopg and goopg↔PG18 (async and sync)
+- **Logical replication** (pgoutput): goopg→PG18 and PG18→goopg (async and sync)
+- Replication slots, walsender, walreceiver
+- Standby promotion
+- 9 replication patterns verified end-to-end (see `internal/testport/`)
+
+### Catalog & DDL
+- `pg_class`, `pg_attribute`, `pg_index` heap tables in PG18-compatible format
+- `pg_namespace`, `pg_type`, `pg_proc` views
+- `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`
+- `CREATE VIEW`, `DROP VIEW`
+- `CREATE INDEX`, `DROP INDEX`
+- `CREATE PUBLICATION`, `CREATE SUBSCRIPTION`
+- Catalog recovery from heap on startup (no JSON side-channel)
+- `pg_internal.init` relcache init file written for PG standby fast-start
+
+### Benchmark Coverage
+- All 22 HammerDB TPC-H queries pass (SF=1, verified 2026-05-26)
+- pgbench: standard, simple-update, select-only workloads
+
+---
 
 ## Quickstart
 
@@ -31,45 +115,43 @@ of targets and overridable variables.
 
 ### Prerequisites
 
-- Go (matching `go.mod`'s toolchain).
-- A locally built upstream PostgreSQL client toolchain at
+- Go (matching `go.mod`'s toolchain directive).
+- A locally built upstream PostgreSQL client toolchain under
   `postgres/local_install/`. The Makefile expects:
   - `postgres/local_install/bin/` — `psql`, `pg_ctl`, etc.
-  - `postgres/local_install/lib/` — the matching shared libraries
-    (`libpq.so*`, ICU, …).
+  - `postgres/local_install/lib/` — matching shared libraries (`libpq.so*`, ICU, …)
 
   If you have not built it yet, build the `postgres/` submodule with
-  `--prefix=$(pwd)/local_install` and `make install` in `postgres/` directory.
-  The Makefile only needs the client tools and
-  their shared libraries; the upstream `postgres` server binary is not
-  used at runtime.
+  `--prefix=$(pwd)/local_install` and run `make install` inside `postgres/`.
+  Only the client tools and libraries are needed; the upstream `postgres` server
+  binary is not used at runtime.
 
 ### Environment for the in-tree PostgreSQL client tools
 
-`psql` and the rest of the client tools under `postgres/local_install/bin`
-load shared libraries from `postgres/local_install/lib`, which is **not**
-on the system loader path. Every Makefile target that invokes a client
-tool prepends both directories itself; if you run any of the steps
-manually, prepend them explicitly:
+`psql` and other client tools under `postgres/local_install/bin` load shared
+libraries from `postgres/local_install/lib`, which is not on the system loader
+path. Every Makefile target that invokes a client tool prepends both
+directories. If you run steps manually, prepend them explicitly:
 
 ```bash
 export PATH="$PWD/postgres/local_install/bin:$PATH"
 export LD_LIBRARY_PATH="$PWD/postgres/local_install/lib:${LD_LIBRARY_PATH:-}"
-# macOS users: also set DYLD_LIBRARY_PATH to the same value as LD_LIBRARY_PATH.
+# macOS: also set DYLD_LIBRARY_PATH to the same value.
 ```
 
-`make print-env` prints the exact lines this Makefile uses.
+`make print-env` prints the exact lines the Makefile uses.
 
 ### One-shot lifecycle via make
 
 ```bash
 make build          # → ./bin/goopg
-make init           # → tmp/goopg-data/ (override with DATA_DIR=...)
+make init           # → tmp/goopg-data/  (override: DATA_DIR=...)
 make start          # background server on 127.0.0.1:5432; log: tmp/goopg.log
 make psql           # connect with the in-tree psql
 make stop           # graceful shutdown
 make clean-data     # remove the data directory
-# optionally: make clean   # also removes ./bin/goopg
+# optionally:
+make clean          # also removes ./bin/goopg
 ```
 
 Common overrides:
@@ -81,8 +163,6 @@ make psql  LISTEN=0.0.0.0:55432 DATA_DIR=/tmp/my-cluster PSQL_DBNAME=postgres
 
 ### Equivalent raw commands
 
-For the record, the same flow without the Makefile:
-
 ```bash
 # 1. Build.
 go build -o ./bin/goopg ./cmd/goopg
@@ -90,64 +170,80 @@ go build -o ./bin/goopg ./cmd/goopg
 # 2. Initialize the data directory.
 ./bin/goopg init -D ./tmp/goopg-data
 
-# 3. Start the server. `goopg start` runs in the foreground; either run
-#    it in a dedicated terminal or background it as the Makefile does.
+# 3. Start the server in one terminal.
 ./bin/goopg start -D ./tmp/goopg-data --listen 127.0.0.1:5432
 
-# 4. In another terminal, with the in-tree client toolchain on PATH and
-#    LD_LIBRARY_PATH (see "Environment" above), connect:
+# 4. Connect from another terminal (with PATH / LD_LIBRARY_PATH set as above).
 psql -h 127.0.0.1 -p 5432 -U postgres -d postgres
 
-# 5. Stop the server gracefully (from any terminal where the Makefile
-#    environment or the binary's path is reachable):
+# 5. Stop the server.
 ./bin/goopg stop -D ./tmp/goopg-data
 
 # 6. Drop the cluster.
 rm -rf ./tmp/goopg-data
 ```
 
-`goopg start` exits when it receives `SIGINT` / `SIGTERM` or when
+`goopg start` exits when it receives `SIGINT`/`SIGTERM` or when
 `goopg stop -D <datadir>` requests a shutdown over the control socket.
 
-## Active Development Milestones
+### Running tests
+
+```bash
+# Unit tests (fast, no server needed)
+go test ./...
+
+# End-to-end replication tests (requires postgres/ client tools on PATH)
+export PATH=$PWD/postgres/local_install/bin:$PATH
+export LD_LIBRARY_PATH=$PWD/postgres/local_install/lib:$LD_LIBRARY_PATH
+go test ./internal/testport/... -v -timeout 300s
+```
+
+---
+
+## Repository Layout
+
+```
+cmd/goopg/          entry point (init / start / stop / promote)
+internal/
+  analyzer/         semantic analysis (type resolution, name binding)
+  catalog/          in-memory catalog, publication/subscription state
+  executor/         query execution operators
+  initdb/           cluster bootstrap and open/close lifecycle
+  mvcc/             MVCC manager, snapshots, ProcArray, clog
+  parser/           SQL parser
+  planner/          query planner (cost model, join order, statistics)
+  server/           wire-protocol server, dispatcher
+  storage/          buffer pool, heap pages, B-tree, WAL, VM, FSM
+  testport/         end-to-end replication and PostgreSQL interop tests
+  testutil/         test cluster harnesses
+  vacuum/           VACUUM and autovacuum
+  wal/              WAL writer, reader, classifier, replication
+docs/
+  design/           design documents per subsystem
+  milestones/       milestone tracking (numbered 0001–0116+)
+practice/           research notes and reference material
+postgres/           PostgreSQL 18 source submodule (oracle reference)
+bench/              TPC-H and pgbench benchmark scripts
+```
+
+---
+
+## Active Milestones
 
 | Milestone | Title | Status |
 |-----------|-------|--------|
-| 0053 | HammerDB TPC-H complete-run verification | landed |
-| 0054 | TPC-H performance and optimisation | in progress |
-| 0055 | Staged B-tree enhancement program | largely landed |
-| 0056 | Buffer-pool PinNew race fix + splitMu removal | in progress |
-| 0057 | TPC-H measurement prerequisites | planned |
-| 0066 | Executor runtime allocation reductions (PIVOT) | landed (`perf-analysis`) |
-| 0067 | TPC-H structural runtime — 1200 s baseline + diagnostics | landed (`perf-analysis`) |
-| **0068** | **Executor GC-Optimized Pipeline Refactor** | **planned (`perf-analysis`)** |
+| M0094 | Replication E2E completion & TAP test porting | in-progress |
+| M0095 | Client-tools TAP test porting | in-progress |
+| M0096 | RC isolation-test suite: feature implementation & spec pass | in-progress |
+| M0097 | pg_regress coverage: feature parity & test pass | in-progress |
+| M0100 | RC isolation-test suite: runtime correctness closure | in-progress |
+| M0104 | SERIALIZABLE isolation via SSI anomaly prevention | planned |
+| M0106 | PG relcache init file compatibility | planned |
+| M0107 | Performance optimization refactor | planned |
+| M0112 | pg_statistic heap table for ANALYZE persistence | planned |
+| M0113 | Heap-based index recovery via pg_index | planned |
+| M0114 | pg_internal.init relcache fast-start cache | planned |
+| M0115 | Heap tuple hint bit caching | planned |
+| M0116 | Multi-column Index-Only Scan key decoding | planned |
 
-Milestone 0057 addresses the benchmark infrastructure prerequisites —
-background-worker visibility, checkpoint suppression, crash recovery,
-and per-query cancellation — needed for reliable M0054-0007 runs.
-See `docs/milestones/0057-tpch-measurement-prerequisites.md` for the
-full plan and `cmd/tpch-runner/README.md` for the query-runner tool.
-
-Milestone 0068 is a **large-scale executor refactor** targeting GC
-overhead and live-heap pointer density. M0066 PIVOT eliminated 99.23 %
-of Q5's allocations (`multiHashJoinOp.copyOut`, 2.02 TB on a 60 s pprof
-window) and removed `time.Parse` from hot loops; Q5 / Q20 still cancel
-at `cancel-after=1200s` because residual cost is **memory-copy bound**
-(`runtime.duffcopy` + `memclr` ≈ 60 % of CPU). M0068 status (PARTIAL;
-landed on `gc-oriented-refactor`):
-
-- **Datum compact layout (M0068-0001)** — Datum shrunk from ~120 B /
-  4 pointers to **56 B / 2 pointers** (commit `aef72b7`).
-- **Row pool (M0068-0004, partial)** — `sync.Pool` keyed by row width
-  via `internal/executor/row_pool.go`; wired into `cloneRow` and
-  operator scratch buffers (commit `e9080ac`).
-- **sortOp memory-bounded (M0068-0006)** — chunked external sort with
-  spill files + N-way merge over `container/heap` (commit `d79ebda`).
-
-The TupleSlot pipeline (replaces `BorrowSemantics`), per-batch string
-arena, and IndexScan lazy iteration are **deferred to M0069**
-(`M0069-0001` / `0002` / `0003`) — they require changing every
-operator's `Next()` signature, which is out of scope for one session.
-See `docs/milestones/0068-executor-gc-pipeline-refactor.md`,
-`analysis/tpch-m0068-baseline-2026-05-08.md`, and the four design docs
-`docs/design/0068-000{1..4}-*.md` for the detailed plan.
+See `docs/milestones/README.md` for the full milestone index.

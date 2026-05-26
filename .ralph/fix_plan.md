@@ -3433,6 +3433,109 @@ Design doc: `docs/milestones/0114-pg-internal-init-relcache-fast-start-cache.md`
 Detailed task breakdown and design document creation are deferred to the
 implementer when this milestone is selected for development.
 
+## M0115 — Heap Tuple Hint Bit Caching (filed 2026-05-26)
+
+Source: `practice/pg_mvcc_internals.md` §"Hint Bits".
+Design doc: `docs/design/mvcc-optimize/0115-0001-hint-bit-caching.md`
+Milestone: `docs/milestones/0115-hint-bit-caching.md`
+
+### Background
+
+`TupleVisible` (`internal/mvcc/visibility.go`) calls `snap.SeesCommittedXID`
+for every tuple on every scan.  PostgreSQL avoids this by caching the result
+in the tuple's `t_infomask` after the first check.  The infomask constants
+(`HeapXminCommitted`, `HeapXminInvalid`, `HeapXmaxCommitted`, `HeapXmaxInvalid`)
+are already defined in `internal/storage/heap.go` but are never read or written
+by the visibility check.
+
+### Sub-milestone breakdown
+
+- [ ] **M0115-0001** — FrozenTransactionID fast path
+      - File: `internal/mvcc/visibility.go`
+      - Add `if h.Xmin == storage.FrozenTransactionID { goto xmaxCheck }` at the
+        top of `TupleVisible` and `TupleVisibleSubxact`.
+      - Unit test: `TestFrozenXIDFastPath` — verify `SeesCommittedXID` is not
+        called when `xmin == FrozenTransactionID`.
+
+- [ ] **M0115-0002** — Hint-bit read path in `TupleVisible`
+      - Before calling `SeesCommittedXID(h.Xmin)`, check `HeapXminCommitted`
+        (return true path) and `HeapXminInvalid` (return false path).
+      - Same for `h.Xmax` / `HeapXmaxCommitted` / `HeapXmaxInvalid`.
+      - Unit test: `TestHintBitReadShortCircuit` — pre-set bits, confirm
+        `SeesCommittedXID` is not reached.
+
+- [ ] **M0115-0003** — `storage.Pool.MarkDirtyHintBit` method
+      - Add `dirtyHintBit` dirty-flag variant to the buffer frame struct.
+      - `MarkDirtyHintBit` marks dirty without emitting WAL.
+      - Checkpoint flushes hint-bit-dirty pages to disk normally.
+      - Unit test: `TestMarkDirtyHintBitNoWAL` — confirm WAL stream length is
+        unchanged after a `MarkDirtyHintBit` call.
+
+- [ ] **M0115-0004** — Hint-bit write path
+      - Add `TupleVisibleWithHintBits(h, snap, xid, slot *storage.Slot) bool`.
+      - After `SeesCommittedXID` confirms commit status, write the appropriate
+        bit to the on-page tuple header via `PageWriteHintBit` and call
+        `pool.MarkDirtyHintBit(slot)`.
+      - Unit test: `TestHintBitWrite` — after a visibility check, the on-page
+        infomask has the expected bit set.
+
+- [ ] **M0115-0005** — Wire `TupleVisibleWithHintBits` into scan operators
+      - `seqScanOp` and `indexScanOp` pass the current page slot.
+      - Read-only callers (tests, standby replay) continue using `TupleVisible`.
+
+- [ ] **M0115-0006** — Regression tests
+      - `go test ./internal/mvcc/...` passes.
+      - `go test ./internal/executor/... -count=1` passes.
+      - `go test ./internal/server/... -count=1` passes.
+
+- [ ] **M0115-0007** — Benchmark gate
+      - Run `pgbench -T 60 -c 10 -M simple -S` before and after.
+      - TPS must not decrease by more than 2%.
+
+---
+
+## M0116 — Multi-Column Index-Only Scan Key Decoding (filed 2026-05-26)
+
+Source: `practice/pg_mvcc_internals.md` §"Visibility Map" + §"HOT Updates".
+Design doc: `docs/design/mvcc-optimize/0116-0001-multi-column-ios.md`
+Milestone: `docs/milestones/0116-multi-column-index-only-scan.md`
+
+### Background
+
+`indexOnlyScanOp.decodeRowFromKey` (`internal/executor/operators_indexonly.go`)
+rejects multi-column keys with `"multi-column key decode not supported yet"`.
+Tables with composite PKs (e.g., `lineitem (l_orderkey, l_linenumber)`) fall
+back to heap fetches even when the Visibility Map could allow a pure index scan.
+
+### Sub-milestone breakdown
+
+- [ ] **M0116-0001** — Multi-column `decodeRowFromKey`
+      - Replace the single-column fast path with a loop over all index columns.
+      - Extract `decodeIndexKeyColumn(key []byte, typeName string) (Datum, int, error)`
+        helper; the single-column path migrates into this helper unchanged.
+      - Supported types: `int4`, `int8`, `float8`, `bool`, `date`, `timestamp`,
+        `text`, `varchar`, `bpchar`, `name`.
+
+- [ ] **M0116-0002** — Planner column-coverage check
+      - `planIndexOnlyScan` verifies that every column in the SELECT target list
+        is present in the composite index key.
+      - Falls back to `IndexScan` if any projected column is absent.
+      - Add `IndexColumns []IndexColumn` to the `IndexOnlyScan` plan node to
+        carry the ordered column list to the executor.
+
+- [ ] **M0116-0003** — Integration tests
+      - `TestIOS_CompositeInt4Int4`: 2-column (int4, int4) PK.
+      - `TestIOS_CompositeInt4Text`: 2-column (int4, text) unique.
+      - `TestIOS_HeapFallback`: non-covering projection → `IndexScan` chosen.
+      - `TestIOS_3Columns`: 3-column composite key, full coverage.
+
+- [ ] **M0116-0004** — Regression check
+      - `go test ./internal/executor/... -run TestIndexOnly` passes for
+        existing single-column cases.
+      - No TPS regression in pgbench select-only vs. pre-milestone baseline.
+
+---
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).

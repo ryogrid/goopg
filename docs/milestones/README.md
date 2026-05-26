@@ -135,3 +135,8 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0106 | PG relcache init file compatibility (backend startup from goopg backup) | planned | `0106-pg-relcache-init-file-compat.md` |
 | 0107 | Performance optimization refactor (mctx + pointer-free Datum + concrete executor + MVCC/activity/bufpool/WAL/runtime contention fixes; keeps M0105/M0106 PG-compat invariants) | planned | `0107-performance-optimization-refactor.md` |
 | 0108 | `postgresql.conf.sample` template + initdb wiring + registry↔template sync rule (AGENT.md rule landed at filing time) | accepted | `0108-postgresql-conf-sample-template.md` |
+| 0112 | `pg_statistic` heap table for ANALYZE statistics persistence | planned | `0112-pg-statistic-heap-table-for-stats-persistence.md` |
+| 0113 | Heap-based index recovery via `pg_index` | planned | `0113-heap-based-index-recovery-via-pg-index.md` |
+| 0114 | `pg_internal.init` relcache fast-start cache | planned | `0114-pg-internal-init-relcache-fast-start-cache.md` |
+| 0115 | Heap tuple hint bit caching (HEAP_XMIN_COMMITTED / HEAP_XMAX_INVALID read+write path in TupleVisible; FrozenTransactionID fast path; hint-bit-only page dirty without WAL) | planned | `0115-hint-bit-caching.md` |
+| 0116 | Multi-column Index-Only Scan key decoding (composite B-tree key decode; planner column-coverage check; extends Visibility Map optimization to composite-PK tables) | planned | `0116-multi-column-index-only-scan.md` |
