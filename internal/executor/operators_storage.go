@@ -3068,12 +3068,12 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return ptr, err
 	}
 
+	// Always emit the native RecordKindHeapInsert WAL record so the logical
+	// decoder sees the change. When ctx.LogCanonical != nil, the caller also
+	// emits a canonical XLOG_HEAP_INSERT (FPI) via emitCanonicalHeapInsert.
+	// PG physical standbys skip the native record; goopg's classifier skips
+	// the canonical one. Both coexist safely in the WAL stream.
 	logHeap := ctx.Pool.LogHeapInsert()
-	if ctx.LogCanonical != nil {
-		// Suppress legacy WAL; the caller emits a PG-canonical XLOG_HEAP_INSERT
-		// record via emitCanonicalHeapInsert after writeHeapRowReturning returns.
-		logHeap = nil
-	}
 	tryAppendToBlock := func(blk storage.BlockNumber) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -3505,15 +3505,15 @@ func markHeapDeleteDirtyAndClearVM(
 	lineSlot uint16, xmax storage.TransactionID,
 	oldTuple []byte,
 ) error {
-	if ctx.LogCanonical != nil {
-		// Suppress legacy WAL; the caller emits a PG-canonical XLOG_HEAP_DELETE
-		// record via emitCanonicalHeapDelete after markHeapDeleteDirtyAndClearVM
-		// returns and the slot is unpinned.
-		ctx.Pool.MarkDirty(slot)
-	} else {
-		if err := markHeapDeleteDirty(ctx.Pool, slot, rel, blk, lineSlot, xmax, oldTuple); err != nil {
-			return err
-		}
+	// Always emit the native RecordKindHeapDelete WAL record so the logical
+	// decoder (classifier.go) sees the change for pgoutput/logical replication.
+	// When ctx.LogCanonical != nil, the caller additionally emits a canonical
+	// XLOG_HEAP_DELETE record (FPI) after unpinning the slot. PG physical
+	// standbys safely skip the native record (classifyXLogRecord routes it via
+	// RmgrXLog/0xF0) and apply the canonical FPI; goopg's classifier skips the
+	// canonical record and processes the native one.
+	if err := markHeapDeleteDirty(ctx.Pool, slot, rel, blk, lineSlot, xmax, oldTuple); err != nil {
+		return err
 	}
 	if ctx.VM != nil {
 		ctx.VM.ClearBlock(rel, blk)
