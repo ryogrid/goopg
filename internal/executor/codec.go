@@ -9,6 +9,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // EncodeRow serialises a Datum row into the heap-tuple data area.
@@ -778,31 +779,33 @@ func DecodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.C
 	return decodeRowIntoMctx(dst, cols, data, sctx)
 }
 
-// DecodeRowIntoMctxPGTuple decodes a PG heap tuple's body using both the null
-// bitmap and storedNatts to correctly handle NULL columns and ALTER TABLE ADD
-// COLUMN. It is the preferred decoder for seqScanOp when tuple.Bitmap is
-// available. bitmap may be nil (all columns non-null). storedNatts == 0 means
-// "no information" (fall back to len(cols)).
+// DecodeRowIntoMctxPGTuple decodes a heap tuple's body, using the tuple HEADER
+// (storedNatts + null bitmap) as the authoritative format discriminator. It
+// NEVER guesses the format from the column bytes — guessing is the source of
+// the cross-acceptance corruption class (see docs/design/0111-0002-...).
+//
+// Discriminator (M0111-0002): a goopg legacy-format tuple has no null bitmap
+// and leaves natts unset (0); a PG-physical tuple always sets natts (>= 1) and
+// carries a null bitmap when it has NULLs. PostgreSQL never writes natts == 0,
+// so (storedNatts == 0 && bitmap == nil) unambiguously means "legacy". Anything
+// else is PG-physical. bitmap may be nil for an all-non-null PG row (then natts
+// distinguishes it from legacy). storedNatts < len(cols) means ALTER TABLE ADD
+// COLUMN — trailing columns decode as NULL.
 func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mctx.Context) error {
+	// Legacy-format tuple: no bitmap and natts unset. Decode deterministically
+	// with the legacy decoder — do not attempt the PG path (which can spuriously
+	// accept legacy bytes). The legacy branch is removed in M0111-0002 S3 once
+	// all writes are PG-physical and the data dir is re-initialised.
+	if storedNatts == 0 && len(bitmap) == 0 {
+		return decodeGoopgRowIntoMctx(dst, cols, data, sctx)
+	}
+
+	// PG-physical decode with null-bitmap and natts awareness.
 	n := len(cols)
 	if storedNatts == 0 {
+		// A bitmap is present but natts was not recorded; assume all columns.
 		storedNatts = n
 	}
-
-	// Fast path: no nulls and stored natts == schema → existing decoder.
-	if len(bitmap) == 0 && storedNatts >= n {
-		return decodeRowIntoMctx(dst, cols, data, sctx)
-	}
-
-	// Try goopg legacy format first (if bitmap is non-empty this is unlikely
-	// to succeed, but we try for backward compat).
-	if len(bitmap) == 0 {
-		if err := decodeGoopgRowIntoMctx(dst, cols, data, sctx); err == nil {
-			return nil
-		}
-	}
-
-	// PG physical format decode with null bitmap and natts awareness.
 	off := 0
 	for i, c := range cols {
 		// Columns beyond stored natts were added via ALTER TABLE ADD COLUMN.
@@ -829,6 +832,26 @@ func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byt
 		off += consumed
 	}
 	return nil
+}
+
+// DecodeHeapTupleRowInto fills dst from a heap tuple, selecting the row format
+// deterministically from the tuple header (natts + null bitmap) rather than
+// guessing from the bytes. This is the header-driven replacement for the bare
+// DecodeRowInto on any read path that holds the storage.HeapTuple. M0111-0002.
+func DecodeHeapTupleRowInto(dst Row, cols []catalog.Column, tuple storage.HeapTuple, sctx *mctx.Context) error {
+	natts := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
+	return DecodeRowIntoMctxPGTuple(dst, cols, tuple.Data, tuple.Bitmap, natts, sctx)
+}
+
+// DecodeHeapTupleRow is the allocating sibling of DecodeHeapTupleRowInto: it
+// returns a freshly-allocated Row. Use it where the bare DecodeRow was used on
+// a path that holds the storage.HeapTuple. M0111-0002.
+func DecodeHeapTupleRow(cols []catalog.Column, tuple storage.HeapTuple, sctx *mctx.Context) (Row, error) {
+	row := make(Row, len(cols))
+	if err := DecodeHeapTupleRowInto(row, cols, tuple, sctx); err != nil {
+		return nil, err
+	}
+	return row, nil
 }
 
 // DecodeRowIntoArena is the legacy alias kept for call-site compatibility

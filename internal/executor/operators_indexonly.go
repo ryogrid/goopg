@@ -153,7 +153,7 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 
 // decodeRowFromHeap projects only the covered columns from a full heap tuple.
 func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
-	fullRow, err := DecodeRow(o.plan.Table.Columns, t.Data)
+	fullRow, err := DecodeHeapTupleRow(o.plan.Table.Columns, t, nil)
 	if err != nil {
 		return nil, err
 	}

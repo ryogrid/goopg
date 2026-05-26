@@ -287,7 +287,7 @@ func DetoastValue(ctx *Context, toastRel storage.RelFileNode, pointer []byte) ([
 			if !mvcc.TupleVisible(t.Header, ctx.Snap, ctx.Tx.XID) {
 				continue
 			}
-			row, err := DecodeRow(toastCols, t.Data)
+			row, err := DecodeHeapTupleRow(toastCols, t, nil)
 			if err != nil || len(row) < 3 {
 				continue
 			}

@@ -143,7 +143,7 @@ func epqFollowHOT(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber
 	if !found {
 		return 0, nil, false
 	}
-	latestRow, decErr := DecodeRow(cols, latestTup.Data)
+	latestRow, decErr := DecodeHeapTupleRow(cols, latestTup, nil)
 	if decErr != nil {
 		return 0, nil, false
 	}
@@ -354,7 +354,7 @@ func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.Block
 			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID) {
 				return rel, epqChainResult{}, false
 			}
-			row, decErr := DecodeRow(cols, tup.Data)
+			row, decErr := DecodeHeapTupleRow(cols, tup, nil)
 			if decErr != nil {
 				return rel, epqChainResult{}, false
 			}

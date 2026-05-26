@@ -334,7 +334,7 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		if o.scanRow == nil || len(o.scanRow) != len(o.plan.Table.Columns) {
 			o.scanRow = acquireRow(len(o.plan.Table.Columns))
 		}
-		decErr := DecodeRowInto(o.scanRow, o.plan.Table.Columns, tuple.Data)
+		decErr := DecodeHeapTupleRowInto(o.scanRow, o.plan.Table.Columns, tuple, nil)
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
 		if decErr != nil {
