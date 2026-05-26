@@ -151,11 +151,17 @@ func toastStore(ctx *Context, toastRel storage.RelFileNode, data []byte) ([]byte
 			{Kind: KindInt, Int: int64(seq)},
 			NewBytesDatum(chunkData),
 		}
-		body, err := EncodeRow(toastCols, chunkRow)
+		// PG-native physical format (M0111-0002): TOAST chunks are a normal
+		// heap table, so they follow the single unified row format. The three
+		// columns (oid, seq, bytea) are never NULL, so no bitmap is needed;
+		// natts marks the tuple PG-physical for the header-driven decoder.
+		body, err := EncodeRowPG(toastCols, chunkRow)
 		if err != nil {
 			return nil, err
 		}
 		tuple := storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+		tuple.Header.SetNatts(len(toastCols))
+		tuple.Header.Infomask |= storage.HeapXmaxInvalid
 		if err := writeHeapTupleToRel(ctx, toastRel, tuple); err != nil {
 			return nil, err
 		}

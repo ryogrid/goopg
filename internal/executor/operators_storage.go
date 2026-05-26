@@ -1432,31 +1432,18 @@ func tryApplyHOTUpdate(
 	if err := ctx.MaterializeWriterXID(); err != nil {
 		return false, err
 	}
-	// When canonical WAL is active, encode HOT-update tuples in PG-native
-	// physical format so they are consistent with non-HOT updates written by
-	// writeHeapRowReturning/writeHeapRowReturningPG.  Mixed encoding (goopg
-	// for HOT, PG for non-HOT) causes decodeGoopgRowIntoMctx to sometimes
-	// "accidentally succeed" on PG-encoded rows with wrong values when the
-	// over-read case slips through the off < len(data) trailing-bytes check.
-	// M0107: HOT-update encoding parity fix.
-	var (
-		body   []byte
-		bitmap []byte
-	)
-	if ctx.LogCanonical != nil {
-		var encErr error
-		body, encErr = EncodeRowPG(cols, newRow)
-		if encErr != nil {
-			return false, &ExecError{Code: "XX000", Message: encErr.Error()}
+	// Always encode in PG-native physical format (M0111-0002): one on-disk
+	// heap-tuple format for HOT and non-HOT updates alike. goopg reads it back
+	// by selecting the decoder from the tuple header (natts/bitmap).
+	body, encErr := EncodeRowPG(cols, newRow)
+	if encErr != nil {
+		var ee *ExecError
+		if errors.As(encErr, &ee) {
+			return false, ee
 		}
-		bitmap = NullBitmapPG(newRow)
-	} else {
-		var encErr error
-		body, encErr = EncodeRow(cols, newRow)
-		if encErr != nil {
-			return false, &ExecError{Code: "XX000", Message: encErr.Error()}
-		}
+		return false, &ExecError{Code: "XX000", Message: encErr.Error()}
 	}
+	bitmap := NullBitmapPG(newRow)
 	var tup storage.HeapTuple
 	if len(bitmap) > 0 {
 		tup = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
@@ -1464,10 +1451,8 @@ func tryApplyHOTUpdate(
 		tup = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
 	}
 	tup.Header.Infomask |= storage.HeapOnlyTuple
-	if ctx.LogCanonical != nil {
-		tup.Header.SetNatts(len(cols))
-		tup.Header.Infomask |= storage.HeapXmaxInvalid
-	}
+	tup.Header.SetNatts(len(cols))
+	tup.Header.Infomask |= storage.HeapXmaxInvalid
 	tupleBytes, err := tup.MarshalBinary()
 	if err != nil {
 		return false, err
@@ -3055,45 +3040,29 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return ptr, &ExecError{Code: "XX000", Message: toastErr.Error()}
 	}
 
-	// When canonical WAL is active, encode the tuple in PG-native physical
-	// format so the FPI page is valid for a PG standby to read via
-	// heap_deform_tuple. The goopg primary decodes PG-format data back via the
-	// decodePhysicalPGRowIntoArena fallback inside decodeRowIntoArena.
-	// M0106-0010 batched-36.
-	var (
-		body   []byte
-		bitmap []byte
-	)
-	if ctx.LogCanonical != nil {
-		var encErr error
-		body, encErr = EncodeRowPG(cols, row)
-		if encErr != nil {
-			return ptr, &ExecError{Code: "XX000", Message: encErr.Error()}
+	// Always encode in PG-native physical format (M0111-0002): a single
+	// on-disk heap-tuple format, byte-valid for a PG standby's
+	// heap_deform_tuple. goopg reads it back by selecting the decoder from the
+	// tuple header (natts/bitmap) in DecodeRowIntoMctxPGTuple.
+	body, encErr := EncodeRowPG(cols, row)
+	if encErr != nil {
+		// Preserve ExecError (e.g. 22P02 invalid input, 22003 out of range)
+		// so the SQLSTATE and message reach the client unchanged.
+		var ee *ExecError
+		if errors.As(encErr, &ee) {
+			return ptr, ee
 		}
-		bitmap = NullBitmapPG(row)
-	} else {
-		var encErr error
-		body, encErr = EncodeRow(cols, row)
-		if encErr != nil {
-			// Preserve ExecError (e.g. 22P02 for invalid input syntax) so the
-			// SQLSTATE and message reach the client unchanged. M0097-0003.
-			var ee *ExecError
-			if errors.As(encErr, &ee) {
-				return ptr, ee
-			}
-			return ptr, &ExecError{Code: "XX000", Message: encErr.Error()}
-		}
+		return ptr, &ExecError{Code: "XX000", Message: encErr.Error()}
 	}
+	bitmap := NullBitmapPG(row)
 	var tuple storage.HeapTuple
 	if len(bitmap) > 0 {
 		tuple = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
 	} else {
 		tuple = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
 	}
-	if ctx.LogCanonical != nil {
-		tuple.Header.SetNatts(len(cols))
-		tuple.Header.Infomask |= storage.HeapXmaxInvalid
-	}
+	tuple.Header.SetNatts(len(cols))
+	tuple.Header.Infomask |= storage.HeapXmaxInvalid
 	tupleBytes, err := tuple.MarshalBinary()
 	if err != nil {
 		return ptr, err
