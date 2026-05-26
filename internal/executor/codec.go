@@ -73,14 +73,17 @@ func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 			continue
 		}
 		if d.Kind == KindToastPointer {
-			// Encode as PG external/on-disk TOAST reference:
-			// short varlena header (1 byte) + 12-byte pointer = 13 bytes.
-			// Header: (13 << 1) | 1 = 0x1B (VARATT_IS_EXTERNAL_ONDISK).
+			// Encode as PG external varlena reference: VARATT_IS_1B_E (0x01)
+			// followed by a 12-byte pointer = 13 bytes total.
+			// 0x01 is reserved in PG's varlena encoding as the 1-byte external
+			// marker; it can never be a data varlena (0x01>>1=0 = zero-length).
+			// This avoids the 0x1B collision where any 12-char string also
+			// produces header (13<<1)|1 = 0x1B and was misidentified as TOAST.
 			// Aligned to 4 bytes (PG TOAST pointers are int-aligned).
 			off = alignPhysicalPGOffset(off, 4)
 			ptr := d.BytesValue()
 			buf := make([]byte, 13)
-			buf[0] = 0x1B // short varlena: len=13, external
+			buf[0] = 0x01 // VARATT_IS_1B_E: external varlena, unambiguous
 			copy(buf[1:], ptr)
 			for len(out) < off+13 {
 				out = append(out, 0)
@@ -900,12 +903,11 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		}
 		return NewTimeDatum(pgTimeFromMicros(micros)), 12, nil
 	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown":
-		// PG external/on-disk TOAST reference: short varlena header 0x1B
-		// (VARATT_IS_EXTERNAL_ONDISK) followed by a 12-byte pointer.
-		// Recognise it before the general varlena decode so the Datum
-		// carries KindToastPointer, which needsDetoast / DetoastRow
-		// will resolve to the original value.  M0111-0003.
-		if len(data) >= 13 && data[0] == 0x1B {
+		// PG external varlena (VARATT_IS_1B_E = 0x01): our TOAST pointer.
+		// 0x01 is unambiguous: 0x01>>1=0 is an invalid data varlena length,
+		// so no legitimate data string can produce this header byte.
+		// (The previous marker 0x1B collided with 12-char strings.)
+		if len(data) >= 13 && data[0] == 0x01 {
 			ptr := make([]byte, 12)
 			copy(ptr, data[1:13])
 			return NewToastPointerDatum(ptr), 13, nil
