@@ -1,30 +1,21 @@
 package initdb
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
 )
 
-// TestCreateTableSurvivesRestartViaCatalogHeap is the definitive test for
-// M0030-0003: after CREATE TABLE, even if the JSON snapshot is deleted,
-// the table is recoverable from the pg_class/pg_attribute heap files.
-//
-// Flow:
-//  1. Init + Open + CREATE TABLE + SaveCatalog + Close (writes both JSON and heap)
-//  2. Delete pg_catalog.json
-//  3. Re-Open: JSON absent → loadCatalogSnapshot is a no-op
-//             heap scan → loadUserTablesFromHeap finds the table
-//  4. Assert table is in the catalog with correct columns
+// TestCreateTableSurvivesRestartViaCatalogHeap verifies that after CREATE TABLE,
+// the table is recoverable from the pg_class/pg_attribute heap files on restart.
+// This is the sole catalog recovery path — no JSON is written or read.
 func TestCreateTableSurvivesRestartViaCatalogHeap(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
 	if err := Init(Options{DataDir: dir}); err != nil {
 		t.Fatal(err)
 	}
 
-	// Phase 1: create table, save catalog, close.
 	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
 	if err != nil {
 		t.Fatal(err)
@@ -36,23 +27,15 @@ func TestCreateTableSurvivesRestartViaCatalogHeap(t *testing.T) {
 	}
 	rt1.Close()
 
-	// Phase 2: remove the JSON snapshot.
-	jsonPath := filepath.Join(dir, CatalogSnapshotFile)
-	if err := os.Remove(jsonPath); err != nil {
-		t.Fatalf("remove JSON snapshot: %v", err)
-	}
-
-	// Phase 3: re-open — table must load from heap only.
 	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rt2.Close()
 
-	// Phase 4: verify.
 	tbl, ok := rt2.Catalog.LookupTable(parser.ObjectName{Name: "heap_test"})
 	if !ok {
-		t.Fatal("heap_test not found in catalog after JSON deletion — heap recovery failed")
+		t.Fatal("heap_test not found in catalog after restart — heap recovery failed")
 	}
 	if tbl.OID == 0 {
 		t.Error("heap_test has OID=0 (zero value)")
@@ -69,7 +52,7 @@ func TestCreateTableSurvivesRestartViaCatalogHeap(t *testing.T) {
 }
 
 // TestMultipleTablesLoadFromHeap verifies that multiple user tables created
-// via DDL-sync are all recovered from heap when the JSON is absent.
+// via DDL-sync are all recovered from heap on restart.
 func TestMultipleTablesLoadFromHeap(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
 	if err := Init(Options{DataDir: dir}); err != nil {
@@ -89,9 +72,6 @@ func TestMultipleTablesLoadFromHeap(t *testing.T) {
 	}
 	rt1.Close()
 
-	// Delete JSON.
-	_ = os.Remove(filepath.Join(dir, CatalogSnapshotFile))
-
 	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
 	if err != nil {
 		t.Fatal(err)
@@ -100,11 +80,10 @@ func TestMultipleTablesLoadFromHeap(t *testing.T) {
 
 	for _, name := range []string{"alpha", "beta", "gamma"} {
 		if _, ok := rt2.Catalog.LookupTable(parser.ObjectName{Name: name}); !ok {
-			t.Errorf("table %q missing after JSON deletion", name)
+			t.Errorf("table %q missing after restart", name)
 		}
 	}
 
-	// Column spot-check for beta.
 	beta, ok := rt2.Catalog.LookupTable(parser.ObjectName{Name: "beta"})
 	if !ok {
 		t.Fatal("beta not found")
@@ -114,9 +93,8 @@ func TestMultipleTablesLoadFromHeap(t *testing.T) {
 	}
 }
 
-// TestHeapLoadIdempotentWithJSON verifies that when both JSON and heap have
-// a table, the result is still correct (no duplicate, no panic).
-func TestHeapLoadIdempotentWithJSON(t *testing.T) {
+// TestHeapLoadIdempotent verifies that opening twice doesn't corrupt the catalog.
+func TestHeapLoadIdempotent(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
 	if err := Init(Options{DataDir: dir}); err != nil {
 		t.Fatal(err)
@@ -133,10 +111,9 @@ func TestHeapLoadIdempotentWithJSON(t *testing.T) {
 	}
 	rt1.Close()
 
-	// Re-open with BOTH JSON and heap present.
 	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
 	if err != nil {
-		t.Fatalf("Open with both JSON and heap: %v", err)
+		t.Fatalf("second Open: %v", err)
 	}
 	defer rt2.Close()
 

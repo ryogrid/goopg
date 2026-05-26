@@ -992,6 +992,22 @@ func (p *Pool) MarkDirty(s *Slot) {
 	}
 }
 
+// MarkDirtyHintBit marks s dirty for a hint-bit-only write. Unlike MarkDirty,
+// it does NOT call maybeEmitFPI: hint bits are re-derived from pg_xact on
+// crash recovery and are never WAL-logged. The page is flushed to disk at
+// checkpoint time, persisting the cached bits for future restarts.
+func (p *Pool) MarkDirtyHintBit(s *Slot) {
+	for {
+		old := s.state.Load()
+		if old&slotDirtyBit != 0 {
+			return
+		}
+		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			return
+		}
+	}
+}
+
 // MarkDirtyWithLSN records an explicit page LSN and marks the slot dirty.
 func (p *Pool) MarkDirtyWithLSN(s *Slot, lsn LSN) {
 	s.contentMu.Lock()

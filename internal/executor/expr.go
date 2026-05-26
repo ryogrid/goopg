@@ -257,6 +257,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			// can format it with strconv.FormatFloat rather than big.Int decimal expansion.
 			return NewStringDatum(fs), nil
 		}
+		// pg_lsn arithmetic/comparison: detect KindString "X/Y" pattern.
+		if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||
+			(right.Kind == KindString && looksLikePgLSN(right.StringValue())) {
+			res, handled, lsnErr := evalPgLSNBinary(x.Op, left, right, x.Pos())
+			if lsnErr != nil {
+				return Datum{}, lsnErr
+			}
+			if handled {
+				return res, nil
+			}
+		}
 	normalBinaryOp:
 		result, err := evalBinary(x.Op, left, right, x.Pos())
 		if err != nil {
@@ -351,6 +362,165 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 		return NewBoolDatum(!d.BoolValue()), nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown unary operator %s", op)}
+}
+
+// looksLikePgLSN reports whether s is in "X/Y" format (1–8 uppercase hex digits each).
+func looksLikePgLSN(s string) bool {
+	slash := strings.IndexByte(s, '/')
+	if slash < 1 || slash > 8 {
+		return false
+	}
+	hexLow := s[slash+1:]
+	if len(hexLow) < 1 || len(hexLow) > 8 {
+		return false
+	}
+	for _, c := range s[:slash] + hexLow {
+		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// pgLSNParseDelta extracts an int64 delta from a numeric/integer datum for pg_lsn arithmetic.
+// Returns (delta, isNaN, ok). isNaN=true when NaN (caller must error).
+func pgLSNParseDelta(d Datum) (int64, bool, bool) {
+	switch d.Kind {
+	case KindInt:
+		return d.Int, false, true
+	case KindNumeric:
+		s := d.Format()
+		if s == "NaN" {
+			return 0, true, true
+		}
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return v, false, true
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return int64(f), false, true
+		}
+	case KindString:
+		s := d.StringValue()
+		if s == "NaN" {
+			return 0, true, true
+		}
+		if !looksLikePgLSN(s) {
+			if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return v, false, true
+			}
+		}
+	}
+	return 0, false, false
+}
+
+// evalPgLSNBinary handles pg_lsn comparison and arithmetic operators.
+// Returns (result, true, nil) when handled, (zero, false, nil) to fall through.
+func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool, error) {
+	// Parse one or both sides as pg_lsn uint64.
+	parseLSNDatum := func(d Datum) (uint64, bool) {
+		if d.Kind == KindString {
+			u, err := parsePgLSN(d.StringValue())
+			if err == nil {
+				return u, true
+			}
+		}
+		return 0, false
+	}
+
+	switch op {
+	case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+		lu, lok := parseLSNDatum(left)
+		ru, rok := parseLSNDatum(right)
+		if !lok || !rok {
+			return Datum{}, false, nil
+		}
+		var result bool
+		switch op {
+		case parser.OpEq:
+			result = lu == ru
+		case parser.OpNe:
+			result = lu != ru
+		case parser.OpLt:
+			result = lu < ru
+		case parser.OpLe:
+			result = lu <= ru
+		case parser.OpGt:
+			result = lu > ru
+		case parser.OpGe:
+			result = lu >= ru
+		}
+		return NewBoolDatum(result), true, nil
+	case parser.OpSub:
+		// pg_lsn - pg_lsn → numeric
+		lu, lok := parseLSNDatum(left)
+		ru, rok := parseLSNDatum(right)
+		if lok && rok {
+			var diff int64
+			if lu >= ru {
+				diff = int64(lu - ru)
+			} else {
+				diff = -int64(ru - lu)
+			}
+			return NewStringDatum(fmt.Sprintf("%d", diff)), true, nil
+		}
+		// pg_lsn - numeric → pg_lsn
+		if lok {
+			delta, isNaN, ok := pgLSNParseDelta(right)
+			if ok {
+				if isNaN {
+					return Datum{}, true, &ExecError{Code: "0A000", Pos: pos,
+						Message: "cannot subtract NaN from pg_lsn"}
+				}
+				if delta < 0 {
+					if uint64(-delta) > lu {
+						return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+					}
+					return NewStringDatum(formatPgLSN(lu - uint64(-delta))), true, nil
+				}
+				if uint64(delta) > lu {
+					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+				}
+				return NewStringDatum(formatPgLSN(lu-uint64(delta))), true, nil
+			}
+		}
+	case parser.OpAdd:
+		// pg_lsn + numeric → pg_lsn
+		lu, lok := parseLSNDatum(left)
+		ru, rok := parseLSNDatum(right)
+		var lsnVal uint64
+		var numericDatum Datum
+		if lok && !rok {
+			lsnVal = lu
+			numericDatum = right
+		} else if rok && !lok {
+			lsnVal = ru
+			numericDatum = left
+		} else {
+			return Datum{}, false, nil
+		}
+		delta, isNaN, ok := pgLSNParseDelta(numericDatum)
+		if ok {
+			if isNaN {
+				return Datum{}, true, &ExecError{Code: "0A000", Pos: pos,
+					Message: "cannot add NaN to pg_lsn"}
+			}
+			var result uint64
+			if delta >= 0 {
+				result = lsnVal + uint64(delta)
+				if result < lsnVal {
+					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+				}
+			} else {
+				neg := uint64(-delta)
+				if neg > lsnVal {
+					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
+				}
+				result = lsnVal - neg
+			}
+			return NewStringDatum(formatPgLSN(result)), true, nil
+		}
+	}
+	return Datum{}, false, nil
 }
 
 // evalBinary handles arithmetic, comparison, and boolean operators.
@@ -694,6 +864,20 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		bIsString := b.Kind == KindString
 		if aIsString && bIsString {
 			as, bs := a.StringValue(), b.StringValue()
+			// pg_lsn comparison: use uint64 semantics. M0097-pg_lsn.
+			if looksLikePgLSN(as) && looksLikePgLSN(bs) {
+				lu, errL := parsePgLSN(as)
+				ru, errR := parsePgLSN(bs)
+				if errL == nil && errR == nil {
+					if lu < ru {
+						return -1, nil
+					}
+					if lu > ru {
+						return 1, nil
+					}
+					return 0, nil
+				}
+			}
 			// UUID cross-format comparison: if either looks like a UUID in any format,
 			// normalize both to canonical form so hyphenated matches non-hyphenated. M0097-0003.
 			if isValidUUIDStr(as) || isValidUUIDStr(bs) {
@@ -735,6 +919,20 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		return 0, nil
 	case KindString:
 		as, bs := a.StringValue(), b.StringValue()
+		// pg_lsn comparison: use uint64 semantics, not lexicographic. M0097-pg_lsn.
+		if looksLikePgLSN(as) && looksLikePgLSN(bs) {
+			lu, errL := parsePgLSN(as)
+			ru, errR := parsePgLSN(bs)
+			if errL == nil && errR == nil {
+				if lu < ru {
+					return -1, nil
+				}
+				if lu > ru {
+					return 1, nil
+				}
+				return 0, nil
+			}
+		}
 		// UUID cross-format comparison: normalize both if either is a valid UUID. M0097-0003.
 		if isValidUUIDStr(as) || isValidUUIDStr(bs) {
 			if isValidUUIDStr(as) {
@@ -1257,6 +1455,22 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return Datum{Kind: KindInt, Int: n}, nil
 		default:
 			return d, nil
+		}
+	case "pg_lsn":
+		switch d.Kind {
+		case KindString:
+			u, err := parsePgLSN(strings.TrimSpace(d.StringValue()))
+			if err != nil {
+				if ee, ok := err.(*ExecError); ok {
+					ee.Pos = pos
+				}
+				return Datum{}, err
+			}
+			return NewStringDatum(formatPgLSN(u)), nil
+		case KindInt:
+			return NewStringDatum(formatPgLSN(uint64(d.Int))), nil
+		default:
+			return NewStringDatum(d.Format()), nil
 		}
 	case "regclass":
 		// `oid::regclass` renders as the relation name (matches PG's

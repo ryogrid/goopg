@@ -9,51 +9,8 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/storage"
 )
-
-// EncodeRow serialises a Datum row into the heap-tuple data area.
-//
-// v0 uses a private fixed-format encoding rather than upstream's
-// per-type typlen/typalign rules. Each column emits one null-flag
-// byte (0 = present, 1 = NULL) followed by the value bytes when
-// present:
-//
-//   - int4              : 4-byte big-endian
-//   - int8 / timestamp  : 8-byte big-endian
-//   - bool              : 1 byte
-//   - text / varchar /
-//     char / unknown    : 4-byte big-endian length prefix + raw bytes
-//
-// We diverge from upstream's wire-shaped tuple body intentionally —
-// matching upstream's encoding requires the type system milestone 7
-// is going to land. Until then this codec is the goopg-internal
-// contract between Insert/SeqScan and storage.
-func EncodeRow(cols []catalog.Column, row Row) ([]byte, error) {
-	if len(cols) != len(row) {
-		return nil, fmt.Errorf("EncodeRow: %d cols vs %d datums", len(cols), len(row))
-	}
-	var out []byte
-	for i, c := range cols {
-		d := row[i]
-		if d.IsNull() {
-			out = append(out, 1)
-			continue
-		}
-		// TOAST pointer: flag byte 0x02 followed by 12-byte pointer.
-		if d.Kind == KindToastPointer {
-			out = append(out, 2)
-			out = append(out, d.BytesValue()...)
-			continue
-		}
-		out = append(out, 0)
-		buf, err := encodeValue(c.Type, d)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, buf...)
-	}
-	return out, nil
-}
 
 // EncodeRowPG encodes a row in PG-native physical tuple format
 // (M0105-0010). Used for catalog pages that PG must read directly,
@@ -116,14 +73,17 @@ func encodeRowPG(cols []catalog.Column, row Row) ([]byte, error) {
 			continue
 		}
 		if d.Kind == KindToastPointer {
-			// Encode as PG external/on-disk TOAST reference:
-			// short varlena header (1 byte) + 12-byte pointer = 13 bytes.
-			// Header: (13 << 1) | 1 = 0x1B (VARATT_IS_EXTERNAL_ONDISK).
+			// Encode as PG external varlena reference: VARATT_IS_1B_E (0x01)
+			// followed by a 12-byte pointer = 13 bytes total.
+			// 0x01 is reserved in PG's varlena encoding as the 1-byte external
+			// marker; it can never be a data varlena (0x01>>1=0 = zero-length).
+			// This avoids the 0x1B collision where any 12-char string also
+			// produces header (13<<1)|1 = 0x1B and was misidentified as TOAST.
 			// Aligned to 4 bytes (PG TOAST pointers are int-aligned).
 			off = alignPhysicalPGOffset(off, 4)
 			ptr := d.BytesValue()
 			buf := make([]byte, 13)
-			buf[0] = 0x1B // short varlena: len=13, external
+			buf[0] = 0x01 // VARATT_IS_1B_E: external varlena, unambiguous
 			copy(buf[1:], ptr)
 			for len(out) < off+13 {
 				out = append(out, 0)
@@ -262,6 +222,23 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		}
 		var buf [8]byte
 		binary.LittleEndian.PutUint64(buf[:], uint64(v))
+		return buf[:], nil
+	case "pg_lsn":
+		var u uint64
+		switch d.Kind {
+		case KindInt:
+			u = uint64(d.Int)
+		case KindString:
+			var err error
+			u, err = parsePgLSN(strings.TrimSpace(d.StringValue()))
+			if err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("expected pg_lsn, got kind %d", d.Kind)
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], u)
 		return buf[:], nil
 	case "oid", "regproc":
 		var v int64
@@ -438,10 +415,17 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		binary.LittleEndian.PutUint32(buf[:], v)
 		return buf[:], nil
 	case "numeric", "decimal":
-		// encodeValuePG default calls StringValue() which returns "" for
-		// KindNumeric (Int/M fields, not Buf). Use numericText to get the
-		// decimal string representation, then store as PG varlena-text.
-		return varlenaTextBytes(numericText(d)), nil
+		// Store as PG varlena-text. coerceTextLikeDatum yields the decimal
+		// string for KindNumeric/KindInt and passes a KindString through
+		// verbatim (e.g. INSERT ... VALUES ('123.45') arriving as text) —
+		// numericText alone reads only the Int/Scale fields and would emit
+		// "0" for a KindString. M0111-0002 (restores the string→numeric path
+		// the removed legacy encodeValue had).
+		s, err := coerceTextLikeDatum(t, d)
+		if err != nil {
+			return nil, err
+		}
+		return varlenaTextBytes(s), nil
 	case "aclitem[]", "_aclitem":
 		// PG binary empty ArrayType, elemtype = aclitem (1033).
 		// PG's deconstruct_array asserts on ARR_ELEMTYPE; a text varlena
@@ -472,6 +456,21 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return d.BytesValue(), nil
 		}
 		return emptyArrayTypeBytes(21), nil
+	case "float4[]", "_float4":
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
+		return emptyArrayTypeBytes(700), nil
+	case "anyarray":
+		// anyarray can hold any element type. Callers pass a pre-built
+		// ArrayType blob via KindBytes (e.g. pg_statistic.stavalues*).
+		// NullDatum is written via the null bitmap by EncodeRowPG, so
+		// we only reach here for non-null datums.
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
+		// Fallback: empty anyarray with elemtype=text (safe placeholder).
+		return emptyArrayTypeBytes(25), nil
 	case "char[]", "_char":
 		// PG binary empty ArrayType, elemtype = char (18).
 		// Used for pg_proc.proargmodes when no per-arg modes are set.
@@ -585,158 +584,6 @@ func DecodeRow(cols []catalog.Column, data []byte) (Row, error) {
 	return row, nil
 }
 
-// DecodeRowProjection (M0054-0005c-followup) decodes only the columns
-// whose index is true in `keep`, skipping payload allocation for
-// other columns. dst[i] for i where !keep[i] is set to NullDatum
-// (a marker, NOT the SQL NULL — callers must not read those slots).
-//
-// The variable-length column codec means we cannot skip past a
-// column without parsing its length header, so the savings come
-// from the per-column heap allocations: varchar/char/text avoid
-// the `string(data[4:4+n])` copy and numeric avoids the
-// `parseNumeric` big.Int materialisation. For a TPC-H index-build
-// path that needs only the indexed key column out of N, this
-// removes the dominant allocation source flagged by
-// `M0054-0004` pprof (DecodeRow 39 % cum in the `idx` window).
-//
-// Caller invariants:
-//   - `len(dst) >= len(cols)`
-//   - `len(keep) >= len(cols)`
-//
-// arena == nil falls back to the legacy `make([]byte)` path —
-// behaviour byte-for-byte identical regardless of caller.
-func DecodeRowProjection(dst Row, cols []catalog.Column, data []byte, keep []bool) error {
-	return decodeRowProjectionMctx(dst, cols, data, keep, nil)
-}
-
-// DecodeRowProjectionIntoArena is the arena-aware sibling of
-// DecodeRowProjection. When arena != nil, projected variable-length
-// columns (varchar / char / text / bytea, numeric text storage)
-// emit Datums whose payload lives in the arena's pages — single
-// allocation per page amortises across thousands of strings.
-// Skipped columns produce no Datum allocation in either mode.
-//
-// Used by index-build paths (operators_ddl.go: collectBTreeEntries
-// and backfillBTree) where the decoded Datum's lifetime ends at
-// encodeBTreeKeyForColumn — the encoded key is a fresh []byte copy.
-//
-// Caller invariants (same as DecodeRowProjection plus):
-//   - arena.Reset() bound to the producer's batch boundary
-//     (per-page in DDL paths).
-//   - Datums must not be retained past the next Reset.
-//
-// arena == nil falls back to the legacy `make([]byte)` path —
-// behaviour byte-for-byte identical to DecodeRowProjection.
-//
-// M0074-0004 — see docs/design/0074-0004-decode-row-projection-arena.md.
-func DecodeRowProjectionIntoArena(dst Row, cols []catalog.Column, data []byte, keep []bool, sctx *mctx.Context) error {
-	return decodeRowProjectionMctx(dst, cols, data, keep, sctx)
-}
-
-func decodeRowProjectionMctx(dst Row, cols []catalog.Column, data []byte, keep []bool, sctx *mctx.Context) error {
-	off := 0
-	for i, c := range cols {
-		if off >= len(data) {
-			dst[i] = NullDatum
-			continue
-		}
-		flag := data[off]
-		off++
-		if flag == 1 {
-			dst[i] = NullDatum
-			continue
-		}
-		if flag == 2 {
-			const toastPtrSize = 12
-			if off+toastPtrSize > len(data) {
-				return fmt.Errorf("DecodeRowProjection: %s: truncated TOAST pointer", c.Name)
-			}
-			if keep[i] {
-				// TOAST pointer: always Buf-backed regardless
-				// of sctx binding — detoasted bytes need to
-				// outlive the sctx Reset cycle.
-				dst[i] = NewToastPointerDatum(append([]byte(nil), data[off:off+toastPtrSize]...))
-			} else {
-				dst[i] = NullDatum
-			}
-			off += toastPtrSize
-			continue
-		}
-		if keep[i] {
-			var (
-				v   Datum
-				n   int
-				err error
-			)
-			if sctx != nil {
-				v, n, err = decodeValueMctx(c.Type, data[off:], sctx)
-			} else {
-				v, n, err = decodeValue(c.Type, data[off:])
-			}
-			if err != nil {
-				return fmt.Errorf("DecodeRowProjection: %s: %w", c.Name, err)
-			}
-			dst[i] = v
-			off += n
-			continue
-		}
-		// Not kept: advance offset only. Avoids the per-column
-		// heap allocations (string copy, big.Int).
-		n, err := decodeValueSize(c.Type, data[off:])
-		if err != nil {
-			return fmt.Errorf("DecodeRowProjection: %s: %w", c.Name, err)
-		}
-		dst[i] = NullDatum
-		off += n
-	}
-	return nil
-}
-
-// decodeValueSize returns just the byte length of an encoded value
-// without materialising a Datum. Used by DecodeRowProjection to
-// skip columns whose payload the caller does not need.
-// (M0054-0005c-followup.)
-func decodeValueSize(t catalog.Type, data []byte) (int, error) {
-	switch t.Name {
-	case "int2", "smallint":
-		if len(data) < 2 {
-			return 0, fmt.Errorf("truncated int2")
-		}
-		return 2, nil
-	case "int4", "integer", "int", "serial":
-		if len(data) < 4 {
-			return 0, fmt.Errorf("truncated int4/serial")
-		}
-		return 4, nil
-	case "int8", "bigint", "bigserial":
-		if len(data) < 8 {
-			return 0, fmt.Errorf("truncated int8/bigserial")
-		}
-		return 8, nil
-	case "bool", "boolean":
-		if len(data) < 1 {
-			return 0, fmt.Errorf("truncated bool")
-		}
-		return 1, nil
-	case "timestamp", "timestamptz", "date", "time", "timetz":
-		if len(data) < 8 {
-			return 0, fmt.Errorf("truncated %s", t.Name)
-		}
-		return 8, nil
-	default:
-		// numeric, varchar, char, text — all use a 4-byte big-endian
-		// length prefix followed by `n` bytes of payload.
-		if len(data) < 4 {
-			return 0, fmt.Errorf("truncated varlen header")
-		}
-		n := int(binary.BigEndian.Uint32(data[:4]))
-		if 4+n > len(data) {
-			return 0, fmt.Errorf("truncated varlen body")
-		}
-		return 4 + n, nil
-	}
-}
-
 // DecodeRowInto fills an existing Row slice from encoded tuple data.
 // Avoids the allocation that DecodeRow would make. The caller must
 // ensure len(dst) == len(cols). M0027-0001.
@@ -778,31 +625,28 @@ func DecodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.C
 	return decodeRowIntoMctx(dst, cols, data, sctx)
 }
 
-// DecodeRowIntoMctxPGTuple decodes a PG heap tuple's body using both the null
-// bitmap and storedNatts to correctly handle NULL columns and ALTER TABLE ADD
-// COLUMN. It is the preferred decoder for seqScanOp when tuple.Bitmap is
-// available. bitmap may be nil (all columns non-null). storedNatts == 0 means
-// "no information" (fall back to len(cols)).
+// DecodeRowIntoMctxPGTuple decodes a heap tuple's body, using the tuple HEADER
+// (storedNatts + null bitmap) as the authoritative format discriminator. It
+// NEVER guesses the format from the column bytes — guessing is the source of
+// the cross-acceptance corruption class (see docs/design/0111-0002-...).
+//
+// Discriminator (M0111-0002): a goopg legacy-format tuple has no null bitmap
+// and leaves natts unset (0); a PG-physical tuple always sets natts (>= 1) and
+// carries a null bitmap when it has NULLs. PostgreSQL never writes natts == 0,
+// so (storedNatts == 0 && bitmap == nil) unambiguously means "legacy". Anything
+// else is PG-physical. bitmap may be nil for an all-non-null PG row (then natts
+// distinguishes it from legacy). storedNatts < len(cols) means ALTER TABLE ADD
+// COLUMN — trailing columns decode as NULL.
 func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byte, storedNatts int, sctx *mctx.Context) error {
+	// PG-physical decode with null-bitmap and natts awareness. M0111-0002 S3:
+	// the goopg legacy format has been removed, so there is a single on-disk
+	// format. A PG-physical tuple always records natts; storedNatts==0 means a
+	// header-less body (e.g. via the bare DecodeRow wrappers in tests) — treat
+	// all columns as present.
 	n := len(cols)
 	if storedNatts == 0 {
 		storedNatts = n
 	}
-
-	// Fast path: no nulls and stored natts == schema → existing decoder.
-	if len(bitmap) == 0 && storedNatts >= n {
-		return decodeRowIntoMctx(dst, cols, data, sctx)
-	}
-
-	// Try goopg legacy format first (if bitmap is non-empty this is unlikely
-	// to succeed, but we try for backward compat).
-	if len(bitmap) == 0 {
-		if err := decodeGoopgRowIntoMctx(dst, cols, data, sctx); err == nil {
-			return nil
-		}
-	}
-
-	// PG physical format decode with null bitmap and natts awareness.
 	off := 0
 	for i, c := range cols {
 		// Columns beyond stored natts were added via ALTER TABLE ADD COLUMN.
@@ -831,110 +675,32 @@ func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byt
 	return nil
 }
 
-// DecodeRowIntoArena is the legacy alias kept for call-site compatibility
-// during the M0107-0001 migration. Delegates to DecodeRowIntoMctx.
-//
-// Deprecated: use DecodeRowIntoMctx directly.
-func DecodeRowIntoArena(dst Row, cols []catalog.Column, data []byte, arena *mctx.Context) error {
-	return decodeRowIntoMctx(dst, cols, data, arena)
+// DecodeHeapTupleRowInto fills dst from a heap tuple, selecting the row format
+// deterministically from the tuple header (natts + null bitmap) rather than
+// guessing from the bytes. This is the header-driven replacement for the bare
+// DecodeRowInto on any read path that holds the storage.HeapTuple. M0111-0002.
+func DecodeHeapTupleRowInto(dst Row, cols []catalog.Column, tuple storage.HeapTuple, sctx *mctx.Context) error {
+	natts := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
+	return DecodeRowIntoMctxPGTuple(dst, cols, tuple.Data, tuple.Bitmap, natts, sctx)
+}
+
+// DecodeHeapTupleRow is the allocating sibling of DecodeHeapTupleRowInto: it
+// returns a freshly-allocated Row. Use it where the bare DecodeRow was used on
+// a path that holds the storage.HeapTuple. M0111-0002.
+func DecodeHeapTupleRow(cols []catalog.Column, tuple storage.HeapTuple, sctx *mctx.Context) (Row, error) {
+	row := make(Row, len(cols))
+	if err := DecodeHeapTupleRowInto(row, cols, tuple, sctx); err != nil {
+		return nil, err
+	}
+	return row, nil
 }
 
 func decodeRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.Context) error {
-	// Try PG-native physical format first — all new data written via
-	// EncodeRowPG since M0106-0010 uses this format.  Fall back to
-	// goopg legacy format for cold-storage tuples that predate M0106.
-	// M0111-0001: the old "legacy first" order caused the legacy
-	// decoder to accidentally accept PG-format bytes as valid legacy
-	// data (e.g. interpreting a PG varlena header as a legacy flag
-	// byte), silently returning wrong data.  When both decoders
-	// failed the PG-format error was returned, producing the
-	// "DecodePhysicalPGRow: filler: truncated varlena" symptom.
-	if err := decodePhysicalPGRowIntoMctx(dst, cols, data, sctx); err == nil {
-		return nil
-	} else if err := decodeGoopgRowIntoMctx(dst, cols, data, sctx); err == nil {
-		return nil
-	} else {
-		return err
-	}
-}
-
-func decodeGoopgRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.Context) error {
-	off := 0
-	for i, c := range cols {
-		if off >= len(data) {
-			dst[i] = NullDatum
-			continue
-		}
-		flag := data[off]
-		off++
-		if flag == 1 {
-			dst[i] = NullDatum
-			continue
-		}
-		// TOAST pointer: 12 bytes following the 0x02 flag byte.
-		// Always Buf-backed regardless of sctx binding —
-		// detoasted bytes (when DetoastRow runs later) need to
-		// outlive the sctx's Reset cycle.
-		if flag == 2 {
-			const toastPtrSize = 12
-			if off+toastPtrSize > len(data) {
-				return fmt.Errorf("DecodeRow: %s: truncated TOAST pointer", c.Name)
-			}
-			// Sanity-check numChunks (pointer[8:12]) before accepting this
-			// as a genuine TOAST pointer. PG-physical rows can accidentally
-			// parse as flag==2 when the first LE byte of an int4 column (e.g.
-			// aid=2) equals 0x02 and the remaining bytes happen to fill
-			// exactly len(data) bytes. Without this check, the accidental
-			// "TOAST pointer" carries numChunks from unrelated bytes (e.g.
-			// high abalance bits) which can be ~4 billion, causing DetoastValue
-			// to attempt a 96 GB allocation and panic with "runtime: out of memory".
-			// A real TOAST chunk sequence is bounded by maxToastSize/chunkSize.
-			// We use 1<<20 (≈1M chunks × 2KB each = 2 GB) as a loose upper bound
-			// that rejects corrupted/accidental pointers while accepting any real TOAST.
-			const maxToastChunks = 1 << 20
-			numChunks := int(binary.BigEndian.Uint32(data[off+8 : off+toastPtrSize]))
-			if numChunks < 0 || numChunks > maxToastChunks {
-				return fmt.Errorf("DecodeRow: %s: implausible TOAST numChunks %d (not goopg format)", c.Name, numChunks)
-			}
-			dst[i] = NewToastPointerDatum(append([]byte(nil), data[off:off+toastPtrSize]...))
-			off += toastPtrSize
-			continue
-		}
-		var (
-			v   Datum
-			n   int
-			err error
-		)
-		if sctx != nil {
-			v, n, err = decodeValueMctx(c.Type, data[off:], sctx)
-		} else {
-			v, n, err = decodeValue(c.Type, data[off:])
-		}
-		if err != nil {
-			return fmt.Errorf("DecodeRow: %s: %w", c.Name, err)
-		}
-		dst[i] = v
-		off += n
-	}
-	// Decoder must consume exactly len(data) bytes.  Two failure modes indicate
-	// this is not goopg format:
-	//   off < len(data): trailing bytes remain (PG physical layout whose first
-	//                    byte happened to match a null/TOAST flag).
-	//   off > len(data): the loop guard (off >= len → NullDatum, no off advance)
-	//                    let off coast past the end, silently yielding wrong
-	//                    values without consuming the right number of bytes.
-	//                    Catching this prevents silent data corruption when the
-	//                    PG-encoded tuple is accidentally "decoded" by the goopg
-	//                    path (M0107: HOT-update encoding parity fix).
-	// In either case return an error so the caller falls through to
-	// decodePhysicalPGRowIntoMctx.
-	if off != len(data) {
-		if off < len(data) {
-			return fmt.Errorf("DecodeRow: goopg format: %d trailing bytes", len(data)-off)
-		}
-		return fmt.Errorf("DecodeRow: goopg format: overread by %d bytes (off=%d len=%d)", off-len(data), off, len(data))
-	}
-	return nil
+	// M0111-0002 S3: single on-disk format. The bare DecodeRow*/DecodeRowInto*
+	// wrappers (header-less paths, used by tests) decode PG-physical bodies
+	// only; the goopg legacy format and the format-guessing fallback were
+	// removed once all writes became PG-physical and re-init was mandated.
+	return decodePhysicalPGRowIntoMctx(dst, cols, data, sctx)
 }
 
 func decodePhysicalPGRowIntoMctx(dst Row, cols []catalog.Column, data []byte, sctx *mctx.Context) error {
@@ -982,11 +748,11 @@ func physicalPGTypeAlign(t catalog.Type) int {
 		return 2
 	case "int4", "integer", "int", "serial", "oid", "regproc", "float4", "real", "date", "xid":
 		return 4
-	case "int8", "bigint", "bigserial", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz":
+	case "int8", "bigint", "bigserial", "pg_lsn", "float8", "double precision", "double", "timestamp", "timestamptz", "time", "timetz":
 		return 8
 	case "name":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
-	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "anyarray", "pg_node_tree", "oidvector", "int2vector":
+	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "float4[]", "_float4", "anyarray", "pg_node_tree", "oidvector", "int2vector":
 		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector / int2vector
 	default:
 		return 4
@@ -1011,6 +777,7 @@ func pgPhysicalTypeIsVarlena(t catalog.Type) bool {
 		"int2", "smallint",
 		"int4", "integer", "int", "serial",
 		"int8", "bigint", "bigserial",
+		"pg_lsn",
 		"oid", "regproc",
 		"timestamp", "timestamptz", "date", "time", "timetz",
 		"name",
@@ -1081,6 +848,11 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("truncated int8")
 		}
 		return NewIntDatum(int64(binary.LittleEndian.Uint64(data[:8]))), 8, nil
+	case "pg_lsn":
+		if len(data) < 8 {
+			return Datum{}, 0, fmt.Errorf("truncated pg_lsn")
+		}
+		return NewStringDatum(formatPgLSN(binary.LittleEndian.Uint64(data[:8]))), 8, nil
 	case "oid", "regproc":
 		if len(data) < 4 {
 			return Datum{}, 0, fmt.Errorf("truncated oid")
@@ -1146,12 +918,11 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		}
 		return NewTimeDatum(pgTimeFromMicros(micros)), 12, nil
 	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown":
-		// PG external/on-disk TOAST reference: short varlena header 0x1B
-		// (VARATT_IS_EXTERNAL_ONDISK) followed by a 12-byte pointer.
-		// Recognise it before the general varlena decode so the Datum
-		// carries KindToastPointer, which needsDetoast / DetoastRow
-		// will resolve to the original value.  M0111-0003.
-		if len(data) >= 13 && data[0] == 0x1B {
+		// PG external varlena (VARATT_IS_1B_E = 0x01): our TOAST pointer.
+		// 0x01 is unambiguous: 0x01>>1=0 is an invalid data varlena length,
+		// so no legitimate data string can produce this header byte.
+		// (The previous marker 0x1B collided with 12-char strings.)
+		if len(data) >= 13 && data[0] == 0x01 {
 			ptr := make([]byte, 12)
 			copy(ptr, data[1:13])
 			return NewToastPointerDatum(ptr), 13, nil
@@ -1337,307 +1108,36 @@ func coerceStringToInt64(s, typeName string) (int64, error) {
 	return parseIntegerInput(s, typeName, 64)
 }
 
-func encodeValue(t catalog.Type, d Datum) ([]byte, error) {
-	switch t.Name {
-	case "int4", "integer", "int", "serial":
-		var v int64
-		switch d.Kind {
-		case KindInt:
-			v = d.Int
-		case KindString:
-			var err error
-			v, err = coerceStringToInt64(d.StringValue(), "integer")
-			if err != nil {
-				return nil, err
-			}
-			if v < -2147483648 || v > 2147483647 {
-				return nil, &ExecError{Code: "22003",
-					Message: fmt.Sprintf("value %q is out of range for type integer", strings.TrimSpace(d.StringValue()))}
-			}
-		default:
-			return nil, fmt.Errorf("expected int for %s, got kind %d", t.Name, d.Kind)
-		}
-		var buf [4]byte
-		binary.BigEndian.PutUint32(buf[:], uint32(int32(v)))
-		return buf[:], nil
-	case "int8", "bigint", "bigserial":
-		var v int64
-		switch d.Kind {
-		case KindInt:
-			v = d.Int
-		case KindString:
-			var err error
-			v, err = coerceStringToInt64(d.StringValue(), "bigint")
-			if err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("expected int for %s, got kind %d", t.Name, d.Kind)
-		}
-		var buf [8]byte
-		binary.BigEndian.PutUint64(buf[:], uint64(v))
-		return buf[:], nil
-	case "int2", "smallint":
-		// int2 (smallint): stored as 2-byte big-endian int16. M0097-0003.
-		var v int64
-		switch d.Kind {
-		case KindInt:
-			v = d.Int
-		case KindString:
-			var err error
-			v, err = coerceStringToInt64(d.StringValue(), "smallint")
-			if err != nil {
-				return nil, err
-			}
-		case KindNumeric:
-			v = d.NumericMantissaValue()
-		default:
-			return nil, fmt.Errorf("kind %d cannot encode as smallint", d.Kind)
-		}
-		if v < -32768 || v > 32767 {
-			return nil, &ExecError{Code: "22003",
-				Message: fmt.Sprintf("value \"%d\" is out of range for type smallint", v)}
-		}
-		var buf [2]byte
-		binary.BigEndian.PutUint16(buf[:], uint16(int16(v)))
-		return buf[:], nil
-
-	case "float4", "real":
-		// float4 stored as varlen text for v0 compatibility. M0097-0003.
-		var s string
-		switch d.Kind {
-		case KindInt:
-			s = strconv.FormatInt(d.Int, 10)
-		case KindString:
-			raw := strings.TrimSpace(d.StringValue())
-			if _, err := strconv.ParseFloat(raw, 32); err != nil {
-				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type real: %q", d.StringValue())}
-			}
-			s = raw
-		case KindNumeric:
-			s = numericText(d)
-		default:
-			return nil, fmt.Errorf("kind %d cannot encode as real", d.Kind)
-		}
-		return encodeVarlen([]byte(s)), nil
-
-	case "float8", "double precision", "double":
-		// float8 stored as varlen text for v0 compatibility. M0097-0003.
-		var s string
-		switch d.Kind {
-		case KindInt:
-			s = strconv.FormatInt(d.Int, 10)
-		case KindString:
-			raw := strings.TrimSpace(d.StringValue())
-			if _, err := strconv.ParseFloat(raw, 64); err != nil {
-				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type double precision: %q", d.StringValue())}
-			}
-			s = raw
-		case KindNumeric:
-			s = numericText(d)
-		default:
-			return nil, fmt.Errorf("kind %d cannot encode as double precision", d.Kind)
-		}
-		return encodeVarlen([]byte(s)), nil
-
-	case "bool", "boolean":
-		if d.Kind != KindBool {
-			return nil, fmt.Errorf("expected bool, got kind %d", d.Kind)
-		}
-		if d.BoolValue() {
-			return []byte{1}, nil
-		}
-		return []byte{0}, nil
-	case "timestamp", "timestamptz", "date":
-		// DATE shares the timestamp on-disk shape: an 8-byte
-		// big-endian nanos-since-epoch. The midnight-UTC
-		// coercion happens at literal-parse time (date '...' →
-		// KindTime at midnight), so a column-level distinction
-		// from timestamp isn't needed for arithmetic and
-		// comparison. Wire-format formatting back to the
-		// `YYYY-MM-DD` shape would belong in a dedicated KindDate
-		// carrier, deferred to the type-system milestone.
-		if d.Kind == KindString {
-			ts, err := parseCopyTimestamp(d.StringValue())
-			if err != nil {
-				return nil, &ExecError{Code: "22007",
-					Message: fmt.Sprintf("invalid input syntax for type %s: %q", t.Name, d.StringValue())}
-			}
-			d = NewTimeDatum(ts)
-		}
-		if d.Kind != KindTime {
-			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
-		}
-		var buf [8]byte
-		binary.BigEndian.PutUint64(buf[:], uint64(d.TimeValue().UnixNano()))
-		return buf[:], nil
-	case "time", "timetz":
-		// TIME stores only time-of-day as 8-byte big-endian nanos anchored at epoch.
-		if d.Kind == KindString {
-			ts, err := parseTimeString(d.StringValue())
-			if err != nil {
-				return nil, err
-			}
-			d = NewTimeDatum(ts)
-		}
-		if d.Kind != KindTime {
-			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
-		}
-		var buf [8]byte
-		binary.BigEndian.PutUint64(buf[:], uint64(d.TimeValue().UnixNano()))
-		return buf[:], nil
-	case "oid":
-		// Oid: uint32 (0..4294967295). Negative input is treated as a uint32
-		// wrap-around per PostgreSQL behavior (e.g., -1040 → 4294966256). M0097-0003.
-		var n int64
-		switch d.Kind {
-		case KindInt:
-			n = d.Int
-		case KindString:
-			var err error
-			origStr := d.StringValue() // preserve original for error messages
-			rawStr := strings.TrimSpace(origStr)
-			n, err = strconv.ParseInt(rawStr, 10, 64)
-			if err != nil {
-				numErr, isNumErr := err.(*strconv.NumError)
-				if isNumErr && numErr.Err == strconv.ErrRange {
-					// Value is syntactically valid but overflows int64 → out of range.
-					return nil, &ExecError{Code: "22003",
-						Message: fmt.Sprintf("value %q is out of range for type oid", rawStr)}
-				}
-				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type oid: %q", origStr)}
-			}
-		default:
-			return nil, fmt.Errorf("kind %d cannot encode as oid", d.Kind)
-		}
-		// Wrap negative values: -N → 2^32 + (-N) for -2^32 < -N < 0.
-		if n < 0 {
-			n += 4294967296
-		}
-		if n < 0 || n > 4294967295 {
-			return nil, &ExecError{Code: "22003",
-				Message: fmt.Sprintf("value %d is out of range for type oid", n)}
-		}
-		// Store as 4-byte big-endian uint32 (same as int4). M0097-0003.
-		var buf [4]byte
-		binary.BigEndian.PutUint32(buf[:], uint32(n))
-		return buf[:], nil
-
-	case "uuid":
-		// Uuid accepts standard/brace/no-hyphen formats; normalizes to lowercase
-		// canonical xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx for storage. M0097-0003.
-		var uuidStr string
-		switch d.Kind {
-		case KindString:
-			uuidStr = strings.TrimSpace(d.StringValue())
-			if !isValidUUIDStr(uuidStr) {
-				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type uuid: %q", d.StringValue())}
-			}
-			uuidStr = normalizeUUIDStr(uuidStr)
-		default:
-			return nil, fmt.Errorf("kind %d cannot encode as uuid", d.Kind)
-		}
-		return encodeVarlen([]byte(uuidStr)), nil
-
-	case "name":
-		// The "name" type silently truncates input to NAMEDATALEN-1 = 63 bytes,
-		// matching PostgreSQL's behaviour (postgres/src/include/pg_config_manual.h).
-		// M0097-0003.
-		var s string
-		switch d.Kind {
-		case KindString:
-			s = d.StringValue()
-		case KindBytes:
-			s = string(d.BytesValue())
-		case KindInt:
-			s = fmt.Sprintf("%d", d.Int)
-		default:
-			return nil, fmt.Errorf("kind %d cannot encode as name", d.Kind)
-		}
-		if len(s) > 63 {
-			s = s[:63]
-		}
-		return encodeVarlen([]byte(s)), nil
-
-	case "numeric", "decimal":
-		// NUMERIC values flow on the wire as decimal text in the
-		// same varlen frame VARCHAR uses. KindNumeric formats via
-		// formatNumeric so the stored bytes are stable across
-		// arithmetic chains. KindInt / KindString round-trip
-		// straight through (the analyzer accepts both as
-		// assignable to numeric, e.g. HammerDB's loader sends
-		// pre-formatted strings). See
-		// docs/design/0003-0012-numeric-arithmetic.md.
-		switch d.Kind {
-		case KindNumeric:
-			return encodeVarlen([]byte(numericText(d))), nil
-		case KindInt:
-			return encodeVarlen([]byte(strconv.FormatInt(d.Int, 10))), nil
-		case KindString:
-			return encodeVarlen([]byte(d.StringValue())), nil
-		case KindBytes:
-			return encodeVarlen(d.BytesValue()), nil
-		}
-		return nil, fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
-	default:
-		// Variable-length text-like fallback. NUMERIC datums emit
-		// the canonical decimal text via formatNumeric so a column
-		// with an unrecognised type name still receives a usable
-		// representation (mirrors the dedicated numeric arm above).
-		var s string
-		switch d.Kind {
-		case KindString:
-			s = d.StringValue()
-		case KindBytes:
-			return encodeVarlen(d.BytesValue()), nil
-		case KindInt:
-			// Coerce integer to text-form when the target column is text-like.
-			// This occurs for CTAS `SELECT generate_series(1,10)` where the
-			// column is given a fallback "text" type. M0096-0008.
-			s = fmt.Sprintf("%d", d.Int)
-		case KindNumeric:
-			s = numericText(d)
-		default:
-			return nil, fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
-		}
-		// varchar(N) and char(N) length enforcement. M0097-0003.
-		tname := strings.ToLower(t.Name)
-		if tname == "varchar" || tname == "character varying" {
-			if len(t.Args) > 0 {
-				n := int(t.Args[0])
-				// Strip trailing spaces: PostgreSQL accepts trailing spaces if the
-				// stripped value fits within N (e.g., 'c     ' → 'c' in varchar(1)).
-				stripped := strings.TrimRight(s, " ")
-				if len(stripped) > n {
-					return nil, &ExecError{Code: "22001",
-						Message: fmt.Sprintf("value too long for type character varying(%d)", n)}
-				}
-				s = stripped
-			}
-		} else if tname == "char" || tname == "bpchar" || tname == "character" {
-			// Bare `char` with no length argument defaults to char(1) in PostgreSQL.
-			n := 1
-			if len(t.Args) > 0 {
-				n = int(t.Args[0])
-			}
-
-			stripped := strings.TrimRight(s, " ")
-			if len(stripped) > n {
-				return nil, &ExecError{Code: "22001",
-					Message: fmt.Sprintf("value too long for type character(%d)", n)}
-			}
-			// Store the stripped value; the DataRow output path re-pads to N
-			// for wire protocol display so psql sees N-width char columns.
-			// We do NOT pad in storage to avoid breaking comparison semantics
-			// (compareDatum uses strings.Compare which is padding-sensitive). M0097-0003.
-			s = stripped
-		}
-		return encodeVarlen([]byte(s)), nil
+// parsePgLSN parses a "X/Y" pg_lsn string into a uint64.
+// X and Y are 1–8 hex digits each, no leading spaces allowed.
+// Returns an error with "22P02" code on invalid input.
+func parsePgLSN(s string) (uint64, error) {
+	slash := strings.IndexByte(s, '/')
+	if slash < 1 || slash > 8 {
+		return 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type pg_lsn: %q", s)}
 	}
+	hexHigh := s[:slash]
+	hexLow := s[slash+1:]
+	if len(hexLow) < 1 || len(hexLow) > 8 || len(hexLow)+slash+1 != len(s) {
+		return 0, &ExecError{Code: "22P02",
+			Message: fmt.Sprintf("invalid input syntax for type pg_lsn: %q", s)}
+	}
+	// Validate hex characters only
+	for _, c := range hexHigh + hexLow {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return 0, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type pg_lsn: %q", s)}
+		}
+	}
+	high, _ := strconv.ParseUint(hexHigh, 16, 32)
+	low, _ := strconv.ParseUint(hexLow, 16, 32)
+	return (high << 32) | low, nil
+}
+
+// formatPgLSN formats a uint64 WAL LSN as "X/Y" uppercase hex.
+func formatPgLSN(v uint64) string {
+	return fmt.Sprintf("%X/%X", v>>32, v&0xFFFFFFFF)
 }
 
 // isValidUUIDStr reports whether s is a valid UUID string in any of
@@ -1697,202 +1197,4 @@ func encodeVarlen(b []byte) []byte {
 	binary.BigEndian.PutUint32(out[:4], uint32(len(b)))
 	copy(out[4:], b)
 	return out
-}
-
-func decodeValue(t catalog.Type, data []byte) (Datum, int, error) {
-	switch t.Name {
-	case "int2", "smallint":
-		if len(data) < 2 {
-			return Datum{}, 0, fmt.Errorf("truncated int2")
-		}
-		v := int16(binary.BigEndian.Uint16(data[:2]))
-		return Datum{Kind: KindInt, Int: int64(v)}, 2, nil
-	case "int4", "integer", "int", "serial":
-		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated int4/serial")
-		}
-		v := int32(binary.BigEndian.Uint32(data[:4]))
-		return Datum{Kind: KindInt, Int: int64(v)}, 4, nil
-	case "oid":
-		// oid is uint32 stored as 4-byte big-endian. M0097-0003.
-		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated oid")
-		}
-		v := binary.BigEndian.Uint32(data[:4])
-		return Datum{Kind: KindInt, Int: int64(v)}, 4, nil
-	case "int8", "bigint", "bigserial":
-		if len(data) < 8 {
-			return Datum{}, 0, fmt.Errorf("truncated int8/bigserial")
-		}
-		v := int64(binary.BigEndian.Uint64(data[:8]))
-		return Datum{Kind: KindInt, Int: v}, 8, nil
-	case "bool", "boolean":
-		if len(data) < 1 {
-			return Datum{}, 0, fmt.Errorf("truncated bool")
-		}
-		return NewBoolDatum(data[0] != 0), 1, nil
-	case "timestamp", "timestamptz", "date", "time", "timetz":
-		if len(data) < 8 {
-			return Datum{}, 0, fmt.Errorf("truncated %s", t.Name)
-		}
-		ns := int64(binary.BigEndian.Uint64(data[:8]))
-		return NewTimeDatum(time.Unix(0, ns).UTC()), 8, nil
-	case "float8", "double precision", "double", "float4", "real":
-		// Stored as varlen text. Decode as KindNumeric for proper numeric sort/comparison.
-		// M0097-0003.
-		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated float")
-		}
-		n := int(binary.BigEndian.Uint32(data[:4]))
-		if 4+n > len(data) {
-			return Datum{}, 0, fmt.Errorf("truncated float body")
-		}
-		text := string(data[4 : 4+n])
-		if v, scale, ok := parseNumericFast(text); ok {
-			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, 4 + n, nil
-		}
-		m, s, err := parseNumeric(text)
-		if err == nil {
-			return newNumeric(m, int(s)), 4 + n, nil
-		}
-		// NaN / infinity fall back to string (handled by comparison/display).
-		return NewStringDatum(text), 4 + n, nil
-	case "numeric", "decimal":
-		// Stored as varlen text. Parse into KindNumeric so
-		// arithmetic and comparison can run through the
-		// scale-aligning helpers without re-parsing on every
-		// row. Strings that aren't valid numerics surface as
-		// 22P02 — same SQLSTATE upstream reports.
-		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated numeric")
-		}
-		n := int(binary.BigEndian.Uint32(data[:4]))
-		if 4+n > len(data) {
-			return Datum{}, 0, fmt.Errorf("truncated numeric body")
-		}
-		text := string(data[4 : 4+n])
-		// M0058-0003: int64 fast path for integer-valued NUMERIC.
-		// HammerDB's TPC-H schema stores all integer columns as
-		// NUMERIC; the fast path avoids ~400 ns of big.Int allocation
-		// per column on every row decoded.
-		if v, scale, ok := parseNumericFast(text); ok {
-			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, 4 + n, nil
-		}
-		m, s, err := parseNumeric(text)
-		if err != nil {
-			return Datum{}, 0, fmt.Errorf("decode numeric %q: %w", text, err)
-		}
-		return newNumeric(m, int(s)), 4 + n, nil
-	default:
-		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated varlen header")
-		}
-		n := int(binary.BigEndian.Uint32(data[:4]))
-		if 4+n > len(data) {
-			return Datum{}, 0, fmt.Errorf("truncated varlen body")
-		}
-		return NewStringDatum(string(data[4 : 4+n])), 4 + n, nil
-	}
-}
-
-// decodeValueArena mirrors decodeValue but routes variable-length
-// payload (varchar / char / text / bytea — the `default` switch
-// arm in decodeValue) through arena.Allocate instead of
-// `make([]byte)`. Numeric text remains on the legacy parse path
-// (Datum.Int / Big / Scale), as does every fixed-width type.
-//
-// M0073-0002. The split between decodeValue and decodeValueArena
-// keeps the legacy callers (DecodeRow, DecodeRowProjection, toast
-// resolution, ANALYZE) byte-for-byte unchanged — only the
-// per-page seqScan / per-Rescan indexScan path opts in.
-func decodeValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) (Datum, int, error) {
-	switch t.Name {
-	case "int2", "smallint":
-		if len(data) < 2 {
-			return Datum{}, 0, fmt.Errorf("truncated int2")
-		}
-		v := int16(binary.BigEndian.Uint16(data[:2]))
-		return Datum{Kind: KindInt, Int: int64(v)}, 2, nil
-	case "int4", "integer", "int", "serial":
-		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated int4/serial")
-		}
-		v := int32(binary.BigEndian.Uint32(data[:4]))
-		return Datum{Kind: KindInt, Int: int64(v)}, 4, nil
-	case "oid":
-		// oid is uint32 stored as 4-byte big-endian. M0097-0003.
-		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated oid")
-		}
-		v := binary.BigEndian.Uint32(data[:4])
-		return Datum{Kind: KindInt, Int: int64(v)}, 4, nil
-	case "int8", "bigint", "bigserial":
-		if len(data) < 8 {
-			return Datum{}, 0, fmt.Errorf("truncated int8/bigserial")
-		}
-		v := int64(binary.BigEndian.Uint64(data[:8]))
-		return Datum{Kind: KindInt, Int: v}, 8, nil
-	case "bool", "boolean":
-		if len(data) < 1 {
-			return Datum{}, 0, fmt.Errorf("truncated bool")
-		}
-		return NewBoolDatum(data[0] != 0), 1, nil
-	case "timestamp", "timestamptz", "date", "time", "timetz":
-		if len(data) < 8 {
-			return Datum{}, 0, fmt.Errorf("truncated %s", t.Name)
-		}
-		ns := int64(binary.BigEndian.Uint64(data[:8]))
-		return NewTimeDatum(time.Unix(0, ns).UTC()), 8, nil
-	case "float8", "double precision", "double", "float4", "real":
-		// Same as decodeValue: decode as KindNumeric for proper sort. M0097-0003.
-		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated float")
-		}
-		n := int(binary.BigEndian.Uint32(data[:4]))
-		if 4+n > len(data) {
-			return Datum{}, 0, fmt.Errorf("truncated float body")
-		}
-		text := string(data[4 : 4+n])
-		if v, scale, ok := parseNumericFast(text); ok {
-			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, 4 + n, nil
-		}
-		m, s, err := parseNumeric(text)
-		if err == nil {
-			return newNumeric(m, int(s)), 4 + n, nil
-		}
-		return NewStringDatum(text), 4 + n, nil
-	case "numeric", "decimal":
-		// Numeric stays on the parse path — Datum.Int / Big /
-		// Scale carry the value, no Buf payload to arena.
-		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated numeric")
-		}
-		n := int(binary.BigEndian.Uint32(data[:4]))
-		if 4+n > len(data) {
-			return Datum{}, 0, fmt.Errorf("truncated numeric body")
-		}
-		text := string(data[4 : 4+n])
-		if v, scale, ok := parseNumericFast(text); ok {
-			return Datum{Kind: KindNumeric, Int: v, Scale: scale}, 4 + n, nil
-		}
-		m, s, err := parseNumeric(text)
-		if err != nil {
-			return Datum{}, 0, fmt.Errorf("decode numeric %q: %w", text, err)
-		}
-		return newNumeric(m, int(s)), 4 + n, nil
-	default:
-		// varchar / char / text / bytea: mctx-backed.
-		if len(data) < 4 {
-			return Datum{}, 0, fmt.Errorf("truncated varlen header")
-		}
-		n := int(binary.BigEndian.Uint32(data[:4]))
-		if 4+n > len(data) {
-			return Datum{}, 0, fmt.Errorf("truncated varlen body")
-		}
-		if n == 0 {
-			return Datum{Kind: KindString, ArenaID: sctx.ID()}, 4, nil
-		}
-		moff, mlen := sctx.AllocBytes(data[4 : 4+n])
-		return newStringArenaDatum(sctx, moff, mlen), 4 + n, nil
-	}
 }

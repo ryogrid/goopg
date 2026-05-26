@@ -375,6 +375,8 @@ const (
 	TypeRelationId      uint32 = 1247 // pg_type
 	AttributeRelationId uint32 = 1249 // pg_attribute
 	RelationRelationId  uint32 = 1259 // pg_class
+	IndexRelationId     uint32 = 2610 // pg_index
+	StatisticRelationId uint32 = 2619 // pg_statistic
 )
 
 // FirstUserOID is the first OID handed out for user-created tables.

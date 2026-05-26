@@ -52,6 +52,17 @@ type Options struct {
 	// SlotName is the physical replication slot the standby will
 	// connect against. Defaults to "standby_slot".
 	SlotName string
+	// ApplicationName, when non-empty, is appended to the standby's
+	// primary_conninfo as `application_name=<value>`. The primary
+	// receives this in the walreceiver startup handshake and records
+	// it in pg_stat_replication. Required when the primary must match
+	// the standby by name (e.g. synchronous_standby_names).
+	ApplicationName string
+	// PrimaryExtraConf holds additional postgresql.conf lines appended
+	// to the primary's config after Init but before the first Start.
+	// Use it to set GUCs that must be effective from the first boot,
+	// e.g. synchronous_standby_names for sync-replication tests.
+	PrimaryExtraConf []string
 	// StartupWait / ShutdownWait are forwarded to the underlying
 	// single-cluster harness. Defaults match cluster.Options.
 	StartupWait  time.Duration
@@ -68,8 +79,10 @@ type ReplCluster struct {
 	Primary      *cluster.Cluster
 	Standby      *cluster.Cluster
 	SlotName     string
-	repoRoot     string
-	preCloneHook func(*cluster.Cluster) error
+	repoRoot         string
+	applicationName  string
+	primaryExtraConf []string
+	preCloneHook     func(*cluster.Cluster) error
 }
 
 // New constructs the pair. Both clusters get their own fresh data
@@ -109,11 +122,13 @@ func New(name string, opts Options) (*ReplCluster, error) {
 		return nil, fmt.Errorf("replcluster: standby: %w", err)
 	}
 	return &ReplCluster{
-		Primary:      primary,
-		Standby:      standby,
-		SlotName:     slotName,
-		repoRoot:     opts.RepoRoot,
-		preCloneHook: opts.PreCloneHook,
+		Primary:          primary,
+		Standby:          standby,
+		SlotName:         slotName,
+		repoRoot:         opts.RepoRoot,
+		applicationName:  opts.ApplicationName,
+		primaryExtraConf: opts.PrimaryExtraConf,
+		preCloneHook:     opts.PreCloneHook,
 	}, nil
 }
 
@@ -125,6 +140,11 @@ func (r *ReplCluster) Setup() error {
 	// 1. Init primary; pre-create the slot on its data dir.
 	if err := r.Primary.Init(); err != nil {
 		return fmt.Errorf("replcluster: primary init: %w", err)
+	}
+	for _, line := range r.primaryExtraConf {
+		if err := r.Primary.AppendPostgresqlConf(line); err != nil {
+			return fmt.Errorf("replcluster: primary extra conf %q: %w", line, err)
+		}
 	}
 	slots, err := wal.OpenSlots(r.Primary.DataDir())
 	if err != nil {
@@ -179,7 +199,11 @@ func (r *ReplCluster) Setup() error {
 	if err != nil {
 		return fmt.Errorf("replcluster: parse primary addr: %w", err)
 	}
-	conninfoLine := fmt.Sprintf("primary_conninfo = 'host=%s port=%s'", host, port)
+	conninfo := fmt.Sprintf("host=%s port=%s", host, port)
+	if r.applicationName != "" {
+		conninfo += fmt.Sprintf(" application_name=%s", r.applicationName)
+	}
+	conninfoLine := fmt.Sprintf("primary_conninfo = '%s'", conninfo)
 	slotLine := fmt.Sprintf("primary_slot_name = '%s'", r.SlotName)
 	if err := r.Standby.AppendPostgresqlConf(conninfoLine); err != nil {
 		return fmt.Errorf("replcluster: append conninfo: %w", err)

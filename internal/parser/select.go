@@ -1650,7 +1650,7 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		"float4", "float8", "real",
 		"numeric", "decimal",
 		"text", "varchar", "char", "bpchar",
-		"name", "oid":
+		"name", "oid", "pg_lsn":
 		next := p.peek(1)
 		if next.Kind != TokenStringLit {
 			return nil, false

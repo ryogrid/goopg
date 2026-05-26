@@ -138,6 +138,11 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 			message = "invalid input syntax for type uuid: \"" + v + "\""
 			sqlCode = "22P02"
 		}
+	case "pg_lsn":
+		if _, err := parsePgLSN(v); err != nil {
+			message = "invalid input syntax for type pg_lsn: \"" + v + "\""
+			sqlCode = "22P02"
+		}
 	case "tid":
 		// tid: validate "(block,offset)" via tidin semantics. M0097-0036.
 		if _, _, ok := parseTidInput(v); !ok {

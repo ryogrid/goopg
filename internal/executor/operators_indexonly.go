@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -138,22 +139,69 @@ func (o *indexOnlyScanOp) Close() error {
 }
 
 // decodeRowFromKey extracts covered column values from a B-tree key.
-// Only single-column indexes are fully supported (v0); multi-column returns
-// an error so the caller falls back gracefully.
 func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
-	if len(o.plan.Index.Columns) != 1 || len(o.plan.Covered) != 1 {
-		return nil, fmt.Errorf("index-only scan: multi-column key decode not supported yet")
+	if len(o.plan.Index.Columns) == 1 && len(o.plan.Covered) == 1 {
+		d, err := decodeBTreeKeyToDatum(key, o.plan.Covered[0])
+		if err != nil {
+			return nil, err
+		}
+		return Row{d}, nil
 	}
-	d, err := decodeBTreeKeyToDatum(key, o.plan.Covered[0])
-	if err != nil {
-		return nil, err
+	// Multi-column: decode all key columns in declaration order, then project.
+	decoded := make(map[string]Datum, len(o.plan.Index.Columns))
+	off := 0
+	for _, colName := range o.plan.Index.Columns {
+		col, ok := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
+		if !ok {
+			return nil, fmt.Errorf("IOS: index column %q not in catalog", colName)
+		}
+		d, n, err := decodeIndexKeyColumn(key[off:], *col)
+		if err != nil {
+			return nil, fmt.Errorf("IOS key col %q: %w", colName, err)
+		}
+		decoded[colName] = d
+		off += n
 	}
-	return Row{d}, nil
+	row := make(Row, len(o.plan.Covered))
+	for i, col := range o.plan.Covered {
+		d, ok := decoded[col.Name]
+		if !ok {
+			return nil, fmt.Errorf("IOS: covered column %q not decoded", col.Name)
+		}
+		row[i] = d
+	}
+	return row, nil
+}
+
+// decodeIndexKeyColumn decodes one column from a B-tree key slice and returns
+// the Datum plus the number of bytes consumed. Used by the multi-column path.
+func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
+	typeName := col.Type.Name
+	switch {
+	case isInt4Type(typeName):
+		v, err := btree.DecodeInt4(key)
+		return Datum{Kind: KindInt, Int: int64(v)}, 4, err
+	case isInt8Type(typeName):
+		v, err := btree.DecodeInt8(key)
+		return Datum{Kind: KindInt, Int: v}, 8, err
+	case isFloat8Type(typeName):
+		v, err := btree.DecodeFloat8(key)
+		return NewStringDatum(strconv.FormatFloat(v, 'g', -1, 64)), 8, err
+	case isTimestampType(typeName):
+		v, err := btree.DecodeTimestamp(key)
+		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
+		return NewTimeDatum(ts), 8, err
+	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName):
+		raw, n, err := btree.DecodeVarcharLen(key)
+		return NewStringDatum(string(raw)), n, err
+	default:
+		return NullDatum, 0, fmt.Errorf("IOS: unsupported key type %q", typeName)
+	}
 }
 
 // decodeRowFromHeap projects only the covered columns from a full heap tuple.
 func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
-	fullRow, err := DecodeRow(o.plan.Table.Columns, t.Data)
+	fullRow, err := DecodeHeapTupleRow(o.plan.Table.Columns, t, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +236,14 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 		}
 		return Datum{Kind: KindInt, Int: v}, nil
 
-	case isVarcharType(typeName), isCharType(typeName):
+	case isFloat8Type(typeName):
+		v, err := btree.DecodeFloat8(key)
+		if err != nil {
+			return NullDatum, err
+		}
+		return NewStringDatum(strconv.FormatFloat(v, 'g', -1, 64)), nil
+
+	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName):
 		b, err := btree.DecodeVarchar(key)
 		if err != nil {
 			return NullDatum, err

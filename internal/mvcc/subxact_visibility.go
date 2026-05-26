@@ -145,9 +145,20 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 		}
 		return !isCurrentTxXID(h.Xmax, currentXID, r)
 	}
-	if !SeesCommittedXIDWithSubxacts(snap, h.Xmin, r) {
-		return false
+
+	// M0115-0001: FrozenTransactionID fast path (same as TupleVisible).
+	if h.Xmin != storage.FrozenTransactionID {
+		// M0115-0002: hint-bit read for xmin.
+		if h.Infomask&storage.HeapXminInvalid != 0 {
+			return false
+		}
+		if h.Infomask&storage.HeapXminCommitted == 0 {
+			if !SeesCommittedXIDWithSubxacts(snap, h.Xmin, r) {
+				return false
+			}
+		}
 	}
+
 	if h.Xmax == storage.InvalidTransactionID {
 		return true
 	}
@@ -157,7 +168,22 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 	if isCurrentTxXID(h.Xmax, currentXID, r) {
 		return false
 	}
+	// M0115-0002: hint-bit read for xmax.
+	if h.Infomask&storage.HeapXmaxInvalid != 0 {
+		return true
+	}
+	if h.Infomask&storage.HeapXmaxCommitted != 0 {
+		return false
+	}
 	return !SeesCommittedXIDWithSubxacts(snap, h.Xmax, r)
+}
+
+// IsSelfXID reports whether xid belongs to the current transaction — either
+// the exact currentXID or, when currentXID is a sub-xact, its top-level
+// ancestor. Used by callers that need to skip hint-bit writes for self-visible
+// tuples (which are visible without a snapshot check and may still be rolled back).
+func IsSelfXID(xid, currentXID storage.TransactionID, r SubxactResolver) bool {
+	return isCurrentTxXID(xid, currentXID, r)
 }
 
 // isCurrentTxXID reports whether xid was written by the current transaction.

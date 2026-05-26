@@ -158,7 +158,7 @@ func TestToastByteaRoundTrip(t *testing.T) {
 }
 
 // TestToastPointerCodecRoundTrip verifies that a KindToastPointer datum
-// survives EncodeRow → DecodeRowInto without corruption.
+// survives EncodeRowPG → DecodeRowInto without corruption.
 func TestToastPointerCodecRoundTrip(t *testing.T) {
 	cols := []catalog.Column{
 		{Name: "id", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
@@ -169,9 +169,9 @@ func TestToastPointerCodecRoundTrip(t *testing.T) {
 		{Kind: KindInt, Int: 99},
 		NewToastPointerDatum(ptr),
 	}
-	encoded, err := EncodeRow(cols, row)
+	encoded, err := EncodeRowPG(cols, row)
 	if err != nil {
-		t.Fatalf("EncodeRow: %v", err)
+		t.Fatalf("EncodeRowPG: %v", err)
 	}
 
 	decoded := make(Row, 2)

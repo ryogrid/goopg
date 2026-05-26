@@ -72,6 +72,11 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 			return nil, &ExecError{Code: "XX000", Pos: o.stmt.Pos(), Message: err.Error()}
 		}
 		o.ctx.Catalog.SetTableStats(tbl, stats)
+		// M0112: persist stats to pg_statistic so they survive restart.
+		if werr := persistStatsToPGStatistic(o.ctx, tbl, stats); werr != nil {
+			// Non-fatal: stats are in memory; log and continue.
+			_ = werr
+		}
 	}
 	return nil, EOF
 }
@@ -88,6 +93,35 @@ func (o *analyzeOp) targets() []parser.ObjectName {
 	// Iterate the catalog in some stable order. v0's InMemory
 	// catalog doesn't expose a public iterator, so we don't
 	// support the catalog-wide form yet.
+	return nil
+}
+
+// persistStatsToPGStatistic writes per-column statistics to the pg_statistic
+// heap table (OID 2619) so they survive a server restart (M0112). One row is
+// written per column that has statistics. Existing rows for the same
+// (starelid, staattnum, stainherit) are not deleted first — the heap grows
+// monotonically; startup reads the most recent live tuple. Non-fatal on error.
+func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.TableStats) error {
+	if ctx == nil || ctx.Pool == nil || tbl == nil || stats == nil {
+		return nil
+	}
+	statRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.StatisticRelationId,
+		Fork:   storage.MainFork,
+	}
+	cols := pgStatisticColumnsPG18()
+	for i, cs := range stats.Columns {
+		if i >= len(tbl.Columns) {
+			break
+		}
+		col := tbl.Columns[i]
+		attNum := int16(col.Ordinal + 1)
+		row := buildUserPGStatisticRow(tbl.OID, attNum, cs)
+		if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil {
+			return fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
+		}
+	}
 	return nil
 }
 
@@ -191,24 +225,11 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 			if !mvcc.TupleVisible(t.Header, snap, tx.XID) {
 				continue
 			}
-			// Decode from the tuple header rather than letting DecodeRow
-			// guess the format. A goopg legacy-format tuple (EncodeRow path,
-			// written when canonical WAL logging is off) has no null bitmap
-			// and natts==0; its [flag][big-endian value] body can be
-			// mis-parsed by DecodeRow's PG-first heuristic — e.g. an int4
-			// whose big-endian low byte (0x0f=15, 0x1c=28, …) forms a valid
-			// PG varlena header that consumes exactly to end-of-tuple,
-			// silently yielding a wrong value (id 15/28 → 0). PG-physical
-			// tuples set natts (and may carry a null bitmap), so the header
-			// disambiguates the two formats. M0097-analyze-decode.
+			// Decode the PG-physical tuple body using the header (natts +
+			// null bitmap). Single on-disk row format since M0111-0002.
 			row := make(Row, len(tbl.Columns))
 			natts := int(t.Header.Infomask2 & 0x07FF)
-			var derr error
-			if len(t.Bitmap) == 0 && natts == 0 {
-				derr = decodeGoopgRowIntoMctx(row, tbl.Columns, t.Data, nil)
-			} else {
-				derr = DecodeRowIntoMctxPGTuple(row, tbl.Columns, t.Data, t.Bitmap, natts, nil)
-			}
+			derr := DecodeRowIntoMctxPGTuple(row, tbl.Columns, t.Data, t.Bitmap, natts, nil)
 			if derr != nil {
 				pool.Unpin(slot)
 				return nil, fmt.Errorf("ANALYZE %s slot=%d: %w", tbl.QualifiedName(), s, derr)

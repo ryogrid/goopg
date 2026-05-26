@@ -1514,22 +1514,8 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			// Decode using the format indicated by the tuple header's natts
-			// field (Infomask2 low 11 bits). When natts > 0 the row was
-			// written by writeHeapRowReturning with ctx.LogCanonical != nil
-			// (PG physical layout, EncodeRowPG). When natts == 0 the row
-			// uses the legacy goopg layout (EncodeRow). Using the wrong
-			// decoder on PG-format data can produce plausible-looking
-			// but incorrect Datums (e.g. the 0x02 first byte of a LE int4=2
-			// is misread as a TOAST pointer flag and accidentally passes
-			// the sanity check if numChunks happens to be small).
-			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
-			var decErr error
-			if storedNatts > 0 {
-				decErr = decodePhysicalPGRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
-			} else {
-				decErr = decodeGoopgRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
-			}
+			// Single on-disk row format (PG-physical) since M0111-0002.
+			decErr := decodePhysicalPGRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
 			if decErr != nil {
 				continue
 			}
@@ -1593,28 +1579,6 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
-}
-
-// buildKeepMaskForIndex returns a per-column boolean mask whose
-// `i`-th entry is true iff `tableCols[i]` is referenced by `indexCols`.
-// Used by `DecodeRowProjection` to skip per-column heap allocations
-// for columns the index does not need. (M0054-0005c-followup.)
-// nil entries in indexCols (expression index columns) are skipped.
-func buildKeepMaskForIndex(tableCols []catalog.Column, indexCols []*catalog.Column) []bool {
-	want := make(map[string]struct{}, len(indexCols))
-	for _, ic := range indexCols {
-		if ic == nil {
-			continue // expression column — no catalog column
-		}
-		want[ic.Name] = struct{}{}
-	}
-	keep := make([]bool, len(tableCols))
-	for i := range tableCols {
-		if _, ok := want[tableCols[i].Name]; ok {
-			keep[i] = true
-		}
-	}
-	return keep
 }
 
 func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) error {
@@ -1903,13 +1867,20 @@ func isFloat8Type(name string) bool {
 	}
 }
 
+func isTextType(name string) bool {
+	return strings.ToLower(name) == "text"
+}
+
+func isNameType(name string) bool {
+	return strings.ToLower(name) == "name"
+}
+
 // isSupportedBTreeKeyType lists the column types accepted by
 // createSingleColumnBTreeIndex. int4 is the original v0 path; int8
 // and numeric landed for HammerDB TPC-H compatibility. varchar landed
 // in M0044-0001; char in M0044-0002; timestamp in M0044-0003.
 func isSupportedBTreeKeyType(name string) bool {
-	switch strings.ToLower(name) {
-	case "text", "name":
+	if isTextType(name) || isNameType(name) {
 		return true
 	}
 	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
@@ -2340,10 +2311,10 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	return nil
 }
 
-// syncIndexToCatalogHeap writes a pg_class row for idx. Called by
-// createBTreeIndex after the full index build succeeds. The row layout
-// matches PG18's 34-column pg_class so the index is visible to an attaching
-// PG18 standby (see syncTableToCatalogHeap for context).
+// syncIndexToCatalogHeap writes a pg_class row and a pg_index row for idx.
+// Called by createBTreeIndex after the full index build succeeds. The row
+// layouts match PG18 canonical format so the index is visible to an attaching
+// PG18 standby and is recoverable via heap scan on restart (M0113).
 func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	classRel := storage.RelFileNode{
 		DBOid:  catalog.DefaultDBOid,
@@ -2361,6 +2332,18 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	if err := insertPgClassRelnameNspIndexEntry(ctx, idx.Name, relnamespace, classTID); err != nil {
 		return fmt.Errorf("pg_class_relname_nsp_index for index: %w", err)
 	}
+
+	// M0113: write pg_index row so the index is recoverable from the heap
+	// on restart without relying on goopg-private WAL records.
+	pgIndexRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.IndexRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(idx)); err != nil {
+		return fmt.Errorf("pg_index: %w", err)
+	}
+
 	// M0106-0011: CREATE INDEX (and ALTER TABLE ADD PRIMARY KEY) writes a
 	// pg_class row for the new index relation. Flag the txn so the commit
 	// hook emits RecordKindXactCommitInval and refreshes pg_internal.init;

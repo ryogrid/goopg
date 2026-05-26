@@ -35,8 +35,21 @@ func TupleVisible(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.T
 		}
 		return h.Xmax != currentXID
 	}
-	if !snap.SeesCommittedXID(h.Xmin) {
-		return false
+
+	// M0115-0001: FrozenTransactionID fast path. Frozen tuples are universally
+	// visible; skip all xmin snapshot arithmetic (CPU micro-optimisation only —
+	// SeesCommittedXID would return true anyway via xid < Xmin).
+	if h.Xmin != storage.FrozenTransactionID {
+		// M0115-0002: hint-bit read path — skip SeesCommittedXID when the
+		// result is already cached in t_infomask.
+		if h.Infomask&storage.HeapXminInvalid != 0 {
+			return false
+		}
+		if h.Infomask&storage.HeapXminCommitted == 0 {
+			if !snap.SeesCommittedXID(h.Xmin) {
+				return false
+			}
+		}
 	}
 
 	// No deleting transaction: tuple is visible.
@@ -49,6 +62,13 @@ func TupleVisible(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.T
 	}
 	// Deleted by our own transaction: invisible.
 	if h.Xmax == currentXID {
+		return false
+	}
+	// M0115-0002: hint-bit read for xmax.
+	if h.Infomask&storage.HeapXmaxInvalid != 0 {
+		return true
+	}
+	if h.Infomask&storage.HeapXmaxCommitted != 0 {
 		return false
 	}
 	// Deleted by a transaction visible as committed to the snapshot:

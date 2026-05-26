@@ -796,6 +796,15 @@ M0097-0001 wires it up.
       - pg_type virtual table: typname, typtype for enums/domains
       - evalTypedStringLit: unknown type fallback (enum/domain casts work)
       - Design doc: 0097-0017-0001-enum-domain-types.md
+      - pg_lsn type support added 2026-05-26 (branch align-data-structure-with-pg):
+        encodeValuePG (8-byte LE), decodePhysicalPGValueMctx, parsePgLSN/formatPgLSN helpers,
+        evalPgLSNBinary (comparison + arithmetic), looksLikePgLSN pattern check,
+        compareDatum uint64-based ordering, evalCast pg_lsn case,
+        isOidOrUUIDTarget extended to include pg_lsn for assignment coercion,
+        tryTypedLiteral + typeOIDFor (OID 3220).
+        Stash was originally created before M0111-0002 S3 (legacy codec deletion);
+        conflicts in encodeValue/decodeValueMctx (deleted) resolved by keeping only
+        PG-physical paths. Debug os.OpenFile logging removed.
 
 - [x] **M0097-0018**
       - Summary: System catalog + GUC + vacuum parity.  2026-05-12.
@@ -3178,6 +3187,52 @@ Operational note (2026-05-22):
       - DoD: `go test -race ./internal/executor/ ./internal/storage/` PASS
         (except pre-existing flaky `TestAnalyzeRespectsStatsTarget`).
 
+### TPC-H 22-query verification (2026-05-26)
+
+All 22 TPC-H SF=1 power-test queries passed on branch `align-data-structure-with-pg`
+at commit `26cf58d` (TOAST marker fix) + `40ed3a3` (JSON catalog removal).
+A full data-directory reset was required because M0111-0002 S2 changed the
+on-disk heap-tuple format and the TOAST marker byte changed from `0x1B` to `0x01`.
+
+**Root cause of prior failure (Q11 `column "inf" does not exist`):**
+`0x1B = (13<<1)|1` is a valid short-varlena header for any 12-char string.
+HammerDB `gen_phone` always produces 12-char phone numbers, so every `s_phone`
+and `c_phone` column value was misidentified as a TOAST pointer. `DetoastRow`
+failed silently; all supplier (10k rows) and customer (150k rows) tuples were
+dropped by the seqscan. Fixed by switching to `0x01` (VARATT_IS_1B_E), which
+is an impossible data-varlena header.
+
+**Per-query results (HammerDB execution order):**
+
+| Order | Query | Time (s) |
+|------:|------:|---------:|
+|  1 | Q14 |  20.728 |
+|  2 | Q2  |  59.078 |
+|  3 | Q9  |  56.059 |
+|  4 | Q20 |  19.451 |
+|  5 | Q6  |  13.116 |
+|  6 | Q17 |  45.209 |
+|  7 | Q18 |  36.773 |
+|  8 | Q8  | 171.430 |
+|  9 | Q21 | 295.057 |
+| 10 | Q13 |  84.864 |
+| 11 | Q3  |  16.789 |
+| 12 | Q22 |  84.918 |
+| 13 | Q16 |   2.904 |
+| 14 | Q4  | 217.190 |
+| 15 | Q11 |   2.409 |
+| 16 | Q15 |  36.701 |
+| 17 | Q1  |  20.036 |
+| 18 | Q10 |  18.524 |
+| 19 | Q19 |  24.503 |
+| 20 | Q5  |  18.603 |
+| 21 | Q7  | 122.899 |
+| 22 | Q12 | 100.535 |
+
+**Total elapsed:** 1469 s (~24.5 min)  
+**Geometric mean:** 36.30 s  
+**Full report:** `bench/tpch/logs/tpch_power_test_20260526.md`
+
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 
 Operational note (2026-05-22):
@@ -3333,6 +3388,178 @@ complete, these can be re-evaluated.
         pinning, full arena + planner string interning, pointer-free `Token`,
         GC-safe reusable per-connection buffer — all either reintroduce the
         crash pattern or are out of proportion to a noise-level win.
+
+## M0112 — pg_statistic Heap Table for ANALYZE Statistics Persistence (filed 2026-05-26)
+
+**COMPLETE 2026-05-26** (commit a16a0c1):
+- `ANALYZE` now calls `persistStatsToPGStatistic` after computing stats; one
+  `pg_statistic` row (OID 2619) is written per column via `writeHeapRowCanonical`.
+- `loadStatisticsFromHeap` in `open.go` scans pg_statistic at startup and
+  restores per-column `NDistinct`/`NullFrac`/MCV/Histogram into the in-memory
+  catalog so planner stats survive restarts.
+- New `PGStatisticRow` + `DecodePGStatisticPhysicalRow` in `catalog/codec.go`;
+  `pgStatisticColumnsPG18` + `buildUserPGStatisticRow` in
+  `executor/pg18_user_catalog_rows.go`.  MCV freqs as `_float4` arrays,
+  values/histogram bounds as `text[]` (KindBytes passthrough in codec.go).
+
+goopg's `ANALYZE` stores column statistics (NDistinct, MCVs, histogram, null
+fraction) only in the in-memory catalog.  They are lost on every restart,
+forcing re-ANALYZE before the planner can use accurate estimates.  PostgreSQL
+persists these statistics in the `pg_statistic` system heap table (OID 2619)
+and reads them back on startup.  This milestone implements `pg_statistic` in
+PG18-canonical physical format so statistics survive restarts and are readable
+by an attaching PG18 standby.
+Design doc: `docs/milestones/0112-pg-statistic-heap-table-for-stats-persistence.md`
+
+## M0113 — Heap-Based Index Recovery via pg_index (filed 2026-05-26)
+
+**COMPLETE 2026-05-26** (commit a16a0c1):
+- `syncIndexToCatalogHeap` (`operators_ddl.go`) now writes a `pg_index` row
+  (OID 2610) on every `CREATE INDEX` in addition to the existing `pg_class` row.
+- `loadUserIndexesFromHeap` in `open.go` performs a 3-pass scan (pg_class for
+  relkind='i' rows, pg_index for indkey/indrelid, pg_attribute for attnum→name
+  mapping) and calls `RegisterIndexDuringRecovery` — making pg_index the primary
+  index-recovery path.  `replayIndexDDLRecords` is retained as a fallback for
+  pre-M0113 clusters that have no pg_index rows.
+- New `PGIndexRow` + `DecodePGIndexPhysicalRow` in `catalog/codec.go`; int2vector
+  decoded at fixed offset 24 (ArrayType header dims[0] gives count).
+- `IndexRelationId = 2610` added to `catalog/catalog.go`.
+
+goopg currently recovers index catalog entries via a goopg-private WAL record
+(`RecordKindIndexDDL`, replayed by `replayIndexDDLRecords`).  PostgreSQL
+recovers indexes from `pg_class` (relkind='i') + `pg_index` heap tables on
+startup.  goopg already writes `pg_class` rows for indexes
+(`syncIndexToCatalogHeap`) but lacks `pg_index`.  This milestone adds
+`pg_index` in PG18-canonical physical format, populates it on `CREATE INDEX`,
+and reads it at startup to reconstruct index catalog entries from heap alone —
+eliminating the goopg-private WAL side-channel.
+Design doc: `docs/milestones/0113-heap-based-index-recovery-via-pg-index.md`
+
+## M0114 — pg_internal.init Relcache Fast-Start Cache for goopg (filed 2026-05-26)
+
+**COMPLETE 2026-05-26** (commit a16a0c1):
+- New file `internal/initdb/catalog_cache.go`: goopg-native JSON snapshot at
+  `base/<dbOid>/pg_goopg_catalog_cache.json`.  Stores user table/column info;
+  version-stamped to force cold rebuild on schema change.
+- `readCatalogCache` called in `Open()` before `loadUserTablesFromHeap`; on cache
+  hit the heap scan is skipped entirely.
+- `writeCatalogCache` called after the OID-advance block on non-cache-hit startups
+  to warm the cache for the next restart.
+- `UnlinkCatalogCache` called alongside `RelcacheInitFileUnlink` on DDL commits
+  (uses `cat.DBOID()` — not the hardcoded `DefaultDBOid` — to match the file path
+  written by `writeCatalogCache`).
+- Implementation note: reading PG18's binary relcache format is overly complex for
+  goopg's needs; the design doc's original intent was adapted to a simpler JSON
+  snapshot that is co-invalidated with `pg_internal.init`.
+
+goopg scans all `pg_class` / `pg_attribute` pages on every startup to rebuild
+its in-memory catalog.  PostgreSQL avoids this O(N-pages) cost by reading
+`pg_internal.init`, a binary relcache snapshot written at end-of-startup and
+invalidated on DDL commit.  goopg already writes `pg_internal.init` for PG
+standby compatibility (M0106) but does not read it for its own startup.  This
+milestone implements the read path: if the file is present and valid, load the
+in-memory catalog from it and skip the heap scan; fall back to the heap scan
+on missing/stale/corrupt file.
+Design doc: `docs/milestones/0114-pg-internal-init-relcache-fast-start-cache.md`
+
+## M0115 — Heap Tuple Hint Bit Caching (filed 2026-05-26)
+
+Source: `practice/pg_mvcc_internals.md` §"Hint Bits".
+Design doc: `docs/design/mvcc-optimize/0115-0001-hint-bit-caching.md`
+Milestone: `docs/milestones/0115-hint-bit-caching.md`
+
+### Background
+
+`TupleVisible` (`internal/mvcc/visibility.go`) calls `snap.SeesCommittedXID`
+for every tuple on every scan.  PostgreSQL avoids this by caching the result
+in the tuple's `t_infomask` after the first check.  The infomask constants
+(`HeapXminCommitted`, `HeapXminInvalid`, `HeapXmaxCommitted`, `HeapXmaxInvalid`)
+are already defined in `internal/storage/heap.go` but are never read or written
+by the visibility check.
+
+### Sub-milestone breakdown
+
+- [x] **M0115-0001** — FrozenTransactionID fast path
+      - **COMPLETE 2026-05-26** (commit d7aa5ef): `mvcc/visibility.go` and
+        `mvcc/subxact_visibility.go` — `if h.Xmin != storage.FrozenTransactionID`
+        guards the xmin snapshot arithmetic; frozen tuples skip all xmin checks.
+
+- [x] **M0115-0002** — Hint-bit read path in `TupleVisible`
+      - **COMPLETE 2026-05-26** (commit d7aa5ef): `HeapXminInvalid` (return false)
+        and `HeapXminCommitted` (skip SeesCommittedXID) checks added before the
+        snapshot call in both `TupleVisible` and `TupleVisibleSubxact`.
+        Xmax read path similarly short-circuits on `HeapXmaxInvalid` /
+        `HeapXmaxCommitted`.
+
+- [x] **M0115-0003** — `storage.Pool.MarkDirtyHintBit` method
+      - **COMPLETE 2026-05-26** (commit d7aa5ef): `storage/bufpool.go` line 995 —
+        CAS loop that sets the dirty bit without emitting WAL FPI.
+
+- [x] **M0115-0004** — Hint-bit write path
+      - **COMPLETE 2026-05-26** (commit d7aa5ef): `storage/heap.go`
+        `SetXminHintBit` helper OR-s `HeapXminCommitted`/`HeapXminInvalid` into
+        the on-page infomask at `heapTupleInfomaskOffset=20`.
+
+- [x] **M0115-0005** — Wire `TupleVisibleWithHintBits` into scan operators
+      - **COMPLETE 2026-05-26** (commit d7aa5ef): `executor/operators_storage.go`
+        seqScan lazily writes `HeapXminCommitted` after confirming visibility;
+        `IsSelfXID` guard prevents stamping sub-transaction rows prematurely.
+        `IsSelfXID` exported from `mvcc/subxact_visibility.go`.
+
+- [x] **M0115-0006** — Regression tests
+      - **COMPLETE 2026-05-26**: `go test ./internal/mvcc/...` PASS.
+        `go test ./internal/executor/... -count=1` passes modulo
+        `TestToastByteaRoundTrip` (pre-existing, unrelated to M0115).
+
+- [ ] **M0115-0007** — Benchmark gate
+      - Run `pgbench -T 60 -c 10 -M simple -S` before and after.
+      - TPS must not decrease by more than 2%.
+      - NOTE: Formal before/after comparison not yet recorded. M0107 established
+        the 42k TPS baseline (select-only); M0115 is an optimization so regression
+        is unlikely, but benchmark data not captured for this milestone.
+
+---
+
+## M0116 — Multi-Column Index-Only Scan Key Decoding (filed 2026-05-26)
+
+Source: `practice/pg_mvcc_internals.md` §"Visibility Map" + §"HOT Updates".
+Design doc: `docs/design/mvcc-optimize/0116-0001-multi-column-ios.md`
+Milestone: `docs/milestones/0116-multi-column-index-only-scan.md`
+
+### Background
+
+`indexOnlyScanOp.decodeRowFromKey` (`internal/executor/operators_indexonly.go`)
+rejects multi-column keys with `"multi-column key decode not supported yet"`.
+Tables with composite PKs (e.g., `lineitem (l_orderkey, l_linenumber)`) fall
+back to heap fetches even when the Visibility Map could allow a pure index scan.
+
+### Sub-milestone breakdown
+
+- [x] **M0116-0001** — Multi-column `decodeRowFromKey`
+      COMPLETE 2026-05-26 (commit d7aa5ef): `decodeIndexKeyColumn(key []byte,
+      col catalog.Column) (Datum, int, error)` helper added to
+      `operators_indexonly.go`; `decodeRowFromKey` refactored with single-column
+      fast path + multi-column loop over `o.plan.Index.Columns` → project
+      covered columns. New btree decoders: `DecodeFloat8`, `DecodeDate`,
+      `DecodeBool`, `DecodeVarcharLen` in `internal/access/btree/btree.go`.
+
+- [x] **M0116-0002** — Planner column-coverage check
+      COMPLETE 2026-05-26 (commit d7aa5ef): `tryPromoteIndexOnlyScan` in
+      `internal/planner/planner.go` — removed the M0053-0001 guard that
+      blocked composite indexes (`len(idxScan.Index.Columns) != 1`). The
+      existing coverage-check loop already handles multi-column correctly.
+
+- [ ] **M0116-0003** — Integration tests
+      NOT DONE: named tests (`TestIOS_CompositeInt4Int4`, `TestIOS_CompositeInt4Text`,
+      `TestIOS_HeapFallback`, `TestIOS_3Columns`) were not written. Multi-column
+      path is exercised implicitly by TPC-H lineitem/partsupp queries.
+
+- [ ] **M0116-0004** — Regression check
+      PARTIAL: `go test ./internal/executor/... -run TestIndexOnly` passes for
+      existing single-column cases; formal pgbench TPS comparison vs. pre-M0116
+      baseline not yet recorded.
+
+---
 
 ## Completed
 

@@ -1,7 +1,6 @@
 package initdb
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -9,14 +8,12 @@ import (
 )
 
 // TestCreateIndexSurvivesRestartViaWAL pins the M0079-0001
-// recovery path: after CREATE INDEX, even if the JSON catalog
-// snapshot is deleted (simulating a crash before SaveCatalog),
+// recovery path: after CREATE INDEX (no SaveCatalog),
 // the index is recovered from the WAL on the next Open.
 //
 // Flow:
 //  1. Init + Open + CREATE TABLE + CREATE INDEX + Close (no SaveCatalog)
-//  2. Re-Open: JSON absent → loadCatalogSnapshot is a no-op
-//             heap scan → loadUserTablesFromHeap finds the table
+//  2. Re-Open: heap scan → loadUserTablesFromHeap finds the table
 //             WAL replay → replayIndexDDLRecords finds the CREATE INDEX
 //  3. Assert the index is in the catalog with correct metadata
 //
@@ -38,19 +35,12 @@ func TestCreateIndexSurvivesRestartViaWAL(t *testing.T) {
 	}
 	runDDL(t, rt1, "CREATE TABLE accts (aid int4 NOT NULL, abalance int4)")
 	runDDL(t, rt1, "CREATE UNIQUE INDEX accts_pkey ON accts (aid)")
-	// Note: NO SaveCatalog call here — that's the bug we're
-	// recovering from.
+	// Note: NO SaveCatalog call here — simulating a crash.
 	if err := rt1.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Phase 2: confirm JSON snapshot is missing or out of date.
-	// Either way Open's recovery path should reconstruct the
-	// index from WAL.
-	jsonPath := filepath.Join(dir, CatalogSnapshotFile)
-	_ = os.Remove(jsonPath) // OK if it didn't exist
-
-	// Phase 3: Re-Open — index must be recovered from WAL.
+	// Phase 2: Re-Open — index must be recovered from WAL.
 	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
 	if err != nil {
 		t.Fatal(err)
@@ -100,8 +90,6 @@ func TestDropIndexSurvivesRestartViaWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_ = os.Remove(filepath.Join(dir, CatalogSnapshotFile))
-
 	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +126,6 @@ func TestCreateIndexRecoveredOIDDoesNotCollide(t *testing.T) {
 	if err := rt1.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_ = os.Remove(filepath.Join(dir, CatalogSnapshotFile))
 
 	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
 	if err != nil {

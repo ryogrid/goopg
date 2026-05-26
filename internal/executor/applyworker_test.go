@@ -35,7 +35,7 @@ func TestApplyWorkerInsertsRowFromPgoutputStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := encodeBodyV0([]any{7, "alpha"}, []string{"int4", "text"})
-	tuple := wrapAsHeapTuple(t, body)
+	tuple := wrapAsHeapTuple(t, body, 2)
 	if err := po.Change(wal.Change{
 		Kind:     wal.ChangeInsert,
 		Rel:      pubCat.RelFileNode(pubTbl),
@@ -116,7 +116,6 @@ func TestApplyWorkerInsertsRowFromPgoutputStream(t *testing.T) {
 		t.Errorf("col[1]=%q want alpha", rows[0][1].StringValue())
 	}
 }
-
 
 // TestPrimaryKeyOnlyRow pins the partial-key helper that applyUpdate
 // falls back on when pgoutput omits OldTuple (REPLICA IDENTITY DEFAULT
@@ -306,7 +305,6 @@ func TestApplyWorkerDecodeReturnsUnchangedMask(t *testing.T) {
 	}
 }
 
-
 // TestApplyWorkerDecodeRemapsReorderedColumns pins M0103-0007 rung 10:
 // when publisher and subscriber declare the same columns in a different
 // physical order, decodePgoutputTupleAsRow must look up local positions
@@ -369,7 +367,6 @@ func TestApplyWorkerDecodeRejectsUnmatchedRemoteCol(t *testing.T) {
 		t.Errorf("error %q must mention the unmatched col name", err.Error())
 	}
 }
-
 
 // TestApplyWorkerDecodeMarksSubscriberExtraAsMissing pins M0103-0007 rung 11:
 // when the subscriber declares a column the publisher does not include in its
@@ -593,7 +590,6 @@ func TestApplyWorkerInsertRejectsUnchangedToast(t *testing.T) {
 	}
 }
 
-
 // TestApplyWorkerTruncate pins M0103-0007 rung 9: the apply worker
 // handles pgoutput 'T' (TRUNCATE) frames by stamping xmax on every
 // visible tuple in each named relation, transactional with the
@@ -756,41 +752,48 @@ func TestApplyWorkerInsertWithoutRelationFails(t *testing.T) {
 // embed in HeapInsert tuples. Duplicated here from
 // internal/wal/pgoutput_test.go because Go-test packages can't
 // share helpers across packages.
+// PG-physical column-data body (M0111-0002: single on-disk format).
+// Non-NULL int4/int8/text, alignment mirroring executor.physicalPGTypeAlign
+// (int4/text=4, int8=8); pair with wrapAsHeapTuple to stamp natts.
 func encodeBodyV0(values []any, types []string) []byte {
 	var out []byte
-	for i, v := range values {
-		if v == nil {
-			out = append(out, 1)
-			continue
+	alignTo := func(a int) {
+		for len(out)%a != 0 {
+			out = append(out, 0)
 		}
-		out = append(out, 0)
+	}
+	for i, v := range values {
 		switch types[i] {
 		case "int4":
+			alignTo(4)
 			var tmp [4]byte
-			binary.BigEndian.PutUint32(tmp[:], uint32(int32(v.(int))))
+			binary.LittleEndian.PutUint32(tmp[:], uint32(int32(v.(int))))
 			out = append(out, tmp[:]...)
 		case "int8":
+			alignTo(8)
 			var tmp [8]byte
-			binary.BigEndian.PutUint64(tmp[:], uint64(v.(int64)))
+			binary.LittleEndian.PutUint64(tmp[:], uint64(v.(int64)))
 			out = append(out, tmp[:]...)
 		case "text":
+			alignTo(4)
 			s := v.(string)
-			var ln [4]byte
-			binary.BigEndian.PutUint32(ln[:], uint32(len(s)))
-			out = append(out, ln[:]...)
+			total := len(s) + 1 // PG short varlena: header byte included in len
+			out = append(out, byte((total<<1)|0x01))
 			out = append(out, []byte(s)...)
 		}
 	}
 	return out
 }
 
-func wrapAsHeapTuple(t *testing.T, body []byte) []byte {
+func wrapAsHeapTuple(t *testing.T, body []byte, natts int) []byte {
 	t.Helper()
-	tup, err := storage.NewHeapTuple(42, 0, body).MarshalBinary()
+	tup := storage.NewHeapTuple(42, 0, body)
+	tup.Header.SetNatts(natts)
+	raw, err := tup.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return tup
+	return raw
 }
 
 // pgoutputMessageLength is the test-side helper to chunk the
@@ -862,7 +865,7 @@ func pgoutputBIRC(t *testing.T, snap *wal.CatalogSnapshot, rel storage.RelFileNo
 		t.Fatal(err)
 	}
 	body := encodeBodyV0([]any{id, label}, []string{"int4", "text"})
-	tuple := wrapAsHeapTuple(t, body)
+	tuple := wrapAsHeapTuple(t, body, 2)
 	if err := po.Change(wal.Change{
 		Kind:     wal.ChangeInsert,
 		Rel:      rel,

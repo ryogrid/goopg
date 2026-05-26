@@ -3,6 +3,7 @@ package testport
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"testing"
@@ -144,16 +145,19 @@ func TestE2E_LogicalReplication(t *testing.T) {
 		return emitMsg(t, func(po *wal.PgOutput) error { return po.Change(c) })
 	}
 
-	// makeTuple encodes a row as a v0 heap-tuple byte slice suitable
-	// for OldTuple / NewTuple in a wal.Change.
+	// makeTuple encodes a row as a PG-physical heap-tuple byte slice
+	// for OldTuple / NewTuple in a wal.Change. SetNatts must be called
+	// so encodePgoTuplePhysical knows how many columns to decode.
 	makeTuple := func(t *testing.T, id int, val string) []byte {
 		t.Helper()
 		body := logicalRepEncodeBody([]any{id, val}, []string{"int4", "text"})
-		tup, err := storage.NewHeapTuple(1, 0, body).MarshalBinary()
+		ht := storage.NewHeapTuple(1, 0, body)
+		ht.Header.SetNatts(2)
+		raw, err := ht.MarshalBinary()
 		if err != nil {
 			t.Fatal(err)
 		}
-		return tup
+		return raw
 	}
 
 	// driveXact wraps changes in Begin → changes → Commit, applying each
@@ -266,28 +270,142 @@ func TestE2E_LogicalReplication(t *testing.T) {
 	}
 }
 
-// logicalRepEncodeBody encodes values in the v0 executor codec format
-// (null-flag then big-endian value bytes) for use in logical replication
-// test helpers. Mirrors the encoder in internal/executor/codec.go.
+// TestE2E_PhysicalReplicationSync verifies synchronous streaming replication
+// between two goopg nodes. After the standby connects, the primary is
+// configured with synchronous_standby_names so that a subsequent INSERT
+// with synchronous_commit='remote_apply' blocks until the standby has
+// applied the WAL. The row must be visible on the standby immediately after
+// the INSERT returns.
+func TestE2E_PhysicalReplicationSync(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping replication test in short mode")
+	}
+
+	const appName = "goopg_sync_standby"
+	baseDir := t.TempDir()
+	rc, err := replcluster.New("e2e_phys_sync", replcluster.Options{
+		RepoRoot:        repoRoot(t),
+		BaseDir:         baseDir,
+		SlotName:        "e2e_phys_sync_slot",
+		ApplicationName: appName,
+		// Set before first primary boot so it is effective from startup.
+		PrimaryExtraConf: []string{
+			"synchronous_standby_names = '" + appName + "'",
+		},
+		StartupWait:  30 * time.Second,
+		ShutdownWait: 10 * time.Second,
+		PreCloneHook: func(primary *cluster.Cluster) error {
+			_, err := primary.Query(context.Background(), "CREATE TABLE sync_t (id int)")
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rc.Setup(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rc.Stop() }()
+
+	// Wait for the standby to be registered as 'sync' in pg_stat_replication.
+	syncQuery := fmt.Sprintf(
+		"SELECT sync_state FROM pg_stat_replication WHERE application_name = '%s'",
+		appName)
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, err := rc.Primary.Query(context.Background(), syncQuery)
+		if err == nil && len(rows) > 0 && rows[0][0] == "sync" {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	// Verify sync state was achieved; if not, the INSERT below will still
+	// exercise the path (the standby may just be 'potential').
+	rows, _ := rc.Primary.Query(context.Background(), syncQuery)
+	if len(rows) == 0 || rows[0][0] != "sync" {
+		t.Fatalf("standby did not reach sync_state='sync' within 20s (got %v)", rows)
+	}
+
+	// INSERT with synchronous_commit='remote_apply' on a persistent connection
+	// so the SET persists for the duration of the INSERT.
+	host, port, err := netSplitHostPort(rc.Primary.ListenAddr())
+	if err != nil {
+		t.Fatalf("split primary addr: %v", err)
+	}
+	dsn := fmt.Sprintf("host=%s port=%s user=%s dbname=%s sslmode=disable",
+		host, port, "postgres", "postgres")
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("db.Conn: %v", err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := conn.ExecContext(ctx, "SET synchronous_commit = 'remote_apply'"); err != nil {
+		t.Fatalf("SET synchronous_commit: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "INSERT INTO sync_t VALUES (99)"); err != nil {
+		t.Fatalf("sync INSERT: %v", err)
+	}
+	// sync_commit='remote_apply' guarantees the standby applied the WAL before
+	// the INSERT returned, so the row must be immediately visible.
+	standbyRows, err := rc.Standby.Query(context.Background(),
+		"SELECT id FROM sync_t WHERE id = 99")
+	if err != nil {
+		t.Fatalf("standby query: %v", err)
+	}
+	if len(standbyRows) == 0 || standbyRows[0][0] != "99" {
+		t.Fatalf("standby did not have sync row immediately: rows=%v", standbyRows)
+	}
+}
+
+// logicalRepEncodeBody encodes values in PG-physical format for use in
+// logical replication test helpers. Mirrors executor.encodeRowPG: no
+// null-flag bytes, PG alignment, little-endian fixed-width values, and
+// varlena headers for text. NULL values are skipped (no bytes emitted),
+// matching the behaviour of encodeRowPG. The caller must stamp the natts
+// into the HeapTuple's Infomask2 so the pgoutput encoder can walk columns.
 func logicalRepEncodeBody(values []any, types []string) []byte {
 	var out []byte
+	off := 0
+	pad := func(align int) {
+		for off%align != 0 {
+			out = append(out, 0)
+			off++
+		}
+	}
 	for i, v := range values {
 		if v == nil {
-			out = append(out, 1)
-			continue
+			continue // NULL: no bytes, bitmap handled at tuple level
 		}
-		out = append(out, 0)
 		switch types[i] {
 		case "int4":
+			pad(4)
 			var tmp [4]byte
-			binary.BigEndian.PutUint32(tmp[:], uint32(int32(v.(int))))
+			binary.LittleEndian.PutUint32(tmp[:], uint32(int32(v.(int))))
 			out = append(out, tmp[:]...)
+			off += 4
 		case "text":
+			pad(4) // varlena is int-aligned in PG
 			s := v.(string)
-			var ln [4]byte
-			binary.BigEndian.PutUint32(ln[:], uint32(len(s)))
-			out = append(out, ln[:]...)
-			out = append(out, []byte(s)...)
+			total := len(s) + 1 // 1-byte short header
+			if total <= 127 {
+				out = append(out, byte(total<<1)|1)
+				out = append(out, []byte(s)...)
+				off += total
+			} else {
+				total = len(s) + 4 // 4-byte header
+				var hdr [4]byte
+				binary.LittleEndian.PutUint32(hdr[:], uint32(total)<<2)
+				out = append(out, hdr[:]...)
+				out = append(out, []byte(s)...)
+				off += total
+			}
 		}
 	}
 	return out

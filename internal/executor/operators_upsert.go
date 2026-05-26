@@ -439,7 +439,7 @@ func (o *upsertOp) probeArbiterByKey(rel storage.RelFileNode, cols []catalog.Col
 					hotBuf.RUnlock()
 					o.ctx.Pool.Unpin(hotBuf)
 					if liveFound && isLiveForUniqueCheck(o.ctx, liveTuple.Header.Xmin, liveTuple.Header.Xmax) {
-						row, rerr := DecodeRow(cols, liveTuple.Data)
+						row, rerr := DecodeHeapTupleRow(cols, liveTuple, nil)
 						if rerr == nil {
 							foundPtr = storage.ItemPointer{Block: ptr.Block, Offset: liveSlot}
 							foundRow = row
@@ -451,7 +451,7 @@ func (o *upsertOp) probeArbiterByKey(rel storage.RelFileNode, cols []catalog.Col
 			}
 			return true, nil
 		}
-		row, err := DecodeRow(cols, tuple.Data)
+		row, err := DecodeHeapTupleRow(cols, tuple, nil)
 		if err != nil {
 			return false, err
 		}

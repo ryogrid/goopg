@@ -17,7 +17,7 @@ func TestEncodeDecodeNumericRoundTrip(t *testing.T) {
 	}
 	// Integer datum (`INSERT INTO t (n) VALUES (42)`).
 	row := Row{{Kind: KindInt, Int: 42}}
-	bytes, err := EncodeRow(cols, row)
+	bytes, err := EncodeRowPG(cols, row)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestEncodeDecodeNumericRoundTrip(t *testing.T) {
 
 	// String values with decimals (e.g. HammerDB loader).
 	rowStr := Row{NewStringDatum("1234567890.12345")}
-	bytes2, err := EncodeRow(cols, rowStr)
+	bytes2, err := EncodeRowPG(cols, rowStr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestEncodeDecodeNumericRoundTrip(t *testing.T) {
 	// KindNumeric datums (output of NUMERIC arithmetic) format
 	// back to their canonical decimal-text form.
 	rowNum := Row{{Kind: KindNumeric, Int: -12345, Scale: 3}}
-	bytes3, err := EncodeRow(cols, rowNum)
+	bytes3, err := EncodeRowPG(cols, rowNum)
 	if err != nil {
 		t.Fatal(err)
 	}

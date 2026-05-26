@@ -17,8 +17,8 @@ func TestSeqScanReadsPostgresPhysicalTuple(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)
 	}
-	defer pool.Close()
 	defer mgr.Close()
+	defer pool.Close()
 
 	cat := catalog.NewInMemory()
 	tbl, err := cat.CreateTable(parser.ObjectName{Schema: "public", Name: "bench_log"}, []catalog.Column{
@@ -33,8 +33,14 @@ func TestSeqScanReadsPostgresPhysicalTuple(t *testing.T) {
 	if err := storage.InitPage(page); err != nil {
 		t.Fatalf("InitPage: %v", err)
 	}
-	rawTuple, err := storage.NewHeapTuple(storage.FrozenTransactionID, storage.InvalidTransactionID,
-		encodePhysicalBenchLogRow(-999, "bootstrap")).MarshalBinary()
+	// A real PostgreSQL physical tuple records its attribute count in
+	// t_infomask2 (HeapTupleHeaderSetNatts). Set it so the header-driven
+	// decoder recognises this as PG-physical rather than goopg-legacy
+	// (M0111-0002: natts>0 || bitmap!=nil ⇒ PG-physical).
+	physTup := storage.NewHeapTuple(storage.FrozenTransactionID, storage.InvalidTransactionID,
+		encodePhysicalBenchLogRow(-999, "bootstrap"))
+	physTup.Header.SetNatts(len(tbl.Columns))
+	rawTuple, err := physTup.MarshalBinary()
 	if err != nil {
 		t.Fatalf("MarshalBinary: %v", err)
 	}
