@@ -36,7 +36,7 @@ drop_if_exists,130,failed
 advisory_lock,142,failed
 case,146,failed
 uuid,169,failed
-select_distinct_on,182,failed
+select_distinct_on,170,failed
 partition_info,185,failed
 timetz,209,failed
 pg_lsn,21,failed

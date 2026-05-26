@@ -284,7 +284,7 @@ M0097-0001 wires it up.
       - Reason for keeping checked: these are explicit scope/design exclusions,
         not unfinished parity items.
 
-- [ ] **M0097-0003**
+- [x] **M0097-0003**
       - Summary: Core standalone + scalar type parity. (partial 2026-05-12)
       - Multiple fixes landed:
         - 1. Double-ReadyForQuery: `errQueryErrorSent` sentinel fixes duplicate RFQ.
@@ -805,6 +805,14 @@ M0097-0001 wires it up.
         Stash was originally created before M0111-0002 S3 (legacy codec deletion);
         conflicts in encodeValue/decodeValueMctx (deleted) resolved by keeping only
         PG-physical paths. Debug os.OpenFile logging removed.
+      - pg_lsn arithmetic completed 2026-05-26 (commit 8adc309):
+        evalFastExpr fast-path pg_lsn detection (exprnode.go); pgLSNParseDelta
+        refactored to (uint64, isNeg, isNaN, ok) for correct uint64 overflow;
+        TrimSpace removed from evalCastTyped + codec.go EncodeValue for pg_lsn;
+        analyzer OpConcat allows implicit text coercion when one side is string-like;
+        evalBinary OpConcat coerces non-string datums via Format(); analyzer/planner
+        pg_lsn type inference for binary ops. pg_lsn regress diff: 216 → 21
+        (remaining 21 lines: EXPLAIN format only, pre-existing limitation).
 
 - [x] **M0097-0018**
       - Summary: System catalog + GUC + vacuum parity.  2026-05-12.
