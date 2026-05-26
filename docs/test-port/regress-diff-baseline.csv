@@ -23,13 +23,13 @@ functional_deps,0,pass
 copydml,45,failed
 tid,0,pass
 errors,0,pass
-hash_part,32,failed
+hash_part,0,pass
 hash_index,0,pass
 index_including_gist,112,failed
 expressions,118,failed
 select_into,120,failed
 prepare,0,pass
-dbsize,128,failed
+dbsize,0,pass
 lock,131,failed
 prepared_xacts,132,failed
 drop_if_exists,130,failed
@@ -39,7 +39,7 @@ uuid,169,failed
 select_distinct_on,182,failed
 partition_info,185,failed
 timetz,209,failed
-pg_lsn,216,failed
+pg_lsn,21,failed
 misc,230,failed
 tidscan,231,failed
 temp,232,failed

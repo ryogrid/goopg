@@ -230,7 +230,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			u = uint64(d.Int)
 		case KindString:
 			var err error
-			u, err = parsePgLSN(strings.TrimSpace(d.StringValue()))
+			u, err = parsePgLSN(d.StringValue())
 			if err != nil {
 				return nil, err
 			}

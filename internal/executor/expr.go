@@ -382,35 +382,43 @@ func looksLikePgLSN(s string) bool {
 	return true
 }
 
-// pgLSNParseDelta extracts an int64 delta from a numeric/integer datum for pg_lsn arithmetic.
-// Returns (delta, isNaN, ok). isNaN=true when NaN (caller must error).
-func pgLSNParseDelta(d Datum) (int64, bool, bool) {
+// pgLSNParseDelta extracts a numeric delta from a datum for pg_lsn arithmetic.
+// Returns (absValue uint64, isNegative bool, isNaN bool, ok bool).
+// isNegative=true means subtract absValue; false means add absValue.
+// isNaN=true means caller must error (NaN operand).
+// M0097-pg_lsn: use uint64 to avoid sign overflow for large pg_lsn differences.
+func pgLSNParseDelta(d Datum) (uint64, bool, bool, bool) {
+	parseStr := func(s string) (uint64, bool, bool, bool) {
+		if s == "NaN" {
+			return 0, false, true, true
+		}
+		if strings.HasPrefix(s, "-") {
+			if v, err := strconv.ParseUint(s[1:], 10, 64); err == nil {
+				return v, true, false, true
+			}
+			return 0, false, false, false
+		}
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return v, false, false, true
+		}
+		return 0, false, false, false
+	}
 	switch d.Kind {
 	case KindInt:
-		return d.Int, false, true
+		if d.Int < 0 {
+			return uint64(-d.Int), true, false, true
+		}
+		return uint64(d.Int), false, false, true
 	case KindNumeric:
-		s := d.Format()
-		if s == "NaN" {
-			return 0, true, true
-		}
-		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-			return v, false, true
-		}
-		if f, err := strconv.ParseFloat(s, 64); err == nil {
-			return int64(f), false, true
-		}
+		return parseStr(d.Format())
 	case KindString:
 		s := d.StringValue()
-		if s == "NaN" {
-			return 0, true, true
+		if looksLikePgLSN(s) {
+			return 0, false, false, false
 		}
-		if !looksLikePgLSN(s) {
-			if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-				return v, false, true
-			}
-		}
+		return parseStr(s)
 	}
-	return 0, false, false
+	return 0, false, false, false
 }
 
 // evalPgLSNBinary handles pg_lsn comparison and arithmetic operators.
@@ -451,36 +459,35 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 		}
 		return NewBoolDatum(result), true, nil
 	case parser.OpSub:
-		// pg_lsn - pg_lsn → numeric
+		// pg_lsn - pg_lsn → numeric (unsigned difference as decimal string)
 		lu, lok := parseLSNDatum(left)
 		ru, rok := parseLSNDatum(right)
 		if lok && rok {
-			var diff int64
 			if lu >= ru {
-				diff = int64(lu - ru)
-			} else {
-				diff = -int64(ru - lu)
+				return NewStringDatum(strconv.FormatUint(lu-ru, 10)), true, nil
 			}
-			return NewStringDatum(fmt.Sprintf("%d", diff)), true, nil
+			return NewStringDatum("-" + strconv.FormatUint(ru-lu, 10)), true, nil
 		}
 		// pg_lsn - numeric → pg_lsn
 		if lok {
-			delta, isNaN, ok := pgLSNParseDelta(right)
+			abs, isNeg, isNaN, ok := pgLSNParseDelta(right)
 			if ok {
 				if isNaN {
 					return Datum{}, true, &ExecError{Code: "0A000", Pos: pos,
 						Message: "cannot subtract NaN from pg_lsn"}
 				}
-				if delta < 0 {
-					if uint64(-delta) > lu {
+				if isNeg {
+					// pg_lsn - (-N) = pg_lsn + N
+					result := lu + abs
+					if result < lu {
 						return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
 					}
-					return NewStringDatum(formatPgLSN(lu - uint64(-delta))), true, nil
+					return NewStringDatum(formatPgLSN(result)), true, nil
 				}
-				if uint64(delta) > lu {
+				if abs > lu {
 					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
 				}
-				return NewStringDatum(formatPgLSN(lu-uint64(delta))), true, nil
+				return NewStringDatum(formatPgLSN(lu - abs)), true, nil
 			}
 		}
 	case parser.OpAdd:
@@ -498,24 +505,22 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 		} else {
 			return Datum{}, false, nil
 		}
-		delta, isNaN, ok := pgLSNParseDelta(numericDatum)
+		abs, isNeg, isNaN, ok := pgLSNParseDelta(numericDatum)
 		if ok {
 			if isNaN {
 				return Datum{}, true, &ExecError{Code: "0A000", Pos: pos,
 					Message: "cannot add NaN to pg_lsn"}
 			}
-			var result uint64
-			if delta >= 0 {
-				result = lsnVal + uint64(delta)
-				if result < lsnVal {
+			if isNeg {
+				// pg_lsn + (-N) = pg_lsn - N
+				if abs > lsnVal {
 					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
 				}
-			} else {
-				neg := uint64(-delta)
-				if neg > lsnVal {
-					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
-				}
-				result = lsnVal - neg
+				return NewStringDatum(formatPgLSN(lsnVal - abs)), true, nil
+			}
+			result := lsnVal + abs
+			if result < lsnVal {
+				return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
 			}
 			return NewStringDatum(formatPgLSN(result)), true, nil
 		}
@@ -597,10 +602,12 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		}
 		return arithmetic(op, left.Int, right.Int, pos)
 	case parser.OpConcat:
-		if (left.Kind != KindString) || (right.Kind != KindString) {
-			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator || requires string operands"}
+		// Non-string operands are implicitly coerced to text, matching
+		// PostgreSQL's || behaviour (e.g. `1 || '/'`). M0097-pg_lsn.
+		if left.IsNull() || right.IsNull() {
+			return NullDatum, nil
 		}
-		return NewStringDatum(left.StringValue() + right.StringValue()), nil
+		return NewStringDatum(left.Format() + right.Format()), nil
 	case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
 		// Bitwise operators: require integer operands. M0097-0003.
 		if left.Kind != KindInt || right.Kind != KindInt {
@@ -1459,7 +1466,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 	case "pg_lsn":
 		switch d.Kind {
 		case KindString:
-			u, err := parsePgLSN(strings.TrimSpace(d.StringValue()))
+			u, err := parsePgLSN(d.StringValue())
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
 					ee.Pos = pos
@@ -3218,6 +3225,9 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewBoolDatum(err == nil), nil
 			case "pg_snapshot":
 				return NewBoolDatum(parsePgSnapshotValid(v)), nil
+			case "pg_lsn":
+				_, err := parsePgLSN(v)
+				return NewBoolDatum(err == nil), nil
 			case "time", "timetz":
 				_, err := parseTimeString(v)
 				return NewBoolDatum(err == nil), nil

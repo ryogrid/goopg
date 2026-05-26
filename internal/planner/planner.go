@@ -4419,6 +4419,17 @@ func exprType(e Expr) catalog.Type {
 				return s == "float8" || s == "double precision" || s == "double" ||
 					s == "float4" || s == "real" || s == "float"
 			}
+			// pg_lsn arithmetic: pg_lsn - pg_lsn → int8; pg_lsn +/- numeric → pg_lsn. M0097-pg_lsn.
+			isPgLSN := func(n string) bool { return strings.EqualFold(n, "pg_lsn") }
+			if isPgLSN(lt.Name) && isPgLSN(rt.Name) && x.Op == parser.OpSub {
+				return catalog.Type{Name: "int8"}
+			}
+			if isPgLSN(lt.Name) && (x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: "pg_lsn"}
+			}
+			if isPgLSN(rt.Name) && x.Op == parser.OpAdd {
+				return catalog.Type{Name: "pg_lsn"}
+			}
 			if isFloat(lt.Name) || isFloat(rt.Name) {
 				// Wider float type wins.
 				if lt.Name == "float8" || lt.Name == "double precision" || lt.Name == "double" ||

@@ -222,6 +222,17 @@ func evalFastExpr(exprs exprTreeSlab, idx int32, slot SlotView, ctx *Context) (D
 		if err != nil {
 			return Datum{}, err
 		}
+		// pg_lsn arithmetic: detect before evalBinary (mirrors evalExprSlot). M0097-pg_lsn.
+		if (left.Kind == KindString && looksLikePgLSN(left.StringValue())) ||
+			(right.Kind == KindString && looksLikePgLSN(right.StringValue())) {
+			res, handled, lsnErr := evalPgLSNBinary(op, left, right, 0)
+			if lsnErr != nil {
+				return Datum{}, lsnErr
+			}
+			if handled {
+				return res, nil
+			}
+		}
 		result, err := evalBinary(op, left, right, 0)
 		if err != nil {
 			return Datum{}, err

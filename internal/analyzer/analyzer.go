@@ -844,6 +844,22 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				ae.Hint = "Could not choose a best candidate operator. You might need to add explicit type casts."
 				return catalog.Type{}, ae
 			}
+			// pg_lsn arithmetic: pg_lsn - pg_lsn → int8;
+			// pg_lsn +/- numeric/int* → pg_lsn. M0097-pg_lsn.
+			isPgLSN := func(t catalog.Type) bool {
+				return strings.EqualFold(t.Name, "pg_lsn")
+			}
+			if isPgLSN(leftTyp) && isPgLSN(rightTyp) && x.Op == parser.OpSub {
+				return catalog.Type{Name: "int8"}, nil
+			}
+			if isPgLSN(leftTyp) && (isNumericLike(rightTyp) || isUnknownType(rightTyp)) &&
+				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: "pg_lsn"}, nil
+			}
+			if isPgLSN(rightTyp) && (isNumericLike(leftTyp) || isUnknownType(leftTyp)) &&
+				x.Op == parser.OpAdd {
+				return catalog.Type{Name: "pg_lsn"}, nil
+			}
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))
 			}
@@ -858,11 +874,17 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 			return rightTyp, nil
 		case parser.OpConcat:
-			if !isStringLike(leftTyp) || !isStringLike(rightTyp) {
+			// Require at least one string-like (or unknown) operand.
+			// When one side is non-string but the other is string-like,
+			// PostgreSQL implicitly casts the non-string side to text
+			// (e.g. `1 || '/'`). If both sides are non-string, error.
+			// M0097-pg_lsn.
+			leftStr := isStringLike(leftTyp) || isUnknownType(leftTyp)
+			rightStr := isStringLike(rightTyp) || isUnknownType(rightTyp)
+			if !leftStr && !rightStr {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", "operator || requires string operands")
 			}
-			// Mixed string types (text || varchar, etc.) promote to text.
-			return PromoteStringType(leftTyp, rightTyp), nil
+			return catalog.Type{Name: "text"}, nil
 		case parser.OpLike, parser.OpNotLike:
 			// Both operands must be string-like (text/varchar/char/
 			// bpchar/unknown). Pattern can be a literal or column.
