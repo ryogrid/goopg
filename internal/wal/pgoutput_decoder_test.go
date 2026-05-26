@@ -74,7 +74,7 @@ func TestPgoutputDecoderRoundTripRelationAndInsert(t *testing.T) {
 	var buf bytes.Buffer
 	po := NewPgOutput(snap, &buf)
 	body := encodeBodyV0([]any{42, "alpha"}, []string{"int4", "text"})
-	tuple := wrapAsHeapTuple(t, body)
+	tuple := wrapAsHeapTuple(t, body, 2)
 	if err := po.Change(Change{Kind: ChangeInsert, Rel: c.RelFileNode(tbl), NewTuple: tuple}); err != nil {
 		t.Fatal(err)
 	}
@@ -163,14 +163,14 @@ func TestPgoutputDecoderRejectsTruncated(t *testing.T) {
 	}
 }
 
-
 // TestPgoutputDecoderTruncateMessage hand-crafts a pgoutput 'T'
 // frame and pins the parsed fields. M0103-0007 rung 9: goopg's
 // PgOutput encoder does not (yet) emit TRUNCATE, so we synthesise
 // the upstream wire shape directly. The byte layout mirrors
 // `logicalrep_write_truncate` in
 // postgres/src/backend/replication/logical/proto.c:
-//   'T' | nrelids(4 BE) | option_bits(1) | relid_1(4 BE) … relid_n(4 BE)
+//
+//	'T' | nrelids(4 BE) | option_bits(1) | relid_1(4 BE) … relid_n(4 BE)
 //
 // The option_bits byte is the bitwise OR of TRUNCATE_CASCADE (0x01)
 // and TRUNCATE_RESTART_SEQS (0x02); we exercise both so the round

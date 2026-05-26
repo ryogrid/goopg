@@ -25,41 +25,49 @@ func snapshotForRel(t *testing.T, name string, cols []catalog.Column) (*CatalogS
 // frame so tests can construct on-disk bytes the plugin will
 // decode. Kept self-contained to avoid pulling in the executor
 // package.
+// encodeBodyV0 builds a PG-physical column-data body (M0111-0002: single
+// on-disk format). Test helper supporting non-NULL int4/int8/text — all the
+// pgoutput tests need. Alignment mirrors executor.physicalPGTypeAlign
+// (int4/text=4, int8=8); pair it with wrapAsHeapTuple to stamp natts.
 func encodeBodyV0(values []any, types []string) []byte {
 	var out []byte
-	for i, v := range values {
-		if v == nil {
-			out = append(out, 1)
-			continue
+	alignTo := func(a int) {
+		for len(out)%a != 0 {
+			out = append(out, 0)
 		}
-		out = append(out, 0)
-		switch t := types[i]; t {
+	}
+	for i, v := range values {
+		switch types[i] {
 		case "int4":
+			alignTo(4)
 			var tmp [4]byte
-			binary.BigEndian.PutUint32(tmp[:], uint32(int32(v.(int))))
+			binary.LittleEndian.PutUint32(tmp[:], uint32(int32(v.(int))))
 			out = append(out, tmp[:]...)
 		case "int8":
+			alignTo(8)
 			var tmp [8]byte
-			binary.BigEndian.PutUint64(tmp[:], uint64(v.(int64)))
+			binary.LittleEndian.PutUint64(tmp[:], uint64(v.(int64)))
 			out = append(out, tmp[:]...)
 		case "text":
+			alignTo(4)
 			s := v.(string)
-			var ln [4]byte
-			binary.BigEndian.PutUint32(ln[:], uint32(len(s)))
-			out = append(out, ln[:]...)
+			total := len(s) + 1 // PG short varlena: header byte included in len
+			out = append(out, byte((total<<1)|0x01))
 			out = append(out, []byte(s)...)
 		}
 	}
 	return out
 }
 
-func wrapAsHeapTuple(t *testing.T, body []byte) []byte {
+func wrapAsHeapTuple(t *testing.T, body []byte, natts int) []byte {
 	t.Helper()
-	tup, err := storage.NewHeapTuple(42, 0, body).MarshalBinary()
+	tup := storage.NewHeapTuple(42, 0, body)
+	tup.Header.SetNatts(natts)
+	raw, err := tup.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return tup
+	return raw
 }
 
 // TestPgOutputBeginEmitsCanonicalShape pins the M0008 / 0008-0002
@@ -124,7 +132,7 @@ func TestPgOutputInsertEmitsRelationOnceThenInsert(t *testing.T) {
 	var buf bytes.Buffer
 	po := NewPgOutput(snap, &buf)
 	body := encodeBodyV0([]any{1, "alpha"}, []string{"int4", "text"})
-	tuple := wrapAsHeapTuple(t, body)
+	tuple := wrapAsHeapTuple(t, body, 2)
 
 	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tuple}); err != nil {
 		t.Fatal(err)
@@ -142,7 +150,7 @@ func TestPgOutputInsertEmitsRelationOnceThenInsert(t *testing.T) {
 
 	buf.Reset()
 	body2 := encodeBodyV0([]any{2, "beta"}, []string{"int4", "text"})
-	tup2 := wrapAsHeapTuple(t, body2)
+	tup2 := wrapAsHeapTuple(t, body2, 2)
 	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tup2}); err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +177,7 @@ func TestPgOutputInsertEncodesIntAndText(t *testing.T) {
 	var buf bytes.Buffer
 	po := NewPgOutput(snap, &buf)
 	body := encodeBodyV0([]any{42, "alpha"}, []string{"int4", "text"})
-	tuple := wrapAsHeapTuple(t, body)
+	tuple := wrapAsHeapTuple(t, body, 2)
 	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tuple}); err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +301,7 @@ func TestPgOutputFilterSuppressesEmission(t *testing.T) {
 	po.SetFilter(alwaysFalseFilter{})
 
 	body := encodeBodyV0([]any{1}, []string{"int4"})
-	tuple := wrapAsHeapTuple(t, body)
+	tuple := wrapAsHeapTuple(t, body, 1)
 	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tuple}); err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +334,7 @@ func TestPgOutputFilterPerKind(t *testing.T) {
 
 	// Then an insert — should emit R + I.
 	body := encodeBodyV0([]any{1}, []string{"int4"})
-	tuple := wrapAsHeapTuple(t, body)
+	tuple := wrapAsHeapTuple(t, body, 1)
 	if err := po.Change(Change{Kind: ChangeInsert, Rel: rel, NewTuple: tuple}); err != nil {
 		t.Fatal(err)
 	}
@@ -350,8 +358,8 @@ func TestPgoutputUpdateMessageEncoding(t *testing.T) {
 
 	oldBody := encodeBodyV0([]any{1, "hello"}, []string{"int4", "text"})
 	newBody := encodeBodyV0([]any{1, "world"}, []string{"int4", "text"})
-	oldTuple := wrapAsHeapTuple(t, oldBody)
-	newTuple := wrapAsHeapTuple(t, newBody)
+	oldTuple := wrapAsHeapTuple(t, oldBody, 2)
+	newTuple := wrapAsHeapTuple(t, newBody, 2)
 
 	var buf bytes.Buffer
 	po := NewPgOutput(snap, &buf)
@@ -409,7 +417,7 @@ func TestPgoutputDeleteWithOldTupleEmitsO(t *testing.T) {
 	snap, rel := snapshotForRel(t, "items", cols)
 
 	body := encodeBodyV0([]any{42}, []string{"int4"})
-	oldTuple := wrapAsHeapTuple(t, body)
+	oldTuple := wrapAsHeapTuple(t, body, 1)
 
 	var buf bytes.Buffer
 	po := NewPgOutput(snap, &buf)
@@ -447,7 +455,6 @@ func TestPgoutputDeleteWithOldTupleEmitsO(t *testing.T) {
 	}
 }
 
-
 // TestPgoutputUpdateWithoutOldTupleGoesDirectlyToN pins M0103-0004:
 // when REPLICA IDENTITY DEFAULT applies and no replica-identity column
 // was modified, upstream `logicalrep_write_update` skips the K/O block
@@ -463,7 +470,7 @@ func TestPgoutputUpdateWithoutOldTupleGoesDirectlyToN(t *testing.T) {
 	snap, rel := snapshotForRel(t, "items", cols)
 
 	newBody := encodeBodyV0([]any{7, "after"}, []string{"int4", "text"})
-	newTuple := wrapAsHeapTuple(t, newBody)
+	newTuple := wrapAsHeapTuple(t, newBody, 2)
 
 	var buf bytes.Buffer
 	po := NewPgOutput(snap, &buf)

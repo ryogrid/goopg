@@ -34,22 +34,3 @@ func TestEncodeValuePGTimeRejectsNamedZoneWithoutDate(t *testing.T) {
 		t.Fatal("expected time parse error for bare named timezone")
 	}
 }
-
-func TestDecodeRowFallsBackToLegacyTimeEncoding(t *testing.T) {
-	cols := []catalog.Column{{Name: "f1", Type: catalog.Type{Name: "time", Args: []int64{2}}}}
-	body, err := EncodeRow(cols, Row{NewStringDatum("02:03 PST")})
-	if err != nil {
-		t.Fatalf("EncodeRow(time): %v", err)
-	}
-	var got Row = make([]Datum, 1)
-	if err := DecodeRowInto(got, cols, body); err != nil {
-		t.Fatalf("DecodeRowInto(time): %v", err)
-	}
-	if got[0].Kind != KindTime {
-		t.Fatalf("decoded kind=%v, want KindTime", got[0].Kind)
-	}
-	u := got[0].TimeValue().UTC()
-	if u.Hour() != 2 || u.Minute() != 3 || u.Second() != 0 {
-		t.Fatalf("decoded time=%s, want 02:03:00", u.Format("15:04:05"))
-	}
-}

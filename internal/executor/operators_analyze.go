@@ -191,24 +191,11 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 			if !mvcc.TupleVisible(t.Header, snap, tx.XID) {
 				continue
 			}
-			// Decode from the tuple header rather than letting DecodeRow
-			// guess the format. A goopg legacy-format tuple (EncodeRow path,
-			// written when canonical WAL logging is off) has no null bitmap
-			// and natts==0; its [flag][big-endian value] body can be
-			// mis-parsed by DecodeRow's PG-first heuristic — e.g. an int4
-			// whose big-endian low byte (0x0f=15, 0x1c=28, …) forms a valid
-			// PG varlena header that consumes exactly to end-of-tuple,
-			// silently yielding a wrong value (id 15/28 → 0). PG-physical
-			// tuples set natts (and may carry a null bitmap), so the header
-			// disambiguates the two formats. M0097-analyze-decode.
+			// Decode the PG-physical tuple body using the header (natts +
+			// null bitmap). Single on-disk row format since M0111-0002.
 			row := make(Row, len(tbl.Columns))
 			natts := int(t.Header.Infomask2 & 0x07FF)
-			var derr error
-			if len(t.Bitmap) == 0 && natts == 0 {
-				derr = decodeGoopgRowIntoMctx(row, tbl.Columns, t.Data, nil)
-			} else {
-				derr = DecodeRowIntoMctxPGTuple(row, tbl.Columns, t.Data, t.Bitmap, natts, nil)
-			}
+			derr := DecodeRowIntoMctxPGTuple(row, tbl.Columns, t.Data, t.Bitmap, natts, nil)
 			if derr != nil {
 				pool.Unpin(slot)
 				return nil, fmt.Errorf("ANALYZE %s slot=%d: %w", tbl.QualifiedName(), s, derr)

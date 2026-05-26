@@ -52,8 +52,8 @@ const (
 // postgres/src/include/replication/logicalproto.h. The byte is a
 // bitmask: bit 0 = CASCADE, bit 1 = RESTART IDENTITY.
 const (
-	pgoTruncateCascade        byte = 0x01
-	pgoTruncateRestartSeqs    byte = 0x02
+	pgoTruncateCascade     byte = 0x01
+	pgoTruncateRestartSeqs byte = 0x02
 )
 
 // pgoutput tuple-column status bytes. Mirror upstream's
@@ -287,61 +287,21 @@ func (p *PgOutput) writeUpdate(rel *RelationDef, oldTuple, newTuple []byte) erro
 // package depends on `wal` and inverting the import direction would create a
 // cycle. See docs/design/0008-0002-pgoutput-plugin.md.
 //
-// Format dispatch (M0111-0002): the tuple HEADER is the authoritative
-// discriminator, mirroring executor.DecodeRowIntoMctxPGTuple — a goopg
-// legacy-format tuple has no null bitmap and leaves natts unset (0); a
-// PG-physical tuple sets natts (>= 1) and carries a null bitmap when it has
-// NULLs. Never guess the format from the column bytes. The legacy branch is
-// removed in M0111-0002 S3 once all writes are PG-physical.
+// M0111-0002: goopg has a single on-disk heap-tuple format (PG-physical); the
+// legacy [flag][value] walk was removed. Decode uses the tuple header (natts +
+// null bitmap).
 func encodePgoTuple(cols []ColumnDef, raw []byte) ([]byte, error) {
 	tup, err := storage.ParseHeapTuple(raw)
 	if err != nil {
 		return nil, err
 	}
 	natts := int(tup.Header.Infomask2 & storage.HeapNattsMask)
-	if natts == 0 && len(tup.Bitmap) == 0 {
-		return encodePgoTupleLegacy(cols, tup.Data)
-	}
 	return encodePgoTuplePhysical(cols, tup.Data, tup.Bitmap, natts)
 }
 
-// encodePgoTupleLegacy walks a goopg legacy-format body ([flag][value] per
-// column, no null bitmap). Removed in M0111-0002 S3.
-func encodePgoTupleLegacy(cols []ColumnDef, body []byte) ([]byte, error) {
-	out := make([]byte, 0, 2+len(cols)*8)
-	out = appendUint16(out, uint16(len(cols)))
-
-	off := 0
-	for _, col := range cols {
-		if off >= len(body) {
-			// ALTER TABLE ADD COLUMN appended a column the
-			// stored tuple predates: emit NULL for the
-			// trailing column.
-			out = append(out, pgoColNull)
-			continue
-		}
-		flag := body[off]
-		off++
-		if flag == 1 {
-			out = append(out, pgoColNull)
-			continue
-		}
-		val, n, derr := pgoDecodeValue(col.Type, body[off:])
-		if derr != nil {
-			return nil, fmt.Errorf("col %q: %w", col.Name, derr)
-		}
-		off += n
-		out = append(out, pgoColText)
-		out = appendUint32(out, uint32(len(val)))
-		out = append(out, val...)
-	}
-	return out, nil
-}
-
 // encodePgoTuplePhysical walks a PG-physical body using the null bitmap and
-// per-type alignment, re-emitting each column as pgoutput text. It produces the
-// same text encodePgoTupleLegacy would for the same logical value so the
-// subscriber's apply worker parses it identically. M0111-0002.
+// per-type alignment, re-emitting each column as the canonical pgoutput text
+// the subscriber's apply worker parses. M0111-0002.
 func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts int) ([]byte, error) {
 	out := make([]byte, 0, 2+len(cols)*8)
 	out = appendUint16(out, uint16(len(cols)))
@@ -373,55 +333,6 @@ func encodePgoTuplePhysical(cols []ColumnDef, body, bitmap []byte, storedNatts i
 		out = append(out, val...)
 	}
 	return out, nil
-}
-
-// pgoDecodeValue reads the column value bytes per v0's on-disk
-// codec frame (mirror of `executor/codec.go::decodeValue`) and
-// returns the canonical text representation upstream's
-// pgoutput emits with `LOGICALREP_COLUMN_TEXT`.
-func pgoDecodeValue(t catalog.Type, data []byte) ([]byte, int, error) {
-	switch t.Name {
-	case "int4", "integer", "int":
-		if len(data) < 4 {
-			return nil, 0, fmt.Errorf("int4: short read len=%d", len(data))
-		}
-		v := int32(binary.BigEndian.Uint32(data[:4]))
-		return []byte(strconv.FormatInt(int64(v), 10)), 4, nil
-	case "int8", "bigint":
-		if len(data) < 8 {
-			return nil, 0, fmt.Errorf("int8: short read len=%d", len(data))
-		}
-		v := int64(binary.BigEndian.Uint64(data[:8]))
-		return []byte(strconv.FormatInt(v, 10)), 8, nil
-	case "bool", "boolean":
-		if len(data) < 1 {
-			return nil, 0, fmt.Errorf("bool: short read")
-		}
-		if data[0] != 0 {
-			return []byte("t"), 1, nil
-		}
-		return []byte("f"), 1, nil
-	case "timestamp", "timestamptz", "date":
-		if len(data) < 8 {
-			return nil, 0, fmt.Errorf("timestamp: short read len=%d", len(data))
-		}
-		nanos := int64(binary.BigEndian.Uint64(data[:8]))
-		ts := time.Unix(0, nanos).UTC().Format("2006-01-02 15:04:05.000000")
-		return []byte(ts), 8, nil
-	}
-	// Variable-length text-like fallback (text / varchar /
-	// numeric / unknown): 4-byte big-endian length + raw
-	// bytes. Mirrors `executor/codec.go::encodeVarlen`.
-	if len(data) < 4 {
-		return nil, 0, fmt.Errorf("varlen: short header len=%d", len(data))
-	}
-	ln := int(binary.BigEndian.Uint32(data[:4]))
-	if 4+ln > len(data) {
-		return nil, 0, fmt.Errorf("varlen: truncated body len=%d want %d", len(data), 4+ln)
-	}
-	out := make([]byte, ln)
-	copy(out, data[4:4+ln])
-	return out, 4 + ln, nil
 }
 
 // pgoPhysicalAlign rounds off up to the PG storage alignment for t's physical

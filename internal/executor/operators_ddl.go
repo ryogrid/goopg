@@ -1514,22 +1514,8 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			// Decode using the format indicated by the tuple header's natts
-			// field (Infomask2 low 11 bits). When natts > 0 the row was
-			// written by writeHeapRowReturning with ctx.LogCanonical != nil
-			// (PG physical layout, EncodeRowPG). When natts == 0 the row
-			// uses the legacy goopg layout (EncodeRow). Using the wrong
-			// decoder on PG-format data can produce plausible-looking
-			// but incorrect Datums (e.g. the 0x02 first byte of a LE int4=2
-			// is misread as a TOAST pointer flag and accidentally passes
-			// the sanity check if numChunks happens to be small).
-			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
-			var decErr error
-			if storedNatts > 0 {
-				decErr = decodePhysicalPGRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
-			} else {
-				decErr = decodeGoopgRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
-			}
+			// Single on-disk row format (PG-physical) since M0111-0002.
+			decErr := decodePhysicalPGRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
 			if decErr != nil {
 				continue
 			}
@@ -1593,28 +1579,6 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
-}
-
-// buildKeepMaskForIndex returns a per-column boolean mask whose
-// `i`-th entry is true iff `tableCols[i]` is referenced by `indexCols`.
-// Used by `DecodeRowProjection` to skip per-column heap allocations
-// for columns the index does not need. (M0054-0005c-followup.)
-// nil entries in indexCols (expression index columns) are skipped.
-func buildKeepMaskForIndex(tableCols []catalog.Column, indexCols []*catalog.Column) []bool {
-	want := make(map[string]struct{}, len(indexCols))
-	for _, ic := range indexCols {
-		if ic == nil {
-			continue // expression column — no catalog column
-		}
-		want[ic.Name] = struct{}{}
-	}
-	keep := make([]bool, len(tableCols))
-	for i := range tableCols {
-		if _, ok := want[tableCols[i].Name]; ok {
-			keep[i] = true
-		}
-	}
-	return keep
 }
 
 func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) error {
