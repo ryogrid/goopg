@@ -1404,6 +1404,21 @@ M0097-0001 wires it up.
         (GMT+05:00 → -05:00 = UTC-5, matching PG's timestamptz_in semantics).
         **uuid: 0 diff lines, PASS. Commit: 0b50376.**
 
+- [x] **M0097-0030 — Port select_distinct_on regress test**
+      - Summary: Make `select_distinct_on` reach `pass` (170 diff lines → 0).
+      - Work: (1) Parser: `ORDER BY expr USING <op>` — added `UsingOp string`
+        to `SortBy` AST node; `parseSortUsingOperator()` consumes operator
+        tokens; `sortUsingIsDesc()` classifies `>` / `>=` / `*gt*` as DESC.
+        (2) Planner: New `DistinctOn` plan node with `KeyCols []int`; planner
+        validates ORDER BY prefix match but allows shorter ORDER BY (adds
+        implicit Sort with missing DISTINCT ON keys); ordinal substitution
+        applied to DISTINCT ON exprs fixing `DISTINCT ON (1)` ordinal refs;
+        `exprEqual` extended with recursive `*FuncCall` / `*BinaryOp` cases.
+        (3) Executor: `distinctOnOp` streams sorted input, builds key string
+        from `KeyCols` output columns via `datumKey()`, emits first row per key.
+      - **COMPLETE 2026-05-26 (M0097-0030 — select_distinct_on 170 → 0):**
+        select_distinct_on: 0 diff lines, PASS. Commit: 805f544.
+
 - [ ] **M0097-0031 — Port GUC regress test**
       - Summary: Make `guc` reach `pass`.
       - SHOW/SET/SET LOCAL/RESET are wired through the executor
