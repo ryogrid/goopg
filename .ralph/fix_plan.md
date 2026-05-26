@@ -3343,6 +3343,50 @@ complete, these can be re-evaluated.
         GC-safe reusable per-connection buffer — all either reintroduce the
         crash pattern or are out of proportion to a noise-level win.
 
+## M0112 — pg_statistic Heap Table for ANALYZE Statistics Persistence (filed 2026-05-26)
+
+goopg's `ANALYZE` stores column statistics (NDistinct, MCVs, histogram, null
+fraction) only in the in-memory catalog.  They are lost on every restart,
+forcing re-ANALYZE before the planner can use accurate estimates.  PostgreSQL
+persists these statistics in the `pg_statistic` system heap table (OID 2619)
+and reads them back on startup.  This milestone implements `pg_statistic` in
+PG18-canonical physical format so statistics survive restarts and are readable
+by an attaching PG18 standby.
+Design doc: `docs/milestones/0112-pg-statistic-heap-table-for-stats-persistence.md`
+
+Detailed task breakdown and design document creation are deferred to the
+implementer when this milestone is selected for development.
+
+## M0113 — Heap-Based Index Recovery via pg_index (filed 2026-05-26)
+
+goopg currently recovers index catalog entries via a goopg-private WAL record
+(`RecordKindIndexDDL`, replayed by `replayIndexDDLRecords`).  PostgreSQL
+recovers indexes from `pg_class` (relkind='i') + `pg_index` heap tables on
+startup.  goopg already writes `pg_class` rows for indexes
+(`syncIndexToCatalogHeap`) but lacks `pg_index`.  This milestone adds
+`pg_index` in PG18-canonical physical format, populates it on `CREATE INDEX`,
+and reads it at startup to reconstruct index catalog entries from heap alone —
+eliminating the goopg-private WAL side-channel.
+Design doc: `docs/milestones/0113-heap-based-index-recovery-via-pg-index.md`
+
+Detailed task breakdown and design document creation are deferred to the
+implementer when this milestone is selected for development.
+
+## M0114 — pg_internal.init Relcache Fast-Start Cache for goopg (filed 2026-05-26)
+
+goopg scans all `pg_class` / `pg_attribute` pages on every startup to rebuild
+its in-memory catalog.  PostgreSQL avoids this O(N-pages) cost by reading
+`pg_internal.init`, a binary relcache snapshot written at end-of-startup and
+invalidated on DDL commit.  goopg already writes `pg_internal.init` for PG
+standby compatibility (M0106) but does not read it for its own startup.  This
+milestone implements the read path: if the file is present and valid, load the
+in-memory catalog from it and skip the heap scan; fall back to the heap scan
+on missing/stale/corrupt file.
+Design doc: `docs/milestones/0114-pg-internal-init-relcache-fast-start-cache.md`
+
+Detailed task breakdown and design document creation are deferred to the
+implementer when this milestone is selected for development.
+
 ## Completed
 
 - [x] Project initialization (Ralph harness wired up).
