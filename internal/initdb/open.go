@@ -671,6 +671,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 					if err := catalog.RelcacheInitFileUnlink(abs, catalog.DefaultDBOid); err != nil {
 						return err
 					}
+					// M0114: co-invalidate the goopg catalog cache whenever
+					// pg_internal.init is unlinked so both files track the same
+					// invalidation epoch. The cache is rebuilt on the next startup.
+					// Use cat.DBOID() rather than DefaultDBOid — the resolved OID
+					// may differ when the postgres DB carries a non-default OID.
+					UnlinkCatalogCache(abs, cat.DBOID())
 					// Regenerate pg_internal.init immediately after unlinking
 					// so the primary always has fresh copies for pg_basebackup.
 					// The nailed-rel lists are static (system catalogs only).
@@ -827,16 +833,32 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: system catalog load: %w", err)
 	}
+	// M0114: try the fast-start catalog cache (pg_goopg_catalog_cache.json).
+	// If the JSON snapshot is present and valid, populate the catalog directly
+	// without scanning pg_class/pg_attribute pages. Falls through to the heap
+	// scan on a miss (file absent, version mismatch, or parse error).
+	cacheHit := false
+	if abs != "" {
+		var cerr error
+		if cacheHit, cerr = readCatalogCache(abs, cat.DBOID(), cat); cerr != nil {
+			slog.Warn("catalogCache: read failed, falling back to heap scan", "err", cerr)
+			cacheHit = false
+		}
+	}
+
 	// Load user tables from the pg_class/pg_attribute heap files (M0030-0003).
 	// This is the sole catalog recovery path: DDL writes rows here via
 	// syncTableToCatalogHeap, and WAL replay restores them after a crash.
 	// Safe on old clusters — skips if pg_class relfile is absent.
 	// The clog is passed to filter rows whose xmin was never committed (M0030-0007).
-	if err := loadUserTablesFromHeap(mgr, cat, clog); err != nil {
-		_ = pool.Close()
-		_ = walWriter.Close()
-		_ = mgr.Close()
-		return nil, fmt.Errorf("goopg: user table heap load: %w", err)
+	// Skipped when M0114 catalog cache provided a valid snapshot above.
+	if !cacheHit {
+		if err := loadUserTablesFromHeap(mgr, cat, clog); err != nil {
+			_ = pool.Close()
+			_ = walWriter.Close()
+			_ = mgr.Close()
+			return nil, fmt.Errorf("goopg: user table heap load: %w", err)
+		}
 	}
 
 	// M0106-0013: after loading user tables from heap, advance the OID
@@ -847,6 +869,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	for _, tbl := range cat.AllTables() {
 		if tbl.OID >= catalog.FirstUserOID {
 			cat.AdvanceNextOIDPast(tbl.OID)
+		}
+	}
+
+	// M0114: write the catalog cache after a successful heap scan so the
+	// next startup can skip pg_class/pg_attribute scanning entirely.
+	// Non-fatal: a write failure just means a cold-start next time.
+	if abs != "" && !cacheHit {
+		if werr := writeCatalogCache(abs, cat.DBOID(), cat); werr != nil {
+			slog.Warn("catalogCache: write failed", "err", werr)
 		}
 	}
 
@@ -864,6 +895,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: database DDL replay: %w", err)
 	}
 
+	// M0112: restore per-column planner statistics from pg_statistic.
+	// Non-fatal: if absent or malformed, the planner uses defaults until
+	// the next ANALYZE run.
+	if err := loadStatisticsFromHeap(mgr, cat, clog); err != nil {
+		slog.Warn("loadStatisticsFromHeap failed", "err", err)
+	}
+
+	// M0113: recover user indexes from pg_index heap (PG18-canonical path).
+	// Falls back to the WAL-replay path below for clusters that predate M0113
+	// (no pg_index rows written yet).
+	if err := loadUserIndexesFromHeap(mgr, cat, clog); err != nil {
+		slog.Warn("loadUserIndexesFromHeap failed, falling back to WAL replay", "err", err)
+	}
+
 	// M0079-0001: replay CREATE/DROP INDEX WAL records into the
 	// in-memory catalog. Without this pass, indexes created
 	// after the last checkpoint would disappear from
@@ -874,6 +919,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// every UPDATE fell back to a 10M-row Seq Scan). Must run
 	// AFTER `loadUserTablesFromHeap` so the owning table is
 	// already in the catalog when we register the index.
+	// M0113: kept as fallback for pre-M0113 clusters without pg_index rows.
 	if err := replayIndexDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
@@ -1991,6 +2037,268 @@ func verifyInitialized(dir string) error {
 	got := strings.TrimSpace(string(pv))
 	if got != CatalogVersion {
 		return fmt.Errorf("goopg: data directory catalog version %q does not match this binary (%q)", got, CatalogVersion)
+	}
+	return nil
+}
+
+// loadUserIndexesFromHeap recovers user-defined index catalog entries from the
+// pg_index heap table (OID 2610). Called after loadUserTablesFromHeap so the
+// owning tables are already registered (M0113).
+//
+// For each index found in pg_class (relkind='i', OID >= FirstUserOID), a
+// matching pg_index row is sought to obtain indrelid and indkey (the column
+// attnum vector). Column names are resolved via the already-loaded pg_attribute
+// data for the parent table.
+//
+// Non-fatal: if pg_index is absent or malformed, this function returns an error
+// and the caller falls back to WAL-replay-based index recovery.
+func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	// --- Pass 1: collect index rows from pg_class (relkind='i') ---
+	classRel := storage.RelFileNode{
+		DBOid:  cat.DBOID(),
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	nClassBlocks, err := mgr.NBlocks(classRel)
+	if err != nil || nClassBlocks == 0 {
+		return nil
+	}
+
+	page := make(storage.Page, storage.BlockSize)
+
+	type indexClassRow struct {
+		oid   uint32
+		name  string
+		nsp   uint32
+	}
+	var indexRows []indexClassRow
+
+	for blk := storage.BlockNumber(0); blk < nClassBlocks; blk++ {
+		if err := mgr.ReadBlock(classRel, blk, page); err != nil {
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			continue
+		}
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
+				continue
+			}
+			row, err := catalog.DecodePGClassPhysicalRow(ht.Data)
+			if err != nil {
+				continue
+			}
+			if row.RelKind == "i" && row.OID >= catalog.FirstUserOID {
+				indexRows = append(indexRows, indexClassRow{oid: row.OID, name: row.RelName, nsp: row.RelNamespace})
+			}
+		}
+	}
+	if len(indexRows) == 0 {
+		return nil
+	}
+
+	// --- Pass 2: scan pg_index for matching rows ---
+	pgIndexRel := storage.RelFileNode{
+		DBOid:  cat.DBOID(),
+		RelOid: catalog.IndexRelationId,
+		Fork:   storage.MainFork,
+	}
+	nIndexBlocks, err := mgr.NBlocks(pgIndexRel)
+	if err != nil || nIndexBlocks == 0 {
+		return nil
+	}
+
+	type recoveredIndex struct {
+		indexRelid uint32
+		indRelid   uint32
+		indKey     []int16
+		isUnique   bool
+		isPrimary  bool
+	}
+	byIndexRelid := make(map[uint32]recoveredIndex, len(indexRows))
+
+	for blk := storage.BlockNumber(0); blk < nIndexBlocks; blk++ {
+		if err := mgr.ReadBlock(pgIndexRel, blk, page); err != nil {
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			continue
+		}
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
+				continue
+			}
+			row, err := catalog.DecodePGIndexPhysicalRow(ht.Data)
+			if err != nil {
+				continue
+			}
+			if row.IndexRelid >= catalog.FirstUserOID {
+				byIndexRelid[row.IndexRelid] = recoveredIndex{
+					indexRelid: row.IndexRelid,
+					indRelid:   row.IndRelid,
+					indKey:     row.IndKey,
+					isUnique:   row.IndIsUnique,
+					isPrimary:  row.IndIsPrimary,
+				}
+			}
+		}
+	}
+
+	// --- Pass 3: for each index row, resolve column names and register ---
+	for _, ir := range indexRows {
+		pgIdx, ok := byIndexRelid[ir.oid]
+		if !ok {
+			// No pg_index row yet — this cluster predates M0113; WAL fallback handles it.
+			continue
+		}
+		tbl, ok := cat.LookupTableByOID(pgIdx.indRelid)
+		if !ok {
+			continue
+		}
+		// Map attnum → column name.
+		colNames := make([]string, 0, len(pgIdx.indKey))
+		for _, attnum := range pgIdx.indKey {
+			if attnum <= 0 || int(attnum) > len(tbl.Columns) {
+				continue
+			}
+			colNames = append(colNames, tbl.Columns[attnum-1].Name)
+		}
+		if len(colNames) == 0 {
+			continue
+		}
+		schema := ""
+		if ir.nsp == catalog.PGCatalogNamespaceOID {
+			schema = "pg_catalog"
+		} else if ir.nsp == catalog.PublicNamespaceOID {
+			schema = "public"
+		}
+		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid)
+	}
+	return nil
+}
+
+// loadStatisticsFromHeap restores per-column planner statistics from the
+// pg_statistic heap table (OID 2619). Called during startup after user tables
+// are loaded (M0112). Non-fatal: a missing or corrupt pg_statistic file is
+// silently ignored; the planner falls back to hard-coded defaults until the
+// next ANALYZE run.
+func loadStatisticsFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *mvcc.CLog) error {
+	statRel := storage.RelFileNode{
+		DBOid:  cat.DBOID(),
+		RelOid: catalog.StatisticRelationId,
+		Fork:   storage.MainFork,
+	}
+	nBlocks, err := mgr.NBlocks(statRel)
+	if err != nil || nBlocks == 0 {
+		return nil
+	}
+
+	page := make(storage.Page, storage.BlockSize)
+
+	// Collect the most recent live stat row per (starelid, staattnum).
+	// Multiple rows can exist if ANALYZE was run multiple times; the last
+	// live tuple wins (highest slot number in the highest block).
+	type statKey struct {
+		relid  uint32
+		attnum int16
+	}
+	statMap := make(map[statKey]catalog.PGStatisticRow)
+
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		if err := mgr.ReadBlock(statRel, blk, page); err != nil {
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			continue
+		}
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			if ht.Header.Xmin == storage.InvalidTransactionID || ht.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			if clog != nil && clog.GetStatus(ht.Header.Xmin) == mvcc.TxnStatusAborted {
+				continue
+			}
+			row, err := catalog.DecodePGStatisticPhysicalRow(ht.Data, ht.Bitmap)
+			if err != nil {
+				continue
+			}
+			if row.StaRelid >= catalog.FirstUserOID && row.StaAttNum > 0 {
+				statMap[statKey{relid: row.StaRelid, attnum: row.StaAttNum}] = row
+			}
+		}
+	}
+
+	if len(statMap) == 0 {
+		return nil
+	}
+
+	// Group rows by table OID and apply stats to the in-memory catalog.
+	byRelid := make(map[uint32][]catalog.PGStatisticRow)
+	for _, row := range statMap {
+		byRelid[row.StaRelid] = append(byRelid[row.StaRelid], row)
+	}
+
+	for relid, rows := range byRelid {
+		tbl, ok := cat.LookupTableByOID(relid)
+		if !ok {
+			continue
+		}
+		sort.Slice(rows, func(i, j int) bool { return rows[i].StaAttNum < rows[j].StaAttNum })
+
+		colStats := make([]catalog.ColumnStats, len(tbl.Columns))
+		for _, sr := range rows {
+			idx := int(sr.StaAttNum) - 1
+			if idx < 0 || idx >= len(colStats) {
+				continue
+			}
+			var distinctVal int64
+			if sr.StaDistinct > 0 {
+				distinctVal = int64(sr.StaDistinct)
+			}
+			cs := catalog.ColumnStats{
+				NDistinct: distinctVal,
+				NullFrac:  float64(sr.StaNullFrac),
+			}
+			// MCV
+			if len(sr.MCVFreqs) > 0 && len(sr.MCVValues) > 0 {
+				n := len(sr.MCVFreqs)
+				if len(sr.MCVValues) < n {
+					n = len(sr.MCVValues)
+				}
+				cs.MCV = make([]catalog.MCVEntry, n)
+				for i := 0; i < n; i++ {
+					cs.MCV[i] = catalog.MCVEntry{Value: sr.MCVValues[i], Frequency: float64(sr.MCVFreqs[i])}
+				}
+			}
+			// Histogram
+			if len(sr.HistBounds) > 0 {
+				cs.Histogram = append([]string(nil), sr.HistBounds...)
+			}
+			colStats[idx] = cs
+		}
+		stats := &catalog.TableStats{Columns: colStats}
+		cat.SetTableStats(tbl, stats)
 	}
 	return nil
 }

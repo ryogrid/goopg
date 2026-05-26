@@ -2311,10 +2311,10 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	return nil
 }
 
-// syncIndexToCatalogHeap writes a pg_class row for idx. Called by
-// createBTreeIndex after the full index build succeeds. The row layout
-// matches PG18's 34-column pg_class so the index is visible to an attaching
-// PG18 standby (see syncTableToCatalogHeap for context).
+// syncIndexToCatalogHeap writes a pg_class row and a pg_index row for idx.
+// Called by createBTreeIndex after the full index build succeeds. The row
+// layouts match PG18 canonical format so the index is visible to an attaching
+// PG18 standby and is recoverable via heap scan on restart (M0113).
 func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	classRel := storage.RelFileNode{
 		DBOid:  catalog.DefaultDBOid,
@@ -2332,6 +2332,18 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 	if err := insertPgClassRelnameNspIndexEntry(ctx, idx.Name, relnamespace, classTID); err != nil {
 		return fmt.Errorf("pg_class_relname_nsp_index for index: %w", err)
 	}
+
+	// M0113: write pg_index row so the index is recoverable from the heap
+	// on restart without relying on goopg-private WAL records.
+	pgIndexRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.IndexRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(idx)); err != nil {
+		return fmt.Errorf("pg_index: %w", err)
+	}
+
 	// M0106-0011: CREATE INDEX (and ALTER TABLE ADD PRIMARY KEY) writes a
 	// pg_class row for the new index relation. Flag the txn so the commit
 	// hook emits RecordKindXactCommitInval and refreshes pg_internal.init;

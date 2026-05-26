@@ -15,6 +15,10 @@ package executor
 // the canonical PG18 tupdesc and locates the user table correctly.
 
 import (
+	"encoding/binary"
+	"math"
+	"strconv"
+
 	"github.com/goopg/goopg/internal/catalog"
 )
 
@@ -309,4 +313,290 @@ func attGeneratedFor(col catalog.Column) string {
 		return "s"
 	}
 	return ""
+}
+
+// --- pg_index row builders (M0113) ---
+
+// pgIndexColumnsPG18 mirrors initdb.pgIndexColDefs — the canonical PG18
+// pg_index row layout (21 columns, matching FormData_pg_index in
+// postgres/src/include/catalog/pg_index.h).
+func pgIndexColumnsPG18() []catalog.Column {
+	return []catalog.Column{
+		{Name: "indexrelid", Type: catalog.Type{Name: "oid"}},
+		{Name: "indrelid", Type: catalog.Type{Name: "oid"}},
+		{Name: "indnatts", Type: catalog.Type{Name: "int2"}},
+		{Name: "indnkeyatts", Type: catalog.Type{Name: "int2"}},
+		{Name: "indisunique", Type: catalog.Type{Name: "bool"}},
+		{Name: "indnullsnotdistinct", Type: catalog.Type{Name: "bool"}},
+		{Name: "indisprimary", Type: catalog.Type{Name: "bool"}},
+		{Name: "indisexclusion", Type: catalog.Type{Name: "bool"}},
+		{Name: "indimmediate", Type: catalog.Type{Name: "bool"}},
+		{Name: "indisclustered", Type: catalog.Type{Name: "bool"}},
+		{Name: "indisvalid", Type: catalog.Type{Name: "bool"}},
+		{Name: "indcheckxmin", Type: catalog.Type{Name: "bool"}},
+		{Name: "indisready", Type: catalog.Type{Name: "bool"}},
+		{Name: "indislive", Type: catalog.Type{Name: "bool"}},
+		{Name: "indisreplident", Type: catalog.Type{Name: "bool"}},
+		{Name: "indkey", Type: catalog.Type{Name: "int2vector"}},
+		{Name: "indcollation", Type: catalog.Type{Name: "oidvector"}},
+		{Name: "indclass", Type: catalog.Type{Name: "oidvector"}},
+		{Name: "indoption", Type: catalog.Type{Name: "int2vector"}},
+		{Name: "indexprs", Type: catalog.Type{Name: "pg_node_tree"}},
+		{Name: "indpred", Type: catalog.Type{Name: "pg_node_tree"}},
+	}
+}
+
+// buildUserPGIndexRow constructs the 21-column PG18-canonical pg_index row
+// for a user-defined index. Column names are mapped to 1-based attnums via
+// the index's parent table column list.
+func buildUserPGIndexRow(idx *catalog.Index) Row {
+	n := len(idx.Columns)
+	natts := int64(n)
+
+	attnums := make([]int16, n)
+	if idx.Table != nil {
+		for i, colName := range idx.Columns {
+			for _, col := range idx.Table.Columns {
+				if col.Name == colName {
+					attnums[i] = int16(col.Ordinal + 1)
+					break
+				}
+			}
+		}
+	}
+	zeros32 := make([]uint32, n)
+	zeros16 := make([]int16, n)
+
+	return Row{
+		NewIntDatum(int64(idx.OID)),                          // indexrelid
+		NewIntDatum(int64(tableOIDForIndex(idx))),            // indrelid
+		NewIntDatum(natts),                                   // indnatts
+		NewIntDatum(natts),                                   // indnkeyatts
+		NewBoolDatum(idx.Unique),                             // indisunique
+		NewBoolDatum(false),                                  // indnullsnotdistinct
+		NewBoolDatum(idx.Primary),                            // indisprimary
+		NewBoolDatum(false),                                  // indisexclusion
+		NewBoolDatum(true),                                   // indimmediate
+		NewBoolDatum(false),                                  // indisclustered
+		NewBoolDatum(true),                                   // indisvalid
+		NewBoolDatum(false),                                  // indcheckxmin
+		NewBoolDatum(true),                                   // indisready
+		NewBoolDatum(true),                                   // indislive
+		NewBoolDatum(false),                                  // indisreplident
+		NewBytesDatum(pgInt2VectorBytes(attnums)),            // indkey
+		NewBytesDatum(pgOIDVectorBytes(zeros32)),             // indcollation
+		NewBytesDatum(pgOIDVectorBytes(zeros32)),             // indclass
+		NewBytesDatum(pgInt2VectorBytes(zeros16)),            // indoption
+		NullDatum,                                            // indexprs (NULL)
+		NullDatum,                                            // indpred  (NULL)
+	}
+}
+
+func tableOIDForIndex(idx *catalog.Index) uint32 {
+	if idx.Table != nil {
+		return idx.Table.OID
+	}
+	return 0
+}
+
+// pgInt2VectorBytes builds the on-disk int2vector blob.
+// Mirrors initdb.int2VectorBytes.
+func pgInt2VectorBytes(values []int16) []byte {
+	const hdrSize = 24
+	total := hdrSize + 2*len(values)
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	binary.LittleEndian.PutUint32(buf[4:8], 1)
+	binary.LittleEndian.PutUint32(buf[8:12], 0)
+	binary.LittleEndian.PutUint32(buf[12:16], 21) // INT2OID
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(values)))
+	binary.LittleEndian.PutUint32(buf[20:24], 0)
+	for i, v := range values {
+		binary.LittleEndian.PutUint16(buf[hdrSize+2*i:hdrSize+2*i+2], uint16(v))
+	}
+	return buf
+}
+
+// pgOIDVectorBytes builds the on-disk oidvector blob.
+// Mirrors initdb.oidVectorBytes.
+func pgOIDVectorBytes(oids []uint32) []byte {
+	const hdrSize = 24
+	total := hdrSize + 4*len(oids)
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	binary.LittleEndian.PutUint32(buf[4:8], 1)
+	binary.LittleEndian.PutUint32(buf[8:12], 0)
+	binary.LittleEndian.PutUint32(buf[12:16], 26) // OIDOID
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(oids)))
+	binary.LittleEndian.PutUint32(buf[20:24], 0)
+	for i, o := range oids {
+		binary.LittleEndian.PutUint32(buf[hdrSize+4*i:hdrSize+4*i+4], o)
+	}
+	return buf
+}
+
+// --- pg_statistic row builders (M0112) ---
+
+// pgStatisticColumnsPG18 mirrors the canonical PG18 pg_statistic row layout
+// (31 columns, matching FormData_pg_statistic in pg_statistic.h).
+func pgStatisticColumnsPG18() []catalog.Column {
+	return []catalog.Column{
+		{Name: "starelid", Type: catalog.Type{Name: "oid"}},
+		{Name: "staattnum", Type: catalog.Type{Name: "int2"}},
+		{Name: "stainherit", Type: catalog.Type{Name: "bool"}},
+		{Name: "stanullfrac", Type: catalog.Type{Name: "float4"}},
+		{Name: "stawidth", Type: catalog.Type{Name: "int4"}},
+		{Name: "stadistinct", Type: catalog.Type{Name: "float4"}},
+		{Name: "stakind1", Type: catalog.Type{Name: "int2"}},
+		{Name: "stakind2", Type: catalog.Type{Name: "int2"}},
+		{Name: "stakind3", Type: catalog.Type{Name: "int2"}},
+		{Name: "stakind4", Type: catalog.Type{Name: "int2"}},
+		{Name: "stakind5", Type: catalog.Type{Name: "int2"}},
+		{Name: "staop1", Type: catalog.Type{Name: "oid"}},
+		{Name: "staop2", Type: catalog.Type{Name: "oid"}},
+		{Name: "staop3", Type: catalog.Type{Name: "oid"}},
+		{Name: "staop4", Type: catalog.Type{Name: "oid"}},
+		{Name: "staop5", Type: catalog.Type{Name: "oid"}},
+		{Name: "stacoll1", Type: catalog.Type{Name: "oid"}},
+		{Name: "stacoll2", Type: catalog.Type{Name: "oid"}},
+		{Name: "stacoll3", Type: catalog.Type{Name: "oid"}},
+		{Name: "stacoll4", Type: catalog.Type{Name: "oid"}},
+		{Name: "stacoll5", Type: catalog.Type{Name: "oid"}},
+		{Name: "stanumbers1", Type: catalog.Type{Name: "float4[]"}},
+		{Name: "stanumbers2", Type: catalog.Type{Name: "float4[]"}},
+		{Name: "stanumbers3", Type: catalog.Type{Name: "float4[]"}},
+		{Name: "stanumbers4", Type: catalog.Type{Name: "float4[]"}},
+		{Name: "stanumbers5", Type: catalog.Type{Name: "float4[]"}},
+		{Name: "stavalues1", Type: catalog.Type{Name: "anyarray"}},
+		{Name: "stavalues2", Type: catalog.Type{Name: "anyarray"}},
+		{Name: "stavalues3", Type: catalog.Type{Name: "anyarray"}},
+		{Name: "stavalues4", Type: catalog.Type{Name: "anyarray"}},
+		{Name: "stavalues5", Type: catalog.Type{Name: "anyarray"}},
+	}
+}
+
+const (
+	statisticKindMCV       int16 = 1
+	statisticKindHistogram int16 = 2
+	// eqOp is the OID for text equality operator (used for staop1 MCV slot).
+	eqOp uint32 = 98 // text =
+)
+
+// buildUserPGStatisticRow builds a 31-column PG18-canonical pg_statistic row
+// for one column of a user table. MCV values are stored in slot 1
+// (stakind1=1), histogram in slot 2 (stakind2=2), remaining slots empty.
+func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.ColumnStats) Row {
+	// float4 columns (stanullfrac, stadistinct) are encoded as varlena text
+	// by EncodeRowPG's "float4" branch; pass KindString.
+	nullFracStr := strconv.FormatFloat(stats.NullFrac, 'g', -1, 32)
+	var distinctF64 float64
+	if stats.NDistinct > 0 {
+		distinctF64 = float64(stats.NDistinct)
+	}
+	distinctStr := strconv.FormatFloat(distinctF64, 'g', -1, 32)
+
+	var stakind1, stakind2 int16
+	var staop1 uint32
+	var stanumbers1 Datum = NullDatum
+	var stavalues1 Datum = NullDatum
+	var stanumbers2 Datum = NullDatum
+	var stavalues2 Datum = NullDatum
+
+	if len(stats.MCV) > 0 {
+		stakind1 = statisticKindMCV
+		staop1 = eqOp
+		freqs := make([]float32, len(stats.MCV))
+		vals := make([]string, len(stats.MCV))
+		for i, e := range stats.MCV {
+			freqs[i] = float32(e.Frequency)
+			vals[i] = e.Value
+		}
+		stanumbers1 = NewBytesDatum(pgFloat4ArrayBytes(freqs))
+		stavalues1 = NewBytesDatum(pgTextArrayBytes(vals))
+	}
+	if len(stats.Histogram) > 0 {
+		stakind2 = statisticKindHistogram
+		stavalues2 = NewBytesDatum(pgTextArrayBytes(stats.Histogram))
+	}
+
+	return Row{
+		NewIntDatum(int64(tableOID)),      // starelid
+		NewIntDatum(int64(attNum)),        // staattnum
+		NewBoolDatum(false),               // stainherit
+		NewStringDatum(nullFracStr),       // stanullfrac (float4 as varlena text)
+		NewIntDatum(8),                    // stawidth (avg col width, placeholder)
+		NewStringDatum(distinctStr),       // stadistinct (float4 as varlena text)
+		NewIntDatum(int64(stakind1)),      // stakind1
+		NewIntDatum(int64(stakind2)),      // stakind2
+		NewIntDatum(0),                    // stakind3
+		NewIntDatum(0),                    // stakind4
+		NewIntDatum(0),                    // stakind5
+		NewIntDatum(int64(staop1)),        // staop1
+		NewIntDatum(0),                    // staop2
+		NewIntDatum(0),                    // staop3
+		NewIntDatum(0),                    // staop4
+		NewIntDatum(0),                    // staop5
+		NewIntDatum(0),                    // stacoll1
+		NewIntDatum(0),                    // stacoll2
+		NewIntDatum(0),                    // stacoll3
+		NewIntDatum(0),                    // stacoll4
+		NewIntDatum(0),                    // stacoll5
+		stanumbers1,                       // stanumbers1
+		stanumbers2,                       // stanumbers2
+		NullDatum,                         // stanumbers3
+		NullDatum,                         // stanumbers4
+		NullDatum,                         // stanumbers5
+		stavalues1,                        // stavalues1
+		stavalues2,                        // stavalues2
+		NullDatum,                         // stavalues3
+		NullDatum,                         // stavalues4
+		NullDatum,                         // stavalues5
+	}
+}
+
+// pgFloat4ArrayBytes builds a PG _float4 ArrayType blob from a slice of float32.
+func pgFloat4ArrayBytes(vals []float32) []byte {
+	const hdrSize = 24
+	total := hdrSize + 4*len(vals)
+	buf := make([]byte, total)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
+	binary.LittleEndian.PutUint32(buf[4:8], 1)    // ndim
+	binary.LittleEndian.PutUint32(buf[8:12], 0)   // dataoffset (no nulls)
+	binary.LittleEndian.PutUint32(buf[12:16], 700) // float4 OID
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(vals)))
+	binary.LittleEndian.PutUint32(buf[20:24], 1)  // lbound=1
+	for i, v := range vals {
+		binary.LittleEndian.PutUint32(buf[hdrSize+4*i:hdrSize+4*i+4], math.Float32bits(v))
+	}
+	return buf
+}
+
+// pgTextArrayBytes builds a PG text[] (OID 25) ArrayType blob from a slice of strings.
+// Each element is a varlena with 4-byte header (total_size << 2) followed by UTF-8 bytes.
+func pgTextArrayBytes(strs []string) []byte {
+	const hdrSize = 24
+	totalData := 0
+	for _, s := range strs {
+		n := len(s) + 4 // 4-byte header + data bytes
+		// align to 4 bytes
+		totalData += (n + 3) &^ 3
+	}
+	total := hdrSize + totalData
+	buf := make([]byte, 0, total)
+	hdr := make([]byte, hdrSize)
+	binary.LittleEndian.PutUint32(hdr[12:16], 25) // text OID
+	binary.LittleEndian.PutUint32(hdr[16:20], uint32(len(strs)))
+	binary.LittleEndian.PutUint32(hdr[20:24], 1) // lbound=1
+	// vl_len_ filled after computing total
+	buf = append(buf, hdr...)
+	for _, s := range strs {
+		raw := []byte(s)
+		n := 4 + len(raw)
+		elem := make([]byte, (n+3)&^3)
+		binary.LittleEndian.PutUint32(elem[0:4], uint32(n)<<2)
+		copy(elem[4:], raw)
+		buf = append(buf, elem...)
+	}
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(buf))<<2)
+	return buf
 }

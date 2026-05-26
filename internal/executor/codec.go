@@ -456,6 +456,21 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return d.BytesValue(), nil
 		}
 		return emptyArrayTypeBytes(21), nil
+	case "float4[]", "_float4":
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
+		return emptyArrayTypeBytes(700), nil
+	case "anyarray":
+		// anyarray can hold any element type. Callers pass a pre-built
+		// ArrayType blob via KindBytes (e.g. pg_statistic.stavalues*).
+		// NullDatum is written via the null bitmap by EncodeRowPG, so
+		// we only reach here for non-null datums.
+		if d.Kind == KindBytes {
+			return d.BytesValue(), nil
+		}
+		// Fallback: empty anyarray with elemtype=text (safe placeholder).
+		return emptyArrayTypeBytes(25), nil
 	case "char[]", "_char":
 		// PG binary empty ArrayType, elemtype = char (18).
 		// Used for pg_proc.proargmodes when no per-arg modes are set.
@@ -737,7 +752,7 @@ func physicalPGTypeAlign(t catalog.Type) int {
 		return 8
 	case "name":
 		return 1 // PG 'c' alignment (fixed-size, 1-byte aligned)
-	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "anyarray", "pg_node_tree", "oidvector", "int2vector":
+	case "aclitem[]", "_aclitem", "text[]", "_text", "oid[]", "_oid", "int2[]", "_int2", "char[]", "_char", "float4[]", "_float4", "anyarray", "pg_node_tree", "oidvector", "int2vector":
 		return 4 // PG 'i' alignment for varlena ArrayType / pg_node_tree / oidvector / int2vector
 	default:
 		return 4

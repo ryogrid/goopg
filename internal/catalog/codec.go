@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -514,6 +515,234 @@ func decodePGBool(v byte, field string) (bool, error) {
 	default:
 		return false, fmt.Errorf("%s: invalid bool %d", field, v)
 	}
+}
+
+// PGIndexRow holds the fields from pg_index needed for catalog recovery.
+type PGIndexRow struct {
+	IndexRelid  uint32  // indexrelid
+	IndRelid    uint32  // indrelid (owning table OID)
+	IndNAtts    int16   // indnatts
+	IndKey      []int16 // attnum values for each indexed column
+	IndIsUnique bool    // indisunique
+	IndIsPrimary bool   // indisprimary
+}
+
+const (
+	// pgIndexFixedSize is the byte length of the fixed-width prefix of a
+	// pg_index physical heap tuple up to (and including) the padding byte
+	// before indkey. Layout: indexrelid[4] + indrelid[4] + indnatts[2] +
+	// indnkeyatts[2] + 11 bool fields[11] + 1 pad = 24 bytes.
+	pgIndexFixedSize        = 24
+	pgIndexOffIndexRelid    = 0
+	pgIndexOffIndRelid      = 4
+	pgIndexOffIndNAtts      = 8
+	pgIndexOffIndIsUnique   = 12
+	pgIndexOffIndIsPrimary  = 14
+	// indkey int2vector starts at offset 24 after the 1-byte alignment pad.
+	pgIndexOffIndKey        = 24
+)
+
+// DecodePGIndexPhysicalRow decodes the PG18 physical on-disk format of a
+// pg_index tuple. Only the fields needed for catalog recovery are extracted.
+// The int2vector indkey blob is decoded to extract attnum values.
+func DecodePGIndexPhysicalRow(data []byte) (PGIndexRow, error) {
+	var r PGIndexRow
+	if len(data) < pgIndexFixedSize {
+		return r, fmt.Errorf("pg_index physical row too short: len=%d", len(data))
+	}
+	r.IndexRelid = binary.LittleEndian.Uint32(data[pgIndexOffIndexRelid : pgIndexOffIndexRelid+4])
+	r.IndRelid = binary.LittleEndian.Uint32(data[pgIndexOffIndRelid : pgIndexOffIndRelid+4])
+	r.IndNAtts = int16(binary.LittleEndian.Uint16(data[pgIndexOffIndNAtts : pgIndexOffIndNAtts+2]))
+	r.IndIsUnique = data[pgIndexOffIndIsUnique] != 0
+	r.IndIsPrimary = data[pgIndexOffIndIsPrimary] != 0
+
+	// Decode indkey int2vector (ArrayType varlena) at fixed offset 24.
+	// int2VectorBytes layout: vl_len_[4] + ndim[4] + dataoff[4] +
+	// elemtype[4] + dims[4] + lbounds[4] = 24-byte header, then n*2 data.
+	const vectorHdrSize = 24
+	if len(data) < pgIndexOffIndKey+vectorHdrSize {
+		return r, fmt.Errorf("pg_index: indkey varlena header truncated")
+	}
+	blob := data[pgIndexOffIndKey:]
+	n := int(binary.LittleEndian.Uint32(blob[16:20])) // dims[0]
+	if n < 0 || n > 1024 {
+		return r, fmt.Errorf("pg_index: indkey element count out of range: %d", n)
+	}
+	needed := vectorHdrSize + 2*n
+	if len(blob) < needed {
+		return r, fmt.Errorf("pg_index: indkey data truncated (need %d got %d)", needed, len(blob))
+	}
+	r.IndKey = make([]int16, n)
+	for i := range r.IndKey {
+		r.IndKey[i] = int16(binary.LittleEndian.Uint16(blob[vectorHdrSize+2*i : vectorHdrSize+2*i+2]))
+	}
+	return r, nil
+}
+
+// PGStatisticRow holds the fields from pg_statistic needed for in-memory
+// planner statistics reconstruction.
+type PGStatisticRow struct {
+	StaRelid    uint32    // starelid — owning relation OID
+	StaAttNum   int16     // staattnum — column number (1-based)
+	StaNullFrac float32   // stanullfrac
+	StaWidth    int32     // stawidth (avg column width in bytes)
+	StaDistinct float32   // stadistinct (<0 → fraction; >0 → count)
+	StaKind1    int16     // stakind1 (1=MCV, 2=histogram, 0=empty)
+	StaKind2    int16     // stakind2
+	MCVFreqs    []float32 // stanumbers1 when stakind1==STATISTIC_KIND_MCV
+	MCVValues   []string  // stavalues1 decoded as text
+	HistBounds  []string  // stavalues2 decoded as text when stakind2==STATISTIC_KIND_HISTOGRAM
+}
+
+// pgStatisticPhysicalFixed is the byte length of the fixed-size prefix of a
+// pg_statistic physical tuple. Layout (with C-struct alignment):
+//   starelid[4] staattnum[2] stainherit[1] pad[1] stanullfrac[4] stawidth[4]
+//   stadistinct[4] stakind1[2] stakind2[2] stakind3[2] stakind4[2] stakind5[2]
+//   pad[2] staop1..5[20] stacoll1..5[20] = 72 bytes
+const pgStatisticPhysicalFixed = 72
+
+const (
+	pgStatOffStaRelid    = 0
+	pgStatOffStaAttNum   = 4
+	pgStatOffStaNullFrac = 8  // after bool + 1 pad → aligned to 4
+	pgStatOffStaWidth    = 12
+	pgStatOffStaDistinct = 16
+	pgStatOffStaKind1    = 20
+	pgStatOffStaKind2    = 22
+)
+
+// DecodePGStatisticPhysicalRow decodes the PG18 physical on-disk format of a
+// pg_statistic tuple. The nullable varlena columns (stanumbers1-5,
+// stavalues1-5) are decoded using the null bitmap from the heap tuple.
+//
+// bitmap is the heap tuple null bitmap (may be nil when HEAP_HASNULL is not
+// set). Column numbering is 1-based (matching pg_statistic attnum).
+func DecodePGStatisticPhysicalRow(data []byte, bitmap []byte) (PGStatisticRow, error) {
+	var r PGStatisticRow
+	if len(data) < pgStatisticPhysicalFixed {
+		return r, fmt.Errorf("pg_statistic physical row too short: len=%d", len(data))
+	}
+	r.StaRelid = binary.LittleEndian.Uint32(data[pgStatOffStaRelid : pgStatOffStaRelid+4])
+	r.StaAttNum = int16(binary.LittleEndian.Uint16(data[pgStatOffStaAttNum : pgStatOffStaAttNum+2]))
+	// float4 stored as IEEE-754 little-endian
+	r.StaNullFrac = math.Float32frombits(binary.LittleEndian.Uint32(data[pgStatOffStaNullFrac : pgStatOffStaNullFrac+4]))
+	r.StaWidth = int32(binary.LittleEndian.Uint32(data[pgStatOffStaWidth : pgStatOffStaWidth+4]))
+	r.StaDistinct = math.Float32frombits(binary.LittleEndian.Uint32(data[pgStatOffStaDistinct : pgStatOffStaDistinct+4]))
+	r.StaKind1 = int16(binary.LittleEndian.Uint16(data[pgStatOffStaKind1 : pgStatOffStaKind1+2]))
+	r.StaKind2 = int16(binary.LittleEndian.Uint16(data[pgStatOffStaKind2 : pgStatOffStaKind2+2]))
+
+	// Varlena columns follow the fixed part. Columns 22-31 (stanumbers1-5,
+	// stavalues1-5) are nullable. Each may be NULL (bit clear in bitmap)
+	// or present (varlena bytes in data).
+	//
+	// isNull returns true when column col (1-based) is marked NULL in the
+	// null bitmap. If bitmap is nil all columns are non-null.
+	isNull := func(col int) bool {
+		if len(bitmap) == 0 {
+			return false
+		}
+		idx := col - 1 // 0-based
+		return (bitmap[idx/8]>>(uint(idx)%8))&1 == 0
+	}
+
+	// Advance through varlena columns 22-31 in order.
+	// We only care about stanumbers1 (col 22) and stavalues1-2 (cols 27, 28).
+	off := pgStatisticPhysicalFixed
+
+	readVarlena := func(col int) ([]byte, error) {
+		if isNull(col) {
+			return nil, nil
+		}
+		// Align to 4 bytes (oidvector/anyarray/_float4 all use 'i' alignment).
+		off = (off + 3) &^ 3
+		if off+4 > len(data) {
+			return nil, fmt.Errorf("pg_statistic col %d: varlena header truncated", col)
+		}
+		sz := int(binary.LittleEndian.Uint32(data[off:off+4]) >> 2)
+		if off+sz > len(data) {
+			return nil, fmt.Errorf("pg_statistic col %d: varlena body truncated", col)
+		}
+		blob := data[off : off+sz]
+		off += sz
+		return blob, nil
+	}
+
+	// stanumbers1-5 (cols 22-26)
+	for col := 22; col <= 26; col++ {
+		blob, err := readVarlena(col)
+		if err != nil {
+			return r, err
+		}
+		if col == 22 && blob != nil {
+			r.MCVFreqs = decodeFloat4Array(blob)
+		}
+	}
+	// stavalues1-5 (cols 27-31)
+	for col := 27; col <= 31; col++ {
+		blob, err := readVarlena(col)
+		if err != nil {
+			return r, err
+		}
+		if blob == nil {
+			continue
+		}
+		switch col {
+		case 27:
+			r.MCVValues = decodeTextArray(blob)
+		case 28:
+			if r.StaKind2 == 2 { // STATISTIC_KIND_HISTOGRAM
+				r.HistBounds = decodeTextArray(blob)
+			}
+		}
+	}
+	return r, nil
+}
+
+// decodeFloat4Array decodes a PG ArrayType blob containing float4 elements.
+// Returns nil for malformed blobs.
+func decodeFloat4Array(blob []byte) []float32 {
+	const hdrSize = 24
+	if len(blob) < hdrSize {
+		return nil
+	}
+	n := int(binary.LittleEndian.Uint32(blob[16:20])) // dims[0]
+	if n <= 0 || len(blob) < hdrSize+4*n {
+		return nil
+	}
+	out := make([]float32, n)
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(blob[hdrSize+4*i : hdrSize+4*i+4]))
+	}
+	return out
+}
+
+// decodeTextArray decodes a PG ArrayType blob with text (OID 25) elements.
+// Each element is a varlena with 4-byte little-endian header (len << 2).
+// Returns nil for malformed blobs.
+func decodeTextArray(blob []byte) []string {
+	const hdrSize = 24
+	if len(blob) < hdrSize {
+		return nil
+	}
+	n := int(binary.LittleEndian.Uint32(blob[16:20])) // dims[0]
+	if n <= 0 {
+		return nil
+	}
+	out := make([]string, 0, n)
+	off := hdrSize
+	for i := 0; i < n; i++ {
+		// Each text element in an array has a 4-byte varlena header.
+		if off+4 > len(blob) {
+			break
+		}
+		sz := int(binary.LittleEndian.Uint32(blob[off:off+4]) >> 2)
+		if sz < 4 || off+sz > len(blob) {
+			break
+		}
+		out = append(out, string(blob[off+4:off+sz]))
+		off += sz
+	}
+	return out
 }
 
 // TypeNameToOID maps a goopg type name string to its canonical pg_type OID.

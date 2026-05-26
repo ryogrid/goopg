@@ -72,6 +72,11 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 			return nil, &ExecError{Code: "XX000", Pos: o.stmt.Pos(), Message: err.Error()}
 		}
 		o.ctx.Catalog.SetTableStats(tbl, stats)
+		// M0112: persist stats to pg_statistic so they survive restart.
+		if werr := persistStatsToPGStatistic(o.ctx, tbl, stats); werr != nil {
+			// Non-fatal: stats are in memory; log and continue.
+			_ = werr
+		}
 	}
 	return nil, EOF
 }
@@ -88,6 +93,35 @@ func (o *analyzeOp) targets() []parser.ObjectName {
 	// Iterate the catalog in some stable order. v0's InMemory
 	// catalog doesn't expose a public iterator, so we don't
 	// support the catalog-wide form yet.
+	return nil
+}
+
+// persistStatsToPGStatistic writes per-column statistics to the pg_statistic
+// heap table (OID 2619) so they survive a server restart (M0112). One row is
+// written per column that has statistics. Existing rows for the same
+// (starelid, staattnum, stainherit) are not deleted first — the heap grows
+// monotonically; startup reads the most recent live tuple. Non-fatal on error.
+func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.TableStats) error {
+	if ctx == nil || ctx.Pool == nil || tbl == nil || stats == nil {
+		return nil
+	}
+	statRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.StatisticRelationId,
+		Fork:   storage.MainFork,
+	}
+	cols := pgStatisticColumnsPG18()
+	for i, cs := range stats.Columns {
+		if i >= len(tbl.Columns) {
+			break
+		}
+		col := tbl.Columns[i]
+		attNum := int16(col.Ordinal + 1)
+		row := buildUserPGStatisticRow(tbl.OID, attNum, cs)
+		if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil {
+			return fmt.Errorf("pg_statistic col %q: %w", col.Name, err)
+		}
+	}
 	return nil
 }
 
