@@ -703,6 +703,8 @@ func compatNoopCommandTag(sql string) (string, bool) {
 	switch {
 	case strings.HasPrefix(norm, "create user "), strings.HasPrefix(norm, "create role "):
 		return "CREATE ROLE", true
+	case strings.HasPrefix(norm, "create schema "), norm == "create schema":
+		return "CREATE SCHEMA", true
 	case strings.HasPrefix(norm, "grant "), norm == "grant":
 		return "GRANT", true
 	case strings.HasPrefix(norm, "revoke "), norm == "revoke":
@@ -1379,6 +1381,21 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			{Code: protocol.FieldSQLState, Value: "00000"},
 			{Code: protocol.FieldMessage, Value: msg},
 		}); nerr != nil {
+			return nerr
+		}
+	}
+	// Emit NOTICE+DETAIL messages (e.g. DROP CASCADE cascade list). M0097-0020.
+	for _, n := range ctx.TakeNoticesWithDetail() {
+		fields := []protocol.ErrorField{
+			{Code: protocol.FieldSeverity, Value: "NOTICE"},
+			{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: protocol.FieldSQLState, Value: "00000"},
+			{Code: protocol.FieldMessage, Value: n.Message},
+		}
+		if n.Detail != "" {
+			fields = append(fields, protocol.ErrorField{Code: protocol.FieldDetail, Value: n.Detail})
+		}
+		if nerr := w.WriteNoticeResponse(fields); nerr != nil {
 			return nerr
 		}
 	}

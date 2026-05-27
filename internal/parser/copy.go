@@ -151,7 +151,13 @@ func (p *parser) parseCopyInnerQuery() (Stmt, error) {
 			return p.parseStatementWithCTE()
 		}
 	}
-	return p.parseSelect()
+	// For COPY (SELECT … INTO …): stop before consuming INTO so parseCopy's
+	// SelectInto detection mechanism still works. M0097-0024.
+	old := p.selectIntoCopyStop
+	p.selectIntoCopyStop = true
+	stmt, err := p.parseSelect()
+	p.selectIntoCopyStop = old
+	return stmt, err
 }
 
 // skipInnerQueryRemainder consumes the unparsed tail of a COPY (...) inner

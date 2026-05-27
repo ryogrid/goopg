@@ -890,6 +890,12 @@ type CreateTableStmt struct {
 	// M0096-0009 will use these; for now the field is populated so the
 	// syntax is accepted and the executor can create the child table.
 	Inherits []ObjectName
+	// ColumnAliases holds the optional column-name list from
+	// `CREATE TABLE name (col1, col2, …) AS SELECT …`. When non-nil its
+	// length must not exceed the number of columns the SELECT returns; alias
+	// names replace the derived column names left-to-right; remaining columns
+	// keep their SELECT-derived names. M0097-0020.
+	ColumnAliases []string
 	// SelectSource is non-nil for `CREATE TABLE name AS SELECT …` (CTAS).
 	// The table is created with columns derived from the SELECT result. M0096-0008.
 	SelectSource *SelectStmt

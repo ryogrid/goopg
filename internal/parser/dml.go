@@ -34,7 +34,12 @@ func (p *parser) parseInsert() (Stmt, error) {
 	}
 	// INSERT … SELECT | INSERT … VALUES | INSERT … DEFAULT VALUES
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
+		// SELECT … INTO is not permitted inside INSERT's SELECT (M0097-0020).
+		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+		p.selectIntoNoPos = false
 		sel, err := p.parseSelect()
+		p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 		if err != nil {
 			return nil, err
 		}

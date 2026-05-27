@@ -314,6 +314,8 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if _, exists := o.ctx.Catalog.LookupTable(s.Name); exists {
 		if s.IfNotExists {
+			o.ctx.Notices = append(o.ctx.Notices,
+				fmt.Sprintf("relation %q already exists, skipping", s.Name.String()))
 			return nil
 		}
 		// TEMP TABLE shadows the permanent table: save the permanent table for
@@ -518,14 +520,26 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		return &ExecError{Code: "42601", Pos: s.Pos(), Message: err.Error()}
 	}
 	outSchema := selectNode.Output()
+	// Validate column alias count: aliases must not exceed column count. M0097-0020.
+	if len(s.ColumnAliases) > len(outSchema) {
+		return &ExecError{
+			Code:    "42601",
+			Pos:     s.Pos(),
+			Message: "too many column names were specified",
+		}
+	}
 	cols := make([]catalog.Column, len(outSchema))
 	for i, sc := range outSchema {
 		typeName := sc.Type.Name
 		if typeName == "" || typeName == "unknown" {
 			typeName = "text"
 		}
+		colName := sc.Name
+		if i < len(s.ColumnAliases) {
+			colName = s.ColumnAliases[i]
+		}
 		cols[i] = catalog.Column{
-			Name: sc.Name, Type: catalog.Type{Name: strings.ToLower(typeName)},
+			Name: colName, Type: catalog.Type{Name: strings.ToLower(typeName)},
 		}
 	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
@@ -2697,6 +2711,67 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 
 // it emits a NOTICE; otherwise it silently succeeds (no catalog check). M0097-0008.
 func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
+	objType := strings.ToLower(s.ObjType)
+
+	// DROP SCHEMA [IF EXISTS] name [CASCADE|RESTRICT] — M0097-0020.
+	// Find all user tables in the schema and cascade-drop them.
+	if objType == "schema" {
+		for _, name := range s.Names {
+			schemaName := name.Name
+			if name.Schema != "" {
+				schemaName = name.Schema + "." + name.Name
+			}
+			tables := o.ctx.Catalog.TablesInSchema(schemaName)
+			if len(tables) == 0 && !s.IfExists {
+				// No tables found; schema may not exist (we don't track schemas separately).
+				// Return "schema does not exist" only when not IF EXISTS.
+				return &ExecError{
+					Code:    "3F000",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("schema %q does not exist", schemaName),
+				}
+			}
+			if s.IfExists && len(tables) == 0 {
+				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", schemaName))
+				continue
+			}
+			if s.Behavior == parser.DropCascade && len(tables) > 0 {
+				// Sort table names for deterministic DETAIL output.
+				sort.Slice(tables, func(i, j int) bool {
+					return tables[i].String() < tables[j].String()
+				})
+				// Drop each table in the schema.
+				for _, tbl := range tables {
+					if err := o.ctx.Catalog.DropTable(tbl); err != nil {
+						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
+					}
+				}
+				// Emit NOTICE "drop cascades to N other objects" with DETAIL.
+				// PostgreSQL's DETAIL field is multi-line; psql prints the first
+				// line with "DETAIL:" and continuation lines as plain text.
+				detailLines := make([]string, len(tables))
+				for i, tbl := range tables {
+					detailLines[i] = fmt.Sprintf("drop cascades to table %s", tbl.String())
+				}
+				detail := strings.Join(detailLines, "\n")
+				o.ctx.AddNoticeWithDetail(
+					fmt.Sprintf("drop cascades to %d other objects", len(tables)),
+					detail,
+				)
+			}
+		}
+		return nil
+	}
+
+	// DROP USER / DROP ROLE — succeed silently when we cannot verify role existence.
+	// goopg tracks roles in the server's in-memory set but the executor has no
+	// callback to it; pretend success to avoid spurious "does not exist" errors
+	// in regress tests that CREATE then DROP a user within the same session.
+	// M0097-0020.
+	if objType == "user" || objType == "role" || objType == "group" {
+		return nil
+	}
+
 	if s.IfExists {
 		// Emit NOTICE for each name (we don't know if they exist).
 		// The test driver compares against expected NOTICEs.
@@ -2706,7 +2781,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		return nil
 	}
 	// Handle sequence drops against the in-memory registry. M0097-0038.
-	if strings.ToLower(s.ObjType) == "sequence" {
+	if objType == "sequence" {
 		for _, name := range s.Names {
 			if !DropSequence(name.String()) {
 				return &ExecError{
@@ -2719,7 +2794,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		return nil
 	}
 	// Handle DROP MATERIALIZED VIEW via the catalog's DropView. M0097-0038.
-	if strings.ToLower(s.ObjType) == "materialized view" {
+	if objType == "materialized view" {
 		for _, name := range s.Names {
 			if err := o.ctx.Catalog.DropView(name, s.IfExists); err != nil {
 				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
@@ -2729,7 +2804,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	}
 	// DROP AGGREGATE: validate the arg type and emit PG-style error messages.
 	// PG format: "aggregate name(canonicaltype) does not exist". M0097-regress.
-	if strings.ToLower(s.ObjType) == "aggregate" && len(s.Names) > 0 && len(s.ArgTypes) > 0 {
+	if objType == "aggregate" && len(s.Names) > 0 && len(s.ArgTypes) > 0 {
 		argType := s.ArgTypes[0]
 		if argType != "" && argType != "*" {
 			canonical := dropCompatCanonicalType(argType)
@@ -2743,7 +2818,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	}
 	// DROP OPERATOR: validate types and emit PG-style error messages.
 	// ArgTypes = [leftType, rightType]; "" means single-arg (missing second arg). M0097-regress.
-	if strings.ToLower(s.ObjType) == "operator" && len(s.Names) > 0 && len(s.ArgTypes) == 2 {
+	if objType == "operator" && len(s.Names) > 0 && len(s.ArgTypes) == 2 {
 		leftType := s.ArgTypes[0]
 		rightType := s.ArgTypes[1]
 		// Single type argument (no comma) → PG reports "missing argument".

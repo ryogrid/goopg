@@ -475,7 +475,12 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect) {
 		return nil, p.errAtCur("expected SELECT after AS")
 	}
+	// SELECT … INTO is not permitted in a view body (M0097-0020).
+	old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+	p.selectIntoErrMsg = "views must not contain SELECT INTO"
+	p.selectIntoNoPos = true
 	inner, err := p.parseSelect()
+	p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 	if err != nil {
 		return nil, err
 	}
@@ -590,6 +595,38 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		return nil, err
 	}
 	stmt.Name = name
+
+	// Detect optional column-alias list before AS:
+	//   CREATE TABLE name (col1, col2, …) AS SELECT … [WITH NO DATA]
+	// Disambiguation from regular column defs: CTAS aliases are bare identifiers
+	// with no type. We speculatively consume the parenthesised list; if AS does
+	// NOT follow we restore the token index and fall through to regular parsing.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		savedIdx := p.idx
+		p.advance() // consume '('
+		var aliasCandidate []string
+		ok := true
+		for p.cur().Kind != TokenEOF {
+			id, err := p.parseIdent()
+			if err != nil {
+				ok = false
+				break
+			}
+			aliasCandidate = append(aliasCandidate, identText(id))
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+		if ok && p.acceptSymbol(")") && p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
+			// Confirmed CTAS column-alias list: keep the aliases and let the
+			// AS check below consume and process the CREATE TABLE AS body.
+			stmt.ColumnAliases = aliasCandidate
+		} else {
+			// Not a CTAS alias list: restore and let regular column-def
+			// parsing handle the '(' (which may be empty `()` or real defs).
+			p.idx = savedIdx
+		}
+	}
 
 	// CREATE TABLE name AS SELECT/EXECUTE … [WITH NO DATA] (CTAS). M0096-0008.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {

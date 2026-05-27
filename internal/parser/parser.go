@@ -25,9 +25,16 @@ var tokenSlicePool = sync.Pool{
 type SyntaxError struct {
 	Pos     int
 	Message string
+	// Raw suppresses the "syntax error at or near …" wrapper: Error() returns
+	// Message verbatim. Used for semantic errors caught during parsing (e.g.
+	// "SELECT … INTO is not allowed here") that have their own wording.
+	Raw bool
 }
 
 func (e *SyntaxError) Error() string {
+	if e.Raw {
+		return e.Message
+	}
 	return fmt.Sprintf("syntax error at or near %q (byte %d)", e.Message, e.Pos)
 }
 
@@ -181,6 +188,19 @@ func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
 type parser struct {
 	tokens []Token
 	idx    int
+	// selectIntoErrMsg is non-empty when SELECT … INTO is forbidden in the
+	// current parse context (cursor, subquery, view body, INSERT SELECT).
+	// parseSelect emits a SyntaxError with this message when INTO is seen.
+	// selectIntoNoPos suppresses the FieldPosition field (for contexts where
+	// PG does not emit a caret, e.g. CREATE VIEW).
+	selectIntoErrMsg string
+	selectIntoNoPos  bool
+	// selectIntoCopyStop: when true, parseSelect stops *before* consuming
+	// INTO (returning a partial SelectStmt). parseCopy uses this to detect
+	// the deprecated `SELECT … INTO …` form and flag CopyStmt.SelectInto so
+	// planCopy can emit the PG-compatible "COPY (SELECT INTO) is not
+	// supported" error. M0097-0024.
+	selectIntoCopyStop bool
 }
 
 func (p *parser) cur() Token {
@@ -1563,11 +1583,20 @@ func (p *parser) parseMergeWhenClause() (*MergeWhenClause, error) {
 	return clause, nil
 }
 
-// parseReset: RESET name | RESET ALL
+// parseReset: RESET name | RESET ALL | RESET SESSION AUTHORIZATION
 func (p *parser) parseReset() (Stmt, error) {
 	t := p.advance()
 	if p.acceptKeyword(KwAll) {
 		return &ResetStmt{pos: t.Pos, All: true}, nil
+	}
+	// RESET SESSION AUTHORIZATION — no-op: map to "session_authorization" GUC.
+	// SESSION is KwCatUnreserved so parseGUCName would consume it and leave
+	// "AUTHORIZATION" as a stray token, causing a syntax error. Intercept here.
+	if p.acceptKeyword(KwSession) {
+		if !p.acceptIdentKeyword("authorization") {
+			return nil, p.errAtCur("expected AUTHORIZATION after RESET SESSION")
+		}
+		return &ResetStmt{pos: t.Pos, Name: "session_authorization"}, nil
 	}
 	name, err := p.parseGUCName()
 	if err != nil {
@@ -1678,7 +1707,12 @@ func (p *parser) parseDeclareCursor() (Stmt, error) {
 		return nil, p.errAtCur("expected FOR in DECLARE CURSOR")
 	}
 
+	// SELECT … INTO is not permitted inside a cursor (M0097-0020).
+	old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+	p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+	p.selectIntoNoPos = false
 	query, err := p.parseSelect()
+	p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 	if err != nil {
 		return nil, err
 	}

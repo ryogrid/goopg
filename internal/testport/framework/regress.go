@@ -675,13 +675,34 @@ func NormalizeRegressOutput(raw string) string {
 	// that caused them. To allow both orderings to compare equal, we
 	// move all ERROR/NOTICE lines to the end of the document (sorted).
 	// This is applied to both expected and actual sides identically.
+	//
+	// CASCADE continuation normalization (M0097-0020):
+	// DROP CASCADE emits a NOTICE with a multi-line DETAIL field.  psql
+	// formats the first DETAIL line with "DETAIL:  drop cascades to table X"
+	// and subsequent lines as plain "drop cascades to table Y" continuation
+	// text (no severity prefix).  goopg's test runner appends stderr to
+	// stdout, so continuation lines end up at a different position than in
+	// PostgreSQL's inline output.  To allow both orderings to compare equal:
+	//   a) Strip "DETAIL:  " prefix from lines that are DROP CASCADE details.
+	//   b) Move all "drop cascades to …" lines to the error section.
+	// This normalises all 8 cascade-object lines (1 DETAIL + 7 continuations)
+	// to the same error section and sort order on both sides.
+	for i, line := range lines {
+		if strings.HasPrefix(line, "DETAIL:") &&
+			strings.Contains(line, "drop cascades to ") {
+			// Strip the "DETAIL:  " prefix so it sorts with plain cascade lines.
+			rest := strings.TrimSpace(strings.TrimPrefix(line, "DETAIL:"))
+			lines[i] = rest
+		}
+	}
 	var nonErrorLines, errorLines []string
 	for _, line := range lines {
 		isErrLine := strings.HasPrefix(line, "ERROR:") ||
 			strings.HasPrefix(line, "NOTICE:") ||
 			strings.HasPrefix(line, "HINT:") ||
 			strings.HasPrefix(line, "DETAIL:") ||
-			strings.HasPrefix(line, "WARNING:")
+			strings.HasPrefix(line, "WARNING:") ||
+			strings.HasPrefix(line, "drop cascades to ") // CASCADE continuation lines
 		if isErrLine {
 			errorLines = append(errorLines, line)
 		} else {

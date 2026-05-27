@@ -71,10 +71,27 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		return s.handleShow(w, sess, name)
 	case strings.HasPrefix(upper, "SET LOCAL "):
 		return s.handleSet(w, sess, matchable[len("SET LOCAL "):], true)
+	// SET SESSION AUTHORIZATION name — no-op: we don't implement role switching.
+	// Must be checked before the generic "SET " case so splitSet doesn't mis-parse
+	// "SESSION AUTHORIZATION name" as parameter "SESSION" with value "AUTHORIZATION name".
+	case strings.HasPrefix(upper, "SET SESSION AUTHORIZATION "),
+		upper == "SET SESSION AUTHORIZATION":
+		if err := w.WriteCommandComplete("SET"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	case strings.HasPrefix(upper, "SET "):
 		return s.handleSet(w, sess, matchable[len("SET "):], false)
 	case upper == "RESET ALL":
 		sess.ResetAll()
+		if err := w.WriteCommandComplete("RESET"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	// RESET SESSION AUTHORIZATION — no-op: no role to restore.
+	// Must be checked before the generic "RESET " case so "SESSION AUTHORIZATION"
+	// is not used verbatim as a GUC parameter name.
+	case upper == "RESET SESSION AUTHORIZATION":
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
 		}

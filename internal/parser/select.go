@@ -110,6 +110,33 @@ func (p *parser) parseSelect() (Stmt, error) {
 		s.Targets = tgts
 	}
 
+	// SELECT … INTO [TABLE] tablename … is PostgreSQL's old syntax for CTAS.
+	// It is only permitted at the top level (not inside cursors, subqueries,
+	// views, or INSERT's SELECT). M0097-0020.
+	var selectIntoTable *ObjectName
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwInto {
+		switch {
+		case p.selectIntoCopyStop:
+			// COPY inner-query mode: stop before INTO so parseCopy can detect
+			// and flag CopyStmt.SelectInto for planCopy's error path. M0097-0024.
+		case p.selectIntoErrMsg != "":
+			// Forbidden context: produce the appropriate error at the INTO position.
+			errPos := p.cur().Pos
+			if p.selectIntoNoPos {
+				errPos = -1
+			}
+			return nil, &SyntaxError{Pos: errPos, Message: p.selectIntoErrMsg, Raw: true}
+		default:
+			p.advance()                   // consume INTO
+			_ = p.acceptKeyword(KwTable) // optional TABLE keyword
+			name, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			selectIntoTable = &name
+		}
+	}
+
 	if p.acceptKeyword(KwFrom) {
 		fromExprs, from, err := p.parseFromList()
 		if err != nil {
@@ -241,6 +268,15 @@ func (p *parser) parseSelect() (Stmt, error) {
 	}
 	if err := RewriteIndirectionStarTargets(s, nil); err != nil {
 		return nil, err
+	}
+	// SELECT INTO: wrap the SelectStmt in a CreateTableStmt to be handled
+	// identically to CTAS by the planner/executor. M0097-0020.
+	if selectIntoTable != nil {
+		return &CreateTableStmt{
+			pos:          s.pos,
+			Name:         *selectIntoTable,
+			SelectSource: s,
+		}, nil
 	}
 	return s, nil
 }
@@ -726,7 +762,12 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	if isSubqueryStart {
 		pos := p.cur().Pos
 		p.advance() // (
+		// SELECT … INTO is not permitted in a derived-table subquery (M0097-0020).
+		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+		p.selectIntoNoPos = false
 		inner, err := p.parseSelect()
+		p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 		if err != nil {
 			return RangeVar{}, err
 		}
@@ -1658,7 +1699,12 @@ func (p *parser) parsePrimary() (Expr, error) {
 			// have their own grammars and are deferred to a
 			// follow-up loop.
 			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
+				// SELECT … INTO is not permitted in a scalar subquery (M0097-0020).
+				old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+				p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+				p.selectIntoNoPos = false
 				inner, err := p.parseSelect()
+				p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 				if err != nil {
 					return nil, err
 				}
@@ -1830,7 +1876,12 @@ func (p *parser) parseExistsExpr(negated bool) (Expr, error) {
 	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect) {
 		return nil, p.errAtCur("EXISTS requires a parenthesised SELECT")
 	}
+	// SELECT … INTO is not permitted in an EXISTS subquery (M0097-0020).
+	old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+	p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+	p.selectIntoNoPos = false
 	inner, err := p.parseSelect()
+	p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 	if err != nil {
 		return nil, err
 	}
@@ -1882,7 +1933,12 @@ func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 		return nil, p.errAtCur("expected '(' after IN")
 	}
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
+		// SELECT … INTO is not permitted in an IN subquery (M0097-0020).
+		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+		p.selectIntoNoPos = false
 		inner, err := p.parseSelect()
+		p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 		if err != nil {
 			return nil, err
 		}

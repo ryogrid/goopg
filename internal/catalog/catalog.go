@@ -295,6 +295,9 @@ type Catalog interface {
 	AddColumn(table *Table, col Column) (*Column, error)
 	DropTable(name parser.ObjectName) error
 	DropIndex(name parser.ObjectName) error
+	// TablesInSchema returns the names of all non-virtual user tables in the given
+	// schema.  Used by DROP SCHEMA CASCADE. M0097-0020.
+	TablesInSchema(schemaName string) []parser.ObjectName
 	IndexesOnTable(table *Table) []*Index
 	HasPrimaryKey(table *Table) bool
 	RelFileNode(table *Table) storage.RelFileNode
@@ -2134,6 +2137,30 @@ func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
 	}
 	delete(c.tables, k)
 	return nil
+}
+
+// TablesInSchema returns the names of all non-virtual user tables whose Schema
+// field matches schemaName (case-insensitive).  Virtual/system tables in
+// pg_catalog or information_schema are excluded.  Used by DROP SCHEMA CASCADE
+// to identify objects to cascade-drop. M0097-0020.
+func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	schemaLC := strings.ToLower(schemaName)
+	var out []parser.ObjectName
+	for _, t := range c.tables {
+		if t.Virtual {
+			continue // skip system/virtual tables
+		}
+		tSchema := t.Schema
+		if tSchema == "" {
+			tSchema = "public"
+		}
+		if strings.ToLower(tSchema) == schemaLC {
+			out = append(out, parser.ObjectName{Schema: t.Schema, Name: t.Name})
+		}
+	}
+	return out
 }
 
 func (c *InMemory) DropTable(name parser.ObjectName) error {
