@@ -431,11 +431,12 @@ func TestPlanDerivedTable(t *testing.T) {
 		}
 	})
 
-	t.Run("derived table requires alias", func(t *testing.T) {
-		// The parser-side check enforces this.
+	t.Run("derived table without alias auto-generates synthetic alias", func(t *testing.T) {
+		// PostgreSQL 16+ allows omitting the alias on a derived table; goopg
+		// mirrors this by injecting a synthetic "__sq_<pos>" alias at parse time.
 		_, err := parser.Parse("SELECT * FROM (SELECT 1) ORDER BY 1")
-		if err == nil {
-			t.Fatalf("expected parser error for missing alias on derived table")
+		if err != nil {
+			t.Fatalf("unexpected parser error for derived table without alias: %v", err)
 		}
 	})
 }

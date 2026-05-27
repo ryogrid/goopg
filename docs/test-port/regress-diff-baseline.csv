@@ -26,7 +26,7 @@ errors,0,pass
 hash_part,0,pass
 hash_index,0,pass
 index_including_gist,112,failed
-expressions,118,failed
+expressions,0,pass
 select_into,133,failed
 prepare,0,pass
 dbsize,0,pass

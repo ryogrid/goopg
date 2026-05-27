@@ -1274,7 +1274,7 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 				ct.Name = "varbit"
 			}
 		case "timestamp":
-			if p.acceptIdentKeyword("with") {
+			if p.acceptKeyword(KwWith) {
 				p.acceptIdentKeyword("time")
 				p.acceptIdentKeyword("zone")
 				ct.Name = "timestamptz"
@@ -1284,7 +1284,7 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 				ct.Name = "timestamp"
 			}
 		case "time":
-			if p.acceptIdentKeyword("with") {
+			if p.acceptKeyword(KwWith) {
 				p.acceptIdentKeyword("time")
 				p.acceptIdentKeyword("zone")
 				ct.Name = "timetz"
@@ -1314,6 +1314,32 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 				return ColumnType{}, p.errAtCur("expected ',' or ')'")
 			}
 			break
+		}
+	}
+	// Handle "time(N) with/without time zone" and "timestamp(N) with/without time zone"
+	// where the timezone qualifier follows the typmod parentheses.
+	if len(ct.Args) > 0 {
+		switch strings.ToLower(ct.Name) {
+		case "time":
+			if p.acceptKeyword(KwWith) {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "timetz"
+			} else if p.acceptIdentKeyword("without") {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "time"
+			}
+		case "timestamp":
+			if p.acceptKeyword(KwWith) {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "timestamptz"
+			} else if p.acceptIdentKeyword("without") {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "timestamp"
+			}
 		}
 	}
 	if first.Kind != TokenQuotedIdent && strings.EqualFold(ct.Name, "char") && len(ct.Args) == 0 {
