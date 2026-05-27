@@ -16,8 +16,11 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"sync"
+
+	"github.com/goopg/goopg/internal/catalog"
 )
 
 // advisoryKey is the unified key for advisory locks.
@@ -48,6 +51,8 @@ type advisoryHold struct {
 	owner        uintptr
 	sessionCount int
 	xactCount    int
+	shared       bool // true = ShareLock, false = ExclusiveLock (for pg_locks reporting)
+	twoArg       bool // true = int4+int4 form (objsubid=2), false = bigint form (objsubid=1)
 }
 
 type advisorySessionHolds struct {
@@ -92,10 +97,12 @@ func (m *advisoryManager) cleanupSessionStateLocked(sess uintptr) {
 	}
 }
 
-func (m *advisoryManager) addHoldLocked(key advisoryKey, sess uintptr, xactScoped bool) {
+func (m *advisoryManager) addHoldLocked(key advisoryKey, sess uintptr, xactScoped, shared, twoArg bool) {
 	hold := m.held[key]
 	if hold.owner == 0 {
 		hold.owner = sess
+		hold.shared = shared
+		hold.twoArg = twoArg
 	}
 	state := m.sessionStateLocked(sess)
 	if xactScoped {
@@ -192,19 +199,19 @@ func (m *advisoryManager) releaseAllXactLocked(sess uintptr) {
 
 // acquire blocks until the lock is available for sess or ctx is cancelled.
 // Returns ctx.Err() if cancelled, nil on success.
-func (m *advisoryManager) acquire(ctx context.Context, key advisoryKey, sess uintptr, xactScoped bool) error {
+func (m *advisoryManager) acquire(ctx context.Context, key advisoryKey, sess uintptr, xactScoped, shared, twoArg bool) error {
 	m.mu.Lock()
 
 	holder, held := m.held[key]
 	if !held {
 		// Lock is free — acquire immediately.
-		m.addHoldLocked(key, sess, xactScoped)
+		m.addHoldLocked(key, sess, xactScoped, shared, twoArg)
 		m.mu.Unlock()
 		return nil
 	}
 	if holder.owner == sess {
 		// Same session already holds it — re-entrant, no-op.
-		m.addHoldLocked(key, sess, xactScoped)
+		m.addHoldLocked(key, sess, xactScoped, shared, twoArg)
 		m.mu.Unlock()
 		return nil
 	}
@@ -220,7 +227,7 @@ func (m *advisoryManager) acquire(ctx context.Context, key advisoryKey, sess uin
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return m.acquire(ctx, key, sess, xactScoped)
+		return m.acquire(ctx, key, sess, xactScoped, shared, twoArg)
 
 	case <-ctx.Done():
 		// Cancelled before we got the lock — remove our waiter entry.
@@ -239,7 +246,7 @@ func (m *advisoryManager) acquire(ctx context.Context, key advisoryKey, sess uin
 
 // tryAcquire is a non-blocking attempt to acquire the lock.
 // Returns true if acquired, false if already held by a different session.
-func (m *advisoryManager) tryAcquire(key advisoryKey, sess uintptr, xactScoped bool) bool {
+func (m *advisoryManager) tryAcquire(key advisoryKey, sess uintptr, xactScoped, shared, twoArg bool) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -247,7 +254,7 @@ func (m *advisoryManager) tryAcquire(key advisoryKey, sess uintptr, xactScoped b
 	if held && holder.owner != sess {
 		return false
 	}
-	m.addHoldLocked(key, sess, xactScoped)
+	m.addHoldLocked(key, sess, xactScoped, shared, twoArg)
 	return true
 }
 
@@ -334,5 +341,60 @@ func advisorySessionIDFromContext(ctx *Context) uintptr {
 func ReleaseAdvisoryTransactionLocks(identity any) {
 	if id := advisoryPointerID(identity); id != 0 {
 		globalAdvisoryMgr.releaseAllXact(id)
+	}
+}
+
+// PgLockRows returns pg_locks-compatible rows for all currently-held advisory
+// locks. Column order matches pg_locks virtual table:
+// locktype, database, relation, page, tuple, virtualxid, transactionid,
+// classid, objid, objsubid, virtualtransaction, pid, mode, granted, fastpath, waitstart.
+// M0097-0021.
+func (m *advisoryManager) PgLockRows() [][]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.held) == 0 {
+		return nil
+	}
+	rows := make([][]string, 0, len(m.held))
+	for key, hold := range m.held {
+		classid := fmt.Sprintf("%d", key.hi)
+		objid := fmt.Sprintf("%d", key.lo)
+		subid := "1"
+		if hold.twoArg {
+			subid = "2"
+		}
+		mode := "ExclusiveLock"
+		if hold.shared {
+			mode = "ShareLock"
+		}
+		rows = append(rows, []string{
+			"advisory", // locktype
+			"16384",    // database
+			"",         // relation
+			"",         // page
+			"",         // tuple
+			"",         // virtualxid
+			"",         // transactionid
+			classid,    // classid
+			objid,      // objid
+			subid,      // objsubid
+			"",         // virtualtransaction
+			"0",        // pid
+			mode,       // mode
+			"t",        // granted
+			"f",        // fastpath
+			"",         // waitstart
+		})
+	}
+	return rows
+}
+
+// init registers the advisory lock row provider with the catalog package so
+// pg_locks can include advisory lock state without creating an import cycle.
+// M0097-0021.
+func init() {
+	catalog.AdvisoryLockRowsFunc = func() [][]string {
+		return globalAdvisoryMgr.PgLockRows()
 	}
 }

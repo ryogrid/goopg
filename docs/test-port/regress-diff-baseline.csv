@@ -33,7 +33,7 @@ dbsize,0,pass
 lock,131,failed
 prepared_xacts,132,failed
 drop_if_exists,130,failed
-advisory_lock,142,failed
+advisory_lock,0,pass
 case,148,failed
 uuid,0,pass
 select_distinct_on,0,passed

@@ -194,6 +194,13 @@ type Context struct {
 	// any blocking point. M0100-0005.
 	NoticeFlush func(string)
 
+	// Warnings accumulates WARNING-severity messages emitted during statement
+	// execution (e.g. "you don't own a lock of type ExclusiveLock" from
+	// pg_advisory_unlock* called without a matching held lock). The server
+	// emits these as NoticeResponse with WARNING severity before CommandComplete.
+	// M0097-0021.
+	Warnings []string
+
 	// Sequence session state — maps sequence key → last nextval result
 	// for currval(); LastSeqVal/LastSeqSet track the lastval() return. M0097-0009.
 	CurrSeqVals map[string]int64
@@ -304,6 +311,20 @@ func (c *Context) TakeNotices() []string {
 	n := c.Notices
 	c.Notices = nil
 	return n
+}
+
+// AddWarning appends a WARNING-severity message to the context's warning queue.
+// M0097-0021.
+func (c *Context) AddWarning(msg string) {
+	c.Warnings = append(c.Warnings, msg)
+}
+
+// TakeWarnings returns and clears the accumulated warnings.
+// M0097-0021.
+func (c *Context) TakeWarnings() []string {
+	w := c.Warnings
+	c.Warnings = nil
+	return w
 }
 
 // acquireRelLock funnels every operator's relation-level lock

@@ -1383,6 +1383,18 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		}
 	}
 
+	// Emit accumulated WARNING messages before CommandComplete. M0097-0021.
+	for _, msg := range ctx.TakeWarnings() {
+		if nerr := w.WriteNoticeResponse([]protocol.ErrorField{
+			{Code: protocol.FieldSeverity, Value: "WARNING"},
+			{Code: protocol.FieldSeverityNonLocal, Value: "WARNING"},
+			{Code: protocol.FieldSQLState, Value: "55000"},
+			{Code: protocol.FieldMessage, Value: msg},
+		}); nerr != nil {
+			return nerr
+		}
+	}
+
 	tag := commandTagFor(node, op, rowCount)
 	if tag == "" {
 		tag = "OK"

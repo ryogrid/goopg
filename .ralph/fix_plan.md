@@ -1075,6 +1075,32 @@ M0097-0001 wires it up.
         and `ObjType` set to `"materialized view"` (was `"materialized"`).
         (h) Partitioned-table error includes `"public."` schema prefix.
         `tid` → **pass** (0 diff lines). Baseline CSV updated.
+      - **Progress 2026-05-27 (M0097-0039 — advisory_lock → pass):**
+        (a) Added `oid` column to `pg_database` virtual table (ordinal 0,
+        value "16384"); this makes `SELECT oid AS datoid FROM pg_database
+        WHERE datname = current_database() \gset` succeed, eliminating
+        lex errors from undefined `:datoid` variable.
+        (b) Added `Warnings []string` + `AddWarning()`/`TakeWarnings()`
+        to executor `Context`; server dispatch now emits accumulated
+        warnings as NoticeResponse with `severity=WARNING` before
+        CommandComplete.
+        (c) Replaced `pg_advisory_lock_shared` / `pg_advisory_xact_lock_shared`
+        no-ops with full `evalAdvisoryLock(..., shared=true)` implementation;
+        these now return void (empty string) instead of `f` (bool false).
+        (d) Extended `advisoryHold` with `shared bool` / `twoArg bool`
+        fields; `addHoldLocked`, `acquire`, `tryAcquire` propagate them.
+        (e) Added `PgLockRows() [][]string` to `advisoryManager`; emits
+        one row per held key with correct classid/objid/objsubid/mode;
+        registered via `catalog.AdvisoryLockRowsFunc` callback (avoids
+        executor→catalog import cycle).
+        (f) `pg_locks.VirtualRows` now appends advisory lock rows from
+        the callback; the existing static "relation" row is preserved.
+        (g) `pg_advisory_unlock_shared` now calls proper
+        `evalAdvisoryUnlock(..., shared=true)` returning actual bool;
+        both `pg_advisory_unlock` and `pg_advisory_unlock_shared` emit
+        `WARNING: you don't own a lock of type ExclusiveLock/ShareLock`
+        when the lock is not held.
+        `advisory_lock` → **pass** (0 diff lines). Baseline CSV updated.
 
 - [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
       - Summary: Make these 10 tests reach `pass`:

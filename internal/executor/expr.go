@@ -3207,44 +3207,46 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// to true (matching PostgreSQL's behaviour for void-returning functions).
 
 	case "pg_advisory_lock":
-		// pg_advisory_lock(bigint) or pg_advisory_lock(int4, int4)
-		return evalAdvisoryLock(x, row, ctx, false, false)
+		// pg_advisory_lock(bigint) or pg_advisory_lock(int4, int4) → void
+		return evalAdvisoryLock(x, row, ctx, false, false, false)
 
 	case "pg_advisory_unlock":
 		// pg_advisory_unlock(bigint) → boolean
 		// pg_advisory_unlock(int4, int4) → boolean
-		return evalAdvisoryUnlock(x, row, ctx)
+		return evalAdvisoryUnlock(x, row, ctx, false)
 
 	case "pg_advisory_unlock_all":
 		// pg_advisory_unlock_all() → void
 		return evalAdvisoryUnlockAll(ctx)
 
 	case "pg_advisory_xact_lock":
-		// pg_advisory_xact_lock(int4, int4) → void  (xact-scoped)
-		return evalAdvisoryLock(x, row, ctx, false, true)
+		// pg_advisory_xact_lock(bigint) or pg_advisory_xact_lock(int4, int4) → void  (xact-scoped)
+		return evalAdvisoryLock(x, row, ctx, false, true, false)
 
 	case "pg_try_advisory_xact_lock":
-		// pg_try_advisory_xact_lock(int4, int4) → boolean  (non-blocking)
-		return evalAdvisoryLock(x, row, ctx, true, true)
+		// pg_try_advisory_xact_lock(bigint) or pg_try_advisory_xact_lock(int4, int4) → boolean
+		return evalAdvisoryLock(x, row, ctx, true, true, false)
 
 	case "pg_try_advisory_lock":
 		// pg_try_advisory_lock(bigint) → boolean  (non-blocking)
-		return evalAdvisoryLock(x, row, ctx, true, false)
+		return evalAdvisoryLock(x, row, ctx, true, false, false)
 
-	// ── Shared-mode advisory lock stubs (M0097-0010) ─────────────────────
-	// Shared advisory locks allow multiple sessions to hold the same key.
-	// v0 returns void/true without actually acquiring locks — implementing
-	// true shared-mode semantics in the single-session test context would
-	// risk deadlocks when the same session acquires both exclusive and shared
-	// versions of the same key. Returning immediately is correct for the
-	// regress test context (single connection, no cross-session contention).
-	case "pg_advisory_lock_shared", "pg_advisory_xact_lock_shared":
-		// Shared lock: accepted, no-op for single-session tests.
-		return Datum{Kind: KindBool}, nil
-	case "pg_try_advisory_lock_shared", "pg_try_advisory_xact_lock_shared":
-		return NewBoolDatum(true), nil
+	// ── Shared-mode advisory lock variants (M0097-0021) ──────────────────
+	case "pg_advisory_lock_shared":
+		// pg_advisory_lock_shared(bigint) or pg_advisory_lock_shared(int4, int4) → void
+		return evalAdvisoryLock(x, row, ctx, false, false, true)
+	case "pg_advisory_xact_lock_shared":
+		// pg_advisory_xact_lock_shared(bigint) or pg_advisory_xact_lock_shared(int4, int4) → void
+		return evalAdvisoryLock(x, row, ctx, false, true, true)
+	case "pg_try_advisory_lock_shared":
+		// pg_try_advisory_lock_shared(bigint) → boolean
+		return evalAdvisoryLock(x, row, ctx, true, false, true)
+	case "pg_try_advisory_xact_lock_shared":
+		// pg_try_advisory_xact_lock_shared(bigint) → boolean
+		return evalAdvisoryLock(x, row, ctx, true, true, true)
 	case "pg_advisory_unlock_shared":
-		return NewBoolDatum(true), nil
+		// pg_advisory_unlock_shared(bigint) or pg_advisory_unlock_shared(int4, int4) → boolean
+		return evalAdvisoryUnlock(x, row, ctx, true)
 
 	// ── Boolean comparison functions (M0097-0003) ─────────────────────────
 	// These are the C-level backing functions for bool operators; the
@@ -5029,15 +5031,18 @@ func parseNumericOrZero(s string) *big.Int {
 //   - tryOnly=true : non-blocking (pg_try_advisory_*); returns true/false.
 //   - tryOnly=false: blocking (pg_advisory_lock, pg_advisory_xact_lock);
 //     blocks until the lock is acquired or ctx is cancelled.
+//   - shared=true  : ShareLock mode (pg_advisory_*_shared variants).
+//   - shared=false : ExclusiveLock mode.
 //
 // Argument forms:
 //
-//	(bigint)        → key = bigint
-//	(int4, int4)    → key = (classid, objid)
-func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, xactScoped bool) (Datum, error) {
+//	(bigint)        → key = bigint, twoArg=false
+//	(int4, int4)    → key = (classid, objid), twoArg=true
+func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, xactScoped bool, shared bool) (Datum, error) {
 	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
+	var twoArg bool
 	switch len(x.Args) {
 	case 1:
 		v, err := evalExpr(x.Args[0], row, ctx)
@@ -5049,6 +5054,7 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 			return NullDatum, nil
 		}
 		key = bigintToKey(n)
+		twoArg = false
 	case 2:
 		v0, err := evalExpr(x.Args[0], row, ctx)
 		if err != nil {
@@ -5061,12 +5067,13 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 		n0, _ := datumInt64(v0)
 		n1, _ := datumInt64(v1)
 		key = int4ToKey(int32(n0), int32(n1))
+		twoArg = true
 	default:
 		return NullDatum, nil
 	}
 
 	if tryOnly {
-		ok := globalAdvisoryMgr.tryAcquire(key, sess, xactScoped)
+		ok := globalAdvisoryMgr.tryAcquire(key, sess, xactScoped, shared, twoArg)
 		return NewBoolDatum(ok), nil
 	}
 
@@ -5075,18 +5082,20 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 	if qctx == nil {
 		qctx = context.Background()
 	}
-	if err := globalAdvisoryMgr.acquire(qctx, key, sess, xactScoped); err != nil {
+	if err := globalAdvisoryMgr.acquire(qctx, key, sess, xactScoped, shared, twoArg); err != nil {
 		// Context cancelled (step timed out or runner aborted).
 		return NullDatum, nil
 	}
-	// Return a non-NULL string so `IS NOT NULL` in WHERE clauses is true.
+	// Return a non-NULL void-like empty string (PostgreSQL advisory lock functions
+	// return void; non-NULL so `IS NOT NULL` in WHERE clauses is true).
 	return NewStringDatum(""), nil
 }
 
-// evalAdvisoryUnlock implements pg_advisory_unlock(bigint) and
-// pg_advisory_unlock(int4, int4). Returns true if the lock was held by
-// this session and has been released, false otherwise.
-func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+// evalAdvisoryUnlock implements pg_advisory_unlock(bigint), pg_advisory_unlock(int4,int4),
+// pg_advisory_unlock_shared(bigint), and pg_advisory_unlock_shared(int4,int4).
+// Returns true if the lock was held by this session and has been released, false otherwise.
+// Emits WARNING "you don't own a lock of type <mode>" when returning false. M0097-0021.
+func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context, shared bool) (Datum, error) {
 	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
@@ -5115,6 +5124,15 @@ func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context) (Datum, erro
 	}
 
 	ok := globalAdvisoryMgr.release(key, sess)
+	if !ok {
+		lockType := "ExclusiveLock"
+		if shared {
+			lockType = "ShareLock"
+		}
+		if ctx != nil {
+			ctx.AddWarning("you don't own a lock of type " + lockType)
+		}
+	}
 	return NewBoolDatum(ok), nil
 }
 

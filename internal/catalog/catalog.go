@@ -24,6 +24,16 @@ var (
 	ErrDatabaseNotFound = errors.New("database does not exist")
 )
 
+// AdvisoryLockRowsFunc is optionally set by the executor to provide
+// currently-held advisory lock rows for the pg_locks virtual table.
+// Each returned slice has the same column order as pg_locks.VirtualRows:
+// locktype, database, relation, page, tuple, virtualxid, transactionid,
+// classid, objid, objsubid, virtualtransaction, pid, mode, granted,
+// fastpath, waitstart.
+// This avoids an import cycle (executor → catalog; catalog must not → executor).
+// M0097-0021.
+var AdvisoryLockRowsFunc func() [][]string
+
 // Type is the textual type tag plus an optional typmod argument list.
 // v0 keeps types as strings so the planner doesn't need a real type
 // system; the executor casts based on Type.Name until the type system
@@ -1053,14 +1063,15 @@ func (c *InMemory) registerSystemTables() {
 		Schema: "pg_catalog",
 		Name:   "pg_database",
 		Columns: []Column{
-			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 0},
-			{Name: "datdba", Type: Type{Name: "text"}, Ordinal: 1},
-			{Name: "encoding", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "datdba", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "encoding", Type: Type{Name: "text"}, Ordinal: 3},
 			// Additional columns for vacuumdb --all (M0095-0004).
-			{Name: "datallowconn", Type: Type{Name: "boolean"}, Ordinal: 3},
-			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 4},
+			{Name: "datallowconn", Type: Type{Name: "boolean"}, Ordinal: 4},
+			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 5},
 			// datistemplate: standard pg_database column; false for all live databases (M0097-0021).
-			{Name: "datistemplate", Type: Type{Name: "boolean"}, Ordinal: 5},
+			{Name: "datistemplate", Type: Type{Name: "boolean"}, Ordinal: 6},
 		},
 		OID:     1262, // upstream's DatabaseRelationId
 		Virtual: true,
@@ -1073,6 +1084,7 @@ func (c *InMemory) registerSystemTables() {
 		out := make([][]string, 0, len(names))
 		for _, n := range names {
 			out = append(out, []string{
+				"16384", // oid: conventional database OID (M0097-0021)
 				n,
 				"10",    // datdba: OID of owner (10 = postgres superuser)
 				"6",     // encoding: 6 = UTF8
@@ -1266,13 +1278,18 @@ func (c *InMemory) registerSystemTables() {
 
 	// ── M0097-0018: system views needed by regress tests ──────────────────
 
-	// pg_locks: return at least one row so count(*) > 0 passes.
+	// pg_locks: return static relation row plus live advisory lock rows.
+	// M0097-0021: AdvisoryLockRowsFunc is set by the executor at init time.
 	pgLocks.VirtualRows = func() [][]string {
-		return [][]string{
-			// locktype, database, relation, page, tuple, virtualxid, transactionid,
-			// classid, objid, objsubid, virtualtransaction, pid, mode, granted, fastpath, waitstart
+		// locktype, database, relation, page, tuple, virtualxid, transactionid,
+		// classid, objid, objsubid, virtualtransaction, pid, mode, granted, fastpath, waitstart
+		rows := [][]string{
 			{"relation", "16384", "1259", "", "", "", "", "", "", "", "1/1", "0", "AccessShareLock", "t", "t", ""},
 		}
+		if AdvisoryLockRowsFunc != nil {
+			rows = append(rows, AdvisoryLockRowsFunc()...)
+		}
+		return rows
 	}
 
 	// pg_available_extensions — 0 rows is fine.
