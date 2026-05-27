@@ -1692,6 +1692,33 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
 		}
 		return d, nil
+	case "numeric", "decimal":
+		// Cast to numeric: validate string inputs, pass through numeric/int as-is.
+		// M0097-0056: prevents 'foo'::numeric from succeeding silently.
+		switch d.Kind {
+		case KindNumeric:
+			return d, nil
+		case KindInt:
+			return numericFromInt(d.Int), nil
+		case KindString:
+			s := strings.TrimSpace(d.StringValue())
+			// NaN and Infinity are valid numeric special values.
+			if strings.EqualFold(s, "nan") || strings.EqualFold(s, "infinity") ||
+				strings.EqualFold(s, "-infinity") {
+				return d, nil
+			}
+			_, _, err := parseNumeric(s)
+			if err != nil {
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type numeric: %q", d.StringValue())}
+			}
+			// Re-use the string datum rather than allocating a big.Int when fast
+			// path would suffice; the string form is already the canonical form.
+			return d, nil
+		default:
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+				Message: fmt.Sprintf("cannot cast type %v to numeric", d.Kind)}
+		}
 	}
 	return d, nil // pass-through for unknown types
 }

@@ -423,6 +423,73 @@ func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog) (N
 	return node, nil
 }
 
+// setOpNeedsCast reports whether a column from the right UNION branch (type
+// rname) needs a runtime cast to match the left branch type (lname).
+// We only cast when the right side has a generic text/unknown type and the
+// left side has a specific typed type that can validate the string. This
+// handles cases like `SELECT '3.4'::numeric UNION SELECT 'foo'` (where 'foo'
+// needs numeric validation) without incorrectly coercing widening situations
+// like `SELECT 1 UNION SELECT 2.2` (int ∪ numeric → should stay numeric).
+// M0097-0056.
+func setOpNeedsCast(lname, rname string) bool {
+	if lname == rname || lname == "" || rname == "" {
+		return false
+	}
+	// Only cast when the right side is a generic text/string type and
+	// the left side is a more specific type that validates the string.
+	isGenericString := func(t string) bool {
+		return t == "text" || t == "varchar" || t == "bpchar" || t == "char" ||
+			t == "name" || t == "" || t == "unknown"
+	}
+	if !isGenericString(rname) {
+		return false // right is already typed; let executor handle it
+	}
+	// Left is a non-string type: validate right's string against it.
+	return !isGenericString(lname)
+}
+
+// wrapSetOpBranchWithCasts wraps the right branch of a UNION/INTERSECT/EXCEPT
+// in a Project node with CastExpr nodes for columns where the right branch has
+// a generic text type but the left branch has a specific typed type. This
+// ensures that string values are validated at evaluation time
+// (e.g., 'foo'::numeric fails at run time). M0097-0056.
+func wrapSetOpBranchWithCasts(pos int, leftSchema Schema, right Node) Node {
+	rightSchema := right.Output()
+	// Check if any column needs a cast.
+	needCast := false
+	for i, lc := range leftSchema {
+		if i >= len(rightSchema) {
+			break
+		}
+		if setOpNeedsCast(lc.Type.Name, rightSchema[i].Type.Name) {
+			needCast = true
+			break
+		}
+	}
+	if !needCast {
+		return right
+	}
+	// Build a Project with CastExpr for columns that need validation.
+	targets := make([]Expr, len(rightSchema))
+	outSchema := make(Schema, len(rightSchema))
+	for i := range rightSchema {
+		var expr Expr = &ColumnRef{pos: pos, Index: i}
+		lc := leftSchema[i]
+		rc := rightSchema[i]
+		if setOpNeedsCast(lc.Type.Name, rc.Type.Name) {
+			expr = &CastExpr{
+				pos:        pos,
+				Operand:    expr,
+				TargetType: lc.Type.Name,
+				SourceType: rc.Type.Name,
+			}
+		}
+		targets[i] = expr
+		outSchema[i] = SchemaColumn{Name: rc.Name, Type: lc.Type}
+	}
+	return &Project{pos: pos, Child: right, Targets: targets, schema: outSchema}
+}
+
 func setOpKeyword(t parser.SetOpType) string {
 	switch t {
 	case parser.SetOpIntersect:
@@ -559,6 +626,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 					Message: fmt.Sprintf("each %s query must have the same number of columns", setOpKeyword(seg.opType)),
 				}
 			}
+			// Type unification: wrap the right branch in a Project with CastExpr
+			// nodes for columns where the left and right types differ. This ensures
+			// that string values like 'foo' are validated when the left branch
+			// declares a typed column (e.g. numeric). M0097-0056.
+			right = wrapSetOpBranchWithCasts(seg.opPos, left.Output(), right)
 			left = &SetOp{pos: s.Pos(), Left: left, Right: right, Op: seg.opType, All: seg.opAll}
 			// If this segment is the last "inner" segment, apply the sort/limit
 			// to the intermediate result before processing outer segments.
