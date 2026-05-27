@@ -54,7 +54,7 @@ enum,318,failed
 equivclass,320,failed
 xid,408,failed
 random,385,failed
-select_distinct,394,failed
+select_distinct,26,failed
 regex,415,failed
 btree_index,435,failed
 cluster,438,failed

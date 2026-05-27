@@ -1060,6 +1060,24 @@ M0097-0001 wires it up.
         requires real role-based INSERT permission checking (SET SESSION
         AUTHORIZATION is a no-op so goopg stays as superuser).
         Baseline CSV updated: `select_into` 133 → 1 diff line.
+      - **Progress 2026-05-27 (M0097-0041 — select_distinct 394→26 diff):**
+        (a) `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`: end-to-end
+            (parser AST → analyzer type-check → planner plan node →
+            executor `evalIsDistinctFrom`).
+        (b) Parenthesized compound queries `(SELECT …) UNION ALL (SELECT …)`:
+            `parseParenthesisedSelectStmt`; handles nested set-ops by walking
+            to rightmost node before attaching outer op.
+        (c) Missing planner GUCs: `jit_above_cost`, `parallel_setup_cost`,
+            `parallel_tuple_cost` (TypeReal).
+        (d) `SET x TO DEFAULT` / `SET x = DEFAULT`: resets GUC to boot value.
+        (e) Parser bug: `SELECT DISTINCT ON (…)` was setting `s.Distinct=true`
+            causing a spurious `Distinct` node over `DistinctOn`; fixed by
+            only setting `s.Distinct` when there is no ON clause.
+        (f) `distinctOp`: sort deduped rows for deterministic output matching
+            PostgreSQL's sort-based DISTINCT (NULLs last).
+        Remaining 26 diff lines: all require table inheritance (`person*`
+        syntax); deferred to inheritance milestone.
+        Baseline CSV updated: `select_distinct` 394 → 26 diff lines.
 
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:
