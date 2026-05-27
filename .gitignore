@@ -83,3 +83,9 @@ serena/
 
 # Scratch tree-dump from exploration tools.
 code_tree.txt
+
+# TPC-H goopg runtime artifacts (PostgreSQL data dir, pid, logs) — must never be committed.
+bench/tpch/runtime_goopg/data/
+bench/tpch/runtime_goopg/*.pid
+bench/tpch/runtime_goopg/*.log
+bench/tpch/runtime_goopg/tmp/
