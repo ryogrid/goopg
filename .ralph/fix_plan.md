@@ -598,8 +598,17 @@ M0097-0001 wires it up.
         millennium/microseconds/milliseconds/timezone). All date/time tests
         now run without hanging (date=0.07s, horology=0.08s, interval=0.09s,
         timestamp=0.35s). Output still defers (format/precision diffs).
+      - timetz parity (2026-05-27): timezone offset now stored in Datum.Scale
+        (minutes east of UTC). parseTimeTZString() extracts TZ abbreviations
+        (PDT, PST, EDT, ...) and explicit offsets (+05:30, -07). Encoder/decoder
+        updated for 12-byte wire format. Display changed from hardcoded +00 to
+        actual offset (±HH[:MM]). EXTRACT/date_part TIMEZONE/TIMEZONE_HOUR/
+        TIMEZONE_MINUTE/EPOCH fields handle offset. TIME WITH TIME ZONE 'literal'
+        and TIMESTAMP WITH TIME ZONE 'literal' now parsed as typed literals.
+        timetz baseline: 209→51 diffs.
       - Action: close remaining format/precision diffs and rerun date/time regress
-        cases until defer is removed.
+        cases until defer is removed. Remaining timetz gaps: AT LOCAL, AT TIME ZONE,
+        pg_get_viewdef, TABLE shorthand, operator-not-found vs not-unique message.
 
 - [ ] **M0097-0005**
       - Summary: Core SELECT + DML parity.

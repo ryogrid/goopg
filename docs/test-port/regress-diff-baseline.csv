@@ -38,7 +38,7 @@ case,148,failed
 uuid,0,pass
 select_distinct_on,0,passed
 partition_info,185,failed
-timetz,209,failed
+timetz,51,failed
 pg_lsn,0,pass
 misc,262,failed
 tidscan,295,failed

@@ -1173,12 +1173,18 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		x.CachedTime = t.UTC()
 		x.CacheValid = true
 		return NewTimeDatum(x.CachedTime), nil
-	case "time", "timetz":
+	case "time":
 		ts, err := parseTimeString(x.Value)
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time: %q", x.Value)}
 		}
 		return NewTimeDatum(ts), nil
+	case "timetz":
+		ts, offsetSecs, err := parseTimeTZString(x.Value)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", x.Value)}
+		}
+		return NewTimeTZDatum(ts, offsetSecs), nil
 	case "timestamp", "timestamptz":
 		// Try a few common upstream layouts in order. The
 		// `2006-01-02 15:04:05` form is what TPC-H and pgbench
@@ -1541,7 +1547,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
 		}
 		return d, nil
-	case "time", "timetz":
+	case "time":
 		// Cast to time: extract time-of-day from KindTime, parse strings. M0097-0004.
 		if d.Kind == KindString {
 			ts, err := parseTimeString(d.StringValue())
@@ -1554,6 +1560,21 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			t := d.TimeValue().UTC()
 			// Re-anchor to epoch to strip any date component.
 			return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
+		}
+		return d, nil
+	case "timetz":
+		// Cast to timetz: parse strings with timezone offset. M0097-0004.
+		if d.Kind == KindString {
+			ts, offsetSecs, err := parseTimeTZString(d.StringValue())
+			if err != nil {
+				return Datum{}, err
+			}
+			return NewTimeTZDatum(ts, offsetSecs), nil
+		}
+		if d.Kind == KindTime {
+			t := d.TimeValue().UTC()
+			// Re-anchor to epoch to strip any date component; preserve stored offset.
+			return NewTimeTZDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC), d.TimeTZOffsetSecs()), nil
 		}
 		return d, nil
 	case "timestamp", "timestamptz":
@@ -2047,17 +2068,40 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 		f := float64(u.Second())*1000 + float64(u.Nanosecond())/1_000_000.0
 		return newNumericFromFloat(f), nil
 	case "epoch":
-		f := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
-		return newNumericFromFloat(f), nil
+		localSecs := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
+		if srcType == "timetz" {
+			// timetz epoch = UTC seconds-of-day = local_time - offset
+			return newNumericFromFloat(localSecs - float64(src.TimeTZOffsetSecs())), nil
+		}
+		return newNumericFromFloat(localSecs), nil
 	case "timezone", "timezone_hour", "timezone_minute":
-		if isTimeOnly {
+		if srcType == "time" {
 			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
 				Message: fmt.Sprintf("unit %q not supported for type time without time zone", field)}
 		}
-		return Datum{Kind: KindInt, Int: 0}, nil // UTC only
+		if !isTimeOnly {
+			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("unit %q not supported for type timestamp without time zone", field)}
+		}
+		// timetz: return offset components
+		offsetSecs := src.TimeTZOffsetSecs()
+		switch field {
+		case "timezone":
+			return Datum{Kind: KindInt, Int: int64(offsetSecs)}, nil
+		case "timezone_hour":
+			h := offsetSecs / 3600
+			return Datum{Kind: KindInt, Int: int64(h)}, nil
+		case "timezone_minute":
+			m := (offsetSecs % 3600) / 60
+			return Datum{Kind: KindInt, Int: int64(m)}, nil
+		}
 	}
 	// For time-of-day types, reject date-specific fields with PG-compatible errors. M0097-0004.
 	if isTimeOnly {
+		typeName := "time without time zone"
+		if srcType == "timetz" {
+			typeName = "time with time zone"
+		}
 		switch field {
 		case "hour", "minute", "microseconds", "microsecond":
 			// allowed for time types (handled by extractTimestampField below)
@@ -2070,10 +2114,10 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 			}
 			if knownDateFields[field] {
 				return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
-					Message: fmt.Sprintf("unit %q not supported for type time without time zone", field)}
+					Message: fmt.Sprintf("unit %q not supported for type %s", field, typeName)}
 			}
 			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
-				Message: fmt.Sprintf("unit %q not recognized for type time without time zone", field)}
+				Message: fmt.Sprintf("unit %q not recognized for type %s", field, typeName)}
 		}
 	}
 	n, err := extractTimestampField(x.Field, u, x.Pos())
@@ -2188,6 +2232,11 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return newNumericFromFloat(f), nil
 	case "epoch":
 		f := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
+		// For timetz datums, epoch = UTC seconds-of-day = local_time - offset.
+		// Scale stores timezone offset in minutes east of UTC.
+		if src.Scale != 0 {
+			f -= float64(src.TimeTZOffsetSecs())
+		}
 		return newNumericFromFloat(f), nil
 	}
 	n, err := extractTimestampField(field, u, x.Pos())

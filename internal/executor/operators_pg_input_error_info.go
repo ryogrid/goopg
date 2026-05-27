@@ -56,9 +56,21 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 	var message, sqlCode string
 
 	switch t {
-	case "time", "timetz":
+	case "time":
 		// Validate time strings using the same parser as column INSERT. M0097-0004.
 		_, e := parseTimeString(v)
+		if e != nil {
+			if ee, ok := e.(*ExecError); ok {
+				message = ee.Message
+				sqlCode = ee.Code
+			} else {
+				message = e.Error()
+				sqlCode = "22007"
+			}
+		}
+	case "timetz":
+		// Validate timetz strings with timezone-aware parser. M0097-0004.
+		_, _, e := parseTimeTZString(v)
 		if e != nil {
 			if ee, ok := e.(*ExecError); ok {
 				message = ee.Message

@@ -1705,6 +1705,32 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 		"numeric", "decimal",
 		"text", "varchar", "char", "bpchar",
 		"name", "oid", "pg_lsn":
+		// Handle multi-word type names: "TIME WITH TIME ZONE 'lit'" and
+		// "TIMESTAMP WITH TIME ZONE 'lit'" / "WITHOUT TIME ZONE 'lit'".
+		// Layout: peek(0)=cur(time/timestamp) peek(1)=with/without peek(2)=time peek(3)=zone peek(4)=string
+		if name == "time" || name == "timestamp" {
+			tok1 := p.peek(1)
+			tok2 := p.peek(2)
+			tok3 := p.peek(3)
+			tok4 := p.peek(4)
+			isWithKw := tok1.Kind == TokenKeyword && tok1.Keyword == KwWith
+			isWithoutIdent := tok1.Kind == TokenIdent && strings.EqualFold(tok1.Value, "without")
+			if (isWithKw || isWithoutIdent) && tok4.Kind == TokenStringLit &&
+				tok2.Kind == TokenIdent && strings.EqualFold(tok2.Value, "time") &&
+				tok3.Kind == TokenIdent && strings.EqualFold(tok3.Value, "zone") {
+				typName := name + "tz"
+				if isWithoutIdent {
+					typName = name // WITHOUT TIME ZONE = plain time/timestamp
+				}
+				pos := t.Pos
+				p.advance() // type name (time/timestamp)
+				p.advance() // WITH/WITHOUT
+				p.advance() // time
+				p.advance() // zone
+				strTok := p.advance() // string literal
+				return &TypedStringLit{pos: pos, Type: typName, Value: strTok.Value}, true
+			}
+		}
 		next := p.peek(1)
 		if next.Kind != TokenStringLit {
 			return nil, false

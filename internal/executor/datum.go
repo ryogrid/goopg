@@ -340,6 +340,21 @@ func NewTimeDatum(t time.Time) Datum {
 	return Datum{Kind: KindTime, Int: t.UTC().UnixNano()}
 }
 
+// NewTimeTZDatum constructs a KindTime Datum for a timetz column.
+// The local time is stored as nanoseconds since 1970-01-01 00:00:00 UTC.
+// offsetSecs is the timezone offset east of UTC in seconds (e.g., PDT = -25200).
+// The offset is stored in Datum.Scale as minutes (int16 range ≥ ±840 covers ±14h).
+// Callers with sub-minute offsets (historical oddities) lose the remainder.
+func NewTimeTZDatum(t time.Time, offsetSecs int) Datum {
+	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), Scale: int16(offsetSecs / 60)}
+}
+
+// TimeTZOffsetSecs returns the timezone offset in seconds east of UTC for a
+// timetz Datum (stored in Scale as minutes). Returns 0 for plain time datums.
+func (d Datum) TimeTZOffsetSecs() int {
+	return int(d.Scale) * 60
+}
+
 // NewIntervalDatum constructs a KindInterval Datum from
 // month/day components. Sub-day grain is rejected at parse time.
 func NewIntervalDatum(months, days int32) Datum {

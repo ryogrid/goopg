@@ -1345,10 +1345,10 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 							valueBuf = d.AppendValueText(valueBuf)
 						}
 					case "timetz":
-						// Timetz displays as HH:MM:SS[.ffffff]+00. M0097-0004.
+						// Timetz displays as HH:MM:SS[.ffffff]±HH[:MM]. M0097-0004.
 						if d.Kind == executor.KindTime {
 							valueBuf = appendTimeText(valueBuf, d, sc.Type)
-							valueBuf = append(valueBuf, "+00"...)
+							valueBuf = appendTimeTZOffset(valueBuf, d.TimeTZOffsetSecs())
 						} else {
 							valueBuf = d.AppendValueText(valueBuf)
 						}
@@ -1585,6 +1585,25 @@ func appendTimeText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
 			dst = append(dst, '.')
 			dst = append(dst, frac...)
 		}
+	}
+	return dst
+}
+
+// appendTimeTZOffset appends the timezone offset to dst in PostgreSQL's format:
+// "+HH", "-HH", "+HH:MM", or "-HH:MM". offsetSecs is seconds east of UTC.
+// UTC (0) is rendered as "+00".
+func appendTimeTZOffset(dst []byte, offsetSecs int) []byte {
+	if offsetSecs < 0 {
+		dst = append(dst, '-')
+		offsetSecs = -offsetSecs
+	} else {
+		dst = append(dst, '+')
+	}
+	h := offsetSecs / 3600
+	m := (offsetSecs % 3600) / 60
+	dst = append(dst, byte('0'+h/10), byte('0'+h%10))
+	if m != 0 {
+		dst = append(dst, ':', byte('0'+m/10), byte('0'+m%10))
 	}
 	return dst
 }

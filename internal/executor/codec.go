@@ -309,18 +309,21 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		return buf[:], nil
 	case "timetz":
 		if d.Kind == KindString {
-			ts, err := parseTimeString(d.StringValue())
+			ts, offsetSecs, err := parseTimeTZString(d.StringValue())
 			if err != nil {
 				return nil, err
 			}
-			d = NewTimeDatum(ts)
+			d = NewTimeTZDatum(ts, offsetSecs)
 		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
 		var buf [12]byte
 		binary.LittleEndian.PutUint64(buf[:8], uint64(pgTimeMicros(d.TimeValue())))
-		binary.LittleEndian.PutUint32(buf[8:], 0)
+		// PG wire stores timezone offset as int32 seconds, positive = west of UTC.
+		// Our Scale stores minutes east of UTC; convert: pgOffset = -Scale*60.
+		pgOffset := int32(-d.TimeTZOffsetSecs())
+		binary.LittleEndian.PutUint32(buf[8:], uint32(pgOffset))
 		return buf[:], nil
 	case "name":
 		// PG NameData: fixed 64 bytes, '\0'-padded. The name type silently
@@ -941,7 +944,11 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		if micros < 0 || micros > maxTimeMicros {
 			return Datum{}, 0, fmt.Errorf("invalid timetz micros")
 		}
-		return NewTimeDatum(pgTimeFromMicros(micros)), 12, nil
+		// PG wire stores offset as int32 seconds, positive = west of UTC.
+		// Convert to our convention: positive = east of UTC.
+		pgOffset := int32(binary.LittleEndian.Uint32(data[8:12]))
+		offsetSecs := int(-pgOffset)
+		return NewTimeTZDatum(pgTimeFromMicros(micros), offsetSecs), 12, nil
 	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown":
 		// PG external varlena (VARATT_IS_1B_E = 0x01): our TOAST pointer.
 		// 0x01 is unambiguous: 0x01>>1=0 is an invalid data varlena length,
