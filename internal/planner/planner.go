@@ -1681,7 +1681,23 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		}
 	}
 	b := rangeBinding{table: tbl, alias: rv.Alias, offset: 0, sourceIdx: sourceIdx}
-	ctx := newResolveContext([]rangeBinding{b}, tableSchemaWithSource(tbl, sourceIdx))
+	baseSchema := tableSchemaWithSource(tbl, sourceIdx)
+	// Apply column alias renaming from FROM tbl AS alias (col1, col2, ...).
+	// The parser stores the alias list in rv.Columns; here we rename the
+	// schema entries so downstream name resolution and the output column
+	// names use the aliases (e.g. SELECT * FROM J1_TBL AS t1 (a, b, c)
+	// shows "a | b | c" not "i | j | t"). M0097-0054.
+	if len(rv.Columns) > 0 {
+		renamed := make(Schema, len(baseSchema))
+		copy(renamed, baseSchema)
+		for i, colName := range rv.Columns {
+			if i < len(renamed) {
+				renamed[i].Name = colName
+			}
+		}
+		baseSchema = renamed
+	}
+	ctx := newResolveContext([]rangeBinding{b}, baseSchema)
 	// View: plan the stored inner SELECT and substitute its
 	// node. The outer ctx's schema (built from the view's
 	// catalog Table) takes precedence for downstream name
