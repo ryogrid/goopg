@@ -25,26 +25,25 @@ import (
 // HighKey (M0011-0002 — see
 // docs/design/0011-0002-btree-numeric-build-and-uniqueness.md), which
 // is required for NUMERIC keys whose encoded form exceeds the
-// previous 4-byte field. Layout, in little-endian:
+// previous 4-byte field. v4 widened the HighKey field from 32 to 256
+// bytes to accommodate text/varchar B-tree keys (e.g. road.name in
+// create_index regress). Layout, in little-endian:
 //
 //	offset 0  Prev        (4 bytes)
 //	offset 4  Next        (4 bytes)
 //	offset 8  Level       (4 bytes)
 //	offset 12 Flags       (2 bytes)
 //	offset 14 HighKeyLen  (2 bytes)
-//	offset 16 HighKey     (32 bytes; bytes 0..HighKeyLen valid)
-const SizeOfBTPageOpaque = 48
+//	offset 16 HighKey     (256 bytes; bytes 0..HighKeyLen valid)
+const SizeOfBTPageOpaque = 272
 
-// MaxHighKeyLen bounds the on-disk HighKey field. Covers the int4
-// encoding (4 bytes) and the NUMERIC encoding (≤25 bytes per
-// 0011-0001) with headroom. M0041-0004 widened EncodeNumericKey to
-// accept *big.Int mantissas, but the only B-tree NUMERIC keys in
-// practice are stored column values (TPC-H l_partkey, ps_partkey,
-// etc.) that fit in int64 and therefore in ≤25 bytes; the
-// arbitrary-precision lane only matters for runtime arithmetic
-// results that never enter an index. So MaxHighKeyLen stays 32 to
-// preserve on-disk page-format compatibility.
-const MaxHighKeyLen = 32
+// MaxHighKeyLen bounds the on-disk HighKey field. v4 widened this
+// from 32 to 256 bytes so text/varchar B-tree keys (which can be
+// longer than int4=4 or NUMERIC≤25) are stored without truncation.
+// Keys longer than 256 bytes are not supported by the bulk-loader or
+// split path and will return an error; in practice all regress-test
+// and TPC-H index keys fit comfortably within this bound.
+const MaxHighKeyLen = 256
 
 // btSpecialOffset is where the opaque area starts on every B-tree page.
 const btSpecialOffset = storage.BlockSize - SizeOfBTPageOpaque
@@ -81,7 +80,7 @@ const (
 	rootStart storage.BlockNumber = 1
 
 	btreeMagic   uint32 = 0x053162
-	btreeVersion uint32 = 3 // bumped by M0011-0002 (variable-length HighKey, 48-byte opaque)
+	btreeVersion uint32 = 4 // bumped by M0011-0002 (v3: variable-length HighKey, 48-byte opaque); v4: widened HighKey field to 256 bytes for text keys (272-byte opaque)
 )
 
 // BTreeMeta is the v0 metapage payload.
