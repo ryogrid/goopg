@@ -1115,6 +1115,19 @@ M0097-0001 wires it up.
         - `union` 48: unordered results (14), parenthesized set-op ORDER BY scope (6),
           generate_series SRF (8), PL/pgSQL expensivefunc (4), error fmt (10+).
         - `returning` 475: table inheritance (INHERITS), UPDATE FROM, RETURNING OLD/NEW.
+      - **Progress 2026-05-27 (M0097-0043 — NULLS FIRST/LAST ORDER BY):**
+        (a) Parser: `SortBy.NullsFirst *bool`; `parseSortItem` consumes
+            `NULLS FIRST` / `NULLS LAST` via `acceptIdentKeyword`.
+        (b) Planner: `SortKey.NullsFirst bool`; helper `sortByNullsFirst`
+            computes effective placement (PG default: DESC→nulls first,
+            ASC→nulls last). All 6 `SortKey` construction sites updated.
+        (c) Executor: `lessRows` uses `k.NullsFirst`; `compareSortDatums`
+            in window op extended with `nullsFirst bool` parameter.
+        (d) EXPLAIN: emits non-default `NULLS FIRST/LAST` in Sort Key lines.
+        (e) `TestCompatWindowRankNullPeersAsc` updated (was asserting old
+            inverted NULL behavior).
+        Design: `docs/design/0097-0043-nulls-first-last-order-by.md`.
+        Baseline CSV updated: `select` 876→238, `case` 148→93, `window` 3894→3269.
 
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:

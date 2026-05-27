@@ -1169,6 +1169,17 @@ func (p *parser) parseSortItem() (SortBy, error) {
 	} else {
 		_ = p.acceptKeyword(KwAsc)
 	}
+	// Optional NULLS FIRST / NULLS LAST (PostgreSQL extension to SQL standard).
+	if p.acceptIdentKeyword("nulls") {
+		if p.acceptIdentKeyword("first") {
+			t := true
+			sb.NullsFirst = &t
+		} else if p.acceptIdentKeyword("last") {
+			f := false
+			sb.NullsFirst = &f
+		}
+		// Unknown token after NULLS — leave NullsFirst nil (use default).
+	}
 	return sb, nil
 }
 

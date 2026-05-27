@@ -525,10 +525,11 @@ func (s SetOpClause) Pos() int { return s.pos }
 
 // SortBy is one entry in an ORDER BY list.
 type SortBy struct {
-	pos     int
-	Expr    Expr
-	Desc    bool   // true for DESC, false for ASC (the default)
-	UsingOp string // operator name from ORDER BY x USING op; "" if not used
+	pos        int
+	Expr       Expr
+	Desc       bool   // true for DESC, false for ASC (the default)
+	UsingOp    string // operator name from ORDER BY x USING op; "" if not used
+	NullsFirst *bool  // nil = use default (ASC→nulls last, DESC→nulls first); &true = NULLS FIRST; &false = NULLS LAST
 }
 
 func (s SortBy) Pos() int { return s.pos }

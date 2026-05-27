@@ -245,6 +245,13 @@ func emitNodeDetailLines(n planner.Node, indent string, rows *[]Row, attachedFil
 				if k.Desc {
 					s += " DESC"
 				}
+				// Emit NULLS FIRST/LAST only when it's non-default.
+				// Default: ASC → NULLS LAST, DESC → NULLS FIRST.
+				if k.NullsFirst && !k.Desc {
+					s += " NULLS FIRST"
+				} else if !k.NullsFirst && k.Desc {
+					s += " NULLS LAST"
+				}
 				parts = append(parts, s)
 			}
 			*rows = append(*rows, Row{NewStringDatum(indent + "Sort Key: " + strings.Join(parts, ", "))})

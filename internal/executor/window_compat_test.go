@@ -120,18 +120,21 @@ func TestCompatWindowRankNullPeersAsc(t *testing.T) {
 		}
 	}
 
+	// PostgreSQL ORDER BY val ASC (default) puts NULLs LAST.
+	// So: 10 gets rank=1, NULLs (peers) get rank=2.
+	// Outer ORDER BY rk, val: (10, 1) first, then (NULL, 2), (NULL, 2).
 	rows := runQuery(t, ctx,
 		"SELECT val, rank() OVER (ORDER BY val) AS rk FROM t ORDER BY rk, val")
 	if len(rows) != 3 {
 		t.Fatalf("rows=%d want 3", len(rows))
 	}
-	if !rows[0][0].IsNull() || rows[0][1].Kind != KindInt || rows[0][1].Int != 1 {
-		t.Fatalf("row0=%+v want NULL rank=1", rows[0])
+	if rows[0][0].Kind != KindInt || rows[0][0].Int != 10 || rows[0][1].Kind != KindInt || rows[0][1].Int != 1 {
+		t.Fatalf("row0=%+v want 10 rank=1", rows[0])
 	}
-	if !rows[1][0].IsNull() || rows[1][1].Kind != KindInt || rows[1][1].Int != 1 {
-		t.Fatalf("row1=%+v want NULL rank=1", rows[1])
+	if !rows[1][0].IsNull() || rows[1][1].Kind != KindInt || rows[1][1].Int != 2 {
+		t.Fatalf("row1=%+v want NULL rank=2", rows[1])
 	}
-	if rows[2][0].Kind != KindInt || rows[2][0].Int != 10 || rows[2][1].Kind != KindInt || rows[2][1].Int != 3 {
-		t.Fatalf("row2=%+v want 10 rank=3", rows[2])
+	if !rows[2][0].IsNull() || rows[2][1].Kind != KindInt || rows[2][1].Int != 2 {
+		t.Fatalf("row2=%+v want NULL rank=2", rows[2])
 	}
 }

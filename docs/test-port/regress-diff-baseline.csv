@@ -34,7 +34,7 @@ lock,131,failed
 prepared_xacts,132,failed
 drop_if_exists,130,failed
 advisory_lock,0,pass
-case,148,failed
+case,93,failed
 uuid,0,pass
 select_distinct_on,0,passed
 partition_info,185,failed
@@ -79,7 +79,7 @@ fast_default,729,failed
 returning,475,failed
 join_hash,747,failed
 copy2,850,failed
-select,876,failed
+select,238,failed
 int8,617,failed
 domain,932,failed
 jsonpath,940,failed
@@ -122,7 +122,7 @@ updatable_views,3102,failed
 timestamptz,3137,failed
 horology,3576,failed
 numeric,3786,failed
-window,3894,failed
+window,3269,failed
 jsonb_jsonpath,4214,failed
 partition_prune,4217,failed
 jsonb,4904,failed

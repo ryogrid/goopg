@@ -502,10 +502,10 @@ func (o *sortOp) lessRows(a, b Row) bool {
 			return false
 		}
 		if av.IsNull() && !bv.IsNull() {
-			return !k.Desc
+			return k.NullsFirst // NULL sorts first when NullsFirst=true
 		}
 		if !av.IsNull() && bv.IsNull() {
-			return k.Desc
+			return !k.NullsFirst // non-NULL sorts first when NullsFirst=false
 		}
 		if av.IsNull() && bv.IsNull() {
 			continue

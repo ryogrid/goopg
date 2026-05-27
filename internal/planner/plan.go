@@ -727,8 +727,9 @@ func (n *CTEScan) Output() Schema { return n.schema }
 
 // Sort — orders the child's rows by the given keys.
 type SortKey struct {
-	Expr Expr
-	Desc bool
+	Expr       Expr
+	Desc       bool
+	NullsFirst bool // true = NULLs sort before non-NULLs; false = after (PostgreSQL default: ASC→last, DESC→first)
 }
 
 type Sort struct {

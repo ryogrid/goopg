@@ -163,6 +163,15 @@ func toPlanError(err error) error {
 	return err
 }
 
+// sortByNullsFirst computes the effective NullsFirst flag for a parser.SortBy.
+// PostgreSQL defaults: ASC → NULLS LAST (false), DESC → NULLS FIRST (true).
+func sortByNullsFirst(sb parser.SortBy) bool {
+	if sb.NullsFirst != nil {
+		return *sb.NullsFirst
+	}
+	return sb.Desc // DESC default: nulls first; ASC default: nulls last
+}
+
 // resolveContext holds the per-statement name-resolution scope.
 //
 // v0 only supports single-relation FROM clauses, so this is just one
@@ -358,8 +367,9 @@ func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog) (N
 					}
 				}
 				keys = append(keys, SortKey{
-					Expr: &ColumnRef{pos: sb.Expr.Pos(), Index: idx, Name: out[idx].Name, Type: out[idx].Type},
-					Desc: sb.Desc,
+					Expr:       &ColumnRef{pos: sb.Expr.Pos(), Index: idx, Name: out[idx].Name, Type: out[idx].Type},
+					Desc:       sb.Desc,
+					NullsFirst: sortByNullsFirst(sb),
 				})
 				continue
 			}
@@ -367,7 +377,7 @@ func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog) (N
 			if err != nil {
 				return nil, err
 			}
-			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc})
+			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 		}
 		node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
 	}
@@ -814,7 +824,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			if err != nil {
 				return nil, err
 			}
-			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc})
+			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 		}
 		node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
 	}
@@ -1051,13 +1061,16 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			sortKeys := make([]SortKey, len(resolvedDistinct))
 			for i, col := range keyCols {
 				var desc bool
+				var nullsFirst bool
 				if i < len(s.OrderBy) {
 					desc = s.OrderBy[i].Desc
+					nullsFirst = sortByNullsFirst(s.OrderBy[i])
 				}
 				outCol := outSchema[col]
 				sortKeys[i] = SortKey{
-					Expr: &ColumnRef{Index: col, Name: outCol.Name, Type: outCol.Type},
-					Desc: desc,
+					Expr:       &ColumnRef{Index: col, Name: outCol.Name, Type: outCol.Type},
+					Desc:       desc,
+					NullsFirst: nullsFirst,
 				}
 			}
 			out = &Sort{pos: s.Pos(), Child: out, Keys: sortKeys}
@@ -2324,7 +2337,7 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		order = append(order, SortKey{Expr: r, Desc: ob.Desc})
+		order = append(order, SortKey{Expr: r, Desc: ob.Desc, NullsFirst: sortByNullsFirst(ob)})
 	}
 
 	outputSchema := append(Schema(nil), inputCtx.schema...)
@@ -3291,7 +3304,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 		if serr != nil {
 			return AggregateCall{}, serr
 		}
-		orderByKeys = append(orderByKeys, SortKey{Expr: e, Desc: sb.Desc})
+		orderByKeys = append(orderByKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 	}
 	return AggregateCall{
 		pos:      fc.Pos(),

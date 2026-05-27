@@ -487,7 +487,7 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 		s.Child = child
 		s.Keys = make([]SortKey, len(n.Keys))
 		for i, k := range n.Keys {
-			s.Keys[i] = SortKey{Expr: cloneExprReplacingOuter(k.Expr, replace), Desc: k.Desc}
+			s.Keys[i] = SortKey{Expr: cloneExprReplacingOuter(k.Expr, replace), Desc: k.Desc, NullsFirst: k.NullsFirst}
 		}
 		return &s, nil
 	case *Limit:
