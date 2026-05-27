@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
@@ -592,7 +593,22 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				precached = freshNode
 			}
 		}
+		// M0097-0059: enforce statement_timeout by deriving a deadline
+		// context. The executor checks ctx.Ctx.Err() at each outer-row
+		// boundary; when the deadline fires the next check returns
+		// context.DeadlineExceeded and the executor surfaces error 57014.
+		savedCtx := ectx.Ctx
+		var stmtCancel context.CancelFunc
+		if timeoutMs := sessionStatementTimeout(sess); timeoutMs > 0 {
+			var stmtCtx context.Context
+			stmtCtx, stmtCancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
+			ectx.Ctx = stmtCtx
+		}
 		err := s.executeOneSimpleStmt(w, ectx, stmt, connTx, &autoCommit, precached)
+		if stmtCancel != nil {
+			stmtCancel()
+		}
+		ectx.Ctx = savedCtx
 		ectx.Params = restoreParams
 		if err != nil {
 			if errors.Is(err, errQueryErrorSent) {
@@ -711,6 +727,24 @@ func sessionWorkMem(sess *config.SessionRegistry) int64 {
 	}
 	// work_mem is stored in KB; convert to bytes.
 	return kb * 1024
+}
+
+// sessionStatementTimeout reads the effective `statement_timeout` GUC from
+// the session and returns it in milliseconds. Returns 0 (no timeout) if the
+// setting is missing, zero, or unparseable. M0097-0059.
+func sessionStatementTimeout(sess *config.SessionRegistry) int64 {
+	if sess == nil {
+		return 0
+	}
+	_, eff, ok := sess.Get("statement_timeout")
+	if !ok {
+		return 0
+	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64)
+	if err != nil || ms <= 0 {
+		return 0
+	}
+	return ms
 }
 
 func compatNoopCommandTag(sql string) (string, bool) {

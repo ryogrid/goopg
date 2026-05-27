@@ -887,6 +887,85 @@ func (p *parser) parseFromList() ([]FromExpr, []RangeVar, error) {
 	return out, flat, nil
 }
 
+// tryParseParenJoin attempts to parse a parenthesized join expression of
+// the form `(T1 JOIN T2 ON ...) [AS alias] [(col1, col2, ...)]`. On success
+// it returns a RangeVar whose Subquery is a synthetic SELECT * FROM <join>.
+// On failure (the "(" is not a valid join grouping) it restores the parser
+// position and returns (zero, false, nil) so the caller can fall back.
+// M0097-0059.
+func (p *parser) tryParseParenJoin() (RangeVar, bool, error) {
+	saved := p.idx
+	pos := p.cur().Pos
+
+	if !p.acceptSymbol("(") {
+		return RangeVar{}, false, nil
+	}
+
+	// Parse the inner content as a FROM item (table + optional JOINs).
+	item, flat, err := p.parseFromItem()
+	if err != nil {
+		// Not a valid join expression inside; restore and report failure.
+		p.idx = saved
+		return RangeVar{}, false, nil
+	}
+
+	// Require the matching closing ")".
+	if !p.acceptSymbol(")") {
+		p.idx = saved
+		return RangeVar{}, false, nil
+	}
+
+	// Build a synthetic `SELECT * FROM <join>` so the caller can treat the
+	// grouped join as a derived-table subquery. The SelectStmt carries both
+	// the structured FromExpr (for planFromClause's explicit-JOIN branch) and
+	// the flat From list (for the planner's range-var lookup).
+	synSel := &SelectStmt{
+		pos:       pos,
+		Targets:   []ResTarget{{pos: pos, Expr: &StarExpr{pos: pos}}},
+		From:      flat,
+		FromExprs: []FromExpr{item},
+	}
+
+	rv := RangeVar{pos: pos, Subquery: synSel}
+
+	// Parse optional `AS alias` or bare alias.
+	if p.acceptKeyword(KwAs) {
+		t, err := p.parseIdent()
+		if err != nil {
+			return RangeVar{}, false, err
+		}
+		rv.Alias = identText(t)
+	} else if isAliasStart(p.cur()) {
+		t := p.advance()
+		rv.Alias = identText(t)
+	}
+
+	if rv.Alias == "" {
+		// Provide a synthetic alias so downstream code can build a valid binding.
+		rv.Alias = fmt.Sprintf("__sq_%x", pos)
+	}
+
+	// Optional column-alias list: `AS alias (col1, col2, ...)`.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance() // consume "("
+		for {
+			t, err := p.parseIdent()
+			if err != nil {
+				return RangeVar{}, false, err
+			}
+			rv.Columns = append(rv.Columns, identText(t))
+			if p.acceptSymbol(",") {
+				continue
+			}
+			break
+		}
+		if !p.acceptSymbol(")") {
+			return RangeVar{}, false, p.errAtCur("expected ')' after column alias list")
+		}
+	}
+	return rv, true, nil
+}
+
 func (p *parser) parseFromItem() (FromExpr, []RangeVar, error) {
 	base, err := p.parseRangeVar()
 	if err != nil {
@@ -1086,6 +1165,19 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 			}
 		}
 		return rv, nil
+	}
+	// M0097-0059: Parenthesized join expression:
+	//   FROM (T1 JOIN T2 ON ...) AS alias
+	//   FROM (T1 CROSS JOIN T2) AS tx (col1, col2, ...)
+	// When "(" is NOT followed by a subquery keyword, try to parse
+	// it as a grouped join expression and wrap it in a synthetic
+	// SELECT * FROM ... subquery.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		if rv, ok, err := p.tryParseParenJoin(); err != nil {
+			return RangeVar{}, err
+		} else if ok {
+			return rv, nil
+		}
 	}
 	obj, err := p.parseObjectName()
 	if err != nil {

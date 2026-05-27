@@ -200,6 +200,13 @@ func (o *nestedLoopIndexJoinOp) Next() (TupleSlot, error) {
 		}
 
 		// Pull the next outer row.
+		// Check for statement-timeout cancellation once per outer row.
+		// M0097-0059: statement_timeout enforcement.
+		if o.ctx != nil && o.ctx.Ctx != nil {
+			if cerr := o.ctx.Ctx.Err(); cerr != nil {
+				return nil, &ExecError{Code: "57014", Message: "canceling statement due to statement timeout"}
+			}
+		}
 		outerSlot, err := o.outer.Next()
 		if err == EOF {
 			return nil, EOF
