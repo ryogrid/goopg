@@ -230,6 +230,18 @@ type IsBoolExpr struct {
 func (e *IsBoolExpr) Pos() int { return e.pos }
 func (*IsBoolExpr) exprNode()  {}
 
+// IsDistinctFromExpr mirrors parser.IsDistinctFromExpr after both operands
+// have been planned. Negated=true for IS NOT DISTINCT FROM.
+type IsDistinctFromExpr struct {
+	pos     int
+	Left    Expr
+	Right   Expr
+	Negated bool
+}
+
+func (e *IsDistinctFromExpr) Pos() int { return e.pos }
+func (*IsDistinctFromExpr) exprNode()  {}
+
 // SubqueryExpr mirrors parser.SubqueryExpr after the inner
 // SELECT has been planned. The executor opens / drains /
 // closes Plan once at evaluation time and returns the single

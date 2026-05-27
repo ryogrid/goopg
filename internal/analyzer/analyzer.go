@@ -634,6 +634,8 @@ func exprHasWindowFunc(e parser.Expr) bool {
 		return exprHasWindowFunc(x.Operand)
 	case *parser.IsBoolExpr:
 		return exprHasWindowFunc(x.Operand)
+	case *parser.IsDistinctFromExpr:
+		return exprHasWindowFunc(x.Left) || exprHasWindowFunc(x.Right)
 	case *parser.InExpr:
 		if exprHasWindowFunc(x.Operand) {
 			return true
@@ -754,6 +756,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 	case *parser.IsBoolExpr:
 		// IS [NOT] TRUE/FALSE/UNKNOWN always returns bool. M0097-0003.
 		if _, err := analyzeExpr(x.Operand, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "bool"}, nil
+	case *parser.IsDistinctFromExpr:
+		// IS [NOT] DISTINCT FROM always returns bool (null-safe equality).
+		if _, err := analyzeExpr(x.Left, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		if _, err := analyzeExpr(x.Right, ctx); err != nil {
 			return catalog.Type{}, err
 		}
 		return catalog.Type{Name: "bool"}, nil

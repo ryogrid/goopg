@@ -2405,6 +2405,11 @@ func walkExprForWindows(e parser.Expr, fn func(*parser.FuncCall) error) error {
 		return walkExprForWindows(x.Operand, fn)
 	case *parser.IsBoolExpr:
 		return walkExprForWindows(x.Operand, fn)
+	case *parser.IsDistinctFromExpr:
+		if err := walkExprForWindows(x.Left, fn); err != nil {
+			return err
+		}
+		return walkExprForWindows(x.Right, fn)
 	case *parser.InExpr:
 		if err := walkExprForWindows(x.Operand, fn); err != nil {
 			return err
@@ -2540,6 +2545,8 @@ func isConstantPlanExpr(e Expr) bool {
 		return isConstantPlanExpr(x.Operand)
 	case *IsNullExpr:
 		return isConstantPlanExpr(x.Operand)
+	case *IsDistinctFromExpr:
+		return isConstantPlanExpr(x.Left) && isConstantPlanExpr(x.Right)
 	}
 	return false
 }
@@ -2639,6 +2646,16 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			return nil, err
 		}
 		return &IsBoolExpr{pos: x.Pos(), Operand: operand, TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}, nil
+	case *parser.IsDistinctFromExpr:
+		lv, err := resolveExpr(x.Left, agg.input)
+		if err != nil {
+			return nil, err
+		}
+		rv, err := resolveExpr(x.Right, agg.input)
+		if err != nil {
+			return nil, err
+		}
+		return &IsDistinctFromExpr{pos: x.Pos(), Left: lv, Right: rv, Negated: x.Negated}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, agg.input)
 		if err != nil {
@@ -2907,6 +2924,16 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 			return nil, err
 		}
 		return &IsBoolExpr{pos: x.Pos(), Operand: operand, TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}, nil
+	case *parser.IsDistinctFromExpr:
+		lv, err := resolveExprAfterWindow(x.Left, win)
+		if err != nil {
+			return nil, err
+		}
+		rv, err := resolveExprAfterWindow(x.Right, win)
+		if err != nil {
+			return nil, err
+		}
+		return &IsDistinctFromExpr{pos: x.Pos(), Left: lv, Right: rv, Negated: x.Negated}, nil
 	}
 	return resolveExprForWindowInput(e, win.input, win.agg)
 }
@@ -2992,6 +3019,11 @@ func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
 		return walkExpr(x.Operand, fn)
 	case *parser.IsBoolExpr:
 		return walkExpr(x.Operand, fn)
+	case *parser.IsDistinctFromExpr:
+		if err := walkExpr(x.Left, fn); err != nil {
+			return err
+		}
+		return walkExpr(x.Right, fn)
 	case *parser.FuncCall:
 		if err := fn(x); err != nil {
 			return err
@@ -3193,6 +3225,12 @@ func parserExprKey(e parser.Expr) string {
 			return "isnotnull:(" + parserExprKey(x.Operand) + ")"
 		}
 		return "isnull:(" + parserExprKey(x.Operand) + ")"
+	case *parser.IsDistinctFromExpr:
+		pfx := "isdistinct"
+		if x.Negated {
+			pfx = "isnotdistinct"
+		}
+		return pfx + ":(" + parserExprKey(x.Left) + "):(" + parserExprKey(x.Right) + ")"
 	case *parser.BinaryOp:
 		return "b:" + x.Op.String() + ":(" + parserExprKey(x.Left) + "):(" + parserExprKey(x.Right) + ")"
 	case *parser.FuncCall:
@@ -3346,7 +3384,7 @@ func isConstantExpr(e Expr) bool {
 	switch x := e.(type) {
 	case *ColumnRef, *OuterColumnRef:
 		return false
-	case *SubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr, *IsBoolExpr:
+	case *SubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr, *IsBoolExpr, *IsDistinctFromExpr:
 		return false
 	case *BinaryOp:
 		return isConstantExpr(x.Left) && isConstantExpr(x.Right)
@@ -4999,6 +5037,16 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			return nil, err
 		}
 		return &IsBoolExpr{pos: x.Pos(), Operand: operand, TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}, nil
+	case *parser.IsDistinctFromExpr:
+		lv, err := resolveExpr(x.Left, ctx)
+		if err != nil {
+			return nil, err
+		}
+		rv, err := resolveExpr(x.Right, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &IsDistinctFromExpr{pos: x.Pos(), Left: lv, Right: rv, Negated: x.Negated}, nil
 	case *parser.ArraySubscriptExpr:
 		// expr[index] — array element access. Convert to array_subscript(base, index)
 		// so the executor can handle it without a new plan node type. M0097-0003.

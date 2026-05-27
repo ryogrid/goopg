@@ -4,6 +4,8 @@ package executor
 // M0097-0005.
 
 import (
+	"sort"
+
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -53,6 +55,29 @@ func (o *distinctOp) Open(ctx *Context) error {
 		seen[k] = struct{}{}
 		o.rows = append(o.rows, ownedRow)
 	}
+	// Sort rows for deterministic output matching PostgreSQL's sort-based
+	// DISTINCT: NULL values sort last, non-null values by datum order.
+	sort.Slice(o.rows, func(i, j int) bool {
+		ri, rj := o.rows[i], o.rows[j]
+		for col := 0; col < len(ri) && col < len(rj); col++ {
+			a, b := ri[col], rj[col]
+			if a.IsNull() && b.IsNull() {
+				continue
+			}
+			if a.IsNull() {
+				return false // NULLs last
+			}
+			if b.IsNull() {
+				return true
+			}
+			cmp, err := compareDatum(a, b, 0)
+			if err != nil || cmp == 0 {
+				continue
+			}
+			return cmp < 0
+		}
+		return len(ri) < len(rj)
+	})
 	return nil
 }
 

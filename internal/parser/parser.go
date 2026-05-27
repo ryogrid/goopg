@@ -301,6 +301,13 @@ func (p *parser) acceptIdentKeyword(names ...string) bool {
 // parseStatement dispatches on the leading keyword.
 func (p *parser) parseStatement() (Stmt, error) {
 	t := p.cur()
+	// Parenthesised compound query: (SELECT ...) UNION ALL (SELECT ...)
+	// PostgreSQL allows any set-operation branch to be wrapped in parentheses.
+	// Handle this at the statement level by consuming the '(' then delegating
+	// to parseParenthesisedSelectStmt.
+	if t.Kind == TokenSymbol && t.Value == "(" {
+		return p.parseParenthesisedSelectStmt()
+	}
 	if t.Kind != TokenKeyword && t.Kind != TokenIdent {
 		return nil, p.errAtCur("expected statement")
 	}

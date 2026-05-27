@@ -349,8 +349,45 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			result = !result
 		}
 		return NewBoolDatum(result), nil
+	case *planner.IsDistinctFromExpr:
+		// IS [NOT] DISTINCT FROM — null-safe equality. Always returns boolean.
+		//   a IS DISTINCT FROM b     = NOT (a = b OR (a IS NULL AND b IS NULL))
+		//   a IS NOT DISTINCT FROM b = (a = b OR (a IS NULL AND b IS NULL))
+		lv, err := evalExprSlot(x.Left, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		rv, err := evalExprSlot(x.Right, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		return evalIsDistinctFrom(lv, rv, x.Negated)
 	}
 	return Datum{}, &ExecError{Code: "XX000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported expression %T", e)}
+}
+
+// evalIsDistinctFrom implements a IS [NOT] DISTINCT FROM b.
+//
+//	IS DISTINCT FROM     = NOT (a = b OR (a IS NULL AND b IS NULL))
+//	IS NOT DISTINCT FROM = (a = b OR (a IS NULL AND b IS NULL))
+func evalIsDistinctFrom(lv, rv Datum, negated bool) (Datum, error) {
+	var equal bool
+	if lv.IsNull() && rv.IsNull() {
+		equal = true
+	} else if lv.IsNull() || rv.IsNull() {
+		equal = false
+	} else {
+		cmp, err := compareDatum(lv, rv, 0)
+		if err != nil {
+			equal = false
+		} else {
+			equal = cmp == 0
+		}
+	}
+	if negated {
+		return NewBoolDatum(equal), nil // IS NOT DISTINCT FROM
+	}
+	return NewBoolDatum(!equal), nil // IS DISTINCT FROM
 }
 
 // evalUnary handles -, +, NOT.

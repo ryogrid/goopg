@@ -78,7 +78,6 @@ func (p *parser) parseSelect() (Stmt, error) {
 	}
 	s := &SelectStmt{pos: t.Pos}
 	if p.acceptKeyword(KwDistinct) {
-		s.Distinct = true
 		// DISTINCT ON (expr [, ...]) — parse the expression list.
 		// The ON keyword is reserved (KwCatReserved) so we use acceptKeyword.
 		if p.acceptKeyword(KwOn) {
@@ -93,6 +92,11 @@ func (p *parser) parseSelect() (Stmt, error) {
 				return nil, p.errAtCur("expected ')' after DISTINCT ON expression list")
 			}
 			s.DistinctOn = exprs
+			// s.Distinct stays false: deduplication is handled by DistinctOn,
+			// not by a separate Distinct node.
+		} else {
+			// Plain SELECT DISTINCT (no ON clause).
+			s.Distinct = true
 		}
 	}
 	// Empty target list: `SELECT FROM <table>` is valid in upstream PG
@@ -556,7 +560,14 @@ func (p *parser) parseSetOpClause() (*SetOpClause, bool, error) {
 	} else {
 		_ = p.acceptKeyword(KwDistinct)
 	}
-	rhsStmt, err := p.parseSelect()
+	// The RHS may itself be a parenthesised compound query.
+	var rhsStmt Stmt
+	var err error
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		rhsStmt, err = p.parseParenthesisedSelectStmt()
+	} else {
+		rhsStmt, err = p.parseSelect()
+	}
 	if err != nil {
 		return nil, false, err
 	}
@@ -566,6 +577,92 @@ func (p *parser) parseSetOpClause() (*SetOpClause, bool, error) {
 	}
 	clause.Right = rhs
 	return clause, true, nil
+}
+
+// parseParenthesisedSelectStmt handles a top-level compound query where the
+// first branch is wrapped in parentheses, e.g.:
+//
+//	(SELECT a FROM t1 EXCEPT SELECT a FROM t2) UNION ALL (SELECT a FROM t3)
+//
+// PostgreSQL allows any branch of a set-operation to be parenthesised.
+// We handle this at the statement level by consuming '(' ... ')' and then
+// looking for a trailing UNION / INTERSECT / EXCEPT clause.
+func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
+	p.advance() // consume '('
+	inner, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	innerSel, ok := inner.(*SelectStmt)
+	if !ok {
+		return nil, p.errAtCur("expected SELECT inside parentheses")
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' after SELECT in parenthesised query")
+	}
+	// Optional trailing set-operation (UNION ALL / EXCEPT / INTERSECT …).
+	if setOp, present, err := p.parseSetOpClause(); err != nil {
+		return nil, err
+	} else if present {
+		// If innerSel already has a SetOp from the parenthesised content
+		// (e.g. "(A EXCEPT B) UNION ALL (C ...)"), we need to attach the
+		// outer set-op to the RIGHTMOST node in the existing chain rather
+		// than overwriting innerSel.SetOp. This mirrors how PostgreSQL's
+		// grammar builds left-to-right set-op trees:
+		//   (A EXCEPT B) UNION ALL C → A.SetOp=EXCEPT→B.SetOp=UNION_ALL→C
+		if innerSel.SetOp == nil {
+			innerSel.SetOp = setOp
+		} else {
+			// Walk to the rightmost SelectStmt and attach there.
+			rightmost := innerSel.SetOp.Right
+			for rightmost.SetOp != nil {
+				rightmost = rightmost.SetOp.Right
+			}
+			rightmost.SetOp = setOp
+		}
+		// Lift ORDER BY/LIMIT/OFFSET from right branch up to outermost level
+		// (mirrors what parseSelect does for non-parenthesised set ops).
+		if right := setOp.Right; right != nil {
+			if innerSel.OrderBy == nil && right.OrderBy != nil {
+				innerSel.OrderBy = right.OrderBy
+				right.OrderBy = nil
+			}
+			if innerSel.Limit == nil && right.Limit != nil {
+				innerSel.Limit = right.Limit
+				right.Limit = nil
+			}
+			if innerSel.Offset == nil && right.Offset != nil {
+				innerSel.Offset = right.Offset
+				right.Offset = nil
+			}
+		}
+	}
+	// Optional ORDER BY / LIMIT / OFFSET after the parenthesised compound.
+	if p.acceptKeyword(KwOrder) {
+		if !p.acceptKeyword(KwBy) {
+			return nil, p.errAtCur("expected BY after ORDER")
+		}
+		ob, err := p.parseSortList()
+		if err != nil {
+			return nil, err
+		}
+		innerSel.OrderBy = ob
+	}
+	if p.acceptKeyword(KwLimit) {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		innerSel.Limit = e
+	}
+	if p.acceptKeyword(KwOffset) {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		innerSel.Offset = e
+	}
+	return innerSel, nil
 }
 
 func (p *parser) parseTargetList() ([]ResTarget, error) {
@@ -1294,13 +1391,26 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 					left = &IsBoolExpr{pos: pos, Operand: left, Negated: negated}
 					continue
 				}
+				// IS [NOT] DISTINCT FROM expr — null-safe equality.
+				// Semantics: a IS DISTINCT FROM b = NOT (a = b OR (a IS NULL AND b IS NULL))
+				if p.acceptKeyword(KwDistinct) {
+					if !p.acceptKeyword(KwFrom) {
+						return nil, p.errAtCur("expected FROM after IS [NOT] DISTINCT")
+					}
+					right, err := p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+					left = &IsDistinctFromExpr{pos: pos, Left: left, Right: right, Negated: negated}
+					continue
+				}
 				// Not IS NULL / IS NOT NULL — put the parser back
 				// by not consuming further; produce an IS-predicate
 				// error only if we consumed NOT.
 				if negated {
-					return nil, p.errAtCur("expected NULL, TRUE, FALSE, or UNKNOWN after IS NOT")
+					return nil, p.errAtCur("expected NULL, TRUE, FALSE, UNKNOWN, or DISTINCT FROM after IS NOT")
 				}
-				// IS DISTINCT FROM, etc. — not yet supported;
+				// IS <something> — not yet supported;
 				// the caller will see an error on the next token.
 			}
 		}

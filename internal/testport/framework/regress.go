@@ -112,6 +112,7 @@ func RunRegressSubset(ctx context.Context, repoRoot string, cases []RegressCase,
 		if dir := os.Getenv("GOOPG_REGRESS_DIFF_DIR"); dir != "" {
 			_ = os.WriteFile(fmt.Sprintf("%s/%s_expected.txt", dir, c.Name), []byte(normExpected), 0644)
 			_ = os.WriteFile(fmt.Sprintf("%s/%s_actual.txt", dir, c.Name), []byte(normActual), 0644)
+			_ = os.WriteFile(fmt.Sprintf("%s/%s_raw.txt", dir, c.Name), []byte(actual), 0644)
 		}
 		results = append(results, RegressResult{Name: c.Name, SQLPath: c.SQLPath, Status: "defer", Rationale: "output mismatch; normalization rules need extension"})
 	}

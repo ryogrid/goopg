@@ -148,6 +148,22 @@ type IsBoolExpr struct {
 func (e *IsBoolExpr) Pos() int { return e.pos }
 func (*IsBoolExpr) exprNode()  {}
 
+// IsDistinctFromExpr is `expr IS [NOT] DISTINCT FROM expr`.
+// Result is always boolean (never NULL):
+//   - IS DISTINCT FROM     = NOT (a = b OR (a IS NULL AND b IS NULL))
+//   - IS NOT DISTINCT FROM = (a = b OR (a IS NULL AND b IS NULL))
+//
+// Negated=true for IS NOT DISTINCT FROM.
+type IsDistinctFromExpr struct {
+	pos     int
+	Left    Expr
+	Right   Expr
+	Negated bool // true for IS NOT DISTINCT FROM
+}
+
+func (e *IsDistinctFromExpr) Pos() int { return e.pos }
+func (*IsDistinctFromExpr) exprNode()  {}
+
 // SubqueryExpr is the v0 scalar-subquery expression: a
 // parenthesised SELECT used in expression position. The
 // executor evaluates it once per Open and binds the single

@@ -452,6 +452,27 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// Planner cost GUCs — goopg ignores them but SET succeeds so test
+	// scripts that adjust them don't fail with "unrecognized parameter".
+	// Values mirror postgres/src/backend/utils/misc/guc_tables.c.
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_above_cost", Type: TypeReal, BootVal: "100000",
+		MinVal: -1, MaxVal: 1e15,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "parallel_setup_cost", Type: TypeReal, BootVal: "1000",
+		MinVal: 0, MaxVal: 1e15,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "parallel_tuple_cost", Type: TypeReal, BootVal: "0.1",
+		MinVal: 0, MaxVal: 1e15,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "search_path", Type: TypeString, BootVal: `"$user", public`,
 		Context: ContextUserset,
