@@ -1314,6 +1314,49 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 			}
 		}
 
+		// `expr AT LOCAL` and `expr AT TIME ZONE zone-expr` — timezone conversion.
+		// Desugar to FuncCall to avoid introducing new plan nodes:
+		//   f1 AT LOCAL                    → FuncCall{Name:"timezone", Args:[f1]}
+		//   f1 AT TIME ZONE 'UTC+10'       → FuncCall{Name:"timezone", Args:['UTC+10', f1]}
+		//   f1 AT TIME ZONE INTERVAL '-10' → FuncCall{Name:"timezone", Args:[StringConst("-10:00"), f1]}
+		// Arg order matches timetz_at_local(timetz), timetz_zone(text,timetz),
+		// timetz_izone(interval,timetz) — PG convention puts zone first.
+		if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "at") {
+			pos := t.Pos
+			p.advance() // consume AT
+			if p.acceptKeyword(KwLocal) {
+				left = &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: "timezone"}, Args: []Expr{left}}
+				continue
+			}
+			// AT TIME ZONE <zone-expr>
+			if p.acceptIdentKeyword("time") {
+				if !p.acceptIdentKeyword("zone") {
+					return nil, p.errAtCur("expected ZONE after AT TIME")
+				}
+				// Special-case: INTERVAL 'HH:MM' as a sub-day timezone offset.
+				// The standard interval parser only handles day/month/year units, so
+				// INTERVAL '00:00' / INTERVAL '-10:00' fall through here as strings.
+				var zone Expr
+				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "interval") {
+					if p.peek(1).Kind == TokenStringLit {
+						p.advance() // INTERVAL
+						strTok := p.advance() // string literal
+						zone = &StringConst{pos: strTok.Pos, Value: strTok.Value}
+					}
+				}
+				if zone == nil {
+					var err error
+					zone, err = p.parseExprPrec(precCompare + 1)
+					if err != nil {
+						return nil, err
+					}
+				}
+				left = &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: "timezone"}, Args: []Expr{zone, left}}
+				continue
+			}
+			return nil, p.errAtCur("expected LOCAL or TIME ZONE after AT")
+		}
+
 		op, prec, ok := p.peekBinaryOp()
 		if !ok || prec < min {
 			return left, nil

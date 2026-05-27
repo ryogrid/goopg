@@ -4584,6 +4584,20 @@ func exprType(e Expr) catalog.Type {
 			"cardinality", "strpos", "position":
 			// String/array length functions return int4. M0097-0003.
 			return catalog.Type{Name: "int4"}
+		case "timezone":
+			// AT LOCAL / AT TIME ZONE: return type depends on the input (last arg).
+			if len(x.Args) > 0 {
+				inputArg := x.Args[len(x.Args)-1]
+				t := exprType(inputArg)
+				switch strings.ToLower(t.Name) {
+				case "timetz":
+					return catalog.Type{Name: "timetz"}
+				case "timestamptz":
+					return catalog.Type{Name: "timestamp"}
+				case "timestamp":
+					return catalog.Type{Name: "timestamptz"}
+				}
+			}
 		case "coalesce", "greatest", "least":
 			// Return the type of the first non-unknown argument (widest wins
 			// in practice since args are resolved before exprType is called).

@@ -831,14 +831,22 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				strings.EqualFold(leftTyp.Name, "interval") && isTimestampLike(rightTyp) {
 				return catalog.Type{Name: "timestamp"}, nil
 			}
-			// time + time / timestamp + timestamp → ambiguous operator error
-			// matching PostgreSQL's "operator is not unique" format. M0097-0004.
+			// time + time / timestamp + timestamp → operator error.
+			// timetz+timetz: "operator does not exist" (42883) — no such operator in PG.
+			// time+time / etc.: "operator is not unique" (42725) — multiple candidates.
 			// Note: only trigger when BOTH sides are concrete time/timestamp types
 			// (not "unknown", which covers untyped string literals).
 			if (x.Op == parser.OpAdd || x.Op == parser.OpSub) &&
 				isConcreteTimestampLike(leftTyp) && isConcreteTimestampLike(rightTyp) {
 				lname := pgTimeName(leftTyp.Name)
 				rname := pgTimeName(rightTyp.Name)
+				// timetz has no + or - operator at all; other time types are "not unique".
+				if strings.EqualFold(leftTyp.Name, "timetz") || strings.EqualFold(rightTyp.Name, "timetz") {
+					ae := analyzeError(x.Pos(), "42883",
+						fmt.Sprintf("operator does not exist: %s %s %s", lname, x.Op, rname))
+					ae.Hint = "No operator matches the given name and argument types. You might need to add explicit type casts."
+					return catalog.Type{}, ae
+				}
 				ae := analyzeError(x.Pos(), "42725",
 					fmt.Sprintf("operator is not unique: %s %s %s", lname, x.Op, rname))
 				ae.Hint = "Could not choose a best candidate operator. You might need to add explicit type casts."

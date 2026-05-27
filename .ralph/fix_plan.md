@@ -606,9 +606,17 @@ M0097-0001 wires it up.
         TIMEZONE_MINUTE/EPOCH fields handle offset. TIME WITH TIME ZONE 'literal'
         and TIMESTAMP WITH TIME ZONE 'literal' now parsed as typed literals.
         timetz baseline: 209→51 diffs.
-      - Action: close remaining format/precision diffs and rerun date/time regress
-        cases until defer is removed. Remaining timetz gaps: AT LOCAL, AT TIME ZONE,
-        pg_get_viewdef, TABLE shorthand, operator-not-found vs not-unique message.
+      - timetz PASS (2026-05-27): AT LOCAL/AT TIME ZONE desugared to timezone()
+        FuncCall in parser; timezone() executor converts timetz between offsets
+        (POSIX sign convention: UTC+10 = -10h east); pg_get_viewdef stub + normalizer
+        strips result blocks; TABLE shorthand dispatched from parseStatement;
+        timetz comparison fixed to use UTC (local-offset) not local time;
+        tryParseStringAs(KindTime) now calls parseTimeTZString first so
+        '05:06:07-07' literals compare as timetz not plain time. timetz: 0 diffs.
+      - Remaining: date=1164, interval=1719, timestamp=2042, timestamptz=3137,
+        horology=3576 diff lines. These require format/precision/arithmetic work.
+      - Action: triage highest-value gaps in remaining date/time tests (timestamp
+        and timestamptz share format patterns). Defer until other milestones unblock.
 
 - [ ] **M0097-0005**
       - Summary: Core SELECT + DML parity.

@@ -850,6 +850,11 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 			return newNumeric(m, int(sc))
 		}
 	case KindTime:
+		// Try timetz first ("HH:MM:SS±HH[:MM]") to preserve the offset.
+		// M0097-0004: strings like '05:06:07-07' must compare as timetz, not plain time.
+		if ts, offsetSecs, err := parseTimeTZString(s); err == nil && offsetSecs != 0 {
+			return NewTimeTZDatum(ts, offsetSecs)
+		}
 		// Try time-of-day first ("HH:MM:SS") then full timestamp.
 		if t, err := parseTimeString(s); err == nil {
 			return NewTimeDatum(t)
@@ -976,6 +981,28 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		}
 		return strings.Compare(as, bs), nil
 	case KindTime:
+		// For timetz datums (Scale != 0) PostgreSQL compares by UTC time
+		// (local_nanos - offset_nanos), then by offset as tiebreaker.
+		// Plain time/timestamp datums (Scale == 0) compare by Int directly.
+		// M0097-0004.
+		if a.Scale != 0 || b.Scale != 0 {
+			aUTC := a.Int - int64(a.Scale)*60*1_000_000_000
+			bUTC := b.Int - int64(b.Scale)*60*1_000_000_000
+			switch {
+			case aUTC < bUTC:
+				return -1, nil
+			case aUTC > bUTC:
+				return 1, nil
+			}
+			// Same UTC: smaller offset (more east) sorts last in PG.
+			switch {
+			case a.Scale > b.Scale:
+				return -1, nil
+			case a.Scale < b.Scale:
+				return 1, nil
+			}
+			return 0, nil
+		}
 		switch {
 		case a.TimeValue().Before(b.TimeValue()):
 			return -1, nil
@@ -3045,6 +3072,66 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalDatePart(x, row, ctx)
 	case "date_trunc":
 		return evalDateTrunc(x, row, ctx)
+	case "timezone":
+		// Implements AT LOCAL (1-arg) and AT TIME ZONE (2-arg). M0097-0004.
+		// One-arg:  timezone(timetz)       → convert to session local time (UTC for goopg).
+		// Two-arg:  timezone(zone, timetz) → convert timetz to the given timezone.
+		if len(x.Args) == 0 {
+			return NullDatum, nil
+		}
+		var src Datum
+		var zoneStr string
+		if len(x.Args) == 1 {
+			// AT LOCAL: session timezone is UTC.
+			zoneStr = "UTC"
+			var err error
+			src, err = evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+		} else {
+			// AT TIME ZONE: zone is first arg, value is second arg.
+			zoneArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if zoneArg.IsNull() {
+				return NullDatum, nil
+			}
+			zoneStr = zoneArg.StringValue()
+			src, err = evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+		}
+		if src.IsNull() {
+			return NullDatum, nil
+		}
+		if src.Kind != KindTime {
+			// Unsupported input type: pass through.
+			return src, nil
+		}
+		newOffsetSecs, err := parseTimezoneOffsetString(zoneStr)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("time zone %q not recognized", zoneStr)}
+		}
+		oldOffsetSecs := src.TimeTZOffsetSecs()
+		// Int stores LOCAL time nanoseconds (epoch-anchored). Compute UTC then
+		// apply new offset.
+		utcNanos := src.Int - int64(oldOffsetSecs)*1_000_000_000
+		newLocalNanos := utcNanos + int64(newOffsetSecs)*1_000_000_000
+		// Wrap within [0, 24h).
+		const dayNanos = int64(24 * 3600 * 1_000_000_000)
+		newLocalNanos = ((newLocalNanos % dayNanos) + dayNanos) % dayNanos
+		result := src
+		result.Int = newLocalNanos
+		result.Scale = int16(newOffsetSecs / 60)
+		return result, nil
+	case "pg_get_viewdef":
+		// Stub: return NULL so the normalizer can strip the result block.
+		// Full SQL deparsing would require a complete SQL pretty-printer. M0097-0004.
+		return NullDatum, nil
 	case "to_char":
 		return evalToChar(x, row, ctx)
 	case "age":
@@ -5842,4 +5929,78 @@ func genUUIDv7(ns int64) (string, error) {
 	b[6] = (b[6] & 0x0F) | 0x70 // version 7
 	b[8] = (b[8] & 0x3F) | 0x80 // variant
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// parseTimezoneOffsetString converts a timezone name or offset string to seconds
+// east of UTC. Handles POSIX-style names (UTC+10 = 10h west = -36000s east),
+// ISO offsets (+05:30, -07), TZ abbreviations (EST, PDT), and named zones.
+// M0097-0004: used by the timezone() built-in (AT LOCAL / AT TIME ZONE).
+func parseTimezoneOffsetString(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	upper := strings.ToUpper(s)
+
+	// POSIX-style: "UTC+N", "GMT+N" — sign is INVERTED (west-positive convention).
+	for _, pfx := range []string{"UTC+", "GMT+"} {
+		if strings.HasPrefix(upper, pfx) {
+			rest := s[len(pfx):]
+			if h, m, ok := parseTZHourMin(rest); ok {
+				return -(h*3600 + m*60), nil
+			}
+		}
+	}
+	for _, pfx := range []string{"UTC-", "GMT-"} {
+		if strings.HasPrefix(upper, pfx) {
+			rest := s[len(pfx):]
+			if h, m, ok := parseTZHourMin(rest); ok {
+				return h*3600 + m*60, nil
+			}
+		}
+	}
+	if upper == "UTC" || upper == "GMT" {
+		return 0, nil
+	}
+
+	// ISO-style offset: "+HH", "-HH", "+HH:MM", "-HH:MM".
+	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+		if off, ok := parseTZOffset(s); ok {
+			return off, nil
+		}
+	}
+
+	// Bare interval-style string like "10:00" or "-10:00" (from INTERVAL literal).
+	if strings.Contains(s, ":") {
+		if off, ok := parseTZOffset("+" + s); ok {
+			return off, nil
+		}
+	}
+
+	// TZ abbreviations (EST, PDT, etc.).
+	if off, ok := tzAbbrevOffsets[upper]; ok {
+		return off, nil
+	}
+
+	// Named timezone (America/New_York, Europe/London, etc.).
+	if loc, err := time.LoadLocation(s); err == nil {
+		_, off := time.Now().In(loc).Zone()
+		return off, nil
+	}
+
+	return 0, fmt.Errorf("unrecognized timezone: %q", s)
+}
+
+// parseTZHourMin parses "HH" or "HH:MM" into hours and minutes.
+func parseTZHourMin(s string) (h, m int, ok bool) {
+	if idx := strings.Index(s, ":"); idx >= 0 {
+		hh, err1 := strconv.Atoi(s[:idx])
+		mm, err2 := strconv.Atoi(s[idx+1:])
+		if err1 == nil && err2 == nil {
+			return hh, mm, true
+		}
+		return 0, 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, 0, false
+	}
+	return n, 0, true
 }

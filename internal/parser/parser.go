@@ -320,7 +320,8 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseSet()
 	case KwReset:
 		return p.parseReset()
-	case KwSelect:
+	case KwSelect, KwTable:
+		// TABLE tablename is handled inside parseSelect as a shorthand. M0097-0004.
 		return p.parseSelect()
 	case KwInsert:
 		return p.parseInsert()
