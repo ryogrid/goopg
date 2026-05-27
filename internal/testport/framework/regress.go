@@ -836,10 +836,29 @@ func sortUnorderedResultBlocks(lines []string) []string {
 		// Found separator at i. Data rows start at i+1, end before the row-count line.
 		dataStart := i + 1
 		dataEnd := dataStart
-		for dataEnd < len(out) && !isRowCountLine(out[dataEnd]) {
+		// Scan forward for the row-count line, but stop early if we hit another
+		// separator (meaning we passed into a different result block — the current
+		// block has no row-count footer, e.g. because goopg returned an error) or
+		// exceed a reasonable row limit. Without this guard, an ERROR response
+		// causes the scan to consume SQL statement lines from subsequent commands
+		// and sort them as if they were data rows. M0097-0050 fix.
+		const maxDataRows = 1000
+		for dataEnd < len(out) && dataEnd-dataStart < maxDataRows {
+			if isRowCountLine(out[dataEnd]) {
+				break
+			}
+			if isSeparatorLine(out[dataEnd]) {
+				// Hit another block's separator — current block is malformed.
+				dataEnd = dataStart // signal: skip this block
+				break
+			}
 			dataEnd++
 		}
-		// dataEnd is now the row-count line (or EOF). Data rows are [dataStart, dataEnd).
+		// Skip if block is malformed (no row-count footer found) or too small.
+		// dataEnd may equal len(out) if EOF was reached without a row-count line.
+		if dataEnd == dataStart || dataEnd >= len(out) || !isRowCountLine(out[dataEnd]) {
+			continue
+		}
 		if dataEnd-dataStart < 2 {
 			continue // 0 or 1 data row — sorting is a no-op
 		}

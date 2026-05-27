@@ -533,7 +533,21 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		//   then append UNION ALL C without re-sorting. M0097-0044.
 		innerBoundary := s.InnerSegmentCount // 0 = no boundary (normal)
 		for i, seg := range segments {
+			// Middle segments (all but the last) had their SetOp saved+cleared
+			// above, then restored early for plan-cache correctness. Re-clear
+			// before planning so planSelect(seg.stmt) sees this as a leaf and
+			// does not recursively re-flatten the already-flattened chain.
+			// The last segment is either a true leaf (SetOp=nil) or an
+			// explicitly-parenthesised compound (Parenthesized=true) that must
+			// retain its SetOp so the inner compound is planned correctly.
+			// M0097-0050.
+			if i < len(segments)-1 {
+				seg.stmt.SetOp = nil
+			}
 			right, rerr := planSelect(seg.stmt, cat)
+			if i < len(segments)-1 {
+				seg.stmt.SetOp = savedSetOps[i+1] // restore for plan-cache
+			}
 			if rerr != nil {
 				return nil, rerr
 			}
