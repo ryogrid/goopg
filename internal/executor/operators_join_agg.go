@@ -814,6 +814,17 @@ type aggregateOp struct {
 	idx  int
 }
 
+// floatSpecialKind encodes the IEEE 754 special-value state for
+// sum/avg when float4/float8 inputs contain NaN or Infinity.
+type floatSpecialKind int8
+
+const (
+	floatSpecialNone     floatSpecialKind = 0
+	floatSpecialNaN      floatSpecialKind = 1 // NaN dominates all
+	floatSpecialPosInf   floatSpecialKind = 2 // +Infinity
+	floatSpecialNegInf   floatSpecialKind = 3 // -Infinity
+)
+
 type aggRuntime struct {
 	hasValue bool
 	value    Datum
@@ -824,7 +835,11 @@ type aggRuntime struct {
 	sum        int64
 	numericSum Datum
 	count      int64
-	distinct   map[string]struct{}
+	// floatSpecial tracks NaN/Infinity state for sum/avg when float
+	// inputs contain special IEEE 754 values (stored as KindString).
+	// M0097-0053.
+	floatSpecial floatSpecialKind
+	distinct     map[string]struct{}
 	// Extended aggregate accumulators (M0097-0007).
 	boolResult bool   // for bool_and / bool_or / every
 	intResult  int64  // for bit_and / bit_or / bit_xor
@@ -1029,6 +1044,34 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 				return &ExecError{Code: "22003", Pos: call.Pos(), Message: err.Error()}
 			}
 			st.numericSum = s
+		case KindString:
+			// Special IEEE 754 float values (NaN, Infinity, -Infinity) are
+			// stored as KindString by the codec. Handle them here so
+			// sum/avg on float4/float8 columns with special values works.
+			// NaN dominates; +Inf and -Inf obey IEEE addition rules.
+			// M0097-0053.
+			switch arg.StringValue() {
+			case "NaN":
+				st.floatSpecial = floatSpecialNaN
+			case "Infinity":
+				switch st.floatSpecial {
+				case floatSpecialNegInf:
+					st.floatSpecial = floatSpecialNaN // +Inf + (-Inf) = NaN
+				case floatSpecialNone:
+					st.floatSpecial = floatSpecialPosInf
+				// floatSpecialNaN: stays NaN; floatSpecialPosInf: stays +Inf
+				}
+			case "-Infinity":
+				switch st.floatSpecial {
+				case floatSpecialPosInf:
+					st.floatSpecial = floatSpecialNaN // -Inf + (+Inf) = NaN
+				case floatSpecialNone:
+					st.floatSpecial = floatSpecialNegInf
+				// floatSpecialNaN: stays NaN; floatSpecialNegInf: stays -Inf
+				}
+			default:
+				return &ExecError{Code: "42804", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s requires numeric argument in v0", name)}
+			}
 		default:
 			return &ExecError{Code: "42804", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s requires numeric argument in v0", name)}
 		}
@@ -1176,6 +1219,16 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if !st.hasValue {
 			return NullDatum
 		}
+		// IEEE 754 special values from float4/float8 columns take precedence.
+		// M0097-0053.
+		switch st.floatSpecial {
+		case floatSpecialNaN:
+			return NewStringDatum("NaN")
+		case floatSpecialPosInf:
+			return NewStringDatum("Infinity")
+		case floatSpecialNegInf:
+			return NewStringDatum("-Infinity")
+		}
 		if st.numericSum.Kind == KindNumeric {
 			return st.numericSum
 		}
@@ -1184,6 +1237,15 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if st.count == 0 {
 			return NullDatum
 		}
+		// IEEE 754 special values from float4/float8 columns. M0097-0053.
+		switch st.floatSpecial {
+		case floatSpecialNaN:
+			return NewStringDatum("NaN")
+		case floatSpecialPosInf:
+			return NewStringDatum("Infinity")
+		case floatSpecialNegInf:
+			return NewStringDatum("-Infinity")
+		}
 		if st.numericSum.Kind == KindNumeric {
 			d, err := numericDiv(st.numericSum, numericFromInt(st.count), call.Pos())
 			if err != nil {
@@ -1191,7 +1253,14 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 			}
 			return d
 		}
-		return Datum{Kind: KindInt, Int: st.sum / st.count}
+		// avg(integer types) must return numeric, not integer (PostgreSQL
+		// behaviour: avg(int2/int4/int8) → numeric). M0097-0053.
+		numSum := numericFromInt(st.sum)
+		d, err := numericDiv(numSum, numericFromInt(st.count), call.Pos())
+		if err != nil {
+			return NullDatum
+		}
+		return d
 	case "min", "max":
 		if !st.hasValue {
 			return NullDatum
