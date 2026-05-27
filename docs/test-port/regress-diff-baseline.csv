@@ -27,7 +27,7 @@ hash_part,0,pass
 hash_index,0,pass
 index_including_gist,84,failed
 expressions,0,pass
-select_into,2,failed
+select_into,0,pass
 prepare,0,pass
 dbsize,0,pass
 lock,155,failed
@@ -51,7 +51,7 @@ plancache,196,failed
 create_procedure,324,failed
 text,338,failed
 enum,403,failed
-equivclass,57,failed
+equivclass,0,pass
 xid,404,failed
 random,451,failed
 select_distinct,0,passed
@@ -79,7 +79,7 @@ fast_default,729,failed
 returning,577,failed
 join_hash,193,failed
 copy2,919,failed
-select,82,failed
+select,56,failed
 int8,613,failed
 domain,932,failed
 jsonpath,940,failed
@@ -88,7 +88,7 @@ float8,1025,failed
 rowtypes,1030,failed
 constraints,901,failed
 portals,1089,failed
-union,16,failed
+union,5,failed
 date,1164,failed
 copy,1257,failed
 generated_stored,1337,failed
@@ -127,4 +127,4 @@ jsonb_jsonpath,4214,failed
 partition_prune,4217,failed
 jsonb,4904,failed
 partition_join,1496,failed
-join,6800,failed
+join,4471,failed
