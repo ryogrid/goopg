@@ -1573,6 +1573,13 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 			if err != nil {
 				return nil, err
 			}
+			// M0097-0058: apply column alias renaming from
+			// FROM tbl alias (col1, col2, ...) so that the
+			// analyzer scope uses the aliased names. Without
+			// this, resolving `alias.col1` fails with "column
+			// does not exist" because the scope still has the
+			// original catalog column names.
+			tbl = applyRangeVarColumnAliases(rv, tbl)
 			rels = append(rels, scopeRel{table: tbl, alias: rv.Alias})
 		}
 		return rels, nil
@@ -1583,16 +1590,38 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 		if err != nil {
 			return nil, err
 		}
+		tbl = applyRangeVarColumnAliases(item.Base, tbl)
 		rels = append(rels, scopeRel{table: tbl, alias: item.Base.Alias})
 		for _, j := range item.Joins {
 			rt, err := resolveTable(ctx, j.Right)
 			if err != nil {
 				return nil, err
 			}
+			rt = applyRangeVarColumnAliases(j.Right, rt)
 			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias, usingHidden: j.Using})
 		}
 	}
 	return rels, nil
+}
+
+// applyRangeVarColumnAliases returns a shallow copy of tbl with
+// column names replaced by the alias list from rv.Columns, or
+// tbl itself when rv.Columns is empty or the table came from a
+// subquery (subqueries handle their own renaming). M0097-0058.
+func applyRangeVarColumnAliases(rv parser.RangeVar, tbl *catalog.Table) *catalog.Table {
+	if len(rv.Columns) == 0 || rv.Subquery != nil {
+		return tbl
+	}
+	cp := *tbl
+	cols := make([]catalog.Column, len(tbl.Columns))
+	copy(cols, tbl.Columns)
+	for i, alias := range rv.Columns {
+		if i < len(cols) {
+			cols[i].Name = alias
+		}
+	}
+	cp.Columns = cols
+	return &cp
 }
 
 // synthesizeSubqueryTable analyzes a derived table — the

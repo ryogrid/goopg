@@ -85,6 +85,23 @@ func tryBushyDP(node Node, pred Expr, ctx *resolveContext, cat catalog.Catalog) 
 	if len(scans) != len(tables) {
 		return node, pred
 	}
+	// M0097-0058: buildBindingsPosMap resolves column-index remapping
+	// via (table-pointer, alias) scan keys, which only exist for
+	// SeqScan and IndexScan leaves. Subquery FROM items (Aggregate,
+	// Values, etc.) produce a synthetic catalog.Table in their binding
+	// that never matches any scan node, so after bushy DP restructures
+	// the join tree the ColumnRefs for subquery columns stay at their
+	// pre-DP cross-join indices and cause an index-out-of-bounds panic
+	// inside the inner join's row evaluation. Skip bushy DP for any
+	// FROM list that contains non-table leaf nodes.
+	for _, scan := range scans {
+		switch scan.(type) {
+		case *SeqScan, *IndexScan, *MultiHashJoin:
+			// OK — buildBindingsPosMap can remap these.
+		default:
+			return node, pred
+		}
+	}
 	conjuncts := splitAnd(pred)
 	// M0076-0001 attempt 2026-05-10: re-enabled the
 	// inferTransitiveEqualities hook with M0076-0004's

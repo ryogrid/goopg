@@ -34,7 +34,7 @@ lock,155,failed
 prepared_xacts,172,failed
 drop_if_exists,176,failed
 advisory_lock,0,pass
-case,34,failed
+case,24,failed
 uuid,0,pass
 select_distinct_on,0,passed
 partition_info,185,failed
@@ -66,7 +66,7 @@ sequence,417,failed
 matview,287,failed
 transactions,599,failed
 create_table_like,356,failed
-limit,17,failed
+limit,15,failed
 create_table,584,failed
 guc,748,failed
 update,669,failed
@@ -88,7 +88,7 @@ float8,1025,failed
 rowtypes,1030,failed
 constraints,901,failed
 portals,1089,failed
-union,5,failed
+union,4,failed
 date,1164,failed
 copy,1257,failed
 generated_stored,1337,failed
@@ -127,4 +127,4 @@ jsonb_jsonpath,4214,failed
 partition_prune,4217,failed
 jsonb,4904,failed
 partition_join,1496,failed
-join,4471,failed
+join,4262,failed
