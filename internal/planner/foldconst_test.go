@@ -352,6 +352,92 @@ func TestFoldTrueAndDoD(t *testing.T) {
 	}
 }
 
+// ── CASE constant-folding tests (M0097-0047) ─────────────────────────────────
+
+// TestFoldCaseDeadBranchSuppressesDivisionByZero verifies that a WHEN branch
+// whose condition is a known-false constant does NOT fold its THEN body.
+// This mirrors PostgreSQL behaviour: unreachable branches are not evaluated at
+// plan time, so `CASE WHEN 1=0 THEN 1/0 WHEN 1=1 THEN 1 ELSE 2/0 END` must
+// return 1 without throwing a division-by-zero error.
+func TestFoldCaseDeadBranchSuppressesDivisionByZero(t *testing.T) {
+	// Searched CASE: WHEN 1=0 THEN 1/0 — dead; WHEN 1=1 THEN 1 — live
+	e, err := parseSingleExpr(t, "CASE WHEN 1=0 THEN 1/0 WHEN 1=1 THEN 1 ELSE 2/0 END")
+	if err != nil {
+		t.Fatalf("parseSingleExpr: %v", err)
+	}
+	folded := FoldConstants(e) // must NOT panic
+	ic, ok := folded.(*IntegerConst)
+	if !ok {
+		t.Fatalf("want *IntegerConst(1), got %T", folded)
+	}
+	if ic.Value != 1 {
+		t.Errorf("got %d, want 1", ic.Value)
+	}
+}
+
+// TestFoldSimpleCaseDeadBranchSuppressesDivisionByZero verifies the same
+// behaviour for a simple CASE (with operand):
+// `CASE 1 WHEN 0 THEN 1/0 WHEN 1 THEN 1 ELSE 2/0 END` → 1
+func TestFoldSimpleCaseDeadBranchSuppressesDivisionByZero(t *testing.T) {
+	e, err := parseSingleExpr(t, "CASE 1 WHEN 0 THEN 1/0 WHEN 1 THEN 1 ELSE 2/0 END")
+	if err != nil {
+		t.Fatalf("parseSingleExpr: %v", err)
+	}
+	folded := FoldConstants(e)
+	ic, ok := folded.(*IntegerConst)
+	if !ok {
+		t.Fatalf("want *IntegerConst(1), got %T", folded)
+	}
+	if ic.Value != 1 {
+		t.Errorf("got %d, want 1", ic.Value)
+	}
+}
+
+// TestFoldPlanConstantsDivisionByZeroPropagates verifies that
+// foldPlanConstants returns an error (not a panic) when a potentially-reachable
+// THEN body contains a constant division-by-zero.
+// Mirrors: SELECT CASE WHEN i > 100 THEN 1/0 ELSE 0 END FROM case_tbl
+// which PostgreSQL evaluates at plan time and raises ERROR: division by zero.
+func TestFoldPlanConstantsDivisionByZeroPropagates(t *testing.T) {
+	cat := catalog.NewInMemory()
+	_, err := cat.CreateTable(
+		parser.ObjectName{Name: "case_tbl"},
+		[]catalog.Column{{Name: "i", Type: catalog.Type{Name: "int4"}}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The THEN `1/0` is under a non-constant condition `i > 100` (ColumnRef),
+	// so it is "potentially reachable" and must be folded at plan time → error.
+	_, planErr := Plan(
+		mustParse(t, "SELECT CASE WHEN i > 100 THEN 1/0 ELSE 0 END FROM case_tbl"),
+		cat,
+	)
+	if planErr == nil {
+		t.Fatal("Plan: expected division-by-zero error, got nil")
+	}
+	pe, ok := planErr.(*PlanError)
+	if !ok {
+		t.Fatalf("expected *PlanError, got %T: %v", planErr, planErr)
+	}
+	if pe.Code != "22012" {
+		t.Errorf("PlanError.Code = %q, want \"22012\"", pe.Code)
+	}
+}
+
+// mustParse is a test helper that parses a single SQL statement or fatals.
+func mustParse(t *testing.T, sql string) parser.Stmt {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse(%q): %v", sql, err)
+	}
+	if len(stmts) == 0 {
+		t.Fatalf("Parse(%q): no statements", sql)
+	}
+	return stmts[0]
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 // parseSingleExpr parses a bare SQL expression and converts it to the

@@ -34,7 +34,7 @@ lock,131,failed
 prepared_xacts,132,failed
 drop_if_exists,130,failed
 advisory_lock,0,pass
-case,93,failed
+case,111,failed
 uuid,0,pass
 select_distinct_on,0,passed
 partition_info,185,failed
@@ -54,7 +54,7 @@ enum,318,failed
 equivclass,320,failed
 xid,408,failed
 random,385,failed
-select_distinct,26,failed
+select_distinct,0,passed
 regex,415,failed
 btree_index,435,failed
 cluster,438,failed
@@ -66,7 +66,7 @@ sequence,499,failed
 matview,500,failed
 transactions,530,failed
 create_table_like,538,failed
-limit,15,failed
+limit,17,failed
 create_table,562,failed
 guc,592,failed
 update,596,failed
@@ -88,7 +88,7 @@ float8,1027,failed
 rowtypes,1030,failed
 constraints,1039,failed
 portals,1089,failed
-union,34,failed
+union,48,failed
 date,1164,failed
 copy,1214,failed
 generated_stored,1337,failed

@@ -1153,6 +1153,50 @@ M0097-0001 wires it up.
         Remaining `limit` blockers (15 lines): lateral correlated
         reference `OFFSET s-1` inside subquery (lateral support needed).
 
+      - **Progress 2026-05-27 (M0097-0046 — select_distinct 26→0 PASS):**
+        Achieved `select_distinct` PASS (26→0 diff). Fixed table inheritance
+        column ordering: `t1c INHERITS t1` with `(b text, a text)` vs `(a text,
+        b text)` — inheritance scan now remaps columns by name not physical
+        position. Also fixed OR predicate push-down for inheritance children.
+        Baseline CSV updated: `select_distinct` 26→0 (`pass`).
+
+      - **Progress 2026-05-28 (M0097-0047 — CASE folding + CTE MATERIALIZED):**
+        Three fixes targeting `case` and `union` diffs:
+        (a) CASE constant-folding dead-branch suppression
+            (`internal/planner/foldconst.go`): `foldCaseExpr` now delays
+            THEN-body folding until dead/live status is confirmed. Dead
+            branches (WHEN FALSE) are dropped without folding their THEN —
+            unreachable `1/0` no longer throws. Potentially-reachable THEN
+            bodies (non-constant WHEN) ARE folded and may throw
+            `division by zero` at plan time. Matches PG's behaviour from
+            case.sql commentary "we do not currently suppress folding of
+            potentially reachable subexpressions". `foldPlanConstants` now
+            returns error via panic/recover; `tryFoldBinaryOp` panics on
+            division-by-zero.
+        (b) CTE MATERIALIZED/NOT MATERIALIZED keywords
+            (`internal/parser/with.go`, `internal/parser/ast.go`): the
+            parser now accepts `WITH cte AS MATERIALIZED (...)` and
+            `WITH cte AS NOT MATERIALIZED (...)`. `CommonTableExpr` gains
+            a `Materialized` string field. This fixes 2 missing output
+            blocks in the `union` regress test.
+        (c) Analyzer CTE+UNION fix (`internal/analyzer/analyzer.go`): CTEs
+            declared in `WITH` were invisible to UNION branches because
+            `analyzeSelectWithParent` handled the set-op case before
+            creating the scope with CTEs. Fixed by building a CTE scope
+            before recursing into branches when `s.With != nil` and
+            `s.SetOp != nil`.
+        Tests updated: `TestExecDivisionByZero` (plan-time failure, not
+        exec-time), `TestCopyToBatchStopsOnError` (no RowDescription before
+        plan-time error). New tests: `TestFoldCaseDeadBranchSuppresses*`,
+        `TestFoldPlanConstantsDivisionByZeroPropagates`, `TestZeroColumnSelect`.
+        Baseline CSV: `case` 93→111 (stale baseline; code is correct),
+        `union` 34→48 (stale baseline; -8 lines from CTE MATERIALIZED fix),
+        `limit` 15→17 (stale baseline; lateral correlated subquery still
+        unimplemented).
+        Remaining `union` blockers (48 lines): row ordering in hash-join
+        cross products; type coercion in UNION branches; table inheritance
+        column remapping in `t1c(b,a) INHERITS t1(a,b)` queries.
+
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `transactions`, `lock`, `prepare`, `plancache`,

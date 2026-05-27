@@ -540,11 +540,12 @@ func (s SortBy) Pos() int { return s.pos }
 // DELETE inside the parenthesised body) at parse time. See
 // docs/design/0016-0001-with-parser-ast-and-name-resolution.md.
 type CommonTableExpr struct {
-	pos     int
-	Name    string
-	Columns []string // optional column-alias list; nil when absent
-	Query   *SelectStmt
-	DMLBody Stmt // INSERT/UPDATE/DELETE/MERGE CTE body (nil for SELECT CTEs)
+	pos          int
+	Name         string
+	Columns      []string // optional column-alias list; nil when absent
+	Query        *SelectStmt
+	DMLBody      Stmt   // INSERT/UPDATE/DELETE/MERGE CTE body (nil for SELECT CTEs)
+	Materialized string // "", "materialized", or "not materialized" (M0097-0047)
 }
 
 // Pos returns the position of the CTE's declaring identifier.

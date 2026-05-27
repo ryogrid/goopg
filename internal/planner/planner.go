@@ -1109,7 +1109,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		out = &LockRows{pos: s.Locking[0].Pos(), Child: out, Locks: locks}
 	}
 	// Collapse all-constant sub-expressions in the final plan tree.
-	foldPlanConstants(out)
+	// A non-nil return means a constant evaluation error (e.g. division by zero)
+	// occurred in a potentially-reachable sub-expression. M0097-0047.
+	if foldErr := foldPlanConstants(out); foldErr != nil {
+		return nil, foldErr
+	}
 	// DISTINCT ON (expr [, ...]): implement ordered deduplication.
 	// M0097-0005.
 	if len(s.DistinctOn) > 0 {

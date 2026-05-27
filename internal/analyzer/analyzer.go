@@ -240,13 +240,30 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 		// supported. Analyze the right side first (innermost first),
 		// then the left side with SetOp temporarily cleared to avoid
 		// infinite recursion. M0097-0024.
-		if err := analyzeSelectWithParent(s.SetOp.Right, cat, parent); err != nil {
+		//
+		// If the outermost set-op statement carries a WITH clause (e.g.
+		// `WITH cte AS (...) SELECT … UNION SELECT FROM cte`), the CTE
+		// names must be visible to ALL branches. Build a scope with the
+		// CTEs registered BEFORE recursing into the branches so that
+		// both the right and left sides can reference them. M0097-0047.
+		setOpParent := parent
+		if s.With != nil {
+			ctxForSetOp := &scope{parent: parent, cat: cat}
+			if err := analyzeWith(s.With, ctxForSetOp); err != nil {
+				return err
+			}
+			setOpParent = ctxForSetOp
+		}
+		if err := analyzeSelectWithParent(s.SetOp.Right, cat, setOpParent); err != nil {
 			return err
 		}
 		saved := s.SetOp
 		s.SetOp = nil
-		err := analyzeSelectWithParent(s, cat, parent)
+		savedWith := s.With
+		s.With = nil // already processed above; don't re-register in the left-branch recursion
+		err := analyzeSelectWithParent(s, cat, setOpParent)
 		s.SetOp = saved
+		s.With = savedWith
 		if err != nil {
 			return err
 		}

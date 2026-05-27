@@ -349,16 +349,33 @@ func TestExecBooleanThreeValuedLogic(t *testing.T) {
 }
 
 // TestExecDivisionByZero produces SQLSTATE 22012, the canonical code.
+// PostgreSQL folds `10 / 0` at plan time via eval_const_expressions, so
+// goopg now raises the error at plan time too (M0097-0047). The test
+// accepts either plan-time or execution-time 22012 to remain robust
+// if the folding strategy ever changes.
 func TestExecDivisionByZero(t *testing.T) {
-	plan := planOne(t, "SELECT 10 / 0", catalog.NewInMemory())
+	stmts, err := parser.Parse("SELECT 10 / 0")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	plan, planErr := planner.Plan(stmts[0], catalog.NewInMemory())
+	if planErr != nil {
+		// Plan-time failure: check for SQLSTATE 22012.
+		pe, ok := planErr.(*planner.PlanError)
+		if !ok || pe.Code != "22012" {
+			t.Errorf("planErr=%v, want *PlanError{Code:\"22012\"}", planErr)
+		}
+		return // expected: division by zero at plan time
+	}
+	// Plan succeeded; execution should fail.
 	op, _ := Build(plan)
-	_, err := Run(op, NewContext())
-	if err == nil {
+	_, execErr := Run(op, NewContext())
+	if execErr == nil {
 		t.Fatal("expected error")
 	}
-	ee, ok := err.(*ExecError)
+	ee, ok := execErr.(*ExecError)
 	if !ok || ee.Code != "22012" {
-		t.Errorf("err=%v", err)
+		t.Errorf("execErr=%v", execErr)
 	}
 }
 
