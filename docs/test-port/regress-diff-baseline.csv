@@ -27,7 +27,7 @@ hash_part,0,pass
 hash_index,0,pass
 index_including_gist,112,failed
 expressions,0,pass
-select_into,133,failed
+select_into,1,failed
 prepare,0,pass
 dbsize,0,pass
 lock,131,failed

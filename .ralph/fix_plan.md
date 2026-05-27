@@ -1043,6 +1043,23 @@ M0097-0001 wires it up.
       - DoD: `go test -v -run 'TestPort_RegressSuite/(select|...)'`
         reports `pass` for every listed test.  Normalization rules
         added to `NormalizeRegressOutput`.  Coverage doc regenerated.
+      - **Progress 2026-05-27 (M0097-0040 — select_into 133→1 diff):**
+        (a) `SELECT INTO` now parses to `CreateTableStmt` with `SelectInto=true`.
+        (b) CTAS column alias capture via `ColumnAliases` field.
+        (c) `parseReset`: `RESET SESSION AUTHORIZATION` intercept before `parseGUCName`.
+        (d) `query.go`: `SET/RESET SESSION AUTHORIZATION` no-ops before generic SET/RESET.
+        (e) `compatNoopCommandTag`: `CREATE SCHEMA` added as no-op.
+        (f) `execDropCompat`: `DROP USER/ROLE/GROUP` always succeed (no permission tracking);
+            `DROP SCHEMA CASCADE` drops all schema tables + emits `NoticeWithDetail`.
+        (g) `TablesInSchema` added to catalog interface + `InMemory` implementation.
+        (h) `NoticeWithDetail` struct + `AddNoticeWithDetail`/`TakeNoticesWithDetail`
+            in executor context; dispatch sends them with `FieldDetail`.
+        (i) Regress normalizer: strip `DETAIL:` from cascade lines; move
+            all "drop cascades to " lines to error section for PG↔goopg consistency.
+        Remaining 1 diff line: `ERROR: permission denied for table tbl_withdata1`
+        requires real role-based INSERT permission checking (SET SESSION
+        AUTHORIZATION is a no-op so goopg stays as superuser).
+        Baseline CSV updated: `select_into` 133 → 1 diff line.
 
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:
