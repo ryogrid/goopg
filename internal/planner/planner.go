@@ -590,7 +590,13 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	var node Node
 	var ctx *resolveContext
 
-	if len(s.From) == 0 {
+	if len(s.ValuesRows) > 0 && len(s.From) == 0 && len(s.Targets) == 0 {
+		// Standalone VALUES statement: VALUES (r1), (r2), ...
+		// M0097-0049. Return directly after building the node and applying
+		// ORDER BY / LIMIT so we don't pass through the target-list projection
+		// path (which would collapse to 0 columns for empty Targets).
+		return planStandaloneValuesSelect(s, cat)
+	} else if len(s.From) == 0 {
 		// Constant SELECT — `SELECT 1`. The target list resolves
 		// against the empty schema.
 		ctx = newResolveContext(nil, nil)
@@ -1917,6 +1923,95 @@ func buildVirtualValues(pos int, tbl *catalog.Table, schema Schema) Node {
 	// rows at run time (the plan cache may otherwise serve a stale
 	// snapshot — see M0094-0005).
 	return &Values{pos: pos, Rows: rows, schema: schema, VirtualSource: tbl}
+}
+
+// planStandaloneValuesSelect plans a standalone `VALUES (r1), (r2), ...` statement.
+// Columns are named "column1", "column2", ... (PostgreSQL convention). Types
+// are inferred from the first row's expressions. ORDER BY / LIMIT are applied
+// inline. M0097-0049.
+func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+	rows := s.ValuesRows
+	if len(rows) == 0 {
+		return nil, &PlanError{Pos: s.Pos(), Code: "42601", Message: "VALUES must have at least one row"}
+	}
+	nCols := len(rows[0])
+	innerCtx := &resolveContext{cat: cat} // no outer column refs in standalone VALUES
+	planRows := make([][]Expr, len(rows))
+	for i, row := range rows {
+		if len(row) != nCols {
+			return nil, &PlanError{Pos: s.Pos(), Code: "42601",
+				Message: fmt.Sprintf("VALUES row %d has wrong number of columns: expected %d, got %d", i+1, nCols, len(row))}
+		}
+		planRow := make([]Expr, nCols)
+		for j, e := range row {
+			r, err := resolveExpr(e, innerCtx)
+			if err != nil {
+				return nil, err
+			}
+			planRow[j] = r
+		}
+		planRows[i] = planRow
+	}
+	// Infer column types by unifying across all rows (not just the first).
+	// This handles e.g. VALUES (1,2), (3,8), (7,77.7) where col2 must be numeric.
+	schema := make(Schema, nCols)
+	for i := 0; i < nCols; i++ {
+		name := fmt.Sprintf("column%d", i+1)
+		typ := exprType(planRows[0][i])
+		for r := 1; r < len(planRows); r++ {
+			typ = unifyValueTypes(typ, exprType(planRows[r][i]))
+		}
+		schema[i] = SchemaColumn{Name: name, Type: typ}
+	}
+	var node Node = &Values{pos: s.Pos(), Rows: planRows, schema: schema}
+
+	// Apply ORDER BY if present (e.g. VALUES (3),(1) ORDER BY 1).
+	sortCtx := newResolveContext(nil, schema)
+	sortCtx.cat = cat
+	if len(s.OrderBy) > 0 {
+		keys := make([]SortKey, 0, len(s.OrderBy))
+		for _, sb := range s.OrderBy {
+			var e Expr
+			// Positional ORDER BY (1-based) resolves against the VALUES schema.
+			if ic, ok := sb.Expr.(*parser.IntegerConst); ok {
+				idx := int(ic.Value) - 1
+				if idx >= 0 && idx < len(schema) {
+					sc := schema[idx]
+					e = &ColumnRef{pos: ic.Pos(), Index: idx, Name: sc.Name, Type: sc.Type}
+				}
+			}
+			if e == nil {
+				var err error
+				e, err = resolveExpr(sb.Expr, sortCtx)
+				if err != nil {
+					return nil, err
+				}
+			}
+			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
+		}
+		node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
+	}
+
+	// Apply LIMIT / OFFSET if present.
+	if s.Limit != nil || s.Offset != nil {
+		var lim, off Expr
+		if s.Limit != nil {
+			e, err := resolveExpr(s.Limit, sortCtx)
+			if err != nil {
+				return nil, err
+			}
+			lim = e
+		}
+		if s.Offset != nil {
+			e, err := resolveExpr(s.Offset, sortCtx)
+			if err != nil {
+				return nil, err
+			}
+			off = e
+		}
+		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off}
+	}
+	return node, nil
 }
 
 // planValuesSubquery plans a `(VALUES (r1), (r2), ...) AS alias (col1, col2)`
@@ -5164,6 +5259,56 @@ func isNumericTypeName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// unifyValueTypes returns the "wider" of two types for VALUES column type inference.
+// Follows PostgreSQL's type unification rules for VALUES: integer types promote
+// to numeric when a non-integer numeric appears, and numeric/float types dominate.
+// M0097-0049.
+func unifyValueTypes(a, b catalog.Type) catalog.Type {
+	an := strings.ToLower(a.Name)
+	bn := strings.ToLower(b.Name)
+	if an == bn {
+		return a
+	}
+	// "unknown" is the bottom type — any concrete type wins.
+	if an == "unknown" || an == "" {
+		return b
+	}
+	if bn == "unknown" || bn == "" {
+		return a
+	}
+	// Numeric type hierarchy: int2 < int4 < int8 < numeric < float4 < float8
+	numericRank := func(n string) int {
+		switch n {
+		case "int2", "smallint", "smallserial":
+			return 1
+		case "int4", "integer", "int", "serial":
+			return 2
+		case "int8", "bigint", "bigserial":
+			return 3
+		case "numeric", "decimal":
+			return 4
+		case "float4", "real":
+			return 5
+		case "float8", "double precision", "double", "float":
+			return 6
+		}
+		return 0
+	}
+	ra, rb := numericRank(an), numericRank(bn)
+	if ra > 0 && rb > 0 {
+		if ra >= rb {
+			return a
+		}
+		return b
+	}
+	// Non-numeric: if either is text, use text.
+	if an == "text" || bn == "text" {
+		return catalog.Type{Name: "text"}
+	}
+	// Fallback: keep the first type (unknown columns stay as first-row type).
+	return a
 }
 
 // isIntegerLikeType reports whether name is a fixed-width integer type

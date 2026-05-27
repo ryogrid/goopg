@@ -34,7 +34,7 @@ lock,131,failed
 prepared_xacts,132,failed
 drop_if_exists,130,failed
 advisory_lock,0,pass
-case,111,failed
+case,109,failed
 uuid,0,pass
 select_distinct_on,0,passed
 partition_info,185,failed
@@ -76,10 +76,10 @@ float4,676,failed
 explain,696,failed
 insert,699,failed
 fast_default,729,failed
-returning,475,failed
+returning,577,failed
 join_hash,747,failed
 copy2,850,failed
-select,137,failed
+select,125,failed
 int8,617,failed
 domain,932,failed
 jsonpath,940,failed
@@ -88,7 +88,7 @@ float8,1027,failed
 rowtypes,1030,failed
 constraints,1039,failed
 portals,1089,failed
-union,35,failed
+union,32,failed
 date,1164,failed
 copy,1214,failed
 generated_stored,1337,failed

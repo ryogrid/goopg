@@ -34,6 +34,84 @@ func (p *parser) parseValuesStmt() (Stmt, error) {
 	return s, nil
 }
 
+// parseValuesSelect parses a VALUES statement that may be followed by
+// UNION/INTERSECT/EXCEPT and/or ORDER BY/LIMIT/OFFSET. This is called
+// from parseSelect when the current token is VALUES. M0097-0049.
+func (p *parser) parseValuesSelect() (Stmt, error) {
+	t, err := p.expectKeyword(KwValues)
+	if err != nil {
+		return nil, err
+	}
+	s := &SelectStmt{pos: t.Pos}
+	for {
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' for VALUES row")
+		}
+		row, err := p.parseExprList()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' after VALUES row")
+		}
+		s.ValuesRows = append(s.ValuesRows, row)
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	// Handle trailing ORDER BY / LIMIT / OFFSET / FETCH FIRST.
+	if p.acceptKeyword(KwOrder) {
+		if !p.acceptKeyword(KwBy) {
+			return nil, p.errAtCur("expected BY after ORDER")
+		}
+		orderBy, err := p.parseSortList()
+		if err != nil {
+			return nil, err
+		}
+		s.OrderBy = orderBy
+	}
+	if p.acceptKeyword(KwLimit) {
+		if !p.acceptKeyword(KwAll) {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			s.Limit = e
+		}
+	}
+	if p.acceptKeyword(KwOffset) {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		s.Offset = e
+		p.acceptIdentKeyword("row", "rows")
+	}
+	// Handle UNION/INTERSECT/EXCEPT set-op.
+	if setOp, ok, err := p.parseSetOpClause(); err != nil {
+		return nil, err
+	} else if ok {
+		s.SetOp = setOp
+		// Lift trailing ORDER BY / LIMIT / OFFSET from RHS to outermost level
+		// (same lifting logic as in parseSelect). M0097-0024.
+		if right := setOp.Right; right != nil && !right.Parenthesized {
+			if s.OrderBy == nil && right.OrderBy != nil {
+				s.OrderBy = right.OrderBy
+				right.OrderBy = nil
+			}
+			if s.Limit == nil && right.Limit != nil {
+				s.Limit = right.Limit
+				right.Limit = nil
+			}
+			if s.Offset == nil && right.Offset != nil {
+				s.Offset = right.Offset
+				right.Offset = nil
+			}
+		}
+	}
+	return s, nil
+}
+
 // parseSelect parses a SELECT statement.
 //
 // Grammar (v0):
@@ -51,8 +129,10 @@ func (p *parser) parseSelect() (Stmt, error) {
 	// A bare VALUES(...) is a valid standalone statement in PostgreSQL.
 	// When used as a subquery (SELECT * FROM (VALUES ...) AS t), the inner
 	// parsing entry point is parseSelect, so we handle VALUES here.
+	// We do NOT return immediately — we fall through to handle trailing
+	// UNION/INTERSECT/EXCEPT and ORDER BY/LIMIT that may follow the VALUES.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwValues {
-		return p.parseValuesStmt()
+		return p.parseValuesSelect()
 	}
 	// TABLE tablename is shorthand for SELECT * FROM tablename. M0097-0003.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTable {

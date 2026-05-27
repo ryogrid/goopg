@@ -685,6 +685,11 @@ func NormalizeRegressOutput(raw string) string {
 		}
 		lines = out
 	}
+	// Sort data rows within unordered result blocks. M0097-0050.
+	// When a query has no ORDER BY clause, the row order is non-deterministic
+	// (hash-table order from PostgreSQL vs. different scan/join order in goopg).
+	// Sorting both sides identically makes unordered results compare equal.
+	lines = sortUnorderedResultBlocks(lines)
 	// Strip trailing blank lines.
 	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
 		lines = lines[:len(lines)-1]
@@ -739,4 +744,114 @@ func NormalizeRegressOutput(raw string) string {
 		all = append(all, errorLines...)
 	}
 	return strings.Join(all, "\n")
+}
+
+// sortUnorderedResultBlocks sorts the data rows within each psql result block
+// that is NOT preceded by a query containing ORDER BY, FETCH FIRST, or similar
+// ordering constructs. This handles the common case where PostgreSQL and goopg
+// produce the same rows but in different order (e.g. hash-join vs nested-loop,
+// hash-agg vs sort-agg). M0097-0050.
+//
+// A psql result block looks like (in psql -a mode):
+//
+//	SELECT ...;            <- echoed SQL (ends with ;)
+//	 col1 | col2           <- column header
+//	------+------          <- separator line (all dashes/pipes/spaces)
+//	 val1 | val2           <- data rows
+//	(N rows)               <- row count
+func sortUnorderedResultBlocks(lines []string) []string {
+	// isSeparatorLine reports whether a line is a psql column-separator line
+	// (e.g. "------+------" or "----------") — all chars are -, +, |, or space,
+	// with at least one '-' and no letters/digits.
+	isSeparatorLine := func(s string) bool {
+		hasDash := false
+		for _, c := range s {
+			if c == '-' {
+				hasDash = true
+			} else if c != '+' && c != '|' && c != ' ' {
+				return false
+			}
+		}
+		return hasDash && len(s) > 0
+	}
+
+	// isRowCountLine reports whether a line is the "(N rows)" or "(1 row)" line.
+	isRowCountLine := func(s string) bool {
+		s = strings.TrimSpace(s)
+		if len(s) < 6 {
+			return false
+		}
+		if s[0] != '(' {
+			return false
+		}
+		i := 1
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+		if i == 1 {
+			return false // no digits
+		}
+		rest := strings.TrimSpace(s[i:])
+		return rest == "rows)" || rest == "row)"
+	}
+
+	// hasOrderBy checks if any of the recent "context" lines (echoed SQL)
+	// contain an ORDER BY clause (case-insensitive). We look back up to
+	// 30 lines to find the SQL that produced this result.
+	hasOrderBy := func(lines []string, sepIdx int) bool {
+		// Collect lines backward until we hit the previous row-count line
+		// (end of previous result block) or start of lines.
+		// The SQL for this result is between that point and sepIdx.
+		sqlBuf := strings.Builder{}
+		// We look at lines from [lookStart, sepIdx-1]. The header line is
+		// at sepIdx-1, so the SQL is at [lookStart, sepIdx-2].
+		lookStart := sepIdx - 30
+		if lookStart < 0 {
+			lookStart = 0
+		}
+		// Find the most recent row-count line before sepIdx to narrow the window.
+		for i := sepIdx - 1; i >= lookStart; i-- {
+			if isRowCountLine(lines[i]) {
+				lookStart = i + 1
+				break
+			}
+		}
+		for i := lookStart; i < sepIdx; i++ {
+			sqlBuf.WriteString(lines[i])
+			sqlBuf.WriteByte(' ')
+		}
+		sql := strings.ToUpper(sqlBuf.String())
+		return strings.Contains(sql, "ORDER") || strings.Contains(sql, "FETCH") ||
+			strings.Contains(sql, "LIMIT") || strings.Contains(sql, "FOR UPDATE") ||
+			strings.Contains(sql, "FOR SHARE") || strings.Contains(sql, "SKIP LOCKED")
+	}
+
+	out := make([]string, len(lines))
+	copy(out, lines)
+
+	for i, line := range out {
+		if !isSeparatorLine(line) {
+			continue
+		}
+		// Found separator at i. Data rows start at i+1, end before the row-count line.
+		dataStart := i + 1
+		dataEnd := dataStart
+		for dataEnd < len(out) && !isRowCountLine(out[dataEnd]) {
+			dataEnd++
+		}
+		// dataEnd is now the row-count line (or EOF). Data rows are [dataStart, dataEnd).
+		if dataEnd-dataStart < 2 {
+			continue // 0 or 1 data row — sorting is a no-op
+		}
+		// Check if the preceding SQL had ORDER BY.
+		if hasOrderBy(out, i) {
+			continue // ordered result — do not sort
+		}
+		// Sort the data rows (in-place) for deterministic comparison.
+		dataRows := make([]string, dataEnd-dataStart)
+		copy(dataRows, out[dataStart:dataEnd])
+		sort.Strings(dataRows)
+		copy(out[dataStart:dataEnd], dataRows)
+	}
+	return out
 }
