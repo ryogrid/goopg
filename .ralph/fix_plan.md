@@ -1197,6 +1197,27 @@ M0097-0001 wires it up.
         cross products; type coercion in UNION branches; table inheritance
         column remapping in `t1c(b,a) INHERITS t1(a,b)` queries.
 
+      - **Progress 2026-05-28 (M0097-0048 — inheritance column remapping + ORDER BY fix):**
+        Three fixes:
+        (a) Inheritance column remapping (`internal/planner/planner.go`):
+            `buildInheritanceRemapProject` wraps child SeqScan in a Project
+            that reorders columns to match parent schema order when a child
+            table was created with different column ordering (e.g. `t1c(b,a)`
+            when parent `t1(a,b)`). Uses child's own physical schema for the
+            SeqScan, then remaps via ColumnRef indices pointing to child
+            physical columns in parent ordinal order.
+        (b) `ALTER TABLE child INHERIT parent` support (`internal/parser/ddl.go`,
+            `internal/parser/ast.go`, `internal/executor/operators_ddl.go`):
+            Parser now accepts `INHERIT parent` and `NO INHERIT parent` actions
+            in ALTER TABLE. Executor registers the child via
+            `im.RegisterInheritanceChild` and inherits any missing parent columns.
+        (c) ORDER BY positional integer with SELECT * (`internal/planner/planner.go`):
+            In the regular SELECT sort path, when `resolveOrderBySubstitution`
+            returns an unchanged IntegerConst (because the target is a StarExpr),
+            the sort key is now resolved as a positional ColumnRef against the
+            output schema — matching the behaviour of `wrapSetOpSortLimit`.
+        Baseline CSV: `union` 48→35, `join` 9933→6800.
+
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `transactions`, `lock`, `prepare`, `plancache`,

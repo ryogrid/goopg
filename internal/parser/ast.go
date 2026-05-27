@@ -1257,6 +1257,13 @@ const (
 	// Validates old column exists, new name not a system column, and no
 	// inheritance child already has a column with the new name. M0097-regress.
 	AlterTableRenameColumn
+	// AlterTableInherit — `INHERIT parent_table`.
+	// Registers an existing table as an inheritance child of the given parent.
+	// Mirrors `CREATE TABLE child () INHERITS (parent)` at run time. M0097-0048.
+	AlterTableInherit
+	// AlterTableNoInherit — `NO INHERIT parent_table`.
+	// Removes the inheritance relationship; no-op in goopg v0. M0097-0048.
+	AlterTableNoInherit
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1289,6 +1296,10 @@ type AlterTableAction struct {
 	// OldColumnName is populated for AlterTableRenameColumn and holds the
 	// existing column name to be renamed. M0097-regress.
 	OldColumnName string
+
+	// InheritParent is populated for AlterTableInherit and AlterTableNoInherit.
+	// Holds the parent table name. M0097-0048.
+	InheritParent ObjectName
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

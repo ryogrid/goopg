@@ -891,15 +891,29 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
 			var e Expr
 			var err error
-			if win != nil {
-				e, err = resolveExprAfterWindow(expr, win)
-			} else if agg == nil {
-				e, err = resolveExpr(expr, sortCtx)
-			} else {
-				e, err = resolveExprAfterAggregate(expr, agg)
+			// If resolveOrderBySubstitution returned the original IntegerConst
+			// unchanged (e.g. because the target is SELECT *), handle it as a
+			// 1-based positional reference against the output schema.  This
+			// matches wrapSetOpSortLimit and the SRF post-sort path.
+			if ic, ok := expr.(*parser.IntegerConst); ok {
+				outSchema := sortCtx.schema
+				idx := int(ic.Value) - 1
+				if idx >= 0 && idx < len(outSchema) {
+					sc := outSchema[idx]
+					e = &ColumnRef{pos: ic.Pos(), Index: idx, Name: sc.Name, Type: sc.Type}
+				}
 			}
-			if err != nil {
-				return nil, err
+			if e == nil {
+				if win != nil {
+					e, err = resolveExprAfterWindow(expr, win)
+				} else if agg == nil {
+					e, err = resolveExpr(expr, sortCtx)
+				} else {
+					e, err = resolveExprAfterAggregate(expr, agg)
+				}
+				if err != nil {
+					return nil, err
+				}
 			}
 			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 		}
@@ -1757,12 +1771,19 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}
 			var root Node = parentScan
 			for _, child := range allDesc {
-				childSchema := tableSchemaWithSource(b.table, sourceIdx)
-				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childSchema}
+				// Use the child's own physical schema for the SeqScan so that
+				// physical column indices are correct for the child's row layout.
+				childScanSchema := tableSchemaWithSource(child, sourceIdx)
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema}
+				var childNode Node = childScan
+				// If the child has a different column order than the parent,
+				// wrap the scan in a remap Project that emits columns in parent
+				// schema order (matching the UNION ALL left side).
+				childNode = buildInheritanceRemapProject(rv.Pos(), childScan, tbl, child, sourceIdx)
 				root = &SetOp{
 					pos:   rv.Pos(),
 					Left:  root,
-					Right: childScan,
+					Right: childNode,
 					All:   true,
 				}
 			}
@@ -1792,6 +1813,50 @@ func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32) []*ca
 		queue = append(queue, im.InheritanceChildren(child.OID)...)
 	}
 	return result
+}
+
+// buildInheritanceRemapProject wraps childScan in a Project that emits
+// columns in the same order as the parent table schema.  When a child
+// table has the same column order as the parent (the common case), a
+// bare ColumnRef pass-through is generated and the executor will inline
+// the trivial projection.  When column order differs (e.g. CREATE TABLE
+// child(b, a) INHERITS parent(a, b)), the ColumnRef indices are
+// permuted so that `a` always refers to the child's physical `a` column
+// regardless of its ordinal position.  Child-only columns (not in
+// parent) are dropped so the UNION ALL arms have identical width.
+func buildInheritanceRemapProject(pos int, childScan *SeqScan, parent, child *catalog.Table, sourceIdx int16) Node {
+	// Build a name→childIndex map for fast lookup.
+	childIdxByName := make(map[string]int, len(child.Columns))
+	for i, c := range child.Columns {
+		childIdxByName[c.Name] = i
+	}
+
+	targets := make([]Expr, 0, len(parent.Columns))
+	outSchema := make(Schema, 0, len(parent.Columns))
+	needsRemap := false
+	for parentIdx, pc := range parent.Columns {
+		childIdx, ok := childIdxByName[pc.Name]
+		if !ok {
+			// Column exists in parent but not in child (shouldn't normally
+			// happen in valid inheritance, but guard defensively).
+			targets = append(targets, &NullConst{pos: pos})
+			outSchema = append(outSchema, SchemaColumn{Name: pc.Name, Type: pc.Type, SourceTableIdx: sourceIdx})
+			needsRemap = true
+			continue
+		}
+		if childIdx != parentIdx {
+			needsRemap = true
+		}
+		targets = append(targets, &ColumnRef{Index: childIdx, Name: pc.Name, Type: pc.Type})
+		outSchema = append(outSchema, SchemaColumn{Name: pc.Name, Type: pc.Type, SourceTableIdx: sourceIdx})
+	}
+	if !needsRemap {
+		// Column order matches parent — no remap needed; return scan as-is.
+		// Update the scan's schema to match parent-ordered schema (same
+		// content, different SchemaColumn.SourceTableIdx encoding is fine).
+		return childScan
+	}
+	return &Project{pos: pos, Child: childScan, Targets: targets, schema: outSchema}
 }
 
 // buildVirtualValues materialises a virtual table's current rows as

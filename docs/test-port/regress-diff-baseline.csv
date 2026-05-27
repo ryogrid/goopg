@@ -88,7 +88,7 @@ float8,1027,failed
 rowtypes,1030,failed
 constraints,1039,failed
 portals,1089,failed
-union,48,failed
+union,35,failed
 date,1164,failed
 copy,1214,failed
 generated_stored,1337,failed
@@ -127,4 +127,4 @@ jsonb_jsonpath,4214,failed
 partition_prune,4217,failed
 jsonb,4904,failed
 partition_join,5347,failed
-join,9933,failed
+join,6800,failed

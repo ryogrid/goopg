@@ -2542,6 +2542,25 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act := AlterTableAction{pos: p.cur().Pos, Kind: AlterTableAttachPartition}
 		return act, nil
 	}
+	// INHERIT parent_table (M0097-0048)
+	if p.acceptIdentKeyword("inherit") {
+		parentName, err := p.parseObjectName()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableInherit, InheritParent: parentName}, nil
+	}
+	// NO INHERIT parent_table (M0097-0048) — no-op in v0
+	if p.acceptIdentKeyword("no") {
+		if !p.acceptIdentKeyword("inherit") {
+			return AlterTableAction{}, p.errAtCur("expected INHERIT after NO")
+		}
+		parentName, err := p.parseObjectName()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableNoInherit, InheritParent: parentName}, nil
+	}
 	if !p.acceptKeyword(KwAdd) {
 		return AlterTableAction{}, p.errAtCur("expected ADD")
 	}

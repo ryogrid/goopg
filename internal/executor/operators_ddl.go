@@ -1177,6 +1177,30 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 			}
 			// No actual rename implemented yet — just validate.
+		case parser.AlterTableInherit:
+			// INHERIT parent_table — register the named table as a parent of tbl
+			// so that scanning the parent includes tbl's rows (M0097-0048).
+			parentTbl, ok := o.ctx.Catalog.LookupTable(act.InheritParent)
+			if !ok {
+				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.InheritParent.String())}
+			}
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				im.RegisterInheritanceChild(parentTbl.OID, tbl.OID)
+			}
+			// Copy parent columns that the child doesn't already have.
+			// In PostgreSQL, ALTER TABLE child INHERIT parent validates that child
+			// already has matching columns; goopg v0 just ensures they are present.
+			childColByName := make(map[string]bool, len(tbl.Columns))
+			for _, c := range tbl.Columns {
+				childColByName[strings.ToLower(c.Name)] = true
+			}
+			for _, pc := range parentTbl.Columns {
+				if !childColByName[strings.ToLower(pc.Name)] {
+					tbl.Columns = append(tbl.Columns, pc)
+				}
+			}
+		case parser.AlterTableNoInherit:
+			// NO INHERIT parent_table — no-op in v0; just accept the syntax.
 		default:
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE action is not supported in v0"}
 		}
