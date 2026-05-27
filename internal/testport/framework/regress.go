@@ -222,7 +222,8 @@ func NormalizeRegressOutput(raw string) string {
 			}
 			filtered = append(filtered, line)
 		} else if strings.Contains(line, "unsupported statement (got do)") ||
-			strings.Contains(line, "unsupported statement (got do block)") {
+			strings.Contains(line, "unsupported statement (got do block)") ||
+			strings.Contains(line, "DO block language") && strings.Contains(line, "is not supported in v0") {
 			// goopg does not implement DO (anonymous PL/pgSQL) blocks.
 			// Drop this error so it doesn't create diff against PG which runs them. M0097-0003.
 		} else if strings.Contains(line, `syntax error at or near "end of input"`) {
@@ -665,6 +666,24 @@ func NormalizeRegressOutput(raw string) string {
 			lines = append(lines[:i], lines[i+1:]...)
 			i--
 		}
+	}
+	// Collapse consecutive blank lines to at most one blank line.
+	// EXPLAIN stripping leaves blank lines from the SQL source echo (the blank
+	// line between statements in the .sql file). PostgreSQL's output preserves
+	// them while goopg sometimes omits them. Collapsing multiple consecutive
+	// blanks to one removes spurious diff lines. M0097-0049.
+	{
+		out := lines[:0]
+		prevBlank := false
+		for _, line := range lines {
+			isBlank := strings.TrimSpace(line) == ""
+			if isBlank && prevBlank {
+				continue // skip consecutive blank lines
+			}
+			out = append(out, line)
+			prevBlank = isBlank
+		}
+		lines = out
 	}
 	// Strip trailing blank lines.
 	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {

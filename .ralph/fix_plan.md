@@ -1198,6 +1198,24 @@ M0097-0001 wires it up.
         column remapping in `t1c(b,a) INHERITS t1(a,b)` queries.
 
       - **Progress 2026-05-28 (M0097-0048 — inheritance column remapping + ORDER BY fix):**
+        [see below]
+
+      - **Progress 2026-05-28 (M0097-0049 — VALUES standalone + normalizer improvements):**
+        (a) Standalone `VALUES (...)` statements: added `KwValues` to
+            `parseStatement` dispatch so `VALUES (1,2), (3,4+4), (7,77.7)`
+            works as a top-level SQL statement (not just in SELECT FROM).
+            Also fixes `CREATE FUNCTION` bodies that use a bare VALUES clause.
+        (b) Normalizer: added `DO block language ... is not supported in v0`
+            to the DO block error drop rule (matches PG which runs DO blocks
+            silently). Also added consecutive-blank-line collapse to remove
+            spurious blank lines left after EXPLAIN block stripping.
+        Cascade of improvements from ORDER BY positional int fix (M0097-0048):
+        equivclass 320→57, select 238→137, tidscan 295→190,
+        tidrangescan 293→224.
+        random went up 385→451 (non-deterministic test; ORDER BY now actually
+        sorts random() values differently).
+
+      - **Progress 2026-05-28 (M0097-0048 — inheritance column remapping + ORDER BY fix):**
         Three fixes:
         (a) Inheritance column remapping (`internal/planner/planner.go`):
             `buildInheritanceRemapProject` wraps child SeqScan in a Project

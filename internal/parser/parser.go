@@ -347,8 +347,9 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseSet()
 	case KwReset:
 		return p.parseReset()
-	case KwSelect, KwTable:
+	case KwSelect, KwTable, KwValues:
 		// TABLE tablename is handled inside parseSelect as a shorthand. M0097-0004.
+		// VALUES (...), (...) is a valid standalone statement in PostgreSQL. M0097-0049.
 		return p.parseSelect()
 	case KwInsert:
 		return p.parseInsert()
