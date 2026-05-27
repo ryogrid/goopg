@@ -23,7 +23,16 @@ func orderBySubstitution(expr parser.Expr, targets []parser.ResTarget) parser.Ex
 	if ic, ok := expr.(*parser.IntegerConst); ok {
 		idx := int(ic.Value) - 1
 		if idx >= 0 && idx < len(targets) {
-			return targets[idx].Expr
+			// Do not substitute when the target is a bare star expansion:
+			// `SELECT * FROM t … ORDER BY 1` in a set-op context has the
+			// ORDER BY owned by the whole set-op (not the left branch), and
+			// targets[0] is a StarExpr that hasn't been expanded yet.
+			// Substituting StarExpr here causes analyzeExpr to reject it;
+			// keep the integer constant so analysis treats it as a number
+			// rather than an unresolved star. M0097-0042.
+			if _, isStar := targets[idx].Expr.(*parser.StarExpr); !isStar {
+				return targets[idx].Expr
+			}
 		}
 		return expr
 	}
@@ -191,6 +200,23 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 	return analyzeSelectWithParent(s, cat, outerScope)
 }
 
+// lockingClauseName returns the SQL name of a locking strength (FOR UPDATE, etc.)
+// for use in error messages. M0097-0042.
+func lockingClauseName(s parser.LockStrength) string {
+	switch s {
+	case parser.LockStrengthForUpdate:
+		return "FOR UPDATE"
+	case parser.LockStrengthForNoKeyUpdate:
+		return "FOR NO KEY UPDATE"
+	case parser.LockStrengthForShare:
+		return "FOR SHARE"
+	case parser.LockStrengthForKeyShare:
+		return "FOR KEY SHARE"
+	default:
+		return "FOR UPDATE"
+	}
+}
+
 // analyzeSelectWithParent analyzes a SELECT with the supplied
 // scope as lexical-scope parent. Used by SubqueryExpr /
 // InExpr / ExistsExpr handlers when recursing into inner
@@ -198,6 +224,18 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *scope) error {
 	// s.Distinct is now supported via the planner's Distinct node. M0097-0005.
 	if s.SetOp != nil {
+		// FOR UPDATE/NO KEY UPDATE is not allowed on any branch of a set-op.
+		// Check the right branch (directly) and the outer left side. M0097-0042.
+		if len(s.SetOp.Right.Locking) > 0 {
+			lc := s.SetOp.Right.Locking[0]
+			return analyzeError(lc.Pos(), "0A000",
+				lockingClauseName(lc.Strength)+" is not allowed with UNION/INTERSECT/EXCEPT")
+		}
+		if len(s.Locking) > 0 {
+			lc := s.Locking[0]
+			return analyzeError(lc.Pos(), "0A000",
+				lockingClauseName(lc.Strength)+" is not allowed with UNION/INTERSECT/EXCEPT")
+		}
 		// UNION / INTERSECT / EXCEPT (with optional ALL) are all
 		// supported. Analyze the right side first (innermost first),
 		// then the left side with SetOp temporarily cleared to avoid
@@ -326,6 +364,15 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 // executor narrow the supported runtime subset later.
 func analyzeLockingClauses(s *parser.SelectStmt, ctx *scope) error {
 	first := s.Locking[0]
+	// SKIP LOCKED and WITH TIES cannot be combined. M0097-0042.
+	if s.WithTies {
+		for _, lc := range s.Locking {
+			if lc.WaitPolicy == parser.LockWaitSkipLocked {
+				return analyzeError(lc.Pos(), "0A000",
+					"SKIP LOCKED and WITH TIES options cannot be used together")
+			}
+		}
+	}
 	if len(s.From) == 0 {
 		return analyzeError(first.Pos(), "0A000",
 			"FOR UPDATE/SHARE is not allowed in this context")

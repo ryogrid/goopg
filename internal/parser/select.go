@@ -103,10 +103,22 @@ func (p *parser) parseSelect() (Stmt, error) {
 	// (returns one zero-column row per source row). HammerDB writes
 	// `SELECT EXISTS (SELECT FROM pg_tables WHERE …)` with this shape.
 	// Also `SELECT;` (no targets, no FROM) is allowed — PG returns 1 row.
-	// Skip the target-list parse when the next token is FROM, ';', or EOF.
+	// Also `SELECT UNION SELECT` (empty list + set-op) — M0097-0042.
+	// Skip the target-list parse when the next token is FROM, ';', EOF,
+	// UNION, INTERSECT, EXCEPT, ORDER, LIMIT, OFFSET, FETCH, or FOR.
 	isSemiOrEOF := p.cur().Kind == TokenSymbol && p.cur().Value == ";" ||
 		p.cur().Kind == TokenEOF
-	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom) && !isSemiOrEOF {
+	isSetOpOrClause := (p.cur().Kind == TokenKeyword && (
+		p.cur().Keyword == KwUnion ||
+		p.cur().Keyword == KwIntersect ||
+		p.cur().Keyword == KwExcept ||
+		p.cur().Keyword == KwOrder ||
+		p.cur().Keyword == KwLimit ||
+		p.cur().Keyword == KwOffset ||
+		p.cur().Keyword == KwFor)) ||
+		// FETCH FIRST … is an ident keyword in this parser's classification.
+		(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "fetch"))
+	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom) && !isSemiOrEOF && !isSetOpOrClause {
 		tgts, err := p.parseTargetList()
 		if err != nil {
 			return nil, err
@@ -199,6 +211,17 @@ func (p *parser) parseSelect() (Stmt, error) {
 		// Optional `{ROW | ROWS}` trailer per SQL standard.
 		// Both are no-ops for v0 — OFFSET applies the same way.
 		p.acceptIdentKeyword("row", "rows")
+		// SQL allows OFFSET to precede LIMIT (e.g. `ORDER BY x OFFSET 10 LIMIT 5`).
+		// If no LIMIT was parsed before the OFFSET, check for one now.
+		if s.Limit == nil {
+			if p.acceptKeyword(KwLimit) {
+				lim, lerr := p.parseExpr()
+				if lerr != nil {
+					return nil, lerr
+				}
+				s.Limit = lim
+			}
+		}
 	}
 	// SQL-standard `FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY`
 	// is accepted as a synonym for `LIMIT n`. Upstream allows it
@@ -223,13 +246,31 @@ func (p *parser) parseSelect() (Stmt, error) {
 		if !p.acceptIdentKeyword("row", "rows") {
 			return nil, p.errAtCur("expected ROW or ROWS after FETCH count")
 		}
-		if !p.acceptIdentKeyword("only") {
-			return nil, p.errAtCur("expected ONLY after FETCH … ROW(S) (WITH TIES is not supported in v0)")
+		if p.acceptIdentKeyword("only") {
+			// FETCH FIRST n ROWS ONLY — standard SQL limit.
+		} else if p.acceptKeyword(KwWith) {
+			// FETCH FIRST n ROWS WITH TIES — include rows that tie with the n-th row. M0097-0042.
+			if !p.acceptIdentKeyword("ties") {
+				return nil, p.errAtCur("expected TIES after WITH in FETCH … WITH TIES")
+			}
+			s.WithTies = true
+		} else {
+			return nil, p.errAtCur("expected ONLY or WITH TIES after FETCH … ROW(S)")
 		}
 		if s.Limit != nil {
 			return nil, p.errAtCur("LIMIT and FETCH FIRST cannot both be specified")
 		}
 		s.Limit = count
+		// SQL standard also allows OFFSET to follow FETCH FIRST … ONLY/WITH TIES.
+		// E.g. `ORDER BY x FETCH FIRST 5 ROWS WITH TIES OFFSET 10`. M0097-0042.
+		if s.Offset == nil && p.acceptKeyword(KwOffset) {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			s.Offset = e
+			p.acceptIdentKeyword("row", "rows")
+		}
 	}
 	if setOp, ok, err := p.parseSetOpClause(); err != nil {
 		return nil, err
@@ -245,17 +286,24 @@ func (p *parser) parseSelect() (Stmt, error) {
 		// wrapSetOpSortLimit resolves them against the combined output
 		// (e.g. copyselect's `… UNION … ORDER BY 1`). M0097-0024.
 		if right := setOp.Right; right != nil {
-			if s.OrderBy == nil && right.OrderBy != nil {
-				s.OrderBy = right.OrderBy
-				right.OrderBy = nil
-			}
-			if s.Limit == nil && right.Limit != nil {
-				s.Limit = right.Limit
-				right.Limit = nil
-			}
-			if s.Offset == nil && right.Offset != nil {
-				s.Offset = right.Offset
-				right.Offset = nil
+			// Only lift ORDER BY / LIMIT / OFFSET when the right branch is
+			// NOT explicitly parenthesised. If the user wrote `A UNION (B
+			// ORDER BY 1 LIMIT 2)`, the ORDER BY/LIMIT belong to the inner
+			// `(B)` group only — they are NOT the trailing sort/limit for the
+			// whole UNION result. M0097-0042.
+			if !right.Parenthesized {
+				if s.OrderBy == nil && right.OrderBy != nil {
+					s.OrderBy = right.OrderBy
+					right.OrderBy = nil
+				}
+				if s.Limit == nil && right.Limit != nil {
+					s.Limit = right.Limit
+					right.Limit = nil
+				}
+				if s.Offset == nil && right.Offset != nil {
+					s.Offset = right.Offset
+					right.Offset = nil
+				}
 			}
 		}
 	}
@@ -589,7 +637,15 @@ func (p *parser) parseSetOpClause() (*SetOpClause, bool, error) {
 // looking for a trailing UNION / INTERSECT / EXCEPT clause.
 func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 	p.advance() // consume '('
-	inner, err := p.parseSelect()
+	// Handle nested parentheses: (((SELECT ...))) recurses here so that any
+	// depth of wrapping works. M0097-0042.
+	var inner Stmt
+	var err error
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		inner, err = p.parseParenthesisedSelectStmt()
+	} else {
+		inner, err = p.parseSelect()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -600,6 +656,10 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("expected ')' after SELECT in parenthesised query")
 	}
+	// Mark that this SelectStmt came from an explicit parenthesised expression
+	// so the planner's left-associativity flattening stops here (the content
+	// was explicitly grouped and must be treated as an atomic unit). M0097-0042.
+	innerSel.Parenthesized = true
 	// Optional trailing set-operation (UNION ALL / EXCEPT / INTERSECT …).
 	if setOp, present, err := p.parseSetOpClause(); err != nil {
 		return nil, err
@@ -1685,6 +1745,141 @@ func (p *parser) consumeTypeIdent() (string, error) {
 	return "", p.errAtCur("expected type name")
 }
 
+// parseCastFuncExpr parses the SQL standard CAST(expr AS type) form.
+// The parser has already consumed the "cast" identifier; we are positioned
+// just before the opening '('. M0097-0042.
+func (p *parser) parseCastFuncExpr(pos int) (Expr, error) {
+	p.advance() // consume '('
+	expr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptKeyword(KwAs) {
+		return nil, p.errAtCur("expected AS in CAST(expr AS type)")
+	}
+	// Parse the target type using the same shared type-name parser as ::.
+	name, err := p.parseTypeNameAfterCast()
+	if err != nil {
+		return nil, err
+	}
+	// Optional array suffix — same semantics as :: cast.
+	for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+		p.advance()
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+			p.advance()
+		}
+	}
+	// Optional typmod list: char(4), varchar(100), numeric(10,2), etc.
+	var typmods []int64
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance()
+		for {
+			if p.cur().Kind != TokenIntLit {
+				return nil, p.errAtCur("expected integer typmod in CAST type")
+			}
+			n, err := strconv.ParseInt(p.cur().Value, 10, 64)
+			if err != nil {
+				return nil, p.errAtCur("invalid typmod in CAST type")
+			}
+			typmods = append(typmods, n)
+			p.advance()
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+				p.advance()
+				continue
+			}
+			break
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close typmod list in CAST")
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close CAST()")
+	}
+	return &CastExpr{pos: pos, Operand: expr, Type: name, Typmods: typmods}, nil
+}
+
+// parseTrimFuncCall parses TRIM([LEADING|TRAILING|BOTH] [chars FROM] string)
+// and normalises it to a regular ltrim/rtrim/btrim FuncCall. The "trim"
+// identifier has already been consumed; we are positioned just before '('.
+// M0097-0042.
+func (p *parser) parseTrimFuncCall(pos int) (Expr, error) {
+	p.advance() // consume '('
+
+	// Detect direction keyword: LEADING → ltrim, TRAILING → rtrim, BOTH → btrim
+	funcName := "btrim" // default
+	switch {
+	case p.acceptIdentKeyword("leading"):
+		funcName = "ltrim"
+	case p.acceptIdentKeyword("trailing"):
+		funcName = "rtrim"
+	case p.acceptIdentKeyword("both"):
+		funcName = "btrim"
+	}
+
+	// Optional: characters-to-trim expression before FROM.
+	// Detect: if next token is NOT "from", parse an expr as the chars arg.
+	var charsExpr Expr
+	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom) &&
+		!(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "from")) {
+		var err error
+		charsExpr, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Consume FROM (either keyword or identifier).
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom {
+		p.advance()
+	} else if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "from") {
+		p.advance()
+	}
+
+	// The string expression.
+	strExpr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close TRIM()")
+	}
+
+	// Build a FuncCall equivalent. PostgreSQL exposes trim(string, chars) as
+	// btrim/ltrim/rtrim(string, chars). The chars argument is optional.
+	var args []Expr
+	args = append(args, strExpr)
+	if charsExpr != nil {
+		args = append(args, charsExpr)
+	}
+	return &FuncCall{pos: pos, Name: ObjectName{pos: pos, Name: funcName}, Args: args}, nil
+}
+
+// parseArrayConstructor parses ARRAY[e1, e2, ...] — the caller has already
+// consumed the `array` identifier and the current token is `[`. M0097-0042.
+func (p *parser) parseArrayConstructor(pos int) (Expr, error) {
+	p.advance() // consume '['
+	var elems []Expr
+	if !(p.cur().Kind == TokenSymbol && p.cur().Value == "]") {
+		first, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, first)
+		for p.acceptSymbol(",") {
+			elem, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, elem)
+		}
+	}
+	if !p.acceptSymbol("]") {
+		return nil, p.errAtCur("expected ']' after array elements")
+	}
+	return &ArrayConstructorExpr{pos: pos, Elements: elems}, nil
+}
+
 // peekBinaryOp returns the OpCode and precedence of the current
 // token if it can extend an expression as a left-associative binary
 // operator. Returns ok=false when the current token can't.
@@ -2291,6 +2486,13 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 			return nil, &SyntaxError{Pos: startPos, Message: "too many name parts before .*"}
 		}
 	}
+	// ARRAY[e1, e2, ...] constructor — intercept before the subscript
+	// path in parseExprPrec converts `array[i]` into a subscript on a
+	// hypothetical column named "array". M0097-0042.
+	if len(parts) == 1 && strings.EqualFold(parts[0], "array") &&
+		p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+		return p.parseArrayConstructor(startPos)
+	}
 	// Function call?
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 		// EXTRACT has its own grammar: EXTRACT(field FROM expr).
@@ -2302,6 +2504,17 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 		}
 		if len(parts) == 1 && (strings.EqualFold(parts[0], "substring") || strings.EqualFold(parts[0], "substr")) {
 			return p.parseSubstringFuncCall(startPos, strings.ToLower(parts[0]))
+		}
+		// CAST(expr AS type) — SQL standard type cast syntax. The `cast`
+		// identifier is not a keyword in goopg, so it falls through here as
+		// a function name. Intercept it before the generic call path. M0097-0042.
+		if len(parts) == 1 && strings.EqualFold(parts[0], "cast") {
+			return p.parseCastFuncExpr(startPos)
+		}
+		// TRIM([LEADING|TRAILING|BOTH] [chars FROM] string) — SQL standard trim.
+		// Intercept before the generic call path. M0097-0042.
+		if len(parts) == 1 && strings.EqualFold(parts[0], "trim") {
+			return p.parseTrimFuncCall(startPos)
 		}
 		var name ObjectName
 		switch len(parts) {

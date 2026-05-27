@@ -1078,6 +1078,43 @@ M0097-0001 wires it up.
         Remaining 26 diff lines: all require table inheritance (`person*`
         syntax); deferred to inheritance milestone.
         Baseline CSV updated: `select_distinct` 394 → 26 diff lines.
+      - **Progress 2026-05-27 (M0097-0042 — limit 551→47, union 1097→48, returning 732→475):**
+        (a) OFFSET after FETCH FIRST: SQL standard allows OFFSET after
+            `FETCH FIRST n ROWS WITH TIES/ONLY`; added second offset check
+            after FETCH block in `parseSelect`.
+        (b) WITH TIES full implementation: `limitState` gains `tieKeyExprIdxs`,
+            `tieKeyVals`, `inTiesPhase`; executor evaluates tie keys, emits
+            additional rows while key values match last emitted row.
+        (c) exprType return-type inference: `nextval`/`currval`/`lastval`/`setval`
+            → int8; `random`/`random_normal`/`drandom` → float8; `generate_series`
+            → int8. Fixes numeric column alignment in psql output (OID 25→20/701).
+        (d) Float8 arithmetic with KindString datums: `random()` returns
+            `KindString{"0.5"}`; fast path (ResultType="float8") and slow path
+            (OpMul/OpDiv/OpMod) both updated to parse string-formatted floats.
+        (e) `evalCastTyped` / `roundFloatToInt`: handle `KindString` for float
+            source types (e.g. `(random()*.1)::int`).
+        (f) `resolveColumnRefAt` schema fallback: when `len(ctx.bindings) == 0`
+            (set-op ORDER BY context), scan `ctx.schema` for unqualified column
+            names. Fixes `SELECT q1,q2 EXCEPT SELECT q2,q1 ORDER BY q2,q1`.
+        (g) FOR UPDATE / NO KEY UPDATE rejected in set-op branches (SQLSTATE 0A000).
+        (h) Sequence session state (`currval`/`lastval`) persisted per-connection
+            across statements via new `SeqCurrVals`/`SeqLastVal`/`SeqLastSet`
+            fields in `connTx`; wired in `dispatchSimpleQueryViaExecutor`.
+        (i) Cursor position tracking: `cursorEntry` struct materialises result
+            set on first FETCH and tracks `Pos` across FORWARD/BACKWARD/ABSOLUTE.
+        (j) `ArrayConstructorExpr`: `ARRAY[e1, e2, …]` parsed and evaluated.
+        (k) `SELECT UNION SELECT` (empty target list before set-op): gate in
+            `parseSelect` skips target-list parsing when next token is set-op keyword.
+        (l) `orderBySubstitution` guard: skip star expressions in set-op ORDER BY.
+        (m) Sequence ascending default start=1, descending start=-1 (PostgreSQL convention).
+        (n) `rowKey` numeric normalisation: strips trailing zeros so `"0.0"` == `"0"`.
+        Design: `docs/design/0097-0042-limit-union-returning-improvements.md`.
+        Baseline CSV updated: `limit` 551→47, `union` 1097→48, `returning` 732→475.
+        Remaining blockers:
+        - `limit` 47: ProjectSet / SRF expansion in SELECT list (generate_series).
+        - `union` 48: unordered results (14), parenthesized set-op ORDER BY scope (6),
+          generate_series SRF (8), PL/pgSQL expensivefunc (4), error fmt (10+).
+        - `returning` 475: table inheritance (INHERITS), UPDATE FROM, RETURNING OLD/NEW.
 
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:

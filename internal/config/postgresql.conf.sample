@@ -172,6 +172,9 @@
 
 #random_page_cost = 4.0                 # 0-1e9
 #effective_cache_size = 4GB             # 1-1099511627776 kB
+#jit_above_cost = 100000                # perform JIT compilation when query cost is above this; -1 disables
+#parallel_setup_cost = 1000             # cost of starting up worker processes for parallel query
+#parallel_tuple_cost = 0.1             # cost of passing each tuple from worker to master backend
 
 
 #------------------------------------------------------------------------------

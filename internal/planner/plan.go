@@ -766,10 +766,16 @@ func (n *MultiHashJoin) Output() Schema { return n.schema }
 
 // Limit — caps the number of rows; both fields are optional.
 type Limit struct {
-	pos    int
-	Child  Node
-	Limit  Expr // nil when no limit
-	Offset Expr // nil when no offset
+	pos      int
+	Child    Node
+	Limit    Expr // nil when no limit
+	Offset   Expr // nil when no offset
+	// WithTies is true when FETCH FIRST n ROWS WITH TIES was used. M0097-0042.
+	WithTies bool
+	// TiesKeys holds the ORDER BY expressions for WITH TIES comparison.
+	// When WithTies=true, after emitting LimitCount rows the executor continues
+	// emitting rows until the ORDER BY key changes from the last emitted row.
+	TiesKeys []Expr
 }
 
 func (n *Limit) Pos() int       { return n.pos }
@@ -890,7 +896,7 @@ type Insert struct {
 }
 
 func (n *Insert) Pos() int       { return n.pos }
-func (n *Insert) Output() Schema { return nil }
+func (n *Insert) Output() Schema { return n.ReturningSchema }
 
 // LockStrength enumerates the row-locking strength a SELECT
 // requested via FOR UPDATE / FOR SHARE. Mirrors upstream's

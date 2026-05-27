@@ -390,3 +390,14 @@ type ArraySubscriptExpr struct {
 
 func (e *ArraySubscriptExpr) Pos() int { return e.pos }
 func (*ArraySubscriptExpr) exprNode()  {}
+
+// ArrayConstructorExpr is ARRAY[e1, e2, ...] — an array constructor
+// that evaluates its elements and formats them as a PostgreSQL array
+// literal {v1,v2,...}. M0097-0042.
+type ArrayConstructorExpr struct {
+	pos      int
+	Elements []Expr
+}
+
+func (e *ArrayConstructorExpr) Pos() int { return e.pos }
+func (*ArrayConstructorExpr) exprNode()  {}

@@ -243,11 +243,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			var lf, rf float64
 			if left.Kind == KindNumeric {
 				lf, _ = strconv.ParseFloat(left.Format(), 64)
+			} else if left.Kind == KindString {
+				// String-formatted float (e.g. from random()). M0097-0042.
+				lf, _ = strconv.ParseFloat(left.StringValue(), 64)
 			} else {
 				lf = float64(left.Int)
 			}
 			if right.Kind == KindNumeric {
 				rf, _ = strconv.ParseFloat(right.Format(), 64)
+			} else if right.Kind == KindString {
+				// String-formatted float. M0097-0042.
+				rf, _ = strconv.ParseFloat(right.StringValue(), 64)
 			} else {
 				rf = float64(right.Int)
 			}
@@ -646,6 +652,18 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		}
 		fallthrough
 	case parser.OpMul, parser.OpDiv, parser.OpMod:
+		// String operands can be parsed as numeric (same as in OpAdd/OpSub above).
+		// Handles cases like random()*0 where random() returns a string-formatted float. M0097-0042.
+		if left.Kind == KindString {
+			if m, s, err := parseNumeric(left.StringValue()); err == nil {
+				left = newNumeric(m, int(s))
+			}
+		}
+		if right.Kind == KindString {
+			if m, s, err := parseNumeric(right.StringValue()); err == nil {
+				right = newNumeric(m, int(s))
+			}
+		}
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
 			a, b, err := promoteToNumeric(left, right, op, pos)
 			if err != nil {
@@ -1288,10 +1306,16 @@ func roundNumericToInt(d Datum, pos int) (int64, error) {
 	return rounded, nil
 }
 
-// roundFloatToInt rounds a KindNumeric datum using banker's rounding
+// roundFloatToInt rounds a KindNumeric or KindString datum using banker's rounding
 // (round half to even) — PostgreSQL's float8/float4→integer rule. M0097-0003.
+// KindString is handled for datums produced by the float8 arithmetic path. M0097-0042.
 func roundFloatToInt(d Datum, pos int) (int64, error) {
-	text := numericText(d)
+	var text string
+	if d.Kind == KindString {
+		text = d.StringValue()
+	} else {
+		text = numericText(d)
+	}
 	f, err := strconv.ParseFloat(text, 64)
 	if err != nil {
 		return 0, &ExecError{Code: "22P02", Pos: pos,
@@ -1322,7 +1346,9 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, erro
 	}
 	// For float8/float4 → integer casts, override the default (away-from-zero)
 	// rounding inside evalCast to use banker's rounding instead.
-	if isFloatSourceType(sourceType) && d.Kind == KindNumeric {
+	// Also handle KindString datums produced by the float8 arithmetic path
+	// (e.g. "0.05" from random()*0.1). M0097-0042.
+	if isFloatSourceType(sourceType) && (d.Kind == KindNumeric || d.Kind == KindString) {
 		intTarget := strings.ToLower(targetType)
 		switch intTarget {
 		case "int2", "smallint":
@@ -3342,6 +3368,51 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(elems[n-1]), nil
 		}
 		return NullDatum, nil
+
+	case "array_construct":
+		// array_construct(e1, e2, ...) → text representation of array {v1,v2,...}
+		// Used to evaluate ARRAY[e1, e2, ...] constructors. M0097-0042.
+		var sb strings.Builder
+		sb.WriteByte('{')
+		for i, arg := range x.Args {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			v, err := evalExpr(arg, row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if v.IsNull() {
+				sb.WriteString("NULL")
+			} else {
+				sb.WriteString(v.Format())
+			}
+		}
+		sb.WriteByte('}')
+		return NewStringDatum(sb.String()), nil
+
+	case "row":
+		// ROW(e1, e2, ...) → composite record literal displayed as (v1,v2,...).
+		// PostgreSQL's row constructor; the parser folds ROW(...) into a FuncCall
+		// with name "row". Used in union.sql set-op tests. M0097-0042.
+		var sbRow strings.Builder
+		sbRow.WriteByte('(')
+		for i, arg := range x.Args {
+			if i > 0 {
+				sbRow.WriteByte(',')
+			}
+			v, err := evalExpr(arg, row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if v.IsNull() {
+				sbRow.WriteString("NULL")
+			} else {
+				sbRow.WriteString(v.Format())
+			}
+		}
+		sbRow.WriteByte(')')
+		return NewStringDatum(sbRow.String()), nil
 
 	case "parse_ident":
 		// parse_ident(str text [, strict boolean = true]) → text[]

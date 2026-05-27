@@ -655,7 +655,17 @@ type SelectStmt struct {
 	OrderBy   []SortBy
 	Limit     Expr // nil when absent; integer expression in v0
 	Offset    Expr // nil when absent
-	SetOp     *SetOpClause
+	// WithTies is true when `FETCH FIRST n ROWS WITH TIES` was used.
+	// M0097-0042: returns additional rows tied on the ORDER BY key.
+	WithTies bool
+	SetOp    *SetOpClause
+	// Parenthesized is set when this SelectStmt was the result of
+	// parseParenthesisedSelectStmt() — i.e. the whole compound was
+	// explicitly wrapped in parentheses. The planner uses this flag
+	// to stop its left-associativity flattening loop from recursing
+	// into the parenthesised content (which already has its own
+	// correctly-ordered chain). M0097-0042.
+	Parenthesized bool
 	// Locking holds parsed `FOR UPDATE / FOR SHARE [OF …]
 	// [NOWAIT | SKIP LOCKED]` clauses (M0021-0001). Empty for
 	// every pre-M0021 SELECT — preserves byte-for-byte

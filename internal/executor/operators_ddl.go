@@ -2534,9 +2534,12 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	if s.Increment != nil {
 		increment = *s.Increment
 	}
-	start := minV
+	// Default start values follow PostgreSQL convention (not the type minimum):
+	// ascending (increment > 0) → start = 1; descending → start = -1.
+	// M0097-0042.
+	start := int64(1)
 	if increment < 0 {
-		start = maxV
+		start = int64(-1)
 	}
 	if s.Start != nil {
 		start = *s.Start

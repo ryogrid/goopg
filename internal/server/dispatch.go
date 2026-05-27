@@ -216,6 +216,21 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Share the per-connection TEMP TABLE shadow map so it persists
 		// across statements in the same connection. M0097-0003.
 		ectx.TempTableShadows = connTx.TempTableShadows
+		// Wire per-connection sequence session state (currval/lastval) so
+		// values persist across statements within the same connection. M0097-0042.
+		if connTx.SeqCurrVals != nil {
+			ectx.CurrSeqVals = connTx.SeqCurrVals
+		}
+		ectx.LastSeqVal = connTx.SeqLastVal
+		ectx.LastSeqSet = connTx.SeqLastSet
+		// Save sequence session state back to the connection after dispatch.
+		defer func() {
+			if ectx.CurrSeqVals != nil {
+				connTx.SeqCurrVals = ectx.CurrSeqVals
+			}
+			connTx.SeqLastVal = ectx.LastSeqVal
+			connTx.SeqLastSet = ectx.LastSeqSet
+		}()
 	}
 	ectx.Snap = snap
 	ectx.Checkpointer = s.cfg.Checkpointer
@@ -488,11 +503,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 			continue
 		}
-		// FETCH [ALL|n] [FROM|IN] cursor_name (M0097-0003).
+		// FETCH [ALL|n] [FROM|IN] cursor_name (M0097-0003 / M0097-0042).
 		if fs, ok := stmt.(*parser.FetchStmt); ok {
 			if connTx != nil {
-				if curSQL, found := connTx.cursorLookup(fs.CursorName); found {
-					if err := s.executeFetchAll(ctx, w, ectx, curSQL, fs.CursorName, fs.Count); err != nil {
+				if cur, found := connTx.cursorLookup(fs.CursorName); found {
+					if err := s.executeFetch(ctx, w, ectx, cur, fs.CursorName, fs.Count, fs.Forward); err != nil {
 						return err
 					}
 					continue
@@ -1686,50 +1701,19 @@ func typeOIDFor(name string) uint32 {
 	return 25
 }
 
-// executeFetchAll executes a cursor's stored SELECT and emits
-// RowDescription + DataRow* + CommandComplete "FETCH N".
-// cursorName identifies which DECLARE in the stored SQL to use.
-// count < 0 means fetch all rows (used by FETCH ALL).
-func (s *Server) executeFetchAll(_ context.Context, w *protocol.FrameWriter, ectx *executor.Context, cursorSQL string, cursorName string, count int64) error {
-	// Extract the SELECT from the stored cursor SQL, matching by cursor name.
-	// The stored SQL may be the entire query batch containing multiple DECLAREs.
-	stmts, err := parser.Parse(cursorSQL)
-	if err != nil {
-		return s.writeQueryError(w, "26000", fmt.Sprintf("cursor query parse error: %v", err))
-	}
-	var selectStmt parser.Stmt
-	for _, st := range stmts {
-		if dc, ok := st.(*parser.DeclareCursorStmt); ok {
-			if strings.EqualFold(dc.Name, cursorName) {
-				selectStmt = dc.Query
-				break
-			}
-		}
-		if _, ok := st.(*parser.SelectStmt); ok {
-			selectStmt = st
-			break
+// executeFetch executes or resumes a cursor fetch. It materialises the cursor's
+// result set on first access and then tracks the cursor position across FETCH
+// FORWARD / FETCH BACKWARD calls. count < 0 means ALL. forward=true for FORWARD
+// (default), false for BACKWARD. M0097-0042 cursor position tracking.
+func (s *Server) executeFetch(_ context.Context, w *protocol.FrameWriter, ectx *executor.Context, cur *cursorEntry, cursorName string, count int64, forward bool) error {
+	// Materialise on first access.
+	if !cur.Materialized {
+		if err := s.materializeCursor(ectx, cur, cursorName); err != nil {
+			return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
 		}
 	}
-	if selectStmt == nil {
-		return s.writeQueryError(w, "26000", fmt.Sprintf("cursor \"%s\" query not found", cursorName))
-	}
 
-	node, err := planner.Plan(selectStmt, s.cfg.Catalog)
-	if err != nil {
-		code, msg := planErrorFields(err)
-		return s.writeQueryError(w, code, msg)
-	}
-	op, buildErr := executor.BuildFastIterator(node)
-	if buildErr != nil {
-		return s.writeQueryError(w, execErrCode(buildErr), execErrMsg(buildErr))
-	}
-	if openErr := op.Open(ectx); openErr != nil {
-		_ = op.Close()
-		return s.writeQueryError(w, execErrCode(openErr), execErrMsg(openErr))
-	}
-	defer func() { _ = op.Close() }()
-
-	schema := op.Schema()
+	schema := cur.Schema
 	if schema != nil {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
@@ -1746,20 +1730,82 @@ func (s *Server) executeFetchAll(_ context.Context, w *protocol.FrameWriter, ect
 		}
 	}
 
+	// Determine which rows to emit based on direction and position.
+	//
+	// Cursor position model (PostgreSQL semantics, M0097-0042):
+	//   pos=0       = BOF (before first row)
+	//   pos=1..N    = AT row k; next FORWARD returns rows[k..], next BACKWARD returns rows[k-1]
+	//   pos=N+1     = EOF (past last row); FORWARD returns nothing
+	//
+	// FETCH FORWARD n from pos P: return rows[P..P+n-1] (0-indexed), new pos = min(P+n, N)
+	//   (where N = total rows; we use N not N+1 as EOF sentinel because len(cur.Rows) == N)
+	// FETCH BACKWARD n (finite) from pos P: return rows[P-n..P-1] reversed, new pos = max(P-n, 1)
+	//   The minimum finite-backward pos is 1 (not 0 = BOF). Only BACKWARD ALL reaches BOF.
+	// FETCH BACKWARD ALL from pos P: return rows[0..P-1] reversed, new pos = 0 (BOF)
+	// FETCH FORWARD ALL from pos P: return rows[P..N-1], new pos = N (EOF)
+	total := len(cur.Rows)
+	fetchAll := count < 0
+	var rowsToSend []executor.Row
+	if forward {
+		// FETCH [FORWARD] [n|ALL]
+		start := cur.Pos
+		if start >= total {
+			start = total
+		}
+		end := total // ALL
+		if !fetchAll {
+			end = start + int(count)
+			if end > total {
+				end = total
+			}
+		}
+		rowsToSend = cur.Rows[start:end]
+		if fetchAll {
+			cur.Pos = total // EOF
+		} else {
+			cur.Pos = end
+		}
+	} else {
+		// FETCH BACKWARD [n|ALL]
+		end := cur.Pos // exclusive upper bound for 0-indexed slice
+		if end > total {
+			end = total
+		}
+		start := 0 // ALL: go all the way to BOF
+		if !fetchAll {
+			start = end - int(count)
+			if start < 0 {
+				start = 0
+			}
+		}
+		// The rows from start..end-1 in reverse order.
+		n := end - start
+		rev := make([]executor.Row, n)
+		for i := 0; i < n; i++ {
+			rev[i] = cur.Rows[start+n-1-i]
+		}
+		rowsToSend = rev
+		if fetchAll {
+			cur.Pos = 0 // BOF
+		} else {
+			// Finite BACKWARD: new pos = max(P-n, 1) when P > 0; stays at 0 when already at BOF.
+			// Minimum is 1 (not 0=BOF) so that the row just fetched can be re-fetched on the next
+			// FETCH ALL — but only when we actually were above BOF. M0097-0042.
+			if end == 0 {
+				cur.Pos = 0 // already at BOF, no change
+			} else {
+				newPos := end - int(count)
+				if newPos < 1 {
+					newPos = 1
+				}
+				cur.Pos = newPos
+			}
+		}
+	}
+
 	var rowCount int64
-	for {
-		if count >= 0 && rowCount >= count {
-			break
-		}
-		slot, nextErr := op.Next()
-		if nextErr == executor.EOF {
-			break
-		}
-		if nextErr != nil {
-			return s.writeQueryError(w, execErrCode(nextErr), execErrMsg(nextErr))
-		}
+	for _, row := range rowsToSend {
 		if schema != nil {
-			row := slot.Row()
 			cells, valueBuf := w.DataRowScratch(len(row))
 			for _, d := range row {
 				if d.IsNull() {
@@ -1773,8 +1819,69 @@ func (s *Server) executeFetchAll(_ context.Context, w *protocol.FrameWriter, ect
 			if err := w.PutDataRowScratch(cells, valueBuf); err != nil {
 				return err
 			}
-			rowCount++
 		}
+		rowCount++
 	}
 	return w.WriteCommandComplete(fmt.Sprintf("FETCH %d", rowCount))
+}
+
+// materializeCursor executes the cursor's SELECT once and buffers all rows in cur.
+func (s *Server) materializeCursor(ectx *executor.Context, cur *cursorEntry, cursorName string) error {
+	stmts, err := parser.Parse(cur.SQL)
+	if err != nil {
+		return &executor.ExecError{Code: "26000", Message: fmt.Sprintf("cursor query parse error: %v", err)}
+	}
+	var selectStmt parser.Stmt
+	for _, st := range stmts {
+		if dc, ok := st.(*parser.DeclareCursorStmt); ok {
+			if strings.EqualFold(dc.Name, cursorName) {
+				selectStmt = dc.Query
+				break
+			}
+		}
+		if _, ok := st.(*parser.SelectStmt); ok {
+			selectStmt = st
+			break
+		}
+	}
+	if selectStmt == nil {
+		return &executor.ExecError{Code: "26000", Message: fmt.Sprintf("cursor \"%s\" query not found", cursorName)}
+	}
+
+	node, planErr := planner.Plan(selectStmt, s.cfg.Catalog)
+	if planErr != nil {
+		code, msg := planErrorFields(planErr)
+		return &executor.ExecError{Code: string(code), Message: msg}
+	}
+	op, buildErr := executor.BuildFastIterator(node)
+	if buildErr != nil {
+		return buildErr
+	}
+	if openErr := op.Open(ectx); openErr != nil {
+		_ = op.Close()
+		return openErr
+	}
+	defer func() { _ = op.Close() }()
+
+	cur.Schema = op.Schema()
+	cur.Rows = nil
+	for {
+		slot, nextErr := op.Next()
+		if nextErr == executor.EOF {
+			break
+		}
+		if nextErr != nil {
+			return nextErr
+		}
+		// Clone the row so it survives after the operator is closed.
+		if slot != nil {
+			row := slot.Row()
+			cloned := make(executor.Row, len(row))
+			copy(cloned, row)
+			cur.Rows = append(cur.Rows, cloned)
+		}
+	}
+	cur.Pos = 0
+	cur.Materialized = true
+	return nil
 }

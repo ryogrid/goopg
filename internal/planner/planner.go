@@ -344,8 +344,9 @@ func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog) (N
 	ctx := newResolveContext(nil, out)
 	ctx.cat = cat
 
+	var keys []SortKey
 	if len(s.OrderBy) > 0 {
-		keys := make([]SortKey, 0, len(s.OrderBy))
+		keys = make([]SortKey, 0, len(s.OrderBy))
 		for _, sb := range s.OrderBy {
 			if ic, ok := sb.Expr.(*parser.IntegerConst); ok {
 				idx := int(ic.Value) - 1
@@ -371,7 +372,19 @@ func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog) (N
 		node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
 	}
 
-	if s.Limit != nil || s.Offset != nil {
+	if s.Limit != nil || s.Offset != nil || s.WithTies {
+		// WITH TIES without ORDER BY is an error (matches PostgreSQL).
+		if s.WithTies && len(s.OrderBy) == 0 {
+			return nil, &PlanError{Pos: s.Pos(), Code: "42P20",
+				Message: "WITH TIES cannot be specified without ORDER BY clause"}
+		}
+		// NULL literal as the row count in FETCH FIRST ... WITH TIES is an error. M0097-0042.
+		if s.WithTies {
+			if _, isNull := s.Limit.(*parser.NullConst); isNull {
+				return nil, &PlanError{Pos: s.Pos(), Code: "22004",
+					Message: "row count cannot be null in FETCH FIRST ... WITH TIES clause"}
+			}
+		}
 		var lim, off Expr
 		if s.Limit != nil {
 			e, err := resolveExpr(s.Limit, ctx)
@@ -387,7 +400,15 @@ func wrapSetOpSortLimit(s *parser.SelectStmt, node Node, cat catalog.Catalog) (N
 			}
 			off = e
 		}
-		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off}
+		// Collect ORDER BY key expressions for WITH TIES comparison.
+		var tiesKeys []Expr
+		if s.WithTies {
+			for _, k := range keys {
+				tiesKeys = append(tiesKeys, k.Expr)
+			}
+		}
+		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
+			WithTies: s.WithTies, TiesKeys: tiesKeys}
 	}
 	return node, nil
 }
@@ -423,34 +444,97 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	defer restore()
 
 	if s.SetOp != nil {
-		// Plan the right branch first, then the left branch with the
-		// SetOp chain temporarily cleared to avoid infinite recursion.
-		setOp := s.SetOp
-		right, err := planSelect(setOp.Right, cat)
-		if err != nil {
-			return nil, err
+		// Flatten the right-associative parse tree into a flat list of
+		// (stmt, op) pairs and rebuild left-to-right so that
+		//   A UNION B UNION ALL C → (A UNION B) UNION ALL C
+		// instead of the right-associative
+		//   A UNION (B UNION ALL C).
+		// SQL set operations are left-associative at equal precedence
+		// (INTERSECT binds tighter than UNION/EXCEPT, but left-associativity
+		// within a level is always required). M0097-0042.
+		//
+		// When the RHS of a set-op is explicitly parenthesised
+		// (rightStmt.Parenthesized == true), we stop flattening: the user
+		// wrote explicit parens to override associativity, so the inner
+		// compound is treated as an atomic unit by planSelect recursion.
+		// e.g. `1.1 UNION (SELECT 2 UNION ALL SELECT 2)` → outer UNION deduplicates.
+		type setOpSegment struct {
+			opType parser.SetOpType
+			opAll  bool
+			opPos  int
+			stmt   *parser.SelectStmt
 		}
-		s.SetOp = nil
-		left, err := planSelect(s, cat)
-		s.SetOp = setOp
-		if err != nil {
-			return nil, err
-		}
-		// Each branch must project the same number of columns. PostgreSQL
-		// reports this at parse-analysis time (SQLSTATE 42601). M0097-0024.
-		if lc, rc := len(left.Output()), len(right.Output()); lc != rc {
-			return nil, &PlanError{
-				Pos:     setOp.Pos(),
-				Code:    "42601",
-				Message: fmt.Sprintf("each %s query must have the same number of columns", setOpKeyword(setOp.Type)),
+		var segments []setOpSegment
+		{
+			cur := s
+			for cur.SetOp != nil {
+				rightStmt := cur.SetOp.Right
+				segments = append(segments, setOpSegment{
+					opType: cur.SetOp.Type,
+					opAll:  cur.SetOp.All,
+					opPos:  cur.SetOp.Pos(),
+					stmt:   rightStmt,
+				})
+				if rightStmt.Parenthesized {
+					break // explicit grouping: stop flattening, treat as atomic
+				}
+				cur = rightStmt
 			}
 		}
-		var node Node = &SetOp{pos: s.Pos(), Left: left, Right: right, Op: setOp.Type, All: setOp.All}
+		// Temporarily clear all SetOps so planSelect on each leaf doesn't
+		// recurse into the chain again. Also clear ORDER BY / LIMIT /
+		// OFFSET from the left branch — these belong to the whole set-op
+		// result and are applied by wrapSetOpSortLimit below, not to the
+		// leftmost branch alone. Without this, `SELECT * FROM t INTERSECT
+		// … ORDER BY 1` would try to resolve the positional ORDER BY
+		// against the unexpanded StarExpr. M0097-0042.
+		savedSetOps := make([]*parser.SetOpClause, len(segments))
+		savedSetOps[0] = s.SetOp
+		s.SetOp = nil
+		for i := 0; i < len(segments)-1; i++ {
+			savedSetOps[i+1] = segments[i].stmt.SetOp
+			segments[i].stmt.SetOp = nil
+		}
+		savedOrderBy := s.OrderBy
+		savedLimit := s.Limit
+		savedOffset := s.Offset
+		s.OrderBy = nil
+		s.Limit = nil
+		s.Offset = nil
+		// Plan the leftmost branch (s without its SetOp chain or sort/limit).
+		left, err := planSelect(s, cat)
+		// Restore everything (plan cache may reuse the AST).
+		s.SetOp = savedSetOps[0]
+		for i := 0; i < len(segments)-1; i++ {
+			segments[i].stmt.SetOp = savedSetOps[i+1]
+		}
+		s.OrderBy = savedOrderBy
+		s.Limit = savedLimit
+		s.Offset = savedOffset
+		if err != nil {
+			return nil, err
+		}
+		// Build left-associatively: fold each subsequent branch in from the left.
+		for _, seg := range segments {
+			right, rerr := planSelect(seg.stmt, cat)
+			if rerr != nil {
+				return nil, rerr
+			}
+			// Each branch must project the same number of columns.
+			if lc, rc := len(left.Output()), len(right.Output()); lc != rc {
+				return nil, &PlanError{
+					Pos:     seg.opPos,
+					Code:    "42601",
+					Message: fmt.Sprintf("each %s query must have the same number of columns", setOpKeyword(seg.opType)),
+				}
+			}
+			left = &SetOp{pos: s.Pos(), Left: left, Right: right, Op: seg.opType, All: seg.opAll}
+		}
 		// A trailing ORDER BY / LIMIT / OFFSET binds to the whole set
 		// operation and references the combined output columns by name
 		// or 1-based position (PostgreSQL §7.6). copyselect uses
 		// `… UNION … ORDER BY 1`. M0097-0024.
-		return wrapSetOpSortLimit(s, node, cat)
+		return wrapSetOpSortLimit(s, left, cat)
 	}
 	// s.Distinct with empty target list is invalid in PostgreSQL (syntax error).
 	// With targets it is handled by wrapping the final plan with a Distinct node.
@@ -705,8 +789,9 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 
+	var keys []SortKey
 	if len(s.OrderBy) > 0 {
-		keys := make([]SortKey, 0, len(s.OrderBy))
+		keys = make([]SortKey, 0, len(s.OrderBy))
 		for _, sb := range s.OrderBy {
 			// SQL allows ORDER BY to reference target-list aliases
 			// (`SELECT sum(x) AS revenue ... ORDER BY revenue`)
@@ -733,7 +818,19 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 		node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
 	}
-	if s.Limit != nil || s.Offset != nil {
+	if s.Limit != nil || s.Offset != nil || s.WithTies {
+		// WITH TIES without ORDER BY is an error (matches PostgreSQL).
+		if s.WithTies && len(s.OrderBy) == 0 {
+			return nil, &PlanError{Pos: s.Pos(), Code: "42P20",
+				Message: "WITH TIES cannot be specified without ORDER BY clause"}
+		}
+		// NULL literal as row count in FETCH FIRST ... WITH TIES is an error. M0097-0042.
+		if s.WithTies {
+			if _, isNull := s.Limit.(*parser.NullConst); isNull {
+				return nil, &PlanError{Pos: s.Pos(), Code: "22004",
+					Message: "row count cannot be null in FETCH FIRST ... WITH TIES clause"}
+			}
+		}
 		var lim, off Expr
 		if s.Limit != nil {
 			e, err := resolveExpr(s.Limit, ctx)
@@ -749,7 +846,15 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			}
 			off = e
 		}
-		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off}
+		// Collect ORDER BY key expressions for WITH TIES comparison.
+		var tiesKeys []Expr
+		if s.WithTies {
+			for _, k := range keys {
+				tiesKeys = append(tiesKeys, k.Expr)
+			}
+		}
+		node = &Limit{pos: s.Pos(), Child: node, Limit: lim, Offset: off,
+			WithTies: s.WithTies, TiesKeys: tiesKeys}
 	}
 
 	var (
@@ -1999,10 +2104,14 @@ func naturalJoinColumns(leftCtx, rightCtx *resolveContext) []string {
 // Q9, Q10, Q21 use the alias form (`ORDER BY revenue DESC`).
 func resolveOrderBySubstitution(expr parser.Expr, targets []parser.ResTarget) parser.Expr {
 	// Positional: `ORDER BY 1` → targets[0].Expr.
+	// Guard: do not substitute a StarExpr — `SELECT * ORDER BY 1` needs
+	// the positional ref resolved against the schema, not the star. M0097-0042.
 	if ic, ok := expr.(*parser.IntegerConst); ok {
 		idx := int(ic.Value) - 1
 		if idx >= 0 && idx < len(targets) {
-			return targets[idx].Expr
+			if _, isStar := targets[idx].Expr.(*parser.StarExpr); !isStar {
+				return targets[idx].Expr
+			}
 		}
 		return expr
 	}
@@ -4671,6 +4780,15 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "timestamptz"}
 		case "gen_random_uuid", "uuidv4", "uuidv7":
 			return catalog.Type{Name: "uuid"}
+		case "nextval", "currval", "lastval", "setval":
+			// Sequence functions return int8 (bigint). M0097-0042.
+			return catalog.Type{Name: "int8"}
+		case "random", "random_normal", "drandom":
+			// random() → float8 in [0,1). M0097-0042.
+			return catalog.Type{Name: "float8"}
+		case "generate_series":
+			// generate_series in scalar context returns int8 for integer args. M0097-0042.
+			return catalog.Type{Name: "int8"}
 		}
 		return catalog.Type{Name: "unknown"}
 	}
@@ -5059,6 +5177,18 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			return nil, err
 		}
 		return &FuncCall{pos: x.Pos(), Name: "array_subscript", Args: []Expr{base, idx}}, nil
+	case *parser.ArrayConstructorExpr:
+		// ARRAY[e1, e2, ...] constructor — resolve each element and convert to
+		// array_construct so the executor formats the result as {v1,v2,...}. M0097-0042.
+		args := make([]Expr, len(x.Elements))
+		for i, e := range x.Elements {
+			r, err := resolveExpr(e, ctx)
+			if err != nil {
+				return nil, err
+			}
+			args[i] = r
+		}
+		return &FuncCall{pos: x.Pos(), Name: "array_construct", Args: args}, nil
 	}
 	return nil, &PlanError{Pos: e.Pos(), Code: "0A000", Message: fmt.Sprintf("unsupported expression %T", e)}
 }
@@ -5090,6 +5220,22 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 // for in-scope ambiguity / missing-FROM diagnostics.
 func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Expr, bool, error) {
 	if len(ctx.bindings) == 0 {
+		// No table bindings — the only resolvable references are unqualified
+		// column names that appear in ctx.schema. This case arises in
+		// wrapSetOpSortLimit, where ORDER BY references the set-op's output
+		// columns by name (e.g. `SELECT q1,q2 … EXCEPT … ORDER BY q2,q1`).
+		// Qualified references (x.Table != "") cannot be resolved without a
+		// binding, so we return not-found. M0097-0042.
+		if x.Table == "" && x.Schema == "" {
+			for i, col := range ctx.schema {
+				if strings.EqualFold(col.Name, x.Column) {
+					if level == 0 {
+						return &ColumnRef{pos: x.Pos(), Index: i, Name: col.Name, Type: col.Type}, true, nil
+					}
+					return &OuterColumnRef{pos: x.Pos(), Level: level, Index: i, Name: col.Name, Type: col.Type}, true, nil
+				}
+			}
+		}
 		return nil, false, nil
 	}
 

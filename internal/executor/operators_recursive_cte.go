@@ -161,6 +161,9 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 }
 
 // rowKey builds a string key for row deduplication. M0097-0006.
+// Numeric values are normalised by stripping trailing decimal zeros so that
+// KindNumeric "0.0" and KindInt "0" compare equal across cross-type UNIONs
+// (e.g. FLOAT8_TBL UNION INT4_TBL). M0097-0042.
 func rowKey(row Row) string {
 	var sb strings.Builder
 	for i, d := range row {
@@ -170,7 +173,19 @@ func rowKey(row Row) string {
 		if d.IsNull() {
 			sb.WriteString("<NULL>")
 		} else {
-			sb.WriteString(d.Format())
+			s := d.Format()
+			// Strip trailing zeros after the decimal point so that "0.0",
+			// "0.00", "0.000" and "0" all canonicalise to "0". This is
+			// necessary when the two sides of a UNION have different Go
+			// kinds (KindNumeric vs KindInt) for the same logical value.
+			if strings.Contains(s, ".") {
+				s = strings.TrimRight(s, "0")
+				s = strings.TrimRight(s, ".")
+				if s == "" || s == "-" {
+					s = "0" // edge-case: "-0." → "-0" → "-" → "0"
+				}
+			}
+			sb.WriteString(s)
 		}
 	}
 	return sb.String()
