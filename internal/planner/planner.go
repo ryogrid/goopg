@@ -525,7 +525,14 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			return nil, err
 		}
 		// Build left-associatively: fold each subsequent branch in from the left.
-		for _, seg := range segments {
+		// When s.InnerSegmentCount > 0, ORDER BY/LIMIT/OFFSET applies to the
+		// result of the first InnerSegmentCount segments (the "inner" compound),
+		// not the final outer result. Example:
+		//   (((A INTERSECT B ORDER BY 1))) UNION ALL C
+		// → after segment 1 (INTERSECT), apply ORDER BY to Sort(INTERSECT),
+		//   then append UNION ALL C without re-sorting. M0097-0044.
+		innerBoundary := s.InnerSegmentCount // 0 = no boundary (normal)
+		for i, seg := range segments {
 			right, rerr := planSelect(seg.stmt, cat)
 			if rerr != nil {
 				return nil, rerr
@@ -539,7 +546,28 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 				}
 			}
 			left = &SetOp{pos: s.Pos(), Left: left, Right: right, Op: seg.opType, All: seg.opAll}
+			// If this segment is the last "inner" segment, apply the sort/limit
+			// to the intermediate result before processing outer segments.
+			if innerBoundary > 0 && i+1 == innerBoundary {
+				inner, werr := wrapSetOpSortLimit(s, left, cat)
+				if werr != nil {
+					return nil, werr
+				}
+				left = inner
+				// Clear the saved ORDER BY/LIMIT/OFFSET so wrapSetOpSortLimit
+				// below doesn't apply them again to the outer result.
+				savedOrderBy = nil
+				savedLimit = nil
+				savedOffset = nil
+				s.OrderBy = nil
+				s.Limit = nil
+				s.Offset = nil
+			}
 		}
+		// Restore final ORDER BY / LIMIT / OFFSET (may be nil if cleared above).
+		s.OrderBy = savedOrderBy
+		s.Limit = savedLimit
+		s.Offset = savedOffset
 		// A trailing ORDER BY / LIMIT / OFFSET binds to the whole set
 		// operation and references the combined output columns by name
 		// or 1-based position (PostgreSQL §7.6). copyselect uses
@@ -790,6 +818,44 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 
+	// SELECT-list SRF expansion (generate_series in SELECT target list). M0097-0045.
+	// Sort placement depends on whether ORDER BY references:
+	//   (a) PS output columns (SELECT list aliases / column names) → sort AFTER PS
+	//   (b) base-table columns not in SELECT list (e.g. tenthous)  → sort BEFORE PS
+	// Decision: try to resolve each ORDER BY key against the PS output schema first.
+	// If ALL keys resolve in PS output → sort after PS.
+	// If ANY key only resolves in child schema → sort before PS (pre-sort).
+	var selectSrfPending *ProjectSet  // set when SRF is detected; applied after sort
+	var selectSrfPreSort bool         // true → sort BEFORE PS
+	if agg == nil && ps == nil && !needsWindowStage(s) {
+		srfPS, srfErr := buildSelectSrfProjectSet(s, node, ctx)
+		if srfErr != nil {
+			return nil, srfErr
+		}
+		if srfPS != nil {
+			selectSrfPending = srfPS
+			// Determine sort placement: if any ORDER BY key can't be resolved
+			// in the PS output schema but CAN be resolved in the child schema,
+			// sort before PS (so base-table columns are visible).
+			if len(s.OrderBy) > 0 {
+				psCtx := newResolveContext(nil, srfPS.schema)
+				psCtx.cat = cat
+				for _, sb := range s.OrderBy {
+					expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
+					_, errPS := resolveExpr(expr, psCtx)
+					if errPS != nil {
+						// Can't resolve in PS schema; try child schema.
+						_, errChild := resolveExpr(expr, ctx)
+						if errChild == nil {
+							// Need pre-sort.
+							selectSrfPreSort = true
+						}
+					}
+				}
+			}
+		}
+	}
+
 	var win *windowSurface
 	if needsWindowStage(s) {
 		var err error
@@ -799,8 +865,19 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	}
 
+	// Build ORDER BY sort keys.  For SRF mode:
+	//   - Pre-sort (selectSrfPreSort): resolve against child schema (ctx unchanged).
+	//   - Post-sort (default SRF): resolve against PS output schema.
+	// Build pre-sort keys now; post-sort keys are built after PS is wired in.
 	var keys []SortKey
-	if len(s.OrderBy) > 0 {
+	if len(s.OrderBy) > 0 && (selectSrfPending == nil || selectSrfPreSort) {
+		// Normal path OR SRF pre-sort path.
+		sortCtx := ctx // default: child schema (also used for pre-sort)
+		if selectSrfPending != nil && !selectSrfPreSort {
+			// SRF post-sort: resolve against PS output
+			sortCtx = newResolveContext(nil, selectSrfPending.schema)
+			sortCtx.cat = cat
+		}
 		keys = make([]SortKey, 0, len(s.OrderBy))
 		for _, sb := range s.OrderBy {
 			// SQL allows ORDER BY to reference target-list aliases
@@ -817,7 +894,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			if win != nil {
 				e, err = resolveExprAfterWindow(expr, win)
 			} else if agg == nil {
-				e, err = resolveExpr(expr, ctx)
+				e, err = resolveExpr(expr, sortCtx)
 			} else {
 				e, err = resolveExprAfterAggregate(expr, agg)
 			}
@@ -827,6 +904,48 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 		}
 		node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
+	}
+	// Wire the ProjectSet into the plan (after pre-sort if applicable).
+	// Then build post-sort keys on the PS output if needed.
+	if selectSrfPending != nil {
+		selectSrfPending.Child = node
+		node = selectSrfPending
+		ps = selectSrfPending
+		ctx = newResolveContext(nil, selectSrfPending.schema)
+		ctx.cat = cat
+		// Post-sort: sort AFTER PS expansion. ORDER BY may reference output
+		// columns by alias (ColumnRef) or 1-based position (IntegerConst).
+		// Do NOT call resolveOrderBySubstitution here — that would replace
+		// the alias with the raw SRF FuncCall expression, causing the sort
+		// key to evaluate generate_series() as a scalar (always returns start
+		// value) instead of referencing the already-expanded output column.
+		// Instead, resolve the original ORDER BY expression directly against
+		// the PS output schema.
+		if len(s.OrderBy) > 0 && !selectSrfPreSort {
+			psSchema := selectSrfPending.schema
+			keys = make([]SortKey, 0, len(s.OrderBy))
+			for _, sb := range s.OrderBy {
+				var e Expr
+				var err error
+				// Positional ref: ORDER BY 1 → ColumnRef into PS output.
+				if ic, ok := sb.Expr.(*parser.IntegerConst); ok {
+					idx := int(ic.Value) - 1
+					if idx >= 0 && idx < len(psSchema) {
+						sc := psSchema[idx]
+						e = &ColumnRef{pos: ic.Pos(), Index: idx, Name: sc.Name, Type: sc.Type}
+					}
+				}
+				if e == nil {
+					// Named / expression ref: resolve directly against PS output schema.
+					e, err = resolveExpr(sb.Expr, ctx) // ctx = PS schema
+					if err != nil {
+						return nil, err
+					}
+				}
+				keys = append(keys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
+			}
+			node = &Sort{pos: s.Pos(), Child: node, Keys: keys}
+		}
 	}
 	if s.Limit != nil || s.Offset != nil || s.WithTies {
 		// WITH TIES without ORDER BY is an error (matches PostgreSQL).
@@ -1841,6 +1960,116 @@ func projectSetCompositeSchema(name string) Schema {
 		}
 	}
 	return nil
+}
+
+// buildSelectSrfProjectSet detects generate_series(...) calls in the SELECT
+// target list and wraps the child node in a ProjectSet that expands the SRFs.
+// Multiple generate_series calls in the same SELECT list are "zipped" together
+// (each step advances all SRFs in lockstep; NULL-pads the shorter ones).
+// Non-SRF targets are evaluated once per child row and repeated for each step.
+// Returns nil, nil when no SRF is present in the target list. M0097-0045.
+func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveContext) (*ProjectSet, error) {
+	type srfEntry struct {
+		colIdx int
+		start  parser.Expr
+		stop   parser.Expr
+		step   parser.Expr // may be nil
+	}
+	var srfs []srfEntry
+	for i, t := range s.Targets {
+		fc, ok := t.Expr.(*parser.FuncCall)
+		if !ok {
+			continue
+		}
+		if !strings.EqualFold(fc.Name.Name, "generate_series") {
+			continue
+		}
+		if len(fc.Args) < 2 || len(fc.Args) > 3 {
+			return nil, &PlanError{Pos: fc.Pos(), Code: "42883",
+				Message: "generate_series requires 2 or 3 arguments"}
+		}
+		e := srfEntry{colIdx: i, start: fc.Args[0], stop: fc.Args[1]}
+		if len(fc.Args) == 3 {
+			e.step = fc.Args[2]
+		}
+		srfs = append(srfs, e)
+	}
+	if len(srfs) == 0 {
+		return nil, nil
+	}
+
+	// Build per-column resolved expressions.
+	srfColMap := make(map[int]bool, len(srfs))
+	for _, e := range srfs {
+		srfColMap[e.colIdx] = true
+	}
+
+	schema := make(Schema, len(s.Targets))
+	otherExprs := make([]Expr, len(s.Targets))
+	for i, t := range s.Targets {
+		alias := t.Alias
+		if srfColMap[i] {
+			name := alias
+			if name == "" {
+				name = "generate_series"
+			}
+			schema[i] = SchemaColumn{Name: name, Type: catalog.Type{Name: "int8"}}
+			// otherExprs[i] stays nil — executor fills this from SRF
+		} else {
+			expr, err := resolveExpr(t.Expr, ctx)
+			if err != nil {
+				return nil, err
+			}
+			name := alias
+			if name == "" {
+				name = exprOutputName(t.Expr)
+			}
+			ty := exprType(expr)
+			schema[i] = SchemaColumn{Name: name, Type: ty}
+			otherExprs[i] = expr
+		}
+	}
+
+	// Resolve SRF args against ctx (may reference FROM-clause columns).
+	srfCols := make([]SrfCol, len(srfs))
+	for k, e := range srfs {
+		start, err := resolveExpr(e.start, ctx)
+		if err != nil {
+			return nil, err
+		}
+		stop, err := resolveExpr(e.stop, ctx)
+		if err != nil {
+			return nil, err
+		}
+		var step Expr
+		if e.step != nil {
+			step, err = resolveExpr(e.step, ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+		srfCols[k] = SrfCol{ColIdx: e.colIdx, Start: start, Stop: stop, Step: step}
+	}
+
+	return &ProjectSet{
+		pos:        s.Pos(),
+		Child:      child,
+		SrfCols:    srfCols,
+		OtherExprs: otherExprs,
+		schema:     schema,
+	}, nil
+}
+
+// exprOutputName returns a human-readable column name for an expression that
+// has no explicit alias. Matches PostgreSQL's heuristic used in SELECT lists.
+func exprOutputName(e parser.Expr) string {
+	switch x := e.(type) {
+	case *parser.ColumnRef:
+		return x.Column
+	case *parser.FuncCall:
+		return strings.ToLower(x.Name.Name)
+	}
+	return "?column?"
 }
 
 // planTableFuncRangeVar plans a table-valued function in the FROM clause.

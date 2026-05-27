@@ -1128,6 +1128,30 @@ M0097-0001 wires it up.
             inverted NULL behavior).
         Design: `docs/design/0097-0043-nulls-first-last-order-by.md`.
         Baseline CSV updated: `select` 876→238, `case` 148→93, `window` 3894→3269.
+      - **Progress 2026-05-27 (M0097-0044 — parenthesised set-op ORDER BY scope):**
+        Root cause: `(((A INTERSECT B ORDER BY 1))) UNION ALL C` — the
+        parser attached UNION ALL inside the INTERSECT chain; planner
+        applied ORDER BY to the whole UNION ALL result instead of just the
+        INTERSECT result. Fix: new `SelectStmt.InnerSegmentCount int`
+        marks the boundary; planner applies `wrapSetOpSortLimit` at that
+        boundary and clears ORDER BY/LIMIT/OFFSET for outer segments.
+        Baseline CSV updated: `union` 48→42.
+      - **Progress 2026-05-27 (M0097-0045 — generate_series in SELECT list):**
+        Implemented ProjectSet expansion for `generate_series()` in SELECT
+        target list (SRF-in-SELECT, a.k.a. ProjectSet mode).
+        (a) `planner/plan.go`: `SrfCol` struct + `ProjectSet.SrfCols`,
+            `ProjectSet.OtherExprs` for SELECT-list SRF mode.
+        (b) `planner/planner.go`: `buildSelectSrfProjectSet()` detects
+            generate_series in targets; Sort placement is adaptive:
+            ORDER BY on PS output → Sort AFTER PS; ORDER BY on base-table
+            column not in SELECT → Sort BEFORE PS. Post-sort uses direct
+            ColumnRef resolution to sort by PS output column values.
+        (c) `executor/operators_project_set.go`: `openSelectSrfMode()`
+            evaluates SRF args per child row, generates series, zips
+            multiple SRFs with NULL-padding.
+        Baseline CSV updated: `limit` 47→15, `union` 42→34.
+        Remaining `limit` blockers (15 lines): lateral correlated
+        reference `OFFSET s-1` inside subquery (lateral support needed).
 
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:

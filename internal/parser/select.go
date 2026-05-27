@@ -674,11 +674,25 @@ func (p *parser) parseParenthesisedSelectStmt() (Stmt, error) {
 			innerSel.SetOp = setOp
 		} else {
 			// Walk to the rightmost SelectStmt and attach there.
+			// Count inner segments while walking — used below to record
+			// InnerSegmentCount when the inner compound has ORDER BY.
+			innerSegCount := 1 // the innerSel.SetOp itself is segment 1
 			rightmost := innerSel.SetOp.Right
 			for rightmost.SetOp != nil {
+				innerSegCount++
 				rightmost = rightmost.SetOp.Right
 			}
 			rightmost.SetOp = setOp
+			// When the inner compound has ORDER BY / LIMIT / OFFSET, those
+			// clauses belong to the INNER result, not the outer set-op we
+			// just appended. Record InnerSegmentCount so the planner can
+			// apply the sort/limit to the inner result only.
+			// Example: (((A INTERSECT B ORDER BY 1))) UNION ALL C
+			//   innerSegCount=1 (INTERSECT), ORDER BY is on innerSel.
+			// M0097-0044.
+			if innerSel.OrderBy != nil || innerSel.Limit != nil || innerSel.Offset != nil {
+				innerSel.InnerSegmentCount = innerSegCount
+			}
 		}
 		// Lift ORDER BY/LIMIT/OFFSET from right branch up to outermost level
 		// (mirrors what parseSelect does for non-parenthesised set ops).

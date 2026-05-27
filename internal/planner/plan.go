@@ -850,12 +850,27 @@ type PgGetPublicationTables struct {
 //
 // The output schema is the SRF's expanded composite (relid, attrs, qual
 // for pg_get_publication_tables). M0103-0008 final sub-step.
+// SrfCol describes one generate_series call in the SELECT target list
+// for the SELECT-list SRF expansion mode of ProjectSet. M0097-0045.
+type SrfCol struct {
+	ColIdx int  // which output column this SRF fills
+	Start  Expr // generate_series start arg
+	Stop   Expr // generate_series stop arg
+	Step   Expr // generate_series step arg (nil → step 1)
+}
+
 type ProjectSet struct {
 	pos     int
 	Child   Node
 	SrfName string
 	SrfArgs []Expr
 	schema  Schema
+	// SELECT-list SRF mode (generate_series in target list). M0097-0045.
+	// When non-empty, the operator expands the SRFs and zips them
+	// together, repeating OtherExprs for each step. The output schema
+	// covers both SRF and non-SRF columns.
+	SrfCols    []SrfCol // one per generate_series call in target list
+	OtherExprs []Expr   // non-SRF target expressions; nil slot = SRF slot
 }
 
 func (n *ProjectSet) Pos() int       { return n.pos }

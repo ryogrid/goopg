@@ -667,6 +667,16 @@ type SelectStmt struct {
 	// into the parenthesised content (which already has its own
 	// correctly-ordered chain). M0097-0042.
 	Parenthesized bool
+	// InnerSegmentCount > 0 when a parenthesised compound query has an
+	// ORDER BY/LIMIT/OFFSET that belongs to the INNER compound (not the
+	// outer UNION/EXCEPT/INTERSECT that was appended after the closing
+	// paren). The planner applies the sort/limit to the result of the
+	// first InnerSegmentCount set-op segments, then continues building
+	// the remaining outer segments without sorting. Example:
+	//   (((A INTERSECT B ORDER BY 1))) UNION ALL C
+	// -> InnerSegmentCount=1 means ORDER BY 1 sorts the INTERSECT result,
+	//    not the final UNION ALL output. M0097-0044.
+	InnerSegmentCount int
 	// Locking holds parsed `FOR UPDATE / FOR SHARE [OF …]
 	// [NOWAIT | SKIP LOCKED]` clauses (M0021-0001). Empty for
 	// every pre-M0021 SELECT — preserves byte-for-byte

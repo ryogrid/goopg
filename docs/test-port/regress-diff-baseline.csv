@@ -66,7 +66,7 @@ sequence,499,failed
 matview,500,failed
 transactions,530,failed
 create_table_like,538,failed
-limit,47,failed
+limit,15,failed
 create_table,562,failed
 guc,592,failed
 update,596,failed
@@ -88,7 +88,7 @@ float8,1027,failed
 rowtypes,1030,failed
 constraints,1039,failed
 portals,1089,failed
-union,48,failed
+union,34,failed
 date,1164,failed
 copy,1214,failed
 generated_stored,1337,failed
