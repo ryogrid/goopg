@@ -1004,15 +1004,32 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	_ = p.acceptKeyword(KwLateral)
 
 	// Derived table: `(SELECT …) AS alias`. The alias is mandatory
-	// in upstream PG; we mirror that. The two-token lookahead
-	// (`(` + SELECT) is necessary to disambiguate from
-	// `( table_name )` which v0 doesn't currently support but
-	// upstream does.
-	isSubqueryStart := p.cur().Kind == TokenSymbol && p.cur().Value == "(" &&
-		(p.peek(1).Kind == TokenKeyword && (p.peek(1).Keyword == KwSelect || p.peek(1).Keyword == KwValues || p.peek(1).Keyword == KwWith || p.peek(1).Keyword == KwTable))
+	// in upstream PG; we mirror that. Scan past any leading `(`
+	// tokens to find SELECT/VALUES/WITH/TABLE so that double-nested
+	// forms like `((SELECT ...)) AS t` also work (M0097-0055).
+	isSubqueryStart := false
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		for i := 0; ; i++ {
+			tok := p.peek(i)
+			if tok.Kind == TokenSymbol && tok.Value == "(" {
+				continue // skip additional opening parens
+			}
+			if tok.Kind == TokenKeyword && (tok.Keyword == KwSelect || tok.Keyword == KwValues || tok.Keyword == KwWith || tok.Keyword == KwTable) {
+				isSubqueryStart = true
+			}
+			break
+		}
+	}
 	if isSubqueryStart {
 		pos := p.cur().Pos
-		p.advance() // (
+		// Consume ALL leading '(' tokens so that ((SELECT ...)) is handled
+		// as well as the simple (SELECT ...) case. Track depth to match the
+		// right number of closing ')' after the subquery. M0097-0055.
+		depth := 0
+		for p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance()
+			depth++
+		}
 		// SELECT … INTO is not permitted in a derived-table subquery (M0097-0020).
 		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
@@ -1022,8 +1039,11 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 		if err != nil {
 			return RangeVar{}, err
 		}
-		if !p.acceptSymbol(")") {
-			return RangeVar{}, p.errAtCur("expected ')' after subquery in FROM")
+		// Consume all matching closing parens.
+		for i := 0; i < depth; i++ {
+			if !p.acceptSymbol(")") {
+				return RangeVar{}, p.errAtCur("expected ')' after subquery in FROM")
+			}
 		}
 		sel, ok := inner.(*SelectStmt)
 		if !ok {
