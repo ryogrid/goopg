@@ -50,9 +50,9 @@ truncate,255,failed
 plancache,276,failed
 create_procedure,283,failed
 text,287,failed
-enum,318,failed
+enum,406,failed
 equivclass,57,failed
-xid,408,failed
+xid,404,failed
 random,451,failed
 select_distinct,0,passed
 regex,415,failed
@@ -67,7 +67,7 @@ matview,500,failed
 transactions,530,failed
 create_table_like,538,failed
 limit,17,failed
-create_table,562,failed
+create_table,441,failed
 guc,592,failed
 update,596,failed
 misc_functions,602,failed
@@ -112,7 +112,7 @@ groupingsets,2214,failed
 arrays,2441,failed
 merge,2502,failed
 create_index,2553,failed
-alter_table,2602,failed
+alter_table,2152,failed
 multirangetypes,2801,failed
 rules,2880,failed
 inherit,2888,failed
