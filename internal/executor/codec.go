@@ -1034,7 +1034,20 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		}
 		return newNumeric(m, int(s)), n, nil
 	default:
-		return Datum{}, 0, fmt.Errorf("unsupported PostgreSQL physical type %q", t.Name)
+		// Unknown type (e.g. "point", "path", custom types).  goopg's
+		// encodeValuePG stores them as PG varlena text (the default branch
+		// calls varlenaTextBytes).  Decode symmetrically.  This mirrors the
+		// pgPhysicalTypeIsVarlena default which returns true for unknown
+		// types.  M0097-0046.
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode %q as varlena: %w", t.Name, err)
+		}
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(payload)
+			return newStringArenaDatum(sctx, moff, mlen), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
 	}
 }
 

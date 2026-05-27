@@ -1201,6 +1201,32 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// M0097-0005.
 	if s.Distinct {
 		out = &Distinct{pos: s.Pos(), Child: out, schema: out.Output()}
+		// The distinctOp sorts rows internally in ascending order.  When the
+		// query has ORDER BY, that inner sort loses the requested direction.
+		// Re-apply ORDER BY on top of Distinct by resolving each ORDER BY key
+		// against the Distinct output schema (schema-only, no bindings, so
+		// only unqualified column-name references work — which is fine since
+		// ORDER BY in a DISTINCT query must reference projected columns).
+		// M0097-0046.
+		if len(s.OrderBy) > 0 {
+			distinctOut := out.Output()
+			outerCtx := newResolveContext(nil, distinctOut)
+			outerCtx.cat = cat
+			outerKeys := make([]SortKey, 0, len(s.OrderBy))
+			for _, sb := range s.OrderBy {
+				expr := resolveOrderBySubstitution(sb.Expr, s.Targets)
+				e, err := resolveExpr(expr, outerCtx)
+				if err != nil {
+					// Key not resolvable in Distinct output — skip outer sort.
+					outerKeys = nil
+					break
+				}
+				outerKeys = append(outerKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
+			}
+			if len(outerKeys) > 0 {
+				out = &Sort{pos: s.Pos(), Child: out, Keys: outerKeys}
+			}
+		}
 	}
 	return wrapDMLCTEPrefix(out, dmlPlans), nil
 }
@@ -1717,15 +1743,16 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	}
 	// Inheritance-aware scan (M0096-0009): when scanning a table that has
 	// inheritance children, produce a UNION ALL of SeqScans over the parent
-	// AND all children.  Unlike partitioned tables (where the parent has no
+	// AND all descendants.  Unlike partitioned tables (where the parent has no
 	// rows), an inherited parent may itself contain rows, so the parent scan
-	// is always included first.
+	// is always included first.  M0097-0046: expand recursively so that
+	// grandchildren (e.g. stud_emp → emp → person) are included too.
 	if im, ok := cat.(*catalog.InMemory); ok {
-		children := im.InheritanceChildren(tbl.OID)
-		if len(children) > 0 {
+		allDesc := collectInheritanceDescendants(im, tbl.OID)
+		if len(allDesc) > 0 {
 			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}
 			var root Node = parentScan
-			for _, child := range children {
+			for _, child := range allDesc {
 				childSchema := tableSchemaWithSource(b.table, sourceIdx)
 				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childSchema}
 				root = &SetOp{
@@ -1739,6 +1766,28 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		}
 	}
 	return &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}, b, nil
+}
+
+// collectInheritanceDescendants performs a breadth-first traversal of the
+// inheritance tree rooted at parentOID and returns all descendants in BFS
+// order, deduplicated (a table can be a descendant via multiple paths, e.g.
+// stud_emp inherits from both emp and student which both inherit from person).
+// M0097-0046.
+func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32) []*catalog.Table {
+	var result []*catalog.Table
+	seen := make(map[uint32]bool)
+	queue := im.InheritanceChildren(parentOID)
+	for len(queue) > 0 {
+		child := queue[0]
+		queue = queue[1:]
+		if seen[child.OID] {
+			continue
+		}
+		seen[child.OID] = true
+		result = append(result, child)
+		queue = append(queue, im.InheritanceChildren(child.OID)...)
+	}
+	return result
 }
 
 // buildVirtualValues materialises a virtual table's current rows as

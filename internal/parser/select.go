@@ -1044,6 +1044,12 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 		rv.TableFunc = &TableFuncRef{pos: obj.pos, Name: srfFuncName, Args: args}
 	}
 
+	// `table*` syntax: the `*` means "include inheritance children".  In
+	// goopg the planner always includes inheritance children when the
+	// catalog has registered them, so `*` is a syntax-level no-op.
+	// M0097-0046.
+	_ = p.acceptSymbol("*")
+
 	// Optional alias: AS ident [(col, ...)], or bare ident for the "implicit alias"
 	// shorthand that pgbench uses (`pgbench_accounts a`).
 	// The optional column alias list (SELECT ...) AS t(c1, c2) is consumed

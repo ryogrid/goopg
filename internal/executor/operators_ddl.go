@@ -365,9 +365,22 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 			inheritParents = append(inheritParents, parent)
 			// Append parent columns (deep copy to avoid aliasing).
+			// Deduplicate: skip columns whose name already exists — multiple
+			// inheritance parents may share columns (e.g. emp and student both
+			// inherit name/age/location from person, so stud_emp INHERITS (emp,
+			// student) should have those columns only once).  M0097-0046.
 			for _, pc := range parent.Columns {
-				c := pc
-				cols = append(cols, c)
+				found := false
+				for _, ec := range cols {
+					if strings.EqualFold(ec.Name, pc.Name) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					c := pc
+					cols = append(cols, c)
+				}
 			}
 		}
 	}
