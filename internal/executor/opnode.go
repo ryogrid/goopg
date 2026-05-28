@@ -59,9 +59,15 @@ import (
 // Operators like projectOp must evaluate targets even when Cells is empty
 // (the target expressions may be constants that don't reference input).
 type Slot struct {
-	schema planner.Schema
-	Cells  []Datum
-	HasRow bool // false == DML nil-row; true == real row (may have 0 cols)
+	schema  planner.Schema
+	Cells   []Datum
+	HasRow  bool // false == DML nil-row; true == real row (may have 0 cols)
+	// M0097-0062: ctid system column forwarded from MaterializedSlot.
+	// Set by fillFromTupleSlot when the incoming TupleSlot is a
+	// *MaterializedSlot that carries ctid info (seqScanOp path).
+	hasCTID   bool
+	ctidBlock uint32
+	ctidOff   uint16
 }
 
 // Reset truncates Cells to zero length, re-using the backing array.
@@ -80,6 +86,10 @@ func (s *Slot) CopyTo(dst *Slot) {
 	}
 	dst.Cells = dst.Cells[:len(s.Cells)]
 	copy(dst.Cells, s.Cells)
+	// M0097-0062: propagate ctid so tidscan / tidrangescan predicates work.
+	dst.hasCTID = s.hasCTID
+	dst.ctidBlock = s.ctidBlock
+	dst.ctidOff = s.ctidOff
 }
 
 // ----- TupleSlot / SlotView interface implementations ------------------
@@ -120,6 +130,7 @@ func (s *Slot) fillFromTupleSlot(ts TupleSlot) {
 		s.Cells = s.Cells[:0]
 		s.schema = nil
 		s.HasRow = false
+		s.hasCTID = false
 		return
 	}
 	row := ts.Row()
@@ -130,6 +141,15 @@ func (s *Slot) fillFromTupleSlot(ts TupleSlot) {
 	copy(s.Cells, row)
 	s.schema = ts.Schema()
 	s.HasRow = true
+	// M0097-0062: propagate ctid from MaterializedSlot so CTIDExpr
+	// evaluates correctly through the opnode pipeline.
+	if ms, ok := ts.(*MaterializedSlot); ok && ms.hasCTID {
+		s.hasCTID = true
+		s.ctidBlock = ms.ctidBlock
+		s.ctidOff = ms.ctidOff
+	} else {
+		s.hasCTID = false
+	}
 }
 
 // ---------------------------------------------------------------------------

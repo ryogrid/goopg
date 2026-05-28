@@ -108,7 +108,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 	case *planner.SubqueryExpr:
 		return evalSubquery(x, slotToRow(slot), ctx)
 	case *planner.InExpr:
-		return evalInExpr(x, slotToRow(slot), ctx)
+		return evalInExpr(x, slot, ctx)
 	case *planner.ExistsExpr:
 		return evalExistsExpr(x, slotToRow(slot), ctx)
 	case *planner.TypedStringLit:
@@ -130,8 +130,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 	case *planner.CTIDExpr:
 		// `ctid` system column: per-row TID injected by seqScanOp
 		// into MaterializedSlot.hasCTID. M0097-0038.
-		if ms, ok := slot.(*MaterializedSlot); ok && ms.hasCTID {
-			return NewStringDatum(fmt.Sprintf("(%d,%d)", ms.ctidBlock, ms.ctidOff)), nil
+		// M0097-0062: also handle opnode *Slot which propagates ctid
+		// from MaterializedSlot via fillFromTupleSlot.
+		switch s := slot.(type) {
+		case *MaterializedSlot:
+			if s.hasCTID {
+				return NewStringDatum(fmt.Sprintf("(%d,%d)", s.ctidBlock, s.ctidOff)), nil
+			}
+		case *Slot:
+			if s.hasCTID {
+				return NewStringDatum(fmt.Sprintf("(%d,%d)", s.ctidBlock, s.ctidOff)), nil
+			}
 		}
 		return NullDatum, nil
 	case *planner.NumericConst:
@@ -2729,8 +2738,9 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 //   - inner empty → false (NOT IN: true).
 //
 // Multi-column subqueries raise 42601.
-func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
-	operand, err := evalExpr(x.Operand, row, ctx)
+func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
+	// Use evalExprSlot so CTIDExpr can access hasCTID from the slot. M0097-0062.
+	operand, err := evalExprSlot(x.Operand, slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -2738,6 +2748,7 @@ func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 
+	row := slotToRow(slot)
 	values, err := collectInValues(x, row, ctx)
 	if err != nil {
 		return Datum{}, err

@@ -1432,20 +1432,46 @@ func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		}
 		innerCtx.rels = rels
 	}
-	cols := make([]catalog.Column, 0, len(body.Targets))
-	for i, tgt := range body.Targets {
-		name := tgt.Alias
-		if name == "" {
-			name = deriveAnalyzerTargetName(tgt.Expr)
+	var cols []catalog.Column
+	if len(body.Targets) == 0 && len(body.ValuesRows) > 0 {
+		// VALUES anchor (e.g. VALUES (1) UNION ALL SELECT n+1 ...): no Targets,
+		// so infer columns from the first row. Names are "column1", "column2", ...
+		// and types are "unknown" (the planner resolves exact types). M0097-0062.
+		nCols := len(body.ValuesRows[0])
+		cols = make([]catalog.Column, nCols)
+		for i := 0; i < nCols; i++ {
+			cols[i] = catalog.Column{Name: fmt.Sprintf("column%d", i+1), Type: catalog.Type{Name: "unknown"}, Ordinal: i}
 		}
-		if name == "" {
-			name = fmt.Sprintf("?column?%d", i+1)
+	} else {
+		cols = make([]catalog.Column, 0, len(body.Targets))
+		for i, tgt := range body.Targets {
+			name := tgt.Alias
+			if name == "" {
+				name = deriveAnalyzerTargetName(tgt.Expr)
+			}
+			if name == "" {
+				name = fmt.Sprintf("?column?%d", i+1)
+			}
+			typ, err := analyzeExpr(tgt.Expr, innerCtx)
+			if err != nil {
+				return err
+			}
+			cols = append(cols, catalog.Column{Name: name, Type: typ, Ordinal: i})
 		}
-		typ, err := analyzeExpr(tgt.Expr, innerCtx)
-		if err != nil {
-			return err
+	}
+	// Apply explicit column alias list (the `(col, ...)` after the CTE name),
+	// matching what registerAnalyzedCTE does for non-recursive CTEs.
+	// Without this, `WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL ...)` registers
+	// the CTE with column name "?column?1" instead of "n", causing the recursive
+	// member to fail with "column n does not exist".
+	if len(cte.Columns) > 0 {
+		if len(cte.Columns) != len(cols) {
+			return analyzeError(cte.Pos(), "42P10",
+				fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(cols)))
 		}
-		cols = append(cols, catalog.Column{Name: name, Type: typ, Ordinal: i})
+		for i, alias := range cte.Columns {
+			cols[i].Name = alias
+		}
 	}
 	colAliases := make([]string, len(cols))
 	for i, c := range cols {
@@ -1984,9 +2010,10 @@ func isComparable(left, right catalog.Type) bool {
 		return true
 	}
 	// uuid, name, oid and other text-backed types are comparable with text/varchar. M0097-0003.
+	// tid is also text-backed (string representation "(block,offset)"); ctid = '(0,1)' must work. M0097-0062.
 	isTextBacked := func(t catalog.Type) bool {
 		switch strings.ToLower(t.Name) {
-		case "uuid", "name", "oid", "oidvector", "int2vector", "pg_lsn":
+		case "uuid", "name", "oid", "oidvector", "int2vector", "pg_lsn", "tid":
 			return true
 		}
 		return false

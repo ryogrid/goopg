@@ -226,6 +226,29 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
 	}
 
 	anchorSchema := anchor.Output()
+	// Apply explicit column alias list (the `(col, ...)` after the CTE name).
+	// Without this, the WorkTableScan and the CTE catalog entry use the raw
+	// planner output names (e.g. "?column?1"), causing the recursive member to
+	// fail with "column n does not exist" when the query uses aliases like
+	// `WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL ...)`. Mirror the renaming
+	// that the non-recursive CTE path does at lines 165-178.
+	if len(cte.Columns) > 0 {
+		if len(cte.Columns) != len(anchorSchema) {
+			if hadEntry {
+				planCTEs[key] = savedEntry
+			}
+			return nil, &PlanError{
+				Pos:     cte.Pos(),
+				Code:    "42P10",
+				Message: fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(anchorSchema)),
+			}
+		}
+		renamed := make(Schema, len(anchorSchema))
+		for i, c := range anchorSchema {
+			renamed[i] = SchemaColumn{Name: cte.Columns[i], Type: c.Type}
+		}
+		anchorSchema = renamed
+	}
 	wts := &WorkTableScan{pos: cte.Pos(), schema: anchorSchema}
 	wtCols := make([]catalog.Column, len(anchorSchema))
 	for i, c := range anchorSchema {
