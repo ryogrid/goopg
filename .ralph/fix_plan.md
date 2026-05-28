@@ -1308,6 +1308,16 @@ M0097-0001 wires it up.
         `generate_series` is implemented.
       - Mapped to completed M0097-0011/0012.
       - DoD: same as M0097-0020.
+      - **Progress 2026-05-28 (M0097-0071):** `random` diff 451→314.
+        EnumType.Values→[]EnumValue{Label,SortOrder}; real PRNG replacing
+        constant-0.5 stub; setseed(), random_normal() (Box-Muller),
+        random(lo,hi) with uint64 overflow-safe arithmetic; datumToFloat64
+        helper fixes arg extraction for KindInt args (was silently ignored
+        causing random_normal(10,0)→N(0,1) instead of 10); KindInt return
+        for integer range (fixes min/max lex vs numeric comparison);
+        pg_input_is_valid/pg_input_error_info enum support. Remaining diffs:
+        PL/pgSQL KS tests (need plpgsql execution), NaN/Inf numeric
+        representation, decimal quantization for random(-0.5, 0.49).
 
 - [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
       - Summary: Make these 13 tests reach `pass`:
