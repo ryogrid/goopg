@@ -3943,12 +3943,23 @@ by the visibility check.
         `go test ./internal/executor/... -count=1` passes modulo
         `TestToastByteaRoundTrip` (pre-existing, unrelated to M0115).
 
-- [ ] **M0115-0007** — Benchmark gate
-      - Run `pgbench -T 60 -c 10 -M simple -S` before and after.
-      - TPS must not decrease by more than 2%.
-      - NOTE: Formal before/after comparison not yet recorded. M0107 established
-        the 42k TPS baseline (select-only); M0115 is an optimization so regression
-        is unlikely, but benchmark data not captured for this milestone.
+- [x] **M0115-0007** — Benchmark gate
+      - **COMPLETE 2026-05-29.** Spec config `pgbench -T 60 -c 10 -M simple -S`
+        run twice on a baseline build (ff6076e4, the commit just before M0115;
+        with `internal/executor/hash_partition.go` cherry-picked from `8223992f`
+        because ff6076e4 was committed on this branch in a momentarily broken
+        state — the call site landed in 574b0a2c before the helper file landed
+        in 8223992f) and twice on HEAD (`a53c046f`, M0115-0001..0006 + M0116).
+        Baseline mean 57,213.6 TPS; HEAD mean 56,695.4 TPS; **Δ = −0.906 %**,
+        within the −2.0 % gate. Latency unchanged at 0.175–0.176 ms; 0 failed
+        transactions either side. Result: PASS. Design doc:
+        `docs/design/mvcc-optimize/0115-0007-benchmark-gate.md` (indexed in
+        `mvcc-optimize/README.md`). Raw artifacts:
+        `tmp/perf-optimize/m0115-0007/{baseline,head}/bench_run{1,2}.txt`
+        and `bench_summary.txt`. Interpretation in the design doc: `pgbench
+        -S` is a narrow read-only workload that doesn't exercise the cold
+        `SeesCommittedXID` path M0115 short-circuits — the gate is
+        ceiling-preserving here, as expected for a regression check.
 
 ---
 
