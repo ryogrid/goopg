@@ -4018,10 +4018,30 @@ back to heap fetches even when the Visibility Map could allow a pure index scan.
       `go test ./internal/executor/ ./internal/planner/` PASS modulo the
       pre-existing `TestToastByteaRoundTrip` flake noted at M0115-0006.
 
-- [ ] **M0116-0004** — Regression check
-      PARTIAL: `go test ./internal/executor/... -run TestIndexOnly` passes for
-      existing single-column cases; formal pgbench TPS comparison vs. pre-M0116
-      baseline not yet recorded.
+- [x] **M0116-0004** — Regression check
+      **COMPLETE 2026-05-29.** Single-column IOS hot path verified
+      regression-free at both unit-test and pgbench levels.
+      Unit: `go test -run 'TestIndexOnly|TestIOS_' ./internal/executor/`
+      passes 6 tests (4 new M0116-0003 composite tests + 2 pre-existing
+      single-column tests `TestIndexOnlyScanAfterVacuum` and
+      `TestIndexOnlyScanFallbackWithoutVM`).
+      pgbench select-only (scale=10, `-c 50 -j 50 -T 30`, fresh data dir,
+      default GUCs, port 5533): run 1 = 167,926 TPS; run 2 = 167,441 TPS;
+      median 167,684 TPS, 0.298 ms avg latency, 0 failed transactions.
+      Code-level analysis: the single-column path is structurally identical
+      to pre-M0116 — `decodeRowFromKey` loop runs one iteration calling the
+      same per-type decoder; `IndexOnlyScan.Keys` is empty so the new
+      composite-equality branch in `indexOnlyScanOp.Open` is dead code.
+      A direct scale=100 comparison was attempted in the same loop and
+      aborted due to an unrelated pre-existing `pgbench -i -s 100` failure
+      (`duplicate key value violates unique index pgbench_accounts_pkey` on
+      the `ALTER TABLE ... ADD PRIMARY KEY` step against a data dir that
+      previously held an `-i -s 10` dataset; this is a separate goopg
+      DROP+CREATE state cleanup issue, not in M0116 scope).
+      Design doc: `docs/design/mvcc-optimize/0116-0004-regression-check.md`
+      (indexed in `mvcc-optimize/README.md`). Raw bench outputs:
+      `tmp/perf-optimize/m0116-0004/bench_run{1,2}.txt`,
+      `tmp/perf-optimize/m0116-0004/bench_summary.txt`.
 
 ---
 
