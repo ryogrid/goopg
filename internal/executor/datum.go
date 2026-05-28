@@ -62,6 +62,12 @@ const (
 	// path: ArenaID + Int=(offset<<32|length) encode the sign+BE-bytes
 	// representation. When clear, Int holds the int64 fast-path mantissa.
 	flagBigNumeric uint8 = 1 << 0
+
+	// flagDate marks a KindTime datum as a DATE (not a timestamp).
+	// When set, Format() renders the value using PostgreSQL's Postgres,MDY
+	// date output style ("MM-DD-YYYY"), matching the pg_regress default
+	// DateStyle. M0097-0063.
+	flagDate uint8 = 1 << 1
 )
 
 // Datum is one column value flowing through the operator tree.
@@ -504,6 +510,10 @@ func (d Datum) Format() string {
 	case KindBytes:
 		return string(d.BytesValue())
 	case KindTime:
+		if d.Flags&flagDate != 0 {
+			// DATE type: render as Postgres MDY style "MM-DD-YYYY". M0097-0063.
+			return d.TimeValue().Format("01-02-2006")
+		}
 		return d.TimeValue().Format("2006-01-02 15:04:05.000000")
 	case KindInterval:
 		return fmt.Sprintf("%d months %d days", d.IntervalMonthsValue(), d.IntervalDaysValue())

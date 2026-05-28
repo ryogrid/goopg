@@ -1454,10 +1454,13 @@ const (
 	precBitXor   = 5 // # (same as compare in PG)
 	precBitAnd   = 6 // & (higher than | in PG)
 	precBitShift = 6 // << >> (same as & in PG)
-	precAddSub   = 7
-	precMulDiv   = 8
-	precConcat   = 9
-	precUnary    = 10
+	// precConcat (||) must be BELOW precAddSub so that `'x' || 2+3` parses
+	// as `'x' || (2+3)`, matching PostgreSQL's operator precedence table
+	// where || is in the "other operators" group below + and -. M0097-0063.
+	precConcat = 6 // || — below +/- (7) so `a || 2+3` → `a || (2+3)`
+	precAddSub = 7
+	precMulDiv = 8
+	precUnary  = 10
 )
 
 // parseExpr drives the precedence-climbing loop.

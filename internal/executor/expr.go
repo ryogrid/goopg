@@ -721,10 +721,21 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		}
 		return arithmetic(op, left.Int, right.Int, pos)
 	case parser.OpConcat:
-		// Non-string operands are implicitly coerced to text, matching
-		// PostgreSQL's || behaviour (e.g. `1 || '/'`). M0097-pg_lsn.
+		// || requires at least one string-typed operand. When one side is text
+		// (or string-like), the other side is coerced to text. When both sides
+		// are non-string (e.g. integer || numeric), PostgreSQL raises
+		// "operator does not exist" — match that behaviour. M0097-0063.
 		if left.IsNull() || right.IsNull() {
 			return NullDatum, nil
+		}
+		leftIsStr := left.Kind == KindString || left.Kind == KindBytes
+		rightIsStr := right.Kind == KindString || right.Kind == KindBytes
+		if !leftIsStr && !rightIsStr {
+			// Neither operand is string-like → PG-compatible error.
+			return Datum{}, &ExecError{Code: "42883", Pos: pos,
+				Message: fmt.Sprintf("operator does not exist: %s || %s",
+					pgKindTypeName(left.Kind), pgKindTypeName(right.Kind)),
+				Hint: "No operator matches the given name and argument types. You might need to add explicit type casts."}
 		}
 		return NewStringDatum(left.Format() + right.Format()), nil
 	case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
@@ -1456,7 +1467,13 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			}
 			return d, nil
 		case KindString:
-			n, err := parseIntegerInput(d.StringValue(), "smallint", 16)
+			s := d.StringValue()
+			// Array literals like '{1,2,3}'::int2[] pass through — the parser strips '[]'
+			// making the target type look like 'int2', but the value is an array. M0097-0063.
+			if len(s) > 0 && s[0] == '{' {
+				return d, nil
+			}
+			n, err := parseIntegerInput(s, "smallint", 16)
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
 					ee.Pos = pos
@@ -1485,7 +1502,13 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			}
 			return d, nil
 		case KindString:
-			n, err := parseIntegerInput(d.StringValue(), "integer", 32)
+			s := d.StringValue()
+			// Array literals like '{1,2,3}'::int4[] pass through — the parser strips '[]'
+			// making the target type look like 'int4', but the value is an array. M0097-0063.
+			if len(s) > 0 && s[0] == '{' {
+				return d, nil
+			}
+			n, err := parseIntegerInput(s, "integer", 32)
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
 					ee.Pos = pos
@@ -1510,7 +1533,12 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		case KindInt:
 			return d, nil
 		case KindString:
-			n, err := parseIntegerInput(d.StringValue(), "bigint", 64)
+			s := d.StringValue()
+			// Array literals like '{1,2,3}'::int8[] pass through — parser strips '[]'. M0097-0063.
+			if len(s) > 0 && s[0] == '{' {
+				return d, nil
+			}
+			n, err := parseIntegerInput(s, "bigint", 64)
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
 					ee.Pos = pos
@@ -4197,11 +4225,30 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return Datum{Kind: KindInt, Int: int64(len([]rune(s.StringValue())))}, nil
 		}
 	case "length":
-		// length(text) → int  (byte length for bytea, char length for text)
+		// length(text) → int  (byte length for bytea, char length for text).
+		// Only valid for text/varchar/char/bytea — integer/numeric/etc. must error
+		// because PostgreSQL does not define length(integer). M0097-0063.
 		if len(x.Args) == 1 {
 			s, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
+			}
+			if s.Kind != KindString && s.Kind != KindBytes {
+				typName := "unknown"
+				switch s.Kind {
+				case KindInt:
+					typName = "integer"
+				case KindNumeric:
+					typName = "numeric"
+				case KindBool:
+					typName = "boolean"
+				case KindTime:
+					typName = "timestamp"
+				}
+				return Datum{}, &ExecError{Code: "42883",
+					Message: fmt.Sprintf("function length(%s) does not exist", typName),
+					Hint:    "No function matches the given name and argument types. You might need to add explicit type casts.",
+					Pos:     x.Pos()}
 			}
 			return Datum{Kind: KindInt, Int: int64(len([]rune(s.StringValue())))}, nil
 		}
@@ -4371,7 +4418,22 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(parts[idx-1]), nil
 		}
 	case "concat":
-		// concat(any, ...) → text — NULL inputs are treated as empty string
+		// concat(any, ...) → text — NULL inputs are treated as empty string.
+		// concat(VARIADIC NULL::anyarray) → NULL (not empty string). M0097-0063.
+		// Expand VARIADIC array arguments into individual string values.
+		if x.Variadic && len(x.Args) == 1 {
+			// concat(VARIADIC arr) — single array arg with VARIADIC flag.
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(v.StringValue())
+			var buf strings.Builder
+			for _, e := range elems {
+				buf.WriteString(e)
+			}
+			return NewStringDatum(buf.String()), nil
+		}
 		var buf strings.Builder
 		for _, arg := range x.Args {
 			v, err := evalExpr(arg, row, ctx)
@@ -4382,13 +4444,36 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NewStringDatum(buf.String()), nil
 	case "concat_ws":
-		// concat_ws(sep, any, ...) → text
+		// concat_ws(sep, any, ...) → text.
+		// concat_ws(sep, VARIADIC arr) — expand array elements. M0097-0063.
 		if len(x.Args) >= 1 {
 			sepArg, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || sepArg.IsNull() {
 				return NullDatum, nil
 			}
 			sep := sepArg.StringValue()
+
+			// Check for VARIADIC last argument.
+			if x.Variadic && len(x.Args) == 2 {
+				arrVal, verr := evalExpr(x.Args[1], row, ctx)
+				if verr != nil || arrVal.IsNull() {
+					return NullDatum, nil
+				}
+				// Must be an array (string starting with '{').
+				sv := arrVal.StringValue()
+				if len(sv) == 0 || sv[0] != '{' {
+					return Datum{}, &ExecError{Code: "42809",
+						Message: "VARIADIC argument must be an array",
+						Pos:     x.Pos()}
+				}
+				elems := parseTextArray(sv)
+				var parts []string
+				for _, e := range elems {
+					parts = append(parts, e)
+				}
+				return NewStringDatum(strings.Join(parts, sep)), nil
+			}
+
 			var parts []string
 			for _, arg := range x.Args[1:] {
 				v, verr := evalExpr(arg, row, ctx)
@@ -4476,8 +4561,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || s.IsNull() {
 				return NewStringDatum("NULL"), nil
 			}
-			escaped := strings.ReplaceAll(s.StringValue(), "'", "''")
-			return NewStringDatum("'" + escaped + "'"), nil
+			return NewStringDatum(pgQuoteLiteral(s.StringValue())), nil
 		}
 	case "quote_ident":
 		if len(x.Args) == 1 {
@@ -4536,23 +4620,56 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(result), nil
 		}
 	case "format":
-		// format(fmt, args...) — implements %s, %I (quote_ident), %L (quote_literal). M0097-0003.
+		// format(fmt, args...) — PostgreSQL format() with positional args, width, flags.
+		// %[position][flags][width]type where type = s | I | L | %. M0097-0003 / M0097-0063.
+		// format(fmt, VARIADIC arr) expands the array into individual arguments. M0097-0063.
 		if len(x.Args) >= 1 {
 			f, err := evalExpr(x.Args[0], row, ctx)
-			if err != nil || f.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if f.IsNull() {
 				return NullDatum, nil
 			}
 			fmtStr := f.StringValue()
-			// Evaluate remaining args.
-			args := make([]Datum, 0, len(x.Args)-1)
-			for _, a := range x.Args[1:] {
-				v, e := evalExpr(a, row, ctx)
+
+			// Evaluate remaining args, expanding VARIADIC array if present.
+			// x.Variadic is true when any argument was marked with VARIADIC keyword.
+			var args []Datum
+			nonFmtArgs := x.Args[1:]
+			if x.Variadic && len(nonFmtArgs) == 1 {
+				// format(fmt, VARIADIC arr) — single variadic array.
+				v, e := evalExpr(nonFmtArgs[0], row, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
-				args = append(args, v)
+				if !v.IsNull() {
+					sv := v.StringValue()
+					if len(sv) == 0 || sv[0] != '{' {
+						return Datum{}, &ExecError{Code: "42809",
+							Message: "VARIADIC argument must be an array",
+							Pos:     x.Pos()}
+					}
+					elems := parseTextArray(sv)
+					for _, e := range elems {
+						args = append(args, NewStringDatum(e))
+					}
+				}
+				// If v is NULL, args stays empty → format string must not use any args.
+			} else {
+				for _, a := range nonFmtArgs {
+					v, e := evalExpr(a, row, ctx)
+					if e != nil {
+						return Datum{}, e
+					}
+					args = append(args, v)
+				}
 			}
-			result := applyPgFormat(fmtStr, args)
+
+			result, ferr := applyPgFormatFull(fmtStr, args)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
 			return NewStringDatum(result), nil
 		}
 
@@ -5446,7 +5563,9 @@ func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 	year, month, day := t.UTC().Date()
 	out := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
-	return NewTimeDatum(out), nil
+	d := NewTimeDatum(out)
+	d.Flags |= flagDate // mark as DATE type for Postgres MDY display. M0097-0063.
+	return d, nil
 }
 
 // evalSubstr implements PostgreSQL's `substr(string, from [, count])`
@@ -5839,9 +5958,33 @@ func formatTextArray(elems []string) string {
 
 // applyPgFormat implements PostgreSQL's format() function for common specifiers:
 // %s (value as text), %I (quote_ident), %L (quote_literal), %% (literal %). M0097-0003.
+// applyPgFormat is kept as a simple no-error wrapper for callers that don't
+// need error propagation. New callers should use applyPgFormatFull.
 func applyPgFormat(fmtStr string, args []Datum) string {
+	s, _ := applyPgFormatFull(fmtStr, args)
+	return s
+}
+
+// applyPgFormatFull implements PostgreSQL format():
+//
+//	%[position][flags][width]type
+//
+// position: N$ (1-based index into args; absent = sequential)
+// flags:    - (left-align)
+// width:    integer (minimum field width, space-padded)
+// type:     s | I | L | %
+//
+// Returns an error for:
+//   - argument 0 (arguments numbered from 1)
+//   - too few arguments
+//   - unterminated format specifier
+//   - unrecognized type specifier
+//   - NULL value for %I
+//
+// M0097-0063.
+func applyPgFormatFull(fmtStr string, args []Datum) (string, error) {
 	var sb strings.Builder
-	argIdx := 0
+	seqIdx := 0 // next sequential arg index (0-based)
 	for i := 0; i < len(fmtStr); i++ {
 		if fmtStr[i] != '%' {
 			sb.WriteByte(fmtStr[i])
@@ -5849,40 +5992,215 @@ func applyPgFormat(fmtStr string, args []Datum) string {
 		}
 		i++
 		if i >= len(fmtStr) {
-			sb.WriteByte('%')
-			break
+			// Unterminated at very end.
+			return "", &ExecError{Code: "22023",
+				Message: "unterminated format() type specifier",
+				Hint:    `For a single "%" use "%%".`}
 		}
-		switch fmtStr[i] {
-		case '%':
+		if fmtStr[i] == '%' {
 			sb.WriteByte('%')
+			continue
+		}
+
+		// Parse optional position (digits followed by $).
+		pos := -1 // -1 = sequential
+		j := i
+		for j < len(fmtStr) && fmtStr[j] >= '0' && fmtStr[j] <= '9' {
+			j++
+		}
+		if j > i && j < len(fmtStr) && fmtStr[j] == '$' {
+			// Positional argument.
+			n := 0
+			for _, c := range fmtStr[i:j] {
+				n = n*10 + int(c-'0')
+			}
+			if n == 0 {
+				return "", &ExecError{Code: "22023",
+					Message: "format specifies argument 0, but arguments are numbered from 1"}
+			}
+			pos = n - 1 // convert to 0-based
+			i = j + 1   // skip past '$'
+		}
+
+		if i >= len(fmtStr) {
+			return "", &ExecError{Code: "22023",
+				Message: "unterminated format() type specifier",
+				Hint:    `For a single "%" use "%%".`}
+		}
+
+		// Parse optional flags.
+		leftAlign := false
+		if fmtStr[i] == '-' {
+			leftAlign = true
+			i++
+		}
+
+		if i >= len(fmtStr) {
+			return "", &ExecError{Code: "22023",
+				Message: "unterminated format() type specifier",
+				Hint:    `For a single "%" use "%%".`}
+		}
+
+		// Parse optional width: either a decimal integer, or * / *N$ (width from arg).
+		width := 0
+		if fmtStr[i] == '*' {
+			// Width taken from an argument.
+			i++ // consume '*'
+			// Check for *N$ positional width.
+			widthPos := -1
+			j2 := i
+			for j2 < len(fmtStr) && fmtStr[j2] >= '0' && fmtStr[j2] <= '9' {
+				j2++
+			}
+			if j2 > i && j2 < len(fmtStr) && fmtStr[j2] == '$' {
+				n := 0
+				for _, c := range fmtStr[i:j2] {
+					n = n*10 + int(c-'0')
+				}
+				if n == 0 {
+					return "", &ExecError{Code: "22023",
+						Message: "format specifies argument 0, but arguments are numbered from 1"}
+				}
+				widthPos = n - 1
+				i = j2 + 1
+			}
+			// Get width value from argument.
+			// Even for positional *N$, we always advance seqIdx by 1 to mirror PG's
+			// sequential-slot accounting — this prevents the same slot from being
+			// reused as both the width provider and the value. M0097-0063.
+			var wArgI int
+			if widthPos >= 0 {
+				wArgI = widthPos
+			} else {
+				wArgI = seqIdx
+			}
+			seqIdx++ // always advance, regardless of positional vs sequential
+			if wArgI < len(args) && !args[wArgI].IsNull() {
+				w := int(args[wArgI].Int)
+				if w < 0 {
+					leftAlign = true
+					w = -w
+				}
+				width = w
+			}
+		} else {
+			for i < len(fmtStr) && fmtStr[i] >= '0' && fmtStr[i] <= '9' {
+				width = width*10 + int(fmtStr[i]-'0')
+				i++
+			}
+		}
+
+		if i >= len(fmtStr) {
+			return "", &ExecError{Code: "22023",
+				Message: "unterminated format() type specifier",
+				Hint:    `For a single "%" use "%%".`}
+		}
+
+		// Determine argument index.
+		var argI int
+		if pos >= 0 {
+			argI = pos
+		} else {
+			argI = seqIdx
+			seqIdx++
+		}
+
+		// Type specifier.
+		spec := fmtStr[i]
+		switch spec {
 		case 's':
-			if argIdx < len(args) {
-				sb.WriteString(args[argIdx].Format())
-				argIdx++
+			if argI >= len(args) {
+				return "", &ExecError{Code: "22023", Message: "too few arguments for format()"}
 			}
+			d := args[argI]
+			var s string
+			if d.IsNull() {
+				s = ""
+			} else {
+				s = d.Format()
+			}
+			sb.WriteString(padString(s, width, leftAlign))
 		case 'I':
-			// quote_ident: quote identifier only if necessary.
-			if argIdx < len(args) {
-				ident := args[argIdx].StringValue()
-				argIdx++
-				sb.WriteString(pgQuoteIdent(ident))
+			if argI >= len(args) {
+				return "", &ExecError{Code: "22023", Message: "too few arguments for format()"}
 			}
+			d := args[argI]
+			if d.IsNull() {
+				return "", &ExecError{Code: "22004",
+					Message: "null values cannot be formatted as an SQL identifier"}
+			}
+			// Use Format() so integers, numerics, etc. get their string representation.
+			ident := pgQuoteIdent(d.Format())
+			sb.WriteString(padString(ident, width, leftAlign))
 		case 'L':
-			// quote_literal: always quotes with single quotes.
-			if argIdx < len(args) {
-				lit := args[argIdx].StringValue()
-				argIdx++
-				escaped := strings.ReplaceAll(lit, "'", "''")
-				sb.WriteByte('\'')
-				sb.WriteString(escaped)
-				sb.WriteByte('\'')
+			if argI >= len(args) {
+				return "", &ExecError{Code: "22023", Message: "too few arguments for format()"}
 			}
+			d := args[argI]
+			var lit string
+			if d.IsNull() {
+				lit = "NULL"
+			} else {
+				// Use Format() so integers, numerics, etc. get their string representation.
+				escaped := strings.ReplaceAll(d.Format(), "'", "''")
+				lit = "'" + escaped + "'"
+			}
+			sb.WriteString(padString(lit, width, leftAlign))
 		default:
-			sb.WriteByte('%')
-			sb.WriteByte(fmtStr[i])
+			return "", &ExecError{Code: "22023",
+				Message: fmt.Sprintf("unrecognized format() type specifier %q", string(spec)),
+				Hint:    `For a single "%" use "%%".`}
 		}
 	}
-	return sb.String()
+	return sb.String(), nil
+}
+
+// padString pads s to at least minWidth characters. If leftAlign, spaces are
+// added on the right; otherwise on the left.
+func padString(s string, minWidth int, leftAlign bool) string {
+	if minWidth <= 0 || len(s) >= minWidth {
+		return s
+	}
+	pad := strings.Repeat(" ", minWidth-len(s))
+	if leftAlign {
+		return s + pad
+	}
+	return pad + s
+}
+
+// pgKindTypeName returns the PostgreSQL type name for a Datum Kind,
+// used in error messages like "operator does not exist: integer || numeric".
+func pgKindTypeName(k DatumKind) string {
+	switch k {
+	case KindInt:
+		return "integer"
+	case KindNumeric:
+		return "numeric"
+	case KindBool:
+		return "boolean"
+	case KindTime:
+		return "timestamp"
+	case KindString:
+		return "text"
+	case KindBytes:
+		return "bytea"
+	default:
+		return "unknown"
+	}
+}
+
+// pgQuoteLiteral returns a SQL string literal for s.
+// If s contains backslashes, uses E'...' escape-string syntax so that
+// backslashes are correctly represented. Otherwise uses standard '...' form.
+func pgQuoteLiteral(s string) string {
+	if strings.Contains(s, `\`) {
+		// E-string syntax: escape ' as '' and \ as \\.
+		escaped := strings.ReplaceAll(s, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, `'`, `''`)
+		return `E'` + escaped + `'`
+	}
+	escaped := strings.ReplaceAll(s, `'`, `''`)
+	return `'` + escaped + `'`
 }
 
 // pgQuoteIdent quotes a SQL identifier if necessary (uppercase, spaces, special chars). M0097-0003.

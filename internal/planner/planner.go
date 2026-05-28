@@ -3498,7 +3498,14 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			}
 			args = append(args, pa)
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}, nil
+		varExp := false
+		for _, v := range x.Variadic {
+			if v {
+				varExp = true
+				break
+			}
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp}, nil
 	case *parser.ArrayConstructorExpr:
 		// ARRAY[e1, e2, ...] after GROUP BY — resolve each element
 		// through the post-aggregate surface (so group-by columns

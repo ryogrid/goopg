@@ -961,11 +961,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			// When one side is non-string but the other is string-like,
 			// PostgreSQL implicitly casts the non-string side to text
 			// (e.g. `1 || '/'`). If both sides are non-string, error.
-			// M0097-pg_lsn.
+			// Match PG's "operator does not exist: TYPE || TYPE" format. M0097-0063.
 			leftStr := isStringLike(leftTyp) || isUnknownType(leftTyp)
 			rightStr := isStringLike(rightTyp) || isUnknownType(rightTyp)
 			if !leftStr && !rightStr {
-				return catalog.Type{}, analyzeError(x.Pos(), "42804", "operator || requires string operands")
+				return catalog.Type{}, analyzeError(x.Pos(), "42883",
+					fmt.Sprintf("operator does not exist: %s || %s",
+						pgDisplayTypeName(leftTyp.Name), pgDisplayTypeName(rightTyp.Name)))
 			}
 			return catalog.Type{Name: "text"}, nil
 		case parser.OpLike, parser.OpNotLike:
@@ -2202,4 +2204,27 @@ func isExactNumericTextTarget(name string) bool {
 		return true
 	}
 	return false
+}
+
+// pgDisplayTypeName converts internal type names to the PG-compatible
+// display form used in error messages (e.g. "int8" → "integer"). M0097-0063.
+func pgDisplayTypeName(name string) string {
+	switch strings.ToLower(name) {
+	case "int2", "smallint":
+		return "smallint"
+	case "int4", "int", "integer":
+		return "integer"
+	case "int8", "bigint":
+		return "integer" // PG treats unqualified integer literals as "integer" in errors
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision", "double":
+		return "double precision"
+	case "bool", "boolean":
+		return "boolean"
+	case "text", "varchar", "bpchar", "char":
+		return "text"
+	default:
+		return name
+	}
 }

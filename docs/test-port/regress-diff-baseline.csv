@@ -49,7 +49,7 @@ tidrangescan,171,failed
 truncate,311,failed
 plancache,196,failed
 create_procedure,324,failed
-text,338,failed
+text,0,pass
 enum,325,failed
 equivclass,0,pass
 xid,404,failed
