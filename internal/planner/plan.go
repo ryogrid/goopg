@@ -510,6 +510,11 @@ type IndexOnlyScan struct {
 	Table   *catalog.Table
 	Index   *catalog.Index
 	Key     Expr
+	// Keys mirrors IndexScan.Keys: a full multi-column equality probe
+	// (one Expr per Index.Columns entry, in declared order). When set,
+	// takes priority over Key. Carries the M0054-0006 composite probe
+	// across IOS promotion so multi-column equality stays index-only.
+	Keys    []Expr
 	LowKey  Expr
 	HighKey Expr
 	// Covered is the slice of catalog.Column entries that the output schema

@@ -58,7 +58,23 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	}
 
 	var loBytes, hiBytes []byte
-	if o.plan.Key != nil {
+	switch {
+	case len(o.plan.Keys) > 0:
+		// Full multi-column equality probe (M0054-0006 composite),
+		// preserved through IOS promotion by M0116-0003. The planner
+		// guarantees len(Keys) == len(Index.Columns), so the encoded
+		// probe addresses one B-tree leaf entry exactly — no suffix
+		// padding required.
+		key, ok, err := o.lookupKeys()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		loBytes = key
+		hiBytes = key
+	case o.plan.Key != nil:
 		key, ok, err := o.lookupKey()
 		if err != nil {
 			return err
@@ -71,7 +87,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		if len(o.plan.Index.Columns) > 1 {
 			hiBytes = appendCompositeUpperPadding(key)
 		}
-	} else {
+	default:
 		lo, hi, ok, err := o.lookupRangeBounds()
 		if err != nil {
 			return err
@@ -90,9 +106,11 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		// Fast path: ALL_VISIBLE → decode from key, zero heap reads.
 		if ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block) {
 			row, err := o.decodeRowFromKey(key)
-			if err == nil {
-				o.rows = append(o.rows, row)
+			if err != nil {
+				return false, &ExecError{Code: "XX000", Pos: o.plan.Pos(),
+					Message: fmt.Sprintf("IOS decode: %v", err)}
 			}
+			o.rows = append(o.rows, row)
 			return true, nil
 		}
 
@@ -178,18 +196,34 @@ func (o *indexOnlyScanOp) decodeRowFromKey(key []byte) (Row, error) {
 // the Datum plus the number of bytes consumed. Used by the multi-column path.
 func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 	typeName := col.Type.Name
+	// Fixed-width branches must slice `key` to the type's exact byte
+	// width before delegating — btree.DecodeInt4 / DecodeInt8 enforce
+	// `len(b) == width`, which fails when the multi-column loop passes
+	// the still-trailing remainder of a composite key.
 	switch {
 	case isInt4Type(typeName):
-		v, err := btree.DecodeInt4(key)
+		if len(key) < 4 {
+			return NullDatum, 0, fmt.Errorf("btree: int4 key truncated, got %d bytes", len(key))
+		}
+		v, err := btree.DecodeInt4(key[:4])
 		return Datum{Kind: KindInt, Int: int64(v)}, 4, err
 	case isInt8Type(typeName):
-		v, err := btree.DecodeInt8(key)
+		if len(key) < 8 {
+			return NullDatum, 0, fmt.Errorf("btree: int8 key truncated, got %d bytes", len(key))
+		}
+		v, err := btree.DecodeInt8(key[:8])
 		return Datum{Kind: KindInt, Int: v}, 8, err
 	case isFloat8Type(typeName):
-		v, err := btree.DecodeFloat8(key)
+		if len(key) < 8 {
+			return NullDatum, 0, fmt.Errorf("btree: float8 key truncated, got %d bytes", len(key))
+		}
+		v, err := btree.DecodeFloat8(key[:8])
 		return NewStringDatum(strconv.FormatFloat(v, 'g', -1, 64)), 8, err
 	case isTimestampType(typeName):
-		v, err := btree.DecodeTimestamp(key)
+		if len(key) < 8 {
+			return NullDatum, 0, fmt.Errorf("btree: timestamp key truncated, got %d bytes", len(key))
+		}
+		v, err := btree.DecodeTimestamp(key[:8])
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
 		return NewTimeDatum(ts), 8, err
 	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName),
@@ -263,6 +297,45 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 	default:
 		return NullDatum, fmt.Errorf("index-only scan: unsupported key type %q for key decode", typeName)
 	}
+}
+
+// lookupKeys evaluates Keys[i] in declared order and concatenates the
+// per-column B-tree encodings, mirroring indexScanOp.lookupKeys. Carries
+// the M0054-0006 composite probe through IOS promotion (M0116-0003).
+// Any NULL component short-circuits to ok=false — equality on NULL is
+// unknown, so the probe correctly produces zero rows.
+func (o *indexOnlyScanOp) lookupKeys() ([]byte, bool, error) {
+	if len(o.plan.Keys) != len(o.plan.Index.Columns) {
+		return nil, false, &ExecError{
+			Code: "XX000", Pos: o.plan.Pos(),
+			Message: fmt.Sprintf("indexOnlyScanOp.lookupKeys: planner supplied %d keys for index %q with %d columns",
+				len(o.plan.Keys), o.plan.Index.Name, len(o.plan.Index.Columns)),
+		}
+	}
+	var probe []byte
+	for i, ke := range o.plan.Keys {
+		v, err := evalExpr(ke, nil, o.ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		if v.IsNull() {
+			return nil, false, nil
+		}
+		colName := o.plan.Index.Columns[i]
+		col, found := o.ctx.Catalog.LookupColumn(o.plan.Table, colName)
+		if !found {
+			return nil, false, &ExecError{
+				Code: "XX000", Pos: o.plan.Pos(),
+				Message: fmt.Sprintf("indexed column %q not found on table %q", colName, o.plan.Table.Name),
+			}
+		}
+		segment, encErr := encodeBTreeKeyForColumn(v, col, ke.Pos())
+		if encErr != nil {
+			return nil, false, encErr
+		}
+		probe = append(probe, segment...)
+	}
+	return probe, true, nil
 }
 
 // lookupKey evaluates the equality probe key expression.

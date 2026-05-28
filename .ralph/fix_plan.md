@@ -3981,10 +3981,42 @@ back to heap fetches even when the Visibility Map could allow a pure index scan.
       blocked composite indexes (`len(idxScan.Index.Columns) != 1`). The
       existing coverage-check loop already handles multi-column correctly.
 
-- [ ] **M0116-0003** — Integration tests
-      NOT DONE: named tests (`TestIOS_CompositeInt4Int4`, `TestIOS_CompositeInt4Text`,
-      `TestIOS_HeapFallback`, `TestIOS_3Columns`) were not written. Multi-column
-      path is exercised implicitly by TPC-H lineitem/partsupp queries.
+- [x] **M0116-0003** — Integration tests
+      **COMPLETE 2026-05-29.** Four named tests added to
+      `internal/executor/m0116_multicol_indexonly_test.go`:
+      `TestIOS_CompositeInt4Int4`, `TestIOS_CompositeInt4Text`,
+      `TestIOS_HeapFallback`, `TestIOS_3Columns` — all PASS.
+      Each builds a real heap+index pair, VACUUMs to set ALL_VISIBLE, asserts
+      the planner picks `IndexOnlyScan` (or `IndexScan` for HeapFallback) by
+      walking the plan tree, and verifies the returned rows decode correctly
+      from the composite B-tree key bytes.
+      The new tests uncovered three latent runtime gaps that M0116-0001 /
+      M0116-0002 had not exercised; all three are fixed in the same loop so
+      multi-column IOS is genuinely end-to-end correct:
+      (a) `internal/executor/operators_indexonly.go` `decodeIndexKeyColumn`
+          dispatched the int4 / int8 / timestamp branches to the strict
+          `btree.DecodeInt4/8` decoders, which require `len(b) == width`. From
+          the multi-column loop they received the still-trailing remainder of
+          the composite key (8 bytes for the leading int4 column on a
+          `(int4, int4)` key) and rejected every row. Fix: slice `key[:width]`
+          per fixed-width branch and bounds-check before delegating.
+      (b) `internal/planner/planner.go` `tryPromoteIndexOnlyScan` copied
+          `idxScan.Key` / `LowKey` / `HighKey` but dropped `idxScan.Keys` (the
+          M0054-0006 composite probe vector). After promotion the IOS lost the
+          ability to encode a full multi-column equality probe. Fix: added
+          `Keys []Expr` to `IndexOnlyScan` (`internal/planner/plan.go`), copied
+          it through promotion, and taught `indexOnlyScanOp.Open` a
+          `len(o.plan.Keys) > 0` branch with a new `lookupKeys` helper
+          mirroring `indexScanOp.lookupKeys`.
+      (c) `indexOnlyScanOp` scan callback silently swallowed
+          `decodeRowFromKey` errors (`if err == nil { append }`), so any
+          decode failure looked like a missing row instead of a server error.
+          Replaced with proper XX000 propagation so future decode bugs surface
+          loudly rather than corrupt result sets.
+      Design doc updated: `docs/design/mvcc-optimize/0116-0001-multi-column-ios.md`
+      §5.1 (Runtime gaps uncovered by tests). Regression: full
+      `go test ./internal/executor/ ./internal/planner/` PASS modulo the
+      pre-existing `TestToastByteaRoundTrip` flake noted at M0115-0006.
 
 - [ ] **M0116-0004** — Regression check
       PARTIAL: `go test ./internal/executor/... -run TestIndexOnly` passes for

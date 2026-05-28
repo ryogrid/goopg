@@ -6566,6 +6566,7 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 		Table:   idxScan.Table,
 		Index:   idxScan.Index,
 		Key:     idxScan.Key,
+		Keys:    idxScan.Keys,
 		LowKey:  idxScan.LowKey,
 		HighKey: idxScan.HighKey,
 		Covered: covered,
