@@ -2871,6 +2871,80 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		return nil
 	}
 
+	// DROP CAST (fromType AS toType) — PG error: "cast from type X to type Y does not exist".
+	// M0097-0071. Validate source/target types; generate PG-style error message.
+	if objType == "cast" && len(s.CastTypes) == 2 {
+		fromType := s.CastTypes[0]
+		toType := s.CastTypes[1]
+		// Canonicalize type names (int → integer, etc.).
+		fromCanon := dropCompatCanonicalType(fromType)
+		toCanon := dropCompatCanonicalType(toType)
+		// Validate unknown types only when they don't look like schema-qualified names.
+		if !strings.Contains(fromType, ".") && fromCanon == "" {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", fromType))
+				return nil
+			}
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", fromType)}
+		}
+		if !strings.Contains(toType, ".") && toCanon == "" {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", toType))
+				return nil
+			}
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", toType)}
+		}
+		if fromCanon == "" {
+			fromCanon = fromType
+		}
+		if toCanon == "" {
+			toCanon = toType
+		}
+		msg := fmt.Sprintf("cast from type %s to type %s does not exist", fromCanon, toCanon)
+		if s.IfExists {
+			o.ctx.AddNotice(msg + ", skipping")
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: msg}
+	}
+
+	// DROP OPERATOR CLASS/FAMILY name USING method — M0097-0071.
+	// PG validates the access method first; if unknown, always errors (even with IF EXISTS).
+	// Known access methods: btree, hash, gist, gin, spgist, brin, heap.
+	if objType == "operator class" || objType == "operator family" {
+		knownAMs := map[string]bool{
+			"btree": true, "hash": true, "gist": true,
+			"gin": true, "spgist": true, "brin": true, "heap": true,
+		}
+		method := strings.ToLower(s.UsingMethod)
+		if method != "" && !knownAMs[method] {
+			// Unknown access method → ERROR regardless of IF EXISTS.
+			return &ExecError{
+				Code:    "42704",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("access method %q does not exist", s.UsingMethod),
+			}
+		}
+		// Known or missing access method.
+		if len(s.Names) > 0 {
+			name := s.Names[0]
+			var msg string
+			if method != "" {
+				msg = fmt.Sprintf("%s %q does not exist for access method %q", s.ObjType, name.String(), s.UsingMethod)
+			} else {
+				msg = fmt.Sprintf("%s %q does not exist", s.ObjType, name.String())
+			}
+			if s.IfExists {
+				o.ctx.AddNotice(msg + ", skipping")
+				return nil
+			}
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: msg}
+		}
+		return nil
+	}
+
 	if s.IfExists {
 		// Emit NOTICE for each name (we don't know if they exist).
 		// The test driver compares against expected NOTICEs.

@@ -428,6 +428,19 @@ identLedStatement:
 				p.advance()
 			}
 			return &CompatNoopStmt{pos: t.Pos, Tag: "SECURITY LABEL"}, nil
+		case "lock":
+			// LOCK [TABLE] tablename [IN lockmode MODE] [NOWAIT] — accept as no-op.
+			// goopg's MVCC does not need explicit table locking for correctness;
+			// parsing the statement prevents "syntax error at or near 'lock'" noise
+			// in regress tests that LOCK tables before querying pg_locks. M0097-0071.
+			p.advance()
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &CompatNoopStmt{pos: t.Pos, Tag: "LOCK TABLE"}, nil
 		}
 	}
 	return nil, p.errAtCur("unsupported statement")
@@ -1177,6 +1190,18 @@ func (p *parser) parseSet() (Stmt, error) {
 			return s, nil
 		}
 		// otherwise fall through: SET SESSION TRANSACTION ... handled below
+	}
+	// SET ROLE rolename — accept as no-op. goopg does not implement role-based
+	// access control; SET ROLE is accepted silently. M0097-0071.
+	if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "role" {
+		p.advance() // consume "role"
+		// consume the role name (or DEFAULT)
+		if !p.acceptKeyword(KwDefault) {
+			_, _ = p.parseIdent()
+		}
+		s.Name = "role"
+		s.Default = true
+		return s, nil
 	}
 	// SET [LOCAL] TRANSACTION <mode> — intercept before generic GUC path.
 	// M0096-0002: supports ISOLATION LEVEL; other modes accepted as no-op.

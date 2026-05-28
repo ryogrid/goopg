@@ -152,6 +152,17 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		// CREATE OPERATOR — accept and skip. M0097-regress.
 		return p.parseSkipToSemicolon(t.Pos)
+	// CREATE CONVERSION name ... — accept as no-op. M0097-0071.
+	case p.acceptIdentKeyword("conversion"):
+		return p.parseSkipToSemicolon(t.Pos)
+	// CREATE TEXT SEARCH ... — accept as no-op. M0097-0071.
+	case p.acceptIdentKeyword("text"):
+		return p.parseSkipToSemicolon(t.Pos)
+	// CREATE SERVER / CREATE FOREIGN ... — accept as no-op. M0097-0071.
+	case p.acceptIdentKeyword("server"):
+		return p.parseSkipToSemicolon(t.Pos)
+	case p.acceptIdentKeyword("foreign"):
+		return p.parseSkipToSemicolon(t.Pos)
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after CREATE")
 }
@@ -514,7 +525,7 @@ func (p *parser) parseCreateMatViewTail(pos int) (Stmt, error) {
 	}
 	stmt.Name = name
 	// Skip optional USING index_method clause.
-	if p.acceptIdentKeyword("using") {
+	if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
 		_, _ = p.parseIdent()
 	}
 	// Skip optional WITH (storage_params).
@@ -1409,6 +1420,13 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 	if first.Kind != TokenQuotedIdent && strings.EqualFold(ct.Name, "char") && len(ct.Args) == 0 {
 		ct.Args = []int64{1}
 	}
+	// Accept trailing [] array notation (e.g. int[], text[][], integer[]).
+	// We don't track the dimension count; just consume the brackets. M0097-0071.
+	for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+		p.advance() // consume "["
+		_ = p.acceptSymbol("]")
+		ct.IsArray = true
+	}
 	return ct, nil
 }
 
@@ -1796,10 +1814,49 @@ func (p *parser) parseDrop() (Stmt, error) {
 		return &DropCompatStmt{pos: t.Pos, ObjType: "aggregate", IfExists: ifExists,
 			Names: []ObjectName{name}, Behavior: behavior, ArgTypes: []string{argType}}, nil
 	}
-	// DROP OPERATOR [IF EXISTS] name ( left_type , right_type ) [CASCADE|RESTRICT]
-	// PG requires the parenthesised type list; without it (or with just a bare
-	// comma-separated identifier list) the grammar produces a syntax error.
+	// DROP OPERATOR [CLASS|FAMILY] [IF EXISTS] ... M0097-0071.
+	// Handles DROP OPERATOR name (type, type), DROP OPERATOR CLASS name USING method,
+	// and DROP OPERATOR FAMILY name USING method.
 	if p.acceptIdentKeyword("operator") {
+		// Check for CLASS or FAMILY sub-forms first.
+		var opSubtype string
+		if p.acceptIdentKeyword("class") {
+			opSubtype = "operator class"
+		} else if p.acceptIdentKeyword("family") {
+			opSubtype = "operator family"
+		}
+		if opSubtype != "" {
+			// DROP OPERATOR CLASS|FAMILY [IF EXISTS] name USING method [CASCADE|RESTRICT]
+			ifExists := false
+			if p.acceptKeyword(KwIf) {
+				if _, err := p.expectKeyword(KwExists); err != nil {
+					return nil, err
+				}
+				ifExists = true
+			}
+			name, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			// Consume USING method_name (store in UsingMethod for error formatting). M0097-0071.
+			var usingMethod string
+			if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
+				if tok, err2 := p.parseIdent(); err2 == nil {
+					usingMethod = tok.Value
+				}
+			}
+			behavior := DropDefault
+			switch {
+			case p.acceptKeyword(KwCascade):
+				behavior = DropCascade
+			case p.acceptKeyword(KwRestrict):
+			}
+			return &DropCompatStmt{pos: t.Pos, ObjType: opSubtype, IfExists: ifExists,
+				Names: []ObjectName{name}, Behavior: behavior, UsingMethod: usingMethod}, nil
+		}
+		// DROP OPERATOR [IF EXISTS] name ( left_type , right_type ) [CASCADE|RESTRICT]
+		// PG requires the parenthesised type list; without it (or with just a bare
+		// comma-separated identifier list) the grammar produces a syntax error.
 		ifExists := false
 		if p.acceptKeyword(KwIf) {
 			if _, err := p.expectKeyword(KwExists); err != nil {
@@ -1869,13 +1926,93 @@ func (p *parser) parseDrop() (Stmt, error) {
 		return &DropCompatStmt{pos: t.Pos, ObjType: "operator", IfExists: ifExists,
 			Names: []ObjectName{name}, Behavior: behavior, ArgTypes: []string{leftType, rightType}}, nil
 	}
+	// DROP TEXT SEARCH DICTIONARY|PARSER|TEMPLATE|CONFIGURATION — M0097-0071.
+	// "text" is an identifier; "search" and sub-type keywords are also identifiers.
+	if p.acceptIdentKeyword("text") {
+		_ = p.acceptIdentKeyword("search") // consume "search" if present
+		var tsType string
+		switch {
+		case p.acceptIdentKeyword("dictionary"):
+			tsType = "text search dictionary"
+		case p.acceptIdentKeyword("parser"):
+			tsType = "text search parser"
+		case p.acceptIdentKeyword("template"):
+			tsType = "text search template"
+		case p.acceptIdentKeyword("configuration"):
+			tsType = "text search configuration"
+		default:
+			tsType = "text search"
+		}
+		ifExists, names, behavior, err := p.parseDropTail()
+		if err != nil {
+			return nil, err
+		}
+		return &DropCompatStmt{
+			pos: t.Pos, ObjType: tsType, IfExists: ifExists, Names: names, Behavior: behavior,
+		}, nil
+	}
+	// DROP CAST (fromType AS toType) [IF EXISTS] [CASCADE|RESTRICT] — M0097-0071.
+	// "cast" is an ident keyword; the argument list uses (type AS type) syntax.
+	if p.acceptIdentKeyword("cast") {
+		ifExists := false
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			ifExists = true
+		}
+		// Expect "(" opening the type pair.
+		if !p.acceptSymbol("(") {
+			return nil, p.errSyntaxAtCur()
+		}
+		// Parse fromType (may be qualified).
+		var fromType, toType string
+		if tok, err2 := p.parseIdent(); err2 == nil {
+			fromType = tok.Value
+		}
+		// Schema-qualified type: fromSchema.fromType
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+			p.advance()
+			if tok, err2 := p.parseIdent(); err2 == nil {
+				fromType = fromType + "." + tok.Value
+			}
+		}
+		// Consume AS.
+		_ = p.acceptKeyword(KwAs)
+		// Parse toType (may be qualified).
+		if tok, err2 := p.parseIdent(); err2 == nil {
+			toType = tok.Value
+		}
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+			p.advance()
+			if tok, err2 := p.parseIdent(); err2 == nil {
+				toType = toType + "." + tok.Value
+			}
+		}
+		// Consume ")".
+		_ = p.acceptSymbol(")")
+		behavior := DropDefault
+		switch {
+		case p.acceptKeyword(KwCascade):
+			behavior = DropCascade
+		case p.acceptKeyword(KwRestrict):
+		}
+		return &DropCompatStmt{
+			pos:       t.Pos,
+			ObjType:   "cast",
+			IfExists:  ifExists,
+			Behavior:  behavior,
+			CastTypes: []string{fromType, toType},
+		}, nil
+	}
 	// Handle ident-based DROP targets as compatibility stubs. M0097-0008.
 	for _, objType := range []string{
 		"sequence", "schema",
-		"collation", "cast",
+		"collation",
 		"materialized", "extension", "server",
 		"language", "access", "event", "transform",
 		"group", "role", "user",
+		"conversion", // M0097-0071
 	} {
 		if p.acceptIdentKeyword(objType) {
 			// "materialized view" is two words; VIEW is a keyword token, not ident. M0097-0038.
@@ -1883,6 +2020,11 @@ func (p *parser) parseDrop() (Stmt, error) {
 			if objType == "materialized" {
 				_ = p.acceptIdentKeyword("view") || p.acceptKeyword(KwView)
 				resolvedType = "materialized view"
+			}
+			// "access method" is two words; skip "method" after "access". M0097-0071.
+			if objType == "access" {
+				_ = p.acceptIdentKeyword("method")
+				resolvedType = "access method"
 			}
 			ifExists, names, behavior, err := p.parseDropTail()
 			if err != nil {

@@ -832,10 +832,11 @@ func (s *DeleteStmt) stmtNode() {}
 // `numeric(10,2)` carries [10, 2]. Schema-qualified type names
 // (e.g. `pg_catalog.int4`) populate Schema.
 type ColumnType struct {
-	pos    int
-	Schema string
-	Name   string
-	Args   []int64
+	pos     int
+	Schema  string
+	Name    string
+	Args    []int64
+	IsArray bool // true if type has [] array suffix (e.g. int[], text[]); M0097-0071
 }
 
 func (c ColumnType) Pos() int { return c.pos }
@@ -1129,6 +1130,11 @@ type DropCompatStmt struct {
 	// ArgTypes holds parsed argument types for AGGREGATE and OPERATOR.
 	// AGGREGATE: [argtype]; OPERATOR: [leftType, rightType] ("" = missing/NONE).
 	ArgTypes []string
+	// UsingMethod holds the access method name for DROP OPERATOR CLASS/FAMILY.
+	// E.g. "btree", "hash", "gist". M0097-0071.
+	UsingMethod string
+	// CastTypes holds [fromType, toType] for DROP CAST (fromType AS toType). M0097-0071.
+	CastTypes []string
 }
 
 // CreateAggregateStmt is a minimal representation of CREATE AGGREGATE used to

@@ -30,9 +30,9 @@ expressions,0,pass
 select_into,0,pass
 prepare,0,pass
 dbsize,0,pass
-lock,151,failed
+lock,118,failed
 prepared_xacts,172,failed
-drop_if_exists,175,failed
+drop_if_exists,156,failed
 advisory_lock,0,pass
 case,0,pass
 uuid,0,pass
@@ -65,9 +65,9 @@ create_function_sql,525,failed
 sequence,396,failed
 matview,272,failed
 transactions,559,failed
-create_table_like,179,failed
+create_table_like,178,failed
 limit,0,pass
-create_table,429,failed
+create_table,427,failed
 guc,748,failed
 update,669,failed
 misc_functions,602,failed
@@ -81,7 +81,7 @@ join_hash,150,failed
 copy2,919,failed
 select,68,failed
 int8,613,failed
-domain,1015,failed
+domain,1009,failed
 jsonpath,940,failed
 indexing,972,failed
 float8,1025,failed
