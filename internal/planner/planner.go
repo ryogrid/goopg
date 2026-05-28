@@ -1649,6 +1649,35 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 			schema:    mergedSchema,
 			Lateral:   nodeReferencesOuter(rightNode),
 		}
+		// M0097-0060: For FULL JOIN USING / FULL JOIN NATURAL, populate
+		// UsingLeftCols/UsingRightCols so the executor can coalesce USING
+		// column values from the right side into the left-column positions
+		// when the left side has no matching row (right-only FULL JOIN row).
+		if joinType == JoinTypeFull && len(usingCols) > 0 {
+			leftW := len(leftCtx.schema)
+			for _, uc := range usingCols {
+				// Find left-side column index (first matching name).
+				leftIdx := -1
+				for i, sc := range leftCtx.schema {
+					if strings.EqualFold(sc.Name, uc) {
+						leftIdx = i
+						break
+					}
+				}
+				// Find right-side column index (relative to merged schema).
+				rightIdx := -1
+				for i, c := range rightBinding.table.Columns {
+					if strings.EqualFold(c.Name, uc) {
+						rightIdx = leftW + i
+						break
+					}
+				}
+				if leftIdx >= 0 && rightIdx >= 0 {
+					jn.UsingLeftCols = append(jn.UsingLeftCols, leftIdx)
+					jn.UsingRightCols = append(jn.UsingRightCols, rightIdx)
+				}
+			}
+		}
 		// Pick a specialised equality join algorithm when the
 		// predicate decomposes into disjoint-side keys:
 		//   - INNER / LEFT: hash join (M0003 rule); cost-driven
@@ -1658,6 +1687,24 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 		// CROSS and non-equality predicates stay on nested-loop.
 		leftWidth := len(leftCtx.schema)
 		if lk, rk, ok := splitEqualityForHash(pred, leftWidth); ok {
+			// M0097-0060: Clone the ColumnRefs returned by
+			// splitEqualityForHash before assigning to LeftKey/RightKey.
+			// splitEqualityForHash returns the BinaryOp's inner Left/Right
+			// pointers directly.  reresolveJoinByName's predRebind later
+			// walks those same Predicate ColumnRef objects and may mutate
+			// their Index (when the name is ambiguous on the intended side
+			// it falls back to the opposite side).  Without cloning, that
+			// mutation corrupts LeftKey/RightKey through the shared pointer,
+			// causing chained NATURAL JOIN / USING queries to hash-probe on
+			// the wrong column (0 rows).
+			if cr, ok2 := lk.(*ColumnRef); ok2 {
+				clone := *cr
+				lk = &clone
+			}
+			if cr, ok2 := rk.(*ColumnRef); ok2 {
+				clone := *cr
+				rk = &clone
+			}
 			jn.LeftKey = lk
 			jn.RightKey = rk
 			switch jn.Type {
@@ -3452,6 +3499,19 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			args = append(args, pa)
 		}
 		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star}, nil
+	case *parser.ArrayConstructorExpr:
+		// ARRAY[e1, e2, ...] after GROUP BY — resolve each element
+		// through the post-aggregate surface (so group-by columns
+		// resolve correctly) and emit as array_construct. M0097-0060.
+		args := make([]Expr, len(x.Elements))
+		for i, el := range x.Elements {
+			r, err := resolveExprAfterAggregate(el, agg)
+			if err != nil {
+				return nil, err
+			}
+			args[i] = r
+		}
+		return &FuncCall{pos: x.Pos(), Name: "array_construct", Args: args}, nil
 	case *parser.StarExpr:
 		return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
 	}

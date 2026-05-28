@@ -562,6 +562,16 @@ type Join struct {
 		LeftKey   Expr // populated when Algo == JoinAlgoHash
 		RightKey  Expr
 		BuildLeft bool // hash join: build on left input instead of right
+		// UsingLeftCols / UsingRightCols hold the ABSOLUTE column
+		// indices (relative to the merged schema) of the USING
+		// columns from the left and right sides respectively.
+		// Set only for FULL JOIN USING / FULL JOIN NATURAL. The
+		// executor uses them to coalesce unmatched right-row output:
+		// when the left side is NULL (right-only row), each
+		// UsingLeftCols[i] is set to the value at UsingRightCols[i].
+		// M0097-0060.
+		UsingLeftCols  []int
+		UsingRightCols []int
 		// Lateral marks the right child as referencing the left
 		// child's columns through a FROM-clause LATERAL SRF (M0103-0008).
 		// The executor must drive the right per-outer-row, binding the

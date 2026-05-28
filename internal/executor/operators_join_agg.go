@@ -253,10 +253,34 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 			if rightMatched[j] {
 				continue
 			}
-			o.rows = append(o.rows, concatRows(nullLeft, r))
+			// M0097-0060: FULL JOIN USING coalescing. For unmatched
+			// right rows the left side is all NULL; copy each USING
+			// column value from the right position to the left position
+			// so `SELECT *` sees COALESCE(left.col, right.col) = right.col.
+			merged := concatRows(nullLeft, r)
+			for k, lIdx := range o.plan.UsingLeftCols {
+				rIdx := o.plan.UsingRightCols[k]
+				if rIdx < len(merged) {
+					merged[lIdx] = merged[rIdx]
+				}
+			}
+			o.rows = append(o.rows, merged)
 		}
 	}
 	return nil
+}
+
+// coalesceUsingRow applies FULL JOIN USING coalescing: for each USING
+// column pair, copy the right-side value into the left-side position
+// so star-expansion sees the correct non-NULL value for unmatched right
+// rows. Modifies merged in place. M0097-0060.
+func (o *joinOp) coalesceUsingRow(merged Row) {
+	for k, lIdx := range o.plan.UsingLeftCols {
+		rIdx := o.plan.UsingRightCols[k]
+		if lIdx < len(merged) && rIdx < len(merged) {
+			merged[lIdx] = merged[rIdx]
+		}
+	}
 }
 
 // openLazyHashJoin builds a hash table from the build side and sets
@@ -420,7 +444,9 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 			i++
 		case cmp > 0:
 			if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-				o.rows = append(o.rows, concatRows(nullLeft, rightKeyed[j].row))
+				merged := concatRows(nullLeft, rightKeyed[j].row)
+				o.coalesceUsingRow(merged)
+				o.rows = append(o.rows, merged)
 			}
 			j++
 		default:
@@ -461,7 +487,9 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 	}
 	for ; j < len(rightKeyed); j++ {
 		if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-			o.rows = append(o.rows, concatRows(nullLeft, rightKeyed[j].row))
+			merged := concatRows(nullLeft, rightKeyed[j].row)
+			o.coalesceUsingRow(merged)
+			o.rows = append(o.rows, merged)
 		}
 	}
 
@@ -472,7 +500,9 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 	}
 	if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
 		for _, r := range rightNull {
-			o.rows = append(o.rows, concatRows(nullLeft, r))
+			merged := concatRows(nullLeft, r)
+			o.coalesceUsingRow(merged)
+			o.rows = append(o.rows, merged)
 		}
 	}
 
