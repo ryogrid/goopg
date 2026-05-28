@@ -364,11 +364,20 @@ func (p *parser) parseUpdate() (Stmt, error) {
 		stmt.From = from
 	}
 	if p.acceptKeyword(KwWhere) {
-		w, err := p.parseExpr()
-		if err != nil {
-			return nil, err
+		// WHERE CURRENT OF cursor — positioned update. M0097-0069.
+		if p.acceptIdentKeyword("current") && p.acceptKeyword(KwOf) {
+			nameToken := p.cur()
+			if nameToken.Kind == TokenIdent || nameToken.Kind == TokenKeyword {
+				stmt.CurrentOf = nameToken.Value
+				p.advance()
+			}
+		} else {
+			w, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Where = w
 		}
-		stmt.Where = w
 	}
 	if p.acceptKeyword(KwReturning) {
 		ret, err := p.parseTargetList()
@@ -439,11 +448,20 @@ func (p *parser) parseDelete() (Stmt, error) {
 	}
 	stmt := &DeleteStmt{pos: t.Pos, Target: target}
 	if p.acceptKeyword(KwWhere) {
-		w, err := p.parseExpr()
-		if err != nil {
-			return nil, err
+		// WHERE CURRENT OF cursor — positioned delete. M0097-0069.
+		if p.acceptIdentKeyword("current") && p.acceptKeyword(KwOf) {
+			nameToken := p.cur()
+			if nameToken.Kind == TokenIdent || nameToken.Kind == TokenKeyword {
+				stmt.CurrentOf = nameToken.Value
+				p.advance()
+			}
+		} else {
+			w, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Where = w
 		}
-		stmt.Where = w
 	}
 	if p.acceptKeyword(KwReturning) {
 		ret, err := p.parseTargetList()

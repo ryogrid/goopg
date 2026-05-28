@@ -37,11 +37,11 @@ advisory_lock,0,pass
 case,0,pass
 uuid,0,pass
 select_distinct_on,0,passed
-partition_info,185,failed
+partition_info,234,failed
 timetz,0,pass
 pg_lsn,0,pass
 misc,260,failed
-tidscan,84,failed
+tidscan,52,failed
 temp,281,failed
 txid,287,failed
 index_including,257,failed
@@ -87,7 +87,7 @@ indexing,972,failed
 float8,1025,failed
 rowtypes,1030,failed
 constraints,901,failed
-portals,1089,failed
+portals,763,failed
 union,0,passed
 date,1164,failed
 copy,1257,failed
@@ -101,10 +101,10 @@ rangetypes,1526,failed
 incremental_sort,1560,failed
 interval,1719,failed
 create_view,1864,failed
-rangefuncs,1911,failed
+rangefuncs,1923,failed
 strings,2207,failed
 timestamp,2201,failed
-plpgsql,2053,failed
+plpgsql,2312,failed
 json,2152,failed
 aggregates,1377,failed
 subselect,882,failed

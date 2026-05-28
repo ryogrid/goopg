@@ -1735,33 +1735,77 @@ func (p *parser) parseDeclareCursor() (Stmt, error) {
 	return &DeclareCursorStmt{pos: pos, Name: name, Query: query}, nil
 }
 
-// parseFetchCursor parses FETCH [FORWARD|BACKWARD] [ALL|n] [FROM|IN] cursor_name.
+// parseFetchCursor parses FETCH direction cursor_name.
+// Supports all PG directions: NEXT, PRIOR, FIRST, LAST, ABSOLUTE n,
+// RELATIVE n, FORWARD [n|ALL], BACKWARD [n|ALL], ALL, n. M0097-0069.
 func (p *parser) parseFetchCursor() (Stmt, error) {
 	pos := p.cur().Pos
 	p.advance() // consume "fetch"
 
-	count := int64(-1) // -1 = ALL
+	count := int64(1) // default: NEXT = 1
 	forward := true
 
-	// optional direction keyword
-	if p.acceptIdentKeyword("forward") {
-		forward = true
-	} else if p.acceptIdentKeyword("backward") || p.acceptIdentKeyword("prior") {
+	switch {
+	case p.acceptIdentKeyword("next"):
+		count = 1
+	case p.acceptIdentKeyword("prior"):
 		forward = false
-	}
-
-	// count: ALL or integer literal
-	if p.acceptKeyword(KwAll) {
+		count = 1
+	case p.acceptIdentKeyword("first"):
+		count = 1
+	case p.acceptIdentKeyword("last"):
+		forward = false
+		count = 1
+	case p.acceptIdentKeyword("absolute"):
+		if p.cur().Kind == TokenIntLit {
+			var err error
+			count, err = p.parseIntLit()
+			if err != nil {
+				return nil, err
+			}
+		}
+	case p.acceptIdentKeyword("relative"):
+		if p.cur().Kind == TokenIntLit {
+			var err error
+			count, err = p.parseIntLit()
+			if err != nil {
+				return nil, err
+			}
+		}
+	case p.acceptIdentKeyword("forward"):
+		if p.acceptKeyword(KwAll) {
+			count = -1
+		} else if p.cur().Kind == TokenIntLit {
+			var err error
+			count, err = p.parseIntLit()
+			if err != nil {
+				return nil, err
+			}
+		}
+	case p.acceptIdentKeyword("backward"):
+		forward = false
+		if p.acceptKeyword(KwAll) {
+			count = -1
+		} else if p.cur().Kind == TokenIntLit {
+			var err error
+			count, err = p.parseIntLit()
+			if err != nil {
+				return nil, err
+			}
+		}
+	case p.acceptKeyword(KwAll):
 		count = -1
-	} else if p.cur().Kind == TokenIntLit {
-		var err error
-		count, err = p.parseIntLit()
-		if err != nil {
-			return nil, err
+	default:
+		if p.cur().Kind == TokenIntLit {
+			var err error
+			count, err = p.parseIntLit()
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	// FROM or IN
+	// FROM or IN (optional)
 	if !p.acceptKeyword(KwFrom) {
 		p.acceptKeyword(KwIn)
 	}

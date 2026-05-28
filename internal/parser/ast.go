@@ -802,6 +802,7 @@ type UpdateStmt struct {
 	Set       []UpdateAssign
 	From      []RangeVar // FROM-clause tables (nil when absent). M0097-0065.
 	Where     Expr       // nil when absent
+	CurrentOf string     // cursor name for WHERE CURRENT OF cursor. M0097-0069.
 	Returning []ResTarget
 }
 
@@ -818,7 +819,8 @@ type DeleteStmt struct {
 	pos       int
 	With      *WithClause
 	Target    RangeVar
-	Where     Expr // nil when absent
+	Where     Expr   // nil when absent
+	CurrentOf string // cursor name for WHERE CURRENT OF cursor. M0097-0069.
 	Returning []ResTarget
 }
 
