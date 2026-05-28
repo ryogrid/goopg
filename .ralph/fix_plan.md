@@ -1313,45 +1313,38 @@ M0097-0001 wires it up.
             pass `lateralCtx` through to `planValuesSubquery`.
         Baseline CSV updated: `select` 137→0 (`pass`).
 
-      - **Regression discovered 2026-05-29 (M0097-0074 — post-c945744c
-        regress baseline drift):** Re-running `TestPort_RegressSuite` on
-        HEAD (`f29c44e4`) shows the c945744c "121/121 pass" claim no longer
-        holds; at least 10 previously-passing cases now SKIP with the
-        following normalised diff-line counts (sorted ascending so the
-        cheapest fix sorts first):
-        - returning: 553
-        - insert: 588
-        - update: 641
-        - explain: 724
-        - subselect: 837
-        - join: 1302
-        - inherit: 1306
-        - aggregates: 1338
-        - partition_join: 1441
-        - with: 2414
-        Confirmed by running each test individually via
-        `GOOPG_REGRESS_DIFF_DIR=/tmp/regress-diffs go test -v -run
-        'TestPort_RegressSuite/(explain|insert|update|returning|with|aggregates|inherit|join|subselect|partition_join)$'
-        ./internal/testport/`. `boolean` was used as a control case and
-        still PASS, confirming the test harness itself is sane.
-        Suspect commits (only three between c945744c and HEAD): `26cb3148`
-        (pg_available_wal_summaries SRF), `9b915fad` (EPQ CTID stamping +
-        isolation EXPLAIN normalization), `f29c44e4` (mvcc
-        HeapXminCommitted bypass skips snapshot range check). The MVCC and
-        EPQ-stamping changes are the most plausible cause for the broad
-        DML/aggregate spread. Baseline CSV + upstream-regress-coverage.md
-        refreshed to reflect reality (the 10 rows above flipped to
-        `failed`); broader sweep across the remaining 110+ cases is
-        deferred to the next loop (suite was running >13 min and got
-        cancelled). Umbrella tasks M0097-0020/0021/0023/0025/0026/0027/0028
-        CANNOT be marked complete yet because their DoD depends on these
-        cases passing. **Action for next loop:** bisect across the three
-        suspect commits (likely `f29c44e4` based on the
-        DML/aggregate/inherit blast radius) to identify which one broke
-        snapshot visibility, then either revert with a regression test, or
-        fix forward + add a regression test that covers the broken case.
-        Do NOT mark any M0097-002X umbrella complete until the full suite
-        is re-verified green.
+      - **Bisect resolved 2026-05-29 (M0097-0074 follow-up — false
+        regression):** The "regression" framing in the prior note was
+        wrong. Bisected by checking out `c945744c` in a separate worktree
+        and re-running all 10 cases (returning, insert, update, explain,
+        subselect, join, inherit, aggregates, partition_join, with). At
+        `c945744c` every one of them produces an IDENTICAL diff-line count
+        to HEAD (553/588/641/724/837/1302/1306/1338/1441/2414 — exact
+        match), and a byte-level `diff` of the actual outputs at the two
+        commits only differs in the embedded `psql:/tmp/...` tempfile
+        path. Therefore the three commits between c945744c and HEAD
+        (`26cb3148`, `9b915fad`, `f29c44e4`) caused NO behavioural
+        regression in `TestPort_RegressSuite`. The MVCC fix in `f29c44e4`
+        and the EPQ-stamping work in `9b915fad` stay as-is; no revert.
+        Root cause of the false alarm: M0097-0073's sweep claim
+        ("121/121 pass") was a measurement error — the 10 cases listed
+        above have been failing all along (probably because the sweep
+        script ran cases without the diff-emission path active and only
+        counted `regress_suite_test.go:115` SKIP exits as PASS, mis-
+        characterising every defer-skip as a pass). The refreshed
+        baseline CSV from the prior loop (rows flipped to `failed`) is
+        the accurate state and stays. Umbrella tasks
+        M0097-0020/0021/0023/0025/0026/0027/0028 remain blocked on real
+        feature work for these 10 cases (see the per-case diff samples in
+        `/tmp/regress-diffs-head` for the actual failure modes —
+        `returning` for instance shows missing `i.f1` join values and
+        UPDATE … RETURNING returning 0 rows). **Next-loop action:** pick
+        the cheapest failing case from the list and start a real fix
+        (recommend `returning` 553 diff lines), routed through the
+        appropriate umbrella sub-milestone. Do NOT re-bisect the three
+        suspect commits — they are exonerated. Do NOT mark any
+        M0097-002X umbrella complete until the full suite is re-verified
+        green.
 
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:
