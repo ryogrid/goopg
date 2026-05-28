@@ -789,16 +789,19 @@ func (a UpdateAssign) Pos() int { return a.pos }
 
 // UpdateStmt — `[WITH ...] UPDATE target SET col = expr [, …]
 //
-//	[WHERE expr] [RETURNING target_list]`. FROM-clause joins in
+//	[FROM from_list] [WHERE expr] [RETURNING target_list]`.
 //
-// UPDATE are deferred. The optional `With` field (M0016-0001) is
-// nil when no WITH clause precedes the UPDATE.
+// The optional `With` field (M0016-0001) is nil when no WITH clause
+// precedes the UPDATE. The optional `From` field (M0097-0065) holds
+// the FROM-clause tables that provide additional columns for SET and
+// WHERE expressions (PostgreSQL non-standard extension).
 type UpdateStmt struct {
 	pos       int
 	With      *WithClause
 	Target    RangeVar
 	Set       []UpdateAssign
-	Where     Expr // nil when absent
+	From      []RangeVar // FROM-clause tables (nil when absent). M0097-0065.
+	Where     Expr       // nil when absent
 	Returning []ResTarget
 }
 

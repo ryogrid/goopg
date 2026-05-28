@@ -737,7 +737,30 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 					pgKindTypeName(left.Kind), pgKindTypeName(right.Kind)),
 				Hint: "No operator matches the given name and argument types. You might need to add explicit type casts."}
 		}
-		return NewStringDatum(left.Format() + right.Format()), nil
+		// Array concatenation: if both operands look like PostgreSQL arrays
+		// ({v1,v2,...}), merge their elements rather than text-concat.
+		// This handles ARRAY[...] || ARRAY[...] and array || array patterns.
+		// M0097-0065.
+		ls := left.Format()
+		rs := right.Format()
+		if len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}' &&
+			len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}' {
+			leftInner := ls[1 : len(ls)-1]
+			rightInner := rs[1 : len(rs)-1]
+			var inner string
+			switch {
+			case leftInner == "" && rightInner == "":
+				inner = ""
+			case leftInner == "":
+				inner = rightInner
+			case rightInner == "":
+				inner = leftInner
+			default:
+				inner = leftInner + "," + rightInner
+			}
+			return NewStringDatum("{" + inner + "}"), nil
+		}
+		return NewStringDatum(ls + rs), nil
 	case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
 		// Bitwise operators: require integer operands. M0097-0003.
 		if left.Kind != KindInt || right.Kind != KindInt {

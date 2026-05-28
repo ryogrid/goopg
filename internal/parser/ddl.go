@@ -311,8 +311,11 @@ func parseSkipToSemicolonHelper(p *parser, stmt Stmt) (Stmt, error) {
 }
 
 // parseSkipToSemicolon advances past all tokens until ';' or EOF and returns a
-// no-op DoStmt so the caller has a valid non-nil Stmt. Used for DDL statements
-// that are syntactically accepted but semantically ignored. M0097-0027.
+// CompatNoopStmt so the caller has a valid non-nil Stmt that succeeds silently.
+// Used for DDL statements that are syntactically accepted but semantically
+// ignored (e.g. CREATE OPERATOR, CREATE CAST). M0097-0027. Previously returned
+// DoStmt which failed with "DO block language not supported" and aborted
+// any enclosing transaction; CompatNoopStmt avoids that. M0097-0065.
 func (p *parser) parseSkipToSemicolon(pos int) (Stmt, error) {
 	for {
 		tok := p.cur()
@@ -324,7 +327,7 @@ func (p *parser) parseSkipToSemicolon(pos int) (Stmt, error) {
 		}
 		p.advance()
 	}
-	return &DoStmt{pos: pos}, nil
+	return &CompatNoopStmt{pos: pos, Tag: "CREATE"}, nil
 }
 
 // parseCreatePublicationTail picks up after CREATE PUBLICATION.
@@ -2829,6 +2832,28 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 				}
 			}
 			p.advance()
+		}
+	}
+	// Accept array notation: int[], text[], etc. Append [] to the base type
+	// name and skip any dimension expressions like [N]. M0097-0065.
+	for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+		p.advance() // consume [
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+			// Empty []: plain array type.
+			stmt.BaseType += "[]"
+			p.advance() // consume ]
+		} else {
+			// Dimensioned [N]: skip until ].
+			for p.cur().Kind != TokenSymbol || p.cur().Value != "]" {
+				if p.cur().Kind == TokenEOF {
+					break
+				}
+				p.advance()
+			}
+			stmt.BaseType += "[]"
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+				p.advance() // consume ]
+			}
 		}
 	}
 	// Parse constraint list.

@@ -4831,6 +4831,79 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
+
+	// Build resolve context.  When UPDATE … FROM is present, the FROM tables
+	// are appended as additional bindings so that SET and WHERE expressions can
+	// reference their columns.  M0097-0065.
+	var fromTables []*catalog.Table
+	var fromScans []*SeqScan
+	var fromSchema Schema
+	if len(s.From) > 0 {
+		bindings := []rangeBinding{
+			{table: tbl, alias: s.Target.Alias, offset: 0, sourceIdx: 1},
+		}
+		sch := tableSchemaWithSource(tbl, 1)
+		offset := len(tbl.Columns)
+		for idx, rv := range s.From {
+			fromTbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
+			if !ok {
+				return nil, &PlanError{Pos: rv.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", rv.Name)}
+			}
+			si := int16(idx + 2) // sourceIdx 2, 3, … for FROM tables
+			alias := rv.Alias
+			if alias == "" {
+				alias = strings.ToLower(rv.Name)
+			}
+			bindings = append(bindings, rangeBinding{
+				table: fromTbl, alias: alias, offset: offset, sourceIdx: si,
+			})
+			fromSchema = append(fromSchema, tableSchemaWithSource(fromTbl, si)...)
+			sch = append(sch, tableSchemaWithSource(fromTbl, si)...)
+			fromTables = append(fromTables, fromTbl)
+			fromScans = append(fromScans, &SeqScan{pos: rv.Pos(), Table: fromTbl, schema: tableSchemaWithSource(fromTbl, si)})
+			offset += len(fromTbl.Columns)
+		}
+		ctx := newResolveContext(bindings, sch)
+		ctx.cat = cat
+		// Apply the WHERE predicate (no index optimization for UPDATE FROM). M0097-0065.
+		var pred Expr
+		if s.Where != nil {
+			pred, err = resolveExpr(s.Where, ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+		set := make([]Expr, len(tbl.Columns))
+		for _, a := range s.Set {
+			col, ok := cat.LookupColumn(tbl, a.Column)
+			if !ok {
+				return nil, &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
+			}
+			expr, err := resolveExpr(a.Expr, ctx)
+			if err != nil {
+				return nil, err
+			}
+			set[col.Ordinal] = expr
+		}
+		// The target scan has NO filter; the executor does the nested-loop
+		// cross-product and applies FromPred against the combined row. M0097-0065.
+		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(tbl, 1)}
+		upd := &Update{
+			pos: s.Pos(), Table: tbl, Child: tgtScan, Set: set,
+			FromTables: fromTables, FromScans: fromScans, FromSchema: fromSchema,
+			FromPred: pred,
+		}
+		if len(s.Returning) > 0 {
+			retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
+			if err != nil {
+				return nil, err
+			}
+			upd.Returning = retExprs
+			upd.ReturningSchema = retSchema
+		}
+		return upd, nil
+	}
+
 	ctx := singleBindingContext(tbl, s.Target.Alias)
 	ctx.cat = cat
 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
@@ -5250,11 +5323,26 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	// Function call: use function name as the implicit column label.
 	// Matches PostgreSQL's FigureColname() logic for FuncCall nodes.
 	if fc, ok := e.(*FuncCall); ok && fc.Name != "" {
+		// array_construct is the lowered form of ARRAY[...]; PostgreSQL
+		// FigureColname returns "array" for ArrayExpr nodes. M0097-0065.
+		if fc.Name == "array_construct" {
+			return "array", exprType(e)
+		}
 		return fc.Name, exprType(e)
 	}
-	// CASE expression: PostgreSQL uses "case" as implicit column label.
-	// Matches FigureColname() returning "case" for CaseExpr nodes. M0097-0003.
-	if _, ok := e.(*CaseExpr); ok {
+	// CASE expression: PostgreSQL's FigureColname() tries ELSE first, then
+	// each WHEN result, then falls back to "case". M0097-0065.
+	if ce, ok := e.(*CaseExpr); ok {
+		if ce.Else != nil {
+			if name, _ := targetMeta(ce.Else, t); name != "?column?" {
+				return name, exprType(e)
+			}
+		}
+		for _, w := range ce.Whens {
+			if name, _ := targetMeta(w.Then, t); name != "?column?" {
+				return name, exprType(e)
+			}
+		}
 		return "case", exprType(e)
 	}
 	// EXTRACT expression: PostgreSQL uses "extract" as the implicit column label.

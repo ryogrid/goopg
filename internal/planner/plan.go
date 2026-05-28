@@ -1057,6 +1057,12 @@ type OnConflictPlan struct {
 // Set is parallel to the table's columns: nil entries leave the
 // existing value alone; non-nil entries are evaluated against the
 // child's rows.
+//
+// When FromTables is non-empty (UPDATE … FROM …, M0097-0065) the
+// executor performs a nested-loop cross-product between the target
+// table scan and the FROM tables, applying the predicate to the
+// combined row. The FromSchema field holds the concatenated schema
+// of all FROM tables so the executor can allocate the right row size.
 type Update struct {
 	pos             int
 	Table           *catalog.Table
@@ -1064,6 +1070,16 @@ type Update struct {
 	Set             []Expr // len == len(Table.Columns)
 	Returning       []Expr // per-target RETURNING expressions (nil = no RETURNING)
 	ReturningSchema Schema // output schema when Returning is non-nil
+	// UPDATE … FROM (M0097-0065): additional source tables.
+	// When non-empty the executor iterates all FROM tables as a nested
+	// loop cross-product against the target scan and applies FromPred
+	// (which may reference both target and FROM columns) to select
+	// matching rows. Set expressions are also evaluated against the
+	// combined (target ++ from...) row.
+	FromTables    []*catalog.Table
+	FromScans     []*SeqScan // one per FROM table
+	FromSchema    Schema     // combined schema of all FROM tables
+	FromPred      Expr       // WHERE predicate over combined row (nil = no filter)
 }
 
 func (n *Update) Pos() int       { return n.pos }

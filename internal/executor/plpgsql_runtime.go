@@ -1040,6 +1040,19 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 			args = append(args, pa)
 		}
 		return &planner.FuncCall{Name: x.Name.String(), Args: args, Star: x.Star}, nil
+	case *parser.ArrayConstructorExpr:
+		// ARRAY[e1, e2, ...] constructor inside a PL/pgSQL body. Lower each
+		// element and emit as array_construct so the executor formats the
+		// result as {v1,v2,...}. M0097-0065.
+		largs := make([]planner.Expr, len(x.Elements))
+		for i, el := range x.Elements {
+			lowered, err := lowerPLpgSQLExpr(el, frame)
+			if err != nil {
+				return nil, err
+			}
+			largs[i] = lowered
+		}
+		return &planner.FuncCall{Name: "array_construct", Args: largs}, nil
 	default:
 		return nil, &ExecError{Code: "0A000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL expression %T", e)}
 	}

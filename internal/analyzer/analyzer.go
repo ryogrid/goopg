@@ -604,6 +604,19 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 		return err
 	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
+	// Add FROM-clause tables to scope so WHERE / SET expressions can reference
+	// their columns (e.g. `UPDATE t SET i = b.j FROM other b WHERE ...`). M0097-0065.
+	for _, rv := range s.From {
+		fromTbl, err := lookupTable(cat, rv)
+		if err != nil {
+			return err
+		}
+		alias := rv.Alias
+		if alias == "" {
+			alias = rv.Name
+		}
+		ctx.rels = append(ctx.rels, scopeRel{table: fromTbl, alias: alias})
+	}
 	if s.With != nil {
 		if err := analyzeWith(s.With, ctx); err != nil {
 			return err
@@ -1039,6 +1052,17 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{}, err
 		}
 		return catalog.Type{Name: "record"}, nil
+	case *parser.ArrayConstructorExpr:
+		// ARRAY[e1, e2, ...] constructor — walk each element for analysis
+		// errors and return a generic text[] type. The planner's resolveExpr
+		// converts this to FuncCall{Name:"array_construct"} which the executor
+		// evaluates as a {v1,v2,...} text representation. M0097-0065.
+		for _, el := range x.Elements {
+			if _, err := analyzeExpr(el, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		return catalog.Type{Name: "text[]"}, nil
 	default:
 		return catalog.Type{}, analyzeError(e.Pos(), "0A000", fmt.Sprintf("unsupported expression %T", e))
 	}
