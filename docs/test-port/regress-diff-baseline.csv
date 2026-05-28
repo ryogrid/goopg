@@ -127,4 +127,4 @@ jsonb_jsonpath,4783,failed
 partition_prune,1089,failed
 jsonb,5827,failed
 partition_join,1446,failed
-join,1330,failed
+join,1316,failed

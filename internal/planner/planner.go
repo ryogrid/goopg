@@ -5135,6 +5135,44 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 			outSchema = append(outSchema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx})
 		}
 	}
+	// M0097-0061: PostgreSQL places USING columns first in SELECT * output:
+	// "using-cols, left-rest, right-rest". Without explicit reordering the
+	// left table's natural column order is preserved, which is wrong when the
+	// USING column is not the first column of the left table.
+	//
+	// Example: t1(a,b,c) JOIN t2(a,b) USING (b) → must output "b | a | c | a"
+	// not "a | b | c | a". Collect USING names from any right-binding's
+	// usingHidden list, then move those columns to the front.
+	if !qualified {
+		usingSet := make(map[string]bool)
+		for _, b := range bset {
+			for _, uh := range b.usingHidden {
+				usingSet[strings.ToLower(uh)] = true
+			}
+		}
+		if len(usingSet) > 0 {
+			var frontIdx, restIdx []int
+			for i, sc := range outSchema {
+				if usingSet[strings.ToLower(sc.Name)] {
+					frontIdx = append(frontIdx, i)
+				} else {
+					restIdx = append(restIdx, i)
+				}
+			}
+			newExpr := make([]Expr, 0, len(outExpr))
+			newSchema := make(Schema, 0, len(outSchema))
+			for _, i := range frontIdx {
+				newExpr = append(newExpr, outExpr[i])
+				newSchema = append(newSchema, outSchema[i])
+			}
+			for _, i := range restIdx {
+				newExpr = append(newExpr, outExpr[i])
+				newSchema = append(newSchema, outSchema[i])
+			}
+			outExpr = newExpr
+			outSchema = newSchema
+		}
+	}
 	return outExpr, outSchema, nil
 }
 
