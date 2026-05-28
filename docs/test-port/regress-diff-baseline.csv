@@ -34,7 +34,7 @@ lock,151,failed
 prepared_xacts,172,failed
 drop_if_exists,175,failed
 advisory_lock,0,pass
-case,34,failed
+case,0,pass
 uuid,0,pass
 select_distinct_on,0,passed
 partition_info,185,failed
@@ -66,7 +66,7 @@ sequence,417,failed
 matview,287,failed
 transactions,599,failed
 create_table_like,356,failed
-limit,17,failed
+limit,0,pass
 create_table,584,failed
 guc,748,failed
 update,669,failed

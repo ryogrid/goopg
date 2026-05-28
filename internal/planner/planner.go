@@ -195,6 +195,14 @@ type resolveContext struct {
 	// Var.varlevelsup by counting how many parent links to walk.
 	// nil for the top-level SELECT.
 	parent *resolveContext
+	// lateralSibling marks a lateral context that is at the SAME
+	// correlated-subquery nesting level as its parent — it extends
+	// the current FROM-clause scope horizontally, not vertically.
+	// resolveColumnRef does NOT increment the level counter when
+	// walking through a lateralSibling context, so OuterColumnRef
+	// nodes get the correct level for the executor's OuterRows stack.
+	// M0097-0065.
+	lateralSibling bool
 }
 
 type rangeBinding struct {
@@ -2247,6 +2255,20 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 	if lateralCtx != nil {
 		latCtxWithCat := *lateralCtx
 		latCtxWithCat.cat = cat
+		// Chain to the current planParent so that outer-query columns
+		// (e.g. `s` from the main SELECT) remain visible inside nested
+		// derived-table subqueries. Without this, a correlated reference
+		// in an OFFSET/LIMIT/WHERE inside a derived table two levels deep
+		// fails with "column does not exist".
+		// Mark as lateralSibling so resolveColumnRef does NOT increment
+		// the outer-ref level when crossing this context — it represents
+		// the same correlated-subquery boundary as planParent, not a new
+		// one. This keeps OuterColumnRef.Level consistent with the
+		// executor's OuterRows stack depth. M0097-0065.
+		if latCtxWithCat.parent == nil {
+			latCtxWithCat.parent = planParent
+			latCtxWithCat.lateralSibling = true
+		}
 		inner, err = planSelectWithParent(rv.Subquery, cat, &latCtxWithCat)
 	} else {
 		inner, err = Plan(rv.Subquery, cat)
@@ -5565,6 +5587,16 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "int8"}
 		}
 		return catalog.Type{Name: "unknown"}
+	case *SubqueryExpr:
+		// Return the type of the first output column of the subquery plan so
+		// the wire layer advertises the correct TypeOID (e.g. int8 instead of
+		// text) and psql right-aligns numeric results. M0097-0066.
+		if x.Plan != nil {
+			if sch := x.Plan.Output(); len(sch) > 0 {
+				return sch[0].Type
+			}
+		}
+		return catalog.Type{Name: "unknown"}
 	}
 	return catalog.Type{Name: "unknown"}
 }
@@ -6024,6 +6056,11 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 	// local scope is an error; ambiguity at a parent level
 	// shadows the further parents (no error). Found at parent
 	// level produces an OuterColumnRef.
+	//
+	// lateralSibling contexts (horizontal FROM-clause scope extensions)
+	// do NOT increment the level because they correspond to the same
+	// outer-row push as their parent — only real correlated-subquery
+	// boundaries (planSelectWithParent calls) push to OuterRows. M0097-0065.
 	level := 0
 	for cur := ctx; cur != nil; cur = cur.parent {
 		ref, ok, err := resolveColumnRefAt(x, cur, level)
@@ -6033,7 +6070,9 @@ func resolveColumnRef(x *parser.ColumnRef, ctx *resolveContext) (Expr, error) {
 		if ok {
 			return ref, nil
 		}
-		level++
+		if !cur.lateralSibling {
+			level++
+		}
 	}
 	return nil, &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
 }

@@ -1638,7 +1638,21 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 	}
 	rels := make([]scopeRel, 0, len(s.From))
 	for _, item := range s.FromExprs {
-		tbl, err := resolveTable(ctx, item.Base)
+		var tbl *catalog.Table
+		var err error
+		if item.Base.Subquery != nil {
+			// Derived-table base item: pass accumulated left-side rels as
+			// lateral outer scope so the inner SELECT can resolve correlated
+			// references to earlier FROM items AND to outer-query columns
+			// (via ctx.parent). This mirrors the JOIN lateral path below and
+			// fixes cases like:
+			//   FROM (VALUES(1)) AS x, (SELECT … OFFSET s-1) AS y
+			// where s is a column from an enclosing query. M0097-0065.
+			lateralCtx := &scope{parent: ctx, cat: ctx.cat, rels: append([]scopeRel(nil), rels...)}
+			tbl, err = synthesizeSubqueryTable(ctx.cat, item.Base, lateralCtx)
+		} else {
+			tbl, err = resolveTable(ctx, item.Base)
+		}
 		if err != nil {
 			return nil, err
 		}
