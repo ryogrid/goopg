@@ -41,7 +41,7 @@ partition_info,185,failed
 timetz,0,pass
 pg_lsn,0,pass
 misc,260,failed
-tidscan,160,failed
+tidscan,116,failed
 temp,281,failed
 txid,287,failed
 index_including,257,failed
@@ -50,7 +50,7 @@ truncate,311,failed
 plancache,196,failed
 create_procedure,324,failed
 text,338,failed
-enum,403,failed
+enum,325,failed
 equivclass,0,pass
 xid,404,failed
 random,451,failed
@@ -116,7 +116,7 @@ alter_table,2137,failed
 multirangetypes,2801,failed
 rules,2986,failed
 inherit,1329,failed
-with,2482,failed
+with,2415,failed
 foreign_key,2992,failed
 updatable_views,3071,failed
 timestamptz,3526,failed

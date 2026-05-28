@@ -2404,24 +2404,55 @@ func (c *InMemory) LookupEnum(name string) (*EnumType, bool) {
 	return et, ok
 }
 
+// EnumLabelTooLong is returned by AddEnumValue when value exceeds 63 bytes.
+// Code 22P02 is used in execAlterType.
+type EnumLabelTooLong struct{ Label string }
+
+func (e *EnumLabelTooLong) Error() string {
+	return fmt.Sprintf("invalid enum label %q", e.Label)
+}
+
+// EnumLabelNotFound is returned when BEFORE/AFTER reference label is not found.
+// The message matches PostgreSQL's wording.
+type EnumLabelNotFound struct{ Label string }
+
+func (e *EnumLabelNotFound) Error() string {
+	return fmt.Sprintf("%q is not an existing enum label", e.Label)
+}
+
 // AddEnumValue appends a new label to an existing enum. before/after are
 // reference labels (empty = append at end). Returns an error if label already
-// exists unless ifNotExists is true, in which case it is a no-op. M0097-0017.
+// exists unless ifNotExists is true, in which case it is a no-op (returns nil).
+//
+// To distinguish the "skipped duplicate" case (for NOTICE emission), use
+// AddEnumValueResult which returns a skipped bool. M0097-0017.
 func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, after string) error {
+	_, err := c.AddEnumValueResult(name, value, ifNotExists, before, after)
+	return err
+}
+
+// AddEnumValueResult is like AddEnumValue but also returns skipped=true when
+// ifNotExists=true and the label already exists (caller should emit a NOTICE).
+// M0097-0063.
+func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, before, after string) (skipped bool, err error) {
+	// PostgreSQL limits enum labels to 63 bytes (NAMEDATALEN-1). M0097-0063.
+	if len(value) > 63 {
+		return false, &EnumLabelTooLong{Label: value}
+	}
 	k := strings.ToLower(name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, ok := c.enumTypes[k]
 	if !ok {
-		return fmt.Errorf("type %q does not exist", name)
+		return false, fmt.Errorf("type %q does not exist", name)
 	}
 	// Check for duplicate.
 	for _, v := range et.Values {
 		if strings.EqualFold(v, value) {
 			if ifNotExists {
-				return nil
+				return true, nil // skipped — caller should emit NOTICE
 			}
-			return fmt.Errorf("enum label %q already exists", value)
+			return false, fmt.Errorf("enum label %q already exists", value)
 		}
 	}
 	switch {
@@ -2433,10 +2464,10 @@ func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, af
 				newVals = append(newVals, value)
 				newVals = append(newVals, et.Values[i:]...)
 				et.Values = newVals
-				return nil
+				return false, nil
 			}
 		}
-		return fmt.Errorf("enum label %q not found", before)
+		return false, &EnumLabelNotFound{Label: before}
 	case after != "":
 		for i, v := range et.Values {
 			if strings.EqualFold(v, after) {
@@ -2445,14 +2476,14 @@ func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, af
 				newVals = append(newVals, value)
 				newVals = append(newVals, et.Values[i+1:]...)
 				et.Values = newVals
-				return nil
+				return false, nil
 			}
 		}
-		return fmt.Errorf("enum label %q not found", after)
+		return false, &EnumLabelNotFound{Label: after}
 	default:
 		et.Values = append(et.Values, value)
 	}
-	return nil
+	return false, nil
 }
 
 // DropEnum removes an enum type. cascade=true is accepted (stub — does not

@@ -199,6 +199,36 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 			}
 		}
+		// ── Enum cast validation ─────────────────────────────────────────
+		// If the target type is a user-defined enum and the input is a
+		// non-NULL, non-array string, verify the value is a valid enum label.
+		// Guards: skip array types (target ends with []), skip array literals
+		// (value starts with {), skip NULL values. M0097-0063.
+		if ctx != nil && ctx.Catalog != nil && !v.IsNull() &&
+			!strings.HasSuffix(x.TargetType, "[]") {
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+				if et, isEnum := im.LookupEnum(x.TargetType); isEnum {
+					strVal := v.StringValue()
+					// Skip array literals (e.g. '{red,green,blue}'::rainbow[]).
+					if len(strVal) == 0 || strVal[0] != '{' {
+						found := false
+						for _, label := range et.Values {
+							if strings.EqualFold(label, strVal) {
+								found = true
+								break
+							}
+						}
+						if !found {
+							return NullDatum, &ExecError{
+								Code:    "22P02",
+								Pos:     x.Pos(),
+								Message: fmt.Sprintf("invalid input value for enum %s: %q", et.Name, strVal),
+							}
+						}
+					}
+				}
+			}
+		}
 		result, err := evalCastTyped(v, x.TargetType, x.SourceType, x.Pos())
 		if err != nil {
 			return Datum{}, err
@@ -3301,6 +3331,82 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NewIntDatum(1), nil
 
+	// ── Enum support functions (M0097-0063) ──────────────────────────────
+	// enum_first(anyenum) — first value in the enum ordering.
+	// enum_last(anyenum) — last value in the enum ordering.
+	// enum_range(anyenum) — all enum values as an array.
+	// enum_range(anyenum, anyenum) — bounded range as an array.
+	// Arguments are typically NULL::typename or value::typename casts; we
+	// extract the type name from the CastExpr rather than the runtime value.
+	case "enum_first":
+		typeName := enumTypeNameFromArgs(x.Args)
+		if typeName == "" || ctx == nil || ctx.Catalog == nil {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		et, ok := im.LookupEnum(typeName)
+		if !ok || len(et.Values) == 0 {
+			return NullDatum, nil
+		}
+		return NewStringDatum(et.Values[0]), nil
+
+	case "enum_last":
+		typeName := enumTypeNameFromArgs(x.Args)
+		if typeName == "" || ctx == nil || ctx.Catalog == nil {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		et, ok := im.LookupEnum(typeName)
+		if !ok || len(et.Values) == 0 {
+			return NullDatum, nil
+		}
+		return NewStringDatum(et.Values[len(et.Values)-1]), nil
+
+	case "enum_range", "enum_range_bounds":
+		typeName := enumTypeNameFromArgs(x.Args)
+		if typeName == "" || ctx == nil || ctx.Catalog == nil {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		et, ok := im.LookupEnum(typeName)
+		if !ok {
+			return NullDatum, nil
+		}
+		vals := et.Values
+		if len(x.Args) >= 2 {
+			// enum_range(lo, hi): lo=NULL means start from first; hi=NULL means end at last.
+			loVal, loErr := evalExpr(x.Args[0], row, ctx)
+			hiVal, hiErr := evalExpr(x.Args[1], row, ctx)
+			if loErr == nil && !loVal.IsNull() {
+				loStr := loVal.StringValue()
+				for i, v := range vals {
+					if strings.EqualFold(v, loStr) {
+						vals = vals[i:]
+						break
+					}
+				}
+			}
+			if hiErr == nil && !hiVal.IsNull() {
+				hiStr := hiVal.StringValue()
+				for i, v := range vals {
+					if strings.EqualFold(v, hiStr) {
+						vals = vals[:i+1]
+						break
+					}
+				}
+			}
+		}
+		return NewStringDatum(formatTextArray(vals)), nil
+
 	// ── Advisory lock functions (M0096-0003) ──────────────────────────────
 	// All variants block/return immediately depending on lock availability.
 	// pg_advisory_lock / pg_advisory_xact_lock return non-NULL (void-like)
@@ -6150,6 +6256,19 @@ func parseTimezoneOffsetString(s string) (int, error) {
 	}
 
 	return 0, fmt.Errorf("unrecognized timezone: %q", s)
+}
+
+// enumTypeNameFromArgs inspects planner-level argument expressions to find the
+// enum type name for enum_first / enum_last / enum_range. Arguments are
+// typically NULL::typename or value::typename casts; the CastExpr carries the
+// TargetType. M0097-0063.
+func enumTypeNameFromArgs(args []planner.Expr) string {
+	for _, arg := range args {
+		if cast, ok := arg.(*planner.CastExpr); ok {
+			return cast.TargetType
+		}
+	}
+	return ""
 }
 
 // parseTZHourMin parses "HH" or "HH:MM" into hours and minutes.

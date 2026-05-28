@@ -2726,7 +2726,8 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 	}
 	stmt := &AlterTypeStmt{pos: pos, Name: name.Name, Schema: name.Schema}
 	// ADD VALUE [IF NOT EXISTS] 'val' [BEFORE|AFTER 'ref']
-	if p.acceptIdentKeyword("add") {
+	// NOTE: ADD is a reserved keyword (KwAdd), not an ident keyword — use acceptKeyword.
+	if p.acceptKeyword(KwAdd) {
 		if !p.acceptIdentKeyword("value") {
 			// consume until ';' or EOF
 			for p.cur().Kind != TokenEOF {

@@ -3055,10 +3055,28 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	if s.AddValue == "" {
 		return nil // RENAME VALUE / RENAME TO / OWNER TO — no-op
 	}
-	if err := cat.AddEnumValue(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After); err != nil {
-		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After)
+	if err == nil {
+		if skipped {
+			// IF NOT EXISTS with existing label: emit NOTICE, continue.
+			o.ctx.AddNotice(fmt.Sprintf("enum label %q already exists, skipping", s.AddValue))
+		}
+		return nil
 	}
-	return nil
+	switch e := err.(type) {
+	case *catalog.EnumLabelTooLong:
+		// PostgreSQL: "invalid enum label %q" DETAIL "Labels must be 63 bytes or less."
+		return &ExecError{
+			Code:    "22023",
+			Pos:     s.Pos(),
+			Message: fmt.Sprintf("invalid enum label %q", e.Label),
+			Detail:  "Labels must be 63 bytes or less.",
+		}
+	case *catalog.EnumLabelNotFound:
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: e.Error()}
+	default:
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
 }
 
 func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
