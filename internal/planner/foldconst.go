@@ -175,6 +175,8 @@ func foldPlanConstantsInner(node Node) {
 		for i := range n.Args {
 			n.Args[i] = FoldConstants(n.Args[i])
 		}
+	case *PgAvailableWalSummaries:
+		// no sub-expressions to fold
 	}
 }
 

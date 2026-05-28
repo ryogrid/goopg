@@ -1203,7 +1203,7 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 		lower := strings.ToLower(obj.Name)
 		switch lower {
 		case "generate_series", "pg_input_error_info", "parse_ident",
-			"pg_get_publication_tables":
+			"pg_get_publication_tables", "pg_available_wal_summaries":
 			srfFuncName = lower
 		}
 	}

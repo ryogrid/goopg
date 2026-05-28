@@ -84,7 +84,7 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
 
 ### Sub-milestones
 
-- [ ] **M0095-0002**
+- [x] **M0095-0002**
       - Summary: Port `pg_walsummary/002` (WAL block summarization)
         as adapted Go test in `client_tools_port_test.go`.
       - Basic SQL (CREATE TABLE, INSERT, VACUUM, CHECKPOINT) passes.
@@ -92,8 +92,27 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
         pg_stat_io walsummarizer rows, pg_walsummary -i) deferred with explicit
         t.Skip blocker (goopg rejects unknown GUCs at startup; function not
         implemented). CSV row WS-002 added; markdown regenerated (2026-05-12).
-      - Action: add summarize_wal compatibility (GUC + catalog/functions + CLI path)
-        and remove t.Skip blocker.
+      - **COMPLETE 2026-05-29 (M0095-0002):** t.Skip removed; test passes.
+        Four changes closed all blockers:
+        (a) `pg_stat_io` virtual table (`internal/catalog/catalog.go`): 20
+            columns matching PG 16+ schema (backend_type, object, context,
+            reads/read_bytes/read_time, writes/…, writebacks/…, extends/…,
+            hits, evictions, reuses, fsyncs/fsync_time, stats_reset); OID 8061;
+            VirtualRows returns nil (no I/O stats tracked in goopg v0).
+        (b) `PgAvailableWalSummaries` plan node (`internal/planner/plan.go`):
+            schema {tli int8, start_lsn pg_lsn, end_lsn pg_lsn}; cases added
+            to FoldConstants and walkPlanExprs (no sub-expressions).
+        (c) `planPgAvailableWalSummaries` + FROM whitelist (`internal/planner/planner.go`,
+            `internal/parser/select.go`): planner routes `FROM
+            pg_available_wal_summaries()` to the new plan node; parser FROM-clause
+            SRF dispatch now includes `"pg_available_wal_summaries"` in its name
+            switch so `pg_available_wal_summaries()` is parsed as a TableFuncRef.
+        (d) `pgAvailableWalSummariesOp` executor (`internal/executor/operators_pg_available_wal_summaries.go`,
+            `executor.go`): always returns 0 rows (no WAL summarizer in goopg v0).
+        Test assertions: `SELECT count(*) FROM pg_available_wal_summaries()` = 0;
+        `SELECT count(*) FROM pg_stat_io WHERE backend_type = 'walsummarizer'` = 0.
+        `pg_walsummary -i` sub-case remains commented out (no summary files when
+        `summarize_wal = off`). `TestPort_PgWalsummary002Blocks` → PASS.
 
 - [ ] **M0095-0003**
       - Summary: Port `pg_basebackup/010`, `011`, `020`, `030`, `040`

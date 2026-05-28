@@ -28,6 +28,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newPgInputErrorInfoOp(p)), nil
 	case *planner.PgGetPublicationTables:
 		return maybeInstrument(p, newPgGetPublicationTablesOp(p)), nil
+	case *planner.PgAvailableWalSummaries:
+		return maybeInstrument(p, newPgAvailableWalSummariesOp(p)), nil
 	case *planner.ProjectSet:
 		child, err := Build(p.Child)
 		if err != nil {

@@ -920,6 +920,18 @@ func (n *PgGetPublicationTables) Output() Schema { return n.schema }
 func (n *PgInputErrorInfo) Pos() int       { return n.pos }
 func (n *PgInputErrorInfo) Output() Schema { return n.schema }
 
+// PgAvailableWalSummaries implements pg_available_wal_summaries() as a
+// FROM-clause SRF. Returns (tli int8, start_lsn pg_lsn, end_lsn pg_lsn)
+// for each available WAL summary file. goopg v0 has no WAL summarizer
+// (summarize_wal is always off), so this always returns 0 rows. M0095-0002.
+type PgAvailableWalSummaries struct {
+	pos    int
+	schema Schema
+}
+
+func (n *PgAvailableWalSummaries) Pos() int       { return n.pos }
+func (n *PgAvailableWalSummaries) Output() Schema { return n.schema }
+
 // ScalarFuncScan returns a single row from a scalar function call used in
 // the FROM clause (e.g. `FROM parse_ident(...) AS a`). The function result
 // is returned as a single column named ColName with type ColType. M0097-0003.

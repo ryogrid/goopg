@@ -1579,6 +1579,39 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.tables["pg_catalog.pg_stat_wal"] = pgStatWal
 
+	// pg_stat_io — per-backend-type I/O statistics (PG 16+, OID 8061).
+	// goopg v0 does not track I/O statistics; all counters are 0 and no
+	// rows are returned. The table exists so queries filtering by
+	// backend_type (e.g. 'walsummarizer') succeed and return 0 rows.
+	pgStatIO := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_io", Virtual: true,
+		Columns: []Column{
+			{Name: "backend_type", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "object", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "context", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "reads", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "read_bytes", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "read_time", Type: Type{Name: "float8"}, Ordinal: 5},
+			{Name: "writes", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "write_bytes", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "write_time", Type: Type{Name: "float8"}, Ordinal: 8},
+			{Name: "writebacks", Type: Type{Name: "int8"}, Ordinal: 9},
+			{Name: "writeback_time", Type: Type{Name: "float8"}, Ordinal: 10},
+			{Name: "extends", Type: Type{Name: "int8"}, Ordinal: 11},
+			{Name: "extend_bytes", Type: Type{Name: "int8"}, Ordinal: 12},
+			{Name: "extend_time", Type: Type{Name: "float8"}, Ordinal: 13},
+			{Name: "hits", Type: Type{Name: "int8"}, Ordinal: 14},
+			{Name: "evictions", Type: Type{Name: "int8"}, Ordinal: 15},
+			{Name: "reuses", Type: Type{Name: "int8"}, Ordinal: 16},
+			{Name: "fsyncs", Type: Type{Name: "int8"}, Ordinal: 17},
+			{Name: "fsync_time", Type: Type{Name: "float8"}, Ordinal: 18},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 19},
+		},
+		OID: 8061,
+	}
+	pgStatIO.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_stat_io"] = pgStatIO
+
 	// pg_wait_events — needs at least one row per type.
 	pgWaitEvents := &Table{
 		Schema: "pg_catalog", Name: "pg_wait_events", Virtual: true,

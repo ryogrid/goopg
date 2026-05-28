@@ -2598,6 +2598,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_get_publication_tables") {
 		return planPgGetPublicationTables(rv, sourceIdx, lateralCtx)
 	}
+	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
+		return planPgAvailableWalSummaries(rv, sourceIdx)
+	}
 	if !strings.EqualFold(tf.Name, "generate_series") {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
 			Message: fmt.Sprintf("table-valued function %q not supported", tf.Name)}
@@ -2757,6 +2760,30 @@ func planPgGetPublicationTables(rv parser.RangeVar, sourceIdx int16, lateralCtx 
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgGetPublicationTables{pos: tf.Pos(), Args: args, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgAvailableWalSummaries routes a FROM-clause invocation of
+// pg_available_wal_summaries() into a PgAvailableWalSummaries plan node.
+// goopg v0 has no WAL summarizer, so the operator always returns 0 rows.
+// M0095-0002.
+func planPgAvailableWalSummaries(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_available_wal_summaries"
+	}
+	colNames := []string{"tli", "start_lsn", "end_lsn"}
+	colTypes := []string{"int8", "pg_lsn", "pg_lsn"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgAvailableWalSummaries{pos: tf.Pos(), schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }

@@ -330,6 +330,8 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, a := range n.Args {
 			walkExprTree(a, visit)
 		}
+	case *PgAvailableWalSummaries:
+		// no sub-expressions to walk
 	case *MultiHashJoin:
 		for _, tbl := range n.Tables {
 			walkPlanExprs(tbl, visit)
