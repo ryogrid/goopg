@@ -92,7 +92,7 @@ func TestPgDatabaseVirtualRowsEnumeratesRegistry(t *testing.T) {
 	rows := tbl.VirtualRows()
 	seen := map[string]bool{}
 	for _, r := range rows {
-		seen[r[0]] = true
+		seen[r[1]] = true // r[1] is datname; r[0] is oid
 	}
 	if !seen["postgres"] || !seen["tpch"] {
 		t.Errorf("pg_database rows = %v, want both postgres and tpch", rows)

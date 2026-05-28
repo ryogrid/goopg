@@ -62,7 +62,7 @@ func (o *windowOp) Open(ctx *Context) error {
 					sortErr = err
 					return false
 				}
-				cmp, decided, err := compareSortDatums(a, b, pe.Pos(), false)
+				cmp, decided, err := compareSortDatums(a, b, pe.Pos(), false, false)
 				if err != nil {
 					sortErr = err
 					return false
@@ -82,7 +82,7 @@ func (o *windowOp) Open(ctx *Context) error {
 					sortErr = err
 					return false
 				}
-				cmp, decided, err := compareSortDatums(a, b, ok.Expr.Pos(), ok.Desc)
+				cmp, decided, err := compareSortDatums(a, b, ok.Expr.Pos(), ok.Desc, ok.NullsFirst)
 				if err != nil {
 					sortErr = err
 					return false
@@ -264,15 +264,25 @@ func (o *windowOp) samePeer(prev, cur Row) (bool, error) {
 	return true, nil
 }
 
-func compareSortDatums(a, b Datum, pos int, desc bool) (cmp int, decided bool, err error) {
+// compareSortDatums compares two datums for sort purposes.
+// nullsFirst determines whether NULLs sort before or after non-NULLs.
+// The returned cmp is in "natural" order; the caller applies direction (desc).
+// NULLs vs non-NULLs: the sign is chosen so that after applying the desc
+// direction test (cmp < 0 for ASC, cmp > 0 for DESC) we get the correct
+// "comes first" answer.
+//
+// Formula for NULL vs non-null:
+//   cmp = 1  when nullsFirst == desc  (both true or both false)
+//   cmp = -1 when nullsFirst != desc
+func compareSortDatums(a, b Datum, pos int, desc bool, nullsFirst bool) (cmp int, decided bool, err error) {
 	if a.IsNull() && !b.IsNull() {
-		if desc {
+		if nullsFirst == desc {
 			return 1, true, nil
 		}
 		return -1, true, nil
 	}
 	if !a.IsNull() && b.IsNull() {
-		if desc {
+		if nullsFirst == desc {
 			return -1, true, nil
 		}
 		return 1, true, nil

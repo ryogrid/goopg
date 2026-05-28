@@ -301,12 +301,18 @@ func copyTextToDatum(t catalog.Type, raw []byte) (Datum, error) {
 			return Datum{}, err
 		}
 		return NewTimeDatum(ts), nil
-	case "time", "timetz":
+	case "time":
 		ts, err := parseTimeString(string(raw))
 		if err != nil {
 			return Datum{}, err
 		}
 		return NewTimeDatum(ts), nil
+	case "timetz":
+		ts, offsetSecs, err := parseTimeTZString(string(raw))
+		if err != nil {
+			return Datum{}, err
+		}
+		return NewTimeTZDatum(ts, offsetSecs), nil
 	case "numeric", "decimal":
 		text := string(raw)
 		// M0058-0003: int64 fast path for integer-valued NUMERIC. The
@@ -497,6 +503,245 @@ func parseTimeString(s string) (time.Time, error) {
 	return time.Date(1970, 1, 1, h, m, sec, ns, time.UTC), nil
 }
 
+// tzAbbrevOffsets maps common timezone abbreviations to their UTC offsets
+// in seconds east of UTC (positive = east/ahead, negative = west/behind).
+// Matches PostgreSQL's built-in abbreviation table (pg_timezone_abbrevs).
+// Where abbreviations conflict (IST, CST) we follow PG's default table.
+var tzAbbrevOffsets = map[string]int{
+	// Universal
+	"UTC": 0, "GMT": 0, "Z": 0, "UT": 0,
+	// North America — Standard
+	"NST":  -12600, // Newfoundland Standard
+	"AST":  -14400, // Atlantic Standard
+	"EST":  -18000, // Eastern Standard
+	"CST":  -21600, // Central Standard (US; PG default for CST)
+	"MST":  -25200, // Mountain Standard
+	"PST":  -28800, // Pacific Standard
+	"AKST": -32400, // Alaska Standard
+	"HST":  -36000, // Hawaii Standard
+	// North America — Daylight
+	"NDT":  -9000,  // Newfoundland Daylight
+	"ADT":  -10800, // Atlantic Daylight
+	"EDT":  -14400, // Eastern Daylight
+	"CDT":  -18000, // Central Daylight
+	"MDT":  -21600, // Mountain Daylight
+	"PDT":  -25200, // Pacific Daylight
+	"AKDT": -28800, // Alaska Daylight
+	"HDT":  -32400, // Hawaii Daylight
+	// Europe
+	"WET":  0,     // Western European
+	"CET":  3600,  // Central European Standard
+	"MET":  3600,  // Middle European
+	"EET":  7200,  // Eastern European Standard
+	"WEST": 3600,  // Western European Summer
+	"CEST": 7200,  // Central European Summer
+	"MEST": 7200,  // Middle European Summer
+	"EEST": 10800, // Eastern European Summer
+	"BST":  3600,  // British Summer
+	"IST":  3600,  // Irish Summer (PG default for IST — India uses +05:30 explicitly)
+	"MSK":  10800, // Moscow
+	// Asia/Pacific
+	"JST":  32400, // Japan Standard
+	"KST":  32400, // Korea Standard
+	"AEST": 36000, // Australia Eastern Standard
+	"AEDT": 39600, // Australia Eastern Daylight
+}
+
+// parseTZOffset parses an explicit timezone offset string like "+05", "-07", "+05:30", "-04:00"
+// into seconds east of UTC. Returns (offsetSecs, ok).
+func parseTZOffset(s string) (int, bool) {
+	if len(s) < 2 {
+		return 0, false
+	}
+	sign := 1
+	if s[0] == '-' {
+		sign = -1
+	} else if s[0] == '+' {
+		sign = 1
+	} else {
+		return 0, false
+	}
+	rest := s[1:]
+	// Try HH:MM or HH
+	var h, m int
+	if idx := strings.Index(rest, ":"); idx >= 0 {
+		hh, err1 := strconv.Atoi(rest[:idx])
+		mm, err2 := strconv.Atoi(rest[idx+1:])
+		if err1 != nil || err2 != nil {
+			return 0, false
+		}
+		h, m = hh, mm
+	} else {
+		hh, err := strconv.Atoi(rest)
+		if err != nil {
+			return 0, false
+		}
+		h = hh
+	}
+	if h < 0 || h > 15 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return sign * (h*3600 + m*60), true
+}
+
+// parseTimeTZString parses a PostgreSQL timetz string and returns the local
+// time (anchored at 1970-01-01 UTC) and the timezone offset in seconds east
+// of UTC (positive = east/ahead, negative = west/behind).
+//
+// Supported inputs:
+//   - "HH:MM:SS.ffffff +HH" / "-HH" / "+HH:MM" explicit offset
+//   - "HH:MM PDT" / "PST" / etc. timezone abbreviations
+//   - "YYYY-MM-DD HH:MM:SS America/New_York" full timestamp with named TZ
+//   - "HH:MM:SS" bare time (offset defaults to +00)
+//
+// Inputs with named timezone in bare time strings (no date) are rejected.
+func parseTimeTZString(s string) (time.Time, int, error) {
+	orig := s
+	s = strings.TrimSpace(s)
+
+	offsetSecs := 0
+
+	// Full timestamp with date prefix: "YYYY-MM-DD HH:MM:SS[±HH[:MM]] [TZ]"
+	if len(s) >= 10 && s[4] == '-' && s[7] == '-' {
+		dateStr := s[:10]
+		rest := strings.TrimSpace(s[10:])
+		// Split time portion from space-separated timezone suffix
+		var timeStr, tzStr string
+		if idx := strings.Index(rest, " "); idx >= 0 {
+			timeStr = rest[:idx]
+			tzStr = strings.TrimSpace(rest[idx+1:])
+		} else {
+			timeStr = rest
+		}
+		if tzStr != "" {
+			// Named timezone like "America/New_York"
+			if strings.Contains(tzStr, "/") {
+				loc, err := time.LoadLocation(tzStr)
+				if err == nil {
+					// Parse the full datetime in the named timezone
+					full := dateStr + " " + timeStr
+					for _, layout := range []string{"2006-01-02 15:04:05.999999", "2006-01-02 15:04:05", "2006-01-02 15:04"} {
+						if ts, e := time.ParseInLocation(layout, full, loc); e == nil {
+							_, off := ts.Zone()
+							offsetSecs = off // seconds east of UTC
+							// Extract H/M/S from local time
+							lt := ts.In(loc)
+							t, err := parseTimeString(lt.Format("15:04:05.999999"))
+							if err != nil {
+								break
+							}
+							return t, offsetSecs, nil
+						}
+					}
+				}
+				// Named zone but couldn't load → strip to just time, offset = 0
+			} else if off, ok := parseTZOffset(tzStr); ok {
+				offsetSecs = off
+			} else if off, ok := tzAbbrevOffsets[strings.ToUpper(tzStr)]; ok {
+				offsetSecs = off
+			}
+		}
+		// timeStr may have an inline numeric offset like "13:30:25.575401-04" or "13:30:25+05:30"
+		// Extract it before passing to parseTimeString.
+		if offsetSecs == 0 {
+			if plus := strings.LastIndex(timeStr, "+"); plus > 2 {
+				if off, ok := parseTZOffset(timeStr[plus:]); ok {
+					offsetSecs = off
+					timeStr = timeStr[:plus]
+				}
+			} else if minus := strings.LastIndex(timeStr, "-"); minus > 2 {
+				if off, ok := parseTZOffset(timeStr[minus:]); ok {
+					offsetSecs = off
+					timeStr = timeStr[:minus]
+				}
+			}
+		}
+		// Fall through: just parse the time portion
+		t, err := parseTimeString(timeStr)
+		if err != nil {
+			return time.Time{}, 0, wrapTimeTZError(err, orig)
+		}
+		return t, offsetSecs, nil
+	}
+
+	// Bare time string — reject named timezones (e.g. "15:36:39 America/New_York")
+	if idx := strings.Index(s, " "); idx >= 0 {
+		tzPart := strings.TrimSpace(s[idx+1:])
+		if strings.Contains(tzPart, "/") {
+			return time.Time{}, 0, &ExecError{Code: "22007",
+				Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", orig)}
+		}
+	}
+
+	// Strip AM/PM first (before timezone extraction)
+	upper := strings.ToUpper(s)
+	isPM := false
+	if strings.HasSuffix(upper, " PM") {
+		isPM = true
+		s = strings.TrimSpace(s[:len(s)-3])
+		upper = strings.ToUpper(s)
+	} else if strings.HasSuffix(upper, " AM") {
+		s = strings.TrimSpace(s[:len(s)-3])
+		upper = strings.ToUpper(s)
+	}
+
+	// Extract timezone: space-separated abbreviation or explicit offset after time.
+	// Unrecognized suffixes are rejected (PostgreSQL errors on unknown TZ abbreviations).
+	if idx := strings.LastIndex(s, " "); idx >= 0 {
+		tzPart := s[idx+1:]
+		timePart := s[:idx]
+		// Try as abbreviation
+		if off, ok := tzAbbrevOffsets[strings.ToUpper(tzPart)]; ok {
+			offsetSecs = off
+			s = timePart
+		} else if off, ok := parseTZOffset(tzPart); ok {
+			offsetSecs = off
+			s = timePart
+		} else {
+			// Unrecognized abbreviation — reject with error (e.g. "m2", "MSK m2")
+			return time.Time{}, 0, &ExecError{Code: "22007",
+				Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", orig)}
+		}
+	} else {
+		// No space — check for inline +HH or -HH suffix
+		if plus := strings.LastIndex(s, "+"); plus > 2 {
+			if off, ok := parseTZOffset(s[plus:]); ok {
+				offsetSecs = off
+				s = s[:plus]
+			}
+		} else if minus := strings.LastIndex(s, "-"); minus > 2 {
+			if off, ok := parseTZOffset(s[minus:]); ok {
+				offsetSecs = off
+				s = s[:minus]
+			}
+		}
+	}
+
+	// Now parse the bare time portion (re-apply isPM if needed)
+	if isPM {
+		// Prepend PM back since parseTimeString handles it
+		s = s + " PM"
+	}
+
+	t, err := parseTimeString(s)
+	if err != nil {
+		return time.Time{}, 0, wrapTimeTZError(err, orig)
+	}
+	return t, offsetSecs, nil
+}
+
+// wrapTimeTZError converts a time-parsing error into a timetz error.
+// Range errors (22008) are preserved with "time with time zone" wording.
+// Syntax errors (22007) are re-wrapped with the original full string.
+func wrapTimeTZError(err error, orig string) error {
+	if ee, ok := err.(*ExecError); ok && ee.Code == "22008" {
+		return &ExecError{Code: "22008",
+			Message: fmt.Sprintf("date/time field value out of range: %q", orig)}
+	}
+	return &ExecError{Code: "22007",
+		Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", orig)}
+}
+
 // parseCopyTimestamp accepts the layouts upstream's COPY TEXT input
 // commonly produces: with or without fractional seconds, with or
 // without timezone.
@@ -515,5 +760,78 @@ func parseCopyTimestamp(s string) (time.Time, error) {
 			return ts.UTC(), nil
 		}
 	}
+	// Try verbose natural-language format used by PostgreSQL's datetime output
+	// e.g. "Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00".
+	if ts, err := parseFullTimestamp(s); err == nil {
+		return ts, nil
+	}
 	return time.Time{}, fmt.Errorf("invalid timestamp %q", s)
+}
+
+// parseFullTimestamp parses PostgreSQL verbose timestamp strings such as
+// "Tuesday, February 22, 2022 2:22:22.00 PM GMT+05:00".
+// Timezone offset follows ISO convention: +05:00 means UTC+5.
+func parseFullTimestamp(s string) (time.Time, error) {
+	// Strip optional leading day-of-week prefix "Monday, ".
+	if idx := strings.Index(s, ", "); idx > 0 && idx < 12 {
+		// Only strip if the text before the comma looks like a weekday name.
+		prefix := strings.TrimSpace(s[:idx])
+		weekdays := []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
+		for _, wd := range weekdays {
+			if strings.EqualFold(prefix, wd) {
+				s = strings.TrimSpace(s[idx+2:])
+				break
+			}
+		}
+	}
+	// Normalize timezone abbreviation+offset like "GMT+05:00" → "+05:00".
+	// GMT prefix is dropped; the +/-HH:MM offset is kept (ISO convention:
+	// +05:00 means UTC+5, consistent with PostgreSQL's timestamptz_in).
+	s = normalizeTimestampTZ(s)
+
+	// Try layouts for "Month D, YYYY H:MM:SS[.ff] AM/PM ±HH:MM" and variants.
+	layouts := []string{
+		"January 2, 2006 3:04:05.999 PM -07:00",
+		"January 2, 2006 3:04:05.99 PM -07:00",
+		"January 2, 2006 3:04:05.9 PM -07:00",
+		"January 2, 2006 3:04:05 PM -07:00",
+		"January 2, 2006 15:04:05.999 -07:00",
+		"January 2, 2006 15:04:05 -07:00",
+		"January 2, 2006 3:04:05.999 PM",
+		"January 2, 2006 3:04:05 PM",
+		"January 2, 2006 15:04:05.999",
+		"January 2, 2006 15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("parseFullTimestamp: cannot parse %q", s)
+}
+
+// normalizeTimestampTZ converts POSIX-style timezone names like "GMT+05:00" or
+// "UTC-08:00" into ISO-style numeric offsets that Go's time.Parse understands.
+// In POSIX convention, GMT+H means UTC-H (sign is inverted vs ISO 8601), so we
+// flip the sign when stripping the prefix.  A bare "GMT"/"UTC" maps to "+00:00".
+func normalizeTimestampTZ(s string) string {
+	for _, prefix := range []string{"GMT", "UTC"} {
+		upper := strings.ToUpper(s)
+		if idx := strings.Index(upper, prefix); idx >= 0 {
+			after := s[idx+len(prefix):]
+			if len(after) > 0 && (after[0] == '+' || after[0] == '-') {
+				// Flip sign: POSIX "GMT+5" = ISO "-05:00"
+				flipped := "-"
+				if after[0] == '-' {
+					flipped = "+"
+				}
+				s = s[:idx] + flipped + after[1:]
+				return strings.TrimSpace(s)
+			} else if len(after) == 0 || after[0] == ' ' {
+				s = s[:idx] + "+00:00" + after
+				return strings.TrimSpace(s)
+			}
+		}
+	}
+	return s
 }

@@ -1,0 +1,65 @@
+pgbench (18.3)
+starting vacuum...end.
+pgbench: error: pgbench:pgbench: error: client 48 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+ error: client 39 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+client 47 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 41 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: pgbench: error: client 37 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+client 42 aborted in command 6 (SQL) of script 0; perhaps the backend died while processing
+pgbench: pgbench: error: client 38 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+error: client 43 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench:pgbench: pgbench: error: client 36 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+error: client 34 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+ error: client 45 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 44 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 46 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 40 aborted in command 6 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 0 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 49 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 35 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 33 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 31 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 28 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 32 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 30 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 29 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench:pgbench: error:  error: client 25 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 27 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+client 26 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 24 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 23 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 22 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 21 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 20 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench:pgbench: error: client 18 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+ error: client 19 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 17 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench:pgbench: error: client 15 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+ error: client 16 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 13 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 14 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 12 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 11 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 9 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 8 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 10 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 6 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 7 aborted in command 6 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 5 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 4 aborted in command 6 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 3 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 2 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+pgbench: error: client 1 aborted in command 8 (SQL) of script 0; perhaps the backend died while processing
+transaction type: <builtin: simple update>
+scaling factor: 100
+query mode: simple
+number of clients: 50
+number of threads: 50
+maximum number of tries: 1
+duration: 90 s
+number of transactions actually processed: 477
+number of failed transactions: 0 (0.000%)
+latency average = 118.783 ms
+initial connection time = 4.886 ms
+tps = 420.935960 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.

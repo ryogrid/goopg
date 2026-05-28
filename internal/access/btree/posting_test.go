@@ -112,16 +112,16 @@ func TestBulkCreateDeduplication(t *testing.T) {
 
 	// 7 distinct "shipmode-like" values, each padded to 30 chars (no nulls)
 	// to simulate a composite index key. The encoded key is 31 bytes
-	// (EncodeVarchar adds a 0x00 terminator) which fits within MaxHighKeyLen=32.
+	// (EncodeVarchar adds a 0x00 terminator) which fits within MaxHighKeyLen=256.
 	// 500 entries each = 3500 total.
 	const numKeys = 7
 	const perKey = 1000 // 1000 TIDs per key → each posting item ≈6 KB = 1 leaf page
-	const padTo = 29   // 29 chars + 0x00 terminator = 30 bytes ≤ MaxHighKeyLen=32
+	const padTo = 29   // 29 chars + 0x00 terminator = 30 bytes ≤ MaxHighKeyLen=256
 	baseKeys := []string{"AIR", "MAIL", "RAIL", "REGAIR", "SHIP", "TRUCK", "FOB"}
 
 	padKey := func(s string) []byte {
 		// Pad with 'X' to avoid null bytes (which EncodeVarchar would
-		// escape into 2-byte sequences, blowing past MaxHighKeyLen=32).
+		// escape into 2-byte sequences, blowing past MaxHighKeyLen=256).
 		b := make([]byte, padTo)
 		for i := range b {
 			b[i] = 'X'

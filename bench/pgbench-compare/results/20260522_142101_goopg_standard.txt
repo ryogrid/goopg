@@ -1,0 +1,25 @@
+pgbench (18.3)
+starting vacuum...end.
+pgbench: error: client 5 script 0 aborted in command 6 query 0: ERROR:  DecodePhysicalPGRow: filler: truncated varlena
+pgbench: error: client 2 script 0 aborted in command 6 query 0: ERROR:  DecodePhysicalPGRow: filler: truncated varlena
+pgbench: error: client 7 script 0 aborted in command 6 query 0: ERROR:  DecodePhysicalPGRow: filler: truncated varlena
+pgbench: error: client 0 script 0 aborted in command 6 query 0: ERROR:  DecodePhysicalPGRow: filler: truncated varlena
+pgbench: error: client 6 script 0 aborted in command 6 query 0: ERROR:  DecodePhysicalPGRow: filler: truncated varlena
+pgbench: error: client 9 script 0 aborted in command 6 query 0: ERROR:  DecodePhysicalPGRow: filler: truncated varlena
+pgbench: error: client 1 script 0 aborted in command 6 query 0: ERROR:  DecodePhysicalPGRow: filler: truncated varlena
+pgbench: error: client 8 script 0 aborted in command 6 query 0: ERROR:  DecodePhysicalPGRow: filler: truncated varlena
+pgbench: error: client 4 script 0 aborted in command 6 query 0: ERROR:  DecodePhysicalPGRow: filler: truncated varlena
+pgbench: error: client 3 script 0 aborted in command 6 query 0: ERROR:  DecodePhysicalPGRow: filler: truncated varlena
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 100
+query mode: simple
+number of clients: 10
+number of threads: 2
+maximum number of tries: 1
+duration: 60 s
+number of transactions actually processed: 2605
+number of failed transactions: 0 (0.000%)
+latency average = 45.749 ms
+initial connection time = 2.542 ms
+tps = 218.583967 (without initial connection time)
+pgbench: error: Run was aborted; the above results are incomplete.

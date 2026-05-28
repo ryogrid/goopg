@@ -253,10 +253,34 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 			if rightMatched[j] {
 				continue
 			}
-			o.rows = append(o.rows, concatRows(nullLeft, r))
+			// M0097-0060: FULL JOIN USING coalescing. For unmatched
+			// right rows the left side is all NULL; copy each USING
+			// column value from the right position to the left position
+			// so `SELECT *` sees COALESCE(left.col, right.col) = right.col.
+			merged := concatRows(nullLeft, r)
+			for k, lIdx := range o.plan.UsingLeftCols {
+				rIdx := o.plan.UsingRightCols[k]
+				if rIdx < len(merged) {
+					merged[lIdx] = merged[rIdx]
+				}
+			}
+			o.rows = append(o.rows, merged)
 		}
 	}
 	return nil
+}
+
+// coalesceUsingRow applies FULL JOIN USING coalescing: for each USING
+// column pair, copy the right-side value into the left-side position
+// so star-expansion sees the correct non-NULL value for unmatched right
+// rows. Modifies merged in place. M0097-0060.
+func (o *joinOp) coalesceUsingRow(merged Row) {
+	for k, lIdx := range o.plan.UsingLeftCols {
+		rIdx := o.plan.UsingRightCols[k]
+		if lIdx < len(merged) && rIdx < len(merged) {
+			merged[lIdx] = merged[rIdx]
+		}
+	}
 }
 
 // openLazyHashJoin builds a hash table from the build side and sets
@@ -420,7 +444,9 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 			i++
 		case cmp > 0:
 			if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-				o.rows = append(o.rows, concatRows(nullLeft, rightKeyed[j].row))
+				merged := concatRows(nullLeft, rightKeyed[j].row)
+				o.coalesceUsingRow(merged)
+				o.rows = append(o.rows, merged)
 			}
 			j++
 		default:
@@ -461,7 +487,9 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 	}
 	for ; j < len(rightKeyed); j++ {
 		if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
-			o.rows = append(o.rows, concatRows(nullLeft, rightKeyed[j].row))
+			merged := concatRows(nullLeft, rightKeyed[j].row)
+			o.coalesceUsingRow(merged)
+			o.rows = append(o.rows, merged)
 		}
 	}
 
@@ -472,7 +500,9 @@ func (o *joinOp) runMergeJoin(leftRows, rightRows []Row, leftWidth, rightWidth i
 	}
 	if o.plan.Type == planner.JoinTypeRight || o.plan.Type == planner.JoinTypeFull {
 		for _, r := range rightNull {
-			o.rows = append(o.rows, concatRows(nullLeft, r))
+			merged := concatRows(nullLeft, r)
+			o.coalesceUsingRow(merged)
+			o.rows = append(o.rows, merged)
 		}
 	}
 
@@ -814,6 +844,17 @@ type aggregateOp struct {
 	idx  int
 }
 
+// floatSpecialKind encodes the IEEE 754 special-value state for
+// sum/avg when float4/float8 inputs contain NaN or Infinity.
+type floatSpecialKind int8
+
+const (
+	floatSpecialNone     floatSpecialKind = 0
+	floatSpecialNaN      floatSpecialKind = 1 // NaN dominates all
+	floatSpecialPosInf   floatSpecialKind = 2 // +Infinity
+	floatSpecialNegInf   floatSpecialKind = 3 // -Infinity
+)
+
 type aggRuntime struct {
 	hasValue bool
 	value    Datum
@@ -824,7 +865,11 @@ type aggRuntime struct {
 	sum        int64
 	numericSum Datum
 	count      int64
-	distinct   map[string]struct{}
+	// floatSpecial tracks NaN/Infinity state for sum/avg when float
+	// inputs contain special IEEE 754 values (stored as KindString).
+	// M0097-0053.
+	floatSpecial floatSpecialKind
+	distinct     map[string]struct{}
 	// Extended aggregate accumulators (M0097-0007).
 	boolResult bool   // for bool_and / bool_or / every
 	intResult  int64  // for bit_and / bit_or / bit_xor
@@ -838,6 +883,9 @@ type aggRuntime struct {
 	// pg_get_publication_tables. M0103-0008 probe-survival.
 	arrayElems    []string
 	arrayElemNull []bool
+	// arrayElemKeys stores ORDER BY key values for array_agg(x ORDER BY y).
+	// Each entry corresponds to arrayElems[i]; nil when no ORDER BY.
+	arrayElemKeys [][]Datum
 }
 
 func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
@@ -1026,6 +1074,34 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 				return &ExecError{Code: "22003", Pos: call.Pos(), Message: err.Error()}
 			}
 			st.numericSum = s
+		case KindString:
+			// Special IEEE 754 float values (NaN, Infinity, -Infinity) are
+			// stored as KindString by the codec. Handle them here so
+			// sum/avg on float4/float8 columns with special values works.
+			// NaN dominates; +Inf and -Inf obey IEEE addition rules.
+			// M0097-0053.
+			switch arg.StringValue() {
+			case "NaN":
+				st.floatSpecial = floatSpecialNaN
+			case "Infinity":
+				switch st.floatSpecial {
+				case floatSpecialNegInf:
+					st.floatSpecial = floatSpecialNaN // +Inf + (-Inf) = NaN
+				case floatSpecialNone:
+					st.floatSpecial = floatSpecialPosInf
+				// floatSpecialNaN: stays NaN; floatSpecialPosInf: stays +Inf
+				}
+			case "-Infinity":
+				switch st.floatSpecial {
+				case floatSpecialPosInf:
+					st.floatSpecial = floatSpecialNaN // -Inf + (+Inf) = NaN
+				case floatSpecialNone:
+					st.floatSpecial = floatSpecialNegInf
+				// floatSpecialNaN: stays NaN; floatSpecialNegInf: stays -Inf
+				}
+			default:
+				return &ExecError{Code: "42804", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s requires numeric argument in v0", name)}
+			}
 		default:
 			return &ExecError{Code: "42804", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s requires numeric argument in v0", name)}
 		}
@@ -1121,8 +1197,8 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 			st.strResult += "," + sv
 		}
 	case "array_agg":
-		// array_agg(expr) — accumulate per-row elements. NULLs are
-		// permitted as array elements upstream, but the IsNull early-
+		// array_agg(expr [ORDER BY sort_list]) — accumulate per-row elements.
+		// NULLs are permitted as array elements upstream, but the IsNull early-
 		// return above already skipped them; that matches goopg's
 		// existing aggregate convention (count/sum/etc. all skip NULL
 		// inputs) and is sufficient for the M0103-0008 probe query
@@ -1134,6 +1210,18 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 		// would print them.
 		st.arrayElems = append(st.arrayElems, arg.Format())
 		st.arrayElemNull = append(st.arrayElemNull, false)
+		// Evaluate ORDER BY expressions for later sorting in finishAgg.
+		if len(call.OrderBy) > 0 {
+			keys := make([]Datum, 0, len(call.OrderBy))
+			for _, sk := range call.OrderBy {
+				kv, kerr := evalExprSlot(sk.Expr, slot, o.ctx)
+				if kerr != nil {
+					kv = NullDatum
+				}
+				keys = append(keys, kv.MaterializeArena())
+			}
+			st.arrayElemKeys = append(st.arrayElemKeys, keys)
+		}
 		st.hasValue = true
 	case "any_value":
 		// any_value(x) — return the first non-null value seen.
@@ -1161,6 +1249,16 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if !st.hasValue {
 			return NullDatum
 		}
+		// IEEE 754 special values from float4/float8 columns take precedence.
+		// M0097-0053.
+		switch st.floatSpecial {
+		case floatSpecialNaN:
+			return NewStringDatum("NaN")
+		case floatSpecialPosInf:
+			return NewStringDatum("Infinity")
+		case floatSpecialNegInf:
+			return NewStringDatum("-Infinity")
+		}
 		if st.numericSum.Kind == KindNumeric {
 			return st.numericSum
 		}
@@ -1169,6 +1267,15 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if st.count == 0 {
 			return NullDatum
 		}
+		// IEEE 754 special values from float4/float8 columns. M0097-0053.
+		switch st.floatSpecial {
+		case floatSpecialNaN:
+			return NewStringDatum("NaN")
+		case floatSpecialPosInf:
+			return NewStringDatum("Infinity")
+		case floatSpecialNegInf:
+			return NewStringDatum("-Infinity")
+		}
 		if st.numericSum.Kind == KindNumeric {
 			d, err := numericDiv(st.numericSum, numericFromInt(st.count), call.Pos())
 			if err != nil {
@@ -1176,7 +1283,14 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 			}
 			return d
 		}
-		return Datum{Kind: KindInt, Int: st.sum / st.count}
+		// avg(integer types) must return numeric, not integer (PostgreSQL
+		// behaviour: avg(int2/int4/int8) → numeric). M0097-0053.
+		numSum := numericFromInt(st.sum)
+		d, err := numericDiv(numSum, numericFromInt(st.count), call.Pos())
+		if err != nil {
+			return NullDatum
+		}
+		return d
 	case "min", "max":
 		if !st.hasValue {
 			return NullDatum
@@ -1200,6 +1314,40 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 	case "array_agg":
 		if !st.hasValue {
 			return NullDatum
+		}
+		// Sort elements by ORDER BY keys if present.
+		if len(st.arrayElemKeys) == len(st.arrayElems) && len(st.arrayElemKeys) > 0 {
+			// Build index slice and sort by keys.
+			idx := make([]int, len(st.arrayElems))
+			for i := range idx {
+				idx[i] = i
+			}
+			orderByDescs := make([]bool, len(call.OrderBy))
+			for i, sk := range call.OrderBy {
+				orderByDescs[i] = sk.Desc
+			}
+			sort.SliceStable(idx, func(a, b int) bool {
+				ka, kb := st.arrayElemKeys[idx[a]], st.arrayElemKeys[idx[b]]
+				for ki := range ka {
+					if ki >= len(kb) {
+						break
+					}
+					cmp, err := compareDatum(ka[ki], kb[ki], 0)
+					if err != nil || cmp == 0 {
+						continue
+					}
+					if ki < len(orderByDescs) && orderByDescs[ki] {
+						return cmp > 0
+					}
+					return cmp < 0
+				}
+				return false
+			})
+			sorted := make([]string, len(st.arrayElems))
+			for i, origIdx := range idx {
+				sorted[i] = st.arrayElems[origIdx]
+			}
+			return NewStringDatum(formatTextArray(sorted))
 		}
 		// NULL elements are not currently distinguished — applyAgg's
 		// IsNull early-return drops them. Suffices for the M0103-0008

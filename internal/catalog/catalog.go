@@ -24,6 +24,16 @@ var (
 	ErrDatabaseNotFound = errors.New("database does not exist")
 )
 
+// AdvisoryLockRowsFunc is optionally set by the executor to provide
+// currently-held advisory lock rows for the pg_locks virtual table.
+// Each returned slice has the same column order as pg_locks.VirtualRows:
+// locktype, database, relation, page, tuple, virtualxid, transactionid,
+// classid, objid, objsubid, virtualtransaction, pid, mode, granted,
+// fastpath, waitstart.
+// This avoids an import cycle (executor → catalog; catalog must not → executor).
+// M0097-0021.
+var AdvisoryLockRowsFunc func() [][]string
+
 // Type is the textual type tag plus an optional typmod argument list.
 // v0 keeps types as strings so the planner doesn't need a real type
 // system; the executor casts based on Type.Name until the type system
@@ -285,6 +295,9 @@ type Catalog interface {
 	AddColumn(table *Table, col Column) (*Column, error)
 	DropTable(name parser.ObjectName) error
 	DropIndex(name parser.ObjectName) error
+	// TablesInSchema returns the names of all non-virtual user tables in the given
+	// schema.  Used by DROP SCHEMA CASCADE. M0097-0020.
+	TablesInSchema(schemaName string) []parser.ObjectName
 	IndexesOnTable(table *Table) []*Index
 	HasPrimaryKey(table *Table) bool
 	RelFileNode(table *Table) storage.RelFileNode
@@ -340,6 +353,10 @@ type InMemory struct {
 	enumTypes map[string]*EnumType
 	// domains holds user-defined domain types. M0097-0017.
 	domains map[string]*Domain
+	// compositeTypeNames tracks names of composite/range/base types created via
+	// CREATE TYPE ... AS (...). Since we don't implement composite type evaluation,
+	// we only track the name so DROP TYPE can succeed silently. M0097-0064.
+	compositeTypeNames map[string]bool
 
 	// constraintViewDeps maps "tableOID:constraintName" → []viewName for
 	// views that rely on the constraint for GROUP BY functional dependency.
@@ -352,11 +369,20 @@ type InMemory struct {
 	opClassHashFuncs map[string]string
 }
 
+// EnumValue is one label in a user-defined enum type together with its sort
+// position, matching pg_enum.enumsortorder (float4). Initial values start at
+// 1.0, 2.0, …; BEFORE/AFTER insertions get the midpoint of their neighbours.
+// M0097-0071.
+type EnumValue struct {
+	Label     string
+	SortOrder float64
+}
+
 // EnumType holds one user-defined enum type. M0097-0017.
 type EnumType struct {
 	Name   string
 	OID    uint32
-	Values []string // ordered labels; position = sortorder (0-based)
+	Values []EnumValue // ordered by SortOrder; each element stores its own sortorder
 }
 
 // Domain holds one user-defined domain type. M0097-0017.
@@ -422,6 +448,7 @@ func NewInMemory() *InMemory {
 		inheritanceChildren: make(map[uint32][]uint32),
 		enumTypes:           make(map[string]*EnumType),
 		domains:             make(map[string]*Domain),
+		compositeTypeNames:  make(map[string]bool),
 		constraintViewDeps:  make(map[string][]string),
 		opClassHashFuncs:    make(map[string]string),
 	}
@@ -898,7 +925,7 @@ func (c *InMemory) registerSystemTables() {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		out := make([][]string, 0, len(c.tables))
+		out := make([][]string, 0, len(c.tables)+len(c.indexes))
 		for _, k := range keys {
 			t := c.tables[k]
 			if t.Virtual {
@@ -927,6 +954,27 @@ func (c *InMemory) registerSystemTables() {
 				populated,                    // relispopulated
 				strconv.Itoa(len(t.Columns)), // relnatts: number of user columns
 				"d",                          // relreplident: REPLICA_IDENTITY_DEFAULT
+			})
+		}
+		// Emit index rows (relkind='i') so pg_class can be used to count indexes.
+		idxKeys := make([]string, 0, len(c.indexes))
+		for k := range c.indexes {
+			idxKeys = append(idxKeys, k)
+		}
+		sort.Strings(idxKeys)
+		for _, k := range idxKeys {
+			idx := c.indexes[k]
+			out = append(out, []string{
+				strconv.Itoa(int(idx.OID)), // oid
+				idx.Name,                   // relname
+				"i",                        // relkind = index
+				"2200",                     // relnamespace
+				"p",                        // relpersistence
+				"0",                        // reltoastrelid
+				"0",                        // relpages
+				"t",                        // relispopulated
+				"0",                        // relnatts
+				"n",                        // relreplident: not applicable for indexes
 			})
 		}
 		return out
@@ -1032,14 +1080,15 @@ func (c *InMemory) registerSystemTables() {
 		Schema: "pg_catalog",
 		Name:   "pg_database",
 		Columns: []Column{
-			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 0},
-			{Name: "datdba", Type: Type{Name: "text"}, Ordinal: 1},
-			{Name: "encoding", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "datdba", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "encoding", Type: Type{Name: "text"}, Ordinal: 3},
 			// Additional columns for vacuumdb --all (M0095-0004).
-			{Name: "datallowconn", Type: Type{Name: "boolean"}, Ordinal: 3},
-			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 4},
+			{Name: "datallowconn", Type: Type{Name: "boolean"}, Ordinal: 4},
+			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 5},
 			// datistemplate: standard pg_database column; false for all live databases (M0097-0021).
-			{Name: "datistemplate", Type: Type{Name: "boolean"}, Ordinal: 5},
+			{Name: "datistemplate", Type: Type{Name: "boolean"}, Ordinal: 6},
 		},
 		OID:     1262, // upstream's DatabaseRelationId
 		Virtual: true,
@@ -1052,6 +1101,7 @@ func (c *InMemory) registerSystemTables() {
 		out := make([][]string, 0, len(names))
 		for _, n := range names {
 			out = append(out, []string{
+				"16384", // oid: conventional database OID (M0097-0021)
 				n,
 				"10",    // datdba: OID of owner (10 = postgres superuser)
 				"6",     // encoding: 6 = UTF8
@@ -1223,12 +1273,12 @@ func (c *InMemory) registerSystemTables() {
 		oid := 20000
 		for _, name := range names {
 			et := c.enumTypes[name]
-			for i, label := range et.Values {
+			for _, ev := range et.Values {
 				rows = append(rows, []string{
 					fmt.Sprintf("%d", oid),
 					et.Name,
-					fmt.Sprintf("%d", i+1),
-					label,
+					strconv.FormatFloat(ev.SortOrder, 'f', -1, 32),
+					ev.Label,
 				})
 				oid++
 			}
@@ -1245,13 +1295,18 @@ func (c *InMemory) registerSystemTables() {
 
 	// ── M0097-0018: system views needed by regress tests ──────────────────
 
-	// pg_locks: return at least one row so count(*) > 0 passes.
+	// pg_locks: return static relation row plus live advisory lock rows.
+	// M0097-0021: AdvisoryLockRowsFunc is set by the executor at init time.
 	pgLocks.VirtualRows = func() [][]string {
-		return [][]string{
-			// locktype, database, relation, page, tuple, virtualxid, transactionid,
-			// classid, objid, objsubid, virtualtransaction, pid, mode, granted, fastpath, waitstart
+		// locktype, database, relation, page, tuple, virtualxid, transactionid,
+		// classid, objid, objsubid, virtualtransaction, pid, mode, granted, fastpath, waitstart
+		rows := [][]string{
 			{"relation", "16384", "1259", "", "", "", "", "", "", "", "1/1", "0", "AccessShareLock", "t", "t", ""},
 		}
+		if AdvisoryLockRowsFunc != nil {
+			rows = append(rows, AdvisoryLockRowsFunc()...)
+		}
+		return rows
 	}
 
 	// pg_available_extensions — 0 rows is fine.
@@ -1524,6 +1579,39 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.tables["pg_catalog.pg_stat_wal"] = pgStatWal
 
+	// pg_stat_io — per-backend-type I/O statistics (PG 16+, OID 8061).
+	// goopg v0 does not track I/O statistics; all counters are 0 and no
+	// rows are returned. The table exists so queries filtering by
+	// backend_type (e.g. 'walsummarizer') succeed and return 0 rows.
+	pgStatIO := &Table{
+		Schema: "pg_catalog", Name: "pg_stat_io", Virtual: true,
+		Columns: []Column{
+			{Name: "backend_type", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "object", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "context", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "reads", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "read_bytes", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "read_time", Type: Type{Name: "float8"}, Ordinal: 5},
+			{Name: "writes", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "write_bytes", Type: Type{Name: "int8"}, Ordinal: 7},
+			{Name: "write_time", Type: Type{Name: "float8"}, Ordinal: 8},
+			{Name: "writebacks", Type: Type{Name: "int8"}, Ordinal: 9},
+			{Name: "writeback_time", Type: Type{Name: "float8"}, Ordinal: 10},
+			{Name: "extends", Type: Type{Name: "int8"}, Ordinal: 11},
+			{Name: "extend_bytes", Type: Type{Name: "int8"}, Ordinal: 12},
+			{Name: "extend_time", Type: Type{Name: "float8"}, Ordinal: 13},
+			{Name: "hits", Type: Type{Name: "int8"}, Ordinal: 14},
+			{Name: "evictions", Type: Type{Name: "int8"}, Ordinal: 15},
+			{Name: "reuses", Type: Type{Name: "int8"}, Ordinal: 16},
+			{Name: "fsyncs", Type: Type{Name: "int8"}, Ordinal: 17},
+			{Name: "fsync_time", Type: Type{Name: "float8"}, Ordinal: 18},
+			{Name: "stats_reset", Type: Type{Name: "timestamptz"}, Ordinal: 19},
+		},
+		OID: 8061,
+	}
+	pgStatIO.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_stat_io"] = pgStatIO
+
 	// pg_wait_events — needs at least one row per type.
 	pgWaitEvents := &Table{
 		Schema: "pg_catalog", Name: "pg_wait_events", Virtual: true,
@@ -1767,6 +1855,19 @@ func (c *InMemory) registerSystemTables() {
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
 			{"enable_tidscan", "on", "", "Query Tuning / Planner Method Configuration",
 				"Enables the planner's use of TID scan plans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			// Additional planner GUCs needed for regress tests. M0097-0069.
+			{"from_collapse_limit", "8", "", "Query Tuning / Planner Cost Constants",
+				"Sets the FROM-list size beyond which subqueries are not collapsed.", "",
+				"user", "integer", "default", "1", "2147483647", "", "8", "8", "", "", "f"},
+			{"join_collapse_limit", "8", "", "Query Tuning / Planner Cost Constants",
+				"Sets the FROM-list size beyond which JOIN constructs are not flattened.", "",
+				"user", "integer", "default", "1", "2147483647", "", "8", "8", "", "", "f"},
+			{"hash_mem_multiplier", "2.0", "", "Query Tuning / Planner Cost Constants",
+				"Multiple of work_mem to use for hash tables.", "",
+				"user", "real", "default", "1", "1000", "", "2", "2", "", "", "f"},
+			{"parallel_leader_participation", "on", "", "Query Tuning / Planner Method Configuration",
+				"Controls whether Gather and Gather Merge also run subplans.", "",
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
 		}
 		// PostgreSQL's pg_settings view is backed by the alphabetically
@@ -2098,6 +2199,30 @@ func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
 	return nil
 }
 
+// TablesInSchema returns the names of all non-virtual user tables whose Schema
+// field matches schemaName (case-insensitive).  Virtual/system tables in
+// pg_catalog or information_schema are excluded.  Used by DROP SCHEMA CASCADE
+// to identify objects to cascade-drop. M0097-0020.
+func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	schemaLC := strings.ToLower(schemaName)
+	var out []parser.ObjectName
+	for _, t := range c.tables {
+		if t.Virtual {
+			continue // skip system/virtual tables
+		}
+		tSchema := t.Schema
+		if tSchema == "" {
+			tSchema = "public"
+		}
+		if strings.ToLower(tSchema) == schemaLC {
+			out = append(out, parser.ObjectName{Schema: t.Schema, Name: t.Name})
+		}
+	}
+	return out
+}
+
 func (c *InMemory) DropTable(name parser.ObjectName) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2320,10 +2445,14 @@ func (c *InMemory) RegisterEnum(name string, values []string) (*EnumType, error)
 	if _, exists := c.enumTypes[k]; exists {
 		return nil, fmt.Errorf("type %q already exists", name)
 	}
+	evs := make([]EnumValue, len(values))
+	for i, v := range values {
+		evs[i] = EnumValue{Label: v, SortOrder: float64(i + 1)}
+	}
 	et := &EnumType{
 		Name:   k,
 		OID:    c.nextOID,
-		Values: append([]string(nil), values...),
+		Values: evs,
 	}
 	c.nextOID++
 	c.enumTypes[k] = et
@@ -2339,55 +2468,109 @@ func (c *InMemory) LookupEnum(name string) (*EnumType, bool) {
 	return et, ok
 }
 
+// EnumLabelTooLong is returned by AddEnumValue when value exceeds 63 bytes.
+// Code 22P02 is used in execAlterType.
+type EnumLabelTooLong struct{ Label string }
+
+func (e *EnumLabelTooLong) Error() string {
+	return fmt.Sprintf("invalid enum label %q", e.Label)
+}
+
+// EnumLabelNotFound is returned when BEFORE/AFTER reference label is not found.
+// The message matches PostgreSQL's wording.
+type EnumLabelNotFound struct{ Label string }
+
+func (e *EnumLabelNotFound) Error() string {
+	return fmt.Sprintf("%q is not an existing enum label", e.Label)
+}
+
 // AddEnumValue appends a new label to an existing enum. before/after are
 // reference labels (empty = append at end). Returns an error if label already
-// exists unless ifNotExists is true, in which case it is a no-op. M0097-0017.
+// exists unless ifNotExists is true, in which case it is a no-op (returns nil).
+//
+// To distinguish the "skipped duplicate" case (for NOTICE emission), use
+// AddEnumValueResult which returns a skipped bool. M0097-0017.
 func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, after string) error {
+	_, err := c.AddEnumValueResult(name, value, ifNotExists, before, after)
+	return err
+}
+
+// AddEnumValueResult is like AddEnumValue but also returns skipped=true when
+// ifNotExists=true and the label already exists (caller should emit a NOTICE).
+// M0097-0063.
+func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, before, after string) (skipped bool, err error) {
+	// PostgreSQL limits enum labels to 63 bytes (NAMEDATALEN-1). M0097-0063.
+	if len(value) > 63 {
+		return false, &EnumLabelTooLong{Label: value}
+	}
 	k := strings.ToLower(name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	et, ok := c.enumTypes[k]
 	if !ok {
-		return fmt.Errorf("type %q does not exist", name)
+		return false, fmt.Errorf("type %q does not exist", name)
 	}
 	// Check for duplicate.
 	for _, v := range et.Values {
-		if strings.EqualFold(v, value) {
+		if strings.EqualFold(v.Label, value) {
 			if ifNotExists {
-				return nil
+				return true, nil // skipped — caller should emit NOTICE
 			}
-			return fmt.Errorf("enum label %q already exists", value)
+			return false, fmt.Errorf("enum label %q already exists", value)
 		}
 	}
 	switch {
 	case before != "":
 		for i, v := range et.Values {
-			if strings.EqualFold(v, before) {
-				newVals := make([]string, 0, len(et.Values)+1)
+			if strings.EqualFold(v.Label, before) {
+				// Compute sortorder: midpoint of predecessor and v, or v-1 if first.
+				var newSortOrder float64
+				if i == 0 {
+					newSortOrder = v.SortOrder - 1
+				} else {
+					newSortOrder = (et.Values[i-1].SortOrder + v.SortOrder) / 2
+				}
+				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
+				newVals := make([]EnumValue, 0, len(et.Values)+1)
 				newVals = append(newVals, et.Values[:i]...)
-				newVals = append(newVals, value)
+				newVals = append(newVals, newEV)
 				newVals = append(newVals, et.Values[i:]...)
 				et.Values = newVals
-				return nil
+				return false, nil
 			}
 		}
-		return fmt.Errorf("enum label %q not found", before)
+		return false, &EnumLabelNotFound{Label: before}
 	case after != "":
 		for i, v := range et.Values {
-			if strings.EqualFold(v, after) {
-				newVals := make([]string, 0, len(et.Values)+1)
+			if strings.EqualFold(v.Label, after) {
+				// Compute sortorder: midpoint of v and successor, or v+1 if last.
+				var newSortOrder float64
+				if i+1 == len(et.Values) {
+					newSortOrder = v.SortOrder + 1
+				} else {
+					newSortOrder = (v.SortOrder + et.Values[i+1].SortOrder) / 2
+				}
+				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
+				newVals := make([]EnumValue, 0, len(et.Values)+1)
 				newVals = append(newVals, et.Values[:i+1]...)
-				newVals = append(newVals, value)
+				newVals = append(newVals, newEV)
 				newVals = append(newVals, et.Values[i+1:]...)
 				et.Values = newVals
-				return nil
+				return false, nil
 			}
 		}
-		return fmt.Errorf("enum label %q not found", after)
+		return false, &EnumLabelNotFound{Label: after}
 	default:
-		et.Values = append(et.Values, value)
+		// Append: sortorder = last + 1, or 1 for first element.
+		var newSortOrder float64
+		if len(et.Values) == 0 {
+			newSortOrder = 1
+		} else {
+			newSortOrder = et.Values[len(et.Values)-1].SortOrder + 1
+		}
+		et.Values = append(et.Values, EnumValue{Label: value, SortOrder: newSortOrder})
 	}
-	return nil
+	return false, nil
 }
 
 // DropEnum removes an enum type. cascade=true is accepted (stub — does not
@@ -2400,6 +2583,30 @@ func (c *InMemory) DropEnum(name string, cascade bool) error {
 		return fmt.Errorf("type %q does not exist", name)
 	}
 	delete(c.enumTypes, k)
+	return nil
+}
+
+// RegisterCompositeType records a composite/range/base type name so that
+// DROP TYPE can succeed. We don't model composite type internals in v0;
+// tracking the name is enough for DROP TYPE to avoid a false-positive error.
+// M0097-0064.
+func (c *InMemory) RegisterCompositeType(name string) {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.compositeTypeNames[k] = true
+}
+
+// DropCompositeType removes a composite type name. Returns an error if not
+// found. M0097-0064.
+func (c *InMemory) DropCompositeType(name string) error {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.compositeTypeNames[k] {
+		return fmt.Errorf("type %q does not exist", name)
+	}
+	delete(c.compositeTypeNames, k)
 	return nil
 }
 

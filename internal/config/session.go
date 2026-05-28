@@ -64,6 +64,11 @@ func (s *SessionRegistry) Get(name string) (*Variable, string, bool) {
 // the variable doesn't exist, the value fails validation, or the
 // variable's Context forbids SQL-driven changes.
 func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
+	// SET x TO DEFAULT / SET x = DEFAULT resets to the boot value.
+	// Treat "DEFAULT" (case-insensitive) the same as RESET.
+	if strings.EqualFold(value, "DEFAULT") {
+		return s.Reset(name)
+	}
 	v, ok := s.lookupVariable(name)
 	if !ok {
 		if !isCustomGUCName(name) {

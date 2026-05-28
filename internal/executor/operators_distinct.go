@@ -4,6 +4,8 @@ package executor
 // M0097-0005.
 
 import (
+	"sort"
+
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -53,6 +55,29 @@ func (o *distinctOp) Open(ctx *Context) error {
 		seen[k] = struct{}{}
 		o.rows = append(o.rows, ownedRow)
 	}
+	// Sort rows for deterministic output matching PostgreSQL's sort-based
+	// DISTINCT: NULL values sort last, non-null values by datum order.
+	sort.Slice(o.rows, func(i, j int) bool {
+		ri, rj := o.rows[i], o.rows[j]
+		for col := 0; col < len(ri) && col < len(rj); col++ {
+			a, b := ri[col], rj[col]
+			if a.IsNull() && b.IsNull() {
+				continue
+			}
+			if a.IsNull() {
+				return false // NULLs last
+			}
+			if b.IsNull() {
+				return true
+			}
+			cmp, err := compareDatum(a, b, 0)
+			if err != nil || cmp == 0 {
+				continue
+			}
+			return cmp < 0
+		}
+		return len(ri) < len(rj)
+	})
 	return nil
 }
 
@@ -70,3 +95,59 @@ func (o *distinctOp) Next() (TupleSlot, error) {
 }
 
 func (o *distinctOp) Close() error { return o.child.Close() }
+
+// distinctOnOp implements SELECT DISTINCT ON (key,...) by reading sorted input
+// and emitting only the first row per distinct key combination.
+// The child must be pre-sorted so rows with equal keys are contiguous.
+type distinctOnOp struct {
+	plan    *planner.DistinctOn
+	child   Operator
+	ctx     *Context
+	schema  planner.Schema
+	prevKey string
+	started bool
+}
+
+func newDistinctOnOp(p *planner.DistinctOn, child Operator) *distinctOnOp {
+	return &distinctOnOp{plan: p, child: child, schema: p.Output()}
+}
+
+func (o *distinctOnOp) Schema() planner.Schema { return o.schema }
+
+func (o *distinctOnOp) Open(ctx *Context) error {
+	o.ctx = ctx
+	o.started = false
+	o.prevKey = ""
+	return o.child.Open(ctx)
+}
+
+func (o *distinctOnOp) Next() (TupleSlot, error) {
+	keyCols := o.plan.KeyCols
+	for {
+		slot, err := o.child.Next()
+		if err != nil {
+			return nil, err
+		}
+		if slot == nil {
+			continue
+		}
+		row := slot.Row()
+		// Build a key from the DISTINCT ON columns.
+		var key string
+		for _, idx := range keyCols {
+			if idx >= 0 && idx < len(row) {
+				key += datumKey(row[idx]) + "\x00"
+			}
+		}
+		if !o.started || key != o.prevKey {
+			o.started = true
+			o.prevKey = key
+			return SlotFromRow(o.schema, cloneRow(row)), nil
+		}
+		// Duplicate key: skip this row.
+	}
+}
+
+func (o *distinctOnOp) Close() error { return o.child.Close() }
+
+

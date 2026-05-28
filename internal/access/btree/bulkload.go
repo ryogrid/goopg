@@ -434,12 +434,12 @@ func itemsToRawItems(items []item) []rawItem {
 // maxRawItemSize bounds an individual on-page item so that
 //  1. it satisfies storage.PageAddItemRaw's 15-bit Length field (0x7FFF), and
 //  2. it physically fits on an 8 KiB page after page header (24 B), B-tree
-//     opaque trailer (48 B, includes HighKey reserve) and the new line
-//     pointer (4 B). 8192 - 24 - 48 - 4 = 8116 — round down for safety.
+//     opaque trailer (272 B, includes 256-byte HighKey reserve) and the new
+//     line pointer (4 B). 8192 - 24 - 272 - 4 = 7892 — round down for safety.
 //
 // M0053-0005 uses this constant to split oversized posting-list runs into
 // multiple smaller posting items so each fits on a single page.
-const maxRawItemSize = 8000
+const maxRawItemSize = 7800
 
 // deduplicateToRawItems groups consecutive same-key items into
 // posting-list rawItems (M0047-0003). Items must already be sorted by key.

@@ -98,7 +98,7 @@ func TestAnalyzeAmbiguousColumnError(t *testing.T) {
 func TestAnalyzeTypeErrors(t *testing.T) {
 	cat := analyzerCatalog(t)
 	expectAnalyzeCode(t, cat, "SELECT aid FROM pgbench_accounts WHERE aid", "42804")
-	expectAnalyzeCode(t, cat, "SELECT aid || abalance FROM pgbench_accounts", "42804")
+	expectAnalyzeCode(t, cat, "SELECT aid || abalance FROM pgbench_accounts", "42883")
 	expectAnalyzeCode(t, cat, "SELECT aid FROM pgbench_accounts LIMIT 'x'", "42804")
 }
 

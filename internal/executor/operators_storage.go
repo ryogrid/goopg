@@ -2060,6 +2060,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	cols := tbl.Columns
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 
+	// UPDATE … FROM: nested-loop cross-product path. M0097-0065.
+	if len(o.plan.FromTables) > 0 {
+		return o.updateWithFrom(rel, cols)
+	}
+
 	// Use IndexScan (B-tree) when available — O(log n) instead of O(n).
 	if o.idxScan != nil {
 		return o.updateViaIndex(rel, cols)
@@ -2633,6 +2638,176 @@ func (o *updateOp) scanForMatches(rel storage.RelFileNode, cols []catalog.Column
 	return scanMatching(o.ctx, rel, cols, o.pred, fn)
 }
 
+// updateWithFrom implements UPDATE … FROM by collecting all FROM-table rows
+// into memory, then doing a nested-loop cross-product against each target
+// table row, applying o.plan.FromPred to find matching combinations, and
+// scheduling the rewrite. M0097-0065.
+func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Column) (TupleSlot, error) {
+	// Step 1: collect all rows from each FROM table.
+	type fromRows struct {
+		rows []Row
+	}
+	fromSets := make([]fromRows, len(o.plan.FromTables))
+	for i, fromTbl := range o.plan.FromTables {
+		fromRel := o.ctx.Catalog.RelFileNode(fromTbl)
+		fromCols := fromTbl.Columns
+		var rows []Row
+		if err := scanMatching(o.ctx, fromRel, fromCols, nil, func(_ storage.BlockNumber, _ uint16, row Row) error {
+			rows = append(rows, cloneRow(row))
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		fromSets[i] = fromRows{rows: rows}
+	}
+
+	// Step 2: scan target table without predicate; for each target row, do
+	// the cross-product over all FROM-table row combinations. M0097-0065.
+	type pendingUpdate struct {
+		blk    storage.BlockNumber
+		slot   uint16
+		newRow Row
+		oldRow Row
+	}
+	var pending []pendingUpdate
+
+	if err := scanMatching(o.ctx, rel, tgtCols, nil, func(blk storage.BlockNumber, slot uint16, tgtRow Row) error {
+		// Build all combinations of FROM rows via recursive enumeration.
+		var recurse func(depth int, combinedRow Row) error
+		recurse = func(depth int, combinedRow Row) error {
+			if depth == len(fromSets) {
+				// Full combined row available; evaluate predicate.
+				if o.plan.FromPred != nil {
+					v, _ := evalExpr(o.plan.FromPred, combinedRow, o.ctx)
+					if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+						return nil
+					}
+				}
+				// Predicate passed: compute new target row.
+				nCols := len(tgtCols)
+				newRow := make(Row, nCols)
+				for i := range tgtCols {
+					if i < len(o.plan.Set) && o.plan.Set[i] != nil {
+						v, err := evalExpr(o.plan.Set[i], combinedRow, o.ctx)
+						if err != nil {
+							return err
+						}
+						newRow[i] = v
+					} else if i < len(tgtRow) {
+						newRow[i] = tgtRow[i]
+					}
+				}
+				_ = computeGeneratedColumns(tgtCols, newRow)
+				pending = append(pending, pendingUpdate{blk: blk, slot: slot, newRow: newRow, oldRow: cloneRow(tgtRow)})
+				return nil
+			}
+			for _, fromRow := range fromSets[depth].rows {
+				next := append(combinedRow[:len(combinedRow):len(combinedRow)], fromRow...)
+				if err := recurse(depth+1, next); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		// Start recursion with the target row as the base of combinedRow.
+		return recurse(0, append(Row(nil), tgtRow...))
+	}); err != nil {
+		return nil, err
+	}
+
+	// Step 3: apply pending updates (same two-pass approach as the regular path).
+	hotEligible := hotUpdateEligible(o.plan, o.ctx)
+	seen := make(map[[2]uint64]bool) // deduplicate (blk, slot) — each target row updated at most once
+	for _, pu := range pending {
+		key := [2]uint64{uint64(pu.blk), uint64(pu.slot)}
+		if seen[key] {
+			continue // already updated by an earlier FROM match
+		}
+		seen[key] = true
+
+		// Fire BEFORE UPDATE triggers.
+		if len(o.plan.Table.Triggers) > 0 {
+			retRow, ok := fireTriggers(o.ctx, o.plan.Table, "before", "update", pu.oldRow, pu.newRow)
+			if !ok {
+				continue
+			}
+			pu.newRow = retRow
+		}
+		used := false
+		if hotEligible {
+			var err error
+			used, err = tryApplyHOTUpdate(o.ctx, rel, tgtCols, pu.blk, pu.slot, pu.newRow)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !used {
+			// Non-HOT update: stamp xmax on old tuple, write new tuple.
+			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
+			if err != nil {
+				return nil, err
+			}
+			s.Lock()
+			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
+			if oldGerr != nil {
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				continue // slot gone (concurrent prune)
+			}
+			if isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				// Simplified: skip concurrent-update EPQ for FROM case.
+				continue
+			}
+			var oldTupleBytes []byte
+			oldTupleBytes, _ = oldTup.MarshalBinary()
+			stampErr := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
+			if stampErr != nil {
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				if errors.Is(stampErr, storage.ErrUnsupportedItem) || errors.Is(stampErr, storage.ErrInvalidSlot) {
+					continue
+				}
+				return nil, stampErr
+			}
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
+			s.Unlock()
+			o.ctx.Pool.Unpin(s)
+			if derr != nil {
+				return nil, derr
+			}
+			newPtr, werr := writeHeapRowReturning(o.ctx, rel, tgtCols, pu.newRow)
+			if werr != nil {
+				return nil, werr
+			}
+			maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, tgtCols, pu.newRow, newPtr)
+			if cerr := stampOldCtid(o.ctx, rel, pu.blk, pu.slot, newPtr); cerr != nil {
+				return nil, cerr
+			}
+			if o.ctx.LogCanonical != nil {
+				if derr := emitCanonicalHeapDelete(o.ctx, rel, pu.blk, pu.slot); derr != nil {
+					return nil, derr
+				}
+				if ierr := emitCanonicalHeapInsert(o.ctx, rel, newPtr); ierr != nil {
+					return nil, ierr
+				}
+			}
+		}
+		ssiRecordTupleWrite(o.ctx, rel, pu.blk, pu.slot)
+		o.rowsAffected++
+		o.appendUpdateRetRow(pu.newRow)
+	}
+
+	o.done = true
+	if o.retIdx < len(o.retRows) {
+		row := o.retRows[o.retIdx]
+		o.retIdx++
+		return SlotFromRow(o.plan.ReturningSchema, row), nil
+	}
+	return nil, EOF
+}
+
 func (o *deleteOp) scanForMatches(rel storage.RelFileNode, cols []catalog.Column, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
 	return scanMatching(o.ctx, rel, cols, o.pred, fn)
 }
@@ -2860,7 +3035,8 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		if err != nil || key == nil {
 			continue
 		}
-		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, pos); raiseErr != nil {
+		detail := buildUniqueConstraintDetail(idx, cols, row)
+		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
 			return raiseErr
 		}
 	}
@@ -2876,7 +3052,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 //
 // Mirrors upstream heap_check_unique's WaitForLockersMultiple path that
 // produces the <waiting ...> interleaving seen in read-write-unique.spec.
-func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTree, key []byte, idxName string, pos int) error {
+func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTree, key []byte, idxName, detail string, pos int) error {
 	var inflightXmin storage.TransactionID
 	var liveConflict bool
 
@@ -2944,9 +3120,31 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTre
 			Code:    "23505",
 			Pos:     pos,
 			Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idxName),
+			Detail:  detail,
 		}
 	}
 	return nil
+}
+
+// buildUniqueConstraintDetail builds the DETAIL string for a 23505 error:
+// "Key (col1, col2, ...)=(val1, val2, ...) already exists."
+func buildUniqueConstraintDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
+	colNames := make([]string, 0, len(idx.Columns))
+	colVals := make([]string, 0, len(idx.Columns))
+	for _, idxCol := range idx.Columns {
+		colNames = append(colNames, idxCol)
+		val := ""
+		for i, col := range cols {
+			if col.Name == idxCol && i < len(row) {
+				val = row[i].Format()
+				break
+			}
+		}
+		colVals = append(colVals, val)
+	}
+	return fmt.Sprintf("Key (%s)=(%s) already exists.",
+		strings.Join(colNames, ", "),
+		strings.Join(colVals, ", "))
 }
 
 // isLiveForUniqueCheck decides whether a tuple with the given xmin/xmax

@@ -29,7 +29,21 @@ import (
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
 )
+
+// cursorEntry holds the state of an open SQL cursor. M0097-0042.
+// The cursor is materialised lazily: on the first FETCH the server
+// executes the stored SELECT, buffers all rows, and sets Materialized.
+// Subsequent FETCHes advance/retreat Pos without re-running the query.
+// Pos is the *next* row index for a forward fetch; ranges [0, len(Rows)].
+type cursorEntry struct {
+	SQL         string          // raw SQL containing the DECLARE … FOR <select>
+	Rows        []executor.Row  // all result rows, nil until Materialized
+	Schema      planner.Schema  // output schema from the first execution
+	Pos         int             // current position: 0 = before first row, len(Rows) = past last
+	Materialized bool
+}
 
 // connTxState is the per-connection explicit-transaction holder.
 // Zero value means "no explicit transaction active" (auto-commit mode).
@@ -51,8 +65,17 @@ type connTxState struct {
 	// Populated when CREATE TEMP TABLE shadows a permanent table. M0097-0003.
 	TempTableShadows map[string]*catalog.Table
 	// Cursors holds open SQL cursors declared by DECLARE ... CURSOR FOR select.
-	// Key = cursor name (case-insensitive), value = SELECT SQL text.
-	Cursors map[string]string
+	// Key = cursor name (case-insensitive), value = cursor state.
+	// M0097-0042: cursor entries track materialized rows and position for
+	// FETCH FORWARD/BACKWARD support.
+	Cursors map[string]*cursorEntry
+	// SeqCurrVals holds per-sequence last nextval values for currval().
+	// Session-scoped: persists across statements and transactions. M0097-0042.
+	SeqCurrVals map[string]int64
+	// SeqLastVal / SeqLastSet track the most recent nextval across all sequences
+	// (for lastval()). Session-scoped. M0097-0042.
+	SeqLastVal int64
+	SeqLastSet bool
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr
@@ -266,21 +289,21 @@ func (ps *preparedStatements) DeleteAll() {
 func (c *connTxState) cursorDeclare(name, sql string) {
 	c.mu.Lock()
 	if c.Cursors == nil {
-		c.Cursors = make(map[string]string)
+		c.Cursors = make(map[string]*cursorEntry)
 	}
-	c.Cursors[strings.ToLower(name)] = sql
+	c.Cursors[strings.ToLower(name)] = &cursorEntry{SQL: sql}
 	c.mu.Unlock()
 }
 
-// cursorLookup returns the SELECT SQL for a named cursor.
-func (c *connTxState) cursorLookup(name string) (string, bool) {
+// cursorLookup returns the cursor entry for a named cursor.
+func (c *connTxState) cursorLookup(name string) (*cursorEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.Cursors == nil {
-		return "", false
+		return nil, false
 	}
-	sql, ok := c.Cursors[strings.ToLower(name)]
-	return sql, ok
+	e, ok := c.Cursors[strings.ToLower(name)]
+	return e, ok
 }
 
 // cursorClose removes a named cursor (or all cursors when name is "").

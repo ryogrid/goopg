@@ -39,7 +39,7 @@ func FoldConstants(e Expr) Expr {
 	// ── Cast expression ────────────────────────────────────────────────
 	case *CastExpr:
 		operand := FoldConstants(x.Operand)
-		return &CastExpr{pos: x.pos, Operand: operand, TargetType: x.TargetType, SourceType: x.SourceType}
+		return &CastExpr{pos: x.pos, Operand: operand, TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
 
 	// ── Unary operator ─────────────────────────────────────────────────
 	case *UnaryOp:
@@ -62,7 +62,7 @@ func FoldConstants(e Expr) Expr {
 		for i, item := range x.List {
 			folded[i] = FoldConstants(item)
 		}
-		return &InExpr{pos: x.pos, Operand: FoldConstants(x.Operand), Negated: x.Negated, Plan: x.Plan, List: folded, IsNonCorrelated: x.IsNonCorrelated}
+		return &InExpr{pos: x.pos, Operand: FoldConstants(x.Operand), Negated: x.Negated, NotEqualAny: x.NotEqualAny, Plan: x.Plan, List: folded, IsNonCorrelated: x.IsNonCorrelated}
 
 	case *FuncCall:
 		foldedArgs := make([]Expr, len(x.Args))
@@ -77,10 +77,34 @@ func FoldConstants(e Expr) Expr {
 	}
 }
 
+// foldEvalPanic is the panic payload used to propagate a constant-fold
+// evaluation error (e.g. integer division by zero) out of FoldConstants and
+// up to foldPlanConstants, which converts it into a *PlanError.
+// This matches PostgreSQL's behaviour of not suppressing constant-folding of
+// potentially-reachable sub-expressions (see case.sql commentary).
+type foldEvalPanic struct{ err error }
+
 // foldPlanConstants applies FoldConstants to every expression embedded in a
 // plan tree, mutating the tree in-place. Called at the end of planSelect and
 // other plan-building functions to collapse constant sub-expressions.
-func foldPlanConstants(node Node) {
+// Returns a non-nil *PlanError when a constant sub-expression raises an
+// evaluation error (e.g. division by zero) that PostgreSQL would also raise at
+// planning time. M0097-0047.
+func foldPlanConstants(node Node) (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if fe, ok := r.(foldEvalPanic); ok {
+				retErr = fe.err
+			} else {
+				panic(r) // re-panic for unexpected panics
+			}
+		}
+	}()
+	foldPlanConstantsInner(node)
+	return nil
+}
+
+func foldPlanConstantsInner(node Node) {
 	if node == nil {
 		return
 	}
@@ -89,17 +113,17 @@ func foldPlanConstants(node Node) {
 		if n.Predicate != nil {
 			n.Predicate = FoldConstants(n.Predicate)
 		}
-		foldPlanConstants(n.Child)
+		foldPlanConstantsInner(n.Child)
 	case *Project:
 		for i, t := range n.Targets {
 			n.Targets[i] = FoldConstants(t)
 		}
-		foldPlanConstants(n.Child)
+		foldPlanConstantsInner(n.Child)
 	case *Sort:
 		for i, k := range n.Keys {
 			n.Keys[i].Expr = FoldConstants(k.Expr)
 		}
-		foldPlanConstants(n.Child)
+		foldPlanConstantsInner(n.Child)
 	case *Limit:
 		if n.Limit != nil {
 			n.Limit = FoldConstants(n.Limit)
@@ -107,10 +131,10 @@ func foldPlanConstants(node Node) {
 		if n.Offset != nil {
 			n.Offset = FoldConstants(n.Offset)
 		}
-		foldPlanConstants(n.Child)
+		foldPlanConstantsInner(n.Child)
 	case *Aggregate:
 		// HAVING predicate is modelled as a Filter node wrapping Aggregate;
-		// it will be folded when foldPlanConstants visits that Filter node.
+		// it will be folded when foldPlanConstantsInner visits that Filter node.
 		for i, g := range n.GroupExprs {
 			n.GroupExprs[i] = FoldConstants(g)
 		}
@@ -119,7 +143,7 @@ func foldPlanConstants(node Node) {
 				n.Aggs[i].Arg = FoldConstants(a.Arg)
 			}
 		}
-		foldPlanConstants(n.Child)
+		foldPlanConstantsInner(n.Child)
 	case *Join:
 		if n.LeftKey != nil {
 			n.LeftKey = FoldConstants(n.LeftKey)
@@ -130,12 +154,12 @@ func foldPlanConstants(node Node) {
 		if n.Predicate != nil {
 			n.Predicate = FoldConstants(n.Predicate)
 		}
-		foldPlanConstants(n.Left)
-		foldPlanConstants(n.Right)
+		foldPlanConstantsInner(n.Left)
+		foldPlanConstantsInner(n.Right)
 	case *WindowAgg:
-		foldPlanConstants(n.Child)
+		foldPlanConstantsInner(n.Child)
 	case *Distinct:
-		foldPlanConstants(n.Child)
+		foldPlanConstantsInner(n.Child)
 	case *SeqScan, *IndexScan, *IndexOnlyScan, *Values, *WorkTableScan:
 		// leaf nodes: nothing to fold
 	case *GenerateSeries:
@@ -151,6 +175,8 @@ func foldPlanConstants(node Node) {
 		for i := range n.Args {
 			n.Args[i] = FoldConstants(n.Args[i])
 		}
+	case *PgAvailableWalSummaries:
+		// no sub-expressions to fold
 	}
 }
 
@@ -228,6 +254,14 @@ func tryFoldBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
 	}
 	result, err := evalLiteralBinary(pos, op, lv, rv)
 	if err != nil {
+		// Division by zero in a constant expression must propagate to the planner
+		// immediately — this matches PostgreSQL's behaviour of not suppressing
+		// constant-folding of potentially-reachable subexpressions (case.sql).
+		// Other errors (type mismatch, unsupported op) are silently ignored and
+		// the expression is left unfolded. M0097-0047.
+		if err.Error() == "division by zero" {
+			panic(foldEvalPanic{err: &PlanError{Code: "22012", Message: "division by zero"}})
+		}
 		return nil // silently skip: leave expression unfolded on type mismatch
 	}
 	return result
@@ -266,30 +300,62 @@ func tryFoldUnaryOp(pos int, op parser.OpCode, operand Expr) Expr {
 
 // foldCaseExpr folds a CASE expression.
 // Constant WHEN conditions are evaluated at plan time:
-//   - WHEN FALSE → branch dropped
+//   - WHEN FALSE → branch and its THEN are dropped (THEN is NOT folded)
 //   - WHEN TRUE  → branch taken; subsequent branches dropped
+//
+// Critically, dead branches are NOT folded — this matches PostgreSQL's
+// simplify_case_when_conditions: an unreachable THEN expression like 1/0 does
+// not throw, but a THEN under a non-constant WHEN (potentially reachable) IS
+// folded and may throw if it contains a constant evaluation error. M0097-0047.
 func foldCaseExpr(x *CaseExpr) Expr {
 	operand := FoldConstants(x.Operand)
 	var newWhens []CaseWhen
 	for _, w := range x.Whens {
 		cond := FoldConstants(w.When)
-		then := FoldConstants(w.Then)
-		// Searched CASE: evaluate the WHEN condition if it's a boolean literal.
+
+		// ── Searched CASE (no operand) ────────────────────────────────────────
+		// Check dead/live BEFORE folding the THEN body.
 		if operand == nil {
 			if bc, ok := cond.(*BooleanConst); ok {
-				if bc.Value {
-					// WHEN TRUE: this branch is always taken; subsequent are dead.
-					if len(newWhens) == 0 {
-						// Simplify entire CASE to this THEN value.
-						return then
-					}
-					// Use this THEN as the ELSE and stop.
-					return &CaseExpr{pos: x.pos, Operand: nil, Whens: newWhens, Else: then}
+				if !bc.Value {
+					// WHEN FALSE: dead branch — do NOT fold the THEN body.
+					// An unreachable 1/0 here must not throw.
+					continue
 				}
-				// WHEN FALSE: dead branch, skip.
-				continue
+				// WHEN TRUE: fold THEN (it is definitely reachable).
+				then := FoldConstants(w.Then)
+				if len(newWhens) == 0 {
+					return then
+				}
+				return &CaseExpr{pos: x.pos, Operand: nil, Whens: newWhens, Else: then}
 			}
 		}
+
+		// ── Simple CASE (with operand) ────────────────────────────────────────
+		// If both the operand and the WHEN value are literals, compare them now
+		// to skip dead branches without folding their THEN body.
+		if operand != nil {
+			if opLit, opOk := toLiteralValue(operand); opOk {
+				if whenLit, wOk := toLiteralValue(cond); wOk {
+					cmp, cerr := litCompare(opLit, whenLit)
+					if cerr == nil {
+						if cmp != 0 {
+							// Dead branch: operand != WHEN value — do NOT fold THEN.
+							continue
+						}
+						// Matching branch: fold THEN and terminate.
+						then := FoldConstants(w.Then)
+						if len(newWhens) == 0 {
+							return then
+						}
+						return &CaseExpr{pos: x.pos, Operand: operand, Whens: newWhens, Else: then}
+					}
+				}
+			}
+		}
+
+		// Non-dead / non-constant branch: fold THEN (it is potentially reachable).
+		then := FoldConstants(w.Then)
 		newWhens = append(newWhens, CaseWhen{When: cond, Then: then})
 	}
 	elseExpr := FoldConstants(x.Else)

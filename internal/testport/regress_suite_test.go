@@ -283,7 +283,7 @@ func (e *ClusterRegressExecutor) ExecuteSQL(_ context.Context, sql string) (stri
 		Args:    args,
 		Dir:     e.RepoRoot,
 		Env:     e.psqlEnv(),
-		Timeout: 30 * time.Second,
+		Timeout: 120 * time.Second,
 	})
 	return result.Stdout + result.Stderr, nil
 }

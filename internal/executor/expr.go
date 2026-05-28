@@ -3,15 +3,18 @@ package executor
 import (
 	"context"
 	"crypto/md5"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
+	mathrand "math/rand"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -19,6 +22,13 @@ import (
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
+)
+
+// sessionPRNG is the per-process random-number generator used by random(),
+// setseed() and random_normal(). Protected by sessionPRNGMu. M0097-0071.
+var (
+	sessionPRNG   = mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
+	sessionPRNGMu sync.Mutex
 )
 
 // ExecError is the executor's structured error. Code is a SQLSTATE
@@ -106,9 +116,11 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 	case *planner.SubqueryExpr:
 		return evalSubquery(x, slotToRow(slot), ctx)
 	case *planner.InExpr:
-		return evalInExpr(x, slotToRow(slot), ctx)
+		return evalInExpr(x, slot, ctx)
 	case *planner.ExistsExpr:
 		return evalExistsExpr(x, slotToRow(slot), ctx)
+	case *planner.RowExpr:
+		return evalRowExpr(x, slot, ctx)
 	case *planner.TypedStringLit:
 		return evalTypedStringLit(x)
 	case *planner.IntervalLit:
@@ -128,8 +140,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 	case *planner.CTIDExpr:
 		// `ctid` system column: per-row TID injected by seqScanOp
 		// into MaterializedSlot.hasCTID. M0097-0038.
-		if ms, ok := slot.(*MaterializedSlot); ok && ms.hasCTID {
-			return NewStringDatum(fmt.Sprintf("(%d,%d)", ms.ctidBlock, ms.ctidOff)), nil
+		// M0097-0062: also handle opnode *Slot which propagates ctid
+		// from MaterializedSlot via fillFromTupleSlot.
+		switch s := slot.(type) {
+		case *MaterializedSlot:
+			if s.hasCTID {
+				return NewStringDatum(fmt.Sprintf("(%d,%d)", s.ctidBlock, s.ctidOff)), nil
+			}
+		case *Slot:
+			if s.hasCTID {
+				return NewStringDatum(fmt.Sprintf("(%d,%d)", s.ctidBlock, s.ctidOff)), nil
+			}
 		}
 		return NullDatum, nil
 	case *planner.NumericConst:
@@ -188,7 +209,60 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 			}
 		}
-		return evalCastTyped(v, x.TargetType, x.SourceType, x.Pos())
+		// ── Enum cast validation ─────────────────────────────────────────
+		// If the target type is a user-defined enum and the input is a
+		// non-NULL, non-array string, verify the value is a valid enum label.
+		// Guards: skip array types (target ends with []), skip array literals
+		// (value starts with {), skip NULL values. M0097-0063.
+		if ctx != nil && ctx.Catalog != nil && !v.IsNull() &&
+			!strings.HasSuffix(x.TargetType, "[]") {
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+				if et, isEnum := im.LookupEnum(x.TargetType); isEnum {
+					strVal := v.StringValue()
+					// Skip array literals (e.g. '{red,green,blue}'::rainbow[]).
+					if len(strVal) == 0 || strVal[0] != '{' {
+						found := false
+						for _, label := range et.Values {
+							if strings.EqualFold(label.Label, strVal) {
+								found = true
+								break
+							}
+						}
+						if !found {
+							return NullDatum, &ExecError{
+								Code:    "22P02",
+								Pos:     x.Pos(),
+								Message: fmt.Sprintf("invalid input value for enum %s: %q", et.Name, strVal),
+							}
+						}
+					}
+				}
+			}
+		}
+		result, err := evalCastTyped(v, x.TargetType, x.SourceType, x.Pos())
+		if err != nil {
+			return Datum{}, err
+		}
+		// Apply typmod precision for time/timetz casts (e.g., ::timetz(4)).
+		// PostgreSQL truncates fractional seconds to the specified precision.
+		if x.Typmod > 0 && result.Kind == KindTime {
+			switch x.TargetType {
+			case "time", "timetz", "time with time zone":
+				prec := x.Typmod
+				if prec > 6 {
+					prec = 6 // PostgreSQL max precision for time types
+				}
+				t := result.TimeValue()
+				ns := int64(t.Nanosecond())
+				factor := int64(1)
+				for i := int64(0); i < 6-prec; i++ {
+					factor *= 10
+				}
+				ns = (ns / (factor * 1000)) * (factor * 1000)
+				result = NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), int(ns), t.Location()))
+			}
+		}
+		return result, nil
 	case *planner.BinaryOp:
 		left, err := evalExprSlot(x.Left, slot, ctx)
 		if err != nil {
@@ -218,11 +292,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			var lf, rf float64
 			if left.Kind == KindNumeric {
 				lf, _ = strconv.ParseFloat(left.Format(), 64)
+			} else if left.Kind == KindString {
+				// String-formatted float (e.g. from random()). M0097-0042.
+				lf, _ = strconv.ParseFloat(left.StringValue(), 64)
 			} else {
 				lf = float64(left.Int)
 			}
 			if right.Kind == KindNumeric {
 				rf, _ = strconv.ParseFloat(right.Format(), 64)
+			} else if right.Kind == KindString {
+				// String-formatted float. M0097-0042.
+				rf, _ = strconv.ParseFloat(right.StringValue(), 64)
 			} else {
 				rf = float64(right.Int)
 			}
@@ -324,8 +404,45 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			result = !result
 		}
 		return NewBoolDatum(result), nil
+	case *planner.IsDistinctFromExpr:
+		// IS [NOT] DISTINCT FROM — null-safe equality. Always returns boolean.
+		//   a IS DISTINCT FROM b     = NOT (a = b OR (a IS NULL AND b IS NULL))
+		//   a IS NOT DISTINCT FROM b = (a = b OR (a IS NULL AND b IS NULL))
+		lv, err := evalExprSlot(x.Left, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		rv, err := evalExprSlot(x.Right, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		return evalIsDistinctFrom(lv, rv, x.Negated)
 	}
 	return Datum{}, &ExecError{Code: "XX000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported expression %T", e)}
+}
+
+// evalIsDistinctFrom implements a IS [NOT] DISTINCT FROM b.
+//
+//	IS DISTINCT FROM     = NOT (a = b OR (a IS NULL AND b IS NULL))
+//	IS NOT DISTINCT FROM = (a = b OR (a IS NULL AND b IS NULL))
+func evalIsDistinctFrom(lv, rv Datum, negated bool) (Datum, error) {
+	var equal bool
+	if lv.IsNull() && rv.IsNull() {
+		equal = true
+	} else if lv.IsNull() || rv.IsNull() {
+		equal = false
+	} else {
+		cmp, err := compareDatum(lv, rv, 0)
+		if err != nil {
+			equal = false
+		} else {
+			equal = cmp == 0
+		}
+	}
+	if negated {
+		return NewBoolDatum(equal), nil // IS NOT DISTINCT FROM
+	}
+	return NewBoolDatum(!equal), nil // IS DISTINCT FROM
 }
 
 // evalUnary handles -, +, NOT.
@@ -382,35 +499,43 @@ func looksLikePgLSN(s string) bool {
 	return true
 }
 
-// pgLSNParseDelta extracts an int64 delta from a numeric/integer datum for pg_lsn arithmetic.
-// Returns (delta, isNaN, ok). isNaN=true when NaN (caller must error).
-func pgLSNParseDelta(d Datum) (int64, bool, bool) {
+// pgLSNParseDelta extracts a numeric delta from a datum for pg_lsn arithmetic.
+// Returns (absValue uint64, isNegative bool, isNaN bool, ok bool).
+// isNegative=true means subtract absValue; false means add absValue.
+// isNaN=true means caller must error (NaN operand).
+// M0097-pg_lsn: use uint64 to avoid sign overflow for large pg_lsn differences.
+func pgLSNParseDelta(d Datum) (uint64, bool, bool, bool) {
+	parseStr := func(s string) (uint64, bool, bool, bool) {
+		if s == "NaN" {
+			return 0, false, true, true
+		}
+		if strings.HasPrefix(s, "-") {
+			if v, err := strconv.ParseUint(s[1:], 10, 64); err == nil {
+				return v, true, false, true
+			}
+			return 0, false, false, false
+		}
+		if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return v, false, false, true
+		}
+		return 0, false, false, false
+	}
 	switch d.Kind {
 	case KindInt:
-		return d.Int, false, true
+		if d.Int < 0 {
+			return uint64(-d.Int), true, false, true
+		}
+		return uint64(d.Int), false, false, true
 	case KindNumeric:
-		s := d.Format()
-		if s == "NaN" {
-			return 0, true, true
-		}
-		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-			return v, false, true
-		}
-		if f, err := strconv.ParseFloat(s, 64); err == nil {
-			return int64(f), false, true
-		}
+		return parseStr(d.Format())
 	case KindString:
 		s := d.StringValue()
-		if s == "NaN" {
-			return 0, true, true
+		if looksLikePgLSN(s) {
+			return 0, false, false, false
 		}
-		if !looksLikePgLSN(s) {
-			if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-				return v, false, true
-			}
-		}
+		return parseStr(s)
 	}
-	return 0, false, false
+	return 0, false, false, false
 }
 
 // evalPgLSNBinary handles pg_lsn comparison and arithmetic operators.
@@ -451,36 +576,35 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 		}
 		return NewBoolDatum(result), true, nil
 	case parser.OpSub:
-		// pg_lsn - pg_lsn → numeric
+		// pg_lsn - pg_lsn → numeric (unsigned difference as decimal string)
 		lu, lok := parseLSNDatum(left)
 		ru, rok := parseLSNDatum(right)
 		if lok && rok {
-			var diff int64
 			if lu >= ru {
-				diff = int64(lu - ru)
-			} else {
-				diff = -int64(ru - lu)
+				return NewStringDatum(strconv.FormatUint(lu-ru, 10)), true, nil
 			}
-			return NewStringDatum(fmt.Sprintf("%d", diff)), true, nil
+			return NewStringDatum("-" + strconv.FormatUint(ru-lu, 10)), true, nil
 		}
 		// pg_lsn - numeric → pg_lsn
 		if lok {
-			delta, isNaN, ok := pgLSNParseDelta(right)
+			abs, isNeg, isNaN, ok := pgLSNParseDelta(right)
 			if ok {
 				if isNaN {
 					return Datum{}, true, &ExecError{Code: "0A000", Pos: pos,
 						Message: "cannot subtract NaN from pg_lsn"}
 				}
-				if delta < 0 {
-					if uint64(-delta) > lu {
+				if isNeg {
+					// pg_lsn - (-N) = pg_lsn + N
+					result := lu + abs
+					if result < lu {
 						return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
 					}
-					return NewStringDatum(formatPgLSN(lu - uint64(-delta))), true, nil
+					return NewStringDatum(formatPgLSN(result)), true, nil
 				}
-				if uint64(delta) > lu {
+				if abs > lu {
 					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
 				}
-				return NewStringDatum(formatPgLSN(lu-uint64(delta))), true, nil
+				return NewStringDatum(formatPgLSN(lu - abs)), true, nil
 			}
 		}
 	case parser.OpAdd:
@@ -498,24 +622,22 @@ func evalPgLSNBinary(op parser.OpCode, left, right Datum, pos int) (Datum, bool,
 		} else {
 			return Datum{}, false, nil
 		}
-		delta, isNaN, ok := pgLSNParseDelta(numericDatum)
+		abs, isNeg, isNaN, ok := pgLSNParseDelta(numericDatum)
 		if ok {
 			if isNaN {
 				return Datum{}, true, &ExecError{Code: "0A000", Pos: pos,
 					Message: "cannot add NaN to pg_lsn"}
 			}
-			var result uint64
-			if delta >= 0 {
-				result = lsnVal + uint64(delta)
-				if result < lsnVal {
+			if isNeg {
+				// pg_lsn + (-N) = pg_lsn - N
+				if abs > lsnVal {
 					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
 				}
-			} else {
-				neg := uint64(-delta)
-				if neg > lsnVal {
-					return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
-				}
-				result = lsnVal - neg
+				return NewStringDatum(formatPgLSN(lsnVal - abs)), true, nil
+			}
+			result := lsnVal + abs
+			if result < lsnVal {
+				return Datum{}, true, &ExecError{Code: "22003", Pos: pos, Message: "pg_lsn out of range"}
 			}
 			return NewStringDatum(formatPgLSN(result)), true, nil
 		}
@@ -579,6 +701,18 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		}
 		fallthrough
 	case parser.OpMul, parser.OpDiv, parser.OpMod:
+		// String operands can be parsed as numeric (same as in OpAdd/OpSub above).
+		// Handles cases like random()*0 where random() returns a string-formatted float. M0097-0042.
+		if left.Kind == KindString {
+			if m, s, err := parseNumeric(left.StringValue()); err == nil {
+				left = newNumeric(m, int(s))
+			}
+		}
+		if right.Kind == KindString {
+			if m, s, err := parseNumeric(right.StringValue()); err == nil {
+				right = newNumeric(m, int(s))
+			}
+		}
 		if left.Kind == KindNumeric || right.Kind == KindNumeric {
 			a, b, err := promoteToNumeric(left, right, op, pos)
 			if err != nil {
@@ -597,10 +731,46 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		}
 		return arithmetic(op, left.Int, right.Int, pos)
 	case parser.OpConcat:
-		if (left.Kind != KindString) || (right.Kind != KindString) {
-			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator || requires string operands"}
+		// || requires at least one string-typed operand. When one side is text
+		// (or string-like), the other side is coerced to text. When both sides
+		// are non-string (e.g. integer || numeric), PostgreSQL raises
+		// "operator does not exist" — match that behaviour. M0097-0063.
+		if left.IsNull() || right.IsNull() {
+			return NullDatum, nil
 		}
-		return NewStringDatum(left.StringValue() + right.StringValue()), nil
+		leftIsStr := left.Kind == KindString || left.Kind == KindBytes
+		rightIsStr := right.Kind == KindString || right.Kind == KindBytes
+		if !leftIsStr && !rightIsStr {
+			// Neither operand is string-like → PG-compatible error.
+			return Datum{}, &ExecError{Code: "42883", Pos: pos,
+				Message: fmt.Sprintf("operator does not exist: %s || %s",
+					pgKindTypeName(left.Kind), pgKindTypeName(right.Kind)),
+				Hint: "No operator matches the given name and argument types. You might need to add explicit type casts."}
+		}
+		// Array concatenation: if both operands look like PostgreSQL arrays
+		// ({v1,v2,...}), merge their elements rather than text-concat.
+		// This handles ARRAY[...] || ARRAY[...] and array || array patterns.
+		// M0097-0065.
+		ls := left.Format()
+		rs := right.Format()
+		if len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}' &&
+			len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}' {
+			leftInner := ls[1 : len(ls)-1]
+			rightInner := rs[1 : len(rs)-1]
+			var inner string
+			switch {
+			case leftInner == "" && rightInner == "":
+				inner = ""
+			case leftInner == "":
+				inner = rightInner
+			case rightInner == "":
+				inner = leftInner
+			default:
+				inner = leftInner + "," + rightInner
+			}
+			return NewStringDatum("{" + inner + "}"), nil
+		}
+		return NewStringDatum(ls + rs), nil
 	case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
 		// Bitwise operators: require integer operands. M0097-0003.
 		if left.Kind != KindInt || right.Kind != KindInt {
@@ -727,9 +897,29 @@ func matchSQLLike(s, pat string) bool {
 	return pi == len(pat)
 }
 
+// pgPatternToGoRE2 translates PostgreSQL-specific regex escapes that are not
+// supported by Go's RE2 engine into their RE2 equivalents.
+// Currently handles: \m (word-start) and \M (word-end) → \b. M0097-0073.
+func pgPatternToGoRE2(pattern string) string {
+	var b strings.Builder
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == '\\' && i+1 < len(pattern) {
+			switch pattern[i+1] {
+			case 'm', 'M':
+				b.WriteString(`\b`)
+				i++
+				continue
+			}
+		}
+		b.WriteByte(pattern[i])
+	}
+	return b.String()
+}
+
 // evalPOSIXRegex evaluates a POSIX extended regex match.
 // caseInsensitive applies the (?i) flag. M0097-0011.
 func evalPOSIXRegex(s, pattern string, caseInsensitive bool) (bool, error) {
+	pattern = pgPatternToGoRE2(pattern)
 	if caseInsensitive {
 		pattern = "(?i)" + pattern
 	}
@@ -818,6 +1008,11 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 			return newNumeric(m, int(sc))
 		}
 	case KindTime:
+		// Try timetz first ("HH:MM:SS±HH[:MM]") to preserve the offset.
+		// M0097-0004: strings like '05:06:07-07' must compare as timetz, not plain time.
+		if ts, offsetSecs, err := parseTimeTZString(s); err == nil && offsetSecs != 0 {
+			return NewTimeTZDatum(ts, offsetSecs)
+		}
 		// Try time-of-day first ("HH:MM:SS") then full timestamp.
 		if t, err := parseTimeString(s); err == nil {
 			return NewTimeDatum(t)
@@ -944,6 +1139,28 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		}
 		return strings.Compare(as, bs), nil
 	case KindTime:
+		// For timetz datums (Scale != 0) PostgreSQL compares by UTC time
+		// (local_nanos - offset_nanos), then by offset as tiebreaker.
+		// Plain time/timestamp datums (Scale == 0) compare by Int directly.
+		// M0097-0004.
+		if a.Scale != 0 || b.Scale != 0 {
+			aUTC := a.Int - int64(a.Scale)*60*1_000_000_000
+			bUTC := b.Int - int64(b.Scale)*60*1_000_000_000
+			switch {
+			case aUTC < bUTC:
+				return -1, nil
+			case aUTC > bUTC:
+				return 1, nil
+			}
+			// Same UTC: smaller offset (more east) sorts last in PG.
+			switch {
+			case a.Scale > b.Scale:
+				return -1, nil
+			case a.Scale < b.Scale:
+				return 1, nil
+			}
+			return 0, nil
+		}
 		switch {
 		case a.TimeValue().Before(b.TimeValue()):
 			return -1, nil
@@ -1141,12 +1358,18 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		x.CachedTime = t.UTC()
 		x.CacheValid = true
 		return NewTimeDatum(x.CachedTime), nil
-	case "time", "timetz":
+	case "time":
 		ts, err := parseTimeString(x.Value)
 		if err != nil {
 			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time: %q", x.Value)}
 		}
 		return NewTimeDatum(ts), nil
+	case "timetz":
+		ts, offsetSecs, err := parseTimeTZString(x.Value)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22007", Pos: x.Pos(), Message: fmt.Sprintf("invalid input syntax for type time with time zone: %q", x.Value)}
+		}
+		return NewTimeTZDatum(ts, offsetSecs), nil
 	case "timestamp", "timestamptz":
 		// Try a few common upstream layouts in order. The
 		// `2006-01-02 15:04:05` form is what TPC-H and pgbench
@@ -1186,10 +1409,16 @@ func roundNumericToInt(d Datum, pos int) (int64, error) {
 	return rounded, nil
 }
 
-// roundFloatToInt rounds a KindNumeric datum using banker's rounding
+// roundFloatToInt rounds a KindNumeric or KindString datum using banker's rounding
 // (round half to even) — PostgreSQL's float8/float4→integer rule. M0097-0003.
+// KindString is handled for datums produced by the float8 arithmetic path. M0097-0042.
 func roundFloatToInt(d Datum, pos int) (int64, error) {
-	text := numericText(d)
+	var text string
+	if d.Kind == KindString {
+		text = d.StringValue()
+	} else {
+		text = numericText(d)
+	}
 	f, err := strconv.ParseFloat(text, 64)
 	if err != nil {
 		return 0, &ExecError{Code: "22P02", Pos: pos,
@@ -1198,6 +1427,22 @@ func roundFloatToInt(d Datum, pos int) (int64, error) {
 	// Banker's rounding: round half to nearest even.
 	rounded := math.RoundToEven(f)
 	return int64(rounded), nil
+}
+
+// datumToFloat64 converts any numeric Datum kind to float64.
+// Returns (value, true) on success; (0, false) if conversion is not possible.
+func datumToFloat64(d Datum) (float64, bool) {
+	switch d.Kind {
+	case KindInt:
+		return float64(d.Int), true
+	case KindNumeric:
+		f, err := strconv.ParseFloat(d.Format(), 64)
+		return f, err == nil
+	case KindString:
+		f, err := strconv.ParseFloat(strings.TrimSpace(d.StringValue()), 64)
+		return f, err == nil
+	}
+	return 0, false
 }
 
 // isFloatSourceType reports whether a type name denotes a floating-point type
@@ -1220,7 +1465,9 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, erro
 	}
 	// For float8/float4 → integer casts, override the default (away-from-zero)
 	// rounding inside evalCast to use banker's rounding instead.
-	if isFloatSourceType(sourceType) && d.Kind == KindNumeric {
+	// Also handle KindString datums produced by the float8 arithmetic path
+	// (e.g. "0.05" from random()*0.1). M0097-0042.
+	if isFloatSourceType(sourceType) && (d.Kind == KindNumeric || d.Kind == KindString) {
 		intTarget := strings.ToLower(targetType)
 		switch intTarget {
 		case "int2", "smallint":
@@ -1289,7 +1536,13 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			}
 			return d, nil
 		case KindString:
-			n, err := parseIntegerInput(d.StringValue(), "smallint", 16)
+			s := d.StringValue()
+			// Array literals like '{1,2,3}'::int2[] pass through — the parser strips '[]'
+			// making the target type look like 'int2', but the value is an array. M0097-0063.
+			if len(s) > 0 && s[0] == '{' {
+				return d, nil
+			}
+			n, err := parseIntegerInput(s, "smallint", 16)
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
 					ee.Pos = pos
@@ -1318,7 +1571,13 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			}
 			return d, nil
 		case KindString:
-			n, err := parseIntegerInput(d.StringValue(), "integer", 32)
+			s := d.StringValue()
+			// Array literals like '{1,2,3}'::int4[] pass through — the parser strips '[]'
+			// making the target type look like 'int4', but the value is an array. M0097-0063.
+			if len(s) > 0 && s[0] == '{' {
+				return d, nil
+			}
+			n, err := parseIntegerInput(s, "integer", 32)
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
 					ee.Pos = pos
@@ -1343,7 +1602,12 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		case KindInt:
 			return d, nil
 		case KindString:
-			n, err := parseIntegerInput(d.StringValue(), "bigint", 64)
+			s := d.StringValue()
+			// Array literals like '{1,2,3}'::int8[] pass through — parser strips '[]'. M0097-0063.
+			if len(s) > 0 && s[0] == '{' {
+				return d, nil
+			}
+			n, err := parseIntegerInput(s, "bigint", 64)
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
 					ee.Pos = pos
@@ -1459,7 +1723,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 	case "pg_lsn":
 		switch d.Kind {
 		case KindString:
-			u, err := parsePgLSN(strings.TrimSpace(d.StringValue()))
+			u, err := parsePgLSN(d.StringValue())
 			if err != nil {
 				if ee, ok := err.(*ExecError); ok {
 					ee.Pos = pos
@@ -1509,7 +1773,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return NewTimeDatum(time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)), nil
 		}
 		return d, nil
-	case "time", "timetz":
+	case "time":
 		// Cast to time: extract time-of-day from KindTime, parse strings. M0097-0004.
 		if d.Kind == KindString {
 			ts, err := parseTimeString(d.StringValue())
@@ -1522,6 +1786,21 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			t := d.TimeValue().UTC()
 			// Re-anchor to epoch to strip any date component.
 			return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
+		}
+		return d, nil
+	case "timetz":
+		// Cast to timetz: parse strings with timezone offset. M0097-0004.
+		if d.Kind == KindString {
+			ts, offsetSecs, err := parseTimeTZString(d.StringValue())
+			if err != nil {
+				return Datum{}, err
+			}
+			return NewTimeTZDatum(ts, offsetSecs), nil
+		}
+		if d.Kind == KindTime {
+			t := d.TimeValue().UTC()
+			// Re-anchor to epoch to strip any date component; preserve stored offset.
+			return NewTimeTZDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC), d.TimeTZOffsetSecs()), nil
 		}
 		return d, nil
 	case "timestamp", "timestamptz":
@@ -1549,6 +1828,33 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return NewStringDatum(fmt.Sprintf("(%d,%d)", block, offset)), nil
 		}
 		return d, nil
+	case "numeric", "decimal":
+		// Cast to numeric: validate string inputs, pass through numeric/int as-is.
+		// M0097-0056: prevents 'foo'::numeric from succeeding silently.
+		switch d.Kind {
+		case KindNumeric:
+			return d, nil
+		case KindInt:
+			return numericFromInt(d.Int), nil
+		case KindString:
+			s := strings.TrimSpace(d.StringValue())
+			// NaN and Infinity are valid numeric special values.
+			if strings.EqualFold(s, "nan") || strings.EqualFold(s, "infinity") ||
+				strings.EqualFold(s, "-infinity") {
+				return d, nil
+			}
+			_, _, err := parseNumeric(s)
+			if err != nil {
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type numeric: %q", d.StringValue())}
+			}
+			// Re-use the string datum rather than allocating a big.Int when fast
+			// path would suffice; the string form is already the canonical form.
+			return d, nil
+		default:
+			return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+				Message: fmt.Sprintf("cannot cast type %v to numeric", d.Kind)}
+		}
 	}
 	return d, nil // pass-through for unknown types
 }
@@ -2015,17 +2321,40 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 		f := float64(u.Second())*1000 + float64(u.Nanosecond())/1_000_000.0
 		return newNumericFromFloat(f), nil
 	case "epoch":
-		f := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
-		return newNumericFromFloat(f), nil
+		localSecs := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
+		if srcType == "timetz" {
+			// timetz epoch = UTC seconds-of-day = local_time - offset
+			return newNumericFromFloat(localSecs - float64(src.TimeTZOffsetSecs())), nil
+		}
+		return newNumericFromFloat(localSecs), nil
 	case "timezone", "timezone_hour", "timezone_minute":
-		if isTimeOnly {
+		if srcType == "time" {
 			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
 				Message: fmt.Sprintf("unit %q not supported for type time without time zone", field)}
 		}
-		return Datum{Kind: KindInt, Int: 0}, nil // UTC only
+		if !isTimeOnly {
+			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("unit %q not supported for type timestamp without time zone", field)}
+		}
+		// timetz: return offset components
+		offsetSecs := src.TimeTZOffsetSecs()
+		switch field {
+		case "timezone":
+			return Datum{Kind: KindInt, Int: int64(offsetSecs)}, nil
+		case "timezone_hour":
+			h := offsetSecs / 3600
+			return Datum{Kind: KindInt, Int: int64(h)}, nil
+		case "timezone_minute":
+			m := (offsetSecs % 3600) / 60
+			return Datum{Kind: KindInt, Int: int64(m)}, nil
+		}
 	}
 	// For time-of-day types, reject date-specific fields with PG-compatible errors. M0097-0004.
 	if isTimeOnly {
+		typeName := "time without time zone"
+		if srcType == "timetz" {
+			typeName = "time with time zone"
+		}
 		switch field {
 		case "hour", "minute", "microseconds", "microsecond":
 			// allowed for time types (handled by extractTimestampField below)
@@ -2038,10 +2367,10 @@ func evalExtract(x *planner.ExtractExpr, row Row, ctx *Context) (Datum, error) {
 			}
 			if knownDateFields[field] {
 				return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
-					Message: fmt.Sprintf("unit %q not supported for type time without time zone", field)}
+					Message: fmt.Sprintf("unit %q not supported for type %s", field, typeName)}
 			}
 			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
-				Message: fmt.Sprintf("unit %q not recognized for type time without time zone", field)}
+				Message: fmt.Sprintf("unit %q not recognized for type %s", field, typeName)}
 		}
 	}
 	n, err := extractTimestampField(x.Field, u, x.Pos())
@@ -2156,6 +2485,11 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return newNumericFromFloat(f), nil
 	case "epoch":
 		f := float64(u.Hour()*3600+u.Minute()*60+u.Second()) + float64(u.Nanosecond())/1e9
+		// For timetz datums, epoch = UTC seconds-of-day = local_time - offset.
+		// Scale stores timezone offset in minutes east of UTC.
+		if src.Scale != 0 {
+			f -= float64(src.TimeTZOffsetSecs())
+		}
 		return newNumericFromFloat(f), nil
 	}
 	n, err := extractTimestampField(field, u, x.Pos())
@@ -2531,8 +2865,9 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 //   - inner empty → false (NOT IN: true).
 //
 // Multi-column subqueries raise 42601.
-func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
-	operand, err := evalExpr(x.Operand, row, ctx)
+func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
+	// Use evalExprSlot so CTIDExpr can access hasCTID from the slot. M0097-0062.
+	operand, err := evalExprSlot(x.Operand, slot, ctx)
 	if err != nil {
 		return Datum{}, err
 	}
@@ -2540,9 +2875,29 @@ func evalInExpr(x *planner.InExpr, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 
+	row := slotToRow(slot)
 	values, err := collectInValues(x, row, ctx)
 	if err != nil {
 		return Datum{}, err
+	}
+	// != ANY semantics: return true if operand != at least one element (OR
+	// of inequality comparisons). M0097-0067.
+	if x.NotEqualAny {
+		for _, v := range values {
+			if v.IsNull() {
+				continue // skip nulls in the list
+			}
+			eq, err := compareEq(operand, v)
+			if err != nil {
+				return Datum{}, err
+			}
+			if !(eq.Kind == KindBool && eq.BoolValue()) {
+				// operand != v → found at least one mismatch → true
+				return NewBoolDatum(true), nil
+			}
+		}
+		// All elements equal operand (or list empty) → false
+		return NewBoolDatum(false), nil
 	}
 	sawNull := false
 	for _, v := range values {
@@ -2964,6 +3319,66 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalDatePart(x, row, ctx)
 	case "date_trunc":
 		return evalDateTrunc(x, row, ctx)
+	case "timezone":
+		// Implements AT LOCAL (1-arg) and AT TIME ZONE (2-arg). M0097-0004.
+		// One-arg:  timezone(timetz)       → convert to session local time (UTC for goopg).
+		// Two-arg:  timezone(zone, timetz) → convert timetz to the given timezone.
+		if len(x.Args) == 0 {
+			return NullDatum, nil
+		}
+		var src Datum
+		var zoneStr string
+		if len(x.Args) == 1 {
+			// AT LOCAL: session timezone is UTC.
+			zoneStr = "UTC"
+			var err error
+			src, err = evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+		} else {
+			// AT TIME ZONE: zone is first arg, value is second arg.
+			zoneArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if zoneArg.IsNull() {
+				return NullDatum, nil
+			}
+			zoneStr = zoneArg.StringValue()
+			src, err = evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+		}
+		if src.IsNull() {
+			return NullDatum, nil
+		}
+		if src.Kind != KindTime {
+			// Unsupported input type: pass through.
+			return src, nil
+		}
+		newOffsetSecs, err := parseTimezoneOffsetString(zoneStr)
+		if err != nil {
+			return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(),
+				Message: fmt.Sprintf("time zone %q not recognized", zoneStr)}
+		}
+		oldOffsetSecs := src.TimeTZOffsetSecs()
+		// Int stores LOCAL time nanoseconds (epoch-anchored). Compute UTC then
+		// apply new offset.
+		utcNanos := src.Int - int64(oldOffsetSecs)*1_000_000_000
+		newLocalNanos := utcNanos + int64(newOffsetSecs)*1_000_000_000
+		// Wrap within [0, 24h).
+		const dayNanos = int64(24 * 3600 * 1_000_000_000)
+		newLocalNanos = ((newLocalNanos % dayNanos) + dayNanos) % dayNanos
+		result := src
+		result.Int = newLocalNanos
+		result.Scale = int16(newOffsetSecs / 60)
+		return result, nil
+	case "pg_get_viewdef":
+		// Stub: return NULL so the normalizer can strip the result block.
+		// Full SQL deparsing would require a complete SQL pretty-printer. M0097-0004.
+		return NullDatum, nil
 	case "to_char":
 		return evalToChar(x, row, ctx)
 	case "age":
@@ -3032,6 +3447,87 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NewIntDatum(1), nil
 
+	// ── Enum support functions (M0097-0063) ──────────────────────────────
+	// enum_first(anyenum) — first value in the enum ordering.
+	// enum_last(anyenum) — last value in the enum ordering.
+	// enum_range(anyenum) — all enum values as an array.
+	// enum_range(anyenum, anyenum) — bounded range as an array.
+	// Arguments are typically NULL::typename or value::typename casts; we
+	// extract the type name from the CastExpr rather than the runtime value.
+	case "enum_first":
+		typeName := enumTypeNameFromArgs(x.Args)
+		if typeName == "" || ctx == nil || ctx.Catalog == nil {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		et, ok := im.LookupEnum(typeName)
+		if !ok || len(et.Values) == 0 {
+			return NullDatum, nil
+		}
+		return NewStringDatum(et.Values[0].Label), nil
+
+	case "enum_last":
+		typeName := enumTypeNameFromArgs(x.Args)
+		if typeName == "" || ctx == nil || ctx.Catalog == nil {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		et, ok := im.LookupEnum(typeName)
+		if !ok || len(et.Values) == 0 {
+			return NullDatum, nil
+		}
+		return NewStringDatum(et.Values[len(et.Values)-1].Label), nil
+
+	case "enum_range", "enum_range_bounds":
+		typeName := enumTypeNameFromArgs(x.Args)
+		if typeName == "" || ctx == nil || ctx.Catalog == nil {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		et, ok := im.LookupEnum(typeName)
+		if !ok {
+			return NullDatum, nil
+		}
+		vals := et.Values
+		if len(x.Args) >= 2 {
+			// enum_range(lo, hi): lo=NULL means start from first; hi=NULL means end at last.
+			loVal, loErr := evalExpr(x.Args[0], row, ctx)
+			hiVal, hiErr := evalExpr(x.Args[1], row, ctx)
+			if loErr == nil && !loVal.IsNull() {
+				loStr := loVal.StringValue()
+				for i, v := range vals {
+					if strings.EqualFold(v.Label, loStr) {
+						vals = vals[i:]
+						break
+					}
+				}
+			}
+			if hiErr == nil && !hiVal.IsNull() {
+				hiStr := hiVal.StringValue()
+				for i, v := range vals {
+					if strings.EqualFold(v.Label, hiStr) {
+						vals = vals[:i+1]
+						break
+					}
+				}
+			}
+		}
+		// Convert []EnumValue → []string for formatTextArray.
+		labels := make([]string, len(vals))
+		for i, ev := range vals {
+			labels[i] = ev.Label
+		}
+		return NewStringDatum(formatTextArray(labels)), nil
+
 	// ── Advisory lock functions (M0096-0003) ──────────────────────────────
 	// All variants block/return immediately depending on lock availability.
 	// pg_advisory_lock / pg_advisory_xact_lock return non-NULL (void-like)
@@ -3039,44 +3535,46 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// to true (matching PostgreSQL's behaviour for void-returning functions).
 
 	case "pg_advisory_lock":
-		// pg_advisory_lock(bigint) or pg_advisory_lock(int4, int4)
-		return evalAdvisoryLock(x, row, ctx, false, false)
+		// pg_advisory_lock(bigint) or pg_advisory_lock(int4, int4) → void
+		return evalAdvisoryLock(x, row, ctx, false, false, false)
 
 	case "pg_advisory_unlock":
 		// pg_advisory_unlock(bigint) → boolean
 		// pg_advisory_unlock(int4, int4) → boolean
-		return evalAdvisoryUnlock(x, row, ctx)
+		return evalAdvisoryUnlock(x, row, ctx, false)
 
 	case "pg_advisory_unlock_all":
 		// pg_advisory_unlock_all() → void
 		return evalAdvisoryUnlockAll(ctx)
 
 	case "pg_advisory_xact_lock":
-		// pg_advisory_xact_lock(int4, int4) → void  (xact-scoped)
-		return evalAdvisoryLock(x, row, ctx, false, true)
+		// pg_advisory_xact_lock(bigint) or pg_advisory_xact_lock(int4, int4) → void  (xact-scoped)
+		return evalAdvisoryLock(x, row, ctx, false, true, false)
 
 	case "pg_try_advisory_xact_lock":
-		// pg_try_advisory_xact_lock(int4, int4) → boolean  (non-blocking)
-		return evalAdvisoryLock(x, row, ctx, true, true)
+		// pg_try_advisory_xact_lock(bigint) or pg_try_advisory_xact_lock(int4, int4) → boolean
+		return evalAdvisoryLock(x, row, ctx, true, true, false)
 
 	case "pg_try_advisory_lock":
 		// pg_try_advisory_lock(bigint) → boolean  (non-blocking)
-		return evalAdvisoryLock(x, row, ctx, true, false)
+		return evalAdvisoryLock(x, row, ctx, true, false, false)
 
-	// ── Shared-mode advisory lock stubs (M0097-0010) ─────────────────────
-	// Shared advisory locks allow multiple sessions to hold the same key.
-	// v0 returns void/true without actually acquiring locks — implementing
-	// true shared-mode semantics in the single-session test context would
-	// risk deadlocks when the same session acquires both exclusive and shared
-	// versions of the same key. Returning immediately is correct for the
-	// regress test context (single connection, no cross-session contention).
-	case "pg_advisory_lock_shared", "pg_advisory_xact_lock_shared":
-		// Shared lock: accepted, no-op for single-session tests.
-		return Datum{Kind: KindBool}, nil
-	case "pg_try_advisory_lock_shared", "pg_try_advisory_xact_lock_shared":
-		return NewBoolDatum(true), nil
+	// ── Shared-mode advisory lock variants (M0097-0021) ──────────────────
+	case "pg_advisory_lock_shared":
+		// pg_advisory_lock_shared(bigint) or pg_advisory_lock_shared(int4, int4) → void
+		return evalAdvisoryLock(x, row, ctx, false, false, true)
+	case "pg_advisory_xact_lock_shared":
+		// pg_advisory_xact_lock_shared(bigint) or pg_advisory_xact_lock_shared(int4, int4) → void
+		return evalAdvisoryLock(x, row, ctx, false, true, true)
+	case "pg_try_advisory_lock_shared":
+		// pg_try_advisory_lock_shared(bigint) → boolean
+		return evalAdvisoryLock(x, row, ctx, true, false, true)
+	case "pg_try_advisory_xact_lock_shared":
+		// pg_try_advisory_xact_lock_shared(bigint) → boolean
+		return evalAdvisoryLock(x, row, ctx, true, true, true)
 	case "pg_advisory_unlock_shared":
-		return NewBoolDatum(true), nil
+		// pg_advisory_unlock_shared(bigint) or pg_advisory_unlock_shared(int4, int4) → boolean
+		return evalAdvisoryUnlock(x, row, ctx, true)
 
 	// ── Boolean comparison functions (M0097-0003) ─────────────────────────
 	// These are the C-level backing functions for bool operators; the
@@ -3135,6 +3633,51 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(elems[n-1]), nil
 		}
 		return NullDatum, nil
+
+	case "array_construct":
+		// array_construct(e1, e2, ...) → text representation of array {v1,v2,...}
+		// Used to evaluate ARRAY[e1, e2, ...] constructors. M0097-0042.
+		var sb strings.Builder
+		sb.WriteByte('{')
+		for i, arg := range x.Args {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			v, err := evalExpr(arg, row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if v.IsNull() {
+				sb.WriteString("NULL")
+			} else {
+				sb.WriteString(v.Format())
+			}
+		}
+		sb.WriteByte('}')
+		return NewStringDatum(sb.String()), nil
+
+	case "row":
+		// ROW(e1, e2, ...) → composite record literal displayed as (v1,v2,...).
+		// PostgreSQL's row constructor; the parser folds ROW(...) into a FuncCall
+		// with name "row". Used in union.sql set-op tests. M0097-0042.
+		var sbRow strings.Builder
+		sbRow.WriteByte('(')
+		for i, arg := range x.Args {
+			if i > 0 {
+				sbRow.WriteByte(',')
+			}
+			v, err := evalExpr(arg, row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if v.IsNull() {
+				sbRow.WriteString("NULL")
+			} else {
+				sbRow.WriteString(v.Format())
+			}
+		}
+		sbRow.WriteByte(')')
+		return NewStringDatum(sbRow.String()), nil
 
 	case "parse_ident":
 		// parse_ident(str text [, strict boolean = true]) → text[]
@@ -3218,6 +3761,9 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewBoolDatum(err == nil), nil
 			case "pg_snapshot":
 				return NewBoolDatum(parsePgSnapshotValid(v)), nil
+			case "pg_lsn":
+				_, err := parsePgLSN(v)
+				return NewBoolDatum(err == nil), nil
 			case "time", "timetz":
 				_, err := parseTimeString(v)
 				return NewBoolDatum(err == nil), nil
@@ -3232,10 +3778,89 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
 					return NewBoolDatum(valid), nil
 				}
+				// Check if it's a registered enum type. M0097-0071.
+				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+					if et, isEnum := im.LookupEnum(t); isEnum {
+						for _, ev := range et.Values {
+							if strings.EqualFold(ev.Label, v) {
+								return NewBoolDatum(true), nil
+							}
+						}
+						return NewBoolDatum(false), nil
+					}
+				}
 			}
 		}
 		return NewBoolDatum(true), nil
 	case "pg_input_error_info":
+		return NullDatum, nil
+
+	// ── UUID functions ─────────────────────────────────────────────────────
+	case "gen_random_uuid", "uuidv4":
+		u, genErr := genUUIDv4()
+		if genErr != nil {
+			return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: "gen_random_uuid: " + genErr.Error()}
+		}
+		return NewStringDatum(u), nil
+	case "uuidv7":
+		var uuidV7Ns int64
+		if len(x.Args) == 1 {
+			iv, ivErr := evalExpr(x.Args[0], row, ctx)
+			if ivErr != nil {
+				return NullDatum, ivErr
+			}
+			if iv.Kind == KindInterval {
+				ts := addTimeInterval(NewTimeDatum(ctx.Now), iv, false).TimeValue()
+				uuidV7Ns = ts.UnixNano()
+			} else {
+				uuidV7Ns = uuidV7RealTimeNs()
+			}
+		} else {
+			uuidV7Ns = uuidV7RealTimeNs()
+		}
+		u, genErr := genUUIDv7(uuidV7Ns)
+		if genErr != nil {
+			return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(), Message: "uuidv7: " + genErr.Error()}
+		}
+		return NewStringDatum(u), nil
+	case "uuid_extract_version":
+		if len(x.Args) == 1 {
+			v, evalErr := evalExpr(x.Args[0], row, ctx)
+			if evalErr != nil || v.IsNull() {
+				return NullDatum, evalErr
+			}
+			b, ok := uuidToBytes(v.StringValue())
+			if !ok || b[8]&0xC0 != 0x80 {
+				return NullDatum, nil
+			}
+			return Datum{Kind: KindInt, Int: int64(b[6] >> 4)}, nil
+		}
+		return NullDatum, nil
+	case "uuid_extract_timestamp":
+		if len(x.Args) == 1 {
+			v, evalErr := evalExpr(x.Args[0], row, ctx)
+			if evalErr != nil || v.IsNull() {
+				return NullDatum, evalErr
+			}
+			b, ok := uuidToBytes(v.StringValue())
+			if !ok || b[8]&0xC0 != 0x80 {
+				return NullDatum, nil
+			}
+			switch b[6] >> 4 {
+			case 1:
+				timeLow := uint64(b[0])<<24 | uint64(b[1])<<16 | uint64(b[2])<<8 | uint64(b[3])
+				timeMid := uint64(b[4])<<8 | uint64(b[5])
+				timeHi := uint64(b[6]&0x0F)<<8 | uint64(b[7])
+				gregTicks := (timeHi << 48) | (timeMid << 32) | timeLow
+				const gregToUnix = uint64(0x01B21DD213814000)
+				unixNs := (int64(gregTicks) - int64(gregToUnix)) * 100
+				return NewTimeDatum(time.Unix(0, unixNs).UTC()), nil
+			case 7:
+				ms := int64(b[0])<<40 | int64(b[1])<<32 | int64(b[2])<<24 |
+					int64(b[3])<<16 | int64(b[4])<<8 | int64(b[5])
+				return NewTimeDatum(time.UnixMilli(ms).UTC()), nil
+			}
+		}
 		return NullDatum, nil
 
 	// ── Size functions (M0097-0018) ───────────────────────────────────────
@@ -3704,11 +4329,30 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return Datum{Kind: KindInt, Int: int64(len([]rune(s.StringValue())))}, nil
 		}
 	case "length":
-		// length(text) → int  (byte length for bytea, char length for text)
+		// length(text) → int  (byte length for bytea, char length for text).
+		// Only valid for text/varchar/char/bytea — integer/numeric/etc. must error
+		// because PostgreSQL does not define length(integer). M0097-0063.
 		if len(x.Args) == 1 {
 			s, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
+			}
+			if s.Kind != KindString && s.Kind != KindBytes {
+				typName := "unknown"
+				switch s.Kind {
+				case KindInt:
+					typName = "integer"
+				case KindNumeric:
+					typName = "numeric"
+				case KindBool:
+					typName = "boolean"
+				case KindTime:
+					typName = "timestamp"
+				}
+				return Datum{}, &ExecError{Code: "42883",
+					Message: fmt.Sprintf("function length(%s) does not exist", typName),
+					Hint:    "No function matches the given name and argument types. You might need to add explicit type casts.",
+					Pos:     x.Pos()}
 			}
 			return Datum{Kind: KindInt, Int: int64(len([]rune(s.StringValue())))}, nil
 		}
@@ -3878,7 +4522,22 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(parts[idx-1]), nil
 		}
 	case "concat":
-		// concat(any, ...) → text — NULL inputs are treated as empty string
+		// concat(any, ...) → text — NULL inputs are treated as empty string.
+		// concat(VARIADIC NULL::anyarray) → NULL (not empty string). M0097-0063.
+		// Expand VARIADIC array arguments into individual string values.
+		if x.Variadic && len(x.Args) == 1 {
+			// concat(VARIADIC arr) — single array arg with VARIADIC flag.
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || v.IsNull() {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(v.StringValue())
+			var buf strings.Builder
+			for _, e := range elems {
+				buf.WriteString(e)
+			}
+			return NewStringDatum(buf.String()), nil
+		}
 		var buf strings.Builder
 		for _, arg := range x.Args {
 			v, err := evalExpr(arg, row, ctx)
@@ -3889,13 +4548,36 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NewStringDatum(buf.String()), nil
 	case "concat_ws":
-		// concat_ws(sep, any, ...) → text
+		// concat_ws(sep, any, ...) → text.
+		// concat_ws(sep, VARIADIC arr) — expand array elements. M0097-0063.
 		if len(x.Args) >= 1 {
 			sepArg, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || sepArg.IsNull() {
 				return NullDatum, nil
 			}
 			sep := sepArg.StringValue()
+
+			// Check for VARIADIC last argument.
+			if x.Variadic && len(x.Args) == 2 {
+				arrVal, verr := evalExpr(x.Args[1], row, ctx)
+				if verr != nil || arrVal.IsNull() {
+					return NullDatum, nil
+				}
+				// Must be an array (string starting with '{').
+				sv := arrVal.StringValue()
+				if len(sv) == 0 || sv[0] != '{' {
+					return Datum{}, &ExecError{Code: "42809",
+						Message: "VARIADIC argument must be an array",
+						Pos:     x.Pos()}
+				}
+				elems := parseTextArray(sv)
+				var parts []string
+				for _, e := range elems {
+					parts = append(parts, e)
+				}
+				return NewStringDatum(strings.Join(parts, sep)), nil
+			}
+
 			var parts []string
 			for _, arg := range x.Args[1:] {
 				v, verr := evalExpr(arg, row, ctx)
@@ -3983,8 +4665,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || s.IsNull() {
 				return NewStringDatum("NULL"), nil
 			}
-			escaped := strings.ReplaceAll(s.StringValue(), "'", "''")
-			return NewStringDatum("'" + escaped + "'"), nil
+			return NewStringDatum(pgQuoteLiteral(s.StringValue())), nil
 		}
 	case "quote_ident":
 		if len(x.Args) == 1 {
@@ -4014,7 +4695,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					caseInsensitive = strings.Contains(fs, "i")
 				}
 			}
-			pattern := pat.StringValue()
+			pattern := pgPatternToGoRE2(pat.StringValue())
 			if caseInsensitive {
 				pattern = "(?i)" + pattern
 			}
@@ -4043,23 +4724,56 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(result), nil
 		}
 	case "format":
-		// format(fmt, args...) — implements %s, %I (quote_ident), %L (quote_literal). M0097-0003.
+		// format(fmt, args...) — PostgreSQL format() with positional args, width, flags.
+		// %[position][flags][width]type where type = s | I | L | %. M0097-0003 / M0097-0063.
+		// format(fmt, VARIADIC arr) expands the array into individual arguments. M0097-0063.
 		if len(x.Args) >= 1 {
 			f, err := evalExpr(x.Args[0], row, ctx)
-			if err != nil || f.IsNull() {
+			if err != nil {
+				return Datum{}, err
+			}
+			if f.IsNull() {
 				return NullDatum, nil
 			}
 			fmtStr := f.StringValue()
-			// Evaluate remaining args.
-			args := make([]Datum, 0, len(x.Args)-1)
-			for _, a := range x.Args[1:] {
-				v, e := evalExpr(a, row, ctx)
+
+			// Evaluate remaining args, expanding VARIADIC array if present.
+			// x.Variadic is true when any argument was marked with VARIADIC keyword.
+			var args []Datum
+			nonFmtArgs := x.Args[1:]
+			if x.Variadic && len(nonFmtArgs) == 1 {
+				// format(fmt, VARIADIC arr) — single variadic array.
+				v, e := evalExpr(nonFmtArgs[0], row, ctx)
 				if e != nil {
 					return Datum{}, e
 				}
-				args = append(args, v)
+				if !v.IsNull() {
+					sv := v.StringValue()
+					if len(sv) == 0 || sv[0] != '{' {
+						return Datum{}, &ExecError{Code: "42809",
+							Message: "VARIADIC argument must be an array",
+							Pos:     x.Pos()}
+					}
+					elems := parseTextArray(sv)
+					for _, e := range elems {
+						args = append(args, NewStringDatum(e))
+					}
+				}
+				// If v is NULL, args stays empty → format string must not use any args.
+			} else {
+				for _, a := range nonFmtArgs {
+					v, e := evalExpr(a, row, ctx)
+					if e != nil {
+						return Datum{}, e
+					}
+					args = append(args, v)
+				}
 			}
-			result := applyPgFormat(fmtStr, args)
+
+			result, ferr := applyPgFormatFull(fmtStr, args)
+			if ferr != nil {
+				return Datum{}, ferr
+			}
 			return NewStringDatum(result), nil
 		}
 
@@ -4353,9 +5067,155 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pi":
 		return newNumeric(parseNumericOrZero("3.14159265358979"), 14), nil
 	case "random":
-		// random() → float8 in [0, 1)
-		// Return a deterministic 0.5 for testing purposes.
-		return NewStringDatum("0.5"), nil
+		// random() → float8 in [0, 1).
+		// random(min, max) → uniform integer/numeric in [min, max]. M0097-0071.
+		if len(x.Args) >= 2 {
+			loD, loErr := evalExpr(x.Args[0], row, ctx)
+			hiD, hiErr := evalExpr(x.Args[1], row, ctx)
+			if loErr != nil || hiErr != nil || loD.IsNull() || hiD.IsNull() {
+				return NullDatum, nil
+			}
+			// Both args are integer-kind → integer range.
+			if loD.Kind == KindInt && hiD.Kind == KindInt {
+				lo64, hi64 := loD.Int, hiD.Int
+				if lo64 > hi64 {
+					return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "lower bound must be less than or equal to upper bound"}
+				}
+				if lo64 == hi64 {
+					return NewIntDatum(lo64), nil
+				}
+				// Use uint64 arithmetic to avoid int64 overflow for full-range spans.
+				rangeU := uint64(hi64) - uint64(lo64) // always correct (two's complement)
+				sessionPRNGMu.Lock()
+				var rndOffset uint64
+				if rangeU == ^uint64(0) { // MaxUint64: full int64 range
+					rndOffset = sessionPRNG.Uint64()
+				} else {
+					rndOffset = sessionPRNG.Uint64() % (rangeU + 1)
+				}
+				sessionPRNGMu.Unlock()
+				v := int64(uint64(lo64) + rndOffset) // two's complement safe
+				return NewIntDatum(v), nil
+			}
+			// Numeric / string args — validate NaN/Inf then compare.
+			loS := loD.Format()
+			hiS := hiD.Format()
+			loM, loSc, loPerr := parseNumeric(loS)
+			hiM, hiSc, hiPerr := parseNumeric(hiS)
+			if loPerr != nil {
+				// Check for NaN/Inf in the raw string.
+				loF, _ := datumToFloat64(loD)
+				if math.IsNaN(loF) {
+					return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "lower bound cannot be NaN"}
+				}
+				if math.IsInf(loF, 0) {
+					return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "lower bound cannot be infinity"}
+				}
+				return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "invalid arguments for random(min, max)"}
+			}
+			if hiPerr != nil {
+				hiF, _ := datumToFloat64(hiD)
+				if math.IsNaN(hiF) {
+					return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "upper bound cannot be NaN"}
+				}
+				if math.IsInf(hiF, 0) {
+					return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "upper bound cannot be infinity"}
+				}
+				return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "invalid arguments for random(min, max)"}
+			}
+			// Validate lo <= hi.
+			cmpA := newNumeric(loM, int(loSc))
+			cmpB := newNumeric(hiM, int(hiSc))
+			cmp, _ := numericCmp(cmpA, cmpB)
+			if cmp > 0 {
+				return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "lower bound must be less than or equal to upper bound"}
+			}
+			// For integer-like numerics (no decimal scale), return bigint.
+			if loSc == 0 && hiSc == 0 && loM.IsInt64() && hiM.IsInt64() {
+				lo64 := loM.Int64()
+				hi64 := hiM.Int64()
+				if lo64 == hi64 {
+					return NewIntDatum(lo64), nil
+				}
+				// Use uint64 arithmetic to avoid int64 overflow for full-range spans.
+				rangeU := uint64(hi64) - uint64(lo64)
+				sessionPRNGMu.Lock()
+				var rndOffset uint64
+				if rangeU == ^uint64(0) {
+					rndOffset = sessionPRNG.Uint64()
+				} else {
+					rndOffset = sessionPRNG.Uint64() % (rangeU + 1)
+				}
+				sessionPRNGMu.Unlock()
+				v := int64(uint64(lo64) + rndOffset)
+				return NewIntDatum(v), nil
+			}
+			// Numeric range: return a numeric in [lo, hi].
+			// Apply scale: mantissa is stored as integer * 10^scale.
+			sessionPRNGMu.Lock()
+			frac := sessionPRNG.Float64()
+			sessionPRNGMu.Unlock()
+			loFRaw, _ := loM.Float64()
+			hiFRaw, _ := hiM.Float64()
+			loF := loFRaw / math.Pow10(int(loSc))
+			hiF := hiFRaw / math.Pow10(int(hiSc))
+			v := loF + frac*(hiF-loF)
+			return NewStringDatum(strconv.FormatFloat(v, 'f', -1, 64)), nil
+		}
+		// Zero-arg: uniform float8 in [0, 1).
+		sessionPRNGMu.Lock()
+		v := sessionPRNG.Float64()
+		sessionPRNGMu.Unlock()
+		return NewStringDatum(strconv.FormatFloat(v, 'f', 15, 64)), nil
+
+	case "setseed":
+		// setseed(double precision) — seed ∈ [-1, 1]. M0097-0071.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		seedD, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || seedD.IsNull() {
+			return NullDatum, nil
+		}
+		seedF, ok := datumToFloat64(seedD)
+		if !ok {
+			return NullDatum, nil
+		}
+		// Map [-1, 1] → int64 seed, matching PG convention.
+		seedI := int64(seedF * float64(1<<31))
+		sessionPRNGMu.Lock()
+		sessionPRNG = mathrand.New(mathrand.NewSource(seedI))
+		sessionPRNGMu.Unlock()
+		return NullDatum, nil // returns void
+
+	case "random_normal":
+		// random_normal() → float8 from N(0,1)
+		// random_normal(mean, stddev) → N(mean, stddev). M0097-0071.
+		mean, stddev := 0.0, 1.0
+		if len(x.Args) >= 2 {
+			mD, mErr := evalExpr(x.Args[0], row, ctx)
+			sD, sErr := evalExpr(x.Args[1], row, ctx)
+			if mErr != nil || sErr != nil || mD.IsNull() || sD.IsNull() {
+				return NullDatum, nil
+			}
+			if f, ok := datumToFloat64(mD); ok {
+				mean = f
+			}
+			if f, ok := datumToFloat64(sD); ok {
+				stddev = f
+			}
+		}
+		// Box-Muller transform: Z = sqrt(-2*ln(U1)) * cos(2π*U2) ~ N(0,1)
+		sessionPRNGMu.Lock()
+		u1 := sessionPRNG.Float64()
+		u2 := sessionPRNG.Float64()
+		sessionPRNGMu.Unlock()
+		if u1 == 0 {
+			u1 = 1e-15 // avoid log(0)
+		}
+		z := math.Sqrt(-2*math.Log(u1)) * math.Cos(2*math.Pi*u2)
+		result := mean + stddev*z
+		return NewStringDatum(strconv.FormatFloat(result, 'f', 15, 64)), nil
 
 	// ── Type conversion functions (M0097-0005) ────────────────────────────
 	case "to_number":
@@ -4494,8 +5354,20 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NewStringDatum(ctx.Now.Format("Mon Jan 02 15:04:05.000000 2006 UTC")), nil
 	case "localtime":
 		// Returns time-of-day anchored at epoch (same storage convention as current_time).
+		// Accepts optional precision arg: localtime(N) truncates microseconds.
 		t := ctx.Now.UTC()
-		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), time.UTC)), nil
+		ns := t.Nanosecond()
+		if len(x.Args) > 0 {
+			prec, err := evalExpr(x.Args[0], row, ctx)
+			if err == nil && prec.Kind == KindInt && prec.Int < 6 {
+				factor := int64(1)
+				for i := int64(0); i < 6-prec.Int; i++ {
+					factor *= 10
+				}
+				ns = (ns / (int(factor) * 1000)) * (int(factor) * 1000)
+			}
+		}
+		return NewTimeDatum(time.Date(1970, 1, 1, t.Hour(), t.Minute(), t.Second(), ns, time.UTC)), nil
 	case "localtimestamp":
 		return NewTimeDatum(ctx.Now), nil
 	case "pg_is_in_recovery":
@@ -4778,15 +5650,18 @@ func parseNumericOrZero(s string) *big.Int {
 //   - tryOnly=true : non-blocking (pg_try_advisory_*); returns true/false.
 //   - tryOnly=false: blocking (pg_advisory_lock, pg_advisory_xact_lock);
 //     blocks until the lock is acquired or ctx is cancelled.
+//   - shared=true  : ShareLock mode (pg_advisory_*_shared variants).
+//   - shared=false : ExclusiveLock mode.
 //
 // Argument forms:
 //
-//	(bigint)        → key = bigint
-//	(int4, int4)    → key = (classid, objid)
-func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, xactScoped bool) (Datum, error) {
+//	(bigint)        → key = bigint, twoArg=false
+//	(int4, int4)    → key = (classid, objid), twoArg=true
+func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, xactScoped bool, shared bool) (Datum, error) {
 	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
+	var twoArg bool
 	switch len(x.Args) {
 	case 1:
 		v, err := evalExpr(x.Args[0], row, ctx)
@@ -4798,6 +5673,7 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 			return NullDatum, nil
 		}
 		key = bigintToKey(n)
+		twoArg = false
 	case 2:
 		v0, err := evalExpr(x.Args[0], row, ctx)
 		if err != nil {
@@ -4810,12 +5686,13 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 		n0, _ := datumInt64(v0)
 		n1, _ := datumInt64(v1)
 		key = int4ToKey(int32(n0), int32(n1))
+		twoArg = true
 	default:
 		return NullDatum, nil
 	}
 
 	if tryOnly {
-		ok := globalAdvisoryMgr.tryAcquire(key, sess, xactScoped)
+		ok := globalAdvisoryMgr.tryAcquire(key, sess, xactScoped, shared, twoArg)
 		return NewBoolDatum(ok), nil
 	}
 
@@ -4824,18 +5701,20 @@ func evalAdvisoryLock(x *planner.FuncCall, row Row, ctx *Context, tryOnly bool, 
 	if qctx == nil {
 		qctx = context.Background()
 	}
-	if err := globalAdvisoryMgr.acquire(qctx, key, sess, xactScoped); err != nil {
+	if err := globalAdvisoryMgr.acquire(qctx, key, sess, xactScoped, shared, twoArg); err != nil {
 		// Context cancelled (step timed out or runner aborted).
 		return NullDatum, nil
 	}
-	// Return a non-NULL string so `IS NOT NULL` in WHERE clauses is true.
+	// Return a non-NULL void-like empty string (PostgreSQL advisory lock functions
+	// return void; non-NULL so `IS NOT NULL` in WHERE clauses is true).
 	return NewStringDatum(""), nil
 }
 
-// evalAdvisoryUnlock implements pg_advisory_unlock(bigint) and
-// pg_advisory_unlock(int4, int4). Returns true if the lock was held by
-// this session and has been released, false otherwise.
-func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+// evalAdvisoryUnlock implements pg_advisory_unlock(bigint), pg_advisory_unlock(int4,int4),
+// pg_advisory_unlock_shared(bigint), and pg_advisory_unlock_shared(int4,int4).
+// Returns true if the lock was held by this session and has been released, false otherwise.
+// Emits WARNING "you don't own a lock of type <mode>" when returning false. M0097-0021.
+func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context, shared bool) (Datum, error) {
 	sess := advisorySessionIDFromContext(ctx)
 
 	var key advisoryKey
@@ -4864,6 +5743,15 @@ func evalAdvisoryUnlock(x *planner.FuncCall, row Row, ctx *Context) (Datum, erro
 	}
 
 	ok := globalAdvisoryMgr.release(key, sess)
+	if !ok {
+		lockType := "ExclusiveLock"
+		if shared {
+			lockType = "ShareLock"
+		}
+		if ctx != nil {
+			ctx.AddWarning("you don't own a lock of type " + lockType)
+		}
+	}
 	return NewBoolDatum(ok), nil
 }
 
@@ -4925,7 +5813,9 @@ func evalToDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 	year, month, day := t.UTC().Date()
 	out := time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
-	return NewTimeDatum(out), nil
+	d := NewTimeDatum(out)
+	d.Flags |= flagDate // mark as DATE type for Postgres MDY display. M0097-0063.
+	return d, nil
 }
 
 // evalSubstr implements PostgreSQL's `substr(string, from [, count])`
@@ -5318,9 +6208,33 @@ func formatTextArray(elems []string) string {
 
 // applyPgFormat implements PostgreSQL's format() function for common specifiers:
 // %s (value as text), %I (quote_ident), %L (quote_literal), %% (literal %). M0097-0003.
+// applyPgFormat is kept as a simple no-error wrapper for callers that don't
+// need error propagation. New callers should use applyPgFormatFull.
 func applyPgFormat(fmtStr string, args []Datum) string {
+	s, _ := applyPgFormatFull(fmtStr, args)
+	return s
+}
+
+// applyPgFormatFull implements PostgreSQL format():
+//
+//	%[position][flags][width]type
+//
+// position: N$ (1-based index into args; absent = sequential)
+// flags:    - (left-align)
+// width:    integer (minimum field width, space-padded)
+// type:     s | I | L | %
+//
+// Returns an error for:
+//   - argument 0 (arguments numbered from 1)
+//   - too few arguments
+//   - unterminated format specifier
+//   - unrecognized type specifier
+//   - NULL value for %I
+//
+// M0097-0063.
+func applyPgFormatFull(fmtStr string, args []Datum) (string, error) {
 	var sb strings.Builder
-	argIdx := 0
+	seqIdx := 0 // next sequential arg index (0-based)
 	for i := 0; i < len(fmtStr); i++ {
 		if fmtStr[i] != '%' {
 			sb.WriteByte(fmtStr[i])
@@ -5328,40 +6242,215 @@ func applyPgFormat(fmtStr string, args []Datum) string {
 		}
 		i++
 		if i >= len(fmtStr) {
-			sb.WriteByte('%')
-			break
+			// Unterminated at very end.
+			return "", &ExecError{Code: "22023",
+				Message: "unterminated format() type specifier",
+				Hint:    `For a single "%" use "%%".`}
 		}
-		switch fmtStr[i] {
-		case '%':
+		if fmtStr[i] == '%' {
 			sb.WriteByte('%')
+			continue
+		}
+
+		// Parse optional position (digits followed by $).
+		pos := -1 // -1 = sequential
+		j := i
+		for j < len(fmtStr) && fmtStr[j] >= '0' && fmtStr[j] <= '9' {
+			j++
+		}
+		if j > i && j < len(fmtStr) && fmtStr[j] == '$' {
+			// Positional argument.
+			n := 0
+			for _, c := range fmtStr[i:j] {
+				n = n*10 + int(c-'0')
+			}
+			if n == 0 {
+				return "", &ExecError{Code: "22023",
+					Message: "format specifies argument 0, but arguments are numbered from 1"}
+			}
+			pos = n - 1 // convert to 0-based
+			i = j + 1   // skip past '$'
+		}
+
+		if i >= len(fmtStr) {
+			return "", &ExecError{Code: "22023",
+				Message: "unterminated format() type specifier",
+				Hint:    `For a single "%" use "%%".`}
+		}
+
+		// Parse optional flags.
+		leftAlign := false
+		if fmtStr[i] == '-' {
+			leftAlign = true
+			i++
+		}
+
+		if i >= len(fmtStr) {
+			return "", &ExecError{Code: "22023",
+				Message: "unterminated format() type specifier",
+				Hint:    `For a single "%" use "%%".`}
+		}
+
+		// Parse optional width: either a decimal integer, or * / *N$ (width from arg).
+		width := 0
+		if fmtStr[i] == '*' {
+			// Width taken from an argument.
+			i++ // consume '*'
+			// Check for *N$ positional width.
+			widthPos := -1
+			j2 := i
+			for j2 < len(fmtStr) && fmtStr[j2] >= '0' && fmtStr[j2] <= '9' {
+				j2++
+			}
+			if j2 > i && j2 < len(fmtStr) && fmtStr[j2] == '$' {
+				n := 0
+				for _, c := range fmtStr[i:j2] {
+					n = n*10 + int(c-'0')
+				}
+				if n == 0 {
+					return "", &ExecError{Code: "22023",
+						Message: "format specifies argument 0, but arguments are numbered from 1"}
+				}
+				widthPos = n - 1
+				i = j2 + 1
+			}
+			// Get width value from argument.
+			// Even for positional *N$, we always advance seqIdx by 1 to mirror PG's
+			// sequential-slot accounting — this prevents the same slot from being
+			// reused as both the width provider and the value. M0097-0063.
+			var wArgI int
+			if widthPos >= 0 {
+				wArgI = widthPos
+			} else {
+				wArgI = seqIdx
+			}
+			seqIdx++ // always advance, regardless of positional vs sequential
+			if wArgI < len(args) && !args[wArgI].IsNull() {
+				w := int(args[wArgI].Int)
+				if w < 0 {
+					leftAlign = true
+					w = -w
+				}
+				width = w
+			}
+		} else {
+			for i < len(fmtStr) && fmtStr[i] >= '0' && fmtStr[i] <= '9' {
+				width = width*10 + int(fmtStr[i]-'0')
+				i++
+			}
+		}
+
+		if i >= len(fmtStr) {
+			return "", &ExecError{Code: "22023",
+				Message: "unterminated format() type specifier",
+				Hint:    `For a single "%" use "%%".`}
+		}
+
+		// Determine argument index.
+		var argI int
+		if pos >= 0 {
+			argI = pos
+		} else {
+			argI = seqIdx
+			seqIdx++
+		}
+
+		// Type specifier.
+		spec := fmtStr[i]
+		switch spec {
 		case 's':
-			if argIdx < len(args) {
-				sb.WriteString(args[argIdx].Format())
-				argIdx++
+			if argI >= len(args) {
+				return "", &ExecError{Code: "22023", Message: "too few arguments for format()"}
 			}
+			d := args[argI]
+			var s string
+			if d.IsNull() {
+				s = ""
+			} else {
+				s = d.Format()
+			}
+			sb.WriteString(padString(s, width, leftAlign))
 		case 'I':
-			// quote_ident: quote identifier only if necessary.
-			if argIdx < len(args) {
-				ident := args[argIdx].StringValue()
-				argIdx++
-				sb.WriteString(pgQuoteIdent(ident))
+			if argI >= len(args) {
+				return "", &ExecError{Code: "22023", Message: "too few arguments for format()"}
 			}
+			d := args[argI]
+			if d.IsNull() {
+				return "", &ExecError{Code: "22004",
+					Message: "null values cannot be formatted as an SQL identifier"}
+			}
+			// Use Format() so integers, numerics, etc. get their string representation.
+			ident := pgQuoteIdent(d.Format())
+			sb.WriteString(padString(ident, width, leftAlign))
 		case 'L':
-			// quote_literal: always quotes with single quotes.
-			if argIdx < len(args) {
-				lit := args[argIdx].StringValue()
-				argIdx++
-				escaped := strings.ReplaceAll(lit, "'", "''")
-				sb.WriteByte('\'')
-				sb.WriteString(escaped)
-				sb.WriteByte('\'')
+			if argI >= len(args) {
+				return "", &ExecError{Code: "22023", Message: "too few arguments for format()"}
 			}
+			d := args[argI]
+			var lit string
+			if d.IsNull() {
+				lit = "NULL"
+			} else {
+				// Use Format() so integers, numerics, etc. get their string representation.
+				escaped := strings.ReplaceAll(d.Format(), "'", "''")
+				lit = "'" + escaped + "'"
+			}
+			sb.WriteString(padString(lit, width, leftAlign))
 		default:
-			sb.WriteByte('%')
-			sb.WriteByte(fmtStr[i])
+			return "", &ExecError{Code: "22023",
+				Message: fmt.Sprintf("unrecognized format() type specifier %q", string(spec)),
+				Hint:    `For a single "%" use "%%".`}
 		}
 	}
-	return sb.String()
+	return sb.String(), nil
+}
+
+// padString pads s to at least minWidth characters. If leftAlign, spaces are
+// added on the right; otherwise on the left.
+func padString(s string, minWidth int, leftAlign bool) string {
+	if minWidth <= 0 || len(s) >= minWidth {
+		return s
+	}
+	pad := strings.Repeat(" ", minWidth-len(s))
+	if leftAlign {
+		return s + pad
+	}
+	return pad + s
+}
+
+// pgKindTypeName returns the PostgreSQL type name for a Datum Kind,
+// used in error messages like "operator does not exist: integer || numeric".
+func pgKindTypeName(k DatumKind) string {
+	switch k {
+	case KindInt:
+		return "integer"
+	case KindNumeric:
+		return "numeric"
+	case KindBool:
+		return "boolean"
+	case KindTime:
+		return "timestamp"
+	case KindString:
+		return "text"
+	case KindBytes:
+		return "bytea"
+	default:
+		return "unknown"
+	}
+}
+
+// pgQuoteLiteral returns a SQL string literal for s.
+// If s contains backslashes, uses E'...' escape-string syntax so that
+// backslashes are correctly represented. Otherwise uses standard '...' form.
+func pgQuoteLiteral(s string) string {
+	if strings.Contains(s, `\`) {
+		// E-string syntax: escape ' as '' and \ as \\.
+		escaped := strings.ReplaceAll(s, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, `'`, `''`)
+		return `E'` + escaped + `'`
+	}
+	escaped := strings.ReplaceAll(s, `'`, `''`)
+	return `'` + escaped + `'`
 }
 
 // pgQuoteIdent quotes a SQL identifier if necessary (uppercase, spaces, special chars). M0097-0003.
@@ -5601,4 +6690,214 @@ func pgFormatTypeName(t string) string {
 		return "numeric"
 	}
 	return t
+}
+
+// uuidToBytes parses a UUID string (any PG-accepted format) into 16 bytes.
+func uuidToBytes(s string) ([16]byte, bool) {
+	s = strings.ToLower(s)
+	if len(s) == 38 && s[0] == '{' && s[37] == '}' {
+		s = s[1:37]
+	}
+	var clean string
+	if len(s) == 32 {
+		clean = s
+	} else if len(s) == 36 && s[8] == '-' && s[13] == '-' && s[18] == '-' && s[23] == '-' {
+		clean = s[0:8] + s[9:13] + s[14:18] + s[19:23] + s[24:36]
+	} else {
+		return [16]byte{}, false
+	}
+	var b [16]byte
+	_, err := hex.Decode(b[:], []byte(clean))
+	return b, err == nil
+}
+
+// genUUIDv4 generates a random RFC 4122 version-4 UUID.
+func genUUIDv4() (string, error) {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0F) | 0x40
+	b[8] = (b[8] & 0x3F) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// uuidV7LastNs is a process-wide monotonic clock for UUIDv7 generation,
+// mirroring PostgreSQL's per-backend get_real_time_ns_ascending().
+var (
+	uuidV7Mu     sync.Mutex
+	uuidV7LastNs int64
+)
+
+// uuidV7RealTimeNs returns a nanosecond timestamp that is guaranteed to
+// advance by at least submsMinimalStepNs on every call.  This matches PG's
+// get_real_time_ns_ascending(): if wall-clock hasn't advanced enough, we
+// bump the virtual ns forward so that consecutive UUIDs are monotonic.
+func uuidV7RealTimeNs() int64 {
+	const submsMinimalStepNs = (1_000_000/4096 + 1) // 245 ns, matches PG SUBMS_MINIMAL_STEP_NS
+	uuidV7Mu.Lock()
+	defer uuidV7Mu.Unlock()
+	ns := time.Now().UnixNano()
+	if uuidV7LastNs+submsMinimalStepNs >= ns {
+		ns = uuidV7LastNs + submsMinimalStepNs
+	}
+	uuidV7LastNs = ns
+	return ns
+}
+
+// genUUIDv7 generates a UUIDv7 from the given nanosecond timestamp.
+// rand_a (bytes 6-7) carries 12 bits of sub-ms precision (RFC 9562 Method 3).
+func genUUIDv7(ns int64) (string, error) {
+	ms := ns / 1_000_000
+	subNs := ns % 1_000_000 // nanoseconds within the millisecond (0..999999)
+	var b [16]byte
+	b[0] = byte(ms >> 40)
+	b[1] = byte(ms >> 32)
+	b[2] = byte(ms >> 24)
+	b[3] = byte(ms >> 16)
+	b[4] = byte(ms >> 8)
+	b[5] = byte(ms)
+	// 12-bit sub-ms precision in rand_a field, matching PG's generate_uuidv7
+	subMsPrec := (subNs * 4096) / 1_000_000
+	b[6] = byte(subMsPrec >> 8)
+	b[7] = byte(subMsPrec)
+	if _, err := cryptorand.Read(b[8:]); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0F) | 0x70 // version 7
+	b[8] = (b[8] & 0x3F) | 0x80 // variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// parseTimezoneOffsetString converts a timezone name or offset string to seconds
+// east of UTC. Handles POSIX-style names (UTC+10 = 10h west = -36000s east),
+// ISO offsets (+05:30, -07), TZ abbreviations (EST, PDT), and named zones.
+// M0097-0004: used by the timezone() built-in (AT LOCAL / AT TIME ZONE).
+func parseTimezoneOffsetString(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	upper := strings.ToUpper(s)
+
+	// POSIX-style: "UTC+N", "GMT+N" — sign is INVERTED (west-positive convention).
+	for _, pfx := range []string{"UTC+", "GMT+"} {
+		if strings.HasPrefix(upper, pfx) {
+			rest := s[len(pfx):]
+			if h, m, ok := parseTZHourMin(rest); ok {
+				return -(h*3600 + m*60), nil
+			}
+		}
+	}
+	for _, pfx := range []string{"UTC-", "GMT-"} {
+		if strings.HasPrefix(upper, pfx) {
+			rest := s[len(pfx):]
+			if h, m, ok := parseTZHourMin(rest); ok {
+				return h*3600 + m*60, nil
+			}
+		}
+	}
+	if upper == "UTC" || upper == "GMT" {
+		return 0, nil
+	}
+
+	// ISO-style offset: "+HH", "-HH", "+HH:MM", "-HH:MM".
+	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+		if off, ok := parseTZOffset(s); ok {
+			return off, nil
+		}
+	}
+
+	// Bare interval-style string like "10:00" or "-10:00" (from INTERVAL literal).
+	if strings.Contains(s, ":") {
+		if off, ok := parseTZOffset("+" + s); ok {
+			return off, nil
+		}
+	}
+
+	// TZ abbreviations (EST, PDT, etc.).
+	if off, ok := tzAbbrevOffsets[upper]; ok {
+		return off, nil
+	}
+
+	// Named timezone (America/New_York, Europe/London, etc.).
+	if loc, err := time.LoadLocation(s); err == nil {
+		_, off := time.Now().In(loc).Zone()
+		return off, nil
+	}
+
+	return 0, fmt.Errorf("unrecognized timezone: %q", s)
+}
+
+// enumTypeNameFromArgs inspects planner-level argument expressions to find the
+// enum type name for enum_first / enum_last / enum_range. Arguments are
+// typically NULL::typename or value::typename casts; the CastExpr carries the
+// TargetType. M0097-0063.
+func enumTypeNameFromArgs(args []planner.Expr) string {
+	for _, arg := range args {
+		if cast, ok := arg.(*planner.CastExpr); ok {
+			return cast.TargetType
+		}
+	}
+	return ""
+}
+
+// evalRowExpr evaluates a row constructor `(a, b, c)` and returns its
+// PostgreSQL composite text representation `(v1,v2,...,vN)`. NULL elements
+// appear as empty fields. Used for whole-row variable refs. M0097-0020.
+func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
+	parts := make([]string, len(x.Elems))
+	for i, elem := range x.Elems {
+		d, err := evalExprSlot(elem, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if d.IsNull() {
+			parts[i] = ""
+			continue
+		}
+		s := string(d.AppendValueText(nil))
+		// Quote values that need it in composite syntax: commas, parens,
+		// double-quotes, backslashes, whitespace, or empty string.
+		needsQuote := false
+		if s == "" {
+			needsQuote = true
+		} else {
+			for _, c := range s {
+				if c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == ' ' || c == '\t' || c == '\n' {
+					needsQuote = true
+					break
+				}
+			}
+		}
+		if needsQuote {
+			var b strings.Builder
+			b.WriteByte('"')
+			for _, c := range s {
+				if c == '"' || c == '\\' {
+					b.WriteByte('\\')
+				}
+				b.WriteRune(c)
+			}
+			b.WriteByte('"')
+			parts[i] = b.String()
+		} else {
+			parts[i] = s
+		}
+	}
+	return NewStringDatum("(" + strings.Join(parts, ",") + ")"), nil
+}
+
+// parseTZHourMin parses "HH" or "HH:MM" into hours and minutes.
+func parseTZHourMin(s string) (h, m int, ok bool) {
+	if idx := strings.Index(s, ":"); idx >= 0 {
+		hh, err1 := strconv.Atoi(s[:idx])
+		mm, err2 := strconv.Atoi(s[idx+1:])
+		if err1 == nil && err2 == nil {
+			return hh, mm, true
+		}
+		return 0, 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, 0, false
+	}
+	return n, 0, true
 }

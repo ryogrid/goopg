@@ -185,6 +185,16 @@ type ReturnStmt struct {
 func (r *ReturnStmt) Pos() int          { return r.pos }
 func (r *ReturnStmt) plpgsqlStmtNode() {}
 
+// ReturnNextStmt is `RETURN NEXT expr;` — emits one row from a SETOF
+// PL/pgSQL function and continues execution. M0097-0073.
+type ReturnNextStmt struct {
+	pos  int
+	Expr parser.Expr
+}
+
+func (r *ReturnNextStmt) Pos() int          { return r.pos }
+func (r *ReturnNextStmt) plpgsqlStmtNode() {}
+
 // SQLStmt is an embedded SQL DML/query statement in a PL/pgSQL body.
 // The raw SQL text is stored verbatim; at execution time the executor
 // substitutes OLD.* / NEW.* references with the trigger context rows,

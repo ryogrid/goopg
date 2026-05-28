@@ -152,6 +152,17 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		// CREATE OPERATOR — accept and skip. M0097-regress.
 		return p.parseSkipToSemicolon(t.Pos)
+	// CREATE CONVERSION name ... — accept as no-op. M0097-0071.
+	case p.acceptIdentKeyword("conversion"):
+		return p.parseSkipToSemicolon(t.Pos)
+	// CREATE TEXT SEARCH ... — accept as no-op. M0097-0071.
+	case p.acceptIdentKeyword("text"):
+		return p.parseSkipToSemicolon(t.Pos)
+	// CREATE SERVER / CREATE FOREIGN ... — accept as no-op. M0097-0071.
+	case p.acceptIdentKeyword("server"):
+		return p.parseSkipToSemicolon(t.Pos)
+	case p.acceptIdentKeyword("foreign"):
+		return p.parseSkipToSemicolon(t.Pos)
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after CREATE")
 }
@@ -311,8 +322,11 @@ func parseSkipToSemicolonHelper(p *parser, stmt Stmt) (Stmt, error) {
 }
 
 // parseSkipToSemicolon advances past all tokens until ';' or EOF and returns a
-// no-op DoStmt so the caller has a valid non-nil Stmt. Used for DDL statements
-// that are syntactically accepted but semantically ignored. M0097-0027.
+// CompatNoopStmt so the caller has a valid non-nil Stmt that succeeds silently.
+// Used for DDL statements that are syntactically accepted but semantically
+// ignored (e.g. CREATE OPERATOR, CREATE CAST). M0097-0027. Previously returned
+// DoStmt which failed with "DO block language not supported" and aborted
+// any enclosing transaction; CompatNoopStmt avoids that. M0097-0065.
 func (p *parser) parseSkipToSemicolon(pos int) (Stmt, error) {
 	for {
 		tok := p.cur()
@@ -324,7 +338,7 @@ func (p *parser) parseSkipToSemicolon(pos int) (Stmt, error) {
 		}
 		p.advance()
 	}
-	return &DoStmt{pos: pos}, nil
+	return &CompatNoopStmt{pos: pos, Tag: "CREATE"}, nil
 }
 
 // parseCreatePublicationTail picks up after CREATE PUBLICATION.
@@ -475,7 +489,12 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect) {
 		return nil, p.errAtCur("expected SELECT after AS")
 	}
+	// SELECT … INTO is not permitted in a view body (M0097-0020).
+	old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+	p.selectIntoErrMsg = "views must not contain SELECT INTO"
+	p.selectIntoNoPos = true
 	inner, err := p.parseSelect()
+	p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 	if err != nil {
 		return nil, err
 	}
@@ -506,7 +525,7 @@ func (p *parser) parseCreateMatViewTail(pos int) (Stmt, error) {
 	}
 	stmt.Name = name
 	// Skip optional USING index_method clause.
-	if p.acceptIdentKeyword("using") {
+	if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
 		_, _ = p.parseIdent()
 	}
 	// Skip optional WITH (storage_params).
@@ -590,6 +609,38 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		return nil, err
 	}
 	stmt.Name = name
+
+	// Detect optional column-alias list before AS:
+	//   CREATE TABLE name (col1, col2, …) AS SELECT … [WITH NO DATA]
+	// Disambiguation from regular column defs: CTAS aliases are bare identifiers
+	// with no type. We speculatively consume the parenthesised list; if AS does
+	// NOT follow we restore the token index and fall through to regular parsing.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		savedIdx := p.idx
+		p.advance() // consume '('
+		var aliasCandidate []string
+		ok := true
+		for p.cur().Kind != TokenEOF {
+			id, err := p.parseIdent()
+			if err != nil {
+				ok = false
+				break
+			}
+			aliasCandidate = append(aliasCandidate, identText(id))
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+		if ok && p.acceptSymbol(")") && p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
+			// Confirmed CTAS column-alias list: keep the aliases and let the
+			// AS check below consume and process the CREATE TABLE AS body.
+			stmt.ColumnAliases = aliasCandidate
+		} else {
+			// Not a CTAS alias list: restore and let regular column-def
+			// parsing handle the '(' (which may be empty `()` or real defs).
+			p.idx = savedIdx
+		}
+	}
 
 	// CREATE TABLE name AS SELECT/EXECUTE … [WITH NO DATA] (CTAS). M0096-0008.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
@@ -731,6 +782,50 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			}
 		}
 		stmt.PartitionOf = poc
+		// Optional PARTITION BY for nested partitions: CREATE TABLE foo3 PARTITION OF foo2
+		// FOR VALUES ... PARTITION BY list(b). M0097-0020.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPartition {
+			if p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwBy {
+				pos2 := p.cur().Pos
+				p.advance() // PARTITION
+				p.advance() // BY
+				method := ""
+				switch {
+				case p.acceptIdentKeyword("list"):
+					method = "LIST"
+				case p.acceptIdentKeyword("range"):
+					method = "RANGE"
+				case p.acceptIdentKeyword("hash"):
+					method = "HASH"
+				default:
+					return nil, p.errAtCur("expected LIST, RANGE, or HASH after PARTITION BY")
+				}
+				if !p.acceptSymbol("(") {
+					return nil, p.errAtCur("expected '(' after partition method")
+				}
+				var keyCols, opClasses []string
+				for {
+					col, err := p.parseIdent()
+					if err != nil {
+						return nil, err
+					}
+					keyCols = append(keyCols, identText(col))
+					opClass := ""
+					if p.cur().Kind == TokenIdent {
+						opClass = p.cur().Value
+						p.advance()
+					}
+					opClasses = append(opClasses, opClass)
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, OpClasses: opClasses}
+			}
+		}
 		// ON COMMIT clause may follow FOR VALUES ... in partition tables.
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
 			p.advance()
@@ -872,12 +967,36 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					p.advance()
 				}
 			}
+		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwLike {
+			// LIKE source_table [INCLUDING/EXCLUDING option …] — copy columns. M0097-0069.
+			p.advance() // consume LIKE
+			srcName, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			stmt.LikeTables = append(stmt.LikeTables, srcName)
+			stmt.BodyOrder = append(stmt.BodyOrder, "@@LIKE:"+srcName.String())
+			// Consume optional INCLUDING/EXCLUDING clauses.
+			for p.acceptIdentKeyword("including") || p.acceptIdentKeyword("excluding") {
+				// Option keyword: DEFAULTS, CONSTRAINTS, INDEXES, IDENTITY,
+				// COMMENTS, STATISTICS, STORAGE, ALL.
+				_ = p.acceptIdentKeyword("defaults") ||
+					p.acceptIdentKeyword("constraints") ||
+					p.acceptIdentKeyword("indexes") ||
+					p.acceptIdentKeyword("identity") ||
+					p.acceptIdentKeyword("comments") ||
+					p.acceptIdentKeyword("statistics") ||
+					p.acceptIdentKeyword("storage") ||
+					p.acceptKeyword(KwAll) ||
+					p.acceptIdentKeyword("generated")
+			}
 		} else {
 			col, err := p.parseColumnDef()
 			if err != nil {
 				return nil, err
 			}
 			stmt.Columns = append(stmt.Columns, col)
+			stmt.BodyOrder = append(stmt.BodyOrder, col.Name)
 			if col.Primary {
 				stmt.PrimaryKey = append(stmt.PrimaryKey, col.Name)
 			}
@@ -1071,6 +1190,9 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			col.NotNull = true
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull:
 			p.advance() // NULL is the default; absorb it
+		// COLLATE collation_name — ignore collation; goopg v0 doesn't track collations. M0097-0071.
+		case p.acceptIdentKeyword("collate"):
+			_, _ = p.parseIdent() // consume collation name (may be quoted)
 		// GENERATED ALWAYS AS (expr) STORED  (M0096-0008)
 		case p.acceptIdentKeyword("generated"):
 			if !p.acceptIdentKeyword("always") {
@@ -1274,7 +1396,7 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 				ct.Name = "varbit"
 			}
 		case "timestamp":
-			if p.acceptIdentKeyword("with") {
+			if p.acceptKeyword(KwWith) {
 				p.acceptIdentKeyword("time")
 				p.acceptIdentKeyword("zone")
 				ct.Name = "timestamptz"
@@ -1284,7 +1406,7 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 				ct.Name = "timestamp"
 			}
 		case "time":
-			if p.acceptIdentKeyword("with") {
+			if p.acceptKeyword(KwWith) {
 				p.acceptIdentKeyword("time")
 				p.acceptIdentKeyword("zone")
 				ct.Name = "timetz"
@@ -1316,8 +1438,41 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 			break
 		}
 	}
+	// Handle "time(N) with/without time zone" and "timestamp(N) with/without time zone"
+	// where the timezone qualifier follows the typmod parentheses.
+	if len(ct.Args) > 0 {
+		switch strings.ToLower(ct.Name) {
+		case "time":
+			if p.acceptKeyword(KwWith) {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "timetz"
+			} else if p.acceptIdentKeyword("without") {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "time"
+			}
+		case "timestamp":
+			if p.acceptKeyword(KwWith) {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "timestamptz"
+			} else if p.acceptIdentKeyword("without") {
+				p.acceptIdentKeyword("time")
+				p.acceptIdentKeyword("zone")
+				ct.Name = "timestamp"
+			}
+		}
+	}
 	if first.Kind != TokenQuotedIdent && strings.EqualFold(ct.Name, "char") && len(ct.Args) == 0 {
 		ct.Args = []int64{1}
+	}
+	// Accept trailing [] array notation (e.g. int[], text[][], integer[]).
+	// We don't track the dimension count; just consume the brackets. M0097-0071.
+	for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+		p.advance() // consume "["
+		_ = p.acceptSymbol("]")
+		ct.IsArray = true
 	}
 	return ct, nil
 }
@@ -1706,10 +1861,49 @@ func (p *parser) parseDrop() (Stmt, error) {
 		return &DropCompatStmt{pos: t.Pos, ObjType: "aggregate", IfExists: ifExists,
 			Names: []ObjectName{name}, Behavior: behavior, ArgTypes: []string{argType}}, nil
 	}
-	// DROP OPERATOR [IF EXISTS] name ( left_type , right_type ) [CASCADE|RESTRICT]
-	// PG requires the parenthesised type list; without it (or with just a bare
-	// comma-separated identifier list) the grammar produces a syntax error.
+	// DROP OPERATOR [CLASS|FAMILY] [IF EXISTS] ... M0097-0071.
+	// Handles DROP OPERATOR name (type, type), DROP OPERATOR CLASS name USING method,
+	// and DROP OPERATOR FAMILY name USING method.
 	if p.acceptIdentKeyword("operator") {
+		// Check for CLASS or FAMILY sub-forms first.
+		var opSubtype string
+		if p.acceptIdentKeyword("class") {
+			opSubtype = "operator class"
+		} else if p.acceptIdentKeyword("family") {
+			opSubtype = "operator family"
+		}
+		if opSubtype != "" {
+			// DROP OPERATOR CLASS|FAMILY [IF EXISTS] name USING method [CASCADE|RESTRICT]
+			ifExists := false
+			if p.acceptKeyword(KwIf) {
+				if _, err := p.expectKeyword(KwExists); err != nil {
+					return nil, err
+				}
+				ifExists = true
+			}
+			name, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			// Consume USING method_name (store in UsingMethod for error formatting). M0097-0071.
+			var usingMethod string
+			if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
+				if tok, err2 := p.parseIdent(); err2 == nil {
+					usingMethod = tok.Value
+				}
+			}
+			behavior := DropDefault
+			switch {
+			case p.acceptKeyword(KwCascade):
+				behavior = DropCascade
+			case p.acceptKeyword(KwRestrict):
+			}
+			return &DropCompatStmt{pos: t.Pos, ObjType: opSubtype, IfExists: ifExists,
+				Names: []ObjectName{name}, Behavior: behavior, UsingMethod: usingMethod}, nil
+		}
+		// DROP OPERATOR [IF EXISTS] name ( left_type , right_type ) [CASCADE|RESTRICT]
+		// PG requires the parenthesised type list; without it (or with just a bare
+		// comma-separated identifier list) the grammar produces a syntax error.
 		ifExists := false
 		if p.acceptKeyword(KwIf) {
 			if _, err := p.expectKeyword(KwExists); err != nil {
@@ -1779,13 +1973,93 @@ func (p *parser) parseDrop() (Stmt, error) {
 		return &DropCompatStmt{pos: t.Pos, ObjType: "operator", IfExists: ifExists,
 			Names: []ObjectName{name}, Behavior: behavior, ArgTypes: []string{leftType, rightType}}, nil
 	}
+	// DROP TEXT SEARCH DICTIONARY|PARSER|TEMPLATE|CONFIGURATION — M0097-0071.
+	// "text" is an identifier; "search" and sub-type keywords are also identifiers.
+	if p.acceptIdentKeyword("text") {
+		_ = p.acceptIdentKeyword("search") // consume "search" if present
+		var tsType string
+		switch {
+		case p.acceptIdentKeyword("dictionary"):
+			tsType = "text search dictionary"
+		case p.acceptIdentKeyword("parser"):
+			tsType = "text search parser"
+		case p.acceptIdentKeyword("template"):
+			tsType = "text search template"
+		case p.acceptIdentKeyword("configuration"):
+			tsType = "text search configuration"
+		default:
+			tsType = "text search"
+		}
+		ifExists, names, behavior, err := p.parseDropTail()
+		if err != nil {
+			return nil, err
+		}
+		return &DropCompatStmt{
+			pos: t.Pos, ObjType: tsType, IfExists: ifExists, Names: names, Behavior: behavior,
+		}, nil
+	}
+	// DROP CAST (fromType AS toType) [IF EXISTS] [CASCADE|RESTRICT] — M0097-0071.
+	// "cast" is an ident keyword; the argument list uses (type AS type) syntax.
+	if p.acceptIdentKeyword("cast") {
+		ifExists := false
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			ifExists = true
+		}
+		// Expect "(" opening the type pair.
+		if !p.acceptSymbol("(") {
+			return nil, p.errSyntaxAtCur()
+		}
+		// Parse fromType (may be qualified).
+		var fromType, toType string
+		if tok, err2 := p.parseIdent(); err2 == nil {
+			fromType = tok.Value
+		}
+		// Schema-qualified type: fromSchema.fromType
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+			p.advance()
+			if tok, err2 := p.parseIdent(); err2 == nil {
+				fromType = fromType + "." + tok.Value
+			}
+		}
+		// Consume AS.
+		_ = p.acceptKeyword(KwAs)
+		// Parse toType (may be qualified).
+		if tok, err2 := p.parseIdent(); err2 == nil {
+			toType = tok.Value
+		}
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+			p.advance()
+			if tok, err2 := p.parseIdent(); err2 == nil {
+				toType = toType + "." + tok.Value
+			}
+		}
+		// Consume ")".
+		_ = p.acceptSymbol(")")
+		behavior := DropDefault
+		switch {
+		case p.acceptKeyword(KwCascade):
+			behavior = DropCascade
+		case p.acceptKeyword(KwRestrict):
+		}
+		return &DropCompatStmt{
+			pos:       t.Pos,
+			ObjType:   "cast",
+			IfExists:  ifExists,
+			Behavior:  behavior,
+			CastTypes: []string{fromType, toType},
+		}, nil
+	}
 	// Handle ident-based DROP targets as compatibility stubs. M0097-0008.
 	for _, objType := range []string{
 		"sequence", "schema",
-		"collation", "cast",
+		"collation",
 		"materialized", "extension", "server",
 		"language", "access", "event", "transform",
 		"group", "role", "user",
+		"conversion", // M0097-0071
 	} {
 		if p.acceptIdentKeyword(objType) {
 			// "materialized view" is two words; VIEW is a keyword token, not ident. M0097-0038.
@@ -1793,6 +2067,11 @@ func (p *parser) parseDrop() (Stmt, error) {
 			if objType == "materialized" {
 				_ = p.acceptIdentKeyword("view") || p.acceptKeyword(KwView)
 				resolvedType = "materialized view"
+			}
+			// "access method" is two words; skip "method" after "access". M0097-0071.
+			if objType == "access" {
+				_ = p.acceptIdentKeyword("method")
+				resolvedType = "access method"
 			}
 			ifExists, names, behavior, err := p.parseDropTail()
 			if err != nil {
@@ -2479,6 +2758,25 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act := AlterTableAction{pos: p.cur().Pos, Kind: AlterTableAttachPartition}
 		return act, nil
 	}
+	// INHERIT parent_table (M0097-0048)
+	if p.acceptIdentKeyword("inherit") {
+		parentName, err := p.parseObjectName()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableInherit, InheritParent: parentName}, nil
+	}
+	// NO INHERIT parent_table (M0097-0048) — no-op in v0
+	if p.acceptIdentKeyword("no") {
+		if !p.acceptIdentKeyword("inherit") {
+			return AlterTableAction{}, p.errAtCur("expected INHERIT after NO")
+		}
+		parentName, err := p.parseObjectName()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableNoInherit, InheritParent: parentName}, nil
+	}
 	if !p.acceptKeyword(KwAdd) {
 		return AlterTableAction{}, p.errAtCur("expected ADD")
 	}
@@ -2644,7 +2942,8 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 	}
 	stmt := &AlterTypeStmt{pos: pos, Name: name.Name, Schema: name.Schema}
 	// ADD VALUE [IF NOT EXISTS] 'val' [BEFORE|AFTER 'ref']
-	if p.acceptIdentKeyword("add") {
+	// NOTE: ADD is a reserved keyword (KwAdd), not an ident keyword — use acceptKeyword.
+	if p.acceptKeyword(KwAdd) {
 		if !p.acceptIdentKeyword("value") {
 			// consume until ';' or EOF
 			for p.cur().Kind != TokenEOF {
@@ -2746,6 +3045,28 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 				}
 			}
 			p.advance()
+		}
+	}
+	// Accept array notation: int[], text[], etc. Append [] to the base type
+	// name and skip any dimension expressions like [N]. M0097-0065.
+	for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+		p.advance() // consume [
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+			// Empty []: plain array type.
+			stmt.BaseType += "[]"
+			p.advance() // consume ]
+		} else {
+			// Dimensioned [N]: skip until ].
+			for p.cur().Kind != TokenSymbol || p.cur().Value != "]" {
+				if p.cur().Kind == TokenEOF {
+					break
+				}
+				p.advance()
+			}
+			stmt.BaseType += "[]"
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
+				p.advance() // consume ]
+			}
 		}
 	}
 	// Parse constraint list.
@@ -2854,18 +3175,31 @@ func (p *parser) parseDropDomain(pos int) (Stmt, error) {
 	return &DropDomainStmt{pos: pos, Names: names, IfExists: ifExists, Cascade: cascade}, nil
 }
 
-// parseTruncate: TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT].
+// parseTruncate: TRUNCATE [TABLE] [ONLY] name [, [ONLY] …]
+// [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE|RESTRICT]. M0097-0069.
 func (p *parser) parseTruncate() (Stmt, error) {
 	t, err := p.expectKeyword(KwTruncate)
 	if err != nil {
 		return nil, err
 	}
 	_ = p.acceptKeyword(KwTable) // optional
-	names, err := p.parseObjectList()
-	if err != nil {
-		return nil, err
+	// Parse table list with optional ONLY prefix per entry.
+	var names []ObjectName
+	for {
+		_ = p.acceptIdentKeyword("only") // ONLY is optional before each name
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+		if !p.acceptSymbol(",") {
+			break
+		}
 	}
 	stmt := &TruncateStmt{pos: t.Pos, Names: names}
+	// Optional RESTART IDENTITY | CONTINUE IDENTITY clause.
+	_ = p.acceptIdentKeyword("restart") && p.acceptIdentKeyword("identity") ||
+		p.acceptIdentKeyword("continue") && p.acceptIdentKeyword("identity")
 	switch {
 	case p.acceptKeyword(KwCascade):
 		stmt.Behavior = DropCascade

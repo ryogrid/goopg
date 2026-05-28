@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -191,7 +192,8 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 		v, err := btree.DecodeTimestamp(key)
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
 		return NewTimeDatum(ts), 8, err
-	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName):
+	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName),
+		strings.ToLower(typeName) == "uuid":
 		raw, n, err := btree.DecodeVarcharLen(key)
 		return NewStringDatum(string(raw)), n, err
 	default:

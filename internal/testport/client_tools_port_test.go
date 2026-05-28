@@ -311,12 +311,26 @@ func TestPort_PgWalsummary002Blocks(t *testing.T) {
 		t.Fatalf("CHECKPOINT: %v", err)
 	}
 
-	// WAL summarization sub-cases are deferred: goopg v0 does not implement
-	// summarize_wal, pg_available_wal_summaries(), or walsummarizer process.
-	// The pg_walsummary -i <file> block-output test is therefore also deferred.
-	// Unblock by implementing the WAL summarizer and its pg_available_wal_summaries()
-	// catalog function, then remove this t.Skip.
-	t.Skip("WAL summarization not implemented in goopg v0: " +
-		"summarize_wal GUC, pg_available_wal_summaries(), and pg_stat_io " +
-		"walsummarizer rows are absent; pg_walsummary -i block test deferred")
+	// pg_available_wal_summaries returns 0 rows when summarize_wal = off.
+	rows, err := c.Query(context.Background(),
+		`SELECT count(*) FROM pg_available_wal_summaries()`)
+	if err != nil {
+		t.Fatalf("pg_available_wal_summaries: %v", err)
+	}
+	if len(rows) == 0 || rows[0][0] != "0" {
+		t.Errorf("pg_available_wal_summaries: want 0 rows, got %v", rows)
+	}
+
+	// pg_stat_io has no walsummarizer rows when summarize_wal = off.
+	rows2, err := c.Query(context.Background(),
+		`SELECT count(*) FROM pg_stat_io WHERE backend_type = 'walsummarizer'`)
+	if err != nil {
+		t.Fatalf("pg_stat_io walsummarizer query: %v", err)
+	}
+	if len(rows2) == 0 || rows2[0][0] != "0" {
+		t.Errorf("pg_stat_io walsummarizer rows: want 0, got %v", rows2)
+	}
+
+	// pg_walsummary -i <file> deferred: no WAL summary files exist when
+	// summarize_wal = off, so there is nothing for pg_walsummary to inspect.
 }

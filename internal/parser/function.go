@@ -43,7 +43,7 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 		return nil, err
 	}
 	// Accept optional SETOF modifier (set-returning functions). M0096-0007.
-	_ = p.acceptIdentKeyword("setof")
+	returnsSet := p.acceptIdentKeyword("setof")
 	retType, err := p.parseColumnType()
 	if err != nil {
 		return nil, err
@@ -54,6 +54,7 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 		Name:       name,
 		Args:       args,
 		ReturnType: retType,
+		ReturnsSet: returnsSet,
 	}
 	// The LANGUAGE / AS clauses can appear in either order (mirrors
 	// upstream). Loop until both have been seen or we hit an
@@ -83,6 +84,25 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 				return nil, err
 			}
 			stmt.Body = body
+			sawAs = true
+		// PG14 SQL-standard function body: RETURN expr (without AS $$...$$).
+		// Treated as equivalent to SELECT expr; store as "SELECT <tokens>" body. M0097-0071.
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReturn:
+			if sawAs {
+				return nil, p.errAtCur("duplicate body clause (RETURN after AS)")
+			}
+			p.advance() // consume RETURN
+			// Collect tokens until EOF, semicolon, or end of statement.
+			var bodyToks []string
+			for p.cur().Kind != TokenEOF {
+				t := p.cur()
+				if t.Kind == TokenSymbol && t.Value == ";" {
+					break
+				}
+				bodyToks = append(bodyToks, t.Value)
+				p.advance()
+			}
+			stmt.Body = "SELECT " + strings.Join(bodyToks, " ")
 			sawAs = true
 		case p.isFunctionAttribute():
 			// Consume IMMUTABLE/VOLATILE/STABLE/STRICT/SECURITY DEFINER

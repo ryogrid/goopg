@@ -82,6 +82,20 @@ func (p *parser) parseCTE() (*CommonTableExpr, error) {
 		// is good enough; preserves the position at the cursor.
 		return nil, err
 	}
+	// Optional MATERIALIZED / NOT MATERIALIZED hint. PostgreSQL supports:
+	//   WITH cte AS MATERIALIZED (SELECT ...)
+	//   WITH cte AS NOT MATERIALIZED (SELECT ...)
+	// These are identifier keywords (not reserved), parsed with acceptIdentKeyword.
+	// M0097-0047.
+	switch {
+	case p.acceptIdentKeyword("materialized"):
+		cte.Materialized = "materialized"
+	case p.acceptKeyword(KwNot):
+		if !p.acceptIdentKeyword("materialized") {
+			return nil, p.errAtCur("expected MATERIALIZED after NOT in CTE")
+		}
+		cte.Materialized = "not materialized"
+	}
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '(' after AS in CTE")
 	}

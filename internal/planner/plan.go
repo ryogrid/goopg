@@ -182,6 +182,11 @@ type InExpr struct {
 	pos             int
 	Operand         Expr
 	Negated         bool
+	// NotEqualAny marks `x != ANY(list)` semantics: true if operand is
+	// not equal to at least one element in List (OR of != comparisons).
+	// Distinct from Negated which means NOT IN (AND of != comparisons).
+	// M0097-0067.
+	NotEqualAny     bool
 	Plan            Node // populated when the source is a subquery
 	List            []Expr
 	IsNonCorrelated bool
@@ -229,6 +234,18 @@ type IsBoolExpr struct {
 
 func (e *IsBoolExpr) Pos() int { return e.pos }
 func (*IsBoolExpr) exprNode()  {}
+
+// IsDistinctFromExpr mirrors parser.IsDistinctFromExpr after both operands
+// have been planned. Negated=true for IS NOT DISTINCT FROM.
+type IsDistinctFromExpr struct {
+	pos     int
+	Left    Expr
+	Right   Expr
+	Negated bool
+}
+
+func (e *IsDistinctFromExpr) Pos() int { return e.pos }
+func (*IsDistinctFromExpr) exprNode()  {}
 
 // SubqueryExpr mirrors parser.SubqueryExpr after the inner
 // SELECT has been planned. The executor opens / drains /
@@ -372,10 +389,23 @@ type CastExpr struct {
 	Operand    Expr
 	TargetType string // normalized lowercase type name (e.g., "int2", "bool")
 	SourceType string // operand's declared type — used by executor to pick rounding mode. M0097-0003.
+	Typmod     int64  // optional precision/scale modifier (e.g., 4 for ::timetz(4)); 0 means no typmod.
 }
 
 func (e *CastExpr) Pos() int { return e.pos }
 func (*CastExpr) exprNode()  {}
+
+// RowExpr is a resolved row constructor `(a, b, c)`. At evaluation time it
+// produces a text composite representation `(v1,v2,...,vN)`. Used for
+// whole-row variable refs and row-constructor IN comparisons. M0097-0020.
+type RowExpr struct {
+	pos   int
+	Elems []Expr
+	Types []catalog.Type
+}
+
+func (e *RowExpr) Pos() int { return e.pos }
+func (*RowExpr) exprNode()  {}
 
 // UnaryOp — Op Operand.
 //
@@ -549,6 +579,16 @@ type Join struct {
 		LeftKey   Expr // populated when Algo == JoinAlgoHash
 		RightKey  Expr
 		BuildLeft bool // hash join: build on left input instead of right
+		// UsingLeftCols / UsingRightCols hold the ABSOLUTE column
+		// indices (relative to the merged schema) of the USING
+		// columns from the left and right sides respectively.
+		// Set only for FULL JOIN USING / FULL JOIN NATURAL. The
+		// executor uses them to coalesce unmatched right-row output:
+		// when the left side is NULL (right-only row), each
+		// UsingLeftCols[i] is set to the value at UsingRightCols[i].
+		// M0097-0060.
+		UsingLeftCols  []int
+		UsingRightCols []int
 		// Lateral marks the right child as referencing the left
 		// child's columns through a FROM-clause LATERAL SRF (M0103-0008).
 		// The executor must drive the right per-outer-row, binding the
@@ -571,6 +611,9 @@ type AggregateCall struct {
 	Type     catalog.Type
 	// Filter is the resolved FILTER (WHERE ...) predicate. M0097-0007.
 	Filter Expr
+	// OrderBy is the ORDER BY clause inside the aggregate call, e.g.
+	// array_agg(x ORDER BY y). Only used for ordering-sensitive aggregates.
+	OrderBy []SortKey
 }
 
 func (a AggregateCall) Pos() int { return a.pos }
@@ -711,8 +754,9 @@ func (n *CTEScan) Output() Schema { return n.schema }
 
 // Sort — orders the child's rows by the given keys.
 type SortKey struct {
-	Expr Expr
-	Desc bool
+	Expr       Expr
+	Desc       bool
+	NullsFirst bool // true = NULLs sort before non-NULLs; false = after (PostgreSQL default: ASC→last, DESC→first)
 }
 
 type Sort struct {
@@ -750,10 +794,16 @@ func (n *MultiHashJoin) Output() Schema { return n.schema }
 
 // Limit — caps the number of rows; both fields are optional.
 type Limit struct {
-	pos    int
-	Child  Node
-	Limit  Expr // nil when no limit
-	Offset Expr // nil when no offset
+	pos      int
+	Child    Node
+	Limit    Expr // nil when no limit
+	Offset   Expr // nil when no offset
+	// WithTies is true when FETCH FIRST n ROWS WITH TIES was used. M0097-0042.
+	WithTies bool
+	// TiesKeys holds the ORDER BY expressions for WITH TIES comparison.
+	// When WithTies=true, after emitting LimitCount rows the executor continues
+	// emitting rows until the ORDER BY key changes from the last emitted row.
+	TiesKeys []Expr
 }
 
 func (n *Limit) Pos() int       { return n.pos }
@@ -827,12 +877,38 @@ type PgGetPublicationTables struct {
 //
 // The output schema is the SRF's expanded composite (relid, attrs, qual
 // for pg_get_publication_tables). M0103-0008 final sub-step.
+// SrfCol describes one generate_series call in the SELECT target list
+// for the SELECT-list SRF expansion mode of ProjectSet. M0097-0045.
+type SrfCol struct {
+	ColIdx int  // which output column this SRF fills
+	Start  Expr // generate_series start arg
+	Stop   Expr // generate_series stop arg
+	Step   Expr // generate_series step arg (nil → step 1)
+}
+
+// UserSrfCol describes one user-defined SETOF SQL function call in the SELECT
+// target list. The executor calls the function body and collects all rows.
+// M0097-0020.
+type UserSrfCol struct {
+	ColIdx  int    // which output column this SRF fills
+	FuncPos int    // source position for error reporting
+	Args    []Expr // resolved argument expressions
+	Routine *catalog.Routine
+}
+
 type ProjectSet struct {
 	pos     int
 	Child   Node
 	SrfName string
 	SrfArgs []Expr
 	schema  Schema
+	// SELECT-list SRF mode (generate_series in target list). M0097-0045.
+	// When non-empty, the operator expands the SRFs and zips them
+	// together, repeating OtherExprs for each step. The output schema
+	// covers both SRF and non-SRF columns.
+	SrfCols     []SrfCol     // one per generate_series call in target list
+	UserSrfCols []UserSrfCol // one per user-defined SETOF function call. M0097-0020.
+	OtherExprs  []Expr       // non-SRF target expressions; nil slot = SRF slot
 }
 
 func (n *ProjectSet) Pos() int       { return n.pos }
@@ -843,6 +919,18 @@ func (n *PgGetPublicationTables) Output() Schema { return n.schema }
 
 func (n *PgInputErrorInfo) Pos() int       { return n.pos }
 func (n *PgInputErrorInfo) Output() Schema { return n.schema }
+
+// PgAvailableWalSummaries implements pg_available_wal_summaries() as a
+// FROM-clause SRF. Returns (tli int8, start_lsn pg_lsn, end_lsn pg_lsn)
+// for each available WAL summary file. goopg v0 has no WAL summarizer
+// (summarize_wal is always off), so this always returns 0 rows. M0095-0002.
+type PgAvailableWalSummaries struct {
+	pos    int
+	schema Schema
+}
+
+func (n *PgAvailableWalSummaries) Pos() int       { return n.pos }
+func (n *PgAvailableWalSummaries) Output() Schema { return n.schema }
 
 // ScalarFuncScan returns a single row from a scalar function call used in
 // the FROM clause (e.g. `FROM parse_ident(...) AS a`). The function result
@@ -874,7 +962,7 @@ type Insert struct {
 }
 
 func (n *Insert) Pos() int       { return n.pos }
-func (n *Insert) Output() Schema { return nil }
+func (n *Insert) Output() Schema { return n.ReturningSchema }
 
 // LockStrength enumerates the row-locking strength a SELECT
 // requested via FOR UPDATE / FOR SHARE. Mirrors upstream's
@@ -1009,6 +1097,12 @@ type OnConflictPlan struct {
 // Set is parallel to the table's columns: nil entries leave the
 // existing value alone; non-nil entries are evaluated against the
 // child's rows.
+//
+// When FromTables is non-empty (UPDATE … FROM …, M0097-0065) the
+// executor performs a nested-loop cross-product between the target
+// table scan and the FROM tables, applying the predicate to the
+// combined row. The FromSchema field holds the concatenated schema
+// of all FROM tables so the executor can allocate the right row size.
 type Update struct {
 	pos             int
 	Table           *catalog.Table
@@ -1016,6 +1110,16 @@ type Update struct {
 	Set             []Expr // len == len(Table.Columns)
 	Returning       []Expr // per-target RETURNING expressions (nil = no RETURNING)
 	ReturningSchema Schema // output schema when Returning is non-nil
+	// UPDATE … FROM (M0097-0065): additional source tables.
+	// When non-empty the executor iterates all FROM tables as a nested
+	// loop cross-product against the target scan and applies FromPred
+	// (which may reference both target and FROM columns) to select
+	// matching rows. Set expressions are also evaluated against the
+	// combined (target ++ from...) row.
+	FromTables    []*catalog.Table
+	FromScans     []*SeqScan // one per FROM table
+	FromSchema    Schema     // combined schema of all FROM tables
+	FromPred      Expr       // WHERE predicate over combined row (nil = no filter)
 }
 
 func (n *Update) Pos() int       { return n.pos }
@@ -1244,6 +1348,21 @@ type Distinct struct {
 
 func (n *Distinct) Pos() int       { return n.pos }
 func (n *Distinct) Output() Schema { return n.schema }
+
+// DistinctOn implements SELECT DISTINCT ON (expr,...) semantics: the child
+// must already be sorted by the DISTINCT ON key columns (as a prefix);
+// this node emits only the first row per distinct combination of key values.
+// KeyCols holds the output column indices that form the DISTINCT ON key.
+// M0097-0005.
+type DistinctOn struct {
+	pos     int
+	Child   Node
+	KeyCols []int // indices into the output schema for DISTINCT ON keys
+	schema  Schema
+}
+
+func (n *DistinctOn) Pos() int       { return n.pos }
+func (n *DistinctOn) Output() Schema { return n.schema }
 
 // RecursiveUnion implements a WITH RECURSIVE fixpoint (M0016-0004).
 // Anchor is the non-recursive initial SELECT; Recursive is the

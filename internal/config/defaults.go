@@ -250,8 +250,31 @@ func BuildDefaultRegistry() *Registry {
 	// docs/design/0092-0005-lookup-goroutine-io-hooks-guc.md.
 	r.MustRegister(NewVariable(Variable{
 		Name: "track_io_timing", Type: TypeBool, BootVal: "off",
-		Context: ContextPostmaster,
+		Context: ContextUserset,
 		Scope:   ScopeServer,
+	}))
+
+	// Compatibility stubs for GUCs checked by pg_regress tests. M0097-0073.
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit", Type: TypeBool, BootVal: "off",
+		Context: ContextUserset,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name:        "compute_query_id",
+		Type:        TypeEnum,
+		BootVal:     "off",
+		EnumOptions: []string{"off", "on", "auto", "regress"},
+		Context:     ContextUserset,
+		Scope:       ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name:        "plan_cache_mode",
+		Type:        TypeEnum,
+		BootVal:     "auto",
+		EnumOptions: []string{"auto", "force_generic_plan", "force_custom_plan"},
+		Context:     ContextUserset,
+		Scope:       ScopeServer,
 	}))
 
 	// wal_sender_memory_buffer sizes (in bytes) the in-memory
@@ -411,6 +434,12 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 	r.MustRegister(NewVariable(Variable{
+		Name: "max_parallel_maintenance_workers", Type: TypeInt, BootVal: "2",
+		MinVal: 0, MaxVal: 1024,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
 		Name: "min_parallel_table_scan_size", Type: TypeInt, Unit: UnitKB, BootVal: "8388608",
 		MinVal: 0, MaxVal: 715827882,
 		Context: ContextUserset,
@@ -449,6 +478,27 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "effective_cache_size", Type: TypeInt, Unit: UnitKB, BootVal: "4GB",
 		MinVal: 1, MaxVal: 1 << 40,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// Planner cost GUCs — goopg ignores them but SET succeeds so test
+	// scripts that adjust them don't fail with "unrecognized parameter".
+	// Values mirror postgres/src/backend/utils/misc/guc_tables.c.
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit_above_cost", Type: TypeReal, BootVal: "100000",
+		MinVal: -1, MaxVal: 1e15,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "parallel_setup_cost", Type: TypeReal, BootVal: "1000",
+		MinVal: 0, MaxVal: 1e15,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "parallel_tuple_cost", Type: TypeReal, BootVal: "0.1",
+		MinVal: 0, MaxVal: 1e15,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
@@ -497,7 +547,7 @@ func BuildDefaultRegistry() *Registry {
 	// Planner toggle GUCs. Upstream uses them for testing (`SET
 	// enable_seqscan = off` to force an index plan). v0's planner
 	// ignores them — the rule-based decisions still apply — but
-	// the SET succeeds so test scripts don't trip.
+	// the SET succeeds so test scripts don't trip. M0097-0069.
 	for _, name := range []string{
 		"enable_seqscan", "enable_indexscan", "enable_indexonlyscan",
 		"enable_bitmapscan", "enable_hashjoin", "enable_mergejoin",
@@ -507,6 +557,15 @@ func BuildDefaultRegistry() *Registry {
 		// `off` keeps the legacy Hash plan for joins that the
 		// rule would otherwise rewrite.
 		"enable_nestloop_index",
+		// Additional planner method toggles present in catalog pg_settings
+		// but missing from the registry — needed so SET succeeds. M0097-0069.
+		"enable_partitionwise_join", "enable_partitionwise_aggregate",
+		"enable_parallel_hash", "enable_parallel_append",
+		"enable_gathermerge", "enable_incremental_sort",
+		"enable_async_append", "enable_memoize",
+		"enable_presorted_aggregate", "enable_distinct_reordering",
+		"enable_group_by_reordering", "enable_self_join_elimination",
+		"enable_tidscan",
 	} {
 		r.MustRegister(NewVariable(Variable{
 			Name: name, Type: TypeBool, BootVal: "on",
@@ -514,6 +573,28 @@ func BuildDefaultRegistry() *Registry {
 			Scope:   ScopeSession | ScopeTransaction,
 		}))
 	}
+
+	// Additional planner cost/limit GUCs. v0 ignores them but registers
+	// them so SET succeeds. M0097-0069.
+	r.MustRegister(NewVariable(Variable{
+		Name: "parallel_leader_participation", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "from_collapse_limit", Type: TypeInt, BootVal: "8",
+		MinVal: 1, MaxVal: 2147483647,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "join_collapse_limit", Type: TypeInt, BootVal: "8",
+		MinVal: 1, MaxVal: 2147483647,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "hash_mem_multiplier", Type: TypeReal, BootVal: "2.0",
+		MinVal: 1, MaxVal: 1000,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
 
 	// Time-bounded session GUCs commonly issued by JDBC / pgbouncer.
 	r.MustRegister(NewVariable(Variable{

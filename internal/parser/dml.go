@@ -34,7 +34,12 @@ func (p *parser) parseInsert() (Stmt, error) {
 	}
 	// INSERT … SELECT | INSERT … VALUES | INSERT … DEFAULT VALUES
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
+		// SELECT … INTO is not permitted inside INSERT's SELECT (M0097-0020).
+		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+		p.selectIntoNoPos = false
 		sel, err := p.parseSelect()
+		p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 		if err != nil {
 			return nil, err
 		}
@@ -314,12 +319,16 @@ func (p *parser) parseValuesRow() ([]Expr, error) {
 	return row, nil
 }
 
-// parseUpdate: UPDATE target SET col = expr [, …] [WHERE expr]
-// [RETURNING target_list].
+// parseUpdate: UPDATE target SET col = expr [, …]
+// [FROM from_list] [WHERE expr] [RETURNING target_list].
 //
 // pgbench emits:
 //
 //	UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2
+//
+// PostgreSQL non-standard FROM clause (M0097-0065):
+//
+//	UPDATE t SET i = f(b.col) FROM other_tbl b WHERE ...
 func (p *parser) parseUpdate() (Stmt, error) {
 	t, err := p.expectKeyword(KwUpdate)
 	if err != nil {
@@ -337,12 +346,38 @@ func (p *parser) parseUpdate() (Stmt, error) {
 		return nil, err
 	}
 	stmt := &UpdateStmt{pos: t.Pos, Target: target, Set: assigns}
-	if p.acceptKeyword(KwWhere) {
-		w, err := p.parseExpr()
+	// Optional FROM clause (PostgreSQL extension). M0097-0065.
+	if p.acceptKeyword(KwFrom) {
+		var from []RangeVar
+		rv, err := p.parseRangeVar()
 		if err != nil {
 			return nil, err
 		}
-		stmt.Where = w
+		from = append(from, rv)
+		for p.acceptSymbol(",") {
+			rv, err := p.parseRangeVar()
+			if err != nil {
+				return nil, err
+			}
+			from = append(from, rv)
+		}
+		stmt.From = from
+	}
+	if p.acceptKeyword(KwWhere) {
+		// WHERE CURRENT OF cursor — positioned update. M0097-0069.
+		if p.acceptIdentKeyword("current") && p.acceptKeyword(KwOf) {
+			nameToken := p.cur()
+			if nameToken.Kind == TokenIdent || nameToken.Kind == TokenKeyword {
+				stmt.CurrentOf = nameToken.Value
+				p.advance()
+			}
+		} else {
+			w, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Where = w
+		}
 	}
 	if p.acceptKeyword(KwReturning) {
 		ret, err := p.parseTargetList()
@@ -413,11 +448,20 @@ func (p *parser) parseDelete() (Stmt, error) {
 	}
 	stmt := &DeleteStmt{pos: t.Pos, Target: target}
 	if p.acceptKeyword(KwWhere) {
-		w, err := p.parseExpr()
-		if err != nil {
-			return nil, err
+		// WHERE CURRENT OF cursor — positioned delete. M0097-0069.
+		if p.acceptIdentKeyword("current") && p.acceptKeyword(KwOf) {
+			nameToken := p.cur()
+			if nameToken.Kind == TokenIdent || nameToken.Kind == TokenKeyword {
+				stmt.CurrentOf = nameToken.Value
+				p.advance()
+			}
+		} else {
+			w, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Where = w
 		}
-		stmt.Where = w
 	}
 	if p.acceptKeyword(KwReturning) {
 		ret, err := p.parseTargetList()

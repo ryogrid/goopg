@@ -291,11 +291,12 @@ func TestCopyToBatchStopsOnError(t *testing.T) {
 
 	writeQuery(t, conn, "copy (select 1) to stdout; select 1/0;")
 	frames := readUntilReady(t, conn)
-	// select 1/0 emits RowDescription before the runtime division-by-zero
-	// error fires (PG sends 'T' then 'E').
+	// select 1/0 is folded at plan time (PostgreSQL's eval_const_expressions
+	// evaluates constant-arithmetic errors at plan time), so no RowDescription
+	// is emitted — the error fires before the query begins executing. M0097-0047.
 	want := []byte{
 		protocol.MsgCopyOutResponse, protocol.MsgCopyData, protocol.MsgCopyDone, protocol.MsgCommandComplete,
-		protocol.MsgRowDescription, protocol.MsgErrorResponse, protocol.MsgReadyForQuery,
+		protocol.MsgErrorResponse, protocol.MsgReadyForQuery,
 	}
 	if len(frames) != len(want) {
 		t.Fatalf("frames=%d want=%d (%v)", len(frames), len(want), frameTypes(frames))
@@ -305,7 +306,7 @@ func TestCopyToBatchStopsOnError(t *testing.T) {
 			t.Fatalf("frame[%d]=%q want %q (%v)", i, frames[i].Type, w, frameTypes(frames))
 		}
 	}
-	got := parseErrorFields(t, frames[5].Payload)
+	got := parseErrorFields(t, frames[4].Payload) // frame 4 = ErrorResponse (no RowDescription)
 	if !strings.Contains(got[protocol.FieldMessage], "division by zero") {
 		t.Errorf("message=%q want division-by-zero error", got[protocol.FieldMessage])
 	}

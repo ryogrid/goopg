@@ -330,6 +330,8 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, a := range n.Args {
 			walkExprTree(a, visit)
 		}
+	case *PgAvailableWalSummaries:
+		// no sub-expressions to walk
 	case *MultiHashJoin:
 		for _, tbl := range n.Tables {
 			walkPlanExprs(tbl, visit)
@@ -369,6 +371,10 @@ func walkExprTree(e Expr, visit func(Expr)) {
 		walkExprTree(x.Else, visit)
 	case *ExtractExpr:
 		walkExprTree(x.Source, visit)
+	case *RowExpr:
+		for _, elem := range x.Elems {
+			walkExprTree(elem, visit)
+		}
 	}
 }
 
@@ -487,7 +493,7 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 		s.Child = child
 		s.Keys = make([]SortKey, len(n.Keys))
 		for i, k := range n.Keys {
-			s.Keys[i] = SortKey{Expr: cloneExprReplacingOuter(k.Expr, replace), Desc: k.Desc}
+			s.Keys[i] = SortKey{Expr: cloneExprReplacingOuter(k.Expr, replace), Desc: k.Desc, NullsFirst: k.NullsFirst}
 		}
 		return &s, nil
 	case *Limit:
@@ -610,7 +616,7 @@ func cloneExprReplacingOuter(e Expr, replace map[*OuterColumnRef]*ColumnRef) Exp
 		}
 		return &cl
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: cloneExprReplacingOuter(x.Operand, replace), TargetType: x.TargetType, SourceType: x.SourceType}
+		return &CastExpr{pos: x.Pos(), Operand: cloneExprReplacingOuter(x.Operand, replace), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
 	case *ExtractExpr:
 		cl := *x
 		cl.Source = cloneExprReplacingOuter(x.Source, replace)
@@ -676,7 +682,7 @@ func cloneExprSubstituteAggIdx0(e Expr, aggColRef *ColumnRef) Expr {
 		}
 		return &cl
 	case *CastExpr:
-		return &CastExpr{pos: x.Pos(), Operand: cloneExprSubstituteAggIdx0(x.Operand, aggColRef), TargetType: x.TargetType, SourceType: x.SourceType}
+		return &CastExpr{pos: x.Pos(), Operand: cloneExprSubstituteAggIdx0(x.Operand, aggColRef), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
 	case *ExtractExpr:
 		cl := *x
 		cl.Source = cloneExprSubstituteAggIdx0(x.Source, aggColRef)

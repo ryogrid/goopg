@@ -28,6 +28,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newPgInputErrorInfoOp(p)), nil
 	case *planner.PgGetPublicationTables:
 		return maybeInstrument(p, newPgGetPublicationTablesOp(p)), nil
+	case *planner.PgAvailableWalSummaries:
+		return maybeInstrument(p, newPgAvailableWalSummariesOp(p)), nil
 	case *planner.ProjectSet:
 		child, err := Build(p.Child)
 		if err != nil {
@@ -155,6 +157,12 @@ func Build(plan planner.Node) (Operator, error) {
 			return nil, err
 		}
 		return maybeInstrument(p, newDistinctOp(p, child)), nil
+	case *planner.DistinctOn:
+		child, err := Build(p.Child)
+		if err != nil {
+			return nil, err
+		}
+		return maybeInstrument(p, newDistinctOnOp(p, child)), nil
 	case *planner.SetOp:
 		left, err := Build(p.Left)
 		if err != nil {
@@ -360,8 +368,21 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		// limitState holds only the compiled indices — no *planner.Limit reference.
 		limitExprIdx := tree.exprs.buildExpr(p.Limit)
 		offsetExprIdx := tree.exprs.buildExpr(p.Offset)
+		var tieKeyExprIdxs []int32
+		if p.WithTies {
+			tieKeyExprIdxs = make([]int32, len(p.TiesKeys))
+			for i, ke := range p.TiesKeys {
+				tieKeyExprIdxs[i] = tree.exprs.buildExpr(ke)
+			}
+		}
 		return tree.add(OpNode{Kind: OpLimit, childA: childIdx, childB: noChild,
-			state: &limitState{limitExprIdx: limitExprIdx, offsetExprIdx: offsetExprIdx, limitCount: -1}}), nil
+			state: &limitState{
+				limitExprIdx:   limitExprIdx,
+				offsetExprIdx:  offsetExprIdx,
+				tieKeyExprIdxs: tieKeyExprIdxs,
+				limitCount:     -1,
+				withTies:       p.WithTies,
+			}}), nil
 
 	case *planner.Sort:
 		childIdx, err := tree.buildRec(p.Child)

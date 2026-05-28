@@ -59,9 +59,15 @@ import (
 // Operators like projectOp must evaluate targets even when Cells is empty
 // (the target expressions may be constants that don't reference input).
 type Slot struct {
-	schema planner.Schema
-	Cells  []Datum
-	HasRow bool // false == DML nil-row; true == real row (may have 0 cols)
+	schema  planner.Schema
+	Cells   []Datum
+	HasRow  bool // false == DML nil-row; true == real row (may have 0 cols)
+	// M0097-0062: ctid system column forwarded from MaterializedSlot.
+	// Set by fillFromTupleSlot when the incoming TupleSlot is a
+	// *MaterializedSlot that carries ctid info (seqScanOp path).
+	hasCTID   bool
+	ctidBlock uint32
+	ctidOff   uint16
 }
 
 // Reset truncates Cells to zero length, re-using the backing array.
@@ -80,6 +86,10 @@ func (s *Slot) CopyTo(dst *Slot) {
 	}
 	dst.Cells = dst.Cells[:len(s.Cells)]
 	copy(dst.Cells, s.Cells)
+	// M0097-0062: propagate ctid so tidscan / tidrangescan predicates work.
+	dst.hasCTID = s.hasCTID
+	dst.ctidBlock = s.ctidBlock
+	dst.ctidOff = s.ctidOff
 }
 
 // ----- TupleSlot / SlotView interface implementations ------------------
@@ -120,6 +130,7 @@ func (s *Slot) fillFromTupleSlot(ts TupleSlot) {
 		s.Cells = s.Cells[:0]
 		s.schema = nil
 		s.HasRow = false
+		s.hasCTID = false
 		return
 	}
 	row := ts.Row()
@@ -130,6 +141,15 @@ func (s *Slot) fillFromTupleSlot(ts TupleSlot) {
 	copy(s.Cells, row)
 	s.schema = ts.Schema()
 	s.HasRow = true
+	// M0097-0062: propagate ctid from MaterializedSlot so CTIDExpr
+	// evaluates correctly through the opnode pipeline.
+	if ms, ok := ts.(*MaterializedSlot); ok && ms.hasCTID {
+		s.hasCTID = true
+		s.ctidBlock = ms.ctidBlock
+		s.ctidOff = ms.ctidOff
+	} else {
+		s.hasCTID = false
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -241,13 +261,20 @@ type projectState struct {
 }
 
 // limitState is the per-node state for OpLimit.
+// WITH TIES support added M0097-0042: when withTies is true, continue emitting
+// rows after limitCount is reached as long as their ORDER BY key values equal
+// tieKeyVals (saved from the last emitted row).
 type limitState struct {
-	limitExprIdx  int32 // exprTreeSlab index for LIMIT expr (noExpr = unlimited)
-	offsetExprIdx int32 // exprTreeSlab index for OFFSET expr (noExpr = no offset)
-	limitCount    int64 // -1 means unlimited (resolved at Open time)
-	offsetCount   int64
-	emitted       int64
-	skipped       int64
+	limitExprIdx   int32   // exprTreeSlab index for LIMIT expr (noExpr = unlimited)
+	offsetExprIdx  int32   // exprTreeSlab index for OFFSET expr (noExpr = no offset)
+	tieKeyExprIdxs []int32 // exprTreeSlab indices for ORDER BY key exprs (WITH TIES)
+	tieKeyVals     Row     // key values of last emitted row (set at limit boundary)
+	limitCount     int64   // -1 means unlimited (resolved at Open time)
+	offsetCount    int64
+	emitted        int64
+	skipped        int64
+	withTies       bool
+	inTiesPhase    bool
 }
 
 // opAdapterState wraps a legacy Operator for non-migrated operators.
@@ -446,6 +473,8 @@ func opOpen(tree *opTreeSlab, idx int32, ctx *Context) error {
 		s.skipped = 0
 		s.limitCount = -1
 		s.offsetCount = 0
+		s.inTiesPhase = false
+		s.tieKeyVals = nil
 		if err := opOpen(tree, n.childA, ctx); err != nil {
 			return err
 		}
@@ -454,20 +483,31 @@ func opOpen(tree *opTreeSlab, idx int32, ctx *Context) error {
 			if err != nil {
 				return err
 			}
-			if v.Kind != KindInt {
-				return &ExecError{Code: "42804", Message: "LIMIT must be integer"}
+			if v.IsNull() {
+				// NULL LIMIT means no limit (return all rows) — unless WITH TIES. M0097-0042.
+				if s.withTies {
+					return &ExecError{Code: "22004",
+						Message: "row count cannot be null in FETCH FIRST ... WITH TIES clause"}
+				}
+			} else {
+				if v.Kind != KindInt {
+					return &ExecError{Code: "42804", Message: "LIMIT must be integer"}
+				}
+				s.limitCount = v.Int
 			}
-			s.limitCount = v.Int
 		}
 		if s.offsetExprIdx != noExpr {
 			v, err := evalFastExpr(tree.exprs, s.offsetExprIdx, nil, ctx)
 			if err != nil {
 				return err
 			}
-			if v.Kind != KindInt {
-				return &ExecError{Code: "42804", Message: "OFFSET must be integer"}
+			// NULL OFFSET means no offset (start from beginning). M0097-0042.
+			if !v.IsNull() {
+				if v.Kind != KindInt {
+					return &ExecError{Code: "42804", Message: "OFFSET must be integer"}
+				}
+				s.offsetCount = v.Int
 			}
-			s.offsetCount = v.Int
 		}
 		return nil
 
@@ -689,6 +729,7 @@ func projectOpNext(tree *opTreeSlab, n *OpNode, dst *Slot) error {
 
 // limitOpNext enforces LIMIT / OFFSET by skipping and counting rows
 // from childA. Mirrors limitOp.Next() but uses opNext for the child.
+// WITH TIES support added M0097-0042.
 func limitOpNext(tree *opTreeSlab, n *OpNode, dst *Slot) error {
 	s := n.state.(*limitState)
 	for s.skipped < s.offsetCount {
@@ -698,12 +739,38 @@ func limitOpNext(tree *opTreeSlab, n *OpNode, dst *Slot) error {
 		s.skipped++
 	}
 	if s.limitCount >= 0 && s.emitted >= s.limitCount {
-		return EOF
+		if !s.withTies {
+			return EOF
+		}
+		// WITH TIES: continue while ORDER BY key values equal those of
+		// the last emitted row (saved in tieKeyVals). M0097-0042.
+		if err := opNext(tree, n.childA, dst); err != nil {
+			return err
+		}
+		// Evaluate ORDER BY key exprs on the new row and compare to tieKeyVals.
+		for i, idx := range s.tieKeyExprIdxs {
+			v, err := evalFastExpr(tree.exprs, idx, dst, nil)
+			if err != nil || !datumEquals(v, s.tieKeyVals[i]) {
+				return EOF
+			}
+		}
+		return nil
 	}
 	if err := opNext(tree, n.childA, dst); err != nil {
 		return err
 	}
 	s.emitted++
+	// Save ORDER BY key values of this row for WITH TIES comparison. M0097-0042.
+	if s.withTies && s.limitCount >= 0 && s.emitted == s.limitCount {
+		s.tieKeyVals = make(Row, len(s.tieKeyExprIdxs))
+		for i, idx := range s.tieKeyExprIdxs {
+			v, err := evalFastExpr(tree.exprs, idx, dst, nil)
+			if err != nil {
+				return err
+			}
+			s.tieKeyVals[i] = v
+		}
+	}
 	return nil
 }
 

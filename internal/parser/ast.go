@@ -525,9 +525,11 @@ func (s SetOpClause) Pos() int { return s.pos }
 
 // SortBy is one entry in an ORDER BY list.
 type SortBy struct {
-	pos  int
-	Expr Expr
-	Desc bool // true for DESC, false for ASC (the default)
+	pos        int
+	Expr       Expr
+	Desc       bool   // true for DESC, false for ASC (the default)
+	UsingOp    string // operator name from ORDER BY x USING op; "" if not used
+	NullsFirst *bool  // nil = use default (ASC→nulls last, DESC→nulls first); &true = NULLS FIRST; &false = NULLS LAST
 }
 
 func (s SortBy) Pos() int { return s.pos }
@@ -538,11 +540,12 @@ func (s SortBy) Pos() int { return s.pos }
 // DELETE inside the parenthesised body) at parse time. See
 // docs/design/0016-0001-with-parser-ast-and-name-resolution.md.
 type CommonTableExpr struct {
-	pos     int
-	Name    string
-	Columns []string // optional column-alias list; nil when absent
-	Query   *SelectStmt
-	DMLBody Stmt // INSERT/UPDATE/DELETE/MERGE CTE body (nil for SELECT CTEs)
+	pos          int
+	Name         string
+	Columns      []string // optional column-alias list; nil when absent
+	Query        *SelectStmt
+	DMLBody      Stmt   // INSERT/UPDATE/DELETE/MERGE CTE body (nil for SELECT CTEs)
+	Materialized string // "", "materialized", or "not materialized" (M0097-0047)
 }
 
 // Pos returns the position of the CTE's declaring identifier.
@@ -654,7 +657,27 @@ type SelectStmt struct {
 	OrderBy   []SortBy
 	Limit     Expr // nil when absent; integer expression in v0
 	Offset    Expr // nil when absent
-	SetOp     *SetOpClause
+	// WithTies is true when `FETCH FIRST n ROWS WITH TIES` was used.
+	// M0097-0042: returns additional rows tied on the ORDER BY key.
+	WithTies bool
+	SetOp    *SetOpClause
+	// Parenthesized is set when this SelectStmt was the result of
+	// parseParenthesisedSelectStmt() — i.e. the whole compound was
+	// explicitly wrapped in parentheses. The planner uses this flag
+	// to stop its left-associativity flattening loop from recursing
+	// into the parenthesised content (which already has its own
+	// correctly-ordered chain). M0097-0042.
+	Parenthesized bool
+	// InnerSegmentCount > 0 when a parenthesised compound query has an
+	// ORDER BY/LIMIT/OFFSET that belongs to the INNER compound (not the
+	// outer UNION/EXCEPT/INTERSECT that was appended after the closing
+	// paren). The planner applies the sort/limit to the result of the
+	// first InnerSegmentCount set-op segments, then continues building
+	// the remaining outer segments without sorting. Example:
+	//   (((A INTERSECT B ORDER BY 1))) UNION ALL C
+	// -> InnerSegmentCount=1 means ORDER BY 1 sorts the INTERSECT result,
+	//    not the final UNION ALL output. M0097-0044.
+	InnerSegmentCount int
 	// Locking holds parsed `FOR UPDATE / FOR SHARE [OF …]
 	// [NOWAIT | SKIP LOCKED]` clauses (M0021-0001). Empty for
 	// every pre-M0021 SELECT — preserves byte-for-byte
@@ -766,16 +789,20 @@ func (a UpdateAssign) Pos() int { return a.pos }
 
 // UpdateStmt — `[WITH ...] UPDATE target SET col = expr [, …]
 //
-//	[WHERE expr] [RETURNING target_list]`. FROM-clause joins in
+//	[FROM from_list] [WHERE expr] [RETURNING target_list]`.
 //
-// UPDATE are deferred. The optional `With` field (M0016-0001) is
-// nil when no WITH clause precedes the UPDATE.
+// The optional `With` field (M0016-0001) is nil when no WITH clause
+// precedes the UPDATE. The optional `From` field (M0097-0065) holds
+// the FROM-clause tables that provide additional columns for SET and
+// WHERE expressions (PostgreSQL non-standard extension).
 type UpdateStmt struct {
 	pos       int
 	With      *WithClause
 	Target    RangeVar
 	Set       []UpdateAssign
-	Where     Expr // nil when absent
+	From      []RangeVar // FROM-clause tables (nil when absent). M0097-0065.
+	Where     Expr       // nil when absent
+	CurrentOf string     // cursor name for WHERE CURRENT OF cursor. M0097-0069.
 	Returning []ResTarget
 }
 
@@ -792,7 +819,8 @@ type DeleteStmt struct {
 	pos       int
 	With      *WithClause
 	Target    RangeVar
-	Where     Expr // nil when absent
+	Where     Expr   // nil when absent
+	CurrentOf string // cursor name for WHERE CURRENT OF cursor. M0097-0069.
 	Returning []ResTarget
 }
 
@@ -804,10 +832,11 @@ func (s *DeleteStmt) stmtNode() {}
 // `numeric(10,2)` carries [10, 2]. Schema-qualified type names
 // (e.g. `pg_catalog.int4`) populate Schema.
 type ColumnType struct {
-	pos    int
-	Schema string
-	Name   string
-	Args   []int64
+	pos     int
+	Schema  string
+	Name    string
+	Args    []int64
+	IsArray bool // true if type has [] array suffix (e.g. int[], text[]); M0097-0071
 }
 
 func (c ColumnType) Pos() int { return c.pos }
@@ -889,6 +918,12 @@ type CreateTableStmt struct {
 	// M0096-0009 will use these; for now the field is populated so the
 	// syntax is accepted and the executor can create the child table.
 	Inherits []ObjectName
+	// ColumnAliases holds the optional column-name list from
+	// `CREATE TABLE name (col1, col2, …) AS SELECT …`. When non-nil its
+	// length must not exceed the number of columns the SELECT returns; alias
+	// names replace the derived column names left-to-right; remaining columns
+	// keep their SELECT-derived names. M0097-0020.
+	ColumnAliases []string
 	// SelectSource is non-nil for `CREATE TABLE name AS SELECT …` (CTAS).
 	// The table is created with columns derived from the SELECT result. M0096-0008.
 	SelectSource *SelectStmt
@@ -899,6 +934,15 @@ type CreateTableStmt struct {
 	// TableChecks holds raw SQL expressions from table-level CHECK constraints.
 	// M0097-0014.
 	TableChecks []string
+	// LikeTables holds the source table names from LIKE clauses.
+	// `CREATE TABLE t (LIKE src INCLUDING DEFAULTS)` copies src's columns. M0097-0069.
+	// Deprecated: use BodyOrder for positional interleaving.
+	LikeTables []ObjectName
+	// BodyOrder tracks the order of explicit columns and LIKE clauses in the
+	// CREATE TABLE body so the executor can interleave columns correctly.
+	// Each element is either a column name (for explicit columns) or
+	// "@@LIKE:schema.table" (for LIKE source_table clauses). M0097-0069.
+	BodyOrder []string
 }
 
 func (s *CreateTableStmt) Pos() int  { return s.pos }
@@ -1086,6 +1130,11 @@ type DropCompatStmt struct {
 	// ArgTypes holds parsed argument types for AGGREGATE and OPERATOR.
 	// AGGREGATE: [argtype]; OPERATOR: [leftType, rightType] ("" = missing/NONE).
 	ArgTypes []string
+	// UsingMethod holds the access method name for DROP OPERATOR CLASS/FAMILY.
+	// E.g. "btree", "hash", "gist". M0097-0071.
+	UsingMethod string
+	// CastTypes holds [fromType, toType] for DROP CAST (fromType AS toType). M0097-0071.
+	CastTypes []string
 }
 
 // CreateAggregateStmt is a minimal representation of CREATE AGGREGATE used to
@@ -1228,6 +1277,13 @@ const (
 	// Validates old column exists, new name not a system column, and no
 	// inheritance child already has a column with the new name. M0097-regress.
 	AlterTableRenameColumn
+	// AlterTableInherit — `INHERIT parent_table`.
+	// Registers an existing table as an inheritance child of the given parent.
+	// Mirrors `CREATE TABLE child () INHERITS (parent)` at run time. M0097-0048.
+	AlterTableInherit
+	// AlterTableNoInherit — `NO INHERIT parent_table`.
+	// Removes the inheritance relationship; no-op in goopg v0. M0097-0048.
+	AlterTableNoInherit
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1260,6 +1316,10 @@ type AlterTableAction struct {
 	// OldColumnName is populated for AlterTableRenameColumn and holds the
 	// existing column name to be renamed. M0097-regress.
 	OldColumnName string
+
+	// InheritParent is populated for AlterTableInherit and AlterTableNoInherit.
+	// Holds the parent table name. M0097-0048.
+	InheritParent ObjectName
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }
@@ -1409,6 +1469,7 @@ type CreateFunctionStmt struct {
 	Name       ObjectName
 	Args       []FunctionArg
 	ReturnType ColumnType
+	ReturnsSet bool   // RETURNS SETOF ... M0097-0020
 	Language   string // lower-cased, e.g. "plpgsql"
 	Body       string // raw source between the dollar-quote delimiters
 }

@@ -204,7 +204,7 @@ regress-sql,regress,postgres/src/test/regress/sql/tidscan.sql,postgres/src/test/
 regress-sql,regress,postgres/src/test/regress/sql/time.sql,postgres/src/test/regress/sql/time.sql,pass,Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13)
 regress-sql,regress,postgres/src/test/regress/sql/timestamp.sql,postgres/src/test/regress/sql/timestamp.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/timestamptz.sql,postgres/src/test/regress/sql/timestamptz.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
-regress-sql,regress,postgres/src/test/regress/sql/timetz.sql,postgres/src/test/regress/sql/timetz.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/timetz.sql,postgres/src/test/regress/sql/timetz.sql,pass,TestPort_RegressSuite/timetz passes — M0097-0004: AT LOCAL/AT TIME ZONE/timezone()/timetz comparison/TABLE shorthand
 regress-sql,regress,postgres/src/test/regress/sql/transactions.sql,postgres/src/test/regress/sql/transactions.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/triggers.sql,postgres/src/test/regress/sql/triggers.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/truncate.sql,postgres/src/test/regress/sql/truncate.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope

@@ -156,6 +156,10 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 			if !SeesCommittedXIDWithSubxacts(snap, h.Xmin, r) {
 				return false
 			}
+		} else if !snap.SeesCommittedXID(h.Xmin) {
+			// HeapXminCommitted cached that xmin committed, but this snapshot
+			// may have been taken before xmin committed (xmin was in-progress).
+			return false
 		}
 	}
 

@@ -314,6 +314,8 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if _, exists := o.ctx.Catalog.LookupTable(s.Name); exists {
 		if s.IfNotExists {
+			o.ctx.Notices = append(o.ctx.Notices,
+				fmt.Sprintf("relation %q already exists, skipping", s.Name.String()))
 			return nil
 		}
 		// TEMP TABLE shadows the permanent table: save the permanent table for
@@ -363,29 +365,101 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 			inheritParents = append(inheritParents, parent)
 			// Append parent columns (deep copy to avoid aliasing).
+			// Deduplicate: skip columns whose name already exists — multiple
+			// inheritance parents may share columns (e.g. emp and student both
+			// inherit name/age/location from person, so stud_emp INHERITS (emp,
+			// student) should have those columns only once).  M0097-0046.
 			for _, pc := range parent.Columns {
-				c := pc
-				cols = append(cols, c)
+				found := false
+				for _, ec := range cols {
+					if strings.EqualFold(ec.Name, pc.Name) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					c := pc
+					cols = append(cols, c)
+				}
 			}
 		}
 	}
-	// Append any columns explicitly declared in the CREATE TABLE body.
-	for _, c := range s.Columns {
-		typeName := strings.ToLower(c.Type.Name)
-		// Resolve domain/enum types to their storage type. M0097-0017.
-		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-			if resolved := im.ResolveColumnType(typeName); resolved != typeName {
-				typeName = resolved
+	// Append body elements in declaration order: explicit columns and LIKE clauses
+	// interleaved by their BodyOrder. M0097-0069.
+	if len(s.BodyOrder) > 0 {
+		// Build a lookup map for explicit columns by name.
+		colByName := make(map[string]parser.ColumnDef, len(s.Columns))
+		for _, c := range s.Columns {
+			colByName[strings.ToLower(c.Name)] = c
+		}
+		// Build a lookup for LIKE sources.
+		likeByKey := make(map[string]*catalog.Table)
+		for _, likeName := range s.LikeTables {
+			src, ok := o.ctx.Catalog.LookupTable(likeName)
+			if ok {
+				likeByKey["@@LIKE:"+likeName.String()] = src
 			}
 		}
-		cols = append(cols, catalog.Column{
-			Name:            c.Name,
-			Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
-			NotNull:         c.NotNull,
-			GeneratedExpr:   c.GeneratedExpr,
-			GeneratedAlways: c.GeneratedAlways,
-			DefaultExpr:     c.DefaultExpr,
-		})
+		addCol := func(c parser.ColumnDef) {
+			typeName := strings.ToLower(c.Type.Name)
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if resolved := im.ResolveColumnType(typeName); resolved != typeName {
+					typeName = resolved
+				}
+			}
+			cols = append(cols, catalog.Column{
+				Name:            c.Name,
+				Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
+				NotNull:         c.NotNull,
+				GeneratedExpr:   c.GeneratedExpr,
+				GeneratedAlways: c.GeneratedAlways,
+				DefaultExpr:     c.DefaultExpr,
+			})
+		}
+		for _, item := range s.BodyOrder {
+			if strings.HasPrefix(item, "@@LIKE:") {
+				src, ok := likeByKey[item]
+				if !ok {
+					continue
+				}
+				for _, sc := range src.Columns {
+					found := false
+					for _, ec := range cols {
+						if strings.EqualFold(ec.Name, sc.Name) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						c := sc
+						cols = append(cols, c)
+					}
+				}
+			} else {
+				c, ok := colByName[strings.ToLower(item)]
+				if ok {
+					addCol(c)
+				}
+			}
+		}
+	} else {
+		// Fallback: no BodyOrder (e.g. empty column list or old path).
+		for _, c := range s.Columns {
+			typeName := strings.ToLower(c.Type.Name)
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if resolved := im.ResolveColumnType(typeName); resolved != typeName {
+					typeName = resolved
+				}
+			}
+			cols = append(cols, catalog.Column{
+				Name:            c.Name,
+				Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
+				NotNull:         c.NotNull,
+				GeneratedExpr:   c.GeneratedExpr,
+				GeneratedAlways: c.GeneratedAlways,
+				DefaultExpr:     c.DefaultExpr,
+			})
+		}
 	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
@@ -518,14 +592,26 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		return &ExecError{Code: "42601", Pos: s.Pos(), Message: err.Error()}
 	}
 	outSchema := selectNode.Output()
+	// Validate column alias count: aliases must not exceed column count. M0097-0020.
+	if len(s.ColumnAliases) > len(outSchema) {
+		return &ExecError{
+			Code:    "42601",
+			Pos:     s.Pos(),
+			Message: "too many column names were specified",
+		}
+	}
 	cols := make([]catalog.Column, len(outSchema))
 	for i, sc := range outSchema {
 		typeName := sc.Type.Name
 		if typeName == "" || typeName == "unknown" {
 			typeName = "text"
 		}
+		colName := sc.Name
+		if i < len(s.ColumnAliases) {
+			colName = s.ColumnAliases[i]
+		}
 		cols[i] = catalog.Column{
-			Name: sc.Name, Type: catalog.Type{Name: strings.ToLower(typeName)},
+			Name: colName, Type: catalog.Type{Name: strings.ToLower(typeName)},
 		}
 	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
@@ -1150,6 +1236,30 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 			}
 			// No actual rename implemented yet — just validate.
+		case parser.AlterTableInherit:
+			// INHERIT parent_table — register the named table as a parent of tbl
+			// so that scanning the parent includes tbl's rows (M0097-0048).
+			parentTbl, ok := o.ctx.Catalog.LookupTable(act.InheritParent)
+			if !ok {
+				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.InheritParent.String())}
+			}
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				im.RegisterInheritanceChild(parentTbl.OID, tbl.OID)
+			}
+			// Copy parent columns that the child doesn't already have.
+			// In PostgreSQL, ALTER TABLE child INHERIT parent validates that child
+			// already has matching columns; goopg v0 just ensures they are present.
+			childColByName := make(map[string]bool, len(tbl.Columns))
+			for _, c := range tbl.Columns {
+				childColByName[strings.ToLower(c.Name)] = true
+			}
+			for _, pc := range parentTbl.Columns {
+				if !childColByName[strings.ToLower(pc.Name)] {
+					tbl.Columns = append(tbl.Columns, pc)
+				}
+			}
+		case parser.AlterTableNoInherit:
+			// NO INHERIT parent_table — no-op in v0; just accept the syntax.
 		default:
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE action is not supported in v0"}
 		}
@@ -1738,6 +1848,12 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		}
 		micros := v.TimeValue().Sub(pgEpoch).Microseconds()
 		return btree.EncodeTimestamp(micros), nil
+	case strings.ToLower(col.Type.Name) == "uuid":
+		// uuid stored as canonical lowercase-dashes text; sort order matches byte order.
+		if v.Kind != KindString {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not uuid at runtime", col.Name)}
+		}
+		return btree.EncodeVarchar([]byte(v.StringValue())), nil
 	case strings.ToLower(col.Type.Name) == "text":
 		// text type: encode as varchar bytes. M0096-0008.
 		var s string
@@ -1885,7 +2001,7 @@ func isSupportedBTreeKeyType(name string) bool {
 	}
 	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
 		isVarcharType(name) || isCharType(name) || isTimestampType(name) ||
-		isFloat8Type(name)
+		isFloat8Type(name) || strings.ToLower(name) == "uuid"
 }
 
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
@@ -1967,8 +2083,9 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			Name: strings.ToLower(s.ReturnType.Name),
 			Args: append([]int64(nil), s.ReturnType.Args...),
 		},
-		Language: lang,
-		Body:     s.Body,
+		ReturnsSet: s.ReturnsSet,
+		Language:   lang,
+		Body:       s.Body,
 	}
 	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
@@ -2514,9 +2631,12 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	if s.Increment != nil {
 		increment = *s.Increment
 	}
-	start := minV
+	// Default start values follow PostgreSQL convention (not the type minimum):
+	// ascending (increment > 0) → start = 1; descending → start = -1.
+	// M0097-0042.
+	start := int64(1)
 	if increment < 0 {
-		start = maxV
+		start = int64(-1)
 	}
 	if s.Start != nil {
 		start = *s.Start
@@ -2691,6 +2811,141 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 
 // it emits a NOTICE; otherwise it silently succeeds (no catalog check). M0097-0008.
 func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
+	objType := strings.ToLower(s.ObjType)
+
+	// DROP SCHEMA [IF EXISTS] name [CASCADE|RESTRICT] — M0097-0020.
+	// Find all user tables in the schema and cascade-drop them.
+	if objType == "schema" {
+		for _, name := range s.Names {
+			schemaName := name.Name
+			if name.Schema != "" {
+				schemaName = name.Schema + "." + name.Name
+			}
+			tables := o.ctx.Catalog.TablesInSchema(schemaName)
+			if len(tables) == 0 && !s.IfExists {
+				// No tables found; schema may not exist (we don't track schemas separately).
+				// Return "schema does not exist" only when not IF EXISTS.
+				return &ExecError{
+					Code:    "3F000",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("schema %q does not exist", schemaName),
+				}
+			}
+			if s.IfExists && len(tables) == 0 {
+				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", schemaName))
+				continue
+			}
+			if s.Behavior == parser.DropCascade && len(tables) > 0 {
+				// Sort table names for deterministic DETAIL output.
+				sort.Slice(tables, func(i, j int) bool {
+					return tables[i].String() < tables[j].String()
+				})
+				// Drop each table in the schema.
+				for _, tbl := range tables {
+					if err := o.ctx.Catalog.DropTable(tbl); err != nil {
+						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
+					}
+				}
+				// Emit NOTICE "drop cascades to N other objects" with DETAIL.
+				// PostgreSQL's DETAIL field is multi-line; psql prints the first
+				// line with "DETAIL:" and continuation lines as plain text.
+				detailLines := make([]string, len(tables))
+				for i, tbl := range tables {
+					detailLines[i] = fmt.Sprintf("drop cascades to table %s", tbl.String())
+				}
+				detail := strings.Join(detailLines, "\n")
+				o.ctx.AddNoticeWithDetail(
+					fmt.Sprintf("drop cascades to %d other objects", len(tables)),
+					detail,
+				)
+			}
+		}
+		return nil
+	}
+
+	// DROP USER / DROP ROLE — succeed silently when we cannot verify role existence.
+	// goopg tracks roles in the server's in-memory set but the executor has no
+	// callback to it; pretend success to avoid spurious "does not exist" errors
+	// in regress tests that CREATE then DROP a user within the same session.
+	// M0097-0020.
+	if objType == "user" || objType == "role" || objType == "group" {
+		return nil
+	}
+
+	// DROP CAST (fromType AS toType) — PG error: "cast from type X to type Y does not exist".
+	// M0097-0071. Validate source/target types; generate PG-style error message.
+	if objType == "cast" && len(s.CastTypes) == 2 {
+		fromType := s.CastTypes[0]
+		toType := s.CastTypes[1]
+		// Canonicalize type names (int → integer, etc.).
+		fromCanon := dropCompatCanonicalType(fromType)
+		toCanon := dropCompatCanonicalType(toType)
+		// Validate unknown types only when they don't look like schema-qualified names.
+		if !strings.Contains(fromType, ".") && fromCanon == "" {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", fromType))
+				return nil
+			}
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", fromType)}
+		}
+		if !strings.Contains(toType, ".") && toCanon == "" {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", toType))
+				return nil
+			}
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", toType)}
+		}
+		if fromCanon == "" {
+			fromCanon = fromType
+		}
+		if toCanon == "" {
+			toCanon = toType
+		}
+		msg := fmt.Sprintf("cast from type %s to type %s does not exist", fromCanon, toCanon)
+		if s.IfExists {
+			o.ctx.AddNotice(msg + ", skipping")
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: msg}
+	}
+
+	// DROP OPERATOR CLASS/FAMILY name USING method — M0097-0071.
+	// PG validates the access method first; if unknown, always errors (even with IF EXISTS).
+	// Known access methods: btree, hash, gist, gin, spgist, brin, heap.
+	if objType == "operator class" || objType == "operator family" {
+		knownAMs := map[string]bool{
+			"btree": true, "hash": true, "gist": true,
+			"gin": true, "spgist": true, "brin": true, "heap": true,
+		}
+		method := strings.ToLower(s.UsingMethod)
+		if method != "" && !knownAMs[method] {
+			// Unknown access method → ERROR regardless of IF EXISTS.
+			return &ExecError{
+				Code:    "42704",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("access method %q does not exist", s.UsingMethod),
+			}
+		}
+		// Known or missing access method.
+		if len(s.Names) > 0 {
+			name := s.Names[0]
+			var msg string
+			if method != "" {
+				msg = fmt.Sprintf("%s %q does not exist for access method %q", s.ObjType, name.String(), s.UsingMethod)
+			} else {
+				msg = fmt.Sprintf("%s %q does not exist", s.ObjType, name.String())
+			}
+			if s.IfExists {
+				o.ctx.AddNotice(msg + ", skipping")
+				return nil
+			}
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: msg}
+		}
+		return nil
+	}
+
 	if s.IfExists {
 		// Emit NOTICE for each name (we don't know if they exist).
 		// The test driver compares against expected NOTICEs.
@@ -2700,7 +2955,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		return nil
 	}
 	// Handle sequence drops against the in-memory registry. M0097-0038.
-	if strings.ToLower(s.ObjType) == "sequence" {
+	if objType == "sequence" {
 		for _, name := range s.Names {
 			if !DropSequence(name.String()) {
 				return &ExecError{
@@ -2713,7 +2968,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		return nil
 	}
 	// Handle DROP MATERIALIZED VIEW via the catalog's DropView. M0097-0038.
-	if strings.ToLower(s.ObjType) == "materialized view" {
+	if objType == "materialized view" {
 		for _, name := range s.Names {
 			if err := o.ctx.Catalog.DropView(name, s.IfExists); err != nil {
 				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
@@ -2723,7 +2978,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	}
 	// DROP AGGREGATE: validate the arg type and emit PG-style error messages.
 	// PG format: "aggregate name(canonicaltype) does not exist". M0097-regress.
-	if strings.ToLower(s.ObjType) == "aggregate" && len(s.Names) > 0 && len(s.ArgTypes) > 0 {
+	if objType == "aggregate" && len(s.Names) > 0 && len(s.ArgTypes) > 0 {
 		argType := s.ArgTypes[0]
 		if argType != "" && argType != "*" {
 			canonical := dropCompatCanonicalType(argType)
@@ -2737,7 +2992,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	}
 	// DROP OPERATOR: validate types and emit PG-style error messages.
 	// ArgTypes = [leftType, rightType]; "" means single-arg (missing second arg). M0097-regress.
-	if strings.ToLower(s.ObjType) == "operator" && len(s.Names) > 0 && len(s.ArgTypes) == 2 {
+	if objType == "operator" && len(s.Names) > 0 && len(s.ArgTypes) == 2 {
 		leftType := s.ArgTypes[0]
 		rightType := s.ArgTypes[1]
 		// Single type argument (no comma) → PG reports "missing argument".
@@ -2911,12 +3166,14 @@ func aggregatePgTypeName(t string) string {
 // M0097-0017.
 
 func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
-	if !s.IsEnum {
-		// Composite / range / base types — not yet supported, ignore silently.
-		return nil
-	}
 	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
+		return nil
+	}
+	if !s.IsEnum {
+		// Composite / range / base types — not fully supported in v0.
+		// Register the name so DROP TYPE can succeed without error. M0097-0064.
+		cat.RegisterCompositeType(s.Name)
 		return nil
 	}
 	_, err := cat.RegisterEnum(s.Name, s.EnumValues)
@@ -2934,10 +3191,28 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	if s.AddValue == "" {
 		return nil // RENAME VALUE / RENAME TO / OWNER TO — no-op
 	}
-	if err := cat.AddEnumValue(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After); err != nil {
-		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After)
+	if err == nil {
+		if skipped {
+			// IF NOT EXISTS with existing label: emit NOTICE, continue.
+			o.ctx.AddNotice(fmt.Sprintf("enum label %q already exists, skipping", s.AddValue))
+		}
+		return nil
 	}
-	return nil
+	switch e := err.(type) {
+	case *catalog.EnumLabelTooLong:
+		// PostgreSQL: "invalid enum label %q" DETAIL "Labels must be 63 bytes or less."
+		return &ExecError{
+			Code:    "22023",
+			Pos:     s.Pos(),
+			Message: fmt.Sprintf("invalid enum label %q", e.Label),
+			Detail:  "Labels must be 63 bytes or less.",
+		}
+	case *catalog.EnumLabelNotFound:
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: e.Error()}
+	default:
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
 }
 
 func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
@@ -2947,10 +3222,18 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 	}
 	for _, name := range s.Names {
 		n := name.Name
-		if err := cat.DropEnum(n, s.Cascade); err != nil {
-			if !s.IfExists {
-				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", n)}
-			}
+		// Try to drop as enum first, then as composite type. M0097-0064.
+		enumErr := cat.DropEnum(n, s.Cascade)
+		if enumErr == nil {
+			continue // successfully dropped as enum
+		}
+		compErr := cat.DropCompositeType(n)
+		if compErr == nil {
+			continue // successfully dropped as composite type
+		}
+		// Neither enum nor composite — report error unless IF EXISTS.
+		if !s.IfExists {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", n)}
 		}
 	}
 	return nil

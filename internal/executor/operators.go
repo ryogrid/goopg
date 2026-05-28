@@ -236,21 +236,39 @@ func (o *filterOp) Next() (TupleSlot, error) {
 // M0071-0012 Stage C: pass-through. limitOp returns the child's
 // slot unchanged on each emitted row — it owns no Row buffer and
 // no borrow contract is needed.
+//
+// WITH TIES support (M0097-0042): when withTies is true and emitted==limitCount,
+// continue emitting rows whose ORDER BY key values equal tieKeyVals (the keys of
+// the last emitted row). tieKeyExprs are the ORDER BY key expressions evaluated
+// against each row via evalExpr.
 type limitOp struct {
-	child       Operator
-	limitExpr   planner.Expr
-	offsetExpr  planner.Expr
-	limitCount  int64 // -1 for no limit
-	offsetCount int64
-	emitted     int64
-	skipped     int64
+	child        Operator
+	limitExpr    planner.Expr
+	offsetExpr   planner.Expr
+	limitCount   int64 // -1 for no limit
+	offsetCount  int64
+	emitted      int64
+	skipped      int64
+	withTies     bool
+	tieKeyExprs  []planner.Expr
+	tieKeyVals   Row // key values of last emitted row (set when emitted==limitCount)
+	inTiesPhase  bool
+	ctx          *Context
 }
 
 func newLimitOp(plan *planner.Limit, child Operator) *limitOp {
-	return &limitOp{child: child, limitExpr: plan.Limit, offsetExpr: plan.Offset, limitCount: -1}
+	return &limitOp{
+		child:       child,
+		limitExpr:   plan.Limit,
+		offsetExpr:  plan.Offset,
+		limitCount:  -1,
+		withTies:    plan.WithTies,
+		tieKeyExprs: plan.TiesKeys,
+	}
 }
 
 func (o *limitOp) Open(ctx *Context) error {
+	o.ctx = ctx
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
@@ -259,20 +277,32 @@ func (o *limitOp) Open(ctx *Context) error {
 		if err != nil {
 			return err
 		}
-		if v.Kind != KindInt {
-			return &ExecError{Code: "42804", Pos: o.limitExpr.Pos(), Message: "LIMIT must be integer"}
+		if v.IsNull() {
+			// NULL LIMIT means no limit (return all rows) — unless WITH TIES,
+			// which requires a concrete row count. M0097-0042.
+			if o.withTies {
+				return &ExecError{Code: "22004", Pos: o.limitExpr.Pos(),
+					Message: "row count cannot be null in FETCH FIRST ... WITH TIES clause"}
+			}
+		} else {
+			if v.Kind != KindInt {
+				return &ExecError{Code: "42804", Pos: o.limitExpr.Pos(), Message: "LIMIT must be integer"}
+			}
+			o.limitCount = v.Int
 		}
-		o.limitCount = v.Int
 	}
 	if o.offsetExpr != nil {
 		v, err := evalExpr(o.offsetExpr, nil, ctx)
 		if err != nil {
 			return err
 		}
-		if v.Kind != KindInt {
-			return &ExecError{Code: "42804", Pos: o.offsetExpr.Pos(), Message: "OFFSET must be integer"}
+		// NULL OFFSET means no offset (start from beginning). M0097-0042.
+		if !v.IsNull() {
+			if v.Kind != KindInt {
+				return &ExecError{Code: "42804", Pos: o.offsetExpr.Pos(), Message: "OFFSET must be integer"}
+			}
+			o.offsetCount = v.Int
 		}
-		o.offsetCount = v.Int
 	}
 	return nil
 }
@@ -288,14 +318,61 @@ func (o *limitOp) Next() (TupleSlot, error) {
 		o.skipped++
 	}
 	if o.limitCount >= 0 && o.emitted >= o.limitCount {
-		return nil, EOF
+		if !o.withTies {
+			return nil, EOF
+		}
+		// WITH TIES: continue while ORDER BY key values equal those of
+		// the last emitted row. M0097-0042.
+		slot, err := o.child.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !o.inTiesPhase {
+			// First time we hit the limit — we need tieKeyVals already set
+			// from the last emitted row (set below). Now check if this next
+			// row ties.
+			o.inTiesPhase = true
+		}
+		row := slotRow(slot)
+		if !o.tiesRowMatches(row) {
+			return nil, EOF
+		}
+		return slot, nil
 	}
 	slot, err := o.child.Next()
 	if err != nil {
 		return nil, err
 	}
 	o.emitted++
+	// Save the ORDER BY key values of this (possibly last-within-limit) row
+	// for WITH TIES comparison. M0097-0042.
+	if o.withTies && o.limitCount >= 0 && o.emitted == o.limitCount {
+		row := slotRow(slot)
+		o.tieKeyVals = make(Row, len(o.tieKeyExprs))
+		for i, expr := range o.tieKeyExprs {
+			v, err := evalExpr(expr, row, o.ctx)
+			if err != nil {
+				return nil, err
+			}
+			o.tieKeyVals[i] = v
+		}
+	}
 	return slot, nil
+}
+
+// tiesRowMatches returns true when the supplied row has ORDER BY key values
+// equal to tieKeyVals (the boundary values saved from the last within-limit row).
+func (o *limitOp) tiesRowMatches(row Row) bool {
+	for i, expr := range o.tieKeyExprs {
+		v, err := evalExpr(expr, row, o.ctx)
+		if err != nil {
+			return false
+		}
+		if !datumEquals(v, o.tieKeyVals[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // sortOp buffers the child's output then sorts under the supplied
@@ -425,10 +502,10 @@ func (o *sortOp) lessRows(a, b Row) bool {
 			return false
 		}
 		if av.IsNull() && !bv.IsNull() {
-			return !k.Desc
+			return k.NullsFirst // NULL sorts first when NullsFirst=true
 		}
 		if !av.IsNull() && bv.IsNull() {
-			return k.Desc
+			return !k.NullsFirst // non-NULL sorts first when NullsFirst=false
 		}
 		if av.IsNull() && bv.IsNull() {
 			continue

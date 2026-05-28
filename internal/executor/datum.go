@@ -62,6 +62,12 @@ const (
 	// path: ArenaID + Int=(offset<<32|length) encode the sign+BE-bytes
 	// representation. When clear, Int holds the int64 fast-path mantissa.
 	flagBigNumeric uint8 = 1 << 0
+
+	// flagDate marks a KindTime datum as a DATE (not a timestamp).
+	// When set, Format() renders the value using PostgreSQL's Postgres,MDY
+	// date output style ("MM-DD-YYYY"), matching the pg_regress default
+	// DateStyle. M0097-0063.
+	flagDate uint8 = 1 << 1
 )
 
 // Datum is one column value flowing through the operator tree.
@@ -340,6 +346,21 @@ func NewTimeDatum(t time.Time) Datum {
 	return Datum{Kind: KindTime, Int: t.UTC().UnixNano()}
 }
 
+// NewTimeTZDatum constructs a KindTime Datum for a timetz column.
+// The local time is stored as nanoseconds since 1970-01-01 00:00:00 UTC.
+// offsetSecs is the timezone offset east of UTC in seconds (e.g., PDT = -25200).
+// The offset is stored in Datum.Scale as minutes (int16 range ≥ ±840 covers ±14h).
+// Callers with sub-minute offsets (historical oddities) lose the remainder.
+func NewTimeTZDatum(t time.Time, offsetSecs int) Datum {
+	return Datum{Kind: KindTime, Int: t.UTC().UnixNano(), Scale: int16(offsetSecs / 60)}
+}
+
+// TimeTZOffsetSecs returns the timezone offset in seconds east of UTC for a
+// timetz Datum (stored in Scale as minutes). Returns 0 for plain time datums.
+func (d Datum) TimeTZOffsetSecs() int {
+	return int(d.Scale) * 60
+}
+
 // NewIntervalDatum constructs a KindInterval Datum from
 // month/day components. Sub-day grain is rejected at parse time.
 func NewIntervalDatum(months, days int32) Datum {
@@ -489,6 +510,10 @@ func (d Datum) Format() string {
 	case KindBytes:
 		return string(d.BytesValue())
 	case KindTime:
+		if d.Flags&flagDate != 0 {
+			// DATE type: render as Postgres MDY style "MM-DD-YYYY". M0097-0063.
+			return d.TimeValue().Format("01-02-2006")
+		}
 		return d.TimeValue().Format("2006-01-02 15:04:05.000000")
 	case KindInterval:
 		return fmt.Sprintf("%d months %d days", d.IntervalMonthsValue(), d.IntervalDaysValue())

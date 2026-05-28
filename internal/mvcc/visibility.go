@@ -49,6 +49,10 @@ func TupleVisible(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.T
 			if !snap.SeesCommittedXID(h.Xmin) {
 				return false
 			}
+		} else if !snap.SeesCommittedXID(h.Xmin) {
+			// HeapXminCommitted cached that xmin committed, but this snapshot
+			// may have taken before xmin committed (xmin was in-progress).
+			return false
 		}
 	}
 

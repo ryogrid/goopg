@@ -96,11 +96,12 @@ func (*IntervalLit) exprNode()  {}
 // in the inner set follow upstream's three-valued semantics:
 // `x IN (a, NULL)` returns NULL when x doesn't match a.
 type InExpr struct {
-	pos      int
-	Operand  Expr
-	Negated  bool         // NOT IN
-	Subquery *SelectStmt  // populated for IN (subquery)
-	List     []Expr       // populated for IN (val_list)
+	pos         int
+	Operand     Expr
+	Negated     bool        // NOT IN
+	NotEqualAny bool        // != ANY semantics (OR of != comparisons). M0097-0067.
+	Subquery    *SelectStmt // populated for IN (subquery)
+	List        []Expr      // populated for IN (val_list)
 }
 
 func (e *InExpr) Pos() int { return e.pos }
@@ -147,6 +148,22 @@ type IsBoolExpr struct {
 
 func (e *IsBoolExpr) Pos() int { return e.pos }
 func (*IsBoolExpr) exprNode()  {}
+
+// IsDistinctFromExpr is `expr IS [NOT] DISTINCT FROM expr`.
+// Result is always boolean (never NULL):
+//   - IS DISTINCT FROM     = NOT (a = b OR (a IS NULL AND b IS NULL))
+//   - IS NOT DISTINCT FROM = (a = b OR (a IS NULL AND b IS NULL))
+//
+// Negated=true for IS NOT DISTINCT FROM.
+type IsDistinctFromExpr struct {
+	pos     int
+	Left    Expr
+	Right   Expr
+	Negated bool // true for IS NOT DISTINCT FROM
+}
+
+func (e *IsDistinctFromExpr) Pos() int { return e.pos }
+func (*IsDistinctFromExpr) exprNode()  {}
 
 // SubqueryExpr is the v0 scalar-subquery expression: a
 // parenthesised SELECT used in expression position. The
@@ -270,6 +287,16 @@ type IndirectionStar struct {
 func (e *IndirectionStar) Pos() int { return e.pos }
 func (*IndirectionStar) exprNode()  {}
 
+// RowExpr represents a row constructor `(a, b, c)` (shorthand for ROW(a,b,c)).
+// Emitted by parsePrimary when a comma follows the first parenthesised expression. M0097-0020.
+type RowExpr struct {
+	pos   int
+	Elems []Expr
+}
+
+func (e *RowExpr) Pos() int { return e.pos }
+func (*RowExpr) exprNode()  {}
+
 // BinaryOp is `Left Op Right` for the arithmetic, string-concat,
 // comparison, and boolean operators v0 recognises.
 //
@@ -374,3 +401,14 @@ type ArraySubscriptExpr struct {
 
 func (e *ArraySubscriptExpr) Pos() int { return e.pos }
 func (*ArraySubscriptExpr) exprNode()  {}
+
+// ArrayConstructorExpr is ARRAY[e1, e2, ...] — an array constructor
+// that evaluates its elements and formats them as a PostgreSQL array
+// literal {v1,v2,...}. M0097-0042.
+type ArrayConstructorExpr struct {
+	pos      int
+	Elements []Expr
+}
+
+func (e *ArrayConstructorExpr) Pos() int { return e.pos }
+func (*ArrayConstructorExpr) exprNode()  {}

@@ -22,8 +22,8 @@ func TestEnumDomainSmoke(t *testing.T) {
 	
 	indigoIdx, blueIdx := -1, -1
 	for i, v := range found.Values {
-		if v == "indigo" { indigoIdx = i }
-		if v == "blue" { blueIdx = i }
+		if v.Label == "indigo" { indigoIdx = i }
+		if v.Label == "blue" { blueIdx = i }
 	}
 	if indigoIdx < 0 || blueIdx < 0 || indigoIdx >= blueIdx {
 		t.Errorf("indigo (%d) should be before blue (%d) in %v", indigoIdx, blueIdx, found.Values)

@@ -118,6 +118,19 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 		s = fmt.Sprintf("%d", d.Int)
 	case KindNumeric:
 		s = numericText(d)
+	case KindBool:
+		if d.BoolValue() {
+			s = "t"
+		} else {
+			s = "f"
+		}
+	case KindTime:
+		// KindTime → text: use goopg's standard timestamp text format.
+		// Covers DEFAULT(now()) and similar timestamp-valued expressions
+		// being stored in a text column. M0097-0029.
+		s = d.Format()
+	case KindInterval:
+		s = d.Format()
 	default:
 		return "", fmt.Errorf("kind %d cannot encode as %s", d.Kind, t.Name)
 	}
@@ -230,7 +243,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			u = uint64(d.Int)
 		case KindString:
 			var err error
-			u, err = parsePgLSN(strings.TrimSpace(d.StringValue()))
+			u, err = parsePgLSN(d.StringValue())
 			if err != nil {
 				return nil, err
 			}
@@ -296,18 +309,21 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		return buf[:], nil
 	case "timetz":
 		if d.Kind == KindString {
-			ts, err := parseTimeString(d.StringValue())
+			ts, offsetSecs, err := parseTimeTZString(d.StringValue())
 			if err != nil {
 				return nil, err
 			}
-			d = NewTimeDatum(ts)
+			d = NewTimeTZDatum(ts, offsetSecs)
 		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
 		var buf [12]byte
 		binary.LittleEndian.PutUint64(buf[:8], uint64(pgTimeMicros(d.TimeValue())))
-		binary.LittleEndian.PutUint32(buf[8:], 0)
+		// PG wire stores timezone offset as int32 seconds, positive = west of UTC.
+		// Our Scale stores minutes east of UTC; convert: pgOffset = -Scale*60.
+		pgOffset := int32(-d.TimeTZOffsetSecs())
+		binary.LittleEndian.PutUint32(buf[8:], uint32(pgOffset))
 		return buf[:], nil
 	case "name":
 		// PG NameData: fixed 64 bytes, '\0'-padded. The name type silently
@@ -498,6 +514,18 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 			return nil, fmt.Errorf("expected bytes for int2vector, got kind %d", d.Kind)
 		}
 		return d.BytesValue(), nil
+	case "uuid":
+		// Validate and normalize UUID to canonical lowercase-with-dashes format.
+		// M0097-0029.
+		if d.Kind != KindString {
+			return nil, fmt.Errorf("expected string for uuid, got kind %d", d.Kind)
+		}
+		s := d.StringValue()
+		if !isValidUUIDStr(s) {
+			return nil, &ExecError{Code: "22P02",
+				Message: fmt.Sprintf("invalid input syntax for type uuid: %q", s)}
+		}
+		return varlenaTextBytes(normalizeUUIDStr(s)), nil
 	case "pg_node_tree":
 		// KindBytes passthrough: pre-encoded varlena bytes (e.g. PGLZ-compressed
 		// varlena produced by pglzVarlenaDatum in initdb bootstrap).
@@ -916,7 +944,11 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		if micros < 0 || micros > maxTimeMicros {
 			return Datum{}, 0, fmt.Errorf("invalid timetz micros")
 		}
-		return NewTimeDatum(pgTimeFromMicros(micros)), 12, nil
+		// PG wire stores offset as int32 seconds, positive = west of UTC.
+		// Convert to our convention: positive = east of UTC.
+		pgOffset := int32(binary.LittleEndian.Uint32(data[8:12]))
+		offsetSecs := int(-pgOffset)
+		return NewTimeTZDatum(pgTimeFromMicros(micros), offsetSecs), 12, nil
 	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown":
 		// PG external varlena (VARATT_IS_1B_E = 0x01): our TOAST pointer.
 		// 0x01 is unambiguous: 0x01>>1=0 is an invalid data varlena length,
@@ -959,6 +991,21 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		}
 		// NaN / Infinity / other non-decimal text falls back to string.
 		return NewStringDatum(text), n, nil
+	case "uuid":
+		// goopg stores UUID as varlena-text (canonical lowercase-with-dashes
+		// format). Decode: read the varlena payload and return as KindString.
+		// UUID rows were previously silently dropped because this case was
+		// missing and the default returned "unsupported PostgreSQL physical
+		// type". M0097-0029.
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, err
+		}
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(payload)
+			return newStringArenaDatum(sctx, moff, mlen), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
 	case "bytea":
 		payload, n, err := decodePhysicalPGVarlena(data)
 		if err != nil {
@@ -987,7 +1034,20 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		}
 		return newNumeric(m, int(s)), n, nil
 	default:
-		return Datum{}, 0, fmt.Errorf("unsupported PostgreSQL physical type %q", t.Name)
+		// Unknown type (e.g. "point", "path", custom types).  goopg's
+		// encodeValuePG stores them as PG varlena text (the default branch
+		// calls varlenaTextBytes).  Decode symmetrically.  This mirrors the
+		// pgPhysicalTypeIsVarlena default which returns true for unknown
+		// types.  M0097-0046.
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode %q as varlena: %w", t.Name, err)
+		}
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(payload)
+			return newStringArenaDatum(sctx, moff, mlen), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
 	}
 }
 

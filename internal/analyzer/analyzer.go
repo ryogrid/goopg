@@ -23,7 +23,16 @@ func orderBySubstitution(expr parser.Expr, targets []parser.ResTarget) parser.Ex
 	if ic, ok := expr.(*parser.IntegerConst); ok {
 		idx := int(ic.Value) - 1
 		if idx >= 0 && idx < len(targets) {
-			return targets[idx].Expr
+			// Do not substitute when the target is a bare star expansion:
+			// `SELECT * FROM t … ORDER BY 1` in a set-op context has the
+			// ORDER BY owned by the whole set-op (not the left branch), and
+			// targets[0] is a StarExpr that hasn't been expanded yet.
+			// Substituting StarExpr here causes analyzeExpr to reject it;
+			// keep the integer constant so analysis treats it as a number
+			// rather than an unresolved star. M0097-0042.
+			if _, isStar := targets[idx].Expr.(*parser.StarExpr); !isStar {
+				return targets[idx].Expr
+			}
 		}
 		return expr
 	}
@@ -191,6 +200,23 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 	return analyzeSelectWithParent(s, cat, outerScope)
 }
 
+// lockingClauseName returns the SQL name of a locking strength (FOR UPDATE, etc.)
+// for use in error messages. M0097-0042.
+func lockingClauseName(s parser.LockStrength) string {
+	switch s {
+	case parser.LockStrengthForUpdate:
+		return "FOR UPDATE"
+	case parser.LockStrengthForNoKeyUpdate:
+		return "FOR NO KEY UPDATE"
+	case parser.LockStrengthForShare:
+		return "FOR SHARE"
+	case parser.LockStrengthForKeyShare:
+		return "FOR KEY SHARE"
+	default:
+		return "FOR UPDATE"
+	}
+}
+
 // analyzeSelectWithParent analyzes a SELECT with the supplied
 // scope as lexical-scope parent. Used by SubqueryExpr /
 // InExpr / ExistsExpr handlers when recursing into inner
@@ -198,17 +224,46 @@ func analyzeSelect(s *parser.SelectStmt, cat catalog.Catalog) error {
 func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *scope) error {
 	// s.Distinct is now supported via the planner's Distinct node. M0097-0005.
 	if s.SetOp != nil {
+		// FOR UPDATE/NO KEY UPDATE is not allowed on any branch of a set-op.
+		// Check the right branch (directly) and the outer left side. M0097-0042.
+		if len(s.SetOp.Right.Locking) > 0 {
+			lc := s.SetOp.Right.Locking[0]
+			return analyzeError(lc.Pos(), "0A000",
+				lockingClauseName(lc.Strength)+" is not allowed with UNION/INTERSECT/EXCEPT")
+		}
+		if len(s.Locking) > 0 {
+			lc := s.Locking[0]
+			return analyzeError(lc.Pos(), "0A000",
+				lockingClauseName(lc.Strength)+" is not allowed with UNION/INTERSECT/EXCEPT")
+		}
 		// UNION / INTERSECT / EXCEPT (with optional ALL) are all
 		// supported. Analyze the right side first (innermost first),
 		// then the left side with SetOp temporarily cleared to avoid
 		// infinite recursion. M0097-0024.
-		if err := analyzeSelectWithParent(s.SetOp.Right, cat, parent); err != nil {
+		//
+		// If the outermost set-op statement carries a WITH clause (e.g.
+		// `WITH cte AS (...) SELECT … UNION SELECT FROM cte`), the CTE
+		// names must be visible to ALL branches. Build a scope with the
+		// CTEs registered BEFORE recursing into the branches so that
+		// both the right and left sides can reference them. M0097-0047.
+		setOpParent := parent
+		if s.With != nil {
+			ctxForSetOp := &scope{parent: parent, cat: cat}
+			if err := analyzeWith(s.With, ctxForSetOp); err != nil {
+				return err
+			}
+			setOpParent = ctxForSetOp
+		}
+		if err := analyzeSelectWithParent(s.SetOp.Right, cat, setOpParent); err != nil {
 			return err
 		}
 		saved := s.SetOp
 		s.SetOp = nil
-		err := analyzeSelectWithParent(s, cat, parent)
+		savedWith := s.With
+		s.With = nil // already processed above; don't re-register in the left-branch recursion
+		err := analyzeSelectWithParent(s, cat, setOpParent)
 		s.SetOp = saved
+		s.With = savedWith
 		if err != nil {
 			return err
 		}
@@ -326,6 +381,15 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 // executor narrow the supported runtime subset later.
 func analyzeLockingClauses(s *parser.SelectStmt, ctx *scope) error {
 	first := s.Locking[0]
+	// SKIP LOCKED and WITH TIES cannot be combined. M0097-0042.
+	if s.WithTies {
+		for _, lc := range s.Locking {
+			if lc.WaitPolicy == parser.LockWaitSkipLocked {
+				return analyzeError(lc.Pos(), "0A000",
+					"SKIP LOCKED and WITH TIES options cannot be used together")
+			}
+		}
+	}
 	if len(s.From) == 0 {
 		return analyzeError(first.Pos(), "0A000",
 			"FOR UPDATE/SHARE is not allowed in this context")
@@ -540,6 +604,19 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 		return err
 	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
+	// Add FROM-clause tables to scope so WHERE / SET expressions can reference
+	// their columns (e.g. `UPDATE t SET i = b.j FROM other b WHERE ...`). M0097-0065.
+	for _, rv := range s.From {
+		fromTbl, err := lookupTable(cat, rv)
+		if err != nil {
+			return err
+		}
+		alias := rv.Alias
+		if alias == "" {
+			alias = rv.Name
+		}
+		ctx.rels = append(ctx.rels, scopeRel{table: fromTbl, alias: alias})
+	}
 	if s.With != nil {
 		if err := analyzeWith(s.With, ctx); err != nil {
 			return err
@@ -634,6 +711,8 @@ func exprHasWindowFunc(e parser.Expr) bool {
 		return exprHasWindowFunc(x.Operand)
 	case *parser.IsBoolExpr:
 		return exprHasWindowFunc(x.Operand)
+	case *parser.IsDistinctFromExpr:
+		return exprHasWindowFunc(x.Left) || exprHasWindowFunc(x.Right)
 	case *parser.InExpr:
 		if exprHasWindowFunc(x.Operand) {
 			return true
@@ -757,6 +836,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{}, err
 		}
 		return catalog.Type{Name: "bool"}, nil
+	case *parser.IsDistinctFromExpr:
+		// IS [NOT] DISTINCT FROM always returns bool (null-safe equality).
+		if _, err := analyzeExpr(x.Left, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		if _, err := analyzeExpr(x.Right, ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		return catalog.Type{Name: "bool"}, nil
 	case *parser.NullConst:
 		return catalog.Type{Name: "unknown"}, nil
 	case *parser.BooleanConst:
@@ -831,18 +919,42 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 				strings.EqualFold(leftTyp.Name, "interval") && isTimestampLike(rightTyp) {
 				return catalog.Type{Name: "timestamp"}, nil
 			}
-			// time + time / timestamp + timestamp → ambiguous operator error
-			// matching PostgreSQL's "operator is not unique" format. M0097-0004.
+			// time + time / timestamp + timestamp → operator error.
+			// timetz+timetz: "operator does not exist" (42883) — no such operator in PG.
+			// time+time / etc.: "operator is not unique" (42725) — multiple candidates.
 			// Note: only trigger when BOTH sides are concrete time/timestamp types
 			// (not "unknown", which covers untyped string literals).
 			if (x.Op == parser.OpAdd || x.Op == parser.OpSub) &&
 				isConcreteTimestampLike(leftTyp) && isConcreteTimestampLike(rightTyp) {
 				lname := pgTimeName(leftTyp.Name)
 				rname := pgTimeName(rightTyp.Name)
+				// timetz has no + or - operator at all; other time types are "not unique".
+				if strings.EqualFold(leftTyp.Name, "timetz") || strings.EqualFold(rightTyp.Name, "timetz") {
+					ae := analyzeError(x.Pos(), "42883",
+						fmt.Sprintf("operator does not exist: %s %s %s", lname, x.Op, rname))
+					ae.Hint = "No operator matches the given name and argument types. You might need to add explicit type casts."
+					return catalog.Type{}, ae
+				}
 				ae := analyzeError(x.Pos(), "42725",
 					fmt.Sprintf("operator is not unique: %s %s %s", lname, x.Op, rname))
 				ae.Hint = "Could not choose a best candidate operator. You might need to add explicit type casts."
 				return catalog.Type{}, ae
+			}
+			// pg_lsn arithmetic: pg_lsn - pg_lsn → int8;
+			// pg_lsn +/- numeric/int* → pg_lsn. M0097-pg_lsn.
+			isPgLSN := func(t catalog.Type) bool {
+				return strings.EqualFold(t.Name, "pg_lsn")
+			}
+			if isPgLSN(leftTyp) && isPgLSN(rightTyp) && x.Op == parser.OpSub {
+				return catalog.Type{Name: "int8"}, nil
+			}
+			if isPgLSN(leftTyp) && (isNumericLike(rightTyp) || isUnknownType(rightTyp)) &&
+				(x.Op == parser.OpAdd || x.Op == parser.OpSub) {
+				return catalog.Type{Name: "pg_lsn"}, nil
+			}
+			if isPgLSN(rightTyp) && (isNumericLike(leftTyp) || isUnknownType(leftTyp)) &&
+				x.Op == parser.OpAdd {
+				return catalog.Type{Name: "pg_lsn"}, nil
 			}
 			if !isNumericLike(leftTyp) || !isNumericLike(rightTyp) {
 				return catalog.Type{}, analyzeError(x.Pos(), "42804", fmt.Sprintf("operator %s requires numeric operands", x.Op))
@@ -858,11 +970,19 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 			return rightTyp, nil
 		case parser.OpConcat:
-			if !isStringLike(leftTyp) || !isStringLike(rightTyp) {
-				return catalog.Type{}, analyzeError(x.Pos(), "42804", "operator || requires string operands")
+			// Require at least one string-like (or unknown) operand.
+			// When one side is non-string but the other is string-like,
+			// PostgreSQL implicitly casts the non-string side to text
+			// (e.g. `1 || '/'`). If both sides are non-string, error.
+			// Match PG's "operator does not exist: TYPE || TYPE" format. M0097-0063.
+			leftStr := isStringLike(leftTyp) || isUnknownType(leftTyp)
+			rightStr := isStringLike(rightTyp) || isUnknownType(rightTyp)
+			if !leftStr && !rightStr {
+				return catalog.Type{}, analyzeError(x.Pos(), "42883",
+					fmt.Sprintf("operator does not exist: %s || %s",
+						pgDisplayTypeName(leftTyp.Name), pgDisplayTypeName(rightTyp.Name)))
 			}
-			// Mixed string types (text || varchar, etc.) promote to text.
-			return PromoteStringType(leftTyp, rightTyp), nil
+			return catalog.Type{Name: "text"}, nil
 		case parser.OpLike, parser.OpNotLike:
 			// Both operands must be string-like (text/varchar/char/
 			// bpchar/unknown). Pattern can be a literal or column.
@@ -932,6 +1052,26 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{}, err
 		}
 		return catalog.Type{Name: "record"}, nil
+	case *parser.RowExpr:
+		// Row constructor (a, b, c): validate each element and return text.
+		// Used in `(a,b) IN (VALUES ...)` expansion. M0097-0020.
+		for _, el := range x.Elems {
+			if _, err := analyzeExpr(el, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		return catalog.Type{Name: "text"}, nil
+	case *parser.ArrayConstructorExpr:
+		// ARRAY[e1, e2, ...] constructor — walk each element for analysis
+		// errors and return a generic text[] type. The planner's resolveExpr
+		// converts this to FuncCall{Name:"array_construct"} which the executor
+		// evaluates as a {v1,v2,...} text representation. M0097-0065.
+		for _, el := range x.Elements {
+			if _, err := analyzeExpr(el, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		return catalog.Type{Name: "text[]"}, nil
 	default:
 		return catalog.Type{}, analyzeError(e.Pos(), "0A000", fmt.Sprintf("unsupported expression %T", e))
 	}
@@ -1125,6 +1265,19 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 				return catalog.Type{Name: "tid"}, true, nil
 			}
 		}
+		// Whole-row variable: unqualified column name matches a binding alias → composite (text). M0097-0020.
+		for _, rel := range ctx.rels {
+			if rel.qualifiedOnly {
+				continue
+			}
+			name := rel.alias
+			if name == "" {
+				name = rel.table.Name
+			}
+			if strings.EqualFold(x.Column, name) {
+				return catalog.Type{Name: "text"}, true, nil
+			}
+		}
 		return catalog.Type{}, false, nil
 	}
 	return *found, true, nil
@@ -1148,7 +1301,7 @@ func scopeRelMatches(rel scopeRel, table, schema string) bool {
 
 func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
 	if rv.Subquery != nil {
-		return synthesizeSubqueryTable(cat, rv)
+		return synthesizeSubqueryTable(cat, rv, nil)
 	}
 	// Table-valued function (M0096-0006): produce a synthetic table.
 	// The planner is the source of truth for SRF return shapes; this
@@ -1327,20 +1480,46 @@ func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		}
 		innerCtx.rels = rels
 	}
-	cols := make([]catalog.Column, 0, len(body.Targets))
-	for i, tgt := range body.Targets {
-		name := tgt.Alias
-		if name == "" {
-			name = deriveAnalyzerTargetName(tgt.Expr)
+	var cols []catalog.Column
+	if len(body.Targets) == 0 && len(body.ValuesRows) > 0 {
+		// VALUES anchor (e.g. VALUES (1) UNION ALL SELECT n+1 ...): no Targets,
+		// so infer columns from the first row. Names are "column1", "column2", ...
+		// and types are "unknown" (the planner resolves exact types). M0097-0062.
+		nCols := len(body.ValuesRows[0])
+		cols = make([]catalog.Column, nCols)
+		for i := 0; i < nCols; i++ {
+			cols[i] = catalog.Column{Name: fmt.Sprintf("column%d", i+1), Type: catalog.Type{Name: "unknown"}, Ordinal: i}
 		}
-		if name == "" {
-			name = fmt.Sprintf("?column?%d", i+1)
+	} else {
+		cols = make([]catalog.Column, 0, len(body.Targets))
+		for i, tgt := range body.Targets {
+			name := tgt.Alias
+			if name == "" {
+				name = deriveAnalyzerTargetName(tgt.Expr)
+			}
+			if name == "" {
+				name = fmt.Sprintf("?column?%d", i+1)
+			}
+			typ, err := analyzeExpr(tgt.Expr, innerCtx)
+			if err != nil {
+				return err
+			}
+			cols = append(cols, catalog.Column{Name: name, Type: typ, Ordinal: i})
 		}
-		typ, err := analyzeExpr(tgt.Expr, innerCtx)
-		if err != nil {
-			return err
+	}
+	// Apply explicit column alias list (the `(col, ...)` after the CTE name),
+	// matching what registerAnalyzedCTE does for non-recursive CTEs.
+	// Without this, `WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL ...)` registers
+	// the CTE with column name "?column?1" instead of "n", causing the recursive
+	// member to fail with "column n does not exist".
+	if len(cte.Columns) > 0 {
+		if len(cte.Columns) != len(cols) {
+			return analyzeError(cte.Pos(), "42P10",
+				fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(cols)))
 		}
-		cols = append(cols, catalog.Column{Name: name, Type: typ, Ordinal: i})
+		for i, alias := range cte.Columns {
+			cols[i].Name = alias
+		}
 	}
 	colAliases := make([]string, len(cols))
 	for i, c := range cols {
@@ -1468,26 +1647,79 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 			if err != nil {
 				return nil, err
 			}
+			// M0097-0058: apply column alias renaming from
+			// FROM tbl alias (col1, col2, ...) so that the
+			// analyzer scope uses the aliased names. Without
+			// this, resolving `alias.col1` fails with "column
+			// does not exist" because the scope still has the
+			// original catalog column names.
+			tbl = applyRangeVarColumnAliases(rv, tbl)
 			rels = append(rels, scopeRel{table: tbl, alias: rv.Alias})
 		}
 		return rels, nil
 	}
 	rels := make([]scopeRel, 0, len(s.From))
 	for _, item := range s.FromExprs {
-		tbl, err := resolveTable(ctx, item.Base)
+		var tbl *catalog.Table
+		var err error
+		if item.Base.Subquery != nil {
+			// Derived-table base item: pass accumulated left-side rels as
+			// lateral outer scope so the inner SELECT can resolve correlated
+			// references to earlier FROM items AND to outer-query columns
+			// (via ctx.parent). This mirrors the JOIN lateral path below and
+			// fixes cases like:
+			//   FROM (VALUES(1)) AS x, (SELECT … OFFSET s-1) AS y
+			// where s is a column from an enclosing query. M0097-0065.
+			lateralCtx := &scope{parent: ctx, cat: ctx.cat, rels: append([]scopeRel(nil), rels...)}
+			tbl, err = synthesizeSubqueryTable(ctx.cat, item.Base, lateralCtx)
+		} else {
+			tbl, err = resolveTable(ctx, item.Base)
+		}
 		if err != nil {
 			return nil, err
 		}
+		tbl = applyRangeVarColumnAliases(item.Base, tbl)
 		rels = append(rels, scopeRel{table: tbl, alias: item.Base.Alias})
 		for _, j := range item.Joins {
-			rt, err := resolveTable(ctx, j.Right)
+			var rt *catalog.Table
+			if j.Right.Subquery != nil {
+				// LATERAL subquery in a JOIN: pass the accumulated left-side
+				// relations as the outer scope so the inner SELECT can
+				// resolve correlated references like t1.col where t1 is the
+				// left side of the JOIN. M0097-0064.
+				lateralCtx := &scope{parent: ctx, cat: ctx.cat, rels: append([]scopeRel(nil), rels...)}
+				rt, err = synthesizeSubqueryTable(ctx.cat, j.Right, lateralCtx)
+			} else {
+				rt, err = resolveTable(ctx, j.Right)
+			}
 			if err != nil {
 				return nil, err
 			}
+			rt = applyRangeVarColumnAliases(j.Right, rt)
 			rels = append(rels, scopeRel{table: rt, alias: j.Right.Alias, usingHidden: j.Using})
 		}
 	}
 	return rels, nil
+}
+
+// applyRangeVarColumnAliases returns a shallow copy of tbl with
+// column names replaced by the alias list from rv.Columns, or
+// tbl itself when rv.Columns is empty or the table came from a
+// subquery (subqueries handle their own renaming). M0097-0058.
+func applyRangeVarColumnAliases(rv parser.RangeVar, tbl *catalog.Table) *catalog.Table {
+	if len(rv.Columns) == 0 || rv.Subquery != nil {
+		return tbl
+	}
+	cp := *tbl
+	cols := make([]catalog.Column, len(tbl.Columns))
+	copy(cols, tbl.Columns)
+	for i, alias := range rv.Columns {
+		if i < len(cols) {
+			cols[i].Name = alias
+		}
+	}
+	cp.Columns = cols
+	return &cp
 }
 
 // synthesizeSubqueryTable analyzes a derived table — the
@@ -1534,7 +1766,7 @@ func expandInnerStarColumns(star *parser.StarExpr, innerCtx *scope) []catalog.Co
 	return cols
 }
 
-func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
+func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar, outerCtx *scope) (*catalog.Table, error) {
 	// VALUES subquery: FROM (VALUES (r1), ...) AS t(c1, c2).
 	// The inner SelectStmt has no Targets; build the column list from the
 	// explicit alias list (rv.Columns) or synthetic names. M0097-0003.
@@ -1552,7 +1784,11 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.
 		}
 		return &catalog.Table{Name: rv.Alias, Columns: cols}, nil
 	}
-	if err := analyzeSelectWithParent(rv.Subquery, cat, nil); err != nil {
+	// LATERAL subquery analysis: pass outerCtx as the lexical-scope parent so
+	// the inner SELECT can resolve correlated references to outer FROM-clause
+	// columns (e.g. t1.tenthous when t1 is the left side of a JOIN LATERAL).
+	// M0097-0064.
+	if err := analyzeSelectWithParent(rv.Subquery, cat, outerCtx); err != nil {
 		// LATERAL fallback: correlated reference to outer table fails analysis.
 		// When explicit column aliases are provided (rv.Columns), produce a
 		// synthetic table with those column names and unknown (text) types.
@@ -1568,7 +1804,7 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.
 		}
 		return nil, err
 	}
-	innerCtx := &scope{cat: cat}
+	innerCtx := &scope{cat: cat, parent: outerCtx}
 	if len(rv.Subquery.From) > 0 || len(rv.Subquery.FromExprs) > 0 {
 		rels, err := buildSelectScope(rv.Subquery, cat)
 		if err != nil {
@@ -1850,9 +2086,10 @@ func isComparable(left, right catalog.Type) bool {
 		return true
 	}
 	// uuid, name, oid and other text-backed types are comparable with text/varchar. M0097-0003.
+	// tid is also text-backed (string representation "(block,offset)"); ctid = '(0,1)' must work. M0097-0062.
 	isTextBacked := func(t catalog.Type) bool {
 		switch strings.ToLower(t.Name) {
-		case "uuid", "name", "oid", "oidvector", "int2vector", "pg_lsn":
+		case "uuid", "name", "oid", "oidvector", "int2vector", "pg_lsn", "tid":
 			return true
 		}
 		return false
@@ -2041,4 +2278,27 @@ func isExactNumericTextTarget(name string) bool {
 		return true
 	}
 	return false
+}
+
+// pgDisplayTypeName converts internal type names to the PG-compatible
+// display form used in error messages (e.g. "int8" → "integer"). M0097-0063.
+func pgDisplayTypeName(name string) string {
+	switch strings.ToLower(name) {
+	case "int2", "smallint":
+		return "smallint"
+	case "int4", "int", "integer":
+		return "integer"
+	case "int8", "bigint":
+		return "integer" // PG treats unqualified integer literals as "integer" in errors
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision", "double":
+		return "double precision"
+	case "bool", "boolean":
+		return "boolean"
+	case "text", "varchar", "bpchar", "char":
+		return "text"
+	default:
+		return name
+	}
 }

@@ -188,11 +188,25 @@ type Context struct {
 	// messages to the client. M0097-0008.
 	Notices []string
 
+	// NoticesWithDetail accumulates NOTICE messages that include a multi-line
+	// DETAIL field (e.g. DROP SCHEMA CASCADE cascade list). The Detail string
+	// contains newline-separated continuation lines; the protocol layer sends
+	// the first continuation as the DETAIL field and psql formats the rest as
+	// plain continuation lines in its output. M0097-0020.
+	NoticesWithDetail []NoticeWithDetail
+
 	// NoticeFlush, when non-nil, is called for each NOTICE as it is generated
 	// so the server can send it to the client in real-time (before CommandComplete).
 	// This matches PostgreSQL's behavior where NOTICE messages arrive before
 	// any blocking point. M0100-0005.
 	NoticeFlush func(string)
+
+	// Warnings accumulates WARNING-severity messages emitted during statement
+	// execution (e.g. "you don't own a lock of type ExclusiveLock" from
+	// pg_advisory_unlock* called without a matching held lock). The server
+	// emits these as NoticeResponse with WARNING severity before CommandComplete.
+	// M0097-0021.
+	Warnings []string
 
 	// Sequence session state — maps sequence key → last nextval result
 	// for currval(); LastSeqVal/LastSeqSet track the lastval() return. M0097-0009.
@@ -304,6 +318,41 @@ func (c *Context) TakeNotices() []string {
 	n := c.Notices
 	c.Notices = nil
 	return n
+}
+
+// NoticeWithDetail is a NOTICE that carries a multi-line DETAIL field.
+// Used for DROP CASCADE output where the detail lists all cascaded objects.
+type NoticeWithDetail struct {
+	Message string
+	Detail  string // newline-separated lines; each becomes one psql output line
+}
+
+// AddNoticeWithDetail appends a NOTICE with a DETAIL field to the queue.
+// The detail lines are formatted by the wire layer so psql emits the first
+// line with "DETAIL:" prefix and the rest as plain continuation lines.
+func (c *Context) AddNoticeWithDetail(msg, detail string) {
+	c.NoticesWithDetail = append(c.NoticesWithDetail, NoticeWithDetail{Message: msg, Detail: detail})
+}
+
+// TakeNoticesWithDetail returns and clears the detail-carrying notice queue.
+func (c *Context) TakeNoticesWithDetail() []NoticeWithDetail {
+	n := c.NoticesWithDetail
+	c.NoticesWithDetail = nil
+	return n
+}
+
+// AddWarning appends a WARNING-severity message to the context's warning queue.
+// M0097-0021.
+func (c *Context) AddWarning(msg string) {
+	c.Warnings = append(c.Warnings, msg)
+}
+
+// TakeWarnings returns and clears the accumulated warnings.
+// M0097-0021.
+func (c *Context) TakeWarnings() []string {
+	w := c.Warnings
+	c.Warnings = nil
+	return w
 }
 
 // acquireRelLock funnels every operator's relation-level lock

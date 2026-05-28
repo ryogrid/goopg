@@ -25,9 +25,16 @@ var tokenSlicePool = sync.Pool{
 type SyntaxError struct {
 	Pos     int
 	Message string
+	// Raw suppresses the "syntax error at or near …" wrapper: Error() returns
+	// Message verbatim. Used for semantic errors caught during parsing (e.g.
+	// "SELECT … INTO is not allowed here") that have their own wording.
+	Raw bool
 }
 
 func (e *SyntaxError) Error() string {
+	if e.Raw {
+		return e.Message
+	}
 	return fmt.Sprintf("syntax error at or near %q (byte %d)", e.Message, e.Pos)
 }
 
@@ -181,6 +188,19 @@ func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
 type parser struct {
 	tokens []Token
 	idx    int
+	// selectIntoErrMsg is non-empty when SELECT … INTO is forbidden in the
+	// current parse context (cursor, subquery, view body, INSERT SELECT).
+	// parseSelect emits a SyntaxError with this message when INTO is seen.
+	// selectIntoNoPos suppresses the FieldPosition field (for contexts where
+	// PG does not emit a caret, e.g. CREATE VIEW).
+	selectIntoErrMsg string
+	selectIntoNoPos  bool
+	// selectIntoCopyStop: when true, parseSelect stops *before* consuming
+	// INTO (returning a partial SelectStmt). parseCopy uses this to detect
+	// the deprecated `SELECT … INTO …` form and flag CopyStmt.SelectInto so
+	// planCopy can emit the PG-compatible "COPY (SELECT INTO) is not
+	// supported" error. M0097-0024.
+	selectIntoCopyStop bool
 }
 
 func (p *parser) cur() Token {
@@ -281,6 +301,13 @@ func (p *parser) acceptIdentKeyword(names ...string) bool {
 // parseStatement dispatches on the leading keyword.
 func (p *parser) parseStatement() (Stmt, error) {
 	t := p.cur()
+	// Parenthesised compound query: (SELECT ...) UNION ALL (SELECT ...)
+	// PostgreSQL allows any set-operation branch to be wrapped in parentheses.
+	// Handle this at the statement level by consuming the '(' then delegating
+	// to parseParenthesisedSelectStmt.
+	if t.Kind == TokenSymbol && t.Value == "(" {
+		return p.parseParenthesisedSelectStmt()
+	}
 	if t.Kind != TokenKeyword && t.Kind != TokenIdent {
 		return nil, p.errAtCur("expected statement")
 	}
@@ -320,7 +347,9 @@ func (p *parser) parseStatement() (Stmt, error) {
 		return p.parseSet()
 	case KwReset:
 		return p.parseReset()
-	case KwSelect:
+	case KwSelect, KwTable, KwValues:
+		// TABLE tablename is handled inside parseSelect as a shorthand. M0097-0004.
+		// VALUES (...), (...) is a valid standalone statement in PostgreSQL. M0097-0049.
 		return p.parseSelect()
 	case KwInsert:
 		return p.parseInsert()
@@ -399,6 +428,19 @@ identLedStatement:
 				p.advance()
 			}
 			return &CompatNoopStmt{pos: t.Pos, Tag: "SECURITY LABEL"}, nil
+		case "lock":
+			// LOCK [TABLE] tablename [IN lockmode MODE] [NOWAIT] — accept as no-op.
+			// goopg's MVCC does not need explicit table locking for correctness;
+			// parsing the statement prevents "syntax error at or near 'lock'" noise
+			// in regress tests that LOCK tables before querying pg_locks. M0097-0071.
+			p.advance()
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &CompatNoopStmt{pos: t.Pos, Tag: "LOCK TABLE"}, nil
 		}
 	}
 	return nil, p.errAtCur("unsupported statement")
@@ -846,12 +888,20 @@ func (p *parser) parseVacuumOptionList(v *VacuumStmt) error {
 		switch {
 		case p.acceptKeyword(KwVerbose):
 			v.Verbose = true
+			_ = p.acceptKeyword(KwTrue) || p.acceptKeyword(KwFalse) ||
+				p.acceptIdentKeyword("true") || p.acceptIdentKeyword("false")
 		case p.acceptKeyword(KwAnalyze) || p.acceptKeyword(KwAnalyse):
 			v.Analyze = true
+			_ = p.acceptKeyword(KwTrue) || p.acceptKeyword(KwFalse) ||
+				p.acceptIdentKeyword("true") || p.acceptIdentKeyword("false")
 		case p.acceptKeyword(KwFull):
 			v.Full = true
+			_ = p.acceptKeyword(KwTrue) || p.acceptKeyword(KwFalse) ||
+				p.acceptIdentKeyword("true") || p.acceptIdentKeyword("false")
 		case p.acceptKeyword(KwFreeze):
 			v.Freeze = true
+			_ = p.acceptKeyword(KwTrue) || p.acceptKeyword(KwFalse) ||
+				p.acceptIdentKeyword("true") || p.acceptIdentKeyword("false")
 		case p.acceptIdentKeyword("disable_page_skipping"):
 			v.DisablePageSkipping = true
 		case p.acceptIdentKeyword("skip_database_stats"):
@@ -1140,6 +1190,18 @@ func (p *parser) parseSet() (Stmt, error) {
 			return s, nil
 		}
 		// otherwise fall through: SET SESSION TRANSACTION ... handled below
+	}
+	// SET ROLE rolename — accept as no-op. goopg does not implement role-based
+	// access control; SET ROLE is accepted silently. M0097-0071.
+	if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "role" {
+		p.advance() // consume "role"
+		// consume the role name (or DEFAULT)
+		if !p.acceptKeyword(KwDefault) {
+			_, _ = p.parseIdent()
+		}
+		s.Name = "role"
+		s.Default = true
+		return s, nil
 	}
 	// SET [LOCAL] TRANSACTION <mode> — intercept before generic GUC path.
 	// M0096-0002: supports ISOLATION LEVEL; other modes accepted as no-op.
@@ -1562,11 +1624,20 @@ func (p *parser) parseMergeWhenClause() (*MergeWhenClause, error) {
 	return clause, nil
 }
 
-// parseReset: RESET name | RESET ALL
+// parseReset: RESET name | RESET ALL | RESET SESSION AUTHORIZATION
 func (p *parser) parseReset() (Stmt, error) {
 	t := p.advance()
 	if p.acceptKeyword(KwAll) {
 		return &ResetStmt{pos: t.Pos, All: true}, nil
+	}
+	// RESET SESSION AUTHORIZATION — no-op: map to "session_authorization" GUC.
+	// SESSION is KwCatUnreserved so parseGUCName would consume it and leave
+	// "AUTHORIZATION" as a stray token, causing a syntax error. Intercept here.
+	if p.acceptKeyword(KwSession) {
+		if !p.acceptIdentKeyword("authorization") {
+			return nil, p.errAtCur("expected AUTHORIZATION after RESET SESSION")
+		}
+		return &ResetStmt{pos: t.Pos, Name: "session_authorization"}, nil
 	}
 	name, err := p.parseGUCName()
 	if err != nil {
@@ -1677,40 +1748,89 @@ func (p *parser) parseDeclareCursor() (Stmt, error) {
 		return nil, p.errAtCur("expected FOR in DECLARE CURSOR")
 	}
 
+	// SELECT … INTO is not permitted inside a cursor (M0097-0020).
+	old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+	p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+	p.selectIntoNoPos = false
 	query, err := p.parseSelect()
+	p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 	if err != nil {
 		return nil, err
 	}
 	return &DeclareCursorStmt{pos: pos, Name: name, Query: query}, nil
 }
 
-// parseFetchCursor parses FETCH [FORWARD|BACKWARD] [ALL|n] [FROM|IN] cursor_name.
+// parseFetchCursor parses FETCH direction cursor_name.
+// Supports all PG directions: NEXT, PRIOR, FIRST, LAST, ABSOLUTE n,
+// RELATIVE n, FORWARD [n|ALL], BACKWARD [n|ALL], ALL, n. M0097-0069.
 func (p *parser) parseFetchCursor() (Stmt, error) {
 	pos := p.cur().Pos
 	p.advance() // consume "fetch"
 
-	count := int64(-1) // -1 = ALL
+	count := int64(1) // default: NEXT = 1
 	forward := true
 
-	// optional direction keyword
-	if p.acceptIdentKeyword("forward") {
-		forward = true
-	} else if p.acceptIdentKeyword("backward") || p.acceptIdentKeyword("prior") {
+	switch {
+	case p.acceptIdentKeyword("next"):
+		count = 1
+	case p.acceptIdentKeyword("prior"):
 		forward = false
-	}
-
-	// count: ALL or integer literal
-	if p.acceptKeyword(KwAll) {
+		count = 1
+	case p.acceptIdentKeyword("first"):
+		count = 1
+	case p.acceptIdentKeyword("last"):
+		forward = false
+		count = 1
+	case p.acceptIdentKeyword("absolute"):
+		if p.cur().Kind == TokenIntLit {
+			var err error
+			count, err = p.parseIntLit()
+			if err != nil {
+				return nil, err
+			}
+		}
+	case p.acceptIdentKeyword("relative"):
+		if p.cur().Kind == TokenIntLit {
+			var err error
+			count, err = p.parseIntLit()
+			if err != nil {
+				return nil, err
+			}
+		}
+	case p.acceptIdentKeyword("forward"):
+		if p.acceptKeyword(KwAll) {
+			count = -1
+		} else if p.cur().Kind == TokenIntLit {
+			var err error
+			count, err = p.parseIntLit()
+			if err != nil {
+				return nil, err
+			}
+		}
+	case p.acceptIdentKeyword("backward"):
+		forward = false
+		if p.acceptKeyword(KwAll) {
+			count = -1
+		} else if p.cur().Kind == TokenIntLit {
+			var err error
+			count, err = p.parseIntLit()
+			if err != nil {
+				return nil, err
+			}
+		}
+	case p.acceptKeyword(KwAll):
 		count = -1
-	} else if p.cur().Kind == TokenIntLit {
-		var err error
-		count, err = p.parseIntLit()
-		if err != nil {
-			return nil, err
+	default:
+		if p.cur().Kind == TokenIntLit {
+			var err error
+			count, err = p.parseIntLit()
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
-	// FROM or IN
+	// FROM or IN (optional)
 	if !p.acceptKeyword(KwFrom) {
 		p.acceptKeyword(KwIn)
 	}
