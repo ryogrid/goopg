@@ -62,12 +62,12 @@ vacuum,275,failed
 insert_conflict,329,failed
 tuplesort,478,failed
 create_function_sql,525,failed
-sequence,417,failed
-matview,287,failed
-transactions,599,failed
-create_table_like,356,failed
+sequence,396,failed
+matview,272,failed
+transactions,559,failed
+create_table_like,179,failed
 limit,0,pass
-create_table,584,failed
+create_table,429,failed
 guc,748,failed
 update,669,failed
 misc_functions,602,failed
@@ -81,7 +81,7 @@ join_hash,150,failed
 copy2,919,failed
 select,68,failed
 int8,613,failed
-domain,932,failed
+domain,1015,failed
 jsonpath,940,failed
 indexing,972,failed
 float8,1025,failed
@@ -115,7 +115,7 @@ create_index,1597,failed
 alter_table,2137,failed
 multirangetypes,2801,failed
 rules,2986,failed
-inherit,1329,failed
+inherit,1323,failed
 with,2415,failed
 foreign_key,2992,failed
 updatable_views,3071,failed

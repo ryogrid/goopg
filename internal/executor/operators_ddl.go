@@ -384,23 +384,82 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 	}
-	// Append any columns explicitly declared in the CREATE TABLE body.
-	for _, c := range s.Columns {
-		typeName := strings.ToLower(c.Type.Name)
-		// Resolve domain/enum types to their storage type. M0097-0017.
-		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-			if resolved := im.ResolveColumnType(typeName); resolved != typeName {
-				typeName = resolved
+	// Append body elements in declaration order: explicit columns and LIKE clauses
+	// interleaved by their BodyOrder. M0097-0069.
+	if len(s.BodyOrder) > 0 {
+		// Build a lookup map for explicit columns by name.
+		colByName := make(map[string]parser.ColumnDef, len(s.Columns))
+		for _, c := range s.Columns {
+			colByName[strings.ToLower(c.Name)] = c
+		}
+		// Build a lookup for LIKE sources.
+		likeByKey := make(map[string]*catalog.Table)
+		for _, likeName := range s.LikeTables {
+			src, ok := o.ctx.Catalog.LookupTable(likeName)
+			if ok {
+				likeByKey["@@LIKE:"+likeName.String()] = src
 			}
 		}
-		cols = append(cols, catalog.Column{
-			Name:            c.Name,
-			Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
-			NotNull:         c.NotNull,
-			GeneratedExpr:   c.GeneratedExpr,
-			GeneratedAlways: c.GeneratedAlways,
-			DefaultExpr:     c.DefaultExpr,
-		})
+		addCol := func(c parser.ColumnDef) {
+			typeName := strings.ToLower(c.Type.Name)
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if resolved := im.ResolveColumnType(typeName); resolved != typeName {
+					typeName = resolved
+				}
+			}
+			cols = append(cols, catalog.Column{
+				Name:            c.Name,
+				Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
+				NotNull:         c.NotNull,
+				GeneratedExpr:   c.GeneratedExpr,
+				GeneratedAlways: c.GeneratedAlways,
+				DefaultExpr:     c.DefaultExpr,
+			})
+		}
+		for _, item := range s.BodyOrder {
+			if strings.HasPrefix(item, "@@LIKE:") {
+				src, ok := likeByKey[item]
+				if !ok {
+					continue
+				}
+				for _, sc := range src.Columns {
+					found := false
+					for _, ec := range cols {
+						if strings.EqualFold(ec.Name, sc.Name) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						c := sc
+						cols = append(cols, c)
+					}
+				}
+			} else {
+				c, ok := colByName[strings.ToLower(item)]
+				if ok {
+					addCol(c)
+				}
+			}
+		}
+	} else {
+		// Fallback: no BodyOrder (e.g. empty column list or old path).
+		for _, c := range s.Columns {
+			typeName := strings.ToLower(c.Type.Name)
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if resolved := im.ResolveColumnType(typeName); resolved != typeName {
+					typeName = resolved
+				}
+			}
+			cols = append(cols, catalog.Column{
+				Name:            c.Name,
+				Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
+				NotNull:         c.NotNull,
+				GeneratedExpr:   c.GeneratedExpr,
+				GeneratedAlways: c.GeneratedAlways,
+				DefaultExpr:     c.DefaultExpr,
+			})
+		}
 	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {

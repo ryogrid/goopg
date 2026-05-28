@@ -933,6 +933,15 @@ type CreateTableStmt struct {
 	// TableChecks holds raw SQL expressions from table-level CHECK constraints.
 	// M0097-0014.
 	TableChecks []string
+	// LikeTables holds the source table names from LIKE clauses.
+	// `CREATE TABLE t (LIKE src INCLUDING DEFAULTS)` copies src's columns. M0097-0069.
+	// Deprecated: use BodyOrder for positional interleaving.
+	LikeTables []ObjectName
+	// BodyOrder tracks the order of explicit columns and LIKE clauses in the
+	// CREATE TABLE body so the executor can interleave columns correctly.
+	// Each element is either a column name (for explicit columns) or
+	// "@@LIKE:schema.table" (for LIKE source_table clauses). M0097-0069.
+	BodyOrder []string
 }
 
 func (s *CreateTableStmt) Pos() int  { return s.pos }

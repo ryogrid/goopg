@@ -912,12 +912,36 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					p.advance()
 				}
 			}
+		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwLike {
+			// LIKE source_table [INCLUDING/EXCLUDING option …] — copy columns. M0097-0069.
+			p.advance() // consume LIKE
+			srcName, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			stmt.LikeTables = append(stmt.LikeTables, srcName)
+			stmt.BodyOrder = append(stmt.BodyOrder, "@@LIKE:"+srcName.String())
+			// Consume optional INCLUDING/EXCLUDING clauses.
+			for p.acceptIdentKeyword("including") || p.acceptIdentKeyword("excluding") {
+				// Option keyword: DEFAULTS, CONSTRAINTS, INDEXES, IDENTITY,
+				// COMMENTS, STATISTICS, STORAGE, ALL.
+				_ = p.acceptIdentKeyword("defaults") ||
+					p.acceptIdentKeyword("constraints") ||
+					p.acceptIdentKeyword("indexes") ||
+					p.acceptIdentKeyword("identity") ||
+					p.acceptIdentKeyword("comments") ||
+					p.acceptIdentKeyword("statistics") ||
+					p.acceptIdentKeyword("storage") ||
+					p.acceptKeyword(KwAll) ||
+					p.acceptIdentKeyword("generated")
+			}
 		} else {
 			col, err := p.parseColumnDef()
 			if err != nil {
 				return nil, err
 			}
 			stmt.Columns = append(stmt.Columns, col)
+			stmt.BodyOrder = append(stmt.BodyOrder, col.Name)
 			if col.Primary {
 				stmt.PrimaryKey = append(stmt.PrimaryKey, col.Name)
 			}
