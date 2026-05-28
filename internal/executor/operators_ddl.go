@@ -3032,12 +3032,14 @@ func aggregatePgTypeName(t string) string {
 // M0097-0017.
 
 func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
-	if !s.IsEnum {
-		// Composite / range / base types — not yet supported, ignore silently.
-		return nil
-	}
 	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
+		return nil
+	}
+	if !s.IsEnum {
+		// Composite / range / base types — not fully supported in v0.
+		// Register the name so DROP TYPE can succeed without error. M0097-0064.
+		cat.RegisterCompositeType(s.Name)
 		return nil
 	}
 	_, err := cat.RegisterEnum(s.Name, s.EnumValues)
@@ -3086,10 +3088,18 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 	}
 	for _, name := range s.Names {
 		n := name.Name
-		if err := cat.DropEnum(n, s.Cascade); err != nil {
-			if !s.IfExists {
-				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", n)}
-			}
+		// Try to drop as enum first, then as composite type. M0097-0064.
+		enumErr := cat.DropEnum(n, s.Cascade)
+		if enumErr == nil {
+			continue // successfully dropped as enum
+		}
+		compErr := cat.DropCompositeType(n)
+		if compErr == nil {
+			continue // successfully dropped as composite type
+		}
+		// Neither enum nor composite — report error unless IF EXISTS.
+		if !s.IfExists {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", n)}
 		}
 	}
 	return nil

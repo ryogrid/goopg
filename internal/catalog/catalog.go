@@ -353,6 +353,10 @@ type InMemory struct {
 	enumTypes map[string]*EnumType
 	// domains holds user-defined domain types. M0097-0017.
 	domains map[string]*Domain
+	// compositeTypeNames tracks names of composite/range/base types created via
+	// CREATE TYPE ... AS (...). Since we don't implement composite type evaluation,
+	// we only track the name so DROP TYPE can succeed silently. M0097-0064.
+	compositeTypeNames map[string]bool
 
 	// constraintViewDeps maps "tableOID:constraintName" → []viewName for
 	// views that rely on the constraint for GROUP BY functional dependency.
@@ -435,6 +439,7 @@ func NewInMemory() *InMemory {
 		inheritanceChildren: make(map[uint32][]uint32),
 		enumTypes:           make(map[string]*EnumType),
 		domains:             make(map[string]*Domain),
+		compositeTypeNames:  make(map[string]bool),
 		constraintViewDeps:  make(map[string][]string),
 		opClassHashFuncs:    make(map[string]string),
 	}
@@ -2496,6 +2501,30 @@ func (c *InMemory) DropEnum(name string, cascade bool) error {
 		return fmt.Errorf("type %q does not exist", name)
 	}
 	delete(c.enumTypes, k)
+	return nil
+}
+
+// RegisterCompositeType records a composite/range/base type name so that
+// DROP TYPE can succeed. We don't model composite type internals in v0;
+// tracking the name is enough for DROP TYPE to avoid a false-positive error.
+// M0097-0064.
+func (c *InMemory) RegisterCompositeType(name string) {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.compositeTypeNames[k] = true
+}
+
+// DropCompositeType removes a composite type name. Returns an error if not
+// found. M0097-0064.
+func (c *InMemory) DropCompositeType(name string) error {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.compositeTypeNames[k] {
+		return fmt.Errorf("type %q does not exist", name)
+	}
+	delete(c.compositeTypeNames, k)
 	return nil
 }
 

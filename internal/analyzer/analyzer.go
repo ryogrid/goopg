@@ -1255,7 +1255,7 @@ func scopeRelMatches(rel scopeRel, table, schema string) bool {
 
 func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
 	if rv.Subquery != nil {
-		return synthesizeSubqueryTable(cat, rv)
+		return synthesizeSubqueryTable(cat, rv, nil)
 	}
 	// Table-valued function (M0096-0006): produce a synthetic table.
 	// The planner is the source of truth for SRF return shapes; this
@@ -1621,7 +1621,17 @@ func buildSelectScopeIn(s *parser.SelectStmt, ctx *scope) ([]scopeRel, error) {
 		tbl = applyRangeVarColumnAliases(item.Base, tbl)
 		rels = append(rels, scopeRel{table: tbl, alias: item.Base.Alias})
 		for _, j := range item.Joins {
-			rt, err := resolveTable(ctx, j.Right)
+			var rt *catalog.Table
+			if j.Right.Subquery != nil {
+				// LATERAL subquery in a JOIN: pass the accumulated left-side
+				// relations as the outer scope so the inner SELECT can
+				// resolve correlated references like t1.col where t1 is the
+				// left side of the JOIN. M0097-0064.
+				lateralCtx := &scope{parent: ctx, cat: ctx.cat, rels: append([]scopeRel(nil), rels...)}
+				rt, err = synthesizeSubqueryTable(ctx.cat, j.Right, lateralCtx)
+			} else {
+				rt, err = resolveTable(ctx, j.Right)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -1696,7 +1706,7 @@ func expandInnerStarColumns(star *parser.StarExpr, innerCtx *scope) []catalog.Co
 	return cols
 }
 
-func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error) {
+func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar, outerCtx *scope) (*catalog.Table, error) {
 	// VALUES subquery: FROM (VALUES (r1), ...) AS t(c1, c2).
 	// The inner SelectStmt has no Targets; build the column list from the
 	// explicit alias list (rv.Columns) or synthetic names. M0097-0003.
@@ -1714,7 +1724,11 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.
 		}
 		return &catalog.Table{Name: rv.Alias, Columns: cols}, nil
 	}
-	if err := analyzeSelectWithParent(rv.Subquery, cat, nil); err != nil {
+	// LATERAL subquery analysis: pass outerCtx as the lexical-scope parent so
+	// the inner SELECT can resolve correlated references to outer FROM-clause
+	// columns (e.g. t1.tenthous when t1 is the left side of a JOIN LATERAL).
+	// M0097-0064.
+	if err := analyzeSelectWithParent(rv.Subquery, cat, outerCtx); err != nil {
 		// LATERAL fallback: correlated reference to outer table fails analysis.
 		// When explicit column aliases are provided (rv.Columns), produce a
 		// synthetic table with those column names and unknown (text) types.
@@ -1730,7 +1744,7 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.
 		}
 		return nil, err
 	}
-	innerCtx := &scope{cat: cat}
+	innerCtx := &scope{cat: cat, parent: outerCtx}
 	if len(rv.Subquery.From) > 0 || len(rv.Subquery.FromExprs) > 0 {
 		rels, err := buildSelectScope(rv.Subquery, cat)
 		if err != nil {

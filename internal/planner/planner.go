@@ -1741,7 +1741,7 @@ func planFromItem(item parser.FromExpr, cat catalog.Catalog, nextSourceIdx *int1
 
 func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	if rv.Subquery != nil {
-		return planSubqueryRangeVar(rv, cat, sourceIdx)
+		return planSubqueryRangeVar(rv, cat, sourceIdx, lateralCtx)
 	}
 	if rv.TableFunc != nil {
 		return planTableFuncRangeVar(rv, cat, sourceIdx, lateralCtx)
@@ -2232,13 +2232,25 @@ func planValuesSubquery(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding
 // never registered in the catalog — it lives only to satisfy
 // the rangeBinding contract that downstream column resolution
 // uses.
-func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16) (Node, rangeBinding, error) {
+func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	// Handle bare VALUES(...) subquery: `FROM (VALUES (r1), (r2)) AS t(c1, c2)`.
 	// M0097-0003.
 	if len(rv.Subquery.ValuesRows) > 0 {
 		return planValuesSubquery(rv, sourceIdx)
 	}
-	inner, err := Plan(rv.Subquery, cat)
+	// LATERAL subquery: use planSelectWithParent so the inner SELECT can
+	// resolve correlated references to outer-scope columns. M0097-0064.
+	// buildAnalyzerOuterScope checks ctx.cat != nil; copy lateralCtx with
+	// cat set so the analyzer outer-scope chain is built correctly.
+	var inner Node
+	var err error
+	if lateralCtx != nil {
+		latCtxWithCat := *lateralCtx
+		latCtxWithCat.cat = cat
+		inner, err = planSelectWithParent(rv.Subquery, cat, &latCtxWithCat)
+	} else {
+		inner, err = Plan(rv.Subquery, cat)
+	}
 	if err != nil {
 		// LATERAL subquery fallback: when the inner subquery references outer
 		// columns (correlated lateral reference) the planner fails with a

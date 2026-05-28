@@ -231,7 +231,7 @@ Status policy for this phase:
 | type_sanity | `postgres/src/test/regress/sql/type_sanity.sql` | `postgres/src/test/regress/expected/type_sanity.out` | excluded | Type sanity; out of scope for goopg v0. |
 | typed_table | `postgres/src/test/regress/sql/typed_table.sql` | `postgres/src/test/regress/expected/typed_table.out` | excluded | Typed tables (OF type); out of scope for goopg v0. |
 | unicode | `postgres/src/test/regress/sql/unicode.sql` | `postgres/src/test/regress/expected/unicode.out` | excluded | Unicode semantics; out of scope for goopg v0. |
-| union | `postgres/src/test/regress/sql/union.sql` | `postgres/src/test/regress/expected/union.out` | failed | Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope |
+| union | `postgres/src/test/regress/sql/union.sql` | `postgres/src/test/regress/expected/union.out` | passed | M0097-0064: lateral JOIN scope threading (analyzer + planner), composite type DROP tracking |
 | updatable_views | `postgres/src/test/regress/sql/updatable_views.sql` | `postgres/src/test/regress/expected/updatable_views.out` | failed | Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope |
 | update | `postgres/src/test/regress/sql/update.sql` | `postgres/src/test/regress/expected/update.out` | failed | Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope |
 | uuid | `postgres/src/test/regress/sql/uuid.sql` | `postgres/src/test/regress/expected/uuid.out` | failed | Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope |

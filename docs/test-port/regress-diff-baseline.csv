@@ -88,7 +88,7 @@ float8,1025,failed
 rowtypes,1030,failed
 constraints,901,failed
 portals,1089,failed
-union,8,failed
+union,0,passed
 date,1164,failed
 copy,1257,failed
 generated_stored,1337,failed
