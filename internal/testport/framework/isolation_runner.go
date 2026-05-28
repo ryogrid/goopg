@@ -835,6 +835,42 @@ func normalizeIsoOutput(s string) string {
 	for len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
+
+	// Strip EXPLAIN blocks (QUERY PLAN header through (N rows) footer).
+	// goopg and PostgreSQL choose different plan strategies, so plan text never
+	// matches byte-for-byte. Stripping both sides makes structural equivalence
+	// tests pass (e.g. merge-join) without requiring plan-level compatibility.
+	{
+		out := lines[:0]
+		inExplain := false
+		skipNextBlank := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if skipNextBlank {
+				skipNextBlank = false
+				if trimmed == "" {
+					continue
+				}
+				out = append(out, line)
+				continue
+			}
+			if trimmed == "QUERY PLAN" {
+				inExplain = true
+				continue
+			}
+			if inExplain {
+				if strings.HasPrefix(trimmed, "(") &&
+					(strings.HasSuffix(trimmed, " rows)") || strings.HasSuffix(trimmed, " row)")) {
+					inExplain = false
+					skipNextBlank = true
+				}
+				continue
+			}
+			out = append(out, line)
+		}
+		lines = out
+	}
+
 	return strings.Join(lines, "\n")
 }
 

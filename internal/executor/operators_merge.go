@@ -592,7 +592,17 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	if derr != nil {
 		return derr
 	}
-	return writeHeapRow(ctx, rel, cols, newRow)
+	// Write new tuple version and link old→new via t_ctid so EPQ chain
+	// followers (epqFollowChainFull) can locate the latest version after
+	// a concurrent committed update (M0100-0005).
+	newPtr, werr := writeHeapRowReturning(ctx, rel, cols, newRow)
+	if werr != nil {
+		return werr
+	}
+	if cerr := stampOldCtid(ctx, rel, blk, slot, newPtr); cerr != nil {
+		return cerr
+	}
+	return nil
 }
 
 // mergeApplyDelete stamps xmax on the tuple at (blk, slot).
