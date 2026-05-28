@@ -3,13 +3,14 @@ package executor
 import (
 	"context"
 	"crypto/md5"
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
+	mathrand "math/rand"
 	"regexp"
 	"strconv"
 	"strings"
@@ -21,6 +22,13 @@ import (
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
+)
+
+// sessionPRNG is the per-process random-number generator used by random(),
+// setseed() and random_normal(). Protected by sessionPRNGMu. M0097-0071.
+var (
+	sessionPRNG   = mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
+	sessionPRNGMu sync.Mutex
 )
 
 // ExecError is the executor's structured error. Code is a SQLSTATE
@@ -213,7 +221,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if len(strVal) == 0 || strVal[0] != '{' {
 						found := false
 						for _, label := range et.Values {
-							if strings.EqualFold(label, strVal) {
+							if strings.EqualFold(label.Label, strVal) {
 								found = true
 								break
 							}
@@ -1397,6 +1405,22 @@ func roundFloatToInt(d Datum, pos int) (int64, error) {
 	// Banker's rounding: round half to nearest even.
 	rounded := math.RoundToEven(f)
 	return int64(rounded), nil
+}
+
+// datumToFloat64 converts any numeric Datum kind to float64.
+// Returns (value, true) on success; (0, false) if conversion is not possible.
+func datumToFloat64(d Datum) (float64, bool) {
+	switch d.Kind {
+	case KindInt:
+		return float64(d.Int), true
+	case KindNumeric:
+		f, err := strconv.ParseFloat(d.Format(), 64)
+		return f, err == nil
+	case KindString:
+		f, err := strconv.ParseFloat(strings.TrimSpace(d.StringValue()), 64)
+		return f, err == nil
+	}
+	return 0, false
 }
 
 // isFloatSourceType reports whether a type name denotes a floating-point type
@@ -3421,7 +3445,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if !ok || len(et.Values) == 0 {
 			return NullDatum, nil
 		}
-		return NewStringDatum(et.Values[0]), nil
+		return NewStringDatum(et.Values[0].Label), nil
 
 	case "enum_last":
 		typeName := enumTypeNameFromArgs(x.Args)
@@ -3436,7 +3460,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if !ok || len(et.Values) == 0 {
 			return NullDatum, nil
 		}
-		return NewStringDatum(et.Values[len(et.Values)-1]), nil
+		return NewStringDatum(et.Values[len(et.Values)-1].Label), nil
 
 	case "enum_range", "enum_range_bounds":
 		typeName := enumTypeNameFromArgs(x.Args)
@@ -3459,7 +3483,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if loErr == nil && !loVal.IsNull() {
 				loStr := loVal.StringValue()
 				for i, v := range vals {
-					if strings.EqualFold(v, loStr) {
+					if strings.EqualFold(v.Label, loStr) {
 						vals = vals[i:]
 						break
 					}
@@ -3468,14 +3492,19 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if hiErr == nil && !hiVal.IsNull() {
 				hiStr := hiVal.StringValue()
 				for i, v := range vals {
-					if strings.EqualFold(v, hiStr) {
+					if strings.EqualFold(v.Label, hiStr) {
 						vals = vals[:i+1]
 						break
 					}
 				}
 			}
 		}
-		return NewStringDatum(formatTextArray(vals)), nil
+		// Convert []EnumValue → []string for formatTextArray.
+		labels := make([]string, len(vals))
+		for i, ev := range vals {
+			labels[i] = ev.Label
+		}
+		return NewStringDatum(formatTextArray(labels)), nil
 
 	// ── Advisory lock functions (M0096-0003) ──────────────────────────────
 	// All variants block/return immediately depending on lock availability.
@@ -3726,6 +3755,17 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				// varchar(N) / character varying(N) / char(N) / bpchar(N). M0097-0003.
 				if valid, ok := pgInputIsValidTypedLen(v, t); ok {
 					return NewBoolDatum(valid), nil
+				}
+				// Check if it's a registered enum type. M0097-0071.
+				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+					if et, isEnum := im.LookupEnum(t); isEnum {
+						for _, ev := range et.Values {
+							if strings.EqualFold(ev.Label, v) {
+								return NewBoolDatum(true), nil
+							}
+						}
+						return NewBoolDatum(false), nil
+					}
 				}
 			}
 		}
@@ -5005,9 +5045,155 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pi":
 		return newNumeric(parseNumericOrZero("3.14159265358979"), 14), nil
 	case "random":
-		// random() → float8 in [0, 1)
-		// Return a deterministic 0.5 for testing purposes.
-		return NewStringDatum("0.5"), nil
+		// random() → float8 in [0, 1).
+		// random(min, max) → uniform integer/numeric in [min, max]. M0097-0071.
+		if len(x.Args) >= 2 {
+			loD, loErr := evalExpr(x.Args[0], row, ctx)
+			hiD, hiErr := evalExpr(x.Args[1], row, ctx)
+			if loErr != nil || hiErr != nil || loD.IsNull() || hiD.IsNull() {
+				return NullDatum, nil
+			}
+			// Both args are integer-kind → integer range.
+			if loD.Kind == KindInt && hiD.Kind == KindInt {
+				lo64, hi64 := loD.Int, hiD.Int
+				if lo64 > hi64 {
+					return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "lower bound must be less than or equal to upper bound"}
+				}
+				if lo64 == hi64 {
+					return NewIntDatum(lo64), nil
+				}
+				// Use uint64 arithmetic to avoid int64 overflow for full-range spans.
+				rangeU := uint64(hi64) - uint64(lo64) // always correct (two's complement)
+				sessionPRNGMu.Lock()
+				var rndOffset uint64
+				if rangeU == ^uint64(0) { // MaxUint64: full int64 range
+					rndOffset = sessionPRNG.Uint64()
+				} else {
+					rndOffset = sessionPRNG.Uint64() % (rangeU + 1)
+				}
+				sessionPRNGMu.Unlock()
+				v := int64(uint64(lo64) + rndOffset) // two's complement safe
+				return NewIntDatum(v), nil
+			}
+			// Numeric / string args — validate NaN/Inf then compare.
+			loS := loD.Format()
+			hiS := hiD.Format()
+			loM, loSc, loPerr := parseNumeric(loS)
+			hiM, hiSc, hiPerr := parseNumeric(hiS)
+			if loPerr != nil {
+				// Check for NaN/Inf in the raw string.
+				loF, _ := datumToFloat64(loD)
+				if math.IsNaN(loF) {
+					return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "lower bound cannot be NaN"}
+				}
+				if math.IsInf(loF, 0) {
+					return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "lower bound cannot be infinity"}
+				}
+				return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "invalid arguments for random(min, max)"}
+			}
+			if hiPerr != nil {
+				hiF, _ := datumToFloat64(hiD)
+				if math.IsNaN(hiF) {
+					return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "upper bound cannot be NaN"}
+				}
+				if math.IsInf(hiF, 0) {
+					return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "upper bound cannot be infinity"}
+				}
+				return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "invalid arguments for random(min, max)"}
+			}
+			// Validate lo <= hi.
+			cmpA := newNumeric(loM, int(loSc))
+			cmpB := newNumeric(hiM, int(hiSc))
+			cmp, _ := numericCmp(cmpA, cmpB)
+			if cmp > 0 {
+				return NullDatum, &ExecError{Code: "22003", Pos: x.Pos(), Message: "lower bound must be less than or equal to upper bound"}
+			}
+			// For integer-like numerics (no decimal scale), return bigint.
+			if loSc == 0 && hiSc == 0 && loM.IsInt64() && hiM.IsInt64() {
+				lo64 := loM.Int64()
+				hi64 := hiM.Int64()
+				if lo64 == hi64 {
+					return NewIntDatum(lo64), nil
+				}
+				// Use uint64 arithmetic to avoid int64 overflow for full-range spans.
+				rangeU := uint64(hi64) - uint64(lo64)
+				sessionPRNGMu.Lock()
+				var rndOffset uint64
+				if rangeU == ^uint64(0) {
+					rndOffset = sessionPRNG.Uint64()
+				} else {
+					rndOffset = sessionPRNG.Uint64() % (rangeU + 1)
+				}
+				sessionPRNGMu.Unlock()
+				v := int64(uint64(lo64) + rndOffset)
+				return NewIntDatum(v), nil
+			}
+			// Numeric range: return a numeric in [lo, hi].
+			// Apply scale: mantissa is stored as integer * 10^scale.
+			sessionPRNGMu.Lock()
+			frac := sessionPRNG.Float64()
+			sessionPRNGMu.Unlock()
+			loFRaw, _ := loM.Float64()
+			hiFRaw, _ := hiM.Float64()
+			loF := loFRaw / math.Pow10(int(loSc))
+			hiF := hiFRaw / math.Pow10(int(hiSc))
+			v := loF + frac*(hiF-loF)
+			return NewStringDatum(strconv.FormatFloat(v, 'f', -1, 64)), nil
+		}
+		// Zero-arg: uniform float8 in [0, 1).
+		sessionPRNGMu.Lock()
+		v := sessionPRNG.Float64()
+		sessionPRNGMu.Unlock()
+		return NewStringDatum(strconv.FormatFloat(v, 'f', 15, 64)), nil
+
+	case "setseed":
+		// setseed(double precision) — seed ∈ [-1, 1]. M0097-0071.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		seedD, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || seedD.IsNull() {
+			return NullDatum, nil
+		}
+		seedF, ok := datumToFloat64(seedD)
+		if !ok {
+			return NullDatum, nil
+		}
+		// Map [-1, 1] → int64 seed, matching PG convention.
+		seedI := int64(seedF * float64(1<<31))
+		sessionPRNGMu.Lock()
+		sessionPRNG = mathrand.New(mathrand.NewSource(seedI))
+		sessionPRNGMu.Unlock()
+		return NullDatum, nil // returns void
+
+	case "random_normal":
+		// random_normal() → float8 from N(0,1)
+		// random_normal(mean, stddev) → N(mean, stddev). M0097-0071.
+		mean, stddev := 0.0, 1.0
+		if len(x.Args) >= 2 {
+			mD, mErr := evalExpr(x.Args[0], row, ctx)
+			sD, sErr := evalExpr(x.Args[1], row, ctx)
+			if mErr != nil || sErr != nil || mD.IsNull() || sD.IsNull() {
+				return NullDatum, nil
+			}
+			if f, ok := datumToFloat64(mD); ok {
+				mean = f
+			}
+			if f, ok := datumToFloat64(sD); ok {
+				stddev = f
+			}
+		}
+		// Box-Muller transform: Z = sqrt(-2*ln(U1)) * cos(2π*U2) ~ N(0,1)
+		sessionPRNGMu.Lock()
+		u1 := sessionPRNG.Float64()
+		u2 := sessionPRNG.Float64()
+		sessionPRNGMu.Unlock()
+		if u1 == 0 {
+			u1 = 1e-15 // avoid log(0)
+		}
+		z := math.Sqrt(-2*math.Log(u1)) * math.Cos(2*math.Pi*u2)
+		result := mean + stddev*z
+		return NewStringDatum(strconv.FormatFloat(result, 'f', 15, 64)), nil
 
 	// ── Type conversion functions (M0097-0005) ────────────────────────────
 	case "to_number":
@@ -6506,7 +6692,7 @@ func uuidToBytes(s string) ([16]byte, bool) {
 // genUUIDv4 generates a random RFC 4122 version-4 UUID.
 func genUUIDv4() (string, error) {
 	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	if _, err := cryptorand.Read(b[:]); err != nil {
 		return "", err
 	}
 	b[6] = (b[6] & 0x0F) | 0x40
@@ -6553,7 +6739,7 @@ func genUUIDv7(ns int64) (string, error) {
 	subMsPrec := (subNs * 4096) / 1_000_000
 	b[6] = byte(subMsPrec >> 8)
 	b[7] = byte(subMsPrec)
-	if _, err := rand.Read(b[8:]); err != nil {
+	if _, err := cryptorand.Read(b[8:]); err != nil {
 		return "", err
 	}
 	b[6] = (b[6] & 0x0F) | 0x70 // version 7

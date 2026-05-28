@@ -369,11 +369,20 @@ type InMemory struct {
 	opClassHashFuncs map[string]string
 }
 
+// EnumValue is one label in a user-defined enum type together with its sort
+// position, matching pg_enum.enumsortorder (float4). Initial values start at
+// 1.0, 2.0, …; BEFORE/AFTER insertions get the midpoint of their neighbours.
+// M0097-0071.
+type EnumValue struct {
+	Label     string
+	SortOrder float64
+}
+
 // EnumType holds one user-defined enum type. M0097-0017.
 type EnumType struct {
 	Name   string
 	OID    uint32
-	Values []string // ordered labels; position = sortorder (0-based)
+	Values []EnumValue // ordered by SortOrder; each element stores its own sortorder
 }
 
 // Domain holds one user-defined domain type. M0097-0017.
@@ -1264,12 +1273,12 @@ func (c *InMemory) registerSystemTables() {
 		oid := 20000
 		for _, name := range names {
 			et := c.enumTypes[name]
-			for i, label := range et.Values {
+			for _, ev := range et.Values {
 				rows = append(rows, []string{
 					fmt.Sprintf("%d", oid),
 					et.Name,
-					fmt.Sprintf("%d", i+1),
-					label,
+					strconv.FormatFloat(ev.SortOrder, 'f', -1, 32),
+					ev.Label,
 				})
 				oid++
 			}
@@ -2403,10 +2412,14 @@ func (c *InMemory) RegisterEnum(name string, values []string) (*EnumType, error)
 	if _, exists := c.enumTypes[k]; exists {
 		return nil, fmt.Errorf("type %q already exists", name)
 	}
+	evs := make([]EnumValue, len(values))
+	for i, v := range values {
+		evs[i] = EnumValue{Label: v, SortOrder: float64(i + 1)}
+	}
 	et := &EnumType{
 		Name:   k,
 		OID:    c.nextOID,
-		Values: append([]string(nil), values...),
+		Values: evs,
 	}
 	c.nextOID++
 	c.enumTypes[k] = et
@@ -2466,7 +2479,7 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 	}
 	// Check for duplicate.
 	for _, v := range et.Values {
-		if strings.EqualFold(v, value) {
+		if strings.EqualFold(v.Label, value) {
 			if ifNotExists {
 				return true, nil // skipped — caller should emit NOTICE
 			}
@@ -2476,10 +2489,18 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 	switch {
 	case before != "":
 		for i, v := range et.Values {
-			if strings.EqualFold(v, before) {
-				newVals := make([]string, 0, len(et.Values)+1)
+			if strings.EqualFold(v.Label, before) {
+				// Compute sortorder: midpoint of predecessor and v, or v-1 if first.
+				var newSortOrder float64
+				if i == 0 {
+					newSortOrder = v.SortOrder - 1
+				} else {
+					newSortOrder = (et.Values[i-1].SortOrder + v.SortOrder) / 2
+				}
+				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
+				newVals := make([]EnumValue, 0, len(et.Values)+1)
 				newVals = append(newVals, et.Values[:i]...)
-				newVals = append(newVals, value)
+				newVals = append(newVals, newEV)
 				newVals = append(newVals, et.Values[i:]...)
 				et.Values = newVals
 				return false, nil
@@ -2488,10 +2509,18 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 		return false, &EnumLabelNotFound{Label: before}
 	case after != "":
 		for i, v := range et.Values {
-			if strings.EqualFold(v, after) {
-				newVals := make([]string, 0, len(et.Values)+1)
+			if strings.EqualFold(v.Label, after) {
+				// Compute sortorder: midpoint of v and successor, or v+1 if last.
+				var newSortOrder float64
+				if i+1 == len(et.Values) {
+					newSortOrder = v.SortOrder + 1
+				} else {
+					newSortOrder = (v.SortOrder + et.Values[i+1].SortOrder) / 2
+				}
+				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
+				newVals := make([]EnumValue, 0, len(et.Values)+1)
 				newVals = append(newVals, et.Values[:i+1]...)
-				newVals = append(newVals, value)
+				newVals = append(newVals, newEV)
 				newVals = append(newVals, et.Values[i+1:]...)
 				et.Values = newVals
 				return false, nil
@@ -2499,7 +2528,14 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 		}
 		return false, &EnumLabelNotFound{Label: after}
 	default:
-		et.Values = append(et.Values, value)
+		// Append: sortorder = last + 1, or 1 for first element.
+		var newSortOrder float64
+		if len(et.Values) == 0 {
+			newSortOrder = 1
+		} else {
+			newSortOrder = et.Values[len(et.Values)-1].SortOrder + 1
+		}
+		et.Values = append(et.Values, EnumValue{Label: value, SortOrder: newSortOrder})
 	}
 	return false, nil
 }

@@ -53,7 +53,7 @@ text,0,pass
 enum,325,failed
 equivclass,0,pass
 xid,404,failed
-random,451,failed
+random,314,failed
 select_distinct,0,passed
 regex,417,failed
 btree_index,78,failed

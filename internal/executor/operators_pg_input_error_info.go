@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -167,6 +168,24 @@ func (o *pgInputErrorInfoOp) Next() (TupleSlot, error) {
 	default:
 		// varchar(N) / character varying(N) / char(N) — length validation. M0097-0003.
 		message, sqlCode = validateTypedLen(v, t)
+		// Check if it's a registered enum type. M0097-0071.
+		if message == "" {
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if et, isEnum := im.LookupEnum(t); isEnum {
+					valid := false
+					for _, ev := range et.Values {
+						if strings.EqualFold(ev.Label, v) {
+							valid = true
+							break
+						}
+					}
+					if !valid {
+						message = fmt.Sprintf("invalid input value for enum %s: %q", et.Name, v)
+						sqlCode = "22P02"
+					}
+				}
+			}
+		}
 	}
 
 	if message == "" {
