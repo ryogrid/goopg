@@ -369,6 +369,10 @@ func walkExprTree(e Expr, visit func(Expr)) {
 		walkExprTree(x.Else, visit)
 	case *ExtractExpr:
 		walkExprTree(x.Source, visit)
+	case *RowExpr:
+		for _, elem := range x.Elems {
+			walkExprTree(elem, visit)
+		}
 	}
 }
 

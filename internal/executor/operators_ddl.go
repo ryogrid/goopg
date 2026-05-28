@@ -2083,8 +2083,9 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			Name: strings.ToLower(s.ReturnType.Name),
 			Args: append([]int64(nil), s.ReturnType.Args...),
 		},
-		Language: lang,
-		Body:     s.Body,
+		ReturnsSet: s.ReturnsSet,
+		Language:   lang,
+		Body:       s.Body,
 	}
 	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).

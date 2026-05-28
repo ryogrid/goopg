@@ -782,6 +782,50 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			}
 		}
 		stmt.PartitionOf = poc
+		// Optional PARTITION BY for nested partitions: CREATE TABLE foo3 PARTITION OF foo2
+		// FOR VALUES ... PARTITION BY list(b). M0097-0020.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPartition {
+			if p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwBy {
+				pos2 := p.cur().Pos
+				p.advance() // PARTITION
+				p.advance() // BY
+				method := ""
+				switch {
+				case p.acceptIdentKeyword("list"):
+					method = "LIST"
+				case p.acceptIdentKeyword("range"):
+					method = "RANGE"
+				case p.acceptIdentKeyword("hash"):
+					method = "HASH"
+				default:
+					return nil, p.errAtCur("expected LIST, RANGE, or HASH after PARTITION BY")
+				}
+				if !p.acceptSymbol("(") {
+					return nil, p.errAtCur("expected '(' after partition method")
+				}
+				var keyCols, opClasses []string
+				for {
+					col, err := p.parseIdent()
+					if err != nil {
+						return nil, err
+					}
+					keyCols = append(keyCols, identText(col))
+					opClass := ""
+					if p.cur().Kind == TokenIdent {
+						opClass = p.cur().Value
+						p.advance()
+					}
+					opClasses = append(opClasses, opClass)
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, OpClasses: opClasses}
+			}
+		}
 		// ON COMMIT clause may follow FOR VALUES ... in partition tables.
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
 			p.advance()

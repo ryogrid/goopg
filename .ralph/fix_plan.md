@@ -1236,6 +1236,33 @@ M0097-0001 wires it up.
             output schema — matching the behaviour of `wrapSetOpSortLimit`.
         Baseline CSV: `union` 48→35, `join` 9933→6800.
 
+      - **Progress 2026-05-29 (M0097-0072 — select 137→0 PASS):**
+        Three fixes closing the last 3 blockers in `select.sql`:
+        (a) Analyzer: added `*parser.RowExpr` case to `analyzeExpr`
+            (`internal/analyzer/analyzer.go`). Without this, `(a,b) IN
+            (VALUES ...)` — where the operand is a row constructor
+            `*parser.RowExpr` — hit the `default:` fallback and raised
+            `0A000 unsupported expression *parser.RowExpr`. The fix
+            validates each element and returns `text` type, consistent
+            with how PostgreSQL type-checks row constructors.
+        (b) Planner: added `*RowExpr` case to `targetMeta`
+            (`internal/planner/planner.go`). When a whole-row variable
+            (`select foo from (select 1) as foo`) resolves to a
+            `*planner.RowExpr`, the column name was falling through to
+            `?column?` instead of using the alias `foo`. The fix checks
+            if the expression is `*RowExpr` and extracts the name from
+            the original `*parser.ColumnRef`.
+        (c) Planner: extended `planValuesSubquery` to accept a
+            `lateralCtx` and expand qualified star expressions
+            (`n.*`) in VALUES rows (`internal/planner/planner.go`).
+            Added inner `expandRow` function that resolves `n.*` to
+            the columns of table `n` from `lateralCtx.bindings`; for
+            a zero-column table (e.g. `CREATE TEMP TABLE nocols()`)
+            the expansion produces an empty column list, yielding a
+            0-column VALUES node. `planSubqueryRangeVar` updated to
+            pass `lateralCtx` through to `planValuesSubquery`.
+        Baseline CSV updated: `select` 137→0 (`pass`).
+
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `transactions`, `lock`, `prepare`, `plancache`,

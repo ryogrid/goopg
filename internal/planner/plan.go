@@ -395,6 +395,18 @@ type CastExpr struct {
 func (e *CastExpr) Pos() int { return e.pos }
 func (*CastExpr) exprNode()  {}
 
+// RowExpr is a resolved row constructor `(a, b, c)`. At evaluation time it
+// produces a text composite representation `(v1,v2,...,vN)`. Used for
+// whole-row variable refs and row-constructor IN comparisons. M0097-0020.
+type RowExpr struct {
+	pos   int
+	Elems []Expr
+	Types []catalog.Type
+}
+
+func (e *RowExpr) Pos() int { return e.pos }
+func (*RowExpr) exprNode()  {}
+
 // UnaryOp — Op Operand.
 //
 // M0073-0003: Op is parser.OpCode (int8 enum), was string.
@@ -874,6 +886,16 @@ type SrfCol struct {
 	Step   Expr // generate_series step arg (nil → step 1)
 }
 
+// UserSrfCol describes one user-defined SETOF SQL function call in the SELECT
+// target list. The executor calls the function body and collects all rows.
+// M0097-0020.
+type UserSrfCol struct {
+	ColIdx  int    // which output column this SRF fills
+	FuncPos int    // source position for error reporting
+	Args    []Expr // resolved argument expressions
+	Routine *catalog.Routine
+}
+
 type ProjectSet struct {
 	pos     int
 	Child   Node
@@ -884,8 +906,9 @@ type ProjectSet struct {
 	// When non-empty, the operator expands the SRFs and zips them
 	// together, repeating OtherExprs for each step. The output schema
 	// covers both SRF and non-SRF columns.
-	SrfCols    []SrfCol // one per generate_series call in target list
-	OtherExprs []Expr   // non-SRF target expressions; nil slot = SRF slot
+	SrfCols     []SrfCol     // one per generate_series call in target list
+	UserSrfCols []UserSrfCol // one per user-defined SETOF function call. M0097-0020.
+	OtherExprs  []Expr       // non-SRF target expressions; nil slot = SRF slot
 }
 
 func (n *ProjectSet) Pos() int       { return n.pos }

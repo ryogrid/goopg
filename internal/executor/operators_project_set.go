@@ -40,8 +40,8 @@ func (o *projectSetOp) Open(ctx *Context) error {
 		return err
 	}
 
-	// SELECT-list SRF mode: generate_series() in target list. M0097-0045.
-	if len(o.plan.SrfCols) > 0 {
+	// SELECT-list SRF mode: generate_series() or user SETOF functions in target list.
+	if len(o.plan.SrfCols) > 0 || len(o.plan.UserSrfCols) > 0 {
 		return o.openSelectSrfMode(ctx)
 	}
 
@@ -109,12 +109,12 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 			otherVals[j] = d
 		}
 
-		// 2. Evaluate each SRF and collect series values.
+		// 2. Evaluate each generate_series SRF and collect series values.
 		type seriesResult struct {
 			colIdx int
 			vals   []int64
 		}
-		results := make([]seriesResult, len(o.plan.SrfCols))
+		genResults := make([]seriesResult, len(o.plan.SrfCols))
 		maxLen := 0
 		for k, sc := range o.plan.SrfCols {
 			startD, err := evalExpr(sc.Start, childRow, ctx)
@@ -148,7 +148,32 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 					vals = append(vals, v)
 				}
 			}
-			results[k] = seriesResult{colIdx: sc.ColIdx, vals: vals}
+			genResults[k] = seriesResult{colIdx: sc.ColIdx, vals: vals}
+			if len(vals) > maxLen {
+				maxLen = len(vals)
+			}
+		}
+
+		// Evaluate user-defined SETOF SQL functions. M0097-0020.
+		type userSrfResult struct {
+			colIdx int
+			vals   []Datum
+		}
+		userResults := make([]userSrfResult, len(o.plan.UserSrfCols))
+		for k, usc := range o.plan.UserSrfCols {
+			args := make([]Datum, len(usc.Args))
+			for j, arg := range usc.Args {
+				d, err := evalExpr(arg, childRow, ctx)
+				if err != nil {
+					return err
+				}
+				args[j] = d
+			}
+			vals, err := evalSQLFunctionSetof(usc.Routine, args, ctx, usc.FuncPos)
+			if err != nil {
+				return err
+			}
+			userResults[k] = userSrfResult{colIdx: usc.ColIdx, vals: vals}
 			if len(vals) > maxLen {
 				maxLen = len(vals)
 			}
@@ -158,11 +183,18 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 		for step := 0; step < maxLen; step++ {
 			outRow := make(Row, n)
 			copy(outRow, otherVals)
-			for _, sr := range results {
+			for _, sr := range genResults {
 				if step < len(sr.vals) {
 					outRow[sr.colIdx] = NewIntDatum(sr.vals[step])
 				} else {
 					outRow[sr.colIdx] = Datum{} // NULL
+				}
+			}
+			for _, ur := range userResults {
+				if step < len(ur.vals) {
+					outRow[ur.colIdx] = ur.vals[step]
+				} else {
+					outRow[ur.colIdx] = Datum{} // NULL
 				}
 			}
 			o.rows = append(o.rows, outRow)

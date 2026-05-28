@@ -43,7 +43,7 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 		return nil, err
 	}
 	// Accept optional SETOF modifier (set-returning functions). M0096-0007.
-	_ = p.acceptIdentKeyword("setof")
+	returnsSet := p.acceptIdentKeyword("setof")
 	retType, err := p.parseColumnType()
 	if err != nil {
 		return nil, err
@@ -54,6 +54,7 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 		Name:       name,
 		Args:       args,
 		ReturnType: retType,
+		ReturnsSet: returnsSet,
 	}
 	// The LANGUAGE / AS clauses can appear in either order (mirrors
 	// upstream). Loop until both have been seen or we hit an

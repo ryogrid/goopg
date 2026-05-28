@@ -287,6 +287,16 @@ type IndirectionStar struct {
 func (e *IndirectionStar) Pos() int { return e.pos }
 func (*IndirectionStar) exprNode()  {}
 
+// RowExpr represents a row constructor `(a, b, c)` (shorthand for ROW(a,b,c)).
+// Emitted by parsePrimary when a comma follows the first parenthesised expression. M0097-0020.
+type RowExpr struct {
+	pos   int
+	Elems []Expr
+}
+
+func (e *RowExpr) Pos() int { return e.pos }
+func (*RowExpr) exprNode()  {}
+
 // BinaryOp is `Left Op Right` for the arithmetic, string-concat,
 // comparison, and boolean operators v0 recognises.
 //

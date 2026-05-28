@@ -1052,6 +1052,15 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{}, err
 		}
 		return catalog.Type{Name: "record"}, nil
+	case *parser.RowExpr:
+		// Row constructor (a, b, c): validate each element and return text.
+		// Used in `(a,b) IN (VALUES ...)` expansion. M0097-0020.
+		for _, el := range x.Elems {
+			if _, err := analyzeExpr(el, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		return catalog.Type{Name: "text"}, nil
 	case *parser.ArrayConstructorExpr:
 		// ARRAY[e1, e2, ...] constructor — walk each element for analysis
 		// errors and return a generic text[] type. The planner's resolveExpr
@@ -1254,6 +1263,19 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 			}
 			if match != nil {
 				return catalog.Type{Name: "tid"}, true, nil
+			}
+		}
+		// Whole-row variable: unqualified column name matches a binding alias → composite (text). M0097-0020.
+		for _, rel := range ctx.rels {
+			if rel.qualifiedOnly {
+				continue
+			}
+			name := rel.alias
+			if name == "" {
+				name = rel.table.Name
+			}
+			if strings.EqualFold(x.Column, name) {
+				return catalog.Type{Name: "text"}, true, nil
 			}
 		}
 		return catalog.Type{}, false, nil

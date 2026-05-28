@@ -2186,21 +2186,72 @@ func planStandaloneValuesSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node
 // planValuesSubquery plans a `(VALUES (r1), (r2), ...) AS alias (col1, col2)`
 // subquery in the FROM clause. The column names come from the alias column list
 // or from synthetic names like "column1", "column2". M0097-0003.
-func planValuesSubquery(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+//
+// lateralCtx provides outer-scope bindings for LATERAL contexts. When
+// non-nil, qualified star expressions like `n.*` are expanded to the columns
+// of the named table binding (may be 0 columns for a table with no columns).
+// M0097-0020.
+func planValuesSubquery(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	rows := rv.Subquery.ValuesRows
 	if len(rows) == 0 {
 		return nil, rangeBinding{}, &PlanError{Pos: rv.Pos(), Code: "0A000", Message: "VALUES must have at least one row"}
 	}
-	nCols := len(rows[0])
-	ctx := &resolveContext{} // no column refs allowed in VALUES
+	ctx := &resolveContext{cat: cat} // cat needed so scalar subqueries inside VALUES can be planned. M0097-0020.
+	if lateralCtx != nil {
+		ctx.parent = lateralCtx
+	}
+
+	// Expand any star expressions in the first row to determine nCols.
+	// `tbl.*` in a LATERAL VALUES expands to all columns of tbl. M0097-0020.
+	expandRow := func(row []parser.Expr) ([]parser.Expr, error) {
+		var out []parser.Expr
+		for _, e := range row {
+			star, ok := e.(*parser.StarExpr)
+			if !ok || star.Table == "" || lateralCtx == nil {
+				out = append(out, e)
+				continue
+			}
+			// Qualified star: expand to columns of the named table.
+			expanded := false
+			for _, b := range lateralCtx.bindings {
+				tname := b.alias
+				if tname == "" {
+					tname = b.table.Name
+				}
+				if !strings.EqualFold(star.Table, tname) {
+					continue
+				}
+				for _, c := range b.table.Columns {
+					out = append(out, &parser.ColumnRef{Column: c.Name})
+				}
+				expanded = true
+				break
+			}
+			if !expanded {
+				out = append(out, e) // leave as-is; will error later
+			}
+		}
+		return out, nil
+	}
+
+	expandedFirst, err := expandRow(rows[0])
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	nCols := len(expandedFirst)
+
 	planRows := make([][]Expr, len(rows))
 	for i, row := range rows {
-		if len(row) != nCols {
+		expanded, err := expandRow(row)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		if len(expanded) != nCols {
 			return nil, rangeBinding{}, &PlanError{Pos: rv.Pos(), Code: "42601",
-				Message: fmt.Sprintf("VALUES row %d has wrong number of columns: expected %d, got %d", i+1, nCols, len(row))}
+				Message: fmt.Sprintf("VALUES row %d has wrong number of columns: expected %d, got %d", i+1, nCols, len(expanded))}
 		}
 		planRow := make([]Expr, nCols)
-		for j, e := range row {
+		for j, e := range expanded {
 			r, err := resolveExpr(e, ctx)
 			if err != nil {
 				return nil, rangeBinding{}, err
@@ -2242,9 +2293,9 @@ func planValuesSubquery(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding
 // uses.
 func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	// Handle bare VALUES(...) subquery: `FROM (VALUES (r1), (r2)) AS t(c1, c2)`.
-	// M0097-0003.
+	// M0097-0003. Pass lateralCtx so qualified star (n.*) can be expanded. M0097-0020.
 	if len(rv.Subquery.ValuesRows) > 0 {
-		return planValuesSubquery(rv, sourceIdx)
+		return planValuesSubquery(rv, cat, sourceIdx, lateralCtx)
 	}
 	// LATERAL subquery: use planSelectWithParent so the inner SELECT can
 	// resolve correlated references to outer-scope columns. M0097-0064.
@@ -2370,12 +2421,12 @@ func projectSetCompositeSchema(name string) Schema {
 	return nil
 }
 
-// buildSelectSrfProjectSet detects generate_series(...) calls in the SELECT
-// target list and wraps the child node in a ProjectSet that expands the SRFs.
-// Multiple generate_series calls in the same SELECT list are "zipped" together
+// buildSelectSrfProjectSet detects generate_series(...) and user-defined SETOF
+// function calls in the SELECT target list and wraps the child node in a
+// ProjectSet that expands the SRFs. Multiple SRF calls are "zipped" together
 // (each step advances all SRFs in lockstep; NULL-pads the shorter ones).
 // Non-SRF targets are evaluated once per child row and repeated for each step.
-// Returns nil, nil when no SRF is present in the target list. M0097-0045.
+// Returns nil, nil when no SRF is present in the target list. M0097-0045/0020.
 func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveContext) (*ProjectSet, error) {
 	type srfEntry struct {
 		colIdx int
@@ -2383,32 +2434,57 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		stop   parser.Expr
 		step   parser.Expr // may be nil
 	}
+	type userSrfEntry struct {
+		colIdx  int
+		fc      *parser.FuncCall
+		routine *catalog.Routine
+	}
 	var srfs []srfEntry
+	var userSrfs []userSrfEntry
+	var rs *catalog.Routines
+	if ctx != nil && ctx.cat != nil {
+		rs = ctx.cat.Routines()
+	}
 	for i, t := range s.Targets {
 		fc, ok := t.Expr.(*parser.FuncCall)
 		if !ok {
 			continue
 		}
-		if !strings.EqualFold(fc.Name.Name, "generate_series") {
+		if strings.EqualFold(fc.Name.Name, "generate_series") {
+			if len(fc.Args) < 2 || len(fc.Args) > 3 {
+				return nil, &PlanError{Pos: fc.Pos(), Code: "42883",
+					Message: "generate_series requires 2 or 3 arguments"}
+			}
+			e := srfEntry{colIdx: i, start: fc.Args[0], stop: fc.Args[1]}
+			if len(fc.Args) == 3 {
+				e.step = fc.Args[2]
+			}
+			srfs = append(srfs, e)
 			continue
 		}
-		if len(fc.Args) < 2 || len(fc.Args) > 3 {
-			return nil, &PlanError{Pos: fc.Pos(), Code: "42883",
-				Message: "generate_series requires 2 or 3 arguments"}
+		// Check if the function is a user-defined SETOF SQL function. M0097-0020.
+		if rs != nil {
+			candidates := rs.LookupByName(fc.Name)
+			for _, r := range candidates {
+				if r.ReturnsSet && strings.EqualFold(r.Language, "sql") {
+					if len(r.ArgTypes) == len(fc.Args) {
+						userSrfs = append(userSrfs, userSrfEntry{colIdx: i, fc: fc, routine: r})
+						break
+					}
+				}
+			}
 		}
-		e := srfEntry{colIdx: i, start: fc.Args[0], stop: fc.Args[1]}
-		if len(fc.Args) == 3 {
-			e.step = fc.Args[2]
-		}
-		srfs = append(srfs, e)
 	}
-	if len(srfs) == 0 {
+	if len(srfs) == 0 && len(userSrfs) == 0 {
 		return nil, nil
 	}
 
 	// Build per-column resolved expressions.
-	srfColMap := make(map[int]bool, len(srfs))
+	srfColMap := make(map[int]bool, len(srfs)+len(userSrfs))
 	for _, e := range srfs {
+		srfColMap[e.colIdx] = true
+	}
+	for _, e := range userSrfs {
 		srfColMap[e.colIdx] = true
 	}
 
@@ -2417,11 +2493,24 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	for i, t := range s.Targets {
 		alias := t.Alias
 		if srfColMap[i] {
+			// SRF column: determine output name and type.
 			name := alias
 			if name == "" {
-				name = "generate_series"
+				if fc, ok := t.Expr.(*parser.FuncCall); ok {
+					name = strings.ToLower(fc.Name.Name)
+				} else {
+					name = "?column?"
+				}
 			}
-			schema[i] = SchemaColumn{Name: name, Type: catalog.Type{Name: "int8"}}
+			retType := catalog.Type{Name: "int8"} // generate_series default
+			// Check if this is a user SRF and get its return type.
+			for _, u := range userSrfs {
+				if u.colIdx == i {
+					retType = catalog.Type{Name: u.routine.ReturnType.Name}
+					break
+				}
+			}
+			schema[i] = SchemaColumn{Name: name, Type: retType}
 			// otherExprs[i] stays nil — executor fills this from SRF
 		} else {
 			expr, err := resolveExpr(t.Expr, ctx)
@@ -2438,7 +2527,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		}
 	}
 
-	// Resolve SRF args against ctx (may reference FROM-clause columns).
+	// Resolve generate_series SRF args against ctx.
 	srfCols := make([]SrfCol, len(srfs))
 	for k, e := range srfs {
 		start, err := resolveExpr(e.start, ctx)
@@ -2459,12 +2548,27 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		srfCols[k] = SrfCol{ColIdx: e.colIdx, Start: start, Stop: stop, Step: step}
 	}
 
+	// Resolve user SETOF function args against ctx. M0097-0020.
+	userSrfCols := make([]UserSrfCol, len(userSrfs))
+	for k, u := range userSrfs {
+		resolvedArgs := make([]Expr, len(u.fc.Args))
+		for j, arg := range u.fc.Args {
+			ra, err := resolveExpr(arg, ctx)
+			if err != nil {
+				return nil, err
+			}
+			resolvedArgs[j] = ra
+		}
+		userSrfCols[k] = UserSrfCol{ColIdx: u.colIdx, FuncPos: u.fc.Pos(), Args: resolvedArgs, Routine: u.routine}
+	}
+
 	return &ProjectSet{
-		pos:        s.Pos(),
-		Child:      child,
-		SrfCols:    srfCols,
-		OtherExprs: otherExprs,
-		schema:     schema,
+		pos:         s.Pos(),
+		Child:       child,
+		SrfCols:     srfCols,
+		UserSrfCols: userSrfCols,
+		OtherExprs:  otherExprs,
+		schema:      schema,
 	}, nil
 }
 
@@ -5303,6 +5407,13 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if cr, ok := e.(*ColumnRef); ok {
 		return cr.Name, cr.Type
 	}
+	// Whole-row variable: resolveExpr converts *parser.ColumnRef → *RowExpr.
+	// Name comes from the original column reference. M0097-0020.
+	if _, ok := e.(*RowExpr); ok {
+		if cr, ok := t.Expr.(*parser.ColumnRef); ok {
+			return cr.Column, exprType(e)
+		}
+	}
 	if _, ok := e.(*CTIDExpr); ok {
 		return "ctid", catalog.Type{Name: "tid"}
 	}
@@ -5416,6 +5527,8 @@ func exprType(e Expr) catalog.Type {
 		return catalog.Type{Name: "bool"}
 	case *NullConst:
 		return catalog.Type{Name: "unknown"}
+	case *RowExpr:
+		return catalog.Type{Name: "text"} // composite displayed as text
 	case *TypedStringLit:
 		// Typed string literals carry their explicit type (e.g. int2 '2').
 		// Return it so downstream type inference (BinaryOp etc.) can use it.
@@ -5716,11 +5829,70 @@ func planSubqueryExpr(x *parser.SubqueryExpr, parent *resolveContext) (Expr, err
 	return &SubqueryExpr{pos: x.Pos(), Plan: inner, IsNonCorrelated: !planHasOuterRef(inner)}, nil
 }
 
+// planRowExprIn expands `(a,b) [NOT] IN (VALUES (v1a,v1b),(v2a,v2b),...)` into
+// nested AND/OR comparisons at plan time, avoiding a multi-column subquery
+// in the executor. M0097-0020.
+func planRowExprIn(row *parser.RowExpr, valuesRows [][]parser.Expr, negated bool, pos int, ctx *resolveContext) (Expr, error) {
+	nCols := len(row.Elems)
+	var orTerms []Expr
+	for _, vrow := range valuesRows {
+		if len(vrow) != nCols {
+			return nil, &PlanError{Pos: pos, Code: "42601",
+				Message: fmt.Sprintf("row value has %d columns but IN list has %d columns", nCols, len(vrow))}
+		}
+		// Build AND(a=v1, b=v2, ...) for this values row.
+		var andTerms []Expr
+		for j, lhsExpr := range row.Elems {
+			lhs, err := resolveExpr(lhsExpr, ctx)
+			if err != nil {
+				return nil, err
+			}
+			rhs, err := resolveExpr(vrow[j], ctx)
+			if err != nil {
+				return nil, err
+			}
+			cmp := &BinaryOp{pos: pos, Op: parser.OpEq, Left: lhs, Right: rhs}
+			andTerms = append(andTerms, cmp)
+		}
+		var andExpr Expr
+		if len(andTerms) == 1 {
+			andExpr = andTerms[0]
+		} else {
+			andExpr = andTerms[0]
+			for _, t := range andTerms[1:] {
+				andExpr = &BinaryOp{pos: pos, Op: parser.OpAnd, Left: andExpr, Right: t}
+			}
+		}
+		orTerms = append(orTerms, andExpr)
+	}
+	if len(orTerms) == 0 {
+		return &BooleanConst{pos: pos, Value: negated}, nil
+	}
+	var orExpr Expr
+	if len(orTerms) == 1 {
+		orExpr = orTerms[0]
+	} else {
+		orExpr = orTerms[0]
+		for _, t := range orTerms[1:] {
+			orExpr = &BinaryOp{pos: pos, Op: parser.OpOr, Left: orExpr, Right: t}
+		}
+	}
+	if negated {
+		return &UnaryOp{pos: pos, Op: parser.OpNot, Operand: orExpr}, nil
+	}
+	return orExpr, nil
+}
+
 // planInExpr resolves the operand and either plans the inner
 // subquery (passing the outer ctx as parent for correlated
 // references) or recursively resolves the value list,
 // depending on which the parser produced.
 func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
+	// Row constructor IN (VALUES ...): expand to OR(AND(a=v1,b=v1b), ...) at plan time.
+	// M0097-0020.
+	if rowExpr, ok := x.Operand.(*parser.RowExpr); ok && x.Subquery != nil && len(x.Subquery.ValuesRows) > 0 {
+		return planRowExprIn(rowExpr, x.Subquery.ValuesRows, x.Negated, x.Pos(), ctx)
+	}
 	op, err := resolveExpr(x.Operand, ctx)
 	if err != nil {
 		return nil, err
@@ -5912,6 +6084,18 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		return planInExpr(x, ctx)
 	case *parser.ExistsExpr:
 		return planExistsExpr(x, ctx)
+	case *parser.RowExpr:
+		elems := make([]Expr, len(x.Elems))
+		types := make([]catalog.Type, len(x.Elems))
+		for i, elem := range x.Elems {
+			re, err := resolveExpr(elem, ctx)
+			if err != nil {
+				return nil, err
+			}
+			elems[i] = re
+			types[i] = exprType(re)
+		}
+		return &RowExpr{pos: x.Pos(), Elems: elems, Types: types}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExpr(x.Source, ctx)
 		if err != nil {
@@ -6233,6 +6417,32 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 	}
 	if found != nil {
 		return found, true, nil
+	}
+	// Whole-row variable: unqualified column name matches a binding alias → composite row.
+	// E.g. `select foo from (select 1) as foo` returns `(1)`. M0097-0020.
+	for _, b := range ctx.bindings {
+		if b.qualifiedOnly {
+			continue
+		}
+		name := b.alias
+		if name == "" {
+			name = b.table.Name
+		}
+		if !strings.EqualFold(x.Column, name) {
+			continue
+		}
+		elems := make([]Expr, len(b.table.Columns))
+		types := make([]catalog.Type, len(b.table.Columns))
+		for i, c := range b.table.Columns {
+			idx := b.offset + i
+			if level == 0 {
+				elems[i] = &ColumnRef{pos: x.Pos(), Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}
+			} else {
+				elems[i] = &OuterColumnRef{pos: x.Pos(), Level: level, Index: idx, Name: c.Name, Type: c.Type, SourceTableIdx: b.sourceIdx}
+			}
+			types[i] = c.Type
+		}
+		return &RowExpr{pos: x.Pos(), Elems: elems, Types: types}, true, nil
 	}
 	return nil, false, nil
 }

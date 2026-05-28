@@ -2277,6 +2277,21 @@ func (p *parser) parsePrimary() (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Row constructor: `(a, b, ...)` — collect remaining elements. M0097-0020.
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+				elems := []Expr{inner}
+				for p.acceptSymbol(",") {
+					next, err := p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+					elems = append(elems, next)
+				}
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+				return &RowExpr{pos: t.Pos, Elems: elems}, nil
+			}
 			if !p.acceptSymbol(")") {
 				return nil, p.errAtCur("expected ')'")
 			}
@@ -2488,8 +2503,8 @@ func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '(' after IN")
 	}
-	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
-		// SELECT … INTO is not permitted in an IN subquery (M0097-0020).
+	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
+		// SELECT/VALUES … inside IN (...). M0097-0020.
 		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
 		p.selectIntoNoPos = false

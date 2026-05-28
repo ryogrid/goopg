@@ -1469,6 +1469,7 @@ type CreateFunctionStmt struct {
 	Name       ObjectName
 	Args       []FunctionArg
 	ReturnType ColumnType
+	ReturnsSet bool   // RETURNS SETOF ... M0097-0020
 	Language   string // lower-cased, e.g. "plpgsql"
 	Body       string // raw source between the dollar-quote delimiters
 }

@@ -183,6 +183,80 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	return coerced, nil
 }
 
+// evalSQLFunctionSetof calls a SETOF SQL function and returns all rows as
+// []Datum (first column of each row). Used by the ProjectSet operator for
+// user-defined SETOF functions in SELECT target lists. M0097-0020.
+func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos int) ([]Datum, error) {
+	body := r.Body
+	if len(r.ArgNames) > 0 {
+		body = rewriteSQLNamedParams(body, r.ArgNames)
+	}
+	stmts, err := parser.Parse(body)
+	if err != nil {
+		return nil, &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for function %s: %v", r.QualifiedName(), err)}
+	}
+	if len(stmts) != 1 {
+		return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("SQL function %s must contain exactly one statement in v0", r.QualifiedName())}
+	}
+	child := NewContext()
+	if ctx != nil {
+		*child = *ctx
+	}
+	child.Notices = nil
+	child.Params = make([]Datum, len(args))
+	for i, arg := range args {
+		declared := catalog.Type{Name: "unknown"}
+		if i < len(r.ArgTypes) {
+			declared = normalizeCatalogType(r.ArgTypes[i])
+		}
+		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
+		if err != nil {
+			return nil, err
+		}
+		child.Params[i] = coerced
+	}
+	node, err := planner.Plan(stmts[0], child.Catalog)
+	if err != nil {
+		return nil, err
+	}
+	op, err := Build(node)
+	if err != nil {
+		return nil, err
+	}
+	if err := op.Open(child); err != nil {
+		_ = op.Close()
+		return nil, err
+	}
+	defer op.Close()
+	var out []Datum
+	retType := normalizeCatalogType(r.ReturnType)
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		row := slotRow(slot)
+		if len(row) == 0 {
+			out = append(out, NullDatum)
+			continue
+		}
+		coerced, err := coerceDatumToType(row[0], retType, pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, coerced)
+	}
+	if ctx != nil {
+		for _, n := range child.TakeNotices() {
+			ctx.AddNotice(n)
+		}
+	}
+	return out, nil
+}
+
 func routineRegistry(ctx *Context) *catalog.Routines {
 	if ctx == nil || ctx.Catalog == nil {
 		return nil

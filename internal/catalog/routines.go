@@ -38,6 +38,7 @@ type Routine struct {
 	ArgTypes   []Type
 	ArgModes   []string // parallel to ArgTypes; "i"=IN, "o"=OUT, "b"=INOUT, "v"=VARIADIC; nil=all IN
 	ReturnType Type
+	ReturnsSet bool   // RETURNS SETOF ... M0097-0020
 	Language   string // lower-cased
 	Body       string // raw routine source between the dollar-quote delimiters
 }

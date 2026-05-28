@@ -119,6 +119,8 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		return evalInExpr(x, slot, ctx)
 	case *planner.ExistsExpr:
 		return evalExistsExpr(x, slotToRow(slot), ctx)
+	case *planner.RowExpr:
+		return evalRowExpr(x, slot, ctx)
 	case *planner.TypedStringLit:
 		return evalTypedStringLit(x)
 	case *planner.IntervalLit:
@@ -6815,6 +6817,52 @@ func enumTypeNameFromArgs(args []planner.Expr) string {
 		}
 	}
 	return ""
+}
+
+// evalRowExpr evaluates a row constructor `(a, b, c)` and returns its
+// PostgreSQL composite text representation `(v1,v2,...,vN)`. NULL elements
+// appear as empty fields. Used for whole-row variable refs. M0097-0020.
+func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
+	parts := make([]string, len(x.Elems))
+	for i, elem := range x.Elems {
+		d, err := evalExprSlot(elem, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if d.IsNull() {
+			parts[i] = ""
+			continue
+		}
+		s := string(d.AppendValueText(nil))
+		// Quote values that need it in composite syntax: commas, parens,
+		// double-quotes, backslashes, whitespace, or empty string.
+		needsQuote := false
+		if s == "" {
+			needsQuote = true
+		} else {
+			for _, c := range s {
+				if c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == ' ' || c == '\t' || c == '\n' {
+					needsQuote = true
+					break
+				}
+			}
+		}
+		if needsQuote {
+			var b strings.Builder
+			b.WriteByte('"')
+			for _, c := range s {
+				if c == '"' || c == '\\' {
+					b.WriteByte('\\')
+				}
+				b.WriteRune(c)
+			}
+			b.WriteByte('"')
+			parts[i] = b.String()
+		} else {
+			parts[i] = s
+		}
+	}
+	return NewStringDatum("(" + strings.Join(parts, ",") + ")"), nil
 }
 
 // parseTZHourMin parses "HH" or "HH:MM" into hours and minutes.
