@@ -411,6 +411,12 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 	r.MustRegister(NewVariable(Variable{
+		Name: "max_parallel_maintenance_workers", Type: TypeInt, BootVal: "2",
+		MinVal: 0, MaxVal: 1024,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
 		Name: "min_parallel_table_scan_size", Type: TypeInt, Unit: UnitKB, BootVal: "8388608",
 		MinVal: 0, MaxVal: 715827882,
 		Context: ContextUserset,

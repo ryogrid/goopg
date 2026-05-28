@@ -1146,6 +1146,9 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			col.NotNull = true
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull:
 			p.advance() // NULL is the default; absorb it
+		// COLLATE collation_name — ignore collation; goopg v0 doesn't track collations. M0097-0071.
+		case p.acceptIdentKeyword("collate"):
+			_, _ = p.parseIdent() // consume collation name (may be quoted)
 		// GENERATED ALWAYS AS (expr) STORED  (M0096-0008)
 		case p.acceptIdentKeyword("generated"):
 			if !p.acceptIdentKeyword("always") {
