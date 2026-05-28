@@ -1814,6 +1814,19 @@ func (c *InMemory) registerSystemTables() {
 			{"enable_tidscan", "on", "", "Query Tuning / Planner Method Configuration",
 				"Enables the planner's use of TID scan plans.", "",
 				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
+			// Additional planner GUCs needed for regress tests. M0097-0069.
+			{"from_collapse_limit", "8", "", "Query Tuning / Planner Cost Constants",
+				"Sets the FROM-list size beyond which subqueries are not collapsed.", "",
+				"user", "integer", "default", "1", "2147483647", "", "8", "8", "", "", "f"},
+			{"join_collapse_limit", "8", "", "Query Tuning / Planner Cost Constants",
+				"Sets the FROM-list size beyond which JOIN constructs are not flattened.", "",
+				"user", "integer", "default", "1", "2147483647", "", "8", "8", "", "", "f"},
+			{"hash_mem_multiplier", "2.0", "", "Query Tuning / Planner Cost Constants",
+				"Multiple of work_mem to use for hash tables.", "",
+				"user", "real", "default", "1", "1000", "", "2", "2", "", "", "f"},
+			{"parallel_leader_participation", "on", "", "Query Tuning / Planner Method Configuration",
+				"Controls whether Gather and Gather Merge also run subplans.", "",
+				"user", "bool", "default", "", "", "", "on", "on", "", "", "f"},
 		}
 		// PostgreSQL's pg_settings view is backed by the alphabetically
 		// sorted GUC table, so callers that query it without ORDER BY (e.g.

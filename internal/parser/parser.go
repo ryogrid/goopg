@@ -875,12 +875,20 @@ func (p *parser) parseVacuumOptionList(v *VacuumStmt) error {
 		switch {
 		case p.acceptKeyword(KwVerbose):
 			v.Verbose = true
+			_ = p.acceptKeyword(KwTrue) || p.acceptKeyword(KwFalse) ||
+				p.acceptIdentKeyword("true") || p.acceptIdentKeyword("false")
 		case p.acceptKeyword(KwAnalyze) || p.acceptKeyword(KwAnalyse):
 			v.Analyze = true
+			_ = p.acceptKeyword(KwTrue) || p.acceptKeyword(KwFalse) ||
+				p.acceptIdentKeyword("true") || p.acceptIdentKeyword("false")
 		case p.acceptKeyword(KwFull):
 			v.Full = true
+			_ = p.acceptKeyword(KwTrue) || p.acceptKeyword(KwFalse) ||
+				p.acceptIdentKeyword("true") || p.acceptIdentKeyword("false")
 		case p.acceptKeyword(KwFreeze):
 			v.Freeze = true
+			_ = p.acceptKeyword(KwTrue) || p.acceptKeyword(KwFalse) ||
+				p.acceptIdentKeyword("true") || p.acceptIdentKeyword("false")
 		case p.acceptIdentKeyword("disable_page_skipping"):
 			v.DisablePageSkipping = true
 		case p.acceptIdentKeyword("skip_database_stats"):

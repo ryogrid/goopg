@@ -41,12 +41,12 @@ partition_info,185,failed
 timetz,0,pass
 pg_lsn,0,pass
 misc,260,failed
-tidscan,116,failed
+tidscan,84,failed
 temp,281,failed
 txid,287,failed
 index_including,257,failed
 tidrangescan,171,failed
-truncate,311,failed
+truncate,289,failed
 plancache,196,failed
 create_procedure,324,failed
 text,0,pass
@@ -77,7 +77,7 @@ explain,731,failed
 insert,702,failed
 fast_default,729,failed
 returning,557,failed
-join_hash,191,failed
+join_hash,150,failed
 copy2,919,failed
 select,68,failed
 int8,613,failed

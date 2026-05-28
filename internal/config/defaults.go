@@ -518,7 +518,7 @@ func BuildDefaultRegistry() *Registry {
 	// Planner toggle GUCs. Upstream uses them for testing (`SET
 	// enable_seqscan = off` to force an index plan). v0's planner
 	// ignores them — the rule-based decisions still apply — but
-	// the SET succeeds so test scripts don't trip.
+	// the SET succeeds so test scripts don't trip. M0097-0069.
 	for _, name := range []string{
 		"enable_seqscan", "enable_indexscan", "enable_indexonlyscan",
 		"enable_bitmapscan", "enable_hashjoin", "enable_mergejoin",
@@ -528,6 +528,15 @@ func BuildDefaultRegistry() *Registry {
 		// `off` keeps the legacy Hash plan for joins that the
 		// rule would otherwise rewrite.
 		"enable_nestloop_index",
+		// Additional planner method toggles present in catalog pg_settings
+		// but missing from the registry — needed so SET succeeds. M0097-0069.
+		"enable_partitionwise_join", "enable_partitionwise_aggregate",
+		"enable_parallel_hash", "enable_parallel_append",
+		"enable_gathermerge", "enable_incremental_sort",
+		"enable_async_append", "enable_memoize",
+		"enable_presorted_aggregate", "enable_distinct_reordering",
+		"enable_group_by_reordering", "enable_self_join_elimination",
+		"enable_tidscan",
 	} {
 		r.MustRegister(NewVariable(Variable{
 			Name: name, Type: TypeBool, BootVal: "on",
@@ -535,6 +544,28 @@ func BuildDefaultRegistry() *Registry {
 			Scope:   ScopeSession | ScopeTransaction,
 		}))
 	}
+
+	// Additional planner cost/limit GUCs. v0 ignores them but registers
+	// them so SET succeeds. M0097-0069.
+	r.MustRegister(NewVariable(Variable{
+		Name: "parallel_leader_participation", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "from_collapse_limit", Type: TypeInt, BootVal: "8",
+		MinVal: 1, MaxVal: 2147483647,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "join_collapse_limit", Type: TypeInt, BootVal: "8",
+		MinVal: 1, MaxVal: 2147483647,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "hash_mem_multiplier", Type: TypeReal, BootVal: "2.0",
+		MinVal: 1, MaxVal: 1000,
+		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+	}))
 
 	// Time-bounded session GUCs commonly issued by JDBC / pgbouncer.
 	r.MustRegister(NewVariable(Variable{

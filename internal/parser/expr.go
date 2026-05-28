@@ -96,11 +96,12 @@ func (*IntervalLit) exprNode()  {}
 // in the inner set follow upstream's three-valued semantics:
 // `x IN (a, NULL)` returns NULL when x doesn't match a.
 type InExpr struct {
-	pos      int
-	Operand  Expr
-	Negated  bool         // NOT IN
-	Subquery *SelectStmt  // populated for IN (subquery)
-	List     []Expr       // populated for IN (val_list)
+	pos         int
+	Operand     Expr
+	Negated     bool        // NOT IN
+	NotEqualAny bool        // != ANY semantics (OR of != comparisons). M0097-0067.
+	Subquery    *SelectStmt // populated for IN (subquery)
+	List        []Expr      // populated for IN (val_list)
 }
 
 func (e *InExpr) Pos() int { return e.pos }

@@ -2962,18 +2962,31 @@ func (p *parser) parseDropDomain(pos int) (Stmt, error) {
 	return &DropDomainStmt{pos: pos, Names: names, IfExists: ifExists, Cascade: cascade}, nil
 }
 
-// parseTruncate: TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT].
+// parseTruncate: TRUNCATE [TABLE] [ONLY] name [, [ONLY] …]
+// [RESTART IDENTITY | CONTINUE IDENTITY] [CASCADE|RESTRICT]. M0097-0069.
 func (p *parser) parseTruncate() (Stmt, error) {
 	t, err := p.expectKeyword(KwTruncate)
 	if err != nil {
 		return nil, err
 	}
 	_ = p.acceptKeyword(KwTable) // optional
-	names, err := p.parseObjectList()
-	if err != nil {
-		return nil, err
+	// Parse table list with optional ONLY prefix per entry.
+	var names []ObjectName
+	for {
+		_ = p.acceptIdentKeyword("only") // ONLY is optional before each name
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+		if !p.acceptSymbol(",") {
+			break
+		}
 	}
 	stmt := &TruncateStmt{pos: t.Pos, Names: names}
+	// Optional RESTART IDENTITY | CONTINUE IDENTITY clause.
+	_ = p.acceptIdentKeyword("restart") && p.acceptIdentKeyword("identity") ||
+		p.acceptIdentKeyword("continue") && p.acceptIdentKeyword("identity")
 	switch {
 	case p.acceptKeyword(KwCascade):
 		stmt.Behavior = DropCascade

@@ -3690,7 +3690,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if x.Subquery != nil {
 			return planInExpr(x, win.input)
 		}
-		return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, List: list}, nil
+		return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, List: list}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExprAfterWindow(x.Operand, win)
 		if err != nil {
@@ -5725,7 +5725,7 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated}
+	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny}
 	if x.Subquery != nil {
 		if ctx == nil || ctx.cat == nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "IN (subquery) not supported in this context"}

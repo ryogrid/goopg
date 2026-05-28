@@ -1702,18 +1702,26 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 		}
 
 		// `expr = ANY (array[...])` — desugar to `expr IN (...)`.
-		// Used by vacuumdb catalog queries: `relkind = ANY (array['r','m'])`.
-		// Only the `= ANY` form is handled; `<> ANY` etc. are not emitted
-		// by vacuumdb so they remain deferred.
+		// `expr != ANY (array[...])` / `expr <> ANY (...)` — desugar to
+		// `expr NOT IN (...)` (semantically "at least one element is !=",
+		// which for a finite non-null list equals NOT IN). M0097-0067.
 		if precCompare >= min {
-			if t := p.cur(); t.Kind == TokenOperator && t.Value == "=" &&
+			if t := p.cur(); t.Kind == TokenOperator && (t.Value == "=" || t.Value == "!=" || t.Value == "<>") &&
 				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwAny {
+				notEq := t.Value != "="
 				pos := t.Pos
-				p.advance() // =
+				p.advance() // = / != / <>
 				p.advance() // ANY
 				inExpr, err := p.parseAnyTail(left, pos)
 				if err != nil {
 					return nil, err
+				}
+				if notEq {
+					// != ANY → mark as NotEqualAny (OR of != comparisons),
+					// not as Negated/NOT IN (AND of != comparisons). M0097-0067.
+					if ie, ok := inExpr.(*InExpr); ok {
+						ie.NotEqualAny = true
+					}
 				}
 				left = inExpr
 				continue
@@ -1859,6 +1867,13 @@ func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 		p.advance() // [
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
 			p.advance()
+			// Consume optional `::type[]` cast after empty ARRAY[]. M0097-0067.
+			for p.cur().Kind == TokenOperator && p.cur().Value == "::" {
+				dummy := &NullConst{}
+				if _, err := p.parseCastTail(dummy); err != nil {
+					return nil, err
+				}
+			}
 		} else {
 			first, err := p.parseExpr()
 			if err != nil {
@@ -1874,6 +1889,16 @@ func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 			}
 			if !p.acceptSymbol("]") {
 				return nil, p.errAtCur("expected ']'")
+			}
+			// Consume optional `::type[]` cast after ARRAY[...] — e.g.
+			// ctid = ANY(ARRAY['(0,1)','(0,2)']::tid[]).
+			// We already have the elements; the cast type is discarded since
+			// InExpr coerces at runtime. M0097-0067.
+			for p.cur().Kind == TokenOperator && p.cur().Value == "::" {
+				dummy := &NullConst{}
+				if _, err := p.parseCastTail(dummy); err != nil {
+					return nil, err
+				}
 			}
 		}
 	} else {

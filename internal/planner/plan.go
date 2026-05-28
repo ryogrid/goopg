@@ -182,6 +182,11 @@ type InExpr struct {
 	pos             int
 	Operand         Expr
 	Negated         bool
+	// NotEqualAny marks `x != ANY(list)` semantics: true if operand is
+	// not equal to at least one element in List (OR of != comparisons).
+	// Distinct from Negated which means NOT IN (AND of != comparisons).
+	// M0097-0067.
+	NotEqualAny     bool
 	Plan            Node // populated when the source is a subquery
 	List            []Expr
 	IsNonCorrelated bool

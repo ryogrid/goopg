@@ -2834,6 +2834,25 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 	if err != nil {
 		return Datum{}, err
 	}
+	// != ANY semantics: return true if operand != at least one element (OR
+	// of inequality comparisons). M0097-0067.
+	if x.NotEqualAny {
+		for _, v := range values {
+			if v.IsNull() {
+				continue // skip nulls in the list
+			}
+			eq, err := compareEq(operand, v)
+			if err != nil {
+				return Datum{}, err
+			}
+			if !(eq.Kind == KindBool && eq.BoolValue()) {
+				// operand != v → found at least one mismatch → true
+				return NewBoolDatum(true), nil
+			}
+		}
+		// All elements equal operand (or list empty) → false
+		return NewBoolDatum(false), nil
+	}
 	sawNull := false
 	for _, v := range values {
 		if v.IsNull() {
