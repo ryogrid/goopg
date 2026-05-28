@@ -1236,6 +1236,37 @@ M0097-0001 wires it up.
             output schema — matching the behaviour of `wrapSetOpSortLimit`.
         Baseline CSV: `union` 48→35, `join` 9933→6800.
 
+      - **Progress 2026-05-29 (M0097-0073 — explain 728→0 PASS):**
+        Seven fixes closing all blockers in `explain.sql`:
+        (a) PL/pgSQL AST: added `ReturnNextStmt` node
+            (`internal/plpgsql/ast.go`); parser detects `RETURN NEXT`
+            ident token and emits it (`internal/plpgsql/parser.go`).
+        (b) Executor: `plpgsqlFrame.returnNextRows []Datum` accumulates
+            `RETURN NEXT` values; `ReturnNextStmt` appends and continues;
+            `evalPLpgSQLFunctionSetof` drives a plpgsql SETOF body and
+            returns the accumulated rows
+            (`internal/executor/plpgsql_runtime.go`).
+        (c) `ForSelectStmt` executor: detects `EXECUTE ` prefix in the
+            captured SQL text, evaluates the remainder expression as a
+            PL/pgSQL expr to get the actual SQL string, then parses/runs
+            it — fixing `FOR ln IN EXECUTE $1 LOOP`
+            (`internal/executor/plpgsql_runtime.go`).
+        (d) Planner: extended SETOF SRF detection to include `plpgsql`
+            language (was SQL-only) so `explain_filter(text)` resolves
+            as a SRF column in SELECT target list
+            (`internal/planner/planner.go`).
+        (e) ProjectSet operator: dispatches to `evalPLpgSQLFunctionSetof`
+            for plpgsql-language user SRFs
+            (`internal/executor/operators_project_set.go`).
+        (f) `regexp_replace` / `evalPOSIXRegex`: added `pgPatternToGoRE2`
+            helper that translates `\m`/`\M` PostgreSQL word-boundary
+            anchors to `\b` before RE2 compile; avoids silent no-op on
+            invalid pattern (`internal/executor/expr.go`).
+        (g) Config: `track_io_timing` context changed from
+            `ContextPostmaster` to `ContextUserset`; added `jit`,
+            `compute_query_id`, `plan_cache_mode` GUC stubs
+            (`internal/config/defaults.go`, `postgresql.conf.sample`).
+
       - **Progress 2026-05-29 (M0097-0072 — select 137→0 PASS):**
         Three fixes closing the last 3 blockers in `select.sql`:
         (a) Analyzer: added `*parser.RowExpr` case to `analyzeExpr`

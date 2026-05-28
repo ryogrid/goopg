@@ -2466,7 +2466,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		if rs != nil {
 			candidates := rs.LookupByName(fc.Name)
 			for _, r := range candidates {
-				if r.ReturnsSet && strings.EqualFold(r.Language, "sql") {
+				if r.ReturnsSet && (strings.EqualFold(r.Language, "sql") || strings.EqualFold(r.Language, "plpgsql")) {
 					if len(r.ArgTypes) == len(fc.Args) {
 						userSrfs = append(userSrfs, userSrfEntry{colIdx: i, fc: fc, routine: r})
 						break

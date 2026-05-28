@@ -1044,15 +1044,24 @@ func (p *bodyParser) scanExprToSemicolon(ctx string) (parser.Expr, error) {
 	return expr, nil
 }
 
-// parseReturn parses `RETURN expr;`. Expression capture goes
-// through scanExprToSemicolon — same path as assignment and
-// declaration initializers — so the AST shape matches a SELECT
-// target-list expression and the future interpreter can reuse the
-// SQL evaluator without translation.
-func (p *bodyParser) parseReturn() (*ReturnStmt, error) {
+// parseReturn parses `RETURN [NEXT] expr;`. RETURN NEXT emits one row
+// from a SETOF function and continues; plain RETURN exits the function.
+func (p *bodyParser) parseReturn() (Stmt, error) {
 	retTok, err := p.expectKeyword(parser.KwReturn)
 	if err != nil {
 		return nil, err
+	}
+	// RETURN NEXT expr; — PL/pgSQL SETOF row emitter. M0097-0073.
+	if p.cur().Kind == parser.TokenIdent && strings.EqualFold(p.cur().Value, "next") {
+		p.advance() // consume NEXT
+		expr, err := p.scanExprToSemicolon("RETURN NEXT expression")
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(";") {
+			return nil, p.errAtCur("expected ';' to terminate RETURN NEXT")
+		}
+		return &ReturnNextStmt{pos: retTok.Pos, Expr: expr}, nil
 	}
 	expr, err := p.scanExprToSemicolon("RETURN expression")
 	if err != nil {

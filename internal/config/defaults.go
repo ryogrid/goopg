@@ -250,8 +250,31 @@ func BuildDefaultRegistry() *Registry {
 	// docs/design/0092-0005-lookup-goroutine-io-hooks-guc.md.
 	r.MustRegister(NewVariable(Variable{
 		Name: "track_io_timing", Type: TypeBool, BootVal: "off",
-		Context: ContextPostmaster,
+		Context: ContextUserset,
 		Scope:   ScopeServer,
+	}))
+
+	// Compatibility stubs for GUCs checked by pg_regress tests. M0097-0073.
+	r.MustRegister(NewVariable(Variable{
+		Name: "jit", Type: TypeBool, BootVal: "off",
+		Context: ContextUserset,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name:        "compute_query_id",
+		Type:        TypeEnum,
+		BootVal:     "off",
+		EnumOptions: []string{"off", "on", "auto", "regress"},
+		Context:     ContextUserset,
+		Scope:       ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name:        "plan_cache_mode",
+		Type:        TypeEnum,
+		BootVal:     "auto",
+		EnumOptions: []string{"auto", "force_generic_plan", "force_custom_plan"},
+		Context:     ContextUserset,
+		Scope:       ScopeServer,
 	}))
 
 	// wal_sender_memory_buffer sizes (in bytes) the in-memory

@@ -206,7 +206,9 @@
 # - Process Title / I/O Timing -
 
 #track_io_timing = off                  # collect per-I/O wait timing
-                                        # (change requires restart)
+#jit = off                              # allow JIT compilation
+#compute_query_id = off                 # compute query identifiers
+#plan_cache_mode = auto                 # plan cache mode
 
 
 #------------------------------------------------------------------------------

@@ -13,6 +13,8 @@ package executor
 // row and zips multiple SRFs together (parallel expansion with NULL padding).
 
 import (
+	"strings"
+
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -169,9 +171,17 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 				}
 				args[j] = d
 			}
-			vals, err := evalSQLFunctionSetof(usc.Routine, args, ctx, usc.FuncPos)
-			if err != nil {
-				return err
+			var (
+				vals   []Datum
+				srfErr error
+			)
+			if strings.EqualFold(usc.Routine.Language, "plpgsql") {
+				vals, srfErr = evalPLpgSQLFunctionSetof(usc.Routine, args, ctx, usc.FuncPos)
+			} else {
+				vals, srfErr = evalSQLFunctionSetof(usc.Routine, args, ctx, usc.FuncPos)
+			}
+			if srfErr != nil {
+				return srfErr
 			}
 			userResults[k] = userSrfResult{colIdx: usc.ColIdx, vals: vals}
 			if len(vals) > maxLen {

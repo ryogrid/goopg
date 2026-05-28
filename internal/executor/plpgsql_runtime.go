@@ -30,12 +30,15 @@ func rewriteSQLNamedParams(body string, argNames []string) string {
 // plpgsqlFrame is the local variable frame for one routine call.
 // Names are case-insensitive and map to row slots consumed by evalExpr.
 type plpgsqlFrame struct {
-	indexByName map[string]int
-	types       []catalog.Type
-	values      Row
+	indexByName    map[string]int
+	types          []catalog.Type
+	values         Row
 	// trig is non-nil when this frame is for a trigger function body.
 	// M0096-0012.
 	trig *plpgsqlTrigCtx
+	// returnNextRows accumulates values from RETURN NEXT for SETOF
+	// functions. M0097-0073.
+	returnNextRows []Datum
 }
 
 // plpgsqlTrigCtx holds the trigger execution context injected into
@@ -255,6 +258,66 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 		}
 	}
 	return out, nil
+}
+
+// evalPLpgSQLFunctionSetof calls a SETOF PL/pgSQL function via RETURN NEXT
+// accumulation and returns all collected rows. Used by the ProjectSet operator
+// for user-defined SETOF plpgsql functions in SELECT target lists. M0097-0073.
+func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos int) ([]Datum, error) {
+	block, err := plpgsql.Parse(r.Body)
+	if err != nil {
+		return nil, &ExecError{Code: "P0000", Pos: pos, Message: fmt.Sprintf("invalid PL/pgSQL body for function %s: %v", r.QualifiedName(), err)}
+	}
+	child := NewContext()
+	if ctx != nil {
+		*child = *ctx
+	}
+	child.Notices = nil
+	child.Params = make([]Datum, len(args))
+	frame := newPLpgSQLFrame()
+	for i, arg := range args {
+		declared := catalog.Type{Name: "unknown"}
+		if i < len(r.ArgTypes) {
+			declared = normalizeCatalogType(r.ArgTypes[i])
+		}
+		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
+		if err != nil {
+			return nil, err
+		}
+		child.Params[i] = coerced
+		if i < len(r.ArgNames) {
+			if err := frame.add(r.ArgNames[i], declared, coerced); err != nil {
+				return nil, &ExecError{Code: "42P13", Pos: pos, Message: err.Error()}
+			}
+		}
+	}
+	for _, d := range block.Declarations {
+		typ := catalogTypeFromColumnType(d.Type)
+		value := NullDatum
+		if d.Default != nil {
+			value, err = evalPLpgSQLExpr(d.Default, frame, child)
+			if err != nil {
+				return nil, err
+			}
+		}
+		value, err = coerceDatumToType(value, typ, d.Pos(), fmt.Sprintf("variable %q", d.Name))
+		if err != nil {
+			return nil, err
+		}
+		if err := frame.add(d.Name, typ, value); err != nil {
+			return nil, &ExecError{Code: "42P13", Pos: d.Pos(), Message: err.Error()}
+		}
+	}
+	_, _, err = executePLpgSQLStmtList(block.Statements, r, frame, child)
+	if ctx != nil {
+		for _, n := range child.TakeNotices() {
+			ctx.AddNotice(n)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return frame.returnNextRows, nil
 }
 
 func routineRegistry(ctx *Context) *catalog.Routines {
@@ -649,6 +712,15 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		return v, flowReturn, nil
 
+	case *plpgsql.ReturnNextStmt:
+		// RETURN NEXT — append one value to the SETOF accumulator. M0097-0073.
+		v, err := evalPLpgSQLExpr(s.Expr, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		frame.returnNextRows = append(frame.returnNextRows, v)
+		return Datum{}, flowNone, nil
+
 	case *plpgsql.RaiseStmt:
 		// RAISE EXCEPTION/ERROR: surface as an executor error.
 		// RAISE NOTICE/WARNING/INFO/LOG/DEBUG: queue via context so the server
@@ -748,6 +820,24 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		sql := s.SQL
 		if frame.trig != nil {
 			sql = substituteTriggerRefs(sql, frame.trig)
+		}
+		// FOR rec IN EXECUTE expr LOOP — dynamic SQL cursor. M0097-0073.
+		// The captured SQL text starts with EXECUTE; evaluate the rest as an
+		// expression to get the actual SQL string.
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sql)), "EXECUTE ") {
+			exprText := strings.TrimSpace(sql[strings.IndexByte(sql, ' '):])
+			sqlExpr, parseErr := parser.ParseExpr(exprText)
+			if parseErr != nil {
+				return Datum{}, flowNone, &ExecError{Code: "42601", Message: fmt.Sprintf("FOR EXECUTE expression parse error: %v", parseErr)}
+			}
+			sqlDatum, evalErr := evalPLpgSQLExpr(sqlExpr, frame, ctx)
+			if evalErr != nil {
+				return Datum{}, flowNone, evalErr
+			}
+			if sqlDatum.IsNull() {
+				return Datum{}, flowNone, nil
+			}
+			sql = sqlDatum.StringValue()
 		}
 		// Execute the query and collect rows.
 		stmts, err := parser.Parse(sql)

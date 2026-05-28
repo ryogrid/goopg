@@ -897,9 +897,29 @@ func matchSQLLike(s, pat string) bool {
 	return pi == len(pat)
 }
 
+// pgPatternToGoRE2 translates PostgreSQL-specific regex escapes that are not
+// supported by Go's RE2 engine into their RE2 equivalents.
+// Currently handles: \m (word-start) and \M (word-end) → \b. M0097-0073.
+func pgPatternToGoRE2(pattern string) string {
+	var b strings.Builder
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == '\\' && i+1 < len(pattern) {
+			switch pattern[i+1] {
+			case 'm', 'M':
+				b.WriteString(`\b`)
+				i++
+				continue
+			}
+		}
+		b.WriteByte(pattern[i])
+	}
+	return b.String()
+}
+
 // evalPOSIXRegex evaluates a POSIX extended regex match.
 // caseInsensitive applies the (?i) flag. M0097-0011.
 func evalPOSIXRegex(s, pattern string, caseInsensitive bool) (bool, error) {
+	pattern = pgPatternToGoRE2(pattern)
 	if caseInsensitive {
 		pattern = "(?i)" + pattern
 	}
@@ -4675,7 +4695,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					caseInsensitive = strings.Contains(fs, "i")
 				}
 			}
-			pattern := pat.StringValue()
+			pattern := pgPatternToGoRE2(pat.StringValue())
 			if caseInsensitive {
 				pattern = "(?i)" + pattern
 			}
