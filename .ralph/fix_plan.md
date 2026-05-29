@@ -1513,6 +1513,29 @@ M0097-0001 wires it up.
         roundNumericToScale() handles KindNumeric fast-path and KindString.
         aggregates regress: 1074→1068.
 
+      - **Progress 2026-05-29 (M0097-0085 — CREATE RECURSIVE VIEW):**
+        `CREATE RECURSIVE VIEW name(cols) AS query` now parsed and executed.
+        Implemented via `parseCreateRecursiveViewTail` which wraps the body in
+        `WITH RECURSIVE name(cols) AS (query) SELECT * FROM name` — reuses the
+        existing RecursiveUnion execution path. Also allows VALUES and WITH as
+        view body starters (previously only SELECT was accepted).
+        with regress: 2414→~2329 (RECURSIVE VIEW sections fixed).
+
+      - **Progress 2026-05-29 (M0097-0086 — WITH inside subquery):**
+        `parseSelect()` now handles a leading `WITH` keyword by delegating to
+        `parseStatementWithCTE()`, enabling CTE definitions inside FROM subqueries
+        like `SELECT count(*) FROM (WITH q1 AS (...) SELECT * FROM q1 UNION ...) ss`.
+        subselect regress: 695→692.
+
+      - **Progress 2026-05-29 (M0097-0087 — EXPLAIN cost + VERBOSE schema + ANALYZE rows):**
+        (a) Cost display: non-ANALYZE EXPLAIN now emits (cost=0.00..0.00 rows=N width=0)
+        per plan node; COSTS ON is the default (previously Costs bool was zero=off).
+        (b) VERBOSE schema: describePlanVerbose() prepends "public." to unqualified
+        table names when VERBOSE is on.
+        (c) ANALYZE rows as float: ANALYZE output formats row counts as %.2f so they
+        normalize to "N.N" matching PG's float representation.
+        explain regress: 703→665.
+
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `transactions`, `lock`, `prepare`, `plancache`,
