@@ -116,6 +116,81 @@ func newMaterializedCTEScanOp(p *planner.MaterializedCTEScan) *materializedCTESc
 	return &materializedCTEScanOp{plan: p}
 }
 
+// cteScanOp executes a regular (SELECT) CTE with materialization semantics:
+// the first time this CTE name is scanned within a query, all rows are
+// buffered into ctx.CTERowCache[name]; subsequent scans replay from the cache.
+// This implements PostgreSQL's CTE optimization-fence for volatile CTEs
+// (e.g. `WITH q AS (SELECT random() ...) SELECT * FROM q UNION SELECT * FROM q`
+// where q must produce the same rows both times). M0097-0099.
+type cteScanOp struct {
+	plan  *planner.CTEScan
+	child Operator
+	rows  []Row
+	idx   int
+}
+
+func newCteScanOp(p *planner.CTEScan) (*cteScanOp, error) {
+	child, err := Build(p.Child)
+	if err != nil {
+		return nil, err
+	}
+	return &cteScanOp{plan: p, child: child}, nil
+}
+
+func (o *cteScanOp) Schema() planner.Schema { return o.plan.Output() }
+
+func (o *cteScanOp) Open(ctx *Context) error {
+	key := strings.ToLower(o.plan.Name)
+	if ctx.CTERowCache != nil {
+		if cached, ok := ctx.CTERowCache[key]; ok {
+			// Replay from cache (second or later reference to this CTE).
+			o.rows = cached
+			o.idx = 0
+			return nil
+		}
+	}
+	// First reference: run the child plan and buffer all rows.
+	if err := o.child.Open(ctx); err != nil {
+		return err
+	}
+	var rows []Row
+	for {
+		slot, err := o.child.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			o.child.Close()
+			return err
+		}
+		// Clone the row so it survives after child is closed.
+		r := slotRow(slot)
+		owned := make(Row, len(r))
+		copy(owned, r)
+		rows = append(rows, owned)
+	}
+	o.child.Close()
+	// Store in cache so subsequent scans can replay.
+	if ctx.CTERowCache == nil {
+		ctx.CTERowCache = make(map[string][]Row)
+	}
+	ctx.CTERowCache[key] = rows
+	o.rows = rows
+	o.idx = 0
+	return nil
+}
+
+func (o *cteScanOp) Close() error { return nil }
+
+func (o *cteScanOp) Next() (TupleSlot, error) {
+	if o.idx >= len(o.rows) {
+		return nil, EOF
+	}
+	row := o.rows[o.idx]
+	o.idx++
+	return SlotFromRow(o.plan.Output(), row), nil
+}
+
 func (o *materializedCTEScanOp) Schema() planner.Schema { return o.plan.Output() }
 
 func (o *materializedCTEScanOp) Open(ctx *Context) error {

@@ -282,6 +282,12 @@ type Context struct {
 	// Key is the lowercase CTE name; value is the materialized RETURNING rows.
 	MaterializedCTEs map[string][][]Datum
 
+	// CTERowCache holds rows materialized from regular (SELECT) CTEs when the same
+	// CTE is referenced more than once in a query. The first CTEScan for a given
+	// name buffers all rows here; subsequent scans replay from the buffer.
+	// Key is the lowercase CTE name; value is the materialized row set (nil = not yet filled).
+	CTERowCache map[string][]Row
+
 	// CTEWriteFence, when non-nil, is a set of row pointers written by DML
 	// CTEs during their execution phase. The outer query's seqScanOp skips
 	// these tuples to implement CTE snapshot isolation: DML-CTE writes must

@@ -543,11 +543,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 			ectx.Snap = snap2
 		}
-		// Per-statement reset: clear the DML-CTE write fence from any previous
-		// statement so subsequent SELECTs don't accidentally skip rows that were
-		// inserted/updated by a prior DML CTE in the same transaction.
+		// Per-statement reset: clear the DML-CTE write fence and the regular-CTE
+		// row cache from any previous statement. The row cache is query-scoped:
+		// a CTE named "q" in query 1 must not bleed into query 2 (they may
+		// produce different rows). CTEWriteFence is cleared for the same reason.
 		ectx.CTEWriteFence = nil
 		ectx.InDMLCTE = false
+		ectx.CTERowCache = nil
 
 		// COPY inside a multi-statement simple-query batch (psql `\;`).
 		// Intercept before the plan-cache / executeOneSimpleStmt path —
