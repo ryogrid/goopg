@@ -126,6 +126,10 @@ func (p *parser) parseValuesSelect() (Stmt, error) {
 //
 // Planner support for JOIN/group/set semantics lands separately.
 func (p *parser) parseSelect() (Stmt, error) {
+	// WITH ... SELECT ... inside a subquery or view body.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith {
+		return p.parseStatementWithCTE()
+	}
 	// A bare VALUES(...) is a valid standalone statement in PostgreSQL.
 	// When used as a subquery (SELECT * FROM (VALUES ...) AS t), the inner
 	// parsing entry point is parseSelect, so we handle VALUES here.
