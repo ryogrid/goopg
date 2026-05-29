@@ -221,7 +221,7 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
-			outline := indent + "  Output: (" + strings.Join(cols, ", ") + ")"
+			outline := indent + "  Output: " + strings.Join(cols, ", ")
 			*rows = append(*rows, Row{NewStringDatum(outline)})
 		}
 	}
@@ -455,7 +455,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
-			outline := indent + "  Output: (" + strings.Join(cols, ", ") + ")"
+			outline := indent + "  Output: " + strings.Join(cols, ", ")
 			*rows = append(*rows, Row{NewStringDatum(outline)})
 		}
 	}
@@ -569,7 +569,13 @@ func describePlan(n planner.Node) string {
 		// inspecting EXPLAIN can verify which scans feed the
 		// cost model.
 		if p.Table != nil && p.Table.Stats != nil {
+			if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
+				return fmt.Sprintf("Seq Scan on %s %s (stats)", p.Table.QualifiedName(), p.Alias)
+			}
 			return fmt.Sprintf("Seq Scan on %s (stats)", p.Table.QualifiedName())
+		}
+		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
+			return fmt.Sprintf("Seq Scan on %s %s", p.Table.QualifiedName(), p.Alias)
 		}
 		return fmt.Sprintf("Seq Scan on %s", p.Table.QualifiedName())
 	case *planner.IndexScan:

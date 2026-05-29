@@ -120,7 +120,7 @@ xid,0,pass
 returning,334,failed
 insert,514,failed
 update,450,failed
-explain,724,failed
+explain,703,failed
 subselect,837,failed
 join,1302,failed
 inherit,1306,failed

@@ -869,22 +869,50 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				op.Close()
 				return Datum{}, flowNone, err
 			}
-			// Bind row columns to the loop variable's sub-fields.
-			// For each column in the slot, inject as _<var>_<colname> in frame.
+			// Bind row columns to the loop variable.
+			// - For record/row variables: assign to _<var>_<colname> sub-fields.
+			// - For scalar variables: if the loop var exists directly in frame
+			//   and the query returns exactly 1 column, assign to it directly.
 			if slot != nil && slot.Schema() != nil {
 				row := slotRow(slot)
-				for i, sc := range slot.Schema() {
-					colKey := "_" + varName + "_" + strings.ToLower(sc.Name)
-					if idx, ok := frame.indexByName[colKey]; ok {
-						if i < len(row) {
-							frame.values[idx] = row[i]
+				schema := slot.Schema()
+				// Scalar shortcut: if varName exists in frame and the query
+				// returns one column, assign directly to varName.
+				if len(schema) == 1 {
+					if idx, ok := frame.indexByName[varName]; ok {
+						if len(row) > 0 {
+							frame.values[idx] = row[0]
 						}
 					} else {
-						// Auto-register new column variable.
-						_ = frame.add(colKey, sc.Type, NullDatum)
-						if i < len(row) {
-							if idx2, ok2 := frame.indexByName[colKey]; ok2 {
-								frame.values[idx2] = row[i]
+						// Fall through to sub-field naming below.
+						colKey := "_" + varName + "_" + strings.ToLower(schema[0].Name)
+						if idx2, ok2 := frame.indexByName[colKey]; ok2 {
+							if len(row) > 0 {
+								frame.values[idx2] = row[0]
+							}
+						} else {
+							_ = frame.add(colKey, schema[0].Type, NullDatum)
+							if len(row) > 0 {
+								if idx3, ok3 := frame.indexByName[colKey]; ok3 {
+									frame.values[idx3] = row[0]
+								}
+							}
+						}
+					}
+				} else {
+					for i, sc := range schema {
+						colKey := "_" + varName + "_" + strings.ToLower(sc.Name)
+						if idx, ok := frame.indexByName[colKey]; ok {
+							if i < len(row) {
+								frame.values[idx] = row[i]
+							}
+						} else {
+							// Auto-register new column variable.
+							_ = frame.add(colKey, sc.Type, NullDatum)
+							if i < len(row) {
+								if idx2, ok2 := frame.indexByName[colKey]; ok2 {
+									frame.values[idx2] = row[i]
+								}
 							}
 						}
 					}
