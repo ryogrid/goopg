@@ -117,9 +117,9 @@ vacuum,0,pass
 varchar,0,pass
 window,0,pass
 xid,0,pass
-returning,394,failed
-insert,588,failed
-update,641,failed
+returning,334,failed
+insert,539,failed
+update,450,failed
 explain,724,failed
 subselect,837,failed
 join,1302,failed

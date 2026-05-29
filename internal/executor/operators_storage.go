@@ -1736,6 +1736,8 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		row := decRow
 
 		// Build new row from SET expressions.
+		// Clear multi-column subquery cache so each row gets a fresh evaluation.
+		clear(o.ctx.MultiAssignSubqCache)
 		newRow := make(Row, len(cols))
 		for i := range cols {
 			if o.plan.Set[i] == nil {
@@ -2077,7 +2079,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 
 	// UPDATE … FROM: nested-loop cross-product path. M0097-0065.
-	if len(o.plan.FromTables) > 0 {
+	if len(o.plan.FromScans) > 0 {
 		return o.updateWithFrom(rel, cols)
 	}
 
@@ -2144,6 +2146,8 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			scanPred = nil
 		}
 		if err := scanMatching(o.ctx, scanRel, scanCols, scanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
+			// Clear multi-column subquery cache so each row gets a fresh evaluation.
+			clear(o.ctx.MultiAssignSubqCache)
 			evalRow := row
 			if isInheritChild {
 				evalRow = remapChildRowToParent(row, inheritColMap)
@@ -2300,6 +2304,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						break
 					}
 					// Re-bind SET expressions against the latest row.
+					clear(o.ctx.MultiAssignSubqCache)
 					for i := range puCols {
 						setIdx := i
 						if setIdx < len(o.plan.Set) && o.plan.Set[setIdx] != nil {
@@ -2537,7 +2542,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
 	// DELETE … USING: nested-loop cross-product path. M0097-0076.
-	if len(o.plan.UsingTables) > 0 {
+	if len(o.plan.UsingScans) > 0 {
 		return o.deleteWithUsing()
 	}
 	o.done = true
@@ -2772,6 +2777,34 @@ func (o *updateOp) scanForMatches(rel storage.RelFileNode, cols []catalog.Column
 	return scanMatching(o.ctx, rel, cols, o.pred, fn)
 }
 
+// collectNodeRows opens the given plan node, drains it into a Row slice, then
+// closes it. Used by UPDATE … FROM and DELETE … USING to materialise their
+// source sets, which may be real-table SeqScans or arbitrary subquery nodes
+// (including VALUES).
+func collectNodeRows(node planner.Node, ctx *Context) ([]Row, error) {
+	op, err := Build(node)
+	if err != nil {
+		return nil, err
+	}
+	if err := op.Open(ctx); err != nil {
+		op.Close()
+		return nil, err
+	}
+	defer op.Close()
+	var rows []Row
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, cloneRow(slot.Row()))
+	}
+	return rows, nil
+}
+
 // updateWithFrom implements UPDATE … FROM by collecting all FROM-table rows
 // into memory, then doing a nested-loop cross-product against each target
 // table row, applying o.plan.FromPred to find matching combinations, and
@@ -2781,16 +2814,11 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	type fromRows struct {
 		rows []Row
 	}
-	fromSets := make([]fromRows, len(o.plan.FromTables))
-	for i, fromTbl := range o.plan.FromTables {
-		fromRel := o.ctx.Catalog.RelFileNode(fromTbl)
-		fromCols := fromTbl.Columns
-		var rows []Row
-		if err := scanMatching(o.ctx, fromRel, fromCols, nil, func(_ storage.BlockNumber, _ uint16, row Row) error {
-			rows = append(rows, cloneRow(row))
-			return nil
-		}); err != nil {
-			return nil, err
+	fromSets := make([]fromRows, len(o.plan.FromScans))
+	for i, fromNode := range o.plan.FromScans {
+		rows, err2 := collectNodeRows(fromNode, o.ctx)
+		if err2 != nil {
+			return nil, err2
 		}
 		fromSets[i] = fromRows{rows: rows}
 	}
@@ -2853,6 +2881,8 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 							return nil
 						}
 					}
+					// Clear multi-column subquery cache so each combined row gets a fresh evaluation.
+					clear(o.ctx.MultiAssignSubqCache)
 					// Predicate passed: compute new row in parent column space.
 					parentNewRow := make(Row, tgtColCount)
 					for i := range tgtCols {
@@ -3037,16 +3067,11 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 	type usingRows struct {
 		rows []Row
 	}
-	usingSets := make([]usingRows, len(o.plan.UsingTables))
-	for i, useTbl := range o.plan.UsingTables {
-		useRel := o.ctx.Catalog.RelFileNode(useTbl)
-		useCols := useTbl.Columns
-		var rows []Row
-		if err := scanMatching(o.ctx, useRel, useCols, nil, func(_ storage.BlockNumber, _ uint16, row Row) error {
-			rows = append(rows, cloneRow(row))
-			return nil
-		}); err != nil {
-			return nil, err
+	usingSets := make([]usingRows, len(o.plan.UsingScans))
+	for i, usingNode := range o.plan.UsingScans {
+		rows, err2 := collectNodeRows(usingNode, o.ctx)
+		if err2 != nil {
+			return nil, err2
 		}
 		usingSets[i] = usingRows{rows: rows}
 	}

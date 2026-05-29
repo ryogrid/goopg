@@ -401,7 +401,7 @@ func visitColumnRefsForTable(e Expr, onIdx func(int)) {
 	switch x := e.(type) {
 	case *ColumnRef:
 		onIdx(x.Index)
-	case *OuterColumnRef, *SubqueryExpr, *InExpr, *ExistsExpr:
+	case *OuterColumnRef, *SubqueryExpr, *InExpr, *ExistsExpr, *MultiAssignSubqElem, *MultiAssignSubqRow:
 		// outer refs and subqueries → out of scope
 	case *BinaryOp:
 		visitColumnRefsForTable(x.Left, onIdx)
@@ -1237,6 +1237,8 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 		}
 		switch x := e.(type) {
 		case *SubqueryExpr:
+			remapPosMapAfterRewrite(x.Plan, nil)
+		case *MultiAssignSubqRow:
 			remapPosMapAfterRewrite(x.Plan, nil)
 		case *InExpr:
 			if x.Plan != nil {

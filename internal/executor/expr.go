@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unsafe"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mctx"
@@ -115,6 +116,8 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		return evalCaseExpr(x, slotToRow(slot), ctx)
 	case *planner.SubqueryExpr:
 		return evalSubquery(x, slotToRow(slot), ctx)
+	case *planner.MultiAssignSubqElem:
+		return evalMultiAssignSubqElem(x, slotToRow(slot), ctx)
 	case *planner.InExpr:
 		return evalInExpr(x, slot, ctx)
 	case *planner.ExistsExpr:
@@ -3153,6 +3156,77 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 		return Datum{}, err
 	}
 	return val, nil
+}
+
+// evalMultiAssignSubqRow executes the subquery for a multi-column SET
+// assignment and caches the full result row in ctx.MultiAssignSubqCache keyed
+// by the *MultiAssignSubqRow pointer. The cache is cleared per-row by the
+// update executor before evaluating SET expressions.
+func evalMultiAssignSubqRow(x *planner.MultiAssignSubqRow, row Row, ctx *Context) ([]Datum, error) {
+	key := uintptr(unsafe.Pointer(x))
+	if ctx.MultiAssignSubqCache != nil {
+		if cached, ok := ctx.MultiAssignSubqCache[key]; ok {
+			return cached, nil
+		}
+	}
+	ctx.OuterRows = append(ctx.OuterRows, row)
+	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	op, err := Build(x.Plan)
+	if err != nil {
+		return nil, err
+	}
+	if err := op.Open(ctx); err != nil {
+		_ = op.Close()
+		return nil, err
+	}
+	defer func() { _ = op.Close() }()
+	slot, err := op.Next()
+	if err == EOF {
+		// No rows: return a slice of NullDatum values.
+		nulls := make([]Datum, x.NCols)
+		for i := range nulls {
+			nulls[i] = NullDatum
+		}
+		if ctx.MultiAssignSubqCache == nil {
+			ctx.MultiAssignSubqCache = make(map[uintptr][]Datum)
+		}
+		ctx.MultiAssignSubqCache[key] = nulls
+		return nulls, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	resultRow := slotRow(slot)
+	if len(resultRow) != x.NCols {
+		return nil, &ExecError{Code: "42601", Pos: x.Pos(), Message: fmt.Sprintf("subquery returned %d columns, expected %d", len(resultRow), x.NCols)}
+	}
+	// Clone result so it outlives the operator close.
+	result := make([]Datum, len(resultRow))
+	copy(result, resultRow)
+	// Drain to detect multiple rows.
+	if _, err2 := op.Next(); err2 != EOF {
+		if err2 == nil {
+			return nil, &ExecError{Code: "21000", Pos: x.Pos(), Message: "more than one row returned by a subquery used as an expression"}
+		}
+		return nil, err2
+	}
+	if ctx.MultiAssignSubqCache == nil {
+		ctx.MultiAssignSubqCache = make(map[uintptr][]Datum)
+	}
+	ctx.MultiAssignSubqCache[key] = result
+	return result, nil
+}
+
+// evalMultiAssignSubqElem evaluates one column of a multi-column SET subquery.
+func evalMultiAssignSubqElem(x *planner.MultiAssignSubqElem, row Row, ctx *Context) (Datum, error) {
+	result, err := evalMultiAssignSubqRow(x.Row, row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if x.ColIdx < 0 || x.ColIdx >= len(result) {
+		return NullDatum, nil
+	}
+	return result[x.ColIdx], nil
 }
 
 // evalCaseExpr evaluates the SQL CASE expression. Two forms:

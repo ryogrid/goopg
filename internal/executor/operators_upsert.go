@@ -697,6 +697,8 @@ func (o *upsertOp) evalUpdate(existing Row, inserted Row) (Row, bool, error) {
 			return nil, true, nil
 		}
 	}
+	// Clear multi-column subquery cache so each conflict row gets a fresh evaluation.
+	clear(o.ctx.MultiAssignSubqCache)
 	updated := make(Row, len(existing))
 	for i := range existing {
 		expr := o.plan.OnConflict.UpdateSet[i]

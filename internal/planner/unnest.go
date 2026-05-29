@@ -98,6 +98,8 @@ func walkSubqueryPlansInExpr(e Expr) Expr {
 	switch x := e.(type) {
 	case *SubqueryExpr:
 		x.Plan = unnestSubqueriesInPlan(x.Plan)
+	case *MultiAssignSubqRow:
+		x.Plan = unnestSubqueriesInPlan(x.Plan)
 	case *InExpr:
 		x.Plan = unnestSubqueriesInPlan(x.Plan)
 	case *ExistsExpr:
@@ -375,6 +377,10 @@ func walkExprTree(e Expr, visit func(Expr)) {
 		for _, elem := range x.Elems {
 			walkExprTree(elem, visit)
 		}
+	case *MultiAssignSubqElem:
+		// Visit the shared row node so planHasOuterRef can detect
+		// the inner plan's outer references.
+		visit(x.Row)
 	}
 }
 

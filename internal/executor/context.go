@@ -86,6 +86,13 @@ type Context struct {
 	SubqueryCache      map[string][]Datum
 	SubqueryCacheScope int // OuterRows len when cached; cleared on change
 
+	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
+	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
+	// pointer (as uintptr). Cleared by the update executor at the start of
+	// each row's SET evaluation so correlated subqueries are re-evaluated
+	// per row while non-correlated ones are evaluated once per row.
+	MultiAssignSubqCache map[uintptr][]Datum
+
 	// StatsTarget is the effective `default_statistics_target`
 	// GUC value for the current statement. ANALYZE uses
 	// `targrows = StatsTarget * 300` for sample sizing, mirrors

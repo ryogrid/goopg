@@ -4294,7 +4294,8 @@ func isConstantExpr(e Expr) bool {
 	switch x := e.(type) {
 	case *ColumnRef, *OuterColumnRef:
 		return false
-	case *SubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr, *IsBoolExpr, *IsDistinctFromExpr:
+	case *SubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr, *IsBoolExpr, *IsDistinctFromExpr,
+		*MultiAssignSubqElem, *MultiAssignSubqRow:
 		return false
 	case *BinaryOp:
 		return isConstantExpr(x.Left) && isConstantExpr(x.Right)
@@ -4571,10 +4572,37 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 		return nil
 	}
 	for i := range s.Set {
-		if _, ok := s.Set[i].Expr.(*parser.DefaultMarker); !ok {
+		a := &s.Set[i]
+		if len(a.Columns) > 0 {
+			// Multi-column tuple form: RHS is a *parser.RowExpr whose Elems
+			// may contain DefaultMarker values.
+			row, ok := a.Expr.(*parser.RowExpr)
+			if !ok {
+				continue
+			}
+			for j, colName := range a.Columns {
+				if j >= len(row.Elems) {
+					break
+				}
+				if _, ok := row.Elems[j].(*parser.DefaultMarker); !ok {
+					continue
+				}
+				col, ok := cat.LookupColumn(tbl, colName)
+				if !ok {
+					return nil
+				}
+				if def := tbl.Columns[col.Ordinal].DefaultExpr; def != nil {
+					row.Elems[j] = def
+				} else {
+					row.Elems[j] = &parser.NullConst{}
+				}
+			}
 			continue
 		}
-		col, ok := cat.LookupColumn(tbl, s.Set[i].Column)
+		if _, ok := a.Expr.(*parser.DefaultMarker); !ok {
+			continue
+		}
+		col, ok := cat.LookupColumn(tbl, a.Column)
 		if !ok {
 			// planUpdate / analyzer will raise 42703 for unknown
 			// columns; leave the marker so the error path stays
@@ -4582,9 +4610,9 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 			return nil
 		}
 		if def := tbl.Columns[col.Ordinal].DefaultExpr; def != nil {
-			s.Set[i].Expr = def
+			a.Expr = def
 		} else {
-			s.Set[i].Expr = &parser.NullConst{}
+			a.Expr = &parser.NullConst{}
 		}
 	}
 	return nil
@@ -4786,15 +4814,9 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 
 	out.UpdateSet = make([]Expr, n)
 	for _, a := range oc.UpdateSet {
-		col, ok := cat.LookupColumn(tbl, a.Column)
-		if !ok {
-			return nil, &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
-		}
-		expr, err := resolveExpr(a.Expr, ctx)
-		if err != nil {
+		if err := applyUpdateAssign(a, tbl, out.UpdateSet, ctx, cat); err != nil {
 			return nil, err
 		}
-		out.UpdateSet[col.Ordinal] = expr
 	}
 	if oc.UpdateWhere != nil {
 		pred, err := resolveExpr(oc.UpdateWhere, ctx)
@@ -4974,6 +4996,74 @@ func insertValuesSchema(tbl *catalog.Table, colIndex []int) Schema {
 	return out
 }
 
+// applyUpdateAssign resolves one SET assignment (single- or multi-column form)
+// and stores the resulting expression(s) into the set slice indexed by column ordinal.
+// applyUpdateAssign resolves one SET assignment (single- or multi-column form)
+// and stores the resulting expression(s) into the set slice indexed by column ordinal.
+func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ctx *resolveContext, cat catalog.Catalog) error {
+	if len(a.Columns) > 0 {
+		// Multi-column tuple form: (c1, c2, ...) = (e1, e2, ...) or subquery.
+		switch rhs := a.Expr.(type) {
+		case *parser.RowExpr:
+			// Row-constructor form: (c1,c2,c3) = (e1,e2,e3).
+			// After rewriteUpdateDefaultMarkers, DefaultMarkers have been replaced.
+			if len(rhs.Elems) != len(a.Columns) {
+				return &PlanError{Pos: a.Pos(), Code: "42601", Message: fmt.Sprintf("number of columns (%d) does not match number of values (%d)", len(a.Columns), len(rhs.Elems))}
+			}
+			for i, colName := range a.Columns {
+				col, ok := cat.LookupColumn(tbl, colName)
+				if !ok {
+					return &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", colName, tbl.Name)}
+				}
+				expr, err := resolveExpr(rhs.Elems[i], ctx)
+				if err != nil {
+					return err
+				}
+				set[col.Ordinal] = expr
+			}
+			return nil
+		case *parser.SubqueryExpr:
+			// Subquery form: (c1, c2) = (SELECT x, y FROM ...).
+			// Build the inner plan once and create MultiAssignSubqElem per column.
+			innerPlan, err := planSelectWithParent(rhs.Inner, cat, ctx)
+			if err != nil {
+				return err
+			}
+			sharedRow := &MultiAssignSubqRow{
+				pos:             a.Pos(),
+				Plan:            innerPlan,
+				NCols:           len(a.Columns),
+				IsNonCorrelated: !planHasOuterRef(innerPlan),
+			}
+			for i, colName := range a.Columns {
+				col, ok := cat.LookupColumn(tbl, colName)
+				if !ok {
+					return &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", colName, tbl.Name)}
+				}
+				set[col.Ordinal] = &MultiAssignSubqElem{
+					pos:    a.Pos(),
+					Row:    sharedRow,
+					ColIdx: i,
+				}
+			}
+			return nil
+		default:
+			return &PlanError{Pos: a.Pos(), Code: "0A000", Message: "unsupported RHS for multi-column SET assignment"}
+		}
+	}
+	// Single-column form.
+	col, ok := cat.LookupColumn(tbl, a.Column)
+	if !ok {
+		return &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
+	}
+	expr, err := resolveExpr(a.Expr, ctx)
+	if err != nil {
+		return err
+	}
+	set[col.Ordinal] = expr
+	return nil
+}
+
 func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	restore, _, err := preplanWithClause(s.With, cat)
 	if err != nil {
@@ -4989,7 +5079,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	// are appended as additional bindings so that SET and WHERE expressions can
 	// reference their columns.  M0097-0065.
 	var fromTables []*catalog.Table
-	var fromScans []*SeqScan
+	var fromScans []Node
 	var fromSchema Schema
 	if len(s.From) > 0 {
 		bindings := []rangeBinding{
@@ -4998,22 +5088,35 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		sch := tableSchemaWithSource(tbl, 1)
 		offset := len(tbl.Columns)
 		for idx, rv := range s.From {
-			fromTbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
-			if !ok {
-				return nil, &PlanError{Pos: rv.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", rv.Name)}
-			}
 			si := int16(idx + 2) // sourceIdx 2, 3, … for FROM tables
-			alias := rv.Alias
+			fromNode, fromBinding, err2 := planScanRangeVar(rv, cat, si, nil)
+			if err2 != nil {
+				return nil, err2
+			}
+			fromTbl := fromBinding.table
+			// Build a schema with sourceIdx assigned.
+			fromSch := tableSchemaWithSource(fromTbl, si)
+			alias := fromBinding.alias
 			if alias == "" {
-				alias = strings.ToLower(rv.Name)
+				alias = rv.Alias
+				if alias == "" {
+					alias = strings.ToLower(rv.Name)
+				}
 			}
 			bindings = append(bindings, rangeBinding{
 				table: fromTbl, alias: alias, offset: offset, sourceIdx: si,
 			})
-			fromSchema = append(fromSchema, tableSchemaWithSource(fromTbl, si)...)
-			sch = append(sch, tableSchemaWithSource(fromTbl, si)...)
-			fromTables = append(fromTables, fromTbl)
-			fromScans = append(fromScans, &SeqScan{pos: rv.Pos(), Table: fromTbl, schema: tableSchemaWithSource(fromTbl, si)})
+			fromSchema = append(fromSchema, fromSch...)
+			sch = append(sch, fromSch...)
+			// For real tables (SeqScan-backed), record the catalog table for
+			// inheritance scanning. For subqueries, append nil — the executor
+			// will drive the plan node from FromScans[i] instead.
+			if _, isSeq := fromNode.(*SeqScan); isSeq {
+				fromTables = append(fromTables, fromTbl)
+			} else {
+				fromTables = append(fromTables, nil)
+			}
+			fromScans = append(fromScans, fromNode)
 			offset += len(fromTbl.Columns)
 		}
 		ctx := newResolveContext(bindings, sch)
@@ -5028,15 +5131,9 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		}
 		set := make([]Expr, len(tbl.Columns))
 		for _, a := range s.Set {
-			col, ok := cat.LookupColumn(tbl, a.Column)
-			if !ok {
-				return nil, &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
-			}
-			expr, err := resolveExpr(a.Expr, ctx)
-			if err != nil {
+			if err := applyUpdateAssign(a, tbl, set, ctx, cat); err != nil {
 				return nil, err
 			}
-			set[col.Ordinal] = expr
 		}
 		// The target scan has NO filter; the executor does the nested-loop
 		// cross-product and applies FromPred against the combined row. M0097-0065.
@@ -5079,15 +5176,9 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	}
 	set := make([]Expr, len(tbl.Columns))
 	for _, a := range s.Set {
-		col, ok := cat.LookupColumn(tbl, a.Column)
-		if !ok {
-			return nil, &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
-		}
-		expr, err := resolveExpr(a.Expr, ctx)
-		if err != nil {
+		if err := applyUpdateAssign(a, tbl, set, ctx, cat); err != nil {
 			return nil, err
 		}
-		set[col.Ordinal] = expr
 	}
 	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set}
 	if len(s.Returning) > 0 {
@@ -5118,7 +5209,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 	// UPDATE … FROM path in planUpdate.
 	if len(s.Using) > 0 {
 		var usingTables []*catalog.Table
-		var usingScans []*SeqScan
+		var usingScans []Node
 		var usingSchema Schema
 		bindings := []rangeBinding{
 			{table: tbl, alias: s.Target.Alias, offset: 0, sourceIdx: 1},
@@ -5126,22 +5217,31 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		sch := tableSchemaWithSource(tbl, 1)
 		offset := len(tbl.Columns)
 		for idx, rv := range s.Using {
-			useTbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
-			if !ok {
-				return nil, &PlanError{Pos: rv.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", rv.Name)}
-			}
 			si := int16(idx + 2) // sourceIdx 2, 3, … for USING tables
-			alias := rv.Alias
+			usingNode, usingBinding, err2 := planScanRangeVar(rv, cat, si, nil)
+			if err2 != nil {
+				return nil, err2
+			}
+			useTbl := usingBinding.table
+			useSch := tableSchemaWithSource(useTbl, si)
+			alias := usingBinding.alias
 			if alias == "" {
-				alias = strings.ToLower(rv.Name)
+				alias = rv.Alias
+				if alias == "" {
+					alias = strings.ToLower(rv.Name)
+				}
 			}
 			bindings = append(bindings, rangeBinding{
 				table: useTbl, alias: alias, offset: offset, sourceIdx: si,
 			})
-			usingSchema = append(usingSchema, tableSchemaWithSource(useTbl, si)...)
-			sch = append(sch, tableSchemaWithSource(useTbl, si)...)
-			usingTables = append(usingTables, useTbl)
-			usingScans = append(usingScans, &SeqScan{pos: rv.Pos(), Table: useTbl, schema: tableSchemaWithSource(useTbl, si)})
+			usingSchema = append(usingSchema, useSch...)
+			sch = append(sch, useSch...)
+			if _, isSeq := usingNode.(*SeqScan); isSeq {
+				usingTables = append(usingTables, useTbl)
+			} else {
+				usingTables = append(usingTables, nil)
+			}
+			usingScans = append(usingScans, usingNode)
 			offset += len(useTbl.Columns)
 		}
 		ctx := newResolveContext(bindings, sch)
@@ -5796,6 +5896,13 @@ func exprType(e Expr) catalog.Type {
 			}
 		}
 		return catalog.Type{Name: "unknown"}
+	case *MultiAssignSubqElem:
+		if x.Row != nil && x.Row.Plan != nil {
+			if sch := x.Row.Plan.Output(); x.ColIdx < len(sch) {
+				return sch[x.ColIdx].Type
+			}
+		}
+		return catalog.Type{Name: "unknown"}
 	}
 	return catalog.Type{Name: "unknown"}
 }
@@ -6047,6 +6154,10 @@ func planHasOuterRef(node Node) bool {
 				if x.Plan != nil && planHasOuterRef(x.Plan) {
 					found = true
 				}
+			case *MultiAssignSubqRow:
+				if x.Plan != nil && planHasOuterRef(x.Plan) {
+					found = true
+				}
 			case *InExpr:
 				if x.Plan != nil && planHasOuterRef(x.Plan) {
 					found = true
@@ -6071,6 +6182,14 @@ func planHasOuterRef(node Node) bool {
 // Two parent channels are wired: planParent (planner-side, so
 // resolveColumnRef can walk up the resolveContext chain) and
 // the analyzer's outer-scope channel (so the recursive
+// planSelectWithParent plans an inner SELECT with the supplied
+// resolveContext as the lexical-scope parent. Used by
+// SubqueryExpr / InExpr / ExistsExpr / MultiAssignSubqRow to enable
+// correlated subqueries.
+//
+// The parent is injected via the package-level planParent channel (so
+// resolveColumnRef can walk up the resolveContext chain) and
+// the analyzer's outer-scope channel (so the recursive
 // Analyze pass that Plan() invokes also sees the outer
 // scope). Both are restored on return.
 func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *resolveContext) (Node, error) {
@@ -6084,7 +6203,16 @@ func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *
 		restore := analyzer.SetOuterScope(scope)
 		defer restore()
 	}
-	return Plan(stmt, cat)
+
+	// Skip the analyzer re-pass and call planSelect directly.
+	// The outer statement's Plan() already analyzed the full tree
+	// (including this sub-SELECT) under the correct scope (with
+	// CTE names, outer relations, etc.). Re-running the analyzer
+	// here would fail for CTE references (e.g. DO UPDATE SET
+	// (b,a)=(SELECT ... FROM cte) where cte lives in planCTEs
+	// but not in the catalog). Mirrors preplanWithClause's
+	// planSelect(cte.Query, cat) pattern for CTE bodies.
+	return planSelect(stmt, cat)
 }
 
 // buildAnalyzerOuterScope walks a resolveContext chain and

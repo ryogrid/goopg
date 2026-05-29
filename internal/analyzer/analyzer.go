@@ -576,6 +576,21 @@ func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat cata
 		},
 	}
 	for _, assign := range oc.UpdateSet {
+		if len(assign.Columns) > 0 {
+			// Multi-column tuple form: validate each target column name.
+			// RHS expression analysis is deferred to the planner because
+			// the RHS may reference CTEs from an outer WITH clause that
+			// are not visible in this analyzer scope (they live in the
+			// planner's global planCTEs map). The planner validates the
+			// RHS via planSelectWithParent / resolveExpr.
+			for _, colName := range assign.Columns {
+				if _, ok := lookupColumn(tbl, colName); !ok {
+					return analyzeError(assign.Pos(), "42703",
+						fmt.Sprintf("column %q of relation %q does not exist", colName, tbl.Name))
+				}
+			}
+			continue
+		}
 		col, ok := lookupColumn(tbl, assign.Column)
 		if !ok {
 			return analyzeError(assign.Pos(), "42703",
@@ -626,6 +641,19 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 		return err
 	}
 	for _, assign := range s.Set {
+		if len(assign.Columns) > 0 {
+			// Multi-column tuple form: (c1, c2, …) = (e1, e2, …).
+			// Validate each target column and analyse the RHS expression.
+			for _, colName := range assign.Columns {
+				if _, ok := lookupColumn(tbl, colName); !ok {
+					return analyzeError(assign.Pos(), "42703", fmt.Sprintf("column %q of relation %q does not exist", colName, tbl.Name))
+				}
+			}
+			if _, err := analyzeExpr(assign.Expr, ctx); err != nil {
+				return err
+			}
+			continue
+		}
 		col, ok := lookupColumn(tbl, assign.Column)
 		if !ok {
 			return analyzeError(assign.Pos(), "42703", fmt.Sprintf("column %q of relation %q does not exist", assign.Column, tbl.Name))

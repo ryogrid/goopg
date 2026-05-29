@@ -383,7 +383,8 @@ func walkColumnRefs(e planner.Expr, onIdx func(int), onOuter func()) {
 		onIdx(x.Index)
 	case *planner.OuterColumnRef:
 		onOuter()
-	case *planner.SubqueryExpr, *planner.ExistsExpr, *planner.InExpr:
+	case *planner.SubqueryExpr, *planner.ExistsExpr, *planner.InExpr,
+		*planner.MultiAssignSubqElem, *planner.MultiAssignSubqRow:
 		onOuter()
 	case *planner.BinaryOp:
 		walkColumnRefs(x.Left, onIdx, onOuter)

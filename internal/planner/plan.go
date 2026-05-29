@@ -264,6 +264,31 @@ type SubqueryExpr struct {
 func (e *SubqueryExpr) Pos() int { return e.pos }
 func (*SubqueryExpr) exprNode()  {}
 
+// MultiAssignSubqRow represents a multi-column sub-SELECT used on the RHS of
+// a tuple SET assignment: SET (a, b) = (SELECT x, y FROM …).
+// A single MultiAssignSubqRow is shared by all MultiAssignSubqElem expressions
+// for the same assignment; the executor evaluates the subquery once per row and
+// caches the result tuple in Context.MultiAssignSubqCache keyed by this pointer.
+type MultiAssignSubqRow struct {
+	pos             int
+	Plan            Node
+	NCols           int  // expected number of output columns
+	IsNonCorrelated bool
+}
+
+func (e *MultiAssignSubqRow) Pos() int { return e.pos }
+func (*MultiAssignSubqRow) exprNode()  {}
+
+// MultiAssignSubqElem extracts one column from a MultiAssignSubqRow result.
+type MultiAssignSubqElem struct {
+	pos    int
+	Row    *MultiAssignSubqRow
+	ColIdx int // 0-based index into the subquery result row
+}
+
+func (e *MultiAssignSubqElem) Pos() int { return e.pos }
+func (*MultiAssignSubqElem) exprNode()  {}
+
 // CaseWhen mirrors parser.CaseWhen with planner-resolved
 // expressions in place of parser-AST nodes.
 type CaseWhen struct {
@@ -1122,7 +1147,7 @@ type Update struct {
 	// matching rows. Set expressions are also evaluated against the
 	// combined (target ++ from...) row.
 	FromTables    []*catalog.Table
-	FromScans     []*SeqScan // one per FROM table
+	FromScans     []Node // one per FROM table (may be SeqScan or subquery node)
 	FromSchema    Schema     // combined schema of all FROM tables
 	FromPred      Expr       // WHERE predicate over combined row (nil = no filter)
 }
@@ -1145,7 +1170,7 @@ type Delete struct {
 	// target and USING columns) to select matching victim rows.
 	// RETURNING may reference USING columns via the combined row.
 	UsingTables []*catalog.Table
-	UsingScans  []*SeqScan
+	UsingScans  []Node // one per USING table (may be SeqScan or subquery node)
 	UsingSchema Schema
 	UsingPred   Expr
 }
