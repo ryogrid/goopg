@@ -2249,12 +2249,43 @@ func (p *parser) parsePrimary() (Expr, error) {
 	case TokenSymbol:
 		if t.Value == "(" {
 			p.advance()
-			// `( SELECT … )` is a subquery expression. v0
-			// supports only the scalar form (one column, at
-			// most one row at evaluation time); IN / EXISTS
-			// have their own grammars and are deferred to a
-			// follow-up loop.
-			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
+			// `( SELECT … )` is a subquery expression. Also handles
+			// nested-paren forms like `((SELECT …) UNION SELECT …)`.
+			// Look ahead through leading `(` tokens to find SELECT/VALUES.
+			isSubqStart := false
+			if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
+				isSubqStart = true
+			} else if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				for i := 0; ; i++ {
+					tok := p.peek(i)
+					if tok.Kind == TokenSymbol && tok.Value == "(" {
+						continue
+					}
+					if tok.Kind == TokenKeyword && (tok.Keyword == KwSelect || tok.Keyword == KwValues) {
+						isSubqStart = true
+					}
+					break
+				}
+			}
+			if isSubqStart && p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				// Nested-paren subquery like `((SELECT …) UNION …)`.
+				// Delegate to parseParenthesisedSelectStmt (no leading `(`
+				// consumed yet — it will consume it).
+				inner, err := p.parseParenthesisedSelectStmt()
+				if err != nil {
+					return nil, err
+				}
+				sel, ok := inner.(*SelectStmt)
+				if !ok {
+					return nil, &SyntaxError{Pos: t.Pos, Message: "subquery did not produce SELECT"}
+				}
+				// Consume optional extra closing parens added by caller's depth tracking.
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')' to close subquery")
+				}
+				return &SubqueryExpr{pos: t.Pos, Inner: sel}, nil
+			}
+			if isSubqStart {
 				// SELECT … INTO is not permitted in a scalar subquery (M0097-0020).
 				old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 				p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
@@ -2263,6 +2294,23 @@ func (p *parser) parsePrimary() (Expr, error) {
 				p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 				if err != nil {
 					return nil, err
+				}
+				// Allow set operations inside the parenthesised subquery:
+				// (SELECT 2 UNION SELECT 3) is a valid scalar subquery.
+				if innerSel, ok := inner.(*SelectStmt); ok {
+					if setOp, present, err2 := p.parseSetOpClause(); err2 != nil {
+						return nil, err2
+					} else if present {
+						if innerSel.SetOp == nil {
+							innerSel.SetOp = setOp
+						} else {
+							rightmost := innerSel.SetOp.Right
+							for rightmost.SetOp != nil {
+								rightmost = rightmost.SetOp.Right
+							}
+							rightmost.SetOp = setOp
+						}
+					}
 				}
 				if !p.acceptSymbol(")") {
 					return nil, p.errAtCur("expected ')' to close subquery")

@@ -5657,7 +5657,8 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if fc, ok := e.(*FuncCall); ok && fc.Name != "" {
 		// array_construct is the lowered form of ARRAY[...]; PostgreSQL
 		// FigureColname returns "array" for ArrayExpr nodes. M0097-0065.
-		if fc.Name == "array_construct" {
+		// array_subscript is the lowered form of arr[idx]; PG also returns "array".
+		if fc.Name == "array_construct" || fc.Name == "array_subscript" {
 			return "array", exprType(e)
 		}
 		return fc.Name, exprType(e)
