@@ -1568,6 +1568,22 @@ M0097-0001 wires it up.
         b.tableOidColIdx so a.tableoid resolves to the correct per-row leaf OID.
         inherit regress: 1162→992 (−170). join +53 (cascade from more inheritance rows).
 
+      - **Progress 2026-05-29 (M0097-0094 — correlated IN subquery: semi-join fix):**
+        Correlated IN subqueries (`col IN (SELECT col2 FROM t WHERE col3 = outer.col)`)
+        returned 0 rows due to two bugs in `unnestInExpr`:
+        (1) `innerKey.Name` used the equijoin column name (e.g. "f1") rather than the
+        inner plan's output column name (e.g. "f2"); `reresolveJoinByName.predRebind`
+        found "f1" on the left side and reset `innerKey.Index` from 3 to 0, corrupting
+        the hash-join build key to always hash null → 0 probe matches. Fix: use
+        `innerPlan.Output()[0].Name`.
+        (2) Join type was `JoinTypeInner` instead of `JoinTypeSemi`/`JoinTypeAnti`,
+        producing duplicate outer rows and a merged schema causing downstream column-index
+        overflows. Fix mirrors `unnestNonCorrelatedInExpr`: use `JoinTypeSemi`/`JoinTypeAnti`,
+        outer-only schema, drop the IN conjunct from the filter, and set `IsolatedScope=true`
+        on the inner Project.
+        `subselect` regress diff: 711 (was 721 pre-fix). Design:
+        `docs/design/0097-0094-correlated-in-semi-join-fix.md`.
+
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `transactions`, `lock`, `prepare`, `plancache`,

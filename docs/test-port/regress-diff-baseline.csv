@@ -121,7 +121,7 @@ returning,334,failed
 insert,499,failed
 update,425,failed
 explain,665,failed
-subselect,634,failed
+subselect,711,failed
 join,1146,failed
 inherit,992,failed
 aggregates,1038,failed
