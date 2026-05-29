@@ -1663,6 +1663,30 @@ M0097-0001 wires it up.
         CREATE VIEW WITH security_invoker, C-language function, DROP SCHEMA CASCADE notice.
         Design: `docs/design/0097-0095-lock-table-pg-locks-tracking.md`.
 
+      - **Progress 2026-05-30 (M0097-0096 — upsertOp RETURNING + Stage A removal):**
+        Two fixes: (a) `upsertOp` was missing RETURNING support — Schema() returned nil,
+        Next() always ended with EOF, and no retRows accumulator existed. Added
+        `retRows []Row`/`retIdx int` to `upsertOp`, `appendUpsertRetRow()` helper,
+        `Schema()` now returns `ReturningSchema` when RETURNING is present, and
+        `Next()` yields accumulated rows after the processing loop (mirrors `insertOp`).
+        (b) Removed the Stage A guard (`ON CONFLICT DO UPDATE may not modify conflict-key
+        column`) that blocked `DO UPDATE SET (b, a) = (SELECT ...)` patterns — the guard
+        was overly conservative; `applyUpdate`'s `maintainArbiterRow` already correctly
+        inserts a new arbiter entry for the updated key. Tests: `TestUpsertConflictKeyModificationAllowed`
+        replaces `TestUpsertConflictKeyModificationRejected`.
+        Design: `docs/design/0097-0096-upsert-returning-stage-a-removal.md`.
+        `update.sql` diff: 425 → 414 (−11 lines).
+        Remaining blockers: correlated subquery in DO UPDATE multi-column SET
+        still returns 0 rows; `xmin/xmax/tableoid::regclass` system columns in RETURNING;
+        partitioned ON CONFLICT routing.
+      - **Progress 2026-05-30 (M0097-0098 — CTE visibility in FROM subquery):**
+        `synthesizeSubqueryTable()` now calls `analyzeWith()` to register CTEs in
+        `innerCtx` before calling `buildSelectScopeIn()`. Previously, CTE names defined
+        in a FROM-subquery's own WITH clause were invisible (42P01) because
+        `buildSelectScope` used catalog-only lookup. Fixes: `SELECT count(*) FROM
+        (WITH y AS (SELECT * FROM x) SELECT * FROM y) ss`. `subselect` diff: 711 → 626
+        (−85 lines, improvement from cascading CTE scope fixes).
+
 - [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `plpgsql`, `create_function_sql`, `create_procedure`,
