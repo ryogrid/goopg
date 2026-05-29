@@ -150,6 +150,40 @@ func (o *cteScanOp) isStreamingChild() bool {
 	case *planner.WorkTableScan, *planner.RecursiveUnion:
 		return true
 	}
+	// If the child plan subtree contains a WorkTableScan (e.g. a non-recursive
+	// CTE that wraps another CTE which is the recursive work table reference),
+	// we must stream to avoid caching stale rows from the first iteration.
+	return planContainsWorkTableScan(o.plan.Child)
+}
+
+// planContainsWorkTableScan walks the plan tree looking for a WorkTableScan node.
+// This is needed to detect CTEs whose body (even indirectly) reads from a recursive
+// CTE's work table — those CTEs must be streamed, not materialized.
+func planContainsWorkTableScan(n planner.Node) bool {
+	if n == nil {
+		return false
+	}
+	if _, ok := n.(*planner.WorkTableScan); ok {
+		return true
+	}
+	if scan, ok := n.(*planner.CTEScan); ok {
+		return planContainsWorkTableScan(scan.Child)
+	}
+	if ru, ok := n.(*planner.RecursiveUnion); ok {
+		return planContainsWorkTableScan(ru.Anchor) || planContainsWorkTableScan(ru.Recursive)
+	}
+	if p, ok := n.(*planner.Project); ok {
+		return planContainsWorkTableScan(p.Child)
+	}
+	if f, ok := n.(*planner.Filter); ok {
+		return planContainsWorkTableScan(f.Child)
+	}
+	if s, ok := n.(*planner.Sort); ok {
+		return planContainsWorkTableScan(s.Child)
+	}
+	if so, ok := n.(*planner.SetOp); ok {
+		return planContainsWorkTableScan(so.Left) || planContainsWorkTableScan(so.Right)
+	}
 	return false
 }
 
