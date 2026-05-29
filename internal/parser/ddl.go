@@ -59,6 +59,14 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return s, nil
 		}
 	}
+	// CREATE RECURSIVE VIEW name(cols) AS query (M0097-0085).
+	// Equivalent to: CREATE VIEW name AS (WITH RECURSIVE name(cols) AS (query) SELECT * FROM name).
+	if p.acceptKeyword(KwRecursive) {
+		if _, err := p.expectKeyword(KwView); err != nil {
+			return nil, err
+		}
+		return p.parseCreateRecursiveViewTail(t.Pos, orReplace)
+	}
 	switch {
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTable:
 		if orReplace {
@@ -486,7 +494,9 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 	if _, err := p.expectKeyword(KwAs); err != nil {
 		return nil, err
 	}
-	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect) {
+	// Allow SELECT, VALUES, or WITH as the view body.
+	cur := p.cur()
+	if !(cur.Kind == TokenKeyword && (cur.Keyword == KwSelect || cur.Keyword == KwValues || cur.Keyword == KwWith)) {
 		return nil, p.errAtCur("expected SELECT after AS")
 	}
 	// SELECT … INTO is not permitted in a view body (M0097-0020).
@@ -503,6 +513,63 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 		return nil, &SyntaxError{Pos: pos, Message: "view body did not produce SELECT"}
 	}
 	stmt.Query = sel
+	return stmt, nil
+}
+
+// parseCreateRecursiveViewTail handles CREATE [OR REPLACE] RECURSIVE VIEW name(cols) AS query.
+// The recursive view is stored as a plain view whose body is a CTE:
+//   WITH RECURSIVE name(cols) AS (query) SELECT * FROM name
+func (p *parser) parseCreateRecursiveViewTail(pos int, orReplace bool) (Stmt, error) {
+	stmt := &CreateViewStmt{pos: pos, OrReplace: orReplace}
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+	// Mandatory column list for recursive views.
+	var cols []string
+	if p.acceptSymbol("(") {
+		cols, err = p.parseColumnNameList()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' after recursive view column list")
+		}
+		stmt.Columns = cols
+	}
+	if _, err = p.expectKeyword(KwAs); err != nil {
+		return nil, err
+	}
+	// Parse the view body.
+	old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+	p.selectIntoErrMsg = "views must not contain SELECT INTO"
+	p.selectIntoNoPos = true
+	body, err := p.parseSelect()
+	p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
+	if err != nil {
+		return nil, err
+	}
+	bodySel, ok := body.(*SelectStmt)
+	if !ok {
+		return nil, &SyntaxError{Pos: pos, Message: "recursive view body did not produce SELECT"}
+	}
+	// Wrap: WITH RECURSIVE name(cols) AS (body) SELECT * FROM name.
+	cte := &CommonTableExpr{
+		Name:    name.Name,
+		Columns: cols,
+		Query:   bodySel,
+	}
+	outer := &SelectStmt{
+		pos: pos,
+		With: &WithClause{
+			Recursive: true,
+			CTEs:      []*CommonTableExpr{cte},
+		},
+		Targets: []ResTarget{{Expr: &StarExpr{pos: pos}}},
+		From:    []RangeVar{{pos: pos, Name: name.Name}},
+	}
+	stmt.Query = outer
 	return stmt, nil
 }
 
