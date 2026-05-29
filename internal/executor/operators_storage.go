@@ -1028,6 +1028,17 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			row = newRow
 		}
 
+		// NOT NULL constraint enforcement.
+		for i, col := range cols {
+			if col.NotNull && i < len(row) && row[i].IsNull() {
+				return nil, &ExecError{
+					Code:    "23502",
+					Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, o.plan.Table.Name),
+					Detail:  formatRowForDetail(cols, row),
+				}
+			}
+		}
+
 		// CHECK constraint enforcement (M0097-0014).
 		if len(o.plan.Table.CheckConstraints) > 0 {
 			if err := checkConstraints(o.ctx, o.plan.Table, row); err != nil {
@@ -1116,6 +1127,20 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
 	return nil, EOF
+}
+
+// formatRowForDetail formats a row for NOT NULL violation DETAIL messages.
+// Produces: "Failing row contains (v1, v2, ...)."
+func formatRowForDetail(cols []catalog.Column, row Row) string {
+	parts := make([]string, len(cols))
+	for i := range cols {
+		if i >= len(row) || row[i].IsNull() {
+			parts[i] = "null"
+			continue
+		}
+		parts[i] = row[i].Format()
+	}
+	return "Failing row contains (" + strings.Join(parts, ", ") + ")."
 }
 
 // routeToPartition finds the partition child table that matches the given row
@@ -2769,14 +2794,6 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 	return nil, EOF
 }
 
-// scanForMatches walks every block/slot of rel, decodes visible
-// tuples, evaluates the operator's predicate, and invokes fn for
-// each match. Blocks are unpinned before the next iteration so
-// pendingUpdate's downstream Pin doesn't deadlock against itself.
-func (o *updateOp) scanForMatches(rel storage.RelFileNode, cols []catalog.Column, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
-	return scanMatching(o.ctx, rel, cols, o.pred, fn)
-}
-
 // collectNodeRows opens the given plan node, drains it into a Row slice, then
 // closes it. Used by UPDATE … FROM and DELETE … USING to materialise their
 // source sets, which may be real-table SeqScans or arbitrary subquery nodes
@@ -3039,10 +3056,6 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
 	return nil, EOF
-}
-
-func (o *deleteOp) scanForMatches(rel storage.RelFileNode, cols []catalog.Column, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
-	return scanMatching(o.ctx, rel, cols, o.pred, fn)
 }
 
 // deleteWithUsing implements DELETE … USING by collecting all USING-table

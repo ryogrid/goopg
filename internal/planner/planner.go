@@ -4530,7 +4530,19 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 		s.Rows = [][]parser.Expr{row}
 		s.DefaultValues = false
 	}
-	for _, r := range s.Rows {
+	for ri, r := range s.Rows {
+		// When no explicit column list and the row is shorter than the
+		// column count, pad with DefaultMarkers so substitution handles
+		// them (PostgreSQL behaviour: trailing missing columns get DEFAULT).
+		if len(s.Columns) == 0 && len(r) < len(colIndex) {
+			padded := make([]parser.Expr, len(colIndex))
+			copy(padded, r)
+			for i := len(r); i < len(colIndex); i++ {
+				padded[i] = &parser.DefaultMarker{}
+			}
+			s.Rows[ri] = padded
+			r = padded
+		}
 		if len(r) != len(colIndex) {
 			// planInsert raises the arity error; skip rewriting and let
 			// it surface uniformly.
@@ -4676,6 +4688,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		}
 		rows := make([][]Expr, 0, len(s.Rows))
 		for _, r := range s.Rows {
+			// Short rows padded with DefaultMarker in rewriteInsertDefaultMarkers.
 			if len(r) != len(colIndex) {
 				return nil, &PlanError{
 					Pos:     s.Pos(),

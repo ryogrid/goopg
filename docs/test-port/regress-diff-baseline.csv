@@ -118,7 +118,7 @@ varchar,0,pass
 window,0,pass
 xid,0,pass
 returning,334,failed
-insert,539,failed
+insert,514,failed
 update,450,failed
 explain,724,failed
 subselect,837,failed
