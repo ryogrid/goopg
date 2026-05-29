@@ -4691,7 +4691,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 				}
 			}
 			row := make([]Expr, 0, len(r))
-			ctx := &resolveContext{} // VALUES rows have no input columns
+			ctx := &resolveContext{cat: cat} // VALUES rows have no input columns but may contain scalar subqueries
 			for _, e := range r {
 				pe, err := resolveExpr(e, ctx)
 				if err != nil {
