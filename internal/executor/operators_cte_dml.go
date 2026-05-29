@@ -116,17 +116,23 @@ func newMaterializedCTEScanOp(p *planner.MaterializedCTEScan) *materializedCTESc
 	return &materializedCTEScanOp{plan: p}
 }
 
-// cteScanOp executes a regular (SELECT) CTE with materialization semantics:
-// the first time this CTE name is scanned within a query, all rows are
-// buffered into ctx.CTERowCache[name]; subsequent scans replay from the cache.
-// This implements PostgreSQL's CTE optimization-fence for volatile CTEs
-// (e.g. `WITH q AS (SELECT random() ...) SELECT * FROM q UNION SELECT * FROM q`
-// where q must produce the same rows both times). M0097-0099.
+// cteScanOp executes a regular (SELECT) CTE with two modes:
+//
+//   - Streaming mode (recursive CTEs): passes rows from child directly.
+//     Used when Child is *planner.WorkTableScan (recursive self-reference)
+//     or *planner.RecursiveUnion (outer reference). LIMIT must be able to
+//     stop a recursive CTE before it buffers infinitely. M0097-0099.
+//
+//   - Materializing mode (non-recursive CTEs): buffers all rows on first
+//     Open(), replays from ctx.CTERowCache on subsequent Open()s. This
+//     implements PostgreSQL's CTE optimization-fence: volatile CTEs
+//     (e.g. random()) produce the same rows every reference. M0097-0099.
 type cteScanOp struct {
-	plan  *planner.CTEScan
-	child Operator
-	rows  []Row
-	idx   int
+	plan      *planner.CTEScan
+	child     Operator
+	streaming bool // true = don't cache; stream from child
+	rows      []Row
+	idx       int
 }
 
 func newCteScanOp(p *planner.CTEScan) (*cteScanOp, error) {
@@ -139,33 +145,21 @@ func newCteScanOp(p *planner.CTEScan) (*cteScanOp, error) {
 
 func (o *cteScanOp) Schema() planner.Schema { return o.plan.Output() }
 
+func (o *cteScanOp) isStreamingChild() bool {
+	switch o.plan.Child.(type) {
+	case *planner.WorkTableScan, *planner.RecursiveUnion:
+		return true
+	}
+	return false
+}
+
 func (o *cteScanOp) Open(ctx *Context) error {
-	// WorkTableScan is the self-reference inside a recursive CTE body.
-	// It must NOT be cached — each recursive iteration needs fresh rows
-	// from ctx.WorkTableRows. Skip the cache entirely for these. M0097-0099.
-	if _, isWorkTable := o.plan.Child.(*planner.WorkTableScan); isWorkTable {
-		if err := o.child.Open(ctx); err != nil {
-			return err
-		}
-		var rows []Row
-		for {
-			slot, err := o.child.Next()
-			if err == EOF {
-				break
-			}
-			if err != nil {
-				o.child.Close()
-				return err
-			}
-			r := slotRow(slot)
-			owned := make(Row, len(r))
-			copy(owned, r)
-			rows = append(rows, owned)
-		}
-		o.child.Close()
-		o.rows = rows
-		o.idx = 0
-		return nil
+	// Streaming mode: WorkTableScan (recursive self-reference) and RecursiveUnion
+	// (outer reference to recursive CTE) must NOT be cached. Both need lazy row
+	// delivery so LIMIT can stop them before the full sequence is produced.
+	if o.isStreamingChild() {
+		o.streaming = true
+		return o.child.Open(ctx)
 	}
 
 	key := strings.ToLower(o.plan.Name)
@@ -208,9 +202,17 @@ func (o *cteScanOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *cteScanOp) Close() error { return nil }
+func (o *cteScanOp) Close() error {
+	if o.streaming {
+		return o.child.Close()
+	}
+	return nil
+}
 
 func (o *cteScanOp) Next() (TupleSlot, error) {
+	if o.streaming {
+		return o.child.Next()
+	}
 	if o.idx >= len(o.rows) {
 		return nil, EOF
 	}
