@@ -1611,12 +1611,28 @@ func (o *updateOp) Schema() planner.Schema { return o.plan.ReturningSchema }
 // appendUpdateRetRow evaluates the plan's RETURNING expressions against
 // newRow and appends the result to o.retRows. No-op when RETURNING is absent.
 func (o *updateOp) appendUpdateRetRow(newRow Row) {
+	o.appendUpdateRetRowWithFrom(newRow, nil)
+}
+
+// appendUpdateRetRowWithFrom is the UPDATE … FROM variant: RETURNING
+// expressions may reference columns from joined FROM tables. The
+// planner resolves those references with column indices that follow
+// the target columns, so we build a combined eval row
+// `[newRow..., fromPortion...]` to satisfy them. fromPortion may be nil
+// for the plain UPDATE path.
+func (o *updateOp) appendUpdateRetRowWithFrom(newRow Row, fromPortion Row) {
 	if len(o.plan.Returning) == 0 {
 		return
 	}
+	evalRow := newRow
+	if len(fromPortion) > 0 {
+		evalRow = make(Row, 0, len(newRow)+len(fromPortion))
+		evalRow = append(evalRow, newRow...)
+		evalRow = append(evalRow, fromPortion...)
+	}
 	retRow := make(Row, len(o.plan.Returning))
 	for i, expr := range o.plan.Returning {
-		v, _ := evalExpr(expr, newRow, o.ctx)
+		v, _ := evalExpr(expr, evalRow, o.ctx)
 		retRow[i] = v
 	}
 	o.retRows = append(o.retRows, retRow)
@@ -2664,12 +2680,15 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	// Step 2: scan target table without predicate; for each target row, do
 	// the cross-product over all FROM-table row combinations. M0097-0065.
 	type pendingUpdate struct {
-		blk    storage.BlockNumber
-		slot   uint16
-		newRow Row
-		oldRow Row
+		blk         storage.BlockNumber
+		slot        uint16
+		newRow      Row
+		oldRow      Row
+		fromPortion Row // joined FROM-table columns for RETURNING; nil when RETURNING absent
 	}
 	var pending []pendingUpdate
+	tgtColCount := len(tgtCols)
+	needFromForReturning := len(o.plan.Returning) > 0
 
 	if err := scanMatching(o.ctx, rel, tgtCols, nil, func(blk storage.BlockNumber, slot uint16, tgtRow Row) error {
 		// Build all combinations of FROM rows via recursive enumeration.
@@ -2698,7 +2717,11 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					}
 				}
 				_ = computeGeneratedColumns(tgtCols, newRow)
-				pending = append(pending, pendingUpdate{blk: blk, slot: slot, newRow: newRow, oldRow: cloneRow(tgtRow)})
+				var fromPortion Row
+				if needFromForReturning && len(combinedRow) > tgtColCount {
+					fromPortion = cloneRow(combinedRow[tgtColCount:])
+				}
+				pending = append(pending, pendingUpdate{blk: blk, slot: slot, newRow: newRow, oldRow: cloneRow(tgtRow), fromPortion: fromPortion})
 				return nil
 			}
 			for _, fromRow := range fromSets[depth].rows {
@@ -2796,7 +2819,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		}
 		ssiRecordTupleWrite(o.ctx, rel, pu.blk, pu.slot)
 		o.rowsAffected++
-		o.appendUpdateRetRow(pu.newRow)
+		o.appendUpdateRetRowWithFrom(pu.newRow, pu.fromPortion)
 	}
 
 	o.done = true

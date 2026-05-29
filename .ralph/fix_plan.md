@@ -1313,6 +1313,31 @@ M0097-0001 wires it up.
             pass `lateralCtx` through to `planValuesSubquery`.
         Baseline CSV updated: `select` 137→0 (`pass`).
 
+      - **Progress 2026-05-29 (M0097-0075 — UPDATE FROM RETURNING projects FROM columns):**
+        First diverging case in `returning` regress test (553→545 diff lines, -8) fixed.
+        `UPDATE foo SET … FROM int4_tbl i … RETURNING foo.*, i.f1` returned NULL for
+        `i.f1` because `planUpdate` (`internal/planner/planner.go:4977`) resolved
+        RETURNING expressions against a combined `[target_cols..., from_cols...]`
+        binding context, but `updateWithFrom` only stored the target-only `newRow`
+        in `pendingUpdate` and `appendUpdateRetRow(pu.newRow)` evaluated RETURNING
+        against the truncated slice. Fix in `internal/executor/operators_storage.go`:
+        (a) split `appendUpdateRetRow` into a thin wrapper + new
+            `appendUpdateRetRowWithFrom(newRow, fromPortion Row)` that builds
+            `evalRow = [newRow..., fromPortion...]` before evaluating;
+        (b) `pendingUpdate` gains `fromPortion Row`, cloned from
+            `combinedRow[tgtColCount:]` at the recursion leaf (cloning required
+            because `combinedRow` reuses backing storage across siblings);
+        (c) the pending-apply loop calls `appendUpdateRetRowWithFrom`. Non-FROM
+            callers (`updateViaIndex`, `Next[2]`) still call the legacy wrapper
+            which forwards `fromPortion == nil`.
+        Design: `docs/design/0097-0075-update-from-returning-projection.md`.
+        Verification: `go build ./...` clean; `go test ./internal/executor/
+        ./internal/planner/` passes modulo pre-existing `TestToastByteaRoundTrip`
+        flake (confirmed on baseline `e1185591`); regress diff 553→545.
+        Next blockers (in order of first occurrence): DELETE USING parser,
+        ALTER TABLE ADD COLUMN DEFAULT backfill, INHERITS row propagation,
+        RETURNING OLD/NEW.
+
       - **Bisect resolved 2026-05-29 (M0097-0074 follow-up — false
         regression):** The "regression" framing in the prior note was
         wrong. Bisected by checking out `c945744c` in a separate worktree

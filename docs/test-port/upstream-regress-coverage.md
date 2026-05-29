@@ -180,7 +180,7 @@ Status policy for this phase:
 | reindex_catalog | `postgres/src/test/regress/sql/reindex_catalog.sql` | `postgres/src/test/regress/expected/reindex_catalog.out` | pass | Confirmed pass via TestPort_RegressSuite — M0097-0003 (2026-05-13) |
 | reloptions | `postgres/src/test/regress/sql/reloptions.sql` | `postgres/src/test/regress/expected/reloptions.out` | excluded | Table/index reloptions; out of scope for goopg v0. |
 | replica_identity | `postgres/src/test/regress/sql/replica_identity.sql` | `postgres/src/test/regress/expected/replica_identity.out` | excluded | Replica identity; out of scope for goopg v0. |
-| returning | `postgres/src/test/regress/sql/returning.sql` | `postgres/src/test/regress/expected/returning.out` | failed | Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope |
+| returning | `postgres/src/test/regress/sql/returning.sql` | `postgres/src/test/regress/expected/returning.out` | failed | Attempted via TestPort_RegressSuite; 545 diff lines (down from 553 after M0097-0075 UPDATE FROM RETURNING fix); remaining blockers: DELETE USING parser, ALTER TABLE ADD COLUMN DEFAULT backfill, INHERITS row propagation, RETURNING OLD/NEW |
 | roleattributes | `postgres/src/test/regress/sql/roleattributes.sql` | `postgres/src/test/regress/expected/roleattributes.out` | excluded | Role attributes; out of scope for goopg v0. |
 | rowsecurity | `postgres/src/test/regress/sql/rowsecurity.sql` | `postgres/src/test/regress/expected/rowsecurity.out` | excluded | Row security; out of scope for goopg v0. |
 | rowtypes | `postgres/src/test/regress/sql/rowtypes.sql` | `postgres/src/test/regress/expected/rowtypes.out` | failed | Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope |
