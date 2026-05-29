@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"math"
 	"fmt"
 	"sort"
 	"strconv"
@@ -886,6 +887,10 @@ type aggRuntime struct {
 	// arrayElemKeys stores ORDER BY key values for array_agg(x ORDER BY y).
 	// Each entry corresponds to arrayElems[i]; nil when no ORDER BY.
 	arrayElemKeys [][]Datum
+	// Variance accumulators (var_pop/var_samp/stddev_pop/stddev_samp).
+	// Uses Welford's online algorithm for numerical stability.
+	floatMean float64 // running mean (Welford M)
+	floatM2   float64 // running sum of squared deviations (Welford S)
 }
 
 func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
@@ -1230,12 +1235,32 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 			st.hasValue = true
 		}
 	default:
-		// Extended aggregates (var_pop, stddev, percentile, etc.):
-		// stub — accumulate into sum/count for numeric, ignore otherwise.
+		// Variance/stddev aggregates: accumulate float sum and sum of squares.
 		// M0097-0007.
-		st.count++
-		if arg.Kind == KindInt {
-			st.sum += arg.Int
+		switch strings.ToLower(call.Name) {
+		case "var_pop", "var_samp", "stddev_pop", "stddev_samp", "stddev", "variance":
+			if !arg.IsNull() {
+				var f float64
+				switch arg.Kind {
+				case KindInt:
+					f = float64(arg.Int)
+				case KindNumeric:
+					f, _ = strconv.ParseFloat(formatNumeric(arg.NumericMantissaValue(), arg.NumericScaleValue()), 64)
+				case KindString:
+					f, _ = strconv.ParseFloat(arg.StringValue(), 64)
+				}
+				// Welford's online algorithm for numerical stability
+				st.count++
+				delta := f - st.floatMean
+				st.floatMean += delta / float64(st.count)
+				delta2 := f - st.floatMean
+				st.floatM2 += delta * delta2
+			}
+		default:
+			st.count++
+			if arg.Kind == KindInt {
+				st.sum += arg.Int
+			}
 		}
 	}
 	return nil
@@ -1360,8 +1385,39 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		}
 		return st.value
 	}
-	// Extended aggregates (var_pop, stddev, etc.) — stub: return NULL.
-	// M0097-0007.
+	// Variance/stddev aggregates. M0097-0007.
+	switch strings.ToLower(call.Name) {
+	case "var_pop", "variance":
+		if st.count == 0 {
+			return NullDatum
+		}
+		varPop := st.floatM2 / float64(st.count)
+		return NewStringDatum(strconv.FormatFloat(varPop, 'f', -1, 64))
+	case "var_samp":
+		if st.count < 2 {
+			return NullDatum
+		}
+		varSamp := st.floatM2 / float64(st.count-1)
+		return NewStringDatum(strconv.FormatFloat(varSamp, 'f', -1, 64))
+	case "stddev_pop":
+		if st.count == 0 {
+			return NullDatum
+		}
+		varPop := st.floatM2 / float64(st.count)
+		if varPop < 0 {
+			varPop = 0
+		}
+		return NewStringDatum(strconv.FormatFloat(math.Sqrt(varPop), 'f', -1, 64))
+	case "stddev_samp", "stddev":
+		if st.count < 2 {
+			return NullDatum
+		}
+		varSamp := st.floatM2 / float64(st.count-1)
+		if varSamp < 0 {
+			varSamp = 0
+		}
+		return NewStringDatum(strconv.FormatFloat(math.Sqrt(varSamp), 'f', -1, 64))
+	}
 	return NullDatum
 }
 
