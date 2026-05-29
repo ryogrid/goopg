@@ -125,7 +125,7 @@ Status policy for this phase:
 | largeobject | `postgres/src/test/regress/sql/largeobject.sql` | `postgres/src/test/regress/expected/largeobject.out` | excluded | Large object; out of scope for goopg v0. |
 | limit | `postgres/src/test/regress/sql/limit.sql` | `postgres/src/test/regress/expected/limit.out` | failed | Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope |
 | line | `postgres/src/test/regress/sql/line.sql` | `postgres/src/test/regress/expected/line.out` | excluded | Geometric type; out of scope for goopg v0. |
-| lock | `postgres/src/test/regress/sql/lock.sql` | `postgres/src/test/regress/expected/lock.out` | failed | Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope |
+| lock | `postgres/src/test/regress/sql/lock.sql` | `postgres/src/test/regress/expected/lock.out` | failed | Attempted via TestPort_RegressSuite; 44 diff lines (down from 83); remaining: SET ROLE / permission denied (role-based access), CREATE VIEW WITH security_invoker, C-language function, inheritance child locking. M0097-0095. |
 | lseg | `postgres/src/test/regress/sql/lseg.sql` | `postgres/src/test/regress/expected/lseg.out` | excluded | Geometric type; out of scope for goopg v0. |
 | macaddr | `postgres/src/test/regress/sql/macaddr.sql` | `postgres/src/test/regress/expected/macaddr.out` | excluded | MAC address type; out of scope for goopg v0. |
 | macaddr8 | `postgres/src/test/regress/sql/macaddr8.sql` | `postgres/src/test/regress/expected/macaddr8.out` | excluded | MAC address (EUI-64) type; out of scope for goopg v0. |

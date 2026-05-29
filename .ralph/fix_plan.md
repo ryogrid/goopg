@@ -1641,6 +1641,27 @@ M0097-0001 wires it up.
         `WARNING: you don't own a lock of type ExclusiveLock/ShareLock`
         when the lock is not held.
         `advisory_lock` → **pass** (0 diff lines). Baseline CSV updated.
+      - **Progress 2026-05-29 (M0097-0095 — lock 83→44 diffs):**
+        Six changes reduce `lock.sql` from 83 to 44 diff lines:
+        (a) `LockTableStmt` parser + executor: `LOCK [TABLE] rel [IN mode MODE]
+            [NOWAIT]` now parsed into a real AST node; NOWAIT/SHARE/IN keywords
+            handled; executor registers relation OIDs in a global
+            `relLockMgr`; released on COMMIT/ROLLBACK via `connTxState.End()`.
+        (b) Transitive view locking: locking a view also locks all tables/views
+            referenced in its SELECT body (FROM, subquery targets, WHERE
+            subqueries); locking a table also locks inheritance children.
+        (c) pg_class includes user views: views (Virtual=true, View!=nil) now
+            appear in pg_class with relkind='v'; previously filtered out.
+        (d) pg_locks includes relation locks via `RelationLockRowsFunc` hook.
+        (e) execCreateView uses `planSchema` for column count: `SELECT * FROM
+            t1, t2` now produces 2-column view (not 1-column from raw targets).
+        (f) Planner cycle guard: `viewPlanDepth` atomic counter prevents
+            infinite recursion on circular view definitions (depth > 64 →
+            42P10 error; treated as 0A000 at CREATE VIEW time so circular views
+            are created without error).
+        Remaining 44 diffs: SET ROLE / permission denied (role-based access),
+        CREATE VIEW WITH security_invoker, C-language function, DROP SCHEMA CASCADE notice.
+        Design: `docs/design/0097-0095-lock-table-pg-locks-tracking.md`.
 
 - [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
       - Summary: Make these 10 tests reach `pass`:
