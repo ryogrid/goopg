@@ -24,6 +24,11 @@ var (
 	ErrDatabaseNotFound = errors.New("database does not exist")
 )
 
+// RelationLockRowsFunc is optionally set by the executor to provide
+// currently-held relation lock rows (from LOCK TABLE) for pg_locks.
+// Same column order as AdvisoryLockRowsFunc. M0097.
+var RelationLockRowsFunc func() [][]string
+
 // AdvisoryLockRowsFunc is optionally set by the executor to provide
 // currently-held advisory lock rows for the pg_locks virtual table.
 // Each returned slice has the same column order as pg_locks.VirtualRows:
@@ -936,9 +941,9 @@ func (c *InMemory) registerSystemTables() {
 		out := make([][]string, 0, len(c.tables)+len(c.indexes))
 		for _, k := range keys {
 			t := c.tables[k]
-			if t.Virtual {
-				// Don't list ourselves in our own view — keeps the
-				// regclass probe shape predictable for pgbench.
+			if t.Virtual && t.View == nil && !t.IsMatView {
+				// Skip system-catalog virtual tables (pg_class, pg_locks, etc.)
+				// but include user views (t.View != nil) and materialized views.
 				continue
 			}
 			relkind := "r"
@@ -1310,6 +1315,9 @@ func (c *InMemory) registerSystemTables() {
 		// classid, objid, objsubid, virtualtransaction, pid, mode, granted, fastpath, waitstart
 		rows := [][]string{
 			{"relation", "16384", "1259", "", "", "", "", "", "", "", "1/1", "0", "AccessShareLock", "t", "t", ""},
+		}
+		if RelationLockRowsFunc != nil {
+			rows = append(rows, RelationLockRowsFunc()...)
 		}
 		if AdvisoryLockRowsFunc != nil {
 			rows = append(rows, AdvisoryLockRowsFunc()...)

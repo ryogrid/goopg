@@ -429,18 +429,9 @@ identLedStatement:
 			}
 			return &CompatNoopStmt{pos: t.Pos, Tag: "SECURITY LABEL"}, nil
 		case "lock":
-			// LOCK [TABLE] tablename [IN lockmode MODE] [NOWAIT] — accept as no-op.
-			// goopg's MVCC does not need explicit table locking for correctness;
-			// parsing the statement prevents "syntax error at or near 'lock'" noise
-			// in regress tests that LOCK tables before querying pg_locks. M0097-0071.
-			p.advance()
-			for p.cur().Kind != TokenEOF {
-				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
-					break
-				}
-				p.advance()
-			}
-			return &CompatNoopStmt{pos: t.Pos, Tag: "LOCK TABLE"}, nil
+			// LOCK [TABLE] [ONLY] rel [, ...] [IN lock_mode MODE] [NOWAIT].
+			// M0097: parse into LockTableStmt so the executor can track locks in pg_locks.
+			return p.parseLockTable(t.Pos)
 		}
 	}
 	return nil, p.errAtCur("unsupported statement")
@@ -1888,4 +1879,115 @@ func (p *parser) parseCloseCursor() (Stmt, error) {
 	name := nameToken.Value
 	p.advance()
 	return &CloseStmt{pos: pos, Name: name}, nil
+}
+
+// parseLockTable parses LOCK [TABLE] [ONLY] rel [, ...] [IN lock_mode MODE] [NOWAIT].
+// Lock mode names follow PostgreSQL convention (e.g. "AccessExclusiveLock"). M0097.
+func (p *parser) parseLockTable(pos int) (*LockTableStmt, error) {
+	p.advance() // consume "lock"
+	// skip optional TABLE keyword (it's a keyword token KwTable)
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTable {
+		p.advance()
+	}
+	// parse relation list: [ONLY] schema.table [*] [, ...]
+	var rels []LockTableRelation
+	for {
+		// skip optional ONLY keyword
+		p.acceptIdentKeyword("only")
+		// relation name: must be ident or keyword (for reserved-word table names)
+		tok := p.cur()
+		if tok.Kind != TokenIdent && tok.Kind != TokenKeyword {
+			return nil, p.errAtCur("expected relation name")
+		}
+		name := tok.Value
+		p.advance()
+		var schema string
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+			p.advance()
+			schema = name
+			tok2 := p.cur()
+			if tok2.Kind != TokenIdent && tok2.Kind != TokenKeyword {
+				return nil, p.errAtCur("expected relation name after schema")
+			}
+			name = tok2.Value
+			p.advance()
+		}
+		// skip optional * (inheritance wildcard)
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+			p.advance()
+		}
+		rels = append(rels, LockTableRelation{Schema: schema, Name: name})
+		if p.cur().Kind != TokenSymbol || p.cur().Value != "," {
+			break
+		}
+		p.advance() // consume ","
+	}
+	// parse optional IN <mode> MODE — "IN" is a keyword (KwIn)
+	mode := "AccessExclusiveLock" // default per PostgreSQL
+	if (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwIn) ||
+		(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "in")) {
+		p.advance() // consume "in"
+		mode = p.parseLockMode()
+		// consume optional MODE keyword (may be TokenIdent or TokenKeyword)
+		if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "mode") {
+			p.advance()
+		}
+	}
+	// parse optional NOWAIT (KwNowait is a keyword token)
+	noWait := false
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNowait {
+		noWait = true
+		p.advance()
+	}
+	return &LockTableStmt{pos: pos, Relations: rels, Mode: mode, NoWait: noWait}, nil
+}
+
+// lockModeWords maps multi-word lock modes to their PostgreSQL internal name.
+var lockModeNames = []struct {
+	words []string
+	name  string
+}{
+	{[]string{"access", "share"}, "AccessShareLock"},
+	{[]string{"row", "share"}, "RowShareLock"},
+	{[]string{"row", "exclusive"}, "RowExclusiveLock"},
+	{[]string{"share", "update", "exclusive"}, "ShareUpdateExclusiveLock"},
+	{[]string{"share", "row", "exclusive"}, "ShareRowExclusiveLock"},
+	{[]string{"share"}, "ShareLock"},
+	{[]string{"exclusive"}, "ExclusiveLock"},
+	{[]string{"access", "exclusive"}, "AccessExclusiveLock"},
+}
+
+// parseLockMode reads the lock mode keywords (without the trailing MODE keyword).
+func (p *parser) parseLockMode() string {
+	// collect words until we hit MODE or a non-identifier token
+	var words []string
+	for {
+		tok := p.cur()
+		if tok.Kind == TokenIdent || tok.Kind == TokenKeyword {
+			w := strings.ToLower(tok.Value)
+			if w == "mode" {
+				break
+			}
+			words = append(words, w)
+			p.advance()
+		} else {
+			break
+		}
+	}
+	// match against known multi-word modes (longest match first)
+	for _, entry := range lockModeNames {
+		if len(entry.words) == len(words) {
+			match := true
+			for i, w := range entry.words {
+				if words[i] != w {
+					match = false
+					break
+				}
+			}
+			if match {
+				return entry.name
+			}
+		}
+	}
+	return "AccessExclusiveLock" // fallback
 }

@@ -1192,6 +1192,24 @@ func (s *DropCompatStmt) stmtNode() {}
 func (s *CompatNoopStmt) Pos() int  { return s.pos }
 func (s *CompatNoopStmt) stmtNode() {}
 
+// LockTableRelation is one relation target inside a LOCK TABLE statement.
+type LockTableRelation struct {
+	Schema string
+	Name   string
+}
+
+// LockTableStmt — `LOCK [TABLE] [ONLY] rel [, ...] [IN lock_mode MODE] [NOWAIT]`.
+// Mode is the PostgreSQL lock mode name (e.g. "AccessExclusiveLock"). M0097.
+type LockTableStmt struct {
+	pos       int
+	Relations []LockTableRelation
+	Mode      string // PostgreSQL lock mode name
+	NoWait    bool
+}
+
+func (s *LockTableStmt) Pos() int  { return s.pos }
+func (s *LockTableStmt) stmtNode() {}
+
 // CreatePublicationStmt — `CREATE PUBLICATION name [FOR ALL TABLES |
 // FOR TABLE t1 [, t2 ...]] [WITH (k = v, ...)]`. v0 honours
 // `publish = 'insert,update,delete'`; truncate / row filters /

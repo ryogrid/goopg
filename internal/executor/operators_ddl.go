@@ -109,6 +109,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateOpClass(s)
 	case *parser.CompatNoopStmt:
 		return nil, nil // GRANT/REVOKE/COMMENT/etc — accepted, no-op. M0097-0016.
+	case *parser.LockTableStmt:
+		return nil, o.execLockTable(s)
 	case *parser.DoStmt:
 		return nil, o.execDoBlock(s)
 	case *parser.CreateTypeStmt:
@@ -793,7 +795,10 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 		// the planner's incompleteness does not reject views upstream
 		// would accept; those fail at reference time instead.
 		if pe, ok := err.(*planner.PlanError); ok {
-			if pe.Code != "0A000" {
+			// Ignore feature-not-supported (0A000) and circular-view (42P10)
+			// errors — PostgreSQL allows circular/forward-referencing views;
+			// they only error when accessed, not when defined.
+			if pe.Code != "0A000" && pe.Code != "42P10" {
 				return &ExecError{Code: pe.Code, Message: pe.Message, Hint: pe.Hint, Pos: pe.Pos}
 			}
 		} else {
@@ -805,34 +810,77 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
 		}
 	}
-	// Compute the column count + names. Aliases override the
-	// SELECT's target-list names; otherwise derive from the
-	// target shape — bare ColumnRef → its name, FuncCall →
-	// the function name (matches upstream's "sum" / "count"
-	// convention).
-	// Re-plan to get actual column types (e.g. `tid` for ctid). M0097-0038.
+	// Compute the column count + names. Use planSchema (which expands
+	// * and handles multi-table FROM) as the authoritative column list.
+	// Aliases override the planner's names; otherwise derive from the
+	// planned output. M0097-0038.
+	//
+	// For OR REPLACE: temporarily remove the existing view so that the
+	// new body's plan doesn't recurse back into the old definition
+	// (circular-view stack overflow). The view is removed only for the
+	// duration of planning, then re-inserted when we call CreateView below.
 	var planSchema planner.Schema
+	if s.OrReplace {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			_ = im.DropView(s.Name, true) // remove old def so plan can't cycle back to it
+		}
+	}
 	if viewPlan, planErr := planner.Plan(s.Query, o.ctx.Catalog); planErr == nil {
 		planSchema = viewPlan.Output()
 	}
-	cols := make([]catalog.Column, 0, len(s.Query.Targets))
-	for i, tgt := range s.Query.Targets {
-		name := ""
-		if i < len(s.Columns) {
-			name = s.Columns[i]
-		} else if tgt.Alias != "" {
-			name = tgt.Alias
+	// Ignore plan errors during view creation (including circular-view 42P10).
+	// PostgreSQL allows circular view definitions; they fail only when accessed.
+	var cols []catalog.Column
+	if len(planSchema) > 0 {
+		// Use plan-derived schema: handles * expansion, multi-table FROM, etc.
+		cols = make([]catalog.Column, len(planSchema))
+		for i, sc := range planSchema {
+			name := ""
+			if i < len(s.Columns) {
+				name = s.Columns[i]
+			} else if i < len(s.Query.Targets) {
+				tgt := s.Query.Targets[i]
+				if tgt.Alias != "" {
+					name = tgt.Alias
+				} else {
+					name = deriveTargetName(tgt.Expr)
+				}
+			}
+			if name == "" {
+				name = sc.Name
+			}
+			if name == "" {
+				name = fmt.Sprintf("?column?%d", i+1)
+			}
+			typ := sc.Type
+			if typ.Name == "" {
+				typ = catalog.Type{Name: "unknown"}
+			}
+			cols[i] = catalog.Column{Name: name, Type: typ}
+		}
+	} else {
+		// Fallback: use target list when planning fails (0A000 cases or cycles).
+		// If explicit column aliases were provided, use them to determine count.
+		if len(s.Columns) > 0 {
+			cols = make([]catalog.Column, len(s.Columns))
+			for i, alias := range s.Columns {
+				cols[i] = catalog.Column{Name: alias, Type: catalog.Type{Name: "unknown"}}
+			}
 		} else {
-			name = deriveTargetName(tgt.Expr)
+			cols = make([]catalog.Column, 0, len(s.Query.Targets))
+			for i, tgt := range s.Query.Targets {
+				name := ""
+				if tgt.Alias != "" {
+					name = tgt.Alias
+				} else {
+					name = deriveTargetName(tgt.Expr)
+				}
+				if name == "" {
+					name = fmt.Sprintf("?column?%d", i+1)
+				}
+				cols = append(cols, catalog.Column{Name: name, Type: catalog.Type{Name: "unknown"}})
+			}
 		}
-		if name == "" {
-			name = fmt.Sprintf("?column?%d", i+1)
-		}
-		typ := catalog.Type{Name: "unknown"}
-		if i < len(planSchema) && planSchema[i].Type.Name != "" {
-			typ = planSchema[i].Type
-		}
-		cols = append(cols, catalog.Column{Name: name, Type: typ})
 	}
 	if _, err := o.ctx.Catalog.CreateView(s.Name, cols, s.Columns, s.Query, s.OrReplace); err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
@@ -3420,4 +3468,186 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		}
 	}
 	return nil
+}
+
+// execLockTable handles LOCK [TABLE] rel [, ...] [IN mode MODE] [NOWAIT].
+// It records the held locks in globalRelLockMgr so they appear in pg_locks.
+// PostgreSQL transitively locks all relations that a view depends on, so
+// locking a view also locks its underlying tables/views recursively. M0097.
+// The locks are released when the session's transaction ends (execCommit/execRollback).
+func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
+	sess := o.ctx.Session
+	if sess == nil {
+		return nil
+	}
+	dbOID := uint32(16384) // default DB OID
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		dbOID = im.DBOID()
+	}
+	// Resolve search_path schemas for unqualified names.
+	searchSchemas := lockTableSearchSchemas(o.ctx)
+	visited := make(map[uint32]bool)
+	for _, rel := range s.Relations {
+		tbl, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: rel.Schema, Name: rel.Name})
+		if !ok && rel.Schema == "" {
+			for _, sc := range searchSchemas {
+				tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: rel.Name})
+				if ok {
+					break
+				}
+			}
+		}
+		if !ok {
+			return &ExecError{
+				Code:    "42P01",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("relation \"%s\" does not exist", rel.Name),
+			}
+		}
+		lockRelationTransitively(sess, dbOID, s.Mode, tbl, o.ctx.Catalog, visited)
+	}
+	return nil
+}
+
+// lockRelationTransitively registers a lock on tbl and recursively locks:
+// (a) for views: all tables/views referenced by the view's body;
+// (b) for tables: all inheritance children.
+// This mirrors PostgreSQL's behaviour for LOCK TABLE. M0097.
+func lockRelationTransitively(sess Session, dbOID uint32, mode string, tbl *catalog.Table, cat catalog.Catalog, visited map[uint32]bool) {
+	if visited[tbl.OID] {
+		return
+	}
+	visited[tbl.OID] = true
+	globalRelLockMgr.AddRelationLock(sess, dbOID, tbl.OID, mode)
+	if tbl.View != nil {
+		// Walk the view body to find referenced tables/views.
+		refs := collectSelectTableRefs(tbl.View)
+		for _, ref := range refs {
+			dep, ok := cat.LookupTable(parser.ObjectName{Schema: ref.Schema, Name: ref.Name})
+			if !ok && ref.Schema == "" {
+				dep, ok = cat.LookupTable(parser.ObjectName{Schema: "public", Name: ref.Name})
+			}
+			if !ok {
+				continue
+			}
+			lockRelationTransitively(sess, dbOID, mode, dep, cat, visited)
+		}
+	} else {
+		// Lock inheritance children transitively (PostgreSQL also acquires
+		// locks on all children when a parent table is locked).
+		if im, ok := cat.(*catalog.InMemory); ok {
+			for _, child := range im.InheritanceChildren(tbl.OID) {
+				lockRelationTransitively(sess, dbOID, mode, child, cat, visited)
+			}
+		}
+	}
+}
+
+// collectSelectTableRefs walks a SelectStmt and collects all table/view
+// RangeVar references, including those inside subquery expressions. M0097.
+func collectSelectTableRefs(sel *parser.SelectStmt) []parser.RangeVar {
+	if sel == nil {
+		return nil
+	}
+	var refs []parser.RangeVar
+	// Walk From (flat list) and FromExprs (JOIN structure).
+	collectFromRangeVars(sel.From, &refs)
+	for _, fe := range sel.FromExprs {
+		collectFromRangeVars([]parser.RangeVar{fe.Base}, &refs)
+		for _, j := range fe.Joins {
+			collectFromRangeVars([]parser.RangeVar{j.Right}, &refs)
+		}
+	}
+	// Walk SELECT target expressions for scalar subqueries.
+	for _, tgt := range sel.Targets {
+		collectExprTableRefs(tgt.Expr, &refs)
+	}
+	// Walk WHERE for IN-subquery and correlated subqueries.
+	collectExprTableRefs(sel.Where, &refs)
+	// Walk set-operation right side (UNION/INTERSECT/EXCEPT).
+	if sel.SetOp != nil && sel.SetOp.Right != nil {
+		refs = append(refs, collectSelectTableRefs(sel.SetOp.Right)...)
+	}
+	return refs
+}
+
+// collectFromRangeVars recursively collects table/view RangeVars from a FROM list.
+func collectFromRangeVars(from []parser.RangeVar, out *[]parser.RangeVar) {
+	for _, rv := range from {
+		if rv.Name != "" {
+			*out = append(*out, rv)
+		}
+		if rv.Subquery != nil {
+			refs := collectSelectTableRefs(rv.Subquery)
+			*out = append(*out, refs...)
+		}
+	}
+}
+
+// collectExprTableRefs walks an expression tree for subquery table refs.
+func collectExprTableRefs(expr parser.Expr, out *[]parser.RangeVar) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *parser.SubqueryExpr:
+		if e.Inner != nil {
+			*out = append(*out, collectSelectTableRefs(e.Inner)...)
+		}
+	case *parser.InExpr:
+		collectExprTableRefs(e.Operand, out)
+		if e.Subquery != nil {
+			*out = append(*out, collectSelectTableRefs(e.Subquery)...)
+		}
+		for _, v := range e.List {
+			collectExprTableRefs(v, out)
+		}
+	case *parser.BinaryOp:
+		collectExprTableRefs(e.Left, out)
+		collectExprTableRefs(e.Right, out)
+	case *parser.UnaryOp:
+		collectExprTableRefs(e.Operand, out)
+	case *parser.FuncCall:
+		for _, a := range e.Args {
+			collectExprTableRefs(a, out)
+		}
+		collectExprTableRefs(e.Filter, out)
+	case *parser.CastExpr:
+		collectExprTableRefs(e.Operand, out)
+	case *parser.CaseExpr:
+		collectExprTableRefs(e.Operand, out)
+		for _, w := range e.Whens {
+			collectExprTableRefs(w.When, out)
+			collectExprTableRefs(w.Then, out)
+		}
+		collectExprTableRefs(e.Else, out)
+	case *parser.ExistsExpr:
+		if e.Subquery != nil {
+			*out = append(*out, collectSelectTableRefs(e.Subquery)...)
+		}
+	}
+}
+
+// lockTableSearchSchemas returns the ordered list of schemas to search when
+// resolving an unqualified LOCK TABLE target. Reads search_path GUC; falls
+// back to "public" when not available.
+func lockTableSearchSchemas(ctx *Context) []string {
+	sp := `"$user", public`
+	if ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("search_path"); ok {
+			sp = v
+		}
+	}
+	var result []string
+	for _, raw := range strings.Split(sp, ",") {
+		s := strings.TrimSpace(strings.Trim(strings.TrimSpace(raw), `"'`))
+		if s == "" || s == "$user" {
+			continue
+		}
+		result = append(result, s)
+	}
+	if len(result) == 0 {
+		result = []string{"public"}
+	}
+	return result
 }

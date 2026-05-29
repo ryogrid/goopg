@@ -4,11 +4,23 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
+
+// viewPlanDepth is a goroutine-local-ish counter that prevents infinite
+// recursion when planning circular view definitions. Each call to Plan that
+// plans a view body increments it; exceeding maxViewPlanDepth returns a
+// cycle error instead of growing the stack. Because Go lacks true TLS, we
+// use an atomic process-global counter — it's conservative (may incorrectly
+// detect "cycles" under extreme parallel planning) but prevents crashes.
+// M0097: lock-test circular view (lock_view2 ↔ lock_view3 cycle guard).
+var viewPlanDepth atomic.Int32
+
+const maxViewPlanDepth = 64
 
 // PlanError is the planner's structured error. SQLSTATE-style codes
 // align with upstream's `errcodes.txt`; the analyzer/executor passes
@@ -91,6 +103,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt,
 		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt,
 		*parser.CompatNoopStmt,
+		*parser.LockTableStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
 		*parser.CreateDomainStmt, *parser.DropDomainStmt,
 		*parser.CreateAggregateStmt,
@@ -1845,6 +1858,16 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// alias list. Column count must match what the view
 	// declared; v0 reports a planner error otherwise.
 	if tbl.View != nil {
+		// Cycle guard: prevent infinite recursion on circular view definitions.
+		depth := viewPlanDepth.Add(1)
+		defer viewPlanDepth.Add(-1)
+		if depth > maxViewPlanDepth {
+			return nil, rangeBinding{}, &PlanError{
+				Pos:  rv.Pos(),
+				Code: "42P10",
+				Message: fmt.Sprintf("view %q has a circular definition", tbl.QualifiedName()),
+			}
+		}
 		inner, err := Plan(tbl.View, cat)
 		if err != nil {
 			return nil, rangeBinding{}, err

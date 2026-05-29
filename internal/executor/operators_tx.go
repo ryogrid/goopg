@@ -152,6 +152,7 @@ func (o *transactionOp) execCommit() error {
 		_ = o.ctx.SyncRep.WaitForLSN(o.ctx.Ctx, o.ctx.WAL.WrittenLSN(), o.ctx.SyncCommitMode)
 	}
 	o.ctx.Session.EndExplicitTransaction()
+	globalRelLockMgr.ReleaseSession(o.ctx.Session)
 	o.clearCtxTransaction()
 	return nil
 }
@@ -175,6 +176,7 @@ func (o *transactionOp) execRollback() error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	o.ctx.Session.EndExplicitTransaction()
+	globalRelLockMgr.ReleaseSession(o.ctx.Session)
 	o.clearCtxTransaction()
 	return nil
 }
