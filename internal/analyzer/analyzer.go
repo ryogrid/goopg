@@ -1850,8 +1850,15 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar, outerCtx *
 		return nil, err
 	}
 	innerCtx := &scope{cat: cat, parent: outerCtx}
+	// When the subquery has a WITH clause, register the CTEs in innerCtx so
+	// that buildSelectScopeIn can find CTE-named tables via resolveTable
+	// (which walks the scope chain). buildSelectScope uses lookupTable which
+	// is catalog-only and silently drops CTE names. M0097-0098.
+	if rv.Subquery.With != nil {
+		_ = analyzeWith(rv.Subquery.With, innerCtx)
+	}
 	if len(rv.Subquery.From) > 0 || len(rv.Subquery.FromExprs) > 0 {
-		rels, err := buildSelectScope(rv.Subquery, cat)
+		rels, err := buildSelectScopeIn(rv.Subquery, innerCtx)
 		if err != nil {
 			return nil, err
 		}
