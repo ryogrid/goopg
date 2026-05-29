@@ -1494,11 +1494,19 @@ func resolveTable(ctx *scope, rv parser.RangeVar) (*catalog.Table, error) {
 // columns, registers the CTE in the scope, then analyzes the recursive
 // member (right side) with the CTE self-reference visible.
 func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
+	// PostgreSQL rejects DML inside a WITH RECURSIVE body with
+	// "recursive query must not contain data-modifying statements" (42P19).
+	if cte.DMLBody != nil {
+		return analyzeError(cte.Pos(), "42P19",
+			fmt.Sprintf("recursive query %q must not contain data-modifying statements", cte.Name))
+	}
 	body := cte.Query
-	if body.SetOp == nil || body.SetOp.Type != parser.SetOpUnion || !body.SetOp.All {
+	// PostgreSQL allows both UNION and UNION ALL for recursive CTEs.
+	// Only fall back to the non-recursive path when there is no set operation
+	// (body.SetOp == nil) or the set operation is not UNION-family (Intersect/Except).
+	if body.SetOp == nil || body.SetOp.Type != parser.SetOpUnion {
 		// No recursive self-join — just analyse the body as a
-		// regular CTE.  The planner enforces the UNION ALL
-		// requirement for true recursive CTEs.
+		// regular CTE.
 		if err := analyzeSelectWithParent(body, ctx.cat, ctx); err != nil {
 			return err
 		}

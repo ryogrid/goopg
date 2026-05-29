@@ -261,6 +261,16 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
 		table:  &catalog.Table{Name: cte.Name, Columns: wtCols},
 	}
 
+	// Validate the recursive member for structural constraints before planning.
+	if err := validateRecursiveMember(key, cte.Name, cte.Pos(), cte.Query.SetOp.Right); err != nil {
+		if hadEntry {
+			planCTEs[key] = savedEntry
+		} else {
+			delete(planCTEs, key)
+		}
+		return nil, err
+	}
+
 	rec, err := planSelect(cte.Query.SetOp.Right, cat)
 	if err != nil {
 		if hadEntry {
@@ -289,6 +299,113 @@ func lookupPlannedCTE(name string) *plannedCTE {
 		return nil
 	}
 	return planCTEs[strings.ToLower(name)]
+}
+
+// validateRecursiveMember checks that the recursive member of a WITH RECURSIVE
+// CTE satisfies PostgreSQL's structural constraints (PostgreSQL 14+ checks).
+// Returns a PlanError with SQLSTATE 0A000 if any constraint is violated.
+// cteNameLower is the lowercase CTE name; ctePos is used for error position.
+func validateRecursiveMember(cteNameLower string, cteName string, ctePos int, rec *parser.SelectStmt) error {
+	w := &recRefWalker{name: cteNameLower, origName: cteName, pos: ctePos}
+	w.walkSelect(rec, false, false, false)
+	return w.err
+}
+
+// recRefWalker walks a recursive member's AST counting references to the
+// recursive CTE name and detecting structural constraint violations.
+type recRefWalker struct {
+	name     string // lowercase CTE name
+	origName string // original (display) name
+	pos      int    // position for error reporting
+	refs     int    // total references found so far
+	err      error  // first error found
+}
+
+func (w *recRefWalker) setErr(err error) {
+	if w.err == nil {
+		w.err = err
+	}
+}
+
+func (w *recRefWalker) walkSelect(sel *parser.SelectStmt, inSub, inExceptRight, inOuter bool) {
+	if sel == nil || w.err != nil {
+		return
+	}
+	if sel.SetOp != nil {
+		if sel.SetOp.Type == parser.SetOpExcept {
+			sub := &recRefWalker{name: w.name, origName: w.origName, pos: w.pos}
+			sub.walkSelect(sel.SetOp.Right, inSub, true, false)
+			if sub.refs > 0 {
+				w.setErr(&PlanError{Pos: w.pos, Code: "0A000",
+					Message: fmt.Sprintf("recursive reference to query %q must not appear within EXCEPT", w.origName)})
+				return
+			}
+		} else {
+			w.walkSelect(sel.SetOp.Right, inSub, inExceptRight, inOuter)
+		}
+	}
+	if len(sel.FromExprs) > 0 {
+		for _, fexpr := range sel.FromExprs {
+			w.walkFromExpr(fexpr, inSub, inExceptRight)
+			if w.err != nil {
+				return
+			}
+		}
+	} else {
+		for _, rv := range sel.From {
+			w.walkRangeVar(rv, inSub, inExceptRight, inOuter)
+			if w.err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (w *recRefWalker) walkRangeVar(rv parser.RangeVar, inSub, inExceptRight, inOuter bool) {
+	if w.err != nil {
+		return
+	}
+	if rv.Subquery != nil {
+		sub := &recRefWalker{name: w.name, origName: w.origName, pos: w.pos}
+		sub.walkSelect(rv.Subquery, true, inExceptRight, false)
+		if sub.refs > 0 {
+			w.setErr(&PlanError{Pos: w.pos, Code: "0A000",
+				Message: fmt.Sprintf("recursive reference to query %q must not appear within a subquery", w.origName)})
+		}
+		w.refs += sub.refs
+		return
+	}
+	if strings.ToLower(rv.Name) != w.name {
+		return
+	}
+	w.refs++
+	if inExceptRight {
+		w.setErr(&PlanError{Pos: w.pos, Code: "0A000",
+			Message: fmt.Sprintf("recursive reference to query %q must not appear within EXCEPT", w.origName)})
+	} else if inSub {
+		w.setErr(&PlanError{Pos: w.pos, Code: "0A000",
+			Message: fmt.Sprintf("recursive reference to query %q must not appear within a subquery", w.origName)})
+	} else if inOuter {
+		w.setErr(&PlanError{Pos: w.pos, Code: "0A000",
+			Message: fmt.Sprintf("recursive reference to query %q must not appear within an outer join", w.origName)})
+	} else if w.refs > 1 {
+		w.setErr(&PlanError{Pos: w.pos, Code: "0A000",
+			Message: fmt.Sprintf("recursive reference to query %q must not appear more than once", w.origName)})
+	}
+}
+
+func (w *recRefWalker) walkFromExpr(fexpr parser.FromExpr, inSub, inExceptRight bool) {
+	if w.err != nil {
+		return
+	}
+	w.walkRangeVar(fexpr.Base, inSub, inExceptRight, false)
+	for _, j := range fexpr.Joins {
+		if w.err != nil {
+			return
+		}
+		isOuter := j.Type == parser.JoinLeft || j.Type == parser.JoinRight || j.Type == parser.JoinFull
+		w.walkRangeVar(j.Right, inSub, inExceptRight, isOuter)
+	}
 }
 
 
