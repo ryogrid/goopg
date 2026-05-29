@@ -457,6 +457,7 @@ type RangeVar struct {
 	Columns   []string // optional column-alias list: (SELECT …) AS t (c1, c2)
 	Subquery  *SelectStmt
 	TableFunc *TableFuncRef // M0096-0006: table-valued function (e.g. generate_series)
+	Only      bool          // FROM ONLY tablename — skip inheritance children
 }
 
 // TableFuncRef is a table-valued function used in the FROM clause.

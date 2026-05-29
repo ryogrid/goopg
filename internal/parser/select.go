@@ -1086,6 +1086,10 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	// ordinary derived tables (no correlated-outer-reference evaluation).
 	_ = p.acceptKeyword(KwLateral)
 
+	// FROM ONLY tablename — consume the ONLY keyword; the planner will skip
+	// inheritance children for this table reference. M0097-0099.
+	onlyModifier := p.acceptIdentKeyword("only")
+
 	// Derived table: `(SELECT …) AS alias`. The alias is mandatory
 	// in upstream PG; we mirror that. Scan past any leading `(`
 	// tokens to find SELECT/VALUES/WITH/TABLE so that double-nested
@@ -1187,7 +1191,7 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	if err != nil {
 		return RangeVar{}, err
 	}
-	rv := RangeVar{pos: obj.pos, Schema: obj.Schema, Name: obj.Name}
+	rv := RangeVar{pos: obj.pos, Schema: obj.Schema, Name: obj.Name, Only: onlyModifier}
 
 	// Table-valued function call: name(arg, …) [AS alias] (M0096-0006).
 	// Recognized: generate_series, pg_input_error_info, parse_ident,

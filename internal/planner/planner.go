@@ -1963,7 +1963,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// rows), an inherited parent may itself contain rows, so the parent scan
 	// is always included first.  M0097-0046: expand recursively so that
 	// grandchildren (e.g. stud_emp → emp → person) are included too.
-	if im, ok := cat.(*catalog.InMemory); ok {
+	// FROM ONLY tablename skips all children (M0097-0099).
+	if im, ok := cat.(*catalog.InMemory); ok && !rv.Only {
 		allDesc := collectInheritanceDescendants(im, tbl.OID)
 
 		if len(allDesc) > 0 {
@@ -3727,8 +3728,54 @@ func resolveTargetsAfterAggregate(targets []parser.ResTarget, agg *aggregateSurf
 	out := make([]Expr, 0, len(targets))
 	schema := make(Schema, 0, len(targets))
 	for _, t := range targets {
-		if _, ok := t.Expr.(*parser.StarExpr); ok {
-			return nil, nil, &PlanError{Pos: t.Pos(), Code: "0A000", Message: "SELECT * with GROUP BY/aggregate is not supported in v0 planner"}
+		if star, ok := t.Expr.(*parser.StarExpr); ok {
+			// Expand * into concrete column refs using the aggregate input context,
+			// then validate each column against the aggregate surface (GROUP BY or
+			// functional dependency). This mirrors PostgreSQL's expandRTE + GROUP BY
+			// column check. M0097-0099.
+			expanded, expandedSchema, err := expandStarTarget(star, agg.input)
+			if err != nil {
+				return nil, nil, err
+			}
+			for i, colExpr := range expanded {
+				cr := colExpr.(*ColumnRef)
+				var outExpr Expr
+				if outIdx, ok2 := agg.groupByInputCol[cr.Index]; ok2 {
+					outExpr = &ColumnRef{pos: cr.pos, Index: outIdx, Name: agg.output.schema[outIdx].Name, Type: agg.output.schema[outIdx].Type}
+				} else if outIdx, already := agg.funcDepCols[cr.Index]; already {
+					outExpr = &ColumnRef{pos: cr.pos, Index: outIdx, Name: agg.output.schema[outIdx].Name, Type: agg.output.schema[outIdx].Type}
+				} else if isColumnFunctionallyDetermined(cr, agg) {
+					outIdx := len(agg.node.schema)
+					sc := SchemaColumn{Name: cr.Name, Type: cr.Type, SourceTableIdx: cr.SourceTableIdx}
+					agg.node.schema = append(agg.node.schema, sc)
+					agg.output.schema = append(agg.output.schema, sc)
+					agg.node.Passthrough = append(agg.node.Passthrough, cr)
+					agg.funcDepCols[cr.Index] = outIdx
+					outExpr = &ColumnRef{pos: cr.pos, Index: outIdx, Name: sc.Name, Type: sc.Type}
+				} else {
+					colName := cr.Name
+					for _, b := range agg.input.bindings {
+						if b.sourceIdx == cr.SourceTableIdx {
+							tbl := b.alias
+							if tbl == "" {
+								tbl = b.table.Name
+							}
+							if tbl != "" {
+								colName = tbl + "." + cr.Name
+							}
+							break
+						}
+					}
+					return nil, nil, &PlanError{
+						Pos:     cr.pos,
+						Code:    "42803",
+						Message: fmt.Sprintf("column %q must appear in the GROUP BY clause or be used in an aggregate function", colName),
+					}
+				}
+				out = append(out, outExpr)
+				schema = append(schema, SchemaColumn{Name: expandedSchema[i].Name, Type: expandedSchema[i].Type})
+			}
+			continue
 		}
 		e, err := resolveExprAfterAggregate(t.Expr, agg)
 		if err != nil {
