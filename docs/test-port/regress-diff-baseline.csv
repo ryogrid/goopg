@@ -122,8 +122,8 @@ insert,514,failed
 update,450,failed
 explain,703,failed
 subselect,697,failed
-join,1302,failed
-inherit,1306,failed
-aggregates,1338,failed
-partition_join,1441,failed
-with,2414,failed
+join,1088,failed
+inherit,1162,failed
+aggregates,1074,failed
+partition_join,1293,failed
+with,2283,failed
