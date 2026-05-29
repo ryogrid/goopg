@@ -140,6 +140,34 @@ func newCteScanOp(p *planner.CTEScan) (*cteScanOp, error) {
 func (o *cteScanOp) Schema() planner.Schema { return o.plan.Output() }
 
 func (o *cteScanOp) Open(ctx *Context) error {
+	// WorkTableScan is the self-reference inside a recursive CTE body.
+	// It must NOT be cached — each recursive iteration needs fresh rows
+	// from ctx.WorkTableRows. Skip the cache entirely for these. M0097-0099.
+	if _, isWorkTable := o.plan.Child.(*planner.WorkTableScan); isWorkTable {
+		if err := o.child.Open(ctx); err != nil {
+			return err
+		}
+		var rows []Row
+		for {
+			slot, err := o.child.Next()
+			if err == EOF {
+				break
+			}
+			if err != nil {
+				o.child.Close()
+				return err
+			}
+			r := slotRow(slot)
+			owned := make(Row, len(r))
+			copy(owned, r)
+			rows = append(rows, owned)
+		}
+		o.child.Close()
+		o.rows = rows
+		o.idx = 0
+		return nil
+	}
+
 	key := strings.ToLower(o.plan.Name)
 	if ctx.CTERowCache != nil {
 		if cached, ok := ctx.CTERowCache[key]; ok {
