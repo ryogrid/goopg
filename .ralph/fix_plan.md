@@ -1536,6 +1536,38 @@ M0097-0001 wires it up.
         normalize to "N.N" matching PG's float representation.
         explain regress: 703→665.
 
+      - **Progress 2026-05-29 (M0097-0088 — scalar subqueries in VALUES rows):**
+        planInsert now uses ctx.cat=cat for VALUES rows, enabling planSubqueryExpr
+        to plan scalar subqueries like (SELECT 2) inside VALUES cells.
+        insert regress: 514→499.
+
+      - **Progress 2026-05-29 (M0097-0089 — array_construct element type + subquery array subscript):**
+        exprType for array_construct returns element type with [] suffix.
+        array_subscript SubqueryExpr case: infer element type from subquery output.
+        subselect regress: 692→686.
+
+      - **Progress 2026-05-29 (M0097-0090 — 'float' type recognized as float8 alias):**
+        Added bare 'float' to isNumericTypeName, isNumericOrIntegerTarget, isFloatSourceType,
+        evalCast float4/float8 cases, and server typeOIDFor (OID 701 = float8).
+        subselect regress: 686→679.
+
+      - **Progress 2026-05-29 (M0097-0091 — 'float' type recognized across all sites):**
+        Extended all remaining float-type recognition sites to include bare 'float'.
+        subselect regress: 679→637 (SUBSELECT_TBL float columns now accept integer inserts).
+
+      - **Progress 2026-05-29 (M0097-0092 — var_pop/var_samp/stddev_pop/stddev_samp aggregates):**
+        Implemented variance/stddev aggregates using Welford's numerically stable online
+        algorithm. Added floatMean/floatM2 to aggRuntime.
+        aggregates regress: 1068→1038.
+
+      - **Progress 2026-05-29 (M0097-0093 — inheritance child-only column discard + tableoid):**
+        buildInheritanceRemapProject: set needsRemap=true when len(child.Columns)>len(parent.Columns)
+        to discard child-only columns (e.g. bb in CREATE TABLE b(bb) INHERITS (a)) that were
+        previously passed through unchanged when column positions matched parent.
+        Also: inheritance UNION ALL now wraps each scan with wrapWithTableoid() and sets
+        b.tableOidColIdx so a.tableoid resolves to the correct per-row leaf OID.
+        inherit regress: 1162→992 (−170). join +53 (cascade from more inheritance rows).
+
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `transactions`, `lock`, `prepare`, `plancache`,
