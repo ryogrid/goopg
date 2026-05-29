@@ -1942,9 +1942,12 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// grandchildren (e.g. stud_emp → emp → person) are included too.
 	if im, ok := cat.(*catalog.InMemory); ok {
 		allDesc := collectInheritanceDescendants(im, tbl.OID)
+
 		if len(allDesc) > 0 {
 			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}
-			var root Node = parentScan
+			// Add tableoid column to parent scan so per-row OID is available. M0097-0093.
+			parentWrapped := wrapWithTableoid(parentScan, tbl.OID, sourceIdx, rv.Pos())
+			var root Node = parentWrapped
 			for _, child := range allDesc {
 				// Use the child's own physical schema for the SeqScan so that
 				// physical column indices are correct for the child's row layout.
@@ -1955,6 +1958,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// wrap the scan in a remap Project that emits columns in parent
 				// schema order (matching the UNION ALL left side).
 				childNode = buildInheritanceRemapProject(rv.Pos(), childScan, tbl, child, sourceIdx)
+				// Wrap with tableoid so each row carries the correct leaf OID.
+				childNode = wrapWithTableoid(childNode, child.OID, sourceIdx, rv.Pos())
 				root = &SetOp{
 					pos:   rv.Pos(),
 					Left:  root,
@@ -1962,6 +1967,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					All:   true,
 				}
 			}
+			b.tableOidColIdx = len(b.table.Columns)
+			ctx.schema = root.Output()
 			return root, b, nil
 		}
 	}
@@ -2024,6 +2031,12 @@ func buildInheritanceRemapProject(pos int, childScan *SeqScan, parent, child *ca
 		}
 		targets = append(targets, &ColumnRef{Index: childIdx, Name: pc.Name, Type: pc.Type})
 		outSchema = append(outSchema, SchemaColumn{Name: pc.Name, Type: pc.Type, SourceTableIdx: sourceIdx})
+	}
+	// If the child has more columns than the parent (child-only columns to
+	// drop), a remap Project is required even if the shared columns are in the
+	// same order positions.
+	if len(child.Columns) > len(parent.Columns) {
+		needsRemap = true
 	}
 	if !needsRemap {
 		// Column order matches parent — no remap needed; return scan as-is.

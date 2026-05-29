@@ -123,7 +123,7 @@ update,425,failed
 explain,665,failed
 subselect,637,failed
 join,1093,failed
-inherit,1162,failed
+inherit,992,failed
 aggregates,1038,failed
 partition_join,1293,failed
 with,2261,failed

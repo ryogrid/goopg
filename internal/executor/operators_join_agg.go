@@ -104,6 +104,7 @@ func (o *joinOp) Open(ctx *Context) error {
 		return err
 	}
 
+
 	leftWidth := len(o.left.Schema())
 	rightWidth := len(o.right.Schema())
 	if leftWidth == 0 && len(leftRows) > 0 {
