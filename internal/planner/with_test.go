@@ -125,6 +125,69 @@ func TestPlanWithoutCTEUnchanged(t *testing.T) {
 	}
 }
 
+// TestPlanRecursiveCTEOrderByRejected: ORDER BY in a recursive CTE is
+// not implemented in PostgreSQL/goopg — it is rejected with 0A000.
+func TestPlanRecursiveCTEOrderByRejected(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t, "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x ORDER BY 1) SELECT n FROM x LIMIT 5")
+	_, err := Plan(stmt, cat)
+	if err == nil {
+		t.Fatal("expected ORDER BY rejection, got nil")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok {
+		t.Fatalf("err type=%T, want *PlanError", err)
+	}
+	if pe.Code != "0A000" {
+		t.Errorf("code=%s, want 0A000", pe.Code)
+	}
+	if !strings.Contains(pe.Message, "ORDER BY") {
+		t.Errorf("message=%q, want ORDER BY mention", pe.Message)
+	}
+}
+
+// TestPlanRecursiveCTEOffsetRejected: OFFSET in a recursive CTE body is
+// rejected with 0A000 matching PostgreSQL behaviour.
+func TestPlanRecursiveCTEOffsetRejected(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t, "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x OFFSET 0) SELECT n FROM x LIMIT 5")
+	_, err := Plan(stmt, cat)
+	if err == nil {
+		t.Fatal("expected OFFSET rejection, got nil")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok {
+		t.Fatalf("err type=%T, want *PlanError", err)
+	}
+	if pe.Code != "0A000" {
+		t.Errorf("code=%s, want 0A000", pe.Code)
+	}
+	if !strings.Contains(pe.Message, "OFFSET") {
+		t.Errorf("message=%q, want OFFSET mention", pe.Message)
+	}
+}
+
+// TestPlanRecursiveCTEAggregateInRecursiveMemberRejected: aggregate
+// functions are not allowed in a recursive query's recursive term.
+func TestPlanRecursiveCTEAggregateInRecursiveMemberRejected(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t, "WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM x) SELECT n FROM x")
+	_, err := Plan(stmt, cat)
+	if err == nil {
+		t.Fatal("expected aggregate rejection, got nil")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok {
+		t.Fatalf("err type=%T, want *PlanError", err)
+	}
+	if pe.Code != "0A000" {
+		t.Errorf("code=%s, want 0A000", pe.Code)
+	}
+	if !strings.Contains(pe.Message, "aggregate") {
+		t.Errorf("message=%q, want aggregate mention", pe.Message)
+	}
+}
+
 // TestPlanInsertOnConflictNoMatchingArbiter — without a unique
 // index covering the conflict-target columns, the planner can't
 // pick an arbiter and surfaces upstream's 42P10 ("no unique or

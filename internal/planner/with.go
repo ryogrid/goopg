@@ -205,6 +205,28 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
 			Message: "WITH RECURSIVE body must use UNION or UNION ALL",
 		}
 	}
+	// PostgreSQL rejects several constructs in the CTE body of a WITH RECURSIVE.
+	if len(cte.Query.OrderBy) > 0 {
+		return nil, &PlanError{
+			Pos:     cte.Pos(),
+			Code:    "0A000",
+			Message: "ORDER BY in a recursive query is not implemented",
+		}
+	}
+	if cte.Query.Offset != nil {
+		return nil, &PlanError{
+			Pos:     cte.Pos(),
+			Code:    "0A000",
+			Message: "OFFSET in a recursive query is not implemented",
+		}
+	}
+	if len(cte.Query.Locking) > 0 {
+		return nil, &PlanError{
+			Pos:     cte.Pos(),
+			Code:    "0A000",
+			Message: "FOR UPDATE/SHARE in a recursive query is not implemented",
+		}
+	}
 	unionAll := cte.Query.SetOp.All // false = UNION (dedup), true = UNION ALL
 
 	// Save and clear SetOp so planSelect for the anchor does NOT
@@ -308,7 +330,32 @@ func lookupPlannedCTE(name string) *plannedCTE {
 func validateRecursiveMember(cteNameLower string, cteName string, ctePos int, rec *parser.SelectStmt) error {
 	w := &recRefWalker{name: cteNameLower, origName: cteName, pos: ctePos}
 	w.walkSelect(rec, false, false, false)
-	return w.err
+	if w.err != nil {
+		return w.err
+	}
+	return validateNoAggregatesInRecursiveMember(rec, ctePos)
+}
+
+// validateNoAggregatesInRecursiveMember walks the SELECT targets and SetOp chain
+// of the recursive member for aggregate function calls. PostgreSQL rejects these
+// with "aggregate functions are not allowed in a recursive query's recursive term".
+func validateNoAggregatesInRecursiveMember(sel *parser.SelectStmt, ctePos int) error {
+	if sel == nil {
+		return nil
+	}
+	for _, tgt := range sel.Targets {
+		if _, ok := tgt.Expr.(*parser.FuncCall); ok {
+			fc := tgt.Expr.(*parser.FuncCall)
+			if isAggregateFunc(fc) {
+				return &PlanError{Pos: ctePos, Code: "0A000",
+					Message: "aggregate functions are not allowed in a recursive query's recursive term"}
+			}
+		}
+	}
+	if sel.SetOp != nil {
+		return validateNoAggregatesInRecursiveMember(sel.SetOp.Right, ctePos)
+	}
+	return nil
 }
 
 // recRefWalker walks a recursive member's AST counting references to the
