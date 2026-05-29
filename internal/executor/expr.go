@@ -246,6 +246,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
+		// Apply numeric(P,S) typmod: round to S decimal places.
+		// Typmod is encoded as (P<<16)|S by the planner's encodeTypmod.
+		if x.Typmod > 0 {
+			switch strings.ToLower(x.TargetType) {
+			case "numeric", "decimal":
+				scale := int16(x.Typmod & 0xFFFF)
+				if scale >= 0 && scale <= 38 {
+					result = roundNumericToScale(result, scale)
+				}
+			}
+		}
 		// Apply typmod precision for time/timetz casts (e.g., ::timetz(4)).
 		// PostgreSQL truncates fractional seconds to the specified precision.
 		if x.Typmod > 0 && result.Kind == KindTime {
@@ -1462,6 +1473,55 @@ func isFloatSourceType(t string) bool {
 // evalCastTyped is like evalCast but accepts the source type so it can select
 // the correct rounding mode (banker's for float, away-from-zero for numeric).
 // M0097-0003.
+// roundNumericToScale rounds a Datum to the given decimal scale.
+// Handles KindNumeric (int64 fast-path and big.Int), KindString, and KindInt.
+func roundNumericToScale(d Datum, scale int16) Datum {
+	switch d.Kind {
+	case KindNumeric:
+		curScale := d.NumericScaleValue()
+		if curScale <= scale {
+			// Already at or below target scale; no rounding needed but may need padding.
+			// Re-format with exact scale for correct display.
+			var s string
+			if d.Flags&flagBigNumeric != 0 {
+				s = formatNumericBig(big.NewInt(0).Set(d.NumericBigValue()), curScale)
+			} else {
+				s = formatNumeric(d.NumericMantissaValue(), curScale)
+			}
+			// Parse back at scale to add trailing zeros.
+			f, err := strconv.ParseFloat(s, 64)
+			if err != nil {
+				return d
+			}
+			return NewStringDatum(strconv.FormatFloat(f, 'f', int(scale), 64))
+		}
+		// Need to reduce scale: convert to float64 and round.
+		var s string
+		if d.Flags&flagBigNumeric != 0 {
+			s = formatNumericBig(big.NewInt(0).Set(d.NumericBigValue()), curScale)
+		} else {
+			s = formatNumeric(d.NumericMantissaValue(), curScale)
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return d
+		}
+		factor := math.Pow10(int(scale))
+		return NewStringDatum(strconv.FormatFloat(math.Round(f*factor)/factor, 'f', int(scale), 64))
+	case KindString:
+		s := d.StringValue()
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return d
+		}
+		factor := math.Pow10(int(scale))
+		return NewStringDatum(strconv.FormatFloat(math.Round(f*factor)/factor, 'f', int(scale), 64))
+	case KindInt:
+		return NewStringDatum(strconv.FormatFloat(float64(d.Int), 'f', int(scale), 64))
+	}
+	return d
+}
+
 func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, error) {
 	if sourceType == "" {
 		return evalCast(d, targetType, pos)

@@ -3638,10 +3638,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			return nil, err
 		}
 		typeName := strings.ToLower(x.Type.Name)
-		var typmod int64
-		if len(x.Typmods) > 0 {
-			typmod = x.Typmods[0]
-		}
+		typmod := encodeTypmod(typeName, x.Typmods)
 		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod}, nil
 	case *parser.FuncCall:
 		if x.Over != nil {
@@ -3748,10 +3745,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 			return nil, err
 		}
 		typeName := strings.ToLower(x.Type.Name)
-		var typmod int64
-		if len(x.Typmods) > 0 {
-			typmod = x.Typmods[0]
-		}
+		typmod := encodeTypmod(typeName, x.Typmods)
 		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExprAfterWindow(x.Source, win)
@@ -5688,6 +5682,25 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 
 // castTargetLabel maps a cast target type name to the PostgreSQL column label
 // used for that type when the cast result has no explicit alias. M0097-0003.
+// encodeTypmod encodes the typmod for a cast target type.
+// For numeric(P,S), returns (P<<16)|S so the executor can decode both.
+// For other types, returns Typmods[0] if present (existing behaviour).
+func encodeTypmod(typeName string, typmods []int64) int64 {
+	switch strings.ToLower(typeName) {
+	case "numeric", "decimal":
+		if len(typmods) >= 2 {
+			return (typmods[0] << 16) | typmods[1]
+		} else if len(typmods) == 1 {
+			return typmods[0]
+		}
+	default:
+		if len(typmods) > 0 {
+			return typmods[0]
+		}
+	}
+	return 0
+}
+
 func castTargetLabel(t string) string {
 	switch t {
 	case "boolean":
@@ -6417,10 +6430,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		}
 		typeName := strings.ToLower(x.Type.Name)
 		srcType := exprType(operand).Name
-		var typmod int64
-		if len(x.Typmods) > 0 {
-			typmod = x.Typmods[0]
-		}
+		typmod := encodeTypmod(typeName, x.Typmods)
 		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType, Typmod: typmod}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, ctx)
