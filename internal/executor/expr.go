@@ -1286,7 +1286,7 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		}
 		return Datum{Kind: KindInt, Int: n}, nil
 
-	case "float4", "real", "float8":
+	case "float", "float4", "real", "float8":
 		// Goopg v0 stores floats as KindNumeric strings. Validate via
 		// ParseFloat so the error message is PostgreSQL-compatible.
 		v := strings.TrimSpace(x.Value)
@@ -1464,7 +1464,7 @@ func datumToFloat64(d Datum) (float64, bool) {
 // for float→integer casts. M0097-0003.
 func isFloatSourceType(t string) bool {
 	switch strings.ToLower(t) {
-	case "float4", "float8", "real", "double precision":
+	case "float", "float4", "float8", "real", "double precision":
 		return true
 	}
 	return false
@@ -1739,7 +1739,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		default:
 			return d, nil
 		}
-	case "float4", "real", "float8", "double precision":
+	case "float", "float4", "real", "float8", "double precision":
 		// Normalize KindNumeric through float64 to strip trailing zeros (0.0→0). M0097-0003.
 		// PostgreSQL float8out uses printf-style format that removes trailing zeros.
 		if d.Kind == KindNumeric {

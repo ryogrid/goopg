@@ -2305,7 +2305,7 @@ func isNumericOrIntegerTarget(name string) bool {
 		"int2", "smallint",
 		"int4", "integer", "int",
 		"int8", "bigint",
-		"float4", "real",
+		"float", "float4", "real",
 		"float8", "double precision", "double":
 		return true
 	}

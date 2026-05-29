@@ -1699,7 +1699,7 @@ func typeOIDFor(name string) uint32 {
 		return 20
 	case "float4", "real":
 		return 700
-	case "float8", "double precision", "double":
+	case "float", "float8", "double precision", "double":
 		return 701
 	case "bool", "boolean":
 		return 16
