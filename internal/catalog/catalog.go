@@ -60,6 +60,14 @@ type Column struct {
 	// INSERT time so logical replication preserves DEFAULT semantics across
 	// schema-extended subscribers (M0103-0007 rung 13).
 	DefaultExpr parser.Expr
+	// MissingValue is the precomputed default value used by the heap
+	// decoder for rows that pre-date this column (storedNatts < ordinal+1).
+	// Populated by `ALTER TABLE ADD COLUMN <name> <type> DEFAULT <const>`
+	// to avoid the table rewrite — mirrors PostgreSQL's `attmissingval`.
+	// Type is `executor.Datum`, stored as `any` to avoid the catalog →
+	// executor import cycle. nil means trailing missing columns decode as
+	// NULL (the prior default). M0097-0077.
+	MissingValue any
 }
 
 // Table is one relation in the catalog.

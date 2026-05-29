@@ -678,8 +678,16 @@ func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byt
 	off := 0
 	for i, c := range cols {
 		// Columns beyond stored natts were added via ALTER TABLE ADD COLUMN.
+		// M0097-0077: when the column has a precomputed MissingValue Datum
+		// (set by ALTER TABLE ADD COLUMN … DEFAULT <const>), surface it
+		// instead of NULL — the "fast default" path that avoids a table
+		// rewrite, mirroring PostgreSQL's `attmissingval`.
 		if i >= storedNatts {
-			dst[i] = NullDatum
+			if mv, ok := c.MissingValue.(Datum); ok {
+				dst[i] = mv
+			} else {
+				dst[i] = NullDatum
+			}
 			continue
 		}
 		// Check null bitmap: bit i = 0 means column i is NULL.

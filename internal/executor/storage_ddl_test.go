@@ -312,6 +312,77 @@ func TestDDLAlterTableAddColumnKeepsExistingRows(t *testing.T) {
 	}
 }
 
+// TestDDLAlterTableAddColumnDefaultBackfillsExistingRows pins the
+// M0097-0077 "fast default" end-to-end: a row written before
+// `ALTER TABLE ... ADD COLUMN c <type> DEFAULT <const>` must surface the
+// constant default (not NULL) on a subsequent scan, without a table
+// rewrite — mirroring PostgreSQL's attmissingval. This is the e2e
+// counterpart to the decoder-level TestDecodeRowIntoMctxPGTuple* tests.
+func TestDDLAlterTableAddColumnDefaultBackfillsExistingRows(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE items (id int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "items"})
+	if err := writeHeapRow(ctx, ctx.Catalog.RelFileNode(tbl), tbl.Columns, Row{{Kind: KindInt, Int: 7}}); err != nil {
+		t.Fatalf("writeHeapRow: %v", err)
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE items ADD COLUMN qty int DEFAULT 99"); err != nil {
+		t.Fatalf("ALTER TABLE ADD COLUMN DEFAULT: %v", err)
+	}
+	tbl, _ = ctx.Catalog.LookupTable(parser.ObjectName{Name: "items"})
+	if len(tbl.Columns) != 2 || tbl.Columns[1].Name != "qty" {
+		t.Fatalf("columns after ADD COLUMN: %+v", tbl.Columns)
+	}
+	if mv, ok := tbl.Columns[1].MissingValue.(Datum); !ok || mv.Kind != KindInt || mv.Int != 99 {
+		t.Fatalf("MissingValue = %+v, want KindInt 99", tbl.Columns[1].MissingValue)
+	}
+
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	if rows[0][0].Int != 7 {
+		t.Fatalf("id=%d want=7", rows[0][0].Int)
+	}
+	if rows[0][1].IsNull() || rows[0][1].Kind != KindInt || rows[0][1].Int != 99 {
+		t.Fatalf("pre-ALTER row should read DEFAULT 99, got %+v", rows[0][1])
+	}
+}
+
+// TestDDLAlterTableAddColumnDuplicateErrors pins that adding a column that
+// already exists on the named relation still returns 42701 (duplicate_column).
+// Regression guard for M0097-0077: the inheritance-recursion refactor must
+// keep erroring on the root table — only same-named columns on recursed
+// inheritance children are silently merged.
+func TestDDLAlterTableAddColumnDuplicateErrors(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE items (id int, label text)"); err != nil {
+		t.Fatal(err)
+	}
+	err := runDDL(t, ctx, "ALTER TABLE items ADD COLUMN label text")
+	if err == nil {
+		t.Fatal("expected 42701 duplicate_column for ADD COLUMN of existing column")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42701" {
+		t.Fatalf("error = %v, want ExecError 42701", err)
+	}
+}
+
 func TestDDLAlterTableAddPrimaryKeyCreatesUniqueIndex(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()

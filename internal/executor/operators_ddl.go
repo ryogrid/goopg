@@ -1279,26 +1279,183 @@ func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalo
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE ADD COLUMN ... NOT NULL is only supported on empty tables"}
 		}
 	}
-	_, err := o.ctx.Catalog.AddColumn(tbl, catalog.Column{
-		Name:    col.Name,
-		Type:    catalog.Type{Name: strings.ToLower(col.Type.Name), Args: append([]int64(nil), col.Type.Args...)},
-		NotNull: col.NotNull,
-	})
-	if err == nil {
-		// M0106-0011: ALTER TABLE ADD COLUMN mutates the relation's
-		// pg_attribute row set and bumps pg_class.relnatts. Flag the txn
-		// so the commit-time xact-marker hook unlinks + regenerates
-		// pg_internal.init; a stale init file would keep a PG18 standby
-		// reading the pre-ALTER attribute count.
-		if o.ctx.TxnMgr != nil {
-			o.ctx.TxnMgr.SetRelcacheInvalPending()
+	newCol := catalog.Column{
+		Name:        col.Name,
+		Type:        catalog.Type{Name: strings.ToLower(col.Type.Name), Args: append([]int64(nil), col.Type.Args...)},
+		NotNull:     col.NotNull,
+		DefaultExpr: col.DefaultExpr,
+	}
+	// "Fast default" backfill (mirrors PostgreSQL's attmissingval): when the
+	// new column has a constant DEFAULT, evaluate it once at ALTER time and
+	// record the Datum on the column. The heap decoder uses it to fill the
+	// column for rows that pre-date this ALTER (storedNatts < new ordinal),
+	// so existing rows surface the default without a table rewrite. M0097-0077.
+	if col.DefaultExpr != nil {
+		if d, ok := constDefaultDatum(col.DefaultExpr, newCol.Type); ok && !d.IsNull() {
+			newCol.MissingValue = d
 		}
-		return nil
 	}
-	if strings.Contains(strings.ToLower(err.Error()), "already exists") {
-		return &ExecError{Code: "42701", Pos: act.Pos(), Message: err.Error()}
+	if err := o.addColumnRecursive(tbl, newCol, act, stmt, true); err != nil {
+		return err
 	}
-	return &ExecError{Code: "XX000", Pos: stmt.Pos(), Message: err.Error()}
+	// M0106-0011: ALTER TABLE ADD COLUMN mutates the relation's
+	// pg_attribute row set and bumps pg_class.relnatts. Flag the txn
+	// so the commit-time xact-marker hook unlinks + regenerates
+	// pg_internal.init; a stale init file would keep a PG18 standby
+	// reading the pre-ALTER attribute count.
+	if o.ctx.TxnMgr != nil {
+		o.ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+	return nil
+}
+
+// addColumnRecursive applies a `catalog.AddColumn` to tbl and every
+// transitive inheritance / partition child. Mirrors PostgreSQL's
+// `ATAddColumn` recursion: a child that already has a same-named column
+// is silently skipped (PG attaches by name + type-compatibility merge);
+// goopg v0 just treats "already exists" as a no-op so subsequent SELECTs
+// project the inherited column rather than erroring. M0097-0077.
+func (o *ddlOp) addColumnRecursive(tbl *catalog.Table, col catalog.Column, act parser.AlterTableAction, stmt *parser.AlterTableStmt, isRoot bool) error {
+	if _, err := o.ctx.Catalog.AddColumn(tbl, col); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return &ExecError{Code: "XX000", Pos: stmt.Pos(), Message: err.Error()}
+		}
+		// "Already exists" on the root (named) relation is a genuine user
+		// error — 42701 duplicate_column, matching PostgreSQL. On a recursed
+		// inheritance/partition child it's the column-merge case PG accepts
+		// silently: the child keeps its existing same-named column and the
+		// ADD becomes a no-op there. M0097-0077.
+		if isRoot {
+			return &ExecError{Code: "42701", Pos: act.Pos(), Message: err.Error()}
+		}
+	}
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, child := range im.InheritanceChildren(tbl.OID) {
+			if err := o.addColumnRecursive(child, col, act, stmt, false); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// constDefaultDatum evaluates a constant DEFAULT expression — the kinds
+// PostgreSQL records as `attmissingval`-eligible — against the column's
+// declared type. Returns (zero, false) for non-constant or unsupported
+// expressions; the caller then falls back to "decode missing trailing
+// columns as NULL". Handles bare literals plus unary `-` over numeric
+// literals (so `DEFAULT -1` survives). Cast wrappers (`CAST(x AS T)`)
+// are unwrapped — the target type comes from the column anyway. M0097-0077.
+func constDefaultDatum(e parser.Expr, t catalog.Type) (Datum, bool) {
+	switch v := e.(type) {
+	case *parser.NullConst:
+		return NullDatum, true
+	case *parser.BooleanConst:
+		if v.Value {
+			return Datum{Kind: KindBool, Int: 1}, true
+		}
+		return Datum{Kind: KindBool, Int: 0}, true
+	case *parser.IntegerConst:
+		return integerConstAsType(v.Value, t)
+	case *parser.NumericConst:
+		return numericConstAsType(v.Value, t)
+	case *parser.StringConst:
+		return stringConstAsType(v.Value, t)
+	case *parser.UnaryOp:
+		if v.Op != parser.OpUnaryNeg {
+			return Datum{}, false
+		}
+		switch inner := v.Operand.(type) {
+		case *parser.IntegerConst:
+			return integerConstAsType(-inner.Value, t)
+		case *parser.NumericConst:
+			s := inner.Value
+			if strings.HasPrefix(s, "-") {
+				s = s[1:]
+			} else {
+				s = "-" + s
+			}
+			return numericConstAsType(s, t)
+		}
+	}
+	return Datum{}, false
+}
+
+func integerConstAsType(v int64, t catalog.Type) (Datum, bool) {
+	switch strings.ToLower(t.Name) {
+	case "int2", "int4", "int8", "smallint", "integer", "int", "bigint", "oid":
+		return Datum{Kind: KindInt, Int: v}, true
+	case "bool", "boolean":
+		if v == 0 {
+			return Datum{Kind: KindBool, Int: 0}, true
+		}
+		return Datum{Kind: KindBool, Int: 1}, true
+	case "numeric", "decimal":
+		return Datum{Kind: KindNumeric, Int: v, Scale: 0}, true
+	case "float4", "float8", "real", "double precision", "double":
+		return Datum{Kind: KindNumeric, Int: v, Scale: 0}, true
+	case "text", "varchar", "bpchar", "char", "name":
+		s := strconv.FormatInt(v, 10)
+		return Datum{Kind: KindString, Buf: []byte(s)}, true
+	}
+	return Datum{}, false
+}
+
+func numericConstAsType(s string, t catalog.Type) (Datum, bool) {
+	switch strings.ToLower(t.Name) {
+	case "int2", "int4", "int8", "smallint", "integer", "int", "bigint", "oid":
+		// Reject if it has a decimal point — let it route through NUMERIC
+		// instead so we don't silently truncate.
+		if strings.ContainsAny(s, ".eE") {
+			return Datum{}, false
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return Datum{}, false
+		}
+		return Datum{Kind: KindInt, Int: n}, true
+	case "numeric", "decimal", "float4", "float8", "real", "double precision", "double":
+		// Parse mantissa+scale: split on the decimal point. Scientific
+		// notation (1e9) is not handled here — caller leaves MissingValue
+		// nil and decoder falls back to NULL (rare for DEFAULT).
+		if strings.ContainsAny(s, "eE") {
+			return Datum{}, false
+		}
+		neg := strings.HasPrefix(s, "-")
+		if neg {
+			s = s[1:]
+		}
+		dot := strings.IndexByte(s, '.')
+		var mantissaStr string
+		var scale int16
+		if dot < 0 {
+			mantissaStr = s
+		} else {
+			mantissaStr = s[:dot] + s[dot+1:]
+			scale = int16(len(s) - dot - 1)
+		}
+		n, err := strconv.ParseInt(mantissaStr, 10, 64)
+		if err != nil {
+			return Datum{}, false
+		}
+		if neg {
+			n = -n
+		}
+		return Datum{Kind: KindNumeric, Int: n, Scale: scale}, true
+	case "text", "varchar", "bpchar", "char", "name":
+		return Datum{Kind: KindString, Buf: []byte(s)}, true
+	}
+	return Datum{}, false
+}
+
+func stringConstAsType(s string, t catalog.Type) (Datum, bool) {
+	switch strings.ToLower(t.Name) {
+	case "text", "varchar", "bpchar", "char", "name":
+		return Datum{Kind: KindString, Buf: []byte(s)}, true
+	case "bytea":
+		return Datum{Kind: KindBytes, Buf: []byte(s)}, true
+	}
+	return Datum{}, false
 }
 
 func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.AlterTableAction) error {

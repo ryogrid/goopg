@@ -1379,6 +1379,44 @@ M0097-0001 wires it up.
         INHERITS row propagation through UPDATE FROM / DELETE USING,
         RETURNING OLD/NEW alias references.
 
+      - **Progress 2026-05-29 (M0097-0077 — ADD COLUMN … DEFAULT fast
+        default / attmissingval):** Third in-order `returning` regress
+        blocker cleared. `ALTER TABLE foo ADD COLUMN f4 int8 DEFAULT 99`
+        added the column but recorded no default; the heap decoder emitted
+        NullDatum for every column beyond the row's stored natts, so rows
+        written before the ALTER surfaced NULL instead of the DEFAULT.
+        Fix mirrors PG's `attmissingval` "fast default" (no table rewrite):
+        (a) catalog — `Column` gains `MissingValue any` (holds an
+            executor.Datum, typed `any` to dodge the catalog→executor
+            import cycle; nil = decode-as-NULL fallback).
+        (b) executor/ddl — `execAlterTableAddColumn` evaluates the column's
+            constant DefaultExpr once via new `constDefaultDatum(expr,type)`
+            (int/numeric/string/bool/NULL literals + unary `-`, coerced to
+            the column type) and stores it on the column when constant and
+            non-NULL.
+        (c) executor/codec — `DecodeRowIntoMctxPGTuple`'s `i >= storedNatts`
+            branch surfaces `c.MissingValue.(Datum)` when present, else
+            NullDatum.
+        Bundled inheritance recursion: `addColumnRecursive(…, isRoot)`
+        applies AddColumn then recurses over InheritanceChildren; duplicate
+        column on the root is a real `42701`, on a child it's PG's silent
+        merge no-op. The `isRoot` flag fixes a draft bug that distinguished
+        root vs child by `tbl.Name == act.Column.Name` (never matches) and
+        silently swallowed the root-table 42701.
+        Coverage: `TestDecodeRowIntoMctxPGTuple{Uses,No}MissingValue*`,
+        `TestConstDefaultDatumLiteralCases`,
+        `TestDDLAlterTableAddColumnDefaultBackfillsExistingRows`,
+        `TestDDLAlterTableAddColumnDuplicateErrors`.
+        Design: `docs/design/0097-0077-add-column-default-fast-default.md`.
+        Verification: `go build ./...` and `go vet ./internal/executor/`
+        clean; `go test ./internal/executor/` passes modulo the
+        pre-existing `TestToastByteaRoundTrip` failure (reproduced on clean
+        baseline `20198ce0` with this change stashed — unrelated);
+        `go test ./internal/parser/ ./internal/analyzer/ ./internal/planner/
+        ./internal/catalog/` all PASS.
+        Next blockers (in order): INHERITS row propagation through
+        UPDATE FROM / DELETE USING, RETURNING OLD/NEW alias references.
+
       - **Bisect resolved 2026-05-29 (M0097-0074 follow-up — false
         regression):** The "regression" framing in the prior note was
         wrong. Bisected by checking out `c945744c` in a separate worktree
