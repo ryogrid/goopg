@@ -819,8 +819,9 @@ type DeleteStmt struct {
 	pos       int
 	With      *WithClause
 	Target    RangeVar
-	Where     Expr   // nil when absent
-	CurrentOf string // cursor name for WHERE CURRENT OF cursor. M0097-0069.
+	Using     []RangeVar // USING-clause tables (nil when absent). M0097-0076.
+	Where     Expr       // nil when absent
+	CurrentOf string     // cursor name for WHERE CURRENT OF cursor. M0097-0069.
 	Returning []ResTarget
 }
 

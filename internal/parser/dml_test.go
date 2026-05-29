@@ -127,6 +127,36 @@ func TestParseDelete(t *testing.T) {
 	}
 }
 
+// TestParseDeleteUsing: DELETE FROM … USING …, … WHERE … RETURNING (M0097-0076).
+func TestParseDeleteUsing(t *testing.T) {
+	stmts, err := Parse("DELETE FROM t USING u, v w WHERE t.a = u.a AND t.b = w.b RETURNING t.a, u.x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	del, ok := stmts[0].(*DeleteStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if del.Target.Name != "t" {
+		t.Errorf("target=%+v", del.Target)
+	}
+	if len(del.Using) != 2 {
+		t.Fatalf("Using=%+v", del.Using)
+	}
+	if del.Using[0].Name != "u" || del.Using[0].Alias != "" {
+		t.Errorf("Using[0]=%+v", del.Using[0])
+	}
+	if del.Using[1].Name != "v" || del.Using[1].Alias != "w" {
+		t.Errorf("Using[1]=%+v", del.Using[1])
+	}
+	if del.Where == nil {
+		t.Fatal("missing WHERE")
+	}
+	if len(del.Returning) != 2 {
+		t.Fatalf("Returning=%+v", del.Returning)
+	}
+}
+
 // TestParseDMLSyntaxErrors pins SyntaxError type for the canonical
 // missing-piece cases.
 func TestParseDMLSyntaxErrors(t *testing.T) {

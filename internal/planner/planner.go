@@ -5111,6 +5111,65 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
+
+	// DELETE … USING (M0097-0076): build a combined resolve context
+	// over the target plus all USING tables so that WHERE and
+	// RETURNING can reference USING-table columns. Mirrors the
+	// UPDATE … FROM path in planUpdate.
+	if len(s.Using) > 0 {
+		var usingTables []*catalog.Table
+		var usingScans []*SeqScan
+		var usingSchema Schema
+		bindings := []rangeBinding{
+			{table: tbl, alias: s.Target.Alias, offset: 0, sourceIdx: 1},
+		}
+		sch := tableSchemaWithSource(tbl, 1)
+		offset := len(tbl.Columns)
+		for idx, rv := range s.Using {
+			useTbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
+			if !ok {
+				return nil, &PlanError{Pos: rv.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", rv.Name)}
+			}
+			si := int16(idx + 2) // sourceIdx 2, 3, … for USING tables
+			alias := rv.Alias
+			if alias == "" {
+				alias = strings.ToLower(rv.Name)
+			}
+			bindings = append(bindings, rangeBinding{
+				table: useTbl, alias: alias, offset: offset, sourceIdx: si,
+			})
+			usingSchema = append(usingSchema, tableSchemaWithSource(useTbl, si)...)
+			sch = append(sch, tableSchemaWithSource(useTbl, si)...)
+			usingTables = append(usingTables, useTbl)
+			usingScans = append(usingScans, &SeqScan{pos: rv.Pos(), Table: useTbl, schema: tableSchemaWithSource(useTbl, si)})
+			offset += len(useTbl.Columns)
+		}
+		ctx := newResolveContext(bindings, sch)
+		ctx.cat = cat
+		var pred Expr
+		if s.Where != nil {
+			pred, err = resolveExpr(s.Where, ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(tbl, 1)}
+		del := &Delete{
+			pos: s.Pos(), Table: tbl, Child: tgtScan,
+			UsingTables: usingTables, UsingScans: usingScans, UsingSchema: usingSchema,
+			UsingPred: pred,
+		}
+		if len(s.Returning) > 0 {
+			retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
+			if err != nil {
+				return nil, err
+			}
+			del.Returning = retExprs
+			del.ReturningSchema = retSchema
+		}
+		return del, nil
+	}
+
 	ctx := singleBindingContext(tbl, s.Target.Alias)
 	// When an explicit alias is set, using the original table name in WHERE
 	// must produce the PostgreSQL-specific error. M0097-0003.

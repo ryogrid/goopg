@@ -941,6 +941,30 @@ func TestPlanDelete(t *testing.T) {
 	}
 }
 
+// TestPlanDeleteUsing: DELETE … USING binds USING-table columns into
+// the WHERE/RETURNING resolve context (M0097-0076). Mirrors the
+// UPDATE … FROM planner path; UsingTables/UsingPred get populated and
+// RETURNING column references resolve against the joined schema.
+func TestPlanDeleteUsing(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	node, err := Plan(parseOne(t,
+		"DELETE FROM pgbench_history USING pgbench_accounts a "+
+			"WHERE pgbench_history.aid = a.aid RETURNING pgbench_history.aid, a.bid"), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	del := node.(*Delete)
+	if len(del.UsingTables) != 1 || del.UsingTables[0].Name != "pgbench_accounts" {
+		t.Fatalf("UsingTables=%+v", del.UsingTables)
+	}
+	if del.UsingPred == nil {
+		t.Fatal("UsingPred should be populated when USING + WHERE are present")
+	}
+	if len(del.Returning) != 2 {
+		t.Fatalf("Returning len=%d want 2", len(del.Returning))
+	}
+}
+
 // TestPlanDDLAndUtilityPassThrough: DDL/utility statements wrap
 // without decomposing.
 func TestPlanDDLAndUtilityPassThrough(t *testing.T) {

@@ -1338,6 +1338,47 @@ M0097-0001 wires it up.
         ALTER TABLE ADD COLUMN DEFAULT backfill, INHERITS row propagation,
         RETURNING OLD/NEW.
 
+      - **Progress 2026-05-29 (M0097-0076 — DELETE … USING clause):**
+        Next divergent `returning` regress line cleared: `DELETE FROM foo
+        USING int4_tbl WHERE foo.f1 + 123455 = int4_tbl.f1 RETURNING foo.*,
+        int4_tbl.f1` had silently no-op'd because `parseDelete` had no USING
+        branch. Mirrors the existing UPDATE … FROM path in four layers:
+        (a) parser — `DeleteStmt` gains `Using []RangeVar`; `parseDelete`
+            consumes optional `USING <RangeVar>[, …]` before WHERE.
+        (b) analyzer — `analyzeDelete` appends each USING table to the scope
+            so WHERE/RETURNING type-check; also now analyzes `s.Returning`
+            (mirrors `analyzeUpdate`).
+        (c) planner — `Delete` gains `UsingTables`/`UsingScans`/`UsingSchema`/
+            `UsingPred`; `planDelete` adds an early branch for `len(s.Using)
+            > 0` that builds a combined `rangeBinding`s context with
+            monotonically increasing `sourceIdx` (1, 2, …) and `offset`
+            advancing by each table's column count. WHERE resolves to
+            `UsingPred`; RETURNING resolves against the same context.
+        (d) executor — `deleteOp.Next` dispatches to `deleteWithUsing` when
+            `len(o.plan.UsingTables) > 0`. Collects all USING-table rows,
+            scans target with no predicate, recursive nested-loop
+            cross-product against cached USING rows, evaluates `UsingPred`,
+            stamps xmax on matched victims. Each target slot recorded at
+            most once (`seen` map keyed by `(block, slot)`) matching PG's
+            semantics. `appendDeleteRetRowWithUsing(oldRow, usingPortion)`
+            builds `evalRow = [oldRow..., usingPortion...]` before
+            RETURNING; plain DELETE path forwards `usingPortion == nil`.
+            EvalPlanQual retry chain intentionally skipped — concurrent
+            xmax conflicts skip the victim (v0 simplification; full EPQ for
+            DELETE USING is M0097-0020 follow-up scope).
+        Coverage: `TestParseDeleteUsing` (parser/dml_test.go) pins
+        `USING t1, t2 alias` syntax; `TestPlanDeleteUsing`
+        (planner/planner_test.go) pins analyzer+planner column-binding for
+        USING-table refs in WHERE and RETURNING.
+        Design: `docs/design/0097-0076-delete-using-clause.md`.
+        Verification: `go build ./...` and `go vet ./...` clean;
+        `go test ./internal/parser/ ./internal/analyzer/ ./internal/planner/`
+        all PASS; `go test ./internal/executor/` passes modulo the
+        pre-existing `TestToastByteaRoundTrip` flake.
+        Next blockers (in order): ALTER TABLE ADD COLUMN DEFAULT backfill,
+        INHERITS row propagation through UPDATE FROM / DELETE USING,
+        RETURNING OLD/NEW alias references.
+
       - **Bisect resolved 2026-05-29 (M0097-0074 follow-up — false
         regression):** The "regression" framing in the prior note was
         wrong. Bisected by checking out `c945744c` in a separate worktree

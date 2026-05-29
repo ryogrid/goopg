@@ -647,12 +647,29 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 		return err
 	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
+	// Add USING-clause tables to scope so WHERE / RETURNING expressions
+	// can reference their columns. Mirrors analyzeUpdate's FROM handling.
+	// M0097-0076.
+	for _, rv := range s.Using {
+		useTbl, err := lookupTable(cat, rv)
+		if err != nil {
+			return err
+		}
+		alias := rv.Alias
+		if alias == "" {
+			alias = rv.Name
+		}
+		ctx.rels = append(ctx.rels, scopeRel{table: useTbl, alias: alias})
+	}
 	if s.With != nil {
 		if err := analyzeWith(s.With, ctx); err != nil {
 			return err
 		}
 	}
-	return analyzeWhere(s.Where, ctx)
+	if err := analyzeWhere(s.Where, ctx); err != nil {
+		return err
+	}
+	return analyzeTargets(s.Returning, ctx)
 }
 
 func analyzeWhere(where parser.Expr, ctx *scope) error {

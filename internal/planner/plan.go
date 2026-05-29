@@ -1138,6 +1138,16 @@ type Delete struct {
 	Child           Node
 	Returning       []Expr
 	ReturningSchema Schema
+	// DELETE … USING (M0097-0076): additional source tables.
+	// Same semantics as Update.FromTables: when non-empty the executor
+	// iterates all USING tables as a nested-loop cross-product against
+	// the target scan and applies UsingPred (which may reference both
+	// target and USING columns) to select matching victim rows.
+	// RETURNING may reference USING columns via the combined row.
+	UsingTables []*catalog.Table
+	UsingScans  []*SeqScan
+	UsingSchema Schema
+	UsingPred   Expr
 }
 
 func (n *Delete) Pos() int       { return n.pos }

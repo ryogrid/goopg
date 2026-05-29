@@ -447,6 +447,23 @@ func (p *parser) parseDelete() (Stmt, error) {
 		return nil, err
 	}
 	stmt := &DeleteStmt{pos: t.Pos, Target: target}
+	// Optional USING clause (PostgreSQL extension). M0097-0076.
+	if p.acceptKeyword(KwUsing) {
+		var using []RangeVar
+		rv, err := p.parseRangeVar()
+		if err != nil {
+			return nil, err
+		}
+		using = append(using, rv)
+		for p.acceptSymbol(",") {
+			rv, err := p.parseRangeVar()
+			if err != nil {
+				return nil, err
+			}
+			using = append(using, rv)
+		}
+		stmt.Using = using
+	}
 	if p.acceptKeyword(KwWhere) {
 		// WHERE CURRENT OF cursor — positioned delete. M0097-0069.
 		if p.acceptIdentKeyword("current") && p.acceptKeyword(KwOf) {

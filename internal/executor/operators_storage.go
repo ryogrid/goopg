@@ -2421,12 +2421,28 @@ func (o *deleteOp) Schema() planner.Schema { return o.plan.ReturningSchema }
 // appendDeleteRetRow evaluates RETURNING expressions against the old row
 // (before deletion) and appends to o.retRows (M0100-0005).
 func (o *deleteOp) appendDeleteRetRow(oldRow Row) {
+	o.appendDeleteRetRowWithUsing(oldRow, nil)
+}
+
+// appendDeleteRetRowWithUsing is the DELETE … USING variant (M0097-0076):
+// RETURNING expressions may reference columns from joined USING tables.
+// The planner resolves those references with column indices that follow
+// the target columns, so we build a combined eval row
+// `[oldRow..., usingPortion...]` to satisfy them. usingPortion may be
+// nil for the plain DELETE path.
+func (o *deleteOp) appendDeleteRetRowWithUsing(oldRow Row, usingPortion Row) {
 	if len(o.plan.Returning) == 0 {
 		return
 	}
+	evalRow := oldRow
+	if len(usingPortion) > 0 {
+		evalRow = make(Row, 0, len(oldRow)+len(usingPortion))
+		evalRow = append(evalRow, oldRow...)
+		evalRow = append(evalRow, usingPortion...)
+	}
 	retRow := make(Row, len(o.plan.Returning))
 	for i, expr := range o.plan.Returning {
-		v, _ := evalExpr(expr, oldRow, o.ctx)
+		v, _ := evalExpr(expr, evalRow, o.ctx)
 		retRow[i] = v
 	}
 	o.retRows = append(o.retRows, retRow)
@@ -2458,6 +2474,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		row := o.retRows[o.retIdx]
 		o.retIdx++
 		return SlotFromRow(o.plan.ReturningSchema, row), nil
+	}
+	// DELETE … USING: nested-loop cross-product path. M0097-0076.
+	if len(o.plan.UsingTables) > 0 {
+		return o.deleteWithUsing()
 	}
 	o.done = true
 	// M0093: DELETE is unconditionally a write — materialise the
@@ -2833,6 +2853,158 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 
 func (o *deleteOp) scanForMatches(rel storage.RelFileNode, cols []catalog.Column, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
 	return scanMatching(o.ctx, rel, cols, o.pred, fn)
+}
+
+// deleteWithUsing implements DELETE … USING by collecting all USING-table
+// rows into memory, then doing a nested-loop cross-product against each
+// target table row, applying o.plan.UsingPred to find matching
+// combinations, and stamping xmax on the matched target tuples.
+// M0097-0076. Mirrors updateOp.updateWithFrom.
+func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
+	o.done = true
+	// DELETE is unconditionally a write — materialise the transaction's
+	// XID before the scan so foreign-lock checks see the real XID.
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return nil, err
+	}
+	tbl := o.plan.Table
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	tgtCols := tbl.Columns
+	tgtColCount := len(tgtCols)
+	needUsingForReturning := len(o.plan.Returning) > 0
+
+	// Step 1: collect all rows from each USING table.
+	type usingRows struct {
+		rows []Row
+	}
+	usingSets := make([]usingRows, len(o.plan.UsingTables))
+	for i, useTbl := range o.plan.UsingTables {
+		useRel := o.ctx.Catalog.RelFileNode(useTbl)
+		useCols := useTbl.Columns
+		var rows []Row
+		if err := scanMatching(o.ctx, useRel, useCols, nil, func(_ storage.BlockNumber, _ uint16, row Row) error {
+			rows = append(rows, cloneRow(row))
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		usingSets[i] = usingRows{rows: rows}
+	}
+
+	// Step 2: scan target table without predicate; for each target row,
+	// do the cross-product over all USING-table row combinations and
+	// collect victims. Each target slot is recorded at most once.
+	type victim struct {
+		blk          storage.BlockNumber
+		slot         uint16
+		oldRow       Row
+		usingPortion Row // joined USING-table columns for RETURNING; nil when RETURNING absent
+	}
+	var victims []victim
+	seen := make(map[[2]uint64]bool)
+
+	if err := scanMatching(o.ctx, rel, tgtCols, nil, func(blk storage.BlockNumber, slot uint16, tgtRow Row) error {
+		key := [2]uint64{uint64(blk), uint64(slot)}
+		if seen[key] {
+			return nil
+		}
+		// Cross-product enumeration via recursion.
+		var recurse func(depth int, combinedRow Row) error
+		recurse = func(depth int, combinedRow Row) error {
+			if seen[key] {
+				return nil
+			}
+			if depth == len(usingSets) {
+				if o.plan.UsingPred != nil {
+					v, _ := evalExpr(o.plan.UsingPred, combinedRow, o.ctx)
+					if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+						return nil
+					}
+				}
+				var usingPortion Row
+				if needUsingForReturning && len(combinedRow) > tgtColCount {
+					usingPortion = cloneRow(combinedRow[tgtColCount:])
+				}
+				victims = append(victims, victim{blk: blk, slot: slot, oldRow: cloneRow(tgtRow), usingPortion: usingPortion})
+				seen[key] = true
+				return nil
+			}
+			for _, useRow := range usingSets[depth].rows {
+				next := append(combinedRow[:len(combinedRow):len(combinedRow)], useRow...)
+				if err := recurse(depth+1, next); err != nil {
+					return err
+				}
+				if seen[key] {
+					return nil
+				}
+			}
+			return nil
+		}
+		return recurse(0, append(Row(nil), tgtRow...))
+	}); err != nil {
+		return nil, err
+	}
+
+	// Step 3: apply pending deletes. Mirrors the plain DELETE write loop
+	// but without EPQ chain-following (simplified for the USING case;
+	// concurrent xmax-conflicts skip the victim).
+	for _, v := range victims {
+		// Fire BEFORE DELETE triggers and enforce FK constraints.
+		if len(tbl.Triggers) > 0 {
+			_, ok := fireTriggers(o.ctx, tbl, "before", "delete", v.oldRow, nil)
+			if !ok {
+				continue
+			}
+		}
+		if err := enforceFKOnDelete(o.ctx, tbl, v.oldRow); err != nil {
+			return nil, err
+		}
+		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: v.blk})
+		if err != nil {
+			return nil, err
+		}
+		s.Lock()
+		oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
+		if oldGerr != nil {
+			s.Unlock()
+			o.ctx.Pool.Unpin(s)
+			continue
+		}
+		if isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+			s.Unlock()
+			o.ctx.Pool.Unpin(s)
+			continue // skip concurrent-update EPQ for USING case
+		}
+		oldTupleBytes, _ := oldTup.MarshalBinary()
+		if stampErr := storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID); stampErr != nil {
+			s.Unlock()
+			o.ctx.Pool.Unpin(s)
+			if errors.Is(stampErr, storage.ErrUnsupportedItem) {
+				continue
+			}
+			return nil, stampErr
+		}
+		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
+		s.Unlock()
+		o.ctx.Pool.Unpin(s)
+		if derr != nil {
+			return nil, derr
+		}
+		if cerr := emitCanonicalHeapDelete(o.ctx, rel, v.blk, v.slot); cerr != nil {
+			return nil, cerr
+		}
+		ssiRecordTupleWrite(o.ctx, rel, v.blk, v.slot)
+		o.appendDeleteRetRowWithUsing(v.oldRow, v.usingPortion)
+		o.rowsAffected++
+	}
+
+	// Yield first RETURNING row inline.
+	if o.retIdx < len(o.retRows) {
+		row := o.retRows[o.retIdx]
+		o.retIdx++
+		return SlotFromRow(o.plan.ReturningSchema, row), nil
+	}
+	return nil, EOF
 }
 
 // foreignLockOnly reports whether `h` indicates the tuple is
