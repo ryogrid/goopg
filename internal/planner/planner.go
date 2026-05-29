@@ -5853,11 +5853,29 @@ func exprType(e Expr) catalog.Type {
 			"cardinality", "strpos", "position":
 			// String/array length functions return int4. M0097-0003.
 			return catalog.Type{Name: "int4"}
+		case "array_construct":
+			// ARRAY[e1,...] constructor: return element type with [] suffix.
+			if len(x.Args) > 0 {
+				et := exprType(x.Args[0])
+				if et.Name != "" {
+					return catalog.Type{Name: et.Name + "[]"}
+				}
+			}
+			return catalog.Type{Name: "text[]"}
 		case "array_subscript":
-			// Return element type: check array_construct args or the array type name.
+			// Return element type: check array_construct args, subquery schema, or array type name.
 			if len(x.Args) > 0 {
 				if fc, ok := x.Args[0].(*FuncCall); ok && fc.Name == "array_construct" && len(fc.Args) > 0 {
 					return exprType(fc.Args[0])
+				}
+				// Subquery base: infer element type from subquery output schema.
+				if sq, ok := x.Args[0].(*SubqueryExpr); ok && sq.Plan != nil {
+					if schema := sq.Plan.Output(); len(schema) > 0 {
+						arrT := schema[0].Type
+						if strings.HasSuffix(arrT.Name, "[]") {
+							return catalog.Type{Name: arrT.Name[:len(arrT.Name)-2]}
+						}
+					}
 				}
 				arrT := exprType(x.Args[0])
 				if strings.HasPrefix(arrT.Name, "_") {
