@@ -1545,19 +1545,25 @@ func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		}
 	} else {
 		cols = make([]catalog.Column, 0, len(body.Targets))
-		for i, tgt := range body.Targets {
+		for _, tgt := range body.Targets {
+			// A top-level `*` / `t.*` must be expanded to concrete columns —
+			// analyzeExpr rejects a bare StarExpr. Mirrors registerAnalyzedCTE.
+			if star, ok := tgt.Expr.(*parser.StarExpr); ok {
+				cols = append(cols, expandInnerStarColumns(star, innerCtx)...)
+				continue
+			}
 			name := tgt.Alias
 			if name == "" {
 				name = deriveAnalyzerTargetName(tgt.Expr)
 			}
 			if name == "" {
-				name = fmt.Sprintf("?column?%d", i+1)
+				name = fmt.Sprintf("?column?%d", len(cols)+1)
 			}
 			typ, err := analyzeExpr(tgt.Expr, innerCtx)
 			if err != nil {
 				return err
 			}
-			cols = append(cols, catalog.Column{Name: name, Type: typ, Ordinal: i})
+			cols = append(cols, catalog.Column{Name: name, Type: typ, Ordinal: len(cols)})
 		}
 	}
 	// Apply explicit column alias list (the `(col, ...)` after the CTE name),
