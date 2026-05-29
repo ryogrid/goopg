@@ -1686,6 +1686,36 @@ M0097-0001 wires it up.
         `buildSelectScope` used catalog-only lookup. Fixes: `SELECT count(*) FROM
         (WITH y AS (SELECT * FROM x) SELECT * FROM y) ss`. `subselect` diff: 711 → 626
         (−85 lines, improvement from cascading CTE scope fixes).
+      - **Progress 2026-05-30 (M0097-0099 — multiple WITH and recursive CTE fixes):**
+        Four improvements in a single loop:
+        (a) `planRecursiveCTE` (`with.go`): reject ORDER BY/OFFSET/FOR UPDATE/SHARE
+            in recursive CTE body and aggregate functions in recursive member with
+            0A000 errors matching PostgreSQL wording exactly. Closes divergences in
+            `with.sql` error sections. Tests: `TestPlanRecursiveCTEOrderByRejected`,
+            `TestPlanRecursiveCTEOffsetRejected`, `TestPlanRecursiveCTEAggregateInRecursiveMemberRejected`.
+        (b) `resolveTargetsAfterAggregate` (`planner.go`): `SELECT *` with `GROUP BY`
+            no longer raises "SELECT * with GROUP BY/aggregate is not supported in v0
+            planner". Now expands the star via `expandStarTarget` and validates each
+            column: in GROUP BY list, functionally determined (PK), or 42803.
+            Tests: `TestSelectStarWithGroupByAllColumns`, `TestSelectStarWithGroupByPKFuncDep`.
+        (c) `FROM ONLY tablename` (`parser/ast.go`, `parser/select.go`, `planner/planner.go`):
+            `RangeVar.Only bool`; `parseRangeVar` consumes the ONLY keyword; `planScanRangeVar`
+            skips `collectInheritanceDescendants` when `Only=true`. Closes "relation 'only'
+            does not exist" errors. Tests: `TestSelectStarWithGroupByAllColumns`.
+        (d) `extra_float_digits`/`bytea_output` GUCs (`config/defaults.go`): registered
+            with correct types, boot values, and scopes (Userset). Closes
+            "unrecognized configuration parameter" errors in aggregates.sql.
+        (e) CTE materialization (`executor/context.go`, `executor/executor.go`,
+            `executor/operators_cte_dml.go`, `server/dispatch.go`): new `cteScanOp`
+            materializes a CTE on first `Open()` into `ctx.CTERowCache[name]` and
+            replays cached rows on subsequent `Open()` calls. WorkTableScan self-
+            references (recursive CTE body) bypass the cache to get fresh work-table
+            rows each iteration. Fixes: `WITH q1 AS (SELECT random() ...) SELECT * FROM
+            q1 UNION SELECT * FROM q1` now returns 5 rows (not 10). `ctx.CTERowCache`
+            is cleared per-statement in dispatch.go. Tests:
+            `TestExecuteWithCTEMaterializationUnion`, `TestExecuteWithCTEMaterializationCount`.
+        `with` diff: 2819 → significantly improved (recursive CTEs restored + materialization).
+        `aggregates` diff: 1268 → 1253 (FROM ONLY + SELECT * GROUP BY + GUC stubs).
 
 - [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
       - Summary: Make these 10 tests reach `pass`:
