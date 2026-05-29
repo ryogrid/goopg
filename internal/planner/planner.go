@@ -5840,6 +5840,18 @@ func exprType(e Expr) catalog.Type {
 			"cardinality", "strpos", "position":
 			// String/array length functions return int4. M0097-0003.
 			return catalog.Type{Name: "int4"}
+		case "array_subscript":
+			// Return element type: check array_construct args or the array type name.
+			if len(x.Args) > 0 {
+				if fc, ok := x.Args[0].(*FuncCall); ok && fc.Name == "array_construct" && len(fc.Args) > 0 {
+					return exprType(fc.Args[0])
+				}
+				arrT := exprType(x.Args[0])
+				if strings.HasPrefix(arrT.Name, "_") {
+					return catalog.Type{Name: arrT.Name[1:]}
+				}
+			}
+			return catalog.Type{Name: "text"}
 		case "timezone":
 			// AT LOCAL / AT TIME ZONE: return type depends on the input (last arg).
 			if len(x.Args) > 0 {

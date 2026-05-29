@@ -3685,8 +3685,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 
 	case "array_subscript":
-		// array_subscript(arr text[], idx int) → text
 		// Array element access: arr[idx] (1-based). Used for SQL a[N] syntax. M0097-0003.
+		// Returns the element as its natural type (int for integer arrays, else text).
 		if len(x.Args) == 2 {
 			arr, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil {
@@ -3704,7 +3704,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if n < 1 || int(n) > len(elems) {
 				return NullDatum, nil
 			}
-			return NewStringDatum(elems[n-1]), nil
+			elem := elems[n-1]
+			// Try to infer element type: if the element looks like a plain integer
+			// (no decimal point, no quotes), return an integer datum for correct
+			// psql alignment and comparison semantics. Matches PG's behaviour where
+			// ARRAY[1,2,3][1] returns int4, not text.
+			if iv, err2 := strconv.ParseInt(elem, 10, 64); err2 == nil && !strings.Contains(elem, ".") {
+				return NewIntDatum(iv), nil
+			}
+			return NewStringDatum(elem), nil
 		}
 		return NullDatum, nil
 
