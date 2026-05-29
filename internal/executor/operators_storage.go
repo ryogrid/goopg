@@ -2100,16 +2100,27 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		slot    uint16
 		cols    []catalog.Column // columns of the source relation
 		newRow  Row
+		retRow  Row            // parent-aligned row for RETURNING (nil = use newRow); M0097-0078
 		oldRow  Row            // for BEFORE UPDATE trigger firing
 		scanTbl *catalog.Table // table the row came from (M0100-0005o: partition-child triggers)
 	}
 	pending := make([]pendingUpdate, 0, 1)
 
 	// Scan parent + partition/inheritance children. M0096-0013.
+	// For inheritance children, track a column-map so SET/WHERE/RETURNING
+	// expressions (resolved against parent ordinals) work on child rows. M0097-0078.
 	updateScanTables := []*catalog.Table{tbl}
+	var inheritChildOIDs map[uint32]bool
 	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		updateScanTables = append(updateScanTables, imU.PartitionChildren(tbl.OID)...)
-		updateScanTables = append(updateScanTables, imU.InheritanceChildren(tbl.OID)...)
+		inheritChildren := imU.InheritanceChildren(tbl.OID)
+		updateScanTables = append(updateScanTables, inheritChildren...)
+		if len(inheritChildren) > 0 {
+			inheritChildOIDs = make(map[uint32]bool, len(inheritChildren))
+			for _, ic := range inheritChildren {
+				inheritChildOIDs[ic.OID] = true
+			}
+		}
 	}
 	for _, scanTbl := range updateScanTables {
 		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
@@ -2121,26 +2132,70 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		}
 		captureRel := scanRel
 		captureCols := scanCols
-		if err := scanMatching(o.ctx, scanRel, scanCols, o.pred, func(blk storage.BlockNumber, slot uint16, row Row) error {
-			nCols := len(captureCols)
-			newRow := make(Row, nCols)
-			for i := range captureCols {
-				setIdx := i
-				if setIdx < len(o.plan.Set) && o.plan.Set[setIdx] != nil {
-					v, err := evalExpr(o.plan.Set[setIdx], row, o.ctx)
-					if err != nil {
-						return err
+		isInheritChild := inheritChildOIDs != nil && inheritChildOIDs[scanTbl.OID]
+		// For inheritance children, pass nil predicate to scanMatching and apply
+		// it manually after remapping the child row to parent ordinals. M0097-0078.
+		var inheritColMap []int
+		if isInheritChild {
+			inheritColMap = buildInheritColMap(cols, captureCols)
+		}
+		scanPred := o.pred
+		if isInheritChild {
+			scanPred = nil
+		}
+		if err := scanMatching(o.ctx, scanRel, scanCols, scanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
+			evalRow := row
+			if isInheritChild {
+				evalRow = remapChildRowToParent(row, inheritColMap)
+				if o.pred != nil {
+					v, _ := evalExpr(o.pred, evalRow, o.ctx)
+					if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+						return nil
 					}
-					newRow[i] = v
-				} else {
-					if i < len(row) {
-						newRow[i] = row[i]
+				}
+			}
+			var newRow Row
+			if isInheritChild {
+				// Evaluate SET exprs in parent column space, then map back to child.
+				parentNewRow := make(Row, len(cols))
+				for pi := range cols {
+					if pi < len(o.plan.Set) && o.plan.Set[pi] != nil {
+						v, err := evalExpr(o.plan.Set[pi], evalRow, o.ctx)
+						if err != nil {
+							return err
+						}
+						parentNewRow[pi] = v
+					} else {
+						parentNewRow[pi] = evalRow[pi]
+					}
+				}
+				newRow = remapParentRowToChild(parentNewRow, row, cols, captureCols)
+			} else {
+				nCols := len(captureCols)
+				newRow = make(Row, nCols)
+				for i := range captureCols {
+					setIdx := i
+					if setIdx < len(o.plan.Set) && o.plan.Set[setIdx] != nil {
+						v, err := evalExpr(o.plan.Set[setIdx], row, o.ctx)
+						if err != nil {
+							return err
+						}
+						newRow[i] = v
+					} else {
+						if i < len(row) {
+							newRow[i] = row[i]
+						}
 					}
 				}
 			}
 			_ = computeGeneratedColumns(captureCols, newRow)
+			// Parent-aligned retRow so RETURNING exprs (parent ordinals) evaluate correctly.
+			var retRow Row
+			if isInheritChild && len(o.plan.Returning) > 0 {
+				retRow = remapChildRowToParent(newRow, inheritColMap)
+			}
 			pending = append(pending, pendingUpdate{rel: captureRel, blk: blk, slot: slot, cols: captureCols, newRow: newRow,
-				oldRow: cloneRow(row), scanTbl: scanTbl})
+				retRow: retRow, oldRow: cloneRow(evalRow), scanTbl: scanTbl})
 			return nil
 		}); err != nil {
 			return nil, err
@@ -2378,7 +2433,13 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			// paths — the rw-conflict target is the SLOT that any concurrent
 			// SERIALIZABLE reader would have predicate-locked.
 			ssiRecordTupleWrite(o.ctx, puRel, pu.blk, pu.slot)
-			o.appendUpdateRetRow(pu.newRow)
+			// Use parent-aligned retRow for RETURNING when available (inheritance
+			// children store a remapped row so RETURNING exprs work correctly). M0097-0078.
+			if pu.retRow != nil {
+				o.appendUpdateRetRow(pu.retRow)
+			} else {
+				o.appendUpdateRetRow(pu.newRow)
+			}
 			o.rowsAffected++
 		}
 	}
@@ -2494,15 +2555,25 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		blk     storage.BlockNumber
 		slot    uint16
 		row     Row
+		retRow  Row              // parent-aligned row for RETURNING (nil = use row); M0097-0078
 		cols    []catalog.Column // for EPQ chain-following (M0100-0004)
 		scanTbl *catalog.Table   // table the row came from (M0100-0005o: partition-child triggers)
 	}
 	// Collect victims from parent + partition/inheritance children. M0096-0013.
+	// For inheritance children, remap rows to parent ordinals for predicate/RETURNING. M0097-0078.
 	var victims []victim
 	scanTables := []*catalog.Table{tbl}
+	var delInheritChildOIDs map[uint32]bool
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		scanTables = append(scanTables, im.PartitionChildren(tbl.OID)...)
-		scanTables = append(scanTables, im.InheritanceChildren(tbl.OID)...)
+		delInheritChildren := im.InheritanceChildren(tbl.OID)
+		scanTables = append(scanTables, delInheritChildren...)
+		if len(delInheritChildren) > 0 {
+			delInheritChildOIDs = make(map[uint32]bool, len(delInheritChildren))
+			for _, ic := range delInheritChildren {
+				delInheritChildOIDs[ic.OID] = true
+			}
+		}
 	}
 	for _, scanTbl := range scanTables {
 		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
@@ -2514,8 +2585,30 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		captureRel := scanRel // capture for closure
 		captureCols := scanTbl.Columns
 		captureTbl := scanTbl
-		if err := scanMatching(o.ctx, scanRel, scanTbl.Columns, o.pred, func(blk storage.BlockNumber, slot uint16, row Row) error {
-			victims = append(victims, victim{rel: captureRel, blk: blk, slot: slot, row: cloneRow(row), cols: captureCols, scanTbl: captureTbl})
+		isDelInheritChild := delInheritChildOIDs != nil && delInheritChildOIDs[scanTbl.OID]
+		var delInheritColMap []int
+		if isDelInheritChild {
+			delInheritColMap = buildInheritColMap(tbl.Columns, captureCols)
+		}
+		delScanPred := o.pred
+		if isDelInheritChild {
+			delScanPred = nil // apply predicate manually after row remapping
+		}
+		if err := scanMatching(o.ctx, scanRel, scanTbl.Columns, delScanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
+			var retRow Row
+			if isDelInheritChild {
+				parentAligned := remapChildRowToParent(row, delInheritColMap)
+				if o.pred != nil {
+					v, _ := evalExpr(o.pred, parentAligned, o.ctx)
+					if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+						return nil
+					}
+				}
+				if len(o.plan.Returning) > 0 {
+					retRow = parentAligned
+				}
+			}
+			victims = append(victims, victim{rel: captureRel, blk: blk, slot: slot, row: cloneRow(row), retRow: retRow, cols: captureCols, scanTbl: captureTbl})
 			return nil
 		}); err != nil {
 			return nil, err
@@ -2653,7 +2746,12 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			// The rw-conflict target is the slot a concurrent SERIALIZABLE
 			// reader would have predicate-locked before the xmax stamp.
 			ssiRecordTupleWrite(o.ctx, victimRel, v.blk, v.slot)
-			o.appendDeleteRetRow(v.row)
+			// Use parent-aligned retRow for RETURNING when available (inheritance children). M0097-0078.
+			if v.retRow != nil {
+				o.appendDeleteRetRow(v.retRow)
+			} else {
+				o.appendDeleteRetRow(v.row)
+			}
 			o.rowsAffected++
 		}
 	}
@@ -2697,12 +2795,15 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		fromSets[i] = fromRows{rows: rows}
 	}
 
-	// Step 2: scan target table without predicate; for each target row, do
-	// the cross-product over all FROM-table row combinations. M0097-0065.
+	// Step 2: scan target table (parent + inheritance children) without predicate;
+	// for each target row, cross-product with FROM-table rows. M0097-0065, M0097-0078.
 	type pendingUpdate struct {
+		rel         storage.RelFileNode // source relation (parent or child)
+		tgtCols     []catalog.Column   // columns of source relation
 		blk         storage.BlockNumber
 		slot        uint16
 		newRow      Row
+		retNewRow   Row // parent-aligned new row for RETURNING (nil = use newRow); M0097-0078
 		oldRow      Row
 		fromPortion Row // joined FROM-table columns for RETURNING; nil when RETURNING absent
 	}
@@ -2710,58 +2811,112 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	tgtColCount := len(tgtCols)
 	needFromForReturning := len(o.plan.Returning) > 0
 
-	if err := scanMatching(o.ctx, rel, tgtCols, nil, func(blk storage.BlockNumber, slot uint16, tgtRow Row) error {
-		// Build all combinations of FROM rows via recursive enumeration.
-		var recurse func(depth int, combinedRow Row) error
-		recurse = func(depth int, combinedRow Row) error {
-			if depth == len(fromSets) {
-				// Full combined row available; evaluate predicate.
-				if o.plan.FromPred != nil {
-					v, _ := evalExpr(o.plan.FromPred, combinedRow, o.ctx)
-					if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
-						return nil
-					}
-				}
-				// Predicate passed: compute new target row.
-				nCols := len(tgtCols)
-				newRow := make(Row, nCols)
-				for i := range tgtCols {
-					if i < len(o.plan.Set) && o.plan.Set[i] != nil {
-						v, err := evalExpr(o.plan.Set[i], combinedRow, o.ctx)
-						if err != nil {
-							return err
-						}
-						newRow[i] = v
-					} else if i < len(tgtRow) {
-						newRow[i] = tgtRow[i]
-					}
-				}
-				_ = computeGeneratedColumns(tgtCols, newRow)
-				var fromPortion Row
-				if needFromForReturning && len(combinedRow) > tgtColCount {
-					fromPortion = cloneRow(combinedRow[tgtColCount:])
-				}
-				pending = append(pending, pendingUpdate{blk: blk, slot: slot, newRow: newRow, oldRow: cloneRow(tgtRow), fromPortion: fromPortion})
-				return nil
+	// Collect inheritance children for the FROM target scan. M0097-0078.
+	type fromScanTarget struct {
+		rel    storage.RelFileNode
+		cols   []catalog.Column
+		colMap []int // nil = parent (no remapping); set for inheritance children
+	}
+	fromScanTargets := []fromScanTarget{{rel: rel, cols: tgtCols}}
+	if imFrom, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, ic := range imFrom.InheritanceChildren(o.plan.Table.OID) {
+			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lockmgr.RowExclusiveLock); err != nil {
+				return nil, err
 			}
-			for _, fromRow := range fromSets[depth].rows {
-				next := append(combinedRow[:len(combinedRow):len(combinedRow)], fromRow...)
-				if err := recurse(depth+1, next); err != nil {
-					return err
-				}
-			}
-			return nil
+			fromScanTargets = append(fromScanTargets, fromScanTarget{
+				rel:    o.ctx.Catalog.RelFileNode(ic),
+				cols:   ic.Columns,
+				colMap: buildInheritColMap(tgtCols, ic.Columns),
+			})
 		}
-		// Start recursion with the target row as the base of combinedRow.
-		return recurse(0, append(Row(nil), tgtRow...))
-	}); err != nil {
-		return nil, err
 	}
 
-	// Step 3: apply pending updates (same two-pass approach as the regular path).
+	for _, fst := range fromScanTargets {
+		fst := fst // capture
+		if err := scanMatching(o.ctx, fst.rel, fst.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
+			// For inheritance children: remap raw child row to parent col positions so
+			// FromPred and SET exprs (which use parent ordinals) evaluate correctly. M0097-0078.
+			var tgtRow Row
+			if fst.colMap != nil {
+				tgtRow = remapChildRowToParent(rawRow, fst.colMap)
+			} else {
+				tgtRow = rawRow
+			}
+			// Build all combinations of FROM rows via recursive enumeration.
+			var recurse func(depth int, combinedRow Row) error
+			recurse = func(depth int, combinedRow Row) error {
+				if depth == len(fromSets) {
+					// Full combined row available; evaluate predicate.
+					if o.plan.FromPred != nil {
+						v, _ := evalExpr(o.plan.FromPred, combinedRow, o.ctx)
+						if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+							return nil
+						}
+					}
+					// Predicate passed: compute new row in parent column space.
+					parentNewRow := make(Row, tgtColCount)
+					for i := range tgtCols {
+						if i < len(o.plan.Set) && o.plan.Set[i] != nil {
+							v, err := evalExpr(o.plan.Set[i], combinedRow, o.ctx)
+							if err != nil {
+								return err
+							}
+							parentNewRow[i] = v
+						} else if i < len(tgtRow) {
+							parentNewRow[i] = tgtRow[i]
+						}
+					}
+					// For inheritance children, map back to child column order for writing.
+					var actualNewRow Row
+					var retNewRow Row
+					if fst.colMap != nil {
+						actualNewRow = remapParentRowToChild(parentNewRow, rawRow, tgtCols, fst.cols)
+						retNewRow = parentNewRow // RETURNING exprs use parent ordinals
+					} else {
+						actualNewRow = parentNewRow
+					}
+					_ = computeGeneratedColumns(fst.cols, actualNewRow)
+					var fromPortion Row
+					if needFromForReturning && len(combinedRow) > tgtColCount {
+						fromPortion = cloneRow(combinedRow[tgtColCount:])
+					}
+					pending = append(pending, pendingUpdate{
+						rel: fst.rel, tgtCols: fst.cols,
+						blk: blk, slot: slot,
+						newRow: actualNewRow, retNewRow: retNewRow,
+						oldRow: cloneRow(rawRow), fromPortion: fromPortion,
+					})
+					return nil
+				}
+				for _, fromRow := range fromSets[depth].rows {
+					next := append(combinedRow[:len(combinedRow):len(combinedRow)], fromRow...)
+					if err := recurse(depth+1, next); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			// Start recursion with the (parent-aligned) target row as base.
+			return recurse(0, append(Row(nil), tgtRow...))
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	// Step 3: apply pending updates. M0097-0065.
+	// pu.rel / pu.tgtCols are used for child tables (inheritance); fall back to
+	// parent rel/tgtCols when unset. M0097-0078.
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
-	seen := make(map[[2]uint64]bool) // deduplicate (blk, slot) — each target row updated at most once
+	seen := make(map[[2]uint64]bool)
 	for _, pu := range pending {
+		puRel := pu.rel
+		if puRel == (storage.RelFileNode{}) {
+			puRel = rel
+		}
+		puCols := pu.tgtCols
+		if puCols == nil {
+			puCols = tgtCols
+		}
 		key := [2]uint64{uint64(pu.blk), uint64(pu.slot)}
 		if seen[key] {
 			continue // already updated by an earlier FROM match
@@ -2777,7 +2932,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 			pu.newRow = retRow
 		}
 		used := false
-		if hotEligible {
+		if hotEligible && puRel == rel {
 			var err error
 			used, err = tryApplyHOTUpdate(o.ctx, rel, tgtCols, pu.blk, pu.slot, pu.newRow)
 			if err != nil {
@@ -2786,7 +2941,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		}
 		if !used {
 			// Non-HOT update: stamp xmax on old tuple, write new tuple.
-			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk})
+			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: puRel, Block: pu.blk})
 			if err != nil {
 				return nil, err
 			}
@@ -2814,32 +2969,37 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				}
 				return nil, stampErr
 			}
-			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puRel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
 				return nil, derr
 			}
-			newPtr, werr := writeHeapRowReturning(o.ctx, rel, tgtCols, pu.newRow)
+			newPtr, werr := writeHeapRowReturning(o.ctx, puRel, puCols, pu.newRow)
 			if werr != nil {
 				return nil, werr
 			}
-			maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, tgtCols, pu.newRow, newPtr)
-			if cerr := stampOldCtid(o.ctx, rel, pu.blk, pu.slot, newPtr); cerr != nil {
+			maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, puCols, pu.newRow, newPtr)
+			if cerr := stampOldCtid(o.ctx, puRel, pu.blk, pu.slot, newPtr); cerr != nil {
 				return nil, cerr
 			}
 			if o.ctx.LogCanonical != nil {
-				if derr := emitCanonicalHeapDelete(o.ctx, rel, pu.blk, pu.slot); derr != nil {
+				if derr := emitCanonicalHeapDelete(o.ctx, puRel, pu.blk, pu.slot); derr != nil {
 					return nil, derr
 				}
-				if ierr := emitCanonicalHeapInsert(o.ctx, rel, newPtr); ierr != nil {
+				if ierr := emitCanonicalHeapInsert(o.ctx, puRel, newPtr); ierr != nil {
 					return nil, ierr
 				}
 			}
 		}
-		ssiRecordTupleWrite(o.ctx, rel, pu.blk, pu.slot)
+		ssiRecordTupleWrite(o.ctx, puRel, pu.blk, pu.slot)
 		o.rowsAffected++
-		o.appendUpdateRetRowWithFrom(pu.newRow, pu.fromPortion)
+		// Use retNewRow for RETURNING when available (inheritance children). M0097-0078.
+		retForRet := pu.newRow
+		if pu.retNewRow != nil {
+			retForRet = pu.retNewRow
+		}
+		o.appendUpdateRetRowWithFrom(retForRet, pu.fromPortion)
 	}
 
 	o.done = true
@@ -2891,64 +3051,107 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		usingSets[i] = usingRows{rows: rows}
 	}
 
-	// Step 2: scan target table without predicate; for each target row,
-	// do the cross-product over all USING-table row combinations and
-	// collect victims. Each target slot is recorded at most once.
+	// Step 2: scan target table (parent + inheritance children) without predicate;
+	// cross-product with USING-table rows to collect victims. M0097-0076, M0097-0078.
 	type victim struct {
+		rel          storage.RelFileNode // source relation (parent or child)
 		blk          storage.BlockNumber
 		slot         uint16
-		oldRow       Row
+		oldRow       Row // raw row in source table column order (for xmax stamping)
+		retOldRow    Row // parent-aligned row for RETURNING (nil = use oldRow); M0097-0078
 		usingPortion Row // joined USING-table columns for RETURNING; nil when RETURNING absent
 	}
 	var victims []victim
 	seen := make(map[[2]uint64]bool)
 
-	if err := scanMatching(o.ctx, rel, tgtCols, nil, func(blk storage.BlockNumber, slot uint16, tgtRow Row) error {
-		key := [2]uint64{uint64(blk), uint64(slot)}
-		if seen[key] {
-			return nil
+	// Collect inheritance children for the USING target scan. M0097-0078.
+	type usingScanTarget struct {
+		rel    storage.RelFileNode
+		cols   []catalog.Column
+		colMap []int // nil = parent; set for inheritance children
+	}
+	usingScanTargets := []usingScanTarget{{rel: rel, cols: tgtCols}}
+	if imDel, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, ic := range imDel.InheritanceChildren(tbl.OID) {
+			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lockmgr.RowExclusiveLock); err != nil {
+				return nil, err
+			}
+			usingScanTargets = append(usingScanTargets, usingScanTarget{
+				rel:    o.ctx.Catalog.RelFileNode(ic),
+				cols:   ic.Columns,
+				colMap: buildInheritColMap(tgtCols, ic.Columns),
+			})
 		}
-		// Cross-product enumeration via recursion.
-		var recurse func(depth int, combinedRow Row) error
-		recurse = func(depth int, combinedRow Row) error {
+	}
+
+	for _, ust := range usingScanTargets {
+		ust := ust // capture
+		if err := scanMatching(o.ctx, ust.rel, ust.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
+			key := [2]uint64{uint64(blk), uint64(slot)}
 			if seen[key] {
 				return nil
 			}
-			if depth == len(usingSets) {
-				if o.plan.UsingPred != nil {
-					v, _ := evalExpr(o.plan.UsingPred, combinedRow, o.ctx)
-					if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
-						return nil
-					}
-				}
-				var usingPortion Row
-				if needUsingForReturning && len(combinedRow) > tgtColCount {
-					usingPortion = cloneRow(combinedRow[tgtColCount:])
-				}
-				victims = append(victims, victim{blk: blk, slot: slot, oldRow: cloneRow(tgtRow), usingPortion: usingPortion})
-				seen[key] = true
-				return nil
+			// For inheritance children: remap to parent column positions so
+			// UsingPred (which uses parent ordinals) evaluates correctly. M0097-0078.
+			var tgtRow Row
+			if ust.colMap != nil {
+				tgtRow = remapChildRowToParent(rawRow, ust.colMap)
+			} else {
+				tgtRow = rawRow
 			}
-			for _, useRow := range usingSets[depth].rows {
-				next := append(combinedRow[:len(combinedRow):len(combinedRow)], useRow...)
-				if err := recurse(depth+1, next); err != nil {
-					return err
-				}
+			// Cross-product enumeration via recursion.
+			var recurse func(depth int, combinedRow Row) error
+			recurse = func(depth int, combinedRow Row) error {
 				if seen[key] {
 					return nil
 				}
+				if depth == len(usingSets) {
+					if o.plan.UsingPred != nil {
+						v, _ := evalExpr(o.plan.UsingPred, combinedRow, o.ctx)
+						if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+							return nil
+						}
+					}
+					var usingPortion Row
+					if needUsingForReturning && len(combinedRow) > tgtColCount {
+						usingPortion = cloneRow(combinedRow[tgtColCount:])
+					}
+					// For inheritance children, store parent-aligned tgtRow for RETURNING. M0097-0078.
+					var retOldRow Row
+					if ust.colMap != nil {
+						retOldRow = cloneRow(tgtRow)
+					}
+					victims = append(victims, victim{
+						rel: ust.rel, blk: blk, slot: slot,
+						oldRow: cloneRow(rawRow), retOldRow: retOldRow,
+						usingPortion: usingPortion,
+					})
+					seen[key] = true
+					return nil
+				}
+				for _, useRow := range usingSets[depth].rows {
+					next := append(combinedRow[:len(combinedRow):len(combinedRow)], useRow...)
+					if err := recurse(depth+1, next); err != nil {
+						return err
+					}
+					if seen[key] {
+						return nil
+					}
+				}
+				return nil
 			}
-			return nil
+			return recurse(0, append(Row(nil), tgtRow...))
+		}); err != nil {
+			return nil, err
 		}
-		return recurse(0, append(Row(nil), tgtRow...))
-	}); err != nil {
-		return nil, err
 	}
 
-	// Step 3: apply pending deletes. Mirrors the plain DELETE write loop
-	// but without EPQ chain-following (simplified for the USING case;
-	// concurrent xmax-conflicts skip the victim).
+	// Step 3: apply pending deletes. Uses v.rel for child tables. M0097-0076, M0097-0078.
 	for _, v := range victims {
+		vRel := v.rel
+		if vRel == (storage.RelFileNode{}) {
+			vRel = rel
+		}
 		// Fire BEFORE DELETE triggers and enforce FK constraints.
 		if len(tbl.Triggers) > 0 {
 			_, ok := fireTriggers(o.ctx, tbl, "before", "delete", v.oldRow, nil)
@@ -2959,7 +3162,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		if err := enforceFKOnDelete(o.ctx, tbl, v.oldRow); err != nil {
 			return nil, err
 		}
-		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: v.blk})
+		s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: vRel, Block: v.blk})
 		if err != nil {
 			return nil, err
 		}
@@ -2984,17 +3187,22 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 			}
 			return nil, stampErr
 		}
-		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
+		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, vRel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
 		s.Unlock()
 		o.ctx.Pool.Unpin(s)
 		if derr != nil {
 			return nil, derr
 		}
-		if cerr := emitCanonicalHeapDelete(o.ctx, rel, v.blk, v.slot); cerr != nil {
+		if cerr := emitCanonicalHeapDelete(o.ctx, vRel, v.blk, v.slot); cerr != nil {
 			return nil, cerr
 		}
-		ssiRecordTupleWrite(o.ctx, rel, v.blk, v.slot)
-		o.appendDeleteRetRowWithUsing(v.oldRow, v.usingPortion)
+		ssiRecordTupleWrite(o.ctx, vRel, v.blk, v.slot)
+		// Use parent-aligned retOldRow for RETURNING when available. M0097-0078.
+		delRetRow := v.oldRow
+		if v.retOldRow != nil {
+			delRetRow = v.retOldRow
+		}
+		o.appendDeleteRetRowWithUsing(delRetRow, v.usingPortion)
 		o.rowsAffected++
 	}
 
@@ -3340,6 +3548,58 @@ func buildUniqueConstraintDetail(idx *catalog.Index, cols []catalog.Column, row 
 	return fmt.Sprintf("Key (%s)=(%s) already exists.",
 		strings.Join(colNames, ", "),
 		strings.Join(colVals, ", "))
+}
+
+// buildInheritColMap returns a mapping from parent column ordinal to child column
+// ordinal, matched by name. Returns -1 for parent columns absent from the child.
+// Used by inheritance-aware UPDATE/DELETE row remapping. M0097-0078.
+func buildInheritColMap(parentCols, childCols []catalog.Column) []int {
+	childByName := make(map[string]int, len(childCols))
+	for i, c := range childCols {
+		childByName[strings.ToLower(c.Name)] = i
+	}
+	m := make([]int, len(parentCols))
+	for i, pc := range parentCols {
+		if ci, ok := childByName[strings.ToLower(pc.Name)]; ok {
+			m[i] = ci
+		} else {
+			m[i] = -1
+		}
+	}
+	return m
+}
+
+// remapChildRowToParent builds a parent-length Row where position i holds the
+// child column value for parent column i (via colMap). Missing entries are NullDatum.
+func remapChildRowToParent(childRow Row, colMap []int) Row {
+	out := make(Row, len(colMap))
+	for i, ci := range colMap {
+		if ci >= 0 && ci < len(childRow) {
+			out[i] = childRow[ci]
+		} else {
+			out[i] = NullDatum
+		}
+	}
+	return out
+}
+
+// remapParentRowToChild builds a child-length Row where each child column gets
+// the updated value from parentRow at the matching parent ordinal (by name).
+// Child-only columns (not in parent) are filled from childRaw unchanged.
+func remapParentRowToChild(parentRow Row, childRaw Row, parentCols, childCols []catalog.Column) Row {
+	parentByName := make(map[string]int, len(parentCols))
+	for i, pc := range parentCols {
+		parentByName[strings.ToLower(pc.Name)] = i
+	}
+	out := make(Row, len(childCols))
+	for ci, cc := range childCols {
+		if pi, ok := parentByName[strings.ToLower(cc.Name)]; ok {
+			out[ci] = parentRow[pi]
+		} else if ci < len(childRaw) {
+			out[ci] = childRaw[ci]
+		}
+	}
+	return out
 }
 
 // isLiveForUniqueCheck decides whether a tuple with the given xmin/xmax

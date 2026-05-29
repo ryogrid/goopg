@@ -1417,6 +1417,21 @@ M0097-0001 wires it up.
         Next blockers (in order): INHERITS row propagation through
         UPDATE FROM / DELETE USING, RETURNING OLD/NEW alias references.
 
+      - **Progress 2026-05-29 (M0097-0078 — Inheritance-aware UPDATE/DELETE column remapping):**
+        Root cause: UPDATE/DELETE scanned inheritance children but applied
+        SET/WHERE/RETURNING expressions using parent column ordinals against
+        child row layouts (e.g. child `foochild` has `fc` between `f3` and
+        `f4`, so parent ordinal 3 pointed to `fc=-123` instead of `f4=99`).
+        Fix: three new helpers `buildInheritColMap`, `remapChildRowToParent`,
+        `remapParentRowToChild` in `operators_storage.go`; seq-scan,
+        UPDATE...FROM, and DELETE...USING loops detect inheritance children,
+        remap to parent space for evaluation, map results back to child
+        layout for writes, and use parent-aligned rows for RETURNING.
+        `returning` regress: 479→394 diff lines (−85).
+        Design: `docs/design/0097-0078-inheritance-dml-column-remapping.md`.
+        Remaining blockers: rules/views (ON INSERT/UPDATE/DELETE DO INSTEAD),
+        whole-row RETURNING variables, RETURNING OLD/NEW (PG18 syntax).
+
       - **Bisect resolved 2026-05-29 (M0097-0074 follow-up — false
         regression):** The "regression" framing in the prior note was
         wrong. Bisected by checking out `c945744c` in a separate worktree

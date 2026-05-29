@@ -117,7 +117,7 @@ vacuum,0,pass
 varchar,0,pass
 window,0,pass
 xid,0,pass
-returning,553,failed
+returning,394,failed
 insert,588,failed
 update,641,failed
 explain,724,failed
