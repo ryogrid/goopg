@@ -1465,6 +1465,54 @@ M0097-0001 wires it up.
         M0097-002X umbrella complete until the full suite is re-verified
         green.
 
+      - **Progress 2026-05-29 (M0097-0079 — UPDATE/DELETE subquery FROM/USING + multi-column tuple SET):**
+        Three improvements: (a) UPDATE … FROM (VALUES…) AS v / DELETE … USING (VALUES…) now
+        plan correctly — planner uses planScanRangeVar for FROM/USING entries so subqueries
+        (VALUES, SELECT, CTE) are accepted; executor uses new collectNodeRows() helper;
+        FromScans/UsingScans changed from []*SeqScan → []Node. (b) Multi-column tuple SET:
+        UPDATE SET (c1,c2,c3) = (e1,e2,e3) implemented end-to-end; parser gains Columns []string
+        in UpdateAssign; planner handles row-constructor and subquery RHS via new
+        MultiAssignSubqRow/MultiAssignSubqElem plan nodes; executor caches per-row subquery
+        results in MultiAssignSubqCache. (c) validate-ralph-state: added safe auto-repair rule
+        for stale "running/executing" status with newer failed progress.
+        Baseline diffs: update 641→450, returning 394→334, insert 588→539.
+
+      - **Progress 2026-05-29 (M0097-0080 — NOT NULL enforcement + short VALUES padding):**
+        (a) NOT NULL: insertOp.Next() checks NotNull columns before writing; SQLSTATE 23502
+        with "Failing row contains (...)" DETAIL. (b) Short VALUES: INSERT INTO t VALUES (v1,v2)
+        with fewer values than columns now pads trailing columns with DefaultMarker in
+        rewriteInsertDefaultMarkers(), matching PostgreSQL's trailing-default behaviour.
+        insert regress: 539→514.
+
+      - **Progress 2026-05-29 (M0097-0081 — PL/pgSQL scalar FOR loop var + EXPLAIN format):**
+        (a) FOR ln IN EXECUTE sql LOOP: when loop variable is a declared scalar and query
+        returns one column, assign directly to varName (not _varname_colname sub-field).
+        Fixes explain_filter() returning 0 rows. (b) EXPLAIN: Seq Scan emits FROM-clause alias
+        (e.g. "Seq Scan on int8_tbl i8"). (c) EXPLAIN VERBOSE Output: no wrapping parens.
+        (d) planner_test.go: updated arity-mismatch test case.
+        explain regress: 724→703.
+
+      - **Progress 2026-05-29 (M0097-0082 — array_subscript name + subquery UNION + EXPLAIN alias):**
+        (a) array_subscript column name → "array" (matching PostgreSQL FigureColname).
+        (b) Scalar subquery UNION: SELECT ((SELECT 2) UNION SELECT 2) now parses; expr parser
+        looks ahead through nested parens for SELECT/VALUES start; nested-paren forms delegate
+        to parseParenthesisedSelectStmt.
+        (c) EXPLAIN VERBOSE Output parens removed (also fixed in previous loop).
+        subselect regress: 837→695; explain regress: 703 (cascade).
+        All 10 tracked failed cases refreshed: join 1302→1088, with 2414→2283,
+        inherit 1306→1162, aggregates 1338→1074, partition_join 1441→1293.
+
+      - **Progress 2026-05-29 (M0097-0083 — array subscript int coercion + type inference):**
+        array_subscript executor: integer element strings return NewIntDatum not NewStringDatum.
+        exprType for array_subscript infers element type from array_construct args.
+        subselect regress: 695 (minor improvement).
+
+      - **Progress 2026-05-29 (M0097-0084 — numeric(P,S) scale rounding via typmod):**
+        encodeTypmod() in planner encodes precision+scale as (P<<16)|S; executor's CastExpr
+        handler decodes scale and calls roundNumericToScale() for numeric/decimal targets.
+        roundNumericToScale() handles KindNumeric fast-path and KindString.
+        aggregates regress: 1074→1068.
+
 - [ ] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `transactions`, `lock`, `prepare`, `plancache`,
