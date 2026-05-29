@@ -119,11 +119,11 @@ window,0,pass
 xid,0,pass
 returning,334,failed
 insert,514,failed
-update,450,failed
+update,425,failed
 explain,665,failed
 subselect,692,failed
 join,1088,failed
 inherit,1162,failed
 aggregates,1068,failed
 partition_join,1293,failed
-with,2329,failed
+with,2334,failed
