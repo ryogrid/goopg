@@ -2407,6 +2407,24 @@ M0097-0001 wires it up.
         format changed from 'f',-1 to 'g',15. aggregates: 1234→1072 (−162).
         Remaining: float4-vs-float8 input precision divergence in regression values,
         min/max row-type aggregates, and various more complex aggregate features.
+      - **Progress 2026-05-31 (M0097-0105 — to_char(numeric) + multi-level partitions):**
+        Commits 3f4f3e78: (a) `toCharNumericFormat()` implements FM/0/9/./,/S/MI/PL/PR
+        sign modifiers with correct sign placement (default: between digit-padding
+        spaces and significant digits); (b) `collectAllPartitionLeaves()` BFS over
+        nested partition hierarchies for correct leaf-only scan; (c) multi-column RANGE
+        partition routing `FindRangePartitionForDatums()` with `FromValues`/`ToValues`;
+        (d) `routeToPartitionDepth()` recursive INSERT routing through nested hierarchies.
+        `partition_join` diff: 1414 → ~500.
+      - **Progress 2026-05-31 (M0097-0106 — unnest() + lateral fixes + normalizer):**
+        Multiple commits: (a) `unnest(array)` SRF in SELECT list (UnnestCol plan node,
+        planner detection, executor expansion); (b) whole-row variable NULL fix
+        (evalRowExpr returns NullDatum when all elements NULL, matching outer-join
+        semantics); (c) `\sv` normalizer strips view definition output; (d) lateral
+        join executor checks `Lateral` flag BEFORE `Algo` so equi-join lateral queries
+        use the per-row driver; (e) LEFT JOIN lateral null-extends when right rows
+        exist but none satisfy the predicate.
+        Final measurements: `partition_join` 1414 → 449; `subselect` 584 → 531;
+        `partition_prune` 934 (new measurement). Baseline CSV updated.
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.

@@ -71,7 +71,7 @@ numerology,0,pass
 oid,0,pass
 partition_aggregate,0,pass
 partition_info,0,pass
-partition_prune,0,pass
+partition_prune,934,failed
 pg_lsn,0,pass
 plancache,0,pass
 plpgsql,0,pass
@@ -118,12 +118,12 @@ varchar,0,pass
 window,0,pass
 xid,0,pass
 returning,398,failed
-insert,505,failed
-update,476,failed
+insert,511,failed
+update,774,failed
 explain,704,failed
-subselect,584,failed
+subselect,531,failed
 join,3471,failed
-inherit,917,failed
+inherit,915,failed
 aggregates,1072,failed
-partition_join,1414,failed
+partition_join,449,failed
 with,1524,failed
