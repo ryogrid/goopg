@@ -278,6 +278,21 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		}
 		return result, nil
 	case *planner.BinaryOp:
+		// Special case: row-constructor comparison with multi-column scalar subquery.
+		// ROW(a, b) = (SELECT x, y FROM ...) → element-wise comparison.
+		// ROW(a,b) is planned as FuncCall{Name:"row",...} not RowExpr. M0097-0020.
+		if x.Op == parser.OpEq || x.Op == parser.OpNe {
+			if rowFc, ok := x.Left.(*planner.FuncCall); ok && strings.EqualFold(rowFc.Name, "row") {
+				if sqOp, ok := x.Right.(*planner.SubqueryExpr); ok {
+					return evalRowFuncCallVsSubqueryExpr(x.Op, rowFc.Args, sqOp, slot, ctx)
+				}
+			}
+			if rowFc, ok := x.Right.(*planner.FuncCall); ok && strings.EqualFold(rowFc.Name, "row") {
+				if sqOp, ok := x.Left.(*planner.SubqueryExpr); ok {
+					return evalRowFuncCallVsSubqueryExpr(x.Op, rowFc.Args, sqOp, slot, ctx)
+				}
+			}
+		}
 		left, err := evalExprSlot(x.Left, slot, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -3096,6 +3111,90 @@ func evalRowConstructorInExpr(x *planner.InExpr, rowOp *planner.RowExpr, slot Sl
 		return NullDatum, nil
 	}
 	return NewBoolDatum(x.Negated), nil
+}
+
+// evalRowFuncCallVsSubqueryExpr handles ROW(a,b,...) = (SELECT x,y,... FROM ...)
+// by evaluating the subquery as a multi-column row and comparing element-wise.
+// Op must be OpEq or OpNe. The rowArgs are the Args of the FuncCall{Name:"row",...}.
+// M0097-0020.
+func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []planner.Expr, sqOp *planner.SubqueryExpr, slot SlotView, ctx *Context) (Datum, error) {
+	if ctx.Ctx != nil {
+		if err := ctx.Ctx.Err(); err != nil {
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
+	// Evaluate left-side elements.
+	leftElems := make([]Datum, len(rowArgs))
+	for i, e := range rowArgs {
+		v, err := evalExprSlot(e, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		leftElems[i] = v
+	}
+
+	// Push outer row for correlated subquery resolution.
+	outerRow := slotToRow(slot)
+	ctx.OuterRows = append(ctx.OuterRows, outerRow)
+	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+
+	innerOp, err := Build(sqOp.Plan)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := innerOp.Open(ctx); err != nil {
+		_ = innerOp.Close()
+		return Datum{}, err
+	}
+	defer func() { _ = innerOp.Close() }()
+
+	innerSlot, err := innerOp.Next()
+	if err == EOF {
+		return NullDatum, nil // empty subquery → NULL per SQL semantics
+	}
+	if err != nil {
+		return Datum{}, err
+	}
+	rightRow := slotRow(innerSlot)
+
+	// Drain: exactly one row allowed.
+	if _, err2 := innerOp.Next(); err2 != EOF {
+		if err2 == nil {
+			return Datum{}, &ExecError{Code: "21000", Pos: sqOp.Pos(), Message: "more than one row returned by a subquery used as an expression"}
+		}
+		return Datum{}, err2
+	}
+
+	if len(rightRow) != len(leftElems) {
+		return Datum{}, &ExecError{
+			Code:    "42601",
+			Pos:     sqOp.Pos(),
+			Message: fmt.Sprintf("row value has %d columns but subquery has %d columns", len(leftElems), len(rightRow)),
+		}
+	}
+
+	// Compare element-by-element with 3-valued logic.
+	sawNull := false
+	for i := 0; i < len(leftElems); i++ {
+		left, right := leftElems[i], rightRow[i]
+		if left.IsNull() || right.IsNull() {
+			sawNull = true
+			continue
+		}
+		eq, err := compareEq(left, right)
+		if err != nil {
+			return Datum{}, err
+		}
+		if eq.Kind == KindBool && !eq.BoolValue() {
+			// Definitely not equal: row comparison is FALSE (for =) or TRUE (for !=).
+			return NewBoolDatum(op == parser.OpNe), nil
+		}
+	}
+	if sawNull {
+		return NullDatum, nil
+	}
+	// All elements equal: row comparison is TRUE (for =) or FALSE (for !=).
+	return NewBoolDatum(op == parser.OpEq), nil
 }
 
 // collectInValues returns the inner set for `IN (...)`. When

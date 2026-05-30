@@ -110,6 +110,41 @@ func TestArrayUpperLowerLength(t *testing.T) {
 	}
 }
 
+// TestRowEqSubqueryConstant verifies ROW(a,b) = (SELECT x,y) constant comparison.
+func TestRowEqSubqueryConstant(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE rsst (f1 int, f2 int)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO rsst VALUES (1,2),(3,4)"); err != nil {
+		t.Fatal(err)
+	}
+
+	// ROW(1,2) = (SELECT 3,4) → always FALSE (1≠3)
+	rows := runQueryRows(t, ctx, "SELECT ROW(1,2) = (SELECT 3,4) AS eq FROM rsst ORDER BY f1")
+	if len(rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows))
+	}
+	for i, r := range rows {
+		if r[0].Kind != KindBool || r[0].BoolValue() {
+			t.Errorf("row %d: expected false, got %v", i, r[0])
+		}
+	}
+
+	// ROW(1,2) = (SELECT 1,2) → always TRUE
+	rows2 := runQueryRows(t, ctx, "SELECT ROW(1,2) = (SELECT 1,2) AS eq FROM rsst ORDER BY f1")
+	if len(rows2) != 2 {
+		t.Fatalf("got %d rows, want 2", len(rows2))
+	}
+	for i, r := range rows2 {
+		if r[0].Kind != KindBool || !r[0].BoolValue() {
+			t.Errorf("row %d: expected true, got %v", i, r[0])
+		}
+	}
+}
+
 // TestArrayUpperLowerNullForDimNotOne verifies NULL returned for dim != 1.
 func TestArrayUpperLowerNullForDimNotOne(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)

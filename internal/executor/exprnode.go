@@ -140,6 +140,27 @@ func (s *exprTreeSlab) buildExpr(e planner.Expr) int32 {
 			*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
 			return idx
 		}
+		// Row-constructor = (SELECT ...) must use evalExprSlot's element-wise
+		// comparison path (evalRowFuncCallVsSubqueryExpr). The fast path's
+		// ExprBinaryOp would evaluate the SubqueryExpr via ExprAdapter and fail
+		// with "scalar subquery returned N columns" before reaching evalBinary.
+		// M0097-0020.
+		if t.Op == parser.OpEq || t.Op == parser.OpNe {
+			if rowFc, okL := t.Left.(*planner.FuncCall); okL && strings.EqualFold(rowFc.Name, "row") {
+				if _, okR := t.Right.(*planner.SubqueryExpr); okR {
+					idx := int32(len(*s))
+					*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
+					return idx
+				}
+			}
+			if rowFc, okR := t.Right.(*planner.FuncCall); okR && strings.EqualFold(rowFc.Name, "row") {
+				if _, okL := t.Left.(*planner.SubqueryExpr); okL {
+					idx := int32(len(*s))
+					*s = append(*s, ExprNode{Kind: ExprAdapter, orig: e})
+					return idx
+				}
+			}
+		}
 		// Reserve this node's slot BEFORE recursing into children so the
 		// index is stable even if subsequent appends reallocate the slab.
 		idx := int32(len(*s))
