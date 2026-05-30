@@ -1796,6 +1796,32 @@ M0097-0001 wires it up.
         Tests: `TestDefaultPartitionRouting` (new).
         Design: (inline in fix_plan; no separate design doc for small fixes).
 
+      - **Progress 2026-05-30 (M0097-0101 — nested WITH + LATERAL + WITH RECURSIVE non-union):**
+        Four fixes (commit 281648df):
+        (a) `registerAnalyzedCTE` (`internal/analyzer/analyzer.go`): when a CTE
+            body has its own `WITH` clause, call `analyzeWith(cte.Query.With, innerCtx)`
+            before `buildSelectScopeIn` so inner CTEs (e.g., `w8`) are registered
+            before the FROM clause resolves them. Fixes `WITH w6 AS (WITH w8 AS
+            (SELECT 1) SELECT * FROM w8)` → "relation 'w8' does not exist".
+        (b) `planRecursiveCTE` (`internal/planner/with.go`): non-UNION bodies
+            in `WITH RECURSIVE` are now planned as regular CTEs (PG allows
+            `WITH RECURSIVE name AS (single_select)`). Previously rejected
+            with "WITH RECURSIVE body must use UNION or UNION ALL".
+        (c) `nodeReferencesOuter` (`internal/planner/planner.go`): now calls
+            `planHasOuterRef` (walks full plan tree) instead of only matching
+            `PgGetPublicationTables`. LATERAL joins with CTE/recursive subquery
+            right children now correctly get `Lateral=true`.
+        (d) `walkPlanExprs` (`internal/planner/unnest.go`): added cases for
+            `RecursiveUnion`, `CTEScan`, `CTEDMLPrefix`, `SetOp`, `Distinct`,
+            `DistinctOn`, `ProjectSet` so `planHasOuterRef` can find
+            `OuterColumnRef` nodes deep in CTE plans.
+        (e) `openLateral` (`internal/executor/operators_join_agg.go`): general
+            lateral path for non-SRF right children uses `ctx.OuterRows` push
+            (instead of `BindLateralOuter`); `CTERowCache` cleared per iteration
+            so outer-dependent CTEs recompute for each left row.
+        Impact: `subselect` 685→652, `with` 1531→1519 diff lines.
+        Tests: existing executor/planner/analyzer suites all pass.
+
 - [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `plpgsql`, `create_function_sql`, `create_procedure`,
