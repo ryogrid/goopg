@@ -1584,13 +1584,16 @@ M0097-0001 wires it up.
         `subselect` regress diff: 711 (was 721 pre-fix). Design:
         `docs/design/0097-0094-correlated-in-semi-join-fix.md`.
 
-- [ ] **M0097-0021 — Port transaction / locking regress tests**
+- [x] **M0097-0021 — Port transaction / locking regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `transactions`, `lock`, `prepare`, `plancache`,
         `prepared_xacts`, `portals`, `advisory_lock`, `tid`,
         `tidscan`, `tidrangescan`.
       - Mapped to completed M0097-0010.
       - DoD: same as M0097-0020.
+      - **COMPLETE 2026-05-30**: All 10 tests pass. `lock` was the last
+        holdout; see M0097-0095 and M0097-0021 progress notes above for the
+        SET ROLE / CREATE VIEW WITH / LANGUAGE C / DROP VIEW CASCADE fixes.
       - **Progress 2026-05-25 (M0097-0038 — tid → pass):** Implemented
         `ctid` system-column support end-to-end. Features added:
         (a) `CTIDExpr` plan node (`internal/planner/plan.go`);
