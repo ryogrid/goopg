@@ -1845,6 +1845,16 @@ M0097-0001 wires it up.
         Remaining `subselect` blockers: `ROW(1,2) = (SELECT f1, f2)` row-comparison
         with multi-column scalar subquery; `pg_get_viewdef` output format; complex
         correlated queries.
+      - **Progress 2026-05-30 (M0097-0103 — ROW(a,b) = (SELECT x,y) comparison):**
+        Commit c269fa43: `ROW(1,2) = (SELECT f1, f2 FROM t)` element-wise
+        comparison implemented. Two changes: (a) `evalExprSlot` BinaryOp case
+        detects `FuncCall("row") == SubqueryExpr` pattern and routes to
+        `evalRowFuncCallVsSubqueryExpr` (3-valued element-wise logic: NULL if
+        any NULL, FALSE if any element mismatch, TRUE if all match, inverted
+        for OpNe); (b) `exprnode.go buildExpr` makes the `FuncCall("row") =
+        SubqueryExpr` BinaryOp fall back to ExprAdapter so the fast-path
+        `ExprBinaryOp` evaluator cannot pre-evaluate the multi-column SubqueryExpr.
+        Test: `TestRowEqSubqueryConstant`. `subselect` diff: 613 → 584 (−29).
 
 - [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
       - Summary: Make these 10 tests reach `pass`:
