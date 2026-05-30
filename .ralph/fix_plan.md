@@ -2458,6 +2458,35 @@ M0097-0001 wires it up.
         (f) create_aggregate.sql pre-setup for aggregates test; 935→652 (30% improvement).
         Remaining gaps: NOTICE count mismatch for my_avg/my_sum (~33), float precision (~80),
         statistics tables (~30), WITHIN GROUP (~30), various smaller.
+      - **Progress 2026-05-31 (M0097-0109 — aggregates 652→553 diff, 4 commits):**
+        Four targeted commit series reducing aggregates from 652 → 553 changed lines (99-line
+        improvement, ~15% further reduction from prior 652 baseline):
+        (a) WITHIN GROUP ordered-set aggregates (commit 48816f37): parser `WithinGroup []SortBy`
+        on FuncCall; planner `WithinGroup bool` + `WithinGroupOrderBy []SortKey` on AggregateCall;
+        executor `finishWithinGroupAgg` implementing percentile_cont (linear interpolation),
+        percentile_disc (ceil(p*n) method), rank/dense_rank/cume_dist/percent_rank (hypothetical-set).
+        Direct arg stored per-row in `withinGroupDirectArg`; NULL-skip for within-group values.
+        Results: `percentile_disc(0.5) WITHIN GROUP (ORDER BY thousand) FROM tenk1` → 499 ✓;
+        rank/dense_rank/cume_dist/percent_rank correct for all basic test cases.
+        (b) STRICT sfunc + DISTINCT ORDER BY for user-defined aggregates (commit 29827766):
+        `catalog.Routine.Strict bool` parsed from CREATE FUNCTION; `UserAggregate.SFuncStrict`
+        set from sfunc lookup; `applyAgg` skips NULL inputs when strict; DISTINCT user-defined agg
+        deferred to `finishAgg` with correct multi-arg dedup + `distinctUserAggRows [][]Datum`
+        accumulation + ORDER BY sort before sfunc calls. `aggfstr` (strict) now correctly omits
+        null rows; `aggfns(distinct a,b,c order by b)` now correctly sorted.
+        (c) COMBINEFUNC parsing + WITHIN GROUP validation (commit 11e0226f): `parseAggregateOptions`
+        now handles `combinefunc/serialfunc/deserialfunc/mstype/msfunc/minitcond/sortop/hypothetical`
+        as ignored options; paren-depth tracking skips function-call values like `balkifnull(int8,int8)`.
+        WITHIN GROUP validation: non-OSA + WITHIN GROUP → "X is not an ordered-set aggregate";
+        OSA with extra ORDER BY inside args → "cannot use multiple ORDER BY clauses with WITHIN GROUP";
+        percentile_cont/disc without WITHIN GROUP (and no OVER) → "WITHIN GROUP is required".
+        (d) DROP TABLE CASCADE inheritance NOTICEs + early WITHIN GROUP validation (commit 19692bb6):
+        DROP TABLE CASCADE with 1 child → "drop cascades to table X"; with N children →
+        "drop cascades to N other objects". Early WITHIN GROUP check before zero-arg return.
+        Remaining gaps (~553 changed lines): float4 precision divergence (~80), statistics table
+        queries requiring regexp_split_to_array+unnest+2D array_agg (~30), excess NOTICEs from
+        my_avg/my_sum non-shared state (~40), error section mismatches (~30), aggfns ~<~ custom
+        operator ORDER BY (~20), min/max row type composite comparison (~10), various smaller.
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
