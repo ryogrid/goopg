@@ -81,11 +81,16 @@ func (o *joinOp) Open(ctx *Context) error {
 		}
 		return o.openLazyHashJoin(ctx)
 	}
-	if o.plan.Algo == planner.JoinAlgoHash {
-		return o.openLazyHashJoin(ctx)
-	}
+	// Lateral joins must always use the per-row driver path so the right-side
+	// plan can evaluate OuterColumnRef nodes against the current left row.
+	// Check Lateral BEFORE Algo: even when the planner chose hash-join for the
+	// equi-predicate, the equality predicate just means JOIN ON col=col, not
+	// that the right side is independent of the outer row. M0097-0106.
 	if o.plan.Lateral {
 		return o.openLateral(ctx)
+	}
+	if o.plan.Algo == planner.JoinAlgoHash {
+		return o.openLazyHashJoin(ctx)
 	}
 	if err := o.left.Open(ctx); err != nil {
 		return err
