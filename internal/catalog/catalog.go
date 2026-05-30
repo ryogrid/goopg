@@ -216,6 +216,7 @@ type PartitionBound struct {
 	Modulus   int64    // HASH: modulus
 	Remainder int64    // HASH: remainder (partition index)
 	IsHash    bool     // true for HASH partitions
+	IsDefault bool     // true for DEFAULT partitions
 }
 
 // TableStats captures the pg_class-shaped table-level stats
@@ -554,12 +555,17 @@ func (c *InMemory) RegisterPartitionChild(parentOID, childOID uint32) {
 func (c *InMemory) FindPartitionForValue(parentOID uint32, keyValue string) *Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
 		for _, t := range c.tables {
 			if t.OID != childOID {
 				continue
 			}
 			for _, pb := range t.PartitionBounds {
+				if pb.IsDefault {
+					defaultPart = t
+					continue
+				}
 				for _, v := range pb.InValues {
 					if v == keyValue {
 						return t
@@ -568,7 +574,7 @@ func (c *InMemory) FindPartitionForValue(parentOID uint32, keyValue string) *Tab
 			}
 		}
 	}
-	return nil
+	return defaultPart // fall back to DEFAULT partition
 }
 
 // FindRangePartitionForValue finds the RANGE partition child that contains keyValue.
@@ -576,12 +582,17 @@ func (c *InMemory) FindPartitionForValue(parentOID uint32, keyValue string) *Tab
 func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) *Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
 		for _, t := range c.tables {
 			if t.OID != childOID {
 				continue
 			}
 			for _, pb := range t.PartitionBounds {
+				if pb.IsDefault {
+					defaultPart = t
+					continue
+				}
 				if pb.From == "" && pb.To == "" {
 					continue
 				}
@@ -598,7 +609,7 @@ func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) 
 			}
 		}
 	}
-	return nil
+	return defaultPart // fall back to DEFAULT partition
 }
 
 // FindHashPartitionForValue finds the HASH partition child that owns the given
@@ -612,12 +623,17 @@ func (c *InMemory) FindHashPartitionForValue(parentOID uint32, keyValue string) 
 		h ^= uint64(b)
 		h *= 1099511628211
 	}
+	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
 		for _, t := range c.tables {
 			if t.OID != childOID {
 				continue
 			}
 			for _, pb := range t.PartitionBounds {
+				if pb.IsDefault {
+					defaultPart = t
+					continue
+				}
 				if pb.IsHash && pb.Modulus > 0 {
 					if int64(h%uint64(pb.Modulus)) == pb.Remainder {
 						return t
@@ -626,7 +642,7 @@ func (c *InMemory) FindHashPartitionForValue(parentOID uint32, keyValue string) 
 			}
 		}
 	}
-	return nil
+	return defaultPart // fall back to DEFAULT partition
 }
 
 // HasDatabase reports whether the given database name is registered

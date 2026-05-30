@@ -763,12 +763,14 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		}
 		// Array concatenation: if both operands look like PostgreSQL arrays
 		// ({v1,v2,...}), merge their elements rather than text-concat.
-		// This handles ARRAY[...] || ARRAY[...] and array || array patterns.
+		// Also handles array || element and element || array (append/prepend).
 		// M0097-0065.
 		ls := left.Format()
 		rs := right.Format()
-		if len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}' &&
-			len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}' {
+		lsIsArr := len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}'
+		rsIsArr := len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}'
+		if lsIsArr && rsIsArr {
+			// array || array: merge inner elements.
 			leftInner := ls[1 : len(ls)-1]
 			rightInner := rs[1 : len(rs)-1]
 			var inner string
@@ -783,6 +785,22 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 				inner = leftInner + "," + rightInner
 			}
 			return NewStringDatum("{" + inner + "}"), nil
+		}
+		if lsIsArr && !rsIsArr {
+			// array || element: append element to array.
+			inner := ls[1 : len(ls)-1]
+			if inner == "" {
+				return NewStringDatum("{" + rs + "}"), nil
+			}
+			return NewStringDatum("{" + inner + "," + rs + "}"), nil
+		}
+		if rsIsArr && !lsIsArr {
+			// element || array: prepend element.
+			inner := rs[1 : len(rs)-1]
+			if inner == "" {
+				return NewStringDatum("{" + ls + "}"), nil
+			}
+			return NewStringDatum("{" + ls + "," + inner + "}"), nil
 		}
 		return NewStringDatum(ls + rs), nil
 	case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
@@ -1758,6 +1776,11 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				return d, nil // unexpected, keep original
 			}
 			return newNumeric(m, int(s)), nil
+		}
+		// Integer → float8: promote to KindNumeric so float arithmetic applies.
+		// Without this, float8(count(*)) / scalar_int uses integer division (→ 0).
+		if d.Kind == KindInt {
+			return numericFromInt(d.Int), nil
 		}
 		return d, nil
 	case "oid":

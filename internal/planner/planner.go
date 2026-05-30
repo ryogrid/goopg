@@ -5916,6 +5916,16 @@ func exprType(e Expr) catalog.Type {
 		// FuncCalls reach here with no type carried. Match the
 		// known-typed builtins; everything else stays unknown.
 		switch strings.ToLower(x.Name) {
+		// Type-cast functions: single-arg calls like float8(expr) act as explicit casts.
+		// Return the target type so downstream type inference (BinaryOp, wire) is correct.
+		case "float8", "double precision", "double", "float":
+			if len(x.Args) == 1 {
+				return catalog.Type{Name: "float8"}
+			}
+		case "float4", "real":
+			if len(x.Args) == 1 {
+				return catalog.Type{Name: "float4"}
+			}
 		case "count":
 			return catalog.Type{Name: "int8"}
 		case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":

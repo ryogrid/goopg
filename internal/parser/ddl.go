@@ -771,8 +771,12 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				}
 			}
 		}
-		// FOR VALUES ...
-		if p.acceptKeyword(KwFor) {
+		// FOR VALUES … or bare DEFAULT (both forms accepted by PostgreSQL).
+		// `CREATE TABLE child PARTITION OF parent DEFAULT` is the short form
+		// for the default partition; `FOR VALUES DEFAULT` is also valid.
+		if p.acceptKeyword(KwDefault) || p.acceptIdentKeyword("default") {
+			poc.Default = true
+		} else if p.acceptKeyword(KwFor) {
 			if _, err := p.expectKeyword(KwValues); err != nil {
 				return nil, err
 			}

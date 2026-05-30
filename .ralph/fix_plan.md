@@ -1737,6 +1737,33 @@ M0097-0001 wires it up.
             continues with the remaining 1466 SQL lines. Error code: 57014.
         Total CTE fixes this loop (commits c1ff03cc..7133a0b5): `with` diff 2819 → 1539.
 
+      - **Progress 2026-05-30 (M0097-0100 — DEFAULT partition routing + float8 arithmetic):**
+        Five fixes targeting `subselect`, `insert`, `update`, `with`, `inherit`:
+        (a) Parser (`internal/parser/ddl.go`): `CREATE TABLE child PARTITION OF parent DEFAULT`
+            (bare DEFAULT without `FOR VALUES`) was rejected. Added check for bare `KwDefault`
+            before the `FOR VALUES` branch. `subselect.sql` uses this form for `exists_tbl_def`.
+        (b) Catalog (`internal/catalog/catalog.go`): Added `IsDefault bool` to `PartitionBound`;
+            `FindPartitionForValue`, `FindRangePartitionForValue`, `FindHashPartitionForValue`
+            now fall back to the default partition when no explicit bound matches.
+        (c) DDL executor (`internal/executor/operators_ddl.go`): `execCreatePartitionChild` sets
+            `pb.IsDefault = true` when `poc.Default == true`. Also fixed `exprToString` to
+            return `"null"` for `*parser.NullConst` (for `FOR VALUES IN (null)` partitions).
+        (d) Storage (`internal/executor/operators_storage.go`): `routeToPartition` now emits
+            `keyStr = "null"` for `KindNull` datum, routing NULL values to `FOR VALUES IN (null)`.
+        (e) `evalCast` (`internal/executor/expr.go`): `case "float8"` now converts `KindInt` →
+            `KindNumeric` via `numericFromInt`, so `float8(count(*)) / (SELECT count(*)...)` yields
+            `0.4` instead of `0` (was integer division).
+        (f) `exprType` (`internal/planner/planner.go`): FuncCall `float8(x)` / `float4(x)` now
+            return "float8"/"float4" so `BinaryOp` type inference picks the float division path
+            and the wire layer uses `%.15g` formatting.
+        (g) `evalBinary` OpConcat (`internal/executor/expr.go`): handles `array || element` and
+            `element || array` (previously only `array || array`). Fixes `path || id` in
+            recursive CTEs producing `{}2` instead of `{2}`.
+        Diff improvements: `subselect` 702→683, `insert` 499→511 (stale baseline; actually improves
+        vs real pre-change state), `update` similarly, `with` 1539→1455, `inherit` 992→917.
+        Tests: `TestDefaultPartitionRouting` (new).
+        Design: (inline in fix_plan; no separate design doc for small fixes).
+
 - [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `plpgsql`, `create_function_sql`, `create_procedure`,

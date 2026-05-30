@@ -1206,6 +1206,8 @@ func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory) *cat
 			keyStr = fmt.Sprintf("%d", keyDatum.Int)
 		} else if keyDatum.Kind == KindString {
 			keyStr = keyDatum.StringValue()
+		} else if keyDatum.IsNull() {
+			keyStr = "null" // matches FOR VALUES IN (null)
 		}
 		return im.FindPartitionForValue(parent.OID, keyStr)
 	case "RANGE":

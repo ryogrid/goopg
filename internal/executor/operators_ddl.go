@@ -684,7 +684,11 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 
 	// Build partition bounds from the FOR VALUES clause.
 	var pb catalog.PartitionBound
-	if poc.IsHash {
+	if poc.Default {
+		// DEFAULT partition: catches all values not matched by other partitions.
+		pb.IsDefault = true
+		tbl.PartitionBounds = []catalog.PartitionBound{pb}
+	} else if poc.IsHash {
 		// HASH partition: MODULUS + REMAINDER. M0097-0015.
 		pb.IsHash = true
 		pb.Modulus = poc.Modulus
@@ -759,6 +763,8 @@ func exprToString(e parser.Expr) string {
 		return fmt.Sprintf("%d", v.Value)
 	case *parser.StringConst:
 		return v.Value
+	case *parser.NullConst:
+		return "null"
 	}
 	return fmt.Sprintf("%v", e)
 }
