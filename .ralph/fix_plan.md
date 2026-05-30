@@ -2487,6 +2487,25 @@ M0097-0001 wires it up.
         queries requiring regexp_split_to_array+unnest+2D array_agg (~30), excess NOTICEs from
         my_avg/my_sum non-shared state (~40), error section mismatches (~30), aggfns ~<~ custom
         operator ORDER BY (~20), min/max row type composite comparison (~10), various smaller.
+      - **Progress 2026-05-31 (M0097-0110 — aggregates 553→569 diff, commits 3efcea87..5d44bbbb):**
+        Multiple improvements reducing aggregates diff from 582 (pre-loop baseline) to 569 (−13):
+        (a) `unnest(...)::type` in SELECT list: SRF detection unwraps CastExpr around unnest FuncCall;
+            CastType stored in UnnestCol; executor applies evalCastTyped per element. M0097-0035.
+        (b) Multi-dimensional array flattening: expandArrayDatum recursively flattens nested arrays
+            matching PG's unnest() scalar-flattening semantics ({{1},{2}} → 1,2).
+        (c) Infer element type from array column type: implicit cast applied for int4[]/int8[]/etc.
+            columns so integer elements sort numerically not lexicographically.
+        (d) array_agg return type: exprType and buildAggregateCall both return element_type+"[]".
+        (e) Aggregate shared transition state (leader/follower): SharedStateSlot in AggregateCall;
+            applyAgg skips follower sfunc calls; followers synced from leader before finishAgg.
+            Reduces duplicate avg_transfn/sum_transfn NOTICE calls (47→27 excess NOTICEs).
+        (f) ALTER AGGREGATE ... RENAME TO: fixes test_rank/test_percentile_disc "does not exist".
+        (g) FROM unnest: also committed (earlier loop) FROM unnest(array) in FROM clause support
+            + percentile_cont/disc array form + DISTINCT ORDER BY validation.
+        Remaining gaps (~569 diff lines): float4 precision divergence (~80), statistics table
+        data format mismatches (aamin/aamax arrays vs scalars ~30), excess NOTICEs (still ~27
+        from DISTINCT sharing + non-overlapping queries), error section mismatches (~30),
+        aggfns ~<~ operator ORDER BY (~20), min/max row type composite comparison (~10).
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
