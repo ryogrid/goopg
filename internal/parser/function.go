@@ -105,6 +105,10 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 			stmt.Body = "SELECT " + strings.Join(bodyToks, " ")
 			sawAs = true
 		case p.isFunctionAttribute():
+			// Detect STRICT / RETURNS NULL ON NULL INPUT — M0097-0035.
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "strict") {
+				stmt.Strict = true
+			}
 			// Consume IMMUTABLE/VOLATILE/STABLE/STRICT/SECURITY DEFINER
 			// and other function attributes; they have no runtime effect
 			// in goopg but must be parsed to reach the AS $$body$$ clause.

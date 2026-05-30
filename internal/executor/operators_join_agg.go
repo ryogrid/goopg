@@ -976,6 +976,10 @@ type aggRuntime struct {
 	// percentile_cont(p)) evaluated from the first row of the group. M0097-0035.
 	withinGroupDirectArg    Datum
 	withinGroupDirectArgSet bool
+	// distinctUserAggRows holds per-row arg vectors for user-defined aggregates
+	// with DISTINCT (and optional ORDER BY). Deferred to finishAgg for correct
+	// multi-arg dedup and ORDER BY sort before sfunc calls. M0097-0035.
+	distinctUserAggRows [][]Datum // inner: [sortKey0..., arg0, arg1, ...]
 }
 
 func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
@@ -1177,14 +1181,34 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 	if err != nil {
 		return err
 	}
-	// For user-defined aggregates: NULL handling depends on whether the sfunc is strict.
-	// We treat all user sfuncs as non-strict (pass NULLs through) unless the sfunc is
-	// a known built-in strict function. For simplicity, skip NULLs only for built-in aggs.
+	// For user-defined aggregates with a strict sfunc: skip rows where any arg is NULL.
+	// STRICT means "returns null on null input" — sfunc not called when any arg is NULL. M0097-0035.
+	if call.UserAgg != nil && call.UserAgg.SFuncStrict {
+		if arg.IsNull() {
+			return nil
+		}
+		if call.Arg2 != nil {
+			a2, _ := evalExprSlot(call.Arg2, slot, o.ctx)
+			if a2.IsNull() {
+				return nil
+			}
+		}
+		for _, ea := range call.ExtraArgs {
+			eav, _ := evalExprSlot(ea, slot, o.ctx)
+			if eav.IsNull() {
+				return nil
+			}
+		}
+	}
+	// For built-in aggregates: NULL handling depends on the aggregate.
+	// array_agg includes NULLs; all others skip NULLs.
 	if arg.IsNull() && name != "array_agg" && call.UserAgg == nil {
 		return nil
 	}
 
-	if call.Distinct {
+	// User-defined DISTINCT aggregates: defer dedup to finishAgg for correct multi-arg handling.
+	// Only apply the single-arg outer dedup for built-in aggregates. M0097-0035.
+	if call.Distinct && call.UserAgg == nil {
 		if st.distinct == nil {
 			st.distinct = map[string]struct{}{}
 		}
@@ -1464,6 +1488,38 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 	default:
 		// User-defined aggregates (CREATE AGGREGATE): call sfunc on each row.
 		if call.UserAgg != nil {
+			// For DISTINCT aggregates, accumulate all arg vectors for deduplication
+			// and optional ORDER BY sorting in finishAgg. M0097-0035.
+			if call.Distinct {
+				// Build row: [sortKey0, ..., arg0, arg1, ...extraArgs].
+				// Sort keys first (for ORDER BY), then arg values for sfunc. M0097-0035.
+				nSortKeys := len(call.OrderBy)
+				row := make([]Datum, 0, nSortKeys+1+1+len(call.ExtraArgs))
+				// Evaluate sort keys first.
+				for _, sk := range call.OrderBy {
+					kv, _ := evalExprSlot(sk.Expr, slot, o.ctx)
+					row = append(row, kv.MaterializeArena())
+				}
+				// Then arg values.
+				row = append(row, arg.MaterializeArena())
+				// Arg2
+				if call.Arg2 != nil {
+					a2, a2err := evalExprSlot(call.Arg2, slot, o.ctx)
+					if a2err == nil {
+						row = append(row, a2.MaterializeArena())
+					}
+				}
+				// ExtraArgs
+				for _, ea := range call.ExtraArgs {
+					ev, everr := evalExprSlot(ea, slot, o.ctx)
+					if everr == nil {
+						row = append(row, ev.MaterializeArena())
+					}
+				}
+				st.distinctUserAggRows = append(st.distinctUserAggRows, row)
+				st.hasValue = true
+				return nil
+			}
 			ua := call.UserAgg
 			// Initialize state from InitCond on first call.
 			if !st.userStateSet {
@@ -1568,6 +1624,74 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 	// Handle user-defined aggregates first.
 	if call.UserAgg != nil {
 		ua := call.UserAgg
+		// For DISTINCT user-defined aggregates: deduplicate, sort, then call sfunc. M0097-0035.
+		if call.Distinct && len(st.distinctUserAggRows) > 0 {
+			nSortKeys := len(call.OrderBy)
+			// Deduplicate by all arg values (rows[nSortKeys:]).
+			seen := map[string]struct{}{}
+			var deduped [][]Datum
+			for _, row := range st.distinctUserAggRows {
+				argSlice := row[nSortKeys:]
+				var keyParts []string
+				for _, d := range argSlice {
+					keyParts = append(keyParts, datumKey(d))
+				}
+				k := strings.Join(keyParts, "	")
+				if _, ok := seen[k]; ok {
+					continue
+				}
+				seen[k] = struct{}{}
+				deduped = append(deduped, row)
+			}
+			// Sort by ORDER BY sort keys if present.
+			if nSortKeys > 0 {
+				sort.SliceStable(deduped, func(i, j int) bool {
+					for ki := 0; ki < nSortKeys; ki++ {
+						ai, bi := deduped[i][ki], deduped[j][ki]
+						aNull, bNull := ai.IsNull(), bi.IsNull()
+						if aNull && bNull {
+							continue
+						}
+						nullsFirst := call.OrderBy[ki].NullsFirst
+						if aNull {
+							return nullsFirst
+						}
+						if bNull {
+							return !nullsFirst
+						}
+						cmp, err := compareDatum(ai, bi, 0)
+						if err != nil || cmp == 0 {
+							continue
+						}
+						if call.OrderBy[ki].Desc {
+							return cmp > 0
+						}
+						return cmp < 0
+					}
+					return false
+				})
+			}
+			// Initialize state and call sfunc for each deduped+sorted row.
+			state := userAggInitState(ua)
+			for _, row := range deduped {
+				argSlice := row[nSortKeys:]
+				sfuncArgs := make([]Datum, 0, 1+len(argSlice))
+				sfuncArgs = append(sfuncArgs, state)
+				sfuncArgs = append(sfuncArgs, argSlice...)
+				newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
+				if serr == nil {
+					state = newState
+				}
+			}
+			if ua.FinalFunc == "" {
+				return state
+			}
+			result, ferr := executeSFuncCall(ua.FinalFunc, []Datum{state}, o.ctx)
+			if ferr != nil {
+				return NullDatum
+			}
+			return result
+		}
 		if !st.hasValue {
 			return NullDatum
 		}

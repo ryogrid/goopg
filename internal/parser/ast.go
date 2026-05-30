@@ -1495,6 +1495,7 @@ type CreateFunctionStmt struct {
 	ReturnsSet bool   // RETURNS SETOF ... M0097-0020
 	Language   string // lower-cased, e.g. "plpgsql"
 	Body       string // raw source between the dollar-quote delimiters
+	Strict     bool   // STRICT / RETURNS NULL ON NULL INPUT M0097-0035
 }
 
 func (s *CreateFunctionStmt) Pos() int  { return s.pos }

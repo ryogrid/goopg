@@ -2405,6 +2405,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		ReturnsSet: s.ReturnsSet,
 		Language:   lang,
 		Body:       s.Body,
+		Strict:     s.Strict,
 	}
 	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
@@ -3421,6 +3422,14 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	}
 	if s.HasBaseType && s.BaseType != "" && s.BaseType != "*" && s.BaseType != "any" {
 		agg.ArgTypes = []string{s.BaseType}
+	}
+	// Check if the sfunc is STRICT by looking it up in the routine registry.
+	// A strict sfunc skips NULL inputs (the aggregate state is unchanged on NULL rows). M0097-0035.
+	if rs := o.ctx.Catalog.Routines(); rs != nil && s.SFunc != "" {
+		sfuncName := parser.ObjectName{Name: s.SFunc}
+		if candidates := rs.LookupByName(sfuncName); len(candidates) > 0 {
+			agg.SFuncStrict = candidates[0].Strict
+		}
 	}
 	o.ctx.Catalog.RegisterUserAggregate(agg)
 	return nil

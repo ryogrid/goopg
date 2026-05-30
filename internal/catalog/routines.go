@@ -41,6 +41,7 @@ type Routine struct {
 	ReturnsSet bool   // RETURNS SETOF ... M0097-0020
 	Language   string // lower-cased
 	Body       string // raw routine source between the dollar-quote delimiters
+	Strict     bool   // STRICT / CALLED ON NULL INPUT; if true, sfunc skips NULL inputs
 }
 
 // QualifiedName returns the upstream-style schema-qualified routine

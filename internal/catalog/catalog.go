@@ -421,12 +421,13 @@ type Domain struct {
 // UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
 // It is stored in InMemory.userAggregates and looked up by lower-case name.
 type UserAggregate struct {
-	Name      string   // lower-case aggregate name
-	ArgTypes  []string // base argument type names (may be empty for zero-arg like count(*))
-	SType     string   // state type name
-	SFunc     string   // state transition function name
-	FinalFunc string   // final function name (may be empty)
-	InitCond  string   // initial condition string (may be empty)
+	Name        string   // lower-case aggregate name
+	ArgTypes    []string // base argument type names (may be empty for zero-arg like count(*))
+	SType       string   // state type name
+	SFunc       string   // state transition function name
+	FinalFunc   string   // final function name (may be empty)
+	InitCond    string   // initial condition string (may be empty)
+	SFuncStrict bool     // true if sfunc is STRICT (skips NULL inputs)
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
