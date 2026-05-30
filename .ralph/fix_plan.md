@@ -2442,6 +2442,22 @@ M0097-0001 wires it up.
         from create_aggregate.sql (~130, ordering issue), WITHIN GROUP (~200),
         custom aggregate functions (~250), FILTER correlated subquery (~100),
         statistics (~90). aggregates: 1072 → 935.
+      - **Progress 2026-05-31 (M0097-0108 — aggregates 935→652 diff):**
+        Commit 19eaddfe: (a) user-defined aggregate support: catalog.UserAggregate,
+        RegisterUserAggregate/LookupUserAggregateByName; execCreateAggregate now
+        registers; collectAggregateCalls recognizes user-defined aggregates;
+        applyAgg/finishAgg call sfunc/finalfunc via executeSFuncCall (int8inc,
+        int8inc_any, int4pl, int4_avg_accum, int8_avg, user SQL routines);
+        AggregateCall.ExtraArgs for 3+ arg aggregates (aggfns(a,b,c));
+        (b) ROW() constructor: NULL elements render as empty string not "NULL"
+        (matching PG composite type display: `(0,,)` not `(0,NULL,NULL)`);
+        (c) array_append, array_prepend, array_cat, array_dims, array_ndims,
+        regexp_split_to_array added to evalFuncCall; (d) targetMeta SubqueryExpr
+        propagates inner query column name (scalar subquery → "min" not "?column?");
+        (e) CREATE UNIQUE INDEX accepts NULLS [NOT] DISTINCT (PG 15+ syntax);
+        (f) create_aggregate.sql pre-setup for aggregates test; 935→652 (30% improvement).
+        Remaining gaps: NOTICE count mismatch for my_avg/my_sum (~33), float precision (~80),
+        statistics tables (~30), WITHIN GROUP (~30), various smaller.
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
