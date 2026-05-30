@@ -648,6 +648,13 @@ type AggregateCall struct {
 	// OrderBy is the ORDER BY clause inside the aggregate call, e.g.
 	// array_agg(x ORDER BY y). Only used for ordering-sensitive aggregates.
 	OrderBy []SortKey
+	// WithinGroup is true when this is an ordered-set aggregate using
+	// WITHIN GROUP (ORDER BY ...) syntax. M0097-0035.
+	WithinGroup bool
+	// WithinGroupOrderBy holds the sort keys from WITHIN GROUP (ORDER BY ...).
+	// The executor accumulates these per-row values, sorts them, and then
+	// applies the aggregate function (percentile_cont/disc, rank, etc.).
+	WithinGroupOrderBy []SortKey
 	// UserAgg is non-nil for user-defined aggregates registered via
 	// CREATE AGGREGATE. The executor uses it to call sfunc/finalfunc.
 	UserAgg *catalog.UserAggregate

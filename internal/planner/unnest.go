@@ -286,6 +286,12 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 			for _, ea := range a.ExtraArgs {
 				walkExprTree(ea, visit)
 			}
+			for _, sk := range a.OrderBy {
+				walkExprTree(sk.Expr, visit)
+			}
+			for _, sk := range a.WithinGroupOrderBy {
+				walkExprTree(sk.Expr, visit)
+			}
 		}
 	case *Sort:
 		walkPlanExprs(n.Child, visit)

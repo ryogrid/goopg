@@ -968,6 +968,14 @@ type aggRuntime struct {
 	// Initialized from initcond; updated by sfunc on each row.
 	userState    Datum
 	userStateSet bool // true once userState has been initialized
+	// withinGroupElems accumulates per-row values for WITHIN GROUP (ORDER BY ...)
+	// ordered-set aggregates (percentile_cont, percentile_disc, rank, dense_rank, mode).
+	// Each entry is [sortKey0, sortKey1, ..., valueExpr]. M0097-0035.
+	withinGroupElems [][]Datum
+	// withinGroupDirectArg stores the "direct argument" (e.g. the fraction p in
+	// percentile_cont(p)) evaluated from the first row of the group. M0097-0035.
+	withinGroupDirectArg    Datum
+	withinGroupDirectArgSet bool
 }
 
 func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
@@ -1126,6 +1134,37 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 		}
 		st.count++
 		st.hasValue = true
+		return nil
+	}
+
+	// Ordered-set aggregates (WITHIN GROUP): accumulate sort-key values per row.
+	// The direct arg (call.Arg, e.g. the fraction p in percentile_cont(p)) is
+	// evaluated lazily in finishAgg from the first row's value. M0097-0035.
+	if call.WithinGroup && len(call.WithinGroupOrderBy) > 0 {
+		// Evaluate the direct argument (call.Arg) from the first row.
+		if !st.withinGroupDirectArgSet && call.Arg != nil {
+			v, verr := evalExprSlot(call.Arg, slot, o.ctx)
+			if verr == nil {
+				st.withinGroupDirectArg = v
+				st.withinGroupDirectArgSet = true
+			}
+		}
+		row := make([]Datum, len(call.WithinGroupOrderBy))
+		allNull := true
+		for i, sk := range call.WithinGroupOrderBy {
+			v, verr := evalExprSlot(sk.Expr, slot, o.ctx)
+			if verr != nil {
+				return verr
+			}
+			row[i] = v
+			if !v.IsNull() {
+				allNull = false
+			}
+		}
+		if !allNull {
+			st.withinGroupElems = append(st.withinGroupElems, row)
+			st.hasValue = true
+		}
 		return nil
 	}
 
@@ -1522,6 +1561,10 @@ func aggDatumToFloat64(d Datum) float64 {
 }
 
 func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum {
+	// Handle ordered-set aggregates (WITHIN GROUP) before regular handling. M0097-0035.
+	if call.WithinGroup {
+		return finishWithinGroupAgg(st, call, o.ctx)
+	}
 	// Handle user-defined aggregates first.
 	if call.UserAgg != nil {
 		ua := call.UserAgg
@@ -2109,4 +2152,254 @@ func executeSFuncCall(funcName string, args []Datum, ctx *Context) (Datum, error
 func formatAvgInt8(sum, count int64) string {
 	r := new(big.Rat).SetFrac(big.NewInt(sum), big.NewInt(count))
 	return r.FloatString(16)
+}
+
+// finishWithinGroupAgg handles ordered-set aggregate finalization for
+// WITHIN GROUP (ORDER BY ...) aggregate functions. M0097-0035.
+//
+// The st.withinGroupElems slice contains one []Datum per input row,
+// where each entry holds the sort-key value(s) from WithinGroupOrderBy.
+// For single-key cases (most common), each inner slice has one element.
+func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Context) Datum {
+	name := strings.ToLower(call.Name)
+	elems := st.withinGroupElems
+	if len(elems) == 0 {
+		return NullDatum
+	}
+
+	// Sort the elements according to WithinGroupOrderBy direction.
+	// Each elem is []Datum with one Datum per sort key.
+	sortKeys := call.WithinGroupOrderBy
+	sort.SliceStable(elems, func(i, j int) bool {
+		for ki, sk := range sortKeys {
+			if ki >= len(elems[i]) || ki >= len(elems[j]) {
+				break
+			}
+			ai, bi := elems[i][ki], elems[j][ki]
+			// NULLs: by default NULLs LAST for ASC, FIRST for DESC.
+			aNull, bNull := ai.IsNull(), bi.IsNull()
+			if aNull && bNull {
+				continue
+			}
+			nullsFirst := sk.NullsFirst
+			if aNull {
+				return nullsFirst
+			}
+			if bNull {
+				return !nullsFirst
+			}
+			cmp, err := compareDatum(ai, bi, 0)
+			if err != nil || cmp == 0 {
+				continue
+			}
+			if sk.Desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
+	})
+
+	// Extract the first sort-key values (the "ordered values").
+	// For most ordered-set aggregates, only the first key is used as the value.
+	orderedVals := make([]Datum, len(elems))
+	for i, row := range elems {
+		if len(row) > 0 {
+			orderedVals[i] = row[0]
+		} else {
+			orderedVals[i] = NullDatum
+		}
+	}
+
+	switch name {
+	case "percentile_cont":
+		// Use direct arg stored during applyAgg from the first row of the group.
+		if call.Arg == nil || !st.withinGroupDirectArgSet {
+			return NullDatum
+		}
+		p := st.withinGroupDirectArg
+		pf := aggDatumToFloat64(p)
+		if math.IsNaN(pf) || pf < 0 || pf > 1 {
+			return NullDatum
+		}
+		n := len(orderedVals)
+		if n == 0 {
+			return NullDatum
+		}
+		// Linear interpolation: position = p * (n-1) (0-indexed).
+		pos := pf * float64(n-1)
+		lower := int(math.Floor(pos))
+		upper := int(math.Ceil(pos))
+		if lower >= n {
+			lower = n - 1
+		}
+		if upper >= n {
+			upper = n - 1
+		}
+		if lower == upper {
+			return orderedVals[lower]
+		}
+		// Interpolate between lower and upper values.
+		frac := pos - float64(lower)
+		lo := aggDatumToFloat64(orderedVals[lower])
+		hi := aggDatumToFloat64(orderedVals[upper])
+		result := lo + frac*(hi-lo)
+		return NewStringDatum(strconv.FormatFloat(result, 'g', 15, 64))
+
+	case "percentile_disc":
+		// Use direct arg stored during applyAgg from the first row of the group.
+		if call.Arg == nil || !st.withinGroupDirectArgSet {
+			return NullDatum
+		}
+		p := st.withinGroupDirectArg
+		pf := aggDatumToFloat64(p)
+		if math.IsNaN(pf) || pf < 0 || pf > 1 {
+			return NullDatum
+		}
+		n := len(orderedVals)
+		if n == 0 {
+			return NullDatum
+		}
+		// Find smallest index i such that (i+1)/n >= p.
+		// Equivalently: i = ceil(p * n) - 1 (0-indexed), clamped to [0, n-1].
+		rowNum := int(math.Ceil(pf * float64(n)))
+		if rowNum < 1 {
+			rowNum = 1
+		}
+		if rowNum > n {
+			rowNum = n
+		}
+		return orderedVals[rowNum-1]
+
+	case "rank":
+		// rank(v) WITHIN GROUP (ORDER BY x): count values strictly less than v, +1.
+		if call.Arg == nil || !st.withinGroupDirectArgSet {
+			return NullDatum
+		}
+		v := st.withinGroupDirectArg
+		rank := int64(1)
+		for _, val := range orderedVals {
+			if val.IsNull() {
+				continue
+			}
+			cmp, cerr := compareDatum(val, v, 0)
+			if cerr != nil {
+				continue
+			}
+			if cmp < 0 {
+				rank++
+			}
+		}
+		return NewIntDatum(rank)
+
+	case "dense_rank":
+		// dense_rank(v) WITHIN GROUP (ORDER BY x): count distinct values strictly less than v, +1.
+		if call.Arg == nil || !st.withinGroupDirectArgSet {
+			return NullDatum
+		}
+		v := st.withinGroupDirectArg
+		seen := map[string]struct{}{}
+		for _, val := range orderedVals {
+			if val.IsNull() {
+				continue
+			}
+			cmp, cerr := compareDatum(val, v, 0)
+			if cerr != nil {
+				continue
+			}
+			if cmp < 0 {
+				seen[datumKey(val)] = struct{}{}
+			}
+		}
+		return NewIntDatum(int64(len(seen)) + 1)
+
+	case "cume_dist":
+		// cume_dist(v) WITHIN GROUP (ORDER BY x): fraction of rows <= v (including hypothetical row).
+		if !st.withinGroupDirectArgSet {
+			return NullDatum
+		}
+		v := st.withinGroupDirectArg
+		totalWithHypothetical := int64(len(orderedVals)) + 1
+		lessOrEqual := int64(0)
+		for _, val := range orderedVals {
+			if val.IsNull() {
+				continue
+			}
+			cmp, cerr := compareDatum(val, v, 0)
+			if cerr != nil {
+				continue
+			}
+			if cmp <= 0 {
+				lessOrEqual++
+			}
+		}
+		lessOrEqual++ // count the hypothetical row itself
+		result := float64(lessOrEqual) / float64(totalWithHypothetical)
+		return NewStringDatum(strconv.FormatFloat(result, 'g', 15, 64))
+
+	case "percent_rank":
+		// percent_rank(v) WITHIN GROUP (ORDER BY x): (rank-1) / (total-1).
+		if !st.withinGroupDirectArgSet {
+			return NullDatum
+		}
+		v := st.withinGroupDirectArg
+		totalWithHypothetical := int64(len(orderedVals)) + 1
+		if totalWithHypothetical <= 1 {
+			return NewStringDatum("0")
+		}
+		rank := int64(1)
+		for _, val := range orderedVals {
+			if val.IsNull() {
+				continue
+			}
+			cmp, cerr := compareDatum(val, v, 0)
+			if cerr != nil {
+				continue
+			}
+			if cmp < 0 {
+				rank++
+			}
+		}
+		result := float64(rank-1) / float64(totalWithHypothetical-1)
+		return NewStringDatum(strconv.FormatFloat(result, 'g', 15, 64))
+
+	case "mode":
+		// mode() WITHIN GROUP (ORDER BY x): most frequent value (lowest if tie).
+		freq := map[string]int{}
+		order := []string{}
+		vals := map[string]Datum{}
+		for _, val := range orderedVals {
+			if val.IsNull() {
+				continue
+			}
+			k := datumKey(val)
+			if _, seen := freq[k]; !seen {
+				order = append(order, k)
+				vals[k] = val
+			}
+			freq[k]++
+		}
+		if len(order) == 0 {
+			return NullDatum
+		}
+		maxFreq := 0
+		best := order[0]
+		for _, k := range order {
+			if freq[k] > maxFreq {
+				maxFreq = freq[k]
+				best = k
+			}
+		}
+		return vals[best]
+	}
+
+	return NullDatum
+}
+
+// evalExprFromRow evaluates a planner expression against a fixed (possibly empty) row.
+// Used by ordered-set aggregate finalizers to evaluate "direct arguments" like the
+// percentile fraction p in `percentile_cont(p) WITHIN GROUP (ORDER BY x)`.
+func evalExprFromRow(expr planner.Expr, row Row, ctx *Context) (Datum, error) {
+	slot := SlotFromRow(nil, row)
+	return evalExprSlot(expr, slot, ctx)
 }

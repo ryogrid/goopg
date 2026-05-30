@@ -363,6 +363,10 @@ type FuncCall struct {
 	// OrderBy is the optional ORDER BY within the aggregate argument list
 	// (M0097-0007), e.g. string_agg(x, ',' ORDER BY x).
 	OrderBy []SortBy
+	// WithinGroup holds the sort list from `WITHIN GROUP (ORDER BY ...)`.
+	// Non-nil only for ordered-set aggregate functions (percentile_cont,
+	// percentile_disc, rank, dense_rank, mode). M0097-0035.
+	WithinGroup []SortBy
 	// Variadic is a parallel slice to Args. When Variadic[i] is true, the i-th
 	// argument was prefixed with the VARIADIC keyword (M0103-0008 probe-
 	// survival: libpqrcv fetch_table_list emits

@@ -4141,7 +4141,17 @@ func isAggregateFunc(fc *parser.FuncCall) bool {
 	if fc.Over != nil {
 		return false
 	}
-	switch strings.ToLower(fc.Name.Name) {
+	name := strings.ToLower(fc.Name.Name)
+	// Ordered-set / hypothetical-set aggregates: rank, dense_rank, cume_dist,
+	// percent_rank are aggregate functions ONLY when WITHIN GROUP is present;
+	// otherwise they are window functions. M0097-0035.
+	if len(fc.WithinGroup) > 0 {
+		switch name {
+		case "rank", "dense_rank", "cume_dist", "percent_rank":
+			return true
+		}
+	}
+	switch name {
 	case "count", "sum", "avg", "min", "max",
 		// Statistical aggregates (M0097-0007)
 		"var_pop", "var_samp", "variance",
@@ -4305,6 +4315,18 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			return AggregateCall{}, err
 		}
 	}
+	// Resolve WITHIN GROUP (ORDER BY ...) sort keys — ordered-set aggregates.
+	// M0097-0035: percentile_cont/disc, rank, dense_rank, mode.
+	var withinGroupKeys []SortKey
+	if len(fc.WithinGroup) > 0 {
+		for _, sb := range fc.WithinGroup {
+			e, serr := resolveExpr(sb.Expr, inputCtx)
+			if serr != nil {
+				return AggregateCall{}, serr
+			}
+			withinGroupKeys = append(withinGroupKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
+		}
+	}
 	outType := catalog.Type{Name: "unknown"}
 	switch name {
 	case "count":
@@ -4330,6 +4352,44 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		"regr_r2", "regr_slope", "regr_intercept",
 		"covar_pop", "covar_samp", "corr":
 		outType = catalog.Type{Name: "float8"}
+	// Ordered-set aggregates (M0097-0035).
+	case "percentile_cont":
+		if len(withinGroupKeys) > 0 {
+			wgType := exprType(withinGroupKeys[0].Expr)
+			if wgType.Name != "" && wgType.Name != "unknown" {
+				outType = wgType
+			} else {
+				outType = catalog.Type{Name: "float8"}
+			}
+		} else {
+			outType = catalog.Type{Name: "float8"}
+		}
+	case "percentile_disc":
+		if len(withinGroupKeys) > 0 {
+			wgType := exprType(withinGroupKeys[0].Expr)
+			if wgType.Name != "" && wgType.Name != "unknown" {
+				outType = wgType
+			} else {
+				outType = catalog.Type{Name: "numeric"}
+			}
+		} else {
+			outType = catalog.Type{Name: "numeric"}
+		}
+	case "rank", "dense_rank":
+		outType = catalog.Type{Name: "int8"}
+	case "cume_dist", "percent_rank":
+		outType = catalog.Type{Name: "float8"}
+	case "mode":
+		if len(withinGroupKeys) > 0 {
+			wgType := exprType(withinGroupKeys[0].Expr)
+			if wgType.Name != "" && wgType.Name != "unknown" {
+				outType = wgType
+			} else {
+				outType = catalog.Type{Name: "numeric"}
+			}
+		} else {
+			outType = catalog.Type{Name: "numeric"}
+		}
 	default:
 		// Check for user-defined aggregate in catalog.
 		if cat != nil {
@@ -4361,16 +4421,18 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 					extraArgs = append(extraArgs, ea)
 				}
 				return AggregateCall{
-					pos:       fc.Pos(),
-					Name:      name,
-					Arg:       argExpr,
-					Arg2:      argExpr2,
-					ExtraArgs: extraArgs,
-					Distinct:  fc.Distinct,
-					Type:      outType,
-					Filter:    filterExpr,
-					OrderBy:   orderByKeys,
-					UserAgg:   ua,
+					pos:                fc.Pos(),
+					Name:               name,
+					Arg:                argExpr,
+					Arg2:               argExpr2,
+					ExtraArgs:          extraArgs,
+					Distinct:           fc.Distinct,
+					Type:               outType,
+					Filter:             filterExpr,
+					OrderBy:            orderByKeys,
+					WithinGroup:        len(withinGroupKeys) > 0,
+					WithinGroupOrderBy: withinGroupKeys,
+					UserAgg:            ua,
 				}, nil
 			}
 		}
@@ -4387,14 +4449,16 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		orderByKeys = append(orderByKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 	}
 	return AggregateCall{
-		pos:      fc.Pos(),
-		Name:     name,
-		Arg:      argExpr,
-		Arg2:     argExpr2,
-		Distinct: fc.Distinct,
-		Type:     outType,
-		Filter:   filterExpr,
-		OrderBy:  orderByKeys,
+		pos:                fc.Pos(),
+		Name:               name,
+		Arg:                argExpr,
+		Arg2:               argExpr2,
+		Distinct:           fc.Distinct,
+		Type:               outType,
+		Filter:             filterExpr,
+		OrderBy:            orderByKeys,
+		WithinGroup:        len(withinGroupKeys) > 0,
+		WithinGroupOrderBy: withinGroupKeys,
 	}, nil
 }
 

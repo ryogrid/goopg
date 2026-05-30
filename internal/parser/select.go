@@ -521,7 +521,12 @@ func isParserAggregateName(name string) bool {
 		"string_agg", "array_agg", "json_agg", "jsonb_agg",
 		"json_object_agg", "jsonb_object_agg",
 		"xmlagg", "any_value",
-		"percentile_cont", "percentile_disc", "mode":
+		"percentile_cont", "percentile_disc", "mode",
+		// Hypothetical-set aggregates. These are also window functions (rank, etc.),
+		// but when used with WITHIN GROUP they become aggregate functions. The parser
+		// cannot distinguish here since isParserAggregateName only sees the name;
+		// include them so exprContainsAggregateCall fires correctly. M0097-0035.
+		"rank", "dense_rank", "cume_dist", "percent_rank":
 		return true
 	}
 	return false
@@ -3006,10 +3011,36 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 	}
 }
 
-// maybeWindowTail consumes optional `FILTER (WHERE ...)` and/or
-// `OVER (...)` clauses after a function-call's closing `)`.
+// maybeWindowTail consumes optional `WITHIN GROUP (ORDER BY ...)`,
+// `FILTER (WHERE ...)`, and/or `OVER (...)` clauses after a function-call's
+// closing `)`.
+// WITHIN GROUP (M0097-0035) stamps fc.WithinGroup.
 // FILTER (M0097-0007) stamps fc.Filter; OVER (M0020) stamps fc.Over.
 func (p *parser) maybeWindowTail(fc *FuncCall) (Expr, error) {
+	// WITHIN GROUP (ORDER BY sortlist) — ordered-set aggregate.
+	// `within` is an identifier (not a reserved keyword), so use acceptIdentKeyword.
+	if p.acceptIdentKeyword("within") {
+		if !p.acceptKeyword(KwGroup) {
+			return nil, p.errAtCur("expected GROUP after WITHIN")
+		}
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after WITHIN GROUP")
+		}
+		if !p.acceptKeyword(KwOrder) {
+			return nil, p.errAtCur("expected ORDER after WITHIN GROUP (")
+		}
+		if !p.acceptKeyword(KwBy) {
+			return nil, p.errAtCur("expected BY after WITHIN GROUP (ORDER")
+		}
+		wg, wgerr := p.parseSortList()
+		if wgerr != nil {
+			return nil, wgerr
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close WITHIN GROUP clause")
+		}
+		fc.WithinGroup = wg
+	}
 	// FILTER (WHERE condition) — aggregate filter clause.
 	if p.acceptIdentKeyword("filter") {
 		if p.acceptSymbol("(") {
