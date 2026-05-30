@@ -1939,10 +1939,17 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return numericFromInt(d.Int), nil
 		case KindString:
 			s := strings.TrimSpace(d.StringValue())
-			// NaN and Infinity are valid numeric special values.
-			if strings.EqualFold(s, "nan") || strings.EqualFold(s, "infinity") ||
-				strings.EqualFold(s, "-infinity") {
-				return d, nil
+			// NaN and Infinity (including abbreviated forms) are valid numeric special values.
+			// Normalize to canonical capitalization so applyAgg's switch can match them.
+			if strings.EqualFold(s, "nan") {
+				return NewStringDatum("NaN"), nil
+			}
+			if strings.EqualFold(s, "inf") || strings.EqualFold(s, "infinity") ||
+				strings.EqualFold(s, "+inf") || strings.EqualFold(s, "+infinity") {
+				return NewStringDatum("Infinity"), nil
+			}
+			if strings.EqualFold(s, "-inf") || strings.EqualFold(s, "-infinity") {
+				return NewStringDatum("-Infinity"), nil
 			}
 			_, _, err := parseNumeric(s)
 			if err != nil {

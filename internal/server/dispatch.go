@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -1612,6 +1613,16 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 		} else {
 			return append(dst, s...)
 		}
+	}
+	// PostgreSQL uses canonical names for special values, not Go's "+Inf"/"-Inf".
+	if math.IsInf(f, 1) {
+		return append(dst, "Infinity"...)
+	}
+	if math.IsInf(f, -1) {
+		return append(dst, "-Infinity"...)
+	}
+	if math.IsNaN(f) {
+		return append(dst, "NaN"...)
 	}
 	// PostgreSQL's float8out uses %.15g (DBL_DIG = 15 significant digits).
 	// This handles: scientific notation for large/tiny values, decimal for normal,

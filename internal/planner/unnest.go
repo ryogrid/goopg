@@ -280,6 +280,9 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 			if a.Arg != nil {
 				walkExprTree(a.Arg, visit)
 			}
+			if a.Arg2 != nil {
+				walkExprTree(a.Arg2, visit)
+			}
 		}
 	case *Sort:
 		walkPlanExprs(n.Child, visit)
@@ -509,6 +512,9 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			a.Aggs[i] = ag
 			if ag.Arg != nil {
 				a.Aggs[i].Arg = cloneExprReplacingOuter(ag.Arg, replace)
+			}
+			if ag.Arg2 != nil {
+				a.Aggs[i].Arg2 = cloneExprReplacingOuter(ag.Arg2, replace)
 			}
 		}
 		return &a, nil
@@ -764,6 +770,9 @@ func cloneAggregateCall(call AggregateCall) AggregateCall {
 	c := call
 	if call.Arg != nil {
 		c.Arg = cloneExprLeaf(call.Arg)
+	}
+	if call.Arg2 != nil {
+		c.Arg2 = cloneExprLeaf(call.Arg2)
 	}
 	return c
 }

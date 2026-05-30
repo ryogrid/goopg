@@ -4147,6 +4147,14 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 	if err != nil {
 		return AggregateCall{}, err
 	}
+	// Resolve optional second argument (two-argument aggregates: regr_*, covar_*, corr).
+	var argExpr2 Expr
+	if len(fc.Args) >= 2 {
+		argExpr2, err = resolveExpr(fc.Args[1], inputCtx)
+		if err != nil {
+			return AggregateCall{}, err
+		}
+	}
 	outType := catalog.Type{Name: "unknown"}
 	switch name {
 	case "count":
@@ -4157,9 +4165,21 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 			outType = catalog.Type{Name: "int8"}
 		}
 	case "avg":
-		outType = catalog.Type{Name: "numeric"}
+		// avg(float4/float8) returns float8; avg(integer types) returns numeric. M0097-0020.
+		argType := exprType(argExpr)
+		if isFloatTypeName(argType.Name) {
+			outType = catalog.Type{Name: "float8"}
+		} else {
+			outType = catalog.Type{Name: "numeric"}
+		}
 	case "min", "max":
 		outType = exprType(argExpr)
+	case "regr_count":
+		outType = catalog.Type{Name: "int8"}
+	case "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy",
+		"regr_r2", "regr_slope", "regr_intercept",
+		"covar_pop", "covar_samp", "corr":
+		outType = catalog.Type{Name: "float8"}
 	default:
 		// Extended aggregates (M0097-0007): accept but return null/stub type.
 		outType = catalog.Type{Name: "numeric"}
@@ -4177,6 +4197,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 		pos:      fc.Pos(),
 		Name:     name,
 		Arg:      argExpr,
+		Arg2:     argExpr2,
 		Distinct: fc.Distinct,
 		Type:     outType,
 		Filter:   filterExpr,
@@ -6057,6 +6078,15 @@ func exprType(e Expr) catalog.Type {
 		return catalog.Type{Name: "unknown"}
 	}
 	return catalog.Type{Name: "unknown"}
+}
+
+// isFloatTypeName reports whether name is a floating-point type (float4/float8).
+func isFloatTypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "float4", "float8", "real", "double precision", "double", "float":
+		return true
+	}
+	return false
 }
 
 // isNumericTypeName reports whether name refers to a numeric type

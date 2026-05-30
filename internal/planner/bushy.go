@@ -1347,12 +1347,18 @@ func remapPosMapAfterRewrite(node Node, posMap func(int) int) {
 				if n.Aggs[i].Arg != nil {
 					remapByPosMap(&n.Aggs[i].Arg, pm)
 				}
+				if n.Aggs[i].Arg2 != nil {
+					remapByPosMap(&n.Aggs[i].Arg2, pm)
+				}
 			}
 		}
 		subRemap(n.GroupExprs)
 		for i := range n.Aggs {
 			if n.Aggs[i].Arg != nil {
 				subRemap([]Expr{n.Aggs[i].Arg})
+			}
+			if n.Aggs[i].Arg2 != nil {
+				subRemap([]Expr{n.Aggs[i].Arg2})
 			}
 		}
 		return
@@ -1520,6 +1526,9 @@ func remapAggExprsWithBindings(node Node, bindings []rangeBinding) {
 	for i := range aggNode.Aggs {
 		if aggNode.Aggs[i].Arg != nil {
 			remapByPosMap(&aggNode.Aggs[i].Arg, posMap)
+		}
+		if aggNode.Aggs[i].Arg2 != nil {
+			remapByPosMap(&aggNode.Aggs[i].Arg2, posMap)
 		}
 	}
 }

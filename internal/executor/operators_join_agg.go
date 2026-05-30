@@ -942,6 +942,14 @@ type aggRuntime struct {
 	// Uses Welford's online algorithm for numerical stability.
 	floatMean float64 // running mean (Welford M)
 	floatM2   float64 // running sum of squared deviations (Welford S)
+	// Regression accumulators for regr_*/covar_*/corr. M0097-0020.
+	// Follows PostgreSQL's float8_regr_accum signature: first arg is y, second is x.
+	regrN     int64   // count of non-NULL (x,y) pairs
+	regrSumX  float64 // Σx
+	regrSumY  float64 // Σy
+	regrSumXX float64 // Σx²
+	regrSumXY float64 // Σx*y
+	regrSumYY float64 // Σy²
 }
 
 func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
@@ -1131,32 +1139,45 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 			}
 			st.numericSum = s
 		case KindString:
-			// Special IEEE 754 float values (NaN, Infinity, -Infinity) are
-			// stored as KindString by the codec. Handle them here so
-			// sum/avg on float4/float8 columns with special values works.
-			// NaN dominates; +Inf and -Inf obey IEEE addition rules.
-			// M0097-0053.
-			switch arg.StringValue() {
-			case "NaN":
+			// IEEE 754 special values and regular float strings from evalCast.
+			// NaN dominates; +Inf/-Inf obey IEEE addition rules. M0097-0053 / M0097-0020.
+			// Use case-insensitive and alias-aware comparisons since evalCast for
+			// float8 returns the raw KindString value without normalization.
+			sv := strings.TrimSpace(arg.StringValue())
+			svLow := strings.ToLower(sv)
+			switch {
+			case svLow == "nan":
 				st.floatSpecial = floatSpecialNaN
-			case "Infinity":
+			case svLow == "infinity" || svLow == "+infinity" || svLow == "inf" || svLow == "+inf":
 				switch st.floatSpecial {
 				case floatSpecialNegInf:
 					st.floatSpecial = floatSpecialNaN // +Inf + (-Inf) = NaN
 				case floatSpecialNone:
 					st.floatSpecial = floatSpecialPosInf
-				// floatSpecialNaN: stays NaN; floatSpecialPosInf: stays +Inf
 				}
-			case "-Infinity":
+			case svLow == "-infinity" || svLow == "-inf":
 				switch st.floatSpecial {
 				case floatSpecialPosInf:
 					st.floatSpecial = floatSpecialNaN // -Inf + (+Inf) = NaN
 				case floatSpecialNone:
 					st.floatSpecial = floatSpecialNegInf
-				// floatSpecialNaN: stays NaN; floatSpecialNegInf: stays -Inf
 				}
 			default:
-				return &ExecError{Code: "42804", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s requires numeric argument in v0", name)}
+				// Regular numeric string (e.g. from evalCast on float8/float4 column).
+				// Parse and accumulate as KindNumeric. M0097-0020.
+				m, scale, perr := parseNumeric(sv)
+				if perr != nil {
+					return &ExecError{Code: "42804", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s requires numeric argument in v0", name)}
+				}
+				numArg := newNumeric(m, int(scale))
+				if !st.hasValue || st.numericSum.Kind != KindNumeric {
+					st.numericSum = Datum{Kind: KindNumeric, Scale: numArg.Scale}
+				}
+				s, serr := numericAdd(st.numericSum, numArg)
+				if serr != nil {
+					return &ExecError{Code: "22003", Pos: call.Pos(), Message: serr.Error()}
+				}
+				st.numericSum = s
 			}
 		default:
 			return &ExecError{Code: "42804", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s requires numeric argument in v0", name)}
@@ -1307,6 +1328,26 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 				delta2 := f - st.floatMean
 				st.floatM2 += delta * delta2
 			}
+		case "regr_count", "regr_sxx", "regr_syy", "regr_sxy",
+			"regr_avgx", "regr_avgy", "regr_r2", "regr_slope", "regr_intercept",
+			"covar_pop", "covar_samp", "corr":
+			// Two-argument regression aggregates. First arg is y (dependent),
+			// second arg is x (independent). M0097-0020.
+			if call.Arg2 == nil {
+				break
+			}
+			arg2, a2err := evalExprSlot(call.Arg2, slot, o.ctx)
+			if a2err != nil || arg2.IsNull() {
+				break // skip row if either arg is NULL
+			}
+			y := aggDatumToFloat64(arg)
+			x := aggDatumToFloat64(arg2)
+			st.regrN++
+			st.regrSumX += x
+			st.regrSumY += y
+			st.regrSumXX += x * x
+			st.regrSumXY += x * y
+			st.regrSumYY += y * y
 		default:
 			st.count++
 			if arg.Kind == KindInt {
@@ -1315,6 +1356,21 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 		}
 	}
 	return nil
+}
+
+// aggDatumToFloat64 converts any numeric datum to float64 for aggregate computation.
+func aggDatumToFloat64(d Datum) float64 {
+	switch d.Kind {
+	case KindInt:
+		return float64(d.Int)
+	case KindNumeric:
+		f, _ := strconv.ParseFloat(formatNumeric(d.NumericMantissaValue(), d.NumericScaleValue()), 64)
+		return f
+	case KindString:
+		f, _ := strconv.ParseFloat(d.StringValue(), 64)
+		return f
+	}
+	return 0
 }
 
 func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum {
@@ -1351,6 +1407,17 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 			return NewStringDatum("Infinity")
 		case floatSpecialNegInf:
 			return NewStringDatum("-Infinity")
+		}
+		// avg(float4/float8) returns float8 — use float64 division and format
+		// with %.15g to match PostgreSQL's float8out. M0097-0020.
+		if strings.EqualFold(call.Type.Name, "float8") || strings.EqualFold(call.Type.Name, "float4") {
+			var fsum float64
+			if st.numericSum.Kind == KindNumeric {
+				fsum = aggDatumToFloat64(st.numericSum)
+			} else {
+				fsum = float64(st.sum)
+			}
+			return NewStringDatum(strconv.FormatFloat(fsum/float64(st.count), 'g', 15, 64))
 		}
 		if st.numericSum.Kind == KindNumeric {
 			d, err := numericDiv(st.numericSum, numericFromInt(st.count), call.Pos())
@@ -1443,13 +1510,13 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 			return NullDatum
 		}
 		varPop := st.floatM2 / float64(st.count)
-		return NewStringDatum(strconv.FormatFloat(varPop, 'f', -1, 64))
+		return NewStringDatum(strconv.FormatFloat(varPop, 'g', 15, 64))
 	case "var_samp":
 		if st.count < 2 {
 			return NullDatum
 		}
 		varSamp := st.floatM2 / float64(st.count-1)
-		return NewStringDatum(strconv.FormatFloat(varSamp, 'f', -1, 64))
+		return NewStringDatum(strconv.FormatFloat(varSamp, 'g', 15, 64))
 	case "stddev_pop":
 		if st.count == 0 {
 			return NullDatum
@@ -1458,7 +1525,7 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if varPop < 0 {
 			varPop = 0
 		}
-		return NewStringDatum(strconv.FormatFloat(math.Sqrt(varPop), 'f', -1, 64))
+		return NewStringDatum(strconv.FormatFloat(math.Sqrt(varPop), 'g', 15, 64))
 	case "stddev_samp", "stddev":
 		if st.count < 2 {
 			return NullDatum
@@ -1467,7 +1534,98 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if varSamp < 0 {
 			varSamp = 0
 		}
-		return NewStringDatum(strconv.FormatFloat(math.Sqrt(varSamp), 'f', -1, 64))
+		return NewStringDatum(strconv.FormatFloat(math.Sqrt(varSamp), 'g', 15, 64))
+	}
+
+	// Regression aggregates. M0097-0020.
+	switch strings.ToLower(call.Name) {
+	case "regr_count":
+		return NewIntDatum(st.regrN)
+	case "regr_avgx":
+		if st.regrN < 1 {
+			return NullDatum
+		}
+		return NewStringDatum(strconv.FormatFloat(st.regrSumX/float64(st.regrN), 'g', 15, 64))
+	case "regr_avgy":
+		if st.regrN < 1 {
+			return NullDatum
+		}
+		return NewStringDatum(strconv.FormatFloat(st.regrSumY/float64(st.regrN), 'g', 15, 64))
+	case "regr_sxx":
+		if st.regrN < 1 {
+			return NullDatum
+		}
+		sxx := st.regrSumXX - st.regrSumX*st.regrSumX/float64(st.regrN)
+		return NewStringDatum(strconv.FormatFloat(sxx, 'g', 15, 64))
+	case "regr_syy":
+		if st.regrN < 1 {
+			return NullDatum
+		}
+		syy := st.regrSumYY - st.regrSumY*st.regrSumY/float64(st.regrN)
+		return NewStringDatum(strconv.FormatFloat(syy, 'g', 15, 64))
+	case "regr_sxy":
+		if st.regrN < 1 {
+			return NullDatum
+		}
+		sxy := st.regrSumXY - st.regrSumX*st.regrSumY/float64(st.regrN)
+		return NewStringDatum(strconv.FormatFloat(sxy, 'g', 15, 64))
+	case "covar_pop":
+		if st.regrN < 1 {
+			return NullDatum
+		}
+		sxy := st.regrSumXY - st.regrSumX*st.regrSumY/float64(st.regrN)
+		return NewStringDatum(strconv.FormatFloat(sxy/float64(st.regrN), 'g', 15, 64))
+	case "covar_samp":
+		if st.regrN < 2 {
+			return NullDatum
+		}
+		sxy := st.regrSumXY - st.regrSumX*st.regrSumY/float64(st.regrN)
+		return NewStringDatum(strconv.FormatFloat(sxy/float64(st.regrN-1), 'g', 15, 64))
+	case "regr_r2":
+		if st.regrN < 1 {
+			return NullDatum
+		}
+		sxx := st.regrSumXX - st.regrSumX*st.regrSumX/float64(st.regrN)
+		syy := st.regrSumYY - st.regrSumY*st.regrSumY/float64(st.regrN)
+		sxy := st.regrSumXY - st.regrSumX*st.regrSumY/float64(st.regrN)
+		if sxx == 0 {
+			return NullDatum
+		}
+		r2 := (sxy * sxy) / (sxx * syy)
+		return NewStringDatum(strconv.FormatFloat(r2, 'g', 15, 64))
+	case "regr_slope":
+		if st.regrN < 1 {
+			return NullDatum
+		}
+		sxx := st.regrSumXX - st.regrSumX*st.regrSumX/float64(st.regrN)
+		sxy := st.regrSumXY - st.regrSumX*st.regrSumY/float64(st.regrN)
+		if sxx == 0 {
+			return NullDatum
+		}
+		return NewStringDatum(strconv.FormatFloat(sxy/sxx, 'g', 15, 64))
+	case "regr_intercept":
+		if st.regrN < 1 {
+			return NullDatum
+		}
+		sxx := st.regrSumXX - st.regrSumX*st.regrSumX/float64(st.regrN)
+		sxy := st.regrSumXY - st.regrSumX*st.regrSumY/float64(st.regrN)
+		if sxx == 0 {
+			return NullDatum
+		}
+		slope := sxy / sxx
+		intercept := (st.regrSumY - slope*st.regrSumX) / float64(st.regrN)
+		return NewStringDatum(strconv.FormatFloat(intercept, 'g', 15, 64))
+	case "corr":
+		if st.regrN < 1 {
+			return NullDatum
+		}
+		sxx := st.regrSumXX - st.regrSumX*st.regrSumX/float64(st.regrN)
+		syy := st.regrSumYY - st.regrSumY*st.regrSumY/float64(st.regrN)
+		sxy := st.regrSumXY - st.regrSumX*st.regrSumY/float64(st.regrN)
+		if sxx <= 0 || syy <= 0 {
+			return NullDatum
+		}
+		return NewStringDatum(strconv.FormatFloat(sxy/math.Sqrt(sxx*syy), 'g', 15, 64))
 	}
 	return NullDatum
 }

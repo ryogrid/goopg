@@ -636,6 +636,7 @@ type AggregateCall struct {
 	pos      int
 	Name     string
 	Arg      Expr // nil for count(*)
+	Arg2     Expr // second arg for two-argument aggregates (regr_*, covar_*, corr)
 	Star     bool
 	Distinct bool
 	Type     catalog.Type

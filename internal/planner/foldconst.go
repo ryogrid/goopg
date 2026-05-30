@@ -142,6 +142,9 @@ func foldPlanConstantsInner(node Node) {
 			if a.Arg != nil {
 				n.Aggs[i].Arg = FoldConstants(a.Arg)
 			}
+			if a.Arg2 != nil {
+				n.Aggs[i].Arg2 = FoldConstants(a.Arg2)
+			}
 		}
 		foldPlanConstantsInner(n.Child)
 	case *Join:
