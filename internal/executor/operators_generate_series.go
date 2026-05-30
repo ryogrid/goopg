@@ -27,6 +27,9 @@ func (o *generateSeriesOp) Schema() planner.Schema { return o.plan.Output() }
 
 func (o *generateSeriesOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	// Reset iteration state so re-opening (e.g. in a lateral loop) starts fresh.
+	o.started = false
+	o.done = false
 	return nil
 }
 

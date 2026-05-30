@@ -776,6 +776,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	}
 
 	if s.Where != nil {
+		// Aggregate functions are not allowed in WHERE. M0097-0035.
+		if exprHasAggregate(s.Where) {
+			return nil, &PlanError{Pos: s.Where.Pos(), Code: "42803",
+				Message: "aggregate functions are not allowed in WHERE"}
+		}
 		if isSimpleSingle {
 			// M0051-0004: inject synthetic range predicates alongside any
 			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
@@ -2742,6 +2747,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "unnest") {
+		return planFromUnnest(rv, sourceIdx, lateralCtx)
+	}
 	if !strings.EqualFold(tf.Name, "generate_series") {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
 			Message: fmt.Sprintf("table-valued function %q not supported", tf.Name)}
@@ -2788,6 +2796,53 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 
 // planScalarFuncScan plans a scalar function in FROM clause that returns one
 // row with a single column of the given colType. Used for parse_ident etc.
+// planFromUnnest plans FROM unnest(array_expr) alias(col).
+// Expands an array expression into one row per element. M0097-0035.
+func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) != 1 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "unnest requires exactly 1 argument"}
+	}
+	// Resolve the array argument. Use lateralCtx if provided (LATERAL FROM).
+	ctx := &resolveContext{}
+	if lateralCtx != nil {
+		ctx = lateralCtx
+	}
+	arrExpr, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	// Infer the element type from the array expression type.
+	elemTypeName := "text"
+	arrType := exprType(arrExpr)
+	if strings.HasSuffix(arrType.Name, "[]") {
+		base := strings.TrimSuffix(arrType.Name, "[]")
+		if base != "" {
+			elemTypeName = base
+		}
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "unnest"
+	}
+	colName := alias
+	if len(rv.Columns) > 0 {
+		colName = rv.Columns[0]
+	}
+	elemType := catalog.Type{Name: elemTypeName}
+	tbl := &catalog.Table{
+		Name: alias,
+		Columns: []catalog.Column{
+			{Name: colName, Type: elemType, Ordinal: 0},
+		},
+	}
+	schema := Schema{SchemaColumn{Name: colName, Type: elemType, SourceTableIdx: sourceIdx}}
+	node := &FromUnnest{pos: tf.Pos(), ArrExpr: arrExpr, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
 func planScalarFuncScan(rv parser.RangeVar, sourceIdx int16, colType string) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
 	alias := rv.Alias
@@ -3706,7 +3761,10 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 	case *parser.ParamRef:
 		return &ParamRef{pos: x.Pos(), Number: x.Number}, nil
 	case *parser.CaseExpr:
-		return resolveCaseExpr(x, agg.input)
+		// Resolve each sub-expression through the aggregate surface so that
+		// GROUP BY expressions inside the CASE are correctly remapped to the
+		// aggregate output ColumnRefs. M0097-0035.
+		return resolveCaseExprAfterAggregate(x, agg)
 	case *parser.ColumnRef:
 		resolved, err := resolveColumnRef(x, agg.input)
 		if err != nil {
@@ -4070,7 +4128,7 @@ func collectAggregateCalls(s *parser.SelectStmt, cat catalog.Catalog) ([]*parser
 			if len(fc.Args) > 0 {
 				for _, a := range fc.Args {
 					if exprHasAggregate(a) {
-						return &PlanError{Pos: a.Pos(), Code: "42803", Message: "nested aggregate calls are not supported in v0 planner"}
+						return &PlanError{Pos: a.Pos(), Code: "42803", Message: "aggregate function calls cannot be nested"}
 					}
 				}
 			}
@@ -4265,6 +4323,11 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		if ferr != nil {
 			return AggregateCall{}, ferr
 		}
+		// Aggregate functions are not allowed inside a FILTER clause. M0097-0035.
+		if exprHasAggregate(fc.Filter) {
+			return AggregateCall{}, &PlanError{Pos: fc.Filter.Pos(), Code: "42803",
+				Message: "aggregate functions are not allowed in FILTER"}
+		}
 	}
 	// Validate WITHIN GROUP for non-ordered-set aggregates early (before arg checks).
 	// This fires before the zero-arg early return so sum() WITHIN GROUP gives the right error. M0097-0035.
@@ -4276,6 +4339,21 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		default:
 			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
 				Message: fmt.Sprintf("%s is not an ordered-set aggregate, so it cannot have WITHIN GROUP", name)}
+		}
+	}
+
+	// DISTINCT ORDER BY validation: for agg(DISTINCT args ORDER BY cols),
+	// every ORDER BY expression must appear in the argument list. M0097-0035.
+	if fc.Distinct && len(fc.OrderBy) > 0 && len(fc.Args) > 0 {
+		argKeys := make(map[string]bool, len(fc.Args))
+		for _, arg := range fc.Args {
+			argKeys[parserExprKey(arg)] = true
+		}
+		for _, ob := range fc.OrderBy {
+			if !argKeys[parserExprKey(ob.Expr)] {
+				return AggregateCall{}, &PlanError{Pos: ob.Expr.Pos(), Code: "42P10",
+					Message: "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"}
+			}
 		}
 	}
 
@@ -4309,16 +4387,26 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 	// Many aggregates accept 0 or more args; only enforce 1-arg for the
 	// core ones. Extended aggregates (M0097-0007) may have 2+ args.
 	if len(fc.Args) == 0 {
-		// Zero-arg aggregates like count(*) handled above; all others need args.
-		return AggregateCall{
-			pos: fc.Pos(), Name: name, Distinct: fc.Distinct,
-			Type:   catalog.Type{Name: "numeric"},
-			Filter: filterExpr,
-		}, nil
+		// mode() is a zero-arg ordered-set aggregate whose ordering comes
+		// entirely from WITHIN GROUP — skip the early return and fall through
+		// to WITHIN GROUP processing below. M0097-0035.
+		if name != "mode" || len(fc.WithinGroup) == 0 {
+			return AggregateCall{
+				pos: fc.Pos(), Name: name, Distinct: fc.Distinct,
+				Type:   catalog.Type{Name: "numeric"},
+				Filter: filterExpr,
+			}, nil
+		}
 	}
-	argExpr, err := resolveExpr(fc.Args[0], inputCtx)
-	if err != nil {
-		return AggregateCall{}, err
+	// Resolve the primary argument. Zero-arg ordered-set aggregates (mode)
+	// have no Arg and skip this block. M0097-0035.
+	var argExpr Expr
+	var err error
+	if len(fc.Args) > 0 {
+		argExpr, err = resolveExpr(fc.Args[0], inputCtx)
+		if err != nil {
+			return AggregateCall{}, err
+		}
 	}
 	// Resolve optional second argument (two-argument aggregates: regr_*, covar_*, corr).
 	var argExpr2 Expr
@@ -6771,6 +6859,40 @@ func resolveCaseExpr(x *parser.CaseExpr, ctx *resolveContext) (Expr, error) {
 
 // resolveExpr walks a parser.Expr and replaces ColumnRef nodes with
 // indexed planner ColumnRefs. Other node types are translated 1:1.
+// resolveCaseExprAfterAggregate resolves a CASE expression in the post-aggregate
+// context. Each sub-expression is resolved through the aggregate surface so that
+// GROUP BY key expressions inside the CASE are remapped to aggregate output
+// ColumnRefs, not re-evaluated against the input schema. M0097-0035.
+func resolveCaseExprAfterAggregate(x *parser.CaseExpr, agg *aggregateSurface) (Expr, error) {
+	out := &CaseExpr{pos: x.Pos()}
+	if x.Operand != nil {
+		operand, err := resolveExprAfterAggregate(x.Operand, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.Operand = operand
+	}
+	for _, w := range x.Whens {
+		when, err := resolveExprAfterAggregate(w.When, agg)
+		if err != nil {
+			return nil, err
+		}
+		then, err := resolveExprAfterAggregate(w.Then, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.Whens = append(out.Whens, CaseWhen{When: when, Then: then})
+	}
+	if x.Else != nil {
+		els, err := resolveExprAfterAggregate(x.Else, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.Else = els
+	}
+	return out, nil
+}
+
 func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	switch x := e.(type) {
 	case *parser.IntegerConst:

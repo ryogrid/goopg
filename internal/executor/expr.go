@@ -3946,6 +3946,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Stub: return NULL so the normalizer can strip the result block.
 		// Full SQL deparsing would require a complete SQL pretty-printer. M0097-0004.
 		return NullDatum, nil
+	case "pg_collation_for":
+		// Stub: goopg does not track collations; always return "default". M0097-0035.
+		// The real function returns the collation of its argument.
+		return NewStringDatum(`"default"`), nil
 	case "to_char":
 		return evalToChar(x, row, ctx)
 	case "age":

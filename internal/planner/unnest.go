@@ -337,6 +337,8 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		if n.Step != nil {
 			walkExprTree(n.Step, visit)
 		}
+	case *FromUnnest:
+		walkExprTree(n.ArrExpr, visit)
 	case *PgInputErrorInfo:
 		walkExprTree(n.Value, visit)
 		walkExprTree(n.Type, visit)

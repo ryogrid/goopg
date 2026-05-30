@@ -1061,8 +1061,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 			return catalog.Type{Name: "int8"}, nil
 		case "sum":
-			if x.Star || len(x.Args) != 1 {
+			// Skip argument count check when WITHIN GROUP is present;
+			// the planner validates ordered-set aggregate usage. M0097-0035.
+			if (x.Star || len(x.Args) != 1) && len(x.WithinGroup) == 0 {
 				return catalog.Type{}, analyzeError(x.Pos(), "42601", "sum() requires exactly one argument")
+			}
+			if len(x.WithinGroup) > 0 {
+				return catalog.Type{Name: "unknown"}, nil
 			}
 			argTyp, err := analyzeExpr(x.Args[0], ctx)
 			if err != nil {

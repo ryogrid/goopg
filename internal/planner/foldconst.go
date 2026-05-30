@@ -171,6 +171,8 @@ func foldPlanConstantsInner(node Node) {
 		if n.Step != nil {
 			n.Step = FoldConstants(n.Step)
 		}
+	case *FromUnnest:
+		n.ArrExpr = FoldConstants(n.ArrExpr)
 	case *PgInputErrorInfo:
 		n.Value = FoldConstants(n.Value)
 		n.Type = FoldConstants(n.Type)

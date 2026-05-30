@@ -888,6 +888,17 @@ func (n *GenerateSeries) Output() Schema { return n.schema }
 // set-returning function in the FROM clause. Returns 0 rows if the
 // input is valid, or 1 row with (message, detail, hint, sql_error_code)
 // if it is invalid. M0097-0003.
+// FromUnnest expands an array expression into one row per element in the
+// FROM clause: `FROM unnest(arr_expr) alias(col)`. M0097-0035.
+type FromUnnest struct {
+	pos     int
+	ArrExpr Expr
+	schema  Schema
+}
+
+func (n *FromUnnest) Pos() int       { return n.pos }
+func (n *FromUnnest) Output() Schema { return n.schema }
+
 type PgInputErrorInfo struct {
 	pos    int
 	Value  Expr

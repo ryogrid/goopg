@@ -1643,9 +1643,12 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 				seen[k] = struct{}{}
 				deduped = append(deduped, row)
 			}
-			// Sort by ORDER BY sort keys if present.
-			if nSortKeys > 0 {
-				sort.SliceStable(deduped, func(i, j int) bool {
+			// Sort by ORDER BY sort keys when present. When no ORDER BY is given,
+			// sort by the argument values (PostgreSQL's default for DISTINCT
+			// aggregates — ensures deterministic, reproducible order). M0097-0035.
+			sort.SliceStable(deduped, func(i, j int) bool {
+				if nSortKeys > 0 {
+					// User-specified ORDER BY columns come first.
 					for ki := 0; ki < nSortKeys; ki++ {
 						ai, bi := deduped[i][ki], deduped[j][ki]
 						aNull, bNull := ai.IsNull(), bi.IsNull()
@@ -1669,8 +1672,30 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 						return cmp < 0
 					}
 					return false
-				})
-			}
+				}
+				// No ORDER BY: sort by arg values for deterministic DISTINCT order.
+				argI := deduped[i][nSortKeys:]
+				argJ := deduped[j][nSortKeys:]
+				for k := 0; k < len(argI) && k < len(argJ); k++ {
+					ai, bj := argI[k], argJ[k]
+					aNull, bNull := ai.IsNull(), bj.IsNull()
+					if aNull && bNull {
+						continue
+					}
+					if aNull {
+						return false // NULLs last
+					}
+					if bNull {
+						return true
+					}
+					cmp, err := compareDatum(ai, bj, 0)
+					if err != nil || cmp == 0 {
+						continue
+					}
+					return cmp < 0
+				}
+				return false
+			})
 			// Initialize state and call sfunc for each deduped+sorted row.
 			state := userAggInitState(ua)
 			for _, row := range deduped {
@@ -2342,33 +2367,32 @@ func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Contex
 			return NullDatum
 		}
 		p := st.withinGroupDirectArg
-		pf := aggDatumToFloat64(p)
-		if math.IsNaN(pf) || pf < 0 || pf > 1 {
-			return NullDatum
-		}
 		n := len(orderedVals)
 		if n == 0 {
 			return NullDatum
 		}
-		// Linear interpolation: position = p * (n-1) (0-indexed).
-		pos := pf * float64(n-1)
-		lower := int(math.Floor(pos))
-		upper := int(math.Ceil(pos))
-		if lower >= n {
-			lower = n - 1
+		// Array form: percentile_cont(array[p1,p2,...]) WITHIN GROUP (ORDER BY x)
+		// returns an array of interpolated values. M0097-0035.
+		if fracs, ok := tryParseFloatArray(p); ok {
+			results := make([]string, len(fracs))
+			for i, pf := range fracs {
+				if math.IsNaN(pf) {
+					results[i] = "NULL"
+					continue
+				}
+				if pf < 0 || pf > 1 {
+					results[i] = "NULL"
+					continue
+				}
+				results[i] = percentileContOneFloat(orderedVals, n, pf)
+			}
+			return NewStringDatum(formatTextArray(results))
 		}
-		if upper >= n {
-			upper = n - 1
+		pf := aggDatumToFloat64(p)
+		if math.IsNaN(pf) || pf < 0 || pf > 1 {
+			return NullDatum
 		}
-		if lower == upper {
-			return orderedVals[lower]
-		}
-		// Interpolate between lower and upper values.
-		frac := pos - float64(lower)
-		lo := aggDatumToFloat64(orderedVals[lower])
-		hi := aggDatumToFloat64(orderedVals[upper])
-		result := lo + frac*(hi-lo)
-		return NewStringDatum(strconv.FormatFloat(result, 'g', 15, 64))
+		return NewStringDatum(percentileContOneFloat(orderedVals, n, pf))
 
 	case "percentile_disc":
 		// Use direct arg stored during applyAgg from the first row of the group.
@@ -2376,24 +2400,37 @@ func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Contex
 			return NullDatum
 		}
 		p := st.withinGroupDirectArg
-		pf := aggDatumToFloat64(p)
-		if math.IsNaN(pf) || pf < 0 || pf > 1 {
-			return NullDatum
-		}
 		n := len(orderedVals)
 		if n == 0 {
 			return NullDatum
 		}
-		// Find smallest index i such that (i+1)/n >= p.
-		// Equivalently: i = ceil(p * n) - 1 (0-indexed), clamped to [0, n-1].
-		rowNum := int(math.Ceil(pf * float64(n)))
-		if rowNum < 1 {
-			rowNum = 1
+		// Array form: percentile_disc(array[p1,p2,...]) WITHIN GROUP (ORDER BY x)
+		// returns an array of discrete values. The array may be 2D ({{...}}). M0097-0035.
+		if fracs, ok := tryParseFloatArray(p); ok {
+			results := make([]string, len(fracs))
+			for i, pf := range fracs {
+				if math.IsNaN(pf) {
+					results[i] = "NULL"
+					continue
+				}
+				if pf < 0 || pf > 1 {
+					results[i] = "NULL"
+					continue
+				}
+				d := percentileDiscOneFloat(orderedVals, n, pf)
+				if d.IsNull() {
+					results[i] = "NULL"
+				} else {
+					results[i] = d.Format()
+				}
+			}
+			return NewStringDatum(formatTextArray(results))
 		}
-		if rowNum > n {
-			rowNum = n
+		pf := aggDatumToFloat64(p)
+		if math.IsNaN(pf) || pf < 0 || pf > 1 {
+			return NullDatum
 		}
-		return orderedVals[rowNum-1]
+		return percentileDiscOneFloat(orderedVals, n, pf)
 
 	case "rank":
 		// rank(v) WITHIN GROUP (ORDER BY x): count values strictly less than v, +1.
@@ -2523,6 +2560,78 @@ func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Contex
 // evalExprFromRow evaluates a planner expression against a fixed (possibly empty) row.
 // Used by ordered-set aggregate finalizers to evaluate "direct arguments" like the
 // percentile fraction p in `percentile_cont(p) WITHIN GROUP (ORDER BY x)`.
+// tryParseFloatArray attempts to parse a Datum as a text-format float array
+// like {0.25,0.5,0.75}. Returns the fractions and true on success. M0097-0035.
+func tryParseFloatArray(d Datum) ([]float64, bool) {
+	sv := ""
+	switch d.Kind {
+	case KindString:
+		sv = d.StringValue()
+	case KindBytes:
+		sv = string(d.BytesValue())
+	default:
+		return nil, false
+	}
+	sv = strings.TrimSpace(sv)
+	if !strings.HasPrefix(sv, "{") {
+		return nil, false
+	}
+	// Flatten multi-dimensional arrays: {{NULL,1,0.5},{0.75,0.25,NULL}}
+	// → [NULL, 1, 0.5, 0.75, 0.25, NULL]
+	flat := strings.NewReplacer("{", "", "}", "").Replace(sv)
+	parts := strings.Split(flat, ",")
+	fracs := make([]float64, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if strings.EqualFold(p, "null") || p == "" {
+			fracs = append(fracs, math.NaN())
+			continue
+		}
+		f, err := strconv.ParseFloat(p, 64)
+		if err != nil {
+			return nil, false
+		}
+		fracs = append(fracs, f)
+	}
+	return fracs, true
+}
+
+// percentileContOneFloat computes percentile_cont for a single fraction pf
+// over the sorted orderedVals. Returns the result as a string Datum. M0097-0035.
+func percentileContOneFloat(orderedVals []Datum, n int, pf float64) string {
+	pos := pf * float64(n-1)
+	lower := int(math.Floor(pos))
+	upper := int(math.Ceil(pos))
+	if lower >= n {
+		lower = n - 1
+	}
+	if upper >= n {
+		upper = n - 1
+	}
+	if lower == upper {
+		return orderedVals[lower].Format()
+	}
+	frac := pos - float64(lower)
+	lo := aggDatumToFloat64(orderedVals[lower])
+	hi := aggDatumToFloat64(orderedVals[upper])
+	result := lo + frac*(hi-lo)
+	return strconv.FormatFloat(result, 'g', 15, 64)
+}
+
+// percentileDiscOneFloat computes percentile_disc for a single fraction pf
+// over the sorted orderedVals. Returns the matching element Datum. M0097-0035.
+func percentileDiscOneFloat(orderedVals []Datum, n int, pf float64) Datum {
+	rowNum := int(math.Ceil(pf * float64(n)))
+	if rowNum < 1 {
+		rowNum = 1
+	}
+	if rowNum > n {
+		rowNum = n
+	}
+	return orderedVals[rowNum-1]
+}
+
+
 func evalExprFromRow(expr planner.Expr, row Row, ctx *Context) (Datum, error) {
 	slot := SlotFromRow(nil, row)
 	return evalExprSlot(expr, slot, ctx)
