@@ -2396,6 +2396,17 @@ M0097-0001 wires it up.
         particularly the `update` test hang (RANGE partition
         row-movement).  Triage after M0097-0020 completes.
       - DoD: same as M0097-0020.
+      - **Progress 2026-05-30 (M0097-0104 — aggregates 1234→1072):**
+        Six fixes (commit 68cb97d2): (a) sum/avg KindString regular floats
+        from evalCast now accumulate via parseNumeric (was error); (b) 'inf'/'nan'
+        recognized in numeric cast and canonicalized; (c) avg(float8) returns
+        float8 type + uses float64 arithmetic; (d) regression aggregates
+        implemented (regr_count/sxx/syy/sxy/avgx/avgy/r2/slope/intercept,
+        covar_pop/samp, corr) with Arg2 in AggregateCall; (e) appendFloat8Text
+        emits "Infinity"/"-Infinity"/"NaN" not Go's "+Inf"; (f) stddev/var_pop
+        format changed from 'f',-1 to 'g',15. aggregates: 1234→1072 (−162).
+        Remaining: float4-vs-float8 input precision divergence in regression values,
+        min/max row-type aggregates, and various more complex aggregate features.
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
