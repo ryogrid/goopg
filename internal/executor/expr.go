@@ -7508,6 +7508,7 @@ func enumTypeNameFromArgs(args []planner.Expr) string {
 // appear as empty fields. Used for whole-row variable refs. M0097-0020.
 func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
 	parts := make([]string, len(x.Elems))
+	allNull := true
 	for i, elem := range x.Elems {
 		d, err := evalExprSlot(elem, slot, ctx)
 		if err != nil {
@@ -7517,6 +7518,7 @@ func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error)
 			parts[i] = ""
 			continue
 		}
+		allNull = false
 		s := string(d.AppendValueText(nil))
 		// Quote values that need it in composite syntax: commas, parens,
 		// double-quotes, backslashes, whitespace, or empty string.
@@ -7545,6 +7547,11 @@ func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error)
 		} else {
 			parts[i] = s
 		}
+	}
+	// When all elements are NULL (e.g., from null-extending outer join side),
+	// return NULL for the whole row — matching PostgreSQL's outer-join null semantics.
+	if allNull {
+		return NullDatum, nil
 	}
 	return NewStringDatum("(" + strings.Join(parts, ",") + ")"), nil
 }

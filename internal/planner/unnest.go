@@ -366,6 +366,9 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, e := range n.OtherExprs {
 			walkExprTree(e, visit)
 		}
+		for _, uc := range n.UnnestCols {
+			walkExprTree(uc.ArrExpr, visit)
+		}
 	}
 }
 

@@ -2532,7 +2532,12 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		fc      *parser.FuncCall
 		routine *catalog.Routine
 	}
+	type unnestEntry struct {
+		colIdx  int
+		arrExpr parser.Expr
+	}
 	var srfs []srfEntry
+	var unnests []unnestEntry
 	var userSrfs []userSrfEntry
 	var rs *catalog.Routines
 	if ctx != nil && ctx.cat != nil {
@@ -2555,6 +2560,15 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			srfs = append(srfs, e)
 			continue
 		}
+		// unnest(array) → one row per element. M0097-0106.
+		if strings.EqualFold(fc.Name.Name, "unnest") {
+			if len(fc.Args) != 1 {
+				return nil, &PlanError{Pos: fc.Pos(), Code: "42883",
+					Message: "unnest requires exactly 1 argument"}
+			}
+			unnests = append(unnests, unnestEntry{colIdx: i, arrExpr: fc.Args[0]})
+			continue
+		}
 		// Check if the function is a user-defined SETOF SQL function. M0097-0020.
 		if rs != nil {
 			candidates := rs.LookupByName(fc.Name)
@@ -2568,13 +2582,16 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			}
 		}
 	}
-	if len(srfs) == 0 && len(userSrfs) == 0 {
+	if len(srfs) == 0 && len(unnests) == 0 && len(userSrfs) == 0 {
 		return nil, nil
 	}
 
 	// Build per-column resolved expressions.
-	srfColMap := make(map[int]bool, len(srfs)+len(userSrfs))
+	srfColMap := make(map[int]bool, len(srfs)+len(unnests)+len(userSrfs))
 	for _, e := range srfs {
+		srfColMap[e.colIdx] = true
+	}
+	for _, e := range unnests {
 		srfColMap[e.colIdx] = true
 	}
 	for _, e := range userSrfs {
@@ -2596,6 +2613,26 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 				}
 			}
 			retType := catalog.Type{Name: "int8"} // generate_series default
+			// Check if this is an unnest SRF and get its element type.
+			for _, u := range unnests {
+				if u.colIdx == i {
+					// Infer element type from array arg type (strip [] suffix).
+					arrType := "text" // default
+					if fc2, ok := t.Expr.(*parser.FuncCall); ok && len(fc2.Args) == 1 {
+						resolved, err2 := resolveExpr(fc2.Args[0], ctx)
+						if err2 == nil {
+							at := exprType(resolved).Name
+							if strings.HasSuffix(at, "[]") {
+								arrType = at[:len(at)-2]
+							} else {
+								arrType = "text"
+							}
+						}
+					}
+					retType = catalog.Type{Name: arrType}
+					break
+				}
+			}
 			// Check if this is a user SRF and get its return type.
 			for _, u := range userSrfs {
 				if u.colIdx == i {
@@ -2641,6 +2678,16 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		srfCols[k] = SrfCol{ColIdx: e.colIdx, Start: start, Stop: stop, Step: step}
 	}
 
+	// Resolve unnest array args against ctx. M0097-0106.
+	unnestCols := make([]UnnestCol, len(unnests))
+	for k, u := range unnests {
+		arrResolved, err := resolveExpr(u.arrExpr, ctx)
+		if err != nil {
+			return nil, err
+		}
+		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved}
+	}
+
 	// Resolve user SETOF function args against ctx. M0097-0020.
 	userSrfCols := make([]UserSrfCol, len(userSrfs))
 	for k, u := range userSrfs {
@@ -2659,6 +2706,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		pos:         s.Pos(),
 		Child:       child,
 		SrfCols:     srfCols,
+		UnnestCols:  unnestCols,
 		UserSrfCols: userSrfCols,
 		OtherExprs:  otherExprs,
 		schema:      schema,
@@ -6111,6 +6159,15 @@ func exprType(e Expr) catalog.Type {
 		case "generate_series":
 			// generate_series in scalar context returns int8 for integer args. M0097-0042.
 			return catalog.Type{Name: "int8"}
+		case "unnest":
+			// unnest(array) returns the element type. M0097-0106.
+			if len(x.Args) == 1 {
+				at := exprType(x.Args[0]).Name
+				if strings.HasSuffix(at, "[]") {
+					return catalog.Type{Name: at[:len(at)-2]}
+				}
+			}
+			return catalog.Type{Name: "text"}
 		}
 		return catalog.Type{Name: "unknown"}
 	case *SubqueryExpr:

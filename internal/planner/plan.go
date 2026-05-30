@@ -917,6 +917,12 @@ type SrfCol struct {
 	Step   Expr // generate_series step arg (nil → step 1)
 }
 
+// UnnestCol represents an unnest(array) SRF column in a SELECT list. M0097-0106.
+type UnnestCol struct {
+	ColIdx  int  // which output column this SRF fills
+	ArrExpr Expr // the array argument
+}
+
 // UserSrfCol describes one user-defined SETOF SQL function call in the SELECT
 // target list. The executor calls the function body and collects all rows.
 // M0097-0020.
@@ -938,6 +944,7 @@ type ProjectSet struct {
 	// together, repeating OtherExprs for each step. The output schema
 	// covers both SRF and non-SRF columns.
 	SrfCols     []SrfCol     // one per generate_series call in target list
+	UnnestCols  []UnnestCol  // one per unnest(array) call in target list. M0097-0106.
 	UserSrfCols []UserSrfCol // one per user-defined SETOF function call. M0097-0020.
 	OtherExprs  []Expr       // non-SRF target expressions; nil slot = SRF slot
 }
