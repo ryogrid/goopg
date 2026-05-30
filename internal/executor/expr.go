@@ -2950,8 +2950,14 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 //     value → NULL.
 //   - inner empty → false (NOT IN: true).
 //
-// Multi-column subqueries raise 42601.
+// Multi-column subqueries raise 42601 unless the operand is a RowExpr,
+// in which case element-wise tuple comparison is used (row-constructor IN).
 func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
+	// Row-constructor IN/NOT IN subquery: (a, b) IN (SELECT x, y FROM ...).
+	// Route to element-wise tuple comparison. M0097-0020.
+	if rowOp, ok := x.Operand.(*planner.RowExpr); ok && x.Plan != nil {
+		return evalRowConstructorInExpr(x, rowOp, slot, ctx)
+	}
 	// Use evalExprSlot so CTIDExpr can access hasCTID from the slot. M0097-0062.
 	operand, err := evalExprSlot(x.Operand, slot, ctx)
 	if err != nil {
@@ -3000,6 +3006,93 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 		}
 	}
 	if sawNull {
+		return NullDatum, nil
+	}
+	return NewBoolDatum(x.Negated), nil
+}
+
+// evalRowConstructorInExpr handles (a, b, ...) IN (SELECT x, y, ... FROM ...)
+// using element-wise 3-valued-logic tuple comparison. M0097-0020.
+func evalRowConstructorInExpr(x *planner.InExpr, rowOp *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
+	if ctx.Ctx != nil {
+		if err := ctx.Ctx.Err(); err != nil {
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
+	// Evaluate each element of the left-side row constructor.
+	leftElems := make([]Datum, len(rowOp.Elems))
+	for i, e := range rowOp.Elems {
+		v, err := evalExprSlot(e, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		leftElems[i] = v
+	}
+	nCols := len(leftElems)
+
+	// Push outer row for correlated subquery resolution.
+	outerRow := slotToRow(slot)
+	ctx.OuterRows = append(ctx.OuterRows, outerRow)
+	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+
+	op, err := Build(x.Plan)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := op.Open(ctx); err != nil {
+		_ = op.Close()
+		return Datum{}, err
+	}
+	defer func() { _ = op.Close() }()
+
+	sawNullRow := false
+	for {
+		innerSlot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return Datum{}, err
+		}
+		rightRow := slotRow(innerSlot)
+		if len(rightRow) != nCols {
+			return Datum{}, &ExecError{
+				Code: "42601",
+				Pos:  x.Pos(),
+				Message: fmt.Sprintf("row value has %d columns but subquery has %d columns",
+					nCols, len(rightRow)),
+			}
+		}
+		// Compare element-by-element with 3-valued logic:
+		// rowFalse=true → at least one element is definitely not equal.
+		// rowNull=true  → at least one element comparison is indeterminate (NULL).
+		rowFalse := false
+		rowNull := false
+		for i := 0; i < nCols; i++ {
+			left, right := leftElems[i], rightRow[i]
+			if left.IsNull() || right.IsNull() {
+				rowNull = true
+				continue
+			}
+			eq, err := compareEq(left, right)
+			if err != nil {
+				return Datum{}, err
+			}
+			if !(eq.Kind == KindBool && eq.BoolValue()) {
+				rowFalse = true
+				break
+			}
+		}
+		if !rowFalse && !rowNull {
+			// All elements matched.
+			return NewBoolDatum(!x.Negated), nil
+		}
+		if !rowFalse && rowNull {
+			// No definitive mismatch but some NULLs — result may be NULL.
+			sawNullRow = true
+		}
+	}
+	if sawNullRow {
 		return NullDatum, nil
 	}
 	return NewBoolDatum(x.Negated), nil
@@ -3796,6 +3889,99 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewIntDatum(iv), nil
 			}
 			return NewStringDatum(elem), nil
+		}
+		return NullDatum, nil
+
+	case "array_upper":
+		// array_upper(anyarray, int) → int: upper bound of specified dimension (1-based).
+		// For 1-D arrays, returns the number of elements (lower is always 1).
+		// Returns NULL for empty arrays, NULL inputs, or dim != 1.
+		if len(x.Args) == 2 {
+			arr, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			dimDatum, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arr.IsNull() || dimDatum.IsNull() {
+				return NullDatum, nil
+			}
+			dim := dimDatum.Int
+			if dimDatum.Kind == KindString {
+				dim, _ = strconv.ParseInt(dimDatum.StringValue(), 10, 64)
+			}
+			if dim != 1 {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(arr.StringValue())
+			if len(elems) == 0 {
+				return NullDatum, nil
+			}
+			return NewIntDatum(int64(len(elems))), nil
+		}
+		return NullDatum, nil
+
+	case "array_lower":
+		// array_lower(anyarray, int) → int: lower bound of specified dimension.
+		// For standard PostgreSQL arrays the lower bound is always 1.
+		// Returns NULL for empty arrays, NULL inputs, or dim != 1.
+		if len(x.Args) == 2 {
+			arr, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			dimDatum, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arr.IsNull() || dimDatum.IsNull() {
+				return NullDatum, nil
+			}
+			dim := dimDatum.Int
+			if dimDatum.Kind == KindString {
+				dim, _ = strconv.ParseInt(dimDatum.StringValue(), 10, 64)
+			}
+			if dim != 1 {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(arr.StringValue())
+			if len(elems) == 0 {
+				return NullDatum, nil
+			}
+			return NewIntDatum(1), nil
+		}
+		return NullDatum, nil
+
+	case "array_length":
+		// array_length(anyarray, int) → int: number of elements in the specified dimension.
+		// Equivalent to array_upper - array_lower + 1 = upper (since lower=1).
+		// Returns NULL for empty arrays, NULL inputs, or dim != 1.
+		if len(x.Args) == 2 {
+			arr, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			dimDatum, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arr.IsNull() || dimDatum.IsNull() {
+				return NullDatum, nil
+			}
+			dim := dimDatum.Int
+			if dimDatum.Kind == KindString {
+				dim, _ = strconv.ParseInt(dimDatum.StringValue(), 10, 64)
+			}
+			if dim != 1 {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(arr.StringValue())
+			if len(elems) == 0 {
+				return NullDatum, nil
+			}
+			return NewIntDatum(int64(len(elems))), nil
 		}
 		return NullDatum, nil
 
