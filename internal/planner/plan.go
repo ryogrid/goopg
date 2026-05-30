@@ -658,6 +658,11 @@ type AggregateCall struct {
 	// UserAgg is non-nil for user-defined aggregates registered via
 	// CREATE AGGREGATE. The executor uses it to call sfunc/finalfunc.
 	UserAgg *catalog.UserAggregate
+	// SharedStateSlot is the index into aggregateOp.sharedUserStates for
+	// user-defined aggregates that share transition state (same sfunc/stype/args/distinct/filter).
+	// -1 means no sharing. When ≥ 0, applyAgg uses the shared slot instead of
+	// the per-call aggRuntime.userState. M0097-0035.
+	SharedStateSlot int
 }
 
 func (a AggregateCall) Pos() int { return a.pos }
@@ -943,8 +948,9 @@ type SrfCol struct {
 
 // UnnestCol represents an unnest(array) SRF column in a SELECT list. M0097-0106.
 type UnnestCol struct {
-	ColIdx  int  // which output column this SRF fills
-	ArrExpr Expr // the array argument
+	ColIdx   int    // which output column this SRF fills
+	ArrExpr  Expr   // the array argument
+	CastType string // cast each element to this type (e.g. "int4"), empty=no cast. M0097-0035.
 }
 
 // UserSrfCol describes one user-defined SETOF SQL function call in the SELECT

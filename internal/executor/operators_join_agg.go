@@ -908,6 +908,14 @@ type aggregateOp struct {
 	ctx  *Context
 	rows []Row
 	idx  int
+
+	// sharedUserStates supports PG aggregate state sharing: when multiple user-defined
+	// aggregates have the same sfunc/stype and the same input, sfunc is called only
+	// once per row and the state is shared. SharedStateSlot=-1 means no sharing. M0097-0035.
+	sharedUserStates       []Datum
+	sharedUserStateSet     []bool
+	sharedUserStateVersion []int64 // which currentRowVersion last updated this slot
+	currentRowVersion      int64   // incremented per input row
 }
 
 // floatSpecialKind encodes the IEEE 754 special-value state for
@@ -992,6 +1000,19 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		return err
 	}
 
+	// Compute the number of shared state slots needed for this aggregate. M0097-0035.
+	maxSlot := -1
+	for _, call := range o.plan.Aggs {
+		if call.SharedStateSlot > maxSlot {
+			maxSlot = call.SharedStateSlot
+		}
+	}
+	nSlots := maxSlot + 1
+	o.sharedUserStates = make([]Datum, nSlots)
+	o.sharedUserStateSet = make([]bool, nSlots)
+	o.sharedUserStateVersion = make([]int64, nSlots)
+	o.currentRowVersion = 0
+
 	type groupRuntime struct {
 		groupValues      Row
 		passthroughVals  Row // values of functionally-determined passthrough columns
@@ -1047,7 +1068,24 @@ func (o *aggregateOp) Open(ctx *Context) error {
 			order = append(order, key)
 		}
 
+		o.currentRowVersion++
 		for i, call := range o.plan.Aggs {
+			// For user-defined aggregates with shared transition state, only the
+			// "leader" (first call with this SharedStateSlot) calls sfunc. Followers
+			// skip applyAgg — they will be synced from the leader's final state just
+			// before finishAgg. M0097-0035.
+			if call.SharedStateSlot >= 0 && call.UserAgg != nil && i > 0 {
+				isFollower := false
+				for j := 0; j < i; j++ {
+					if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
+						isFollower = true
+						break
+					}
+				}
+				if isFollower {
+					continue
+				}
+			}
 			if err := o.applyAgg(&gr.aggs[i], call, slot); err != nil {
 				return err
 			}
@@ -1071,6 +1109,20 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		}
 		out := make(Row, 0, len(gr.groupValues)+len(o.plan.Aggs)+len(gr.passthroughVals))
 		out = append(out, gr.groupValues...)
+		// Sync follower aggregates from their leader before finishAgg. M0097-0035.
+		for i, call := range o.plan.Aggs {
+			if call.SharedStateSlot < 0 || call.UserAgg == nil || i == 0 {
+				continue
+			}
+			for j := 0; j < i; j++ {
+				if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
+					gr.aggs[i].userState = gr.aggs[j].userState
+					gr.aggs[i].userStateSet = gr.aggs[j].userStateSet
+					gr.aggs[i].hasValue = gr.aggs[j].hasValue
+					break
+				}
+			}
+		}
 		for i, call := range o.plan.Aggs {
 			out = append(out, o.finishAgg(gr.aggs[i], call))
 		}

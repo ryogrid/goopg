@@ -169,13 +169,16 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 			}
 			var vals []Datum
 			if !arrD.IsNull() {
-				elems := parseTextArray(arrD.StringValue())
-				for _, elem := range elems {
-					if elem == "NULL" {
-						vals = append(vals, NullDatum)
-					} else {
-						vals = append(vals, NewStringDatum(elem))
+				// Use expandArrayDatum for multi-dimensional array flattening (PG semantics).
+				elems := expandArrayDatum(arrD)
+				for _, d := range elems {
+					if !d.IsNull() && uc.CastType != "" {
+						// Apply element-level cast when unnest(...)::type syntax used. M0097-0035.
+						if cd, cerr := evalCastTyped(d, uc.CastType, "", 0); cerr == nil {
+							d = cd
+						}
 					}
+					vals = append(vals, d)
 				}
 			}
 			unnestResults[k] = unnestResult{colIdx: uc.ColIdx, vals: vals}

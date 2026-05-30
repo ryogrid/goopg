@@ -105,6 +105,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execRefreshMatView(s)
 	case *parser.CreateAggregateStmt:
 		return nil, o.execCreateAggregate(s)
+	case *parser.AlterAggregateRenameStmt:
+		return nil, o.execAlterAggregateRename(s)
 	case *parser.CreateOpClassStmt:
 		return nil, o.execCreateOpClass(s)
 	case *parser.CompatNoopStmt:
@@ -3440,6 +3442,21 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 		}
 	}
 	o.ctx.Catalog.RegisterUserAggregate(agg)
+	return nil
+}
+
+// execAlterAggregateRename handles ALTER AGGREGATE name(args) RENAME TO newname. M0097-0035.
+func (o *ddlOp) execAlterAggregateRename(s *parser.AlterAggregateRenameStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER AGGREGATE RENAME requires InMemory catalog"}
+	}
+	oldName := s.OldName.Name
+	newName := s.NewName
+	if !im.RenameUserAggregate(oldName, newName) {
+		return &ExecError{Code: "42883", Pos: s.Pos(),
+			Message: fmt.Sprintf("aggregate %s does not exist", oldName)}
+	}
 	return nil
 }
 

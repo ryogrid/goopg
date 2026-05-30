@@ -2538,8 +2538,9 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		routine *catalog.Routine
 	}
 	type unnestEntry struct {
-		colIdx  int
-		arrExpr parser.Expr
+		colIdx   int
+		arrExpr  parser.Expr
+		castType string // element-level cast type (e.g. "int4"); empty = no cast. M0097-0035.
 	}
 	var srfs []srfEntry
 	var unnests []unnestEntry
@@ -2549,7 +2550,16 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		rs = ctx.cat.Routines()
 	}
 	for i, t := range s.Targets {
-		fc, ok := t.Expr.(*parser.FuncCall)
+		// Unwrap a CastExpr to find the underlying SRF (e.g. unnest(...)::int). M0097-0035.
+		targetExpr := t.Expr
+		var srfCastType string
+		if castExpr, isCast := targetExpr.(*parser.CastExpr); isCast {
+			if _, isFc := castExpr.Operand.(*parser.FuncCall); isFc {
+				targetExpr = castExpr.Operand
+				srfCastType = castExpr.Type.Name
+			}
+		}
+		fc, ok := targetExpr.(*parser.FuncCall)
 		if !ok {
 			continue
 		}
@@ -2566,12 +2576,13 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			continue
 		}
 		// unnest(array) → one row per element. M0097-0106.
+		// Also handles (unnest(array))::type for element-level casting. M0097-0035.
 		if strings.EqualFold(fc.Name.Name, "unnest") {
 			if len(fc.Args) != 1 {
 				return nil, &PlanError{Pos: fc.Pos(), Code: "42883",
 					Message: "unnest requires exactly 1 argument"}
 			}
-			unnests = append(unnests, unnestEntry{colIdx: i, arrExpr: fc.Args[0]})
+			unnests = append(unnests, unnestEntry{colIdx: i, arrExpr: fc.Args[0], castType: srfCastType})
 			continue
 		}
 		// Check if the function is a user-defined SETOF SQL function. M0097-0020.
@@ -2611,7 +2622,12 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			// SRF column: determine output name and type.
 			name := alias
 			if name == "" {
-				if fc, ok := t.Expr.(*parser.FuncCall); ok {
+				// Unwrap CastExpr for name: (unnest(...))::int → "unnest"
+				nameExpr := t.Expr
+				if ce, isCe := nameExpr.(*parser.CastExpr); isCe {
+					nameExpr = ce.Operand
+				}
+				if fc, ok := nameExpr.(*parser.FuncCall); ok {
 					name = strings.ToLower(fc.Name.Name)
 				} else {
 					name = "?column?"
@@ -2621,9 +2637,19 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			// Check if this is an unnest SRF and get its element type.
 			for _, u := range unnests {
 				if u.colIdx == i {
+					// If there's an explicit cast, use that type.
+					if u.castType != "" {
+						retType = catalog.Type{Name: u.castType}
+						break
+					}
 					// Infer element type from array arg type (strip [] suffix).
 					arrType := "text" // default
-					if fc2, ok := t.Expr.(*parser.FuncCall); ok && len(fc2.Args) == 1 {
+					// Unwrap CastExpr to get the inner FuncCall.
+					innerExpr := t.Expr
+					if ce, isCe := innerExpr.(*parser.CastExpr); isCe {
+						innerExpr = ce.Operand
+					}
+					if fc2, ok := innerExpr.(*parser.FuncCall); ok && len(fc2.Args) == 1 {
 						resolved, err2 := resolveExpr(fc2.Args[0], ctx)
 						if err2 == nil {
 							at := exprType(resolved).Name
@@ -2684,13 +2710,28 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	}
 
 	// Resolve unnest array args against ctx. M0097-0106.
+	// When no explicit cast is given, infer the element type from the array type
+	// so the executor produces correctly-typed elements (e.g. int4 not text). M0097-0035.
 	unnestCols := make([]UnnestCol, len(unnests))
 	for k, u := range unnests {
 		arrResolved, err := resolveExpr(u.arrExpr, ctx)
 		if err != nil {
 			return nil, err
 		}
-		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved}
+		castType := u.castType
+		if castType == "" {
+			// Infer element type from array type suffix.
+			at := exprType(arrResolved).Name
+			if strings.HasSuffix(at, "[]") {
+				base := at[:len(at)-2]
+				// Only apply type-preserving cast for concrete element types.
+				switch base {
+				case "int4", "int8", "int2", "float4", "float8", "bool", "numeric":
+					castType = base
+				}
+			}
+		}
+		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved, CastType: castType}
 	}
 
 	// Resolve user SETOF function args against ctx. M0097-0020.
@@ -3591,6 +3632,48 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: pa.Type})
 	}
 
+	// Assign shared state slots for user-defined aggregates that share sfunc/stype/args/distinct/filter.
+	// PG calls sfunc once per row when multiple aggregates share the same transition state.
+	// This eliminates duplicate NOTICE/side-effect calls for identical sfunc invocations. M0097-0035.
+	{
+		type stateKey struct{ sfunc, stype, argKey string; distinct bool; filterKey string }
+		slotByKey := map[stateKey]int{}
+		nextSlot := 0
+		for i := range plannedAggs {
+			pa := &plannedAggs[i]
+			if pa.UserAgg == nil || pa.Distinct {
+				// Non-user aggregates and DISTINCT aggregates do not share state.
+				pa.SharedStateSlot = -1
+				continue
+			}
+			if pa.Filter != nil {
+				// Filtered aggregates share state only when filters match (handle via key).
+			}
+			argK := ""
+			if pa.Arg != nil {
+				argK = planExprContentKey(pa.Arg)
+			}
+			filterK := ""
+			if pa.Filter != nil {
+				filterK = planExprContentKey(pa.Filter)
+			}
+			sk := stateKey{
+				sfunc:     strings.ToLower(pa.UserAgg.SFunc),
+				stype:     strings.ToLower(pa.UserAgg.SType),
+				argKey:    argK,
+				distinct:  pa.Distinct,
+				filterKey: filterK,
+			}
+			if slot, exists := slotByKey[sk]; exists {
+				pa.SharedStateSlot = slot
+			} else {
+				slotByKey[sk] = nextSlot
+				pa.SharedStateSlot = nextSlot
+				nextSlot++
+			}
+		}
+	}
+
 	aggNode := &Aggregate{
 		pos:        s.Pos(),
 		Child:      child,
@@ -4283,6 +4366,31 @@ func parserExprHasWindowFunc(e parser.Expr) bool {
 	return found
 }
 
+// planExprContentKey returns a content-based string key for a planner Expr,
+// used to compare resolved expressions for aggregate state-sharing equality. M0097-0035.
+func planExprContentKey(e Expr) string {
+	if e == nil {
+		return "<nil>"
+	}
+	switch x := e.(type) {
+	case *ColumnRef:
+		return fmt.Sprintf("col:%d/%d", x.SourceTableIdx, x.Index)
+	case *IntegerConst:
+		return fmt.Sprintf("int:%d", x.Value)
+	case *StringConst:
+		return fmt.Sprintf("str:%s", x.Value)
+	case *FuncCall:
+		var b strings.Builder
+		b.WriteString("fn:" + strings.ToLower(x.Name))
+		for _, a := range x.Args {
+			b.WriteString("|" + planExprContentKey(a))
+		}
+		return b.String()
+	default:
+		return fmt.Sprintf("%T", e)
+	}
+}
+
 func aggregateCallKey(fc *parser.FuncCall) string {
 	b := strings.Builder{}
 	b.WriteString(strings.ToLower(fc.Name.String()))
@@ -4455,6 +4563,18 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 	switch name {
 	case "count":
 		outType = catalog.Type{Name: "int8"}
+	case "array_agg":
+		// array_agg(expr) returns the element type with [] suffix. M0097-0035.
+		if argExpr != nil {
+			et := exprType(argExpr)
+			if et.Name != "" && et.Name != "unknown" {
+				outType = catalog.Type{Name: et.Name + "[]"}
+			} else {
+				outType = catalog.Type{Name: "text[]"}
+			}
+		} else {
+			outType = catalog.Type{Name: "text[]"}
+		}
 	case "sum":
 		outType = exprType(argExpr)
 		if strings.EqualFold(outType.Name, "unknown") || outType.Name == "" {
@@ -6357,6 +6477,15 @@ func exprType(e Expr) catalog.Type {
 			"cardinality", "strpos", "position":
 			// String/array length functions return int4. M0097-0003.
 			return catalog.Type{Name: "int4"}
+		case "array_agg":
+			// array_agg(expr) returns the element type with [] suffix. M0097-0035.
+			if len(x.Args) > 0 {
+				et := exprType(x.Args[0])
+				if et.Name != "" && et.Name != "unknown" {
+					return catalog.Type{Name: et.Name + "[]"}
+				}
+			}
+			return catalog.Type{Name: "text[]"}
 		case "array_construct":
 			// ARRAY[e1,...] constructor: return element type with [] suffix.
 			if len(x.Args) > 0 {

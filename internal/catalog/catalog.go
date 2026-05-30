@@ -329,6 +329,9 @@ type Catalog interface {
 	// LookupUserAggregateByName looks up a user-defined aggregate by lower-case name.
 	// Returns nil, false if not found.
 	LookupUserAggregateByName(name string) (*UserAggregate, bool)
+	// RenameUserAggregate renames an existing user-defined aggregate.
+	// Returns false if the old name is not found.
+	RenameUserAggregate(oldName, newName string) bool
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -508,6 +511,21 @@ func (c *InMemory) LookupUserAggregateByName(name string) (*UserAggregate, bool)
 	defer c.mu.RUnlock()
 	a, ok := c.userAggregates[strings.ToLower(name)]
 	return a, ok
+}
+
+// RenameUserAggregate renames an existing user-defined aggregate. M0097-0035.
+func (c *InMemory) RenameUserAggregate(oldName, newName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oldKey := strings.ToLower(oldName)
+	agg, ok := c.userAggregates[oldKey]
+	if !ok {
+		return false
+	}
+	delete(c.userAggregates, oldKey)
+	agg.Name = newName
+	c.userAggregates[strings.ToLower(newName)] = agg
+	return true
 }
 
 // SetDBOID overrides the database OID used for RelFileNode generation.

@@ -59,29 +59,30 @@ func (o *fromUnnestOp) Next() (TupleSlot, error) {
 	return SlotFromRow(nil, row), nil
 }
 
-// expandArrayDatum parses a Datum containing an array and returns its elements.
+// expandArrayDatum parses a Datum containing an array and returns its scalar elements.
+// For multi-dimensional arrays (e.g. {{1},{2},{3}}), elements are recursively flattened
+// to scalars, matching PostgreSQL's unnest() semantics. M0097-0035.
 func expandArrayDatum(d Datum) []Datum {
 	var elems []Datum
+	var sv string
 	switch d.Kind {
 	case KindString:
-		// Text array format: {elem1,elem2,...}
-		parts := parseTextArray(d.StringValue())
-		for _, p := range parts {
-			if p == "NULL" {
-				elems = append(elems, NullDatum)
-			} else {
-				elems = append(elems, NewStringDatum(p))
-			}
-		}
+		sv = d.StringValue()
 	case KindBytes:
-		// Bytes stored as text array in varlena format.
-		parts := parseTextArray(string(d.BytesValue()))
-		for _, p := range parts {
-			if p == "NULL" {
-				elems = append(elems, NullDatum)
-			} else {
-				elems = append(elems, NewStringDatum(p))
-			}
+		sv = string(d.BytesValue())
+	default:
+		return elems
+	}
+	parts := parseTextArray(sv)
+	for _, p := range parts {
+		if p == "NULL" {
+			elems = append(elems, NullDatum)
+		} else if len(p) >= 2 && p[0] == '{' && p[len(p)-1] == '}' {
+			// Nested array element — recursively flatten (PG unnest flattens all dims).
+			inner := expandArrayDatum(NewStringDatum(p))
+			elems = append(elems, inner...)
+		} else {
+			elems = append(elems, NewStringDatum(p))
 		}
 	}
 	return elems

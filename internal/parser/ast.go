@@ -1157,6 +1157,17 @@ type CreateAggregateStmt struct {
 func (s *CreateAggregateStmt) Pos() int  { return s.pos }
 func (s *CreateAggregateStmt) stmtNode() {}
 
+// AlterAggregateRenameStmt renames a user-defined aggregate. M0097-0035.
+// ALTER AGGREGATE name(argtype_list) RENAME TO newname
+type AlterAggregateRenameStmt struct {
+	pos     int
+	OldName ObjectName
+	NewName string
+}
+
+func (s *AlterAggregateRenameStmt) Pos() int  { return s.pos }
+func (s *AlterAggregateRenameStmt) stmtNode() {}
+
 // CreateOpClassStmt is a minimal representation of CREATE OPERATOR CLASS used
 // to register custom hash support functions for hash partitioning. M0097-0027.
 // We only capture the FUNCTION 2 (hash extended) entry; everything else is

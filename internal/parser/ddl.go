@@ -2684,13 +2684,59 @@ func (p *parser) parseAlter() (Stmt, error) {
 	if p.acceptIdentKeyword("type") {
 		return p.parseAlterType(t.Pos)
 	}
-	// ALTER VIEW / SCHEMA / INDEX / FUNCTION / PROCEDURE / AGGREGATE /
+	// ALTER AGGREGATE name(argtype_list) RENAME TO newname. M0097-0035.
+	if p.acceptIdentKeyword("aggregate") {
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		// Skip the argument type list (parenthesised, may contain ORDER BY).
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			depth := 1
+			p.advance()
+			for depth > 0 && p.cur().Kind != TokenEOF {
+				switch {
+				case p.cur().Kind == TokenSymbol && p.cur().Value == "(":
+					depth++
+				case p.cur().Kind == TokenSymbol && p.cur().Value == ")":
+					depth--
+					if depth == 0 {
+						continue
+					}
+				}
+				p.advance()
+			}
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				p.advance()
+			}
+		}
+		// Check for RENAME TO newname.
+		if p.acceptIdentKeyword("rename") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &AlterAggregateRenameStmt{pos: t.Pos, OldName: name, NewName: newNameTok.Value}, nil
+		}
+		// Other ALTER AGGREGATE forms: consume as no-op.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return &AlterTableStmt{pos: t.Pos}, nil
+	}
+	// ALTER VIEW / SCHEMA / INDEX / FUNCTION / PROCEDURE /
 	// COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / PUBLICATION /
 	// SUBSCRIPTION / SYSTEM — compatibility stubs. Consume until end of
 	// statement and return an empty AlterTableStmt (executor no-ops it).
 	for _, objIdent := range []string{
 		"schema", "view", "index", "function", "procedure",
-		"aggregate", "collation", "domain", "extension", "language",
+		"collation", "domain", "extension", "language",
 		"operator", "publication", "subscription", "system",
 		"materialized",
 	} {
