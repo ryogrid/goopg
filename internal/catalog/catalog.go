@@ -2437,6 +2437,24 @@ func (c *InMemory) AllTables() []*Table {
 	return out
 }
 
+// AllUserViews returns deep copies of every user-created non-materialized view.
+// Used by DROP VIEW CASCADE dependency scanning. M0097-0021.
+func (c *InMemory) AllUserViews() []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*Table, 0)
+	for _, t := range c.tables {
+		if !t.Virtual || t.View == nil || t.IsMatView {
+			continue
+		}
+		cp := *t
+		cp.Columns = append([]Column(nil), t.Columns...)
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
 // FKRef pairs a child table with one of its FK constraints that
 // references a given parent table. M0096-0011.
 type FKRef struct {

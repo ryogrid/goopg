@@ -920,27 +920,115 @@ func deriveTargetName(e parser.Expr) string {
 // execDropView removes a view from the catalog. No relation
 // file is involved — views are virtual.
 func (o *ddlOp) execDropView(s *parser.DropViewStmt) error {
+	dropped := make(map[string]bool)
 	for _, name := range s.Names {
-		if _, ok := o.ctx.Catalog.LookupTable(name); !ok {
-			if s.IfExists {
-				o.ctx.AddNotice(fmt.Sprintf("view %q does not exist, skipping", name.String()))
-				continue
-			}
-			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("view %q does not exist", name.String())}
-		}
-		if err := o.ctx.Catalog.DropView(name, s.IfExists); err != nil {
-			if s.IfExists {
-				o.ctx.AddNotice(fmt.Sprintf("view %q does not exist, skipping", name.String()))
-				continue
-			}
-			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
-		}
-		// Clean up constraint dependencies registered by CREATE VIEW. M0097-0036.
-		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-			im.UnregisterViewConstraintDeps(name.String())
+		if err := o.execDropOneView(name, s.IfExists, s.Behavior, s.Pos(), dropped); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// execDropOneView drops a single view, cascading to dependent views when
+// behavior == DropCascade. The dropped map prevents infinite recursion on
+// circular view definitions. M0097-0021.
+func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior parser.DropBehavior, pos int, dropped map[string]bool) error {
+	key := name.String()
+	if dropped[key] {
+		return nil // already being dropped in this cascade
+	}
+	if _, ok := o.ctx.Catalog.LookupTable(name); !ok {
+		if ifExists {
+			o.ctx.AddNotice(fmt.Sprintf("view %q does not exist, skipping", name.String()))
+			return nil
+		}
+		return &ExecError{Code: "42P01", Pos: pos, Message: fmt.Sprintf("view %q does not exist", name.String())}
+	}
+
+	// Mark as being dropped before recursing to break circular dependency cycles.
+	dropped[key] = true
+
+	// CASCADE: drop any dependent views before dropping this one.
+	if behavior == parser.DropCascade {
+		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+			deps := viewsDependingOnView(im, name)
+			for _, depName := range deps {
+				if !dropped[depName.String()] {
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to view %s", depName.String()))
+					if err := o.execDropOneView(depName, true, behavior, pos, dropped); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+
+	if err := o.ctx.Catalog.DropView(name, ifExists); err != nil {
+		if ifExists {
+			o.ctx.AddNotice(fmt.Sprintf("view %q does not exist, skipping", name.String()))
+			return nil
+		}
+		return &ExecError{Code: "42P01", Pos: pos, Message: err.Error()}
+	}
+	// Clean up constraint dependencies registered by CREATE VIEW. M0097-0036.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		im.UnregisterViewConstraintDeps(name.String())
+	}
+	return nil
+}
+
+// viewsDependingOnView returns all views whose body directly references the given view name.
+// Used by DROP VIEW CASCADE to find dependent views. M0097-0021.
+func viewsDependingOnView(im *catalog.InMemory, target parser.ObjectName) []parser.ObjectName {
+	targetName := target.Name
+	var deps []parser.ObjectName
+	for _, t := range im.AllUserViews() {
+		if t.View == nil || t.IsMatView {
+			continue
+		}
+		if t.Name == target.Name && t.Schema == target.Schema {
+			continue // skip the view itself
+		}
+		if selectRefsViewName(t.View, targetName) {
+			deps = append(deps, parser.ObjectName{Schema: t.Schema, Name: t.Name})
+		}
+	}
+	return deps
+}
+
+// selectRefsViewName reports whether sel or any sub-select references the given view/table name.
+func selectRefsViewName(sel *parser.SelectStmt, name string) bool {
+	if sel == nil {
+		return false
+	}
+	for _, rv := range sel.From {
+		if rangeVarRefsName(&rv, name) {
+			return true
+		}
+	}
+	for _, fe := range sel.FromExprs {
+		if rangeVarRefsName(&fe.Base, name) {
+			return true
+		}
+		for _, j := range fe.Joins {
+			if rangeVarRefsName(&j.Right, name) {
+				return true
+			}
+		}
+	}
+	// Check set-op right branch (UNION/INTERSECT/EXCEPT).
+	if sel.SetOp != nil && selectRefsViewName(sel.SetOp.Right, name) {
+		return true
+	}
+	return false
+}
+
+// rangeVarRefsName checks if rv or its subquery references name.
+func rangeVarRefsName(rv *parser.RangeVar, name string) bool {
+	if rv.Subquery != nil {
+		return selectRefsViewName(rv.Subquery, name)
+	}
+	return strings.EqualFold(rv.Name, name)
 }
 
 func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
@@ -2273,9 +2361,11 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	if lang == "" {
 		return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE FUNCTION requires a LANGUAGE clause"}
 	}
-	if lang != "plpgsql" && lang != "sql" {
+	if lang != "plpgsql" && lang != "sql" && lang != "c" {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage A: plpgsql, sql)", s.Language)}
 	}
+	// LANGUAGE C: store as a stub. When called, evalFuncCall detects lang=="c"
+	// and returns a type-appropriate default value (true for bool, 0 for int, etc.).
 	argTypes := make([]catalog.Type, len(s.Args))
 	argNames := make([]string, len(s.Args))
 	for i, a := range s.Args {
@@ -2320,7 +2410,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	if lang == "" {
 		return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE PROCEDURE requires a LANGUAGE clause"}
 	}
-	if lang != "plpgsql" && lang != "sql" {
+	if lang != "plpgsql" && lang != "sql" && lang != "c" {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage B: plpgsql, sql)", s.Language)}
 	}
 	argTypes := make([]catalog.Type, len(s.Args))
@@ -3033,19 +3123,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				schemaName = name.Schema + "." + name.Name
 			}
 			tables := o.ctx.Catalog.TablesInSchema(schemaName)
-			if len(tables) == 0 && !s.IfExists {
-				// No tables found; schema may not exist (we don't track schemas separately).
-				// Return "schema does not exist" only when not IF EXISTS.
-				return &ExecError{
-					Code:    "3F000",
-					Pos:     s.Pos(),
-					Message: fmt.Sprintf("schema %q does not exist", schemaName),
-				}
-			}
 			if s.IfExists && len(tables) == 0 {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", schemaName))
 				continue
 			}
+			// goopg does not track schemas separately — we infer existence from tables.
+			// If no tables exist, the schema may be genuinely absent OR may have had its
+			// tables dropped individually beforehand (e.g. lock.sql drops all tables/views
+			// before DROP SCHEMA CASCADE). Succeed silently to match PostgreSQL's behaviour
+			// of dropping an empty schema without error.
 			if s.Behavior == parser.DropCascade && len(tables) > 0 {
 				// Sort table names for deterministic DETAIL output.
 				sort.Slice(tables, func(i, j int) bool {

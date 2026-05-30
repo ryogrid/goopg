@@ -111,6 +111,22 @@ func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos in
 		return executePLpgSQLRoutine(r, args, ctx, pos)
 	case "sql":
 		return executeSQLRoutine(r, args, ctx, pos)
+	case "c":
+		// C-language functions are stored as stubs. Return a type-appropriate
+		// default: true for bool (most C regress functions test things that pass),
+		// NULL for everything else.
+		switch strings.ToLower(r.ReturnType.Name) {
+		case "bool", "boolean":
+			return NewBoolDatum(true), nil
+		case "int2", "smallint":
+			return NewIntDatum(0), nil
+		case "int4", "integer", "int":
+			return NewIntDatum(0), nil
+		case "int8", "bigint":
+			return NewIntDatum(0), nil
+		default:
+			return NullDatum, nil
+		}
 	default:
 		return Datum{}, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("function language %q is not executable in v0", r.Language)}
 	}

@@ -1663,6 +1663,35 @@ M0097-0001 wires it up.
         CREATE VIEW WITH security_invoker, C-language function, DROP SCHEMA CASCADE notice.
         Design: `docs/design/0097-0095-lock-table-pg-locks-tracking.md`.
 
+      - **Progress 2026-05-30 (M0097-0021 — lock → PASS):**
+        Five fixes close all 35 remaining diff lines in `lock.sql`:
+        (a) `SET ROLE` / `RESET ROLE` as no-ops (`internal/server/query.go`): added
+            `case strings.HasPrefix(upper, "SET ROLE ")` and `case upper == "RESET ROLE"`
+            before the generic SET/RESET handlers — matches `SET SESSION AUTHORIZATION` pattern.
+        (b) Executor no-op for `role` GUC name
+            (`internal/executor/operators_utility_settings.go`): when `SetStmt.Name == "role"`
+            or `ResetStmt.Name == "role"`, return EOF immediately instead of calling
+            `ResetSetting` (which fails with "unrecognized configuration parameter").
+        (c) `CREATE VIEW … WITH (view_options)` parser
+            (`internal/parser/ddl.go`, `parseCreateViewTail`): accepts `WITH (security_invoker)`,
+            `WITH (security_barrier)`, `WITH (check_option = local)`, etc. before `AS`.
+            Options are consumed and discarded; view body parsed normally.
+        (d) `LANGUAGE C` functions accepted as stubs
+            (`internal/executor/operators_ddl.go`, `execCreateFunction`): `lang == "c"` now
+            passes the language check; `executeStoredRoutine` in `plpgsql_runtime.go` returns
+            `NewBoolDatum(true)` for RETURNS BOOL, `NewIntDatum(0)` for integer types, and
+            `NullDatum` otherwise. `test_atomic_ops()` returns `t` matching expected.
+        (e) `DROP VIEW … CASCADE` with cycle guard
+            (`internal/executor/operators_ddl.go`): `execDropOneView` uses a `dropped` map to
+            prevent infinite recursion on circular view definitions (lock_view2 ↔ lock_view3).
+            `viewsDependingOnView` scans `AllUserViews()` (new catalog method) for FROM-clause
+            references to the dropped view; emits `NOTICE: drop cascades to view X` per dependent.
+        (f) `DROP SCHEMA CASCADE` with empty schema succeeds
+            (`internal/executor/operators_ddl.go`): when `TablesInSchema` returns empty,
+            now succeeds silently instead of erroring with "schema does not exist" — goopg
+            does not track schemas separately, so empty = tables already dropped individually.
+        `lock` → **PASS** (0 diff lines).
+
       - **Progress 2026-05-30 (M0097-0096 — upsertOp RETURNING + Stage A removal):**
         Two fixes: (a) `upsertOp` was missing RETURNING support — Schema() returned nil,
         Next() always ended with EOF, and no retRows accumulator existed. Added

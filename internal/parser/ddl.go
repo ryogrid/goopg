@@ -491,6 +491,28 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 		}
 		stmt.Columns = cols
 	}
+	// Optional WITH (view_option_name [= view_option_value] [, ...]) before AS.
+	// PostgreSQL supports security_invoker, security_barrier, check_option.
+	// goopg v0 accepts and ignores all view options.
+	if p.acceptKeyword(KwWith) {
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after WITH in CREATE VIEW")
+		}
+		for !p.acceptSymbol(")") {
+			// option name (identifier)
+			if _, err := p.parseIdent(); err != nil {
+				return nil, err
+			}
+			// optional = value
+			if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+				p.advance()
+				if _, err := p.parseIdent(); err != nil {
+					return nil, err
+				}
+			}
+			p.acceptSymbol(",")
+		}
+	}
 	if _, err := p.expectKeyword(KwAs); err != nil {
 		return nil, err
 	}
