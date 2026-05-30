@@ -3422,6 +3422,27 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 		return &ExecError{Code: "42P13", Pos: s.Pos(),
 			Message: "aggregate input type must be specified"}
 	}
+	// Validate finalfunc existence before registering. PostgreSQL looks up the
+	// finalfunc in pg_proc and returns 42883 if no overload matches the stype.
+	// We check our user-defined routines registry first, then fall back to the
+	// built-in finalfunc allowlist (PostgreSQL internal functions we handle but
+	// don't register in the catalog). M0097-0112.
+	if s.FinalFunc != "" {
+		ffLower := strings.ToLower(s.FinalFunc)
+		found := knownBuiltinAggFinalFuncs[ffLower]
+		if !found {
+			if rs := o.ctx.Catalog.Routines(); rs != nil {
+				if candidates := rs.LookupByName(parser.ObjectName{Name: s.FinalFunc}); len(candidates) > 0 {
+					found = true
+				}
+			}
+		}
+		if !found {
+			stypeName := aggregatePgTypeName(s.SType)
+			return &ExecError{Code: "42883", Pos: s.Pos(),
+				Message: fmt.Sprintf("function %s(%s) does not exist", ffLower, stypeName)}
+		}
+	}
 	// Register in the catalog so the planner and executor can find it.
 	agg := &catalog.UserAggregate{
 		Name:      strings.ToLower(s.Name.Name),
@@ -3473,6 +3494,26 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 	}
 	im.RegisterOpClassHashFunc(s.Name, s.HashFuncName)
 	return nil
+}
+
+// knownBuiltinAggFinalFuncs is the set of PostgreSQL built-in function names
+// that may appear as a finalfunc in CREATE AGGREGATE. These are handled as
+// special cases in the executor (finishAgg) and are not registered in the
+// user-defined routines catalog, so the finalfunc validation skips them.
+// M0097-0112.
+var knownBuiltinAggFinalFuncs = map[string]bool{
+	"int8_avg":              true,
+	"numeric_avg":           true,
+	"numeric_avg_combine":   true,
+	"numeric_out":           true,
+	"percentile_disc_final": true,
+	"percentile_cont_final": true,
+	"rank_final":            true,
+	"dense_rank_final":      true,
+	"cume_dist_final":       true,
+	"percent_rank_final":    true,
+	"mode_final":            true,
+	"hypothetical_rank_common_final": true,
 }
 
 // aggregatePgTypeName maps an internal type name to the SQL type name used

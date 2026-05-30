@@ -26,7 +26,7 @@ domain,0,pass
 drop_if_exists,0,pass
 enum,0,pass
 equivclass,0,pass
-errors,1,failed
+errors,0,pass
 expressions,0,pass
 fast_default,0,pass
 float4,630,failed
