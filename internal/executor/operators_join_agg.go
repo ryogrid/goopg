@@ -1117,7 +1117,7 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 	if err != nil {
 		return err
 	}
-	if arg.IsNull() {
+	if arg.IsNull() && name != "array_agg" {
 		return nil
 	}
 
@@ -1255,6 +1255,19 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 			} else {
 				st.intResult &= arg.Int
 			}
+		} else if arg.Kind == KindString {
+			// BIT(n) type: parse binary string like "B0101" or "0101".
+			bstr := arg.StringValue()
+			bstr = strings.TrimPrefix(strings.TrimPrefix(bstr, "B"), "b")
+			if v, err := strconv.ParseInt(bstr, 2, 64); err == nil {
+				if !st.hasValue {
+					st.intResult = v
+					st.strResult = fmt.Sprintf("b%d", len(bstr))
+					st.hasValue = true
+				} else {
+					st.intResult &= v
+				}
+			}
 		}
 	case "bit_or":
 		if arg.Kind == KindInt {
@@ -1263,6 +1276,18 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 				st.hasValue = true
 			} else {
 				st.intResult |= arg.Int
+			}
+		} else if arg.Kind == KindString {
+			bstr := arg.StringValue()
+			bstr = strings.TrimPrefix(strings.TrimPrefix(bstr, "B"), "b")
+			if v, err := strconv.ParseInt(bstr, 2, 64); err == nil {
+				if !st.hasValue {
+					st.intResult = v
+					st.strResult = fmt.Sprintf("b%d", len(bstr))
+					st.hasValue = true
+				} else {
+					st.intResult |= v
+				}
 			}
 		}
 	case "bit_xor":
@@ -1273,31 +1298,87 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 			} else {
 				st.intResult ^= arg.Int
 			}
+		} else if arg.Kind == KindString {
+			bstr := arg.StringValue()
+			bstr = strings.TrimPrefix(strings.TrimPrefix(bstr, "B"), "b")
+			if v, err := strconv.ParseInt(bstr, 2, 64); err == nil {
+				if !st.hasValue {
+					st.intResult = v
+					st.strResult = fmt.Sprintf("b%d", len(bstr))
+					st.hasValue = true
+				} else {
+					st.intResult ^= v
+				}
+			}
 		}
 	case "string_agg":
 		// string_agg(expr, delimiter) — accumulate in strResult with delimiter.
+		// For bytea values, st.boolResult=true signals hex-encoded mode.
+		const hexChars = "0123456789abcdef"
+		if arg.Kind == KindBytes {
+			// Bytea string_agg: concatenate hex-encoded bytes with hex-encoded delimiter.
+			b := arg.BytesValue()
+			hexBuf := make([]byte, len(b)*2)
+			for i, bb := range b {
+				hexBuf[2*i] = hexChars[bb>>4]
+				hexBuf[2*i+1] = hexChars[bb&0x0f]
+			}
+			hexVal := string(hexBuf)
+			delimHex := ""
+			if call.Arg2 != nil {
+				dv, _ := evalExprSlot(call.Arg2, slot, o.ctx)
+				if !dv.IsNull() && dv.Kind == KindBytes {
+					db := dv.BytesValue()
+					dh := make([]byte, len(db)*2)
+					for i, bb := range db {
+						dh[2*i] = hexChars[bb>>4]
+						dh[2*i+1] = hexChars[bb&0x0f]
+					}
+					delimHex = string(dh)
+				}
+			}
+			if !st.hasValue {
+				st.strResult = hexVal
+				st.boolResult = true // bytea mode flag
+				st.hasValue = true
+			} else {
+				st.strResult += delimHex + hexVal
+			}
+			break
+		}
+		// Text string_agg: evaluate the delimiter from Arg2.
+		delim := ""
+		if call.Arg2 != nil {
+			dv, derr := evalExprSlot(call.Arg2, slot, o.ctx)
+			if derr != nil {
+				break
+			}
+			if !dv.IsNull() {
+				delim = dv.Format()
+			}
+		}
 		sv := arg.Format()
 		if !st.hasValue {
 			st.strResult = sv
 			st.hasValue = true
 		} else {
-			// Use comma as default delimiter; second arg would refine this.
-			st.strResult += "," + sv
+			st.strResult += delim + sv
 		}
 	case "array_agg":
 		// array_agg(expr [ORDER BY sort_list]) — accumulate per-row elements.
-		// NULLs are permitted as array elements upstream, but the IsNull early-
-		// return above already skipped them; that matches goopg's
-		// existing aggregate convention (count/sum/etc. all skip NULL
-		// inputs) and is sufficient for the M0103-0008 probe query
-		// where the input column (pg_publication.pubname) is NOT NULL.
+		// NULLs are included as array elements (PostgreSQL semantics).
 		// Elements are stored as their Format() string; finishAgg
 		// wraps them in PG's text-array literal syntax. Numeric kinds
 		// (int, numeric, oid) and string kinds (text, char, varchar)
 		// all round-trip through Format() identically to how a SELECT
 		// would print them.
-		st.arrayElems = append(st.arrayElems, arg.Format())
-		st.arrayElemNull = append(st.arrayElemNull, false)
+		elemStr := ""
+		isNull := arg.IsNull()
+		if !isNull {
+			elemStr = arg.Format()
+		}
+		st.arrayElems = append(st.arrayElems, elemStr)
+		st.arrayElemNull = append(st.arrayElemNull, isNull)
 		// Evaluate ORDER BY expressions for later sorting in finishAgg.
 		if len(call.OrderBy) > 0 {
 			keys := make([]Datum, 0, len(call.OrderBy))
@@ -1459,10 +1540,20 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if !st.hasValue {
 			return NullDatum
 		}
+		// BIT(n) type: format as zero-padded binary string.
+		if strings.HasPrefix(st.strResult, "b") {
+			if width, err := strconv.Atoi(st.strResult[1:]); err == nil && width > 0 {
+				return NewStringDatum(fmt.Sprintf("%0*b", width, uint64(st.intResult)))
+			}
+		}
 		return Datum{Kind: KindInt, Int: st.intResult}
 	case "string_agg":
 		if !st.hasValue {
 			return NullDatum
+		}
+		// Bytea mode: st.boolResult=true means result is hex-encoded bytes.
+		if st.boolResult {
+			return NewStringDatum(`\x` + st.strResult)
 		}
 		return NewStringDatum(st.strResult)
 	case "array_agg":
@@ -1486,6 +1577,22 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 					if ki >= len(kb) {
 						break
 					}
+					akNull := ka[ki].IsNull()
+					bkNull := kb[ki].IsNull()
+					if akNull && bkNull {
+						continue
+					}
+					// NULLs LAST for ASC (default), NULLs FIRST for DESC (default).
+					nullsFirst := false
+					if ki < len(call.OrderBy) {
+						nullsFirst = call.OrderBy[ki].NullsFirst
+					}
+					if akNull {
+						return nullsFirst
+					}
+					if bkNull {
+						return !nullsFirst
+					}
 					cmp, err := compareDatum(ka[ki], kb[ki], 0)
 					if err != nil || cmp == 0 {
 						continue
@@ -1497,17 +1604,17 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 				}
 				return false
 			})
-			sorted := make([]string, len(st.arrayElems))
+			sortedElems := make([]string, len(st.arrayElems))
+			sortedNulls := make([]bool, len(st.arrayElems))
 			for i, origIdx := range idx {
-				sorted[i] = st.arrayElems[origIdx]
+				sortedElems[i] = st.arrayElems[origIdx]
+				if origIdx < len(st.arrayElemNull) {
+					sortedNulls[i] = st.arrayElemNull[origIdx]
+				}
 			}
-			return NewStringDatum(formatTextArray(sorted))
+			return NewStringDatum(formatTextArrayWithNulls(sortedElems, sortedNulls))
 		}
-		// NULL elements are not currently distinguished — applyAgg's
-		// IsNull early-return drops them. Suffices for the M0103-0008
-		// probe (pg_publication.pubname is NOT NULL); proper NULL-
-		// element support is deferred.
-		return NewStringDatum(formatTextArray(st.arrayElems))
+		return NewStringDatum(formatTextArrayWithNulls(st.arrayElems, st.arrayElemNull))
 	case "any_value":
 		if !st.hasValue {
 			return NullDatum

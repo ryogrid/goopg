@@ -1406,6 +1406,17 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						} else {
 							valueBuf = d.AppendValueText(valueBuf)
 						}
+					case "bytea":
+						// Bytea values display as \xhexstring (default hex mode). M0097-0035.
+						if d.Kind == executor.KindBytes {
+							valueBuf = append(valueBuf, '\\', 'x')
+							const hexChars = "0123456789abcdef"
+							for _, b := range d.BytesValue() {
+								valueBuf = append(valueBuf, hexChars[b>>4], hexChars[b&0x0f])
+							}
+						} else {
+							valueBuf = d.AppendValueText(valueBuf)
+						}
 					default:
 						valueBuf = d.AppendValueText(valueBuf)
 					}

@@ -140,6 +140,7 @@ type CopyFromExecutor struct {
 	plan   *planner.Copy
 	cols   []catalog.Column // table's full column list, in declared order
 	rowsIn int64
+	nullStr string // NULL sentinel string, default `\N`
 
 	// binary path state
 	binaryBuf        []byte
@@ -162,10 +163,17 @@ func NewCopyFromExecutor(ctx *Context, plan *planner.Copy) (*CopyFromExecutor, e
 	if ctx.Pool == nil || ctx.Catalog == nil || ctx.TxnMgr == nil {
 		return nil, &ExecError{Code: "XX000", Pos: plan.Pos(), Message: "COPY FROM requires storage handles in Context"}
 	}
+	nullStr := `\N`
+	for _, opt := range plan.Options {
+		if strings.EqualFold(opt.Name, "null") {
+			nullStr = opt.Value
+		}
+	}
 	return &CopyFromExecutor{
-		ctx:  ctx,
-		plan: plan,
-		cols: plan.Table.Columns,
+		ctx:     ctx,
+		plan:    plan,
+		cols:    plan.Table.Columns,
+		nullStr: nullStr,
 	}, nil
 }
 
@@ -179,7 +187,7 @@ func (c *CopyFromExecutor) PushLine(line []byte) error {
 	for i, ord := range c.plan.ColumnIndex {
 		listedCols[i] = c.cols[ord]
 	}
-	src, err := DecodeCopyTextRow(line, listedCols)
+	src, err := DecodeCopyTextRow(line, listedCols, c.nullStr)
 	if err != nil {
 		return &ExecError{Code: "22P04", Pos: c.plan.Pos(), Message: fmt.Sprintf("COPY: %v", err)}
 	}
@@ -337,10 +345,17 @@ func RunCopyFromFile(ctx *Context, plan *planner.Copy) (int64, error) {
 	defer f.Close()
 
 	// Build a CopyFromExecutor directly (bypassing rejectFileEndpoint).
+	nullStr := `\N`
+	for _, opt := range plan.Options {
+		if strings.EqualFold(opt.Name, "null") {
+			nullStr = opt.Value
+		}
+	}
 	fe := &CopyFromExecutor{
-		ctx:  ctx,
-		plan: plan,
-		cols: plan.Table.Columns,
+		ctx:     ctx,
+		plan:    plan,
+		cols:    plan.Table.Columns,
+		nullStr: nullStr,
 	}
 
 	scanner := bufio.NewScanner(f)

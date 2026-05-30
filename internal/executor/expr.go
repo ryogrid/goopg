@@ -11,6 +11,8 @@ import (
 	"math"
 	"math/big"
 	mathrand "math/rand"
+	"bytes"
+	"encoding/base64"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1185,6 +1187,8 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 			}
 		}
 		return strings.Compare(as, bs), nil
+	case KindBytes:
+		return bytes.Compare(a.BytesValue(), b.BytesValue()), nil
 	case KindTime:
 		// For timetz datums (Scale != 0) PostgreSQL compares by UTC time
 		// (local_nanos - offset_nanos), then by offset as tiebreaker.
@@ -4173,6 +4177,34 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewBoolDatum(a.BoolValue() != b.BoolValue()), nil
 		}
 
+	// ── Aggregate state functions for bool_and / bool_or ─────────────────
+	// These are strict (return NULL if either arg is NULL), matching PG's
+	// booland_statefunc / boolor_statefunc internals.
+	case "booland_statefunc":
+		if len(x.Args) == 2 {
+			a, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || a.IsNull() {
+				return NullDatum, nil
+			}
+			b, err2 := evalExpr(x.Args[1], row, ctx)
+			if err2 != nil || b.IsNull() {
+				return NullDatum, nil
+			}
+			return NewBoolDatum(a.BoolValue() && b.BoolValue()), nil
+		}
+	case "boolor_statefunc":
+		if len(x.Args) == 2 {
+			a, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || a.IsNull() {
+				return NullDatum, nil
+			}
+			b, err2 := evalExpr(x.Args[1], row, ctx)
+			if err2 != nil || b.IsNull() {
+				return NullDatum, nil
+			}
+			return NewBoolDatum(a.BoolValue() || b.BoolValue()), nil
+		}
+
 	case "array_subscript":
 		// Array element access: arr[idx] (1-based). Used for SQL a[N] syntax. M0097-0003.
 		// Returns the element as its natural type (int for integer arrays, else text).
@@ -5881,6 +5913,206 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		result := mean + stddev*z
 		return NewStringDatum(strconv.FormatFloat(result, 'f', 15, 64)), nil
 
+	// ── float8 aggregate state functions ─────────────────────────────────
+	// These back stddev, variance, regression aggregates in PostgreSQL.
+	// State arrays are represented as PostgreSQL array literals: {n1,n2,...}
+
+	case "float8_accum":
+		// float8_accum(float8[], float8) -> float8[]
+		// Accumulates one value into a 3-element Youngs-Cramer state {N, Sx, Sxx}.
+		if len(x.Args) == 2 {
+			stateD, e1 := evalExpr(x.Args[0], row, ctx)
+			valD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil || valD.IsNull() {
+				return NullDatum, nil
+			}
+			var state [3]float64
+			if !stateD.IsNull() {
+				elems := parseTextArray(stateD.StringValue())
+				if len(elems) == 3 {
+					for i := range state {
+						state[i], _ = strconv.ParseFloat(elems[i], 64)
+					}
+				}
+			}
+			newval, _ := strconv.ParseFloat(valD.Format(), 64)
+			nOld := state[0]
+			sxOld := state[1]
+			sxxOld := state[2]
+			n := nOld + 1
+			sx := sxOld + newval
+			var sxx float64
+			if nOld > 0 {
+				tmp := newval*n - sx
+				sxx = sxxOld + tmp*tmp/(n*nOld)
+			} else {
+				if math.IsInf(newval, 0) || math.IsNaN(newval) {
+					sxx = math.NaN()
+				} else {
+					sxx = 0
+				}
+			}
+			parts := []string{
+				strconv.FormatFloat(n, 'g', -1, 64),
+				strconv.FormatFloat(sx, 'g', -1, 64),
+				strconv.FormatFloat(sxx, 'g', -1, 64),
+			}
+			return NewStringDatum("{" + strings.Join(parts, ",") + "}"), nil
+		}
+
+	case "float8_regr_accum":
+		// float8_regr_accum(float8[], float8, float8) -> float8[]
+		// Accumulates one (Y, X) pair into a 6-element regression state
+		// {N, Sx, Sxx, Sy, Syy, Sxy}.
+		if len(x.Args) == 3 {
+			stateD, e1 := evalExpr(x.Args[0], row, ctx)
+			yD, e2 := evalExpr(x.Args[1], row, ctx)
+			xD, e3 := evalExpr(x.Args[2], row, ctx)
+			if e1 != nil || e2 != nil || e3 != nil || yD.IsNull() || xD.IsNull() {
+				return NullDatum, nil
+			}
+			var state [6]float64
+			if !stateD.IsNull() {
+				elems := parseTextArray(stateD.StringValue())
+				if len(elems) == 6 {
+					for i := range state {
+						state[i], _ = strconv.ParseFloat(elems[i], 64)
+					}
+				}
+			}
+			yVal, _ := strconv.ParseFloat(yD.Format(), 64)
+			xVal, _ := strconv.ParseFloat(xD.Format(), 64)
+			nOld := state[0]
+			sxOld, sxxOld := state[1], state[2]
+			syOld, syyOld, sxyOld := state[3], state[4], state[5]
+			n := nOld + 1
+			sx := sxOld + xVal
+			sy := syOld + yVal
+			var sxx, syy, sxy float64
+			if nOld > 0 {
+				tmpX := xVal*n - sx
+				tmpY := yVal*n - sy
+				scale := 1.0 / (n * nOld)
+				sxx = sxxOld + tmpX*tmpX*scale
+				syy = syyOld + tmpY*tmpY*scale
+				sxy = sxyOld + tmpX*tmpY*scale
+			}
+			parts := []string{
+				strconv.FormatFloat(n, 'g', -1, 64),
+				strconv.FormatFloat(sx, 'g', -1, 64),
+				strconv.FormatFloat(sxx, 'g', -1, 64),
+				strconv.FormatFloat(sy, 'g', -1, 64),
+				strconv.FormatFloat(syy, 'g', -1, 64),
+				strconv.FormatFloat(sxy, 'g', -1, 64),
+			}
+			return NewStringDatum("{" + strings.Join(parts, ",") + "}"), nil
+		}
+
+	case "float8_combine":
+		// float8_combine(float8[], float8[]) -> float8[]
+		// Merges two 3-element Youngs-Cramer states {N, Sx, Sxx}.
+		if len(x.Args) == 2 {
+			s1D, e1 := evalExpr(x.Args[0], row, ctx)
+			s2D, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			parse3 := func(d Datum) ([3]float64, bool) {
+				var s [3]float64
+				if d.IsNull() {
+					return s, false
+				}
+				elems := parseTextArray(d.StringValue())
+				if len(elems) != 3 {
+					return s, false
+				}
+				for i := range s {
+					s[i], _ = strconv.ParseFloat(elems[i], 64)
+				}
+				return s, true
+			}
+			st1, ok1 := parse3(s1D)
+			st2, ok2 := parse3(s2D)
+			if !ok1 || st1[0] == 0 {
+				if ok2 {
+					return s2D, nil
+				}
+				return NullDatum, nil
+			}
+			if !ok2 || st2[0] == 0 {
+				return s1D, nil
+			}
+			n1, sx1, sxx1 := st1[0], st1[1], st1[2]
+			n2, sx2, sxx2 := st2[0], st2[1], st2[2]
+			n := n1 + n2
+			sx := sx1 + sx2
+			tmp := sx1/n1 - sx2/n2
+			sxx := sxx1 + sxx2 + n1*n2*tmp*tmp/n
+			parts := []string{
+				strconv.FormatFloat(n, 'g', -1, 64),
+				strconv.FormatFloat(sx, 'g', -1, 64),
+				strconv.FormatFloat(sxx, 'g', -1, 64),
+			}
+			return NewStringDatum("{" + strings.Join(parts, ",") + "}"), nil
+		}
+
+	case "float8_regr_combine":
+		// float8_regr_combine(float8[], float8[]) -> float8[]
+		// Merges two 6-element regression states {N, Sx, Sxx, Sy, Syy, Sxy}.
+		if len(x.Args) == 2 {
+			s1D, e1 := evalExpr(x.Args[0], row, ctx)
+			s2D, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			parse6 := func(d Datum) ([6]float64, bool) {
+				var s [6]float64
+				if d.IsNull() {
+					return s, false
+				}
+				elems := parseTextArray(d.StringValue())
+				if len(elems) != 6 {
+					return s, false
+				}
+				for i := range s {
+					s[i], _ = strconv.ParseFloat(elems[i], 64)
+				}
+				return s, true
+			}
+			st1, ok1 := parse6(s1D)
+			st2, ok2 := parse6(s2D)
+			if !ok1 || st1[0] == 0 {
+				if ok2 {
+					return s2D, nil
+				}
+				return NullDatum, nil
+			}
+			if !ok2 || st2[0] == 0 {
+				return s1D, nil
+			}
+			n1, sx1, sxx1 := st1[0], st1[1], st1[2]
+			sy1, syy1, sxy1 := st1[3], st1[4], st1[5]
+			n2, sx2, sxx2 := st2[0], st2[1], st2[2]
+			sy2, syy2, sxy2 := st2[3], st2[4], st2[5]
+			n := n1 + n2
+			sx := sx1 + sx2
+			sy := sy1 + sy2
+			tmpX := sx1/n1 - sx2/n2
+			tmpY := sy1/n1 - sy2/n2
+			sxx := sxx1 + sxx2 + n1*n2*tmpX*tmpX/n
+			syy := syy1 + syy2 + n1*n2*tmpY*tmpY/n
+			sxy := sxy1 + sxy2 + n1*n2*tmpX*tmpY/n
+			parts := []string{
+				strconv.FormatFloat(n, 'g', -1, 64),
+				strconv.FormatFloat(sx, 'g', -1, 64),
+				strconv.FormatFloat(sxx, 'g', -1, 64),
+				strconv.FormatFloat(sy, 'g', -1, 64),
+				strconv.FormatFloat(syy, 'g', -1, 64),
+				strconv.FormatFloat(sxy, 'g', -1, 64),
+			}
+			return NewStringDatum("{" + strings.Join(parts, ",") + "}"), nil
+		}
+
 	// ── Type conversion functions (M0097-0005) ────────────────────────────
 	case "to_number":
 		// to_number(text, fmt) → numeric — simplified: parse as numeric
@@ -5908,7 +6140,63 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// encode(bytea, format) — stub: return empty string
 		return NewStringDatum(""), nil
 	case "decode":
-		return NullDatum, nil
+		// decode(text, format) -> bytea. Formats: hex, escape, base64.
+		if len(x.Args) != 2 {
+			return NullDatum, nil
+		}
+		src, serr := evalExpr(x.Args[0], row, ctx)
+		if serr != nil || src.IsNull() {
+			return NullDatum, nil
+		}
+		fmtArg, ferr := evalExpr(x.Args[1], row, ctx)
+		if ferr != nil || fmtArg.IsNull() {
+			return NullDatum, nil
+		}
+		format := strings.ToLower(strings.TrimSpace(fmtArg.Format()))
+		switch format {
+		case "hex":
+			hexStr := src.Format()
+			// strip optional \x prefix
+			hexStr = strings.TrimPrefix(hexStr, `\x`)
+			b, err := hex.DecodeString(hexStr)
+			if err != nil {
+				return NullDatum, &ExecError{Code: "22023", Message: fmt.Sprintf("invalid hexadecimal data: %v", err)}
+			}
+			return NewBytesDatum(b), nil
+		case "escape":
+			// PostgreSQL escape format: \xxx octal or \\ for backslash
+			s := src.Format()
+			var out []byte
+			for i := 0; i < len(s); {
+				if s[i] == '\\' && i+1 < len(s) {
+					if s[i+1] == '\\' {
+						out = append(out, '\\')
+						i += 2
+					} else if i+3 < len(s) && s[i+1] >= '0' && s[i+1] <= '3' &&
+						s[i+2] >= '0' && s[i+2] <= '7' && s[i+3] >= '0' && s[i+3] <= '7' {
+						v := (s[i+1]-'0')<<6 | (s[i+2]-'0')<<3 | (s[i+3] - '0')
+						out = append(out, v)
+						i += 4
+					} else {
+						out = append(out, s[i])
+						i++
+					}
+				} else {
+					out = append(out, s[i])
+					i++
+				}
+			}
+			return NewBytesDatum(out), nil
+		case "base64":
+			var b []byte
+			b, err := base64.StdEncoding.DecodeString(src.Format())
+			if err != nil {
+				return NullDatum, &ExecError{Code: "22023", Message: fmt.Sprintf("invalid base64 data: %v", err)}
+			}
+			return NewBytesDatum(b), nil
+		default:
+			return NullDatum, &ExecError{Code: "22023", Message: fmt.Sprintf("unrecognized encoding: %q", format)}
+		}
 
 	// ── Misc functions (M0097-0005) ────────────────────────────────────────
 	case "coalesce":
@@ -6842,6 +7130,50 @@ func formatTextArray(elems []string) string {
 	for i, e := range elems {
 		if i > 0 {
 			sb.WriteByte(',')
+		}
+		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes.
+		needsQuote := len(e) == 0
+		if !needsQuote {
+			for _, c := range e {
+				if c == '"' || c == ',' || c == '{' || c == '}' || c == '\\' || c == ' ' || c == '\t' {
+					needsQuote = true
+					break
+				}
+			}
+		}
+		if needsQuote {
+			sb.WriteByte('"')
+			for _, c := range e {
+				if c == '"' || c == '\\' {
+					sb.WriteByte('\\')
+				}
+				sb.WriteRune(c)
+			}
+			sb.WriteByte('"')
+		} else {
+			sb.WriteString(e)
+		}
+	}
+	sb.WriteByte('}')
+	return sb.String()
+}
+
+// formatTextArrayWithNulls renders a PostgreSQL text-array literal where
+// some elements may be NULL. NULL elements are rendered as the unquoted
+// token NULL (PostgreSQL array literal syntax: {1,NULL,3}).
+func formatTextArrayWithNulls(elems []string, nulls []bool) string {
+	if len(elems) == 0 {
+		return "{}"
+	}
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, e := range elems {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		if i < len(nulls) && nulls[i] {
+			sb.WriteString("NULL")
+			continue
 		}
 		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes.
 		needsQuote := len(e) == 0
