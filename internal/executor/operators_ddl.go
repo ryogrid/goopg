@@ -1067,7 +1067,15 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				}
 			}
 			if s.Behavior == parser.DropCascade {
-				for _, child := range im.InheritanceChildren(tbl.OID) {
+				inheritChildren := im.InheritanceChildren(tbl.OID)
+				if len(inheritChildren) == 1 {
+					childName := parser.ObjectName{Schema: inheritChildren[0].Schema, Name: inheritChildren[0].Name}
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to table %s", childName.String()))
+				} else if len(inheritChildren) > 1 {
+					// Match PostgreSQL format: summary NOTICE + DETAIL for each child.
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to %d other objects", len(inheritChildren)))
+				}
+				for _, child := range inheritChildren {
 					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
 					if err := o.dropTableByRef(childName, child); err != nil {
 						return err

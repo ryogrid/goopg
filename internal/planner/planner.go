@@ -4266,6 +4266,19 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			return AggregateCall{}, ferr
 		}
 	}
+	// Validate WITHIN GROUP for non-ordered-set aggregates early (before arg checks).
+	// This fires before the zero-arg early return so sum() WITHIN GROUP gives the right error. M0097-0035.
+	if len(fc.WithinGroup) > 0 {
+		switch name {
+		case "percentile_cont", "percentile_disc", "mode",
+			"rank", "dense_rank", "cume_dist", "percent_rank":
+			// OK — ordered-set aggregates; validation continues below.
+		default:
+			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
+				Message: fmt.Sprintf("%s is not an ordered-set aggregate, so it cannot have WITHIN GROUP", name)}
+		}
+	}
+
 	if fc.Star {
 		// User-defined star aggregates (e.g. newcnt(*)).
 		if name != "count" {
