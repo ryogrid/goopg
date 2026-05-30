@@ -856,10 +856,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 
 	var agg *aggregateSurface
 	savedBindings := ctx.bindings
-	if needsAggregateStage(s) {
+	if needsAggregateStage(s, cat) {
 		var having Expr
 		var err error
-		node, ctx, agg, having, err = buildAggregateStage(s, node, ctx)
+		node, ctx, agg, having, err = buildAggregateStage(s, node, ctx, cat)
 		if err != nil {
 			return nil, err
 		}
@@ -3165,6 +3165,8 @@ type aggregateSurface struct {
 	// funcDepCols maps input column index → output schema index for columns
 	// that are functionally determined by the GROUP BY key. M0097-0003.
 	funcDepCols map[int]int
+	// cat is the catalog, used to look up user-defined aggregates.
+	cat catalog.Catalog
 }
 
 type windowBinding struct {
@@ -3179,12 +3181,15 @@ type windowSurface struct {
 	windowByKey map[string]windowBinding
 }
 
-func needsAggregateStage(s *parser.SelectStmt) bool {
+func needsAggregateStage(s *parser.SelectStmt, cat catalog.Catalog) bool {
 	if len(s.GroupBy) > 0 {
 		return true
 	}
+	hasAgg := func(e parser.Expr) bool {
+		return exprHasAggregate(e) || exprHasUserAggregate(e, cat)
+	}
 	for _, t := range s.Targets {
-		if exprHasAggregate(t.Expr) {
+		if hasAgg(t.Expr) {
 			return true
 		}
 	}
@@ -3194,7 +3199,7 @@ func needsAggregateStage(s *parser.SelectStmt) bool {
 		return true
 	}
 	for _, sb := range s.OrderBy {
-		if exprHasAggregate(sb.Expr) {
+		if hasAgg(sb.Expr) {
 			return true
 		}
 	}
@@ -3476,7 +3481,7 @@ func walkExprForWindows(e parser.Expr, fn func(*parser.FuncCall) error) error {
 	return nil
 }
 
-func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext) (Node, *resolveContext, *aggregateSurface, Expr, error) {
+func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext, cat catalog.Catalog) (Node, *resolveContext, *aggregateSurface, Expr, error) {
 	groupExprs := make([]Expr, 0, len(s.GroupBy))
 	groupByExpr := map[string]int{}
 	groupByInputCol := map[int]int{}
@@ -3510,7 +3515,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		outputSchema = append(outputSchema, SchemaColumn{Name: groupExprName(r), Type: exprType(r)})
 	}
 
-	aggCalls, err := collectAggregateCalls(s)
+	aggCalls, err := collectAggregateCalls(s, cat)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -3521,7 +3526,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		if _, exists := aggByKey[k]; exists {
 			continue
 		}
-		pa, err := buildAggregateCall(fc, inputCtx)
+		pa, err := buildAggregateCall(fc, inputCtx, cat)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
@@ -3548,6 +3553,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		aggregateByKey:  aggByKey,
 		node:            aggNode,
 		funcDepCols:     map[int]int{},
+		cat:             cat,
 	}
 
 	var having Expr
@@ -3785,7 +3791,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		if x.Over != nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
 		}
-		if isAggregateFunc(x) {
+		if isAggregateFunc(x) || isUserAggregateFunc(x, agg.cat) {
 			k := aggregateCallKey(x)
 			b, ok := agg.aggregateByKey[k]
 			if !ok {
@@ -4053,12 +4059,12 @@ func resolveTargetsAfterWindow(targets []parser.ResTarget, win *windowSurface) (
 	return out, schema, nil
 }
 
-func collectAggregateCalls(s *parser.SelectStmt) ([]*parser.FuncCall, error) {
+func collectAggregateCalls(s *parser.SelectStmt, cat catalog.Catalog) ([]*parser.FuncCall, error) {
 	seen := map[string]struct{}{}
 	out := make([]*parser.FuncCall, 0)
 	visit := func(e parser.Expr) error {
 		return walkExpr(e, func(fc *parser.FuncCall) error {
-			if !isAggregateFunc(fc) {
+			if !isAggregateFunc(fc) && !isUserAggregateFunc(fc, cat) {
 				return nil
 			}
 			if len(fc.Args) > 0 {
@@ -4170,6 +4176,34 @@ func exprHasAggregate(e parser.Expr) bool {
 	return found
 }
 
+// isUserAggregateFunc returns true if fc is a user-defined aggregate registered in cat.
+func isUserAggregateFunc(fc *parser.FuncCall, cat catalog.Catalog) bool {
+	if fc.Over != nil {
+		return false // window functions are not aggregates
+	}
+	if cat == nil {
+		return false
+	}
+	_, ok := cat.LookupUserAggregateByName(fc.Name.Name)
+	return ok
+}
+
+// exprHasUserAggregate returns true if the expression contains a call to a
+// user-defined aggregate registered in cat.
+func exprHasUserAggregate(e parser.Expr, cat catalog.Catalog) bool {
+	if cat == nil {
+		return false
+	}
+	found := false
+	_ = walkExpr(e, func(fc *parser.FuncCall) error {
+		if isUserAggregateFunc(fc, cat) {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
 func parserExprHasWindowFunc(e parser.Expr) bool {
 	found := false
 	_ = walkExprForWindows(e, func(fc *parser.FuncCall) error {
@@ -4208,7 +4242,7 @@ func aggregateCallKey(fc *parser.FuncCall) string {
 	return b.String()
 }
 
-func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (AggregateCall, error) {
+func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catalog.Catalog) (AggregateCall, error) {
 	name := strings.ToLower(fc.Name.Name)
 	// Resolve the FILTER (WHERE ...) predicate up front so every return path
 	// below carries it — including count(*) and zero-arg aggregates, which
@@ -4223,7 +4257,21 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 		}
 	}
 	if fc.Star {
-		if name != "count" || len(fc.Args) != 0 {
+		// User-defined star aggregates (e.g. newcnt(*)).
+		if name != "count" {
+			if cat != nil {
+				if ua, ok := cat.LookupUserAggregateByName(name); ok {
+					return AggregateCall{
+						pos:      fc.Pos(),
+						Name:     name,
+						Star:     true,
+						Distinct: fc.Distinct,
+						Type:     catalog.Type{Name: ua.SType},
+						Filter:   filterExpr,
+						UserAgg:  ua,
+					}, nil
+				}
+			}
 			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: "only count(*) is supported with * aggregate arguments"}
 		}
 		return AggregateCall{
@@ -4283,6 +4331,49 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 		"covar_pop", "covar_samp", "corr":
 		outType = catalog.Type{Name: "float8"}
 	default:
+		// Check for user-defined aggregate in catalog.
+		if cat != nil {
+			if ua, ok := cat.LookupUserAggregateByName(name); ok {
+				// Determine return type: if there's a finalfunc, output type is
+				// typically numeric/unknown; if no finalfunc, use the stype.
+				if ua.FinalFunc != "" {
+					// finalfunc determines output — use "numeric" as a safe default.
+					outType = catalog.Type{Name: "numeric"}
+				} else {
+					outType = catalog.Type{Name: ua.SType}
+				}
+				// Resolve ORDER BY inside the aggregate call.
+				var orderByKeys []SortKey
+				for _, sb := range fc.OrderBy {
+					e, serr := resolveExpr(sb.Expr, inputCtx)
+					if serr != nil {
+						return AggregateCall{}, serr
+					}
+					orderByKeys = append(orderByKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
+				}
+				// Resolve extra args beyond the second (e.g. aggfns(a,b,c) has c as ExtraArgs[0]).
+				var extraArgs []Expr
+				for i := 2; i < len(fc.Args); i++ {
+					ea, earr := resolveExpr(fc.Args[i], inputCtx)
+					if earr != nil {
+						return AggregateCall{}, earr
+					}
+					extraArgs = append(extraArgs, ea)
+				}
+				return AggregateCall{
+					pos:       fc.Pos(),
+					Name:      name,
+					Arg:       argExpr,
+					Arg2:      argExpr2,
+					ExtraArgs: extraArgs,
+					Distinct:  fc.Distinct,
+					Type:      outType,
+					Filter:    filterExpr,
+					OrderBy:   orderByKeys,
+					UserAgg:   ua,
+				}, nil
+			}
+		}
 		// Extended aggregates (M0097-0007): accept but return null/stub type.
 		outType = catalog.Type{Name: "numeric"}
 	}
@@ -5884,6 +5975,13 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	// Matches FigureColname() for ExtractExpr nodes. M0097-0004.
 	if _, ok := e.(*ExtractExpr); ok {
 		return "extract", exprType(e)
+	}
+	// Propagate the inner query's first output column name so that
+	// `(SELECT min(x) FROM t)` renders as "min" not "?column?". M0097-0035.
+	if sq, ok := e.(*SubqueryExpr); ok && sq.Plan != nil {
+		if sch := sq.Plan.Output(); len(sch) > 0 && sch[0].Name != "" && sch[0].Name != "?column?" {
+			return sch[0].Name, sch[0].Type
+		}
 	}
 	return "?column?", exprType(e)
 }

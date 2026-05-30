@@ -1,3 +1,4 @@
+
 # Agent Build Instructions — goopg
 
 `goopg` is a from-scratch Go reimplementation of PostgreSQL. The project
@@ -42,18 +43,18 @@ milestones are tackled. Do not create empty stubs ahead of time.
 ## Build
 
 ```bash
-GOEXPERIMENT=greenteagc go build ./...                       # whole module
-GOEXPERIMENT=greenteagc go build -o bin/goopg ./cmd/goopg    # produce the binary explicitly
+go build ./...                       # whole module
+go build -o bin/goopg ./cmd/goopg    # produce the binary explicitly
 ```
 
 ## Test
 
 ```bash
-GOEXPERIMENT=greenteagc go test ./...                                   # full suite
-GOEXPERIMENT=greenteagc go test -run <Pattern> ./internal/<pkg>         # focused
-GOEXPERIMENT=greenteagc go test -race ./...                             # race detector — preferred when
+go test ./...                                   # full suite
+go test -run <Pattern> ./internal/<pkg>         # focused
+go test -race ./...                             # race detector — preferred when
                                                 # touching concurrency code
-GOEXPERIMENT=greenteagc go test -cover ./...                            # coverage summary
+go test -cover ./...                            # coverage summary
 
 # Ralph loop state consistency guard (run before final status block)
 make ralph-state-guard
@@ -71,13 +72,13 @@ several minutes. Do NOT include them in the default full-suite run.
 
 ```bash
 # Run all ported PostgreSQL oracle TAP tests (slow; requires client tools)
-GOEXPERIMENT=greenteagc go test -v -run TestPort_ ./internal/testport/
+go test -v -run TestPort_ ./internal/testport/
 
 # Run one specific oracle test
-GOEXPERIMENT=greenteagc go test -v -run TestPort_Psql001Basic ./internal/testport/
+go test -v -run TestPort_Psql001Basic ./internal/testport/
 
 # Run all testport tests (oracle TAP + integration suites)
-GOEXPERIMENT=greenteagc go test -v -tags integration ./internal/testport/
+go test -v -tags integration ./internal/testport/
 ```
 
 The current ported-test inventory and deferral status is in

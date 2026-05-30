@@ -186,9 +186,93 @@ func (p *parser) parseCreateAggregateTail(pos int) (Stmt, error) {
 		return nil, err
 	}
 	stmt.Name = name
-	// "(key = value, …)" option list.
+
+	// Support two forms:
+	//   New style: aggregate_name(type1, type2, ...) (sfunc=F, stype=S, ...)
+	//   Old style: aggregate_name (sfunc=F, basetype=T, stype=S, ...)
+	//
+	// Distinguish by peeking ahead in the first '(' block: if none of the
+	// tokens before the closing ')' has '=' right after it, it's an arg-type
+	// list (new style). Otherwise it's an old-style option list.
 	if p.cur().Kind != TokenSymbol || p.cur().Value != "(" {
 		return nil, p.errSyntaxAtCur()
+	}
+
+	// Peek ahead to detect which style.
+	isNewStyle := p.aggregateIsNewStyle()
+
+	if isNewStyle {
+		// New style: parse "(type1, type2, ...)" as arg types.
+		p.advance() // consume "("
+		var argTypes []string
+		for p.cur().Kind != TokenSymbol || p.cur().Value != ")" {
+			if p.cur().Kind == TokenEOF {
+				break
+			}
+			// Collect type tokens until ',' or ')'.
+			tok := p.cur()
+			p.advance()
+			argTypes = append(argTypes, strings.ToLower(tok.Value))
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+				p.advance()
+			}
+		}
+		if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+			p.advance() // consume ")"
+		}
+		if len(argTypes) > 0 {
+			stmt.HasBaseType = true
+			stmt.BaseType = argTypes[0]
+		}
+		// For zero-arg new-style: CREATE AGGREGATE name (*) (...)
+		// The arg list was just "*".
+		if len(argTypes) == 1 && argTypes[0] == "*" {
+			stmt.HasBaseType = true
+			stmt.BaseType = "*"
+		}
+		// Now parse the options block "(sfunc=F, stype=S, ...)".
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			if err := p.parseAggregateOptions(stmt); err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		// Old style: parse "(basetype=T, sfunc=F, stype=S, ...)".
+		if err := p.parseAggregateOptions(stmt); err != nil {
+			return nil, err
+		}
+	}
+	return stmt, nil
+}
+
+// aggregateIsNewStyle peeks ahead to determine if the current '(' block is
+// a new-style arg-type list (no '=' tokens) or an old-style option list.
+// Does NOT consume any tokens.
+func (p *parser) aggregateIsNewStyle() bool {
+	// Scan forward from current position looking for '='.
+	// If we find '=' before the matching ')', it's old style.
+	depth := 0
+	for i := p.idx; i < len(p.tokens); i++ {
+		tok := p.tokens[i]
+		if tok.Kind == TokenSymbol && tok.Value == "(" {
+			depth++
+		} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+			depth--
+			if depth == 0 {
+				break
+			}
+		} else if depth == 1 && tok.Kind == TokenOperator && tok.Value == "=" {
+			return false // found '=' inside first-level parens → old style
+		}
+	}
+	return true // no '=' found → new style
+}
+
+// parseAggregateOptions parses the "(key=value, ...)" option list for a
+// CREATE AGGREGATE statement, consuming the enclosing parentheses.
+func (p *parser) parseAggregateOptions(stmt *CreateAggregateStmt) error {
+	if p.cur().Kind != TokenSymbol || p.cur().Value != "(" {
+		return p.errSyntaxAtCur()
 	}
 	p.advance() // consume "("
 	for p.cur().Kind != TokenSymbol || p.cur().Value != ")" {
@@ -206,14 +290,24 @@ func (p *parser) parseCreateAggregateTail(pos int) (Stmt, error) {
 				p.advance()
 			}
 			key := strings.ToLower(keyTok.Value)
+			// valStr is the raw value; for string literals the lexer stores
+			// the literal without surrounding quotes already.
+			valStr := valTok.Value
 			switch key {
 			case "basetype":
 				stmt.HasBaseType = true
-				stmt.BaseType = strings.ToLower(valTok.Value)
-			case "stype":
-				stmt.SType = strings.ToLower(valTok.Value)
+				stmt.BaseType = strings.ToLower(valStr)
+			case "stype", "stype1":
+				stmt.SType = strings.ToLower(valStr)
+			case "sfunc", "sfunc1":
+				stmt.SFunc = strings.ToLower(valStr)
 			case "finalfunc":
-				stmt.FinalFunc = strings.ToLower(valTok.Value)
+				stmt.FinalFunc = strings.ToLower(valStr)
+			case "initcond", "initcond1":
+				stmt.InitCond = valStr
+			// Accepted but ignored options.
+			case "parallel", "sspace":
+				// ignore
 			}
 		}
 		// Skip optional comma.
@@ -224,7 +318,7 @@ func (p *parser) parseCreateAggregateTail(pos int) (Stmt, error) {
 	if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
 		p.advance() // consume ")"
 	}
-	return stmt, nil
+	return nil
 }
 
 // parseCreateOpClassTail picks up after "CREATE OPERATOR CLASS".
@@ -1732,6 +1826,11 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 				p.advance()
 			}
 		}
+	}
+	// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+ unique index option) — accept and discard.
+	if p.acceptIdentKeyword("nulls") {
+		_ = p.acceptKeyword(KwNot)
+		_ = p.acceptIdentKeyword("distinct")
 	}
 	// Optional WHERE predicate (partial index) — parse and discard.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhere {

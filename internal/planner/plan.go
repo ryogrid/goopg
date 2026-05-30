@@ -637,14 +637,20 @@ type AggregateCall struct {
 	Name     string
 	Arg      Expr // nil for count(*)
 	Arg2     Expr // second arg for two-argument aggregates (regr_*, covar_*, corr)
-	Star     bool
-	Distinct bool
-	Type     catalog.Type
+	// ExtraArgs holds the 3rd and subsequent arguments for user-defined
+	// multi-arg aggregates (e.g. aggfns(a, b, c) where Arg=a, Arg2=b, ExtraArgs=[c]).
+	ExtraArgs []Expr
+	Star      bool
+	Distinct  bool
+	Type      catalog.Type
 	// Filter is the resolved FILTER (WHERE ...) predicate. M0097-0007.
 	Filter Expr
 	// OrderBy is the ORDER BY clause inside the aggregate call, e.g.
 	// array_agg(x ORDER BY y). Only used for ordering-sensitive aggregates.
 	OrderBy []SortKey
+	// UserAgg is non-nil for user-defined aggregates registered via
+	// CREATE AGGREGATE. The executor uses it to call sfunc/finalfunc.
+	UserAgg *catalog.UserAggregate
 }
 
 func (a AggregateCall) Pos() int { return a.pos }

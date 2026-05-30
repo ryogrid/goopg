@@ -324,6 +324,11 @@ type Catalog interface {
 	// state. Implementations may return a process-local registry
 	// (current InMemory behaviour) or a future on-disk-backed one.
 	Routines() *Routines
+	// RegisterUserAggregate registers a user-defined aggregate in the catalog.
+	RegisterUserAggregate(agg *UserAggregate)
+	// LookupUserAggregateByName looks up a user-defined aggregate by lower-case name.
+	// Returns nil, false if not found.
+	LookupUserAggregateByName(name string) (*UserAggregate, bool)
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -383,6 +388,10 @@ type InMemory struct {
 	// Only FUNCTION 2 (hash extended) entries are registered; used by
 	// satisfies_hash_partition. M0097-0027.
 	opClassHashFuncs map[string]string
+
+	// userAggregates maps lower-case aggregate name → UserAggregate for
+	// user-defined aggregates registered via CREATE AGGREGATE.
+	userAggregates map[string]*UserAggregate
 }
 
 // EnumValue is one label in a user-defined enum type together with its sort
@@ -407,6 +416,17 @@ type Domain struct {
 	OID     uint32
 	Base    Type // resolved base type
 	NotNull bool
+}
+
+// UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
+// It is stored in InMemory.userAggregates and looked up by lower-case name.
+type UserAggregate struct {
+	Name      string   // lower-case aggregate name
+	ArgTypes  []string // base argument type names (may be empty for zero-arg like count(*))
+	SType     string   // state type name
+	SFunc     string   // state transition function name
+	FinalFunc string   // final function name (may be empty)
+	InitCond  string   // initial condition string (may be empty)
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -467,9 +487,26 @@ func NewInMemory() *InMemory {
 		compositeTypeNames:  make(map[string]bool),
 		constraintViewDeps:  make(map[string][]string),
 		opClassHashFuncs:    make(map[string]string),
+		userAggregates:      make(map[string]*UserAggregate),
 	}
 	c.registerSystemTables()
 	return c
+}
+
+// RegisterUserAggregate registers a user-defined aggregate in the catalog.
+func (c *InMemory) RegisterUserAggregate(agg *UserAggregate) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.userAggregates[strings.ToLower(agg.Name)] = agg
+}
+
+// LookupUserAggregateByName looks up a user-defined aggregate by name (case-insensitive).
+// Returns nil, false if not found.
+func (c *InMemory) LookupUserAggregateByName(name string) (*UserAggregate, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	a, ok := c.userAggregates[strings.ToLower(name)]
+	return a, ok
 }
 
 // SetDBOID overrides the database OID used for RelFileNode generation.

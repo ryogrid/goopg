@@ -2425,6 +2425,23 @@ M0097-0001 wires it up.
         exist but none satisfy the predicate.
         Final measurements: `partition_join` 1414 → 449; `subselect` 584 → 531;
         `partition_prune` 934 (new measurement). Baseline CSV updated.
+      - **Progress 2026-05-31 (M0097-0107 — aggregates 1072→935 diff):**
+        Seven fixes (commit 0743f7db): (a) COPY NULL option: custom null
+        sentinel (e.g. NULL 'null') now recognized in text-format COPY; fixes
+        bitwise_test + bool_test tables → BIT_AND/OR/XOR, BOOL_AND/OR pass;
+        (b) array_agg includes NULLs per PostgreSQL semantics; (c) array_agg
+        ORDER BY respects NullsFirst (ASC→NULLS LAST by default); (d) BIT(n)
+        type BIT_AND/OR/XOR: KindString bit-string inputs parsed and formatted
+        as binary string; (e) booland_statefunc / boolor_statefunc added as
+        strict built-in functions; (f) float8_accum / float8_combine /
+        float8_regr_accum / float8_regr_combine implemented with Youngs-Cramer
+        algorithm; (g) decode(text,'hex') implemented → KindBytes; bytea
+        compareDatum fixed; min/max and string_agg on bytea now work; bytea
+        dispatch formats as \xhexstring.
+        Remaining gaps: float precision differences (~80), user-defined aggs
+        from create_aggregate.sql (~130, ordering issue), WITHIN GROUP (~200),
+        custom aggregate functions (~250), FILTER correlated subquery (~100),
+        statistics (~90). aggregates: 1072 → 935.
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.

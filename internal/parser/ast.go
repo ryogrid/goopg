@@ -1149,7 +1149,9 @@ type CreateAggregateStmt struct {
 	HasBaseType bool
 	BaseType    string // e.g. "int4"
 	SType       string // state type (e.g. "int4")
+	SFunc       string // state transition function name
 	FinalFunc   string // final function name
+	InitCond    string // initial condition string (e.g. "0" or "{0,0}")
 }
 
 func (s *CreateAggregateStmt) Pos() int  { return s.pos }

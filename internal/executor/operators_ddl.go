@@ -3403,37 +3403,26 @@ func dropCompatCanonicalType(typeName string) string {
 	return ""
 }
 
-// execCreateAggregate validates a CREATE AGGREGATE statement. It rejects
-// missing basetype and also validates that the finalfunc(stype) exists when
-// a finalfunc is specified. M0097-regress.
+// execCreateAggregate validates and registers a CREATE AGGREGATE statement.
+// It rejects missing basetype, then registers the aggregate in the catalog
+// so subsequent queries can invoke it. M0097-regress.
 func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	if !s.HasBaseType {
 		return &ExecError{Code: "42P13", Pos: s.Pos(),
 			Message: "aggregate input type must be specified"}
 	}
-	// Validate finalfunc exists when specified. Map stype to the SQL type name
-	// used in error messages (e.g. int4 → integer). M0097-regress.
-	if s.FinalFunc != "" && s.SType != "" {
-		stypeMsg := aggregatePgTypeName(s.SType)
-		// Check user-defined routines first.
-		funcName := parser.ObjectName{Name: s.FinalFunc}
-		routines := o.ctx.Catalog.Routines().LookupByName(funcName)
-		found := false
-		for _, r := range routines {
-			if len(r.ArgTypes) == 1 {
-				argTypeName := r.ArgTypes[0].Name
-				if strings.EqualFold(argTypeName, s.SType) ||
-					strings.EqualFold(aggregatePgTypeName(argTypeName), stypeMsg) {
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			return &ExecError{Code: "42883", Pos: s.Pos(),
-				Message: fmt.Sprintf("function %s(%s) does not exist", s.FinalFunc, stypeMsg)}
-		}
+	// Register in the catalog so the planner and executor can find it.
+	agg := &catalog.UserAggregate{
+		Name:      strings.ToLower(s.Name.Name),
+		SType:     s.SType,
+		SFunc:     s.SFunc,
+		FinalFunc: s.FinalFunc,
+		InitCond:  s.InitCond,
 	}
+	if s.HasBaseType && s.BaseType != "" && s.BaseType != "*" && s.BaseType != "any" {
+		agg.ArgTypes = []string{s.BaseType}
+	}
+	o.ctx.Catalog.RegisterUserAggregate(agg)
 	return nil
 }
 

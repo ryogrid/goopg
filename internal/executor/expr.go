@@ -4367,9 +4367,34 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, err
 			}
 			if v.IsNull() {
-				sbRow.WriteString("NULL")
+				// PostgreSQL row constructor: NULL elements appear as empty fields.
+				// e.g. ROW(0,NULL,NULL) → "(0,,)" matching composite type display.
 			} else {
-				sbRow.WriteString(v.Format())
+				s := v.Format()
+				// Quote values containing commas, parens, quotes, backslashes, spaces.
+				needsQ := false
+				if s == "" {
+					needsQ = true
+				} else {
+					for _, c := range s {
+						if c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == ' ' || c == '\t' {
+							needsQ = true
+							break
+						}
+					}
+				}
+				if needsQ {
+					sbRow.WriteByte('"')
+					for _, c := range s {
+						if c == '"' || c == '\\' {
+							sbRow.WriteByte('\\')
+						}
+						sbRow.WriteRune(c)
+					}
+					sbRow.WriteByte('"')
+				} else {
+					sbRow.WriteString(s)
+				}
 			}
 		}
 		sbRow.WriteByte(')')
@@ -6111,6 +6136,123 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				strconv.FormatFloat(sxy, 'g', -1, 64),
 			}
 			return NewStringDatum("{" + strings.Join(parts, ",") + "}"), nil
+		}
+
+	// ── Array functions ──────────────────────────────────────────────────
+
+	case "array_append":
+		// array_append(anyarray, anyelement) → anyarray
+		// Appends element to the end of an array. M0097-0035.
+		if len(x.Args) == 2 {
+			arrD, e1 := evalExpr(x.Args[0], row, ctx)
+			elemD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			var elems []string
+			if !arrD.IsNull() {
+				elems = parseTextArray(arrD.StringValue())
+			}
+			var elemStr string
+			if elemD.IsNull() {
+				elemStr = "NULL"
+			} else {
+				elemStr = elemD.Format()
+			}
+			elems = append(elems, elemStr)
+			return NewStringDatum(formatTextArray(elems)), nil
+		}
+
+	case "array_prepend":
+		// array_prepend(anyelement, anyarray) → anyarray
+		if len(x.Args) == 2 {
+			elemD, e1 := evalExpr(x.Args[0], row, ctx)
+			arrD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			var elems []string
+			if !arrD.IsNull() {
+				elems = parseTextArray(arrD.StringValue())
+			}
+			var elemStr string
+			if elemD.IsNull() {
+				elemStr = "NULL"
+			} else {
+				elemStr = elemD.Format()
+			}
+			elems = append([]string{elemStr}, elems...)
+			return NewStringDatum(formatTextArray(elems)), nil
+		}
+
+	case "array_cat":
+		// array_cat(anyarray, anyarray) → anyarray
+		if len(x.Args) == 2 {
+			a1, e1 := evalExpr(x.Args[0], row, ctx)
+			a2, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			var elems []string
+			if !a1.IsNull() {
+				elems = append(elems, parseTextArray(a1.StringValue())...)
+			}
+			if !a2.IsNull() {
+				elems = append(elems, parseTextArray(a2.StringValue())...)
+			}
+			return NewStringDatum(formatTextArray(elems)), nil
+		}
+
+	case "array_dims":
+		// array_dims(anyarray) → text — returns '[1:N]' for a 1-D array of N elements.
+		if len(x.Args) == 1 {
+			arrD, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || arrD.IsNull() {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(arrD.StringValue())
+			return NewStringDatum(fmt.Sprintf("[1:%d]", len(elems))), nil
+		}
+
+	case "array_ndims":
+		// array_ndims(anyarray) → int — returns 1 for a 1-D array.
+		if len(x.Args) == 1 {
+			arrD, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || arrD.IsNull() {
+				return NullDatum, nil
+			}
+			_ = parseTextArray(arrD.StringValue())
+			return NewIntDatum(1), nil
+		}
+
+	case "regexp_split_to_array":
+		// regexp_split_to_array(string, pattern [, flags]) → text[]
+		// Splits string by regexp and returns the parts as an array. M0097-0035.
+		if len(x.Args) >= 2 {
+			strD, e1 := evalExpr(x.Args[0], row, ctx)
+			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil || strD.IsNull() || patD.IsNull() {
+				return NullDatum, nil
+			}
+			flags := ""
+			if len(x.Args) >= 3 {
+				flagD, fe := evalExpr(x.Args[2], row, ctx)
+				if fe == nil && !flagD.IsNull() {
+					flags = flagD.StringValue()
+				}
+			}
+			pat := patD.StringValue()
+			// Build RE2 pattern with flags.
+			reStr := pat
+			if strings.Contains(flags, "i") {
+				reStr = "(?i)" + reStr
+			}
+			re, rerr := regexp.Compile(reStr)
+			if rerr != nil {
+				return NullDatum, &ExecError{Code: "2201B", Pos: x.Pos(), Message: fmt.Sprintf("invalid regular expression: %v", rerr)}
+			}
+			parts := re.Split(strD.StringValue(), -1)
+			return NewStringDatum(formatTextArray(parts)), nil
 		}
 
 	// ── Type conversion functions (M0097-0005) ────────────────────────────

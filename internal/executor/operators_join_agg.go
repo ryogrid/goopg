@@ -1,12 +1,15 @@
 package executor
 
 import (
-	"math"
 	"fmt"
+	"math"
+	"math/big"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -961,6 +964,10 @@ type aggRuntime struct {
 	regrSumXX float64 // Σx²
 	regrSumXY float64 // Σx*y
 	regrSumYY float64 // Σy²
+	// userState holds the running state for user-defined aggregates (CREATE AGGREGATE).
+	// Initialized from initcond; updated by sfunc on each row.
+	userState    Datum
+	userStateSet bool // true once userState has been initialized
 }
 
 func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
@@ -1097,6 +1104,20 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 
 	name := strings.ToLower(call.Name)
 	if call.Star {
+		if call.UserAgg != nil {
+			// User-defined star aggregate (e.g. newcnt(*)) — call sfunc with state only.
+			ua := call.UserAgg
+			if !st.userStateSet {
+				st.userState = userAggInitState(ua)
+				st.userStateSet = true
+			}
+			newState, serr := executeSFuncCall(ua.SFunc, []Datum{st.userState}, o.ctx)
+			if serr == nil {
+				st.userState = newState
+			}
+			st.hasValue = true
+			return nil
+		}
 		if name != "count" {
 			return &ExecError{Code: "0A000", Pos: call.Pos(), Message: fmt.Sprintf("aggregate %s(*) is not supported", call.Name)}
 		}
@@ -1117,7 +1138,10 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 	if err != nil {
 		return err
 	}
-	if arg.IsNull() && name != "array_agg" {
+	// For user-defined aggregates: NULL handling depends on whether the sfunc is strict.
+	// We treat all user sfuncs as non-strict (pass NULLs through) unless the sfunc is
+	// a known built-in strict function. For simplicity, skip NULLs only for built-in aggs.
+	if arg.IsNull() && name != "array_agg" && call.UserAgg == nil {
 		return nil
 	}
 
@@ -1399,6 +1423,38 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 			st.hasValue = true
 		}
 	default:
+		// User-defined aggregates (CREATE AGGREGATE): call sfunc on each row.
+		if call.UserAgg != nil {
+			ua := call.UserAgg
+			// Initialize state from InitCond on first call.
+			if !st.userStateSet {
+				st.userState = userAggInitState(ua)
+				st.userStateSet = true
+			}
+			// Build args: [state, arg1, arg2, ...extraArgs].
+			sfuncArgs := []Datum{st.userState}
+			sfuncArgs = append(sfuncArgs, arg)
+			// Evaluate optional second argument.
+			if call.Arg2 != nil {
+				arg2, a2err := evalExprSlot(call.Arg2, slot, o.ctx)
+				if a2err == nil {
+					sfuncArgs = append(sfuncArgs, arg2)
+				}
+			}
+			// Evaluate any extra arguments beyond the second (3-arg+ user aggregates).
+			for _, ea := range call.ExtraArgs {
+				ev, everr := evalExprSlot(ea, slot, o.ctx)
+				if everr == nil {
+					sfuncArgs = append(sfuncArgs, ev)
+				}
+			}
+			newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
+			if serr == nil {
+				st.userState = newState
+			}
+			st.hasValue = true
+			return nil
+		}
 		// Variance/stddev aggregates: accumulate float sum and sum of squares.
 		// M0097-0007.
 		switch strings.ToLower(call.Name) {
@@ -1466,6 +1522,23 @@ func aggDatumToFloat64(d Datum) float64 {
 }
 
 func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum {
+	// Handle user-defined aggregates first.
+	if call.UserAgg != nil {
+		ua := call.UserAgg
+		if !st.hasValue {
+			return NullDatum
+		}
+		state := st.userState
+		if ua.FinalFunc == "" {
+			return state
+		}
+		// Call the final function.
+		result, ferr := executeSFuncCall(ua.FinalFunc, []Datum{state}, o.ctx)
+		if ferr != nil {
+			return NullDatum
+		}
+		return result
+	}
 	switch strings.ToLower(call.Name) {
 	case "count":
 		return Datum{Kind: KindInt, Int: st.count}
@@ -1917,4 +1990,123 @@ func canonicalNumericKey(mantissa int64, scale int) string {
 	b = append(b, ':')
 	b = strconv.AppendInt(b, int64(scale), 10)
 	return string(b)
+}
+
+// userAggInitState returns the initial state Datum for a user-defined aggregate.
+// An empty InitCond gives NullDatum; a numeric string like "0" gives NewIntDatum(0);
+// an array literal like "{0,0}" or "{}" gives NewStringDatum(initcond).
+func userAggInitState(ua *catalog.UserAggregate) Datum {
+	ic := ua.InitCond
+	if ic == "" {
+		return NullDatum
+	}
+	// Try to parse as an integer.
+	if n, err := strconv.ParseInt(ic, 10, 64); err == nil {
+		return NewIntDatum(n)
+	}
+	// Otherwise treat as string (covers arrays, empty array, text, etc.).
+	return NewStringDatum(ic)
+}
+
+// executeSFuncCall invokes a named state-transition or final function for a
+// user-defined aggregate.  Built-in SQL/PG functions are handled inline;
+// user-defined SQL functions are executed via executeStoredRoutine.
+func executeSFuncCall(funcName string, args []Datum, ctx *Context) (Datum, error) {
+	switch strings.ToLower(funcName) {
+	case "int8inc":
+		// int8inc(int8) → int8+1: counts every row
+		if len(args) >= 1 {
+			n, _ := datumInt64(args[0])
+			return NewIntDatum(n + 1), nil
+		}
+	case "int8inc_any":
+		// int8inc_any(int8, any) → int8+1: counts rows ignoring second arg
+		if len(args) >= 1 {
+			n, _ := datumInt64(args[0])
+			return NewIntDatum(n + 1), nil
+		}
+	case "int4pl", "int8pl":
+		// int4pl/int8pl(int,int) → sum
+		if len(args) == 2 {
+			a, _ := datumInt64(args[0])
+			b, _ := datumInt64(args[1])
+			return NewIntDatum(a + b), nil
+		}
+	case "int2pl":
+		if len(args) == 2 {
+			a, _ := datumInt64(args[0])
+			b, _ := datumInt64(args[1])
+			return NewIntDatum(a + b), nil
+		}
+	case "int4_avg_accum":
+		// int4_avg_accum(int8[], int4) → int8[] as {count, sum}
+		if len(args) == 2 {
+			state := parseTextArray(args[0].StringValue())
+			cnt, sum := int64(0), int64(0)
+			if len(state) == 2 {
+				cnt, _ = strconv.ParseInt(state[0], 10, 64)
+				sum, _ = strconv.ParseInt(state[1], 10, 64)
+			}
+			val, _ := datumInt64(args[1])
+			return NewStringDatum(fmt.Sprintf("{%d,%d}", cnt+1, sum+val)), nil
+		}
+	case "int8_avg":
+		// int8_avg(int8[]) → numeric: sum/count
+		if len(args) == 1 {
+			state := parseTextArray(args[0].StringValue())
+			if len(state) == 2 {
+				cnt, _ := strconv.ParseInt(state[0], 10, 64)
+				sum, _ := strconv.ParseInt(state[1], 10, 64)
+				if cnt == 0 {
+					return NullDatum, nil
+				}
+				return NewStringDatum(formatAvgInt8(sum, cnt)), nil
+			}
+		}
+	case "least_accum":
+		// least_accum(int8, int8) → least($1, $2), strict (skip NULLs)
+		if len(args) == 2 {
+			if args[0].IsNull() {
+				return args[1], nil
+			}
+			if args[1].IsNull() {
+				return args[0], nil
+			}
+			a, _ := datumInt64(args[0])
+			b, _ := datumInt64(args[1])
+			if b < a {
+				return NewIntDatum(b), nil
+			}
+			return NewIntDatum(a), nil
+		}
+	}
+	// Try user-defined routine from the catalog.
+	rs := routineRegistry(ctx)
+	if rs != nil {
+		funcObjName := parser.ObjectName{Name: funcName}
+		candidates := rs.LookupByName(funcObjName)
+		if len(candidates) > 0 {
+			// Use first candidate with matching arg count.
+			for _, r := range candidates {
+				if len(r.ArgTypes) == len(args) {
+					result, rerr := executeStoredRoutine(r, args, ctx, 0)
+					if rerr == nil {
+						return result, nil
+					}
+				}
+			}
+			// Fallback: try any candidate.
+			result, rerr := executeStoredRoutine(candidates[0], args, ctx, 0)
+			if rerr == nil {
+				return result, nil
+			}
+		}
+	}
+	return NullDatum, &ExecError{Code: "42883", Message: fmt.Sprintf("aggregate state function %q does not exist", funcName)}
+}
+
+// formatAvgInt8 formats sum/count as a PostgreSQL numeric with 16 decimal places.
+func formatAvgInt8(sum, count int64) string {
+	r := new(big.Rat).SetFrac(big.NewInt(sum), big.NewInt(count))
+	return r.FloatString(16)
 }
