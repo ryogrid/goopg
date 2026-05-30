@@ -2607,8 +2607,8 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	return Datum{Kind: KindInt, Int: n}, nil
 }
 
-// evalToChar implements to_char(timestamp, fmt) → text.
-// Converts a timestamp to a string using a PostgreSQL format string.
+// evalToChar implements to_char(value, fmt) → text.
+// Converts a timestamp or number to a string using a PostgreSQL format string.
 // Supports a subset of PostgreSQL format codes. M0097-0004.
 func evalToChar(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) < 2 {
@@ -2622,17 +2622,224 @@ func evalToChar(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if err != nil || fmtArg.IsNull() {
 		return NullDatum, nil
 	}
-	// to_char(numeric, fmt) — number formatting; return as-is for now.
-	if srcArg.Kind != KindTime {
-		return NewStringDatum(srcArg.Format()), nil
+	fmtStr := strings.TrimSpace(fmtArg.StringValue())
+	// to_char(timestamp/time, fmt) — time/date formatting.
+	if srcArg.Kind == KindTime {
+		t := srcArg.TimeValue().UTC()
+		goFmt := pgToCharToGoFormat(fmtStr)
+		return NewStringDatum(t.Format(goFmt)), nil
 	}
-	t := srcArg.TimeValue().UTC()
-	goFmt := pgToCharToGoFormat(strings.TrimSpace(fmtArg.StringValue()))
-	return NewStringDatum(t.Format(goFmt)), nil
+	// to_char(numeric, fmt) — number formatting. M0097-0105.
+	return NewStringDatum(toCharNumericFormat(srcArg, fmtStr)), nil
 }
 
-// pgToCharToGoFormat converts a PostgreSQL to_char format string to a Go
-// time.Format layout string. Supports the most common format codes.
+// toCharNumericFormat formats a numeric Datum using a PostgreSQL numeric format string.
+// Supports: FM prefix, 0 (zero-fill), 9 (space-fill), . (decimal point),
+// , (grouping separator), S/MI/PL/PR signs. M0097-0105.
+func toCharNumericFormat(val Datum, fmtStr string) string {
+	// Detect and strip FM (fill mode: suppress leading/trailing spaces).
+	// FM may appear at the start or end of the format string.
+	fm := false
+	upper := strings.ToUpper(strings.TrimSpace(fmtStr))
+	if strings.Contains(upper, "FM") {
+		fm = true
+		upper = strings.ReplaceAll(upper, "FM", "")
+	}
+
+	// Detect sign modifiers.
+	hasMI := strings.Contains(upper, "MI")
+	hasPL := strings.Contains(upper, "PL")
+	hasPR := strings.Contains(upper, "PR")
+	hasS := false
+	if !hasMI && !hasPL && !hasPR {
+		if strings.HasPrefix(upper, "S") || strings.HasSuffix(upper, "S") {
+			hasS = true
+		}
+	}
+	// Strip sign specifiers for digit processing.
+	digitFmt := upper
+	digitFmt = strings.ReplaceAll(digitFmt, "MI", "")
+	digitFmt = strings.ReplaceAll(digitFmt, "PL", "")
+	digitFmt = strings.ReplaceAll(digitFmt, "PR", "")
+	if !strings.Contains(digitFmt, "D") { // keep D (locale decimal) but remove S
+		digitFmt = strings.ReplaceAll(digitFmt, "S", "")
+	}
+	// Replace locale separators with canonical chars for parsing.
+	digitFmt = strings.ReplaceAll(digitFmt, "G", ",")
+	digitFmt = strings.ReplaceAll(digitFmt, "D", ".")
+	digitFmt = strings.ReplaceAll(digitFmt, "L", "")
+	digitFmt = strings.ReplaceAll(digitFmt, "C", "")
+	digitFmt = strings.ReplaceAll(digitFmt, "S", "")
+
+	// Split into integer and decimal parts.
+	dotIdx := strings.Index(digitFmt, ".")
+	var intFmt, decFmt string
+	if dotIdx >= 0 {
+		intFmt = digitFmt[:dotIdx]
+		decFmt = digitFmt[dotIdx+1:]
+	} else {
+		intFmt = digitFmt
+	}
+	// Remove grouping separators from format (just track digit positions).
+	intFmtDigits := strings.ReplaceAll(intFmt, ",", "")
+	decFmtDigits := strings.ReplaceAll(decFmt, ",", "")
+
+	// Count digit positions.
+	intPositions := 0
+	for _, c := range intFmtDigits {
+		if c == '0' || c == '9' {
+			intPositions++
+		}
+	}
+	decPositions := 0
+	for _, c := range decFmtDigits {
+		if c == '0' || c == '9' {
+			decPositions++
+		}
+	}
+
+	// Extract the numeric value as integer and optional fractional string.
+	negative := false
+	var intVal int64
+	var fracStr string
+	switch val.Kind {
+	case KindInt:
+		intVal = val.Int
+		if intVal < 0 {
+			negative = true
+			intVal = -intVal
+		}
+	case KindNumeric:
+		m := val.NumericMantissaValue() // int64 mantissa
+		s := int(val.NumericScaleValue())
+		if m < 0 {
+			negative = true
+			m = -m
+		}
+		if s > 0 {
+			var divisor int64 = 1
+			for i := 0; i < s; i++ {
+				divisor *= 10
+			}
+			intVal = m / divisor
+			rem := m % divisor
+			if decPositions > 0 {
+				fracStr = fmt.Sprintf("%0*d", s, rem)
+				if len(fracStr) > decPositions {
+					fracStr = fracStr[:decPositions]
+				}
+			}
+		} else {
+			intVal = m
+		}
+	case KindString:
+		f, parseErr := strconv.ParseFloat(val.StringValue(), 64)
+		if parseErr == nil {
+			if f < 0 {
+				negative = true
+				f = -f
+			}
+			intVal = int64(f)
+			if decPositions > 0 {
+				frac := f - float64(intVal)
+				fs := fmt.Sprintf("%.*f", decPositions, frac)
+				if len(fs) > 2 {
+					fracStr = fs[2:] // strip "0."
+				}
+				if len(fracStr) > decPositions {
+					fracStr = fracStr[:decPositions]
+				}
+			}
+		}
+	}
+
+	// Format the integer part: walk format right-to-left, filling each digit position.
+	intStr := strconv.FormatInt(intVal, 10)
+	var intBuf []byte
+	pos := len(intStr) - 1
+	for fi := len(intFmtDigits) - 1; fi >= 0; fi-- {
+		fc := intFmtDigits[fi]
+		if fc != '0' && fc != '9' {
+			continue
+		}
+		if pos >= 0 {
+			intBuf = append([]byte{intStr[pos]}, intBuf...)
+			pos--
+		} else {
+			if fc == '0' {
+				intBuf = append([]byte{'0'}, intBuf...)
+			} else {
+				intBuf = append([]byte{' '}, intBuf...)
+			}
+		}
+	}
+	// If number has more digits than format, prepend the overflow digits.
+	for pos >= 0 {
+		intBuf = append([]byte{intStr[pos]}, intBuf...)
+		pos--
+	}
+	result := string(intBuf)
+
+	// Append decimal part.
+	if dotIdx >= 0 && decPositions > 0 {
+		if fracStr == "" {
+			fracStr = strings.Repeat("0", decPositions)
+		} else if len(fracStr) < decPositions {
+			fracStr += strings.Repeat("0", decPositions-len(fracStr))
+		}
+		result = result + "." + fracStr
+	}
+
+	// FM mode: trim leading spaces from the digit portion before sign.
+	if fm {
+		result = strings.TrimLeft(result, " ")
+		if dotIdx >= 0 {
+			result = strings.TrimRight(result, "0")
+			result = strings.TrimRight(result, ".")
+		}
+	}
+
+	// Apply sign.
+	if hasMI {
+		if negative {
+			result = result + "-"
+		} else if !fm {
+			result = result + " "
+		}
+	} else if hasPL {
+		if negative {
+			result = "-" + result
+		} else {
+			result = "+" + result
+		}
+	} else if hasPR {
+		if negative {
+			result = "<" + result + ">"
+		} else if !fm {
+			result = " " + result + " "
+		}
+	} else if hasS {
+		if negative {
+			result = "-" + result
+		} else {
+			result = "+" + result
+		}
+	} else {
+		// Default: sign goes immediately before the significant digits, after
+		// any digit-padding spaces produced by '9' fill.  FM strips those spaces
+		// before we get here, so the negative sign always goes at position 0 in
+		// FM mode.  Non-FM positive reserves a sign position with one extra space.
+		if negative {
+			trim := strings.TrimLeft(result, " ")
+			spaces := len(result) - len(trim)
+			result = strings.Repeat(" ", spaces) + "-" + trim
+		} else if !fm {
+			result = " " + result
+		}
+	}
+	return result
+}
+
 func pgToCharToGoFormat(pg string) string {
 	replacer := strings.NewReplacer(
 		"YYYY", "2006",

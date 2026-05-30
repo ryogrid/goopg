@@ -1182,10 +1182,16 @@ func remapRowForPartition(parentCols, childCols []catalog.Column, row Row) Row {
 // based on the parent's partition key. Returns nil if no partition matches.
 // M0096-0007.
 func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory) *catalog.Table {
-	if len(parent.PartitionKey) == 0 {
+	return routeToPartitionDepth(parent, row, im, 0)
+}
+
+// routeToPartitionDepth recurses through nested partition hierarchies. The
+// depth guard (max 8) prevents infinite loops on circular catalog states.
+func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory, depth int) *catalog.Table {
+	if len(parent.PartitionKey) == 0 || depth > 8 {
 		return nil
 	}
-	// Find the column index for the partition key
+	// Find the column index for the first partition key (used by LIST/HASH).
 	keyColName := parent.PartitionKey[0]
 	keyIdx := -1
 	for i, col := range parent.Columns {
@@ -1199,6 +1205,7 @@ func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory) *cat
 	}
 	keyDatum := row[keyIdx]
 
+	var child *catalog.Table
 	switch parent.PartitionMethod {
 	case "LIST":
 		keyStr := ""
@@ -1209,11 +1216,40 @@ func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory) *cat
 		} else if keyDatum.IsNull() {
 			keyStr = "null" // matches FOR VALUES IN (null)
 		}
-		return im.FindPartitionForValue(parent.OID, keyStr)
+		child = im.FindPartitionForValue(parent.OID, keyStr)
 	case "RANGE":
-		if keyDatum.Kind == KindInt {
-			return im.FindRangePartitionForValue(parent.OID, keyDatum.Int)
+		// Build a string-formatted key tuple covering all partition key columns.
+		// This supports both single-column (PartitionKey len=1) and multi-column
+		// (PartitionKey len>1) RANGE partitioning.
+		keyStrs := make([]string, 0, len(parent.PartitionKey))
+		for _, keyCol := range parent.PartitionKey {
+			kidx := -1
+			for i, col := range parent.Columns {
+				if strings.EqualFold(col.Name, keyCol) {
+					kidx = i
+					break
+				}
+			}
+			if kidx < 0 || kidx >= len(row) {
+				return nil
+			}
+			d := row[kidx]
+			switch d.Kind {
+			case KindInt:
+				keyStrs = append(keyStrs, fmt.Sprintf("%d", d.Int))
+			case KindString:
+				keyStrs = append(keyStrs, d.StringValue())
+			case KindNumeric:
+				keyStrs = append(keyStrs, d.StringValue())
+			default:
+				if d.IsNull() {
+					keyStrs = append(keyStrs, "null")
+				} else {
+					keyStrs = append(keyStrs, d.Format())
+				}
+			}
 		}
+		child = im.FindRangePartitionForDatums(parent.OID, keyStrs)
 	case "HASH":
 		// Use string representation of key for hash. M0097-0015.
 		keyStr := ""
@@ -1224,9 +1260,20 @@ func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory) *cat
 		} else {
 			keyStr = keyDatum.Format()
 		}
-		return im.FindHashPartitionForValue(parent.OID, keyStr)
+		child = im.FindHashPartitionForValue(parent.OID, keyStr)
 	}
-	return nil
+	if child == nil {
+		return nil
+	}
+	// Recurse into nested partitions (multi-level partition hierarchies).
+	// The child row may need to be remapped to the child's column order first.
+	if len(child.PartitionKey) > 0 {
+		childRow := remapRowForPartition(parent.Columns, child.Columns, row)
+		if nested := routeToPartitionDepth(child, childRow, im, depth+1); nested != nil {
+			return nested
+		}
+	}
+	return child
 }
 
 // extractScanAndPredicate walks an Update/Delete child plan and pulls

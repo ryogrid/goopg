@@ -1926,20 +1926,32 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		return buildVirtualValues(rv.Pos(), tbl, ctx.schema), b, nil
 	}
 	// Partition-aware scan (M0096-0007): when scanning a partitioned table,
-	// produce a union of SeqScans over all partition children.
+	// produce a union of SeqScans over all leaf partitions (recursing through
+	// nested partitioned children). Multi-level partition hierarchies require
+	// collecting ALL leaf descendants, not only direct children.
 	if len(tbl.PartitionKey) > 0 {
 		if im, ok := cat.(*catalog.InMemory); ok {
-			children := im.PartitionChildren(tbl.OID)
-			if len(children) > 0 {
-				// Build a UNION ALL of SeqScans over all children.
+			// Collect all leaf partitions recursively.
+			leaves := collectAllPartitionLeaves(im, tbl.OID)
+			if len(leaves) > 0 {
+				// Build a UNION ALL of SeqScans over all leaf partitions.
 				// Per-leaf wrap with a Project that adds `tableoid`
 				// as the trailing slot so a `tableoid::regclass`
 				// reference reports the actual leaf relname (M0100-0005y).
 				var root Node
-				for _, child := range children {
-					childSchema := tableSchemaWithSource(b.table, sourceIdx)
-					childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childSchema}
-					wrapped := wrapWithTableoid(childScan, child.OID, sourceIdx, rv.Pos())
+				for _, leaf := range leaves {
+					// The SeqScan must use the leaf's OWN physical schema so
+					// the decoder reads columns in the right order. When the leaf
+					// has a different column order from the root partition table,
+					// buildInheritanceRemapProject wraps the scan in a Project
+					// that reorders to the root table's logical schema.
+					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
+					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema}
+					var leafNode Node = leafScan
+					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
+						leafNode = buildInheritanceRemapProject(rv.Pos(), leafScan, tbl, leaf, sourceIdx)
+					}
+					wrapped := wrapWithTableoid(leafNode, leaf.OID, sourceIdx, rv.Pos())
 					if root == nil {
 						root = wrapped
 					} else {
@@ -2021,6 +2033,48 @@ func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32) []*ca
 		queue = append(queue, im.InheritanceChildren(child.OID)...)
 	}
 	return result
+}
+
+// collectAllPartitionLeaves does a BFS over the partition hierarchy rooted at
+// parentOID and returns all LEAF partitions (non-partitioned tables). Nested
+// partitioned tables (which are themselves PARTITION BY) are NOT included in
+// the result — only their leaf descendants are. This is required for correct
+// scanning of multi-level partition hierarchies (e.g. range_parted → part_b_10_b_20
+// (partitioned) → part_c_1_100 (leaf)). M0097-0105.
+func collectAllPartitionLeaves(im *catalog.InMemory, parentOID uint32) []*catalog.Table {
+	var leaves []*catalog.Table
+	seen := make(map[uint32]bool)
+	queue := im.PartitionChildren(parentOID)
+	for len(queue) > 0 {
+		child := queue[0]
+		queue = queue[1:]
+		if seen[child.OID] {
+			continue
+		}
+		seen[child.OID] = true
+		if len(child.PartitionKey) > 0 {
+			// Intermediate partitioned node: recurse into its children.
+			queue = append(queue, im.PartitionChildren(child.OID)...)
+		} else {
+			// Leaf partition: include in the scan.
+			leaves = append(leaves, child)
+		}
+	}
+	return leaves
+}
+
+// columnsInSameOrder returns true when the column name sequence matches
+// exactly, used to skip the remap Project when layout is identical.
+func columnsInSameOrder(a, b []catalog.Column) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
 }
 
 // buildInheritanceRemapProject wraps childScan in a Project that emits

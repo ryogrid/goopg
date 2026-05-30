@@ -679,8 +679,14 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	}
 	// Set partition metadata on the child.
 	tbl.PartitionParentOID = parent.OID
-	tbl.PartitionMethod = parent.PartitionMethod
-	tbl.PartitionKey = parent.PartitionKey
+	// Use the child's own PARTITION BY clause when present (e.g. nested
+	// partitioned tables: CREATE TABLE p1 PARTITION OF p FOR VALUES ... PARTITION BY RANGE (c)).
+	// Leaf partitions have no PartitionMethod/PartitionKey of their own.
+	if s.PartitionBy != nil {
+		tbl.PartitionMethod = s.PartitionBy.Method
+		tbl.PartitionKey = s.PartitionBy.KeyCols
+		tbl.PartitionKeyOpClasses = s.PartitionBy.OpClasses
+	}
 
 	// Build partition bounds from the FOR VALUES clause.
 	var pb catalog.PartitionBound
@@ -701,12 +707,18 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		}
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	} else if len(poc.FromValues) > 0 || len(poc.ToValues) > 0 {
-		// RANGE partition.
+		// RANGE partition: store all key-column values for multi-column routing.
 		if len(poc.FromValues) > 0 {
-			pb.From = exprToString(poc.FromValues[0])
+			pb.From = exprToString(poc.FromValues[0]) // backward compat (single-col)
+			for _, v := range poc.FromValues {
+				pb.FromValues = append(pb.FromValues, exprToString(v))
+			}
 		}
 		if len(poc.ToValues) > 0 {
-			pb.To = exprToString(poc.ToValues[0])
+			pb.To = exprToString(poc.ToValues[0]) // backward compat (single-col)
+			for _, v := range poc.ToValues {
+				pb.ToValues = append(pb.ToValues, exprToString(v))
+			}
 		}
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	}
@@ -1308,9 +1320,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				break // child doesn't exist yet, skip
 			}
 			// Set partition metadata on the child.
-			childTbl.PartitionParentOID = tbl.OID
-			childTbl.PartitionMethod = tbl.PartitionMethod
-			childTbl.PartitionKey = tbl.PartitionKey
+			// ATTACH PARTITION only establishes the parent-child relationship and
+			// partition bounds. The child's PartitionKey/Method are properties of its
+			// OWN PARTITION BY clause and must NOT be overwritten by the parent's values.
 			// Build partition bounds. M0097-0015 adds HASH.
 			var pb catalog.PartitionBound
 			if poc.IsHash {
@@ -1323,10 +1335,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					pb.InValues = append(pb.InValues, exprToString(e))
 				}
 				if len(poc.FromValues) > 0 {
-					pb.From = exprToString(poc.FromValues[0])
+					pb.From = exprToString(poc.FromValues[0]) // backward compat
+					for _, v := range poc.FromValues {
+						pb.FromValues = append(pb.FromValues, exprToString(v))
+					}
 				}
 				if len(poc.ToValues) > 0 {
-					pb.To = exprToString(poc.ToValues[0])
+					pb.To = exprToString(poc.ToValues[0]) // backward compat
+					for _, v := range poc.ToValues {
+						pb.ToValues = append(pb.ToValues, exprToString(v))
+					}
 				}
 				if len(pb.InValues) > 0 || pb.From != "" || pb.To != "" {
 					childTbl.PartitionBounds = []catalog.PartitionBound{pb}

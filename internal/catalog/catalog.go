@@ -210,13 +210,15 @@ type ForeignKey struct {
 // For RANGE partitioning, From and To contain the bound strings ("MINVALUE", "MAXVALUE", or a literal).
 // For HASH partitioning, Modulus and Remainder specify the hash bucket. M0096-0007; HASH M0097-0015.
 type PartitionBound struct {
-	InValues  []string // LIST: values in this partition
-	From      string   // RANGE: lower bound
-	To        string   // RANGE: upper bound
-	Modulus   int64    // HASH: modulus
-	Remainder int64    // HASH: remainder (partition index)
-	IsHash    bool     // true for HASH partitions
-	IsDefault bool     // true for DEFAULT partitions
+	InValues   []string // LIST: values in this partition
+	From       string   // RANGE: lower bound (single-column, kept for compat)
+	To         string   // RANGE: upper bound (single-column, kept for compat)
+	FromValues []string // RANGE: lower bound tuple (multi-column; len==1 for single-col)
+	ToValues   []string // RANGE: upper bound tuple (multi-column; len==1 for single-col)
+	Modulus    int64    // HASH: modulus
+	Remainder  int64    // HASH: remainder (partition index)
+	IsHash     bool     // true for HASH partitions
+	IsDefault  bool     // true for DEFAULT partitions
 }
 
 // TableStats captures the pg_class-shaped table-level stats
@@ -610,6 +612,110 @@ func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) 
 		}
 	}
 	return defaultPart // fall back to DEFAULT partition
+}
+
+// FindRangePartitionForDatums routes a row to its RANGE partition using a
+// multi-column key tuple expressed as string-formatted values (one per
+// partition-key column). Tuple comparison is lexicographic:
+// (k1,k2,...) >= (f1,f2,...) AND (k1,k2,...) < (t1,t2,...).
+// "MINVALUE" and "MAXVALUE" are special sentinels (-∞ and +∞).
+func (c *InMemory) FindRangePartitionForDatums(parentOID uint32, keyStrs []string) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var defaultPart *Table
+	for _, childOID := range c.partitionChildren[parentOID] {
+		for _, t := range c.tables {
+			if t.OID != childOID {
+				continue
+			}
+			for _, pb := range t.PartitionBounds {
+				if pb.IsDefault {
+					defaultPart = t
+					continue
+				}
+				if len(pb.FromValues) == 0 && len(pb.ToValues) == 0 {
+					continue
+				}
+				if rangeStrTupleGE(keyStrs, pb.FromValues) && rangeStrTupleLT(keyStrs, pb.ToValues) {
+					return t
+				}
+			}
+		}
+	}
+	return defaultPart
+}
+
+// rangeStrTupleGE returns true if key >= bound (lexicographic tuple comparison).
+func rangeStrTupleGE(key, bound []string) bool {
+	for i := range key {
+		if i >= len(bound) {
+			break
+		}
+		cmp := compareRangeBoundStr(key[i], bound[i])
+		if cmp > 0 {
+			return true
+		}
+		if cmp < 0 {
+			return false
+		}
+	}
+	return true // equal on all compared positions: satisfies >=
+}
+
+// rangeStrTupleLT returns true if key < bound (lexicographic tuple comparison).
+func rangeStrTupleLT(key, bound []string) bool {
+	for i := range key {
+		if i >= len(bound) {
+			break
+		}
+		cmp := compareRangeBoundStr(key[i], bound[i])
+		if cmp < 0 {
+			return true
+		}
+		if cmp > 0 {
+			return false
+		}
+	}
+	return false // equal on all compared positions: does NOT satisfy < (exclusive upper bound)
+}
+
+// compareRangeBoundStr compares a string-formatted key value against a
+// partition bound string. Returns -1, 0, +1.
+// "MINVALUE" is -∞ (key > MINVALUE → +1); "MAXVALUE" is +∞ (key < MAXVALUE → -1).
+func compareRangeBoundStr(keyStr, boundStr string) int {
+	switch boundStr {
+	case "MINVALUE":
+		return 1 // anything > -∞
+	case "MAXVALUE":
+		return -1 // anything < +∞
+	}
+	switch keyStr {
+	case "MINVALUE":
+		return -1
+	case "MAXVALUE":
+		return 1
+	}
+	// Try integer comparison first (covers int, bigint, etc.).
+	var ki, bi int64
+	_, kerr := fmt.Sscanf(keyStr, "%d", &ki)
+	_, berr := fmt.Sscanf(boundStr, "%d", &bi)
+	if kerr == nil && berr == nil {
+		if ki < bi {
+			return -1
+		}
+		if ki > bi {
+			return 1
+		}
+		return 0
+	}
+	// Fall back to lexicographic string comparison (text, char, etc.).
+	if keyStr < boundStr {
+		return -1
+	}
+	if keyStr > boundStr {
+		return 1
+	}
+	return 0
 }
 
 // FindHashPartitionForValue finds the HASH partition child that owns the given
