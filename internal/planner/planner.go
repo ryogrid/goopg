@@ -4319,12 +4319,35 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 	// M0097-0035: percentile_cont/disc, rank, dense_rank, mode.
 	var withinGroupKeys []SortKey
 	if len(fc.WithinGroup) > 0 {
+		// Validate: non-ordered-set aggregates reject WITHIN GROUP.
+		switch name {
+		case "percentile_cont", "percentile_disc", "mode",
+			"rank", "dense_rank", "cume_dist", "percent_rank":
+			// OK — these are ordered-set / hypothetical-set aggregates.
+		default:
+			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
+				Message: fmt.Sprintf("%s is not an ordered-set aggregate, so it cannot have WITHIN GROUP", name)}
+		}
+		// Validate: WITHIN GROUP conflicts with ORDER BY inside the call args.
+		if len(fc.OrderBy) > 0 {
+			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42P13",
+				Message: "cannot use multiple ORDER BY clauses with WITHIN GROUP"}
+		}
 		for _, sb := range fc.WithinGroup {
 			e, serr := resolveExpr(sb.Expr, inputCtx)
 			if serr != nil {
 				return AggregateCall{}, serr
 			}
 			withinGroupKeys = append(withinGroupKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
+		}
+	} else {
+		// Validate: ordered-set aggregates require WITHIN GROUP (unless window func).
+		switch name {
+		case "percentile_cont", "percentile_disc":
+			if fc.Over == nil {
+				return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
+					Message: fmt.Sprintf("WITHIN GROUP is required for ordered-set aggregate %s", name)}
+			}
 		}
 	}
 	outType := catalog.Type{Name: "unknown"}

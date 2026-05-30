@@ -306,8 +306,29 @@ func (p *parser) parseAggregateOptions(stmt *CreateAggregateStmt) error {
 			case "initcond", "initcond1":
 				stmt.InitCond = valStr
 			// Accepted but ignored options.
-			case "parallel", "sspace":
+			case "parallel", "sspace", "combinefunc", "serialfunc", "deserialfunc",
+				"mstype", "msfunc", "minvfunc", "mfinalfunc", "minitcond",
+				"sortop", "hypothetical", "mspace":
 				// ignore
+			}
+			// If the value token is followed by '(', skip the arg list
+			// (e.g. COMBINEFUNC = balkifnull(int8, int8)). M0097-0035.
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				depth := 1
+				p.advance() // consume "("
+				for depth > 0 && p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+						depth++
+					} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+						depth--
+					}
+					if depth > 0 {
+						p.advance()
+					}
+				}
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+					p.advance() // consume final ")"
+				}
 			}
 		}
 		// Skip optional comma.
