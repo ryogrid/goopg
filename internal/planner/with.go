@@ -198,12 +198,40 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, error) {
 	key := strings.ToLower(cte.Name)
 
+	// PostgreSQL allows WITH RECURSIVE CTEs whose bodies don't actually
+	// recurse (no UNION self-reference). In that case, treat the CTE as a
+	// regular non-recursive CTE — plan it with planSelect and register it.
 	if cte.Query.SetOp == nil {
-		return nil, &PlanError{
-			Pos:     cte.Pos(),
-			Code:    "0A000",
-			Message: "WITH RECURSIVE body must use UNION or UNION ALL",
+		body, err := planSelect(cte.Query, cat)
+		if err != nil {
+			return nil, err
 		}
+		schema := body.Output()
+		if len(cte.Columns) > 0 {
+			if len(cte.Columns) != len(schema) {
+				return nil, &PlanError{
+					Pos:     cte.Pos(),
+					Code:    "42P10",
+					Message: fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(schema)),
+				}
+			}
+			renamed := make(Schema, len(schema))
+			for i, c := range schema {
+				renamed[i] = SchemaColumn{Name: cte.Columns[i], Type: c.Type}
+			}
+			schema = renamed
+		}
+		cols := make([]catalog.Column, len(schema))
+		for i, c := range schema {
+			cols[i] = catalog.Column{Name: c.Name, Type: c.Type}
+		}
+		planCTEs[key] = &plannedCTE{
+			name:   cte.Name,
+			body:   body,
+			schema: schema,
+			table:  &catalog.Table{Name: cte.Name, Columns: cols},
+		}
+		return body, nil
 	}
 	// PostgreSQL rejects several constructs in the CTE body of a WITH RECURSIVE.
 	if len(cte.Query.OrderBy) > 0 {

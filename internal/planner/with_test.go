@@ -64,22 +64,15 @@ func TestPlanWithCTEReferencingPriorSibling(t *testing.T) {
 	}
 }
 
-// TestPlanWithRecursiveRejected: non-UNION-ALL recursive CTEs are
-// rejected by the planner. The analyzer passes WITH RECURSIVE
-// through, but the planner requires UNION ALL.
-func TestPlanWithRecursiveRejected(t *testing.T) {
+// TestPlanWithRecursiveNonUnionAccepted: PostgreSQL allows WITH RECURSIVE
+// CTEs whose bodies don't actually recurse (no UNION self-reference). goopg
+// now matches PG: plan them as regular non-recursive CTEs.
+func TestPlanWithRecursiveNonUnionAccepted(t *testing.T) {
 	cat := pgbenchCatalog(t)
 	stmt := parseOne(t, "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r")
 	_, err := Plan(stmt, cat)
-	if err == nil {
-		t.Fatal("expected RECURSIVE rejection, got nil")
-	}
-	pe, ok := err.(*PlanError)
-	if !ok {
-		t.Fatalf("err type=%T, want *PlanError", err)
-	}
-	if pe.Code != "0A000" {
-		t.Errorf("code=%s, want 0A000", pe.Code)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

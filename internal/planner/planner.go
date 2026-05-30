@@ -1546,8 +1546,10 @@ func nodeReferencesOuter(n Node) bool {
 				return true
 			}
 		}
+		return false
 	}
-	return false
+	// General case: walk the plan tree for OuterColumnRef expressions.
+	return planHasOuterRef(n)
 }
 
 func exprContainsColumnRef(e Expr) bool {

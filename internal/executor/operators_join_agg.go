@@ -128,20 +128,22 @@ type lateralBindable interface {
 }
 
 // openLateral handles `Join.Lateral == true`: drain the left, then
-// for each left row bind the outer slot on the right child and
-// (re)open the right to drain its rows for that single outer row.
+// for each left row re-run the right side with the left row in scope.
 // Concatenated rows accumulate in o.rows and are emitted via the
 // existing Next() path.
 //
-// The right child must implement `lateralBindable` (only
-// `pg_get_publication_tables` qualifies today). LEFT lateral
-// joins fall back to a null-padded outer row when the SRF emits
-// zero rows for a given outer; CROSS / INNER drop the outer row.
+// Two paths:
+//   - If the right child implements lateralBindable (e.g. pg_get_publication_tables):
+//     use BindLateralOuter to pass the outer row directly.
+//   - Otherwise: push the left row onto ctx.OuterRows so OuterColumnRef
+//     expressions inside the right subtree can resolve correlated refs.
+//     The CTERowCache is saved/cleared per iteration so LATERAL CTEs that
+//     depend on the outer row (e.g. WITH RECURSIVE inside LATERAL) are
+//     re-evaluated for each outer row, not served from a stale cache.
+//
+// LEFT lateral joins emit a null-padded row when the right side yields
+// zero rows; CROSS / INNER drop the outer row.
 func (o *joinOp) openLateral(ctx *Context) error {
-	bindable, ok := o.right.(lateralBindable)
-	if !ok {
-		return fmt.Errorf("internal error: lateral join right child %T does not support BindLateralOuter", o.right)
-	}
 	if err := o.left.Open(ctx); err != nil {
 		return err
 	}
@@ -156,22 +158,69 @@ func (o *joinOp) openLateral(ctx *Context) error {
 	}
 	rightWidth := len(o.right.Schema())
 	nullRight := nullRow(rightWidth)
-	outerSlot := SlotFromRow(o.left.Schema(), nil)
-	bindable.BindLateralOuter(outerSlot)
-	defer bindable.BindLateralOuter(nil)
+
+	bindable, isSRF := o.right.(lateralBindable)
+	if isSRF {
+		outerSlot := SlotFromRow(o.left.Schema(), nil)
+		bindable.BindLateralOuter(outerSlot)
+		defer bindable.BindLateralOuter(nil)
+		for i, l := range leftRows {
+			if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
+				if err := o.ctx.Ctx.Err(); err != nil {
+					return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+				}
+			}
+			outerSlot.row = l
+			if err := o.right.Open(ctx); err != nil {
+				return err
+			}
+			rightRows, err := drainRowsCtx(o.right, ctx)
+			_ = o.right.Close()
+			if err != nil {
+				return err
+			}
+			if len(rightRows) == 0 && o.plan.Type == planner.JoinTypeLeft {
+				o.rows = append(o.rows, concatRows(l, nullRight))
+				continue
+			}
+			for _, r := range rightRows {
+				joined := concatRows(l, r)
+				ok, perr := o.joinPredicateMatch(joined)
+				if perr != nil {
+					return perr
+				}
+				if !ok {
+					continue
+				}
+				o.rows = append(o.rows, joined)
+			}
+		}
+		return nil
+	}
+
+	// General LATERAL: push each left row as an outer row context so
+	// OuterColumnRef (level=1) expressions in the right subtree resolve
+	// against it. Also clear CTERowCache per iteration so LATERAL CTEs
+	// whose content depends on the outer row are re-materialised.
+	savedCTECache := ctx.CTERowCache
 	for i, l := range leftRows {
 		if i&0xFF == 0 && o.ctx != nil && o.ctx.Ctx != nil {
 			if err := o.ctx.Ctx.Err(); err != nil {
 				return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 			}
 		}
-		outerSlot.row = l
-		if err := o.right.Open(ctx); err != nil {
-			return err
+		ctx.OuterRows = append(ctx.OuterRows, l)
+		ctx.CTERowCache = nil // clear per-iteration so outer-dependent CTEs recompute
+		var rightRows []Row
+		if openErr := o.right.Open(ctx); openErr == nil {
+			rightRows, err = drainRowsCtx(o.right, ctx)
+			_ = o.right.Close()
+		} else {
+			err = openErr
 		}
-		rightRows, err := drainRowsCtx(o.right, ctx)
-		_ = o.right.Close()
+		ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1]
 		if err != nil {
+			ctx.CTERowCache = savedCTECache
 			return err
 		}
 		if len(rightRows) == 0 && o.plan.Type == planner.JoinTypeLeft {
@@ -182,6 +231,7 @@ func (o *joinOp) openLateral(ctx *Context) error {
 			joined := concatRows(l, r)
 			ok, perr := o.joinPredicateMatch(joined)
 			if perr != nil {
+				ctx.CTERowCache = savedCTECache
 				return perr
 			}
 			if !ok {

@@ -341,6 +341,28 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, f := range n.Filters {
 			walkExprTree(f, visit)
 		}
+	case *RecursiveUnion:
+		walkPlanExprs(n.Anchor, visit)
+		walkPlanExprs(n.Recursive, visit)
+	case *CTEScan:
+		walkPlanExprs(n.Child, visit)
+	case *CTEDMLPrefix:
+		for _, dml := range n.DMls {
+			walkPlanExprs(dml, visit)
+		}
+		walkPlanExprs(n.Body, visit)
+	case *SetOp:
+		walkPlanExprs(n.Left, visit)
+		walkPlanExprs(n.Right, visit)
+	case *Distinct:
+		walkPlanExprs(n.Child, visit)
+	case *DistinctOn:
+		walkPlanExprs(n.Child, visit)
+	case *ProjectSet:
+		walkPlanExprs(n.Child, visit)
+		for _, e := range n.OtherExprs {
+			walkExprTree(e, visit)
+		}
 	}
 }
 

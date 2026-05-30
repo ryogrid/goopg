@@ -1650,6 +1650,16 @@ func analyzeWith(with *parser.WithClause, ctx *scope) error {
 
 func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 	innerCtx := &scope{cat: ctx.cat, parent: ctx}
+	// If the CTE body has its own WITH clause, register those inner
+	// CTEs in innerCtx so they are visible when resolving the body's
+	// FROM clause below. Without this, `WITH w6 AS (WITH w8 AS
+	// (SELECT 1) SELECT * FROM w8)` fails because w8 is not in scope
+	// when registerAnalyzedCTE tries to resolve FROM w8.
+	if cte.Query.With != nil {
+		if err := analyzeWith(cte.Query.With, innerCtx); err != nil {
+			return err
+		}
+	}
 	if len(cte.Query.From) > 0 || len(cte.Query.FromExprs) > 0 {
 		rels, err := buildSelectScopeIn(cte.Query, innerCtx)
 		if err != nil {

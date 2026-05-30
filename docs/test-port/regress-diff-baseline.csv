@@ -121,9 +121,9 @@ returning,398,failed
 insert,511,failed
 update,476,failed
 explain,704,failed
-subselect,685,failed
+subselect,652,failed
 join,1211,failed
 inherit,992,failed
 aggregates,1253,failed
 partition_join,1441,failed
-with,1531,failed
+with,1519,failed
