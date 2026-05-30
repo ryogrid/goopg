@@ -1822,6 +1822,30 @@ M0097-0001 wires it up.
         Impact: `subselect` 685→652, `with` 1531→1519 diff lines.
         Tests: existing executor/planner/analyzer suites all pass.
 
+      - **Progress 2026-05-30 (M0097-0102 — row-constructor IN/NOT IN + array functions):**
+        Three fixes (commit 6511a102):
+        (a) `evalRowConstructorInExpr` (`internal/executor/expr.go`): `(col1, col2)
+            IN (SELECT x, y FROM ...)` now performs element-wise 3-valued-logic
+            tuple comparison. `evalInExpr` routes `*planner.RowExpr` operands with
+            `Plan != nil` to the new function. Fixes `(f1, f2) IN/NOT IN
+            (SELECT f2, CAST(f3 AS int4) FROM SUBSELECT_TBL WHERE f3 IS NOT NULL)`.
+            Tests: `TestRowConstructorInSubquery`, `TestRowConstructorNotInSubquery`.
+        (b) `array_upper(anyarray, int)`, `array_lower(anyarray, int)`,
+            `array_length(anyarray, int)` implemented in `evalFuncCall`. All return
+            NULL for empty arrays, NULL inputs, or dim != 1; otherwise `upper` and
+            `length` return element count, `lower` returns 1. Fixes `with` JOIN
+            queries using `array_upper(path, 1)` in ON clause that previously
+            returned 0 rows.
+            Tests: `TestArrayUpperLowerLength`, `TestArrayUpperLowerNullForDimNotOne`.
+        (c) Baseline CSV updated: `subselect` 652→613, `with` 1519→1524 (data now
+            correct, alignment only issue remains), `inherit` 992→917 (array
+            functions also fix inheritance queries), `aggregates` 1253→1234,
+            `partition_join` 1441→1414, `insert` 511→505. `join` 1211→3471 (stale
+            CSV entry corrected to current baseline; not a regression).
+        Remaining `subselect` blockers: `ROW(1,2) = (SELECT f1, f2)` row-comparison
+        with multi-column scalar subquery; `pg_get_viewdef` output format; complex
+        correlated queries.
+
 - [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `plpgsql`, `create_function_sql`, `create_procedure`,
