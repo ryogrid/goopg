@@ -184,10 +184,7 @@ func (o *joinOp) openLateral(ctx *Context) error {
 			if err != nil {
 				return err
 			}
-			if len(rightRows) == 0 && o.plan.Type == planner.JoinTypeLeft {
-				o.rows = append(o.rows, concatRows(l, nullRight))
-				continue
-			}
+			matched := false
 			for _, r := range rightRows {
 				joined := concatRows(l, r)
 				ok, perr := o.joinPredicateMatch(joined)
@@ -197,7 +194,13 @@ func (o *joinOp) openLateral(ctx *Context) error {
 				if !ok {
 					continue
 				}
+				matched = true
 				o.rows = append(o.rows, joined)
+			}
+			// LEFT JOIN: null-extend when the right side produced no rows or
+			// no right row satisfied the join predicate.
+			if (len(rightRows) == 0 || !matched) && o.plan.Type == planner.JoinTypeLeft {
+				o.rows = append(o.rows, concatRows(l, nullRight))
 			}
 		}
 		return nil
@@ -228,10 +231,7 @@ func (o *joinOp) openLateral(ctx *Context) error {
 			ctx.CTERowCache = savedCTECache
 			return err
 		}
-		if len(rightRows) == 0 && o.plan.Type == planner.JoinTypeLeft {
-			o.rows = append(o.rows, concatRows(l, nullRight))
-			continue
-		}
+		matched := false
 		for _, r := range rightRows {
 			joined := concatRows(l, r)
 			ok, perr := o.joinPredicateMatch(joined)
@@ -242,7 +242,13 @@ func (o *joinOp) openLateral(ctx *Context) error {
 			if !ok {
 				continue
 			}
+			matched = true
 			o.rows = append(o.rows, joined)
+		}
+		// LEFT JOIN: null-extend when the right side produced no rows or
+		// no right row satisfied the join predicate.
+		if (len(rightRows) == 0 || !matched) && o.plan.Type == planner.JoinTypeLeft {
+			o.rows = append(o.rows, concatRows(l, nullRight))
 		}
 	}
 	return nil
