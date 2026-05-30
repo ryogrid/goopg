@@ -3509,9 +3509,19 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		return nil
 	}
 	if !s.IsEnum {
-		// Composite / range / base types — not fully supported in v0.
-		// Register the name so DROP TYPE can succeed without error. M0097-0064.
-		cat.RegisterCompositeType(s.Name)
+		// Composite / range / base types — register the name so DROP TYPE can
+		// succeed without error. If the type has a parsed field list, also
+		// store the fields to enable PL/pgSQL field access/assignment.
+		// M0097-0064, M0097-composite.
+		if s.IsComposite && len(s.CompositeFields) > 0 {
+			fields := make([]catalog.CompositeField, len(s.CompositeFields))
+			for i, f := range s.CompositeFields {
+				fields[i] = catalog.CompositeField{Name: f.Name, ColType: f.ColType}
+			}
+			cat.RegisterCompositeTypeWithFields(s.Name, fields)
+		} else {
+			cat.RegisterCompositeType(s.Name)
+		}
 		return nil
 	}
 	_, err := cat.RegisterEnum(s.Name, s.EnumValues)

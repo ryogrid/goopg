@@ -780,6 +780,20 @@ func (p *bodyParser) parseDottedExprStmt(nameTok parser.Token) (*AssignStmt, err
 		}
 		return &AssignStmt{pos: pos, Target: "_" + prefix + "_" + strings.ToLower(field), Value: expr}, nil
 	}
+	// Composite type field assignment: varName.fieldName := expr
+	// Emit as AssignStmt with target "varname\x00fieldname" so the runtime
+	// can distinguish it from a plain variable assignment. M0097-composite.
+	if isAssign && prefix != "new" && prefix != "old" {
+		p.advance() // consume ':=' or '='
+		expr, err := p.scanExprToSemicolon("assignment value")
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(";") {
+			return nil, p.errAtCur("expected ';' to terminate assignment")
+		}
+		return &AssignStmt{pos: pos, Target: prefix + "\x00" + strings.ToLower(field), Value: expr}, nil
+	}
 	// Unrelated dotted refs / non-assign expressions: swallow to ';' and
 	// emit the noop sentinel — preserves the M0096-0012 behaviour.
 	for p.cur().Kind != parser.TokenEOF {

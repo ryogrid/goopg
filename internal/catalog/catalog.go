@@ -332,6 +332,10 @@ type Catalog interface {
 	// RenameUserAggregate renames an existing user-defined aggregate.
 	// Returns false if the old name is not found.
 	RenameUserAggregate(oldName, newName string) bool
+	// LookupCompositeTypeFields returns the ordered field list for a composite
+	// type registered via RegisterCompositeTypeWithFields. Returns nil if the
+	// type has no field metadata. M0097-composite.
+	LookupCompositeTypeFields(name string) []CompositeField
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -381,6 +385,9 @@ type InMemory struct {
 	// CREATE TYPE ... AS (...). Since we don't implement composite type evaluation,
 	// we only track the name so DROP TYPE can succeed silently. M0097-0064.
 	compositeTypeNames map[string]bool
+	// compositeTypeFields stores the ordered field list for composite types so
+	// that PL/pgSQL can perform field access and assignment. M0097-composite.
+	compositeTypeFields map[string][]CompositeField
 
 	// constraintViewDeps maps "tableOID:constraintName" → []viewName for
 	// views that rely on the constraint for GROUP BY functional dependency.
@@ -419,6 +426,13 @@ type Domain struct {
 	OID     uint32
 	Base    Type // resolved base type
 	NotNull bool
+}
+
+// CompositeField describes one field in a user-defined composite type.
+// M0097-composite.
+type CompositeField struct {
+	Name    string // lower-case field name
+	ColType string // column type string (e.g. "bigint", "text")
 }
 
 // UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
@@ -489,6 +503,7 @@ func NewInMemory() *InMemory {
 		enumTypes:           make(map[string]*EnumType),
 		domains:             make(map[string]*Domain),
 		compositeTypeNames:  make(map[string]bool),
+		compositeTypeFields: make(map[string][]CompositeField),
 		constraintViewDeps:  make(map[string][]string),
 		opClassHashFuncs:    make(map[string]string),
 		userAggregates:      make(map[string]*UserAggregate),
@@ -2807,6 +2822,25 @@ func (c *InMemory) RegisterCompositeType(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.compositeTypeNames[k] = true
+}
+
+// RegisterCompositeTypeWithFields records a composite type together with its
+// ordered field list, enabling PL/pgSQL field access/assignment. M0097-composite.
+func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []CompositeField) {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.compositeTypeNames[k] = true
+	c.compositeTypeFields[k] = fields
+}
+
+// LookupCompositeTypeFields returns the ordered field list for a composite type,
+// or nil if the type is not known or has no field metadata. M0097-composite.
+func (c *InMemory) LookupCompositeTypeFields(name string) []CompositeField {
+	k := strings.ToLower(name)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.compositeTypeFields[k]
 }
 
 // DropCompositeType removes a composite type name. Returns an error if not

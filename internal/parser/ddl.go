@@ -3161,6 +3161,37 @@ func (p *parser) parseCreateType(pos int) (Stmt, error) {
 		return stmt, nil
 	}
 	if !p.acceptIdentKeyword("enum") {
+		// AS ( ... ) — composite type with field list.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance() // consume '('
+			stmt.IsComposite = true
+			for {
+				if p.cur().Kind != TokenIdent {
+					break
+				}
+				fname := strings.ToLower(p.advance().Value)
+				// Collect type tokens until ',' or ')'
+				var typeParts []string
+				for p.cur().Kind != TokenEOF &&
+					!(p.cur().Kind == TokenSymbol && (p.cur().Value == "," || p.cur().Value == ")")) {
+					typeParts = append(typeParts, p.cur().Value)
+					p.advance()
+				}
+				stmt.CompositeFields = append(stmt.CompositeFields, TypeField{
+					Name:    fname,
+					ColType: strings.Join(typeParts, " "),
+				})
+				if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+					p.advance() // consume ','
+				} else {
+					break
+				}
+			}
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				p.advance() // consume ')'
+			}
+			return stmt, nil
+		}
 		// AS <something-else> — stub: consume remaining tokens.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {

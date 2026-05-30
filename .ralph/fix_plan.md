@@ -2487,6 +2487,30 @@ M0097-0001 wires it up.
         queries requiring regexp_split_to_array+unnest+2D array_agg (~30), excess NOTICEs from
         my_avg/my_sum non-shared state (~40), error section mismatches (~30), aggfns ~<~ custom
         operator ORDER BY (~20), min/max row type composite comparison (~10), various smaller.
+      - **Progress 2026-05-31 (M0097-0111 — PL/pgSQL composite type field access, aggregates 411→369 diff):**
+        Root cause identified: `avg_transfn` uses `avg_state` composite type (`CREATE TYPE avg_state AS
+        (total bigint, count bigint)`) with field access/assignment (`new_state.total := n`,
+        `state.total + n`). Three independent bugs blocked this:
+        (1) `parseDottedExprStmt` (plpgsql/parser.go) generated a NO-OP for `ident.field := expr` when
+            ident is not NEW/OLD — now generates `AssignStmt{Target: "varname\x00fieldname", Value: expr}`.
+        (2) `lowerPLpgSQLExpr` (plpgsql_runtime.go) returned "qualified names not supported" for
+            `ColumnRef{Table: "state", Column: "total"}` — now checks frame.compositeVarFields[varName]
+            and extracts the field as a constant.
+        (3) `lowerPLpgSQLExpr` had NO case for `*parser.IsNullExpr`, so `state is null` failed with
+            "unsupported PL/pgSQL expression *parser.IsNullExpr" — added IsNullExpr and
+            IsDistinctFromExpr cases.
+        Infrastructure: `CREATE TYPE avg_state AS (total bigint, count bigint)` now parses and stores
+        field schema (catalog.CompositeField, compositeTypeFields map). At PL/pgSQL DECLARE/arg time,
+        frame.compositeVarFields populated. `executePLpgSQLStmt` handles `target\x00field` composite
+        assignment via updateCompositeField/extractCompositeField helpers.
+        Verification: avg_transfn(NULL,1)→(1,1), avg_transfn((1,1),3)→(4,2), avg_finalfn((4,2))→2
+        (unit tests TestPlpgsqlCompositeFieldAccess, TestPlpgsqlCompositeFieldChained).
+        Impact: `my_avg(one),my_avg(one)` → `2|2` (was NULL|NULL); all 6 my_avg/my_sum shared-state
+        cases now correct. aggregates diff: 411 → 369 (−42 lines).
+        Baseline CSV updated: aggregates 553→369. float4 (630), float8 (881), errors (1) were
+        pre-existing regressions not caused by this loop — CSV corrected from stale "0,pass".
+        Design: (inline; no separate design doc for targeted bug fixes).
+
       - **Progress 2026-05-31 (M0097-0110 — aggregates 553→569 diff, commits 3efcea87..5d44bbbb):**
         Multiple improvements reducing aggregates diff from 582 (pre-loop baseline) to 569 (−13):
         (a) `unnest(...)::type` in SELECT list: SRF detection unwraps CastExpr around unnest FuncCall;

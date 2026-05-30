@@ -1569,13 +1569,23 @@ type DropProcedureStmt struct {
 func (s *DropProcedureStmt) Pos() int  { return s.pos }
 func (s *DropProcedureStmt) stmtNode() {}
 
-// CreateTypeStmt — CREATE TYPE name AS ENUM (val1, val2, …). M0097-0017.
+// TypeField describes one field in a composite type definition.
+// M0097-composite.
+type TypeField struct {
+	Name    string // lower-case field name
+	ColType string // column type string (e.g. "bigint", "text")
+}
+
+// CreateTypeStmt — CREATE TYPE name AS ENUM (val1, val2, …) or
+// CREATE TYPE name AS (field type, …). M0097-0017, M0097-composite.
 type CreateTypeStmt struct {
-	pos        int
-	Name       string
-	Schema     string
-	IsEnum     bool
-	EnumValues []string
+	pos             int
+	Name            string
+	Schema          string
+	IsEnum          bool
+	EnumValues      []string
+	IsComposite     bool
+	CompositeFields []TypeField
 }
 
 func (s *CreateTypeStmt) Pos() int  { return s.pos }

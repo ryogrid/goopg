@@ -39,6 +39,11 @@ type plpgsqlFrame struct {
 	// returnNextRows accumulates values from RETURN NEXT for SETOF
 	// functions. M0097-0073.
 	returnNextRows []Datum
+	// compositeVarFields maps lower-case variable name → ordered field list
+	// for variables declared as composite types.  Populated at DECLARE time
+	// (and for function arguments) so that field access / assignment works
+	// inside the PL/pgSQL body. M0097-composite.
+	compositeVarFields map[string][]catalog.CompositeField
 }
 
 // plpgsqlTrigCtx holds the trigger execution context injected into
@@ -55,7 +60,10 @@ type plpgsqlTrigCtx struct {
 }
 
 func newPLpgSQLFrame() *plpgsqlFrame {
-	return &plpgsqlFrame{indexByName: make(map[string]int)}
+	return &plpgsqlFrame{
+		indexByName:        make(map[string]int),
+		compositeVarFields: make(map[string][]catalog.CompositeField),
+	}
 }
 
 func (f *plpgsqlFrame) add(name string, typ catalog.Type, value Datum) error {
@@ -414,8 +422,15 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 		}
 		child.Params[i] = coerced
 		if i < len(r.ArgNames) {
+			argName := strings.ToLower(r.ArgNames[i])
 			if err := frame.add(r.ArgNames[i], declared, coerced); err != nil {
 				return Datum{}, &ExecError{Code: "42P13", Pos: pos, Message: err.Error()}
+			}
+			// If this argument is a composite type, record its field schema.
+			if child != nil && child.Catalog != nil {
+				if fields := child.Catalog.LookupCompositeTypeFields(declared.Name); len(fields) > 0 {
+					frame.compositeVarFields[argName] = fields
+				}
 			}
 		}
 	}
@@ -434,6 +449,12 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 		}
 		if err := frame.add(d.Name, typ, value); err != nil {
 			return Datum{}, &ExecError{Code: "42P13", Pos: d.Pos(), Message: err.Error()}
+		}
+		// If this declaration is a composite type, record its field schema.
+		if child != nil && child.Catalog != nil {
+			if fields := child.Catalog.LookupCompositeTypeFields(typ.Name); len(fields) > 0 {
+				frame.compositeVarFields[strings.ToLower(d.Name)] = fields
+			}
 		}
 	}
 	res, flow, err := executePLpgSQLStmtList(block.Statements, r, frame, child)
@@ -484,6 +505,36 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		// _plpgsql_noop is the silent discard target for unrecognised
 		// dotted-expression statements. M0096-0012.
 		if s.Target == "_plpgsql_noop" {
+			return Datum{}, flowNone, nil
+		}
+		// Composite field assignment: target is "varname\x00fieldname".
+		// M0097-composite.
+		if strings.ContainsRune(s.Target, '\x00') {
+			parts := strings.SplitN(s.Target, "\x00", 2)
+			varName, fieldSpec := parts[0], parts[1]
+			idx, ok := frame.lookup(varName)
+			if !ok {
+				// Unknown variable — silently skip (best-effort).
+				return Datum{}, flowNone, nil
+			}
+			v, err := evalPLpgSQLExpr(s.Value, frame, ctx)
+			if err != nil {
+				return Datum{}, flowNone, err
+			}
+			fields := frame.compositeVarFields[varName]
+			fieldIdx := -1
+			for i, f := range fields {
+				if strings.ToLower(f.Name) == fieldSpec {
+					fieldIdx = i
+					break
+				}
+			}
+			if fieldIdx < 0 {
+				// Field not found in known composite type — silently skip.
+				return Datum{}, flowNone, nil
+			}
+			current := frame.values[idx]
+			frame.values[idx] = updateCompositeField(current, fieldIdx, len(fields), v)
 			return Datum{}, flowNone, nil
 		}
 		idx, ok := frame.lookup(s.Target)
@@ -1208,6 +1259,34 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 			}
 		}
 		if x.Schema != "" || x.Table != "" {
+			// Check for composite type field access: table=varName, column=fieldName.
+			// M0097-composite.
+			if x.Schema == "" {
+				varName := strings.ToLower(x.Table)
+				if fields, ok := frame.compositeVarFields[varName]; ok {
+					colName := strings.ToLower(x.Column)
+					for i, f := range fields {
+						if strings.ToLower(f.Name) == colName {
+							idx, ok2 := frame.lookup(varName)
+							if !ok2 {
+								break
+							}
+							val := frame.values[idx]
+							if val.IsNull() {
+								return &planner.NullConst{}, nil
+							}
+							fieldVal := extractCompositeField(val.StringValue(), i)
+							if fieldVal == "" {
+								return &planner.NullConst{}, nil
+							}
+							if n, err2 := strconv.ParseInt(fieldVal, 10, 64); err2 == nil {
+								return &planner.IntegerConst{Value: n}, nil
+							}
+							return &planner.StringConst{Value: fieldVal}, nil
+						}
+					}
+				}
+			}
 			return nil, &ExecError{Code: "0A000", Pos: x.Pos(), Message: "qualified names are not supported in PL/pgSQL expressions in v0"}
 		}
 		idx, ok := frame.lookup(x.Column)
@@ -1249,9 +1328,6 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 		}
 		return &planner.FuncCall{Name: x.Name.String(), Args: args, Star: x.Star}, nil
 	case *parser.ArrayConstructorExpr:
-		// ARRAY[e1, e2, ...] constructor inside a PL/pgSQL body. Lower each
-		// element and emit as array_construct so the executor formats the
-		// result as {v1,v2,...}. M0097-0065.
 		largs := make([]planner.Expr, len(x.Elements))
 		for i, el := range x.Elements {
 			lowered, err := lowerPLpgSQLExpr(el, frame)
@@ -1261,6 +1337,24 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 			largs[i] = lowered
 		}
 		return &planner.FuncCall{Name: "array_construct", Args: largs}, nil
+	case *parser.IsNullExpr:
+		// IS [NOT] NULL in PL/pgSQL condition expressions (e.g. "state is null").
+		op, err := lowerPLpgSQLExpr(x.Operand, frame)
+		if err != nil {
+			return nil, err
+		}
+		return &planner.IsNullExpr{Operand: op, Negated: x.Negated}, nil
+	case *parser.IsDistinctFromExpr:
+		// IS [NOT] DISTINCT FROM in PL/pgSQL expressions.
+		left, err := lowerPLpgSQLExpr(x.Left, frame)
+		if err != nil {
+			return nil, err
+		}
+		right, err := lowerPLpgSQLExpr(x.Right, frame)
+		if err != nil {
+			return nil, err
+		}
+		return &planner.IsDistinctFromExpr{Left: left, Right: right, Negated: x.Negated}, nil
 	default:
 		return nil, &ExecError{Code: "0A000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL expression %T", e)}
 	}
@@ -1919,4 +2013,50 @@ func rowToCompositeText(cols []catalog.Column, row Row) string {
 	}
 	sb.WriteByte(')')
 	return sb.String()
+}
+
+// ── Composite type helpers (M0097-composite) ─────────────────────────────────
+
+// extractCompositeField extracts the Nth field (0-based) from a PostgreSQL
+// composite literal like "(1,2,3)". Returns "" for NULL / missing fields.
+// This implementation handles simple (non-quoted) scalar fields that arise
+// from bigint / integer composite types (avg_state etc.).
+func extractCompositeField(s string, idx int) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "(") || !strings.HasSuffix(s, ")") {
+		return ""
+	}
+	inner := s[1 : len(s)-1]
+	parts := strings.Split(inner, ",")
+	if idx >= len(parts) {
+		return ""
+	}
+	return strings.TrimSpace(parts[idx])
+}
+
+// updateCompositeField returns a new composite literal Datum where the field
+// at fieldIdx (0-based) has been replaced by newVal.  If current is NULL the
+// other fields are initialised to empty (NULL).
+func updateCompositeField(current Datum, fieldIdx, nFields int, newVal Datum) Datum {
+	var parts []string
+	if current.IsNull() {
+		parts = make([]string, nFields)
+	} else {
+		s := strings.TrimSpace(current.StringValue())
+		if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+			inner := s[1 : len(s)-1]
+			parts = strings.Split(inner, ",")
+		} else {
+			parts = make([]string, nFields)
+		}
+	}
+	for len(parts) < nFields {
+		parts = append(parts, "")
+	}
+	if newVal.IsNull() {
+		parts[fieldIdx] = ""
+	} else {
+		parts[fieldIdx] = newVal.Format()
+	}
+	return NewStringDatum("(" + strings.Join(parts, ",") + ")")
 }

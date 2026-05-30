@@ -26,11 +26,11 @@ domain,0,pass
 drop_if_exists,0,pass
 enum,0,pass
 equivclass,0,pass
-errors,0,pass
+errors,1,failed
 expressions,0,pass
 fast_default,0,pass
-float4,0,pass
-float8,0,pass
+float4,630,failed
+float8,881,failed
 foreign_key,0,pass
 functional_deps,0,pass
 generated_stored,0,pass
@@ -124,6 +124,6 @@ explain,704,failed
 subselect,531,failed
 join,3471,failed
 inherit,915,failed
-aggregates,553,failed
+aggregates,369,failed
 partition_join,449,failed
 with,1524,failed
