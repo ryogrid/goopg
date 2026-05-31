@@ -2683,6 +2683,32 @@ M0097-0001 wires it up.
         var_pop(numeric) precision (~6), rank() type unification (~6), error section
         mismatches (~30), various smaller.
 
+      - **Progress 2026-05-31 (M0097-0118..0120 — aggregates 197→184 diff, 3 commits):**
+        Three commits (bd5abdad, 7fd2294c, 76e22031) reducing aggregates diff from 197 to 184:
+        (a) Youngs-Cramer variance algorithm: switch from Welford's to Youngs-Cramer
+            (N, Sx, Sxx accumulators) in applyAgg. Eliminates catastrophic cancellation
+            for large-offset float8 inputs (var_pop({1e8+3,...,1e8+7}) → 2.5 exactly, was
+            2.50000000558794). NaN/Inf inputs set floatM2=NaN so finishAgg returns NaN.
+        (b) variance() = var_samp: separate "variance" from "var_pop" in finishAgg.
+            PostgreSQL's variance() is sample variance (÷ n-1), not population variance.
+            Fixes variance(unique1::int4) over 40k rows: 8333333→8333541.
+        (c) Hypothetical-set agg with 0 actual rows: rank/dense_rank → 1, percent_rank → 0,
+            cume_dist → 1 (PG-compatible; was NullDatum).
+        (d) rank('3') with numeric ORDER BY: text/unknown direct args wrapped in explicit cast;
+            rank('fred') propagates runtime type error → "invalid input syntax".
+        (e) FILTER nested-agg error: "aggregate function calls cannot be nested" (was "not
+            allowed in FILTER") — matches PG for agg-in-FILTER-of-agg.
+        (f) withinGroupTypeName: canonical PG display names in WITHIN GROUP type mismatch errors.
+        (g) INITCOND in shared-state key: aggregates with different INITCONDs no longer share
+            transition state. Fixes my_avg_init2 returning 7 (shared) instead of 4.
+        (h) Strict sfunc with NULL state: skip sfunc call when state is already NULL.
+        (i) PlanError.Detail field + wire emission for future ordered-set agg grouping errors.
+        Remaining gaps (~184 diffs): aamin/aamax 2D array aggregation (~24),
+        outer-aggregate HAVING subquery (~13), 10000-row correlated agg (~18),
+        var_pop(numeric) precision (float4 storage format, ~6), rank(x) ungrouped var
+        detection (~5), collation-mismatch rank (~5), variance display format precision
+        (~6), error section mismatches (~30), various smaller.
+
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
       - These depend on planner equivalence-class and functional-
