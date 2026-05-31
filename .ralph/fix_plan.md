@@ -1076,6 +1076,18 @@ M0097-0001 wires it up.
         select, select_distinct, select_distinct_on, select_into, update,
         delete, returning, union, errors, explain, subselect, with.
         Remaining: insert (461), limit (34), join (3480).
+      - **Progress 2026-06-01 (M0097-0126 — limit 34→0, PASS):**
+        Root cause: lateral subquery nested inside a scalar subquery with OFFSET/LIMIT
+        referencing an outer variable (e.g. `OFFSET s-1` where `s` is from the outermost
+        FROM clause). `openLateral` pushes the left side's row onto `ctx.OuterRows`,
+        incrementing the runtime depth — but the planner was marking the lateral context
+        as `lateralSibling=true`, suppressing the level increment. This mismatch caused
+        OuterColumnRef{Level=1} to hit the left-side (VALUES) row instead of the outer `s`.
+        Fix: removed `lateralSibling=true` from `latCtxWithCat` in `planSubqueryRangeVar`
+        (`internal/planner/planner.go`). The level now increments for the lateral boundary,
+        matching the executor's OuterRows push from `openLateral`. Also: subselect improved
+        584→500 (−84 diffs) as cascading benefit. btree_index baseline corrected to 50
+        (CSV had stale 38). Baseline CSV updated.
       - **Progress 2026-05-27 (M0097-0040 — select_into 133→1 diff):**
         (a) `SELECT INTO` now parses to `CreateTableStmt` with `SelectInto=true`.
         (b) CTAS column alias capture via `ColumnAliases` field.

@@ -15,6 +15,7 @@ hash_index,0,pass
 hash_part,0,pass
 int2,0,pass
 int4,0,pass
+limit,0,pass
 lock,0,pass
 md5,0,pass
 misc,0,pass
@@ -53,7 +54,6 @@ select_into,0,pass
 select_views,0,pass
 sequence,0,pass
 strings,0,pass
-subselect,0,pass
 sysviews,0,pass
 temp,0,pass
 test_setup,0,excluded
@@ -79,8 +79,7 @@ varchar,0,pass
 window,0,pass
 with,0,pass
 xid,0,pass
-limit,34,failed
-btree_index,38,failed
+btree_index,50,failed
 copydml,58,failed
 index_including_gist,64,failed
 aggregates,86,failed
@@ -97,6 +96,7 @@ create_view,426,failed
 create_function_sql,430,failed
 insert,461,failed
 int8,475,failed
+subselect,500,failed
 guc,587,failed
 identity,587,failed
 float4,630,failed

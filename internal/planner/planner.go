@@ -2418,7 +2418,13 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// executor's OuterRows stack depth. M0097-0065.
 		if latCtxWithCat.parent == nil {
 			latCtxWithCat.parent = planParent
-			latCtxWithCat.lateralSibling = true
+			// Do NOT set lateralSibling=true: openLateral() pushes the left-side
+			// row onto ctx.OuterRows per right-side re-evaluation, so the lateral
+			// boundary introduces a new OuterRows depth level at runtime. Leaving
+			// lateralSibling false makes level increments agree with the executor's
+			// stack depth, so OuterColumnRef.Level correctly addresses ctx.OuterRows.
+			// This fixes OFFSET/LIMIT expressions that reference outer variables
+			// inside lateral subqueries nested within scalar subqueries. M0097-0065.
 		}
 		inner, err = planSelectWithParent(rv.Subquery, cat, &latCtxWithCat)
 	} else {
