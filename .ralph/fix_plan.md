@@ -2734,6 +2734,38 @@ M0097-0001 wires it up.
         outer-aggregate HAVING subquery (~13), 10000-row correlated agg (~18),
         var_pop(b::numeric) float4→numeric precision (~12), error section mismatches (~28),
         collation/ungrouped-var rank errors (~10), various smaller.
+      - **Progress 2026-06-01 (M0097-0122 — aggregates 170→153 diffs via 7 targeted fixes):**
+        (a) OSA ungrouped-var validation: `buildAggregateStage` now detects hypothetical-set
+            aggregates (rank/dense_rank/cume_dist/percent_rank) whose direct arg is an ungrouped
+            ColumnRef. Error: `column "X" must appear in the GROUP BY clause or be used in an
+            aggregate function` with DETAIL `Direct arguments of an ordered-set aggregate must use
+            only grouped columns.` (PlanError.Detail wired via planErrorHintFields).
+        (b) Nested agg in FILTER → "cannot be nested": `buildAggregateCall` now produces
+            `aggregate function calls cannot be nested` (matching PG) instead of `aggregate
+            functions are not allowed in FILTER` when an aggregate's FILTER contains another agg.
+        (c) generate_series FROM binding int4: `planTableFuncRangeVar` now uses int4 column type
+            when `generate_series(start, stop)` args are `*IntegerConst` (or already int4-typed).
+            Previously hardcoded int8. Fixes `rank('fred') within group (order by x) from
+            generate_series(1,5) x` runtime error saying "bigint" → now "integer".
+        (d) WITHIN GROUP integer literal display: in the `WITHIN GROUP types X and Y cannot be
+            matched` error, integer literal direct args now display as "integer" (int4) instead
+            of "int8"/"bigint", matching PG's behavior for untyped literal 3 in `rank(3)`.
+        (e) Function-not-exist integer literal display: in `function rank(X, name, name) does not
+            exist`, integer literal direct args display as "integer" instead of "int8".
+        (f) COMBINEFUNC support: `CreateAggregateStmt` gains `CombineFunc string`;
+            `catalog.UserAggregate` gains `CombineFunc string`; parser captures `COMBINEFUNC =
+            funcname` in `parseAggregateOptions`; `execCreateAggregate` stores it; `finishAgg`
+            calls `combinefunc(NULL, partial_state)` when `CombineFunc != ""`, enabling the `balk`
+            aggregate pattern (STRICT combinefunc with NULL first arg returns NULL → final NULL).
+        (g) NULLS NOT DISTINCT parse fix: `NULLS NOT DISTINCT` in CREATE UNIQUE INDEX now
+            correctly consumes the `DISTINCT` keyword token (was using `acceptIdentKeyword` which
+            only accepts identifier tokens, not the `KwDistinct` reserved keyword → "syntax error
+            at or near distinct" in the aggregates error section).
+        Remaining gaps (~153 diffs): var_pop(b::numeric) numeric precision (8), aamin/aamax
+        2D array aggregation (20), outer-aggregate HAVING/correlated subqueries (30+),
+        error section: "not allowed in WHERE" extras (4), "canceling stmt" extras (4),
+        "collation mismatch" missing (2), "column t1.f1" missing (2), avg_transfn NOTICE
+        extras (2), various smaller.
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.

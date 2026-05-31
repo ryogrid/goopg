@@ -2101,6 +2101,16 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 			return NullDatum
 		}
 		state := st.userState
+		// Apply CombineFunc when defined: combinefunc(NULL, partial_state).
+		// Even in non-parallel mode, PG calls the combine function once to merge
+		// the NULL initial combine-state with the single partial state. A STRICT
+		// combinefunc with a NULL first arg returns NULL (the balk aggregate pattern). M0097-0122.
+		if ua.CombineFunc != "" {
+			combined, cerr := executeSFuncCall(ua.CombineFunc, []Datum{NullDatum, state}, o.ctx)
+			if cerr == nil {
+				state = combined
+			}
+		}
 		if ua.FinalFunc == "" {
 			return state
 		}

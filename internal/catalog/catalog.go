@@ -443,6 +443,7 @@ type UserAggregate struct {
 	SType       string   // state type name
 	SFunc       string   // state transition function name
 	FinalFunc   string   // final function name (may be empty)
+	CombineFunc string   // combine function name for parallel agg (may be empty)
 	InitCond    string   // initial condition string (may be empty)
 	SFuncStrict bool     // true if sfunc is STRICT (skips NULL inputs)
 	Variadic    bool     // true when declared with VARIADIC input arg

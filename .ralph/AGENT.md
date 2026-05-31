@@ -5,6 +5,11 @@
 target platform is x86_64 Linux only. See `.ralph/specs/GOAL_AND_REQUIREMENTS.md`
 for the authoritative goals; pick work from `.ralph/fix_plan.md`.
 
+## At Start of Session
+
+You MUST execute the following commands at the start of every session.
+- `export GOMEMLIMIT=15GiB`
+
 ## Toolchain
 
 - Go (≥ 1.22, whatever is on PATH).

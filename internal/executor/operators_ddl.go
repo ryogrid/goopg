@@ -3454,12 +3454,13 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	}
 	// Register in the catalog so the planner and executor can find it.
 	agg := &catalog.UserAggregate{
-		Name:      strings.ToLower(s.Name.Name),
-		SType:     s.SType,
-		SFunc:     s.SFunc,
-		FinalFunc: s.FinalFunc,
-		InitCond:  s.InitCond,
-		Variadic:  s.Variadic,
+		Name:        strings.ToLower(s.Name.Name),
+		SType:       s.SType,
+		SFunc:       s.SFunc,
+		FinalFunc:   s.FinalFunc,
+		CombineFunc: s.CombineFunc,
+		InitCond:    s.InitCond,
+		Variadic:    s.Variadic,
 	}
 	if s.HasBaseType && s.BaseType != "" && s.BaseType != "*" && s.BaseType != "any" {
 		agg.ArgTypes = []string{s.BaseType}

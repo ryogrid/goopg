@@ -2840,13 +2840,20 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if len(rv.Columns) > 0 {
 		colName = rv.Columns[0]
 	}
+	// Use int4 when args are integer literals or int4-typed (PG overload resolution). M0097-0122.
+	seriesType := "int8"
+	if _, ok := start.(*IntegerConst); ok {
+		seriesType = "int4"
+	} else if t := exprType(start); t.Name == "int4" || t.Name == "integer" || t.Name == "int" {
+		seriesType = "int4"
+	}
 	tbl := &catalog.Table{
 		Name: alias,
 		Columns: []catalog.Column{
-			{Name: colName, Type: catalog.Type{Name: "int8"}, Ordinal: 0},
+			{Name: colName, Type: catalog.Type{Name: seriesType}, Ordinal: 0},
 		},
 	}
-	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: "int8"}, SourceTableIdx: sourceIdx}}
+	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: seriesType}, SourceTableIdx: sourceIdx}}
 	node := &GenerateSeries{pos: tf.Pos(), Start: start, Stop: stop, Step: step, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
@@ -3690,6 +3697,31 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
+		// Validate: for hypothetical-set aggregates (rank, dense_rank, cume_dist, percent_rank),
+		// direct args must not be ungrouped column refs. M0097-0122.
+		if isHypotheticalSetAggName(pa.Name) && pa.Arg != nil {
+			if cr, ok := pa.Arg.(*ColumnRef); ok {
+				if _, inGroup := groupByInputCol[cr.Index]; !inGroup {
+					qualName := cr.Name
+					for _, b := range inputCtx.bindings {
+						if b.table != nil && len(b.table.Columns) > 0 {
+							if cr.Index >= b.offset && cr.Index < b.offset+len(b.table.Columns) {
+								if b.alias != "" {
+									qualName = b.alias + "." + cr.Name
+								}
+								break
+							}
+						}
+					}
+					return nil, nil, nil, nil, &PlanError{
+						Pos:    fc.Pos(),
+						Code:   "42803",
+						Message: fmt.Sprintf(`column "%s" must appear in the GROUP BY clause or be used in an aggregate function`, qualName),
+						Detail:  "Direct arguments of an ordered-set aggregate must use only grouped columns.",
+					}
+				}
+			}
+		}
 		idx := len(outputSchema)
 		aggByKey[k] = aggregateBinding{index: idx, typ: pa.Type}
 		plannedAggs = append(plannedAggs, pa)
@@ -4499,7 +4531,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		// Aggregate functions are not allowed inside a FILTER clause.
 		if exprHasAggregate(fc.Filter) {
 			return AggregateCall{}, &PlanError{Pos: fc.Filter.Pos(), Code: "42803",
-				Message: "aggregate functions are not allowed in FILTER"}
+				Message: "aggregate function calls cannot be nested"}
 		}
 	}
 	// Validate WITHIN GROUP for non-ordered-set aggregates early (before arg checks).
@@ -4657,12 +4689,17 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			if nDirect != nOrder {
 				// Build "function rank(type1, type2, ...) does not exist" message matching PG.
 				var sigParts []string
-				for _, arg := range fc.Args {
+				for i, arg := range fc.Args {
 					ra, _ := resolveExpr(arg, inputCtx)
 					t := exprType(ra).Name
 					if t == "" || t == "unknown" {
 						t = "text"
 					}
+					// Integer literals default to "integer" (int4) in PG error messages. M0097-0122.
+					if _, isInt := arg.(*parser.IntegerConst); isInt && (t == "int8" || t == "bigint") {
+						t = "integer"
+					}
+					_ = i
 					sigParts = append(sigParts, t)
 				}
 				for _, sk := range withinGroupKeys {
@@ -4708,9 +4745,14 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 					argT = orderT
 				}
 				if !isTypeCompatibleForHypothetical(argT, orderT) {
+					// Integer literals display as "integer" (int4) in PG error messages. M0097-0122.
+					displayArgT := argT
+					if _, isInt := argE.(*parser.IntegerConst); isInt && (argT == "int8" || argT == "bigint") {
+						displayArgT = "integer"
+					}
 					return AggregateCall{}, &PlanError{Pos: argE.Pos(), Code: "42P13",
 						Message: fmt.Sprintf("WITHIN GROUP types %s and %s cannot be matched",
-							withinGroupTypeName(orderT), withinGroupTypeName(argT))}
+							withinGroupTypeName(orderT), withinGroupTypeName(displayArgT))}
 				}
 			}
 		}
@@ -6805,11 +6847,15 @@ func exprType(e Expr) catalog.Type {
 			// random() → float8 in [0,1). M0097-0042.
 			return catalog.Type{Name: "float8"}
 		case "generate_series":
-			// generate_series returns int4 for int4 args, int8 for int8/untyped args (PG overload rules).
+			// generate_series returns int4 for int4 args or integer literals (PG overload rules).
 			if len(x.Args) >= 1 {
 				argT := exprType(x.Args[0]).Name
 				switch argT {
 				case "int4", "integer", "int":
+					return catalog.Type{Name: "int4"}
+				}
+				// Integer literals (untyped) default to int4 overload, matching PG's overload resolution.
+				if _, ok := x.Args[0].(*IntegerConst); ok {
 					return catalog.Type{Name: "int4"}
 				}
 			}
@@ -6912,6 +6958,16 @@ func withinGroupDirectArgColumnName(e Expr) string {
 		return withinGroupDirectArgColumnName(x.Operand)
 	}
 	return "expression"
+}
+
+// isHypotheticalSetAggName returns true for built-in hypothetical-set aggregates
+// whose direct args must be constants or GROUP BY cols. M0097-0122.
+func isHypotheticalSetAggName(name string) bool {
+	switch strings.ToLower(name) {
+	case "rank", "dense_rank", "cume_dist", "percent_rank":
+		return true
+	}
+	return false
 }
 
 // withinGroupTypeName converts internal type names to PG-compatible display names

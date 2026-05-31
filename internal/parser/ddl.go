@@ -322,8 +322,10 @@ func (p *parser) parseAggregateOptions(stmt *CreateAggregateStmt) error {
 				stmt.FinalFunc = strings.ToLower(valStr)
 			case "initcond", "initcond1":
 				stmt.InitCond = valStr
+			case "combinefunc":
+				stmt.CombineFunc = strings.ToLower(valStr)
 			// Accepted but ignored options.
-			case "parallel", "sspace", "combinefunc", "serialfunc", "deserialfunc",
+			case "parallel", "sspace", "serialfunc", "deserialfunc",
 				"mstype", "msfunc", "minvfunc", "mfinalfunc", "minitcond",
 				"sortop", "hypothetical", "mspace":
 				// ignore
@@ -1886,9 +1888,12 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 		}
 	}
 	// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+ unique index option) — accept and discard.
+	// DISTINCT may be a reserved keyword token (KwDistinct), not just an identifier.
 	if p.acceptIdentKeyword("nulls") {
 		_ = p.acceptKeyword(KwNot)
-		_ = p.acceptIdentKeyword("distinct")
+		if !p.acceptKeyword(KwDistinct) {
+			_ = p.acceptIdentKeyword("distinct")
+		}
 	}
 	// Optional WHERE predicate (partial index) — parse and discard.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhere {

@@ -1152,6 +1152,7 @@ type CreateAggregateStmt struct {
 	SType       string // state type (e.g. "int4")
 	SFunc       string // state transition function name
 	FinalFunc   string // final function name
+	CombineFunc string // combine function name (for parallel aggregation)
 	InitCond    string // initial condition string (e.g. "0" or "{0,0}")
 }
 
