@@ -2949,7 +2949,26 @@ func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Contex
 			return NullDatum
 		}
 		// Array form: percentile_disc(array[p1,p2,...]) WITHIN GROUP (ORDER BY x)
-		// returns an array of discrete values. The array may be 2D ({{...}}). M0097-0035.
+		// returns an array of discrete values. 2D arrays preserve structure. M0097-0125.
+		if rows, ok := tryParseFloat2DArray(p); ok {
+			result2D := make([][]string, len(rows))
+			for r, row := range rows {
+				result2D[r] = make([]string, len(row))
+				for c, pf := range row {
+					if math.IsNaN(pf) || pf < 0 || pf > 1 {
+						result2D[r][c] = "NULL"
+						continue
+					}
+					d := percentileDiscOneFloat(orderedVals, n, pf)
+					if d.IsNull() {
+						result2D[r][c] = "NULL"
+					} else {
+						result2D[r][c] = d.Format()
+					}
+				}
+			}
+			return NewStringDatum(format2DTextArray(result2D))
+		}
 		if fracs, ok := tryParseFloatArray(p); ok {
 			results := make([]string, len(fracs))
 			for i, pf := range fracs {
@@ -3160,6 +3179,87 @@ func tryParseFloatArray(d Datum) ([]float64, bool) {
 		fracs = append(fracs, f)
 	}
 	return fracs, true
+}
+
+// tryParseFloat2DArray parses a 2D array string like {{null,1,0.5},{0.75,0.25,null}}
+// into a slice of rows, each row being a slice of float64 (NaN for NULL).
+// Returns (rows, true) if input is a well-formed 2D array; otherwise (nil, false). M0097-0125.
+func tryParseFloat2DArray(d Datum) ([][]float64, bool) {
+	sv := ""
+	switch d.Kind {
+	case KindString:
+		sv = d.StringValue()
+	case KindBytes:
+		sv = string(d.BytesValue())
+	default:
+		return nil, false
+	}
+	sv = strings.TrimSpace(sv)
+	// Must start with {{ to be a 2D array.
+	if !strings.HasPrefix(sv, "{{") {
+		return nil, false
+	}
+	// Strip outer braces: {{a,b},{c,d}} → {a,b},{c,d}
+	inner := sv[1 : len(sv)-1]
+	// Split into rows: find each {...} sub-array.
+	var rows [][]float64
+	depth := 0
+	start := -1
+	for i, ch := range inner {
+		switch ch {
+		case '{':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}':
+			depth--
+			if depth == 0 && start >= 0 {
+				rowStr := inner[start+1 : i] // strip { and }
+				parts := strings.Split(rowStr, ",")
+				row := make([]float64, len(parts))
+				for j, p := range parts {
+					p = strings.TrimSpace(p)
+					if strings.EqualFold(p, "null") || p == "" {
+						row[j] = math.NaN()
+						continue
+					}
+					f, err := strconv.ParseFloat(p, 64)
+					if err != nil {
+						return nil, false
+					}
+					row[j] = f
+				}
+				rows = append(rows, row)
+				start = -1
+			}
+		}
+	}
+	if len(rows) == 0 {
+		return nil, false
+	}
+	return rows, true
+}
+
+// format2DTextArray formats a 2D slice of string values as {{a,b},{c,d}}. M0097-0125.
+func format2DTextArray(rows [][]string) string {
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, row := range rows {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('{')
+		for j, v := range row {
+			if j > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(v)
+		}
+		sb.WriteByte('}')
+	}
+	sb.WriteByte('}')
+	return sb.String()
 }
 
 // percentileContOneFloat computes percentile_cont for a single fraction pf

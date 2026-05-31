@@ -2134,17 +2134,18 @@ func (p *parser) parseTrimFuncCall(pos int) (Expr, error) {
 
 // parseArrayConstructor parses ARRAY[e1, e2, ...] — the caller has already
 // consumed the `array` identifier and the current token is `[`. M0097-0042.
+// Handles nested sub-array syntax ARRAY[[a,b],[c,d]] for 2D arrays. M0097-0125.
 func (p *parser) parseArrayConstructor(pos int) (Expr, error) {
 	p.advance() // consume '['
 	var elems []Expr
 	if !(p.cur().Kind == TokenSymbol && p.cur().Value == "]") {
-		first, err := p.parseExpr()
+		first, err := p.parseArrayElement(pos)
 		if err != nil {
 			return nil, err
 		}
 		elems = append(elems, first)
 		for p.acceptSymbol(",") {
-			elem, err := p.parseExpr()
+			elem, err := p.parseArrayElement(pos)
 			if err != nil {
 				return nil, err
 			}
@@ -2155,6 +2156,16 @@ func (p *parser) parseArrayConstructor(pos int) (Expr, error) {
 		return nil, p.errAtCur("expected ']' after array elements")
 	}
 	return &ArrayConstructorExpr{pos: pos, Elements: elems}, nil
+}
+
+// parseArrayElement parses one element inside ARRAY[...]. If the element
+// starts with '[', it is a nested sub-array (2D array syntax). M0097-0125.
+func (p *parser) parseArrayElement(_ int) (Expr, error) {
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+		subPos := p.cur().Pos
+		return p.parseArrayConstructor(subPos)
+	}
+	return p.parseExpr()
 }
 
 // peekBinaryOp returns the OpCode and precedence of the current

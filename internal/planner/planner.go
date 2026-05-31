@@ -2644,7 +2644,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 						retType = catalog.Type{Name: u.castType}
 						break
 					}
-					// Infer element type from array arg type (strip [] suffix).
+					// Infer element type from array arg type (strip ALL [] for 2D). M0097-0125.
 					arrType := "text" // default
 					// Unwrap CastExpr to get the inner FuncCall.
 					innerExpr := t.Expr
@@ -2655,10 +2655,12 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 						resolved, err2 := resolveExpr(fc2.Args[0], ctx)
 						if err2 == nil {
 							at := exprType(resolved).Name
-							if strings.HasSuffix(at, "[]") {
-								arrType = at[:len(at)-2]
-							} else {
-								arrType = "text"
+							base := at
+							for strings.HasSuffix(base, "[]") {
+								base = base[:len(base)-2]
+							}
+							if base != at && base != "" {
+								arrType = base
 							}
 						}
 					}
@@ -2930,12 +2932,15 @@ func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveCont
 	if err != nil {
 		return nil, rangeBinding{}, err
 	}
-	// Infer the element type from the array expression type.
+	// Infer the element type from the array expression type (strip ALL [] for 2D). M0097-0125.
 	elemTypeName := "text"
 	arrType := exprType(arrExpr)
-	if strings.HasSuffix(arrType.Name, "[]") {
-		base := strings.TrimSuffix(arrType.Name, "[]")
-		if base != "" {
+	{
+		base := arrType.Name
+		for strings.HasSuffix(base, "[]") {
+			base = base[:len(base)-2]
+		}
+		if base != arrType.Name && base != "" {
 			elemTypeName = base
 		}
 	}
@@ -6876,10 +6881,15 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "int8"}
 		case "unnest":
 			// unnest(array) returns the element type. M0097-0106.
+			// Strip ALL [] suffixes to handle 2D arrays (e.g. int[][] → int). M0097-0125.
 			if len(x.Args) == 1 {
 				at := exprType(x.Args[0]).Name
-				if strings.HasSuffix(at, "[]") {
-					return catalog.Type{Name: at[:len(at)-2]}
+				base := at
+				for strings.HasSuffix(base, "[]") {
+					base = base[:len(base)-2]
+				}
+				if base != at && base != "" {
+					return catalog.Type{Name: base}
 				}
 			}
 			return catalog.Type{Name: "text"}

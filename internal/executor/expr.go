@@ -8247,9 +8247,11 @@ func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error)
 			parts[i] = s
 		}
 	}
-	// When all elements are NULL (e.g., from null-extending outer join side),
-	// return NULL for the whole row — matching PostgreSQL's outer-join null semantics.
-	if allNull {
+	// When all elements are NULL AND the row has zero elements, return NullDatum.
+	// For non-empty rows, even if all elements are NULL, return "()" to match
+	// PostgreSQL's display of a row with all-null fields (e.g. SELECT foo FROM
+	// (SELECT NULL) AS foo → "()", not NULL). M0097-0125.
+	if allNull && len(parts) == 0 {
 		return NullDatum, nil
 	}
 	return NewStringDatum("(" + strings.Join(parts, ",") + ")"), nil
