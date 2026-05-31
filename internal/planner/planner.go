@@ -4494,12 +4494,11 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		if ferr != nil {
 			return AggregateCall{}, ferr
 		}
-		// Aggregate functions nested inside a FILTER clause are not allowed. M0097-0117.
-		// PG uses "aggregate functions are not allowed in FILTER" for direct filter
-		// errors (not nested-agg-in-agg which is the "cannot be nested" path).
+		// Aggregate functions nested inside a FILTER clause are not allowed.
+		// PostgreSQL reports "aggregate function calls cannot be nested" here.
 		if exprHasAggregate(fc.Filter) {
 			return AggregateCall{}, &PlanError{Pos: fc.Filter.Pos(), Code: "42803",
-				Message: "aggregate functions are not allowed in FILTER"}
+				Message: "aggregate function calls cannot be nested"}
 		}
 	}
 	// Validate WITHIN GROUP for non-ordered-set aggregates early (before arg checks).
@@ -4669,9 +4668,31 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 				}
 				argT := exprType(resolvedArg).Name
 				orderT := exprType(withinGroupKeys[i].Expr).Name
+				// If the direct arg is a text/unknown literal and the ORDER BY column is
+				// numeric, wrap the main argExpr in an explicit cast so it coerces at
+				// runtime (e.g. rank('3') within group (order by int_col)).
+				// Invalid strings ('fred') will then fail at runtime with a type error,
+				// matching PostgreSQL's behavior.
+				aLow := strings.ToLower(argT)
+				oLow := strings.ToLower(orderT)
+				isNumericOrderT := func(t string) bool {
+					switch t {
+					case "int2", "int4", "int8", "int", "integer", "smallint", "bigint",
+						"float4", "float8", "real", "double precision", "numeric", "decimal":
+						return true
+					}
+					return false
+				}
+				if (aLow == "text" || aLow == "unknown") && isNumericOrderT(oLow) {
+					if i == 0 {
+						argExpr = &CastExpr{Operand: argExpr, TargetType: orderT}
+					}
+					argT = orderT
+				}
 				if !isTypeCompatibleForHypothetical(argT, orderT) {
 					return AggregateCall{}, &PlanError{Pos: argE.Pos(), Code: "42P13",
-						Message: fmt.Sprintf("WITHIN GROUP types %s and %s cannot be matched", orderT, argT)}
+						Message: fmt.Sprintf("WITHIN GROUP types %s and %s cannot be matched",
+							withinGroupTypeName(orderT), withinGroupTypeName(argT))}
 				}
 			}
 		}
@@ -6841,6 +6862,24 @@ func isTypeCompatibleForHypothetical(orderT, argT string) bool {
 		return true
 	}
 	return false
+}
+
+// withinGroupTypeName converts internal type names to PG-compatible display names
+// for WITHIN GROUP type mismatch error messages.
+func withinGroupTypeName(t string) string {
+	switch strings.ToLower(t) {
+	case "int4", "int", "serial":
+		return "integer"
+	case "int8", "bigint", "bigserial":
+		return "bigint"
+	case "int2", "smallint", "smallserial":
+		return "smallint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision":
+		return "double precision"
+	}
+	return t
 }
 
 // isOrderedSetFinalFunc returns true if the finalfunc name corresponds to a

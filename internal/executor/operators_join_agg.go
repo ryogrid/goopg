@@ -962,8 +962,8 @@ type aggRuntime struct {
 	arrayElemKeys [][]Datum
 	// Variance accumulators (var_pop/var_samp/stddev_pop/stddev_samp).
 	// Uses Welford's online algorithm for numerical stability.
-	floatMean float64 // running mean (Welford M)
-	floatM2   float64 // running sum of squared deviations (Welford S)
+	floatSx float64 // running sum of values (Youngs-Cramer Sx)
+	floatM2 float64 // running sum of squared deviations (Youngs-Cramer Sxx)
 	// Regression accumulators for regr_*/covar_*/corr. M0097-0020.
 	// Follows PostgreSQL's float8_regr_accum signature: first arg is y, second is x.
 	regrN     int64   // count of non-NULL (x,y) pairs
@@ -1219,12 +1219,15 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 	// evaluated lazily in finishAgg from the first row's value. M0097-0035.
 	if call.WithinGroup && len(call.WithinGroupOrderBy) > 0 {
 		// Evaluate the direct argument (call.Arg) from the first row.
+		// If evaluation fails (e.g. rank('fred') with int ORDER BY), propagate
+		// the error so the caller sees "invalid input syntax" instead of NULL.
 		if !st.withinGroupDirectArgSet && call.Arg != nil {
 			v, verr := evalExprSlot(call.Arg, slot, o.ctx)
-			if verr == nil {
-				st.withinGroupDirectArg = v
-				st.withinGroupDirectArgSet = true
+			if verr != nil {
+				return verr
 			}
+			st.withinGroupDirectArg = v
+			st.withinGroupDirectArgSet = true
 		}
 		row := make([]Datum, len(call.WithinGroupOrderBy))
 		allNull := true
@@ -1665,12 +1668,18 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 				if isFloat4TypeName(call.InputType.Name) {
 					f = float64(float32(f))
 				}
-				// Welford's online algorithm for numerical stability
+				// Youngs-Cramer algorithm: numerically stable for large-offset inputs.
+				// tmp = x*N - Sx avoids subtracting two large nearly-equal values.
+				// NaN/Inf propagates through the computation; we mark floatM2 = NaN
+				// so the final result is NaN regardless of count (matches PG behavior).
 				st.count++
-				delta := f - st.floatMean
-				st.floatMean += delta / float64(st.count)
-				delta2 := f - st.floatMean
-				st.floatM2 += delta * delta2
+				st.floatSx += f
+				if math.IsNaN(f) || math.IsInf(f, 0) {
+					st.floatM2 = math.NaN()
+				} else if st.count > 1 && !math.IsNaN(st.floatM2) {
+					tmp := f*float64(st.count) - st.floatSx
+					st.floatM2 += tmp * tmp / (float64(st.count) * float64(st.count-1))
+				}
 			}
 		case "regr_count", "regr_sxx", "regr_syy", "regr_sxy",
 			"regr_avgx", "regr_avgy", "regr_r2", "regr_slope", "regr_intercept",
@@ -2019,13 +2028,14 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 	}
 	// Variance/stddev aggregates. M0097-0007.
 	switch strings.ToLower(call.Name) {
-	case "var_pop", "variance":
+	case "var_pop":
 		if st.count == 0 {
 			return NullDatum
 		}
 		varPop := st.floatM2 / float64(st.count)
 		return NewStringDatum(strconv.FormatFloat(varPop, 'g', 15, 64))
-	case "var_samp":
+	case "variance", "var_samp":
+		// In PostgreSQL, variance() = var_samp() (sample variance, divides by n-1).
 		if st.count < 2 {
 			return NullDatum
 		}
@@ -2449,6 +2459,16 @@ func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Contex
 	name := strings.ToLower(call.Name)
 	elems := st.withinGroupElems
 	if len(elems) == 0 {
+		// Hypothetical-set aggregates return a defined value when there are 0 actual rows:
+		// the hypothetical row is alone so rank=1, percent_rank=0, cume_dist=1.
+		switch name {
+		case "rank", "dense_rank":
+			return NewIntDatum(1)
+		case "percent_rank":
+			return NewStringDatum("0")
+		case "cume_dist":
+			return NewStringDatum("1")
+		}
 		return NullDatum
 	}
 
