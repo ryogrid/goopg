@@ -711,10 +711,17 @@ func planErrorFields(err error) (sqlstate.Code, string) {
 // by the error. Returns nil when no hint is present. M0097-0003.
 func planErrorHintFields(err error) []protocol.ErrorField {
 	var pe *planner.PlanError
-	if errors.As(err, &pe) && pe.Hint != "" {
-		return []protocol.ErrorField{{Code: protocol.FieldHint, Value: pe.Hint}}
+	if !errors.As(err, &pe) {
+		return nil
 	}
-	return nil
+	var fields []protocol.ErrorField
+	if pe.Detail != "" {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldDetail, Value: pe.Detail})
+	}
+	if pe.Hint != "" {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldHint, Value: pe.Hint})
+	}
+	return fields
 }
 
 func execErrCode(err error) sqlstate.Code {

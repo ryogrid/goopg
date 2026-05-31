@@ -30,6 +30,7 @@ type PlanError struct {
 	Code    string
 	Message string
 	Hint    string // optional hint message (emitted as 'H' field in wire protocol)
+	Detail  string // optional detail message (emitted as 'D' field in wire protocol)
 }
 
 func (e *PlanError) Error() string {
@@ -4661,7 +4662,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 						name, nDirect, nOrder),
 				}
 			}
-			// Validate that direct arg types are compatible with ordering column types.
+				// Validate that direct arg types are compatible with ordering column types.
 			for i, argE := range fc.Args {
 				resolvedArg, aerr := resolveExpr(argE, inputCtx)
 				if aerr != nil {
@@ -6863,6 +6864,18 @@ func isTypeCompatibleForHypothetical(orderT, argT string) bool {
 		return true
 	}
 	return false
+}
+
+// withinGroupDirectArgColumnName extracts a display name from a non-constant
+// WITHIN GROUP direct arg expression for error messages.
+func withinGroupDirectArgColumnName(e Expr) string {
+	switch x := e.(type) {
+	case *ColumnRef:
+		return x.Name
+	case *CastExpr:
+		return withinGroupDirectArgColumnName(x.Operand)
+	}
+	return "expression"
 }
 
 // withinGroupTypeName converts internal type names to PG-compatible display names
