@@ -1540,9 +1540,11 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 	default:
 		// User-defined aggregates (CREATE AGGREGATE): call sfunc on each row.
 		if call.UserAgg != nil {
-			// For DISTINCT aggregates, accumulate all arg vectors for deduplication
-			// and optional ORDER BY sorting in finishAgg. M0097-0035.
-			if call.Distinct {
+			// For DISTINCT or ORDER BY aggregates, accumulate all arg vectors for
+			// deduplication and/or sorting in finishAgg. M0097-0035.
+			// Non-DISTINCT with ORDER BY also needs row accumulation so rows can
+			// be sorted before sfunc calls (PostgreSQL semantics). M0097-0113.
+			if call.Distinct || len(call.OrderBy) > 0 {
 				// Build row: [sortKey0, ..., arg0, arg1, ...extraArgs].
 				// Sort keys first (for ORDER BY), then arg values for sfunc. M0097-0035.
 				nSortKeys := len(call.OrderBy)
@@ -1676,24 +1678,30 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 	// Handle user-defined aggregates first.
 	if call.UserAgg != nil {
 		ua := call.UserAgg
-		// For DISTINCT user-defined aggregates: deduplicate, sort, then call sfunc. M0097-0035.
-		if call.Distinct && len(st.distinctUserAggRows) > 0 {
+		// For DISTINCT or ORDER BY user-defined aggregates: deduplicate and/or sort,
+		// then call sfunc in the resulting order. M0097-0035 / M0097-0113.
+		if (call.Distinct || len(call.OrderBy) > 0) && len(st.distinctUserAggRows) > 0 {
 			nSortKeys := len(call.OrderBy)
-			// Deduplicate by all arg values (rows[nSortKeys:]).
-			seen := map[string]struct{}{}
+			// Deduplicate by all arg values (rows[nSortKeys:]) when DISTINCT is requested.
 			var deduped [][]Datum
-			for _, row := range st.distinctUserAggRows {
-				argSlice := row[nSortKeys:]
-				var keyParts []string
-				for _, d := range argSlice {
-					keyParts = append(keyParts, datumKey(d))
+			if call.Distinct {
+				seen := map[string]struct{}{}
+				for _, row := range st.distinctUserAggRows {
+					argSlice := row[nSortKeys:]
+					var keyParts []string
+					for _, d := range argSlice {
+						keyParts = append(keyParts, datumKey(d))
+					}
+					k := strings.Join(keyParts, "	")
+					if _, ok := seen[k]; ok {
+						continue
+					}
+					seen[k] = struct{}{}
+					deduped = append(deduped, row)
 				}
-				k := strings.Join(keyParts, "	")
-				if _, ok := seen[k]; ok {
-					continue
-				}
-				seen[k] = struct{}{}
-				deduped = append(deduped, row)
+			} else {
+				// No dedup: use all accumulated rows in order (ORDER BY only).
+				deduped = st.distinctUserAggRows
 			}
 			// Sort by ORDER BY sort keys when present. When no ORDER BY is given,
 			// sort by the argument values (PostgreSQL's default for DISTINCT

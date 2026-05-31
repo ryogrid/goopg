@@ -1411,12 +1411,24 @@ func (p *parser) parseSortItem() (SortBy, error) {
 
 // parseSortUsingOperator consumes the operator (or identifier/qualified name) that
 // follows ORDER BY expr USING.  Returns the raw operator string.
+// Multi-character operators like ~<~ are tokenized as separate single-char operator
+// tokens (~, <, ~) by the lexer, so we greedily concatenate adjacent operator tokens.
 func (p *parser) parseSortUsingOperator() string {
 	cur := p.cur()
 	switch cur.Kind {
 	case TokenOperator, TokenSymbol:
+		// Greedily consume consecutive operator tokens to handle multi-char
+		// operators like ~<~, ~>~, ~<=~, ~>=~ which the lexer splits into parts.
+		// Only TokenOperator tokens are concatenated; TokenSymbol (,;().[]) are delimiters.
+		op := cur.Value
 		p.advance()
-		return cur.Value
+		if cur.Kind == TokenOperator {
+			for p.cur().Kind == TokenOperator {
+				op += p.cur().Value
+				p.advance()
+			}
+		}
+		return op
 	case TokenIdent:
 		// Could be a simple name (varchar_lt) or schema-qualified (pg_catalog.int4lt).
 		name := cur.Value
@@ -1441,8 +1453,8 @@ func (p *parser) parseSortUsingOperator() string {
 // sortUsingIsDesc returns true when op is a "greater-than"-style operator,
 // meaning ORDER BY x USING op should sort descending.
 func sortUsingIsDesc(op string) bool {
-	// Symbol operators: > or >=
-	if op == ">" || op == ">=" {
+	// Symbol operators: > or >= (and locale-independent variants ~>~ / ~>=~).
+	if op == ">" || op == ">=" || op == "~>~" || op == "~>=~" {
 		return true
 	}
 	// Named operators: anything containing "gt" as a suffix or standalone.
