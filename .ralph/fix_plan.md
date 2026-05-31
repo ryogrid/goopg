@@ -2709,6 +2709,32 @@ M0097-0001 wires it up.
         detection (~5), collation-mismatch rank (~5), variance display format precision
         (~6), error section mismatches (~30), various smaller.
 
+      - **Progress 2026-06-01 (M0097-0121 — aggregates 184→170 diff, 7 fixes):**
+        Seven targeted fixes (commit c143d4b6):
+        (a) DEFERRABLE in table-level PRIMARY KEY constraint (parser/ddl.go): accepts
+            and discards [NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]. Fixes
+            spurious 'relation t3 does not exist' errors from t3 table creation failure.
+        (b) Partial column alias lists in FROM clause (planner.go): `FROM t alias (col1)`
+            now accepted when fewer aliases than columns — matches PostgreSQL semantics.
+            Removes 'table X has 16 columns available but 1 columns specified' error.
+        (c) generate_series return type: int4 for int4 args (was int8). Fixes
+            'invalid input syntax for type bigint' → 'for type integer' in rank errors.
+        (d) FILTER error message: 'aggregate functions are not allowed in FILTER'
+            (was 'aggregate function calls cannot be nested' in FILTER context).
+        (e) Rank arg-count error format: 'function rank(type1, type2, ...) does not exist'
+            with HINT, matching PostgreSQL (was 'WITHIN GROUP arguments do not match').
+        (f) Multi-arg rank/dense_rank WITHIN GROUP: rank(5,'AZZZZ',50) WITHIN GROUP
+            (ORDER BY col1, col2 DESC, col1) now correctly does tuple comparison,
+            returns 67 for ten=5 over tenk1 (was returning 1 due to single-key comparison).
+        (g) Exact integer variance/stddev: variance(int4) uses big.Int accumulation
+            + big.Rat rational output with 12 decimal places, matching PostgreSQL's
+            numeric_poly_var_samp. variance(unique1::int4) = 8333541.588539713493 (was
+            8333541.58853976).
+        Remaining gaps (~170 diffs): aamin/aamax 2D array aggregation (~24),
+        outer-aggregate HAVING subquery (~13), 10000-row correlated agg (~18),
+        var_pop(b::numeric) float4→numeric precision (~12), error section mismatches (~28),
+        collation/ungrouped-var rank errors (~10), various smaller.
+
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
       - These depend on planner equivalence-class and functional-
