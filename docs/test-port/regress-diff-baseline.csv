@@ -124,6 +124,6 @@ explain,704,failed
 subselect,531,failed
 join,3471,failed
 inherit,915,failed
-aggregates,328,failed
+aggregates,314,failed
 partition_join,449,failed
 with,1524,failed

@@ -2561,6 +2561,37 @@ M0097-0001 wires it up.
             to fail. Fix: greedily concatenate consecutive `TokenOperator`
             tokens. Also added `~>~`/`~>=~` recognition to `sortUsingIsDesc`.
         Remaining aggregates blockers: float precision (~80 diffs), complex
+        
+      - **Progress 2026-05-31 (M0097-0114 — aggregates 328→314 diff):**
+        Six fixes (multiple commits):
+        (a) Unnest element type inference (`internal/planner/planner.go`):
+            `buildSelectSrfProjectSet` auto-infer switch now normalises type
+            aliases — `"int"`, `"integer"`, `"bigint"`, `"real"`, etc. map to
+            canonical forms (`"int4"`, `"int8"`, `"float4"`) so
+            `unnest(array_agg(x))` where x has type `int` correctly casts
+            elements to `int4`. Fixes `v_pagg_test` `amax`/`aamax` wrong values
+            (`max("990","5000")="990"` → `max(990,5000)=5000`).
+        (b) PL/pgSQL array subscript assignment (`x[1] := expr`): Added
+            `ArraySubscriptAssignStmt` to plpgsql AST; `parseAssign` now
+            detects `[` after identifier; `parseArraySubscriptAssign` parses
+            subscript + value; `executePLpgSQLStmt` handles runtime: updates
+            the array element in-place.
+        (c) PL/pgSQL array subscript read (`x[1]` in expression): Added
+            `*parser.ArraySubscriptExpr` to `lowerPLpgSQLExpr` → emitted as
+            `FuncCall("array_subscript", [base, index])`.
+        (d) `%TYPE` in PL/pgSQL DECLARE: `parseTypeRef` now detects `%TYPE`
+            suffix (tokenized as `TokenOperator"%"` + ident `"TYPE"`) and
+            returns `text` as stand-in type — enables `res x%TYPE` syntax.
+        (e) STRICT plpgsql functions: `executePLpgSQLRoutine` and
+            `evalPLpgSQLFunctionSetof` now check `r.Strict` and return
+            `NullDatum`/`nil` immediately when any arg is NULL.
+        (f) `array_fill(val, dims)` implemented in `evalFuncCall`: fills a
+            1-D array of `dims[0]` copies of `val`.
+        (g) Rank() hypothetical-set arg-count validation (`buildAggregateCall`):
+            validates N direct args == N ORDER BY cols for rank/dense_rank/
+            cume_dist/percent_rank; type incompatibility raises
+            `WITHIN GROUP types X and Y cannot be matched`.
+        Baseline CSV updated: aggregates 328→314.
         correlated subqueries (HAVING with outer aggregate, ~30), nested array
         aggregation (aamin/aamax ~20), column alignment (~20), error section (~30).
 

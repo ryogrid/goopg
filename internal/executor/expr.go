@@ -4334,6 +4334,39 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NullDatum, nil
 
+	case "array_fill":
+		// array_fill(val, dims_array[, lb_array]) → fills an array with val repeated N times.
+		// array_fill(1.0, ARRAY[4]) = {1.0,1.0,1.0,1.0}. Only 1-D supported. M0097-0113.
+		if len(x.Args) >= 2 {
+			val, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			dimsD, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if val.IsNull() || dimsD.IsNull() {
+				return NullDatum, nil
+			}
+			// dimsD is an array like {4} — parse it and get the first dimension.
+			dimElems := parseTextArray(dimsD.StringValue())
+			n := int64(0)
+			if len(dimElems) > 0 {
+				n, _ = strconv.ParseInt(dimElems[0], 10, 64)
+			}
+			valStr := val.Format()
+			if val.IsNull() {
+				valStr = "NULL"
+			}
+			elems := make([]string, n)
+			for i := range elems {
+				elems[i] = valStr
+			}
+			return NewStringDatum("{" + strings.Join(elems, ",") + "}"), nil
+		}
+		return NullDatum, nil
+
 	case "array_construct":
 		// array_construct(e1, e2, ...) → text representation of array {v1,v2,...}
 		// Used to evaluate ARRAY[e1, e2, ...] constructors. M0097-0042.

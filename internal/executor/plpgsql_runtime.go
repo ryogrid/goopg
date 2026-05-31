@@ -288,6 +288,14 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 // accumulation and returns all collected rows. Used by the ProjectSet operator
 // for user-defined SETOF plpgsql functions in SELECT target lists. M0097-0073.
 func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos int) ([]Datum, error) {
+	// STRICT: if any argument is NULL, return empty set without executing the body.
+	if r.Strict {
+		for _, arg := range args {
+			if arg.IsNull() {
+				return nil, nil
+			}
+		}
+	}
 	block, err := plpgsql.Parse(r.Body)
 	if err != nil {
 		return nil, &ExecError{Code: "P0000", Pos: pos, Message: fmt.Sprintf("invalid PL/pgSQL body for function %s: %v", r.QualifiedName(), err)}
@@ -397,6 +405,14 @@ func routineArgsCompatible(argTypes []catalog.Type, args []Datum) bool {
 func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
 	if strings.ToLower(r.Language) != "plpgsql" {
 		return Datum{}, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("function language %q is not executable in v0", r.Language)}
+	}
+	// STRICT: if any argument is NULL, return NULL without executing the body.
+	if r.Strict {
+		for _, arg := range args {
+			if arg.IsNull() {
+				return NullDatum, nil
+			}
+		}
 	}
 	block, err := plpgsql.Parse(r.Body)
 	if err != nil {
@@ -572,6 +588,44 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				}
 			}
 		}
+		return Datum{}, flowNone, nil
+
+	case *plpgsql.ArraySubscriptAssignStmt:
+		// Array subscript assignment: x[idx] := value. M0097-0113.
+		idx, ok := frame.lookup(s.VarName)
+		if !ok {
+			return Datum{}, flowNone, &ExecError{Code: "42703", Pos: s.Pos(), Message: fmt.Sprintf("variable %q does not exist", s.VarName)}
+		}
+		// Evaluate subscript (1-based per PG convention).
+		subD, err := evalPLpgSQLExpr(s.Subscript, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		sub := int(subD.Int) // subscript index (1-based)
+		if subD.Kind != KindInt || sub < 1 {
+			return Datum{}, flowNone, &ExecError{Code: "2202E", Pos: s.Pos(), Message: "array subscript out of range"}
+		}
+		// Evaluate new value.
+		newVal, err := evalPLpgSQLExpr(s.Value, frame, ctx)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		// Get the current array datum (stored as KindString "{e1,e2,...}").
+		arrD := frame.values[idx]
+		var elems []string
+		if !arrD.IsNull() {
+			elems = parseTextArray(arrD.StringValue())
+		}
+		// Extend array if necessary.
+		for len(elems) < sub {
+			elems = append(elems, "NULL")
+		}
+		// Replace element at 1-based index.
+		elems[sub-1] = newVal.Format()
+		if newVal.IsNull() {
+			elems[sub-1] = "NULL"
+		}
+		frame.values[idx] = NewStringDatum("{" + strings.Join(elems, ",") + "}")
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.IfStmt:
@@ -1355,6 +1409,17 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 			return nil, err
 		}
 		return &planner.IsDistinctFromExpr{Left: left, Right: right, Negated: x.Negated}, nil
+	case *parser.ArraySubscriptExpr:
+		// array[subscript] read in PL/pgSQL (e.g. x[1] on the RHS).
+		arr, err := lowerPLpgSQLExpr(x.Base, frame)
+		if err != nil {
+			return nil, err
+		}
+		sub, err := lowerPLpgSQLExpr(x.Index, frame)
+		if err != nil {
+			return nil, err
+		}
+		return &planner.FuncCall{Name: "array_subscript", Args: []planner.Expr{arr, sub}}, nil
 	default:
 		return nil, &ExecError{Code: "0A000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL expression %T", e)}
 	}

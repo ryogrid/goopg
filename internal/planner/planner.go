@@ -2723,11 +2723,23 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			// Infer element type from array type suffix.
 			at := exprType(arrResolved).Name
 			if strings.HasSuffix(at, "[]") {
-				base := at[:len(at)-2]
-				// Only apply type-preserving cast for concrete element types.
+				base := strings.ToLower(at[:len(at)-2])
+				// Normalize type aliases → canonical form so int[]/integer[]/bigint[] etc. work.
 				switch base {
-				case "int4", "int8", "int2", "float4", "float8", "bool", "numeric":
-					castType = base
+				case "int4", "int", "integer":
+					castType = "int4"
+				case "int8", "bigint":
+					castType = "int8"
+				case "int2", "smallint":
+					castType = "int2"
+				case "float4", "real":
+					castType = "float4"
+				case "float8", "double precision", "float":
+					castType = "float8"
+				case "bool", "boolean":
+					castType = "bool"
+				case "numeric", "decimal":
+					castType = "numeric"
 				}
 			}
 		}
@@ -4548,6 +4560,32 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 				return AggregateCall{}, serr
 			}
 			withinGroupKeys = append(withinGroupKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
+		}
+		// Hypothetical-set aggregates require exactly one direct arg per ordering column.
+		switch name {
+		case "rank", "dense_rank", "cume_dist", "percent_rank":
+			nDirect := len(fc.Args)
+			nOrder := len(withinGroupKeys)
+			if nDirect != nOrder {
+				return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
+					Message: fmt.Sprintf("WITHIN GROUP (ORDER BY) arguments do not match"),
+					Hint: fmt.Sprintf("To use the hypothetical-set aggregate %s, the number of hypothetical direct arguments (here %d) must match the number of ordering columns (here %d).",
+						name, nDirect, nOrder),
+				}
+			}
+			// Validate that direct arg types are compatible with ordering column types.
+			for i, argE := range fc.Args {
+				resolvedArg, aerr := resolveExpr(argE, inputCtx)
+				if aerr != nil {
+					return AggregateCall{}, aerr
+				}
+				argT := exprType(resolvedArg).Name
+				orderT := exprType(withinGroupKeys[i].Expr).Name
+				if !isTypeCompatibleForHypothetical(argT, orderT) {
+					return AggregateCall{}, &PlanError{Pos: argE.Pos(), Code: "42P13",
+						Message: fmt.Sprintf("WITHIN GROUP types %s and %s cannot be matched", orderT, argT)}
+				}
+			}
 		}
 	} else {
 		// Validate: ordered-set aggregates require WITHIN GROUP (unless window func).
@@ -6618,6 +6656,41 @@ func isFloatTypeName(name string) bool {
 // isNumericTypeName reports whether name refers to a numeric type
 // (NUMERIC / DECIMAL family). Used by exprType to promote arithmetic
 // to numeric whenever any operand is numeric.
+// isTypeCompatibleForHypothetical returns true if a direct arg type is compatible
+// with an ordering column type for hypothetical-set aggregates (rank etc.).
+// Compatible means same type family or one is unknown/text that can coerce.
+func isTypeCompatibleForHypothetical(orderT, argT string) bool {
+	oLow := strings.ToLower(orderT)
+	aLow := strings.ToLower(argT)
+	if oLow == aLow || aLow == "unknown" || oLow == "unknown" {
+		return true
+	}
+	// Text-like types coerce freely.
+	textLike := func(t string) bool {
+		return t == "text" || t == "varchar" || t == "bpchar" || t == "name" || t == "char"
+	}
+	if textLike(oLow) && textLike(aLow) {
+		return true
+	}
+	// Numeric families coerce.
+	numericLike := func(t string) bool {
+		switch t {
+		case "int2", "int4", "int8", "int", "integer", "smallint", "bigint",
+			"float4", "float8", "real", "double precision", "numeric", "decimal":
+			return true
+		}
+		return false
+	}
+	if numericLike(oLow) && numericLike(aLow) {
+		return true
+	}
+	// varchar coerces to/from text-like.
+	if textLike(oLow) && (aLow == "text" || aLow == "unknown") {
+		return true
+	}
+	return false
+}
+
 func isNumericTypeName(name string) bool {
 	switch strings.ToLower(name) {
 	case "numeric", "decimal":
