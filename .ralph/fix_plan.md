@@ -2792,6 +2792,27 @@ M0097-0001 wires it up.
             `var_samp(b::numeric)` 22918.738754573→22918.738754573025. 12 diff lines fixed.
         Remaining gaps (~131 diffs): aamin/aamax 2D array column alignment (20), outer-aggregate
         HAVING/subquery (12), 10000 rows vs 1 outer aggregate (22), count(*) filter (3), misc.
+      - **Progress 2026-06-01 (M0097-0125 — aggregates 131→86 diffs, 4 fixes):**
+        Four targeted fixes (commit 0f127d53):
+        (a) Unnest type inference for multi-dimensional arrays (planner.go, 3 sites):
+            `exprType("unnest")`, `buildSelectSrfProjectSet` schema determination, and
+            `planFromUnnest` all stripped only ONE `[]` suffix from array element types.
+            Changed to loop-based stripping so `unnest(integer[][])` → element type `integer`
+            (not `integer[]`). Fixes aamin/aamax column alignment in `v_pagg_test` view (20 diffs).
+        (b) ARRAY[[a,b],[c,d]] 2D array literal parsing (parser/select.go):
+            `parseArrayConstructor` now uses `parseArrayElement` which recursively handles
+            nested `[...]` inside `ARRAY[...]`. Previously `ARRAY[[null,1,0.5],[0.75,0.25,null]]`
+            failed to parse, silently dropping the percentile_disc 2D query.
+        (c) percentile_disc with 2D array input (operators_join_agg.go):
+            Added `tryParseFloat2DArray` + `format2DTextArray` helpers. `percentile_disc`
+            checks for 2D input first and preserves output structure (5 diffs fixed).
+        (d) evalRowExpr null-row display (expr.go):
+            `allNull → NullDatum` now only applies for empty rows (0 elements). Non-empty
+            all-null rows (e.g. `SELECT foo FROM (SELECT NULL) AS foo`) return `()` matching
+            PG display. Fixes `select` test regression (1 diff → 0, test passes again).
+        Remaining gaps (~86 diffs): outer-aggregate HAVING/subquery (20), 10000 rows vs 1
+        outer aggregate (21), ARRAY(subquery) syntax (7), aggregate+SRF combo (3), error
+        section mismatches (12), misc (23).
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
