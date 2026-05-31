@@ -6583,7 +6583,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || v.IsNull() {
 				continue
 			}
-			if best.IsNull() || v.Format() > best.Format() {
+			if best.IsNull() {
+				best = v
+				continue
+			}
+			cmp, cerr := compareDatum(v, best, x.Pos())
+			if cerr != nil || cmp > 0 {
 				best = v
 			}
 		}
@@ -6595,7 +6600,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || v.IsNull() {
 				continue
 			}
-			if best.IsNull() || v.Format() < best.Format() {
+			if best.IsNull() {
+				best = v
+				continue
+			}
+			cmp, cerr := compareDatum(v, best, x.Pos())
+			if cerr != nil || cmp < 0 {
 				best = v
 			}
 		}

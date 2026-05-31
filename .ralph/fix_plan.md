@@ -2766,6 +2766,14 @@ M0097-0001 wires it up.
         error section: "not allowed in WHERE" extras (4), "canceling stmt" extras (4),
         "collation mismatch" missing (2), "column t1.f1" missing (2), avg_transfn NOTICE
         extras (2), various smaller.
+      - **Progress 2026-06-01 (M0097-0123 — least/greatest numeric comparison fix, 153→145 diffs):**
+        `least()` and `greatest()` were using `v.Format() < best.Format()` (string comparison)
+        instead of `compareDatum()` (numeric-aware). This caused `least(-2147483647, -123456)`
+        to return -123456 (wrong) because "-2..." > "-1..." lexicographically. Fixed by switching
+        to `compareDatum(v, best)` which uses numeric comparison for KindInt/KindNumeric values.
+        Impact: cleast_agg(4.5, f1) from int4_tbl now correctly returns -2147483647 (was -123456).
+        Also likely fixes any other queries using least/greatest with numeric values in the error
+        section (contributed to 8-line reduction).
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
