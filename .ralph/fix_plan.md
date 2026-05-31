@@ -2530,6 +2530,17 @@ M0097-0001 wires it up.
         data format mismatches (aamin/aamax arrays vs scalars ~30), excess NOTICEs (still ~27
         from DISTINCT sharing + non-overlapping queries), error section mismatches (~30),
         aggfns ~<~ operator ORDER BY (~20), min/max row type composite comparison (~10).
+      - **Progress 2026-05-31 (M0097-0112 — errors 1→0, aggregates 369→364):**
+        Two fixes: (a) `execCreateAggregate` now validates the `finalfunc` name before
+        registering: checks `knownBuiltinAggFinalFuncs` (allowlist of PostgreSQL built-in
+        finalfunc names handled in finishAgg) then user-defined routines registry; emits
+        SQLSTATE 42883 "function X(stype) does not exist" on miss. Fixes `errors.sql` 1→0
+        diff (CREATE AGGREGATE with finalfunc=int2um, stype=int4 now correctly rejected).
+        (b) DROP TABLE CASCADE with N>1 inheritance children now emits `AddNoticeWithDetail`
+        (NOTICE summary + DETAIL listing each child) instead of a plain summary NOTICE, matching
+        PostgreSQL's format. After normalizer DETAIL-stripping and error-section collation,
+        expected and actual match. aggregates.sql 369→364 diff lines.
+        errors.sql: 0 diffs → now PASS. Baseline CSV updated.
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
