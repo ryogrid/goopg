@@ -1258,8 +1258,12 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 		return err
 	}
 	// For user-defined aggregates with a strict sfunc: skip rows where any arg is NULL.
-	// STRICT means "returns null on null input" — sfunc not called when any arg is NULL. M0097-0035.
+	// STRICT means "returns null on null input" — sfunc not called when any arg is NULL.
+	// This includes the state (first sfunc arg): if state is NULL, skip all subsequent rows.
 	if call.UserAgg != nil && call.UserAgg.SFuncStrict {
+		if st.userStateSet && st.userState.IsNull() {
+			return nil // state went NULL; sfunc cannot be called (state is first arg, strict)
+		}
 		if arg.IsNull() {
 			return nil
 		}

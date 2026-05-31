@@ -3699,7 +3699,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// PG calls sfunc once per row when multiple aggregates share the same transition state.
 	// This eliminates duplicate NOTICE/side-effect calls for identical sfunc invocations. M0097-0035.
 	{
-		type stateKey struct{ sfunc, stype, argKey string; distinct bool; filterKey string }
+		type stateKey struct{ sfunc, stype, argKey, initcond string; distinct bool; filterKey string }
 		slotByKey := map[stateKey]int{}
 		nextSlot := 0
 		for i := range plannedAggs {
@@ -3726,6 +3726,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 				argKey:    argK,
 				distinct:  pa.Distinct,
 				filterKey: filterK,
+				initcond:  pa.UserAgg.InitCond, // aggregates with different INITCONDs must not share state
 			}
 			if slot, exists := slotByKey[sk]; exists {
 				pa.SharedStateSlot = slot
