@@ -1074,8 +1074,17 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 					childName := parser.ObjectName{Schema: inheritChildren[0].Schema, Name: inheritChildren[0].Name}
 					o.ctx.AddNotice(fmt.Sprintf("drop cascades to table %s", childName.String()))
 				} else if len(inheritChildren) > 1 {
-					// Match PostgreSQL format: summary NOTICE + DETAIL for each child.
-					o.ctx.AddNotice(fmt.Sprintf("drop cascades to %d other objects", len(inheritChildren)))
+					// PostgreSQL emits summary NOTICE + DETAIL listing each child.
+					// Normalizer strips DETAIL prefix and moves all lines to error section.
+					detail := make([]string, len(inheritChildren))
+					for i, child := range inheritChildren {
+						childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+						detail[i] = fmt.Sprintf("drop cascades to table %s", childName.String())
+					}
+					o.ctx.AddNoticeWithDetail(
+						fmt.Sprintf("drop cascades to %d other objects", len(inheritChildren)),
+						strings.Join(detail, "\n"),
+					)
 				}
 				for _, child := range inheritChildren {
 					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
