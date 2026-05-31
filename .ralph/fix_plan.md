@@ -2659,6 +2659,30 @@ M0097-0001 wires it up.
         FILTER nested-agg error message fixed.
         aggregates diff: 234→220. Baseline CSV updated.
 
+      - **Progress 2026-05-31 (M0097-0117 — aggregates 220→197 diff, 6 fixes):**
+        Six targeted fixes reducing aggregates diff from 220 to 197 (commit a4a2d21e):
+        (a) Array literal comparison in compareDatum: `{e1,e2,...}` strings now use
+            element-wise numeric comparison (compareArrayStrings) rather than
+            lexicographic strings.Compare. Fixes min/max over integer-array columns.
+        (b) Aggregate output sorted by GROUP BY key: aggregateOp.Open sorts output
+            rows by GROUP BY key columns after materializing, matching PostgreSQL's
+            sort-based aggregate output order. Fixes mode() within-group row ordering.
+        (c) FILTER aggregate error message: buildAggregateCall now correctly emits
+            "aggregate functions are not allowed in FILTER" (was "cannot be nested").
+        (d) generate_subscripts FROM SRF: added generate_subscripts(anyarray, dim[, rev])
+            as a supported FROM-clause table function returning integer subscripts.
+            Required by least_accum SQL function body.
+        (e) VARIADIC in CREATE FUNCTION: parseFunctionArg now accepts VARIADIC mode
+            keyword (treated as IN semantically). Previously least_accum with
+            VARIADIC parameter was rejected at parse time, preventing registration.
+        (f) Variadic aggregate arg bundling: UserAggregate.Variadic bool added;
+            parser detects VARIADIC in CREATE AGGREGATE; applyAgg bundles all input
+            args into a single array when ua.Variadic=true (matching PG's sfunc call).
+        Remaining gaps (~197 diffs): aamin/aamax 2D array type mismatch (~24),
+        outer-aggregate HAVING subquery (~13), 10000-row correlated agg (~18),
+        var_pop(numeric) precision (~6), rank() type unification (~6), error section
+        mismatches (~30), various smaller.
+
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
       - These depend on planner equivalence-class and functional-
