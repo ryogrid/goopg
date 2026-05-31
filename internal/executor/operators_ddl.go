@@ -3459,6 +3459,7 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 		SFunc:     s.SFunc,
 		FinalFunc: s.FinalFunc,
 		InitCond:  s.InitCond,
+		Variadic:  s.Variadic,
 	}
 	if s.HasBaseType && s.BaseType != "" && s.BaseType != "*" && s.BaseType != "any" {
 		agg.ArgTypes = []string{s.BaseType}

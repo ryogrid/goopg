@@ -1152,6 +1152,77 @@ func compareRowElem(a, b string) int {
 // compareRowStrings compares two PostgreSQL composite-type (row) strings.
 // Elements are compared in order; numeric elements use numeric comparison.
 // Returns 0 if not recognizable as row format, falling back to lexicographic.
+// splitArrayElements splits a PostgreSQL array literal "{e1,e2,...}" into elements.
+// Handles nested arrays like "{{1,2},{3,4}}" and quoted elements.
+func splitArrayElements(s string) []string {
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return nil
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return []string{}
+	}
+	var elems []string
+	depth := 0
+	inQuote := false
+	start := 0
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		if inQuote {
+			if c == '"' {
+				if i+1 < len(inner) && inner[i+1] == '"' {
+					i++
+				} else {
+					inQuote = false
+				}
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+		case ',':
+			if depth == 0 {
+				elems = append(elems, inner[start:i])
+				start = i + 1
+			}
+		}
+	}
+	elems = append(elems, inner[start:])
+	return elems
+}
+
+// compareArrayStrings compares two PostgreSQL array literals element-wise.
+// Nested arrays are compared recursively; scalar elements use numeric comparison.
+func compareArrayStrings(a, b string) int {
+	ae := splitArrayElements(a)
+	be := splitArrayElements(b)
+	if ae == nil || be == nil {
+		return strings.Compare(a, b)
+	}
+	n := len(ae)
+	if len(be) < n {
+		n = len(be)
+	}
+	for i := 0; i < n; i++ {
+		ea, eb := ae[i], be[i]
+		var c int
+		if len(ea) > 0 && ea[0] == '{' && len(eb) > 0 && eb[0] == '{' {
+			c = compareArrayStrings(ea, eb)
+		} else {
+			c = compareRowElem(ea, eb)
+		}
+		if c != 0 {
+			return c
+		}
+	}
+	return len(ae) - len(be)
+}
+
 func compareRowStrings(a, b string) int {
 	ae := splitRowElements(a)
 	be := splitRowElements(b)
@@ -1286,6 +1357,11 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		// numeric comparison so max(row(a,b)) works correctly. M0097-0115.
 		if len(as) > 0 && as[0] == '(' && len(bs) > 0 && bs[0] == '(' {
 			return compareRowStrings(as, bs), nil
+		}
+		// Array literal comparison: "{e1,e2,...}" uses element-wise numeric
+		// comparison so min/max over integer arrays work correctly. M0097-0117.
+		if len(as) > 0 && as[0] == '{' && len(bs) > 0 && bs[0] == '{' {
+			return compareArrayStrings(as, bs), nil
 		}
 		return strings.Compare(as, bs), nil
 	case KindBytes:

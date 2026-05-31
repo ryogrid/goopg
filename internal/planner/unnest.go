@@ -331,6 +331,12 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 				walkExprTree(e, visit)
 			}
 		}
+	case *GenerateSubscripts:
+		walkExprTree(n.ArrExpr, visit)
+		walkExprTree(n.Dim, visit)
+		if n.Reversed != nil {
+			walkExprTree(n.Reversed, visit)
+		}
 	case *GenerateSeries:
 		walkExprTree(n.Start, visit)
 		walkExprTree(n.Stop, visit)

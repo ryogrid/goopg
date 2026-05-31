@@ -445,6 +445,7 @@ type UserAggregate struct {
 	FinalFunc   string   // final function name (may be empty)
 	InitCond    string   // initial condition string (may be empty)
 	SFuncStrict bool     // true if sfunc is STRICT (skips NULL inputs)
+	Variadic    bool     // true when declared with VARIADIC input arg
 }
 
 // Fixed OIDs for the three core system catalog heap tables.

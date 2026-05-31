@@ -895,6 +895,19 @@ type GenerateSeries struct {
 func (n *GenerateSeries) Pos() int       { return n.pos }
 func (n *GenerateSeries) Output() Schema { return n.schema }
 
+// GenerateSubscripts produces subscript integers 1..array_length for
+// generate_subscripts(anyarray, dim[, reverse]) in the FROM clause. M0097-0117.
+type GenerateSubscripts struct {
+	pos      int
+	ArrExpr  Expr
+	Dim      Expr
+	Reversed Expr // optional; nil = false
+	schema   Schema
+}
+
+func (n *GenerateSubscripts) Pos() int       { return n.pos }
+func (n *GenerateSubscripts) Output() Schema { return n.schema }
+
 // PgInputErrorInfo implements pg_input_error_info(value, type) as a
 // set-returning function in the FROM clause. Returns 0 rows if the
 // input is valid, or 1 row with (message, detail, hint, sql_error_code)

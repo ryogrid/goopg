@@ -205,9 +205,25 @@ func (p *parser) parseCreateAggregateTail(pos int) (Stmt, error) {
 		// New style: parse "(type1, type2, ...)" as arg types.
 		p.advance() // consume "("
 		var argTypes []string
+		isVariadic := false
 		for p.cur().Kind != TokenSymbol || p.cur().Value != ")" {
 			if p.cur().Kind == TokenEOF {
 				break
+			}
+			// Detect VARIADIC keyword in arg list.
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwVariadic {
+				isVariadic = true
+				p.advance()
+				continue // skip parameter name following VARIADIC
+			}
+			// Skip parameter name (identifier before type).
+			// Pattern: "VARIADIC name type" — skip ident if followed by another ident/keyword.
+			if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+				next := p.peek(1)
+				if (next.Kind == TokenIdent || next.Kind == TokenKeyword) && next.Value != ")" && next.Value != "," {
+					p.advance()
+					continue
+				}
 			}
 			// Collect type tokens until ',' or ')'.
 			tok := p.cur()
@@ -223,6 +239,7 @@ func (p *parser) parseCreateAggregateTail(pos int) (Stmt, error) {
 		if len(argTypes) > 0 {
 			stmt.HasBaseType = true
 			stmt.BaseType = argTypes[0]
+			stmt.Variadic = isVariadic
 		}
 		// For zero-arg new-style: CREATE AGGREGATE name (*) (...)
 		// The arg list was just "*".

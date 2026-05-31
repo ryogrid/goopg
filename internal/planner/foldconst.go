@@ -165,6 +165,12 @@ func foldPlanConstantsInner(node Node) {
 		foldPlanConstantsInner(n.Child)
 	case *SeqScan, *IndexScan, *IndexOnlyScan, *Values, *WorkTableScan:
 		// leaf nodes: nothing to fold
+	case *GenerateSubscripts:
+		n.ArrExpr = FoldConstants(n.ArrExpr)
+		n.Dim = FoldConstants(n.Dim)
+		if n.Reversed != nil {
+			n.Reversed = FoldConstants(n.Reversed)
+		}
 	case *GenerateSeries:
 		n.Start = FoldConstants(n.Start)
 		n.Stop = FoldConstants(n.Stop)

@@ -1148,6 +1148,7 @@ type CreateAggregateStmt struct {
 	Name        ObjectName
 	HasBaseType bool
 	BaseType    string // e.g. "int4"
+	Variadic    bool   // true when declared with VARIADIC arg (variadic agg)
 	SType       string // state type (e.g. "int4")
 	SFunc       string // state transition function name
 	FinalFunc   string // final function name

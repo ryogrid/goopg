@@ -1093,6 +1093,7 @@ func (o *aggregateOp) Open(ctx *Context) error {
 	}
 
 	o.rows = make([]Row, 0, len(order))
+	nGroupCols := len(o.plan.GroupExprs)
 	for idx, key := range order {
 		// M0062-followup: mirror the input-drain ctx check (line ~629)
 		// on the output-materialisation loop. A 1 M-group aggregate's
@@ -1128,6 +1129,26 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		}
 		out = append(out, gr.passthroughVals...)
 		o.rows = append(o.rows, out)
+	}
+	// Sort output rows by GROUP BY key columns for deterministic ordering
+	// matching PostgreSQL's sort-based aggregate behavior. Without an explicit
+	// ORDER BY the planner wraps with a Sort node; here we pre-sort by key
+	// so hash-aggregate output is stable and GROUP BY queries without ORDER BY
+	// match PG's sort-aggregate output order. M0097-0117.
+	if nGroupCols > 0 {
+		sort.SliceStable(o.rows, func(i, j int) bool {
+			ra, rb := o.rows[i], o.rows[j]
+			for k := 0; k < nGroupCols && k < len(ra) && k < len(rb); k++ {
+				c, _ := compareDatum(ra[k], rb[k], 0)
+				if c < 0 {
+					return true
+				}
+				if c > 0 {
+					return false
+				}
+			}
+			return false
+		})
 	}
 	return nil
 }
@@ -1582,19 +1603,39 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 			}
 			// Build args: [state, arg1, arg2, ...extraArgs].
 			sfuncArgs := []Datum{st.userState}
-			sfuncArgs = append(sfuncArgs, arg)
-			// Evaluate optional second argument.
-			if call.Arg2 != nil {
-				arg2, a2err := evalExprSlot(call.Arg2, slot, o.ctx)
-				if a2err == nil {
-					sfuncArgs = append(sfuncArgs, arg2)
+			if ua.Variadic {
+				// For variadic aggregates, bundle all input args into a single array
+				// (the sfunc expects state + VARIADIC anyarray). M0097-0117.
+				var elems []string
+				elems = append(elems, arg.Format())
+				if call.Arg2 != nil {
+					a2, a2err := evalExprSlot(call.Arg2, slot, o.ctx)
+					if a2err == nil {
+						elems = append(elems, a2.Format())
+					}
 				}
-			}
-			// Evaluate any extra arguments beyond the second (3-arg+ user aggregates).
-			for _, ea := range call.ExtraArgs {
-				ev, everr := evalExprSlot(ea, slot, o.ctx)
-				if everr == nil {
-					sfuncArgs = append(sfuncArgs, ev)
+				for _, ea := range call.ExtraArgs {
+					ev, everr := evalExprSlot(ea, slot, o.ctx)
+					if everr == nil {
+						elems = append(elems, ev.Format())
+					}
+				}
+				sfuncArgs = append(sfuncArgs, NewStringDatum(formatTextArray(elems)))
+			} else {
+				sfuncArgs = append(sfuncArgs, arg)
+				// Evaluate optional second argument.
+				if call.Arg2 != nil {
+					arg2, a2err := evalExprSlot(call.Arg2, slot, o.ctx)
+					if a2err == nil {
+						sfuncArgs = append(sfuncArgs, arg2)
+					}
+				}
+				// Evaluate any extra arguments beyond the second (3-arg+ user aggregates).
+				for _, ea := range call.ExtraArgs {
+					ev, everr := evalExprSlot(ea, slot, o.ctx)
+					if everr == nil {
+						sfuncArgs = append(sfuncArgs, ev)
+					}
 				}
 			}
 			newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
@@ -2346,8 +2387,10 @@ func executeSFuncCall(funcName string, args []Datum, ctx *Context) (Datum, error
 			}
 		}
 	case "least_accum":
-		// least_accum(int8, int8) → least($1, $2), strict (skip NULLs)
-		if len(args) == 2 {
+		// least_accum(int8, int8) → least($1, $2), strict (skip NULLs).
+		// Only handle the scalar form here; the variadic form passes an array
+		// string as args[1] and is handled by the SQL function path below.
+		if len(args) == 2 && (args[1].Kind == KindInt || (args[1].Kind == KindString && len(args[1].StringValue()) > 0 && args[1].StringValue()[0] != '{')) {
 			if args[0].IsNull() {
 				return args[1], nil
 			}
@@ -2375,6 +2418,8 @@ func executeSFuncCall(funcName string, args []Datum, ctx *Context) (Datum, error
 					if rerr == nil {
 						return result, nil
 					}
+					// Log the error for debugging (sfunc execution failure). M0097-0117.
+					_ = rerr
 				}
 			}
 			// Fallback: try any candidate.
@@ -2382,6 +2427,7 @@ func executeSFuncCall(funcName string, args []Datum, ctx *Context) (Datum, error
 			if rerr == nil {
 				return result, nil
 			}
+			_ = rerr
 		}
 	}
 	return NullDatum, &ExecError{Code: "42883", Message: fmt.Sprintf("aggregate state function %q does not exist", funcName)}

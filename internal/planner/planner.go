@@ -2804,6 +2804,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "unnest") {
 		return planFromUnnest(rv, sourceIdx, lateralCtx)
 	}
+	if strings.EqualFold(tf.Name, "generate_subscripts") {
+		return planGenerateSubscripts(rv, sourceIdx, lateralCtx)
+	}
 	if !strings.EqualFold(tf.Name, "generate_series") {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
 			Message: fmt.Sprintf("table-valued function %q not supported", tf.Name)}
@@ -2849,6 +2852,53 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 }
 
 // planScalarFuncScan plans a scalar function in FROM clause that returns one
+// planGenerateSubscripts plans generate_subscripts(arr, dim[, reverse]) FROM clause SRF.
+// Returns 1..array_length(arr, dim) integer subscripts. M0097-0117.
+func planGenerateSubscripts(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) < 2 || len(tf.Args) > 3 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "generate_subscripts requires 2 or 3 arguments"}
+	}
+	ctx := &resolveContext{}
+	if lateralCtx != nil {
+		ctx = lateralCtx
+	}
+	arrExpr, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	dimExpr, err := resolveExpr(tf.Args[1], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	var revExpr Expr
+	if len(tf.Args) == 3 {
+		revExpr, err = resolveExpr(tf.Args[2], ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "generate_subscripts"
+	}
+	colName := alias
+	if len(rv.Columns) > 0 {
+		colName = rv.Columns[0]
+	}
+	tbl := &catalog.Table{
+		Name: alias,
+		Columns: []catalog.Column{
+			{Name: colName, Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		},
+	}
+	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: "int4"}, SourceTableIdx: sourceIdx}}
+	node := &GenerateSubscripts{pos: tf.Pos(), ArrExpr: arrExpr, Dim: dimExpr, Reversed: revExpr, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
 // row with a single column of the given colType. Used for parse_ident etc.
 // planFromUnnest plans FROM unnest(array_expr) alias(col).
 // Expands an array expression into one row per element. M0097-0035.
@@ -4444,11 +4494,12 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		if ferr != nil {
 			return AggregateCall{}, ferr
 		}
-		// Aggregate functions nested inside a FILTER clause are not allowed. M0097-0035.
-		// PG error: "aggregate function calls cannot be nested" (same code 42803).
+		// Aggregate functions nested inside a FILTER clause are not allowed. M0097-0117.
+		// PG uses "aggregate functions are not allowed in FILTER" for direct filter
+		// errors (not nested-agg-in-agg which is the "cannot be nested" path).
 		if exprHasAggregate(fc.Filter) {
 			return AggregateCall{}, &PlanError{Pos: fc.Filter.Pos(), Code: "42803",
-				Message: "aggregate function calls cannot be nested"}
+				Message: "aggregate functions are not allowed in FILTER"}
 		}
 	}
 	// Validate WITHIN GROUP for non-ordered-set aggregates early (before arg checks).
