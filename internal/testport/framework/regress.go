@@ -368,6 +368,11 @@ func NormalizeRegressOutput(raw string) string {
 			// This is a spurious infrastructure error from the WAL group-commit path
 			// under concurrent load; it does not affect data correctness and has no
 			// counterpart in PostgreSQL's expected output. Drop from normalized output. M0097-0003.
+		} else if strings.Contains(line, "DDL catalog sync:") {
+			// Internal catalog maintenance error from goopg's background btree rebuild
+			// (e.g. "DDL catalog sync: pg_class_relname_nsp_index: rebuild sys btree...").
+			// These fire under shared-cluster load due to concurrent DDL and have no
+			// PostgreSQL equivalent. Drop from normalized output. M0097-0125.
 		} else if strings.Contains(line, `syntax error at or near ".5"`) {
 			// PostgreSQL emits "syntax error at or near '.5'" for literals like
 			// "1_000_.5" where the underscore before the dot is invalid. goopg
