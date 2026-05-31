@@ -2542,6 +2542,28 @@ M0097-0001 wires it up.
         expected and actual match. aggregates.sql 369→364 diff lines.
         errors.sql: 0 diffs → now PASS. Baseline CSV updated.
 
+      - **Progress 2026-05-31 (M0097-0113 — aggregates 364→328 diff):**
+        Two fixes (commit b86bc75e):
+        (a) User-defined aggregate ORDER BY without DISTINCT
+            (`internal/executor/operators_join_agg.go`): `applyAgg` was only
+            accumulating rows into `distinctUserAggRows` when `call.Distinct`
+            was true. When a user-defined aggregate has ORDER BY but no DISTINCT
+            (e.g. `aggfns(a,b,c ORDER BY b)`), rows were processed in input
+            order. Fix: extend the accumulation condition to
+            `call.Distinct || len(call.OrderBy) > 0`; update `finishAgg` to
+            skip deduplication when `!call.Distinct`. Fixes views with
+            user-defined aggregates + ORDER BY (view plan cache reuse exposed
+            the bug more clearly than direct queries).
+        (b) Multi-char operator parsing for ORDER BY USING
+            (`internal/parser/select.go`): `parseSortUsingOperator` consumed
+            only one token, so `~<~` (lexed as 3 tokens: `~`, `<`, `~`) was
+            treated as `~` only, causing CREATE VIEW with `ORDER BY c USING ~<~`
+            to fail. Fix: greedily concatenate consecutive `TokenOperator`
+            tokens. Also added `~>~`/`~>=~` recognition to `sortUsingIsDesc`.
+        Remaining aggregates blockers: float precision (~80 diffs), complex
+        correlated subqueries (HAVING with outer aggregate, ~30), nested array
+        aggregation (aamin/aamax ~20), column alignment (~20), error section (~30).
+
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
       - These depend on planner equivalence-class and functional-
