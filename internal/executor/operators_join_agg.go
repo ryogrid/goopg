@@ -2450,6 +2450,36 @@ func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Contex
 		}
 	}
 
+	// User-defined ordered-set aggregates: delegate to built-in implementations
+	// based on their final function name (e.g. test_rank uses rank_final → rank).
+	// This handles aggregates created via CREATE AGGREGATE and renamed with ALTER AGGREGATE.
+	if call.UserAgg != nil {
+		ff := strings.ToLower(call.UserAgg.FinalFunc)
+		var builtinName string
+		switch ff {
+		case "rank_final":
+			builtinName = "rank"
+		case "dense_rank_final":
+			builtinName = "dense_rank"
+		case "percent_rank_final":
+			builtinName = "percent_rank"
+		case "cume_dist_final":
+			builtinName = "cume_dist"
+		case "percentile_disc_final":
+			builtinName = "percentile_disc"
+		case "percentile_cont_final":
+			builtinName = "percentile_cont"
+		case "mode_final":
+			builtinName = "mode"
+		}
+		if builtinName != "" {
+			bc := call
+			bc.Name = builtinName
+			bc.UserAgg = nil
+			return finishWithinGroupAgg(st, bc, ctx)
+		}
+	}
+
 	switch name {
 	case "percentile_cont":
 		// Use direct arg stored during applyAgg from the first row of the group.

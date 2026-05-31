@@ -2595,6 +2595,70 @@ M0097-0001 wires it up.
         correlated subqueries (HAVING with outer aggregate, ~30), nested array
         aggregation (aamin/aamax ~20), column alignment (~20), error section (~30).
 
+      - **Progress 2026-05-31 (M0097-0115 — aggregates 314→234 diff):**
+        Six fixes (commit 9517a949):
+        (a) `float4 sum` display: `finishAgg` for `sum` casts KindNumeric result
+            through `float32` and formats with 6 sig digits when `call.InputType`
+            is float4/real — matches PG's `float4pl` transition-type accumulation
+            (sum of 4 aggtest values: 431.77261 → 431.773).
+        (b) `float4 variance/regression`: `applyAgg` applies `f = float64(float32(f))`
+            before Welford accumulation when `InputType` is float4, matching PG's
+            `float4_accum` float32-precision input semantics. Fixes stddev_pop/
+            var_pop of float4 columns (+regression aggregates).
+        (c) `percentile_cont` with float4 ORDER BY: planner now returns float8
+            (not float4) for float4 WITHIN GROUP key, matching PG's upcast; executor
+            rounds ordered values through float32 for PG-compatible linear interpolation
+            (53.4485 → 53.4485001564026). New planner-side `WithinGroupKeyType` field
+            in `AggregateCall` carries the ORDER BY column type.
+        (d) `string_agg` return type: added explicit `case "string_agg"` in
+            `buildAggregateCall` returning the arg's type (text/bytea), fixing
+            right-alignment of bytea `string_agg` results.
+        (e) Row composite comparison in `compareDatum`: `KindString` values starting
+            with `(` now delegate to `compareRowStrings` which compares elements
+            numerically, fixing `max(row(a,b))` returning the wrong row (56,7.8)
+            instead of (100,99.097).
+        (f) `collation_for`: returns `"POSIX"` (matching C-locale regression
+            databases) instead of `"default"`.
+        New fields: `AggregateCall.InputType` (primary arg type),
+        `AggregateCall.WithinGroupKeyType` (ORDER BY column type for ordered-set aggs).
+        New helpers: `isFloat4TypeName` (planner + executor), `splitRowElements/
+        compareRowElem/compareRowStrings` (expr.go).
+        Tests: `TestSplitRowElements`, `TestCompareRowStrings`, `TestIsFloat4TypeName`.
+        Remaining aggregates blockers (~234 diff lines): outer-level aggregates in
+        subquery HAVING/FILTER (~25), statistics table aamin/aamax nested array
+        aggregation (~20), var_pop(b::numeric) exact arithmetic needed (~8),
+        var_pop accuracy for large-offset float8 (~6), mode() group ordering (~6),
+        test_rank/test_percentile_disc user-defined hypothetical-set aggs (~8),
+        CORR 10000 rows outer-aggregate reference (~18), various smaller.
+
+      - **Progress 2026-05-31 (M0097-0116 — aggregates 234→220 diff, 4 fixes):**
+        Four targeted fixes reducing aggregates diff from 234 to 220:
+        (a) `AlterAggregateRenameStmt` missing from planner DDL pass-through list
+            (`internal/planner/planner.go`): `ALTER AGGREGATE ... RENAME TO` was
+            parsed correctly but the planner returned "unsupported statement type"
+            before the executor could handle it. Added `*parser.AlterAggregateRenameStmt`
+            to the DDL case list alongside `CreateAggregateStmt`. Fixes the root cause
+            of test_rank/test_percentile_disc "does not exist" errors: the RENAME was
+            never executing, so the catalog never had these names.
+        (b) User-defined ordered-set aggregates in WITHIN GROUP planner:
+            Two WITHIN GROUP validation checks (`buildAggregateCall`, both at the
+            early validation and main resolution phases) now accept user-defined
+            aggregates found in the catalog, in addition to the built-in list.
+            Previously any aggregate name not in (rank/dense_rank/percentile_cont/etc.)
+            was rejected with "not an ordered-set aggregate" regardless of catalog state.
+        (c) `finishWithinGroupAgg` routing for user-defined ordered-set aggregates:
+            When `call.UserAgg != nil` and `call.WithinGroup=true`, routes to built-in
+            implementations based on `UserAgg.FinalFunc` (rank_final→rank, 
+            percentile_disc_final→percentile_disc, etc.). Also sets correct output types
+            for user-defined ordered-set aggregates in the planner default case.
+        (d) `"aggregate functions are not allowed in FILTER"` → 
+            `"aggregate function calls cannot be nested"`: The FILTER check in
+            `buildAggregateCall` now emits the correct PG error message matching
+            42803 "aggregate function calls cannot be nested" (was "not allowed in FILTER").
+        Result: test_rank(3)→5 and test_percentile_disc(0.5)→499 now correct;
+        FILTER nested-agg error message fixed.
+        aggregates diff: 234→220. Baseline CSV updated.
+
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
       - These depend on planner equivalence-class and functional-

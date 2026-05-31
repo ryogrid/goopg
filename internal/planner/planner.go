@@ -107,6 +107,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
 		*parser.CreateDomainStmt, *parser.DropDomainStmt,
 		*parser.CreateAggregateStmt,
+		*parser.AlterAggregateRenameStmt,
 		*parser.CreateOpClassStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
@@ -4443,10 +4444,11 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		if ferr != nil {
 			return AggregateCall{}, ferr
 		}
-		// Aggregate functions are not allowed inside a FILTER clause. M0097-0035.
+		// Aggregate functions nested inside a FILTER clause are not allowed. M0097-0035.
+		// PG error: "aggregate function calls cannot be nested" (same code 42803).
 		if exprHasAggregate(fc.Filter) {
 			return AggregateCall{}, &PlanError{Pos: fc.Filter.Pos(), Code: "42803",
-				Message: "aggregate functions are not allowed in FILTER"}
+				Message: "aggregate function calls cannot be nested"}
 		}
 	}
 	// Validate WITHIN GROUP for non-ordered-set aggregates early (before arg checks).
@@ -4457,8 +4459,17 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			"rank", "dense_rank", "cume_dist", "percent_rank":
 			// OK — ordered-set aggregates; validation continues below.
 		default:
-			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
-				Message: fmt.Sprintf("%s is not an ordered-set aggregate, so it cannot have WITHIN GROUP", name)}
+			// Also allow user-defined ordered-set aggregates (e.g. test_rank, test_percentile_disc).
+			isUserOSA := false
+			if cat != nil {
+				if _, ok := cat.LookupUserAggregateByName(name); ok {
+					isUserOSA = true
+				}
+			}
+			if !isUserOSA {
+				return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
+					Message: fmt.Sprintf("%s is not an ordered-set aggregate, so it cannot have WITHIN GROUP", name)}
+			}
 		}
 	}
 
@@ -4544,10 +4555,22 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		switch name {
 		case "percentile_cont", "percentile_disc", "mode",
 			"rank", "dense_rank", "cume_dist", "percent_rank":
-			// OK — these are ordered-set / hypothetical-set aggregates.
+			// OK — these are built-in ordered-set / hypothetical-set aggregates.
 		default:
-			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
-				Message: fmt.Sprintf("%s is not an ordered-set aggregate, so it cannot have WITHIN GROUP", name)}
+			// User-defined ordered-set aggregates (e.g. test_rank with finalfunc=rank_final)
+			// are also allowed. Detect by checking if the aggregate is in the catalog.
+			// Any user-defined aggregate called with WITHIN GROUP is accepted here;
+			// the executor's finishWithinGroupAgg routes based on UserAgg.FinalFunc.
+			isUserOrderedSet := false
+			if cat != nil {
+				if _, ok := cat.LookupUserAggregateByName(name); ok {
+					isUserOrderedSet = true
+				}
+			}
+			if !isUserOrderedSet {
+				return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
+					Message: fmt.Sprintf("%s is not an ordered-set aggregate, so it cannot have WITHIN GROUP", name)}
+			}
 		}
 		// Validate: WITHIN GROUP conflicts with ORDER BY inside the call args.
 		if len(fc.OrderBy) > 0 {
@@ -4562,8 +4585,22 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			withinGroupKeys = append(withinGroupKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 		}
 		// Hypothetical-set aggregates require exactly one direct arg per ordering column.
+		// This includes built-in (rank, etc.) and user-defined hypothetical-set aggregates.
+		isHypotheticalSet := false
 		switch name {
 		case "rank", "dense_rank", "cume_dist", "percent_rank":
+			isHypotheticalSet = true
+		default:
+			if cat != nil {
+				if ua, ok := cat.LookupUserAggregateByName(name); ok {
+					switch strings.ToLower(ua.FinalFunc) {
+					case "rank_final", "dense_rank_final", "percent_rank_final", "cume_dist_final":
+						isHypotheticalSet = true
+					}
+				}
+			}
+		}
+		if isHypotheticalSet {
 			nDirect := len(fc.Args)
 			nOrder := len(withinGroupKeys)
 			if nDirect != nOrder {
@@ -4688,13 +4725,44 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		// Check for user-defined aggregate in catalog.
 		if cat != nil {
 			if ua, ok := cat.LookupUserAggregateByName(name); ok {
-				// Determine return type: if there's a finalfunc, output type is
-				// typically numeric/unknown; if no finalfunc, use the stype.
-				if ua.FinalFunc != "" {
-					// finalfunc determines output — use "numeric" as a safe default.
-					outType = catalog.Type{Name: "numeric"}
-				} else {
-					outType = catalog.Type{Name: ua.SType}
+				// Determine return type: for ordered-set aggregates with known finalfuncs,
+				// use the same type as the corresponding built-in.
+				switch strings.ToLower(ua.FinalFunc) {
+				case "rank_final", "dense_rank_final":
+					outType = catalog.Type{Name: "int8"}
+				case "percent_rank_final", "cume_dist_final":
+					outType = catalog.Type{Name: "float8"}
+				case "percentile_disc_final":
+					if len(withinGroupKeys) > 0 {
+						wgType := exprType(withinGroupKeys[0].Expr)
+						if wgType.Name != "" && wgType.Name != "unknown" {
+							outType = wgType
+						} else {
+							outType = catalog.Type{Name: "numeric"}
+						}
+					} else {
+						outType = catalog.Type{Name: "numeric"}
+					}
+				case "percentile_cont_final":
+					outType = catalog.Type{Name: "float8"}
+				case "mode_final":
+					if len(withinGroupKeys) > 0 {
+						wgType := exprType(withinGroupKeys[0].Expr)
+						if wgType.Name != "" && wgType.Name != "unknown" {
+							outType = wgType
+						} else {
+							outType = catalog.Type{Name: "numeric"}
+						}
+					} else {
+						outType = catalog.Type{Name: "numeric"}
+					}
+				default:
+					// Non-ordered-set user-defined aggregate: use stype or numeric default.
+					if ua.FinalFunc != "" {
+						outType = catalog.Type{Name: "numeric"}
+					} else {
+						outType = catalog.Type{Name: ua.SType}
+					}
 				}
 				// Resolve ORDER BY inside the aggregate call.
 				var orderByKeys []SortKey
@@ -6719,6 +6787,17 @@ func isTypeCompatibleForHypothetical(orderT, argT string) bool {
 	}
 	// varchar coerces to/from text-like.
 	if textLike(oLow) && (aLow == "text" || aLow == "unknown") {
+		return true
+	}
+	return false
+}
+
+// isOrderedSetFinalFunc returns true if the finalfunc name corresponds to a
+// built-in ordered-set aggregate executor implementation.
+func isOrderedSetFinalFunc(finalFunc string) bool {
+	switch strings.ToLower(finalFunc) {
+	case "rank_final", "dense_rank_final", "percent_rank_final", "cume_dist_final",
+		"percentile_disc_final", "percentile_cont_final", "mode_final":
 		return true
 	}
 	return false
