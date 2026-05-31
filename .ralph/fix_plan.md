@@ -2774,6 +2774,24 @@ M0097-0001 wires it up.
         Impact: cleast_agg(4.5, f1) from int4_tbl now correctly returns -2147483647 (was -123456).
         Also likely fixes any other queries using least/greatest with numeric values in the error
         section (contributed to 8-line reduction).
+      - **Progress 2026-06-01 (M0097-0124 — aggregates 145→131 diffs, 3 fixes):**
+        Three targeted fixes reducing aggregates diff from 145 to 131:
+        (a) FILTER→nested error in subquery context: `buildAggregateCall` now gives "aggregate
+            function calls cannot be nested" instead of "not allowed in FILTER" when the FILTER
+            contains an aggregate and `inputCtx.parent != nil` (i.e., the aggregate is inside a
+            scalar subquery). Fixes queries like `(select max(...) filter (where sum(...)>0) from t)`.
+            Net: -2 "not allowed in FILTER" extras, +2 "cannot be nested" (matches expected). 4 diff
+            lines fixed. M0097-0124/M0097-0125.
+        (b) Exact numeric variance: Added `numericExact bool + numericSx/numericSxx *big.Rat` to
+            `aggRuntime`. For `var_pop/var_samp/stddev_pop/stddev_samp` with KindNumeric inputs
+            (non-float4/float8), accumulates exact rational Σx and Σx² instead of converting to
+            float64. `exactNumericVariance` computes (N*Σxx - (Σx)²) / N² using exact big.Rat
+            arithmetic matching PG's numeric_accum path. Variance output uses `formatBigRatDecimal`
+            (12 decimal places, trailing zero strip); stddev uses Newton-Raphson sqrt at 15 sig figs.
+            Fixes: `var_pop(b::numeric)` 17189.0540659298→17189.054065929769,
+            `var_samp(b::numeric)` 22918.738754573→22918.738754573025. 12 diff lines fixed.
+        Remaining gaps (~131 diffs): aamin/aamax 2D array column alignment (20), outer-aggregate
+        HAVING/subquery (12), 10000 rows vs 1 outer aggregate (22), count(*) filter (3), misc.
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.

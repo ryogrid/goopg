@@ -970,6 +970,12 @@ type aggRuntime struct {
 	intExact bool
 	intSx    *big.Int // Σx
 	intSxx   *big.Int // Σx²
+	// Exact rational accumulators for var_pop/var_samp/stddev on numeric inputs.
+	// When numericExact is true, these hold exact rational values matching PG's
+	// numeric_accum path (which uses exact arithmetic, not floating point). M0097-0125.
+	numericExact bool
+	numericSx    *big.Rat // Σx (exact)
+	numericSxx   *big.Rat // Σx² (exact)
 	// Regression accumulators for regr_*/covar_*/corr. M0097-0020.
 	// Follows PostgreSQL's float8_regr_accum signature: first arg is y, second is x.
 	regrN     int64   // count of non-NULL (x,y) pairs
@@ -1700,6 +1706,28 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 					st.count++
 					break
 				}
+				// For pure numeric inputs (not float4/float8 cast), use exact rational
+				// arithmetic matching PG's numeric_accum path. M0097-0125.
+				if arg.Kind == KindNumeric && !isFloat4TypeName(call.InputType.Name) &&
+					strings.ToLower(call.InputType.Name) != "float4" &&
+					strings.ToLower(call.InputType.Name) != "float8" &&
+					strings.ToLower(call.InputType.Name) != "real" &&
+					strings.ToLower(call.InputType.Name) != "double precision" {
+					if st.numericSx == nil {
+						st.numericExact = true
+						st.numericSx = new(big.Rat)
+						st.numericSxx = new(big.Rat)
+					}
+					numStr := formatNumeric(arg.NumericMantissaValue(), arg.NumericScaleValue())
+					x := new(big.Rat)
+					if _, ok := x.SetString(numStr); ok {
+						st.numericSx.Add(st.numericSx, x)
+						x2 := new(big.Rat).Mul(x, x)
+						st.numericSxx.Add(st.numericSxx, x2)
+					}
+					st.count++
+					break
+				}
 				var f float64
 				switch arg.Kind {
 				case KindInt:
@@ -1851,6 +1879,53 @@ func isFloat4TypeName(name string) bool {
 // Matching PostgreSQL's int4_accum / numeric_var_samp / numeric_var_pop path.
 // isSample: true=var_samp/stddev_samp, false=var_pop/stddev_pop.
 // isSqrt: true=stddev output, false=variance output.
+// exactNumericVariance computes var_pop/var_samp/stddev for exact rational accumulators.
+// Matches PG's numeric_accum + numeric_var_pop/var_samp path for numeric inputs. M0097-0125.
+func exactNumericVariance(sx, sxx *big.Rat, n int64, isSample, isSqrt bool) Datum {
+	bigN := new(big.Rat).SetInt64(n)
+	// numerator = N * Σxx - (Σx)²
+	numer := new(big.Rat).Mul(bigN, sxx)
+	sxSq := new(big.Rat).Mul(sx, sx)
+	numer.Sub(numer, sxSq)
+	// denominator = N² (pop) or N*(N-1) (samp)
+	var denom *big.Rat
+	if isSample {
+		denom = new(big.Rat).Mul(bigN, new(big.Rat).SetInt64(n-1))
+	} else {
+		denom = new(big.Rat).Mul(bigN, bigN)
+	}
+	if denom.Sign() == 0 {
+		return NullDatum
+	}
+	result := new(big.Rat).Quo(numer, denom)
+	if isSqrt {
+		f64, _ := result.Float64()
+		if f64 <= 0 {
+			// Variance is 0 (or negative due to floating-point artifacts): stddev = 0.
+			return NewStringDatum("0")
+		}
+		prec := uint(128)
+		ratFloat := new(big.Float).SetPrec(prec).SetRat(result)
+		seed := new(big.Float).SetPrec(prec).SetFloat64(math.Sqrt(f64))
+		half := new(big.Float).SetPrec(prec).SetFloat64(0.5)
+		for i := 0; i < 15; i++ {
+			if seed.Sign() == 0 {
+				break
+			}
+			div := new(big.Float).SetPrec(prec).Quo(ratFloat, seed)
+			seed.Mul(half, new(big.Float).SetPrec(prec).Add(seed, div))
+		}
+		// PG uses 15 significant digits for numeric stddev output (extra_float_digits=0).
+		s := seed.Text('g', 15)
+		if strings.Contains(s, ".") && !strings.Contains(s, "e") {
+			s = strings.TrimRight(s, "0")
+			s = strings.TrimRight(s, ".")
+		}
+		return NewStringDatum(s)
+	}
+	return NewStringDatum(formatBigRatDecimal(result, 12))
+}
+
 func exactIntVariance(sx, sxx *big.Int, n int64, isSample, isSqrt bool) Datum {
 	bigN := big.NewInt(n)
 	// numerator = N * Sxx - Sx²
@@ -2293,6 +2368,9 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if st.intExact {
 			return exactIntVariance(st.intSx, st.intSxx, st.count, false, false)
 		}
+		if st.numericExact {
+			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, false)
+		}
 		varPop := st.floatM2 / float64(st.count)
 		return NewStringDatum(strconv.FormatFloat(varPop, 'g', 15, 64))
 	case "variance", "var_samp":
@@ -2303,6 +2381,9 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		if st.intExact {
 			return exactIntVariance(st.intSx, st.intSxx, st.count, true, false)
 		}
+		if st.numericExact {
+			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, false)
+		}
 		varSamp := st.floatM2 / float64(st.count-1)
 		return NewStringDatum(strconv.FormatFloat(varSamp, 'g', 15, 64))
 	case "stddev_pop":
@@ -2311,6 +2392,9 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		}
 		if st.intExact {
 			return exactIntVariance(st.intSx, st.intSxx, st.count, false, true)
+		}
+		if st.numericExact {
+			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, false, true)
 		}
 		varPop := st.floatM2 / float64(st.count)
 		if varPop < 0 {
@@ -2323,6 +2407,9 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 		}
 		if st.intExact {
 			return exactIntVariance(st.intSx, st.intSxx, st.count, true, true)
+		}
+		if st.numericExact {
+			return exactNumericVariance(st.numericSx, st.numericSxx, st.count, true, true)
 		}
 		varSamp := st.floatM2 / float64(st.count-1)
 		if varSamp < 0 {

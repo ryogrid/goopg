@@ -2723,9 +2723,14 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		castType := u.castType
 		if castType == "" {
 			// Infer element type from array type suffix.
+			// Strip ALL [] suffixes to get the scalar base type (handles 2D arrays
+			// like int4[][] from array_agg(ARRAY[x]) where unnest flattens all dims).
 			at := exprType(arrResolved).Name
-			if strings.HasSuffix(at, "[]") {
-				base := strings.ToLower(at[:len(at)-2])
+			base := strings.ToLower(at)
+			for strings.HasSuffix(base, "[]") {
+				base = base[:len(base)-2]
+			}
+			if base != strings.ToLower(at) {
 				// Normalize type aliases → canonical form so int[]/integer[]/bigint[] etc. work.
 				switch base {
 				case "int4", "int", "integer":
@@ -4523,15 +4528,24 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 	// counted every row). M0097-0007 / M0097-0032.
 	var filterExpr Expr
 	if fc.Filter != nil {
+		// Check for aggregates in FILTER before resolveExpr to produce the correct PG
+		// error message. PG distinguishes two cases (M0097-0124 / M0097-0125):
+		//   • top-level aggregate with agg in FILTER → "not allowed in FILTER"
+		//   • agg inside a scalar subquery whose FILTER contains another agg →
+		//     "aggregate function calls cannot be nested"
+		// The distinction maps to whether the current resolve context is a subquery
+		// (inputCtx.parent != nil).
+		if exprHasAggregate(fc.Filter) {
+			msg := "aggregate functions are not allowed in FILTER"
+			if inputCtx != nil && inputCtx.parent != nil {
+				msg = "aggregate function calls cannot be nested"
+			}
+			return AggregateCall{}, &PlanError{Pos: fc.Filter.Pos(), Code: "42803", Message: msg}
+		}
 		var ferr error
 		filterExpr, ferr = resolveExpr(fc.Filter, inputCtx)
 		if ferr != nil {
 			return AggregateCall{}, ferr
-		}
-		// Aggregate functions are not allowed inside a FILTER clause.
-		if exprHasAggregate(fc.Filter) {
-			return AggregateCall{}, &PlanError{Pos: fc.Filter.Pos(), Code: "42803",
-				Message: "aggregate function calls cannot be nested"}
 		}
 	}
 	// Validate WITHIN GROUP for non-ordered-set aggregates early (before arg checks).
