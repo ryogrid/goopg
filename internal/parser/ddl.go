@@ -1098,6 +1098,16 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 				}
 			}
+			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE] — accept and discard.
+			if p.acceptKeyword(KwNot) {
+				_ = p.acceptKeyword(KwDeferrable)
+			} else {
+				p.acceptKeyword(KwDeferrable)
+			}
+			if p.acceptIdentKeyword("initially") {
+				_ = p.acceptIdentKeyword("deferred")
+				_ = p.acceptIdentKeyword("immediate")
+			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
 			// Table-level UNIQUE (cols) — accept as no-op for now.
 			p.advance()
@@ -1148,6 +1158,16 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 							p.advance()
 						}
 					}
+				}
+				// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE] — accept and discard.
+				if p.acceptKeyword(KwNot) {
+					_ = p.acceptKeyword(KwDeferrable)
+				} else {
+					p.acceptKeyword(KwDeferrable)
+				}
+				if p.acceptIdentKeyword("initially") {
+					_ = p.acceptIdentKeyword("deferred")
+					_ = p.acceptIdentKeyword("immediate")
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 				p.advance()

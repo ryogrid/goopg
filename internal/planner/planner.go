@@ -1819,9 +1819,9 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		}
 	}
 	// Validate column alias count when provided: AS t(c1, c2, ...).
-	// PostgreSQL raises an error if the number of column aliases does not match
-	// the actual table column count. M0097-0003.
-	if len(rv.Columns) > 0 && len(rv.Columns) != len(tbl.Columns) {
+	// PostgreSQL raises an error only if MORE aliases are given than there are columns.
+	// Partial alias lists (fewer aliases than columns) are allowed. M0097-0003.
+	if len(rv.Columns) > 0 && len(rv.Columns) > len(tbl.Columns) {
 		return nil, rangeBinding{}, &PlanError{
 			Pos:  rv.Pos(),
 			Code: "42P01",
@@ -4496,11 +4496,10 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		if ferr != nil {
 			return AggregateCall{}, ferr
 		}
-		// Aggregate functions nested inside a FILTER clause are not allowed.
-		// PostgreSQL reports "aggregate function calls cannot be nested" here.
+		// Aggregate functions are not allowed inside a FILTER clause.
 		if exprHasAggregate(fc.Filter) {
 			return AggregateCall{}, &PlanError{Pos: fc.Filter.Pos(), Code: "42803",
-				Message: "aggregate function calls cannot be nested"}
+				Message: "aggregate functions are not allowed in FILTER"}
 		}
 	}
 	// Validate WITHIN GROUP for non-ordered-set aggregates early (before arg checks).
@@ -4656,8 +4655,25 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			nDirect := len(fc.Args)
 			nOrder := len(withinGroupKeys)
 			if nDirect != nOrder {
+				// Build "function rank(type1, type2, ...) does not exist" message matching PG.
+				var sigParts []string
+				for _, arg := range fc.Args {
+					ra, _ := resolveExpr(arg, inputCtx)
+					t := exprType(ra).Name
+					if t == "" || t == "unknown" {
+						t = "text"
+					}
+					sigParts = append(sigParts, t)
+				}
+				for _, sk := range withinGroupKeys {
+					t := exprType(sk.Expr).Name
+					if t == "" || t == "unknown" {
+						t = "text"
+					}
+					sigParts = append(sigParts, t)
+				}
 				return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
-					Message: fmt.Sprintf("WITHIN GROUP (ORDER BY) arguments do not match"),
+					Message: fmt.Sprintf("function %s(%s) does not exist", name, strings.Join(sigParts, ", ")),
 					Hint: fmt.Sprintf("To use the hypothetical-set aggregate %s, the number of hypothetical direct arguments (here %d) must match the number of ordering columns (here %d).",
 						name, nDirect, nOrder),
 				}
@@ -4894,11 +4910,24 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 	if len(withinGroupKeys) > 0 {
 		withinGroupKeyType = exprType(withinGroupKeys[0].Expr)
 	}
+	// For hypothetical-set aggregates with multiple direct args (e.g. rank(5,'AZZZZ',50)),
+	// store the extra direct args in ExtraArgs for multi-key tuple comparison at runtime.
+	var hypotheticalExtraArgs []Expr
+	if len(withinGroupKeys) > 0 && len(fc.Args) > 1 {
+		for _, extraArgE := range fc.Args[1:] {
+			ea, eerr := resolveExpr(extraArgE, inputCtx)
+			if eerr != nil {
+				return AggregateCall{}, eerr
+			}
+			hypotheticalExtraArgs = append(hypotheticalExtraArgs, ea)
+		}
+	}
 	return AggregateCall{
 		pos:                fc.Pos(),
 		Name:               name,
 		Arg:                argExpr,
 		Arg2:               argExpr2,
+		ExtraArgs:          hypotheticalExtraArgs,
 		Distinct:           fc.Distinct,
 		Type:               outType,
 		InputType:          inputType,
@@ -6776,7 +6805,14 @@ func exprType(e Expr) catalog.Type {
 			// random() → float8 in [0,1). M0097-0042.
 			return catalog.Type{Name: "float8"}
 		case "generate_series":
-			// generate_series in scalar context returns int8 for integer args. M0097-0042.
+			// generate_series returns int4 for int4 args, int8 for int8/untyped args (PG overload rules).
+			if len(x.Args) >= 1 {
+				argT := exprType(x.Args[0]).Name
+				switch argT {
+				case "int4", "integer", "int":
+					return catalog.Type{Name: "int4"}
+				}
+			}
 			return catalog.Type{Name: "int8"}
 		case "unnest":
 			// unnest(array) returns the element type. M0097-0106.
