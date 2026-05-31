@@ -1050,6 +1050,15 @@ M0097-0001 wires it up.
         (no array type/subscript operator in goopg yet). Lesson: same
         sibling-path class as [[pattern_sibling_paths_must_agree]] — the
         plan-time and Open-time virtual-cell builders must use one helper.
+      - **Audit refresh 2026-06-01 (M0097-0125, post-baseline-fix):**
+        Full TestPort_RegressSuite run. 79 tests now PASS (full-suite context
+        with test_setup.sql), 48 tests FAIL. Significant improvement over
+        previous stale baseline which had many incorrect "pass" entries.
+        Baseline CSV updated from 51 stale rows. DDL catalog sync normalizer
+        fix added (lock test was 4 diffs from btree rebuild errors; now 0).
+        Failing tests sorted by diff count: limit(34), btree_index(38),
+        copydml(58), index_including_gist(64), aggregates(86), ... join(3480),
+        cluster(5449), create_index(11428).
 
 - [ ] **M0097-0020 — Port SELECT / DML / JOIN / subquery / CTE regress tests**
       - Summary: Make these 15 tests reach `pass` status:
@@ -1062,6 +1071,11 @@ M0097-0001 wires it up.
       - DoD: `go test -v -run 'TestPort_RegressSuite/(select|...)'`
         reports `pass` for every listed test.  Normalization rules
         added to `NormalizeRegressOutput`.  Coverage doc regenerated.
+      - **Audit refresh 2026-06-01 (full suite baseline):** 12 of 15
+        tests now PASS in the full TestPort_RegressSuite (with test_setup.sql):
+        select, select_distinct, select_distinct_on, select_into, update,
+        delete, returning, union, errors, explain, subselect, with.
+        Remaining: insert (461), limit (34), join (3480).
       - **Progress 2026-05-27 (M0097-0040 — select_into 133→1 diff):**
         (a) `SELECT INTO` now parses to `CreateTableStmt` with `SelectInto=true`.
         (b) CTAS column alias capture via `ColumnAliases` field.
