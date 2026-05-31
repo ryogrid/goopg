@@ -1618,6 +1618,12 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 				case KindString:
 					f, _ = strconv.ParseFloat(arg.StringValue(), 64)
 				}
+				// For float4 input, round through float32 to match PG's float4_accum
+				// semantics (PG stores float4 as 4-byte IEEE 754; accumulation uses the
+				// float32-precision value, not the original decimal string). M0097-0115.
+				if isFloat4TypeName(call.InputType.Name) {
+					f = float64(float32(f))
+				}
 				// Welford's online algorithm for numerical stability
 				st.count++
 				delta := f - st.floatMean
@@ -1639,6 +1645,11 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 			}
 			y := aggDatumToFloat64(arg)
 			x := aggDatumToFloat64(arg2)
+			// For float4 input, round through float32 to match PG's float4_accum. M0097-0115.
+			if isFloat4TypeName(call.InputType.Name) {
+				y = float64(float32(y))
+				x = float64(float32(x))
+			}
 			st.regrN++
 			st.regrSumX += x
 			st.regrSumY += y
@@ -1656,6 +1667,17 @@ func (o *aggregateOp) applyAgg(st *aggRuntime, call planner.AggregateCall, slot 
 }
 
 // aggDatumToFloat64 converts any numeric datum to float64 for aggregate computation.
+// isFloat4TypeName returns true for float4/real (single-precision) types.
+// Used to apply float32 rounding for PG-compatible float4 aggregate semantics.
+func isFloat4TypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "float4", "real":
+		return true
+	default:
+		return false
+	}
+}
+
 func aggDatumToFloat64(d Datum) float64 {
 	switch d.Kind {
 	case KindInt:
@@ -1809,6 +1831,14 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 			return NewStringDatum("-Infinity")
 		}
 		if st.numericSum.Kind == KindNumeric {
+			// For float4 input, PostgreSQL uses float4 as the transition type
+			// (float4pl accumulation with intermediate float32 rounding). Simulate
+			// this by casting the final sum through float32 and formatting with
+			// float4 precision (6 significant digits). M0097-0115.
+			if isFloat4TypeName(call.InputType.Name) {
+				fsum := aggDatumToFloat64(st.numericSum)
+				return NewStringDatum(strconv.FormatFloat(float64(float32(fsum)), 'g', 6, 32))
+			}
 			return st.numericSum
 		}
 		return Datum{Kind: KindInt, Int: st.sum}
@@ -2431,6 +2461,7 @@ func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Contex
 		if n == 0 {
 			return NullDatum
 		}
+		float4Input := isFloat4TypeName(call.WithinGroupKeyType.Name)
 		// Array form: percentile_cont(array[p1,p2,...]) WITHIN GROUP (ORDER BY x)
 		// returns an array of interpolated values. M0097-0035.
 		if fracs, ok := tryParseFloatArray(p); ok {
@@ -2444,7 +2475,7 @@ func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Contex
 					results[i] = "NULL"
 					continue
 				}
-				results[i] = percentileContOneFloat(orderedVals, n, pf)
+				results[i] = percentileContOneFloat(orderedVals, n, pf, float4Input)
 			}
 			return NewStringDatum(formatTextArray(results))
 		}
@@ -2452,7 +2483,7 @@ func finishWithinGroupAgg(st aggRuntime, call planner.AggregateCall, ctx *Contex
 		if math.IsNaN(pf) || pf < 0 || pf > 1 {
 			return NullDatum
 		}
-		return NewStringDatum(percentileContOneFloat(orderedVals, n, pf))
+		return NewStringDatum(percentileContOneFloat(orderedVals, n, pf, float4Input))
 
 	case "percentile_disc":
 		// Use direct arg stored during applyAgg from the first row of the group.
@@ -2658,7 +2689,9 @@ func tryParseFloatArray(d Datum) ([]float64, bool) {
 
 // percentileContOneFloat computes percentile_cont for a single fraction pf
 // over the sorted orderedVals. Returns the result as a string Datum. M0097-0035.
-func percentileContOneFloat(orderedVals []Datum, n int, pf float64) string {
+// If float4Input is true, ordered values are rounded through float32 to match
+// PG's float4_accum semantics (float4 binary storage → float8 interpolation). M0097-0115.
+func percentileContOneFloat(orderedVals []Datum, n int, pf float64, float4Input bool) string {
 	pos := pf * float64(n-1)
 	lower := int(math.Floor(pos))
 	upper := int(math.Ceil(pos))
@@ -2669,11 +2702,19 @@ func percentileContOneFloat(orderedVals []Datum, n int, pf float64) string {
 		upper = n - 1
 	}
 	if lower == upper {
-		return orderedVals[lower].Format()
+		lo := aggDatumToFloat64(orderedVals[lower])
+		if float4Input {
+			lo = float64(float32(lo))
+		}
+		return strconv.FormatFloat(lo, 'g', 15, 64)
 	}
 	frac := pos - float64(lower)
 	lo := aggDatumToFloat64(orderedVals[lower])
 	hi := aggDatumToFloat64(orderedVals[upper])
+	if float4Input {
+		lo = float64(float32(lo))
+		hi = float64(float32(hi))
+	}
 	result := lo + frac*(hi-lo)
 	return strconv.FormatFloat(result, 'g', 15, 64)
 }

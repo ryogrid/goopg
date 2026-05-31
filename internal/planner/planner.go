@@ -4626,6 +4626,13 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		} else {
 			outType = catalog.Type{Name: "numeric"}
 		}
+	case "string_agg":
+		// string_agg(expr, delimiter) returns the same type as its first arg
+		// (text for text input, bytea for bytea input). M0097-0115.
+		outType = exprType(argExpr)
+		if outType.Name == "" || outType.Name == "unknown" {
+			outType = catalog.Type{Name: "text"}
+		}
 	case "min", "max":
 		outType = exprType(argExpr)
 	case "regr_count":
@@ -4636,9 +4643,14 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		outType = catalog.Type{Name: "float8"}
 	// Ordered-set aggregates (M0097-0035).
 	case "percentile_cont":
+		// percentile_cont always returns float8 for numeric/float inputs because
+		// linear interpolation produces a float8 value. For float4 ORDER BY,
+		// PG upcasts to float8 internally. M0097-0115.
 		if len(withinGroupKeys) > 0 {
 			wgType := exprType(withinGroupKeys[0].Expr)
-			if wgType.Name != "" && wgType.Name != "unknown" {
+			if isFloat4TypeName(wgType.Name) {
+				outType = catalog.Type{Name: "float8"}
+			} else if wgType.Name != "" && wgType.Name != "unknown" {
 				outType = wgType
 			} else {
 				outType = catalog.Type{Name: "float8"}
@@ -4730,6 +4742,16 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		}
 		orderByKeys = append(orderByKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 	}
+	// Capture input type for precision-sensitive aggregates (float4 sum/variance).
+	var inputType catalog.Type
+	if argExpr != nil {
+		inputType = exprType(argExpr)
+	}
+	// Capture ORDER BY column type for ordered-set aggregates (percentile_cont float4 rounding).
+	var withinGroupKeyType catalog.Type
+	if len(withinGroupKeys) > 0 {
+		withinGroupKeyType = exprType(withinGroupKeys[0].Expr)
+	}
 	return AggregateCall{
 		pos:                fc.Pos(),
 		Name:               name,
@@ -4737,6 +4759,8 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 		Arg2:               argExpr2,
 		Distinct:           fc.Distinct,
 		Type:               outType,
+		InputType:          inputType,
+		WithinGroupKeyType: withinGroupKeyType,
 		Filter:             filterExpr,
 		OrderBy:            orderByKeys,
 		WithinGroup:        len(withinGroupKeys) > 0,
@@ -6648,6 +6672,15 @@ func exprType(e Expr) catalog.Type {
 func isFloatTypeName(name string) bool {
 	switch strings.ToLower(name) {
 	case "float4", "float8", "real", "double precision", "double", "float":
+		return true
+	}
+	return false
+}
+
+// isFloat4TypeName returns true for float4/real (single-precision) types.
+func isFloat4TypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "float4", "real":
 		return true
 	}
 	return false

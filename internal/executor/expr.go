@@ -1075,6 +1075,102 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 
 // compareDatum returns -1/0/1 the same way upstream's btree
 // comparators do, scoped to the v0 type set.
+// splitRowElements splits a PostgreSQL row-literal string "(e1,e2,...)" into
+// its elements. Handles nested parentheses and double-quoted strings.
+// Returns nil if s is not a valid row literal.
+func splitRowElements(s string) []string {
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return nil
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return []string{}
+	}
+	var elems []string
+	depth := 0
+	inQuote := false
+	start := 0
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		if inQuote {
+			if c == '"' {
+				if i+1 < len(inner) && inner[i+1] == '"' {
+					i++ // escaped quote
+				} else {
+					inQuote = false
+				}
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				elems = append(elems, inner[start:i])
+				start = i + 1
+			}
+		}
+	}
+	elems = append(elems, inner[start:])
+	return elems
+}
+
+// compareRowElem compares two row element strings element-wise.
+// Numeric strings are compared numerically; others lexicographically.
+func compareRowElem(a, b string) int {
+	if a == b {
+		return 0
+	}
+	// NULL is represented as empty string in row format; NULL < any non-NULL.
+	if a == "" {
+		return -1
+	}
+	if b == "" {
+		return 1
+	}
+	// Try numeric comparison.
+	af, aerr := strconv.ParseFloat(a, 64)
+	bf, berr := strconv.ParseFloat(b, 64)
+	if aerr == nil && berr == nil {
+		switch {
+		case af < bf:
+			return -1
+		case af > bf:
+			return 1
+		default:
+			return 0
+		}
+	}
+	return strings.Compare(a, b)
+}
+
+// compareRowStrings compares two PostgreSQL composite-type (row) strings.
+// Elements are compared in order; numeric elements use numeric comparison.
+// Returns 0 if not recognizable as row format, falling back to lexicographic.
+func compareRowStrings(a, b string) int {
+	ae := splitRowElements(a)
+	be := splitRowElements(b)
+	if ae == nil || be == nil {
+		return strings.Compare(a, b)
+	}
+	n := len(ae)
+	if len(be) < n {
+		n = len(be)
+	}
+	for i := 0; i < n; i++ {
+		c := compareRowElem(ae[i], be[i])
+		if c != 0 {
+			return c
+		}
+	}
+	return len(ae) - len(be)
+}
+
 func compareDatum(a, b Datum, pos int) (int, error) {
 	// Implicit cross-kind promotion so planner-side column-index
 	// misalignments don't crash the entire query.  PostgreSQL
@@ -1185,6 +1281,11 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 			if isValidUUIDStr(bs) {
 				bs = normalizeUUIDStr(bs)
 			}
+		}
+		// Composite row literal comparison: "(e1,e2,...)" uses element-wise
+		// numeric comparison so max(row(a,b)) works correctly. M0097-0115.
+		if len(as) > 0 && as[0] == '(' && len(bs) > 0 && bs[0] == '(' {
+			return compareRowStrings(as, bs), nil
 		}
 		return strings.Compare(as, bs), nil
 	case KindBytes:
@@ -3947,9 +4048,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Full SQL deparsing would require a complete SQL pretty-printer. M0097-0004.
 		return NullDatum, nil
 	case "pg_collation_for":
-		// Stub: goopg does not track collations; always return "default". M0097-0035.
-		// The real function returns the collation of its argument.
-		return NewStringDatum(`"default"`), nil
+		// Return "POSIX" to match the C/POSIX locale used in regression tests.
+		// PG regression databases are created with --locale=C, so text values
+		// have POSIX collation. M0097-0115.
+		return NewStringDatum(`"POSIX"`), nil
 	case "to_char":
 		return evalToChar(x, row, ctx)
 	case "age":

@@ -643,6 +643,12 @@ type AggregateCall struct {
 	Star      bool
 	Distinct  bool
 	Type      catalog.Type
+	// InputType is the type of the primary argument expression, used for
+	// precision-sensitive aggregates (e.g. float4 sum/variance use float32 semantics).
+	InputType catalog.Type
+	// WithinGroupKeyType is the type of the first ORDER BY column in WITHIN GROUP
+	// ordered-set aggregates. Used for percentile_cont float32 precision rounding.
+	WithinGroupKeyType catalog.Type
 	// Filter is the resolved FILTER (WHERE ...) predicate. M0097-0007.
 	Filter Expr
 	// OrderBy is the ORDER BY clause inside the aggregate call, e.g.
