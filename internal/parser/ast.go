@@ -1216,6 +1216,7 @@ type CompatNoopStmt struct {
 	ObjName   ObjectName // optional: primary object name for compat registry
 	ArgTypes  []string   // optional: arg types for operator compat registry (e.g. ["bigint","bigint"])
 	TableName ObjectName // optional: table name for rule compat registry
+	RuleKind  string     // optional: rule kind for COPY DML error messages (M0097-0140)
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }

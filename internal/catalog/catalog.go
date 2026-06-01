@@ -436,6 +436,10 @@ type InMemory struct {
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
 	compatObjects map[string]map[string]struct{}
+
+	// tableRuleKinds tracks the most-recently-registered rule kind per table.
+	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
+	tableRuleKinds map[string]string
 }
 
 // EnumValue is one label in a user-defined enum type together with its sort
@@ -2582,6 +2586,36 @@ func (c *InMemory) DropCompatObject(objType, name string) bool {
 		return true
 	}
 	return false
+}
+
+// RegisterTableRuleKind records the most recently created rule kind for a table.
+// Used by planCopy to return rule-specific errors. M0097-0140.
+func (c *InMemory) RegisterTableRuleKind(tableName, kind string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tableRuleKinds == nil {
+		c.tableRuleKinds = make(map[string]string)
+	}
+	c.tableRuleKinds[strings.ToLower(tableName)] = kind
+}
+
+// UnregisterTableRules removes the rule kind record for a table (on DROP RULE). M0097-0140.
+func (c *InMemory) UnregisterTableRules(tableName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tableRuleKinds != nil {
+		delete(c.tableRuleKinds, strings.ToLower(tableName))
+	}
+}
+
+// TableRuleKind returns the most recently registered rule kind for a table, or "". M0097-0140.
+func (c *InMemory) TableRuleKind(tableName string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.tableRuleKinds == nil {
+		return ""
+	}
+	return c.tableRuleKinds[strings.ToLower(tableName)]
 }
 
 func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {

@@ -583,9 +583,15 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 		ns.ObjName = ObjectName{Name: tok.Value}
 		p.advance()
 	}
-	// Scan for "TO <tablename>" to extract the table this rule applies to.
-	// Skip tokens (tracking depth) until we reach the top-level semicolon or EOF.
+	// Scan for "TO <tablename>" and detect the rule kind (DO ALSO, DO INSTEAD NOTHING,
+	// multi-statement, conditional, or utility action). M0097-0140.
 	depth := 0
+	seenDo := false      // passed DO keyword at depth 0
+	seenInstead := false // passed INSTEAD keyword at depth 0 after DO
+	seenAlso := false    // DO ALSO detected
+	hasWhere := false    // WHERE clause present before DO
+	gotKind := false     // rule kind already determined
+
 	for {
 		tok := p.cur()
 		if tok.Kind == TokenEOF {
@@ -597,6 +603,10 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 		if tok.Kind == TokenSymbol {
 			switch tok.Value {
 			case "(", "[":
+				if depth == 0 && seenInstead && !gotKind {
+					ns.RuleKind = "multi-statement DO INSTEAD"
+					gotKind = true
+				}
 				depth++
 				p.advance()
 				continue
@@ -606,12 +616,39 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 				}
 			}
 		}
-		// At top-level, look for "TO <tablename>" to capture the table.
-		if depth == 0 && tok.Kind == TokenKeyword && Keyword(tok.Value) == KwTo && ns.TableName.Name == "" {
-			p.advance()
-			tname, _ := p.parseObjectName()
-			ns.TableName = tname
-			continue
+		if depth == 0 {
+			kw := strings.ToUpper(tok.Value)
+			switch {
+			case kw == "TO" && ns.TableName.Name == "" && !seenDo:
+				p.advance()
+				tname, _ := p.parseObjectName()
+				ns.TableName = tname
+				continue
+			case kw == "WHERE" && !seenDo:
+				hasWhere = true
+			case kw == "DO" && !seenDo:
+				seenDo = true
+			case seenDo && !seenInstead && !seenAlso && kw == "INSTEAD":
+				seenInstead = true
+			case seenDo && !seenInstead && !seenAlso && kw == "ALSO":
+				ns.RuleKind = "DO ALSO"
+				seenAlso = true
+				gotKind = true
+			case seenInstead && !gotKind && kw == "NOTHING":
+				ns.RuleKind = "DO INSTEAD NOTHING"
+				gotKind = true
+			case seenInstead && !gotKind && kw == "NOTIFY":
+				ns.RuleKind = "utility"
+				gotKind = true
+			case seenInstead && !gotKind:
+				// First meaningful token after INSTEAD: not NOTHING, not (, not NOTIFY.
+				if hasWhere {
+					ns.RuleKind = "conditional DO INSTEAD"
+				} else {
+					ns.RuleKind = "DO INSTEAD"
+				}
+				gotKind = true
+			}
 		}
 		p.advance()
 	}

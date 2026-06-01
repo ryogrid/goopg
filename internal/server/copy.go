@@ -443,6 +443,15 @@ func (s *Server) runCopyToStream(w *protocol.FrameWriter, ctx *executor.Context,
 	if err := w.WriteCopyDone(); err != nil {
 		return count, false, err
 	}
+	// Flush NOTICEs accumulated by DML operators (e.g. trigger RAISE NOTICE). M0097-0140.
+	for _, msg := range ctx.TakeNotices() {
+		_ = w.WriteNoticeResponse([]protocol.ErrorField{
+			{Code: protocol.FieldSeverity, Value: "NOTICE"},
+			{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: protocol.FieldSQLState, Value: "00000"},
+			{Code: protocol.FieldMessage, Value: msg},
+		})
+	}
 	return count, false, nil
 }
 

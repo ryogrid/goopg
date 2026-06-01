@@ -79,7 +79,7 @@ uuid,0,pass
 vacuum,0,pass
 varchar,0,pass
 xid,0,pass
-copydml,36,failed
+copydml,0,pass
 index_including_gist,64,failed
 aggregates,95,failed
 create_table_like,113,failed

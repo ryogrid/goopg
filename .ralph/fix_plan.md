@@ -2093,6 +2093,42 @@ M0097-0001 wires it up.
         Baseline CSV: corrected window (0→3504, never actually passing) and
         with (0→1518) to reflect true state.  test stays 0/pass.
 
+      - **Progress 2026-06-02 (M0097-0140 — copydml 32→0 diffs, PASS):**
+        Six interconnected fixes close all 32 copydml diff lines:
+        (a) `RuleKind string` field added to `CompatNoopStmt` AST (`internal/parser/ast.go`).
+        (b) `parseCreateRuleTail` (`internal/parser/ddl.go`) now detects rule kind by scanning
+            the CREATE RULE body: DO ALSO, DO INSTEAD NOTHING, multi-statement DO INSTEAD (paren),
+            conditional DO INSTEAD (WHERE before DO), and utility (NOTIFY) are stored in `RuleKind`.
+        (c) `RegisterTableRuleKind`/`TableRuleKind`/`UnregisterTableRules` added to `catalog.InMemory`
+            with `tableRuleKinds map[string]string` field (not on the Catalog interface). M0097-0140.
+        (d) `execCompatNoop` (`internal/executor/operators_ddl.go`) registers rule kind when
+            ObjType="rule" and RuleKind is set; `execDropRule` calls `UnregisterTableRules` on
+            DROP RULE to clear the entry. M0097-0140.
+        (e) `copyDMLRuleError` helper (`internal/planner/copy.go`) type-asserts to `*catalog.InMemory`,
+            extracts target table name from INSERT/UPDATE/DELETE DML stmt, and returns the
+            appropriate rule-specific error message matching PostgreSQL's DoCopy checks:
+            "DO ALSO rules are not supported for COPY" / "DO INSTEAD NOTHING rules are not
+            supported for COPY" / "conditional DO INSTEAD rules are not supported for COPY" /
+            "multi-statement DO INSTEAD rules are not supported for COPY" /
+            "COPY query must not be a utility command". `planCopy` calls it before returning
+            the generic "COPY query must have a RETURNING clause" error. M0097-0140.
+        (f) AFTER trigger firing added to DML operators (`internal/executor/operators_storage.go`):
+            `insertOp.Next` non-partitioned path, SeqScan `updateOp.Next` path, `deleteOp.Next`
+            path each call `fireTriggers(ctx, tbl, "after", event, ...)` after committing the
+            row mutation. M0097-0140.
+        (g) Notice flush in `runCopyToStream` (`internal/server/copy.go`): after `WriteCopyDone()`,
+            flush all accumulated notices from the executor context so trigger RAISE NOTICE output
+            reaches the client before CommandComplete. M0097-0140.
+        (h) Critical bug fix in `executePLpgSQLTriggerBody` (`internal/executor/plpgsql_runtime.go`):
+            `child = *ctx` copied `ctx.Notices` slice header into child; when AFTER trigger fired
+            after BEFORE trigger, child propagated ALL ctx notices (including BEFORE trigger output)
+            back to ctx → double-notification. Fix: `child.Notices = nil` after the copy so only
+            the trigger's OWN notices propagate back. M0097-0140.
+        Tests: `go test ./internal/parser/ ./internal/planner/ ./internal/catalog/ ./internal/executor/`
+        (modulo pre-existing TestToastByteaRoundTrip / TestPgGetPublicationTablesRelidMatchesPgClassOid
+        flakes). `TestPort_RegressSuite/copydml` → PASS.
+        Baseline CSV: copydml 36→0 pass.
+
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
         `copy`, `copy2`, `copydml`, `copyselect`, `sequence`,

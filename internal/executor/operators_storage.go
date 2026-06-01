@@ -1116,6 +1116,10 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// M0104-0007: SSI write-path hook for the non-partitioned insert path.
 		ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset)
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)
+		// AFTER INSERT triggers (M0097-0140).
+		if len(o.plan.Table.Triggers) > 0 {
+			fireTriggers(o.ctx, o.plan.Table, "after", "insert", nil, row)
+		}
 		o.appendInsertRetRow(row)
 		o.rowsAffected++
 	}
@@ -2116,6 +2120,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 		}
 		if !epqSkip {
+			// AFTER UPDATE triggers (M0097-0140).
+			if len(idxTbl.Triggers) > 0 {
+				fireTriggers(o.ctx, idxTbl, "after", "update", pu.oldRow, pu.newRow)
+			}
 			o.appendUpdateRetRow(pu.newRow)
 			o.rowsAffected++
 		}
@@ -2513,6 +2521,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			// paths — the rw-conflict target is the SLOT that any concurrent
 			// SERIALIZABLE reader would have predicate-locked.
 			ssiRecordTupleWrite(o.ctx, puRel, pu.blk, pu.slot)
+			// AFTER UPDATE triggers (M0097-0140).
+			scanTblForAfterTrig := pu.scanTbl
+			if scanTblForAfterTrig == nil {
+				scanTblForAfterTrig = tbl
+			}
+			if len(scanTblForAfterTrig.Triggers) > 0 {
+				fireTriggers(o.ctx, scanTblForAfterTrig, "after", "update", pu.oldRow, pu.newRow)
+			}
 			// Use parent-aligned retRow for RETURNING when available (inheritance
 			// children store a remapped row so RETURNING exprs work correctly). M0097-0078.
 			if pu.retRow != nil {
@@ -2826,6 +2842,14 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			// The rw-conflict target is the slot a concurrent SERIALIZABLE
 			// reader would have predicate-locked before the xmax stamp.
 			ssiRecordTupleWrite(o.ctx, victimRel, v.blk, v.slot)
+			// AFTER DELETE triggers (M0097-0140).
+			if len(tbl.Triggers) > 0 {
+				delRow := v.row
+				if v.retRow != nil {
+					delRow = v.retRow
+				}
+				fireTriggers(o.ctx, tbl, "after", "delete", delRow, nil)
+			}
 			// Use parent-aligned retRow for RETURNING when available (inheritance children). M0097-0078.
 			if v.retRow != nil {
 				o.appendDeleteRetRow(v.retRow)

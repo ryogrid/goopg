@@ -1604,6 +1604,10 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 	child := NewContext()
 	if ctx != nil {
 		*child = *ctx
+		// Clear inherited notices so the child accumulates only its own;
+		// existing ctx.Notices are propagated by the parent, not re-propagated
+		// by the child's TakeNotices loop below. M0097-0140.
+		child.Notices = nil
 	}
 	frame := newPLpgSQLFrame()
 	frame.trig = trig

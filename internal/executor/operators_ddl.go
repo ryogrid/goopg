@@ -3158,6 +3158,8 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		key := s.Name + "@" + s.Table.String()
 		if im.DropCompatObject("rule", key) {
+			// Also remove the table rule kind so future COPY DML sees no rule. M0097-0140.
+			im.UnregisterTableRules(s.Table.Name)
 			return nil
 		}
 	}
@@ -3848,6 +3850,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if s.TableName.Name != "" {
 			key := s.ObjName.Name + "@" + s.TableName.String()
 			im.RegisterCompatObject("rule", key)
+			// Also record the rule kind for COPY DML rule-specific errors. M0097-0140.
+			if s.RuleKind != "" {
+				im.RegisterTableRuleKind(s.TableName.Name, s.RuleKind)
+			}
 		}
 	default:
 		// conversion, text search dictionary/configuration/parser/template, etc.
