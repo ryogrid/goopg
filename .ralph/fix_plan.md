@@ -2021,6 +2021,22 @@ M0097-0001 wires it up.
         Commits: a6eaf522 (overflow + LIKE), c174d809 (float8 decimal notation).
         Baseline CSV updated: create_table_like 132→125, copydml 58→36, int8 239→273
         (baseline 239 was stale; 273 is the accurate current count with individual test runs).
+      - **Progress 2026-06-02 (M0097-0139 — pg_attribute + parser):**
+        Three fixes reducing create_table_like 125→113 diffs:
+        (a) `PGAttributeColumns()` expanded to 24-column PG18 canonical layout
+            (`internal/catalog/codec.go`). The 6-column schema misread physical
+            field positions (attlen as attnum, etc.). Now matches `initdb.pgAttrColDefs()`
+            and `syncTableToCatalogHeap`'s write path. `SELECT attcompression FROM
+            pg_attribute` now works. TestPGAttributeColumnsCount updated.
+        (b) `CREATE FOREIGN TABLE` parser fix (`internal/parser/ddl.go`): FOREIGN
+            is a reserved keyword — `acceptKeyword(KwForeign)` replaces
+            `acceptIdentKeyword("foreign")` which silently never matched. CREATE
+            FOREIGN TABLE now parses as CompatNoopStmt, removing 3 "syntax error
+            near foreign" errors.
+        (c) `CREATE STATISTICS` parses as CompatNoopStmt. Removes 4 "syntax error
+            near statistics" errors.
+        Commit: 586a5539. create_table_like: 125 → 113 diffs.
+        Baseline CSV: create_table_like 113.
       - **Progress 2026-06-01 (M0097-0133 — GENERATED AS IDENTITY + LIKE flags):**
         (a) `GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY` column parsing added to
             `parseColumnDef` (`internal/parser/ddl.go`): after `GENERATED ALWAYS AS` or
