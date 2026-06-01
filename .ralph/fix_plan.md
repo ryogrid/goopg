@@ -2839,6 +2839,21 @@ M0097-0001 wires it up.
         Remaining gaps (~86 diffs): outer-aggregate HAVING/subquery (20), 10000 rows vs 1
         outer aggregate (21), ARRAY(subquery) syntax (7), aggregate+SRF combo (3), error
         section mismatches (12), misc (23).
+      - **Progress 2026-06-01 (M0097-0127 — aggregates build-fixed + ARRAY/CollateExpr):**
+        Five fixes (commit 9a9d224c): (a) Build fix: evalRowToRowComparison at line 8234
+        called compareDatum with 2 args (M0097-0126 changed signature to 3); fixed to
+        compareDatum(lDat, rDat, 0). (b) ARRAY(subquery): parser produces ArraySubqueryExpr;
+        planner plans via planArraySubqueryExpr; executor evalArraySubquery collects rows into
+        text-array; targetMeta/exprOutputName return "array" as column name. Fixes
+        {2,3,4}/{3,4,5}/{4,5,6} 3-row array query. (c) CollateExpr: parser wraps
+        `expr COLLATE "name"` in CollateExpr (was discarded); planner pass-through; executor
+        evaluates operand. (d) Collation mismatch: in buildAggregateCall, if both direct arg
+        and WITHIN GROUP ORDER BY key are CollateExpr with different collation names, emit
+        SQLSTATE 42P21 "collation mismatch". Fixes rank('adam'::text collate "C") within group
+        (order by x collate "POSIX") → error. (e) Outer-level agg validation: WITHIN GROUP
+        ORDER BY with OuterColumnRef → "outer-level aggregate cannot contain a lower-level
+        variable" error. Fixes ARRAY(SELECT percentile_disc(a) within group (order by x)).
+        Aggregates raw diff: 110 → 93 (down from 86 pre-M0097-0126 due to lateral fix side effects).
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
