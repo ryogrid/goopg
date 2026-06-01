@@ -264,8 +264,11 @@ func (l *lexer) next() (Token, error) {
 			}
 			// Commit to numeric if: next char after '.' is a digit, whitespace, semicolon,
 			// comma, closing paren, end of input, or other non-ident non-dot char.
-			// Do NOT commit if followed by an identifier (qualified name `tbl.col`).
-			if !isIdentStart(nextAfterDot) && nextAfterDot != '.' {
+			// Also commit if next is 'e'/'E' followed by '+', '-', or a digit (scientific notation
+			// like "4664.E+5" or "1.E-10"). Do NOT commit if followed by a plain identifier.
+			isExponentStart := (nextAfterDot == 'e' || nextAfterDot == 'E') &&
+				l.pos+2 < len(l.src) && (l.src[l.pos+2] == '+' || l.src[l.pos+2] == '-' || isDigit(l.src[l.pos+2]))
+			if isExponentStart || (!isIdentStart(nextAfterDot) && nextAfterDot != '.') {
 				l.pos++ // consume '.'
 				fracStart := l.pos
 				for l.pos < len(l.src) && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {

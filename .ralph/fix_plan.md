@@ -2793,6 +2793,20 @@ M0097-0001 wires it up.
             formats with FormatFloat(fsum, 'g', 15, 64) to match PG's float8out. aggregates: 95→87.
         Added tests: `TestSyntax_DDL_MatViewPgClass` (integration), `TestMatviewPgClassLookup` (unit).
         Baseline CSV updated: matview 247→175, aggregates 95→87.
+      - **Progress 2026-06-02 (M0097-0141 — enum ORDER BY, loop 477):**
+        Five-part fix (commit 0d77a623):
+        (a) `catalog.ResolveColumnType`: preserve enum type name (not "text") so columns retain
+            enum type name for sort-order lookup during scan.
+        (b) `seqScanOp.Open`: pre-compute `enumTypes []*catalog.EnumType`; in `Next()` after
+            `cloneRowOwned`, convert KindString → KindEnum{sortOrder,label} for enum columns.
+            `compareDatum` already uses sort order for KindEnum.
+        (c) `analyzer.isAssignable`: allow text → user-defined (non-built-in) type assignment
+            so `INSERT INTO t (enum_col) VALUES ('label')` compiles.
+        (d) `analyzer.isComparable`: allow string ↔ user-defined type comparison so
+            `WHERE enum_col = 'label'` compiles.
+        (e) `executor.evalCast` (text target): KindEnum → KindString(label) so `col::text`
+            casts use alphabetical order, not enum sort order.
+        enum regress: 269 → 237 diffs. Baseline updated.
 
       - **Progress 2026-05-31 (M0097-0113 — aggregates 364→328 diff):**
         Two fixes (commit b86bc75e):

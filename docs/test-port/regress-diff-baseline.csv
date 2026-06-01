@@ -84,7 +84,7 @@ index_including_gist,64,failed
 aggregates,87,failed
 create_table_like,113,failed
 index_including,204,failed
-insert_conflict,211,failed
+insert_conflict,239,failed
 join_hash,245,failed
 matview,175,failed
 enum,237,failed
@@ -93,7 +93,7 @@ create_procedure,274,failed
 create_table,388,failed
 create_view,426,failed
 create_function_sql,430,failed
-insert,461,failed
+insert,507,failed
 subselect,500,failed
 guc,587,failed
 identity,587,failed
