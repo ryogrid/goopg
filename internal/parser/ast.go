@@ -1308,6 +1308,8 @@ type AlterTableActionKind int
 const (
 	AlterTableAddPrimaryKey AlterTableActionKind = iota
 	AlterTableAddColumn
+	AlterTableAddCheck // ADD [CONSTRAINT name] CHECK (expr)
+	AlterTableNoOp     // Unknown constraint type accepted as no-op
 	// AlterTableAddForeignKey is `ADD [CONSTRAINT name] FOREIGN
 	// KEY (cols) REFERENCES table (cols) [NOT DEFERRABLE |
 	// DEFERRABLE]`. v0 parses it for compatibility with HammerDB
@@ -1376,6 +1378,9 @@ type AlterTableAction struct {
 	// InheritParent is populated for AlterTableInherit and AlterTableNoInherit.
 	// Holds the parent table name. M0097-0048.
 	InheritParent ObjectName
+
+	// CheckExpr is the raw SQL expression for AlterTableAddCheck.
+	CheckExpr string
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

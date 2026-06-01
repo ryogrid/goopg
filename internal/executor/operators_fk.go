@@ -933,15 +933,34 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 	if len(tbl.CheckConstraints) == 0 {
 		return nil
 	}
+	// Build FROM clause with actual column values so the planner can
+	// resolve column names. Format:
+	//   SELECT (expr) FROM (VALUES (v1::t1, v2::t2,...)) AS _chk(c1, c2,...)
+	colNames := make([]string, len(tbl.Columns))
+	for i, col := range tbl.Columns {
+		colNames[i] = col.Name
+	}
+	colNamesJoined := strings.Join(colNames, ", ")
+
 	for _, exprSQL := range tbl.CheckConstraints {
 		if exprSQL == "" {
 			continue
 		}
-		// Parse the CHECK expression as a SQL expression.
-		fullSQL := "SELECT (" + exprSQL + ")"
+		// Build actual-value from clause for this row.
+		colVals := make([]string, len(tbl.Columns))
+		for i, col := range tbl.Columns {
+			if i < len(row) && !row[i].IsNull() {
+				v := row[i].Format()
+				colVals[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::" + col.Type.Name
+			} else {
+				colVals[i] = "NULL::" + col.Type.Name
+			}
+		}
+		rowFrom := " FROM (VALUES (" + strings.Join(colVals, ", ") + ")) AS _chk(" + colNamesJoined + ")"
+		fullSQL := "SELECT (" + exprSQL + ")" + rowFrom
 		stmts, err := parser.Parse(fullSQL)
 		if err != nil || len(stmts) == 0 {
-			continue // invalid check expr: skip
+			continue
 		}
 		plan, err := planner.Plan(stmts[0], ctx.Catalog)
 		if err != nil {
@@ -951,24 +970,26 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 		if err != nil {
 			continue
 		}
-		// Build a synthetic slot from the row so the CHECK expression
-		// can reference column values.
 		synthCtx := *ctx
-		synthCtx.OuterRows = append(synthCtx.OuterRows, row)
 		if err := op.Open(&synthCtx); err != nil {
 			op.Close()
 			continue
 		}
 		slot, err2 := op.Next()
+		// Read slot data BEFORE Close (Close releases the backing row memory).
+		var result Datum
+		hasResult := false
+		if err2 == nil && slot != nil {
+			sr := slotRow(slot)
+			if len(sr) > 0 {
+				result = sr[0]
+				hasResult = true
+			}
+		}
 		op.Close()
-		if err2 != nil || slot == nil {
+		if !hasResult {
 			continue
 		}
-		sr := slotRow(slot)
-		if len(sr) == 0 {
-			continue
-		}
-		result := sr[0]
 		// NULL check result → pass (SQL NULL is not a constraint failure)
 		if result.IsNull() {
 			continue

@@ -84,7 +84,7 @@ copydml,58,failed
 index_including_gist,64,failed
 aggregates,68,failed
 drop_if_exists,0,pass
-create_table_like,136,failed
+create_table_like,132,failed
 index_including,204,failed
 insert_conflict,211,failed
 join_hash,245,failed

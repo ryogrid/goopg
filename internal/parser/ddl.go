@@ -1381,6 +1381,9 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						likeKey += ":+defaults"
 					}
 				case p.acceptIdentKeyword("constraints"):
+					if isIncluding {
+						likeKey += ":+constraints"
+					}
 				case p.acceptIdentKeyword("indexes"):
 				case p.acceptIdentKeyword("identity"):
 					if isIncluding {
@@ -1395,7 +1398,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 				case p.acceptKeyword(KwAll):
 					if isIncluding {
-						likeKey += ":+defaults:+identity:+generated"
+						likeKey += ":+defaults:+identity:+generated:+constraints"
 					}
 				}
 			}
@@ -2655,6 +2658,9 @@ func (p *parser) parseCheckExpr() (string, error) {
 				return strings.Join(parts, " "), nil
 			}
 			parts = append(parts, ")")
+		} else if t.Kind == TokenStringLit {
+			// Re-add quotes for string literals (token stores value without quotes).
+			parts = append(parts, "'"+strings.ReplaceAll(t.Value, "'", "''")+"'")
 		} else {
 			parts = append(parts, t.Value)
 		}
@@ -3531,10 +3537,34 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act.RefColumns = refCols
 		act.Deferrable = deferrable
 		return act, nil
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
+		// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
+		p.advance() // consume CHECK
+		expr, err := p.parseCheckExpr()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		// Consume optional NOT VALID trailer.
+		_ = p.acceptKeyword(KwNot) && p.acceptIdentKeyword("valid")
+		act.Kind = AlterTableAddCheck
+		act.CheckExpr = expr
+		return act, nil
 	default:
 		// ADD [COLUMN] column_def — bare ident or COLUMN keyword.
 		if act.ConstraintName != "" {
-			return AlterTableAction{}, p.errAtCur("expected PRIMARY KEY or FOREIGN KEY after CONSTRAINT name")
+			// Unknown constraint type with something after it (e.g. UNIQUE, EXCLUDE).
+			// Accept as no-op if there's actual content; error if at EOF/nothing.
+			if p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
+				return AlterTableAction{}, p.errAtCur("expected PRIMARY KEY or FOREIGN KEY after CONSTRAINT name")
+			}
+			// Skip to semicolon or EOF.
+			for p.cur().Kind != TokenSymbol || p.cur().Value != ";" {
+				if p.cur().Kind == TokenEOF {
+					break
+				}
+				p.advance()
+			}
+			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
 		}
 		_ = p.acceptKeyword(KwColumn)
 		col, err := p.parseColumnDef()

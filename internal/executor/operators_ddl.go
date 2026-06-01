@@ -388,6 +388,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 	}
+	// CHECK constraints to inherit from LIKE INCLUDING CONSTRAINTS clauses.
+	var likeCheckConstraints []string
 	// Append body elements in declaration order: explicit columns and LIKE clauses
 	// interleaved by their BodyOrder. M0097-0069.
 	if len(s.BodyOrder) > 0 {
@@ -397,6 +399,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			colByName[strings.ToLower(c.Name)] = c
 		}
 		// Build a lookup for LIKE sources.
+		_ = likeCheckConstraints // will be populated below for LIKE INCLUDING CONSTRAINTS
 		likeByKey := make(map[string]*catalog.Table)
 		for _, likeName := range s.LikeTables {
 			src, ok := o.ctx.Catalog.LookupTable(likeName)
@@ -431,6 +434,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				includeIdentity := strings.Contains(likeFlags, ":+identity")
 				includeGenerated := strings.Contains(likeFlags, ":+generated")
 				includeDefaults := strings.Contains(likeFlags, ":+defaults")
+				includeConstraints := strings.Contains(likeFlags, ":+constraints")
 				src, ok := likeByKey[baseKey]
 				if !ok {
 					continue
@@ -459,6 +463,22 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 							c.DefaultExpr = nil
 						}
 						cols = append(cols, c)
+					}
+					// Copy CHECK constraints from source table when INCLUDING CONSTRAINTS.
+					if includeConstraints {
+						for _, chk := range src.CheckConstraints {
+							// Avoid duplicating constraints already present (e.g. from column-level).
+							found := false
+							for _, existing := range likeCheckConstraints {
+								if existing == chk {
+									found = true
+									break
+								}
+							}
+							if !found {
+								likeCheckConstraints = append(likeCheckConstraints, chk)
+							}
+						}
 					}
 				}
 			} else {
@@ -601,6 +621,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 	}
 	tbl.CheckConstraints = append(tbl.CheckConstraints, s.TableChecks...)
+	// Apply LIKE INCLUDING CONSTRAINTS checks (copied from LIKE source tables).
+	tbl.CheckConstraints = append(tbl.CheckConstraints, likeCheckConstraints...)
 	return nil
 }
 
@@ -1368,6 +1390,13 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable); !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
 			}
+		case parser.AlterTableAddCheck:
+			// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
+			if act.CheckExpr != "" {
+				tbl.CheckConstraints = append(tbl.CheckConstraints, act.CheckExpr)
+			}
+		case parser.AlterTableNoOp:
+			// Unknown ADD CONSTRAINT type — no-op.
 		case parser.AlterTableDropConstraint:
 			if err := o.execAlterTableDropConstraint(tbl, act); err != nil {
 				return err
