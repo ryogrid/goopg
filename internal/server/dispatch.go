@@ -107,9 +107,17 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// database in pg_database / can connect to it, and (b) emit a
 		// WAL record so the registration survives a crash. Other
 		// commands fall through to the wire-protocol no-op tag handler.
-		if handled, herr := s.tryHandleDatabaseDDL(sql); handled {
+		if handled, notice, herr := s.tryHandleDatabaseDDL(sql); handled {
 			if herr != nil {
 				return s.writeQueryError(w, sqlstate.SystemError, herr.Error())
+			}
+			if notice != "" {
+				_ = w.WriteNoticeResponse([]protocol.ErrorField{
+					{Code: protocol.FieldSeverity, Value: "NOTICE"},
+					{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
+					{Code: protocol.FieldSQLState, Value: "00000"},
+					{Code: protocol.FieldMessage, Value: notice},
+				})
 			}
 			tag := databaseDDLCommandTag(sql)
 			if err := w.WriteCommandComplete(tag); err != nil {
@@ -1655,10 +1663,9 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 	if math.IsNaN(f) {
 		return append(dst, "NaN"...)
 	}
-	// PostgreSQL's float8out uses %.15g (DBL_DIG = 15 significant digits).
-	// This handles: scientific notation for large/tiny values, decimal for normal,
-	// negative zero ("-0"), and avoids spurious scientific notation for integers.
-	return strconv.AppendFloat(dst, f, 'g', 15, 64)
+	// PostgreSQL's float8out uses the shortest round-trip representation
+	// (extra_float_digits=1 by default in PG 14+). Go's -1 precision matches this.
+	return strconv.AppendFloat(dst, f, 'g', -1, 64)
 }
 
 // appendTimeText formats a KindTime datum as a time-of-day string matching PostgreSQL's

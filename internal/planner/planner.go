@@ -779,7 +779,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 
 	if s.Where != nil {
 		// Aggregate functions are not allowed in WHERE. M0097-0035.
-		if exprHasAggregate(s.Where) {
+		// Exception: correlated outer-scope aggregates (all column refs reference
+		// tables NOT in the current FROM clause) are allowed — PG permits
+		// `WHERE sum(outer.col) = inner.col` inside EXISTS subqueries. M0097-0035.
+		if exprHasAggregate(s.Where) && !exprAllAggregatesAreOuterRef(s.Where, ctx) {
 			return nil, &PlanError{Pos: s.Where.Pos(), Code: "42803",
 				Message: "aggregate functions are not allowed in WHERE"}
 		}
@@ -4473,6 +4476,82 @@ func exprHasAggregate(e parser.Expr) bool {
 		return nil
 	})
 	return found
+}
+
+// exprAllAggregatesAreOuterRef returns true if every aggregate function call in e
+// has ALL of its column references pointing to tables NOT in the current scope
+// (i.e., they are outer-query correlated references). In that case, the aggregate
+// is from the outer scope and may be allowed in WHERE for correlated subqueries.
+// If ctx is nil or has no bindings, always returns false (conservative). M0097-0035.
+func exprAllAggregatesAreOuterRef(e parser.Expr, ctx *resolveContext) bool {
+	if ctx == nil || len(ctx.bindings) == 0 {
+		return false
+	}
+	// Build a set of current-scope table aliases (lower-cased).
+	currentTables := make(map[string]bool)
+	for _, b := range ctx.bindings {
+		currentTables[strings.ToLower(b.alias)] = true
+		if b.table != nil {
+			currentTables[strings.ToLower(b.table.Name)] = true
+		}
+	}
+	// collectColRefs collects all ColumnRef table names from an expression (non-recursive
+	// through function calls — only looks at direct args).
+	var collectColRefs func(expr parser.Expr) []string
+	collectColRefs = func(expr parser.Expr) []string {
+		var refs []string
+		switch x := expr.(type) {
+		case *parser.ColumnRef:
+			refs = append(refs, strings.ToLower(x.Table))
+		case *parser.BinaryOp:
+			refs = append(refs, collectColRefs(x.Left)...)
+			refs = append(refs, collectColRefs(x.Right)...)
+		case *parser.UnaryOp:
+			refs = append(refs, collectColRefs(x.Operand)...)
+		case *parser.FuncCall:
+			for _, a := range x.Args {
+				refs = append(refs, collectColRefs(a)...)
+			}
+		case *parser.CastExpr:
+			refs = append(refs, collectColRefs(x.Operand)...)
+		}
+		return refs
+	}
+	// walkAggregates calls fn for each aggregate FuncCall found in e.
+	var walkAggregates func(expr parser.Expr) bool // returns false if any current-scope ref found
+	walkAggregates = func(expr parser.Expr) bool {
+		fc, ok := expr.(*parser.FuncCall)
+		if ok && isAggregateFunc(fc) {
+			// Check if all column refs inside this aggregate are outer-scope.
+			for _, arg := range fc.Args {
+				for _, tbl := range collectColRefs(arg) {
+					if tbl == "" {
+						// Unqualified ref: assume current-scope (conservative).
+						return false
+					}
+					if currentTables[tbl] {
+						return false // current-scope ref → not an outer aggregate
+					}
+				}
+			}
+			return true // all refs are outer
+		}
+		// Recurse into non-aggregate expressions.
+		switch x := expr.(type) {
+		case *parser.BinaryOp:
+			return walkAggregates(x.Left) && walkAggregates(x.Right)
+		case *parser.UnaryOp:
+			return walkAggregates(x.Operand)
+		case *parser.FuncCall:
+			for _, a := range x.Args {
+				if !walkAggregates(a) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return exprHasAggregate(e) && walkAggregates(e)
 }
 
 // isUserAggregateFunc returns true if fc is a user-defined aggregate registered in cat.

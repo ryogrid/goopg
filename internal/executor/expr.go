@@ -2865,39 +2865,55 @@ func evalToChar(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // Supports: FM prefix, 0 (zero-fill), 9 (space-fill), . (decimal point),
 // , (grouping separator), S/MI/PL/PR signs. M0097-0105.
 func toCharNumericFormat(val Datum, fmtStr string) string {
-	// Detect and strip FM (fill mode: suppress leading/trailing spaces).
-	// FM may appear at the start or end of the format string.
-	fm := false
+	orig := fmtStr
 	upper := strings.ToUpper(strings.TrimSpace(fmtStr))
-	if strings.Contains(upper, "FM") {
-		fm = true
+
+	// FM: fill mode — strip leading/trailing spaces.
+	fm := strings.Contains(upper, "FM")
+	if fm {
 		upper = strings.ReplaceAll(upper, "FM", "")
 	}
 
-	// Detect sign modifiers.
-	hasMI := strings.Contains(upper, "MI")
-	hasPL := strings.Contains(upper, "PL")
-	hasPR := strings.Contains(upper, "PR")
-	hasS := false
-	if !hasMI && !hasPL && !hasPR {
-		if strings.HasPrefix(upper, "S") || strings.HasSuffix(upper, "S") {
-			hasS = true
-		}
+	// TH/th ordinal suffix.
+	hasTHUpper, hasTHLower := false, false
+	if strings.Contains(upper, "TH") {
+		origNoFM := strings.ReplaceAll(strings.ReplaceAll(orig, "FM", ""), "fm", "")
+		hasTHUpper = strings.Contains(origNoFM, "TH")
+		hasTHLower = strings.Contains(origNoFM, "th")
+		upper = strings.ReplaceAll(upper, "TH", "")
 	}
-	// Strip sign specifiers for digit processing.
+
+	// Detect sign modifiers. MI/PL positions matter (prefix vs suffix).
+	hasMIStart := strings.HasPrefix(upper, "MI")
+	hasMIEnd := !hasMIStart && strings.HasSuffix(upper, "MI")
+	hasMI := hasMIStart || hasMIEnd
+	hasPLEnd := strings.HasSuffix(upper, "PL")
+	hasPLStart := !hasPLEnd && strings.HasPrefix(upper, "PL")
+	hasPL := hasPLStart || hasPLEnd
+	hasPR := strings.Contains(upper, "PR")
+	hasSStart, hasSSuffix, hasS := false, false, false
+	if !hasMI && !hasPL && !hasPR {
+		// Remove G/D/L/C/spaces so they don't confuse S detection.
+		chk := strings.NewReplacer("G", "", "D", "", "L", "", "C", "", " ", "").Replace(upper)
+		if strings.HasPrefix(chk, "S") {
+			hasSStart = true
+		} else if strings.HasSuffix(chk, "S") {
+			hasSSuffix = true
+		}
+		hasS = hasSStart || hasSSuffix
+	}
+
+	// Strip sign specifiers for digit-format processing.
 	digitFmt := upper
 	digitFmt = strings.ReplaceAll(digitFmt, "MI", "")
 	digitFmt = strings.ReplaceAll(digitFmt, "PL", "")
 	digitFmt = strings.ReplaceAll(digitFmt, "PR", "")
-	if !strings.Contains(digitFmt, "D") { // keep D (locale decimal) but remove S
-		digitFmt = strings.ReplaceAll(digitFmt, "S", "")
-	}
-	// Replace locale separators with canonical chars for parsing.
+	digitFmt = strings.ReplaceAll(digitFmt, "S", "")
+	// Map locale separators to canonical chars.
 	digitFmt = strings.ReplaceAll(digitFmt, "G", ",")
 	digitFmt = strings.ReplaceAll(digitFmt, "D", ".")
 	digitFmt = strings.ReplaceAll(digitFmt, "L", "")
 	digitFmt = strings.ReplaceAll(digitFmt, "C", "")
-	digitFmt = strings.ReplaceAll(digitFmt, "S", "")
 
 	// Split into integer and decimal parts.
 	dotIdx := strings.Index(digitFmt, ".")
@@ -2908,17 +2924,26 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 	} else {
 		intFmt = digitFmt
 	}
-	// Remove grouping separators from format (just track digit positions).
 	intFmtDigits := strings.ReplaceAll(intFmt, ",", "")
 	decFmtDigits := strings.ReplaceAll(decFmt, ",", "")
 
-	// Count digit positions.
-	intPositions := 0
-	for _, c := range intFmtDigits {
-		if c == '0' || c == '9' {
-			intPositions++
+	// Zero-fill: a '0' format char at position i makes all positions j >= i use
+	// '0' fill instead of ' ' fill (propagates rightward from the leftmost '0').
+	zeroFillFrom := len(intFmtDigits) // default: no zero-fill
+	for i, c := range intFmtDigits {
+		if c == '0' {
+			zeroFillFrom = i
+			break
 		}
 	}
+	// totalDigitPositions is used to map right-to-left walk index → left-to-right position.
+	totalDigitPositions := 0
+	for _, c := range intFmtDigits {
+		if c == '0' || c == '9' {
+			totalDigitPositions++
+		}
+	}
+
 	decPositions := 0
 	for _, c := range decFmtDigits {
 		if c == '0' || c == '9' {
@@ -2926,7 +2951,7 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		}
 	}
 
-	// Extract the numeric value as integer and optional fractional string.
+	// Extract numeric value.
 	negative := false
 	var intVal int64
 	var fracStr string
@@ -2938,7 +2963,7 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 			intVal = -intVal
 		}
 	case KindNumeric:
-		m := val.NumericMantissaValue() // int64 mantissa
+		m := val.NumericMantissaValue()
 		s := int(val.NumericScaleValue())
 		if m < 0 {
 			negative = true
@@ -2972,7 +2997,7 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 				frac := f - float64(intVal)
 				fs := fmt.Sprintf("%.*f", decPositions, frac)
 				if len(fs) > 2 {
-					fracStr = fs[2:] // strip "0."
+					fracStr = fs[2:]
 				}
 				if len(fracStr) > decPositions {
 					fracStr = fracStr[:decPositions]
@@ -2981,30 +3006,63 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		}
 	}
 
-	// Format the integer part: walk format right-to-left, filling each digit position.
+	// Format integer part: walk intFmt right-to-left, preserving comma positions.
+	// Track whether each char slot is a fill position (vs actual digit).
 	intStr := strconv.FormatInt(intVal, 10)
 	var intBuf []byte
+	var intIsFill []bool // parallel to intBuf: true = fill char
 	pos := len(intStr) - 1
-	for fi := len(intFmtDigits) - 1; fi >= 0; fi-- {
-		fc := intFmtDigits[fi]
-		if fc != '0' && fc != '9' {
-			continue
-		}
-		if pos >= 0 {
-			intBuf = append([]byte{intStr[pos]}, intBuf...)
-			pos--
-		} else {
-			if fc == '0' {
-				intBuf = append([]byte{'0'}, intBuf...)
+	digitPosFromRight := 0
+	for fi := len(intFmt) - 1; fi >= 0; fi-- {
+		fc := intFmt[fi]
+		switch fc {
+		case ',':
+			intBuf = append([]byte{','}, intBuf...)
+			intIsFill = append([]bool{true}, intIsFill...) // comma is fill until second pass
+		case '0', '9':
+			digitPosFromLeft := totalDigitPositions - 1 - digitPosFromRight
+			digitPosFromRight++
+			fillCh := byte(' ')
+			if digitPosFromLeft >= zeroFillFrom {
+				fillCh = '0'
+			}
+			if pos >= 0 {
+				intBuf = append([]byte{intStr[pos]}, intBuf...)
+				intIsFill = append([]bool{false}, intIsFill...)
+				pos--
 			} else {
-				intBuf = append([]byte{' '}, intBuf...)
+				intBuf = append([]byte{fillCh}, intBuf...)
+				intIsFill = append([]bool{true}, intIsFill...)
 			}
 		}
 	}
-	// If number has more digits than format, prepend the overflow digits.
+	// Overflow: more digits than format positions.
 	for pos >= 0 {
 		intBuf = append([]byte{intStr[pos]}, intBuf...)
+		intIsFill = append([]bool{false}, intIsFill...)
 		pos--
+	}
+
+	// Second pass: replace commas in the fill area (before first actual digit) with
+	// the appropriate fill char (space for '9' area, '0' for '0' area).
+	seenActualDigit := false
+	for i := range intBuf {
+		if !intIsFill[i] {
+			seenActualDigit = true
+		}
+		if intBuf[i] == ',' && !seenActualDigit {
+			// Determine fill char at this position from the nearest digit slot.
+			// Use the rightmost fill char type in the prefix region.
+			// Simple heuristic: if any preceding fill slot used '0', use '0', else ' '.
+			fillCh := byte(' ')
+			for j := 0; j < i; j++ {
+				if intIsFill[j] && intBuf[j] == '0' {
+					fillCh = '0'
+					break
+				}
+			}
+			intBuf[i] = fillCh
+		}
 	}
 	result := string(intBuf)
 
@@ -3018,27 +3076,65 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		result = result + "." + fracStr
 	}
 
-	// FM mode: trim leading spaces from the digit portion before sign.
+	// FM mode: strip leading spaces only (from '9' fill without zero-fill propagation).
+	// '0' fill positions and propagated zero-fill are NOT stripped.
+	// For decimal: strip trailing zeros from '9' decimal positions; keep '0' positions.
 	if fm {
 		result = strings.TrimLeft(result, " ")
+		if result == "" || result == "." {
+			result = "0"
+		}
 		if dotIdx >= 0 {
-			result = strings.TrimRight(result, "0")
-			result = strings.TrimRight(result, ".")
+			hasAnyDecimalZero := strings.ContainsRune(decFmtDigits, '0')
+			if !hasAnyDecimalZero {
+				// Strip trailing fractional zeros (from '9' positions); keep dot.
+				result = strings.TrimRight(result, "0")
+			}
 		}
 	}
 
-	// Apply sign.
+	// Ordinal suffix (positive values only).
+	ordSuffix := ""
+	if (hasTHUpper || hasTHLower) && !negative {
+		sfx := toCharOrdinalSuffix(intVal)
+		if hasTHLower {
+			sfx = strings.ToLower(sfx)
+		}
+		ordSuffix = sfx
+	}
+
+	// Apply sign modifier.
 	if hasMI {
-		if negative {
-			result = result + "-"
-		} else if !fm {
-			result = result + " "
+		if hasMIStart {
+			if negative {
+				result = "-" + result
+			} else if !fm {
+				result = " " + result
+			}
+		} else {
+			// hasMIEnd: sign at the end.
+			if negative {
+				result = result + "-"
+			} else if !fm {
+				result = result + " "
+			}
 		}
 	} else if hasPL {
-		if negative {
-			result = "-" + result
+		if hasPLEnd {
+			if !negative {
+				result = result + "+"
+			} else {
+				trim := strings.TrimLeft(result, " ")
+				spaces := len(result) - len(trim)
+				result = strings.Repeat(" ", spaces) + "-" + trim
+			}
 		} else {
-			result = "+" + result
+			// hasPLStart: plus at the start.
+			if negative {
+				result = "-" + result
+			} else {
+				result = "+" + result
+			}
 		}
 	} else if hasPR {
 		if negative {
@@ -3047,16 +3143,23 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 			result = " " + result + " "
 		}
 	} else if hasS {
-		if negative {
-			result = "-" + result
+		if hasSSuffix {
+			if negative {
+				result = result + "-"
+			} else {
+				result = result + "+"
+			}
 		} else {
-			result = "+" + result
+			// hasSStart.
+			if negative {
+				result = "-" + result
+			} else {
+				result = "+" + result
+			}
 		}
 	} else {
-		// Default: sign goes immediately before the significant digits, after
-		// any digit-padding spaces produced by '9' fill.  FM strips those spaces
-		// before we get here, so the negative sign always goes at position 0 in
-		// FM mode.  Non-FM positive reserves a sign position with one extra space.
+		// Default: sign immediately before first significant digit; positive
+		// reserves one extra leading space for the sign position.
 		if negative {
 			trim := strings.TrimLeft(result, " ")
 			spaces := len(result) - len(trim)
@@ -3065,7 +3168,28 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 			result = " " + result
 		}
 	}
-	return result
+
+	return result + ordSuffix
+}
+
+// toCharOrdinalSuffix returns the English ordinal suffix (ST/ND/RD/TH) for n.
+func toCharOrdinalSuffix(n int64) string {
+	if n < 0 {
+		n = -n
+	}
+	if mod100 := n % 100; mod100 >= 11 && mod100 <= 13 {
+		return "TH"
+	}
+	switch n % 10 {
+	case 1:
+		return "ST"
+	case 2:
+		return "ND"
+	case 3:
+		return "RD"
+	default:
+		return "TH"
+	}
 }
 
 func pgToCharToGoFormat(pg string) string {

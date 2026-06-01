@@ -88,14 +88,14 @@ create_table_like,132,failed
 index_including,204,failed
 insert_conflict,211,failed
 join_hash,245,failed
-enum,320,failed
+enum,201,failed
 matview,247,failed
 create_procedure,274,failed
 create_table,388,failed
 create_view,426,failed
 create_function_sql,430,failed
 insert,461,failed
-int8,418,failed
+int8,239,failed
 subselect,500,failed
 guc,587,failed
 identity,587,failed
@@ -107,7 +107,7 @@ indexing,760,failed
 inherit,805,failed
 domain,810,failed
 constraints,818,failed
-float8,881,failed
+float8,884,failed
 jsonpath,939,failed
 generated_stored,1042,failed
 incremental_sort,1057,failed

@@ -1926,6 +1926,14 @@ M0097-0001 wires it up.
         pg_input_is_valid/pg_input_error_info enum support. Remaining diffs:
         PL/pgSQL KS tests (need plpgsql execution), NaN/Inf numeric
         representation, decimal quantization for random(-0.5, 0.49).
+      - **Progress 2026-06-02 (M0097-0136 — enum renumbering + enumsortorder):**
+        Implemented float32-precision midpoint computation and automatic renumbering
+        in `AddEnumValueResult` (`internal/catalog/catalog.go`). When the float32
+        midpoint would equal either neighbor (float4 precision exhausted after ~23
+        halvings), `renumberEnumValues` assigns sequential integers (1, 2, ..., N).
+        After 30 insertions of i1..i30 before L2 in the insenum test, renumbering
+        triggers on insertion i24 → sort orders become 1..24+25 integers, giving
+        i20=21 > 20 → NULL in the CASE expression. enum: 320 → 201 diffs.
 
 - [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
       - Summary: Make these 13 tests reach `pass`:
@@ -1978,6 +1986,18 @@ M0097-0001 wires it up.
         OpAdd/OpSub via sign-bit trick `(a^r)&(b^r) < 0` / `(a^b)&(a^r) < 0`.
         Both fast-path and slow-path evaluators fixed (both call `evalBinary → arithmetic`).
         Commit: b164aa14. int8: 576 → 418 diffs.
+      - **Progress 2026-06-02 (M0097-0137 — to_char grouping+ordinal+sign + float8 precision):**
+        (a) `toCharNumericFormat` rewritten (`internal/executor/expr.go`): (1) grouping
+        separators now actually inserted in output (G/comma preserved in intFmt walk,
+        second pass replaces leading commas with fill char); (2) TH/th ordinal suffix
+        implemented (`toCharOrdinalSuffix` helper: ST/ND/RD/TH, case-sensitive, positive
+        only); (3) S sign tracks prefix vs suffix position; (4) MI sign tracks start vs
+        end position; (5) PL tracks start vs end; (6) zero-fill: a leftmost '0' format
+        char propagates zero-fill rightward; FM strips leading spaces (not zeros).
+        (b) `appendFloat8Text` (`internal/server/dispatch.go`): changed from
+        `'g',15` to `'g',-1` (shortest round-trip representation matching PG
+        `extra_float_digits=1` default).
+        int8: 418 → 239 diffs. All previously-passing tests remain PASS.
       - **Progress 2026-06-01 (M0097-0133 — GENERATED AS IDENTITY + LIKE flags):**
         (a) `GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY` column parsing added to
             `parseColumnDef` (`internal/parser/ddl.go`): after `GENERATED ALWAYS AS` or

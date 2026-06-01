@@ -2897,6 +2897,15 @@ func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, af
 // AddEnumValueResult is like AddEnumValue but also returns skipped=true when
 // ifNotExists=true and the label already exists (caller should emit a NOTICE).
 // M0097-0063.
+// renumberEnumValues assigns sequential integer sort orders (1, 2, 3, ...) to all
+// enum values, matching PostgreSQL's RenumberEnumType triggered when float4
+// precision is exhausted for midpoint insertions.
+func renumberEnumValues(et *EnumType) {
+	for i := range et.Values {
+		et.Values[i].SortOrder = float64(i + 1)
+	}
+}
+
 func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, before, after string) (skipped bool, err error) {
 	// PostgreSQL limits enum labels to 63 bytes (NAMEDATALEN-1). M0097-0063.
 	if len(value) > 63 {
@@ -2922,12 +2931,21 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 	case before != "":
 		for i, v := range et.Values {
 			if strings.EqualFold(v.Label, before) {
-				// Compute sortorder: midpoint of predecessor and v, or v-1 if first.
 				var newSortOrder float64
 				if i == 0 {
-					newSortOrder = v.SortOrder - 1
+					newSortOrder = float64(float32(v.SortOrder) - 1)
 				} else {
-					newSortOrder = (et.Values[i-1].SortOrder + v.SortOrder) / 2
+					prev32 := float32(et.Values[i-1].SortOrder)
+					next32 := float32(et.Values[i].SortOrder)
+					mid32 := (prev32 + next32) / 2
+					if mid32 <= prev32 || mid32 >= next32 {
+						// float4 precision exhausted — renumber to sequential integers.
+						renumberEnumValues(et)
+						prev32 = float32(et.Values[i-1].SortOrder)
+						next32 = float32(et.Values[i].SortOrder)
+						mid32 = (prev32 + next32) / 2
+					}
+					newSortOrder = float64(mid32)
 				}
 				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
 				newVals := make([]EnumValue, 0, len(et.Values)+1)
@@ -2942,12 +2960,20 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 	case after != "":
 		for i, v := range et.Values {
 			if strings.EqualFold(v.Label, after) {
-				// Compute sortorder: midpoint of v and successor, or v+1 if last.
 				var newSortOrder float64
 				if i+1 == len(et.Values) {
-					newSortOrder = v.SortOrder + 1
+					newSortOrder = float64(float32(v.SortOrder) + 1)
 				} else {
-					newSortOrder = (v.SortOrder + et.Values[i+1].SortOrder) / 2
+					prev32 := float32(et.Values[i].SortOrder)
+					next32 := float32(et.Values[i+1].SortOrder)
+					mid32 := (prev32 + next32) / 2
+					if mid32 <= prev32 || mid32 >= next32 {
+						renumberEnumValues(et)
+						prev32 = float32(et.Values[i].SortOrder)
+						next32 = float32(et.Values[i+1].SortOrder)
+						mid32 = (prev32 + next32) / 2
+					}
+					newSortOrder = float64(mid32)
 				}
 				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
 				newVals := make([]EnumValue, 0, len(et.Values)+1)
