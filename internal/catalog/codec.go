@@ -124,15 +124,40 @@ func PGClassColumns() []Column {
 }
 
 // PGAttributeColumns returns the column schema for pg_attribute heap rows.
+// Matches the 24-column PG18 canonical layout written by initdb.pgAttrColDefs.
+// The physical heap encoding follows this column order, so the schema must
+// agree with it for the executor's decoder to read correct values.
 func PGAttributeColumns() []Column {
-	return []Column{
-		{Name: "attrelid", Type: Type{Name: "int4"}, Ordinal: 0},
-		{Name: "attname", Type: Type{Name: "text"}, Ordinal: 1},
-		{Name: "atttypid", Type: Type{Name: "int4"}, Ordinal: 2},
-		{Name: "attnum", Type: Type{Name: "int4"}, Ordinal: 3},
-		{Name: "attnotnull", Type: Type{Name: "bool"}, Ordinal: 4},
-		{Name: "attisdropped", Type: Type{Name: "bool"}, Ordinal: 5},
+	cols := []Column{
+		{Name: "attrelid", Type: Type{Name: "oid"}},
+		{Name: "attname", Type: Type{Name: "name"}},
+		{Name: "atttypid", Type: Type{Name: "oid"}},
+		{Name: "attlen", Type: Type{Name: "int2"}},
+		{Name: "attnum", Type: Type{Name: "int2"}},
+		{Name: "atttypmod", Type: Type{Name: "int4"}},
+		{Name: "attndims", Type: Type{Name: "int2"}},
+		{Name: "attbyval", Type: Type{Name: "bool"}},
+		{Name: "attalign", Type: Type{Name: "char"}},
+		{Name: "attstorage", Type: Type{Name: "char"}},
+		{Name: "attcompression", Type: Type{Name: "char"}},
+		{Name: "attnotnull", Type: Type{Name: "bool"}},
+		{Name: "atthasdef", Type: Type{Name: "bool"}},
+		{Name: "atthasmissing", Type: Type{Name: "bool"}},
+		{Name: "attidentity", Type: Type{Name: "char"}},
+		{Name: "attgenerated", Type: Type{Name: "char"}},
+		{Name: "attisdropped", Type: Type{Name: "bool"}},
+		{Name: "attislocal", Type: Type{Name: "bool"}},
+		{Name: "attinhcount", Type: Type{Name: "int2"}},
+		{Name: "attcollation", Type: Type{Name: "oid"}},
+		{Name: "attacl", Type: Type{Name: "text"}},
+		{Name: "attoptions", Type: Type{Name: "text"}},
+		{Name: "attfdwoptions", Type: Type{Name: "text"}},
+		{Name: "attmissingval", Type: Type{Name: "text"}},
 	}
+	for i := range cols {
+		cols[i].Ordinal = i
+	}
+	return cols
 }
 
 // PGTypeColumns returns the column schema for pg_type heap rows.

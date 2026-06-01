@@ -103,9 +103,25 @@ func TestPGClassColumnsCount(t *testing.T) {
 }
 
 // TestPGAttributeColumnsCount checks the pg_attribute schema column count.
+// The schema must match the PG18 canonical 24-column layout written by initdb.
 func TestPGAttributeColumnsCount(t *testing.T) {
-	if got := len(PGAttributeColumns()); got != 6 {
-		t.Errorf("PGAttributeColumns: len=%d want 6", got)
+	cols := PGAttributeColumns()
+	if got := len(cols); got != 24 {
+		t.Errorf("PGAttributeColumns: len=%d want 24", got)
+	}
+	// Verify key columns are present at the right ordinals.
+	wantCols := []struct{ ord int; name string }{
+		{0, "attrelid"}, {1, "attname"}, {2, "atttypid"}, {4, "attnum"},
+		{10, "attcompression"}, {11, "attnotnull"}, {16, "attisdropped"},
+	}
+	for _, wc := range wantCols {
+		if wc.ord >= len(cols) {
+			t.Errorf("ordinal %d out of range", wc.ord)
+			continue
+		}
+		if got := cols[wc.ord].Name; got != wc.name {
+			t.Errorf("cols[%d].Name = %q want %q", wc.ord, got, wc.name)
+		}
 	}
 }
 

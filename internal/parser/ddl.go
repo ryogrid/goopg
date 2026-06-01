@@ -259,9 +259,14 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		return stmt, nil
 	// CREATE SERVER / CREATE FOREIGN ... — accept as no-op. M0097-0071.
+	// FOREIGN is a reserved keyword so acceptKeyword is required (not acceptIdentKeyword).
 	case p.acceptIdentKeyword("server"):
 		return p.parseSkipToSemicolon(t.Pos)
-	case p.acceptIdentKeyword("foreign"):
+	case p.acceptKeyword(KwForeign):
+		return p.parseSkipToSemicolon(t.Pos)
+	// CREATE STATISTICS name ON expr, ... FROM table — accept as no-op.
+	// Extended statistics are not implemented in goopg v0.
+	case p.acceptIdentKeyword("statistics"):
 		return p.parseSkipToSemicolon(t.Pos)
 	// CREATE RULE name AS ON event TO table [WHERE cond] DO ... — accept as no-op.
 	// Rules are not implemented in goopg v0; CREATE RULE succeeds silently so that
