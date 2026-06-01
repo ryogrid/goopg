@@ -388,6 +388,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 	}
+	// Track which column names came from INHERITS (used below for LIKE merge vs error).
+	inheritedColNames := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		inheritedColNames[strings.ToLower(c.Name)] = true
+	}
+
 	// CHECK constraints to inherit from LIKE INCLUDING CONSTRAINTS clauses.
 	var likeCheckConstraints []string
 	// Append body elements in declaration order: explicit columns and LIKE clauses
@@ -440,6 +446,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					continue
 				}
 				for _, sc := range src.Columns {
+					colNameLower := strings.ToLower(sc.Name)
 					found := false
 					for _, ec := range cols {
 						if strings.EqualFold(ec.Name, sc.Name) {
@@ -447,23 +454,52 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 							break
 						}
 					}
-					if !found {
-						c := sc
-						// Clear IdentityColumn unless INCLUDING IDENTITY or INCLUDING ALL was specified.
-						if !includeIdentity {
-							c.IdentityColumn = false
+					if found {
+						if inheritedColNames[colNameLower] {
+							// Column came from INHERITS — emit NOTICE "merging column X with
+							// inherited definition" and skip (matches PostgreSQL merge semantics).
+							o.ctx.AddNotice(fmt.Sprintf("merging column %q with inherited definition", sc.Name))
+						} else {
+							// Column already defined by an explicit column or a previous LIKE clause.
+							// PostgreSQL raises "column X specified more than once" (42701).
+							return &ExecError{
+								Code:    "42701",
+								Pos:     s.Pos(),
+								Message: fmt.Sprintf("column %q specified more than once", sc.Name),
+							}
 						}
-						// Clear GeneratedAlways/GeneratedExpr unless INCLUDING GENERATED or INCLUDING ALL.
-						if !includeGenerated {
-							c.GeneratedAlways = false
-							c.GeneratedExpr = ""
+						// Either way, skip (don't add the column again) and continue.
+						if includeConstraints {
+							for _, chk := range src.CheckConstraints {
+								found := false
+								for _, existing := range likeCheckConstraints {
+									if existing == chk {
+										found = true
+										break
+									}
+								}
+								if !found {
+									likeCheckConstraints = append(likeCheckConstraints, chk)
+								}
+							}
 						}
-						// Clear DefaultExpr unless INCLUDING DEFAULTS or INCLUDING ALL was specified.
-						if !includeDefaults {
-							c.DefaultExpr = nil
-						}
-						cols = append(cols, c)
+						continue
 					}
+					c := sc
+					// Clear IdentityColumn unless INCLUDING IDENTITY or INCLUDING ALL was specified.
+					if !includeIdentity {
+						c.IdentityColumn = false
+					}
+					// Clear GeneratedAlways/GeneratedExpr unless INCLUDING GENERATED or INCLUDING ALL.
+					if !includeGenerated {
+						c.GeneratedAlways = false
+						c.GeneratedExpr = ""
+					}
+					// Clear DefaultExpr unless INCLUDING DEFAULTS or INCLUDING ALL was specified.
+					if !includeDefaults {
+						c.DefaultExpr = nil
+					}
+					cols = append(cols, c)
 					// Copy CHECK constraints from source table when INCLUDING CONSTRAINTS.
 					if includeConstraints {
 						for _, chk := range src.CheckConstraints {

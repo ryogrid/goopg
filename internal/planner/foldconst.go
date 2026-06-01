@@ -2,6 +2,7 @@ package planner
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -265,13 +266,16 @@ func tryFoldBinaryOp(pos int, op parser.OpCode, l, r Expr) Expr {
 	}
 	result, err := evalLiteralBinary(pos, op, lv, rv)
 	if err != nil {
-		// Division by zero in a constant expression must propagate to the planner
-		// immediately — this matches PostgreSQL's behaviour of not suppressing
-		// constant-folding of potentially-reachable subexpressions (case.sql).
+		// Division by zero and integer overflow in constant expressions must
+		// propagate to the planner immediately — matches PostgreSQL's behaviour of
+		// not suppressing folding of potentially-reachable subexpressions (case.sql).
 		// Other errors (type mismatch, unsupported op) are silently ignored and
 		// the expression is left unfolded. M0097-0047.
 		if err.Error() == "division by zero" {
 			panic(foldEvalPanic{err: &PlanError{Code: "22012", Message: "division by zero"}})
+		}
+		if pe, ok := err.(*PlanError); ok && pe.Code == "22003" {
+			panic(foldEvalPanic{err: pe})
 		}
 		return nil // silently skip: leave expression unfolded on type mismatch
 	}
@@ -443,14 +447,35 @@ func evalArith(pos int, op parser.OpCode, l, r literalValue) (Expr, error) {
 		a, b := l.intV, r.intV
 		switch op {
 		case parser.OpAdd:
-			return &IntegerConst{pos: pos, Value: a + b}, nil
+			r := a + b
+			if (a^r)&(b^r) < 0 {
+				return nil, &PlanError{Code: "22003", Message: "bigint out of range"}
+			}
+			return &IntegerConst{pos: pos, Value: r}, nil
 		case parser.OpSub:
-			return &IntegerConst{pos: pos, Value: a - b}, nil
+			r := a - b
+			if (a^b)&(a^r) < 0 {
+				return nil, &PlanError{Code: "22003", Message: "bigint out of range"}
+			}
+			return &IntegerConst{pos: pos, Value: r}, nil
 		case parser.OpMul:
-			return &IntegerConst{pos: pos, Value: a * b}, nil
+			r := a * b
+			if a != 0 && b != 0 {
+				if a == math.MinInt64 || b == math.MinInt64 {
+					if a != 1 && b != 1 {
+						return nil, &PlanError{Code: "22003", Message: "bigint out of range"}
+					}
+				} else if r/a != b {
+					return nil, &PlanError{Code: "22003", Message: "bigint out of range"}
+				}
+			}
+			return &IntegerConst{pos: pos, Value: r}, nil
 		case parser.OpDiv:
 			if b == 0 {
 				return nil, fmt.Errorf("division by zero")
+			}
+			if a == math.MinInt64 && b == -1 {
+				return nil, &PlanError{Code: "22003", Message: "bigint out of range"}
 			}
 			return &IntegerConst{pos: pos, Value: a / b}, nil
 		case parser.OpMod:

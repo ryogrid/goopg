@@ -1043,6 +1043,10 @@ func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 		if b == 0 {
 			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
 		}
+		// MinInt64 / -1 overflows: the mathematical result 2^63 doesn't fit in int64.
+		if a == math.MinInt64 && b == -1 {
+			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+		}
 		r = a / b
 	case parser.OpMod:
 		if b == 0 {
@@ -5941,6 +5945,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			if v.Kind == KindInt {
 				n := v.Int
+				if n == math.MinInt64 {
+					// abs(MinInt64) overflows: MinInt64 = -2^63, abs = 2^63 which can't fit int64.
+					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
+				}
 				if n < 0 {
 					n = -n
 				}
