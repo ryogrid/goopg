@@ -2805,11 +2805,11 @@ func (p *parser) parseAlter() (Stmt, error) {
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter {
 			p.advance() // consume ALTER
 			_ = p.acceptKeyword(KwColumn)
-			// Read column name.
-			if p.cur().Kind == TokenIdent {
+			// Read column name (identifier or unreserved keyword).
+			if p.cur().Kind == TokenIdent || (p.cur().Kind == TokenKeyword && IsColNameKeyword(p.cur().Keyword)) {
 				p.advance()
 			}
-			if p.acceptIdentKeyword("set") {
+			if p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet) {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 					// Consume the options block.
 					depth := 1

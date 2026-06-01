@@ -237,3 +237,34 @@ func typeOf(v interface{}) string {
 	}
 	return fmt.Sprintf("%T", v)
 }
+
+// TestParseAlterIndexAlterColumnSet pins two parser fixes in ddl.go (M0097-0023):
+//  1. The column name after ALTER COLUMN may be an unreserved keyword — the
+//     parser now accepts IsColNameKeyword tokens in addition to TokenIdent.
+//  2. SET is a keyword token (KwSet), not an identifier — the parser now
+//     accepts p.acceptKeyword(KwSet) in addition to p.acceptIdentKeyword("set").
+//
+// The resulting AST must have Name="myidx" and exactly one action of kind
+// AlterTableAlterColumnSet.
+func TestParseAlterIndexAlterColumnSet(t *testing.T) {
+	stmts, err := Parse("ALTER INDEX myidx ALTER COLUMN id SET (n_distinct=100)")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(stmts))
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("expected *AlterTableStmt, got %T", stmts[0])
+	}
+	if at.Name.Name != "myidx" {
+		t.Errorf("Name.Name = %q, want %q", at.Name.Name, "myidx")
+	}
+	if len(at.Actions) != 1 {
+		t.Fatalf("Actions len=%d, want 1", len(at.Actions))
+	}
+	if at.Actions[0].Kind != AlterTableAlterColumnSet {
+		t.Errorf("Actions[0].Kind = %v, want AlterTableAlterColumnSet", at.Actions[0].Kind)
+	}
+}

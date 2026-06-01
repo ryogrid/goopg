@@ -79,7 +79,7 @@ varchar,0,pass
 window,0,pass
 with,0,pass
 xid,0,pass
-btree_index,50,failed
+btree_index,0,pass
 copydml,58,failed
 index_including_gist,64,failed
 aggregates,68,failed
