@@ -2222,6 +2222,13 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 				fsum := aggDatumToFloat64(st.numericSum)
 				return NewStringDatum(strconv.FormatFloat(float64(float32(fsum)), 'g', 6, 32))
 			}
+			// For float8 input, format with 15 significant digits (PostgreSQL's
+			// float8out format) to avoid spurious trailing-digit differences. M0097-0035.
+			switch strings.ToLower(call.InputType.Name) {
+			case "float8", "double precision", "double", "float":
+				fsum := aggDatumToFloat64(st.numericSum)
+				return NewStringDatum(strconv.FormatFloat(fsum, 'g', 15, 64))
+			}
 			return st.numericSum
 		}
 		return Datum{Kind: KindInt, Int: st.sum}

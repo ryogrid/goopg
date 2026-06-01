@@ -552,6 +552,12 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.pos, Message: "SeqScan requires storage handles in Context"}
 	}
+	// Reject scans of unpopulated materialized views (WITH NO DATA / before REFRESH). M0097-0025.
+	if o.tbl != nil && o.tbl.IsMatView && !o.tbl.IsPopulated {
+		return &ExecError{Code: "55000", Pos: o.pos,
+			Message: fmt.Sprintf("materialized view %q has not been populated", o.tbl.Name),
+			Hint:    "Use the REFRESH MATERIALIZED VIEW command."}
+	}
 	o.ctx = ctx
 	// Cache rel once — avoids the catalog RLock on every Next() call.
 	o.rel = ctx.Catalog.RelFileNode(o.tbl)

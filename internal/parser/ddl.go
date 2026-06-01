@@ -965,9 +965,9 @@ func (p *parser) parseCreateMatViewTail(pos int) (Stmt, error) {
 		return nil, &SyntaxError{Pos: pos, Message: "materialized view body did not produce SELECT"}
 	}
 	stmt.Query = sel
-	// Optional WITH [NO] DATA clause.
+	// Optional WITH [NO] DATA clause. "NO" is a plain identifier, not a keyword.
 	if p.acceptKeyword(KwWith) {
-		if p.acceptKeyword(KwNot) {
+		if p.acceptIdentKeyword("no") {
 			_ = p.acceptIdentKeyword("data")
 			stmt.WithNoData = true
 		} else {
@@ -989,9 +989,9 @@ func (p *parser) parseRefreshMatView(pos int) (Stmt, error) {
 		return nil, err
 	}
 	stmt.Name = name
-	// Optional WITH [NO] DATA.
+	// Optional WITH [NO] DATA. "NO" is a plain identifier, not a keyword.
 	if p.acceptKeyword(KwWith) {
-		if p.acceptKeyword(KwNot) {
+		if p.acceptIdentKeyword("no") {
 			_ = p.acceptIdentKeyword("data")
 			stmt.WithNoData = true
 		} else {

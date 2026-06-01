@@ -81,12 +81,12 @@ varchar,0,pass
 xid,0,pass
 copydml,0,pass
 index_including_gist,64,failed
-aggregates,95,failed
+aggregates,87,failed
 create_table_like,113,failed
 index_including,204,failed
 insert_conflict,211,failed
 join_hash,245,failed
-matview,247,failed
+matview,175,failed
 enum,269,failed
 int8,273,failed
 create_procedure,274,failed
