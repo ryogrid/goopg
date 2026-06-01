@@ -32,6 +32,10 @@ func (s *Server) tryHandleRoleDDL(sql string) (bool, error) {
 			return false, nil // malformed; let caller handle
 		}
 		s.registerRole(name)
+		// Also register in catalog so executor-level DROP ROLE IF EXISTS can check.
+		if s.cfg.Catalog != nil {
+			s.cfg.Catalog.RegisterRole(name)
+		}
 		return true, nil
 
 	case strings.HasPrefix(norm, "drop role "), strings.HasPrefix(norm, "drop user "):
@@ -41,6 +45,10 @@ func (s *Server) tryHandleRoleDDL(sql string) (bool, error) {
 		}
 		if err := s.unregisterRole(name, ifExists); err != nil {
 			return true, err
+		}
+		// Also unregister from catalog.
+		if s.cfg.Catalog != nil {
+			s.cfg.Catalog.UnregisterRole(name)
 		}
 		return true, nil
 	}

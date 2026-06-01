@@ -314,6 +314,18 @@ type Catalog interface {
 	// TablesInSchema returns the names of all non-virtual user tables in the given
 	// schema.  Used by DROP SCHEMA CASCADE. M0097-0020.
 	TablesInSchema(schemaName string) []parser.ObjectName
+	// SchemaExists reports whether a schema has been registered.
+	SchemaExists(name string) bool
+	// RegisterSchema records a user-created schema. M0097-drop_if_exists.
+	RegisterSchema(name string)
+	// UnregisterSchema removes a schema from the registry. M0097-drop_if_exists.
+	UnregisterSchema(name string)
+	// RoleExists reports whether a role has been registered. M0097-drop_if_exists.
+	RoleExists(name string) bool
+	// RegisterRole records a user-created role. M0097-drop_if_exists.
+	RegisterRole(name string)
+	// UnregisterRole removes a role from the registry. M0097-drop_if_exists.
+	UnregisterRole(name string)
 	IndexesOnTable(table *Table) []*Index
 	HasPrimaryKey(table *Table) bool
 	RelFileNode(table *Table) storage.RelFileNode
@@ -402,6 +414,16 @@ type InMemory struct {
 	// userAggregates maps lower-case aggregate name → UserAggregate for
 	// user-defined aggregates registered via CREATE AGGREGATE.
 	userAggregates map[string]*UserAggregate
+
+	// schemas tracks user-created schemas (CREATE SCHEMA). Pre-populated
+	// with the standard system schemas. Maps lowercase schema name → OID.
+	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
+	schemas map[string]uint32
+
+	// roles tracks user-created roles (CREATE ROLE / CREATE USER). Used by
+	// DROP ROLE IF EXISTS to produce proper "does not exist" notices.
+	// M0097-drop_if_exists.
+	roles map[string]struct{}
 }
 
 // EnumValue is one label in a user-defined enum type together with its sort
@@ -508,7 +530,14 @@ func NewInMemory() *InMemory {
 		compositeTypeFields: make(map[string][]CompositeField),
 		constraintViewDeps:  make(map[string][]string),
 		opClassHashFuncs:    make(map[string]string),
-		userAggregates:      make(map[string]*UserAggregate),
+		userAggregates: make(map[string]*UserAggregate),
+		schemas: map[string]uint32{
+			"pg_catalog":         11,
+			"public":             2200,
+			"information_schema": 99,
+			"pg_toast":           2200, // toast uses same OID as public in simplified model
+		},
+		roles: make(map[string]struct{}),
 	}
 	c.registerSystemTables()
 	return c
@@ -1151,11 +1180,20 @@ func (c *InMemory) registerSystemTables() {
 			if t.IsMatView && !t.IsPopulated {
 				populated = "f"
 			}
+			// Resolve namespace OID from the schema registry.
+			schema := t.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			nsOID := c.schemas[strings.ToLower(schema)]
+			if nsOID == 0 {
+				nsOID = 2200 // default to public
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // oid: numeric OID (M0103-0008 rung 16)
 				t.Name,                       // relname
 				relkind,                      // relkind
-				"2200",                       // relnamespace: OID of public namespace
+				strconv.Itoa(int(nsOID)),     // relnamespace: schema OID
 				"p",                          // relpersistence: permanent
 				"0",                          // reltoastrelid: no TOAST table
 				"0",                          // relpages: estimated page count
@@ -1172,17 +1210,28 @@ func (c *InMemory) registerSystemTables() {
 		sort.Strings(idxKeys)
 		for _, k := range idxKeys {
 			idx := c.indexes[k]
+			// Resolve namespace from the index's table.
+			idxNsOID := uint32(2200)
+			if idx.Table != nil {
+				schema := idx.Table.Schema
+				if schema == "" {
+					schema = "public"
+				}
+				if oid := c.schemas[strings.ToLower(schema)]; oid != 0 {
+					idxNsOID = oid
+				}
+			}
 			out = append(out, []string{
-				strconv.Itoa(int(idx.OID)), // oid
-				idx.Name,                   // relname
-				"i",                        // relkind = index
-				"2200",                     // relnamespace
-				"p",                        // relpersistence
-				"0",                        // reltoastrelid
-				"0",                        // relpages
-				"t",                        // relispopulated
-				"0",                        // relnatts
-				"n",                        // relreplident: not applicable for indexes
+				strconv.Itoa(int(idx.OID)),   // oid
+				idx.Name,                     // relname
+				"i",                          // relkind = index
+				strconv.Itoa(int(idxNsOID)), // relnamespace
+				"p",                          // relpersistence
+				"0",                          // reltoastrelid
+				"0",                          // relpages
+				"t",                          // relispopulated
+				"0",                          // relnatts
+				"n",                          // relreplident: not applicable for indexes
 			})
 		}
 		return out
@@ -1208,11 +1257,24 @@ func (c *InMemory) registerSystemTables() {
 		Virtual: true,
 	}
 	pgNamespace.VirtualRows = func() [][]string {
-		return [][]string{
-			{"11", "pg_catalog", "10", ""},
-			{"2200", "public", "10", ""},
-			{"99", "information_schema", "10", ""},
+		c.mu.RLock()
+		schemas := c.allSchemasLocked()
+		c.mu.RUnlock()
+		// Sort by OID for deterministic output.
+		sort.Slice(schemas, func(i, j int) bool { return schemas[i].oid < schemas[j].oid })
+		out := make([][]string, 0, len(schemas))
+		for _, s := range schemas {
+			if s.name == "pg_toast" {
+				continue // skip internal alias
+			}
+			out = append(out, []string{
+				strconv.Itoa(int(s.oid)), // oid
+				s.name,                   // nspname
+				"10",                     // nspowner
+				"",                       // nspacl
+			})
 		}
+		return out
 	}
 	c.tables["pg_catalog.pg_namespace"] = pgNamespace
 
@@ -2414,6 +2476,72 @@ func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
 // field matches schemaName (case-insensitive).  Virtual/system tables in
 // pg_catalog or information_schema are excluded.  Used by DROP SCHEMA CASCADE
 // to identify objects to cascade-drop. M0097-0020.
+// SchemaExists reports whether a schema with the given name has been registered.
+// Pre-populated with the standard system schemas; user schemas are added by
+// RegisterSchema (called from CREATE SCHEMA). M0097-drop_if_exists.
+func (c *InMemory) SchemaExists(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.schemas[strings.ToLower(name)]
+	return ok
+}
+
+// SchemaOID returns the OID for the given schema name (0 if not found).
+func (c *InMemory) SchemaOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.schemas[strings.ToLower(name)]
+}
+
+// RegisterSchema records a user-created schema. Called from execCreateSchema.
+func (c *InMemory) RegisterSchema(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	if _, ok := c.schemas[lc]; !ok {
+		c.nextOID++
+		c.schemas[lc] = c.nextOID
+	}
+}
+
+// UnregisterSchema removes a schema from the registry. Called from DROP SCHEMA.
+func (c *InMemory) UnregisterSchema(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.schemas, strings.ToLower(name))
+}
+
+// allSchemasLocked returns all (name, oid) pairs. Must be called with mu held.
+func (c *InMemory) allSchemasLocked() []struct{ name string; oid uint32 } {
+	out := make([]struct{ name string; oid uint32 }, 0, len(c.schemas))
+	for name, oid := range c.schemas {
+		out = append(out, struct{ name string; oid uint32 }{name, oid})
+	}
+	return out
+}
+
+// RoleExists reports whether a role with the given name has been registered.
+func (c *InMemory) RoleExists(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.roles[strings.ToLower(name)]
+	return ok
+}
+
+// RegisterRole records a user-created role. Called from CREATE ROLE/USER.
+func (c *InMemory) RegisterRole(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.roles[strings.ToLower(name)] = struct{}{}
+}
+
+// UnregisterRole removes a role from the registry. Called from DROP ROLE.
+func (c *InMemory) UnregisterRole(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.roles, strings.ToLower(name))
+}
+
 func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

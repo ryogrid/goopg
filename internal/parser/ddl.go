@@ -2362,6 +2362,24 @@ func (p *parser) parseDrop() (Stmt, error) {
 			}, nil
 		}
 	}
+	// KwLanguage and KwGroup are tokenized as TokenKeyword, not TokenIdent,
+	// so acceptIdentKeyword("language"/"group") fails — handle them explicitly.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwLanguage {
+		p.advance()
+		ifExists, names, behavior, err := p.parseDropTail()
+		if err != nil {
+			return nil, err
+		}
+		return &DropCompatStmt{pos: t.Pos, ObjType: "language", IfExists: ifExists, Names: names, Behavior: behavior}, nil
+	}
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwGroup {
+		p.advance()
+		ifExists, names, behavior, err := p.parseDropTail()
+		if err != nil {
+			return nil, err
+		}
+		return &DropCompatStmt{pos: t.Pos, ObjType: "group", IfExists: ifExists, Names: names, Behavior: behavior}, nil
+	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, SEQUENCE, SCHEMA, TYPE, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after DROP")
 }
 

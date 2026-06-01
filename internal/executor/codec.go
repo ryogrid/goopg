@@ -271,6 +271,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		binary.LittleEndian.PutUint32(buf[:], uint32(v))
 		return buf[:], nil
 	case "timestamp", "timestamptz":
+		if d.Kind == KindString {
+			t, err := parseCopyTimestamp(d.StringValue())
+			if err != nil {
+				return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
+			}
+			d = NewTimeDatum(t.UTC())
+		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
@@ -283,6 +290,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		binary.LittleEndian.PutUint64(buf[:], uint64(micros))
 		return buf[:], nil
 	case "date":
+		if d.Kind == KindString {
+			t, err := parseCopyTimestamp(d.StringValue())
+			if err != nil {
+				return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type date: %q", d.StringValue())}
+			}
+			d = NewTimeDatum(t.UTC())
+		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}

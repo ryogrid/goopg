@@ -951,6 +951,9 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 	if dropped[key] {
 		return nil // already being dropped in this cascade
 	}
+	if ifExists && o.dropSchemaQualifiedNotice(name) {
+		return nil
+	}
 	if _, ok := o.ctx.Catalog.LookupTable(name); !ok {
 		if ifExists {
 			o.ctx.AddNotice(fmt.Sprintf("view %q does not exist, skipping", name.String()))
@@ -1050,6 +1053,9 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP TABLE requires Pool in Context"}
 	}
 	for _, name := range s.Names {
+		if s.IfExists && o.dropSchemaQualifiedNotice(name) {
+			continue
+		}
 		tbl, ok := o.ctx.Catalog.LookupTable(name)
 		if !ok {
 			if s.IfExists {
@@ -1220,6 +1226,9 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 	flagInval := false
 	droppedOIDs := make([]uint32, 0, len(s.Names))
 	for _, name := range s.Names {
+		if s.IfExists && o.dropSchemaQualifiedNotice(name) {
+			continue
+		}
 		idx, ok := o.ctx.Catalog.LookupIndex(name)
 		if !ok {
 			if s.IfExists {
@@ -2519,6 +2528,9 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 // execDropProcedure removes a procedure from the routine registry
 // (mirrors execDropFunction).
 func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
+	if s.IfExists && o.dropSchemaQualifiedNotice(s.Name) {
+		return nil
+	}
 	rs := o.ctx.Catalog.Routines()
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP PROCEDURE requires routine registry"}
@@ -2557,6 +2569,18 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 // the unique overload (and surfaces 42725 "ambiguous function"
 // if more than one exists).
 func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
+	if s.IfExists && o.dropSchemaQualifiedNotice(s.Name) {
+		return nil
+	}
+	// Check if any arg type is schema-qualified with a non-existent schema. M0097-drop_if_exists.
+	if s.IfExists && s.Args != nil {
+		for _, a := range s.Args {
+			if a.Type.Schema != "" && !o.ctx.Catalog.SchemaExists(a.Type.Schema) {
+				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", a.Type.Schema))
+				return nil
+			}
+		}
+	}
 	rs := o.ctx.Catalog.Routines()
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP FUNCTION requires routine registry"}
@@ -3174,6 +3198,20 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 }
 
 // it emits a NOTICE; otherwise it silently succeeds (no catalog check). M0097-0008.
+// dropSchemaQualifiedNotice emits "schema X does not exist, skipping" when
+// the name is schema-qualified and the schema is not registered. Returns true
+// if the notice was emitted (and the caller should skip this name).
+func (o *ddlOp) dropSchemaQualifiedNotice(name parser.ObjectName) bool {
+	if name.Schema == "" {
+		return false
+	}
+	if !o.ctx.Catalog.SchemaExists(name.Schema) {
+		o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", name.Schema))
+		return true
+	}
+	return false
+}
+
 func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	objType := strings.ToLower(s.ObjType)
 
@@ -3185,16 +3223,19 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if name.Schema != "" {
 				schemaName = name.Schema + "." + name.Name
 			}
+			// Use schema registry when available. If registered → exists (even if empty).
+			schemaRegistered := o.ctx.Catalog.SchemaExists(schemaName)
 			tables := o.ctx.Catalog.TablesInSchema(schemaName)
-			if s.IfExists && len(tables) == 0 {
+			if s.IfExists && !schemaRegistered {
 				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", schemaName))
 				continue
 			}
-			// goopg does not track schemas separately — we infer existence from tables.
-			// If no tables exist, the schema may be genuinely absent OR may have had its
-			// tables dropped individually beforehand (e.g. lock.sql drops all tables/views
-			// before DROP SCHEMA CASCADE). Succeed silently to match PostgreSQL's behaviour
-			// of dropping an empty schema without error.
+			if !s.IfExists && !schemaRegistered {
+				return &ExecError{Code: "3F000", Pos: s.Pos(),
+					Message: fmt.Sprintf("schema %q does not exist", schemaName)}
+			}
+			// Schema is registered; unregister it.
+			o.ctx.Catalog.UnregisterSchema(schemaName)
 			if s.Behavior == parser.DropCascade && len(tables) > 0 {
 				// Sort table names for deterministic DETAIL output.
 				sort.Slice(tables, func(i, j int) bool {
@@ -3223,12 +3264,26 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		return nil
 	}
 
-	// DROP USER / DROP ROLE — succeed silently when we cannot verify role existence.
-	// goopg tracks roles in the server's in-memory set but the executor has no
-	// callback to it; pretend success to avoid spurious "does not exist" errors
-	// in regress tests that CREATE then DROP a user within the same session.
-	// M0097-0020.
+	// DROP USER / DROP ROLE / DROP GROUP — check catalog role registry.
+	// M0097-drop_if_exists.
 	if objType == "user" || objType == "role" || objType == "group" {
+		for _, name := range s.Names {
+			roleName := strings.ToLower(name.Name)
+			exists := o.ctx.Catalog.RoleExists(roleName)
+			if s.IfExists {
+				if !exists {
+					o.ctx.AddNotice(fmt.Sprintf("role %q does not exist, skipping", name.Name))
+				} else {
+					o.ctx.Catalog.UnregisterRole(roleName)
+				}
+			} else {
+				if !exists {
+					return &ExecError{Code: "42704", Pos: s.Pos(),
+						Message: fmt.Sprintf("role %q does not exist", name.Name)}
+				}
+				o.ctx.Catalog.UnregisterRole(roleName)
+			}
+		}
 		return nil
 	}
 
@@ -3237,11 +3292,36 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	if objType == "cast" && len(s.CastTypes) == 2 {
 		fromType := s.CastTypes[0]
 		toType := s.CastTypes[1]
+		// Check for schema-qualified types with non-existent schemas first.
+		fromSchema := ""
+		toSchema := ""
+		if idx := strings.LastIndex(fromType, "."); idx >= 0 {
+			fromSchema = fromType[:idx]
+		}
+		if idx := strings.LastIndex(toType, "."); idx >= 0 {
+			toSchema = toType[:idx]
+		}
+		if fromSchema != "" && !o.ctx.Catalog.SchemaExists(fromSchema) {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", fromSchema))
+				return nil
+			}
+			return &ExecError{Code: "3F000", Pos: s.Pos(),
+				Message: fmt.Sprintf("schema %q does not exist", fromSchema)}
+		}
+		if toSchema != "" && !o.ctx.Catalog.SchemaExists(toSchema) {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", toSchema))
+				return nil
+			}
+			return &ExecError{Code: "3F000", Pos: s.Pos(),
+				Message: fmt.Sprintf("schema %q does not exist", toSchema)}
+		}
 		// Canonicalize type names (int → integer, etc.).
 		fromCanon := dropCompatCanonicalType(fromType)
 		toCanon := dropCompatCanonicalType(toType)
 		// Validate unknown types only when they don't look like schema-qualified names.
-		if !strings.Contains(fromType, ".") && fromCanon == "" {
+		if fromSchema == "" && fromCanon == "" {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", fromType))
 				return nil
@@ -3249,7 +3329,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("type %q does not exist", fromType)}
 		}
-		if !strings.Contains(toType, ".") && toCanon == "" {
+		if toSchema == "" && toCanon == "" {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", toType))
 				return nil
@@ -3275,6 +3355,10 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	// PG validates the access method first; if unknown, always errors (even with IF EXISTS).
 	// Known access methods: btree, hash, gist, gin, spgist, brin, heap.
 	if objType == "operator class" || objType == "operator family" {
+		// Schema-qualified name with non-existent schema takes priority. M0097-0071.
+		if s.IfExists && len(s.Names) > 0 && o.dropSchemaQualifiedNotice(s.Names[0]) {
+			return nil
+		}
 		knownAMs := map[string]bool{
 			"btree": true, "hash": true, "gist": true,
 			"gin": true, "spgist": true, "brin": true, "heap": true,
@@ -3307,9 +3391,12 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	}
 
 	if s.IfExists {
-		// Emit NOTICE for each name (we don't know if they exist).
-		// The test driver compares against expected NOTICEs.
+		// Emit NOTICE for each name. When the name is schema-qualified and the schema
+		// doesn't exist, report "schema X does not exist" instead of the object type.
 		for _, name := range s.Names {
+			if o.dropSchemaQualifiedNotice(name) {
+				continue
+			}
 			o.ctx.AddNotice(fmt.Sprintf("%s %q does not exist, skipping", s.ObjType, name.String()))
 		}
 		return nil
@@ -3338,32 +3425,139 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	}
 	// DROP AGGREGATE: validate the arg type and emit PG-style error messages.
 	// PG format: "aggregate name(canonicaltype) does not exist". M0097-regress.
-	if objType == "aggregate" && len(s.Names) > 0 && len(s.ArgTypes) > 0 {
-		argType := s.ArgTypes[0]
-		if argType != "" && argType != "*" {
-			canonical := dropCompatCanonicalType(argType)
-			if canonical == "" {
-				return &ExecError{Code: "42704", Pos: s.Pos(),
-					Message: fmt.Sprintf(`type %q does not exist`, argType)}
+	if objType == "aggregate" && len(s.Names) > 0 {
+		aggName := s.Names[0]
+		// Schema-qualified with non-existent schema.
+		if aggName.Schema != "" && !o.ctx.Catalog.SchemaExists(aggName.Schema) {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", aggName.Schema))
+				return nil
 			}
-			return &ExecError{Code: "42883", Pos: s.Pos(),
-				Message: fmt.Sprintf("aggregate %s(%s) does not exist", s.Names[0].String(), canonical)}
+			return &ExecError{Code: "3F000", Pos: s.Pos(),
+				Message: fmt.Sprintf("schema %q does not exist", aggName.Schema)}
 		}
+		// Build PG-style arg list for the error message.
+		argList := ""
+		if len(s.ArgTypes) > 0 {
+			argType := s.ArgTypes[0]
+			if argType == "*" {
+				// DROP AGGREGATE name(*) — non-IF EXISTS: "aggregate name(*) does not exist"
+				// IF EXISTS notice: "aggregate name() does not exist, skipping"
+				if s.IfExists {
+					o.ctx.AddNotice(fmt.Sprintf("aggregate %s() does not exist, skipping", aggName.Name))
+					return nil
+				}
+				return &ExecError{Code: "42883", Pos: s.Pos(),
+					Message: fmt.Sprintf("aggregate %s(*) does not exist", aggName.Name)}
+			} else if argType != "" {
+				// Check if arg type schema doesn't exist.
+				if idx := strings.LastIndex(argType, "."); idx >= 0 {
+					argSchema := argType[:idx]
+					if !o.ctx.Catalog.SchemaExists(argSchema) {
+						if s.IfExists {
+							o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", argSchema))
+							return nil
+						}
+						return &ExecError{Code: "3F000", Pos: s.Pos(),
+							Message: fmt.Sprintf("schema %q does not exist", argSchema)}
+					}
+				}
+				canonical := dropCompatCanonicalType(argType)
+				if canonical == "" {
+					if s.IfExists {
+						o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", argType))
+						return nil
+					}
+					return &ExecError{Code: "42704", Pos: s.Pos(),
+						Message: fmt.Sprintf(`type %q does not exist`, argType)}
+				}
+				// NOTICE uses pg_catalog-qualified type; ERROR uses canonical unqualified name.
+				// e.g. NOTICE: aggregate foo(pg_catalog.int4) vs ERROR: aggregate foo(integer).
+				pgCanon := dropCompatPGCatalogType(canonical)
+				argList = pgCanon // notice form
+			}
+		}
+		// Compute canonical form for ERROR (unqualified: real, integer, etc.)
+		// dropCompatCanonicalType handles bare names; strip pg_catalog. prefix first.
+		argListErr := argList
+		if argList != "" {
+			bare := argList
+			if strings.HasPrefix(bare, "pg_catalog.") {
+				bare = bare[len("pg_catalog."):]
+			}
+			if can := dropCompatCanonicalType(bare); can != "" {
+				argListErr = can
+			}
+		}
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("aggregate %s(%s) does not exist, skipping", aggName.Name, argList))
+			return nil
+		}
+		return &ExecError{Code: "42883", Pos: s.Pos(),
+			Message: fmt.Sprintf("aggregate %s(%s) does not exist", aggName.Name, argListErr)}
 	}
 	// DROP OPERATOR: validate types and emit PG-style error messages.
 	// ArgTypes = [leftType, rightType]; "" means single-arg (missing second arg). M0097-regress.
 	if objType == "operator" && len(s.Names) > 0 && len(s.ArgTypes) == 2 {
+		opNameObj := s.Names[0]
 		leftType := s.ArgTypes[0]
 		rightType := s.ArgTypes[1]
+
+		// Schema-qualified operator name with non-existent schema.
+		if opNameObj.Schema != "" && !o.ctx.Catalog.SchemaExists(opNameObj.Schema) {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("schema %q does not exist, skipping", opNameObj.Schema))
+				return nil
+			}
+			return &ExecError{Code: "3F000", Pos: s.Pos(),
+				Message: fmt.Sprintf("schema %q does not exist", opNameObj.Schema)}
+		}
+
+		// Helper: check if a type arg is schema-qualified with non-existent schema.
+		checkTypeSchema := func(t string) (schemaErr bool) {
+			if idx := strings.LastIndex(t, "."); idx >= 0 {
+				argSchema := t[:idx]
+				if !o.ctx.Catalog.SchemaExists(argSchema) {
+					if s.IfExists {
+						o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", t))
+					} else {
+						// Note: actual error returns from caller
+					}
+					return true
+				}
+			}
+			return false
+		}
+		if checkTypeSchema(leftType) {
+			if s.IfExists {
+				return nil
+			}
+			// Unknown type in schema
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf(`type %q does not exist`, leftType)}
+		}
+		if checkTypeSchema(rightType) {
+			if s.IfExists {
+				return nil
+			}
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf(`type %q does not exist`, rightType)}
+		}
+
 		// Single type argument (no comma) → PG reports "missing argument".
 		if rightType == "" && leftType != "none" {
 			return &ExecError{Code: "42P13", Pos: s.Pos(),
 				Message: "missing argument",
 				Hint:    "Use NONE to denote the missing argument of a unary operator."}
 		}
-		// Validate left type.
+		// Validate left type (non-schema-qualified).
 		if leftType != "" && leftType != "none" {
 			if dropCompatCanonicalType(leftType) == "" {
+				if s.IfExists {
+					// Unknown type in operator args → PG says "type X does not exist, skipping"
+					o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", leftType))
+					return nil
+				}
 				return &ExecError{Code: "42704", Pos: s.Pos(),
 					Message: fmt.Sprintf(`type %q does not exist`, leftType)}
 			}
@@ -3371,6 +3565,10 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		// Validate right type.
 		if rightType != "" && rightType != "none" {
 			if dropCompatCanonicalType(rightType) == "" {
+				if s.IfExists {
+					o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", rightType))
+					return nil
+				}
 				return &ExecError{Code: "42704", Pos: s.Pos(),
 					Message: fmt.Sprintf(`type %q does not exist`, rightType)}
 			}
@@ -3384,7 +3582,11 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		if rightCanon == "" {
 			rightCanon = rightType
 		}
-		opName := s.Names[0].String()
+		opName := opNameObj.Name
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("operator %s does not exist, skipping", opName))
+			return nil
+		}
 		return &ExecError{Code: "42883", Pos: s.Pos(),
 			Message: fmt.Sprintf("operator does not exist: %s %s %s", leftCanon, opName, rightCanon)}
 	}
@@ -3402,6 +3604,53 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 // dropCompatCanonicalType maps PostgreSQL short type names to their canonical
 // names used in error messages (e.g. "int4" → "integer", "float4" → "real").
 // Returns "" for unknown/invalid type names.
+// dropCompatPGCatalogType maps a canonical type name to pg_catalog-qualified form
+// as PostgreSQL uses in DROP AGGREGATE/FUNCTION notices. M0097-drop_if_exists.
+func dropCompatPGCatalogType(canonical string) string {
+	switch canonical {
+	case "integer":
+		return "pg_catalog.int4"
+	case "smallint":
+		return "pg_catalog.int2"
+	case "bigint":
+		return "pg_catalog.int8"
+	case "boolean":
+		return "pg_catalog.bool"
+	case "text":
+		return "pg_catalog.text"
+	case "real":
+		return "pg_catalog.float4"
+	case "double precision":
+		return "pg_catalog.float8"
+	case "oid":
+		return "pg_catalog.oid"
+	case "name":
+		return "pg_catalog.name"
+	default:
+		return canonical
+	}
+}
+
+// dropCompatFuncTypeCanon maps type names to function-signature canonical form
+// (e.g. int → int4) as PG uses in error messages. M0097-drop_if_exists.
+func dropCompatFuncTypeCanon(typeName string) string {
+	switch strings.ToLower(typeName) {
+	case "int", "int4", "integer", "serial":
+		return "int4"
+	case "int2", "smallint", "smallserial":
+		return "int2"
+	case "int8", "bigint", "bigserial":
+		return "int8"
+	case "bool", "boolean":
+		return "bool"
+	case "float4", "real":
+		return "float4"
+	case "float8", "double precision":
+		return "float8"
+	}
+	return dropCompatCanonicalType(typeName)
+}
+
 func dropCompatCanonicalType(typeName string) string {
 	switch strings.ToLower(typeName) {
 	case "int4", "integer", "int", "serial":
@@ -3646,6 +3895,9 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		return nil
 	}
 	for _, name := range s.Names {
+		if s.IfExists && o.dropSchemaQualifiedNotice(name) {
+			continue
+		}
 		n := name.Name
 		// Try to drop as enum first, then as composite type. M0097-0064.
 		enumErr := cat.DropEnum(n, s.Cascade)
@@ -3683,6 +3935,9 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		return nil
 	}
 	for _, name := range s.Names {
+		if s.IfExists && o.dropSchemaQualifiedNotice(name) {
+			continue
+		}
 		if err := cat.DropDomain(name.Name, s.IfExists, s.Cascade); err != nil {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 		}

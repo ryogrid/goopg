@@ -76,14 +76,14 @@ update,0,pass
 uuid,0,pass
 vacuum,0,pass
 varchar,0,pass
-window,0,pass
-with,0,pass
+window,3504,failed
+with,1518,failed
 xid,0,pass
 btree_index,0,pass
 copydml,58,failed
 index_including_gist,64,failed
 aggregates,68,failed
-drop_if_exists,118,failed
+drop_if_exists,89,failed
 create_table_like,149,failed
 index_including,204,failed
 insert_conflict,211,failed

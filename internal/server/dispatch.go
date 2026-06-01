@@ -136,6 +136,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			return w.WriteReadyForQuery(protocol.TxStatusIdle)
 		}
 		if tag, ok := compatNoopCommandTag(sql); ok {
+			// Side-effect: register schema for CREATE SCHEMA statements.
+			if tag == "CREATE SCHEMA" && s.cfg.Catalog != nil {
+				norm := normalizeCompatSQL(sql)
+				if schemaName := schemaNameFromCreate(norm); schemaName != "" {
+					s.cfg.Catalog.RegisterSchema(schemaName)
+				}
+			}
 			if err := w.WriteCommandComplete(tag); err != nil {
 				return err
 			}
@@ -756,7 +763,7 @@ func compatNoopCommandTag(sql string) (string, bool) {
 	case strings.HasPrefix(norm, "create user "), strings.HasPrefix(norm, "create role "):
 		return "CREATE ROLE", true
 	case strings.HasPrefix(norm, "create schema "), norm == "create schema":
-		return "CREATE SCHEMA", true
+		return "CREATE SCHEMA", true // name extraction done separately in dispatchSimpleQueryViaExecutor
 	case strings.HasPrefix(norm, "grant "), norm == "grant":
 		return "GRANT", true
 	case strings.HasPrefix(norm, "revoke "), norm == "revoke":
@@ -779,6 +786,19 @@ func compatNoopCommandTag(sql string) (string, bool) {
 		return "SECURITY LABEL", true
 	}
 	return "", false
+}
+
+// schemaNameFromCreate extracts the schema name from a normalised CREATE SCHEMA statement.
+func schemaNameFromCreate(norm string) string {
+	if !strings.HasPrefix(norm, "create schema ") {
+		return ""
+	}
+	rest := strings.TrimSpace(norm[len("create schema "):])
+	// Skip optional AUTHORIZATION keyword.
+	if strings.HasPrefix(rest, "authorization ") {
+		return ""
+	}
+	return extractFirstSQLIdent("", rest)
 }
 
 func normalizeCompatSQL(sql string) string {
