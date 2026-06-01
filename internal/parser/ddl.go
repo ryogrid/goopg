@@ -1606,7 +1606,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		// GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY or GENERATED ALWAYS AS (expr) STORED (M0096-0008)
 		case p.acceptIdentKeyword("generated"):
 			isAlways := p.acceptIdentKeyword("always")
-			isByDefault := !isAlways && (p.acceptKeyword(KwBy) && p.acceptIdentKeyword("default"))
+			isByDefault := !isAlways && (p.acceptKeyword(KwBy) && p.acceptKeyword(KwDefault))
 			if !isAlways && !isByDefault {
 				return ColumnDef{}, p.errAtCur("expected ALWAYS or BY DEFAULT after GENERATED")
 			}
