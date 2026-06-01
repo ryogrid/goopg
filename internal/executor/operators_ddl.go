@@ -110,7 +110,7 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 	case *parser.CreateOpClassStmt:
 		return nil, o.execCreateOpClass(s)
 	case *parser.CompatNoopStmt:
-		return nil, nil // GRANT/REVOKE/COMMENT/etc — accepted, no-op. M0097-0016.
+		return nil, o.execCompatNoop(s)
 	case *parser.LockTableStmt:
 		return nil, o.execLockTable(s)
 	case *parser.DoStmt:
@@ -3063,6 +3063,13 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 		o.ctx.AddNotice(fmt.Sprintf("rule %q for relation %q does not exist, skipping", s.Name, s.Table.Name))
 		return nil
 	}
+	// Check compat registry: if the rule was registered via CREATE RULE (noop), succeed silently.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		key := s.Name + "@" + s.Table.String()
+		if im.DropCompatObject("rule", key) {
+			return nil
+		}
+	}
 	return &ExecError{Code: "42704", Pos: s.Pos(),
 		Message: fmt.Sprintf("rule %q for relation %q does not exist", s.Name, s.Table.Name)}
 }
@@ -3363,6 +3370,19 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		return nil
 	}
 
+	// DROP DATABASE [IF EXISTS] name — goopg is a single-database system; always reports not found.
+	if objType == "database" {
+		for _, name := range s.Names {
+			dbName := name.Name
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("database %q does not exist, skipping", dbName))
+			} else {
+				return &ExecError{Code: "3D000", Pos: s.Pos(),
+					Message: fmt.Sprintf("database %q does not exist", dbName)}
+			}
+		}
+		return nil
+	}
 	// DROP CAST (fromType AS toType) — PG error: "cast from type X to type Y does not exist".
 	// M0097-0071. Validate source/target types; generate PG-style error message.
 	if objType == "cast" && len(s.CastTypes) == 2 {
@@ -3490,6 +3510,9 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	// Handle DROP MATERIALIZED VIEW via the catalog's DropView. M0097-0038.
 	if objType == "materialized view" {
 		for _, name := range s.Names {
+			if s.IfExists && o.dropSchemaQualifiedNotice(name) {
+				continue
+			}
 			if err := o.ctx.Catalog.DropView(name, s.IfExists); err != nil {
 				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 			}
@@ -3658,6 +3681,13 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			o.ctx.AddNotice(fmt.Sprintf("operator %s does not exist, skipping", opName))
 			return nil
 		}
+		// Check compat registry: if the operator was registered via CREATE OPERATOR (noop), succeed silently.
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			key := opName + "(" + leftCanon + "," + rightCanon + ")"
+			if im.DropCompatObject("operator", key) {
+				return nil
+			}
+		}
 		return &ExecError{Code: "42883", Pos: s.Pos(),
 			Message: fmt.Sprintf("operator does not exist: %s %s %s", leftCanon, opName, rightCanon)}
 	}
@@ -3673,12 +3703,64 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		return nil
 	}
 	// Without IF EXISTS, pretend the first name doesn't exist (generates error).
+	// Check compat registry for noop-created objects that can be silently dropped.
 	if len(s.Names) > 0 {
+		switch objType {
+		case "conversion", "text search configuration", "text search dictionary",
+			"text search parser", "text search template":
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if im.DropCompatObject(objType, s.Names[0].String()) {
+					return nil
+				}
+			}
+		}
 		return &ExecError{
 			Code:    "42704",
 			Pos:     s.Pos(),
 			Message: fmt.Sprintf("%s %q does not exist", s.ObjType, s.Names[0].String()),
 		}
+	}
+	return nil
+}
+
+// execCompatNoop handles CompatNoopStmt (GRANT/REVOKE/COMMENT/CREATE RULE/etc).
+// If the statement carries ObjType+ObjName, it registers the object in the compat
+// registry so subsequent DROP statements can verify its existence. M0097-drop_if_exists.
+func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
+	if s.ObjType == "" {
+		return nil // pure no-op (GRANT, REVOKE, COMMENT, etc.)
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	switch s.ObjType {
+	case "operator":
+		// Build the compat key as opName(leftCanon,rightCanon) to match DROP OPERATOR lookup.
+		leftArg, rightArg := "", ""
+		if len(s.ArgTypes) >= 2 {
+			leftArg = s.ArgTypes[0]
+			rightArg = s.ArgTypes[1]
+		}
+		leftCanon := dropCompatCanonicalType(leftArg)
+		rightCanon := dropCompatCanonicalType(rightArg)
+		if leftCanon == "" {
+			leftCanon = leftArg
+		}
+		if rightCanon == "" {
+			rightCanon = rightArg
+		}
+		key := s.ObjName.Name + "(" + leftCanon + "," + rightCanon + ")"
+		im.RegisterCompatObject("operator", key)
+	case "rule":
+		// Key format must match DROP RULE: ruleName@tableName.
+		if s.TableName.Name != "" {
+			key := s.ObjName.Name + "@" + s.TableName.String()
+			im.RegisterCompatObject("rule", key)
+		}
+	default:
+		// conversion, text search dictionary/configuration/parser/template, etc.
+		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 	}
 	return nil
 }

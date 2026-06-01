@@ -1204,8 +1204,12 @@ func (s *DoStmt) stmtNode() {}
 // accepts syntactically but does not execute (GRANT, REVOKE, COMMENT ON,
 // SECURITY LABEL, etc.). The executor silently succeeds. M0097-0016.
 type CompatNoopStmt struct {
-	pos int
-	Tag string // CommandComplete tag, e.g. "GRANT", "REVOKE", "COMMENT"
+	pos       int
+	Tag       string     // CommandComplete tag, e.g. "GRANT", "REVOKE", "COMMENT"
+	ObjType   string     // optional: object type for compat registry (e.g. "conversion")
+	ObjName   ObjectName // optional: primary object name for compat registry
+	ArgTypes  []string   // optional: arg types for operator compat registry (e.g. ["bigint","bigint"])
+	TableName ObjectName // optional: table name for rule compat registry
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }

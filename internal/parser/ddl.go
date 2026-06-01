@@ -158,14 +158,106 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if p.acceptIdentKeyword("class") {
 			return p.parseCreateOpClassTail(t.Pos)
 		}
-		// CREATE OPERATOR — accept and skip. M0097-regress.
-		return p.parseSkipToSemicolon(t.Pos)
-	// CREATE CONVERSION name ... — accept as no-op. M0097-0071.
+		// CREATE OPERATOR name (leftarg=T, rightarg=T, ...) — parse name + arg types for compat
+		// registry so DROP OPERATOR can find it later. M0097-regress.
+		opName, _ := p.parseOperatorName()
+		// Extract leftarg and rightarg from the parenthesised option list.
+		var leftArg, rightArg string
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance() // consume '('
+			depth := 1
+			for depth > 0 {
+				tok := p.cur()
+				if tok.Kind == TokenEOF {
+					break
+				}
+				if tok.Kind == TokenSymbol {
+					if tok.Value == "(" {
+						depth++
+						p.advance()
+						continue
+					} else if tok.Value == ")" {
+						depth--
+						p.advance()
+						continue
+					} else if tok.Value == "," || tok.Value == ";" {
+						p.advance()
+						continue
+					}
+				}
+				// Look for "leftarg = type" or "rightarg = type" key-value pairs.
+				if depth == 1 && (tok.Kind == TokenIdent || tok.Kind == TokenKeyword) {
+					key := strings.ToLower(tok.Value)
+					p.advance()
+					if (p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=" {
+						p.advance()
+						// Collect type name (may be multi-word like "double precision").
+						var typeParts []string
+						for p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+							typeParts = append(typeParts, p.cur().Value)
+							p.advance()
+						}
+						typeName := strings.Join(typeParts, " ")
+						if key == "leftarg" {
+							leftArg = typeName
+						} else if key == "rightarg" {
+							rightArg = typeName
+						}
+					}
+					continue
+				}
+				p.advance()
+			}
+		}
+		stmt, err := p.parseSkipToSemicolon(t.Pos)
+		if err != nil {
+			return nil, err
+		}
+		if ns, ok := stmt.(*CompatNoopStmt); ok {
+			ns.ObjType = "operator"
+			ns.ObjName = ObjectName{Name: opName.Name, Schema: opName.Schema}
+			ns.ArgTypes = []string{leftArg, rightArg}
+		}
+		return stmt, nil
+	// CREATE CONVERSION name ... — parse name for compat registry, then skip. M0097-0071.
 	case p.acceptIdentKeyword("conversion"):
-		return p.parseSkipToSemicolon(t.Pos)
-	// CREATE TEXT SEARCH ... — accept as no-op. M0097-0071.
+		convName, _ := p.parseObjectName()
+		stmt, err := p.parseSkipToSemicolon(t.Pos)
+		if err != nil {
+			return nil, err
+		}
+		if ns, ok := stmt.(*CompatNoopStmt); ok {
+			ns.ObjType = "conversion"
+			ns.ObjName = convName
+		}
+		return stmt, nil
+	// CREATE TEXT SEARCH DICTIONARY|CONFIGURATION|PARSER|TEMPLATE name — parse name for compat registry. M0097-0071.
 	case p.acceptIdentKeyword("text"):
-		return p.parseSkipToSemicolon(t.Pos)
+		_ = p.acceptIdentKeyword("search") // consume "search"
+		var tsType string
+		switch {
+		case p.acceptIdentKeyword("dictionary"):
+			tsType = "text search dictionary"
+		case p.acceptIdentKeyword("configuration"):
+			tsType = "text search configuration"
+		case p.acceptIdentKeyword("parser"):
+			tsType = "text search parser"
+		case p.acceptIdentKeyword("template"):
+			tsType = "text search template"
+		}
+		var tsName ObjectName
+		if tsType != "" {
+			tsName, _ = p.parseObjectName()
+		}
+		stmt, err := p.parseSkipToSemicolon(t.Pos)
+		if err != nil {
+			return nil, err
+		}
+		if ns, ok := stmt.(*CompatNoopStmt); ok && tsType != "" {
+			ns.ObjType = tsType
+			ns.ObjName = tsName
+		}
+		return stmt, nil
 	// CREATE SERVER / CREATE FOREIGN ... — accept as no-op. M0097-0071.
 	case p.acceptIdentKeyword("server"):
 		return p.parseSkipToSemicolon(t.Pos)
@@ -480,6 +572,13 @@ func parseSkipToSemicolonHelper(p *parser, stmt Stmt) (Stmt, error) {
 // The CREATE RULE syntax can have nested parens in the DO clause, so we
 // use depth tracking rather than a simple scan to semicolon.
 func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
+	// Extract rule name (first token after RULE keyword).
+	ns := &CompatNoopStmt{pos: pos, Tag: "CREATE RULE", ObjType: "rule"}
+	if tok := p.cur(); tok.Kind == TokenIdent || tok.Kind == TokenKeyword {
+		ns.ObjName = ObjectName{Name: tok.Value}
+		p.advance()
+	}
+	// Scan for "TO <tablename>" to extract the table this rule applies to.
 	// Skip tokens (tracking depth) until we reach the top-level semicolon or EOF.
 	depth := 0
 	for {
@@ -487,26 +586,31 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 		if tok.Kind == TokenEOF {
 			break
 		}
+		if tok.Kind == TokenSymbol && tok.Value == ";" && depth == 0 {
+			break
+		}
 		if tok.Kind == TokenSymbol {
 			switch tok.Value {
 			case "(", "[":
 				depth++
+				p.advance()
+				continue
 			case ")", "]":
 				if depth > 0 {
 					depth--
 				}
-			case ";":
-				if depth == 0 {
-					break
-				}
 			}
 		}
-		if tok.Kind == TokenSymbol && tok.Value == ";" && depth == 0 {
-			break
+		// At top-level, look for "TO <tablename>" to capture the table.
+		if depth == 0 && tok.Kind == TokenKeyword && Keyword(tok.Value) == KwTo && ns.TableName.Name == "" {
+			p.advance()
+			tname, _ := p.parseObjectName()
+			ns.TableName = tname
+			continue
 		}
 		p.advance()
 	}
-	return &CompatNoopStmt{pos: pos, Tag: "CREATE RULE"}, nil
+	return ns, nil
 }
 
 func (p *parser) parseSkipToSemicolon(pos int) (Stmt, error) {
@@ -2135,6 +2239,35 @@ func (p *parser) parseDrop() (Stmt, error) {
 		(cur.Value == "tuple" || cur.Value == "instance" || cur.Value == "rewrite") {
 		return nil, p.errSyntaxAtCur()
 	}
+	// DROP DATABASE [IF EXISTS] name — goopg is single-database; always reports does-not-exist.
+	if p.acceptIdentKeyword("database") {
+		ifExists, names, behavior, err := p.parseDropTail()
+		if err != nil {
+			return nil, err
+		}
+		return &DropCompatStmt{pos: t.Pos, ObjType: "database", IfExists: ifExists,
+			Names: names, Behavior: behavior}, nil
+	}
+	// DROP FOREIGN TABLE [IF EXISTS] name [, ...] [CASCADE|RESTRICT] — accepted as no-op.
+	// DROP FOREIGN DATA WRAPPER [IF EXISTS] name [, ...] — accepted as no-op.
+	// PG emits schema-not-found notice for schema-qualified names with non-existent schemas.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign {
+		p.advance()
+		objType := "foreign table"
+		if p.acceptKeyword(KwTable) {
+			// DROP FOREIGN TABLE — consume TABLE, use "foreign table" type.
+		} else if p.acceptIdentKeyword("data") {
+			// DROP FOREIGN DATA WRAPPER
+			_ = p.acceptIdentKeyword("wrapper")
+			objType = "foreign-data wrapper"
+		}
+		ifExists, names, behavior, err := p.parseDropTail()
+		if err != nil {
+			return nil, err
+		}
+		return &DropCompatStmt{pos: t.Pos, ObjType: objType, IfExists: ifExists,
+			Names: names, Behavior: behavior}, nil
+	}
 	// DROP AGGREGATE [IF EXISTS] name ( argtype_list ) [CASCADE|RESTRICT]
 	// PG requires the parenthesised argument-type list; without it the grammar
 	// produces a syntax error at the token following the name.
@@ -2162,6 +2295,13 @@ func (p *parser) parseDrop() (Stmt, error) {
 			p.advance()
 		} else if tok, err2 := p.parseIdent(); err2 == nil {
 			argType = tok.Value
+			// Read schema-qualified type: schema.type (e.g. no_such_schema.no_such_type).
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+				p.advance()
+				if tok2, err3 := p.parseIdent(); err3 == nil {
+					argType = argType + "." + tok2.Value
+				}
+			}
 		}
 		// Skip rest of arg list until matching ")".
 		depth := 1
@@ -2269,6 +2409,13 @@ func (p *parser) parseDrop() (Stmt, error) {
 			leftType = "none"
 		} else if tok, err2 := p.parseIdent(); err2 == nil {
 			leftType = tok.Value
+			// Read schema-qualified type: schema.type
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+				p.advance()
+				if tok2, err3 := p.parseIdent(); err3 == nil {
+					leftType = leftType + "." + tok2.Value
+				}
+			}
 		}
 		var rightType string
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
@@ -2280,6 +2427,13 @@ func (p *parser) parseDrop() (Stmt, error) {
 				rightType = "none"
 			} else if tok, err2 := p.parseIdent(); err2 == nil {
 				rightType = tok.Value
+				// Read schema-qualified type: schema.type
+				if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+					p.advance()
+					if tok2, err3 := p.parseIdent(); err3 == nil {
+						rightType = rightType + "." + tok2.Value
+					}
+				}
 			}
 		}
 		// Skip to closing ")".
