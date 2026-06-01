@@ -1194,6 +1194,10 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		}
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", idxName.String())}
 	}
+	if s.OpClassWithOptions != "" {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("operator class %s has no options", s.OpClassWithOptions)}
+	}
 	if s.Fillfactor != 0 && (s.Fillfactor < 10 || s.Fillfactor > 100) {
 		return &ExecError{Code: "22023", Pos: s.Pos(),
 			Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", s.Fillfactor),
@@ -1285,6 +1289,25 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 	tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
 	if !ok {
+		// Not a heap table — check if it's an index.
+		if idx, isIdx := o.ctx.Catalog.LookupIndex(s.Name); isIdx {
+			for _, act := range s.Actions {
+				if act.Kind == parser.AlterTableAlterColumnSet {
+					detail := "This operation is not supported for indexes."
+					if idx.Table != nil && len(idx.Table.PartitionKey) > 0 {
+						detail = "This operation is not supported for partitioned indexes."
+					}
+					return &ExecError{
+						Code:    "0A000",
+						Pos:     s.Pos(),
+						Message: fmt.Sprintf("ALTER action ALTER COLUMN ... SET cannot be performed on relation %q", s.Name.Name),
+						Detail:  detail,
+					}
+				}
+			}
+			// Other ALTER actions on index: silently accept in v0.
+			return nil
+		}
 		if s.IfExists {
 			return nil
 		}
@@ -1439,6 +1462,8 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableNoInherit:
 			// NO INHERIT parent_table — no-op in v0; just accept the syntax.
+		case parser.AlterTableAlterColumnSet:
+			// SET (options) on a column of a heap table: no-op in goopg v0.
 		default:
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE action is not supported in v0"}
 		}

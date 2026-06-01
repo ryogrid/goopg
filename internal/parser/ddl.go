@@ -1829,12 +1829,13 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '('")
 	}
-	cols, colExprs, err := p.parseIndexColumnList()
+	cols, colExprs, opClassWithOptions, err := p.parseIndexColumnList()
 	if err != nil {
 		return nil, err
 	}
 	stmt.Columns = cols
 	stmt.ColExprs = colExprs
+	stmt.OpClassWithOptions = opClassWithOptions
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("expected ')'")
 	}
@@ -1916,9 +1917,10 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 // For expression entries the column name is stored as "" and the parsed
 // expression is returned in the parallel exprs slice. Simple column names
 // are stored verbatim with nil in exprs.
-func (p *parser) parseIndexColumnList() ([]string, []Expr, error) {
+func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
 	var cols []string
 	var exprs []Expr
+	var opClassWithOptions string
 	for {
 		var colName string
 		var colExpr Expr
@@ -1928,7 +1930,7 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, error) {
 			// Parse and capture the expression.
 			e, err := p.parseExpr()
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, "", err
 			}
 			colName = "" // expression — no simple column name
 			colExpr = e
@@ -1936,14 +1938,14 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, error) {
 			// Parenthesised expression: (expr)
 			e, err := p.parseExpr()
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, "", err
 			}
 			colName = ""
 			colExpr = e
 		} else {
 			tok, err := p.parseIdent()
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, "", err
 			}
 			colName = identText(tok)
 		}
@@ -1957,8 +1959,27 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, error) {
 		// Optional opclass name (bare ident that is not a known keyword
 		// and not ',' or ')')
 		if p.cur().Kind == TokenIdent {
-			// This is the opclass name — skip it.
+			// This is the opclass name — capture it.
+			opClassName := p.cur().Value
 			p.advance()
+			// Optional operator class options: (foo=1, bar=2).
+			// Most built-in operator classes have no options; presence here
+			// is recorded so the executor can reject with the PG error.
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				if opClassWithOptions == "" {
+					opClassWithOptions = opClassName
+				}
+				depth := 1
+				p.advance() // consume '('
+				for depth > 0 && p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+						depth++
+					} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+						depth--
+					}
+					p.advance()
+				}
+			}
 		}
 
 		// Optional ASC/DESC
@@ -1986,7 +2007,7 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, error) {
 			break
 		}
 	}
-	return cols, exprs, nil
+	return cols, exprs, opClassWithOptions, nil
 }
 
 // parseDrop dispatches on the next keyword after DROP.
@@ -2772,12 +2793,59 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return &AlterTableStmt{pos: t.Pos}, nil
 	}
-	// ALTER VIEW / SCHEMA / INDEX / FUNCTION / PROCEDURE /
+	// ALTER INDEX name ALTER COLUMN col SET (options) — emit the action so
+	// the executor can raise the appropriate error. M0097-0023.
+	if p.acceptKeyword(KwIndex) {
+		// Read the index name (may be schema-qualified).
+		idxName, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		// Check for ALTER COLUMN col SET (options).
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter {
+			p.advance() // consume ALTER
+			_ = p.acceptKeyword(KwColumn)
+			// Read column name.
+			if p.cur().Kind == TokenIdent {
+				p.advance()
+			}
+			if p.acceptIdentKeyword("set") {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+					// Consume the options block.
+					depth := 1
+					p.advance() // consume '('
+					for depth > 0 && p.cur().Kind != TokenEOF {
+						if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+							depth++
+						} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+							depth--
+						}
+						p.advance()
+					}
+					stmt := &AlterTableStmt{pos: t.Pos, Name: idxName}
+					stmt.Actions = append(stmt.Actions, AlterTableAction{
+						Kind: AlterTableAlterColumnSet,
+					})
+					return stmt, nil
+				}
+			}
+		}
+		// Other ALTER INDEX forms: consume rest as no-op.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return &AlterTableStmt{pos: t.Pos}, nil
+	}
+
+	// ALTER VIEW / SCHEMA / FUNCTION / PROCEDURE /
 	// COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / PUBLICATION /
 	// SUBSCRIPTION / SYSTEM — compatibility stubs. Consume until end of
 	// statement and return an empty AlterTableStmt (executor no-ops it).
 	for _, objIdent := range []string{
-		"schema", "view", "index", "function", "procedure",
+		"schema", "view", "function", "procedure",
 		"collation", "domain", "extension", "language",
 		"operator", "publication", "subscription", "system",
 		"materialized",
@@ -2931,8 +2999,37 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// ALTER COLUMN — parse as no-op (consume rest).
+	// ALTER COLUMN — handle SET (options) specially; consume other forms as no-op.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter {
+		p.advance() // consume ALTER
+		// Skip COLUMN keyword if present.
+		_ = p.acceptKeyword(KwColumn)
+		// Read the column name.
+		if p.cur().Kind == TokenIdent {
+			p.advance()
+		}
+		// Check for SET (options) pattern.
+		if p.acceptIdentKeyword("set") {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				// Consume the options block.
+				depth := 1
+				p.advance() // consume '('
+				for depth > 0 && p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+						depth++
+					} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+						depth--
+					}
+					p.advance()
+				}
+				// Emit AlterTableAlterColumnSet action.
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind: AlterTableAlterColumnSet,
+				})
+				return stmt, nil
+			}
+		}
+		// Other ALTER COLUMN forms: consume rest as no-op.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break

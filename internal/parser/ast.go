@@ -996,6 +996,12 @@ type CreateIndexStmt struct {
 	// Columns[i] == "" (expression column); nil for plain column names.
 	ColExprs   []Expr
 	Fillfactor int // 0 means unset; valid range 10–100
+	// OpClassWithOptions holds the name of the first operator class that
+	// specifies parameters (e.g. "int4_ops" from `id int4_ops(foo=1)`).
+	// Empty string means no operator class options were given. In PostgreSQL
+	// most built-in operator classes have no options, so a non-empty value
+	// here causes an error at execution time. M0097-0023.
+	OpClassWithOptions string
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }
@@ -1320,6 +1326,10 @@ const (
 	// AlterTableNoInherit — `NO INHERIT parent_table`.
 	// Removes the inheritance relationship; no-op in goopg v0. M0097-0048.
 	AlterTableNoInherit
+	// AlterTableAlterColumnSet — `ALTER COLUMN name SET (options)`.
+	// For heap tables this is a no-op in goopg v0; for indexes it raises
+	// an appropriate error (M0097-0023 btree_index parity).
+	AlterTableAlterColumnSet
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the

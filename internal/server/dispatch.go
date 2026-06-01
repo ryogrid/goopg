@@ -1729,6 +1729,8 @@ func typeOIDFor(name string) uint32 {
 		return 16
 	case "oid":
 		return 26
+	case "oidvector":
+		return 30
 	case "name":
 		return 19
 	case "uuid":
