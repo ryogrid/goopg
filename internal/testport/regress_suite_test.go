@@ -92,6 +92,12 @@ func TestPort_RegressSuite(t *testing.T) {
 				t.Log("cluster recovered")
 			}
 
+			// Run per-test pre-setup SQL if defined (e.g. create_aggregate.sql
+			// for the aggregates test).
+			if preFile, ok := regressPreSetup[rc.Name]; ok {
+				runRegressSQLFile(t, root, psqlBin, c, preFile)
+			}
+
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
 
@@ -115,6 +121,42 @@ func TestPort_RegressSuite(t *testing.T) {
 				t.Skipf("deferred: %s", r.Rationale)
 			}
 		})
+	}
+}
+
+// regressPreSetup maps test names to SQL files that must be executed against
+// the cluster before the test SQL runs. The paths are relative to the repo root.
+var regressPreSetup = map[string]string{
+	"aggregates": "postgres/src/test/regress/sql/create_aggregate.sql",
+}
+
+// runRegressSQLFile runs a SQL file against the cluster via psql.
+// Failures are logged but do not abort the test.
+func runRegressSQLFile(t *testing.T, root string, psqlBin string, c *cluster.Cluster, relPath string) {
+	t.Helper()
+	sqlPath := filepath.Join(root, relPath)
+	if _, err := os.Stat(sqlPath); err != nil {
+		t.Logf("pre-setup file %s not found, skipping: %v", relPath, err)
+		return
+	}
+	addr := c.ListenAddr()
+	host, port, _ := net.SplitHostPort(addr)
+	libDir := filepath.Join(root, "postgres", "local_install", "lib")
+	prev := os.Getenv("LD_LIBRARY_PATH")
+	ldPath := libDir
+	if prev != "" {
+		ldPath += ":" + prev
+	}
+	absSrcDir := filepath.Join(root, "postgres", "src", "test", "regress")
+	result, _ := util.RunCommand(util.CommandSpec{
+		Name:    psqlBin,
+		Args:    []string{"-h", host, "-p", port, "-U", "postgres", "-d", "postgres", "-X", "-q", "-a", "-f", sqlPath},
+		Dir:     root,
+		Env:     []string{"PGPASSWORD=", "LD_LIBRARY_PATH=" + ldPath, "PG_ABS_SRCDIR=" + absSrcDir},
+		Timeout: 60 * time.Second,
+	})
+	if result.ExitCode != 0 {
+		t.Logf("pre-setup %s completed with errors (may be OK): exit=%d", relPath, result.ExitCode)
 	}
 }
 

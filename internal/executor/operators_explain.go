@@ -205,11 +205,18 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 	if depth > 0 {
 		prefix = indent + "->  "
 	}
-	label := prefix + describePlan(n)
-	if opts.Costs {
-		if est := planner.EstimateRows(n); est > 0 {
-			label += fmt.Sprintf(" (rows=%d)", est)
+	label := prefix + describePlanVerbose(n, opts.Verbose)
+	// COSTS defaults to ON in PostgreSQL (and goopg); only suppress when
+	// the user explicitly wrote COSTS OFF (Set.Costs=true and Costs=false).
+	showCosts := !opts.Set.Costs || opts.Costs
+	if showCosts {
+		est := planner.EstimateRows(n)
+		if est <= 0 {
+			est = 1
 		}
+		// Emit PG-compatible cost annotation: (cost=0.00..0.00 rows=N width=0)
+		// The mock 0.00 costs are replaced by 'N' in EXPLAIN normalization.
+		label += fmt.Sprintf("  (cost=0.00..0.00 rows=%d width=0)", est)
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
 
@@ -221,7 +228,7 @@ func walkPlanFiltered(n planner.Node, depth int, rows *[]Row, opts parser.Explai
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
-			outline := indent + "  Output: (" + strings.Join(cols, ", ") + ")"
+			outline := indent + "  Output: " + strings.Join(cols, ", ")
 			*rows = append(*rows, Row{NewStringDatum(outline)})
 		}
 	}
@@ -434,18 +441,22 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	if depth > 0 {
 		prefix = indent + "->  "
 	}
-	label := prefix + describePlan(n)
-	if opts.Costs {
-		if est := planner.EstimateRows(n); est > 0 {
-			label += fmt.Sprintf(" (rows=%d)", est)
+	label := prefix + describePlanVerbose(n, opts.Verbose)
+	showCostsA := !opts.Set.Costs || opts.Costs
+	if showCostsA {
+		est := planner.EstimateRows(n)
+		if est <= 0 {
+			est = 1
 		}
+		label += fmt.Sprintf("  (cost=0.00..0.00 rows=%d width=0)", est)
 	}
 	if s, ok := stats[n]; ok && s != nil {
 		if s.timing {
-			label += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%d loops=%d)",
-				nsToMs(s.startupNs), nsToMs(s.totalNs), s.rowsOut, s.loops)
+			// PG formats rows as float (e.g. "rows=5.00") for ANALYZE output.
+			label += fmt.Sprintf(" (actual time=%.3f..%.3f rows=%.2f loops=%d)",
+				nsToMs(s.startupNs), nsToMs(s.totalNs), float64(s.rowsOut), s.loops)
 		} else {
-			label += fmt.Sprintf(" (actual rows=%d loops=%d)", s.rowsOut, s.loops)
+			label += fmt.Sprintf(" (actual rows=%.2f loops=%d)", float64(s.rowsOut), s.loops)
 		}
 	}
 	*rows = append(*rows, Row{NewStringDatum(label)})
@@ -455,7 +466,7 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
-			outline := indent + "  Output: (" + strings.Join(cols, ", ") + ")"
+			outline := indent + "  Output: " + strings.Join(cols, ", ")
 			*rows = append(*rows, Row{NewStringDatum(outline)})
 		}
 	}
@@ -527,6 +538,41 @@ func planToJSON(n planner.Node, opts parser.ExplainOptions) map[string]any {
 // for Join), table names (SeqScan / IndexScan), and aggregate
 // shapes that are useful for verifying planner choices without
 // running the query.
+// schemaQualify prepends "public." to an unqualified table name for VERBOSE mode.
+func schemaQualify(name string) string {
+	if strings.Contains(name, ".") {
+		return name
+	}
+	return "public." + name
+}
+
+// describePlanVerbose returns the plan-node description; verbose=true adds schema qualification.
+func describePlanVerbose(n planner.Node, verbose bool) string {
+	if !verbose {
+		return describePlan(n)
+	}
+	switch p := n.(type) {
+	case *planner.SeqScan:
+		if p.Table == nil {
+			return describePlan(n)
+		}
+		tname := schemaQualify(p.Table.QualifiedName())
+		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
+			return fmt.Sprintf("Seq Scan on %s %s", tname, p.Alias)
+		}
+		return "Seq Scan on " + tname
+	case *planner.IndexScan:
+		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
+	case *planner.Insert:
+		return "Insert on " + schemaQualify(p.Table.QualifiedName())
+	case *planner.Update:
+		return "Update on " + schemaQualify(p.Table.QualifiedName())
+	case *planner.Delete:
+		return "Delete on " + schemaQualify(p.Table.QualifiedName())
+	}
+	return describePlan(n)
+}
+
 func describePlan(n planner.Node) string {
 	switch p := n.(type) {
 	case *planner.Project:
@@ -569,7 +615,13 @@ func describePlan(n planner.Node) string {
 		// inspecting EXPLAIN can verify which scans feed the
 		// cost model.
 		if p.Table != nil && p.Table.Stats != nil {
+			if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
+				return fmt.Sprintf("Seq Scan on %s %s (stats)", p.Table.QualifiedName(), p.Alias)
+			}
 			return fmt.Sprintf("Seq Scan on %s (stats)", p.Table.QualifiedName())
+		}
+		if p.Alias != "" && p.Alias != strings.ToLower(p.Table.Name) {
+			return fmt.Sprintf("Seq Scan on %s %s", p.Table.QualifiedName(), p.Alias)
 		}
 		return fmt.Sprintf("Seq Scan on %s", p.Table.QualifiedName())
 	case *planner.IndexScan:

@@ -129,6 +129,16 @@ func autoRepair(status statusFile, progress progressFile, maxSkew time.Duration)
 			repairs = append(repairs,
 				fmt.Sprintf("status marked completed/idle because progress completed is newer by > %s", maxSkew))
 		}
+
+		// Safe rule: stale "running/executing" status with newer failed progress.
+		isProgressFailed := strings.EqualFold(progress.Status, "failed") || strings.EqualFold(progress.Status, "error")
+		if isStatusRunning && isProgressFailed && isExecuting && progressTS.After(statusTS.Add(maxSkew)) {
+			repairedStatus.Status = "idle"
+			repairedStatus.LastAction = "idle"
+			repairedStatus.Timestamp = progressTS.Format(time.RFC3339)
+			repairs = append(repairs,
+				fmt.Sprintf("status marked idle because progress failed is newer by > %s", maxSkew))
+		}
 	}
 
 	return repairedStatus, repairedProgress, repairs

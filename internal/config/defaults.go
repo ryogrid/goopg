@@ -470,6 +470,18 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 	r.MustRegister(NewVariable(Variable{
+		Name: "extra_float_digits", Type: TypeInt, BootVal: "1",
+		MinVal: -15, MaxVal: 3,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "bytea_output", Type: TypeEnum, BootVal: "hex",
+		EnumOptions: []string{"escape", "hex"},
+		Context:     ContextUserset,
+		Scope:       ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
 		Name: "random_page_cost", Type: TypeReal, BootVal: "4.0",
 		MinVal: 0, MaxVal: 1e9,
 		Context: ContextUserset,

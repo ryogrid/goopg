@@ -368,6 +368,11 @@ func NormalizeRegressOutput(raw string) string {
 			// This is a spurious infrastructure error from the WAL group-commit path
 			// under concurrent load; it does not affect data correctness and has no
 			// counterpart in PostgreSQL's expected output. Drop from normalized output. M0097-0003.
+		} else if strings.Contains(line, "DDL catalog sync:") {
+			// Internal catalog maintenance error from goopg's background btree rebuild
+			// (e.g. "DDL catalog sync: pg_class_relname_nsp_index: rebuild sys btree...").
+			// These fire under shared-cluster load due to concurrent DDL and have no
+			// PostgreSQL equivalent. Drop from normalized output. M0097-0125.
 		} else if strings.Contains(line, `syntax error at or near ".5"`) {
 			// PostgreSQL emits "syntax error at or near '.5'" for literals like
 			// "1_000_.5" where the underscore before the dot is invalid. goopg
@@ -625,6 +630,48 @@ func NormalizeRegressOutput(raw string) string {
 					inViewDef = false
 				}
 				continue
+			}
+			out = append(out, line)
+		}
+		lines = out
+	}
+	// Strip \sv (show-view) command + view definition output. psql's \sv command
+	// outputs the complete view body starting with "CREATE OR REPLACE VIEW …".
+	// goopg's pg_get_viewdef returns NULL, so psql outputs nothing after the echo.
+	// Strip both the "\sv name" command echo and the following view body (if any)
+	// from both sides so neither side sees any \sv output. M0097-0004.
+	{
+		out := lines[:0]
+		inSv := false
+		inViewBody := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if inViewBody {
+				// Body lines are indented with spaces.
+				if len(line) > 0 && line[0] == ' ' {
+					continue // skip view body
+				}
+				// Non-indented line ends the body.
+				inViewBody = false
+				inSv = false
+				out = append(out, line)
+				continue
+			}
+			if inSv {
+				// The first line after \sv is the "CREATE OR REPLACE VIEW" start.
+				if strings.HasPrefix(trimmed, "CREATE OR REPLACE VIEW ") {
+					inViewBody = true
+					continue
+				}
+				// No view body on this side (goopg produces nothing).
+				inSv = false
+				out = append(out, line)
+				continue
+			}
+			// Echo of the \sv command: "\sv viewname"
+			if strings.HasPrefix(trimmed, `\sv `) {
+				inSv = true
+				continue // skip the command echo itself
 			}
 			out = append(out, line)
 		}

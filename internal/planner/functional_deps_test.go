@@ -74,3 +74,54 @@ func TestGroupByUniqueColumnRejected(t *testing.T) {
 		t.Errorf("error message = %q, want grouping-error wording", pe.Message)
 	}
 }
+
+// TestSelectStarWithGroupByAllColumns: SELECT * FROM t GROUP BY a,b,c
+// should succeed when all columns are in the GROUP BY list. Previously
+// returned "SELECT * with GROUP BY/aggregate is not supported in v0 planner".
+func TestSelectStarWithGroupByAllColumns(t *testing.T) {
+	cat, _ := articlesFDCatalog(t)
+	// articles has 3 columns: id, keywords, body
+	stmt := parseOne(t, "SELECT * FROM articles GROUP BY id, keywords, body")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if got := len(node.Output()); got != 3 {
+		t.Errorf("schema width = %d, want 3 (all article columns)", got)
+	}
+}
+
+// TestSelectStarWithGroupByPKFuncDep: SELECT * FROM t GROUP BY id
+// should succeed when id is a primary key (all other columns are
+// functionally determined). Previously rejected with the same error.
+func TestSelectStarWithGroupByPKFuncDep(t *testing.T) {
+	cat, _ := articlesFDCatalog(t)
+	// articles(id PK, keywords, body): grouping by PK → keywords and body are passthrough
+	stmt := parseOne(t, "SELECT * FROM articles GROUP BY id")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if got := len(node.Output()); got != 3 {
+		t.Errorf("schema width = %d, want 3 (id + 2 passthrough cols)", got)
+	}
+}
+
+// TestSelectStarWithGroupByNonGroupedColumnRejected: SELECT * FROM t GROUP BY id
+// when t has columns not functionally determined by id (no PK) must fail.
+func TestSelectStarWithGroupByNonGroupedColumnRejected(t *testing.T) {
+	cat, _ := articlesFDCatalog(t)
+	// body is a unique non-PK column; grouping by body does not functionally determine others
+	stmt := parseOne(t, "SELECT * FROM articles GROUP BY body")
+	_, err := Plan(stmt, cat)
+	if err == nil {
+		t.Fatal("expected error for non-determined columns after star expansion, got nil")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok {
+		t.Fatalf("error type = %T, want *PlanError", err)
+	}
+	if pe.Code != "42803" {
+		t.Errorf("error code = %q, want 42803", pe.Code)
+	}
+}

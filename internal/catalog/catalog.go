@@ -24,6 +24,11 @@ var (
 	ErrDatabaseNotFound = errors.New("database does not exist")
 )
 
+// RelationLockRowsFunc is optionally set by the executor to provide
+// currently-held relation lock rows (from LOCK TABLE) for pg_locks.
+// Same column order as AdvisoryLockRowsFunc. M0097.
+var RelationLockRowsFunc func() [][]string
+
 // AdvisoryLockRowsFunc is optionally set by the executor to provide
 // currently-held advisory lock rows for the pg_locks virtual table.
 // Each returned slice has the same column order as pg_locks.VirtualRows:
@@ -60,6 +65,14 @@ type Column struct {
 	// INSERT time so logical replication preserves DEFAULT semantics across
 	// schema-extended subscribers (M0103-0007 rung 13).
 	DefaultExpr parser.Expr
+	// MissingValue is the precomputed default value used by the heap
+	// decoder for rows that pre-date this column (storedNatts < ordinal+1).
+	// Populated by `ALTER TABLE ADD COLUMN <name> <type> DEFAULT <const>`
+	// to avoid the table rewrite — mirrors PostgreSQL's `attmissingval`.
+	// Type is `executor.Datum`, stored as `any` to avoid the catalog →
+	// executor import cycle. nil means trailing missing columns decode as
+	// NULL (the prior default). M0097-0077.
+	MissingValue any
 }
 
 // Table is one relation in the catalog.
@@ -197,12 +210,15 @@ type ForeignKey struct {
 // For RANGE partitioning, From and To contain the bound strings ("MINVALUE", "MAXVALUE", or a literal).
 // For HASH partitioning, Modulus and Remainder specify the hash bucket. M0096-0007; HASH M0097-0015.
 type PartitionBound struct {
-	InValues  []string // LIST: values in this partition
-	From      string   // RANGE: lower bound
-	To        string   // RANGE: upper bound
-	Modulus   int64    // HASH: modulus
-	Remainder int64    // HASH: remainder (partition index)
-	IsHash    bool     // true for HASH partitions
+	InValues   []string // LIST: values in this partition
+	From       string   // RANGE: lower bound (single-column, kept for compat)
+	To         string   // RANGE: upper bound (single-column, kept for compat)
+	FromValues []string // RANGE: lower bound tuple (multi-column; len==1 for single-col)
+	ToValues   []string // RANGE: upper bound tuple (multi-column; len==1 for single-col)
+	Modulus    int64    // HASH: modulus
+	Remainder  int64    // HASH: remainder (partition index)
+	IsHash     bool     // true for HASH partitions
+	IsDefault  bool     // true for DEFAULT partitions
 }
 
 // TableStats captures the pg_class-shaped table-level stats
@@ -298,6 +314,18 @@ type Catalog interface {
 	// TablesInSchema returns the names of all non-virtual user tables in the given
 	// schema.  Used by DROP SCHEMA CASCADE. M0097-0020.
 	TablesInSchema(schemaName string) []parser.ObjectName
+	// SchemaExists reports whether a schema has been registered.
+	SchemaExists(name string) bool
+	// RegisterSchema records a user-created schema. M0097-drop_if_exists.
+	RegisterSchema(name string)
+	// UnregisterSchema removes a schema from the registry. M0097-drop_if_exists.
+	UnregisterSchema(name string)
+	// RoleExists reports whether a role has been registered. M0097-drop_if_exists.
+	RoleExists(name string) bool
+	// RegisterRole records a user-created role. M0097-drop_if_exists.
+	RegisterRole(name string)
+	// UnregisterRole removes a role from the registry. M0097-drop_if_exists.
+	UnregisterRole(name string)
 	IndexesOnTable(table *Table) []*Index
 	HasPrimaryKey(table *Table) bool
 	RelFileNode(table *Table) storage.RelFileNode
@@ -308,6 +336,18 @@ type Catalog interface {
 	// state. Implementations may return a process-local registry
 	// (current InMemory behaviour) or a future on-disk-backed one.
 	Routines() *Routines
+	// RegisterUserAggregate registers a user-defined aggregate in the catalog.
+	RegisterUserAggregate(agg *UserAggregate)
+	// LookupUserAggregateByName looks up a user-defined aggregate by lower-case name.
+	// Returns nil, false if not found.
+	LookupUserAggregateByName(name string) (*UserAggregate, bool)
+	// RenameUserAggregate renames an existing user-defined aggregate.
+	// Returns false if the old name is not found.
+	RenameUserAggregate(oldName, newName string) bool
+	// LookupCompositeTypeFields returns the ordered field list for a composite
+	// type registered via RegisterCompositeTypeWithFields. Returns nil if the
+	// type has no field metadata. M0097-composite.
+	LookupCompositeTypeFields(name string) []CompositeField
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -357,6 +397,9 @@ type InMemory struct {
 	// CREATE TYPE ... AS (...). Since we don't implement composite type evaluation,
 	// we only track the name so DROP TYPE can succeed silently. M0097-0064.
 	compositeTypeNames map[string]bool
+	// compositeTypeFields stores the ordered field list for composite types so
+	// that PL/pgSQL can perform field access and assignment. M0097-composite.
+	compositeTypeFields map[string][]CompositeField
 
 	// constraintViewDeps maps "tableOID:constraintName" → []viewName for
 	// views that rely on the constraint for GROUP BY functional dependency.
@@ -367,6 +410,20 @@ type InMemory struct {
 	// Only FUNCTION 2 (hash extended) entries are registered; used by
 	// satisfies_hash_partition. M0097-0027.
 	opClassHashFuncs map[string]string
+
+	// userAggregates maps lower-case aggregate name → UserAggregate for
+	// user-defined aggregates registered via CREATE AGGREGATE.
+	userAggregates map[string]*UserAggregate
+
+	// schemas tracks user-created schemas (CREATE SCHEMA). Pre-populated
+	// with the standard system schemas. Maps lowercase schema name → OID.
+	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
+	schemas map[string]uint32
+
+	// roles tracks user-created roles (CREATE ROLE / CREATE USER). Used by
+	// DROP ROLE IF EXISTS to produce proper "does not exist" notices.
+	// M0097-drop_if_exists.
+	roles map[string]struct{}
 }
 
 // EnumValue is one label in a user-defined enum type together with its sort
@@ -391,6 +448,27 @@ type Domain struct {
 	OID     uint32
 	Base    Type // resolved base type
 	NotNull bool
+}
+
+// CompositeField describes one field in a user-defined composite type.
+// M0097-composite.
+type CompositeField struct {
+	Name    string // lower-case field name
+	ColType string // column type string (e.g. "bigint", "text")
+}
+
+// UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
+// It is stored in InMemory.userAggregates and looked up by lower-case name.
+type UserAggregate struct {
+	Name        string   // lower-case aggregate name
+	ArgTypes    []string // base argument type names (may be empty for zero-arg like count(*))
+	SType       string   // state type name
+	SFunc       string   // state transition function name
+	FinalFunc   string   // final function name (may be empty)
+	CombineFunc string   // combine function name for parallel agg (may be empty)
+	InitCond    string   // initial condition string (may be empty)
+	SFuncStrict bool     // true if sfunc is STRICT (skips NULL inputs)
+	Variadic    bool     // true when declared with VARIADIC input arg
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -449,11 +527,51 @@ func NewInMemory() *InMemory {
 		enumTypes:           make(map[string]*EnumType),
 		domains:             make(map[string]*Domain),
 		compositeTypeNames:  make(map[string]bool),
+		compositeTypeFields: make(map[string][]CompositeField),
 		constraintViewDeps:  make(map[string][]string),
 		opClassHashFuncs:    make(map[string]string),
+		userAggregates: make(map[string]*UserAggregate),
+		schemas: map[string]uint32{
+			"pg_catalog":         11,
+			"public":             2200,
+			"information_schema": 99,
+			"pg_toast":           2200, // toast uses same OID as public in simplified model
+		},
+		roles: make(map[string]struct{}),
 	}
 	c.registerSystemTables()
 	return c
+}
+
+// RegisterUserAggregate registers a user-defined aggregate in the catalog.
+func (c *InMemory) RegisterUserAggregate(agg *UserAggregate) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.userAggregates[strings.ToLower(agg.Name)] = agg
+}
+
+// LookupUserAggregateByName looks up a user-defined aggregate by name (case-insensitive).
+// Returns nil, false if not found.
+func (c *InMemory) LookupUserAggregateByName(name string) (*UserAggregate, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	a, ok := c.userAggregates[strings.ToLower(name)]
+	return a, ok
+}
+
+// RenameUserAggregate renames an existing user-defined aggregate. M0097-0035.
+func (c *InMemory) RenameUserAggregate(oldName, newName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oldKey := strings.ToLower(oldName)
+	agg, ok := c.userAggregates[oldKey]
+	if !ok {
+		return false
+	}
+	delete(c.userAggregates, oldKey)
+	agg.Name = newName
+	c.userAggregates[strings.ToLower(newName)] = agg
+	return true
 }
 
 // SetDBOID overrides the database OID used for RelFileNode generation.
@@ -541,12 +659,17 @@ func (c *InMemory) RegisterPartitionChild(parentOID, childOID uint32) {
 func (c *InMemory) FindPartitionForValue(parentOID uint32, keyValue string) *Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
 		for _, t := range c.tables {
 			if t.OID != childOID {
 				continue
 			}
 			for _, pb := range t.PartitionBounds {
+				if pb.IsDefault {
+					defaultPart = t
+					continue
+				}
 				for _, v := range pb.InValues {
 					if v == keyValue {
 						return t
@@ -555,7 +678,7 @@ func (c *InMemory) FindPartitionForValue(parentOID uint32, keyValue string) *Tab
 			}
 		}
 	}
-	return nil
+	return defaultPart // fall back to DEFAULT partition
 }
 
 // FindRangePartitionForValue finds the RANGE partition child that contains keyValue.
@@ -563,12 +686,17 @@ func (c *InMemory) FindPartitionForValue(parentOID uint32, keyValue string) *Tab
 func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) *Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
 		for _, t := range c.tables {
 			if t.OID != childOID {
 				continue
 			}
 			for _, pb := range t.PartitionBounds {
+				if pb.IsDefault {
+					defaultPart = t
+					continue
+				}
 				if pb.From == "" && pb.To == "" {
 					continue
 				}
@@ -585,7 +713,111 @@ func (c *InMemory) FindRangePartitionForValue(parentOID uint32, keyValue int64) 
 			}
 		}
 	}
-	return nil
+	return defaultPart // fall back to DEFAULT partition
+}
+
+// FindRangePartitionForDatums routes a row to its RANGE partition using a
+// multi-column key tuple expressed as string-formatted values (one per
+// partition-key column). Tuple comparison is lexicographic:
+// (k1,k2,...) >= (f1,f2,...) AND (k1,k2,...) < (t1,t2,...).
+// "MINVALUE" and "MAXVALUE" are special sentinels (-∞ and +∞).
+func (c *InMemory) FindRangePartitionForDatums(parentOID uint32, keyStrs []string) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var defaultPart *Table
+	for _, childOID := range c.partitionChildren[parentOID] {
+		for _, t := range c.tables {
+			if t.OID != childOID {
+				continue
+			}
+			for _, pb := range t.PartitionBounds {
+				if pb.IsDefault {
+					defaultPart = t
+					continue
+				}
+				if len(pb.FromValues) == 0 && len(pb.ToValues) == 0 {
+					continue
+				}
+				if rangeStrTupleGE(keyStrs, pb.FromValues) && rangeStrTupleLT(keyStrs, pb.ToValues) {
+					return t
+				}
+			}
+		}
+	}
+	return defaultPart
+}
+
+// rangeStrTupleGE returns true if key >= bound (lexicographic tuple comparison).
+func rangeStrTupleGE(key, bound []string) bool {
+	for i := range key {
+		if i >= len(bound) {
+			break
+		}
+		cmp := compareRangeBoundStr(key[i], bound[i])
+		if cmp > 0 {
+			return true
+		}
+		if cmp < 0 {
+			return false
+		}
+	}
+	return true // equal on all compared positions: satisfies >=
+}
+
+// rangeStrTupleLT returns true if key < bound (lexicographic tuple comparison).
+func rangeStrTupleLT(key, bound []string) bool {
+	for i := range key {
+		if i >= len(bound) {
+			break
+		}
+		cmp := compareRangeBoundStr(key[i], bound[i])
+		if cmp < 0 {
+			return true
+		}
+		if cmp > 0 {
+			return false
+		}
+	}
+	return false // equal on all compared positions: does NOT satisfy < (exclusive upper bound)
+}
+
+// compareRangeBoundStr compares a string-formatted key value against a
+// partition bound string. Returns -1, 0, +1.
+// "MINVALUE" is -∞ (key > MINVALUE → +1); "MAXVALUE" is +∞ (key < MAXVALUE → -1).
+func compareRangeBoundStr(keyStr, boundStr string) int {
+	switch boundStr {
+	case "MINVALUE":
+		return 1 // anything > -∞
+	case "MAXVALUE":
+		return -1 // anything < +∞
+	}
+	switch keyStr {
+	case "MINVALUE":
+		return -1
+	case "MAXVALUE":
+		return 1
+	}
+	// Try integer comparison first (covers int, bigint, etc.).
+	var ki, bi int64
+	_, kerr := fmt.Sscanf(keyStr, "%d", &ki)
+	_, berr := fmt.Sscanf(boundStr, "%d", &bi)
+	if kerr == nil && berr == nil {
+		if ki < bi {
+			return -1
+		}
+		if ki > bi {
+			return 1
+		}
+		return 0
+	}
+	// Fall back to lexicographic string comparison (text, char, etc.).
+	if keyStr < boundStr {
+		return -1
+	}
+	if keyStr > boundStr {
+		return 1
+	}
+	return 0
 }
 
 // FindHashPartitionForValue finds the HASH partition child that owns the given
@@ -599,12 +831,17 @@ func (c *InMemory) FindHashPartitionForValue(parentOID uint32, keyValue string) 
 		h ^= uint64(b)
 		h *= 1099511628211
 	}
+	var defaultPart *Table
 	for _, childOID := range c.partitionChildren[parentOID] {
 		for _, t := range c.tables {
 			if t.OID != childOID {
 				continue
 			}
 			for _, pb := range t.PartitionBounds {
+				if pb.IsDefault {
+					defaultPart = t
+					continue
+				}
 				if pb.IsHash && pb.Modulus > 0 {
 					if int64(h%uint64(pb.Modulus)) == pb.Remainder {
 						return t
@@ -613,7 +850,7 @@ func (c *InMemory) FindHashPartitionForValue(parentOID uint32, keyValue string) 
 			}
 		}
 	}
-	return nil
+	return defaultPart // fall back to DEFAULT partition
 }
 
 // HasDatabase reports whether the given database name is registered
@@ -928,9 +1165,9 @@ func (c *InMemory) registerSystemTables() {
 		out := make([][]string, 0, len(c.tables)+len(c.indexes))
 		for _, k := range keys {
 			t := c.tables[k]
-			if t.Virtual {
-				// Don't list ourselves in our own view — keeps the
-				// regclass probe shape predictable for pgbench.
+			if t.Virtual && t.View == nil && !t.IsMatView {
+				// Skip system-catalog virtual tables (pg_class, pg_locks, etc.)
+				// but include user views (t.View != nil) and materialized views.
 				continue
 			}
 			relkind := "r"
@@ -943,11 +1180,20 @@ func (c *InMemory) registerSystemTables() {
 			if t.IsMatView && !t.IsPopulated {
 				populated = "f"
 			}
+			// Resolve namespace OID from the schema registry.
+			schema := t.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			nsOID := c.schemas[strings.ToLower(schema)]
+			if nsOID == 0 {
+				nsOID = 2200 // default to public
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // oid: numeric OID (M0103-0008 rung 16)
 				t.Name,                       // relname
 				relkind,                      // relkind
-				"2200",                       // relnamespace: OID of public namespace
+				strconv.Itoa(int(nsOID)),     // relnamespace: schema OID
 				"p",                          // relpersistence: permanent
 				"0",                          // reltoastrelid: no TOAST table
 				"0",                          // relpages: estimated page count
@@ -964,17 +1210,28 @@ func (c *InMemory) registerSystemTables() {
 		sort.Strings(idxKeys)
 		for _, k := range idxKeys {
 			idx := c.indexes[k]
+			// Resolve namespace from the index's table.
+			idxNsOID := uint32(2200)
+			if idx.Table != nil {
+				schema := idx.Table.Schema
+				if schema == "" {
+					schema = "public"
+				}
+				if oid := c.schemas[strings.ToLower(schema)]; oid != 0 {
+					idxNsOID = oid
+				}
+			}
 			out = append(out, []string{
-				strconv.Itoa(int(idx.OID)), // oid
-				idx.Name,                   // relname
-				"i",                        // relkind = index
-				"2200",                     // relnamespace
-				"p",                        // relpersistence
-				"0",                        // reltoastrelid
-				"0",                        // relpages
-				"t",                        // relispopulated
-				"0",                        // relnatts
-				"n",                        // relreplident: not applicable for indexes
+				strconv.Itoa(int(idx.OID)),   // oid
+				idx.Name,                     // relname
+				"i",                          // relkind = index
+				strconv.Itoa(int(idxNsOID)), // relnamespace
+				"p",                          // relpersistence
+				"0",                          // reltoastrelid
+				"0",                          // relpages
+				"t",                          // relispopulated
+				"0",                          // relnatts
+				"n",                          // relreplident: not applicable for indexes
 			})
 		}
 		return out
@@ -1000,11 +1257,24 @@ func (c *InMemory) registerSystemTables() {
 		Virtual: true,
 	}
 	pgNamespace.VirtualRows = func() [][]string {
-		return [][]string{
-			{"11", "pg_catalog", "10", ""},
-			{"2200", "public", "10", ""},
-			{"99", "information_schema", "10", ""},
+		c.mu.RLock()
+		schemas := c.allSchemasLocked()
+		c.mu.RUnlock()
+		// Sort by OID for deterministic output.
+		sort.Slice(schemas, func(i, j int) bool { return schemas[i].oid < schemas[j].oid })
+		out := make([][]string, 0, len(schemas))
+		for _, s := range schemas {
+			if s.name == "pg_toast" {
+				continue // skip internal alias
+			}
+			out = append(out, []string{
+				strconv.Itoa(int(s.oid)), // oid
+				s.name,                   // nspname
+				"10",                     // nspowner
+				"",                       // nspacl
+			})
 		}
+		return out
 	}
 	c.tables["pg_catalog.pg_namespace"] = pgNamespace
 
@@ -1302,6 +1572,9 @@ func (c *InMemory) registerSystemTables() {
 		// classid, objid, objsubid, virtualtransaction, pid, mode, granted, fastpath, waitstart
 		rows := [][]string{
 			{"relation", "16384", "1259", "", "", "", "", "", "", "", "1/1", "0", "AccessShareLock", "t", "t", ""},
+		}
+		if RelationLockRowsFunc != nil {
+			rows = append(rows, RelationLockRowsFunc()...)
 		}
 		if AdvisoryLockRowsFunc != nil {
 			rows = append(rows, AdvisoryLockRowsFunc()...)
@@ -2203,6 +2476,72 @@ func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
 // field matches schemaName (case-insensitive).  Virtual/system tables in
 // pg_catalog or information_schema are excluded.  Used by DROP SCHEMA CASCADE
 // to identify objects to cascade-drop. M0097-0020.
+// SchemaExists reports whether a schema with the given name has been registered.
+// Pre-populated with the standard system schemas; user schemas are added by
+// RegisterSchema (called from CREATE SCHEMA). M0097-drop_if_exists.
+func (c *InMemory) SchemaExists(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.schemas[strings.ToLower(name)]
+	return ok
+}
+
+// SchemaOID returns the OID for the given schema name (0 if not found).
+func (c *InMemory) SchemaOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.schemas[strings.ToLower(name)]
+}
+
+// RegisterSchema records a user-created schema. Called from execCreateSchema.
+func (c *InMemory) RegisterSchema(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	if _, ok := c.schemas[lc]; !ok {
+		c.nextOID++
+		c.schemas[lc] = c.nextOID
+	}
+}
+
+// UnregisterSchema removes a schema from the registry. Called from DROP SCHEMA.
+func (c *InMemory) UnregisterSchema(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.schemas, strings.ToLower(name))
+}
+
+// allSchemasLocked returns all (name, oid) pairs. Must be called with mu held.
+func (c *InMemory) allSchemasLocked() []struct{ name string; oid uint32 } {
+	out := make([]struct{ name string; oid uint32 }, 0, len(c.schemas))
+	for name, oid := range c.schemas {
+		out = append(out, struct{ name string; oid uint32 }{name, oid})
+	}
+	return out
+}
+
+// RoleExists reports whether a role with the given name has been registered.
+func (c *InMemory) RoleExists(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.roles[strings.ToLower(name)]
+	return ok
+}
+
+// RegisterRole records a user-created role. Called from CREATE ROLE/USER.
+func (c *InMemory) RegisterRole(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.roles[strings.ToLower(name)] = struct{}{}
+}
+
+// UnregisterRole removes a role from the registry. Called from DROP ROLE.
+func (c *InMemory) UnregisterRole(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.roles, strings.ToLower(name))
+}
+
 func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -2405,6 +2744,24 @@ func (c *InMemory) AllTables() []*Table {
 	return out
 }
 
+// AllUserViews returns deep copies of every user-created non-materialized view.
+// Used by DROP VIEW CASCADE dependency scanning. M0097-0021.
+func (c *InMemory) AllUserViews() []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*Table, 0)
+	for _, t := range c.tables {
+		if !t.Virtual || t.View == nil || t.IsMatView {
+			continue
+		}
+		cp := *t
+		cp.Columns = append([]Column(nil), t.Columns...)
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
 // FKRef pairs a child table with one of its FK constraints that
 // references a given parent table. M0096-0011.
 type FKRef struct {
@@ -2595,6 +2952,25 @@ func (c *InMemory) RegisterCompositeType(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.compositeTypeNames[k] = true
+}
+
+// RegisterCompositeTypeWithFields records a composite type together with its
+// ordered field list, enabling PL/pgSQL field access/assignment. M0097-composite.
+func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []CompositeField) {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.compositeTypeNames[k] = true
+	c.compositeTypeFields[k] = fields
+}
+
+// LookupCompositeTypeFields returns the ordered field list for a composite type,
+// or nil if the type is not known or has no field metadata. M0097-composite.
+func (c *InMemory) LookupCompositeTypeFields(name string) []CompositeField {
+	k := strings.ToLower(name)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.compositeTypeFields[k]
 }
 
 // DropCompositeType removes a composite type name. Returns an error if not

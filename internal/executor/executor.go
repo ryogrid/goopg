@@ -24,6 +24,10 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newValuesOp(p)), nil
 	case *planner.GenerateSeries:
 		return maybeInstrument(p, newGenerateSeriesOp(p)), nil
+	case *planner.GenerateSubscripts:
+		return maybeInstrument(p, newGenerateSubscriptsOp(p)), nil
+	case *planner.FromUnnest:
+		return maybeInstrument(p, newFromUnnestOp(p)), nil
 	case *planner.PgInputErrorInfo:
 		return maybeInstrument(p, newPgInputErrorInfoOp(p)), nil
 	case *planner.PgGetPublicationTables:
@@ -39,14 +43,12 @@ func Build(plan planner.Node) (Operator, error) {
 	case *planner.ScalarFuncScan:
 		return maybeInstrument(p, newScalarFuncScanOp(p)), nil
 	case *planner.CTEScan:
-		// CTEScan is a labeling wrap from M0016-0004 — Stage A
-		// inlines the CTE body under the wrap, so executing it
-		// is just executing the child. The wrap exists so EXPLAIN
-		// can surface the CTE name; runtime semantics are
-		// identical to the child. The recursive Build wraps the
-		// child, so the CTEScan layer doesn't need its own
-		// instrumented row.
-		return Build(p.Child)
+		// CTEScan wraps the inlined CTE body. Use cteScanOp which materializes
+		// all rows on first Open() and replays them on subsequent Open() calls
+		// (same CTE name, same ctx.CTERowCache). This implements PostgreSQL's
+		// CTE optimization-fence: a volatile CTE (e.g. random()) produces the
+		// same rows regardless of how many times it is referenced. M0097-0099.
+		return newCteScanOp(p)
 	case *planner.CTEDMLPrefix:
 		return newCTEDMLPrefixOp(p), nil
 	case *planner.MaterializedCTEScan:

@@ -261,8 +261,55 @@ type SubqueryExpr struct {
 	IsNonCorrelated bool
 }
 
+// ArraySubqueryExpr represents ARRAY(SELECT ...) — collects all rows of the
+// inner plan (must be single-column) into a PostgreSQL text-array. M0097-0127.
+type ArraySubqueryExpr struct {
+	pos             int
+	Plan            Node
+	IsNonCorrelated bool
+}
+
+// CollateExpr wraps an expression with an explicit collation name for
+// mismatch detection in WITHIN GROUP ORDER BY validation. M0097-0127.
+type CollateExpr struct {
+	pos           int
+	Operand       Expr
+	CollationName string
+}
+
+func (e *CollateExpr) Pos() int { return e.pos }
+func (*CollateExpr) exprNode()  {}
+
+func (e *ArraySubqueryExpr) Pos() int { return e.pos }
+func (*ArraySubqueryExpr) exprNode()  {}
+
 func (e *SubqueryExpr) Pos() int { return e.pos }
 func (*SubqueryExpr) exprNode()  {}
+
+// MultiAssignSubqRow represents a multi-column sub-SELECT used on the RHS of
+// a tuple SET assignment: SET (a, b) = (SELECT x, y FROM …).
+// A single MultiAssignSubqRow is shared by all MultiAssignSubqElem expressions
+// for the same assignment; the executor evaluates the subquery once per row and
+// caches the result tuple in Context.MultiAssignSubqCache keyed by this pointer.
+type MultiAssignSubqRow struct {
+	pos             int
+	Plan            Node
+	NCols           int  // expected number of output columns
+	IsNonCorrelated bool
+}
+
+func (e *MultiAssignSubqRow) Pos() int { return e.pos }
+func (*MultiAssignSubqRow) exprNode()  {}
+
+// MultiAssignSubqElem extracts one column from a MultiAssignSubqRow result.
+type MultiAssignSubqElem struct {
+	pos    int
+	Row    *MultiAssignSubqRow
+	ColIdx int // 0-based index into the subquery result row
+}
+
+func (e *MultiAssignSubqElem) Pos() int { return e.pos }
+func (*MultiAssignSubqElem) exprNode()  {}
 
 // CaseWhen mirrors parser.CaseWhen with planner-resolved
 // expressions in place of parser-AST nodes.
@@ -510,6 +557,11 @@ type IndexOnlyScan struct {
 	Table   *catalog.Table
 	Index   *catalog.Index
 	Key     Expr
+	// Keys mirrors IndexScan.Keys: a full multi-column equality probe
+	// (one Expr per Index.Columns entry, in declared order). When set,
+	// takes priority over Key. Carries the M0054-0006 composite probe
+	// across IOS promotion so multi-column equality stays index-only.
+	Keys    []Expr
 	LowKey  Expr
 	HighKey Expr
 	// Covered is the slice of catalog.Column entries that the output schema
@@ -606,14 +658,39 @@ type AggregateCall struct {
 	pos      int
 	Name     string
 	Arg      Expr // nil for count(*)
-	Star     bool
-	Distinct bool
-	Type     catalog.Type
+	Arg2     Expr // second arg for two-argument aggregates (regr_*, covar_*, corr)
+	// ExtraArgs holds the 3rd and subsequent arguments for user-defined
+	// multi-arg aggregates (e.g. aggfns(a, b, c) where Arg=a, Arg2=b, ExtraArgs=[c]).
+	ExtraArgs []Expr
+	Star      bool
+	Distinct  bool
+	Type      catalog.Type
+	// InputType is the type of the primary argument expression, used for
+	// precision-sensitive aggregates (e.g. float4 sum/variance use float32 semantics).
+	InputType catalog.Type
+	// WithinGroupKeyType is the type of the first ORDER BY column in WITHIN GROUP
+	// ordered-set aggregates. Used for percentile_cont float32 precision rounding.
+	WithinGroupKeyType catalog.Type
 	// Filter is the resolved FILTER (WHERE ...) predicate. M0097-0007.
 	Filter Expr
 	// OrderBy is the ORDER BY clause inside the aggregate call, e.g.
 	// array_agg(x ORDER BY y). Only used for ordering-sensitive aggregates.
 	OrderBy []SortKey
+	// WithinGroup is true when this is an ordered-set aggregate using
+	// WITHIN GROUP (ORDER BY ...) syntax. M0097-0035.
+	WithinGroup bool
+	// WithinGroupOrderBy holds the sort keys from WITHIN GROUP (ORDER BY ...).
+	// The executor accumulates these per-row values, sorts them, and then
+	// applies the aggregate function (percentile_cont/disc, rank, etc.).
+	WithinGroupOrderBy []SortKey
+	// UserAgg is non-nil for user-defined aggregates registered via
+	// CREATE AGGREGATE. The executor uses it to call sfunc/finalfunc.
+	UserAgg *catalog.UserAggregate
+	// SharedStateSlot is the index into aggregateOp.sharedUserStates for
+	// user-defined aggregates that share transition state (same sfunc/stype/args/distinct/filter).
+	// -1 means no sharing. When ≥ 0, applyAgg uses the shared slot instead of
+	// the per-call aggRuntime.userState. M0097-0035.
+	SharedStateSlot int
 }
 
 func (a AggregateCall) Pos() int { return a.pos }
@@ -840,10 +917,34 @@ type GenerateSeries struct {
 func (n *GenerateSeries) Pos() int       { return n.pos }
 func (n *GenerateSeries) Output() Schema { return n.schema }
 
+// GenerateSubscripts produces subscript integers 1..array_length for
+// generate_subscripts(anyarray, dim[, reverse]) in the FROM clause. M0097-0117.
+type GenerateSubscripts struct {
+	pos      int
+	ArrExpr  Expr
+	Dim      Expr
+	Reversed Expr // optional; nil = false
+	schema   Schema
+}
+
+func (n *GenerateSubscripts) Pos() int       { return n.pos }
+func (n *GenerateSubscripts) Output() Schema { return n.schema }
+
 // PgInputErrorInfo implements pg_input_error_info(value, type) as a
 // set-returning function in the FROM clause. Returns 0 rows if the
 // input is valid, or 1 row with (message, detail, hint, sql_error_code)
 // if it is invalid. M0097-0003.
+// FromUnnest expands an array expression into one row per element in the
+// FROM clause: `FROM unnest(arr_expr) alias(col)`. M0097-0035.
+type FromUnnest struct {
+	pos     int
+	ArrExpr Expr
+	schema  Schema
+}
+
+func (n *FromUnnest) Pos() int       { return n.pos }
+func (n *FromUnnest) Output() Schema { return n.schema }
+
 type PgInputErrorInfo struct {
 	pos    int
 	Value  Expr
@@ -886,6 +987,13 @@ type SrfCol struct {
 	Step   Expr // generate_series step arg (nil → step 1)
 }
 
+// UnnestCol represents an unnest(array) SRF column in a SELECT list. M0097-0106.
+type UnnestCol struct {
+	ColIdx   int    // which output column this SRF fills
+	ArrExpr  Expr   // the array argument
+	CastType string // cast each element to this type (e.g. "int4"), empty=no cast. M0097-0035.
+}
+
 // UserSrfCol describes one user-defined SETOF SQL function call in the SELECT
 // target list. The executor calls the function body and collects all rows.
 // M0097-0020.
@@ -907,6 +1015,7 @@ type ProjectSet struct {
 	// together, repeating OtherExprs for each step. The output schema
 	// covers both SRF and non-SRF columns.
 	SrfCols     []SrfCol     // one per generate_series call in target list
+	UnnestCols  []UnnestCol  // one per unnest(array) call in target list. M0097-0106.
 	UserSrfCols []UserSrfCol // one per user-defined SETOF function call. M0097-0020.
 	OtherExprs  []Expr       // non-SRF target expressions; nil slot = SRF slot
 }
@@ -1117,7 +1226,7 @@ type Update struct {
 	// matching rows. Set expressions are also evaluated against the
 	// combined (target ++ from...) row.
 	FromTables    []*catalog.Table
-	FromScans     []*SeqScan // one per FROM table
+	FromScans     []Node // one per FROM table (may be SeqScan or subquery node)
 	FromSchema    Schema     // combined schema of all FROM tables
 	FromPred      Expr       // WHERE predicate over combined row (nil = no filter)
 }
@@ -1133,6 +1242,16 @@ type Delete struct {
 	Child           Node
 	Returning       []Expr
 	ReturningSchema Schema
+	// DELETE … USING (M0097-0076): additional source tables.
+	// Same semantics as Update.FromTables: when non-empty the executor
+	// iterates all USING tables as a nested-loop cross-product against
+	// the target scan and applies UsingPred (which may reference both
+	// target and USING columns) to select matching victim rows.
+	// RETURNING may reference USING columns via the combined row.
+	UsingTables []*catalog.Table
+	UsingScans  []Node // one per USING table (may be SeqScan or subquery node)
+	UsingSchema Schema
+	UsingPred   Expr
 }
 
 func (n *Delete) Pos() int       { return n.pos }

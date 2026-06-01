@@ -104,17 +104,23 @@ func TestExecCreateOrReplaceFunctionUpdatesBody(t *testing.T) {
 }
 
 // TestExecCreateFunctionRejectsUnsupportedLanguage pins the
-// language-allowlist diagnostic. The Stage A executor only
-// accepts plpgsql / sql; anything else surfaces SQLSTATE 42704
-// "undefined object" with a specific message.
+// language-allowlist diagnostic. The Stage A executor accepts plpgsql, sql,
+// and c (C-stub); other languages surface SQLSTATE 42704.
 func TestExecCreateFunctionRejectsUnsupportedLanguage(t *testing.T) {
 	cat := catalog.NewInMemory()
+	// LANGUAGE C is now accepted as a stub — must not error.
+	if err := runRoutineDDL(t,
+		`CREATE FUNCTION f() RETURNS bool LANGUAGE c AS ''`,
+		cat); err != nil {
+		t.Fatalf("LANGUAGE C should be accepted as stub, got err=%v", err)
+	}
+	// Other unsupported languages still surface 42704.
 	err := runRoutineDDL(t,
-		`CREATE FUNCTION f() RETURNS int LANGUAGE c AS $$ noop $$`,
+		`CREATE FUNCTION g() RETURNS int LANGUAGE python3 AS $$ pass $$`,
 		cat)
 	ee, ok := err.(*ExecError)
 	if !ok || ee.Code != "42704" {
-		t.Fatalf("got err=%v, want ExecError SQLSTATE 42704", err)
+		t.Fatalf("got err=%v, want ExecError SQLSTATE 42704 for python3", err)
 	}
 }
 

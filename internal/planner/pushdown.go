@@ -246,7 +246,7 @@ func walkColumnRefs(e Expr, onIdx func(int), onOuter func()) {
 		onIdx(x.Index)
 	case *OuterColumnRef:
 		onOuter()
-	case *SubqueryExpr, *ExistsExpr:
+	case *SubqueryExpr, *ExistsExpr, *MultiAssignSubqElem, *MultiAssignSubqRow:
 		// Subqueries can reference outer columns; treat as out
 		// of scope rather than walking into the inner plan.
 		onOuter()

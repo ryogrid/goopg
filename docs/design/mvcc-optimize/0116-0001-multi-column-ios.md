@@ -183,6 +183,40 @@ the loop can advance `off` by a constant without a length prefix.
 Integration: wire a `lineitem`-style table with `(l_orderkey int4, l_linenumber int4)`
 composite PK and verify IOS is chosen and returns correct results.
 
+### 5.1 Runtime gaps uncovered by tests (M0116-0003, 2026-05-29)
+
+Writing the four tests above against the M0116-0001/0002 code revealed three
+runtime gaps that the original design did not explicitly call out. All three
+are now fixed:
+
+1. **Fixed-width decoder slice discipline.** `decodeIndexKeyColumn` originally
+   passed the whole remaining key slice (e.g. 8 bytes on a `(int4, int4)`
+   composite) into `btree.DecodeInt4`, which asserts `len(b) == 4` and rejects
+   anything else. From the single-column path this was fine; from the
+   multi-column loop it discarded every row. The dispatch now slices
+   `key[:width]` per fixed-width branch (int4 / int8 / float8 / timestamp) and
+   bounds-checks before delegating.
+
+2. **`Keys` carried through IOS promotion.** `IndexScan.Keys` (the M0054-0006
+   composite-equality probe vector) was not copied into the promoted
+   `IndexOnlyScan`. The struct gains `Keys []Expr`,
+   `tryPromoteIndexOnlyScan` copies it, and `indexOnlyScanOp.Open` adds a
+   `len(Keys) > 0` branch that calls a new `lookupKeys` helper mirroring
+   `indexScanOp.lookupKeys`. Without this, a full equality probe like
+   `WHERE a = 1 AND b = 20` against a composite `(a, b)` index would
+   degenerate to a leading-column-only probe plus a residual filter — still
+   correct under the *single-column* IOS heuristic, but it would have been
+   wrong as soon as the planner started using composite `Keys` for IOS.
+
+3. **No silent decode failures.** The fast-path scan callback used
+   `if err == nil { append }`, masking any future decode bug as a missing
+   row. It now propagates an XX000 `ExecError` from the scan, matching the
+   convention the rest of the executor follows.
+
+These three fixes are landed alongside the M0116-0003 tests so the test
+suite actually validates the multi-column IOS end-to-end correctness story
+on top of the planner and decoder changes.
+
 ---
 
 ## 6. Performance Expectations

@@ -105,6 +105,10 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 			stmt.Body = "SELECT " + strings.Join(bodyToks, " ")
 			sawAs = true
 		case p.isFunctionAttribute():
+			// Detect STRICT / RETURNS NULL ON NULL INPUT — M0097-0035.
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "strict") {
+				stmt.Strict = true
+			}
 			// Consume IMMUTABLE/VOLATILE/STABLE/STRICT/SECURITY DEFINER
 			// and other function attributes; they have no runtime effect
 			// in goopg but must be parsed to reach the AS $$body$$ clause.
@@ -232,7 +236,15 @@ func (p *parser) parseFunctionArg() (FunctionArg, error) {
 	pos := p.cur().Pos
 	arg := FunctionArg{pos: pos, Mode: FuncArgIn}
 
-	// Reject Stage B mode keywords for functions (but not procedures).
+	// Accept VARIADIC parameter mode — treat as IN for execution purposes.
+	// The function body receives variadic args as a bundled array ($N). M0097-0117.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwVariadic {
+		p.advance()
+		arg.Mode = FuncArgVariadic
+		return p.parseArgNameAndType(pos, arg)
+	}
+
+	// Reject other Stage B mode keywords for functions (but not procedures).
 	if err := p.rejectStageBModes(pos); err != nil {
 		return FunctionArg{}, err
 	}

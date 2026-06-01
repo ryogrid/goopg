@@ -124,6 +124,12 @@ func (o *recursiveUnionOp) Next() (TupleSlot, error) {
 		}
 		iterRows := make([]Row, 0)
 		for {
+			// Check context cancellation (statement timeout) periodically
+			// so LIMIT propagation works even within a long recursive iteration.
+			if err := o.ctx.Ctx.Err(); err != nil {
+				o.recursive.Close()
+				return nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
 			slot, err := o.recursive.Next()
 			if err == EOF {
 				break

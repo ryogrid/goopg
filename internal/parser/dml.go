@@ -408,6 +408,51 @@ func (p *parser) parseAssignList() ([]UpdateAssign, error) {
 
 func (p *parser) parseAssign() (UpdateAssign, error) {
 	pos := p.cur().Pos
+	// Multi-column tuple assignment: (c1, c2, ...) = (e1, e2, ...) or subquery.
+	// Detected by a leading '(' that starts a column-name list.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance() // consume '('
+		cols, err := p.parseColumnNameList()
+		if err != nil {
+			return UpdateAssign{}, err
+		}
+		if !p.acceptSymbol(")") {
+			return UpdateAssign{}, p.errAtCur("expected ')'")
+		}
+		if p.cur().Kind != TokenOperator || p.cur().Value != "=" {
+			return UpdateAssign{}, p.errAtCur("expected '='")
+		}
+		p.advance() // consume '='
+		// RHS: either a row constructor (e1, e2, ...) allowing DEFAULT,
+		// or a subquery.  We handle the parenthesised-list form manually
+		// so that bare DEFAULT keywords are accepted inside the tuple.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			// Peek ahead: if the next token looks like a SELECT keyword it's
+			// a subquery; otherwise parse as a VALUES-style row (allows DEFAULT).
+			next := p.peek(1)
+			if next.Kind == TokenKeyword && (next.Keyword == KwSelect || next.Keyword == KwWith) {
+				expr, err := p.parseExpr()
+				if err != nil {
+					return UpdateAssign{}, err
+				}
+				return UpdateAssign{pos: pos, Columns: cols, Expr: expr}, nil
+			}
+			// Parse parenthesised element list with DEFAULT support.
+			rhsPos := p.cur().Pos
+			elems, err := p.parseValuesRow()
+			if err != nil {
+				return UpdateAssign{}, err
+			}
+			return UpdateAssign{pos: pos, Columns: cols, Expr: &RowExpr{pos: rhsPos, Elems: elems}}, nil
+		}
+		// Subquery or other expression (no paren at start).
+		expr, err := p.parseExpr()
+		if err != nil {
+			return UpdateAssign{}, err
+		}
+		return UpdateAssign{pos: pos, Columns: cols, Expr: expr}, nil
+	}
+	// Single-column form (existing code).
 	col, err := p.parseIdent()
 	if err != nil {
 		return UpdateAssign{}, err
@@ -447,6 +492,23 @@ func (p *parser) parseDelete() (Stmt, error) {
 		return nil, err
 	}
 	stmt := &DeleteStmt{pos: t.Pos, Target: target}
+	// Optional USING clause (PostgreSQL extension). M0097-0076.
+	if p.acceptKeyword(KwUsing) {
+		var using []RangeVar
+		rv, err := p.parseRangeVar()
+		if err != nil {
+			return nil, err
+		}
+		using = append(using, rv)
+		for p.acceptSymbol(",") {
+			rv, err := p.parseRangeVar()
+			if err != nil {
+				return nil, err
+			}
+			using = append(using, rv)
+		}
+		stmt.Using = using
+	}
 	if p.acceptKeyword(KwWhere) {
 		// WHERE CURRENT OF cursor — positioned delete. M0097-0069.
 		if p.acceptIdentKeyword("current") && p.acceptKeyword(KwOf) {

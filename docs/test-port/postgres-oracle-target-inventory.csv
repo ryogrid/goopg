@@ -109,7 +109,7 @@ regress-sql,regress,postgres/src/test/regress/sql/jsonb_jsonpath.sql,postgres/sr
 regress-sql,regress,postgres/src/test/regress/sql/jsonpath.sql,postgres/src/test/regress/sql/jsonpath.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/jsonpath_encoding.sql,postgres/src/test/regress/sql/jsonpath_encoding.sql,excluded,JSONPath encoding; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/largeobject.sql,postgres/src/test/regress/sql/largeobject.sql,excluded,Large object; out of scope for goopg v0.
-regress-sql,regress,postgres/src/test/regress/sql/limit.sql,postgres/src/test/regress/sql/limit.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
+regress-sql,regress,postgres/src/test/regress/sql/limit.sql,postgres/src/test/regress/sql/limit.sql,port,PASS via TestPort_RegressSuite — lateral OFFSET outer-ref fix (M0097-0126)
 regress-sql,regress,postgres/src/test/regress/sql/line.sql,postgres/src/test/regress/sql/line.sql,excluded,Geometric type; out of scope for goopg v0.
 regress-sql,regress,postgres/src/test/regress/sql/lock.sql,postgres/src/test/regress/sql/lock.sql,failed,Attempted via TestPort_RegressSuite; output diverges from expected — M0097-0003 scope
 regress-sql,regress,postgres/src/test/regress/sql/lseg.sql,postgres/src/test/regress/sql/lseg.sql,excluded,Geometric type; out of scope for goopg v0.

@@ -708,11 +708,15 @@ func (p *bodyParser) parseDeclaration() (*Declaration, error) {
 // assignment to the trigger's new-row column (BEFORE triggers in PG can
 // rewrite NEW.*); for `OLD.field` it is a no-op (OLD is immutable).
 // M0096-0012; NEW-write path added M0100-0005p.
-func (p *bodyParser) parseAssign() (*AssignStmt, error) {
+func (p *bodyParser) parseAssign() (Stmt, error) {
 	nameTok := p.advance()
 	// Handle dotted target: `ident.field ...`.
 	if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "." {
 		return p.parseDottedExprStmt(nameTok)
+	}
+	// Handle array subscript assignment: `x[idx] := value;`.
+	if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "[" {
+		return p.parseArraySubscriptAssign(nameTok)
 	}
 	isAssign := false
 	if p.cur().Kind == parser.TokenOperator && p.cur().Value == ":=" {
@@ -780,6 +784,20 @@ func (p *bodyParser) parseDottedExprStmt(nameTok parser.Token) (*AssignStmt, err
 		}
 		return &AssignStmt{pos: pos, Target: "_" + prefix + "_" + strings.ToLower(field), Value: expr}, nil
 	}
+	// Composite type field assignment: varName.fieldName := expr
+	// Emit as AssignStmt with target "varname\x00fieldname" so the runtime
+	// can distinguish it from a plain variable assignment. M0097-composite.
+	if isAssign && prefix != "new" && prefix != "old" {
+		p.advance() // consume ':=' or '='
+		expr, err := p.scanExprToSemicolon("assignment value")
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(";") {
+			return nil, p.errAtCur("expected ';' to terminate assignment")
+		}
+		return &AssignStmt{pos: pos, Target: prefix + "\x00" + strings.ToLower(field), Value: expr}, nil
+	}
 	// Unrelated dotted refs / non-assign expressions: swallow to ';' and
 	// emit the noop sentinel — preserves the M0096-0012 behaviour.
 	for p.cur().Kind != parser.TokenEOF {
@@ -790,6 +808,84 @@ func (p *bodyParser) parseDottedExprStmt(nameTok parser.Token) (*AssignStmt, err
 		p.advance()
 	}
 	return &AssignStmt{pos: pos, Target: "_plpgsql_noop", Value: &parser.IntegerConst{}}, nil
+}
+
+// parseArraySubscriptAssign parses `x[subscript] := value;` in PL/pgSQL.
+func (p *bodyParser) parseArraySubscriptAssign(nameTok parser.Token) (*ArraySubscriptAssignStmt, error) {
+	pos := nameTok.Pos
+	p.advance() // consume '['
+	subscriptToks, err := p.scanToMatchingBracket()
+	if err != nil {
+		return nil, err
+	}
+	p.advance() // consume ']'
+	isAssign := false
+	if p.cur().Kind == parser.TokenOperator && p.cur().Value == ":=" {
+		isAssign = true
+	} else if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "=" {
+		isAssign = true
+	}
+	if !isAssign {
+		return nil, p.errAtCur("expected ':=' or '=' after array subscript")
+	}
+	p.advance() // consume ':=' or '='
+	valueExpr, err := p.scanExprToSemicolon("array subscript assignment value")
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptSymbol(";") {
+		return nil, p.errAtCur("expected ';' to terminate array subscript assignment")
+	}
+	subscriptExpr, perr := parseExprFromTokens(subscriptToks)
+	if perr != nil {
+		return nil, p.errAt(pos, "invalid array subscript: %v", perr)
+	}
+	return &ArraySubscriptAssignStmt{
+		pos:       pos,
+		VarName:   strings.ToLower(nameTok.Value),
+		Subscript: subscriptExpr,
+		Value:     valueExpr,
+	}, nil
+}
+
+// scanToMatchingBracket scans tokens until the matching ']' (handling nesting).
+// Returns tokens between '[' and ']' exclusive; caller has already consumed '['.
+func (p *bodyParser) scanToMatchingBracket() ([]parser.Token, error) {
+	var toks []parser.Token
+	depth := 1
+	for {
+		t := p.cur()
+		if t.Kind == parser.TokenEOF {
+			return nil, p.errAtCur("unexpected EOF inside array subscript")
+		}
+		if t.Kind == parser.TokenSymbol {
+			if t.Value == "[" {
+				depth++
+			} else if t.Value == "]" {
+				depth--
+				if depth == 0 {
+					return toks, nil
+				}
+			}
+		}
+		toks = append(toks, t)
+		p.advance()
+	}
+}
+
+// parseExprFromTokens parses a single SQL expression from a token slice.
+// Reconstructs the source text from tokens and delegates to parser.ParseExpr.
+func parseExprFromTokens(toks []parser.Token) (parser.Expr, error) {
+	if len(toks) == 0 {
+		return nil, fmt.Errorf("empty subscript")
+	}
+	// Reconstruct the source from token values and parse as a SQL expression.
+	src := ""
+	for _, t := range toks {
+		src += t.Value + " "
+	}
+	src = strings.TrimSpace(src)
+	return parser.ParseExpr(src)
 }
 
 // parseSQLStmt captures an embedded SQL statement (INSERT / UPDATE / DELETE /
@@ -961,6 +1057,15 @@ func (p *bodyParser) parseTypeRef() (parser.ColumnType, error) {
 		endPos = t.Pos + len(t.Value)
 	}
 	consume() // first ident
+	// Handle `varname%TYPE` — consume and use text as stand-in type.
+	// % is tokenized as TokenOperator by the SQL lexer.
+	if p.cur().Kind == parser.TokenOperator && p.cur().Value == "%" {
+		p.advance() // consume '%'
+		if p.cur().Kind == parser.TokenIdent && strings.EqualFold(p.cur().Value, "type") {
+			p.advance() // consume 'TYPE'
+		}
+		return parser.ColumnType{Name: "text"}, nil
+	}
 	if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "." {
 		consume()
 		if p.cur().Kind != parser.TokenIdent {

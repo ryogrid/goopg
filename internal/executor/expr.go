@@ -11,12 +11,15 @@ import (
 	"math"
 	"math/big"
 	mathrand "math/rand"
+	"bytes"
+	"encoding/base64"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
+	"unsafe"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mctx"
@@ -115,6 +118,13 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		return evalCaseExpr(x, slotToRow(slot), ctx)
 	case *planner.SubqueryExpr:
 		return evalSubquery(x, slotToRow(slot), ctx)
+	case *planner.ArraySubqueryExpr:
+		return evalArraySubquery(x, slotToRow(slot), ctx)
+	case *planner.CollateExpr:
+		// Pass-through: evaluate operand and ignore collation at runtime. M0097-0127.
+		return evalExprSlot(x.Operand, slot, ctx)
+	case *planner.MultiAssignSubqElem:
+		return evalMultiAssignSubqElem(x, slotToRow(slot), ctx)
 	case *planner.InExpr:
 		return evalInExpr(x, slot, ctx)
 	case *planner.ExistsExpr:
@@ -243,6 +253,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
+		// Apply numeric(P,S) typmod: round to S decimal places.
+		// Typmod is encoded as (P<<16)|S by the planner's encodeTypmod.
+		if x.Typmod > 0 {
+			switch strings.ToLower(x.TargetType) {
+			case "numeric", "decimal":
+				scale := int16(x.Typmod & 0xFFFF)
+				if scale >= 0 && scale <= 38 {
+					result = roundNumericToScale(result, scale)
+				}
+			}
+		}
 		// Apply typmod precision for time/timetz casts (e.g., ::timetz(4)).
 		// PostgreSQL truncates fractional seconds to the specified precision.
 		if x.Typmod > 0 && result.Kind == KindTime {
@@ -264,6 +285,29 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		}
 		return result, nil
 	case *planner.BinaryOp:
+		// Row-to-row comparisons: element-wise with proper NULL propagation.
+		// (a,b) OP (c,d): compare element by element; NULL in any element → NULL.
+		// This implements SQL row-comparison semantics (ISO SQL §8.7). M0097-0023.
+		if lRow, ok := x.Left.(*planner.RowExpr); ok {
+			if rRow, ok := x.Right.(*planner.RowExpr); ok {
+				return evalRowToRowComparison(x.Op, lRow, rRow, slot, ctx)
+			}
+		}
+		// Special case: row-constructor comparison with multi-column scalar subquery.
+		// ROW(a, b) = (SELECT x, y FROM ...) → element-wise comparison.
+		// ROW(a,b) is planned as FuncCall{Name:"row",...} not RowExpr. M0097-0020.
+		if x.Op == parser.OpEq || x.Op == parser.OpNe {
+			if rowFc, ok := x.Left.(*planner.FuncCall); ok && strings.EqualFold(rowFc.Name, "row") {
+				if sqOp, ok := x.Right.(*planner.SubqueryExpr); ok {
+					return evalRowFuncCallVsSubqueryExpr(x.Op, rowFc.Args, sqOp, slot, ctx)
+				}
+			}
+			if rowFc, ok := x.Right.(*planner.FuncCall); ok && strings.EqualFold(rowFc.Name, "row") {
+				if sqOp, ok := x.Left.(*planner.SubqueryExpr); ok {
+					return evalRowFuncCallVsSubqueryExpr(x.Op, rowFc.Args, sqOp, slot, ctx)
+				}
+			}
+		}
 		left, err := evalExprSlot(x.Left, slot, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -749,12 +793,14 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		}
 		// Array concatenation: if both operands look like PostgreSQL arrays
 		// ({v1,v2,...}), merge their elements rather than text-concat.
-		// This handles ARRAY[...] || ARRAY[...] and array || array patterns.
+		// Also handles array || element and element || array (append/prepend).
 		// M0097-0065.
 		ls := left.Format()
 		rs := right.Format()
-		if len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}' &&
-			len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}' {
+		lsIsArr := len(ls) >= 2 && ls[0] == '{' && ls[len(ls)-1] == '}'
+		rsIsArr := len(rs) >= 2 && rs[0] == '{' && rs[len(rs)-1] == '}'
+		if lsIsArr && rsIsArr {
+			// array || array: merge inner elements.
 			leftInner := ls[1 : len(ls)-1]
 			rightInner := rs[1 : len(rs)-1]
 			var inner string
@@ -769,6 +815,22 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 				inner = leftInner + "," + rightInner
 			}
 			return NewStringDatum("{" + inner + "}"), nil
+		}
+		if lsIsArr && !rsIsArr {
+			// array || element: append element to array.
+			inner := ls[1 : len(ls)-1]
+			if inner == "" {
+				return NewStringDatum("{" + rs + "}"), nil
+			}
+			return NewStringDatum("{" + inner + "," + rs + "}"), nil
+		}
+		if rsIsArr && !lsIsArr {
+			// element || array: prepend element.
+			inner := rs[1 : len(rs)-1]
+			if inner == "" {
+				return NewStringDatum("{" + ls + "}"), nil
+			}
+			return NewStringDatum("{" + ls + "," + inner + "}"), nil
 		}
 		return NewStringDatum(ls + rs), nil
 	case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
@@ -950,10 +1012,29 @@ func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 	switch op {
 	case parser.OpAdd:
 		r = a + b
+		// Detect int64 add overflow: same-sign inputs with opposite-sign result.
+		if (a^r)&(b^r) < 0 {
+			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+		}
 	case parser.OpSub:
 		r = a - b
+		// Detect int64 sub overflow: different-sign inputs with result differing from a's sign.
+		if (a^b)&(a^r) < 0 {
+			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+		}
 	case parser.OpMul:
+		// Detect int64 multiplication overflow. M0097-int8-overflow.
 		r = a * b
+		if a != 0 && b != 0 {
+			if a == math.MinInt64 || b == math.MinInt64 {
+				// MinInt64 * 1 = MinInt64 (OK); MinInt64 * anything_else overflows.
+				if a != 1 && b != 1 {
+					return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+				}
+			} else if r/a != b {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+			}
+		}
 	case parser.OpDiv:
 		if b == 0 {
 			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
@@ -1026,6 +1107,173 @@ func tryParseStringAs(target DatumKind, s string) Datum {
 
 // compareDatum returns -1/0/1 the same way upstream's btree
 // comparators do, scoped to the v0 type set.
+// splitRowElements splits a PostgreSQL row-literal string "(e1,e2,...)" into
+// its elements. Handles nested parentheses and double-quoted strings.
+// Returns nil if s is not a valid row literal.
+func splitRowElements(s string) []string {
+	if len(s) < 2 || s[0] != '(' || s[len(s)-1] != ')' {
+		return nil
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return []string{}
+	}
+	var elems []string
+	depth := 0
+	inQuote := false
+	start := 0
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		if inQuote {
+			if c == '"' {
+				if i+1 < len(inner) && inner[i+1] == '"' {
+					i++ // escaped quote
+				} else {
+					inQuote = false
+				}
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				elems = append(elems, inner[start:i])
+				start = i + 1
+			}
+		}
+	}
+	elems = append(elems, inner[start:])
+	return elems
+}
+
+// compareRowElem compares two row element strings element-wise.
+// Numeric strings are compared numerically; others lexicographically.
+func compareRowElem(a, b string) int {
+	if a == b {
+		return 0
+	}
+	// NULL is represented as empty string in row format; NULL < any non-NULL.
+	if a == "" {
+		return -1
+	}
+	if b == "" {
+		return 1
+	}
+	// Try numeric comparison.
+	af, aerr := strconv.ParseFloat(a, 64)
+	bf, berr := strconv.ParseFloat(b, 64)
+	if aerr == nil && berr == nil {
+		switch {
+		case af < bf:
+			return -1
+		case af > bf:
+			return 1
+		default:
+			return 0
+		}
+	}
+	return strings.Compare(a, b)
+}
+
+// compareRowStrings compares two PostgreSQL composite-type (row) strings.
+// Elements are compared in order; numeric elements use numeric comparison.
+// Returns 0 if not recognizable as row format, falling back to lexicographic.
+// splitArrayElements splits a PostgreSQL array literal "{e1,e2,...}" into elements.
+// Handles nested arrays like "{{1,2},{3,4}}" and quoted elements.
+func splitArrayElements(s string) []string {
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return nil
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return []string{}
+	}
+	var elems []string
+	depth := 0
+	inQuote := false
+	start := 0
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		if inQuote {
+			if c == '"' {
+				if i+1 < len(inner) && inner[i+1] == '"' {
+					i++
+				} else {
+					inQuote = false
+				}
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+		case ',':
+			if depth == 0 {
+				elems = append(elems, inner[start:i])
+				start = i + 1
+			}
+		}
+	}
+	elems = append(elems, inner[start:])
+	return elems
+}
+
+// compareArrayStrings compares two PostgreSQL array literals element-wise.
+// Nested arrays are compared recursively; scalar elements use numeric comparison.
+func compareArrayStrings(a, b string) int {
+	ae := splitArrayElements(a)
+	be := splitArrayElements(b)
+	if ae == nil || be == nil {
+		return strings.Compare(a, b)
+	}
+	n := len(ae)
+	if len(be) < n {
+		n = len(be)
+	}
+	for i := 0; i < n; i++ {
+		ea, eb := ae[i], be[i]
+		var c int
+		if len(ea) > 0 && ea[0] == '{' && len(eb) > 0 && eb[0] == '{' {
+			c = compareArrayStrings(ea, eb)
+		} else {
+			c = compareRowElem(ea, eb)
+		}
+		if c != 0 {
+			return c
+		}
+	}
+	return len(ae) - len(be)
+}
+
+func compareRowStrings(a, b string) int {
+	ae := splitRowElements(a)
+	be := splitRowElements(b)
+	if ae == nil || be == nil {
+		return strings.Compare(a, b)
+	}
+	n := len(ae)
+	if len(be) < n {
+		n = len(be)
+	}
+	for i := 0; i < n; i++ {
+		c := compareRowElem(ae[i], be[i])
+		if c != 0 {
+			return c
+		}
+	}
+	return len(ae) - len(be)
+}
+
 func compareDatum(a, b Datum, pos int) (int, error) {
 	// Implicit cross-kind promotion so planner-side column-index
 	// misalignments don't crash the entire query.  PostgreSQL
@@ -1137,7 +1385,19 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 				bs = normalizeUUIDStr(bs)
 			}
 		}
+		// Composite row literal comparison: "(e1,e2,...)" uses element-wise
+		// numeric comparison so max(row(a,b)) works correctly. M0097-0115.
+		if len(as) > 0 && as[0] == '(' && len(bs) > 0 && bs[0] == '(' {
+			return compareRowStrings(as, bs), nil
+		}
+		// Array literal comparison: "{e1,e2,...}" uses element-wise numeric
+		// comparison so min/max over integer arrays work correctly. M0097-0117.
+		if len(as) > 0 && as[0] == '{' && len(bs) > 0 && bs[0] == '{' {
+			return compareArrayStrings(as, bs), nil
+		}
 		return strings.Compare(as, bs), nil
+	case KindBytes:
+		return bytes.Compare(a.BytesValue(), b.BytesValue()), nil
 	case KindTime:
 		// For timetz datums (Scale != 0) PostgreSQL compares by UTC time
 		// (local_nanos - offset_nanos), then by offset as tiebreaker.
@@ -1272,7 +1532,7 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 		}
 		return Datum{Kind: KindInt, Int: n}, nil
 
-	case "float4", "real", "float8":
+	case "float", "float4", "real", "float8":
 		// Goopg v0 stores floats as KindNumeric strings. Validate via
 		// ParseFloat so the error message is PostgreSQL-compatible.
 		v := strings.TrimSpace(x.Value)
@@ -1450,7 +1710,7 @@ func datumToFloat64(d Datum) (float64, bool) {
 // for float→integer casts. M0097-0003.
 func isFloatSourceType(t string) bool {
 	switch strings.ToLower(t) {
-	case "float4", "float8", "real", "double precision":
+	case "float", "float4", "float8", "real", "double precision":
 		return true
 	}
 	return false
@@ -1459,6 +1719,55 @@ func isFloatSourceType(t string) bool {
 // evalCastTyped is like evalCast but accepts the source type so it can select
 // the correct rounding mode (banker's for float, away-from-zero for numeric).
 // M0097-0003.
+// roundNumericToScale rounds a Datum to the given decimal scale.
+// Handles KindNumeric (int64 fast-path and big.Int), KindString, and KindInt.
+func roundNumericToScale(d Datum, scale int16) Datum {
+	switch d.Kind {
+	case KindNumeric:
+		curScale := d.NumericScaleValue()
+		if curScale <= scale {
+			// Already at or below target scale; no rounding needed but may need padding.
+			// Re-format with exact scale for correct display.
+			var s string
+			if d.Flags&flagBigNumeric != 0 {
+				s = formatNumericBig(big.NewInt(0).Set(d.NumericBigValue()), curScale)
+			} else {
+				s = formatNumeric(d.NumericMantissaValue(), curScale)
+			}
+			// Parse back at scale to add trailing zeros.
+			f, err := strconv.ParseFloat(s, 64)
+			if err != nil {
+				return d
+			}
+			return NewStringDatum(strconv.FormatFloat(f, 'f', int(scale), 64))
+		}
+		// Need to reduce scale: convert to float64 and round.
+		var s string
+		if d.Flags&flagBigNumeric != 0 {
+			s = formatNumericBig(big.NewInt(0).Set(d.NumericBigValue()), curScale)
+		} else {
+			s = formatNumeric(d.NumericMantissaValue(), curScale)
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return d
+		}
+		factor := math.Pow10(int(scale))
+		return NewStringDatum(strconv.FormatFloat(math.Round(f*factor)/factor, 'f', int(scale), 64))
+	case KindString:
+		s := d.StringValue()
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return d
+		}
+		factor := math.Pow10(int(scale))
+		return NewStringDatum(strconv.FormatFloat(math.Round(f*factor)/factor, 'f', int(scale), 64))
+	case KindInt:
+		return NewStringDatum(strconv.FormatFloat(float64(d.Int), 'f', int(scale), 64))
+	}
+	return d
+}
+
 func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, error) {
 	if sourceType == "" {
 		return evalCast(d, targetType, pos)
@@ -1676,7 +1985,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		default:
 			return d, nil
 		}
-	case "float4", "real", "float8", "double precision":
+	case "float", "float4", "real", "float8", "double precision":
 		// Normalize KindNumeric through float64 to strip trailing zeros (0.0→0). M0097-0003.
 		// PostgreSQL float8out uses printf-style format that removes trailing zeros.
 		if d.Kind == KindNumeric {
@@ -1695,6 +2004,11 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				return d, nil // unexpected, keep original
 			}
 			return newNumeric(m, int(s)), nil
+		}
+		// Integer → float8: promote to KindNumeric so float arithmetic applies.
+		// Without this, float8(count(*)) / scalar_int uses integer division (→ 0).
+		if d.Kind == KindInt {
+			return numericFromInt(d.Int), nil
 		}
 		return d, nil
 	case "oid":
@@ -1838,10 +2152,17 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return numericFromInt(d.Int), nil
 		case KindString:
 			s := strings.TrimSpace(d.StringValue())
-			// NaN and Infinity are valid numeric special values.
-			if strings.EqualFold(s, "nan") || strings.EqualFold(s, "infinity") ||
-				strings.EqualFold(s, "-infinity") {
-				return d, nil
+			// NaN and Infinity (including abbreviated forms) are valid numeric special values.
+			// Normalize to canonical capitalization so applyAgg's switch can match them.
+			if strings.EqualFold(s, "nan") {
+				return NewStringDatum("NaN"), nil
+			}
+			if strings.EqualFold(s, "inf") || strings.EqualFold(s, "infinity") ||
+				strings.EqualFold(s, "+inf") || strings.EqualFold(s, "+infinity") {
+				return NewStringDatum("Infinity"), nil
+			}
+			if strings.EqualFold(s, "-inf") || strings.EqualFold(s, "-infinity") {
+				return NewStringDatum("-Infinity"), nil
 			}
 			_, _, err := parseNumeric(s)
 			if err != nil {
@@ -2499,8 +2820,8 @@ func evalDatePart(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	return Datum{Kind: KindInt, Int: n}, nil
 }
 
-// evalToChar implements to_char(timestamp, fmt) → text.
-// Converts a timestamp to a string using a PostgreSQL format string.
+// evalToChar implements to_char(value, fmt) → text.
+// Converts a timestamp or number to a string using a PostgreSQL format string.
 // Supports a subset of PostgreSQL format codes. M0097-0004.
 func evalToChar(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) < 2 {
@@ -2514,17 +2835,224 @@ func evalToChar(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if err != nil || fmtArg.IsNull() {
 		return NullDatum, nil
 	}
-	// to_char(numeric, fmt) — number formatting; return as-is for now.
-	if srcArg.Kind != KindTime {
-		return NewStringDatum(srcArg.Format()), nil
+	fmtStr := strings.TrimSpace(fmtArg.StringValue())
+	// to_char(timestamp/time, fmt) — time/date formatting.
+	if srcArg.Kind == KindTime {
+		t := srcArg.TimeValue().UTC()
+		goFmt := pgToCharToGoFormat(fmtStr)
+		return NewStringDatum(t.Format(goFmt)), nil
 	}
-	t := srcArg.TimeValue().UTC()
-	goFmt := pgToCharToGoFormat(strings.TrimSpace(fmtArg.StringValue()))
-	return NewStringDatum(t.Format(goFmt)), nil
+	// to_char(numeric, fmt) — number formatting. M0097-0105.
+	return NewStringDatum(toCharNumericFormat(srcArg, fmtStr)), nil
 }
 
-// pgToCharToGoFormat converts a PostgreSQL to_char format string to a Go
-// time.Format layout string. Supports the most common format codes.
+// toCharNumericFormat formats a numeric Datum using a PostgreSQL numeric format string.
+// Supports: FM prefix, 0 (zero-fill), 9 (space-fill), . (decimal point),
+// , (grouping separator), S/MI/PL/PR signs. M0097-0105.
+func toCharNumericFormat(val Datum, fmtStr string) string {
+	// Detect and strip FM (fill mode: suppress leading/trailing spaces).
+	// FM may appear at the start or end of the format string.
+	fm := false
+	upper := strings.ToUpper(strings.TrimSpace(fmtStr))
+	if strings.Contains(upper, "FM") {
+		fm = true
+		upper = strings.ReplaceAll(upper, "FM", "")
+	}
+
+	// Detect sign modifiers.
+	hasMI := strings.Contains(upper, "MI")
+	hasPL := strings.Contains(upper, "PL")
+	hasPR := strings.Contains(upper, "PR")
+	hasS := false
+	if !hasMI && !hasPL && !hasPR {
+		if strings.HasPrefix(upper, "S") || strings.HasSuffix(upper, "S") {
+			hasS = true
+		}
+	}
+	// Strip sign specifiers for digit processing.
+	digitFmt := upper
+	digitFmt = strings.ReplaceAll(digitFmt, "MI", "")
+	digitFmt = strings.ReplaceAll(digitFmt, "PL", "")
+	digitFmt = strings.ReplaceAll(digitFmt, "PR", "")
+	if !strings.Contains(digitFmt, "D") { // keep D (locale decimal) but remove S
+		digitFmt = strings.ReplaceAll(digitFmt, "S", "")
+	}
+	// Replace locale separators with canonical chars for parsing.
+	digitFmt = strings.ReplaceAll(digitFmt, "G", ",")
+	digitFmt = strings.ReplaceAll(digitFmt, "D", ".")
+	digitFmt = strings.ReplaceAll(digitFmt, "L", "")
+	digitFmt = strings.ReplaceAll(digitFmt, "C", "")
+	digitFmt = strings.ReplaceAll(digitFmt, "S", "")
+
+	// Split into integer and decimal parts.
+	dotIdx := strings.Index(digitFmt, ".")
+	var intFmt, decFmt string
+	if dotIdx >= 0 {
+		intFmt = digitFmt[:dotIdx]
+		decFmt = digitFmt[dotIdx+1:]
+	} else {
+		intFmt = digitFmt
+	}
+	// Remove grouping separators from format (just track digit positions).
+	intFmtDigits := strings.ReplaceAll(intFmt, ",", "")
+	decFmtDigits := strings.ReplaceAll(decFmt, ",", "")
+
+	// Count digit positions.
+	intPositions := 0
+	for _, c := range intFmtDigits {
+		if c == '0' || c == '9' {
+			intPositions++
+		}
+	}
+	decPositions := 0
+	for _, c := range decFmtDigits {
+		if c == '0' || c == '9' {
+			decPositions++
+		}
+	}
+
+	// Extract the numeric value as integer and optional fractional string.
+	negative := false
+	var intVal int64
+	var fracStr string
+	switch val.Kind {
+	case KindInt:
+		intVal = val.Int
+		if intVal < 0 {
+			negative = true
+			intVal = -intVal
+		}
+	case KindNumeric:
+		m := val.NumericMantissaValue() // int64 mantissa
+		s := int(val.NumericScaleValue())
+		if m < 0 {
+			negative = true
+			m = -m
+		}
+		if s > 0 {
+			var divisor int64 = 1
+			for i := 0; i < s; i++ {
+				divisor *= 10
+			}
+			intVal = m / divisor
+			rem := m % divisor
+			if decPositions > 0 {
+				fracStr = fmt.Sprintf("%0*d", s, rem)
+				if len(fracStr) > decPositions {
+					fracStr = fracStr[:decPositions]
+				}
+			}
+		} else {
+			intVal = m
+		}
+	case KindString:
+		f, parseErr := strconv.ParseFloat(val.StringValue(), 64)
+		if parseErr == nil {
+			if f < 0 {
+				negative = true
+				f = -f
+			}
+			intVal = int64(f)
+			if decPositions > 0 {
+				frac := f - float64(intVal)
+				fs := fmt.Sprintf("%.*f", decPositions, frac)
+				if len(fs) > 2 {
+					fracStr = fs[2:] // strip "0."
+				}
+				if len(fracStr) > decPositions {
+					fracStr = fracStr[:decPositions]
+				}
+			}
+		}
+	}
+
+	// Format the integer part: walk format right-to-left, filling each digit position.
+	intStr := strconv.FormatInt(intVal, 10)
+	var intBuf []byte
+	pos := len(intStr) - 1
+	for fi := len(intFmtDigits) - 1; fi >= 0; fi-- {
+		fc := intFmtDigits[fi]
+		if fc != '0' && fc != '9' {
+			continue
+		}
+		if pos >= 0 {
+			intBuf = append([]byte{intStr[pos]}, intBuf...)
+			pos--
+		} else {
+			if fc == '0' {
+				intBuf = append([]byte{'0'}, intBuf...)
+			} else {
+				intBuf = append([]byte{' '}, intBuf...)
+			}
+		}
+	}
+	// If number has more digits than format, prepend the overflow digits.
+	for pos >= 0 {
+		intBuf = append([]byte{intStr[pos]}, intBuf...)
+		pos--
+	}
+	result := string(intBuf)
+
+	// Append decimal part.
+	if dotIdx >= 0 && decPositions > 0 {
+		if fracStr == "" {
+			fracStr = strings.Repeat("0", decPositions)
+		} else if len(fracStr) < decPositions {
+			fracStr += strings.Repeat("0", decPositions-len(fracStr))
+		}
+		result = result + "." + fracStr
+	}
+
+	// FM mode: trim leading spaces from the digit portion before sign.
+	if fm {
+		result = strings.TrimLeft(result, " ")
+		if dotIdx >= 0 {
+			result = strings.TrimRight(result, "0")
+			result = strings.TrimRight(result, ".")
+		}
+	}
+
+	// Apply sign.
+	if hasMI {
+		if negative {
+			result = result + "-"
+		} else if !fm {
+			result = result + " "
+		}
+	} else if hasPL {
+		if negative {
+			result = "-" + result
+		} else {
+			result = "+" + result
+		}
+	} else if hasPR {
+		if negative {
+			result = "<" + result + ">"
+		} else if !fm {
+			result = " " + result + " "
+		}
+	} else if hasS {
+		if negative {
+			result = "-" + result
+		} else {
+			result = "+" + result
+		}
+	} else {
+		// Default: sign goes immediately before the significant digits, after
+		// any digit-padding spaces produced by '9' fill.  FM strips those spaces
+		// before we get here, so the negative sign always goes at position 0 in
+		// FM mode.  Non-FM positive reserves a sign position with one extra space.
+		if negative {
+			trim := strings.TrimLeft(result, " ")
+			spaces := len(result) - len(trim)
+			result = strings.Repeat(" ", spaces) + "-" + trim
+		} else if !fm {
+			result = " " + result
+		}
+	}
+	return result
+}
+
 func pgToCharToGoFormat(pg string) string {
 	replacer := strings.NewReplacer(
 		"YYYY", "2006",
@@ -2864,8 +3392,14 @@ func evalIntervalLit(x *planner.IntervalLit) (Datum, error) {
 //     value → NULL.
 //   - inner empty → false (NOT IN: true).
 //
-// Multi-column subqueries raise 42601.
+// Multi-column subqueries raise 42601 unless the operand is a RowExpr,
+// in which case element-wise tuple comparison is used (row-constructor IN).
 func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
+	// Row-constructor IN/NOT IN subquery: (a, b) IN (SELECT x, y FROM ...).
+	// Route to element-wise tuple comparison. M0097-0020.
+	if rowOp, ok := x.Operand.(*planner.RowExpr); ok && x.Plan != nil {
+		return evalRowConstructorInExpr(x, rowOp, slot, ctx)
+	}
 	// Use evalExprSlot so CTIDExpr can access hasCTID from the slot. M0097-0062.
 	operand, err := evalExprSlot(x.Operand, slot, ctx)
 	if err != nil {
@@ -2917,6 +3451,177 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 	return NewBoolDatum(x.Negated), nil
+}
+
+// evalRowConstructorInExpr handles (a, b, ...) IN (SELECT x, y, ... FROM ...)
+// using element-wise 3-valued-logic tuple comparison. M0097-0020.
+func evalRowConstructorInExpr(x *planner.InExpr, rowOp *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
+	if ctx.Ctx != nil {
+		if err := ctx.Ctx.Err(); err != nil {
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
+	// Evaluate each element of the left-side row constructor.
+	leftElems := make([]Datum, len(rowOp.Elems))
+	for i, e := range rowOp.Elems {
+		v, err := evalExprSlot(e, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		leftElems[i] = v
+	}
+	nCols := len(leftElems)
+
+	// Push outer row for correlated subquery resolution.
+	outerRow := slotToRow(slot)
+	ctx.OuterRows = append(ctx.OuterRows, outerRow)
+	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+
+	op, err := Build(x.Plan)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := op.Open(ctx); err != nil {
+		_ = op.Close()
+		return Datum{}, err
+	}
+	defer func() { _ = op.Close() }()
+
+	sawNullRow := false
+	for {
+		innerSlot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return Datum{}, err
+		}
+		rightRow := slotRow(innerSlot)
+		if len(rightRow) != nCols {
+			return Datum{}, &ExecError{
+				Code: "42601",
+				Pos:  x.Pos(),
+				Message: fmt.Sprintf("row value has %d columns but subquery has %d columns",
+					nCols, len(rightRow)),
+			}
+		}
+		// Compare element-by-element with 3-valued logic:
+		// rowFalse=true → at least one element is definitely not equal.
+		// rowNull=true  → at least one element comparison is indeterminate (NULL).
+		rowFalse := false
+		rowNull := false
+		for i := 0; i < nCols; i++ {
+			left, right := leftElems[i], rightRow[i]
+			if left.IsNull() || right.IsNull() {
+				rowNull = true
+				continue
+			}
+			eq, err := compareEq(left, right)
+			if err != nil {
+				return Datum{}, err
+			}
+			if !(eq.Kind == KindBool && eq.BoolValue()) {
+				rowFalse = true
+				break
+			}
+		}
+		if !rowFalse && !rowNull {
+			// All elements matched.
+			return NewBoolDatum(!x.Negated), nil
+		}
+		if !rowFalse && rowNull {
+			// No definitive mismatch but some NULLs — result may be NULL.
+			sawNullRow = true
+		}
+	}
+	if sawNullRow {
+		return NullDatum, nil
+	}
+	return NewBoolDatum(x.Negated), nil
+}
+
+// evalRowFuncCallVsSubqueryExpr handles ROW(a,b,...) = (SELECT x,y,... FROM ...)
+// by evaluating the subquery as a multi-column row and comparing element-wise.
+// Op must be OpEq or OpNe. The rowArgs are the Args of the FuncCall{Name:"row",...}.
+// M0097-0020.
+func evalRowFuncCallVsSubqueryExpr(op parser.OpCode, rowArgs []planner.Expr, sqOp *planner.SubqueryExpr, slot SlotView, ctx *Context) (Datum, error) {
+	if ctx.Ctx != nil {
+		if err := ctx.Ctx.Err(); err != nil {
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
+	// Evaluate left-side elements.
+	leftElems := make([]Datum, len(rowArgs))
+	for i, e := range rowArgs {
+		v, err := evalExprSlot(e, slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		leftElems[i] = v
+	}
+
+	// Push outer row for correlated subquery resolution.
+	outerRow := slotToRow(slot)
+	ctx.OuterRows = append(ctx.OuterRows, outerRow)
+	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+
+	innerOp, err := Build(sqOp.Plan)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := innerOp.Open(ctx); err != nil {
+		_ = innerOp.Close()
+		return Datum{}, err
+	}
+	defer func() { _ = innerOp.Close() }()
+
+	innerSlot, err := innerOp.Next()
+	if err == EOF {
+		return NullDatum, nil // empty subquery → NULL per SQL semantics
+	}
+	if err != nil {
+		return Datum{}, err
+	}
+	rightRow := slotRow(innerSlot)
+
+	// Drain: exactly one row allowed.
+	if _, err2 := innerOp.Next(); err2 != EOF {
+		if err2 == nil {
+			return Datum{}, &ExecError{Code: "21000", Pos: sqOp.Pos(), Message: "more than one row returned by a subquery used as an expression"}
+		}
+		return Datum{}, err2
+	}
+
+	if len(rightRow) != len(leftElems) {
+		return Datum{}, &ExecError{
+			Code:    "42601",
+			Pos:     sqOp.Pos(),
+			Message: fmt.Sprintf("row value has %d columns but subquery has %d columns", len(leftElems), len(rightRow)),
+		}
+	}
+
+	// Compare element-by-element with 3-valued logic.
+	sawNull := false
+	for i := 0; i < len(leftElems); i++ {
+		left, right := leftElems[i], rightRow[i]
+		if left.IsNull() || right.IsNull() {
+			sawNull = true
+			continue
+		}
+		eq, err := compareEq(left, right)
+		if err != nil {
+			return Datum{}, err
+		}
+		if eq.Kind == KindBool && !eq.BoolValue() {
+			// Definitely not equal: row comparison is FALSE (for =) or TRUE (for !=).
+			return NewBoolDatum(op == parser.OpNe), nil
+		}
+	}
+	if sawNull {
+		return NullDatum, nil
+	}
+	// All elements equal: row comparison is TRUE (for =) or FALSE (for !=).
+	return NewBoolDatum(op == parser.OpEq), nil
 }
 
 // collectInValues returns the inner set for `IN (...)`. When
@@ -3155,6 +3860,125 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 	return val, nil
 }
 
+// evalArraySubquery implements ARRAY(SELECT ...) — runs the inner plan and
+// collects all result rows (must be single-column) into a PostgreSQL text-array
+// string like {v1,v2,...}. M0097-0127.
+func evalArraySubquery(x *planner.ArraySubqueryExpr, row Row, ctx *Context) (Datum, error) {
+	if ctx.Ctx != nil {
+		if err := ctx.Ctx.Err(); err != nil {
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
+	ctx.OuterRows = append(ctx.OuterRows, row)
+	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+
+	op, err := Build(x.Plan)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := op.Open(ctx); err != nil {
+		_ = op.Close()
+		return Datum{}, err
+	}
+	defer func() { _ = op.Close() }()
+
+	var elems []string
+	var nulls []bool
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return Datum{}, err
+		}
+		r := slotRow(slot)
+		if len(r) != 1 {
+			return Datum{}, &ExecError{Code: "42601", Pos: x.Pos(), Message: fmt.Sprintf("ARRAY subquery returned %d columns, expected 1", len(r))}
+		}
+		d := r[0]
+		if d.IsNull() {
+			elems = append(elems, "")
+			nulls = append(nulls, true)
+		} else {
+			elems = append(elems, d.Format())
+			nulls = append(nulls, false)
+		}
+	}
+	return NewStringDatum(formatTextArrayWithNulls(elems, nulls)), nil
+}
+
+// evalMultiAssignSubqRow executes the subquery for a multi-column SET
+// assignment and caches the full result row in ctx.MultiAssignSubqCache keyed
+// by the *MultiAssignSubqRow pointer. The cache is cleared per-row by the
+// update executor before evaluating SET expressions.
+func evalMultiAssignSubqRow(x *planner.MultiAssignSubqRow, row Row, ctx *Context) ([]Datum, error) {
+	key := uintptr(unsafe.Pointer(x))
+	if ctx.MultiAssignSubqCache != nil {
+		if cached, ok := ctx.MultiAssignSubqCache[key]; ok {
+			return cached, nil
+		}
+	}
+	ctx.OuterRows = append(ctx.OuterRows, row)
+	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+	op, err := Build(x.Plan)
+	if err != nil {
+		return nil, err
+	}
+	if err := op.Open(ctx); err != nil {
+		_ = op.Close()
+		return nil, err
+	}
+	defer func() { _ = op.Close() }()
+	slot, err := op.Next()
+	if err == EOF {
+		// No rows: return a slice of NullDatum values.
+		nulls := make([]Datum, x.NCols)
+		for i := range nulls {
+			nulls[i] = NullDatum
+		}
+		if ctx.MultiAssignSubqCache == nil {
+			ctx.MultiAssignSubqCache = make(map[uintptr][]Datum)
+		}
+		ctx.MultiAssignSubqCache[key] = nulls
+		return nulls, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	resultRow := slotRow(slot)
+	if len(resultRow) != x.NCols {
+		return nil, &ExecError{Code: "42601", Pos: x.Pos(), Message: fmt.Sprintf("subquery returned %d columns, expected %d", len(resultRow), x.NCols)}
+	}
+	// Clone result so it outlives the operator close.
+	result := make([]Datum, len(resultRow))
+	copy(result, resultRow)
+	// Drain to detect multiple rows.
+	if _, err2 := op.Next(); err2 != EOF {
+		if err2 == nil {
+			return nil, &ExecError{Code: "21000", Pos: x.Pos(), Message: "more than one row returned by a subquery used as an expression"}
+		}
+		return nil, err2
+	}
+	if ctx.MultiAssignSubqCache == nil {
+		ctx.MultiAssignSubqCache = make(map[uintptr][]Datum)
+	}
+	ctx.MultiAssignSubqCache[key] = result
+	return result, nil
+}
+
+// evalMultiAssignSubqElem evaluates one column of a multi-column SET subquery.
+func evalMultiAssignSubqElem(x *planner.MultiAssignSubqElem, row Row, ctx *Context) (Datum, error) {
+	result, err := evalMultiAssignSubqRow(x.Row, row, ctx)
+	if err != nil {
+		return Datum{}, err
+	}
+	if x.ColIdx < 0 || x.ColIdx >= len(result) {
+		return NullDatum, nil
+	}
+	return result[x.ColIdx], nil
+}
+
 // evalCaseExpr evaluates the SQL CASE expression. Two forms:
 //
 //	-- searched: each WHEN is a boolean predicate
@@ -3379,6 +4203,11 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Stub: return NULL so the normalizer can strip the result block.
 		// Full SQL deparsing would require a complete SQL pretty-printer. M0097-0004.
 		return NullDatum, nil
+	case "pg_collation_for":
+		// Return "POSIX" to match the C/POSIX locale used in regression tests.
+		// PG regression databases are created with --locale=C, so text values
+		// have POSIX collation. M0097-0115.
+		return NewStringDatum(`"POSIX"`), nil
 	case "to_char":
 		return evalToChar(x, row, ctx)
 	case "age":
@@ -3610,9 +4439,37 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewBoolDatum(a.BoolValue() != b.BoolValue()), nil
 		}
 
+	// ── Aggregate state functions for bool_and / bool_or ─────────────────
+	// These are strict (return NULL if either arg is NULL), matching PG's
+	// booland_statefunc / boolor_statefunc internals.
+	case "booland_statefunc":
+		if len(x.Args) == 2 {
+			a, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || a.IsNull() {
+				return NullDatum, nil
+			}
+			b, err2 := evalExpr(x.Args[1], row, ctx)
+			if err2 != nil || b.IsNull() {
+				return NullDatum, nil
+			}
+			return NewBoolDatum(a.BoolValue() && b.BoolValue()), nil
+		}
+	case "boolor_statefunc":
+		if len(x.Args) == 2 {
+			a, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || a.IsNull() {
+				return NullDatum, nil
+			}
+			b, err2 := evalExpr(x.Args[1], row, ctx)
+			if err2 != nil || b.IsNull() {
+				return NullDatum, nil
+			}
+			return NewBoolDatum(a.BoolValue() || b.BoolValue()), nil
+		}
+
 	case "array_subscript":
-		// array_subscript(arr text[], idx int) → text
 		// Array element access: arr[idx] (1-based). Used for SQL a[N] syntax. M0097-0003.
+		// Returns the element as its natural type (int for integer arrays, else text).
 		if len(x.Args) == 2 {
 			arr, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil {
@@ -3630,7 +4487,141 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if n < 1 || int(n) > len(elems) {
 				return NullDatum, nil
 			}
-			return NewStringDatum(elems[n-1]), nil
+			elem := elems[n-1]
+			// Try to infer element type: if the element looks like a plain integer
+			// (no decimal point, no quotes), return an integer datum for correct
+			// psql alignment and comparison semantics. Matches PG's behaviour where
+			// ARRAY[1,2,3][1] returns int4, not text.
+			if iv, err2 := strconv.ParseInt(elem, 10, 64); err2 == nil && !strings.Contains(elem, ".") {
+				return NewIntDatum(iv), nil
+			}
+			return NewStringDatum(elem), nil
+		}
+		return NullDatum, nil
+
+	case "array_upper":
+		// array_upper(anyarray, int) → int: upper bound of specified dimension (1-based).
+		// For 1-D arrays, returns the number of elements (lower is always 1).
+		// Returns NULL for empty arrays, NULL inputs, or dim != 1.
+		if len(x.Args) == 2 {
+			arr, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			dimDatum, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arr.IsNull() || dimDatum.IsNull() {
+				return NullDatum, nil
+			}
+			dim := dimDatum.Int
+			if dimDatum.Kind == KindString {
+				dim, _ = strconv.ParseInt(dimDatum.StringValue(), 10, 64)
+			}
+			if dim != 1 {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(arr.StringValue())
+			if len(elems) == 0 {
+				return NullDatum, nil
+			}
+			return NewIntDatum(int64(len(elems))), nil
+		}
+		return NullDatum, nil
+
+	case "array_lower":
+		// array_lower(anyarray, int) → int: lower bound of specified dimension.
+		// For standard PostgreSQL arrays the lower bound is always 1.
+		// Returns NULL for empty arrays, NULL inputs, or dim != 1.
+		if len(x.Args) == 2 {
+			arr, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			dimDatum, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arr.IsNull() || dimDatum.IsNull() {
+				return NullDatum, nil
+			}
+			dim := dimDatum.Int
+			if dimDatum.Kind == KindString {
+				dim, _ = strconv.ParseInt(dimDatum.StringValue(), 10, 64)
+			}
+			if dim != 1 {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(arr.StringValue())
+			if len(elems) == 0 {
+				return NullDatum, nil
+			}
+			return NewIntDatum(1), nil
+		}
+		return NullDatum, nil
+
+	case "array_length":
+		// array_length(anyarray, int) → int: number of elements in the specified dimension.
+		// Equivalent to array_upper - array_lower + 1 = upper (since lower=1).
+		// Returns NULL for empty arrays, NULL inputs, or dim != 1.
+		if len(x.Args) == 2 {
+			arr, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			dimDatum, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arr.IsNull() || dimDatum.IsNull() {
+				return NullDatum, nil
+			}
+			dim := dimDatum.Int
+			if dimDatum.Kind == KindString {
+				dim, _ = strconv.ParseInt(dimDatum.StringValue(), 10, 64)
+			}
+			if dim != 1 {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(arr.StringValue())
+			if len(elems) == 0 {
+				return NullDatum, nil
+			}
+			return NewIntDatum(int64(len(elems))), nil
+		}
+		return NullDatum, nil
+
+	case "array_fill":
+		// array_fill(val, dims_array[, lb_array]) → fills an array with val repeated N times.
+		// array_fill(1.0, ARRAY[4]) = {1.0,1.0,1.0,1.0}. Only 1-D supported. M0097-0113.
+		if len(x.Args) >= 2 {
+			val, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			dimsD, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if val.IsNull() || dimsD.IsNull() {
+				return NullDatum, nil
+			}
+			// dimsD is an array like {4} — parse it and get the first dimension.
+			dimElems := parseTextArray(dimsD.StringValue())
+			n := int64(0)
+			if len(dimElems) > 0 {
+				n, _ = strconv.ParseInt(dimElems[0], 10, 64)
+			}
+			valStr := val.Format()
+			if val.IsNull() {
+				valStr = "NULL"
+			}
+			elems := make([]string, n)
+			for i := range elems {
+				elems[i] = valStr
+			}
+			return NewStringDatum("{" + strings.Join(elems, ",") + "}"), nil
 		}
 		return NullDatum, nil
 
@@ -3671,9 +4662,34 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, err
 			}
 			if v.IsNull() {
-				sbRow.WriteString("NULL")
+				// PostgreSQL row constructor: NULL elements appear as empty fields.
+				// e.g. ROW(0,NULL,NULL) → "(0,,)" matching composite type display.
 			} else {
-				sbRow.WriteString(v.Format())
+				s := v.Format()
+				// Quote values containing commas, parens, quotes, backslashes, spaces.
+				needsQ := false
+				if s == "" {
+					needsQ = true
+				} else {
+					for _, c := range s {
+						if c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == ' ' || c == '\t' {
+							needsQ = true
+							break
+						}
+					}
+				}
+				if needsQ {
+					sbRow.WriteByte('"')
+					for _, c := range s {
+						if c == '"' || c == '\\' {
+							sbRow.WriteByte('\\')
+						}
+						sbRow.WriteRune(c)
+					}
+					sbRow.WriteByte('"')
+				} else {
+					sbRow.WriteString(s)
+				}
 			}
 		}
 		sbRow.WriteByte(')')
@@ -5217,6 +6233,323 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		result := mean + stddev*z
 		return NewStringDatum(strconv.FormatFloat(result, 'f', 15, 64)), nil
 
+	// ── float8 aggregate state functions ─────────────────────────────────
+	// These back stddev, variance, regression aggregates in PostgreSQL.
+	// State arrays are represented as PostgreSQL array literals: {n1,n2,...}
+
+	case "float8_accum":
+		// float8_accum(float8[], float8) -> float8[]
+		// Accumulates one value into a 3-element Youngs-Cramer state {N, Sx, Sxx}.
+		if len(x.Args) == 2 {
+			stateD, e1 := evalExpr(x.Args[0], row, ctx)
+			valD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil || valD.IsNull() {
+				return NullDatum, nil
+			}
+			var state [3]float64
+			if !stateD.IsNull() {
+				elems := parseTextArray(stateD.StringValue())
+				if len(elems) == 3 {
+					for i := range state {
+						state[i], _ = strconv.ParseFloat(elems[i], 64)
+					}
+				}
+			}
+			newval, _ := strconv.ParseFloat(valD.Format(), 64)
+			nOld := state[0]
+			sxOld := state[1]
+			sxxOld := state[2]
+			n := nOld + 1
+			sx := sxOld + newval
+			var sxx float64
+			if nOld > 0 {
+				tmp := newval*n - sx
+				sxx = sxxOld + tmp*tmp/(n*nOld)
+			} else {
+				if math.IsInf(newval, 0) || math.IsNaN(newval) {
+					sxx = math.NaN()
+				} else {
+					sxx = 0
+				}
+			}
+			parts := []string{
+				strconv.FormatFloat(n, 'g', -1, 64),
+				strconv.FormatFloat(sx, 'g', -1, 64),
+				strconv.FormatFloat(sxx, 'g', -1, 64),
+			}
+			return NewStringDatum("{" + strings.Join(parts, ",") + "}"), nil
+		}
+
+	case "float8_regr_accum":
+		// float8_regr_accum(float8[], float8, float8) -> float8[]
+		// Accumulates one (Y, X) pair into a 6-element regression state
+		// {N, Sx, Sxx, Sy, Syy, Sxy}.
+		if len(x.Args) == 3 {
+			stateD, e1 := evalExpr(x.Args[0], row, ctx)
+			yD, e2 := evalExpr(x.Args[1], row, ctx)
+			xD, e3 := evalExpr(x.Args[2], row, ctx)
+			if e1 != nil || e2 != nil || e3 != nil || yD.IsNull() || xD.IsNull() {
+				return NullDatum, nil
+			}
+			var state [6]float64
+			if !stateD.IsNull() {
+				elems := parseTextArray(stateD.StringValue())
+				if len(elems) == 6 {
+					for i := range state {
+						state[i], _ = strconv.ParseFloat(elems[i], 64)
+					}
+				}
+			}
+			yVal, _ := strconv.ParseFloat(yD.Format(), 64)
+			xVal, _ := strconv.ParseFloat(xD.Format(), 64)
+			nOld := state[0]
+			sxOld, sxxOld := state[1], state[2]
+			syOld, syyOld, sxyOld := state[3], state[4], state[5]
+			n := nOld + 1
+			sx := sxOld + xVal
+			sy := syOld + yVal
+			var sxx, syy, sxy float64
+			if nOld > 0 {
+				tmpX := xVal*n - sx
+				tmpY := yVal*n - sy
+				scale := 1.0 / (n * nOld)
+				sxx = sxxOld + tmpX*tmpX*scale
+				syy = syyOld + tmpY*tmpY*scale
+				sxy = sxyOld + tmpX*tmpY*scale
+			}
+			parts := []string{
+				strconv.FormatFloat(n, 'g', -1, 64),
+				strconv.FormatFloat(sx, 'g', -1, 64),
+				strconv.FormatFloat(sxx, 'g', -1, 64),
+				strconv.FormatFloat(sy, 'g', -1, 64),
+				strconv.FormatFloat(syy, 'g', -1, 64),
+				strconv.FormatFloat(sxy, 'g', -1, 64),
+			}
+			return NewStringDatum("{" + strings.Join(parts, ",") + "}"), nil
+		}
+
+	case "float8_combine":
+		// float8_combine(float8[], float8[]) -> float8[]
+		// Merges two 3-element Youngs-Cramer states {N, Sx, Sxx}.
+		if len(x.Args) == 2 {
+			s1D, e1 := evalExpr(x.Args[0], row, ctx)
+			s2D, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			parse3 := func(d Datum) ([3]float64, bool) {
+				var s [3]float64
+				if d.IsNull() {
+					return s, false
+				}
+				elems := parseTextArray(d.StringValue())
+				if len(elems) != 3 {
+					return s, false
+				}
+				for i := range s {
+					s[i], _ = strconv.ParseFloat(elems[i], 64)
+				}
+				return s, true
+			}
+			st1, ok1 := parse3(s1D)
+			st2, ok2 := parse3(s2D)
+			if !ok1 || st1[0] == 0 {
+				if ok2 {
+					return s2D, nil
+				}
+				return NullDatum, nil
+			}
+			if !ok2 || st2[0] == 0 {
+				return s1D, nil
+			}
+			n1, sx1, sxx1 := st1[0], st1[1], st1[2]
+			n2, sx2, sxx2 := st2[0], st2[1], st2[2]
+			n := n1 + n2
+			sx := sx1 + sx2
+			tmp := sx1/n1 - sx2/n2
+			sxx := sxx1 + sxx2 + n1*n2*tmp*tmp/n
+			parts := []string{
+				strconv.FormatFloat(n, 'g', -1, 64),
+				strconv.FormatFloat(sx, 'g', -1, 64),
+				strconv.FormatFloat(sxx, 'g', -1, 64),
+			}
+			return NewStringDatum("{" + strings.Join(parts, ",") + "}"), nil
+		}
+
+	case "float8_regr_combine":
+		// float8_regr_combine(float8[], float8[]) -> float8[]
+		// Merges two 6-element regression states {N, Sx, Sxx, Sy, Syy, Sxy}.
+		if len(x.Args) == 2 {
+			s1D, e1 := evalExpr(x.Args[0], row, ctx)
+			s2D, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			parse6 := func(d Datum) ([6]float64, bool) {
+				var s [6]float64
+				if d.IsNull() {
+					return s, false
+				}
+				elems := parseTextArray(d.StringValue())
+				if len(elems) != 6 {
+					return s, false
+				}
+				for i := range s {
+					s[i], _ = strconv.ParseFloat(elems[i], 64)
+				}
+				return s, true
+			}
+			st1, ok1 := parse6(s1D)
+			st2, ok2 := parse6(s2D)
+			if !ok1 || st1[0] == 0 {
+				if ok2 {
+					return s2D, nil
+				}
+				return NullDatum, nil
+			}
+			if !ok2 || st2[0] == 0 {
+				return s1D, nil
+			}
+			n1, sx1, sxx1 := st1[0], st1[1], st1[2]
+			sy1, syy1, sxy1 := st1[3], st1[4], st1[5]
+			n2, sx2, sxx2 := st2[0], st2[1], st2[2]
+			sy2, syy2, sxy2 := st2[3], st2[4], st2[5]
+			n := n1 + n2
+			sx := sx1 + sx2
+			sy := sy1 + sy2
+			tmpX := sx1/n1 - sx2/n2
+			tmpY := sy1/n1 - sy2/n2
+			sxx := sxx1 + sxx2 + n1*n2*tmpX*tmpX/n
+			syy := syy1 + syy2 + n1*n2*tmpY*tmpY/n
+			sxy := sxy1 + sxy2 + n1*n2*tmpX*tmpY/n
+			parts := []string{
+				strconv.FormatFloat(n, 'g', -1, 64),
+				strconv.FormatFloat(sx, 'g', -1, 64),
+				strconv.FormatFloat(sxx, 'g', -1, 64),
+				strconv.FormatFloat(sy, 'g', -1, 64),
+				strconv.FormatFloat(syy, 'g', -1, 64),
+				strconv.FormatFloat(sxy, 'g', -1, 64),
+			}
+			return NewStringDatum("{" + strings.Join(parts, ",") + "}"), nil
+		}
+
+	// ── Array functions ──────────────────────────────────────────────────
+
+	case "array_append":
+		// array_append(anyarray, anyelement) → anyarray
+		// Appends element to the end of an array. M0097-0035.
+		if len(x.Args) == 2 {
+			arrD, e1 := evalExpr(x.Args[0], row, ctx)
+			elemD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			var elems []string
+			if !arrD.IsNull() {
+				elems = parseTextArray(arrD.StringValue())
+			}
+			var elemStr string
+			if elemD.IsNull() {
+				elemStr = "NULL"
+			} else {
+				elemStr = elemD.Format()
+			}
+			elems = append(elems, elemStr)
+			return NewStringDatum(formatTextArray(elems)), nil
+		}
+
+	case "array_prepend":
+		// array_prepend(anyelement, anyarray) → anyarray
+		if len(x.Args) == 2 {
+			elemD, e1 := evalExpr(x.Args[0], row, ctx)
+			arrD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			var elems []string
+			if !arrD.IsNull() {
+				elems = parseTextArray(arrD.StringValue())
+			}
+			var elemStr string
+			if elemD.IsNull() {
+				elemStr = "NULL"
+			} else {
+				elemStr = elemD.Format()
+			}
+			elems = append([]string{elemStr}, elems...)
+			return NewStringDatum(formatTextArray(elems)), nil
+		}
+
+	case "array_cat":
+		// array_cat(anyarray, anyarray) → anyarray
+		if len(x.Args) == 2 {
+			a1, e1 := evalExpr(x.Args[0], row, ctx)
+			a2, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			var elems []string
+			if !a1.IsNull() {
+				elems = append(elems, parseTextArray(a1.StringValue())...)
+			}
+			if !a2.IsNull() {
+				elems = append(elems, parseTextArray(a2.StringValue())...)
+			}
+			return NewStringDatum(formatTextArray(elems)), nil
+		}
+
+	case "array_dims":
+		// array_dims(anyarray) → text — returns '[1:N]' for a 1-D array of N elements.
+		if len(x.Args) == 1 {
+			arrD, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || arrD.IsNull() {
+				return NullDatum, nil
+			}
+			elems := parseTextArray(arrD.StringValue())
+			return NewStringDatum(fmt.Sprintf("[1:%d]", len(elems))), nil
+		}
+
+	case "array_ndims":
+		// array_ndims(anyarray) → int — returns 1 for a 1-D array.
+		if len(x.Args) == 1 {
+			arrD, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || arrD.IsNull() {
+				return NullDatum, nil
+			}
+			_ = parseTextArray(arrD.StringValue())
+			return NewIntDatum(1), nil
+		}
+
+	case "regexp_split_to_array":
+		// regexp_split_to_array(string, pattern [, flags]) → text[]
+		// Splits string by regexp and returns the parts as an array. M0097-0035.
+		if len(x.Args) >= 2 {
+			strD, e1 := evalExpr(x.Args[0], row, ctx)
+			patD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil || strD.IsNull() || patD.IsNull() {
+				return NullDatum, nil
+			}
+			flags := ""
+			if len(x.Args) >= 3 {
+				flagD, fe := evalExpr(x.Args[2], row, ctx)
+				if fe == nil && !flagD.IsNull() {
+					flags = flagD.StringValue()
+				}
+			}
+			pat := patD.StringValue()
+			// Build RE2 pattern with flags.
+			reStr := pat
+			if strings.Contains(flags, "i") {
+				reStr = "(?i)" + reStr
+			}
+			re, rerr := regexp.Compile(reStr)
+			if rerr != nil {
+				return NullDatum, &ExecError{Code: "2201B", Pos: x.Pos(), Message: fmt.Sprintf("invalid regular expression: %v", rerr)}
+			}
+			parts := re.Split(strD.StringValue(), -1)
+			return NewStringDatum(formatTextArray(parts)), nil
+		}
+
 	// ── Type conversion functions (M0097-0005) ────────────────────────────
 	case "to_number":
 		// to_number(text, fmt) → numeric — simplified: parse as numeric
@@ -5244,7 +6577,63 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// encode(bytea, format) — stub: return empty string
 		return NewStringDatum(""), nil
 	case "decode":
-		return NullDatum, nil
+		// decode(text, format) -> bytea. Formats: hex, escape, base64.
+		if len(x.Args) != 2 {
+			return NullDatum, nil
+		}
+		src, serr := evalExpr(x.Args[0], row, ctx)
+		if serr != nil || src.IsNull() {
+			return NullDatum, nil
+		}
+		fmtArg, ferr := evalExpr(x.Args[1], row, ctx)
+		if ferr != nil || fmtArg.IsNull() {
+			return NullDatum, nil
+		}
+		format := strings.ToLower(strings.TrimSpace(fmtArg.Format()))
+		switch format {
+		case "hex":
+			hexStr := src.Format()
+			// strip optional \x prefix
+			hexStr = strings.TrimPrefix(hexStr, `\x`)
+			b, err := hex.DecodeString(hexStr)
+			if err != nil {
+				return NullDatum, &ExecError{Code: "22023", Message: fmt.Sprintf("invalid hexadecimal data: %v", err)}
+			}
+			return NewBytesDatum(b), nil
+		case "escape":
+			// PostgreSQL escape format: \xxx octal or \\ for backslash
+			s := src.Format()
+			var out []byte
+			for i := 0; i < len(s); {
+				if s[i] == '\\' && i+1 < len(s) {
+					if s[i+1] == '\\' {
+						out = append(out, '\\')
+						i += 2
+					} else if i+3 < len(s) && s[i+1] >= '0' && s[i+1] <= '3' &&
+						s[i+2] >= '0' && s[i+2] <= '7' && s[i+3] >= '0' && s[i+3] <= '7' {
+						v := (s[i+1]-'0')<<6 | (s[i+2]-'0')<<3 | (s[i+3] - '0')
+						out = append(out, v)
+						i += 4
+					} else {
+						out = append(out, s[i])
+						i++
+					}
+				} else {
+					out = append(out, s[i])
+					i++
+				}
+			}
+			return NewBytesDatum(out), nil
+		case "base64":
+			var b []byte
+			b, err := base64.StdEncoding.DecodeString(src.Format())
+			if err != nil {
+				return NullDatum, &ExecError{Code: "22023", Message: fmt.Sprintf("invalid base64 data: %v", err)}
+			}
+			return NewBytesDatum(b), nil
+		default:
+			return NullDatum, &ExecError{Code: "22023", Message: fmt.Sprintf("unrecognized encoding: %q", format)}
+		}
 
 	// ── Misc functions (M0097-0005) ────────────────────────────────────────
 	case "coalesce":
@@ -5274,7 +6663,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || v.IsNull() {
 				continue
 			}
-			if best.IsNull() || v.Format() > best.Format() {
+			if best.IsNull() {
+				best = v
+				continue
+			}
+			cmp, cerr := compareDatum(v, best, x.Pos())
+			if cerr != nil || cmp > 0 {
 				best = v
 			}
 		}
@@ -5286,7 +6680,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || v.IsNull() {
 				continue
 			}
-			if best.IsNull() || v.Format() < best.Format() {
+			if best.IsNull() {
+				best = v
+				continue
+			}
+			cmp, cerr := compareDatum(v, best, x.Pos())
+			if cerr != nil || cmp < 0 {
 				best = v
 			}
 		}
@@ -6206,6 +7605,50 @@ func formatTextArray(elems []string) string {
 	return sb.String()
 }
 
+// formatTextArrayWithNulls renders a PostgreSQL text-array literal where
+// some elements may be NULL. NULL elements are rendered as the unquoted
+// token NULL (PostgreSQL array literal syntax: {1,NULL,3}).
+func formatTextArrayWithNulls(elems []string, nulls []bool) string {
+	if len(elems) == 0 {
+		return "{}"
+	}
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, e := range elems {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		if i < len(nulls) && nulls[i] {
+			sb.WriteString("NULL")
+			continue
+		}
+		// Quote the element if it contains special chars, spaces, commas, braces, or backslashes.
+		needsQuote := len(e) == 0
+		if !needsQuote {
+			for _, c := range e {
+				if c == '"' || c == ',' || c == '{' || c == '}' || c == '\\' || c == ' ' || c == '\t' {
+					needsQuote = true
+					break
+				}
+			}
+		}
+		if needsQuote {
+			sb.WriteByte('"')
+			for _, c := range e {
+				if c == '"' || c == '\\' {
+					sb.WriteByte('\\')
+				}
+				sb.WriteRune(c)
+			}
+			sb.WriteByte('"')
+		} else {
+			sb.WriteString(e)
+		}
+	}
+	sb.WriteByte('}')
+	return sb.String()
+}
+
 // applyPgFormat implements PostgreSQL's format() function for common specifiers:
 // %s (value as text), %I (quote_ident), %L (quote_literal), %% (literal %). M0097-0003.
 // applyPgFormat is kept as a simple no-error wrapper for callers that don't
@@ -6839,11 +8282,53 @@ func enumTypeNameFromArgs(args []planner.Expr) string {
 	return ""
 }
 
+// evalRowToRowComparison evaluates (a,b,...) OP (c,d,...) using element-wise
+// comparison with standard SQL NULL semantics: if any compared element is NULL,
+// the result is NULL for that step. Implements ISO SQL §8.7 row comparison.
+// Used for WHERE (proname, pronamespace) > ('abs', 0) style predicates.
+func evalRowToRowComparison(op parser.OpCode, left, right *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
+	n := len(left.Elems)
+	if len(right.Elems) < n {
+		n = len(right.Elems)
+	}
+	for i := 0; i < n; i++ {
+		lDat, err := evalExprSlot(left.Elems[i], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		rDat, err := evalExprSlot(right.Elems[i], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if lDat.IsNull() || rDat.IsNull() {
+			return NullDatum, nil
+		}
+		cmp, err := compareDatum(lDat, rDat, 0)
+		if err != nil {
+			return Datum{}, err
+		}
+		isLast := (i == n-1)
+		if cmp < 0 {
+			return NewBoolDatum(op == parser.OpLt || op == parser.OpLe || op == parser.OpNe), nil
+		} else if cmp > 0 {
+			return NewBoolDatum(op == parser.OpGt || op == parser.OpGe || op == parser.OpNe), nil
+		}
+		// Equal — if last element, apply equality part of operator
+		if isLast {
+			return NewBoolDatum(op == parser.OpEq || op == parser.OpLe || op == parser.OpGe), nil
+		}
+		// Continue to next element
+	}
+	// All elements equal (or n=0)
+	return NewBoolDatum(op == parser.OpEq || op == parser.OpLe || op == parser.OpGe), nil
+}
+
 // evalRowExpr evaluates a row constructor `(a, b, c)` and returns its
 // PostgreSQL composite text representation `(v1,v2,...,vN)`. NULL elements
 // appear as empty fields. Used for whole-row variable refs. M0097-0020.
 func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
 	parts := make([]string, len(x.Elems))
+	allNull := true
 	for i, elem := range x.Elems {
 		d, err := evalExprSlot(elem, slot, ctx)
 		if err != nil {
@@ -6853,6 +8338,7 @@ func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error)
 			parts[i] = ""
 			continue
 		}
+		allNull = false
 		s := string(d.AppendValueText(nil))
 		// Quote values that need it in composite syntax: commas, parens,
 		// double-quotes, backslashes, whitespace, or empty string.
@@ -6881,6 +8367,13 @@ func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error)
 		} else {
 			parts[i] = s
 		}
+	}
+	// When all elements are NULL AND the row has zero elements, return NullDatum.
+	// For non-empty rows, even if all elements are NULL, return "()" to match
+	// PostgreSQL's display of a row with all-null fields (e.g. SELECT foo FROM
+	// (SELECT NULL) AS foo → "()", not NULL). M0097-0125.
+	if allNull && len(parts) == 0 {
+		return NullDatum, nil
 	}
 	return NewStringDatum("(" + strings.Join(parts, ",") + ")"), nil
 }

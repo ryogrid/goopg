@@ -576,6 +576,21 @@ func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat cata
 		},
 	}
 	for _, assign := range oc.UpdateSet {
+		if len(assign.Columns) > 0 {
+			// Multi-column tuple form: validate each target column name.
+			// RHS expression analysis is deferred to the planner because
+			// the RHS may reference CTEs from an outer WITH clause that
+			// are not visible in this analyzer scope (they live in the
+			// planner's global planCTEs map). The planner validates the
+			// RHS via planSelectWithParent / resolveExpr.
+			for _, colName := range assign.Columns {
+				if _, ok := lookupColumn(tbl, colName); !ok {
+					return analyzeError(assign.Pos(), "42703",
+						fmt.Sprintf("column %q of relation %q does not exist", colName, tbl.Name))
+				}
+			}
+			continue
+		}
 		col, ok := lookupColumn(tbl, assign.Column)
 		if !ok {
 			return analyzeError(assign.Pos(), "42703",
@@ -626,6 +641,19 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 		return err
 	}
 	for _, assign := range s.Set {
+		if len(assign.Columns) > 0 {
+			// Multi-column tuple form: (c1, c2, …) = (e1, e2, …).
+			// Validate each target column and analyse the RHS expression.
+			for _, colName := range assign.Columns {
+				if _, ok := lookupColumn(tbl, colName); !ok {
+					return analyzeError(assign.Pos(), "42703", fmt.Sprintf("column %q of relation %q does not exist", colName, tbl.Name))
+				}
+			}
+			if _, err := analyzeExpr(assign.Expr, ctx); err != nil {
+				return err
+			}
+			continue
+		}
 		col, ok := lookupColumn(tbl, assign.Column)
 		if !ok {
 			return analyzeError(assign.Pos(), "42703", fmt.Sprintf("column %q of relation %q does not exist", assign.Column, tbl.Name))
@@ -647,12 +675,29 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 		return err
 	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
+	// Add USING-clause tables to scope so WHERE / RETURNING expressions
+	// can reference their columns. Mirrors analyzeUpdate's FROM handling.
+	// M0097-0076.
+	for _, rv := range s.Using {
+		useTbl, err := lookupTable(cat, rv)
+		if err != nil {
+			return err
+		}
+		alias := rv.Alias
+		if alias == "" {
+			alias = rv.Name
+		}
+		ctx.rels = append(ctx.rels, scopeRel{table: useTbl, alias: alias})
+	}
 	if s.With != nil {
 		if err := analyzeWith(s.With, ctx); err != nil {
 			return err
 		}
 	}
-	return analyzeWhere(s.Where, ctx)
+	if err := analyzeWhere(s.Where, ctx); err != nil {
+		return err
+	}
+	return analyzeTargets(s.Returning, ctx)
 }
 
 func analyzeWhere(where parser.Expr, ctx *scope) error {
@@ -710,6 +755,8 @@ func exprHasWindowFunc(e parser.Expr) bool {
 	case *parser.IsNullExpr:
 		return exprHasWindowFunc(x.Operand)
 	case *parser.IsBoolExpr:
+		return exprHasWindowFunc(x.Operand)
+	case *parser.CollateExpr:
 		return exprHasWindowFunc(x.Operand)
 	case *parser.IsDistinctFromExpr:
 		return exprHasWindowFunc(x.Left) || exprHasWindowFunc(x.Right)
@@ -784,6 +831,17 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		return catalog.Type{Name: "int8"}, nil
 	case *parser.CaseExpr:
 		return analyzeCaseExpr(x, ctx)
+	case *parser.CollateExpr:
+		// CollateExpr is a pass-through; analyze operand for correlated refs. M0097-0127.
+		return analyzeExpr(x.Operand, ctx)
+	case *parser.ArraySubqueryExpr:
+		// Analyze inner SELECT for correlated refs; result is text[]. M0097-0127.
+		if ctx != nil && ctx.cat != nil {
+			if err := analyzeSelectWithParent(x.Inner, ctx.cat, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		return catalog.Type{Name: "text[]"}, nil
 	case *parser.SubqueryExpr:
 		// Recursively analyze the inner SELECT with the current
 		// scope as lexical parent so correlated column refs
@@ -1016,8 +1074,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			}
 			return catalog.Type{Name: "int8"}, nil
 		case "sum":
-			if x.Star || len(x.Args) != 1 {
+			// Skip argument count check when WITHIN GROUP is present;
+			// the planner validates ordered-set aggregate usage. M0097-0035.
+			if (x.Star || len(x.Args) != 1) && len(x.WithinGroup) == 0 {
 				return catalog.Type{}, analyzeError(x.Pos(), "42601", "sum() requires exactly one argument")
+			}
+			if len(x.WithinGroup) > 0 {
+				return catalog.Type{Name: "unknown"}, nil
 			}
 			argTyp, err := analyzeExpr(x.Args[0], ctx)
 			if err != nil {
@@ -1449,11 +1512,19 @@ func resolveTable(ctx *scope, rv parser.RangeVar) (*catalog.Table, error) {
 // columns, registers the CTE in the scope, then analyzes the recursive
 // member (right side) with the CTE self-reference visible.
 func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
+	// PostgreSQL rejects DML inside a WITH RECURSIVE body with
+	// "recursive query must not contain data-modifying statements" (42P19).
+	if cte.DMLBody != nil {
+		return analyzeError(cte.Pos(), "42P19",
+			fmt.Sprintf("recursive query %q must not contain data-modifying statements", cte.Name))
+	}
 	body := cte.Query
-	if body.SetOp == nil || body.SetOp.Type != parser.SetOpUnion || !body.SetOp.All {
+	// PostgreSQL allows both UNION and UNION ALL for recursive CTEs.
+	// Only fall back to the non-recursive path when there is no set operation
+	// (body.SetOp == nil) or the set operation is not UNION-family (Intersect/Except).
+	if body.SetOp == nil || body.SetOp.Type != parser.SetOpUnion {
 		// No recursive self-join — just analyse the body as a
-		// regular CTE.  The planner enforces the UNION ALL
-		// requirement for true recursive CTEs.
+		// regular CTE.
 		if err := analyzeSelectWithParent(body, ctx.cat, ctx); err != nil {
 			return err
 		}
@@ -1492,19 +1563,25 @@ func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		}
 	} else {
 		cols = make([]catalog.Column, 0, len(body.Targets))
-		for i, tgt := range body.Targets {
+		for _, tgt := range body.Targets {
+			// A top-level `*` / `t.*` must be expanded to concrete columns —
+			// analyzeExpr rejects a bare StarExpr. Mirrors registerAnalyzedCTE.
+			if star, ok := tgt.Expr.(*parser.StarExpr); ok {
+				cols = append(cols, expandInnerStarColumns(star, innerCtx)...)
+				continue
+			}
 			name := tgt.Alias
 			if name == "" {
 				name = deriveAnalyzerTargetName(tgt.Expr)
 			}
 			if name == "" {
-				name = fmt.Sprintf("?column?%d", i+1)
+				name = fmt.Sprintf("?column?%d", len(cols)+1)
 			}
 			typ, err := analyzeExpr(tgt.Expr, innerCtx)
 			if err != nil {
 				return err
 			}
-			cols = append(cols, catalog.Column{Name: name, Type: typ, Ordinal: i})
+			cols = append(cols, catalog.Column{Name: name, Type: typ, Ordinal: len(cols)})
 		}
 	}
 	// Apply explicit column alias list (the `(col, ...)` after the CTE name),
@@ -1591,6 +1668,16 @@ func analyzeWith(with *parser.WithClause, ctx *scope) error {
 
 func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 	innerCtx := &scope{cat: ctx.cat, parent: ctx}
+	// If the CTE body has its own WITH clause, register those inner
+	// CTEs in innerCtx so they are visible when resolving the body's
+	// FROM clause below. Without this, `WITH w6 AS (WITH w8 AS
+	// (SELECT 1) SELECT * FROM w8)` fails because w8 is not in scope
+	// when registerAnalyzedCTE tries to resolve FROM w8.
+	if cte.Query.With != nil {
+		if err := analyzeWith(cte.Query.With, innerCtx); err != nil {
+			return err
+		}
+	}
 	if len(cte.Query.From) > 0 || len(cte.Query.FromExprs) > 0 {
 		rels, err := buildSelectScopeIn(cte.Query, innerCtx)
 		if err != nil {
@@ -1805,8 +1892,15 @@ func synthesizeSubqueryTable(cat catalog.Catalog, rv parser.RangeVar, outerCtx *
 		return nil, err
 	}
 	innerCtx := &scope{cat: cat, parent: outerCtx}
+	// When the subquery has a WITH clause, register the CTEs in innerCtx so
+	// that buildSelectScopeIn can find CTE-named tables via resolveTable
+	// (which walks the scope chain). buildSelectScope uses lookupTable which
+	// is catalog-only and silently drops CTE names. M0097-0098.
+	if rv.Subquery.With != nil {
+		_ = analyzeWith(rv.Subquery.With, innerCtx)
+	}
 	if len(rv.Subquery.From) > 0 || len(rv.Subquery.FromExprs) > 0 {
-		rels, err := buildSelectScope(rv.Subquery, cat)
+		rels, err := buildSelectScopeIn(rv.Subquery, innerCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -1994,7 +2088,7 @@ func isIntegerLike(t catalog.Type) bool {
 func isNumericTypeName(name string) bool {
 	switch strings.ToLower(name) {
 	case "int", "int2", "int4", "int8", "integer", "smallint", "bigint", "numeric", "decimal",
-		"float4", "float8", "real", "double", "double precision",
+		"float", "float4", "float8", "real", "double", "double precision",
 		// SERIAL family are not real types: PostgreSQL resolves them to
 		// int4/int8/int2 (pg_typeof reports "integer"). Treat them as their
 		// integer base so `serial_col = 1` / `serial_col + 1` type-check the
@@ -2260,7 +2354,7 @@ func isNumericOrIntegerTarget(name string) bool {
 		"int2", "smallint",
 		"int4", "integer", "int",
 		"int8", "bigint",
-		"float4", "real",
+		"float", "float4", "real",
 		"float8", "double precision", "double":
 		return true
 	}

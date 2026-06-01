@@ -52,8 +52,8 @@ func EncodeCopyTextRow(dst []byte, row Row, cols []catalog.Column) ([]byte, erro
 // trailing newline) into Datums shaped by cols. Returns an error
 // when the field count doesn't match cols, or a column value can't
 // parse into its declared type.
-func DecodeCopyTextRow(line []byte, cols []catalog.Column) (Row, error) {
-	fields, err := splitCopyTextFields(line)
+func DecodeCopyTextRow(line []byte, cols []catalog.Column, nullStr string) (Row, error) {
+	fields, err := splitCopyTextFields(line, nullStr)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +85,7 @@ type copyField struct {
 // the unescaped sequence `\N` is the SQL NULL sentinel; that's
 // distinct from the literal two-byte string "\N", which would have
 // to be written `\\N` on the wire.
-func splitCopyTextFields(line []byte) ([]copyField, error) {
+func splitCopyTextFields(line []byte, nullStr string) ([]copyField, error) {
 	// Phase 1: split on unescaped tabs. Backslash escapes are NOT
 	// processed here — we first find tab boundaries, then unescape
 	// each field in phase 2. This prevents a trailing `\` in a
@@ -100,8 +100,13 @@ func splitCopyTextFields(line []byte) ([]copyField, error) {
 	}
 	rawFields = append(rawFields, line[start:])
 
+	nullBytes := []byte(nullStr)
 	out := make([]copyField, 0, len(rawFields))
 	for _, raw := range rawFields {
+		if bytes.Equal(raw, nullBytes) {
+			out = append(out, copyField{isNull: true})
+			continue
+		}
 		cf, err := unescapeCopyTextField(raw)
 		if err != nil {
 			return nil, err

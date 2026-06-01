@@ -42,3 +42,5 @@ pruning, VACUUM Freeze, and the ProcArray. The remaining gaps from
 |---|---|---|
 | [0115-0001-hint-bit-caching.md](0115-0001-hint-bit-caching.md) | M0115 | Hint Bit Caching in Heap Tuple Visibility |
 | [0116-0001-multi-column-ios.md](0116-0001-multi-column-ios.md) | M0116 | Multi-Column Index-Only Scan Key Decoding |
+| [0116-0004-regression-check.md](0116-0004-regression-check.md) | M0116-0004 | Regression check: single-column IOS path + pgbench select-only TPS |
+| [0115-0007-benchmark-gate.md](0115-0007-benchmark-gate.md) | M0115-0007 | Benchmark gate: pgbench -T 60 -c 10 -M simple -S before/after M0115 |

@@ -270,12 +270,10 @@ func TestUpsertConflictByConstraintName(t *testing.T) {
 	}
 }
 
-// TestUpsertConflictKeyModificationRejected — Stage A scope guard:
-// a SET expression that targets the conflict-key column is
-// rejected at upsertOp.Open with 0A000. Without this, the
-// arbiter index entry would point at a tuple whose actual key
-// differs, breaking future probes on the original key.
-func TestUpsertConflictKeyModificationRejected(t *testing.T) {
+// TestUpsertConflictKeyModificationAllowed — PostgreSQL allows DO UPDATE SET
+// to target the conflict-key column (e.g. SET id = excluded.id). The arbiter
+// index correctly tracks the new key via maintainArbiterRow after the update.
+func TestUpsertConflictKeyModificationAllowed(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
 	if err := runDDL(t, ctx, "CREATE TABLE items (id int, label text)"); err != nil {
@@ -283,7 +281,8 @@ func TestUpsertConflictKeyModificationRejected(t *testing.T) {
 	}
 	upsertSeed(t, ctx)
 
-	stmts, err := parser.Parse("INSERT INTO items (id, label) VALUES (2, 'x') ON CONFLICT (id) DO UPDATE SET id = excluded.id + 100")
+	// Insert a row that conflicts on id=2 and sets id=excluded.id (no-op change).
+	stmts, err := parser.Parse("INSERT INTO items (id, label) VALUES (2, 'x') ON CONFLICT (id) DO UPDATE SET id = excluded.id, label = 'updated'")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,16 +294,9 @@ func TestUpsertConflictKeyModificationRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = op.Open(ctx)
+	if err := op.Open(ctx); err != nil {
+		t.Fatalf("Open() error: %v", err)
+	}
+	_, _ = op.Next()
 	_ = op.Close()
-	if err == nil {
-		t.Fatal("expected error rejecting conflict-key modification, got nil")
-	}
-	ee, ok := err.(*ExecError)
-	if !ok {
-		t.Fatalf("err type = %T, want *ExecError", err)
-	}
-	if ee.Code != "0A000" {
-		t.Errorf("err code = %q, want 0A000", ee.Code)
-	}
 }

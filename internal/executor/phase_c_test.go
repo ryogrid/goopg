@@ -1332,3 +1332,90 @@ func TestBuildExprFloatFallsBackToAdapter(t *testing.T) {
 		t.Fatalf("float8 BinaryOp: want ExprAdapter, got Kind=%d", slab[idx].Kind)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// M0097-0128 — RowExpr fast-path NULL propagation.
+// ---------------------------------------------------------------------------
+
+// TestBuildExprRowToRowNullFallsBackToAdapter verifies that buildExpr compiles
+// a BinaryOp whose both operands are *planner.RowExpr into an ExprAdapter node
+// (not ExprBinaryOp). This is the M0097-0128 guard: without it evalFastExpr
+// would render each RowExpr as a composite text string and compare strings,
+// returning "(abs,20)" >= "(abs,)" = TRUE instead of the correct NULL.
+//
+// The end-to-end behavioural correctness (filter emits 0 rows when the RHS
+// tuple contains NULL) is covered by TestRowCompareNull in
+// row_compare_null_test.go. This test pins the compilation-level invariant.
+func TestBuildExprRowToRowNullFallsBackToAdapter(t *testing.T) {
+	t.Run("buildExpr_emits_ExprAdapter", func(t *testing.T) {
+		var slab exprTreeSlab
+		e := &planner.BinaryOp{
+			Op:    parser.OpGe,
+			Left:  &planner.RowExpr{Elems: []planner.Expr{&planner.ColumnRef{Index: 0}, &planner.ColumnRef{Index: 1}}},
+			Right: &planner.RowExpr{Elems: []planner.Expr{&planner.StringConst{Value: "abs"}, &planner.NullConst{}}},
+		}
+		idx := slab.buildExpr(e)
+		if slab[idx].Kind != ExprAdapter {
+			t.Fatalf("RowExpr>=RowExpr BinaryOp: want ExprAdapter, got Kind=%d", slab[idx].Kind)
+		}
+		if slab[idx].orig == nil {
+			t.Error("ExprAdapter.orig must be non-nil so evalExprSlot can evaluate it")
+		}
+	})
+
+	t.Run("RunFast_row_comparison_with_null_returns_zero_rows", func(t *testing.T) {
+		// End-to-end: with a real storage fixture, the fast path (RunFast)
+		// must also propagate NULL and return 0 rows when first elements are
+		// equal but the second element of the RHS is NULL.
+		ctx, cat, cleanup := newStorageFixture(t)
+		defer cleanup()
+
+		// Create a small table and seed two rows whose first element matches.
+		if _, err := cat.CreateTable(parser.ObjectName{Name: "rcn_fast"}, []catalog.Column{
+			{Name: "a", Type: catalog.Type{Name: "text"}},
+			{Name: "b", Type: catalog.Type{Name: "int4"}},
+		}); err != nil {
+			t.Fatalf("CreateTable: %v", err)
+		}
+		for _, ins := range []string{
+			"INSERT INTO rcn_fast VALUES ('abs', 20)",
+			"INSERT INTO rcn_fast VALUES ('abs', 21)",
+		} {
+			insPlan := planOne(t, ins, cat)
+			insOp, err := Build(insPlan)
+			if err != nil {
+				t.Fatalf("Build INSERT: %v", err)
+			}
+			if err := insOp.Open(ctx); err != nil {
+				t.Fatalf("Open INSERT: %v", err)
+			}
+			for {
+				_, err := insOp.Next()
+				if err == EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("Next INSERT: %v", err)
+				}
+			}
+			_ = insOp.Close()
+		}
+
+		// (a, b) >= ('abs', NULL) must yield NULL for all rows — filter emits 0.
+		plan := planOne(t, "SELECT a, b FROM rcn_fast WHERE (a, b) >= ('abs', NULL)", cat)
+		tree, rootIdx, err := BuildFast(plan)
+		if err != nil {
+			t.Fatalf("BuildFast: %v", err)
+		}
+		rows, err := RunFast(tree, rootIdx, ctx)
+		if err != nil {
+			t.Fatalf("RunFast: %v", err)
+		}
+		if len(rows) != 0 {
+			t.Errorf("RunFast: got %d rows, want 0 — (col,col) >= ('abs',NULL) must yield NULL, not TRUE", len(rows))
+			for i, r := range rows {
+				t.Logf("  row[%d]: %v", i, r)
+			}
+		}
+	})
+}

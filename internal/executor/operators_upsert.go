@@ -64,6 +64,10 @@ type upsertOp struct {
 	child        Operator
 	rowsAffected int64
 	done         bool
+	// RETURNING accumulator: appendUpsertRetRow fills retRows during the
+	// processing loop; Next() streams them out on subsequent calls.
+	retRows []Row
+	retIdx  int
 	// arbiterTree is opened lazily on first conflict probe (or
 	// first row insert when ArbiterIndex != nil) and kept across
 	// the statement for cheap reuse. nil when ArbiterIndex is nil
@@ -87,7 +91,27 @@ func newUpsertOp(p *planner.Insert, child Operator) *upsertOp {
 	return &upsertOp{plan: p, child: child}
 }
 
-func (o *upsertOp) Schema() planner.Schema { return nil }
+func (o *upsertOp) Schema() planner.Schema {
+	if len(o.plan.Returning) > 0 {
+		return o.plan.ReturningSchema
+	}
+	return nil
+}
+
+// appendUpsertRetRow evaluates RETURNING expressions against the given row
+// (inserted or updated, in target-table column order) and accumulates the
+// result in o.retRows for streaming by Next(). No-op when RETURNING is absent.
+func (o *upsertOp) appendUpsertRetRow(row Row) {
+	if len(o.plan.Returning) == 0 {
+		return
+	}
+	retRow := make(Row, len(o.plan.Returning))
+	for i, expr := range o.plan.Returning {
+		v, _ := evalExpr(expr, row, o.ctx)
+		retRow[i] = v
+	}
+	o.retRows = append(o.retRows, retRow)
+}
 
 func (o *upsertOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
@@ -97,30 +121,6 @@ func (o *upsertOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "upsertOp built without OnConflict plan"}
 	}
 	o.ctx = ctx
-
-	// Stage A guard: DO UPDATE SET cannot rewrite conflict-key
-	// columns. The arbiter index entry for the original key would
-	// still point at the new tuple, but the new tuple's actual
-	// key bytes differ — future probes would land on the wrong
-	// row. Reject loudly rather than silently corrupting the
-	// index.
-	if o.plan.OnConflict.Action == planner.OnConflictActionUpdate {
-		for _, ord := range o.plan.OnConflict.ArbiterColumns {
-			if ord == -1 {
-				// Expression-based arbiter column — no single catalog column
-				// to check; the expression result is the conflict key.
-				continue
-			}
-			if o.plan.OnConflict.UpdateSet[ord] != nil {
-				col := o.plan.Table.Columns[ord]
-				return &ExecError{
-					Code:    "0A000",
-					Pos:     o.plan.Pos(),
-					Message: fmt.Sprintf("ON CONFLICT DO UPDATE may not modify conflict-key column %q in v0 (Stage A)", col.Name),
-				}
-			}
-		}
-	}
 
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
@@ -147,6 +147,11 @@ func (o *upsertOp) Close() error { return o.child.Close() }
 
 func (o *upsertOp) Next() (TupleSlot, error) {
 	if o.done {
+		if len(o.plan.Returning) > 0 && o.retIdx < len(o.retRows) {
+			row := o.retRows[o.retIdx]
+			o.retIdx++
+			return SlotFromRow(o.plan.ReturningSchema, row), nil
+		}
 		return nil, EOF
 	}
 	o.done = true
@@ -204,6 +209,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			if err := o.applyInsert(rel, cols, inserted, arbiterKey); err != nil {
 				return nil, err
 			}
+			o.appendUpsertRetRow(inserted)
 			o.rowsAffected++
 			_ = writeTbl
 			continue
@@ -268,6 +274,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 						if err := o.applyInsert(rel, cols, inserted, arbiterKey); err != nil {
 							return nil, err
 						}
+						o.appendUpsertRetRow(inserted)
 						o.rowsAffected++
 						continue nextSourceRow
 					}
@@ -276,6 +283,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				if err := o.applyUpdate(rel, cols, conflictPtr, updated); err != nil {
 					return nil, err
 				}
+				o.appendUpsertRetRow(updated)
 				o.rowsAffected++
 				continue nextSourceRow
 			}
@@ -285,6 +293,14 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 	}
 	// Restore parent's tree handle so Close() releases a stable resource.
 	o.arbiterTree = parentTree
+	// Yield the first RETURNING row inline; subsequent rows come from the
+	// done-branch. Without RETURNING, return EOF so the wire layer issues
+	// `INSERT N`.
+	if len(o.plan.Returning) > 0 && o.retIdx < len(o.retRows) {
+		row := o.retRows[o.retIdx]
+		o.retIdx++
+		return SlotFromRow(o.plan.ReturningSchema, row), nil
+	}
 	return nil, EOF
 }
 
@@ -697,6 +713,8 @@ func (o *upsertOp) evalUpdate(existing Row, inserted Row) (Row, bool, error) {
 			return nil, true, nil
 		}
 	}
+	// Clear multi-column subquery cache so each conflict row gets a fresh evaluation.
+	clear(o.ctx.MultiAssignSubqCache)
 	updated := make(Row, len(existing))
 	for i := range existing {
 		expr := o.plan.OnConflict.UpdateSet[i]

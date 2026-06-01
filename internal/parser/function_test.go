@@ -99,16 +99,15 @@ func TestParseCreateFunctionExplicitIN(t *testing.T) {
 	}
 }
 
-// TestParseCreateFunctionRejectsOutInoutVariadic guards Stage A's
-// scope: OUT / INOUT / VARIADIC arrive in Stage B and must surface
-// a specific diagnostic now, not a generic syntax error.
+// TestParseCreateFunctionRejectsOutInout guards Stage A's scope: OUT / INOUT
+// are not yet supported. VARIADIC is now accepted (M0097-0117).
 func TestParseCreateFunctionRejectsOutInoutVariadic(t *testing.T) {
-	cases := []string{
+	// OUT and INOUT are still rejected.
+	rejectCases := []string{
 		`CREATE FUNCTION f(OUT y int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN END $$`,
 		`CREATE FUNCTION f(INOUT y int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN END $$`,
-		`CREATE FUNCTION f(VARIADIC y int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN END $$`,
 	}
-	for _, src := range cases {
+	for _, src := range rejectCases {
 		t.Run(src[:32], func(t *testing.T) {
 			_, err := Parse(src)
 			if err == nil {
@@ -118,6 +117,11 @@ func TestParseCreateFunctionRejectsOutInoutVariadic(t *testing.T) {
 				t.Errorf("err = %v, want a Stage-A-only message", err)
 			}
 		})
+	}
+	// VARIADIC is now accepted — treat as IN for execution purposes.
+	variadicSQL := `CREATE FUNCTION f(VARIADIC y int) RETURNS int LANGUAGE sql AS $$ SELECT $1 $$`
+	if _, err := Parse(variadicSQL); err != nil {
+		t.Errorf("VARIADIC function rejected: %v", err)
 	}
 }
 

@@ -42,8 +42,8 @@ func (o *projectSetOp) Open(ctx *Context) error {
 		return err
 	}
 
-	// SELECT-list SRF mode: generate_series() or user SETOF functions in target list.
-	if len(o.plan.SrfCols) > 0 || len(o.plan.UserSrfCols) > 0 {
+	// SELECT-list SRF mode: generate_series() / unnest() / user SETOF functions in target list.
+	if len(o.plan.SrfCols) > 0 || len(o.plan.UnnestCols) > 0 || len(o.plan.UserSrfCols) > 0 {
 		return o.openSelectSrfMode(ctx)
 	}
 
@@ -156,6 +156,37 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 			}
 		}
 
+		// Evaluate unnest(array) SRF columns. M0097-0106.
+		type unnestResult struct {
+			colIdx int
+			vals   []Datum
+		}
+		unnestResults := make([]unnestResult, len(o.plan.UnnestCols))
+		for k, uc := range o.plan.UnnestCols {
+			arrD, err := evalExpr(uc.ArrExpr, childRow, ctx)
+			if err != nil {
+				return err
+			}
+			var vals []Datum
+			if !arrD.IsNull() {
+				// Use expandArrayDatum for multi-dimensional array flattening (PG semantics).
+				elems := expandArrayDatum(arrD)
+				for _, d := range elems {
+					if !d.IsNull() && uc.CastType != "" {
+						// Apply element-level cast when unnest(...)::type syntax used. M0097-0035.
+						if cd, cerr := evalCastTyped(d, uc.CastType, "", 0); cerr == nil {
+							d = cd
+						}
+					}
+					vals = append(vals, d)
+				}
+			}
+			unnestResults[k] = unnestResult{colIdx: uc.ColIdx, vals: vals}
+			if len(vals) > maxLen {
+				maxLen = len(vals)
+			}
+		}
+
 		// Evaluate user-defined SETOF SQL functions. M0097-0020.
 		type userSrfResult struct {
 			colIdx int
@@ -198,6 +229,13 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 					outRow[sr.colIdx] = NewIntDatum(sr.vals[step])
 				} else {
 					outRow[sr.colIdx] = Datum{} // NULL
+				}
+			}
+			for _, unnr := range unnestResults {
+				if step < len(unnr.vals) {
+					outRow[unnr.colIdx] = unnr.vals[step]
+				} else {
+					outRow[unnr.colIdx] = Datum{} // NULL
 				}
 			}
 			for _, ur := range userResults {

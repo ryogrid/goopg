@@ -98,6 +98,8 @@ func walkSubqueryPlansInExpr(e Expr) Expr {
 	switch x := e.(type) {
 	case *SubqueryExpr:
 		x.Plan = unnestSubqueriesInPlan(x.Plan)
+	case *MultiAssignSubqRow:
+		x.Plan = unnestSubqueriesInPlan(x.Plan)
 	case *InExpr:
 		x.Plan = unnestSubqueriesInPlan(x.Plan)
 	case *ExistsExpr:
@@ -278,6 +280,18 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 			if a.Arg != nil {
 				walkExprTree(a.Arg, visit)
 			}
+			if a.Arg2 != nil {
+				walkExprTree(a.Arg2, visit)
+			}
+			for _, ea := range a.ExtraArgs {
+				walkExprTree(ea, visit)
+			}
+			for _, sk := range a.OrderBy {
+				walkExprTree(sk.Expr, visit)
+			}
+			for _, sk := range a.WithinGroupOrderBy {
+				walkExprTree(sk.Expr, visit)
+			}
 		}
 	case *Sort:
 		walkPlanExprs(n.Child, visit)
@@ -317,12 +331,20 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 				walkExprTree(e, visit)
 			}
 		}
+	case *GenerateSubscripts:
+		walkExprTree(n.ArrExpr, visit)
+		walkExprTree(n.Dim, visit)
+		if n.Reversed != nil {
+			walkExprTree(n.Reversed, visit)
+		}
 	case *GenerateSeries:
 		walkExprTree(n.Start, visit)
 		walkExprTree(n.Stop, visit)
 		if n.Step != nil {
 			walkExprTree(n.Step, visit)
 		}
+	case *FromUnnest:
+		walkExprTree(n.ArrExpr, visit)
 	case *PgInputErrorInfo:
 		walkExprTree(n.Value, visit)
 		walkExprTree(n.Type, visit)
@@ -338,6 +360,31 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 		for _, f := range n.Filters {
 			walkExprTree(f, visit)
+		}
+	case *RecursiveUnion:
+		walkPlanExprs(n.Anchor, visit)
+		walkPlanExprs(n.Recursive, visit)
+	case *CTEScan:
+		walkPlanExprs(n.Child, visit)
+	case *CTEDMLPrefix:
+		for _, dml := range n.DMls {
+			walkPlanExprs(dml, visit)
+		}
+		walkPlanExprs(n.Body, visit)
+	case *SetOp:
+		walkPlanExprs(n.Left, visit)
+		walkPlanExprs(n.Right, visit)
+	case *Distinct:
+		walkPlanExprs(n.Child, visit)
+	case *DistinctOn:
+		walkPlanExprs(n.Child, visit)
+	case *ProjectSet:
+		walkPlanExprs(n.Child, visit)
+		for _, e := range n.OtherExprs {
+			walkExprTree(e, visit)
+		}
+		for _, uc := range n.UnnestCols {
+			walkExprTree(uc.ArrExpr, visit)
 		}
 	}
 }
@@ -375,6 +422,10 @@ func walkExprTree(e Expr, visit func(Expr)) {
 		for _, elem := range x.Elems {
 			walkExprTree(elem, visit)
 		}
+	case *MultiAssignSubqElem:
+		// Visit the shared row node so planHasOuterRef can detect
+		// the inner plan's outer references.
+		visit(x.Row)
 	}
 }
 
@@ -481,6 +532,12 @@ func clonePlanReplacingOuter(node Node, replace map[*OuterColumnRef]*ColumnRef) 
 			a.Aggs[i] = ag
 			if ag.Arg != nil {
 				a.Aggs[i].Arg = cloneExprReplacingOuter(ag.Arg, replace)
+			}
+			if ag.Arg2 != nil {
+				a.Aggs[i].Arg2 = cloneExprReplacingOuter(ag.Arg2, replace)
+			}
+			for j, ea := range ag.ExtraArgs {
+				a.Aggs[i].ExtraArgs[j] = cloneExprReplacingOuter(ea, replace)
 			}
 		}
 		return &a, nil
@@ -736,6 +793,15 @@ func cloneAggregateCall(call AggregateCall) AggregateCall {
 	c := call
 	if call.Arg != nil {
 		c.Arg = cloneExprLeaf(call.Arg)
+	}
+	if call.Arg2 != nil {
+		c.Arg2 = cloneExprLeaf(call.Arg2)
+	}
+	if len(call.ExtraArgs) > 0 {
+		c.ExtraArgs = make([]Expr, len(call.ExtraArgs))
+		for i, ea := range call.ExtraArgs {
+			c.ExtraArgs[i] = cloneExprLeaf(ea)
+		}
 	}
 	return c
 }
@@ -1180,56 +1246,66 @@ func unnestInExpr(in *InExpr, outer Node) (Node, error) {
 		Type:           params[0].OuterRef.Type,
 		SourceTableIdx: params[0].OuterRef.SourceTableIdx,
 	}
+	// innerKey.Index is the position of the inner plan's output column in the
+	// merged (outer ++ inner) schema. innerKey.Name MUST match the inner plan's
+	// actual output column name — NOT params[0].SubCol.Name (the equijoin column).
+	// reresolveJoinByName.predRebind re-binds keys by Name: if innerKey.Name is
+	// the equijoin column ("f1") but the inner plan projects a different column
+	// ("f2"), predRebind won't find "f1" on the right side and falls back to the
+	// left, silently setting innerKey.Index to the outer "f1" position (0), which
+	// corrupts the hash-join key and produces 0 matches.
+	innerOutName := params[0].SubCol.Name
+	if out := innerPlan.Output(); len(out) > 0 {
+		innerOutName = out[0].Name
+	}
 	innerKey := &ColumnRef{
 		pos:            params[0].SubCol.Pos(),
 		Index:          outerWidth,
-		Name:           params[0].SubCol.Name,
+		Name:           innerOutName,
 		Type:           params[0].SubCol.Type,
-		SourceTableIdx: params[0].SubCol.SourceTableIdx,
+		SourceTableIdx: 0, // inner output column; no outer source identity
 	}
 
-	// Build a semi-join predicate that replaces the IN expression
-	// in the filter.  `column = inner_col` (single param).
-	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: innerKey}
+	// Mark the root Project of the inner plan as IsolatedScope so the NLI
+	// rewriter does not convert the SemiJoin into an NLI (mirrors the
+	// non-correlated path; M0071-0002).
+	if proj, ok := innerPlan.(*Project); ok {
+		proj.IsolatedScope = true
+	}
 
-	// Remove the IN conjunct from the filter and add the
-	// semi-join predicate.
+	// Drop the IN conjunct from the filter — the join encodes the equality
+	// via (LeftKey, RightKey) and the SemiJoin type. Keeping it in the
+	// filter would re-evaluate it on the outer-only semi-join output where
+	// innerKey.Index (outerWidth) is out of range.
 	conjuncts := splitAnd(filter.Predicate)
 	newConjuncts := make([]Expr, 0, len(conjuncts))
-	found := false
 	for _, c := range conjuncts {
-		if c == conjunct {
-			if !found {
-				newConjuncts = append(newConjuncts, semiPred)
-				found = true
-			}
-			// skip the original IN conjunct
-		} else {
+		if c != conjunct {
 			newConjuncts = append(newConjuncts, c)
 		}
 	}
-	if !found {
-		newConjuncts = append(newConjuncts, semiPred)
+	if len(newConjuncts) == 0 {
+		filter.Predicate = &BooleanConst{pos: in.Pos(), Value: true}
+	} else {
+		filter.Predicate = combineAnd(newConjuncts)
 	}
-	filter.Predicate = combineAnd(newConjuncts)
 
-	mergedSchema := make(Schema, outerWidth+innerWidth)
-	copy(mergedSchema, outerChild.Output())
-	copy(mergedSchema[outerWidth:], innerPlan.Output())
-
-	// Use inner join with dedup on the right side (semi-join)
-	// — JoinTypeSemi builds a deduplicated set of the right
-	// child and probes from the left.
+	semiPred := &BinaryOp{pos: in.Pos(), Op: parser.OpEq, Left: outerKey, Right: innerKey}
+	joinType := JoinTypeSemi
+	if in.Negated {
+		joinType = JoinTypeAnti
+	}
+	_ = innerWidth
 	join := &Join{
 		pos:       in.Pos(),
-		Type:      JoinTypeInner,
+		Type:      joinType,
 		Algo:      JoinAlgoHash,
 		Left:      outerChild,
 		Right:     innerPlan,
 		Predicate: semiPred,
 		LeftKey:   outerKey,
 		RightKey:  innerKey,
-		schema:    mergedSchema,
+		schema:    append(Schema(nil), outerChild.Output()...),
 	}
 	filter.Child = join
 	return outer, nil

@@ -20,8 +20,11 @@ func TestPgProcViewEmptyByDefault(t *testing.T) {
 	if !ok {
 		t.Fatal("pg_proc not registered")
 	}
-	if rows := tbl.VirtualRows(); len(rows) != 0 {
-		t.Errorf("rows = %d, want 0 (no routines registered)", len(rows))
+	rows := tbl.VirtualRows()
+	// Built-in stubs are always present; without user-defined routines we
+	// should see exactly len(builtinProcs) rows.
+	if len(rows) != len(builtinProcs) {
+		t.Errorf("rows = %d, want %d (only built-in stubs)", len(rows), len(builtinProcs))
 	}
 }
 
@@ -46,26 +49,32 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
 	rows := tbl.VirtualRows()
-	if len(rows) != 1 {
-		t.Fatalf("rows = %d, want 1", len(rows))
+	// Built-in stubs + 1 user routine.
+	wantLen := len(builtinProcs) + 1
+	if len(rows) != wantLen {
+		t.Fatalf("rows = %d, want %d", len(rows), wantLen)
 	}
-	row := rows[0]
+	// User routine is appended after built-ins.
+	row := rows[len(rows)-1]
 	// Columns: oid, proname, pronamespace, prolang, prorettype,
 	//          proargtypes, prosrc.
 	if row[1] != "add" {
 		t.Errorf("proname = %q, want add", row[1])
 	}
-	if row[2] != "public" {
-		t.Errorf("pronamespace = %q, want public", row[2])
+	// pronamespace is now the OID string "2200" for public.
+	if row[2] != "2200" {
+		t.Errorf("pronamespace = %q, want 2200 (public OID)", row[2])
 	}
 	if row[3] != "plpgsql" {
 		t.Errorf("prolang = %q, want plpgsql", row[3])
 	}
-	if row[4] != "int" {
-		t.Errorf("prorettype = %q, want int", row[4])
+	// prorettype is now the OID string for "int" (int4 = 23).
+	if row[4] != "23" {
+		t.Errorf("prorettype = %q, want 23 (int4 OID)", row[4])
 	}
-	if row[5] != "int,int" {
-		t.Errorf("proargtypes = %q, want int,int", row[5])
+	// proargtypes is now space-separated OID strings (oidvector format).
+	if row[5] != "23 23" {
+		t.Errorf("proargtypes = %q, want \"23 23\" (int4 OID twice)", row[5])
 	}
 	if row[6] != "BEGIN RETURN $1 + $2; END" {
 		t.Errorf("prosrc = %q", row[6])
@@ -97,15 +106,18 @@ func TestPgProcViewOrdering(t *testing.T) {
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
 	rows := tbl.VirtualRows()
-	if len(rows) != 3 {
-		t.Fatalf("rows = %d, want 3", len(rows))
+	// Built-in stubs + 3 user routines.
+	wantLen := len(builtinProcs) + 3
+	if len(rows) != wantLen {
+		t.Fatalf("rows = %d, want %d", len(rows), wantLen)
 	}
 	// Insertion order: zeta, alpha, mu — OIDs assigned in that
-	// order — view rows should be [zeta, alpha, mu].
+	// order — user view rows are appended after built-ins in insertion order.
 	wantNames := []string{"zeta", "alpha", "mu"}
+	userRows := rows[len(builtinProcs):]
 	for i, want := range wantNames {
-		if rows[i][1] != want {
-			t.Errorf("row %d proname = %q, want %q", i, rows[i][1], want)
+		if userRows[i][1] != want {
+			t.Errorf("row %d proname = %q, want %q", i, userRows[i][1], want)
 		}
 	}
 }

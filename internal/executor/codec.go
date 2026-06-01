@@ -271,6 +271,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		binary.LittleEndian.PutUint32(buf[:], uint32(v))
 		return buf[:], nil
 	case "timestamp", "timestamptz":
+		if d.Kind == KindString {
+			t, err := parseCopyTimestamp(d.StringValue())
+			if err != nil {
+				return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type timestamp: %q", d.StringValue())}
+			}
+			d = NewTimeDatum(t.UTC())
+		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
@@ -283,6 +290,13 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		binary.LittleEndian.PutUint64(buf[:], uint64(micros))
 		return buf[:], nil
 	case "date":
+		if d.Kind == KindString {
+			t, err := parseCopyTimestamp(d.StringValue())
+			if err != nil {
+				return nil, &ExecError{Code: "22007", Pos: 0, Message: fmt.Sprintf("invalid input syntax for type date: %q", d.StringValue())}
+			}
+			d = NewTimeDatum(t.UTC())
+		}
 		if d.Kind != KindTime {
 			return nil, fmt.Errorf("expected time, got kind %d", d.Kind)
 		}
@@ -678,8 +692,16 @@ func DecodeRowIntoMctxPGTuple(dst Row, cols []catalog.Column, data, bitmap []byt
 	off := 0
 	for i, c := range cols {
 		// Columns beyond stored natts were added via ALTER TABLE ADD COLUMN.
+		// M0097-0077: when the column has a precomputed MissingValue Datum
+		// (set by ALTER TABLE ADD COLUMN … DEFAULT <const>), surface it
+		// instead of NULL — the "fast default" path that avoids a table
+		// rewrite, mirroring PostgreSQL's `attmissingval`.
 		if i >= storedNatts {
-			dst[i] = NullDatum
+			if mv, ok := c.MissingValue.(Datum); ok {
+				dst[i] = mv
+			} else {
+				dst[i] = NullDatum
+			}
 			continue
 		}
 		// Check null bitmap: bit i = 0 means column i is NULL.

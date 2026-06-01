@@ -78,6 +78,18 @@ type AssignStmt struct {
 func (a *AssignStmt) Pos() int         { return a.pos }
 func (a *AssignStmt) plpgsqlStmtNode() {}
 
+// ArraySubscriptAssignStmt is `varname[idx] := value;` in PL/pgSQL.
+// Modifies element idx (1-based per PG) of the named array variable.
+type ArraySubscriptAssignStmt struct {
+	pos       int
+	VarName   string
+	Subscript parser.Expr
+	Value     parser.Expr
+}
+
+func (a *ArraySubscriptAssignStmt) Pos() int         { return a.pos }
+func (a *ArraySubscriptAssignStmt) plpgsqlStmtNode() {}
+
 // IfStmt is `IF condition THEN statements [ ELSIF condition THEN
 // statements ]* [ ELSE statements ] END IF;`.
 type IfStmt struct {

@@ -4,11 +4,23 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
+
+// viewPlanDepth is a goroutine-local-ish counter that prevents infinite
+// recursion when planning circular view definitions. Each call to Plan that
+// plans a view body increments it; exceeding maxViewPlanDepth returns a
+// cycle error instead of growing the stack. Because Go lacks true TLS, we
+// use an atomic process-global counter — it's conservative (may incorrectly
+// detect "cycles" under extreme parallel planning) but prevents crashes.
+// M0097: lock-test circular view (lock_view2 ↔ lock_view3 cycle guard).
+var viewPlanDepth atomic.Int32
+
+const maxViewPlanDepth = 64
 
 // PlanError is the planner's structured error. SQLSTATE-style codes
 // align with upstream's `errcodes.txt`; the analyzer/executor passes
@@ -18,6 +30,7 @@ type PlanError struct {
 	Code    string
 	Message string
 	Hint    string // optional hint message (emitted as 'H' field in wire protocol)
+	Detail  string // optional detail message (emitted as 'D' field in wire protocol)
 }
 
 func (e *PlanError) Error() string {
@@ -91,9 +104,11 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt,
 		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt,
 		*parser.CompatNoopStmt,
+		*parser.LockTableStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
 		*parser.CreateDomainStmt, *parser.DropDomainStmt,
 		*parser.CreateAggregateStmt,
+		*parser.AlterAggregateRenameStmt,
 		*parser.CreateOpClassStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
@@ -763,6 +778,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	}
 
 	if s.Where != nil {
+		// Aggregate functions are not allowed in WHERE. M0097-0035.
+		if exprHasAggregate(s.Where) {
+			return nil, &PlanError{Pos: s.Where.Pos(), Code: "42803",
+				Message: "aggregate functions are not allowed in WHERE"}
+		}
 		if isSimpleSingle {
 			// M0051-0004: inject synthetic range predicates alongside any
 			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
@@ -843,10 +863,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 
 	var agg *aggregateSurface
 	savedBindings := ctx.bindings
-	if needsAggregateStage(s) {
+	if needsAggregateStage(s, cat) {
 		var having Expr
 		var err error
-		node, ctx, agg, having, err = buildAggregateStage(s, node, ctx)
+		node, ctx, agg, having, err = buildAggregateStage(s, node, ctx, cat)
 		if err != nil {
 			return nil, err
 		}
@@ -927,8 +947,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// If ANY key only resolves in child schema → sort before PS (pre-sort).
 	var selectSrfPending *ProjectSet  // set when SRF is detected; applied after sort
 	var selectSrfPreSort bool         // true → sort BEFORE PS
-	if agg == nil && ps == nil && !needsWindowStage(s) {
-		srfPS, srfErr := buildSelectSrfProjectSet(s, node, ctx)
+	// Also run SRF detection when agg != nil: an aggregate result row can be
+	// expanded by generate_series/unnest in the same SELECT list. M0097-0035.
+	if ps == nil && !needsWindowStage(s) {
+		srfPS, srfErr := buildSelectSrfProjectSet(s, node, ctx, agg)
 		if srfErr != nil {
 			return nil, srfErr
 		}
@@ -1533,8 +1555,10 @@ func nodeReferencesOuter(n Node) bool {
 				return true
 			}
 		}
+		return false
 	}
-	return false
+	// General case: walk the plan tree for OuterColumnRef expressions.
+	return planHasOuterRef(n)
 }
 
 func exprContainsColumnRef(e Expr) bool {
@@ -1797,9 +1821,9 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		}
 	}
 	// Validate column alias count when provided: AS t(c1, c2, ...).
-	// PostgreSQL raises an error if the number of column aliases does not match
-	// the actual table column count. M0097-0003.
-	if len(rv.Columns) > 0 && len(rv.Columns) != len(tbl.Columns) {
+	// PostgreSQL raises an error only if MORE aliases are given than there are columns.
+	// Partial alias lists (fewer aliases than columns) are allowed. M0097-0003.
+	if len(rv.Columns) > 0 && len(rv.Columns) > len(tbl.Columns) {
 		return nil, rangeBinding{}, &PlanError{
 			Pos:  rv.Pos(),
 			Code: "42P01",
@@ -1845,6 +1869,16 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// alias list. Column count must match what the view
 	// declared; v0 reports a planner error otherwise.
 	if tbl.View != nil {
+		// Cycle guard: prevent infinite recursion on circular view definitions.
+		depth := viewPlanDepth.Add(1)
+		defer viewPlanDepth.Add(-1)
+		if depth > maxViewPlanDepth {
+			return nil, rangeBinding{}, &PlanError{
+				Pos:  rv.Pos(),
+				Code: "42P10",
+				Message: fmt.Sprintf("view %q has a circular definition", tbl.QualifiedName()),
+			}
+		}
 		inner, err := Plan(tbl.View, cat)
 		if err != nil {
 			return nil, rangeBinding{}, err
@@ -1901,20 +1935,32 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		return buildVirtualValues(rv.Pos(), tbl, ctx.schema), b, nil
 	}
 	// Partition-aware scan (M0096-0007): when scanning a partitioned table,
-	// produce a union of SeqScans over all partition children.
+	// produce a union of SeqScans over all leaf partitions (recursing through
+	// nested partitioned children). Multi-level partition hierarchies require
+	// collecting ALL leaf descendants, not only direct children.
 	if len(tbl.PartitionKey) > 0 {
 		if im, ok := cat.(*catalog.InMemory); ok {
-			children := im.PartitionChildren(tbl.OID)
-			if len(children) > 0 {
-				// Build a UNION ALL of SeqScans over all children.
+			// Collect all leaf partitions recursively.
+			leaves := collectAllPartitionLeaves(im, tbl.OID)
+			if len(leaves) > 0 {
+				// Build a UNION ALL of SeqScans over all leaf partitions.
 				// Per-leaf wrap with a Project that adds `tableoid`
 				// as the trailing slot so a `tableoid::regclass`
 				// reference reports the actual leaf relname (M0100-0005y).
 				var root Node
-				for _, child := range children {
-					childSchema := tableSchemaWithSource(b.table, sourceIdx)
-					childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childSchema}
-					wrapped := wrapWithTableoid(childScan, child.OID, sourceIdx, rv.Pos())
+				for _, leaf := range leaves {
+					// The SeqScan must use the leaf's OWN physical schema so
+					// the decoder reads columns in the right order. When the leaf
+					// has a different column order from the root partition table,
+					// buildInheritanceRemapProject wraps the scan in a Project
+					// that reorders to the root table's logical schema.
+					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
+					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema}
+					var leafNode Node = leafScan
+					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
+						leafNode = buildInheritanceRemapProject(rv.Pos(), leafScan, tbl, leaf, sourceIdx)
+					}
+					wrapped := wrapWithTableoid(leafNode, leaf.OID, sourceIdx, rv.Pos())
 					if root == nil {
 						root = wrapped
 					} else {
@@ -1940,11 +1986,15 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// rows), an inherited parent may itself contain rows, so the parent scan
 	// is always included first.  M0097-0046: expand recursively so that
 	// grandchildren (e.g. stud_emp → emp → person) are included too.
-	if im, ok := cat.(*catalog.InMemory); ok {
+	// FROM ONLY tablename skips all children (M0097-0099).
+	if im, ok := cat.(*catalog.InMemory); ok && !rv.Only {
 		allDesc := collectInheritanceDescendants(im, tbl.OID)
+
 		if len(allDesc) > 0 {
 			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}
-			var root Node = parentScan
+			// Add tableoid column to parent scan so per-row OID is available. M0097-0093.
+			parentWrapped := wrapWithTableoid(parentScan, tbl.OID, sourceIdx, rv.Pos())
+			var root Node = parentWrapped
 			for _, child := range allDesc {
 				// Use the child's own physical schema for the SeqScan so that
 				// physical column indices are correct for the child's row layout.
@@ -1955,6 +2005,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// wrap the scan in a remap Project that emits columns in parent
 				// schema order (matching the UNION ALL left side).
 				childNode = buildInheritanceRemapProject(rv.Pos(), childScan, tbl, child, sourceIdx)
+				// Wrap with tableoid so each row carries the correct leaf OID.
+				childNode = wrapWithTableoid(childNode, child.OID, sourceIdx, rv.Pos())
 				root = &SetOp{
 					pos:   rv.Pos(),
 					Left:  root,
@@ -1962,6 +2014,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					All:   true,
 				}
 			}
+			b.tableOidColIdx = len(b.table.Columns)
+			ctx.schema = root.Output()
 			return root, b, nil
 		}
 	}
@@ -1988,6 +2042,48 @@ func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32) []*ca
 		queue = append(queue, im.InheritanceChildren(child.OID)...)
 	}
 	return result
+}
+
+// collectAllPartitionLeaves does a BFS over the partition hierarchy rooted at
+// parentOID and returns all LEAF partitions (non-partitioned tables). Nested
+// partitioned tables (which are themselves PARTITION BY) are NOT included in
+// the result — only their leaf descendants are. This is required for correct
+// scanning of multi-level partition hierarchies (e.g. range_parted → part_b_10_b_20
+// (partitioned) → part_c_1_100 (leaf)). M0097-0105.
+func collectAllPartitionLeaves(im *catalog.InMemory, parentOID uint32) []*catalog.Table {
+	var leaves []*catalog.Table
+	seen := make(map[uint32]bool)
+	queue := im.PartitionChildren(parentOID)
+	for len(queue) > 0 {
+		child := queue[0]
+		queue = queue[1:]
+		if seen[child.OID] {
+			continue
+		}
+		seen[child.OID] = true
+		if len(child.PartitionKey) > 0 {
+			// Intermediate partitioned node: recurse into its children.
+			queue = append(queue, im.PartitionChildren(child.OID)...)
+		} else {
+			// Leaf partition: include in the scan.
+			leaves = append(leaves, child)
+		}
+	}
+	return leaves
+}
+
+// columnsInSameOrder returns true when the column name sequence matches
+// exactly, used to skip the remap Project when layout is identical.
+func columnsInSameOrder(a, b []catalog.Column) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
 }
 
 // buildInheritanceRemapProject wraps childScan in a Project that emits
@@ -2025,6 +2121,12 @@ func buildInheritanceRemapProject(pos int, childScan *SeqScan, parent, child *ca
 		targets = append(targets, &ColumnRef{Index: childIdx, Name: pc.Name, Type: pc.Type})
 		outSchema = append(outSchema, SchemaColumn{Name: pc.Name, Type: pc.Type, SourceTableIdx: sourceIdx})
 	}
+	// If the child has more columns than the parent (child-only columns to
+	// drop), a remap Project is required even if the shared columns are in the
+	// same order positions.
+	if len(child.Columns) > len(parent.Columns) {
+		needsRemap = true
+	}
 	if !needsRemap {
 		// Column order matches parent — no remap needed; return scan as-is.
 		// Update the scan's schema to match parent-ordered schema (same
@@ -2056,9 +2158,20 @@ func buildInheritanceRemapProject(pos int, childScan *SeqScan, parent, child *ca
 // typed one way at plan time and another at Open would diverge silently).
 func TypedVirtualCell(pos int, value, colType string) Expr {
 	switch strings.ToLower(colType) {
-	case "int2", "int4", "int8", "integer", "bigint", "smallint":
+	case "int2", "int4", "int8", "integer", "bigint", "smallint",
+		"oid", "xid", "cid", "regproc", "regprocedure":
 		if n, err := strconv.ParseInt(value, 10, 64); err == nil {
 			return &IntegerConst{pos: pos, Value: n}
+		}
+	case "oidvector":
+		// Sort numerically by first (or only) OID; display as text (like PG oidvector).
+		// For single-element oidvectors, parse to IntegerConst for numeric sort.
+		// Multi-element ("20 23") falls back to StringConst (text sort).
+		parts := strings.Fields(value)
+		if len(parts) == 1 {
+			if n, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
+				return &IntegerConst{pos: pos, Value: n}
+			}
 		}
 	case "bool", "boolean":
 		switch value {
@@ -2318,7 +2431,13 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		// executor's OuterRows stack depth. M0097-0065.
 		if latCtxWithCat.parent == nil {
 			latCtxWithCat.parent = planParent
-			latCtxWithCat.lateralSibling = true
+			// Do NOT set lateralSibling=true: openLateral() pushes the left-side
+			// row onto ctx.OuterRows per right-side re-evaluation, so the lateral
+			// boundary introduces a new OuterRows depth level at runtime. Leaving
+			// lateralSibling false makes level increments agree with the executor's
+			// stack depth, so OuterColumnRef.Level correctly addresses ctx.OuterRows.
+			// This fixes OFFSET/LIMIT expressions that reference outer variables
+			// inside lateral subqueries nested within scalar subqueries. M0097-0065.
 		}
 		inner, err = planSelectWithParent(rv.Subquery, cat, &latCtxWithCat)
 	} else {
@@ -2427,7 +2546,7 @@ func projectSetCompositeSchema(name string) Schema {
 // (each step advances all SRFs in lockstep; NULL-pads the shorter ones).
 // Non-SRF targets are evaluated once per child row and repeated for each step.
 // Returns nil, nil when no SRF is present in the target list. M0097-0045/0020.
-func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveContext) (*ProjectSet, error) {
+func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveContext, agg *aggregateSurface) (*ProjectSet, error) {
 	type srfEntry struct {
 		colIdx int
 		start  parser.Expr
@@ -2439,14 +2558,29 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		fc      *parser.FuncCall
 		routine *catalog.Routine
 	}
+	type unnestEntry struct {
+		colIdx   int
+		arrExpr  parser.Expr
+		castType string // element-level cast type (e.g. "int4"); empty = no cast. M0097-0035.
+	}
 	var srfs []srfEntry
+	var unnests []unnestEntry
 	var userSrfs []userSrfEntry
 	var rs *catalog.Routines
 	if ctx != nil && ctx.cat != nil {
 		rs = ctx.cat.Routines()
 	}
 	for i, t := range s.Targets {
-		fc, ok := t.Expr.(*parser.FuncCall)
+		// Unwrap a CastExpr to find the underlying SRF (e.g. unnest(...)::int). M0097-0035.
+		targetExpr := t.Expr
+		var srfCastType string
+		if castExpr, isCast := targetExpr.(*parser.CastExpr); isCast {
+			if _, isFc := castExpr.Operand.(*parser.FuncCall); isFc {
+				targetExpr = castExpr.Operand
+				srfCastType = castExpr.Type.Name
+			}
+		}
+		fc, ok := targetExpr.(*parser.FuncCall)
 		if !ok {
 			continue
 		}
@@ -2462,6 +2596,16 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			srfs = append(srfs, e)
 			continue
 		}
+		// unnest(array) → one row per element. M0097-0106.
+		// Also handles (unnest(array))::type for element-level casting. M0097-0035.
+		if strings.EqualFold(fc.Name.Name, "unnest") {
+			if len(fc.Args) != 1 {
+				return nil, &PlanError{Pos: fc.Pos(), Code: "42883",
+					Message: "unnest requires exactly 1 argument"}
+			}
+			unnests = append(unnests, unnestEntry{colIdx: i, arrExpr: fc.Args[0], castType: srfCastType})
+			continue
+		}
 		// Check if the function is a user-defined SETOF SQL function. M0097-0020.
 		if rs != nil {
 			candidates := rs.LookupByName(fc.Name)
@@ -2475,13 +2619,16 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			}
 		}
 	}
-	if len(srfs) == 0 && len(userSrfs) == 0 {
+	if len(srfs) == 0 && len(unnests) == 0 && len(userSrfs) == 0 {
 		return nil, nil
 	}
 
 	// Build per-column resolved expressions.
-	srfColMap := make(map[int]bool, len(srfs)+len(userSrfs))
+	srfColMap := make(map[int]bool, len(srfs)+len(unnests)+len(userSrfs))
 	for _, e := range srfs {
+		srfColMap[e.colIdx] = true
+	}
+	for _, e := range unnests {
 		srfColMap[e.colIdx] = true
 	}
 	for _, e := range userSrfs {
@@ -2496,13 +2643,50 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			// SRF column: determine output name and type.
 			name := alias
 			if name == "" {
-				if fc, ok := t.Expr.(*parser.FuncCall); ok {
+				// Unwrap CastExpr for name: (unnest(...))::int → "unnest"
+				nameExpr := t.Expr
+				if ce, isCe := nameExpr.(*parser.CastExpr); isCe {
+					nameExpr = ce.Operand
+				}
+				if fc, ok := nameExpr.(*parser.FuncCall); ok {
 					name = strings.ToLower(fc.Name.Name)
 				} else {
 					name = "?column?"
 				}
 			}
 			retType := catalog.Type{Name: "int8"} // generate_series default
+			// Check if this is an unnest SRF and get its element type.
+			for _, u := range unnests {
+				if u.colIdx == i {
+					// If there's an explicit cast, use that type.
+					if u.castType != "" {
+						retType = catalog.Type{Name: u.castType}
+						break
+					}
+					// Infer element type from array arg type (strip ALL [] for 2D). M0097-0125.
+					arrType := "text" // default
+					// Unwrap CastExpr to get the inner FuncCall.
+					innerExpr := t.Expr
+					if ce, isCe := innerExpr.(*parser.CastExpr); isCe {
+						innerExpr = ce.Operand
+					}
+					if fc2, ok := innerExpr.(*parser.FuncCall); ok && len(fc2.Args) == 1 {
+						resolved, err2 := resolveExpr(fc2.Args[0], ctx)
+						if err2 == nil {
+							at := exprType(resolved).Name
+							base := at
+							for strings.HasSuffix(base, "[]") {
+								base = base[:len(base)-2]
+							}
+							if base != at && base != "" {
+								arrType = base
+							}
+						}
+					}
+					retType = catalog.Type{Name: arrType}
+					break
+				}
+			}
 			// Check if this is a user SRF and get its return type.
 			for _, u := range userSrfs {
 				if u.colIdx == i {
@@ -2513,7 +2697,15 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			schema[i] = SchemaColumn{Name: name, Type: retType}
 			// otherExprs[i] stays nil — executor fills this from SRF
 		} else {
-			expr, err := resolveExpr(t.Expr, ctx)
+			var expr Expr
+			var err error
+			if agg != nil {
+				// When combined with an aggregate, non-SRF targets reference
+				// aggregate output columns — use post-agg resolution. M0097-0035.
+				expr, err = resolveExprAfterAggregate(t.Expr, agg)
+			} else {
+				expr, err = resolveExpr(t.Expr, ctx)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -2548,6 +2740,48 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		srfCols[k] = SrfCol{ColIdx: e.colIdx, Start: start, Stop: stop, Step: step}
 	}
 
+	// Resolve unnest array args against ctx. M0097-0106.
+	// When no explicit cast is given, infer the element type from the array type
+	// so the executor produces correctly-typed elements (e.g. int4 not text). M0097-0035.
+	unnestCols := make([]UnnestCol, len(unnests))
+	for k, u := range unnests {
+		arrResolved, err := resolveExpr(u.arrExpr, ctx)
+		if err != nil {
+			return nil, err
+		}
+		castType := u.castType
+		if castType == "" {
+			// Infer element type from array type suffix.
+			// Strip ALL [] suffixes to get the scalar base type (handles 2D arrays
+			// like int4[][] from array_agg(ARRAY[x]) where unnest flattens all dims).
+			at := exprType(arrResolved).Name
+			base := strings.ToLower(at)
+			for strings.HasSuffix(base, "[]") {
+				base = base[:len(base)-2]
+			}
+			if base != strings.ToLower(at) {
+				// Normalize type aliases → canonical form so int[]/integer[]/bigint[] etc. work.
+				switch base {
+				case "int4", "int", "integer":
+					castType = "int4"
+				case "int8", "bigint":
+					castType = "int8"
+				case "int2", "smallint":
+					castType = "int2"
+				case "float4", "real":
+					castType = "float4"
+				case "float8", "double precision", "float":
+					castType = "float8"
+				case "bool", "boolean":
+					castType = "bool"
+				case "numeric", "decimal":
+					castType = "numeric"
+				}
+			}
+		}
+		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved, CastType: castType}
+	}
+
 	// Resolve user SETOF function args against ctx. M0097-0020.
 	userSrfCols := make([]UserSrfCol, len(userSrfs))
 	for k, u := range userSrfs {
@@ -2566,6 +2800,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		pos:         s.Pos(),
 		Child:       child,
 		SrfCols:     srfCols,
+		UnnestCols:  unnestCols,
 		UserSrfCols: userSrfCols,
 		OtherExprs:  otherExprs,
 		schema:      schema,
@@ -2580,6 +2815,9 @@ func exprOutputName(e parser.Expr) string {
 		return x.Column
 	case *parser.FuncCall:
 		return strings.ToLower(x.Name.Name)
+	case *parser.ArraySubqueryExpr:
+		_ = x
+		return "array"
 	}
 	return "?column?"
 }
@@ -2600,6 +2838,12 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	}
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
+	}
+	if strings.EqualFold(tf.Name, "unnest") {
+		return planFromUnnest(rv, sourceIdx, lateralCtx)
+	}
+	if strings.EqualFold(tf.Name, "generate_subscripts") {
+		return planGenerateSubscripts(rv, sourceIdx, lateralCtx)
 	}
 	if !strings.EqualFold(tf.Name, "generate_series") {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
@@ -2633,20 +2877,124 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if len(rv.Columns) > 0 {
 		colName = rv.Columns[0]
 	}
+	// Use int4 when args are integer literals or int4-typed (PG overload resolution). M0097-0122.
+	seriesType := "int8"
+	if _, ok := start.(*IntegerConst); ok {
+		seriesType = "int4"
+	} else if t := exprType(start); t.Name == "int4" || t.Name == "integer" || t.Name == "int" {
+		seriesType = "int4"
+	}
 	tbl := &catalog.Table{
 		Name: alias,
 		Columns: []catalog.Column{
-			{Name: colName, Type: catalog.Type{Name: "int8"}, Ordinal: 0},
+			{Name: colName, Type: catalog.Type{Name: seriesType}, Ordinal: 0},
 		},
 	}
-	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: "int8"}, SourceTableIdx: sourceIdx}}
+	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: seriesType}, SourceTableIdx: sourceIdx}}
 	node := &GenerateSeries{pos: tf.Pos(), Start: start, Stop: stop, Step: step, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
 
 // planScalarFuncScan plans a scalar function in FROM clause that returns one
+// planGenerateSubscripts plans generate_subscripts(arr, dim[, reverse]) FROM clause SRF.
+// Returns 1..array_length(arr, dim) integer subscripts. M0097-0117.
+func planGenerateSubscripts(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) < 2 || len(tf.Args) > 3 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "generate_subscripts requires 2 or 3 arguments"}
+	}
+	ctx := &resolveContext{}
+	if lateralCtx != nil {
+		ctx = lateralCtx
+	}
+	arrExpr, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	dimExpr, err := resolveExpr(tf.Args[1], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	var revExpr Expr
+	if len(tf.Args) == 3 {
+		revExpr, err = resolveExpr(tf.Args[2], ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "generate_subscripts"
+	}
+	colName := alias
+	if len(rv.Columns) > 0 {
+		colName = rv.Columns[0]
+	}
+	tbl := &catalog.Table{
+		Name: alias,
+		Columns: []catalog.Column{
+			{Name: colName, Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+		},
+	}
+	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: "int4"}, SourceTableIdx: sourceIdx}}
+	node := &GenerateSubscripts{pos: tf.Pos(), ArrExpr: arrExpr, Dim: dimExpr, Reversed: revExpr, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
 // row with a single column of the given colType. Used for parse_ident etc.
+// planFromUnnest plans FROM unnest(array_expr) alias(col).
+// Expands an array expression into one row per element. M0097-0035.
+func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) != 1 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "unnest requires exactly 1 argument"}
+	}
+	// Resolve the array argument. Use lateralCtx if provided (LATERAL FROM).
+	ctx := &resolveContext{}
+	if lateralCtx != nil {
+		ctx = lateralCtx
+	}
+	arrExpr, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	// Infer the element type from the array expression type (strip ALL [] for 2D). M0097-0125.
+	elemTypeName := "text"
+	arrType := exprType(arrExpr)
+	{
+		base := arrType.Name
+		for strings.HasSuffix(base, "[]") {
+			base = base[:len(base)-2]
+		}
+		if base != arrType.Name && base != "" {
+			elemTypeName = base
+		}
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "unnest"
+	}
+	colName := alias
+	if len(rv.Columns) > 0 {
+		colName = rv.Columns[0]
+	}
+	elemType := catalog.Type{Name: elemTypeName}
+	tbl := &catalog.Table{
+		Name: alias,
+		Columns: []catalog.Column{
+			{Name: colName, Type: elemType, Ordinal: 0},
+		},
+	}
+	schema := Schema{SchemaColumn{Name: colName, Type: elemType, SourceTableIdx: sourceIdx}}
+	node := &FromUnnest{pos: tf.Pos(), ArrExpr: arrExpr, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
 func planScalarFuncScan(rv parser.RangeVar, sourceIdx int16, colType string) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
 	alias := rv.Alias
@@ -3024,6 +3372,8 @@ type aggregateSurface struct {
 	// funcDepCols maps input column index → output schema index for columns
 	// that are functionally determined by the GROUP BY key. M0097-0003.
 	funcDepCols map[int]int
+	// cat is the catalog, used to look up user-defined aggregates.
+	cat catalog.Catalog
 }
 
 type windowBinding struct {
@@ -3038,12 +3388,15 @@ type windowSurface struct {
 	windowByKey map[string]windowBinding
 }
 
-func needsAggregateStage(s *parser.SelectStmt) bool {
+func needsAggregateStage(s *parser.SelectStmt, cat catalog.Catalog) bool {
 	if len(s.GroupBy) > 0 {
 		return true
 	}
+	hasAgg := func(e parser.Expr) bool {
+		return exprHasAggregate(e) || exprHasUserAggregate(e, cat)
+	}
 	for _, t := range s.Targets {
-		if exprHasAggregate(t.Expr) {
+		if hasAgg(t.Expr) {
 			return true
 		}
 	}
@@ -3053,7 +3406,7 @@ func needsAggregateStage(s *parser.SelectStmt) bool {
 		return true
 	}
 	for _, sb := range s.OrderBy {
-		if exprHasAggregate(sb.Expr) {
+		if hasAgg(sb.Expr) {
 			return true
 		}
 	}
@@ -3335,7 +3688,7 @@ func walkExprForWindows(e parser.Expr, fn func(*parser.FuncCall) error) error {
 	return nil
 }
 
-func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext) (Node, *resolveContext, *aggregateSurface, Expr, error) {
+func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext, cat catalog.Catalog) (Node, *resolveContext, *aggregateSurface, Expr, error) {
 	groupExprs := make([]Expr, 0, len(s.GroupBy))
 	groupByExpr := map[string]int{}
 	groupByInputCol := map[int]int{}
@@ -3369,7 +3722,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		outputSchema = append(outputSchema, SchemaColumn{Name: groupExprName(r), Type: exprType(r)})
 	}
 
-	aggCalls, err := collectAggregateCalls(s)
+	aggCalls, err := collectAggregateCalls(s, cat)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -3380,14 +3733,82 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		if _, exists := aggByKey[k]; exists {
 			continue
 		}
-		pa, err := buildAggregateCall(fc, inputCtx)
+		pa, err := buildAggregateCall(fc, inputCtx, cat)
 		if err != nil {
 			return nil, nil, nil, nil, err
+		}
+		// Validate: for hypothetical-set aggregates (rank, dense_rank, cume_dist, percent_rank),
+		// direct args must not be ungrouped column refs. M0097-0122.
+		if isHypotheticalSetAggName(pa.Name) && pa.Arg != nil {
+			if cr, ok := pa.Arg.(*ColumnRef); ok {
+				if _, inGroup := groupByInputCol[cr.Index]; !inGroup {
+					qualName := cr.Name
+					for _, b := range inputCtx.bindings {
+						if b.table != nil && len(b.table.Columns) > 0 {
+							if cr.Index >= b.offset && cr.Index < b.offset+len(b.table.Columns) {
+								if b.alias != "" {
+									qualName = b.alias + "." + cr.Name
+								}
+								break
+							}
+						}
+					}
+					return nil, nil, nil, nil, &PlanError{
+						Pos:    fc.Pos(),
+						Code:   "42803",
+						Message: fmt.Sprintf(`column "%s" must appear in the GROUP BY clause or be used in an aggregate function`, qualName),
+						Detail:  "Direct arguments of an ordered-set aggregate must use only grouped columns.",
+					}
+				}
+			}
 		}
 		idx := len(outputSchema)
 		aggByKey[k] = aggregateBinding{index: idx, typ: pa.Type}
 		plannedAggs = append(plannedAggs, pa)
 		outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: pa.Type})
+	}
+
+	// Assign shared state slots for user-defined aggregates that share sfunc/stype/args/distinct/filter.
+	// PG calls sfunc once per row when multiple aggregates share the same transition state.
+	// This eliminates duplicate NOTICE/side-effect calls for identical sfunc invocations. M0097-0035.
+	{
+		type stateKey struct{ sfunc, stype, argKey, initcond string; distinct bool; filterKey string }
+		slotByKey := map[stateKey]int{}
+		nextSlot := 0
+		for i := range plannedAggs {
+			pa := &plannedAggs[i]
+			if pa.UserAgg == nil || pa.Distinct {
+				// Non-user aggregates and DISTINCT aggregates do not share state.
+				pa.SharedStateSlot = -1
+				continue
+			}
+			if pa.Filter != nil {
+				// Filtered aggregates share state only when filters match (handle via key).
+			}
+			argK := ""
+			if pa.Arg != nil {
+				argK = planExprContentKey(pa.Arg)
+			}
+			filterK := ""
+			if pa.Filter != nil {
+				filterK = planExprContentKey(pa.Filter)
+			}
+			sk := stateKey{
+				sfunc:     strings.ToLower(pa.UserAgg.SFunc),
+				stype:     strings.ToLower(pa.UserAgg.SType),
+				argKey:    argK,
+				distinct:  pa.Distinct,
+				filterKey: filterK,
+				initcond:  pa.UserAgg.InitCond, // aggregates with different INITCONDs must not share state
+			}
+			if slot, exists := slotByKey[sk]; exists {
+				pa.SharedStateSlot = slot
+			} else {
+				slotByKey[sk] = nextSlot
+				pa.SharedStateSlot = nextSlot
+				nextSlot++
+			}
+		}
 	}
 
 	aggNode := &Aggregate{
@@ -3407,6 +3828,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		aggregateByKey:  aggByKey,
 		node:            aggNode,
 		funcDepCols:     map[int]int{},
+		cat:             cat,
 	}
 
 	var having Expr
@@ -3520,6 +3942,14 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.SubqueryExpr:
 		return planSubqueryExpr(x, agg.input)
+	case *parser.ArraySubqueryExpr:
+		return planArraySubqueryExpr(x, agg.input)
+	case *parser.CollateExpr:
+		inner, err := resolveExprAfterAggregate(x.Operand, agg)
+		if err != nil {
+			return nil, err
+		}
+		return &CollateExpr{pos: x.Pos(), Operand: inner, CollationName: x.CollationName}, nil
 	case *parser.InExpr:
 		return planInExpr(x, agg.input)
 	case *parser.ExistsExpr:
@@ -3559,7 +3989,10 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 	case *parser.ParamRef:
 		return &ParamRef{pos: x.Pos(), Number: x.Number}, nil
 	case *parser.CaseExpr:
-		return resolveCaseExpr(x, agg.input)
+		// Resolve each sub-expression through the aggregate surface so that
+		// GROUP BY expressions inside the CASE are correctly remapped to the
+		// aggregate output ColumnRefs. M0097-0035.
+		return resolveCaseExprAfterAggregate(x, agg)
 	case *parser.ColumnRef:
 		resolved, err := resolveColumnRef(x, agg.input)
 		if err != nil {
@@ -3638,16 +4071,13 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			return nil, err
 		}
 		typeName := strings.ToLower(x.Type.Name)
-		var typmod int64
-		if len(x.Typmods) > 0 {
-			typmod = x.Typmods[0]
-		}
+		typmod := encodeTypmod(typeName, x.Typmods)
 		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod}, nil
 	case *parser.FuncCall:
 		if x.Over != nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
 		}
-		if isAggregateFunc(x) {
+		if isAggregateFunc(x) || isUserAggregateFunc(x, agg.cat) {
 			k := aggregateCallKey(x)
 			b, ok := agg.aggregateByKey[k]
 			if !ok {
@@ -3694,8 +4124,54 @@ func resolveTargetsAfterAggregate(targets []parser.ResTarget, agg *aggregateSurf
 	out := make([]Expr, 0, len(targets))
 	schema := make(Schema, 0, len(targets))
 	for _, t := range targets {
-		if _, ok := t.Expr.(*parser.StarExpr); ok {
-			return nil, nil, &PlanError{Pos: t.Pos(), Code: "0A000", Message: "SELECT * with GROUP BY/aggregate is not supported in v0 planner"}
+		if star, ok := t.Expr.(*parser.StarExpr); ok {
+			// Expand * into concrete column refs using the aggregate input context,
+			// then validate each column against the aggregate surface (GROUP BY or
+			// functional dependency). This mirrors PostgreSQL's expandRTE + GROUP BY
+			// column check. M0097-0099.
+			expanded, expandedSchema, err := expandStarTarget(star, agg.input)
+			if err != nil {
+				return nil, nil, err
+			}
+			for i, colExpr := range expanded {
+				cr := colExpr.(*ColumnRef)
+				var outExpr Expr
+				if outIdx, ok2 := agg.groupByInputCol[cr.Index]; ok2 {
+					outExpr = &ColumnRef{pos: cr.pos, Index: outIdx, Name: agg.output.schema[outIdx].Name, Type: agg.output.schema[outIdx].Type}
+				} else if outIdx, already := agg.funcDepCols[cr.Index]; already {
+					outExpr = &ColumnRef{pos: cr.pos, Index: outIdx, Name: agg.output.schema[outIdx].Name, Type: agg.output.schema[outIdx].Type}
+				} else if isColumnFunctionallyDetermined(cr, agg) {
+					outIdx := len(agg.node.schema)
+					sc := SchemaColumn{Name: cr.Name, Type: cr.Type, SourceTableIdx: cr.SourceTableIdx}
+					agg.node.schema = append(agg.node.schema, sc)
+					agg.output.schema = append(agg.output.schema, sc)
+					agg.node.Passthrough = append(agg.node.Passthrough, cr)
+					agg.funcDepCols[cr.Index] = outIdx
+					outExpr = &ColumnRef{pos: cr.pos, Index: outIdx, Name: sc.Name, Type: sc.Type}
+				} else {
+					colName := cr.Name
+					for _, b := range agg.input.bindings {
+						if b.sourceIdx == cr.SourceTableIdx {
+							tbl := b.alias
+							if tbl == "" {
+								tbl = b.table.Name
+							}
+							if tbl != "" {
+								colName = tbl + "." + cr.Name
+							}
+							break
+						}
+					}
+					return nil, nil, &PlanError{
+						Pos:     cr.pos,
+						Code:    "42803",
+						Message: fmt.Sprintf("column %q must appear in the GROUP BY clause or be used in an aggregate function", colName),
+					}
+				}
+				out = append(out, outExpr)
+				schema = append(schema, SchemaColumn{Name: expandedSchema[i].Name, Type: expandedSchema[i].Type})
+			}
+			continue
 		}
 		e, err := resolveExprAfterAggregate(t.Expr, agg)
 		if err != nil {
@@ -3748,10 +4224,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 			return nil, err
 		}
 		typeName := strings.ToLower(x.Type.Name)
-		var typmod int64
-		if len(x.Typmods) > 0 {
-			typmod = x.Typmods[0]
-		}
+		typmod := encodeTypmod(typeName, x.Typmods)
 		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: exprType(operand).Name, Typmod: typmod}, nil
 	case *parser.ExtractExpr:
 		src, err := resolveExprAfterWindow(x.Source, win)
@@ -3872,18 +4345,18 @@ func resolveTargetsAfterWindow(targets []parser.ResTarget, win *windowSurface) (
 	return out, schema, nil
 }
 
-func collectAggregateCalls(s *parser.SelectStmt) ([]*parser.FuncCall, error) {
+func collectAggregateCalls(s *parser.SelectStmt, cat catalog.Catalog) ([]*parser.FuncCall, error) {
 	seen := map[string]struct{}{}
 	out := make([]*parser.FuncCall, 0)
 	visit := func(e parser.Expr) error {
 		return walkExpr(e, func(fc *parser.FuncCall) error {
-			if !isAggregateFunc(fc) {
+			if !isAggregateFunc(fc) && !isUserAggregateFunc(fc, cat) {
 				return nil
 			}
 			if len(fc.Args) > 0 {
 				for _, a := range fc.Args {
 					if exprHasAggregate(a) {
-						return &PlanError{Pos: a.Pos(), Code: "42803", Message: "nested aggregate calls are not supported in v0 planner"}
+						return &PlanError{Pos: a.Pos(), Code: "42803", Message: "aggregate function calls cannot be nested"}
 					}
 				}
 			}
@@ -3954,7 +4427,17 @@ func isAggregateFunc(fc *parser.FuncCall) bool {
 	if fc.Over != nil {
 		return false
 	}
-	switch strings.ToLower(fc.Name.Name) {
+	name := strings.ToLower(fc.Name.Name)
+	// Ordered-set / hypothetical-set aggregates: rank, dense_rank, cume_dist,
+	// percent_rank are aggregate functions ONLY when WITHIN GROUP is present;
+	// otherwise they are window functions. M0097-0035.
+	if len(fc.WithinGroup) > 0 {
+		switch name {
+		case "rank", "dense_rank", "cume_dist", "percent_rank":
+			return true
+		}
+	}
+	switch name {
 	case "count", "sum", "avg", "min", "max",
 		// Statistical aggregates (M0097-0007)
 		"var_pop", "var_samp", "variance",
@@ -3989,6 +4472,34 @@ func exprHasAggregate(e parser.Expr) bool {
 	return found
 }
 
+// isUserAggregateFunc returns true if fc is a user-defined aggregate registered in cat.
+func isUserAggregateFunc(fc *parser.FuncCall, cat catalog.Catalog) bool {
+	if fc.Over != nil {
+		return false // window functions are not aggregates
+	}
+	if cat == nil {
+		return false
+	}
+	_, ok := cat.LookupUserAggregateByName(fc.Name.Name)
+	return ok
+}
+
+// exprHasUserAggregate returns true if the expression contains a call to a
+// user-defined aggregate registered in cat.
+func exprHasUserAggregate(e parser.Expr, cat catalog.Catalog) bool {
+	if cat == nil {
+		return false
+	}
+	found := false
+	_ = walkExpr(e, func(fc *parser.FuncCall) error {
+		if isUserAggregateFunc(fc, cat) {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
 func parserExprHasWindowFunc(e parser.Expr) bool {
 	found := false
 	_ = walkExprForWindows(e, func(fc *parser.FuncCall) error {
@@ -3998,6 +4509,31 @@ func parserExprHasWindowFunc(e parser.Expr) bool {
 		return nil
 	})
 	return found
+}
+
+// planExprContentKey returns a content-based string key for a planner Expr,
+// used to compare resolved expressions for aggregate state-sharing equality. M0097-0035.
+func planExprContentKey(e Expr) string {
+	if e == nil {
+		return "<nil>"
+	}
+	switch x := e.(type) {
+	case *ColumnRef:
+		return fmt.Sprintf("col:%d/%d", x.SourceTableIdx, x.Index)
+	case *IntegerConst:
+		return fmt.Sprintf("int:%d", x.Value)
+	case *StringConst:
+		return fmt.Sprintf("str:%s", x.Value)
+	case *FuncCall:
+		var b strings.Builder
+		b.WriteString("fn:" + strings.ToLower(x.Name))
+		for _, a := range x.Args {
+			b.WriteString("|" + planExprContentKey(a))
+		}
+		return b.String()
+	default:
+		return fmt.Sprintf("%T", e)
+	}
 }
 
 func aggregateCallKey(fc *parser.FuncCall) string {
@@ -4027,7 +4563,7 @@ func aggregateCallKey(fc *parser.FuncCall) string {
 	return b.String()
 }
 
-func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (AggregateCall, error) {
+func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catalog.Catalog) (AggregateCall, error) {
 	name := strings.ToLower(fc.Name.Name)
 	// Resolve the FILTER (WHERE ...) predicate up front so every return path
 	// below carries it — including count(*) and zero-arg aggregates, which
@@ -4035,14 +4571,79 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 	// counted every row). M0097-0007 / M0097-0032.
 	var filterExpr Expr
 	if fc.Filter != nil {
+		// Check for aggregates in FILTER before resolveExpr to produce the correct PG
+		// error message. PG distinguishes two cases (M0097-0124 / M0097-0125):
+		//   • top-level aggregate with agg in FILTER → "not allowed in FILTER"
+		//   • agg inside a scalar subquery whose FILTER contains another agg →
+		//     "aggregate function calls cannot be nested"
+		// The distinction maps to whether the current resolve context is a subquery
+		// (inputCtx.parent != nil).
+		if exprHasAggregate(fc.Filter) {
+			msg := "aggregate functions are not allowed in FILTER"
+			if inputCtx != nil && inputCtx.parent != nil {
+				msg = "aggregate function calls cannot be nested"
+			}
+			return AggregateCall{}, &PlanError{Pos: fc.Filter.Pos(), Code: "42803", Message: msg}
+		}
 		var ferr error
 		filterExpr, ferr = resolveExpr(fc.Filter, inputCtx)
 		if ferr != nil {
 			return AggregateCall{}, ferr
 		}
 	}
+	// Validate WITHIN GROUP for non-ordered-set aggregates early (before arg checks).
+	// This fires before the zero-arg early return so sum() WITHIN GROUP gives the right error. M0097-0035.
+	if len(fc.WithinGroup) > 0 {
+		switch name {
+		case "percentile_cont", "percentile_disc", "mode",
+			"rank", "dense_rank", "cume_dist", "percent_rank":
+			// OK — ordered-set aggregates; validation continues below.
+		default:
+			// Also allow user-defined ordered-set aggregates (e.g. test_rank, test_percentile_disc).
+			isUserOSA := false
+			if cat != nil {
+				if _, ok := cat.LookupUserAggregateByName(name); ok {
+					isUserOSA = true
+				}
+			}
+			if !isUserOSA {
+				return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
+					Message: fmt.Sprintf("%s is not an ordered-set aggregate, so it cannot have WITHIN GROUP", name)}
+			}
+		}
+	}
+
+	// DISTINCT ORDER BY validation: for agg(DISTINCT args ORDER BY cols),
+	// every ORDER BY expression must appear in the argument list. M0097-0035.
+	if fc.Distinct && len(fc.OrderBy) > 0 && len(fc.Args) > 0 {
+		argKeys := make(map[string]bool, len(fc.Args))
+		for _, arg := range fc.Args {
+			argKeys[parserExprKey(arg)] = true
+		}
+		for _, ob := range fc.OrderBy {
+			if !argKeys[parserExprKey(ob.Expr)] {
+				return AggregateCall{}, &PlanError{Pos: ob.Expr.Pos(), Code: "42P10",
+					Message: "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"}
+			}
+		}
+	}
+
 	if fc.Star {
-		if name != "count" || len(fc.Args) != 0 {
+		// User-defined star aggregates (e.g. newcnt(*)).
+		if name != "count" {
+			if cat != nil {
+				if ua, ok := cat.LookupUserAggregateByName(name); ok {
+					return AggregateCall{
+						pos:      fc.Pos(),
+						Name:     name,
+						Star:     true,
+						Distinct: fc.Distinct,
+						Type:     catalog.Type{Name: ua.SType},
+						Filter:   filterExpr,
+						UserAgg:  ua,
+					}, nil
+				}
+			}
 			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: "only count(*) is supported with * aggregate arguments"}
 		}
 		return AggregateCall{
@@ -4057,31 +4658,365 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 	// Many aggregates accept 0 or more args; only enforce 1-arg for the
 	// core ones. Extended aggregates (M0097-0007) may have 2+ args.
 	if len(fc.Args) == 0 {
-		// Zero-arg aggregates like count(*) handled above; all others need args.
-		return AggregateCall{
-			pos: fc.Pos(), Name: name, Distinct: fc.Distinct,
-			Type:   catalog.Type{Name: "numeric"},
-			Filter: filterExpr,
-		}, nil
+		// mode() is a zero-arg ordered-set aggregate whose ordering comes
+		// entirely from WITHIN GROUP — skip the early return and fall through
+		// to WITHIN GROUP processing below. M0097-0035.
+		if name != "mode" || len(fc.WithinGroup) == 0 {
+			return AggregateCall{
+				pos: fc.Pos(), Name: name, Distinct: fc.Distinct,
+				Type:   catalog.Type{Name: "numeric"},
+				Filter: filterExpr,
+			}, nil
+		}
 	}
-	argExpr, err := resolveExpr(fc.Args[0], inputCtx)
-	if err != nil {
-		return AggregateCall{}, err
+	// Resolve the primary argument. Zero-arg ordered-set aggregates (mode)
+	// have no Arg and skip this block. M0097-0035.
+	var argExpr Expr
+	var err error
+	if len(fc.Args) > 0 {
+		argExpr, err = resolveExpr(fc.Args[0], inputCtx)
+		if err != nil {
+			return AggregateCall{}, err
+		}
+	}
+	// Resolve optional second argument (two-argument aggregates: regr_*, covar_*, corr).
+	var argExpr2 Expr
+	if len(fc.Args) >= 2 {
+		argExpr2, err = resolveExpr(fc.Args[1], inputCtx)
+		if err != nil {
+			return AggregateCall{}, err
+		}
+	}
+	// Resolve WITHIN GROUP (ORDER BY ...) sort keys — ordered-set aggregates.
+	// M0097-0035: percentile_cont/disc, rank, dense_rank, mode.
+	var withinGroupKeys []SortKey
+	if len(fc.WithinGroup) > 0 {
+		// Validate: non-ordered-set aggregates reject WITHIN GROUP.
+		switch name {
+		case "percentile_cont", "percentile_disc", "mode",
+			"rank", "dense_rank", "cume_dist", "percent_rank":
+			// OK — these are built-in ordered-set / hypothetical-set aggregates.
+		default:
+			// User-defined ordered-set aggregates (e.g. test_rank with finalfunc=rank_final)
+			// are also allowed. Detect by checking if the aggregate is in the catalog.
+			// Any user-defined aggregate called with WITHIN GROUP is accepted here;
+			// the executor's finishWithinGroupAgg routes based on UserAgg.FinalFunc.
+			isUserOrderedSet := false
+			if cat != nil {
+				if _, ok := cat.LookupUserAggregateByName(name); ok {
+					isUserOrderedSet = true
+				}
+			}
+			if !isUserOrderedSet {
+				return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
+					Message: fmt.Sprintf("%s is not an ordered-set aggregate, so it cannot have WITHIN GROUP", name)}
+			}
+		}
+		// Validate: WITHIN GROUP conflicts with ORDER BY inside the call args.
+		if len(fc.OrderBy) > 0 {
+			return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42P13",
+				Message: "cannot use multiple ORDER BY clauses with WITHIN GROUP"}
+		}
+		for _, sb := range fc.WithinGroup {
+			e, serr := resolveExpr(sb.Expr, inputCtx)
+			if serr != nil {
+				return AggregateCall{}, serr
+			}
+			// Validate: WITHIN GROUP ORDER BY cannot reference outer-scope columns.
+			// PostgreSQL error: "outer-level aggregate cannot contain a lower-level variable
+			// in its direct arguments". M0097-0127.
+			walkExprTree(e, func(inner Expr) {
+				if _, isOuter := inner.(*OuterColumnRef); isOuter {
+					serr = &PlanError{Pos: fc.Pos(), Code: "0A000",
+						Message: "outer-level aggregate cannot contain a lower-level variable in its direct arguments"}
+				}
+			})
+			if serr != nil {
+				return AggregateCall{}, serr
+			}
+			withinGroupKeys = append(withinGroupKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
+		}
+		// Validate: collation mismatch between direct arg and WITHIN GROUP ORDER BY key.
+		// PostgreSQL rejects "rank('adam'::text collate "C") within group (order by x collate "POSIX")".
+		// M0097-0127.
+		if ac, ok := argExpr.(*CollateExpr); ok {
+			for _, wk := range withinGroupKeys {
+				if wc, ok2 := wk.Expr.(*CollateExpr); ok2 {
+					if !strings.EqualFold(ac.CollationName, wc.CollationName) {
+						return AggregateCall{}, &PlanError{
+							Pos:  fc.Pos(),
+							Code: "42P21",
+							Message: fmt.Sprintf(
+								"collation mismatch between explicit collations %q and %q",
+								ac.CollationName, wc.CollationName),
+						}
+					}
+				}
+			}
+		}
+		// Hypothetical-set aggregates require exactly one direct arg per ordering column.
+		// This includes built-in (rank, etc.) and user-defined hypothetical-set aggregates.
+		isHypotheticalSet := false
+		switch name {
+		case "rank", "dense_rank", "cume_dist", "percent_rank":
+			isHypotheticalSet = true
+		default:
+			if cat != nil {
+				if ua, ok := cat.LookupUserAggregateByName(name); ok {
+					switch strings.ToLower(ua.FinalFunc) {
+					case "rank_final", "dense_rank_final", "percent_rank_final", "cume_dist_final":
+						isHypotheticalSet = true
+					}
+				}
+			}
+		}
+		if isHypotheticalSet {
+			nDirect := len(fc.Args)
+			nOrder := len(withinGroupKeys)
+			if nDirect != nOrder {
+				// Build "function rank(type1, type2, ...) does not exist" message matching PG.
+				var sigParts []string
+				for i, arg := range fc.Args {
+					ra, _ := resolveExpr(arg, inputCtx)
+					t := exprType(ra).Name
+					if t == "" || t == "unknown" {
+						t = "text"
+					}
+					// Integer literals default to "integer" (int4) in PG error messages. M0097-0122.
+					if _, isInt := arg.(*parser.IntegerConst); isInt && (t == "int8" || t == "bigint") {
+						t = "integer"
+					}
+					_ = i
+					sigParts = append(sigParts, t)
+				}
+				for _, sk := range withinGroupKeys {
+					t := exprType(sk.Expr).Name
+					if t == "" || t == "unknown" {
+						t = "text"
+					}
+					sigParts = append(sigParts, t)
+				}
+				return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
+					Message: fmt.Sprintf("function %s(%s) does not exist", name, strings.Join(sigParts, ", ")),
+					Hint: fmt.Sprintf("To use the hypothetical-set aggregate %s, the number of hypothetical direct arguments (here %d) must match the number of ordering columns (here %d).",
+						name, nDirect, nOrder),
+				}
+			}
+				// Validate that direct arg types are compatible with ordering column types.
+			for i, argE := range fc.Args {
+				resolvedArg, aerr := resolveExpr(argE, inputCtx)
+				if aerr != nil {
+					return AggregateCall{}, aerr
+				}
+				argT := exprType(resolvedArg).Name
+				orderT := exprType(withinGroupKeys[i].Expr).Name
+				// If the direct arg is a text/unknown literal and the ORDER BY column is
+				// numeric, wrap the main argExpr in an explicit cast so it coerces at
+				// runtime (e.g. rank('3') within group (order by int_col)).
+				// Invalid strings ('fred') will then fail at runtime with a type error,
+				// matching PostgreSQL's behavior.
+				aLow := strings.ToLower(argT)
+				oLow := strings.ToLower(orderT)
+				isNumericOrderT := func(t string) bool {
+					switch t {
+					case "int2", "int4", "int8", "int", "integer", "smallint", "bigint",
+						"float4", "float8", "real", "double precision", "numeric", "decimal":
+						return true
+					}
+					return false
+				}
+				if (aLow == "text" || aLow == "unknown") && isNumericOrderT(oLow) {
+					if i == 0 {
+						argExpr = &CastExpr{Operand: argExpr, TargetType: orderT}
+					}
+					argT = orderT
+				}
+				if !isTypeCompatibleForHypothetical(argT, orderT) {
+					// Integer literals display as "integer" (int4) in PG error messages. M0097-0122.
+					displayArgT := argT
+					if _, isInt := argE.(*parser.IntegerConst); isInt && (argT == "int8" || argT == "bigint") {
+						displayArgT = "integer"
+					}
+					return AggregateCall{}, &PlanError{Pos: argE.Pos(), Code: "42P13",
+						Message: fmt.Sprintf("WITHIN GROUP types %s and %s cannot be matched",
+							withinGroupTypeName(orderT), withinGroupTypeName(displayArgT))}
+				}
+			}
+		}
+	} else {
+		// Validate: ordered-set aggregates require WITHIN GROUP (unless window func).
+		switch name {
+		case "percentile_cont", "percentile_disc":
+			if fc.Over == nil {
+				return AggregateCall{}, &PlanError{Pos: fc.Pos(), Code: "42809",
+					Message: fmt.Sprintf("WITHIN GROUP is required for ordered-set aggregate %s", name)}
+			}
+		}
 	}
 	outType := catalog.Type{Name: "unknown"}
 	switch name {
 	case "count":
 		outType = catalog.Type{Name: "int8"}
+	case "array_agg":
+		// array_agg(expr) returns the element type with [] suffix. M0097-0035.
+		if argExpr != nil {
+			et := exprType(argExpr)
+			if et.Name != "" && et.Name != "unknown" {
+				outType = catalog.Type{Name: et.Name + "[]"}
+			} else {
+				outType = catalog.Type{Name: "text[]"}
+			}
+		} else {
+			outType = catalog.Type{Name: "text[]"}
+		}
 	case "sum":
 		outType = exprType(argExpr)
 		if strings.EqualFold(outType.Name, "unknown") || outType.Name == "" {
 			outType = catalog.Type{Name: "int8"}
 		}
 	case "avg":
-		outType = catalog.Type{Name: "numeric"}
+		// avg(float4/float8) returns float8; avg(integer types) returns numeric. M0097-0020.
+		argType := exprType(argExpr)
+		if isFloatTypeName(argType.Name) {
+			outType = catalog.Type{Name: "float8"}
+		} else {
+			outType = catalog.Type{Name: "numeric"}
+		}
+	case "string_agg":
+		// string_agg(expr, delimiter) returns the same type as its first arg
+		// (text for text input, bytea for bytea input). M0097-0115.
+		outType = exprType(argExpr)
+		if outType.Name == "" || outType.Name == "unknown" {
+			outType = catalog.Type{Name: "text"}
+		}
 	case "min", "max":
 		outType = exprType(argExpr)
+	case "regr_count":
+		outType = catalog.Type{Name: "int8"}
+	case "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy",
+		"regr_r2", "regr_slope", "regr_intercept",
+		"covar_pop", "covar_samp", "corr":
+		outType = catalog.Type{Name: "float8"}
+	// Ordered-set aggregates (M0097-0035).
+	case "percentile_cont":
+		// percentile_cont always returns float8 for numeric/float inputs because
+		// linear interpolation produces a float8 value. For float4 ORDER BY,
+		// PG upcasts to float8 internally. M0097-0115.
+		if len(withinGroupKeys) > 0 {
+			wgType := exprType(withinGroupKeys[0].Expr)
+			if isFloat4TypeName(wgType.Name) {
+				outType = catalog.Type{Name: "float8"}
+			} else if wgType.Name != "" && wgType.Name != "unknown" {
+				outType = wgType
+			} else {
+				outType = catalog.Type{Name: "float8"}
+			}
+		} else {
+			outType = catalog.Type{Name: "float8"}
+		}
+	case "percentile_disc":
+		if len(withinGroupKeys) > 0 {
+			wgType := exprType(withinGroupKeys[0].Expr)
+			if wgType.Name != "" && wgType.Name != "unknown" {
+				outType = wgType
+			} else {
+				outType = catalog.Type{Name: "numeric"}
+			}
+		} else {
+			outType = catalog.Type{Name: "numeric"}
+		}
+	case "rank", "dense_rank":
+		outType = catalog.Type{Name: "int8"}
+	case "cume_dist", "percent_rank":
+		outType = catalog.Type{Name: "float8"}
+	case "mode":
+		if len(withinGroupKeys) > 0 {
+			wgType := exprType(withinGroupKeys[0].Expr)
+			if wgType.Name != "" && wgType.Name != "unknown" {
+				outType = wgType
+			} else {
+				outType = catalog.Type{Name: "numeric"}
+			}
+		} else {
+			outType = catalog.Type{Name: "numeric"}
+		}
 	default:
+		// Check for user-defined aggregate in catalog.
+		if cat != nil {
+			if ua, ok := cat.LookupUserAggregateByName(name); ok {
+				// Determine return type: for ordered-set aggregates with known finalfuncs,
+				// use the same type as the corresponding built-in.
+				switch strings.ToLower(ua.FinalFunc) {
+				case "rank_final", "dense_rank_final":
+					outType = catalog.Type{Name: "int8"}
+				case "percent_rank_final", "cume_dist_final":
+					outType = catalog.Type{Name: "float8"}
+				case "percentile_disc_final":
+					if len(withinGroupKeys) > 0 {
+						wgType := exprType(withinGroupKeys[0].Expr)
+						if wgType.Name != "" && wgType.Name != "unknown" {
+							outType = wgType
+						} else {
+							outType = catalog.Type{Name: "numeric"}
+						}
+					} else {
+						outType = catalog.Type{Name: "numeric"}
+					}
+				case "percentile_cont_final":
+					outType = catalog.Type{Name: "float8"}
+				case "mode_final":
+					if len(withinGroupKeys) > 0 {
+						wgType := exprType(withinGroupKeys[0].Expr)
+						if wgType.Name != "" && wgType.Name != "unknown" {
+							outType = wgType
+						} else {
+							outType = catalog.Type{Name: "numeric"}
+						}
+					} else {
+						outType = catalog.Type{Name: "numeric"}
+					}
+				default:
+					// Non-ordered-set user-defined aggregate: use stype or numeric default.
+					if ua.FinalFunc != "" {
+						outType = catalog.Type{Name: "numeric"}
+					} else {
+						outType = catalog.Type{Name: ua.SType}
+					}
+				}
+				// Resolve ORDER BY inside the aggregate call.
+				var orderByKeys []SortKey
+				for _, sb := range fc.OrderBy {
+					e, serr := resolveExpr(sb.Expr, inputCtx)
+					if serr != nil {
+						return AggregateCall{}, serr
+					}
+					orderByKeys = append(orderByKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
+				}
+				// Resolve extra args beyond the second (e.g. aggfns(a,b,c) has c as ExtraArgs[0]).
+				var extraArgs []Expr
+				for i := 2; i < len(fc.Args); i++ {
+					ea, earr := resolveExpr(fc.Args[i], inputCtx)
+					if earr != nil {
+						return AggregateCall{}, earr
+					}
+					extraArgs = append(extraArgs, ea)
+				}
+				return AggregateCall{
+					pos:                fc.Pos(),
+					Name:               name,
+					Arg:                argExpr,
+					Arg2:               argExpr2,
+					ExtraArgs:          extraArgs,
+					Distinct:           fc.Distinct,
+					Type:               outType,
+					Filter:             filterExpr,
+					OrderBy:            orderByKeys,
+					WithinGroup:        len(withinGroupKeys) > 0,
+					WithinGroupOrderBy: withinGroupKeys,
+					UserAgg:            ua,
+				}, nil
+			}
+		}
 		// Extended aggregates (M0097-0007): accept but return null/stub type.
 		outType = catalog.Type{Name: "numeric"}
 	}
@@ -4094,14 +5029,42 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext) (Aggregat
 		}
 		orderByKeys = append(orderByKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
 	}
+	// Capture input type for precision-sensitive aggregates (float4 sum/variance).
+	var inputType catalog.Type
+	if argExpr != nil {
+		inputType = exprType(argExpr)
+	}
+	// Capture ORDER BY column type for ordered-set aggregates (percentile_cont float4 rounding).
+	var withinGroupKeyType catalog.Type
+	if len(withinGroupKeys) > 0 {
+		withinGroupKeyType = exprType(withinGroupKeys[0].Expr)
+	}
+	// For hypothetical-set aggregates with multiple direct args (e.g. rank(5,'AZZZZ',50)),
+	// store the extra direct args in ExtraArgs for multi-key tuple comparison at runtime.
+	var hypotheticalExtraArgs []Expr
+	if len(withinGroupKeys) > 0 && len(fc.Args) > 1 {
+		for _, extraArgE := range fc.Args[1:] {
+			ea, eerr := resolveExpr(extraArgE, inputCtx)
+			if eerr != nil {
+				return AggregateCall{}, eerr
+			}
+			hypotheticalExtraArgs = append(hypotheticalExtraArgs, ea)
+		}
+	}
 	return AggregateCall{
-		pos:      fc.Pos(),
-		Name:     name,
-		Arg:      argExpr,
-		Distinct: fc.Distinct,
-		Type:     outType,
-		Filter:   filterExpr,
-		OrderBy:  orderByKeys,
+		pos:                fc.Pos(),
+		Name:               name,
+		Arg:                argExpr,
+		Arg2:               argExpr2,
+		ExtraArgs:          hypotheticalExtraArgs,
+		Distinct:           fc.Distinct,
+		Type:               outType,
+		InputType:          inputType,
+		WithinGroupKeyType: withinGroupKeyType,
+		Filter:             filterExpr,
+		OrderBy:            orderByKeys,
+		WithinGroup:        len(withinGroupKeys) > 0,
+		WithinGroupOrderBy: withinGroupKeys,
 	}, nil
 }
 
@@ -4294,7 +5257,8 @@ func isConstantExpr(e Expr) bool {
 	switch x := e.(type) {
 	case *ColumnRef, *OuterColumnRef:
 		return false
-	case *SubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr, *IsBoolExpr, *IsDistinctFromExpr:
+	case *SubqueryExpr, *ArraySubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr, *IsBoolExpr, *IsDistinctFromExpr,
+		*MultiAssignSubqElem, *MultiAssignSubqRow:
 		return false
 	case *BinaryOp:
 		return isConstantExpr(x.Left) && isConstantExpr(x.Right)
@@ -4529,7 +5493,19 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 		s.Rows = [][]parser.Expr{row}
 		s.DefaultValues = false
 	}
-	for _, r := range s.Rows {
+	for ri, r := range s.Rows {
+		// When no explicit column list and the row is shorter than the
+		// column count, pad with DefaultMarkers so substitution handles
+		// them (PostgreSQL behaviour: trailing missing columns get DEFAULT).
+		if len(s.Columns) == 0 && len(r) < len(colIndex) {
+			padded := make([]parser.Expr, len(colIndex))
+			copy(padded, r)
+			for i := len(r); i < len(colIndex); i++ {
+				padded[i] = &parser.DefaultMarker{}
+			}
+			s.Rows[ri] = padded
+			r = padded
+		}
 		if len(r) != len(colIndex) {
 			// planInsert raises the arity error; skip rewriting and let
 			// it surface uniformly.
@@ -4571,10 +5547,37 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 		return nil
 	}
 	for i := range s.Set {
-		if _, ok := s.Set[i].Expr.(*parser.DefaultMarker); !ok {
+		a := &s.Set[i]
+		if len(a.Columns) > 0 {
+			// Multi-column tuple form: RHS is a *parser.RowExpr whose Elems
+			// may contain DefaultMarker values.
+			row, ok := a.Expr.(*parser.RowExpr)
+			if !ok {
+				continue
+			}
+			for j, colName := range a.Columns {
+				if j >= len(row.Elems) {
+					break
+				}
+				if _, ok := row.Elems[j].(*parser.DefaultMarker); !ok {
+					continue
+				}
+				col, ok := cat.LookupColumn(tbl, colName)
+				if !ok {
+					return nil
+				}
+				if def := tbl.Columns[col.Ordinal].DefaultExpr; def != nil {
+					row.Elems[j] = def
+				} else {
+					row.Elems[j] = &parser.NullConst{}
+				}
+			}
 			continue
 		}
-		col, ok := cat.LookupColumn(tbl, s.Set[i].Column)
+		if _, ok := a.Expr.(*parser.DefaultMarker); !ok {
+			continue
+		}
+		col, ok := cat.LookupColumn(tbl, a.Column)
 		if !ok {
 			// planUpdate / analyzer will raise 42703 for unknown
 			// columns; leave the marker so the error path stays
@@ -4582,9 +5585,9 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 			return nil
 		}
 		if def := tbl.Columns[col.Ordinal].DefaultExpr; def != nil {
-			s.Set[i].Expr = def
+			a.Expr = def
 		} else {
-			s.Set[i].Expr = &parser.NullConst{}
+			a.Expr = &parser.NullConst{}
 		}
 	}
 	return nil
@@ -4648,6 +5651,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		}
 		rows := make([][]Expr, 0, len(s.Rows))
 		for _, r := range s.Rows {
+			// Short rows padded with DefaultMarker in rewriteInsertDefaultMarkers.
 			if len(r) != len(colIndex) {
 				return nil, &PlanError{
 					Pos:     s.Pos(),
@@ -4656,7 +5660,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 				}
 			}
 			row := make([]Expr, 0, len(r))
-			ctx := &resolveContext{} // VALUES rows have no input columns
+			ctx := &resolveContext{cat: cat} // VALUES rows have no input columns but may contain scalar subqueries
 			for _, e := range r {
 				pe, err := resolveExpr(e, ctx)
 				if err != nil {
@@ -4786,15 +5790,9 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 
 	out.UpdateSet = make([]Expr, n)
 	for _, a := range oc.UpdateSet {
-		col, ok := cat.LookupColumn(tbl, a.Column)
-		if !ok {
-			return nil, &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
-		}
-		expr, err := resolveExpr(a.Expr, ctx)
-		if err != nil {
+		if err := applyUpdateAssign(a, tbl, out.UpdateSet, ctx, cat); err != nil {
 			return nil, err
 		}
-		out.UpdateSet[col.Ordinal] = expr
 	}
 	if oc.UpdateWhere != nil {
 		pred, err := resolveExpr(oc.UpdateWhere, ctx)
@@ -4974,6 +5972,74 @@ func insertValuesSchema(tbl *catalog.Table, colIndex []int) Schema {
 	return out
 }
 
+// applyUpdateAssign resolves one SET assignment (single- or multi-column form)
+// and stores the resulting expression(s) into the set slice indexed by column ordinal.
+// applyUpdateAssign resolves one SET assignment (single- or multi-column form)
+// and stores the resulting expression(s) into the set slice indexed by column ordinal.
+func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ctx *resolveContext, cat catalog.Catalog) error {
+	if len(a.Columns) > 0 {
+		// Multi-column tuple form: (c1, c2, ...) = (e1, e2, ...) or subquery.
+		switch rhs := a.Expr.(type) {
+		case *parser.RowExpr:
+			// Row-constructor form: (c1,c2,c3) = (e1,e2,e3).
+			// After rewriteUpdateDefaultMarkers, DefaultMarkers have been replaced.
+			if len(rhs.Elems) != len(a.Columns) {
+				return &PlanError{Pos: a.Pos(), Code: "42601", Message: fmt.Sprintf("number of columns (%d) does not match number of values (%d)", len(a.Columns), len(rhs.Elems))}
+			}
+			for i, colName := range a.Columns {
+				col, ok := cat.LookupColumn(tbl, colName)
+				if !ok {
+					return &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", colName, tbl.Name)}
+				}
+				expr, err := resolveExpr(rhs.Elems[i], ctx)
+				if err != nil {
+					return err
+				}
+				set[col.Ordinal] = expr
+			}
+			return nil
+		case *parser.SubqueryExpr:
+			// Subquery form: (c1, c2) = (SELECT x, y FROM ...).
+			// Build the inner plan once and create MultiAssignSubqElem per column.
+			innerPlan, err := planSelectWithParent(rhs.Inner, cat, ctx)
+			if err != nil {
+				return err
+			}
+			sharedRow := &MultiAssignSubqRow{
+				pos:             a.Pos(),
+				Plan:            innerPlan,
+				NCols:           len(a.Columns),
+				IsNonCorrelated: !planHasOuterRef(innerPlan),
+			}
+			for i, colName := range a.Columns {
+				col, ok := cat.LookupColumn(tbl, colName)
+				if !ok {
+					return &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", colName, tbl.Name)}
+				}
+				set[col.Ordinal] = &MultiAssignSubqElem{
+					pos:    a.Pos(),
+					Row:    sharedRow,
+					ColIdx: i,
+				}
+			}
+			return nil
+		default:
+			return &PlanError{Pos: a.Pos(), Code: "0A000", Message: "unsupported RHS for multi-column SET assignment"}
+		}
+	}
+	// Single-column form.
+	col, ok := cat.LookupColumn(tbl, a.Column)
+	if !ok {
+		return &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
+	}
+	expr, err := resolveExpr(a.Expr, ctx)
+	if err != nil {
+		return err
+	}
+	set[col.Ordinal] = expr
+	return nil
+}
+
 func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	restore, _, err := preplanWithClause(s.With, cat)
 	if err != nil {
@@ -4989,7 +6055,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	// are appended as additional bindings so that SET and WHERE expressions can
 	// reference their columns.  M0097-0065.
 	var fromTables []*catalog.Table
-	var fromScans []*SeqScan
+	var fromScans []Node
 	var fromSchema Schema
 	if len(s.From) > 0 {
 		bindings := []rangeBinding{
@@ -4998,22 +6064,35 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		sch := tableSchemaWithSource(tbl, 1)
 		offset := len(tbl.Columns)
 		for idx, rv := range s.From {
-			fromTbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
-			if !ok {
-				return nil, &PlanError{Pos: rv.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", rv.Name)}
-			}
 			si := int16(idx + 2) // sourceIdx 2, 3, … for FROM tables
-			alias := rv.Alias
+			fromNode, fromBinding, err2 := planScanRangeVar(rv, cat, si, nil)
+			if err2 != nil {
+				return nil, err2
+			}
+			fromTbl := fromBinding.table
+			// Build a schema with sourceIdx assigned.
+			fromSch := tableSchemaWithSource(fromTbl, si)
+			alias := fromBinding.alias
 			if alias == "" {
-				alias = strings.ToLower(rv.Name)
+				alias = rv.Alias
+				if alias == "" {
+					alias = strings.ToLower(rv.Name)
+				}
 			}
 			bindings = append(bindings, rangeBinding{
 				table: fromTbl, alias: alias, offset: offset, sourceIdx: si,
 			})
-			fromSchema = append(fromSchema, tableSchemaWithSource(fromTbl, si)...)
-			sch = append(sch, tableSchemaWithSource(fromTbl, si)...)
-			fromTables = append(fromTables, fromTbl)
-			fromScans = append(fromScans, &SeqScan{pos: rv.Pos(), Table: fromTbl, schema: tableSchemaWithSource(fromTbl, si)})
+			fromSchema = append(fromSchema, fromSch...)
+			sch = append(sch, fromSch...)
+			// For real tables (SeqScan-backed), record the catalog table for
+			// inheritance scanning. For subqueries, append nil — the executor
+			// will drive the plan node from FromScans[i] instead.
+			if _, isSeq := fromNode.(*SeqScan); isSeq {
+				fromTables = append(fromTables, fromTbl)
+			} else {
+				fromTables = append(fromTables, nil)
+			}
+			fromScans = append(fromScans, fromNode)
 			offset += len(fromTbl.Columns)
 		}
 		ctx := newResolveContext(bindings, sch)
@@ -5028,15 +6107,9 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		}
 		set := make([]Expr, len(tbl.Columns))
 		for _, a := range s.Set {
-			col, ok := cat.LookupColumn(tbl, a.Column)
-			if !ok {
-				return nil, &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
-			}
-			expr, err := resolveExpr(a.Expr, ctx)
-			if err != nil {
+			if err := applyUpdateAssign(a, tbl, set, ctx, cat); err != nil {
 				return nil, err
 			}
-			set[col.Ordinal] = expr
 		}
 		// The target scan has NO filter; the executor does the nested-loop
 		// cross-product and applies FromPred against the combined row. M0097-0065.
@@ -5079,15 +6152,9 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	}
 	set := make([]Expr, len(tbl.Columns))
 	for _, a := range s.Set {
-		col, ok := cat.LookupColumn(tbl, a.Column)
-		if !ok {
-			return nil, &PlanError{Pos: a.Pos(), Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", a.Column, tbl.Name)}
-		}
-		expr, err := resolveExpr(a.Expr, ctx)
-		if err != nil {
+		if err := applyUpdateAssign(a, tbl, set, ctx, cat); err != nil {
 			return nil, err
 		}
-		set[col.Ordinal] = expr
 	}
 	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set}
 	if len(s.Returning) > 0 {
@@ -5111,6 +6178,74 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
+
+	// DELETE … USING (M0097-0076): build a combined resolve context
+	// over the target plus all USING tables so that WHERE and
+	// RETURNING can reference USING-table columns. Mirrors the
+	// UPDATE … FROM path in planUpdate.
+	if len(s.Using) > 0 {
+		var usingTables []*catalog.Table
+		var usingScans []Node
+		var usingSchema Schema
+		bindings := []rangeBinding{
+			{table: tbl, alias: s.Target.Alias, offset: 0, sourceIdx: 1},
+		}
+		sch := tableSchemaWithSource(tbl, 1)
+		offset := len(tbl.Columns)
+		for idx, rv := range s.Using {
+			si := int16(idx + 2) // sourceIdx 2, 3, … for USING tables
+			usingNode, usingBinding, err2 := planScanRangeVar(rv, cat, si, nil)
+			if err2 != nil {
+				return nil, err2
+			}
+			useTbl := usingBinding.table
+			useSch := tableSchemaWithSource(useTbl, si)
+			alias := usingBinding.alias
+			if alias == "" {
+				alias = rv.Alias
+				if alias == "" {
+					alias = strings.ToLower(rv.Name)
+				}
+			}
+			bindings = append(bindings, rangeBinding{
+				table: useTbl, alias: alias, offset: offset, sourceIdx: si,
+			})
+			usingSchema = append(usingSchema, useSch...)
+			sch = append(sch, useSch...)
+			if _, isSeq := usingNode.(*SeqScan); isSeq {
+				usingTables = append(usingTables, useTbl)
+			} else {
+				usingTables = append(usingTables, nil)
+			}
+			usingScans = append(usingScans, usingNode)
+			offset += len(useTbl.Columns)
+		}
+		ctx := newResolveContext(bindings, sch)
+		ctx.cat = cat
+		var pred Expr
+		if s.Where != nil {
+			pred, err = resolveExpr(s.Where, ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(tbl, 1)}
+		del := &Delete{
+			pos: s.Pos(), Table: tbl, Child: tgtScan,
+			UsingTables: usingTables, UsingScans: usingScans, UsingSchema: usingSchema,
+			UsingPred: pred,
+		}
+		if len(s.Returning) > 0 {
+			retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
+			if err != nil {
+				return nil, err
+			}
+			del.Returning = retExprs
+			del.ReturningSchema = retSchema
+		}
+		return del, nil
+	}
+
 	ctx := singleBindingContext(tbl, s.Target.Alias)
 	// When an explicit alias is set, using the original table name in WHERE
 	// must produce the PostgreSQL-specific error. M0097-0003.
@@ -5485,7 +6620,8 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if fc, ok := e.(*FuncCall); ok && fc.Name != "" {
 		// array_construct is the lowered form of ARRAY[...]; PostgreSQL
 		// FigureColname returns "array" for ArrayExpr nodes. M0097-0065.
-		if fc.Name == "array_construct" {
+		// array_subscript is the lowered form of arr[idx]; PG also returns "array".
+		if fc.Name == "array_construct" || fc.Name == "array_subscript" {
 			return "array", exprType(e)
 		}
 		return fc.Name, exprType(e)
@@ -5510,11 +6646,41 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if _, ok := e.(*ExtractExpr); ok {
 		return "extract", exprType(e)
 	}
+	// Propagate the inner query's first output column name so that
+	// `(SELECT min(x) FROM t)` renders as "min" not "?column?". M0097-0035.
+	if sq, ok := e.(*SubqueryExpr); ok && sq.Plan != nil {
+		if sch := sq.Plan.Output(); len(sch) > 0 && sch[0].Name != "" && sch[0].Name != "?column?" {
+			return sch[0].Name, sch[0].Type
+		}
+	}
+	// ARRAY(SELECT ...) always renders as column name "array". M0097-0127.
+	if _, ok := e.(*ArraySubqueryExpr); ok {
+		return "array", exprType(e)
+	}
 	return "?column?", exprType(e)
 }
 
 // castTargetLabel maps a cast target type name to the PostgreSQL column label
 // used for that type when the cast result has no explicit alias. M0097-0003.
+// encodeTypmod encodes the typmod for a cast target type.
+// For numeric(P,S), returns (P<<16)|S so the executor can decode both.
+// For other types, returns Typmods[0] if present (existing behaviour).
+func encodeTypmod(typeName string, typmods []int64) int64 {
+	switch strings.ToLower(typeName) {
+	case "numeric", "decimal":
+		if len(typmods) >= 2 {
+			return (typmods[0] << 16) | typmods[1]
+		} else if len(typmods) == 1 {
+			return typmods[0]
+		}
+	default:
+		if len(typmods) > 0 {
+			return typmods[0]
+		}
+	}
+	return 0
+}
+
 func castTargetLabel(t string) string {
 	switch t {
 	case "boolean":
@@ -5647,6 +6813,16 @@ func exprType(e Expr) catalog.Type {
 		// FuncCalls reach here with no type carried. Match the
 		// known-typed builtins; everything else stays unknown.
 		switch strings.ToLower(x.Name) {
+		// Type-cast functions: single-arg calls like float8(expr) act as explicit casts.
+		// Return the target type so downstream type inference (BinaryOp, wire) is correct.
+		case "float8", "double precision", "double", "float":
+			if len(x.Args) == 1 {
+				return catalog.Type{Name: "float8"}
+			}
+		case "float4", "real":
+			if len(x.Args) == 1 {
+				return catalog.Type{Name: "float4"}
+			}
 		case "count":
 			return catalog.Type{Name: "int8"}
 		case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
@@ -5667,6 +6843,45 @@ func exprType(e Expr) catalog.Type {
 			"cardinality", "strpos", "position":
 			// String/array length functions return int4. M0097-0003.
 			return catalog.Type{Name: "int4"}
+		case "array_agg":
+			// array_agg(expr) returns the element type with [] suffix. M0097-0035.
+			if len(x.Args) > 0 {
+				et := exprType(x.Args[0])
+				if et.Name != "" && et.Name != "unknown" {
+					return catalog.Type{Name: et.Name + "[]"}
+				}
+			}
+			return catalog.Type{Name: "text[]"}
+		case "array_construct":
+			// ARRAY[e1,...] constructor: return element type with [] suffix.
+			if len(x.Args) > 0 {
+				et := exprType(x.Args[0])
+				if et.Name != "" {
+					return catalog.Type{Name: et.Name + "[]"}
+				}
+			}
+			return catalog.Type{Name: "text[]"}
+		case "array_subscript":
+			// Return element type: check array_construct args, subquery schema, or array type name.
+			if len(x.Args) > 0 {
+				if fc, ok := x.Args[0].(*FuncCall); ok && fc.Name == "array_construct" && len(fc.Args) > 0 {
+					return exprType(fc.Args[0])
+				}
+				// Subquery base: infer element type from subquery output schema.
+				if sq, ok := x.Args[0].(*SubqueryExpr); ok && sq.Plan != nil {
+					if schema := sq.Plan.Output(); len(schema) > 0 {
+						arrT := schema[0].Type
+						if strings.HasSuffix(arrT.Name, "[]") {
+							return catalog.Type{Name: arrT.Name[:len(arrT.Name)-2]}
+						}
+					}
+				}
+				arrT := exprType(x.Args[0])
+				if strings.HasPrefix(arrT.Name, "_") {
+					return catalog.Type{Name: arrT.Name[1:]}
+				}
+			}
+			return catalog.Type{Name: "text"}
 		case "timezone":
 			// AT LOCAL / AT TIME ZONE: return type depends on the input (last arg).
 			if len(x.Args) > 0 {
@@ -5723,8 +6938,33 @@ func exprType(e Expr) catalog.Type {
 			// random() → float8 in [0,1). M0097-0042.
 			return catalog.Type{Name: "float8"}
 		case "generate_series":
-			// generate_series in scalar context returns int8 for integer args. M0097-0042.
+			// generate_series returns int4 for int4 args or integer literals (PG overload rules).
+			if len(x.Args) >= 1 {
+				argT := exprType(x.Args[0]).Name
+				switch argT {
+				case "int4", "integer", "int":
+					return catalog.Type{Name: "int4"}
+				}
+				// Integer literals (untyped) default to int4 overload, matching PG's overload resolution.
+				if _, ok := x.Args[0].(*IntegerConst); ok {
+					return catalog.Type{Name: "int4"}
+				}
+			}
 			return catalog.Type{Name: "int8"}
+		case "unnest":
+			// unnest(array) returns the element type. M0097-0106.
+			// Strip ALL [] suffixes to handle 2D arrays (e.g. int[][] → int). M0097-0125.
+			if len(x.Args) == 1 {
+				at := exprType(x.Args[0]).Name
+				base := at
+				for strings.HasSuffix(base, "[]") {
+					base = base[:len(base)-2]
+				}
+				if base != at && base != "" {
+					return catalog.Type{Name: base}
+				}
+			}
+			return catalog.Type{Name: "text"}
 		}
 		return catalog.Type{Name: "unknown"}
 	case *SubqueryExpr:
@@ -5737,13 +6977,136 @@ func exprType(e Expr) catalog.Type {
 			}
 		}
 		return catalog.Type{Name: "unknown"}
+	case *CollateExpr:
+		// CollateExpr is a pass-through; delegate type to the inner expression. M0097-0127.
+		return exprType(x.Operand)
+	case *ArraySubqueryExpr:
+		// Result is a text-array of the inner column's element type. M0097-0127.
+		if x.Plan != nil {
+			if sch := x.Plan.Output(); len(sch) > 0 {
+				elem := sch[0].Type.Name
+				return catalog.Type{Name: elem + "[]"}
+			}
+		}
+		return catalog.Type{Name: "text[]"}
+	case *MultiAssignSubqElem:
+		if x.Row != nil && x.Row.Plan != nil {
+			if sch := x.Row.Plan.Output(); x.ColIdx < len(sch) {
+				return sch[x.ColIdx].Type
+			}
+		}
+		return catalog.Type{Name: "unknown"}
 	}
 	return catalog.Type{Name: "unknown"}
+}
+
+// isFloatTypeName reports whether name is a floating-point type (float4/float8).
+func isFloatTypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "float4", "float8", "real", "double precision", "double", "float":
+		return true
+	}
+	return false
+}
+
+// isFloat4TypeName returns true for float4/real (single-precision) types.
+func isFloat4TypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "float4", "real":
+		return true
+	}
+	return false
 }
 
 // isNumericTypeName reports whether name refers to a numeric type
 // (NUMERIC / DECIMAL family). Used by exprType to promote arithmetic
 // to numeric whenever any operand is numeric.
+// isTypeCompatibleForHypothetical returns true if a direct arg type is compatible
+// with an ordering column type for hypothetical-set aggregates (rank etc.).
+// Compatible means same type family or one is unknown/text that can coerce.
+func isTypeCompatibleForHypothetical(orderT, argT string) bool {
+	oLow := strings.ToLower(orderT)
+	aLow := strings.ToLower(argT)
+	if oLow == aLow || aLow == "unknown" || oLow == "unknown" {
+		return true
+	}
+	// Text-like types coerce freely.
+	textLike := func(t string) bool {
+		return t == "text" || t == "varchar" || t == "bpchar" || t == "name" || t == "char"
+	}
+	if textLike(oLow) && textLike(aLow) {
+		return true
+	}
+	// Numeric families coerce.
+	numericLike := func(t string) bool {
+		switch t {
+		case "int2", "int4", "int8", "int", "integer", "smallint", "bigint",
+			"float4", "float8", "real", "double precision", "numeric", "decimal":
+			return true
+		}
+		return false
+	}
+	if numericLike(oLow) && numericLike(aLow) {
+		return true
+	}
+	// varchar coerces to/from text-like.
+	if textLike(oLow) && (aLow == "text" || aLow == "unknown") {
+		return true
+	}
+	return false
+}
+
+// withinGroupDirectArgColumnName extracts a display name from a non-constant
+// WITHIN GROUP direct arg expression for error messages.
+func withinGroupDirectArgColumnName(e Expr) string {
+	switch x := e.(type) {
+	case *ColumnRef:
+		return x.Name
+	case *CastExpr:
+		return withinGroupDirectArgColumnName(x.Operand)
+	}
+	return "expression"
+}
+
+// isHypotheticalSetAggName returns true for built-in hypothetical-set aggregates
+// whose direct args must be constants or GROUP BY cols. M0097-0122.
+func isHypotheticalSetAggName(name string) bool {
+	switch strings.ToLower(name) {
+	case "rank", "dense_rank", "cume_dist", "percent_rank":
+		return true
+	}
+	return false
+}
+
+// withinGroupTypeName converts internal type names to PG-compatible display names
+// for WITHIN GROUP type mismatch error messages.
+func withinGroupTypeName(t string) string {
+	switch strings.ToLower(t) {
+	case "int4", "int", "serial":
+		return "integer"
+	case "int8", "bigint", "bigserial":
+		return "bigint"
+	case "int2", "smallint", "smallserial":
+		return "smallint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision":
+		return "double precision"
+	}
+	return t
+}
+
+// isOrderedSetFinalFunc returns true if the finalfunc name corresponds to a
+// built-in ordered-set aggregate executor implementation.
+func isOrderedSetFinalFunc(finalFunc string) bool {
+	switch strings.ToLower(finalFunc) {
+	case "rank_final", "dense_rank_final", "percent_rank_final", "cume_dist_final",
+		"percentile_disc_final", "percentile_cont_final", "mode_final":
+		return true
+	}
+	return false
+}
+
 func isNumericTypeName(name string) bool {
 	switch strings.ToLower(name) {
 	case "numeric", "decimal":
@@ -5854,6 +7217,20 @@ func planSubqueryExpr(x *parser.SubqueryExpr, parent *resolveContext) (Expr, err
 		return nil, err
 	}
 	return &SubqueryExpr{pos: x.Pos(), Plan: inner, IsNonCorrelated: !planHasOuterRef(inner)}, nil
+}
+
+// planArraySubqueryExpr plans ARRAY(SELECT ...) into an ArraySubqueryExpr node.
+// The inner query must project exactly one column; results are collected into
+// a PostgreSQL text-array at execution time. M0097-0127.
+func planArraySubqueryExpr(x *parser.ArraySubqueryExpr, parent *resolveContext) (Expr, error) {
+	if parent == nil || parent.cat == nil {
+		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "subqueries are not supported in this context"}
+	}
+	inner, err := planSelectWithParent(x.Inner, parent.cat, parent)
+	if err != nil {
+		return nil, err
+	}
+	return &ArraySubqueryExpr{pos: x.Pos(), Plan: inner, IsNonCorrelated: !planHasOuterRef(inner)}, nil
 }
 
 // planRowExprIn expands `(a,b) [NOT] IN (VALUES (v1a,v1b),(v2a,v2b),...)` into
@@ -5988,6 +7365,14 @@ func planHasOuterRef(node Node) bool {
 				if x.Plan != nil && planHasOuterRef(x.Plan) {
 					found = true
 				}
+			case *ArraySubqueryExpr:
+				if x.Plan != nil && planHasOuterRef(x.Plan) {
+					found = true
+				}
+			case *MultiAssignSubqRow:
+				if x.Plan != nil && planHasOuterRef(x.Plan) {
+					found = true
+				}
 			case *InExpr:
 				if x.Plan != nil && planHasOuterRef(x.Plan) {
 					found = true
@@ -6012,6 +7397,14 @@ func planHasOuterRef(node Node) bool {
 // Two parent channels are wired: planParent (planner-side, so
 // resolveColumnRef can walk up the resolveContext chain) and
 // the analyzer's outer-scope channel (so the recursive
+// planSelectWithParent plans an inner SELECT with the supplied
+// resolveContext as the lexical-scope parent. Used by
+// SubqueryExpr / InExpr / ExistsExpr / MultiAssignSubqRow to enable
+// correlated subqueries.
+//
+// The parent is injected via the package-level planParent channel (so
+// resolveColumnRef can walk up the resolveContext chain) and
+// the analyzer's outer-scope channel (so the recursive
 // Analyze pass that Plan() invokes also sees the outer
 // scope). Both are restored on return.
 func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *resolveContext) (Node, error) {
@@ -6025,7 +7418,16 @@ func planSelectWithParent(stmt *parser.SelectStmt, cat catalog.Catalog, parent *
 		restore := analyzer.SetOuterScope(scope)
 		defer restore()
 	}
-	return Plan(stmt, cat)
+
+	// Skip the analyzer re-pass and call planSelect directly.
+	// The outer statement's Plan() already analyzed the full tree
+	// (including this sub-SELECT) under the correct scope (with
+	// CTE names, outer relations, etc.). Re-running the analyzer
+	// here would fail for CTE references (e.g. DO UPDATE SET
+	// (b,a)=(SELECT ... FROM cte) where cte lives in planCTEs
+	// but not in the catalog). Mirrors preplanWithClause's
+	// planSelect(cte.Query, cat) pattern for CTE bodies.
+	return planSelect(stmt, cat)
 }
 
 // buildAnalyzerOuterScope walks a resolveContext chain and
@@ -6093,6 +7495,40 @@ func resolveCaseExpr(x *parser.CaseExpr, ctx *resolveContext) (Expr, error) {
 
 // resolveExpr walks a parser.Expr and replaces ColumnRef nodes with
 // indexed planner ColumnRefs. Other node types are translated 1:1.
+// resolveCaseExprAfterAggregate resolves a CASE expression in the post-aggregate
+// context. Each sub-expression is resolved through the aggregate surface so that
+// GROUP BY key expressions inside the CASE are remapped to aggregate output
+// ColumnRefs, not re-evaluated against the input schema. M0097-0035.
+func resolveCaseExprAfterAggregate(x *parser.CaseExpr, agg *aggregateSurface) (Expr, error) {
+	out := &CaseExpr{pos: x.Pos()}
+	if x.Operand != nil {
+		operand, err := resolveExprAfterAggregate(x.Operand, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.Operand = operand
+	}
+	for _, w := range x.Whens {
+		when, err := resolveExprAfterAggregate(w.When, agg)
+		if err != nil {
+			return nil, err
+		}
+		then, err := resolveExprAfterAggregate(w.Then, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.Whens = append(out.Whens, CaseWhen{When: when, Then: then})
+	}
+	if x.Else != nil {
+		els, err := resolveExprAfterAggregate(x.Else, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.Else = els
+	}
+	return out, nil
+}
+
 func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	switch x := e.(type) {
 	case *parser.IntegerConst:
@@ -6107,6 +7543,16 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.SubqueryExpr:
 		return planSubqueryExpr(x, ctx)
+	case *parser.ArraySubqueryExpr:
+		return planArraySubqueryExpr(x, ctx)
+	case *parser.CollateExpr:
+		// Pass-through: collation is preserved for mismatch detection but
+		// goopg has no runtime collation enforcement. M0097-0127.
+		inner, err := resolveExpr(x.Operand, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &CollateExpr{pos: x.Pos(), Operand: inner, CollationName: x.CollationName}, nil
 	case *parser.InExpr:
 		return planInExpr(x, ctx)
 	case *parser.ExistsExpr:
@@ -6204,10 +7650,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		}
 		typeName := strings.ToLower(x.Type.Name)
 		srcType := exprType(operand).Name
-		var typmod int64
-		if len(x.Typmods) > 0 {
-			typmod = x.Typmods[0]
-		}
+		typmod := encodeTypmod(typeName, x.Typmods)
 		return &CastExpr{pos: x.Pos(), Operand: operand, TargetType: typeName, SourceType: srcType, Typmod: typmod}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, ctx)
@@ -6566,6 +8009,7 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 		Table:   idxScan.Table,
 		Index:   idxScan.Index,
 		Key:     idxScan.Key,
+		Keys:    idxScan.Keys,
 		LowKey:  idxScan.LowKey,
 		HighKey: idxScan.HighKey,
 		Covered: covered,

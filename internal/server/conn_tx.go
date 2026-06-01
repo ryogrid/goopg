@@ -148,6 +148,7 @@ func (c *connTxState) End() {
 	c.mu.Lock()
 	if c.sess != nil {
 		executor.ReleaseAdvisoryTransactionLocks(c.sess)
+		executor.ReleaseRelationLocks(c.sess)
 		c.sess.EndExplicitTransaction()
 	}
 	c.active = false

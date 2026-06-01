@@ -40,6 +40,10 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		if o.ctx == nil {
 			return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SET is not supported in this executor context"}
 		}
+		// "role" and "session_authorization" are no-op names — goopg has no role management.
+		if stmt.Name == "role" || stmt.Name == "session_authorization" {
+			return nil, EOF
+		}
 		if stmt.Default {
 			if o.ctx.ResetSetting == nil {
 				return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "RESET is not supported in this executor context"}
@@ -68,6 +72,10 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 			if o.ctx.ResetAllSettings != nil {
 				o.ctx.ResetAllSettings()
 			}
+			return nil, EOF
+		}
+		// "role" and "session_authorization" are no-op names — goopg has no role management.
+		if stmt.Name == "role" || stmt.Name == "session_authorization" {
 			return nil, EOF
 		}
 		if o.ctx.ResetSetting == nil {

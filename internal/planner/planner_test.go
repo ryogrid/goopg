@@ -941,6 +941,30 @@ func TestPlanDelete(t *testing.T) {
 	}
 }
 
+// TestPlanDeleteUsing: DELETE … USING binds USING-table columns into
+// the WHERE/RETURNING resolve context (M0097-0076). Mirrors the
+// UPDATE … FROM planner path; UsingTables/UsingPred get populated and
+// RETURNING column references resolve against the joined schema.
+func TestPlanDeleteUsing(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	node, err := Plan(parseOne(t,
+		"DELETE FROM pgbench_history USING pgbench_accounts a "+
+			"WHERE pgbench_history.aid = a.aid RETURNING pgbench_history.aid, a.bid"), cat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	del := node.(*Delete)
+	if len(del.UsingTables) != 1 || del.UsingTables[0].Name != "pgbench_accounts" {
+		t.Fatalf("UsingTables=%+v", del.UsingTables)
+	}
+	if del.UsingPred == nil {
+		t.Fatal("UsingPred should be populated when USING + WHERE are present")
+	}
+	if len(del.Returning) != 2 {
+		t.Fatalf("Returning len=%d want 2", len(del.Returning))
+	}
+}
+
 // TestPlanDDLAndUtilityPassThrough: DDL/utility statements wrap
 // without decomposing.
 func TestPlanDDLAndUtilityPassThrough(t *testing.T) {
@@ -972,7 +996,7 @@ func TestPlanResolutionErrors(t *testing.T) {
 		{"SELECT bogus FROM pgbench_accounts", "42703"},                  // undefined_column
 		{"INSERT INTO pgbench_history (nope) VALUES (1)", "42703"},       // undefined_column
 		{"UPDATE pgbench_accounts SET nope = 1 WHERE aid = $1", "42703"}, // undefined_column
-		{"INSERT INTO pgbench_history VALUES (1, 2, 3)", "42601"},        // arity mismatch
+		{"INSERT INTO pgbench_history (tid, bid, aid) VALUES (1, 2)", "42601"}, // explicit col-list arity mismatch
 		{"SELECT 1 UNION SELECT 2, 3", "42601"},                          // set-op column-count mismatch
 		{"SELECT aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", "42702"},
 		{"SELECT aid FROM pgbench_accounts HAVING aid > 0", "42803"},

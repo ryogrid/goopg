@@ -457,6 +457,7 @@ type RangeVar struct {
 	Columns   []string // optional column-alias list: (SELECT …) AS t (c1, c2)
 	Subquery  *SelectStmt
 	TableFunc *TableFuncRef // M0096-0006: table-valued function (e.g. generate_series)
+	Only      bool          // FROM ONLY tablename — skip inheritance children
 }
 
 // TableFuncRef is a table-valued function used in the FROM clause.
@@ -780,9 +781,10 @@ func (s *InsertStmt) stmtNode() {}
 
 // UpdateAssign is one `column = expr` pair in an UPDATE SET clause.
 type UpdateAssign struct {
-	pos    int
-	Column string
-	Expr   Expr
+	pos     int
+	Column  string   // single-column form: "col = expr"
+	Columns []string // multi-column form: "(c1, c2, …) = (e1, e2, …)"
+	Expr    Expr     // RHS: single expr, or *RowExpr for multi-column form
 }
 
 func (a UpdateAssign) Pos() int { return a.pos }
@@ -819,8 +821,9 @@ type DeleteStmt struct {
 	pos       int
 	With      *WithClause
 	Target    RangeVar
-	Where     Expr   // nil when absent
-	CurrentOf string // cursor name for WHERE CURRENT OF cursor. M0097-0069.
+	Using     []RangeVar // USING-clause tables (nil when absent). M0097-0076.
+	Where     Expr       // nil when absent
+	CurrentOf string     // cursor name for WHERE CURRENT OF cursor. M0097-0069.
 	Returning []ResTarget
 }
 
@@ -993,6 +996,12 @@ type CreateIndexStmt struct {
 	// Columns[i] == "" (expression column); nil for plain column names.
 	ColExprs   []Expr
 	Fillfactor int // 0 means unset; valid range 10–100
+	// OpClassWithOptions holds the name of the first operator class that
+	// specifies parameters (e.g. "int4_ops" from `id int4_ops(foo=1)`).
+	// Empty string means no operator class options were given. In PostgreSQL
+	// most built-in operator classes have no options, so a non-empty value
+	// here causes an error at execution time. M0097-0023.
+	OpClassWithOptions string
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }
@@ -1145,12 +1154,27 @@ type CreateAggregateStmt struct {
 	Name        ObjectName
 	HasBaseType bool
 	BaseType    string // e.g. "int4"
+	Variadic    bool   // true when declared with VARIADIC arg (variadic agg)
 	SType       string // state type (e.g. "int4")
+	SFunc       string // state transition function name
 	FinalFunc   string // final function name
+	CombineFunc string // combine function name (for parallel aggregation)
+	InitCond    string // initial condition string (e.g. "0" or "{0,0}")
 }
 
 func (s *CreateAggregateStmt) Pos() int  { return s.pos }
 func (s *CreateAggregateStmt) stmtNode() {}
+
+// AlterAggregateRenameStmt renames a user-defined aggregate. M0097-0035.
+// ALTER AGGREGATE name(argtype_list) RENAME TO newname
+type AlterAggregateRenameStmt struct {
+	pos     int
+	OldName ObjectName
+	NewName string
+}
+
+func (s *AlterAggregateRenameStmt) Pos() int  { return s.pos }
+func (s *AlterAggregateRenameStmt) stmtNode() {}
 
 // CreateOpClassStmt is a minimal representation of CREATE OPERATOR CLASS used
 // to register custom hash support functions for hash partitioning. M0097-0027.
@@ -1180,8 +1204,12 @@ func (s *DoStmt) stmtNode() {}
 // accepts syntactically but does not execute (GRANT, REVOKE, COMMENT ON,
 // SECURITY LABEL, etc.). The executor silently succeeds. M0097-0016.
 type CompatNoopStmt struct {
-	pos int
-	Tag string // CommandComplete tag, e.g. "GRANT", "REVOKE", "COMMENT"
+	pos       int
+	Tag       string     // CommandComplete tag, e.g. "GRANT", "REVOKE", "COMMENT"
+	ObjType   string     // optional: object type for compat registry (e.g. "conversion")
+	ObjName   ObjectName // optional: primary object name for compat registry
+	ArgTypes  []string   // optional: arg types for operator compat registry (e.g. ["bigint","bigint"])
+	TableName ObjectName // optional: table name for rule compat registry
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }
@@ -1189,6 +1217,24 @@ func (s *DropCompatStmt) stmtNode() {}
 
 func (s *CompatNoopStmt) Pos() int  { return s.pos }
 func (s *CompatNoopStmt) stmtNode() {}
+
+// LockTableRelation is one relation target inside a LOCK TABLE statement.
+type LockTableRelation struct {
+	Schema string
+	Name   string
+}
+
+// LockTableStmt — `LOCK [TABLE] [ONLY] rel [, ...] [IN lock_mode MODE] [NOWAIT]`.
+// Mode is the PostgreSQL lock mode name (e.g. "AccessExclusiveLock"). M0097.
+type LockTableStmt struct {
+	pos       int
+	Relations []LockTableRelation
+	Mode      string // PostgreSQL lock mode name
+	NoWait    bool
+}
+
+func (s *LockTableStmt) Pos() int  { return s.pos }
+func (s *LockTableStmt) stmtNode() {}
 
 // CreatePublicationStmt — `CREATE PUBLICATION name [FOR ALL TABLES |
 // FOR TABLE t1 [, t2 ...]] [WITH (k = v, ...)]`. v0 honours
@@ -1284,6 +1330,10 @@ const (
 	// AlterTableNoInherit — `NO INHERIT parent_table`.
 	// Removes the inheritance relationship; no-op in goopg v0. M0097-0048.
 	AlterTableNoInherit
+	// AlterTableAlterColumnSet — `ALTER COLUMN name SET (options)`.
+	// For heap tables this is a no-op in goopg v0; for indexes it raises
+	// an appropriate error (M0097-0023 btree_index parity).
+	AlterTableAlterColumnSet
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1472,6 +1522,7 @@ type CreateFunctionStmt struct {
 	ReturnsSet bool   // RETURNS SETOF ... M0097-0020
 	Language   string // lower-cased, e.g. "plpgsql"
 	Body       string // raw source between the dollar-quote delimiters
+	Strict     bool   // STRICT / RETURNS NULL ON NULL INPUT M0097-0035
 }
 
 func (s *CreateFunctionStmt) Pos() int  { return s.pos }
@@ -1521,7 +1572,7 @@ type CallStmt struct {
 func (s *CallStmt) Pos() int  { return s.pos }
 func (s *CallStmt) stmtNode() {}
 
-// DropProcedureStmt is the AST for `DROP PROCEDURE [IF EXISTS] name [(arg, ...)]`.
+// DropProcedureStmt is the AST for `DROP PROCEDURE/ROUTINE [IF EXISTS] name [(arg, ...)]`.
 // Stage B (procedure follow-up) of M0015.
 type DropProcedureStmt struct {
 	pos      int
@@ -1529,18 +1580,29 @@ type DropProcedureStmt struct {
 	Name     ObjectName
 	Args     []FunctionArg // nil when no parenthesised arg list was given
 	Behavior DropBehavior
+	ObjKind  string // "procedure" or "routine" (default "procedure")
 }
 
 func (s *DropProcedureStmt) Pos() int  { return s.pos }
 func (s *DropProcedureStmt) stmtNode() {}
 
-// CreateTypeStmt — CREATE TYPE name AS ENUM (val1, val2, …). M0097-0017.
+// TypeField describes one field in a composite type definition.
+// M0097-composite.
+type TypeField struct {
+	Name    string // lower-case field name
+	ColType string // column type string (e.g. "bigint", "text")
+}
+
+// CreateTypeStmt — CREATE TYPE name AS ENUM (val1, val2, …) or
+// CREATE TYPE name AS (field type, …). M0097-0017, M0097-composite.
 type CreateTypeStmt struct {
-	pos        int
-	Name       string
-	Schema     string
-	IsEnum     bool
-	EnumValues []string
+	pos             int
+	Name            string
+	Schema          string
+	IsEnum          bool
+	EnumValues      []string
+	IsComposite     bool
+	CompositeFields []TypeField
 }
 
 func (s *CreateTypeStmt) Pos() int  { return s.pos }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -135,6 +136,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			return w.WriteReadyForQuery(protocol.TxStatusIdle)
 		}
 		if tag, ok := compatNoopCommandTag(sql); ok {
+			// Side-effect: register schema for CREATE SCHEMA statements.
+			if tag == "CREATE SCHEMA" && s.cfg.Catalog != nil {
+				norm := normalizeCompatSQL(sql)
+				if schemaName := schemaNameFromCreate(norm); schemaName != "" {
+					s.cfg.Catalog.RegisterSchema(schemaName)
+				}
+			}
 			if err := w.WriteCommandComplete(tag); err != nil {
 				return err
 			}
@@ -543,11 +551,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 			ectx.Snap = snap2
 		}
-		// Per-statement reset: clear the DML-CTE write fence from any previous
-		// statement so subsequent SELECTs don't accidentally skip rows that were
-		// inserted/updated by a prior DML CTE in the same transaction.
+		// Per-statement reset: clear the DML-CTE write fence and the regular-CTE
+		// row cache from any previous statement. The row cache is query-scoped:
+		// a CTE named "q" in query 1 must not bleed into query 2 (they may
+		// produce different rows). CTEWriteFence is cleared for the same reason.
 		ectx.CTEWriteFence = nil
 		ectx.InDMLCTE = false
+		ectx.CTERowCache = nil
 
 		// COPY inside a multi-statement simple-query batch (psql `\;`).
 		// Intercept before the plan-cache / executeOneSimpleStmt path —
@@ -753,7 +763,7 @@ func compatNoopCommandTag(sql string) (string, bool) {
 	case strings.HasPrefix(norm, "create user "), strings.HasPrefix(norm, "create role "):
 		return "CREATE ROLE", true
 	case strings.HasPrefix(norm, "create schema "), norm == "create schema":
-		return "CREATE SCHEMA", true
+		return "CREATE SCHEMA", true // name extraction done separately in dispatchSimpleQueryViaExecutor
 	case strings.HasPrefix(norm, "grant "), norm == "grant":
 		return "GRANT", true
 	case strings.HasPrefix(norm, "revoke "), norm == "revoke":
@@ -776,6 +786,19 @@ func compatNoopCommandTag(sql string) (string, bool) {
 		return "SECURITY LABEL", true
 	}
 	return "", false
+}
+
+// schemaNameFromCreate extracts the schema name from a normalised CREATE SCHEMA statement.
+func schemaNameFromCreate(norm string) string {
+	if !strings.HasPrefix(norm, "create schema ") {
+		return ""
+	}
+	rest := strings.TrimSpace(norm[len("create schema "):])
+	// Skip optional AUTHORIZATION keyword.
+	if strings.HasPrefix(rest, "authorization ") {
+		return ""
+	}
+	return extractFirstSQLIdent("", rest)
 }
 
 func normalizeCompatSQL(sql string) string {
@@ -1403,6 +1426,17 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						} else {
 							valueBuf = d.AppendValueText(valueBuf)
 						}
+					case "bytea":
+						// Bytea values display as \xhexstring (default hex mode). M0097-0035.
+						if d.Kind == executor.KindBytes {
+							valueBuf = append(valueBuf, '\\', 'x')
+							const hexChars = "0123456789abcdef"
+							for _, b := range d.BytesValue() {
+								valueBuf = append(valueBuf, hexChars[b>>4], hexChars[b&0x0f])
+							}
+						} else {
+							valueBuf = d.AppendValueText(valueBuf)
+						}
 					default:
 						valueBuf = d.AppendValueText(valueBuf)
 					}
@@ -1611,6 +1645,16 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 			return append(dst, s...)
 		}
 	}
+	// PostgreSQL uses canonical names for special values, not Go's "+Inf"/"-Inf".
+	if math.IsInf(f, 1) {
+		return append(dst, "Infinity"...)
+	}
+	if math.IsInf(f, -1) {
+		return append(dst, "-Infinity"...)
+	}
+	if math.IsNaN(f) {
+		return append(dst, "NaN"...)
+	}
 	// PostgreSQL's float8out uses %.15g (DBL_DIG = 15 significant digits).
 	// This handles: scientific notation for large/tiny values, decimal for normal,
 	// negative zero ("-0"), and avoids spurious scientific notation for integers.
@@ -1699,12 +1743,14 @@ func typeOIDFor(name string) uint32 {
 		return 20
 	case "float4", "real":
 		return 700
-	case "float8", "double precision", "double":
+	case "float", "float8", "double precision", "double":
 		return 701
 	case "bool", "boolean":
 		return 16
 	case "oid":
 		return 26
+	case "oidvector":
+		return 30
 	case "name":
 		return 19
 	case "uuid":

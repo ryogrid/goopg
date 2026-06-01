@@ -142,6 +142,9 @@ func foldPlanConstantsInner(node Node) {
 			if a.Arg != nil {
 				n.Aggs[i].Arg = FoldConstants(a.Arg)
 			}
+			if a.Arg2 != nil {
+				n.Aggs[i].Arg2 = FoldConstants(a.Arg2)
+			}
 		}
 		foldPlanConstantsInner(n.Child)
 	case *Join:
@@ -162,12 +165,20 @@ func foldPlanConstantsInner(node Node) {
 		foldPlanConstantsInner(n.Child)
 	case *SeqScan, *IndexScan, *IndexOnlyScan, *Values, *WorkTableScan:
 		// leaf nodes: nothing to fold
+	case *GenerateSubscripts:
+		n.ArrExpr = FoldConstants(n.ArrExpr)
+		n.Dim = FoldConstants(n.Dim)
+		if n.Reversed != nil {
+			n.Reversed = FoldConstants(n.Reversed)
+		}
 	case *GenerateSeries:
 		n.Start = FoldConstants(n.Start)
 		n.Stop = FoldConstants(n.Stop)
 		if n.Step != nil {
 			n.Step = FoldConstants(n.Step)
 		}
+	case *FromUnnest:
+		n.ArrExpr = FoldConstants(n.ArrExpr)
 	case *PgInputErrorInfo:
 		n.Value = FoldConstants(n.Value)
 		n.Type = FoldConstants(n.Type)

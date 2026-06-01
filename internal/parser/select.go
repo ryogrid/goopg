@@ -126,6 +126,10 @@ func (p *parser) parseValuesSelect() (Stmt, error) {
 //
 // Planner support for JOIN/group/set semantics lands separately.
 func (p *parser) parseSelect() (Stmt, error) {
+	// WITH ... SELECT ... inside a subquery or view body.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith {
+		return p.parseStatementWithCTE()
+	}
 	// A bare VALUES(...) is a valid standalone statement in PostgreSQL.
 	// When used as a subquery (SELECT * FROM (VALUES ...) AS t), the inner
 	// parsing entry point is parseSelect, so we handle VALUES here.
@@ -517,7 +521,12 @@ func isParserAggregateName(name string) bool {
 		"string_agg", "array_agg", "json_agg", "jsonb_agg",
 		"json_object_agg", "jsonb_object_agg",
 		"xmlagg", "any_value",
-		"percentile_cont", "percentile_disc", "mode":
+		"percentile_cont", "percentile_disc", "mode",
+		// Hypothetical-set aggregates. These are also window functions (rank, etc.),
+		// but when used with WITHIN GROUP they become aggregate functions. The parser
+		// cannot distinguish here since isParserAggregateName only sees the name;
+		// include them so exprContainsAggregateCall fires correctly. M0097-0035.
+		"rank", "dense_rank", "cume_dist", "percent_rank":
 		return true
 	}
 	return false
@@ -1082,6 +1091,10 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	// ordinary derived tables (no correlated-outer-reference evaluation).
 	_ = p.acceptKeyword(KwLateral)
 
+	// FROM ONLY tablename — consume the ONLY keyword; the planner will skip
+	// inheritance children for this table reference. M0097-0099.
+	onlyModifier := p.acceptIdentKeyword("only")
+
 	// Derived table: `(SELECT …) AS alias`. The alias is mandatory
 	// in upstream PG; we mirror that. Scan past any leading `(`
 	// tokens to find SELECT/VALUES/WITH/TABLE so that double-nested
@@ -1183,7 +1196,7 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 	if err != nil {
 		return RangeVar{}, err
 	}
-	rv := RangeVar{pos: obj.pos, Schema: obj.Schema, Name: obj.Name}
+	rv := RangeVar{pos: obj.pos, Schema: obj.Schema, Name: obj.Name, Only: onlyModifier}
 
 	// Table-valued function call: name(arg, …) [AS alias] (M0096-0006).
 	// Recognized: generate_series, pg_input_error_info, parse_ident,
@@ -1203,7 +1216,8 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 		lower := strings.ToLower(obj.Name)
 		switch lower {
 		case "generate_series", "pg_input_error_info", "parse_ident",
-			"pg_get_publication_tables", "pg_available_wal_summaries":
+			"pg_get_publication_tables", "pg_available_wal_summaries",
+			"unnest", "generate_subscripts":
 			srfFuncName = lower
 		}
 	}
@@ -1349,18 +1363,28 @@ func (p *parser) parseSortList() ([]SortBy, error) {
 
 // skipCollationName consumes a (possibly schema-qualified) collation
 // name following the COLLATE keyword, e.g. `"C"`, `pg_catalog."C"`, or
-// `en_US`. The reference is discarded — goopg has no non-default
-// collation support (see the COLLATE postfix in parseExprPrec).
-func (p *parser) skipCollationName() error {
-	if _, err := p.parseIdent(); err != nil {
-		return err
+// `en_US`. Returns the bare collation name (last component). M0097-0127.
+func (p *parser) parseCollationName() (string, error) {
+	tok, err := p.parseIdent()
+	if err != nil {
+		return "", err
 	}
+	name := tok.Value
 	for p.acceptSymbol(".") {
-		if _, err := p.parseIdent(); err != nil {
-			return err
+		tok, err = p.parseIdent() // keep only the last component
+		if err != nil {
+			return "", err
 		}
+		name = tok.Value
 	}
-	return nil
+	return name, nil
+}
+
+// skipCollationName consumes a collation name and discards it.
+// Kept for callers in DDL/DML that don't need the value.
+func (p *parser) skipCollationName() error {
+	_, err := p.parseCollationName()
+	return err
 }
 
 func (p *parser) parseSortItem() (SortBy, error) {
@@ -1397,12 +1421,24 @@ func (p *parser) parseSortItem() (SortBy, error) {
 
 // parseSortUsingOperator consumes the operator (or identifier/qualified name) that
 // follows ORDER BY expr USING.  Returns the raw operator string.
+// Multi-character operators like ~<~ are tokenized as separate single-char operator
+// tokens (~, <, ~) by the lexer, so we greedily concatenate adjacent operator tokens.
 func (p *parser) parseSortUsingOperator() string {
 	cur := p.cur()
 	switch cur.Kind {
 	case TokenOperator, TokenSymbol:
+		// Greedily consume consecutive operator tokens to handle multi-char
+		// operators like ~<~, ~>~, ~<=~, ~>=~ which the lexer splits into parts.
+		// Only TokenOperator tokens are concatenated; TokenSymbol (,;().[]) are delimiters.
+		op := cur.Value
 		p.advance()
-		return cur.Value
+		if cur.Kind == TokenOperator {
+			for p.cur().Kind == TokenOperator {
+				op += p.cur().Value
+				p.advance()
+			}
+		}
+		return op
 	case TokenIdent:
 		// Could be a simple name (varchar_lt) or schema-qualified (pg_catalog.int4lt).
 		name := cur.Value
@@ -1427,8 +1463,8 @@ func (p *parser) parseSortUsingOperator() string {
 // sortUsingIsDesc returns true when op is a "greater-than"-style operator,
 // meaning ORDER BY x USING op should sort descending.
 func sortUsingIsDesc(op string) bool {
-	// Symbol operators: > or >=
-	if op == ">" || op == ">=" {
+	// Symbol operators: > or >= (and locale-independent variants ~>~ / ~>=~).
+	if op == ">" || op == ">=" || op == "~>~" || op == "~>=~" {
 		return true
 	}
 	// Named operators: anything containing "gt" as a suffix or standalone.
@@ -1510,10 +1546,15 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 		// string comparison) and matches the collation-skipping already
 		// done in DDL/conflict-target parsing.
 		if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "collate") {
+			collPos := t.Pos
 			p.advance() // consume COLLATE
-			if err := p.skipCollationName(); err != nil {
+			collName, err := p.parseCollationName()
+			if err != nil {
 				return nil, err
 			}
+			// Wrap in CollateExpr so planner can detect explicit-collation
+			// mismatches in WITHIN GROUP ORDER BY. M0097-0127.
+			left = &CollateExpr{pos: collPos, Operand: left, CollationName: collName}
 			continue
 		}
 		// `expr [NOT] IN (...)` is a postfix-style construct at
@@ -2108,17 +2149,18 @@ func (p *parser) parseTrimFuncCall(pos int) (Expr, error) {
 
 // parseArrayConstructor parses ARRAY[e1, e2, ...] — the caller has already
 // consumed the `array` identifier and the current token is `[`. M0097-0042.
+// Handles nested sub-array syntax ARRAY[[a,b],[c,d]] for 2D arrays. M0097-0125.
 func (p *parser) parseArrayConstructor(pos int) (Expr, error) {
 	p.advance() // consume '['
 	var elems []Expr
 	if !(p.cur().Kind == TokenSymbol && p.cur().Value == "]") {
-		first, err := p.parseExpr()
+		first, err := p.parseArrayElement(pos)
 		if err != nil {
 			return nil, err
 		}
 		elems = append(elems, first)
 		for p.acceptSymbol(",") {
-			elem, err := p.parseExpr()
+			elem, err := p.parseArrayElement(pos)
 			if err != nil {
 				return nil, err
 			}
@@ -2129,6 +2171,16 @@ func (p *parser) parseArrayConstructor(pos int) (Expr, error) {
 		return nil, p.errAtCur("expected ']' after array elements")
 	}
 	return &ArrayConstructorExpr{pos: pos, Elements: elems}, nil
+}
+
+// parseArrayElement parses one element inside ARRAY[...]. If the element
+// starts with '[', it is a nested sub-array (2D array syntax). M0097-0125.
+func (p *parser) parseArrayElement(_ int) (Expr, error) {
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
+		subPos := p.cur().Pos
+		return p.parseArrayConstructor(subPos)
+	}
+	return p.parseExpr()
 }
 
 // peekBinaryOp returns the OpCode and precedence of the current
@@ -2249,12 +2301,43 @@ func (p *parser) parsePrimary() (Expr, error) {
 	case TokenSymbol:
 		if t.Value == "(" {
 			p.advance()
-			// `( SELECT … )` is a subquery expression. v0
-			// supports only the scalar form (one column, at
-			// most one row at evaluation time); IN / EXISTS
-			// have their own grammars and are deferred to a
-			// follow-up loop.
-			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
+			// `( SELECT … )` is a subquery expression. Also handles
+			// nested-paren forms like `((SELECT …) UNION SELECT …)`.
+			// Look ahead through leading `(` tokens to find SELECT/VALUES.
+			isSubqStart := false
+			if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
+				isSubqStart = true
+			} else if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				for i := 0; ; i++ {
+					tok := p.peek(i)
+					if tok.Kind == TokenSymbol && tok.Value == "(" {
+						continue
+					}
+					if tok.Kind == TokenKeyword && (tok.Keyword == KwSelect || tok.Keyword == KwValues) {
+						isSubqStart = true
+					}
+					break
+				}
+			}
+			if isSubqStart && p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				// Nested-paren subquery like `((SELECT …) UNION …)`.
+				// Delegate to parseParenthesisedSelectStmt (no leading `(`
+				// consumed yet — it will consume it).
+				inner, err := p.parseParenthesisedSelectStmt()
+				if err != nil {
+					return nil, err
+				}
+				sel, ok := inner.(*SelectStmt)
+				if !ok {
+					return nil, &SyntaxError{Pos: t.Pos, Message: "subquery did not produce SELECT"}
+				}
+				// Consume optional extra closing parens added by caller's depth tracking.
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')' to close subquery")
+				}
+				return &SubqueryExpr{pos: t.Pos, Inner: sel}, nil
+			}
+			if isSubqStart {
 				// SELECT … INTO is not permitted in a scalar subquery (M0097-0020).
 				old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 				p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
@@ -2263,6 +2346,23 @@ func (p *parser) parsePrimary() (Expr, error) {
 				p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
 				if err != nil {
 					return nil, err
+				}
+				// Allow set operations inside the parenthesised subquery:
+				// (SELECT 2 UNION SELECT 3) is a valid scalar subquery.
+				if innerSel, ok := inner.(*SelectStmt); ok {
+					if setOp, present, err2 := p.parseSetOpClause(); err2 != nil {
+						return nil, err2
+					} else if present {
+						if innerSel.SetOp == nil {
+							innerSel.SetOp = setOp
+						} else {
+							rightmost := innerSel.SetOp.Right
+							for rightmost.SetOp != nil {
+								rightmost = rightmost.SetOp.Right
+							}
+							rightmost.SetOp = setOp
+						}
+					}
 				}
 				if !p.acceptSymbol(")") {
 					return nil, p.errAtCur("expected ')' to close subquery")
@@ -2759,6 +2859,29 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 		p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
 		return p.parseArrayConstructor(startPos)
 	}
+	// ARRAY(SELECT ...) — collect subquery rows into an array. M0097-0127.
+	if len(parts) == 1 && strings.EqualFold(parts[0], "array") &&
+		p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		// Peek: if the token after '(' is SELECT/VALUES/WITH keyword, treat as subquery.
+		saved := p.idx
+		p.advance() // consume '('
+		if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwWith) {
+			inner, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			innerSel, ok := inner.(*SelectStmt)
+			if !ok {
+				return nil, p.errAtCur("expected SELECT inside ARRAY()")
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')' after ARRAY subquery")
+			}
+			return &ArraySubqueryExpr{pos: startPos, Inner: innerSel}, nil
+		}
+		// Not a subquery — restore position and fall through to function call.
+		p.idx = saved
+	}
 	// Function call?
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 		// EXTRACT has its own grammar: EXTRACT(field FROM expr).
@@ -2950,10 +3073,36 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 	}
 }
 
-// maybeWindowTail consumes optional `FILTER (WHERE ...)` and/or
-// `OVER (...)` clauses after a function-call's closing `)`.
+// maybeWindowTail consumes optional `WITHIN GROUP (ORDER BY ...)`,
+// `FILTER (WHERE ...)`, and/or `OVER (...)` clauses after a function-call's
+// closing `)`.
+// WITHIN GROUP (M0097-0035) stamps fc.WithinGroup.
 // FILTER (M0097-0007) stamps fc.Filter; OVER (M0020) stamps fc.Over.
 func (p *parser) maybeWindowTail(fc *FuncCall) (Expr, error) {
+	// WITHIN GROUP (ORDER BY sortlist) — ordered-set aggregate.
+	// `within` is an identifier (not a reserved keyword), so use acceptIdentKeyword.
+	if p.acceptIdentKeyword("within") {
+		if !p.acceptKeyword(KwGroup) {
+			return nil, p.errAtCur("expected GROUP after WITHIN")
+		}
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after WITHIN GROUP")
+		}
+		if !p.acceptKeyword(KwOrder) {
+			return nil, p.errAtCur("expected ORDER after WITHIN GROUP (")
+		}
+		if !p.acceptKeyword(KwBy) {
+			return nil, p.errAtCur("expected BY after WITHIN GROUP (ORDER")
+		}
+		wg, wgerr := p.parseSortList()
+		if wgerr != nil {
+			return nil, wgerr
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close WITHIN GROUP clause")
+		}
+		fc.WithinGroup = wg
+	}
 	// FILTER (WHERE condition) — aggregate filter clause.
 	if p.acceptIdentKeyword("filter") {
 		if p.acceptSymbol("(") {

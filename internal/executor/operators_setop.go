@@ -43,6 +43,13 @@ func (o *setOp) Schema() planner.Schema {
 }
 
 func (o *setOp) Open(ctx *Context) error {
+	// Reset buffered state so the operator can be re-opened (e.g. as a
+	// recursive member of WITH RECURSIVE that is opened every iteration).
+	o.rows = nil
+	o.idx = 0
+	o.leftDone = false
+	o.rightDone = false
+
 	if err := o.left.Open(ctx); err != nil {
 		return err
 	}
@@ -57,11 +64,6 @@ func (o *setOp) Open(ctx *Context) error {
 	if err := o.computeBuffered(); err != nil {
 		return err
 	}
-	// Inputs are fully consumed; release them early.
-	o.left.Close()
-	o.right.Close()
-	o.left = nil
-	o.right = nil
 	return nil
 }
 

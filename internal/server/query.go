@@ -80,6 +80,13 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			return err
 		}
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	// SET ROLE rolename — no-op: goopg has no role management.
+	// Must be before the generic "SET " case so "ROLE" is not passed to handleSet.
+	case strings.HasPrefix(upper, "SET ROLE "), upper == "SET ROLE":
+		if err := w.WriteCommandComplete("SET"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	case strings.HasPrefix(upper, "SET "):
 		return s.handleSet(w, sess, matchable[len("SET "):], false)
 	case upper == "RESET ALL":
@@ -92,6 +99,12 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	// Must be checked before the generic "RESET " case so "SESSION AUTHORIZATION"
 	// is not used verbatim as a GUC parameter name.
 	case upper == "RESET SESSION AUTHORIZATION":
+		if err := w.WriteCommandComplete("RESET"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	// RESET ROLE — no-op: goopg has no role management.
+	case upper == "RESET ROLE":
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
 		}
