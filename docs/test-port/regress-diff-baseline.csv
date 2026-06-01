@@ -89,7 +89,7 @@ index_including,204,failed
 insert_conflict,211,failed
 join_hash,245,failed
 enum,261,failed
-matview,263,failed
+matview,247,failed
 create_procedure,274,failed
 create_table,388,failed
 create_view,426,failed

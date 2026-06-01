@@ -1868,7 +1868,10 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// only relevant when the view didn't supply an explicit
 	// alias list. Column count must match what the view
 	// declared; v0 reports a planner error otherwise.
-	if tbl.View != nil {
+	// Materialized views that have been populated are stored as heap data —
+	// do NOT replan their SELECT body (treat them as regular heap tables).
+	// Unpopulated matviews (WITH NO DATA) return 0 rows (also heap, just empty).
+	if tbl.View != nil && !tbl.IsMatView {
 		// Cycle guard: prevent infinite recursion on circular view definitions.
 		depth := viewPlanDepth.Add(1)
 		defer viewPlanDepth.Add(-1)
