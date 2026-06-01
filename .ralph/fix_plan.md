@@ -2854,6 +2854,29 @@ M0097-0001 wires it up.
         ORDER BY with OuterColumnRef → "outer-level aggregate cannot contain a lower-level
         variable" error. Fixes ARRAY(SELECT percentile_disc(a) within group (order by x)).
         Aggregates raw diff: 110 → 93 (down from 86 pre-M0097-0126 due to lateral fix side effects).
+      - **Progress 2026-06-01 (M0097-0128 — btree_index parity + SRF+aggregate fix):**
+        Two improvements:
+        (a) btree_index parity (committed separately): pg_proc view updated to use
+            numeric OIDs (pronamespace/prolang/prorettype/proargtypes as OID integers).
+            Built-in proc stubs for abs() variants and RI_FKey_* trigger functions.
+            ALTER INDEX name ALTER COLUMN col SET (options) parsed and routed to
+            executor which raises 0A000 error. CREATE INDEX opclass with options
+            syntax (int4_ops(foo=1)) now parsed and correctly rejected.
+            oidvector OID (30) added to typeOIDFor in server/dispatch.go.
+        (b) SRF + aggregate expansion: `SELECT max(unique2), generate_series(1,3) as g
+            FROM tenk1 ORDER BY g DESC` now correctly returns 3 rows instead of 1.
+            Root cause: `buildSelectSrfProjectSet` was guarded by `agg == nil`,
+            silently skipping SRF detection when an aggregate was also present.
+            Fix: remove `agg == nil` guard; pass `agg` into `buildSelectSrfProjectSet`
+            so non-SRF columns use `resolveExprAfterAggregate`. Aggregates
+            raw diff: 93 → 68 (updated baseline 86→68).
+        Remaining gaps (~68 raw diff lines): outer-level aggregate in EXISTS/HAVING
+        (18 lines), nested scalar-subquery aggregate (5 lines), t1.f1 GROUP BY USING
+        join error (4 lines), filter outer-ref aggregate (5 lines), 10000-row outer
+        aggregate promotion (22 lines), bool_test filter result (3 lines),
+        pg_typeof numeric vs integer (2 lines), error section (6 lines), extra
+        NOTICEs (2 lines). These require outer-aggregate-in-subquery promotion
+        (PostgreSQL's "outer query becomes aggregate query" feature) which is complex.
 
 - [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
