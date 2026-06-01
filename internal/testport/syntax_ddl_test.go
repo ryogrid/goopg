@@ -174,3 +174,47 @@ func TestSyntax_DDL_MatViewPgClass(t *testing.T) {
 	}
 	t.Logf("relispopulated: %v", rows3)
 }
+
+// TestSyntax_DDL_EnumOrdering tests that enum values are ordered by declaration, not alphabetically.
+func TestSyntax_DDL_EnumOrdering(t *testing.T) {
+	c := newCluster(t, "syntax_ddl_enum")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	runSQL(t, c, "CREATE TYPE rainbow AS ENUM ('red', 'orange', 'yellow', 'green', 'blue', 'purple')")
+	runSQL(t, c, "CREATE TABLE t (col rainbow)")
+	runSQL(t, c, "INSERT INTO t VALUES ('red'), ('green'), ('yellow')")
+
+	// ORDER BY should use declaration order, not alphabetical
+	rows := runSQL(t, c, "SELECT col FROM t ORDER BY col")
+	t.Logf("enum ORDER BY result: %v", rows)
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows))
+	}
+	if rows[0][0] != "red" || rows[1][0] != "yellow" || rows[2][0] != "green" {
+		t.Errorf("wrong enum order: got %v, want [red yellow green]", rows)
+	}
+}
+
+// TestSyntax_DDL_EnumColumnType tests that enum column types are correctly stored.
+func TestSyntax_DDL_EnumColumnType(t *testing.T) {
+	c := newCluster(t, "syntax_ddl_enum2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	runSQL(t, c, "CREATE TYPE rainbow AS ENUM ('red', 'orange', 'yellow', 'green', 'blue', 'purple')")
+	runSQL(t, c, "CREATE TABLE t (col rainbow)")
+	runSQL(t, c, "INSERT INTO t VALUES ('red'), ('green'), ('yellow')")
+
+	// Check pg_class for table existence
+	rows := runSQL(t, c, "SELECT relname FROM pg_class WHERE relname = 't'")
+	t.Logf("pg_class table t: %v", rows)
+
+	// Test basic enum ordering
+	rows2 := runSQL(t, c, "SELECT col FROM t ORDER BY col")
+	t.Logf("ORDER BY col: %v", rows2)
+	if len(rows2) != 3 {
+		t.Fatalf("expected 3 rows got %d", len(rows2))
+	}
+	t.Logf("First row value: %q kind info: len=%d", rows2[0][0], len(rows2[0][0]))
+}

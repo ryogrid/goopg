@@ -2198,6 +2198,14 @@ func isComparable(left, right catalog.Type) bool {
 	if isNumericTypeName(left.Name) && strings.EqualFold(right.Name, "oid") {
 		return true
 	}
+	// User-defined types (enum, domain, composite) ↔ string: allow comparison
+	// since enums are stored as text and string literals are cast at runtime. M0097-enum.
+	if !isKnownBuiltinType(left.Name) && isStringTypeName(right.Name) {
+		return true
+	}
+	if isStringTypeName(left.Name) && !isKnownBuiltinType(right.Name) {
+		return true
+	}
 	return false
 }
 
@@ -2320,6 +2328,32 @@ func isAssignable(src, dst catalog.Type) bool {
 	// PostgreSQL allows integer/numeric values to be inserted into text/varchar
 	// columns via implicit cast. M0097-0003.
 	if isNumericTypeName(src.Name) && isStringTypeName(dst.Name) {
+		return true
+	}
+	// User-defined types (enums, domains, composites) are stored as text.
+	// Allow string → user-defined type assignment; the executor validates
+	// the enum label at runtime via the ::enum cast path. M0097-enum.
+	if isStringTypeName(src.Name) && !isKnownBuiltinType(dst.Name) {
+		return true
+	}
+	return false
+}
+
+// isKnownBuiltinType reports whether name is a known built-in scalar type.
+// Used to distinguish user-defined types (enum, domain, composite) from built-ins.
+func isKnownBuiltinType(name string) bool {
+	switch strings.ToLower(name) {
+	case "text", "varchar", "char", "bpchar", "character varying",
+		"name", "unknown", "citext",
+		"int2", "smallint", "int4", "integer", "int", "int8", "bigint",
+		"serial", "smallserial", "bigserial",
+		"float4", "real", "float8", "double precision", "double", "float",
+		"numeric", "decimal",
+		"bool", "boolean",
+		"date", "time", "timetz", "timestamp", "timestamptz", "interval",
+		"oid", "uuid", "pg_lsn", "xid", "xid8", "cid", "regproc",
+		"bytea", "varbit", "bit", "json", "jsonb",
+		"tid", "money":
 		return true
 	}
 	return false

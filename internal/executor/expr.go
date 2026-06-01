@@ -1990,6 +1990,9 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				return NewStringDatum(string(appendTimeOnlyValueText(nil, d.TimeValue()))), nil
 			}
 			return NewStringDatum(d.Format()), nil
+		case KindEnum:
+			// Cast enum to text: return the label string (loses sort order). M0097-enum.
+			return NewStringDatum(string(d.Buf)), nil
 		case KindString:
 			s := d.StringValue()
 			// For "char" (internal 1-byte type), interpret backslash-octal escapes

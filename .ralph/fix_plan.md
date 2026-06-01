@@ -2778,6 +2778,21 @@ M0097-0001 wires it up.
         PostgreSQL's format. After normalizer DETAIL-stripping and error-section collation,
         expected and actual match. aggregates.sql 369→364 diff lines.
         errors.sql: 0 diffs → now PASS. Baseline CSV updated.
+      - **Progress 2026-06-02 (M0097-0140 — matview+aggregates fixes, loop 476):**
+        Three fixes (commit 6396d459):
+        (a) Parser: `WITH NO DATA` in CREATE/REFRESH MATERIALIZED VIEW parsed "NO" as `KwNot`
+            instead of `acceptIdentKeyword("no")`, causing syntax error that left tokens in stream.
+            No matview had ever been created WITH NO DATA — all matview tests were broken at
+            the CREATE step. Fix: use `acceptIdentKeyword("no")` in both parseCreateMatViewTail
+            and parseRefreshMatView. matview: 247 → 175 diffs (−72).
+        (b) Executor: `seqScanOp.Open` now checks `tbl.IsMatView && !tbl.IsPopulated` and
+            returns SQLSTATE 55000 "materialized view has not been populated". Matches PG's
+            "Use the REFRESH MATERIALIZED VIEW command" behavior.
+        (c) `sum(float8)` finishAgg: was returning KindNumeric (full precision), giving
+            `6.800000000000001` instead of `6.8`. Now converts via aggDatumToFloat64 and
+            formats with FormatFloat(fsum, 'g', 15, 64) to match PG's float8out. aggregates: 95→87.
+        Added tests: `TestSyntax_DDL_MatViewPgClass` (integration), `TestMatviewPgClassLookup` (unit).
+        Baseline CSV updated: matview 247→175, aggregates 95→87.
 
       - **Progress 2026-05-31 (M0097-0113 — aggregates 364→328 diff):**
         Two fixes (commit b86bc75e):

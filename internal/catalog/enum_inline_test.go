@@ -43,7 +43,9 @@ func TestEnumDomainSmoke(t *testing.T) {
 	got := c.ResolveColumnType("domainint4")
 	if got != "int4" { t.Errorf("ResolveColumnType(domainint4) = %q, want int4", got) }
 	got = c.ResolveColumnType("rainbow")
-	if got != "text" { t.Errorf("ResolveColumnType(rainbow) = %q, want text", got) }
+	// Enum types now preserve their original name (not resolved to "text") so that
+	// enum sort order can be looked up from the column type during scan. M0097-enum.
+	if got != "rainbow" { t.Errorf("ResolveColumnType(rainbow) = %q, want rainbow", got) }
 	got = c.ResolveColumnType("int8")
 	if got != "int8" { t.Errorf("ResolveColumnType(int8) = %q, want int8", got) }
 	

@@ -3143,16 +3143,15 @@ func (c *InMemory) ResolveColumnType(typeName string) string {
 	k := strings.ToLower(typeName)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	// Check domain.
+	// Check domain: resolve to base type.
 	if d, ok := c.domains[k]; ok {
 		baseName := strings.ToLower(d.Base.Name)
 		// Recurse (without lock reacquire — use direct map lookup).
 		return c.resolveColumnTypeLocked(baseName)
 	}
-	// Check enum.
-	if _, ok := c.enumTypes[k]; ok {
-		return "text"
-	}
+	// Enum types: preserve the enum type name (NOT "text") so the executor
+	// can look up sort order for ORDER BY semantics (M0097-enum).
+	// Encoding/decoding still works via the varlena-text default path.
 	return typeName
 }
 
@@ -3161,9 +3160,6 @@ func (c *InMemory) resolveColumnTypeLocked(typeName string) string {
 	k := strings.ToLower(typeName)
 	if d, ok := c.domains[k]; ok {
 		return c.resolveColumnTypeLocked(strings.ToLower(d.Base.Name))
-	}
-	if _, ok := c.enumTypes[k]; ok {
-		return "text"
 	}
 	return typeName
 }

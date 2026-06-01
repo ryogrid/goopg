@@ -528,6 +528,10 @@ type seqScanOp struct {
 	// `row` field is overwritten per emission. Caller must
 	// consume / Materialize before the next Next() invocation.
 	slot MaterializedSlot
+
+	// enumTypes[i] is non-nil when cols[i] is a user-defined enum type.
+	// Used to convert KindString heap datums to KindEnum for correct ORDER BY. M0097-enum.
+	enumTypes []*catalog.EnumType
 }
 
 // seqScanLookahead is the number of blocks ahead of the current
@@ -559,6 +563,16 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			Hint:    "Use the REFRESH MATERIALIZED VIEW command."}
 	}
 	o.ctx = ctx
+	// Pre-compute which columns are enum types so Next() can inject KindEnum datums
+	// for correct ORDER BY semantics (M0097-enum).
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		o.enumTypes = make([]*catalog.EnumType, len(o.cols))
+		for i, col := range o.cols {
+			if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
+				o.enumTypes[i] = et
+			}
+		}
+	}
 	// Cache rel once — avoids the catalog RLock on every Next() call.
 	o.rel = ctx.Catalog.RelFileNode(o.tbl)
 	if err := ctx.acquireRelLock(o.rel, lockmgr.AccessShareLock); err != nil {
@@ -797,6 +811,25 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// to other sessions; a concurrent UPDATE could otherwise
 			// tear the bytes the parent is decoding.
 			row = cloneRowOwned(row)
+			// Inject KindEnum datums for enum-typed columns (M0097-enum).
+			if len(o.enumTypes) > 0 {
+				for i, et := range o.enumTypes {
+					if et == nil || i >= len(row) {
+						continue
+					}
+					d := row[i]
+					if d.Kind != KindString && d.Kind != KindBytes {
+						continue
+					}
+					label := d.StringValue()
+					for _, ev := range et.Values {
+						if ev.Label == label {
+							row[i] = NewEnumDatum(ev.SortOrder, label)
+							break
+						}
+					}
+				}
+			}
 			if o.pinned != nil {
 				o.pinned.RUnlock()
 			}
