@@ -1012,10 +1012,29 @@ func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 	switch op {
 	case parser.OpAdd:
 		r = a + b
+		// Detect int64 add overflow: same-sign inputs with opposite-sign result.
+		if (a^r)&(b^r) < 0 {
+			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+		}
 	case parser.OpSub:
 		r = a - b
+		// Detect int64 sub overflow: different-sign inputs with result differing from a's sign.
+		if (a^b)&(a^r) < 0 {
+			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+		}
 	case parser.OpMul:
+		// Detect int64 multiplication overflow. M0097-int8-overflow.
 		r = a * b
+		if a != 0 && b != 0 {
+			if a == math.MinInt64 || b == math.MinInt64 {
+				// MinInt64 * 1 = MinInt64 (OK); MinInt64 * anything_else overflows.
+				if a != 1 && b != 1 {
+					return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+				}
+			} else if r/a != b {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+			}
+		}
 	case parser.OpDiv:
 		if b == 0 {
 			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}

@@ -1955,6 +1955,22 @@ M0097-0001 wires it up.
         text search double errors (2 lines), mysterious `type "no_such_schema"` × 2
         (from DROP TYPE/DOMAIN IF EXISTS no_such_schema.foo not triggering schema
         notice in the catalog), schema notices missing × 5.
+      - **Progress 2026-06-01 (M0097-0131 — drop_if_exists 34→0, PASS):**
+        Root cause: executor `CompatNoopStmt` handler returned `nil, nil` without
+        registering objects in the compat registry, so DROP after CREATE failed.
+        (a) `CompatNoopStmt` AST gains `ArgTypes []string` (for operator leftarg/rightarg)
+            and `TableName ObjectName` (for rule ON-table).
+        (b) `parseCreateRuleTail`: extracts rule name (first ident) and table name
+            (token after `TO` keyword) so the compat key `ruleName@tableName` matches
+            `execDropTrigger`'s DROP RULE lookup.
+        (c) CREATE OPERATOR parser: scans leftarg/rightarg from the parenthesised
+            option list; `=` is `TokenOperator`, not `TokenSymbol` (bug fixed).
+        (d) `execCompatNoop` (new function replaces `return nil, nil`): when `ObjType`
+            is set, registers the object in the compat registry; operators build key
+            `opName(leftCanon,rightCanon)`; rules build `ruleName@tableName`; others
+            use `ObjName.String()`.
+        Tests: `TestParseCreateOperatorArgTypes`, `TestParseCreateRuleTableName`.
+        Commit: efd725af. Result: drop_if_exists → 0 diffs, **PASS**.
       - **Progress 2026-06-01 (M0097-0129 — drop_if_exists 118→89 + date INSERT fix):**
         Three improvements: (a) Schema-qualified DROP IF EXISTS now emits
         "schema X does not exist, skipping" when the schema is not registered
