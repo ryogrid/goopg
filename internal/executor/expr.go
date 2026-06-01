@@ -3843,15 +3843,40 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		ctx.SubqueryCache[cacheKey] = out
 		return out, nil
 	}
-	out := make([]Datum, len(x.List))
-	for i, e := range x.List {
+	// Evaluate each list element. When the list has a single element that
+	// evaluates to an array literal "{e1,e2,...}", expand it into individual
+	// elements so `x = ANY (ARRAY[...])` / `x = ANY ('{...}'::type[])` works
+	// correctly. M0097-enum-any.
+	rawOut := make([]Datum, 0, len(x.List))
+	for _, e := range x.List {
 		v, err := evalExpr(e, row, ctx)
 		if err != nil {
 			return nil, err
 		}
-		out[i] = v
+		rawOut = append(rawOut, v)
 	}
-	return out, nil
+	// Expand array-literal elements: a KindString "{...}" in the list is treated
+	// as an array of individual text values, matching PostgreSQL's = ANY (array)
+	// semantics where the single operand is an array type.
+	if len(rawOut) == 1 {
+		v := rawOut[0]
+		if v.Kind == KindString {
+			s := v.StringValue()
+			if len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}' {
+				elems := parseTextArray(s)
+				out := make([]Datum, len(elems))
+				for i, el := range elems {
+					if el == "NULL" {
+						out[i] = NullDatum
+					} else {
+						out[i] = NewStringDatum(el)
+					}
+				}
+				return out, nil
+			}
+		}
+	}
+	return rawOut, nil
 }
 
 // evalExistsExpr evaluates `[NOT] EXISTS (subquery)`. Opens
@@ -4210,6 +4235,14 @@ func compareEq(a, b Datum) (Datum, error) {
 		return NewBoolDatum(fmt.Sprintf("%d", a.Int) == b.StringValue()), nil
 	case aIsString && b.Kind == KindInt:
 		return NewBoolDatum(a.StringValue() == fmt.Sprintf("%d", b.Int)), nil
+	// KindEnum vs string: compare by label (used in = ANY with array literals).
+	// M0097-enum-any.
+	case a.Kind == KindEnum && bIsString:
+		return NewBoolDatum(string(a.Buf) == b.StringValue()), nil
+	case aIsString && b.Kind == KindEnum:
+		return NewBoolDatum(a.StringValue() == string(b.Buf)), nil
+	case a.Kind == KindEnum && b.Kind == KindEnum:
+		return NewBoolDatum(a.Int == b.Int), nil
 	}
 	return NewBoolDatum(false), nil
 }

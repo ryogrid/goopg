@@ -1769,6 +1769,29 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 			}
 		}
 
+		// `expr = ALL (array[...])` — desugar to NOT (expr != ANY (array)).
+		// `= ALL` is true iff the operand equals every element of the array.
+		// M0097-enum-all.
+		if precCompare >= min {
+			if t := p.cur(); t.Kind == TokenOperator && t.Value == "=" &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwAll {
+				pos := t.Pos
+				p.advance() // =
+				p.advance() // ALL
+				inExpr, err := p.parseAnyTail(left, pos)
+				if err != nil {
+					return nil, err
+				}
+				// Mark as NotEqualAny; wrap in NOT so the executor returns
+				// true only when all elements equal the operand.
+				if ie, ok := inExpr.(*InExpr); ok {
+					ie.NotEqualAny = true
+				}
+				left = &UnaryOp{pos: pos, Op: OpNot, Operand: inExpr}
+				continue
+			}
+		}
+
 		// OPERATOR(schema.op) — qualified operator: desugar to its base operator.
 		// Used by vacuumdb and other PostgreSQL client tools:
 		// `nspname OPERATOR(pg_catalog.=) 'public'`.

@@ -2186,6 +2186,13 @@ func TypedVirtualCell(pos int, value, colType string) Expr {
 		case "f", "false", "FALSE", "no", "off", "0":
 			return &BooleanConst{pos: pos, Value: false}
 		}
+	case "numeric", "decimal", "float4", "float8", "real", "double precision":
+		// Return as NumericConst so numeric columns in virtual tables sort
+		// numerically rather than lexicographically (e.g. pg_enum.enumsortorder).
+		// M0097-enum-sort-numeric.
+		if value != "" {
+			return &NumericConst{pos: pos, Value: value}
+		}
 	}
 	return &StringConst{pos: pos, Value: value}
 }
@@ -3918,6 +3925,30 @@ func isTextLikePlannerType(name string) bool {
 		return true
 	}
 	return false
+}
+
+// isUserDefinedPlannerType returns true for non-empty, non-builtin type names.
+// Used to detect user-defined types (enums, domains) for implicit comparison cast.
+// M0097-enum-cmp.
+func isUserDefinedPlannerType(name string) bool {
+	if name == "" || name == "unknown" {
+		return false
+	}
+	switch strings.ToLower(name) {
+	case "text", "varchar", "char", "bpchar", "character varying",
+		"name", "citext",
+		"int2", "smallint", "int4", "integer", "int", "int8", "bigint",
+		"serial", "smallserial", "bigserial",
+		"float4", "real", "float8", "double precision", "double", "float",
+		"numeric", "decimal",
+		"bool", "boolean",
+		"date", "time", "timetz", "timestamp", "timestamptz", "interval",
+		"oid", "uuid", "pg_lsn", "xid", "xid8", "cid", "regproc",
+		"bytea", "varbit", "bit", "json", "jsonb",
+		"tid", "money":
+		return false
+	}
+	return true
 }
 
 func groupExprName(e Expr) string {
@@ -6702,8 +6733,21 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if fc, ok := e.(*FuncCall); ok && fc.Name != "" {
 		// array_construct is the lowered form of ARRAY[...]; PostgreSQL
 		// FigureColname returns "array" for ArrayExpr nodes. M0097-0065.
-		// array_subscript is the lowered form of arr[idx]; PG also returns "array".
-		if fc.Name == "array_construct" || fc.Name == "array_subscript" {
+		if fc.Name == "array_construct" {
+			return "array", exprType(e)
+		}
+		// array_subscript is the lowered form of arr[idx]. PG's FigureColname
+		// follows the array operand's element type (e.g. (rainbow[])[2] → "rainbow").
+		// The parser strips [] from cast types (::rainbow[] stored as TargetType "rainbow"),
+		// so the first argument's declared type IS the element type of the array.
+		// Fall back to "array" when the type cannot be determined. M0097-enum-sub.
+		if fc.Name == "array_subscript" {
+			if len(fc.Args) > 0 {
+				elemType := exprType(fc.Args[0]).Name
+				if elemType != "" && elemType != "unknown" && elemType != "text" {
+					return elemType, exprType(e)
+				}
+			}
 			return "array", exprType(e)
 		}
 		return fc.Name, exprType(e)
@@ -7679,6 +7723,13 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		// For comparisons involving a `name` type, coerce the non-name side
 		// to "name" so the executor truncates it to 63 chars (NAMEDATALEN-1),
 		// matching PostgreSQL's namecmp() semantics. M0097-0003.
+		//
+		// For comparisons involving a user-defined type (enum, domain) on one
+		// side and a string literal on the other, coerce the string to the
+		// user-defined type so the executor's evalCast converts it to KindEnum
+		// (with correct sort order) before comparison. Without this, enum
+		// comparisons like col > 'yellow' compare labels alphabetically instead
+		// of by declaration order. M0097-enum-cmp.
 		switch x.Op {
 		case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 			lt, rt := exprType(l), exprType(r)
@@ -7686,6 +7737,10 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: "name"}
 			} else if strings.EqualFold(rt.Name, "name") && !strings.EqualFold(lt.Name, "name") && isTextLikePlannerType(lt.Name) {
 				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: "name"}
+			} else if isUserDefinedPlannerType(lt.Name) && isTextLikePlannerType(rt.Name) {
+				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: strings.ToLower(lt.Name)}
+			} else if isTextLikePlannerType(lt.Name) && isUserDefinedPlannerType(rt.Name) {
+				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: strings.ToLower(rt.Name)}
 			}
 		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
