@@ -5,6 +5,7 @@ package executor
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"strconv"
 	"time"
@@ -54,6 +55,11 @@ const (
 	// raw decoded rows (e.g. UPDATE predicates) receive already-detoasted
 	// datums from the underlying scan.
 	KindToastPointer
+	// KindEnum stores an enum value for correct ORDER BY semantics.
+	// Datum.Int = math.Float64bits(sortOrder) for comparison.
+	// Datum.Buf = []byte(label) for display.
+	// compareDatum compares by sort order; Format/StringValue return the label.
+	KindEnum
 )
 
 // Datum flag bits (Datum.Flags).
@@ -494,6 +500,18 @@ func appendTimeOnlyValueText(dst []byte, t time.Time) []byte {
 	return append(dst, frac[:end]...)
 }
 
+// NewEnumDatum creates an enum datum with the given sort order and label.
+// KindEnum stores sort order in Int (as float64 bits) and label in Buf.
+// compareDatum uses sort order; Format/StringValue return the label.
+func NewEnumDatum(sortOrder float64, label string) Datum {
+	return Datum{Kind: KindEnum, Int: int64(math.Float64bits(sortOrder)), Buf: []byte(label)}
+}
+
+// EnumSortOrder extracts the sort order from a KindEnum datum.
+func (d Datum) EnumSortOrder() float64 {
+	return math.Float64frombits(uint64(d.Int))
+}
+
 func (d Datum) Format() string {
 	switch d.Kind {
 	case KindNull:
@@ -509,6 +527,9 @@ func (d Datum) Format() string {
 		return d.StringValue()
 	case KindBytes:
 		return string(d.BytesValue())
+	case KindEnum:
+		// Display the label (Buf), not the sort order (Int).
+		return string(d.Buf)
 	case KindTime:
 		if d.Flags&flagDate != 0 {
 			// DATE type: render as Postgres MDY style "MM-DD-YYYY". M0097-0063.

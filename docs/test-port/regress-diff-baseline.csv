@@ -88,7 +88,7 @@ create_table_like,136,failed
 index_including,204,failed
 insert_conflict,211,failed
 join_hash,245,failed
-enum,261,failed
+enum,320,failed
 matview,247,failed
 create_procedure,274,failed
 create_table,388,failed

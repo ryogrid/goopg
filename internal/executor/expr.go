@@ -231,9 +231,11 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					strVal := v.StringValue()
 					// Skip array literals (e.g. '{red,green,blue}'::rainbow[]).
 					if len(strVal) == 0 || strVal[0] != '{' {
+						var matchedSort float64
 						found := false
 						for _, label := range et.Values {
 							if strings.EqualFold(label.Label, strVal) {
+								matchedSort = label.SortOrder
 								found = true
 								break
 							}
@@ -245,6 +247,8 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 								Message: fmt.Sprintf("invalid input value for enum %s: %q", et.Name, strVal),
 							}
 						}
+						// Return KindEnum for correct ORDER BY semantics.
+						return NewEnumDatum(matchedSort, strVal), nil
 					}
 				}
 			}
@@ -1425,6 +1429,17 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 		case a.TimeValue().Before(b.TimeValue()):
 			return -1, nil
 		case a.TimeValue().After(b.TimeValue()):
+			return 1, nil
+		}
+		return 0, nil
+	case KindEnum:
+		// Enum comparison uses sort order, not label. M0097-enum-sort.
+		ao := math.Float64frombits(uint64(a.Int))
+		bo := math.Float64frombits(uint64(b.Int))
+		switch {
+		case ao < bo:
+			return -1, nil
+		case ao > bo:
 			return 1, nil
 		}
 		return 0, nil
