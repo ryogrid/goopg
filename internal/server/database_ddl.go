@@ -32,6 +32,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -117,7 +118,7 @@ func databaseDDLCommandTag(sql string) string {
 	}
 }
 
-// tryHandleDatabaseDDL returns (handled, err). When handled is true
+// tryHandleDatabaseDDL returns (handled, notice, err). When handled is true
 // the dispatch path should NOT fall through to compatNoopCommandTag.
 //
 //   - handled=true,  err=nil   → CommandComplete should be written
@@ -127,24 +128,24 @@ func databaseDDLCommandTag(sql string) string {
 // The catalog mutation happens BEFORE the WAL append; if the WAL
 // append fails the catalog mutation is rolled back so the on-disk
 // state and in-memory state stay consistent.
-func (s *Server) tryHandleDatabaseDDL(sql string) (bool, error) {
+func (s *Server) tryHandleDatabaseDDL(sql string) (bool, string, error) {
 	kind, name := classifyDatabaseDDL(sql)
 	if kind == databaseDDLNone {
-		return false, nil
+		return false, "", nil
 	}
 	if name == "" {
-		return true, errors.New("missing database name")
+		return true, "", errors.New("missing database name")
 	}
 	if s.cfg.Catalog == nil {
 		// No catalog plumbed (some test/embedded paths). Fall back to
 		// the legacy no-op so behaviour is unchanged.
-		return false, nil
+		return false, "", nil
 	}
 	cat, ok := s.cfg.Catalog.(databaseRegistry)
 	if !ok {
 		// Catalog implementation does not expose the database
 		// registry surface yet — preserve legacy no-op behaviour.
-		return false, nil
+		return false, "", nil
 	}
 	switch kind {
 	case databaseDDLCreate:
@@ -154,18 +155,18 @@ func (s *Server) tryHandleDatabaseDDL(sql string) (bool, error) {
 				// SQLSTATE 42P04. Surface the same error text but
 				// route through the generic system-error path; the
 				// caller wraps SQLSTATE.
-				return true, err
+				return true, "", err
 			}
-			return true, err
+			return true, "", err
 		}
 		if s.cfg.WAL != nil {
 			if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateDatabase(name)); werr != nil {
 				// Roll back the catalog change so memory and disk agree.
 				_ = cat.DropDatabase(name)
-				return true, werr
+				return true, "", werr
 			}
 		}
-		return true, nil
+		return true, "", nil
 	case databaseDDLDrop:
 		if err := cat.DropDatabase(name); err != nil {
 			if errors.Is(err, catalog.ErrDatabaseNotFound) {
@@ -174,21 +175,24 @@ func (s *Server) tryHandleDatabaseDDL(sql string) (bool, error) {
 				// when the user said IF EXISTS. Inspect the SQL again.
 				lower := strings.ToLower(strings.TrimSpace(sql))
 				if strings.HasPrefix(lower, "drop database if exists ") {
-					return true, nil
+					notice := fmt.Sprintf("database %q does not exist, skipping", name)
+					return true, notice, nil
 				}
+				// Non-IF-EXISTS: produce PG-compatible error with database name.
+				return true, "", fmt.Errorf("database %q does not exist", name)
 			}
-			return true, err
+			return true, "", err
 		}
 		if s.cfg.WAL != nil {
 			if _, _, werr := s.cfg.WAL.Append(wal.EncodeDropDatabase(name)); werr != nil {
 				// Re-create the catalog entry so the abort is consistent.
 				_ = cat.CreateDatabase(name)
-				return true, werr
+				return true, "", werr
 			}
 		}
-		return true, nil
+		return true, "", nil
 	}
-	return false, nil
+	return false, "", nil
 }
 
 // databaseRegistry is the subset of catalog.Catalog the database-DDL
