@@ -162,6 +162,19 @@ type IsDistinctFromExpr struct {
 	Negated bool // true for IS NOT DISTINCT FROM
 }
 
+// CollateExpr represents `expr COLLATE collation_name`. goopg doesn't enforce
+// collations at runtime, but the node preserves the collation name so the
+// planner can detect explicit-collation mismatches (e.g. "C" vs "POSIX") in
+// WITHIN GROUP ORDER BY validation. M0097-0127.
+type CollateExpr struct {
+	pos           int
+	Operand       Expr
+	CollationName string
+}
+
+func (e *CollateExpr) Pos() int { return e.pos }
+func (*CollateExpr) exprNode()  {}
+
 func (e *IsDistinctFromExpr) Pos() int { return e.pos }
 func (*IsDistinctFromExpr) exprNode()  {}
 
@@ -413,6 +426,16 @@ type ArrayConstructorExpr struct {
 	pos      int
 	Elements []Expr
 }
+
+// ArraySubqueryExpr represents ARRAY(SELECT ...) — a subquery whose single-column
+// results are collected into a PostgreSQL array. M0097-0127.
+type ArraySubqueryExpr struct {
+	pos   int
+	Inner *SelectStmt
+}
+
+func (e *ArraySubqueryExpr) Pos() int { return e.pos }
+func (*ArraySubqueryExpr) exprNode()  {}
 
 func (e *ArrayConstructorExpr) Pos() int { return e.pos }
 func (*ArrayConstructorExpr) exprNode()  {}

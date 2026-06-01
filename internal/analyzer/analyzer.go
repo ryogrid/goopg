@@ -756,6 +756,8 @@ func exprHasWindowFunc(e parser.Expr) bool {
 		return exprHasWindowFunc(x.Operand)
 	case *parser.IsBoolExpr:
 		return exprHasWindowFunc(x.Operand)
+	case *parser.CollateExpr:
+		return exprHasWindowFunc(x.Operand)
 	case *parser.IsDistinctFromExpr:
 		return exprHasWindowFunc(x.Left) || exprHasWindowFunc(x.Right)
 	case *parser.InExpr:
@@ -829,6 +831,17 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		return catalog.Type{Name: "int8"}, nil
 	case *parser.CaseExpr:
 		return analyzeCaseExpr(x, ctx)
+	case *parser.CollateExpr:
+		// CollateExpr is a pass-through; analyze operand for correlated refs. M0097-0127.
+		return analyzeExpr(x.Operand, ctx)
+	case *parser.ArraySubqueryExpr:
+		// Analyze inner SELECT for correlated refs; result is text[]. M0097-0127.
+		if ctx != nil && ctx.cat != nil {
+			if err := analyzeSelectWithParent(x.Inner, ctx.cat, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		return catalog.Type{Name: "text[]"}, nil
 	case *parser.SubqueryExpr:
 		// Recursively analyze the inner SELECT with the current
 		// scope as lexical parent so correlated column refs

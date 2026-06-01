@@ -1363,18 +1363,28 @@ func (p *parser) parseSortList() ([]SortBy, error) {
 
 // skipCollationName consumes a (possibly schema-qualified) collation
 // name following the COLLATE keyword, e.g. `"C"`, `pg_catalog."C"`, or
-// `en_US`. The reference is discarded — goopg has no non-default
-// collation support (see the COLLATE postfix in parseExprPrec).
-func (p *parser) skipCollationName() error {
-	if _, err := p.parseIdent(); err != nil {
-		return err
+// `en_US`. Returns the bare collation name (last component). M0097-0127.
+func (p *parser) parseCollationName() (string, error) {
+	tok, err := p.parseIdent()
+	if err != nil {
+		return "", err
 	}
+	name := tok.Value
 	for p.acceptSymbol(".") {
-		if _, err := p.parseIdent(); err != nil {
-			return err
+		tok, err = p.parseIdent() // keep only the last component
+		if err != nil {
+			return "", err
 		}
+		name = tok.Value
 	}
-	return nil
+	return name, nil
+}
+
+// skipCollationName consumes a collation name and discards it.
+// Kept for callers in DDL/DML that don't need the value.
+func (p *parser) skipCollationName() error {
+	_, err := p.parseCollationName()
+	return err
 }
 
 func (p *parser) parseSortItem() (SortBy, error) {
@@ -1536,10 +1546,15 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 		// string comparison) and matches the collation-skipping already
 		// done in DDL/conflict-target parsing.
 		if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "collate") {
+			collPos := t.Pos
 			p.advance() // consume COLLATE
-			if err := p.skipCollationName(); err != nil {
+			collName, err := p.parseCollationName()
+			if err != nil {
 				return nil, err
 			}
+			// Wrap in CollateExpr so planner can detect explicit-collation
+			// mismatches in WITHIN GROUP ORDER BY. M0097-0127.
+			left = &CollateExpr{pos: collPos, Operand: left, CollationName: collName}
 			continue
 		}
 		// `expr [NOT] IN (...)` is a postfix-style construct at
@@ -2843,6 +2858,29 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 	if len(parts) == 1 && strings.EqualFold(parts[0], "array") &&
 		p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
 		return p.parseArrayConstructor(startPos)
+	}
+	// ARRAY(SELECT ...) — collect subquery rows into an array. M0097-0127.
+	if len(parts) == 1 && strings.EqualFold(parts[0], "array") &&
+		p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		// Peek: if the token after '(' is SELECT/VALUES/WITH keyword, treat as subquery.
+		saved := p.idx
+		p.advance() // consume '('
+		if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwWith) {
+			inner, err := p.parseSelect()
+			if err != nil {
+				return nil, err
+			}
+			innerSel, ok := inner.(*SelectStmt)
+			if !ok {
+				return nil, p.errAtCur("expected SELECT inside ARRAY()")
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')' after ARRAY subquery")
+			}
+			return &ArraySubqueryExpr{pos: startPos, Inner: innerSel}, nil
+		}
+		// Not a subquery — restore position and fall through to function call.
+		p.idx = saved
 	}
 	// Function call?
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {

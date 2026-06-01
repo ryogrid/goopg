@@ -2156,9 +2156,20 @@ func buildInheritanceRemapProject(pos int, childScan *SeqScan, parent, child *ca
 // typed one way at plan time and another at Open would diverge silently).
 func TypedVirtualCell(pos int, value, colType string) Expr {
 	switch strings.ToLower(colType) {
-	case "int2", "int4", "int8", "integer", "bigint", "smallint":
+	case "int2", "int4", "int8", "integer", "bigint", "smallint",
+		"oid", "xid", "cid", "regproc", "regprocedure":
 		if n, err := strconv.ParseInt(value, 10, 64); err == nil {
 			return &IntegerConst{pos: pos, Value: n}
+		}
+	case "oidvector":
+		// Sort numerically by first (or only) OID; display as text (like PG oidvector).
+		// For single-element oidvectors, parse to IntegerConst for numeric sort.
+		// Multi-element ("20 23") falls back to StringConst (text sort).
+		parts := strings.Fields(value)
+		if len(parts) == 1 {
+			if n, err := strconv.ParseInt(parts[0], 10, 64); err == nil {
+				return &IntegerConst{pos: pos, Value: n}
+			}
 		}
 	case "bool", "boolean":
 		switch value {
@@ -2794,6 +2805,9 @@ func exprOutputName(e parser.Expr) string {
 		return x.Column
 	case *parser.FuncCall:
 		return strings.ToLower(x.Name.Name)
+	case *parser.ArraySubqueryExpr:
+		_ = x
+		return "array"
 	}
 	return "?column?"
 }
@@ -3918,6 +3932,14 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.SubqueryExpr:
 		return planSubqueryExpr(x, agg.input)
+	case *parser.ArraySubqueryExpr:
+		return planArraySubqueryExpr(x, agg.input)
+	case *parser.CollateExpr:
+		inner, err := resolveExprAfterAggregate(x.Operand, agg)
+		if err != nil {
+			return nil, err
+		}
+		return &CollateExpr{pos: x.Pos(), Operand: inner, CollationName: x.CollationName}, nil
 	case *parser.InExpr:
 		return planInExpr(x, agg.input)
 	case *parser.ExistsExpr:
@@ -4690,7 +4712,37 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 			if serr != nil {
 				return AggregateCall{}, serr
 			}
+			// Validate: WITHIN GROUP ORDER BY cannot reference outer-scope columns.
+			// PostgreSQL error: "outer-level aggregate cannot contain a lower-level variable
+			// in its direct arguments". M0097-0127.
+			walkExprTree(e, func(inner Expr) {
+				if _, isOuter := inner.(*OuterColumnRef); isOuter {
+					serr = &PlanError{Pos: fc.Pos(), Code: "0A000",
+						Message: "outer-level aggregate cannot contain a lower-level variable in its direct arguments"}
+				}
+			})
+			if serr != nil {
+				return AggregateCall{}, serr
+			}
 			withinGroupKeys = append(withinGroupKeys, SortKey{Expr: e, Desc: sb.Desc, NullsFirst: sortByNullsFirst(sb)})
+		}
+		// Validate: collation mismatch between direct arg and WITHIN GROUP ORDER BY key.
+		// PostgreSQL rejects "rank('adam'::text collate "C") within group (order by x collate "POSIX")".
+		// M0097-0127.
+		if ac, ok := argExpr.(*CollateExpr); ok {
+			for _, wk := range withinGroupKeys {
+				if wc, ok2 := wk.Expr.(*CollateExpr); ok2 {
+					if !strings.EqualFold(ac.CollationName, wc.CollationName) {
+						return AggregateCall{}, &PlanError{
+							Pos:  fc.Pos(),
+							Code: "42P21",
+							Message: fmt.Sprintf(
+								"collation mismatch between explicit collations %q and %q",
+								ac.CollationName, wc.CollationName),
+						}
+					}
+				}
+			}
 		}
 		// Hypothetical-set aggregates require exactly one direct arg per ordering column.
 		// This includes built-in (rank, etc.) and user-defined hypothetical-set aggregates.
@@ -5195,7 +5247,7 @@ func isConstantExpr(e Expr) bool {
 	switch x := e.(type) {
 	case *ColumnRef, *OuterColumnRef:
 		return false
-	case *SubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr, *IsBoolExpr, *IsDistinctFromExpr,
+	case *SubqueryExpr, *ArraySubqueryExpr, *ExistsExpr, *InExpr, *IsNullExpr, *IsBoolExpr, *IsDistinctFromExpr,
 		*MultiAssignSubqElem, *MultiAssignSubqRow:
 		return false
 	case *BinaryOp:
@@ -6591,6 +6643,10 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 			return sch[0].Name, sch[0].Type
 		}
 	}
+	// ARRAY(SELECT ...) always renders as column name "array". M0097-0127.
+	if _, ok := e.(*ArraySubqueryExpr); ok {
+		return "array", exprType(e)
+	}
 	return "?column?", exprType(e)
 }
 
@@ -6911,6 +6967,18 @@ func exprType(e Expr) catalog.Type {
 			}
 		}
 		return catalog.Type{Name: "unknown"}
+	case *CollateExpr:
+		// CollateExpr is a pass-through; delegate type to the inner expression. M0097-0127.
+		return exprType(x.Operand)
+	case *ArraySubqueryExpr:
+		// Result is a text-array of the inner column's element type. M0097-0127.
+		if x.Plan != nil {
+			if sch := x.Plan.Output(); len(sch) > 0 {
+				elem := sch[0].Type.Name
+				return catalog.Type{Name: elem + "[]"}
+			}
+		}
+		return catalog.Type{Name: "text[]"}
 	case *MultiAssignSubqElem:
 		if x.Row != nil && x.Row.Plan != nil {
 			if sch := x.Row.Plan.Output(); x.ColIdx < len(sch) {
@@ -7141,6 +7209,20 @@ func planSubqueryExpr(x *parser.SubqueryExpr, parent *resolveContext) (Expr, err
 	return &SubqueryExpr{pos: x.Pos(), Plan: inner, IsNonCorrelated: !planHasOuterRef(inner)}, nil
 }
 
+// planArraySubqueryExpr plans ARRAY(SELECT ...) into an ArraySubqueryExpr node.
+// The inner query must project exactly one column; results are collected into
+// a PostgreSQL text-array at execution time. M0097-0127.
+func planArraySubqueryExpr(x *parser.ArraySubqueryExpr, parent *resolveContext) (Expr, error) {
+	if parent == nil || parent.cat == nil {
+		return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "subqueries are not supported in this context"}
+	}
+	inner, err := planSelectWithParent(x.Inner, parent.cat, parent)
+	if err != nil {
+		return nil, err
+	}
+	return &ArraySubqueryExpr{pos: x.Pos(), Plan: inner, IsNonCorrelated: !planHasOuterRef(inner)}, nil
+}
+
 // planRowExprIn expands `(a,b) [NOT] IN (VALUES (v1a,v1b),(v2a,v2b),...)` into
 // nested AND/OR comparisons at plan time, avoiding a multi-column subquery
 // in the executor. M0097-0020.
@@ -7270,6 +7352,10 @@ func planHasOuterRef(node Node) bool {
 			case *OuterColumnRef:
 				found = true
 			case *SubqueryExpr:
+				if x.Plan != nil && planHasOuterRef(x.Plan) {
+					found = true
+				}
+			case *ArraySubqueryExpr:
 				if x.Plan != nil && planHasOuterRef(x.Plan) {
 					found = true
 				}
@@ -7447,6 +7533,16 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.SubqueryExpr:
 		return planSubqueryExpr(x, ctx)
+	case *parser.ArraySubqueryExpr:
+		return planArraySubqueryExpr(x, ctx)
+	case *parser.CollateExpr:
+		// Pass-through: collation is preserved for mismatch detection but
+		// goopg has no runtime collation enforcement. M0097-0127.
+		inner, err := resolveExpr(x.Operand, ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &CollateExpr{pos: x.Pos(), Operand: inner, CollationName: x.CollationName}, nil
 	case *parser.InExpr:
 		return planInExpr(x, ctx)
 	case *parser.ExistsExpr:

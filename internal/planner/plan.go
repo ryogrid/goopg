@@ -261,6 +261,28 @@ type SubqueryExpr struct {
 	IsNonCorrelated bool
 }
 
+// ArraySubqueryExpr represents ARRAY(SELECT ...) — collects all rows of the
+// inner plan (must be single-column) into a PostgreSQL text-array. M0097-0127.
+type ArraySubqueryExpr struct {
+	pos             int
+	Plan            Node
+	IsNonCorrelated bool
+}
+
+// CollateExpr wraps an expression with an explicit collation name for
+// mismatch detection in WITHIN GROUP ORDER BY validation. M0097-0127.
+type CollateExpr struct {
+	pos           int
+	Operand       Expr
+	CollationName string
+}
+
+func (e *CollateExpr) Pos() int { return e.pos }
+func (*CollateExpr) exprNode()  {}
+
+func (e *ArraySubqueryExpr) Pos() int { return e.pos }
+func (*ArraySubqueryExpr) exprNode()  {}
+
 func (e *SubqueryExpr) Pos() int { return e.pos }
 func (*SubqueryExpr) exprNode()  {}
 

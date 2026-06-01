@@ -118,6 +118,11 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		return evalCaseExpr(x, slotToRow(slot), ctx)
 	case *planner.SubqueryExpr:
 		return evalSubquery(x, slotToRow(slot), ctx)
+	case *planner.ArraySubqueryExpr:
+		return evalArraySubquery(x, slotToRow(slot), ctx)
+	case *planner.CollateExpr:
+		// Pass-through: evaluate operand and ignore collation at runtime. M0097-0127.
+		return evalExprSlot(x.Operand, slot, ctx)
 	case *planner.MultiAssignSubqElem:
 		return evalMultiAssignSubqElem(x, slotToRow(slot), ctx)
 	case *planner.InExpr:
@@ -280,6 +285,14 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		}
 		return result, nil
 	case *planner.BinaryOp:
+		// Row-to-row comparisons: element-wise with proper NULL propagation.
+		// (a,b) OP (c,d): compare element by element; NULL in any element → NULL.
+		// This implements SQL row-comparison semantics (ISO SQL §8.7). M0097-0023.
+		if lRow, ok := x.Left.(*planner.RowExpr); ok {
+			if rRow, ok := x.Right.(*planner.RowExpr); ok {
+				return evalRowToRowComparison(x.Op, lRow, rRow, slot, ctx)
+			}
+		}
 		// Special case: row-constructor comparison with multi-column scalar subquery.
 		// ROW(a, b) = (SELECT x, y FROM ...) → element-wise comparison.
 		// ROW(a,b) is planned as FuncCall{Name:"row",...} not RowExpr. M0097-0020.
@@ -3826,6 +3839,54 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 		return Datum{}, err
 	}
 	return val, nil
+}
+
+// evalArraySubquery implements ARRAY(SELECT ...) — runs the inner plan and
+// collects all result rows (must be single-column) into a PostgreSQL text-array
+// string like {v1,v2,...}. M0097-0127.
+func evalArraySubquery(x *planner.ArraySubqueryExpr, row Row, ctx *Context) (Datum, error) {
+	if ctx.Ctx != nil {
+		if err := ctx.Ctx.Err(); err != nil {
+			return Datum{}, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		}
+	}
+	ctx.OuterRows = append(ctx.OuterRows, row)
+	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+
+	op, err := Build(x.Plan)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := op.Open(ctx); err != nil {
+		_ = op.Close()
+		return Datum{}, err
+	}
+	defer func() { _ = op.Close() }()
+
+	var elems []string
+	var nulls []bool
+	for {
+		slot, err := op.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return Datum{}, err
+		}
+		r := slotRow(slot)
+		if len(r) != 1 {
+			return Datum{}, &ExecError{Code: "42601", Pos: x.Pos(), Message: fmt.Sprintf("ARRAY subquery returned %d columns, expected 1", len(r))}
+		}
+		d := r[0]
+		if d.IsNull() {
+			elems = append(elems, "")
+			nulls = append(nulls, true)
+		} else {
+			elems = append(elems, d.Format())
+			nulls = append(nulls, false)
+		}
+	}
+	return NewStringDatum(formatTextArrayWithNulls(elems, nulls)), nil
 }
 
 // evalMultiAssignSubqRow executes the subquery for a multi-column SET
@@ -8200,6 +8261,47 @@ func enumTypeNameFromArgs(args []planner.Expr) string {
 		}
 	}
 	return ""
+}
+
+// evalRowToRowComparison evaluates (a,b,...) OP (c,d,...) using element-wise
+// comparison with standard SQL NULL semantics: if any compared element is NULL,
+// the result is NULL for that step. Implements ISO SQL §8.7 row comparison.
+// Used for WHERE (proname, pronamespace) > ('abs', 0) style predicates.
+func evalRowToRowComparison(op parser.OpCode, left, right *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error) {
+	n := len(left.Elems)
+	if len(right.Elems) < n {
+		n = len(right.Elems)
+	}
+	for i := 0; i < n; i++ {
+		lDat, err := evalExprSlot(left.Elems[i], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		rDat, err := evalExprSlot(right.Elems[i], slot, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if lDat.IsNull() || rDat.IsNull() {
+			return NullDatum, nil
+		}
+		cmp, err := compareDatum(lDat, rDat, 0)
+		if err != nil {
+			return Datum{}, err
+		}
+		isLast := (i == n-1)
+		if cmp < 0 {
+			return NewBoolDatum(op == parser.OpLt || op == parser.OpLe || op == parser.OpNe), nil
+		} else if cmp > 0 {
+			return NewBoolDatum(op == parser.OpGt || op == parser.OpGe || op == parser.OpNe), nil
+		}
+		// Equal — if last element, apply equality part of operator
+		if isLast {
+			return NewBoolDatum(op == parser.OpEq || op == parser.OpLe || op == parser.OpGe), nil
+		}
+		// Continue to next element
+	}
+	// All elements equal (or n=0)
+	return NewBoolDatum(op == parser.OpEq || op == parser.OpLe || op == parser.OpGe), nil
 }
 
 // evalRowExpr evaluates a row constructor `(a, b, c)` and returns its
