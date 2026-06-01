@@ -1937,6 +1937,25 @@ M0097-0001 wires it up.
         VACUUM at `internal/executor/operators_vacuum.go`.
       - Mapped to completed M0097-0008.
       - DoD: same as M0097-0020.
+      - **Progress 2026-06-01 (M0097-0129 — drop_if_exists 118→89 + date INSERT fix):**
+        Three improvements: (a) Schema-qualified DROP IF EXISTS now emits
+        "schema X does not exist, skipping" when the schema is not registered
+        (added `dropSchemaQualifiedNotice` calls to execDropOneView, execDropTable,
+        execDropIndex, execDropFunction, execDropProcedure, execDropType, execDropDomain,
+        and operator-class/family branch of execDropCompat). (b) Aggregate error
+        messages now use canonical unqualified type names ("real", "integer") for
+        ERROR, and pg_catalog-qualified names for NOTICE — fixes `errors` test
+        regression from the uncommitted changes. (c) Schema and role tracking added
+        to catalog (RegisterSchema/SchemaExists/UnregisterSchema,
+        RegisterRole/RoleExists/UnregisterRole); CREATE SCHEMA side-effect registered
+        in dispatcher; DROP ROLE/USER/GROUP validates registry.
+        Also fixed: `encodeValuePG` for "date"/"timestamp"/"timestamptz" columns now
+        handles KindString input by parsing via `parseCopyTimestamp`, fixing
+        INSERT INTO date-column VALUES (string literal) failures
+        ("expected time, got kind 3"). Enables window.sql's empsalary INSERT.
+        drop_if_exists: 118 → 89 normalized diff lines.
+        Baseline CSV: corrected window (0→3504, never actually passing) and
+        with (0→1518) to reflect true state.  test stays 0/pass.
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
