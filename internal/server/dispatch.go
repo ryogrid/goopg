@@ -1663,9 +1663,18 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 	if math.IsNaN(f) {
 		return append(dst, "NaN"...)
 	}
-	// PostgreSQL's float8out uses the shortest round-trip representation
-	// (extra_float_digits=1 by default in PG 14+). Go's -1 precision matches this.
-	return strconv.AppendFloat(dst, f, 'g', -1, 64)
+	// PostgreSQL's float8out uses the shortest round-trip representation.
+	// Go's 'g',-1 uses scientific notation for exponents >= 1, but PostgreSQL
+	// uses decimal for exponents in [1,14] (equivalent to %.15g). Convert back
+	// to decimal in that range to match PostgreSQL's formatting.
+	s := strconv.FormatFloat(f, 'g', -1, 64)
+	if idx := strings.IndexByte(s, 'e'); idx >= 0 {
+		exp, err := strconv.Atoi(s[idx+1:])
+		if err == nil && exp >= 1 && exp <= 14 {
+			s = strconv.FormatFloat(f, 'f', -1, 64)
+		}
+	}
+	return append(dst, s...)
 }
 
 // appendTimeText formats a KindTime datum as a time-of-day string matching PostgreSQL's
