@@ -1059,6 +1059,26 @@ M0097-0001 wires it up.
         Failing tests sorted by diff count: limit(34), btree_index(38),
         copydml(58), index_including_gist(64), aggregates(86), ... join(3480),
         cluster(5449), create_index(11428).
+      - **Progress 2026-06-01 (M0097-0128 — btree_index 50→0, PASS):**
+        Two fixes: (a) Fast-path row comparison NULL propagation
+        (`internal/executor/exprnode.go`): `buildExpr` was compiling
+        `BinaryOp(op, *RowExpr, *RowExpr)` as `ExprBinaryOp` with two
+        `ExprAdapter` children; this caused each `RowExpr` to be evaluated as
+        a composite text string via `evalRowExpr`, and then the two strings
+        were compared as text — producing `"(abs,20)" >= "(abs,)"` = TRUE
+        instead of NULL. Fix: detect `*planner.RowExpr` on both sides and
+        fall back to `ExprAdapter` so `evalExprSlot`'s
+        `evalRowToRowComparison` is used (element-wise 3-valued-logic with
+        correct NULL propagation). Tests: `TestBuildExprRowToRowNullFallsBackToAdapter`.
+        Design: M0097-0128 (inline; no separate doc for small fix).
+        (b) `ALTER INDEX name ALTER COLUMN col SET (options)` parser
+        (`internal/parser/ddl.go`): `SET` is tokenized as `KwSet` (not
+        `TokenIdent`) so `p.acceptIdentKeyword("set")` returned false, causing
+        the parser to fall to the no-op path and return an empty
+        `AlterTableStmt{Name:""}`. Fix: accept `KwSet` via
+        `p.acceptKeyword(KwSet)` in addition to the ident path; also accept
+        unreserved-keyword column names (`IsColNameKeyword`). Tests:
+        `TestParseAlterIndexAlterColumnSet`. Baseline CSV: `btree_index` 50→0 pass.
 
 - [ ] **M0097-0020 — Port SELECT / DML / JOIN / subquery / CTE regress tests**
       - Summary: Make these 15 tests reach `pass` status:
