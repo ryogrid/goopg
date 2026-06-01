@@ -1934,6 +1934,24 @@ M0097-0001 wires it up.
         After 30 insertions of i1..i30 before L2 in the insenum test, renumbering
         triggers on insertion i24 → sort orders become 1..24+25 integers, giving
         i20=21 > 20 → NULL in the CASE expression. enum: 320 → 201 diffs.
+      - **Progress 2026-06-02 (M0097-0141 — enum comparison + any/all + subscript name):**
+        Six interconnected fixes (commit 06ba143f):
+        (a) `TypedVirtualCell` (planner.go): numeric/float columns return `NumericConst`
+            so `pg_enum.enumsortorder ORDER BY` sorts numerically (was lexicographic).
+        (b) `isUserDefinedPlannerType` (planner.go): new helper returning true for
+            non-builtin type names.
+        (c) `resolveExpr BinaryOp` (planner.go): for comparison operators, when one
+            side has a user-defined type and other is string-like, wrap string in
+            CastExpr so evalCast converts label to `KindEnum` with correct sort order.
+            Fixes `col > 'yellow'` comparing by declaration order, not alphabetically.
+        (d) `compareEq` (executor/expr.go): `KindEnum` vs `KindString` case compares
+            by label text for equality. Fixes `= ANY ({...}::enum[])`.
+        (e) `collectInValues` (executor/expr.go): single-element `{...}` array literal
+            expands to individual string datums, enabling `= ANY (array_literal)`.
+        (f) `= ALL (array)` parser (parser/select.go): desugared as `NOT (x != ANY (array))`.
+        (g) `targetMeta array_subscript` (planner.go): returns element type name as
+            column label (e.g. `rainbow` for `(arr::rainbow[])[2]`).
+        enum: 237 → 96 normalized diff lines (isolated run).
 
 - [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
       - Summary: Make these 13 tests reach `pass`:
