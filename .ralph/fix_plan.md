@@ -1937,6 +1937,24 @@ M0097-0001 wires it up.
         VACUUM at `internal/executor/operators_vacuum.go`.
       - Mapped to completed M0097-0008.
       - DoD: same as M0097-0020.
+      - **Progress 2026-06-01 (M0097-0130 — drop_if_exists 89→34 diffs):**
+        Six targeted fixes (commit 3de09d89): (a) Restructured execDropCompat so
+        sequence/matview/aggregate/operator IF EXISTS handling runs before the
+        generic block (was unreachable for IF EXISTS, causing wrong notice format).
+        (b) Function DROP notice now emits arg types in pg_catalog-qualified format
+        (e.g. `function foo(pg_catalog.int4,text,pg_catalog.int4[]) does not exist`)
+        with unknown types generating type-not-found notice instead. (c) Procedure/
+        routine DROP ambiguity error changed to `procedure/routine name "X" is not
+        unique` with HINT. (d) DROP ROUTINE parser dispatch + DropProcedureStmt.ObjKind
+        field for "routine" keyword. (e) CREATE RULE as CompatNoopStmt (depth-tracking
+        parser); execDropTrigger/execDropType/execDropDomain emit IF EXISTS notices
+        properly; operator checkTypeSchema generates schema notice not type notice.
+        (f) tryHandleRoleDDL handles CREATE/DROP GROUP so role registry stays accurate.
+        Remaining 34 diffs: DATABASE/FDW not supported (10 lines), operator extra
+        errors from CREATE OPERATOR noop (3 lines), rule tracking missing (1 line),
+        text search double errors (2 lines), mysterious `type "no_such_schema"` × 2
+        (from DROP TYPE/DOMAIN IF EXISTS no_such_schema.foo not triggering schema
+        notice in the catalog), schema notices missing × 5.
       - **Progress 2026-06-01 (M0097-0129 — drop_if_exists 118→89 + date INSERT fix):**
         Three improvements: (a) Schema-qualified DROP IF EXISTS now emits
         "schema X does not exist, skipping" when the schema is not registered
