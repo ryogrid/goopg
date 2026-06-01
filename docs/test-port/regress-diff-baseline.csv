@@ -83,7 +83,7 @@ btree_index,0,pass
 copydml,58,failed
 index_including_gist,64,failed
 aggregates,68,failed
-drop_if_exists,89,failed
+drop_if_exists,34,failed
 create_table_like,149,failed
 index_including,204,failed
 insert_conflict,211,failed

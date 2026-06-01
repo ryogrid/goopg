@@ -171,6 +171,11 @@ func (p *parser) parseCreate() (Stmt, error) {
 		return p.parseSkipToSemicolon(t.Pos)
 	case p.acceptIdentKeyword("foreign"):
 		return p.parseSkipToSemicolon(t.Pos)
+	// CREATE RULE name AS ON event TO table [WHERE cond] DO ... — accept as no-op.
+	// Rules are not implemented in goopg v0; CREATE RULE succeeds silently so that
+	// DROP RULE can track rule existence.
+	case p.acceptIdentKeyword("rule"):
+		return p.parseCreateRuleTail(t.Pos)
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after CREATE")
 }
@@ -469,6 +474,41 @@ func parseSkipToSemicolonHelper(p *parser, stmt Stmt) (Stmt, error) {
 // ignored (e.g. CREATE OPERATOR, CREATE CAST). M0097-0027. Previously returned
 // DoStmt which failed with "DO block language not supported" and aborted
 // any enclosing transaction; CompatNoopStmt avoids that. M0097-0065.
+// parseCreateRuleTail parses a CREATE RULE statement as a no-op.
+// Rules are not implemented in goopg v0 but CREATE RULE must parse
+// successfully so that DROP RULE can track the existence of created rules.
+// The CREATE RULE syntax can have nested parens in the DO clause, so we
+// use depth tracking rather than a simple scan to semicolon.
+func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
+	// Skip tokens (tracking depth) until we reach the top-level semicolon or EOF.
+	depth := 0
+	for {
+		tok := p.cur()
+		if tok.Kind == TokenEOF {
+			break
+		}
+		if tok.Kind == TokenSymbol {
+			switch tok.Value {
+			case "(", "[":
+				depth++
+			case ")", "]":
+				if depth > 0 {
+					depth--
+				}
+			case ";":
+				if depth == 0 {
+					break
+				}
+			}
+		}
+		if tok.Kind == TokenSymbol && tok.Value == ";" && depth == 0 {
+			break
+		}
+		p.advance()
+	}
+	return &CompatNoopStmt{pos: pos, Tag: "CREATE RULE"}, nil
+}
+
 func (p *parser) parseSkipToSemicolon(pos int) (Stmt, error) {
 	for {
 		tok := p.cur()
@@ -2076,6 +2116,18 @@ func (p *parser) parseDrop() (Stmt, error) {
 	// DROP RULE [IF EXISTS] name ON table — real syntax.
 	if p.acceptIdentKeyword("rule") {
 		return p.parseDropRuleTail(t.Pos)
+	}
+	// DROP ROUTINE [IF EXISTS] name [(arg_types)] [CASCADE|RESTRICT].
+	// Semantically equivalent to DROP PROCEDURE but uses "routine" in error messages.
+	if p.acceptIdentKeyword("routine") {
+		s, err := p.parseDropProcedureTail(t.Pos)
+		if err != nil {
+			return nil, err
+		}
+		if ps, ok := s.(*DropProcedureStmt); ok {
+			ps.ObjKind = "routine"
+		}
+		return s, nil
 	}
 	// Old DROP RULE aliases (tuple/instance/rewrite rule) — PG rejects with
 	// a syntax error at the alias keyword.
