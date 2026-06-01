@@ -1955,6 +1955,21 @@ M0097-0001 wires it up.
         text search double errors (2 lines), mysterious `type "no_such_schema"` × 2
         (from DROP TYPE/DOMAIN IF EXISTS no_such_schema.foo not triggering schema
         notice in the catalog), schema notices missing × 5.
+      - **Progress 2026-06-01 (M0097-0135 — constraint enforcement + LIKE flags 136→132):**
+        Four interconnected fixes for `create_table_like`:
+        (a) `ALTER TABLE ADD [CONSTRAINT name] CHECK (expr)` parser: new `AlterTableAddCheck`
+            action kind; executor appends `CheckExpr` to `tbl.CheckConstraints`.
+            Unknown constraint types (UNIQUE, EXCLUDE) → `AlterTableNoOp` (skip to `;`).
+        (b) `parseCheckExpr`: string literals re-quoted — `TokenStringLit.Value` strips
+            quotes; now emits `'` + escaped value + `'` so `CHECK (xx = 'text')` stores
+            `xx = 'text'` not `xx = text`.
+        (c) `LIKE INCLUDING CONSTRAINTS`: parser tracks `:+constraints` flag in BodyOrder
+            key; executor copies `src.CheckConstraints` when set.
+        (d) `checkConstraints` VALUES-based evaluation: `SELECT (expr) FROM (VALUES
+            (v::t,...)) AS _chk(c,...)` gives the planner a column-name binding so
+            `xx` resolves. Critical bug: slot data now read BEFORE `op.Close()` (Close
+            releases backing row memory; reading after was UB giving KindNull).
+        Commits: ba76c814. create_table_like: 136→132 diffs.
       - **Progress 2026-06-01 (M0097-0132 — int8 overflow 576→418 diffs):**
         Added int64 add/sub/mul overflow detection in `arithmetic()` (`internal/executor/expr.go`).
         Previously Go integer arithmetic wrapped silently; goopg returned wrong results for

@@ -95,7 +95,7 @@ create_table,388,failed
 create_view,426,failed
 create_function_sql,430,failed
 insert,461,failed
-int8,475,failed
+int8,418,failed
 subselect,500,failed
 guc,587,failed
 identity,587,failed
