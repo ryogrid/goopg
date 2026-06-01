@@ -82,7 +82,7 @@ xid,0,pass
 btree_index,50,failed
 copydml,58,failed
 index_including_gist,64,failed
-aggregates,86,failed
+aggregates,68,failed
 drop_if_exists,118,failed
 create_table_like,149,failed
 index_including,204,failed

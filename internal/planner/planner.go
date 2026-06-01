@@ -947,8 +947,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// If ANY key only resolves in child schema → sort before PS (pre-sort).
 	var selectSrfPending *ProjectSet  // set when SRF is detected; applied after sort
 	var selectSrfPreSort bool         // true → sort BEFORE PS
-	if agg == nil && ps == nil && !needsWindowStage(s) {
-		srfPS, srfErr := buildSelectSrfProjectSet(s, node, ctx)
+	// Also run SRF detection when agg != nil: an aggregate result row can be
+	// expanded by generate_series/unnest in the same SELECT list. M0097-0035.
+	if ps == nil && !needsWindowStage(s) {
+		srfPS, srfErr := buildSelectSrfProjectSet(s, node, ctx, agg)
 		if srfErr != nil {
 			return nil, srfErr
 		}
@@ -2544,7 +2546,7 @@ func projectSetCompositeSchema(name string) Schema {
 // (each step advances all SRFs in lockstep; NULL-pads the shorter ones).
 // Non-SRF targets are evaluated once per child row and repeated for each step.
 // Returns nil, nil when no SRF is present in the target list. M0097-0045/0020.
-func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveContext) (*ProjectSet, error) {
+func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveContext, agg *aggregateSurface) (*ProjectSet, error) {
 	type srfEntry struct {
 		colIdx int
 		start  parser.Expr
@@ -2695,7 +2697,15 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			schema[i] = SchemaColumn{Name: name, Type: retType}
 			// otherExprs[i] stays nil — executor fills this from SRF
 		} else {
-			expr, err := resolveExpr(t.Expr, ctx)
+			var expr Expr
+			var err error
+			if agg != nil {
+				// When combined with an aggregate, non-SRF targets reference
+				// aggregate output columns — use post-agg resolution. M0097-0035.
+				expr, err = resolveExprAfterAggregate(t.Expr, agg)
+			} else {
+				expr, err = resolveExpr(t.Expr, ctx)
+			}
 			if err != nil {
 				return nil, err
 			}
