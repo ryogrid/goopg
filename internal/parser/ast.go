@@ -869,6 +869,12 @@ type ColumnDef struct {
 	// GeneratedExpr holds the raw SQL expression text (without surrounding parens)
 	// for a stored generated column. Empty for ordinary columns.
 	GeneratedExpr string
+	// IdentityColumn is true for `GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY` columns.
+	// The sequence is registered during CREATE TABLE; INSERT uses nextval() as default.
+	IdentityColumn bool
+	// IdentityAlways is true when the identity generation is ALWAYS (vs BY DEFAULT).
+	// ALWAYS means user-provided values are rejected; BY DEFAULT allows them.
+	IdentityAlways bool
 
 	// DefaultExpr holds the parsed AST of the column's DEFAULT clause when
 	// one was given (`col INT DEFAULT 0`). nil for columns without a DEFAULT.

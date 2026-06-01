@@ -993,8 +993,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// here: missing[i]=true for every column NOT in plan.ColumnIndex.
 		applyDefaultsForMissing(cols, row, insertMissing)
 
-		// Auto-generate values for SERIAL / BIGSERIAL / SMALLSERIAL columns.
-		// M0097-0009: if a serial column's slot is still NullDatum (not provided
+		// Auto-generate values for SERIAL / BIGSERIAL / SMALLSERIAL columns
+		// and GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
+		// M0097-0009: if a serial/identity column's slot is still NullDatum (not provided
 		// in the INSERT), call nextval on the implicit sequence.
 		for i, col := range cols {
 			if !row[i].IsNull() {
@@ -1002,12 +1003,12 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			}
 			seqName := ""
 			switch strings.ToLower(col.Type.Name) {
-			case "serial":
+			case "serial", "bigserial", "smallserial":
 				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
-			case "bigserial":
-				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
-			case "smallserial":
-				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+			default:
+				if col.IdentityColumn {
+					seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+				}
 			}
 			if seqName == "" {
 				continue

@@ -1366,21 +1366,40 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				return nil, err
 			}
 			stmt.LikeTables = append(stmt.LikeTables, srcName)
-			stmt.BodyOrder = append(stmt.BodyOrder, "@@LIKE:"+srcName.String())
+			likeKey := "@@LIKE:" + srcName.String()
 			// Consume optional INCLUDING/EXCLUDING clauses.
-			for p.acceptIdentKeyword("including") || p.acceptIdentKeyword("excluding") {
-				// Option keyword: DEFAULTS, CONSTRAINTS, INDEXES, IDENTITY,
-				// COMMENTS, STATISTICS, STORAGE, ALL.
-				_ = p.acceptIdentKeyword("defaults") ||
-					p.acceptIdentKeyword("constraints") ||
-					p.acceptIdentKeyword("indexes") ||
-					p.acceptIdentKeyword("identity") ||
-					p.acceptIdentKeyword("comments") ||
-					p.acceptIdentKeyword("statistics") ||
-					p.acceptIdentKeyword("storage") ||
-					p.acceptKeyword(KwAll) ||
-					p.acceptIdentKeyword("generated")
+			// Track whether IDENTITY or GENERATED or ALL is included to copy identity/generated columns.
+			for {
+				isIncluding := p.acceptIdentKeyword("including")
+				isExcluding := !isIncluding && p.acceptIdentKeyword("excluding")
+				if !isIncluding && !isExcluding {
+					break
+				}
+				switch {
+				case p.acceptIdentKeyword("defaults"):
+					if isIncluding {
+						likeKey += ":+defaults"
+					}
+				case p.acceptIdentKeyword("constraints"):
+				case p.acceptIdentKeyword("indexes"):
+				case p.acceptIdentKeyword("identity"):
+					if isIncluding {
+						likeKey += ":+identity"
+					}
+				case p.acceptIdentKeyword("comments"):
+				case p.acceptIdentKeyword("statistics"):
+				case p.acceptIdentKeyword("storage"):
+				case p.acceptIdentKeyword("generated"):
+					if isIncluding {
+						likeKey += ":+generated"
+					}
+				case p.acceptKeyword(KwAll):
+					if isIncluding {
+						likeKey += ":+defaults:+identity:+generated"
+					}
+				}
 			}
+			stmt.BodyOrder = append(stmt.BodyOrder, likeKey)
 		} else {
 			col, err := p.parseColumnDef()
 			if err != nil {
@@ -1584,13 +1603,40 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		// COLLATE collation_name — ignore collation; goopg v0 doesn't track collations. M0097-0071.
 		case p.acceptIdentKeyword("collate"):
 			_, _ = p.parseIdent() // consume collation name (may be quoted)
-		// GENERATED ALWAYS AS (expr) STORED  (M0096-0008)
+		// GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY or GENERATED ALWAYS AS (expr) STORED (M0096-0008)
 		case p.acceptIdentKeyword("generated"):
-			if !p.acceptIdentKeyword("always") {
-				return ColumnDef{}, p.errAtCur("expected ALWAYS after GENERATED")
+			isAlways := p.acceptIdentKeyword("always")
+			isByDefault := !isAlways && (p.acceptKeyword(KwBy) && p.acceptIdentKeyword("default"))
+			if !isAlways && !isByDefault {
+				return ColumnDef{}, p.errAtCur("expected ALWAYS or BY DEFAULT after GENERATED")
 			}
 			if _, err := p.expectKeyword(KwAs); err != nil {
 				return ColumnDef{}, err
+			}
+			// GENERATED ALWAYS AS IDENTITY [(sequence_options)] — identity column.
+			if p.acceptIdentKeyword("identity") {
+				col.IdentityColumn = true
+				col.IdentityAlways = isAlways
+				// Skip optional sequence options: (START WITH n INCREMENT BY m ...)
+				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+					depth := 1
+					p.advance()
+					for depth > 0 && p.cur().Kind != TokenEOF {
+						if p.cur().Kind == TokenSymbol {
+							if p.cur().Value == "(" {
+								depth++
+							} else if p.cur().Value == ")" {
+								depth--
+								if depth == 0 {
+									p.advance()
+									break
+								}
+							}
+						}
+						p.advance()
+					}
+				}
+				continue
 			}
 			if !p.acceptSymbol("(") {
 				return ColumnDef{}, p.errAtCur("expected '(' after GENERATED ALWAYS AS")

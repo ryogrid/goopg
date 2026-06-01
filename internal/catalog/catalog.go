@@ -73,6 +73,9 @@ type Column struct {
 	// executor import cycle. nil means trailing missing columns decode as
 	// NULL (the prior default). M0097-0077.
 	MissingValue any
+	// IdentityColumn is true for GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
+	// When true, INSERT without an explicit value calls nextval(tablename_colname_seq).
+	IdentityColumn bool
 }
 
 // Table is one relation in the catalog.
@@ -320,6 +323,11 @@ type Catalog interface {
 	RegisterSchema(name string)
 	// UnregisterSchema removes a schema from the registry. M0097-drop_if_exists.
 	UnregisterSchema(name string)
+	// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
+	// objType is "conversion", "operator", "rule", "text search configuration", etc.
+	RegisterCompatObject(objType, name string)
+	// DropCompatObject removes an object from the compat registry. Returns true if found.
+	DropCompatObject(objType, name string) bool
 	// RoleExists reports whether a role has been registered. M0097-drop_if_exists.
 	RoleExists(name string) bool
 	// RegisterRole records a user-created role. M0097-drop_if_exists.
@@ -424,6 +432,10 @@ type InMemory struct {
 	// DROP ROLE IF EXISTS to produce proper "does not exist" notices.
 	// M0097-drop_if_exists.
 	roles map[string]struct{}
+
+	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
+	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
+	compatObjects map[string]map[string]struct{}
 }
 
 // EnumValue is one label in a user-defined enum type together with its sort
@@ -2540,6 +2552,36 @@ func (c *InMemory) UnregisterRole(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.roles, strings.ToLower(name))
+}
+
+// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
+// Used so that DROP X (without IF EXISTS) can succeed when CREATE X was also a noop.
+func (c *InMemory) RegisterCompatObject(objType, name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.compatObjects == nil {
+		c.compatObjects = make(map[string]map[string]struct{})
+	}
+	key := strings.ToLower(objType)
+	if _, ok := c.compatObjects[key]; !ok {
+		c.compatObjects[key] = make(map[string]struct{})
+	}
+	c.compatObjects[key][name] = struct{}{}
+}
+
+// DropCompatObject removes an object from the compat registry. Returns true if found+removed.
+func (c *InMemory) DropCompatObject(objType, name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(objType)
+	if c.compatObjects == nil {
+		return false
+	}
+	if _, ok := c.compatObjects[key][name]; ok {
+		delete(c.compatObjects[key], name)
+		return true
+	}
+	return false
 }
 
 func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {

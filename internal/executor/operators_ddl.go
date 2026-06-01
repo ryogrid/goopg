@@ -414,15 +414,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			cols = append(cols, catalog.Column{
 				Name:            c.Name,
 				Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
-				NotNull:         c.NotNull,
+				NotNull:         c.NotNull || c.IdentityColumn,
 				GeneratedExpr:   c.GeneratedExpr,
 				GeneratedAlways: c.GeneratedAlways,
 				DefaultExpr:     c.DefaultExpr,
+				IdentityColumn:  c.IdentityColumn,
 			})
 		}
 		for _, item := range s.BodyOrder {
 			if strings.HasPrefix(item, "@@LIKE:") {
-				src, ok := likeByKey[item]
+				// Parse the like key and flags: "@@LIKE:tablename[:+identity][:+generated]"
+				// Strip flags from the key to look up the source table.
+				likeFlags := item
+				baseParts := strings.Split(item, ":")
+				baseKey := baseParts[0] + ":" + baseParts[1] // "@@LIKE:tablename"
+				includeIdentity := strings.Contains(likeFlags, ":+identity")
+				includeGenerated := strings.Contains(likeFlags, ":+generated")
+				includeDefaults := strings.Contains(likeFlags, ":+defaults")
+				src, ok := likeByKey[baseKey]
 				if !ok {
 					continue
 				}
@@ -436,6 +445,19 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					}
 					if !found {
 						c := sc
+						// Clear IdentityColumn unless INCLUDING IDENTITY or INCLUDING ALL was specified.
+						if !includeIdentity {
+							c.IdentityColumn = false
+						}
+						// Clear GeneratedAlways/GeneratedExpr unless INCLUDING GENERATED or INCLUDING ALL.
+						if !includeGenerated {
+							c.GeneratedAlways = false
+							c.GeneratedExpr = ""
+						}
+						// Clear DefaultExpr unless INCLUDING DEFAULTS or INCLUDING ALL was specified.
+						if !includeDefaults {
+							c.DefaultExpr = nil
+						}
 						cols = append(cols, c)
 					}
 				}
@@ -491,28 +513,32 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			})
 		}
 	}
-	// Register implicit sequences for SERIAL / BIGSERIAL / SMALLSERIAL columns.
+	// Register implicit sequences for SERIAL / BIGSERIAL / SMALLSERIAL columns
+	// and GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
+	// Uses `cols` (not s.Columns) so LIKE-copied identity columns are also covered.
 	// M0097-0009: creates the sequence so nextval() works for default generation.
-	for _, c := range s.Columns {
+	for _, c := range cols {
 		colTypeLow := strings.ToLower(c.Type.Name)
 		var seqMin, seqMax int64
+		isSerial := false
 		switch colTypeLow {
 		case "serial", "int4", "integer":
-			// serial = int4 range
 			seqMin, seqMax = 1, 2147483647
+			isSerial = colTypeLow == "serial"
 		case "bigserial", "int8", "bigint":
 			seqMin, seqMax = 1, 9223372036854775807
+			isSerial = colTypeLow == "bigserial"
 		case "smallserial", "int2", "smallint":
 			seqMin, seqMax = 1, 32767
-		default:
-			continue
+			isSerial = colTypeLow == "smallserial"
 		}
-		if colTypeLow != "serial" && colTypeLow != "bigserial" && colTypeLow != "smallserial" {
-			continue // only register sequences for serial types
+		if !isSerial && !c.IdentityColumn {
+			continue // only register sequences for serial/identity types
 		}
 		seqName := strings.ToLower(s.Name.Name) + "_" + strings.ToLower(c.Name) + "_seq"
 		RegisterSequence(seqName, 1, 1, seqMin, seqMax, false)
 	}
+
 	// If PARTITION BY, annotate the table with partition metadata
 	if s.PartitionBy != nil {
 		tbl.PartitionMethod = s.PartitionBy.Method
