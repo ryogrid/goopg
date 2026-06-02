@@ -1251,6 +1251,22 @@ func (c *InMemory) registerSystemTables() {
 				"n",                          // relreplident: not applicable for indexes
 			})
 		}
+		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
+		// PostgreSQL's pg_class is a real heap table; oid::int8 queries like
+		//   SELECT oid::int8 FROM pg_class WHERE relname = 'pg_class'
+		// must return 1259. M0097-0029.
+		out = append(out, []string{
+			"1259",  // oid
+			"pg_class", // relname
+			"r",    // relkind = regular table
+			"11",   // relnamespace = pg_catalog
+			"p",    // relpersistence
+			"0",    // reltoastrelid
+			"0",    // relpages
+			"t",    // relispopulated
+			"10",   // relnatts: 10 columns defined above
+			"n",    // relreplident
+		})
 		return out
 	}
 	c.tables["pg_catalog.pg_class"] = pgClass

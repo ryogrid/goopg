@@ -548,6 +548,9 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 	case parser.OpUnaryNeg:
 		switch d.Kind {
 		case KindInt:
+			if d.Int == math.MinInt64 {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+			}
 			return Datum{Kind: KindInt, Int: -d.Int}, nil
 		case KindNumeric:
 			// Negate a numeric/float value. M0097-0003.
@@ -1754,8 +1757,44 @@ func roundFloatToInt(d Datum, pos int) (int64, error) {
 		return 0, &ExecError{Code: "22P02", Pos: pos,
 			Message: fmt.Sprintf("invalid float value for integer cast: %s", text)}
 	}
+	// Check for NaN and out-of-range before converting to int64.
+	if math.IsNaN(f) || math.IsInf(f, 0) || f > float64(math.MaxInt64) || f < float64(math.MinInt64) {
+		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+	}
 	// Banker's rounding: round half to nearest even.
 	rounded := math.RoundToEven(f)
+	// Re-check after rounding (the rounded value could edge over MaxInt64).
+	if rounded > float64(math.MaxInt64) || rounded < float64(math.MinInt64) {
+		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+	}
+	return int64(rounded), nil
+}
+
+// roundFloat4ToInt rounds a KindNumeric or KindString datum that represents a float4
+// value to int64, parsing via float32 precision (matching PostgreSQL's float4→int8 cast).
+// The float4 source has already been rounded to float32 precision before storage as a
+// KindNumeric string, so we parse via float32 to get the correct rounded value. M0097-0147.
+func roundFloat4ToInt(d Datum, pos int) (int64, error) {
+	var text string
+	if d.Kind == KindString {
+		text = d.StringValue()
+	} else {
+		text = numericText(d)
+	}
+	// Parse as float32 to honour float4 precision (PostgreSQL's float4 is IEEE 754 single).
+	f32, err := strconv.ParseFloat(text, 32)
+	if err != nil {
+		return 0, &ExecError{Code: "22P02", Pos: pos,
+			Message: fmt.Sprintf("invalid float value for integer cast: %s", text)}
+	}
+	f := float64(float32(f32))
+	if math.IsNaN(f) || math.IsInf(f, 0) || f > float64(math.MaxInt64) || f < float64(math.MinInt64) {
+		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+	}
+	rounded := math.RoundToEven(f)
+	if rounded > float64(math.MaxInt64) || rounded < float64(math.MinInt64) {
+		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+	}
 	return int64(rounded), nil
 }
 
@@ -1846,11 +1885,17 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, erro
 	// rounding inside evalCast to use banker's rounding instead.
 	// Also handle KindString datums produced by the float8 arithmetic path
 	// (e.g. "0.05" from random()*0.1). M0097-0042.
+	// For float4 source, parse via float32 precision to match PostgreSQL semantics. M0097-0147.
+	isFloat4Source := strings.ToLower(sourceType) == "float4" || strings.ToLower(sourceType) == "real"
 	if isFloatSourceType(sourceType) && (d.Kind == KindNumeric || d.Kind == KindString) {
+		roundFn := roundFloatToInt
+		if isFloat4Source {
+			roundFn = roundFloat4ToInt
+		}
 		intTarget := strings.ToLower(targetType)
 		switch intTarget {
 		case "int2", "smallint":
-			n, err := roundFloatToInt(d, pos)
+			n, err := roundFn(d, pos)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -1859,7 +1904,7 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, erro
 			}
 			return Datum{Kind: KindInt, Int: n}, nil
 		case "int4", "integer", "int":
-			n, err := roundFloatToInt(d, pos)
+			n, err := roundFn(d, pos)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -1868,7 +1913,7 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, erro
 			}
 			return Datum{Kind: KindInt, Int: n}, nil
 		case "int8", "bigint":
-			n, err := roundFloatToInt(d, pos)
+			n, err := roundFn(d, pos)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -2058,7 +2103,43 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		default:
 			return d, nil
 		}
-	case "float", "float4", "real", "float8", "double precision":
+	case "float4", "real":
+		// Integer → float4: round-trip through float32 to apply float32 precision.
+		// PostgreSQL float4 has ~7 significant decimal digits; full int64 precision
+		// must be lost before display. M0097-0147.
+		if d.Kind == KindInt {
+			f32 := float32(d.Int)
+			f64 := float64(f32)
+			normalized := strconv.FormatFloat(f64, 'f', -1, 64)
+			if v, s, ok := parseNumericFast(normalized); ok {
+				return Datum{Kind: KindNumeric, Int: v, Scale: s}, nil
+			}
+			m, s, parseErr := parseNumeric(normalized)
+			if parseErr != nil {
+				return numericFromInt(d.Int), nil // unexpected, keep original
+			}
+			return newNumeric(m, int(s)), nil
+		}
+		// Normalize KindNumeric through float64 to strip trailing zeros (0.0→0). M0097-0003.
+		if d.Kind == KindNumeric {
+			text := numericText(d)
+			f, err := strconv.ParseFloat(text, 64)
+			if err != nil {
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type float8: %q", text)}
+			}
+			normalized := strconv.FormatFloat(f, 'f', -1, 64)
+			if v, s, ok := parseNumericFast(normalized); ok {
+				return Datum{Kind: KindNumeric, Int: v, Scale: s}, nil
+			}
+			m, s, parseErr := parseNumeric(normalized)
+			if parseErr != nil {
+				return d, nil // unexpected, keep original
+			}
+			return newNumeric(m, int(s)), nil
+		}
+		return d, nil
+	case "float", "float8", "double precision":
 		// Normalize KindNumeric through float64 to strip trailing zeros (0.0→0). M0097-0003.
 		// PostgreSQL float8out uses printf-style format that removes trailing zeros.
 		if d.Kind == KindNumeric {
@@ -2088,7 +2169,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		switch d.Kind {
 		case KindInt:
 			if d.Int < 0 || d.Int > 4294967295 {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "value out of range for type oid"}
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "OID out of range"}
 			}
 			return d, nil
 		case KindString:
@@ -2100,8 +2181,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				return Datum{}, err
 			}
 			if n < 0 || n > 4294967295 {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos,
-					Message: fmt.Sprintf("value %q is out of range for type oid", d.StringValue())}
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "OID out of range"}
 			}
 			return Datum{Kind: KindInt, Int: n}, nil
 		default:
@@ -2965,14 +3045,21 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		i := 0
 		for i < len(upper) {
 			if upper[i] == '"' {
-				// Find closing quote.
+				// Find closing quote; handle backslash-escaped quotes \"  inside.
 				j := i + 1
 				for j < len(upper) && upper[j] != '"' {
-					j++
+					if upper[j] == '\\' && j+1 < len(upper) && upper[j+1] == '"' {
+						j += 2 // skip \"
+					} else {
+						j++
+					}
 				}
+				// Extract raw text from orig (preserving case) and unescape \" → ".
+				rawText := orig[i+1 : i+1+(j-(i+1))]
+				rawText = strings.ReplaceAll(rawText, `\"`, `"`)
 				quotedSegs = append(quotedSegs, quotedSeg{
 					insertAfterPos: stripped.Len(),
-					text:           orig[i+1 : i+1+(j-(i+1))],
+					text:           rawText,
 				})
 				i = j + 1 // skip past closing '"'
 			} else {
@@ -2990,6 +3077,18 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		hasTHUpper = strings.Contains(origNoFM, "TH")
 		hasTHLower = strings.Contains(origNoFM, "th")
 		upper = strings.ReplaceAll(upper, "TH", "")
+	}
+
+	// Detect SG (sign) in the middle of the format: 2-char code that outputs the sign (+/-)
+	// at that position without any extra leading sign space. Detect AFTER quoted-text removal
+	// so the position is relative to the stripped upper string. SG at position 0 is handled
+	// by the hasSStart path below (S at start of format). M0097-0147.
+	hasSGMid := false
+	sgMidInjectAt := 0
+	if idx := strings.Index(upper, "SG"); idx > 0 {
+		hasSGMid = true
+		sgMidInjectAt = idx
+		upper = upper[:idx] + upper[idx+2:]
 	}
 
 	// Detect sign modifiers. MI/PL positions matter (prefix vs suffix).
@@ -3021,7 +3120,7 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 	// Map locale separators to canonical chars.
 	digitFmt = strings.ReplaceAll(digitFmt, "G", ",")
 	digitFmt = strings.ReplaceAll(digitFmt, "D", ".")
-	digitFmt = strings.ReplaceAll(digitFmt, "L", "")
+	digitFmt = strings.ReplaceAll(digitFmt, "L", " ")
 	digitFmt = strings.ReplaceAll(digitFmt, "C", "")
 
 	// V — decimal shift: multiply value by 10^N where N = digit positions after V.
@@ -3185,12 +3284,16 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 
 	// Second pass: replace commas in the fill area (before first actual digit) with
 	// the appropriate fill char (space for '9' area, '0' for '0' area).
+	// gFillCount tracks how many G (comma) separators were in the fill area (before first
+	// actual digit); used later by the S-start sign handler to adjust column width.
+	gFillCount := 0
 	seenActualDigit := false
 	for i := range intBuf {
 		if !intIsFill[i] {
 			seenActualDigit = true
 		}
 		if intBuf[i] == ',' && !seenActualDigit {
+			gFillCount++
 			// Determine fill char at this position from the nearest digit slot.
 			// Use the rightmost fill char type in the prefix region.
 			// Simple heuristic: if any preceding fill slot used '0', use '0', else ' '.
@@ -3205,6 +3308,12 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		}
 	}
 	result := string(intBuf)
+
+	// V-shift extends effective output width: 99999V99 with value 1234 → 1234×100=123400,
+	// width = 5 (before V) + 2 (after V) = 7 digit slots, not just 5. Pad with fill if needed.
+	if vShift > 0 && len(result) < totalDigitPositions+vShift {
+		result = strings.Repeat(" ", totalDigitPositions+vShift-len(result)) + result
+	}
 
 	// Append decimal part.
 	if dotIdx >= 0 && decPositions > 0 {
@@ -3261,11 +3370,57 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		ordSuffix = sfx
 	}
 
+	// Splice quoted literal segments into result BEFORE applying sign.
+	// The insertAfterPos values are relative to the stripped-upper (digit-only) coordinate
+	// system. Inserting before sign keeps them valid without a sign-prefix offset.
+	// Exception: hasSGMid injects the sign at a digit-column position; if quoted text also
+	// appears, positions shift and would require re-calculation — defer that edge case.
+	if len(quotedSegs) > 0 && !hasSGMid {
+		for i := len(quotedSegs) - 1; i >= 0; i-- {
+			seg := quotedSegs[i]
+			insertAt := seg.insertAfterPos
+			// Adjust insertion point when the literal format space immediately before
+			// the insertion is in the fill area (all preceding positions are fills).
+			// In PostgreSQL's to_char, a literal separator space adjacent to the fill
+			// region is output AFTER the quoted text rather than before, so we insert
+			// before it. For large values (digit at the preceding position) no shift.
+			if insertAt > 0 && insertAt <= len(intFmt) && intFmt[insertAt-1] == ' ' {
+				allFillBefore := true
+				for j := 0; j < insertAt-1; j++ {
+					if !intIsFill[j] {
+						allFillBefore = false
+						break
+					}
+				}
+				if allFillBefore {
+					insertAt--
+				}
+			}
+			if insertAt > len(result) {
+				insertAt = len(result)
+			}
+			result = result[:insertAt] + seg.text + result[insertAt:]
+		}
+	}
+
 	// Apply sign modifier.
-	if hasMI {
+	if hasSGMid {
+		// SG in the middle: inject sign at the recorded position, no leading sign space.
+		sign := byte('+')
+		if negative {
+			sign = '-'
+		}
+		if sgMidInjectAt > len(result) {
+			sgMidInjectAt = len(result)
+		}
+		result = result[:sgMidInjectAt] + string(sign) + result[sgMidInjectAt:]
+	} else if hasMI {
 		if hasMIStart {
 			if negative {
-				result = "-" + result
+				// Place minus right before the first significant digit.
+				trim := strings.TrimLeft(result, " ")
+				spaces := len(result) - len(trim)
+				result = strings.Repeat(" ", spaces) + "-" + trim
 			} else if !fm {
 				result = " " + result
 			}
@@ -3280,25 +3435,30 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 	} else if hasPL {
 		if hasPLEnd {
 			if !negative {
-				result = result + "+"
+				// PL-end positive: add one more leading sign-space and trailing + symbol.
+				result = " " + result + "+"
 			} else {
+				// PL-end negative: sign right before digits, trailing space for PL position.
 				trim := strings.TrimLeft(result, " ")
 				spaces := len(result) - len(trim)
-				result = strings.Repeat(" ", spaces) + "-" + trim
+				result = strings.Repeat(" ", spaces) + "-" + trim + " "
 			}
 		} else {
-			// hasPLStart: plus at the start.
+			// hasPLStart: sign right before first significant digit.
+			trim := strings.TrimLeft(result, " ")
+			spaces := len(result) - len(trim)
 			if negative {
-				result = "-" + result
+				result = strings.Repeat(" ", spaces) + "-" + trim
 			} else {
-				result = "+" + result
+				result = strings.Repeat(" ", spaces) + "+" + trim
 			}
 		}
 	} else if hasPR {
 		if negative {
-			// Strip leading fill spaces before wrapping (PG: "<digits>" right-justified).
+			// Place < right before the first significant digit, > at end.
 			trim := strings.TrimLeft(result, " ")
-			result = "<" + trim + ">"
+			spaces := len(result) - len(trim)
+			result = strings.Repeat(" ", spaces) + "<" + trim + ">"
 		} else if !fm {
 			result = " " + result + " "
 		}
@@ -3310,11 +3470,27 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 				result = result + "+"
 			}
 		} else {
-			// hasSStart.
-			if negative {
-				result = "-" + result
+			// hasSStart: sign right before first significant digit (no extra leading space).
+			trim := strings.TrimLeft(result, " ")
+			spaces := len(result) - len(trim)
+			if gFillCount > 0 {
+				// G separators in fill area produce an extra fill space; absorb them
+				// so the sign sits at position 0 with the correct total width.
+				fill := spaces - gFillCount
+				if fill < 0 {
+					fill = 0
+				}
+				if negative {
+					result = "-" + strings.Repeat(" ", fill) + trim
+				} else {
+					result = "+" + strings.Repeat(" ", fill) + trim
+				}
 			} else {
-				result = "+" + result
+				if negative {
+					result = strings.Repeat(" ", spaces) + "-" + trim
+				} else {
+					result = strings.Repeat(" ", spaces) + "+" + trim
+				}
 			}
 		}
 	} else {
@@ -3329,23 +3505,13 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		}
 	}
 
-	// Splice quoted literal segments back into result at their recorded positions.
-	// quotedSegs are keyed by position in the stripped-upper string. We need to map
-	// those positions to positions in the result string. The result has the same
-	// character structure as digitFmt (with sign/fill changes prepended/appended),
-	// so we scan the digitFmt to build an offset mapping.
-	if len(quotedSegs) > 0 {
-		// Simple approach: since the format was processed character by character, and
-		// quoted segments were removed from upper before digitFmt was built, we insert
-		// them by appending to the end for now (most common usage is suffix text).
-		// For positioned insertion, rebuild by finding their offset in the final string.
-		// The insertAfterPos is in stripped-upper-space; the sign prefix shifts the offset.
+	// hasSGMid + quoted text: sign position shifts with text insertion; fall back to
+	// post-sign insertion with a sign-prefix offset to keep sign embedded correctly.
+	if len(quotedSegs) > 0 && hasSGMid {
 		signPrefix := 0
 		if len(result) > 0 && (result[0] == ' ' || result[0] == '+' || result[0] == '-') {
 			signPrefix = 1
 		}
-		_ = signPrefix
-		// Insert segments in reverse order to keep offsets valid.
 		for i := len(quotedSegs) - 1; i >= 0; i-- {
 			seg := quotedSegs[i]
 			insertAt := seg.insertAfterPos + signPrefix
@@ -3407,11 +3573,8 @@ func toCharScientific(val Datum, mantissaFmt string, lowercase bool, fm bool) st
 	}
 	expFormatted := fmt.Sprintf("%s%02s", expSign, expNum)
 
-	eLetter := "e"
-	if !lowercase {
-		eLetter = "E"
-	}
-	result := mantissa + eLetter + expFormatted
+	// PostgreSQL always uses lowercase 'e' in scientific notation regardless of EEEE/eeee case.
+	result := mantissa + "e" + expFormatted
 
 	if negative {
 		result = "-" + result
@@ -3447,6 +3610,18 @@ func toCharRoman(val Datum, fm bool) string {
 		return strings.Repeat(" ", 15-len(roman)) + roman
 	}
 	return roman
+}
+
+// int64ToAbsUint64 returns the absolute value of v as uint64,
+// correctly handling math.MinInt64 which cannot be negated in int64.
+func int64ToAbsUint64(v int64) uint64 {
+	if v >= 0 {
+		return uint64(v)
+	}
+	if v == math.MinInt64 {
+		return uint64(math.MaxInt64) + 1
+	}
+	return uint64(-v)
 }
 
 func toCharOrdinalSuffix(n int64) string {
@@ -6466,68 +6641,63 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return newNumeric(m, int(sc)), nil
 		}
 	case "gcd":
-		// gcd(a, b) → greatest common divisor, always non-negative. M0097-0003.
+		// gcd(a, b) — greatest common divisor, non-negative. M0097-0003.
+		// Uses uint64 absolute values so MinInt64 doesn't overflow on negation.
 		if len(x.Args) == 2 {
 			av, e1 := evalExpr(x.Args[0], row, ctx)
 			bv, e2 := evalExpr(x.Args[1], row, ctx)
 			if e1 != nil || e2 != nil || av.IsNull() || bv.IsNull() {
 				return NullDatum, nil
 			}
-			a64, b64 := av.Int, bv.Int
-			// Compute absolute values in int64 to avoid overflow.
-			if a64 < 0 {
-				a64 = -a64
+			absA := int64ToAbsUint64(av.Int)
+			absB := int64ToAbsUint64(bv.Int)
+			ua, ub := absA, absB
+			for ub != 0 {
+				ua, ub = ub, ua%ub
 			}
-			if b64 < 0 {
-				b64 = -b64
-			}
-			// Euclidean algorithm.
-			for b64 != 0 {
-				a64, b64 = b64, a64%b64
-			}
-			// If both inputs fit in int4 range (or are INT4_MIN), check for
-			// int4 result overflow: gcd(INT4_MIN, x) = |INT4_MIN|= 2^31 > INT4_MAX.
+			const maxInt64 = uint64(math.MaxInt64)
 			isInt4Range := av.Int >= -2147483648 && av.Int <= 2147483647 &&
 				bv.Int >= -2147483648 && bv.Int <= 2147483647
-			if isInt4Range && a64 > 2147483647 {
-				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+			if isInt4Range {
+				if ua > 2147483647 {
+					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+				}
+			} else if ua > maxInt64 {
+				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
 			}
-			return Datum{Kind: KindInt, Int: a64}, nil
+			return Datum{Kind: KindInt, Int: int64(ua)}, nil
 		}
 	case "lcm":
-		// lcm(a, b) → least common multiple, always non-negative. M0097-0003.
+		// lcm(a, b) — least common multiple, non-negative. M0097-0003.
+		// Uses uint64 to handle MinInt64 without overflow.
 		if len(x.Args) == 2 {
 			av, e1 := evalExpr(x.Args[0], row, ctx)
 			bv, e2 := evalExpr(x.Args[1], row, ctx)
 			if e1 != nil || e2 != nil || av.IsNull() || bv.IsNull() {
 				return NullDatum, nil
 			}
-			a64, b64 := av.Int, bv.Int
-			// lcm(0, b) = lcm(a, 0) = 0
-			if a64 == 0 || b64 == 0 {
+			if av.Int == 0 || bv.Int == 0 {
 				return Datum{Kind: KindInt, Int: 0}, nil
 			}
-			absA, absB := a64, b64
-			if absA < 0 {
-				absA = -absA
-			}
-			if absB < 0 {
-				absB = -absB
-			}
-			// Compute gcd.
+			absA := int64ToAbsUint64(av.Int)
+			absB := int64ToAbsUint64(bv.Int)
 			ga, gb := absA, absB
 			for gb != 0 {
 				ga, gb = gb, ga%gb
 			}
-			// lcm = |a| / gcd(a,b) * |b| (division first to reduce overflow risk).
+			// lcm = |a|/gcd * |b| — divide first to reduce overflow risk.
 			result := (absA / ga) * absB
-			// Overflow check for int4 inputs.
+			const maxInt64 = uint64(math.MaxInt64)
 			isInt4Range := av.Int >= -2147483648 && av.Int <= 2147483647 &&
 				bv.Int >= -2147483648 && bv.Int <= 2147483647
-			if isInt4Range && result > 2147483647 {
-				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+			if isInt4Range {
+				if result > 2147483647 {
+					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+				}
+			} else if result > maxInt64 {
+				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
 			}
-			return Datum{Kind: KindInt, Int: result}, nil
+			return Datum{Kind: KindInt, Int: int64(result)}, nil
 		}
 	case "mod":
 		// mod(a, b) → a % b

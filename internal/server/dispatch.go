@@ -1467,7 +1467,12 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				if i < len(schema) {
 					sc := schema[i]
 					switch strings.ToLower(sc.Type.Name) {
-					case "float8", "double precision", "double", "float4", "real":
+					case "float4", "real":
+						// float4/real uses float32 precision (~7 significant digits).
+						// Use strconv bit=32 so the shortest float32 round-trip representation
+						// is produced (e.g. 4.56789e+15 not 4.567889919082496e+15). M0097-0022.
+						valueBuf = appendFloatText(valueBuf, d, 32)
+					case "float8", "double precision", "double":
 						// float8/float4 values must display in PostgreSQL's output format:
 						// scientific notation for very large/small values, shortest decimal
 						// for normal ones. Convert KindNumeric to float64 and use %g. M0097-0003.
@@ -1696,6 +1701,54 @@ func rowsAffected(op executor.Operator) int64 {
 
 // appendFloat8Text formats a datum for wire output as a float8/float4 value.
 // Uses strconv.FormatFloat so large/small values display in scientific notation
+// appendFloatText formats a datum for wire output using the specified bitSize (32 or 64).
+// bitSize=32 gives float32 precision (shortest round-trip via float32), bitSize=64 gives float8.
+func appendFloatText(dst []byte, d executor.Datum, bitSize int) []byte {
+	if d.IsNull() {
+		return dst
+	}
+	var f float64
+	switch d.Kind {
+	case executor.KindInt:
+		if bitSize == 32 {
+			f = float64(float32(d.Int))
+		} else {
+			f = float64(d.Int)
+		}
+	case executor.KindString:
+		s := d.StringValue()
+		if parsed, err := strconv.ParseFloat(s, bitSize); err == nil {
+			f = parsed
+		} else {
+			return append(dst, s...)
+		}
+	default:
+		s := d.Format()
+		if parsed, err := strconv.ParseFloat(s, bitSize); err == nil {
+			f = parsed
+		} else {
+			return append(dst, s...)
+		}
+	}
+	if math.IsInf(f, 1) {
+		return append(dst, "Infinity"...)
+	}
+	if math.IsInf(f, -1) {
+		return append(dst, "-Infinity"...)
+	}
+	if math.IsNaN(f) {
+		return append(dst, "NaN"...)
+	}
+	s := strconv.FormatFloat(f, 'g', -1, bitSize)
+	if idx := strings.IndexByte(s, 'e'); idx >= 0 {
+		exp, err := strconv.Atoi(s[idx+1:])
+		if err == nil && exp >= 1 && exp <= 14 {
+			s = strconv.FormatFloat(f, 'f', -1, bitSize)
+		}
+	}
+	return append(dst, s...)
+}
+
 // (e.g. 1.2345678901234e+200) matching PostgreSQL's float8out behavior. M0097-0003.
 func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 	if d.IsNull() {
