@@ -88,7 +88,7 @@ insert_conflict,239,failed
 join_hash,245,failed
 matview,175,failed
 enum,0,pass
-int8,153,failed
+int8,0,pass
 create_procedure,274,failed
 create_table,388,failed
 create_view,426,failed

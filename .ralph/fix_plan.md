@@ -2266,6 +2266,27 @@ M0097-0001 wires it up.
         (h) `generate_series(start, stop, 0)`: returns
             `ERROR: step size cannot equal zero` instead of `(0 rows)`. M0097-0147.
         Baseline CSV: int8 273→153 diffs.
+      - **COMPLETE 2026-06-02 (M0097-0148 — int8 153→0 diffs, PASS, loop 531):**
+        Seven interconnected fixes close all remaining int8 diffs:
+        (a) `SG` format code in the middle: `toCharNumericFormat` detects `SG` at
+            non-start position and injects sign at that offset, no extra leading
+            sign-space. `999999SG9999999999` for value 123 → `      +       123`.
+        (b) OID error message: `"value out of range for type oid"` →
+            `"OID out of range"` matching PostgreSQL's wording, sorts correctly.
+        (c) `pg_class` self-row: `VirtualRows` now includes a row for `pg_class`
+            itself (OID=1259, relkind='r', namespace=11) so
+            `SELECT oid::int8 FROM pg_class WHERE relname='pg_class'` → 1259.
+        (d) float4 wire format: new `appendFloatText(bitSize=32)` for float4/real
+            outputs float32-precision values via psql.
+        (e) float4→int cast: `roundFloat4ToInt` parses via float32 precision.
+        (f) unary negation overflow: `evalUnary` returns 22003 for INT64_MIN.
+        (g) Quoted-text alignment: inserts segments BEFORE sign application;
+            literal separator spaces in the fill area are moved AFTER the text
+            (matching PostgreSQL's digit-fill absorption behaviour). Fixes 1-space
+            off-by-one in rows where the quoted format group has fill positions.
+        Tests updated: catalog/catalog_test.go and planner/virtual_test.go filter
+        by relname instead of asserting pg_class row count == 1.
+        int8: 0 diffs → **PASS**.
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
