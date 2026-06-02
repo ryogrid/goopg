@@ -222,9 +222,12 @@ type Context struct {
 	LastSeqSet  bool
 
 	// TempTableShadows maps table name → original permanent *catalog.Table for
-	// TEMP TABLE shadowing. Populated by execCreateTable when a TEMP TABLE
-	// shadows a permanent one; used by execDropTable to restore it. M0097-0003.
+	// CREATE TEMP TABLE shadowing. Populated by execCreateTable; restored on DROP.
 	TempTableShadows map[string]*catalog.Table
+	// PendingEnumValues tracks enum labels added via ALTER TYPE … ADD VALUE inside
+	// the current explicit transaction.  They must not be used until COMMIT.
+	// map[enumTypeName][label]=true.  Nil when not in an explicit transaction.
+	PendingEnumValues map[string]map[string]bool
 
 	// WAL exposes the cluster's WAL writer so execCommit can read the
 	// WrittenLSN after a local flush to bound the SyncRep wait. nil

@@ -558,7 +558,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Register FK constraints from inline REFERENCES clauses. M0096-0011.
 	for _, c := range s.Columns {
 		if c.RefTable.Name != "" {
-			tbl.ForeignKeys = append(tbl.ForeignKeys, catalog.ForeignKey{
+			fk := catalog.ForeignKey{
 				Columns:           []string{c.Name},
 				RefTable:          c.RefTable.Name,
 				RefColumns:        c.RefColumns,
@@ -566,7 +566,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				OnUpdate:          c.OnUpdate,
 				Deferrable:        c.FKDeferrable,
 				InitiallyDeferred: c.FKInitiallyDeferred,
-			})
+			}
+			// Check type compatibility between referencing and referenced column.
+			if err := checkFKColumnTypeCompatibility(o.ctx, tbl, fk, c.Type.Name, s.Pos()); err != nil {
+				return err
+			}
+			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		}
 	}
 	// Register implicit sequences for SERIAL / BIGSERIAL / SMALLSERIAL columns
@@ -4194,6 +4199,17 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		if skipped {
 			// IF NOT EXISTS with existing label: emit NOTICE, continue.
 			o.ctx.AddNotice(fmt.Sprintf("enum label %q already exists, skipping", s.AddValue))
+		} else if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+			// Value added inside an uncommitted transaction: mark as "unsafe".
+			// Callers must not use it until COMMIT (PostgreSQL safety rule).
+			if o.ctx.PendingEnumValues == nil {
+				o.ctx.PendingEnumValues = make(map[string]map[string]bool)
+			}
+			typeName := strings.ToLower(s.Name)
+			if o.ctx.PendingEnumValues[typeName] == nil {
+				o.ctx.PendingEnumValues[typeName] = make(map[string]bool)
+			}
+			o.ctx.PendingEnumValues[typeName][s.AddValue] = true
 		}
 		return nil
 	}

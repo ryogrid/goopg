@@ -247,6 +247,10 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 								Message: fmt.Sprintf("invalid input value for enum %s: %q", et.Name, strVal),
 							}
 						}
+						// Reject unsafe values added in the current uncommitted transaction.
+						if isUnsafeEnumValue(ctx, x.TargetType, strVal) {
+							return Datum{}, enumUnsafeError(strVal, et.Name, x.Pos())
+						}
 						// Return KindEnum for correct ORDER BY semantics.
 						return NewEnumDatum(matchedSort, strVal), nil
 					}
@@ -4518,7 +4522,11 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if !ok || len(et.Values) == 0 {
 			return NullDatum, nil
 		}
-		return NewStringDatum(et.Values[len(et.Values)-1].Label), nil
+		lastLabel := et.Values[len(et.Values)-1].Label
+		if isUnsafeEnumValue(ctx, typeName, lastLabel) {
+			return Datum{}, enumUnsafeError(lastLabel, typeName, x.Pos())
+		}
+		return NewStringDatum(lastLabel), nil
 
 	case "enum_range", "enum_range_bounds":
 		typeName := enumTypeNameFromArgs(x.Args)
@@ -4555,6 +4563,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 						break
 					}
 				}
+			}
+		}
+		// Check if any value in range is an unsafe pending enum value.
+		for _, ev := range vals {
+			if isUnsafeEnumValue(ctx, typeName, ev.Label) {
+				return Datum{}, enumUnsafeError(ev.Label, typeName, x.Pos())
 			}
 		}
 		// Convert []EnumValue → []string for formatTextArray.
@@ -8491,6 +8505,27 @@ func enumTypeNameFromArgs(args []planner.Expr) string {
 		}
 	}
 	return ""
+}
+
+// isUnsafeEnumValue returns true when label is a "pending" enum value that was
+// added by ALTER TYPE … ADD VALUE inside the current (uncommitted) explicit
+// transaction.  Such values must not be used until COMMIT.
+func isUnsafeEnumValue(ctx *Context, typeName, label string) bool {
+	if ctx == nil || ctx.PendingEnumValues == nil {
+		return false
+	}
+	pending := ctx.PendingEnumValues[strings.ToLower(typeName)]
+	return pending != nil && pending[label]
+}
+
+// enumUnsafeError builds the "unsafe use of new value" ExecError.
+func enumUnsafeError(label, typeName string, pos int) error {
+	return &ExecError{
+		Code:    "0A000",
+		Pos:     pos,
+		Message: fmt.Sprintf("unsafe use of new value %q of enum type %s", label, typeName),
+		Hint:    "New enum values must be committed before they can be used.",
+	}
 }
 
 // evalRowToRowComparison evaluates (a,b,...) OP (c,d,...) using element-wise

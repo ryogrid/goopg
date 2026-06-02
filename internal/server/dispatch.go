@@ -233,6 +233,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Share the per-connection TEMP TABLE shadow map so it persists
 		// across statements in the same connection. M0097-0003.
 		ectx.TempTableShadows = connTx.TempTableShadows
+		ectx.PendingEnumValues = connTx.PendingEnumValues
 		// Wire per-connection sequence session state (currval/lastval) so
 		// values persist across statements within the same connection. M0097-0042.
 		if connTx.SeqCurrVals != nil {
@@ -341,13 +342,19 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		if connTx != nil && connTx.IsFailed() {
 			_, isCommit := stmt.(*parser.CommitStmt)
 			_, isRollback := stmt.(*parser.RollbackStmt)
-			if !isCommit && !isRollback {
+			_, isRollbackTo := stmt.(*parser.RollbackToSavepointStmt)
+			if !isCommit && !isRollback && !isRollbackTo {
 				return s.writeQueryError(w, "25P02",
 					"current transaction is aborted, commands ignored until end of transaction block")
 			}
 			// COMMIT/ROLLBACK clears the failed state — handled below in
 			// executeOneSimpleStmt → TxCommit/TxRollback path, which calls
 			// connTx.End() (resetting failed=false). Fall through.
+			// ROLLBACK TO SAVEPOINT clears the failed state so subsequent
+			// statements within the same transaction can proceed.
+			if isRollbackTo {
+				connTx.ClearFailed()
+			}
 		}
 
 		// EXPLAIN EXECUTE <name> (M0100-0005h): the planner wraps an
@@ -646,6 +653,10 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Write back the temp-table shadow map so it persists across statements. M0097-0003.
 		if connTx != nil && ectx.TempTableShadows != nil {
 			connTx.TempTableShadows = ectx.TempTableShadows
+		}
+		// Write back pending enum values (including nil after COMMIT/ROLLBACK).
+		if connTx != nil {
+			connTx.PendingEnumValues = ectx.PendingEnumValues
 		}
 	}
 	// Update pg_stat_activity to idle after successful execution.
@@ -1276,6 +1287,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
 					_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 					connTx.End()
+					ctx.PendingEnumValues = nil
 					return w.WriteCommandComplete("ROLLBACK")
 				}
 				explicitTx := connTx.Tx()
@@ -1291,15 +1303,18 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					if ssiErr := s.cfg.TxnMgr.PreCommitCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
 						_ = s.cfg.TxnMgr.Rollback(explicitTx)
 						connTx.End()
+						ctx.PendingEnumValues = nil
 						return s.writeQueryError(w, "40001",
 							"could not serialize access due to read/write dependencies among transactions: "+ssiErr.Error())
 					}
 				}
 				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
 					connTx.End()
+					ctx.PendingEnumValues = nil
 					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 				}
 				connTx.End()
+				ctx.PendingEnumValues = nil
 				maybeForceGCAfterCommit()
 				// Leave *autoCommitPtr = false so the caller does NOT attempt
 				// a second TxnMgr.Commit on the already-committed transaction.
@@ -1317,6 +1332,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			if connTx != nil && connTx.InExplicit() {
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 				connTx.End()
+				ctx.PendingEnumValues = nil
 				// Leave *autoCommitPtr = false to avoid a second rollback attempt.
 			} else {
 				// ROLLBACK outside an explicit transaction: emit warning.

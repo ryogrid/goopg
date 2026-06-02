@@ -215,6 +215,10 @@ func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
 func (o *transactionOp) clearCtxTransaction() {
 	o.ctx.Tx = mvcc.Transaction{}
 	o.ctx.Snap = mvcc.Snapshot{}
+	// Clear pending enum values so that after COMMIT/ROLLBACK the
+	// write-back in dispatch.go does not restore stale pending labels
+	// and incorrectly block usage of committed enum values.
+	o.ctx.PendingEnumValues = nil
 }
 
 // execSavepoint allocates a sub-transaction XID and pushes the savepoint

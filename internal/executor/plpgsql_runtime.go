@@ -386,6 +386,18 @@ func resolveRoutineOverload(rs *catalog.Routines, name parser.ObjectName, args [
 	case 1:
 		return matches[0], nil
 	default:
+		// Prefer non-polymorphic overloads over polymorphic ones (anyenum,
+		// anyelement, anyarray, etc.).  This mirrors PostgreSQL's function
+		// overload resolution: a specific-type match beats a polymorphic one.
+		specific := make([]*catalog.Routine, 0, len(matches))
+		for _, c := range matches {
+			if !hasPolymorphicArgType(c.ArgTypes) {
+				specific = append(specific, c)
+			}
+		}
+		if len(specific) == 1 {
+			return specific[0], nil
+		}
 		return nil, &ExecError{Code: "42725", Pos: pos, Message: fmt.Sprintf("function %s is not unique", sig)}
 	}
 }
@@ -400,6 +412,23 @@ func routineArgsCompatible(argTypes []catalog.Type, args []Datum) bool {
 		}
 	}
 	return true
+}
+
+// hasPolymorphicArgType returns true when any declared argument type is a
+// PostgreSQL polymorphic pseudo-type (anyenum, anyelement, anyarray, etc.).
+// Used in resolveRoutineOverload to prefer specific-type overloads over
+// generic polymorphic ones.
+func hasPolymorphicArgType(argTypes []catalog.Type) bool {
+	for _, t := range argTypes {
+		switch strings.ToLower(t.Name) {
+		case "anyenum", "anyelement", "anyarray", "anynonarray",
+			"anyrange", "anymultirange", "anycompatible",
+			"anycompatiblearray", "anycompatiblerange",
+			"anycompatiblemultirange":
+			return true
+		}
+	}
+	return false
 }
 
 func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {

@@ -268,6 +268,71 @@ func fkConstraintName(childTbl *catalog.Table, fk catalog.ForeignKey) string {
 	return fmt.Sprintf("%s_%s_fkey", tbl, col)
 }
 
+// checkFKColumnTypeCompatibility verifies that the referencing column type is
+// compatible with the referenced column type.  For user-defined enum types the
+// types must be identical; for other types no check is performed (implicit
+// casts handled at query time).  Called at CREATE TABLE time.
+func checkFKColumnTypeCompatibility(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, refColTypeName string, pos int) error {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	// Only check if the referencing column is a known enum type.
+	if _, isEnum := im.LookupEnum(refColTypeName); !isEnum {
+		return nil
+	}
+	// Look up the referenced table.
+	refTbl, found := ctx.Catalog.LookupTable(parser.ObjectName{Name: fk.RefTable})
+	if !found || refTbl == nil {
+		return nil
+	}
+	// Determine referenced column name.
+	refColName := ""
+	if len(fk.RefColumns) > 0 {
+		refColName = fk.RefColumns[0]
+	} else {
+		for _, idx := range ctx.Catalog.IndexesOnTable(refTbl) {
+			if idx.Primary && len(idx.Columns) > 0 {
+				refColName = idx.Columns[0]
+				break
+			}
+		}
+	}
+	if refColName == "" {
+		return nil
+	}
+	// Find the referenced column type.
+	referencedTypeName := ""
+	for _, col := range refTbl.Columns {
+		if strings.EqualFold(col.Name, refColName) {
+			referencedTypeName = col.Type.Name
+			break
+		}
+	}
+	if referencedTypeName == "" {
+		return nil
+	}
+	// Both sides must be the same enum type.
+	if strings.EqualFold(refColTypeName, referencedTypeName) {
+		return nil
+	}
+	constraintName := fkConstraintName(childTbl, fk)
+	childColName := ""
+	if len(fk.Columns) > 0 {
+		childColName = fk.Columns[0]
+	}
+	return &ExecError{
+		Code: "42804",
+		Pos:  pos,
+		Message: fmt.Sprintf(
+			"foreign key constraint %q cannot be implemented",
+			constraintName),
+		Detail: fmt.Sprintf(
+			"Key columns %q of the referencing table and %q of the referenced table are of incompatible types: %s and %s.",
+			childColName, refColName, refColTypeName, referencedTypeName),
+	}
+}
+
 // fkValsForDetail renders FK column values for the PostgreSQL-style DETAIL
 // line `Key (col)=(val) is not present in table "<parent>".`
 func fkValsForDetail(vals []Datum) string {

@@ -76,6 +76,10 @@ type connTxState struct {
 	// (for lastval()). Session-scoped. M0097-0042.
 	SeqLastVal int64
 	SeqLastSet bool
+	// PendingEnumValues tracks enum labels added via ALTER TYPE … ADD VALUE
+	// inside the current explicit transaction.  They are "unsafe" until COMMIT.
+	// map[enumTypeName][label]=true.  Cleared on COMMIT/ROLLBACK (End()).
+	PendingEnumValues map[string]map[string]bool
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr
@@ -86,6 +90,14 @@ type connTxState struct {
 func (c *connTxState) Fail() {
 	c.mu.Lock()
 	c.failed = true
+	c.mu.Unlock()
+}
+
+// ClearFailed clears the failed transaction state.  Used after ROLLBACK TO
+// SAVEPOINT restores the transaction to a pre-error state.
+func (c *connTxState) ClearFailed() {
+	c.mu.Lock()
+	c.failed = false
 	c.mu.Unlock()
 }
 
@@ -154,6 +166,7 @@ func (c *connTxState) End() {
 	c.active = false
 	c.failed = false
 	c.tx = mvcc.Transaction{}
+	c.PendingEnumValues = nil
 	c.mu.Unlock()
 }
 
