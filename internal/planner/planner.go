@@ -5299,10 +5299,19 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		// M0044-0005: varchar/char column indexes — probe key is
 		// a plain string literal; evaluates to KindString at
 		// runtime and routes through EncodeVarchar/EncodeChar.
+		// For user-defined enum columns, wrap in CastExpr so the
+		// executor converts the string to KindEnum (sort order). M0097-0022.
+		if col2, ok2 := cat.(*catalog.InMemory); ok2 {
+			if _, isEnum := col2.LookupEnum(col.Type.Name); isEnum {
+				resolvedKey = &CastExpr{pos: keyExpr.Pos(), Operand: resolvedKey, TargetType: col.Type.Name}
+			}
+		}
 	case *TypedStringLit:
 		// M0044-0005: timestamp column indexes — probe key is a
 		// typed literal like `timestamp '1995-01-01'`; evaluates
 		// to KindTime and routes through EncodeTimestamp.
+	case *CastExpr:
+		// Enum literal already wrapped by resolveExpr BinaryOp. M0097-0022.
 	default:
 		return nil, false, nil
 	}
@@ -5516,6 +5525,15 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 		}
 		if !isConstantExpr(resolvedKey) {
 			continue
+		}
+		// For user-defined enum columns, wrap string literals in CastExpr
+		// so the executor converts them to KindEnum (sort order). M0097-0022.
+		if _, ok2 := resolvedKey.(*StringConst); ok2 {
+			if col2, ok3 := cat.(*catalog.InMemory); ok3 {
+				if _, isEnum := col2.LookupEnum(col.Type.Name); isEnum {
+					resolvedKey = &CastExpr{pos: keyExpr.Pos(), Operand: resolvedKey, TargetType: col.Type.Name}
+				}
+			}
 		}
 
 		// Assign bounds based on canonical operator

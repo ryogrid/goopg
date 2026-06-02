@@ -1948,7 +1948,14 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			return &ExecError{Code: "42703", Pos: pos, Message: fmt.Sprintf("column %q of relation %q does not exist", name, tbl.Name)}
 		}
 		if !isSupportedBTreeKeyType(col.Type.Name) {
-			return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", col.Type.Name)}
+			// Also accept user-defined enum types. M0097-0022.
+			isEnum := false
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				_, isEnum = im.LookupEnum(col.Type.Name)
+			}
+			if !isEnum {
+				return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", col.Type.Name)}
+			}
 		}
 		cols[i] = col
 	}
@@ -2091,6 +2098,33 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 				continue
 			}
 			row := scanRow
+			// For enum columns, convert KindString labels to KindEnum (sort order)
+			// so encodeBTreeKeyForColumn can use float64 encoding consistently
+			// with the probe path. M0097-0022.
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				for _, c := range cols {
+					if c == nil {
+						continue
+					}
+					et, isEnum := im.LookupEnum(c.Type.Name)
+					if !isEnum {
+						continue
+					}
+					idx := c.Ordinal
+					if idx < 0 || idx >= len(row) {
+						continue
+					}
+					if row[idx].Kind == KindString {
+						label := row[idx].StringValue()
+						for _, ev := range et.Values {
+							if ev.Label == label {
+								row[idx] = NewEnumDatum(ev.SortOrder, label)
+								break
+							}
+						}
+					}
+				}
+			}
 			key, encErr := encodeCompositeBTreeKey(row, cols, pos)
 			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)
@@ -2359,6 +2393,12 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not float at runtime (kind %d)", col.Name, v.Kind)}
 		}
 		return btree.EncodeFloat8(f), nil
+	}
+	// Enum types: encode sort order as float64. M0097-0022.
+	// The caller (collectBTreeEntries) pre-converts KindString enum labels to KindEnum
+	// so both backfill and probe paths use the same float64 encoding.
+	if v.Kind == KindEnum {
+		return btree.EncodeFloat8(v.EnumSortOrder()), nil
 	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }
@@ -4123,8 +4163,23 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	if !ok {
 		return nil
 	}
+	// RENAME VALUE 'old' TO 'new' — M0097-0022.
+	if s.RenameOldValue != "" {
+		err := cat.RenameEnumValue(s.Name, s.RenameOldValue, s.RenameNewValue)
+		if err == nil {
+			return nil
+		}
+		switch e := err.(type) {
+		case *catalog.EnumLabelNotFound:
+			return &ExecError{Code: "42710", Pos: s.Pos(), Message: e.Error()}
+		case *catalog.EnumLabelAlreadyExists:
+			return &ExecError{Code: "42710", Pos: s.Pos(), Message: e.Error()}
+		default:
+			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+		}
+	}
 	if s.AddValue == "" {
-		return nil // RENAME VALUE / RENAME TO / OWNER TO — no-op
+		return nil // RENAME TO / OWNER TO — no-op
 	}
 	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After)
 	if err == nil {

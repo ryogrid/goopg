@@ -3501,7 +3501,13 @@ func lockedByForeign(h storage.HeapTupleHeader, currentXID storage.TransactionID
 // each index column by name in cols and encoding the corresponding row value.
 // Returns nil (no error) when any key column is NULL (NULLs don't participate
 // in unique constraints) or when the column is not found. M0100-0005.
-func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row) ([]byte, error) {
+// cat is optional (may be nil): when provided, KindString values on enum-typed
+// columns are converted to KindEnum so encoding is consistent with the probe path.
+func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]byte, error) {
+	var im *catalog.InMemory
+	if len(cat) > 0 && cat[0] != nil {
+		im, _ = cat[0].(*catalog.InMemory)
+	}
 	var out []byte
 	for _, idxColName := range idx.Columns {
 		var col *catalog.Column
@@ -3519,6 +3525,19 @@ func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row) 
 		v := row[colOrd]
 		if v.IsNull() {
 			return nil, nil // NULLs don't participate in unique constraints
+		}
+		// For enum columns: convert KindString labels to KindEnum (sort order)
+		// so encoding matches the btree probe path. M0097-0022.
+		if v.Kind == KindString && im != nil {
+			if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
+				label := v.StringValue()
+				for _, ev := range et.Values {
+					if ev.Label == label {
+						v = NewEnumDatum(ev.SortOrder, label)
+						break
+					}
+				}
+			}
 		}
 		keyPart, err := encodeBTreeKeyForColumn(v, col, 0)
 		if err != nil {
@@ -3544,7 +3563,7 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row)
+		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
 		if err != nil || key == nil {
 			continue
 		}
@@ -3585,7 +3604,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row)
+		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
 		if err != nil || key == nil {
 			continue
 		}

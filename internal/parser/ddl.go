@@ -3756,7 +3756,36 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// Any other ALTER TYPE variant (RENAME, OWNER TO, etc.) — consume as stub.
+	// RENAME VALUE 'old' TO 'new' (enum label rename). M0097-0022.
+	if p.acceptIdentKeyword("rename") {
+		if p.acceptIdentKeyword("value") {
+			// Consume old label string.
+			if p.cur().Kind != TokenStringLit {
+				return nil, p.errAtCur("expected string literal for old enum value")
+			}
+			stmt.RenameOldValue = p.cur().Value
+			p.advance()
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			// Consume new label string.
+			if p.cur().Kind != TokenStringLit {
+				return nil, p.errAtCur("expected string literal for new enum value")
+			}
+			stmt.RenameNewValue = p.cur().Value
+			p.advance()
+			return stmt, nil
+		}
+		// RENAME TO new_name or other RENAME variants — consume as stub.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return stmt, nil
+	}
+	// Any other ALTER TYPE variant (OWNER TO, etc.) — consume as stub.
 	for p.cur().Kind != TokenEOF {
 		if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 			break

@@ -2917,6 +2917,43 @@ func (e *EnumLabelNotFound) Error() string {
 	return fmt.Sprintf("%q is not an existing enum label", e.Label)
 }
 
+// EnumLabelAlreadyExists is returned by RenameEnumValue when the new label already exists.
+type EnumLabelAlreadyExists struct{ Label string }
+
+func (e *EnumLabelAlreadyExists) Error() string {
+	return fmt.Sprintf("enum label %q already exists", e.Label)
+}
+
+// RenameEnumValue renames an existing enum label to a new label.
+// Returns EnumLabelNotFound if oldLabel does not exist, EnumLabelAlreadyExists if newLabel
+// already exists. M0097-0022.
+func (c *InMemory) RenameEnumValue(typeName, oldLabel, newLabel string) error {
+	k := strings.ToLower(typeName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.enumTypes[k]
+	if !ok {
+		return fmt.Errorf("type %q does not exist", typeName)
+	}
+	oldIdx := -1
+	for i, ev := range et.Values {
+		if ev.Label == oldLabel {
+			oldIdx = i
+			break
+		}
+	}
+	if oldIdx < 0 {
+		return &EnumLabelNotFound{Label: oldLabel}
+	}
+	for _, ev := range et.Values {
+		if ev.Label == newLabel {
+			return &EnumLabelAlreadyExists{Label: newLabel}
+		}
+	}
+	et.Values[oldIdx].Label = newLabel
+	return nil
+}
+
 // AddEnumValue appends a new label to an existing enum. before/after are
 // reference labels (empty = append at end). Returns an error if label already
 // exists unless ifNotExists is true, in which case it is a no-op (returns nil).

@@ -293,10 +293,23 @@ func assertNoChildRows(ctx *Context, childTbl *catalog.Table, fk catalog.Foreign
 		return err
 	}
 	if found {
+		constraintName := fkConstraintName(childTbl, fk)
+		// Resolve the referenced (parent) columns for the DETAIL line.
+		// If RefColumns is empty, the FK references the parent's PK.
+		refCols := fk.RefColumns
+		if len(refCols) == 0 {
+			if parentTbl, ok2 := ctx.Catalog.(*catalog.InMemory); ok2 {
+				if pt, ok3 := parentTbl.LookupTable(parser.ObjectName{Name: fk.RefTable}); ok3 {
+					refCols = pkColumns(pt)
+				}
+			}
+		}
 		return &ExecError{
 			Code:    "23503",
-			Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint on table %q",
-				fk.RefTable, childTbl.Name),
+			Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint %q on table %q",
+				fk.RefTable, constraintName, childTbl.Name),
+			Detail: fmt.Sprintf("Key (%s)=(%s) is still referenced from table %q.",
+				strings.Join(refCols, ", "), fkValsForDetail(vals), childTbl.Name),
 		}
 	}
 	return nil

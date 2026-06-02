@@ -1952,6 +1952,32 @@ M0097-0001 wires it up.
         (g) `targetMeta array_subscript` (planner.go): returns element type name as
             column label (e.g. `rainbow` for `(arr::rainbow[])[2]`).
         enum: 237 → 96 normalized diff lines (isolated run).
+      - **Progress 2026-06-02 (M0097-0142 — enum btree + RENAME VALUE, loop 478):**
+        Eight interconnected fixes (multiple files):
+        (a) `ALTER TYPE name RENAME VALUE 'old' TO 'new'` — parser (`parseAlterType`
+            now parses RENAME VALUE), catalog (`RenameEnumValue`, `EnumLabelAlreadyExists`),
+            executor (`execAlterType` routes to `cat.RenameEnumValue`). Fixes crimson rename.
+        (b) Btree index on enum columns — `createBTreeIndex` now allows enum column
+            types (via `im.LookupEnum` type-assert), `encodeBTreeKeyForColumn` encodes
+            KindEnum as `EncodeFloat8(sortOrder)`. Btree range queries now use
+            float-sort ordering instead of alphabetical string ordering.
+        (c) Backfill enum conversion — `collectBTreeEntries` pre-converts KindString
+            heap datums to KindEnum by looking up the catalog before encoding.
+        (d) INSERT index maintenance enum conversion — `encodeIndexKeyFromCols` accepts
+            optional catalog and converts KindString → KindEnum for enum-typed index
+            columns.
+        (e) Planner index probe cast — `planIndexScanFromWhere` and `tryRangeIndexScan`
+            wrap StringConst keys in CastExpr for enum-typed index columns so the
+            executor evaluates 'yellow' to KindEnum{sortOrder=3.0} at runtime.
+        (f) IndexScan heap row enum conversion — `indexScanOp.Next()` converts enum
+            column KindString datums to KindEnum after heap decode, fixing Filter
+            predicate comparisons (e.g. green > yellow sorts by sort order, not alpha).
+        (g) IndexOnlyScan decode enum — `decodeBTreeKeyToDatum` and `decodeRowFromHeap`
+            handle unknown (enum) column types via float8 decode and KindEnum conversion.
+        (h) FK DELETE detail + constraint name — `assertNoChildRows` now includes
+            constraint name and DETAIL line matching PostgreSQL format.
+        New test: `TestEnumBTreeRangeScan` (enum_btree_range_test.go).
+        enum: 96 → 57 normalized diff lines (full-suite run).
 
 - [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
       - Summary: Make these 13 tests reach `pass`:

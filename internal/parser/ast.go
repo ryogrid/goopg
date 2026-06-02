@@ -1621,14 +1621,17 @@ func (s *CreateTypeStmt) Pos() int  { return s.pos }
 func (s *CreateTypeStmt) stmtNode() {}
 
 // AlterTypeStmt — ALTER TYPE name ADD VALUE [IF NOT EXISTS] val [BEFORE|AFTER ref]. M0097-0017.
+// Also handles RENAME VALUE 'old' TO 'new' (M0097-0022).
 type AlterTypeStmt struct {
-	pos         int
-	Name        string
-	Schema      string
-	AddValue    string
-	IfNotExists bool
-	Before      string // reference value for BEFORE positioning
-	After       string // reference value for AFTER positioning
+	pos            int
+	Name           string
+	Schema         string
+	AddValue       string
+	IfNotExists    bool
+	Before         string // reference value for BEFORE positioning
+	After          string // reference value for AFTER positioning
+	RenameOldValue string // RENAME VALUE: existing label (empty when ADD VALUE)
+	RenameNewValue string // RENAME VALUE: replacement label
 }
 
 func (s *AlterTypeStmt) Pos() int  { return s.pos }

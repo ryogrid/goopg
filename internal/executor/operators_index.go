@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/goopg/goopg/internal/access/btree"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/planner"
@@ -341,6 +342,23 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 			return nil, decErr
 		}
 		row := o.scanRow
+		// Convert KindString enum column values to KindEnum (sort order) so
+		// Filter predicates can compare by declaration order. M0097-0022.
+		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+			for i, col := range o.plan.Table.Columns {
+				if et, isEnum := im.LookupEnum(col.Type.Name); isEnum && i < len(row) {
+					if row[i].Kind == KindString {
+						label := row[i].StringValue()
+						for _, ev := range et.Values {
+							if ev.Label == label {
+								row[i] = NewEnumDatum(ev.SortOrder, label)
+								break
+							}
+						}
+					}
+				}
+			}
+		}
 		if needsDetoast(row) {
 			detoasted, err := DetoastRow(o.ctx, o.heapRel, o.plan.Table.Columns, row)
 			if err != nil {
