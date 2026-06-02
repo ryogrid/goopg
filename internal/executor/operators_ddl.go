@@ -3011,6 +3011,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 	return nil
 }
 
+
 // syncIndexToCatalogHeap writes a pg_class row and a pg_index row for idx.
 // Called by createBTreeIndex after the full index build succeeds. The row
 // layouts match PG18 canonical format so the index is visible to an attaching
@@ -4160,6 +4161,13 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	// Track enum type creation so ROLLBACK can drop it.  M0097-0022.
+	if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		if o.ctx.PendingCreatedEnums == nil {
+			o.ctx.PendingCreatedEnums = make(map[string]bool)
+		}
+		o.ctx.PendingCreatedEnums[strings.ToLower(s.Name)] = true
+	}
 	return nil
 }
 
@@ -4183,11 +4191,24 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
 	}
-	// RENAME TO new_name — rename the enum type. M0097-enum-rename.
+	// RENAME TO new_name — rename the enum type. Track for ROLLBACK.  M0097-0022.
 	if s.RenameTo != "" {
 		err := cat.RenameEnum(s.Name, s.RenameTo)
 		if err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+		}
+		if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+			oldK := strings.ToLower(s.Name)
+			newK := strings.ToLower(s.RenameTo)
+			o.ctx.PendingEnumRenames = append(o.ctx.PendingEnumRenames, EnumRenameEntry{OldName: oldK, NewName: newK})
+			// Update PendingCreatedEnums to track the current name so that
+			// isUnsafeEnumValue and rollback undo both use the right key.
+			// undoEnumDDLFromContext applies inverse renames to PendingCreatedEnums
+			// during rollback so the final drop uses the (then-restored) old name.
+			if o.ctx.PendingCreatedEnums[oldK] {
+				delete(o.ctx.PendingCreatedEnums, oldK)
+				o.ctx.PendingCreatedEnums[newK] = true
+			}
 		}
 		return nil
 	}
@@ -4200,16 +4221,20 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			// IF NOT EXISTS with existing label: emit NOTICE, continue.
 			o.ctx.AddNotice(fmt.Sprintf("enum label %q already exists, skipping", s.AddValue))
 		} else if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
-			// Value added inside an uncommitted transaction: mark as "unsafe".
-			// Callers must not use it until COMMIT (PostgreSQL safety rule).
-			if o.ctx.PendingEnumValues == nil {
-				o.ctx.PendingEnumValues = make(map[string]map[string]bool)
-			}
+			// Value added inside an uncommitted transaction: mark as "unsafe" ONLY if
+			// the type was NOT created in the same transaction (newly-created enum values
+			// are immediately safe — only pre-existing-type additions need the guard).
+			// M0097-0022.
 			typeName := strings.ToLower(s.Name)
-			if o.ctx.PendingEnumValues[typeName] == nil {
-				o.ctx.PendingEnumValues[typeName] = make(map[string]bool)
+			if !o.ctx.PendingCreatedEnums[typeName] {
+				if o.ctx.PendingEnumValues == nil {
+					o.ctx.PendingEnumValues = make(map[string]map[string]bool)
+				}
+				if o.ctx.PendingEnumValues[typeName] == nil {
+					o.ctx.PendingEnumValues[typeName] = make(map[string]bool)
+				}
+				o.ctx.PendingEnumValues[typeName][s.AddValue] = true
 			}
-			o.ctx.PendingEnumValues[typeName][s.AddValue] = true
 		}
 		return nil
 	}

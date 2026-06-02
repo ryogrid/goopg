@@ -228,6 +228,14 @@ type Context struct {
 	// the current explicit transaction.  They must not be used until COMMIT.
 	// map[enumTypeName][label]=true.  Nil when not in an explicit transaction.
 	PendingEnumValues map[string]map[string]bool
+	// PendingEnumRenames tracks ALTER TYPE … RENAME TO operations within the
+	// current explicit transaction.  On ROLLBACK, reversed in reverse order.
+	// M0097-0022.
+	PendingEnumRenames []EnumRenameEntry
+	// PendingCreatedEnums tracks enum types created via CREATE TYPE … AS ENUM
+	// within the current explicit transaction.  On ROLLBACK, created types are
+	// dropped from the catalog.  map[enumTypeName(lowercase)]=true.  M0097-0022.
+	PendingCreatedEnums map[string]bool
 
 	// WAL exposes the cluster's WAL writer so execCommit can read the
 	// WrittenLSN after a local flush to bound the SyncRep wait. nil
@@ -555,3 +563,8 @@ func (c *Context) MaterializeWriterXID() error {
 	}
 	return nil
 }
+
+
+// EnumRenameEntry records one ALTER TYPE … RENAME TO operation for transactional rollback.
+// OldName and NewName are lowercase. M0097-0022.
+type EnumRenameEntry struct{ OldName, NewName string }

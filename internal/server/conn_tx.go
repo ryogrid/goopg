@@ -80,6 +80,12 @@ type connTxState struct {
 	// inside the current explicit transaction.  They are "unsafe" until COMMIT.
 	// map[enumTypeName][label]=true.  Cleared on COMMIT/ROLLBACK (End()).
 	PendingEnumValues map[string]map[string]bool
+	// PendingEnumRenames tracks ALTER TYPE … RENAME TO within the current tx.
+	// On ROLLBACK, reversed in reverse order.  Cleared on COMMIT/ROLLBACK. M0097-0022.
+	PendingEnumRenames []executor.EnumRenameEntry
+	// PendingCreatedEnums tracks CREATE TYPE … AS ENUM within the current tx.
+	// On ROLLBACK, created types are dropped.  map[name(lowercase)]=true.  M0097-0022.
+	PendingCreatedEnums map[string]bool
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr
@@ -167,6 +173,8 @@ func (c *connTxState) End() {
 	c.failed = false
 	c.tx = mvcc.Transaction{}
 	c.PendingEnumValues = nil
+	c.PendingEnumRenames = nil
+	c.PendingCreatedEnums = nil
 	c.mu.Unlock()
 }
 

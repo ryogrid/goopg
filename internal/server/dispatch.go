@@ -234,6 +234,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// across statements in the same connection. M0097-0003.
 		ectx.TempTableShadows = connTx.TempTableShadows
 		ectx.PendingEnumValues = connTx.PendingEnumValues
+		ectx.PendingEnumRenames = connTx.PendingEnumRenames
+		ectx.PendingCreatedEnums = connTx.PendingCreatedEnums
 		// Wire per-connection sequence session state (currval/lastval) so
 		// values persist across statements within the same connection. M0097-0042.
 		if connTx.SeqCurrVals != nil {
@@ -654,9 +656,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		if connTx != nil && ectx.TempTableShadows != nil {
 			connTx.TempTableShadows = ectx.TempTableShadows
 		}
-		// Write back pending enum values (including nil after COMMIT/ROLLBACK).
+		// Write back pending enum values/renames/creates (including nil after COMMIT/ROLLBACK).
 		if connTx != nil {
 			connTx.PendingEnumValues = ectx.PendingEnumValues
+			connTx.PendingEnumRenames = ectx.PendingEnumRenames
+			connTx.PendingCreatedEnums = ectx.PendingCreatedEnums
 		}
 	}
 	// Update pg_stat_activity to idle after successful execution.
@@ -1211,6 +1215,42 @@ func coerceExecParam(d executor.Datum, targetType string) executor.Datum {
 //
 // connTx, if non-nil, tracks the per-connection explicit transaction
 // state so BEGIN/COMMIT/ROLLBACK can open/close real TxnMgr transactions.
+// undoEnumDDLForRollback reverses enum DDL (ADD VALUE, RENAME TO, CREATE TYPE AS ENUM)
+// recorded in connTx.  Must be called before connTx.End() on ROLLBACK paths.  M0097-0022.
+func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
+	if connTx == nil {
+		return
+	}
+	inm, ok := cat.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	// Step 1: Remove enum values added via ALTER TYPE … ADD VALUE in this tx.
+	// Do before undo-renames so type names are still at current (renamed) values.
+	for typeName, labels := range connTx.PendingEnumValues {
+		for label := range labels {
+			inm.RemoveEnumValue(typeName, label)
+		}
+	}
+	// Step 2: Undo renames in reverse order; track name changes in created-set.
+	created := make(map[string]bool, len(connTx.PendingCreatedEnums))
+	for k, v := range connTx.PendingCreatedEnums {
+		created[k] = v
+	}
+	for i := len(connTx.PendingEnumRenames) - 1; i >= 0; i-- {
+		r := connTx.PendingEnumRenames[i]
+		_ = inm.RenameEnum(r.NewName, r.OldName)
+		if created[r.NewName] {
+			delete(created, r.NewName)
+			created[r.OldName] = true
+		}
+	}
+	// Step 3: Drop types created in this transaction (now at original names).
+	for name := range created {
+		_ = inm.DropEnum(name, false)
+	}
+}
+
 // autoCommitPtr, if non-nil, is set to false when a BEGIN starts an
 // explicit transaction (telling the caller not to auto-commit).
 // cachedNode, when non-nil, is a pre-validated plan from the cross-session
@@ -1286,8 +1326,11 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				if connTx.IsFailed() {
 					// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
 					_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
+					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
 					ctx.PendingEnumValues = nil
+					ctx.PendingEnumRenames = nil
+					ctx.PendingCreatedEnums = nil
 					return w.WriteCommandComplete("ROLLBACK")
 				}
 				explicitTx := connTx.Tx()
@@ -1302,19 +1345,27 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				if explicitTx.Isolation == mvcc.IsolationSerializable && explicitTx.Handle != 0 {
 					if ssiErr := s.cfg.TxnMgr.PreCommitCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
 						_ = s.cfg.TxnMgr.Rollback(explicitTx)
+						undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 						connTx.End()
 						ctx.PendingEnumValues = nil
+						ctx.PendingEnumRenames = nil
+						ctx.PendingCreatedEnums = nil
 						return s.writeQueryError(w, "40001",
 							"could not serialize access due to read/write dependencies among transactions: "+ssiErr.Error())
 					}
 				}
 				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
+					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
 					ctx.PendingEnumValues = nil
+					ctx.PendingEnumRenames = nil
+					ctx.PendingCreatedEnums = nil
 					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 				}
 				connTx.End()
 				ctx.PendingEnumValues = nil
+				ctx.PendingEnumRenames = nil
+				ctx.PendingCreatedEnums = nil
 				maybeForceGCAfterCommit()
 				// Leave *autoCommitPtr = false so the caller does NOT attempt
 				// a second TxnMgr.Commit on the already-committed transaction.
@@ -1331,8 +1382,11 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		case planner.TxRollback:
 			if connTx != nil && connTx.InExplicit() {
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
+				undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 				connTx.End()
 				ctx.PendingEnumValues = nil
+				ctx.PendingEnumRenames = nil
+				ctx.PendingCreatedEnums = nil
 				// Leave *autoCommitPtr = false to avoid a second rollback attempt.
 			} else {
 				// ROLLBACK outside an explicit transaction: emit warning.

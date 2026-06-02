@@ -1540,7 +1540,7 @@ func (c *InMemory) registerSystemTables() {
 		Schema: "pg_catalog",
 		Name:   "pg_enum",
 		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
 			{Name: "enumtypid", Type: Type{Name: "text"}, Ordinal: 1},
 			{Name: "enumsortorder", Type: Type{Name: "numeric"}, Ordinal: 2},
 			{Name: "enumlabel", Type: Type{Name: "text"}, Ordinal: 3},
@@ -3087,6 +3087,25 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 		et.Values = append(et.Values, EnumValue{Label: value, SortOrder: newSortOrder})
 	}
 	return false, nil
+}
+
+
+// RemoveEnumValue removes a label from an existing enum type.
+// Used to roll back ALTER TYPE … ADD VALUE on transaction ROLLBACK. M0097-0022.
+func (c *InMemory) RemoveEnumValue(typeName, label string) {
+	k := strings.ToLower(typeName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, found := c.enumTypes[k]
+	if !found {
+		return
+	}
+	for i, ev := range et.Values {
+		if ev.Label == label {
+			et.Values = append(et.Values[:i], et.Values[i+1:]...)
+			return
+		}
+	}
 }
 
 // DropEnum removes an enum type. cascade=true is accepted (stub — does not

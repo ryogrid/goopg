@@ -118,6 +118,7 @@ func (o *transactionOp) execCommit() error {
 				// Rollback the transaction on constraint violation.
 				_ = o.ctx.TxnMgr.Rollback(tx)
 				o.ctx.Session.EndExplicitTransaction()
+				undoEnumDDLFromContext(o.ctx)
 				o.clearCtxTransaction()
 				return err
 			}
@@ -130,6 +131,7 @@ func (o *transactionOp) execCommit() error {
 	if ssiErr := ssiPreCommitCheck(o.ctx, tx); ssiErr != nil {
 		_ = o.ctx.TxnMgr.Rollback(tx)
 		o.ctx.Session.EndExplicitTransaction()
+		undoEnumDDLFromContext(o.ctx)
 		o.clearCtxTransaction()
 		if ee, ok := ssiErr.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
@@ -177,6 +179,7 @@ func (o *transactionOp) execRollback() error {
 	}
 	o.ctx.Session.EndExplicitTransaction()
 	globalRelLockMgr.ReleaseSession(o.ctx.Session)
+	undoEnumDDLFromContext(o.ctx)
 	o.clearCtxTransaction()
 	return nil
 }
@@ -219,6 +222,43 @@ func (o *transactionOp) clearCtxTransaction() {
 	// write-back in dispatch.go does not restore stale pending labels
 	// and incorrectly block usage of committed enum values.
 	o.ctx.PendingEnumValues = nil
+	o.ctx.PendingEnumRenames = nil
+	o.ctx.PendingCreatedEnums = nil
+}
+
+// undoEnumDDLFromContext reverses enum DDL (ADD VALUE, RENAME TO, CREATE TYPE AS ENUM)
+// recorded in ctx.  Must be called before clearCtxTransaction() on ROLLBACK.  M0097-0022.
+func undoEnumDDLFromContext(ctx *Context) {
+	inm, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	// Step 1: Remove any enum values added via ALTER TYPE … ADD VALUE in this tx.
+	// Do this before undoing renames so type names are still at current (renamed) values.
+	for typeName, labels := range ctx.PendingEnumValues {
+		for label := range labels {
+			inm.RemoveEnumValue(typeName, label)
+		}
+	}
+	// Step 2: Undo renames in reverse order.  Also reverse their effect on the
+	// created-set so that after all renames are undone, 'created' holds current
+	// (post-undo) names — the keys to pass to DropEnum.
+	created := make(map[string]bool, len(ctx.PendingCreatedEnums))
+	for k, v := range ctx.PendingCreatedEnums {
+		created[k] = v
+	}
+	for i := len(ctx.PendingEnumRenames) - 1; i >= 0; i-- {
+		r := ctx.PendingEnumRenames[i]
+		_ = inm.RenameEnum(r.NewName, r.OldName)
+		if created[r.NewName] {
+			delete(created, r.NewName)
+			created[r.OldName] = true
+		}
+	}
+	// Step 3: Drop types created in this transaction (now at original names).
+	for name := range created {
+		_ = inm.DropEnum(name, false)
+	}
 }
 
 // execSavepoint allocates a sub-transaction XID and pushes the savepoint
