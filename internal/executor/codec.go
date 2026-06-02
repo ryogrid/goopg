@@ -971,7 +971,32 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		pgOffset := int32(binary.LittleEndian.Uint32(data[8:12]))
 		offsetSecs := int(-pgOffset)
 		return NewTimeTZDatum(pgTimeFromMicros(micros), offsetSecs), 12, nil
-	case "text", "varchar", "character varying", "bpchar", "character", "char", "unknown":
+	case "char":
+		// Single-byte internal "char" type (no length modifier): fixed 1-byte
+		// field. "char(N)" (with args) is bpchar (varlena) and is handled by
+		// the varlena branch below. M0097-0146.
+		if len(t.Args) == 0 {
+			if len(data) < 1 {
+				return Datum{}, 0, fmt.Errorf("truncated char")
+			}
+			return NewStringDatum(string(data[:1])), 1, nil
+		}
+		// char(N) = bpchar = varlena; fall through to varlena branch.
+		if len(data) >= 13 && data[0] == 0x01 {
+			ptr := make([]byte, 12)
+			copy(ptr, data[1:13])
+			return NewToastPointerDatum(ptr), 13, nil
+		}
+		payload, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, err
+		}
+		if sctx != nil {
+			moff, mlen := sctx.AllocBytes(payload)
+			return newStringArenaDatum(sctx, moff, mlen), n, nil
+		}
+		return NewStringDatum(string(payload)), n, nil
+	case "text", "varchar", "character varying", "bpchar", "character", "unknown":
 		// PG external varlena (VARATT_IS_1B_E = 0x01): our TOAST pointer.
 		// 0x01 is unambiguous: 0x01>>1=0 is an invalid data varlena length,
 		// so no legitimate data string can produce this header byte.

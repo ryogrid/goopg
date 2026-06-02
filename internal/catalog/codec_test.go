@@ -127,8 +127,8 @@ func TestPGAttributeColumnsCount(t *testing.T) {
 
 // TestPGTypeColumnsCount checks the pg_type schema column count.
 func TestPGTypeColumnsCount(t *testing.T) {
-	if got := len(PGTypeColumns()); got != 7 {
-		t.Errorf("PGTypeColumns: len=%d want 7", got)
+	if got := len(PGTypeColumns()); got != 32 {
+		t.Errorf("PGTypeColumns: len=%d want 32", got)
 	}
 }
 

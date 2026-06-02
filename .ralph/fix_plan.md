@@ -2028,6 +2028,28 @@ M0097-0001 wires it up.
         requires pg_type SeqScan to work (PGTypeColumns() has 7 cols vs 32 actual;
         SeqScan always returns 0 rows → NOT EXISTS TRUE → all pg_enum rows returned).
         Fix: expand PGTypeColumns() to full 32-column schema (deferred: risk/scope).
+      - **COMPLETE 2026-06-02 (M0097-0146 — enum → 0 diffs, PASS, loop 529):**
+        Six interconnected fixes close the 3 remaining enum diffs:
+        (a) `enumtypid` type: `pg_enum.enumtypid` changed from `"text"` to `"oid"`;
+            VirtualRows now stores `et.OID` (integer) instead of `et.Name`.
+        (b) `::regtype` cast: CastExpr evaluator handles `"regtype"` → looks up enum
+            type OID via LookupEnum, returns KindInt so `'rainbow'::regtype = enumtypid`
+            works correctly.
+        (c) `PGTypeColumns()` expanded from 7 to 32 columns matching `pgTypeColDefs()`
+            (the PG18 physical format). This enables SeqScan on pg_type to decode
+            both built-in rows (194 rows from initdb) and user-created enum type rows.
+        (d) `char` decode fix in `decodePhysicalPGValueMctx`: bare `"char"` (no args)
+            was matched by the varlena text branch; now handled as a 1-byte fixed
+            type before the varlena branch.
+        (e) `syncEnumTypeToCatalogHeap` + `deleteTypeFromCatalogHeap`: new functions
+            insert/delete pg_type rows for user-created enum types; `mirrorCatalogRelToPostgresDB`
+            keeps base/5/1247 in sync. `MaterializeWriterXID()` called before DELETE
+            stamp (otherwise xmax=0=InvalidTransactionID = no-op).
+        (f) NOT EXISTS anti-join project strip: `unnestExistsExpr` now strips a
+            non-identity `Project` wrapper from the inner plan so the hash build
+            uses raw SeqScan rows (whose column indices match `SubCol.Index`) rather
+            than the `SELECT 1` projected output (which only has 1 column).
+        enum: 3 → 0 diffs → **PASS** (54 in CSV → 0).
 
 - [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
       - Summary: Make these 13 tests reach `pass`:

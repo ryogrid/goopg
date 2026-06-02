@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -2909,6 +2910,48 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	})
 }
 
+// syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
+// the pg_type heap (OID 1247). Called after RegisterEnum so that queries like
+// `SELECT 1 FROM pg_type WHERE oid = enumtypid` return the expected rows.
+// Mirrors to DBOid=5 (postgres db) so the seqScan (which reads from the
+// session's DBOID) finds the row. M0097-0022 (enum → pg_type parity).
+func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
+	if !catalogHeapSyncAvailable(ctx) {
+		return
+	}
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForEnum(et)); err != nil {
+		return
+	}
+	// Mirror pg_type to the postgres database (DBOid=5) so sessions using
+	// the postgres db can find the new type row via SeqScan. This mirrors
+	// the pattern used by syncTableToCatalogHeap. M0097-0022.
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+}
+
+// deleteTypeFromCatalogHeap stamps xmax on the pg_type row for typeOID.
+// Called by execDropType so dropped enums don't leave orphan pg_type rows.
+// pg_type rows are written by syncEnumTypeToCatalogHeap using pgTypeColumnsPG18
+// which has oid (4-byte LE uint32) as column 0. M0097-0022.
+func deleteTypeFromCatalogHeap(ctx *Context, dbOid uint32, typeOID uint32, xmax storage.TransactionID) {
+	typeRel := storage.RelFileNode{
+		DBOid:  dbOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	stampCatalogRows(ctx, typeRel, xmax, func(data []byte) bool {
+		if len(data) < 4 {
+			return false
+		}
+		// Column 0 of pgTypeColumnsPG18 is oid (4-byte LE uint32) at offset 0.
+		return binary.LittleEndian.Uint32(data[0:4]) == typeOID
+	})
+}
+
 // catalogHeapSyncAvailable returns true when the M0030-0001 system catalog
 // heap relfiles are accessible and DDL operations should write rows to
 // pg_class / pg_attribute. The proxy indicator is whether pg_attribute is
@@ -4157,10 +4200,13 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		}
 		return nil
 	}
-	_, err := cat.RegisterEnum(s.Name, s.EnumValues)
+	et, err := cat.RegisterEnum(s.Name, s.EnumValues)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	// Write a pg_type heap row so `SELECT 1 FROM pg_type WHERE oid = enumtypid`
+	// returns a match for the new type. M0097-0022.
+	syncEnumTypeToCatalogHeap(o.ctx, et)
 	// Track enum type creation so ROLLBACK can drop it.  M0097-0022.
 	if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
 		if o.ctx.PendingCreatedEnums == nil {
@@ -4265,6 +4311,17 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		}
 		n := name.Name
 		// Try to drop as enum first, then as composite type. M0097-0064.
+		// Stamp pg_type row before in-memory delete (need OID while et still exists).
+		// MaterializeWriterXID ensures a real non-zero XID is used; DROP TYPE
+		// does not call writeHeapRowReturningPG so the XID would otherwise
+		// remain InvalidTransactionID (0), which is a no-op stamp. M0097-0022.
+		if et, ok := cat.LookupEnum(n); ok && catalogHeapSyncAvailable(o.ctx) {
+			if o.ctx.MaterializeWriterXID() == nil {
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.OID, o.ctx.Tx.XID)
+				// Mirror pg_type to postgres db so the xmax stamp is visible via SeqScan.
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			}
+		}
 		enumErr := cat.DropEnum(n, s.Cascade)
 		if enumErr == nil {
 			continue // successfully dropped as enum

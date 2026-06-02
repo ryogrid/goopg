@@ -1541,7 +1541,7 @@ func (c *InMemory) registerSystemTables() {
 		Name:   "pg_enum",
 		Columns: []Column{
 			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
-			{Name: "enumtypid", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "enumtypid", Type: Type{Name: "oid"}, Ordinal: 1},
 			{Name: "enumsortorder", Type: Type{Name: "numeric"}, Ordinal: 2},
 			{Name: "enumlabel", Type: Type{Name: "text"}, Ordinal: 3},
 		},
@@ -1563,7 +1563,7 @@ func (c *InMemory) registerSystemTables() {
 			for _, ev := range et.Values {
 				rows = append(rows, []string{
 					fmt.Sprintf("%d", oid),
-					et.Name,
+					fmt.Sprintf("%d", et.OID),
 					strconv.FormatFloat(ev.SortOrder, 'f', -1, 32),
 					ev.Label,
 				})

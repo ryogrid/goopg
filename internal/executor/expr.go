@@ -197,6 +197,20 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		//   - `<text>::regclass` resolves the relation name to its numeric OID
 		// The latter is the exact pgbench probe shape:
 		//   `... WHERE oid = $1::pg_catalog.regclass`.
+		// `::regtype` resolves a type name to its OID (string→oid).
+		if strings.EqualFold(x.TargetType, "regtype") && ctx != nil && ctx.Catalog != nil {
+			if v.Kind == KindString {
+				typName := strings.ToLower(strings.TrimSpace(v.StringValue()))
+				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+					if et, found := im.LookupEnum(typName); found {
+						return NewIntDatum(int64(et.OID)), nil
+					}
+				}
+				// Built-in type stubs: return 0 as a sentinel (no-op; queries
+				// matching built-in types with enumtypid will find no rows).
+				return NewIntDatum(0), nil
+			}
+		}
 		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
 			switch v.Kind {
 			case KindInt:
