@@ -460,10 +460,11 @@ type EnumType struct {
 
 // Domain holds one user-defined domain type. M0097-0017.
 type Domain struct {
-	Name    string
-	OID     uint32
-	Base    Type // resolved base type
-	NotNull bool
+	Name          string
+	OID           uint32
+	Base          Type // resolved base type
+	NotNull       bool
+	CheckInValues []string // allowed values from CHECK (VALUE IN ...), M0097-domain-check
 }
 
 // CompositeField describes one field in a user-defined composite type.
@@ -2954,6 +2955,25 @@ func (c *InMemory) RenameEnumValue(typeName, oldLabel, newLabel string) error {
 	return nil
 }
 
+// RenameEnum renames an enum type from oldName to newName. M0097-enum-rename.
+func (c *InMemory) RenameEnum(oldName, newName string) error {
+	ok := strings.ToLower(oldName)
+	nk := strings.ToLower(newName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, found := c.enumTypes[ok]
+	if !found {
+		return fmt.Errorf("type %q does not exist", oldName)
+	}
+	if _, exists := c.enumTypes[nk]; exists {
+		return fmt.Errorf("type %q already exists", newName)
+	}
+	delete(c.enumTypes, ok)
+	et.Name = nk
+	c.enumTypes[nk] = et
+	return nil
+}
+
 // AddEnumValue appends a new label to an existing enum. before/after are
 // reference labels (empty = append at end). Returns an error if label already
 // exists unless ifNotExists is true, in which case it is a no-op (returns nil).
@@ -3129,7 +3149,7 @@ func (c *InMemory) DropCompositeType(name string) error {
 
 // RegisterDomain creates a new domain type. Returns an error if name already
 // exists. M0097-0017.
-func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain, error) {
+func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, checkInValues ...string) (*Domain, error) {
 	k := strings.ToLower(name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -3137,10 +3157,11 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain
 		return nil, fmt.Errorf("type %q already exists", name)
 	}
 	d := &Domain{
-		Name:    k,
-		OID:     c.nextOID,
-		Base:    base,
-		NotNull: notNull,
+		Name:          k,
+		OID:           c.nextOID,
+		Base:          base,
+		NotNull:       notNull,
+		CheckInValues: checkInValues,
 	}
 	c.nextOID++
 	c.domains[k] = d

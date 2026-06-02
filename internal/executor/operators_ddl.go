@@ -4178,8 +4178,16 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
 	}
+	// RENAME TO new_name — rename the enum type. M0097-enum-rename.
+	if s.RenameTo != "" {
+		err := cat.RenameEnum(s.Name, s.RenameTo)
+		if err != nil {
+			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+		}
+		return nil
+	}
 	if s.AddValue == "" {
-		return nil // RENAME TO / OWNER TO — no-op
+		return nil // OWNER TO — no-op
 	}
 	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After)
 	if err == nil {
@@ -4240,7 +4248,7 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 		return nil
 	}
 	baseType := catalog.Type{Name: s.BaseType}
-	_, err := cat.RegisterDomain(s.Name, baseType, s.NotNull)
+	_, err := cat.RegisterDomain(s.Name, baseType, s.NotNull, s.CheckInValues...)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}

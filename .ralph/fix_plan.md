@@ -1978,6 +1978,24 @@ M0097-0001 wires it up.
             constraint name and DETAIL line matching PostgreSQL format.
         New test: `TestEnumBTreeRangeScan` (enum_btree_range_test.go).
         enum: 96 → 57 normalized diff lines (full-suite run).
+      - **Progress 2026-06-02 (M0097-0143 — RENAME TO + domain check, loop 479):**
+        (a) `ALTER TYPE name RENAME TO new_name` — now implemented: `RenameTo string`
+            added to `AlterTypeStmt`; `parseAlterType` parses `RENAME TO new_name` and
+            extracts the new type name; `catalog.InMemory.RenameEnum(old, new)` atomically
+            renames the enum entry; `execAlterType` routes to `cat.RenameEnum`.
+            Tests: `TestEnumRenameToWorks`.
+        (b) Domain CHECK constraint enforcement — `VALUE IN (...)` pattern:
+            `CreateDomainStmt.CheckInValues []string` stores parsed IN-list;
+            `tryParseCheckInValues()` parser helper extracts string literals from
+            `CHECK (VALUE IN ('a','b','c'))` form; `Domain.CheckInValues []string`
+            stored in catalog; `evalExprSlot CastExpr` checks the label against
+            CheckInValues when casting to a domain type, returns SQLSTATE 23514
+            with message `value for domain X violates check constraint "X_check"`.
+            Tests: `TestDomainCheckConstraintEnforced`.
+        enum: 57 → 54 diff lines (domain check removes 10 extra rgb lines;
+        RENAME TO changes some error patterns due to transactional DDL limitations).
+        Remaining: "unsafe new enum value" (transaction-aware tracking), echo_me
+        overload resolution, enum_range after RENAME TO (transactional DDL), pg_enum.
 
 - [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
       - Summary: Make these 13 tests reach `pass`:

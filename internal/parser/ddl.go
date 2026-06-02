@@ -3776,7 +3776,16 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 			p.advance()
 			return stmt, nil
 		}
-		// RENAME TO new_name or other RENAME variants — consume as stub.
+		// RENAME TO new_name — parse the new type name. M0097-enum-rename.
+		if p.acceptKeyword(KwTo) {
+			newName, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			stmt.RenameTo = newName.Name
+			return stmt, nil
+		}
+		// Other RENAME variants (e.g. RENAME ATTRIBUTE) — consume as stub.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break
@@ -3916,14 +3925,22 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 				// Fall through to CHECK handling below.
 				if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
 					p.advance()
-					if err := p.skipParenExpr(); err != nil {
+					if vals := p.tryParseCheckInValues(); vals != nil {
+						if stmt.CheckInValues == nil {
+							stmt.CheckInValues = vals
+						}
+					} else if err := p.skipParenExpr(); err != nil {
 						return nil, err
 					}
 				}
 				continue
 			case KwCheck:
 				p.advance()
-				if err := p.skipParenExpr(); err != nil {
+				if vals := p.tryParseCheckInValues(); vals != nil {
+					if stmt.CheckInValues == nil {
+						stmt.CheckInValues = vals
+					}
+				} else if err := p.skipParenExpr(); err != nil {
 					return nil, err
 				}
 				continue
@@ -3961,6 +3978,59 @@ func (p *parser) skipParenExpr() error {
 		p.advance()
 	}
 	return nil
+}
+
+// tryParseCheckInValues tries to parse a CHECK (VALUE IN ('a','b','c')) pattern.
+// Returns the list of allowed string values if the pattern matches, or nil if
+// the expression does not follow the VALUE IN (...) form (caller should fall back
+// to skipParenExpr). M0097-domain-check.
+func (p *parser) tryParseCheckInValues() []string {
+	// Save position so we can revert if the pattern doesn't match.
+	start := p.idx
+	if !p.acceptSymbol("(") {
+		return nil
+	}
+	// Expect the keyword VALUE (as identifier).
+	if p.cur().Kind != TokenIdent || !strings.EqualFold(p.cur().Value, "value") {
+		p.idx = start
+		return nil
+	}
+	p.advance() // consume VALUE
+	// Expect IN keyword.
+	if !p.acceptKeyword(KwIn) {
+		p.idx = start
+		return nil
+	}
+	// Expect opening paren for the IN list.
+	if !p.acceptSymbol("(") {
+		p.idx = start
+		return nil
+	}
+	// Parse string literals.
+	var vals []string
+	for {
+		if p.cur().Kind != TokenStringLit {
+			p.idx = start
+			return nil
+		}
+		vals = append(vals, p.cur().Value)
+		p.advance()
+		if p.acceptSymbol(",") {
+			continue
+		}
+		break
+	}
+	// Expect closing paren for IN list.
+	if !p.acceptSymbol(")") {
+		p.idx = start
+		return nil
+	}
+	// Expect closing paren for CHECK(...).
+	if !p.acceptSymbol(")") {
+		p.idx = start
+		return nil
+	}
+	return vals
 }
 
 // parseDropDomain picks up after DROP DOMAIN has been detected.

@@ -1632,6 +1632,7 @@ type AlterTypeStmt struct {
 	After          string // reference value for AFTER positioning
 	RenameOldValue string // RENAME VALUE: existing label (empty when ADD VALUE)
 	RenameNewValue string // RENAME VALUE: replacement label
+	RenameTo       string // RENAME TO: new type name (M0097-enum-rename)
 }
 
 func (s *AlterTypeStmt) Pos() int  { return s.pos }
@@ -1650,11 +1651,12 @@ func (s *DropTypeStmt) stmtNode() {}
 
 // CreateDomainStmt — CREATE DOMAIN name [AS] base_type [constraints]. M0097-0017.
 type CreateDomainStmt struct {
-	pos      int
-	Name     string
-	Schema   string
-	BaseType string // base type name
-	NotNull  bool
+	pos            int
+	Name           string
+	Schema         string
+	BaseType       string   // base type name
+	NotNull        bool
+	CheckInValues  []string // allowed values from CHECK (VALUE IN ('a','b','c')), M0097-domain-check
 }
 
 func (s *CreateDomainStmt) Pos() int  { return s.pos }

@@ -257,6 +257,34 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if err != nil {
 			return Datum{}, err
 		}
+		// Domain CHECK constraint enforcement: VALUE IN (...). M0097-domain-check.
+		if ctx != nil && ctx.Catalog != nil {
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+				if dom, isDomain := im.LookupDomain(x.TargetType); isDomain && len(dom.CheckInValues) > 0 {
+					// Get the string label of the value being cast.
+					var label string
+					if result.Kind == KindEnum {
+						label = string(result.Buf)
+					} else {
+						label = result.StringValue()
+					}
+					found := false
+					for _, allowed := range dom.CheckInValues {
+						if strings.EqualFold(label, allowed) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						return Datum{}, &ExecError{
+							Code:    "23514",
+							Pos:     x.Pos(),
+							Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), strings.ToLower(dom.Name)+"_check"),
+						}
+					}
+				}
+			}
+		}
 		// Apply numeric(P,S) typmod: round to S decimal places.
 		// Typmod is encoded as (P<<16)|S by the planner's encodeTypmod.
 		if x.Typmod > 0 {
