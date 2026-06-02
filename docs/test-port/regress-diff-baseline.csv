@@ -89,10 +89,10 @@ join_hash,245,failed
 matview,175,failed
 enum,0,pass
 int8,0,pass
-create_procedure,274,failed
+create_procedure,307,failed
 create_table,388,failed
 create_view,426,failed
-create_function_sql,430,failed
+create_function_sql,415,failed
 insert,507,failed
 subselect,500,failed
 guc,587,failed

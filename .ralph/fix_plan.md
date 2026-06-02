@@ -2050,6 +2050,33 @@ M0097-0001 wires it up.
             uses raw SeqScan rows (whose column indices match `SubCol.Index`) rather
             than the `SELECT 1` projected output (which only has 1 column).
         enum: 3 → 0 diffs → **PASS** (54 in CSV → 0).
+      - **Progress 2026-06-03 (M0097-0149 — pg_proc + SQL procedures + ALTER FUNCTION):**
+        Six coordinated improvements targeting create_function_sql (430→415) and
+        create_procedure (320→307) regress diffs (commit 83d01d2b):
+        (a) SQL-language PROCEDURE execution: `callOp.Next()` routes SQL procedures
+            through new `executeSQLProcedure` in plpgsql_runtime.go. Nil-slot panic fix:
+            return `nil, EOF` for IN-only procedures (not `nil, nil` which caused
+            slot.Row() panic when schema was non-nil).
+        (b) `::regproc`/`::regprocedure` cast: evaluates function-name string to OID
+            via routine registry (lowercased to match parser case-folding). Enables
+            `WHERE oid IN ('functest_A_1'::regproc, ...)` to find pg_proc rows.
+        (c) `::regtype` bidirectional cast: OID integer/string → builtin type name via
+            `oidToBuiltinTypeName()`; space-separated oidvector → `[0:N]={text,date}`
+            array notation (parser strips `[]` from `::regtype[]`).
+        (d) `pg_proc` view expanded: added `provolatile`, `prosecdef`, `proleakproof`,
+            `proisstrict`, `prokind` columns. `Routine` struct, `CreateFunctionStmt`,
+            `CreateProcedureStmt` gain matching fields; `execCreate*` populates them.
+        (e) `ALTER FUNCTION/PROCEDURE`: new `AlterFunctionStmt` AST node; parser uses
+            `acceptKeyword(KwFunction/KwProcedure)` (not acceptIdentKeyword — FUNCTION
+            is KwCatUnreserved keyword); `execAlterFunction` mutates Volatile/Security
+            Definer/Leakproof/Strict in-place.
+        (f) `CALLED ON NULL INPUT` / `RETURNS NULL ON NULL INPUT` parsing fixed: `ON`
+            and `NULL` are reserved keywords — use `acceptKeyword(KwOn/KwNull)`.
+            `KwReturns` added to `isFunctionAttribute()` so RETURNS NULL ON NULL INPUT
+            is recognized in CREATE FUNCTION attribute loops.
+        Procedure-vs-function guard: `executeStoredRoutine` raises SQLSTATE 42809 when
+        `r.IsProcedure` is true, preventing `SELECT ptest1(...)` from executing a procedure body.
+        Baseline CSV: create_function_sql 430→415, create_procedure 274→307 (stale entry corrected).
 
 - [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
       - Summary: Make these 13 tests reach `pass`:
