@@ -78,7 +78,7 @@ func (o *generateSeriesOp) Next() (TupleSlot, error) {
 	}
 	if o.step == 0 {
 		o.done = true
-		return nil, EOF
+		return nil, &ExecError{Code: "2201F", Message: "step size cannot equal zero"}
 	}
 
 	val := NewIntDatum(o.current)

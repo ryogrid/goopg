@@ -2295,6 +2295,13 @@ func (p *parser) parseUnary() (Expr, error) {
 			return nil, err
 		}
 		return &UnaryOp{pos: t.Pos, Op: OpNot, Operand: operand}, nil
+	case t.Kind == TokenOperator && t.Value == "~":
+		p.advance()
+		operand, err := p.parseExprPrec(precUnary)
+		if err != nil {
+			return nil, err
+		}
+		return &UnaryOp{pos: t.Pos, Op: OpBitNot, Operand: operand}, nil
 	}
 	return p.parsePrimary()
 }

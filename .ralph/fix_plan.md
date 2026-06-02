@@ -2244,6 +2244,28 @@ M0097-0001 wires it up.
         (modulo pre-existing TestToastByteaRoundTrip / TestPgGetPublicationTablesRelidMatchesPgClassOid
         flakes). `TestPort_RegressSuite/copydml` → PASS.
         Baseline CSV: copydml 36→0 pass.
+      - **Progress 2026-06-02 (M0097-0147 — int8 273→153 diffs, loop 530):**
+        Seven interconnected fixes:
+        (a) `to_char` EEEE/eeee scientific notation: `toCharScientific()` helper;
+            `to_char(1234, '9.99EEEE')` → `1.23e+03`. M0097-0147.
+        (b) `to_char` RN Roman numerals: `toCharRoman()` helper; FMRN → `CDLVI`
+            for 456; `###############` for values > 3999. M0097-0147.
+        (c) `to_char` V decimal-shift: format `99999V99` treats value as shifted
+            by N digits after V; `to_char(1234, '99999V99')` → `123400`. M0097-0147.
+        (d) `to_char` decimal G separator: decimal section now walks `decFmt`
+            left-to-right inserting commas (D999G999 → `.000,000`). M0097-0147.
+        (e) `to_char` literal spaces: `case ' ':` in integer walk outputs literal
+            spaces between digits (`S 9 9 9 . 9 9 9`). M0097-0147.
+        (f) `to_char` quoted text: pre-scan extracts `"..."` segments and splices
+            them back into result after formatting. M0097-0147.
+        (g) `~` (OpBitNot) prefix operator: parser `parseUnary` handles `~`;
+            executor `evalUnary` implements `^d.Int`; `exprType` for
+            `OpBitAnd/Or/Xor/ShiftLeft/ShiftRight` returns proper integer type
+            (fixes `<<`/`>>` right-alignment). Restores the missing 5-row bitwise
+            ops result block in int8 test. M0097-0147.
+        (h) `generate_series(start, stop, 0)`: returns
+            `ERROR: step size cannot equal zero` instead of `(0 rows)`. M0097-0147.
+        Baseline CSV: int8 273→153 diffs.
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:

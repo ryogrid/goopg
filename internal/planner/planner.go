@@ -6929,6 +6929,20 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "text"}
 		case parser.OpAnd, parser.OpOr, parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe, parser.OpLike, parser.OpNotLike:
 			return catalog.Type{Name: "bool"}
+		case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor:
+			// Bitwise ops return the promoted integer type of both operands.
+			lt := exprType(x.Left)
+			rt := exprType(x.Right)
+			if lt.Name == "int8" || lt.Name == "bigint" || rt.Name == "int8" || rt.Name == "bigint" {
+				return catalog.Type{Name: "int8"}
+			}
+			if isIntegerLikeType(lt.Name) {
+				return lt
+			}
+			return catalog.Type{Name: "int8"}
+		case parser.OpBitShiftLeft, parser.OpBitShiftRight:
+			// Shift ops return the type of the left operand.
+			return exprType(x.Left)
 		}
 		return catalog.Type{Name: "unknown"}
 	case *UnaryOp:

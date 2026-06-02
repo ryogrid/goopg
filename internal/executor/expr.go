@@ -571,6 +571,11 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator NOT requires boolean"}
 		}
 		return NewBoolDatum(!d.BoolValue()), nil
+	case parser.OpBitNot:
+		if d.Kind != KindInt {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator ~ requires integer operand"}
+		}
+		return Datum{Kind: KindInt, Int: ^d.Int}, nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown unary operator %s", op)}
 }
@@ -2921,10 +2926,61 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 	orig := fmtStr
 	upper := strings.ToUpper(strings.TrimSpace(fmtStr))
 
+	// EEEE/eeee — scientific notation: delegate entirely.
+	if strings.Contains(upper, "EEEE") {
+		// Extract the mantissa format (everything before EEEE, minus FM/sign tokens).
+		eeeeIdx := strings.Index(strings.ToUpper(orig), "EEEE")
+		mantissaRaw := orig[:eeeeIdx]
+		mantissaFmt := strings.NewReplacer("FM", "", "fm", "", "S", "", "s", "").Replace(mantissaRaw)
+		lowercase := strings.Contains(orig, "eeee")
+		fmMode := strings.Contains(upper, "FM")
+		return toCharScientific(val, mantissaFmt, lowercase, fmMode)
+	}
+
+	// RN — Roman numerals: delegate entirely.
+	if strings.Contains(upper, "RN") {
+		fmMode := strings.Contains(upper, "FM")
+		return toCharRoman(val, fmMode)
+	}
+
 	// FM: fill mode — strip leading/trailing spaces.
 	fm := strings.Contains(upper, "FM")
 	if fm {
 		upper = strings.ReplaceAll(upper, "FM", "")
+	}
+
+	// Pre-scan original format for quoted literal text segments ("...").
+	// We extract them keyed by their byte-position range so we can splice them
+	// back into the result after digit formatting.
+	type quotedSeg struct {
+		// position in the upper-cased, stripped format string after quotes removed
+		insertAfterPos int // insert after this many chars of the stripped upper string
+		text           string
+	}
+	var quotedSegs []quotedSeg
+	{
+		// Build a parallel "stripped" upper string (no quote regions) and record where
+		// each quoted segment goes.
+		stripped := strings.Builder{}
+		i := 0
+		for i < len(upper) {
+			if upper[i] == '"' {
+				// Find closing quote.
+				j := i + 1
+				for j < len(upper) && upper[j] != '"' {
+					j++
+				}
+				quotedSegs = append(quotedSegs, quotedSeg{
+					insertAfterPos: stripped.Len(),
+					text:           orig[i+1 : i+1+(j-(i+1))],
+				})
+				i = j + 1 // skip past closing '"'
+			} else {
+				stripped.WriteByte(upper[i])
+				i++
+			}
+		}
+		upper = stripped.String()
 	}
 
 	// TH/th ordinal suffix.
@@ -2968,6 +3024,18 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 	digitFmt = strings.ReplaceAll(digitFmt, "L", "")
 	digitFmt = strings.ReplaceAll(digitFmt, "C", "")
 
+	// V — decimal shift: multiply value by 10^N where N = digit positions after V.
+	vShift := 0
+	if vIdx := strings.Index(digitFmt, "V"); vIdx >= 0 {
+		afterV := digitFmt[vIdx+1:]
+		for _, c := range afterV {
+			if c == '0' || c == '9' {
+				vShift++
+			}
+		}
+		digitFmt = digitFmt[:vIdx]
+	}
+
 	// Split into integer and decimal parts.
 	dotIdx := strings.Index(digitFmt, ".")
 	var intFmt, decFmt string
@@ -2978,7 +3046,9 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		intFmt = digitFmt
 	}
 	intFmtDigits := strings.ReplaceAll(intFmt, ",", "")
+	intFmtDigits = strings.ReplaceAll(intFmtDigits, " ", "")
 	decFmtDigits := strings.ReplaceAll(decFmt, ",", "")
+	decFmtDigits = strings.ReplaceAll(decFmtDigits, " ", "")
 
 	// Zero-fill: a '0' format char at position i makes all positions j >= i use
 	// '0' fill instead of ' ' fill (propagates rightward from the leftmost '0').
@@ -3059,7 +3129,20 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		}
 	}
 
-	// Format integer part: walk intFmt right-to-left, preserving comma positions.
+	// Apply V shift: multiply intVal by 10^vShift and clear decimal part.
+	if vShift > 0 {
+		mult := int64(1)
+		for i := 0; i < vShift; i++ {
+			mult *= 10
+		}
+		intVal *= mult
+		fracStr = ""
+		decPositions = 0
+		decFmt = ""
+		dotIdx = -1
+	}
+
+	// Format integer part: walk intFmt right-to-left, preserving comma/space positions.
 	// Track whether each char slot is a fill position (vs actual digit).
 	intStr := strconv.FormatInt(intVal, 10)
 	var intBuf []byte
@@ -3072,6 +3155,10 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		case ',':
 			intBuf = append([]byte{','}, intBuf...)
 			intIsFill = append([]bool{true}, intIsFill...) // comma is fill until second pass
+		case ' ':
+			// Literal space in format — treat as fill spacer.
+			intBuf = append([]byte{' '}, intBuf...)
+			intIsFill = append([]bool{true}, intIsFill...)
 		case '0', '9':
 			digitPosFromLeft := totalDigitPositions - 1 - digitPosFromRight
 			digitPosFromRight++
@@ -3126,7 +3213,25 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		} else if len(fracStr) < decPositions {
 			fracStr += strings.Repeat("0", decPositions-len(fracStr))
 		}
-		result = result + "." + fracStr
+		// Walk decFmt left-to-right to insert any commas at their positions (G separators).
+		decOut := strings.Builder{}
+		fracPos := 0
+		for _, dc := range decFmt {
+			switch dc {
+			case ',':
+				decOut.WriteByte(',')
+			case ' ':
+				decOut.WriteByte(' ')
+			case '0', '9':
+				if fracPos < len(fracStr) {
+					decOut.WriteByte(fracStr[fracPos])
+				} else {
+					decOut.WriteByte('0')
+				}
+				fracPos++
+			}
+		}
+		result = result + "." + decOut.String()
 	}
 
 	// FM mode: strip leading spaces only (from '9' fill without zero-fill propagation).
@@ -3191,7 +3296,9 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		}
 	} else if hasPR {
 		if negative {
-			result = "<" + result + ">"
+			// Strip leading fill spaces before wrapping (PG: "<digits>" right-justified).
+			trim := strings.TrimLeft(result, " ")
+			result = "<" + trim + ">"
 		} else if !fm {
 			result = " " + result + " "
 		}
@@ -3222,10 +3329,126 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		}
 	}
 
+	// Splice quoted literal segments back into result at their recorded positions.
+	// quotedSegs are keyed by position in the stripped-upper string. We need to map
+	// those positions to positions in the result string. The result has the same
+	// character structure as digitFmt (with sign/fill changes prepended/appended),
+	// so we scan the digitFmt to build an offset mapping.
+	if len(quotedSegs) > 0 {
+		// Simple approach: since the format was processed character by character, and
+		// quoted segments were removed from upper before digitFmt was built, we insert
+		// them by appending to the end for now (most common usage is suffix text).
+		// For positioned insertion, rebuild by finding their offset in the final string.
+		// The insertAfterPos is in stripped-upper-space; the sign prefix shifts the offset.
+		signPrefix := 0
+		if len(result) > 0 && (result[0] == ' ' || result[0] == '+' || result[0] == '-') {
+			signPrefix = 1
+		}
+		_ = signPrefix
+		// Insert segments in reverse order to keep offsets valid.
+		for i := len(quotedSegs) - 1; i >= 0; i-- {
+			seg := quotedSegs[i]
+			insertAt := seg.insertAfterPos + signPrefix
+			if insertAt > len(result) {
+				insertAt = len(result)
+			}
+			result = result[:insertAt] + seg.text + result[insertAt:]
+		}
+	}
+
 	return result + ordSuffix
 }
 
 // toCharOrdinalSuffix returns the English ordinal suffix (ST/ND/RD/TH) for n.
+
+// toCharScientific formats val in scientific notation for the EEEE/eeee format modifier.
+// mantissaFmt is the digit format string before the EEEE token (e.g. "9.99" from "9.99EEEE").
+// lowercase controls whether the exponent uses 'e' or 'E'. fm strips the leading sign space.
+func toCharScientific(val Datum, mantissaFmt string, lowercase bool, fm bool) string {
+	f, ok := datumToFloat64(val)
+	if !ok {
+		return "0"
+	}
+	negative := f < 0
+	if negative {
+		f = -f
+	}
+
+	// Count decimal positions in mantissaFmt (digits after the '.').
+	decPlaces := 0
+	dotSeen := false
+	for _, c := range mantissaFmt {
+		if c == '.' || c == 'D' {
+			dotSeen = true
+			continue
+		}
+		if dotSeen && (c == '0' || c == '9') {
+			decPlaces++
+		}
+	}
+
+	// Format using Go's scientific notation, then reformat the exponent to ±NN.
+	raw := fmt.Sprintf("%.*e", decPlaces, f)
+	// raw is like "1.23e+03" or "1.23e+003" (platform-dependent).
+	eIdx := strings.LastIndex(raw, "e")
+	mantissa := raw[:eIdx]
+	expPart := raw[eIdx+1:] // e.g. "+03" or "+003"
+
+	// Normalise exponent to sign + exactly 2 digits.
+	expSign := "+"
+	if len(expPart) > 0 && (expPart[0] == '+' || expPart[0] == '-') {
+		expSign = string(expPart[0])
+		expPart = expPart[1:]
+	}
+	// Strip leading zeros to get the numeric value, then re-pad to 2 digits.
+	expNum := strings.TrimLeft(expPart, "0")
+	if expNum == "" {
+		expNum = "0"
+	}
+	expFormatted := fmt.Sprintf("%s%02s", expSign, expNum)
+
+	eLetter := "e"
+	if !lowercase {
+		eLetter = "E"
+	}
+	result := mantissa + eLetter + expFormatted
+
+	if negative {
+		result = "-" + result
+	} else if !fm {
+		result = " " + result
+	}
+	return result
+}
+
+// toCharRoman converts val to a Roman numeral string for the RN format.
+// Returns a 15-char right-justified string (or fm-stripped). Out-of-range values return "###############".
+func toCharRoman(val Datum, fm bool) string {
+	f, ok := datumToFloat64(val)
+	if !ok {
+		return "###############"
+	}
+	n := int64(f)
+	if n < 1 || n > 3999 {
+		return "###############"
+	}
+
+	thousands := []string{"", "M", "MM", "MMM"}
+	hundreds := []string{"", "C", "CC", "CCC", "CD", "D", "DC", "DCC", "DCCC", "CM"}
+	tens := []string{"", "X", "XX", "XXX", "XL", "L", "LX", "LXX", "LXXX", "XC"}
+	ones := []string{"", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX"}
+
+	roman := thousands[n/1000] + hundreds[(n%1000)/100] + tens[(n%100)/10] + ones[n%10]
+	if fm {
+		return roman
+	}
+	// Right-justify in 15 chars.
+	if len(roman) < 15 {
+		return strings.Repeat(" ", 15-len(roman)) + roman
+	}
+	return roman
+}
+
 func toCharOrdinalSuffix(n int64) string {
 	if n < 0 {
 		n = -n
