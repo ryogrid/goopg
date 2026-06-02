@@ -1526,16 +1526,36 @@ func (a FunctionArg) Pos() int { return a.pos }
 //
 // See docs/design/0015-0001-create-function-parser-and-ast.md.
 type CreateFunctionStmt struct {
-	pos        int
-	OrReplace  bool
-	Name       ObjectName
-	Args       []FunctionArg
-	ReturnType ColumnType
-	ReturnsSet bool   // RETURNS SETOF ... M0097-0020
-	Language   string // lower-cased, e.g. "plpgsql"
-	Body       string // raw source between the dollar-quote delimiters
-	Strict     bool   // STRICT / RETURNS NULL ON NULL INPUT M0097-0035
+	pos             int
+	OrReplace       bool
+	Name            ObjectName
+	Args            []FunctionArg
+	ReturnType      ColumnType
+	ReturnsSet      bool   // RETURNS SETOF ... M0097-0020
+	Language        string // lower-cased, e.g. "plpgsql"
+	Body            string // raw source between the dollar-quote delimiters
+	Strict          bool   // STRICT / RETURNS NULL ON NULL INPUT M0097-0035
+	Volatile        string // "v"=volatile (default), "s"=stable, "i"=immutable
+	SecurityDefiner bool   // SECURITY DEFINER
+	Leakproof       bool   // LEAKPROOF
 }
+
+// AlterFunctionStmt — `ALTER FUNCTION name([argtypes]) attribute ...`
+// Updates mutable function/procedure attributes (volatile, security, leakproof, strict).
+type AlterFunctionStmt struct {
+	pos             int
+	Name            ObjectName
+	Args            []FunctionArg // nil means no arg list given (applies to all overloads)
+	IsProcedure     bool
+	// Updated attributes (nil = not changed)
+	Volatile        *string // "v", "s", "i"
+	SecurityDefiner *bool
+	Leakproof       *bool
+	Strict          *bool
+}
+
+func (s *AlterFunctionStmt) Pos() int  { return s.pos }
+func (s *AlterFunctionStmt) stmtNode() {}
 
 func (s *CreateFunctionStmt) Pos() int  { return s.pos }
 func (s *CreateFunctionStmt) stmtNode() {}
@@ -1560,13 +1580,13 @@ func (s *DropFunctionStmt) stmtNode() {}
 // CreateProcedureStmt is the AST for `CREATE [OR REPLACE] PROCEDURE ...`.
 // Stage B (procedure follow-up) of M0015.
 type CreateProcedureStmt struct {
-	pos       int
-	OrReplace bool
-	Name      ObjectName
-	Args      []FunctionArg
-	// Procedure doesn't have RETURN type; use FunctionArgMode for OUT/INOUT parameters
-	Language string // lower-cased, e.g. "plpgsql"
-	Body     string // raw source between the dollar-quote delimiters
+	pos             int
+	OrReplace       bool
+	Name            ObjectName
+	Args            []FunctionArg
+	Language        string // lower-cased, e.g. "plpgsql"
+	Body            string // raw source between the dollar-quote delimiters
+	SecurityDefiner bool   // SECURITY DEFINER
 }
 
 func (s *CreateProcedureStmt) Pos() int  { return s.pos }

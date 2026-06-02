@@ -55,6 +55,7 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 		Args:       args,
 		ReturnType: retType,
 		ReturnsSet: returnsSet,
+		Volatile:   "v", // default: volatile
 	}
 	// The LANGUAGE / AS clauses can appear in either order (mirrors
 	// upstream). Loop until both have been seen or we hit an
@@ -105,13 +106,66 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 			stmt.Body = "SELECT " + strings.Join(bodyToks, " ")
 			sawAs = true
 		case p.isFunctionAttribute():
-			// Detect STRICT / RETURNS NULL ON NULL INPUT — M0097-0035.
-			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "strict") {
+			cur := p.cur()
+			// Capture known attributes before consuming them.
+			if cur.Kind == TokenIdent {
+				switch strings.ToLower(cur.Value) {
+				case "strict":
+					stmt.Strict = true
+				case "returns":
+					// RETURNS NULL ON NULL INPUT — Strict=false (explicit)
+					stmt.Strict = false
+				case "immutable":
+					stmt.Volatile = "i"
+				case "stable":
+					stmt.Volatile = "s"
+				case "volatile":
+					stmt.Volatile = "v"
+				case "leakproof":
+					stmt.Leakproof = true
+				case "security":
+					// peek ahead for "definer" or "invoker"
+					p.advance()
+					if p.acceptIdentKeyword("definer") {
+						stmt.SecurityDefiner = true
+					} else {
+						p.acceptIdentKeyword("invoker")
+					}
+					continue
+				case "external":
+					// EXTERNAL SECURITY DEFINER/INVOKER
+					p.advance()
+					p.acceptIdentKeyword("security")
+					if p.acceptIdentKeyword("definer") {
+						stmt.SecurityDefiner = true
+					} else {
+						p.acceptIdentKeyword("invoker")
+					}
+					continue
+				case "called":
+					// CALLED ON NULL INPUT — explicit not-strict
+					stmt.Strict = false
+				}
+			} else if cur.Kind == TokenKeyword && cur.Keyword == KwNot {
+				// NOT LEAKPROOF
+				p.advance()
+				p.acceptIdentKeyword("leakproof")
+				stmt.Leakproof = false
+				continue
+			} else if cur.Kind == TokenKeyword && cur.Keyword == KwReturns {
+				// RETURNS NULL ON NULL INPUT (same as STRICT)
+				p.advance() // RETURNS
+				p.acceptKeyword(KwNull)
+				p.acceptKeyword(KwOn)
+				p.acceptKeyword(KwNull)
+				p.acceptIdentKeyword("input")
 				stmt.Strict = true
+				continue
+			} else if cur.Kind == TokenKeyword && cur.Keyword == KwParallel {
+				p.advance()
+				p.acceptIdentKeyword("safe", "unsafe", "restricted")
+				continue
 			}
-			// Consume IMMUTABLE/VOLATILE/STABLE/STRICT/SECURITY DEFINER
-			// and other function attributes; they have no runtime effect
-			// in goopg but must be parsed to reach the AS $$body$$ clause.
 			p.consumeFunctionAttribute()
 		default:
 			if !sawAs {
@@ -504,7 +558,7 @@ func (p *parser) isFunctionAttribute() bool {
 	cur := p.cur()
 	if cur.Kind == TokenKeyword {
 		switch cur.Keyword {
-		case KwNot, KwParallel:
+		case KwNot, KwParallel, KwReturns:
 			return true
 		}
 	}
@@ -530,6 +584,13 @@ func (p *parser) consumeFunctionAttribute() {
 	case cur.Kind == TokenKeyword && cur.Keyword == KwParallel:
 		p.advance()
 		p.acceptIdentKeyword("safe", "unsafe", "restricted")
+	case cur.Kind == TokenKeyword && cur.Keyword == KwReturns:
+		// RETURNS NULL ON NULL INPUT
+		p.advance()
+		p.acceptKeyword(KwNull)
+		p.acceptKeyword(KwOn)
+		p.acceptKeyword(KwNull)
+		p.acceptIdentKeyword("input")
 	case cur.Kind == TokenIdent:
 		switch strings.ToLower(cur.Value) {
 		case "immutable", "volatile", "stable", "strict", "leakproof", "window":
@@ -544,15 +605,15 @@ func (p *parser) consumeFunctionAttribute() {
 		case "called":
 			// CALLED ON NULL INPUT
 			p.advance()
-			p.acceptIdentKeyword("on")
-			p.acceptIdentKeyword("null")
+			p.acceptKeyword(KwOn)
+			p.acceptKeyword(KwNull)
 			p.acceptIdentKeyword("input")
 		case "returns":
 			// RETURNS NULL ON NULL INPUT
 			p.advance()
-			p.acceptIdentKeyword("null")
-			p.acceptIdentKeyword("on")
-			p.acceptIdentKeyword("null")
+			p.acceptKeyword(KwNull)
+			p.acceptKeyword(KwOn)
+			p.acceptKeyword(KwNull)
 			p.acceptIdentKeyword("input")
 		case "cost", "rows":
 			p.advance()

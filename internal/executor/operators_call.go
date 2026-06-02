@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/planner"
@@ -121,6 +122,24 @@ func (o *callOp) Next() (TupleSlot, error) {
 	}
 
 	r := o.routine
+
+	// SQL-language procedures: execute each statement with bound params.
+	if strings.EqualFold(r.Language, "sql") {
+		var callPos int
+		if o.plan != nil && o.plan.Stmt != nil {
+			callPos = o.plan.Stmt.Pos()
+		}
+		if err := executeSQLProcedure(r, o.args, o.ctx, callPos); err != nil {
+			return nil, err
+		}
+		// Return a tuple matching the OUT-param schema (empty for IN-only procedures).
+		sch := o.Schema()
+		if sch == nil || len(sch) == 0 {
+			return nil, EOF
+		}
+		return asSlot(sch, make(Row, len(sch))), nil
+	}
+
 	block, err := plpgsql.Parse(r.Body)
 	if err != nil {
 		return nil, &ExecError{Code: "P0000", Pos: o.plan.Stmt.Pos(),

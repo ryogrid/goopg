@@ -3158,12 +3158,97 @@ func (p *parser) parseAlter() (Stmt, error) {
 		return &AlterTableStmt{pos: t.Pos}, nil
 	}
 
-	// ALTER VIEW / SCHEMA / FUNCTION / PROCEDURE /
-	// COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / PUBLICATION /
-	// SUBSCRIPTION / SYSTEM — compatibility stubs. Consume until end of
-	// statement and return an empty AlterTableStmt (executor no-ops it).
+	// ALTER FUNCTION / PROCEDURE — may update volatile/security/leakproof/strict attrs.
+	funcConsumed := p.acceptKeyword(KwFunction)
+	procConsumed := !funcConsumed && p.acceptKeyword(KwProcedure)
+	if funcConsumed || procConsumed {
+		isProcedure := procConsumed
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt := &AlterFunctionStmt{pos: t.Pos, Name: name, IsProcedure: isProcedure}
+		// Optional arg list
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			args, argErr := p.parseFunctionArgList()
+			if argErr == nil {
+				stmt.Args = args
+			}
+		}
+		// Consume one or more function attributes
+		for p.isFunctionAttribute() {
+			cur := p.cur()
+			if cur.Kind == TokenIdent {
+				switch strings.ToLower(cur.Value) {
+				case "volatile":
+					v := "v"
+					stmt.Volatile = &v
+				case "stable":
+					v := "s"
+					stmt.Volatile = &v
+				case "immutable":
+					v := "i"
+					stmt.Volatile = &v
+				case "security":
+					p.advance()
+					if p.acceptIdentKeyword("definer") {
+						t := true
+						stmt.SecurityDefiner = &t
+					} else {
+						p.acceptIdentKeyword("invoker")
+						f := false
+						stmt.SecurityDefiner = &f
+					}
+					continue
+				case "leakproof":
+					t := true
+					stmt.Leakproof = &t
+				case "strict":
+					t := true
+					stmt.Strict = &t
+				case "called":
+					p.advance()
+					p.acceptKeyword(KwOn)
+					p.acceptKeyword(KwNull)
+					p.acceptIdentKeyword("input")
+					f := false
+					stmt.Strict = &f
+					continue
+				case "returns":
+					p.advance()
+					p.acceptKeyword(KwNull)
+					p.acceptKeyword(KwOn)
+					p.acceptKeyword(KwNull)
+					p.acceptIdentKeyword("input")
+					t := true
+					stmt.Strict = &t
+					continue
+				}
+			} else if cur.Kind == TokenKeyword && cur.Keyword == KwNot {
+				p.advance()
+				p.acceptIdentKeyword("leakproof")
+				f := false
+				stmt.Leakproof = &f
+				continue
+			} else if cur.Kind == TokenKeyword && cur.Keyword == KwReturns {
+				p.advance()
+				p.acceptKeyword(KwNull)
+				p.acceptKeyword(KwOn)
+				p.acceptKeyword(KwNull)
+				p.acceptIdentKeyword("input")
+				t := true
+				stmt.Strict = &t
+				continue
+			}
+			p.consumeFunctionAttribute()
+		}
+		return stmt, nil
+	}
+
+	// ALTER VIEW / SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / PUBLICATION /
+	// SUBSCRIPTION / SYSTEM — compatibility stubs. Consume until end of statement.
 	for _, objIdent := range []string{
-		"schema", "view", "function", "procedure",
+		"schema", "view",
 		"collation", "domain", "extension", "language",
 		"operator", "publication", "subscription", "system",
 		"materialized",

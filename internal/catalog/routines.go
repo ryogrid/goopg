@@ -31,17 +31,21 @@ import (
 // PL/pgSQL interpreter consumes ArgTypes / ReturnType / Language /
 // Body once those slices land.
 type Routine struct {
-	OID        uint32
-	Schema     string
-	Name       string
-	ArgNames   []string // parallel to ArgTypes; empty string for positional-only args
-	ArgTypes   []Type
-	ArgModes   []string // parallel to ArgTypes; "i"=IN, "o"=OUT, "b"=INOUT, "v"=VARIADIC; nil=all IN
-	ReturnType Type
-	ReturnsSet bool   // RETURNS SETOF ... M0097-0020
-	Language   string // lower-cased
-	Body       string // raw routine source between the dollar-quote delimiters
-	Strict     bool   // STRICT / CALLED ON NULL INPUT; if true, sfunc skips NULL inputs
+	OID             uint32
+	Schema          string
+	Name            string
+	ArgNames        []string // parallel to ArgTypes; empty string for positional-only args
+	ArgTypes        []Type
+	ArgModes        []string // parallel to ArgTypes; "i"=IN, "o"=OUT, "b"=INOUT, "v"=VARIADIC; nil=all IN
+	ReturnType      Type
+	ReturnsSet      bool   // RETURNS SETOF ... M0097-0020
+	Language        string // lower-cased
+	Body            string // raw routine source between the dollar-quote delimiters
+	Strict          bool   // STRICT / CALLED ON NULL INPUT
+	Volatile        string // "v"=volatile (default), "s"=stable, "i"=immutable
+	SecurityDefiner bool   // SECURITY DEFINER
+	Leakproof       bool   // LEAKPROOF
+	IsProcedure     bool   // true when created via CREATE PROCEDURE
 }
 
 // QualifiedName returns the upstream-style schema-qualified routine

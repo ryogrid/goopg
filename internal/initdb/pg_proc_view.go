@@ -126,13 +126,18 @@ func registerPgProcView(cat *catalog.InMemory) error {
 		Schema: "pg_catalog",
 		Name:   "pg_proc",
 		Columns: []catalog.Column{
-			{Name: "oid", Type: catalog.Type{Name: "text"}},
+			{Name: "oid", Type: catalog.Type{Name: "oid"}},
 			{Name: "proname", Type: catalog.Type{Name: "text"}},
 			{Name: "pronamespace", Type: catalog.Type{Name: "oid"}},
 			{Name: "prolang", Type: catalog.Type{Name: "text"}},
-			{Name: "prorettype", Type: catalog.Type{Name: "text"}},
+			{Name: "prorettype", Type: catalog.Type{Name: "oid"}},
 			{Name: "proargtypes", Type: catalog.Type{Name: "oidvector"}},
 			{Name: "prosrc", Type: catalog.Type{Name: "text"}},
+			{Name: "provolatile", Type: catalog.Type{Name: "text"}},
+			{Name: "prosecdef", Type: catalog.Type{Name: "bool"}},
+			{Name: "proleakproof", Type: catalog.Type{Name: "bool"}},
+			{Name: "proisstrict", Type: catalog.Type{Name: "bool"}},
+			{Name: "prokind", Type: catalog.Type{Name: "text"}},
 		},
 		Virtual: true,
 	}
@@ -148,6 +153,11 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				b.retType,
 				b.argTypes,
 				b.src,
+				"v",    // provolatile: volatile
+				"f",    // prosecdef
+				"f",    // proleakproof
+				"f",    // proisstrict
+				"f",    // prokind: function
 			})
 		}
 		// Append user-defined routines.
@@ -162,6 +172,26 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			if strings.EqualFold(r.Schema, "pg_catalog") {
 				ns = "11"
 			}
+			volatile := r.Volatile
+			if volatile == "" {
+				volatile = "v"
+			}
+			secdef := "f"
+			if r.SecurityDefiner {
+				secdef = "t"
+			}
+			leakproof := "f"
+			if r.Leakproof {
+				leakproof = "t"
+			}
+			strict := "f"
+			if r.Strict {
+				strict = "t"
+			}
+			prokind := "f" // function
+			if r.IsProcedure {
+				prokind = "p" // procedure
+			}
 			rows = append(rows, []string{
 				fmt.Sprintf("%d", r.OID),
 				r.Name,
@@ -170,6 +200,11 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				typeNameToOIDStr(r.ReturnType.Name),
 				strings.Join(argOIDs, " "),
 				r.Body,
+				volatile,
+				secdef,
+				leakproof,
+				strict,
+				prokind,
 			})
 		}
 		return rows

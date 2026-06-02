@@ -96,7 +96,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateIndexStmt, *parser.DropIndexStmt,
 		*parser.CreateViewStmt, *parser.DropViewStmt,
 		*parser.TruncateStmt, *parser.AlterTableStmt,
-		*parser.CreateFunctionStmt, *parser.DropFunctionStmt,
+		*parser.CreateFunctionStmt, *parser.DropFunctionStmt, *parser.AlterFunctionStmt,
 		*parser.CreateProcedureStmt, *parser.DropProcedureStmt,
 		*parser.CreateTriggerStmt, *parser.DropTriggerStmt,
 		*parser.DropRuleStmt,

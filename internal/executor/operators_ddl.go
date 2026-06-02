@@ -82,6 +82,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execDropSubscription(s)
 	case *parser.CreateFunctionStmt:
 		return nil, o.execCreateFunction(s)
+	case *parser.AlterFunctionStmt:
+		return nil, o.execAlterFunction(s)
 	case *parser.DropFunctionStmt:
 		return nil, o.execDropFunction(s)
 	case *parser.CreateProcedureStmt:
@@ -2583,6 +2585,10 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		}
 		argNames[i] = a.Name
 	}
+	volatile := s.Volatile
+	if volatile == "" {
+		volatile = "v" // default: volatile
+	}
 	r := &catalog.Routine{
 		Schema:   s.Name.Schema,
 		Name:     s.Name.Name,
@@ -2592,10 +2598,13 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			Name: strings.ToLower(s.ReturnType.Name),
 			Args: append([]int64(nil), s.ReturnType.Args...),
 		},
-		ReturnsSet: s.ReturnsSet,
-		Language:   lang,
-		Body:       s.Body,
-		Strict:     s.Strict,
+		ReturnsSet:      s.ReturnsSet,
+		Language:        lang,
+		Body:            s.Body,
+		Strict:          s.Strict,
+		Volatile:        volatile,
+		SecurityDefiner: s.SecurityDefiner,
+		Leakproof:       s.Leakproof,
 	}
 	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
@@ -2603,6 +2612,50 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
 		}
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// execAlterFunction updates mutable attributes of an existing function/procedure.
+func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
+	rs := o.ctx.Catalog.Routines()
+	if rs == nil {
+		return nil // no routine registry, silently skip
+	}
+	var argTypes []catalog.Type
+	for _, a := range s.Args {
+		argTypes = append(argTypes, catalog.Type{Name: strings.ToLower(a.Type.Name)})
+	}
+	var routines []*catalog.Routine
+	if s.Args == nil {
+		// No arg list: update all overloads
+		routines = rs.LookupByName(s.Name)
+	} else {
+		r, ok := rs.Lookup(s.Name, argTypes)
+		if ok && r != nil {
+			routines = []*catalog.Routine{r}
+		}
+	}
+	if len(routines) == 0 {
+		kind := "function"
+		if s.IsProcedure {
+			kind = "procedure"
+		}
+		return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("%s %s does not exist", kind, s.Name.Name)}
+	}
+	for _, r := range routines {
+		if s.Volatile != nil {
+			r.Volatile = *s.Volatile
+		}
+		if s.SecurityDefiner != nil {
+			r.SecurityDefiner = *s.SecurityDefiner
+		}
+		if s.Leakproof != nil {
+			r.Leakproof = *s.Leakproof
+		}
+		if s.Strict != nil {
+			r.Strict = *s.Strict
+		}
 	}
 	return nil
 }
@@ -2645,13 +2698,16 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		}
 	}
 	r := &catalog.Routine{
-		Schema:   s.Name.Schema,
-		Name:     s.Name.Name,
-		ArgNames: argNames,
-		ArgTypes: argTypes,
-		ArgModes: argModes,
-		Language: lang,
-		Body:     s.Body,
+		Schema:          s.Name.Schema,
+		Name:            s.Name.Name,
+		ArgNames:        argNames,
+		ArgTypes:        argTypes,
+		ArgModes:        argModes,
+		Language:        lang,
+		Body:            s.Body,
+		IsProcedure:     true,
+		SecurityDefiner: s.SecurityDefiner,
+		Volatile:        "v", // procedures default to volatile
 	}
 	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		if errors.Is(err, catalog.ErrRoutineExists) {

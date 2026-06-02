@@ -60,6 +60,65 @@ func (e *ExecError) Error() string {
 // unchanged. New slot-aware sites (NLI/MHJ predicate eval) call
 // evalExprSlot directly so VirtualSlot composition can read via
 // slot.Get(col) without materializing a Row per emitted match.
+// oidToBuiltinTypeName converts a PostgreSQL built-in type OID to its canonical
+// type name (e.g. 16 → "boolean"). Returns "" if the OID is unknown.
+func oidToBuiltinTypeName(oid uint32) string {
+	switch oid {
+	case 16:
+		return "boolean"
+	case 17:
+		return "bytea"
+	case 18:
+		return "\"char\""
+	case 19:
+		return "name"
+	case 20:
+		return "bigint"
+	case 21:
+		return "smallint"
+	case 23:
+		return "integer"
+	case 25:
+		return "text"
+	case 26:
+		return "oid"
+	case 30:
+		return "oidvector"
+	case 700:
+		return "real"
+	case 701:
+		return "double precision"
+	case 1043:
+		return "character varying"
+	case 1082:
+		return "date"
+	case 1083:
+		return "time without time zone"
+	case 1114:
+		return "timestamp without time zone"
+	case 1184:
+		return "timestamp with time zone"
+	case 1186:
+		return "interval"
+	case 1266:
+		return "time with time zone"
+	case 1700:
+		return "numeric"
+	case 2278:
+		return "void"
+	case 2279:
+		return "trigger"
+	case 2281:
+		return "internal"
+	case 2950:
+		return "uuid"
+	case 3220:
+		return "pg_lsn"
+	default:
+		return ""
+	}
+}
+
 func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 	var slot SlotView
 	if row != nil {
@@ -198,17 +257,95 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// The latter is the exact pgbench probe shape:
 		//   `... WHERE oid = $1::pg_catalog.regclass`.
 		// `::regtype` resolves a type name to its OID (string→oid).
+		// `::regproc` resolves a function name to its OID (string→oid).
+		if strings.EqualFold(x.TargetType, "regproc") || strings.EqualFold(x.TargetType, "regprocedure") {
+			if v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
+				funcName := strings.TrimSpace(v.StringValue())
+				// SQL identifiers are case-folded to lowercase when parsed; match that.
+				schema, name := splitQualifiedTable(strings.ToLower(funcName))
+				if rs := ctx.Catalog.Routines(); rs != nil {
+					candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: name})
+					if len(candidates) > 0 {
+						return NewIntDatum(int64(candidates[0].OID)), nil
+					}
+				}
+				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", funcName)}
+			}
+			return v, nil
+		}
 		if strings.EqualFold(x.TargetType, "regtype") && ctx != nil && ctx.Catalog != nil {
-			if v.Kind == KindString {
+			switch v.Kind {
+			case KindString:
 				typName := strings.ToLower(strings.TrimSpace(v.StringValue()))
+				// Check for oidvector (space-separated OIDs like "25 1082").
+				// Parser strips [] from ::regtype[], so oidvectors hit this branch.
+				if strings.ContainsRune(typName, ' ') {
+					parts := strings.Fields(typName)
+					names := make([]string, len(parts))
+					for i, p := range parts {
+						oid, parseErr := strconv.ParseInt(p, 10, 64)
+						if parseErr != nil {
+							names[i] = p
+							continue
+						}
+						if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
+							names[i] = name
+						} else {
+							names[i] = p
+						}
+					}
+					result := fmt.Sprintf("[0:%d]={%s}", len(names)-1, strings.Join(names, ","))
+					return NewStringDatum(result), nil
+				}
+				// Empty oidvector → empty array
+				if typName == "" {
+					return NewStringDatum("{}"), nil
+				}
+				// Try as an OID integer string (e.g. "16" → "boolean")
+				if oid, parseErr := strconv.ParseInt(typName, 10, 64); parseErr == nil {
+					if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
+						return NewStringDatum(name), nil
+					}
+					return NewStringDatum(typName), nil
+				}
+				// Try as a type name → return OID (for enum types)
 				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 					if et, found := im.LookupEnum(typName); found {
 						return NewIntDatum(int64(et.OID)), nil
 					}
 				}
-				// Built-in type stubs: return 0 as a sentinel (no-op; queries
-				// matching built-in types with enumtypid will find no rows).
-				return NewIntDatum(0), nil
+				// Built-in type name → return itself
+				return v, nil
+			case KindInt:
+				// OID integer → type name
+				if name := oidToBuiltinTypeName(uint32(v.Int)); name != "" {
+					return NewStringDatum(name), nil
+				}
+				return NewStringDatum(fmt.Sprintf("%d", v.Int)), nil
+			}
+		}
+		if strings.EqualFold(x.TargetType, "regtype[]") && ctx != nil {
+			// oidvector (space-separated OID strings) → type name array like [0:1]={text,date}
+			if v.Kind == KindString {
+				parts := strings.Fields(v.StringValue())
+				if len(parts) == 0 {
+					return NewStringDatum("{}"), nil
+				}
+				names := make([]string, len(parts))
+				for i, p := range parts {
+					oid, err := strconv.ParseInt(p, 10, 64)
+					if err != nil {
+						names[i] = p
+						continue
+					}
+					if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
+						names[i] = name
+					} else {
+						names[i] = p
+					}
+				}
+				result := fmt.Sprintf("[0:%d]={%s}", len(names)-1, strings.Join(names, ","))
+				return NewStringDatum(result), nil
 			}
 		}
 		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {

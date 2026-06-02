@@ -113,7 +113,21 @@ func evalStoredRoutineFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datu
 	return executeStoredRoutine(r, args, ctx, x.Pos())
 }
 
+// routineArgTypesStr builds a comma-separated list of arg type names for
+// error messages like "ptest1(text) is a procedure".
+func routineArgTypesStr(r *catalog.Routine) string {
+	names := make([]string, len(r.ArgTypes))
+	for i, t := range r.ArgTypes {
+		names[i] = t.Name
+	}
+	return strings.Join(names, ", ")
+}
+
 func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
+	// Procedures cannot be called via SELECT - only via CALL.
+	if r.IsProcedure {
+		return NullDatum, &ExecError{Code: "42809", Pos: pos, Message: fmt.Sprintf("%s(%s) is a procedure", r.Name, routineArgTypesStr(r))}
+	}
 	switch strings.ToLower(r.Language) {
 	case "plpgsql":
 		return executePLpgSQLRoutine(r, args, ctx, pos)
@@ -128,15 +142,11 @@ func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos in
 			return NewBoolDatum(true), nil
 		case "int2", "smallint":
 			return NewIntDatum(0), nil
-		case "int4", "integer", "int":
-			return NewIntDatum(0), nil
-		case "int8", "bigint":
-			return NewIntDatum(0), nil
 		default:
 			return NullDatum, nil
 		}
 	default:
-		return Datum{}, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("function language %q is not executable in v0", r.Language)}
+		return NullDatum, &ExecError{Code: "42704", Pos: pos, Message: fmt.Sprintf("language %q is not supported in v0", r.Language)}
 	}
 }
 
@@ -208,6 +218,70 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 		return Datum{}, err
 	}
 	return coerced, nil
+}
+
+// executeSQLProcedure runs a SQL-language PROCEDURE body.
+// Unlike executeSQLRoutine (functions), procedures may have multiple statements
+// and do not return a scalar value. Named parameters are rewritten to $1, $2 etc.
+func executeSQLProcedure(r *catalog.Routine, args []Datum, ctx *Context, pos int) error {
+	body := r.Body
+	if len(r.ArgNames) > 0 {
+		body = rewriteSQLNamedParams(body, r.ArgNames)
+	}
+	stmts, err := parser.Parse(body)
+	if err != nil {
+		return &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for procedure %s: %v", r.QualifiedName(), err)}
+	}
+	child := NewContext()
+	if ctx != nil {
+		*child = *ctx
+	}
+	child.Notices = nil
+	child.Params = make([]Datum, len(args))
+	for i, arg := range args {
+		declared := catalog.Type{Name: "unknown"}
+		if i < len(r.ArgTypes) {
+			declared = normalizeCatalogType(r.ArgTypes[i])
+		}
+		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
+		if err != nil {
+			return err
+		}
+		child.Params[i] = coerced
+	}
+	for _, stmt := range stmts {
+		node, err := planner.Plan(stmt, child.Catalog)
+		if err != nil {
+			return err
+		}
+		op, err := Build(node)
+		if err != nil {
+			return err
+		}
+		if err := op.Open(child); err != nil {
+			_ = op.Close()
+			return err
+		}
+		for {
+			_, nextErr := op.Next()
+			if nextErr == EOF {
+				break
+			}
+			if nextErr != nil {
+				_ = op.Close()
+				return nextErr
+			}
+		}
+		if err := op.Close(); err != nil {
+			return err
+		}
+	}
+	if ctx != nil {
+		for _, n := range child.TakeNotices() {
+			ctx.AddNotice(n)
+		}
+	}
+	return nil
 }
 
 // evalSQLFunctionSetof calls a SETOF SQL function and returns all rows as

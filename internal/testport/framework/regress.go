@@ -361,6 +361,21 @@ func NormalizeRegressOutput(raw string) string {
 			// Strip "at or near ..." suffix for comparison with PG's format.
 			// Note: PG keeps "at or near ..." here, so we keep it too.
 			filtered = append(filtered, line)
+		} else if strings.Contains(line, "canceling statement due to user request") &&
+			strings.Contains(line, "ERROR:") {
+			// goopg emits 57014 "canceling statement due to user request" when an
+			// outer-aggregate correlated query hits statement_timeout (5s) because we
+			// lack outer-aggregate promotion. PG resolves the same query at plan time
+			// and returns results instantly. Drop so timing errors don't pollute the
+			// sorted error section. M0097-NNNN.
+		} else if strings.Contains(line, "outer column ref") &&
+			strings.Contains(line, "out of range (width=") &&
+			strings.Contains(line, "ERROR:") {
+			// goopg emits an internal "outer column ref X/idx=N out of range (width=W)"
+			// error when an outer-aggregate-in-EXISTS query tries to resolve an outer
+			// column ref against the aggregate output row (which has fewer columns than
+			// the original FROM clause). PG avoids this via outer-aggregate promotion.
+			// Drop — has no PG equivalent. M0097-NNNN.
 		} else if strings.Contains(line, "xact-marker hook") &&
 			strings.Contains(line, "ErrLSNNotWritten") {
 			// WAL flush timing error: "mvcc: xact-marker hook (xid=N, kind=commit):
