@@ -2013,6 +2013,21 @@ M0097-0001 wires it up.
         renames/drops → enum_range blocks fail + extra type-exists errors), and
         pg_enum.enumtypid type mismatch with pg_type.oid (operator incompatibility
         prevents NOT EXISTS subquery from running).
+      - **Progress 2026-06-02 (M0097-0145 — transactional enum DDL rollback, loop 528):**
+        Implemented pseudo-transactional rollback for enum DDL (commit 221ea210):
+        (a) PendingEnumRenames: ALTER TYPE RENAME TO tracked per-tx; ROLLBACK reverses
+            renames in reverse order.
+        (b) PendingCreatedEnums: CREATE TYPE AS ENUM tracked per-tx; ROLLBACK drops
+            the type (key updated on RENAME TO to track current name).
+        (c) ADD VALUE rollback: RemoveEnumValue() removes labels added in this tx on
+            ROLLBACK (before undoing renames, so type names are still current).
+        (d) isUnsafeEnumValue: ADD VALUE to a PendingCreatedEnums type is NOT unsafe
+            (newly-created type → values immediately safe, matching PG semantics).
+        (e) All ROLLBACK paths updated: dispatch.go 4 paths + operators_tx.go 3 paths.
+        enum: 24 → 3 normalized diff lines. Remaining 3: pg_enum NOT EXISTS subquery
+        requires pg_type SeqScan to work (PGTypeColumns() has 7 cols vs 32 actual;
+        SeqScan always returns 0 rows → NOT EXISTS TRUE → all pg_enum rows returned).
+        Fix: expand PGTypeColumns() to full 32-column schema (deferred: risk/scope).
 
 - [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
       - Summary: Make these 13 tests reach `pass`:
