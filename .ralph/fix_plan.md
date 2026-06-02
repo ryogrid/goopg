@@ -1996,6 +1996,23 @@ M0097-0001 wires it up.
         RENAME TO changes some error patterns due to transactional DDL limitations).
         Remaining: "unsafe new enum value" (transaction-aware tracking), echo_me
         overload resolution, enum_range after RENAME TO (transactional DDL), pg_enum.
+      - **Progress 2026-06-02 (M0097-0144 — unsafe-value tracking + overload fix, loop 527):**
+        Seven interconnected fixes (commit 6ca91456):
+        (a) PendingEnumValues tracking — ALTER TYPE ADD VALUE in explicit tx marks label
+            as unsafe; isUnsafeEnumValue guards CastExpr/enum_last/enum_range with 0A000.
+        (b) PendingEnumValues lifecycle — dispatch.go writes back unconditionally; COMMIT/
+            ROLLBACK in executeOneSimpleStmt clears ctx.PendingEnumValues = nil after
+            connTx.End() so committed enum values are usable in subsequent queries.
+            clearCtxTransaction() also clears for executor-routed path.
+        (c) Overload resolution — resolveRoutineOverload prefers specific-type over
+            polymorphic (anyenum/anyelement/anyarray) overloads. Fixes echo_me dispatch.
+        (d) ClearFailed — connTxState.ClearFailed() for ROLLBACK TO SAVEPOINT recovery.
+        (e) FK type-compatibility check for enum columns (SQLSTATE 42804).
+        enum: 54 → 24 normalized diff lines.
+        Remaining 24 diffs: DDL non-transactionality (ROLLBACK doesn't undo enum
+        renames/drops → enum_range blocks fail + extra type-exists errors), and
+        pg_enum.enumtypid type mismatch with pg_type.oid (operator incompatibility
+        prevents NOT EXISTS subquery from running).
 
 - [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
       - Summary: Make these 13 tests reach `pass`:
