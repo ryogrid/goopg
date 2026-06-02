@@ -3158,10 +3158,11 @@ func (p *parser) parseAlter() (Stmt, error) {
 		return &AlterTableStmt{pos: t.Pos}, nil
 	}
 
-	// ALTER FUNCTION / PROCEDURE — may update volatile/security/leakproof/strict attrs.
+	// ALTER FUNCTION / PROCEDURE / ROUTINE — may update volatile/security/leakproof/strict attrs.
 	funcConsumed := p.acceptKeyword(KwFunction)
 	procConsumed := !funcConsumed && p.acceptKeyword(KwProcedure)
-	if funcConsumed || procConsumed {
+	routineConsumed := !funcConsumed && !procConsumed && p.acceptIdentKeyword("routine")
+	if funcConsumed || procConsumed || routineConsumed {
 		isProcedure := procConsumed
 		name, err := p.parseObjectName()
 		if err != nil {
@@ -3176,7 +3177,32 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 		}
 		// Consume one or more function attributes
-		for p.isFunctionAttribute() {
+		for p.isFunctionAttribute() || (p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "owner")) ||
+			(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "rename")) ||
+			(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) {
+			// OWNER TO role — no-op (no role system in goopg v0)
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "owner") {
+				p.advance() // OWNER
+				p.acceptKeyword(KwTo)
+				p.advance() // role name (ident or CURRENT_USER etc.)
+				continue
+			}
+			// RENAME TO new_name — no-op
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "rename") {
+				p.advance() // RENAME
+				p.acceptKeyword(KwTo)
+				p.advance() // new name
+				continue
+			}
+			// SET SCHEMA schema — no-op
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set") {
+				p.advance() // SET
+				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "schema") {
+					p.advance() // SCHEMA
+					p.advance() // schema name
+				}
+				continue
+			}
 			cur := p.cur()
 			if cur.Kind == TokenIdent {
 				switch strings.ToLower(cur.Value) {

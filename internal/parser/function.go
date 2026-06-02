@@ -86,11 +86,23 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 			}
 			stmt.Body = body
 			sawAs = true
+		// PG14 SQL-standard function body: BEGIN ATOMIC ... END (without AS).
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwBegin:
+			if sawAs {
+				return nil, p.errAtCur("duplicate body clause (BEGIN ATOMIC after AS)")
+			}
+			body, err := p.parseFunctionBody()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Body = body
+			stmt.BeginAtomic = true
+			sawAs = true
 		// PG14 SQL-standard function body: RETURN expr (without AS $$...$$).
 		// Treated as equivalent to SELECT expr; store as "SELECT <tokens>" body. M0097-0071.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReturn:
 			if sawAs {
-				return nil, p.errAtCur("duplicate body clause (RETURN after AS)")
+				return nil, &SyntaxError{Raw: true, Message: "duplicate function body specified"}
 			}
 			p.advance() // consume RETURN
 			// Collect tokens until EOF, semicolon, or end of statement.
@@ -104,6 +116,7 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 				p.advance()
 			}
 			stmt.Body = "SELECT " + strings.Join(bodyToks, " ")
+			stmt.IsReturnForm = true
 			sawAs = true
 		case p.isFunctionAttribute():
 			cur := p.cur()
@@ -204,20 +217,29 @@ func (p *parser) parseFunctionBody() (string, error) {
 	// SQL-standard body: BEGIN ATOMIC ... END
 	if t.Kind == TokenKeyword && t.Keyword == KwBegin {
 		// Collect token values between BEGIN ATOMIC and the matching END.
+		// Track BEGIN...END and CASE...END pairs to handle nested constructs.
 		p.advance() // BEGIN
 		_ = p.acceptIdentKeyword("atomic")
 		var parts []string
 		depth := 1
+		caseDepth := 0 // track CASE ... END (CASE does not consume a BEGIN)
 		for depth > 0 && p.cur().Kind != TokenEOF {
 			ct := p.cur()
 			if ct.Kind == TokenKeyword && ct.Keyword == KwBegin {
 				depth++
+			} else if ct.Kind == TokenKeyword && ct.Keyword == KwCase {
+				caseDepth++
 			} else if ct.Kind == TokenKeyword && ct.Keyword == KwEnd {
-				depth--
-				if depth == 0 {
-					p.advance() // END
-					p.acceptSymbol(";")
-					return strings.Join(parts, " "), nil
+				if caseDepth > 0 {
+					caseDepth--
+					// This END belongs to a CASE; don't decrement BEGIN depth.
+				} else {
+					depth--
+					if depth == 0 {
+						p.advance() // END
+						p.acceptSymbol(";")
+						return strings.Join(parts, " "), nil
+					}
 				}
 			}
 			parts = append(parts, ct.Value)
@@ -476,6 +498,7 @@ func (p *parser) parseCreateProcedureTail(pos int, orReplace bool) (Stmt, error)
 		OrReplace: orReplace,
 		Name:      name,
 		Args:      args,
+		Volatile:  "v",
 	}
 	// LANGUAGE / AS clauses in either order (mirrors CREATE FUNCTION)
 	sawLanguage := false
@@ -504,6 +527,18 @@ func (p *parser) parseCreateProcedureTail(pos int, orReplace bool) (Stmt, error)
 			}
 			stmt.Body = body
 			sawAs = true
+		// PG14 SQL-standard procedure body: BEGIN ATOMIC ... END (without AS).
+		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwBegin:
+			if sawAs {
+				return nil, p.errAtCur("duplicate body clause (BEGIN ATOMIC after AS)")
+			}
+			body, err := p.parseFunctionBody()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Body = body
+			stmt.BeginAtomic = true
+			sawAs = true
 		case p.isFunctionAttribute():
 			p.consumeFunctionAttribute()
 		default:
@@ -527,16 +562,28 @@ func (p *parser) parseCallStatement(pos int) (Stmt, error) {
 		pos:  pos,
 		Name: name,
 	}
-	// Optional argument list
+	// Optional argument list; supports named args: CALL proc(name => val)
 	if p.acceptSymbol("(") {
 		args := make([]Expr, 0, 2)
+		argNames := make([]string, 0, 2)
+		hasNamed := false
 		if !p.acceptSymbol(")") {
 			for {
+				// Detect name => expr (named argument).
+				argName := ""
+				if p.cur().Kind == TokenIdent &&
+					p.peek(1).Kind == TokenOperator && p.peek(1).Value == "=>" {
+					argName = p.cur().Value
+					p.advance() // name
+					p.advance() // =>
+					hasNamed = true
+				}
 				expr, err := p.parseExpr()
 				if err != nil {
 					return nil, err
 				}
 				args = append(args, expr)
+				argNames = append(argNames, argName)
 				if p.acceptSymbol(",") {
 					continue
 				}
@@ -547,6 +594,9 @@ func (p *parser) parseCallStatement(pos int) (Stmt, error) {
 			}
 		}
 		stmt.Args = args
+		if hasNamed {
+			stmt.ArgNames = argNames
+		}
 	}
 	return stmt, nil
 }
@@ -666,6 +716,16 @@ func (p *parser) parseDropProcedureTail(pos int) (Stmt, error) {
 		return nil, err
 	}
 	stmt.Args = args
+	// Support comma-separated list: DROP PROCEDURE a, b, c
+	for p.acceptSymbol(",") {
+		extraName, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Names = append(stmt.Names, extraName)
+		// Optionally skip arg list for extra names.
+		_, _ = p.parseFunctionArgList()
+	}
 	switch {
 	case p.acceptKeyword(KwCascade):
 		stmt.Behavior = DropCascade

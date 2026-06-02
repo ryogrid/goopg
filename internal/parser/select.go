@@ -1363,19 +1363,33 @@ func (p *parser) parseSortList() ([]SortBy, error) {
 
 // skipCollationName consumes a (possibly schema-qualified) collation
 // name following the COLLATE keyword, e.g. `"C"`, `pg_catalog."C"`, or
-// `en_US`. Returns the bare collation name (last component). M0097-0127.
+// `en_US`, or a keyword used as collation name (e.g. `default`). Returns
+// the bare collation name (last component). M0097-0127.
 func (p *parser) parseCollationName() (string, error) {
-	tok, err := p.parseIdent()
-	if err != nil {
-		return "", err
-	}
-	name := tok.Value
-	for p.acceptSymbol(".") {
-		tok, err = p.parseIdent() // keep only the last component
+	name := ""
+	// Accept identifier or any keyword that can appear as a collation name.
+	if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+		name = p.cur().Value
+		p.advance()
+	} else {
+		tok, err := p.parseIdent()
 		if err != nil {
 			return "", err
 		}
 		name = tok.Value
+	}
+	for p.acceptSymbol(".") {
+		// After a dot, also accept keywords as name components.
+		if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+			name = p.cur().Value
+			p.advance()
+		} else {
+			tok, err := p.parseIdent()
+			if err != nil {
+				return "", err
+			}
+			name = tok.Value
+		}
 	}
 	return name, nil
 }
@@ -1650,6 +1664,19 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				if op != OpUnknown {
 					pos := t.Pos
 					p.advance() // consume the operator token
+					rhs, err := p.parseExprPrec(precCompare + 1)
+					if err != nil {
+						return nil, err
+					}
+					left = &BinaryOp{pos: pos, Op: op, Left: left, Right: rhs}
+					continue
+				}
+			}
+			// OPERATOR(schema.op) qualified operator syntax (psql \df etc.)
+			if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "operator") &&
+				p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+				pos := t.Pos
+				if op, ok := p.parseQualifiedOperator(); ok {
 					rhs, err := p.parseExprPrec(precCompare + 1)
 					if err != nil {
 						return nil, err
@@ -2693,6 +2720,60 @@ func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 // conjunction inside it (e.g. `BETWEEN a AND b AND c` parses as
 // `BETWEEN a AND b` followed by a top-level AND with c, matching
 // upstream).
+// parseQualifiedOperator parses OPERATOR(schema.op) and maps it to an OpCode.
+// Returns (op, true) on success; the caller has already verified the leading
+// OPERATOR( tokens are present.
+func (p *parser) parseQualifiedOperator() (OpCode, bool) {
+	p.advance() // OPERATOR
+	p.advance() // (
+	// Skip optional schema prefix: schema.
+	if p.cur().Kind == TokenIdent && p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "." {
+		p.advance() // schema name
+		p.advance() // .
+	}
+	// The operator itself is a TokenOperator or a symbol.
+	opStr := ""
+	if p.cur().Kind == TokenOperator || (p.cur().Kind == TokenSymbol && p.cur().Value != ")") {
+		opStr = p.cur().Value
+		p.advance()
+	} else if p.cur().Kind == TokenIdent {
+		opStr = p.cur().Value
+		p.advance()
+	}
+	p.acceptSymbol(")") // consume )
+	switch opStr {
+	case "~":
+		return OpRegexMatch, true
+	case "~*":
+		return OpRegexIMatch, true
+	case "!~":
+		return OpRegexNoMatch, true
+	case "!~*":
+		return OpRegexINoMatch, true
+	case "=":
+		return OpEq, true
+	case "!=", "<>":
+		return OpNe, true
+	case "<":
+		return OpLt, true
+	case ">":
+		return OpGt, true
+	case "<=":
+		return OpLe, true
+	case ">=":
+		return OpGe, true
+	case "+":
+		return OpAdd, true
+	case "-":
+		return OpSub, true
+	case "*":
+		return OpMul, true
+	case "/":
+		return OpDiv, true
+	}
+	return OpUnknown, false
+}
+
 func (p *parser) parseBetweenTail(left Expr, pos int, negated bool) (Expr, error) {
 	low, err := p.parseExprPrec(precAnd + 1)
 	if err != nil {

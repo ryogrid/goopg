@@ -2077,6 +2077,33 @@ M0097-0001 wires it up.
         Procedure-vs-function guard: `executeStoredRoutine` raises SQLSTATE 42809 when
         `r.IsProcedure` is true, preventing `SELECT ptest1(...)` from executing a procedure body.
         Baseline CSV: create_function_sql 430→415, create_procedure 274→307 (stale entry corrected).
+      - **Progress 2026-06-03 (M0097-0150 — function/procedure improvements, loop 3):**
+        Seventeen coordinated fixes (commit below) targeting create_function_sql (415→361) and
+        create_procedure (307→304) normalized diff lines:
+        (a) `BEGIN ATOMIC` body without `AS` keyword: `parseCreateFunctionTail` and
+            `parseCreateProcedureTail` now handle `KwBegin` directly (no preceding AS needed).
+            `CASE ... END` tracking prevents false depth-decrement from inner CASE expressions.
+        (b) `CREATE FUNCTION ... LANGUAGE ...` now optional for `BEGIN ATOMIC` and `RETURN expr`
+            forms (both imply SQL language).
+        (c) `pg_get_functiondef(oid)` fully implemented: looks up routine by OID via
+            `Routines.LookupByOID`, reconstructs DDL in PG format with correct indentation,
+            `$function$` / `$procedure$` dollar-quoting, `BEGIN ATOMIC` form, `RETURN` form.
+        (d) `pg_get_function_arguments(oid)` and `pg_get_function_result(oid)` implemented.
+        (e) `OPERATOR(schema.op)` qualified operator syntax parsed (needed by psql `\df`).
+        (f) `COLLATE pg_catalog.default` — `parseCollationName` accepts keywords as name components.
+        (g) Named arguments in `CALL`: `name => value` syntax parsed; `callOp.Open` reorders
+            args by parameter name when named args present.
+        (h) Default procedure arguments: `callOp.Open` accepts callers providing ≤ declared IN count.
+        (i) `ALTER FUNCTION/PROCEDURE ... OWNER TO role` parsed as no-op.
+        (j) `ALTER ROUTINE` supported (alias for ALTER FUNCTION/PROCEDURE).
+        (k) `DROP PROCEDURE` verifies target is a procedure (not function) before dropping.
+        (l) `DROP PROCEDURE name1, name2` (multi-name list) supported.
+        (m) `pg_function_is_visible` and related `pg_*_is_visible` stubs always return true.
+        (n) `currentWritableSchema` resolves schema from `search_path` for `CREATE FUNCTION/PROCEDURE`.
+        (o) `Routines.Lookup/LookupByName/Drop/DropByName` search all schemas when schema is empty.
+        (p) `callOp.Schema()` returns `nil` (not empty slice) for IN-only procedures, preventing
+            spurious `--\n(0 rows)` output in psql.
+        (q) `coerceDatumToType` accepts `KindString` for time/bool types (overload resolution).
 
 - [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
       - Summary: Make these 13 tests reach `pass`:

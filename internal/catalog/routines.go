@@ -46,6 +46,9 @@ type Routine struct {
 	SecurityDefiner bool   // SECURITY DEFINER
 	Leakproof       bool   // LEAKPROOF
 	IsProcedure     bool   // true when created via CREATE PROCEDURE
+	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
+	IsReturnForm    bool   // PG14 RETURN expr body (stored as "SELECT expr" internally)
+	KindChar        string // prokind: 'f'=function, 'p'=procedure, 'w'=window, 'a'=aggregate
 }
 
 // QualifiedName returns the upstream-style schema-qualified routine
@@ -158,33 +161,48 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 // Lookup returns the routine matching schema+name+argtypes, or
 // false. Stage A uses exact type-name match — the upstream coercion
 // rules arrive when the type system grows up.
+// When schema is empty, searches all schemas.
 func (rs *Routines) Lookup(name parser.ObjectName, argTypes []Type) (*Routine, bool) {
-	schema := name.Schema
-	if schema == "" {
-		schema = "public"
-	}
-	stub := &Routine{Schema: schema, Name: name.Name, ArgTypes: argTypes}
+	stub := &Routine{Name: name.Name, ArgTypes: argTypes}
+	sig := stub.Signature()
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
-	r, ok := rs.byKey[routineKey(schema, name.Name, stub.Signature())]
-	return r, ok
+	if name.Schema != "" {
+		r, ok := rs.byKey[routineKey(name.Schema, name.Name, sig)]
+		return r, ok
+	}
+	// No schema: search all schemas. Try public first for compatibility,
+	// then others.
+	if r, ok := rs.byKey[routineKey("public", name.Name, sig)]; ok {
+		return r, ok
+	}
+	for _, r := range rs.byKey {
+		if strings.EqualFold(r.Name, name.Name) && r.Signature() == sig {
+			return r, true
+		}
+	}
+	return nil, false
 }
 
 // LookupByName returns every overload of the given schema+name.
-// Used by DROP FUNCTION when no argument list was supplied (the
-// caller decides how to handle ambiguity) and by future
-// `pg_get_functiondef` introspection.
+// When schema is empty, searches all schemas (search-path style).
 func (rs *Routines) LookupByName(name parser.ObjectName) []*Routine {
-	schema := name.Schema
-	if schema == "" {
-		schema = "public"
-	}
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
-	keys := rs.byName[nameKey(schema, name.Name)]
-	out := make([]*Routine, 0, len(keys))
-	for _, k := range keys {
-		if r, ok := rs.byKey[k]; ok {
+	if name.Schema != "" {
+		keys := rs.byName[nameKey(name.Schema, name.Name)]
+		out := make([]*Routine, 0, len(keys))
+		for _, k := range keys {
+			if r, ok := rs.byKey[k]; ok {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+	// No schema specified: collect matches from all schemas.
+	var out []*Routine
+	for _, r := range rs.byKey {
+		if strings.EqualFold(r.Name, name.Name) {
 			out = append(out, r)
 		}
 	}
@@ -194,15 +212,29 @@ func (rs *Routines) LookupByName(name parser.ObjectName) []*Routine {
 // Drop removes the routine with the given schema+name+argtypes.
 // Returns ErrRoutineNotFound when the signature doesn't resolve;
 // the caller maps that to the SQL-level IF EXISTS contract.
+// When schema is empty, searches all schemas.
 func (rs *Routines) Drop(name parser.ObjectName, argTypes []Type) error {
-	schema := name.Schema
-	if schema == "" {
-		schema = "public"
-	}
-	stub := &Routine{Schema: schema, Name: name.Name, ArgTypes: argTypes}
+	stub := &Routine{Name: name.Name, ArgTypes: argTypes}
 	signature := stub.Signature()
+	schema := name.Schema
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	// Resolve schema when not provided: try public first, then all schemas.
+	if schema == "" {
+		if _, ok := rs.byKey[routineKey("public", name.Name, signature)]; ok {
+			schema = "public"
+		} else {
+			for _, r := range rs.byKey {
+				if strings.EqualFold(r.Name, name.Name) && r.Signature() == signature {
+					schema = r.Schema
+					break
+				}
+			}
+		}
+		if schema == "" {
+			return fmt.Errorf("%w: %s%s", ErrRoutineNotFound, name.Name, signature)
+		}
+	}
 	k := routineKey(schema, name.Name, signature)
 	if _, ok := rs.byKey[k]; !ok {
 		return fmt.Errorf("%w: %s.%s%s", ErrRoutineNotFound, schema, name.Name, signature)
@@ -226,14 +258,37 @@ func (rs *Routines) Drop(name parser.ObjectName, argTypes []Type) error {
 // supplied to DROP FUNCTION (no argument list). Returns
 // ErrRoutineAmbiguous if more than one overload exists — the
 // caller surfaces the upstream "function name is not unique"
-// SQLSTATE 42725.
+// SQLSTATE 42725. When schema is empty, searches all schemas.
 func (rs *Routines) DropByName(name parser.ObjectName) error {
 	schema := name.Schema
-	if schema == "" {
-		schema = "public"
-	}
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	// Resolve schema when not specified.
+	if schema == "" {
+		// Collect all matching keys across schemas.
+		var allKeys []string
+		for nk, keys := range rs.byName {
+			// nameKey = "schema.name"; check suffix
+			if strings.HasSuffix(nk, "."+strings.ToLower(name.Name)) {
+				allKeys = append(allKeys, keys...)
+			}
+		}
+		switch len(allKeys) {
+		case 0:
+			return fmt.Errorf("%w: %s", ErrRoutineNotFound, name.Name)
+		case 1:
+			k := allKeys[0]
+			r := rs.byKey[k]
+			delete(rs.byKey, k)
+			if r != nil {
+				nk := nameKey(r.Schema, name.Name)
+				delete(rs.byName, nk)
+			}
+			return nil
+		default:
+			return fmt.Errorf("%w: %s", ErrRoutineAmbiguous, name.Name)
+		}
+	}
 	keys := rs.byName[nameKey(schema, name.Name)]
 	switch len(keys) {
 	case 0:
@@ -250,6 +305,18 @@ func (rs *Routines) DropByName(name parser.ObjectName) error {
 
 // List returns every registered routine in deterministic OID order.
 // Used by `pg_catalog.pg_proc`'s virtual-row provider.
+// LookupByOID returns the routine with the given OID, or nil if not found.
+func (rs *Routines) LookupByOID(oid uint32) *Routine {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	for _, r := range rs.byKey {
+		if r.OID == oid {
+			return r
+		}
+	}
+	return nil
+}
+
 func (rs *Routines) List() []*Routine {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()

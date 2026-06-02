@@ -6036,35 +6036,67 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// ── Function introspection stubs (M0097-0012) ─────────────────────────
 	case "pg_get_functiondef":
 		// pg_get_functiondef(func_oid) → text — returns function DDL.
-		// Stub: look up in routine registry and reconstruct definition.
 		if len(x.Args) == 1 {
-			nameArg, err := evalExpr(x.Args[0], row, ctx)
-			if err != nil || nameArg.IsNull() {
+			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || oidArg.IsNull() {
 				return NullDatum, nil
 			}
-			// The argument might be a regproc (function name cast to OID).
-			// Try to look up the function by name.
+			if ctx == nil || ctx.Catalog == nil {
+				return NullDatum, nil
+			}
 			rs := ctx.Catalog.Routines()
-			if rs != nil {
-				name := nameArg.StringValue()
-				candidates := rs.LookupByName(parseRoutineName(name))
+			if rs == nil {
+				return NullDatum, nil
+			}
+			var r *catalog.Routine
+			if oidArg.Kind == KindInt {
+				r = rs.LookupByOID(uint32(oidArg.Int))
+			} else {
+				// Fall back to name lookup for string arguments.
+				schema, nm := splitQualifiedTable(strings.ToLower(strings.TrimSpace(oidArg.StringValue())))
+				candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: nm})
 				if len(candidates) > 0 {
-					r := candidates[0]
-					body := fmt.Sprintf("CREATE OR REPLACE FUNCTION %s(", r.Name)
-					for i, arg := range r.ArgNames {
-						if i > 0 {
-							body += ", "
-						}
-						body += arg + " " + r.ArgTypes[i].Name
-					}
-					body += ") RETURNS " + r.ReturnType.Name + " LANGUAGE " + r.Language + " AS $$\n" + r.Body + "\n$$"
-					return NewStringDatum(body), nil
+					r = candidates[0]
 				}
 			}
-			return NullDatum, nil
+			if r == nil {
+				return NullDatum, nil
+			}
+			return NewStringDatum(buildFunctionDef(r)), nil
 		}
-	case "pg_get_function_arguments", "pg_get_function_result":
+	case "pg_get_function_arguments":
+		// pg_get_function_arguments(oid) → text: comma-separated arg list
+		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
+			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
+				if rs := ctx.Catalog.Routines(); rs != nil {
+					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
+						return NewStringDatum(buildFunctionArguments(r)), nil
+					}
+				}
+			}
+		}
 		return NewStringDatum(""), nil
+	case "pg_get_function_result":
+		// pg_get_function_result(oid) → text: return type
+		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
+			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
+				if rs := ctx.Catalog.Routines(); rs != nil {
+					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil && !r.IsProcedure {
+						return NewStringDatum(canonicalTypeName(r.ReturnType.Name)), nil
+					}
+				}
+			}
+		}
+		return NewStringDatum(""), nil
+	// pg_function_is_visible(oid) → bool: always true (no schema visibility model in v0).
+	case "pg_function_is_visible", "pg_table_is_visible", "pg_type_is_visible",
+		"pg_operator_is_visible", "pg_opfamily_is_visible", "pg_opclass_is_visible",
+		"pg_conversion_is_visible", "pg_aggregate_is_visible", "pg_ts_parser_is_visible",
+		"pg_ts_dict_is_visible", "pg_ts_template_is_visible", "pg_ts_config_is_visible",
+		"pg_statistics_obj_is_visible":
+		return NewBoolDatum(true), nil
 	case "pg_proc":
 		return NullDatum, nil
 	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace":
@@ -9183,4 +9215,179 @@ func parseTZHourMin(s string) (h, m int, ok bool) {
 		return 0, 0, false
 	}
 	return n, 0, true
+}
+
+// buildFunctionArguments returns the argument list string for pg_get_function_arguments().
+// Format: "IN name type, OUT name type, ..." matching PG's pg_get_function_arguments.
+func buildFunctionArguments(r *catalog.Routine) string {
+	if len(r.ArgTypes) == 0 {
+		return ""
+	}
+	parts := make([]string, len(r.ArgTypes))
+	for i, argType := range r.ArgTypes {
+		var part strings.Builder
+		// Mode prefix
+		if r.ArgModes != nil && i < len(r.ArgModes) {
+			switch r.ArgModes[i] {
+			case "i":
+				part.WriteString("IN ")
+			case "o":
+				part.WriteString("OUT ")
+			case "b":
+				part.WriteString("INOUT ")
+			case "v":
+				part.WriteString("VARIADIC ")
+			}
+		}
+		// Name (if any)
+		if i < len(r.ArgNames) && r.ArgNames[i] != "" {
+			part.WriteString(r.ArgNames[i])
+			part.WriteByte(' ')
+		}
+		part.WriteString(canonicalTypeName(argType.Name))
+		parts[i] = part.String()
+	}
+	return strings.Join(parts, ", ")
+}
+
+// buildFunctionDef reconstructs the CREATE FUNCTION / CREATE PROCEDURE DDL
+// for pg_get_functiondef(). Matches PostgreSQL's output format: schema-qualified
+// name, arg types, optional modifiers (STABLE/STRICT/etc.), then body.
+func buildFunctionDef(r *catalog.Routine) string {
+	var sb strings.Builder
+
+	// Header: CREATE OR REPLACE FUNCTION/PROCEDURE schema.name(args)
+	if r.IsProcedure {
+		sb.WriteString("CREATE OR REPLACE PROCEDURE ")
+	} else {
+		sb.WriteString("CREATE OR REPLACE FUNCTION ")
+	}
+	// Schema-qualified name (lowercase matches pg_get_functiondef)
+	if r.Schema != "" {
+		sb.WriteString(r.Schema)
+		sb.WriteByte('.')
+	}
+	sb.WriteString(r.Name)
+	sb.WriteByte('(')
+	for i, argType := range r.ArgTypes {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		// Procedure args include mode prefix
+		if r.IsProcedure && r.ArgModes != nil && i < len(r.ArgModes) {
+			switch r.ArgModes[i] {
+			case "i":
+				sb.WriteString("IN ")
+			case "o":
+				sb.WriteString("OUT ")
+			case "b":
+				sb.WriteString("INOUT ")
+			case "v":
+				sb.WriteString("VARIADIC ")
+			}
+		}
+		if i < len(r.ArgNames) && r.ArgNames[i] != "" {
+			sb.WriteString(r.ArgNames[i])
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(canonicalTypeName(argType.Name))
+	}
+	sb.WriteString(")\n")
+
+	// RETURNS clause (functions only) — 1-space indent like PG's deparser
+	if !r.IsProcedure {
+		sb.WriteString(" RETURNS ")
+		sb.WriteString(canonicalTypeName(r.ReturnType.Name))
+		sb.WriteByte('\n')
+	}
+
+	// LANGUAGE clause — 1-space indent
+	sb.WriteString(" LANGUAGE ")
+	sb.WriteString(r.Language)
+	sb.WriteByte('\n')
+
+	// Volatility modifiers (STABLE, IMMUTABLE — VOLATILE is the default, omitted)
+	switch r.Volatile {
+	case "s":
+		sb.WriteString(" STABLE\n")
+	case "i":
+		sb.WriteString(" IMMUTABLE\n")
+	}
+
+	// STRICT
+	if r.Strict {
+		sb.WriteString(" STRICT\n")
+	}
+
+	// LEAKPROOF
+	if r.Leakproof {
+		sb.WriteString(" LEAKPROOF\n")
+	}
+
+	// SECURITY DEFINER
+	if r.SecurityDefiner {
+		sb.WriteString(" SECURITY DEFINER\n")
+	}
+
+	// Body
+	body := r.Body
+	if r.BeginAtomic {
+		// SQL-standard BEGIN ATOMIC ... END body
+		sb.WriteString("BEGIN ATOMIC\n")
+		// Each statement in the body on its own line with leading space
+		for _, stmt := range strings.Split(body, ";") {
+			stmt = strings.TrimSpace(stmt)
+			if stmt == "" {
+				continue
+			}
+			sb.WriteString(" ")
+			sb.WriteString(stmt)
+			sb.WriteString(";\n")
+		}
+		sb.WriteString("END\n")
+	} else if r.IsReturnForm {
+		// RETURN form: stored as "SELECT expr" — output as "RETURN expr"
+		sb.WriteString("RETURN ")
+		sb.WriteString(strings.TrimPrefix(body, "SELECT "))
+		sb.WriteByte('\n')
+	} else if r.IsProcedure {
+		// Procedure body: multi-line $procedure$...$procedure$ format
+		sb.WriteString("AS $procedure$\n")
+		sb.WriteString(body)
+		if body != "" && body[len(body)-1] != '\n' {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString("$procedure$\n")
+	} else {
+		// Function body: inline $function$...$function$ format
+		sb.WriteString("AS $function$")
+		sb.WriteString(body)
+		sb.WriteString("$function$\n")
+	}
+
+	return sb.String()
+}
+
+// canonicalTypeName normalizes short PG type aliases to their canonical names,
+// matching what pg_get_functiondef displays (e.g. "bool" → "boolean").
+func canonicalTypeName(name string) string {
+	switch strings.ToLower(name) {
+	case "bool":
+		return "boolean"
+	case "int", "int4":
+		return "integer"
+	case "int2":
+		return "smallint"
+	case "int8":
+		return "bigint"
+	case "float4":
+		return "real"
+	case "float8":
+		return "double precision"
+	case "varchar":
+		return "character varying"
+	case "char":
+		return "character"
+	}
+	return name
 }

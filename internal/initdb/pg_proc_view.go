@@ -167,10 +167,19 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			for i, t := range r.ArgTypes {
 				argOIDs[i] = typeNameToOIDStr(t.Name)
 			}
-			// pronamespace: 2200 for public schema, 11 for pg_catalog.
-			ns := "2200"
-			if strings.EqualFold(r.Schema, "pg_catalog") {
+			// pronamespace: use schema OID. public=2200, pg_catalog=11.
+			// For user-created schemas, look up the OID from the catalog.
+			ns := "2200" // default to public
+			switch strings.ToLower(r.Schema) {
+			case "pg_catalog":
 				ns = "11"
+			case "public", "":
+				ns = "2200"
+			default:
+				// Look up user-created schema OID via catalog.
+				if schOID := cat.SchemaOID(r.Schema); schOID != 0 {
+					ns = fmt.Sprintf("%d", schOID)
+				}
 			}
 			volatile := r.Volatile
 			if volatile == "" {

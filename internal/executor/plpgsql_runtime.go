@@ -1571,13 +1571,28 @@ func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datu
 		if v.Kind == KindBool {
 			return v, nil
 		}
+		if v.Kind == KindString {
+			return v, nil // pass-through for overload resolution
+		}
 	case isTimeTypeName(tn):
 		if v.Kind == KindTime {
+			return v, nil
+		}
+		// Implicit coercion of string literals to date/timestamp (PG semantics).
+		if v.Kind == KindString {
+			if t := tryParseStringAs(KindTime, v.StringValue()); !t.IsNull() {
+				return t, nil
+			}
+			// Return pass-through so overload resolution can proceed;
+			// execution will fail with a proper cast error if needed.
 			return v, nil
 		}
 	case isIntervalTypeName(tn):
 		if v.Kind == KindInterval {
 			return v, nil
+		}
+		if v.Kind == KindString {
+			return v, nil // pass-through for overload resolution
 		}
 	default:
 		// Unmodelled types remain pass-through in v0, mirroring the

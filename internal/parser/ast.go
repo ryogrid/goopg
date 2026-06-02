@@ -1538,6 +1538,8 @@ type CreateFunctionStmt struct {
 	Volatile        string // "v"=volatile (default), "s"=stable, "i"=immutable
 	SecurityDefiner bool   // SECURITY DEFINER
 	Leakproof       bool   // LEAKPROOF
+	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
+	IsReturnForm    bool   // PG14 RETURN expr body (no AS keyword, body stored as "SELECT expr")
 }
 
 // AlterFunctionStmt — `ALTER FUNCTION name([argtypes]) attribute ...`
@@ -1587,6 +1589,9 @@ type CreateProcedureStmt struct {
 	Language        string // lower-cased, e.g. "plpgsql"
 	Body            string // raw source between the dollar-quote delimiters
 	SecurityDefiner bool   // SECURITY DEFINER
+	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
+	Strict          bool   // STRICT / RETURNS NULL ON NULL INPUT
+	Volatile        string // "v"=volatile (default), "s"=stable, "i"=immutable
 }
 
 func (s *CreateProcedureStmt) Pos() int  { return s.pos }
@@ -1595,9 +1600,10 @@ func (s *CreateProcedureStmt) stmtNode() {}
 // CallStmt is the AST for `CALL procedure_name([arg [, ...]])`.
 // Stage B (procedure follow-up) of M0015.
 type CallStmt struct {
-	pos  int
-	Name ObjectName
-	Args []Expr // expressions for IN arguments
+	pos      int
+	Name     ObjectName
+	Args     []Expr   // expressions for IN arguments
+	ArgNames []string // parallel to Args; non-empty when caller used name=>val syntax
 	// OUT/INOUT parameter result handling deferred
 }
 
@@ -1610,7 +1616,8 @@ type DropProcedureStmt struct {
 	pos      int
 	IfExists bool
 	Name     ObjectName
-	Args     []FunctionArg // nil when no parenthesised arg list was given
+	Names    []ObjectName   // additional names for multi-name DROP (DROP PROCEDURE a, b)
+	Args     []FunctionArg  // nil when no parenthesised arg list was given
 	Behavior DropBehavior
 	ObjKind  string // "procedure" or "routine" (default "procedure")
 }

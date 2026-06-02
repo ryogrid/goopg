@@ -2569,7 +2569,11 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	}
 	lang := strings.ToLower(s.Language)
 	if lang == "" {
-		return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE FUNCTION requires a LANGUAGE clause"}
+		if s.BeginAtomic || s.IsReturnForm {
+			lang = "sql" // BEGIN ATOMIC / RETURN form implies SQL language
+		} else {
+			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE FUNCTION requires a LANGUAGE clause"}
+		}
 	}
 	if lang != "plpgsql" && lang != "sql" && lang != "c" {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage A: plpgsql, sql)", s.Language)}
@@ -2589,8 +2593,12 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	if volatile == "" {
 		volatile = "v" // default: volatile
 	}
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = currentWritableSchema(o.ctx)
+	}
 	r := &catalog.Routine{
-		Schema:   s.Name.Schema,
+		Schema:   schema,
 		Name:     s.Name.Name,
 		ArgNames: argNames,
 		ArgTypes: argTypes,
@@ -2601,6 +2609,8 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		ReturnsSet:      s.ReturnsSet,
 		Language:        lang,
 		Body:            s.Body,
+		BeginAtomic:     s.BeginAtomic,
+		IsReturnForm:    s.IsReturnForm,
 		Strict:          s.Strict,
 		Volatile:        volatile,
 		SecurityDefiner: s.SecurityDefiner,
@@ -2670,7 +2680,11 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	}
 	lang := strings.ToLower(s.Language)
 	if lang == "" {
-		return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE PROCEDURE requires a LANGUAGE clause"}
+		if s.BeginAtomic {
+			lang = "sql" // BEGIN ATOMIC implies SQL language
+		} else {
+			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE PROCEDURE requires a LANGUAGE clause"}
+		}
 	}
 	if lang != "plpgsql" && lang != "sql" && lang != "c" {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage B: plpgsql, sql)", s.Language)}
@@ -2697,14 +2711,19 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 			argModes[i] = "i"
 		}
 	}
+	procSchema := s.Name.Schema
+	if procSchema == "" {
+		procSchema = currentWritableSchema(o.ctx)
+	}
 	r := &catalog.Routine{
-		Schema:          s.Name.Schema,
+		Schema:          procSchema,
 		Name:            s.Name.Name,
 		ArgNames:        argNames,
 		ArgTypes:        argTypes,
 		ArgModes:        argModes,
 		Language:        lang,
 		Body:            s.Body,
+		BeginAtomic:     s.BeginAtomic,
 		IsProcedure:     true,
 		SecurityDefiner: s.SecurityDefiner,
 		Volatile:        "v", // procedures default to volatile
@@ -2721,6 +2740,15 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 // execDropProcedure removes a procedure from the routine registry
 // (mirrors execDropFunction).
 func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
+	// Drop all names in the list (multi-name DROP PROCEDURE a, b, c).
+	for _, extraName := range s.Names {
+		s2 := *s
+		s2.Name = extraName
+		s2.Names = nil
+		if err := o.execDropProcedure(&s2); err != nil {
+			return err
+		}
+	}
 	if s.IfExists && o.dropSchemaQualifiedNotice(s.Name) {
 		return nil
 	}
@@ -2733,6 +2761,48 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP PROCEDURE requires routine registry"}
 	}
+	// Verify the target exists and is a procedure BEFORE dropping.
+	var found *catalog.Routine
+	if s.Args == nil {
+		cands := rs.LookupByName(s.Name)
+		if len(cands) == 1 {
+			found = cands[0]
+		} else if len(cands) > 1 {
+			if !s.IfExists {
+				return &ExecError{
+					Code:    "42725",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("%s name \"%s\" is not unique", objKind, s.Name.Name),
+					Hint:    fmt.Sprintf("Specify the argument list to select the %s unambiguously.", objKind),
+				}
+			}
+		}
+	} else {
+		argTypes := make([]catalog.Type, len(s.Args))
+		for i, a := range s.Args {
+			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+		}
+		found, _ = rs.Lookup(s.Name, argTypes)
+	}
+	if found == nil {
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("%s %s does not exist, skipping", objKind, s.Name.Name))
+			return nil
+		}
+		// PG format: "procedure name() does not exist"
+		argListStr := buildCallArgListStr(s.Args)
+		return &ExecError{Code: "42883", Pos: s.Pos(),
+			Message:  fmt.Sprintf("%s %s%s does not exist", objKind, s.Name.Name, argListStr),
+			Hint:     "No procedure matches the given name and argument types. You might need to add explicit type casts.",
+		}
+	}
+	// DROP PROCEDURE on a function should fail.
+	if objKind == "procedure" && !found.IsProcedure {
+		return &ExecError{Code: "42809", Pos: s.Pos(),
+			Message: fmt.Sprintf("%s is not a procedure", s.Name.Name),
+			Hint:    "Use DROP FUNCTION to remove a function."}
+	}
+	// Now drop.
 	var err error
 	if s.Args == nil {
 		err = rs.DropByName(s.Name)
@@ -4614,4 +4684,45 @@ func lockTableSearchSchemas(ctx *Context) []string {
 		result = []string{"public"}
 	}
 	return result
+}
+
+// currentWritableSchema returns the first writable schema from the session's
+// search_path GUC. Used by CREATE FUNCTION/PROCEDURE when no schema qualifier
+// is provided. Defaults to "public" if search_path is empty or not set.
+func currentWritableSchema(ctx *Context) string {
+	if ctx == nil || ctx.GetSetting == nil {
+		return "public"
+	}
+	searchPath, ok := ctx.GetSetting("search_path")
+	if !ok || searchPath == "" {
+		return "public"
+	}
+	for _, raw := range strings.Split(searchPath, ",") {
+		s := strings.TrimSpace(raw)
+		s = strings.Trim(s, `"'`)
+		if s == "" || s == "$user" {
+			continue
+		}
+		lc := strings.ToLower(s)
+		if lc == "pg_catalog" || lc == "information_schema" {
+			continue
+		}
+		return s
+	}
+	return "public"
+}
+
+// buildCallArgListStr returns "()" for no arg list or "(type, ...)" for typed args.
+func buildCallArgListStr(args []parser.FunctionArg) string {
+	if args == nil {
+		return "()"
+	}
+	if len(args) == 0 {
+		return "()"
+	}
+	parts := make([]string, len(args))
+	for i, a := range args {
+		parts[i] = strings.ToLower(a.Type.Name)
+	}
+	return "(" + strings.Join(parts, ", ") + ")"
 }
