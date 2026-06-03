@@ -6216,7 +6216,7 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 		}
 		return idx, ords, nil
 	}
-	return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: fmt.Sprintf("there is no unique or exclusion constraint matching the ON CONFLICT specification on relation %q", tbl.Name)}
+	return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: "there is no unique or exclusion constraint matching the ON CONFLICT specification"}
 }
 
 func insertValuesSchema(tbl *catalog.Table, colIndex []int) Schema {

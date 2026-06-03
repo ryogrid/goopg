@@ -1227,6 +1227,21 @@ func remapRowForPartition(parentCols, childCols []catalog.Column, row Row) Row {
 	return out
 }
 
+// partitionColOrderMatches reports whether parentCols and childCols have the
+// same column names in the same order (same layout, no remapping needed).
+// M0097-0028.
+func partitionColOrderMatches(parentCols, childCols []catalog.Column) bool {
+	if len(parentCols) != len(childCols) {
+		return false
+	}
+	for i := range parentCols {
+		if !strings.EqualFold(parentCols[i].Name, childCols[i].Name) {
+			return false
+		}
+	}
+	return true
+}
+
 // based on the parent's partition key. Returns nil if no partition matches.
 // M0096-0007.
 func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory, ctx *Context) (*catalog.Table, error) {

@@ -1758,6 +1758,49 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				im.RegisterPartitionChild(tbl.OID, childTbl.OID)
 			}
+			// Propagate parent unique/PK indexes to the newly attached child
+			// partition. In PostgreSQL, ATTACH PARTITION requires the child to
+			// have matching indexes (created automatically when using CREATE TABLE
+			// … PARTITION OF, or by ATTACH PARTITION propagation). Without this,
+			// upsertOp's arbiter probe and insertOp's unique-constraint check both
+			// miss live duplicates. Only create when the child doesn't already
+			// have a matching index. M0097-0028.
+			for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+				if parentIdx.Method != "btree" || (!parentIdx.Primary && !parentIdx.Unique) {
+					continue
+				}
+				alreadyHas := false
+				for _, childIdx := range o.ctx.Catalog.IndexesOnTable(childTbl) {
+					if len(childIdx.Columns) != len(parentIdx.Columns) {
+						continue
+					}
+					match := true
+					for k := range childIdx.Columns {
+						if !strings.EqualFold(childIdx.Columns[k], parentIdx.Columns[k]) {
+							match = false
+							break
+						}
+					}
+					if match {
+						alreadyHas = true
+						break
+					}
+				}
+				if alreadyHas {
+					continue
+				}
+				var childIdxName parser.ObjectName
+				if parentIdx.Primary {
+					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + "_pkey"}
+				} else {
+					suffix := "_key"
+					if len(parentIdx.Columns) == 1 {
+						suffix = "_" + parentIdx.Columns[0] + "_key"
+					}
+					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + suffix}
+				}
+				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary)
+			}
 		case parser.AlterTableRenameTable:
 			newName := act.NewName
 			probe := parser.ObjectName{Schema: tbl.Schema, Name: newName}

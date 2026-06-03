@@ -186,6 +186,9 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		rel := parentRel
 		cols := parentCols
 		writeTbl := o.plan.Table
+		// partLeaf is set when we route to a leaf with a different column
+		// order from the parent; used for row remapping below. M0097-0028.
+		var partLeaf *catalog.Table
 		if isPartitioned {
 			leaf, leafTree, ferr := o.routeAndOpenLeaf(inserted)
 			if ferr != nil {
@@ -199,14 +202,29 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			cols = leaf.Columns
 			writeTbl = leaf
 			o.arbiterTree = leafTree
+			// Track the leaf when its column order differs from the parent.
+			// insertOp uses remapRowForPartition; we must do the same.
+			if !partitionColOrderMatches(parentCols, leaf.Columns) {
+				partLeaf = leaf
+			}
 		}
 
+		// insertedForLeaf: inserted row in leaf column order (for heap writes).
+		// For non-partitioned or same-order partitions this is the same slice.
+		insertedForLeaf := inserted
+		if partLeaf != nil {
+			insertedForLeaf = remapRowForPartition(parentCols, partLeaf.Columns, inserted)
+		}
+
+		// probeArbiterWaiting calls encodeArbiterKey with o.plan.Table (parent)
+		// columns and reads inserted[parent_col_ord]. Always pass parent-order
+		// inserted for key encoding; conflictRow is decoded in leaf order (cols).
 		arbiterKey, conflictPtr, conflictRow, conflicted, err := o.probeArbiterWaiting(rel, cols, inserted)
 		if err != nil {
 			return nil, err
 		}
 		if !conflicted {
-			if err := o.applyInsert(rel, cols, inserted, arbiterKey); err != nil {
+			if err := o.applyInsert(rel, cols, insertedForLeaf, arbiterKey); err != nil {
 				return nil, err
 			}
 			o.appendUpsertRetRow(inserted)
@@ -226,8 +244,15 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			}
 			// Skip silently — RowsAffected does NOT bump.
 		case planner.OnConflictActionUpdate:
+			// When the leaf has different column order, conflictRow is in leaf
+			// order. evalUpdate expects both rows in parent column order (the
+			// UpdateSet expressions are planned against the parent schema).
+			evalConflictRow := conflictRow
+			if partLeaf != nil {
+				evalConflictRow = remapRowForPartition(partLeaf.Columns, parentCols, conflictRow)
+			}
 			for {
-				updated, skip, err := o.evalUpdate(conflictRow, inserted)
+				updated, skip, err := o.evalUpdate(evalConflictRow, inserted)
 				if err != nil {
 					return nil, err
 				}
@@ -271,16 +296,27 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 						return nil, err
 					}
 					if !conflicted {
-						if err := o.applyInsert(rel, cols, inserted, arbiterKey); err != nil {
+						if err := o.applyInsert(rel, cols, insertedForLeaf, arbiterKey); err != nil {
 							return nil, err
 						}
 						o.appendUpsertRetRow(inserted)
 						o.rowsAffected++
 						continue nextSourceRow
 					}
+					// Update evalConflictRow for the re-probed conflict row.
+					evalConflictRow = conflictRow
+					if partLeaf != nil {
+						evalConflictRow = remapRowForPartition(partLeaf.Columns, parentCols, conflictRow)
+					}
 					continue
 				}
-				if err := o.applyUpdate(rel, cols, conflictPtr, updated); err != nil {
+				// updated is in parent column order (from evalUpdate).
+				// For heap writes, remap to leaf order when column order differs.
+				updatedForLeaf := updated
+				if partLeaf != nil {
+					updatedForLeaf = remapRowForPartition(parentCols, partLeaf.Columns, updated)
+				}
+				if err := o.applyUpdate(rel, cols, conflictPtr, updatedForLeaf, updated); err != nil {
 					return nil, err
 				}
 				o.appendUpsertRetRow(updated)
@@ -641,7 +677,12 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, cols []catalog.Column, i
 // entry pointing at the new ItemPointer; the old entry is left in
 // place — visibility filtering at the next probe will skip it
 // because the tuple's xmax now blocks it.
-func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, oldPtr storage.ItemPointer, updated Row) error {
+//
+// updatedLeaf is the row in the leaf/target table's physical column order
+// (used for the heap write). arbiterRow is in parent column order (used for
+// arbiter key encoding). When they are the same — no partition column
+// remapping needed — pass the same slice for both. M0097-0028.
+func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, oldPtr storage.ItemPointer, updatedLeaf Row, arbiterRow Row) error {
 	// Materialise the XID BEFORE stamping xmax so the old tuple gets a
 	// real delete stamp (not InvalidTransactionID). Without this, the old
 	// tuple's xmax=0 would make it appear still-live to subsequent scans.
@@ -664,14 +705,14 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, o
 	if derr != nil {
 		return derr
 	}
-	newPtr, err := writeHeapRowReturning(o.ctx, rel, cols, updated)
+	newPtr, err := writeHeapRowReturning(o.ctx, rel, cols, updatedLeaf)
 	if err != nil {
 		return err
 	}
 	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
 		o.ctx.CTEWriteFence[newPtr] = struct{}{}
 	}
-	return o.maintainArbiterRow(updated, newPtr)
+	return o.maintainArbiterRow(arbiterRow, newPtr)
 }
 
 // maintainArbiter inserts a precomputed (conflict-key → ptr) entry into the
