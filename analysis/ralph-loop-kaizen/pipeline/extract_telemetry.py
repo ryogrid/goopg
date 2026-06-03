@@ -156,6 +156,115 @@ def circuit_breaker_reasons(repo: Path) -> dict:
     return out
 
 
+_FAILED_LOG_RE = re.compile(r"execution failed, check:\s*(\S+\.log)")
+_START_RE = re.compile(r"=== Starting Loop")
+_OK_RE = re.compile(r"Claude Code execution completed successfully")
+_FAIL_RE = re.compile(r"Claude Code execution failed")
+_TIMEDOUT_RE = re.compile(r"Claude Code execution timed out after")
+
+
+def _classify_one(res: dict | None) -> str:
+    """Bucket a single failed loop by the cause recorded in its .log."""
+    if res is None:
+        return "empty_or_unparseable_log"
+    api = res.get("api_error_status")
+    text = (res.get("result") or "").lower()
+    is_err = bool(res.get("is_error"))
+    if api == 429 or ("hit your limit" in text) or ("usage limit" in text):
+        return "usage_limit_429"
+    if api and api != 429:
+        return f"api_error_{api}"
+    if res.get("terminal_reason") == "timed_out" or "timed out" in text:
+        return "timeout"
+    if "stream" in text and "could not find result" in text:
+        return "stream_parse_failure"
+    if is_err:
+        return "agent_error_nonapi"
+    return "other_marked_failed"
+
+
+def classify_failures(logs: Path) -> dict:
+    """Root-cause the driver's 'execution failed' loops by reading each
+    referenced .log (exact loop->log join via ralph.log) and bucketing the
+    cause. Also measures consecutive-failure run lengths (retry storms)."""
+    ralph = logs / "ralph.log"
+    if not ralph.exists():
+        return {}
+    failed_paths: list[str] = []
+    outcomes: list[str] = []  # ordered 'S'/'F' per resolved loop outcome
+    for line in ralph.read_text(errors="replace").splitlines():
+        if _OK_RE.search(line):
+            outcomes.append("S")
+        elif _TIMEDOUT_RE.search(line):
+            outcomes.append("F")
+        m = _FAILED_LOG_RE.search(line)
+        if m:
+            failed_paths.append(m.group(1))
+            outcomes.append("F")
+
+    buckets: dict[str, int] = {}
+    bucket_durations: dict[str, list[float]] = {}
+    reset_msgs: dict[str, int] = {}
+    missing = 0
+    for p in failed_paths:
+        f = logs / Path(p).name
+        if not f.exists():
+            missing += 1
+            res = None
+        else:
+            res = extract_result_object_safe(f)
+        cat = _classify_one(res)
+        buckets[cat] = buckets.get(cat, 0) + 1
+        if res:
+            bucket_durations.setdefault(cat, []).append(C.to_float(res.get("duration_ms")) / 1000.0)
+            if cat == "usage_limit_429":
+                msg = (res.get("result") or "").strip()[:80]
+                reset_msgs[msg] = reset_msgs.get(msg, 0) + 1
+
+    # consecutive-failure run lengths (retry storms)
+    runs: list[int] = []
+    cur = 0
+    for o in outcomes:
+        if o == "F":
+            cur += 1
+        else:
+            if cur:
+                runs.append(cur)
+            cur = 0
+    if cur:
+        runs.append(cur)
+
+    total_failed = len(failed_paths)
+    return {
+        "failed_loops_seen": total_failed,
+        "missing_logs": missing,
+        "by_cause": dict(sorted(buckets.items(), key=lambda kv: -kv[1])),
+        "by_cause_pct": {
+            k: round(100 * v / total_failed, 1) for k, v in sorted(buckets.items(), key=lambda kv: -kv[1])
+        }
+        if total_failed
+        else {},
+        "median_duration_s_by_cause": {
+            k: round(sorted(v)[len(v) // 2], 1) for k, v in bucket_durations.items() if v
+        },
+        "retry_storms": {
+            "failure_runs": len(runs),
+            "max_consecutive_failures": max(runs) if runs else 0,
+            "runs_ge_5": sum(1 for r in runs if r >= 5),
+            "runs_ge_20": sum(1 for r in runs if r >= 20),
+            "failures_in_runs_ge_5": sum(r for r in runs if r >= 5),
+        },
+        "top_usage_limit_messages": dict(sorted(reset_msgs.items(), key=lambda kv: -kv[1])[:5]),
+    }
+
+
+def extract_result_object_safe(f: Path) -> dict | None:
+    try:
+        return C.extract_result_object(f)
+    except Exception:
+        return None
+
+
 def metrics_summary(rows: list[dict]) -> dict:
     durations = [C.to_float(r.get("duration")) for r in rows if r.get("duration") is not None]
     successes = [bool(r.get("success")) for r in rows]
@@ -240,6 +349,11 @@ def main() -> int:
     ap.add_argument("--logs-dir", default=None)
     ap.add_argument("--out", default=None, help="output directory (default pipeline/data)")
     ap.add_argument("--limit", type=int, default=None, help="cap number of logs (debug)")
+    ap.add_argument(
+        "--classify-failures",
+        action="store_true",
+        help="root-cause the driver's 'execution failed' loops (reads each referenced .log)",
+    )
     args = ap.parse_args()
 
     repo = C.repo_root(args.repo_root)
@@ -250,6 +364,13 @@ def main() -> int:
     if not logs.exists():
         print(f"[telemetry] logs dir not found: {logs}", file=sys.stderr)
         return 1
+
+    if args.classify_failures:
+        cls = classify_failures(logs)
+        C.dump_json(cls, out / "failure_classification.json")
+        print(f"[telemetry] wrote {out / 'failure_classification.json'}")
+        print(json.dumps(cls, indent=2))
+        return 0
 
     rows, parse_failures, n_files = collect_loop_rows(logs, args.limit)
     print(f"[telemetry] parsed {len(rows)}/{n_files} loop logs ({parse_failures} unparseable)")

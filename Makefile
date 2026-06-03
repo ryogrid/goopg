@@ -43,7 +43,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff runtimeshim-matrix
+.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff runtimeshim-matrix
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -171,6 +171,17 @@ ralph-state-guard:
 		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json -fix; \
 		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json; \
 	fi
+
+# Loop-health metrics (kaizen T1): free pipeline pass over the loop history.
+# Prints success rate, cost, cache-read, status-block coverage, permission
+# denials, and the failure breakdown. Nobody was watching these while the
+# success rate sat at 29%. Read-only; no LLM.
+ralph-metrics:
+	@cd analysis/ralph-loop-kaizen/pipeline && \
+		python3 extract_telemetry.py --out data >/dev/null && \
+		python3 extract_telemetry.py --classify-failures --out data >/dev/null && \
+		python3 assemble_corpus.py --out data >/dev/null && \
+		python3 metrics_report.py
 
 # M0107-0008 per-Go-minor maintenance: verify //go:linkname targets in
 # internal/runtimeshim against every Go toolchain present in PATH (the

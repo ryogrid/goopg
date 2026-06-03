@@ -30,7 +30,9 @@ compact pack; an analyst (Claude) then writes the findings below.
 | [`04-rules-and-practices.md`](04-rules-and-practices.md) | Rule settings + **task-conditional practice loading** (the headline proposal). |
 | [`05-tooling.md`](05-tooling.md) | Tools to introduce or create (including the pipeline itself). |
 | [`06-roadmap.md`](06-roadmap.md) | Prioritized, ROI-ranked rollout + how to measure impact. |
+| [`07-implementation-status.md`](07-implementation-status.md) | **What was actually implemented (2026-06-04)**, what was skipped, and corrections implementation revealed. |
 | [`pipeline/`](pipeline/) | The reusable preprocessing toolchain (built; free stages run, LLM stage gated). |
+| [`practice-cards/`](practice-cards/) | The 7 task practice cards + `route.py` (wired) + `concurrency_guard.py`. |
 
 ## Scope and status
 

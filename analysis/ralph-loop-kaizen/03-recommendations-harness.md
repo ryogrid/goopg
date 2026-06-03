@@ -34,6 +34,14 @@ work — but that is a hypothesis, and confirming it is exactly what T2 below do
 
 ## H2. Shrink the always-on static context — **[TOKEN]**
 
+> **Correction (2026-06-04, from implementation — see [`07`](07-implementation-status.md)):**
+> the driver's `build_loop_context` injects only a *count* of remaining tasks and
+> caps the appended context at 500 chars — `fix_plan.md` content is **not**
+> auto-injected, and the dominant cache-read cost is accumulated tool-results
+> across turns, not the static prompt. So the fix_plan split below was **skipped**
+> (≈zero token value, real risk); the genuine lever is turn reduction (H7). The
+> rest of this section is retained for context but read it with that caveat.
+
 [`01 §3`](01-current-state.md): cache-read volume is 5.8M (p50) to 95M (p99)
 tokens/loop, billed every loop. The always-on instruction surface is PROMPT.md
 (~14 KB) + AGENT.md (~14 KB) ≈ 28 KB of fixed prose, plus the open-task slice of
