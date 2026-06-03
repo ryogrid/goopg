@@ -5455,4 +5455,10 @@ back to heap fetches even when the Visibility Map could allow a pure index scan.
 - Every non-trivial subsystem must land alongside (or just before) a design
   doc under `docs/design/`. The spec treats this as a hard requirement.    
 
-<!-- M0097-0151 progress added by loop 4 2026-06-03 -->
+<!-- M0097-0151/0152/0153 progress added by loop 4 2026-06-03 -->
+      - **Progress 2026-06-03 (M0097-0151 — procedure/function parity fixes, loop 4):**
+        Nine fixes: buildFunctionArguments mode-prefix logic (procedures show IN/OUT, functions only when OUT params); callOp.Open OUT-param placeholder skip + VARIADIC matching; execAlterFunction/execDropFunction/execDropProcedure error messages with arg types; ArgDefaults + ArgModes stored for functions; Routine.Signature() excludes OUT params; parser functions accept OUT/INOUT modes. create_procedure: 304→63. create_function_sql: 361→202.
+      - **Progress 2026-06-03 (M0097-0152 — array types + cast[] + keyword casing, loop 4 cont):**
+        Seven fixes: parser preserves [] in ::regtype[] cast (TargetType="regtype[]"); regtype[] handler handles KindInt single-element oidvectors; oidToBuiltinTypeName/typeNameToOIDStr gain array OIDs; IsArray in ArgTypes storage; canonicalTypeName handles arrays; tokenBodySQL uppercase SQL keywords. create_function_sql: 202→184.
+      - **Progress 2026-06-03 (M0097-0153 — SETOF FROM-clause + VOID fix, loop 4 cont):**
+        Five fixes: parser accepts user-defined name() in FROM (allowUserSRF flag); planner handles user SETOF functions via UserSrfScan; executor userSrfScanOp calls evalSQLFunctionSetof; VOID functions return NullDatum; oidvector single-element regtype[] fix. create_function_sql: 184→168. aggregates: 87→64 (side-effect).
