@@ -976,7 +976,7 @@ func (p *parser) tryParseParenJoin() (RangeVar, bool, error) {
 }
 
 func (p *parser) parseFromItem() (FromExpr, []RangeVar, error) {
-	base, err := p.parseRangeVar()
+	base, err := p.parseRangeVar(true)
 	if err != nil {
 		return FromExpr{}, nil, err
 	}
@@ -1046,7 +1046,7 @@ func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
 	// vacuumdb's use case where the lateral subquery doesn't depend on outer
 	// column values at goopg's execution level).
 	_ = p.acceptKeyword(KwLateral)
-	right, err := p.parseRangeVar()
+	right, err := p.parseRangeVar(true)
 	if err != nil {
 		return JoinExpr{}, false, err
 	}
@@ -1085,7 +1085,8 @@ func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
 	return JoinExpr{}, false, p.errAtCur("expected ON or USING in JOIN")
 }
 
-func (p *parser) parseRangeVar() (RangeVar, error) {
+func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
+	fromClause := len(allowUserSRF) > 0 && allowUserSRF[0]
 	// Accept optional LATERAL keyword before a derived table.
 	// LATERAL is silently consumed; goopg treats lateral subqueries as
 	// ordinary derived tables (no correlated-outer-reference evaluation).
@@ -1219,6 +1220,12 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 			"pg_get_publication_tables", "pg_available_wal_summaries",
 			"unnest", "generate_subscripts":
 			srfFuncName = lower
+		default:
+			// Accept any other name(args) in FROM as a potential user-defined SRF.
+			// Only do this in FROM clause context to avoid breaking INSERT INTO t (cols).
+			if fromClause {
+				srfFuncName = obj.Name
+			}
 		}
 	}
 	if srfFuncName != "" {

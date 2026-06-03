@@ -2859,6 +2859,45 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		return planGenerateSubscripts(rv, sourceIdx, lateralCtx)
 	}
 	if !strings.EqualFold(tf.Name, "generate_series") {
+		// Try user-defined SETOF functions from the Routines registry.
+		if rs := cat.Routines(); rs != nil {
+			cands := rs.LookupByName(parser.ObjectName{Name: tf.Name})
+			for _, r := range cands {
+				if r.ReturnsSet {
+					ctx := &resolveContext{}
+					resolvedArgs := make([]Expr, len(tf.Args))
+					for i, a := range tf.Args {
+						re, err := resolveExpr(a, ctx)
+						if err != nil {
+							return nil, rangeBinding{}, err
+						}
+						resolvedArgs[i] = re
+					}
+					alias := rv.Alias
+					if alias == "" {
+						alias = strings.ToLower(tf.Name)
+					}
+					colName := alias
+					if len(rv.Columns) > 0 {
+						colName = rv.Columns[0]
+					}
+					retType := r.ReturnType.Name
+					if retType == "" {
+						retType = "text"
+					}
+					tbl := &catalog.Table{
+						Name: alias,
+						Columns: []catalog.Column{
+							{Name: colName, Type: catalog.Type{Name: retType}, Ordinal: 0},
+						},
+					}
+					schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: retType}, SourceTableIdx: sourceIdx}}
+					node := &UserSrfScan{pos: tf.Pos(), Routine: r, Args: resolvedArgs, schema: schema}
+					b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+					return node, b, nil
+				}
+			}
+		}
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
 			Message: fmt.Sprintf("table-valued function %q not supported", tf.Name)}
 	}

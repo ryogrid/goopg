@@ -914,6 +914,18 @@ type GenerateSeries struct {
 	schema Schema
 }
 
+// UserSrfScan executes a user-defined SETOF SQL/plpgsql function in the FROM
+// clause and emits each returned value as one output row. M0097-0153.
+type UserSrfScan struct {
+	pos     int
+	Routine *catalog.Routine
+	Args    []Expr
+	schema  Schema
+}
+
+func (n *UserSrfScan) Pos() int       { return n.pos }
+func (n *UserSrfScan) Output() Schema { return n.schema }
+
 func (n *GenerateSeries) Pos() int       { return n.pos }
 func (n *GenerateSeries) Output() Schema { return n.schema }
 
