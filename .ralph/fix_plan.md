@@ -1902,7 +1902,7 @@ M0097-0001 wires it up.
         `ExprBinaryOp` evaluator cannot pre-evaluate the multi-column SubqueryExpr.
         Test: `TestRowEqSubqueryConstant`. `subselect` diff: 613 → 584 (−29).
 
-- [ ] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
+- [x] **M0097-0022 — Port function / PL/pgSQL / random regress tests**
       - Summary: Make these 10 tests reach `pass`:
         `plpgsql`, `create_function_sql`, `create_procedure`,
         `rangefuncs`, ~~`expressions`~~, `strings`, `regex`,
@@ -2050,6 +2050,21 @@ M0097-0001 wires it up.
             uses raw SeqScan rows (whose column indices match `SubCol.Index`) rather
             than the `SELECT 1` projected output (which only has 1 column).
         enum: 3 → 0 diffs → **PASS** (54 in CSV → 0).
+      - **COMPLETE 2026-06-04 (M0097-0022 loop 7 — create_function_sql 17→0, PASS):**
+        Seven coordinated changes closed all 17 remaining diffs:
+        (a) pg_get_functiondef INSERT body (2 lines): buildFunctionDef substitutes $N→param names
+            in BEGIN ATOMIC; normalizer accumulates INSERT lines in inBody mode.
+        (b) ALTER TABLE ALTER COLUMN TYPE (6 lines): parser + 4-phase heap rewrite executor;
+            catalog type update + truncate + re-insert with coercion. Tests added.
+        (c) Hash operator class dispatch (4 lines): routeToPartitionDepth calls user-registered
+            FUNCTION 2 (via executeStoredRoutine) for hash partitions; CONTEXT propagates.
+        (d) Schema tracking + DROP CASCADE (5 lines): execCreateTable sets tbl.Schema from
+            search_path for non-public schemas (skips temp tables, partition children);
+            TablesInSchema returns unqualified ObjectName; new opClassSchemas field;
+            DROP SCHEMA CASCADE includes op classes in cascade detail.
+        All 10 tests in M0097-0022 now PASS (create_function_sql, create_procedure, plpgsql,
+        rangefuncs, expressions, strings, regex, misc_functions, misc, random).
+        Design: docs/design/0097-0022-create-function-procedure-improvements.md (updated).
       - **Progress 2026-06-03 (M0097-0155 — DROP CASCADE dependency tracking, loop 6):**
         Seven coordinated changes (commit ed5a6fb3):
         (a) `extractRoutineDeps`: Only track body-level deps for `BeginAtomic=true` or

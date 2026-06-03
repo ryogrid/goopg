@@ -85,7 +85,7 @@ enum,3,failed
 name,3,failed
 index_including_gist,60,failed
 aggregates,64,failed
-create_function_sql,17,failed
+create_function_sql,0,pass
 create_table_like,116,failed
 join_hash,142,failed
 matview,148,failed
