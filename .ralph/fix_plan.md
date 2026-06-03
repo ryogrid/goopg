@@ -2712,6 +2712,28 @@ M0097-0001 wires it up.
         `insert_conflict`, `merge`.
       - Mapped to completed M0097-0016.
       - DoD: same as M0097-0020.
+      - **Progress 2026-06-04 (M0097-0028 — upsert partition crash fix, loop 8):**
+        Three coordinated fixes (commit eee4512e):
+        (a) `ATTACH PARTITION` now propagates parent unique/PK btree indexes to
+            the attached child partition (`operators_ddl.go`). Without this,
+            `upsertOp`'s arbiter probe always missed live rows on the leaf,
+            causing plain INSERT instead of ON CONFLICT DO UPDATE.
+        (b) `upsertOp.Next()` partition column remapping (`operators_upsert.go`):
+            When the leaf partition has a different column order from the parent
+            (e.g. `CREATE TABLE leaf (c int, a int, b text)` attached to a parent
+            with `(a int, b text, c int)`), the upsert path now:
+            - Uses parent-order row for arbiter key encoding
+            - Remaps conflict row from leaf → parent order before `evalUpdate`
+            - Remaps `evalUpdate` result (parent order) → leaf order for heap write
+            Previously caused a server panic or silently wrong column values.
+        (c) `partitionColOrderMatches` helper: cheap fast-path for same-order
+            partitions to skip remapping overhead.
+        Also: removed "on relation X" suffix from "no unique or exclusion
+        constraint" planner error — PostgreSQL 18 omits it.
+        `insert_conflict` regress: 201 → 179 diff lines.
+        Remaining blockers: REFERENCING NEW TABLE AS in triggers (missing NOTICE),
+        subquery correlated DO UPDATE patterns, excluded.col references, schema
+        qualified columns in DO UPDATE, row-expression predicates in WHERE clause.
 
 - [x] **M0097-0029 — Port extended-type / dbsize regress tests**
       - Summary: Make these 22 tests reach `pass`:
