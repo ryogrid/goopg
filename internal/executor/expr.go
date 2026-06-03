@@ -9392,6 +9392,15 @@ func buildFunctionDef(r *catalog.Routine) string {
 	// Body
 	body := r.Body
 	if r.BeginAtomic {
+		// Substitute $N positional parameter references with named parameters
+		// to match PG's decompiled output format.
+		if len(r.ArgNames) > 0 {
+			for i, name := range r.ArgNames {
+				if name != "" {
+					body = strings.ReplaceAll(body, fmt.Sprintf("$%d", i+1), name)
+				}
+			}
+		}
 		// SQL-standard BEGIN ATOMIC ... END body
 		sb.WriteString("BEGIN ATOMIC\n")
 		// Each statement in the body on its own line with leading space

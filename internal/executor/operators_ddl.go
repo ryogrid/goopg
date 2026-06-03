@@ -550,6 +550,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	// If the table was created without an explicit schema qualifier, record the
+	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
+	// Temp tables are session-scoped and not schema-tracked. M0097-0022.
+	if s.Name.Schema == "" && !s.Temporary {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			tbl.Schema = ws
+		}
+	}
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -714,6 +722,14 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	// If the table was created without an explicit schema qualifier, record the
+	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
+	// M0097-0022.
+	if s.Name.Schema == "" {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			tbl.Schema = ws
+		}
+	}
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
 	}
@@ -770,6 +786,14 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// If the table was created without an explicit schema qualifier, record the
+	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
+	// M0097-0022.
+	if s.Name.Schema == "" {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			tbl.Schema = ws
+		}
 	}
 	// Set partition metadata on the child.
 	tbl.PartitionParentOID = parent.OID
@@ -1803,6 +1827,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// NO INHERIT parent_table — no-op in v0; just accept the syntax.
 		case parser.AlterTableAlterColumnSet:
 			// SET (options) on a column of a heap table: no-op in goopg v0.
+		case parser.AlterTableAlterColumnType:
+			if err := o.execAlterColumnType(tbl, act); err != nil {
+				return err
+			}
 		default:
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE action is not supported in v0"}
 		}
@@ -4555,6 +4583,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				}
 				// Collect views in the schema.
 				var droppedViews []string
+				var droppedOpClasses []string
 				if im2, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
 					for _, v := range im2.AllUserViews() {
 						if strings.EqualFold(v.Schema, schemaName) {
@@ -4566,6 +4595,8 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						dropped := map[string]bool{}
 						_ = o.execDropOneView(parser.ObjectName{Schema: schemaName, Name: vn}, true, parser.DropCascade, s.Pos(), dropped)
 					}
+					// Collect operator classes in the schema. M0097-0022.
+					droppedOpClasses = im2.OpClassesInSchema(schemaName)
 				}
 				// Sort table names for deterministic DETAIL output.
 				sort.Slice(tables, func(i, j int) bool {
@@ -4577,12 +4608,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 					}
 				}
-				// Emit NOTICE with total cascade count (tables + views + routines).
-				total := len(tables) + len(droppedViews) + len(droppedRoutines)
+				// Emit NOTICE with total cascade count (tables + views + routines + op classes).
+				total := len(tables) + len(droppedViews) + len(droppedRoutines) + len(droppedOpClasses)
 				if total > 0 {
 					var detailLines []string
 					for _, funcName := range droppedRoutines {
 						detailLines = append(detailLines, fmt.Sprintf("drop cascades to function %s", funcName))
+					}
+					for _, opClass := range droppedOpClasses {
+						detailLines = append(detailLines, fmt.Sprintf("drop cascades to operator family %s for access method hash", opClass))
 					}
 					for _, tbl := range tables {
 						detailLines = append(detailLines, fmt.Sprintf("drop cascades to table %s", tbl.String()))
@@ -5216,14 +5250,19 @@ func (o *ddlOp) execAlterAggregateRename(s *parser.AlterAggregateRenameStmt) err
 // operator class. Only the FUNCTION 2 entry is used; everything else is
 // silently accepted. M0097-0027.
 func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
-	if s.HashFuncName == "" {
-		return nil // no hash support function — nothing to register
-	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
 	}
-	im.RegisterOpClassHashFunc(s.Name, s.HashFuncName)
+	if s.HashFuncName != "" {
+		im.RegisterOpClassHashFunc(s.Name, s.HashFuncName)
+	}
+	// Track the schema for DROP SCHEMA CASCADE detail output. M0097-0022.
+	schema := currentWritableSchema(o.ctx)
+	if schema == "" {
+		schema = "public"
+	}
+	im.RegisterOpClassSchema(s.Name, schema)
 	return nil
 }
 
@@ -5476,6 +5515,131 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 
 // execLockTable handles LOCK [TABLE] rel [, ...] [IN mode MODE] [NOWAIT].
 // It records the held locks in globalRelLockMgr so they appear in pg_locks.
+// execAlterColumnType implements `ALTER TABLE t ALTER COLUMN col TYPE newtype`.
+// It updates the column type in the catalog and, when storage is available,
+// rewrites existing heap rows to re-encode the column value in the new type.
+// M0097-0022.
+func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAction) error {
+	colIdx := -1
+	for i, col := range tbl.Columns {
+		if strings.EqualFold(col.Name, act.ColumnName) {
+			colIdx = i
+			break
+		}
+	}
+	if colIdx < 0 {
+		return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+	}
+
+	oldCatalogType := tbl.Columns[colIdx].Type
+	newCatalogType := catalog.Type{Name: strings.ToLower(act.NewType.Name), Args: append([]int64(nil), act.NewType.Args...)}
+
+	// No-op when the type name is unchanged.
+	if strings.EqualFold(oldCatalogType.Name, newCatalogType.Name) {
+		return nil
+	}
+
+	// If no storage pool is available, just update the catalog type.
+	if o.ctx.Pool == nil {
+		tbl.Columns[colIdx].Type = newCatalogType
+		return nil
+	}
+
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	nBlocks, err := o.ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: err.Error()}
+	}
+
+	// If the table is empty, just update the catalog — nothing to rewrite.
+	if nBlocks == 0 {
+		tbl.Columns[colIdx].Type = newCatalogType
+		return nil
+	}
+
+	// Phase 1: read all visible rows using the OLD column schema.
+	// Build a copy of the columns slice with the old type for decoding.
+	oldCols := make([]catalog.Column, len(tbl.Columns))
+	copy(oldCols, tbl.Columns)
+	// oldCols[colIdx] already has the old type.
+
+	var allRows []Row
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		bufSlot, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if perr != nil {
+			continue
+		}
+		bufSlot.RLock()
+		page := bufSlot.Page()
+		if storage.IsNew(page) {
+			bufSlot.RUnlock()
+			o.ctx.Pool.Unpin(bufSlot)
+			continue
+		}
+		count, cerr := storage.PageLinePointerCount(page)
+		if cerr != nil {
+			bufSlot.RUnlock()
+			o.ctx.Pool.Unpin(bufSlot)
+			continue
+		}
+		for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
+			tuple, terr := storage.PageGetHeapTuple(page, slotIdx)
+			if terr != nil {
+				continue
+			}
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+				continue
+			}
+			row := acquireRow(len(oldCols))
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			if decErr := DecodeRowIntoMctxPGTuple(row, oldCols, tuple.Data, tuple.Bitmap, storedNatts, nil); decErr != nil {
+				continue
+			}
+			// Convert the changed column to the new type.
+			if colIdx < len(row) {
+				if converted, cErr := evalCast(row[colIdx], newCatalogType.Name, act.Pos()); cErr == nil {
+					row[colIdx] = converted
+				}
+			}
+			// Deep-copy the row so arena-backed string Datums survive
+			// beyond the page pin (cloneRowOwned allocates fresh backing).
+			allRows = append(allRows, cloneRowOwned(row))
+			releaseRow(row)
+		}
+		bufSlot.RUnlock()
+		o.ctx.Pool.Unpin(bufSlot)
+	}
+
+	// Phase 2: update the catalog column type.
+	tbl.Columns[colIdx].Type = newCatalogType
+
+	// Phase 3: truncate the heap and all indexes.
+	o.ctx.Pool.InvalidateRel(rel)
+	if terr := o.ctx.Pool.Manager().TruncateRelation(rel); terr != nil {
+		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: terr.Error()}
+	}
+	if o.ctx.FSM != nil {
+		o.ctx.FSM.DropRelation(rel)
+	}
+	if o.ctx.VM != nil {
+		o.ctx.VM.DropRelation(rel)
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+		o.ctx.Pool.InvalidateRel(idxRel)
+		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
+		_, _ = btree.Create(o.ctx.Pool, idxRel)
+	}
+
+	// Phase 4: re-insert all rows with the new encoding.
+	for _, row := range allRows {
+		if werr := writeHeapRow(o.ctx, rel, tbl.Columns, row); werr != nil {
+			return werr
+		}
+	}
+	return nil
+}
+
 // PostgreSQL transitively locks all relations that a view depends on, so
 // locking a view also locks its underlying tables/views recursively. M0097.
 // The locks are released when the session's transaction ends (execCommit/execRollback).

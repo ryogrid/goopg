@@ -347,7 +347,11 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			insertRel := rel
 			if len(tbl.PartitionKey) > 0 {
 				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-					if part := routeToPartition(tbl, row, im); part != nil {
+					part, partErr := routeToPartition(tbl, row, im, o.ctx)
+					if partErr != nil {
+						return nil, partErr
+					}
+					if part != nil {
 						insertTbl = part
 						insertRel = o.ctx.Catalog.RelFileNode(part)
 						row = remapRowForPartition(tbl.Columns, part.Columns, row)

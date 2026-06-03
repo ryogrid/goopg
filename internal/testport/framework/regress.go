@@ -924,10 +924,11 @@ func normalizePgGetFunctiondefBody(lines []string) []string {
 	}
 	// Strip column list from INSERT INTO tbl (col, ...) VALUES → INSERT INTO tbl VALUES
 	stripInsertColList := func(s string) string {
-		// Match: INSERT INTO <tbl> (<cols>) VALUES
+		// Match: INSERT INTO <tbl> (<cols>) VALUES or INSERT INTO <tbl> (<cols>) SELECT
 		upper := strings.ToUpper(s)
 		valIdx := strings.Index(upper, " VALUES")
-		if valIdx < 0 {
+		selIdx := strings.Index(upper, " SELECT ")
+		if valIdx < 0 && selIdx < 0 {
 			return s
 		}
 		intoIdx := strings.Index(upper, "INTO ")
@@ -1059,11 +1060,17 @@ func normalizePgGetFunctiondefBody(lines []string) []string {
 			s = indent + prefix + rest
 			break
 		}
-		// Normalize INSERT ... SELECT: strip column list and function qualifiers.
+		// Normalize INSERT statements: strip column list and function qualifiers.
 		upperS := strings.ToUpper(strings.TrimSpace(s))
 		if strings.HasPrefix(upperS, "INSERT") && strings.Contains(upperS, " SELECT ") {
+			// INSERT ... SELECT: strip col list + strip schema qualifiers in SELECT clause.
 			s = stripInsertColList(s)
 			s = stripSelectQualifier(s)
+			s = compactParens(s)
+		} else if strings.HasPrefix(upperS, "INSERT") && strings.Contains(upperS, " VALUES") {
+			// INSERT ... VALUES: strip col list + strip proc/func qualifiers in VALUES.
+			s = stripInsertColList(s)
+			s = stripFuncQualifier(s)
 			s = compactParens(s)
 		}
 		return s
@@ -1114,7 +1121,7 @@ func normalizePgGetFunctiondefBody(lines []string) []string {
 		}
 
 		// Inside body: accumulate until `;` found.
-		if inBody && (strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "RETURN") || len(pendingBodyLines) > 0) {
+		if inBody && (strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "RETURN") || strings.HasPrefix(upper, "INSERT") || len(pendingBodyLines) > 0) {
 			pendingBodyLines = append(pendingBodyLines, trimmed)
 			if strings.Contains(trimmed, ";") {
 				// Statement complete — merge, normalize, emit.

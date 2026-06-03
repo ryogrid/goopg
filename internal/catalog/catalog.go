@@ -419,6 +419,10 @@ type InMemory struct {
 	// satisfies_hash_partition. M0097-0027.
 	opClassHashFuncs map[string]string
 
+	// opClassSchemas maps operator class name → schema (for DROP SCHEMA CASCADE).
+	// M0097-0022.
+	opClassSchemas map[string]string
+
 	// userAggregates maps lower-case aggregate name → UserAggregate for
 	// user-defined aggregates registered via CREATE AGGREGATE.
 	userAggregates map[string]*UserAggregate
@@ -547,6 +551,7 @@ func NewInMemory() *InMemory {
 		compositeTypeFields: make(map[string][]CompositeField),
 		constraintViewDeps:  make(map[string][]string),
 		opClassHashFuncs:    make(map[string]string),
+		opClassSchemas:      make(map[string]string),
 		userAggregates: make(map[string]*UserAggregate),
 		schemas: map[string]uint32{
 			"pg_catalog":         11,
@@ -870,6 +875,34 @@ func (c *InMemory) FindHashPartitionForValue(parentOID uint32, keyValue string) 
 	return defaultPart // fall back to DEFAULT partition
 }
 
+// FindHashPartitionByHash returns the partition whose modulus/remainder matches
+// the given pre-computed hash value. Used when a user-defined operator class
+// provides the hash function. M0097-0022.
+func (c *InMemory) FindHashPartitionByHash(parentOID uint32, h uint64) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var defaultPart *Table
+	for _, childOID := range c.partitionChildren[parentOID] {
+		for _, t := range c.tables {
+			if t.OID != childOID {
+				continue
+			}
+			for _, pb := range t.PartitionBounds {
+				if pb.IsDefault {
+					defaultPart = t
+					continue
+				}
+				if pb.IsHash && pb.Modulus > 0 {
+					if int64(h%uint64(pb.Modulus)) == pb.Remainder {
+						return t
+					}
+				}
+			}
+		}
+	}
+	return defaultPart
+}
+
 // HasDatabase reports whether the given database name is registered
 // in the catalog. Used by the connection startup path to validate
 // the requested database parameter.
@@ -1044,6 +1077,30 @@ func (c *InMemory) LookupOpClassHashFunc(opClassName string) (string, bool) {
 	defer c.mu.RUnlock()
 	v, ok := c.opClassHashFuncs[opClassName]
 	return v, ok
+}
+
+// RegisterOpClassSchema records the schema of an operator class.
+// Used for DROP SCHEMA CASCADE detail output. M0097-0022.
+func (c *InMemory) RegisterOpClassSchema(opClassName, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.opClassSchemas[opClassName] = schema
+}
+
+// OpClassesInSchema returns the names of operator classes in the given schema,
+// sorted alphabetically. Used for DROP SCHEMA CASCADE detail output. M0097-0022.
+func (c *InMemory) OpClassesInSchema(schemaName string) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	schemaLC := strings.ToLower(schemaName)
+	var out []string
+	for name, schema := range c.opClassSchemas {
+		if strings.ToLower(schema) == schemaLC {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // advanceNextOIDLocked nudges nextOID past `oid` so subsequent
@@ -2938,16 +2995,28 @@ func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
 	defer c.mu.RUnlock()
 	schemaLC := strings.ToLower(schemaName)
 	var out []parser.ObjectName
-	for _, t := range c.tables {
+	for k, t := range c.tables {
 		if t.Virtual {
 			continue // skip system/virtual tables
+		}
+		// Partition children are dropped implicitly when their parent is dropped;
+		// skip them from the direct schema-level cascade list.
+		if len(t.PartitionBounds) > 0 {
+			continue
 		}
 		tSchema := t.Schema
 		if tSchema == "" {
 			tSchema = "public"
 		}
 		if strings.ToLower(tSchema) == schemaLC {
-			out = append(out, parser.ObjectName{Schema: t.Schema, Name: t.Name})
+			// Return ObjectName matching the actual catalog key. Tables stored
+			// under an unqualified key (no schema prefix) must be returned
+			// without schema so DropTable and detail lines use the same key.
+			if k == strings.ToLower(t.Name) {
+				out = append(out, parser.ObjectName{Name: t.Name})
+			} else {
+				out = append(out, parser.ObjectName{Schema: t.Schema, Name: t.Name})
+			}
 		}
 	}
 	return out

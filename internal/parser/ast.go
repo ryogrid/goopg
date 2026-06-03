@@ -1343,6 +1343,10 @@ const (
 	// For heap tables this is a no-op in goopg v0; for indexes it raises
 	// an appropriate error (M0097-0023 btree_index parity).
 	AlterTableAlterColumnSet
+	// AlterTableAlterColumnType — `ALTER COLUMN name TYPE newtype`.
+	// Changes the column type in the catalog and rewrites existing heap rows
+	// to re-encode them with the new type. M0097-0022.
+	AlterTableAlterColumnType
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1382,6 +1386,13 @@ type AlterTableAction struct {
 
 	// CheckExpr is the raw SQL expression for AlterTableAddCheck.
 	CheckExpr string
+
+	// NewType is the target column type for AlterTableAlterColumnType.
+	// M0097-0022.
+	NewType ColumnType
+	// ColumnName is the column being modified for AlterTableAlterColumnType.
+	// M0097-0022.
+	ColumnName string
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

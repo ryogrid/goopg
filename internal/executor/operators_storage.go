@@ -1098,7 +1098,11 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		var routedPart *catalog.Table
 		if isPartitioned {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				routedPart = routeToPartition(o.plan.Table, row, im)
+				var routeErr error
+				routedPart, routeErr = routeToPartition(o.plan.Table, row, im, o.ctx)
+				if routeErr != nil {
+					return nil, routeErr
+				}
 			}
 		}
 
@@ -1225,15 +1229,15 @@ func remapRowForPartition(parentCols, childCols []catalog.Column, row Row) Row {
 
 // based on the parent's partition key. Returns nil if no partition matches.
 // M0096-0007.
-func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory) *catalog.Table {
-	return routeToPartitionDepth(parent, row, im, 0)
+func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory, ctx *Context) (*catalog.Table, error) {
+	return routeToPartitionDepth(parent, row, im, ctx, 0)
 }
 
 // routeToPartitionDepth recurses through nested partition hierarchies. The
 // depth guard (max 8) prevents infinite loops on circular catalog states.
-func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory, depth int) *catalog.Table {
+func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory, ctx *Context, depth int) (*catalog.Table, error) {
 	if len(parent.PartitionKey) == 0 || depth > 8 {
-		return nil
+		return nil, nil
 	}
 	// Find the column index for the first partition key (used by LIST/HASH).
 	keyColName := parent.PartitionKey[0]
@@ -1245,7 +1249,7 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 		}
 	}
 	if keyIdx < 0 || keyIdx >= len(row) {
-		return nil
+		return nil, nil
 	}
 	keyDatum := row[keyIdx]
 
@@ -1275,7 +1279,7 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 				}
 			}
 			if kidx < 0 || kidx >= len(row) {
-				return nil
+				return nil, nil
 			}
 			d := row[kidx]
 			switch d.Kind {
@@ -1295,29 +1299,65 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 		}
 		child = im.FindRangePartitionForDatums(parent.OID, keyStrs)
 	case "HASH":
-		// Use string representation of key for hash. M0097-0015.
-		keyStr := ""
-		if keyDatum.Kind == KindInt {
-			keyStr = fmt.Sprintf("%d", keyDatum.Int)
-		} else if keyDatum.Kind == KindString {
-			keyStr = keyDatum.StringValue()
-		} else {
-			keyStr = keyDatum.Format()
+		opClass := ""
+		if len(parent.PartitionKeyOpClasses) > 0 {
+			opClass = parent.PartitionKeyOpClasses[0]
 		}
-		child = im.FindHashPartitionForValue(parent.OID, keyStr)
+		if opClass != "" && ctx != nil {
+			// Use custom operator class hash function (FUNCTION 2). M0097-0022.
+			hashFuncName, hasFn := im.LookupOpClassHashFunc(opClass)
+			if hasFn {
+				routines := ctx.Catalog.Routines()
+				if routines != nil {
+					rs := routines.LookupByName(parser.ObjectName{Name: hashFuncName})
+					var bestRoutine *catalog.Routine
+					for _, r := range rs {
+						if len(r.ArgTypes) == 2 {
+							bestRoutine = r
+							break
+						}
+					}
+					if bestRoutine != nil {
+						seedDatum := NewIntDatum(int64(hashPartitionSeed))
+						hResult, herr := executeStoredRoutine(bestRoutine, []Datum{keyDatum, seedDatum}, ctx, 0)
+						if herr != nil {
+							return nil, herr
+						}
+						if !hResult.IsNull() {
+							h := uint64(hResult.Int)
+							child = im.FindHashPartitionByHash(parent.OID, h)
+						}
+					}
+				}
+			}
+		}
+		if child == nil && opClass == "" {
+			// Default built-in hash: use string representation of key. M0097-0015.
+			keyStr := ""
+			if keyDatum.Kind == KindInt {
+				keyStr = fmt.Sprintf("%d", keyDatum.Int)
+			} else if keyDatum.Kind == KindString {
+				keyStr = keyDatum.StringValue()
+			} else {
+				keyStr = keyDatum.Format()
+			}
+			child = im.FindHashPartitionForValue(parent.OID, keyStr)
+		}
 	}
 	if child == nil {
-		return nil
+		return nil, nil
 	}
 	// Recurse into nested partitions (multi-level partition hierarchies).
 	// The child row may need to be remapped to the child's column order first.
 	if len(child.PartitionKey) > 0 {
 		childRow := remapRowForPartition(parent.Columns, child.Columns, row)
-		if nested := routeToPartitionDepth(child, childRow, im, depth+1); nested != nil {
-			return nested
+		if nested, err := routeToPartitionDepth(child, childRow, im, ctx, depth+1); err != nil {
+			return nil, err
+		} else if nested != nil {
+			return nested, nil
 		}
 	}
-	return child
+	return child, nil
 }
 
 // extractScanAndPredicate walks an Update/Delete child plan and pulls
@@ -2082,7 +2122,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				var destPartIdx *catalog.Table
 				isCrossPartitionMoveIdx := false
 				if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(idxTbl.PartitionKey) > 0 {
-					if dp := routeToPartition(idxTbl, pu.newRow, imW); dp != nil {
+					dp, dpErr := routeToPartition(idxTbl, pu.newRow, imW, o.ctx)
+					if dpErr != nil {
+						return nil, dpErr
+					}
+					if dp != nil {
 						dpRel := o.ctx.Catalog.RelFileNode(dp)
 						if dpRel != rel {
 							isCrossPartitionMoveIdx = true
@@ -2465,7 +2509,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				var destPart *catalog.Table
 				isCrossPartitionMove := false
 				if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(tbl.PartitionKey) > 0 {
-					destPart = routeToPartition(tbl, pu.newRow, imW)
+					var routeErr error
+					destPart, routeErr = routeToPartition(tbl, pu.newRow, imW, o.ctx)
+					if routeErr != nil {
+						return nil, routeErr
+					}
 					if destPart != nil {
 						destRel := o.ctx.Catalog.RelFileNode(destPart)
 						if destRel != puRel {

@@ -314,7 +314,10 @@ func (o *upsertOp) routeAndOpenLeaf(inserted Row) (*catalog.Table, *btree.BTree,
 	if !ok {
 		return nil, nil, nil
 	}
-	leaf := routeToPartition(o.plan.Table, inserted, im)
+	leaf, leafErr := routeToPartition(o.plan.Table, inserted, im, o.ctx)
+	if leafErr != nil {
+		return nil, nil, leafErr
+	}
 	if leaf == nil {
 		return nil, nil, nil
 	}

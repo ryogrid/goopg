@@ -3429,13 +3429,15 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// ALTER COLUMN — handle SET (options) specially; consume other forms as no-op.
+	// ALTER COLUMN — handle SET (options) and TYPE specially; consume other forms as no-op.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter {
 		p.advance() // consume ALTER
 		// Skip COLUMN keyword if present.
 		_ = p.acceptKeyword(KwColumn)
 		// Read the column name.
-		if p.cur().Kind == TokenIdent {
+		colName := ""
+		if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent {
+			colName = p.cur().Value
 			p.advance()
 		}
 		// Check for SET (options) pattern.
@@ -3458,6 +3460,21 @@ func (p *parser) parseAlter() (Stmt, error) {
 				})
 				return stmt, nil
 			}
+		}
+		// Check for TYPE newtype pattern.
+		// "type" is not in goopg's keyword map — arrives as TokenIdent.
+		if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "type") {
+			p.advance() // consume TYPE
+			newType, err := p.parseColumnType()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				Kind:       AlterTableAlterColumnType,
+				ColumnName: colName,
+				NewType:    newType,
+			})
+			return stmt, nil
 		}
 		// Other ALTER COLUMN forms: consume rest as no-op.
 		for p.cur().Kind != TokenEOF {
