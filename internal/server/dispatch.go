@@ -236,6 +236,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.PendingEnumValues = connTx.PendingEnumValues
 		ectx.PendingEnumRenames = connTx.PendingEnumRenames
 		ectx.PendingCreatedEnums = connTx.PendingCreatedEnums
+		// Wire session-authorization role tracking so LEAKPROOF privilege checks
+		// work after SET SESSION AUTHORIZATION regress_unpriv_user.
+		ectx.NonSuperuserRole = connTx.NonSuperuserRole
+		ectx.SetSessionAuthorization = func(role string) {
+			connTx.NonSuperuserRole = role
+			ectx.NonSuperuserRole = role
+		}
 		// Wire per-connection sequence session state (currval/lastval) so
 		// values persist across statements within the same connection. M0097-0042.
 		if connTx.SeqCurrVals != nil {

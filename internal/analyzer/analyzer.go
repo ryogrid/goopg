@@ -2418,6 +2418,10 @@ func isExactNumericTextTarget(name string) bool {
 	return false
 }
 
+// PGDisplayTypeName is the exported form of pgDisplayTypeName, for use by
+// callers outside the analyzer package (e.g. function body validation).
+func PGDisplayTypeName(name string) string { return pgDisplayTypeName(name) }
+
 // pgDisplayTypeName converts internal type names to the PG-compatible
 // display form used in error messages (e.g. "int8" → "integer"). M0097-0063.
 func pgDisplayTypeName(name string) string {

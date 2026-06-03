@@ -51,6 +51,31 @@ type Routine struct {
 	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
 	IsReturnForm    bool   // PG14 RETURN expr body (stored as "SELECT expr" internally)
 	KindChar        string // prokind: 'f'=function, 'p'=procedure, 'w'=window, 'a'=aggregate
+
+	// Dependency tracking populated at CREATE FUNCTION time for information_schema views.
+	SequenceDeps    []RoutineSeqDep   // sequences referenced via nextval/currval
+	RoutineCallOIDs []uint32          // OIDs of routines called in body/defaults
+	TableDeps       []RoutineTableRef // tables referenced in FROM clauses
+	ColumnDeps      []RoutineColRef   // columns referenced in SELECT/WHERE clauses
+}
+
+// RoutineSeqDep records a sequence dependency of a routine.
+type RoutineSeqDep struct {
+	Schema string
+	Name   string
+}
+
+// RoutineTableRef records a table/view dependency of a routine.
+type RoutineTableRef struct {
+	Schema string
+	Name   string
+}
+
+// RoutineColRef records a column dependency of a routine.
+type RoutineColRef struct {
+	TableSchema string
+	TableName   string
+	ColumnName  string
 }
 
 // QualifiedName returns the upstream-style schema-qualified routine

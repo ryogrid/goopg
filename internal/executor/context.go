@@ -314,6 +314,18 @@ type Context struct {
 	// statement rows (name, statement, parameter_types, result_types).
 	// Wired by the server from the per-connection preparedStatements store.
 	PrepStmtsRows func() [][]string
+
+	// NonSuperuserRole, when non-empty, means the session is currently running
+	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
+	// checks that require superuser (e.g. LEAKPROOF function attribute) must
+	// reject when this is set.
+	NonSuperuserRole string
+
+	// SetSessionAuthorization, when non-nil, updates the per-connection
+	// NonSuperuserRole when SET SESSION AUTHORIZATION is executed via the
+	// parser path (multi-statement batches). The caller (operators_utility_settings)
+	// passes the role name or "" to restore superuser status.
+	SetSessionAuthorization func(role string)
 }
 
 // SettingValue is one effective session setting exposed to SHOW ALL.

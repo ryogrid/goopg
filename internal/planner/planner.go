@@ -7009,6 +7009,11 @@ func exprType(e Expr) catalog.Type {
 		// buildAggregateCall) on the AggregateCall path, but free
 		// FuncCalls reach here with no type carried. Match the
 		// known-typed builtins; everything else stays unknown.
+		// If ReturnType was populated at plan time (e.g. for user-defined
+		// functions), use it directly so psql receives the correct OID.
+		if x.ReturnType != "" {
+			return catalog.Type{Name: x.ReturnType}
+		}
 		switch strings.ToLower(x.Name) {
 		// Type-cast functions: single-arg calls like float8(expr) act as explicit casts.
 		// Return the target type so downstream type inference (BinaryOp, wire) is correct.
@@ -7852,7 +7857,27 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				break
 			}
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp}, nil
+		returnType := ""
+		if ctx.cat != nil {
+			if rs := ctx.cat.Routines(); rs != nil {
+				cands := rs.LookupByName(x.Name)
+				if len(cands) == 1 {
+					returnType = cands[0].ReturnType.Name
+				} else if len(cands) > 1 {
+					allSame := true
+					for _, c := range cands[1:] {
+						if c.ReturnType.Name != cands[0].ReturnType.Name {
+							allSame = false
+							break
+						}
+					}
+					if allSame {
+						returnType = cands[0].ReturnType.Name
+					}
+				}
+			}
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp, ReturnType: returnType}, nil
 	case *parser.StarExpr:
 		return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
 	case *parser.CastExpr:

@@ -896,6 +896,45 @@ func defaultExprToSQL(e parser.Expr) string {
 			return "true"
 		}
 		return "false"
+	case *parser.ColumnRef:
+		if v.Table != "" {
+			return v.Table + "." + v.Column
+		}
+		return v.Column
+	case *parser.FuncCall:
+		var args []string
+		for _, a := range v.Args {
+			args = append(args, defaultExprToSQL(a))
+		}
+		name := v.Name.Name
+		if v.Name.Schema != "" {
+			name = v.Name.Schema + "." + name
+		}
+		return name + "(" + strings.Join(args, ", ") + ")"
+	case *parser.CastExpr:
+		return defaultExprToSQL(v.Operand) + "::" + v.Type.Name
+	case *parser.UnaryOp:
+		switch v.Op {
+		case parser.OpSub:
+			return "-" + defaultExprToSQL(v.Operand)
+		case parser.OpNot:
+			return "NOT " + defaultExprToSQL(v.Operand)
+		}
+	case *parser.BinaryOp:
+		left := defaultExprToSQL(v.Left)
+		right := defaultExprToSQL(v.Right)
+		switch v.Op {
+		case parser.OpAdd:
+			return left + " + " + right
+		case parser.OpSub:
+			return left + " - " + right
+		case parser.OpMul:
+			return left + " * " + right
+		case parser.OpDiv:
+			return left + " / " + right
+		}
+	case *parser.TypedStringLit:
+		return v.Type + " '" + strings.ReplaceAll(v.Value, "'", "''") + "'"
 	}
 	return fmt.Sprintf("%v", e)
 }
@@ -1217,11 +1256,39 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				}
 			}
 		}
+		// CASCADE: drop views that directly reference this table (like PG's pg_depend cascade).
+		if s.Behavior == parser.DropCascade {
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				for _, viewName := range viewsDependingOnTable(im, name) {
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to view %s", viewName.String()))
+					dropped := map[string]bool{}
+					if err := o.execDropOneView(viewName, true, parser.DropCascade, s.Pos(), dropped); err != nil {
+						return err
+					}
+				}
+			}
+		}
 		if err := o.dropTableByRef(name, tbl); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// viewsDependingOnTable returns the names of views that directly reference tableName
+// in their FROM clause. Used by DROP TABLE CASCADE to cascade drops.
+func viewsDependingOnTable(im *catalog.InMemory, tableName parser.ObjectName) []parser.ObjectName {
+	var deps []parser.ObjectName
+	tblLower := strings.ToLower(tableName.Name)
+	for _, tbl := range im.AllUserViews() {
+		if tbl.View == nil {
+			continue
+		}
+		if selectRefsViewName(tbl.View, tblLower) {
+			deps = append(deps, parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name})
+		}
+	}
+	return deps
 }
 
 // dropTableByRef drops a single table by its catalog.Table reference.
@@ -2643,6 +2710,10 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	if schema == "" {
 		schema = currentWritableSchema(o.ctx)
 	}
+	// Only superusers may define a leakproof function.
+	if s.Leakproof && o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: "only superuser can define a leakproof function"}
+	}
 	// Validate SQL function body when check_function_bodies=on (default).
 	if lang == "sql" && !s.BeginAtomic {
 		if err := o.validateSQLFunctionBody(s, len(s.Args)); err != nil {
@@ -2670,6 +2741,10 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		Volatile:        volatile,
 		SecurityDefiner: s.SecurityDefiner,
 		Leakproof:       s.Leakproof,
+	}
+	// Extract dependency information for information_schema views (SQL functions only).
+	if lang == "sql" {
+		extractRoutineDeps(r.Body, r.ArgDefaults, schema, r, o.ctx.Catalog)
 	}
 	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
@@ -2800,6 +2875,12 @@ func (o *ddlOp) validateSQLFunctionBody(s *parser.CreateFunctionStmt, nArgs int)
 		if err := validateParamRefs(stmt, nArgs, funcName); err != nil {
 			return err
 		}
+	}
+
+	// Check for unsupported operator combinations (e.g. date > integer).
+	// This catches cases like RETURN x > 1 where x is a date parameter.
+	if err := checkBodyOperatorTypes(stmts, s.Args, funcName, s.Pos()); err != nil {
+		return err
 	}
 
 	// Check that the final statement is a SELECT (or DML RETURNING).
@@ -2946,6 +3027,171 @@ func validateParamRefs(stmt parser.Stmt, nArgs int, funcName string) error {
 	return walkStmt(stmt)
 }
 
+// checkBodyOperatorTypes walks the function body statements and checks for
+// operator combinations that PostgreSQL rejects with "operator does not exist"
+// (SQLSTATE 42883). The primary case is date/time types compared against
+// numeric types (e.g. "date > integer" has no such operator in PG).
+// Parameter names are resolved from args; positional $N references use arg index.
+func checkBodyOperatorTypes(stmts []parser.Stmt, args []parser.FunctionArg, funcName string, pos int) error {
+	// Build a map: lowercase param name → canonical type name.
+	paramType := make(map[string]string, len(args))
+	for _, a := range args {
+		if a.Name != "" {
+			paramType[strings.ToLower(a.Name)] = strings.ToLower(a.Type.Name)
+		}
+	}
+
+	// Resolve an expression to its pg-display type name for operator checking.
+	// Returns "" if the type cannot be statically determined.
+	var resolveType func(e parser.Expr) string
+	resolveType = func(e parser.Expr) string {
+		if e == nil {
+			return ""
+		}
+		switch n := e.(type) {
+		case *parser.ColumnRef:
+			// Named parameter reference (from RETURN form body "SELECT x > 1").
+			if t, ok := paramType[strings.ToLower(n.Column)]; ok {
+				return t
+			}
+		case *parser.ParamRef:
+			// Positional parameter reference ($1, $2, ...).
+			if n.Number >= 1 && n.Number <= len(args) {
+				return strings.ToLower(args[n.Number-1].Type.Name)
+			}
+		case *parser.IntegerConst:
+			return "integer"
+		case *parser.StringConst:
+			return "text"
+		case *parser.CastExpr:
+			// Type cast: return the target type.
+			return strings.ToLower(n.Type.Name)
+		}
+		return ""
+	}
+
+	// isDateLike returns true for date/time/timestamp types.
+	isDateLike := func(typName string) bool {
+		switch typName {
+		case "date", "time", "timetz", "timestamp", "timestamptz":
+			return true
+		}
+		return false
+	}
+	// isNumericType returns true for integer/float/numeric types.
+	isNumericType := func(typName string) bool {
+		switch typName {
+		case "integer", "int", "int2", "int4", "int8",
+			"smallint", "bigint", "numeric", "decimal",
+			"real", "float4", "float8", "double precision":
+			return true
+		}
+		return false
+	}
+	// pgOpName returns the symbol for a comparison operator.
+	pgOpName := func(op parser.OpCode) string {
+		switch op {
+		case parser.OpGt:
+			return ">"
+		case parser.OpLt:
+			return "<"
+		case parser.OpGe:
+			return ">="
+		case parser.OpLe:
+			return "<="
+		case parser.OpEq:
+			return "="
+		case parser.OpNe:
+			return "<>"
+		default:
+			return op.String()
+		}
+	}
+
+	var walkExpr func(e parser.Expr) error
+	walkExpr = func(e parser.Expr) error {
+		if e == nil {
+			return nil
+		}
+		switch n := e.(type) {
+		case *parser.BinaryOp:
+			// Check operands first (recurse).
+			if err := walkExpr(n.Left); err != nil {
+				return err
+			}
+			if err := walkExpr(n.Right); err != nil {
+				return err
+			}
+			// For comparison operators, check for cross-domain type mismatch.
+			switch n.Op {
+			case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+				leftTyp := resolveType(n.Left)
+				rightTyp := resolveType(n.Right)
+				if leftTyp == "" || rightTyp == "" {
+					return nil // can't determine, skip
+				}
+				// date/timestamp vs integer/numeric: no such operator in PG.
+				if isDateLike(leftTyp) && isNumericType(rightTyp) {
+					leftDisplay := analyzer.PGDisplayTypeName(leftTyp)
+					rightDisplay := analyzer.PGDisplayTypeName(rightTyp)
+					return &ExecError{
+						Code:    "42883",
+						Pos:     pos,
+						Message: fmt.Sprintf("operator does not exist: %s %s %s", leftDisplay, pgOpName(n.Op), rightDisplay),
+						Hint:    "No operator matches the given name and argument types. You might need to add explicit type casts.",
+					}
+				}
+				if isNumericType(leftTyp) && isDateLike(rightTyp) {
+					leftDisplay := analyzer.PGDisplayTypeName(leftTyp)
+					rightDisplay := analyzer.PGDisplayTypeName(rightTyp)
+					return &ExecError{
+						Code:    "42883",
+						Pos:     pos,
+						Message: fmt.Sprintf("operator does not exist: %s %s %s", leftDisplay, pgOpName(n.Op), rightDisplay),
+						Hint:    "No operator matches the given name and argument types. You might need to add explicit type casts.",
+					}
+				}
+			}
+		case *parser.UnaryOp:
+			return walkExpr(n.Operand)
+		case *parser.FuncCall:
+			for _, a := range n.Args {
+				if err := walkExpr(a); err != nil {
+					return err
+				}
+			}
+		case *parser.CastExpr:
+			return walkExpr(n.Operand)
+		}
+		return nil
+	}
+
+	var walkStmt func(s parser.Stmt) error
+	walkStmt = func(s parser.Stmt) error {
+		switch n := s.(type) {
+		case *parser.SelectStmt:
+			for _, t := range n.Targets {
+				if err := walkExpr(t.Expr); err != nil {
+					return err
+				}
+			}
+			if n.Where != nil {
+				if err := walkExpr(n.Where); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	for _, stmt := range stmts {
+		if err := walkStmt(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 	rs := o.ctx.Catalog.Routines()
 	if rs == nil {
@@ -3001,6 +3247,10 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 			}
 		}
 		return nil
+	}
+	// Only superusers may set a function as leakproof.
+	if s.Leakproof != nil && *s.Leakproof && o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: "only superuser can define a leakproof function"}
 	}
 	for _, r := range routines {
 		if s.Volatile != nil {
@@ -5234,6 +5484,182 @@ func buildFunctionArgsList(r *catalog.Routine) string {
 		parts = append(parts, typeName)
 	}
 	return strings.Join(parts, ",")
+}
+
+// extractRoutineDeps parses the function body and arg defaults to populate
+// dependency fields on r for information_schema routine_*_usage views.
+func extractRoutineDeps(body string, argDefaults []string, schema string, r *catalog.Routine, cat catalog.Catalog) {
+	// Panic recovery: extractRoutineDeps is a best-effort feature; never crash the server.
+	defer func() { recover() }() //nolint:errcheck
+	// Skip very long bodies to bound overhead.
+	if len(body) > 2000 {
+		return
+	}
+	// walkExpr walks a parser expression collecting deps.
+	var walkExpr func(e parser.Expr, fromTables map[string]string)
+	var walkSelect func(sel *parser.SelectStmt)
+
+	walkExpr = func(e parser.Expr, fromTables map[string]string) {
+		if e == nil {
+			return
+		}
+		switch n := e.(type) {
+		case *parser.FuncCall:
+			funcName := strings.ToLower(n.Name.Name)
+			// Sequence deps: nextval/currval with string literal arg.
+			if (funcName == "nextval" || funcName == "currval") && len(n.Args) >= 1 {
+				if sc, ok := n.Args[0].(*parser.StringConst); ok {
+					seqName := strings.ToLower(sc.Value)
+					if idx := strings.LastIndex(seqName, "."); idx >= 0 {
+						seqName = seqName[idx+1:]
+					}
+					seqSchema := schema
+					found := false
+					for _, d := range r.SequenceDeps {
+						if d.Name == seqName {
+							found = true
+							break
+						}
+					}
+					if !found {
+						r.SequenceDeps = append(r.SequenceDeps, catalog.RoutineSeqDep{Schema: seqSchema, Name: seqName})
+					}
+				}
+			}
+			// Routine call deps: look up the function name in catalog.
+			if cat != nil && funcName != "nextval" && funcName != "currval" {
+				if rs := cat.Routines(); rs != nil {
+					cands := rs.LookupByName(n.Name)
+					for _, cand := range cands {
+						found := false
+						for _, oid := range r.RoutineCallOIDs {
+							if oid == cand.OID {
+								found = true
+								break
+							}
+						}
+						if !found {
+							r.RoutineCallOIDs = append(r.RoutineCallOIDs, cand.OID)
+						}
+					}
+				}
+			}
+			for _, a := range n.Args {
+				walkExpr(a, fromTables)
+			}
+		case *parser.ColumnRef:
+			// Attribute bare column refs to the single FROM table if applicable.
+			if len(fromTables) == 1 {
+				colName := strings.ToLower(n.Column)
+				if colName == "" {
+					break
+				}
+				var tblName, tblSchema string
+				for k, v := range fromTables {
+					tblName = k
+					tblSchema = v
+				}
+				found := false
+				for _, cd := range r.ColumnDeps {
+					if cd.TableName == tblName && cd.ColumnName == colName {
+						found = true
+						break
+					}
+				}
+				if !found {
+					r.ColumnDeps = append(r.ColumnDeps, catalog.RoutineColRef{
+						TableSchema: tblSchema,
+						TableName:   tblName,
+						ColumnName:  colName,
+					})
+				}
+			}
+		case *parser.BinaryOp:
+			walkExpr(n.Left, fromTables)
+			walkExpr(n.Right, fromTables)
+		case *parser.UnaryOp:
+			walkExpr(n.Operand, fromTables)
+		case *parser.CastExpr:
+			walkExpr(n.Operand, fromTables)
+		case *parser.SubqueryExpr:
+			if n.Inner != nil {
+				walkSelect(n.Inner)
+			}
+		case *parser.CaseExpr:
+			walkExpr(n.Operand, fromTables)
+			for _, w := range n.Whens {
+				walkExpr(w.When, fromTables)
+				walkExpr(w.Then, fromTables)
+			}
+			walkExpr(n.Else, fromTables)
+		case *parser.IsNullExpr:
+			walkExpr(n.Operand, fromTables)
+		}
+	}
+
+	walkSelect = func(sel *parser.SelectStmt) {
+		if sel == nil {
+			return
+		}
+		// Collect FROM tables for column attribution.
+		localFrom := map[string]string{}
+		for _, rv := range sel.From {
+			if rv.Name != "" {
+				tblName := strings.ToLower(rv.Name)
+				tblSchema := strings.ToLower(rv.Schema)
+				if tblSchema == "" {
+					tblSchema = schema
+				}
+				localFrom[tblName] = tblSchema
+				found := false
+				for _, td := range r.TableDeps {
+					if td.Name == tblName && td.Schema == tblSchema {
+						found = true
+						break
+					}
+				}
+				if !found {
+					r.TableDeps = append(r.TableDeps, catalog.RoutineTableRef{Schema: tblSchema, Name: tblName})
+				}
+			}
+			if rv.Subquery != nil {
+				walkSelect(rv.Subquery)
+			}
+		}
+		// Walk targets.
+		for _, t := range sel.Targets {
+			walkExpr(t.Expr, localFrom)
+		}
+		// Walk WHERE.
+		walkExpr(sel.Where, localFrom)
+		// Walk set-op right branch if present.
+		if sel.SetOp != nil && sel.SetOp.Right != nil {
+			walkSelect(sel.SetOp.Right)
+		}
+	}
+
+	// Parse and walk the function body.
+	if body != "" {
+		stmts, err := parser.Parse(body)
+		if err == nil {
+			for _, st := range stmts {
+				if sel, ok := st.(*parser.SelectStmt); ok {
+					walkSelect(sel)
+				}
+			}
+		}
+	}
+
+	// Parse and walk each default expression.
+	for _, def := range argDefaults {
+		if def == "" {
+			continue
+		}
+		e, err := parser.ParseExpr(def)
+		if err == nil {
+			walkExpr(e, nil)
+		}
+	}
 }
 
 // buildCallArgListStr returns "()" for no arg list or "(type, ...)" for typed args.

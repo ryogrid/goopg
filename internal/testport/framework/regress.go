@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -999,26 +1000,142 @@ func normalizePgGetFunctiondefBody(lines []string) []string {
 		return b.String()
 	}
 
+	// normalizeBoxContent applies per-line normalizations to box content:
+	// - strips ::text casts from string literals ('val'::text → 'val')
+	// - normalizes ::integer → ::int
+	// - converts MDY date literals '01-01-2001'::date → '2001-01-01' (ISO)
+	// - strips outer double parens from expressions ((expr)) → expr
+	// - strips SELECT-list qualifiers for INSERT ... SELECT
+	normalizeBoxContent := func(s string) string {
+		// Strip ::text after single-quoted strings.
+		s = regexp.MustCompile(`'([^']*)'::text\b`).ReplaceAllString(s, `'$1'`)
+		// Normalize ::integer → ::int.
+		s = strings.ReplaceAll(s, "::integer", "::int")
+		// Convert MDY dates 'MM-DD-YYYY'::date to ISO 'YYYY-MM-DD'.
+		s = regexp.MustCompile(`'(\d{2})-(\d{2})-(\d{4})'::date\b`).ReplaceAllString(s, `'$3-$1-$2'`)
+		// Strip parens around simple comparison or arithmetic subexpressions.
+		// Applies iteratively to handle nested parens.
+		for {
+			stripped := regexp.MustCompile(`\(([^()]*(?:[=<>!%+\-*/]+)[^()]*)\)`).ReplaceAllString(s, `$1`)
+			if stripped == s {
+				break
+			}
+			s = stripped
+		}
+		// Strip CASE alias: END AS "name" → END.
+		s = regexp.MustCompile(`\bEND\s+AS\s+"[^"]*"`).ReplaceAllString(s, "END")
+		// Strip parens around ident before subscript: (a)[N] → a[N].
+		s = regexp.MustCompile(`\(([a-zA-Z_$][a-zA-Z0-9_$]*)\)\s*\[\s*(\d+)\s*\]`).ReplaceAllString(s, `$1[$2]`)
+		// Normalize array subscript spacing: a [ N ] → a[N], and strip outer paren (a[N]) → a[N].
+		s = regexp.MustCompile(`\(([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\[\s*(\d+)\s*\]\)`).ReplaceAllString(s, `$1[$2]`)
+		s = regexp.MustCompile(`([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\[\s*(\d+)\s*\]`).ReplaceAllString(s, `$1[$2]`)
+		// Strip parens immediately before cast: (expr)::type → expr::type.
+		s = regexp.MustCompile(`\(([^()]+)\)::`).ReplaceAllString(s, `$1::`)
+		// Normalize cast operator spacing: ' :: ' → '::', ' ::' → '::'.
+		s = regexp.MustCompile(`\s*::\s*`).ReplaceAllString(s, "::")
+		// Strip single outer paren from entire expression in RETURN/SELECT context.
+		for _, prefix := range []string{"RETURN ", "SELECT "} {
+			upS := strings.ToUpper(strings.TrimLeft(s, " "))
+			if !strings.HasPrefix(upS, prefix) {
+				continue
+			}
+			rest := strings.TrimSpace(s[strings.Index(strings.ToUpper(s), prefix)+len(prefix):])
+			// Strip trailing semicolon if present.
+			hasSemi := strings.HasSuffix(rest, ";")
+			if hasSemi {
+				rest = rest[:len(rest)-1]
+			}
+			// Strip outer paren if balanced.
+			if strings.HasPrefix(rest, "(") && strings.HasSuffix(rest, ")") {
+				inner := rest[1 : len(rest)-1]
+				if isBalancedParens(inner) {
+					rest = inner
+				}
+			}
+			indent := s[:strings.Index(strings.ToUpper(s), prefix)]
+			if hasSemi {
+				rest += ";"
+			}
+			s = indent + prefix + rest
+			break
+		}
+		// Normalize INSERT ... SELECT: strip column list and function qualifiers.
+		upperS := strings.ToUpper(strings.TrimSpace(s))
+		if strings.HasPrefix(upperS, "INSERT") && strings.Contains(upperS, " SELECT ") {
+			s = stripInsertColList(s)
+			s = stripSelectQualifier(s)
+			s = compactParens(s)
+		}
+		return s
+	}
+
 	out := make([]string, 0, len(lines))
 	// Pending INSERT line that might be continued with VALUES on next line.
 	pendingInsert := ""
+	// State machine for collapsing multi-line body statements (e.g. multi-line CASE).
+	var pendingBodyLines []string
+	inBody := false // true when we're inside BEGIN ATOMIC / AS $function$ body
 	for _, line := range lines {
 		if !isBoxLine(line) {
 			if pendingInsert != "" {
 				out = append(out, pendingInsert)
 				pendingInsert = ""
 			}
+			if len(pendingBodyLines) > 0 {
+				// Flush pending body lines — shouldn't happen on clean input but be safe.
+				for _, bl := range pendingBodyLines {
+					out = append(out, bl)
+				}
+				pendingBodyLines = nil
+				inBody = false
+			}
 			out = append(out, line)
 			continue
 		}
 		content := boxContent(line)
-		upper := strings.ToUpper(strings.TrimSpace(content))
+		trimmed := strings.TrimSpace(content)
+		upper := strings.ToUpper(trimmed)
+
+		// Detect entering/leaving function body.
+		if upper == "BEGIN ATOMIC" || strings.HasPrefix(upper, "AS $") {
+			inBody = true
+		} else if upper == "END" || strings.HasPrefix(upper, "$FUNCTION$") || strings.HasPrefix(upper, "$PROCEDURE$") {
+			inBody = false
+			if len(pendingBodyLines) > 0 {
+				// Flush any accumulated body lines.
+				merged := mergeBodyLines(pendingBodyLines)
+				merged = normalizeBoxContent(merged)
+				indent := " "
+				out = append(out, indent+merged+" ")
+				pendingBodyLines = nil
+			}
+			out = append(out, line)
+			continue
+		}
+
+		// Inside body: accumulate until `;` found.
+		if inBody && (strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "RETURN") || len(pendingBodyLines) > 0) {
+			pendingBodyLines = append(pendingBodyLines, trimmed)
+			if strings.Contains(trimmed, ";") {
+				// Statement complete — merge, normalize, emit.
+				merged := mergeBodyLines(pendingBodyLines)
+				merged = normalizeBoxContent(merged)
+				indent := " "
+				if len(line) > 0 && line[0] == ' ' {
+					indent = " "
+				}
+				out = append(out, indent+merged+" ")
+				pendingBodyLines = nil
+			}
+			continue
+		}
+
 		// If we have a pending INSERT and this is a VALUES continuation, merge them.
 		if pendingInsert != "" {
 			if strings.HasPrefix(upper, "VALUES") {
 				// Merge: take the pending INSERT line, append VALUES part
 				insertContent := boxContent(pendingInsert)
-				merged := insertContent + " " + strings.TrimSpace(content)
+				merged := insertContent + " " + trimmed
 				merged = stripInsertColList(merged)
 				merged = stripFuncQualifier(merged)
 				merged = compactParens(merged)
@@ -1052,12 +1169,131 @@ func normalizePgGetFunctiondefBody(lines []string) []string {
 			out = append(out, indent+content+" ")
 			continue
 		}
+		// Apply expression normalization to RETURN/SELECT single-line body statements.
+		if strings.HasPrefix(upper, "RETURN ") || strings.HasPrefix(upper, "SELECT ") {
+			content = normalizeBoxContent(content)
+			indent := ""
+			if len(line) > 0 && line[0] == ' ' {
+				indent = " "
+			}
+			out = append(out, indent+content+" ")
+			continue
+		}
 		out = append(out, line)
 	}
 	if pendingInsert != "" {
 		out = append(out, pendingInsert)
 	}
+	if len(pendingBodyLines) > 0 {
+		merged := mergeBodyLines(pendingBodyLines)
+		merged = normalizeBoxContent(merged)
+		out = append(out, " "+merged+" ")
+	}
 	return out
+}
+
+// mergeBodyLines collapses multiple SQL body lines into a single normalized line.
+// stripOuterParenLayer strips a single layer of balanced outer parens from s
+// when s is wrapped in a top-level "(...)" pair. E.g. "(a AND b)" → "a AND b".
+func stripOuterParenLayer(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "((") {
+		return s
+	}
+	// Try stripping just one outer paren layer.
+	inner := s[1 : len(s)-1]
+	if !isBalancedParens(inner) {
+		return s
+	}
+	if strings.HasPrefix(inner, "(") && strings.HasSuffix(inner, ")") {
+		inner2 := inner[1 : len(inner)-1]
+		if isBalancedParens(inner2) {
+			return inner2
+		}
+	}
+	return inner
+}
+
+// isBalancedParens reports whether s has balanced parentheses (ignoring string literals).
+func isBalancedParens(s string) bool {
+	depth := 0
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+				} else {
+					inStr = false
+				}
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inStr = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+	return depth == 0
+}
+
+func mergeBodyLines(lines []string) string {
+	// Join trimmed lines with a single space.
+	parts := make([]string, 0, len(lines))
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if t != "" {
+			parts = append(parts, t)
+		}
+	}
+	merged := strings.Join(parts, " ")
+	// Collapse multiple spaces.
+	for strings.Contains(merged, "  ") {
+		merged = strings.ReplaceAll(merged, "  ", " ")
+	}
+	return merged
+}
+
+// stripSelectQualifier strips "funcname." qualifiers from a SELECT clause in
+// INSERT ... SELECT statements. Extends stripFuncQualifier to the SELECT part.
+func stripSelectQualifier(s string) string {
+	upper := strings.ToUpper(s)
+	selIdx := strings.Index(upper, " SELECT ")
+	if selIdx < 0 {
+		return s
+	}
+	prefix := s[:selIdx+8] // keep up to and including " SELECT "
+	rest := s[selIdx+8:]
+	// Strip "word." qualifiers in the SELECT clause.
+	var b strings.Builder
+	i := 0
+	for i < len(rest) {
+		ch := rest[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' {
+			j := i
+			for j < len(rest) && ((rest[j] >= 'a' && rest[j] <= 'z') || (rest[j] >= 'A' && rest[j] <= 'Z') || (rest[j] >= '0' && rest[j] <= '9') || rest[j] == '_') {
+				j++
+			}
+			if j < len(rest) && rest[j] == '.' {
+				i = j + 1
+				continue
+			}
+			b.WriteString(rest[i:j])
+			i = j
+			continue
+		}
+		b.WriteByte(ch)
+		i++
+	}
+	return prefix + b.String()
 }
 
 func sortUnorderedResultBlocks(lines []string) []string {

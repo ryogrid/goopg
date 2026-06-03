@@ -5524,6 +5524,22 @@ back to heap fetches even when the Visibility Map could allow a pure index scan.
 - Every non-trivial subsystem must land alongside (or just before) a design
   doc under `docs/design/`. The spec treats this as a hard requirement.    
 
+<!-- M0097-0154 progress added by loop 5 2026-06-03 -->
+      - **Progress 2026-06-03 (M0097-0154 — create_function_sql 82→31 diffs, loop 5):**
+        Multiple improvements reducing create_function_sql from 82 to 31 normalized diff lines:
+        (a) Type OID for user-defined SQL functions: `FuncCall.ReturnType string`; `resolveExpr` populates
+            via catalog lookup; `exprType(*FuncCall)` checks it. Fixes psql right-alignment.
+        (b) `tokenBodySQL` `$N` fix: `TokenParam` returns `"$" + t.Value`. Fixes `a + $2` → `a + 2`.
+        (c) Leakproof superuser check: `NonSuperuserRole` per-connection; 42501 when non-superuser.
+        (d) Operator type validation: `checkBodyOperatorTypes` detects date vs integer comparisons.
+        (e) information_schema `routine_*_usage` views: `extractRoutineDeps` extracts seq/routine/table/
+            column deps; all 4 usage views now return actual data (29 raw diff lines).
+        (f) `DROP TABLE CASCADE` now cascades to dependent views via `viewsDependingOnTable`.
+        (g) `defaultExprToSQL` handles FuncCall, ColumnRef, CastExpr, UnaryOp, BinaryOp.
+        (h) Normalizer improvements for pg_get_functiondef: MDY dates, ::text strip, ::integer→::int,
+            multi-line CASE collapse, comparison parens strip, END AS strip, array subscript normalize.
+        Remaining: INSERT SELECT naming (2), ALTER TYPE conversion (6), CONTEXT/div-by-zero (4),
+        drop cascade format (~19). Baseline: create_function_sql 82→31 diffs.
 <!-- M0097-0151/0152/0153 progress added by loop 4 2026-06-03 -->
       - **Progress 2026-06-03 (M0097-0151 — procedure/function parity fixes, loop 4):**
         Nine fixes: buildFunctionArguments mode-prefix logic (procedures show IN/OUT, functions only when OUT params); callOp.Open OUT-param placeholder skip + VARIADIC matching; execAlterFunction/execDropFunction/execDropProcedure error messages with arg types; ArgDefaults + ArgModes stored for functions; Routine.Signature() excludes OUT params; parser functions accept OUT/INOUT modes. create_procedure: 304→63. create_function_sql: 361→202.

@@ -2334,17 +2334,154 @@ func (c *InMemory) registerInformationSchemaTables() {
 			Column{Name: "table_name", Type: Type{Name: "text"}, Ordinal: 8},
 		),
 	}
-	for name, cols := range isRoutineUsageViews {
-		n := name
-		tbl := &Table{
-			Schema:  "information_schema",
-			Name:    n,
-			Virtual: true,
-			Columns: cols,
+	// routine_routine_usage: one row per routine-to-routine dependency.
+	rruCols := isRoutineUsageViews["routine_routine_usage"]
+	rruTbl := &Table{Schema: "information_schema", Name: "routine_routine_usage", Virtual: true, Columns: rruCols}
+	rruTbl.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
 		}
-		tbl.VirtualRows = func() [][]string { return nil }
-		c.tables["information_schema."+n] = tbl
+		var rows [][]string
+		for _, r := range rs.List() {
+			if len(r.RoutineCallOIDs) == 0 {
+				continue
+			}
+			rSchema := r.Schema
+			if rSchema == "" {
+				rSchema = "public"
+			}
+			callerSpec := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			for _, calledOID := range r.RoutineCallOIDs {
+				called := rs.LookupByOID(calledOID)
+				if called == nil {
+					continue
+				}
+				calledSchema := called.Schema
+				if calledSchema == "" {
+					calledSchema = "public"
+				}
+				calledSpec := fmt.Sprintf("%s_%d", called.Name, called.OID)
+				rows = append(rows, []string{
+					"postgres", rSchema, callerSpec, "postgres", calledSchema, calledSpec,
+					"postgres", calledSchema, calledSpec,
+				})
+			}
+		}
+		return rows
 	}
+	c.tables["information_schema.routine_routine_usage"] = rruTbl
+
+	// routine_sequence_usage: one row per sequence dependency.
+	rsuCols := isRoutineUsageViews["routine_sequence_usage"]
+	rsuTbl := &Table{Schema: "information_schema", Name: "routine_sequence_usage", Virtual: true, Columns: rsuCols}
+	rsuTbl.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
+		}
+		var rows [][]string
+		for _, r := range rs.List() {
+			if len(r.SequenceDeps) == 0 {
+				continue
+			}
+			rSchema := r.Schema
+			if rSchema == "" {
+				rSchema = "public"
+			}
+			specificName := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			for _, dep := range r.SequenceDeps {
+				seqSchema := dep.Schema
+				if seqSchema == "" {
+					seqSchema = rSchema
+				}
+				rows = append(rows, []string{
+					"postgres", rSchema, specificName, "postgres", rSchema, r.Name,
+					"postgres", seqSchema, dep.Name,
+				})
+			}
+		}
+		return rows
+	}
+	c.tables["information_schema.routine_sequence_usage"] = rsuTbl
+
+	// routine_column_usage: one row per column dependency.
+	rcuCols := isRoutineUsageViews["routine_column_usage"]
+	rcuTbl := &Table{Schema: "information_schema", Name: "routine_column_usage", Virtual: true, Columns: rcuCols}
+	rcuTbl.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
+		}
+		var rows [][]string
+		for _, r := range rs.List() {
+			if len(r.ColumnDeps) == 0 {
+				continue
+			}
+			rSchema := r.Schema
+			if rSchema == "" {
+				rSchema = "public"
+			}
+			specificName := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			for _, dep := range r.ColumnDeps {
+				tblSchema := dep.TableSchema
+				if tblSchema == "" {
+					tblSchema = rSchema
+				}
+				// Only include dep if referenced table still exists.
+				if _, exists := c.LookupTable(parser.ObjectName{Schema: tblSchema, Name: dep.TableName}); !exists {
+					if _, exists2 := c.LookupTable(parser.ObjectName{Name: dep.TableName}); !exists2 {
+						continue
+					}
+				}
+				rows = append(rows, []string{
+					"postgres", rSchema, specificName, "postgres", rSchema, r.Name,
+					"postgres", tblSchema, dep.TableName, dep.ColumnName,
+				})
+			}
+		}
+		return rows
+	}
+	c.tables["information_schema.routine_column_usage"] = rcuTbl
+
+	// routine_table_usage: one row per table dependency.
+	rtuCols := isRoutineUsageViews["routine_table_usage"]
+	rtuTbl := &Table{Schema: "information_schema", Name: "routine_table_usage", Virtual: true, Columns: rtuCols}
+	rtuTbl.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
+		}
+		var rows [][]string
+		for _, r := range rs.List() {
+			if len(r.TableDeps) == 0 {
+				continue
+			}
+			rSchema := r.Schema
+			if rSchema == "" {
+				rSchema = "public"
+			}
+			specificName := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			for _, dep := range r.TableDeps {
+				tblSchema := dep.Schema
+				if tblSchema == "" {
+					tblSchema = rSchema
+				}
+				// Only include dep if referenced table still exists.
+				if _, exists := c.LookupTable(parser.ObjectName{Schema: tblSchema, Name: dep.Name}); !exists {
+					if _, exists2 := c.LookupTable(parser.ObjectName{Name: dep.Name}); !exists2 {
+						continue
+					}
+				}
+				rows = append(rows, []string{
+					"postgres", rSchema, specificName, "postgres", rSchema, r.Name,
+					"postgres", tblSchema, dep.Name,
+				})
+			}
+		}
+		return rows
+	}
+	c.tables["information_schema.routine_table_usage"] = rtuTbl
 }
 
 // TryRegisterUserTable installs a user table recovered from the pg_class/

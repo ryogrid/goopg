@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -40,8 +41,26 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		if o.ctx == nil {
 			return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SET is not supported in this executor context"}
 		}
-		// "role" and "session_authorization" are no-op names — goopg has no role management.
-		if stmt.Name == "role" || stmt.Name == "session_authorization" {
+		// "role" — no-op: goopg has no role management.
+		if stmt.Name == "role" {
+			return nil, EOF
+		}
+		// "session_authorization" — update non-superuser role tracking for
+		// privilege checks (e.g. LEAKPROOF function attribute).
+		if stmt.Name == "session_authorization" {
+			if o.ctx != nil && o.ctx.SetSessionAuthorization != nil {
+				if stmt.Default {
+					o.ctx.SetSessionAuthorization("")
+				} else {
+					role := stmt.Value
+					switch strings.ToUpper(role) {
+					case "", "RESET", "POSTGRES":
+						o.ctx.SetSessionAuthorization("")
+					default:
+						o.ctx.SetSessionAuthorization(role)
+					}
+				}
+			}
 			return nil, EOF
 		}
 		if stmt.Default {
@@ -74,8 +93,15 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 			}
 			return nil, EOF
 		}
-		// "role" and "session_authorization" are no-op names — goopg has no role management.
-		if stmt.Name == "role" || stmt.Name == "session_authorization" {
+		// "role" — no-op: goopg has no role management.
+		if stmt.Name == "role" {
+			return nil, EOF
+		}
+		// "session_authorization" — restore superuser status.
+		if stmt.Name == "session_authorization" {
+			if o.ctx != nil && o.ctx.SetSessionAuthorization != nil {
+				o.ctx.SetSessionAuthorization("")
+			}
 			return nil, EOF
 		}
 		if o.ctx.ResetSetting == nil {

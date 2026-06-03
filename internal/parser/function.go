@@ -265,6 +265,8 @@ func (p *parser) parseFunctionBody() (string, error) {
 // function/procedure bodies. String literals get their quotes restored.
 func tokenBodySQL(t Token) string {
 	switch t.Kind {
+	case TokenParam:
+		return "$" + t.Value // restore $N parameter reference prefix
 	case TokenStringLit:
 		return "'" + strings.ReplaceAll(t.Value, "'", "''") + "'"
 	case TokenKeyword:

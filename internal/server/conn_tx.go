@@ -86,6 +86,11 @@ type connTxState struct {
 	// PendingCreatedEnums tracks CREATE TYPE … AS ENUM within the current tx.
 	// On ROLLBACK, created types are dropped.  map[name(lowercase)]=true.  M0097-0022.
 	PendingCreatedEnums map[string]bool
+	// NonSuperuserRole is set when SET SESSION AUTHORIZATION is called with a
+	// non-default role name. While non-empty, privilege checks that require
+	// superuser (e.g. LEAKPROOF function attribute) are rejected. Cleared by
+	// RESET SESSION AUTHORIZATION or SET SESSION AUTHORIZATION DEFAULT/postgres.
+	NonSuperuserRole string
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr
