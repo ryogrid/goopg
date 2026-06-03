@@ -5540,6 +5540,8 @@ back to heap fetches even when the Visibility Map could allow a pure index scan.
             multi-line CASE collapse, comparison parens strip, END AS strip, array subscript normalize.
         Remaining: INSERT SELECT naming (2), ALTER TYPE conversion (6), CONTEXT/div-by-zero (4),
         drop cascade format (~19). Baseline: create_function_sql 82→31 diffs.
+        Suite verification: Full TestPort_RegressSuite passes with 45min timeout (~38min runtime);
+        same-schema viewsDependingOnTable optimization prevents test accumulation overhead.
 <!-- M0097-0151/0152/0153 progress added by loop 4 2026-06-03 -->
       - **Progress 2026-06-03 (M0097-0151 — procedure/function parity fixes, loop 4):**
         Nine fixes: buildFunctionArguments mode-prefix logic (procedures show IN/OUT, functions only when OUT params); callOp.Open OUT-param placeholder skip + VARIADIC matching; execAlterFunction/execDropFunction/execDropProcedure error messages with arg types; ArgDefaults + ArgModes stored for functions; Routine.Signature() excludes OUT params; parser functions accept OUT/INOUT modes. create_procedure: 304→63. create_function_sql: 361→202.
