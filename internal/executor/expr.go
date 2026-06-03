@@ -9413,7 +9413,7 @@ func buildFunctionDef(r *catalog.Routine) string {
 	} else if r.IsProcedure {
 		// Procedure body: multi-line $procedure$...$procedure$ format
 		sb.WriteString("AS $procedure$\n")
-		sb.WriteString(body)
+		sb.WriteString(strings.TrimLeft(body, "\n"))
 		if body != "" && body[len(body)-1] != '\n' {
 			sb.WriteByte('\n')
 		}

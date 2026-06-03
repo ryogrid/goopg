@@ -319,6 +319,36 @@ func (rs *Routines) DropByName(name parser.ObjectName) error {
 	}
 }
 
+// DropRoutine removes the specific routine r from the registry.
+// It uses the routine's OID for exact matching to avoid any signature
+// ambiguity (important for DROP PROCEDURE with OUT params).
+func (rs *Routines) DropRoutine(r *Routine) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	schema := r.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	sig := r.Signature()
+	k := routineKey(schema, r.Name, sig)
+	if _, ok := rs.byKey[k]; !ok {
+		return fmt.Errorf("%w: %s.%s%s", ErrRoutineNotFound, schema, r.Name, sig)
+	}
+	delete(rs.byKey, k)
+	nk := nameKey(schema, r.Name)
+	keys := rs.byName[nk]
+	for i, kk := range keys {
+		if kk == k {
+			rs.byName[nk] = append(keys[:i], keys[i+1:]...)
+			break
+		}
+	}
+	if len(rs.byName[nk]) == 0 {
+		delete(rs.byName, nk)
+	}
+	return nil
+}
+
 // List returns every registered routine in deterministic OID order.
 // Used by `pg_catalog.pg_proc`'s virtual-row provider.
 // LookupByOID returns the routine with the given OID, or nil if not found.
@@ -380,4 +410,89 @@ func (rs *Routines) List() []*Routine {
 		}
 	}
 	return out
+}
+
+// normalizeDropType normalizes type aliases to canonical names for DROP matching.
+func normalizeDropType(t string) string {
+	switch strings.ToLower(t) {
+	case "int", "integer":
+		return "int4"
+	case "bigint":
+		return "int8"
+	case "smallint":
+		return "int2"
+	case "bool":
+		return "boolean"
+	case "float", "float8", "double precision":
+		return "float8"
+	case "float4", "real":
+		return "float4"
+	}
+	return strings.ToLower(t)
+}
+
+// LookupDropCandidates returns routines matching a DROP arg list using
+// full-arg-list matching (including OUT params). If args[i].ModeExplicit is
+// false, any param mode at position i matches. If ModeExplicit is true,
+// only matching modes are accepted.
+func (rs *Routines) LookupDropCandidates(name parser.ObjectName, args []parser.FunctionArg) []*Routine {
+	dropTypes := make([]string, len(args))
+	for i, a := range args {
+		dropTypes[i] = normalizeDropType(a.Type.Name)
+	}
+
+	modeChar := func(a parser.FunctionArg) string {
+		switch a.Mode {
+		case parser.FuncArgOut:
+			return "o"
+		case parser.FuncArgInout:
+			return "b"
+		case parser.FuncArgVariadic:
+			return "v"
+		default:
+			return "i"
+		}
+	}
+
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+
+	var cands []*Routine
+	for _, r := range rs.byKey {
+		// Name must match
+		if !strings.EqualFold(r.Name, name.Name) {
+			continue
+		}
+		if name.Schema != "" && !strings.EqualFold(r.Schema, name.Schema) {
+			continue
+		}
+		// Full arg count must match (including OUT params)
+		if len(r.ArgTypes) != len(args) {
+			continue
+		}
+		matched := true
+		for i, dropArg := range args {
+			// Type must match
+			rType := normalizeDropType(r.ArgTypes[i].Name)
+			if rType != dropTypes[i] {
+				matched = false
+				break
+			}
+			// Mode match: only filter if explicitly specified
+			if dropArg.ModeExplicit {
+				rMode := "i"
+				if i < len(r.ArgModes) && r.ArgModes[i] != "" {
+					rMode = r.ArgModes[i]
+				}
+				if rMode != modeChar(dropArg) {
+					matched = false
+					break
+				}
+			}
+		}
+		if matched {
+			cands = append(cands, r)
+		}
+	}
+	return cands
 }

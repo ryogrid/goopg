@@ -2835,6 +2835,47 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	if procSchema == "" {
 		procSchema = currentWritableSchema(o.ctx)
 	}
+	// Validate BEGIN ATOMIC body: reject DDL statements like CREATE TABLE.
+	if s.BeginAtomic {
+		upper := strings.ToUpper(s.Body)
+		if strings.Contains(upper, "CREATE TABLE") {
+			return &ExecError{Code: "0A000", Pos: s.Pos(),
+				Message: "CREATE TABLE is not yet supported in unquoted SQL function body"}
+		}
+	}
+	// Validate SQL body: check if a CALL targets a procedure with output args.
+	// PG rejects this at function-creation time for SQL functions.
+	if lang == "sql" && !s.BeginAtomic && s.Body != "" {
+		if rs := o.ctx.Catalog.Routines(); rs != nil {
+			bodyStmts, _ := parser.Parse(s.Body)
+			for _, stmt := range bodyStmts {
+				call, ok := stmt.(*parser.CallStmt)
+				if !ok {
+					continue
+				}
+				// Look up any overload of the called procedure by name
+				callees := rs.LookupByName(call.Name)
+				for _, callee := range callees {
+					// Check if callee has any OUT or INOUT params
+					hasOutputArgs := false
+					for _, mode := range callee.ArgModes {
+						if mode == "o" || mode == "b" {
+							hasOutputArgs = true
+							break
+						}
+					}
+					if hasOutputArgs {
+						return &ExecError{
+							Code:    "0A000",
+							Pos:     s.Pos(),
+							Message: "calling procedures with output arguments is not supported in SQL functions",
+							Context: fmt.Sprintf("SQL function \"%s\"", s.Name.Name),
+						}
+					}
+				}
+			}
+		}
+	}
 	r := &catalog.Routine{
 		Schema:          procSchema,
 		Name:            s.Name.Name,
@@ -2890,27 +2931,36 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	}
 	// Verify the target exists and is a procedure BEFORE dropping.
 	var found *catalog.Routine
-	var argTypes []catalog.Type
 	if s.Args == nil {
 		cands := rs.LookupByName(s.Name)
 		if len(cands) == 1 {
 			found = cands[0]
 		} else if len(cands) > 1 {
-			if !s.IfExists {
-				return &ExecError{
-					Code:    "42725",
-					Pos:     s.Pos(),
-					Message: fmt.Sprintf("%s name \"%s\" is not unique", objKind, s.Name.Name),
-					Hint:    fmt.Sprintf("Specify the argument list to select the %s unambiguously.", objKind),
-				}
+			// "not unique" is an error even with IF EXISTS (only "not found" is suppressed).
+			return &ExecError{
+				Code:    "42725",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("%s name \"%s\" is not unique", objKind, s.Name.Name),
+				Hint:    fmt.Sprintf("Specify the argument list to select the %s unambiguously.", objKind),
 			}
 		}
 	} else {
-		argTypes = make([]catalog.Type, len(s.Args))
-		for i, a := range s.Args {
-			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+		cands := rs.LookupDropCandidates(s.Name, s.Args)
+		switch len(cands) {
+		case 0:
+			// not found — handled below
+		case 1:
+			found = cands[0]
+		default:
+			// multiple matches = ambiguous — arg list was given but still ambiguous;
+			// PG does NOT add "Specify the argument list" hint here since args were given.
+			// "not unique" is an error even with IF EXISTS.
+			return &ExecError{
+				Code:    "42725",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("%s name \"%s\" is not unique", objKind, s.Name.Name),
+			}
 		}
-		found, _ = rs.Lookup(s.Name, argTypes)
 	}
 	if found == nil {
 		if s.IfExists {
@@ -2926,25 +2976,26 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	}
 	// DROP PROCEDURE on a function should fail.
 	if objKind == "procedure" && !found.IsProcedure {
-		argListStr := routineArgListStr(argTypes)
+		// Use the found routine's arg types for the error message (argTypes may
+		// be nil when using LookupDropCandidates-based lookup).
+		argListStr := routineArgListStr(found.ArgTypes)
 		return &ExecError{Code: "42809", Pos: s.Pos(),
 			Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argListStr)}
 	}
-	// Now drop.
+	// Now drop using the specific routine we already identified.
 	var err error
 	if s.Args == nil {
 		err = rs.DropByName(s.Name)
 	} else {
-		dropArgTypes := make([]catalog.Type, len(s.Args))
-		for i, a := range s.Args {
-			dropArgTypes[i] = catalog.Type{
-				Name: strings.ToLower(a.Type.Name),
-				Args: append([]int64(nil), a.Type.Args...),
-			}
-		}
-		err = rs.Drop(s.Name, dropArgTypes)
+		// Use DropRoutine with the exact routine found by LookupDropCandidates
+		// to avoid signature-based ambiguity (OUT params excluded from Signature).
+		err = rs.DropRoutine(found)
 	}
 	if err == nil {
+		// Record the drop for potential rollback on ROLLBACK.
+		if sess, ok := o.ctx.Session.(*BasicSession); ok {
+			sess.AddPendingRoutineDrop(found)
+		}
 		return nil
 	}
 	if errors.Is(err, catalog.ErrRoutineNotFound) {

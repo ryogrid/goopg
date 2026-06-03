@@ -179,9 +179,15 @@ func (o *callOp) Open(ctx *Context) error {
 		if len(callerArgTypeNames) == 0 {
 			typedArgList = "()"
 		}
+		// Only add HINT when no procedure with this name exists at all.
+		// When a procedure exists but types don't match, PG omits the hint.
+		var hint string
+		if len(routines) == 0 {
+			hint = "No procedure matches the given name and argument types. You might need to add explicit type casts."
+		}
 		return &ExecError{Code: "42883", Pos: st.Pos(),
-			Message:  fmt.Sprintf("procedure %s%s does not exist", st.Name.Name, typedArgList),
-			Hint:     "No procedure matches the given name and argument types. You might need to add explicit type casts.",
+			Message: fmt.Sprintf("procedure %s%s does not exist", st.Name.Name, typedArgList),
+			Hint:    hint,
 		}
 	}
 	switch len(matches) {

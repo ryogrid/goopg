@@ -337,15 +337,19 @@ func (p *parser) parseFunctionArg() (FunctionArg, error) {
 		case KwIn:
 			p.advance()
 			arg.Mode = FuncArgIn
+			arg.ModeExplicit = true
 		case KwOut:
 			p.advance()
 			arg.Mode = FuncArgOut
+			arg.ModeExplicit = true
 		case KwInout:
 			p.advance()
 			arg.Mode = FuncArgInout
+			arg.ModeExplicit = true
 		case KwVariadic:
 			p.advance()
 			arg.Mode = FuncArgVariadic
+			arg.ModeExplicit = true
 		}
 	} else if p.cur().Kind == TokenIdent {
 		// Also accept "name mode type" form (e.g. `a OUT int`).
@@ -359,15 +363,19 @@ func (p *parser) parseFunctionArg() (FunctionArg, error) {
 				case KwIn:
 					p.advance()
 					arg.Mode = FuncArgIn
+					arg.ModeExplicit = true
 				case KwOut:
 					p.advance()
 					arg.Mode = FuncArgOut
+					arg.ModeExplicit = true
 				case KwInout:
 					p.advance()
 					arg.Mode = FuncArgInout
+					arg.ModeExplicit = true
 				case KwVariadic:
 					p.advance()
 					arg.Mode = FuncArgVariadic
+					arg.ModeExplicit = true
 				}
 				colType, err := p.parseColumnType()
 				if err != nil {
@@ -404,15 +412,19 @@ func (p *parser) parseProcedureArg() (FunctionArg, error) {
 		case KwIn:
 			p.advance()
 			arg.Mode = FuncArgIn
+			arg.ModeExplicit = true
 		case KwOut:
 			p.advance()
 			arg.Mode = FuncArgOut
+			arg.ModeExplicit = true
 		case KwInout:
 			p.advance()
 			arg.Mode = FuncArgInout
+			arg.ModeExplicit = true
 		case KwVariadic:
 			p.advance()
 			arg.Mode = FuncArgVariadic
+			arg.ModeExplicit = true
 		}
 	} else if p.cur().Kind == TokenIdent {
 		// Might be "name mode type" form (e.g. `a OUT int`). Peek ahead: if
@@ -427,15 +439,19 @@ func (p *parser) parseProcedureArg() (FunctionArg, error) {
 				case KwIn:
 					p.advance()
 					arg.Mode = FuncArgIn
+					arg.ModeExplicit = true
 				case KwOut:
 					p.advance()
 					arg.Mode = FuncArgOut
+					arg.ModeExplicit = true
 				case KwInout:
 					p.advance()
 					arg.Mode = FuncArgInout
+					arg.ModeExplicit = true
 				case KwVariadic:
 					p.advance()
 					arg.Mode = FuncArgVariadic
+					arg.ModeExplicit = true
 				}
 				// Now parse just the type (name already consumed).
 				colType, err := p.parseColumnType()

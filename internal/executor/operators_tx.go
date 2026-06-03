@@ -154,6 +154,10 @@ func (o *transactionOp) execCommit() error {
 		_ = o.ctx.SyncRep.WaitForLSN(o.ctx.Ctx, o.ctx.WAL.WrittenLSN(), o.ctx.SyncCommitMode)
 	}
 	o.ctx.Session.EndExplicitTransaction()
+	// Clear pending routine drops — they're committed, no need to restore.
+	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
+		sess.TakePendingRoutineDrops()
+	}
 	globalRelLockMgr.ReleaseSession(o.ctx.Session)
 	o.clearCtxTransaction()
 	return nil
@@ -172,6 +176,14 @@ func (o *transactionOp) execRollback() error {
 	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
 		for _, entry := range sess.TakePendingDDLCreates() {
 			rollbackDDLCreate(o.ctx, entry)
+		}
+		// Restore any routines that were dropped in this transaction.
+		for _, r := range sess.TakePendingRoutineDrops() {
+			if rs := o.ctx.Catalog.Routines(); rs != nil {
+				// orReplace=true: if the key somehow exists (e.g. a concurrent
+				// create raced in), overwrite it so the drop is fully reversed.
+				_, _ = rs.Create(r, true)
+			}
 		}
 	}
 	if err := o.ctx.TxnMgr.Rollback(tx); err != nil {

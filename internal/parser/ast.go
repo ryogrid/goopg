@@ -1502,11 +1502,12 @@ const (
 // struct now so step 2's analyzer/runtime work doesn't have to
 // retrofit the AST shape.
 type FunctionArg struct {
-	pos     int
-	Name    string // empty for positional-only args
-	Mode    FuncArgMode
-	Type    ColumnType
-	Default Expr // nil when no DEFAULT was given
+	pos          int
+	Name         string // empty for positional-only args
+	Mode         FuncArgMode
+	ModeExplicit bool // true when a mode keyword (IN/OUT/INOUT/VARIADIC) was explicitly specified
+	Type         ColumnType
+	Default      Expr // nil when no DEFAULT was given
 }
 
 func (a FunctionArg) Pos() int { return a.pos }

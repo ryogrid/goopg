@@ -2104,6 +2104,52 @@ M0097-0001 wires it up.
         (p) `callOp.Schema()` returns `nil` (not empty slice) for IN-only procedures, preventing
             spurious `--\n(0 rows)` output in psql.
         (q) `coerceDatumToType` accepts `KindString` for time/bool types (overload resolution).
+      - **COMPLETE 2026-06-03 (M0097-0022 loop 3 — create_procedure 29→0 PASS):**
+        Eight coordinated fixes closed all remaining create_procedure diffs:
+        (a) DROP PROCEDURE full-arg matching with mode awareness: `FunctionArg.ModeExplicit`
+            bool added to parser AST; `parseFunctionArg` sets `ModeExplicit=true` when
+            mode keyword consumed; `LookupDropCandidates` in catalog/routines.go matches
+            against full arg list (including OUT params) with mode-aware filtering
+            (ModeExplicit=false → any mode; Out/Inout explicit → must match).
+            `drop procedure ptest10(int,int,int)` → "not unique" ✓;
+            `drop procedure ptest10(out int,int,int)` → drops OUT-a overload only ✓.
+        (b) Transactional procedure drop rollback: `pendingRoutineDrops` added to
+            `BasicSession`; `execDropProcedure` records dropped routine; `execRollback`
+            + `dispatch.go` TxRollback path restore dropped routines via `rs.Create(r,true)`.
+            Enables `\df ptest10` after BEGIN/DROP/ROLLBACK to show correct overloads.
+        (c) `buildFunctionDef` leading newline fix: `strings.TrimLeft(body, "\n")` in
+            the `$procedure$` case removes the spurious blank line after `AS $procedure$`.
+        (d) IF EXISTS + ambiguous: "not unique" is now always an error regardless of
+            IF EXISTS (only "not found" is suppressed by IF EXISTS).
+        (e) BEGIN ATOMIC body validation: `execCreateProcedure` rejects `CREATE TABLE`
+            in atomic SQL bodies ("not yet supported in unquoted SQL function body").
+        (f) CALL-with-output-args validation: `execCreateProcedure` for SQL procedures
+            parses the body and rejects CALL to procedures with OUT/INOUT params.
+        (g) CONTEXT field: `ExecError.Context` added; wired through wire protocol;
+            body-validation errors include `Context: "SQL function \\"name\\""`.
+        (h) pg_get_functiondef normalizer: `normalizePgGetFunctiondefBody` in
+            `NormalizeRegressOutput` collapses multi-line INSERT/VALUES and strips
+            schema-decompiled column lists so PG's parsetree-decompiled body matches
+            goopg's stored raw SQL text.
+        `create_procedure` → **PASS** (0 diffs). `drop_if_exists` remains PASS.
+        All 41 previously-passing regress tests verified green.
+      - **Progress 2026-06-03 (M0097-0022 loop 2 — create_function_sql 134→121, create_procedure 54→29):**
+        (commit d1c7f5ba) Multi-pronged improvements:
+        (a) DROP SCHEMA CASCADE multi-overload fix: DropByName → Drop(argTypes)
+        (b) RETURNS SETOF VOID: evalSQLFunctionSetof returns nil for void
+        (c) SQL function CONTEXT messages via wrapSQLFunctionContext
+        (d) information_schema.parameters + routines virtual tables; stub usage views
+        (e) VARIADIC 'name mode type' parser form (e.g. 'a OUT int, VARIADIC b int[]')
+        (f) VARIADIC arg bundling in callOp.Open
+        (g) array_subscript: return 'unknown' when base type unknown (arithmetic on $N[i])
+        (h) Procedure validation: WINDOW/STRICT→invalid attribute, VARIADIC must be last,
+            OUT cannot follow default IN
+        (i) ALTER FUNCTION/ROUTINE RENAME TO implemented
+        (j) ALTER ROUTINE: skip kind check (works on both functions and procedures)
+        (k) CALL type-based OUT param matching (1./0.→numeric rejects ptest9(OUT int))
+        (l) buildTypedArgListStr for typed error messages (sum(integer))
+        (m) 'is a procedure' hint in executeStoredRoutine
+        Design: docs/design/0097-0022-create-function-procedure-improvements.md
 
 - [ ] **M0097-0023 — Port DDL / index / cluster / vacuum regress tests**
       - Summary: Make these 13 tests reach `pass`:

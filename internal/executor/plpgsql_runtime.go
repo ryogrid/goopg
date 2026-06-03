@@ -144,6 +144,24 @@ func evalStoredRoutineFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datu
 	if err != nil {
 		return Datum{}, err
 	}
+	// If it's a procedure, emit the "is a procedure" error using the
+	// call-site arg types (string literals show as "unknown", like PG).
+	if r.IsProcedure {
+		argTypeNames := make([]string, len(x.Args))
+		for i, a := range x.Args {
+			if _, isStr := a.(*planner.StringConst); isStr {
+				argTypeNames[i] = "unknown"
+			} else {
+				argTypeNames[i] = r.ArgTypes[i].Name
+			}
+		}
+		return NullDatum, &ExecError{
+			Code:    "42809",
+			Pos:     x.Pos(),
+			Message: fmt.Sprintf("%s(%s) is a procedure", r.Name, strings.Join(argTypeNames, ", ")),
+			Hint:    "To call a procedure, use CALL.",
+		}
+	}
 	return executeStoredRoutine(r, args, ctx, x.Pos())
 }
 

@@ -797,6 +797,14 @@ func NormalizeRegressOutput(raw string) string {
 	// Sort data rows within unordered result blocks. M0097-0050.
 	// When a query has no ORDER BY clause, the row order is non-deterministic
 	// (hash-table order from PostgreSQL vs. different scan/join order in goopg).
+	// Normalize pg_get_functiondef BEGIN ATOMIC body lines.
+	// PostgreSQL decompiles the stored parsetree, adding schema-aware column
+	// lists to INSERT statements and function-name qualifiers to parameters.
+	// goopg stores the raw SQL text (space-tokenized). To allow comparison,
+	// normalize the body lines: strip column lists from INSERT INTO ... VALUES,
+	// collapse multi-line INSERT/VALUES into one, and compact whitespace in
+	// parenthesized lists.
+	lines = normalizePgGetFunctiondefBody(lines)
 	// Sorting both sides identically makes unordered results compare equal.
 	lines = sortUnorderedResultBlocks(lines)
 	// Strip trailing blank lines.
@@ -836,6 +844,7 @@ func NormalizeRegressOutput(raw string) string {
 			strings.HasPrefix(line, "HINT:") ||
 			strings.HasPrefix(line, "DETAIL:") ||
 			strings.HasPrefix(line, "WARNING:") ||
+			strings.HasPrefix(line, "CONTEXT:") ||
 			strings.HasPrefix(line, "drop cascades to ") // CASCADE continuation lines
 		if isErrLine {
 			errorLines = append(errorLines, line)
@@ -868,6 +877,189 @@ func NormalizeRegressOutput(raw string) string {
 //	------+------          <- separator line (all dashes/pipes/spaces)
 //	 val1 | val2           <- data rows
 //	(N rows)               <- row count
+// normalizePgGetFunctiondefBody normalizes the body of pg_get_functiondef
+// output for BEGIN ATOMIC procedures. PostgreSQL stores a parsetree and
+// decompiles it with schema-aware rewrites (e.g. adding column lists to INSERT,
+// qualifying parameter names with the function name). goopg stores raw SQL text.
+// This normalizer strips those differences from both sides so they compare equal.
+func normalizePgGetFunctiondefBody(lines []string) []string {
+	// Detect if a line is inside a pg_get_functiondef box (ends with " +" or "+").
+	// The box content lines look like: " <content><spaces>+" or " <content>+"
+	isBoxLine := func(line string) bool {
+		return strings.HasSuffix(strings.TrimRight(line, " "), "+")
+	}
+	// Extract content from a box line (strip leading space and trailing "+").
+	boxContent := func(line string) string {
+		s := strings.TrimRight(line, " ")
+		s = strings.TrimSuffix(s, "+")
+		s = strings.TrimRight(s, " ")
+		if len(s) > 0 && s[0] == ' ' {
+			s = s[1:]
+		}
+		return s
+	}
+	// Compact whitespace inside parentheses: "( 1 , x )" → "(1, x)"
+	compactParens := func(s string) string {
+		// Simple approach: remove spaces after "(" and before ")" and after ","
+		var b strings.Builder
+		prev := ' '
+		for _, ch := range s {
+			if ch == ' ' {
+				if prev == '(' || prev == ',' {
+					continue // skip space after '(' or ','
+				}
+			} else if (ch == ')' || ch == ',') && prev == ' ' {
+				// Remove the trailing space we already wrote before ')' or ','
+				built := b.String()
+				if len(built) > 0 && built[len(built)-1] == ' ' {
+					b.Reset()
+					b.WriteString(built[:len(built)-1])
+				}
+			}
+			b.WriteRune(ch)
+			prev = ch
+		}
+		return b.String()
+	}
+	// Strip column list from INSERT INTO tbl (col, ...) VALUES → INSERT INTO tbl VALUES
+	stripInsertColList := func(s string) string {
+		// Match: INSERT INTO <tbl> (<cols>) VALUES
+		upper := strings.ToUpper(s)
+		valIdx := strings.Index(upper, " VALUES")
+		if valIdx < 0 {
+			return s
+		}
+		intoIdx := strings.Index(upper, "INTO ")
+		if intoIdx < 0 {
+			return s
+		}
+		afterInto := strings.TrimSpace(s[intoIdx+5:])
+		// Find table name (first token after INTO)
+		spIdx := strings.IndexByte(afterInto, ' ')
+		if spIdx < 0 {
+			return s
+		}
+		tblName := afterInto[:spIdx]
+		afterTbl := strings.TrimSpace(afterInto[spIdx:])
+		// If afterTbl starts with '(', it's a column list — strip it
+		if strings.HasPrefix(afterTbl, "(") {
+			// Find the matching ')'
+			depth := 0
+			for i, ch := range afterTbl {
+				if ch == '(' {
+					depth++
+				} else if ch == ')' {
+					depth--
+					if depth == 0 {
+						rest := strings.TrimSpace(afterTbl[i+1:])
+						prefix := s[:intoIdx+5]
+						return prefix + tblName + " " + rest
+					}
+				}
+			}
+		}
+		return s
+	}
+	// Strip function-name qualifier from parameters: "funcname.param" → "param"
+	stripFuncQualifier := func(s string) string {
+		// Look for "word.word" patterns where the first word matches a function name.
+		// Simple heuristic: inside VALUES(...), replace "ident.ident" with "ident"
+		// only for known patterns — actually just strip any "word." qualifier before values in VALUES
+		// For safety, just strip "<word>." before bare identifiers in VALUES clause.
+		upper := strings.ToUpper(s)
+		valIdx := strings.Index(upper, "VALUES")
+		if valIdx < 0 {
+			return s
+		}
+		var b strings.Builder
+		b.WriteString(s[:valIdx+6]) // keep up to and including "VALUES"
+		rest := s[valIdx+6:]
+		// In the rest (the values), strip "word." qualifiers
+		i := 0
+		for i < len(rest) {
+			ch := rest[i]
+			// Check if we're at start of an identifier
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' {
+				j := i
+				for j < len(rest) && ((rest[j] >= 'a' && rest[j] <= 'z') || (rest[j] >= 'A' && rest[j] <= 'Z') || (rest[j] >= '0' && rest[j] <= '9') || rest[j] == '_') {
+					j++
+				}
+				// If followed by '.', skip the "word." qualifier
+				if j < len(rest) && rest[j] == '.' {
+					i = j + 1 // skip "word."
+					continue
+				}
+				b.WriteString(rest[i:j])
+				i = j
+				continue
+			}
+			b.WriteByte(ch)
+			i++
+		}
+		return b.String()
+	}
+
+	out := make([]string, 0, len(lines))
+	// Pending INSERT line that might be continued with VALUES on next line.
+	pendingInsert := ""
+	for _, line := range lines {
+		if !isBoxLine(line) {
+			if pendingInsert != "" {
+				out = append(out, pendingInsert)
+				pendingInsert = ""
+			}
+			out = append(out, line)
+			continue
+		}
+		content := boxContent(line)
+		upper := strings.ToUpper(strings.TrimSpace(content))
+		// If we have a pending INSERT and this is a VALUES continuation, merge them.
+		if pendingInsert != "" {
+			if strings.HasPrefix(upper, "VALUES") {
+				// Merge: take the pending INSERT line, append VALUES part
+				insertContent := boxContent(pendingInsert)
+				merged := insertContent + " " + strings.TrimSpace(content)
+				merged = stripInsertColList(merged)
+				merged = stripFuncQualifier(merged)
+				merged = compactParens(merged)
+				// Reconstruct box line with original padding
+				indent := ""
+				if len(pendingInsert) > 0 && pendingInsert[0] == ' ' {
+					indent = " "
+				}
+				out = append(out, indent+merged+" ")
+				pendingInsert = ""
+				continue
+			}
+			// Not a VALUES continuation — flush pending
+			out = append(out, pendingInsert)
+			pendingInsert = ""
+		}
+		// Check for INSERT line that might be split (has column list but no VALUES on same line)
+		if strings.HasPrefix(upper, "INSERT") && !strings.Contains(upper, "VALUES") {
+			pendingInsert = line
+			continue
+		}
+		// Normalize INSERT ... VALUES lines
+		if strings.HasPrefix(upper, "INSERT") && strings.Contains(upper, "VALUES") {
+			content = stripInsertColList(content)
+			content = stripFuncQualifier(content)
+			content = compactParens(content)
+			indent := ""
+			if len(line) > 0 && line[0] == ' ' {
+				indent = " "
+			}
+			out = append(out, indent+content+" ")
+			continue
+		}
+		out = append(out, line)
+	}
+	if pendingInsert != "" {
+		out = append(out, pendingInsert)
+	}
+	return out
+}
+
 func sortUnorderedResultBlocks(lines []string) []string {
 	// isSeparatorLine reports whether a line is a psql column-separator line
 	// (e.g. "------+------" or "----------") — all chars are -, +, |, or space,

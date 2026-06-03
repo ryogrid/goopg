@@ -1325,6 +1325,14 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				// a WARNING and ROLLBACK instead of committing. M0100-0005.
 				if connTx.IsFailed() {
 					// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
+					// Restore routines dropped in this transaction.
+					if sess := connTx.Session(); sess != nil {
+						if rs := s.cfg.Catalog.Routines(); rs != nil {
+							for _, r := range sess.TakePendingRoutineDrops() {
+								_, _ = rs.Create(r, true)
+							}
+						}
+					}
 					_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
@@ -1344,6 +1352,14 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				// detected. Returns nil for RC/RR / write-less SERIALIZABLE.
 				if explicitTx.Isolation == mvcc.IsolationSerializable && explicitTx.Handle != 0 {
 					if ssiErr := s.cfg.TxnMgr.PreCommitCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
+						// SSI failure: rollback and restore dropped routines.
+						if sess := connTx.Session(); sess != nil {
+							if rs := s.cfg.Catalog.Routines(); rs != nil {
+								for _, r := range sess.TakePendingRoutineDrops() {
+									_, _ = rs.Create(r, true)
+								}
+							}
+						}
 						_ = s.cfg.TxnMgr.Rollback(explicitTx)
 						undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 						connTx.End()
@@ -1361,6 +1377,10 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					ctx.PendingEnumRenames = nil
 					ctx.PendingCreatedEnums = nil
 					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
+				}
+				// Clear pending routine drops — committed, no restoration needed.
+				if sess := connTx.Session(); sess != nil {
+					sess.TakePendingRoutineDrops()
 				}
 				connTx.End()
 				ctx.PendingEnumValues = nil
@@ -1381,6 +1401,14 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		case planner.TxRollback:
 			if connTx != nil && connTx.InExplicit() {
+				// Restore any routines dropped in this transaction before rolling back.
+				if sess := connTx.Session(); sess != nil {
+					if rs := s.cfg.Catalog.Routines(); rs != nil {
+						for _, r := range sess.TakePendingRoutineDrops() {
+							_, _ = rs.Create(r, true)
+						}
+					}
+				}
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 				undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 				connTx.End()
