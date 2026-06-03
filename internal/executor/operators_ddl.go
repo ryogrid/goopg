@@ -1256,14 +1256,61 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				}
 			}
 		}
-		// CASCADE: drop views that directly reference this table (like PG's pg_depend cascade).
+		// CASCADE: drop views and functions that directly or transitively reference this table.
 		if s.Behavior == parser.DropCascade {
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-				for _, viewName := range viewsDependingOnTable(im, name) {
-					o.ctx.AddNotice(fmt.Sprintf("drop cascades to view %s", viewName.String()))
-					dropped := map[string]bool{}
-					if err := o.execDropOneView(viewName, true, parser.DropCascade, s.Pos(), dropped); err != nil {
-						return err
+				// Collect all dependents in display order: views first, then functions.
+				type cascadeDep struct {
+					kind     string             // "view" or "function"
+					display  string             // full display text, e.g. "view functestv3"
+					viewName parser.ObjectName  // for view drops
+					routine  *catalog.Routine   // for function drops
+				}
+				var deps []cascadeDep
+
+				// Direct view dependents.
+				viewNames := viewsDependingOnTable(im, name)
+				for _, vn := range viewNames {
+					deps = append(deps, cascadeDep{kind: "view", display: "view " + vn.String(), viewName: vn})
+				}
+				// Direct function dependents (via TableDeps).
+				for _, r := range functionsDependingOnTable(o.ctx.Catalog, name) {
+					dn := routineCascadeDisplayName(r)
+					deps = append(deps, cascadeDep{kind: "function", display: "function " + dn, routine: r})
+				}
+				// Transitive function dependents via views being dropped.
+				for _, vn := range viewNames {
+					for _, r := range functionsDependingOnTable(o.ctx.Catalog, vn) {
+						dn := routineCascadeDisplayName(r)
+						deps = append(deps, cascadeDep{kind: "function", display: "function " + dn, routine: r})
+					}
+				}
+
+				// Emit NOTICE: 1 object → individual; N > 1 → "N other objects" + DETAIL.
+				if len(deps) == 1 {
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to %s", deps[0].display))
+				} else if len(deps) > 1 {
+					detail := make([]string, len(deps))
+					for i, d := range deps {
+						detail[i] = fmt.Sprintf("drop cascades to %s", d.display)
+					}
+					o.ctx.AddNoticeWithDetail(
+						fmt.Sprintf("drop cascades to %d other objects", len(deps)),
+						strings.Join(detail, "\n"),
+					)
+				}
+
+				// Drop all dependents.
+				for _, d := range deps {
+					if d.kind == "view" {
+						dropped := map[string]bool{}
+						if err := o.execDropOneView(d.viewName, true, parser.DropCascade, s.Pos(), dropped); err != nil {
+							return err
+						}
+					} else if d.kind == "function" && d.routine != nil {
+						if rs := o.ctx.Catalog.Routines(); rs != nil {
+							_ = rs.DropRoutine(d.routine)
+						}
 					}
 				}
 			}
@@ -1295,6 +1342,92 @@ func viewsDependingOnTable(im *catalog.InMemory, tableName parser.ObjectName) []
 		}
 	}
 	return deps
+}
+
+// functionsDependingOnTable returns all routines whose TableDeps reference the given table/view name.
+// Used by DROP TABLE/VIEW CASCADE to cascade drops to dependent functions.
+func functionsDependingOnTable(cat catalog.Catalog, tableName parser.ObjectName) []*catalog.Routine {
+	rs := cat.Routines()
+	if rs == nil {
+		return nil
+	}
+	tblLower := strings.ToLower(tableName.Name)
+	schemaLower := strings.ToLower(tableName.Schema)
+	var result []*catalog.Routine
+	for _, r := range rs.List() {
+		for _, td := range r.TableDeps {
+			if strings.ToLower(td.Name) == tblLower {
+				// Match if schema is unspecified on either side or schemas agree.
+				if schemaLower == "" || td.Schema == "" || strings.ToLower(td.Schema) == schemaLower {
+					result = append(result, r)
+					break
+				}
+			}
+		}
+	}
+	return result
+}
+
+// functionsDependingOnSequence returns all routines whose SequenceDeps reference the given sequence name.
+func functionsDependingOnSequence(cat catalog.Catalog, seqName string, seqSchema string) []*catalog.Routine {
+	rs := cat.Routines()
+	if rs == nil {
+		return nil
+	}
+	seqLower := strings.ToLower(seqName)
+	schemaLower := strings.ToLower(seqSchema)
+	var result []*catalog.Routine
+	for _, r := range rs.List() {
+		for _, sd := range r.SequenceDeps {
+			if strings.ToLower(sd.Name) == seqLower {
+				if schemaLower == "" || sd.Schema == "" || strings.ToLower(sd.Schema) == schemaLower {
+					result = append(result, r)
+					break
+				}
+			}
+		}
+	}
+	return result
+}
+
+// functionsDependingOnRoutineOID returns all routines whose RoutineCallOIDs include the given OID.
+func functionsDependingOnRoutineOID(cat catalog.Catalog, oid uint32) []*catalog.Routine {
+	rs := cat.Routines()
+	if rs == nil {
+		return nil
+	}
+	var result []*catalog.Routine
+	for _, r := range rs.List() {
+		for _, callOID := range r.RoutineCallOIDs {
+			if callOID == oid {
+				result = append(result, r)
+				break
+			}
+		}
+	}
+	return result
+}
+
+// routineCascadeDisplayName formats a routine's name and arg types for DROP CASCADE NOTICE messages.
+// Format: "funcname(argtype1,argtype2,...)" using canonical type names.
+func routineCascadeDisplayName(r *catalog.Routine) string {
+	name := strings.ToLower(r.Name)
+	parts := make([]string, 0, len(r.ArgTypes))
+	for i, t := range r.ArgTypes {
+		mode := ""
+		if i < len(r.ArgModes) {
+			mode = r.ArgModes[i]
+		}
+		if mode == "o" {
+			continue // Skip OUT params (same as Signature())
+		}
+		canon := dropCompatCanonicalType(t.Name)
+		if canon == "" {
+			canon = strings.ToLower(t.Name)
+		}
+		parts = append(parts, canon)
+	}
+	return name + "(" + strings.Join(parts, ",") + ")"
 }
 
 // dropTableByRef drops a single table by its catalog.Table reference.
@@ -3599,6 +3732,46 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		}
 	}
 
+	// CASCADE: drop functions that depend on this function via RoutineCallOIDs.
+	if s.Behavior == parser.DropCascade {
+		// Collect target routines to find dependents for.
+		var targets []*catalog.Routine
+		if s.Args != nil {
+			argTypes := make([]catalog.Type, len(s.Args))
+			for i, a := range s.Args {
+				argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+			}
+			if target, ok := rs.Lookup(s.Name, argTypes); ok && target != nil {
+				targets = []*catalog.Routine{target}
+			}
+		} else {
+			// No arg list: find all overloads by name.
+			targets = rs.LookupByName(s.Name)
+		}
+		var allDeps []*catalog.Routine
+		for _, target := range targets {
+			for _, dep := range functionsDependingOnRoutineOID(o.ctx.Catalog, target.OID) {
+				allDeps = append(allDeps, dep)
+			}
+		}
+		if len(allDeps) == 1 {
+			dn := routineCascadeDisplayName(allDeps[0])
+			o.ctx.AddNotice(fmt.Sprintf("drop cascades to function %s", dn))
+			_ = rs.DropRoutine(allDeps[0])
+		} else if len(allDeps) > 1 {
+			detail := make([]string, len(allDeps))
+			for i, r := range allDeps {
+				dn := routineCascadeDisplayName(r)
+				detail[i] = fmt.Sprintf("drop cascades to function %s", dn)
+				_ = rs.DropRoutine(r)
+			}
+			o.ctx.AddNoticeWithDetail(
+				fmt.Sprintf("drop cascades to %d other objects", len(allDeps)),
+				strings.Join(detail, "\n"),
+			)
+		}
+	}
+
 	var err error
 	if s.Args == nil {
 		err = rs.DropByName(s.Name)
@@ -4380,6 +4553,20 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					}
 					sort.Strings(droppedRoutines)
 				}
+				// Collect views in the schema.
+				var droppedViews []string
+				if im2, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
+					for _, v := range im2.AllUserViews() {
+						if strings.EqualFold(v.Schema, schemaName) {
+							droppedViews = append(droppedViews, v.Name)
+						}
+					}
+					sort.Strings(droppedViews)
+					for _, vn := range droppedViews {
+						dropped := map[string]bool{}
+						_ = o.execDropOneView(parser.ObjectName{Schema: schemaName, Name: vn}, true, parser.DropCascade, s.Pos(), dropped)
+					}
+				}
 				// Sort table names for deterministic DETAIL output.
 				sort.Slice(tables, func(i, j int) bool {
 					return tables[i].String() < tables[j].String()
@@ -4390,8 +4577,8 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 					}
 				}
-				// Emit NOTICE with total cascade count (tables + routines).
-				total := len(tables) + len(droppedRoutines)
+				// Emit NOTICE with total cascade count (tables + views + routines).
+				total := len(tables) + len(droppedViews) + len(droppedRoutines)
 				if total > 0 {
 					var detailLines []string
 					for _, funcName := range droppedRoutines {
@@ -4399,6 +4586,9 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					}
 					for _, tbl := range tables {
 						detailLines = append(detailLines, fmt.Sprintf("drop cascades to table %s", tbl.String()))
+					}
+					for _, vn := range droppedViews {
+						detailLines = append(detailLines, fmt.Sprintf("drop cascades to view %s", vn))
 					}
 					detail := strings.Join(detailLines, "\n")
 					o.ctx.AddNoticeWithDetail(
@@ -4556,6 +4746,30 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		for _, name := range s.Names {
 			if o.dropSchemaQualifiedNotice(name) {
 				continue
+			}
+			// CASCADE: drop functions that depend on this sequence before dropping it.
+			if s.Behavior == parser.DropCascade {
+				funcDeps := functionsDependingOnSequence(o.ctx.Catalog, name.Name, name.Schema)
+				if len(funcDeps) == 1 {
+					dn := routineCascadeDisplayName(funcDeps[0])
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to function %s", dn))
+					if rs := o.ctx.Catalog.Routines(); rs != nil {
+						_ = rs.DropRoutine(funcDeps[0])
+					}
+				} else if len(funcDeps) > 1 {
+					detail := make([]string, len(funcDeps))
+					for i, r := range funcDeps {
+						dn := routineCascadeDisplayName(r)
+						detail[i] = fmt.Sprintf("drop cascades to function %s", dn)
+						if rs := o.ctx.Catalog.Routines(); rs != nil {
+							_ = rs.DropRoutine(r)
+						}
+					}
+					o.ctx.AddNoticeWithDetail(
+						fmt.Sprintf("drop cascades to %d other objects", len(funcDeps)),
+						strings.Join(detail, "\n"),
+					)
+				}
 			}
 			if !DropSequence(name.String()) {
 				if s.IfExists {
@@ -5644,13 +5858,38 @@ func extractRoutineDeps(body string, argDefaults []string, schema string, r *cat
 		}
 	}
 
-	// Parse and walk the function body.
-	if body != "" {
+	// Parse and walk the function body for table/sequence/routine deps.
+	// Only BEGIN ATOMIC and RETURN-form bodies create pg_depend entries in PG14+.
+	// AS-quoted-string bodies (the old style) do NOT create body-level deps.
+	if body != "" && (r.BeginAtomic || r.IsReturnForm) {
 		stmts, err := parser.Parse(body)
 		if err == nil {
 			for _, st := range stmts {
-				if sel, ok := st.(*parser.SelectStmt); ok {
-					walkSelect(sel)
+				switch s := st.(type) {
+				case *parser.SelectStmt:
+					walkSelect(s)
+				case *parser.InsertStmt:
+					// Record INSERT INTO table as a table dependency.
+					if s.Target.Name != "" {
+						tblName := strings.ToLower(s.Target.Name)
+						tblSchema := strings.ToLower(s.Target.Schema)
+						if tblSchema == "" {
+							tblSchema = schema
+						}
+						found := false
+						for _, td := range r.TableDeps {
+							if td.Name == tblName && td.Schema == tblSchema {
+								found = true
+								break
+							}
+						}
+						if !found {
+							r.TableDeps = append(r.TableDeps, catalog.RoutineTableRef{Schema: tblSchema, Name: tblName})
+						}
+					}
+					if s.Select != nil {
+						walkSelect(s.Select)
+					}
 				}
 			}
 		}
