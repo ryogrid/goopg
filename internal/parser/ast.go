@@ -1549,6 +1549,8 @@ type AlterFunctionStmt struct {
 	Name            ObjectName
 	Args            []FunctionArg // nil means no arg list given (applies to all overloads)
 	IsProcedure     bool
+	IsRoutine       bool   // ALTER ROUTINE: applies to both functions and procedures (M0097-0022)
+	RenameTo        string // RENAME TO new_name (M0097-0022)
 	// Updated attributes (nil = not changed)
 	Volatile        *string // "v", "s", "i"
 	SecurityDefiner *bool
@@ -1599,6 +1601,7 @@ type CreateProcedureStmt struct {
 	SecurityDefiner bool   // SECURITY DEFINER
 	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
 	Strict          bool   // STRICT / RETURNS NULL ON NULL INPUT
+	Window          bool   // WINDOW attribute (invalid for procedures)
 	Volatile        string // "v"=volatile (default), "s"=stable, "i"=immutable
 }
 

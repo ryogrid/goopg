@@ -70,8 +70,9 @@ func (o *callOp) Open(ctx *Context) error {
 		allOverloads := rs.LookupByName(fnName)
 		isBuiltinFunc := isKnownBuiltinFunction(strings.ToLower(st.Name.Name))
 		if isBuiltinFunc {
+			typedArgList := buildTypedArgListStr(st.Args)
 			return &ExecError{Code: "42809", Pos: st.Pos(),
-				Message: fmt.Sprintf("%s%s is not a procedure", st.Name.Name, argList),
+				Message: fmt.Sprintf("%s%s is not a procedure", st.Name.Name, typedArgList),
 				Hint:    "To call a function, use SELECT."}
 		}
 		if len(allOverloads) > 0 {
@@ -111,6 +112,8 @@ func (o *callOp) Open(ctx *Context) error {
 	// placeholder values (NULL) for each OUT param too. So we match against the
 	// total declared param count (IN + OUT + INOUT), or just IN count if fewer args.
 	inArgCount := len(st.Args)
+	// Infer caller arg types from expressions for type-based OUT param matching.
+	callerArgTypeNames := inferCallArgTypes(st.Args)
 	matches := make([]*catalog.Routine, 0, 1)
 	for _, c := range routines {
 		inCount := 0 // IN + INOUT params only
@@ -135,11 +138,50 @@ func (o *callOp) Open(ctx *Context) error {
 		// - Exactly totalCount args (including OUT placeholders), OR
 		// - At most inCount args (defaults fill missing IN/INOUT args), OR
 		// - More than inCount when the last param is VARIADIC (extra args bundled).
-		if inArgCount == totalCount || inArgCount <= inCount {
+		countMatch := inArgCount == totalCount || inArgCount <= inCount ||
+			(hasVariadic && inArgCount >= inCount-1)
+		if !countMatch {
+			continue
+		}
+		// Type-check OUT param positions: when caller provides OUT placeholder
+		// expressions with specific types (e.g. 1./0. → numeric), reject if
+		// the inferred type is incompatible with the declared param type.
+		typeMatch := true
+		if inArgCount == totalCount {
+			for i, mode := range c.ArgModes {
+				if mode != "o" {
+					continue
+				}
+				if i >= len(callerArgTypeNames) {
+					break
+				}
+				callerType := callerArgTypeNames[i]
+				paramType := strings.ToLower(c.ArgTypes[i].Name)
+				if callerType == "unknown" || callerType == "" || paramType == "" {
+					continue // unknown caller type: accept
+				}
+				// Basic type family compatibility check.
+				if !callArgTypeCompatible(callerType, paramType) {
+					typeMatch = false
+					break
+				}
+			}
+		}
+		if typeMatch {
 			matches = append(matches, c)
-		} else if hasVariadic && inArgCount >= inCount-1 {
-			// VARIADIC: accept any number of args >= non-variadic IN params.
-			matches = append(matches, c)
+		}
+	}
+	// If no type-compatible match found but there were count-compatible candidates,
+	// report "procedure name(inferred_types) does not exist".
+	if len(matches) == 0 {
+		// Build typed arg list from inferred types for error message.
+		typedArgList := "(" + strings.Join(callerArgTypeNames, ", ") + ")"
+		if len(callerArgTypeNames) == 0 {
+			typedArgList = "()"
+		}
+		return &ExecError{Code: "42883", Pos: st.Pos(),
+			Message:  fmt.Sprintf("procedure %s%s does not exist", st.Name.Name, typedArgList),
+			Hint:     "No procedure matches the given name and argument types. You might need to add explicit type casts.",
 		}
 	}
 	switch len(matches) {
@@ -250,8 +292,50 @@ func (o *callOp) Open(ctx *Context) error {
 		}
 	}
 
+	// Bundle VARIADIC args into an array datum (M0097-0022).
+	// After positional/named arg mapping, if there's a VARIADIC param and
+	// the caller provided more args than declared params, collect the excess
+	// into an array at the VARIADIC position.
+	for vi, mode := range r.ArgModes {
+		if mode != "v" {
+			continue
+		}
+		// Collect all values from position vi onward as the variadic array.
+		if vi < len(args) {
+			elems := make([]Datum, 0, len(args)-vi)
+			for i := vi; i < len(args); i++ {
+				elems = append(elems, args[i])
+			}
+			arrStr := buildArrayDatum(elems)
+			args = append(args[:vi], arrStr)
+			args = append(args, make([]Datum, len(r.ArgTypes)-len(args))...)
+		}
+		break
+	}
+	// Trim args to declared param count.
+	if len(args) > len(r.ArgTypes) {
+		args = args[:len(r.ArgTypes)]
+	}
+
 	o.args = args
 	return nil
+}
+
+// buildArrayDatum constructs a text-format array datum from a list of elements.
+// Used to bundle VARIADIC arguments. Result is stored as KindString with {e1,e2,...} format.
+func buildArrayDatum(elems []Datum) Datum {
+	if len(elems) == 0 {
+		return NewStringDatum("{}")
+	}
+	parts := make([]string, len(elems))
+	for i, d := range elems {
+		if d.IsNull() {
+			parts[i] = "NULL"
+		} else {
+			parts[i] = d.Format()
+		}
+	}
+	return NewStringDatum("{" + strings.Join(parts, ",") + "}")
 }
 
 // evalCallDefault parses and evaluates a simple constant default expression.
@@ -454,6 +538,84 @@ func buildArgListStr(n int) string {
 		parts[i] = "unknown"
 	}
 	return "(" + strings.Join(parts, ", ") + ")"
+}
+
+// inferCallArgType infers the PG type name of a parser expression without evaluating.
+func inferCallArgType(arg parser.Expr) string {
+	switch x := arg.(type) {
+	case *parser.IntegerConst:
+		return "integer"
+	case *parser.NumericConst:
+		return "numeric"
+	case *parser.StringConst:
+		return "text"
+	case *parser.BooleanConst:
+		return "boolean"
+	case *parser.NullConst:
+		return "unknown"
+	case *parser.BinaryOp:
+		// Arithmetic on two numeric operands → numeric.
+		lt := inferCallArgType(x.Left)
+		rt := inferCallArgType(x.Right)
+		if lt == "numeric" || rt == "numeric" {
+			return "numeric"
+		}
+		if lt == "integer" && rt == "integer" {
+			return "integer"
+		}
+		return "unknown"
+	case *parser.UnaryOp:
+		return inferCallArgType(x.Operand)
+	case *parser.CastExpr:
+		return strings.ToLower(x.Type.Name)
+	}
+	return "unknown"
+}
+
+// inferCallArgTypes infers type names from parser-level expressions
+// for use in error messages. Falls back to "unknown" for complex exprs.
+func inferCallArgTypes(args []parser.Expr) []string {
+	types := make([]string, len(args))
+	for i, arg := range args {
+		types[i] = inferCallArgType(arg)
+	}
+	return types
+}
+
+// callArgTypeCompatible checks if a caller-provided arg type is compatible
+// with a procedure parameter type. Used for OUT param type matching.
+func callArgTypeCompatible(callerType, paramType string) bool {
+	callerType = strings.ToLower(callerType)
+	paramType = strings.ToLower(paramType)
+	if callerType == paramType {
+		return true
+	}
+	// Integer family compatibility.
+	intFamily := map[string]bool{
+		"integer": true, "int4": true, "int": true, "int2": true, "smallint": true,
+		"int8": true, "bigint": true,
+	}
+	if intFamily[callerType] && intFamily[paramType] {
+		return true
+	}
+	// Numeric/decimal family.
+	numFamily := map[string]bool{
+		"numeric": true, "decimal": true, "float4": true, "real": true,
+		"float8": true, "double precision": true,
+	}
+	if numFamily[callerType] && numFamily[paramType] {
+		return true
+	}
+	return false
+}
+
+// buildTypedArgListStr builds "(type1, type2, ...)" from inferred arg types.
+func buildTypedArgListStr(args []parser.Expr) string {
+	if len(args) == 0 {
+		return "()"
+	}
+	types := inferCallArgTypes(args)
+	return "(" + strings.Join(types, ", ") + ")"
 }
 
 // routineArgListStr formats arg types as "(type1, type2)" for error messages,

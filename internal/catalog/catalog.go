@@ -2184,6 +2184,142 @@ func (c *InMemory) registerSystemTables() {
 		sort.Slice(rows, func(i, j int) bool { return rows[i][0] < rows[j][0] })
 		return rows
 	}
+
+	// information_schema virtual tables (M0097-0022).
+	c.registerInformationSchemaTables()
+}
+
+// registerInformationSchemaTables adds information_schema virtual tables:
+// routines, parameters, and usage stubs. These read from the routine registry.
+func (c *InMemory) registerInformationSchemaTables() {
+	// information_schema.routines — one row per user-defined routine.
+	isRoutines := &Table{
+		Schema:  "information_schema",
+		Name:    "routines",
+		Virtual: true,
+		Columns: []Column{
+			{Name: "specific_catalog", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "specific_schema", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "specific_name", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "routine_catalog", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "routine_schema", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "routine_name", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "routine_type", Type: Type{Name: "text"}, Ordinal: 6},
+		},
+	}
+	isRoutines.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
+		}
+		var rows [][]string
+		for _, r := range rs.List() {
+			schema := r.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			specificName := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			rtype := "FUNCTION"
+			if r.IsProcedure {
+				rtype = "PROCEDURE"
+			}
+			rows = append(rows, []string{
+				"postgres", schema, specificName, "postgres", schema, r.Name, rtype,
+			})
+		}
+		return rows
+	}
+	c.tables["information_schema.routines"] = isRoutines
+
+	// information_schema.parameters — one row per parameter per routine.
+	isParams := &Table{
+		Schema:  "information_schema",
+		Name:    "parameters",
+		Virtual: true,
+		Columns: []Column{
+			{Name: "specific_catalog", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "specific_schema", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "specific_name", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "ordinal_position", Type: Type{Name: "int4"}, Ordinal: 3},
+			{Name: "parameter_mode", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "parameter_name", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "data_type", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "parameter_default", Type: Type{Name: "text"}, Ordinal: 7},
+		},
+	}
+	isParams.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
+		}
+		var rows [][]string
+		for _, r := range rs.List() {
+			schema := r.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			specificName := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			for i, t := range r.ArgTypes {
+				mode := "IN"
+				if i < len(r.ArgModes) {
+					switch r.ArgModes[i] {
+					case "o":
+						mode = "OUT"
+					case "b":
+						mode = "INOUT"
+					case "v":
+						mode = "VARIADIC"
+					}
+				}
+				paramName := ""
+				if i < len(r.ArgNames) {
+					paramName = r.ArgNames[i]
+				}
+				paramDefault := ""
+				if i < len(r.ArgDefaults) {
+					pd := r.ArgDefaults[i]
+					if pd != "" {
+						// Annotate string literals with ::type cast (PG canonical form).
+						if len(pd) >= 2 && pd[0] == '\'' && pd[len(pd)-1] == '\'' {
+							typName := strings.ToLower(t.Name)
+							switch typName {
+							case "text", "varchar", "character varying", "char", "bpchar":
+								pd = pd + "::" + typName
+							}
+						}
+						paramDefault = pd
+					}
+				}
+				rows = append(rows, []string{
+					"postgres", schema, specificName,
+					fmt.Sprintf("%d", i+1),
+					mode, paramName, t.Name, paramDefault,
+				})
+			}
+		}
+		return rows
+	}
+	c.tables["information_schema.parameters"] = isParams
+
+	// Stub usage views — return no rows (body analysis not implemented).
+	for _, name := range []string{"routine_routine_usage", "routine_sequence_usage", "routine_column_usage", "routine_table_usage"} {
+		n := name
+		tbl := &Table{
+			Schema:  "information_schema",
+			Name:    n,
+			Virtual: true,
+			Columns: []Column{
+				{Name: "specific_catalog", Type: Type{Name: "text"}, Ordinal: 0},
+				{Name: "specific_schema", Type: Type{Name: "text"}, Ordinal: 1},
+				{Name: "specific_name", Type: Type{Name: "text"}, Ordinal: 2},
+				{Name: "routine_catalog", Type: Type{Name: "text"}, Ordinal: 3},
+				{Name: "routine_schema", Type: Type{Name: "text"}, Ordinal: 4},
+				{Name: "routine_name", Type: Type{Name: "text"}, Ordinal: 5},
+			},
+		}
+		tbl.VirtualRows = func() [][]string { return nil }
+		c.tables["information_schema."+n] = tbl
+	}
 }
 
 // TryRegisterUserTable installs a user table recovered from the pg_class/

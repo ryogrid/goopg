@@ -347,18 +347,58 @@ func (p *parser) parseFunctionArg() (FunctionArg, error) {
 			p.advance()
 			arg.Mode = FuncArgVariadic
 		}
+	} else if p.cur().Kind == TokenIdent {
+		// Also accept "name mode type" form (e.g. `a OUT int`).
+		next := p.peek(1)
+		if next.Kind == TokenKeyword {
+			switch next.Keyword {
+			case KwIn, KwOut, KwInout, KwVariadic:
+				arg.Name = p.cur().Value
+				p.advance()
+				switch p.cur().Keyword {
+				case KwIn:
+					p.advance()
+					arg.Mode = FuncArgIn
+				case KwOut:
+					p.advance()
+					arg.Mode = FuncArgOut
+				case KwInout:
+					p.advance()
+					arg.Mode = FuncArgInout
+				case KwVariadic:
+					p.advance()
+					arg.Mode = FuncArgVariadic
+				}
+				colType, err := p.parseColumnType()
+				if err != nil {
+					return FunctionArg{}, err
+				}
+				arg.Type = colType
+				if p.acceptKeyword(KwDefault) || p.acceptSymbol("=") {
+					expr, err := p.parseExpr()
+					if err != nil {
+						return FunctionArg{}, err
+					}
+					arg.Default = expr
+				}
+				return arg, nil
+			}
+		}
 	}
 
 	return p.parseArgNameAndType(pos, arg)
 }
 
-// parseProcedureArg parses a single procedure argument: `[name] [IN|OUT|INOUT] type
-// [DEFAULT expr]`. Stage B allows OUT, INOUT, and VARIADIC modes.
+// parseProcedureArg parses a single procedure argument in any of the PG forms:
+//   [mode] [name] type      — mode-first
+//   [name] [mode] type      — name-first (PG also accepts this)
+//   [DEFAULT expr]
+// Stage B allows OUT, INOUT, and VARIADIC modes.
 func (p *parser) parseProcedureArg() (FunctionArg, error) {
 	pos := p.cur().Pos
 	arg := FunctionArg{pos: pos, Mode: FuncArgIn}
 
-	// Accept IN / OUT / INOUT / VARIADIC mode keywords.
+	// Accept IN / OUT / INOUT / VARIADIC mode keywords (mode-first form).
 	if p.cur().Kind == TokenKeyword {
 		switch p.cur().Keyword {
 		case KwIn:
@@ -373,6 +413,45 @@ func (p *parser) parseProcedureArg() (FunctionArg, error) {
 		case KwVariadic:
 			p.advance()
 			arg.Mode = FuncArgVariadic
+		}
+	} else if p.cur().Kind == TokenIdent {
+		// Might be "name mode type" form (e.g. `a OUT int`). Peek ahead: if
+		// the next token is a mode keyword, consume name then mode.
+		next := p.peek(1)
+		if next.Kind == TokenKeyword {
+			switch next.Keyword {
+			case KwIn, KwOut, KwInout, KwVariadic:
+				arg.Name = p.cur().Value
+				p.advance() // consume name
+				switch p.cur().Keyword {
+				case KwIn:
+					p.advance()
+					arg.Mode = FuncArgIn
+				case KwOut:
+					p.advance()
+					arg.Mode = FuncArgOut
+				case KwInout:
+					p.advance()
+					arg.Mode = FuncArgInout
+				case KwVariadic:
+					p.advance()
+					arg.Mode = FuncArgVariadic
+				}
+				// Now parse just the type (name already consumed).
+				colType, err := p.parseColumnType()
+				if err != nil {
+					return FunctionArg{}, err
+				}
+				arg.Type = colType
+				if p.acceptKeyword(KwDefault) || p.acceptSymbol("=") {
+					expr, err := p.parseExpr()
+					if err != nil {
+						return FunctionArg{}, err
+					}
+					arg.Default = expr
+				}
+				return arg, nil
+			}
 		}
 	}
 
@@ -571,6 +650,13 @@ func (p *parser) parseCreateProcedureTail(pos int, orReplace bool) (Stmt, error)
 			stmt.BeginAtomic = true
 			sawAs = true
 		case p.isFunctionAttribute():
+			// Track WINDOW and STRICT attributes for validation in executor.
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "window") {
+				stmt.Window = true
+			}
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "strict") {
+				stmt.Strict = true
+			}
 			p.consumeFunctionAttribute()
 		default:
 			if !sawAs {

@@ -41,6 +41,7 @@ type ExecError struct {
 	Message       string
 	Detail        string // optional DETAIL message for wire protocol. M0097-0003.
 	Hint          string // optional HINT message for wire protocol. M0097-0004.
+	Context       string // optional CONTEXT (WHERE) message for wire protocol. M0097-0022.
 	Pos           int
 	ConditionName string // set for RAISE condition_name; used for exception matching. M0097-0003.
 }

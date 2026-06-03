@@ -2708,20 +2708,34 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		argListStr := routineArgListStr(argTypes)
 		return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("%s %s%s does not exist", kind, s.Name.Name, argListStr)}
 	}
-	// Check that each matched routine is of the right kind.
-	for _, r := range routines {
-		if s.IsProcedure && !r.IsProcedure {
-			// ALTER PROCEDURE on a function → "is not a procedure"
-			argList := routineArgListStr(argTypes)
-			return &ExecError{Code: "42809", Pos: s.Pos(),
-				Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argList)}
+	// Check that each matched routine is of the right kind (skip for ALTER ROUTINE).
+	if !s.IsRoutine {
+		for _, r := range routines {
+			if s.IsProcedure && !r.IsProcedure {
+				argList := routineArgListStr(argTypes)
+				return &ExecError{Code: "42809", Pos: s.Pos(),
+					Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argList)}
+			}
+			if !s.IsProcedure && r.IsProcedure {
+				argList := routineArgListStr(argTypes)
+				return &ExecError{Code: "42809", Pos: s.Pos(),
+					Message: fmt.Sprintf("%s%s is not a function", s.Name.Name, argList)}
+			}
 		}
-		if !s.IsProcedure && r.IsProcedure {
-			// ALTER FUNCTION on a procedure → "is not a function"
-			argList := routineArgListStr(argTypes)
-			return &ExecError{Code: "42809", Pos: s.Pos(),
-				Message: fmt.Sprintf("%s%s is not a function", s.Name.Name, argList)}
+	}
+	// Check: STRICT attribute is invalid for ALTER PROCEDURE.
+	if s.IsProcedure && s.Strict != nil {
+		return &ExecError{Code: "42P13", Pos: s.Pos(),
+			Message: "invalid attribute in procedure definition"}
+	}
+	// RENAME TO: update the routine name in the registry.
+	if s.RenameTo != "" {
+		for _, r := range routines {
+			if err := rs.RenameRoutine(r, s.RenameTo); err != nil {
+				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+			}
 		}
+		return nil
 	}
 	for _, r := range routines {
 		if s.Volatile != nil {
@@ -2759,11 +2773,39 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	if lang != "plpgsql" && lang != "sql" && lang != "c" {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage B: plpgsql, sql)", s.Language)}
 	}
+	// Validate procedure-invalid attributes.
+	if s.Window {
+		return &ExecError{Code: "42P13", Pos: s.Pos(),
+			Message: "invalid attribute in procedure definition"}
+	}
+	if s.Strict {
+		return &ExecError{Code: "42P13", Pos: s.Pos(),
+			Message: "invalid attribute in procedure definition"}
+	}
 	argTypes := make([]catalog.Type, len(s.Args))
 	argNames := make([]string, len(s.Args))
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
+	// Validate: VARIADIC must be last; OUT can't follow default IN.
+	variadicSeen := false
+	defaultSeen := false
 	for i, a := range s.Args {
+		if variadicSeen {
+			return &ExecError{Code: "42P13", Pos: s.Pos(),
+				Message: "VARIADIC parameter must be the last parameter"}
+		}
+		if a.Mode == parser.FuncArgVariadic {
+			variadicSeen = true
+		}
+		if a.Mode == parser.FuncArgOut || a.Mode == parser.FuncArgInout {
+			if defaultSeen {
+				return &ExecError{Code: "42P13", Pos: s.Pos(),
+					Message: "procedure OUT parameters cannot appear after one with a default value"}
+			}
+		}
+		if a.Default != nil && (a.Mode == parser.FuncArgIn || a.Mode == 0) {
+			defaultSeen = true
+		}
 		typName := strings.ToLower(a.Type.Name)
 		if a.Type.IsArray {
 			typName += "[]"
@@ -3752,7 +3794,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 							// Build canonical arg list for NOTICE.
 							argStr := r.Name + "(" + buildFunctionArgsList(r) + ")"
 							droppedRoutines = append(droppedRoutines, argStr)
-							_ = rs.DropByName(parser.ObjectName{Schema: r.Schema, Name: r.Name})
+							_ = rs.Drop(parser.ObjectName{Schema: r.Schema, Name: r.Name}, r.ArgTypes)
 						}
 					}
 					sort.Strings(droppedRoutines)

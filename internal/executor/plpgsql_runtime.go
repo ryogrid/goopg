@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -11,6 +12,31 @@ import (
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/plpgsql"
 )
+
+// wrapSQLFunctionContext wraps an error with CONTEXT showing the SQL function
+// name and statement number. If the error already has a Context, it prepends.
+func wrapSQLFunctionContext(err error, funcName string, stmtNum int) error {
+	if err == nil {
+		return nil
+	}
+	var ctx string
+	if stmtNum > 0 {
+		ctx = fmt.Sprintf("SQL function %q statement %d", funcName, stmtNum)
+	} else {
+		ctx = fmt.Sprintf("SQL function %q", funcName)
+	}
+	var ee *ExecError
+	if errors.As(err, &ee) {
+		newErr := *ee
+		if newErr.Context != "" {
+			newErr.Context = ctx + "\n" + newErr.Context
+		} else {
+			newErr.Context = ctx
+		}
+		return &newErr
+	}
+	return &ExecError{Code: "XX000", Message: err.Error(), Context: ctx}
+}
 
 // rewriteSQLNamedParams replaces named parameter references in a SQL function
 // body with positional $n references. This supports SQL functions that reference
@@ -134,7 +160,9 @@ func routineArgTypesStr(r *catalog.Routine) string {
 func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
 	// Procedures cannot be called via SELECT - only via CALL.
 	if r.IsProcedure {
-		return NullDatum, &ExecError{Code: "42809", Pos: pos, Message: fmt.Sprintf("%s(%s) is a procedure", r.Name, routineArgTypesStr(r))}
+		return NullDatum, &ExecError{Code: "42809", Pos: pos,
+			Message: fmt.Sprintf("%s(%s) is a procedure", r.Name, routineArgTypesStr(r)),
+			Hint:    "To call a procedure, use CALL."}
 	}
 	switch strings.ToLower(r.Language) {
 	case "plpgsql":
@@ -196,18 +224,18 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	}
 	// VOID functions: run all statements for side-effects, return NULL.
 	if strings.EqualFold(r.ReturnType.Name, "void") {
-		for _, stmt := range stmts {
+		for si, stmt := range stmts {
 			node, err := planner.Plan(stmt, child.Catalog)
 			if err != nil {
-				return Datum{}, err
+				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
 			}
 			op, err := Build(node)
 			if err != nil {
-				return Datum{}, err
+				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
 			}
 			if err := op.Open(child); err != nil {
 				_ = op.Close()
-				return Datum{}, err
+				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
 			}
 			for {
 				_, nextErr := op.Next()
@@ -216,7 +244,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 				}
 				if nextErr != nil {
 					_ = op.Close()
-					return Datum{}, nextErr
+					return Datum{}, wrapSQLFunctionContext(nextErr, r.Name, si+1)
 				}
 			}
 			_ = op.Close()
@@ -230,17 +258,18 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	}
 	// Execute all statements except the last as side effects; return from last.
 	for i, stmt := range stmts {
+		stmtNum := i + 1
 		node, err := planner.Plan(stmt, child.Catalog)
 		if err != nil {
-			return Datum{}, err
+			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 		op, err := Build(node)
 		if err != nil {
-			return Datum{}, err
+			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 		if err := op.Open(child); err != nil {
 			_ = op.Close()
-			return Datum{}, err
+			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 		if i < len(stmts)-1 {
 			// Side-effect statement: drain rows, continue.
@@ -251,7 +280,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 				}
 				if nextErr != nil {
 					_ = op.Close()
-					return Datum{}, nextErr
+					return Datum{}, wrapSQLFunctionContext(nextErr, r.Name, stmtNum)
 				}
 			}
 			_ = op.Close()
@@ -262,7 +291,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 		out := NullDatum
 		if slot, nextErr := op.Next(); nextErr != EOF {
 			if nextErr != nil {
-				return Datum{}, nextErr
+				return Datum{}, wrapSQLFunctionContext(nextErr, r.Name, stmtNum)
 			}
 			row := slotRow(slot)
 			if len(row) > 0 {
@@ -270,7 +299,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 			}
 			if _, nextErr2 := op.Next(); nextErr2 != EOF {
 				if nextErr2 != nil {
-					return Datum{}, nextErr2
+					return Datum{}, wrapSQLFunctionContext(nextErr2, r.Name, stmtNum)
 				}
 				return Datum{}, &ExecError{Code: "21000", Pos: pos, Message: fmt.Sprintf("SQL function %s returned more than one row", r.QualifiedName())}
 			}
@@ -282,7 +311,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 		}
 		coerced, err := coerceDatumToType(out, normalizeCatalogType(r.ReturnType), pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
 		if err != nil {
-			return Datum{}, err
+			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 		return coerced, nil
 	}
@@ -337,17 +366,18 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 	}
 	var lastRow Row
 	for i, stmt := range stmts {
+		stmtNum := i + 1
 		node, err := planner.Plan(stmt, child.Catalog)
 		if err != nil {
-			return nil, err
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 		op, err := Build(node)
 		if err != nil {
-			return nil, err
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 		if err := op.Open(child); err != nil {
 			_ = op.Close()
-			return nil, err
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 		isLast := i == len(stmts)-1
 		for {
@@ -357,7 +387,7 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 			}
 			if nextErr != nil {
 				_ = op.Close()
-				return nil, nextErr
+				return nil, wrapSQLFunctionContext(nextErr, r.Name, stmtNum)
 			}
 			if isLast && lastRow == nil {
 				// Copy row so it survives op.Close().
@@ -367,7 +397,7 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 			}
 		}
 		if err := op.Close(); err != nil {
-			return nil, err
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 	}
 	if ctx != nil {
@@ -393,6 +423,11 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	if len(stmts) == 0 {
 		return nil, nil
 	}
+	// SETOF VOID returns an empty set (no columns, no rows).
+	retTypeName := strings.ToLower(r.ReturnType.Name)
+	if retTypeName == "void" {
+		return nil, nil
+	}
 	child := NewContext()
 	if ctx != nil {
 		*child = *ctx
@@ -412,17 +447,18 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	}
 	// Execute all statements except the last as side effects; collect rows from last.
 	for i, stmt := range stmts {
+		stmtNum := i + 1
 		node, err := planner.Plan(stmt, child.Catalog)
 		if err != nil {
-			return nil, err
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 		op, err := Build(node)
 		if err != nil {
-			return nil, err
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 		if err := op.Open(child); err != nil {
 			_ = op.Close()
-			return nil, err
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 		if i < len(stmts)-1 {
 			for {
@@ -432,7 +468,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 				}
 				if nextErr != nil {
 					_ = op.Close()
-					return nil, nextErr
+					return nil, wrapSQLFunctionContext(nextErr, r.Name, stmtNum)
 				}
 			}
 			_ = op.Close()
@@ -448,7 +484,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 				break
 			}
 			if nextErr != nil {
-				return nil, nextErr
+				return nil, wrapSQLFunctionContext(nextErr, r.Name, stmtNum)
 			}
 			row := slotRow(slot)
 			if len(row) == 0 {

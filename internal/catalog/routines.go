@@ -333,6 +333,38 @@ func (rs *Routines) LookupByOID(oid uint32) *Routine {
 	return nil
 }
 
+// RenameRoutine changes the Name of a routine in the registry.
+// Updates both byKey and byName indices. M0097-0022.
+func (rs *Routines) RenameRoutine(r *Routine, newName string) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	oldKey := routineKey(r.Schema, r.Name, r.Signature())
+	if _, ok := rs.byKey[oldKey]; !ok {
+		return fmt.Errorf("routine %s.%s not found in registry", r.Schema, r.Name)
+	}
+	oldNK := nameKey(r.Schema, r.Name)
+	// Remove old key from byKey and byName.
+	delete(rs.byKey, oldKey)
+	oldList := rs.byName[oldNK]
+	for i, k := range oldList {
+		if k == oldKey {
+			rs.byName[oldNK] = append(oldList[:i], oldList[i+1:]...)
+			break
+		}
+	}
+	if len(rs.byName[oldNK]) == 0 {
+		delete(rs.byName, oldNK)
+	}
+	// Update the routine name.
+	r.Name = newName
+	newKey := routineKey(r.Schema, r.Name, r.Signature())
+	newNK := nameKey(r.Schema, newName)
+	// Insert under new key and name.
+	rs.byKey[newKey] = r
+	rs.byName[newNK] = append(rs.byName[newNK], newKey)
+	return nil
+}
+
 func (rs *Routines) List() []*Routine {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()

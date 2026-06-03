@@ -754,6 +754,9 @@ func execErrDetailFields(err error) []protocol.ErrorField {
 	if ee.Hint != "" {
 		fields = append(fields, protocol.ErrorField{Code: protocol.FieldHint, Value: ee.Hint})
 	}
+	if ee.Context != "" {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldWhere, Value: ee.Context})
+	}
 	return fields
 }
 

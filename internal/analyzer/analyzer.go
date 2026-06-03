@@ -1098,12 +1098,22 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		}
 	case *parser.ArraySubscriptExpr:
 		// Array element access: expr[index] → element type. For text[] the element is text.
-		// Just analyze sub-expressions and return text (most common case). M0097-0003.
-		if _, err := analyzeExpr(x.Base, ctx); err != nil {
+		// When base type is unknown (e.g. a parameter $N), return "unknown" so arithmetic
+		// on the subscript passes the type check and is resolved at runtime. M0097-0022.
+		baseTyp, err := analyzeExpr(x.Base, ctx)
+		if err != nil {
 			return catalog.Type{}, err
 		}
 		if _, err := analyzeExpr(x.Index, ctx); err != nil {
 			return catalog.Type{}, err
+		}
+		// Infer element type from array type (strip trailing []).
+		if strings.HasSuffix(baseTyp.Name, "[]") {
+			return catalog.Type{Name: baseTyp.Name[:len(baseTyp.Name)-2]}, nil
+		}
+		// Unknown base type → return unknown so arithmetic proceeds.
+		if baseTyp.Name == "" || strings.EqualFold(baseTyp.Name, "unknown") {
+			return catalog.Type{Name: "unknown"}, nil
 		}
 		return catalog.Type{Name: "text"}, nil
 	case *parser.IndirectionStar:

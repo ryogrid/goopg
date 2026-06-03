@@ -7077,6 +7077,11 @@ func exprType(e Expr) catalog.Type {
 				if strings.HasPrefix(arrT.Name, "_") {
 					return catalog.Type{Name: arrT.Name[1:]}
 				}
+				// When base type is unknown (e.g. $N parameter or unresolved expr),
+				// return "unknown" so arithmetic on the subscript can proceed at runtime.
+				if arrT.Name == "" || arrT.Name == "unknown" {
+					return catalog.Type{Name: "unknown"}
+				}
 			}
 			return catalog.Type{Name: "text"}
 		case "timezone":

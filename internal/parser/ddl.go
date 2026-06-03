@@ -3168,7 +3168,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		stmt := &AlterFunctionStmt{pos: t.Pos, Name: name, IsProcedure: isProcedure}
+		stmt := &AlterFunctionStmt{pos: t.Pos, Name: name, IsProcedure: isProcedure, IsRoutine: routineConsumed}
 		// Optional arg list
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 			args, argErr := p.parseFunctionArgList()
@@ -3187,11 +3187,12 @@ func (p *parser) parseAlter() (Stmt, error) {
 				p.advance() // role name (ident or CURRENT_USER etc.)
 				continue
 			}
-			// RENAME TO new_name — no-op
+			// RENAME TO new_name — store new name in stmt
 			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "rename") {
 				p.advance() // RENAME
 				p.acceptKeyword(KwTo)
-				p.advance() // new name
+				newName, _ := p.parseIdent()
+				stmt.RenameTo = identText(newName)
 				continue
 			}
 			// SET SCHEMA schema — no-op
