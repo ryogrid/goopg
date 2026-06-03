@@ -5561,6 +5561,20 @@ back to heap fetches even when the Visibility Map could allow a pure index scan.
 - Every non-trivial subsystem must land alongside (or just before) a design
   doc under `docs/design/`. The spec treats this as a hard requirement.    
 
+<!-- M0097-enum-name-fix progress added by loop 9 2026-06-04 -->
+      - **COMPLETE 2026-06-04 (M0097-enum-name-fix — enum 3→0 PASS, name 3→0 PASS, loop 9):**
+        Two targeted fixes closing the last 6 diff lines across `enum` and `name`:
+        (a) `castTargetLabel` (planner.go): strips `[]` suffix before the switch so `::rainbow[]`
+            column label becomes `rainbow` not `rainbow[]` (matches PG `FigureColname` behavior).
+        (b) `array_subscript` targetMeta (planner.go): strips `[]` from `exprType(arg).Name` so
+            `(arr::rainbow[])[2]` yields column label `rainbow` not `rainbow[]`. Updated comment
+            to correct the false assertion that "parser strips []" — the parser preserves `[]`.
+        (c) `evalCast` `"name[]"` case (executor/expr.go): new switch case truncates each array
+            element to NAMEDATALEN-1=63 bytes; previously the TargetType `"name[]"` had no case
+            so `parse_ident(...)::name[]` silently passed through untruncated 68-char elements.
+        Tests: `enum` → 0 diffs (PASS), `name` → 0 diffs (PASS). Commit: 5978195f.
+        Baseline CSV updated, coverage markdown regenerated.
+
 <!-- M0097-0154 progress added by loop 5 2026-06-03 -->
       - **Progress 2026-06-03 (M0097-0154 — create_function_sql 82→31 diffs, loop 5):**
         Multiple improvements reducing create_function_sql from 82 to 31 normalized diff lines:
