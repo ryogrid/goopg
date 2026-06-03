@@ -2077,6 +2077,29 @@ M0097-0001 wires it up.
         Procedure-vs-function guard: `executeStoredRoutine` raises SQLSTATE 42809 when
         `r.IsProcedure` is true, preventing `SELECT ptest1(...)` from executing a procedure body.
         Baseline CSV: create_function_sql 430→415, create_procedure 274→307 (stale entry corrected).
+      - **Progress 2026-06-03 (M0097-0151 — create_function_sql 121→82 diffs, loop 4):**
+        Five improvements (commit 1360cb26):
+        (a) KindNumeric→int coercion in encodeValuePG: INSERT 1.2 into int column now
+            truncates via roundNumericToInt (enables create_and_insert/alter_and_insert SQL
+            functions to succeed — DDL inside SQL function bodies works).
+        (b) SQL function body validation at CREATE time (check_function_bodies=on):
+            validateSQLFunctionBody detects syntax errors, $N out-of-range, empty body,
+            multiple SELECT columns, string-vs-integer return type mismatch. Eliminates
+            spurious "function already exists" errors from invalid CREATE FUNCTION bodies.
+        (c) "only one AS item needed" parser error for AS 'body1', 'body2' form.
+            "duplicate function body specified" preserved for AS $$ ... $$ RETURN combination.
+        (d) DROP FUNCTION without args: "could not find a function named X" (was wrong message).
+        (e) WINDOW function kind change detection via IsWindow bool on catalog.Routine;
+            DETAIL message reports actual existing object kind.
+        (f) information_schema.routine_*_usage views: proper column schemas (sequence_name,
+            table_name, column_name) per PG standard.
+        (g) Polymorphic return type resolution at runtime: anyarray → integer[] based on
+            actual arg types; 'during startup' context for empty-body call-time errors.
+        Remaining create_function_sql blockers (82 diffs): pg_get_functiondef body
+        normalization (28), information_schema data (20), ALTER COLUMN TYPE (6),
+        partition hash error CONTEXT (4), only superuser (4), operator type check (2),
+        NOTICE cascades (14).
+
       - **Progress 2026-06-03 (M0097-0150 — function/procedure improvements, loop 3):**
         Seventeen coordinated fixes (commit below) targeting create_function_sql (415→361) and
         create_procedure (307→304) normalized diff lines:
