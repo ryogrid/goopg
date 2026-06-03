@@ -218,6 +218,15 @@ type resolveContext struct {
 	// nodes get the correct level for the executor's OuterRows stack.
 	// M0097-0065.
 	lateralSibling bool
+	// havingAgg, when non-nil, marks this context as the outer parent
+	// for a HAVING clause subquery. Aggregate function calls that match
+	// entries in havingAgg.aggregateByKey are "outer aggregate refs" —
+	// they reference the pre-computed value for the current group — and
+	// are replaced with OuterColumnRef pointing to the aggregate output
+	// column. Without this, the executor pushes the aggregate *output*
+	// row (fewer columns than the input) and resolving the outer column
+	// ref at its input-schema index fails with "out of range". M0097-0035.
+	havingAgg *aggregateSurface
 }
 
 type rangeBinding struct {
@@ -4024,6 +4033,26 @@ func groupExprName(e Expr) string {
 	return "?column?"
 }
 
+// buildHavingParentCtx creates a parent resolveContext for EXISTS/subquery
+// expressions inside a HAVING clause. It wraps agg.input with a havingAgg
+// pointer so that resolveExpr, when encountering an aggregate function call
+// whose key matches one of the outer query's aggregates, replaces it with an
+// OuterColumnRef to the pre-computed aggregate output column. This prevents the
+// "outer column ref X/idx=N out of range" error that occurs when the executor
+// pushes the aggregate output row (which has fewer columns than the input) as
+// the outer row for HAVING subqueries. M0097-0035.
+func buildHavingParentCtx(agg *aggregateSurface) *resolveContext {
+	return &resolveContext{
+		table:     agg.input.table,
+		alias:     agg.input.alias,
+		schema:    agg.input.schema,
+		bindings:  agg.input.bindings,
+		cat:       agg.input.cat,
+		parent:    agg.input.parent,
+		havingAgg: agg,
+	}
+}
+
 func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, error) {
 	if idx, ok := agg.groupByExpr[parserExprKey(e)]; ok {
 		// M0097-0155: if SELECT expression is table-qualified (e.g. t1.f1) and the
@@ -4051,9 +4080,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 	case *parser.IntervalLit:
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.SubqueryExpr:
-		return planSubqueryExpr(x, agg.input)
+		return planSubqueryExpr(x, buildHavingParentCtx(agg))
 	case *parser.ArraySubqueryExpr:
-		return planArraySubqueryExpr(x, agg.input)
+		return planArraySubqueryExpr(x, buildHavingParentCtx(agg))
 	case *parser.CollateExpr:
 		inner, err := resolveExprAfterAggregate(x.Operand, agg)
 		if err != nil {
@@ -4061,9 +4090,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		}
 		return &CollateExpr{pos: x.Pos(), Operand: inner, CollationName: x.CollationName}, nil
 	case *parser.InExpr:
-		return planInExpr(x, agg.input)
+		return planInExpr(x, buildHavingParentCtx(agg))
 	case *parser.ExistsExpr:
-		return planExistsExpr(x, agg.input)
+		return planExistsExpr(x, buildHavingParentCtx(agg))
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, agg.input)
 		if err != nil {
@@ -8030,6 +8059,37 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	case *parser.FuncCall:
 		if x.Over != nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
+		}
+		// Outer aggregate reference in HAVING subquery: when a HAVING clause
+		// contains an EXISTS/subquery, and that subquery's predicate references an
+		// aggregate function whose key matches the outer query's aggregate (e.g.
+		// `sum(distinct a.four)` in `HAVING EXISTS(... WHERE sum(distinct a.four) = ...)`),
+		// the aggregate is not a *new* aggregate inside the subquery — it is an outer
+		// reference to the pre-computed group aggregate. Replace it with an
+		// OuterColumnRef pointing to the aggregate output column so the executor
+		// reads the correct value from the aggregate output row. Without this, the
+		// executor resolves the argument's column ref against the aggregate output
+		// row (which has fewer columns than the input) and fails with "out of range".
+		// M0097-0035.
+		if isAggregateFunc(x) || isUserAggregateFunc(x, ctx.cat) {
+			k := aggregateCallKey(x)
+			for p := ctx; p != nil; p = p.parent {
+				if p.havingAgg == nil {
+					continue
+				}
+				if b, ok := p.havingAgg.aggregateByKey[k]; ok {
+					// Count parent hops from current ctx to the context that owns havingAgg.
+					level := 0
+					for q := ctx; q != p; q = q.parent {
+						if !q.lateralSibling {
+							level++
+						}
+					}
+					sc := p.havingAgg.output.schema[b.index]
+					return &OuterColumnRef{pos: x.Pos(), Name: sc.Name, Index: b.index, Level: level, Type: sc.Type}, nil
+				}
+				break // found havingAgg context but this aggregate is not in the outer query
+			}
 		}
 		// pg_typeof(expr) returns the static type of its argument. Fold it at
 		// plan time by replacing the arg with a StringConst holding the type name,

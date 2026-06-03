@@ -3115,6 +3115,25 @@ M0097-0001 wires it up.
             formats with FormatFloat(fsum, 'g', 15, 64) to match PG's float8out. aggregates: 95→87.
         Added tests: `TestSyntax_DDL_MatViewPgClass` (integration), `TestMatviewPgClassLookup` (unit).
         Baseline CSV updated: matview 247→175, aggregates 95→87.
+      - **Progress 2026-06-04 (M0097-0035 — aggregates 55→46, HAVING outer aggregate):**
+        Fixed outer aggregate references in HAVING EXISTS subqueries
+        (`internal/planner/planner.go`). Root cause: when `planExistsExpr` was called
+        from `resolveExprAfterAggregate`, it used `agg.input` (pre-aggregate input context)
+        as the outer context; the executor then pushes the aggregate *output* row (fewer
+        columns) as the outer row, causing "outer column ref X/idx=N out of range (width=2)".
+        Fix: (a) Added `havingAgg *aggregateSurface` field to `resolveContext`; (b) new
+        `buildHavingParentCtx(agg)` wraps `agg.input` with `havingAgg = agg`;
+        (c) `resolveExprAfterAggregate` uses the HAVING parent ctx for EXISTS/subquery/InExpr;
+        (d) `resolveExpr` FuncCall case: walks parent chain looking for `havingAgg`; when an
+        aggregate call's key matches `havingAgg.aggregateByKey`, replaces it with an
+        `OuterColumnRef` pointing to the aggregate output column (so the executor reads the
+        pre-computed group value from the aggregate output row). Fixes:
+        `select ten, sum(distinct four) from onek a group by ten having exists
+         (select 1 from onek b where sum(distinct a.four) = b.four)` now returns 5 rows.
+        aggregates: 55 → 46 diffs. Baseline updated.
+        Remaining aggregates gaps: outer aggregate in HAVING with filter-mismatch (9 lines),
+        FILTER outer-reference hoisting (37 lines), nested aggregate detection (1 line).
+
       - **Progress 2026-06-02 (M0097-0141 — enum ORDER BY, loop 477):**
         Five-part fix (commit 0d77a623):
         (a) `catalog.ResolveColumnType`: preserve enum type name (not "text") so columns retain
@@ -3440,7 +3459,7 @@ M0097-0001 wires it up.
         NOTICEs (2 lines). These require outer-aggregate-in-subquery promotion
         (PostgreSQL's "outer query becomes aggregate query" feature) which is complex.
 
-- [ ] **M0097-0036 — Port equivclass / functional_deps regress tests**
+- [x] **M0097-0036 — Port equivclass / functional_deps regress tests**
       - Summary: Make `equivclass`, `functional_deps` reach `pass`.
       - These depend on planner equivalence-class and functional-
         dependency inference (M0097-0006 scope).  Triage after
@@ -3540,6 +3559,9 @@ M0097-0001 wires it up.
         `functional_deps` → **PASS** (was 21 diff lines). `equivclass` still
         320 diff lines — separate planner equivalence-class feature, not
         addressed here. Design: `docs/design/0097-0036d-view-constraint-dep-tracking-drop-constraint-restrict.md`.
+      - **COMPLETE 2026-06-04:** `equivclass` and `functional_deps` both verify
+        at 0 diff lines (PASS) in `TestPort_RegressSuite`. `tid`, `tidrangescan`,
+        `tidscan` also pass. M0097-0036 DoD met.
 
 - [x] **M0097-0037 — Regress porting task breakdown (2026-05-22)**
       - Summary: Replaced the "promote" tasks with concrete "port"
