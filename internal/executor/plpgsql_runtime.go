@@ -187,6 +187,40 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 		}
 		child.Params[i] = coerced
 	}
+	// VOID functions: run all statements for side-effects, return NULL.
+	if strings.EqualFold(r.ReturnType.Name, "void") {
+		for _, stmt := range stmts {
+			node, err := planner.Plan(stmt, child.Catalog)
+			if err != nil {
+				return Datum{}, err
+			}
+			op, err := Build(node)
+			if err != nil {
+				return Datum{}, err
+			}
+			if err := op.Open(child); err != nil {
+				_ = op.Close()
+				return Datum{}, err
+			}
+			for {
+				_, nextErr := op.Next()
+				if nextErr == EOF {
+					break
+				}
+				if nextErr != nil {
+					_ = op.Close()
+					return Datum{}, nextErr
+				}
+			}
+			_ = op.Close()
+		}
+		if ctx != nil {
+			for _, n := range child.TakeNotices() {
+				ctx.AddNotice(n)
+			}
+		}
+		return NullDatum, nil
+	}
 	// Execute all statements except the last as side effects; return from last.
 	for i, stmt := range stmts {
 		node, err := planner.Plan(stmt, child.Catalog)
