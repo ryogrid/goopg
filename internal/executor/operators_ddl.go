@@ -2915,6 +2915,16 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 // the unique overload (and surfaces 42725 "ambiguous function"
 // if more than one exists).
 func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
+	// Multi-target: DROP FUNCTION f1(args), f2(args)
+	for _, extra := range s.Extras {
+		s2 := *s
+		s2.Name = extra.Name
+		s2.Args = extra.Args
+		s2.Extras = nil
+		if err := o.execDropFunction(&s2); err != nil {
+			return err
+		}
+	}
 	if s.IfExists && o.dropSchemaQualifiedNotice(s.Name) {
 		return nil
 	}

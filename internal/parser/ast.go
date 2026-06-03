@@ -1568,12 +1568,20 @@ func (s *CreateFunctionStmt) stmtNode() {}
 // scope; supporting one name keeps the slice small. The optional
 // argument list is stored verbatim so a later loop can implement
 // overload-resolution drop semantics without re-parsing.
+// DropFunctionItem is one function in a multi-name DROP FUNCTION.
+type DropFunctionItem struct {
+	Name ObjectName
+	Args []FunctionArg
+}
+
 type DropFunctionStmt struct {
 	pos      int
 	IfExists bool
 	Name     ObjectName
 	Args     []FunctionArg // nil when no parenthesised arg list was given
 	Behavior DropBehavior
+	// Extras for multi-target DROP FUNCTION f1(args), f2(args).
+	Extras []DropFunctionItem
 }
 
 func (s *DropFunctionStmt) Pos() int  { return s.pos }

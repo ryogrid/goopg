@@ -490,6 +490,18 @@ func (p *parser) parseDropFunctionTail(pos int) (Stmt, error) {
 		return nil, err
 	}
 	stmt.Args = args
+	// Multi-target: DROP FUNCTION f1(args), f2(args), f3(args)
+	for p.acceptSymbol(",") {
+		extraName, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		extraArgs, err := p.parseFunctionArgList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Extras = append(stmt.Extras, DropFunctionItem{Name: extraName, Args: extraArgs})
+	}
 	switch {
 	case p.acceptKeyword(KwCascade):
 		stmt.Behavior = DropCascade
