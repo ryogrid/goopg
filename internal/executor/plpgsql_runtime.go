@@ -167,7 +167,14 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	if err != nil {
 		return Datum{}, &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for function %s: %v", r.QualifiedName(), err)}
 	}
+	retTypeName := strings.ToLower(r.ReturnType.Name)
 	if len(stmts) == 0 {
+		// Empty body with non-void return type → "final statement must be SELECT"
+		if retTypeName != "" && retTypeName != "void" {
+			return Datum{}, &ExecError{Code: "42P13", Pos: pos,
+				Message: fmt.Sprintf("return type mismatch in function declared to return %s", canonicalReturnType(retTypeName)),
+				Detail:  "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING."}
+		}
 		return NullDatum, nil
 	}
 	child := NewContext()

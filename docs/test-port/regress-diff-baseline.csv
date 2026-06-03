@@ -92,7 +92,7 @@ int8,0,pass
 create_procedure,54,failed
 create_table,388,failed
 create_view,426,failed
-create_function_sql,135,failed
+create_function_sql,134,failed
 insert,507,failed
 subselect,500,failed
 guc,587,failed

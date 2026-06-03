@@ -2671,7 +2671,10 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		}
 		// ErrRoutineKindChange → SQLSTATE 42P13 (cannot change routine kind).
 		if errors.Is(err, catalog.ErrRoutineKindChange) {
-			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "cannot change routine kind"}
+			// execCreateFunction: we're creating a function, existing must be a procedure.
+			return &ExecError{Code: "42P13", Pos: s.Pos(),
+				Message: "cannot change routine kind",
+				Detail:  fmt.Sprintf("%q is a procedure.", s.Name.Name)}
 		}
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -2809,7 +2812,10 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
 		}
 		if errors.Is(err, catalog.ErrRoutineKindChange) {
-			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "cannot change routine kind"}
+			// Existing is a function; we're creating a procedure.
+			return &ExecError{Code: "42P13", Pos: s.Pos(),
+				Message: "cannot change routine kind",
+				Detail:  fmt.Sprintf("%q is a function.", s.Name.Name)}
 		}
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 	}
