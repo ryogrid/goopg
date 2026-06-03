@@ -2255,6 +2255,21 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		default:
 			return d, nil
 		}
+	case "name[]":
+		// name[] cast: truncate each array element to NAMEDATALEN-1 = 63 bytes.
+		// The parser preserves "[]" in TargetType for ::name[] casts; this case
+		// handles the array form so element truncation is applied. M0097-name-fix.
+		s := d.StringValue()
+		if len(s) > 0 && s[0] == '{' && s[len(s)-1] == '}' {
+			elems := parseTextArray(s)
+			for i, e := range elems {
+				if len(e) > 63 {
+					elems[i] = e[:63]
+				}
+			}
+			return NewStringDatum(formatTextArray(elems)), nil
+		}
+		return d, nil
 	case "text", "varchar", "bpchar", "char":
 		switch d.Kind {
 		case KindBool:

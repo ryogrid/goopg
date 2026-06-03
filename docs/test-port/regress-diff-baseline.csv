@@ -81,8 +81,8 @@ uuid,0,pass
 vacuum,0,pass
 varchar,0,pass
 xid,0,pass
-enum,3,failed
-name,3,failed
+enum,0,pass
+name,0,pass
 index_including_gist,60,failed
 aggregates,64,failed
 create_function_sql,0,pass

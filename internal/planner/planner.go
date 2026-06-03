@@ -6801,6 +6801,11 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 		if fc.Name == "array_subscript" {
 			if len(fc.Args) > 0 {
 				elemType := exprType(fc.Args[0]).Name
+				// Strip [] suffix: subscripting rainbow[] yields element type "rainbow".
+				// The TargetType preserves "[]" from the parser; we strip it here for the label.
+				if strings.HasSuffix(elemType, "[]") {
+					elemType = elemType[:len(elemType)-2]
+				}
 				if elemType != "" && elemType != "unknown" && elemType != "text" {
 					return elemType, exprType(e)
 				}
@@ -6865,6 +6870,11 @@ func encodeTypmod(typeName string, typmods []int64) int64 {
 }
 
 func castTargetLabel(t string) string {
+	// Strip array brackets: PostgreSQL FigureColname uses the element type name
+	// as the column label (e.g. ::rainbow[] → "rainbow"). M0097-enum-fix.
+	if strings.HasSuffix(t, "[]") {
+		t = t[:len(t)-2]
+	}
 	switch t {
 	case "boolean":
 		return "bool"
