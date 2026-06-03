@@ -1660,9 +1660,15 @@ func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datu
 		case KindInt:
 			return v, nil
 		case KindNumeric:
-			if v.Scale == 0 {
-				return Datum{Kind: KindInt, Int: v.NumericMantissaValue()}, nil
+			// Truncate numeric to integer (matches PG behavior for RETURNS int functions).
+			mantissa := v.NumericMantissaValue()
+			// Scale away the fractional part if any.
+			scale := v.Scale
+			for scale > 0 {
+				mantissa /= 10
+				scale--
 			}
+			return Datum{Kind: KindInt, Int: mantissa}, nil
 		}
 	case isNumericType(tn):
 		switch v.Kind {
@@ -1710,7 +1716,34 @@ func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datu
 		// no-op cast behaviour in planner/executor.
 		return v, nil
 	}
+	// If this is a function return type mismatch, use PG's canonical message.
+	if strings.HasPrefix(subject, "return value of function ") {
+		// Extract the declared return type canonical name.
+		retTypeName := canonicalReturnType(typ.Name)
+		return Datum{}, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName)}
+	}
 	return Datum{}, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("%s expects type %q but got %s", subject, typ.Name, datumKindName(v))}
+}
+
+// canonicalReturnType returns the canonical PG type name for error messages.
+func canonicalReturnType(name string) string {
+	switch strings.ToLower(name) {
+	case "int", "int4":
+		return "integer"
+	case "int2":
+		return "smallint"
+	case "int8":
+		return "bigint"
+	case "float4":
+		return "real"
+	case "float8":
+		return "double precision"
+	case "bool":
+		return "boolean"
+	case "varchar":
+		return "character varying"
+	}
+	return strings.ToLower(name)
 }
 
 func datumKindName(v Datum) string {
