@@ -2050,6 +2050,28 @@ M0097-0001 wires it up.
             uses raw SeqScan rows (whose column indices match `SubCol.Index`) rather
             than the `SELECT 1` projected output (which only has 1 column).
         enum: 3 → 0 diffs → **PASS** (54 in CSV → 0).
+      - **Progress 2026-06-03 (M0097-0155 — DROP CASCADE dependency tracking, loop 6):**
+        Seven coordinated changes (commit ed5a6fb3):
+        (a) `extractRoutineDeps`: Only track body-level deps for `BeginAtomic=true` or
+            `IsReturnForm=true` functions — AS-quoted-string bodies (old style) do NOT
+            create pg_depend entries in PG14+ for body references, matching PostgreSQL.
+        (b) `extractRoutineDeps`: Walk `InsertStmt` in function bodies to record
+            INSERT INTO table as a TableDep (functest_s_16 inserts into functest1).
+        (c) New helpers: `functionsDependingOnTable`, `functionsDependingOnSequence`,
+            `functionsDependingOnRoutineOID`, `routineCascadeDisplayName`.
+        (d) `DROP TABLE CASCADE`: Collect all dependents (views + direct functions +
+            transitive functions via views); emit combined NOTICE: 1 object → individual
+            notice, N objects → "N other objects" + DETAIL.
+        (e) `DROP SEQUENCE CASCADE`: Cascade to functions whose SequenceDeps include
+            the dropped sequence.
+        (f) `DROP FUNCTION CASCADE`: Cascade to functions whose RoutineCallOIDs include
+            the dropped function OID. Handles both arg-list and no-arg DROP forms.
+        (g) `DROP SCHEMA CASCADE`: Include views in the count/detail lines.
+        create_function_sql: 31 → 17 normalized diff lines (−14).
+        Remaining 17 lines: pg_get_functiondef INSERT body reconstruction (2),
+        ALTER COLUMN TYPE numeric display (6), part_hashint4_error CONTEXT/ERROR
+        via hash operator class (4), DROP SCHEMA cascade count off by 3 (5).
+
       - **Progress 2026-06-03 (M0097-0149 — pg_proc + SQL procedures + ALTER FUNCTION):**
         Six coordinated improvements targeting create_function_sql (430→415) and
         create_procedure (320→307) regress diffs (commit 83d01d2b):
