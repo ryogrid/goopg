@@ -86,6 +86,14 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 			}
 			stmt.Body = body
 			sawAs = true
+			// PG rejects AS 'body1', 'body2' (two quoted bodies).
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+				p.advance() // consume ","
+				if p.cur().Kind == TokenStringLit {
+					p.advance() // consume second body string
+				}
+				return nil, &SyntaxError{Raw: true, Message: `only one AS item needed for language "sql"`}
+			}
 		// PG14 SQL-standard function body: BEGIN ATOMIC ... END (without AS).
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwBegin:
 			if sawAs {
@@ -137,6 +145,8 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 					stmt.Volatile = "v"
 				case "leakproof":
 					stmt.Leakproof = true
+				case "window":
+					stmt.Window = true
 				case "security":
 					// peek ahead for "definer" or "invoker"
 					p.advance()

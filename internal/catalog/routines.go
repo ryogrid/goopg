@@ -47,6 +47,7 @@ type Routine struct {
 	SecurityDefiner bool   // SECURITY DEFINER
 	Leakproof       bool   // LEAKPROOF
 	IsProcedure     bool   // true when created via CREATE PROCEDURE
+	IsWindow        bool   // true when created with WINDOW attribute
 	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
 	IsReturnForm    bool   // PG14 RETURN expr body (stored as "SELECT expr" internally)
 	KindChar        string // prokind: 'f'=function, 'p'=procedure, 'w'=window, 'a'=aggregate
@@ -157,8 +158,12 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 		if !orReplace {
 			return nil, fmt.Errorf("%w: %s%s", ErrRoutineExists, clone.QualifiedName(), signature)
 		}
-		// Cannot change a function to a procedure or vice versa.
+		// Cannot change a function to a procedure or vice versa, or change
+		// a regular function to a window function (or vice versa).
 		if existing.IsProcedure != clone.IsProcedure {
+			return nil, fmt.Errorf("%w: %s", ErrRoutineKindChange, clone.QualifiedName())
+		}
+		if existing.IsWindow != clone.IsWindow {
 			return nil, fmt.Errorf("%w: %s", ErrRoutineKindChange, clone.QualifiedName())
 		}
 		// CREATE OR REPLACE preserves the OID — upstream's contract.

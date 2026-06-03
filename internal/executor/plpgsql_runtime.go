@@ -217,9 +217,12 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	if len(stmts) == 0 {
 		// Empty body with non-void return type → "final statement must be SELECT"
 		if retTypeName != "" && retTypeName != "void" {
+			// Resolve polymorphic return type if possible (e.g. anyarray → integer[]).
+			resolvedRetType := resolvePolymorphicReturnType(retTypeName, r.ArgTypes, args)
 			return Datum{}, &ExecError{Code: "42P13", Pos: pos,
-				Message: fmt.Sprintf("return type mismatch in function declared to return %s", canonicalReturnType(retTypeName)),
-				Detail:  "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING."}
+				Message: fmt.Sprintf("return type mismatch in function declared to return %s", canonicalReturnType(resolvedRetType)),
+				Detail:  "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
+				Context: fmt.Sprintf("SQL function %q during startup", r.Name)}
 		}
 		return NullDatum, nil
 	}
@@ -1787,6 +1790,49 @@ func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datu
 }
 
 // canonicalReturnType returns the canonical PG type name for error messages.
+// resolvePolymorphicReturnType attempts to resolve a polymorphic return type
+// (anyarray, anyelement) based on the actual call-time argument kinds.
+func resolvePolymorphicReturnType(retTypeName string, argTypes []catalog.Type, args []Datum) string {
+	switch strings.ToLower(retTypeName) {
+	case "anyarray":
+		// Find the anyelement argument to determine the element type.
+		for i, at := range argTypes {
+			if strings.ToLower(at.Name) == "anyelement" && i < len(args) {
+				if elem := datumKindToTypeName(args[i].Kind); elem != "" {
+					return elem + "[]"
+				}
+			}
+		}
+	case "anyelement":
+		// Resolve from the first anyarray argument.
+		for i, at := range argTypes {
+			if strings.ToLower(at.Name) == "anyarray" && i < len(args) {
+				if elem := datumKindToTypeName(args[i].Kind); elem != "" {
+					return elem
+				}
+			}
+		}
+	}
+	return retTypeName
+}
+
+// datumKindToTypeName maps a Datum kind to its PG type name for polymorphic resolution.
+func datumKindToTypeName(k DatumKind) string {
+	switch k {
+	case KindInt:
+		return "integer"
+	case KindBool:
+		return "boolean"
+	case KindString:
+		return "text"
+	case KindNumeric:
+		return "numeric"
+	case KindBytes:
+		return "bytea"
+	}
+	return ""
+}
+
 func canonicalReturnType(name string) string {
 	switch strings.ToLower(name) {
 	case "int", "int4":

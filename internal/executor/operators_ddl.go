@@ -2643,6 +2643,12 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	if schema == "" {
 		schema = currentWritableSchema(o.ctx)
 	}
+	// Validate SQL function body when check_function_bodies=on (default).
+	if lang == "sql" && !s.BeginAtomic {
+		if err := o.validateSQLFunctionBody(s, len(s.Args)); err != nil {
+			return err
+		}
+	}
 	r := &catalog.Routine{
 		Schema:   schema,
 		Name:     s.Name.Name,
@@ -2659,6 +2665,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		Body:            s.Body,
 		BeginAtomic:     s.BeginAtomic,
 		IsReturnForm:    s.IsReturnForm,
+		IsWindow:        s.Window,
 		Strict:          s.Strict,
 		Volatile:        volatile,
 		SecurityDefiner: s.SecurityDefiner,
@@ -2671,14 +2678,272 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		}
 		// ErrRoutineKindChange → SQLSTATE 42P13 (cannot change routine kind).
 		if errors.Is(err, catalog.ErrRoutineKindChange) {
-			// execCreateFunction: we're creating a function, existing must be a procedure.
+			// Determine what the existing object IS for accurate DETAIL.
+			detail := fmt.Sprintf("%q is a function.", s.Name.Name)
+			argTypes := make([]catalog.Type, len(s.Args))
+			for i, a := range s.Args {
+				argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+			}
+			if existing, ok := rs.Lookup(s.Name, argTypes); ok && existing != nil && existing.IsProcedure {
+				detail = fmt.Sprintf("%q is a procedure.", s.Name.Name)
+			}
 			return &ExecError{Code: "42P13", Pos: s.Pos(),
 				Message: "cannot change routine kind",
-				Detail:  fmt.Sprintf("%q is a procedure.", s.Name.Name)}
+				Detail:  detail}
 		}
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 	}
 	return nil
+}
+
+// canonReturnTypeName maps internal short type names to PG display names for error messages.
+func canonReturnTypeName(name string) string {
+	switch name {
+	case "int", "int4":
+		return "integer"
+	case "int2":
+		return "smallint"
+	case "int8":
+		return "bigint"
+	case "float4":
+		return "real"
+	case "float8":
+		return "double precision"
+	case "bool":
+		return "boolean"
+	}
+	return name
+}
+
+// isPolymorphicTypeName returns true if the given SQL type name is polymorphic
+// (anyarray, anyelement, anynonarray, anyrange, anycompatible, etc.).
+func isPolymorphicTypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "anyarray", "anyelement", "anynonarray", "anyrange", "anycompatible",
+		"anycompatiblearray", "anycompatiblenonarray", "anycompatiblerange":
+		return true
+	}
+	return false
+}
+
+// validateSQLFunctionBody validates the body of a SQL-language function at
+// CREATE time when check_function_bodies=on. Returns an ExecError on failure.
+func (o *ddlOp) validateSQLFunctionBody(s *parser.CreateFunctionStmt, nArgs int) error {
+	// Respect check_function_bodies GUC (default=on).
+	if o.ctx.GetSetting != nil {
+		if v, ok := o.ctx.GetSetting("check_function_bodies"); ok {
+			switch strings.ToLower(v) {
+			case "off", "false", "0", "no":
+				return nil
+			}
+		}
+	}
+
+	funcName := s.Name.Name
+	retTypeRaw := strings.ToLower(s.ReturnType.Name)
+	// Canonicalize type name to PG display form for error messages.
+	retTypeName := canonReturnTypeName(retTypeRaw)
+
+	// RETURN form (unquoted body) with polymorphic arguments is rejected.
+	if s.IsReturnForm {
+		for _, a := range s.Args {
+			if isPolymorphicTypeName(a.Type.Name) {
+				return &ExecError{
+					Code:    "42P13",
+					Pos:     s.Pos(),
+					Message: "SQL function with unquoted function body cannot have polymorphic arguments",
+				}
+			}
+		}
+	}
+
+	body := s.Body
+	if body == "" {
+		// Empty body — only void functions may have no final SELECT.
+		if retTypeName != "void" {
+			return &ExecError{
+				Code:    "42P13",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName),
+				Detail:  "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
+				Context: fmt.Sprintf("SQL function %q", funcName),
+			}
+		}
+		return nil
+	}
+
+	// Parse the body to catch syntax errors and analyse parameter references.
+	// PG does not add CONTEXT for parse-time errors (context is only added for
+	// type-check and execution errors). So we omit the Context field here.
+	stmts, parseErr := parser.Parse(body)
+	if parseErr != nil {
+		return &ExecError{
+			Code:    "42601",
+			Pos:     s.Pos(),
+			Message: parseErr.Error(),
+		}
+	}
+
+	// Empty parse result for a non-void function.
+	if len(stmts) == 0 && retTypeName != "void" {
+		return &ExecError{
+			Code:    "42P13",
+			Pos:     s.Pos(),
+			Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName),
+			Detail:  "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
+			Context: fmt.Sprintf("SQL function %q", funcName),
+		}
+	}
+
+	// Scan all statements for out-of-range parameter references ($N).
+	for _, stmt := range stmts {
+		if err := validateParamRefs(stmt, nArgs, funcName); err != nil {
+			return err
+		}
+	}
+
+	// Check that the final statement is a SELECT (or DML RETURNING).
+	if len(stmts) > 0 && retTypeName != "void" {
+		last := stmts[len(stmts)-1]
+		switch l := last.(type) {
+		case *parser.SelectStmt:
+			if !s.ReturnsSet {
+				// Check column count for scalar returns.
+				nTargets := len(l.Targets)
+				if l.ValuesRows != nil && len(l.Targets) == 0 {
+					if len(l.ValuesRows) > 0 {
+						nTargets = len(l.ValuesRows[0])
+					}
+				}
+				if nTargets > 1 {
+					return &ExecError{
+						Code:    "42P13",
+						Pos:     s.Pos(),
+						Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName),
+						Detail:  "Final statement must return exactly one column.",
+						Context: fmt.Sprintf("SQL function %q", funcName),
+					}
+				}
+				// Check if the SELECT target type is incompatible with return type.
+				if nTargets == 1 {
+					if err := checkSQLFuncReturnTypeBasic(l.Targets[0].Expr, retTypeName, funcName, s.Pos()); err != nil {
+						return err
+					}
+				}
+			}
+		case *parser.InsertStmt, *parser.UpdateStmt, *parser.DeleteStmt:
+			// OK if they have RETURNING — we don't check that here
+		default:
+			return &ExecError{
+				Code:    "42P13",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName),
+				Detail:  "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
+				Context: fmt.Sprintf("SQL function %q", funcName),
+			}
+		}
+	}
+
+	return nil
+}
+
+// checkSQLFuncReturnTypeBasic does lightweight return-type checking for
+// simple SELECT expressions where the type can be inferred without the full
+// planner. Only fires when the type is obviously incompatible (e.g. a bare
+// string literal returned as integer).
+func checkSQLFuncReturnTypeBasic(expr parser.Expr, retTypeName, funcName string, pos int) error {
+	if expr == nil {
+		return nil
+	}
+	var exprTypeName string
+	switch expr.(type) {
+	case *parser.StringConst:
+		exprTypeName = "text"
+	case *parser.IntegerConst:
+		exprTypeName = "integer"
+	}
+	if exprTypeName == "" {
+		return nil // can't determine type statically
+	}
+	if exprTypeName == retTypeName {
+		return nil // same type
+	}
+	// Check basic incompatibility: text cannot be returned as integer/boolean/etc.
+	textTypes := map[string]bool{"text": true, "varchar": true, "char": true, "character varying": true}
+	intTypes := map[string]bool{"integer": true, "smallint": true, "bigint": true, "real": true, "double precision": true, "boolean": true}
+	if textTypes[exprTypeName] && (intTypes[retTypeName] || retTypeName == "boolean") {
+		return &ExecError{
+			Code:    "42P13",
+			Pos:     pos,
+			Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName),
+			Detail:  fmt.Sprintf("Actual return type is %s.", exprTypeName),
+			Context: fmt.Sprintf("SQL function %q", funcName),
+		}
+	}
+	return nil
+}
+
+// validateParamRefs walks the AST of stmt and returns an error if any
+// parameter reference $N with N > nArgs is found.
+func validateParamRefs(stmt parser.Stmt, nArgs int, funcName string) error {
+	var walkExpr func(node parser.Expr) error
+	walkExpr = func(node parser.Expr) error {
+		if node == nil {
+			return nil
+		}
+		switch n := node.(type) {
+		case *parser.ParamRef:
+			if n.Number > nArgs {
+				// PG does not add CONTEXT for param-reference errors.
+				return &ExecError{
+					Code:    "42P10",
+					Message: fmt.Sprintf("there is no parameter $%d", n.Number),
+				}
+			}
+		case *parser.BinaryOp:
+			if err := walkExpr(n.Left); err != nil {
+				return err
+			}
+			return walkExpr(n.Right)
+		case *parser.UnaryOp:
+			return walkExpr(n.Operand)
+		case *parser.FuncCall:
+			for _, a := range n.Args {
+				if err := walkExpr(a); err != nil {
+					return err
+				}
+			}
+		case *parser.CastExpr:
+			return walkExpr(n.Operand)
+		}
+		return nil
+	}
+	var walkStmt func(s parser.Stmt) error
+	walkStmt = func(s parser.Stmt) error {
+		switch n := s.(type) {
+		case *parser.SelectStmt:
+			for _, t := range n.Targets {
+				if err := walkExpr(t.Expr); err != nil {
+					return err
+				}
+			}
+			if n.Where != nil {
+				if err := walkExpr(n.Where); err != nil {
+					return err
+				}
+			}
+		case *parser.InsertStmt:
+			for _, row := range n.Rows {
+				for _, e := range row {
+					if err := walkExpr(e); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
+	return walkStmt(stmt)
 }
 
 func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
@@ -3095,6 +3360,15 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		return nil
 	}
 	if errors.Is(err, catalog.ErrRoutineNotFound) {
+		// When no argument list was given, PG says "could not find a function named X".
+		if s.Args == nil {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("function %s does not exist, skipping", s.Name.Name))
+				return nil
+			}
+			return &ExecError{Code: "42883", Pos: s.Pos(),
+				Message: fmt.Sprintf("could not find a function named %q", s.Name.Name)}
+		}
 		// Build the function signature for error/notice messages.
 		// PG format for IF EXISTS notice: "function name(pg_catalog.type,...) does not exist, skipping"
 		// PG format for ERROR: "function name(canonical_type,...) does not exist"

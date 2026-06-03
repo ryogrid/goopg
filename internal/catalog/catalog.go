@@ -2301,21 +2301,46 @@ func (c *InMemory) registerInformationSchemaTables() {
 	}
 	c.tables["information_schema.parameters"] = isParams
 
-	// Stub usage views — return no rows (body analysis not implemented).
-	for _, name := range []string{"routine_routine_usage", "routine_sequence_usage", "routine_column_usage", "routine_table_usage"} {
+	// Stub usage views — columns match PG's information_schema; return no rows
+	// (body-dependency analysis not yet implemented).
+	isRoutineUsageColsBase := []Column{
+		{Name: "specific_catalog", Type: Type{Name: "text"}, Ordinal: 0},
+		{Name: "specific_schema", Type: Type{Name: "text"}, Ordinal: 1},
+		{Name: "specific_name", Type: Type{Name: "text"}, Ordinal: 2},
+		{Name: "routine_catalog", Type: Type{Name: "text"}, Ordinal: 3},
+		{Name: "routine_schema", Type: Type{Name: "text"}, Ordinal: 4},
+		{Name: "routine_name", Type: Type{Name: "text"}, Ordinal: 5},
+	}
+	isRoutineUsageViews := map[string][]Column{
+		"routine_routine_usage": append(isRoutineUsageColsBase,
+			Column{Name: "called_specific_catalog", Type: Type{Name: "text"}, Ordinal: 6},
+			Column{Name: "called_specific_schema", Type: Type{Name: "text"}, Ordinal: 7},
+			Column{Name: "called_specific_name", Type: Type{Name: "text"}, Ordinal: 8},
+		),
+		"routine_sequence_usage": append(isRoutineUsageColsBase,
+			Column{Name: "sequence_catalog", Type: Type{Name: "text"}, Ordinal: 6},
+			Column{Name: "sequence_schema", Type: Type{Name: "text"}, Ordinal: 7},
+			Column{Name: "sequence_name", Type: Type{Name: "text"}, Ordinal: 8},
+		),
+		"routine_column_usage": append(isRoutineUsageColsBase,
+			Column{Name: "table_catalog", Type: Type{Name: "text"}, Ordinal: 6},
+			Column{Name: "table_schema", Type: Type{Name: "text"}, Ordinal: 7},
+			Column{Name: "table_name", Type: Type{Name: "text"}, Ordinal: 8},
+			Column{Name: "column_name", Type: Type{Name: "text"}, Ordinal: 9},
+		),
+		"routine_table_usage": append(isRoutineUsageColsBase,
+			Column{Name: "table_catalog", Type: Type{Name: "text"}, Ordinal: 6},
+			Column{Name: "table_schema", Type: Type{Name: "text"}, Ordinal: 7},
+			Column{Name: "table_name", Type: Type{Name: "text"}, Ordinal: 8},
+		),
+	}
+	for name, cols := range isRoutineUsageViews {
 		n := name
 		tbl := &Table{
 			Schema:  "information_schema",
 			Name:    n,
 			Virtual: true,
-			Columns: []Column{
-				{Name: "specific_catalog", Type: Type{Name: "text"}, Ordinal: 0},
-				{Name: "specific_schema", Type: Type{Name: "text"}, Ordinal: 1},
-				{Name: "specific_name", Type: Type{Name: "text"}, Ordinal: 2},
-				{Name: "routine_catalog", Type: Type{Name: "text"}, Ordinal: 3},
-				{Name: "routine_schema", Type: Type{Name: "text"}, Ordinal: 4},
-				{Name: "routine_name", Type: Type{Name: "text"}, Ordinal: 5},
-			},
+			Columns: cols,
 		}
 		tbl.VirtualRows = func() [][]string { return nil }
 		c.tables["information_schema."+n] = tbl

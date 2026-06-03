@@ -177,6 +177,12 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			v = d.Int
+		case KindNumeric:
+			var err error
+			v, err = roundNumericToInt(d, 0)
+			if err != nil {
+				return nil, err
+			}
 		case KindString:
 			var err error
 			v, err = coerceStringToInt64(d.StringValue(), "smallint")
@@ -203,6 +209,12 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			v = d.Int
+		case KindNumeric:
+			var err error
+			v, err = roundNumericToInt(d, 0)
+			if err != nil {
+				return nil, err
+			}
 		case KindString:
 			var err error
 			v, err = coerceStringToInt64(d.StringValue(), "integer")
@@ -224,6 +236,12 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			v = d.Int
+		case KindNumeric:
+			var err error
+			v, err = roundNumericToInt(d, 0)
+			if err != nil {
+				return nil, err
+			}
 		case KindString:
 			var err error
 			v, err = coerceStringToInt64(d.StringValue(), "bigint")
