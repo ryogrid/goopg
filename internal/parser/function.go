@@ -106,13 +106,14 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 			}
 			p.advance() // consume RETURN
 			// Collect tokens until EOF, semicolon, or end of statement.
+			// Use tokenBodySQL to restore string literal quotes.
 			var bodyToks []string
 			for p.cur().Kind != TokenEOF {
 				t := p.cur()
 				if t.Kind == TokenSymbol && t.Value == ";" {
 					break
 				}
-				bodyToks = append(bodyToks, t.Value)
+				bodyToks = append(bodyToks, tokenBodySQL(t))
 				p.advance()
 			}
 			stmt.Body = "SELECT " + strings.Join(bodyToks, " ")
@@ -242,12 +243,25 @@ func (p *parser) parseFunctionBody() (string, error) {
 					}
 				}
 			}
-			parts = append(parts, ct.Value)
+			parts = append(parts, tokenBodySQL(ct))
 			p.advance()
 		}
 		return "", p.errAtCur("unterminated BEGIN ATOMIC body")
 	}
 	return "", p.errAtCur("expected $$body$$ or BEGIN ATOMIC for function body")
+}
+
+// tokenBodySQL reconstructs the SQL representation of a token for storage in
+// function/procedure bodies. String literals get their quotes restored.
+func tokenBodySQL(t Token) string {
+	switch t.Kind {
+	case TokenStringLit:
+		return "'" + strings.ReplaceAll(t.Value, "'", "''") + "'"
+	case TokenKeyword:
+		return t.Value // keywords stored lowercase (consistent with PG)
+	default:
+		return t.Value
+	}
 }
 
 // parseFunctionArgList parses an optional `( arg [, ...] )` list.
@@ -312,22 +326,22 @@ func (p *parser) parseFunctionArg() (FunctionArg, error) {
 	pos := p.cur().Pos
 	arg := FunctionArg{pos: pos, Mode: FuncArgIn}
 
-	// Accept VARIADIC parameter mode — treat as IN for execution purposes.
-	// The function body receives variadic args as a bundled array ($N). M0097-0117.
-	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwVariadic {
-		p.advance()
-		arg.Mode = FuncArgVariadic
-		return p.parseArgNameAndType(pos, arg)
-	}
-
-	// Reject other Stage B mode keywords for functions (but not procedures).
-	if err := p.rejectStageBModes(pos); err != nil {
-		return FunctionArg{}, err
-	}
-
-	// Optional `IN` mode keyword.
-	if p.acceptKeyword(KwIn) {
-		arg.Mode = FuncArgIn
+	// Accept IN / OUT / INOUT / VARIADIC mode keywords (same as procedures).
+	if p.cur().Kind == TokenKeyword {
+		switch p.cur().Keyword {
+		case KwIn:
+			p.advance()
+			arg.Mode = FuncArgIn
+		case KwOut:
+			p.advance()
+			arg.Mode = FuncArgOut
+		case KwInout:
+			p.advance()
+			arg.Mode = FuncArgInout
+		case KwVariadic:
+			p.advance()
+			arg.Mode = FuncArgVariadic
+		}
 	}
 
 	return p.parseArgNameAndType(pos, arg)

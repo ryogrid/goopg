@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/plpgsql"
 )
@@ -88,38 +89,56 @@ func (o *callOp) Open(ctx *Context) error {
 		}
 	}
 
-	// Evaluate CALL arguments.
+	// Evaluate CALL arguments (all positions, including OUT placeholders).
+	// OUT param values will be replaced with NULL after name-reordering below.
 	frame := newPLpgSQLFrame()
 	args := make([]Datum, len(st.Args))
 	for i, arg := range st.Args {
 		d, err := evalPLpgSQLExpr(arg, frame, ctx)
 		if err != nil {
-			return err
+			// For OUT param placeholder expressions like 1/0, PG says the expression
+			// is "not evaluated". Swallow execution errors and use NULL so that e.g.
+			// CALL ptest9(1/0) succeeds. Type-mismatch errors remain via matching below.
+			args[i] = NullDatum
+		} else {
+			args[i] = d
 		}
-		args[i] = d
 	}
 	// Track named-arg names for reordering after routine resolution.
 	callerArgNames := st.ArgNames // nil if no named args
 
-	// Match by number of IN arguments. OUT/INOUT params are excluded
-	// from the arg count comparison since CALL doesn't require values
-	// for them. Caller may provide fewer args than declared (defaults fill).
+	// Match by argument count. For procedures with OUT params, the caller provides
+	// placeholder values (NULL) for each OUT param too. So we match against the
+	// total declared param count (IN + OUT + INOUT), or just IN count if fewer args.
 	inArgCount := len(st.Args)
 	matches := make([]*catalog.Routine, 0, 1)
 	for _, c := range routines {
-		inCount := 0
+		inCount := 0 // IN + INOUT params only
+		totalCount := 0 // all params including OUT
+		hasVariadic := false
 		for _, mode := range c.ArgModes {
+			totalCount++
 			if mode == "" || mode == "i" || mode == "b" {
 				inCount++
+			}
+			if mode == "v" {
+				hasVariadic = true
+				inCount++ // VARIADIC counts as IN for matching
 			}
 		}
 		// If no ArgModes, all args are IN (backward compat).
 		if c.ArgModes == nil {
 			inCount = len(c.ArgTypes)
+			totalCount = len(c.ArgTypes)
 		}
-		// Accept if caller provides at most as many args as declared
-		// (defaults fill missing trailing args).
-		if inArgCount <= inCount {
+		// Caller may provide:
+		// - Exactly totalCount args (including OUT placeholders), OR
+		// - At most inCount args (defaults fill missing IN/INOUT args), OR
+		// - More than inCount when the last param is VARIADIC (extra args bundled).
+		if inArgCount == totalCount || inArgCount <= inCount {
+			matches = append(matches, c)
+		} else if hasVariadic && inArgCount >= inCount-1 {
+			// VARIADIC: accept any number of args >= non-variadic IN params.
 			matches = append(matches, c)
 		}
 	}
@@ -134,30 +153,140 @@ func (o *callOp) Open(ctx *Context) error {
 			Message: fmt.Sprintf("procedure %s is ambiguous", st.Name.Name)}
 	}
 
+	r := o.routine
+
+	// Track which parameter positions were explicitly provided by the caller.
+	// Positions not in this set may receive default values.
+	providedSet := make(map[int]bool, len(args))
+
+	// If caller provided OUT placeholders (len(args) == totalCount), map them to
+	// the right positions (including OUT slots); otherwise positional IN-only mapping.
+	totalCount := len(r.ArgTypes)
+	callerProvidedAll := len(args) == totalCount
+
 	// If named args were provided, reorder them to match routine parameter order.
 	if len(callerArgNames) > 0 && len(callerArgNames) == len(args) {
-		r := o.routine
 		reordered := make([]Datum, len(r.ArgTypes))
-		// Fill positional slots first (unnamed args), then named args.
 		namedByName := map[string]Datum{}
 		for i, nm := range callerArgNames {
 			if nm == "" {
 				reordered[i] = args[i]
+				providedSet[i] = true
 			} else {
 				namedByName[strings.ToLower(nm)] = args[i]
 			}
 		}
-		// Match named args to parameter positions by name.
 		for i, paramName := range r.ArgNames {
 			if d, ok := namedByName[strings.ToLower(paramName)]; ok {
 				reordered[i] = d
+				providedSet[i] = true
 			}
 		}
 		args = reordered
+	} else if callerProvidedAll {
+		// Caller provided args for every param (including OUT placeholders).
+		for i := 0; i < totalCount; i++ {
+			providedSet[i] = true
+		}
+	} else {
+		// Positional args: map caller args to IN/INOUT positions in order.
+		inIdx := 0
+		for i := 0; i < len(r.ArgTypes) && inIdx < len(args); i++ {
+			mode := "i"
+			if i < len(r.ArgModes) && r.ArgModes[i] != "" {
+				mode = r.ArgModes[i]
+			}
+			if mode == "o" {
+				continue // skip OUT params in positional mapping
+			}
+			providedSet[i] = true
+			// Reorder needed: build mapping
+			inIdx++
+		}
+		// If not callerProvidedAll and no named args, positional mapping is 0..len(args)-1
+		// unless we have OUT params mixed in.
+		if !callerProvidedAll {
+			providedSet = make(map[int]bool, len(args))
+			for i := 0; i < len(args); i++ {
+				providedSet[i] = true
+			}
+		}
+	}
+
+	// Replace OUT param positions with NULL — the caller's expression value is
+	// always discarded for OUT params (PostgreSQL: "you can write an expression,
+	// but it's not evaluated").
+	if len(args) == len(r.ArgTypes) {
+		for i := range r.ArgModes {
+			if r.ArgModes[i] == "o" {
+				args[i] = NullDatum
+			}
+		}
+	}
+
+	// Fill missing IN/INOUT parameter slots with evaluated defaults.
+	if len(args) < len(r.ArgTypes) {
+		extended := make([]Datum, len(r.ArgTypes))
+		copy(extended, args)
+		args = extended
+	}
+	for i := 0; i < len(r.ArgTypes); i++ {
+		if providedSet[i] {
+			continue // explicitly provided, keep as-is
+		}
+		mode := "i"
+		if i < len(r.ArgModes) && r.ArgModes[i] != "" {
+			mode = r.ArgModes[i]
+		}
+		if mode == "o" {
+			continue // OUT params don't need caller-provided value
+		}
+		if i < len(r.ArgDefaults) && r.ArgDefaults[i] != "" {
+			d, err := evalCallDefault(r.ArgDefaults[i], ctx)
+			if err != nil {
+				return err
+			}
+			args[i] = d
+		}
 	}
 
 	o.args = args
 	return nil
+}
+
+// evalCallDefault parses and evaluates a simple constant default expression.
+// Handles integer, string, numeric, NULL, and boolean literals.
+// For complex expressions (function calls etc.), attempts full evaluation.
+func evalCallDefault(expr string, ctx *Context) (Datum, error) {
+	stmts, err := parser.Parse("SELECT " + expr)
+	if err != nil || len(stmts) != 1 {
+		return NullDatum, nil
+	}
+	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		return NullDatum, nil
+	}
+	op, err := Build(node)
+	if err != nil {
+		return NullDatum, nil
+	}
+	if err := op.Open(ctx); err != nil {
+		_ = op.Close()
+		return NullDatum, nil
+	}
+	defer op.Close()
+	slot, err := op.Next()
+	if err == EOF {
+		return NullDatum, nil
+	}
+	if err != nil {
+		return NullDatum, nil
+	}
+	row := slotRow(slot)
+	if len(row) == 0 {
+		return NullDatum, nil
+	}
+	return row[0], nil
 }
 
 func (o *callOp) Close() error { return nil }
@@ -179,7 +308,8 @@ func (o *callOp) Next() (TupleSlot, error) {
 		if o.plan != nil && o.plan.Stmt != nil {
 			callPos = o.plan.Stmt.Pos()
 		}
-		if err := executeSQLProcedure(r, o.args, o.ctx, callPos); err != nil {
+		lastRow, err := executeSQLProcedureReturning(r, o.args, o.ctx, callPos)
+		if err != nil {
 			return nil, err
 		}
 		// Return a tuple matching the OUT-param schema (empty for IN-only procedures).
@@ -187,7 +317,17 @@ func (o *callOp) Next() (TupleSlot, error) {
 		if sch == nil || len(sch) == 0 {
 			return nil, EOF
 		}
-		return asSlot(sch, make(Row, len(sch))), nil
+		// Map OUT/INOUT columns from the last statement's result row.
+		// outIdx tracks which column in the last-row corresponds to which OUT column.
+		result := make(Row, len(sch))
+		outIdx := 0
+		for i := range result {
+			if outIdx < len(lastRow) {
+				result[i] = lastRow[outIdx]
+				outIdx++
+			}
+		}
+		return asSlot(sch, result), nil
 	}
 
 	block, err := plpgsql.Parse(r.Body)
@@ -312,6 +452,19 @@ func buildArgListStr(n int) string {
 	parts := make([]string, n)
 	for i := range parts {
 		parts[i] = "unknown"
+	}
+	return "(" + strings.Join(parts, ", ") + ")"
+}
+
+// routineArgListStr formats arg types as "(type1, type2)" for error messages,
+// using canonical PG type names (e.g. "int4" → "integer").
+func routineArgListStr(argTypes []catalog.Type) string {
+	if len(argTypes) == 0 {
+		return "()"
+	}
+	parts := make([]string, len(argTypes))
+	for i, t := range argTypes {
+		parts[i] = canonicalTypeName(t.Name)
 	}
 	return "(" + strings.Join(parts, ", ") + ")"
 }

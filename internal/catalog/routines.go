@@ -37,6 +37,7 @@ type Routine struct {
 	ArgNames        []string // parallel to ArgTypes; empty string for positional-only args
 	ArgTypes        []Type
 	ArgModes        []string // parallel to ArgTypes; "i"=IN, "o"=OUT, "b"=INOUT, "v"=VARIADIC; nil=all IN
+	ArgDefaults     []string // parallel to ArgTypes; raw SQL expression for DEFAULT, "" = no default
 	ReturnType      Type
 	ReturnsSet      bool   // RETURNS SETOF ... M0097-0020
 	Language        string // lower-cased
@@ -64,9 +65,17 @@ func (r *Routine) QualifiedName() string {
 // Stage A uses type-name comparison directly; the future overload
 // resolver will normalise via the type system.
 func (r *Routine) Signature() string {
-	parts := make([]string, len(r.ArgTypes))
+	var parts []string
 	for i, t := range r.ArgTypes {
-		parts[i] = strings.ToLower(t.Name)
+		mode := "i"
+		if i < len(r.ArgModes) && r.ArgModes[i] != "" {
+			mode = r.ArgModes[i]
+		}
+		// OUT params are excluded from the signature (matches PostgreSQL's proargtypes).
+		if mode == "o" {
+			continue
+		}
+		parts = append(parts, strings.ToLower(t.Name))
 	}
 	return "(" + strings.Join(parts, ",") + ")"
 }

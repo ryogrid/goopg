@@ -875,6 +875,31 @@ func exprToString(e parser.Expr) string {
 	return fmt.Sprintf("%v", e)
 }
 
+// defaultExprToSQL converts a default-argument expression to a SQL string
+// that can be re-evaluated at call time. Handles literal constants; for
+// complex expressions it falls back to a best-effort fmt.Sprintf form.
+func defaultExprToSQL(e parser.Expr) string {
+	if e == nil {
+		return ""
+	}
+	switch v := e.(type) {
+	case *parser.IntegerConst:
+		return fmt.Sprintf("%d", v.Value)
+	case *parser.StringConst:
+		return "'" + strings.ReplaceAll(v.Value, "'", "''") + "'"
+	case *parser.NumericConst:
+		return v.Value
+	case *parser.NullConst:
+		return "NULL"
+	case *parser.BooleanConst:
+		if v.Value {
+			return "true"
+		}
+		return "false"
+	}
+	return fmt.Sprintf("%v", e)
+}
+
 // execCreateView registers a view in the catalog. Column
 // types default to `unknown` because v0 doesn't run the
 // type-inference pass against the inner SELECT during DDL —
@@ -2582,12 +2607,29 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	// and returns a type-appropriate default value (true for bool, 0 for int, etc.).
 	argTypes := make([]catalog.Type, len(s.Args))
 	argNames := make([]string, len(s.Args))
+	argModes := make([]string, len(s.Args))
+	argDefaults := make([]string, len(s.Args))
 	for i, a := range s.Args {
 		argTypes[i] = catalog.Type{
 			Name: strings.ToLower(a.Type.Name),
 			Args: append([]int64(nil), a.Type.Args...),
 		}
 		argNames[i] = a.Name
+		switch a.Mode {
+		case parser.FuncArgIn:
+			argModes[i] = "i"
+		case parser.FuncArgOut:
+			argModes[i] = "o"
+		case parser.FuncArgInout:
+			argModes[i] = "b"
+		case parser.FuncArgVariadic:
+			argModes[i] = "v"
+		default:
+			argModes[i] = "i"
+		}
+		if a.Default != nil {
+			argDefaults[i] = defaultExprToSQL(a.Default)
+		}
 	}
 	volatile := s.Volatile
 	if volatile == "" {
@@ -2602,6 +2644,8 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		Name:     s.Name.Name,
 		ArgNames: argNames,
 		ArgTypes: argTypes,
+		ArgModes: argModes,
+		ArgDefaults: argDefaults,
 		ReturnType: catalog.Type{
 			Name: strings.ToLower(s.ReturnType.Name),
 			Args: append([]int64(nil), s.ReturnType.Args...),
@@ -2653,6 +2697,23 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		}
 		return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("%s %s does not exist", kind, s.Name.Name)}
 	}
+	// Check that each matched routine is of the right kind.
+	for _, r := range routines {
+		if s.IsProcedure && !r.IsProcedure {
+			// ALTER PROCEDURE on a function → "is not a procedure"
+			argList := routineArgListStr(argTypes)
+			return &ExecError{Code: "42809", Pos: s.Pos(),
+				Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argList),
+				Hint:    "To alter a function, use ALTER FUNCTION."}
+		}
+		if !s.IsProcedure && r.IsProcedure {
+			// ALTER FUNCTION on a procedure → "is not a function"
+			argList := routineArgListStr(argTypes)
+			return &ExecError{Code: "42809", Pos: s.Pos(),
+				Message: fmt.Sprintf("%s%s is not a function", s.Name.Name, argList),
+				Hint:    "To alter a procedure, use ALTER PROCEDURE."}
+		}
+	}
 	for _, r := range routines {
 		if s.Volatile != nil {
 			r.Volatile = *s.Volatile
@@ -2692,6 +2753,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	argTypes := make([]catalog.Type, len(s.Args))
 	argNames := make([]string, len(s.Args))
 	argModes := make([]string, len(s.Args))
+	argDefaults := make([]string, len(s.Args))
 	for i, a := range s.Args {
 		argTypes[i] = catalog.Type{
 			Name: strings.ToLower(a.Type.Name),
@@ -2710,6 +2772,9 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		default:
 			argModes[i] = "i"
 		}
+		if a.Default != nil {
+			argDefaults[i] = defaultExprToSQL(a.Default)
+		}
 	}
 	procSchema := s.Name.Schema
 	if procSchema == "" {
@@ -2721,6 +2786,7 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		ArgNames:        argNames,
 		ArgTypes:        argTypes,
 		ArgModes:        argModes,
+		ArgDefaults:     argDefaults,
 		Language:        lang,
 		Body:            s.Body,
 		BeginAtomic:     s.BeginAtomic,
@@ -2763,6 +2829,7 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	}
 	// Verify the target exists and is a procedure BEFORE dropping.
 	var found *catalog.Routine
+	var argTypes []catalog.Type
 	if s.Args == nil {
 		cands := rs.LookupByName(s.Name)
 		if len(cands) == 1 {
@@ -2778,7 +2845,7 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 			}
 		}
 	} else {
-		argTypes := make([]catalog.Type, len(s.Args))
+		argTypes = make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
 			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
 		}
@@ -2798,8 +2865,9 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	}
 	// DROP PROCEDURE on a function should fail.
 	if objKind == "procedure" && !found.IsProcedure {
+		argListStr := routineArgListStr(argTypes)
 		return &ExecError{Code: "42809", Pos: s.Pos(),
-			Message: fmt.Sprintf("%s is not a procedure", s.Name.Name),
+			Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argListStr),
 			Hint:    "Use DROP FUNCTION to remove a function."}
 	}
 	// Now drop.
@@ -2807,14 +2875,14 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	if s.Args == nil {
 		err = rs.DropByName(s.Name)
 	} else {
-		argTypes := make([]catalog.Type, len(s.Args))
+		dropArgTypes := make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
-			argTypes[i] = catalog.Type{
+			dropArgTypes[i] = catalog.Type{
 				Name: strings.ToLower(a.Type.Name),
 				Args: append([]int64(nil), a.Type.Args...),
 			}
 		}
-		err = rs.Drop(s.Name, argTypes)
+		err = rs.Drop(s.Name, dropArgTypes)
 	}
 	if err == nil {
 		return nil
@@ -2870,6 +2938,26 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP FUNCTION requires routine registry"}
 	}
+
+	// Pre-check: look up the routine to verify it is a function, not a procedure.
+	if s.Args != nil {
+		argTypes := make([]catalog.Type, len(s.Args))
+		for i, a := range s.Args {
+			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+		}
+		if found, ok := rs.Lookup(s.Name, argTypes); ok && found != nil && found.IsProcedure {
+			// "X(type) is not a function" — matches PG error for DROP FUNCTION on a procedure.
+			argListStr := routineArgListStr(argTypes)
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("%s%s is not a function, skipping", s.Name.Name, argListStr))
+				return nil
+			}
+			return &ExecError{Code: "42809", Pos: s.Pos(),
+				Message: fmt.Sprintf("%s%s is not a function", s.Name.Name, argListStr),
+				Hint:    "To call a procedure, use CALL."}
+		}
+	}
+
 	var err error
 	if s.Args == nil {
 		err = rs.DropByName(s.Name)
@@ -3627,6 +3715,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			}
 			// Schema is registered; unregister it.
 			o.ctx.Catalog.UnregisterSchema(schemaName)
+			// Also drop functions/procedures in this schema.
+			if s.Behavior == parser.DropCascade {
+				rs := o.ctx.Catalog.Routines()
+				if rs != nil {
+					for _, r := range rs.List() {
+						if strings.EqualFold(r.Schema, schemaName) {
+							_ = rs.DropByName(parser.ObjectName{Schema: r.Schema, Name: r.Name})
+						}
+					}
+				}
+			}
 			if s.Behavior == parser.DropCascade && len(tables) > 0 {
 				// Sort table names for deterministic DETAIL output.
 				sort.Slice(tables, func(i, j int) bool {

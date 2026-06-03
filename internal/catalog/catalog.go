@@ -1281,9 +1281,9 @@ func (c *InMemory) registerSystemTables() {
 		Schema: "pg_catalog",
 		Name:   "pg_namespace",
 		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
-			{Name: "nspname", Type: Type{Name: "text"}, Ordinal: 1},
-			{Name: "nspowner", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "nspname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "nspowner", Type: Type{Name: "oid"}, Ordinal: 2},
 			{Name: "nspacl", Type: Type{Name: "text"}, Ordinal: 3},
 		},
 		OID:     2615, // upstream's NamespaceRelationId

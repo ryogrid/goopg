@@ -9223,13 +9223,25 @@ func buildFunctionArguments(r *catalog.Routine) string {
 	if len(r.ArgTypes) == 0 {
 		return ""
 	}
+	// Procedures always show mode prefixes (IN/OUT/INOUT/VARIADIC).
+	// Functions only show mode prefix when at least one param is OUT or INOUT;
+	// if all params are IN/VARIADIC, omit the prefix (PG compat).
+	showMode := r.IsProcedure
+	if !showMode {
+		for _, m := range r.ArgModes {
+			if m == "o" || m == "b" {
+				showMode = true
+				break
+			}
+		}
+	}
 	parts := make([]string, len(r.ArgTypes))
 	for i, argType := range r.ArgTypes {
 		var part strings.Builder
 		// Mode prefix
-		if r.ArgModes != nil && i < len(r.ArgModes) {
+		if showMode && r.ArgModes != nil && i < len(r.ArgModes) {
 			switch r.ArgModes[i] {
-			case "i":
+			case "i", "":
 				part.WriteString("IN ")
 			case "o":
 				part.WriteString("OUT ")
@@ -9238,6 +9250,8 @@ func buildFunctionArguments(r *catalog.Routine) string {
 			case "v":
 				part.WriteString("VARIADIC ")
 			}
+		} else if showMode {
+			part.WriteString("IN ")
 		}
 		// Name (if any)
 		if i < len(r.ArgNames) && r.ArgNames[i] != "" {

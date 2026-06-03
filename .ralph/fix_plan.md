@@ -5454,3 +5454,5 @@ back to heap fetches even when the Visibility Map could allow a pure index scan.
   than what fits in a single agent invocation.
 - Every non-trivial subsystem must land alongside (or just before) a design
   doc under `docs/design/`. The spec treats this as a hard requirement.    
+
+<!-- M0097-0151 progress added by loop 4 2026-06-03 -->

@@ -20,9 +20,17 @@ func rewriteSQLNamedParams(body string, argNames []string) string {
 		if name == "" {
 			continue
 		}
-		re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(name) + `\b`)
-		// Use $$ to produce a literal $ in the replacement (Go regexp convention).
-		body = re.ReplaceAllString(body, fmt.Sprintf("$$%d", i+1))
+		// Match either a string literal (to skip) OR the parameter name as a
+		// whole word. String literals come first in the alternation so they're
+		// consumed without replacement.
+		re := regexp.MustCompile(`'(?:[^'\\]|\\.)*'|(?i)\b` + regexp.QuoteMeta(name) + `\b`)
+		pos := i + 1 // 1-based
+		body = re.ReplaceAllStringFunc(body, func(m string) string {
+			if m[0] == '\'' {
+				return m // leave string literals unchanged
+			}
+			return fmt.Sprintf("$%d", pos)
+		})
 	}
 	return body
 }
@@ -159,8 +167,8 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	if err != nil {
 		return Datum{}, &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for function %s: %v", r.QualifiedName(), err)}
 	}
-	if len(stmts) != 1 {
-		return Datum{}, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("SQL function %s must contain exactly one statement in v0", r.QualifiedName())}
+	if len(stmts) == 0 {
+		return NullDatum, nil
 	}
 	child := NewContext()
 	if ctx != nil {
@@ -179,58 +187,95 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 		}
 		child.Params[i] = coerced
 	}
-	node, err := planner.Plan(stmts[0], child.Catalog)
-	if err != nil {
-		return Datum{}, err
-	}
-	op, err := Build(node)
-	if err != nil {
-		return Datum{}, err
-	}
-	if err := op.Open(child); err != nil {
-		_ = op.Close()
-		return Datum{}, err
-	}
-	defer op.Close()
-	out := NullDatum
-	if slot, err := op.Next(); err != EOF {
+	// Execute all statements except the last as side effects; return from last.
+	for i, stmt := range stmts {
+		node, err := planner.Plan(stmt, child.Catalog)
 		if err != nil {
 			return Datum{}, err
 		}
-		row := slotRow(slot)
-		if len(row) > 0 {
-			out = row[0]
+		op, err := Build(node)
+		if err != nil {
+			return Datum{}, err
 		}
-		if _, err := op.Next(); err != EOF {
-			if err != nil {
-				return Datum{}, err
+		if err := op.Open(child); err != nil {
+			_ = op.Close()
+			return Datum{}, err
+		}
+		if i < len(stmts)-1 {
+			// Side-effect statement: drain rows, continue.
+			for {
+				_, nextErr := op.Next()
+				if nextErr == EOF {
+					break
+				}
+				if nextErr != nil {
+					_ = op.Close()
+					return Datum{}, nextErr
+				}
 			}
-			return Datum{}, &ExecError{Code: "21000", Pos: pos, Message: fmt.Sprintf("SQL function %s returned more than one row", r.QualifiedName())}
+			_ = op.Close()
+			continue
 		}
+		// Last statement: collect return value.
+		defer op.Close()
+		out := NullDatum
+		if slot, nextErr := op.Next(); nextErr != EOF {
+			if nextErr != nil {
+				return Datum{}, nextErr
+			}
+			row := slotRow(slot)
+			if len(row) > 0 {
+				out = row[0]
+			}
+			if _, nextErr2 := op.Next(); nextErr2 != EOF {
+				if nextErr2 != nil {
+					return Datum{}, nextErr2
+				}
+				return Datum{}, &ExecError{Code: "21000", Pos: pos, Message: fmt.Sprintf("SQL function %s returned more than one row", r.QualifiedName())}
+			}
+		}
+		if ctx != nil {
+			for _, n := range child.TakeNotices() {
+				ctx.AddNotice(n)
+			}
+		}
+		coerced, err := coerceDatumToType(out, normalizeCatalogType(r.ReturnType), pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
+		if err != nil {
+			return Datum{}, err
+		}
+		return coerced, nil
 	}
+	// Unreachable — loop always handles the last statement above.
 	if ctx != nil {
 		for _, n := range child.TakeNotices() {
 			ctx.AddNotice(n)
 		}
 	}
-	coerced, err := coerceDatumToType(out, normalizeCatalogType(r.ReturnType), pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
-	if err != nil {
-		return Datum{}, err
-	}
-	return coerced, nil
+	return NullDatum, nil
 }
 
 // executeSQLProcedure runs a SQL-language PROCEDURE body.
 // Unlike executeSQLRoutine (functions), procedures may have multiple statements
 // and do not return a scalar value. Named parameters are rewritten to $1, $2 etc.
 func executeSQLProcedure(r *catalog.Routine, args []Datum, ctx *Context, pos int) error {
+	_, err := executeSQLProcedureCore(r, args, ctx, pos)
+	return err
+}
+
+// executeSQLProcedureReturning executes a SQL procedure and returns the result
+// row from the last statement (for OUT/INOUT parameter procedures).
+func executeSQLProcedureReturning(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Row, error) {
+	return executeSQLProcedureCore(r, args, ctx, pos)
+}
+
+func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Row, error) {
 	body := r.Body
 	if len(r.ArgNames) > 0 {
 		body = rewriteSQLNamedParams(body, r.ArgNames)
 	}
 	stmts, err := parser.Parse(body)
 	if err != nil {
-		return &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for procedure %s: %v", r.QualifiedName(), err)}
+		return nil, &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for procedure %s: %v", r.QualifiedName(), err)}
 	}
 	child := NewContext()
 	if ctx != nil {
@@ -245,35 +290,43 @@ func executeSQLProcedure(r *catalog.Routine, args []Datum, ctx *Context, pos int
 		}
 		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
 		if err != nil {
-			return err
+			return nil, err
 		}
 		child.Params[i] = coerced
 	}
-	for _, stmt := range stmts {
+	var lastRow Row
+	for i, stmt := range stmts {
 		node, err := planner.Plan(stmt, child.Catalog)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		op, err := Build(node)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := op.Open(child); err != nil {
 			_ = op.Close()
-			return err
+			return nil, err
 		}
+		isLast := i == len(stmts)-1
 		for {
-			_, nextErr := op.Next()
+			slot, nextErr := op.Next()
 			if nextErr == EOF {
 				break
 			}
 			if nextErr != nil {
 				_ = op.Close()
-				return nextErr
+				return nil, nextErr
+			}
+			if isLast && lastRow == nil {
+				// Copy row so it survives op.Close().
+				if raw := slotRow(slot); raw != nil {
+					lastRow = append(Row(nil), raw...)
+				}
 			}
 		}
 		if err := op.Close(); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if ctx != nil {
@@ -281,7 +334,7 @@ func executeSQLProcedure(r *catalog.Routine, args []Datum, ctx *Context, pos int
 			ctx.AddNotice(n)
 		}
 	}
-	return nil
+	return lastRow, nil
 }
 
 // evalSQLFunctionSetof calls a SETOF SQL function and returns all rows as
@@ -296,8 +349,8 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	if err != nil {
 		return nil, &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for function %s: %v", r.QualifiedName(), err)}
 	}
-	if len(stmts) != 1 {
-		return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("SQL function %s must contain exactly one statement in v0", r.QualifiedName())}
+	if len(stmts) == 0 {
+		return nil, nil
 	}
 	child := NewContext()
 	if ctx != nil {
@@ -316,46 +369,70 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 		}
 		child.Params[i] = coerced
 	}
-	node, err := planner.Plan(stmts[0], child.Catalog)
-	if err != nil {
-		return nil, err
-	}
-	op, err := Build(node)
-	if err != nil {
-		return nil, err
-	}
-	if err := op.Open(child); err != nil {
-		_ = op.Close()
-		return nil, err
-	}
-	defer op.Close()
-	var out []Datum
-	retType := normalizeCatalogType(r.ReturnType)
-	for {
-		slot, err := op.Next()
-		if err == EOF {
-			break
-		}
+	// Execute all statements except the last as side effects; collect rows from last.
+	for i, stmt := range stmts {
+		node, err := planner.Plan(stmt, child.Catalog)
 		if err != nil {
 			return nil, err
 		}
-		row := slotRow(slot)
-		if len(row) == 0 {
-			out = append(out, NullDatum)
+		op, err := Build(node)
+		if err != nil {
+			return nil, err
+		}
+		if err := op.Open(child); err != nil {
+			_ = op.Close()
+			return nil, err
+		}
+		if i < len(stmts)-1 {
+			for {
+				_, nextErr := op.Next()
+				if nextErr == EOF {
+					break
+				}
+				if nextErr != nil {
+					_ = op.Close()
+					return nil, nextErr
+				}
+			}
+			_ = op.Close()
 			continue
 		}
-		coerced, err := coerceDatumToType(row[0], retType, pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
-		if err != nil {
-			return nil, err
+		// Last statement: collect SETOF rows.
+		defer op.Close()
+		var out []Datum
+		retType := normalizeCatalogType(r.ReturnType)
+		for {
+			slot, nextErr := op.Next()
+			if nextErr == EOF {
+				break
+			}
+			if nextErr != nil {
+				return nil, nextErr
+			}
+			row := slotRow(slot)
+			if len(row) == 0 {
+				out = append(out, NullDatum)
+				continue
+			}
+			coerced, err := coerceDatumToType(row[0], retType, pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, coerced)
 		}
-		out = append(out, coerced)
+		if ctx != nil {
+			for _, n := range child.TakeNotices() {
+				ctx.AddNotice(n)
+			}
+		}
+		return out, nil
 	}
 	if ctx != nil {
 		for _, n := range child.TakeNotices() {
 			ctx.AddNotice(n)
 		}
 	}
-	return out, nil
+	return nil, nil
 }
 
 // evalPLpgSQLFunctionSetof calls a SETOF PL/pgSQL function via RETURN NEXT
