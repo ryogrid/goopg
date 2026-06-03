@@ -80,9 +80,9 @@ vacuum,0,pass
 varchar,0,pass
 xid,0,pass
 copydml,0,pass
-index_including_gist,64,failed
-aggregates,87,failed
-create_table_like,113,failed
+index_including_gist,60,failed
+aggregates,64,failed
+create_table_like,116,failed
 index_including,204,failed
 insert_conflict,239,failed
 join_hash,245,failed
