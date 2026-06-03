@@ -3719,18 +3719,21 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			}
 			// Schema is registered; unregister it.
 			o.ctx.Catalog.UnregisterSchema(schemaName)
-			// Also drop functions/procedures in this schema.
 			if s.Behavior == parser.DropCascade {
+				// Collect routines to drop for NOTICE detail.
+				var droppedRoutines []string
 				rs := o.ctx.Catalog.Routines()
 				if rs != nil {
 					for _, r := range rs.List() {
 						if strings.EqualFold(r.Schema, schemaName) {
+							// Build canonical arg list for NOTICE.
+							argStr := r.Name + "(" + buildFunctionArgsList(r) + ")"
+							droppedRoutines = append(droppedRoutines, argStr)
 							_ = rs.DropByName(parser.ObjectName{Schema: r.Schema, Name: r.Name})
 						}
 					}
+					sort.Strings(droppedRoutines)
 				}
-			}
-			if s.Behavior == parser.DropCascade && len(tables) > 0 {
 				// Sort table names for deterministic DETAIL output.
 				sort.Slice(tables, func(i, j int) bool {
 					return tables[i].String() < tables[j].String()
@@ -3741,18 +3744,22 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 					}
 				}
-				// Emit NOTICE "drop cascades to N other objects" with DETAIL.
-				// PostgreSQL's DETAIL field is multi-line; psql prints the first
-				// line with "DETAIL:" and continuation lines as plain text.
-				detailLines := make([]string, len(tables))
-				for i, tbl := range tables {
-					detailLines[i] = fmt.Sprintf("drop cascades to table %s", tbl.String())
+				// Emit NOTICE with total cascade count (tables + routines).
+				total := len(tables) + len(droppedRoutines)
+				if total > 0 {
+					var detailLines []string
+					for _, funcName := range droppedRoutines {
+						detailLines = append(detailLines, fmt.Sprintf("drop cascades to function %s", funcName))
+					}
+					for _, tbl := range tables {
+						detailLines = append(detailLines, fmt.Sprintf("drop cascades to table %s", tbl.String()))
+					}
+					detail := strings.Join(detailLines, "\n")
+					o.ctx.AddNoticeWithDetail(
+						fmt.Sprintf("drop cascades to %d other objects", total),
+						detail,
+					)
 				}
-				detail := strings.Join(detailLines, "\n")
-				o.ctx.AddNoticeWithDetail(
-					fmt.Sprintf("drop cascades to %d other objects", len(tables)),
-					detail,
-				)
 			}
 		}
 		return nil
@@ -4813,6 +4820,30 @@ func currentWritableSchema(ctx *Context) string {
 		return s
 	}
 	return "public"
+}
+
+// buildFunctionArgsList returns a comma-separated arg type list for a Routine,
+// using canonical type names. Used in DROP CASCADE NOTICE messages.
+func buildFunctionArgsList(r *catalog.Routine) string {
+	if len(r.ArgTypes) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(r.ArgTypes))
+	for i, t := range r.ArgTypes {
+		mode := "i"
+		if i < len(r.ArgModes) && r.ArgModes[i] != "" {
+			mode = r.ArgModes[i]
+		}
+		if mode == "o" {
+			continue // OUT params excluded from signature
+		}
+		typeName := strings.ToLower(t.Name)
+		if canon := dropCompatCanonicalType(typeName); canon != "" {
+			typeName = canon
+		}
+		parts = append(parts, typeName)
+	}
+	return strings.Join(parts, ",")
 }
 
 // buildCallArgListStr returns "()" for no arg list or "(type, ...)" for typed args.
