@@ -1277,11 +1277,17 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 
 // viewsDependingOnTable returns the names of views that directly reference tableName
 // in their FROM clause. Used by DROP TABLE CASCADE to cascade drops.
+// Only checks views in the same schema as the dropped table for performance.
 func viewsDependingOnTable(im *catalog.InMemory, tableName parser.ObjectName) []parser.ObjectName {
 	var deps []parser.ObjectName
 	tblLower := strings.ToLower(tableName.Name)
+	tblSchema := strings.ToLower(tableName.Schema)
 	for _, tbl := range im.AllUserViews() {
 		if tbl.View == nil {
+			continue
+		}
+		// Only check views in the same schema (fast path to avoid scanning all views).
+		if tblSchema != "" && strings.ToLower(tbl.Schema) != tblSchema {
 			continue
 		}
 		if selectRefsViewName(tbl.View, tblLower) {
