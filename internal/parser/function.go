@@ -258,7 +258,12 @@ func tokenBodySQL(t Token) string {
 	case TokenStringLit:
 		return "'" + strings.ReplaceAll(t.Value, "'", "''") + "'"
 	case TokenKeyword:
-		return t.Value // keywords stored lowercase (consistent with PG)
+		// Boolean literals stay lowercase in PG function bodies.
+		switch t.Keyword {
+		case KwTrue, KwFalse, KwNull:
+			return t.Value
+		}
+		return strings.ToUpper(t.Value)
 	default:
 		return t.Value
 	}

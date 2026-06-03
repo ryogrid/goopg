@@ -66,6 +66,43 @@ func typeNameToOIDStr(typName string) string {
 		return "2281"
 	case "pg_lsn":
 		return "3220"
+	// Array types (common ones)
+	case "bool[]", "boolean[]":
+		return "1000"
+	case "bytea[]":
+		return "1001"
+	case "char[]", "\"char\"[]":
+		return "1002"
+	case "name[]":
+		return "1003"
+	case "int8[]", "bigint[]":
+		return "1016"
+	case "int2[]", "smallint[]":
+		return "1005"
+	case "int4[]", "int[]", "integer[]":
+		return "1007"
+	case "text[]":
+		return "1009"
+	case "oid[]":
+		return "1028"
+	case "float4[]", "real[]":
+		return "1021"
+	case "float8[]", "float[]", "double precision[]":
+		return "1022"
+	case "varchar[]", "character varying[]":
+		return "1015"
+	case "date[]":
+		return "1182"
+	case "timestamp[]", "timestamp without time zone[]":
+		return "1115"
+	case "timestamptz[]", "timestamp with time zone[]":
+		return "1185"
+	case "interval[]":
+		return "1187"
+	case "numeric[]", "decimal[]":
+		return "1231"
+	case "uuid[]":
+		return "2951"
 	default:
 		return "0"
 	}

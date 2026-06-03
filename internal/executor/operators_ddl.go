@@ -2610,8 +2610,12 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
 	for i, a := range s.Args {
+		typName := strings.ToLower(a.Type.Name)
+		if a.Type.IsArray {
+			typName += "[]"
+		}
 		argTypes[i] = catalog.Type{
-			Name: strings.ToLower(a.Type.Name),
+			Name: typName,
 			Args: append([]int64(nil), a.Type.Args...),
 		}
 		argNames[i] = a.Name
@@ -2755,8 +2759,12 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	argModes := make([]string, len(s.Args))
 	argDefaults := make([]string, len(s.Args))
 	for i, a := range s.Args {
+		typName := strings.ToLower(a.Type.Name)
+		if a.Type.IsArray {
+			typName += "[]"
+		}
 		argTypes[i] = catalog.Type{
-			Name: strings.ToLower(a.Type.Name),
+			Name: typName,
 			Args: append([]int64(nil), a.Type.Args...),
 		}
 		argNames[i] = a.Name

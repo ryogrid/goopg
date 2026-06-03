@@ -114,6 +114,43 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "uuid"
 	case 3220:
 		return "pg_lsn"
+	// Array types
+	case 1000:
+		return "boolean[]"
+	case 1001:
+		return "bytea[]"
+	case 1002:
+		return "\"char\"[]"
+	case 1003:
+		return "name[]"
+	case 1005:
+		return "smallint[]"
+	case 1007:
+		return "integer[]"
+	case 1009:
+		return "text[]"
+	case 1015:
+		return "character varying[]"
+	case 1016:
+		return "bigint[]"
+	case 1021:
+		return "real[]"
+	case 1022:
+		return "double precision[]"
+	case 1028:
+		return "oid[]"
+	case 1115:
+		return "timestamp without time zone[]"
+	case 1182:
+		return "date[]"
+	case 1185:
+		return "timestamp with time zone[]"
+	case 1187:
+		return "interval[]"
+	case 1231:
+		return "numeric[]"
+	case 2951:
+		return "uuid[]"
 	default:
 		return ""
 	}
@@ -326,13 +363,21 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		}
 		if strings.EqualFold(x.TargetType, "regtype[]") && ctx != nil {
 			// oidvector (space-separated OID strings) → type name array like [0:1]={text,date}
-			if v.Kind == KindString {
-				parts := strings.Fields(v.StringValue())
-				if len(parts) == 0 {
+			// Single-element oidvectors may arrive as KindInt (TypedVirtualCell
+			// parses single-OID oidvector columns to IntegerConst for numeric sort).
+			var oidParts []string
+			switch v.Kind {
+			case KindString:
+				oidParts = strings.Fields(v.StringValue())
+			case KindInt:
+				oidParts = []string{fmt.Sprintf("%d", v.Int)}
+			}
+			if oidParts != nil {
+				if len(oidParts) == 0 {
 					return NewStringDatum("{}"), nil
 				}
-				names := make([]string, len(parts))
-				for i, p := range parts {
+				names := make([]string, len(oidParts))
+				for i, p := range oidParts {
 					oid, err := strconv.ParseInt(p, 10, 64)
 					if err != nil {
 						names[i] = p
@@ -9385,6 +9430,11 @@ func buildFunctionDef(r *catalog.Routine) string {
 // canonicalTypeName normalizes short PG type aliases to their canonical names,
 // matching what pg_get_functiondef displays (e.g. "bool" → "boolean").
 func canonicalTypeName(name string) string {
+	// Handle array types (e.g. "text[]") by canonicalizing the base type.
+	if strings.HasSuffix(name, "[]") {
+		base := canonicalTypeName(name[:len(name)-2])
+		return base + "[]"
+	}
 	switch strings.ToLower(name) {
 	case "bool":
 		return "boolean"

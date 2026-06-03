@@ -2015,13 +2015,14 @@ func (p *parser) parseCastTail(operand Expr) (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Consume optional array suffix `[]` — treat `type[]` as the same type
-	// (goopg v0 doesn't implement array types distinctly; the cast is a no-op). M0097-0003.
+	// Consume optional array suffix `[]` — preserve it in the type name for
+	// casts like ::regtype[] that need different handling than ::regtype. M0097-0003.
 	for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
 		p.advance() // '['
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
 			p.advance() // ']'
 		}
+		name.Name += "[]"
 	}
 	var typmods []int64
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
