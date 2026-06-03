@@ -2674,7 +2674,6 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	return nil
 }
 
-// execAlterFunction updates mutable attributes of an existing function/procedure.
 func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 	rs := o.ctx.Catalog.Routines()
 	if rs == nil {
@@ -2699,7 +2698,8 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		if s.IsProcedure {
 			kind = "procedure"
 		}
-		return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("%s %s does not exist", kind, s.Name.Name)}
+		argListStr := routineArgListStr(argTypes)
+		return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("%s %s%s does not exist", kind, s.Name.Name, argListStr)}
 	}
 	// Check that each matched routine is of the right kind.
 	for _, r := range routines {
@@ -2707,15 +2707,13 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 			// ALTER PROCEDURE on a function → "is not a procedure"
 			argList := routineArgListStr(argTypes)
 			return &ExecError{Code: "42809", Pos: s.Pos(),
-				Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argList),
-				Hint:    "To alter a function, use ALTER FUNCTION."}
+				Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argList)}
 		}
 		if !s.IsProcedure && r.IsProcedure {
 			// ALTER FUNCTION on a procedure → "is not a function"
 			argList := routineArgListStr(argTypes)
 			return &ExecError{Code: "42809", Pos: s.Pos(),
-				Message: fmt.Sprintf("%s%s is not a function", s.Name.Name, argList),
-				Hint:    "To alter a procedure, use ALTER PROCEDURE."}
+				Message: fmt.Sprintf("%s%s is not a function", s.Name.Name, argList)}
 		}
 	}
 	for _, r := range routines {
@@ -2875,8 +2873,7 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	if objKind == "procedure" && !found.IsProcedure {
 		argListStr := routineArgListStr(argTypes)
 		return &ExecError{Code: "42809", Pos: s.Pos(),
-			Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argListStr),
-			Hint:    "Use DROP FUNCTION to remove a function."}
+			Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argListStr)}
 	}
 	// Now drop.
 	var err error
@@ -2961,8 +2958,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 				return nil
 			}
 			return &ExecError{Code: "42809", Pos: s.Pos(),
-				Message: fmt.Sprintf("%s%s is not a function", s.Name.Name, argListStr),
-				Hint:    "To call a procedure, use CALL."}
+				Message: fmt.Sprintf("%s%s is not a function", s.Name.Name, argListStr)}
 		}
 	}
 
