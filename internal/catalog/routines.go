@@ -102,6 +102,9 @@ var (
 	// one overload exists for the bare name. Callers must supply
 	// the argument list to disambiguate.
 	ErrRoutineAmbiguous = errors.New("function name is not unique")
+	// ErrRoutineKindChange is returned when CREATE OR REPLACE tries to change
+	// a function to a procedure or vice versa.
+	ErrRoutineKindChange = errors.New("cannot change routine kind")
 )
 
 // FirstRoutineOID is the first OID handed out for user routines —
@@ -153,6 +156,10 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 	if existing, ok := rs.byKey[k]; ok {
 		if !orReplace {
 			return nil, fmt.Errorf("%w: %s%s", ErrRoutineExists, clone.QualifiedName(), signature)
+		}
+		// Cannot change a function to a procedure or vice versa.
+		if existing.IsProcedure != clone.IsProcedure {
+			return nil, fmt.Errorf("%w: %s", ErrRoutineKindChange, clone.QualifiedName())
 		}
 		// CREATE OR REPLACE preserves the OID — upstream's contract.
 		clone.OID = existing.OID

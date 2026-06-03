@@ -2669,6 +2669,10 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		if errors.Is(err, catalog.ErrRoutineExists) {
 			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
 		}
+		// ErrRoutineKindChange → SQLSTATE 42P13 (cannot change routine kind).
+		if errors.Is(err, catalog.ErrRoutineKindChange) {
+			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "cannot change routine kind"}
+		}
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 	}
 	return nil
@@ -2803,6 +2807,9 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		if errors.Is(err, catalog.ErrRoutineExists) {
 			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
+		}
+		if errors.Is(err, catalog.ErrRoutineKindChange) {
+			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "cannot change routine kind"}
 		}
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 	}
