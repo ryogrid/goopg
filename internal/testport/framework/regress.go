@@ -978,6 +978,20 @@ func sortUnorderedResultBlocks(lines []string) []string {
 		if hasOrderBy(out, i) {
 			continue // ordered result — do not sort
 		}
+		// Skip sorting if any data row ends with " +" — this indicates a
+		// multi-line text value displayed with psql's continuation markers.
+		// Sorting the continuation lines of a single cell (e.g. pg_get_functiondef
+		// output) would produce non-sensical results.
+		hasMultiLine := false
+		for _, row := range out[dataStart:dataEnd] {
+			if strings.HasSuffix(row, "+") {
+				hasMultiLine = true
+				break
+			}
+		}
+		if hasMultiLine {
+			continue // multi-line text cell — do not sort
+		}
 		// Sort the data rows (in-place) for deterministic comparison.
 		dataRows := make([]string, dataEnd-dataStart)
 		copy(dataRows, out[dataStart:dataEnd])
