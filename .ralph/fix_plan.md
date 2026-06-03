@@ -2697,12 +2697,15 @@ M0097-0001 wires it up.
       - Mapped to completed M0097-0014.
       - DoD: same as M0097-0020.
 
-- [ ] **M0097-0027 — Port partition regress tests**
+- [x] **M0097-0027 — Port partition regress tests**
       - Summary: Make these 5 tests reach `pass`:
         `partition_prune`, `partition_join`, `partition_aggregate`,
         `partition_info`, `hash_part`.
       - Mapped to completed M0097-0015.
       - DoD: same as M0097-0020.
+      - **COMPLETE 2026-06-04:** All 5 target tests pass with 0 diff lines
+        (verified via TestPort_RegressSuite): partition_prune, partition_join,
+        partition_aggregate, partition_info, hash_part.
 
 - [ ] **M0097-0028 — Port ON CONFLICT / MERGE regress tests**
       - Summary: Make these 2 tests reach `pass`:
@@ -5600,6 +5603,27 @@ back to heap fetches even when the Visibility Map could allow a pure index scan.
         Seven fixes: parser preserves [] in ::regtype[] cast (TargetType="regtype[]"); regtype[] handler handles KindInt single-element oidvectors; oidToBuiltinTypeName/typeNameToOIDStr gain array OIDs; IsArray in ArgTypes storage; canonicalTypeName handles arrays; tokenBodySQL uppercase SQL keywords. create_function_sql: 202→184.
       - **Progress 2026-06-03 (M0097-0153 — SETOF FROM-clause + VOID fix, loop 4 cont):**
         Five fixes: parser accepts user-defined name() in FROM (allowUserSRF flag); planner handles user SETOF functions via UserSrfScan; executor userSrfScanOp calls evalSQLFunctionSetof; VOID functions return NullDatum; oidvector single-element regtype[] fix. create_function_sql: 184→168. aggregates: 87→64 (side-effect).
+<!-- M0097-0156 progress added by loop 11 2026-06-04 -->
+      - **Progress 2026-06-04 (M0097-0156 — pg_typeof compile-time fold + poly aggregate type, loop 11):**
+        Two targeted fixes:
+        (a) `pg_typeof(expr)` is now folded at PLAN time to a `FuncCall{Name:"pg_typeof",
+            Args:[StringConst{typeName}]}` using `pgTypeofDisplayName(exprType(resolvedArg).Name)`.
+            Added in both `resolveExpr` (non-aggregate) and `resolveExprAfterAggregate` (post-aggregate).
+            The executor's `pg_typeof` case now fast-returns `KindString` args directly (the pre-computed
+            type name). This fixes `pg_typeof(cleast_agg(variadic array[4.5,f1]))` returning "integer"
+            (runtime KindInt from an int4-range result) instead of "numeric" (the aggregate's declared
+            return type). −2 diff lines.
+        (b) Polymorphic SType resolution for user-defined aggregates: `resolvePolyAggOutputType` helper
+            resolves `anycompatible`/`anyelement`/`anyarray` SType to the actual input-derived type.
+            For `anycompatible`, walks `array_construct` args and picks the highest-rank compatible type
+            via `commonCompatibleType`/`compatibleTypeRank`. `cleast_agg(variadic array[4.5,f1])` now
+            has output type `numeric` (from numeric > int4 rank ordering). Tests:
+            `TestPgTypeofFoldsToCompileTimeType`, `TestResolvePolyAggOutputType` in
+            `internal/planner/pg_typeof_test.go`. Design: (inline). aggregates: 57→55 diff lines.
+        Remaining aggregates blockers: USING-join HAVING correlated aggregate (18 lines),
+        scalar subquery outer-aggregate propagation (29 lines), FILTER-in-subquery (4 lines),
+        missing nested-agg error for complex avg ORDER BY (2 lines). Total: ~53 lines.
+        M0097-0027 marked COMPLETE (all partition tests pass). Baseline CSV: aggregates updated.
 <!-- M0097-0155 progress added by loop 10 2026-06-04 -->
       - **Progress 2026-06-04 (M0097-0155 — aggregates 64→57 diffs, loop 10):**
         Three targeted fixes:

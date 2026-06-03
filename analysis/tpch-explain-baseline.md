@@ -77,7 +77,7 @@ Root node: `Projection`
 
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
-| 1 | Seq Scan | nation | — |
+| 1 | Seq Scan | nation n2 | — |
 | 2 | Seq Scan | customer | — |
 | 3 | Seq Scan | orders | — |
 | 4 | Index Scan | lineitem | idx_lineitem_shipdate |
@@ -237,9 +237,9 @@ Root node: `Projection`
 | 1 | Seq Scan | nation | — |
 | 2 | Seq Scan | supplier | — |
 | 3 | Seq Scan | orders | — |
-| 4 | Seq Scan | lineitem | — |
+| 4 | Seq Scan | lineitem l1 | — |
 | 5 | Index Scan | lineitem | idx_lineitem_orderkey |
-| 6 | Seq Scan | lineitem | — |
+| 6 | Seq Scan | lineitem l3 | — |
 
 ### Q22
 
@@ -259,8 +259,11 @@ for an M0054-0003 sub-task investigation.
 | Table | Seq Scan queries | Index Scan queries |
 |-------|------------------|--------------------|
 | customer | Q10, Q18, Q22, Q7 | Q13, Q3, Q5, Q8 |
-| lineitem | Q10, Q17, Q18, Q19, Q21, Q4, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q20, Q21, Q3, Q5, Q6, Q7, Q8 |
-| nation | Q10, Q11, Q2, Q21, Q7 | Q2, Q20, Q5, Q7, Q8, Q9 |
+| lineitem | Q10, Q17, Q18, Q19, Q4, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q20, Q21, Q3, Q5, Q6, Q7, Q8 |
+| lineitem l1 | Q21 | — |
+| lineitem l3 | Q21 | — |
+| nation | Q10, Q11, Q2, Q21 | Q2, Q20, Q5, Q7, Q8, Q9 |
+| nation n2 | Q7 | — |
 | orders | Q13, Q18, Q21, Q7, Q9 | Q10, Q12, Q22, Q3, Q4, Q5, Q8 |
 | part | Q20, Q9 | Q14, Q16, Q17, Q19, Q2, Q8 |
 | partsupp | Q11, Q16, Q2, Q20 | Q2, Q9 |

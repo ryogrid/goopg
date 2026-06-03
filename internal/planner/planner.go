@@ -4198,7 +4198,23 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			if !ok {
 				return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "aggregate call could not be resolved"}
 			}
+			// pg_typeof(agg(...)) after aggregate stage: fold to compile-time type
+			// of the aggregate's output column. Keep FuncCall wrapper for column label.
+			// M0097-0035.
+			if strings.ToLower(x.Name.String()) == "pg_typeof" {
+				typName := pgTypeofDisplayName(b.typ.Name)
+				return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
+			}
 			return &ColumnRef{pos: x.Pos(), Index: b.index, Name: agg.output.schema[b.index].Name, Type: b.typ}, nil
+		}
+		// pg_typeof(non-agg-expr) in post-aggregate context: resolve arg and fold.
+		if strings.ToLower(x.Name.String()) == "pg_typeof" && len(x.Args) == 1 {
+			arg, err := resolveExprAfterAggregate(x.Args[0], agg)
+			if err != nil {
+				return nil, err
+			}
+			typName := pgTypeofDisplayName(exprType(arg).Name)
+			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
 		}
 		args := make([]Expr, 0, len(x.Args))
 		for _, a := range x.Args {
@@ -5171,7 +5187,9 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 					if ua.FinalFunc != "" {
 						outType = catalog.Type{Name: "numeric"}
 					} else {
-						outType = catalog.Type{Name: ua.SType}
+						// For polymorphic stypes (anycompatible, anyelement, anyarray),
+						// resolve to the actual input-derived type. M0097-0035.
+						outType = resolvePolyAggOutputType(ua.SType, argExpr)
 					}
 				}
 				// Resolve ORDER BY inside the aggregate call.
@@ -6931,6 +6949,128 @@ func castTargetLabel(t string) string {
 	return t
 }
 
+// pgTypeofDisplayName maps a planner type name to the display name pg_typeof returns.
+// Mirrors PostgreSQL's format_type_be for common types. M0097-0035.
+func pgTypeofDisplayName(name string) string {
+	switch strings.ToLower(name) {
+	case "int4", "int", "integer", "serial":
+		return "integer"
+	case "int2", "smallint", "smallserial":
+		return "smallint"
+	case "int8", "bigint", "bigserial":
+		return "bigint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision", "float":
+		return "double precision"
+	case "bool", "boolean":
+		return "boolean"
+	case "text":
+		return "text"
+	case "varchar", "character varying":
+		return "character varying"
+	case "char", "character", "bpchar":
+		return "character"
+	case "numeric", "decimal":
+		return "numeric"
+	case "timestamp", "timestamp without time zone":
+		return "timestamp without time zone"
+	case "timestamptz", "timestamp with time zone":
+		return "timestamp with time zone"
+	case "date":
+		return "date"
+	case "time", "time without time zone":
+		return "time without time zone"
+	case "timetz", "time with time zone":
+		return "time with time zone"
+	case "interval":
+		return "interval"
+	case "bytea":
+		return "bytea"
+	case "uuid":
+		return "uuid"
+	case "json":
+		return "json"
+	case "jsonb":
+		return "jsonb"
+	case "oid":
+		return "oid"
+	default:
+		return name
+	}
+}
+
+// compatibleTypeRank returns a numeric rank for anycompatible type resolution.
+// Higher rank wins (numeric > float8 > float4 > int8 > int4 > int2 > text).
+func compatibleTypeRank(name string) int {
+	switch strings.ToLower(name) {
+	case "numeric", "decimal":
+		return 10
+	case "float8", "double precision", "float":
+		return 8
+	case "float4", "real":
+		return 7
+	case "int8", "bigint":
+		return 6
+	case "int4", "integer", "int", "serial":
+		return 5
+	case "int2", "smallint", "smallserial":
+		return 4
+	case "text", "varchar", "character varying":
+		return 2
+	default:
+		return 1
+	}
+}
+
+// commonCompatibleType returns the common anycompatible type for a slice of expressions,
+// picking the highest-ranked type. Used for polymorphic aggregate output type resolution.
+func commonCompatibleType(exprs []Expr) catalog.Type {
+	var best catalog.Type
+	for _, e := range exprs {
+		t := exprType(e)
+		if t.Name == "" || t.Name == "unknown" {
+			continue
+		}
+		if best.Name == "" || compatibleTypeRank(t.Name) > compatibleTypeRank(best.Name) {
+			best = t
+		}
+	}
+	if best.Name == "" {
+		return catalog.Type{Name: "numeric"}
+	}
+	return best
+}
+
+// resolvePolyAggOutputType resolves a polymorphic aggregate SType to an actual catalog type
+// based on the argument expression. Handles anycompatible, anyelement, anyarray.
+// M0097-0035: fixes pg_typeof(cleast_agg(...)) returning "integer" instead of "numeric".
+func resolvePolyAggOutputType(stype string, argExpr Expr) catalog.Type {
+	switch strings.ToLower(stype) {
+	case "anycompatible", "anyelement":
+		// Unwrap array_construct to get element type for variadic array aggregates.
+		if fc, ok := argExpr.(*FuncCall); ok && fc.Name == "array_construct" && len(fc.Args) > 0 {
+			return commonCompatibleType(fc.Args)
+		}
+		et := exprType(argExpr)
+		if et.Name != "" && et.Name != "unknown" {
+			return et
+		}
+		return catalog.Type{Name: "numeric"}
+	case "anyarray":
+		et := exprType(argExpr)
+		if strings.HasSuffix(et.Name, "[]") {
+			return et
+		}
+		if et.Name != "" && et.Name != "unknown" {
+			return catalog.Type{Name: et.Name + "[]"}
+		}
+		return catalog.Type{Name: "text[]"}
+	default:
+		return catalog.Type{Name: stype}
+	}
+}
+
 // exprType returns the planner-level type tag for an expression. v0
 // only knows what ColumnRef carries; everything else gets the
 // "unknown" tag the executor coerces at runtime.
@@ -7890,6 +8030,19 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 	case *parser.FuncCall:
 		if x.Over != nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
+		}
+		// pg_typeof(expr) returns the static type of its argument. Fold it at
+		// plan time by replacing the arg with a StringConst holding the type name,
+		// while keeping the FuncCall wrapper so the column label stays "pg_typeof".
+		// This ensures pg_typeof(user_agg(...)) returns the aggregate's declared
+		// return type rather than the runtime datum kind. M0097-0035.
+		if strings.ToLower(x.Name.String()) == "pg_typeof" && len(x.Args) == 1 {
+			arg, err := resolveExpr(x.Args[0], ctx)
+			if err != nil {
+				return nil, err
+			}
+			typName := pgTypeofDisplayName(exprType(arg).Name)
+			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
 		}
 		args := make([]Expr, 0, len(x.Args))
 		for _, a := range x.Args {

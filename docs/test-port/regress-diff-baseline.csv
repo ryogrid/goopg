@@ -84,7 +84,7 @@ xid,0,pass
 enum,0,pass
 name,0,pass
 index_including_gist,60,failed
-aggregates,57,failed
+aggregates,55,failed
 create_function_sql,0,pass
 create_table_like,116,failed
 join_hash,142,failed

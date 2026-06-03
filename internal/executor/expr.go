@@ -7572,12 +7572,17 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return Datum{Kind: KindInt, Int: int64(cnt)}, nil
 	case "pg_typeof":
 		if len(x.Args) == 1 {
-			// Return the type name as text (best-effort)
+			// Return the type name as text (best-effort).
+			// When the planner has folded pg_typeof(expr) by pre-computing the type
+			// name (stored as a StringConst arg), return it directly. M0097-0035.
 			v, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || v.IsNull() {
 				return NewStringDatum("unknown"), nil
 			}
 			switch v.Kind {
+			case KindString:
+				// Pre-computed type name from planner fold — return as-is.
+				return v, nil
 			case KindInt:
 				return NewStringDatum("integer"), nil
 			case KindBool:
