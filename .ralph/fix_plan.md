@@ -5600,3 +5600,22 @@ back to heap fetches even when the Visibility Map could allow a pure index scan.
         Seven fixes: parser preserves [] in ::regtype[] cast (TargetType="regtype[]"); regtype[] handler handles KindInt single-element oidvectors; oidToBuiltinTypeName/typeNameToOIDStr gain array OIDs; IsArray in ArgTypes storage; canonicalTypeName handles arrays; tokenBodySQL uppercase SQL keywords. create_function_sql: 202→184.
       - **Progress 2026-06-03 (M0097-0153 — SETOF FROM-clause + VOID fix, loop 4 cont):**
         Five fixes: parser accepts user-defined name() in FROM (allowUserSRF flag); planner handles user SETOF functions via UserSrfScan; executor userSrfScanOp calls evalSQLFunctionSetof; VOID functions return NullDatum; oidvector single-element regtype[] fix. create_function_sql: 184→168. aggregates: 87→64 (side-effect).
+<!-- M0097-0155 progress added by loop 10 2026-06-04 -->
+      - **Progress 2026-06-04 (M0097-0155 — aggregates 64→57 diffs, loop 10):**
+        Three targeted fixes:
+        (a) `GROUP BY f1` (USING-merged) vs `SELECT t1.f1` (qualified): added `groupByMergedByName
+            map[string]bool` to `aggregateSurface`; populated in `buildAggregateStage` when GROUP BY
+            has an unqualified ColumnRef that matches a USING-join hidden column; `resolveExprAfterAggregate`
+            skips the `groupByExpr` fast-path match and rejects the `groupByInputCol` match for qualified
+            ColumnRefs when the GROUP BY was USING-merged. Fixes 4 extra `(0 rows)` lines + 1 missing
+            "column t1.f1 must appear in GROUP BY" error = 5 lines saved.
+        (b) DISTINCT shared-state aggregates (e.g. `my_avg(distinct one), my_sum(distinct one)`):
+            planner now allows DISTINCT aggregates to share SharedStateSlot (removed `pa.Distinct`
+            guard from slot assignment — the stateKey already encodes `distinct` so mismatched-distinct
+            pairs stay separate). Executor sync step pre-computes the leader's sfunc state (dedup+sort+sfunc)
+            for DISTINCT aggs when `slotCount[slot] > 1`, injects into leader and followers, clearing
+            `distinctUserAggRows` so `finishAgg` applies each aggregate's own `finalfunc` without
+            re-calling sfunc. Fixes 2 extra `NOTICE: avg_transfn called with N` lines.
+        Remaining aggregates blockers: outer-level aggregate HAVING (18), FILTER with outer reference (29),
+        FILTER IN subquery sum (4), pg_typeof cleast_agg VARIADIC (2), missing nested-agg error (1).
+        Baseline CSV: aggregates 64→57.

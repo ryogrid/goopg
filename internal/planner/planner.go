@@ -3417,7 +3417,13 @@ type aggregateSurface struct {
 	output          *resolveContext
 	groupByExpr     map[string]int
 	groupByInputCol map[int]int
-	aggregateByKey  map[string]aggregateBinding
+	// groupByMergedByName tracks column names (lowercase) that were grouped via
+	// an unqualified USING-join column. When SELECT has a table-qualified reference
+	// t.f1 but GROUP BY had the USING-merged unqualified f1, PostgreSQL requires
+	// t.f1 to also appear in GROUP BY — unlike non-USING GROUP BY c which satisfies
+	// SELECT t.c. M0097-0155.
+	groupByMergedByName map[string]bool
+	aggregateByKey      map[string]aggregateBinding
 	// node is the Aggregate plan node; mutated by resolveExprAfterAggregate
 	// when functionally-determined passthrough columns are discovered.
 	node *Aggregate
@@ -3744,6 +3750,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	groupExprs := make([]Expr, 0, len(s.GroupBy))
 	groupByExpr := map[string]int{}
 	groupByInputCol := map[int]int{}
+	var groupByMergedByName map[string]bool // populated only when USING-join cols appear in GROUP BY
 	outputSchema := make(Schema, 0, len(s.GroupBy)+len(s.Targets))
 
 	for _, g := range s.GroupBy {
@@ -3769,6 +3776,21 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		groupByExpr[parserExprKey(g)] = idx
 		if c, ok := r.(*ColumnRef); ok {
 			groupByInputCol[c.Index] = idx
+		}
+		// Track if this GROUP BY column was an unqualified USING-join merged column.
+		// Used by resolveExprAfterAggregate to reject qualified SELECT refs. M0097-0155.
+		if cr, isColRef := g.(*parser.ColumnRef); isColRef && cr.Table == "" {
+			colLower := strings.ToLower(cr.Column)
+			for _, b := range inputCtx.bindings {
+				for _, uh := range b.usingHidden {
+					if strings.EqualFold(uh, cr.Column) {
+						if groupByMergedByName == nil {
+							groupByMergedByName = make(map[string]bool)
+						}
+						groupByMergedByName[colLower] = true
+					}
+				}
+			}
 		}
 		groupExprs = append(groupExprs, r)
 		outputSchema = append(outputSchema, SchemaColumn{Name: groupExprName(r), Type: exprType(r)})
@@ -3829,8 +3851,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		nextSlot := 0
 		for i := range plannedAggs {
 			pa := &plannedAggs[i]
-			if pa.UserAgg == nil || pa.Distinct {
-				// Non-user aggregates and DISTINCT aggregates do not share state.
+			if pa.UserAgg == nil {
+				// Non-user aggregates do not share state.
 				pa.SharedStateSlot = -1
 				continue
 			}
@@ -3873,14 +3895,15 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 
 	outputCtx := newResolveContext(nil, outputSchema)
 	surface := &aggregateSurface{
-		input:           inputCtx,
-		output:          outputCtx,
-		groupByExpr:     groupByExpr,
-		groupByInputCol: groupByInputCol,
-		aggregateByKey:  aggByKey,
-		node:            aggNode,
-		funcDepCols:     map[int]int{},
-		cat:             cat,
+		input:               inputCtx,
+		output:              outputCtx,
+		groupByExpr:         groupByExpr,
+		groupByInputCol:     groupByInputCol,
+		groupByMergedByName: groupByMergedByName,
+		aggregateByKey:      aggByKey,
+		node:                aggNode,
+		funcDepCols:         map[int]int{},
+		cat:                 cat,
 	}
 
 	var having Expr
@@ -4003,7 +4026,18 @@ func groupExprName(e Expr) string {
 
 func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, error) {
 	if idx, ok := agg.groupByExpr[parserExprKey(e)]; ok {
-		return &ColumnRef{pos: e.Pos(), Index: idx, Name: agg.output.schema[idx].Name, Type: agg.output.schema[idx].Type}, nil
+		// M0097-0155: if SELECT expression is table-qualified (e.g. t1.f1) and the
+		// GROUP BY entry was an unqualified USING-join merged column (GROUP BY f1),
+		// the two are semantically different — PostgreSQL requires the qualified column
+		// to also appear in GROUP BY. Skip this match; fall through to the ColumnRef
+		// case which will emit the proper "must appear in GROUP BY" error.
+		skipMatch := false
+		if cr, isColRef := e.(*parser.ColumnRef); isColRef && cr.Table != "" {
+			skipMatch = agg.groupByMergedByName[strings.ToLower(cr.Column)]
+		}
+		if !skipMatch {
+			return &ColumnRef{pos: e.Pos(), Index: idx, Name: agg.output.schema[idx].Name, Type: agg.output.schema[idx].Type}, nil
+		}
 	}
 	switch x := e.(type) {
 	case *parser.IntegerConst:
@@ -4076,6 +4110,11 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		}
 		col := resolved.(*ColumnRef)
 		idx, ok := agg.groupByInputCol[col.Index]
+		// M0097-0155: reject USING-merge GROUP BY match for qualified SELECT refs.
+		// GROUP BY f1 (USING-merged) does NOT satisfy SELECT t1.f1 (qualified).
+		if ok && x.Table != "" && agg.groupByMergedByName[strings.ToLower(x.Column)] {
+			ok = false
+		}
 		if !ok {
 			// Check if this column is functionally determined by the GROUP BY key.
 			// PostgreSQL SQL92 extension: when GROUP BY covers a primary key of some

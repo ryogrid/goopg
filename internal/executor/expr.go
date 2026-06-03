@@ -9454,6 +9454,58 @@ func buildFunctionDef(r *catalog.Routine) string {
 
 // canonicalTypeName normalizes short PG type aliases to their canonical names,
 // matching what pg_get_functiondef displays (e.g. "bool" → "boolean").
+// pgTypeofNameFromPlanType converts a planner catalog type name to the string
+// that pg_typeof returns for that type. Mirrors PostgreSQL's format_type_be.
+// M0097-0155.
+func pgTypeofNameFromPlanType(name string) string {
+	switch strings.ToLower(name) {
+	case "int4", "int", "integer", "serial":
+		return "integer"
+	case "int2", "smallint", "smallserial":
+		return "smallint"
+	case "int8", "bigint", "bigserial":
+		return "bigint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision", "float":
+		return "double precision"
+	case "bool", "boolean":
+		return "boolean"
+	case "text":
+		return "text"
+	case "varchar", "character varying":
+		return "character varying"
+	case "char", "character", "bpchar":
+		return "character"
+	case "numeric", "decimal":
+		return "numeric"
+	case "timestamp", "timestamp without time zone":
+		return "timestamp without time zone"
+	case "timestamptz", "timestamp with time zone":
+		return "timestamp with time zone"
+	case "date":
+		return "date"
+	case "time", "time without time zone":
+		return "time without time zone"
+	case "timetz", "time with time zone":
+		return "time with time zone"
+	case "interval":
+		return "interval"
+	case "bytea":
+		return "bytea"
+	case "uuid":
+		return "uuid"
+	case "json":
+		return "json"
+	case "jsonb":
+		return "jsonb"
+	case "oid":
+		return "oid"
+	default:
+		return name
+	}
+}
+
 func canonicalTypeName(name string) string {
 	// Handle array types (e.g. "text[]") by canonicalizing the base type.
 	if strings.HasSuffix(name, "[]") {

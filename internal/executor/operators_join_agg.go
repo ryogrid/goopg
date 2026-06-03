@@ -1127,17 +1127,100 @@ func (o *aggregateOp) Open(ctx *Context) error {
 		out := make(Row, 0, len(gr.groupValues)+len(o.plan.Aggs)+len(gr.passthroughVals))
 		out = append(out, gr.groupValues...)
 		// Sync follower aggregates from their leader before finishAgg. M0097-0035.
+		// For DISTINCT aggregates with actual followers (multiple aggs sharing the
+		// same slot), compute the leader's sfunc state once and inject it into
+		// followers so they skip sfunc calls (avoiding duplicate NOTICE/side-
+		// effects) and only apply their own finalfunc. M0097-0155.
+		//
+		// First, count how many aggregates exist per SharedStateSlot to detect
+		// actual sharing (a slot with only one agg is not shared).
+		slotCount := map[int]int{}
+		for _, call := range o.plan.Aggs {
+			if call.SharedStateSlot >= 0 && call.UserAgg != nil {
+				slotCount[call.SharedStateSlot]++
+			}
+		}
+		type slotState struct {
+			state    Datum
+			computed bool
+		}
+		distinctSlotStates := map[int]slotState{}
 		for i, call := range o.plan.Aggs {
-			if call.SharedStateSlot < 0 || call.UserAgg == nil || i == 0 {
+			if call.SharedStateSlot < 0 || call.UserAgg == nil {
 				continue
 			}
-			for j := 0; j < i; j++ {
-				if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
-					gr.aggs[i].userState = gr.aggs[j].userState
-					gr.aggs[i].userStateSet = gr.aggs[j].userStateSet
-					gr.aggs[i].hasValue = gr.aggs[j].hasValue
-					break
+			if !(call.Distinct || len(call.OrderBy) > 0) {
+				// Non-DISTINCT sync: copy userState as before.
+				if i == 0 {
+					continue
 				}
+				for j := 0; j < i; j++ {
+					if o.plan.Aggs[j].SharedStateSlot == call.SharedStateSlot {
+						gr.aggs[i].userState = gr.aggs[j].userState
+						gr.aggs[i].userStateSet = gr.aggs[j].userStateSet
+						gr.aggs[i].hasValue = gr.aggs[j].hasValue
+						break
+					}
+				}
+				continue
+			}
+			// DISTINCT path: pre-compute leader's sfunc state once only when
+			// there are actual followers (slot count > 1). Solo aggregates run
+			// finishAgg normally to preserve ORDER BY sort behaviour.
+			if slotCount[call.SharedStateSlot] <= 1 {
+				continue
+			}
+			ss, alreadyComputed := distinctSlotStates[call.SharedStateSlot]
+			if !alreadyComputed {
+				// This is the leader: compute dedup+sort+sfunc state.
+				ua := call.UserAgg
+				st := gr.aggs[i]
+				nSortKeys := len(call.OrderBy)
+				var deduped [][]Datum
+				if call.Distinct && len(st.distinctUserAggRows) > 0 {
+					seen := map[string]struct{}{}
+					for _, row := range st.distinctUserAggRows {
+						argSlice := row[nSortKeys:]
+						var keyParts []string
+						for _, d := range argSlice {
+							keyParts = append(keyParts, datumKey(d))
+						}
+						k := strings.Join(keyParts, "\t")
+						if _, ok := seen[k]; ok {
+							continue
+						}
+						seen[k] = struct{}{}
+						deduped = append(deduped, row)
+					}
+				} else {
+					deduped = st.distinctUserAggRows
+				}
+				state := userAggInitState(ua)
+				for _, row := range deduped {
+					argSlice := row[nSortKeys:]
+					sfuncArgs := make([]Datum, 0, 1+len(argSlice))
+					sfuncArgs = append(sfuncArgs, state)
+					sfuncArgs = append(sfuncArgs, argSlice...)
+					newState, serr := executeSFuncCall(ua.SFunc, sfuncArgs, o.ctx)
+					if serr == nil {
+						state = newState
+					}
+				}
+				ss = slotState{state: state, computed: true}
+				distinctSlotStates[call.SharedStateSlot] = ss
+				// Replace leader's rows with the pre-computed state so finishAgg
+				// skips sfunc and applies only the leader's finalfunc.
+				gr.aggs[i].userState = state
+				gr.aggs[i].userStateSet = true
+				gr.aggs[i].hasValue = true
+				gr.aggs[i].distinctUserAggRows = nil
+			} else {
+				// Follower: inject leader's sfunc state; clear rows so finishAgg
+				// skips sfunc and applies only the follower's finalfunc.
+				gr.aggs[i].userState = ss.state
+				gr.aggs[i].userStateSet = true
+				gr.aggs[i].hasValue = true
+				gr.aggs[i].distinctUserAggRows = nil
 			}
 		}
 		for i, call := range o.plan.Aggs {
