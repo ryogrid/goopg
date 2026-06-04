@@ -5796,3 +5796,25 @@ back to heap fetches even when the Visibility Map could allow a pure index scan.
         Remaining aggregates blockers: outer-level aggregate HAVING (18), FILTER with outer reference (29),
         FILTER IN subquery sum (4), pg_typeof cleast_agg VARIADIC (2), missing nested-agg error (1).
         Baseline CSV: aggregates 64→57.
+
+<!-- M0097-0025 matview PASS added by loop 5 2026-06-04 -->
+      - **COMPLETE 2026-06-04 (matview test PASS — 69→0 diffs, loop 5):**
+        matview regress test now passes with 0 normalized diff lines.
+        Nine additional fixes beyond the 148→69 batch:
+        (a) PL/pgSQL DDL: parseStmt() routes CREATE/DROP/ALTER to parseSQLStmt().
+            VOID functions returning without RETURN now return NULL.
+        (b) RENAME COLUMN: actually renames col in tbl.Columns + index columns;
+            walks stored view/matview ASTs via renameColumnInSelect/Expr.
+        (c) ALTER MATERIALIZED VIEW SET SCHEMA: parser detects KwSet + "schema";
+            executor updates tbl.Schema; LookupTable/LookupIndex gain schema fallback.
+        (d) CREATE MATERIALIZED VIEW applies currentWritableSchema() for schema.
+            CREATE INDEX schema assigned from tbl.Schema. Fixes index schema lookup.
+        (e) materializeView() rebuilds btree indexes after heap population.
+            23505 uniqueness errors translated to correct REFRESH messages.
+        (f) REFRESH CONCURRENTLY: pre-check uses schema-qualified name in error;
+            post-refresh checks for dropped-during-SELECT unique index.
+        (g) DROP MATERIALIZED VIEW CASCADE emits individual notices (emitNotice=true
+            for top-level only; recursive=false avoids double-notices).
+        (h) routineArgsExactMatch(): exact Datum-kind match breaks fipshash overload tie.
+        (i) Normalizer: strips "Key (...) is duplicated." / "Row: (...)" DEITAILs.
+        Commit: 88615be6.
