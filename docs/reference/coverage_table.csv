@@ -185,7 +185,7 @@ Query Processing,Parallel Query,Partial (Append / SeqScan / IndexScan / Join) su
 Query Processing,Parallel Query,Parallel safety (PARALLEL SAFE / RESTRICTED / UNSAFE),parallel-safety.md,,
 Data Types,Numeric,smallint / integer / bigint (int2/int4/int8 fixed-width),datatype-numeric.md,,
 Data Types,Numeric,real / double precision (float4/float8 IEEE 754),datatype-numeric.md,,
-Data Types,Numeric,numeric / decimal (variable-length, precision/scale, base-10000),datatype-numeric.md,,
+Data Types,Numeric,numeric / decimal (variable-length / precision/scale / base-10000),datatype-numeric.md,,
 Data Types,Numeric,smallserial / serial / bigserial (auto-increment sequences),datatype-numeric.md,,
 Data Types,Monetary,"money type (locale-aware currency / int8-based)",datatype-money.md,,
 Data Types,Character,character varying(n) / varchar(n) / character(n) / char(n) / text,datatype-character.md,,
