@@ -2741,9 +2741,19 @@ M0097-0001 wires it up.
         `partition_info`, `hash_part`.
       - Mapped to completed M0097-0015.
       - DoD: same as M0097-0020.
-      - **COMPLETE 2026-06-04:** All 5 target tests pass with 0 diff lines
-        (verified via TestPort_RegressSuite): partition_prune, partition_join,
-        partition_aggregate, partition_info, hash_part.
+      - **COMPLETE 2026-06-04 (original claim):** All 5 tests claimed pass.
+      - **Regression 2026-06-04 (loop 7):** 4 of 5 tests now fail after matview
+        commits (698bfa76..88615be6): partition_prune 693 diffs, partition_info 254,
+        partition_join 397. Root cause: expression partition keys (NOT a, abs(b),
+        (a+b)/2) were never supported; the "0 diffs" baseline was stale/incorrect.
+      - **RECOVERY 2026-06-04 (loop 7):** partition_aggregate → PASS (64→0 diffs).
+        Three fixes: (a) expression partition keys parsePartitionKeyCols +
+        evalPartitionKeyExpr + PartitionKeyExprs in catalog; (b) array_agg(DISTINCT)
+        now sorts elements ascending (was non-deterministic); (c) ROLLUP/CUBE now
+        extracts grouped columns instead of generating IntegerConst{0}.
+        Remaining: partition_prune 693 diffs (iboolpart + mc3p + EXPLAIN format),
+        partition_info 254, partition_join 397. These require further work on
+        expression key routing and EXPLAIN format normalization.
 
 - [x] **M0097-0028 — Port ON CONFLICT / MERGE regress tests**
       - Summary: Make these 2 tests reach `pass`:
