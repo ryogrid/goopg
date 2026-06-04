@@ -2705,6 +2705,28 @@ M0097-0001 wires it up.
         transitive cross-schema deps, column alias issues (x vs i),
         CONCURRENTLY WITH NO DATA error, "cannot lock rows in matview".
         Commit: 948bfa76.
+      - **Progress 2026-06-04 (matview 9-fix batch — 131→69 diffs):**
+        Nine interconnected fixes (commit 2c2b9d46):
+        (a) CASCADE notices: BFS transitive dep collection emits ONE "N other objects"
+            aggregate notice; normalizer moves "X depends on Y" continuation lines
+            to sorted error section.
+        (b) CREATE MATVIEW column aliases: parser handles `name (col1, col2) AS query`;
+            executor validates alias count and applies to output schema.
+        (c) IF NOT EXISTS: early existence check before analyze/plan avoids spurious
+            division-by-zero; regular CREATE also gets early check.
+        (d) WITH NO DATA: `PlanSchemaOnly` suppresses 22xxx constant-fold errors;
+            `planSelect` returns `(out, foldErr)` for 22xxx to preserve schema info.
+        (e) FOR SHARE on matview: `lockRowsOp.Open` returns "cannot lock rows in
+            materialized view".
+        (f) CONCURRENTLY+NO DATA: `execRefreshMatView` rejects the illegal combination.
+        (g) REFRESH CONCURRENTLY unique index check: rejects when no suitable unique
+            index (non-partial, non-expression); `catalog.Index` gains `HasPredicate`;
+            CREATE INDEX parser tracks WHERE clause.
+        (h) DROP SCHEMA CASCADE: labels matviews correctly; detail built before dropping.
+        (i) DROP INDEX IF EXISTS notice: uses bare name (not schema-qualified).
+        Remaining (69 diffs): column rename (x vs i, value 3 vs 2), PL/pgSQL mvtest_func,
+        duplicate key detection for REFRESH CONCURRENTLY, schema-qualified name diffs,
+        CASCADE notice for mvtest_mv2 missing.
 
 - [ ] **M0097-0026 — Port constraint / FK / trigger / inheritance regress tests**
       - Summary: Make these 5 tests reach `pass`:
