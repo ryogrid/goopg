@@ -855,6 +855,18 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 		return nil, &SyntaxError{Pos: pos, Message: "view body did not produce SELECT"}
 	}
 	stmt.Query = sel
+	// Optional trailing WITH [CASCADED|LOCAL] CHECK OPTION clause.
+	// goopg accepts and ignores the clause (check enforcement not yet implemented).
+	if p.acceptKeyword(KwWith) {
+		_ = p.acceptIdentKeyword("cascaded") || p.acceptKeyword(KwLocal) || p.acceptIdentKeyword("local")
+		if p.cur().Kind != TokenKeyword || p.cur().Keyword != KwCheck {
+			return nil, p.errAtCur("expected CHECK after WITH in view definition")
+		}
+		p.advance()
+		if !p.acceptIdentKeyword("option") {
+			return nil, p.errAtCur("expected OPTION after WITH [CASCADED|LOCAL] CHECK")
+		}
+	}
 	return stmt, nil
 }
 

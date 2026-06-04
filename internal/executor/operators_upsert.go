@@ -231,12 +231,11 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			return nil, err
 		}
 		if !conflicted {
-			if err := o.applyInsert(rel, cols, insertedForLeaf, arbiterKey); err != nil {
+			if err := o.applyInsert(rel, writeTbl, cols, insertedForLeaf, arbiterKey); err != nil {
 				return nil, err
 			}
 			o.appendUpsertRetRow(inserted)
 			o.rowsAffected++
-			_ = writeTbl
 			continue
 		}
 		switch o.plan.OnConflict.Action {
@@ -318,7 +317,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 						return nil, err
 					}
 					if !conflicted {
-						if err := o.applyInsert(rel, cols, insertedForLeaf, arbiterKey); err != nil {
+						if err := o.applyInsert(rel, writeTbl, cols, insertedForLeaf, arbiterKey); err != nil {
 							return nil, err
 						}
 						o.appendUpsertRetRow(inserted)
@@ -349,7 +348,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				if partLeaf != nil {
 					updatedForLeaf = remapRowForPartition(parentCols, partLeaf.Columns, updated)
 				}
-				if err := o.applyUpdate(rel, cols, conflictPtr, updatedForLeaf, updated); err != nil {
+				if err := o.applyUpdate(rel, writeTbl, cols, conflictPtr, updatedForLeaf, updated); err != nil {
 					return nil, err
 				}
 				o.appendUpsertRetRow(updated)
@@ -690,11 +689,13 @@ func (o *upsertOp) findInProgressConflictKey(rel storage.RelFileNode, key []byte
 	return foundXID, case1, foundXID != 0
 }
 
-// applyInsert is the no-conflict happy path. Writes the heap row
-// and stitches a new (key → ItemPointer) entry into the arbiter
-// index so subsequent rows in the same statement (multi-row
-// VALUES, CTE-fed INSERT, etc.) see it.
-func (o *upsertOp) applyInsert(rel storage.RelFileNode, cols []catalog.Column, inserted Row, arbiterKey []byte) error {
+// applyInsert is the no-conflict happy path. Writes the heap row and
+// updates ALL unique/PK indexes on tbl so subsequent probes via any
+// unique index (not just the arbiter) can detect the inserted row.
+// This is required when a table has multiple unique indexes and a future
+// ON CONFLICT clause targets a non-arbiter index (e.g. after an earlier
+// upsert conflict updated a column covered by a second unique index).
+func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, inserted Row, _ []byte) error {
 	ptr, err := writeHeapRowReturning(o.ctx, rel, cols, inserted)
 	if err != nil {
 		return err
@@ -703,7 +704,11 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, cols []catalog.Column, i
 		o.ctx.CTEWriteFence[ptr] = struct{}{}
 	}
 	o.trackWrittenPtr(ptr)
-	return o.maintainArbiter(arbiterKey, ptr)
+	// Maintain all unique indexes so non-arbiter unique indexes stay consistent.
+	// maintainUniqueIndexesForInsert handles the arbiter index too, so we do
+	// not need the separate maintainArbiter call. M0097-0028.
+	maintainUniqueIndexesForInsert(o.ctx, tbl, cols, inserted, ptr)
+	return nil
 }
 
 // trackWrittenPtr records an ItemPointer written in the current statement so
@@ -716,16 +721,16 @@ func (o *upsertOp) trackWrittenPtr(ptr storage.ItemPointer) {
 }
 
 // applyUpdate stamps xmax on the conflicting tuple and writes the
-// updated row as a fresh heap tuple. The arbiter index gets a new
-// entry pointing at the new ItemPointer; the old entry is left in
-// place — visibility filtering at the next probe will skip it
-// because the tuple's xmax now blocks it.
+// updated row as a fresh heap tuple. ALL unique/PK indexes on tbl are
+// updated so subsequent probes via any unique index can detect the row.
+// The old index entries are left in place — visibility filtering at the
+// next probe skips them because the old tuple's xmax is now stamped.
 //
 // updatedLeaf is the row in the leaf/target table's physical column order
 // (used for the heap write). arbiterRow is in parent column order (used for
 // arbiter key encoding). When they are the same — no partition column
 // remapping needed — pass the same slice for both. M0097-0028.
-func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, oldPtr storage.ItemPointer, updatedLeaf Row, arbiterRow Row) error {
+func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldPtr storage.ItemPointer, updatedLeaf Row, _ Row) error {
 	// Materialise the XID BEFORE stamping xmax so the old tuple gets a
 	// real delete stamp (not InvalidTransactionID). Without this, the old
 	// tuple's xmax=0 would make it appear still-live to subsequent scans.
@@ -756,7 +761,11 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, o
 		o.ctx.CTEWriteFence[newPtr] = struct{}{}
 	}
 	o.trackWrittenPtr(newPtr)
-	return o.maintainArbiterRow(arbiterRow, newPtr)
+	// Maintain all unique indexes so non-arbiter unique indexes reflect the
+	// update. M0097-0028: previously only the arbiter was maintained, causing
+	// ON CONFLICT probes via non-arbiter indexes to miss the updated row.
+	maintainUniqueIndexesForInsert(o.ctx, tbl, cols, updatedLeaf, newPtr)
+	return nil
 }
 
 // maintainArbiter inserts a precomputed (conflict-key → ptr) entry into the

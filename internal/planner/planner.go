@@ -6151,44 +6151,37 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 	if len(target.Columns) == 0 {
 		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42601", Message: "ON CONFLICT target requires at least one column"}
 	}
-	// Build a set of wanted column names. Expression columns (name=="") are
-	// represented by a unique sentinel key per position so the set-size
-	// check correctly detects duplicate plain column names.
-	wanted := make(map[string]struct{}, len(target.Columns))
-	for i, c := range target.Columns {
+	// Build a set of plain column names and count expression columns in the
+	// target. PostgreSQL uses liberal/subset matching: every index column must
+	// be satisfied by at least one target column; the target may contain
+	// duplicates or extra columns. This mirrors upstream's permissive inference
+	// logic (documented as "The implementation is liberal in accepting inference
+	// specifications").
+	plainWanted := make(map[string]struct{}, len(target.Columns))
+	exprCount := 0
+	for _, c := range target.Columns {
 		if c == "" {
-			// Expression column — use a unique sentinel per position so each
-			// expression gets its own slot in the wanted set.
-			wanted[fmt.Sprintf("__expr_%d__", i)] = struct{}{}
+			exprCount++
 		} else {
-			wanted[strings.ToLower(c)] = struct{}{}
+			plainWanted[strings.ToLower(c)] = struct{}{}
 		}
-	}
-	if len(wanted) != len(target.Columns) {
-		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: "ON CONFLICT target list contains duplicate columns"}
 	}
 	for _, idx := range cat.IndexesOnTable(tbl) {
 		if !idx.Unique {
 			continue
 		}
-		if len(idx.Columns) != len(target.Columns) {
-			continue
-		}
-		// Match: for each index column position, check that the target has
-		// the same kind of column (plain name or expression). Expression
-		// columns in the index (ic=="") match expression columns in the
-		// target at the same position.
+		// Liberal matching: each index column must be covered by the target.
+		// Target may have more or duplicate columns (allowed per PG semantics).
 		match := true
-		for j, ic := range idx.Columns {
+		for _, ic := range idx.Columns {
 			if ic == "" {
-				// Expression index column — must match expression target column
-				// at same position.
-				if j >= len(target.Columns) || target.Columns[j] != "" {
+				// Expression index column — satisfied by any expression in target.
+				if exprCount == 0 {
 					match = false
 					break
 				}
 			} else {
-				if _, ok := wanted[strings.ToLower(ic)]; !ok {
+				if _, ok := plainWanted[strings.ToLower(ic)]; !ok {
 					match = false
 					break
 				}
