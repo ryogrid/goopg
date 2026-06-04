@@ -112,10 +112,26 @@ func typeOIDForCatalogColumn(typName string) uint32 {
 		return catalog.OIDInt4
 	case "int8", "bigint":
 		return catalog.OIDInt8
+	case "int2", "smallint":
+		return catalog.OIDInt2
 	case "bool", "boolean":
 		return catalog.OIDBool
 	case "text", "varchar", "character varying":
 		return catalog.OIDText
+	case "oid":
+		return catalog.OIDOID
+	case "name":
+		return 19 // pg_type OID 19 = name
+	case "char": // single-byte "char" internal type, OID 18
+		return 18
+	case "regproc":
+		return 24 // OID 24 = regproc
+	case "float4", "real":
+		return catalog.OIDFloat4
+	case "pg_node_tree":
+		return 194 // OID 194 = pg_node_tree
+	case "aclitem[]", "_aclitem":
+		return 1034 // OID 1034 = _aclitem
 	default:
 		return catalog.OIDText // safe fallback
 	}

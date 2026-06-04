@@ -1951,6 +1951,22 @@ func unnestExistsExpr(ex *ExistsExpr, outer Node) (Node, error) {
 	// EXISTS qualifies; the NOT EXISTS doesn't (its inner Filter
 	// still has `l_receiptdate > l_commitdate`).
 	innerPlan = unwrapTrivialWrappers(innerPlan)
+	// M0097-0146: Strip a non-identity Project wrapper from the inner EXISTS
+	// plan so the hash build uses the raw scan rows rather than the projected
+	// output (e.g. `SELECT 1 FROM pg_type WHERE ...` projects [1] which does
+	// NOT contain the pg_type.oid key column). The SubCol.Index values were
+	// computed against the SeqScan/FROM binding schema, so the inner plan
+	// must expose that schema — not a projected subset. A Project that
+	// does NOT contain the key column in its output targets is stripped.
+	if proj, ok := innerPlan.(*Project); ok && !proj.IsolatedScope {
+		// Check whether RightKey column index is accessible in the projected
+		// output. For EXISTS inner plans the equijoin key is always a column
+		// from the scan (SubCol.Index = index in the scan schema, not in the
+		// project output). Strip the project so the hash sees the scan row.
+		innerPlan = proj.Child
+		// Unwrap any Filter(true) that might now be at the top.
+		innerPlan = unwrapTrivialWrappers(innerPlan)
+	}
 	var innerOnlyLifted []Expr
 
 	outerChild := filter.Child

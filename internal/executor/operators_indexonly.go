@@ -231,7 +231,17 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 		raw, n, err := btree.DecodeVarcharLen(key)
 		return NewStringDatum(string(raw)), n, err
 	default:
-		return NullDatum, 0, fmt.Errorf("IOS: unsupported key type %q", typeName)
+		// For unknown types (e.g. user-defined enums encoded as float8), attempt float8 decode.
+		// Enum values are encoded via btree.EncodeFloat8(sortOrder) in encodeBTreeKeyForColumn.
+		if len(key) < 8 {
+			return NullDatum, 0, fmt.Errorf("IOS: unsupported key type %q (too short for float8)", typeName)
+		}
+		f, err := btree.DecodeFloat8(key[:8])
+		if err != nil {
+			return NullDatum, 0, fmt.Errorf("IOS: unsupported key type %q", typeName)
+		}
+		// Return as KindEnum with sort order; label unknown at this stage.
+		return NewEnumDatum(f, ""), 8, nil
 	}
 }
 
@@ -247,6 +257,23 @@ func (o *indexOnlyScanOp) decodeRowFromHeap(t storage.HeapTuple) (Row, error) {
 			if tc.Name == col.Name && j < len(fullRow) {
 				row[i] = fullRow[j]
 				break
+			}
+		}
+	}
+	// Convert KindString enum values to KindEnum (sort order) for correct
+	// comparison in Filter predicates. M0097-0022.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for i, col := range o.plan.Covered {
+			if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
+				if row[i].Kind == KindString {
+					label := row[i].StringValue()
+					for _, ev := range et.Values {
+						if ev.Label == label {
+							row[i] = NewEnumDatum(ev.SortOrder, label)
+							break
+						}
+					}
+				}
 			}
 		}
 	}
@@ -295,7 +322,15 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 		return NewTimeDatum(ts), nil
 
 	default:
-		return NullDatum, fmt.Errorf("index-only scan: unsupported key type %q for key decode", typeName)
+		// Unknown type: attempt float8 decode for user-defined enums. M0097-0022.
+		if len(key) < 8 {
+			return NullDatum, fmt.Errorf("index-only scan: unsupported key type %q for key decode", typeName)
+		}
+		f, err2 := btree.DecodeFloat8(key[:8])
+		if err2 != nil {
+			return NullDatum, fmt.Errorf("index-only scan: unsupported key type %q for key decode", typeName)
+		}
+		return NewEnumDatum(f, ""), nil
 	}
 }
 

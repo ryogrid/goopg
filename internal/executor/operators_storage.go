@@ -528,6 +528,10 @@ type seqScanOp struct {
 	// `row` field is overwritten per emission. Caller must
 	// consume / Materialize before the next Next() invocation.
 	slot MaterializedSlot
+
+	// enumTypes[i] is non-nil when cols[i] is a user-defined enum type.
+	// Used to convert KindString heap datums to KindEnum for correct ORDER BY. M0097-enum.
+	enumTypes []*catalog.EnumType
 }
 
 // seqScanLookahead is the number of blocks ahead of the current
@@ -552,7 +556,23 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.pos, Message: "SeqScan requires storage handles in Context"}
 	}
+	// Reject scans of unpopulated materialized views (WITH NO DATA / before REFRESH). M0097-0025.
+	if o.tbl != nil && o.tbl.IsMatView && !o.tbl.IsPopulated {
+		return &ExecError{Code: "55000", Pos: o.pos,
+			Message: fmt.Sprintf("materialized view %q has not been populated", o.tbl.Name),
+			Hint:    "Use the REFRESH MATERIALIZED VIEW command."}
+	}
 	o.ctx = ctx
+	// Pre-compute which columns are enum types so Next() can inject KindEnum datums
+	// for correct ORDER BY semantics (M0097-enum).
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		o.enumTypes = make([]*catalog.EnumType, len(o.cols))
+		for i, col := range o.cols {
+			if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
+				o.enumTypes[i] = et
+			}
+		}
+	}
 	// Cache rel once — avoids the catalog RLock on every Next() call.
 	o.rel = ctx.Catalog.RelFileNode(o.tbl)
 	if err := ctx.acquireRelLock(o.rel, lockmgr.AccessShareLock); err != nil {
@@ -791,6 +811,25 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// to other sessions; a concurrent UPDATE could otherwise
 			// tear the bytes the parent is decoding.
 			row = cloneRowOwned(row)
+			// Inject KindEnum datums for enum-typed columns (M0097-enum).
+			if len(o.enumTypes) > 0 {
+				for i, et := range o.enumTypes {
+					if et == nil || i >= len(row) {
+						continue
+					}
+					d := row[i]
+					if d.Kind != KindString && d.Kind != KindBytes {
+						continue
+					}
+					label := d.StringValue()
+					for _, ev := range et.Values {
+						if ev.Label == label {
+							row[i] = NewEnumDatum(ev.SortOrder, label)
+							break
+						}
+					}
+				}
+			}
 			if o.pinned != nil {
 				o.pinned.RUnlock()
 			}
@@ -993,8 +1032,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// here: missing[i]=true for every column NOT in plan.ColumnIndex.
 		applyDefaultsForMissing(cols, row, insertMissing)
 
-		// Auto-generate values for SERIAL / BIGSERIAL / SMALLSERIAL columns.
-		// M0097-0009: if a serial column's slot is still NullDatum (not provided
+		// Auto-generate values for SERIAL / BIGSERIAL / SMALLSERIAL columns
+		// and GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
+		// M0097-0009: if a serial/identity column's slot is still NullDatum (not provided
 		// in the INSERT), call nextval on the implicit sequence.
 		for i, col := range cols {
 			if !row[i].IsNull() {
@@ -1002,12 +1042,12 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			}
 			seqName := ""
 			switch strings.ToLower(col.Type.Name) {
-			case "serial":
+			case "serial", "bigserial", "smallserial":
 				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
-			case "bigserial":
-				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
-			case "smallserial":
-				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+			default:
+				if col.IdentityColumn {
+					seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+				}
 			}
 			if seqName == "" {
 				continue
@@ -1058,7 +1098,11 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		var routedPart *catalog.Table
 		if isPartitioned {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				routedPart = routeToPartition(o.plan.Table, row, im)
+				var routeErr error
+				routedPart, routeErr = routeToPartition(o.plan.Table, row, im, o.ctx)
+				if routeErr != nil {
+					return nil, routeErr
+				}
 			}
 		}
 
@@ -1115,6 +1159,10 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// M0104-0007: SSI write-path hook for the non-partitioned insert path.
 		ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset)
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)
+		// AFTER INSERT triggers (M0097-0140).
+		if len(o.plan.Table.Triggers) > 0 {
+			fireTriggers(o.ctx, o.plan.Table, "after", "insert", nil, row)
+		}
 		o.appendInsertRetRow(row)
 		o.rowsAffected++
 	}
@@ -1179,31 +1227,154 @@ func remapRowForPartition(parentCols, childCols []catalog.Column, row Row) Row {
 	return out
 }
 
+// partitionColOrderMatches reports whether parentCols and childCols have the
+// same column names in the same order (same layout, no remapping needed).
+// M0097-0028.
+func partitionColOrderMatches(parentCols, childCols []catalog.Column) bool {
+	if len(parentCols) != len(childCols) {
+		return false
+	}
+	for i := range parentCols {
+		if !strings.EqualFold(parentCols[i].Name, childCols[i].Name) {
+			return false
+		}
+	}
+	return true
+}
+
 // based on the parent's partition key. Returns nil if no partition matches.
 // M0096-0007.
-func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory) *catalog.Table {
-	return routeToPartitionDepth(parent, row, im, 0)
+func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory, ctx *Context) (*catalog.Table, error) {
+	return routeToPartitionDepth(parent, row, im, ctx, 0)
+}
+
+// evalPartitionKeyExpr evaluates a partition key expression (e.g. NOT a, abs(b),
+// (a+b)/2) against the given row. Used when the partition key is an expression
+// rather than a plain column reference. M0097-0023.
+func evalPartitionKeyExpr(expr parser.Expr, cols []catalog.Column, row Row) (Datum, error) {
+	switch x := expr.(type) {
+	case *parser.ColumnRef:
+		for i, col := range cols {
+			if strings.EqualFold(col.Name, x.Column) {
+				if i < len(row) {
+					return row[i], nil
+				}
+				return NullDatum, nil
+			}
+		}
+		return NullDatum, nil
+	case *parser.UnaryOp:
+		v, err := evalPartitionKeyExpr(x.Operand, cols, row)
+		if err != nil {
+			return NullDatum, err
+		}
+		if v.IsNull() {
+			return NullDatum, nil
+		}
+		switch x.Op {
+		case parser.OpNot:
+			b := v.Kind == KindString && strings.EqualFold(v.StringValue(), "t") ||
+				v.Kind == KindBool && v.Int != 0 ||
+				v.Kind == KindInt && v.Int != 0
+			return NewBoolDatum(!b), nil
+		case parser.OpUnaryNeg:
+			if v.Kind == KindInt {
+				return NewIntDatum(-v.Int), nil
+			}
+		}
+	case *parser.BinaryOp:
+		l, err := evalPartitionKeyExpr(x.Left, cols, row)
+		if err != nil {
+			return NullDatum, err
+		}
+		r, err2 := evalPartitionKeyExpr(x.Right, cols, row)
+		if err2 != nil {
+			return NullDatum, err2
+		}
+		if l.IsNull() || r.IsNull() {
+			return NullDatum, nil
+		}
+		lv := int64(0)
+		rv := int64(0)
+		if l.Kind == KindInt {
+			lv = l.Int
+		}
+		if r.Kind == KindInt {
+			rv = r.Int
+		}
+		switch x.Op {
+		case parser.OpAdd:
+			return NewIntDatum(lv + rv), nil
+		case parser.OpSub:
+			return NewIntDatum(lv - rv), nil
+		case parser.OpMul:
+			return NewIntDatum(lv * rv), nil
+		case parser.OpDiv:
+			if rv == 0 {
+				return NullDatum, nil
+			}
+			return NewIntDatum(lv / rv), nil
+		}
+	case *parser.FuncCall:
+		if len(x.Args) == 1 {
+			arg, err := evalPartitionKeyExpr(x.Args[0], cols, row)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arg.IsNull() {
+				return NullDatum, nil
+			}
+			switch strings.ToLower(x.Name.Name) {
+			case "abs":
+				if arg.Kind == KindInt {
+					v := arg.Int
+					if v < 0 {
+						v = -v
+					}
+					return NewIntDatum(v), nil
+				}
+			}
+		}
+	case *parser.IntegerConst:
+		return NewIntDatum(x.Value), nil
+	case *parser.BooleanConst:
+		return NewBoolDatum(x.Value), nil
+	case *parser.NullConst:
+		return NullDatum, nil
+	}
+	return NullDatum, fmt.Errorf("unsupported partition key expression type %T", expr)
 }
 
 // routeToPartitionDepth recurses through nested partition hierarchies. The
 // depth guard (max 8) prevents infinite loops on circular catalog states.
-func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory, depth int) *catalog.Table {
+func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory, ctx *Context, depth int) (*catalog.Table, error) {
 	if len(parent.PartitionKey) == 0 || depth > 8 {
-		return nil
+		return nil, nil
 	}
-	// Find the column index for the first partition key (used by LIST/HASH).
-	keyColName := parent.PartitionKey[0]
-	keyIdx := -1
-	for i, col := range parent.Columns {
-		if strings.EqualFold(col.Name, keyColName) {
-			keyIdx = i
-			break
+
+	// resolvePartitionKeyDatum returns the datum for the i-th partition key entry,
+	// either by reading the named column or evaluating the key expression. M0097-0023.
+	resolvePartitionKeyDatum := func(i int) (Datum, error) {
+		if i < len(parent.PartitionKeyExprs) && parent.PartitionKeyExprs[i] != nil {
+			return evalPartitionKeyExpr(parent.PartitionKeyExprs[i], parent.Columns, row)
 		}
+		keyColName := parent.PartitionKey[i]
+		for j, col := range parent.Columns {
+			if strings.EqualFold(col.Name, keyColName) {
+				if j < len(row) {
+					return row[j], nil
+				}
+				return NullDatum, nil
+			}
+		}
+		return NullDatum, nil
 	}
-	if keyIdx < 0 || keyIdx >= len(row) {
-		return nil
+
+	// Find the column index for the first partition key (used by LIST/HASH).
+	keyDatum, err := resolvePartitionKeyDatum(0)
+	if err != nil {
+		return nil, err
 	}
-	keyDatum := row[keyIdx]
 
 	var child *catalog.Table
 	switch parent.PartitionMethod {
@@ -1213,27 +1384,36 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 			keyStr = fmt.Sprintf("%d", keyDatum.Int)
 		} else if keyDatum.Kind == KindString {
 			keyStr = keyDatum.StringValue()
+		} else if keyDatum.Kind == KindBool {
+			// Try both long ("true"/"false") and short ("t"/"f") boolean formats.
+			// Partition bound values come from string literals like 'true'/'false'.
+			if keyDatum.Int != 0 {
+				keyStr = "true"
+			} else {
+				keyStr = "false"
+			}
 		} else if keyDatum.IsNull() {
 			keyStr = "null" // matches FOR VALUES IN (null)
 		}
 		child = im.FindPartitionForValue(parent.OID, keyStr)
+		// Also try short boolean format if no match with long format.
+		if child == nil && keyDatum.Kind == KindBool {
+			short := "f"
+			if keyDatum.Int != 0 {
+				short = "t"
+			}
+			child = im.FindPartitionForValue(parent.OID, short)
+		}
 	case "RANGE":
 		// Build a string-formatted key tuple covering all partition key columns.
 		// This supports both single-column (PartitionKey len=1) and multi-column
 		// (PartitionKey len>1) RANGE partitioning.
 		keyStrs := make([]string, 0, len(parent.PartitionKey))
-		for _, keyCol := range parent.PartitionKey {
-			kidx := -1
-			for i, col := range parent.Columns {
-				if strings.EqualFold(col.Name, keyCol) {
-					kidx = i
-					break
-				}
+		for ki := range parent.PartitionKey {
+			d, kerr := resolvePartitionKeyDatum(ki)
+			if kerr != nil {
+				return nil, kerr
 			}
-			if kidx < 0 || kidx >= len(row) {
-				return nil
-			}
-			d := row[kidx]
 			switch d.Kind {
 			case KindInt:
 				keyStrs = append(keyStrs, fmt.Sprintf("%d", d.Int))
@@ -1251,29 +1431,65 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 		}
 		child = im.FindRangePartitionForDatums(parent.OID, keyStrs)
 	case "HASH":
-		// Use string representation of key for hash. M0097-0015.
-		keyStr := ""
-		if keyDatum.Kind == KindInt {
-			keyStr = fmt.Sprintf("%d", keyDatum.Int)
-		} else if keyDatum.Kind == KindString {
-			keyStr = keyDatum.StringValue()
-		} else {
-			keyStr = keyDatum.Format()
+		opClass := ""
+		if len(parent.PartitionKeyOpClasses) > 0 {
+			opClass = parent.PartitionKeyOpClasses[0]
 		}
-		child = im.FindHashPartitionForValue(parent.OID, keyStr)
+		if opClass != "" && ctx != nil {
+			// Use custom operator class hash function (FUNCTION 2). M0097-0022.
+			hashFuncName, hasFn := im.LookupOpClassHashFunc(opClass)
+			if hasFn {
+				routines := ctx.Catalog.Routines()
+				if routines != nil {
+					rs := routines.LookupByName(parser.ObjectName{Name: hashFuncName})
+					var bestRoutine *catalog.Routine
+					for _, r := range rs {
+						if len(r.ArgTypes) == 2 {
+							bestRoutine = r
+							break
+						}
+					}
+					if bestRoutine != nil {
+						seedDatum := NewIntDatum(int64(hashPartitionSeed))
+						hResult, herr := executeStoredRoutine(bestRoutine, []Datum{keyDatum, seedDatum}, ctx, 0)
+						if herr != nil {
+							return nil, herr
+						}
+						if !hResult.IsNull() {
+							h := uint64(hResult.Int)
+							child = im.FindHashPartitionByHash(parent.OID, h)
+						}
+					}
+				}
+			}
+		}
+		if child == nil && opClass == "" {
+			// Default built-in hash: use string representation of key. M0097-0015.
+			keyStr := ""
+			if keyDatum.Kind == KindInt {
+				keyStr = fmt.Sprintf("%d", keyDatum.Int)
+			} else if keyDatum.Kind == KindString {
+				keyStr = keyDatum.StringValue()
+			} else {
+				keyStr = keyDatum.Format()
+			}
+			child = im.FindHashPartitionForValue(parent.OID, keyStr)
+		}
 	}
 	if child == nil {
-		return nil
+		return nil, nil
 	}
 	// Recurse into nested partitions (multi-level partition hierarchies).
 	// The child row may need to be remapped to the child's column order first.
 	if len(child.PartitionKey) > 0 {
 		childRow := remapRowForPartition(parent.Columns, child.Columns, row)
-		if nested := routeToPartitionDepth(child, childRow, im, depth+1); nested != nil {
-			return nested
+		if nested, err := routeToPartitionDepth(child, childRow, im, ctx, depth+1); err != nil {
+			return nil, err
+		} else if nested != nil {
+			return nested, nil
 		}
 	}
-	return child
+	return child, nil
 }
 
 // extractScanAndPredicate walks an Update/Delete child plan and pulls
@@ -2038,7 +2254,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				var destPartIdx *catalog.Table
 				isCrossPartitionMoveIdx := false
 				if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(idxTbl.PartitionKey) > 0 {
-					if dp := routeToPartition(idxTbl, pu.newRow, imW); dp != nil {
+					dp, dpErr := routeToPartition(idxTbl, pu.newRow, imW, o.ctx)
+					if dpErr != nil {
+						return nil, dpErr
+					}
+					if dp != nil {
 						dpRel := o.ctx.Catalog.RelFileNode(dp)
 						if dpRel != rel {
 							isCrossPartitionMoveIdx = true
@@ -2115,6 +2335,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 		}
 		if !epqSkip {
+			// AFTER UPDATE triggers (M0097-0140).
+			if len(idxTbl.Triggers) > 0 {
+				fireTriggers(o.ctx, idxTbl, "after", "update", pu.oldRow, pu.newRow)
+			}
 			o.appendUpdateRetRow(pu.newRow)
 			o.rowsAffected++
 		}
@@ -2417,7 +2641,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				var destPart *catalog.Table
 				isCrossPartitionMove := false
 				if imW, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(tbl.PartitionKey) > 0 {
-					destPart = routeToPartition(tbl, pu.newRow, imW)
+					var routeErr error
+					destPart, routeErr = routeToPartition(tbl, pu.newRow, imW, o.ctx)
+					if routeErr != nil {
+						return nil, routeErr
+					}
 					if destPart != nil {
 						destRel := o.ctx.Catalog.RelFileNode(destPart)
 						if destRel != puRel {
@@ -2512,6 +2740,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			// paths — the rw-conflict target is the SLOT that any concurrent
 			// SERIALIZABLE reader would have predicate-locked.
 			ssiRecordTupleWrite(o.ctx, puRel, pu.blk, pu.slot)
+			// AFTER UPDATE triggers (M0097-0140).
+			scanTblForAfterTrig := pu.scanTbl
+			if scanTblForAfterTrig == nil {
+				scanTblForAfterTrig = tbl
+			}
+			if len(scanTblForAfterTrig.Triggers) > 0 {
+				fireTriggers(o.ctx, scanTblForAfterTrig, "after", "update", pu.oldRow, pu.newRow)
+			}
 			// Use parent-aligned retRow for RETURNING when available (inheritance
 			// children store a remapped row so RETURNING exprs work correctly). M0097-0078.
 			if pu.retRow != nil {
@@ -2825,6 +3061,14 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			// The rw-conflict target is the slot a concurrent SERIALIZABLE
 			// reader would have predicate-locked before the xmax stamp.
 			ssiRecordTupleWrite(o.ctx, victimRel, v.blk, v.slot)
+			// AFTER DELETE triggers (M0097-0140).
+			if len(tbl.Triggers) > 0 {
+				delRow := v.row
+				if v.retRow != nil {
+					delRow = v.retRow
+				}
+				fireTriggers(o.ctx, tbl, "after", "delete", delRow, nil)
+			}
 			// Use parent-aligned retRow for RETURNING when available (inheritance children). M0097-0078.
 			if v.retRow != nil {
 				o.appendDeleteRetRow(v.retRow)
@@ -3437,7 +3681,13 @@ func lockedByForeign(h storage.HeapTupleHeader, currentXID storage.TransactionID
 // each index column by name in cols and encoding the corresponding row value.
 // Returns nil (no error) when any key column is NULL (NULLs don't participate
 // in unique constraints) or when the column is not found. M0100-0005.
-func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row) ([]byte, error) {
+// cat is optional (may be nil): when provided, KindString values on enum-typed
+// columns are converted to KindEnum so encoding is consistent with the probe path.
+func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row, cat ...catalog.Catalog) ([]byte, error) {
+	var im *catalog.InMemory
+	if len(cat) > 0 && cat[0] != nil {
+		im, _ = cat[0].(*catalog.InMemory)
+	}
 	var out []byte
 	for _, idxColName := range idx.Columns {
 		var col *catalog.Column
@@ -3455,6 +3705,19 @@ func encodeIndexKeyFromCols(idx *catalog.Index, cols []catalog.Column, row Row) 
 		v := row[colOrd]
 		if v.IsNull() {
 			return nil, nil // NULLs don't participate in unique constraints
+		}
+		// For enum columns: convert KindString labels to KindEnum (sort order)
+		// so encoding matches the btree probe path. M0097-0022.
+		if v.Kind == KindString && im != nil {
+			if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
+				label := v.StringValue()
+				for _, ev := range et.Values {
+					if ev.Label == label {
+						v = NewEnumDatum(ev.SortOrder, label)
+						break
+					}
+				}
+			}
 		}
 		keyPart, err := encodeBTreeKeyForColumn(v, col, 0)
 		if err != nil {
@@ -3480,7 +3743,7 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row)
+		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
 		if err != nil || key == nil {
 			continue
 		}
@@ -3521,7 +3784,7 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row)
+		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
 		if err != nil || key == nil {
 			continue
 		}

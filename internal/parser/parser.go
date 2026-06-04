@@ -1169,15 +1169,18 @@ func (p *parser) parseSet() (Stmt, error) {
 		s.Local = true
 		isLocal = true
 	} else if p.acceptKeyword(KwSession) {
-		// SET SESSION AUTHORIZATION name — accept as no-op SetStmt.
+		// SET SESSION AUTHORIZATION name — store the role name in s.Value so
+		// the executor can update the session's non-superuser role tracking.
 		// "authorization" is not a keyword in goopg so it parses as an ident.
 		if p.acceptIdentKeyword("authorization") {
-			// consume the role name (or DEFAULT)
-			if !p.acceptKeyword(KwDefault) {
-				_, _ = p.parseIdent()
-			}
 			s.Name = "session_authorization"
-			s.Default = true
+			// consume DEFAULT or the role name
+			if p.acceptKeyword(KwDefault) {
+				s.Default = true
+			} else {
+				roleTok, _ := p.parseIdent()
+				s.Value = roleTok.Value
+			}
 			return s, nil
 		}
 		// otherwise fall through: SET SESSION TRANSACTION ... handled below

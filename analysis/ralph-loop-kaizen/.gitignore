@@ -1,0 +1,4 @@
+# Generated / regenerable artifacts — never committed.
+**/__pycache__/
+*.pyc
+pipeline/data/

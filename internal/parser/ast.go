@@ -863,12 +863,19 @@ type ColumnDef struct {
 	Type    ColumnType
 	NotNull bool
 	Primary bool // inline `PRIMARY KEY` constraint
+	Unique  bool // inline `UNIQUE` constraint
 	// GeneratedAlways is true for `GENERATED ALWAYS AS (expr) STORED` columns.
 	// M0096-0008.
 	GeneratedAlways bool
 	// GeneratedExpr holds the raw SQL expression text (without surrounding parens)
 	// for a stored generated column. Empty for ordinary columns.
 	GeneratedExpr string
+	// IdentityColumn is true for `GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY` columns.
+	// The sequence is registered during CREATE TABLE; INSERT uses nextval() as default.
+	IdentityColumn bool
+	// IdentityAlways is true when the identity generation is ALWAYS (vs BY DEFAULT).
+	// ALWAYS means user-provided values are rejected; BY DEFAULT allows them.
+	IdentityAlways bool
 
 	// DefaultExpr holds the parsed AST of the column's DEFAULT clause when
 	// one was given (`col INT DEFAULT 0`). nil for columns without a DEFAULT.
@@ -937,6 +944,10 @@ type CreateTableStmt struct {
 	// TableChecks holds raw SQL expressions from table-level CHECK constraints.
 	// M0097-0014.
 	TableChecks []string
+	// TableUniques holds column-name lists from table-level UNIQUE (col1, col2)
+	// constraints. Each entry is the list of columns for one UNIQUE clause.
+	// M0097-0028.
+	TableUniques [][]string
 	// LikeTables holds the source table names from LIKE clauses.
 	// `CREATE TABLE t (LIKE src INCLUDING DEFAULTS)` copies src's columns. M0097-0069.
 	// Deprecated: use BodyOrder for positional interleaving.
@@ -955,7 +966,8 @@ func (s *CreateTableStmt) stmtNode() {}
 type PartitionByClause struct {
 	pos      int
 	Method   string   // "LIST", "RANGE", or "HASH"
-	KeyCols  []string // partition key column names
+	KeyCols  []string // partition key column names; empty string for expression keys
+	KeyExprs []Expr   // expression-based partition keys; nil for plain column keys (M0097-0023)
 	OpClasses []string // operator class per key col (empty string = default); M0097-0027
 }
 
@@ -975,6 +987,10 @@ type PartitionOfClause struct {
 	Modulus   int64
 	Remainder int64
 	IsHash    bool
+	// UniqueColumns holds column names from the optional column-constraint list
+	// in PARTITION OF, e.g. `CREATE TABLE t1 PARTITION OF t (b UNIQUE) FOR VALUES IN (1)`.
+	// Each entry is a column name to create a unique index on. M0097-0028.
+	UniqueColumns []string
 }
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]
@@ -1002,6 +1018,7 @@ type CreateIndexStmt struct {
 	// most built-in operator classes have no options, so a non-empty value
 	// here causes an error at execution time. M0097-0023.
 	OpClassWithOptions string
+	HasPredicate       bool // true when a WHERE clause (partial index predicate) is present
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }
@@ -1104,11 +1121,12 @@ func (s *DropViewStmt) stmtNode() {}
 // CreateMatViewStmt — `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS
 // query [WITH NO DATA]`. M0097-0013.
 type CreateMatViewStmt struct {
-	pos         int
-	Name        ObjectName
-	Query       *SelectStmt
-	WithNoData  bool
-	IfNotExists bool
+	pos           int
+	Name          ObjectName
+	Query         *SelectStmt
+	WithNoData    bool
+	IfNotExists   bool
+	ColumnAliases []string // optional (col1, col2, ...) after the name
 }
 
 func (s *CreateMatViewStmt) Pos() int  { return s.pos }
@@ -1210,6 +1228,7 @@ type CompatNoopStmt struct {
 	ObjName   ObjectName // optional: primary object name for compat registry
 	ArgTypes  []string   // optional: arg types for operator compat registry (e.g. ["bigint","bigint"])
 	TableName ObjectName // optional: table name for rule compat registry
+	RuleKind  string     // optional: rule kind for COPY DML error messages (M0097-0140)
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }
@@ -1302,6 +1321,8 @@ type AlterTableActionKind int
 const (
 	AlterTableAddPrimaryKey AlterTableActionKind = iota
 	AlterTableAddColumn
+	AlterTableAddCheck // ADD [CONSTRAINT name] CHECK (expr)
+	AlterTableNoOp     // Unknown constraint type accepted as no-op
 	// AlterTableAddForeignKey is `ADD [CONSTRAINT name] FOREIGN
 	// KEY (cols) REFERENCES table (cols) [NOT DEFERRABLE |
 	// DEFERRABLE]`. v0 parses it for compatibility with HammerDB
@@ -1334,6 +1355,14 @@ const (
 	// For heap tables this is a no-op in goopg v0; for indexes it raises
 	// an appropriate error (M0097-0023 btree_index parity).
 	AlterTableAlterColumnSet
+	// AlterTableAlterColumnType — `ALTER COLUMN name TYPE newtype`.
+	// Changes the column type in the catalog and rewrites existing heap rows
+	// to re-encode them with the new type. M0097-0022.
+	AlterTableAlterColumnType
+	// AlterTableDropColumn — `DROP [COLUMN] [IF EXISTS] name [RESTRICT|CASCADE]`.
+	// Marks the named column as dropped (hidden from user queries) while
+	// retaining its heap slot for backward heap-tuple compatibility. M0097-0028.
+	AlterTableDropColumn
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1370,6 +1399,16 @@ type AlterTableAction struct {
 	// InheritParent is populated for AlterTableInherit and AlterTableNoInherit.
 	// Holds the parent table name. M0097-0048.
 	InheritParent ObjectName
+
+	// CheckExpr is the raw SQL expression for AlterTableAddCheck.
+	CheckExpr string
+
+	// NewType is the target column type for AlterTableAlterColumnType.
+	// M0097-0022.
+	NewType ColumnType
+	// ColumnName is the column being modified for AlterTableAlterColumnType.
+	// M0097-0022.
+	ColumnName string
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }
@@ -1386,6 +1425,9 @@ type AlterTableStmt struct {
 	IfExists bool
 	Name     ObjectName
 	Actions  []AlterTableAction
+	// SetSchema holds the target schema name for ALTER TABLE/VIEW/MATERIALIZED VIEW
+	// ... SET SCHEMA <newschema>. Empty means no SET SCHEMA action. M0097-0025.
+	SetSchema string
 }
 
 func (s *AlterTableStmt) Pos() int  { return s.pos }
@@ -1490,11 +1532,12 @@ const (
 // struct now so step 2's analyzer/runtime work doesn't have to
 // retrofit the AST shape.
 type FunctionArg struct {
-	pos     int
-	Name    string // empty for positional-only args
-	Mode    FuncArgMode
-	Type    ColumnType
-	Default Expr // nil when no DEFAULT was given
+	pos          int
+	Name         string // empty for positional-only args
+	Mode         FuncArgMode
+	ModeExplicit bool // true when a mode keyword (IN/OUT/INOUT/VARIADIC) was explicitly specified
+	Type         ColumnType
+	Default      Expr // nil when no DEFAULT was given
 }
 
 func (a FunctionArg) Pos() int { return a.pos }
@@ -1514,16 +1557,41 @@ func (a FunctionArg) Pos() int { return a.pos }
 //
 // See docs/design/0015-0001-create-function-parser-and-ast.md.
 type CreateFunctionStmt struct {
-	pos        int
-	OrReplace  bool
-	Name       ObjectName
-	Args       []FunctionArg
-	ReturnType ColumnType
-	ReturnsSet bool   // RETURNS SETOF ... M0097-0020
-	Language   string // lower-cased, e.g. "plpgsql"
-	Body       string // raw source between the dollar-quote delimiters
-	Strict     bool   // STRICT / RETURNS NULL ON NULL INPUT M0097-0035
+	pos             int
+	OrReplace       bool
+	Name            ObjectName
+	Args            []FunctionArg
+	ReturnType      ColumnType
+	ReturnsSet      bool   // RETURNS SETOF ... M0097-0020
+	Language        string // lower-cased, e.g. "plpgsql"
+	Body            string // raw source between the dollar-quote delimiters
+	Strict          bool   // STRICT / RETURNS NULL ON NULL INPUT M0097-0035
+	Volatile        string // "v"=volatile (default), "s"=stable, "i"=immutable
+	SecurityDefiner bool   // SECURITY DEFINER
+	Leakproof       bool   // LEAKPROOF
+	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
+	IsReturnForm    bool   // PG14 RETURN expr body (no AS keyword, body stored as "SELECT expr")
+	Window          bool   // WINDOW attribute — marks function as a window function
 }
+
+// AlterFunctionStmt — `ALTER FUNCTION name([argtypes]) attribute ...`
+// Updates mutable function/procedure attributes (volatile, security, leakproof, strict).
+type AlterFunctionStmt struct {
+	pos             int
+	Name            ObjectName
+	Args            []FunctionArg // nil means no arg list given (applies to all overloads)
+	IsProcedure     bool
+	IsRoutine       bool   // ALTER ROUTINE: applies to both functions and procedures (M0097-0022)
+	RenameTo        string // RENAME TO new_name (M0097-0022)
+	// Updated attributes (nil = not changed)
+	Volatile        *string // "v", "s", "i"
+	SecurityDefiner *bool
+	Leakproof       *bool
+	Strict          *bool
+}
+
+func (s *AlterFunctionStmt) Pos() int  { return s.pos }
+func (s *AlterFunctionStmt) stmtNode() {}
 
 func (s *CreateFunctionStmt) Pos() int  { return s.pos }
 func (s *CreateFunctionStmt) stmtNode() {}
@@ -1534,12 +1602,20 @@ func (s *CreateFunctionStmt) stmtNode() {}
 // scope; supporting one name keeps the slice small. The optional
 // argument list is stored verbatim so a later loop can implement
 // overload-resolution drop semantics without re-parsing.
+// DropFunctionItem is one function in a multi-name DROP FUNCTION.
+type DropFunctionItem struct {
+	Name ObjectName
+	Args []FunctionArg
+}
+
 type DropFunctionStmt struct {
 	pos      int
 	IfExists bool
 	Name     ObjectName
 	Args     []FunctionArg // nil when no parenthesised arg list was given
 	Behavior DropBehavior
+	// Extras for multi-target DROP FUNCTION f1(args), f2(args).
+	Extras []DropFunctionItem
 }
 
 func (s *DropFunctionStmt) Pos() int  { return s.pos }
@@ -1548,13 +1624,17 @@ func (s *DropFunctionStmt) stmtNode() {}
 // CreateProcedureStmt is the AST for `CREATE [OR REPLACE] PROCEDURE ...`.
 // Stage B (procedure follow-up) of M0015.
 type CreateProcedureStmt struct {
-	pos       int
-	OrReplace bool
-	Name      ObjectName
-	Args      []FunctionArg
-	// Procedure doesn't have RETURN type; use FunctionArgMode for OUT/INOUT parameters
-	Language string // lower-cased, e.g. "plpgsql"
-	Body     string // raw source between the dollar-quote delimiters
+	pos             int
+	OrReplace       bool
+	Name            ObjectName
+	Args            []FunctionArg
+	Language        string // lower-cased, e.g. "plpgsql"
+	Body            string // raw source between the dollar-quote delimiters
+	SecurityDefiner bool   // SECURITY DEFINER
+	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
+	Strict          bool   // STRICT / RETURNS NULL ON NULL INPUT
+	Window          bool   // WINDOW attribute (invalid for procedures)
+	Volatile        string // "v"=volatile (default), "s"=stable, "i"=immutable
 }
 
 func (s *CreateProcedureStmt) Pos() int  { return s.pos }
@@ -1563,9 +1643,10 @@ func (s *CreateProcedureStmt) stmtNode() {}
 // CallStmt is the AST for `CALL procedure_name([arg [, ...]])`.
 // Stage B (procedure follow-up) of M0015.
 type CallStmt struct {
-	pos  int
-	Name ObjectName
-	Args []Expr // expressions for IN arguments
+	pos      int
+	Name     ObjectName
+	Args     []Expr   // expressions for IN arguments
+	ArgNames []string // parallel to Args; non-empty when caller used name=>val syntax
 	// OUT/INOUT parameter result handling deferred
 }
 
@@ -1578,7 +1659,8 @@ type DropProcedureStmt struct {
 	pos      int
 	IfExists bool
 	Name     ObjectName
-	Args     []FunctionArg // nil when no parenthesised arg list was given
+	Names    []ObjectName   // additional names for multi-name DROP (DROP PROCEDURE a, b)
+	Args     []FunctionArg  // nil when no parenthesised arg list was given
 	Behavior DropBehavior
 	ObjKind  string // "procedure" or "routine" (default "procedure")
 }
@@ -1609,14 +1691,18 @@ func (s *CreateTypeStmt) Pos() int  { return s.pos }
 func (s *CreateTypeStmt) stmtNode() {}
 
 // AlterTypeStmt — ALTER TYPE name ADD VALUE [IF NOT EXISTS] val [BEFORE|AFTER ref]. M0097-0017.
+// Also handles RENAME VALUE 'old' TO 'new' (M0097-0022).
 type AlterTypeStmt struct {
-	pos         int
-	Name        string
-	Schema      string
-	AddValue    string
-	IfNotExists bool
-	Before      string // reference value for BEFORE positioning
-	After       string // reference value for AFTER positioning
+	pos            int
+	Name           string
+	Schema         string
+	AddValue       string
+	IfNotExists    bool
+	Before         string // reference value for BEFORE positioning
+	After          string // reference value for AFTER positioning
+	RenameOldValue string // RENAME VALUE: existing label (empty when ADD VALUE)
+	RenameNewValue string // RENAME VALUE: replacement label
+	RenameTo       string // RENAME TO: new type name (M0097-enum-rename)
 }
 
 func (s *AlterTypeStmt) Pos() int  { return s.pos }
@@ -1635,11 +1721,12 @@ func (s *DropTypeStmt) stmtNode() {}
 
 // CreateDomainStmt — CREATE DOMAIN name [AS] base_type [constraints]. M0097-0017.
 type CreateDomainStmt struct {
-	pos      int
-	Name     string
-	Schema   string
-	BaseType string // base type name
-	NotNull  bool
+	pos            int
+	Name           string
+	Schema         string
+	BaseType       string   // base type name
+	NotNull        bool
+	CheckInValues  []string // allowed values from CHECK (VALUE IN ('a','b','c')), M0097-domain-check
 }
 
 func (s *CreateDomainStmt) Pos() int  { return s.pos }

@@ -24,6 +24,17 @@ LOG_FILE      ?= $(REPO_ROOT)/tmp/goopg.log
 PID_FILE      := $(DATA_DIR)/postmaster.pid
 GOOPG_BIN     := $(REPO_ROOT)/bin/goopg
 
+# Memory-cap wrapper (OOM containment — see scripts/goopg-test-run.sh and the
+# "Memory-capped execution" section of .ralph/AGENT.md). Confines a goopg run
+# to a cgroup v2 scope so a runaway query is SIGKILLed inside the scope instead
+# of tripping the system-wide OOM killer, which on WSL2 can take down the VM.
+# Override the limits per invocation, e.g. 'make start GOOPG_MEM_MAX=16G'.
+TEST_RUN            := $(REPO_ROOT)/scripts/goopg-test-run.sh
+GOOPG_MEM_HIGH      ?= 20G
+GOOPG_MEM_MAX       ?= 24G
+GOOPG_MEM_SWAP_MAX  ?= 0
+export GOOPG_MEM_HIGH GOOPG_MEM_MAX GOOPG_MEM_SWAP_MAX
+
 PSQL_HOST     := $(firstword $(subst :, ,$(LISTEN)))
 PSQL_PORT     := $(word 2,$(subst :, ,$(LISTEN)))
 PSQL_DBNAME   ?= postgres
@@ -32,13 +43,14 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff runtimeshim-matrix
+.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff runtimeshim-matrix
 
 help:
 	@echo "goopg lifecycle targets:"
 	@echo "  make build           Build ./bin/goopg from ./cmd/goopg."
 	@echo "  make init            Initialize data directory at DATA_DIR."
-	@echo "  make start           Start the server in the background (logs to LOG_FILE)."
+	@echo "  make start           Start the server in the background, memory-capped (logs to LOG_FILE)."
+	@echo "  make goopg-test-server  Run the server in the foreground inside the memory-cap cgroup scope."
 	@echo "  make stop            Send graceful shutdown to the server at DATA_DIR."
 	@echo "  make restart         Stop then start."
 	@echo "  make psql            Connect to the running server with the in-tree psql."
@@ -85,8 +97,8 @@ start: build
 		exit 1; \
 	fi
 	@mkdir -p "$(dir $(LOG_FILE))"
-	@echo "Starting goopg on $(LISTEN); log: $(LOG_FILE)"
-	@$(ENV_PREFIX) nohup "$(GOOPG_BIN)" start -D "$(DATA_DIR)" --listen "$(LISTEN)" \
+	@echo "Starting goopg on $(LISTEN) (memory-capped: MemoryMax=$(GOOPG_MEM_MAX), swap=$(GOOPG_MEM_SWAP_MAX)); log: $(LOG_FILE)"
+	@$(ENV_PREFIX) GOOPG_CG_UNIT=goopg-server nohup "$(TEST_RUN)" "$(GOOPG_BIN)" start -D "$(DATA_DIR)" --listen "$(LISTEN)" \
 		$(if $(HBA_FILE),--hba "$(HBA_FILE)") \
 		>"$(LOG_FILE)" 2>&1 &
 	@for i in $$(seq 1 50); do \
@@ -98,6 +110,17 @@ start: build
 	done; \
 	echo "goopg start: timed out waiting for $(PID_FILE); see $(LOG_FILE)" >&2; \
 	exit 1
+
+# goopg-test-server: bring up goopg in the FOREGROUND inside the memory-cap
+# cgroup scope. Use this (or 'make start', which is also capped) whenever you
+# start a server to test or benchmark against, so a runaway query is killed
+# inside the scope rather than OOM-ing the host. Stop with Ctrl-C, or from
+# another shell with 'goopg stop -D $(DATA_DIR)'.
+goopg-test-server: build
+	@mkdir -p "$(dir $(DATA_DIR))"
+	@echo "Starting capped goopg on $(LISTEN) (MemoryMax=$(GOOPG_MEM_MAX), swap=$(GOOPG_MEM_SWAP_MAX)); Ctrl-C or 'goopg stop -D $(DATA_DIR)' to stop"
+	@$(ENV_PREFIX) GOOPG_CG_UNIT=goopg-test-server "$(TEST_RUN)" "$(GOOPG_BIN)" start -D "$(DATA_DIR)" --listen "$(LISTEN)" \
+		$(if $(HBA_FILE),--hba "$(HBA_FILE)")
 
 stop:
 	@if [ ! -f "$(PID_FILE)" ]; then \
@@ -148,6 +171,17 @@ ralph-state-guard:
 		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json -fix; \
 		go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json; \
 	fi
+
+# Loop-health metrics (kaizen T1): free pipeline pass over the loop history.
+# Prints success rate, cost, cache-read, status-block coverage, permission
+# denials, and the failure breakdown. Nobody was watching these while the
+# success rate sat at 29%. Read-only; no LLM.
+ralph-metrics:
+	@cd analysis/ralph-loop-kaizen/pipeline && \
+		python3 extract_telemetry.py --out data >/dev/null && \
+		python3 extract_telemetry.py --classify-failures --out data >/dev/null && \
+		python3 assemble_corpus.py --out data >/dev/null && \
+		python3 metrics_report.py
 
 # M0107-0008 per-Go-minor maintenance: verify //go:linkname targets in
 # internal/runtimeshim against every Go toolchain present in PATH (the

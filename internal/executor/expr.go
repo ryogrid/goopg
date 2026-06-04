@@ -41,6 +41,7 @@ type ExecError struct {
 	Message       string
 	Detail        string // optional DETAIL message for wire protocol. M0097-0003.
 	Hint          string // optional HINT message for wire protocol. M0097-0004.
+	Context       string // optional CONTEXT (WHERE) message for wire protocol. M0097-0022.
 	Pos           int
 	ConditionName string // set for RAISE condition_name; used for exception matching. M0097-0003.
 }
@@ -60,6 +61,102 @@ func (e *ExecError) Error() string {
 // unchanged. New slot-aware sites (NLI/MHJ predicate eval) call
 // evalExprSlot directly so VirtualSlot composition can read via
 // slot.Get(col) without materializing a Row per emitted match.
+// oidToBuiltinTypeName converts a PostgreSQL built-in type OID to its canonical
+// type name (e.g. 16 → "boolean"). Returns "" if the OID is unknown.
+func oidToBuiltinTypeName(oid uint32) string {
+	switch oid {
+	case 16:
+		return "boolean"
+	case 17:
+		return "bytea"
+	case 18:
+		return "\"char\""
+	case 19:
+		return "name"
+	case 20:
+		return "bigint"
+	case 21:
+		return "smallint"
+	case 23:
+		return "integer"
+	case 25:
+		return "text"
+	case 26:
+		return "oid"
+	case 30:
+		return "oidvector"
+	case 700:
+		return "real"
+	case 701:
+		return "double precision"
+	case 1043:
+		return "character varying"
+	case 1082:
+		return "date"
+	case 1083:
+		return "time without time zone"
+	case 1114:
+		return "timestamp without time zone"
+	case 1184:
+		return "timestamp with time zone"
+	case 1186:
+		return "interval"
+	case 1266:
+		return "time with time zone"
+	case 1700:
+		return "numeric"
+	case 2278:
+		return "void"
+	case 2279:
+		return "trigger"
+	case 2281:
+		return "internal"
+	case 2950:
+		return "uuid"
+	case 3220:
+		return "pg_lsn"
+	// Array types
+	case 1000:
+		return "boolean[]"
+	case 1001:
+		return "bytea[]"
+	case 1002:
+		return "\"char\"[]"
+	case 1003:
+		return "name[]"
+	case 1005:
+		return "smallint[]"
+	case 1007:
+		return "integer[]"
+	case 1009:
+		return "text[]"
+	case 1015:
+		return "character varying[]"
+	case 1016:
+		return "bigint[]"
+	case 1021:
+		return "real[]"
+	case 1022:
+		return "double precision[]"
+	case 1028:
+		return "oid[]"
+	case 1115:
+		return "timestamp without time zone[]"
+	case 1182:
+		return "date[]"
+	case 1185:
+		return "timestamp with time zone[]"
+	case 1187:
+		return "interval[]"
+	case 1231:
+		return "numeric[]"
+	case 2951:
+		return "uuid[]"
+	default:
+		return ""
+	}
+}
+
 func evalExpr(e planner.Expr, row Row, ctx *Context) (Datum, error) {
 	var slot SlotView
 	if row != nil {
@@ -197,6 +294,106 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		//   - `<text>::regclass` resolves the relation name to its numeric OID
 		// The latter is the exact pgbench probe shape:
 		//   `... WHERE oid = $1::pg_catalog.regclass`.
+		// `::regtype` resolves a type name to its OID (string→oid).
+		// `::regproc` resolves a function name to its OID (string→oid).
+		if strings.EqualFold(x.TargetType, "regproc") || strings.EqualFold(x.TargetType, "regprocedure") {
+			if v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
+				funcName := strings.TrimSpace(v.StringValue())
+				// SQL identifiers are case-folded to lowercase when parsed; match that.
+				schema, name := splitQualifiedTable(strings.ToLower(funcName))
+				if rs := ctx.Catalog.Routines(); rs != nil {
+					candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: name})
+					if len(candidates) > 0 {
+						return NewIntDatum(int64(candidates[0].OID)), nil
+					}
+				}
+				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", funcName)}
+			}
+			return v, nil
+		}
+		if strings.EqualFold(x.TargetType, "regtype") && ctx != nil && ctx.Catalog != nil {
+			switch v.Kind {
+			case KindString:
+				typName := strings.ToLower(strings.TrimSpace(v.StringValue()))
+				// Check for oidvector (space-separated OIDs like "25 1082").
+				// Parser strips [] from ::regtype[], so oidvectors hit this branch.
+				if strings.ContainsRune(typName, ' ') {
+					parts := strings.Fields(typName)
+					names := make([]string, len(parts))
+					for i, p := range parts {
+						oid, parseErr := strconv.ParseInt(p, 10, 64)
+						if parseErr != nil {
+							names[i] = p
+							continue
+						}
+						if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
+							names[i] = name
+						} else {
+							names[i] = p
+						}
+					}
+					result := fmt.Sprintf("[0:%d]={%s}", len(names)-1, strings.Join(names, ","))
+					return NewStringDatum(result), nil
+				}
+				// Empty oidvector → empty array
+				if typName == "" {
+					return NewStringDatum("{}"), nil
+				}
+				// Try as an OID integer string (e.g. "16" → "boolean")
+				if oid, parseErr := strconv.ParseInt(typName, 10, 64); parseErr == nil {
+					if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
+						return NewStringDatum(name), nil
+					}
+					return NewStringDatum(typName), nil
+				}
+				// Try as a type name → return OID (for enum types)
+				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+					if et, found := im.LookupEnum(typName); found {
+						return NewIntDatum(int64(et.OID)), nil
+					}
+				}
+				// Built-in type name → return itself
+				return v, nil
+			case KindInt:
+				// OID integer → type name
+				if name := oidToBuiltinTypeName(uint32(v.Int)); name != "" {
+					return NewStringDatum(name), nil
+				}
+				return NewStringDatum(fmt.Sprintf("%d", v.Int)), nil
+			}
+		}
+		if strings.EqualFold(x.TargetType, "regtype[]") && ctx != nil {
+			// oidvector (space-separated OID strings) → type name array like [0:1]={text,date}
+			// Single-element oidvectors may arrive as KindInt (TypedVirtualCell
+			// parses single-OID oidvector columns to IntegerConst for numeric sort).
+			var oidParts []string
+			switch v.Kind {
+			case KindString:
+				oidParts = strings.Fields(v.StringValue())
+			case KindInt:
+				oidParts = []string{fmt.Sprintf("%d", v.Int)}
+			}
+			if oidParts != nil {
+				if len(oidParts) == 0 {
+					return NewStringDatum("{}"), nil
+				}
+				names := make([]string, len(oidParts))
+				for i, p := range oidParts {
+					oid, err := strconv.ParseInt(p, 10, 64)
+					if err != nil {
+						names[i] = p
+						continue
+					}
+					if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
+						names[i] = name
+					} else {
+						names[i] = p
+					}
+				}
+				result := fmt.Sprintf("[0:%d]={%s}", len(names)-1, strings.Join(names, ","))
+				return NewStringDatum(result), nil
+			}
+		}
 		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
 			switch v.Kind {
 			case KindInt:
@@ -231,9 +428,11 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					strVal := v.StringValue()
 					// Skip array literals (e.g. '{red,green,blue}'::rainbow[]).
 					if len(strVal) == 0 || strVal[0] != '{' {
+						var matchedSort float64
 						found := false
 						for _, label := range et.Values {
 							if strings.EqualFold(label.Label, strVal) {
+								matchedSort = label.SortOrder
 								found = true
 								break
 							}
@@ -245,6 +444,12 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 								Message: fmt.Sprintf("invalid input value for enum %s: %q", et.Name, strVal),
 							}
 						}
+						// Reject unsafe values added in the current uncommitted transaction.
+						if isUnsafeEnumValue(ctx, x.TargetType, strVal) {
+							return Datum{}, enumUnsafeError(strVal, et.Name, x.Pos())
+						}
+						// Return KindEnum for correct ORDER BY semantics.
+						return NewEnumDatum(matchedSort, strVal), nil
 					}
 				}
 			}
@@ -252,6 +457,34 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		result, err := evalCastTyped(v, x.TargetType, x.SourceType, x.Pos())
 		if err != nil {
 			return Datum{}, err
+		}
+		// Domain CHECK constraint enforcement: VALUE IN (...). M0097-domain-check.
+		if ctx != nil && ctx.Catalog != nil {
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+				if dom, isDomain := im.LookupDomain(x.TargetType); isDomain && len(dom.CheckInValues) > 0 {
+					// Get the string label of the value being cast.
+					var label string
+					if result.Kind == KindEnum {
+						label = string(result.Buf)
+					} else {
+						label = result.StringValue()
+					}
+					found := false
+					for _, allowed := range dom.CheckInValues {
+						if strings.EqualFold(label, allowed) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						return Datum{}, &ExecError{
+							Code:    "23514",
+							Pos:     x.Pos(),
+							Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), strings.ToLower(dom.Name)+"_check"),
+						}
+					}
+				}
+			}
 		}
 		// Apply numeric(P,S) typmod: round to S decimal places.
 		// Typmod is encoded as (P<<16)|S by the planner's encodeTypmod.
@@ -498,6 +731,9 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 	case parser.OpUnaryNeg:
 		switch d.Kind {
 		case KindInt:
+			if d.Int == math.MinInt64 {
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+			}
 			return Datum{Kind: KindInt, Int: -d.Int}, nil
 		case KindNumeric:
 			// Negate a numeric/float value. M0097-0003.
@@ -521,6 +757,11 @@ func evalUnary(op parser.OpCode, d Datum, pos int) (Datum, error) {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator NOT requires boolean"}
 		}
 		return NewBoolDatum(!d.BoolValue()), nil
+	case parser.OpBitNot:
+		if d.Kind != KindInt {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: "operator ~ requires integer operand"}
+		}
+		return Datum{Kind: KindInt, Int: ^d.Int}, nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown unary operator %s", op)}
 }
@@ -1039,6 +1280,10 @@ func arithmetic(op parser.OpCode, a, b int64, pos int) (Datum, error) {
 		if b == 0 {
 			return Datum{}, &ExecError{Code: "22012", Pos: pos, Message: "division by zero"}
 		}
+		// MinInt64 / -1 overflows: the mathematical result 2^63 doesn't fit in int64.
+		if a == math.MinInt64 && b == -1 {
+			return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+		}
 		r = a / b
 	case parser.OpMod:
 		if b == 0 {
@@ -1428,6 +1673,17 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 			return 1, nil
 		}
 		return 0, nil
+	case KindEnum:
+		// Enum comparison uses sort order, not label. M0097-enum-sort.
+		ao := math.Float64frombits(uint64(a.Int))
+		bo := math.Float64frombits(uint64(b.Int))
+		switch {
+		case ao < bo:
+			return -1, nil
+		case ao > bo:
+			return 1, nil
+		}
+		return 0, nil
 	}
 	return 0, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("comparison not supported for kind %d", a.Kind)}
 }
@@ -1684,8 +1940,44 @@ func roundFloatToInt(d Datum, pos int) (int64, error) {
 		return 0, &ExecError{Code: "22P02", Pos: pos,
 			Message: fmt.Sprintf("invalid float value for integer cast: %s", text)}
 	}
+	// Check for NaN and out-of-range before converting to int64.
+	if math.IsNaN(f) || math.IsInf(f, 0) || f > float64(math.MaxInt64) || f < float64(math.MinInt64) {
+		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+	}
 	// Banker's rounding: round half to nearest even.
 	rounded := math.RoundToEven(f)
+	// Re-check after rounding (the rounded value could edge over MaxInt64).
+	if rounded > float64(math.MaxInt64) || rounded < float64(math.MinInt64) {
+		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+	}
+	return int64(rounded), nil
+}
+
+// roundFloat4ToInt rounds a KindNumeric or KindString datum that represents a float4
+// value to int64, parsing via float32 precision (matching PostgreSQL's float4→int8 cast).
+// The float4 source has already been rounded to float32 precision before storage as a
+// KindNumeric string, so we parse via float32 to get the correct rounded value. M0097-0147.
+func roundFloat4ToInt(d Datum, pos int) (int64, error) {
+	var text string
+	if d.Kind == KindString {
+		text = d.StringValue()
+	} else {
+		text = numericText(d)
+	}
+	// Parse as float32 to honour float4 precision (PostgreSQL's float4 is IEEE 754 single).
+	f32, err := strconv.ParseFloat(text, 32)
+	if err != nil {
+		return 0, &ExecError{Code: "22P02", Pos: pos,
+			Message: fmt.Sprintf("invalid float value for integer cast: %s", text)}
+	}
+	f := float64(float32(f32))
+	if math.IsNaN(f) || math.IsInf(f, 0) || f > float64(math.MaxInt64) || f < float64(math.MinInt64) {
+		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+	}
+	rounded := math.RoundToEven(f)
+	if rounded > float64(math.MaxInt64) || rounded < float64(math.MinInt64) {
+		return 0, &ExecError{Code: "22003", Pos: pos, Message: "bigint out of range"}
+	}
 	return int64(rounded), nil
 }
 
@@ -1776,11 +2068,17 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, erro
 	// rounding inside evalCast to use banker's rounding instead.
 	// Also handle KindString datums produced by the float8 arithmetic path
 	// (e.g. "0.05" from random()*0.1). M0097-0042.
+	// For float4 source, parse via float32 precision to match PostgreSQL semantics. M0097-0147.
+	isFloat4Source := strings.ToLower(sourceType) == "float4" || strings.ToLower(sourceType) == "real"
 	if isFloatSourceType(sourceType) && (d.Kind == KindNumeric || d.Kind == KindString) {
+		roundFn := roundFloatToInt
+		if isFloat4Source {
+			roundFn = roundFloat4ToInt
+		}
 		intTarget := strings.ToLower(targetType)
 		switch intTarget {
 		case "int2", "smallint":
-			n, err := roundFloatToInt(d, pos)
+			n, err := roundFn(d, pos)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -1789,7 +2087,7 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, erro
 			}
 			return Datum{Kind: KindInt, Int: n}, nil
 		case "int4", "integer", "int":
-			n, err := roundFloatToInt(d, pos)
+			n, err := roundFn(d, pos)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -1798,7 +2096,7 @@ func evalCastTyped(d Datum, targetType, sourceType string, pos int) (Datum, erro
 			}
 			return Datum{Kind: KindInt, Int: n}, nil
 		case "int8", "bigint":
-			n, err := roundFloatToInt(d, pos)
+			n, err := roundFn(d, pos)
 			if err != nil {
 				return Datum{}, err
 			}
@@ -1957,6 +2255,21 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		default:
 			return d, nil
 		}
+	case "name[]":
+		// name[] cast: truncate each array element to NAMEDATALEN-1 = 63 bytes.
+		// The parser preserves "[]" in TargetType for ::name[] casts; this case
+		// handles the array form so element truncation is applied. M0097-name-fix.
+		s := d.StringValue()
+		if len(s) > 0 && s[0] == '{' && s[len(s)-1] == '}' {
+			elems := parseTextArray(s)
+			for i, e := range elems {
+				if len(e) > 63 {
+					elems[i] = e[:63]
+				}
+			}
+			return NewStringDatum(formatTextArray(elems)), nil
+		}
+		return d, nil
 	case "text", "varchar", "bpchar", "char":
 		switch d.Kind {
 		case KindBool:
@@ -1971,6 +2284,9 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				return NewStringDatum(string(appendTimeOnlyValueText(nil, d.TimeValue()))), nil
 			}
 			return NewStringDatum(d.Format()), nil
+		case KindEnum:
+			// Cast enum to text: return the label string (loses sort order). M0097-enum.
+			return NewStringDatum(string(d.Buf)), nil
 		case KindString:
 			s := d.StringValue()
 			// For "char" (internal 1-byte type), interpret backslash-octal escapes
@@ -1985,7 +2301,43 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		default:
 			return d, nil
 		}
-	case "float", "float4", "real", "float8", "double precision":
+	case "float4", "real":
+		// Integer → float4: round-trip through float32 to apply float32 precision.
+		// PostgreSQL float4 has ~7 significant decimal digits; full int64 precision
+		// must be lost before display. M0097-0147.
+		if d.Kind == KindInt {
+			f32 := float32(d.Int)
+			f64 := float64(f32)
+			normalized := strconv.FormatFloat(f64, 'f', -1, 64)
+			if v, s, ok := parseNumericFast(normalized); ok {
+				return Datum{Kind: KindNumeric, Int: v, Scale: s}, nil
+			}
+			m, s, parseErr := parseNumeric(normalized)
+			if parseErr != nil {
+				return numericFromInt(d.Int), nil // unexpected, keep original
+			}
+			return newNumeric(m, int(s)), nil
+		}
+		// Normalize KindNumeric through float64 to strip trailing zeros (0.0→0). M0097-0003.
+		if d.Kind == KindNumeric {
+			text := numericText(d)
+			f, err := strconv.ParseFloat(text, 64)
+			if err != nil {
+				return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type float8: %q", text)}
+			}
+			normalized := strconv.FormatFloat(f, 'f', -1, 64)
+			if v, s, ok := parseNumericFast(normalized); ok {
+				return Datum{Kind: KindNumeric, Int: v, Scale: s}, nil
+			}
+			m, s, parseErr := parseNumeric(normalized)
+			if parseErr != nil {
+				return d, nil // unexpected, keep original
+			}
+			return newNumeric(m, int(s)), nil
+		}
+		return d, nil
+	case "float", "float8", "double precision":
 		// Normalize KindNumeric through float64 to strip trailing zeros (0.0→0). M0097-0003.
 		// PostgreSQL float8out uses printf-style format that removes trailing zeros.
 		if d.Kind == KindNumeric {
@@ -2015,7 +2367,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 		switch d.Kind {
 		case KindInt:
 			if d.Int < 0 || d.Int > 4294967295 {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "value out of range for type oid"}
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "OID out of range"}
 			}
 			return d, nil
 		case KindString:
@@ -2027,8 +2379,7 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				return Datum{}, err
 			}
 			if n < 0 || n > 4294967295 {
-				return Datum{}, &ExecError{Code: "22003", Pos: pos,
-					Message: fmt.Sprintf("value %q is out of range for type oid", d.StringValue())}
+				return Datum{}, &ExecError{Code: "22003", Pos: pos, Message: "OID out of range"}
 			}
 			return Datum{Kind: KindInt, Int: n}, nil
 		default:
@@ -2850,39 +3201,137 @@ func evalToChar(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 // Supports: FM prefix, 0 (zero-fill), 9 (space-fill), . (decimal point),
 // , (grouping separator), S/MI/PL/PR signs. M0097-0105.
 func toCharNumericFormat(val Datum, fmtStr string) string {
-	// Detect and strip FM (fill mode: suppress leading/trailing spaces).
-	// FM may appear at the start or end of the format string.
-	fm := false
+	orig := fmtStr
 	upper := strings.ToUpper(strings.TrimSpace(fmtStr))
-	if strings.Contains(upper, "FM") {
-		fm = true
+
+	// EEEE/eeee — scientific notation: delegate entirely.
+	if strings.Contains(upper, "EEEE") {
+		// Extract the mantissa format (everything before EEEE, minus FM/sign tokens).
+		eeeeIdx := strings.Index(strings.ToUpper(orig), "EEEE")
+		mantissaRaw := orig[:eeeeIdx]
+		mantissaFmt := strings.NewReplacer("FM", "", "fm", "", "S", "", "s", "").Replace(mantissaRaw)
+		lowercase := strings.Contains(orig, "eeee")
+		fmMode := strings.Contains(upper, "FM")
+		return toCharScientific(val, mantissaFmt, lowercase, fmMode)
+	}
+
+	// RN — Roman numerals: delegate entirely.
+	if strings.Contains(upper, "RN") {
+		fmMode := strings.Contains(upper, "FM")
+		return toCharRoman(val, fmMode)
+	}
+
+	// FM: fill mode — strip leading/trailing spaces.
+	fm := strings.Contains(upper, "FM")
+	if fm {
 		upper = strings.ReplaceAll(upper, "FM", "")
 	}
 
-	// Detect sign modifiers.
-	hasMI := strings.Contains(upper, "MI")
-	hasPL := strings.Contains(upper, "PL")
-	hasPR := strings.Contains(upper, "PR")
-	hasS := false
-	if !hasMI && !hasPL && !hasPR {
-		if strings.HasPrefix(upper, "S") || strings.HasSuffix(upper, "S") {
-			hasS = true
-		}
+	// Pre-scan original format for quoted literal text segments ("...").
+	// We extract them keyed by their byte-position range so we can splice them
+	// back into the result after digit formatting.
+	type quotedSeg struct {
+		// position in the upper-cased, stripped format string after quotes removed
+		insertAfterPos int // insert after this many chars of the stripped upper string
+		text           string
 	}
-	// Strip sign specifiers for digit processing.
+	var quotedSegs []quotedSeg
+	{
+		// Build a parallel "stripped" upper string (no quote regions) and record where
+		// each quoted segment goes.
+		stripped := strings.Builder{}
+		i := 0
+		for i < len(upper) {
+			if upper[i] == '"' {
+				// Find closing quote; handle backslash-escaped quotes \"  inside.
+				j := i + 1
+				for j < len(upper) && upper[j] != '"' {
+					if upper[j] == '\\' && j+1 < len(upper) && upper[j+1] == '"' {
+						j += 2 // skip \"
+					} else {
+						j++
+					}
+				}
+				// Extract raw text from orig (preserving case) and unescape \" → ".
+				rawText := orig[i+1 : i+1+(j-(i+1))]
+				rawText = strings.ReplaceAll(rawText, `\"`, `"`)
+				quotedSegs = append(quotedSegs, quotedSeg{
+					insertAfterPos: stripped.Len(),
+					text:           rawText,
+				})
+				i = j + 1 // skip past closing '"'
+			} else {
+				stripped.WriteByte(upper[i])
+				i++
+			}
+		}
+		upper = stripped.String()
+	}
+
+	// TH/th ordinal suffix.
+	hasTHUpper, hasTHLower := false, false
+	if strings.Contains(upper, "TH") {
+		origNoFM := strings.ReplaceAll(strings.ReplaceAll(orig, "FM", ""), "fm", "")
+		hasTHUpper = strings.Contains(origNoFM, "TH")
+		hasTHLower = strings.Contains(origNoFM, "th")
+		upper = strings.ReplaceAll(upper, "TH", "")
+	}
+
+	// Detect SG (sign) in the middle of the format: 2-char code that outputs the sign (+/-)
+	// at that position without any extra leading sign space. Detect AFTER quoted-text removal
+	// so the position is relative to the stripped upper string. SG at position 0 is handled
+	// by the hasSStart path below (S at start of format). M0097-0147.
+	hasSGMid := false
+	sgMidInjectAt := 0
+	if idx := strings.Index(upper, "SG"); idx > 0 {
+		hasSGMid = true
+		sgMidInjectAt = idx
+		upper = upper[:idx] + upper[idx+2:]
+	}
+
+	// Detect sign modifiers. MI/PL positions matter (prefix vs suffix).
+	hasMIStart := strings.HasPrefix(upper, "MI")
+	hasMIEnd := !hasMIStart && strings.HasSuffix(upper, "MI")
+	hasMI := hasMIStart || hasMIEnd
+	hasPLEnd := strings.HasSuffix(upper, "PL")
+	hasPLStart := !hasPLEnd && strings.HasPrefix(upper, "PL")
+	hasPL := hasPLStart || hasPLEnd
+	hasPR := strings.Contains(upper, "PR")
+	hasSStart, hasSSuffix, hasS := false, false, false
+	if !hasMI && !hasPL && !hasPR {
+		// Remove G/D/L/C/spaces so they don't confuse S detection.
+		chk := strings.NewReplacer("G", "", "D", "", "L", "", "C", "", " ", "").Replace(upper)
+		if strings.HasPrefix(chk, "S") {
+			hasSStart = true
+		} else if strings.HasSuffix(chk, "S") {
+			hasSSuffix = true
+		}
+		hasS = hasSStart || hasSSuffix
+	}
+
+	// Strip sign specifiers for digit-format processing.
 	digitFmt := upper
 	digitFmt = strings.ReplaceAll(digitFmt, "MI", "")
 	digitFmt = strings.ReplaceAll(digitFmt, "PL", "")
 	digitFmt = strings.ReplaceAll(digitFmt, "PR", "")
-	if !strings.Contains(digitFmt, "D") { // keep D (locale decimal) but remove S
-		digitFmt = strings.ReplaceAll(digitFmt, "S", "")
-	}
-	// Replace locale separators with canonical chars for parsing.
+	digitFmt = strings.ReplaceAll(digitFmt, "S", "")
+	// Map locale separators to canonical chars.
 	digitFmt = strings.ReplaceAll(digitFmt, "G", ",")
 	digitFmt = strings.ReplaceAll(digitFmt, "D", ".")
-	digitFmt = strings.ReplaceAll(digitFmt, "L", "")
+	digitFmt = strings.ReplaceAll(digitFmt, "L", " ")
 	digitFmt = strings.ReplaceAll(digitFmt, "C", "")
-	digitFmt = strings.ReplaceAll(digitFmt, "S", "")
+
+	// V — decimal shift: multiply value by 10^N where N = digit positions after V.
+	vShift := 0
+	if vIdx := strings.Index(digitFmt, "V"); vIdx >= 0 {
+		afterV := digitFmt[vIdx+1:]
+		for _, c := range afterV {
+			if c == '0' || c == '9' {
+				vShift++
+			}
+		}
+		digitFmt = digitFmt[:vIdx]
+	}
 
 	// Split into integer and decimal parts.
 	dotIdx := strings.Index(digitFmt, ".")
@@ -2893,17 +3342,28 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 	} else {
 		intFmt = digitFmt
 	}
-	// Remove grouping separators from format (just track digit positions).
 	intFmtDigits := strings.ReplaceAll(intFmt, ",", "")
+	intFmtDigits = strings.ReplaceAll(intFmtDigits, " ", "")
 	decFmtDigits := strings.ReplaceAll(decFmt, ",", "")
+	decFmtDigits = strings.ReplaceAll(decFmtDigits, " ", "")
 
-	// Count digit positions.
-	intPositions := 0
-	for _, c := range intFmtDigits {
-		if c == '0' || c == '9' {
-			intPositions++
+	// Zero-fill: a '0' format char at position i makes all positions j >= i use
+	// '0' fill instead of ' ' fill (propagates rightward from the leftmost '0').
+	zeroFillFrom := len(intFmtDigits) // default: no zero-fill
+	for i, c := range intFmtDigits {
+		if c == '0' {
+			zeroFillFrom = i
+			break
 		}
 	}
+	// totalDigitPositions is used to map right-to-left walk index → left-to-right position.
+	totalDigitPositions := 0
+	for _, c := range intFmtDigits {
+		if c == '0' || c == '9' {
+			totalDigitPositions++
+		}
+	}
+
 	decPositions := 0
 	for _, c := range decFmtDigits {
 		if c == '0' || c == '9' {
@@ -2911,7 +3371,7 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		}
 	}
 
-	// Extract the numeric value as integer and optional fractional string.
+	// Extract numeric value.
 	negative := false
 	var intVal int64
 	var fracStr string
@@ -2923,7 +3383,7 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 			intVal = -intVal
 		}
 	case KindNumeric:
-		m := val.NumericMantissaValue() // int64 mantissa
+		m := val.NumericMantissaValue()
 		s := int(val.NumericScaleValue())
 		if m < 0 {
 			negative = true
@@ -2957,7 +3417,7 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 				frac := f - float64(intVal)
 				fs := fmt.Sprintf("%.*f", decPositions, frac)
 				if len(fs) > 2 {
-					fracStr = fs[2:] // strip "0."
+					fracStr = fs[2:]
 				}
 				if len(fracStr) > decPositions {
 					fracStr = fracStr[:decPositions]
@@ -2966,32 +3426,92 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		}
 	}
 
-	// Format the integer part: walk format right-to-left, filling each digit position.
+	// Apply V shift: multiply intVal by 10^vShift and clear decimal part.
+	if vShift > 0 {
+		mult := int64(1)
+		for i := 0; i < vShift; i++ {
+			mult *= 10
+		}
+		intVal *= mult
+		fracStr = ""
+		decPositions = 0
+		decFmt = ""
+		dotIdx = -1
+	}
+
+	// Format integer part: walk intFmt right-to-left, preserving comma/space positions.
+	// Track whether each char slot is a fill position (vs actual digit).
 	intStr := strconv.FormatInt(intVal, 10)
 	var intBuf []byte
+	var intIsFill []bool // parallel to intBuf: true = fill char
 	pos := len(intStr) - 1
-	for fi := len(intFmtDigits) - 1; fi >= 0; fi-- {
-		fc := intFmtDigits[fi]
-		if fc != '0' && fc != '9' {
-			continue
-		}
-		if pos >= 0 {
-			intBuf = append([]byte{intStr[pos]}, intBuf...)
-			pos--
-		} else {
-			if fc == '0' {
-				intBuf = append([]byte{'0'}, intBuf...)
+	digitPosFromRight := 0
+	for fi := len(intFmt) - 1; fi >= 0; fi-- {
+		fc := intFmt[fi]
+		switch fc {
+		case ',':
+			intBuf = append([]byte{','}, intBuf...)
+			intIsFill = append([]bool{true}, intIsFill...) // comma is fill until second pass
+		case ' ':
+			// Literal space in format — treat as fill spacer.
+			intBuf = append([]byte{' '}, intBuf...)
+			intIsFill = append([]bool{true}, intIsFill...)
+		case '0', '9':
+			digitPosFromLeft := totalDigitPositions - 1 - digitPosFromRight
+			digitPosFromRight++
+			fillCh := byte(' ')
+			if digitPosFromLeft >= zeroFillFrom {
+				fillCh = '0'
+			}
+			if pos >= 0 {
+				intBuf = append([]byte{intStr[pos]}, intBuf...)
+				intIsFill = append([]bool{false}, intIsFill...)
+				pos--
 			} else {
-				intBuf = append([]byte{' '}, intBuf...)
+				intBuf = append([]byte{fillCh}, intBuf...)
+				intIsFill = append([]bool{true}, intIsFill...)
 			}
 		}
 	}
-	// If number has more digits than format, prepend the overflow digits.
+	// Overflow: more digits than format positions.
 	for pos >= 0 {
 		intBuf = append([]byte{intStr[pos]}, intBuf...)
+		intIsFill = append([]bool{false}, intIsFill...)
 		pos--
 	}
+
+	// Second pass: replace commas in the fill area (before first actual digit) with
+	// the appropriate fill char (space for '9' area, '0' for '0' area).
+	// gFillCount tracks how many G (comma) separators were in the fill area (before first
+	// actual digit); used later by the S-start sign handler to adjust column width.
+	gFillCount := 0
+	seenActualDigit := false
+	for i := range intBuf {
+		if !intIsFill[i] {
+			seenActualDigit = true
+		}
+		if intBuf[i] == ',' && !seenActualDigit {
+			gFillCount++
+			// Determine fill char at this position from the nearest digit slot.
+			// Use the rightmost fill char type in the prefix region.
+			// Simple heuristic: if any preceding fill slot used '0', use '0', else ' '.
+			fillCh := byte(' ')
+			for j := 0; j < i; j++ {
+				if intIsFill[j] && intBuf[j] == '0' {
+					fillCh = '0'
+					break
+				}
+			}
+			intBuf[i] = fillCh
+		}
+	}
 	result := string(intBuf)
+
+	// V-shift extends effective output width: 99999V99 with value 1234 → 1234×100=123400,
+	// width = 5 (before V) + 2 (after V) = 7 digit slots, not just 5. Pad with fill if needed.
+	if vShift > 0 && len(result) < totalDigitPositions+vShift {
+		result = strings.Repeat(" ", totalDigitPositions+vShift-len(result)) + result
+	}
 
 	// Append decimal part.
 	if dotIdx >= 0 && decPositions > 0 {
@@ -3000,48 +3520,180 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 		} else if len(fracStr) < decPositions {
 			fracStr += strings.Repeat("0", decPositions-len(fracStr))
 		}
-		result = result + "." + fracStr
+		// Walk decFmt left-to-right to insert any commas at their positions (G separators).
+		decOut := strings.Builder{}
+		fracPos := 0
+		for _, dc := range decFmt {
+			switch dc {
+			case ',':
+				decOut.WriteByte(',')
+			case ' ':
+				decOut.WriteByte(' ')
+			case '0', '9':
+				if fracPos < len(fracStr) {
+					decOut.WriteByte(fracStr[fracPos])
+				} else {
+					decOut.WriteByte('0')
+				}
+				fracPos++
+			}
+		}
+		result = result + "." + decOut.String()
 	}
 
-	// FM mode: trim leading spaces from the digit portion before sign.
+	// FM mode: strip leading spaces only (from '9' fill without zero-fill propagation).
+	// '0' fill positions and propagated zero-fill are NOT stripped.
+	// For decimal: strip trailing zeros from '9' decimal positions; keep '0' positions.
 	if fm {
 		result = strings.TrimLeft(result, " ")
+		if result == "" || result == "." {
+			result = "0"
+		}
 		if dotIdx >= 0 {
-			result = strings.TrimRight(result, "0")
-			result = strings.TrimRight(result, ".")
+			hasAnyDecimalZero := strings.ContainsRune(decFmtDigits, '0')
+			if !hasAnyDecimalZero {
+				// Strip trailing fractional zeros (from '9' positions); keep dot.
+				result = strings.TrimRight(result, "0")
+			}
 		}
 	}
 
-	// Apply sign.
-	if hasMI {
+	// Ordinal suffix (positive values only).
+	ordSuffix := ""
+	if (hasTHUpper || hasTHLower) && !negative {
+		sfx := toCharOrdinalSuffix(intVal)
+		if hasTHLower {
+			sfx = strings.ToLower(sfx)
+		}
+		ordSuffix = sfx
+	}
+
+	// Splice quoted literal segments into result BEFORE applying sign.
+	// The insertAfterPos values are relative to the stripped-upper (digit-only) coordinate
+	// system. Inserting before sign keeps them valid without a sign-prefix offset.
+	// Exception: hasSGMid injects the sign at a digit-column position; if quoted text also
+	// appears, positions shift and would require re-calculation — defer that edge case.
+	if len(quotedSegs) > 0 && !hasSGMid {
+		for i := len(quotedSegs) - 1; i >= 0; i-- {
+			seg := quotedSegs[i]
+			insertAt := seg.insertAfterPos
+			// Adjust insertion point when the literal format space immediately before
+			// the insertion is in the fill area (all preceding positions are fills).
+			// In PostgreSQL's to_char, a literal separator space adjacent to the fill
+			// region is output AFTER the quoted text rather than before, so we insert
+			// before it. For large values (digit at the preceding position) no shift.
+			if insertAt > 0 && insertAt <= len(intFmt) && intFmt[insertAt-1] == ' ' {
+				allFillBefore := true
+				for j := 0; j < insertAt-1; j++ {
+					if !intIsFill[j] {
+						allFillBefore = false
+						break
+					}
+				}
+				if allFillBefore {
+					insertAt--
+				}
+			}
+			if insertAt > len(result) {
+				insertAt = len(result)
+			}
+			result = result[:insertAt] + seg.text + result[insertAt:]
+		}
+	}
+
+	// Apply sign modifier.
+	if hasSGMid {
+		// SG in the middle: inject sign at the recorded position, no leading sign space.
+		sign := byte('+')
 		if negative {
-			result = result + "-"
-		} else if !fm {
-			result = result + " "
+			sign = '-'
+		}
+		if sgMidInjectAt > len(result) {
+			sgMidInjectAt = len(result)
+		}
+		result = result[:sgMidInjectAt] + string(sign) + result[sgMidInjectAt:]
+	} else if hasMI {
+		if hasMIStart {
+			if negative {
+				// Place minus right before the first significant digit.
+				trim := strings.TrimLeft(result, " ")
+				spaces := len(result) - len(trim)
+				result = strings.Repeat(" ", spaces) + "-" + trim
+			} else if !fm {
+				result = " " + result
+			}
+		} else {
+			// hasMIEnd: sign at the end.
+			if negative {
+				result = result + "-"
+			} else if !fm {
+				result = result + " "
+			}
 		}
 	} else if hasPL {
-		if negative {
-			result = "-" + result
+		if hasPLEnd {
+			if !negative {
+				// PL-end positive: add one more leading sign-space and trailing + symbol.
+				result = " " + result + "+"
+			} else {
+				// PL-end negative: sign right before digits, trailing space for PL position.
+				trim := strings.TrimLeft(result, " ")
+				spaces := len(result) - len(trim)
+				result = strings.Repeat(" ", spaces) + "-" + trim + " "
+			}
 		} else {
-			result = "+" + result
+			// hasPLStart: sign right before first significant digit.
+			trim := strings.TrimLeft(result, " ")
+			spaces := len(result) - len(trim)
+			if negative {
+				result = strings.Repeat(" ", spaces) + "-" + trim
+			} else {
+				result = strings.Repeat(" ", spaces) + "+" + trim
+			}
 		}
 	} else if hasPR {
 		if negative {
-			result = "<" + result + ">"
+			// Place < right before the first significant digit, > at end.
+			trim := strings.TrimLeft(result, " ")
+			spaces := len(result) - len(trim)
+			result = strings.Repeat(" ", spaces) + "<" + trim + ">"
 		} else if !fm {
 			result = " " + result + " "
 		}
 	} else if hasS {
-		if negative {
-			result = "-" + result
+		if hasSSuffix {
+			if negative {
+				result = result + "-"
+			} else {
+				result = result + "+"
+			}
 		} else {
-			result = "+" + result
+			// hasSStart: sign right before first significant digit (no extra leading space).
+			trim := strings.TrimLeft(result, " ")
+			spaces := len(result) - len(trim)
+			if gFillCount > 0 {
+				// G separators in fill area produce an extra fill space; absorb them
+				// so the sign sits at position 0 with the correct total width.
+				fill := spaces - gFillCount
+				if fill < 0 {
+					fill = 0
+				}
+				if negative {
+					result = "-" + strings.Repeat(" ", fill) + trim
+				} else {
+					result = "+" + strings.Repeat(" ", fill) + trim
+				}
+			} else {
+				if negative {
+					result = strings.Repeat(" ", spaces) + "-" + trim
+				} else {
+					result = strings.Repeat(" ", spaces) + "+" + trim
+				}
+			}
 		}
 	} else {
-		// Default: sign goes immediately before the significant digits, after
-		// any digit-padding spaces produced by '9' fill.  FM strips those spaces
-		// before we get here, so the negative sign always goes at position 0 in
-		// FM mode.  Non-FM positive reserves a sign position with one extra space.
+		// Default: sign immediately before first significant digit; positive
+		// reserves one extra leading space for the sign position.
 		if negative {
 			trim := strings.TrimLeft(result, " ")
 			spaces := len(result) - len(trim)
@@ -3050,7 +3702,143 @@ func toCharNumericFormat(val Datum, fmtStr string) string {
 			result = " " + result
 		}
 	}
+
+	// hasSGMid + quoted text: sign position shifts with text insertion; fall back to
+	// post-sign insertion with a sign-prefix offset to keep sign embedded correctly.
+	if len(quotedSegs) > 0 && hasSGMid {
+		signPrefix := 0
+		if len(result) > 0 && (result[0] == ' ' || result[0] == '+' || result[0] == '-') {
+			signPrefix = 1
+		}
+		for i := len(quotedSegs) - 1; i >= 0; i-- {
+			seg := quotedSegs[i]
+			insertAt := seg.insertAfterPos + signPrefix
+			if insertAt > len(result) {
+				insertAt = len(result)
+			}
+			result = result[:insertAt] + seg.text + result[insertAt:]
+		}
+	}
+
+	return result + ordSuffix
+}
+
+// toCharOrdinalSuffix returns the English ordinal suffix (ST/ND/RD/TH) for n.
+
+// toCharScientific formats val in scientific notation for the EEEE/eeee format modifier.
+// mantissaFmt is the digit format string before the EEEE token (e.g. "9.99" from "9.99EEEE").
+// lowercase controls whether the exponent uses 'e' or 'E'. fm strips the leading sign space.
+func toCharScientific(val Datum, mantissaFmt string, lowercase bool, fm bool) string {
+	f, ok := datumToFloat64(val)
+	if !ok {
+		return "0"
+	}
+	negative := f < 0
+	if negative {
+		f = -f
+	}
+
+	// Count decimal positions in mantissaFmt (digits after the '.').
+	decPlaces := 0
+	dotSeen := false
+	for _, c := range mantissaFmt {
+		if c == '.' || c == 'D' {
+			dotSeen = true
+			continue
+		}
+		if dotSeen && (c == '0' || c == '9') {
+			decPlaces++
+		}
+	}
+
+	// Format using Go's scientific notation, then reformat the exponent to ±NN.
+	raw := fmt.Sprintf("%.*e", decPlaces, f)
+	// raw is like "1.23e+03" or "1.23e+003" (platform-dependent).
+	eIdx := strings.LastIndex(raw, "e")
+	mantissa := raw[:eIdx]
+	expPart := raw[eIdx+1:] // e.g. "+03" or "+003"
+
+	// Normalise exponent to sign + exactly 2 digits.
+	expSign := "+"
+	if len(expPart) > 0 && (expPart[0] == '+' || expPart[0] == '-') {
+		expSign = string(expPart[0])
+		expPart = expPart[1:]
+	}
+	// Strip leading zeros to get the numeric value, then re-pad to 2 digits.
+	expNum := strings.TrimLeft(expPart, "0")
+	if expNum == "" {
+		expNum = "0"
+	}
+	expFormatted := fmt.Sprintf("%s%02s", expSign, expNum)
+
+	// PostgreSQL always uses lowercase 'e' in scientific notation regardless of EEEE/eeee case.
+	result := mantissa + "e" + expFormatted
+
+	if negative {
+		result = "-" + result
+	} else if !fm {
+		result = " " + result
+	}
 	return result
+}
+
+// toCharRoman converts val to a Roman numeral string for the RN format.
+// Returns a 15-char right-justified string (or fm-stripped). Out-of-range values return "###############".
+func toCharRoman(val Datum, fm bool) string {
+	f, ok := datumToFloat64(val)
+	if !ok {
+		return "###############"
+	}
+	n := int64(f)
+	if n < 1 || n > 3999 {
+		return "###############"
+	}
+
+	thousands := []string{"", "M", "MM", "MMM"}
+	hundreds := []string{"", "C", "CC", "CCC", "CD", "D", "DC", "DCC", "DCCC", "CM"}
+	tens := []string{"", "X", "XX", "XXX", "XL", "L", "LX", "LXX", "LXXX", "XC"}
+	ones := []string{"", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX"}
+
+	roman := thousands[n/1000] + hundreds[(n%1000)/100] + tens[(n%100)/10] + ones[n%10]
+	if fm {
+		return roman
+	}
+	// Right-justify in 15 chars.
+	if len(roman) < 15 {
+		return strings.Repeat(" ", 15-len(roman)) + roman
+	}
+	return roman
+}
+
+// int64ToAbsUint64 returns the absolute value of v as uint64,
+// correctly handling math.MinInt64 which cannot be negated in int64.
+func int64ToAbsUint64(v int64) uint64 {
+	if v >= 0 {
+		return uint64(v)
+	}
+	if v == math.MinInt64 {
+		return uint64(math.MaxInt64) + 1
+	}
+	return uint64(-v)
+}
+
+func toCharOrdinalSuffix(n int64) string {
+	if n < 0 {
+		n = -n
+	}
+	if mod100 := n % 100; mod100 >= 11 && mod100 <= 13 {
+		return "TH"
+	}
+	switch n % 10 {
+	case 1:
+		return "ST"
+	case 2:
+		return "ND"
+	case 3:
+		return "RD"
+	default:
+		return "TH"
+	}
 }
 
 func pgToCharToGoFormat(pg string) string {
@@ -3697,15 +4485,40 @@ func collectInValues(x *planner.InExpr, row Row, ctx *Context) ([]Datum, error) 
 		ctx.SubqueryCache[cacheKey] = out
 		return out, nil
 	}
-	out := make([]Datum, len(x.List))
-	for i, e := range x.List {
+	// Evaluate each list element. When the list has a single element that
+	// evaluates to an array literal "{e1,e2,...}", expand it into individual
+	// elements so `x = ANY (ARRAY[...])` / `x = ANY ('{...}'::type[])` works
+	// correctly. M0097-enum-any.
+	rawOut := make([]Datum, 0, len(x.List))
+	for _, e := range x.List {
 		v, err := evalExpr(e, row, ctx)
 		if err != nil {
 			return nil, err
 		}
-		out[i] = v
+		rawOut = append(rawOut, v)
 	}
-	return out, nil
+	// Expand array-literal elements: a KindString "{...}" in the list is treated
+	// as an array of individual text values, matching PostgreSQL's = ANY (array)
+	// semantics where the single operand is an array type.
+	if len(rawOut) == 1 {
+		v := rawOut[0]
+		if v.Kind == KindString {
+			s := v.StringValue()
+			if len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}' {
+				elems := parseTextArray(s)
+				out := make([]Datum, len(elems))
+				for i, el := range elems {
+					if el == "NULL" {
+						out[i] = NullDatum
+					} else {
+						out[i] = NewStringDatum(el)
+					}
+				}
+				return out, nil
+			}
+		}
+	}
+	return rawOut, nil
 }
 
 // evalExistsExpr evaluates `[NOT] EXISTS (subquery)`. Opens
@@ -3797,6 +4610,16 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 	}
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+
+	// Fast path: correlated subquery using a pre-opened cached operator.
+	// Skip SubqueryCache entirely — the operator already rescans correctly
+	// for each outer row, so the key-build + map overhead is unnecessary.
+	if !x.IsNonCorrelated && ctx.CorrSubqOps != nil {
+		if _, inCache := ctx.CorrSubqOps[x]; inCache || planIsIndexScanBased(x.Plan) {
+			return subqueryImpl(x, ctx)
+		}
+	}
+
 	// Check cache for scalar subquery results. For non-correlated
 	// subqueries (M0058-0001), use a constant cache key.
 	cacheKey := subqueryCacheKey(row)
@@ -3829,6 +4652,69 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 }
 
 func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
+	// Correlated scalar subqueries inside aggregates are called once per outer
+	// row. Avoid O(N²) execution via two optimization paths:
+	//
+	// 1. IndexScan path: the inner plan uses a btree index (OuterColumnRef key).
+	//    Cache the pre-opened operator and rescan cheaply per outer row.
+	//    Requires: planIsIndexScanBased(x.Plan).
+	//
+	// 2. Hash map path: inner plan is Project(Filter(SeqScan, col=OuterColumnRef)).
+	//    Scan the inner table ONCE (O(N)) to build key→value map, then do
+	//    O(1) lookups. Works even when no btree index exists.
+	if !x.IsNonCorrelated {
+		// Path 1: IndexScan-based (btree index exists).
+		if planIsIndexScanBased(x.Plan) {
+			if ctx.CorrSubqOps == nil {
+				ctx.CorrSubqOps = make(map[*planner.SubqueryExpr]Operator)
+			}
+			op, found := ctx.CorrSubqOps[x]
+			if !found {
+				var buildErr error
+				op, buildErr = Build(x.Plan)
+				if buildErr != nil {
+					return Datum{}, buildErr
+				}
+				ctx.CorrSubqOps[x] = op
+			}
+			if err := op.Open(ctx); err != nil {
+				delete(ctx.CorrSubqOps, x)
+				_ = op.Close()
+				return Datum{}, err
+			}
+			return subqueryReadOne(op, x)
+		}
+
+		// Path 2: Hash map for Project(Filter(SeqScan, col = OuterColumnRef)).
+		if info, ok := extractCorrSubqHashInfo(x.Plan); ok {
+			if ctx.CorrSubqHashMaps == nil {
+				ctx.CorrSubqHashMaps = make(map[*planner.SubqueryExpr]map[string]Datum)
+			}
+			hm, built := ctx.CorrSubqHashMaps[x]
+			if !built {
+				var hmErr error
+				hm, hmErr = buildCorrSubqHashMap(info, ctx)
+				if hmErr != nil {
+					return Datum{}, hmErr
+				}
+				ctx.CorrSubqHashMaps[x] = hm
+			}
+			// Look up the outer column value.
+			outerVal, err := evalExprSlot(info.outerRef, nil, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if outerVal.IsNull() {
+				return NullDatum, nil
+			}
+			result, found := hm[datumKey(outerVal)]
+			if !found {
+				return NullDatum, nil
+			}
+			return result, nil
+		}
+	}
+
 	op, err := Build(x.Plan)
 	if err != nil {
 		return Datum{}, err
@@ -3838,6 +4724,131 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 		return Datum{}, err
 	}
 	defer func() { _ = op.Close() }()
+	return subqueryReadOne(op, x)
+}
+
+// planIsIndexScanBased returns true when n is a plan whose operators safely
+// support repeated Open() calls without an intervening Close(). Currently
+// true for IndexScan and Project(IndexScan) — the two shapes produced by
+// the correlated-subquery OuterColumnRef → IndexScan rewrite.
+func planIsIndexScanBased(n planner.Node) bool {
+	switch x := n.(type) {
+	case *planner.IndexScan:
+		return true
+	case *planner.Project:
+		return planIsIndexScanBased(x.Child)
+	case *planner.Aggregate:
+		// aggregateOp.Open resets o.idx and rebuilds o.rows each time, and its
+		// child is reopened via the child.Open call. Safe as long as the child
+		// (IndexScan) is safe.
+		return planIsIndexScanBased(x.Child)
+	}
+	return false
+}
+
+// corrSubqHashInfo holds the components extracted from a hash-joinable
+// correlated scalar subquery plan: Project(Filter(SeqScan, col = OuterColumnRef)).
+type corrSubqHashInfo struct {
+	scan      *planner.SeqScan // inner table to scan
+	scanColIdx int              // index of the join key column in SeqScan output
+	outerRef  *planner.OuterColumnRef // outer column reference for join key lookup
+	projExpr  planner.Expr            // project expression to evaluate for result
+}
+
+// extractCorrSubqHashInfo detects the pattern
+// Project(Filter(SeqScan, ColumnRef{col} = OuterColumnRef)) — or the aggregate
+// wrapper Aggregate(same) — and returns the components needed to build a hash
+// map for O(N) build + O(1) lookup per outer row.
+func extractCorrSubqHashInfo(n planner.Node) (corrSubqHashInfo, bool) {
+	var projectTarget planner.Expr
+	switch x := n.(type) {
+	case *planner.Project:
+		if len(x.Targets) != 1 {
+			return corrSubqHashInfo{}, false
+		}
+		projectTarget = x.Targets[0]
+		n = x.Child
+	default:
+		return corrSubqHashInfo{}, false
+	}
+	// n should now be Filter(SeqScan) or SeqScan.
+	var filterPred planner.Expr
+	switch x := n.(type) {
+	case *planner.Filter:
+		filterPred = x.Predicate
+		n = x.Child
+	default:
+		return corrSubqHashInfo{}, false
+	}
+	scan, ok := n.(*planner.SeqScan)
+	if !ok {
+		return corrSubqHashInfo{}, false
+	}
+	// Filter predicate must be: ColumnRef = OuterColumnRef (or reversed).
+	bop, ok := filterPred.(*planner.BinaryOp)
+	if !ok || bop.Op != parser.OpEq {
+		return corrSubqHashInfo{}, false
+	}
+	var innerCol *planner.ColumnRef
+	var outerRef *planner.OuterColumnRef
+	if c, ok2 := bop.Left.(*planner.ColumnRef); ok2 {
+		if o, ok3 := bop.Right.(*planner.OuterColumnRef); ok3 {
+			innerCol, outerRef = c, o
+		}
+	} else if c, ok2 := bop.Right.(*planner.ColumnRef); ok2 {
+		if o, ok3 := bop.Left.(*planner.OuterColumnRef); ok3 {
+			innerCol, outerRef = c, o
+		}
+	}
+	if innerCol == nil || outerRef == nil {
+		return corrSubqHashInfo{}, false
+	}
+	return corrSubqHashInfo{
+		scan:       scan,
+		scanColIdx: innerCol.Index,
+		outerRef:   outerRef,
+		projExpr:   projectTarget,
+	}, true
+}
+
+// buildCorrSubqHashMap scans the inner SeqScan once and builds
+// key → value map where key = datumKey(scan[joinColIdx]) and value = eval(projExpr).
+func buildCorrSubqHashMap(info corrSubqHashInfo, ctx *Context) (map[string]Datum, error) {
+	scanOp, err := Build(info.scan)
+	if err != nil {
+		return nil, err
+	}
+	if err := scanOp.Open(ctx); err != nil {
+		_ = scanOp.Close()
+		return nil, err
+	}
+	defer func() { _ = scanOp.Close() }()
+	result := make(map[string]Datum)
+	for {
+		slot, nerr := scanOp.Next()
+		if nerr == EOF {
+			break
+		}
+		if nerr != nil {
+			return nil, nerr
+		}
+		row := slotRow(slot)
+		if info.scanColIdx >= len(row) {
+			continue
+		}
+		keyDatum := row[info.scanColIdx]
+		valDatum, verr := evalExprSlot(info.projExpr, slot, ctx)
+		if verr != nil {
+			return nil, verr
+		}
+		result[datumKey(keyDatum)] = valDatum
+	}
+	return result, nil
+}
+
+// subqueryReadOne reads exactly one row from op (the scalar subquery result).
+// Returns NullDatum on EOF, error on cardinality violation or scan error.
+func subqueryReadOne(op Operator, x *planner.SubqueryExpr) (Datum, error) {
 	slot, err := op.Next()
 	if err == EOF {
 		return NullDatum, nil
@@ -4064,6 +5075,14 @@ func compareEq(a, b Datum) (Datum, error) {
 		return NewBoolDatum(fmt.Sprintf("%d", a.Int) == b.StringValue()), nil
 	case aIsString && b.Kind == KindInt:
 		return NewBoolDatum(a.StringValue() == fmt.Sprintf("%d", b.Int)), nil
+	// KindEnum vs string: compare by label (used in = ANY with array literals).
+	// M0097-enum-any.
+	case a.Kind == KindEnum && bIsString:
+		return NewBoolDatum(string(a.Buf) == b.StringValue()), nil
+	case aIsString && b.Kind == KindEnum:
+		return NewBoolDatum(a.StringValue() == string(b.Buf)), nil
+	case a.Kind == KindEnum && b.Kind == KindEnum:
+		return NewBoolDatum(a.Int == b.Int), nil
 	}
 	return NewBoolDatum(false), nil
 }
@@ -4311,7 +5330,11 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if !ok || len(et.Values) == 0 {
 			return NullDatum, nil
 		}
-		return NewStringDatum(et.Values[len(et.Values)-1].Label), nil
+		lastLabel := et.Values[len(et.Values)-1].Label
+		if isUnsafeEnumValue(ctx, typeName, lastLabel) {
+			return Datum{}, enumUnsafeError(lastLabel, typeName, x.Pos())
+		}
+		return NewStringDatum(lastLabel), nil
 
 	case "enum_range", "enum_range_bounds":
 		typeName := enumTypeNameFromArgs(x.Args)
@@ -4348,6 +5371,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 						break
 					}
 				}
+			}
+		}
+		// Check if any value in range is an unsafe pending enum value.
+		for _, ev := range vals {
+			if isUnsafeEnumValue(ctx, typeName, ev.Label) {
+				return Datum{}, enumUnsafeError(ev.Label, typeName, x.Pos())
 			}
 		}
 		// Convert []EnumValue → []string for formatTextArray.
@@ -5266,35 +6295,67 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// ── Function introspection stubs (M0097-0012) ─────────────────────────
 	case "pg_get_functiondef":
 		// pg_get_functiondef(func_oid) → text — returns function DDL.
-		// Stub: look up in routine registry and reconstruct definition.
 		if len(x.Args) == 1 {
-			nameArg, err := evalExpr(x.Args[0], row, ctx)
-			if err != nil || nameArg.IsNull() {
+			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || oidArg.IsNull() {
 				return NullDatum, nil
 			}
-			// The argument might be a regproc (function name cast to OID).
-			// Try to look up the function by name.
+			if ctx == nil || ctx.Catalog == nil {
+				return NullDatum, nil
+			}
 			rs := ctx.Catalog.Routines()
-			if rs != nil {
-				name := nameArg.StringValue()
-				candidates := rs.LookupByName(parseRoutineName(name))
+			if rs == nil {
+				return NullDatum, nil
+			}
+			var r *catalog.Routine
+			if oidArg.Kind == KindInt {
+				r = rs.LookupByOID(uint32(oidArg.Int))
+			} else {
+				// Fall back to name lookup for string arguments.
+				schema, nm := splitQualifiedTable(strings.ToLower(strings.TrimSpace(oidArg.StringValue())))
+				candidates := rs.LookupByName(parser.ObjectName{Schema: schema, Name: nm})
 				if len(candidates) > 0 {
-					r := candidates[0]
-					body := fmt.Sprintf("CREATE OR REPLACE FUNCTION %s(", r.Name)
-					for i, arg := range r.ArgNames {
-						if i > 0 {
-							body += ", "
-						}
-						body += arg + " " + r.ArgTypes[i].Name
-					}
-					body += ") RETURNS " + r.ReturnType.Name + " LANGUAGE " + r.Language + " AS $$\n" + r.Body + "\n$$"
-					return NewStringDatum(body), nil
+					r = candidates[0]
 				}
 			}
-			return NullDatum, nil
+			if r == nil {
+				return NullDatum, nil
+			}
+			return NewStringDatum(buildFunctionDef(r)), nil
 		}
-	case "pg_get_function_arguments", "pg_get_function_result":
+	case "pg_get_function_arguments":
+		// pg_get_function_arguments(oid) → text: comma-separated arg list
+		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
+			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
+				if rs := ctx.Catalog.Routines(); rs != nil {
+					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
+						return NewStringDatum(buildFunctionArguments(r)), nil
+					}
+				}
+			}
+		}
 		return NewStringDatum(""), nil
+	case "pg_get_function_result":
+		// pg_get_function_result(oid) → text: return type
+		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
+			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
+				if rs := ctx.Catalog.Routines(); rs != nil {
+					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil && !r.IsProcedure {
+						return NewStringDatum(canonicalTypeName(r.ReturnType.Name)), nil
+					}
+				}
+			}
+		}
+		return NewStringDatum(""), nil
+	// pg_function_is_visible(oid) → bool: always true (no schema visibility model in v0).
+	case "pg_function_is_visible", "pg_table_is_visible", "pg_type_is_visible",
+		"pg_operator_is_visible", "pg_opfamily_is_visible", "pg_opclass_is_visible",
+		"pg_conversion_is_visible", "pg_aggregate_is_visible", "pg_ts_parser_is_visible",
+		"pg_ts_dict_is_visible", "pg_ts_template_is_visible", "pg_ts_config_is_visible",
+		"pg_statistics_obj_is_visible":
+		return NewBoolDatum(true), nil
 	case "pg_proc":
 		return NullDatum, nil
 	case "regproc", "regprocedure", "regclass", "regtype", "regnamespace":
@@ -5802,6 +6863,10 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			if v.Kind == KindInt {
 				n := v.Int
+				if n == math.MinInt64 {
+					// abs(MinInt64) overflows: MinInt64 = -2^63, abs = 2^63 which can't fit int64.
+					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
+				}
 				if n < 0 {
 					n = -n
 				}
@@ -6004,68 +7069,63 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return newNumeric(m, int(sc)), nil
 		}
 	case "gcd":
-		// gcd(a, b) → greatest common divisor, always non-negative. M0097-0003.
+		// gcd(a, b) — greatest common divisor, non-negative. M0097-0003.
+		// Uses uint64 absolute values so MinInt64 doesn't overflow on negation.
 		if len(x.Args) == 2 {
 			av, e1 := evalExpr(x.Args[0], row, ctx)
 			bv, e2 := evalExpr(x.Args[1], row, ctx)
 			if e1 != nil || e2 != nil || av.IsNull() || bv.IsNull() {
 				return NullDatum, nil
 			}
-			a64, b64 := av.Int, bv.Int
-			// Compute absolute values in int64 to avoid overflow.
-			if a64 < 0 {
-				a64 = -a64
+			absA := int64ToAbsUint64(av.Int)
+			absB := int64ToAbsUint64(bv.Int)
+			ua, ub := absA, absB
+			for ub != 0 {
+				ua, ub = ub, ua%ub
 			}
-			if b64 < 0 {
-				b64 = -b64
-			}
-			// Euclidean algorithm.
-			for b64 != 0 {
-				a64, b64 = b64, a64%b64
-			}
-			// If both inputs fit in int4 range (or are INT4_MIN), check for
-			// int4 result overflow: gcd(INT4_MIN, x) = |INT4_MIN|= 2^31 > INT4_MAX.
+			const maxInt64 = uint64(math.MaxInt64)
 			isInt4Range := av.Int >= -2147483648 && av.Int <= 2147483647 &&
 				bv.Int >= -2147483648 && bv.Int <= 2147483647
-			if isInt4Range && a64 > 2147483647 {
-				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+			if isInt4Range {
+				if ua > 2147483647 {
+					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+				}
+			} else if ua > maxInt64 {
+				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
 			}
-			return Datum{Kind: KindInt, Int: a64}, nil
+			return Datum{Kind: KindInt, Int: int64(ua)}, nil
 		}
 	case "lcm":
-		// lcm(a, b) → least common multiple, always non-negative. M0097-0003.
+		// lcm(a, b) — least common multiple, non-negative. M0097-0003.
+		// Uses uint64 to handle MinInt64 without overflow.
 		if len(x.Args) == 2 {
 			av, e1 := evalExpr(x.Args[0], row, ctx)
 			bv, e2 := evalExpr(x.Args[1], row, ctx)
 			if e1 != nil || e2 != nil || av.IsNull() || bv.IsNull() {
 				return NullDatum, nil
 			}
-			a64, b64 := av.Int, bv.Int
-			// lcm(0, b) = lcm(a, 0) = 0
-			if a64 == 0 || b64 == 0 {
+			if av.Int == 0 || bv.Int == 0 {
 				return Datum{Kind: KindInt, Int: 0}, nil
 			}
-			absA, absB := a64, b64
-			if absA < 0 {
-				absA = -absA
-			}
-			if absB < 0 {
-				absB = -absB
-			}
-			// Compute gcd.
+			absA := int64ToAbsUint64(av.Int)
+			absB := int64ToAbsUint64(bv.Int)
 			ga, gb := absA, absB
 			for gb != 0 {
 				ga, gb = gb, ga%gb
 			}
-			// lcm = |a| / gcd(a,b) * |b| (division first to reduce overflow risk).
+			// lcm = |a|/gcd * |b| — divide first to reduce overflow risk.
 			result := (absA / ga) * absB
-			// Overflow check for int4 inputs.
+			const maxInt64 = uint64(math.MaxInt64)
 			isInt4Range := av.Int >= -2147483648 && av.Int <= 2147483647 &&
 				bv.Int >= -2147483648 && bv.Int <= 2147483647
-			if isInt4Range && result > 2147483647 {
-				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+			if isInt4Range {
+				if result > 2147483647 {
+					return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "integer out of range"}
+				}
+			} else if result > maxInt64 {
+				return Datum{}, &ExecError{Code: "22003", Pos: x.Pos(), Message: "bigint out of range"}
 			}
-			return Datum{Kind: KindInt, Int: result}, nil
+			return Datum{Kind: KindInt, Int: int64(result)}, nil
 		}
 	case "mod":
 		// mod(a, b) → a % b
@@ -6710,12 +7770,17 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return Datum{Kind: KindInt, Int: int64(cnt)}, nil
 	case "pg_typeof":
 		if len(x.Args) == 1 {
-			// Return the type name as text (best-effort)
+			// Return the type name as text (best-effort).
+			// When the planner has folded pg_typeof(expr) by pre-computing the type
+			// name (stored as a StringConst arg), return it directly. M0097-0035.
 			v, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || v.IsNull() {
 				return NewStringDatum("unknown"), nil
 			}
 			switch v.Kind {
+			case KindString:
+				// Pre-computed type name from planner fold — return as-is.
+				return v, nil
 			case KindInt:
 				return NewStringDatum("integer"), nil
 			case KindBool:
@@ -8282,6 +9347,27 @@ func enumTypeNameFromArgs(args []planner.Expr) string {
 	return ""
 }
 
+// isUnsafeEnumValue returns true when label is a "pending" enum value that was
+// added by ALTER TYPE … ADD VALUE inside the current (uncommitted) explicit
+// transaction.  Such values must not be used until COMMIT.
+func isUnsafeEnumValue(ctx *Context, typeName, label string) bool {
+	if ctx == nil || ctx.PendingEnumValues == nil {
+		return false
+	}
+	pending := ctx.PendingEnumValues[strings.ToLower(typeName)]
+	return pending != nil && pending[label]
+}
+
+// enumUnsafeError builds the "unsafe use of new value" ExecError.
+func enumUnsafeError(label, typeName string, pos int) error {
+	return &ExecError{
+		Code:    "0A000",
+		Pos:     pos,
+		Message: fmt.Sprintf("unsafe use of new value %q of enum type %s", label, typeName),
+		Hint:    "New enum values must be committed before they can be used.",
+	}
+}
+
 // evalRowToRowComparison evaluates (a,b,...) OP (c,d,...) using element-wise
 // comparison with standard SQL NULL semantics: if any compared element is NULL,
 // the result is NULL for that step. Implements ISO SQL §8.7 row comparison.
@@ -8393,4 +9479,259 @@ func parseTZHourMin(s string) (h, m int, ok bool) {
 		return 0, 0, false
 	}
 	return n, 0, true
+}
+
+// buildFunctionArguments returns the argument list string for pg_get_function_arguments().
+// Format: "IN name type, OUT name type, ..." matching PG's pg_get_function_arguments.
+func buildFunctionArguments(r *catalog.Routine) string {
+	if len(r.ArgTypes) == 0 {
+		return ""
+	}
+	// Procedures always show mode prefixes (IN/OUT/INOUT/VARIADIC).
+	// Functions only show mode prefix when at least one param is OUT or INOUT;
+	// if all params are IN/VARIADIC, omit the prefix (PG compat).
+	showMode := r.IsProcedure
+	if !showMode {
+		for _, m := range r.ArgModes {
+			if m == "o" || m == "b" {
+				showMode = true
+				break
+			}
+		}
+	}
+	parts := make([]string, len(r.ArgTypes))
+	for i, argType := range r.ArgTypes {
+		var part strings.Builder
+		// Mode prefix
+		if showMode && r.ArgModes != nil && i < len(r.ArgModes) {
+			switch r.ArgModes[i] {
+			case "i", "":
+				part.WriteString("IN ")
+			case "o":
+				part.WriteString("OUT ")
+			case "b":
+				part.WriteString("INOUT ")
+			case "v":
+				part.WriteString("VARIADIC ")
+			}
+		} else if showMode {
+			part.WriteString("IN ")
+		}
+		// Name (if any)
+		if i < len(r.ArgNames) && r.ArgNames[i] != "" {
+			part.WriteString(r.ArgNames[i])
+			part.WriteByte(' ')
+		}
+		part.WriteString(canonicalTypeName(argType.Name))
+		parts[i] = part.String()
+	}
+	return strings.Join(parts, ", ")
+}
+
+// buildFunctionDef reconstructs the CREATE FUNCTION / CREATE PROCEDURE DDL
+// for pg_get_functiondef(). Matches PostgreSQL's output format: schema-qualified
+// name, arg types, optional modifiers (STABLE/STRICT/etc.), then body.
+func buildFunctionDef(r *catalog.Routine) string {
+	var sb strings.Builder
+
+	// Header: CREATE OR REPLACE FUNCTION/PROCEDURE schema.name(args)
+	if r.IsProcedure {
+		sb.WriteString("CREATE OR REPLACE PROCEDURE ")
+	} else {
+		sb.WriteString("CREATE OR REPLACE FUNCTION ")
+	}
+	// Schema-qualified name (lowercase matches pg_get_functiondef)
+	if r.Schema != "" {
+		sb.WriteString(r.Schema)
+		sb.WriteByte('.')
+	}
+	sb.WriteString(r.Name)
+	sb.WriteByte('(')
+	for i, argType := range r.ArgTypes {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		// Procedure args include mode prefix
+		if r.IsProcedure && r.ArgModes != nil && i < len(r.ArgModes) {
+			switch r.ArgModes[i] {
+			case "i":
+				sb.WriteString("IN ")
+			case "o":
+				sb.WriteString("OUT ")
+			case "b":
+				sb.WriteString("INOUT ")
+			case "v":
+				sb.WriteString("VARIADIC ")
+			}
+		}
+		if i < len(r.ArgNames) && r.ArgNames[i] != "" {
+			sb.WriteString(r.ArgNames[i])
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(canonicalTypeName(argType.Name))
+	}
+	sb.WriteString(")\n")
+
+	// RETURNS clause (functions only) — 1-space indent like PG's deparser
+	if !r.IsProcedure {
+		sb.WriteString(" RETURNS ")
+		sb.WriteString(canonicalTypeName(r.ReturnType.Name))
+		sb.WriteByte('\n')
+	}
+
+	// LANGUAGE clause — 1-space indent
+	sb.WriteString(" LANGUAGE ")
+	sb.WriteString(r.Language)
+	sb.WriteByte('\n')
+
+	// Volatility modifiers (STABLE, IMMUTABLE — VOLATILE is the default, omitted)
+	switch r.Volatile {
+	case "s":
+		sb.WriteString(" STABLE\n")
+	case "i":
+		sb.WriteString(" IMMUTABLE\n")
+	}
+
+	// STRICT
+	if r.Strict {
+		sb.WriteString(" STRICT\n")
+	}
+
+	// LEAKPROOF
+	if r.Leakproof {
+		sb.WriteString(" LEAKPROOF\n")
+	}
+
+	// SECURITY DEFINER
+	if r.SecurityDefiner {
+		sb.WriteString(" SECURITY DEFINER\n")
+	}
+
+	// Body
+	body := r.Body
+	if r.BeginAtomic {
+		// Substitute $N positional parameter references with named parameters
+		// to match PG's decompiled output format.
+		if len(r.ArgNames) > 0 {
+			for i, name := range r.ArgNames {
+				if name != "" {
+					body = strings.ReplaceAll(body, fmt.Sprintf("$%d", i+1), name)
+				}
+			}
+		}
+		// SQL-standard BEGIN ATOMIC ... END body
+		sb.WriteString("BEGIN ATOMIC\n")
+		// Each statement in the body on its own line with leading space
+		for _, stmt := range strings.Split(body, ";") {
+			stmt = strings.TrimSpace(stmt)
+			if stmt == "" {
+				continue
+			}
+			sb.WriteString(" ")
+			sb.WriteString(stmt)
+			sb.WriteString(";\n")
+		}
+		sb.WriteString("END\n")
+	} else if r.IsReturnForm {
+		// RETURN form: stored as "SELECT expr" — output as "RETURN expr"
+		sb.WriteString("RETURN ")
+		sb.WriteString(strings.TrimPrefix(body, "SELECT "))
+		sb.WriteByte('\n')
+	} else if r.IsProcedure {
+		// Procedure body: multi-line $procedure$...$procedure$ format
+		sb.WriteString("AS $procedure$\n")
+		sb.WriteString(strings.TrimLeft(body, "\n"))
+		if body != "" && body[len(body)-1] != '\n' {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString("$procedure$\n")
+	} else {
+		// Function body: inline $function$...$function$ format
+		sb.WriteString("AS $function$")
+		sb.WriteString(body)
+		sb.WriteString("$function$\n")
+	}
+
+	return sb.String()
+}
+
+// canonicalTypeName normalizes short PG type aliases to their canonical names,
+// matching what pg_get_functiondef displays (e.g. "bool" → "boolean").
+// pgTypeofNameFromPlanType converts a planner catalog type name to the string
+// that pg_typeof returns for that type. Mirrors PostgreSQL's format_type_be.
+// M0097-0155.
+func pgTypeofNameFromPlanType(name string) string {
+	switch strings.ToLower(name) {
+	case "int4", "int", "integer", "serial":
+		return "integer"
+	case "int2", "smallint", "smallserial":
+		return "smallint"
+	case "int8", "bigint", "bigserial":
+		return "bigint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision", "float":
+		return "double precision"
+	case "bool", "boolean":
+		return "boolean"
+	case "text":
+		return "text"
+	case "varchar", "character varying":
+		return "character varying"
+	case "char", "character", "bpchar":
+		return "character"
+	case "numeric", "decimal":
+		return "numeric"
+	case "timestamp", "timestamp without time zone":
+		return "timestamp without time zone"
+	case "timestamptz", "timestamp with time zone":
+		return "timestamp with time zone"
+	case "date":
+		return "date"
+	case "time", "time without time zone":
+		return "time without time zone"
+	case "timetz", "time with time zone":
+		return "time with time zone"
+	case "interval":
+		return "interval"
+	case "bytea":
+		return "bytea"
+	case "uuid":
+		return "uuid"
+	case "json":
+		return "json"
+	case "jsonb":
+		return "jsonb"
+	case "oid":
+		return "oid"
+	default:
+		return name
+	}
+}
+
+func canonicalTypeName(name string) string {
+	// Handle array types (e.g. "text[]") by canonicalizing the base type.
+	if strings.HasSuffix(name, "[]") {
+		base := canonicalTypeName(name[:len(name)-2])
+		return base + "[]"
+	}
+	switch strings.ToLower(name) {
+	case "bool":
+		return "boolean"
+	case "int", "int4":
+		return "integer"
+	case "int2":
+		return "smallint"
+	case "int8":
+		return "bigint"
+	case "float4":
+		return "real"
+	case "float8":
+		return "double precision"
+	case "varchar":
+		return "character varying"
+	case "char":
+		return "character"
+	}
+	return name
 }

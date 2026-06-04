@@ -482,6 +482,11 @@ func BuildDefaultRegistry() *Registry {
 		Scope:       ScopeSession | ScopeTransaction,
 	}))
 	r.MustRegister(NewVariable(Variable{
+		Name: "check_function_bodies", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
 		Name: "random_page_cost", Type: TypeReal, BootVal: "4.0",
 		MinVal: 0, MaxVal: 1e9,
 		Context: ContextUserset,

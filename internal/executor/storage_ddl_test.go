@@ -540,3 +540,56 @@ func TestDDLDropPublicationIfExists(t *testing.T) {
 		t.Errorf("DROP PUBLICATION IF EXISTS missing returned %v want nil", err)
 	}
 }
+
+// TestDDLAlterTableDropColumn pins the table-rewrite DROP COLUMN implementation:
+// rows written before ALTER TABLE DROP COLUMN must lose the dropped column slot;
+// subsequent SELECTs return the surviving columns only. M0097-0023.
+func TestDDLAlterTableDropColumn(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE dropcol (key int, drop1 int, keep1 text, keep2 int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "dropcol"})
+
+	// Insert a row before drop.
+	row := Row{NewIntDatum(1), NewIntDatum(99), NewStringDatum("hello"), NewIntDatum(42)}
+	if err := writeHeapRow(ctx, ctx.Catalog.RelFileNode(tbl), tbl.Columns, row); err != nil {
+		t.Fatalf("writeHeapRow: %v", err)
+	}
+
+	// Drop the middle column.
+	if err := runDDL(t, ctx, "ALTER TABLE dropcol DROP COLUMN drop1"); err != nil {
+		t.Fatalf("ALTER TABLE DROP COLUMN: %v", err)
+	}
+	tbl, _ = ctx.Catalog.LookupTable(parser.ObjectName{Name: "dropcol"})
+	if len(tbl.Columns) != 3 {
+		t.Fatalf("columns after DROP COLUMN: got %d want 3: %+v", len(tbl.Columns), tbl.Columns)
+	}
+	if tbl.Columns[0].Name != "key" || tbl.Columns[1].Name != "keep1" || tbl.Columns[2].Name != "keep2" {
+		t.Fatalf("column names wrong: %+v", tbl.Columns)
+	}
+
+	scan := newSeqScanOp(&planner.SeqScan{Table: tbl})
+	if err := scan.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer scan.Close()
+	rows, err := drainScan(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	if rows[0][0].Kind != KindInt || rows[0][0].Int != 1 {
+		t.Fatalf("key=%+v want 1", rows[0][0])
+	}
+	if rows[0][1].Kind != KindString || rows[0][1].StringValue() != "hello" {
+		t.Fatalf("keep1=%+v want 'hello'", rows[0][1])
+	}
+	if rows[0][2].Kind != KindInt || rows[0][2].Int != 42 {
+		t.Fatalf("keep2=%+v want 42", rows[0][2])
+	}
+}

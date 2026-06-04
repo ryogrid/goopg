@@ -209,10 +209,16 @@ func TestPgClassExposesRelNatts(t *testing.T) {
 	}
 
 	rows := pgClass.VirtualRows()
-	if len(rows) != 1 {
-		t.Fatalf("pg_class rows=%d want 1 (the user 't' table)", len(rows))
+	var row []string
+	for _, r := range rows {
+		if len(r) > 1 && r[1] == "t" { // relname is column 1
+			row = r
+			break
+		}
 	}
-	row := rows[0]
+	if row == nil {
+		t.Fatalf("pg_class has no row for user table 't' (rows=%d)", len(rows))
+	}
 	if len(row) != len(pgClass.Columns) {
 		t.Fatalf("pg_class row width=%d want %d (one cell per column)", len(row), len(pgClass.Columns))
 	}
@@ -256,11 +262,18 @@ func TestPgClassExposesRelReplident(t *testing.T) {
 	}
 
 	rows := pgClass.VirtualRows()
-	if len(rows) != 1 {
-		t.Fatalf("pg_class rows=%d want 1", len(rows))
+	var row []string
+	for _, r := range rows {
+		if len(r) > 1 && r[1] == "t" {
+			row = r
+			break
+		}
 	}
-	if rows[0][ri.Ordinal] != "d" {
-		t.Errorf("pg_class.t.relreplident=%q want %q (REPLICA_IDENTITY_DEFAULT)", rows[0][ri.Ordinal], "d")
+	if row == nil {
+		t.Fatalf("pg_class has no row for user table 't' (rows=%d)", len(rows))
+	}
+	if row[ri.Ordinal] != "d" {
+		t.Errorf("pg_class.t.relreplident=%q want %q (REPLICA_IDENTITY_DEFAULT)", row[ri.Ordinal], "d")
 	}
 }
 
@@ -299,11 +312,18 @@ func TestPgClassOidIsNumericOID(t *testing.T) {
 	}
 
 	rows := pgClass.VirtualRows()
-	if len(rows) != 1 {
-		t.Fatalf("pg_class rows=%d want 1", len(rows))
+	var row []string
+	for _, r := range rows {
+		if len(r) > 1 && r[1] == "t" {
+			row = r
+			break
+		}
+	}
+	if row == nil {
+		t.Fatalf("pg_class has no row for user table 't' (rows=%d)", len(rows))
 	}
 	want := strconv.Itoa(int(tbl.OID))
-	if got := rows[0][oidCol.Ordinal]; got != want {
+	if got := row[oidCol.Ordinal]; got != want {
 		t.Errorf("pg_class.t.oid=%q want %q (numeric OID, M0103-0008 rung 16)", got, want)
 	}
 }

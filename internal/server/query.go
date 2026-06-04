@@ -71,11 +71,22 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		return s.handleShow(w, sess, name)
 	case strings.HasPrefix(upper, "SET LOCAL "):
 		return s.handleSet(w, sess, matchable[len("SET LOCAL "):], true)
-	// SET SESSION AUTHORIZATION name — no-op: we don't implement role switching.
+	// SET SESSION AUTHORIZATION name — track non-superuser role for privilege checks.
 	// Must be checked before the generic "SET " case so splitSet doesn't mis-parse
 	// "SESSION AUTHORIZATION name" as parameter "SESSION" with value "AUTHORIZATION name".
 	case strings.HasPrefix(upper, "SET SESSION AUTHORIZATION "),
 		upper == "SET SESSION AUTHORIZATION":
+		if connTx != nil {
+			// Extract the role name after "SET SESSION AUTHORIZATION ".
+			role := strings.TrimSpace(matchable[len("SET SESSION AUTHORIZATION"):])
+			role = strings.Trim(role, `"'`)
+			switch strings.ToUpper(role) {
+			case "", "DEFAULT", "RESET", "POSTGRES":
+				connTx.NonSuperuserRole = ""
+			default:
+				connTx.NonSuperuserRole = role
+			}
+		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
 		}
@@ -95,10 +106,13 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			return err
 		}
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
-	// RESET SESSION AUTHORIZATION — no-op: no role to restore.
+	// RESET SESSION AUTHORIZATION — restore superuser status.
 	// Must be checked before the generic "RESET " case so "SESSION AUTHORIZATION"
 	// is not used verbatim as a GUC parameter name.
 	case upper == "RESET SESSION AUTHORIZATION":
+		if connTx != nil {
+			connTx.NonSuperuserRole = ""
+		}
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
 		}

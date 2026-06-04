@@ -294,7 +294,8 @@ func matchSingleTableConstantPredicate(f Expr) (*ColumnRef, parser.OpCode, Expr,
 		return nil, parser.OpUnknown, nil, false
 	}
 	switch key.(type) {
-	case *IntegerConst, *NumericConst, *StringConst, *TypedStringLit, *ParamRef:
+	case *IntegerConst, *NumericConst, *StringConst, *TypedStringLit, *ParamRef, *OuterColumnRef:
+		// OuterColumnRef: correlated subquery probe key resolved from ctx.OuterRows at runtime.
 	default:
 		return nil, parser.OpUnknown, nil, false
 	}

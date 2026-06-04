@@ -144,3 +144,77 @@ func TestSyntax_DDL_ViaPsql(t *testing.T) {
 		t.Fatalf("psql exit=%d stderr=%q", res.ExitCode, res.Stderr)
 	}
 }
+
+// TestSyntax_DDL_MatViewPgClass tests that CREATE MATERIALIZED VIEW registers
+// the matview in pg_class and ::regclass lookup works.
+func TestSyntax_DDL_MatViewPgClass(t *testing.T) {
+	c := newCluster(t, "syntax_ddl_matview")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	runSQL(t, c, "CREATE TABLE mvtest_t (id int NOT NULL PRIMARY KEY, type text NOT NULL, amt numeric NOT NULL)")
+	runSQL(t, c, "INSERT INTO mvtest_t VALUES (1, 'x', 2), (2, 'x', 3), (3, 'y', 5)")
+	runSQL(t, c, "CREATE MATERIALIZED VIEW mvtest_tm AS SELECT type, sum(amt) AS totamt FROM mvtest_t GROUP BY type WITH NO DATA")
+
+	// pg_class should show the matview with relkind='m' and relispopulated='f'
+	rows := runSQL(t, c, "SELECT relname, relkind, relispopulated FROM pg_class WHERE relname = 'mvtest_tm'")
+	if len(rows) == 0 {
+		t.Fatal("pg_class WHERE relname='mvtest_tm' returned 0 rows")
+	}
+	t.Logf("pg_class relname lookup: %v", rows)
+
+	// Test ::regclass cast
+	rows2 := runSQL(t, c, "SELECT 'mvtest_tm'::regclass")
+	t.Logf("regclass cast result: %v", rows2)
+
+	// Test the problematic query
+	rows3 := runSQL(t, c, "SELECT relispopulated FROM pg_class WHERE oid = 'mvtest_tm'::regclass")
+	if len(rows3) == 0 {
+		t.Fatal("SELECT relispopulated FROM pg_class WHERE oid = 'mvtest_tm'::regclass returned 0 rows!")
+	}
+	t.Logf("relispopulated: %v", rows3)
+}
+
+// TestSyntax_DDL_EnumOrdering tests that enum values are ordered by declaration, not alphabetically.
+func TestSyntax_DDL_EnumOrdering(t *testing.T) {
+	c := newCluster(t, "syntax_ddl_enum")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	runSQL(t, c, "CREATE TYPE rainbow AS ENUM ('red', 'orange', 'yellow', 'green', 'blue', 'purple')")
+	runSQL(t, c, "CREATE TABLE t (col rainbow)")
+	runSQL(t, c, "INSERT INTO t VALUES ('red'), ('green'), ('yellow')")
+
+	// ORDER BY should use declaration order, not alphabetical
+	rows := runSQL(t, c, "SELECT col FROM t ORDER BY col")
+	t.Logf("enum ORDER BY result: %v", rows)
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows))
+	}
+	if rows[0][0] != "red" || rows[1][0] != "yellow" || rows[2][0] != "green" {
+		t.Errorf("wrong enum order: got %v, want [red yellow green]", rows)
+	}
+}
+
+// TestSyntax_DDL_EnumColumnType tests that enum column types are correctly stored.
+func TestSyntax_DDL_EnumColumnType(t *testing.T) {
+	c := newCluster(t, "syntax_ddl_enum2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	runSQL(t, c, "CREATE TYPE rainbow AS ENUM ('red', 'orange', 'yellow', 'green', 'blue', 'purple')")
+	runSQL(t, c, "CREATE TABLE t (col rainbow)")
+	runSQL(t, c, "INSERT INTO t VALUES ('red'), ('green'), ('yellow')")
+
+	// Check pg_class for table existence
+	rows := runSQL(t, c, "SELECT relname FROM pg_class WHERE relname = 't'")
+	t.Logf("pg_class table t: %v", rows)
+
+	// Test basic enum ordering
+	rows2 := runSQL(t, c, "SELECT col FROM t ORDER BY col")
+	t.Logf("ORDER BY col: %v", rows2)
+	if len(rows2) != 3 {
+		t.Fatalf("expected 3 rows got %d", len(rows2))
+	}
+	t.Logf("First row value: %q kind info: len=%d", rows2[0][0], len(rows2[0][0]))
+}

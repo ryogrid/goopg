@@ -259,9 +259,14 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		return stmt, nil
 	// CREATE SERVER / CREATE FOREIGN ... — accept as no-op. M0097-0071.
+	// FOREIGN is a reserved keyword so acceptKeyword is required (not acceptIdentKeyword).
 	case p.acceptIdentKeyword("server"):
 		return p.parseSkipToSemicolon(t.Pos)
-	case p.acceptIdentKeyword("foreign"):
+	case p.acceptKeyword(KwForeign):
+		return p.parseSkipToSemicolon(t.Pos)
+	// CREATE STATISTICS name ON expr, ... FROM table — accept as no-op.
+	// Extended statistics are not implemented in goopg v0.
+	case p.acceptIdentKeyword("statistics"):
 		return p.parseSkipToSemicolon(t.Pos)
 	// CREATE RULE name AS ON event TO table [WHERE cond] DO ... — accept as no-op.
 	// Rules are not implemented in goopg v0; CREATE RULE succeeds silently so that
@@ -578,9 +583,15 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 		ns.ObjName = ObjectName{Name: tok.Value}
 		p.advance()
 	}
-	// Scan for "TO <tablename>" to extract the table this rule applies to.
-	// Skip tokens (tracking depth) until we reach the top-level semicolon or EOF.
+	// Scan for "TO <tablename>" and detect the rule kind (DO ALSO, DO INSTEAD NOTHING,
+	// multi-statement, conditional, or utility action). M0097-0140.
 	depth := 0
+	seenDo := false      // passed DO keyword at depth 0
+	seenInstead := false // passed INSTEAD keyword at depth 0 after DO
+	seenAlso := false    // DO ALSO detected
+	hasWhere := false    // WHERE clause present before DO
+	gotKind := false     // rule kind already determined
+
 	for {
 		tok := p.cur()
 		if tok.Kind == TokenEOF {
@@ -592,6 +603,10 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 		if tok.Kind == TokenSymbol {
 			switch tok.Value {
 			case "(", "[":
+				if depth == 0 && seenInstead && !gotKind {
+					ns.RuleKind = "multi-statement DO INSTEAD"
+					gotKind = true
+				}
 				depth++
 				p.advance()
 				continue
@@ -601,12 +616,39 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 				}
 			}
 		}
-		// At top-level, look for "TO <tablename>" to capture the table.
-		if depth == 0 && tok.Kind == TokenKeyword && Keyword(tok.Value) == KwTo && ns.TableName.Name == "" {
-			p.advance()
-			tname, _ := p.parseObjectName()
-			ns.TableName = tname
-			continue
+		if depth == 0 {
+			kw := strings.ToUpper(tok.Value)
+			switch {
+			case kw == "TO" && ns.TableName.Name == "" && !seenDo:
+				p.advance()
+				tname, _ := p.parseObjectName()
+				ns.TableName = tname
+				continue
+			case kw == "WHERE" && !seenDo:
+				hasWhere = true
+			case kw == "DO" && !seenDo:
+				seenDo = true
+			case seenDo && !seenInstead && !seenAlso && kw == "INSTEAD":
+				seenInstead = true
+			case seenDo && !seenInstead && !seenAlso && kw == "ALSO":
+				ns.RuleKind = "DO ALSO"
+				seenAlso = true
+				gotKind = true
+			case seenInstead && !gotKind && kw == "NOTHING":
+				ns.RuleKind = "DO INSTEAD NOTHING"
+				gotKind = true
+			case seenInstead && !gotKind && kw == "NOTIFY":
+				ns.RuleKind = "utility"
+				gotKind = true
+			case seenInstead && !gotKind:
+				// First meaningful token after INSTEAD: not NOTHING, not (, not NOTIFY.
+				if hasWhere {
+					ns.RuleKind = "conditional DO INSTEAD"
+				} else {
+					ns.RuleKind = "DO INSTEAD"
+				}
+				gotKind = true
+			}
 		}
 		p.advance()
 	}
@@ -813,6 +855,18 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 		return nil, &SyntaxError{Pos: pos, Message: "view body did not produce SELECT"}
 	}
 	stmt.Query = sel
+	// Optional trailing WITH [CASCADED|LOCAL] CHECK OPTION clause.
+	// goopg accepts and ignores the clause (check enforcement not yet implemented).
+	if p.acceptKeyword(KwWith) {
+		_ = p.acceptIdentKeyword("cascaded") || p.acceptKeyword(KwLocal) || p.acceptIdentKeyword("local")
+		if p.cur().Kind != TokenKeyword || p.cur().Keyword != KwCheck {
+			return nil, p.errAtCur("expected CHECK after WITH in view definition")
+		}
+		p.advance()
+		if !p.acceptIdentKeyword("option") {
+			return nil, p.errAtCur("expected OPTION after WITH [CASCADED|LOCAL] CHECK")
+		}
+	}
 	return stmt, nil
 }
 
@@ -891,6 +945,22 @@ func (p *parser) parseCreateMatViewTail(pos int) (Stmt, error) {
 		return nil, err
 	}
 	stmt.Name = name
+	// Optional column aliases: name (col1, col2, ...) AS query
+	if p.acceptSymbol("(") {
+		for {
+			alias, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.ColumnAliases = append(stmt.ColumnAliases, alias.Value)
+			if p.acceptSymbol(")") {
+				break
+			}
+			if !p.acceptSymbol(",") {
+				return nil, &SyntaxError{Pos: p.cur().Pos, Message: "expected ',' or ')' in column alias list"}
+			}
+		}
+	}
 	// Skip optional USING index_method clause.
 	if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
 		_, _ = p.parseIdent()
@@ -923,9 +993,9 @@ func (p *parser) parseCreateMatViewTail(pos int) (Stmt, error) {
 		return nil, &SyntaxError{Pos: pos, Message: "materialized view body did not produce SELECT"}
 	}
 	stmt.Query = sel
-	// Optional WITH [NO] DATA clause.
+	// Optional WITH [NO] DATA clause. "NO" is a plain identifier, not a keyword.
 	if p.acceptKeyword(KwWith) {
-		if p.acceptKeyword(KwNot) {
+		if p.acceptIdentKeyword("no") {
 			_ = p.acceptIdentKeyword("data")
 			stmt.WithNoData = true
 		} else {
@@ -947,9 +1017,9 @@ func (p *parser) parseRefreshMatView(pos int) (Stmt, error) {
 		return nil, err
 	}
 	stmt.Name = name
-	// Optional WITH [NO] DATA.
+	// Optional WITH [NO] DATA. "NO" is a plain identifier, not a keyword.
 	if p.acceptKeyword(KwWith) {
-		if p.acceptKeyword(KwNot) {
+		if p.acceptIdentKeyword("no") {
 			_ = p.acceptIdentKeyword("data")
 			stmt.WithNoData = true
 		} else {
@@ -1049,20 +1119,37 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			return nil, err
 		}
 		poc := &PartitionOfClause{pos: pos, Parent: parentName}
-		// Optional column definition list (for adding columns to partition)
+		// Optional column definition list: `(col_name UNIQUE [, ...])`.
+		// We extract UNIQUE constraints; other column attributes are ignored.
+		// M0097-0028.
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 			p.advance()
 			if !p.acceptSymbol(")") {
-				// skip column defs inside partition OF for now
+				// Parse each column entry looking for UNIQUE.
+				// Grammar: col_name [type] [constraint ...] [, ...]
+				// We track depth so nested parens (e.g. DEFAULT values) are skipped.
 				depth := 1
+				var curColName string
 				for depth > 0 && p.cur().Kind != TokenEOF {
-					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+					t := p.cur()
+					if t.Kind == TokenSymbol && t.Value == "(" {
 						depth++
-					}
-					if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+						p.advance()
+					} else if t.Kind == TokenSymbol && t.Value == ")" {
 						depth--
-					}
-					if depth > 0 {
+						if depth > 0 {
+							p.advance()
+						}
+					} else if depth == 1 && t.Kind == TokenSymbol && t.Value == "," {
+						curColName = ""
+						p.advance()
+					} else if depth == 1 && curColName == "" && (t.Kind == TokenIdent || t.Kind == TokenKeyword) {
+						curColName = t.Value
+						p.advance()
+					} else if depth == 1 && t.Kind == TokenKeyword && t.Keyword == KwUnique && curColName != "" {
+						poc.UniqueColumns = append(poc.UniqueColumns, curColName)
+						p.advance()
+					} else {
 						p.advance()
 					}
 				}
@@ -1174,27 +1261,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				if !p.acceptSymbol("(") {
 					return nil, p.errAtCur("expected '(' after partition method")
 				}
-				var keyCols, opClasses []string
-				for {
-					col, err := p.parseIdent()
-					if err != nil {
-						return nil, err
-					}
-					keyCols = append(keyCols, identText(col))
-					opClass := ""
-					if p.cur().Kind == TokenIdent {
-						opClass = p.cur().Value
-						p.advance()
-					}
-					opClasses = append(opClasses, opClass)
-					if !p.acceptSymbol(",") {
-						break
-					}
+				keyCols, keyExprs, opClasses, err2 := p.parsePartitionKeyCols()
+				if err2 != nil {
+					return nil, err2
 				}
 				if !p.acceptSymbol(")") {
 					return nil, p.errAtCur("expected ')'")
 				}
-				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, OpClasses: opClasses}
+				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses}
 			}
 		}
 		// ON COMMIT clause may follow FOR VALUES ... in partition tables.
@@ -1255,11 +1329,18 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				_ = p.acceptIdentKeyword("immediate")
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
-			// Table-level UNIQUE (cols) — accept as no-op for now.
+			// Table-level UNIQUE (cols) — create btree index. M0097-0028.
 			p.advance()
 			if p.acceptSymbol("(") {
+				var cols []string
 				for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+						cols = append(cols, p.cur().Value)
+					}
 					p.advance()
+				}
+				if len(cols) > 0 {
+					stmt.TableUniques = append(stmt.TableUniques, cols)
 				}
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
@@ -1316,10 +1397,18 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					_ = p.acceptIdentKeyword("immediate")
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
+				// CONSTRAINT name UNIQUE (cols) — store as table-level unique. M0097-0028.
 				p.advance()
 				if p.acceptSymbol("(") {
+					var cols []string
 					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+						if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+							cols = append(cols, p.cur().Value)
+						}
 						p.advance()
+					}
+					if len(cols) > 0 {
+						stmt.TableUniques = append(stmt.TableUniques, cols)
 					}
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
@@ -1366,21 +1455,43 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				return nil, err
 			}
 			stmt.LikeTables = append(stmt.LikeTables, srcName)
-			stmt.BodyOrder = append(stmt.BodyOrder, "@@LIKE:"+srcName.String())
+			likeKey := "@@LIKE:" + srcName.String()
 			// Consume optional INCLUDING/EXCLUDING clauses.
-			for p.acceptIdentKeyword("including") || p.acceptIdentKeyword("excluding") {
-				// Option keyword: DEFAULTS, CONSTRAINTS, INDEXES, IDENTITY,
-				// COMMENTS, STATISTICS, STORAGE, ALL.
-				_ = p.acceptIdentKeyword("defaults") ||
-					p.acceptIdentKeyword("constraints") ||
-					p.acceptIdentKeyword("indexes") ||
-					p.acceptIdentKeyword("identity") ||
-					p.acceptIdentKeyword("comments") ||
-					p.acceptIdentKeyword("statistics") ||
-					p.acceptIdentKeyword("storage") ||
-					p.acceptKeyword(KwAll) ||
-					p.acceptIdentKeyword("generated")
+			// Track whether IDENTITY or GENERATED or ALL is included to copy identity/generated columns.
+			for {
+				isIncluding := p.acceptIdentKeyword("including")
+				isExcluding := !isIncluding && p.acceptIdentKeyword("excluding")
+				if !isIncluding && !isExcluding {
+					break
+				}
+				switch {
+				case p.acceptIdentKeyword("defaults"):
+					if isIncluding {
+						likeKey += ":+defaults"
+					}
+				case p.acceptIdentKeyword("constraints"):
+					if isIncluding {
+						likeKey += ":+constraints"
+					}
+				case p.acceptIdentKeyword("indexes"):
+				case p.acceptIdentKeyword("identity"):
+					if isIncluding {
+						likeKey += ":+identity"
+					}
+				case p.acceptIdentKeyword("comments"):
+				case p.acceptIdentKeyword("statistics"):
+				case p.acceptIdentKeyword("storage"):
+				case p.acceptIdentKeyword("generated"):
+					if isIncluding {
+						likeKey += ":+generated"
+					}
+				case p.acceptKeyword(KwAll):
+					if isIncluding {
+						likeKey += ":+defaults:+identity:+generated:+constraints"
+					}
+				}
 			}
+			stmt.BodyOrder = append(stmt.BodyOrder, likeKey)
 		} else {
 			col, err := p.parseColumnDef()
 			if err != nil {
@@ -1419,29 +1530,15 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		if !p.acceptSymbol("(") {
 			return nil, p.errAtCur("expected '(' after partition method")
 		}
-		// Parse column names with optional operator class names. M0097-0015/M0097-0027.
-		var keyCols, opClasses []string
-		for {
-			col, err := p.parseIdent()
-			if err != nil {
-				return nil, err
-			}
-			keyCols = append(keyCols, identText(col))
-			// Optional operator class name (e.g. part_test_int4_ops). M0097-0027.
-			opClass := ""
-			if p.cur().Kind == TokenIdent {
-				opClass = p.cur().Value
-				p.advance()
-			}
-			opClasses = append(opClasses, opClass)
-			if !p.acceptSymbol(",") {
-				break
-			}
+		// Parse column names (or expressions) with optional operator class names. M0097-0015/M0097-0027/M0097-0023.
+		keyCols, keyExprs, opClasses, err2 := p.parsePartitionKeyCols()
+		if err2 != nil {
+			return nil, err2
 		}
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
 		}
-		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, KeyCols: keyCols, OpClasses: opClasses}
+		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses}
 	}
 	if p.acceptKeyword(KwWith) {
 		opts, err := p.parseWithOptions()
@@ -1529,6 +1626,49 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 	}
 }
 
+// parsePartitionKeyCols parses the column-list (and possibly expression-list)
+// inside PARTITION BY (key1, key2, ...). Each key may be either a plain column
+// name or a parenthesised expression such as (abs(b)) or ((a+b)/2). M0097-0023.
+func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opClasses []string, err error) {
+	for {
+		var colName string
+		var expr Expr
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			// Expression key: consume the outer '(' and parse a full expression.
+			p.advance()
+			expr, err = p.parseExpr()
+			if err != nil {
+				return
+			}
+			if !p.acceptSymbol(")") {
+				err = p.errAtCur("expected ')' to close partition key expression")
+				return
+			}
+		} else {
+			// Plain column name.
+			var col Token
+			col, err = p.parseIdent()
+			if err != nil {
+				return
+			}
+			colName = identText(col)
+		}
+		keyCols = append(keyCols, colName)
+		keyExprs = append(keyExprs, expr)
+		// Optional operator class name (e.g. part_test_int4_ops). M0097-0027.
+		opClass := ""
+		if p.cur().Kind == TokenIdent {
+			opClass = p.cur().Value
+			p.advance()
+		}
+		opClasses = append(opClasses, opClass)
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return
+}
+
 // parsePartitionBoundValues parses a comma-separated list of partition bound
 // values, which may include MINVALUE/MAXVALUE keywords.
 func (p *parser) parsePartitionBoundValues() ([]Expr, error) {
@@ -1584,13 +1724,40 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		// COLLATE collation_name — ignore collation; goopg v0 doesn't track collations. M0097-0071.
 		case p.acceptIdentKeyword("collate"):
 			_, _ = p.parseIdent() // consume collation name (may be quoted)
-		// GENERATED ALWAYS AS (expr) STORED  (M0096-0008)
+		// GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY or GENERATED ALWAYS AS (expr) STORED (M0096-0008)
 		case p.acceptIdentKeyword("generated"):
-			if !p.acceptIdentKeyword("always") {
-				return ColumnDef{}, p.errAtCur("expected ALWAYS after GENERATED")
+			isAlways := p.acceptIdentKeyword("always")
+			isByDefault := !isAlways && (p.acceptKeyword(KwBy) && p.acceptKeyword(KwDefault))
+			if !isAlways && !isByDefault {
+				return ColumnDef{}, p.errAtCur("expected ALWAYS or BY DEFAULT after GENERATED")
 			}
 			if _, err := p.expectKeyword(KwAs); err != nil {
 				return ColumnDef{}, err
+			}
+			// GENERATED ALWAYS AS IDENTITY [(sequence_options)] — identity column.
+			if p.acceptIdentKeyword("identity") {
+				col.IdentityColumn = true
+				col.IdentityAlways = isAlways
+				// Skip optional sequence options: (START WITH n INCREMENT BY m ...)
+				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+					depth := 1
+					p.advance()
+					for depth > 0 && p.cur().Kind != TokenEOF {
+						if p.cur().Kind == TokenSymbol {
+							if p.cur().Value == "(" {
+								depth++
+							} else if p.cur().Value == ")" {
+								depth--
+								if depth == 0 {
+									p.advance()
+									break
+								}
+							}
+						}
+						p.advance()
+					}
+				}
+				continue
 			}
 			if !p.acceptSymbol("(") {
 				return ColumnDef{}, p.errAtCur("expected '(' after GENERATED ALWAYS AS")
@@ -1687,7 +1854,8 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			}
 		// UNIQUE constraint on column
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
-			p.advance() // accepted as no-op; index will be created explicitly
+			p.advance()
+			col.Unique = true
 		// CHECK (expr) inline column constraint. M0097-0014.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 			p.advance()
@@ -2040,12 +2208,13 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 			_ = p.acceptIdentKeyword("distinct")
 		}
 	}
-	// Optional WHERE predicate (partial index) — parse and discard.
+	// Optional WHERE predicate (partial index) — parse and record.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhere {
 		p.advance()
 		if _, err := p.parseExpr(); err != nil {
 			return nil, err
 		}
+		stmt.HasPredicate = true
 	}
 	return stmt, nil
 }
@@ -2609,6 +2778,9 @@ func (p *parser) parseCheckExpr() (string, error) {
 				return strings.Join(parts, " "), nil
 			}
 			parts = append(parts, ")")
+		} else if t.Kind == TokenStringLit {
+			// Re-add quotes for string literals (token stores value without quotes).
+			parts = append(parts, "'"+strings.ReplaceAll(t.Value, "'", "''")+"'")
 		} else {
 			parts = append(parts, t.Value)
 		}
@@ -3064,15 +3236,152 @@ func (p *parser) parseAlter() (Stmt, error) {
 		return &AlterTableStmt{pos: t.Pos}, nil
 	}
 
-	// ALTER VIEW / SCHEMA / FUNCTION / PROCEDURE /
-	// COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / PUBLICATION /
-	// SUBSCRIPTION / SYSTEM — compatibility stubs. Consume until end of
-	// statement and return an empty AlterTableStmt (executor no-ops it).
+	// ALTER FUNCTION / PROCEDURE / ROUTINE — may update volatile/security/leakproof/strict attrs.
+	funcConsumed := p.acceptKeyword(KwFunction)
+	procConsumed := !funcConsumed && p.acceptKeyword(KwProcedure)
+	routineConsumed := !funcConsumed && !procConsumed && p.acceptIdentKeyword("routine")
+	if funcConsumed || procConsumed || routineConsumed {
+		isProcedure := procConsumed
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt := &AlterFunctionStmt{pos: t.Pos, Name: name, IsProcedure: isProcedure, IsRoutine: routineConsumed}
+		// Optional arg list
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			args, argErr := p.parseFunctionArgList()
+			if argErr == nil {
+				stmt.Args = args
+			}
+		}
+		// Consume one or more function attributes
+		for p.isFunctionAttribute() || (p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "owner")) ||
+			(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "rename")) ||
+			(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) {
+			// OWNER TO role — no-op (no role system in goopg v0)
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "owner") {
+				p.advance() // OWNER
+				p.acceptKeyword(KwTo)
+				p.advance() // role name (ident or CURRENT_USER etc.)
+				continue
+			}
+			// RENAME TO new_name — store new name in stmt
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "rename") {
+				p.advance() // RENAME
+				p.acceptKeyword(KwTo)
+				newName, _ := p.parseIdent()
+				stmt.RenameTo = identText(newName)
+				continue
+			}
+			// SET SCHEMA schema — no-op
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set") {
+				p.advance() // SET
+				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "schema") {
+					p.advance() // SCHEMA
+					p.advance() // schema name
+				}
+				continue
+			}
+			cur := p.cur()
+			if cur.Kind == TokenIdent {
+				switch strings.ToLower(cur.Value) {
+				case "volatile":
+					v := "v"
+					stmt.Volatile = &v
+				case "stable":
+					v := "s"
+					stmt.Volatile = &v
+				case "immutable":
+					v := "i"
+					stmt.Volatile = &v
+				case "security":
+					p.advance()
+					if p.acceptIdentKeyword("definer") {
+						t := true
+						stmt.SecurityDefiner = &t
+					} else {
+						p.acceptIdentKeyword("invoker")
+						f := false
+						stmt.SecurityDefiner = &f
+					}
+					continue
+				case "leakproof":
+					t := true
+					stmt.Leakproof = &t
+				case "strict":
+					t := true
+					stmt.Strict = &t
+				case "called":
+					p.advance()
+					p.acceptKeyword(KwOn)
+					p.acceptKeyword(KwNull)
+					p.acceptIdentKeyword("input")
+					f := false
+					stmt.Strict = &f
+					continue
+				case "returns":
+					p.advance()
+					p.acceptKeyword(KwNull)
+					p.acceptKeyword(KwOn)
+					p.acceptKeyword(KwNull)
+					p.acceptIdentKeyword("input")
+					t := true
+					stmt.Strict = &t
+					continue
+				}
+			} else if cur.Kind == TokenKeyword && cur.Keyword == KwNot {
+				p.advance()
+				p.acceptIdentKeyword("leakproof")
+				f := false
+				stmt.Leakproof = &f
+				continue
+			} else if cur.Kind == TokenKeyword && cur.Keyword == KwReturns {
+				p.advance()
+				p.acceptKeyword(KwNull)
+				p.acceptKeyword(KwOn)
+				p.acceptKeyword(KwNull)
+				p.acceptIdentKeyword("input")
+				t := true
+				stmt.Strict = &t
+				continue
+			}
+			p.consumeFunctionAttribute()
+		}
+		return stmt, nil
+	}
+
+	// ALTER MATERIALIZED VIEW name SET SCHEMA newschema (M0097-0025).
+	if p.acceptIdentKeyword("materialized") {
+		// VIEW is a KwCatUnreserved keyword — accept either way.
+		_ = p.acceptKeyword(KwView) || p.acceptIdentKeyword("view")
+		// Parse the matview name.
+		mvName, _ := p.parseObjectName()
+		// Check for SET SCHEMA action (SET is KwSet, SCHEMA is an identifier).
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet {
+			p.advance() // SET
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "schema") {
+				p.advance() // SCHEMA
+				schemaNameTok := p.cur()
+				p.advance()
+				schemaName := identText(schemaNameTok)
+				return &AlterTableStmt{pos: t.Pos, Name: mvName, SetSchema: schemaName}, nil
+			}
+		}
+		// Other ALTER MATERIALIZED VIEW actions — consume until ';'.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return &AlterTableStmt{pos: t.Pos}, nil
+	}
+	// ALTER VIEW / SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / PUBLICATION /
+	// SUBSCRIPTION / SYSTEM — compatibility stubs. Consume until end of statement.
 	for _, objIdent := range []string{
-		"schema", "view", "function", "procedure",
+		"schema", "view",
 		"collation", "domain", "extension", "language",
 		"operator", "publication", "subscription", "system",
-		"materialized",
 	} {
 		if p.acceptIdentKeyword(objIdent) {
 			// consume until ';' or EOF
@@ -3170,12 +3479,14 @@ func (p *parser) parseAlter() (Stmt, error) {
 		})
 		return stmt, nil
 	}
-	// SET SCHEMA schema_name — parse as a no-op.
+	// SET SCHEMA schema_name — update table/view schema. M0097-0025.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet {
 		if p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema") {
 			p.advance() // SET
-			p.advance() // schema
-			_, _ = p.parseIdent()
+			p.advance() // SCHEMA
+			schemaNameTok := p.cur()
+			p.advance()
+			stmt.SetSchema = identText(schemaNameTok)
 			return stmt, nil
 		}
 	}
@@ -3191,45 +3502,19 @@ func (p *parser) parseAlter() (Stmt, error) {
 		return stmt, nil
 	}
 	// DROP CONSTRAINT name [RESTRICT|CASCADE] — real action (M0097-0036).
-	// DROP COLUMN, DROP DEFAULT, etc. — no-op (consume rest).
-	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDrop {
-		p.advance() // consume DROP
-		if p.acceptKeyword(KwConstraint) {
-			nameTok, err := p.parseIdent()
-			if err != nil {
-				return nil, err
-			}
-			restrict := true // RESTRICT is the PostgreSQL default
-			if p.acceptKeyword(KwCascade) {
-				restrict = false
-			} else {
-				_ = p.acceptKeyword(KwRestrict)
-			}
-			act := AlterTableAction{
-				pos:            nameTok.Pos,
-				Kind:           AlterTableDropConstraint,
-				ConstraintName: identText(nameTok),
-				Restrict:       restrict,
-			}
-			stmt.Actions = append(stmt.Actions, act)
-			return stmt, nil
-		}
-		// DROP COLUMN, DROP DEFAULT, etc. — consume rest as no-op.
-		for p.cur().Kind != TokenEOF {
-			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
-				break
-			}
-			p.advance()
-		}
-		return stmt, nil
-	}
-	// ALTER COLUMN — handle SET (options) specially; consume other forms as no-op.
+	// DROP sub-commands (DROP COLUMN, DROP CONSTRAINT) are handled by
+	// parseAlterTableAction() to support comma-separated multi-action ALTER TABLE
+	// statements (e.g. "ALTER TABLE t DROP COLUMN a, DROP COLUMN b"). Fall through
+	// to the multi-action loop below. M0097-0028.
+	// ALTER COLUMN — handle SET (options) and TYPE specially; consume other forms as no-op.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter {
 		p.advance() // consume ALTER
 		// Skip COLUMN keyword if present.
 		_ = p.acceptKeyword(KwColumn)
 		// Read the column name.
-		if p.cur().Kind == TokenIdent {
+		colName := ""
+		if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent {
+			colName = p.cur().Value
 			p.advance()
 		}
 		// Check for SET (options) pattern.
@@ -3252,6 +3537,21 @@ func (p *parser) parseAlter() (Stmt, error) {
 				})
 				return stmt, nil
 			}
+		}
+		// Check for TYPE newtype pattern.
+		// "type" is not in goopg's keyword map — arrives as TokenIdent.
+		if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "type") {
+			p.advance() // consume TYPE
+			newType, err := p.parseColumnType()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				Kind:       AlterTableAlterColumnType,
+				ColumnName: colName,
+				NewType:    newType,
+			})
+			return stmt, nil
 		}
 		// Other ALTER COLUMN forms: consume rest as no-op.
 		for p.cur().Kind != TokenEOF {
@@ -3399,8 +3699,45 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableNoInherit, InheritParent: parentName}, nil
 	}
+	// DROP COLUMN name / DROP CONSTRAINT name in the multi-action loop.
+	// Both forms share this path so comma-separated "DROP COLUMN a, DROP COLUMN b"
+	// work correctly. M0097-0028.
+	if p.acceptKeyword(KwDrop) {
+		if p.acceptKeyword(KwConstraint) {
+			nameTok, err := p.parseIdent()
+			if err != nil {
+				return AlterTableAction{}, err
+			}
+			restrict := true
+			if p.acceptKeyword(KwCascade) {
+				restrict = false
+			} else {
+				_ = p.acceptKeyword(KwRestrict)
+			}
+			return AlterTableAction{
+				pos:            nameTok.Pos,
+				Kind:           AlterTableDropConstraint,
+				ConstraintName: identText(nameTok),
+				Restrict:       restrict,
+			}, nil
+		}
+		// DROP COLUMN [IF EXISTS] col_name [RESTRICT|CASCADE]
+		_ = p.acceptKeyword(KwColumn)
+		_ = p.acceptIdentKeyword("if") && p.acceptIdentKeyword("exists")
+		colTok := p.cur()
+		if colTok.Kind == TokenIdent || colTok.Kind == TokenQuotedIdent {
+			p.advance()
+			_ = p.acceptKeyword(KwCascade) || p.acceptKeyword(KwRestrict)
+			return AlterTableAction{
+				pos:        colTok.Pos,
+				Kind:       AlterTableDropColumn,
+				ColumnName: identText(colTok),
+			}, nil
+		}
+		return AlterTableAction{}, p.errAtCur("expected column or constraint name after DROP")
+	}
 	if !p.acceptKeyword(KwAdd) {
-		return AlterTableAction{}, p.errAtCur("expected ADD")
+		return AlterTableAction{}, p.errAtCur("expected ADD or DROP")
 	}
 	pos := p.cur().Pos
 	act := AlterTableAction{pos: pos}
@@ -3485,10 +3822,34 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act.RefColumns = refCols
 		act.Deferrable = deferrable
 		return act, nil
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
+		// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
+		p.advance() // consume CHECK
+		expr, err := p.parseCheckExpr()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		// Consume optional NOT VALID trailer.
+		_ = p.acceptKeyword(KwNot) && p.acceptIdentKeyword("valid")
+		act.Kind = AlterTableAddCheck
+		act.CheckExpr = expr
+		return act, nil
 	default:
 		// ADD [COLUMN] column_def — bare ident or COLUMN keyword.
 		if act.ConstraintName != "" {
-			return AlterTableAction{}, p.errAtCur("expected PRIMARY KEY or FOREIGN KEY after CONSTRAINT name")
+			// Unknown constraint type with something after it (e.g. UNIQUE, EXCLUDE).
+			// Accept as no-op if there's actual content; error if at EOF/nothing.
+			if p.cur().Kind == TokenEOF || (p.cur().Kind == TokenSymbol && p.cur().Value == ";") {
+				return AlterTableAction{}, p.errAtCur("expected PRIMARY KEY or FOREIGN KEY after CONSTRAINT name")
+			}
+			// Skip to semicolon or EOF.
+			for p.cur().Kind != TokenSymbol || p.cur().Value != ";" {
+				if p.cur().Kind == TokenEOF {
+					break
+				}
+				p.advance()
+			}
+			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
 		}
 		_ = p.acceptKeyword(KwColumn)
 		col, err := p.parseColumnDef()
@@ -3638,7 +3999,45 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// Any other ALTER TYPE variant (RENAME, OWNER TO, etc.) — consume as stub.
+	// RENAME VALUE 'old' TO 'new' (enum label rename). M0097-0022.
+	if p.acceptIdentKeyword("rename") {
+		if p.acceptIdentKeyword("value") {
+			// Consume old label string.
+			if p.cur().Kind != TokenStringLit {
+				return nil, p.errAtCur("expected string literal for old enum value")
+			}
+			stmt.RenameOldValue = p.cur().Value
+			p.advance()
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			// Consume new label string.
+			if p.cur().Kind != TokenStringLit {
+				return nil, p.errAtCur("expected string literal for new enum value")
+			}
+			stmt.RenameNewValue = p.cur().Value
+			p.advance()
+			return stmt, nil
+		}
+		// RENAME TO new_name — parse the new type name. M0097-enum-rename.
+		if p.acceptKeyword(KwTo) {
+			newName, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			stmt.RenameTo = newName.Name
+			return stmt, nil
+		}
+		// Other RENAME variants (e.g. RENAME ATTRIBUTE) — consume as stub.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return stmt, nil
+	}
+	// Any other ALTER TYPE variant (OWNER TO, etc.) — consume as stub.
 	for p.cur().Kind != TokenEOF {
 		if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 			break
@@ -3769,14 +4168,22 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 				// Fall through to CHECK handling below.
 				if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
 					p.advance()
-					if err := p.skipParenExpr(); err != nil {
+					if vals := p.tryParseCheckInValues(); vals != nil {
+						if stmt.CheckInValues == nil {
+							stmt.CheckInValues = vals
+						}
+					} else if err := p.skipParenExpr(); err != nil {
 						return nil, err
 					}
 				}
 				continue
 			case KwCheck:
 				p.advance()
-				if err := p.skipParenExpr(); err != nil {
+				if vals := p.tryParseCheckInValues(); vals != nil {
+					if stmt.CheckInValues == nil {
+						stmt.CheckInValues = vals
+					}
+				} else if err := p.skipParenExpr(); err != nil {
 					return nil, err
 				}
 				continue
@@ -3814,6 +4221,59 @@ func (p *parser) skipParenExpr() error {
 		p.advance()
 	}
 	return nil
+}
+
+// tryParseCheckInValues tries to parse a CHECK (VALUE IN ('a','b','c')) pattern.
+// Returns the list of allowed string values if the pattern matches, or nil if
+// the expression does not follow the VALUE IN (...) form (caller should fall back
+// to skipParenExpr). M0097-domain-check.
+func (p *parser) tryParseCheckInValues() []string {
+	// Save position so we can revert if the pattern doesn't match.
+	start := p.idx
+	if !p.acceptSymbol("(") {
+		return nil
+	}
+	// Expect the keyword VALUE (as identifier).
+	if p.cur().Kind != TokenIdent || !strings.EqualFold(p.cur().Value, "value") {
+		p.idx = start
+		return nil
+	}
+	p.advance() // consume VALUE
+	// Expect IN keyword.
+	if !p.acceptKeyword(KwIn) {
+		p.idx = start
+		return nil
+	}
+	// Expect opening paren for the IN list.
+	if !p.acceptSymbol("(") {
+		p.idx = start
+		return nil
+	}
+	// Parse string literals.
+	var vals []string
+	for {
+		if p.cur().Kind != TokenStringLit {
+			p.idx = start
+			return nil
+		}
+		vals = append(vals, p.cur().Value)
+		p.advance()
+		if p.acceptSymbol(",") {
+			continue
+		}
+		break
+	}
+	// Expect closing paren for IN list.
+	if !p.acceptSymbol(")") {
+		p.idx = start
+		return nil
+	}
+	// Expect closing paren for CHECK(...).
+	if !p.acceptSymbol(")") {
+		p.idx = start
+		return nil
+	}
+	return vals
 }
 
 // parseDropDomain picks up after DROP DOMAIN has been detected.

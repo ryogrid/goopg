@@ -633,9 +633,46 @@ func (p *parser) parseGroupByElems() ([]Expr, error) {
 			p.skipBalancedParens()
 			out = append(out, &IntegerConst{pos: sentPos, Value: 0})
 		} else if p.acceptIdentKeyword("rollup") || p.acceptIdentKeyword("cube") {
-			sentPos := p.cur().Pos
-			p.skipBalancedParens()
-			out = append(out, &IntegerConst{pos: sentPos, Value: 0})
+			// Parse ROLLUP(col1, col2, ...) / CUBE(col1, col2, ...) as if it were
+			// plain GROUP BY col1, col2, ... (ignoring the grand-total row semantics).
+			// The empty grouping set () from ROLLUP/CUBE is not generated; queries
+			// still aggregate correctly over the non-NULL grouping columns. M0097-0023.
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				p.advance() // consume '('
+				for p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+						p.advance() // consume ')'
+						break
+					}
+					// Each element in ROLLUP may itself be a list in parens like (a,b).
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+						// Parenthesised group: parse inner exprs.
+						p.advance() // consume '('
+						for p.cur().Kind != TokenEOF && !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
+							expr, err := p.parseExpr()
+							if err != nil {
+								break
+							}
+							out = append(out, expr)
+							if !p.acceptSymbol(",") {
+								break
+							}
+						}
+						if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+							p.advance() // consume ')'
+						}
+					} else {
+						expr, err := p.parseExpr()
+						if err != nil {
+							break
+						}
+						out = append(out, expr)
+					}
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+			}
 		} else {
 			expr, err := p.parseExpr()
 			if err != nil {
@@ -976,7 +1013,7 @@ func (p *parser) tryParseParenJoin() (RangeVar, bool, error) {
 }
 
 func (p *parser) parseFromItem() (FromExpr, []RangeVar, error) {
-	base, err := p.parseRangeVar()
+	base, err := p.parseRangeVar(true)
 	if err != nil {
 		return FromExpr{}, nil, err
 	}
@@ -1046,7 +1083,7 @@ func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
 	// vacuumdb's use case where the lateral subquery doesn't depend on outer
 	// column values at goopg's execution level).
 	_ = p.acceptKeyword(KwLateral)
-	right, err := p.parseRangeVar()
+	right, err := p.parseRangeVar(true)
 	if err != nil {
 		return JoinExpr{}, false, err
 	}
@@ -1085,7 +1122,8 @@ func (p *parser) parseJoinClause() (JoinExpr, bool, error) {
 	return JoinExpr{}, false, p.errAtCur("expected ON or USING in JOIN")
 }
 
-func (p *parser) parseRangeVar() (RangeVar, error) {
+func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
+	fromClause := len(allowUserSRF) > 0 && allowUserSRF[0]
 	// Accept optional LATERAL keyword before a derived table.
 	// LATERAL is silently consumed; goopg treats lateral subqueries as
 	// ordinary derived tables (no correlated-outer-reference evaluation).
@@ -1219,6 +1257,12 @@ func (p *parser) parseRangeVar() (RangeVar, error) {
 			"pg_get_publication_tables", "pg_available_wal_summaries",
 			"unnest", "generate_subscripts":
 			srfFuncName = lower
+		default:
+			// Accept any other name(args) in FROM as a potential user-defined SRF.
+			// Only do this in FROM clause context to avoid breaking INSERT INTO t (cols).
+			if fromClause {
+				srfFuncName = obj.Name
+			}
 		}
 	}
 	if srfFuncName != "" {
@@ -1363,19 +1407,33 @@ func (p *parser) parseSortList() ([]SortBy, error) {
 
 // skipCollationName consumes a (possibly schema-qualified) collation
 // name following the COLLATE keyword, e.g. `"C"`, `pg_catalog."C"`, or
-// `en_US`. Returns the bare collation name (last component). M0097-0127.
+// `en_US`, or a keyword used as collation name (e.g. `default`). Returns
+// the bare collation name (last component). M0097-0127.
 func (p *parser) parseCollationName() (string, error) {
-	tok, err := p.parseIdent()
-	if err != nil {
-		return "", err
-	}
-	name := tok.Value
-	for p.acceptSymbol(".") {
-		tok, err = p.parseIdent() // keep only the last component
+	name := ""
+	// Accept identifier or any keyword that can appear as a collation name.
+	if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+		name = p.cur().Value
+		p.advance()
+	} else {
+		tok, err := p.parseIdent()
 		if err != nil {
 			return "", err
 		}
 		name = tok.Value
+	}
+	for p.acceptSymbol(".") {
+		// After a dot, also accept keywords as name components.
+		if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+			name = p.cur().Value
+			p.advance()
+		} else {
+			tok, err := p.parseIdent()
+			if err != nil {
+				return "", err
+			}
+			name = tok.Value
+		}
 	}
 	return name, nil
 }
@@ -1658,6 +1716,19 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 					continue
 				}
 			}
+			// OPERATOR(schema.op) qualified operator syntax (psql \df etc.)
+			if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "operator") &&
+				p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+				pos := t.Pos
+				if op, ok := p.parseQualifiedOperator(); ok {
+					rhs, err := p.parseExprPrec(precCompare + 1)
+					if err != nil {
+						return nil, err
+					}
+					left = &BinaryOp{pos: pos, Op: op, Left: left, Right: rhs}
+					continue
+				}
+			}
 			// `expr [NOT] BETWEEN low AND high` desugars to
 			//   `expr >= low AND expr <= high`
 			// (or wrapped in NOT for the inverse). The low and high
@@ -1765,6 +1836,29 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 					}
 				}
 				left = inExpr
+				continue
+			}
+		}
+
+		// `expr = ALL (array[...])` — desugar to NOT (expr != ANY (array)).
+		// `= ALL` is true iff the operand equals every element of the array.
+		// M0097-enum-all.
+		if precCompare >= min {
+			if t := p.cur(); t.Kind == TokenOperator && t.Value == "=" &&
+				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwAll {
+				pos := t.Pos
+				p.advance() // =
+				p.advance() // ALL
+				inExpr, err := p.parseAnyTail(left, pos)
+				if err != nil {
+					return nil, err
+				}
+				// Mark as NotEqualAny; wrap in NOT so the executor returns
+				// true only when all elements equal the operand.
+				if ie, ok := inExpr.(*InExpr); ok {
+					ie.NotEqualAny = true
+				}
+				left = &UnaryOp{pos: pos, Op: OpNot, Operand: inExpr}
 				continue
 			}
 		}
@@ -1965,13 +2059,14 @@ func (p *parser) parseCastTail(operand Expr) (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Consume optional array suffix `[]` — treat `type[]` as the same type
-	// (goopg v0 doesn't implement array types distinctly; the cast is a no-op). M0097-0003.
+	// Consume optional array suffix `[]` — preserve it in the type name for
+	// casts like ::regtype[] that need different handling than ::regtype. M0097-0003.
 	for p.cur().Kind == TokenSymbol && p.cur().Value == "[" {
 		p.advance() // '['
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "]" {
 			p.advance() // ']'
 		}
+		name.Name += "[]"
 	}
 	var typmods []int64
 	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
@@ -2272,6 +2367,13 @@ func (p *parser) parseUnary() (Expr, error) {
 			return nil, err
 		}
 		return &UnaryOp{pos: t.Pos, Op: OpNot, Operand: operand}, nil
+	case t.Kind == TokenOperator && t.Value == "~":
+		p.advance()
+		operand, err := p.parseExprPrec(precUnary)
+		if err != nil {
+			return nil, err
+		}
+		return &UnaryOp{pos: t.Pos, Op: OpBitNot, Operand: operand}, nil
 	}
 	return p.parsePrimary()
 }
@@ -2663,6 +2765,60 @@ func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 // conjunction inside it (e.g. `BETWEEN a AND b AND c` parses as
 // `BETWEEN a AND b` followed by a top-level AND with c, matching
 // upstream).
+// parseQualifiedOperator parses OPERATOR(schema.op) and maps it to an OpCode.
+// Returns (op, true) on success; the caller has already verified the leading
+// OPERATOR( tokens are present.
+func (p *parser) parseQualifiedOperator() (OpCode, bool) {
+	p.advance() // OPERATOR
+	p.advance() // (
+	// Skip optional schema prefix: schema.
+	if p.cur().Kind == TokenIdent && p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "." {
+		p.advance() // schema name
+		p.advance() // .
+	}
+	// The operator itself is a TokenOperator or a symbol.
+	opStr := ""
+	if p.cur().Kind == TokenOperator || (p.cur().Kind == TokenSymbol && p.cur().Value != ")") {
+		opStr = p.cur().Value
+		p.advance()
+	} else if p.cur().Kind == TokenIdent {
+		opStr = p.cur().Value
+		p.advance()
+	}
+	p.acceptSymbol(")") // consume )
+	switch opStr {
+	case "~":
+		return OpRegexMatch, true
+	case "~*":
+		return OpRegexIMatch, true
+	case "!~":
+		return OpRegexNoMatch, true
+	case "!~*":
+		return OpRegexINoMatch, true
+	case "=":
+		return OpEq, true
+	case "!=", "<>":
+		return OpNe, true
+	case "<":
+		return OpLt, true
+	case ">":
+		return OpGt, true
+	case "<=":
+		return OpLe, true
+	case ">=":
+		return OpGe, true
+	case "+":
+		return OpAdd, true
+	case "-":
+		return OpSub, true
+	case "*":
+		return OpMul, true
+	case "/":
+		return OpDiv, true
+	}
+	return OpUnknown, false
+}
+
 func (p *parser) parseBetweenTail(left Expr, pos int, negated bool) (Expr, error) {
 	low, err := p.parseExprPrec(precAnd + 1)
 	if err != nil {

@@ -73,6 +73,14 @@ type Column struct {
 	// executor import cycle. nil means trailing missing columns decode as
 	// NULL (the prior default). M0097-0077.
 	MissingValue any
+	// IdentityColumn is true for GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
+	// When true, INSERT without an explicit value calls nextval(tablename_colname_seq).
+	IdentityColumn bool
+	// Dropped is true for columns removed via ALTER TABLE DROP COLUMN.
+	// The column's heap slot (Ordinal) is retained for tuple compatibility;
+	// dropped columns are invisible in SELECT *, RETURNING *, and column lookups.
+	// M0097-0028.
+	Dropped bool
 }
 
 // Table is one relation in the catalog.
@@ -169,6 +177,10 @@ type Table struct {
 	// PartitionKeyOpClasses is the operator class name per key column.
 	// Empty string means "use the default hash function". M0097-0027.
 	PartitionKeyOpClasses []string
+	// PartitionKeyExprs holds the parsed expression AST for expression-based
+	// partition keys. Parallel to PartitionKey: nil entry = plain column name,
+	// non-nil entry = expression (e.g. abs(b), (a+b)/2, NOT a). M0097-0023.
+	PartitionKeyExprs []parser.Expr
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -278,7 +290,8 @@ type Index struct {
 	// columns (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil
 	// when Columns[i] == "" (expression column); nil for plain column names.
 	// Not persisted to JSON (parser.Expr is not JSON-serializable).
-	ColExprs []*parser.Expr
+	ColExprs     []*parser.Expr
+	HasPredicate bool // true if this is a partial index (has a WHERE clause)
 }
 
 // QualifiedName renders the table's name in the canonical
@@ -320,6 +333,11 @@ type Catalog interface {
 	RegisterSchema(name string)
 	// UnregisterSchema removes a schema from the registry. M0097-drop_if_exists.
 	UnregisterSchema(name string)
+	// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
+	// objType is "conversion", "operator", "rule", "text search configuration", etc.
+	RegisterCompatObject(objType, name string)
+	// DropCompatObject removes an object from the compat registry. Returns true if found.
+	DropCompatObject(objType, name string) bool
 	// RoleExists reports whether a role has been registered. M0097-drop_if_exists.
 	RoleExists(name string) bool
 	// RegisterRole records a user-created role. M0097-drop_if_exists.
@@ -411,6 +429,10 @@ type InMemory struct {
 	// satisfies_hash_partition. M0097-0027.
 	opClassHashFuncs map[string]string
 
+	// opClassSchemas maps operator class name → schema (for DROP SCHEMA CASCADE).
+	// M0097-0022.
+	opClassSchemas map[string]string
+
 	// userAggregates maps lower-case aggregate name → UserAggregate for
 	// user-defined aggregates registered via CREATE AGGREGATE.
 	userAggregates map[string]*UserAggregate
@@ -424,6 +446,14 @@ type InMemory struct {
 	// DROP ROLE IF EXISTS to produce proper "does not exist" notices.
 	// M0097-drop_if_exists.
 	roles map[string]struct{}
+
+	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
+	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
+	compatObjects map[string]map[string]struct{}
+
+	// tableRuleKinds tracks the most-recently-registered rule kind per table.
+	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
+	tableRuleKinds map[string]string
 }
 
 // EnumValue is one label in a user-defined enum type together with its sort
@@ -444,10 +474,11 @@ type EnumType struct {
 
 // Domain holds one user-defined domain type. M0097-0017.
 type Domain struct {
-	Name    string
-	OID     uint32
-	Base    Type // resolved base type
-	NotNull bool
+	Name          string
+	OID           uint32
+	Base          Type // resolved base type
+	NotNull       bool
+	CheckInValues []string // allowed values from CHECK (VALUE IN ...), M0097-domain-check
 }
 
 // CompositeField describes one field in a user-defined composite type.
@@ -530,6 +561,7 @@ func NewInMemory() *InMemory {
 		compositeTypeFields: make(map[string][]CompositeField),
 		constraintViewDeps:  make(map[string][]string),
 		opClassHashFuncs:    make(map[string]string),
+		opClassSchemas:      make(map[string]string),
 		userAggregates: make(map[string]*UserAggregate),
 		schemas: map[string]uint32{
 			"pg_catalog":         11,
@@ -853,6 +885,34 @@ func (c *InMemory) FindHashPartitionForValue(parentOID uint32, keyValue string) 
 	return defaultPart // fall back to DEFAULT partition
 }
 
+// FindHashPartitionByHash returns the partition whose modulus/remainder matches
+// the given pre-computed hash value. Used when a user-defined operator class
+// provides the hash function. M0097-0022.
+func (c *InMemory) FindHashPartitionByHash(parentOID uint32, h uint64) *Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var defaultPart *Table
+	for _, childOID := range c.partitionChildren[parentOID] {
+		for _, t := range c.tables {
+			if t.OID != childOID {
+				continue
+			}
+			for _, pb := range t.PartitionBounds {
+				if pb.IsDefault {
+					defaultPart = t
+					continue
+				}
+				if pb.IsHash && pb.Modulus > 0 {
+					if int64(h%uint64(pb.Modulus)) == pb.Remainder {
+						return t
+					}
+				}
+			}
+		}
+	}
+	return defaultPart
+}
+
 // HasDatabase reports whether the given database name is registered
 // in the catalog. Used by the connection startup path to validate
 // the requested database parameter.
@@ -1029,6 +1089,30 @@ func (c *InMemory) LookupOpClassHashFunc(opClassName string) (string, bool) {
 	return v, ok
 }
 
+// RegisterOpClassSchema records the schema of an operator class.
+// Used for DROP SCHEMA CASCADE detail output. M0097-0022.
+func (c *InMemory) RegisterOpClassSchema(opClassName, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.opClassSchemas[opClassName] = schema
+}
+
+// OpClassesInSchema returns the names of operator classes in the given schema,
+// sorted alphabetically. Used for DROP SCHEMA CASCADE detail output. M0097-0022.
+func (c *InMemory) OpClassesInSchema(schemaName string) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	schemaLC := strings.ToLower(schemaName)
+	var out []string
+	for name, schema := range c.opClassSchemas {
+		if strings.ToLower(schema) == schemaLC {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // advanceNextOIDLocked nudges nextOID past `oid` so subsequent
 // allocations don't collide with the recovered identifier.
 // Caller must hold c.mu.
@@ -1150,6 +1234,22 @@ func (c *InMemory) registerSystemTables() {
 			//   `SELECT c.oid, c.relreplident, c.relkind FROM pg_class c …`
 			// 'd' = REPLICA_IDENTITY_DEFAULT (PG default for tables).
 			{Name: "relreplident", Type: Type{Name: "char"}, Ordinal: 9},
+			// relchecks: number of CHECK constraints. Always 0 in goopg v0.
+			{Name: "relchecks", Type: Type{Name: "int2"}, Ordinal: 10},
+			// Additional columns used by psql \d+ meta-commands. M0097-0028.
+			{Name: "relhasindex", Type: Type{Name: "bool"}, Ordinal: 11},
+			{Name: "relhasrules", Type: Type{Name: "bool"}, Ordinal: 12},
+			{Name: "relhastriggers", Type: Type{Name: "bool"}, Ordinal: 13},
+			{Name: "relrowsecurity", Type: Type{Name: "bool"}, Ordinal: 14},
+			{Name: "relforcerowsecurity", Type: Type{Name: "bool"}, Ordinal: 15},
+			{Name: "relhasoids", Type: Type{Name: "bool"}, Ordinal: 16},
+			{Name: "relispartition", Type: Type{Name: "bool"}, Ordinal: 17},
+			{Name: "reltablespace", Type: Type{Name: "oid"}, Ordinal: 18},
+			{Name: "reloftype", Type: Type{Name: "oid"}, Ordinal: 19},
+			{Name: "reloptions", Type: Type{Name: "text[]"}, Ordinal: 20},
+			// relam: access method OID. 2=heap for tables, method OID for indexes.
+			// Required by psql \d+ and pg_class.relam joins with pg_am. M0097-0023.
+			{Name: "relam", Type: Type{Name: "oid"}, Ordinal: 21},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -1189,6 +1289,14 @@ func (c *InMemory) registerSystemTables() {
 			if nsOID == 0 {
 				nsOID = 2200 // default to public
 			}
+			hasIdx := "f"
+			if len(c.byTable[t.OID]) > 0 {
+				hasIdx = "t"
+			}
+			isPartition := "f"
+			if t.PartitionParentOID != 0 {
+				isPartition = "t"
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // oid: numeric OID (M0103-0008 rung 16)
 				t.Name,                       // relname
@@ -1200,6 +1308,18 @@ func (c *InMemory) registerSystemTables() {
 				populated,                    // relispopulated
 				strconv.Itoa(len(t.Columns)), // relnatts: number of user columns
 				"d",                          // relreplident: REPLICA_IDENTITY_DEFAULT
+				"0",                          // relchecks: number of CHECK constraints
+				hasIdx,                       // relhasindex
+				"f",                          // relhasrules
+				"f",                          // relhastriggers
+				"f",                          // relrowsecurity
+				"f",                          // relforcerowsecurity
+				"f",                          // relhasoids
+				isPartition,                  // relispartition
+				"0",                          // reltablespace
+				"0",                          // reloftype
+				"",                           // reloptions: empty (NULL via TypedVirtualCell empty-string fallback)
+				"2",                          // relam: heap access method OID (OID 2)
 			})
 		}
 		// Emit index rows (relkind='i') so pg_class can be used to count indexes.
@@ -1221,6 +1341,11 @@ func (c *InMemory) registerSystemTables() {
 					idxNsOID = oid
 				}
 			}
+			// Determine relam for index: btree=403, hash=405, gist=783, gin=2742, spgist=4000, brin=3580.
+			idxRelam := "403" // default btree
+			if idx.Method == "hash" {
+				idxRelam = "405"
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),   // oid
 				idx.Name,                     // relname
@@ -1232,8 +1357,48 @@ func (c *InMemory) registerSystemTables() {
 				"t",                          // relispopulated
 				"0",                          // relnatts
 				"n",                          // relreplident: not applicable for indexes
+				"0",                          // relchecks
+				"f",                          // relhasindex
+				"f",                          // relhasrules
+				"f",                          // relhastriggers
+				"f",                          // relrowsecurity
+				"f",                          // relforcerowsecurity
+				"f",                          // relhasoids
+				"f",                          // relispartition
+				"0",                          // reltablespace
+				"0",                          // reloftype
+				"",                           // reloptions: NULL
+				idxRelam,                     // relam: index access method OID
 			})
 		}
+		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
+		// PostgreSQL's pg_class is a real heap table; oid::int8 queries like
+		//   SELECT oid::int8 FROM pg_class WHERE relname = 'pg_class'
+		// must return 1259. M0097-0029.
+		out = append(out, []string{
+			"1259",     // oid
+			"pg_class", // relname
+			"r",        // relkind = regular table
+			"11",       // relnamespace = pg_catalog
+			"p",        // relpersistence
+			"0",        // reltoastrelid
+			"0",        // relpages
+			"t",        // relispopulated
+			"22",       // relnatts: 22 columns (including relam added M0097-0023)
+			"n",        // relreplident
+			"0",        // relchecks
+			"t",        // relhasindex (pg_class itself has indexes)
+			"f",        // relhasrules
+			"f",        // relhastriggers
+			"f",        // relrowsecurity
+			"f",        // relforcerowsecurity
+			"f",        // relhasoids
+			"f",        // relispartition
+			"0",        // reltablespace
+			"0",        // reloftype
+			"",         // reloptions: NULL
+			"2",        // relam: heap access method OID
+		})
 		return out
 	}
 	c.tables["pg_catalog.pg_class"] = pgClass
@@ -1248,9 +1413,9 @@ func (c *InMemory) registerSystemTables() {
 		Schema: "pg_catalog",
 		Name:   "pg_namespace",
 		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
-			{Name: "nspname", Type: Type{Name: "text"}, Ordinal: 1},
-			{Name: "nspowner", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "nspname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "nspowner", Type: Type{Name: "oid"}, Ordinal: 2},
 			{Name: "nspacl", Type: Type{Name: "text"}, Ordinal: 3},
 		},
 		OID:     2615, // upstream's NamespaceRelationId
@@ -1523,8 +1688,8 @@ func (c *InMemory) registerSystemTables() {
 		Schema: "pg_catalog",
 		Name:   "pg_enum",
 		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "text"}, Ordinal: 0},
-			{Name: "enumtypid", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "enumtypid", Type: Type{Name: "oid"}, Ordinal: 1},
 			{Name: "enumsortorder", Type: Type{Name: "numeric"}, Ordinal: 2},
 			{Name: "enumlabel", Type: Type{Name: "text"}, Ordinal: 3},
 		},
@@ -1546,7 +1711,7 @@ func (c *InMemory) registerSystemTables() {
 			for _, ev := range et.Values {
 				rows = append(rows, []string{
 					fmt.Sprintf("%d", oid),
-					et.Name,
+					fmt.Sprintf("%d", et.OID),
 					strconv.FormatFloat(ev.SortOrder, 'f', -1, 32),
 					ev.Label,
 				})
@@ -1885,6 +2050,23 @@ func (c *InMemory) registerSystemTables() {
 	pgStatIO.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_stat_io"] = pgStatIO
 
+	// pg_description — stores COMMENT ON object descriptions (OID 2609).
+	// COMMENT ON is parsed as a no-op in goopg v0; this stub allows queries
+	// against pg_description to succeed (returning 0 rows) instead of erroring
+	// with "relation pg_description does not exist". M0097-0023.
+	pgDescription := &Table{
+		Schema: "pg_catalog", Name: "pg_description", Virtual: true,
+		Columns: []Column{
+			{Name: "objoid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "objsubid", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "description", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID: 2609,
+	}
+	pgDescription.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_description"] = pgDescription
+
 	// pg_wait_events — needs at least one row per type.
 	pgWaitEvents := &Table{
 		Schema: "pg_catalog", Name: "pg_wait_events", Virtual: true,
@@ -2049,6 +2231,32 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.tables["pg_catalog.pg_timezone_abbrevs"] = pgTimezoneAbbrevs
 
+	// pg_am — access method catalog (OID 2601).
+	// Returns the standard set of PostgreSQL access methods so queries
+	// that join pg_am (e.g. \d+ in psql) succeed. M0097-0028.
+	pgAm := &Table{
+		Schema: "pg_catalog", Name: "pg_am", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "amname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "amhandler", Type: Type{Name: "regproc"}, Ordinal: 2},
+			{Name: "amtype", Type: Type{Name: "char"}, Ordinal: 3},
+		},
+		OID: 2601,
+	}
+	pgAm.VirtualRows = func() [][]string {
+		return [][]string{
+			{"2", "heap", "3", "t"},
+			{"403", "btree", "330", "i"},
+			{"405", "hash", "331", "i"},
+			{"783", "gist", "332", "i"},
+			{"2742", "gin", "333", "i"},
+			{"4000", "spgist", "334", "i"},
+			{"3580", "brin", "335", "i"},
+		}
+	}
+	c.tables["pg_catalog.pg_am"] = pgAm
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {
@@ -2151,6 +2359,304 @@ func (c *InMemory) registerSystemTables() {
 		sort.Slice(rows, func(i, j int) bool { return rows[i][0] < rows[j][0] })
 		return rows
 	}
+
+	// information_schema virtual tables (M0097-0022).
+	c.registerInformationSchemaTables()
+}
+
+// registerInformationSchemaTables adds information_schema virtual tables:
+// routines, parameters, and usage stubs. These read from the routine registry.
+func (c *InMemory) registerInformationSchemaTables() {
+	// information_schema.routines — one row per user-defined routine.
+	isRoutines := &Table{
+		Schema:  "information_schema",
+		Name:    "routines",
+		Virtual: true,
+		Columns: []Column{
+			{Name: "specific_catalog", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "specific_schema", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "specific_name", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "routine_catalog", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "routine_schema", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "routine_name", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "routine_type", Type: Type{Name: "text"}, Ordinal: 6},
+		},
+	}
+	isRoutines.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
+		}
+		var rows [][]string
+		for _, r := range rs.List() {
+			schema := r.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			specificName := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			rtype := "FUNCTION"
+			if r.IsProcedure {
+				rtype = "PROCEDURE"
+			}
+			rows = append(rows, []string{
+				"postgres", schema, specificName, "postgres", schema, r.Name, rtype,
+			})
+		}
+		return rows
+	}
+	c.tables["information_schema.routines"] = isRoutines
+
+	// information_schema.parameters — one row per parameter per routine.
+	isParams := &Table{
+		Schema:  "information_schema",
+		Name:    "parameters",
+		Virtual: true,
+		Columns: []Column{
+			{Name: "specific_catalog", Type: Type{Name: "text"}, Ordinal: 0},
+			{Name: "specific_schema", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "specific_name", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "ordinal_position", Type: Type{Name: "int4"}, Ordinal: 3},
+			{Name: "parameter_mode", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "parameter_name", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "data_type", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "parameter_default", Type: Type{Name: "text"}, Ordinal: 7},
+		},
+	}
+	isParams.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
+		}
+		var rows [][]string
+		for _, r := range rs.List() {
+			schema := r.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			specificName := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			for i, t := range r.ArgTypes {
+				mode := "IN"
+				if i < len(r.ArgModes) {
+					switch r.ArgModes[i] {
+					case "o":
+						mode = "OUT"
+					case "b":
+						mode = "INOUT"
+					case "v":
+						mode = "VARIADIC"
+					}
+				}
+				paramName := ""
+				if i < len(r.ArgNames) {
+					paramName = r.ArgNames[i]
+				}
+				paramDefault := ""
+				if i < len(r.ArgDefaults) {
+					pd := r.ArgDefaults[i]
+					if pd != "" {
+						// Annotate string literals with ::type cast (PG canonical form).
+						if len(pd) >= 2 && pd[0] == '\'' && pd[len(pd)-1] == '\'' {
+							typName := strings.ToLower(t.Name)
+							switch typName {
+							case "text", "varchar", "character varying", "char", "bpchar":
+								pd = pd + "::" + typName
+							}
+						}
+						paramDefault = pd
+					}
+				}
+				rows = append(rows, []string{
+					"postgres", schema, specificName,
+					fmt.Sprintf("%d", i+1),
+					mode, paramName, t.Name, paramDefault,
+				})
+			}
+		}
+		return rows
+	}
+	c.tables["information_schema.parameters"] = isParams
+
+	// Stub usage views — columns match PG's information_schema; return no rows
+	// (body-dependency analysis not yet implemented).
+	isRoutineUsageColsBase := []Column{
+		{Name: "specific_catalog", Type: Type{Name: "text"}, Ordinal: 0},
+		{Name: "specific_schema", Type: Type{Name: "text"}, Ordinal: 1},
+		{Name: "specific_name", Type: Type{Name: "text"}, Ordinal: 2},
+		{Name: "routine_catalog", Type: Type{Name: "text"}, Ordinal: 3},
+		{Name: "routine_schema", Type: Type{Name: "text"}, Ordinal: 4},
+		{Name: "routine_name", Type: Type{Name: "text"}, Ordinal: 5},
+	}
+	isRoutineUsageViews := map[string][]Column{
+		"routine_routine_usage": append(isRoutineUsageColsBase,
+			Column{Name: "called_specific_catalog", Type: Type{Name: "text"}, Ordinal: 6},
+			Column{Name: "called_specific_schema", Type: Type{Name: "text"}, Ordinal: 7},
+			Column{Name: "called_specific_name", Type: Type{Name: "text"}, Ordinal: 8},
+		),
+		"routine_sequence_usage": append(isRoutineUsageColsBase,
+			Column{Name: "sequence_catalog", Type: Type{Name: "text"}, Ordinal: 6},
+			Column{Name: "sequence_schema", Type: Type{Name: "text"}, Ordinal: 7},
+			Column{Name: "sequence_name", Type: Type{Name: "text"}, Ordinal: 8},
+		),
+		"routine_column_usage": append(isRoutineUsageColsBase,
+			Column{Name: "table_catalog", Type: Type{Name: "text"}, Ordinal: 6},
+			Column{Name: "table_schema", Type: Type{Name: "text"}, Ordinal: 7},
+			Column{Name: "table_name", Type: Type{Name: "text"}, Ordinal: 8},
+			Column{Name: "column_name", Type: Type{Name: "text"}, Ordinal: 9},
+		),
+		"routine_table_usage": append(isRoutineUsageColsBase,
+			Column{Name: "table_catalog", Type: Type{Name: "text"}, Ordinal: 6},
+			Column{Name: "table_schema", Type: Type{Name: "text"}, Ordinal: 7},
+			Column{Name: "table_name", Type: Type{Name: "text"}, Ordinal: 8},
+		),
+	}
+	// routine_routine_usage: one row per routine-to-routine dependency.
+	rruCols := isRoutineUsageViews["routine_routine_usage"]
+	rruTbl := &Table{Schema: "information_schema", Name: "routine_routine_usage", Virtual: true, Columns: rruCols}
+	rruTbl.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
+		}
+		var rows [][]string
+		for _, r := range rs.List() {
+			if len(r.RoutineCallOIDs) == 0 {
+				continue
+			}
+			rSchema := r.Schema
+			if rSchema == "" {
+				rSchema = "public"
+			}
+			callerSpec := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			for _, calledOID := range r.RoutineCallOIDs {
+				called := rs.LookupByOID(calledOID)
+				if called == nil {
+					continue
+				}
+				calledSchema := called.Schema
+				if calledSchema == "" {
+					calledSchema = "public"
+				}
+				calledSpec := fmt.Sprintf("%s_%d", called.Name, called.OID)
+				rows = append(rows, []string{
+					"postgres", rSchema, callerSpec, "postgres", calledSchema, calledSpec,
+					"postgres", calledSchema, calledSpec,
+				})
+			}
+		}
+		return rows
+	}
+	c.tables["information_schema.routine_routine_usage"] = rruTbl
+
+	// routine_sequence_usage: one row per sequence dependency.
+	rsuCols := isRoutineUsageViews["routine_sequence_usage"]
+	rsuTbl := &Table{Schema: "information_schema", Name: "routine_sequence_usage", Virtual: true, Columns: rsuCols}
+	rsuTbl.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
+		}
+		var rows [][]string
+		for _, r := range rs.List() {
+			if len(r.SequenceDeps) == 0 {
+				continue
+			}
+			rSchema := r.Schema
+			if rSchema == "" {
+				rSchema = "public"
+			}
+			specificName := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			for _, dep := range r.SequenceDeps {
+				seqSchema := dep.Schema
+				if seqSchema == "" {
+					seqSchema = rSchema
+				}
+				rows = append(rows, []string{
+					"postgres", rSchema, specificName, "postgres", rSchema, r.Name,
+					"postgres", seqSchema, dep.Name,
+				})
+			}
+		}
+		return rows
+	}
+	c.tables["information_schema.routine_sequence_usage"] = rsuTbl
+
+	// routine_column_usage: one row per column dependency.
+	rcuCols := isRoutineUsageViews["routine_column_usage"]
+	rcuTbl := &Table{Schema: "information_schema", Name: "routine_column_usage", Virtual: true, Columns: rcuCols}
+	rcuTbl.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
+		}
+		var rows [][]string
+		for _, r := range rs.List() {
+			if len(r.ColumnDeps) == 0 {
+				continue
+			}
+			rSchema := r.Schema
+			if rSchema == "" {
+				rSchema = "public"
+			}
+			specificName := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			for _, dep := range r.ColumnDeps {
+				tblSchema := dep.TableSchema
+				if tblSchema == "" {
+					tblSchema = rSchema
+				}
+				// Only include dep if referenced table still exists.
+				if _, exists := c.LookupTable(parser.ObjectName{Schema: tblSchema, Name: dep.TableName}); !exists {
+					if _, exists2 := c.LookupTable(parser.ObjectName{Name: dep.TableName}); !exists2 {
+						continue
+					}
+				}
+				rows = append(rows, []string{
+					"postgres", rSchema, specificName, "postgres", rSchema, r.Name,
+					"postgres", tblSchema, dep.TableName, dep.ColumnName,
+				})
+			}
+		}
+		return rows
+	}
+	c.tables["information_schema.routine_column_usage"] = rcuTbl
+
+	// routine_table_usage: one row per table dependency.
+	rtuCols := isRoutineUsageViews["routine_table_usage"]
+	rtuTbl := &Table{Schema: "information_schema", Name: "routine_table_usage", Virtual: true, Columns: rtuCols}
+	rtuTbl.VirtualRows = func() [][]string {
+		rs := c.Routines()
+		if rs == nil {
+			return nil
+		}
+		var rows [][]string
+		for _, r := range rs.List() {
+			if len(r.TableDeps) == 0 {
+				continue
+			}
+			rSchema := r.Schema
+			if rSchema == "" {
+				rSchema = "public"
+			}
+			specificName := fmt.Sprintf("%s_%d", r.Name, r.OID)
+			for _, dep := range r.TableDeps {
+				tblSchema := dep.Schema
+				if tblSchema == "" {
+					tblSchema = rSchema
+				}
+				// Only include dep if referenced table still exists.
+				if _, exists := c.LookupTable(parser.ObjectName{Schema: tblSchema, Name: dep.Name}); !exists {
+					if _, exists2 := c.LookupTable(parser.ObjectName{Name: dep.Name}); !exists2 {
+						continue
+					}
+				}
+				rows = append(rows, []string{
+					"postgres", rSchema, specificName, "postgres", rSchema, r.Name,
+					"postgres", tblSchema, dep.Name,
+				})
+			}
+		}
+		return rows
+	}
+	c.tables["information_schema.routine_table_usage"] = rtuTbl
 }
 
 // TryRegisterUserTable installs a user table recovered from the pg_class/
@@ -2283,6 +2789,12 @@ func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 		if t, ok := c.tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
 			return t, true
 		}
+	} else {
+		// Schema-qualified lookup: fall back to unqualified key to handle tables
+		// that were moved to a different schema via SET SCHEMA (catalog key is unchanged).
+		if t, ok := c.tables[name.Name]; ok && strings.EqualFold(t.Schema, name.Schema) {
+			return t, true
+		}
 	}
 	return nil, false
 }
@@ -2300,12 +2812,23 @@ func (c *InMemory) LookupColumn(table *Table, name string) (*Column, bool) {
 }
 
 // LookupIndex returns the index with the given name, or false when
-// unresolved.
+// unresolved. Unqualified lookups fall back to an unqualified search
+// so schema-qualified references find indexes stored without a schema.
 func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	idx, ok := c.indexes[key(name)]
-	return idx, ok
+	if idx, ok := c.indexes[key(name)]; ok {
+		return idx, ok
+	}
+	// Fallback: try bare name when schema-qualified lookup failed.
+	// Mirrors LookupTable's fallback for the common case where an index
+	// is stored without an explicit schema (e.g. created in search_path context).
+	if name.Schema != "" {
+		if idx, ok := c.indexes[name.Name]; ok {
+			return idx, ok
+		}
+	}
+	return nil, false
 }
 
 // CreateTable installs a new table in the catalog. Returns an error
@@ -2542,21 +3065,93 @@ func (c *InMemory) UnregisterRole(name string) {
 	delete(c.roles, strings.ToLower(name))
 }
 
+// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
+// Used so that DROP X (without IF EXISTS) can succeed when CREATE X was also a noop.
+func (c *InMemory) RegisterCompatObject(objType, name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.compatObjects == nil {
+		c.compatObjects = make(map[string]map[string]struct{})
+	}
+	key := strings.ToLower(objType)
+	if _, ok := c.compatObjects[key]; !ok {
+		c.compatObjects[key] = make(map[string]struct{})
+	}
+	c.compatObjects[key][name] = struct{}{}
+}
+
+// DropCompatObject removes an object from the compat registry. Returns true if found+removed.
+func (c *InMemory) DropCompatObject(objType, name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(objType)
+	if c.compatObjects == nil {
+		return false
+	}
+	if _, ok := c.compatObjects[key][name]; ok {
+		delete(c.compatObjects[key], name)
+		return true
+	}
+	return false
+}
+
+// RegisterTableRuleKind records the most recently created rule kind for a table.
+// Used by planCopy to return rule-specific errors. M0097-0140.
+func (c *InMemory) RegisterTableRuleKind(tableName, kind string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tableRuleKinds == nil {
+		c.tableRuleKinds = make(map[string]string)
+	}
+	c.tableRuleKinds[strings.ToLower(tableName)] = kind
+}
+
+// UnregisterTableRules removes the rule kind record for a table (on DROP RULE). M0097-0140.
+func (c *InMemory) UnregisterTableRules(tableName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tableRuleKinds != nil {
+		delete(c.tableRuleKinds, strings.ToLower(tableName))
+	}
+}
+
+// TableRuleKind returns the most recently registered rule kind for a table, or "". M0097-0140.
+func (c *InMemory) TableRuleKind(tableName string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.tableRuleKinds == nil {
+		return ""
+	}
+	return c.tableRuleKinds[strings.ToLower(tableName)]
+}
+
 func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	schemaLC := strings.ToLower(schemaName)
 	var out []parser.ObjectName
-	for _, t := range c.tables {
+	for k, t := range c.tables {
 		if t.Virtual {
 			continue // skip system/virtual tables
+		}
+		// Partition children are dropped implicitly when their parent is dropped;
+		// skip them from the direct schema-level cascade list.
+		if len(t.PartitionBounds) > 0 {
+			continue
 		}
 		tSchema := t.Schema
 		if tSchema == "" {
 			tSchema = "public"
 		}
 		if strings.ToLower(tSchema) == schemaLC {
-			out = append(out, parser.ObjectName{Schema: t.Schema, Name: t.Name})
+			// Return ObjectName matching the actual catalog key. Tables stored
+			// under an unqualified key (no schema prefix) must be returned
+			// without schema so DropTable and detail lines use the same key.
+			if k == strings.ToLower(t.Name) {
+				out = append(out, parser.ObjectName{Name: t.Name})
+			} else {
+				out = append(out, parser.ObjectName{Schema: t.Schema, Name: t.Name})
+			}
 		}
 	}
 	return out
@@ -2762,6 +3357,106 @@ func (c *InMemory) AllUserViews() []*Table {
 	return out
 }
 
+// AllUserMatViews returns deep copies of every user-created materialized view.
+// Used by DROP TABLE/VIEW/MATERIALIZED VIEW CASCADE dependency scanning.
+func (c *InMemory) AllUserMatViews() []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*Table, 0)
+	for _, t := range c.tables {
+		if !t.IsMatView {
+			continue
+		}
+		cp := *t
+		cp.Columns = append([]Column(nil), t.Columns...)
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// RenameColumnInViews updates all stored view/matview SELECT ASTs to replace
+// references to oldCol on tableName with newCol. Called after ALTER TABLE RENAME COLUMN
+// so dependent views/matviews continue to work. M0097-0025.
+func (c *InMemory) RenameColumnInViews(tableName, oldCol, newCol string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, t := range c.tables {
+		if t.View == nil {
+			continue
+		}
+		renameColumnInSelect(t.View, tableName, oldCol, newCol)
+	}
+}
+
+// renameColumnInSelect walks sel and replaces ColumnRef nodes where
+// Column==oldCol and (Table=="" or Table==tableName) with newCol.
+func renameColumnInSelect(sel *parser.SelectStmt, tableName, oldCol, newCol string) {
+	if sel == nil {
+		return
+	}
+	for i := range sel.Targets {
+		if sel.Targets[i].Expr != nil {
+			sel.Targets[i].Expr = renameColumnInExpr(sel.Targets[i].Expr, tableName, oldCol, newCol)
+		}
+	}
+	if sel.Where != nil {
+		sel.Where = renameColumnInExpr(sel.Where, tableName, oldCol, newCol)
+	}
+	if sel.Having != nil {
+		sel.Having = renameColumnInExpr(sel.Having, tableName, oldCol, newCol)
+	}
+	for i := range sel.GroupBy {
+		sel.GroupBy[i] = renameColumnInExpr(sel.GroupBy[i], tableName, oldCol, newCol)
+	}
+	for i := range sel.OrderBy {
+		sel.OrderBy[i].Expr = renameColumnInExpr(sel.OrderBy[i].Expr, tableName, oldCol, newCol)
+	}
+	for i := range sel.From {
+		if sel.From[i].Subquery != nil {
+			renameColumnInSelect(sel.From[i].Subquery, tableName, oldCol, newCol)
+		}
+	}
+}
+
+func renameColumnInExpr(expr parser.Expr, tableName, oldCol, newCol string) parser.Expr {
+	if expr == nil {
+		return nil
+	}
+	switch e := expr.(type) {
+	case *parser.ColumnRef:
+		if strings.EqualFold(e.Column, oldCol) {
+			if e.Table == "" || strings.EqualFold(e.Table, tableName) {
+				newRef := *e
+				newRef.Column = newCol
+				return &newRef
+			}
+		}
+	case *parser.BinaryOp:
+		e.Left = renameColumnInExpr(e.Left, tableName, oldCol, newCol)
+		e.Right = renameColumnInExpr(e.Right, tableName, oldCol, newCol)
+	case *parser.UnaryOp:
+		e.Operand = renameColumnInExpr(e.Operand, tableName, oldCol, newCol)
+	case *parser.FuncCall:
+		for i := range e.Args {
+			e.Args[i] = renameColumnInExpr(e.Args[i], tableName, oldCol, newCol)
+		}
+	case *parser.CastExpr:
+		e.Operand = renameColumnInExpr(e.Operand, tableName, oldCol, newCol)
+	case *parser.SubqueryExpr:
+		renameColumnInSelect(e.Inner, tableName, oldCol, newCol)
+	case *parser.CaseExpr:
+		for i := range e.Whens {
+			e.Whens[i].When = renameColumnInExpr(e.Whens[i].When, tableName, oldCol, newCol)
+			e.Whens[i].Then = renameColumnInExpr(e.Whens[i].Then, tableName, oldCol, newCol)
+		}
+		if e.Else != nil {
+			e.Else = renameColumnInExpr(e.Else, tableName, oldCol, newCol)
+		}
+	}
+	return expr
+}
+
 // FKRef pairs a child table with one of its FK constraints that
 // references a given parent table. M0096-0011.
 type FKRef struct {
@@ -2841,6 +3536,62 @@ func (e *EnumLabelNotFound) Error() string {
 	return fmt.Sprintf("%q is not an existing enum label", e.Label)
 }
 
+// EnumLabelAlreadyExists is returned by RenameEnumValue when the new label already exists.
+type EnumLabelAlreadyExists struct{ Label string }
+
+func (e *EnumLabelAlreadyExists) Error() string {
+	return fmt.Sprintf("enum label %q already exists", e.Label)
+}
+
+// RenameEnumValue renames an existing enum label to a new label.
+// Returns EnumLabelNotFound if oldLabel does not exist, EnumLabelAlreadyExists if newLabel
+// already exists. M0097-0022.
+func (c *InMemory) RenameEnumValue(typeName, oldLabel, newLabel string) error {
+	k := strings.ToLower(typeName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.enumTypes[k]
+	if !ok {
+		return fmt.Errorf("type %q does not exist", typeName)
+	}
+	oldIdx := -1
+	for i, ev := range et.Values {
+		if ev.Label == oldLabel {
+			oldIdx = i
+			break
+		}
+	}
+	if oldIdx < 0 {
+		return &EnumLabelNotFound{Label: oldLabel}
+	}
+	for _, ev := range et.Values {
+		if ev.Label == newLabel {
+			return &EnumLabelAlreadyExists{Label: newLabel}
+		}
+	}
+	et.Values[oldIdx].Label = newLabel
+	return nil
+}
+
+// RenameEnum renames an enum type from oldName to newName. M0097-enum-rename.
+func (c *InMemory) RenameEnum(oldName, newName string) error {
+	ok := strings.ToLower(oldName)
+	nk := strings.ToLower(newName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, found := c.enumTypes[ok]
+	if !found {
+		return fmt.Errorf("type %q does not exist", oldName)
+	}
+	if _, exists := c.enumTypes[nk]; exists {
+		return fmt.Errorf("type %q already exists", newName)
+	}
+	delete(c.enumTypes, ok)
+	et.Name = nk
+	c.enumTypes[nk] = et
+	return nil
+}
+
 // AddEnumValue appends a new label to an existing enum. before/after are
 // reference labels (empty = append at end). Returns an error if label already
 // exists unless ifNotExists is true, in which case it is a no-op (returns nil).
@@ -2855,6 +3606,15 @@ func (c *InMemory) AddEnumValue(name, value string, ifNotExists bool, before, af
 // AddEnumValueResult is like AddEnumValue but also returns skipped=true when
 // ifNotExists=true and the label already exists (caller should emit a NOTICE).
 // M0097-0063.
+// renumberEnumValues assigns sequential integer sort orders (1, 2, 3, ...) to all
+// enum values, matching PostgreSQL's RenumberEnumType triggered when float4
+// precision is exhausted for midpoint insertions.
+func renumberEnumValues(et *EnumType) {
+	for i := range et.Values {
+		et.Values[i].SortOrder = float64(i + 1)
+	}
+}
+
 func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, before, after string) (skipped bool, err error) {
 	// PostgreSQL limits enum labels to 63 bytes (NAMEDATALEN-1). M0097-0063.
 	if len(value) > 63 {
@@ -2880,12 +3640,21 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 	case before != "":
 		for i, v := range et.Values {
 			if strings.EqualFold(v.Label, before) {
-				// Compute sortorder: midpoint of predecessor and v, or v-1 if first.
 				var newSortOrder float64
 				if i == 0 {
-					newSortOrder = v.SortOrder - 1
+					newSortOrder = float64(float32(v.SortOrder) - 1)
 				} else {
-					newSortOrder = (et.Values[i-1].SortOrder + v.SortOrder) / 2
+					prev32 := float32(et.Values[i-1].SortOrder)
+					next32 := float32(et.Values[i].SortOrder)
+					mid32 := (prev32 + next32) / 2
+					if mid32 <= prev32 || mid32 >= next32 {
+						// float4 precision exhausted — renumber to sequential integers.
+						renumberEnumValues(et)
+						prev32 = float32(et.Values[i-1].SortOrder)
+						next32 = float32(et.Values[i].SortOrder)
+						mid32 = (prev32 + next32) / 2
+					}
+					newSortOrder = float64(mid32)
 				}
 				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
 				newVals := make([]EnumValue, 0, len(et.Values)+1)
@@ -2900,12 +3669,20 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 	case after != "":
 		for i, v := range et.Values {
 			if strings.EqualFold(v.Label, after) {
-				// Compute sortorder: midpoint of v and successor, or v+1 if last.
 				var newSortOrder float64
 				if i+1 == len(et.Values) {
-					newSortOrder = v.SortOrder + 1
+					newSortOrder = float64(float32(v.SortOrder) + 1)
 				} else {
-					newSortOrder = (v.SortOrder + et.Values[i+1].SortOrder) / 2
+					prev32 := float32(et.Values[i].SortOrder)
+					next32 := float32(et.Values[i+1].SortOrder)
+					mid32 := (prev32 + next32) / 2
+					if mid32 <= prev32 || mid32 >= next32 {
+						renumberEnumValues(et)
+						prev32 = float32(et.Values[i].SortOrder)
+						next32 = float32(et.Values[i+1].SortOrder)
+						mid32 = (prev32 + next32) / 2
+					}
+					newSortOrder = float64(mid32)
 				}
 				newEV := EnumValue{Label: value, SortOrder: newSortOrder}
 				newVals := make([]EnumValue, 0, len(et.Values)+1)
@@ -2928,6 +3705,25 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 		et.Values = append(et.Values, EnumValue{Label: value, SortOrder: newSortOrder})
 	}
 	return false, nil
+}
+
+
+// RemoveEnumValue removes a label from an existing enum type.
+// Used to roll back ALTER TYPE … ADD VALUE on transaction ROLLBACK. M0097-0022.
+func (c *InMemory) RemoveEnumValue(typeName, label string) {
+	k := strings.ToLower(typeName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, found := c.enumTypes[k]
+	if !found {
+		return
+	}
+	for i, ev := range et.Values {
+		if ev.Label == label {
+			et.Values = append(et.Values[:i], et.Values[i+1:]...)
+			return
+		}
+	}
 }
 
 // DropEnum removes an enum type. cascade=true is accepted (stub — does not
@@ -2990,7 +3786,7 @@ func (c *InMemory) DropCompositeType(name string) error {
 
 // RegisterDomain creates a new domain type. Returns an error if name already
 // exists. M0097-0017.
-func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain, error) {
+func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, checkInValues ...string) (*Domain, error) {
 	k := strings.ToLower(name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2998,10 +3794,11 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain
 		return nil, fmt.Errorf("type %q already exists", name)
 	}
 	d := &Domain{
-		Name:    k,
-		OID:     c.nextOID,
-		Base:    base,
-		NotNull: notNull,
+		Name:          k,
+		OID:           c.nextOID,
+		Base:          base,
+		NotNull:       notNull,
+		CheckInValues: checkInValues,
 	}
 	c.nextOID++
 	c.domains[k] = d
@@ -3041,16 +3838,15 @@ func (c *InMemory) ResolveColumnType(typeName string) string {
 	k := strings.ToLower(typeName)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	// Check domain.
+	// Check domain: resolve to base type.
 	if d, ok := c.domains[k]; ok {
 		baseName := strings.ToLower(d.Base.Name)
 		// Recurse (without lock reacquire — use direct map lookup).
 		return c.resolveColumnTypeLocked(baseName)
 	}
-	// Check enum.
-	if _, ok := c.enumTypes[k]; ok {
-		return "text"
-	}
+	// Enum types: preserve the enum type name (NOT "text") so the executor
+	// can look up sort order for ORDER BY semantics (M0097-enum).
+	// Encoding/decoding still works via the varlena-text default path.
 	return typeName
 }
 
@@ -3059,9 +3855,6 @@ func (c *InMemory) resolveColumnTypeLocked(typeName string) string {
 	k := strings.ToLower(typeName)
 	if d, ok := c.domains[k]; ok {
 		return c.resolveColumnTypeLocked(strings.ToLower(d.Base.Name))
-	}
-	if _, ok := c.enumTypes[k]; ok {
-		return "text"
 	}
 	return typeName
 }

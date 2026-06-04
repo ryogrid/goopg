@@ -268,6 +268,71 @@ func fkConstraintName(childTbl *catalog.Table, fk catalog.ForeignKey) string {
 	return fmt.Sprintf("%s_%s_fkey", tbl, col)
 }
 
+// checkFKColumnTypeCompatibility verifies that the referencing column type is
+// compatible with the referenced column type.  For user-defined enum types the
+// types must be identical; for other types no check is performed (implicit
+// casts handled at query time).  Called at CREATE TABLE time.
+func checkFKColumnTypeCompatibility(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, refColTypeName string, pos int) error {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	// Only check if the referencing column is a known enum type.
+	if _, isEnum := im.LookupEnum(refColTypeName); !isEnum {
+		return nil
+	}
+	// Look up the referenced table.
+	refTbl, found := ctx.Catalog.LookupTable(parser.ObjectName{Name: fk.RefTable})
+	if !found || refTbl == nil {
+		return nil
+	}
+	// Determine referenced column name.
+	refColName := ""
+	if len(fk.RefColumns) > 0 {
+		refColName = fk.RefColumns[0]
+	} else {
+		for _, idx := range ctx.Catalog.IndexesOnTable(refTbl) {
+			if idx.Primary && len(idx.Columns) > 0 {
+				refColName = idx.Columns[0]
+				break
+			}
+		}
+	}
+	if refColName == "" {
+		return nil
+	}
+	// Find the referenced column type.
+	referencedTypeName := ""
+	for _, col := range refTbl.Columns {
+		if strings.EqualFold(col.Name, refColName) {
+			referencedTypeName = col.Type.Name
+			break
+		}
+	}
+	if referencedTypeName == "" {
+		return nil
+	}
+	// Both sides must be the same enum type.
+	if strings.EqualFold(refColTypeName, referencedTypeName) {
+		return nil
+	}
+	constraintName := fkConstraintName(childTbl, fk)
+	childColName := ""
+	if len(fk.Columns) > 0 {
+		childColName = fk.Columns[0]
+	}
+	return &ExecError{
+		Code: "42804",
+		Pos:  pos,
+		Message: fmt.Sprintf(
+			"foreign key constraint %q cannot be implemented",
+			constraintName),
+		Detail: fmt.Sprintf(
+			"Key columns %q of the referencing table and %q of the referenced table are of incompatible types: %s and %s.",
+			childColName, refColName, refColTypeName, referencedTypeName),
+	}
+}
+
 // fkValsForDetail renders FK column values for the PostgreSQL-style DETAIL
 // line `Key (col)=(val) is not present in table "<parent>".`
 func fkValsForDetail(vals []Datum) string {
@@ -293,10 +358,23 @@ func assertNoChildRows(ctx *Context, childTbl *catalog.Table, fk catalog.Foreign
 		return err
 	}
 	if found {
+		constraintName := fkConstraintName(childTbl, fk)
+		// Resolve the referenced (parent) columns for the DETAIL line.
+		// If RefColumns is empty, the FK references the parent's PK.
+		refCols := fk.RefColumns
+		if len(refCols) == 0 {
+			if parentTbl, ok2 := ctx.Catalog.(*catalog.InMemory); ok2 {
+				if pt, ok3 := parentTbl.LookupTable(parser.ObjectName{Name: fk.RefTable}); ok3 {
+					refCols = pkColumns(pt)
+				}
+			}
+		}
 		return &ExecError{
 			Code:    "23503",
-			Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint on table %q",
-				fk.RefTable, childTbl.Name),
+			Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint %q on table %q",
+				fk.RefTable, constraintName, childTbl.Name),
+			Detail: fmt.Sprintf("Key (%s)=(%s) is still referenced from table %q.",
+				strings.Join(refCols, ", "), fkValsForDetail(vals), childTbl.Name),
 		}
 	}
 	return nil
@@ -933,15 +1011,34 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 	if len(tbl.CheckConstraints) == 0 {
 		return nil
 	}
+	// Build FROM clause with actual column values so the planner can
+	// resolve column names. Format:
+	//   SELECT (expr) FROM (VALUES (v1::t1, v2::t2,...)) AS _chk(c1, c2,...)
+	colNames := make([]string, len(tbl.Columns))
+	for i, col := range tbl.Columns {
+		colNames[i] = col.Name
+	}
+	colNamesJoined := strings.Join(colNames, ", ")
+
 	for _, exprSQL := range tbl.CheckConstraints {
 		if exprSQL == "" {
 			continue
 		}
-		// Parse the CHECK expression as a SQL expression.
-		fullSQL := "SELECT (" + exprSQL + ")"
+		// Build actual-value from clause for this row.
+		colVals := make([]string, len(tbl.Columns))
+		for i, col := range tbl.Columns {
+			if i < len(row) && !row[i].IsNull() {
+				v := row[i].Format()
+				colVals[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::" + col.Type.Name
+			} else {
+				colVals[i] = "NULL::" + col.Type.Name
+			}
+		}
+		rowFrom := " FROM (VALUES (" + strings.Join(colVals, ", ") + ")) AS _chk(" + colNamesJoined + ")"
+		fullSQL := "SELECT (" + exprSQL + ")" + rowFrom
 		stmts, err := parser.Parse(fullSQL)
 		if err != nil || len(stmts) == 0 {
-			continue // invalid check expr: skip
+			continue
 		}
 		plan, err := planner.Plan(stmts[0], ctx.Catalog)
 		if err != nil {
@@ -951,24 +1048,26 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 		if err != nil {
 			continue
 		}
-		// Build a synthetic slot from the row so the CHECK expression
-		// can reference column values.
 		synthCtx := *ctx
-		synthCtx.OuterRows = append(synthCtx.OuterRows, row)
 		if err := op.Open(&synthCtx); err != nil {
 			op.Close()
 			continue
 		}
 		slot, err2 := op.Next()
+		// Read slot data BEFORE Close (Close releases the backing row memory).
+		var result Datum
+		hasResult := false
+		if err2 == nil && slot != nil {
+			sr := slotRow(slot)
+			if len(sr) > 0 {
+				result = sr[0]
+				hasResult = true
+			}
+		}
 		op.Close()
-		if err2 != nil || slot == nil {
+		if !hasResult {
 			continue
 		}
-		sr := slotRow(slot)
-		if len(sr) == 0 {
-			continue
-		}
-		result := sr[0]
 		// NULL check result → pass (SQL NULL is not a constraint failure)
 		if result.IsNull() {
 			continue

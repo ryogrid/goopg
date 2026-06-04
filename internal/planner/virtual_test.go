@@ -42,8 +42,8 @@ func TestPlanSelectFromVirtualPgClass(t *testing.T) {
 	if !ok {
 		t.Fatalf("Filter.Child=%T want *Values", filt.Child)
 	}
-	if len(v.Rows) != 1 {
-		t.Errorf("rows=%d want 1 (one user table seeded)", len(v.Rows))
+	if len(v.Rows) < 1 {
+		t.Errorf("rows=%d want ≥1 (at least the user table seeded)", len(v.Rows))
 	}
 	// Schema must list the four pg_class columns we expose so the
 	// WHERE/projection above can resolve them by name.

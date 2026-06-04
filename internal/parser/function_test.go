@@ -101,27 +101,31 @@ func TestParseCreateFunctionExplicitIN(t *testing.T) {
 
 // TestParseCreateFunctionRejectsOutInout guards Stage A's scope: OUT / INOUT
 // are not yet supported. VARIADIC is now accepted (M0097-0117).
-func TestParseCreateFunctionRejectsOutInoutVariadic(t *testing.T) {
-	// OUT and INOUT are still rejected.
-	rejectCases := []string{
-		`CREATE FUNCTION f(OUT y int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN END $$`,
-		`CREATE FUNCTION f(INOUT y int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN END $$`,
+func TestParseCreateFunctionAcceptsOutInoutVariadic(t *testing.T) {
+	// OUT, INOUT, and VARIADIC are all accepted for functions.
+	acceptCases := []struct {
+		src  string
+		mode FuncArgMode
+	}{
+		{`CREATE FUNCTION f(OUT y int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN END $$`, FuncArgOut},
+		{`CREATE FUNCTION f(INOUT y int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN END $$`, FuncArgInout},
+		{`CREATE FUNCTION f(VARIADIC y int) RETURNS int LANGUAGE sql AS $$ SELECT $1 $$`, FuncArgVariadic},
+		{`CREATE FUNCTION f(a int default 1, out b int) RETURNS int LANGUAGE sql AS $$ SELECT $1 $$`, FuncArgIn},
 	}
-	for _, src := range rejectCases {
-		t.Run(src[:32], func(t *testing.T) {
-			_, err := Parse(src)
-			if err == nil {
-				t.Fatalf("expected parse error")
+	for _, tc := range acceptCases {
+		t.Run(tc.src[:40], func(t *testing.T) {
+			stmts, err := Parse(tc.src)
+			if err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
 			}
-			if !strings.Contains(err.Error(), "Stage A: IN only") {
-				t.Errorf("err = %v, want a Stage-A-only message", err)
+			cf := stmts[0].(*CreateFunctionStmt)
+			if len(cf.Args) == 0 {
+				t.Fatal("no args parsed")
+			}
+			if cf.Args[0].Mode != tc.mode {
+				t.Errorf("Args[0].Mode = %v, want %v", cf.Args[0].Mode, tc.mode)
 			}
 		})
-	}
-	// VARIADIC is now accepted — treat as IN for execution purposes.
-	variadicSQL := `CREATE FUNCTION f(VARIADIC y int) RETURNS int LANGUAGE sql AS $$ SELECT $1 $$`
-	if _, err := Parse(variadicSQL); err != nil {
-		t.Errorf("VARIADIC function rejected: %v", err)
 	}
 }
 

@@ -600,3 +600,84 @@ func pgTextArrayBytes(strs []string) []byte {
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(buf))<<2)
 	return buf
 }
+
+// pgTypeColumnsPG18 mirrors initdb.pgTypeColDefs — the canonical PG18 pg_type
+// row layout (32 columns, matching the Form_pg_type struct in
+// postgres/src/include/catalog/pg_type.h). Used when inserting user-defined
+// type rows (e.g. enum types) into the pg_type heap. M0097-0022.
+func pgTypeColumnsPG18() []catalog.Column {
+	return []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},
+		{Name: "typname", Type: catalog.Type{Name: "name"}},
+		{Name: "typnamespace", Type: catalog.Type{Name: "oid"}},
+		{Name: "typowner", Type: catalog.Type{Name: "oid"}},
+		{Name: "typlen", Type: catalog.Type{Name: "int2"}},
+		{Name: "typbyval", Type: catalog.Type{Name: "bool"}},
+		{Name: "typtype", Type: catalog.Type{Name: "char"}},
+		{Name: "typcategory", Type: catalog.Type{Name: "char"}},
+		{Name: "typispreferred", Type: catalog.Type{Name: "bool"}},
+		{Name: "typisdefined", Type: catalog.Type{Name: "bool"}},
+		{Name: "typdelim", Type: catalog.Type{Name: "char"}},
+		{Name: "typrelid", Type: catalog.Type{Name: "oid"}},
+		{Name: "typsubscript", Type: catalog.Type{Name: "regproc"}},
+		{Name: "typelem", Type: catalog.Type{Name: "oid"}},
+		{Name: "typarray", Type: catalog.Type{Name: "oid"}},
+		{Name: "typinput", Type: catalog.Type{Name: "regproc"}},
+		{Name: "typoutput", Type: catalog.Type{Name: "regproc"}},
+		{Name: "typreceive", Type: catalog.Type{Name: "regproc"}},
+		{Name: "typsend", Type: catalog.Type{Name: "regproc"}},
+		{Name: "typmodin", Type: catalog.Type{Name: "regproc"}},
+		{Name: "typmodout", Type: catalog.Type{Name: "regproc"}},
+		{Name: "typanalyze", Type: catalog.Type{Name: "regproc"}},
+		{Name: "typalign", Type: catalog.Type{Name: "char"}},
+		{Name: "typstorage", Type: catalog.Type{Name: "char"}},
+		{Name: "typnotnull", Type: catalog.Type{Name: "bool"}},
+		{Name: "typbasetype", Type: catalog.Type{Name: "oid"}},
+		{Name: "typtypmod", Type: catalog.Type{Name: "int4"}},
+		{Name: "typndims", Type: catalog.Type{Name: "int4"}},
+		{Name: "typcollation", Type: catalog.Type{Name: "oid"}},
+		{Name: "typdefaultbin", Type: catalog.Type{Name: "pg_node_tree"}},
+		{Name: "typdefault", Type: catalog.Type{Name: "text"}},
+		{Name: "typacl", Type: catalog.Type{Name: "aclitem[]"}},
+	}
+}
+
+// buildUserPGTypeRowForEnum builds a 32-column pg_type Row for a user-defined
+// enum type. The row is PG18-canonical so that a PG18 standby attaching to a
+// goopg basebackup can read it correctly. M0097-0022.
+func buildUserPGTypeRowForEnum(et *catalog.EnumType) Row {
+	return Row{
+		NewIntDatum(int64(et.OID)),          // oid
+		NewStringDatum(et.Name),             // typname (name type)
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
+		NewIntDatum(bootstrapSuperuserOID),  // typowner
+		NewIntDatum(4),                      // typlen (enum = 4 bytes, like oid)
+		NewBoolDatum(false),                 // typbyval
+		NewStringDatum("e"),                 // typtype = 'e' (enum)
+		NewStringDatum("E"),                 // typcategory = TYPCATEGORY_ENUM
+		NewBoolDatum(false),                 // typispreferred
+		NewBoolDatum(true),                  // typisdefined
+		NewStringDatum(","),                 // typdelim
+		NewIntDatum(0),                      // typrelid
+		NewIntDatum(0),                      // typsubscript
+		NewIntDatum(0),                      // typelem
+		NewIntDatum(0),                      // typarray
+		NewIntDatum(0),                      // typinput
+		NewIntDatum(0),                      // typoutput
+		NewIntDatum(0),                      // typreceive
+		NewIntDatum(0),                      // typsend
+		NewIntDatum(0),                      // typmodin
+		NewIntDatum(0),                      // typmodout
+		NewIntDatum(0),                      // typanalyze
+		NewStringDatum("i"),                 // typalign = 'i' (int-aligned, 4-byte)
+		NewStringDatum("p"),                 // typstorage = 'p' (plain)
+		NewBoolDatum(false),                 // typnotnull
+		NewIntDatum(0),                      // typbasetype
+		NewIntDatum(-1),                     // typtypmod
+		NewIntDatum(0),                      // typndims
+		NewIntDatum(0),                      // typcollation
+		NullDatum,                           // typdefaultbin (NULL)
+		NullDatum,                           // typdefault (NULL)
+		NullDatum,                           // typacl (NULL)
+	}
+}

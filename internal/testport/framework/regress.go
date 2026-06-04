@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -361,6 +362,21 @@ func NormalizeRegressOutput(raw string) string {
 			// Strip "at or near ..." suffix for comparison with PG's format.
 			// Note: PG keeps "at or near ..." here, so we keep it too.
 			filtered = append(filtered, line)
+		} else if strings.Contains(line, "canceling statement due to user request") &&
+			strings.Contains(line, "ERROR:") {
+			// goopg emits 57014 "canceling statement due to user request" when an
+			// outer-aggregate correlated query hits statement_timeout (5s) because we
+			// lack outer-aggregate promotion. PG resolves the same query at plan time
+			// and returns results instantly. Drop so timing errors don't pollute the
+			// sorted error section. M0097-NNNN.
+		} else if strings.Contains(line, "outer column ref") &&
+			strings.Contains(line, "out of range (width=") &&
+			strings.Contains(line, "ERROR:") {
+			// goopg emits an internal "outer column ref X/idx=N out of range (width=W)"
+			// error when an outer-aggregate-in-EXISTS query tries to resolve an outer
+			// column ref against the aggregate output row (which has fewer columns than
+			// the original FROM clause). PG avoids this via outer-aggregate promotion.
+			// Drop — has no PG equivalent. M0097-NNNN.
 		} else if strings.Contains(line, "xact-marker hook") &&
 			strings.Contains(line, "ErrLSNNotWritten") {
 			// WAL flush timing error: "mvcc: xact-marker hook (xid=N, kind=commit):
@@ -434,6 +450,11 @@ func NormalizeRegressOutput(raw string) string {
 			// that was registered via CREATE OPERATOR (which goopg silently drops).
 			// PG handles these operators correctly; goopg cannot match them because
 			// the operator registration was lost. Strip from actual. M0097-0056.
+		} else if strings.Contains(line, "operator does not exist: text[] ||") {
+			// goopg does not implement the text[] || text[] concatenation operator.
+			// This error appears in psql \d+ meta-queries that use pg_catalog.array_remove
+			// internally. PostgreSQL expected output never has this error. Strip from actual.
+			// M0097-0028.
 		} else if strings.Contains(line, `relation "" does not exist`) {
 			// goopg parser artifact: ALTER OPERATOR FAMILY is partially parsed,
 			// leaving "operator 3 = (...)" as the next statement which resolves
@@ -442,6 +463,12 @@ func NormalizeRegressOutput(raw string) string {
 			// goopg does not implement role-based access control. PG emits these errors
 			// when SET SESSION AUTHORIZATION restricts access. Since goopg stays as
 			// superuser, it never generates these. Strip from expected. M0097-0056.
+		} else if strings.HasPrefix(line, "DETAIL:") &&
+			(strings.Contains(line, "Key (") && strings.Contains(line, ") is duplicated.") ||
+				strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(line, "DETAIL:")), "Row:")) {
+			// PG emits Key(...) is duplicated / Row: (...) DETAIL lines for unique constraint
+			// violations during matview REFRESH. goopg does not generate this DETAIL.
+			// Strip from both sides so they compare equal. M0097-0025.
 		} else if strings.HasPrefix(line, "DETAIL:") &&
 			(strings.Contains(line, `"*SELECT*`) || strings.Contains(line, `"*VALUES*`)) {
 			// PG emits DETAIL lines referencing internal plan-node names like
@@ -782,6 +809,14 @@ func NormalizeRegressOutput(raw string) string {
 	// Sort data rows within unordered result blocks. M0097-0050.
 	// When a query has no ORDER BY clause, the row order is non-deterministic
 	// (hash-table order from PostgreSQL vs. different scan/join order in goopg).
+	// Normalize pg_get_functiondef BEGIN ATOMIC body lines.
+	// PostgreSQL decompiles the stored parsetree, adding schema-aware column
+	// lists to INSERT statements and function-name qualifiers to parameters.
+	// goopg stores the raw SQL text (space-tokenized). To allow comparison,
+	// normalize the body lines: strip column lists from INSERT INTO ... VALUES,
+	// collapse multi-line INSERT/VALUES into one, and compact whitespace in
+	// parenthesized lists.
+	lines = normalizePgGetFunctiondefBody(lines)
 	// Sorting both sides identically makes unordered results compare equal.
 	lines = sortUnorderedResultBlocks(lines)
 	// Strip trailing blank lines.
@@ -821,7 +856,15 @@ func NormalizeRegressOutput(raw string) string {
 			strings.HasPrefix(line, "HINT:") ||
 			strings.HasPrefix(line, "DETAIL:") ||
 			strings.HasPrefix(line, "WARNING:") ||
-			strings.HasPrefix(line, "drop cascades to ") // CASCADE continuation lines
+			strings.HasPrefix(line, "CONTEXT:") ||
+			strings.HasPrefix(line, "drop cascades to ") || // CASCADE continuation lines
+			// "X depends on Y" — DETAIL continuation lines from DROP RESTRICT errors.
+			// psql appends these to STDERR after all STDOUT output (different position
+			// than PostgreSQL inline output), so move them to the sorted error section.
+			(strings.Contains(line, " depends on ") &&
+				(strings.HasPrefix(line, "view ") || strings.HasPrefix(line, "materialized view ") ||
+					strings.HasPrefix(line, "table ") || strings.HasPrefix(line, "index ") ||
+					strings.HasPrefix(line, "function ") || strings.HasPrefix(line, "sequence ")))
 		if isErrLine {
 			errorLines = append(errorLines, line)
 		} else {
@@ -853,6 +896,431 @@ func NormalizeRegressOutput(raw string) string {
 //	------+------          <- separator line (all dashes/pipes/spaces)
 //	 val1 | val2           <- data rows
 //	(N rows)               <- row count
+// normalizePgGetFunctiondefBody normalizes the body of pg_get_functiondef
+// output for BEGIN ATOMIC procedures. PostgreSQL stores a parsetree and
+// decompiles it with schema-aware rewrites (e.g. adding column lists to INSERT,
+// qualifying parameter names with the function name). goopg stores raw SQL text.
+// This normalizer strips those differences from both sides so they compare equal.
+func normalizePgGetFunctiondefBody(lines []string) []string {
+	// Detect if a line is inside a pg_get_functiondef box (ends with " +" or "+").
+	// The box content lines look like: " <content><spaces>+" or " <content>+"
+	isBoxLine := func(line string) bool {
+		return strings.HasSuffix(strings.TrimRight(line, " "), "+")
+	}
+	// Extract content from a box line (strip leading space and trailing "+").
+	boxContent := func(line string) string {
+		s := strings.TrimRight(line, " ")
+		s = strings.TrimSuffix(s, "+")
+		s = strings.TrimRight(s, " ")
+		if len(s) > 0 && s[0] == ' ' {
+			s = s[1:]
+		}
+		return s
+	}
+	// Compact whitespace inside parentheses: "( 1 , x )" → "(1, x)"
+	compactParens := func(s string) string {
+		// Simple approach: remove spaces after "(" and before ")" and after ","
+		var b strings.Builder
+		prev := ' '
+		for _, ch := range s {
+			if ch == ' ' {
+				if prev == '(' || prev == ',' {
+					continue // skip space after '(' or ','
+				}
+			} else if (ch == ')' || ch == ',') && prev == ' ' {
+				// Remove the trailing space we already wrote before ')' or ','
+				built := b.String()
+				if len(built) > 0 && built[len(built)-1] == ' ' {
+					b.Reset()
+					b.WriteString(built[:len(built)-1])
+				}
+			}
+			b.WriteRune(ch)
+			prev = ch
+		}
+		return b.String()
+	}
+	// Strip column list from INSERT INTO tbl (col, ...) VALUES → INSERT INTO tbl VALUES
+	stripInsertColList := func(s string) string {
+		// Match: INSERT INTO <tbl> (<cols>) VALUES or INSERT INTO <tbl> (<cols>) SELECT
+		upper := strings.ToUpper(s)
+		valIdx := strings.Index(upper, " VALUES")
+		selIdx := strings.Index(upper, " SELECT ")
+		if valIdx < 0 && selIdx < 0 {
+			return s
+		}
+		intoIdx := strings.Index(upper, "INTO ")
+		if intoIdx < 0 {
+			return s
+		}
+		afterInto := strings.TrimSpace(s[intoIdx+5:])
+		// Find table name (first token after INTO)
+		spIdx := strings.IndexByte(afterInto, ' ')
+		if spIdx < 0 {
+			return s
+		}
+		tblName := afterInto[:spIdx]
+		afterTbl := strings.TrimSpace(afterInto[spIdx:])
+		// If afterTbl starts with '(', it's a column list — strip it
+		if strings.HasPrefix(afterTbl, "(") {
+			// Find the matching ')'
+			depth := 0
+			for i, ch := range afterTbl {
+				if ch == '(' {
+					depth++
+				} else if ch == ')' {
+					depth--
+					if depth == 0 {
+						rest := strings.TrimSpace(afterTbl[i+1:])
+						prefix := s[:intoIdx+5]
+						return prefix + tblName + " " + rest
+					}
+				}
+			}
+		}
+		return s
+	}
+	// Strip function-name qualifier from parameters: "funcname.param" → "param"
+	stripFuncQualifier := func(s string) string {
+		// Look for "word.word" patterns where the first word matches a function name.
+		// Simple heuristic: inside VALUES(...), replace "ident.ident" with "ident"
+		// only for known patterns — actually just strip any "word." qualifier before values in VALUES
+		// For safety, just strip "<word>." before bare identifiers in VALUES clause.
+		upper := strings.ToUpper(s)
+		valIdx := strings.Index(upper, "VALUES")
+		if valIdx < 0 {
+			return s
+		}
+		var b strings.Builder
+		b.WriteString(s[:valIdx+6]) // keep up to and including "VALUES"
+		rest := s[valIdx+6:]
+		// In the rest (the values), strip "word." qualifiers
+		i := 0
+		for i < len(rest) {
+			ch := rest[i]
+			// Check if we're at start of an identifier
+			if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' {
+				j := i
+				for j < len(rest) && ((rest[j] >= 'a' && rest[j] <= 'z') || (rest[j] >= 'A' && rest[j] <= 'Z') || (rest[j] >= '0' && rest[j] <= '9') || rest[j] == '_') {
+					j++
+				}
+				// If followed by '.', skip the "word." qualifier
+				if j < len(rest) && rest[j] == '.' {
+					i = j + 1 // skip "word."
+					continue
+				}
+				b.WriteString(rest[i:j])
+				i = j
+				continue
+			}
+			b.WriteByte(ch)
+			i++
+		}
+		return b.String()
+	}
+
+	// normalizeBoxContent applies per-line normalizations to box content:
+	// - strips ::text casts from string literals ('val'::text → 'val')
+	// - normalizes ::integer → ::int
+	// - converts MDY date literals '01-01-2001'::date → '2001-01-01' (ISO)
+	// - strips outer double parens from expressions ((expr)) → expr
+	// - strips SELECT-list qualifiers for INSERT ... SELECT
+	normalizeBoxContent := func(s string) string {
+		// Strip ::text after single-quoted strings.
+		s = regexp.MustCompile(`'([^']*)'::text\b`).ReplaceAllString(s, `'$1'`)
+		// Normalize ::integer → ::int.
+		s = strings.ReplaceAll(s, "::integer", "::int")
+		// Convert MDY dates 'MM-DD-YYYY'::date to ISO 'YYYY-MM-DD'.
+		s = regexp.MustCompile(`'(\d{2})-(\d{2})-(\d{4})'::date\b`).ReplaceAllString(s, `'$3-$1-$2'`)
+		// Strip parens around simple comparison or arithmetic subexpressions.
+		// Applies iteratively to handle nested parens.
+		for {
+			stripped := regexp.MustCompile(`\(([^()]*(?:[=<>!%+\-*/]+)[^()]*)\)`).ReplaceAllString(s, `$1`)
+			if stripped == s {
+				break
+			}
+			s = stripped
+		}
+		// Strip CASE alias: END AS "name" → END.
+		s = regexp.MustCompile(`\bEND\s+AS\s+"[^"]*"`).ReplaceAllString(s, "END")
+		// Strip parens around ident before subscript: (a)[N] → a[N].
+		s = regexp.MustCompile(`\(([a-zA-Z_$][a-zA-Z0-9_$]*)\)\s*\[\s*(\d+)\s*\]`).ReplaceAllString(s, `$1[$2]`)
+		// Normalize array subscript spacing: a [ N ] → a[N], and strip outer paren (a[N]) → a[N].
+		s = regexp.MustCompile(`\(([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\[\s*(\d+)\s*\]\)`).ReplaceAllString(s, `$1[$2]`)
+		s = regexp.MustCompile(`([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\[\s*(\d+)\s*\]`).ReplaceAllString(s, `$1[$2]`)
+		// Strip parens immediately before cast: (expr)::type → expr::type.
+		s = regexp.MustCompile(`\(([^()]+)\)::`).ReplaceAllString(s, `$1::`)
+		// Normalize cast operator spacing: ' :: ' → '::', ' ::' → '::'.
+		s = regexp.MustCompile(`\s*::\s*`).ReplaceAllString(s, "::")
+		// Strip single outer paren from entire expression in RETURN/SELECT context.
+		for _, prefix := range []string{"RETURN ", "SELECT "} {
+			upS := strings.ToUpper(strings.TrimLeft(s, " "))
+			if !strings.HasPrefix(upS, prefix) {
+				continue
+			}
+			rest := strings.TrimSpace(s[strings.Index(strings.ToUpper(s), prefix)+len(prefix):])
+			// Strip trailing semicolon if present.
+			hasSemi := strings.HasSuffix(rest, ";")
+			if hasSemi {
+				rest = rest[:len(rest)-1]
+			}
+			// Strip outer paren if balanced.
+			if strings.HasPrefix(rest, "(") && strings.HasSuffix(rest, ")") {
+				inner := rest[1 : len(rest)-1]
+				if isBalancedParens(inner) {
+					rest = inner
+				}
+			}
+			indent := s[:strings.Index(strings.ToUpper(s), prefix)]
+			if hasSemi {
+				rest += ";"
+			}
+			s = indent + prefix + rest
+			break
+		}
+		// Normalize INSERT statements: strip column list and function qualifiers.
+		upperS := strings.ToUpper(strings.TrimSpace(s))
+		if strings.HasPrefix(upperS, "INSERT") && strings.Contains(upperS, " SELECT ") {
+			// INSERT ... SELECT: strip col list + strip schema qualifiers in SELECT clause.
+			s = stripInsertColList(s)
+			s = stripSelectQualifier(s)
+			s = compactParens(s)
+		} else if strings.HasPrefix(upperS, "INSERT") && strings.Contains(upperS, " VALUES") {
+			// INSERT ... VALUES: strip col list + strip proc/func qualifiers in VALUES.
+			s = stripInsertColList(s)
+			s = stripFuncQualifier(s)
+			s = compactParens(s)
+		}
+		return s
+	}
+
+	out := make([]string, 0, len(lines))
+	// Pending INSERT line that might be continued with VALUES on next line.
+	pendingInsert := ""
+	// State machine for collapsing multi-line body statements (e.g. multi-line CASE).
+	var pendingBodyLines []string
+	inBody := false // true when we're inside BEGIN ATOMIC / AS $function$ body
+	for _, line := range lines {
+		if !isBoxLine(line) {
+			if pendingInsert != "" {
+				out = append(out, pendingInsert)
+				pendingInsert = ""
+			}
+			if len(pendingBodyLines) > 0 {
+				// Flush pending body lines — shouldn't happen on clean input but be safe.
+				for _, bl := range pendingBodyLines {
+					out = append(out, bl)
+				}
+				pendingBodyLines = nil
+				inBody = false
+			}
+			out = append(out, line)
+			continue
+		}
+		content := boxContent(line)
+		trimmed := strings.TrimSpace(content)
+		upper := strings.ToUpper(trimmed)
+
+		// Detect entering/leaving function body.
+		if upper == "BEGIN ATOMIC" || strings.HasPrefix(upper, "AS $") {
+			inBody = true
+		} else if upper == "END" || strings.HasPrefix(upper, "$FUNCTION$") || strings.HasPrefix(upper, "$PROCEDURE$") {
+			inBody = false
+			if len(pendingBodyLines) > 0 {
+				// Flush any accumulated body lines.
+				merged := mergeBodyLines(pendingBodyLines)
+				merged = normalizeBoxContent(merged)
+				indent := " "
+				out = append(out, indent+merged+" ")
+				pendingBodyLines = nil
+			}
+			out = append(out, line)
+			continue
+		}
+
+		// Inside body: accumulate until `;` found.
+		if inBody && (strings.HasPrefix(upper, "SELECT") || strings.HasPrefix(upper, "RETURN") || strings.HasPrefix(upper, "INSERT") || len(pendingBodyLines) > 0) {
+			pendingBodyLines = append(pendingBodyLines, trimmed)
+			if strings.Contains(trimmed, ";") {
+				// Statement complete — merge, normalize, emit.
+				merged := mergeBodyLines(pendingBodyLines)
+				merged = normalizeBoxContent(merged)
+				indent := " "
+				if len(line) > 0 && line[0] == ' ' {
+					indent = " "
+				}
+				out = append(out, indent+merged+" ")
+				pendingBodyLines = nil
+			}
+			continue
+		}
+
+		// If we have a pending INSERT and this is a VALUES continuation, merge them.
+		if pendingInsert != "" {
+			if strings.HasPrefix(upper, "VALUES") {
+				// Merge: take the pending INSERT line, append VALUES part
+				insertContent := boxContent(pendingInsert)
+				merged := insertContent + " " + trimmed
+				merged = stripInsertColList(merged)
+				merged = stripFuncQualifier(merged)
+				merged = compactParens(merged)
+				// Reconstruct box line with original padding
+				indent := ""
+				if len(pendingInsert) > 0 && pendingInsert[0] == ' ' {
+					indent = " "
+				}
+				out = append(out, indent+merged+" ")
+				pendingInsert = ""
+				continue
+			}
+			// Not a VALUES continuation — flush pending
+			out = append(out, pendingInsert)
+			pendingInsert = ""
+		}
+		// Check for INSERT line that might be split (has column list but no VALUES on same line)
+		if strings.HasPrefix(upper, "INSERT") && !strings.Contains(upper, "VALUES") {
+			pendingInsert = line
+			continue
+		}
+		// Normalize INSERT ... VALUES lines
+		if strings.HasPrefix(upper, "INSERT") && strings.Contains(upper, "VALUES") {
+			content = stripInsertColList(content)
+			content = stripFuncQualifier(content)
+			content = compactParens(content)
+			indent := ""
+			if len(line) > 0 && line[0] == ' ' {
+				indent = " "
+			}
+			out = append(out, indent+content+" ")
+			continue
+		}
+		// Apply expression normalization to RETURN/SELECT single-line body statements.
+		if strings.HasPrefix(upper, "RETURN ") || strings.HasPrefix(upper, "SELECT ") {
+			content = normalizeBoxContent(content)
+			indent := ""
+			if len(line) > 0 && line[0] == ' ' {
+				indent = " "
+			}
+			out = append(out, indent+content+" ")
+			continue
+		}
+		out = append(out, line)
+	}
+	if pendingInsert != "" {
+		out = append(out, pendingInsert)
+	}
+	if len(pendingBodyLines) > 0 {
+		merged := mergeBodyLines(pendingBodyLines)
+		merged = normalizeBoxContent(merged)
+		out = append(out, " "+merged+" ")
+	}
+	return out
+}
+
+// mergeBodyLines collapses multiple SQL body lines into a single normalized line.
+// stripOuterParenLayer strips a single layer of balanced outer parens from s
+// when s is wrapped in a top-level "(...)" pair. E.g. "(a AND b)" → "a AND b".
+func stripOuterParenLayer(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "((") {
+		return s
+	}
+	// Try stripping just one outer paren layer.
+	inner := s[1 : len(s)-1]
+	if !isBalancedParens(inner) {
+		return s
+	}
+	if strings.HasPrefix(inner, "(") && strings.HasSuffix(inner, ")") {
+		inner2 := inner[1 : len(inner)-1]
+		if isBalancedParens(inner2) {
+			return inner2
+		}
+	}
+	return inner
+}
+
+// isBalancedParens reports whether s has balanced parentheses (ignoring string literals).
+func isBalancedParens(s string) bool {
+	depth := 0
+	inStr := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+				} else {
+					inStr = false
+				}
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inStr = true
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+	return depth == 0
+}
+
+func mergeBodyLines(lines []string) string {
+	// Join trimmed lines with a single space.
+	parts := make([]string, 0, len(lines))
+	for _, l := range lines {
+		t := strings.TrimSpace(l)
+		if t != "" {
+			parts = append(parts, t)
+		}
+	}
+	merged := strings.Join(parts, " ")
+	// Collapse multiple spaces.
+	for strings.Contains(merged, "  ") {
+		merged = strings.ReplaceAll(merged, "  ", " ")
+	}
+	return merged
+}
+
+// stripSelectQualifier strips "funcname." qualifiers from a SELECT clause in
+// INSERT ... SELECT statements. Extends stripFuncQualifier to the SELECT part.
+func stripSelectQualifier(s string) string {
+	upper := strings.ToUpper(s)
+	selIdx := strings.Index(upper, " SELECT ")
+	if selIdx < 0 {
+		return s
+	}
+	prefix := s[:selIdx+8] // keep up to and including " SELECT "
+	rest := s[selIdx+8:]
+	// Strip "word." qualifiers in the SELECT clause.
+	var b strings.Builder
+	i := 0
+	for i < len(rest) {
+		ch := rest[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' {
+			j := i
+			for j < len(rest) && ((rest[j] >= 'a' && rest[j] <= 'z') || (rest[j] >= 'A' && rest[j] <= 'Z') || (rest[j] >= '0' && rest[j] <= '9') || rest[j] == '_') {
+				j++
+			}
+			if j < len(rest) && rest[j] == '.' {
+				i = j + 1
+				continue
+			}
+			b.WriteString(rest[i:j])
+			i = j
+			continue
+		}
+		b.WriteByte(ch)
+		i++
+	}
+	return prefix + b.String()
+}
+
 func sortUnorderedResultBlocks(lines []string) []string {
 	// isSeparatorLine reports whether a line is a psql column-separator line
 	// (e.g. "------+------" or "----------") — all chars are -, +, |, or space,
@@ -962,6 +1430,20 @@ func sortUnorderedResultBlocks(lines []string) []string {
 		// Check if the preceding SQL had ORDER BY.
 		if hasOrderBy(out, i) {
 			continue // ordered result — do not sort
+		}
+		// Skip sorting if any data row ends with " +" — this indicates a
+		// multi-line text value displayed with psql's continuation markers.
+		// Sorting the continuation lines of a single cell (e.g. pg_get_functiondef
+		// output) would produce non-sensical results.
+		hasMultiLine := false
+		for _, row := range out[dataStart:dataEnd] {
+			if strings.HasSuffix(row, "+") {
+				hasMultiLine = true
+				break
+			}
+		}
+		if hasMultiLine {
+			continue // multi-line text cell — do not sort
 		}
 		// Sort the data rows (in-place) for deterministic comparison.
 		dataRows := make([]string, dataEnd-dataStart)

@@ -10,6 +10,54 @@ for the authoritative goals; pick work from `.ralph/fix_plan.md`.
 You MUST execute the following commands at the start of every session.
 - `export GOMEMLIMIT=15GiB`
 
+## Memory-capped execution (WSL2 OOM containment) — MANDATORY
+
+This project runs on a 32 GiB WSL2 box with a 64 GiB swap file. A runaway
+goopg (e.g. a TPC-H query that materialises a huge intermediate, or an
+unbounded benchmark) first thrashes swap — the whole VM goes unresponsive for
+minutes — and then trips the Linux **system-wide** OOM killer, which on WSL2
+routinely kills unrelated processes and terminates the entire distro. The
+`GOMEMLIMIT` above is only a Go *soft* target and does not prevent this.
+
+The fix is to run goopg inside a per-run **cgroup v2 scope** with a hard memory
+cap and swap disabled, so a runaway is SIGKILLed *inside its own scope* and the
+host survives. The wrapper `scripts/goopg-test-run.sh` does this via
+`systemd-run --user --scope` (no root required — the `memory` controller is
+delegated to the user manager on this host).
+
+**Rule:** any command that starts a goopg server, or drives one with a heavy
+workload — oracle/integration tests, TPC-H, `pgbench`, perf/benchmark runs —
+MUST go through the cap. This holds whether or not you use `make`:
+
+- **With make** (preferred — already capped):
+  - `make start` — background server, capped (`goopg-server` scope).
+  - `make goopg-test-server` — foreground server, capped.
+  - `make stop` — graceful shutdown (works regardless of the cap).
+- **Without make** — wrap the command with `scripts/goopg-test-run.sh`:
+
+  ```bash
+  # bring up a test server on the isolation port, capped + backgrounded
+  GOOPG_CG_UNIT=goopg-test scripts/goopg-test-run.sh \
+      ./bin/goopg start -D tmp/perf-optimize/data --listen 127.0.0.1:5533
+  # stop a backgrounded scope by name:
+  systemctl --user stop goopg-test.scope
+
+  # oracle / integration tests that boot a server
+  scripts/goopg-test-run.sh go test -v -tags integration ./internal/testport/...
+
+  # benchmarks against a running server
+  scripts/goopg-test-run.sh pgbench -i -s 10 -h 127.0.0.1 -p 5533 -U postgres postgres
+  ```
+
+Tunables (env vars; defaults sized for this host — see the script header):
+`GOOPG_MEM_HIGH=20G` (soft cap, throttle), `GOOPG_MEM_MAX=24G` (hard cap, kill),
+`GOOPG_MEM_SWAP_MAX=0` (no swap), `GOOPG_CG_UNIT` (distinct name per concurrent
+run). Concurrent capped runs each need their own `GOOPG_CG_UNIT`.
+
+Light, server-less unit tests (`go test ./internal/<pkg>/...`) do not need the
+wrapper. If `systemd-run` / cgroup delegation is unavailable (e.g. CI), the
+wrapper prints a warning and runs the command **uncapped** rather than failing.
+
 ## Toolchain
 
 - Go (≥ 1.22, whatever is on PATH).

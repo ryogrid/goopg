@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -81,6 +82,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execDropSubscription(s)
 	case *parser.CreateFunctionStmt:
 		return nil, o.execCreateFunction(s)
+	case *parser.AlterFunctionStmt:
+		return nil, o.execAlterFunction(s)
 	case *parser.DropFunctionStmt:
 		return nil, o.execDropFunction(s)
 	case *parser.CreateProcedureStmt:
@@ -388,6 +391,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 	}
+	// Track which column names came from INHERITS (used below for LIKE merge vs error).
+	inheritedColNames := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		inheritedColNames[strings.ToLower(c.Name)] = true
+	}
+
+	// CHECK constraints to inherit from LIKE INCLUDING CONSTRAINTS clauses.
+	var likeCheckConstraints []string
 	// Append body elements in declaration order: explicit columns and LIKE clauses
 	// interleaved by their BodyOrder. M0097-0069.
 	if len(s.BodyOrder) > 0 {
@@ -397,6 +408,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			colByName[strings.ToLower(c.Name)] = c
 		}
 		// Build a lookup for LIKE sources.
+		_ = likeCheckConstraints // will be populated below for LIKE INCLUDING CONSTRAINTS
 		likeByKey := make(map[string]*catalog.Table)
 		for _, likeName := range s.LikeTables {
 			src, ok := o.ctx.Catalog.LookupTable(likeName)
@@ -414,19 +426,30 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			cols = append(cols, catalog.Column{
 				Name:            c.Name,
 				Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
-				NotNull:         c.NotNull,
+				NotNull:         c.NotNull || c.IdentityColumn,
 				GeneratedExpr:   c.GeneratedExpr,
 				GeneratedAlways: c.GeneratedAlways,
 				DefaultExpr:     c.DefaultExpr,
+				IdentityColumn:  c.IdentityColumn,
 			})
 		}
 		for _, item := range s.BodyOrder {
 			if strings.HasPrefix(item, "@@LIKE:") {
-				src, ok := likeByKey[item]
+				// Parse the like key and flags: "@@LIKE:tablename[:+identity][:+generated]"
+				// Strip flags from the key to look up the source table.
+				likeFlags := item
+				baseParts := strings.Split(item, ":")
+				baseKey := baseParts[0] + ":" + baseParts[1] // "@@LIKE:tablename"
+				includeIdentity := strings.Contains(likeFlags, ":+identity")
+				includeGenerated := strings.Contains(likeFlags, ":+generated")
+				includeDefaults := strings.Contains(likeFlags, ":+defaults")
+				includeConstraints := strings.Contains(likeFlags, ":+constraints")
+				src, ok := likeByKey[baseKey]
 				if !ok {
 					continue
 				}
 				for _, sc := range src.Columns {
+					colNameLower := strings.ToLower(sc.Name)
 					found := false
 					for _, ec := range cols {
 						if strings.EqualFold(ec.Name, sc.Name) {
@@ -434,9 +457,67 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 							break
 						}
 					}
-					if !found {
-						c := sc
-						cols = append(cols, c)
+					if found {
+						if inheritedColNames[colNameLower] {
+							// Column came from INHERITS — emit NOTICE "merging column X with
+							// inherited definition" and skip (matches PostgreSQL merge semantics).
+							o.ctx.AddNotice(fmt.Sprintf("merging column %q with inherited definition", sc.Name))
+						} else {
+							// Column already defined by an explicit column or a previous LIKE clause.
+							// PostgreSQL raises "column X specified more than once" (42701).
+							return &ExecError{
+								Code:    "42701",
+								Pos:     s.Pos(),
+								Message: fmt.Sprintf("column %q specified more than once", sc.Name),
+							}
+						}
+						// Either way, skip (don't add the column again) and continue.
+						if includeConstraints {
+							for _, chk := range src.CheckConstraints {
+								found := false
+								for _, existing := range likeCheckConstraints {
+									if existing == chk {
+										found = true
+										break
+									}
+								}
+								if !found {
+									likeCheckConstraints = append(likeCheckConstraints, chk)
+								}
+							}
+						}
+						continue
+					}
+					c := sc
+					// Clear IdentityColumn unless INCLUDING IDENTITY or INCLUDING ALL was specified.
+					if !includeIdentity {
+						c.IdentityColumn = false
+					}
+					// Clear GeneratedAlways/GeneratedExpr unless INCLUDING GENERATED or INCLUDING ALL.
+					if !includeGenerated {
+						c.GeneratedAlways = false
+						c.GeneratedExpr = ""
+					}
+					// Clear DefaultExpr unless INCLUDING DEFAULTS or INCLUDING ALL was specified.
+					if !includeDefaults {
+						c.DefaultExpr = nil
+					}
+					cols = append(cols, c)
+					// Copy CHECK constraints from source table when INCLUDING CONSTRAINTS.
+					if includeConstraints {
+						for _, chk := range src.CheckConstraints {
+							// Avoid duplicating constraints already present (e.g. from column-level).
+							found := false
+							for _, existing := range likeCheckConstraints {
+								if existing == chk {
+									found = true
+									break
+								}
+							}
+							if !found {
+								likeCheckConstraints = append(likeCheckConstraints, chk)
+							}
+						}
 					}
 				}
 			} else {
@@ -469,6 +550,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	// If the table was created without an explicit schema qualifier, record the
+	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
+	// Temp tables are session-scoped and not schema-tracked. M0097-0022.
+	if s.Name.Schema == "" && !s.Temporary {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			tbl.Schema = ws
+		}
+	}
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -480,7 +569,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Register FK constraints from inline REFERENCES clauses. M0096-0011.
 	for _, c := range s.Columns {
 		if c.RefTable.Name != "" {
-			tbl.ForeignKeys = append(tbl.ForeignKeys, catalog.ForeignKey{
+			fk := catalog.ForeignKey{
 				Columns:           []string{c.Name},
 				RefTable:          c.RefTable.Name,
 				RefColumns:        c.RefColumns,
@@ -488,36 +577,46 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				OnUpdate:          c.OnUpdate,
 				Deferrable:        c.FKDeferrable,
 				InitiallyDeferred: c.FKInitiallyDeferred,
-			})
+			}
+			// Check type compatibility between referencing and referenced column.
+			if err := checkFKColumnTypeCompatibility(o.ctx, tbl, fk, c.Type.Name, s.Pos()); err != nil {
+				return err
+			}
+			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		}
 	}
-	// Register implicit sequences for SERIAL / BIGSERIAL / SMALLSERIAL columns.
+	// Register implicit sequences for SERIAL / BIGSERIAL / SMALLSERIAL columns
+	// and GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
+	// Uses `cols` (not s.Columns) so LIKE-copied identity columns are also covered.
 	// M0097-0009: creates the sequence so nextval() works for default generation.
-	for _, c := range s.Columns {
+	for _, c := range cols {
 		colTypeLow := strings.ToLower(c.Type.Name)
 		var seqMin, seqMax int64
+		isSerial := false
 		switch colTypeLow {
 		case "serial", "int4", "integer":
-			// serial = int4 range
 			seqMin, seqMax = 1, 2147483647
+			isSerial = colTypeLow == "serial"
 		case "bigserial", "int8", "bigint":
 			seqMin, seqMax = 1, 9223372036854775807
+			isSerial = colTypeLow == "bigserial"
 		case "smallserial", "int2", "smallint":
 			seqMin, seqMax = 1, 32767
-		default:
-			continue
+			isSerial = colTypeLow == "smallserial"
 		}
-		if colTypeLow != "serial" && colTypeLow != "bigserial" && colTypeLow != "smallserial" {
-			continue // only register sequences for serial types
+		if !isSerial && !c.IdentityColumn {
+			continue // only register sequences for serial/identity types
 		}
 		seqName := strings.ToLower(s.Name.Name) + "_" + strings.ToLower(c.Name) + "_seq"
 		RegisterSequence(seqName, 1, 1, seqMin, seqMax, false)
 	}
+
 	// If PARTITION BY, annotate the table with partition metadata
 	if s.PartitionBy != nil {
 		tbl.PartitionMethod = s.PartitionBy.Method
 		tbl.PartitionKey = s.PartitionBy.KeyCols
 		tbl.PartitionKeyOpClasses = s.PartitionBy.OpClasses
+		tbl.PartitionKeyExprs = s.PartitionBy.KeyExprs // M0097-0023: expression keys
 		// Partitioned tables are "virtual" for storage purposes:
 		// they never hold rows directly — all data lives in children.
 		// But we still create a heap so the table exists for metadata.
@@ -568,6 +667,31 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			return err
 		}
 	}
+	// Create btree indexes for inline column-level UNIQUE constraints.
+	// e.g. `CREATE TABLE t (a int UNIQUE, b text)` — M0097-0028.
+	for _, c := range s.Columns {
+		if c.Unique {
+			idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + c.Name + "_key"}
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false); err != nil {
+				return err
+			}
+		}
+	}
+	// Create btree indexes for table-level UNIQUE (col1, col2) constraints.
+	// e.g. `UNIQUE (a, b)` — M0097-0028.
+	for i, cols := range s.TableUniques {
+		suffix := "_key"
+		if len(cols) == 1 {
+			suffix = "_" + cols[0] + "_key"
+		}
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: fmt.Sprintf("%s%s%d", tbl.Name, suffix, i)}
+		if len(s.TableUniques) == 1 {
+			idxName.Name = tbl.Name + suffix
+		}
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, cols, nil, true, false); err != nil {
+			return err
+		}
+	}
 	// Register CHECK constraints from columns and table-level. M0097-0014.
 	for _, c := range s.Columns {
 		if c.CheckExpr != "" {
@@ -575,6 +699,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 	}
 	tbl.CheckConstraints = append(tbl.CheckConstraints, s.TableChecks...)
+	// Apply LIKE INCLUDING CONSTRAINTS checks (copied from LIKE source tables).
+	tbl.CheckConstraints = append(tbl.CheckConstraints, likeCheckConstraints...)
 	return nil
 }
 
@@ -621,6 +747,14 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// If the table was created without an explicit schema qualifier, record the
+	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
+	// M0097-0022.
+	if s.Name.Schema == "" {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			tbl.Schema = ws
+		}
 	}
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
@@ -679,6 +813,14 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	// If the table was created without an explicit schema qualifier, record the
+	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
+	// M0097-0022.
+	if s.Name.Schema == "" {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			tbl.Schema = ws
+		}
+	}
 	// Set partition metadata on the child.
 	tbl.PartitionParentOID = parent.OID
 	// Use the child's own PARTITION BY clause when present (e.g. nested
@@ -688,6 +830,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		tbl.PartitionMethod = s.PartitionBy.Method
 		tbl.PartitionKey = s.PartitionBy.KeyCols
 		tbl.PartitionKeyOpClasses = s.PartitionBy.OpClasses
+		tbl.PartitionKeyExprs = s.PartitionBy.KeyExprs // M0097-0023
 	}
 
 	// Build partition bounds from the FOR VALUES clause.
@@ -767,6 +910,15 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			return err
 		}
 	}
+	// Create btree indexes for UNIQUE column constraints declared directly on
+	// this partition: `CREATE TABLE child PARTITION OF parent (b UNIQUE) FOR VALUES …`.
+	// M0097-0028.
+	for _, colName := range poc.UniqueColumns {
+		childIdxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + colName + "_key"}
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, []string{colName}, nil, true, false); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -779,6 +931,70 @@ func exprToString(e parser.Expr) string {
 		return v.Value
 	case *parser.NullConst:
 		return "null"
+	}
+	return fmt.Sprintf("%v", e)
+}
+
+// defaultExprToSQL converts a default-argument expression to a SQL string
+// that can be re-evaluated at call time. Handles literal constants; for
+// complex expressions it falls back to a best-effort fmt.Sprintf form.
+func defaultExprToSQL(e parser.Expr) string {
+	if e == nil {
+		return ""
+	}
+	switch v := e.(type) {
+	case *parser.IntegerConst:
+		return fmt.Sprintf("%d", v.Value)
+	case *parser.StringConst:
+		return "'" + strings.ReplaceAll(v.Value, "'", "''") + "'"
+	case *parser.NumericConst:
+		return v.Value
+	case *parser.NullConst:
+		return "NULL"
+	case *parser.BooleanConst:
+		if v.Value {
+			return "true"
+		}
+		return "false"
+	case *parser.ColumnRef:
+		if v.Table != "" {
+			return v.Table + "." + v.Column
+		}
+		return v.Column
+	case *parser.FuncCall:
+		var args []string
+		for _, a := range v.Args {
+			args = append(args, defaultExprToSQL(a))
+		}
+		name := v.Name.Name
+		if v.Name.Schema != "" {
+			name = v.Name.Schema + "." + name
+		}
+		return name + "(" + strings.Join(args, ", ") + ")"
+	case *parser.CastExpr:
+		return defaultExprToSQL(v.Operand) + "::" + v.Type.Name
+	case *parser.UnaryOp:
+		switch v.Op {
+		case parser.OpSub:
+			return "-" + defaultExprToSQL(v.Operand)
+		case parser.OpNot:
+			return "NOT " + defaultExprToSQL(v.Operand)
+		}
+	case *parser.BinaryOp:
+		left := defaultExprToSQL(v.Left)
+		right := defaultExprToSQL(v.Right)
+		switch v.Op {
+		case parser.OpAdd:
+			return left + " + " + right
+		case parser.OpSub:
+			return left + " - " + right
+		case parser.OpMul:
+			return left + " * " + right
+		case parser.OpDiv:
+			return left + " / " + right
+		}
+	case *parser.TypedStringLit:
+		return v.Type + " '" + strings.ReplaceAll(v.Value, "'", "''") + "'"
 	}
 	return fmt.Sprintf("%v", e)
 }
@@ -931,11 +1147,85 @@ func deriveTargetName(e parser.Expr) string {
 	return ""
 }
 
+// transitiveDep describes a single view or materialized view that will be
+// transitively dropped when its parent is dropped with CASCADE.
+type transitiveDep struct {
+	kind       string             // "view" or "materialized view"
+	name       parser.ObjectName
+	parentKind string             // "table", "view", or "materialized view"
+	parentName parser.ObjectName
+}
+
+// collectAllViewTransitiveDeps performs a BFS from startName and returns all
+// views and materialized views that transitively depend on it. startName
+// itself is NOT included in the result. The parentKind/parentName fields of
+// each entry record which immediate ancestor pulled the object in.
+func collectAllViewTransitiveDeps(im *catalog.InMemory, startName parser.ObjectName) []transitiveDep {
+	seen := map[string]bool{}
+	queue := []parser.ObjectName{startName}
+	var result []transitiveDep
+
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+
+		// Determine the kind of curr.
+		currKind := "table"
+		if tbl, ok := im.LookupTable(curr); ok {
+			if tbl.IsMatView {
+				currKind = "materialized view"
+			} else if tbl.View != nil {
+				currKind = "view"
+			}
+		}
+
+		// Views depending on curr.
+		for _, vn := range viewsDependingOnView(im, curr) {
+			k := vn.String()
+			if !seen[k] {
+				seen[k] = true
+				result = append(result, transitiveDep{kind: "view", name: vn, parentKind: currKind, parentName: curr})
+				queue = append(queue, vn)
+			}
+		}
+
+		// MatViews depending on curr.
+		for _, mvn := range matViewsDependingOnRelation(im, curr) {
+			k := mvn.String()
+			if !seen[k] {
+				seen[k] = true
+				result = append(result, transitiveDep{kind: "materialized view", name: mvn, parentKind: currKind, parentName: curr})
+				queue = append(queue, mvn)
+			}
+		}
+	}
+	return result
+}
+
 // execDropView removes a view from the catalog. No relation
 // file is involved — views are virtual.
 func (o *ddlOp) execDropView(s *parser.DropViewStmt) error {
 	dropped := make(map[string]bool)
 	for _, name := range s.Names {
+		// Before dropping, collect all transitive deps and emit ONE aggregate notice.
+		if s.Behavior == parser.DropCascade {
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				deps := collectAllViewTransitiveDeps(im, name)
+				if len(deps) == 1 {
+					d := deps[0]
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to %s %s", d.kind, d.name.String()))
+				} else if len(deps) > 1 {
+					detail := make([]string, len(deps))
+					for i, d := range deps {
+						detail[i] = fmt.Sprintf("drop cascades to %s %s", d.kind, d.name.String())
+					}
+					o.ctx.AddNoticeWithDetail(
+						fmt.Sprintf("drop cascades to %d other objects", len(deps)),
+						strings.Join(detail, "\n"),
+					)
+				}
+			}
+		}
 		if err := o.execDropOneView(name, s.IfExists, s.Behavior, s.Pos(), dropped); err != nil {
 			return err
 		}
@@ -965,14 +1255,22 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 	// Mark as being dropped before recursing to break circular dependency cycles.
 	dropped[key] = true
 
-	// CASCADE: drop any dependent views before dropping this one.
+	// CASCADE: drop any dependent views and matviews before dropping this one.
+	// Notices are emitted by the top-level caller (execDropView), not here.
 	if behavior == parser.DropCascade {
 		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 			deps := viewsDependingOnView(im, name)
 			for _, depName := range deps {
 				if !dropped[depName.String()] {
-					o.ctx.AddNotice(fmt.Sprintf("drop cascades to view %s", depName.String()))
 					if err := o.execDropOneView(depName, true, behavior, pos, dropped); err != nil {
+						return err
+					}
+				}
+			}
+			matDeps := matViewsDependingOnRelation(im, name)
+			for _, depName := range matDeps {
+				if !dropped[depName.String()] {
+					if err := o.execDropOneMatView(depName, true, behavior, pos, dropped, false); err != nil {
 						return err
 					}
 				}
@@ -994,6 +1292,75 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 	return nil
 }
 
+// execDropOneMatView drops a single materialized view, cascading to dependent matviews when
+// behavior == DropCascade. The dropped map prevents infinite recursion.
+// emitNotice controls whether this call emits its own NOTICE (false when called from execDropTable/View
+// which already emits the grouped notice at the top level).
+func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavior parser.DropBehavior, pos int, dropped map[string]bool, emitNotice bool) error {
+	key := name.String()
+	if dropped[key] {
+		return nil // already being dropped in this cascade
+	}
+	if ifExists && o.dropSchemaQualifiedNotice(name) {
+		return nil
+	}
+	if _, ok := o.ctx.Catalog.LookupTable(name); !ok {
+		if ifExists {
+			o.ctx.AddNotice(fmt.Sprintf("materialized view %q does not exist, skipping", name.String()))
+			return nil
+		}
+		return &ExecError{Code: "42P01", Pos: pos, Message: fmt.Sprintf("materialized view %q does not exist", name.String())}
+	}
+
+	// Mark as being dropped before recursing to break circular dependency cycles.
+	dropped[key] = true
+
+	// CASCADE: drop any dependent matviews before dropping this one.
+	// Only emit notices when emitNotice=true (top-level DROP MATERIALIZED VIEW only).
+	if behavior == parser.DropCascade {
+		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+			matDeps := matViewsDependingOnRelation(im, name)
+			if emitNotice {
+				// Emit cascade notice before dropping.
+				newDeps := make([]parser.ObjectName, 0, len(matDeps))
+				for _, dep := range matDeps {
+					if !dropped[dep.String()] {
+						newDeps = append(newDeps, dep)
+					}
+				}
+				if len(newDeps) == 1 {
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to materialized view %s", newDeps[0].String()))
+				} else if len(newDeps) > 1 {
+					details := make([]string, len(newDeps))
+					for i, d := range newDeps {
+						details[i] = fmt.Sprintf("drop cascades to materialized view %s", d.String())
+					}
+					o.ctx.AddNoticeWithDetail(
+						fmt.Sprintf("drop cascades to %d other objects", len(newDeps)),
+						strings.Join(details, "\n"),
+					)
+				}
+			}
+			for _, depName := range matDeps {
+				if !dropped[depName.String()] {
+					if err := o.execDropOneMatView(depName, true, behavior, pos, dropped, false); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+
+	if err := o.ctx.Catalog.DropView(name, ifExists); err != nil {
+		if ifExists {
+			o.ctx.AddNotice(fmt.Sprintf("materialized view %q does not exist, skipping", name.String()))
+			return nil
+		}
+		return &ExecError{Code: "42P01", Pos: pos, Message: err.Error()}
+	}
+	return nil
+}
+
 // viewsDependingOnView returns all views whose body directly references the given view name.
 // Used by DROP VIEW CASCADE to find dependent views. M0097-0021.
 func viewsDependingOnView(im *catalog.InMemory, target parser.ObjectName) []parser.ObjectName {
@@ -1005,6 +1372,25 @@ func viewsDependingOnView(im *catalog.InMemory, target parser.ObjectName) []pars
 		}
 		if t.Name == target.Name && t.Schema == target.Schema {
 			continue // skip the view itself
+		}
+		if selectRefsViewName(t.View, targetName) {
+			deps = append(deps, parser.ObjectName{Schema: t.Schema, Name: t.Name})
+		}
+	}
+	return deps
+}
+
+// matViewsDependingOnRelation returns the names of materialized views that directly reference
+// the given table/view/matview name in their SELECT body. Used by CASCADE drops.
+func matViewsDependingOnRelation(im *catalog.InMemory, target parser.ObjectName) []parser.ObjectName {
+	targetName := strings.ToLower(target.Name)
+	var deps []parser.ObjectName
+	for _, t := range im.AllUserMatViews() {
+		if t.View == nil {
+			continue
+		}
+		if strings.EqualFold(t.Name, target.Name) && strings.EqualFold(t.Schema, target.Schema) {
+			continue // skip the relation itself
 		}
 		if selectRefsViewName(t.View, targetName) {
 			deps = append(deps, parser.ObjectName{Schema: t.Schema, Name: t.Name})
@@ -1068,11 +1454,26 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 		// - Partition children: ALWAYS (they can't exist without the parent).
 		// - Inheritance children: only with CASCADE (M0100-0004).
 		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-			for _, child := range im.PartitionChildren(tbl.OID) {
-				childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
-				if err := o.dropTableByRef(childName, child); err != nil {
-					return err
+			// dropPartitionDescendants recurses depth-first so grandchild
+			// partitions are dropped before their parents. Without recursion,
+			// DROP TABLE on a 2-level partitioned hierarchy left grandchildren
+			// in the catalog, causing "relation already exists" on the next
+			// CREATE TABLE with the same name. M0097-0028.
+			var dropPartitionDescendants func(parent *catalog.Table) error
+			dropPartitionDescendants = func(parent *catalog.Table) error {
+				for _, child := range im.PartitionChildren(parent.OID) {
+					if err := dropPartitionDescendants(child); err != nil {
+						return err
+					}
+					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+					if err := o.dropTableByRef(childName, child); err != nil {
+						return err
+					}
 				}
+				return nil
+			}
+			if err := dropPartitionDescendants(tbl); err != nil {
+				return err
 			}
 			if s.Behavior == parser.DropCascade {
 				inheritChildren := im.InheritanceChildren(tbl.OID)
@@ -1100,11 +1501,256 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				}
 			}
 		}
+		// RESTRICT (default): if any views or matviews depend on this table, error with details.
+		// Include transitive deps (e.g. matviews that depend on a view that depends on this table).
+		if s.Behavior != parser.DropCascade {
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				var depDescs []string
+				directViews := viewsDependingOnTable(im, name)
+				directMVs := matViewsDependingOnRelation(im, name)
+				for _, vn := range directViews {
+					depDescs = append(depDescs, fmt.Sprintf("view %s depends on table %s", vn.String(), name.String()))
+				}
+				for _, mvn := range directMVs {
+					depDescs = append(depDescs, fmt.Sprintf("materialized view %s depends on table %s", mvn.String(), name.String()))
+				}
+				// Transitively reachable deps (views/matviews that depend on the direct views/matviews).
+				seenTransitive := map[string]bool{}
+				for _, vn := range directViews {
+					seenTransitive[vn.String()] = true
+				}
+				for _, mvn := range directMVs {
+					seenTransitive[mvn.String()] = true
+				}
+				allDirect := append(append([]parser.ObjectName{}, directViews...), directMVs...)
+				for _, directDep := range allDirect {
+					transitiveDeps := collectAllViewTransitiveDeps(im, directDep)
+					for _, td := range transitiveDeps {
+						k := td.name.String()
+						if !seenTransitive[k] {
+							seenTransitive[k] = true
+							depDescs = append(depDescs, fmt.Sprintf("%s %s depends on %s %s", td.kind, td.name.String(), td.parentKind, td.parentName.String()))
+						}
+					}
+				}
+				if len(depDescs) > 0 {
+					return &ExecError{
+						Code:    "2BP01",
+						Pos:     s.Pos(),
+						Message: fmt.Sprintf("cannot drop table %s because other objects depend on it", name.String()),
+						Detail:  strings.Join(depDescs, "\n"),
+						Hint:    "Use DROP ... CASCADE to drop the dependent objects too.",
+					}
+				}
+			}
+		}
+		// CASCADE: drop views, matviews, and functions that directly or transitively reference this table.
+		if s.Behavior == parser.DropCascade {
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				// Collect all dependents in display order: views, matviews (including transitively
+				// reached via view chains), then functions.
+				type cascadeDep struct {
+					kind     string             // "view", "materialized view", or "function"
+					display  string             // full display text, e.g. "view functestv3"
+					viewName parser.ObjectName  // for view/matview drops
+					routine  *catalog.Routine   // for function drops
+				}
+				var deps []cascadeDep
+				seen := map[string]bool{}
+
+				// Direct view dependents + all their transitive view/matview deps via BFS.
+				viewNames := viewsDependingOnTable(im, name)
+				for _, vn := range viewNames {
+					k := vn.String()
+					if !seen[k] {
+						seen[k] = true
+						deps = append(deps, cascadeDep{kind: "view", display: "view " + vn.String(), viewName: vn})
+					}
+					// Transitively reachable views/matviews from this view.
+					for _, td := range collectAllViewTransitiveDeps(im, vn) {
+						k2 := td.name.String()
+						if !seen[k2] {
+							seen[k2] = true
+							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + td.name.String(), viewName: td.name})
+						}
+					}
+				}
+				// Direct materialized view dependents + all their transitive deps via BFS.
+				matViewNames := matViewsDependingOnRelation(im, name)
+				for _, mvn := range matViewNames {
+					k := mvn.String()
+					if !seen[k] {
+						seen[k] = true
+						deps = append(deps, cascadeDep{kind: "materialized view", display: "materialized view " + mvn.String(), viewName: mvn})
+					}
+					// Transitively reachable matviews from this matview.
+					for _, td := range collectAllViewTransitiveDeps(im, mvn) {
+						k2 := td.name.String()
+						if !seen[k2] {
+							seen[k2] = true
+							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + td.name.String(), viewName: td.name})
+						}
+					}
+				}
+				// Direct function dependents (via TableDeps).
+				for _, r := range functionsDependingOnTable(o.ctx.Catalog, name) {
+					dn := routineCascadeDisplayName(r)
+					deps = append(deps, cascadeDep{kind: "function", display: "function " + dn, routine: r})
+				}
+				// Transitive function dependents via views being dropped.
+				for _, vn := range viewNames {
+					for _, r := range functionsDependingOnTable(o.ctx.Catalog, vn) {
+						dn := routineCascadeDisplayName(r)
+						deps = append(deps, cascadeDep{kind: "function", display: "function " + dn, routine: r})
+					}
+				}
+
+				// Emit NOTICE: 1 object → individual; N > 1 → "N other objects" + DETAIL.
+				if len(deps) == 1 {
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to %s", deps[0].display))
+				} else if len(deps) > 1 {
+					detail := make([]string, len(deps))
+					for i, d := range deps {
+						detail[i] = fmt.Sprintf("drop cascades to %s", d.display)
+					}
+					o.ctx.AddNoticeWithDetail(
+						fmt.Sprintf("drop cascades to %d other objects", len(deps)),
+						strings.Join(detail, "\n"),
+					)
+				}
+
+				// Drop all dependents using a single shared dropped map to prevent double-drops.
+				droppedViews := map[string]bool{}
+				for _, d := range deps {
+					if d.kind == "view" {
+						if err := o.execDropOneView(d.viewName, true, parser.DropCascade, s.Pos(), droppedViews); err != nil {
+							return err
+						}
+					} else if d.kind == "materialized view" {
+						if err := o.execDropOneMatView(d.viewName, true, parser.DropCascade, s.Pos(), droppedViews, false); err != nil {
+							return err
+						}
+					} else if d.kind == "function" && d.routine != nil {
+						if rs := o.ctx.Catalog.Routines(); rs != nil {
+							_ = rs.DropRoutine(d.routine)
+						}
+					}
+				}
+			}
+		}
 		if err := o.dropTableByRef(name, tbl); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// viewsDependingOnTable returns the names of views that directly reference tableName
+// in their FROM clause. Used by DROP TABLE CASCADE to cascade drops.
+// Only checks views in the same schema as the dropped table for performance.
+func viewsDependingOnTable(im *catalog.InMemory, tableName parser.ObjectName) []parser.ObjectName {
+	var deps []parser.ObjectName
+	tblLower := strings.ToLower(tableName.Name)
+	tblSchema := strings.ToLower(tableName.Schema)
+	for _, tbl := range im.AllUserViews() {
+		if tbl.View == nil {
+			continue
+		}
+		// Only check views in the same schema (fast path to avoid scanning all views).
+		if tblSchema != "" && strings.ToLower(tbl.Schema) != tblSchema {
+			continue
+		}
+		if selectRefsViewName(tbl.View, tblLower) {
+			deps = append(deps, parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name})
+		}
+	}
+	return deps
+}
+
+// functionsDependingOnTable returns all routines whose TableDeps reference the given table/view name.
+// Used by DROP TABLE/VIEW CASCADE to cascade drops to dependent functions.
+func functionsDependingOnTable(cat catalog.Catalog, tableName parser.ObjectName) []*catalog.Routine {
+	rs := cat.Routines()
+	if rs == nil {
+		return nil
+	}
+	tblLower := strings.ToLower(tableName.Name)
+	schemaLower := strings.ToLower(tableName.Schema)
+	var result []*catalog.Routine
+	for _, r := range rs.List() {
+		for _, td := range r.TableDeps {
+			if strings.ToLower(td.Name) == tblLower {
+				// Match if schema is unspecified on either side or schemas agree.
+				if schemaLower == "" || td.Schema == "" || strings.ToLower(td.Schema) == schemaLower {
+					result = append(result, r)
+					break
+				}
+			}
+		}
+	}
+	return result
+}
+
+// functionsDependingOnSequence returns all routines whose SequenceDeps reference the given sequence name.
+func functionsDependingOnSequence(cat catalog.Catalog, seqName string, seqSchema string) []*catalog.Routine {
+	rs := cat.Routines()
+	if rs == nil {
+		return nil
+	}
+	seqLower := strings.ToLower(seqName)
+	schemaLower := strings.ToLower(seqSchema)
+	var result []*catalog.Routine
+	for _, r := range rs.List() {
+		for _, sd := range r.SequenceDeps {
+			if strings.ToLower(sd.Name) == seqLower {
+				if schemaLower == "" || sd.Schema == "" || strings.ToLower(sd.Schema) == schemaLower {
+					result = append(result, r)
+					break
+				}
+			}
+		}
+	}
+	return result
+}
+
+// functionsDependingOnRoutineOID returns all routines whose RoutineCallOIDs include the given OID.
+func functionsDependingOnRoutineOID(cat catalog.Catalog, oid uint32) []*catalog.Routine {
+	rs := cat.Routines()
+	if rs == nil {
+		return nil
+	}
+	var result []*catalog.Routine
+	for _, r := range rs.List() {
+		for _, callOID := range r.RoutineCallOIDs {
+			if callOID == oid {
+				result = append(result, r)
+				break
+			}
+		}
+	}
+	return result
+}
+
+// routineCascadeDisplayName formats a routine's name and arg types for DROP CASCADE NOTICE messages.
+// Format: "funcname(argtype1,argtype2,...)" using canonical type names.
+func routineCascadeDisplayName(r *catalog.Routine) string {
+	name := strings.ToLower(r.Name)
+	parts := make([]string, 0, len(r.ArgTypes))
+	for i, t := range r.ArgTypes {
+		mode := ""
+		if i < len(r.ArgModes) {
+			mode = r.ArgModes[i]
+		}
+		if mode == "o" {
+			continue // Skip OUT params (same as Signature())
+		}
+		canon := dropCompatCanonicalType(t.Name)
+		if canon == "" {
+			canon = strings.ToLower(t.Name)
+		}
+		parts = append(parts, canon)
+	}
+	return name + "(" + strings.Join(parts, ",") + ")"
 }
 
 // dropTableByRef drops a single table by its catalog.Table reference.
@@ -1216,7 +1862,16 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
 	}
-	return o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false)
+	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false); err != nil {
+		return err
+	}
+	// Mark partial indexes so they are excluded from REFRESH CONCURRENTLY checks.
+	if s.HasPredicate {
+		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			idx.HasPredicate = true
+		}
+	}
+	return nil
 }
 
 func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
@@ -1232,7 +1887,8 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		idx, ok := o.ctx.Catalog.LookupIndex(name)
 		if !ok {
 			if s.IfExists {
-				o.ctx.AddNotice(fmt.Sprintf("index %q does not exist, skipping", name.String()))
+				// Use just the index name (not schema-qualified) to match PostgreSQL's notice format.
+				o.ctx.AddNotice(fmt.Sprintf("index %q does not exist, skipping", name.Name))
 				continue
 			}
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("index %q does not exist", name.String())}
@@ -1296,6 +1952,18 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 }
 
 func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
+	// Handle SET SCHEMA — move a table/matview to a new schema. M0097-0025.
+	if s.SetSchema != "" {
+		tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
+		if !ok {
+			if s.IfExists {
+				return nil
+			}
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
+		}
+		tbl.Schema = s.SetSchema
+		return nil
+	}
 	tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
 	if !ok {
 		// Not a heap table — check if it's an index.
@@ -1342,6 +2010,13 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable); !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
 			}
+		case parser.AlterTableAddCheck:
+			// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
+			if act.CheckExpr != "" {
+				tbl.CheckConstraints = append(tbl.CheckConstraints, act.CheckExpr)
+			}
+		case parser.AlterTableNoOp:
+			// Unknown ADD CONSTRAINT type — no-op.
 		case parser.AlterTableDropConstraint:
 			if err := o.execAlterTableDropConstraint(tbl, act); err != nil {
 				return err
@@ -1404,6 +2079,49 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				im.RegisterPartitionChild(tbl.OID, childTbl.OID)
 			}
+			// Propagate parent unique/PK indexes to the newly attached child
+			// partition. In PostgreSQL, ATTACH PARTITION requires the child to
+			// have matching indexes (created automatically when using CREATE TABLE
+			// … PARTITION OF, or by ATTACH PARTITION propagation). Without this,
+			// upsertOp's arbiter probe and insertOp's unique-constraint check both
+			// miss live duplicates. Only create when the child doesn't already
+			// have a matching index. M0097-0028.
+			for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+				if parentIdx.Method != "btree" || (!parentIdx.Primary && !parentIdx.Unique) {
+					continue
+				}
+				alreadyHas := false
+				for _, childIdx := range o.ctx.Catalog.IndexesOnTable(childTbl) {
+					if len(childIdx.Columns) != len(parentIdx.Columns) {
+						continue
+					}
+					match := true
+					for k := range childIdx.Columns {
+						if !strings.EqualFold(childIdx.Columns[k], parentIdx.Columns[k]) {
+							match = false
+							break
+						}
+					}
+					if match {
+						alreadyHas = true
+						break
+					}
+				}
+				if alreadyHas {
+					continue
+				}
+				var childIdxName parser.ObjectName
+				if parentIdx.Primary {
+					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + "_pkey"}
+				} else {
+					suffix := "_key"
+					if len(parentIdx.Columns) == 1 {
+						suffix = "_" + parentIdx.Columns[0] + "_key"
+					}
+					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + suffix}
+				}
+				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary)
+			}
 		case parser.AlterTableRenameTable:
 			newName := act.NewName
 			probe := parser.ObjectName{Schema: tbl.Schema, Name: newName}
@@ -1446,7 +2164,25 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
-			// No actual rename implemented yet — just validate.
+			// Rename the column in the table's schema.
+			for i, col := range tbl.Columns {
+				if strings.EqualFold(col.Name, oldColName) {
+					tbl.Columns[i].Name = newColName
+					break
+				}
+			}
+			// Update any index column references that use the old name.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				for _, idx := range im.IndexesOnTable(tbl) {
+					for i, col := range idx.Columns {
+						if strings.EqualFold(col, oldColName) {
+							idx.Columns[i] = newColName
+						}
+					}
+				}
+				// Update stored view/matview ASTs that reference this column.
+				im.RenameColumnInViews(tbl.Name, oldColName, newColName)
+			}
 		case parser.AlterTableInherit:
 			// INHERIT parent_table — register the named table as a parent of tbl
 			// so that scanning the parent includes tbl's rows (M0097-0048).
@@ -1473,6 +2209,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// NO INHERIT parent_table — no-op in v0; just accept the syntax.
 		case parser.AlterTableAlterColumnSet:
 			// SET (options) on a column of a heap table: no-op in goopg v0.
+		case parser.AlterTableAlterColumnType:
+			if err := o.execAlterColumnType(tbl, act); err != nil {
+				return err
+			}
+		case parser.AlterTableDropColumn:
+			if err := o.execAlterDropColumn(tbl, act); err != nil {
+				return err
+			}
 		default:
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE action is not supported in v0"}
 		}
@@ -1857,7 +2601,14 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 			return &ExecError{Code: "42703", Pos: pos, Message: fmt.Sprintf("column %q of relation %q does not exist", name, tbl.Name)}
 		}
 		if !isSupportedBTreeKeyType(col.Type.Name) {
-			return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", col.Type.Name)}
+			// Also accept user-defined enum types. M0097-0022.
+			isEnum := false
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				_, isEnum = im.LookupEnum(col.Type.Name)
+			}
+			if !isEnum {
+				return &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 only supports int4 / numeric keys, got %q", col.Type.Name)}
+			}
 		}
 		cols[i] = col
 	}
@@ -2000,6 +2751,33 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 				continue
 			}
 			row := scanRow
+			// For enum columns, convert KindString labels to KindEnum (sort order)
+			// so encodeBTreeKeyForColumn can use float64 encoding consistently
+			// with the probe path. M0097-0022.
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				for _, c := range cols {
+					if c == nil {
+						continue
+					}
+					et, isEnum := im.LookupEnum(c.Type.Name)
+					if !isEnum {
+						continue
+					}
+					idx := c.Ordinal
+					if idx < 0 || idx >= len(row) {
+						continue
+					}
+					if row[idx].Kind == KindString {
+						label := row[idx].StringValue()
+						for _, ev := range et.Values {
+							if ev.Label == label {
+								row[idx] = NewEnumDatum(ev.SortOrder, label)
+								break
+							}
+						}
+					}
+				}
+			}
 			key, encErr := encodeCompositeBTreeKey(row, cols, pos)
 			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)
@@ -2269,6 +3047,12 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		}
 		return btree.EncodeFloat8(f), nil
 	}
+	// Enum types: encode sort order as float64. M0097-0022.
+	// The caller (collectBTreeEntries) pre-converts KindString enum labels to KindEnum
+	// so both backfill and probe paths use the same float64 encoding.
+	if v.Kind == KindEnum {
+		return btree.EncodeFloat8(v.EnumSortOrder()), nil
+	}
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }
 
@@ -2383,36 +3167,59 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		if !ok {
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", name.String())}
 		}
-		idxs := o.ctx.Catalog.IndexesOnTable(tbl)
-		rel := o.ctx.Catalog.RelFileNode(tbl)
-		o.ctx.Pool.InvalidateRel(rel)
-		if err := o.ctx.Pool.Manager().TruncateRelation(rel); err != nil {
-			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+		if err := o.truncateTableAndPartitions(tbl, s.Pos()); err != nil {
+			return err
 		}
-		// M0090-0001: clear FSM + VM entries for the truncated
-		// heap. Without this, the next INSERT consults the FSM,
-		// gets a stale block number, calls Pin → ReadBlock and
-		// errors with `short read at block` because nblocks=0
-		// post-truncate.
-		if o.ctx.FSM != nil {
-			o.ctx.FSM.DropRelation(rel)
-		}
-		if o.ctx.VM != nil {
-			o.ctx.VM.DropRelation(rel)
-		}
-		for _, idx := range idxs {
-			idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
-			o.ctx.Pool.InvalidateRel(idxRel)
-			if err := o.ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
-				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// truncateTableAndPartitions truncates a single table's heap + indexes and
+// recursively cascades to all partition descendants. This matches PostgreSQL's
+// TRUNCATE behaviour where a partitioned table implicitly truncates every leaf.
+// M0097-0028 fix: without recursion, TRUNCATE on a multi-level partitioned
+// table left data in grandchild partitions, causing subsequent tests to see
+// stale rows.
+func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int) error {
+	// First recurse into partition children so the leaves are cleared before
+	// the parent (matches PG's depth-first traversal order, though the order
+	// doesn't matter for correctness here).
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, child := range im.PartitionChildren(tbl.OID) {
+			if err := o.truncateTableAndPartitions(child, pos); err != nil {
+				return err
 			}
-			// FSM/VM are heap-relation maps; index relfiles
-			// have no entries to clear. (Btrees track their
-			// own free space inline.) Pair the FSM/VM cleanup
-			// only with the heap rel above.
-			if _, err := btree.Create(o.ctx.Pool, idxRel); err != nil {
-				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
-			}
+		}
+	}
+	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	o.ctx.Pool.InvalidateRel(rel)
+	if err := o.ctx.Pool.Manager().TruncateRelation(rel); err != nil {
+		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	}
+	// M0090-0001: clear FSM + VM entries for the truncated
+	// heap. Without this, the next INSERT consults the FSM,
+	// gets a stale block number, calls Pin → ReadBlock and
+	// errors with `short read at block` because nblocks=0
+	// post-truncate.
+	if o.ctx.FSM != nil {
+		o.ctx.FSM.DropRelation(rel)
+	}
+	if o.ctx.VM != nil {
+		o.ctx.VM.DropRelation(rel)
+	}
+	for _, idx := range idxs {
+		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+		o.ctx.Pool.InvalidateRel(idxRel)
+		if err := o.ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
+			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+		}
+		// FSM/VM are heap-relation maps; index relfiles
+		// have no entries to clear. (Btrees track their
+		// own free space inline.) Pair the FSM/VM cleanup
+		// only with the heap rel above.
+		if _, err := btree.Create(o.ctx.Pool, idxRel); err != nil {
+			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}
 	}
 	return nil
@@ -2430,7 +3237,11 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	}
 	lang := strings.ToLower(s.Language)
 	if lang == "" {
-		return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE FUNCTION requires a LANGUAGE clause"}
+		if s.BeginAtomic || s.IsReturnForm {
+			lang = "sql" // BEGIN ATOMIC / RETURN form implies SQL language
+		} else {
+			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE FUNCTION requires a LANGUAGE clause"}
+		}
 	}
 	if lang != "plpgsql" && lang != "sql" && lang != "c" {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage A: plpgsql, sql)", s.Language)}
@@ -2439,58 +3250,15 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	// and returns a type-appropriate default value (true for bool, 0 for int, etc.).
 	argTypes := make([]catalog.Type, len(s.Args))
 	argNames := make([]string, len(s.Args))
-	for i, a := range s.Args {
-		argTypes[i] = catalog.Type{
-			Name: strings.ToLower(a.Type.Name),
-			Args: append([]int64(nil), a.Type.Args...),
-		}
-		argNames[i] = a.Name
-	}
-	r := &catalog.Routine{
-		Schema:   s.Name.Schema,
-		Name:     s.Name.Name,
-		ArgNames: argNames,
-		ArgTypes: argTypes,
-		ReturnType: catalog.Type{
-			Name: strings.ToLower(s.ReturnType.Name),
-			Args: append([]int64(nil), s.ReturnType.Args...),
-		},
-		ReturnsSet: s.ReturnsSet,
-		Language:   lang,
-		Body:       s.Body,
-		Strict:     s.Strict,
-	}
-	if _, err := rs.Create(r, s.OrReplace); err != nil {
-		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
-		if errors.Is(err, catalog.ErrRoutineExists) {
-			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
-		}
-		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
-	}
-	return nil
-}
-
-// execCreateProcedure registers a procedure in the catalog's
-// Routines() registry (M0015 Stage B). Mirror of execCreateFunction
-// but without RETURNS — procedures use OUT/INOUT params instead.
-func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
-	rs := o.ctx.Catalog.Routines()
-	if rs == nil {
-		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE PROCEDURE requires routine registry"}
-	}
-	lang := strings.ToLower(s.Language)
-	if lang == "" {
-		return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE PROCEDURE requires a LANGUAGE clause"}
-	}
-	if lang != "plpgsql" && lang != "sql" && lang != "c" {
-		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage B: plpgsql, sql)", s.Language)}
-	}
-	argTypes := make([]catalog.Type, len(s.Args))
-	argNames := make([]string, len(s.Args))
 	argModes := make([]string, len(s.Args))
+	argDefaults := make([]string, len(s.Args))
 	for i, a := range s.Args {
+		typName := strings.ToLower(a.Type.Name)
+		if a.Type.IsArray {
+			typName += "[]"
+		}
 		argTypes[i] = catalog.Type{
-			Name: strings.ToLower(a.Type.Name),
+			Name: typName,
 			Args: append([]int64(nil), a.Type.Args...),
 		}
 		argNames[i] = a.Name
@@ -2506,19 +3274,722 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		default:
 			argModes[i] = "i"
 		}
+		if a.Default != nil {
+			argDefaults[i] = defaultExprToSQL(a.Default)
+		}
+	}
+	volatile := s.Volatile
+	if volatile == "" {
+		volatile = "v" // default: volatile
+	}
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = currentWritableSchema(o.ctx)
+	}
+	// Only superusers may define a leakproof function.
+	if s.Leakproof && o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: "only superuser can define a leakproof function"}
+	}
+	// Validate SQL function body when check_function_bodies=on (default).
+	if lang == "sql" && !s.BeginAtomic {
+		if err := o.validateSQLFunctionBody(s, len(s.Args)); err != nil {
+			return err
+		}
 	}
 	r := &catalog.Routine{
-		Schema:   s.Name.Schema,
+		Schema:   schema,
 		Name:     s.Name.Name,
 		ArgNames: argNames,
 		ArgTypes: argTypes,
 		ArgModes: argModes,
-		Language: lang,
-		Body:     s.Body,
+		ArgDefaults: argDefaults,
+		ReturnType: catalog.Type{
+			Name: strings.ToLower(s.ReturnType.Name),
+			Args: append([]int64(nil), s.ReturnType.Args...),
+		},
+		ReturnsSet:      s.ReturnsSet,
+		Language:        lang,
+		Body:            s.Body,
+		BeginAtomic:     s.BeginAtomic,
+		IsReturnForm:    s.IsReturnForm,
+		IsWindow:        s.Window,
+		Strict:          s.Strict,
+		Volatile:        volatile,
+		SecurityDefiner: s.SecurityDefiner,
+		Leakproof:       s.Leakproof,
+	}
+	// Extract dependency information for information_schema views (SQL functions only).
+	if lang == "sql" {
+		extractRoutineDeps(r.Body, r.ArgDefaults, schema, r, o.ctx.Catalog)
+	}
+	if _, err := rs.Create(r, s.OrReplace); err != nil {
+		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
+		if errors.Is(err, catalog.ErrRoutineExists) {
+			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
+		}
+		// ErrRoutineKindChange → SQLSTATE 42P13 (cannot change routine kind).
+		if errors.Is(err, catalog.ErrRoutineKindChange) {
+			// Determine what the existing object IS for accurate DETAIL.
+			detail := fmt.Sprintf("%q is a function.", s.Name.Name)
+			argTypes := make([]catalog.Type, len(s.Args))
+			for i, a := range s.Args {
+				argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+			}
+			if existing, ok := rs.Lookup(s.Name, argTypes); ok && existing != nil && existing.IsProcedure {
+				detail = fmt.Sprintf("%q is a procedure.", s.Name.Name)
+			}
+			return &ExecError{Code: "42P13", Pos: s.Pos(),
+				Message: "cannot change routine kind",
+				Detail:  detail}
+		}
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// canonReturnTypeName maps internal short type names to PG display names for error messages.
+func canonReturnTypeName(name string) string {
+	switch name {
+	case "int", "int4":
+		return "integer"
+	case "int2":
+		return "smallint"
+	case "int8":
+		return "bigint"
+	case "float4":
+		return "real"
+	case "float8":
+		return "double precision"
+	case "bool":
+		return "boolean"
+	}
+	return name
+}
+
+// isPolymorphicTypeName returns true if the given SQL type name is polymorphic
+// (anyarray, anyelement, anynonarray, anyrange, anycompatible, etc.).
+func isPolymorphicTypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "anyarray", "anyelement", "anynonarray", "anyrange", "anycompatible",
+		"anycompatiblearray", "anycompatiblenonarray", "anycompatiblerange":
+		return true
+	}
+	return false
+}
+
+// validateSQLFunctionBody validates the body of a SQL-language function at
+// CREATE time when check_function_bodies=on. Returns an ExecError on failure.
+func (o *ddlOp) validateSQLFunctionBody(s *parser.CreateFunctionStmt, nArgs int) error {
+	// Respect check_function_bodies GUC (default=on).
+	if o.ctx.GetSetting != nil {
+		if v, ok := o.ctx.GetSetting("check_function_bodies"); ok {
+			switch strings.ToLower(v) {
+			case "off", "false", "0", "no":
+				return nil
+			}
+		}
+	}
+
+	funcName := s.Name.Name
+	retTypeRaw := strings.ToLower(s.ReturnType.Name)
+	// Canonicalize type name to PG display form for error messages.
+	retTypeName := canonReturnTypeName(retTypeRaw)
+
+	// RETURN form (unquoted body) with polymorphic arguments is rejected.
+	if s.IsReturnForm {
+		for _, a := range s.Args {
+			if isPolymorphicTypeName(a.Type.Name) {
+				return &ExecError{
+					Code:    "42P13",
+					Pos:     s.Pos(),
+					Message: "SQL function with unquoted function body cannot have polymorphic arguments",
+				}
+			}
+		}
+	}
+
+	body := s.Body
+	if body == "" {
+		// Empty body — only void functions may have no final SELECT.
+		if retTypeName != "void" {
+			return &ExecError{
+				Code:    "42P13",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName),
+				Detail:  "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
+				Context: fmt.Sprintf("SQL function %q", funcName),
+			}
+		}
+		return nil
+	}
+
+	// Parse the body to catch syntax errors and analyse parameter references.
+	// PG does not add CONTEXT for parse-time errors (context is only added for
+	// type-check and execution errors). So we omit the Context field here.
+	stmts, parseErr := parser.Parse(body)
+	if parseErr != nil {
+		return &ExecError{
+			Code:    "42601",
+			Pos:     s.Pos(),
+			Message: parseErr.Error(),
+		}
+	}
+
+	// Empty parse result for a non-void function.
+	if len(stmts) == 0 && retTypeName != "void" {
+		return &ExecError{
+			Code:    "42P13",
+			Pos:     s.Pos(),
+			Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName),
+			Detail:  "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
+			Context: fmt.Sprintf("SQL function %q", funcName),
+		}
+	}
+
+	// Scan all statements for out-of-range parameter references ($N).
+	for _, stmt := range stmts {
+		if err := validateParamRefs(stmt, nArgs, funcName); err != nil {
+			return err
+		}
+	}
+
+	// Check for unsupported operator combinations (e.g. date > integer).
+	// This catches cases like RETURN x > 1 where x is a date parameter.
+	if err := checkBodyOperatorTypes(stmts, s.Args, funcName, s.Pos()); err != nil {
+		return err
+	}
+
+	// Check that the final statement is a SELECT (or DML RETURNING).
+	if len(stmts) > 0 && retTypeName != "void" {
+		last := stmts[len(stmts)-1]
+		switch l := last.(type) {
+		case *parser.SelectStmt:
+			if !s.ReturnsSet {
+				// Check column count for scalar returns.
+				nTargets := len(l.Targets)
+				if l.ValuesRows != nil && len(l.Targets) == 0 {
+					if len(l.ValuesRows) > 0 {
+						nTargets = len(l.ValuesRows[0])
+					}
+				}
+				if nTargets > 1 {
+					return &ExecError{
+						Code:    "42P13",
+						Pos:     s.Pos(),
+						Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName),
+						Detail:  "Final statement must return exactly one column.",
+						Context: fmt.Sprintf("SQL function %q", funcName),
+					}
+				}
+				// Check if the SELECT target type is incompatible with return type.
+				if nTargets == 1 {
+					if err := checkSQLFuncReturnTypeBasic(l.Targets[0].Expr, retTypeName, funcName, s.Pos()); err != nil {
+						return err
+					}
+				}
+			}
+		case *parser.InsertStmt, *parser.UpdateStmt, *parser.DeleteStmt:
+			// OK if they have RETURNING — we don't check that here
+		default:
+			return &ExecError{
+				Code:    "42P13",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName),
+				Detail:  "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
+				Context: fmt.Sprintf("SQL function %q", funcName),
+			}
+		}
+	}
+
+	return nil
+}
+
+// checkSQLFuncReturnTypeBasic does lightweight return-type checking for
+// simple SELECT expressions where the type can be inferred without the full
+// planner. Only fires when the type is obviously incompatible (e.g. a bare
+// string literal returned as integer).
+func checkSQLFuncReturnTypeBasic(expr parser.Expr, retTypeName, funcName string, pos int) error {
+	if expr == nil {
+		return nil
+	}
+	var exprTypeName string
+	switch expr.(type) {
+	case *parser.StringConst:
+		exprTypeName = "text"
+	case *parser.IntegerConst:
+		exprTypeName = "integer"
+	}
+	if exprTypeName == "" {
+		return nil // can't determine type statically
+	}
+	if exprTypeName == retTypeName {
+		return nil // same type
+	}
+	// Check basic incompatibility: text cannot be returned as integer/boolean/etc.
+	textTypes := map[string]bool{"text": true, "varchar": true, "char": true, "character varying": true}
+	intTypes := map[string]bool{"integer": true, "smallint": true, "bigint": true, "real": true, "double precision": true, "boolean": true}
+	if textTypes[exprTypeName] && (intTypes[retTypeName] || retTypeName == "boolean") {
+		return &ExecError{
+			Code:    "42P13",
+			Pos:     pos,
+			Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName),
+			Detail:  fmt.Sprintf("Actual return type is %s.", exprTypeName),
+			Context: fmt.Sprintf("SQL function %q", funcName),
+		}
+	}
+	return nil
+}
+
+// validateParamRefs walks the AST of stmt and returns an error if any
+// parameter reference $N with N > nArgs is found.
+func validateParamRefs(stmt parser.Stmt, nArgs int, funcName string) error {
+	var walkExpr func(node parser.Expr) error
+	walkExpr = func(node parser.Expr) error {
+		if node == nil {
+			return nil
+		}
+		switch n := node.(type) {
+		case *parser.ParamRef:
+			if n.Number > nArgs {
+				// PG does not add CONTEXT for param-reference errors.
+				return &ExecError{
+					Code:    "42P10",
+					Message: fmt.Sprintf("there is no parameter $%d", n.Number),
+				}
+			}
+		case *parser.BinaryOp:
+			if err := walkExpr(n.Left); err != nil {
+				return err
+			}
+			return walkExpr(n.Right)
+		case *parser.UnaryOp:
+			return walkExpr(n.Operand)
+		case *parser.FuncCall:
+			for _, a := range n.Args {
+				if err := walkExpr(a); err != nil {
+					return err
+				}
+			}
+		case *parser.CastExpr:
+			return walkExpr(n.Operand)
+		}
+		return nil
+	}
+	var walkStmt func(s parser.Stmt) error
+	walkStmt = func(s parser.Stmt) error {
+		switch n := s.(type) {
+		case *parser.SelectStmt:
+			for _, t := range n.Targets {
+				if err := walkExpr(t.Expr); err != nil {
+					return err
+				}
+			}
+			if n.Where != nil {
+				if err := walkExpr(n.Where); err != nil {
+					return err
+				}
+			}
+		case *parser.InsertStmt:
+			for _, row := range n.Rows {
+				for _, e := range row {
+					if err := walkExpr(e); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
+	return walkStmt(stmt)
+}
+
+// checkBodyOperatorTypes walks the function body statements and checks for
+// operator combinations that PostgreSQL rejects with "operator does not exist"
+// (SQLSTATE 42883). The primary case is date/time types compared against
+// numeric types (e.g. "date > integer" has no such operator in PG).
+// Parameter names are resolved from args; positional $N references use arg index.
+func checkBodyOperatorTypes(stmts []parser.Stmt, args []parser.FunctionArg, funcName string, pos int) error {
+	// Build a map: lowercase param name → canonical type name.
+	paramType := make(map[string]string, len(args))
+	for _, a := range args {
+		if a.Name != "" {
+			paramType[strings.ToLower(a.Name)] = strings.ToLower(a.Type.Name)
+		}
+	}
+
+	// Resolve an expression to its pg-display type name for operator checking.
+	// Returns "" if the type cannot be statically determined.
+	var resolveType func(e parser.Expr) string
+	resolveType = func(e parser.Expr) string {
+		if e == nil {
+			return ""
+		}
+		switch n := e.(type) {
+		case *parser.ColumnRef:
+			// Named parameter reference (from RETURN form body "SELECT x > 1").
+			if t, ok := paramType[strings.ToLower(n.Column)]; ok {
+				return t
+			}
+		case *parser.ParamRef:
+			// Positional parameter reference ($1, $2, ...).
+			if n.Number >= 1 && n.Number <= len(args) {
+				return strings.ToLower(args[n.Number-1].Type.Name)
+			}
+		case *parser.IntegerConst:
+			return "integer"
+		case *parser.StringConst:
+			return "text"
+		case *parser.CastExpr:
+			// Type cast: return the target type.
+			return strings.ToLower(n.Type.Name)
+		}
+		return ""
+	}
+
+	// isDateLike returns true for date/time/timestamp types.
+	isDateLike := func(typName string) bool {
+		switch typName {
+		case "date", "time", "timetz", "timestamp", "timestamptz":
+			return true
+		}
+		return false
+	}
+	// isNumericType returns true for integer/float/numeric types.
+	isNumericType := func(typName string) bool {
+		switch typName {
+		case "integer", "int", "int2", "int4", "int8",
+			"smallint", "bigint", "numeric", "decimal",
+			"real", "float4", "float8", "double precision":
+			return true
+		}
+		return false
+	}
+	// pgOpName returns the symbol for a comparison operator.
+	pgOpName := func(op parser.OpCode) string {
+		switch op {
+		case parser.OpGt:
+			return ">"
+		case parser.OpLt:
+			return "<"
+		case parser.OpGe:
+			return ">="
+		case parser.OpLe:
+			return "<="
+		case parser.OpEq:
+			return "="
+		case parser.OpNe:
+			return "<>"
+		default:
+			return op.String()
+		}
+	}
+
+	var walkExpr func(e parser.Expr) error
+	walkExpr = func(e parser.Expr) error {
+		if e == nil {
+			return nil
+		}
+		switch n := e.(type) {
+		case *parser.BinaryOp:
+			// Check operands first (recurse).
+			if err := walkExpr(n.Left); err != nil {
+				return err
+			}
+			if err := walkExpr(n.Right); err != nil {
+				return err
+			}
+			// For comparison operators, check for cross-domain type mismatch.
+			switch n.Op {
+			case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
+				leftTyp := resolveType(n.Left)
+				rightTyp := resolveType(n.Right)
+				if leftTyp == "" || rightTyp == "" {
+					return nil // can't determine, skip
+				}
+				// date/timestamp vs integer/numeric: no such operator in PG.
+				if isDateLike(leftTyp) && isNumericType(rightTyp) {
+					leftDisplay := analyzer.PGDisplayTypeName(leftTyp)
+					rightDisplay := analyzer.PGDisplayTypeName(rightTyp)
+					return &ExecError{
+						Code:    "42883",
+						Pos:     pos,
+						Message: fmt.Sprintf("operator does not exist: %s %s %s", leftDisplay, pgOpName(n.Op), rightDisplay),
+						Hint:    "No operator matches the given name and argument types. You might need to add explicit type casts.",
+					}
+				}
+				if isNumericType(leftTyp) && isDateLike(rightTyp) {
+					leftDisplay := analyzer.PGDisplayTypeName(leftTyp)
+					rightDisplay := analyzer.PGDisplayTypeName(rightTyp)
+					return &ExecError{
+						Code:    "42883",
+						Pos:     pos,
+						Message: fmt.Sprintf("operator does not exist: %s %s %s", leftDisplay, pgOpName(n.Op), rightDisplay),
+						Hint:    "No operator matches the given name and argument types. You might need to add explicit type casts.",
+					}
+				}
+			}
+		case *parser.UnaryOp:
+			return walkExpr(n.Operand)
+		case *parser.FuncCall:
+			for _, a := range n.Args {
+				if err := walkExpr(a); err != nil {
+					return err
+				}
+			}
+		case *parser.CastExpr:
+			return walkExpr(n.Operand)
+		}
+		return nil
+	}
+
+	var walkStmt func(s parser.Stmt) error
+	walkStmt = func(s parser.Stmt) error {
+		switch n := s.(type) {
+		case *parser.SelectStmt:
+			for _, t := range n.Targets {
+				if err := walkExpr(t.Expr); err != nil {
+					return err
+				}
+			}
+			if n.Where != nil {
+				if err := walkExpr(n.Where); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	for _, stmt := range stmts {
+		if err := walkStmt(stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
+	rs := o.ctx.Catalog.Routines()
+	if rs == nil {
+		return nil // no routine registry, silently skip
+	}
+	var argTypes []catalog.Type
+	for _, a := range s.Args {
+		argTypes = append(argTypes, catalog.Type{Name: strings.ToLower(a.Type.Name)})
+	}
+	var routines []*catalog.Routine
+	if s.Args == nil {
+		// No arg list: update all overloads
+		routines = rs.LookupByName(s.Name)
+	} else {
+		r, ok := rs.Lookup(s.Name, argTypes)
+		if ok && r != nil {
+			routines = []*catalog.Routine{r}
+		}
+	}
+	if len(routines) == 0 {
+		kind := "function"
+		if s.IsProcedure {
+			kind = "procedure"
+		}
+		argListStr := routineArgListStr(argTypes)
+		return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("%s %s%s does not exist", kind, s.Name.Name, argListStr)}
+	}
+	// Check that each matched routine is of the right kind (skip for ALTER ROUTINE).
+	if !s.IsRoutine {
+		for _, r := range routines {
+			if s.IsProcedure && !r.IsProcedure {
+				argList := routineArgListStr(argTypes)
+				return &ExecError{Code: "42809", Pos: s.Pos(),
+					Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argList)}
+			}
+			if !s.IsProcedure && r.IsProcedure {
+				argList := routineArgListStr(argTypes)
+				return &ExecError{Code: "42809", Pos: s.Pos(),
+					Message: fmt.Sprintf("%s%s is not a function", s.Name.Name, argList)}
+			}
+		}
+	}
+	// Check: STRICT attribute is invalid for ALTER PROCEDURE.
+	if s.IsProcedure && s.Strict != nil {
+		return &ExecError{Code: "42P13", Pos: s.Pos(),
+			Message: "invalid attribute in procedure definition"}
+	}
+	// RENAME TO: update the routine name in the registry.
+	if s.RenameTo != "" {
+		for _, r := range routines {
+			if err := rs.RenameRoutine(r, s.RenameTo); err != nil {
+				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+			}
+		}
+		return nil
+	}
+	// Only superusers may set a function as leakproof.
+	if s.Leakproof != nil && *s.Leakproof && o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: "only superuser can define a leakproof function"}
+	}
+	for _, r := range routines {
+		if s.Volatile != nil {
+			r.Volatile = *s.Volatile
+		}
+		if s.SecurityDefiner != nil {
+			r.SecurityDefiner = *s.SecurityDefiner
+		}
+		if s.Leakproof != nil {
+			r.Leakproof = *s.Leakproof
+		}
+		if s.Strict != nil {
+			r.Strict = *s.Strict
+		}
+	}
+	return nil
+}
+
+// execCreateProcedure registers a procedure in the catalog's
+// Routines() registry (M0015 Stage B). Mirror of execCreateFunction
+// but without RETURNS — procedures use OUT/INOUT params instead.
+func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
+	rs := o.ctx.Catalog.Routines()
+	if rs == nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE PROCEDURE requires routine registry"}
+	}
+	lang := strings.ToLower(s.Language)
+	if lang == "" {
+		if s.BeginAtomic {
+			lang = "sql" // BEGIN ATOMIC implies SQL language
+		} else {
+			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "CREATE PROCEDURE requires a LANGUAGE clause"}
+		}
+	}
+	if lang != "plpgsql" && lang != "sql" && lang != "c" {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("language %q is not supported (Stage B: plpgsql, sql)", s.Language)}
+	}
+	// Validate procedure-invalid attributes.
+	if s.Window {
+		return &ExecError{Code: "42P13", Pos: s.Pos(),
+			Message: "invalid attribute in procedure definition"}
+	}
+	if s.Strict {
+		return &ExecError{Code: "42P13", Pos: s.Pos(),
+			Message: "invalid attribute in procedure definition"}
+	}
+	argTypes := make([]catalog.Type, len(s.Args))
+	argNames := make([]string, len(s.Args))
+	argModes := make([]string, len(s.Args))
+	argDefaults := make([]string, len(s.Args))
+	// Validate: VARIADIC must be last; OUT can't follow default IN.
+	variadicSeen := false
+	defaultSeen := false
+	for i, a := range s.Args {
+		if variadicSeen {
+			return &ExecError{Code: "42P13", Pos: s.Pos(),
+				Message: "VARIADIC parameter must be the last parameter"}
+		}
+		if a.Mode == parser.FuncArgVariadic {
+			variadicSeen = true
+		}
+		if a.Mode == parser.FuncArgOut || a.Mode == parser.FuncArgInout {
+			if defaultSeen {
+				return &ExecError{Code: "42P13", Pos: s.Pos(),
+					Message: "procedure OUT parameters cannot appear after one with a default value"}
+			}
+		}
+		if a.Default != nil && (a.Mode == parser.FuncArgIn || a.Mode == 0) {
+			defaultSeen = true
+		}
+		typName := strings.ToLower(a.Type.Name)
+		if a.Type.IsArray {
+			typName += "[]"
+		}
+		argTypes[i] = catalog.Type{
+			Name: typName,
+			Args: append([]int64(nil), a.Type.Args...),
+		}
+		argNames[i] = a.Name
+		switch a.Mode {
+		case parser.FuncArgIn:
+			argModes[i] = "i"
+		case parser.FuncArgOut:
+			argModes[i] = "o"
+		case parser.FuncArgInout:
+			argModes[i] = "b"
+		case parser.FuncArgVariadic:
+			argModes[i] = "v"
+		default:
+			argModes[i] = "i"
+		}
+		if a.Default != nil {
+			argDefaults[i] = defaultExprToSQL(a.Default)
+		}
+	}
+	procSchema := s.Name.Schema
+	if procSchema == "" {
+		procSchema = currentWritableSchema(o.ctx)
+	}
+	// Validate BEGIN ATOMIC body: reject DDL statements like CREATE TABLE.
+	if s.BeginAtomic {
+		upper := strings.ToUpper(s.Body)
+		if strings.Contains(upper, "CREATE TABLE") {
+			return &ExecError{Code: "0A000", Pos: s.Pos(),
+				Message: "CREATE TABLE is not yet supported in unquoted SQL function body"}
+		}
+	}
+	// Validate SQL body: check if a CALL targets a procedure with output args.
+	// PG rejects this at function-creation time for SQL functions.
+	if lang == "sql" && !s.BeginAtomic && s.Body != "" {
+		if rs := o.ctx.Catalog.Routines(); rs != nil {
+			bodyStmts, _ := parser.Parse(s.Body)
+			for _, stmt := range bodyStmts {
+				call, ok := stmt.(*parser.CallStmt)
+				if !ok {
+					continue
+				}
+				// Look up any overload of the called procedure by name
+				callees := rs.LookupByName(call.Name)
+				for _, callee := range callees {
+					// Check if callee has any OUT or INOUT params
+					hasOutputArgs := false
+					for _, mode := range callee.ArgModes {
+						if mode == "o" || mode == "b" {
+							hasOutputArgs = true
+							break
+						}
+					}
+					if hasOutputArgs {
+						return &ExecError{
+							Code:    "0A000",
+							Pos:     s.Pos(),
+							Message: "calling procedures with output arguments is not supported in SQL functions",
+							Context: fmt.Sprintf("SQL function \"%s\"", s.Name.Name),
+						}
+					}
+				}
+			}
+		}
+	}
+	r := &catalog.Routine{
+		Schema:          procSchema,
+		Name:            s.Name.Name,
+		ArgNames:        argNames,
+		ArgTypes:        argTypes,
+		ArgModes:        argModes,
+		ArgDefaults:     argDefaults,
+		Language:        lang,
+		Body:            s.Body,
+		BeginAtomic:     s.BeginAtomic,
+		IsProcedure:     true,
+		SecurityDefiner: s.SecurityDefiner,
+		Volatile:        "v", // procedures default to volatile
 	}
 	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		if errors.Is(err, catalog.ErrRoutineExists) {
 			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
+		}
+		if errors.Is(err, catalog.ErrRoutineKindChange) {
+			// Existing is a function; we're creating a procedure.
+			return &ExecError{Code: "42P13", Pos: s.Pos(),
+				Message: "cannot change routine kind",
+				Detail:  fmt.Sprintf("%q is a function.", s.Name.Name)}
 		}
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -2528,6 +3999,15 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 // execDropProcedure removes a procedure from the routine registry
 // (mirrors execDropFunction).
 func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
+	// Drop all names in the list (multi-name DROP PROCEDURE a, b, c).
+	for _, extraName := range s.Names {
+		s2 := *s
+		s2.Name = extraName
+		s2.Names = nil
+		if err := o.execDropProcedure(&s2); err != nil {
+			return err
+		}
+	}
 	if s.IfExists && o.dropSchemaQualifiedNotice(s.Name) {
 		return nil
 	}
@@ -2540,20 +4020,73 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP PROCEDURE requires routine registry"}
 	}
+	// Verify the target exists and is a procedure BEFORE dropping.
+	var found *catalog.Routine
+	if s.Args == nil {
+		cands := rs.LookupByName(s.Name)
+		if len(cands) == 1 {
+			found = cands[0]
+		} else if len(cands) > 1 {
+			// "not unique" is an error even with IF EXISTS (only "not found" is suppressed).
+			return &ExecError{
+				Code:    "42725",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("%s name \"%s\" is not unique", objKind, s.Name.Name),
+				Hint:    fmt.Sprintf("Specify the argument list to select the %s unambiguously.", objKind),
+			}
+		}
+	} else {
+		cands := rs.LookupDropCandidates(s.Name, s.Args)
+		switch len(cands) {
+		case 0:
+			// not found — handled below
+		case 1:
+			found = cands[0]
+		default:
+			// multiple matches = ambiguous — arg list was given but still ambiguous;
+			// PG does NOT add "Specify the argument list" hint here since args were given.
+			// "not unique" is an error even with IF EXISTS.
+			return &ExecError{
+				Code:    "42725",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("%s name \"%s\" is not unique", objKind, s.Name.Name),
+			}
+		}
+	}
+	if found == nil {
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("%s %s does not exist, skipping", objKind, s.Name.Name))
+			return nil
+		}
+		// PG format: "procedure name() does not exist"
+		argListStr := buildCallArgListStr(s.Args)
+		return &ExecError{Code: "42883", Pos: s.Pos(),
+			Message:  fmt.Sprintf("%s %s%s does not exist", objKind, s.Name.Name, argListStr),
+			Hint:     "No procedure matches the given name and argument types. You might need to add explicit type casts.",
+		}
+	}
+	// DROP PROCEDURE on a function should fail.
+	if objKind == "procedure" && !found.IsProcedure {
+		// Use the found routine's arg types for the error message (argTypes may
+		// be nil when using LookupDropCandidates-based lookup).
+		argListStr := routineArgListStr(found.ArgTypes)
+		return &ExecError{Code: "42809", Pos: s.Pos(),
+			Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argListStr)}
+	}
+	// Now drop using the specific routine we already identified.
 	var err error
 	if s.Args == nil {
 		err = rs.DropByName(s.Name)
 	} else {
-		argTypes := make([]catalog.Type, len(s.Args))
-		for i, a := range s.Args {
-			argTypes[i] = catalog.Type{
-				Name: strings.ToLower(a.Type.Name),
-				Args: append([]int64(nil), a.Type.Args...),
-			}
-		}
-		err = rs.Drop(s.Name, argTypes)
+		// Use DropRoutine with the exact routine found by LookupDropCandidates
+		// to avoid signature-based ambiguity (OUT params excluded from Signature).
+		err = rs.DropRoutine(found)
 	}
 	if err == nil {
+		// Record the drop for potential rollback on ROLLBACK.
+		if sess, ok := o.ctx.Session.(*BasicSession); ok {
+			sess.AddPendingRoutineDrop(found)
+		}
 		return nil
 	}
 	if errors.Is(err, catalog.ErrRoutineNotFound) {
@@ -2579,6 +4112,16 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 // the unique overload (and surfaces 42725 "ambiguous function"
 // if more than one exists).
 func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
+	// Multi-target: DROP FUNCTION f1(args), f2(args)
+	for _, extra := range s.Extras {
+		s2 := *s
+		s2.Name = extra.Name
+		s2.Args = extra.Args
+		s2.Extras = nil
+		if err := o.execDropFunction(&s2); err != nil {
+			return err
+		}
+	}
 	if s.IfExists && o.dropSchemaQualifiedNotice(s.Name) {
 		return nil
 	}
@@ -2607,6 +4150,65 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 	if rs == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP FUNCTION requires routine registry"}
 	}
+
+	// Pre-check: look up the routine to verify it is a function, not a procedure.
+	if s.Args != nil {
+		argTypes := make([]catalog.Type, len(s.Args))
+		for i, a := range s.Args {
+			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+		}
+		if found, ok := rs.Lookup(s.Name, argTypes); ok && found != nil && found.IsProcedure {
+			// "X(type) is not a function" — matches PG error for DROP FUNCTION on a procedure.
+			argListStr := routineArgListStr(argTypes)
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("%s%s is not a function, skipping", s.Name.Name, argListStr))
+				return nil
+			}
+			return &ExecError{Code: "42809", Pos: s.Pos(),
+				Message: fmt.Sprintf("%s%s is not a function", s.Name.Name, argListStr)}
+		}
+	}
+
+	// CASCADE: drop functions that depend on this function via RoutineCallOIDs.
+	if s.Behavior == parser.DropCascade {
+		// Collect target routines to find dependents for.
+		var targets []*catalog.Routine
+		if s.Args != nil {
+			argTypes := make([]catalog.Type, len(s.Args))
+			for i, a := range s.Args {
+				argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+			}
+			if target, ok := rs.Lookup(s.Name, argTypes); ok && target != nil {
+				targets = []*catalog.Routine{target}
+			}
+		} else {
+			// No arg list: find all overloads by name.
+			targets = rs.LookupByName(s.Name)
+		}
+		var allDeps []*catalog.Routine
+		for _, target := range targets {
+			for _, dep := range functionsDependingOnRoutineOID(o.ctx.Catalog, target.OID) {
+				allDeps = append(allDeps, dep)
+			}
+		}
+		if len(allDeps) == 1 {
+			dn := routineCascadeDisplayName(allDeps[0])
+			o.ctx.AddNotice(fmt.Sprintf("drop cascades to function %s", dn))
+			_ = rs.DropRoutine(allDeps[0])
+		} else if len(allDeps) > 1 {
+			detail := make([]string, len(allDeps))
+			for i, r := range allDeps {
+				dn := routineCascadeDisplayName(r)
+				detail[i] = fmt.Sprintf("drop cascades to function %s", dn)
+				_ = rs.DropRoutine(r)
+			}
+			o.ctx.AddNoticeWithDetail(
+				fmt.Sprintf("drop cascades to %d other objects", len(allDeps)),
+				strings.Join(detail, "\n"),
+			)
+		}
+	}
+
 	var err error
 	if s.Args == nil {
 		err = rs.DropByName(s.Name)
@@ -2624,6 +4226,15 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		return nil
 	}
 	if errors.Is(err, catalog.ErrRoutineNotFound) {
+		// When no argument list was given, PG says "could not find a function named X".
+		if s.Args == nil {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("function %s does not exist, skipping", s.Name.Name))
+				return nil
+			}
+			return &ExecError{Code: "42883", Pos: s.Pos(),
+				Message: fmt.Sprintf("could not find a function named %q", s.Name.Name)}
+		}
 		// Build the function signature for error/notice messages.
 		// PG format for IF EXISTS notice: "function name(pg_catalog.type,...) does not exist, skipping"
 		// PG format for ERROR: "function name(canonical_type,...) does not exist"
@@ -2773,6 +4384,48 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 	})
 }
 
+// syncEnumTypeToCatalogHeap writes a single pg_type row for an enum type into
+// the pg_type heap (OID 1247). Called after RegisterEnum so that queries like
+// `SELECT 1 FROM pg_type WHERE oid = enumtypid` return the expected rows.
+// Mirrors to DBOid=5 (postgres db) so the seqScan (which reads from the
+// session's DBOID) finds the row. M0097-0022 (enum → pg_type parity).
+func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
+	if !catalogHeapSyncAvailable(ctx) {
+		return
+	}
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForEnum(et)); err != nil {
+		return
+	}
+	// Mirror pg_type to the postgres database (DBOid=5) so sessions using
+	// the postgres db can find the new type row via SeqScan. This mirrors
+	// the pattern used by syncTableToCatalogHeap. M0097-0022.
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+}
+
+// deleteTypeFromCatalogHeap stamps xmax on the pg_type row for typeOID.
+// Called by execDropType so dropped enums don't leave orphan pg_type rows.
+// pg_type rows are written by syncEnumTypeToCatalogHeap using pgTypeColumnsPG18
+// which has oid (4-byte LE uint32) as column 0. M0097-0022.
+func deleteTypeFromCatalogHeap(ctx *Context, dbOid uint32, typeOID uint32, xmax storage.TransactionID) {
+	typeRel := storage.RelFileNode{
+		DBOid:  dbOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	stampCatalogRows(ctx, typeRel, xmax, func(data []byte) bool {
+		if len(data) < 4 {
+			return false
+		}
+		// Column 0 of pgTypeColumnsPG18 is oid (4-byte LE uint32) at offset 0.
+		return binary.LittleEndian.Uint32(data[0:4]) == typeOID
+	})
+}
+
 // catalogHeapSyncAvailable returns true when the M0030-0001 system catalog
 // heap relfiles are accessible and DDL operations should write rows to
 // pg_class / pg_attribute. The proxy indicator is whether pg_attribute is
@@ -2874,6 +4527,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 
 	return nil
 }
+
 
 // syncIndexToCatalogHeap writes a pg_class row and a pg_index row for idx.
 // Called by createBTreeIndex after the full index build succeeds. The row
@@ -3067,6 +4721,8 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		key := s.Name + "@" + s.Table.String()
 		if im.DropCompatObject("rule", key) {
+			// Also remove the table rule kind so future COPY DML sees no rule. M0097-0140.
+			im.UnregisterTableRules(s.Table.Name)
 			return nil
 		}
 	}
@@ -3173,11 +4829,28 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	if o.ctx.Pool == nil || o.ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE MATERIALIZED VIEW requires storage"}
 	}
+	// Check for existing relation before planning to avoid spurious runtime
+	// errors (e.g. division by zero) from constant folding in the query.
+	if _, exists := o.ctx.Catalog.LookupTable(s.Name); exists {
+		if s.IfNotExists {
+			o.ctx.AddNotice(fmt.Sprintf("relation %q already exists, skipping", s.Name.String()))
+			return nil
+		}
+		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
+	}
 	// Plan the SELECT query to determine output columns.
 	if err := analyzer.Analyze(s.Query, o.ctx.Catalog); err != nil {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 	}
-	selectPlan, err := planner.Plan(s.Query, o.ctx.Catalog)
+	var selectPlan planner.Node
+	var err error
+	if s.WithNoData {
+		// WITH NO DATA: use schema-only planning that suppresses runtime
+		// evaluation errors (e.g. division by zero) — the query will never execute.
+		selectPlan, err = planner.PlanSchemaOnly(s.Query, o.ctx.Catalog)
+	} else {
+		selectPlan, err = planner.Plan(s.Query, o.ctx.Catalog)
+	}
 	if err != nil {
 		return err
 	}
@@ -3185,10 +4858,18 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	if schema == nil {
 		return &ExecError{Code: "42P10", Pos: s.Pos(), Message: "materialized view query has no output columns"}
 	}
-	// Build column list from plan output schema.
+	// Apply optional column aliases and validate count.
+	if len(s.ColumnAliases) > len(schema) {
+		return &ExecError{Code: "42601", Pos: s.Pos(), Message: "too many column names were specified"}
+	}
+	// Build column list from plan output schema, applying any column aliases.
 	cols := make([]catalog.Column, len(schema))
 	for i, sc := range schema {
-		cols[i] = catalog.Column{Name: sc.Name, Type: sc.Type, Ordinal: i}
+		name := sc.Name
+		if i < len(s.ColumnAliases) {
+			name = s.ColumnAliases[i]
+		}
+		cols[i] = catalog.Column{Name: name, Type: sc.Type, Ordinal: i}
 	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
@@ -3196,6 +4877,12 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	}
 	tbl.IsMatView = true
 	tbl.IsPopulated = !s.WithNoData
+	// Set schema from search_path if not explicitly specified (mirrors CREATE TABLE). M0097-0025.
+	if s.Name.Schema == "" {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			tbl.Schema = ws
+		}
+	}
 	// Store the SELECT AST as the view query (for REFRESH).
 	tbl.View = s.Query
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
@@ -3216,7 +4903,8 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 }
 
 // materializeView executes the view's SELECT query and writes results
-// to the materialized view heap. Used by both initial populate and REFRESH.
+// to the materialized view heap, then rebuilds all btree indexes.
+// Used by both initial populate and REFRESH. M0097-0013.
 func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) error {
 	op, err := Build(selectPlan)
 	if err != nil {
@@ -3244,6 +4932,33 @@ func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) err
 			return werr
 		}
 	}
+	// Rebuild all btree indexes on the matview after population.
+	// This also detects unique constraint violations (duplicate rows). M0097-0025.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, idx := range im.IndexesOnTable(tbl) {
+			idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+			// Truncate (clear) the index storage before rebuilding.
+			o.ctx.Pool.InvalidateRel(idxRel)
+			if err := o.ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
+				return err
+			}
+			// Resolve column name → *catalog.Column for each index column.
+			cols := make([]*catalog.Column, len(idx.Columns))
+			for i, colName := range idx.Columns {
+				if colName == "" {
+					continue // expression column
+				}
+				col, ok2 := o.ctx.Catalog.LookupColumn(tbl, colName)
+				if ok2 {
+					cols[i] = col
+				}
+			}
+			idxName := idx.QualifiedName()
+			if err := o.bulkBuildBTree(idxRel, tbl, cols, idx.Unique, idxName, 0); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -3252,12 +4967,61 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	if o.ctx.Pool == nil || o.ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "REFRESH MATERIALIZED VIEW requires storage"}
 	}
+	// CONCURRENTLY and WITH NO DATA are mutually exclusive.
+	if s.Concurrently && s.WithNoData {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CONCURRENTLY and WITH NO DATA options cannot be used together"}
+	}
 	tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("materialized view %q does not exist", s.Name.String())}
 	}
 	if !tbl.IsMatView {
 		return &ExecError{Code: "42809", Pos: s.Pos(), Message: fmt.Sprintf("%q is not a materialized view", s.Name.String())}
+	}
+	// REFRESH without CONCURRENTLY on a non-populated matview is fine (it populates it).
+	// But CONCURRENTLY requires the matview to already be populated.
+	// refreshErrName returns "schema.name" for error messages, using "public"
+	// as the default schema when tbl.Schema is empty.
+	refreshErrName := func() string {
+		if tbl.Schema == "" || strings.EqualFold(tbl.Schema, "public") {
+			return "public." + tbl.Name
+		}
+		return tbl.Schema + "." + tbl.Name
+	}
+	if s.Concurrently && !tbl.IsPopulated {
+		return &ExecError{Code: "55000", Pos: s.Pos(),
+			Message: fmt.Sprintf("cannot refresh materialized view %q concurrently",
+				refreshErrName()),
+			Hint: "Use the REFRESH MATERIALIZED VIEW command."}
+	}
+	// CONCURRENTLY requires at least one unique index with no WHERE clause.
+	if s.Concurrently {
+		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+			hasUnique := false
+			for _, idx := range im.IndexesOnTable(tbl) {
+				if !idx.Unique || idx.HasPredicate {
+					continue // partial or non-unique — not suitable for CONCURRENTLY
+				}
+				// Check for expression columns (not suitable for CONCURRENTLY).
+				allPlain := true
+				for _, e := range idx.ColExprs {
+					if e != nil {
+						allPlain = false
+						break
+					}
+				}
+				if allPlain {
+					hasUnique = true
+					break
+				}
+			}
+			if !hasUnique {
+				return &ExecError{Code: "55000", Pos: s.Pos(),
+					Message: fmt.Sprintf("cannot refresh materialized view %q concurrently",
+						refreshErrName()),
+					Hint: "Create a unique index with no WHERE clause on one or more columns of the materialized view."}
+			}
+		}
 	}
 	// Re-plan the SELECT from the stored query.
 	if err := analyzer.Analyze(tbl.View, o.ctx.Catalog); err != nil {
@@ -3272,9 +5036,57 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	if err := truncateRelation(o.ctx, rel); err != nil {
 		return err
 	}
-	// Re-populate.
+	// Re-populate. Translate 23505 unique violations to PG-compatible messages.
 	if err := o.materializeView(tbl, selectPlan); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Code == "23505" {
+			if s.Concurrently {
+				// REFRESH CONCURRENTLY duplicate → "new data contains duplicate rows".
+				return &ExecError{Code: "55000", Pos: s.Pos(),
+					Message: fmt.Sprintf("new data for materialized view %q contains duplicate rows without any null columns", s.Name.String())}
+			}
+			// Non-concurrent REFRESH → "could not create unique index 'name'".
+			idxName := ""
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				for _, idx := range im.IndexesOnTable(tbl) {
+					if idx.Unique {
+						idxName = idx.Name
+						break
+					}
+				}
+			}
+			return &ExecError{Code: "23505", Pos: s.Pos(),
+				Message: fmt.Sprintf("could not create unique index %q", idxName)}
+		}
 		return err
+	}
+	// For CONCURRENTLY refresh, verify the unique index still exists after
+	// materialization (it might have been dropped during the SELECT query).
+	// M0097-0025.
+	if s.Concurrently {
+		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+			hasUnique := false
+			for _, idx := range im.IndexesOnTable(tbl) {
+				if !idx.Unique || idx.HasPredicate {
+					continue
+				}
+				allPlain := true
+				for _, e := range idx.ColExprs {
+					if e != nil {
+						allPlain = false
+						break
+					}
+				}
+				if allPlain {
+					hasUnique = true
+					break
+				}
+			}
+			if !hasUnique {
+				return &ExecError{Code: "55000", Pos: s.Pos(),
+					Message: fmt.Sprintf("could not find suitable unique index on materialized view %q",
+						s.Name.String())}
+			}
+		}
 	}
 	tbl.IsPopulated = true
 	return nil
@@ -3319,29 +5131,77 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			}
 			// Schema is registered; unregister it.
 			o.ctx.Catalog.UnregisterSchema(schemaName)
-			if s.Behavior == parser.DropCascade && len(tables) > 0 {
+			if s.Behavior == parser.DropCascade {
+				// Collect routines to drop for NOTICE detail.
+				var droppedRoutines []string
+				rs := o.ctx.Catalog.Routines()
+				if rs != nil {
+					for _, r := range rs.List() {
+						if strings.EqualFold(r.Schema, schemaName) {
+							// Build canonical arg list for NOTICE.
+							argStr := r.Name + "(" + buildFunctionArgsList(r) + ")"
+							droppedRoutines = append(droppedRoutines, argStr)
+							_ = rs.Drop(parser.ObjectName{Schema: r.Schema, Name: r.Name}, r.ArgTypes)
+						}
+					}
+					sort.Strings(droppedRoutines)
+				}
+				// Collect views in the schema.
+				var droppedViews []string
+				var droppedOpClasses []string
+				if im2, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
+					for _, v := range im2.AllUserViews() {
+						if strings.EqualFold(v.Schema, schemaName) {
+							droppedViews = append(droppedViews, v.Name)
+						}
+					}
+					sort.Strings(droppedViews)
+					for _, vn := range droppedViews {
+						dropped := map[string]bool{}
+						_ = o.execDropOneView(parser.ObjectName{Schema: schemaName, Name: vn}, true, parser.DropCascade, s.Pos(), dropped)
+					}
+					// Collect operator classes in the schema. M0097-0022.
+					droppedOpClasses = im2.OpClassesInSchema(schemaName)
+				}
 				// Sort table names for deterministic DETAIL output.
 				sort.Slice(tables, func(i, j int) bool {
 					return tables[i].String() < tables[j].String()
 				})
+				// Build detail lines BEFORE dropping (IsMatView check needs table still in catalog).
+				total := len(tables) + len(droppedViews) + len(droppedRoutines) + len(droppedOpClasses)
+				var detailLines []string
+				if total > 0 {
+					for _, funcName := range droppedRoutines {
+						detailLines = append(detailLines, fmt.Sprintf("drop cascades to function %s", funcName))
+					}
+					for _, opClass := range droppedOpClasses {
+						detailLines = append(detailLines, fmt.Sprintf("drop cascades to operator family %s for access method hash", opClass))
+					}
+					for _, tbl := range tables {
+						kind := "table"
+						if t, ok := o.ctx.Catalog.LookupTable(tbl); ok && t.IsMatView {
+							kind = "materialized view"
+						}
+						detailLines = append(detailLines, fmt.Sprintf("drop cascades to %s %s", kind, tbl.String()))
+					}
+					for _, vn := range droppedViews {
+						detailLines = append(detailLines, fmt.Sprintf("drop cascades to view %s", vn))
+					}
+				}
 				// Drop each table in the schema.
 				for _, tbl := range tables {
 					if err := o.ctx.Catalog.DropTable(tbl); err != nil {
 						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 					}
 				}
-				// Emit NOTICE "drop cascades to N other objects" with DETAIL.
-				// PostgreSQL's DETAIL field is multi-line; psql prints the first
-				// line with "DETAIL:" and continuation lines as plain text.
-				detailLines := make([]string, len(tables))
-				for i, tbl := range tables {
-					detailLines[i] = fmt.Sprintf("drop cascades to table %s", tbl.String())
+				// Emit NOTICE with total cascade count.
+				if total > 0 {
+					detail := strings.Join(detailLines, "\n")
+					o.ctx.AddNoticeWithDetail(
+						fmt.Sprintf("drop cascades to %d other objects", total),
+						detail,
+					)
 				}
-				detail := strings.Join(detailLines, "\n")
-				o.ctx.AddNoticeWithDetail(
-					fmt.Sprintf("drop cascades to %d other objects", len(tables)),
-					detail,
-				)
 			}
 		}
 		return nil
@@ -3493,6 +5353,30 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if o.dropSchemaQualifiedNotice(name) {
 				continue
 			}
+			// CASCADE: drop functions that depend on this sequence before dropping it.
+			if s.Behavior == parser.DropCascade {
+				funcDeps := functionsDependingOnSequence(o.ctx.Catalog, name.Name, name.Schema)
+				if len(funcDeps) == 1 {
+					dn := routineCascadeDisplayName(funcDeps[0])
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to function %s", dn))
+					if rs := o.ctx.Catalog.Routines(); rs != nil {
+						_ = rs.DropRoutine(funcDeps[0])
+					}
+				} else if len(funcDeps) > 1 {
+					detail := make([]string, len(funcDeps))
+					for i, r := range funcDeps {
+						dn := routineCascadeDisplayName(r)
+						detail[i] = fmt.Sprintf("drop cascades to function %s", dn)
+						if rs := o.ctx.Catalog.Routines(); rs != nil {
+							_ = rs.DropRoutine(r)
+						}
+					}
+					o.ctx.AddNoticeWithDetail(
+						fmt.Sprintf("drop cascades to %d other objects", len(funcDeps)),
+						strings.Join(detail, "\n"),
+					)
+				}
+			}
 			if !DropSequence(name.String()) {
 				if s.IfExists {
 					o.ctx.AddNotice(fmt.Sprintf("sequence %q does not exist, skipping", name.String()))
@@ -3509,12 +5393,10 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	}
 	// Handle DROP MATERIALIZED VIEW via the catalog's DropView. M0097-0038.
 	if objType == "materialized view" {
+		dropped := map[string]bool{}
 		for _, name := range s.Names {
-			if s.IfExists && o.dropSchemaQualifiedNotice(name) {
-				continue
-			}
-			if err := o.ctx.Catalog.DropView(name, s.IfExists); err != nil {
-				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
+			if err := o.execDropOneMatView(name, s.IfExists, s.Behavior, s.Pos(), dropped, true); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -3757,6 +5639,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if s.TableName.Name != "" {
 			key := s.ObjName.Name + "@" + s.TableName.String()
 			im.RegisterCompatObject("rule", key)
+			// Also record the rule kind for COPY DML rule-specific errors. M0097-0140.
+			if s.RuleKind != "" {
+				im.RegisterTableRuleKind(s.TableName.Name, s.RuleKind)
+			}
 		}
 	default:
 		// conversion, text search dictionary/configuration/parser/template, etc.
@@ -3934,14 +5820,19 @@ func (o *ddlOp) execAlterAggregateRename(s *parser.AlterAggregateRenameStmt) err
 // operator class. Only the FUNCTION 2 entry is used; everything else is
 // silently accepted. M0097-0027.
 func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
-	if s.HashFuncName == "" {
-		return nil // no hash support function — nothing to register
-	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
 	}
-	im.RegisterOpClassHashFunc(s.Name, s.HashFuncName)
+	if s.HashFuncName != "" {
+		im.RegisterOpClassHashFunc(s.Name, s.HashFuncName)
+	}
+	// Track the schema for DROP SCHEMA CASCADE detail output. M0097-0022.
+	schema := currentWritableSchema(o.ctx)
+	if schema == "" {
+		schema = "public"
+	}
+	im.RegisterOpClassSchema(s.Name, schema)
 	return nil
 }
 
@@ -4014,9 +5905,19 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		}
 		return nil
 	}
-	_, err := cat.RegisterEnum(s.Name, s.EnumValues)
+	et, err := cat.RegisterEnum(s.Name, s.EnumValues)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	// Write a pg_type heap row so `SELECT 1 FROM pg_type WHERE oid = enumtypid`
+	// returns a match for the new type. M0097-0022.
+	syncEnumTypeToCatalogHeap(o.ctx, et)
+	// Track enum type creation so ROLLBACK can drop it.  M0097-0022.
+	if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		if o.ctx.PendingCreatedEnums == nil {
+			o.ctx.PendingCreatedEnums = make(map[string]bool)
+		}
+		o.ctx.PendingCreatedEnums[strings.ToLower(s.Name)] = true
 	}
 	return nil
 }
@@ -4026,14 +5927,65 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	if !ok {
 		return nil
 	}
+	// RENAME VALUE 'old' TO 'new' — M0097-0022.
+	if s.RenameOldValue != "" {
+		err := cat.RenameEnumValue(s.Name, s.RenameOldValue, s.RenameNewValue)
+		if err == nil {
+			return nil
+		}
+		switch e := err.(type) {
+		case *catalog.EnumLabelNotFound:
+			return &ExecError{Code: "42710", Pos: s.Pos(), Message: e.Error()}
+		case *catalog.EnumLabelAlreadyExists:
+			return &ExecError{Code: "42710", Pos: s.Pos(), Message: e.Error()}
+		default:
+			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+		}
+	}
+	// RENAME TO new_name — rename the enum type. Track for ROLLBACK.  M0097-0022.
+	if s.RenameTo != "" {
+		err := cat.RenameEnum(s.Name, s.RenameTo)
+		if err != nil {
+			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+		}
+		if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+			oldK := strings.ToLower(s.Name)
+			newK := strings.ToLower(s.RenameTo)
+			o.ctx.PendingEnumRenames = append(o.ctx.PendingEnumRenames, EnumRenameEntry{OldName: oldK, NewName: newK})
+			// Update PendingCreatedEnums to track the current name so that
+			// isUnsafeEnumValue and rollback undo both use the right key.
+			// undoEnumDDLFromContext applies inverse renames to PendingCreatedEnums
+			// during rollback so the final drop uses the (then-restored) old name.
+			if o.ctx.PendingCreatedEnums[oldK] {
+				delete(o.ctx.PendingCreatedEnums, oldK)
+				o.ctx.PendingCreatedEnums[newK] = true
+			}
+		}
+		return nil
+	}
 	if s.AddValue == "" {
-		return nil // RENAME VALUE / RENAME TO / OWNER TO — no-op
+		return nil // OWNER TO — no-op
 	}
 	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After)
 	if err == nil {
 		if skipped {
 			// IF NOT EXISTS with existing label: emit NOTICE, continue.
 			o.ctx.AddNotice(fmt.Sprintf("enum label %q already exists, skipping", s.AddValue))
+		} else if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+			// Value added inside an uncommitted transaction: mark as "unsafe" ONLY if
+			// the type was NOT created in the same transaction (newly-created enum values
+			// are immediately safe — only pre-existing-type additions need the guard).
+			// M0097-0022.
+			typeName := strings.ToLower(s.Name)
+			if !o.ctx.PendingCreatedEnums[typeName] {
+				if o.ctx.PendingEnumValues == nil {
+					o.ctx.PendingEnumValues = make(map[string]map[string]bool)
+				}
+				if o.ctx.PendingEnumValues[typeName] == nil {
+					o.ctx.PendingEnumValues[typeName] = make(map[string]bool)
+				}
+				o.ctx.PendingEnumValues[typeName][s.AddValue] = true
+			}
 		}
 		return nil
 	}
@@ -4064,6 +6016,17 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		}
 		n := name.Name
 		// Try to drop as enum first, then as composite type. M0097-0064.
+		// Stamp pg_type row before in-memory delete (need OID while et still exists).
+		// MaterializeWriterXID ensures a real non-zero XID is used; DROP TYPE
+		// does not call writeHeapRowReturningPG so the XID would otherwise
+		// remain InvalidTransactionID (0), which is a no-op stamp. M0097-0022.
+		if et, ok := cat.LookupEnum(n); ok && catalogHeapSyncAvailable(o.ctx) {
+			if o.ctx.MaterializeWriterXID() == nil {
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.OID, o.ctx.Tx.XID)
+				// Mirror pg_type to postgres db so the xmax stamp is visible via SeqScan.
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			}
+		}
 		enumErr := cat.DropEnum(n, s.Cascade)
 		if enumErr == nil {
 			continue // successfully dropped as enum
@@ -4088,7 +6051,7 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 		return nil
 	}
 	baseType := catalog.Type{Name: s.BaseType}
-	_, err := cat.RegisterDomain(s.Name, baseType, s.NotNull)
+	_, err := cat.RegisterDomain(s.Name, baseType, s.NotNull, s.CheckInValues...)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -4122,6 +6085,249 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 
 // execLockTable handles LOCK [TABLE] rel [, ...] [IN mode MODE] [NOWAIT].
 // It records the held locks in globalRelLockMgr so they appear in pg_locks.
+// execAlterColumnType implements `ALTER TABLE t ALTER COLUMN col TYPE newtype`.
+// It updates the column type in the catalog and, when storage is available,
+// rewrites existing heap rows to re-encode the column value in the new type.
+// M0097-0022.
+// execAlterDropColumn implements ALTER TABLE ... DROP COLUMN via a table
+// rewrite: reads all visible rows with the OLD schema, removes the dropped
+// column's slot, updates the catalog, truncates the heap + indexes, then
+// re-inserts all rows and rebuilds indexes. Mirrors execAlterColumnType.
+// Indexes referencing only the dropped column become empty orphans (harmless
+// for now; a future pass can DROP them explicitly).
+func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAction) error {
+	// Find the column to drop.
+	dropIdx := -1
+	for i, col := range tbl.Columns {
+		if strings.EqualFold(col.Name, act.ColumnName) {
+			dropIdx = i
+			break
+		}
+	}
+	if dropIdx < 0 {
+		return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+	}
+
+	// Save old columns for decoding existing heap rows.
+	oldCols := make([]catalog.Column, len(tbl.Columns))
+	copy(oldCols, tbl.Columns)
+
+	// If no storage pool is available, just update the catalog (test/unit path).
+	if o.ctx.Pool == nil {
+		tbl.Columns = append(tbl.Columns[:dropIdx], tbl.Columns[dropIdx+1:]...)
+		for i := range tbl.Columns {
+			tbl.Columns[i].Ordinal = i
+		}
+		return nil
+	}
+
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	nBlocks, err := o.ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: err.Error()}
+	}
+
+	// Phase 1: read all visible rows using the OLD column schema.
+	var allRows []Row
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		bufSlot, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if perr != nil {
+			continue
+		}
+		bufSlot.RLock()
+		page := bufSlot.Page()
+		if storage.IsNew(page) {
+			bufSlot.RUnlock()
+			o.ctx.Pool.Unpin(bufSlot)
+			continue
+		}
+		count, cerr := storage.PageLinePointerCount(page)
+		if cerr != nil {
+			bufSlot.RUnlock()
+			o.ctx.Pool.Unpin(bufSlot)
+			continue
+		}
+		for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
+			tuple, terr := storage.PageGetHeapTuple(page, slotIdx)
+			if terr != nil {
+				continue
+			}
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+				continue
+			}
+			row := acquireRow(len(oldCols))
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			if decErr := DecodeRowIntoMctxPGTuple(row, oldCols, tuple.Data, tuple.Bitmap, storedNatts, nil); decErr != nil {
+				releaseRow(row)
+				continue
+			}
+			// Build a new row with the dropped column removed.
+			newRow := make(Row, len(oldCols)-1)
+			copy(newRow[:dropIdx], row[:dropIdx])
+			copy(newRow[dropIdx:], row[dropIdx+1:])
+			allRows = append(allRows, cloneRowOwned(newRow))
+			releaseRow(row)
+		}
+		bufSlot.RUnlock()
+		o.ctx.Pool.Unpin(bufSlot)
+	}
+
+	// Phase 2: update the catalog — remove the dropped column and update ordinals.
+	tbl.Columns = append(tbl.Columns[:dropIdx], tbl.Columns[dropIdx+1:]...)
+	for i := range tbl.Columns {
+		tbl.Columns[i].Ordinal = i
+	}
+
+	// Phase 3: truncate the heap and all indexes.
+	o.ctx.Pool.InvalidateRel(rel)
+	if terr := o.ctx.Pool.Manager().TruncateRelation(rel); terr != nil {
+		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: terr.Error()}
+	}
+	if o.ctx.FSM != nil {
+		o.ctx.FSM.DropRelation(rel)
+	}
+	if o.ctx.VM != nil {
+		o.ctx.VM.DropRelation(rel)
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+		o.ctx.Pool.InvalidateRel(idxRel)
+		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
+		_, _ = btree.Create(o.ctx.Pool, idxRel)
+	}
+
+	// Phase 4: re-insert all rows with the new column layout and rebuild indexes.
+	for _, row := range allRows {
+		ptr, werr := writeHeapRowReturning(o.ctx, rel, tbl.Columns, row)
+		if werr != nil {
+			return werr
+		}
+		maintainUniqueIndexesForInsert(o.ctx, tbl, tbl.Columns, row, ptr)
+	}
+	return nil
+}
+
+func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAction) error {
+	colIdx := -1
+	for i, col := range tbl.Columns {
+		if strings.EqualFold(col.Name, act.ColumnName) {
+			colIdx = i
+			break
+		}
+	}
+	if colIdx < 0 {
+		return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+	}
+
+	oldCatalogType := tbl.Columns[colIdx].Type
+	newCatalogType := catalog.Type{Name: strings.ToLower(act.NewType.Name), Args: append([]int64(nil), act.NewType.Args...)}
+
+	// No-op when the type name is unchanged.
+	if strings.EqualFold(oldCatalogType.Name, newCatalogType.Name) {
+		return nil
+	}
+
+	// If no storage pool is available, just update the catalog type.
+	if o.ctx.Pool == nil {
+		tbl.Columns[colIdx].Type = newCatalogType
+		return nil
+	}
+
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	nBlocks, err := o.ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: err.Error()}
+	}
+
+	// If the table is empty, just update the catalog — nothing to rewrite.
+	if nBlocks == 0 {
+		tbl.Columns[colIdx].Type = newCatalogType
+		return nil
+	}
+
+	// Phase 1: read all visible rows using the OLD column schema.
+	// Build a copy of the columns slice with the old type for decoding.
+	oldCols := make([]catalog.Column, len(tbl.Columns))
+	copy(oldCols, tbl.Columns)
+	// oldCols[colIdx] already has the old type.
+
+	var allRows []Row
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		bufSlot, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if perr != nil {
+			continue
+		}
+		bufSlot.RLock()
+		page := bufSlot.Page()
+		if storage.IsNew(page) {
+			bufSlot.RUnlock()
+			o.ctx.Pool.Unpin(bufSlot)
+			continue
+		}
+		count, cerr := storage.PageLinePointerCount(page)
+		if cerr != nil {
+			bufSlot.RUnlock()
+			o.ctx.Pool.Unpin(bufSlot)
+			continue
+		}
+		for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
+			tuple, terr := storage.PageGetHeapTuple(page, slotIdx)
+			if terr != nil {
+				continue
+			}
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+				continue
+			}
+			row := acquireRow(len(oldCols))
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			if decErr := DecodeRowIntoMctxPGTuple(row, oldCols, tuple.Data, tuple.Bitmap, storedNatts, nil); decErr != nil {
+				continue
+			}
+			// Convert the changed column to the new type.
+			if colIdx < len(row) {
+				if converted, cErr := evalCast(row[colIdx], newCatalogType.Name, act.Pos()); cErr == nil {
+					row[colIdx] = converted
+				}
+			}
+			// Deep-copy the row so arena-backed string Datums survive
+			// beyond the page pin (cloneRowOwned allocates fresh backing).
+			allRows = append(allRows, cloneRowOwned(row))
+			releaseRow(row)
+		}
+		bufSlot.RUnlock()
+		o.ctx.Pool.Unpin(bufSlot)
+	}
+
+	// Phase 2: update the catalog column type.
+	tbl.Columns[colIdx].Type = newCatalogType
+
+	// Phase 3: truncate the heap and all indexes.
+	o.ctx.Pool.InvalidateRel(rel)
+	if terr := o.ctx.Pool.Manager().TruncateRelation(rel); terr != nil {
+		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: terr.Error()}
+	}
+	if o.ctx.FSM != nil {
+		o.ctx.FSM.DropRelation(rel)
+	}
+	if o.ctx.VM != nil {
+		o.ctx.VM.DropRelation(rel)
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+		o.ctx.Pool.InvalidateRel(idxRel)
+		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
+		_, _ = btree.Create(o.ctx.Pool, idxRel)
+	}
+
+	// Phase 4: re-insert all rows with the new encoding.
+	for _, row := range allRows {
+		if werr := writeHeapRow(o.ctx, rel, tbl.Columns, row); werr != nil {
+			return werr
+		}
+	}
+	return nil
+}
+
 // PostgreSQL transitively locks all relations that a view depends on, so
 // locking a view also locks its underlying tables/views recursively. M0097.
 // The locks are released when the session's transaction ends (execCommit/execRollback).
@@ -4300,4 +6506,270 @@ func lockTableSearchSchemas(ctx *Context) []string {
 		result = []string{"public"}
 	}
 	return result
+}
+
+// currentWritableSchema returns the first writable schema from the session's
+// search_path GUC. Used by CREATE FUNCTION/PROCEDURE when no schema qualifier
+// is provided. Defaults to "public" if search_path is empty or not set.
+func currentWritableSchema(ctx *Context) string {
+	if ctx == nil || ctx.GetSetting == nil {
+		return "public"
+	}
+	searchPath, ok := ctx.GetSetting("search_path")
+	if !ok || searchPath == "" {
+		return "public"
+	}
+	for _, raw := range strings.Split(searchPath, ",") {
+		s := strings.TrimSpace(raw)
+		s = strings.Trim(s, `"'`)
+		if s == "" || s == "$user" {
+			continue
+		}
+		lc := strings.ToLower(s)
+		if lc == "pg_catalog" || lc == "information_schema" {
+			continue
+		}
+		return s
+	}
+	return "public"
+}
+
+// buildFunctionArgsList returns a comma-separated arg type list for a Routine,
+// using canonical type names. Used in DROP CASCADE NOTICE messages.
+func buildFunctionArgsList(r *catalog.Routine) string {
+	if len(r.ArgTypes) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(r.ArgTypes))
+	for i, t := range r.ArgTypes {
+		mode := "i"
+		if i < len(r.ArgModes) && r.ArgModes[i] != "" {
+			mode = r.ArgModes[i]
+		}
+		if mode == "o" {
+			continue // OUT params excluded from signature
+		}
+		typeName := strings.ToLower(t.Name)
+		if canon := dropCompatCanonicalType(typeName); canon != "" {
+			typeName = canon
+		}
+		parts = append(parts, typeName)
+	}
+	return strings.Join(parts, ",")
+}
+
+// extractRoutineDeps parses the function body and arg defaults to populate
+// dependency fields on r for information_schema routine_*_usage views.
+func extractRoutineDeps(body string, argDefaults []string, schema string, r *catalog.Routine, cat catalog.Catalog) {
+	// Panic recovery: extractRoutineDeps is a best-effort feature; never crash the server.
+	defer func() { recover() }() //nolint:errcheck
+	// Skip very long bodies to bound overhead.
+	if len(body) > 2000 {
+		return
+	}
+	// walkExpr walks a parser expression collecting deps.
+	var walkExpr func(e parser.Expr, fromTables map[string]string)
+	var walkSelect func(sel *parser.SelectStmt)
+
+	walkExpr = func(e parser.Expr, fromTables map[string]string) {
+		if e == nil {
+			return
+		}
+		switch n := e.(type) {
+		case *parser.FuncCall:
+			funcName := strings.ToLower(n.Name.Name)
+			// Sequence deps: nextval/currval with string literal arg.
+			if (funcName == "nextval" || funcName == "currval") && len(n.Args) >= 1 {
+				if sc, ok := n.Args[0].(*parser.StringConst); ok {
+					seqName := strings.ToLower(sc.Value)
+					if idx := strings.LastIndex(seqName, "."); idx >= 0 {
+						seqName = seqName[idx+1:]
+					}
+					seqSchema := schema
+					found := false
+					for _, d := range r.SequenceDeps {
+						if d.Name == seqName {
+							found = true
+							break
+						}
+					}
+					if !found {
+						r.SequenceDeps = append(r.SequenceDeps, catalog.RoutineSeqDep{Schema: seqSchema, Name: seqName})
+					}
+				}
+			}
+			// Routine call deps: look up the function name in catalog.
+			if cat != nil && funcName != "nextval" && funcName != "currval" {
+				if rs := cat.Routines(); rs != nil {
+					cands := rs.LookupByName(n.Name)
+					for _, cand := range cands {
+						found := false
+						for _, oid := range r.RoutineCallOIDs {
+							if oid == cand.OID {
+								found = true
+								break
+							}
+						}
+						if !found {
+							r.RoutineCallOIDs = append(r.RoutineCallOIDs, cand.OID)
+						}
+					}
+				}
+			}
+			for _, a := range n.Args {
+				walkExpr(a, fromTables)
+			}
+		case *parser.ColumnRef:
+			// Attribute bare column refs to the single FROM table if applicable.
+			if len(fromTables) == 1 {
+				colName := strings.ToLower(n.Column)
+				if colName == "" {
+					break
+				}
+				var tblName, tblSchema string
+				for k, v := range fromTables {
+					tblName = k
+					tblSchema = v
+				}
+				found := false
+				for _, cd := range r.ColumnDeps {
+					if cd.TableName == tblName && cd.ColumnName == colName {
+						found = true
+						break
+					}
+				}
+				if !found {
+					r.ColumnDeps = append(r.ColumnDeps, catalog.RoutineColRef{
+						TableSchema: tblSchema,
+						TableName:   tblName,
+						ColumnName:  colName,
+					})
+				}
+			}
+		case *parser.BinaryOp:
+			walkExpr(n.Left, fromTables)
+			walkExpr(n.Right, fromTables)
+		case *parser.UnaryOp:
+			walkExpr(n.Operand, fromTables)
+		case *parser.CastExpr:
+			walkExpr(n.Operand, fromTables)
+		case *parser.SubqueryExpr:
+			if n.Inner != nil {
+				walkSelect(n.Inner)
+			}
+		case *parser.CaseExpr:
+			walkExpr(n.Operand, fromTables)
+			for _, w := range n.Whens {
+				walkExpr(w.When, fromTables)
+				walkExpr(w.Then, fromTables)
+			}
+			walkExpr(n.Else, fromTables)
+		case *parser.IsNullExpr:
+			walkExpr(n.Operand, fromTables)
+		}
+	}
+
+	walkSelect = func(sel *parser.SelectStmt) {
+		if sel == nil {
+			return
+		}
+		// Collect FROM tables for column attribution.
+		localFrom := map[string]string{}
+		for _, rv := range sel.From {
+			if rv.Name != "" {
+				tblName := strings.ToLower(rv.Name)
+				tblSchema := strings.ToLower(rv.Schema)
+				if tblSchema == "" {
+					tblSchema = schema
+				}
+				localFrom[tblName] = tblSchema
+				found := false
+				for _, td := range r.TableDeps {
+					if td.Name == tblName && td.Schema == tblSchema {
+						found = true
+						break
+					}
+				}
+				if !found {
+					r.TableDeps = append(r.TableDeps, catalog.RoutineTableRef{Schema: tblSchema, Name: tblName})
+				}
+			}
+			if rv.Subquery != nil {
+				walkSelect(rv.Subquery)
+			}
+		}
+		// Walk targets.
+		for _, t := range sel.Targets {
+			walkExpr(t.Expr, localFrom)
+		}
+		// Walk WHERE.
+		walkExpr(sel.Where, localFrom)
+		// Walk set-op right branch if present.
+		if sel.SetOp != nil && sel.SetOp.Right != nil {
+			walkSelect(sel.SetOp.Right)
+		}
+	}
+
+	// Parse and walk the function body for table/sequence/routine deps.
+	// Only BEGIN ATOMIC and RETURN-form bodies create pg_depend entries in PG14+.
+	// AS-quoted-string bodies (the old style) do NOT create body-level deps.
+	if body != "" && (r.BeginAtomic || r.IsReturnForm) {
+		stmts, err := parser.Parse(body)
+		if err == nil {
+			for _, st := range stmts {
+				switch s := st.(type) {
+				case *parser.SelectStmt:
+					walkSelect(s)
+				case *parser.InsertStmt:
+					// Record INSERT INTO table as a table dependency.
+					if s.Target.Name != "" {
+						tblName := strings.ToLower(s.Target.Name)
+						tblSchema := strings.ToLower(s.Target.Schema)
+						if tblSchema == "" {
+							tblSchema = schema
+						}
+						found := false
+						for _, td := range r.TableDeps {
+							if td.Name == tblName && td.Schema == tblSchema {
+								found = true
+								break
+							}
+						}
+						if !found {
+							r.TableDeps = append(r.TableDeps, catalog.RoutineTableRef{Schema: tblSchema, Name: tblName})
+						}
+					}
+					if s.Select != nil {
+						walkSelect(s.Select)
+					}
+				}
+			}
+		}
+	}
+
+	// Parse and walk each default expression.
+	for _, def := range argDefaults {
+		if def == "" {
+			continue
+		}
+		e, err := parser.ParseExpr(def)
+		if err == nil {
+			walkExpr(e, nil)
+		}
+	}
+}
+
+// buildCallArgListStr returns "()" for no arg list or "(type, ...)" for typed args.
+func buildCallArgListStr(args []parser.FunctionArg) string {
+	if args == nil {
+		return "()"
+	}
+	if len(args) == 0 {
+		return "()"
+	}
+	parts := make([]string, len(args))
+	for i, a := range args {
+		parts[i] = strings.ToLower(a.Type.Name)
+	}
+	return "(" + strings.Join(parts, ", ") + ")"
 }

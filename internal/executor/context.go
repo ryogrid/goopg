@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
@@ -85,6 +86,22 @@ type Context struct {
 	// would namespace by InExpr/SubqueryExpr identity.
 	SubqueryCache      map[string][]Datum
 	SubqueryCacheScope int // OuterRows len when cached; cleared on change
+
+	// CorrSubqOps caches pre-built, pre-opened operators for correlated
+	// scalar subqueries so the same plan can be rescanned for each outer
+	// row without repeated Build+openPrep (lock acquire + btree.Open)
+	// overhead. Populated by subqueryImpl; indexScanOp.Open detects the
+	// reuse and skips openPrep on subsequent calls. Operators are not
+	// explicitly closed (locks released at commit; GC handles memory).
+	CorrSubqOps map[*planner.SubqueryExpr]Operator
+
+	// CorrSubqHashMaps caches hash maps built for correlated scalar subqueries
+	// matching Project(Filter(SeqScan, inner_col = OuterColumnRef)). The hash
+	// map is built once by scanning the entire inner table (O(N)) and provides
+	// O(1) lookups per outer row, avoiding O(N²) correlated SeqScan patterns
+	// even when no btree index exists. Keys are datumKey(inner_col_value);
+	// values are the projected result datum.
+	CorrSubqHashMaps map[*planner.SubqueryExpr]map[string]Datum
 
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
@@ -222,9 +239,20 @@ type Context struct {
 	LastSeqSet  bool
 
 	// TempTableShadows maps table name → original permanent *catalog.Table for
-	// TEMP TABLE shadowing. Populated by execCreateTable when a TEMP TABLE
-	// shadows a permanent one; used by execDropTable to restore it. M0097-0003.
+	// CREATE TEMP TABLE shadowing. Populated by execCreateTable; restored on DROP.
 	TempTableShadows map[string]*catalog.Table
+	// PendingEnumValues tracks enum labels added via ALTER TYPE … ADD VALUE inside
+	// the current explicit transaction.  They must not be used until COMMIT.
+	// map[enumTypeName][label]=true.  Nil when not in an explicit transaction.
+	PendingEnumValues map[string]map[string]bool
+	// PendingEnumRenames tracks ALTER TYPE … RENAME TO operations within the
+	// current explicit transaction.  On ROLLBACK, reversed in reverse order.
+	// M0097-0022.
+	PendingEnumRenames []EnumRenameEntry
+	// PendingCreatedEnums tracks enum types created via CREATE TYPE … AS ENUM
+	// within the current explicit transaction.  On ROLLBACK, created types are
+	// dropped from the catalog.  map[enumTypeName(lowercase)]=true.  M0097-0022.
+	PendingCreatedEnums map[string]bool
 
 	// WAL exposes the cluster's WAL writer so execCommit can read the
 	// WrittenLSN after a local flush to bound the SyncRep wait. nil
@@ -303,6 +331,18 @@ type Context struct {
 	// statement rows (name, statement, parameter_types, result_types).
 	// Wired by the server from the per-connection preparedStatements store.
 	PrepStmtsRows func() [][]string
+
+	// NonSuperuserRole, when non-empty, means the session is currently running
+	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
+	// checks that require superuser (e.g. LEAKPROOF function attribute) must
+	// reject when this is set.
+	NonSuperuserRole string
+
+	// SetSessionAuthorization, when non-nil, updates the per-connection
+	// NonSuperuserRole when SET SESSION AUTHORIZATION is executed via the
+	// parser path (multi-statement batches). The caller (operators_utility_settings)
+	// passes the role name or "" to restore superuser status.
+	SetSessionAuthorization func(role string)
 }
 
 // SettingValue is one effective session setting exposed to SHOW ALL.
@@ -552,3 +592,8 @@ func (c *Context) MaterializeWriterXID() error {
 	}
 	return nil
 }
+
+
+// EnumRenameEntry records one ALTER TYPE … RENAME TO operation for transactional rollback.
+// OldName and NewName are lowercase. M0097-0022.
+type EnumRenameEntry struct{ OldName, NewName string }

@@ -79,6 +79,13 @@ type upsertOp struct {
 	// multi-row UPSERTs over the same partition reuse a single
 	// open tree.  Keyed by leaf table OID.  M0100-0005t.
 	leafTrees map[uint32]*btree.BTree
+	// writtenPtrs tracks heap ItemPointers written by this statement
+	// (via applyInsert or applyUpdate).  When a subsequent row in the
+	// same multi-row INSERT conflicts with a pointer in this set, the
+	// conflict target was already affected in this statement and we must
+	// raise SQLSTATE 21000 "ON CONFLICT DO UPDATE command cannot affect
+	// row a second time".  M0097-0028.
+	writtenPtrs map[storage.ItemPointer]struct{}
 }
 
 // RowsAffected satisfies executor.RowCounter — for UPSERT, the
@@ -186,6 +193,9 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		rel := parentRel
 		cols := parentCols
 		writeTbl := o.plan.Table
+		// partLeaf is set when we route to a leaf with a different column
+		// order from the parent; used for row remapping below. M0097-0028.
+		var partLeaf *catalog.Table
 		if isPartitioned {
 			leaf, leafTree, ferr := o.routeAndOpenLeaf(inserted)
 			if ferr != nil {
@@ -199,19 +209,33 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			cols = leaf.Columns
 			writeTbl = leaf
 			o.arbiterTree = leafTree
+			// Track the leaf when its column order differs from the parent.
+			// insertOp uses remapRowForPartition; we must do the same.
+			if !partitionColOrderMatches(parentCols, leaf.Columns) {
+				partLeaf = leaf
+			}
 		}
 
+		// insertedForLeaf: inserted row in leaf column order (for heap writes).
+		// For non-partitioned or same-order partitions this is the same slice.
+		insertedForLeaf := inserted
+		if partLeaf != nil {
+			insertedForLeaf = remapRowForPartition(parentCols, partLeaf.Columns, inserted)
+		}
+
+		// probeArbiterWaiting calls encodeArbiterKey with o.plan.Table (parent)
+		// columns and reads inserted[parent_col_ord]. Always pass parent-order
+		// inserted for key encoding; conflictRow is decoded in leaf order (cols).
 		arbiterKey, conflictPtr, conflictRow, conflicted, err := o.probeArbiterWaiting(rel, cols, inserted)
 		if err != nil {
 			return nil, err
 		}
 		if !conflicted {
-			if err := o.applyInsert(rel, cols, inserted, arbiterKey); err != nil {
+			if err := o.applyInsert(rel, writeTbl, cols, insertedForLeaf, arbiterKey); err != nil {
 				return nil, err
 			}
 			o.appendUpsertRetRow(inserted)
 			o.rowsAffected++
-			_ = writeTbl
 			continue
 		}
 		switch o.plan.OnConflict.Action {
@@ -226,8 +250,30 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			}
 			// Skip silently — RowsAffected does NOT bump.
 		case planner.OnConflictActionUpdate:
+			// Detect "ON CONFLICT DO UPDATE command cannot affect row a second
+			// time": if the conflicting tuple was written by this statement
+			// (its ItemPointer is in writtenPtrs), reject immediately.
+			// This mirrors PostgreSQL's ExecOnConflictUpdate check that
+			// raises SQLSTATE 21000.  M0097-0028.
+			if o.writtenPtrs != nil {
+				if _, secondTime := o.writtenPtrs[conflictPtr]; secondTime {
+					return nil, &ExecError{
+						Code: "21000",
+						Pos:  o.plan.Pos(),
+						Message: "ON CONFLICT DO UPDATE command cannot affect row a second time",
+						Hint: "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.",
+					}
+				}
+			}
+			// When the leaf has different column order, conflictRow is in leaf
+			// order. evalUpdate expects both rows in parent column order (the
+			// UpdateSet expressions are planned against the parent schema).
+			evalConflictRow := conflictRow
+			if partLeaf != nil {
+				evalConflictRow = remapRowForPartition(partLeaf.Columns, parentCols, conflictRow)
+			}
 			for {
-				updated, skip, err := o.evalUpdate(conflictRow, inserted)
+				updated, skip, err := o.evalUpdate(evalConflictRow, inserted)
 				if err != nil {
 					return nil, err
 				}
@@ -271,16 +317,38 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 						return nil, err
 					}
 					if !conflicted {
-						if err := o.applyInsert(rel, cols, inserted, arbiterKey); err != nil {
+						if err := o.applyInsert(rel, writeTbl, cols, insertedForLeaf, arbiterKey); err != nil {
 							return nil, err
 						}
 						o.appendUpsertRetRow(inserted)
 						o.rowsAffected++
 						continue nextSourceRow
 					}
+					// Re-check for second-time conflict after re-probe.
+					if o.writtenPtrs != nil {
+						if _, secondTime := o.writtenPtrs[conflictPtr]; secondTime {
+							return nil, &ExecError{
+								Code:    "21000",
+								Pos:     o.plan.Pos(),
+								Message: "ON CONFLICT DO UPDATE command cannot affect row a second time",
+								Hint:    "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.",
+							}
+						}
+					}
+					// Update evalConflictRow for the re-probed conflict row.
+					evalConflictRow = conflictRow
+					if partLeaf != nil {
+						evalConflictRow = remapRowForPartition(partLeaf.Columns, parentCols, conflictRow)
+					}
 					continue
 				}
-				if err := o.applyUpdate(rel, cols, conflictPtr, updated); err != nil {
+				// updated is in parent column order (from evalUpdate).
+				// For heap writes, remap to leaf order when column order differs.
+				updatedForLeaf := updated
+				if partLeaf != nil {
+					updatedForLeaf = remapRowForPartition(parentCols, partLeaf.Columns, updated)
+				}
+				if err := o.applyUpdate(rel, writeTbl, cols, conflictPtr, updatedForLeaf, updated); err != nil {
 					return nil, err
 				}
 				o.appendUpsertRetRow(updated)
@@ -314,7 +382,10 @@ func (o *upsertOp) routeAndOpenLeaf(inserted Row) (*catalog.Table, *btree.BTree,
 	if !ok {
 		return nil, nil, nil
 	}
-	leaf := routeToPartition(o.plan.Table, inserted, im)
+	leaf, leafErr := routeToPartition(o.plan.Table, inserted, im, o.ctx)
+	if leafErr != nil {
+		return nil, nil, leafErr
+	}
 	if leaf == nil {
 		return nil, nil, nil
 	}
@@ -618,11 +689,13 @@ func (o *upsertOp) findInProgressConflictKey(rel storage.RelFileNode, key []byte
 	return foundXID, case1, foundXID != 0
 }
 
-// applyInsert is the no-conflict happy path. Writes the heap row
-// and stitches a new (key → ItemPointer) entry into the arbiter
-// index so subsequent rows in the same statement (multi-row
-// VALUES, CTE-fed INSERT, etc.) see it.
-func (o *upsertOp) applyInsert(rel storage.RelFileNode, cols []catalog.Column, inserted Row, arbiterKey []byte) error {
+// applyInsert is the no-conflict happy path. Writes the heap row and
+// updates ALL unique/PK indexes on tbl so subsequent probes via any
+// unique index (not just the arbiter) can detect the inserted row.
+// This is required when a table has multiple unique indexes and a future
+// ON CONFLICT clause targets a non-arbiter index (e.g. after an earlier
+// upsert conflict updated a column covered by a second unique index).
+func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, inserted Row, _ []byte) error {
 	ptr, err := writeHeapRowReturning(o.ctx, rel, cols, inserted)
 	if err != nil {
 		return err
@@ -630,15 +703,34 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, cols []catalog.Column, i
 	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
 		o.ctx.CTEWriteFence[ptr] = struct{}{}
 	}
-	return o.maintainArbiter(arbiterKey, ptr)
+	o.trackWrittenPtr(ptr)
+	// Maintain all unique indexes so non-arbiter unique indexes stay consistent.
+	// maintainUniqueIndexesForInsert handles the arbiter index too, so we do
+	// not need the separate maintainArbiter call. M0097-0028.
+	maintainUniqueIndexesForInsert(o.ctx, tbl, cols, inserted, ptr)
+	return nil
+}
+
+// trackWrittenPtr records an ItemPointer written in the current statement so
+// a subsequent conflict against the same row can be detected and rejected.
+func (o *upsertOp) trackWrittenPtr(ptr storage.ItemPointer) {
+	if o.writtenPtrs == nil {
+		o.writtenPtrs = make(map[storage.ItemPointer]struct{})
+	}
+	o.writtenPtrs[ptr] = struct{}{}
 }
 
 // applyUpdate stamps xmax on the conflicting tuple and writes the
-// updated row as a fresh heap tuple. The arbiter index gets a new
-// entry pointing at the new ItemPointer; the old entry is left in
-// place — visibility filtering at the next probe will skip it
-// because the tuple's xmax now blocks it.
-func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, oldPtr storage.ItemPointer, updated Row) error {
+// updated row as a fresh heap tuple. ALL unique/PK indexes on tbl are
+// updated so subsequent probes via any unique index can detect the row.
+// The old index entries are left in place — visibility filtering at the
+// next probe skips them because the old tuple's xmax is now stamped.
+//
+// updatedLeaf is the row in the leaf/target table's physical column order
+// (used for the heap write). arbiterRow is in parent column order (used for
+// arbiter key encoding). When they are the same — no partition column
+// remapping needed — pass the same slice for both. M0097-0028.
+func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldPtr storage.ItemPointer, updatedLeaf Row, _ Row) error {
 	// Materialise the XID BEFORE stamping xmax so the old tuple gets a
 	// real delete stamp (not InvalidTransactionID). Without this, the old
 	// tuple's xmax=0 would make it appear still-live to subsequent scans.
@@ -661,14 +753,19 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, o
 	if derr != nil {
 		return derr
 	}
-	newPtr, err := writeHeapRowReturning(o.ctx, rel, cols, updated)
+	newPtr, err := writeHeapRowReturning(o.ctx, rel, cols, updatedLeaf)
 	if err != nil {
 		return err
 	}
 	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
 		o.ctx.CTEWriteFence[newPtr] = struct{}{}
 	}
-	return o.maintainArbiterRow(updated, newPtr)
+	o.trackWrittenPtr(newPtr)
+	// Maintain all unique indexes so non-arbiter unique indexes reflect the
+	// update. M0097-0028: previously only the arbiter was maintained, causing
+	// ON CONFLICT probes via non-arbiter indexes to miss the updated row.
+	maintainUniqueIndexesForInsert(o.ctx, tbl, cols, updatedLeaf, newPtr)
+	return nil
 }
 
 // maintainArbiter inserts a precomputed (conflict-key → ptr) entry into the

@@ -23,7 +23,10 @@ CLAUDE_OUTPUT_FORMAT="json"
 # Tool permissions
 # Comma-separated list of allowed tools
 # Safe git subcommands only - keep this list minimal and avoid destructive commands
-ALLOWED_TOOLS="Write,Read,Edit,Grep,Bash(grep *),Bash(*),Bash(git add *),Bash(git commit *),Bash(git diff *),Bash(git log *),Bash(git status),Bash(git status *),Bash(git push *),Bash(git pull *),Bash(git fetch *),Bash(git branch *),Bash(git tag *),Bash(go *),Bash(make *),Bash(gofmt *),Bash(rg *),Bash(psql *),Bash(pgbench *),Bash(npm *),Bash(pytest),mcp__serena__*"
+# kaizen H3 (2026-06-04): added the newer built-in tools the loop routinely calls
+# but were previously denied — ToolSearch/TodoWrite/Task*/Glob/Agent/Monitor/
+# ScheduleWakeup accounted for the 437 permission-denial loops in the log history.
+ALLOWED_TOOLS="Write,Read,Edit,Grep,Bash(grep *),Bash(*),Bash(git add *),Bash(git commit *),Bash(git diff *),Bash(git log *),Bash(git status),Bash(git status *),Bash(git push *),Bash(git pull *),Bash(git fetch *),Bash(git branch *),Bash(git tag *),Bash(go *),Bash(make *),Bash(gofmt *),Bash(rg *),Bash(psql *),Bash(pgbench *),Bash(npm *),Bash(pytest),ToolSearch,TodoWrite,TaskCreate,TaskUpdate,TaskGet,TaskList,Glob,Agent,Monitor,ScheduleWakeup,mcp__serena__*"
 
 # Session management
 SESSION_CONTINUITY=true
@@ -36,9 +39,15 @@ GITHUB_TASK_LABEL="ralph-task"
 BEADS_FILTER="status:open"
 
 # Circuit breaker thresholds
+# kaizen H4 (2026-06-04): SAME_ERROR was effectively disabled at 1000 so the breaker
+# never caught repeated-failure storms (it only ever tripped on permission denials,
+# now commented out in lib/circuit_breaker.sh). Restore the lib default (5) as a
+# backstop now that the driver's 429 retry-storm cause is fixed (kaizen H1).
+# OUTPUT_DECLINE is a PERCENT (lib default 70); currently defined but unused by the
+# breaker logic — set to the sensible default for when it is implemented.
 CB_NO_PROGRESS_THRESHOLD=3
-CB_SAME_ERROR_THRESHOLD=1000
-CB_OUTPUT_DECLINE_THRESHOLD=1000
+CB_SAME_ERROR_THRESHOLD=5
+CB_OUTPUT_DECLINE_THRESHOLD=70
 # Auto-update Claude CLI at startup
 CLAUDE_AUTO_UPDATE=true
 

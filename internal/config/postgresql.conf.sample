@@ -209,6 +209,10 @@
 #jit = off                              # allow JIT compilation
 #compute_query_id = off                 # compute query identifiers
 #plan_cache_mode = auto                 # plan cache mode
+#check_function_bodies = on             # validate function bodies during creation
+#extra_float_digits = 1                 # float output precision adjustment
+#bytea_output = hex                     # bytea output format (hex or escape)
+#max_parallel_maintenance_workers = 2   # max parallel workers for maintenance
 
 
 #------------------------------------------------------------------------------

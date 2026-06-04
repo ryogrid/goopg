@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"context"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -173,6 +174,14 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	}
 	for i := range o.plan.Locks {
 		lk := &o.plan.Locks[i]
+		// Materialized views do not support row-level locking.
+		if lk.Table != nil && lk.Table.IsMatView {
+			return &ExecError{
+				Code:    "55000",
+				Pos:     o.plan.Pos(),
+				Message: fmt.Sprintf(`cannot lock rows in materialized view "%s"`, lk.Table.Name),
+			}
+		}
 		rel := ctx.Catalog.RelFileNode(lk.Table)
 		var err error
 		switch lk.WaitPolicy {

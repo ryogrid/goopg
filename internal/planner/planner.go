@@ -44,6 +44,30 @@ func (e *PlanError) Error() string {
 // consulted for name resolution; DDL statements pass through to the
 // executor without decomposing here (catalog mutation happens at
 // execute time).
+// PlanSchemaOnly plans a SELECT statement to determine its output schema but
+// suppresses runtime evaluation errors (e.g. division by zero) from constant
+// folding. Used by CREATE MATERIALIZED VIEW WITH NO DATA where the query is
+// planned only for schema inference and will never be executed.
+func PlanSchemaOnly(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+	if err := rewriteIndirectionStarTargets(s); err != nil {
+		return nil, err
+	}
+	if err := analyzer.Analyze(s, cat); err != nil {
+		return nil, toPlanError(err)
+	}
+	node, err := planSelect(s, cat)
+	if err != nil {
+		// For 22xxx runtime errors (division by zero etc.), planSelect returns
+		// the partially-folded plan alongside the error. The schema is still
+		// valid — use it for schema inference. The query will never execute.
+		if pe, ok := err.(*PlanError); ok && len(pe.Code) >= 2 && pe.Code[:2] == "22" && node != nil {
+			return node, nil
+		}
+		return nil, err
+	}
+	return node, nil
+}
+
 func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
@@ -96,7 +120,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateIndexStmt, *parser.DropIndexStmt,
 		*parser.CreateViewStmt, *parser.DropViewStmt,
 		*parser.TruncateStmt, *parser.AlterTableStmt,
-		*parser.CreateFunctionStmt, *parser.DropFunctionStmt,
+		*parser.CreateFunctionStmt, *parser.DropFunctionStmt, *parser.AlterFunctionStmt,
 		*parser.CreateProcedureStmt, *parser.DropProcedureStmt,
 		*parser.CreateTriggerStmt, *parser.DropTriggerStmt,
 		*parser.DropRuleStmt,
@@ -218,6 +242,15 @@ type resolveContext struct {
 	// nodes get the correct level for the executor's OuterRows stack.
 	// M0097-0065.
 	lateralSibling bool
+	// havingAgg, when non-nil, marks this context as the outer parent
+	// for a HAVING clause subquery. Aggregate function calls that match
+	// entries in havingAgg.aggregateByKey are "outer aggregate refs" —
+	// they reference the pre-computed value for the current group — and
+	// are replaced with OuterColumnRef pointing to the aggregate output
+	// column. Without this, the executor pushes the aggregate *output*
+	// row (fewer columns than the input) and resolving the outer column
+	// ref at its input-schema index fails with "out of range". M0097-0035.
+	havingAgg *aggregateSurface
 }
 
 type rangeBinding struct {
@@ -779,7 +812,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 
 	if s.Where != nil {
 		// Aggregate functions are not allowed in WHERE. M0097-0035.
-		if exprHasAggregate(s.Where) {
+		// Exception: correlated outer-scope aggregates (all column refs reference
+		// tables NOT in the current FROM clause) are allowed — PG permits
+		// `WHERE sum(outer.col) = inner.col` inside EXISTS subqueries. M0097-0035.
+		if exprHasAggregate(s.Where) && !exprAllAggregatesAreOuterRef(s.Where, ctx) {
 			return nil, &PlanError{Pos: s.Where.Pos(), Code: "42803",
 				Message: "aggregate functions are not allowed in WHERE"}
 		}
@@ -859,6 +895,16 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// remaining order differences (OID ≠ FROM order).
 	if len(ctx.bindings) > 0 {
 		remapWithBindings(node, ctx.bindings)
+	}
+
+	// Aggregate sublink promotion: when the outer SELECT has exactly one target
+	// that is a scalar subquery containing a single aggregate referencing outer
+	// scope, promote the whole query to an aggregate query. PostgreSQL does this
+	// to produce one result row for `SELECT (SELECT max(...)) FROM t`.
+	if len(s.GroupBy) == 0 && s.Having == nil && len(s.OrderBy) == 0 && !s.Distinct && s.Limit == nil && s.Offset == nil {
+		if promoted, ok, _ := tryPromoteAggSublink(s, node, ctx, cat); ok {
+			return promoted, nil
+		}
 	}
 
 	var agg *aggregateSurface
@@ -1248,6 +1294,12 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// A non-nil return means a constant evaluation error (e.g. division by zero)
 	// occurred in a potentially-reachable sub-expression. M0097-0047.
 	if foldErr := foldPlanConstants(out); foldErr != nil {
+		// For 22xxx runtime errors (division by zero, etc.) return the partially-
+		// folded plan together with the error so callers that only need the schema
+		// (e.g. CREATE MATERIALIZED VIEW WITH NO DATA) can use out.Output().
+		if pe, ok := foldErr.(*PlanError); ok && len(pe.Code) >= 2 && pe.Code[:2] == "22" {
+			return out, foldErr
+		}
 		return nil, foldErr
 	}
 	// DISTINCT ON (expr [, ...]): implement ordered deduplication.
@@ -1868,7 +1920,10 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// only relevant when the view didn't supply an explicit
 	// alias list. Column count must match what the view
 	// declared; v0 reports a planner error otherwise.
-	if tbl.View != nil {
+	// Materialized views that have been populated are stored as heap data —
+	// do NOT replan their SELECT body (treat them as regular heap tables).
+	// Unpopulated matviews (WITH NO DATA) return 0 rows (also heap, just empty).
+	if tbl.View != nil && !tbl.IsMatView {
 		// Cycle guard: prevent infinite recursion on circular view definitions.
 		depth := viewPlanDepth.Add(1)
 		defer viewPlanDepth.Add(-1)
@@ -2179,6 +2234,13 @@ func TypedVirtualCell(pos int, value, colType string) Expr {
 			return &BooleanConst{pos: pos, Value: true}
 		case "f", "false", "FALSE", "no", "off", "0":
 			return &BooleanConst{pos: pos, Value: false}
+		}
+	case "numeric", "decimal", "float4", "float8", "real", "double precision":
+		// Return as NumericConst so numeric columns in virtual tables sort
+		// numerically rather than lexicographically (e.g. pg_enum.enumsortorder).
+		// M0097-enum-sort-numeric.
+		if value != "" {
+			return &NumericConst{pos: pos, Value: value}
 		}
 	}
 	return &StringConst{pos: pos, Value: value}
@@ -2846,6 +2908,45 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		return planGenerateSubscripts(rv, sourceIdx, lateralCtx)
 	}
 	if !strings.EqualFold(tf.Name, "generate_series") {
+		// Try user-defined SETOF functions from the Routines registry.
+		if rs := cat.Routines(); rs != nil {
+			cands := rs.LookupByName(parser.ObjectName{Name: tf.Name})
+			for _, r := range cands {
+				if r.ReturnsSet {
+					ctx := &resolveContext{}
+					resolvedArgs := make([]Expr, len(tf.Args))
+					for i, a := range tf.Args {
+						re, err := resolveExpr(a, ctx)
+						if err != nil {
+							return nil, rangeBinding{}, err
+						}
+						resolvedArgs[i] = re
+					}
+					alias := rv.Alias
+					if alias == "" {
+						alias = strings.ToLower(tf.Name)
+					}
+					colName := alias
+					if len(rv.Columns) > 0 {
+						colName = rv.Columns[0]
+					}
+					retType := r.ReturnType.Name
+					if retType == "" {
+						retType = "text"
+					}
+					tbl := &catalog.Table{
+						Name: alias,
+						Columns: []catalog.Column{
+							{Name: colName, Type: catalog.Type{Name: retType}, Ordinal: 0},
+						},
+					}
+					schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: retType}, SourceTableIdx: sourceIdx}}
+					node := &UserSrfScan{pos: tf.Pos(), Routine: r, Args: resolvedArgs, schema: schema}
+					b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+					return node, b, nil
+				}
+			}
+		}
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "0A000",
 			Message: fmt.Sprintf("table-valued function %q not supported", tf.Name)}
 	}
@@ -3365,7 +3466,13 @@ type aggregateSurface struct {
 	output          *resolveContext
 	groupByExpr     map[string]int
 	groupByInputCol map[int]int
-	aggregateByKey  map[string]aggregateBinding
+	// groupByMergedByName tracks column names (lowercase) that were grouped via
+	// an unqualified USING-join column. When SELECT has a table-qualified reference
+	// t.f1 but GROUP BY had the USING-merged unqualified f1, PostgreSQL requires
+	// t.f1 to also appear in GROUP BY — unlike non-USING GROUP BY c which satisfies
+	// SELECT t.c. M0097-0155.
+	groupByMergedByName map[string]bool
+	aggregateByKey      map[string]aggregateBinding
 	// node is the Aggregate plan node; mutated by resolveExprAfterAggregate
 	// when functionally-determined passthrough columns are discovered.
 	node *Aggregate
@@ -3386,6 +3493,110 @@ type windowSurface struct {
 	agg         *aggregateSurface
 	output      *resolveContext
 	windowByKey map[string]windowBinding
+}
+
+// hasColumnRefOrSubquery reports whether the expression tree contains any
+// ColumnRef or SubqueryExpr node, indicating a potential outer-scope reference.
+func hasColumnRefOrSubquery(e parser.Expr) bool {
+	if e == nil {
+		return false
+	}
+	switch x := e.(type) {
+	case *parser.ColumnRef:
+		return true
+	case *parser.SubqueryExpr:
+		return true
+	case *parser.BinaryOp:
+		return hasColumnRefOrSubquery(x.Left) || hasColumnRefOrSubquery(x.Right)
+	case *parser.UnaryOp:
+		return hasColumnRefOrSubquery(x.Operand)
+	case *parser.CastExpr:
+		return hasColumnRefOrSubquery(x.Operand)
+	case *parser.FuncCall:
+		for _, a := range x.Args {
+			if hasColumnRefOrSubquery(a) {
+				return true
+			}
+		}
+		if x.Filter != nil && hasColumnRefOrSubquery(x.Filter) {
+			return true
+		}
+		return false
+	case *parser.CaseExpr:
+		for _, w := range x.Whens {
+			if hasColumnRefOrSubquery(w.When) || hasColumnRefOrSubquery(w.Then) {
+				return true
+			}
+		}
+		return hasColumnRefOrSubquery(x.Else)
+	case *parser.InExpr:
+		return hasColumnRefOrSubquery(x.Operand)
+	case *parser.ExistsExpr:
+		return false
+	}
+	return false
+}
+
+// tryPromoteAggSublink checks if the outer SELECT can be promoted to an aggregate
+// query when its sole target is a scalar subquery containing a single aggregate
+// that references the outer FROM. This matches PostgreSQL's aggregate sublink
+// promotion: `SELECT (SELECT max(o.col)) FROM t o` → one result row.
+// Returns (node, true, nil) on success, (nil, false, nil) to fall back.
+func tryPromoteAggSublink(s *parser.SelectStmt, fromNode Node, fromCtx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
+	if len(s.Targets) != 1 {
+		return nil, false, nil
+	}
+	sqExpr, ok := s.Targets[0].Expr.(*parser.SubqueryExpr)
+	if !ok {
+		return nil, false, nil
+	}
+	inner := sqExpr.Inner
+	if inner == nil || len(inner.Targets) != 1 || inner.SetOp != nil ||
+		len(inner.GroupBy) > 0 || len(inner.ValuesRows) > 0 {
+		return nil, false, nil
+	}
+	innerFc, ok := inner.Targets[0].Expr.(*parser.FuncCall)
+	if !ok {
+		return nil, false, nil
+	}
+	if !isAggregateFunc(innerFc) && !isUserAggregateFunc(innerFc, cat) {
+		return nil, false, nil
+	}
+	// Reject nested aggregates: if any arg itself contains an aggregate call,
+	// this is a nested aggregate (e.g. max(min(x))) which must produce an error,
+	// not be promoted. Let normal planning handle (and reject) it.
+	for _, a := range innerFc.Args {
+		if exprHasAggregate(a) {
+			return nil, false, nil
+		}
+	}
+
+	// Check that the aggregate references outer scope (column ref or subquery in args/filter).
+	// Only promote if the aggregate uses a ColumnRef or SubqueryExpr — indicating
+	// the aggregate argument depends on the outer FROM clause.
+	refersOuter := false
+	for _, a := range innerFc.Args {
+		if hasColumnRefOrSubquery(a) {
+			refersOuter = true
+			break
+		}
+	}
+	if !refersOuter && innerFc.Filter != nil && hasColumnRefOrSubquery(innerFc.Filter) {
+		refersOuter = true
+	}
+	if !refersOuter {
+		return nil, false, nil
+	}
+	// Build a synthetic SelectStmt with the inner aggregate as the sole target,
+	// and attempt to plan it as an aggregate over the outer FROM node.
+	synthetic := &parser.SelectStmt{}
+	*synthetic = *s
+	synthetic.Targets = []parser.ResTarget{{Expr: innerFc, Alias: s.Targets[0].Alias}}
+	aggNode, _, _, _, err := buildAggregateStage(synthetic, fromNode, fromCtx, cat)
+	if err != nil {
+		return nil, false, nil // fall back gracefully
+	}
+	return aggNode, true, nil
 }
 
 func needsAggregateStage(s *parser.SelectStmt, cat catalog.Catalog) bool {
@@ -3692,6 +3903,7 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	groupExprs := make([]Expr, 0, len(s.GroupBy))
 	groupByExpr := map[string]int{}
 	groupByInputCol := map[int]int{}
+	var groupByMergedByName map[string]bool // populated only when USING-join cols appear in GROUP BY
 	outputSchema := make(Schema, 0, len(s.GroupBy)+len(s.Targets))
 
 	for _, g := range s.GroupBy {
@@ -3703,6 +3915,12 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		g = resolveOrderBySubstitution(g, s.Targets)
 		// Positional GROUP BY that wasn't substituted → out-of-range position. M0097-0003.
 		if ic, ok := g.(*parser.IntegerConst); ok {
+			// Position 0 is our placeholder for ROLLUP/CUBE/GROUPING SETS (parser stores them
+			// as IntegerConst{Value:0} after skipping the parens). Skip it silently so
+			// ROLLUP/CUBE don't error — they're handled as plain GROUP BY on the key columns.
+			if ic.Value == 0 {
+				continue
+			}
 			return nil, nil, nil, nil, &PlanError{Pos: g.Pos(), Code: "42P10",
 				Message: fmt.Sprintf("GROUP BY position %d is not in select list", ic.Value)}
 		}
@@ -3717,6 +3935,21 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		groupByExpr[parserExprKey(g)] = idx
 		if c, ok := r.(*ColumnRef); ok {
 			groupByInputCol[c.Index] = idx
+		}
+		// Track if this GROUP BY column was an unqualified USING-join merged column.
+		// Used by resolveExprAfterAggregate to reject qualified SELECT refs. M0097-0155.
+		if cr, isColRef := g.(*parser.ColumnRef); isColRef && cr.Table == "" {
+			colLower := strings.ToLower(cr.Column)
+			for _, b := range inputCtx.bindings {
+				for _, uh := range b.usingHidden {
+					if strings.EqualFold(uh, cr.Column) {
+						if groupByMergedByName == nil {
+							groupByMergedByName = make(map[string]bool)
+						}
+						groupByMergedByName[colLower] = true
+					}
+				}
+			}
 		}
 		groupExprs = append(groupExprs, r)
 		outputSchema = append(outputSchema, SchemaColumn{Name: groupExprName(r), Type: exprType(r)})
@@ -3768,6 +4001,27 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: pa.Type})
 	}
 
+	// Fix: scan HAVING's EXISTS/IN subquery WHERE clauses for outer aggregate refs.
+	// Example: HAVING EXISTS (SELECT 1 FROM b WHERE sum(distinct a.four) = b.four)
+	// The sum(distinct a.four) is an outer aggregate reference that must be registered
+	// so resolveExprAfterAggregate (via resolveColumnRef → havingAgg lookup) can find it.
+	if s.Having != nil {
+		for _, fc := range collectHavingSubqueryAggCalls(s.Having, cat) {
+			k := aggregateCallKey(fc)
+			if _, exists := aggByKey[k]; exists {
+				continue
+			}
+			pa, err := buildAggregateCall(fc, inputCtx, cat)
+			if err != nil {
+				continue // skip if unresolvable (e.g. wrong context)
+			}
+			idx := len(outputSchema)
+			aggByKey[k] = aggregateBinding{index: idx, typ: pa.Type}
+			plannedAggs = append(plannedAggs, pa)
+			outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: pa.Type})
+		}
+	}
+
 	// Assign shared state slots for user-defined aggregates that share sfunc/stype/args/distinct/filter.
 	// PG calls sfunc once per row when multiple aggregates share the same transition state.
 	// This eliminates duplicate NOTICE/side-effect calls for identical sfunc invocations. M0097-0035.
@@ -3777,8 +4031,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		nextSlot := 0
 		for i := range plannedAggs {
 			pa := &plannedAggs[i]
-			if pa.UserAgg == nil || pa.Distinct {
-				// Non-user aggregates and DISTINCT aggregates do not share state.
+			if pa.UserAgg == nil {
+				// Non-user aggregates do not share state.
 				pa.SharedStateSlot = -1
 				continue
 			}
@@ -3821,14 +4075,15 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 
 	outputCtx := newResolveContext(nil, outputSchema)
 	surface := &aggregateSurface{
-		input:           inputCtx,
-		output:          outputCtx,
-		groupByExpr:     groupByExpr,
-		groupByInputCol: groupByInputCol,
-		aggregateByKey:  aggByKey,
-		node:            aggNode,
-		funcDepCols:     map[int]int{},
-		cat:             cat,
+		input:               inputCtx,
+		output:              outputCtx,
+		groupByExpr:         groupByExpr,
+		groupByInputCol:     groupByInputCol,
+		groupByMergedByName: groupByMergedByName,
+		aggregateByKey:      aggByKey,
+		node:                aggNode,
+		funcDepCols:         map[int]int{},
+		cat:                 cat,
 	}
 
 	var having Expr
@@ -3914,6 +4169,30 @@ func isTextLikePlannerType(name string) bool {
 	return false
 }
 
+// isUserDefinedPlannerType returns true for non-empty, non-builtin type names.
+// Used to detect user-defined types (enums, domains) for implicit comparison cast.
+// M0097-enum-cmp.
+func isUserDefinedPlannerType(name string) bool {
+	if name == "" || name == "unknown" {
+		return false
+	}
+	switch strings.ToLower(name) {
+	case "text", "varchar", "char", "bpchar", "character varying",
+		"name", "citext",
+		"int2", "smallint", "int4", "integer", "int", "int8", "bigint",
+		"serial", "smallserial", "bigserial",
+		"float4", "real", "float8", "double precision", "double", "float",
+		"numeric", "decimal",
+		"bool", "boolean",
+		"date", "time", "timetz", "timestamp", "timestamptz", "interval",
+		"oid", "uuid", "pg_lsn", "xid", "xid8", "cid", "regproc",
+		"bytea", "varbit", "bit", "json", "jsonb",
+		"tid", "money":
+		return false
+	}
+	return true
+}
+
 func groupExprName(e Expr) string {
 	if c, ok := e.(*ColumnRef); ok {
 		return c.Name
@@ -3925,9 +4204,40 @@ func groupExprName(e Expr) string {
 	return "?column?"
 }
 
+// buildHavingParentCtx creates a parent resolveContext for EXISTS/subquery
+// expressions inside a HAVING clause. It wraps agg.input with a havingAgg
+// pointer so that resolveExpr, when encountering an aggregate function call
+// whose key matches one of the outer query's aggregates, replaces it with an
+// OuterColumnRef to the pre-computed aggregate output column. This prevents the
+// "outer column ref X/idx=N out of range" error that occurs when the executor
+// pushes the aggregate output row (which has fewer columns than the input) as
+// the outer row for HAVING subqueries. M0097-0035.
+func buildHavingParentCtx(agg *aggregateSurface) *resolveContext {
+	return &resolveContext{
+		table:     agg.input.table,
+		alias:     agg.input.alias,
+		schema:    agg.input.schema,
+		bindings:  agg.input.bindings,
+		cat:       agg.input.cat,
+		parent:    agg.input.parent,
+		havingAgg: agg,
+	}
+}
+
 func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, error) {
 	if idx, ok := agg.groupByExpr[parserExprKey(e)]; ok {
-		return &ColumnRef{pos: e.Pos(), Index: idx, Name: agg.output.schema[idx].Name, Type: agg.output.schema[idx].Type}, nil
+		// M0097-0155: if SELECT expression is table-qualified (e.g. t1.f1) and the
+		// GROUP BY entry was an unqualified USING-join merged column (GROUP BY f1),
+		// the two are semantically different — PostgreSQL requires the qualified column
+		// to also appear in GROUP BY. Skip this match; fall through to the ColumnRef
+		// case which will emit the proper "must appear in GROUP BY" error.
+		skipMatch := false
+		if cr, isColRef := e.(*parser.ColumnRef); isColRef && cr.Table != "" {
+			skipMatch = agg.groupByMergedByName[strings.ToLower(cr.Column)]
+		}
+		if !skipMatch {
+			return &ColumnRef{pos: e.Pos(), Index: idx, Name: agg.output.schema[idx].Name, Type: agg.output.schema[idx].Type}, nil
+		}
 	}
 	switch x := e.(type) {
 	case *parser.IntegerConst:
@@ -3941,9 +4251,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 	case *parser.IntervalLit:
 		return &IntervalLit{pos: x.Pos(), Value: x.Value, Unit: x.Unit}, nil
 	case *parser.SubqueryExpr:
-		return planSubqueryExpr(x, agg.input)
+		return planSubqueryExpr(x, buildHavingParentCtx(agg))
 	case *parser.ArraySubqueryExpr:
-		return planArraySubqueryExpr(x, agg.input)
+		return planArraySubqueryExpr(x, buildHavingParentCtx(agg))
 	case *parser.CollateExpr:
 		inner, err := resolveExprAfterAggregate(x.Operand, agg)
 		if err != nil {
@@ -3951,9 +4261,9 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		}
 		return &CollateExpr{pos: x.Pos(), Operand: inner, CollationName: x.CollationName}, nil
 	case *parser.InExpr:
-		return planInExpr(x, agg.input)
+		return planInExpr(x, buildHavingParentCtx(agg))
 	case *parser.ExistsExpr:
-		return planExistsExpr(x, agg.input)
+		return planExistsExpr(x, buildHavingParentCtx(agg))
 	case *parser.IsNullExpr:
 		operand, err := resolveExpr(x.Operand, agg.input)
 		if err != nil {
@@ -4000,6 +4310,11 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		}
 		col := resolved.(*ColumnRef)
 		idx, ok := agg.groupByInputCol[col.Index]
+		// M0097-0155: reject USING-merge GROUP BY match for qualified SELECT refs.
+		// GROUP BY f1 (USING-merged) does NOT satisfy SELECT t1.f1 (qualified).
+		if ok && x.Table != "" && agg.groupByMergedByName[strings.ToLower(x.Column)] {
+			ok = false
+		}
 		if !ok {
 			// Check if this column is functionally determined by the GROUP BY key.
 			// PostgreSQL SQL92 extension: when GROUP BY covers a primary key of some
@@ -4083,7 +4398,23 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			if !ok {
 				return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "aggregate call could not be resolved"}
 			}
+			// pg_typeof(agg(...)) after aggregate stage: fold to compile-time type
+			// of the aggregate's output column. Keep FuncCall wrapper for column label.
+			// M0097-0035.
+			if strings.ToLower(x.Name.String()) == "pg_typeof" {
+				typName := pgTypeofDisplayName(b.typ.Name)
+				return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
+			}
 			return &ColumnRef{pos: x.Pos(), Index: b.index, Name: agg.output.schema[b.index].Name, Type: b.typ}, nil
+		}
+		// pg_typeof(non-agg-expr) in post-aggregate context: resolve arg and fold.
+		if strings.ToLower(x.Name.String()) == "pg_typeof" && len(x.Args) == 1 {
+			arg, err := resolveExprAfterAggregate(x.Args[0], agg)
+			if err != nil {
+				return nil, err
+			}
+			typName := pgTypeofDisplayName(exprType(arg).Name)
+			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
 		}
 		args := make([]Expr, 0, len(x.Args))
 		for _, a := range x.Args {
@@ -4360,6 +4691,19 @@ func collectAggregateCalls(s *parser.SelectStmt, cat catalog.Catalog) ([]*parser
 					}
 				}
 			}
+			// Check ORDER BY expressions (inside the aggregate call) for nested
+			// aggregates. When an ORDER BY clause contains a scalar subquery that
+			// itself has an aggregate, that is a nested-aggregate error (PG detects
+			// this at parse/analysis time). M0097-0035.
+			for _, sb := range fc.OrderBy {
+				if sqe, ok := sb.Expr.(*parser.SubqueryExpr); ok && sqe.Inner != nil {
+					for _, t := range sqe.Inner.Targets {
+						if exprHasAggregate(t.Expr) {
+							return &PlanError{Pos: t.Expr.Pos(), Code: "42803", Message: "aggregate function calls cannot be nested"}
+						}
+					}
+				}
+			}
 			k := aggregateCallKey(fc)
 			if _, ok := seen[k]; ok {
 				return nil
@@ -4385,6 +4729,53 @@ func collectAggregateCalls(s *parser.SelectStmt, cat catalog.Catalog) ([]*parser
 		}
 	}
 	return out, nil
+}
+
+// collectHavingSubqueryAggCalls scans a HAVING expression for EXISTS/IN subqueries
+// and returns aggregate calls found in their WHERE clauses that are not already in aggByKey.
+// This registers outer aggregate refs (e.g. sum(distinct a.four) in HAVING EXISTS WHERE)
+// so the HAVING resolver can produce correct OuterColumnRef nodes.
+func collectHavingSubqueryAggCalls(having parser.Expr, cat catalog.Catalog) []*parser.FuncCall {
+	var result []*parser.FuncCall
+	var scanExpr func(e parser.Expr)
+	scanExpr = func(e parser.Expr) {
+		if e == nil {
+			return
+		}
+		switch x := e.(type) {
+		case *parser.ExistsExpr:
+			if x.Subquery != nil && x.Subquery.Where != nil {
+				_ = walkExpr(x.Subquery.Where, func(fc *parser.FuncCall) error {
+					if isAggregateFunc(fc) || isUserAggregateFunc(fc, cat) {
+						result = append(result, fc)
+					}
+					return nil
+				})
+			}
+		case *parser.InExpr:
+			if x.Subquery != nil && x.Subquery.Where != nil {
+				_ = walkExpr(x.Subquery.Where, func(fc *parser.FuncCall) error {
+					if isAggregateFunc(fc) || isUserAggregateFunc(fc, cat) {
+						result = append(result, fc)
+					}
+					return nil
+				})
+			}
+		case *parser.BinaryOp:
+			scanExpr(x.Left)
+			scanExpr(x.Right)
+		case *parser.UnaryOp:
+			scanExpr(x.Operand)
+		case *parser.CaseExpr:
+			for _, w := range x.Whens {
+				scanExpr(w.When)
+				scanExpr(w.Then)
+			}
+			scanExpr(x.Else)
+		}
+	}
+	scanExpr(having)
+	return result
 }
 
 func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
@@ -4470,6 +4861,82 @@ func exprHasAggregate(e parser.Expr) bool {
 		return nil
 	})
 	return found
+}
+
+// exprAllAggregatesAreOuterRef returns true if every aggregate function call in e
+// has ALL of its column references pointing to tables NOT in the current scope
+// (i.e., they are outer-query correlated references). In that case, the aggregate
+// is from the outer scope and may be allowed in WHERE for correlated subqueries.
+// If ctx is nil or has no bindings, always returns false (conservative). M0097-0035.
+func exprAllAggregatesAreOuterRef(e parser.Expr, ctx *resolveContext) bool {
+	if ctx == nil || len(ctx.bindings) == 0 {
+		return false
+	}
+	// Build a set of current-scope table aliases (lower-cased).
+	currentTables := make(map[string]bool)
+	for _, b := range ctx.bindings {
+		currentTables[strings.ToLower(b.alias)] = true
+		if b.table != nil {
+			currentTables[strings.ToLower(b.table.Name)] = true
+		}
+	}
+	// collectColRefs collects all ColumnRef table names from an expression (non-recursive
+	// through function calls — only looks at direct args).
+	var collectColRefs func(expr parser.Expr) []string
+	collectColRefs = func(expr parser.Expr) []string {
+		var refs []string
+		switch x := expr.(type) {
+		case *parser.ColumnRef:
+			refs = append(refs, strings.ToLower(x.Table))
+		case *parser.BinaryOp:
+			refs = append(refs, collectColRefs(x.Left)...)
+			refs = append(refs, collectColRefs(x.Right)...)
+		case *parser.UnaryOp:
+			refs = append(refs, collectColRefs(x.Operand)...)
+		case *parser.FuncCall:
+			for _, a := range x.Args {
+				refs = append(refs, collectColRefs(a)...)
+			}
+		case *parser.CastExpr:
+			refs = append(refs, collectColRefs(x.Operand)...)
+		}
+		return refs
+	}
+	// walkAggregates calls fn for each aggregate FuncCall found in e.
+	var walkAggregates func(expr parser.Expr) bool // returns false if any current-scope ref found
+	walkAggregates = func(expr parser.Expr) bool {
+		fc, ok := expr.(*parser.FuncCall)
+		if ok && isAggregateFunc(fc) {
+			// Check if all column refs inside this aggregate are outer-scope.
+			for _, arg := range fc.Args {
+				for _, tbl := range collectColRefs(arg) {
+					if tbl == "" {
+						// Unqualified ref: assume current-scope (conservative).
+						return false
+					}
+					if currentTables[tbl] {
+						return false // current-scope ref → not an outer aggregate
+					}
+				}
+			}
+			return true // all refs are outer
+		}
+		// Recurse into non-aggregate expressions.
+		switch x := expr.(type) {
+		case *parser.BinaryOp:
+			return walkAggregates(x.Left) && walkAggregates(x.Right)
+		case *parser.UnaryOp:
+			return walkAggregates(x.Operand)
+		case *parser.FuncCall:
+			for _, a := range x.Args {
+				if !walkAggregates(a) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return exprHasAggregate(e) && walkAggregates(e)
 }
 
 // isUserAggregateFunc returns true if fc is a user-defined aggregate registered in cat.
@@ -4980,7 +5447,9 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 					if ua.FinalFunc != "" {
 						outType = catalog.Type{Name: "numeric"}
 					} else {
-						outType = catalog.Type{Name: ua.SType}
+						// For polymorphic stypes (anycompatible, anyelement, anyarray),
+						// resolve to the actual input-derived type. M0097-0035.
+						outType = resolvePolyAggOutputType(ua.SType, argExpr)
 					}
 				}
 				// Resolve ORDER BY inside the aggregate call.
@@ -5148,6 +5617,48 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 	}
 	leftCol, lIsCol := b.Left.(*parser.ColumnRef)
 	rightCol, rIsCol := b.Right.(*parser.ColumnRef)
+
+	// When both sides are ColumnRefs (e.g. WHERE inner.col = outer.col in a
+	// correlated subquery), check if one side resolves to an OuterColumnRef.
+	// If so, treat it as the key expression (the outer value drives the probe).
+	if lIsCol && rIsCol {
+		leftResolved, leftErr := resolveExpr(b.Left, ctx)
+		rightResolved, rightErr := resolveExpr(b.Right, ctx)
+		_, leftIsOuter := leftResolved.(*OuterColumnRef)
+		_, rightIsOuter := rightResolved.(*OuterColumnRef)
+		if leftErr == nil && rightErr == nil && (leftIsOuter || rightIsOuter) {
+			var colRef *parser.ColumnRef
+			var resolvedKey Expr
+			if rightIsOuter {
+				colRef = leftCol
+				resolvedKey = rightResolved
+			} else {
+				colRef = rightCol
+				resolvedKey = leftResolved
+			}
+			resolvedCol, err := resolveColumnRef(colRef, ctx)
+			if err != nil {
+				return nil, false, nil
+			}
+			col, ok := resolvedCol.(*ColumnRef)
+			if !ok {
+				return nil, false, nil
+			}
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name)
+			if idx == nil {
+				return nil, false, nil
+			}
+			return &IndexScan{
+				pos:    where.Pos(),
+				Table:  tbl,
+				Index:  idx,
+				Key:    resolvedKey,
+				schema: ctx.schema,
+			}, true, nil
+		}
+		return nil, false, nil
+	}
+
 	if lIsCol == rIsCol {
 		return nil, false, nil
 	}
@@ -5186,10 +5697,19 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		// M0044-0005: varchar/char column indexes — probe key is
 		// a plain string literal; evaluates to KindString at
 		// runtime and routes through EncodeVarchar/EncodeChar.
+		// For user-defined enum columns, wrap in CastExpr so the
+		// executor converts the string to KindEnum (sort order). M0097-0022.
+		if col2, ok2 := cat.(*catalog.InMemory); ok2 {
+			if _, isEnum := col2.LookupEnum(col.Type.Name); isEnum {
+				resolvedKey = &CastExpr{pos: keyExpr.Pos(), Operand: resolvedKey, TargetType: col.Type.Name}
+			}
+		}
 	case *TypedStringLit:
 		// M0044-0005: timestamp column indexes — probe key is a
 		// typed literal like `timestamp '1995-01-01'`; evaluates
 		// to KindTime and routes through EncodeTimestamp.
+	case *CastExpr:
+		// Enum literal already wrapped by resolveExpr BinaryOp. M0097-0022.
 	default:
 		return nil, false, nil
 	}
@@ -5403,6 +5923,15 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 		}
 		if !isConstantExpr(resolvedKey) {
 			continue
+		}
+		// For user-defined enum columns, wrap string literals in CastExpr
+		// so the executor converts them to KindEnum (sort order). M0097-0022.
+		if _, ok2 := resolvedKey.(*StringConst); ok2 {
+			if col2, ok3 := cat.(*catalog.InMemory); ok3 {
+				if _, isEnum := col2.LookupEnum(col.Type.Name); isEnum {
+					resolvedKey = &CastExpr{pos: keyExpr.Pos(), Operand: resolvedKey, TargetType: col.Type.Name}
+				}
+			}
 		}
 
 		// Assign bounds based on canonical operator
@@ -5895,44 +6424,37 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 	if len(target.Columns) == 0 {
 		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42601", Message: "ON CONFLICT target requires at least one column"}
 	}
-	// Build a set of wanted column names. Expression columns (name=="") are
-	// represented by a unique sentinel key per position so the set-size
-	// check correctly detects duplicate plain column names.
-	wanted := make(map[string]struct{}, len(target.Columns))
-	for i, c := range target.Columns {
+	// Build a set of plain column names and count expression columns in the
+	// target. PostgreSQL uses liberal/subset matching: every index column must
+	// be satisfied by at least one target column; the target may contain
+	// duplicates or extra columns. This mirrors upstream's permissive inference
+	// logic (documented as "The implementation is liberal in accepting inference
+	// specifications").
+	plainWanted := make(map[string]struct{}, len(target.Columns))
+	exprCount := 0
+	for _, c := range target.Columns {
 		if c == "" {
-			// Expression column — use a unique sentinel per position so each
-			// expression gets its own slot in the wanted set.
-			wanted[fmt.Sprintf("__expr_%d__", i)] = struct{}{}
+			exprCount++
 		} else {
-			wanted[strings.ToLower(c)] = struct{}{}
+			plainWanted[strings.ToLower(c)] = struct{}{}
 		}
-	}
-	if len(wanted) != len(target.Columns) {
-		return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: "ON CONFLICT target list contains duplicate columns"}
 	}
 	for _, idx := range cat.IndexesOnTable(tbl) {
 		if !idx.Unique {
 			continue
 		}
-		if len(idx.Columns) != len(target.Columns) {
-			continue
-		}
-		// Match: for each index column position, check that the target has
-		// the same kind of column (plain name or expression). Expression
-		// columns in the index (ic=="") match expression columns in the
-		// target at the same position.
+		// Liberal matching: each index column must be covered by the target.
+		// Target may have more or duplicate columns (allowed per PG semantics).
 		match := true
-		for j, ic := range idx.Columns {
+		for _, ic := range idx.Columns {
 			if ic == "" {
-				// Expression index column — must match expression target column
-				// at same position.
-				if j >= len(target.Columns) || target.Columns[j] != "" {
+				// Expression index column — satisfied by any expression in target.
+				if exprCount == 0 {
 					match = false
 					break
 				}
 			} else {
-				if _, ok := wanted[strings.ToLower(ic)]; !ok {
+				if _, ok := plainWanted[strings.ToLower(ic)]; !ok {
 					match = false
 					break
 				}
@@ -5960,7 +6482,7 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 		}
 		return idx, ords, nil
 	}
-	return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: fmt.Sprintf("there is no unique or exclusion constraint matching the ON CONFLICT specification on relation %q", tbl.Name)}
+	return nil, nil, &PlanError{Pos: target.Pos(), Code: "42P10", Message: "there is no unique or exclusion constraint matching the ON CONFLICT specification"}
 }
 
 func insertValuesSchema(tbl *catalog.Table, colIndex []int) Schema {
@@ -6620,8 +7142,26 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if fc, ok := e.(*FuncCall); ok && fc.Name != "" {
 		// array_construct is the lowered form of ARRAY[...]; PostgreSQL
 		// FigureColname returns "array" for ArrayExpr nodes. M0097-0065.
-		// array_subscript is the lowered form of arr[idx]; PG also returns "array".
-		if fc.Name == "array_construct" || fc.Name == "array_subscript" {
+		if fc.Name == "array_construct" {
+			return "array", exprType(e)
+		}
+		// array_subscript is the lowered form of arr[idx]. PG's FigureColname
+		// follows the array operand's element type (e.g. (rainbow[])[2] → "rainbow").
+		// The parser strips [] from cast types (::rainbow[] stored as TargetType "rainbow"),
+		// so the first argument's declared type IS the element type of the array.
+		// Fall back to "array" when the type cannot be determined. M0097-enum-sub.
+		if fc.Name == "array_subscript" {
+			if len(fc.Args) > 0 {
+				elemType := exprType(fc.Args[0]).Name
+				// Strip [] suffix: subscripting rainbow[] yields element type "rainbow".
+				// The TargetType preserves "[]" from the parser; we strip it here for the label.
+				if strings.HasSuffix(elemType, "[]") {
+					elemType = elemType[:len(elemType)-2]
+				}
+				if elemType != "" && elemType != "unknown" && elemType != "text" {
+					return elemType, exprType(e)
+				}
+			}
 			return "array", exprType(e)
 		}
 		return fc.Name, exprType(e)
@@ -6682,6 +7222,11 @@ func encodeTypmod(typeName string, typmods []int64) int64 {
 }
 
 func castTargetLabel(t string) string {
+	// Strip array brackets: PostgreSQL FigureColname uses the element type name
+	// as the column label (e.g. ::rainbow[] → "rainbow"). M0097-enum-fix.
+	if strings.HasSuffix(t, "[]") {
+		t = t[:len(t)-2]
+	}
 	switch t {
 	case "boolean":
 		return "bool"
@@ -6697,6 +7242,128 @@ func castTargetLabel(t string) string {
 		return "float8"
 	}
 	return t
+}
+
+// pgTypeofDisplayName maps a planner type name to the display name pg_typeof returns.
+// Mirrors PostgreSQL's format_type_be for common types. M0097-0035.
+func pgTypeofDisplayName(name string) string {
+	switch strings.ToLower(name) {
+	case "int4", "int", "integer", "serial":
+		return "integer"
+	case "int2", "smallint", "smallserial":
+		return "smallint"
+	case "int8", "bigint", "bigserial":
+		return "bigint"
+	case "float4", "real":
+		return "real"
+	case "float8", "double precision", "float":
+		return "double precision"
+	case "bool", "boolean":
+		return "boolean"
+	case "text":
+		return "text"
+	case "varchar", "character varying":
+		return "character varying"
+	case "char", "character", "bpchar":
+		return "character"
+	case "numeric", "decimal":
+		return "numeric"
+	case "timestamp", "timestamp without time zone":
+		return "timestamp without time zone"
+	case "timestamptz", "timestamp with time zone":
+		return "timestamp with time zone"
+	case "date":
+		return "date"
+	case "time", "time without time zone":
+		return "time without time zone"
+	case "timetz", "time with time zone":
+		return "time with time zone"
+	case "interval":
+		return "interval"
+	case "bytea":
+		return "bytea"
+	case "uuid":
+		return "uuid"
+	case "json":
+		return "json"
+	case "jsonb":
+		return "jsonb"
+	case "oid":
+		return "oid"
+	default:
+		return name
+	}
+}
+
+// compatibleTypeRank returns a numeric rank for anycompatible type resolution.
+// Higher rank wins (numeric > float8 > float4 > int8 > int4 > int2 > text).
+func compatibleTypeRank(name string) int {
+	switch strings.ToLower(name) {
+	case "numeric", "decimal":
+		return 10
+	case "float8", "double precision", "float":
+		return 8
+	case "float4", "real":
+		return 7
+	case "int8", "bigint":
+		return 6
+	case "int4", "integer", "int", "serial":
+		return 5
+	case "int2", "smallint", "smallserial":
+		return 4
+	case "text", "varchar", "character varying":
+		return 2
+	default:
+		return 1
+	}
+}
+
+// commonCompatibleType returns the common anycompatible type for a slice of expressions,
+// picking the highest-ranked type. Used for polymorphic aggregate output type resolution.
+func commonCompatibleType(exprs []Expr) catalog.Type {
+	var best catalog.Type
+	for _, e := range exprs {
+		t := exprType(e)
+		if t.Name == "" || t.Name == "unknown" {
+			continue
+		}
+		if best.Name == "" || compatibleTypeRank(t.Name) > compatibleTypeRank(best.Name) {
+			best = t
+		}
+	}
+	if best.Name == "" {
+		return catalog.Type{Name: "numeric"}
+	}
+	return best
+}
+
+// resolvePolyAggOutputType resolves a polymorphic aggregate SType to an actual catalog type
+// based on the argument expression. Handles anycompatible, anyelement, anyarray.
+// M0097-0035: fixes pg_typeof(cleast_agg(...)) returning "integer" instead of "numeric".
+func resolvePolyAggOutputType(stype string, argExpr Expr) catalog.Type {
+	switch strings.ToLower(stype) {
+	case "anycompatible", "anyelement":
+		// Unwrap array_construct to get element type for variadic array aggregates.
+		if fc, ok := argExpr.(*FuncCall); ok && fc.Name == "array_construct" && len(fc.Args) > 0 {
+			return commonCompatibleType(fc.Args)
+		}
+		et := exprType(argExpr)
+		if et.Name != "" && et.Name != "unknown" {
+			return et
+		}
+		return catalog.Type{Name: "numeric"}
+	case "anyarray":
+		et := exprType(argExpr)
+		if strings.HasSuffix(et.Name, "[]") {
+			return et
+		}
+		if et.Name != "" && et.Name != "unknown" {
+			return catalog.Type{Name: et.Name + "[]"}
+		}
+		return catalog.Type{Name: "text[]"}
+	default:
+		return catalog.Type{Name: stype}
+	}
 }
 
 // exprType returns the planner-level type tag for an expression. v0
@@ -6785,6 +7452,20 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: "text"}
 		case parser.OpAnd, parser.OpOr, parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe, parser.OpLike, parser.OpNotLike:
 			return catalog.Type{Name: "bool"}
+		case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor:
+			// Bitwise ops return the promoted integer type of both operands.
+			lt := exprType(x.Left)
+			rt := exprType(x.Right)
+			if lt.Name == "int8" || lt.Name == "bigint" || rt.Name == "int8" || rt.Name == "bigint" {
+				return catalog.Type{Name: "int8"}
+			}
+			if isIntegerLikeType(lt.Name) {
+				return lt
+			}
+			return catalog.Type{Name: "int8"}
+		case parser.OpBitShiftLeft, parser.OpBitShiftRight:
+			// Shift ops return the type of the left operand.
+			return exprType(x.Left)
 		}
 		return catalog.Type{Name: "unknown"}
 	case *UnaryOp:
@@ -6812,6 +7493,11 @@ func exprType(e Expr) catalog.Type {
 		// buildAggregateCall) on the AggregateCall path, but free
 		// FuncCalls reach here with no type carried. Match the
 		// known-typed builtins; everything else stays unknown.
+		// If ReturnType was populated at plan time (e.g. for user-defined
+		// functions), use it directly so psql receives the correct OID.
+		if x.ReturnType != "" {
+			return catalog.Type{Name: x.ReturnType}
+		}
 		switch strings.ToLower(x.Name) {
 		// Type-cast functions: single-arg calls like float8(expr) act as explicit casts.
 		// Return the target type so downstream type inference (BinaryOp, wire) is correct.
@@ -6879,6 +7565,11 @@ func exprType(e Expr) catalog.Type {
 				arrT := exprType(x.Args[0])
 				if strings.HasPrefix(arrT.Name, "_") {
 					return catalog.Type{Name: arrT.Name[1:]}
+				}
+				// When base type is unknown (e.g. $N parameter or unresolved expr),
+				// return "unknown" so arithmetic on the subscript can proceed at runtime.
+				if arrT.Name == "" || arrT.Name == "unknown" {
+					return catalog.Type{Name: "unknown"}
 				}
 			}
 			return catalog.Type{Name: "text"}
@@ -7597,6 +8288,13 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		// For comparisons involving a `name` type, coerce the non-name side
 		// to "name" so the executor truncates it to 63 chars (NAMEDATALEN-1),
 		// matching PostgreSQL's namecmp() semantics. M0097-0003.
+		//
+		// For comparisons involving a user-defined type (enum, domain) on one
+		// side and a string literal on the other, coerce the string to the
+		// user-defined type so the executor's evalCast converts it to KindEnum
+		// (with correct sort order) before comparison. Without this, enum
+		// comparisons like col > 'yellow' compare labels alphabetically instead
+		// of by declaration order. M0097-enum-cmp.
 		switch x.Op {
 		case parser.OpEq, parser.OpNe, parser.OpLt, parser.OpLe, parser.OpGt, parser.OpGe:
 			lt, rt := exprType(l), exprType(r)
@@ -7604,6 +8302,10 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: "name"}
 			} else if strings.EqualFold(rt.Name, "name") && !strings.EqualFold(lt.Name, "name") && isTextLikePlannerType(lt.Name) {
 				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: "name"}
+			} else if isUserDefinedPlannerType(lt.Name) && isTextLikePlannerType(rt.Name) {
+				r = &CastExpr{pos: x.Pos(), Operand: r, TargetType: strings.ToLower(lt.Name)}
+			} else if isTextLikePlannerType(lt.Name) && isUserDefinedPlannerType(rt.Name) {
+				l = &CastExpr{pos: x.Pos(), Operand: l, TargetType: strings.ToLower(rt.Name)}
 			}
 		}
 		node := &BinaryOp{pos: x.Pos(), Op: x.Op, Left: l, Right: r}
@@ -7624,6 +8326,50 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		if x.Over != nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
 		}
+		// Outer aggregate reference in HAVING subquery: when a HAVING clause
+		// contains an EXISTS/subquery, and that subquery's predicate references an
+		// aggregate function whose key matches the outer query's aggregate (e.g.
+		// `sum(distinct a.four)` in `HAVING EXISTS(... WHERE sum(distinct a.four) = ...)`),
+		// the aggregate is not a *new* aggregate inside the subquery — it is an outer
+		// reference to the pre-computed group aggregate. Replace it with an
+		// OuterColumnRef pointing to the aggregate output column so the executor
+		// reads the correct value from the aggregate output row. Without this, the
+		// executor resolves the argument's column ref against the aggregate output
+		// row (which has fewer columns than the input) and fails with "out of range".
+		// M0097-0035.
+		if isAggregateFunc(x) || isUserAggregateFunc(x, ctx.cat) {
+			k := aggregateCallKey(x)
+			for p := ctx; p != nil; p = p.parent {
+				if p.havingAgg == nil {
+					continue
+				}
+				if b, ok := p.havingAgg.aggregateByKey[k]; ok {
+					// Count parent hops from current ctx to the context that owns havingAgg.
+					level := 0
+					for q := ctx; q != p; q = q.parent {
+						if !q.lateralSibling {
+							level++
+						}
+					}
+					sc := p.havingAgg.output.schema[b.index]
+					return &OuterColumnRef{pos: x.Pos(), Name: sc.Name, Index: b.index, Level: level, Type: sc.Type}, nil
+				}
+				break // found havingAgg context but this aggregate is not in the outer query
+			}
+		}
+		// pg_typeof(expr) returns the static type of its argument. Fold it at
+		// plan time by replacing the arg with a StringConst holding the type name,
+		// while keeping the FuncCall wrapper so the column label stays "pg_typeof".
+		// This ensures pg_typeof(user_agg(...)) returns the aggregate's declared
+		// return type rather than the runtime datum kind. M0097-0035.
+		if strings.ToLower(x.Name.String()) == "pg_typeof" && len(x.Args) == 1 {
+			arg, err := resolveExpr(x.Args[0], ctx)
+			if err != nil {
+				return nil, err
+			}
+			typName := pgTypeofDisplayName(exprType(arg).Name)
+			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
+		}
 		args := make([]Expr, 0, len(x.Args))
 		for _, a := range x.Args {
 			pa, err := resolveExpr(a, ctx)
@@ -7639,7 +8385,27 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 				break
 			}
 		}
-		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp}, nil
+		returnType := ""
+		if ctx.cat != nil {
+			if rs := ctx.cat.Routines(); rs != nil {
+				cands := rs.LookupByName(x.Name)
+				if len(cands) == 1 {
+					returnType = cands[0].ReturnType.Name
+				} else if len(cands) > 1 {
+					allSame := true
+					for _, c := range cands[1:] {
+						if c.ReturnType.Name != cands[0].ReturnType.Name {
+							allSame = false
+							break
+						}
+					}
+					if allSame {
+						returnType = cands[0].ReturnType.Name
+					}
+				}
+			}
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp, ReturnType: returnType}, nil
 	case *parser.StarExpr:
 		return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
 	case *parser.CastExpr:

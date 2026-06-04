@@ -47,6 +47,7 @@ type BasicSession struct {
 	tx               mvcc.Transaction
 	snap             mvcc.Snapshot
 	pendingDDL       []DDLUndoEntry    // DDL creates pending rollback
+	pendingRoutineDrops []*catalog.Routine // routines dropped in current tx, for rollback
 	subxactStack     mvcc.SubxactStack // savepoint stack (M0050-0004)
 	currentSubXid    storage.TransactionID // 0 = use top-level tx.XID
 	txFailed         bool              // in_failed_sql_transaction (25P02)
@@ -205,4 +206,16 @@ func (s *BasicSession) TakePendingDDLCreates() []DDLUndoEntry {
 	p := append([]DDLUndoEntry(nil), s.pendingDDL...)
 	s.pendingDDL = nil
 	return p
+}
+
+// AddPendingRoutineDrop records a routine drop for potential rollback.
+func (s *BasicSession) AddPendingRoutineDrop(r *catalog.Routine) {
+	s.pendingRoutineDrops = append(s.pendingRoutineDrops, r)
+}
+
+// TakePendingRoutineDrops returns and clears the pending routine drops.
+func (s *BasicSession) TakePendingRoutineDrops() []*catalog.Routine {
+	drops := s.pendingRoutineDrops
+	s.pendingRoutineDrops = nil
+	return drops
 }

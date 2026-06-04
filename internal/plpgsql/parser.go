@@ -284,10 +284,13 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		return p.parseExit()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwContinue:
 		return p.parseContinue()
-	// SQL DML statements embedded in PL/pgSQL body. M0096-0012.
+	// SQL DML/DDL statements embedded in PL/pgSQL body. M0096-0012.
 	case t.Kind == parser.TokenKeyword && (t.Keyword == parser.KwInsert ||
 		t.Keyword == parser.KwUpdate || t.Keyword == parser.KwDelete ||
-		t.Keyword == parser.KwSelect):
+		t.Keyword == parser.KwSelect ||
+		t.Keyword == parser.KwCreate ||
+		t.Keyword == parser.KwDrop ||
+		t.Keyword == parser.KwAlter):
 		return p.parseSQLStmt()
 	// EXECUTE expr [INTO var] [USING expr, ...]. M0100-0005.
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwExecute:

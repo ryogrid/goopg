@@ -24,6 +24,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newValuesOp(p)), nil
 	case *planner.GenerateSeries:
 		return maybeInstrument(p, newGenerateSeriesOp(p)), nil
+	case *planner.UserSrfScan:
+		return maybeInstrument(p, newUserSrfScanOp(p)), nil
 	case *planner.GenerateSubscripts:
 		return maybeInstrument(p, newGenerateSubscriptsOp(p)), nil
 	case *planner.FromUnnest:

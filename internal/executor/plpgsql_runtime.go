@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -12,6 +13,31 @@ import (
 	"github.com/goopg/goopg/internal/plpgsql"
 )
 
+// wrapSQLFunctionContext wraps an error with CONTEXT showing the SQL function
+// name and statement number. If the error already has a Context, it prepends.
+func wrapSQLFunctionContext(err error, funcName string, stmtNum int) error {
+	if err == nil {
+		return nil
+	}
+	var ctx string
+	if stmtNum > 0 {
+		ctx = fmt.Sprintf("SQL function %q statement %d", funcName, stmtNum)
+	} else {
+		ctx = fmt.Sprintf("SQL function %q", funcName)
+	}
+	var ee *ExecError
+	if errors.As(err, &ee) {
+		newErr := *ee
+		if newErr.Context != "" {
+			newErr.Context = ctx + "\n" + newErr.Context
+		} else {
+			newErr.Context = ctx
+		}
+		return &newErr
+	}
+	return &ExecError{Code: "XX000", Message: err.Error(), Context: ctx}
+}
+
 // rewriteSQLNamedParams replaces named parameter references in a SQL function
 // body with positional $n references. This supports SQL functions that reference
 // their arguments by name (e.g. "select value + seed" → "select $1 + $2").
@@ -20,9 +46,17 @@ func rewriteSQLNamedParams(body string, argNames []string) string {
 		if name == "" {
 			continue
 		}
-		re := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(name) + `\b`)
-		// Use $$ to produce a literal $ in the replacement (Go regexp convention).
-		body = re.ReplaceAllString(body, fmt.Sprintf("$$%d", i+1))
+		// Match either a string literal (to skip) OR the parameter name as a
+		// whole word. String literals come first in the alternation so they're
+		// consumed without replacement.
+		re := regexp.MustCompile(`'(?:[^'\\]|\\.)*'|(?i)\b` + regexp.QuoteMeta(name) + `\b`)
+		pos := i + 1 // 1-based
+		body = re.ReplaceAllStringFunc(body, func(m string) string {
+			if m[0] == '\'' {
+				return m // leave string literals unchanged
+			}
+			return fmt.Sprintf("$%d", pos)
+		})
 	}
 	return body
 }
@@ -110,10 +144,44 @@ func evalStoredRoutineFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datu
 	if err != nil {
 		return Datum{}, err
 	}
+	// If it's a procedure, emit the "is a procedure" error using the
+	// call-site arg types (string literals show as "unknown", like PG).
+	if r.IsProcedure {
+		argTypeNames := make([]string, len(x.Args))
+		for i, a := range x.Args {
+			if _, isStr := a.(*planner.StringConst); isStr {
+				argTypeNames[i] = "unknown"
+			} else {
+				argTypeNames[i] = r.ArgTypes[i].Name
+			}
+		}
+		return NullDatum, &ExecError{
+			Code:    "42809",
+			Pos:     x.Pos(),
+			Message: fmt.Sprintf("%s(%s) is a procedure", r.Name, strings.Join(argTypeNames, ", ")),
+			Hint:    "To call a procedure, use CALL.",
+		}
+	}
 	return executeStoredRoutine(r, args, ctx, x.Pos())
 }
 
+// routineArgTypesStr builds a comma-separated list of arg type names for
+// error messages like "ptest1(text) is a procedure".
+func routineArgTypesStr(r *catalog.Routine) string {
+	names := make([]string, len(r.ArgTypes))
+	for i, t := range r.ArgTypes {
+		names[i] = t.Name
+	}
+	return strings.Join(names, ", ")
+}
+
 func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
+	// Procedures cannot be called via SELECT - only via CALL.
+	if r.IsProcedure {
+		return NullDatum, &ExecError{Code: "42809", Pos: pos,
+			Message: fmt.Sprintf("%s(%s) is a procedure", r.Name, routineArgTypesStr(r)),
+			Hint:    "To call a procedure, use CALL."}
+	}
 	switch strings.ToLower(r.Language) {
 	case "plpgsql":
 		return executePLpgSQLRoutine(r, args, ctx, pos)
@@ -128,15 +196,11 @@ func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos in
 			return NewBoolDatum(true), nil
 		case "int2", "smallint":
 			return NewIntDatum(0), nil
-		case "int4", "integer", "int":
-			return NewIntDatum(0), nil
-		case "int8", "bigint":
-			return NewIntDatum(0), nil
 		default:
 			return NullDatum, nil
 		}
 	default:
-		return Datum{}, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("function language %q is not executable in v0", r.Language)}
+		return NullDatum, &ExecError{Code: "42704", Pos: pos, Message: fmt.Sprintf("language %q is not supported in v0", r.Language)}
 	}
 }
 
@@ -149,8 +213,18 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	if err != nil {
 		return Datum{}, &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for function %s: %v", r.QualifiedName(), err)}
 	}
-	if len(stmts) != 1 {
-		return Datum{}, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("SQL function %s must contain exactly one statement in v0", r.QualifiedName())}
+	retTypeName := strings.ToLower(r.ReturnType.Name)
+	if len(stmts) == 0 {
+		// Empty body with non-void return type → "final statement must be SELECT"
+		if retTypeName != "" && retTypeName != "void" {
+			// Resolve polymorphic return type if possible (e.g. anyarray → integer[]).
+			resolvedRetType := resolvePolymorphicReturnType(retTypeName, r.ArgTypes, args)
+			return Datum{}, &ExecError{Code: "42P13", Pos: pos,
+				Message: fmt.Sprintf("return type mismatch in function declared to return %s", canonicalReturnType(resolvedRetType)),
+				Detail:  "Function's final statement must be SELECT or INSERT/UPDATE/DELETE/MERGE RETURNING.",
+				Context: fmt.Sprintf("SQL function %q during startup", r.Name)}
+		}
+		return NullDatum, nil
 	}
 	child := NewContext()
 	if ctx != nil {
@@ -169,33 +243,182 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 		}
 		child.Params[i] = coerced
 	}
-	node, err := planner.Plan(stmts[0], child.Catalog)
-	if err != nil {
-		return Datum{}, err
-	}
-	op, err := Build(node)
-	if err != nil {
-		return Datum{}, err
-	}
-	if err := op.Open(child); err != nil {
-		_ = op.Close()
-		return Datum{}, err
-	}
-	defer op.Close()
-	out := NullDatum
-	if slot, err := op.Next(); err != EOF {
-		if err != nil {
-			return Datum{}, err
-		}
-		row := slotRow(slot)
-		if len(row) > 0 {
-			out = row[0]
-		}
-		if _, err := op.Next(); err != EOF {
+	// VOID functions: run all statements for side-effects, return NULL.
+	if strings.EqualFold(r.ReturnType.Name, "void") {
+		for si, stmt := range stmts {
+			node, err := planner.Plan(stmt, child.Catalog)
 			if err != nil {
-				return Datum{}, err
+				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
 			}
-			return Datum{}, &ExecError{Code: "21000", Pos: pos, Message: fmt.Sprintf("SQL function %s returned more than one row", r.QualifiedName())}
+			op, err := Build(node)
+			if err != nil {
+				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
+			}
+			if err := op.Open(child); err != nil {
+				_ = op.Close()
+				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
+			}
+			for {
+				_, nextErr := op.Next()
+				if nextErr == EOF {
+					break
+				}
+				if nextErr != nil {
+					_ = op.Close()
+					return Datum{}, wrapSQLFunctionContext(nextErr, r.Name, si+1)
+				}
+			}
+			_ = op.Close()
+		}
+		if ctx != nil {
+			for _, n := range child.TakeNotices() {
+				ctx.AddNotice(n)
+			}
+		}
+		return NullDatum, nil
+	}
+	// Execute all statements except the last as side effects; return from last.
+	for i, stmt := range stmts {
+		stmtNum := i + 1
+		node, err := planner.Plan(stmt, child.Catalog)
+		if err != nil {
+			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
+		}
+		op, err := Build(node)
+		if err != nil {
+			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
+		}
+		if err := op.Open(child); err != nil {
+			_ = op.Close()
+			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
+		}
+		if i < len(stmts)-1 {
+			// Side-effect statement: drain rows, continue.
+			for {
+				_, nextErr := op.Next()
+				if nextErr == EOF {
+					break
+				}
+				if nextErr != nil {
+					_ = op.Close()
+					return Datum{}, wrapSQLFunctionContext(nextErr, r.Name, stmtNum)
+				}
+			}
+			_ = op.Close()
+			continue
+		}
+		// Last statement: collect return value.
+		defer op.Close()
+		out := NullDatum
+		if slot, nextErr := op.Next(); nextErr != EOF {
+			if nextErr != nil {
+				return Datum{}, wrapSQLFunctionContext(nextErr, r.Name, stmtNum)
+			}
+			row := slotRow(slot)
+			if len(row) > 0 {
+				out = row[0]
+			}
+			if _, nextErr2 := op.Next(); nextErr2 != EOF {
+				if nextErr2 != nil {
+					return Datum{}, wrapSQLFunctionContext(nextErr2, r.Name, stmtNum)
+				}
+				return Datum{}, &ExecError{Code: "21000", Pos: pos, Message: fmt.Sprintf("SQL function %s returned more than one row", r.QualifiedName())}
+			}
+		}
+		if ctx != nil {
+			for _, n := range child.TakeNotices() {
+				ctx.AddNotice(n)
+			}
+		}
+		coerced, err := coerceDatumToType(out, normalizeCatalogType(r.ReturnType), pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
+		if err != nil {
+			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
+		}
+		return coerced, nil
+	}
+	// Unreachable — loop always handles the last statement above.
+	if ctx != nil {
+		for _, n := range child.TakeNotices() {
+			ctx.AddNotice(n)
+		}
+	}
+	return NullDatum, nil
+}
+
+// executeSQLProcedure runs a SQL-language PROCEDURE body.
+// Unlike executeSQLRoutine (functions), procedures may have multiple statements
+// and do not return a scalar value. Named parameters are rewritten to $1, $2 etc.
+func executeSQLProcedure(r *catalog.Routine, args []Datum, ctx *Context, pos int) error {
+	_, err := executeSQLProcedureCore(r, args, ctx, pos)
+	return err
+}
+
+// executeSQLProcedureReturning executes a SQL procedure and returns the result
+// row from the last statement (for OUT/INOUT parameter procedures).
+func executeSQLProcedureReturning(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Row, error) {
+	return executeSQLProcedureCore(r, args, ctx, pos)
+}
+
+func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Row, error) {
+	body := r.Body
+	if len(r.ArgNames) > 0 {
+		body = rewriteSQLNamedParams(body, r.ArgNames)
+	}
+	stmts, err := parser.Parse(body)
+	if err != nil {
+		return nil, &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for procedure %s: %v", r.QualifiedName(), err)}
+	}
+	child := NewContext()
+	if ctx != nil {
+		*child = *ctx
+	}
+	child.Notices = nil
+	child.Params = make([]Datum, len(args))
+	for i, arg := range args {
+		declared := catalog.Type{Name: "unknown"}
+		if i < len(r.ArgTypes) {
+			declared = normalizeCatalogType(r.ArgTypes[i])
+		}
+		coerced, err := coerceDatumToType(arg, declared, pos, fmt.Sprintf("argument %d", i+1))
+		if err != nil {
+			return nil, err
+		}
+		child.Params[i] = coerced
+	}
+	var lastRow Row
+	for i, stmt := range stmts {
+		stmtNum := i + 1
+		node, err := planner.Plan(stmt, child.Catalog)
+		if err != nil {
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
+		}
+		op, err := Build(node)
+		if err != nil {
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
+		}
+		if err := op.Open(child); err != nil {
+			_ = op.Close()
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
+		}
+		isLast := i == len(stmts)-1
+		for {
+			slot, nextErr := op.Next()
+			if nextErr == EOF {
+				break
+			}
+			if nextErr != nil {
+				_ = op.Close()
+				return nil, wrapSQLFunctionContext(nextErr, r.Name, stmtNum)
+			}
+			if isLast && lastRow == nil {
+				// Copy row so it survives op.Close().
+				if raw := slotRow(slot); raw != nil {
+					lastRow = append(Row(nil), raw...)
+				}
+			}
+		}
+		if err := op.Close(); err != nil {
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
 	}
 	if ctx != nil {
@@ -203,11 +426,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 			ctx.AddNotice(n)
 		}
 	}
-	coerced, err := coerceDatumToType(out, normalizeCatalogType(r.ReturnType), pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
-	if err != nil {
-		return Datum{}, err
-	}
-	return coerced, nil
+	return lastRow, nil
 }
 
 // evalSQLFunctionSetof calls a SETOF SQL function and returns all rows as
@@ -222,8 +441,13 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	if err != nil {
 		return nil, &ExecError{Code: "42601", Pos: pos, Message: fmt.Sprintf("invalid SQL body for function %s: %v", r.QualifiedName(), err)}
 	}
-	if len(stmts) != 1 {
-		return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("SQL function %s must contain exactly one statement in v0", r.QualifiedName())}
+	if len(stmts) == 0 {
+		return nil, nil
+	}
+	// SETOF VOID returns an empty set (no columns, no rows).
+	retTypeName := strings.ToLower(r.ReturnType.Name)
+	if retTypeName == "void" {
+		return nil, nil
 	}
 	child := NewContext()
 	if ctx != nil {
@@ -242,46 +466,71 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 		}
 		child.Params[i] = coerced
 	}
-	node, err := planner.Plan(stmts[0], child.Catalog)
-	if err != nil {
-		return nil, err
-	}
-	op, err := Build(node)
-	if err != nil {
-		return nil, err
-	}
-	if err := op.Open(child); err != nil {
-		_ = op.Close()
-		return nil, err
-	}
-	defer op.Close()
-	var out []Datum
-	retType := normalizeCatalogType(r.ReturnType)
-	for {
-		slot, err := op.Next()
-		if err == EOF {
-			break
-		}
+	// Execute all statements except the last as side effects; collect rows from last.
+	for i, stmt := range stmts {
+		stmtNum := i + 1
+		node, err := planner.Plan(stmt, child.Catalog)
 		if err != nil {
-			return nil, err
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
-		row := slotRow(slot)
-		if len(row) == 0 {
-			out = append(out, NullDatum)
+		op, err := Build(node)
+		if err != nil {
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
+		}
+		if err := op.Open(child); err != nil {
+			_ = op.Close()
+			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
+		}
+		if i < len(stmts)-1 {
+			for {
+				_, nextErr := op.Next()
+				if nextErr == EOF {
+					break
+				}
+				if nextErr != nil {
+					_ = op.Close()
+					return nil, wrapSQLFunctionContext(nextErr, r.Name, stmtNum)
+				}
+			}
+			_ = op.Close()
 			continue
 		}
-		coerced, err := coerceDatumToType(row[0], retType, pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
-		if err != nil {
-			return nil, err
+		// Last statement: collect SETOF rows.
+		defer op.Close()
+		var out []Datum
+		retType := normalizeCatalogType(r.ReturnType)
+		for {
+			slot, nextErr := op.Next()
+			if nextErr == EOF {
+				break
+			}
+			if nextErr != nil {
+				return nil, wrapSQLFunctionContext(nextErr, r.Name, stmtNum)
+			}
+			row := slotRow(slot)
+			if len(row) == 0 {
+				out = append(out, NullDatum)
+				continue
+			}
+			coerced, err := coerceDatumToType(row[0], retType, pos, fmt.Sprintf("return value of function %s", r.QualifiedName()))
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, coerced)
 		}
-		out = append(out, coerced)
+		if ctx != nil {
+			for _, n := range child.TakeNotices() {
+				ctx.AddNotice(n)
+			}
+		}
+		return out, nil
 	}
 	if ctx != nil {
 		for _, n := range child.TakeNotices() {
 			ctx.AddNotice(n)
 		}
 	}
-	return out, nil
+	return nil, nil
 }
 
 // evalPLpgSQLFunctionSetof calls a SETOF PL/pgSQL function via RETURN NEXT
@@ -386,6 +635,33 @@ func resolveRoutineOverload(rs *catalog.Routines, name parser.ObjectName, args [
 	case 1:
 		return matches[0], nil
 	default:
+		// Prefer non-polymorphic overloads over polymorphic ones (anyenum,
+		// anyelement, anyarray, etc.).  This mirrors PostgreSQL's function
+		// overload resolution: a specific-type match beats a polymorphic one.
+		specific := make([]*catalog.Routine, 0, len(matches))
+		for _, c := range matches {
+			if !hasPolymorphicArgType(c.ArgTypes) {
+				specific = append(specific, c)
+			}
+		}
+		if len(specific) == 1 {
+			return specific[0], nil
+		}
+		if len(specific) == 0 {
+			specific = matches // fall back to polymorphic matches
+		}
+		// Second pass: prefer exact Datum-kind match over coercion-based match.
+		// E.g. fipshash(text) beats fipshash(bytea) when arg is KindString.
+		// Mirrors PostgreSQL's "exact match beats implicit cast" resolution.
+		exact := make([]*catalog.Routine, 0, len(specific))
+		for _, c := range specific {
+			if routineArgsExactMatch(c.ArgTypes, args) {
+				exact = append(exact, c)
+			}
+		}
+		if len(exact) == 1 {
+			return exact[0], nil
+		}
 		return nil, &ExecError{Code: "42725", Pos: pos, Message: fmt.Sprintf("function %s is not unique", sig)}
 	}
 }
@@ -400,6 +676,57 @@ func routineArgsCompatible(argTypes []catalog.Type, args []Datum) bool {
 		}
 	}
 	return true
+}
+
+// routineArgsExactMatch returns true when every argument's Datum kind directly
+// maps to the declared parameter type without coercion. Used as a secondary
+// overload preference after compatibility is established. M0097-0025.
+func routineArgsExactMatch(argTypes []catalog.Type, args []Datum) bool {
+	if len(argTypes) != len(args) {
+		return false
+	}
+	for i, typ := range argTypes {
+		tn := strings.ToLower(typ.Name)
+		v := args[i]
+		var exact bool
+		switch v.Kind {
+		case KindInt:
+			exact = isIntegerTypeName(tn)
+		case KindNumeric:
+			exact = isNumericType(tn)
+		case KindString:
+			exact = isTextTypeName(tn)
+		case KindBool:
+			exact = isBoolTypeName(tn)
+		case KindBytes:
+			exact = (tn == "bytea")
+		case KindTime:
+			exact = isTimeTypeName(tn) || isIntervalTypeName(tn)
+		default:
+			exact = true // unknown kind: treat as exact to avoid false negatives
+		}
+		if !exact {
+			return false
+		}
+	}
+	return true
+}
+
+// hasPolymorphicArgType returns true when any declared argument type is a
+// PostgreSQL polymorphic pseudo-type (anyenum, anyelement, anyarray, etc.).
+// Used in resolveRoutineOverload to prefer specific-type overloads over
+// generic polymorphic ones.
+func hasPolymorphicArgType(argTypes []catalog.Type) bool {
+	for _, t := range argTypes {
+		switch strings.ToLower(t.Name) {
+		case "anyenum", "anyelement", "anyarray", "anynonarray",
+			"anyrange", "anymultirange", "anycompatible",
+			"anycompatiblearray", "anycompatiblerange",
+			"anycompatiblemultirange":
+			return true
+		}
+	}
+	return false
 }
 
 func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
@@ -485,6 +812,10 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 	}
 	if flow == flowReturn {
 		return res, nil
+	}
+	// VOID functions may fall off the end without an explicit RETURN. M0097-0025.
+	if strings.EqualFold(r.ReturnType.Name, "void") {
+		return NullDatum, nil
 	}
 	return Datum{}, &ExecError{Code: "2F005", Pos: pos, Message: fmt.Sprintf("control reached end of function %s without RETURN", r.QualifiedName())}
 }
@@ -1446,9 +1777,15 @@ func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datu
 		case KindInt:
 			return v, nil
 		case KindNumeric:
-			if v.Scale == 0 {
-				return Datum{Kind: KindInt, Int: v.NumericMantissaValue()}, nil
+			// Truncate numeric to integer (matches PG behavior for RETURNS int functions).
+			mantissa := v.NumericMantissaValue()
+			// Scale away the fractional part if any.
+			scale := v.Scale
+			for scale > 0 {
+				mantissa /= 10
+				scale--
 			}
+			return Datum{Kind: KindInt, Int: mantissa}, nil
 		}
 	case isNumericType(tn):
 		switch v.Kind {
@@ -1468,20 +1805,105 @@ func coerceDatumToType(v Datum, typ catalog.Type, pos int, subject string) (Datu
 		if v.Kind == KindBool {
 			return v, nil
 		}
+		if v.Kind == KindString {
+			return v, nil // pass-through for overload resolution
+		}
 	case isTimeTypeName(tn):
 		if v.Kind == KindTime {
+			return v, nil
+		}
+		// Implicit coercion of string literals to date/timestamp (PG semantics).
+		if v.Kind == KindString {
+			if t := tryParseStringAs(KindTime, v.StringValue()); !t.IsNull() {
+				return t, nil
+			}
+			// Return pass-through so overload resolution can proceed;
+			// execution will fail with a proper cast error if needed.
 			return v, nil
 		}
 	case isIntervalTypeName(tn):
 		if v.Kind == KindInterval {
 			return v, nil
 		}
+		if v.Kind == KindString {
+			return v, nil // pass-through for overload resolution
+		}
 	default:
 		// Unmodelled types remain pass-through in v0, mirroring the
 		// no-op cast behaviour in planner/executor.
 		return v, nil
 	}
+	// If this is a function return type mismatch, use PG's canonical message.
+	if strings.HasPrefix(subject, "return value of function ") {
+		// Extract the declared return type canonical name.
+		retTypeName := canonicalReturnType(typ.Name)
+		return Datum{}, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("return type mismatch in function declared to return %s", retTypeName)}
+	}
 	return Datum{}, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("%s expects type %q but got %s", subject, typ.Name, datumKindName(v))}
+}
+
+// canonicalReturnType returns the canonical PG type name for error messages.
+// resolvePolymorphicReturnType attempts to resolve a polymorphic return type
+// (anyarray, anyelement) based on the actual call-time argument kinds.
+func resolvePolymorphicReturnType(retTypeName string, argTypes []catalog.Type, args []Datum) string {
+	switch strings.ToLower(retTypeName) {
+	case "anyarray":
+		// Find the anyelement argument to determine the element type.
+		for i, at := range argTypes {
+			if strings.ToLower(at.Name) == "anyelement" && i < len(args) {
+				if elem := datumKindToTypeName(args[i].Kind); elem != "" {
+					return elem + "[]"
+				}
+			}
+		}
+	case "anyelement":
+		// Resolve from the first anyarray argument.
+		for i, at := range argTypes {
+			if strings.ToLower(at.Name) == "anyarray" && i < len(args) {
+				if elem := datumKindToTypeName(args[i].Kind); elem != "" {
+					return elem
+				}
+			}
+		}
+	}
+	return retTypeName
+}
+
+// datumKindToTypeName maps a Datum kind to its PG type name for polymorphic resolution.
+func datumKindToTypeName(k DatumKind) string {
+	switch k {
+	case KindInt:
+		return "integer"
+	case KindBool:
+		return "boolean"
+	case KindString:
+		return "text"
+	case KindNumeric:
+		return "numeric"
+	case KindBytes:
+		return "bytea"
+	}
+	return ""
+}
+
+func canonicalReturnType(name string) string {
+	switch strings.ToLower(name) {
+	case "int", "int4":
+		return "integer"
+	case "int2":
+		return "smallint"
+	case "int8":
+		return "bigint"
+	case "float4":
+		return "real"
+	case "float8":
+		return "double precision"
+	case "bool":
+		return "boolean"
+	case "varchar":
+		return "character varying"
+	}
+	return strings.ToLower(name)
 }
 
 func datumKindName(v Datum) string {
@@ -1604,6 +2026,10 @@ func executePLpgSQLTriggerBody(r *catalog.Routine, trig *plpgsqlTrigCtx, ctx *Co
 	child := NewContext()
 	if ctx != nil {
 		*child = *ctx
+		// Clear inherited notices so the child accumulates only its own;
+		// existing ctx.Notices are propagated by the parent, not re-propagated
+		// by the child's TakeNotices loop below. M0097-0140.
+		child.Notices = nil
 	}
 	frame := newPLpgSQLFrame()
 	frame.trig = trig

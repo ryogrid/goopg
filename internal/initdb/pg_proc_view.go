@@ -66,6 +66,43 @@ func typeNameToOIDStr(typName string) string {
 		return "2281"
 	case "pg_lsn":
 		return "3220"
+	// Array types (common ones)
+	case "bool[]", "boolean[]":
+		return "1000"
+	case "bytea[]":
+		return "1001"
+	case "char[]", "\"char\"[]":
+		return "1002"
+	case "name[]":
+		return "1003"
+	case "int8[]", "bigint[]":
+		return "1016"
+	case "int2[]", "smallint[]":
+		return "1005"
+	case "int4[]", "int[]", "integer[]":
+		return "1007"
+	case "text[]":
+		return "1009"
+	case "oid[]":
+		return "1028"
+	case "float4[]", "real[]":
+		return "1021"
+	case "float8[]", "float[]", "double precision[]":
+		return "1022"
+	case "varchar[]", "character varying[]":
+		return "1015"
+	case "date[]":
+		return "1182"
+	case "timestamp[]", "timestamp without time zone[]":
+		return "1115"
+	case "timestamptz[]", "timestamp with time zone[]":
+		return "1185"
+	case "interval[]":
+		return "1187"
+	case "numeric[]", "decimal[]":
+		return "1231"
+	case "uuid[]":
+		return "2951"
 	default:
 		return "0"
 	}
@@ -126,13 +163,18 @@ func registerPgProcView(cat *catalog.InMemory) error {
 		Schema: "pg_catalog",
 		Name:   "pg_proc",
 		Columns: []catalog.Column{
-			{Name: "oid", Type: catalog.Type{Name: "text"}},
+			{Name: "oid", Type: catalog.Type{Name: "oid"}},
 			{Name: "proname", Type: catalog.Type{Name: "text"}},
 			{Name: "pronamespace", Type: catalog.Type{Name: "oid"}},
 			{Name: "prolang", Type: catalog.Type{Name: "text"}},
-			{Name: "prorettype", Type: catalog.Type{Name: "text"}},
+			{Name: "prorettype", Type: catalog.Type{Name: "oid"}},
 			{Name: "proargtypes", Type: catalog.Type{Name: "oidvector"}},
 			{Name: "prosrc", Type: catalog.Type{Name: "text"}},
+			{Name: "provolatile", Type: catalog.Type{Name: "text"}},
+			{Name: "prosecdef", Type: catalog.Type{Name: "bool"}},
+			{Name: "proleakproof", Type: catalog.Type{Name: "bool"}},
+			{Name: "proisstrict", Type: catalog.Type{Name: "bool"}},
+			{Name: "prokind", Type: catalog.Type{Name: "text"}},
 		},
 		Virtual: true,
 	}
@@ -148,6 +190,11 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				b.retType,
 				b.argTypes,
 				b.src,
+				"v",    // provolatile: volatile
+				"f",    // prosecdef
+				"f",    // proleakproof
+				"f",    // proisstrict
+				"f",    // prokind: function
 			})
 		}
 		// Append user-defined routines.
@@ -157,10 +204,39 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			for i, t := range r.ArgTypes {
 				argOIDs[i] = typeNameToOIDStr(t.Name)
 			}
-			// pronamespace: 2200 for public schema, 11 for pg_catalog.
-			ns := "2200"
-			if strings.EqualFold(r.Schema, "pg_catalog") {
+			// pronamespace: use schema OID. public=2200, pg_catalog=11.
+			// For user-created schemas, look up the OID from the catalog.
+			ns := "2200" // default to public
+			switch strings.ToLower(r.Schema) {
+			case "pg_catalog":
 				ns = "11"
+			case "public", "":
+				ns = "2200"
+			default:
+				// Look up user-created schema OID via catalog.
+				if schOID := cat.SchemaOID(r.Schema); schOID != 0 {
+					ns = fmt.Sprintf("%d", schOID)
+				}
+			}
+			volatile := r.Volatile
+			if volatile == "" {
+				volatile = "v"
+			}
+			secdef := "f"
+			if r.SecurityDefiner {
+				secdef = "t"
+			}
+			leakproof := "f"
+			if r.Leakproof {
+				leakproof = "t"
+			}
+			strict := "f"
+			if r.Strict {
+				strict = "t"
+			}
+			prokind := "f" // function
+			if r.IsProcedure {
+				prokind = "p" // procedure
 			}
 			rows = append(rows, []string{
 				fmt.Sprintf("%d", r.OID),
@@ -170,6 +246,11 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				typeNameToOIDStr(r.ReturnType.Name),
 				strings.Join(argOIDs, " "),
 				r.Body,
+				volatile,
+				secdef,
+				leakproof,
+				strict,
+				prokind,
 			})
 		}
 		return rows

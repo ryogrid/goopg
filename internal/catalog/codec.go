@@ -124,27 +124,82 @@ func PGClassColumns() []Column {
 }
 
 // PGAttributeColumns returns the column schema for pg_attribute heap rows.
+// Matches the 24-column PG18 canonical layout written by initdb.pgAttrColDefs.
+// The physical heap encoding follows this column order, so the schema must
+// agree with it for the executor's decoder to read correct values.
 func PGAttributeColumns() []Column {
-	return []Column{
-		{Name: "attrelid", Type: Type{Name: "int4"}, Ordinal: 0},
-		{Name: "attname", Type: Type{Name: "text"}, Ordinal: 1},
-		{Name: "atttypid", Type: Type{Name: "int4"}, Ordinal: 2},
-		{Name: "attnum", Type: Type{Name: "int4"}, Ordinal: 3},
-		{Name: "attnotnull", Type: Type{Name: "bool"}, Ordinal: 4},
-		{Name: "attisdropped", Type: Type{Name: "bool"}, Ordinal: 5},
+	cols := []Column{
+		{Name: "attrelid", Type: Type{Name: "oid"}},
+		{Name: "attname", Type: Type{Name: "name"}},
+		{Name: "atttypid", Type: Type{Name: "oid"}},
+		{Name: "attlen", Type: Type{Name: "int2"}},
+		{Name: "attnum", Type: Type{Name: "int2"}},
+		{Name: "atttypmod", Type: Type{Name: "int4"}},
+		{Name: "attndims", Type: Type{Name: "int2"}},
+		{Name: "attbyval", Type: Type{Name: "bool"}},
+		{Name: "attalign", Type: Type{Name: "char"}},
+		{Name: "attstorage", Type: Type{Name: "char"}},
+		{Name: "attcompression", Type: Type{Name: "char"}},
+		{Name: "attnotnull", Type: Type{Name: "bool"}},
+		{Name: "atthasdef", Type: Type{Name: "bool"}},
+		{Name: "atthasmissing", Type: Type{Name: "bool"}},
+		{Name: "attidentity", Type: Type{Name: "char"}},
+		{Name: "attgenerated", Type: Type{Name: "char"}},
+		{Name: "attisdropped", Type: Type{Name: "bool"}},
+		{Name: "attislocal", Type: Type{Name: "bool"}},
+		{Name: "attinhcount", Type: Type{Name: "int2"}},
+		{Name: "attcollation", Type: Type{Name: "oid"}},
+		{Name: "attacl", Type: Type{Name: "text"}},
+		{Name: "attoptions", Type: Type{Name: "text"}},
+		{Name: "attfdwoptions", Type: Type{Name: "text"}},
+		{Name: "attmissingval", Type: Type{Name: "text"}},
 	}
+	for i := range cols {
+		cols[i].Ordinal = i
+	}
+	return cols
 }
 
 // PGTypeColumns returns the column schema for pg_type heap rows.
 func PGTypeColumns() []Column {
+	// Full 32-column PG18-canonical schema matching pgTypeColDefs() in initdb.
+	// Expanded from 7 to 32 columns (M0097-0146) so SeqScan can correctly
+	// decode the physical rows written by bootstrapPgTypeTuples and
+	// syncEnumTypeToCatalogHeap. Column order and types match the
+	// FormData_pg_type struct (postgres/src/include/catalog/pg_type.h).
 	return []Column{
-		{Name: "oid", Type: Type{Name: "int4"}, Ordinal: 0},
-		{Name: "typname", Type: Type{Name: "text"}, Ordinal: 1},
-		{Name: "typnamespace", Type: Type{Name: "int4"}, Ordinal: 2},
-		{Name: "typlen", Type: Type{Name: "int4"}, Ordinal: 3},
-		{Name: "typbyval", Type: Type{Name: "bool"}, Ordinal: 4},
-		{Name: "typtype", Type: Type{Name: "text"}, Ordinal: 5},
-		{Name: "typcategory", Type: Type{Name: "text"}, Ordinal: 6},
+		{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+		{Name: "typname", Type: Type{Name: "name"}, Ordinal: 1},
+		{Name: "typnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+		{Name: "typowner", Type: Type{Name: "oid"}, Ordinal: 3},
+		{Name: "typlen", Type: Type{Name: "int2"}, Ordinal: 4},
+		{Name: "typbyval", Type: Type{Name: "bool"}, Ordinal: 5},
+		{Name: "typtype", Type: Type{Name: "char"}, Ordinal: 6},
+		{Name: "typcategory", Type: Type{Name: "char"}, Ordinal: 7},
+		{Name: "typispreferred", Type: Type{Name: "bool"}, Ordinal: 8},
+		{Name: "typisdefined", Type: Type{Name: "bool"}, Ordinal: 9},
+		{Name: "typdelim", Type: Type{Name: "char"}, Ordinal: 10},
+		{Name: "typrelid", Type: Type{Name: "oid"}, Ordinal: 11},
+		{Name: "typsubscript", Type: Type{Name: "regproc"}, Ordinal: 12},
+		{Name: "typelem", Type: Type{Name: "oid"}, Ordinal: 13},
+		{Name: "typarray", Type: Type{Name: "oid"}, Ordinal: 14},
+		{Name: "typinput", Type: Type{Name: "regproc"}, Ordinal: 15},
+		{Name: "typoutput", Type: Type{Name: "regproc"}, Ordinal: 16},
+		{Name: "typreceive", Type: Type{Name: "regproc"}, Ordinal: 17},
+		{Name: "typsend", Type: Type{Name: "regproc"}, Ordinal: 18},
+		{Name: "typmodin", Type: Type{Name: "regproc"}, Ordinal: 19},
+		{Name: "typmodout", Type: Type{Name: "regproc"}, Ordinal: 20},
+		{Name: "typanalyze", Type: Type{Name: "regproc"}, Ordinal: 21},
+		{Name: "typalign", Type: Type{Name: "char"}, Ordinal: 22},
+		{Name: "typstorage", Type: Type{Name: "char"}, Ordinal: 23},
+		{Name: "typnotnull", Type: Type{Name: "bool"}, Ordinal: 24},
+		{Name: "typbasetype", Type: Type{Name: "oid"}, Ordinal: 25},
+		{Name: "typtypmod", Type: Type{Name: "int4"}, Ordinal: 26},
+		{Name: "typndims", Type: Type{Name: "int4"}, Ordinal: 27},
+		{Name: "typcollation", Type: Type{Name: "oid"}, Ordinal: 28},
+		{Name: "typdefaultbin", Type: Type{Name: "pg_node_tree"}, Ordinal: 29},
+		{Name: "typdefault", Type: Type{Name: "text"}, Ordinal: 30},
+		{Name: "typacl", Type: Type{Name: "aclitem[]"}, Ordinal: 31},
 	}
 }
 

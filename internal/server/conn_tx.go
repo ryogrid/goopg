@@ -76,6 +76,21 @@ type connTxState struct {
 	// (for lastval()). Session-scoped. M0097-0042.
 	SeqLastVal int64
 	SeqLastSet bool
+	// PendingEnumValues tracks enum labels added via ALTER TYPE … ADD VALUE
+	// inside the current explicit transaction.  They are "unsafe" until COMMIT.
+	// map[enumTypeName][label]=true.  Cleared on COMMIT/ROLLBACK (End()).
+	PendingEnumValues map[string]map[string]bool
+	// PendingEnumRenames tracks ALTER TYPE … RENAME TO within the current tx.
+	// On ROLLBACK, reversed in reverse order.  Cleared on COMMIT/ROLLBACK. M0097-0022.
+	PendingEnumRenames []executor.EnumRenameEntry
+	// PendingCreatedEnums tracks CREATE TYPE … AS ENUM within the current tx.
+	// On ROLLBACK, created types are dropped.  map[name(lowercase)]=true.  M0097-0022.
+	PendingCreatedEnums map[string]bool
+	// NonSuperuserRole is set when SET SESSION AUTHORIZATION is called with a
+	// non-default role name. While non-empty, privilege checks that require
+	// superuser (e.g. LEAKPROOF function attribute) are rejected. Cleared by
+	// RESET SESSION AUTHORIZATION or SET SESSION AUTHORIZATION DEFAULT/postgres.
+	NonSuperuserRole string
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr
@@ -86,6 +101,14 @@ type connTxState struct {
 func (c *connTxState) Fail() {
 	c.mu.Lock()
 	c.failed = true
+	c.mu.Unlock()
+}
+
+// ClearFailed clears the failed transaction state.  Used after ROLLBACK TO
+// SAVEPOINT restores the transaction to a pre-error state.
+func (c *connTxState) ClearFailed() {
+	c.mu.Lock()
+	c.failed = false
 	c.mu.Unlock()
 }
 
@@ -154,6 +177,9 @@ func (c *connTxState) End() {
 	c.active = false
 	c.failed = false
 	c.tx = mvcc.Transaction{}
+	c.PendingEnumValues = nil
+	c.PendingEnumRenames = nil
+	c.PendingCreatedEnums = nil
 	c.mu.Unlock()
 }
 

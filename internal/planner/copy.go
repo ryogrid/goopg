@@ -66,6 +66,15 @@ func planCopy(s *parser.CopyStmt, cat catalog.Catalog) (Node, error) {
 		}
 		schema := returningSchemaOf(inner)
 		if schema == nil {
+			// If the target table has rules registered, return a rule-specific
+			// error matching PostgreSQL's DoCopy rule checks. M0097-0140.
+			if msg := copyDMLRuleError(s.QueryDML, cat); msg != "" {
+				return nil, &PlanError{
+					Pos:     s.Pos(),
+					Code:    "0A000",
+					Message: msg,
+				}
+			}
 			return nil, &PlanError{
 				Pos:     s.Pos(),
 				Code:    "0A000",
@@ -190,6 +199,44 @@ func returningSchemaOf(n Node) Schema {
 		return d.ReturningSchema
 	}
 	return nil
+}
+
+// copyDMLRuleError checks whether the DML statement's target table has any
+// registered rule and returns the appropriate rule-specific COPY error message.
+// Returns "" when no rule is registered, in which case the generic "must have
+// a RETURNING clause" error applies. M0097-0140.
+func copyDMLRuleError(dml parser.Stmt, cat catalog.Catalog) string {
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		return ""
+	}
+	// Extract target table name from INSERT/UPDATE/DELETE.
+	var tableName string
+	switch s := dml.(type) {
+	case *parser.InsertStmt:
+		tableName = s.Target.Name
+	case *parser.UpdateStmt:
+		tableName = s.Target.Name
+	case *parser.DeleteStmt:
+		tableName = s.Target.Name
+	}
+	if tableName == "" {
+		return ""
+	}
+	kind := im.TableRuleKind(tableName)
+	switch kind {
+	case "DO ALSO":
+		return "DO ALSO rules are not supported for COPY"
+	case "DO INSTEAD NOTHING":
+		return "DO INSTEAD NOTHING rules are not supported for COPY"
+	case "conditional DO INSTEAD":
+		return "conditional DO INSTEAD rules are not supported for COPY"
+	case "multi-statement DO INSTEAD":
+		return "multi-statement DO INSTEAD rules are not supported for COPY"
+	case "utility":
+		return "COPY query must not be a utility command"
+	}
+	return ""
 }
 
 func toPlannerEndpoint(e parser.CopyEndpoint) CopyEndpoint {

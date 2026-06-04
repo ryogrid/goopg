@@ -107,9 +107,17 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// database in pg_database / can connect to it, and (b) emit a
 		// WAL record so the registration survives a crash. Other
 		// commands fall through to the wire-protocol no-op tag handler.
-		if handled, herr := s.tryHandleDatabaseDDL(sql); handled {
+		if handled, notice, herr := s.tryHandleDatabaseDDL(sql); handled {
 			if herr != nil {
 				return s.writeQueryError(w, sqlstate.SystemError, herr.Error())
+			}
+			if notice != "" {
+				_ = w.WriteNoticeResponse([]protocol.ErrorField{
+					{Code: protocol.FieldSeverity, Value: "NOTICE"},
+					{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
+					{Code: protocol.FieldSQLState, Value: "00000"},
+					{Code: protocol.FieldMessage, Value: notice},
+				})
 			}
 			tag := databaseDDLCommandTag(sql)
 			if err := w.WriteCommandComplete(tag); err != nil {
@@ -225,6 +233,16 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Share the per-connection TEMP TABLE shadow map so it persists
 		// across statements in the same connection. M0097-0003.
 		ectx.TempTableShadows = connTx.TempTableShadows
+		ectx.PendingEnumValues = connTx.PendingEnumValues
+		ectx.PendingEnumRenames = connTx.PendingEnumRenames
+		ectx.PendingCreatedEnums = connTx.PendingCreatedEnums
+		// Wire session-authorization role tracking so LEAKPROOF privilege checks
+		// work after SET SESSION AUTHORIZATION regress_unpriv_user.
+		ectx.NonSuperuserRole = connTx.NonSuperuserRole
+		ectx.SetSessionAuthorization = func(role string) {
+			connTx.NonSuperuserRole = role
+			ectx.NonSuperuserRole = role
+		}
 		// Wire per-connection sequence session state (currval/lastval) so
 		// values persist across statements within the same connection. M0097-0042.
 		if connTx.SeqCurrVals != nil {
@@ -333,13 +351,19 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		if connTx != nil && connTx.IsFailed() {
 			_, isCommit := stmt.(*parser.CommitStmt)
 			_, isRollback := stmt.(*parser.RollbackStmt)
-			if !isCommit && !isRollback {
+			_, isRollbackTo := stmt.(*parser.RollbackToSavepointStmt)
+			if !isCommit && !isRollback && !isRollbackTo {
 				return s.writeQueryError(w, "25P02",
 					"current transaction is aborted, commands ignored until end of transaction block")
 			}
 			// COMMIT/ROLLBACK clears the failed state — handled below in
 			// executeOneSimpleStmt → TxCommit/TxRollback path, which calls
 			// connTx.End() (resetting failed=false). Fall through.
+			// ROLLBACK TO SAVEPOINT clears the failed state so subsequent
+			// statements within the same transaction can proceed.
+			if isRollbackTo {
+				connTx.ClearFailed()
+			}
 		}
 
 		// EXPLAIN EXECUTE <name> (M0100-0005h): the planner wraps an
@@ -638,6 +662,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Write back the temp-table shadow map so it persists across statements. M0097-0003.
 		if connTx != nil && ectx.TempTableShadows != nil {
 			connTx.TempTableShadows = ectx.TempTableShadows
+		}
+		// Write back pending enum values/renames/creates (including nil after COMMIT/ROLLBACK).
+		if connTx != nil {
+			connTx.PendingEnumValues = ectx.PendingEnumValues
+			connTx.PendingEnumRenames = ectx.PendingEnumRenames
+			connTx.PendingCreatedEnums = ectx.PendingCreatedEnums
 		}
 	}
 	// Update pg_stat_activity to idle after successful execution.
@@ -1192,6 +1222,42 @@ func coerceExecParam(d executor.Datum, targetType string) executor.Datum {
 //
 // connTx, if non-nil, tracks the per-connection explicit transaction
 // state so BEGIN/COMMIT/ROLLBACK can open/close real TxnMgr transactions.
+// undoEnumDDLForRollback reverses enum DDL (ADD VALUE, RENAME TO, CREATE TYPE AS ENUM)
+// recorded in connTx.  Must be called before connTx.End() on ROLLBACK paths.  M0097-0022.
+func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
+	if connTx == nil {
+		return
+	}
+	inm, ok := cat.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	// Step 1: Remove enum values added via ALTER TYPE … ADD VALUE in this tx.
+	// Do before undo-renames so type names are still at current (renamed) values.
+	for typeName, labels := range connTx.PendingEnumValues {
+		for label := range labels {
+			inm.RemoveEnumValue(typeName, label)
+		}
+	}
+	// Step 2: Undo renames in reverse order; track name changes in created-set.
+	created := make(map[string]bool, len(connTx.PendingCreatedEnums))
+	for k, v := range connTx.PendingCreatedEnums {
+		created[k] = v
+	}
+	for i := len(connTx.PendingEnumRenames) - 1; i >= 0; i-- {
+		r := connTx.PendingEnumRenames[i]
+		_ = inm.RenameEnum(r.NewName, r.OldName)
+		if created[r.NewName] {
+			delete(created, r.NewName)
+			created[r.OldName] = true
+		}
+	}
+	// Step 3: Drop types created in this transaction (now at original names).
+	for name := range created {
+		_ = inm.DropEnum(name, false)
+	}
+}
+
 // autoCommitPtr, if non-nil, is set to false when a BEGIN starts an
 // explicit transaction (telling the caller not to auto-commit).
 // cachedNode, when non-nil, is a pre-validated plan from the cross-session
@@ -1266,8 +1332,20 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				// a WARNING and ROLLBACK instead of committing. M0100-0005.
 				if connTx.IsFailed() {
 					// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
+					// Restore routines dropped in this transaction.
+					if sess := connTx.Session(); sess != nil {
+						if rs := s.cfg.Catalog.Routines(); rs != nil {
+							for _, r := range sess.TakePendingRoutineDrops() {
+								_, _ = rs.Create(r, true)
+							}
+						}
+					}
 					_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
+					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
+					ctx.PendingEnumValues = nil
+					ctx.PendingEnumRenames = nil
+					ctx.PendingCreatedEnums = nil
 					return w.WriteCommandComplete("ROLLBACK")
 				}
 				explicitTx := connTx.Tx()
@@ -1281,17 +1359,40 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				// detected. Returns nil for RC/RR / write-less SERIALIZABLE.
 				if explicitTx.Isolation == mvcc.IsolationSerializable && explicitTx.Handle != 0 {
 					if ssiErr := s.cfg.TxnMgr.PreCommitCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
+						// SSI failure: rollback and restore dropped routines.
+						if sess := connTx.Session(); sess != nil {
+							if rs := s.cfg.Catalog.Routines(); rs != nil {
+								for _, r := range sess.TakePendingRoutineDrops() {
+									_, _ = rs.Create(r, true)
+								}
+							}
+						}
 						_ = s.cfg.TxnMgr.Rollback(explicitTx)
+						undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 						connTx.End()
+						ctx.PendingEnumValues = nil
+						ctx.PendingEnumRenames = nil
+						ctx.PendingCreatedEnums = nil
 						return s.writeQueryError(w, "40001",
 							"could not serialize access due to read/write dependencies among transactions: "+ssiErr.Error())
 					}
 				}
 				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
+					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
+					ctx.PendingEnumValues = nil
+					ctx.PendingEnumRenames = nil
+					ctx.PendingCreatedEnums = nil
 					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 				}
+				// Clear pending routine drops — committed, no restoration needed.
+				if sess := connTx.Session(); sess != nil {
+					sess.TakePendingRoutineDrops()
+				}
 				connTx.End()
+				ctx.PendingEnumValues = nil
+				ctx.PendingEnumRenames = nil
+				ctx.PendingCreatedEnums = nil
 				maybeForceGCAfterCommit()
 				// Leave *autoCommitPtr = false so the caller does NOT attempt
 				// a second TxnMgr.Commit on the already-committed transaction.
@@ -1307,8 +1408,20 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		case planner.TxRollback:
 			if connTx != nil && connTx.InExplicit() {
+				// Restore any routines dropped in this transaction before rolling back.
+				if sess := connTx.Session(); sess != nil {
+					if rs := s.cfg.Catalog.Routines(); rs != nil {
+						for _, r := range sess.TakePendingRoutineDrops() {
+							_, _ = rs.Create(r, true)
+						}
+					}
+				}
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
+				undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 				connTx.End()
+				ctx.PendingEnumValues = nil
+				ctx.PendingEnumRenames = nil
+				ctx.PendingCreatedEnums = nil
 				// Leave *autoCommitPtr = false to avoid a second rollback attempt.
 			} else {
 				// ROLLBACK outside an explicit transaction: emit warning.
@@ -1389,7 +1502,12 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				if i < len(schema) {
 					sc := schema[i]
 					switch strings.ToLower(sc.Type.Name) {
-					case "float8", "double precision", "double", "float4", "real":
+					case "float4", "real":
+						// float4/real uses float32 precision (~7 significant digits).
+						// Use strconv bit=32 so the shortest float32 round-trip representation
+						// is produced (e.g. 4.56789e+15 not 4.567889919082496e+15). M0097-0022.
+						valueBuf = appendFloatText(valueBuf, d, 32)
+					case "float8", "double precision", "double":
 						// float8/float4 values must display in PostgreSQL's output format:
 						// scientific notation for very large/small values, shortest decimal
 						// for normal ones. Convert KindNumeric to float64 and use %g. M0097-0003.
@@ -1618,6 +1736,54 @@ func rowsAffected(op executor.Operator) int64 {
 
 // appendFloat8Text formats a datum for wire output as a float8/float4 value.
 // Uses strconv.FormatFloat so large/small values display in scientific notation
+// appendFloatText formats a datum for wire output using the specified bitSize (32 or 64).
+// bitSize=32 gives float32 precision (shortest round-trip via float32), bitSize=64 gives float8.
+func appendFloatText(dst []byte, d executor.Datum, bitSize int) []byte {
+	if d.IsNull() {
+		return dst
+	}
+	var f float64
+	switch d.Kind {
+	case executor.KindInt:
+		if bitSize == 32 {
+			f = float64(float32(d.Int))
+		} else {
+			f = float64(d.Int)
+		}
+	case executor.KindString:
+		s := d.StringValue()
+		if parsed, err := strconv.ParseFloat(s, bitSize); err == nil {
+			f = parsed
+		} else {
+			return append(dst, s...)
+		}
+	default:
+		s := d.Format()
+		if parsed, err := strconv.ParseFloat(s, bitSize); err == nil {
+			f = parsed
+		} else {
+			return append(dst, s...)
+		}
+	}
+	if math.IsInf(f, 1) {
+		return append(dst, "Infinity"...)
+	}
+	if math.IsInf(f, -1) {
+		return append(dst, "-Infinity"...)
+	}
+	if math.IsNaN(f) {
+		return append(dst, "NaN"...)
+	}
+	s := strconv.FormatFloat(f, 'g', -1, bitSize)
+	if idx := strings.IndexByte(s, 'e'); idx >= 0 {
+		exp, err := strconv.Atoi(s[idx+1:])
+		if err == nil && exp >= 1 && exp <= 14 {
+			s = strconv.FormatFloat(f, 'f', -1, bitSize)
+		}
+	}
+	return append(dst, s...)
+}
+
 // (e.g. 1.2345678901234e+200) matching PostgreSQL's float8out behavior. M0097-0003.
 func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 	if d.IsNull() {
@@ -1655,10 +1821,18 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 	if math.IsNaN(f) {
 		return append(dst, "NaN"...)
 	}
-	// PostgreSQL's float8out uses %.15g (DBL_DIG = 15 significant digits).
-	// This handles: scientific notation for large/tiny values, decimal for normal,
-	// negative zero ("-0"), and avoids spurious scientific notation for integers.
-	return strconv.AppendFloat(dst, f, 'g', 15, 64)
+	// PostgreSQL's float8out uses the shortest round-trip representation.
+	// Go's 'g',-1 uses scientific notation for exponents >= 1, but PostgreSQL
+	// uses decimal for exponents in [1,14] (equivalent to %.15g). Convert back
+	// to decimal in that range to match PostgreSQL's formatting.
+	s := strconv.FormatFloat(f, 'g', -1, 64)
+	if idx := strings.IndexByte(s, 'e'); idx >= 0 {
+		exp, err := strconv.Atoi(s[idx+1:])
+		if err == nil && exp >= 1 && exp <= 14 {
+			s = strconv.FormatFloat(f, 'f', -1, 64)
+		}
+	}
+	return append(dst, s...)
 }
 
 // appendTimeText formats a KindTime datum as a time-of-day string matching PostgreSQL's
