@@ -2689,6 +2689,22 @@ M0097-0001 wires it up.
         `matview`.
       - Mapped to completed M0097-0013.
       - DoD: same as M0097-0020.
+      - **Progress 2026-06-04 (matview CASCADE fix — 148→131 diffs):**
+        ROOT CAUSE: `DROP TABLE/VIEW CASCADE` did not cascade to dependent
+        materialized views, causing subsequent `CREATE MATERIALIZED VIEW`
+        for the same name to fail with "relation already exists", leaving
+        stale schemas and triggering `EncodeRowPG: 2 cols vs 3 datums` crashes.
+        Fix: added `AllUserMatViews()` catalog method; added `matViewsDependingOnRelation()`
+        helper; added `execDropOneMatView()` with transitive CASCADE support;
+        `DROP TABLE CASCADE` now drops dependent matviews with proper
+        "drop cascades to materialized view X" notices; `DROP VIEW CASCADE`
+        now cascades to dependent matviews; `DROP MATERIALIZED VIEW CASCADE`
+        uses the new transitive drop logic. EncodeRowPG crash eliminated.
+        matview regress diff: 148 → 131 changed lines.
+        Remaining: schema-qualified cascade chain (matview_schema.*),
+        transitive cross-schema deps, column alias issues (x vs i),
+        CONCURRENTLY WITH NO DATA error, "cannot lock rows in matview".
+        Commit: 948bfa76.
 
 - [ ] **M0097-0026 — Port constraint / FK / trigger / inheritance regress tests**
       - Summary: Make these 5 tests reach `pass`:
