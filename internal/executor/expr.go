@@ -4610,6 +4610,16 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 	}
 	ctx.OuterRows = append(ctx.OuterRows, row)
 	defer func() { ctx.OuterRows = ctx.OuterRows[:len(ctx.OuterRows)-1] }()
+
+	// Fast path: correlated subquery using a pre-opened cached operator.
+	// Skip SubqueryCache entirely — the operator already rescans correctly
+	// for each outer row, so the key-build + map overhead is unnecessary.
+	if !x.IsNonCorrelated && ctx.CorrSubqOps != nil {
+		if _, inCache := ctx.CorrSubqOps[x]; inCache || planIsIndexScanBased(x.Plan) {
+			return subqueryImpl(x, ctx)
+		}
+	}
+
 	// Check cache for scalar subquery results. For non-correlated
 	// subqueries (M0058-0001), use a constant cache key.
 	cacheKey := subqueryCacheKey(row)
@@ -4642,6 +4652,69 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 }
 
 func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
+	// Correlated scalar subqueries inside aggregates are called once per outer
+	// row. Avoid O(N²) execution via two optimization paths:
+	//
+	// 1. IndexScan path: the inner plan uses a btree index (OuterColumnRef key).
+	//    Cache the pre-opened operator and rescan cheaply per outer row.
+	//    Requires: planIsIndexScanBased(x.Plan).
+	//
+	// 2. Hash map path: inner plan is Project(Filter(SeqScan, col=OuterColumnRef)).
+	//    Scan the inner table ONCE (O(N)) to build key→value map, then do
+	//    O(1) lookups. Works even when no btree index exists.
+	if !x.IsNonCorrelated {
+		// Path 1: IndexScan-based (btree index exists).
+		if planIsIndexScanBased(x.Plan) {
+			if ctx.CorrSubqOps == nil {
+				ctx.CorrSubqOps = make(map[*planner.SubqueryExpr]Operator)
+			}
+			op, found := ctx.CorrSubqOps[x]
+			if !found {
+				var buildErr error
+				op, buildErr = Build(x.Plan)
+				if buildErr != nil {
+					return Datum{}, buildErr
+				}
+				ctx.CorrSubqOps[x] = op
+			}
+			if err := op.Open(ctx); err != nil {
+				delete(ctx.CorrSubqOps, x)
+				_ = op.Close()
+				return Datum{}, err
+			}
+			return subqueryReadOne(op, x)
+		}
+
+		// Path 2: Hash map for Project(Filter(SeqScan, col = OuterColumnRef)).
+		if info, ok := extractCorrSubqHashInfo(x.Plan); ok {
+			if ctx.CorrSubqHashMaps == nil {
+				ctx.CorrSubqHashMaps = make(map[*planner.SubqueryExpr]map[string]Datum)
+			}
+			hm, built := ctx.CorrSubqHashMaps[x]
+			if !built {
+				var hmErr error
+				hm, hmErr = buildCorrSubqHashMap(info, ctx)
+				if hmErr != nil {
+					return Datum{}, hmErr
+				}
+				ctx.CorrSubqHashMaps[x] = hm
+			}
+			// Look up the outer column value.
+			outerVal, err := evalExprSlot(info.outerRef, nil, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if outerVal.IsNull() {
+				return NullDatum, nil
+			}
+			result, found := hm[datumKey(outerVal)]
+			if !found {
+				return NullDatum, nil
+			}
+			return result, nil
+		}
+	}
+
 	op, err := Build(x.Plan)
 	if err != nil {
 		return Datum{}, err
@@ -4651,6 +4724,131 @@ func subqueryImpl(x *planner.SubqueryExpr, ctx *Context) (Datum, error) {
 		return Datum{}, err
 	}
 	defer func() { _ = op.Close() }()
+	return subqueryReadOne(op, x)
+}
+
+// planIsIndexScanBased returns true when n is a plan whose operators safely
+// support repeated Open() calls without an intervening Close(). Currently
+// true for IndexScan and Project(IndexScan) — the two shapes produced by
+// the correlated-subquery OuterColumnRef → IndexScan rewrite.
+func planIsIndexScanBased(n planner.Node) bool {
+	switch x := n.(type) {
+	case *planner.IndexScan:
+		return true
+	case *planner.Project:
+		return planIsIndexScanBased(x.Child)
+	case *planner.Aggregate:
+		// aggregateOp.Open resets o.idx and rebuilds o.rows each time, and its
+		// child is reopened via the child.Open call. Safe as long as the child
+		// (IndexScan) is safe.
+		return planIsIndexScanBased(x.Child)
+	}
+	return false
+}
+
+// corrSubqHashInfo holds the components extracted from a hash-joinable
+// correlated scalar subquery plan: Project(Filter(SeqScan, col = OuterColumnRef)).
+type corrSubqHashInfo struct {
+	scan      *planner.SeqScan // inner table to scan
+	scanColIdx int              // index of the join key column in SeqScan output
+	outerRef  *planner.OuterColumnRef // outer column reference for join key lookup
+	projExpr  planner.Expr            // project expression to evaluate for result
+}
+
+// extractCorrSubqHashInfo detects the pattern
+// Project(Filter(SeqScan, ColumnRef{col} = OuterColumnRef)) — or the aggregate
+// wrapper Aggregate(same) — and returns the components needed to build a hash
+// map for O(N) build + O(1) lookup per outer row.
+func extractCorrSubqHashInfo(n planner.Node) (corrSubqHashInfo, bool) {
+	var projectTarget planner.Expr
+	switch x := n.(type) {
+	case *planner.Project:
+		if len(x.Targets) != 1 {
+			return corrSubqHashInfo{}, false
+		}
+		projectTarget = x.Targets[0]
+		n = x.Child
+	default:
+		return corrSubqHashInfo{}, false
+	}
+	// n should now be Filter(SeqScan) or SeqScan.
+	var filterPred planner.Expr
+	switch x := n.(type) {
+	case *planner.Filter:
+		filterPred = x.Predicate
+		n = x.Child
+	default:
+		return corrSubqHashInfo{}, false
+	}
+	scan, ok := n.(*planner.SeqScan)
+	if !ok {
+		return corrSubqHashInfo{}, false
+	}
+	// Filter predicate must be: ColumnRef = OuterColumnRef (or reversed).
+	bop, ok := filterPred.(*planner.BinaryOp)
+	if !ok || bop.Op != parser.OpEq {
+		return corrSubqHashInfo{}, false
+	}
+	var innerCol *planner.ColumnRef
+	var outerRef *planner.OuterColumnRef
+	if c, ok2 := bop.Left.(*planner.ColumnRef); ok2 {
+		if o, ok3 := bop.Right.(*planner.OuterColumnRef); ok3 {
+			innerCol, outerRef = c, o
+		}
+	} else if c, ok2 := bop.Right.(*planner.ColumnRef); ok2 {
+		if o, ok3 := bop.Left.(*planner.OuterColumnRef); ok3 {
+			innerCol, outerRef = c, o
+		}
+	}
+	if innerCol == nil || outerRef == nil {
+		return corrSubqHashInfo{}, false
+	}
+	return corrSubqHashInfo{
+		scan:       scan,
+		scanColIdx: innerCol.Index,
+		outerRef:   outerRef,
+		projExpr:   projectTarget,
+	}, true
+}
+
+// buildCorrSubqHashMap scans the inner SeqScan once and builds
+// key → value map where key = datumKey(scan[joinColIdx]) and value = eval(projExpr).
+func buildCorrSubqHashMap(info corrSubqHashInfo, ctx *Context) (map[string]Datum, error) {
+	scanOp, err := Build(info.scan)
+	if err != nil {
+		return nil, err
+	}
+	if err := scanOp.Open(ctx); err != nil {
+		_ = scanOp.Close()
+		return nil, err
+	}
+	defer func() { _ = scanOp.Close() }()
+	result := make(map[string]Datum)
+	for {
+		slot, nerr := scanOp.Next()
+		if nerr == EOF {
+			break
+		}
+		if nerr != nil {
+			return nil, nerr
+		}
+		row := slotRow(slot)
+		if info.scanColIdx >= len(row) {
+			continue
+		}
+		keyDatum := row[info.scanColIdx]
+		valDatum, verr := evalExprSlot(info.projExpr, slot, ctx)
+		if verr != nil {
+			return nil, verr
+		}
+		result[datumKey(keyDatum)] = valDatum
+	}
+	return result, nil
+}
+
+// subqueryReadOne reads exactly one row from op (the scalar subquery result).
+// Returns NullDatum on EOF, error on cardinality violation or scan error.
+func subqueryReadOne(op Operator, x *planner.SubqueryExpr) (Datum, error) {
 	slot, err := op.Next()
 	if err == EOF {
 		return NullDatum, nil

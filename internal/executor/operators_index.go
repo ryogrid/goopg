@@ -167,7 +167,19 @@ func (o *indexScanOp) Schema() planner.Schema { return o.plan.Output() }
 // single-table-IndexScan path). Parent operators that drive multiple
 // probes (M0054-0006 NestedLoopIndexJoin) instead call Open and
 // then `Rescan(outerRow)` per outer row.
+//
+// When o.ctx is already set (operator reused for a correlated scalar
+// subquery across multiple outer rows), Open skips openPrep — the lock
+// and btree handle are still valid — and just rescans with the new
+// outer context. This avoids repeated lock-acquire + btree.Open
+// overhead in the subqueryImpl correlated-operator cache path.
 func (o *indexScanOp) Open(ctx *Context) error {
+	if o.ctx != nil {
+		// Reopen: lock already held, btree handle still valid.
+		// Update context (new ctx.OuterRows from evalSubquery) and rescan.
+		o.ctx = ctx
+		return o.Rescan(nil, 0)
+	}
 	if err := o.openPrep(ctx); err != nil {
 		return err
 	}

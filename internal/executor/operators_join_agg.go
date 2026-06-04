@@ -1012,6 +1012,7 @@ func newAggregateOp(plan *planner.Aggregate, child Operator) *aggregateOp {
 
 func (o *aggregateOp) Open(ctx *Context) error {
 	o.ctx = ctx
+	o.idx = 0 // reset read cursor — o.rows is rebuilt below, so always start at 0
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}

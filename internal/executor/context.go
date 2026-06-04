@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
 )
@@ -85,6 +86,22 @@ type Context struct {
 	// would namespace by InExpr/SubqueryExpr identity.
 	SubqueryCache      map[string][]Datum
 	SubqueryCacheScope int // OuterRows len when cached; cleared on change
+
+	// CorrSubqOps caches pre-built, pre-opened operators for correlated
+	// scalar subqueries so the same plan can be rescanned for each outer
+	// row without repeated Build+openPrep (lock acquire + btree.Open)
+	// overhead. Populated by subqueryImpl; indexScanOp.Open detects the
+	// reuse and skips openPrep on subsequent calls. Operators are not
+	// explicitly closed (locks released at commit; GC handles memory).
+	CorrSubqOps map[*planner.SubqueryExpr]Operator
+
+	// CorrSubqHashMaps caches hash maps built for correlated scalar subqueries
+	// matching Project(Filter(SeqScan, inner_col = OuterColumnRef)). The hash
+	// map is built once by scanning the entire inner table (O(N)) and provides
+	// O(1) lookups per outer row, avoiding O(N²) correlated SeqScan patterns
+	// even when no btree index exists. Keys are datumKey(inner_col_value);
+	// values are the projected result datum.
+	CorrSubqHashMaps map[*planner.SubqueryExpr]map[string]Datum
 
 	// MultiAssignSubqCache caches the result row of a MultiAssignSubqRow
 	// evaluation (tuple SET subquery). Keyed by *planner.MultiAssignSubqRow
