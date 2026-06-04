@@ -111,7 +111,7 @@ WAL,Generic WAL,GenericXLogStart / RegisterBuffer / Finish (for extensions),gene
 WAL,Generic WAL,GENERIC_XLOG_FULL_IMAGE flag (full page vs delta),generic-wal.md,,
 WAL,Custom WAL RMGR,RmgrData struct: rm_redo/rm_desc/rm_identify/rm_startup/rm_cleanup/rm_mask/rm_decode,custom-rmgr.md,,
 WAL,Custom WAL RMGR,RegisterCustomRmgr(rmid / &rmgr) from _PG_init,custom-rmgr.md,,
-MVCC / Transactions,Transaction Model,Transaction IDs (XID, 32-bit, wraparound),transaction-id.md,,
+MVCC / Transactions,Transaction Model,Transaction IDs (XID / 32-bit / wraparound),transaction-id.md,,
 MVCC / Transactions,Transaction Model,Snapshot: xmin/xmax/xip_list,catalogs-overview.md,,
 MVCC / Transactions,Transaction Model,Command IDs (CID) for statement visibility,storage-page-layout.md,,
 MVCC / Transactions,Isolation Levels,Read Committed (statement-level snapshot),transaction-iso.md,,
