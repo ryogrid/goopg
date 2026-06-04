@@ -1247,6 +1247,9 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "reltablespace", Type: Type{Name: "oid"}, Ordinal: 18},
 			{Name: "reloftype", Type: Type{Name: "oid"}, Ordinal: 19},
 			{Name: "reloptions", Type: Type{Name: "text[]"}, Ordinal: 20},
+			// relam: access method OID. 2=heap for tables, method OID for indexes.
+			// Required by psql \d+ and pg_class.relam joins with pg_am. M0097-0023.
+			{Name: "relam", Type: Type{Name: "oid"}, Ordinal: 21},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -1315,7 +1318,8 @@ func (c *InMemory) registerSystemTables() {
 				isPartition,                  // relispartition
 				"0",                          // reltablespace
 				"0",                          // reloftype
-				// reloptions omitted → NULL via NullConst fallback in rematerialiseVirtualRowsFromStrings
+				"",                           // reloptions: empty (NULL via TypedVirtualCell empty-string fallback)
+				"2",                          // relam: heap access method OID (OID 2)
 			})
 		}
 		// Emit index rows (relkind='i') so pg_class can be used to count indexes.
@@ -1336,6 +1340,11 @@ func (c *InMemory) registerSystemTables() {
 				if oid := c.schemas[strings.ToLower(schema)]; oid != 0 {
 					idxNsOID = oid
 				}
+			}
+			// Determine relam for index: btree=403, hash=405, gist=783, gin=2742, spgist=4000, brin=3580.
+			idxRelam := "403" // default btree
+			if idx.Method == "hash" {
+				idxRelam = "405"
 			}
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),   // oid
@@ -1359,6 +1368,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",                          // reltablespace
 				"0",                          // reloftype
 				"",                           // reloptions: NULL
+				idxRelam,                     // relam: index access method OID
 			})
 		}
 		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
@@ -1374,7 +1384,7 @@ func (c *InMemory) registerSystemTables() {
 			"0",        // reltoastrelid
 			"0",        // relpages
 			"t",        // relispopulated
-			"20",       // relnatts: 20 columns defined above
+			"22",       // relnatts: 22 columns (including relam added M0097-0023)
 			"n",        // relreplident
 			"0",        // relchecks
 			"t",        // relhasindex (pg_class itself has indexes)
@@ -1386,7 +1396,8 @@ func (c *InMemory) registerSystemTables() {
 			"f",        // relispartition
 			"0",        // reltablespace
 			"0",        // reloftype
-			// reloptions omitted → NULL
+			"",         // reloptions: NULL
+			"2",        // relam: heap access method OID
 		})
 		return out
 	}
@@ -2038,6 +2049,23 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgStatIO.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_stat_io"] = pgStatIO
+
+	// pg_description — stores COMMENT ON object descriptions (OID 2609).
+	// COMMENT ON is parsed as a no-op in goopg v0; this stub allows queries
+	// against pg_description to succeed (returning 0 rows) instead of erroring
+	// with "relation pg_description does not exist". M0097-0023.
+	pgDescription := &Table{
+		Schema: "pg_catalog", Name: "pg_description", Virtual: true,
+		Columns: []Column{
+			{Name: "objoid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "objsubid", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "description", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID: 2609,
+	}
+	pgDescription.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_description"] = pgDescription
 
 	// pg_wait_events — needs at least one row per type.
 	pgWaitEvents := &Table{

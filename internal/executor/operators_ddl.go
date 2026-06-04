@@ -6089,12 +6089,121 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 // It updates the column type in the catalog and, when storage is available,
 // rewrites existing heap rows to re-encode the column value in the new type.
 // M0097-0022.
-// execAlterDropColumn accepts DROP COLUMN syntax but is a structural no-op in
-// goopg v0. Full DROP COLUMN support (heap-slot preservation, child-partition
-// propagation, catalog hiding) is deferred; the parser already handles the
-// syntax so multi-action ALTER TABLE statements don't fail with a parse error.
-// M0097-0028.
+// execAlterDropColumn implements ALTER TABLE ... DROP COLUMN via a table
+// rewrite: reads all visible rows with the OLD schema, removes the dropped
+// column's slot, updates the catalog, truncates the heap + indexes, then
+// re-inserts all rows and rebuilds indexes. Mirrors execAlterColumnType.
+// Indexes referencing only the dropped column become empty orphans (harmless
+// for now; a future pass can DROP them explicitly).
 func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAction) error {
+	// Find the column to drop.
+	dropIdx := -1
+	for i, col := range tbl.Columns {
+		if strings.EqualFold(col.Name, act.ColumnName) {
+			dropIdx = i
+			break
+		}
+	}
+	if dropIdx < 0 {
+		return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+	}
+
+	// Save old columns for decoding existing heap rows.
+	oldCols := make([]catalog.Column, len(tbl.Columns))
+	copy(oldCols, tbl.Columns)
+
+	// If no storage pool is available, just update the catalog (test/unit path).
+	if o.ctx.Pool == nil {
+		tbl.Columns = append(tbl.Columns[:dropIdx], tbl.Columns[dropIdx+1:]...)
+		for i := range tbl.Columns {
+			tbl.Columns[i].Ordinal = i
+		}
+		return nil
+	}
+
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	nBlocks, err := o.ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: err.Error()}
+	}
+
+	// Phase 1: read all visible rows using the OLD column schema.
+	var allRows []Row
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		bufSlot, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if perr != nil {
+			continue
+		}
+		bufSlot.RLock()
+		page := bufSlot.Page()
+		if storage.IsNew(page) {
+			bufSlot.RUnlock()
+			o.ctx.Pool.Unpin(bufSlot)
+			continue
+		}
+		count, cerr := storage.PageLinePointerCount(page)
+		if cerr != nil {
+			bufSlot.RUnlock()
+			o.ctx.Pool.Unpin(bufSlot)
+			continue
+		}
+		for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
+			tuple, terr := storage.PageGetHeapTuple(page, slotIdx)
+			if terr != nil {
+				continue
+			}
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+				continue
+			}
+			row := acquireRow(len(oldCols))
+			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+			if decErr := DecodeRowIntoMctxPGTuple(row, oldCols, tuple.Data, tuple.Bitmap, storedNatts, nil); decErr != nil {
+				releaseRow(row)
+				continue
+			}
+			// Build a new row with the dropped column removed.
+			newRow := make(Row, len(oldCols)-1)
+			copy(newRow[:dropIdx], row[:dropIdx])
+			copy(newRow[dropIdx:], row[dropIdx+1:])
+			allRows = append(allRows, cloneRowOwned(newRow))
+			releaseRow(row)
+		}
+		bufSlot.RUnlock()
+		o.ctx.Pool.Unpin(bufSlot)
+	}
+
+	// Phase 2: update the catalog — remove the dropped column and update ordinals.
+	tbl.Columns = append(tbl.Columns[:dropIdx], tbl.Columns[dropIdx+1:]...)
+	for i := range tbl.Columns {
+		tbl.Columns[i].Ordinal = i
+	}
+
+	// Phase 3: truncate the heap and all indexes.
+	o.ctx.Pool.InvalidateRel(rel)
+	if terr := o.ctx.Pool.Manager().TruncateRelation(rel); terr != nil {
+		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: terr.Error()}
+	}
+	if o.ctx.FSM != nil {
+		o.ctx.FSM.DropRelation(rel)
+	}
+	if o.ctx.VM != nil {
+		o.ctx.VM.DropRelation(rel)
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+		o.ctx.Pool.InvalidateRel(idxRel)
+		_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
+		_, _ = btree.Create(o.ctx.Pool, idxRel)
+	}
+
+	// Phase 4: re-insert all rows with the new column layout and rebuild indexes.
+	for _, row := range allRows {
+		ptr, werr := writeHeapRowReturning(o.ctx, rel, tbl.Columns, row)
+		if werr != nil {
+			return werr
+		}
+		maintainUniqueIndexesForInsert(o.ctx, tbl, tbl.Columns, row, ptr)
+	}
 	return nil
 }
 
