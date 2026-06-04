@@ -1,6 +1,6 @@
 Category (Major),Sub-Category (Medium),Feature/Detail (Minor),Doc Reference,Status,Notes / Design Decision
 Wire Protocol,Message Data Types,Int16 / Int32 / String / Byte[n] (network byte order),protocol-message-types.md,,
-Wire Protocol,Startup Flow,StartupMessage (Int32 version, user, database, options, replication),protocol-message-formats.md,,
+Wire Protocol,Startup Flow,StartupMessage (Int32 version / user / database / options / replication),protocol-message-formats.md,,
 Wire Protocol,Startup Flow,SSLRequest (Int32 80877103),protocol-message-formats.md,,
 Wire Protocol,Startup Flow,GSSENCRequest (Int32 80877104),protocol-message-formats.md,,
 Wire Protocol,Startup Flow,NegotiateProtocolVersion (v),protocol-message-formats.md,,
