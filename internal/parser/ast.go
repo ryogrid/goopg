@@ -1017,6 +1017,7 @@ type CreateIndexStmt struct {
 	// most built-in operator classes have no options, so a non-empty value
 	// here causes an error at execution time. M0097-0023.
 	OpClassWithOptions string
+	HasPredicate       bool // true when a WHERE clause (partial index predicate) is present
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }
@@ -1119,11 +1120,12 @@ func (s *DropViewStmt) stmtNode() {}
 // CreateMatViewStmt — `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS
 // query [WITH NO DATA]`. M0097-0013.
 type CreateMatViewStmt struct {
-	pos         int
-	Name        ObjectName
-	Query       *SelectStmt
-	WithNoData  bool
-	IfNotExists bool
+	pos           int
+	Name          ObjectName
+	Query         *SelectStmt
+	WithNoData    bool
+	IfNotExists   bool
+	ColumnAliases []string // optional (col1, col2, ...) after the name
 }
 
 func (s *CreateMatViewStmt) Pos() int  { return s.pos }

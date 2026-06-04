@@ -44,6 +44,30 @@ func (e *PlanError) Error() string {
 // consulted for name resolution; DDL statements pass through to the
 // executor without decomposing here (catalog mutation happens at
 // execute time).
+// PlanSchemaOnly plans a SELECT statement to determine its output schema but
+// suppresses runtime evaluation errors (e.g. division by zero) from constant
+// folding. Used by CREATE MATERIALIZED VIEW WITH NO DATA where the query is
+// planned only for schema inference and will never be executed.
+func PlanSchemaOnly(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
+	if err := rewriteIndirectionStarTargets(s); err != nil {
+		return nil, err
+	}
+	if err := analyzer.Analyze(s, cat); err != nil {
+		return nil, toPlanError(err)
+	}
+	node, err := planSelect(s, cat)
+	if err != nil {
+		// For 22xxx runtime errors (division by zero etc.), planSelect returns
+		// the partially-folded plan alongside the error. The schema is still
+		// valid — use it for schema inference. The query will never execute.
+		if pe, ok := err.(*PlanError); ok && len(pe.Code) >= 2 && pe.Code[:2] == "22" && node != nil {
+			return node, nil
+		}
+		return nil, err
+	}
+	return node, nil
+}
+
 func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
@@ -1260,6 +1284,12 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// A non-nil return means a constant evaluation error (e.g. division by zero)
 	// occurred in a potentially-reachable sub-expression. M0097-0047.
 	if foldErr := foldPlanConstants(out); foldErr != nil {
+		// For 22xxx runtime errors (division by zero, etc.) return the partially-
+		// folded plan together with the error so callers that only need the schema
+		// (e.g. CREATE MATERIALIZED VIEW WITH NO DATA) can use out.Output().
+		if pe, ok := foldErr.(*PlanError); ok && len(pe.Code) >= 2 && pe.Code[:2] == "22" {
+			return out, foldErr
+		}
 		return nil, foldErr
 	}
 	// DISTINCT ON (expr [, ...]): implement ordered deduplication.

@@ -945,6 +945,22 @@ func (p *parser) parseCreateMatViewTail(pos int) (Stmt, error) {
 		return nil, err
 	}
 	stmt.Name = name
+	// Optional column aliases: name (col1, col2, ...) AS query
+	if p.acceptSymbol("(") {
+		for {
+			alias, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.ColumnAliases = append(stmt.ColumnAliases, alias.Value)
+			if p.acceptSymbol(")") {
+				break
+			}
+			if !p.acceptSymbol(",") {
+				return nil, &SyntaxError{Pos: p.cur().Pos, Message: "expected ',' or ')' in column alias list"}
+			}
+		}
+	}
 	// Skip optional USING index_method clause.
 	if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
 		_, _ = p.parseIdent()
@@ -2176,12 +2192,13 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 			_ = p.acceptIdentKeyword("distinct")
 		}
 	}
-	// Optional WHERE predicate (partial index) — parse and discard.
+	// Optional WHERE predicate (partial index) — parse and record.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhere {
 		p.advance()
 		if _, err := p.parseExpr(); err != nil {
 			return nil, err
 		}
+		stmt.HasPredicate = true
 	}
 	return stmt, nil
 }

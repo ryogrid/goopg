@@ -851,7 +851,14 @@ func NormalizeRegressOutput(raw string) string {
 			strings.HasPrefix(line, "DETAIL:") ||
 			strings.HasPrefix(line, "WARNING:") ||
 			strings.HasPrefix(line, "CONTEXT:") ||
-			strings.HasPrefix(line, "drop cascades to ") // CASCADE continuation lines
+			strings.HasPrefix(line, "drop cascades to ") || // CASCADE continuation lines
+			// "X depends on Y" — DETAIL continuation lines from DROP RESTRICT errors.
+			// psql appends these to STDERR after all STDOUT output (different position
+			// than PostgreSQL inline output), so move them to the sorted error section.
+			(strings.Contains(line, " depends on ") &&
+				(strings.HasPrefix(line, "view ") || strings.HasPrefix(line, "materialized view ") ||
+					strings.HasPrefix(line, "table ") || strings.HasPrefix(line, "index ") ||
+					strings.HasPrefix(line, "function ") || strings.HasPrefix(line, "sequence ")))
 		if isErrLine {
 			errorLines = append(errorLines, line)
 		} else {

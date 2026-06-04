@@ -1145,11 +1145,85 @@ func deriveTargetName(e parser.Expr) string {
 	return ""
 }
 
+// transitiveDep describes a single view or materialized view that will be
+// transitively dropped when its parent is dropped with CASCADE.
+type transitiveDep struct {
+	kind       string             // "view" or "materialized view"
+	name       parser.ObjectName
+	parentKind string             // "table", "view", or "materialized view"
+	parentName parser.ObjectName
+}
+
+// collectAllViewTransitiveDeps performs a BFS from startName and returns all
+// views and materialized views that transitively depend on it. startName
+// itself is NOT included in the result. The parentKind/parentName fields of
+// each entry record which immediate ancestor pulled the object in.
+func collectAllViewTransitiveDeps(im *catalog.InMemory, startName parser.ObjectName) []transitiveDep {
+	seen := map[string]bool{}
+	queue := []parser.ObjectName{startName}
+	var result []transitiveDep
+
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+
+		// Determine the kind of curr.
+		currKind := "table"
+		if tbl, ok := im.LookupTable(curr); ok {
+			if tbl.IsMatView {
+				currKind = "materialized view"
+			} else if tbl.View != nil {
+				currKind = "view"
+			}
+		}
+
+		// Views depending on curr.
+		for _, vn := range viewsDependingOnView(im, curr) {
+			k := vn.String()
+			if !seen[k] {
+				seen[k] = true
+				result = append(result, transitiveDep{kind: "view", name: vn, parentKind: currKind, parentName: curr})
+				queue = append(queue, vn)
+			}
+		}
+
+		// MatViews depending on curr.
+		for _, mvn := range matViewsDependingOnRelation(im, curr) {
+			k := mvn.String()
+			if !seen[k] {
+				seen[k] = true
+				result = append(result, transitiveDep{kind: "materialized view", name: mvn, parentKind: currKind, parentName: curr})
+				queue = append(queue, mvn)
+			}
+		}
+	}
+	return result
+}
+
 // execDropView removes a view from the catalog. No relation
 // file is involved — views are virtual.
 func (o *ddlOp) execDropView(s *parser.DropViewStmt) error {
 	dropped := make(map[string]bool)
 	for _, name := range s.Names {
+		// Before dropping, collect all transitive deps and emit ONE aggregate notice.
+		if s.Behavior == parser.DropCascade {
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				deps := collectAllViewTransitiveDeps(im, name)
+				if len(deps) == 1 {
+					d := deps[0]
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to %s %s", d.kind, d.name.String()))
+				} else if len(deps) > 1 {
+					detail := make([]string, len(deps))
+					for i, d := range deps {
+						detail[i] = fmt.Sprintf("drop cascades to %s %s", d.kind, d.name.String())
+					}
+					o.ctx.AddNoticeWithDetail(
+						fmt.Sprintf("drop cascades to %d other objects", len(deps)),
+						strings.Join(detail, "\n"),
+					)
+				}
+			}
+		}
 		if err := o.execDropOneView(name, s.IfExists, s.Behavior, s.Pos(), dropped); err != nil {
 			return err
 		}
@@ -1180,12 +1254,12 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 	dropped[key] = true
 
 	// CASCADE: drop any dependent views and matviews before dropping this one.
+	// Notices are emitted by the top-level caller (execDropView), not here.
 	if behavior == parser.DropCascade {
 		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 			deps := viewsDependingOnView(im, name)
 			for _, depName := range deps {
 				if !dropped[depName.String()] {
-					o.ctx.AddNotice(fmt.Sprintf("drop cascades to view %s", depName.String()))
 					if err := o.execDropOneView(depName, true, behavior, pos, dropped); err != nil {
 						return err
 					}
@@ -1194,7 +1268,6 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 			matDeps := matViewsDependingOnRelation(im, name)
 			for _, depName := range matDeps {
 				if !dropped[depName.String()] {
-					o.ctx.AddNotice(fmt.Sprintf("drop cascades to materialized view %s", depName.String()))
 					if err := o.execDropOneMatView(depName, true, behavior, pos, dropped); err != nil {
 						return err
 					}
@@ -1239,12 +1312,12 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 	dropped[key] = true
 
 	// CASCADE: drop any dependent matviews before dropping this one.
+	// Notices are emitted by the top-level caller, not here.
 	if behavior == parser.DropCascade {
 		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 			matDeps := matViewsDependingOnRelation(im, name)
 			for _, depName := range matDeps {
 				if !dropped[depName.String()] {
-					o.ctx.AddNotice(fmt.Sprintf("drop cascades to materialized view %s", depName.String()))
 					if err := o.execDropOneMatView(depName, true, behavior, pos, dropped); err != nil {
 						return err
 					}
@@ -1404,29 +1477,44 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 			}
 		}
 		// RESTRICT (default): if any views or matviews depend on this table, error with details.
+		// Include transitive deps (e.g. matviews that depend on a view that depends on this table).
 		if s.Behavior != parser.DropCascade {
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-				type depDesc struct {
-					desc string // e.g. "materialized view mvtest_tm depends on table mvtest_t"
+				var depDescs []string
+				directViews := viewsDependingOnTable(im, name)
+				directMVs := matViewsDependingOnRelation(im, name)
+				for _, vn := range directViews {
+					depDescs = append(depDescs, fmt.Sprintf("view %s depends on table %s", vn.String(), name.String()))
 				}
-				var depDescs []depDesc
-				for _, vn := range viewsDependingOnTable(im, name) {
-					depDescs = append(depDescs, depDesc{fmt.Sprintf("view %s depends on table %s", vn.String(), name.String())})
+				for _, mvn := range directMVs {
+					depDescs = append(depDescs, fmt.Sprintf("materialized view %s depends on table %s", mvn.String(), name.String()))
 				}
-				for _, mvn := range matViewsDependingOnRelation(im, name) {
-					depDescs = append(depDescs, depDesc{fmt.Sprintf("materialized view %s depends on table %s", mvn.String(), name.String())})
+				// Transitively reachable deps (views/matviews that depend on the direct views/matviews).
+				seenTransitive := map[string]bool{}
+				for _, vn := range directViews {
+					seenTransitive[vn.String()] = true
+				}
+				for _, mvn := range directMVs {
+					seenTransitive[mvn.String()] = true
+				}
+				allDirect := append(append([]parser.ObjectName{}, directViews...), directMVs...)
+				for _, directDep := range allDirect {
+					transitiveDeps := collectAllViewTransitiveDeps(im, directDep)
+					for _, td := range transitiveDeps {
+						k := td.name.String()
+						if !seenTransitive[k] {
+							seenTransitive[k] = true
+							depDescs = append(depDescs, fmt.Sprintf("%s %s depends on %s %s", td.kind, td.name.String(), td.parentKind, td.parentName.String()))
+						}
+					}
 				}
 				if len(depDescs) > 0 {
-					detail := make([]string, len(depDescs))
-					for i, d := range depDescs {
-						detail[i] = d.desc
-					}
 					return &ExecError{
-						Code:   "2BP01",
-						Pos:    s.Pos(),
+						Code:    "2BP01",
+						Pos:     s.Pos(),
 						Message: fmt.Sprintf("cannot drop table %s because other objects depend on it", name.String()),
-						Detail: strings.Join(detail, "\n"),
-						Hint:   "Use DROP ... CASCADE to drop the dependent objects too.",
+						Detail:  strings.Join(depDescs, "\n"),
+						Hint:    "Use DROP ... CASCADE to drop the dependent objects too.",
 					}
 				}
 			}
@@ -1434,7 +1522,8 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 		// CASCADE: drop views, matviews, and functions that directly or transitively reference this table.
 		if s.Behavior == parser.DropCascade {
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-				// Collect all dependents in display order: views, matviews, then functions.
+				// Collect all dependents in display order: views, matviews (including transitively
+				// reached via view chains), then functions.
 				type cascadeDep struct {
 					kind     string             // "view", "materialized view", or "function"
 					display  string             // full display text, e.g. "view functestv3"
@@ -1444,7 +1533,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				var deps []cascadeDep
 				seen := map[string]bool{}
 
-				// Direct view dependents.
+				// Direct view dependents + all their transitive view/matview deps via BFS.
 				viewNames := viewsDependingOnTable(im, name)
 				for _, vn := range viewNames {
 					k := vn.String()
@@ -1452,14 +1541,30 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 						seen[k] = true
 						deps = append(deps, cascadeDep{kind: "view", display: "view " + vn.String(), viewName: vn})
 					}
+					// Transitively reachable views/matviews from this view.
+					for _, td := range collectAllViewTransitiveDeps(im, vn) {
+						k2 := td.name.String()
+						if !seen[k2] {
+							seen[k2] = true
+							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + td.name.String(), viewName: td.name})
+						}
+					}
 				}
-				// Direct materialized view dependents.
+				// Direct materialized view dependents + all their transitive deps via BFS.
 				matViewNames := matViewsDependingOnRelation(im, name)
 				for _, mvn := range matViewNames {
 					k := mvn.String()
 					if !seen[k] {
 						seen[k] = true
 						deps = append(deps, cascadeDep{kind: "materialized view", display: "materialized view " + mvn.String(), viewName: mvn})
+					}
+					// Transitively reachable matviews from this matview.
+					for _, td := range collectAllViewTransitiveDeps(im, mvn) {
+						k2 := td.name.String()
+						if !seen[k2] {
+							seen[k2] = true
+							deps = append(deps, cascadeDep{kind: td.kind, display: td.kind + " " + td.name.String(), viewName: td.name})
+						}
 					}
 				}
 				// Direct function dependents (via TableDeps).
@@ -1489,16 +1594,15 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 					)
 				}
 
-				// Drop all dependents.
+				// Drop all dependents using a single shared dropped map to prevent double-drops.
+				droppedViews := map[string]bool{}
 				for _, d := range deps {
 					if d.kind == "view" {
-						dropped := map[string]bool{}
-						if err := o.execDropOneView(d.viewName, true, parser.DropCascade, s.Pos(), dropped); err != nil {
+						if err := o.execDropOneView(d.viewName, true, parser.DropCascade, s.Pos(), droppedViews); err != nil {
 							return err
 						}
 					} else if d.kind == "materialized view" {
-						dropped := map[string]bool{}
-						if err := o.execDropOneMatView(d.viewName, true, parser.DropCascade, s.Pos(), dropped); err != nil {
+						if err := o.execDropOneMatView(d.viewName, true, parser.DropCascade, s.Pos(), droppedViews); err != nil {
 							return err
 						}
 					} else if d.kind == "function" && d.routine != nil {
@@ -1733,7 +1837,16 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
 	}
-	return o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false)
+	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false); err != nil {
+		return err
+	}
+	// Mark partial indexes so they are excluded from REFRESH CONCURRENTLY checks.
+	if s.HasPredicate {
+		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			idx.HasPredicate = true
+		}
+	}
+	return nil
 }
 
 func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
@@ -1749,7 +1862,8 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		idx, ok := o.ctx.Catalog.LookupIndex(name)
 		if !ok {
 			if s.IfExists {
-				o.ctx.AddNotice(fmt.Sprintf("index %q does not exist, skipping", name.String()))
+				// Use just the index name (not schema-qualified) to match PostgreSQL's notice format.
+				o.ctx.AddNotice(fmt.Sprintf("index %q does not exist, skipping", name.Name))
 				continue
 			}
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("index %q does not exist", name.String())}
@@ -4660,11 +4774,28 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	if o.ctx.Pool == nil || o.ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE MATERIALIZED VIEW requires storage"}
 	}
+	// Check for existing relation before planning to avoid spurious runtime
+	// errors (e.g. division by zero) from constant folding in the query.
+	if _, exists := o.ctx.Catalog.LookupTable(s.Name); exists {
+		if s.IfNotExists {
+			o.ctx.AddNotice(fmt.Sprintf("relation %q already exists, skipping", s.Name.String()))
+			return nil
+		}
+		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: fmt.Sprintf("relation %q already exists", s.Name.String())}
+	}
 	// Plan the SELECT query to determine output columns.
 	if err := analyzer.Analyze(s.Query, o.ctx.Catalog); err != nil {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 	}
-	selectPlan, err := planner.Plan(s.Query, o.ctx.Catalog)
+	var selectPlan planner.Node
+	var err error
+	if s.WithNoData {
+		// WITH NO DATA: use schema-only planning that suppresses runtime
+		// evaluation errors (e.g. division by zero) — the query will never execute.
+		selectPlan, err = planner.PlanSchemaOnly(s.Query, o.ctx.Catalog)
+	} else {
+		selectPlan, err = planner.Plan(s.Query, o.ctx.Catalog)
+	}
 	if err != nil {
 		return err
 	}
@@ -4672,10 +4803,18 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	if schema == nil {
 		return &ExecError{Code: "42P10", Pos: s.Pos(), Message: "materialized view query has no output columns"}
 	}
-	// Build column list from plan output schema.
+	// Apply optional column aliases and validate count.
+	if len(s.ColumnAliases) > len(schema) {
+		return &ExecError{Code: "42601", Pos: s.Pos(), Message: "too many column names were specified"}
+	}
+	// Build column list from plan output schema, applying any column aliases.
 	cols := make([]catalog.Column, len(schema))
 	for i, sc := range schema {
-		cols[i] = catalog.Column{Name: sc.Name, Type: sc.Type, Ordinal: i}
+		name := sc.Name
+		if i < len(s.ColumnAliases) {
+			name = s.ColumnAliases[i]
+		}
+		cols[i] = catalog.Column{Name: name, Type: sc.Type, Ordinal: i}
 	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
@@ -4739,12 +4878,53 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	if o.ctx.Pool == nil || o.ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "REFRESH MATERIALIZED VIEW requires storage"}
 	}
+	// CONCURRENTLY and WITH NO DATA are mutually exclusive.
+	if s.Concurrently && s.WithNoData {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CONCURRENTLY and WITH NO DATA options cannot be used together"}
+	}
 	tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("materialized view %q does not exist", s.Name.String())}
 	}
 	if !tbl.IsMatView {
 		return &ExecError{Code: "42809", Pos: s.Pos(), Message: fmt.Sprintf("%q is not a materialized view", s.Name.String())}
+	}
+	// REFRESH without CONCURRENTLY on a non-populated matview is fine (it populates it).
+	// But CONCURRENTLY requires the matview to already be populated.
+	if s.Concurrently && !tbl.IsPopulated {
+		return &ExecError{Code: "55000", Pos: s.Pos(),
+			Message: fmt.Sprintf("cannot refresh materialized view %q concurrently",
+				s.Name.String()),
+			Hint: "Use the REFRESH MATERIALIZED VIEW command."}
+	}
+	// CONCURRENTLY requires at least one unique index with no WHERE clause.
+	if s.Concurrently {
+		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+			hasUnique := false
+			for _, idx := range im.IndexesOnTable(tbl) {
+				if !idx.Unique || idx.HasPredicate {
+					continue // partial or non-unique — not suitable for CONCURRENTLY
+				}
+				// Check for expression columns (not suitable for CONCURRENTLY).
+				allPlain := true
+				for _, e := range idx.ColExprs {
+					if e != nil {
+						allPlain = false
+						break
+					}
+				}
+				if allPlain {
+					hasUnique = true
+					break
+				}
+			}
+			if !hasUnique {
+				return &ExecError{Code: "55000", Pos: s.Pos(),
+					Message: fmt.Sprintf("cannot refresh materialized view %q concurrently",
+						s.Name.String()),
+					Hint: "Use the REFRESH MATERIALIZED VIEW command."}
+			}
+		}
 	}
 	// Re-plan the SELECT from the stored query.
 	if err := analyzer.Analyze(tbl.View, o.ctx.Catalog); err != nil {
@@ -4842,16 +5022,10 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				sort.Slice(tables, func(i, j int) bool {
 					return tables[i].String() < tables[j].String()
 				})
-				// Drop each table in the schema.
-				for _, tbl := range tables {
-					if err := o.ctx.Catalog.DropTable(tbl); err != nil {
-						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
-					}
-				}
-				// Emit NOTICE with total cascade count (tables + views + routines + op classes).
+				// Build detail lines BEFORE dropping (IsMatView check needs table still in catalog).
 				total := len(tables) + len(droppedViews) + len(droppedRoutines) + len(droppedOpClasses)
+				var detailLines []string
 				if total > 0 {
-					var detailLines []string
 					for _, funcName := range droppedRoutines {
 						detailLines = append(detailLines, fmt.Sprintf("drop cascades to function %s", funcName))
 					}
@@ -4859,11 +5033,24 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						detailLines = append(detailLines, fmt.Sprintf("drop cascades to operator family %s for access method hash", opClass))
 					}
 					for _, tbl := range tables {
-						detailLines = append(detailLines, fmt.Sprintf("drop cascades to table %s", tbl.String()))
+						kind := "table"
+						if t, ok := o.ctx.Catalog.LookupTable(tbl); ok && t.IsMatView {
+							kind = "materialized view"
+						}
+						detailLines = append(detailLines, fmt.Sprintf("drop cascades to %s %s", kind, tbl.String()))
 					}
 					for _, vn := range droppedViews {
 						detailLines = append(detailLines, fmt.Sprintf("drop cascades to view %s", vn))
 					}
+				}
+				// Drop each table in the schema.
+				for _, tbl := range tables {
+					if err := o.ctx.Catalog.DropTable(tbl); err != nil {
+						return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
+					}
+				}
+				// Emit NOTICE with total cascade count.
+				if total > 0 {
 					detail := strings.Join(detailLines, "\n")
 					o.ctx.AddNoticeWithDetail(
 						fmt.Sprintf("drop cascades to %d other objects", total),

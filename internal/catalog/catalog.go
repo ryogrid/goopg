@@ -286,7 +286,8 @@ type Index struct {
 	// columns (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil
 	// when Columns[i] == "" (expression column); nil for plain column names.
 	// Not persisted to JSON (parser.Expr is not JSON-serializable).
-	ColExprs []*parser.Expr
+	ColExprs     []*parser.Expr
+	HasPredicate bool // true if this is a partial index (has a WHERE clause)
 }
 
 // QualifiedName renders the table's name in the canonical
