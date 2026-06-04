@@ -3275,6 +3275,27 @@ M0097-0001 wires it up.
         Remaining aggregates gaps: outer aggregate in HAVING with filter-mismatch (9 lines),
         FILTER outer-reference hoisting (37 lines), nested aggregate detection (1 line).
 
+      - **Progress 2026-06-04 (M0097-0035 loop 8 — aggregates 46→5, three fixes):**
+        Three coordinated fixes reducing aggregates diff from 46 to 5 (commit d7dd89e6):
+        (a) `tryPromoteAggSublink` in `planSelect`: when outer SELECT has one scalar-subquery
+            target whose inner aggregate's FILTER or arg references outer columns, promote to
+            outer aggregate (PostgreSQL's "outer query becomes aggregate" semantics). Falls back
+            gracefully on error (e.g. when arg uses inner-FROM columns like count(inner_c)).
+            Fixes: count(*) filter (where outer_c<>0), max(0) filter (where b1),
+            max(corr_subq) filter (where outer_ref) cases (31 lines).
+        (b) `collectHavingSubqueryAggCalls`: walks HAVING EXISTS/IN subquery WHERE for outer
+            aggregate calls (e.g. sum(distinct a.four) in HAVING EXISTS where). Registers as
+            extra aggregate slots in buildAggregateStage so havingAgg lookup finds them.
+            Fixes HAVING EXISTS outer agg with FILTER mismatch (9 lines).
+        (c) ORDER BY nested-agg detection in `collectAggregateCalls`: when aggregate's fc.OrderBy
+            has a SubqueryExpr whose inner targets contain aggregates, emits "aggregate function
+            calls cannot be nested" (42803). Fixes complex avg(col ORDER BY (select avg(...)))
+            which was timing out instead of being rejected at plan time (1 line).
+        Remaining 5-line diff: select (select max((select unique2 from tenk1 i where
+        i.unique1 = o.unique1))) from tenk1 o — promotion fires but 10000×10000 correlated
+        SeqScans exceed 5s statement_timeout; "canceling statement" error stripped by normalizer.
+        Needs join-based execution (hash join of tenk1 with itself) to be fast enough.
+
       - **Progress 2026-06-02 (M0097-0141 — enum ORDER BY, loop 477):**
         Five-part fix (commit 0d77a623):
         (a) `catalog.ResolveColumnType`: preserve enum type name (not "text") so columns retain
