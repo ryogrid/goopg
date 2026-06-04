@@ -1923,6 +1923,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if err := o.execAlterColumnType(tbl, act); err != nil {
 				return err
 			}
+		case parser.AlterTableDropColumn:
+			if err := o.execAlterDropColumn(tbl, act); err != nil {
+				return err
+			}
 		default:
 			return &ExecError{Code: "0A000", Pos: act.Pos(), Message: "ALTER TABLE action is not supported in v0"}
 		}
@@ -5634,6 +5638,15 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 // It updates the column type in the catalog and, when storage is available,
 // rewrites existing heap rows to re-encode the column value in the new type.
 // M0097-0022.
+// execAlterDropColumn accepts DROP COLUMN syntax but is a structural no-op in
+// goopg v0. Full DROP COLUMN support (heap-slot preservation, child-partition
+// propagation, catalog hiding) is deferred; the parser already handles the
+// syntax so multi-action ALTER TABLE statements don't fail with a parse error.
+// M0097-0028.
+func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAction) error {
+	return nil
+}
+
 func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAction) error {
 	colIdx := -1
 	for i, col := range tbl.Columns {

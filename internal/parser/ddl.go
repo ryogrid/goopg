@@ -3442,38 +3442,10 @@ func (p *parser) parseAlter() (Stmt, error) {
 		return stmt, nil
 	}
 	// DROP CONSTRAINT name [RESTRICT|CASCADE] — real action (M0097-0036).
-	// DROP COLUMN, DROP DEFAULT, etc. — no-op (consume rest).
-	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDrop {
-		p.advance() // consume DROP
-		if p.acceptKeyword(KwConstraint) {
-			nameTok, err := p.parseIdent()
-			if err != nil {
-				return nil, err
-			}
-			restrict := true // RESTRICT is the PostgreSQL default
-			if p.acceptKeyword(KwCascade) {
-				restrict = false
-			} else {
-				_ = p.acceptKeyword(KwRestrict)
-			}
-			act := AlterTableAction{
-				pos:            nameTok.Pos,
-				Kind:           AlterTableDropConstraint,
-				ConstraintName: identText(nameTok),
-				Restrict:       restrict,
-			}
-			stmt.Actions = append(stmt.Actions, act)
-			return stmt, nil
-		}
-		// DROP COLUMN, DROP DEFAULT, etc. — consume rest as no-op.
-		for p.cur().Kind != TokenEOF {
-			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
-				break
-			}
-			p.advance()
-		}
-		return stmt, nil
-	}
+	// DROP sub-commands (DROP COLUMN, DROP CONSTRAINT) are handled by
+	// parseAlterTableAction() to support comma-separated multi-action ALTER TABLE
+	// statements (e.g. "ALTER TABLE t DROP COLUMN a, DROP COLUMN b"). Fall through
+	// to the multi-action loop below. M0097-0028.
 	// ALTER COLUMN — handle SET (options) and TYPE specially; consume other forms as no-op.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter {
 		p.advance() // consume ALTER
@@ -3667,8 +3639,45 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableNoInherit, InheritParent: parentName}, nil
 	}
+	// DROP COLUMN name / DROP CONSTRAINT name in the multi-action loop.
+	// Both forms share this path so comma-separated "DROP COLUMN a, DROP COLUMN b"
+	// work correctly. M0097-0028.
+	if p.acceptKeyword(KwDrop) {
+		if p.acceptKeyword(KwConstraint) {
+			nameTok, err := p.parseIdent()
+			if err != nil {
+				return AlterTableAction{}, err
+			}
+			restrict := true
+			if p.acceptKeyword(KwCascade) {
+				restrict = false
+			} else {
+				_ = p.acceptKeyword(KwRestrict)
+			}
+			return AlterTableAction{
+				pos:            nameTok.Pos,
+				Kind:           AlterTableDropConstraint,
+				ConstraintName: identText(nameTok),
+				Restrict:       restrict,
+			}, nil
+		}
+		// DROP COLUMN [IF EXISTS] col_name [RESTRICT|CASCADE]
+		_ = p.acceptKeyword(KwColumn)
+		_ = p.acceptIdentKeyword("if") && p.acceptIdentKeyword("exists")
+		colTok := p.cur()
+		if colTok.Kind == TokenIdent || colTok.Kind == TokenQuotedIdent {
+			p.advance()
+			_ = p.acceptKeyword(KwCascade) || p.acceptKeyword(KwRestrict)
+			return AlterTableAction{
+				pos:        colTok.Pos,
+				Kind:       AlterTableDropColumn,
+				ColumnName: identText(colTok),
+			}, nil
+		}
+		return AlterTableAction{}, p.errAtCur("expected column or constraint name after DROP")
+	}
 	if !p.acceptKeyword(KwAdd) {
-		return AlterTableAction{}, p.errAtCur("expected ADD")
+		return AlterTableAction{}, p.errAtCur("expected ADD or DROP")
 	}
 	pos := p.cur().Pos
 	act := AlterTableAction{pos: pos}

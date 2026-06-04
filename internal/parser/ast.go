@@ -1356,6 +1356,10 @@ const (
 	// Changes the column type in the catalog and rewrites existing heap rows
 	// to re-encode them with the new type. M0097-0022.
 	AlterTableAlterColumnType
+	// AlterTableDropColumn — `DROP [COLUMN] [IF EXISTS] name [RESTRICT|CASCADE]`.
+	// Marks the named column as dropped (hidden from user queries) while
+	// retaining its heap slot for backward heap-tuple compatibility. M0097-0028.
+	AlterTableDropColumn
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the

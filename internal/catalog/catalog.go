@@ -76,6 +76,11 @@ type Column struct {
 	// IdentityColumn is true for GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
 	// When true, INSERT without an explicit value calls nextval(tablename_colname_seq).
 	IdentityColumn bool
+	// Dropped is true for columns removed via ALTER TABLE DROP COLUMN.
+	// The column's heap slot (Ordinal) is retained for tuple compatibility;
+	// dropped columns are invisible in SELECT *, RETURNING *, and column lookups.
+	// M0097-0028.
+	Dropped bool
 }
 
 // Table is one relation in the catalog.
