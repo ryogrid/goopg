@@ -138,7 +138,7 @@ Query Processing,Query Tree,Var nodes (referencing range-table index + column),q
 Query Processing,Rewrite System,Rule system (pg_rewrite catalog -> query trees with rule actions),rule-system.md,,
 Query Processing,Rewrite System,View rewriting: replace RTE_RELATION(view) -> RTE_SUBQUERY,rule-system.md,,
 Query Processing,Rewrite System,INSERT/UPDATE/DELETE rules on views (auto-rewrite + conditional rules),rule-system.md,,
-Query Processing,Rewrite System,Materialized views (separate storage, REFRESH),rules-materializedviews.md,,
+Query Processing,Rewrite System,Materialized views (separate storage / REFRESH),rules-materializedviews.md,,
 Query Processing,Planner,Path model: cheapest path per relation + cheapest path overall,planner-optimizer.md,,
 Query Processing,Planner,Scan paths: SeqScan / IndexScan / IndexOnlyScan / BitmapHeapScan / TidScan / SampleScan / FunctionScan / SubqueryScan / CteScan / ValuesScan,planner-optimizer.md,,
 Query Processing,Planner,Join paths: NestedLoop / MergeJoin / HashJoin,planner-optimizer.md,,
