@@ -2447,6 +2447,26 @@ M0097-0001 wires it up.
         Tests updated: catalog/catalog_test.go and planner/virtual_test.go filter
         by relname instead of asserting pg_class row count == 1.
         int8: 0 diffs → **PASS**.
+      - **Progress 2026-06-04 (M0097-0023-loop30 — DROP COLUMN + relam + pg_description):**
+        Three changes (commit 0921885d):
+        (a) `execAlterDropColumn` (`internal/executor/operators_ddl.go`): now a real
+            table-rewrite implementation (was no-op). Reads all visible rows with OLD
+            schema, builds new rows without the dropped column, removes column from
+            `tbl.Columns` + updates ordinals, truncates heap + index trees, re-inserts
+            rows + rebuilds btree indexes. Catalog-only path when pool is nil.
+            Tests: `TestDDLAlterTableDropColumn` (new unit test).
+        (b) `pg_class.relam` column (ordinal 21, OID type): heap tables → "2", btree
+            indexes → "403", hash indexes → "405". Eliminates 13 "column relam does
+            not exist" errors from psql \\d+ meta-queries in create_table_like.
+            pg_class self-row relnatts updated from "20" to "22".
+        (c) `pg_description` empty virtual catalog stub (OID 2609): schema
+            {objoid,classoid,objsubid,description}; returns 0 rows (COMMENT ON is
+            still a no-op). Eliminates "relation pg_description does not exist" errors.
+        Results: insert_conflict 130→113 diffs; create_table_like 127→126 diffs.
+        Remaining create_table_like blockers: pg_attrdef/pg_constraint/pg_index/
+        pg_statistic_ext stubs needed for \\d+ display, COMMENT ON storage
+        needed for pg_description data, storage parameter conflicts (MAIN/EXTENDED),
+        NO INHERIT constraint on partitioned tables, foreign data wrapper support.
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:

@@ -86,10 +86,10 @@ name,0,pass
 index_including_gist,60,failed
 aggregates,0,pass
 create_function_sql,0,pass
-create_table_like,116,failed
+create_table_like,126,failed
 join_hash,142,failed
 matview,69,failed
-insert_conflict,179,failed
+insert_conflict,113,failed
 index_including,204,failed
 create_table,388,failed
 create_view,417,failed
