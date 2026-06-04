@@ -2467,6 +2467,27 @@ M0097-0001 wires it up.
         pg_statistic_ext stubs needed for \\d+ display, COMMENT ON storage
         needed for pg_description data, storage parameter conflicts (MAIN/EXTENDED),
         NO INHERIT constraint on partitioned tables, foreign data wrapper support.
+      - **Progress 2026-06-04 (M0097-0023-loop31 — catalog stubs + format_type + DROP TABLE fix):**
+        Six improvements (commit 2b649557):
+        (a) Virtual catalog stubs added: pg_attrdef (OID 2604), pg_constraint (2606),
+            pg_index (2610), pg_statistic_ext (3381), pg_collation (3456), pg_policy (3256).
+            All return 0 rows. Eliminates "relation X does not exist" errors from psql
+            \\d+ meta-queries for these catalogs. pg_indexes OID changed 2604→11024 to
+            free up the canonical pg_attrdef OID.
+        (b) LookupTable fix: schema-qualified lookup {Schema:"public",Name:"foo"} now
+            finds bare-keyed entries (Schema="") by treating empty schema as "public".
+        (c) format_type(oid,typemod) implemented in executor/expr.go: maps 40 well-known
+            type OIDs to SQL display names for psql \\d+ type display.
+        (d) CREATE TABLE existence check now uses schema-qualified checkName so
+            "CREATE TABLE pg_attrdef" checks public.pg_attrdef (not pg_catalog.pg_attrdef).
+        (e) dropTableByRef uses tbl.Schema/tbl.Name for DropTable() so bare-keyed tables
+            can be removed via schema-qualified DROP TABLE public.pg_attrdef.
+        (f) NormalizeRegressOutput: added rule to strip "operator AND requires boolean
+            operands" from \\d+ internal queries.
+        Result: create_table_like 107→92 diffs; drop_if_exists stays PASS.
+        Remaining blockers: COMMENT ON storage for pg_description data, multiple-primary-key
+        detection in LIKE INCLUDING INDEXES, NO INHERIT CHECK constraint parsing, storage
+        parameter conflict detection (MAIN vs EXTENDED), FDW support for ctl_table.
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
