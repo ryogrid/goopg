@@ -407,6 +407,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 
 	// CHECK constraints to inherit from LIKE INCLUDING CONSTRAINTS clauses.
 	var likeCheckConstraints []string
+	// Indexes to copy from LIKE INCLUDING INDEXES clauses (non-PK unique indexes).
+	var likeUniqueIndexes []*catalog.Index
 	// Append body elements in declaration order: explicit columns and LIKE clauses
 	// interleaved by their BodyOrder. M0097-0069.
 	if len(s.BodyOrder) > 0 {
@@ -452,6 +454,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				includeGenerated := strings.Contains(likeFlags, ":+generated")
 				includeDefaults := strings.Contains(likeFlags, ":+defaults")
 				includeConstraints := strings.Contains(likeFlags, ":+constraints")
+				includeIndexes := strings.Contains(likeFlags, ":+indexes")
 				src, ok := likeByKey[baseKey]
 				if !ok {
 					continue
@@ -524,6 +527,34 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 							}
 							if !found {
 								likeCheckConstraints = append(likeCheckConstraints, chk)
+							}
+						}
+					}
+				}
+				// Copy indexes when INCLUDING INDEXES.
+				if includeIndexes {
+					if im2, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+						if im2.HasPrimaryKey(src) {
+							// Check if new table already has a PK (from explicit columns or prior LIKE).
+							if len(s.PrimaryKey) > 0 {
+								return &ExecError{
+									Code:    "42P16",
+									Pos:     s.Pos(),
+									Message: fmt.Sprintf("multiple primary keys for table %q are not allowed", s.Name.Name),
+								}
+							}
+							// Copy PK columns from source.
+							for _, idx := range im2.IndexesOnTable(src) {
+								if idx.Primary {
+									s.PrimaryKey = append(s.PrimaryKey, idx.Columns...)
+									break
+								}
+							}
+						}
+						// Copy unique (non-PK) non-partial indexes.
+						for _, idx := range im2.IndexesOnTable(src) {
+							if idx.Unique && !idx.Primary && !idx.HasPredicate {
+								likeUniqueIndexes = append(likeUniqueIndexes, idx)
 							}
 						}
 					}
@@ -697,6 +728,13 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			idxName.Name = tbl.Name + suffix
 		}
 		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, cols, nil, true, false); err != nil {
+			return err
+		}
+	}
+	// Create btree indexes for LIKE INCLUDING INDEXES unique (non-PK) indexes.
+	for _, idx := range likeUniqueIndexes {
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + strings.Join(idx.Columns, "_") + "_key"}
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, nil, true, false); err != nil {
 			return err
 		}
 	}
@@ -1446,7 +1484,19 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP TABLE requires Pool in Context"}
 	}
+	// Track tables already dropped by cascade during this statement so we can skip
+	// them if they also appear explicitly in s.Names (avoids "does not exist" errors).
+	cascadeDropped := make(map[string]bool)
+	// Pre-build the explicit drop set so we can suppress cascade notices for tables
+	// that are also being dropped explicitly (PostgreSQL doesn't emit those notices).
+	explicitDropSet := make(map[string]bool, len(s.Names))
+	for _, n := range s.Names {
+		explicitDropSet[n.String()] = true
+	}
 	for _, name := range s.Names {
+		if cascadeDropped[name.String()] {
+			continue // already removed by cascade from a prior table in this statement
+		}
 		if s.IfExists && o.dropSchemaQualifiedNotice(name) {
 			continue
 		}
@@ -1485,24 +1535,35 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 			}
 			if s.Behavior == parser.DropCascade {
 				inheritChildren := im.InheritanceChildren(tbl.OID)
-				if len(inheritChildren) == 1 {
-					childName := parser.ObjectName{Schema: inheritChildren[0].Schema, Name: inheritChildren[0].Name}
+				// Only emit notices for children NOT in the explicit drop list.
+				// PostgreSQL suppresses cascade notices when the cascaded object
+				// is also explicitly named in the DROP TABLE statement.
+				var noticeChildren []*catalog.Table
+				for _, child := range inheritChildren {
+					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+					if !explicitDropSet[childName.String()] {
+						noticeChildren = append(noticeChildren, child)
+					}
+				}
+				if len(noticeChildren) == 1 {
+					childName := parser.ObjectName{Schema: noticeChildren[0].Schema, Name: noticeChildren[0].Name}
 					o.ctx.AddNotice(fmt.Sprintf("drop cascades to table %s", childName.String()))
-				} else if len(inheritChildren) > 1 {
+				} else if len(noticeChildren) > 1 {
 					// PostgreSQL emits summary NOTICE + DETAIL listing each child.
 					// Normalizer strips DETAIL prefix and moves all lines to error section.
-					detail := make([]string, len(inheritChildren))
-					for i, child := range inheritChildren {
+					detail := make([]string, len(noticeChildren))
+					for i, child := range noticeChildren {
 						childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
 						detail[i] = fmt.Sprintf("drop cascades to table %s", childName.String())
 					}
 					o.ctx.AddNoticeWithDetail(
-						fmt.Sprintf("drop cascades to %d other objects", len(inheritChildren)),
+						fmt.Sprintf("drop cascades to %d other objects", len(noticeChildren)),
 						strings.Join(detail, "\n"),
 					)
 				}
 				for _, child := range inheritChildren {
 					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+					cascadeDropped[childName.String()] = true // mark so we skip if it appears in s.Names
 					if err := o.dropTableByRef(childName, child); err != nil {
 						return err
 					}
@@ -5122,6 +5183,28 @@ func (o *ddlOp) dropSchemaQualifiedNotice(name parser.ObjectName) bool {
 func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	objType := strings.ToLower(s.ObjType)
 
+	// DROP FOREIGN TABLE [IF EXISTS] name [, ...] — drop the underlying table from catalog.
+	// CREATE FOREIGN TABLE now creates real catalog entries, so we must drop them here.
+	if objType == "foreign table" {
+		for _, name := range s.Names {
+			if s.IfExists && o.dropSchemaQualifiedNotice(name) {
+				continue
+			}
+			tbl, ok := o.ctx.Catalog.LookupTable(name)
+			if !ok {
+				if s.IfExists {
+					o.ctx.AddNotice(fmt.Sprintf("foreign table %q does not exist, skipping", name.String()))
+					continue
+				}
+				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("foreign table %q does not exist", name.String())}
+			}
+			if err := o.dropTableByRef(name, tbl); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	// DROP SCHEMA [IF EXISTS] name [CASCADE|RESTRICT] — M0097-0020.
 	// Find all user tables in the schema and cascade-drop them.
 	if objType == "schema" {
@@ -5607,6 +5690,36 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					return nil
 				}
 			}
+		case "server":
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if im.DropCompatObject("server", s.Names[0].String()) {
+					return nil
+				}
+			}
+		case "foreign-data wrapper":
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				fdwName := s.Names[0].String()
+				if im.DropCompatObject("foreign-data wrapper", fdwName) {
+					// CASCADE: drop all servers associated with this FDW.
+					if s.Behavior == parser.DropCascade {
+						// Find servers registered under this FDW via "fdw-server:fdwname:servername".
+						prefix := fdwName + ":"
+						var cascadeServers []string
+						for _, entry := range im.ListCompatObjects("fdw-server") {
+							if strings.HasPrefix(entry, prefix) {
+								serverName := strings.TrimPrefix(entry, prefix)
+								cascadeServers = append(cascadeServers, serverName)
+							}
+						}
+						for _, serverName := range cascadeServers {
+							im.DropCompatObject("fdw-server", fdwName+":"+serverName)
+							im.DropCompatObject("server", serverName)
+							o.ctx.AddNotice(fmt.Sprintf("drop cascades to server %s", serverName))
+						}
+					}
+					return nil
+				}
+			}
 		}
 		return &ExecError{
 			Code:    "42704",
@@ -5629,6 +5742,16 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		return nil
 	}
 	switch s.ObjType {
+	case "server":
+		// Register server so DROP SERVER can succeed.
+		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+		// If the server references a FDW, store the association for DROP FDW CASCADE.
+		if s.TableName.Name != "" {
+			im.RegisterCompatObject("fdw-server", s.TableName.String()+":"+s.ObjName.String())
+		}
+	case "foreign-data wrapper":
+		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed.
+		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 	case "operator":
 		// Build the compat key as opName(leftCanon,rightCanon) to match DROP OPERATOR lookup.
 		leftArg, rightArg := "", ""

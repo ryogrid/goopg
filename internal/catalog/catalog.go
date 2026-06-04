@@ -3261,6 +3261,26 @@ func (c *InMemory) DropCompatObject(objType, name string) bool {
 	return false
 }
 
+// ListCompatObjects returns all registered names for a given object type.
+func (c *InMemory) ListCompatObjects(objType string) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	key := strings.ToLower(objType)
+	if c.compatObjects == nil {
+		return nil
+	}
+	m := c.compatObjects[key]
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for name := range m {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // RegisterTableRuleKind records the most recently created rule kind for a table.
 // Used by planCopy to return rule-specific errors. M0097-0140.
 func (c *InMemory) RegisterTableRuleKind(tableName, kind string) {

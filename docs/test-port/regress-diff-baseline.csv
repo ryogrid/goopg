@@ -86,7 +86,7 @@ name,0,pass
 index_including_gist,60,failed
 aggregates,0,pass
 create_function_sql,0,pass
-create_table_like,126,failed
+create_table_like,88,failed
 join_hash,142,failed
 matview,69,failed
 insert_conflict,113,failed

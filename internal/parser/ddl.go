@@ -258,11 +258,59 @@ func (p *parser) parseCreate() (Stmt, error) {
 			ns.ObjName = tsName
 		}
 		return stmt, nil
-	// CREATE SERVER / CREATE FOREIGN ... — accept as no-op. M0097-0071.
-	// FOREIGN is a reserved keyword so acceptKeyword is required (not acceptIdentKeyword).
+	// CREATE SERVER name ... FOREIGN DATA WRAPPER fdwname [OPTIONS (...)] — register as compat object. M0097-0071.
 	case p.acceptIdentKeyword("server"):
-		return p.parseSkipToSemicolon(t.Pos)
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		// Look for FOREIGN DATA WRAPPER fdwname to record the FDW association.
+		var fdwName ObjectName
+		for {
+			tok := p.cur()
+			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+				break
+			}
+			// Detect "FOREIGN DATA WRAPPER fdwname".
+			if tok.Kind == TokenKeyword && tok.Keyword == KwForeign {
+				p.advance()
+				if p.acceptIdentKeyword("data") && p.acceptIdentKeyword("wrapper") {
+					fdwName, _ = p.parseObjectName()
+					continue
+				}
+				continue
+			}
+			p.advance()
+		}
+		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "server", ObjName: name}
+		if fdwName.Name != "" {
+			ns.TableName = fdwName // reuse TableName field to store FDW association
+		}
+		return ns, nil
+	// CREATE FOREIGN TABLE / CREATE FOREIGN DATA WRAPPER. M0097-0071.
+	// FOREIGN is a reserved keyword so acceptKeyword is required (not acceptIdentKeyword).
 	case p.acceptKeyword(KwForeign):
+		if p.acceptKeyword(KwTable) {
+			// CREATE FOREIGN TABLE name (cols) SERVER server [OPTIONS (...)]
+			return p.parseCreateForeignTableTail(t.Pos)
+		}
+		if p.acceptIdentKeyword("data") {
+			_ = p.acceptIdentKeyword("wrapper")
+			// CREATE FOREIGN DATA WRAPPER name [OPTIONS (...)] — register as compat object.
+			name, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			for {
+				tok := p.cur()
+				if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+					break
+				}
+				p.advance()
+			}
+			return &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "foreign-data wrapper", ObjName: name}, nil
+		}
+		// Other CREATE FOREIGN ... → skip.
 		return p.parseSkipToSemicolon(t.Pos)
 	// CREATE STATISTICS name ON expr, ... FROM table — accept as no-op.
 	// Extended statistics are not implemented in goopg v0.
@@ -667,6 +715,28 @@ func (p *parser) parseSkipToSemicolon(pos int) (Stmt, error) {
 		p.advance()
 	}
 	return &CompatNoopStmt{pos: pos, Tag: "CREATE"}, nil
+}
+
+// parseCreateForeignTableTail parses the tail of CREATE FOREIGN TABLE after the TABLE keyword.
+// Grammar: name [(colDefs)] SERVER servername [OPTIONS (...)]
+// Returns a CreateTableStmt; the SERVER/OPTIONS suffix is consumed and discarded.
+// Foreign tables are treated as regular tables for storage purposes in goopg v0.
+func (p *parser) parseCreateForeignTableTail(pos int) (Stmt, error) {
+	// Reuse the regular CREATE TABLE parser for name + column list.
+	stmt, err := p.parseCreateTableTail(pos, false)
+	if err != nil {
+		return nil, err
+	}
+	// Consume the optional SERVER name and OPTIONS (...) that follow the column list.
+	// Skip everything up to ';' or EOF.
+	for {
+		tok := p.cur()
+		if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+			break
+		}
+		p.advance()
+	}
+	return stmt, nil
 }
 
 // parseCreatePublicationTail picks up after CREATE PUBLICATION.
@@ -1474,6 +1544,9 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						likeKey += ":+constraints"
 					}
 				case p.acceptIdentKeyword("indexes"):
+					if isIncluding {
+						likeKey += ":+indexes"
+					}
 				case p.acceptIdentKeyword("identity"):
 					if isIncluding {
 						likeKey += ":+identity"
@@ -1487,7 +1560,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 				case p.acceptKeyword(KwAll):
 					if isIncluding {
-						likeKey += ":+defaults:+identity:+generated:+constraints"
+						likeKey += ":+defaults:+identity:+generated:+constraints:+indexes"
 					}
 				}
 			}
@@ -1724,6 +1797,9 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		// COLLATE collation_name — ignore collation; goopg v0 doesn't track collations. M0097-0071.
 		case p.acceptIdentKeyword("collate"):
 			_, _ = p.parseIdent() // consume collation name (may be quoted)
+		// COMPRESSION method — column-level compression method (PG 14+); goopg v0 ignores it.
+		case p.acceptIdentKeyword("compression"):
+			_, _ = p.parseIdent() // consume method name (pglz, lz4, default, etc.)
 		// GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY or GENERATED ALWAYS AS (expr) STORED (M0096-0008)
 		case p.acceptIdentKeyword("generated"):
 			isAlways := p.acceptIdentKeyword("always")

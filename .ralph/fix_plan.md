@@ -2488,6 +2488,36 @@ M0097-0001 wires it up.
         Remaining blockers: COMMENT ON storage for pg_description data, multiple-primary-key
         detection in LIKE INCLUDING INDEXES, NO INHERIT CHECK constraint parsing, storage
         parameter conflict detection (MAIN vs EXTENDED), FDW support for ctl_table.
+      - **Progress 2026-06-04 (M0097-0023-loop32 — LIKE INDEXES + FDW stubs: 117→88 diffs):**
+        Five improvements:
+        (a) `COMPRESSION method` in column defs (`internal/parser/ddl.go`): silently consumed
+            — `b varchar COMPRESSION pglz` no longer causes parse failure. Enables ctl_table
+            creation.
+        (b) `LIKE INCLUDING INDEXES` parser flag (`internal/parser/ddl.go`): sets `:+indexes`
+            flag; `INCLUDING ALL` now also includes `:+indexes`.
+        (c) `LIKE INCLUDING INDEXES` executor (`internal/executor/operators_ddl.go`): copies
+            PK columns from source table (42P16 "multiple primary keys" error when target
+            already has PK); copies non-PK non-partial unique indexes as btree indexes.
+        (d) `execDropTable` cascade-skip (`internal/executor/operators_ddl.go`): tracks
+            `cascadeDropped` map + `explicitDropSet`; inheritance children listed both
+            implicitly (via CASCADE) and explicitly in DROP TABLE no longer error when
+            encountered a second time; cascade notices suppressed for explicitly-listed children.
+        (e) FDW stubs (`internal/parser/ddl.go`, `internal/executor/operators_ddl.go`):
+            `CREATE FOREIGN DATA WRAPPER` → CompatNoopStmt registered in compat registry;
+            `CREATE SERVER` → CompatNoopStmt with FDW association stored; `DROP FOREIGN DATA
+            WRAPPER CASCADE` → emits "drop cascades to server X" notices for associated servers;
+            `DROP FOREIGN TABLE` → drops actual catalog table (was compat no-op); `CREATE
+            FOREIGN TABLE` → `parseCreateForeignTableTail` creates real table (reuses
+            `parseCreateTableTail`, skips SERVER/OPTIONS suffix); `ListCompatObjects` method
+            added to catalog.InMemory.
+        Tests: `TestParseColumnDefCompression` (parser/ddl_test.go),
+        `TestLikeIncludingIndexesCopiesPK` / `TestLikeIncludingIndexesMultiplePKError` /
+        `TestDropTableSkipsAlreadyCascadedChildren` (executor/operators_ddl_like_indexes_test.go).
+        create_table_like: 92 → 88 diffs.
+        Remaining blockers: COMMENT ON storage for pg_description data, NO INHERIT CHECK
+        constraint on partitioned tables, storage parameter conflict detection (MAIN vs
+        EXTENDED), BEGIN/ROLLBACK DDL non-atomicity (schema search_path context lost on
+        rollback causes ctlt1/ctl_schema.ctlt4 extra errors).
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
