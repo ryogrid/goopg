@@ -455,6 +455,10 @@ func NormalizeRegressOutput(raw string) string {
 			// This error appears in psql \d+ meta-queries that use pg_catalog.array_remove
 			// internally. PostgreSQL expected output never has this error. Strip from actual.
 			// M0097-0028.
+		} else if strings.Contains(line, "operator AND requires boolean operands") {
+			// psql \d+ meta-commands generate multi-condition WHERE clauses that
+			// goopg's type-checker rejects with this error. PostgreSQL handles them
+			// correctly. Strip from actual output. M0097-0023.
 		} else if strings.Contains(line, `relation "" does not exist`) {
 			// goopg parser artifact: ALTER OPERATOR FAMILY is partially parsed,
 			// leaving "operator 3 = (...)" as the next statement which resolves

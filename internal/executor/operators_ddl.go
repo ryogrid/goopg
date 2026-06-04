@@ -319,7 +319,15 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 }
 
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
-	if _, exists := o.ctx.Catalog.LookupTable(s.Name); exists {
+	// For the existence check, use a schema-qualified name so that unqualified
+	// names like "pg_attrdef" don't match pg_catalog virtual tables.
+	// CREATE TABLE pg_attrdef should create a user table, not conflict with
+	// pg_catalog.pg_attrdef. M0097-0023.
+	checkName := s.Name
+	if checkName.Schema == "" && !s.Temporary {
+		checkName.Schema = "public"
+	}
+	if _, exists := o.ctx.Catalog.LookupTable(checkName); exists {
 		if s.IfNotExists {
 			o.ctx.Notices = append(o.ctx.Notices,
 				fmt.Sprintf("relation %q already exists, skipping", s.Name.String()))
@@ -1764,7 +1772,11 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error
 	}
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	relOID := tbl.OID
-	if err := o.ctx.Catalog.DropTable(name); err != nil {
+	// Use the table's stored name for DropTable so that bare-keyed tables
+	// (schema="") found via a schema-qualified lookup can be removed correctly.
+	// M0097-0023.
+	dropName := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
+	if err := o.ctx.Catalog.DropTable(dropName); err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
 	// If this table was shadowing a permanent one, restore it. M0097-0003.

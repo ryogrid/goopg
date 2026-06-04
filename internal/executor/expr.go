@@ -7793,6 +7793,27 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewStringDatum("text"), nil
 			}
 		}
+	case "format_type":
+		// format_type(oid, typemod) — returns the SQL name of a data type given
+		// its type OID and optional type modifier. Used by psql \d+ meta-commands.
+		// NULL OID → NULL result. typemod=-1 or NULL means no modifier.
+		// M0097-0023.
+		if len(x.Args) >= 1 {
+			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || oidArg.IsNull() {
+				return NullDatum, nil
+			}
+			typeOID := oidArg.Int
+			typmod := int64(-1)
+			if len(x.Args) >= 2 {
+				modArg, merr := evalExpr(x.Args[1], row, ctx)
+				if merr == nil && !modArg.IsNull() {
+					typmod = modArg.Int
+				}
+			}
+			name := formatTypeOID(typeOID, typmod)
+			return NewStringDatum(name), nil
+		}
 	case "pg_column_size":
 		if len(x.Args) == 1 {
 			v, err := evalExpr(x.Args[0], row, ctx)
@@ -9198,6 +9219,96 @@ func pgFormatTypeName(t string) string {
 		return "numeric"
 	}
 	return t
+}
+
+// formatTypeOID implements PostgreSQL's format_type(oid, typemod) built-in.
+// Maps well-known system type OIDs to their SQL display names. Unknown OIDs
+// return "???". Used by psql \d+ meta-commands. M0097-0023.
+func formatTypeOID(typeOID, typmod int64) string {
+	switch typeOID {
+	case 16:
+		return "boolean"
+	case 17:
+		return "bytea"
+	case 18:
+		return "\"char\""
+	case 19:
+		return "name"
+	case 20:
+		return "bigint"
+	case 21:
+		return "smallint"
+	case 22:
+		return "smallint[]"
+	case 23:
+		return "integer"
+	case 25:
+		return "text"
+	case 26:
+		return "oid"
+	case 27:
+		return "tid"
+	case 28:
+		return "xid"
+	case 29:
+		return "cid"
+	case 30:
+		return "oid[]"
+	case 114:
+		return "json"
+	case 142:
+		return "xml"
+	case 600:
+		return "point"
+	case 700:
+		return "real"
+	case 701:
+		return "double precision"
+	case 1005:
+		return "smallint[]"
+	case 1007:
+		return "integer[]"
+	case 1009:
+		return "text[]"
+	case 1016:
+		return "bigint[]"
+	case 1042:
+		if typmod > 4 {
+			return fmt.Sprintf("character(%d)", typmod-4)
+		}
+		return "character"
+	case 1043:
+		if typmod > 4 {
+			return fmt.Sprintf("character varying(%d)", typmod-4)
+		}
+		return "character varying"
+	case 1082:
+		return "date"
+	case 1083:
+		return "time without time zone"
+	case 1114:
+		return "timestamp without time zone"
+	case 1184:
+		return "timestamp with time zone"
+	case 1186:
+		return "interval"
+	case 1700:
+		return "numeric"
+	case 2249:
+		return "record"
+	case 2950:
+		return "uuid"
+	case 3614:
+		return "tsvector"
+	case 3615:
+		return "tsquery"
+	case 3802:
+		return "jsonb"
+	case 4072:
+		return "jsonpath"
+	default:
+		return "???"
+	}
 }
 
 // uuidToBytes parses a UUID string (any PG-accepted format) into 16 bytes.

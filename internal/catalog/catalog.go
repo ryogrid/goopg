@@ -1445,6 +1445,8 @@ func (c *InMemory) registerSystemTables() {
 
 	// pg_indexes view. HammerDB's checkschema step queries
 	// `select tablename, indexname from pg_indexes where
+	// NOTE: pg_indexes is a VIEW (not a catalog table); OID 11024 is assigned
+	// here to avoid conflicting with the catalog table pg_attrdef (OID 2604).
 	// tablename = '$table'` to verify each TPC-H table has at
 	// least one index after CreateIndexes runs. Mirrors the
 	// upstream view's first three columns; tablespace and
@@ -1460,7 +1462,7 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "tablespace", Type: Type{Name: "text"}, Ordinal: 3},
 			{Name: "indexdef", Type: Type{Name: "text"}, Ordinal: 4},
 		},
-		OID:     2604, // upstream's pg_indexes OID
+		OID:     11024, // VIEW (not catalog table); pg_attrdef owns OID 2604
 		Virtual: true,
 	}
 	pgIndexes.VirtualRows = func() [][]string {
@@ -2066,6 +2068,162 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgDescription.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_description"] = pgDescription
+
+	// pg_attrdef — stores column default expressions (OID 2604).
+	// COMMENT ON and DEFAULT tracking are stubs in goopg v0; this virtual table
+	// lets psql \d+ meta-queries succeed (returning 0 rows) instead of erroring
+	// with "relation pg_attrdef does not exist". M0097-0023.
+	pgAttrdef := &Table{
+		Schema: "pg_catalog", Name: "pg_attrdef", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "adrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "adnum", Type: Type{Name: "int2"}, Ordinal: 2},
+			{Name: "adbin", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID: 2604,
+	}
+	pgAttrdef.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_attrdef"] = pgAttrdef
+
+	// pg_constraint — stores table and domain constraint definitions (OID 2606).
+	// Constraint tracking is a stub in goopg v0; this virtual table lets queries
+	// like SELECT conname FROM pg_constraint WHERE conrelid = ... succeed (returning
+	// 0 rows) instead of erroring with "relation pg_constraint does not exist".
+	// M0097-0023.
+	pgConstraint := &Table{
+		Schema: "pg_catalog", Name: "pg_constraint", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "conname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "connamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "contype", Type: Type{Name: "char"}, Ordinal: 3},
+			{Name: "condeferrable", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "condeferred", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "convalidated", Type: Type{Name: "bool"}, Ordinal: 6},
+			{Name: "conrelid", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "contypid", Type: Type{Name: "oid"}, Ordinal: 8},
+			{Name: "conindid", Type: Type{Name: "oid"}, Ordinal: 9},
+			{Name: "conparentid", Type: Type{Name: "oid"}, Ordinal: 10},
+			{Name: "confrelid", Type: Type{Name: "oid"}, Ordinal: 11},
+			{Name: "confupdtype", Type: Type{Name: "char"}, Ordinal: 12},
+			{Name: "confdeltype", Type: Type{Name: "char"}, Ordinal: 13},
+			{Name: "confmatchtype", Type: Type{Name: "char"}, Ordinal: 14},
+			{Name: "conislocal", Type: Type{Name: "bool"}, Ordinal: 15},
+			{Name: "coninhcount", Type: Type{Name: "int2"}, Ordinal: 16},
+			{Name: "connoinherit", Type: Type{Name: "bool"}, Ordinal: 17},
+			{Name: "conperiod", Type: Type{Name: "bool"}, Ordinal: 18},
+			{Name: "conkey", Type: Type{Name: "int2[]"}, Ordinal: 19},
+			{Name: "confkey", Type: Type{Name: "int2[]"}, Ordinal: 20},
+			{Name: "conpfeqop", Type: Type{Name: "oid[]"}, Ordinal: 21},
+			{Name: "conppeqop", Type: Type{Name: "oid[]"}, Ordinal: 22},
+			{Name: "confdelsetcols", Type: Type{Name: "int2[]"}, Ordinal: 23},
+			{Name: "conbin", Type: Type{Name: "text"}, Ordinal: 24},
+		},
+		OID: 2606,
+	}
+	pgConstraint.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_constraint"] = pgConstraint
+
+	// pg_index — stores index definitions (OID 2610).
+	// This virtual stub lets queries that join against pg_index (e.g. psql \d+
+	// meta-queries) succeed instead of erroring with "relation pg_index does not
+	// exist". M0097-0023.
+	pgIndexCatalog := &Table{
+		Schema: "pg_catalog", Name: "pg_index", Virtual: true,
+		Columns: []Column{
+			{Name: "indexrelid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "indrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "indnatts", Type: Type{Name: "int2"}, Ordinal: 2},
+			{Name: "indnkeyatts", Type: Type{Name: "int2"}, Ordinal: 3},
+			{Name: "indisunique", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "indnullsnotdistinct", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "indisprimary", Type: Type{Name: "bool"}, Ordinal: 6},
+			{Name: "indisexclusion", Type: Type{Name: "bool"}, Ordinal: 7},
+			{Name: "indimmediate", Type: Type{Name: "bool"}, Ordinal: 8},
+			{Name: "indisclustered", Type: Type{Name: "bool"}, Ordinal: 9},
+			{Name: "indisvalid", Type: Type{Name: "bool"}, Ordinal: 10},
+			{Name: "indcheckxmin", Type: Type{Name: "bool"}, Ordinal: 11},
+			{Name: "indisready", Type: Type{Name: "bool"}, Ordinal: 12},
+			{Name: "indislive", Type: Type{Name: "bool"}, Ordinal: 13},
+			{Name: "indisreplident", Type: Type{Name: "bool"}, Ordinal: 14},
+			{Name: "indkey", Type: Type{Name: "int2[]"}, Ordinal: 15},
+			{Name: "indcollation", Type: Type{Name: "oid[]"}, Ordinal: 16},
+			{Name: "indclass", Type: Type{Name: "oid[]"}, Ordinal: 17},
+			{Name: "indoption", Type: Type{Name: "int2[]"}, Ordinal: 18},
+			{Name: "indexprs", Type: Type{Name: "text"}, Ordinal: 19},
+			{Name: "indpred", Type: Type{Name: "text"}, Ordinal: 20},
+			{Name: "indcoloptions", Type: Type{Name: "int2[]"}, Ordinal: 21},
+		},
+		OID: 2610,
+	}
+	pgIndexCatalog.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_index"] = pgIndexCatalog
+
+	// pg_statistic_ext — stores extended statistics objects (OID 3381).
+	// This virtual stub lets queries against pg_statistic_ext succeed instead
+	// of erroring with "relation pg_statistic_ext does not exist". M0097-0023.
+	pgStatisticExt := &Table{
+		Schema: "pg_catalog", Name: "pg_statistic_ext", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "stxrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "stxname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "stxnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "stxowner", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "stxstattarget", Type: Type{Name: "int4"}, Ordinal: 5},
+			{Name: "stxkeys", Type: Type{Name: "int2[]"}, Ordinal: 6},
+			{Name: "stxexprs", Type: Type{Name: "text"}, Ordinal: 7},
+			{Name: "stxkind", Type: Type{Name: "text"}, Ordinal: 8},
+		},
+		OID: 3381,
+	}
+	pgStatisticExt.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_statistic_ext"] = pgStatisticExt
+
+	// pg_collation — stores collation definitions (OID 3456).
+	// This virtual stub lets psql \d+ meta-queries succeed instead of erroring
+	// with "relation pg_collation does not exist". M0097-0023.
+	pgCollation := &Table{
+		Schema: "pg_catalog", Name: "pg_collation", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "collname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "collnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "collowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "collprovider", Type: Type{Name: "char"}, Ordinal: 4},
+			{Name: "collisdeterministic", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "collencoding", Type: Type{Name: "int4"}, Ordinal: 6},
+			{Name: "collcollate", Type: Type{Name: "text"}, Ordinal: 7},
+			{Name: "collctype", Type: Type{Name: "text"}, Ordinal: 8},
+			{Name: "colllocale", Type: Type{Name: "text"}, Ordinal: 9},
+			{Name: "collicurules", Type: Type{Name: "text"}, Ordinal: 10},
+			{Name: "collversion", Type: Type{Name: "text"}, Ordinal: 11},
+		},
+		OID: 3456,
+	}
+	pgCollation.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_collation"] = pgCollation
+
+	// pg_policy — stores row-level security policies (OID 3256).
+	// Row-level security is not implemented in goopg v0; this stub lets psql
+	// \d+ meta-queries succeed instead of erroring. M0097-0023.
+	pgPolicy := &Table{
+		Schema: "pg_catalog", Name: "pg_policy", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "polname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "polrelid", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "polcmd", Type: Type{Name: "char"}, Ordinal: 3},
+			{Name: "polpermissive", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "polroles", Type: Type{Name: "oid[]"}, Ordinal: 5},
+			{Name: "polqual", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "polwithcheck", Type: Type{Name: "text"}, Ordinal: 7},
+		},
+		OID: 3256,
+	}
+	pgPolicy.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_policy"] = pgPolicy
 
 	// pg_wait_events — needs at least one row per type.
 	pgWaitEvents := &Table{
@@ -2792,8 +2950,16 @@ func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 	} else {
 		// Schema-qualified lookup: fall back to unqualified key to handle tables
 		// that were moved to a different schema via SET SCHEMA (catalog key is unchanged).
-		if t, ok := c.tables[name.Name]; ok && strings.EqualFold(t.Schema, name.Schema) {
-			return t, true
+		// A table stored without an explicit schema (t.Schema="") is treated as being
+		// in "public", so a "public.foo" lookup finds a bare-keyed "foo" entry. M0097-0023.
+		if t, ok := c.tables[name.Name]; ok {
+			tSchema := t.Schema
+			if tSchema == "" {
+				tSchema = "public"
+			}
+			if strings.EqualFold(tSchema, name.Schema) {
+				return t, true
+			}
 		}
 	}
 	return nil, false
