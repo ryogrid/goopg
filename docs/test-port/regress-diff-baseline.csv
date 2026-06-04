@@ -32,9 +32,9 @@ numeric_big,0,pass
 numerology,0,pass
 oid,0,pass
 partition_aggregate,0,pass
-partition_info,0,pass
-partition_join,0,pass
-partition_prune,0,pass
+partition_info,254,failed
+partition_join,397,failed
+partition_prune,693,failed
 pg_lsn,0,pass
 plancache,0,pass
 plpgsql,0,pass

@@ -2442,6 +2442,41 @@ func (o *aggregateOp) finishAgg(st aggRuntime, call planner.AggregateCall) Datum
 			}
 			return NewStringDatum(formatTextArrayWithNulls(sortedElems, sortedNulls))
 		}
+		// array_agg(DISTINCT x) without ORDER BY: sort elements for deterministic output.
+		// PostgreSQL returns distinct values in ascending order when no ORDER BY is given.
+		if call.Distinct && len(call.OrderBy) == 0 && len(st.arrayElems) > 0 {
+			sortedElems := make([]string, len(st.arrayElems))
+			sortedNulls := make([]bool, len(st.arrayElemNull))
+			copy(sortedElems, st.arrayElems)
+			copy(sortedNulls, st.arrayElemNull)
+			type elemWithNull struct {
+				s      string
+				isNull bool
+			}
+			pairs := make([]elemWithNull, len(sortedElems))
+			for i := range sortedElems {
+				pairs[i] = elemWithNull{sortedElems[i], i < len(sortedNulls) && sortedNulls[i]}
+			}
+			sort.SliceStable(pairs, func(a, b int) bool {
+				if pairs[a].isNull && pairs[b].isNull {
+					return false
+				}
+				if pairs[a].isNull {
+					return false // NULLs last
+				}
+				if pairs[b].isNull {
+					return true
+				}
+				return pairs[a].s < pairs[b].s
+			})
+			for i, p := range pairs {
+				sortedElems[i] = p.s
+				if i < len(sortedNulls) {
+					sortedNulls[i] = p.isNull
+				}
+			}
+			return NewStringDatum(formatTextArrayWithNulls(sortedElems, sortedNulls))
+		}
 		return NewStringDatum(formatTextArrayWithNulls(st.arrayElems, st.arrayElemNull))
 	case "any_value":
 		if !st.hasValue {

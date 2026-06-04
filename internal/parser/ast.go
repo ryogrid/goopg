@@ -966,7 +966,8 @@ func (s *CreateTableStmt) stmtNode() {}
 type PartitionByClause struct {
 	pos      int
 	Method   string   // "LIST", "RANGE", or "HASH"
-	KeyCols  []string // partition key column names
+	KeyCols  []string // partition key column names; empty string for expression keys
+	KeyExprs []Expr   // expression-based partition keys; nil for plain column keys (M0097-0023)
 	OpClasses []string // operator class per key col (empty string = default); M0097-0027
 }
 

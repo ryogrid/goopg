@@ -1248,25 +1248,133 @@ func routeToPartition(parent *catalog.Table, row Row, im *catalog.InMemory, ctx 
 	return routeToPartitionDepth(parent, row, im, ctx, 0)
 }
 
+// evalPartitionKeyExpr evaluates a partition key expression (e.g. NOT a, abs(b),
+// (a+b)/2) against the given row. Used when the partition key is an expression
+// rather than a plain column reference. M0097-0023.
+func evalPartitionKeyExpr(expr parser.Expr, cols []catalog.Column, row Row) (Datum, error) {
+	switch x := expr.(type) {
+	case *parser.ColumnRef:
+		for i, col := range cols {
+			if strings.EqualFold(col.Name, x.Column) {
+				if i < len(row) {
+					return row[i], nil
+				}
+				return NullDatum, nil
+			}
+		}
+		return NullDatum, nil
+	case *parser.UnaryOp:
+		v, err := evalPartitionKeyExpr(x.Operand, cols, row)
+		if err != nil {
+			return NullDatum, err
+		}
+		if v.IsNull() {
+			return NullDatum, nil
+		}
+		switch x.Op {
+		case parser.OpNot:
+			b := v.Kind == KindString && strings.EqualFold(v.StringValue(), "t") ||
+				v.Kind == KindBool && v.Int != 0 ||
+				v.Kind == KindInt && v.Int != 0
+			return NewBoolDatum(!b), nil
+		case parser.OpUnaryNeg:
+			if v.Kind == KindInt {
+				return NewIntDatum(-v.Int), nil
+			}
+		}
+	case *parser.BinaryOp:
+		l, err := evalPartitionKeyExpr(x.Left, cols, row)
+		if err != nil {
+			return NullDatum, err
+		}
+		r, err2 := evalPartitionKeyExpr(x.Right, cols, row)
+		if err2 != nil {
+			return NullDatum, err2
+		}
+		if l.IsNull() || r.IsNull() {
+			return NullDatum, nil
+		}
+		lv := int64(0)
+		rv := int64(0)
+		if l.Kind == KindInt {
+			lv = l.Int
+		}
+		if r.Kind == KindInt {
+			rv = r.Int
+		}
+		switch x.Op {
+		case parser.OpAdd:
+			return NewIntDatum(lv + rv), nil
+		case parser.OpSub:
+			return NewIntDatum(lv - rv), nil
+		case parser.OpMul:
+			return NewIntDatum(lv * rv), nil
+		case parser.OpDiv:
+			if rv == 0 {
+				return NullDatum, nil
+			}
+			return NewIntDatum(lv / rv), nil
+		}
+	case *parser.FuncCall:
+		if len(x.Args) == 1 {
+			arg, err := evalPartitionKeyExpr(x.Args[0], cols, row)
+			if err != nil {
+				return NullDatum, err
+			}
+			if arg.IsNull() {
+				return NullDatum, nil
+			}
+			switch strings.ToLower(x.Name.Name) {
+			case "abs":
+				if arg.Kind == KindInt {
+					v := arg.Int
+					if v < 0 {
+						v = -v
+					}
+					return NewIntDatum(v), nil
+				}
+			}
+		}
+	case *parser.IntegerConst:
+		return NewIntDatum(x.Value), nil
+	case *parser.BooleanConst:
+		return NewBoolDatum(x.Value), nil
+	case *parser.NullConst:
+		return NullDatum, nil
+	}
+	return NullDatum, fmt.Errorf("unsupported partition key expression type %T", expr)
+}
+
 // routeToPartitionDepth recurses through nested partition hierarchies. The
 // depth guard (max 8) prevents infinite loops on circular catalog states.
 func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory, ctx *Context, depth int) (*catalog.Table, error) {
 	if len(parent.PartitionKey) == 0 || depth > 8 {
 		return nil, nil
 	}
-	// Find the column index for the first partition key (used by LIST/HASH).
-	keyColName := parent.PartitionKey[0]
-	keyIdx := -1
-	for i, col := range parent.Columns {
-		if strings.EqualFold(col.Name, keyColName) {
-			keyIdx = i
-			break
+
+	// resolvePartitionKeyDatum returns the datum for the i-th partition key entry,
+	// either by reading the named column or evaluating the key expression. M0097-0023.
+	resolvePartitionKeyDatum := func(i int) (Datum, error) {
+		if i < len(parent.PartitionKeyExprs) && parent.PartitionKeyExprs[i] != nil {
+			return evalPartitionKeyExpr(parent.PartitionKeyExprs[i], parent.Columns, row)
 		}
+		keyColName := parent.PartitionKey[i]
+		for j, col := range parent.Columns {
+			if strings.EqualFold(col.Name, keyColName) {
+				if j < len(row) {
+					return row[j], nil
+				}
+				return NullDatum, nil
+			}
+		}
+		return NullDatum, nil
 	}
-	if keyIdx < 0 || keyIdx >= len(row) {
-		return nil, nil
+
+	// Find the column index for the first partition key (used by LIST/HASH).
+	keyDatum, err := resolvePartitionKeyDatum(0)
+	if err != nil {
+		return nil, err
 	}
-	keyDatum := row[keyIdx]
 
 	var child *catalog.Table
 	switch parent.PartitionMethod {
@@ -1276,27 +1384,36 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 			keyStr = fmt.Sprintf("%d", keyDatum.Int)
 		} else if keyDatum.Kind == KindString {
 			keyStr = keyDatum.StringValue()
+		} else if keyDatum.Kind == KindBool {
+			// Try both long ("true"/"false") and short ("t"/"f") boolean formats.
+			// Partition bound values come from string literals like 'true'/'false'.
+			if keyDatum.Int != 0 {
+				keyStr = "true"
+			} else {
+				keyStr = "false"
+			}
 		} else if keyDatum.IsNull() {
 			keyStr = "null" // matches FOR VALUES IN (null)
 		}
 		child = im.FindPartitionForValue(parent.OID, keyStr)
+		// Also try short boolean format if no match with long format.
+		if child == nil && keyDatum.Kind == KindBool {
+			short := "f"
+			if keyDatum.Int != 0 {
+				short = "t"
+			}
+			child = im.FindPartitionForValue(parent.OID, short)
+		}
 	case "RANGE":
 		// Build a string-formatted key tuple covering all partition key columns.
 		// This supports both single-column (PartitionKey len=1) and multi-column
 		// (PartitionKey len>1) RANGE partitioning.
 		keyStrs := make([]string, 0, len(parent.PartitionKey))
-		for _, keyCol := range parent.PartitionKey {
-			kidx := -1
-			for i, col := range parent.Columns {
-				if strings.EqualFold(col.Name, keyCol) {
-					kidx = i
-					break
-				}
+		for ki := range parent.PartitionKey {
+			d, kerr := resolvePartitionKeyDatum(ki)
+			if kerr != nil {
+				return nil, kerr
 			}
-			if kidx < 0 || kidx >= len(row) {
-				return nil, nil
-			}
-			d := row[kidx]
 			switch d.Kind {
 			case KindInt:
 				keyStrs = append(keyStrs, fmt.Sprintf("%d", d.Int))

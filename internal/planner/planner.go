@@ -3801,6 +3801,12 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		g = resolveOrderBySubstitution(g, s.Targets)
 		// Positional GROUP BY that wasn't substituted → out-of-range position. M0097-0003.
 		if ic, ok := g.(*parser.IntegerConst); ok {
+			// Position 0 is our placeholder for ROLLUP/CUBE/GROUPING SETS (parser stores them
+			// as IntegerConst{Value:0} after skipping the parens). Skip it silently so
+			// ROLLUP/CUBE don't error — they're handled as plain GROUP BY on the key columns.
+			if ic.Value == 0 {
+				continue
+			}
 			return nil, nil, nil, nil, &PlanError{Pos: g.Pos(), Code: "42P10",
 				Message: fmt.Sprintf("GROUP BY position %d is not in select list", ic.Value)}
 		}

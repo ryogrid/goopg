@@ -616,6 +616,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		tbl.PartitionMethod = s.PartitionBy.Method
 		tbl.PartitionKey = s.PartitionBy.KeyCols
 		tbl.PartitionKeyOpClasses = s.PartitionBy.OpClasses
+		tbl.PartitionKeyExprs = s.PartitionBy.KeyExprs // M0097-0023: expression keys
 		// Partitioned tables are "virtual" for storage purposes:
 		// they never hold rows directly — all data lives in children.
 		// But we still create a heap so the table exists for metadata.
@@ -829,6 +830,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		tbl.PartitionMethod = s.PartitionBy.Method
 		tbl.PartitionKey = s.PartitionBy.KeyCols
 		tbl.PartitionKeyOpClasses = s.PartitionBy.OpClasses
+		tbl.PartitionKeyExprs = s.PartitionBy.KeyExprs // M0097-0023
 	}
 
 	// Build partition bounds from the FOR VALUES clause.

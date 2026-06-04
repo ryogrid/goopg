@@ -1261,27 +1261,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				if !p.acceptSymbol("(") {
 					return nil, p.errAtCur("expected '(' after partition method")
 				}
-				var keyCols, opClasses []string
-				for {
-					col, err := p.parseIdent()
-					if err != nil {
-						return nil, err
-					}
-					keyCols = append(keyCols, identText(col))
-					opClass := ""
-					if p.cur().Kind == TokenIdent {
-						opClass = p.cur().Value
-						p.advance()
-					}
-					opClasses = append(opClasses, opClass)
-					if !p.acceptSymbol(",") {
-						break
-					}
+				keyCols, keyExprs, opClasses, err2 := p.parsePartitionKeyCols()
+				if err2 != nil {
+					return nil, err2
 				}
 				if !p.acceptSymbol(")") {
 					return nil, p.errAtCur("expected ')'")
 				}
-				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, OpClasses: opClasses}
+				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses}
 			}
 		}
 		// ON COMMIT clause may follow FOR VALUES ... in partition tables.
@@ -1543,29 +1530,15 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		if !p.acceptSymbol("(") {
 			return nil, p.errAtCur("expected '(' after partition method")
 		}
-		// Parse column names with optional operator class names. M0097-0015/M0097-0027.
-		var keyCols, opClasses []string
-		for {
-			col, err := p.parseIdent()
-			if err != nil {
-				return nil, err
-			}
-			keyCols = append(keyCols, identText(col))
-			// Optional operator class name (e.g. part_test_int4_ops). M0097-0027.
-			opClass := ""
-			if p.cur().Kind == TokenIdent {
-				opClass = p.cur().Value
-				p.advance()
-			}
-			opClasses = append(opClasses, opClass)
-			if !p.acceptSymbol(",") {
-				break
-			}
+		// Parse column names (or expressions) with optional operator class names. M0097-0015/M0097-0027/M0097-0023.
+		keyCols, keyExprs, opClasses, err2 := p.parsePartitionKeyCols()
+		if err2 != nil {
+			return nil, err2
 		}
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
 		}
-		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, KeyCols: keyCols, OpClasses: opClasses}
+		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses}
 	}
 	if p.acceptKeyword(KwWith) {
 		opts, err := p.parseWithOptions()
@@ -1651,6 +1624,49 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 			return
 		}
 	}
+}
+
+// parsePartitionKeyCols parses the column-list (and possibly expression-list)
+// inside PARTITION BY (key1, key2, ...). Each key may be either a plain column
+// name or a parenthesised expression such as (abs(b)) or ((a+b)/2). M0097-0023.
+func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opClasses []string, err error) {
+	for {
+		var colName string
+		var expr Expr
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			// Expression key: consume the outer '(' and parse a full expression.
+			p.advance()
+			expr, err = p.parseExpr()
+			if err != nil {
+				return
+			}
+			if !p.acceptSymbol(")") {
+				err = p.errAtCur("expected ')' to close partition key expression")
+				return
+			}
+		} else {
+			// Plain column name.
+			var col Token
+			col, err = p.parseIdent()
+			if err != nil {
+				return
+			}
+			colName = identText(col)
+		}
+		keyCols = append(keyCols, colName)
+		keyExprs = append(keyExprs, expr)
+		// Optional operator class name (e.g. part_test_int4_ops). M0097-0027.
+		opClass := ""
+		if p.cur().Kind == TokenIdent {
+			opClass = p.cur().Value
+			p.advance()
+		}
+		opClasses = append(opClasses, opClass)
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return
 }
 
 // parsePartitionBoundValues parses a comma-separated list of partition bound

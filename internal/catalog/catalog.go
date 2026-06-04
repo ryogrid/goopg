@@ -177,6 +177,10 @@ type Table struct {
 	// PartitionKeyOpClasses is the operator class name per key column.
 	// Empty string means "use the default hash function". M0097-0027.
 	PartitionKeyOpClasses []string
+	// PartitionKeyExprs holds the parsed expression AST for expression-based
+	// partition keys. Parallel to PartitionKey: nil entry = plain column name,
+	// non-nil entry = expression (e.g. abs(b), (a+b)/2, NOT a). M0097-0023.
+	PartitionKeyExprs []parser.Expr
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the

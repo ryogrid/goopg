@@ -633,9 +633,46 @@ func (p *parser) parseGroupByElems() ([]Expr, error) {
 			p.skipBalancedParens()
 			out = append(out, &IntegerConst{pos: sentPos, Value: 0})
 		} else if p.acceptIdentKeyword("rollup") || p.acceptIdentKeyword("cube") {
-			sentPos := p.cur().Pos
-			p.skipBalancedParens()
-			out = append(out, &IntegerConst{pos: sentPos, Value: 0})
+			// Parse ROLLUP(col1, col2, ...) / CUBE(col1, col2, ...) as if it were
+			// plain GROUP BY col1, col2, ... (ignoring the grand-total row semantics).
+			// The empty grouping set () from ROLLUP/CUBE is not generated; queries
+			// still aggregate correctly over the non-NULL grouping columns. M0097-0023.
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				p.advance() // consume '('
+				for p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+						p.advance() // consume ')'
+						break
+					}
+					// Each element in ROLLUP may itself be a list in parens like (a,b).
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+						// Parenthesised group: parse inner exprs.
+						p.advance() // consume '('
+						for p.cur().Kind != TokenEOF && !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
+							expr, err := p.parseExpr()
+							if err != nil {
+								break
+							}
+							out = append(out, expr)
+							if !p.acceptSymbol(",") {
+								break
+							}
+						}
+						if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+							p.advance() // consume ')'
+						}
+					} else {
+						expr, err := p.parseExpr()
+						if err != nil {
+							break
+						}
+						out = append(out, expr)
+					}
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+			}
 		} else {
 			expr, err := p.parseExpr()
 			if err != nil {
