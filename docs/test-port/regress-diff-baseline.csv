@@ -88,7 +88,7 @@ aggregates,46,failed
 create_function_sql,0,pass
 create_table_like,116,failed
 join_hash,142,failed
-matview,148,failed
+matview,131,failed
 insert_conflict,179,failed
 index_including,204,failed
 create_table,388,failed
