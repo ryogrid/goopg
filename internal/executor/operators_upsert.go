@@ -79,6 +79,13 @@ type upsertOp struct {
 	// multi-row UPSERTs over the same partition reuse a single
 	// open tree.  Keyed by leaf table OID.  M0100-0005t.
 	leafTrees map[uint32]*btree.BTree
+	// writtenPtrs tracks heap ItemPointers written by this statement
+	// (via applyInsert or applyUpdate).  When a subsequent row in the
+	// same multi-row INSERT conflicts with a pointer in this set, the
+	// conflict target was already affected in this statement and we must
+	// raise SQLSTATE 21000 "ON CONFLICT DO UPDATE command cannot affect
+	// row a second time".  M0097-0028.
+	writtenPtrs map[storage.ItemPointer]struct{}
 }
 
 // RowsAffected satisfies executor.RowCounter — for UPSERT, the
@@ -244,6 +251,21 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			}
 			// Skip silently — RowsAffected does NOT bump.
 		case planner.OnConflictActionUpdate:
+			// Detect "ON CONFLICT DO UPDATE command cannot affect row a second
+			// time": if the conflicting tuple was written by this statement
+			// (its ItemPointer is in writtenPtrs), reject immediately.
+			// This mirrors PostgreSQL's ExecOnConflictUpdate check that
+			// raises SQLSTATE 21000.  M0097-0028.
+			if o.writtenPtrs != nil {
+				if _, secondTime := o.writtenPtrs[conflictPtr]; secondTime {
+					return nil, &ExecError{
+						Code: "21000",
+						Pos:  o.plan.Pos(),
+						Message: "ON CONFLICT DO UPDATE command cannot affect row a second time",
+						Hint: "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.",
+					}
+				}
+			}
 			// When the leaf has different column order, conflictRow is in leaf
 			// order. evalUpdate expects both rows in parent column order (the
 			// UpdateSet expressions are planned against the parent schema).
@@ -302,6 +324,17 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 						o.appendUpsertRetRow(inserted)
 						o.rowsAffected++
 						continue nextSourceRow
+					}
+					// Re-check for second-time conflict after re-probe.
+					if o.writtenPtrs != nil {
+						if _, secondTime := o.writtenPtrs[conflictPtr]; secondTime {
+							return nil, &ExecError{
+								Code:    "21000",
+								Pos:     o.plan.Pos(),
+								Message: "ON CONFLICT DO UPDATE command cannot affect row a second time",
+								Hint:    "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.",
+							}
+						}
 					}
 					// Update evalConflictRow for the re-probed conflict row.
 					evalConflictRow = conflictRow
@@ -669,7 +702,17 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, cols []catalog.Column, i
 	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
 		o.ctx.CTEWriteFence[ptr] = struct{}{}
 	}
+	o.trackWrittenPtr(ptr)
 	return o.maintainArbiter(arbiterKey, ptr)
+}
+
+// trackWrittenPtr records an ItemPointer written in the current statement so
+// a subsequent conflict against the same row can be detected and rejected.
+func (o *upsertOp) trackWrittenPtr(ptr storage.ItemPointer) {
+	if o.writtenPtrs == nil {
+		o.writtenPtrs = make(map[storage.ItemPointer]struct{})
+	}
+	o.writtenPtrs[ptr] = struct{}{}
 }
 
 // applyUpdate stamps xmax on the conflicting tuple and writes the
@@ -712,6 +755,7 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, cols []catalog.Column, o
 	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
 		o.ctx.CTEWriteFence[newPtr] = struct{}{}
 	}
+	o.trackWrittenPtr(newPtr)
 	return o.maintainArbiterRow(arbiterRow, newPtr)
 }
 

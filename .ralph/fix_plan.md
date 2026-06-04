@@ -2734,6 +2734,34 @@ M0097-0001 wires it up.
         Remaining blockers: REFERENCING NEW TABLE AS in triggers (missing NOTICE),
         subquery correlated DO UPDATE patterns, excluded.col references, schema
         qualified columns in DO UPDATE, row-expression predicates in WHERE clause.
+      - **Progress 2026-06-04 (M0097-0028 — partition cascade + UNIQUE constraint fix, loop 9):**
+        Five coordinated fixes (this commit):
+        (a) TRUNCATE partition cascade: `execTruncate` now calls
+            `truncateTableAndPartitions` which recursively clears leaf partitions
+            before the parent. Before this fix, TRUNCATE on a partitioned table
+            left data in child partitions (stale rows persisted across tests).
+        (b) DROP TABLE partition cascade: `execDropTable` now uses a recursive
+            closure `dropPartitionDescendants` to drop grandchildren before
+            parents. Before this fix, `DROP TABLE grandparent` only dropped
+            immediate children, leaving grandchildren in the catalog
+            ("relation already exists" on re-create).
+        (c) ON CONFLICT DO UPDATE "cannot affect row a second time": `upsertOp`
+            now tracks written `storage.ItemPointer`s per statement
+            (`writtenPtrs`); when a subsequent row conflicts with a pointer
+            already written in this statement, raises SQLSTATE 21000.
+            Before: multi-row INSERTs (1,'a'),(1,'b') on a unique col silently
+            applied two updates; expected to fail and rollback.
+        (d) Inline column UNIQUE constraint creates btree index: `CREATE TABLE
+            t (a int UNIQUE, b text)` now creates `t_a_key` btree index.
+            Before: `a UNIQUE` was parsed as a no-op; ON CONFLICT (a) always
+            raised "no unique or exclusion constraint matching".
+        (e) Table-level UNIQUE + PARTITION OF (col UNIQUE) also create btree
+            indexes via `TableUniques [][]string` (parser) and
+            `poc.UniqueColumns []string` (PARTITION OF parser).
+        `insert_conflict` regress: 179 → 150 diff lines.
+        Remaining blockers: wholerow references (i.*, excluded.*), view-based
+        upsert through cascaded check views, dropped-column RETURNING,
+        gist exclusion constraints, composite row comparison predicates.
 
 - [x] **M0097-0029 — Port extended-type / dbsize regress tests**
       - Summary: Make these 22 tests reach `pass`:

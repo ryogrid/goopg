@@ -1091,20 +1091,37 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			return nil, err
 		}
 		poc := &PartitionOfClause{pos: pos, Parent: parentName}
-		// Optional column definition list (for adding columns to partition)
+		// Optional column definition list: `(col_name UNIQUE [, ...])`.
+		// We extract UNIQUE constraints; other column attributes are ignored.
+		// M0097-0028.
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 			p.advance()
 			if !p.acceptSymbol(")") {
-				// skip column defs inside partition OF for now
+				// Parse each column entry looking for UNIQUE.
+				// Grammar: col_name [type] [constraint ...] [, ...]
+				// We track depth so nested parens (e.g. DEFAULT values) are skipped.
 				depth := 1
+				var curColName string
 				for depth > 0 && p.cur().Kind != TokenEOF {
-					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+					t := p.cur()
+					if t.Kind == TokenSymbol && t.Value == "(" {
 						depth++
-					}
-					if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+						p.advance()
+					} else if t.Kind == TokenSymbol && t.Value == ")" {
 						depth--
-					}
-					if depth > 0 {
+						if depth > 0 {
+							p.advance()
+						}
+					} else if depth == 1 && t.Kind == TokenSymbol && t.Value == "," {
+						curColName = ""
+						p.advance()
+					} else if depth == 1 && curColName == "" && (t.Kind == TokenIdent || t.Kind == TokenKeyword) {
+						curColName = t.Value
+						p.advance()
+					} else if depth == 1 && t.Kind == TokenKeyword && t.Keyword == KwUnique && curColName != "" {
+						poc.UniqueColumns = append(poc.UniqueColumns, curColName)
+						p.advance()
+					} else {
 						p.advance()
 					}
 				}
@@ -1297,11 +1314,18 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				_ = p.acceptIdentKeyword("immediate")
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
-			// Table-level UNIQUE (cols) — accept as no-op for now.
+			// Table-level UNIQUE (cols) — create btree index. M0097-0028.
 			p.advance()
 			if p.acceptSymbol("(") {
+				var cols []string
 				for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+						cols = append(cols, p.cur().Value)
+					}
 					p.advance()
+				}
+				if len(cols) > 0 {
+					stmt.TableUniques = append(stmt.TableUniques, cols)
 				}
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
@@ -1358,10 +1382,18 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					_ = p.acceptIdentKeyword("immediate")
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
+				// CONSTRAINT name UNIQUE (cols) — store as table-level unique. M0097-0028.
 				p.advance()
 				if p.acceptSymbol("(") {
+					var cols []string
 					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+						if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+							cols = append(cols, p.cur().Value)
+						}
 						p.advance()
+					}
+					if len(cols) > 0 {
+						stmt.TableUniques = append(stmt.TableUniques, cols)
 					}
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
@@ -1778,7 +1810,8 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			}
 		// UNIQUE constraint on column
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
-			p.advance() // accepted as no-op; index will be created explicitly
+			p.advance()
+			col.Unique = true
 		// CHECK (expr) inline column constraint. M0097-0014.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 			p.advance()

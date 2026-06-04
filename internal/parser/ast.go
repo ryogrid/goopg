@@ -863,6 +863,7 @@ type ColumnDef struct {
 	Type    ColumnType
 	NotNull bool
 	Primary bool // inline `PRIMARY KEY` constraint
+	Unique  bool // inline `UNIQUE` constraint
 	// GeneratedAlways is true for `GENERATED ALWAYS AS (expr) STORED` columns.
 	// M0096-0008.
 	GeneratedAlways bool
@@ -943,6 +944,10 @@ type CreateTableStmt struct {
 	// TableChecks holds raw SQL expressions from table-level CHECK constraints.
 	// M0097-0014.
 	TableChecks []string
+	// TableUniques holds column-name lists from table-level UNIQUE (col1, col2)
+	// constraints. Each entry is the list of columns for one UNIQUE clause.
+	// M0097-0028.
+	TableUniques [][]string
 	// LikeTables holds the source table names from LIKE clauses.
 	// `CREATE TABLE t (LIKE src INCLUDING DEFAULTS)` copies src's columns. M0097-0069.
 	// Deprecated: use BodyOrder for positional interleaving.
@@ -981,6 +986,10 @@ type PartitionOfClause struct {
 	Modulus   int64
 	Remainder int64
 	IsHash    bool
+	// UniqueColumns holds column names from the optional column-constraint list
+	// in PARTITION OF, e.g. `CREATE TABLE t1 PARTITION OF t (b UNIQUE) FOR VALUES IN (1)`.
+	// Each entry is a column name to create a unique index on. M0097-0028.
+	UniqueColumns []string
 }
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]

@@ -666,6 +666,31 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			return err
 		}
 	}
+	// Create btree indexes for inline column-level UNIQUE constraints.
+	// e.g. `CREATE TABLE t (a int UNIQUE, b text)` — M0097-0028.
+	for _, c := range s.Columns {
+		if c.Unique {
+			idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + c.Name + "_key"}
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false); err != nil {
+				return err
+			}
+		}
+	}
+	// Create btree indexes for table-level UNIQUE (col1, col2) constraints.
+	// e.g. `UNIQUE (a, b)` — M0097-0028.
+	for i, cols := range s.TableUniques {
+		suffix := "_key"
+		if len(cols) == 1 {
+			suffix = "_" + cols[0] + "_key"
+		}
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: fmt.Sprintf("%s%s%d", tbl.Name, suffix, i)}
+		if len(s.TableUniques) == 1 {
+			idxName.Name = tbl.Name + suffix
+		}
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, cols, nil, true, false); err != nil {
+			return err
+		}
+	}
 	// Register CHECK constraints from columns and table-level. M0097-0014.
 	for _, c := range s.Columns {
 		if c.CheckExpr != "" {
@@ -880,6 +905,15 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + suffix}
 		}
 		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary); err != nil {
+			return err
+		}
+	}
+	// Create btree indexes for UNIQUE column constraints declared directly on
+	// this partition: `CREATE TABLE child PARTITION OF parent (b UNIQUE) FOR VALUES …`.
+	// M0097-0028.
+	for _, colName := range poc.UniqueColumns {
+		childIdxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + colName + "_key"}
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, []string{colName}, nil, true, false); err != nil {
 			return err
 		}
 	}
@@ -1248,11 +1282,26 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 		// - Partition children: ALWAYS (they can't exist without the parent).
 		// - Inheritance children: only with CASCADE (M0100-0004).
 		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
-			for _, child := range im.PartitionChildren(tbl.OID) {
-				childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
-				if err := o.dropTableByRef(childName, child); err != nil {
-					return err
+			// dropPartitionDescendants recurses depth-first so grandchild
+			// partitions are dropped before their parents. Without recursion,
+			// DROP TABLE on a 2-level partitioned hierarchy left grandchildren
+			// in the catalog, causing "relation already exists" on the next
+			// CREATE TABLE with the same name. M0097-0028.
+			var dropPartitionDescendants func(parent *catalog.Table) error
+			dropPartitionDescendants = func(parent *catalog.Table) error {
+				for _, child := range im.PartitionChildren(parent.OID) {
+					if err := dropPartitionDescendants(child); err != nil {
+						return err
+					}
+					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+					if err := o.dropTableByRef(childName, child); err != nil {
+						return err
+					}
 				}
+				return nil
+			}
+			if err := dropPartitionDescendants(tbl); err != nil {
+				return err
 			}
 			if s.Behavior == parser.DropCascade {
 				inheritChildren := im.InheritanceChildren(tbl.OID)
@@ -2824,36 +2873,59 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		if !ok {
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", name.String())}
 		}
-		idxs := o.ctx.Catalog.IndexesOnTable(tbl)
-		rel := o.ctx.Catalog.RelFileNode(tbl)
-		o.ctx.Pool.InvalidateRel(rel)
-		if err := o.ctx.Pool.Manager().TruncateRelation(rel); err != nil {
-			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+		if err := o.truncateTableAndPartitions(tbl, s.Pos()); err != nil {
+			return err
 		}
-		// M0090-0001: clear FSM + VM entries for the truncated
-		// heap. Without this, the next INSERT consults the FSM,
-		// gets a stale block number, calls Pin → ReadBlock and
-		// errors with `short read at block` because nblocks=0
-		// post-truncate.
-		if o.ctx.FSM != nil {
-			o.ctx.FSM.DropRelation(rel)
-		}
-		if o.ctx.VM != nil {
-			o.ctx.VM.DropRelation(rel)
-		}
-		for _, idx := range idxs {
-			idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
-			o.ctx.Pool.InvalidateRel(idxRel)
-			if err := o.ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
-				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// truncateTableAndPartitions truncates a single table's heap + indexes and
+// recursively cascades to all partition descendants. This matches PostgreSQL's
+// TRUNCATE behaviour where a partitioned table implicitly truncates every leaf.
+// M0097-0028 fix: without recursion, TRUNCATE on a multi-level partitioned
+// table left data in grandchild partitions, causing subsequent tests to see
+// stale rows.
+func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int) error {
+	// First recurse into partition children so the leaves are cleared before
+	// the parent (matches PG's depth-first traversal order, though the order
+	// doesn't matter for correctness here).
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, child := range im.PartitionChildren(tbl.OID) {
+			if err := o.truncateTableAndPartitions(child, pos); err != nil {
+				return err
 			}
-			// FSM/VM are heap-relation maps; index relfiles
-			// have no entries to clear. (Btrees track their
-			// own free space inline.) Pair the FSM/VM cleanup
-			// only with the heap rel above.
-			if _, err := btree.Create(o.ctx.Pool, idxRel); err != nil {
-				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
-			}
+		}
+	}
+	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	o.ctx.Pool.InvalidateRel(rel)
+	if err := o.ctx.Pool.Manager().TruncateRelation(rel); err != nil {
+		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	}
+	// M0090-0001: clear FSM + VM entries for the truncated
+	// heap. Without this, the next INSERT consults the FSM,
+	// gets a stale block number, calls Pin → ReadBlock and
+	// errors with `short read at block` because nblocks=0
+	// post-truncate.
+	if o.ctx.FSM != nil {
+		o.ctx.FSM.DropRelation(rel)
+	}
+	if o.ctx.VM != nil {
+		o.ctx.VM.DropRelation(rel)
+	}
+	for _, idx := range idxs {
+		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+		o.ctx.Pool.InvalidateRel(idxRel)
+		if err := o.ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
+			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+		}
+		// FSM/VM are heap-relation maps; index relfiles
+		// have no entries to clear. (Btrees track their
+		// own free space inline.) Pair the FSM/VM cleanup
+		// only with the heap rel above.
+		if _, err := btree.Create(o.ctx.Pool, idxRel); err != nil {
+			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}
 	}
 	return nil
