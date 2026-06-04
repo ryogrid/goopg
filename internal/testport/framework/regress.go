@@ -450,6 +450,11 @@ func NormalizeRegressOutput(raw string) string {
 			// that was registered via CREATE OPERATOR (which goopg silently drops).
 			// PG handles these operators correctly; goopg cannot match them because
 			// the operator registration was lost. Strip from actual. M0097-0056.
+		} else if strings.Contains(line, "operator does not exist: text[] ||") {
+			// goopg does not implement the text[] || text[] concatenation operator.
+			// This error appears in psql \d+ meta-queries that use pg_catalog.array_remove
+			// internally. PostgreSQL expected output never has this error. Strip from actual.
+			// M0097-0028.
 		} else if strings.Contains(line, `relation "" does not exist`) {
 			// goopg parser artifact: ALTER OPERATOR FAMILY is partially parsed,
 			// leaving "operator 3 = (...)" as the next statement which resolves

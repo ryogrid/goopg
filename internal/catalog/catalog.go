@@ -1229,6 +1229,19 @@ func (c *InMemory) registerSystemTables() {
 			//   `SELECT c.oid, c.relreplident, c.relkind FROM pg_class c …`
 			// 'd' = REPLICA_IDENTITY_DEFAULT (PG default for tables).
 			{Name: "relreplident", Type: Type{Name: "char"}, Ordinal: 9},
+			// relchecks: number of CHECK constraints. Always 0 in goopg v0.
+			{Name: "relchecks", Type: Type{Name: "int2"}, Ordinal: 10},
+			// Additional columns used by psql \d+ meta-commands. M0097-0028.
+			{Name: "relhasindex", Type: Type{Name: "bool"}, Ordinal: 11},
+			{Name: "relhasrules", Type: Type{Name: "bool"}, Ordinal: 12},
+			{Name: "relhastriggers", Type: Type{Name: "bool"}, Ordinal: 13},
+			{Name: "relrowsecurity", Type: Type{Name: "bool"}, Ordinal: 14},
+			{Name: "relforcerowsecurity", Type: Type{Name: "bool"}, Ordinal: 15},
+			{Name: "relhasoids", Type: Type{Name: "bool"}, Ordinal: 16},
+			{Name: "relispartition", Type: Type{Name: "bool"}, Ordinal: 17},
+			{Name: "reltablespace", Type: Type{Name: "oid"}, Ordinal: 18},
+			{Name: "reloftype", Type: Type{Name: "oid"}, Ordinal: 19},
+			{Name: "reloptions", Type: Type{Name: "text[]"}, Ordinal: 20},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -1268,6 +1281,14 @@ func (c *InMemory) registerSystemTables() {
 			if nsOID == 0 {
 				nsOID = 2200 // default to public
 			}
+			hasIdx := "f"
+			if len(c.byTable[t.OID]) > 0 {
+				hasIdx = "t"
+			}
+			isPartition := "f"
+			if t.PartitionParentOID != 0 {
+				isPartition = "t"
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // oid: numeric OID (M0103-0008 rung 16)
 				t.Name,                       // relname
@@ -1279,6 +1300,17 @@ func (c *InMemory) registerSystemTables() {
 				populated,                    // relispopulated
 				strconv.Itoa(len(t.Columns)), // relnatts: number of user columns
 				"d",                          // relreplident: REPLICA_IDENTITY_DEFAULT
+				"0",                          // relchecks: number of CHECK constraints
+				hasIdx,                       // relhasindex
+				"f",                          // relhasrules
+				"f",                          // relhastriggers
+				"f",                          // relrowsecurity
+				"f",                          // relforcerowsecurity
+				"f",                          // relhasoids
+				isPartition,                  // relispartition
+				"0",                          // reltablespace
+				"0",                          // reloftype
+				// reloptions omitted → NULL via NullConst fallback in rematerialiseVirtualRowsFromStrings
 			})
 		}
 		// Emit index rows (relkind='i') so pg_class can be used to count indexes.
@@ -1311,6 +1343,17 @@ func (c *InMemory) registerSystemTables() {
 				"t",                          // relispopulated
 				"0",                          // relnatts
 				"n",                          // relreplident: not applicable for indexes
+				"0",                          // relchecks
+				"f",                          // relhasindex
+				"f",                          // relhasrules
+				"f",                          // relhastriggers
+				"f",                          // relrowsecurity
+				"f",                          // relforcerowsecurity
+				"f",                          // relhasoids
+				"f",                          // relispartition
+				"0",                          // reltablespace
+				"0",                          // reloftype
+				"",                           // reloptions: NULL
 			})
 		}
 		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
@@ -1318,16 +1361,27 @@ func (c *InMemory) registerSystemTables() {
 		//   SELECT oid::int8 FROM pg_class WHERE relname = 'pg_class'
 		// must return 1259. M0097-0029.
 		out = append(out, []string{
-			"1259",  // oid
+			"1259",     // oid
 			"pg_class", // relname
-			"r",    // relkind = regular table
-			"11",   // relnamespace = pg_catalog
-			"p",    // relpersistence
-			"0",    // reltoastrelid
-			"0",    // relpages
-			"t",    // relispopulated
-			"10",   // relnatts: 10 columns defined above
-			"n",    // relreplident
+			"r",        // relkind = regular table
+			"11",       // relnamespace = pg_catalog
+			"p",        // relpersistence
+			"0",        // reltoastrelid
+			"0",        // relpages
+			"t",        // relispopulated
+			"20",       // relnatts: 20 columns defined above
+			"n",        // relreplident
+			"0",        // relchecks
+			"t",        // relhasindex (pg_class itself has indexes)
+			"f",        // relhasrules
+			"f",        // relhastriggers
+			"f",        // relrowsecurity
+			"f",        // relforcerowsecurity
+			"f",        // relhasoids
+			"f",        // relispartition
+			"0",        // reltablespace
+			"0",        // reloftype
+			// reloptions omitted → NULL
 		})
 		return out
 	}
@@ -2143,6 +2197,32 @@ func (c *InMemory) registerSystemTables() {
 		return rows
 	}
 	c.tables["pg_catalog.pg_timezone_abbrevs"] = pgTimezoneAbbrevs
+
+	// pg_am — access method catalog (OID 2601).
+	// Returns the standard set of PostgreSQL access methods so queries
+	// that join pg_am (e.g. \d+ in psql) succeed. M0097-0028.
+	pgAm := &Table{
+		Schema: "pg_catalog", Name: "pg_am", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "amname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "amhandler", Type: Type{Name: "regproc"}, Ordinal: 2},
+			{Name: "amtype", Type: Type{Name: "char"}, Ordinal: 3},
+		},
+		OID: 2601,
+	}
+	pgAm.VirtualRows = func() [][]string {
+		return [][]string{
+			{"2", "heap", "3", "t"},
+			{"403", "btree", "330", "i"},
+			{"405", "hash", "331", "i"},
+			{"783", "gist", "332", "i"},
+			{"2742", "gin", "333", "i"},
+			{"4000", "spgist", "334", "i"},
+			{"3580", "brin", "335", "i"},
+		}
+	}
+	c.tables["pg_catalog.pg_am"] = pgAm
 
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
