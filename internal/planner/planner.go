@@ -897,6 +897,16 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		remapWithBindings(node, ctx.bindings)
 	}
 
+	// Aggregate sublink promotion: when the outer SELECT has exactly one target
+	// that is a scalar subquery containing a single aggregate referencing outer
+	// scope, promote the whole query to an aggregate query. PostgreSQL does this
+	// to produce one result row for `SELECT (SELECT max(...)) FROM t`.
+	if len(s.GroupBy) == 0 && s.Having == nil && len(s.OrderBy) == 0 && !s.Distinct && s.Limit == nil && s.Offset == nil {
+		if promoted, ok, _ := tryPromoteAggSublink(s, node, ctx, cat); ok {
+			return promoted, nil
+		}
+	}
+
 	var agg *aggregateSurface
 	savedBindings := ctx.bindings
 	if needsAggregateStage(s, cat) {
@@ -3485,6 +3495,110 @@ type windowSurface struct {
 	windowByKey map[string]windowBinding
 }
 
+// hasColumnRefOrSubquery reports whether the expression tree contains any
+// ColumnRef or SubqueryExpr node, indicating a potential outer-scope reference.
+func hasColumnRefOrSubquery(e parser.Expr) bool {
+	if e == nil {
+		return false
+	}
+	switch x := e.(type) {
+	case *parser.ColumnRef:
+		return true
+	case *parser.SubqueryExpr:
+		return true
+	case *parser.BinaryOp:
+		return hasColumnRefOrSubquery(x.Left) || hasColumnRefOrSubquery(x.Right)
+	case *parser.UnaryOp:
+		return hasColumnRefOrSubquery(x.Operand)
+	case *parser.CastExpr:
+		return hasColumnRefOrSubquery(x.Operand)
+	case *parser.FuncCall:
+		for _, a := range x.Args {
+			if hasColumnRefOrSubquery(a) {
+				return true
+			}
+		}
+		if x.Filter != nil && hasColumnRefOrSubquery(x.Filter) {
+			return true
+		}
+		return false
+	case *parser.CaseExpr:
+		for _, w := range x.Whens {
+			if hasColumnRefOrSubquery(w.When) || hasColumnRefOrSubquery(w.Then) {
+				return true
+			}
+		}
+		return hasColumnRefOrSubquery(x.Else)
+	case *parser.InExpr:
+		return hasColumnRefOrSubquery(x.Operand)
+	case *parser.ExistsExpr:
+		return false
+	}
+	return false
+}
+
+// tryPromoteAggSublink checks if the outer SELECT can be promoted to an aggregate
+// query when its sole target is a scalar subquery containing a single aggregate
+// that references the outer FROM. This matches PostgreSQL's aggregate sublink
+// promotion: `SELECT (SELECT max(o.col)) FROM t o` → one result row.
+// Returns (node, true, nil) on success, (nil, false, nil) to fall back.
+func tryPromoteAggSublink(s *parser.SelectStmt, fromNode Node, fromCtx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
+	if len(s.Targets) != 1 {
+		return nil, false, nil
+	}
+	sqExpr, ok := s.Targets[0].Expr.(*parser.SubqueryExpr)
+	if !ok {
+		return nil, false, nil
+	}
+	inner := sqExpr.Inner
+	if inner == nil || len(inner.Targets) != 1 || inner.SetOp != nil ||
+		len(inner.GroupBy) > 0 || len(inner.ValuesRows) > 0 {
+		return nil, false, nil
+	}
+	innerFc, ok := inner.Targets[0].Expr.(*parser.FuncCall)
+	if !ok {
+		return nil, false, nil
+	}
+	if !isAggregateFunc(innerFc) && !isUserAggregateFunc(innerFc, cat) {
+		return nil, false, nil
+	}
+	// Reject nested aggregates: if any arg itself contains an aggregate call,
+	// this is a nested aggregate (e.g. max(min(x))) which must produce an error,
+	// not be promoted. Let normal planning handle (and reject) it.
+	for _, a := range innerFc.Args {
+		if exprHasAggregate(a) {
+			return nil, false, nil
+		}
+	}
+
+	// Check that the aggregate references outer scope (column ref or subquery in args/filter).
+	// Only promote if the aggregate uses a ColumnRef or SubqueryExpr — indicating
+	// the aggregate argument depends on the outer FROM clause.
+	refersOuter := false
+	for _, a := range innerFc.Args {
+		if hasColumnRefOrSubquery(a) {
+			refersOuter = true
+			break
+		}
+	}
+	if !refersOuter && innerFc.Filter != nil && hasColumnRefOrSubquery(innerFc.Filter) {
+		refersOuter = true
+	}
+	if !refersOuter {
+		return nil, false, nil
+	}
+	// Build a synthetic SelectStmt with the inner aggregate as the sole target,
+	// and attempt to plan it as an aggregate over the outer FROM node.
+	synthetic := &parser.SelectStmt{}
+	*synthetic = *s
+	synthetic.Targets = []parser.ResTarget{{Expr: innerFc, Alias: s.Targets[0].Alias}}
+	aggNode, _, _, _, err := buildAggregateStage(synthetic, fromNode, fromCtx, cat)
+	if err != nil {
+		return nil, false, nil // fall back gracefully
+	}
+	return aggNode, true, nil
+}
+
 func needsAggregateStage(s *parser.SelectStmt, cat catalog.Catalog) bool {
 	if len(s.GroupBy) > 0 {
 		return true
@@ -3885,6 +3999,27 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		aggByKey[k] = aggregateBinding{index: idx, typ: pa.Type}
 		plannedAggs = append(plannedAggs, pa)
 		outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: pa.Type})
+	}
+
+	// Fix: scan HAVING's EXISTS/IN subquery WHERE clauses for outer aggregate refs.
+	// Example: HAVING EXISTS (SELECT 1 FROM b WHERE sum(distinct a.four) = b.four)
+	// The sum(distinct a.four) is an outer aggregate reference that must be registered
+	// so resolveExprAfterAggregate (via resolveColumnRef → havingAgg lookup) can find it.
+	if s.Having != nil {
+		for _, fc := range collectHavingSubqueryAggCalls(s.Having, cat) {
+			k := aggregateCallKey(fc)
+			if _, exists := aggByKey[k]; exists {
+				continue
+			}
+			pa, err := buildAggregateCall(fc, inputCtx, cat)
+			if err != nil {
+				continue // skip if unresolvable (e.g. wrong context)
+			}
+			idx := len(outputSchema)
+			aggByKey[k] = aggregateBinding{index: idx, typ: pa.Type}
+			plannedAggs = append(plannedAggs, pa)
+			outputSchema = append(outputSchema, SchemaColumn{Name: strings.ToLower(fc.Name.Name), Type: pa.Type})
+		}
 	}
 
 	// Assign shared state slots for user-defined aggregates that share sfunc/stype/args/distinct/filter.
@@ -4556,6 +4691,19 @@ func collectAggregateCalls(s *parser.SelectStmt, cat catalog.Catalog) ([]*parser
 					}
 				}
 			}
+			// Check ORDER BY expressions (inside the aggregate call) for nested
+			// aggregates. When an ORDER BY clause contains a scalar subquery that
+			// itself has an aggregate, that is a nested-aggregate error (PG detects
+			// this at parse/analysis time). M0097-0035.
+			for _, sb := range fc.OrderBy {
+				if sqe, ok := sb.Expr.(*parser.SubqueryExpr); ok && sqe.Inner != nil {
+					for _, t := range sqe.Inner.Targets {
+						if exprHasAggregate(t.Expr) {
+							return &PlanError{Pos: t.Expr.Pos(), Code: "42803", Message: "aggregate function calls cannot be nested"}
+						}
+					}
+				}
+			}
 			k := aggregateCallKey(fc)
 			if _, ok := seen[k]; ok {
 				return nil
@@ -4581,6 +4729,53 @@ func collectAggregateCalls(s *parser.SelectStmt, cat catalog.Catalog) ([]*parser
 		}
 	}
 	return out, nil
+}
+
+// collectHavingSubqueryAggCalls scans a HAVING expression for EXISTS/IN subqueries
+// and returns aggregate calls found in their WHERE clauses that are not already in aggByKey.
+// This registers outer aggregate refs (e.g. sum(distinct a.four) in HAVING EXISTS WHERE)
+// so the HAVING resolver can produce correct OuterColumnRef nodes.
+func collectHavingSubqueryAggCalls(having parser.Expr, cat catalog.Catalog) []*parser.FuncCall {
+	var result []*parser.FuncCall
+	var scanExpr func(e parser.Expr)
+	scanExpr = func(e parser.Expr) {
+		if e == nil {
+			return
+		}
+		switch x := e.(type) {
+		case *parser.ExistsExpr:
+			if x.Subquery != nil && x.Subquery.Where != nil {
+				_ = walkExpr(x.Subquery.Where, func(fc *parser.FuncCall) error {
+					if isAggregateFunc(fc) || isUserAggregateFunc(fc, cat) {
+						result = append(result, fc)
+					}
+					return nil
+				})
+			}
+		case *parser.InExpr:
+			if x.Subquery != nil && x.Subquery.Where != nil {
+				_ = walkExpr(x.Subquery.Where, func(fc *parser.FuncCall) error {
+					if isAggregateFunc(fc) || isUserAggregateFunc(fc, cat) {
+						result = append(result, fc)
+					}
+					return nil
+				})
+			}
+		case *parser.BinaryOp:
+			scanExpr(x.Left)
+			scanExpr(x.Right)
+		case *parser.UnaryOp:
+			scanExpr(x.Operand)
+		case *parser.CaseExpr:
+			for _, w := range x.Whens {
+				scanExpr(w.When)
+				scanExpr(w.Then)
+			}
+			scanExpr(x.Else)
+		}
+	}
+	scanExpr(having)
+	return result
 }
 
 func walkExpr(e parser.Expr, fn func(*parser.FuncCall) error) error {
@@ -5422,6 +5617,48 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 	}
 	leftCol, lIsCol := b.Left.(*parser.ColumnRef)
 	rightCol, rIsCol := b.Right.(*parser.ColumnRef)
+
+	// When both sides are ColumnRefs (e.g. WHERE inner.col = outer.col in a
+	// correlated subquery), check if one side resolves to an OuterColumnRef.
+	// If so, treat it as the key expression (the outer value drives the probe).
+	if lIsCol && rIsCol {
+		leftResolved, leftErr := resolveExpr(b.Left, ctx)
+		rightResolved, rightErr := resolveExpr(b.Right, ctx)
+		_, leftIsOuter := leftResolved.(*OuterColumnRef)
+		_, rightIsOuter := rightResolved.(*OuterColumnRef)
+		if leftErr == nil && rightErr == nil && (leftIsOuter || rightIsOuter) {
+			var colRef *parser.ColumnRef
+			var resolvedKey Expr
+			if rightIsOuter {
+				colRef = leftCol
+				resolvedKey = rightResolved
+			} else {
+				colRef = rightCol
+				resolvedKey = leftResolved
+			}
+			resolvedCol, err := resolveColumnRef(colRef, ctx)
+			if err != nil {
+				return nil, false, nil
+			}
+			col, ok := resolvedCol.(*ColumnRef)
+			if !ok {
+				return nil, false, nil
+			}
+			idx := findBTreeIndexForColumn(cat, tbl, col.Name)
+			if idx == nil {
+				return nil, false, nil
+			}
+			return &IndexScan{
+				pos:    where.Pos(),
+				Table:  tbl,
+				Index:  idx,
+				Key:    resolvedKey,
+				schema: ctx.schema,
+			}, true, nil
+		}
+		return nil, false, nil
+	}
+
 	if lIsCol == rIsCol {
 		return nil, false, nil
 	}
