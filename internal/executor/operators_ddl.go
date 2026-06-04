@@ -1268,7 +1268,7 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 			matDeps := matViewsDependingOnRelation(im, name)
 			for _, depName := range matDeps {
 				if !dropped[depName.String()] {
-					if err := o.execDropOneMatView(depName, true, behavior, pos, dropped); err != nil {
+					if err := o.execDropOneMatView(depName, true, behavior, pos, dropped, false); err != nil {
 						return err
 					}
 				}
@@ -1292,7 +1292,9 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 
 // execDropOneMatView drops a single materialized view, cascading to dependent matviews when
 // behavior == DropCascade. The dropped map prevents infinite recursion.
-func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavior parser.DropBehavior, pos int, dropped map[string]bool) error {
+// emitNotice controls whether this call emits its own NOTICE (false when called from execDropTable/View
+// which already emits the grouped notice at the top level).
+func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavior parser.DropBehavior, pos int, dropped map[string]bool, emitNotice bool) error {
 	key := name.String()
 	if dropped[key] {
 		return nil // already being dropped in this cascade
@@ -1312,13 +1314,34 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 	dropped[key] = true
 
 	// CASCADE: drop any dependent matviews before dropping this one.
-	// Notices are emitted by the top-level caller, not here.
+	// Only emit notices when emitNotice=true (top-level DROP MATERIALIZED VIEW only).
 	if behavior == parser.DropCascade {
 		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 			matDeps := matViewsDependingOnRelation(im, name)
+			if emitNotice {
+				// Emit cascade notice before dropping.
+				newDeps := make([]parser.ObjectName, 0, len(matDeps))
+				for _, dep := range matDeps {
+					if !dropped[dep.String()] {
+						newDeps = append(newDeps, dep)
+					}
+				}
+				if len(newDeps) == 1 {
+					o.ctx.AddNotice(fmt.Sprintf("drop cascades to materialized view %s", newDeps[0].String()))
+				} else if len(newDeps) > 1 {
+					details := make([]string, len(newDeps))
+					for i, d := range newDeps {
+						details[i] = fmt.Sprintf("drop cascades to materialized view %s", d.String())
+					}
+					o.ctx.AddNoticeWithDetail(
+						fmt.Sprintf("drop cascades to %d other objects", len(newDeps)),
+						strings.Join(details, "\n"),
+					)
+				}
+			}
 			for _, depName := range matDeps {
 				if !dropped[depName.String()] {
-					if err := o.execDropOneMatView(depName, true, behavior, pos, dropped); err != nil {
+					if err := o.execDropOneMatView(depName, true, behavior, pos, dropped, false); err != nil {
 						return err
 					}
 				}
@@ -1602,7 +1625,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 							return err
 						}
 					} else if d.kind == "materialized view" {
-						if err := o.execDropOneMatView(d.viewName, true, parser.DropCascade, s.Pos(), droppedViews); err != nil {
+						if err := o.execDropOneMatView(d.viewName, true, parser.DropCascade, s.Pos(), droppedViews, false); err != nil {
 							return err
 						}
 					} else if d.kind == "function" && d.routine != nil {
@@ -1927,6 +1950,18 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 }
 
 func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
+	// Handle SET SCHEMA — move a table/matview to a new schema. M0097-0025.
+	if s.SetSchema != "" {
+		tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
+		if !ok {
+			if s.IfExists {
+				return nil
+			}
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
+		}
+		tbl.Schema = s.SetSchema
+		return nil
+	}
 	tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
 	if !ok {
 		// Not a heap table — check if it's an index.
@@ -2127,7 +2162,25 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
-			// No actual rename implemented yet — just validate.
+			// Rename the column in the table's schema.
+			for i, col := range tbl.Columns {
+				if strings.EqualFold(col.Name, oldColName) {
+					tbl.Columns[i].Name = newColName
+					break
+				}
+			}
+			// Update any index column references that use the old name.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				for _, idx := range im.IndexesOnTable(tbl) {
+					for i, col := range idx.Columns {
+						if strings.EqualFold(col, oldColName) {
+							idx.Columns[i] = newColName
+						}
+					}
+				}
+				// Update stored view/matview ASTs that reference this column.
+				im.RenameColumnInViews(tbl.Name, oldColName, newColName)
+			}
 		case parser.AlterTableInherit:
 			// INHERIT parent_table — register the named table as a parent of tbl
 			// so that scanning the parent includes tbl's rows (M0097-0048).
@@ -4822,6 +4875,12 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	}
 	tbl.IsMatView = true
 	tbl.IsPopulated = !s.WithNoData
+	// Set schema from search_path if not explicitly specified (mirrors CREATE TABLE). M0097-0025.
+	if s.Name.Schema == "" {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			tbl.Schema = ws
+		}
+	}
 	// Store the SELECT AST as the view query (for REFRESH).
 	tbl.View = s.Query
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
@@ -4842,7 +4901,8 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 }
 
 // materializeView executes the view's SELECT query and writes results
-// to the materialized view heap. Used by both initial populate and REFRESH.
+// to the materialized view heap, then rebuilds all btree indexes.
+// Used by both initial populate and REFRESH. M0097-0013.
 func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) error {
 	op, err := Build(selectPlan)
 	if err != nil {
@@ -4870,6 +4930,33 @@ func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) err
 			return werr
 		}
 	}
+	// Rebuild all btree indexes on the matview after population.
+	// This also detects unique constraint violations (duplicate rows). M0097-0025.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, idx := range im.IndexesOnTable(tbl) {
+			idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+			// Truncate (clear) the index storage before rebuilding.
+			o.ctx.Pool.InvalidateRel(idxRel)
+			if err := o.ctx.Pool.Manager().TruncateRelation(idxRel); err != nil {
+				return err
+			}
+			// Resolve column name → *catalog.Column for each index column.
+			cols := make([]*catalog.Column, len(idx.Columns))
+			for i, colName := range idx.Columns {
+				if colName == "" {
+					continue // expression column
+				}
+				col, ok2 := o.ctx.Catalog.LookupColumn(tbl, colName)
+				if ok2 {
+					cols[i] = col
+				}
+			}
+			idxName := idx.QualifiedName()
+			if err := o.bulkBuildBTree(idxRel, tbl, cols, idx.Unique, idxName, 0); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -4891,10 +4978,18 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	}
 	// REFRESH without CONCURRENTLY on a non-populated matview is fine (it populates it).
 	// But CONCURRENTLY requires the matview to already be populated.
+	// refreshErrName returns "schema.name" for error messages, using "public"
+	// as the default schema when tbl.Schema is empty.
+	refreshErrName := func() string {
+		if tbl.Schema == "" || strings.EqualFold(tbl.Schema, "public") {
+			return "public." + tbl.Name
+		}
+		return tbl.Schema + "." + tbl.Name
+	}
 	if s.Concurrently && !tbl.IsPopulated {
 		return &ExecError{Code: "55000", Pos: s.Pos(),
 			Message: fmt.Sprintf("cannot refresh materialized view %q concurrently",
-				s.Name.String()),
+				refreshErrName()),
 			Hint: "Use the REFRESH MATERIALIZED VIEW command."}
 	}
 	// CONCURRENTLY requires at least one unique index with no WHERE clause.
@@ -4921,8 +5016,8 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 			if !hasUnique {
 				return &ExecError{Code: "55000", Pos: s.Pos(),
 					Message: fmt.Sprintf("cannot refresh materialized view %q concurrently",
-						s.Name.String()),
-					Hint: "Use the REFRESH MATERIALIZED VIEW command."}
+						refreshErrName()),
+					Hint: "Create a unique index with no WHERE clause on one or more columns of the materialized view."}
 			}
 		}
 	}
@@ -4939,9 +5034,57 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	if err := truncateRelation(o.ctx, rel); err != nil {
 		return err
 	}
-	// Re-populate.
+	// Re-populate. Translate 23505 unique violations to PG-compatible messages.
 	if err := o.materializeView(tbl, selectPlan); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Code == "23505" {
+			if s.Concurrently {
+				// REFRESH CONCURRENTLY duplicate → "new data contains duplicate rows".
+				return &ExecError{Code: "55000", Pos: s.Pos(),
+					Message: fmt.Sprintf("new data for materialized view %q contains duplicate rows without any null columns", s.Name.String())}
+			}
+			// Non-concurrent REFRESH → "could not create unique index 'name'".
+			idxName := ""
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				for _, idx := range im.IndexesOnTable(tbl) {
+					if idx.Unique {
+						idxName = idx.Name
+						break
+					}
+				}
+			}
+			return &ExecError{Code: "23505", Pos: s.Pos(),
+				Message: fmt.Sprintf("could not create unique index %q", idxName)}
+		}
 		return err
+	}
+	// For CONCURRENTLY refresh, verify the unique index still exists after
+	// materialization (it might have been dropped during the SELECT query).
+	// M0097-0025.
+	if s.Concurrently {
+		if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+			hasUnique := false
+			for _, idx := range im.IndexesOnTable(tbl) {
+				if !idx.Unique || idx.HasPredicate {
+					continue
+				}
+				allPlain := true
+				for _, e := range idx.ColExprs {
+					if e != nil {
+						allPlain = false
+						break
+					}
+				}
+				if allPlain {
+					hasUnique = true
+					break
+				}
+			}
+			if !hasUnique {
+				return &ExecError{Code: "55000", Pos: s.Pos(),
+					Message: fmt.Sprintf("could not find suitable unique index on materialized view %q",
+						s.Name.String())}
+			}
+		}
 	}
 	tbl.IsPopulated = true
 	return nil
@@ -5250,7 +5393,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	if objType == "materialized view" {
 		dropped := map[string]bool{}
 		for _, name := range s.Names {
-			if err := o.execDropOneMatView(name, s.IfExists, s.Behavior, s.Pos(), dropped); err != nil {
+			if err := o.execDropOneMatView(name, s.IfExists, s.Behavior, s.Pos(), dropped, true); err != nil {
 				return err
 			}
 		}

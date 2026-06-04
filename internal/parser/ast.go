@@ -1424,6 +1424,9 @@ type AlterTableStmt struct {
 	IfExists bool
 	Name     ObjectName
 	Actions  []AlterTableAction
+	// SetSchema holds the target schema name for ALTER TABLE/VIEW/MATERIALIZED VIEW
+	// ... SET SCHEMA <newschema>. Empty means no SET SCHEMA action. M0097-0025.
+	SetSchema string
 }
 
 func (s *AlterTableStmt) Pos() int  { return s.pos }

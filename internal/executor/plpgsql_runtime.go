@@ -647,6 +647,21 @@ func resolveRoutineOverload(rs *catalog.Routines, name parser.ObjectName, args [
 		if len(specific) == 1 {
 			return specific[0], nil
 		}
+		if len(specific) == 0 {
+			specific = matches // fall back to polymorphic matches
+		}
+		// Second pass: prefer exact Datum-kind match over coercion-based match.
+		// E.g. fipshash(text) beats fipshash(bytea) when arg is KindString.
+		// Mirrors PostgreSQL's "exact match beats implicit cast" resolution.
+		exact := make([]*catalog.Routine, 0, len(specific))
+		for _, c := range specific {
+			if routineArgsExactMatch(c.ArgTypes, args) {
+				exact = append(exact, c)
+			}
+		}
+		if len(exact) == 1 {
+			return exact[0], nil
+		}
 		return nil, &ExecError{Code: "42725", Pos: pos, Message: fmt.Sprintf("function %s is not unique", sig)}
 	}
 }
@@ -657,6 +672,40 @@ func routineArgsCompatible(argTypes []catalog.Type, args []Datum) bool {
 	}
 	for i := range argTypes {
 		if _, err := coerceDatumToType(args[i], argTypes[i], 0, "argument"); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// routineArgsExactMatch returns true when every argument's Datum kind directly
+// maps to the declared parameter type without coercion. Used as a secondary
+// overload preference after compatibility is established. M0097-0025.
+func routineArgsExactMatch(argTypes []catalog.Type, args []Datum) bool {
+	if len(argTypes) != len(args) {
+		return false
+	}
+	for i, typ := range argTypes {
+		tn := strings.ToLower(typ.Name)
+		v := args[i]
+		var exact bool
+		switch v.Kind {
+		case KindInt:
+			exact = isIntegerTypeName(tn)
+		case KindNumeric:
+			exact = isNumericType(tn)
+		case KindString:
+			exact = isTextTypeName(tn)
+		case KindBool:
+			exact = isBoolTypeName(tn)
+		case KindBytes:
+			exact = (tn == "bytea")
+		case KindTime:
+			exact = isTimeTypeName(tn) || isIntervalTypeName(tn)
+		default:
+			exact = true // unknown kind: treat as exact to avoid false negatives
+		}
+		if !exact {
 			return false
 		}
 	}
@@ -763,6 +812,10 @@ func executePLpgSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos i
 	}
 	if flow == flowReturn {
 		return res, nil
+	}
+	// VOID functions may fall off the end without an explicit RETURN. M0097-0025.
+	if strings.EqualFold(r.ReturnType.Name, "void") {
+		return NullDatum, nil
 	}
 	return Datum{}, &ExecError{Code: "2F005", Pos: pos, Message: fmt.Sprintf("control reached end of function %s without RETURN", r.QualifiedName())}
 }

@@ -3334,13 +3334,38 @@ func (p *parser) parseAlter() (Stmt, error) {
 		return stmt, nil
 	}
 
+	// ALTER MATERIALIZED VIEW name SET SCHEMA newschema (M0097-0025).
+	if p.acceptIdentKeyword("materialized") {
+		// VIEW is a KwCatUnreserved keyword — accept either way.
+		_ = p.acceptKeyword(KwView) || p.acceptIdentKeyword("view")
+		// Parse the matview name.
+		mvName, _ := p.parseObjectName()
+		// Check for SET SCHEMA action (SET is KwSet, SCHEMA is an identifier).
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet {
+			p.advance() // SET
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "schema") {
+				p.advance() // SCHEMA
+				schemaNameTok := p.cur()
+				p.advance()
+				schemaName := identText(schemaNameTok)
+				return &AlterTableStmt{pos: t.Pos, Name: mvName, SetSchema: schemaName}, nil
+			}
+		}
+		// Other ALTER MATERIALIZED VIEW actions — consume until ';'.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return &AlterTableStmt{pos: t.Pos}, nil
+	}
 	// ALTER VIEW / SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / PUBLICATION /
 	// SUBSCRIPTION / SYSTEM — compatibility stubs. Consume until end of statement.
 	for _, objIdent := range []string{
 		"schema", "view",
 		"collation", "domain", "extension", "language",
 		"operator", "publication", "subscription", "system",
-		"materialized",
 	} {
 		if p.acceptIdentKeyword(objIdent) {
 			// consume until ';' or EOF
@@ -3438,12 +3463,14 @@ func (p *parser) parseAlter() (Stmt, error) {
 		})
 		return stmt, nil
 	}
-	// SET SCHEMA schema_name — parse as a no-op.
+	// SET SCHEMA schema_name — update table/view schema. M0097-0025.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet {
 		if p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema") {
 			p.advance() // SET
-			p.advance() // schema
-			_, _ = p.parseIdent()
+			p.advance() // SCHEMA
+			schemaNameTok := p.cur()
+			p.advance()
+			stmt.SetSchema = identText(schemaNameTok)
 			return stmt, nil
 		}
 	}

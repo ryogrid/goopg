@@ -2757,6 +2757,12 @@ func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 		if t, ok := c.tables[key(parser.ObjectName{Schema: "pg_catalog", Name: name.Name})]; ok {
 			return t, true
 		}
+	} else {
+		// Schema-qualified lookup: fall back to unqualified key to handle tables
+		// that were moved to a different schema via SET SCHEMA (catalog key is unchanged).
+		if t, ok := c.tables[name.Name]; ok && strings.EqualFold(t.Schema, name.Schema) {
+			return t, true
+		}
 	}
 	return nil, false
 }
@@ -2774,12 +2780,23 @@ func (c *InMemory) LookupColumn(table *Table, name string) (*Column, bool) {
 }
 
 // LookupIndex returns the index with the given name, or false when
-// unresolved.
+// unresolved. Unqualified lookups fall back to an unqualified search
+// so schema-qualified references find indexes stored without a schema.
 func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	idx, ok := c.indexes[key(name)]
-	return idx, ok
+	if idx, ok := c.indexes[key(name)]; ok {
+		return idx, ok
+	}
+	// Fallback: try bare name when schema-qualified lookup failed.
+	// Mirrors LookupTable's fallback for the common case where an index
+	// is stored without an explicit schema (e.g. created in search_path context).
+	if name.Schema != "" {
+		if idx, ok := c.indexes[name.Name]; ok {
+			return idx, ok
+		}
+	}
+	return nil, false
 }
 
 // CreateTable installs a new table in the catalog. Returns an error
@@ -3324,6 +3341,88 @@ func (c *InMemory) AllUserMatViews() []*Table {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
 	return out
+}
+
+// RenameColumnInViews updates all stored view/matview SELECT ASTs to replace
+// references to oldCol on tableName with newCol. Called after ALTER TABLE RENAME COLUMN
+// so dependent views/matviews continue to work. M0097-0025.
+func (c *InMemory) RenameColumnInViews(tableName, oldCol, newCol string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, t := range c.tables {
+		if t.View == nil {
+			continue
+		}
+		renameColumnInSelect(t.View, tableName, oldCol, newCol)
+	}
+}
+
+// renameColumnInSelect walks sel and replaces ColumnRef nodes where
+// Column==oldCol and (Table=="" or Table==tableName) with newCol.
+func renameColumnInSelect(sel *parser.SelectStmt, tableName, oldCol, newCol string) {
+	if sel == nil {
+		return
+	}
+	for i := range sel.Targets {
+		if sel.Targets[i].Expr != nil {
+			sel.Targets[i].Expr = renameColumnInExpr(sel.Targets[i].Expr, tableName, oldCol, newCol)
+		}
+	}
+	if sel.Where != nil {
+		sel.Where = renameColumnInExpr(sel.Where, tableName, oldCol, newCol)
+	}
+	if sel.Having != nil {
+		sel.Having = renameColumnInExpr(sel.Having, tableName, oldCol, newCol)
+	}
+	for i := range sel.GroupBy {
+		sel.GroupBy[i] = renameColumnInExpr(sel.GroupBy[i], tableName, oldCol, newCol)
+	}
+	for i := range sel.OrderBy {
+		sel.OrderBy[i].Expr = renameColumnInExpr(sel.OrderBy[i].Expr, tableName, oldCol, newCol)
+	}
+	for i := range sel.From {
+		if sel.From[i].Subquery != nil {
+			renameColumnInSelect(sel.From[i].Subquery, tableName, oldCol, newCol)
+		}
+	}
+}
+
+func renameColumnInExpr(expr parser.Expr, tableName, oldCol, newCol string) parser.Expr {
+	if expr == nil {
+		return nil
+	}
+	switch e := expr.(type) {
+	case *parser.ColumnRef:
+		if strings.EqualFold(e.Column, oldCol) {
+			if e.Table == "" || strings.EqualFold(e.Table, tableName) {
+				newRef := *e
+				newRef.Column = newCol
+				return &newRef
+			}
+		}
+	case *parser.BinaryOp:
+		e.Left = renameColumnInExpr(e.Left, tableName, oldCol, newCol)
+		e.Right = renameColumnInExpr(e.Right, tableName, oldCol, newCol)
+	case *parser.UnaryOp:
+		e.Operand = renameColumnInExpr(e.Operand, tableName, oldCol, newCol)
+	case *parser.FuncCall:
+		for i := range e.Args {
+			e.Args[i] = renameColumnInExpr(e.Args[i], tableName, oldCol, newCol)
+		}
+	case *parser.CastExpr:
+		e.Operand = renameColumnInExpr(e.Operand, tableName, oldCol, newCol)
+	case *parser.SubqueryExpr:
+		renameColumnInSelect(e.Inner, tableName, oldCol, newCol)
+	case *parser.CaseExpr:
+		for i := range e.Whens {
+			e.Whens[i].When = renameColumnInExpr(e.Whens[i].When, tableName, oldCol, newCol)
+			e.Whens[i].Then = renameColumnInExpr(e.Whens[i].Then, tableName, oldCol, newCol)
+		}
+		if e.Else != nil {
+			e.Else = renameColumnInExpr(e.Else, tableName, oldCol, newCol)
+		}
+	}
+	return expr
 }
 
 // FKRef pairs a child table with one of its FK constraints that

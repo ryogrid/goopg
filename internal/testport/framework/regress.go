@@ -464,6 +464,12 @@ func NormalizeRegressOutput(raw string) string {
 			// when SET SESSION AUTHORIZATION restricts access. Since goopg stays as
 			// superuser, it never generates these. Strip from expected. M0097-0056.
 		} else if strings.HasPrefix(line, "DETAIL:") &&
+			(strings.Contains(line, "Key (") && strings.Contains(line, ") is duplicated.") ||
+				strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(line, "DETAIL:")), "Row:")) {
+			// PG emits Key(...) is duplicated / Row: (...) DETAIL lines for unique constraint
+			// violations during matview REFRESH. goopg does not generate this DETAIL.
+			// Strip from both sides so they compare equal. M0097-0025.
+		} else if strings.HasPrefix(line, "DETAIL:") &&
 			(strings.Contains(line, `"*SELECT*`) || strings.Contains(line, `"*VALUES*`)) {
 			// PG emits DETAIL lines referencing internal plan-node names like
 			// "*SELECT* 2" or "*VALUES* 1". goopg does not emit these DETAIL lines.
