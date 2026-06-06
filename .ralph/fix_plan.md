@@ -2557,6 +2557,40 @@ M0097-0001 wires it up.
         gates pg_constraint population), COMMENT ON storage for pg_description data,
         NO INHERIT CHECK on partitioned tables, storage parameter conflict detection
         (MAIN vs EXTENDED), BEGIN/ROLLBACK DDL non-atomicity.
+      - **Progress 2026-06-06 (M0097-0023-loop34 — LEFT JOIN inner-only `IN`
+        pushdown index-shift fix; UNBLOCKS pg_constraint population):**
+        Root-caused and fixed the "virtual-table join column-mapping bug" flagged
+        as NEW in loop33. It was NOT a catalog/virtual-table problem — it was a
+        planner rewriter gap. `shiftColumnRefsBy` (`internal/planner/planner.go`)
+        rebases a LEFT JOIN's inner-only ON conjunct by `-leftWidth` when the
+        M0063-0005 optimization pushes it to a Filter on the inner plan, but its
+        `switch` had no `*InExpr` case (the `default` arm returns the node
+        unchanged). Its sibling classifier `walkColumnRefs`/`classifyConjunctSide`
+        (`internal/planner/pushdown.go`) DOES recurse into the literal-list form of
+        `IN`, so the two paths disagreed: `con.contype IN ('p','u','x')` was
+        classified inner-only and pushed down, but its `contype` ColumnRef kept the
+        outer-cumulative index 25 (= pg_index width 22 + ordinal 3) instead of the
+        inner-relative ordinal 3. At exec the inner Filter row is only 25 wide, so
+        `Slot.Get(25)` panicked `index out of range [25] with length 25` — the exact
+        crash that masked pg_constraint population. Fix: add an `*InExpr` case
+        mirroring `walkColumnRefs` (shift `Operand`+`List`; preserve `Plan` — the
+        subquery form is never pushed down and lives in a separate scope). Classic
+        sibling-path desync (see auto-memory `pattern_sibling_paths_must_agree`).
+        Tests: `internal/planner/shift_colrefs_in_test.go` (unit: InExpr operand/list
+        shift, nested-under-BinaryOp), `internal/executor/leftjoin_inner_in_pushdown_test.go`
+        (end-to-end LEFT JOIN over plain user tables with inner-only `kind IN (...)`;
+        VERIFIED to panic `index out of range [2] with length 2` with the fix
+        reverted, and to return correct `(1,'p'),(2,NULL),(3,'x')` with it in place).
+        Design: `docs/design/0097-0023-leftjoin-inner-in-pushdown-shift.md`.
+        Planner suite green; executor suite only the 2 pre-existing unrelated fails
+        (`TestPgGetPublicationTablesRelidMatchesPgClassOid`, `TestToastByteaRoundTrip`,
+        confirmed failing identically on clean HEAD via stash). REMOVES the
+        join-layer blocker: a follow-up loop can now assign real OIDs to named CHECK
+        constraints, populate pg_constraint, and wire COMMENT→pg_description.
+        Remaining blockers (updated): COMMENT ON storage for pg_description data,
+        pg_constraint OID assignment + row population (now unblocked), NO INHERIT
+        CHECK on partitioned tables, storage parameter conflict detection (MAIN vs
+        EXTENDED), BEGIN/ROLLBACK DDL non-atomicity.
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
