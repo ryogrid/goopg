@@ -2618,6 +2618,32 @@ M0097-0001 wires it up.
         anonymous-CHECK PG-faithful auto-naming, `pg_get_expr` function impl, the
         `\d` pg_attrdef-detail AND-boolean error, COMMENT→pg_description storage,
         pg_constraint heap persistence, NO INHERIT CHECK on partitioned tables.
+      - **Progress 2026-06-06 (M0097-0023-loop36 — `\d` publication-probe bool
+        typing):** Root-caused and fixed the `\d <table>` "operator AND requires
+        boolean operands" error. Loop35's note misattributed it to the
+        `pg_attrdef` detail subquery (which actually analyzes fine); the real
+        source is psql's publication probe, last `UNION` branch
+        `WHERE p.puballtables AND pg_catalog.pg_relation_is_publishable(...)`.
+        `pg_publication.puballtables` + siblings `pubinsert/pubupdate/pubdelete/
+        pubtruncate/pubviaroot` were declared `text` in `registerPublicationViews`
+        (`internal/initdb/replication_views.go`), so the analyzer rejected the bare
+        bool column as a non-boolean AND operand. Fix: declare all six flags `bool`
+        (matches `relcache_init.go` `TypeOID:16`); `VirtualRows` already emits
+        `"t"/"f"` via `boolText` → `planner.TypedVirtualCell` decodes `BooleanConst`,
+        so text-format wire output is unchanged (`SELECT puballtables` still shows
+        `t`/`f`). Verified live: `\d ct` advances past the AND error; `WHERE
+        puballtables` boolean context works; `SELECT * FROM pg_publication` intact.
+        Tests: analyzer + planner PASS; initdb FAIL count unchanged at 10 (all
+        pre-existing at HEAD, pg_class/pg_attribute-related, not pg_publication).
+        Design: `docs/design/0097-0023-pg-constraint-population.md` (follow-ups
+        section corrected + next blocker documented).
+        NEXT blocker (distinct root cause): `\d` now errors `operator = has
+        incompatible operand types "int2" and "text"` from the same probe's 2nd
+        UNION branch (`attnum = prattrs[s]`): `pg_publication_rel.prattrs` is `text`
+        (PG: `int2vector`) and `prrelid/prpubid/oid` are `text` (PG: `oid`). A
+        faithful fix retypes the whole publication catalog family to `oid`/
+        `int2vector` consistently — its own loop (oid↔text comparisons cascade
+        across the joins; `pubowner` emits `""`).
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:

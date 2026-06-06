@@ -71,10 +71,29 @@ constraint row (contype `c`, conrelid = table OID, conbin = raw expression).
 - **`pg_get_expr` not implemented.** `\d` and many catalog views call
   `pg_get_expr(conbin, conrelid)`; goopg stores the raw SQL in `conbin`
   directly, but the function itself is missing.
-- **`\d <table>` still errors** with "operator AND requires boolean operands"
-  in a *different* sub-query (the per-attribute detail query joining
-  `pg_attrdef`), independent of pg_constraint — reproduces on a
-  constraint-free table. Separate pre-existing bug.
+- **`\d <table>` "operator AND requires boolean operands" — FIXED (loop36).**
+  The loop35 observation misattributed this to the `pg_attrdef` detail
+  subquery; that subquery actually analyzes fine. The real source is psql's
+  publication probe, whose last `UNION` branch is
+  `WHERE p.puballtables AND pg_catalog.pg_relation_is_publishable(...)`.
+  `pg_publication.puballtables` (and the sibling `pubinsert/pubupdate/
+  pubdelete/pubtruncate/pubviaroot` flags) were declared `text` in
+  `registerPublicationViews` (`internal/initdb/replication_views.go`), so the
+  analyzer rejected the bare bool column as a non-boolean AND operand. Fixed by
+  declaring all six flags `bool`; `VirtualRows` already emits `"t"/"f"` via
+  `boolText`, which `planner.TypedVirtualCell` decodes to `BooleanConst`, so
+  wire output is unchanged. `\d` now advances past this error.
+- **`\d <table>` now errors `operator = has incompatible operand types
+  "int2" and "text"`** (next blocker, distinct root cause). Same publication
+  probe, the second `UNION` branch:
+  `... WHERE attrelid = pr.prrelid AND attnum = prattrs[s]`. `pg_publication_rel`
+  declares `prattrs` as `text` (PG: `int2vector`) so the subscript types as
+  `text`, mismatching `pg_attribute.attnum` (`int2`); `prrelid`/`prpubid`/`oid`
+  are likewise `text` (PG: `oid`). A faithful fix must retype the whole
+  publication catalog family (`pg_publication`, `pg_publication_rel`) to
+  `oid`/`int2vector` consistently — non-trivial because `pg_publication.oid`
+  emits `""` for `pubowner` and oid↔text comparisons cascade across the joins.
+  Scoped as its own loop.
 - **Persistence.** Synthetic constraint OIDs live only in the in-memory
   catalog; they are not written to a `pg_constraint` heap relation, so they do
   not survive restart. Matches the current handling of `NamedChecks`.
