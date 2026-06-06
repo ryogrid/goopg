@@ -406,7 +406,10 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 
 	// CHECK constraints to inherit from LIKE INCLUDING CONSTRAINTS clauses.
-	var likeCheckConstraints []string
+	// Carries the source constraint name so the copy keeps its identity
+	// (PostgreSQL preserves the original CHECK constraint name on LIKE
+	// INCLUDING CONSTRAINTS). M0097-0023.
+	var likeCheckConstraints []catalog.NamedCheckConstraint
 	// Indexes to copy from LIKE INCLUDING INDEXES clauses (non-PK unique indexes).
 	var likeUniqueIndexes []*catalog.Index
 	// Append body elements in declaration order: explicit columns and LIKE clauses
@@ -484,18 +487,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 						}
 						// Either way, skip (don't add the column again) and continue.
 						if includeConstraints {
-							for _, chk := range src.CheckConstraints {
-								found := false
-								for _, existing := range likeCheckConstraints {
-									if existing == chk {
-										found = true
-										break
-									}
-								}
-								if !found {
-									likeCheckConstraints = append(likeCheckConstraints, chk)
-								}
-							}
+							likeCheckConstraints = appendLikeChecks(likeCheckConstraints, src)
 						}
 						continue
 					}
@@ -516,19 +508,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					cols = append(cols, c)
 					// Copy CHECK constraints from source table when INCLUDING CONSTRAINTS.
 					if includeConstraints {
-						for _, chk := range src.CheckConstraints {
-							// Avoid duplicating constraints already present (e.g. from column-level).
-							found := false
-							for _, existing := range likeCheckConstraints {
-								if existing == chk {
-									found = true
-									break
-								}
-							}
-							if !found {
-								likeCheckConstraints = append(likeCheckConstraints, chk)
-							}
-						}
+						likeCheckConstraints = appendLikeChecks(likeCheckConstraints, src)
 					}
 				}
 				// Copy indexes when INCLUDING INDEXES.
@@ -739,15 +719,53 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 	}
 	// Register CHECK constraints from columns and table-level. M0097-0014.
+	// CheckConstraints and NamedChecks are kept parallel (index i ↔ index i)
+	// via Table.AddCheck so the enforcement path can recover the constraint
+	// name for violation messages. Inline/table-level checks are anonymous in
+	// the current parser, so they get empty names (invisible to pg_constraint).
+	// M0097-0023.
 	for _, c := range s.Columns {
 		if c.CheckExpr != "" {
-			tbl.CheckConstraints = append(tbl.CheckConstraints, c.CheckExpr)
+			tbl.AddCheck("", c.CheckExpr, 0)
 		}
 	}
-	tbl.CheckConstraints = append(tbl.CheckConstraints, s.TableChecks...)
+	for _, chk := range s.TableChecks {
+		tbl.AddCheck("", chk, 0)
+	}
 	// Apply LIKE INCLUDING CONSTRAINTS checks (copied from LIKE source tables).
-	tbl.CheckConstraints = append(tbl.CheckConstraints, likeCheckConstraints...)
+	// PostgreSQL preserves the source constraint name; the name is retained so
+	// enforcement can report it. OID is left 0 so the constraint is NOT yet
+	// surfaced through pg_constraint — populating pg_constraint is blocked on a
+	// latent virtual-table LEFT JOIN column-mapping bug (see design doc).
+	// M0097-0023.
+	for _, nc := range likeCheckConstraints {
+		tbl.AddCheck(nc.Name, nc.Expr, 0)
+	}
 	return nil
+}
+
+// appendLikeChecks copies src's CHECK constraints (name + expression) into
+// dst for a LIKE INCLUDING CONSTRAINTS clause, deduplicating by expression so
+// a constraint already inherited (e.g. from a column-level definition) is not
+// added twice. M0097-0023.
+func appendLikeChecks(dst []catalog.NamedCheckConstraint, src *catalog.Table) []catalog.NamedCheckConstraint {
+	for i, expr := range src.CheckConstraints {
+		nc := catalog.NamedCheckConstraint{Expr: expr}
+		if i < len(src.NamedChecks) {
+			nc = src.NamedChecks[i]
+		}
+		dup := false
+		for _, existing := range dst {
+			if existing.Expr == nc.Expr {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			dst = append(dst, nc)
+		}
+	}
+	return dst
 }
 
 // execCreateTableAs implements `CREATE TABLE name AS SELECT …`.
@@ -1196,9 +1214,9 @@ func deriveTargetName(e parser.Expr) string {
 // transitiveDep describes a single view or materialized view that will be
 // transitively dropped when its parent is dropped with CASCADE.
 type transitiveDep struct {
-	kind       string             // "view" or "materialized view"
+	kind       string // "view" or "materialized view"
 	name       parser.ObjectName
-	parentKind string             // "table", "view", or "materialized view"
+	parentKind string // "table", "view", or "materialized view"
 	parentName parser.ObjectName
 }
 
@@ -1619,10 +1637,10 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				// Collect all dependents in display order: views, matviews (including transitively
 				// reached via view chains), then functions.
 				type cascadeDep struct {
-					kind     string             // "view", "materialized view", or "function"
-					display  string             // full display text, e.g. "view functestv3"
-					viewName parser.ObjectName  // for view/matview drops
-					routine  *catalog.Routine   // for function drops
+					kind     string            // "view", "materialized view", or "function"
+					display  string            // full display text, e.g. "view functestv3"
+					viewName parser.ObjectName // for view/matview drops
+					routine  *catalog.Routine  // for function drops
 				}
 				var deps []cascadeDep
 				seen := map[string]bool{}
@@ -2085,8 +2103,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableAddCheck:
 			// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
+			// Track the constraint name so violations report it. OID is left 0
+			// so it stays out of pg_constraint for now (see LIKE note above re:
+			// the latent virtual-table join bug). M0097-0023.
 			if act.CheckExpr != "" {
-				tbl.CheckConstraints = append(tbl.CheckConstraints, act.CheckExpr)
+				tbl.AddCheck(act.ConstraintName, act.CheckExpr, 0)
 			}
 		case parser.AlterTableNoOp:
 			// Unknown ADD CONSTRAINT type — no-op.
@@ -3370,11 +3391,11 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		}
 	}
 	r := &catalog.Routine{
-		Schema:   schema,
-		Name:     s.Name.Name,
-		ArgNames: argNames,
-		ArgTypes: argTypes,
-		ArgModes: argModes,
+		Schema:      schema,
+		Name:        s.Name.Name,
+		ArgNames:    argNames,
+		ArgTypes:    argTypes,
+		ArgModes:    argModes,
 		ArgDefaults: argDefaults,
 		ReturnType: catalog.Type{
 			Name: strings.ToLower(s.ReturnType.Name),
@@ -4134,8 +4155,8 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 		// PG format: "procedure name() does not exist"
 		argListStr := buildCallArgListStr(s.Args)
 		return &ExecError{Code: "42883", Pos: s.Pos(),
-			Message:  fmt.Sprintf("%s %s%s does not exist", objKind, s.Name.Name, argListStr),
-			Hint:     "No procedure matches the given name and argument types. You might need to add explicit type casts.",
+			Message: fmt.Sprintf("%s %s%s does not exist", objKind, s.Name.Name, argListStr),
+			Hint:    "No procedure matches the given name and argument types. You might need to add explicit type casts.",
 		}
 	}
 	// DROP PROCEDURE on a function should fail.
@@ -4600,7 +4621,6 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 
 	return nil
 }
-
 
 // syncIndexToCatalogHeap writes a pg_class row and a pg_index row for idx.
 // Called by createBTreeIndex after the full index build succeeds. The row
@@ -5977,17 +5997,17 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 // user-defined routines catalog, so the finalfunc validation skips them.
 // M0097-0112.
 var knownBuiltinAggFinalFuncs = map[string]bool{
-	"int8_avg":              true,
-	"numeric_avg":           true,
-	"numeric_avg_combine":   true,
-	"numeric_out":           true,
-	"percentile_disc_final": true,
-	"percentile_cont_final": true,
-	"rank_final":            true,
-	"dense_rank_final":      true,
-	"cume_dist_final":       true,
-	"percent_rank_final":    true,
-	"mode_final":            true,
+	"int8_avg":                       true,
+	"numeric_avg":                    true,
+	"numeric_avg_combine":            true,
+	"numeric_out":                    true,
+	"percentile_disc_final":          true,
+	"percentile_cont_final":          true,
+	"rank_final":                     true,
+	"dense_rank_final":               true,
+	"cume_dist_final":                true,
+	"percent_rank_final":             true,
+	"mode_final":                     true,
 	"hypothetical_rank_common_final": true,
 }
 

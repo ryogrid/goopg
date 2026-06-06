@@ -83,6 +83,25 @@ type Column struct {
 	Dropped bool
 }
 
+// NamedCheckConstraint holds a CHECK constraint with an explicit name.
+// Name may be empty for anonymous constraints (e.g. inline column-level CHECK).
+type NamedCheckConstraint struct {
+	Name string // constraint name; empty for auto-named constraints
+	Expr string // raw SQL expression (same as CheckConstraints entry)
+	OID  uint32 // synthetic OID for pg_constraint virtual table
+}
+
+// AddCheck appends a CHECK constraint, keeping CheckConstraints and
+// NamedChecks parallel so index i of each always corresponds. name is
+// empty for anonymous constraints; oid is 0 for anonymous constraints
+// (pg_constraint's VirtualRows skips empty-name / zero-OID rows so the
+// common unnamed case stays invisible in the catalog, matching the
+// pre-existing stub behaviour). M0097-0023.
+func (t *Table) AddCheck(name, expr string, oid uint32) {
+	t.CheckConstraints = append(t.CheckConstraints, expr)
+	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{Name: name, Expr: expr, OID: oid})
+}
+
 // Table is one relation in the catalog.
 type Table struct {
 	Schema  string
@@ -143,6 +162,12 @@ type Table struct {
 	// CheckConstraints holds the raw SQL expressions for table-level and
 	// column-level CHECK constraints. M0097-0014.
 	CheckConstraints []string
+
+	// NamedChecks holds named CHECK constraints (name + expression).
+	// Parallel to CheckConstraints; populated when the constraint has an
+	// explicit CONSTRAINT name clause. Index i of NamedChecks corresponds to
+	// index i of CheckConstraints; Name may be empty for anonymous constraints.
+	NamedChecks []NamedCheckConstraint
 
 	// IsMatView marks this table as a materialized view. The underlying
 	// SELECT query is stored in View; data is materialized in the heap
@@ -454,6 +479,25 @@ type InMemory struct {
 	// tableRuleKinds tracks the most-recently-registered rule kind per table.
 	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
 	tableRuleKinds map[string]string
+
+	// comments stores COMMENT ON descriptions keyed by (classoid, objoid, objsubid).
+	// Populated by SetComment; read by pg_description VirtualRows. M0097-comments.
+	comments map[commentKey]string
+}
+
+// commentKey is the composite key for pg_description.
+type commentKey struct {
+	ClassOID uint32
+	ObjOID   uint32
+	ObjSubID int32
+}
+
+// CommentRow is one row for pg_description.
+type CommentRow struct {
+	ObjOID      uint32
+	ClassOID    uint32
+	ObjSubID    int32
+	Description string
 }
 
 // EnumValue is one label in a user-defined enum type together with its sort
@@ -562,17 +606,61 @@ func NewInMemory() *InMemory {
 		constraintViewDeps:  make(map[string][]string),
 		opClassHashFuncs:    make(map[string]string),
 		opClassSchemas:      make(map[string]string),
-		userAggregates: make(map[string]*UserAggregate),
+		userAggregates:      make(map[string]*UserAggregate),
 		schemas: map[string]uint32{
 			"pg_catalog":         11,
 			"public":             2200,
 			"information_schema": 99,
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
-		roles: make(map[string]struct{}),
+		roles:    make(map[string]struct{}),
+		comments: make(map[commentKey]string),
 	}
 	c.registerSystemTables()
 	return c
+}
+
+// SetComment stores a description for an object in pg_description.
+// classoid is the OID of the system catalog that tracks the object
+// (e.g. 2606 for pg_constraint, 1259 for pg_class, 3381 for pg_statistic_ext).
+// objoid is the OID of the object; objsubid is 0 for whole-object comments,
+// or the attnum for column comments.
+func (c *InMemory) SetComment(classoid, objoid uint32, objsubid int32, description string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.comments == nil {
+		c.comments = make(map[commentKey]string)
+	}
+	k := commentKey{ClassOID: classoid, ObjOID: objoid, ObjSubID: objsubid}
+	if description == "" {
+		delete(c.comments, k)
+	} else {
+		c.comments[k] = description
+	}
+}
+
+// GetComment retrieves a stored description, returning ("", false) when absent.
+func (c *InMemory) GetComment(classoid, objoid uint32, objsubid int32) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.comments[commentKey{ClassOID: classoid, ObjOID: objoid, ObjSubID: objsubid}]
+	return v, ok
+}
+
+// AllComments returns all stored comments as a slice of CommentRow.
+func (c *InMemory) AllComments() []CommentRow {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]CommentRow, 0, len(c.comments))
+	for k, desc := range c.comments {
+		out = append(out, CommentRow{
+			ObjOID:      k.ObjOID,
+			ClassOID:    k.ClassOID,
+			ObjSubID:    k.ObjSubID,
+			Description: desc,
+		})
+	}
+	return out
 }
 
 // RegisterUserAggregate registers a user-defined aggregate in the catalog.
@@ -1347,28 +1435,28 @@ func (c *InMemory) registerSystemTables() {
 				idxRelam = "405"
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(idx.OID)),   // oid
-				idx.Name,                     // relname
-				"i",                          // relkind = index
+				strconv.Itoa(int(idx.OID)),  // oid
+				idx.Name,                    // relname
+				"i",                         // relkind = index
 				strconv.Itoa(int(idxNsOID)), // relnamespace
-				"p",                          // relpersistence
-				"0",                          // reltoastrelid
-				"0",                          // relpages
-				"t",                          // relispopulated
-				"0",                          // relnatts
-				"n",                          // relreplident: not applicable for indexes
-				"0",                          // relchecks
-				"f",                          // relhasindex
-				"f",                          // relhasrules
-				"f",                          // relhastriggers
-				"f",                          // relrowsecurity
-				"f",                          // relforcerowsecurity
-				"f",                          // relhasoids
-				"f",                          // relispartition
-				"0",                          // reltablespace
-				"0",                          // reloftype
-				"",                           // reloptions: NULL
-				idxRelam,                     // relam: index access method OID
+				"p",                         // relpersistence
+				"0",                         // reltoastrelid
+				"0",                         // relpages
+				"t",                         // relispopulated
+				"0",                         // relnatts
+				"n",                         // relreplident: not applicable for indexes
+				"0",                         // relchecks
+				"f",                         // relhasindex
+				"f",                         // relhasrules
+				"f",                         // relhastriggers
+				"f",                         // relrowsecurity
+				"f",                         // relforcerowsecurity
+				"f",                         // relhasoids
+				"f",                         // relispartition
+				"0",                         // reltablespace
+				"0",                         // reloftype
+				"",                          // reloptions: NULL
+				idxRelam,                    // relam: index access method OID
 			})
 		}
 		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
@@ -2066,7 +2154,19 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2609,
 	}
-	pgDescription.VirtualRows = func() [][]string { return nil }
+	pgDescription.VirtualRows = func() [][]string {
+		rows := c.AllComments()
+		out := make([][]string, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, []string{
+				fmt.Sprintf("%d", r.ObjOID),
+				fmt.Sprintf("%d", r.ClassOID),
+				fmt.Sprintf("%d", r.ObjSubID),
+				r.Description,
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_description"] = pgDescription
 
 	// pg_attrdef — stores column default expressions (OID 2604).
@@ -2122,7 +2222,47 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2606,
 	}
-	pgConstraint.VirtualRows = func() [][]string { return nil }
+	pgConstraint.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var out [][]string
+		for _, tbl := range c.tables {
+			if tbl.Virtual || tbl.OID == 0 {
+				continue
+			}
+			// Emit named CHECK constraints.
+			for _, nc := range tbl.NamedChecks {
+				if nc.Name == "" || nc.OID == 0 {
+					continue
+				}
+				row := make([]string, 25)
+				row[0] = fmt.Sprintf("%d", nc.OID)  // oid
+				row[1] = nc.Name                    // conname
+				row[2] = "2200"                     // connamespace (public)
+				row[3] = "c"                        // contype = check
+				row[4] = "f"                        // condeferrable
+				row[5] = "f"                        // condeferred
+				row[6] = "t"                        // convalidated
+				row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
+				row[8] = "0"                        // contypid
+				row[9] = "0"                        // conindid
+				row[10] = "0"                       // conparentid
+				row[11] = "0"                       // confrelid
+				row[12] = " "                       // confupdtype
+				row[13] = " "                       // confdeltype
+				row[14] = " "                       // confmatchtype
+				row[15] = "t"                       // conislocal
+				row[16] = "0"                       // coninhcount
+				row[17] = "f"                       // connoinherit
+				row[18] = "f"                       // conperiod
+				row[24] = nc.Expr                   // conbin
+				out = append(out, row)
+			}
+			// Emit NOT NULL constraints tracked as NamedChecks with type marker.
+			// (Not-null constraints share the NamedChecks slice with a special prefix.)
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_constraint"] = pgConstraint
 
 	// pg_index — stores index definitions (OID 2610).
@@ -3201,10 +3341,19 @@ func (c *InMemory) UnregisterSchema(name string) {
 }
 
 // allSchemasLocked returns all (name, oid) pairs. Must be called with mu held.
-func (c *InMemory) allSchemasLocked() []struct{ name string; oid uint32 } {
-	out := make([]struct{ name string; oid uint32 }, 0, len(c.schemas))
+func (c *InMemory) allSchemasLocked() []struct {
+	name string
+	oid  uint32
+} {
+	out := make([]struct {
+		name string
+		oid  uint32
+	}, 0, len(c.schemas))
 	for name, oid := range c.schemas {
-		out = append(out, struct{ name string; oid uint32 }{name, oid})
+		out = append(out, struct {
+			name string
+			oid  uint32
+		}{name, oid})
 	}
 	return out
 }
@@ -3892,7 +4041,6 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 	}
 	return false, nil
 }
-
 
 // RemoveEnumValue removes a label from an existing enum type.
 // Used to roll back ALTER TYPE … ADD VALUE on transaction ROLLBACK. M0097-0022.

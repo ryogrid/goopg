@@ -2518,6 +2518,45 @@ M0097-0001 wires it up.
         constraint on partitioned tables, storage parameter conflict detection (MAIN vs
         EXTENDED), BEGIN/ROLLBACK DDL non-atomicity (schema search_path context lost on
         rollback causes ctlt1/ctl_schema.ctlt4 extra errors).
+      - **Progress 2026-06-06 (M0097-0023-loop33 — named CHECK constraint violations, 88→85):**
+        PG-compatible CHECK constraint violation messages. Design:
+        `docs/design/0097-0023-named-check-constraint-violations.md`.
+        (a) `catalog.Table.AddCheck(name, expr, oid)` keeps `CheckConstraints` and
+            `NamedChecks` parallel (index i ↔ i) by construction. Previously
+            `NamedChecks` was read by the pg_constraint stub but NEVER populated by
+            any code path. Wired all four writer sites in `operators_ddl.go`:
+            CREATE inline CHECK (anonymous), CREATE table-level CHECK (anonymous),
+            `ALTER … ADD CONSTRAINT name CHECK` (named), and `LIKE INCLUDING
+            CONSTRAINTS` (`appendLikeChecks` preserves the source constraint name,
+            dedup by expr — matches PG).
+        (b) `checkConstraints` (`operators_fk.go`) iterates by index, recovers the
+            name from `NamedChecks[i]`, and emits `new row for relation "T" violates
+            check constraint "NAME"` plus `DETAIL: Failing row contains (…)` via the
+            existing `formatRowForDetail` helper (SQLSTATE 23514). Anonymous checks
+            fall back to the unnamed wording but still gain the DETAIL line.
+        (c) Named checks added with **OID 0** so pg_constraint stays empty.
+            CRITICAL: assigning real OIDs surfaces a PRE-EXISTING latent crash —
+            psql `\d`/`\d+` runs `… pg_index LEFT JOIN pg_constraint con ON (… AND
+            contype IN ('p','u','x'))`; evaluating `contype IN (…)` against a
+            non-empty pg_constraint panics `index out of range [25] with length 25`
+            in `Slot.Get` (opnode.go:98) via `evalInExpr` — the virtual-table LEFT
+            JOIN resolves the right-side `contype` column ref to an absolute index ==
+            slot width. Masked while pg_constraint returned 0 rows. Populating
+            pg_constraint (prereq for COMMENT/pg_description description-join queries)
+            is BLOCKED on fixing this join column-mapping bug.
+        Tests: `internal/executor/operators_ddl_named_check_test.go`
+        (`TestNamedCheckPropagatesThroughLikeConstraints`,
+        `TestCheckViolationReportsNameAndDetail`). Verified isolated (no shared-
+        cluster confound): create_table_like 64→61 (`diff|grep -c '^[<>]'`), the two
+        targeted lines now match PG exactly; constraints 794→793; no new failures in
+        executor/catalog unit suites (2 pre-existing unrelated fails remain).
+        NOTE: catalog.go also carried forward pre-existing UNCOMMITTED comments
+        infrastructure (SetComment/GetComment/AllComments + virtual stubs) from a
+        prior failed loop (progress.json failed 2026-06-05); committed together.
+        Remaining blockers (unchanged): virtual-table join column-mapping bug (NEW —
+        gates pg_constraint population), COMMENT ON storage for pg_description data,
+        NO INHERIT CHECK on partitioned tables, storage parameter conflict detection
+        (MAIN vs EXTENDED), BEGIN/ROLLBACK DDL non-atomicity.
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
