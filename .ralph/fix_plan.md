@@ -2591,6 +2591,33 @@ M0097-0001 wires it up.
         pg_constraint OID assignment + row population (now unblocked), NO INHERIT
         CHECK on partitioned tables, storage parameter conflict detection (MAIN vs
         EXTENDED), BEGIN/ROLLBACK DDL non-atomicity.
+      - **Progress 2026-06-06 (M0097-0023-loop35 — pg_constraint population for
+        named CHECK constraints):** Consumed the loop34 unblock. Named CHECK
+        constraints now get a real OID and surface as `pg_constraint` rows.
+        (a) New `catalog.Catalog.AllocOID() uint32` interface method, implemented
+        on `*InMemory` as an atomic `oid := c.nextOID; c.nextOID++` under the
+        catalog mutex (mirrors the inline CreateTable/CreateIndex pattern, exposed
+        through the interface for executor DDL paths). (b) New
+        `(*ddlOp).allocConstraintOID(name)` returns a fresh OID for a named
+        constraint, 0 for anonymous. (c) Both named `AddCheck` sites in
+        `operators_ddl.go` (`ALTER TABLE … ADD CONSTRAINT name CHECK`, LIKE
+        INCLUDING CONSTRAINTS) now allocate an OID; the existing `pg_constraint`
+        VirtualRows hook (`catalog.go`, already 25-column complete) then emits the
+        row. Verified end-to-end on a live server: `ALTER TABLE ct ADD CONSTRAINT
+        b_positive CHECK (b > 0)` → `pg_constraint` returns
+        `(16418, b_positive, c, 16417, 'b > 0')`, and the previously-crashing
+        `pg_index LEFT JOIN pg_constraint … contype IN ('p','u','x')` now runs
+        crash-free (0 rows, no panic) against non-empty data — the loop34 fix holds.
+        Test: `operators_ddl_named_check_test.go` OID-0 guard replaced with
+        non-zero-OID + VirtualRows-row assertions. Design:
+        `docs/design/0097-0023-pg-constraint-population.md`.
+        NEW observation: `\d <table>` still errors `operator AND requires boolean
+        operands` in a *different* sub-query (the per-attribute `pg_attrdef` detail
+        query) — reproduces on a constraint-free table, so it is a separate
+        pre-existing `\d` bug, NOT constraint-related. Remaining blockers (updated):
+        anonymous-CHECK PG-faithful auto-naming, `pg_get_expr` function impl, the
+        `\d` pg_attrdef-detail AND-boolean error, COMMENT→pg_description storage,
+        pg_constraint heap persistence, NO INHERIT CHECK on partitioned tables.
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:

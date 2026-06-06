@@ -391,6 +391,11 @@ type Catalog interface {
 	// type registered via RegisterCompositeTypeWithFields. Returns nil if the
 	// type has no field metadata. M0097-composite.
 	LookupCompositeTypeFields(name string) []CompositeField
+	// AllocOID atomically allocates and returns a fresh catalog OID from the
+	// running counter. Used to give catalog objects a stable identity when no
+	// dedicated creation method exists — e.g. named CHECK constraints that must
+	// surface in pg_constraint with a real OID. M0097-0023.
+	AllocOID() uint32
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -1228,6 +1233,19 @@ func (c *InMemory) AdvanceNextOIDPast(oid uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.advanceNextOIDLocked(oid)
+}
+
+// AllocOID atomically allocates and returns a fresh OID, advancing the
+// running counter. Mirrors the inline `t.OID = c.nextOID; c.nextOID++`
+// pattern used by CreateTable/CreateIndex, but exposed through the Catalog
+// interface so executor DDL paths (e.g. named CHECK constraint creation)
+// can mint synthetic OIDs without a dedicated catalog mutator. M0097-0023.
+func (c *InMemory) AllocOID() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oid := c.nextOID
+	c.nextOID++
+	return oid
 }
 
 // ListDatabases returns the registered database names in

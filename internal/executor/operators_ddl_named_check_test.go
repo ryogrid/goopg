@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -105,16 +106,49 @@ func TestCheckViolationReportsNameAndDetail(t *testing.T) {
 		t.Errorf("satisfying row should pass, got %v", err)
 	}
 
-	// Verify the named CHECK stays out of pg_constraint for now (OID 0 guard),
-	// avoiding the latent virtual-table join bug.
+	// The named CHECK must now carry a real OID (the latent virtual-table join
+	// crash that previously forced OID 0 was fixed in M0097-0023-loop34) and
+	// surface as a row in pg_constraint. M0097-0023.
 	im, ok := cat.(*catalog.InMemory)
 	if !ok {
 		t.Fatal("catalog is not InMemory")
 	}
+	var fooOID uint32
 	for _, nc := range inhg.NamedChecks {
-		if nc.OID != 0 {
-			t.Errorf("named check %q unexpectedly assigned OID %d (would surface in pg_constraint and hit the latent join bug)", nc.Name, nc.OID)
+		if nc.Name == "foo" {
+			fooOID = nc.OID
 		}
 	}
-	_ = im
+	if fooOID == 0 {
+		t.Fatalf("named check %q was not assigned an OID", "foo")
+	}
+
+	// pg_constraint's VirtualRows must emit exactly one row for the constraint,
+	// with contype='c', conrelid=inhg.OID, conname='foo', and conbin=the expr.
+	pgcon, ok := im.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_constraint"})
+	if !ok || pgcon.VirtualRows == nil {
+		t.Fatal("pg_constraint virtual table not found")
+	}
+	var found bool
+	for _, r := range pgcon.VirtualRows() {
+		if len(r) < 25 || r[1] != "foo" {
+			continue
+		}
+		found = true
+		if r[0] != fmt.Sprintf("%d", fooOID) {
+			t.Errorf("pg_constraint oid = %q, want %d", r[0], fooOID)
+		}
+		if r[3] != "c" {
+			t.Errorf("pg_constraint contype = %q, want \"c\"", r[3])
+		}
+		if r[7] != fmt.Sprintf("%d", inhg.OID) {
+			t.Errorf("pg_constraint conrelid = %q, want %d", r[7], inhg.OID)
+		}
+		if r[24] != "xx = 'text'" {
+			t.Errorf("pg_constraint conbin = %q, want %q", r[24], "xx = 'text'")
+		}
+	}
+	if !found {
+		t.Errorf("pg_constraint did not surface named check %q", "foo")
+	}
 }

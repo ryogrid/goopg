@@ -734,14 +734,27 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	// Apply LIKE INCLUDING CONSTRAINTS checks (copied from LIKE source tables).
 	// PostgreSQL preserves the source constraint name; the name is retained so
-	// enforcement can report it. OID is left 0 so the constraint is NOT yet
-	// surfaced through pg_constraint — populating pg_constraint is blocked on a
-	// latent virtual-table LEFT JOIN column-mapping bug (see design doc).
-	// M0097-0023.
+	// enforcement can report it. Named constraints get a fresh OID so they
+	// surface through pg_constraint (the LEFT JOIN column-mapping crash that
+	// previously masked this was fixed in M0097-0023-loop34). M0097-0023.
 	for _, nc := range likeCheckConstraints {
-		tbl.AddCheck(nc.Name, nc.Expr, 0)
+		tbl.AddCheck(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name))
 	}
 	return nil
+}
+
+// allocConstraintOID returns a fresh catalog OID for a named constraint, or
+// 0 for an anonymous one. Anonymous CHECK constraints are kept at OID 0 so
+// pg_constraint's VirtualRows (which skips empty-name / zero-OID rows) does
+// not surface them — the current parser leaves inline/table-level checks
+// unnamed, and PG-faithful auto-naming is a separate follow-up. A named
+// constraint gets a real OID so psql \d and pg_constraint queries see it.
+// M0097-0023.
+func (o *ddlOp) allocConstraintOID(name string) uint32 {
+	if name == "" || o.ctx == nil || o.ctx.Catalog == nil {
+		return 0
+	}
+	return o.ctx.Catalog.AllocOID()
 }
 
 // appendLikeChecks copies src's CHECK constraints (name + expression) into
@@ -2103,11 +2116,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableAddCheck:
 			// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
-			// Track the constraint name so violations report it. OID is left 0
-			// so it stays out of pg_constraint for now (see LIKE note above re:
-			// the latent virtual-table join bug). M0097-0023.
+			// Track the constraint name so violations report it. A named
+			// constraint gets a fresh OID so it surfaces in pg_constraint
+			// (the latent virtual-table join crash was fixed in
+			// M0097-0023-loop34). M0097-0023.
 			if act.CheckExpr != "" {
-				tbl.AddCheck(act.ConstraintName, act.CheckExpr, 0)
+				tbl.AddCheck(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName))
 			}
 		case parser.AlterTableNoOp:
 			// Unknown ADD CONSTRAINT type — no-op.
