@@ -659,6 +659,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 	}
 
+	// Named UNIQUE/PRIMARY KEY constraints with optional INCLUDE columns. M0097-0023.
+	// These override the generic PK/UNIQUE index name with the constraint name.
+	namedPKCreated := false
+	for _, nc := range s.NamedConstraints {
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: nc.Name}
+		primary := nc.IsPrimary
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, true, primary); err != nil {
+			return err
+		}
+		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			idx.IsConstraint = true
+			idx.IncludeColumns = nc.IncludeColumns
+		}
+		if primary {
+			namedPKCreated = true
+		}
+	}
+
 	// Primary key index creation (M0096-0005).
 	//
 	// Two syntactic forms are supported:
@@ -677,13 +695,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 	}
-	if len(pkCols) > 0 {
+	if len(pkCols) > 0 && !namedPKCreated {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_pkey"}
 		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, nil, true, true); err != nil {
 			// Propagate B-tree index errors (e.g. unsupported key type).
 			// This makes CREATE TABLE fail cleanly rather than silently creating
 			// a table without its primary key constraint.
 			return err
+		}
+		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			idx.IsConstraint = true
+			idx.IncludeColumns = s.PrimaryKeyInclude
 		}
 	}
 	// Create btree indexes for inline column-level UNIQUE constraints.
@@ -694,21 +716,25 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false); err != nil {
 				return err
 			}
+			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+				idx.IsConstraint = true
+			}
 		}
 	}
-	// Create btree indexes for table-level UNIQUE (col1, col2) constraints.
+	// Create btree indexes for table-level UNIQUE (col1, col2) [INCLUDE (…)] constraints.
 	// e.g. `UNIQUE (a, b)` — M0097-0028.
 	for i, cols := range s.TableUniques {
-		suffix := "_key"
-		if len(cols) == 1 {
-			suffix = "_" + cols[0] + "_key"
+		var inclCols []string
+		if i < len(s.TableUniqueIncludes) {
+			inclCols = s.TableUniqueIncludes[i]
 		}
-		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: fmt.Sprintf("%s%s%d", tbl.Name, suffix, i)}
-		if len(s.TableUniques) == 1 {
-			idxName.Name = tbl.Name + suffix
-		}
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: o.autoIndexNameWithIncludes(tbl, cols, inclCols, "key")}
 		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, cols, nil, true, false); err != nil {
 			return err
+		}
+		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			idx.IsConstraint = true
+			idx.IncludeColumns = inclCols
 		}
 	}
 	// Create btree indexes for LIKE INCLUDING INDEXES unique (non-PK) indexes.
@@ -1941,7 +1967,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	}
 	name := s.Name
 	if name == "" {
-		name = o.autoIndexName(tbl, s.Columns, "idx")
+		name = o.autoIndexNameWithIncludes(tbl, s.Columns, s.IncludeColumns, "idx")
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
 	if _, exists := o.ctx.Catalog.LookupIndex(idxName); exists {
@@ -1969,10 +1995,11 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false); err != nil {
 		return err
 	}
-	// Mark partial indexes so they are excluded from REFRESH CONCURRENTLY checks.
-	if s.HasPredicate {
+	// Store INCLUDE columns and partial index flag on the newly created index.
+	if s.HasPredicate || len(s.IncludeColumns) > 0 {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
-			idx.HasPredicate = true
+			idx.HasPredicate = s.HasPredicate
+			idx.IncludeColumns = s.IncludeColumns
 		}
 	}
 	return nil
@@ -2102,6 +2129,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableAddPrimaryKey:
 			if err := o.execAlterTableAddPrimaryKey(tbl, act); err != nil {
+				return err
+			}
+		case parser.AlterTableAddUnique:
+			if err := o.execAlterTableAddUnique(tbl, act); err != nil {
 				return err
 			}
 		case parser.AlterTableAddForeignKey:
@@ -2535,7 +2566,35 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		name = tbl.Name + "_pkey"
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	return o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true)
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true); err != nil {
+		return err
+	}
+	if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+		idx.IsConstraint = true
+		idx.IncludeColumns = act.IncludeColumns
+	}
+	return nil
+}
+
+// execAlterTableAddUnique handles ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)].
+// Creates a btree unique index. M0097-0023.
+func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTableAction) error {
+	if len(act.Columns) == 0 {
+		return nil // UNIQUE USING INDEX — index already exists, treat as no-op
+	}
+	name := act.ConstraintName
+	if name == "" {
+		name = o.autoIndexNameWithIncludes(tbl, act.Columns, act.IncludeColumns, "key")
+	}
+	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false); err != nil {
+		return err
+	}
+	if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+		idx.IsConstraint = true
+		idx.IncludeColumns = act.IncludeColumns
+	}
+	return nil
 }
 
 // execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name [RESTRICT|CASCADE]`.
@@ -3164,8 +3223,42 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }
 
+// pgDeduplicateColNames replicates PostgreSQL's ChooseIndexColumnNames logic:
+// if a column name already appears in the result list, it gets a numeric suffix
+// (e.g., a second "c1" becomes "c11"). This matches PG's auto-naming for
+// covering indexes where include columns may repeat key column names. M0097-0023.
+func pgDeduplicateColNames(cols []string) []string {
+	seen := make([]string, 0, len(cols))
+	result := make([]string, 0, len(cols))
+	for _, col := range cols {
+		cur := col
+		for i := 1; ; i++ {
+			found := false
+			for _, s := range seen {
+				if s == cur {
+					found = true
+					break
+				}
+			}
+			if !found {
+				break
+			}
+			cur = fmt.Sprintf("%s%d", col, i)
+		}
+		seen = append(seen, cur)
+		result = append(result, cur)
+	}
+	return result
+}
+
 func (o *ddlOp) autoIndexName(tbl *catalog.Table, columns []string, suffix string) string {
-	base := tbl.Name + "_" + strings.Join(columns, "_") + "_" + suffix
+	return o.autoIndexNameWithIncludes(tbl, columns, nil, suffix)
+}
+
+func (o *ddlOp) autoIndexNameWithIncludes(tbl *catalog.Table, keyColumns, includeColumns []string, suffix string) string {
+	allCols := append(keyColumns, includeColumns...)
+	deduped := pgDeduplicateColNames(allCols)
+	base := tbl.Name + "_" + strings.Join(deduped, "_") + "_" + suffix
 	candidate := base
 	for i := 1; ; i++ {
 		if _, exists := o.ctx.Catalog.LookupIndex(parser.ObjectName{Schema: tbl.Schema, Name: candidate}); !exists {
@@ -6347,7 +6440,33 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 		tbl.Columns[i].Ordinal = i
 	}
 
-	// Phase 3: truncate the heap and all indexes.
+	// Phase 3: drop indexes that reference the dropped column (key or INCLUDE),
+	// then truncate the heap and remaining indexes.
+	droppedColName := strings.ToLower(act.ColumnName)
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		refsDropped := false
+		for _, c := range idx.Columns {
+			if strings.EqualFold(c, droppedColName) {
+				refsDropped = true
+				break
+			}
+		}
+		if !refsDropped {
+			for _, c := range idx.IncludeColumns {
+				if strings.EqualFold(c, droppedColName) {
+					refsDropped = true
+					break
+				}
+			}
+		}
+		if refsDropped {
+			idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+			o.ctx.Pool.InvalidateRel(idxRel)
+			_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
+			idxName := parser.ObjectName{Schema: idx.Schema, Name: idx.Name}
+			_ = o.ctx.Catalog.DropIndex(idxName)
+		}
+	}
 	o.ctx.Pool.InvalidateRel(rel)
 	if terr := o.ctx.Pool.Manager().TruncateRelation(rel); terr != nil {
 		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: terr.Error()}

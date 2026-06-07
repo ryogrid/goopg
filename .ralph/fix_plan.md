@@ -2644,6 +2644,31 @@ M0097-0001 wires it up.
         faithful fix retypes the whole publication catalog family to `oid`/
         `int2vector` consistently — its own loop (oid↔text comparisons cascade
         across the joins; `pubowner` emits `""`).
+      - **Progress 2026-06-07 (M0097-0023-loop37 — INCLUDE columns + pg_get_indexdef +
+        pg_get_constraintdef + pg_constraint UNIQUE/PK rows: 204→78 diffs):**
+        Six changes spanning parser/catalog/executor:
+        (a) Parser: `INCLUDE (cols)` stored in all 9 syntactic forms
+        (CREATE INDEX, CREATE TABLE UNIQUE/PK/named-CONSTRAINT, ALTER TABLE ADD
+        PRIMARY KEY/UNIQUE/named-CONSTRAINT). `CONCURRENTLY` keyword skipped
+        (was parsed as index name). New `AlterTableAddUnique` action kind,
+        `TableConstraintDef` struct. (b) Catalog: `Index.IncludeColumns`,
+        `Index.IsConstraint`, `AllIndexes()` interface+impl, `BuildIndexDef()`
+        exported helper. `pg_index` VirtualRows fully populated. `pg_constraint`
+        VirtualRows now emits UNIQUE/PK rows from constraint-backed indexes
+        (`contype='u'/'p'`, `conkey='{1,2}'`). (c) Executor DDL: all 7
+        constraint creation paths set `idx.IsConstraint=true` + store
+        `IncludeColumns`. `pgDeduplicateColNames` mirrors PG's
+        `ChooseIndexColumnNames` for auto-name dedup (second `c1` → `c11`).
+        `execAlterDropColumn` now drops dependent indexes (key OR INCLUDE)
+        before heap rewrite — was orphaning them. (d) Executor expr:
+        `pg_get_indexdef(oid)`, `pg_get_constraintdef(oid [, pretty])`
+        implemented. `::regclass` now also resolves index OIDs → index names.
+        Verified: functional_deps PASS, alter_table/create_index SKIP-counts
+        unchanged, Q12/Q13 not broken. Design:
+        `docs/design/0097-0023-include-columns-and-constraint-catalog.md`.
+        Remaining 78 diffs: `box(text)` constructor missing (cascading
+        failures, ~55 diffs), EXCLUDE constraint (~10), `\d` key/non-key
+        display (~9), float vs int formatting (~2), DETAIL messages (~8).
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:

@@ -898,6 +898,15 @@ type ColumnDef struct {
 
 func (c ColumnDef) Pos() int { return c.pos }
 
+// TableConstraintDef describes a named UNIQUE or PRIMARY KEY table-level constraint
+// that may carry INCLUDE covering columns. Used in CreateTableStmt.NamedConstraints.
+type TableConstraintDef struct {
+	Name           string   // constraint/index name
+	Columns        []string // key columns
+	IncludeColumns []string // non-key covering columns from INCLUDE (…)
+	IsPrimary      bool     // true for PRIMARY KEY, false for UNIQUE
+}
+
 // CreateTableStmt — `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name
 //
 //	(column_def [, …]) [WITH (option = value [, …])]`. Foreign keys,
@@ -946,8 +955,20 @@ type CreateTableStmt struct {
 	TableChecks []string
 	// TableUniques holds column-name lists from table-level UNIQUE (col1, col2)
 	// constraints. Each entry is the list of columns for one UNIQUE clause.
-	// M0097-0028.
+	// Anonymous constraints only; named ones are in NamedConstraints. M0097-0028.
 	TableUniques [][]string
+	// TableUniqueIncludes holds the INCLUDE covering columns parallel to
+	// TableUniques: TableUniqueIncludes[i] is the include list for TableUniques[i].
+	// May be shorter than TableUniques if trailing entries have no INCLUDE. M0097-0023.
+	TableUniqueIncludes [][]string
+	// PrimaryKeyInclude holds the INCLUDE covering columns for an anonymous
+	// table-level PRIMARY KEY constraint. M0097-0023.
+	PrimaryKeyInclude []string
+	// NamedConstraints holds explicitly named UNIQUE/PRIMARY KEY constraints, which
+	// may carry INCLUDE covering columns. The parser places named constraints here
+	// instead of (or in addition to for PK) TableUniques/PrimaryKey so that the
+	// executor can use the constraint name as the index name. M0097-0023.
+	NamedConstraints []TableConstraintDef
 	// LikeTables holds the source table names from LIKE clauses.
 	// `CREATE TABLE t (LIKE src INCLUDING DEFAULTS)` copies src's columns. M0097-0069.
 	// Deprecated: use BodyOrder for positional interleaving.
@@ -1018,7 +1039,8 @@ type CreateIndexStmt struct {
 	// most built-in operator classes have no options, so a non-empty value
 	// here causes an error at execution time. M0097-0023.
 	OpClassWithOptions string
-	HasPredicate       bool // true when a WHERE clause (partial index predicate) is present
+	HasPredicate       bool     // true when a WHERE clause (partial index predicate) is present
+	IncludeColumns     []string // non-key covering columns from INCLUDE (…)
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }
@@ -1363,6 +1385,10 @@ const (
 	// Marks the named column as dropped (hidden from user queries) while
 	// retaining its heap slot for backward heap-tuple compatibility. M0097-0028.
 	AlterTableDropColumn
+	// AlterTableAddUnique — `ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)]`.
+	// Creates a btree unique index; the index name comes from ConstraintName or
+	// is auto-generated. M0097-0023.
+	AlterTableAddUnique
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1375,6 +1401,7 @@ type AlterTableAction struct {
 	Kind           AlterTableActionKind
 	ConstraintName string    // optional, ADD CONSTRAINT name PRIMARY KEY …
 	Columns        []string  // populated for AddPrimaryKey + AddForeignKey (local cols)
+	IncludeColumns []string  // non-key covering columns from INCLUDE (…) for PK/UNIQUE
 	Column         ColumnDef // populated for AddColumn
 
 	// Foreign-key extras (only populated for AddForeignKey).

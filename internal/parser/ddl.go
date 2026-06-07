@@ -1380,10 +1380,13 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				return nil, p.errAtCur("expected ')'")
 			}
 			stmt.PrimaryKey = cols
-			// Optional INCLUDE (col, …) — accept and discard for compat.
+			// Optional INCLUDE (col, …) — parse and store covering columns. M0097-0023.
 			if p.acceptIdentKeyword("include") {
 				if p.acceptSymbol("(") {
 					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+						if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+							stmt.PrimaryKeyInclude = append(stmt.PrimaryKeyInclude, p.cur().Value)
+						}
 						p.advance()
 					}
 				}
@@ -1399,7 +1402,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				_ = p.acceptIdentKeyword("immediate")
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
-			// Table-level UNIQUE (cols) — create btree index. M0097-0028.
+			// Table-level UNIQUE (cols) [INCLUDE (incl)] — create btree index. M0097-0028.
 			p.advance()
 			if p.acceptSymbol("(") {
 				var cols []string
@@ -1411,6 +1414,19 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				}
 				if len(cols) > 0 {
 					stmt.TableUniques = append(stmt.TableUniques, cols)
+					// Optional INCLUDE (col, …). M0097-0023.
+					var incl []string
+					if p.acceptIdentKeyword("include") {
+						if p.acceptSymbol("(") {
+							for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+								if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+									incl = append(incl, p.cur().Value)
+								}
+								p.advance()
+							}
+						}
+					}
+					stmt.TableUniqueIncludes = append(stmt.TableUniqueIncludes, incl)
 				}
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
@@ -1429,8 +1445,9 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint {
 			// Table-level CONSTRAINT name (PRIMARY KEY | UNIQUE | CHECK | FOREIGN KEY).
-			p.advance()           // CONSTRAINT
-			_, _ = p.parseIdent() // constraint name (ignore)
+			p.advance() // CONSTRAINT
+			cNameTok, _ := p.parseIdent()
+			constraintName := cNameTok.Value
 			switch {
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
 				p.advance()
@@ -1448,13 +1465,20 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					return nil, p.errAtCur("expected ')'")
 				}
 				stmt.PrimaryKey = cols
-				// Optional INCLUDE (col, …) — accept and discard for compat.
+				cdef := TableConstraintDef{Name: constraintName, Columns: cols, IsPrimary: true}
+				// Optional INCLUDE (col, …) — parse and store covering columns.
 				if p.acceptIdentKeyword("include") {
 					if p.acceptSymbol("(") {
 						for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+							if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+								cdef.IncludeColumns = append(cdef.IncludeColumns, p.cur().Value)
+							}
 							p.advance()
 						}
 					}
+				}
+				if constraintName != "" {
+					stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
 				}
 				// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE] — accept and discard.
 				if p.acceptKeyword(KwNot) {
@@ -1467,7 +1491,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					_ = p.acceptIdentKeyword("immediate")
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
-				// CONSTRAINT name UNIQUE (cols) — store as table-level unique. M0097-0028.
+				// CONSTRAINT name UNIQUE (cols) [INCLUDE (cols)] M0097-0028.
 				p.advance()
 				if p.acceptSymbol("(") {
 					var cols []string
@@ -1478,7 +1502,23 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						p.advance()
 					}
 					if len(cols) > 0 {
-						stmt.TableUniques = append(stmt.TableUniques, cols)
+						cdef := TableConstraintDef{Name: constraintName, Columns: cols}
+						// Optional INCLUDE (col, …).
+						if p.acceptIdentKeyword("include") {
+							if p.acceptSymbol("(") {
+								for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+									if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+										cdef.IncludeColumns = append(cdef.IncludeColumns, p.cur().Value)
+									}
+									p.advance()
+								}
+							}
+						}
+						if constraintName != "" {
+							stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
+						} else {
+							stmt.TableUniques = append(stmt.TableUniques, cols)
+						}
 					}
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
@@ -2191,6 +2231,8 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 		}
 		stmt.IfNotExists = true
 	}
+	// Skip optional CONCURRENTLY keyword (goopg builds indexes synchronously).
+	p.acceptIdentKeyword("concurrently")
 	// Optional index name. If the next token is ON, the name is omitted.
 	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn) {
 		nameTok, err := p.parseIdent()
@@ -2227,21 +2269,24 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("expected ')'")
 	}
-	// Optional INCLUDE (col, …) — accept and discard for compat.
+	// Optional INCLUDE (col, …) — parse and store covering columns.
 	if p.acceptIdentKeyword("include") {
-		if p.acceptSymbol("(") {
-			depth := 1
-			for depth > 0 && p.cur().Kind != TokenEOF {
-				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-					depth++
-				} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
-					depth--
-					if depth == 0 {
-						p.advance()
-						break
-					}
-				}
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after INCLUDE")
+		}
+		for {
+			tok := p.cur()
+			if tok.Kind == TokenIdent || tok.Kind == TokenKeyword {
+				stmt.IncludeColumns = append(stmt.IncludeColumns, tok.Value)
 				p.advance()
+			} else {
+				return nil, p.errAtCur("expected column name in INCLUDE list")
+			}
+			if p.acceptSymbol(")") {
+				break
+			}
+			if !p.acceptSymbol(",") {
+				return nil, p.errAtCur("expected ',' or ')' in INCLUDE list")
 			}
 		}
 	}
@@ -3843,6 +3888,17 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		act.Kind = AlterTableAddPrimaryKey
 		act.Columns = cols
+		// Optional INCLUDE (col, …) — parse and store covering columns. M0097-0023.
+		if p.acceptIdentKeyword("include") {
+			if p.acceptSymbol("(") {
+				for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+						act.IncludeColumns = append(act.IncludeColumns, p.cur().Value)
+					}
+					p.advance()
+				}
+			}
+		}
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
 		// ADD [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES
@@ -3909,6 +3965,40 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		_ = p.acceptKeyword(KwNot) && p.acceptIdentKeyword("valid")
 		act.Kind = AlterTableAddCheck
 		act.CheckExpr = expr
+		return act, nil
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
+		// ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)] — create a unique index.
+		// M0097-0023.
+		p.advance()
+		if !p.acceptIdentKeyword("using") || !p.acceptIdentKeyword("index") {
+			// Normal UNIQUE (cols) form.
+			if p.acceptSymbol("(") {
+				var cols []string
+				for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+						cols = append(cols, p.cur().Value)
+					}
+					p.advance()
+				}
+				act.Columns = cols
+				// Optional INCLUDE (col, …).
+				if p.acceptIdentKeyword("include") {
+					if p.acceptSymbol("(") {
+						for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+							if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+								act.IncludeColumns = append(act.IncludeColumns, p.cur().Value)
+							}
+							p.advance()
+						}
+					}
+				}
+			}
+		} else {
+			// ADD UNIQUE USING INDEX indexname — adopt existing index as unique constraint.
+			// Accept the index name and treat as no-op (the index already exists). M0097-0023.
+			_, _ = p.parseIdent() // consume indexname
+		}
+		act.Kind = AlterTableAddUnique
 		return act, nil
 	default:
 		// ADD [COLUMN] column_def — bare ident or COLUMN keyword.

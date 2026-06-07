@@ -315,8 +315,10 @@ type Index struct {
 	// columns (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil
 	// when Columns[i] == "" (expression column); nil for plain column names.
 	// Not persisted to JSON (parser.Expr is not JSON-serializable).
-	ColExprs     []*parser.Expr
-	HasPredicate bool // true if this is a partial index (has a WHERE clause)
+	ColExprs       []*parser.Expr
+	HasPredicate   bool     // true if this is a partial index (has a WHERE clause)
+	IncludeColumns []string // non-key covering columns from INCLUDE (…)
+	IsConstraint   bool     // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
 }
 
 // QualifiedName renders the table's name in the canonical
@@ -370,6 +372,8 @@ type Catalog interface {
 	// UnregisterRole removes a role from the registry. M0097-drop_if_exists.
 	UnregisterRole(name string)
 	IndexesOnTable(table *Table) []*Index
+	// AllIndexes returns every index in the catalog, sorted by OID. M0097-0023.
+	AllIndexes() []*Index
 	HasPrimaryKey(table *Table) bool
 	RelFileNode(table *Table) storage.RelFileNode
 	IndexRelFileNode(index *Index) storage.RelFileNode
@@ -1603,7 +1607,7 @@ func (c *InMemory) registerSystemTables() {
 					t.Name,
 					idx.Name,
 					"", // tablespace
-					"",
+					BuildIndexDef(idx),
 				})
 			}
 		}
@@ -2276,8 +2280,48 @@ func (c *InMemory) registerSystemTables() {
 				row[24] = nc.Expr                   // conbin
 				out = append(out, row)
 			}
-			// Emit NOT NULL constraints tracked as NamedChecks with type marker.
-			// (Not-null constraints share the NamedChecks slice with a special prefix.)
+		}
+		// Emit UNIQUE and PRIMARY KEY constraints from constraint-backed indexes.
+		for _, idx := range c.indexes {
+			if !idx.IsConstraint || idx.Table == nil {
+				continue
+			}
+			colOrdMap := make(map[string]int, len(idx.Table.Columns))
+			for _, col := range idx.Table.Columns {
+				colOrdMap[col.Name] = col.Ordinal + 1
+			}
+			var keyNums []string
+			for _, colName := range idx.Columns {
+				if ord, ok := colOrdMap[colName]; ok {
+					keyNums = append(keyNums, fmt.Sprintf("%d", ord))
+				}
+			}
+			contype := "u"
+			if idx.Primary {
+				contype = "p"
+			}
+			row := make([]string, 25)
+			row[0] = fmt.Sprintf("%d", idx.OID)
+			row[1] = idx.Name
+			row[2] = "2200"
+			row[3] = contype
+			row[4] = "f"
+			row[5] = "f"
+			row[6] = "t"
+			row[7] = fmt.Sprintf("%d", idx.Table.OID)
+			row[8] = "0"
+			row[9] = fmt.Sprintf("%d", idx.OID)
+			row[10] = "0"
+			row[11] = "0"
+			row[12] = " "
+			row[13] = " "
+			row[14] = " "
+			row[15] = "t"
+			row[16] = "0"
+			row[17] = "f"
+			row[18] = "f"
+			row[19] = "{" + strings.Join(keyNums, ",") + "}"
+			out = append(out, row)
 		}
 		return out
 	}
@@ -2315,7 +2359,125 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2610,
 	}
-	pgIndexCatalog.VirtualRows = func() [][]string { return nil }
+	pgIndexCatalog.VirtualRows = func() [][]string {
+		idxs := c.AllIndexes()
+		out := make([][]string, 0, len(idxs))
+		for _, idx := range idxs {
+			if idx.Table == nil {
+				continue
+			}
+			// Build column-ordinal lookups (1-based) for the parent table.
+			colOrd := make(map[string]int, len(idx.Table.Columns))
+			for _, col := range idx.Table.Columns {
+				colOrd[col.Name] = col.Ordinal + 1
+			}
+			// indkey: key columns then include columns; expression columns get ordinal 0.
+			keyParts := make([]string, 0, len(idx.Columns)+len(idx.IncludeColumns))
+			for _, col := range idx.Columns {
+				if col == "" {
+					keyParts = append(keyParts, "0")
+				} else if ord, ok := colOrd[col]; ok {
+					keyParts = append(keyParts, fmt.Sprintf("%d", ord))
+				} else {
+					keyParts = append(keyParts, "0")
+				}
+			}
+			for _, col := range idx.IncludeColumns {
+				if ord, ok := colOrd[col]; ok {
+					keyParts = append(keyParts, fmt.Sprintf("%d", ord))
+				} else {
+					keyParts = append(keyParts, "0")
+				}
+			}
+			indkey := strings.Join(keyParts, " ")
+			// indclass: one opclass OID per key column (0 = unknown; btree int4=1978).
+			classOIDs := make([]string, len(idx.Columns))
+			for i, col := range idx.Columns {
+				oid := "0"
+				if col != "" {
+					for _, tc := range idx.Table.Columns {
+						if tc.Name == col {
+							switch tc.Type.Name {
+							case "int2", "smallint":
+								oid = "1970"
+							case "int4", "int", "integer", "serial":
+								oid = "1978"
+							case "int8", "bigint", "bigserial":
+								oid = "1980"
+							case "float4", "real":
+								oid = "2968"
+							case "float8", "double precision":
+								oid = "2970"
+							case "text", "varchar", "character varying":
+								oid = "1994"
+							case "name":
+								oid = "1996"
+							case "bpchar", "char", "character":
+								oid = "426"
+							case "oid":
+								oid = "2990"
+							case "bool", "boolean":
+								oid = "424"
+							case "date":
+								oid = "434"
+							case "timestamp", "timestamp without time zone":
+								oid = "2040"
+							case "timestamptz", "timestamp with time zone":
+								oid = "2040"
+							}
+							break
+						}
+					}
+				}
+				classOIDs[i] = oid
+			}
+			indclass := strings.Join(classOIDs, " ")
+			boolStr := func(b bool) string {
+				if b {
+					return "t"
+				}
+				return "f"
+			}
+			natts := len(idx.Columns) + len(idx.IncludeColumns)
+			nkeyatts := len(idx.Columns)
+			// Build space-separated zero-vector for indcollation/indoption.
+			buildZeroVec := func(n int) string {
+				if n <= 0 {
+					return ""
+				}
+				parts := make([]string, n)
+				for i := range parts {
+					parts[i] = "0"
+				}
+				return strings.Join(parts, " ")
+			}
+			out = append(out, []string{
+				fmt.Sprintf("%d", idx.OID),       // indexrelid
+				fmt.Sprintf("%d", idx.Table.OID), // indrelid
+				fmt.Sprintf("%d", natts),          // indnatts
+				fmt.Sprintf("%d", nkeyatts),       // indnkeyatts
+				boolStr(idx.Unique),               // indisunique
+				"f",                               // indnullsnotdistinct
+				boolStr(idx.Primary),              // indisprimary
+				"f",                               // indisexclusion
+				"t",                               // indimmediate
+				"f",                               // indisclustered
+				"t",                               // indisvalid
+				"f",                               // indcheckxmin
+				"t",                               // indisready
+				"t",                               // indislive
+				"f",                               // indisreplident
+				indkey,                            // indkey
+				buildZeroVec(nkeyatts),            // indcollation
+				indclass,                          // indclass
+				buildZeroVec(nkeyatts),            // indoption
+				"",                                // indexprs (NULL)
+				"",                                // indpred (NULL)
+				"",                                // indcoloptions (NULL)
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_index"] = pgIndexCatalog
 
 	// pg_statistic_ext — stores extended statistics objects (OID 3381).
@@ -3560,6 +3722,69 @@ func (c *InMemory) IndexesOnTable(table *Table) []*Index {
 		out = append(out, idx)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].QualifiedName() < out[j].QualifiedName() })
+	return out
+}
+
+// BuildIndexDef reconstructs the CREATE INDEX DDL string for an index.
+// Used by pg_indexes.indexdef and pg_get_indexdef(). M0097-0023.
+func BuildIndexDef(idx *Index) string {
+	var sb strings.Builder
+	sb.WriteString("CREATE ")
+	if idx.Unique {
+		sb.WriteString("UNIQUE ")
+	}
+	sb.WriteString("INDEX ")
+	sb.WriteString(idx.Name)
+	sb.WriteString(" ON ")
+	schema := idx.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	sb.WriteString(schema)
+	sb.WriteByte('.')
+	if idx.Table != nil {
+		sb.WriteString(idx.Table.Name)
+	}
+	method := idx.Method
+	if method == "" {
+		method = "btree"
+	}
+	sb.WriteString(" USING ")
+	sb.WriteString(method)
+	sb.WriteString(" (")
+	for i, col := range idx.Columns {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		if col == "" {
+			sb.WriteString("(expr)")
+		} else {
+			sb.WriteString(col)
+		}
+	}
+	sb.WriteByte(')')
+	if len(idx.IncludeColumns) > 0 {
+		sb.WriteString(" INCLUDE (")
+		for i, col := range idx.IncludeColumns {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(col)
+		}
+		sb.WriteByte(')')
+	}
+	return sb.String()
+}
+
+// AllIndexes returns every index in the catalog, sorted by OID.
+func (c *InMemory) AllIndexes() []*Index {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*Index, 0, len(c.indexes))
+	for _, idx := range c.indexes {
+		out = append(out, idx)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
 	return out
 }
 

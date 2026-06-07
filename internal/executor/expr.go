@@ -402,6 +402,12 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 						return NewStringDatum(tbl.Name), nil
 					}
 				}
+				// Also resolve index OIDs to index names. M0097-0023.
+				for _, idx := range ctx.Catalog.AllIndexes() {
+					if idx.OID == uint32(v.Int) {
+						return NewStringDatum(idx.Name), nil
+					}
+				}
 			case KindString:
 				schema, rel := splitQualifiedTable(v.StringValue())
 				objName := parser.ObjectName{Schema: schema, Name: rel}
@@ -4015,6 +4021,28 @@ func evalAge(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	return NewIntervalDatum(totalMonths, int32(days)), nil
 }
 
+// buildIndexDefString delegates to catalog.BuildIndexDef. M0097-0023.
+func buildIndexDefString(idx *catalog.Index) string {
+	return catalog.BuildIndexDef(idx)
+}
+
+// buildConstraintDefString builds the pg_get_constraintdef text for a
+// UNIQUE or PRIMARY KEY constraint backed by idx. M0097-0023.
+func buildConstraintDefString(idx *catalog.Index) string {
+	keyCols := "(" + strings.Join(idx.Columns, ", ") + ")"
+	var keyword string
+	if idx.Primary {
+		keyword = "PRIMARY KEY"
+	} else {
+		keyword = "UNIQUE"
+	}
+	def := keyword + " " + keyCols
+	if len(idx.IncludeColumns) > 0 {
+		def += " INCLUDE (" + strings.Join(idx.IncludeColumns, ", ") + ")"
+	}
+	return def
+}
+
 // evalMakeDate implements make_date(year, month, day) → date. M0097-0004.
 func evalMakeDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 3 {
@@ -6113,6 +6141,56 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(seqName), nil
 		}
 		return NullDatum, nil
+	case "pg_get_indexdef":
+		// pg_get_indexdef(indexrelid) → text — reconstructs CREATE INDEX DDL. M0097-0023.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		for _, idx := range ctx.Catalog.AllIndexes() {
+			if idx.OID != targetOID {
+				continue
+			}
+			return NewStringDatum(buildIndexDefString(idx)), nil
+		}
+		return NullDatum, nil
+
+	case "pg_get_constraintdef":
+		// pg_get_constraintdef(oid [, pretty bool]) → text
+		// Reconstructs the constraint definition DDL. M0097-0023.
+		// Handles UNIQUE/PRIMARY KEY constraints (backed by indexes with IsConstraint=true).
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		for _, idx := range ctx.Catalog.AllIndexes() {
+			if idx.OID != targetOID || !idx.IsConstraint {
+				continue
+			}
+			return NewStringDatum(buildConstraintDefString(idx)), nil
+		}
+		return NullDatum, nil
+
 	case "pg_sequence_parameters":
 		// SRF returning sequence parameters — stub returns NULL.
 		return NullDatum, nil
