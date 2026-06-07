@@ -665,9 +665,23 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	for _, nc := range s.NamedConstraints {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: nc.Name}
 		if nc.IsExclusion {
-			// EXCLUDE USING: stub catalog entry; no enforcement in v0. M0097-0023.
-			if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, nc); err != nil {
-				return err
+			if nc.ExclusionOp == "=" && strings.ToLower(nc.Method) == "btree" {
+				// btree equality exclusion == unique constraint: build a real btree
+				// so checkExclusionConstraintsForInsert can probe it at INSERT time.
+				if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, false, false); err != nil {
+					return err
+				}
+				if idx, ok2 := o.ctx.Catalog.LookupIndex(idxName); ok2 {
+					idx.IsExclusion = true
+					idx.ExclusionOp = "="
+					idx.IncludeColumns = nc.IncludeColumns
+					idx.IsConstraint = true
+				}
+			} else {
+				// Other exclusion operators: stub catalog entry; no enforcement in v0.
+				if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, nc); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -756,7 +770,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			idx.IncludeColumns = inclCols
 		}
 	}
-	// Create catalog stubs for anonymous EXCLUDE USING constraints. M0097-0023.
+	// Create indexes for anonymous EXCLUDE USING constraints. M0097-0023.
 	for _, ec := range s.TableExclusions {
 		name := ec.Name
 		if name == "" {
@@ -764,8 +778,20 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		ec.Name = name
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: name}
-		if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, ec); err != nil {
-			return err
+		if ec.ExclusionOp == "=" && strings.ToLower(ec.Method) == "btree" {
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false); err != nil {
+				return err
+			}
+			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+				idx.IsExclusion = true
+				idx.ExclusionOp = "="
+				idx.IncludeColumns = ec.IncludeColumns
+				idx.IsConstraint = true
+			}
+		} else {
+			if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, ec); err != nil {
+				return err
+			}
 		}
 	}
 	// Create btree indexes for LIKE INCLUDING INDEXES unique (non-PK) indexes.

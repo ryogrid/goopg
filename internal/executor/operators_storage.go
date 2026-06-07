@@ -1128,6 +1128,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if uerr := checkUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, o.plan.Pos()); uerr != nil {
 				return nil, uerr
 			}
+			if uerr := checkExclusionConstraintsForInsert(o.ctx, partTable, partTable.Columns, partRow, o.plan.Pos()); uerr != nil {
+				return nil, uerr
+			}
 			ptr, werr := writeHeapRowReturning(o.ctx, targetRel, partTable.Columns, partRow)
 			if werr != nil {
 				return nil, werr
@@ -1147,6 +1150,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		}
 		// No matching partition found (or non-partitioned) — write to parent.
 		if uerr := checkUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, o.plan.Pos()); uerr != nil {
+			return nil, uerr
+		}
+		if uerr := checkExclusionConstraintsForInsert(o.ctx, o.plan.Table, cols, row, o.plan.Pos()); uerr != nil {
 			return nil, uerr
 		}
 		ptr, werr := writeHeapRowReturning(o.ctx, targetRel, cols, row)
@@ -1984,7 +1990,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	pending := make([]pendingUpdate, 0, 1) // pre-alloc for common 1-row match
 	heapRel := rel
 
-	err = tree.RangeScan(keyBytes, keyBytes, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
+	hiBytes := keyBytes
+	if len(ix.Index.Columns) > 1 {
+		hiBytes = appendCompositeUpperPadding(keyBytes)
+	}
+	err = tree.RangeScan(keyBytes, hiBytes, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
 		if err != nil {
 			return false, err
@@ -2292,6 +2302,17 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				o.ctx.Pool.Unpin(s)
 				if derr != nil {
 					return nil, derr
+				}
+				// Check unique constraints AFTER stamping xmax so isLiveForUniqueCheck
+				// treats the old row version as dead. Mirrors the normal seqscan update path.
+				{
+					chkTbl := idxTbl
+					if destPartIdx != nil {
+						chkTbl = destPartIdx
+					}
+					if uerr := checkUniqueIndexesForInsert(o.ctx, chkTbl, targetWriteCols, pu.newRow, o.plan.Pos()); uerr != nil {
+						return nil, uerr
+					}
 				}
 				newPtr, werr := writeHeapRowReturning(o.ctx, targetWriteRel, targetWriteCols, pu.newRow)
 				if werr != nil {
@@ -2692,6 +2713,20 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				o.ctx.Pool.Unpin(s)
 				if derr != nil {
 					return nil, derr
+				}
+				// Check unique constraints on the new row AFTER stamping xmax on the
+				// old tuple (so isLiveForUniqueCheck treats the old version as dead).
+				{
+					chkTbl := pu.scanTbl
+					if chkTbl == nil {
+						chkTbl = tbl
+					}
+					if destPart != nil {
+						chkTbl = destPart
+					}
+					if uerr := checkUniqueIndexesForInsert(o.ctx, chkTbl, targetWriteCols, pu.newRow, o.plan.Pos()); uerr != nil {
+						return nil, uerr
+					}
 				}
 				// M0100-0005t: capture the new ItemPointer so we can maintain the
 				// destination partition's unique/PK indexes after a cross-partition
@@ -3794,6 +3829,89 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		}
 	}
 	return nil
+}
+
+// checkExclusionConstraintsForInsert enforces exclusion-constraint violations at
+// INSERT time. For btree EXCLUDE ... WITH = constraints (equality exclusion),
+// this is equivalent to a uniqueness check. Returns 23P01 (exclusion_violation)
+// if a live tuple with the same exclusion-column values already exists.
+func checkExclusionConstraintsForInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, pos int) error {
+	if ctx.Catalog == nil || ctx.Pool == nil {
+		return nil
+	}
+	rel := ctx.Catalog.RelFileNode(tbl)
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if !idx.IsExclusion || idx.ExclusionOp != "=" {
+			continue
+		}
+		idxRel := ctx.Catalog.IndexRelFileNode(idx)
+		tree, err := btree.Open(ctx.Pool, idxRel)
+		if err != nil {
+			continue
+		}
+		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+		if err != nil || key == nil {
+			continue
+		}
+		detail := buildExclusionConstraintDetail(idx, cols, row)
+		if raiseErr := exclusionCheckOnce(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
+			return raiseErr
+		}
+	}
+	return nil
+}
+
+// exclusionCheckOnce probes a btree exclusion index for a conflicting live tuple.
+func exclusionCheckOnce(ctx *Context, rel storage.RelFileNode, tree *btree.BTree, key []byte, idxName, detail string, pos int) error {
+	liveConflict := false
+	_ = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
+		slot, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+		if perr != nil {
+			return true, nil
+		}
+		slot.RLock()
+		tuple, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		slot.RUnlock()
+		ctx.Pool.Unpin(slot)
+		if terr != nil {
+			return true, nil
+		}
+		if isLiveForUniqueCheck(ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
+			liveConflict = true
+			return false, nil
+		}
+		return true, nil
+	})
+	if liveConflict {
+		return &ExecError{
+			Code:    "23P01",
+			Pos:     pos,
+			Message: fmt.Sprintf("conflicting key value violates exclusion constraint %q", idxName),
+			Detail:  detail,
+		}
+	}
+	return nil
+}
+
+// buildExclusionConstraintDetail builds the DETAIL string for a 23P01 error:
+// "Key (col1)=(val1) conflicts with existing key (col1)=(val1)."
+func buildExclusionConstraintDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
+	colNames := make([]string, 0, len(idx.Columns))
+	colVals := make([]string, 0, len(idx.Columns))
+	for _, idxCol := range idx.Columns {
+		colNames = append(colNames, idxCol)
+		val := ""
+		for i, col := range cols {
+			if col.Name == idxCol && i < len(row) {
+				val = row[i].Format()
+				break
+			}
+		}
+		colVals = append(colVals, val)
+	}
+	key := fmt.Sprintf("Key (%s)=(%s)", strings.Join(colNames, ", "), strings.Join(colVals, ", "))
+	return fmt.Sprintf("%s conflicts with existing key (%s)=(%s).",
+		key, strings.Join(colNames, ", "), strings.Join(colVals, ", "))
 }
 
 // uniqueCheckWithWait probes a unique btree for a conflicting live tuple.

@@ -2908,11 +2908,12 @@ func (p *parser) parseExcludeConstraint() TableConstraintDef {
 			}
 			cdef.Columns = append(cdef.Columns, colTok.Value)
 			_ = p.acceptKeyword(KwWith) || p.acceptIdentKeyword("with")
-			// Operator: may be an identifier token or a symbol token (e.g. "=").
+			// Operator: may be an identifier, symbol, or operator token (e.g. "=").
+			// Note: "=" is TokenOperator in goopg's lexer, not TokenSymbol.
 			var opVal string
 			if opTok, e := p.parseIdent(); e == nil {
 				opVal = opTok.Value
-			} else if p.cur().Kind == TokenSymbol {
+			} else if p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator {
 				opVal = p.cur().Value
 				p.advance()
 			}
