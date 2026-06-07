@@ -659,11 +659,18 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 	}
 
-	// Named UNIQUE/PRIMARY KEY constraints with optional INCLUDE columns. M0097-0023.
+	// Named UNIQUE/PRIMARY KEY/EXCLUDE constraints with optional INCLUDE columns. M0097-0023.
 	// These override the generic PK/UNIQUE index name with the constraint name.
 	namedPKCreated := false
 	for _, nc := range s.NamedConstraints {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: nc.Name}
+		if nc.IsExclusion {
+			// EXCLUDE USING: stub catalog entry; no enforcement in v0. M0097-0023.
+			if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, nc); err != nil {
+				return err
+			}
+			continue
+		}
 		primary := nc.IsPrimary
 		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, true, primary); err != nil {
 			return err
@@ -735,6 +742,18 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.IsConstraint = true
 			idx.IncludeColumns = inclCols
+		}
+	}
+	// Create catalog stubs for anonymous EXCLUDE USING constraints. M0097-0023.
+	for _, ec := range s.TableExclusions {
+		name := ec.Name
+		if name == "" {
+			name = o.autoIndexNameWithIncludes(tbl, ec.Columns, ec.IncludeColumns, "excl")
+		}
+		ec.Name = name
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: name}
+		if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, ec); err != nil {
+			return err
 		}
 	}
 	// Create btree indexes for LIKE INCLUDING INDEXES unique (non-PK) indexes.
@@ -1986,7 +2005,23 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			Detail:  "Valid values are between \"10\" and \"100\"."}
 	}
 	method := strings.ToLower(strings.TrimSpace(s.Method))
-	if method == "" || method == "hash" {
+	if method == "rtree" {
+		o.ctx.AddNotice("substituting access method \"gist\" for obsolete method \"rtree\"")
+		method = "gist"
+	}
+	if method == "" {
+		method = "btree"
+	}
+	// brin, gin, hash do not support INCLUDE columns; hash is silently upgraded
+	// to btree only when there are no INCLUDE columns. M0097-0023.
+	if len(s.IncludeColumns) > 0 {
+		switch method {
+		case "brin", "gin", "hash":
+			return &ExecError{Code: "0A000", Pos: s.Pos(),
+				Message: fmt.Sprintf("access method \"%s\" does not support included columns", method)}
+		}
+	}
+	if method == "hash" {
 		method = "btree"
 	}
 	if method != "btree" {
@@ -2749,6 +2784,36 @@ func addGroupByPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkCons
 			}
 		}
 	}
+}
+
+// createExclusionIndexStub registers an EXCLUDE USING constraint in the catalog
+// without type-validation or B-tree building. Exclusion semantics are not
+// enforced in v0; the stub exists so pg_constraint and pg_index queries return
+// correct rows. M0097-0023.
+func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl *catalog.Table, ec parser.TableConstraintDef) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil // unsupported catalog — silently skip
+	}
+	idx, err := im.CreateIndex(idxName, tbl, ec.Columns, false, "btree", false)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return &ExecError{Code: "42P07", Pos: pos, Message: err.Error()}
+		}
+		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	}
+	idx.IsExclusion = true
+	idx.ExclusionOp = ec.ExclusionOp
+	idx.IncludeColumns = ec.IncludeColumns
+	if sess, ok2 := o.ctx.Session.(*BasicSession); ok2 {
+		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
+	}
+	if catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
+	return nil
 }
 
 func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool) error {

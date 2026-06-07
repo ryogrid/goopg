@@ -905,6 +905,9 @@ type TableConstraintDef struct {
 	Columns        []string // key columns
 	IncludeColumns []string // non-key covering columns from INCLUDE (…)
 	IsPrimary      bool     // true for PRIMARY KEY, false for UNIQUE
+	IsExclusion    bool     // true for EXCLUDE USING constraints
+	ExclusionOp    string   // per-column operator (e.g. "=") for single-column EXCLUDE
+	Method         string   // index method for EXCLUDE (e.g. "btree")
 }
 
 // CreateTableStmt — `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name
@@ -964,11 +967,13 @@ type CreateTableStmt struct {
 	// PrimaryKeyInclude holds the INCLUDE covering columns for an anonymous
 	// table-level PRIMARY KEY constraint. M0097-0023.
 	PrimaryKeyInclude []string
-	// NamedConstraints holds explicitly named UNIQUE/PRIMARY KEY constraints, which
-	// may carry INCLUDE covering columns. The parser places named constraints here
-	// instead of (or in addition to for PK) TableUniques/PrimaryKey so that the
-	// executor can use the constraint name as the index name. M0097-0023.
+	// NamedConstraints holds explicitly named UNIQUE/PRIMARY KEY/EXCLUDE constraints,
+	// which may carry INCLUDE covering columns. The parser places named constraints
+	// here so the executor can use the constraint name as the index name. M0097-0023.
 	NamedConstraints []TableConstraintDef
+	// TableExclusions holds anonymous EXCLUDE USING constraints (no CONSTRAINT name).
+	// Named ones are folded into NamedConstraints. M0097-0023.
+	TableExclusions []TableConstraintDef
 	// LikeTables holds the source table names from LIKE clauses.
 	// `CREATE TABLE t (LIKE src INCLUDING DEFAULTS)` copies src's columns. M0097-0069.
 	// Deprecated: use BodyOrder for positional interleaving.

@@ -319,6 +319,8 @@ type Index struct {
 	HasPredicate   bool     // true if this is a partial index (has a WHERE clause)
 	IncludeColumns []string // non-key covering columns from INCLUDE (…)
 	IsConstraint   bool     // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
+	IsExclusion    bool     // true when index backs an EXCLUDE USING constraint
+	ExclusionOp    string   // per-column exclusion operator (e.g. "=")
 }
 
 // QualifiedName renders the table's name in the canonical
@@ -2281,9 +2283,9 @@ func (c *InMemory) registerSystemTables() {
 				out = append(out, row)
 			}
 		}
-		// Emit UNIQUE and PRIMARY KEY constraints from constraint-backed indexes.
+		// Emit UNIQUE, PRIMARY KEY, and EXCLUDE constraints from constraint-backed indexes.
 		for _, idx := range c.indexes {
-			if !idx.IsConstraint || idx.Table == nil {
+			if (!idx.IsConstraint && !idx.IsExclusion) || idx.Table == nil {
 				continue
 			}
 			colOrdMap := make(map[string]int, len(idx.Table.Columns))
@@ -2299,6 +2301,8 @@ func (c *InMemory) registerSystemTables() {
 			contype := "u"
 			if idx.Primary {
 				contype = "p"
+			} else if idx.IsExclusion {
+				contype = "x"
 			}
 			row := make([]string, 25)
 			row[0] = fmt.Sprintf("%d", idx.OID)
@@ -2459,7 +2463,7 @@ func (c *InMemory) registerSystemTables() {
 				boolStr(idx.Unique),               // indisunique
 				"f",                               // indnullsnotdistinct
 				boolStr(idx.Primary),              // indisprimary
-				"f",                               // indisexclusion
+				boolStr(idx.IsExclusion),          // indisexclusion
 				"t",                               // indimmediate
 				"f",                               // indisclustered
 				"t",                               // indisvalid

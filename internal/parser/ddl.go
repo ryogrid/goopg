@@ -1443,6 +1443,10 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
+		} else if p.acceptIdentKeyword("exclude") {
+			// Anonymous EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
+			cdef := p.parseExcludeConstraint()
+			stmt.TableExclusions = append(stmt.TableExclusions, cdef)
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint {
 			// Table-level CONSTRAINT name (PRIMARY KEY | UNIQUE | CHECK | FOREIGN KEY).
 			p.advance() // CONSTRAINT
@@ -1546,6 +1550,11 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 					p.advance()
 				}
+			case p.acceptIdentKeyword("exclude"):
+				// CONSTRAINT name EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
+				cdef := p.parseExcludeConstraint()
+				cdef.Name = constraintName
+				stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
 			default:
 				// Unknown constraint type: skip to next comma/close-paren.
 				for p.cur().Kind != TokenEOF {
@@ -2877,6 +2886,54 @@ func (p *parser) parseDrop() (Stmt, error) {
 		return &DropCompatStmt{pos: t.Pos, ObjType: "group", IfExists: ifExists, Names: names, Behavior: behavior}, nil
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, SEQUENCE, SCHEMA, TYPE, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after DROP")
+}
+
+// parseExcludeConstraint parses the body of EXCLUDE USING method (col WITH op) [INCLUDE (cols)]
+// after the EXCLUDE keyword has already been consumed. Returns a TableConstraintDef. M0097-0023.
+func (p *parser) parseExcludeConstraint() TableConstraintDef {
+	cdef := TableConstraintDef{IsExclusion: true, Method: "btree"}
+	// USING method — USING is a reserved keyword.
+	if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
+		if t, err := p.parseIdent(); err == nil {
+			cdef.Method = strings.ToLower(t.Value)
+		}
+	}
+	// (col WITH op [, …]) — WITH is a reserved keyword.
+	if p.acceptSymbol("(") {
+		for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+			colTok, err := p.parseIdent()
+			if err != nil {
+				p.advance()
+				continue
+			}
+			cdef.Columns = append(cdef.Columns, colTok.Value)
+			_ = p.acceptKeyword(KwWith) || p.acceptIdentKeyword("with")
+			// Operator: may be an identifier token or a symbol token (e.g. "=").
+			var opVal string
+			if opTok, e := p.parseIdent(); e == nil {
+				opVal = opTok.Value
+			} else if p.cur().Kind == TokenSymbol {
+				opVal = p.cur().Value
+				p.advance()
+			}
+			if opVal != "" && cdef.ExclusionOp == "" {
+				cdef.ExclusionOp = opVal
+			}
+			_ = p.acceptSymbol(",")
+		}
+	}
+	// Optional INCLUDE (cols)
+	if p.acceptIdentKeyword("include") {
+		if p.acceptSymbol("(") {
+			for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+					cdef.IncludeColumns = append(cdef.IncludeColumns, p.cur().Value)
+				}
+				p.advance()
+			}
+		}
+	}
+	return cdef
 }
 
 // parseCheckExpr parses `( expr )` after CHECK and returns the raw SQL expression

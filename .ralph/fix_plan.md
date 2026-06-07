@@ -2669,6 +2669,28 @@ M0097-0001 wires it up.
         Remaining 78 diffs: `box(text)` constructor missing (cascading
         failures, ~55 diffs), EXCLUDE constraint (~10), `\d` key/non-key
         display (~9), float vs int formatting (~2), DETAIL messages (~8).
+      - **Progress 2026-06-08 (M0097-0023-loop39 — EXCLUDE USING + box() + pg_get_expr stubs: 78→62 diffs):**
+        (a) Parser: `EXCLUDE USING method (col WITH op) [INCLUDE (cols)]` parsed
+        in both unnamed table-level and `CONSTRAINT name EXCLUDE USING` forms.
+        `USING`/`WITH` are reserved keywords (acceptKeyword vs acceptIdentKeyword).
+        New `TableConstraintDef.{IsExclusion,ExclusionOp,Method}` fields;
+        `CreateTableStmt.TableExclusions` for anonymous EXCLUDE constraints.
+        (b) Catalog: `Index.{IsExclusion,ExclusionOp}` fields. pg_constraint
+        VirtualRows emits contype='x' for exclusion indexes. pg_index VirtualRows
+        sets `indisexclusion` from `idx.IsExclusion`. (c) Executor DDL: new
+        `createExclusionIndexStub` bypasses btree type-validation (box/point are
+        not btree-compatible); creates catalog entry only for pg_constraint queries.
+        Named and unnamed EXCLUDE constraints both route through the stub.
+        `execCreateIndex`: brin/gin/hash+INCLUDE → "access method X does not
+        support included columns"; rtree → "substituting gist" NOTICE; hash
+        upgraded to btree only when no INCLUDE columns. (d) Executor expr:
+        `pg_get_expr` stub (→ ""); `box()` stub (→ NULL) so INSERT succeeds.
+        `buildConstraintDefString` handles EXCLUDE: "EXCLUDE USING btree (c1 WITH =) INCLUDE (c3, c4)".
+        `pg_get_constraintdef` also matches `idx.IsExclusion` indexes.
+        Verified: Q12/Q13 not broken; broader regress suite SKIP-counts unchanged.
+        Remaining 62 diffs: `\d` include-column display (~10), NULL row-comparison
+        (~14), float format (~2), DETAIL messages (~4), gist/spgist errors (~10+),
+        USING INDEX syntax (~2), exclusion enforcement missing (~4).
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:

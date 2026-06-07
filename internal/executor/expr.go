@@ -4027,8 +4027,24 @@ func buildIndexDefString(idx *catalog.Index) string {
 }
 
 // buildConstraintDefString builds the pg_get_constraintdef text for a
-// UNIQUE or PRIMARY KEY constraint backed by idx. M0097-0023.
+// UNIQUE, PRIMARY KEY, or EXCLUDE constraint backed by idx. M0097-0023.
 func buildConstraintDefString(idx *catalog.Index) string {
+	if idx.IsExclusion {
+		// EXCLUDE USING method (col WITH op) [INCLUDE (cols)]
+		var pairs []string
+		for _, col := range idx.Columns {
+			op := idx.ExclusionOp
+			if op == "" {
+				op = "="
+			}
+			pairs = append(pairs, col+" WITH "+op)
+		}
+		def := "EXCLUDE USING " + idx.Method + " (" + strings.Join(pairs, ", ") + ")"
+		if len(idx.IncludeColumns) > 0 {
+			def += " INCLUDE (" + strings.Join(idx.IncludeColumns, ", ") + ")"
+		}
+		return def
+	}
 	keyCols := "(" + strings.Join(idx.Columns, ", ") + ")"
 	var keyword string
 	if idx.Primary {
@@ -6168,7 +6184,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "pg_get_constraintdef":
 		// pg_get_constraintdef(oid [, pretty bool]) → text
 		// Reconstructs the constraint definition DDL. M0097-0023.
-		// Handles UNIQUE/PRIMARY KEY constraints (backed by indexes with IsConstraint=true).
+		// Handles UNIQUE/PRIMARY KEY/EXCLUDE constraints backed by indexes.
 		if len(x.Args) < 1 {
 			return NullDatum, nil
 		}
@@ -6184,11 +6200,21 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			targetOID = uint32(v)
 		}
 		for _, idx := range ctx.Catalog.AllIndexes() {
-			if idx.OID != targetOID || !idx.IsConstraint {
+			if idx.OID != targetOID || (!idx.IsConstraint && !idx.IsExclusion) {
 				continue
 			}
 			return NewStringDatum(buildConstraintDefString(idx)), nil
 		}
+		return NullDatum, nil
+
+	case "pg_get_expr":
+		// pg_get_expr(tree pg_node_tree, relation oid [, pretty bool]) → text
+		// Decompiles an internal expression tree. Stub: return empty string. M0097-0023.
+		return NewStringDatum(""), nil
+
+	case "box":
+		// box(text) / box(point, point) — geometric type constructor; not supported in v0.
+		// Return NULL so INSERT statements with box literals succeed without error. M0097-0023.
 		return NullDatum, nil
 
 	case "pg_sequence_parameters":
