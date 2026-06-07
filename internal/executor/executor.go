@@ -250,6 +250,9 @@ func Build(plan planner.Node) (Operator, error) {
 		if st, ok := p.Stmt.(*parser.SetTransactionStmt); ok {
 			return newSetTransactionOp(st), nil
 		}
+		if rs, ok := p.Stmt.(*parser.ReindexStmt); ok {
+			return newReindexOp(rs), nil
+		}
 		return newUtilityNoOp(p), nil
 	case *planner.Copy:
 		// COPY is currently driven from the wire-protocol layer

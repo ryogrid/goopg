@@ -3375,15 +3375,35 @@ func (p *parser) parseAlter() (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Check for ALTER COLUMN col SET (options).
+		// Check for ALTER COLUMN col SET ...
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter {
 			p.advance() // consume ALTER
 			_ = p.acceptKeyword(KwColumn)
-			// Read column name (identifier or unreserved keyword).
-			if p.cur().Kind == TokenIdent || (p.cur().Kind == TokenKeyword && IsColNameKeyword(p.cur().Keyword)) {
+			// Column can be a name (identifier/keyword) or a 1-based integer position.
+			colName := ""
+			if p.cur().Kind == TokenIntLit {
+				colName = p.cur().Value
+				p.advance()
+			} else if p.cur().Kind == TokenIdent || (p.cur().Kind == TokenKeyword && IsColNameKeyword(p.cur().Keyword)) {
+				colName = p.cur().Value
 				p.advance()
 			}
 			if p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet) {
+				// SET STATISTICS value — emit action for executor to validate.
+				if p.acceptIdentKeyword("statistics") {
+					statsVal := ""
+					if p.cur().Kind == TokenIntLit {
+						statsVal = p.cur().Value
+						p.advance()
+					}
+					stmt := &AlterTableStmt{pos: t.Pos, Name: idxName}
+					stmt.Actions = append(stmt.Actions, AlterTableAction{
+						Kind:       AlterTableSetStatistics,
+						ColumnName: colName,
+						CheckExpr:  statsVal,
+					})
+					return stmt, nil
+				}
 				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 					// Consume the options block.
 					depth := 1
@@ -3398,7 +3418,8 @@ func (p *parser) parseAlter() (Stmt, error) {
 					}
 					stmt := &AlterTableStmt{pos: t.Pos, Name: idxName}
 					stmt.Actions = append(stmt.Actions, AlterTableAction{
-						Kind: AlterTableAlterColumnSet,
+						Kind:       AlterTableAlterColumnSet,
+						ColumnName: colName,
 					})
 					return stmt, nil
 				}
@@ -3933,6 +3954,12 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		if _, err := p.expectKeyword(KwKey); err != nil {
 			return AlterTableAction{}, err
 		}
+		// PRIMARY KEY USING INDEX name — adopt existing index. Treat as no-op.
+		if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
+			p.acceptKeyword(KwIndex)  // consume INDEX keyword
+			_, _ = p.parseIdent()     // consume index name
+			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
+		}
 		if !p.acceptSymbol("(") {
 			return AlterTableAction{}, p.errAtCur("expected '(' after PRIMARY KEY")
 		}
@@ -4027,7 +4054,7 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		// ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)] — create a unique index.
 		// M0097-0023.
 		p.advance()
-		if !p.acceptIdentKeyword("using") || !p.acceptIdentKeyword("index") {
+		if !(p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using")) || !(p.acceptKeyword(KwIndex) || p.acceptIdentKeyword("index")) {
 			// Normal UNIQUE (cols) form.
 			if p.acceptSymbol("(") {
 				var cols []string
@@ -4052,8 +4079,9 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			}
 		} else {
 			// ADD UNIQUE USING INDEX indexname — adopt existing index as unique constraint.
-			// Accept the index name and treat as no-op (the index already exists). M0097-0023.
+			// Treat as no-op; the index already exists in the catalog. M0097-0023.
 			_, _ = p.parseIdent() // consume indexname
+			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
 		}
 		act.Kind = AlterTableAddUnique
 		return act, nil

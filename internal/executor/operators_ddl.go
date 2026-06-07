@@ -681,6 +681,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		if primary {
 			namedPKCreated = true
+			// PRIMARY KEY implies NOT NULL on all key columns (SQL standard).
+			for _, pkCol := range nc.Columns {
+				if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
+					col.NotNull = true
+				}
+			}
 		}
 	}
 
@@ -713,6 +719,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.IsConstraint = true
 			idx.IncludeColumns = s.PrimaryKeyInclude
+		}
+		// PRIMARY KEY implies NOT NULL on all key columns (SQL standard).
+		for _, pkCol := range pkCols {
+			if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
+				col.NotNull = true
+			}
 		}
 	}
 	// Create btree indexes for inline column-level UNIQUE constraints.
@@ -2024,6 +2036,23 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method == "hash" {
 		method = "btree"
 	}
+	// gist and spgist: register catalog metadata only (no physical storage).
+	// pg_index / pg_class / pg_get_indexdef queries work correctly; no actual
+	// index acceleration or constraint enforcement.
+	if method == "gist" || method == "spgist" {
+		idx, createErr := o.ctx.Catalog.CreateIndex(idxName, tbl, s.Columns, s.Unique, method, false)
+		if createErr != nil {
+			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: createErr.Error()}
+		}
+		idx.HasPredicate = s.HasPredicate
+		idx.IncludeColumns = s.IncludeColumns
+		if catalogHeapSyncAvailable(o.ctx) {
+			if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
+				return fmt.Errorf("DDL catalog sync: %w", syncErr)
+			}
+		}
+		return nil
+	}
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
 	}
@@ -2145,6 +2174,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						Pos:     s.Pos(),
 						Message: fmt.Sprintf("ALTER action ALTER COLUMN ... SET cannot be performed on relation %q", s.Name.Name),
 						Detail:  detail,
+					}
+				}
+				if act.Kind == parser.AlterTableSetStatistics {
+					if err := o.execIndexSetStatistics(s.Name.Name, idx, act); err != nil {
+						return err
 					}
 				}
 			}
@@ -2579,6 +2613,44 @@ func numericConstAsType(s string, t catalog.Type) (Datum, bool) {
 	return Datum{}, false
 }
 
+// execIndexSetStatistics validates ALTER INDEX name ALTER COLUMN N SET STATISTICS value.
+// Raises appropriate errors matching PostgreSQL behaviour:
+//   - column N is a non-expression key column → cannot alter statistics on non-expression column
+//   - column N is an INCLUDE (non-key) column → cannot alter statistics on included column
+//   - column N > total column count → column number N of relation does not exist
+//
+// On success (expression key column) it is a no-op in v0. M0097-0023.
+func (o *ddlOp) execIndexSetStatistics(idxRelName string, idx *catalog.Index, act parser.AlterTableAction) error {
+	colNum, err := strconv.Atoi(act.ColumnName)
+	if err != nil || colNum < 1 {
+		// Non-numeric column name in ALTER INDEX … ALTER COLUMN — no-op for now.
+		return nil
+	}
+	nKey := len(idx.Columns)
+	nInclude := len(idx.IncludeColumns)
+	total := nKey + nInclude
+	if colNum > total {
+		return &ExecError{Code: "42703", Pos: act.Pos(),
+			Message: fmt.Sprintf("column number %d of relation %q does not exist", colNum, idxRelName)}
+	}
+	if colNum <= nKey {
+		// Key column: check whether it's an expression column.
+		// goopg stores expression columns as empty string in Columns (ColExprs holds the AST).
+		colName := idx.Columns[colNum-1]
+		if colName != "" {
+			return &ExecError{Code: "42P17", Pos: act.Pos(),
+				Message: fmt.Sprintf("cannot alter statistics on non-expression column %q of index %q", colName, idxRelName),
+				Hint:    "Alter statistics on table column instead."}
+		}
+		// Expression column: success (no physical change in v0).
+		return nil
+	}
+	// INCLUDE column.
+	inclColName := idx.IncludeColumns[colNum-nKey-1]
+	return &ExecError{Code: "42P17", Pos: act.Pos(),
+		Message: fmt.Sprintf("cannot alter statistics on included column %q of index %q", inclColName, idxRelName)}
+}
+
 func stringConstAsType(s string, t catalog.Type) (Datum, bool) {
 	switch strings.ToLower(t.Name) {
 	case "text", "varchar", "bpchar", "char", "name":
@@ -2607,6 +2679,12 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 		idx.IsConstraint = true
 		idx.IncludeColumns = act.IncludeColumns
+	}
+	// PRIMARY KEY implies NOT NULL on all key columns (SQL standard).
+	for _, pkCol := range act.Columns {
+		if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
+			col.NotNull = true
+		}
 	}
 	return nil
 }
@@ -2977,9 +3055,10 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			// Single on-disk row format (PG-physical) since M0111-0002.
-			decErr := decodePhysicalPGRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
-			if decErr != nil {
+			// Use DecodeHeapTupleRowInto (not decodePhysicalPGRowIntoMctx) so that
+			// the null bitmap is respected — rows with null non-key columns (e.g. box)
+			// were previously skipped with a "truncated" decode error.
+			if decErr := DecodeHeapTupleRowInto(scanRow, tbl.Columns, tuple, sctxDDL); decErr != nil {
 				continue
 			}
 			row := scanRow
@@ -3043,7 +3122,7 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 		for i := 1; i < len(entries); i++ {
 			if bytesEqual(entries[i].Key, entries[i-1].Key) {
 				return nil, &ExecError{Code: "23505", Pos: pos,
-					Message: fmt.Sprintf("duplicate key value violates unique index %q", indexName)}
+					Message: fmt.Sprintf("could not create unique index %q", indexName)}
 			}
 		}
 	}

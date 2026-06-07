@@ -1394,6 +1394,10 @@ const (
 	// Creates a btree unique index; the index name comes from ConstraintName or
 	// is auto-generated. M0097-0023.
 	AlterTableAddUnique
+	// AlterTableSetStatistics — `ALTER INDEX name ALTER COLUMN N SET STATISTICS value`.
+	// Raises appropriate errors based on the column position and kind (key/expression/include).
+	// ColumnName holds the column number as a string; CheckExpr holds the statistics value. M0097-0023.
+	AlterTableSetStatistics
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the

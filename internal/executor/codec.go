@@ -415,20 +415,25 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			s = strconv.FormatInt(d.Int, 10)
-		case KindString:
-			raw := strings.TrimSpace(d.StringValue())
-			if _, err := strconv.ParseFloat(raw, 32); err != nil {
-				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type real: %q", d.StringValue())}
+		case KindString, KindNumeric:
+			// Normalize float4 output to %g format (strips trailing zeros like PG).
+			var raw string
+			if d.Kind == KindNumeric {
+				raw = numericText(d)
+			} else {
+				raw = strings.TrimSpace(d.StringValue())
 			}
-			s = raw
-		case KindNumeric:
-			s = numericText(d)
+			f, err := strconv.ParseFloat(raw, 32)
+			if err != nil {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type real: %q", raw)}
+			}
+			s = strconv.FormatFloat(f, 'g', -1, 32)
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as float4", d.Kind)
 		}
 		return varlenaTextBytes(s), nil
-	case "float8", "double precision", "double":
+	case "float8", "double precision", "double", "float":
 		// goopg stores float8 as varlena text for v0 compatibility (same as
 		// goopg-format encodeValue).  PG binary float8 (8-byte IEEE 754 LE)
 		// is deferred until the decode path also supports binary float.
@@ -437,15 +442,20 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 		switch d.Kind {
 		case KindInt:
 			s = strconv.FormatInt(d.Int, 10)
-		case KindString:
-			raw := strings.TrimSpace(d.StringValue())
-			if _, err := strconv.ParseFloat(raw, 64); err != nil {
-				return nil, &ExecError{Code: "22P02",
-					Message: fmt.Sprintf("invalid input syntax for type double precision: %q", d.StringValue())}
+		case KindString, KindNumeric:
+			// Normalize float8 output to %g format (strips trailing zeros like PG).
+			var raw string
+			if d.Kind == KindNumeric {
+				raw = numericText(d)
+			} else {
+				raw = strings.TrimSpace(d.StringValue())
 			}
-			s = raw
-		case KindNumeric:
-			s = numericText(d)
+			f, err := strconv.ParseFloat(raw, 64)
+			if err != nil {
+				return nil, &ExecError{Code: "22P02",
+					Message: fmt.Sprintf("invalid input syntax for type double precision: %q", raw)}
+			}
+			s = strconv.FormatFloat(f, 'g', -1, 64)
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as float8", d.Kind)
 		}
