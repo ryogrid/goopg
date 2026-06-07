@@ -128,6 +128,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt,
 		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt,
 		*parser.CompatNoopStmt,
+		*parser.CommentOnStmt,
 		*parser.LockTableStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
 		*parser.CreateDomainStmt, *parser.DropDomainStmt,

@@ -3310,10 +3310,15 @@ func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
 	if idx, ok := c.indexes[key(name)]; ok {
 		return idx, ok
 	}
-	// Fallback: try bare name when schema-qualified lookup failed.
-	// Mirrors LookupTable's fallback for the common case where an index
-	// is stored without an explicit schema (e.g. created in search_path context).
-	if name.Schema != "" {
+	if name.Schema == "" {
+		// Unqualified name: try "public.<name>" first (indexes created via DDL
+		// always carry the table's schema, which defaults to "public").
+		if idx, ok := c.indexes["public."+name.Name]; ok {
+			return idx, ok
+		}
+	} else {
+		// Schema-qualified lookup failed: fall back to bare name for indexes
+		// created without an explicit schema in the catalog key.
 		if idx, ok := c.indexes[name.Name]; ok {
 			return idx, ok
 		}

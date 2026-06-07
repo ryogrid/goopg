@@ -1264,6 +1264,20 @@ func (s *DropCompatStmt) stmtNode() {}
 func (s *CompatNoopStmt) Pos() int  { return s.pos }
 func (s *CompatNoopStmt) stmtNode() {}
 
+// CommentOnStmt represents a COMMENT ON statement for objects goopg tracks
+// (TABLE, INDEX, COLUMN, CONSTRAINT). The executor stores the description in
+// pg_description via catalog.SetComment. M0097-0023.
+type CommentOnStmt struct {
+	pos         int
+	ObjKind     string     // "table", "index", "column", "constraint"
+	ObjName     ObjectName // table/index name, or table for constraint/column
+	SubName     string     // column name (ObjKind=column) or constraint name (ObjKind=constraint)
+	Description string     // comment text; empty string = IS NULL (delete comment)
+}
+
+func (s *CommentOnStmt) Pos() int  { return s.pos }
+func (s *CommentOnStmt) stmtNode() {}
+
 // LockTableRelation is one relation target inside a LOCK TABLE statement.
 type LockTableRelation struct {
 	Schema string

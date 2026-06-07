@@ -3841,22 +3841,134 @@ func checkExclusionConstraintsForInsert(ctx *Context, tbl *catalog.Table, cols [
 	}
 	rel := ctx.Catalog.RelFileNode(tbl)
 	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
-		if !idx.IsExclusion || idx.ExclusionOp != "=" {
+		if !idx.IsExclusion {
 			continue
 		}
-		idxRel := ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(ctx.Pool, idxRel)
+		switch idx.ExclusionOp {
+		case "=":
+			idxRel := ctx.Catalog.IndexRelFileNode(idx)
+			tree, err := btree.Open(ctx.Pool, idxRel)
+			if err != nil {
+				continue
+			}
+			key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+			if err != nil || key == nil {
+				continue
+			}
+			detail := buildExclusionConstraintDetail(idx, cols, row)
+			if raiseErr := exclusionCheckOnce(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
+				return raiseErr
+			}
+		case "&&":
+			// GiST overlap exclusion: seqscan heap and check box overlap.
+			if raiseErr := checkGistOverlapExclusion(ctx, tbl, idx, cols, row, rel, pos); raiseErr != nil {
+				return raiseErr
+			}
+		}
+	}
+	return nil
+}
+
+// checkGistOverlapExclusion enforces EXCLUDE USING gist (col WITH &&) by
+// scanning the heap and checking whether any live tuple's box overlaps the
+// new row's box value. Returns 23P01 on first conflict found.
+func checkGistOverlapExclusion(ctx *Context, tbl *catalog.Table, idx *catalog.Index, cols []catalog.Column, row Row, rel storage.RelFileNode, pos int) error {
+	if len(idx.Columns) == 0 {
+		return nil
+	}
+	excColName := idx.Columns[0]
+	// Find the new row's box value.
+	newBoxStr := ""
+	for i, col := range cols {
+		if col.Name == excColName && i < len(row) {
+			s, ok := datumAsString(row[i])
+			if !ok {
+				return nil // NULL box — no conflict
+			}
+			newBoxStr = s
+			break
+		}
+	}
+	if newBoxStr == "" {
+		return nil
+	}
+	newUR, newLL, ok := parseBoxText(newBoxStr)
+	if !ok {
+		return nil
+	}
+	// Find the exclusion column index in tbl.Columns for decoding existing rows.
+	excColIdx := -1
+	for i, col := range tbl.Columns {
+		if col.Name == excColName {
+			excColIdx = i
+			break
+		}
+	}
+	if excColIdx < 0 {
+		return nil
+	}
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return nil
+	}
+	decRow := make(Row, len(tbl.Columns))
+	for b := storage.BlockNumber(0); b < nBlocks; b++ {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: b})
 		if err != nil {
 			continue
 		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
-		if err != nil || key == nil {
+		s.RLock()
+		page := s.Page()
+		if storage.IsNew(page) {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
 			continue
 		}
-		detail := buildExclusionConstraintDetail(idx, cols, row)
-		if raiseErr := exclusionCheckOnce(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
-			return raiseErr
+		count, cerr := storage.PageLinePointerCount(page)
+		if cerr != nil {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
 		}
+		for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
+			tup, terr := storage.PageGetHeapTuple(page, slotIdx)
+			if terr != nil {
+				continue
+			}
+			if !isLiveForUniqueCheck(ctx, tup.Header.Xmin, tup.Header.Xmax) {
+				continue
+			}
+			storedNatts := int(tup.Header.Infomask2 & 0x07FF)
+			if decErr := DecodeRowIntoMctxPGTuple(decRow, tbl.Columns, tup.Data, tup.Bitmap, storedNatts, nil); decErr != nil {
+				continue
+			}
+			if excColIdx >= len(decRow) {
+				continue
+			}
+			existBoxStr, ok2 := datumAsString(decRow[excColIdx])
+			if !ok2 {
+				continue
+			}
+			exUR, exLL, ok3 := parseBoxText(existBoxStr)
+			if !ok3 {
+				continue
+			}
+			// Check overlap: !(a.ur < b.ll || b.ur < a.ll) on both axes.
+			if !(newUR[0] < exLL[0] || exUR[0] < newLL[0] || newUR[1] < exLL[1] || exUR[1] < newLL[1]) {
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				detail := fmt.Sprintf("Key (%s)=(%s) conflicts with existing key (%s)=(%s).",
+					excColName, newBoxStr, excColName, existBoxStr)
+				return &ExecError{
+					Code:    "23P01",
+					Pos:     pos,
+					Message: fmt.Sprintf("conflicting key value violates exclusion constraint %q", idx.Name),
+					Detail:  detail,
+				}
+			}
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
 	}
 	return nil
 }

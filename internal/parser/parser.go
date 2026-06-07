@@ -409,8 +409,25 @@ identLedStatement:
 			}
 			return &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value)}, nil
 		case "comment":
-			// COMMENT ON … — parse as a no-op.
-			p.advance()
+			p.advance() // consume "comment" token
+			// COMMENT ON {TABLE|INDEX|COLUMN|CONSTRAINT} … IS 'text'|NULL
+			// For supported object types, return a CommentOnStmt so the executor
+			// stores the description in pg_description. Unsupported types are
+			// accepted as a silent no-op. M0097-0023.
+			if !p.acceptKeyword(KwOn) {
+				// bare COMMENT (no ON) — skip to semicolon
+				for p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+						break
+					}
+					p.advance()
+				}
+				return &CompatNoopStmt{pos: t.Pos, Tag: "COMMENT"}, nil
+			}
+			if cs, ok, err := p.parseCommentOnTail(t.Pos); ok || err != nil {
+				return cs, err
+			}
+			// Unsupported object type — consume rest as no-op.
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break
@@ -1838,6 +1855,75 @@ func (p *parser) parseFetchCursor() (Stmt, error) {
 	p.advance()
 
 	return &FetchStmt{pos: pos, CursorName: cursorName, Count: count, Forward: forward}, nil
+}
+
+// parseCommentOnTail dispatches on the object type after "COMMENT ON".
+// Returns (stmt, true, nil) for supported types (TABLE, INDEX, COLUMN, CONSTRAINT).
+// Returns (nil, false, nil) for unsupported types (caller skips to semicolon).
+// Returns (nil, ?, err) on parse error.
+func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
+	cs := &CommentOnStmt{pos: pos}
+	switch {
+	case p.acceptKeyword(KwTable):
+		cs.ObjKind = "table"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptKeyword(KwIndex):
+		cs.ObjKind = "index"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptKeyword(KwColumn):
+		// COLUMN table.col — parseObjectName reads "table.col" as Schema=table, Name=col.
+		cs.ObjKind = "column"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		// Schema field holds table name; Name field holds column name.
+		cs.ObjName = ObjectName{Name: name.Schema}
+		cs.SubName = name.Name
+	case p.acceptKeyword(KwConstraint):
+		cs.ObjKind = "constraint"
+		// constraint name
+		tok := p.cur()
+		if tok.Kind != TokenIdent && tok.Kind != TokenKeyword {
+			return nil, true, p.errAtCur("expected constraint name")
+		}
+		cs.SubName = tok.Value
+		p.advance()
+		// ON table
+		if !p.acceptKeyword(KwOn) {
+			return nil, true, p.errAtCur("expected ON after constraint name in COMMENT ON CONSTRAINT")
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	default:
+		return nil, false, nil
+	}
+	// IS 'text' | IS NULL
+	if !p.acceptKeyword(KwIs) {
+		return nil, true, p.errAtCur("expected IS after object name in COMMENT ON")
+	}
+	if p.acceptKeyword(KwNull) {
+		cs.Description = ""
+	} else {
+		tok := p.cur()
+		if tok.Kind != TokenStringLit {
+			return nil, true, p.errAtCur("expected string literal or NULL after IS in COMMENT ON")
+		}
+		cs.Description = tok.Value
+		p.advance()
+	}
+	return cs, true, nil
 }
 
 // parseMoveCursor parses MOVE [direction] [count] [FROM|IN] cursor_name.

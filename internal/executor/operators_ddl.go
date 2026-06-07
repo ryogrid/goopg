@@ -114,6 +114,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateOpClass(s)
 	case *parser.CompatNoopStmt:
 		return nil, o.execCompatNoop(s)
+	case *parser.CommentOnStmt:
+		return nil, o.execCommentOn(s)
 	case *parser.LockTableStmt:
 		return nil, o.execLockTable(s)
 	case *parser.DoStmt:
@@ -412,6 +414,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	var likeCheckConstraints []catalog.NamedCheckConstraint
 	// Indexes to copy from LIKE INCLUDING INDEXES clauses (non-PK unique indexes).
 	var likeUniqueIndexes []*catalog.Index
+	// Non-unique plain indexes to copy from LIKE INCLUDING INDEXES clauses.
+	var likeNonUniqueIndexes []*catalog.Index
+	// Source tables for LIKE INCLUDING COMMENTS (pairs: srcTable, indexPrefix).
+	type likeCommentSource struct{ src *catalog.Table }
+	var likeCommentSources []likeCommentSource
 	// Append body elements in declaration order: explicit columns and LIKE clauses
 	// interleaved by their BodyOrder. M0097-0069.
 	if len(s.BodyOrder) > 0 {
@@ -458,9 +465,13 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				includeDefaults := strings.Contains(likeFlags, ":+defaults")
 				includeConstraints := strings.Contains(likeFlags, ":+constraints")
 				includeIndexes := strings.Contains(likeFlags, ":+indexes")
+				includeComments := strings.Contains(likeFlags, ":+comments")
 				src, ok := likeByKey[baseKey]
 				if !ok {
 					continue
+				}
+				if includeComments {
+					likeCommentSources = append(likeCommentSources, likeCommentSource{src: src})
 				}
 				for _, sc := range src.Columns {
 					colNameLower := strings.ToLower(sc.Name)
@@ -531,10 +542,15 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 								}
 							}
 						}
-						// Copy unique (non-PK) non-partial indexes.
+						// Copy unique (non-PK) non-partial indexes and non-unique plain indexes.
 						for _, idx := range im2.IndexesOnTable(src) {
-							if idx.Unique && !idx.Primary && !idx.HasPredicate {
+							if idx.Primary || idx.HasPredicate || idx.IsExclusion {
+								continue
+							}
+							if idx.Unique {
 								likeUniqueIndexes = append(likeUniqueIndexes, idx)
+							} else {
+								likeNonUniqueIndexes = append(likeNonUniqueIndexes, idx)
 							}
 						}
 					}
@@ -801,15 +817,44 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			return err
 		}
 	}
+	// Create btree indexes for LIKE INCLUDING INDEXES non-unique plain indexes.
+	// PostgreSQL copies all non-partial non-PK non-exclusion indexes; non-unique
+	// ones get auto-generated names with the "_idx" suffix. M0097-0023.
+	for _, idx := range likeNonUniqueIndexes {
+		// For expression columns (Columns[i]==""), use "expr" as the name part.
+		nameCols := make([]string, len(idx.Columns))
+		for i, c := range idx.Columns {
+			if c == "" {
+				nameCols[i] = "expr"
+			} else {
+				nameCols[i] = c
+			}
+		}
+		var colExprs []parser.Expr
+		if idx.ColExprs != nil {
+			colExprs = make([]parser.Expr, len(idx.ColExprs))
+			for i, ce := range idx.ColExprs {
+				if ce != nil {
+					colExprs[i] = *ce
+				}
+			}
+		}
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: o.autoIndexNameWithIncludes(tbl, nameCols, nil, "idx")}
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, colExprs, false, false); err != nil {
+			continue // skip indexes with unsupported expression types
+		}
+	}
 	// Register CHECK constraints from columns and table-level. M0097-0014.
 	// CheckConstraints and NamedChecks are kept parallel (index i ↔ index i)
 	// via Table.AddCheck so the enforcement path can recover the constraint
 	// name for violation messages. Inline/table-level checks are anonymous in
 	// the current parser, so they get empty names (invisible to pg_constraint).
-	// M0097-0023.
+	// Column-level CHECKs are auto-named using PostgreSQL's convention
+	// {tablename}_{colname}_check (mirrors how PG assigns names in DDL). M0097-0023.
 	for _, c := range s.Columns {
 		if c.CheckExpr != "" {
-			tbl.AddCheck("", c.CheckExpr, 0)
+			autoName := tbl.Name + "_" + c.Name + "_check"
+			tbl.AddCheck(autoName, c.CheckExpr, o.allocConstraintOID(autoName))
 		}
 	}
 	for _, chk := range s.TableChecks {
@@ -823,6 +868,62 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	for _, nc := range likeCheckConstraints {
 		tbl.AddCheck(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name))
 	}
+	// Copy pg_description comments from LIKE INCLUDING COMMENTS sources:
+	// indexes (matched by column set), named CHECK constraints (matched by name),
+	// and table columns (matched by name). M0097-0023.
+	if len(likeCommentSources) > 0 {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			const (
+				oidPgClass      = uint32(1259)
+				oidPgConstraint = uint32(2606)
+			)
+			dstIndexes := im.IndexesOnTable(tbl)
+			for _, lcs := range likeCommentSources {
+				// Index comments — match by column set.
+				for _, srcIdx := range im.IndexesOnTable(lcs.src) {
+					desc, hasComment := im.GetComment(oidPgClass, srcIdx.OID, 0)
+					if !hasComment || desc == "" {
+						continue
+					}
+					for _, dstIdx := range dstIndexes {
+						if likeIndexColsMatch(srcIdx.Columns, dstIdx.Columns) {
+							im.SetComment(oidPgClass, dstIdx.OID, 0, desc)
+							break
+						}
+					}
+				}
+				// Named CHECK constraint comments — match by constraint name.
+				for _, srcNC := range lcs.src.NamedChecks {
+					if srcNC.OID == 0 {
+						continue
+					}
+					desc, hasComment := im.GetComment(oidPgConstraint, srcNC.OID, 0)
+					if !hasComment || desc == "" {
+						continue
+					}
+					for _, dstNC := range tbl.NamedChecks {
+						if strings.EqualFold(srcNC.Name, dstNC.Name) && dstNC.OID != 0 {
+							im.SetComment(oidPgConstraint, dstNC.OID, 0, desc)
+							break
+						}
+					}
+				}
+				// Column comments — match by column name.
+				for i, srcCol := range lcs.src.Columns {
+					desc, hasComment := im.GetComment(oidPgClass, lcs.src.OID, int32(i+1))
+					if !hasComment || desc == "" {
+						continue
+					}
+					for j, dstCol := range tbl.Columns {
+						if strings.EqualFold(srcCol.Name, dstCol.Name) {
+							im.SetComment(oidPgClass, tbl.OID, int32(j+1), desc)
+							break
+						}
+					}
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -833,6 +934,20 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 // unnamed, and PG-faithful auto-naming is a separate follow-up. A named
 // constraint gets a real OID so psql \d and pg_constraint queries see it.
 // M0097-0023.
+// likeIndexColsMatch returns true when two index column lists are identical
+// (case-insensitive). Empty-string entries (expression columns) match each other.
+func likeIndexColsMatch(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !strings.EqualFold(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 func (o *ddlOp) allocConstraintOID(name string) uint32 {
 	if name == "" || o.ctx == nil || o.ctx.Catalog == nil {
 		return 0
@@ -6066,6 +6181,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		}
 		key := s.ObjName.Name + "(" + leftCanon + "," + rightCanon + ")"
 		im.RegisterCompatObject("operator", key)
+	case "schema":
+		// Register user-created schema so schema-qualified queries resolve correctly.
+		if s.ObjName.Name != "" {
+			im.RegisterSchema(s.ObjName.Name)
+		}
 	case "rule":
 		// Key format must match DROP RULE: ruleName@tableName.
 		if s.TableName.Name != "" {
@@ -6079,6 +6199,57 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	default:
 		// conversion, text search dictionary/configuration/parser/template, etc.
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+	}
+	return nil
+}
+
+// execCommentOn stores a description for a TABLE, INDEX, COLUMN, or CONSTRAINT
+// in pg_description via catalog.SetComment. M0097-0023.
+func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	// classOID constants match PostgreSQL system catalog OIDs.
+	const (
+		oidPgClass      = 1259 // pg_class: tables, indexes, views
+		oidPgConstraint = 2606 // pg_constraint
+	)
+	switch s.ObjKind {
+	case "table":
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		im.SetComment(oidPgClass, tbl.OID, 0, s.Description)
+	case "index":
+		idx, ok := im.LookupIndex(s.ObjName)
+		if !ok {
+			return nil
+		}
+		im.SetComment(oidPgClass, idx.OID, 0, s.Description)
+	case "column":
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		for i, col := range tbl.Columns {
+			if strings.EqualFold(col.Name, s.SubName) {
+				im.SetComment(oidPgClass, tbl.OID, int32(i+1), s.Description)
+				break
+			}
+		}
+	case "constraint":
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		for _, nc := range tbl.NamedChecks {
+			if strings.EqualFold(nc.Name, s.SubName) {
+				im.SetComment(oidPgConstraint, nc.OID, 0, s.Description)
+				break
+			}
+		}
 	}
 	return nil
 }

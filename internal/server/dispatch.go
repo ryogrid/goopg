@@ -1708,6 +1708,9 @@ func ddlTag(stmt parser.Stmt) string {
 	if ns, ok := stmt.(*parser.CompatNoopStmt); ok && ns.Tag != "" {
 		return ns.Tag
 	}
+	if _, ok := stmt.(*parser.CommentOnStmt); ok {
+		return "COMMENT"
+	}
 	return "OK"
 }
 

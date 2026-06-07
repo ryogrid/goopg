@@ -1135,6 +1135,31 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 			matched = !matched
 		}
 		return NewBoolDatum(matched), nil
+	case parser.OpContainedBy, parser.OpContains, parser.OpOverlap:
+		// Geometric box operators: <@ (contained by), @> (contains), && (overlap). M0097-0023.
+		ls, lok := datumAsString(left)
+		rs, rok := datumAsString(right)
+		if !lok || !rok {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires box operands", op)}
+		}
+		aur, all, aok := parseBoxText(ls)
+		bur, bll, bok := parseBoxText(rs)
+		if !aok || !bok {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s: invalid box value", op)}
+		}
+		var result bool
+		switch op {
+		case parser.OpContainedBy:
+			// a <@ b: b contains a; b.ll <= a.ll AND a.ur <= b.ur (both axes)
+			result = bll[0] <= all[0] && aur[0] <= bur[0] && bll[1] <= all[1] && aur[1] <= bur[1]
+		case parser.OpContains:
+			// a @> b: a contains b
+			result = all[0] <= bll[0] && bur[0] <= aur[0] && all[1] <= bll[1] && bur[1] <= aur[1]
+		case parser.OpOverlap:
+			// a && b: boxes overlap (share area or touch on closed boundary)
+			result = !(aur[0] < bll[0] || bur[0] < all[0] || aur[1] < bll[1] || bur[1] < all[1])
+		}
+		return NewBoolDatum(result), nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
 }
@@ -1152,6 +1177,71 @@ func datumAsString(d Datum) (string, bool) {
 		return string(d.BytesValue()), true
 	}
 	return "", false
+}
+
+// datumAsFloat64 extracts a numeric value from a Datum for geometric operations.
+func datumAsFloat64(d Datum) (float64, bool) {
+	switch d.Kind {
+	case KindInt:
+		return float64(d.Int), true
+	case KindNumeric:
+		f, err := strconv.ParseFloat(d.Format(), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	case KindString:
+		f, err := strconv.ParseFloat(d.StringValue(), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	}
+	return 0, false
+}
+
+// parsePointText parses a PostgreSQL point literal "(x,y)" or "x,y" into [x,y].
+func parsePointText(s string) ([2]float64, bool) {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "(")
+	s = strings.TrimSuffix(s, ")")
+	parts := strings.SplitN(s, ",", 2)
+	if len(parts) != 2 {
+		return [2]float64{}, false
+	}
+	x, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	y, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err1 != nil || err2 != nil {
+		return [2]float64{}, false
+	}
+	return [2]float64{x, y}, true
+}
+
+// parseBoxText parses a PostgreSQL box literal "(x1,y1),(x2,y2)" into upper-right, lower-left.
+func parseBoxText(s string) (ur, ll [2]float64, ok bool) {
+	s = strings.TrimSpace(s)
+	// Find the comma between the two coordinate pairs.
+	depth := 0
+	split := -1
+	for i, c := range s {
+		if c == '(' {
+			depth++
+		} else if c == ')' {
+			depth--
+		} else if c == ',' && depth == 0 {
+			split = i
+			break
+		}
+	}
+	if split < 0 {
+		return
+	}
+	p1, ok1 := parsePointText(s[:split])
+	p2, ok2 := parsePointText(s[split+1:])
+	if !ok1 || !ok2 {
+		return
+	}
+	return p1, p2, true
 }
 
 // matchSQLLike implements SQL LIKE pattern semantics: '%' matches
@@ -6212,9 +6302,50 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Decompiles an internal expression tree. Stub: return empty string. M0097-0023.
 		return NewStringDatum(""), nil
 
+	case "point":
+		// point(x, y) → text "(x,y)" — minimal geometric point. M0097-0023.
+		if len(x.Args) == 2 {
+			av, aerr := evalExpr(x.Args[0], row, ctx)
+			bv, berr := evalExpr(x.Args[1], row, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if berr != nil {
+				return Datum{}, berr
+			}
+			ax, aok := datumAsFloat64(av)
+			bx, bok := datumAsFloat64(bv)
+			if aok && bok {
+				return NewStringDatum(fmt.Sprintf("(%g,%g)", ax, bx)), nil
+			}
+		}
+		return NullDatum, nil
+
 	case "box":
-		// box(text) / box(point, point) — geometric type constructor; not supported in v0.
-		// Return NULL so INSERT statements with box literals succeed without error. M0097-0023.
+		// box(point, point) → text "(max_x,max_y),(min_x,min_y)". M0097-0023.
+		if len(x.Args) == 2 {
+			av, aerr := evalExpr(x.Args[0], row, ctx)
+			bv, berr := evalExpr(x.Args[1], row, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if berr != nil {
+				return Datum{}, berr
+			}
+			as, aok := datumAsString(av)
+			bs, bok := datumAsString(bv)
+			if aok && bok {
+				p1, ok1 := parsePointText(as)
+				p2, ok2 := parsePointText(bs)
+				if ok1 && ok2 {
+					urx := math.Max(p1[0], p2[0])
+					ury := math.Max(p1[1], p2[1])
+					llx := math.Min(p1[0], p2[0])
+					lly := math.Min(p1[1], p2[1])
+					return NewStringDatum(fmt.Sprintf("(%g,%g),(%g,%g)", urx, ury, llx, lly)), nil
+				}
+			}
+		}
 		return NullDatum, nil
 
 	case "pg_sequence_parameters":

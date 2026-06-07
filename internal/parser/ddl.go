@@ -321,6 +321,24 @@ func (p *parser) parseCreate() (Stmt, error) {
 	// DROP RULE can track rule existence.
 	case p.acceptIdentKeyword("rule"):
 		return p.parseCreateRuleTail(t.Pos)
+	// CREATE SCHEMA [name] [AUTHORIZATION role] — register schema in catalog.
+	// Standalone CREATE SCHEMA is intercepted by dispatch.go before parsing; this
+	// case handles multi-statement batches where the SQL parser runs first.
+	case p.acceptIdentKeyword("schema"):
+		var schemaName string
+		if tok := p.cur(); (tok.Kind == TokenIdent || tok.Kind == TokenKeyword) &&
+			!strings.EqualFold(tok.Value, "authorization") {
+			schemaName = tok.Value
+			p.advance()
+		}
+		for {
+			tok := p.cur()
+			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+				break
+			}
+			p.advance()
+		}
+		return &CompatNoopStmt{pos: t.Pos, Tag: "CREATE SCHEMA", ObjType: "schema", ObjName: ObjectName{Name: schemaName}}, nil
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after CREATE")
 }
@@ -1601,6 +1619,9 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						likeKey += ":+identity"
 					}
 				case p.acceptIdentKeyword("comments"):
+					if isIncluding {
+						likeKey += ":+comments"
+					}
 				case p.acceptIdentKeyword("statistics"):
 				case p.acceptIdentKeyword("storage"):
 				case p.acceptIdentKeyword("generated"):
@@ -1609,7 +1630,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 				case p.acceptKeyword(KwAll):
 					if isIncluding {
-						likeKey += ":+defaults:+identity:+generated:+constraints:+indexes"
+						likeKey += ":+defaults:+identity:+generated:+constraints:+indexes:+comments"
 					}
 				}
 			}
