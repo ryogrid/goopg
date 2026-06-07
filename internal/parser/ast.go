@@ -894,6 +894,13 @@ type ColumnDef struct {
 	// CheckExpr holds the raw SQL expression for an inline CHECK constraint.
 	// M0097-0014.
 	CheckExpr string
+	// NotNullNoInherit is true when the NOT NULL constraint carries NO INHERIT
+	// (PG18: `c int NOT NULL NO INHERIT`). goopg v0 tracks the flag to emit
+	// the partitioned-table error for LIKE INCLUDING ALL. M0097-0023.
+	NotNullNoInherit bool
+	// CheckNoInherit is true when the inline CHECK constraint carries NO INHERIT.
+	// Stored so LIKE INCLUDING ALL can error on partitioned tables. M0097-0023.
+	CheckNoInherit bool
 }
 
 func (c ColumnDef) Pos() int { return c.pos }
@@ -1269,7 +1276,7 @@ func (s *CompatNoopStmt) stmtNode() {}
 // pg_description via catalog.SetComment. M0097-0023.
 type CommentOnStmt struct {
 	pos         int
-	ObjKind     string     // "table", "index", "column", "constraint"
+	ObjKind     string     // "table", "index", "column", "constraint", "statistics"
 	ObjName     ObjectName // table/index name, or table for constraint/column
 	SubName     string     // column name (ObjKind=column) or constraint name (ObjKind=constraint)
 	Description string     // comment text; empty string = IS NULL (delete comment)
@@ -1277,6 +1284,17 @@ type CommentOnStmt struct {
 
 func (s *CommentOnStmt) Pos() int  { return s.pos }
 func (s *CommentOnStmt) stmtNode() {}
+
+// CreateStatisticsStmt represents CREATE STATISTICS name ON ... FROM table. M0097-0023.
+type CreateStatisticsStmt struct {
+	pos         int
+	Name        ObjectName // statistics object name (possibly schema-qualified)
+	FromTable   ObjectName // the table the statistics are defined on
+	IfNotExists bool
+}
+
+func (s *CreateStatisticsStmt) Pos() int  { return s.pos }
+func (s *CreateStatisticsStmt) stmtNode() {}
 
 // LockTableRelation is one relation target inside a LOCK TABLE statement.
 type LockTableRelation struct {
@@ -1412,6 +1430,10 @@ const (
 	// Raises appropriate errors based on the column position and kind (key/expression/include).
 	// ColumnName holds the column number as a string; CheckExpr holds the statistics value. M0097-0023.
 	AlterTableSetStatistics
+	// AlterTableSetStorage — `ALTER COLUMN name SET STORAGE type`.
+	// Records the storage type (plain/main/external/extended) on the catalog column.
+	// StorageType holds the storage name; ColumnName holds the column. M0097-0023.
+	AlterTableSetStorage
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1459,6 +1481,9 @@ type AlterTableAction struct {
 	// ColumnName is the column being modified for AlterTableAlterColumnType.
 	// M0097-0022.
 	ColumnName string
+	// StorageType is the storage strategy for AlterTableSetStorage.
+	// Values: "plain", "main", "external", "extended". M0097-0023.
+	StorageType string
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

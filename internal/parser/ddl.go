@@ -312,10 +312,9 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		// Other CREATE FOREIGN ... → skip.
 		return p.parseSkipToSemicolon(t.Pos)
-	// CREATE STATISTICS name ON expr, ... FROM table — accept as no-op.
-	// Extended statistics are not implemented in goopg v0.
+	// CREATE STATISTICS [IF NOT EXISTS] name [(types)] ON ... FROM table. M0097-0023.
 	case p.acceptIdentKeyword("statistics"):
-		return p.parseSkipToSemicolon(t.Pos)
+		return p.parseCreateStatisticsTail(t.Pos)
 	// CREATE RULE name AS ON event TO table [WHERE cond] DO ... — accept as no-op.
 	// Rules are not implemented in goopg v0; CREATE RULE succeeds silently so that
 	// DROP RULE can track rule existence.
@@ -719,6 +718,62 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 		p.advance()
 	}
 	return ns, nil
+}
+
+// parseCreateStatisticsTail parses CREATE STATISTICS after the STATISTICS keyword.
+// Grammar: [IF NOT EXISTS] name [(types)] ON expr_list FROM table_name
+// Only the name and FROM table are extracted; the ON clause is skipped. M0097-0023.
+func (p *parser) parseCreateStatisticsTail(pos int) (Stmt, error) {
+	stmt := &CreateStatisticsStmt{pos: pos}
+	// IF NOT EXISTS
+	if p.acceptIdentKeyword("if") {
+		if !p.acceptIdentKeyword("not") {
+			return p.parseSkipToSemicolon(pos)
+		}
+		if !p.acceptIdentKeyword("exists") {
+			return p.parseSkipToSemicolon(pos)
+		}
+		stmt.IfNotExists = true
+	}
+	name, err := p.parseObjectName()
+	if err != nil {
+		return p.parseSkipToSemicolon(pos)
+	}
+	stmt.Name = name
+	// Skip optional (statistics_kind, ...) type list.
+	if p.acceptSymbol("(") {
+		depth := 1
+		for depth > 0 {
+			tok := p.cur()
+			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+				break
+			}
+			if tok.Kind == TokenSymbol && tok.Value == "(" {
+				depth++
+			} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+				depth--
+			}
+			p.advance()
+		}
+	}
+	// Skip tokens until FROM keyword.
+	for {
+		tok := p.cur()
+		if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+			return stmt, nil
+		}
+		if tok.Kind == TokenKeyword && tok.Keyword == KwFrom {
+			p.advance()
+			break
+		}
+		p.advance()
+	}
+	fromTable, err := p.parseObjectName()
+	if err != nil {
+		return stmt, nil // best-effort: return what we have
+	}
+	stmt.FromTable = fromTable
+	return stmt, nil
 }
 
 func (p *parser) parseSkipToSemicolon(pos int) (Stmt, error) {
@@ -1448,7 +1503,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				}
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
-			// Table-level CHECK (expr) [NOT ENFORCED | ENFORCED]. M0097-0014.
+			// Table-level CHECK (expr) [NOT ENFORCED | ENFORCED] [NO INHERIT]. M0097-0014.
 			p.advance()
 			expr, err := p.parseCheckExpr()
 			if err != nil {
@@ -1460,6 +1515,10 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				_ = p.acceptIdentKeyword("enforced")
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
+			}
+			// Accept optional NO INHERIT.
+			if p.acceptIdentKeyword("no") {
+				_ = p.acceptIdentKeyword("inherit")
 			}
 		} else if p.acceptIdentKeyword("exclude") {
 			// Anonymous EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
@@ -1555,6 +1614,10 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				} else {
 					_ = p.acceptIdentKeyword("enforced")
 				}
+				// Accept optional NO INHERIT (CONSTRAINT name CHECK NO INHERIT).
+				if p.acceptIdentKeyword("no") {
+					_ = p.acceptIdentKeyword("inherit")
+				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
 				// Already handled by FK parsing in parseColumnDef / REFERENCES
 				// at the column level. Table-level FOREIGN KEY is a no-op here.
@@ -1624,13 +1687,20 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 				case p.acceptIdentKeyword("statistics"):
 				case p.acceptIdentKeyword("storage"):
+				if isIncluding {
+					likeKey += ":+storage"
+				}
 				case p.acceptIdentKeyword("generated"):
 					if isIncluding {
 						likeKey += ":+generated"
 					}
+				case p.acceptIdentKeyword("statistics"):
+					if isIncluding {
+						likeKey += ":+statistics"
+					}
 				case p.acceptKeyword(KwAll):
 					if isIncluding {
-						likeKey += ":+defaults:+identity:+generated:+constraints:+indexes:+comments"
+						likeKey += ":+defaults:+identity:+generated:+constraints:+indexes:+comments:+statistics:+storage"
 					}
 				}
 			}
@@ -1855,6 +1925,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				return ColumnDef{}, err
 			}
 			col.NotNull = true
+			// Optional NO INHERIT — PG18 NOT NULL constraints may carry NO INHERIT.
+			if p.acceptIdentKeyword("no") {
+				_ = p.acceptIdentKeyword("inherit")
+				col.NotNullNoInherit = true
+			}
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
 			p.advance()
 			if _, err := p.expectKeyword(KwKey); err != nil {
@@ -2016,6 +2091,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
+			// Accept optional NO INHERIT — PG18 column-level CHECK NO INHERIT.
+			if p.acceptIdentKeyword("no") {
+				_ = p.acceptIdentKeyword("inherit")
+				col.CheckNoInherit = true
+			}
 		// CONSTRAINT name CHECK/PRIMARY KEY/UNIQUE/... column constraint.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint:
 			p.advance()           // CONSTRAINT
@@ -2032,6 +2112,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 					_ = p.acceptIdentKeyword("enforced")
 				} else {
 					_ = p.acceptIdentKeyword("enforced")
+				}
+				// Accept optional NO INHERIT (CONSTRAINT name CHECK NO INHERIT).
+				if p.acceptIdentKeyword("no") {
+					_ = p.acceptIdentKeyword("inherit")
+					col.CheckNoInherit = true
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwPrimary:
 				// CONSTRAINT name PRIMARY KEY
@@ -3738,8 +3823,8 @@ func (p *parser) parseAlter() (Stmt, error) {
 			colName = p.cur().Value
 			p.advance()
 		}
-		// Check for SET (options) pattern.
-		if p.acceptIdentKeyword("set") {
+		// Check for SET (options) or SET STORAGE pattern.
+		if p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet) {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 				// Consume the options block.
 				depth := 1
@@ -3755,6 +3840,20 @@ func (p *parser) parseAlter() (Stmt, error) {
 				// Emit AlterTableAlterColumnSet action.
 				stmt.Actions = append(stmt.Actions, AlterTableAction{
 					Kind: AlterTableAlterColumnSet,
+				})
+				return stmt, nil
+			}
+			// SET STORAGE type — record storage strategy on the catalog column.
+			if p.acceptIdentKeyword("storage") {
+				storageType := ""
+				if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+					storageType = strings.ToLower(p.cur().Value)
+					p.advance()
+				}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:        AlterTableSetStorage,
+					ColumnName:  colName,
+					StorageType: storageType,
 				})
 				return stmt, nil
 			}

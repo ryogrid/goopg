@@ -135,6 +135,8 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		}
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
+		ectx.BeginLocalTransaction = sess.BeginTransaction
+		ectx.EndLocalTransaction = sess.EndTransaction
 	}
 	if ectx.Session != nil {
 		advisoryReleaseTarget = ectx.Session

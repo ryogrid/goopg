@@ -116,6 +116,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCompatNoop(s)
 	case *parser.CommentOnStmt:
 		return nil, o.execCommentOn(s)
+	case *parser.CreateStatisticsStmt:
+		return nil, o.execCreateStatistics(s)
 	case *parser.LockTableStmt:
 		return nil, o.execLockTable(s)
 	case *parser.DoStmt:
@@ -321,6 +323,14 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 }
 
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
+	// Pre-resolve schema from search_path before the existence check so that
+	// CREATE TABLE ctlt1 in ctl_schema context doesn't falsely collide with
+	// public.ctlt1 (which shares the bare "ctlt1" catalog key). M0097-0023.
+	if s.Name.Schema == "" && !s.Temporary {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			s.Name.Schema = ws
+		}
+	}
 	// For the existence check, use a schema-qualified name so that unqualified
 	// names like "pg_attrdef" don't match pg_catalog virtual tables.
 	// CREATE TABLE pg_attrdef should create a user table, not conflict with
@@ -391,6 +401,25 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				for _, ec := range cols {
 					if strings.EqualFold(ec.Name, pc.Name) {
 						found = true
+						// Detect storage parameter conflicts between multiple INHERITS parents.
+						pcStor := strings.ToLower(pc.Storage)
+						ecStor := strings.ToLower(ec.Storage)
+						if pcStor == "" {
+							pcStor = "extended"
+						}
+						if ecStor == "" {
+							ecStor = "extended"
+						}
+						// PostgreSQL emits the merging notice BEFORE reporting the conflict.
+						o.ctx.AddNotice(fmt.Sprintf("merging multiple inherited definitions of column %q", pc.Name))
+						if pcStor != ecStor {
+							return &ExecError{
+								Code:    "42611",
+								Pos:     s.Pos(),
+								Message: fmt.Sprintf("column %q has a storage parameter conflict", pc.Name),
+								Detail:  fmt.Sprintf("%s versus %s", strings.ToUpper(ecStor), strings.ToUpper(pcStor)),
+							}
+						}
 						break
 					}
 				}
@@ -406,6 +435,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	for _, c := range cols {
 		inheritedColNames[strings.ToLower(c.Name)] = true
 	}
+	// Build a set of INHERITS parent OIDs so LIKE can detect overlap. M0097-0023.
+	inheritParentOIDSet := make(map[uint32]bool, len(inheritParents))
+	for _, p := range inheritParents {
+		inheritParentOIDSet[p.OID] = true
+	}
 
 	// CHECK constraints to inherit from LIKE INCLUDING CONSTRAINTS clauses.
 	// Carries the source constraint name so the copy keeps its identity
@@ -419,6 +453,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Source tables for LIKE INCLUDING COMMENTS (pairs: srcTable, indexPrefix).
 	type likeCommentSource struct{ src *catalog.Table }
 	var likeCommentSources []likeCommentSource
+	// Source tables for LIKE INCLUDING STATISTICS. M0097-0023.
+	type likeStatisticsSource struct{ src *catalog.Table }
+	var likeStatisticsSources []likeStatisticsSource
+	// NOT NULL constraints to copy from LIKE sources (preserving source name).
+	// Maps col name (lower) → NamedNotNullConstraint from source table. M0097-0023.
+	type likeNotNullEntry struct {
+		name      string
+		colName   string
+		noInherit bool
+	}
+	likeNotNullByCol := make(map[string]likeNotNullEntry)
 	// Append body elements in declaration order: explicit columns and LIKE clauses
 	// interleaved by their BodyOrder. M0097-0069.
 	if len(s.BodyOrder) > 0 {
@@ -434,6 +479,22 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			src, ok := o.ctx.Catalog.LookupTable(likeName)
 			if ok {
 				likeByKey["@@LIKE:"+likeName.String()] = src
+			} else if LookupSequence(likeName.String()) != nil {
+				return &ExecError{
+					Code:    "42809",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("relation %q is invalid in LIKE clause", likeName.Name),
+					Detail:  "This operation is not supported for sequences.",
+				}
+			} else if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && im.HasCompositeType(likeName.Name) {
+				// Composite types are valid LIKE sources in PostgreSQL; goopg
+				// doesn't evaluate their fields, so we produce no columns from them.
+			} else {
+				return &ExecError{
+					Code:    "42P01",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("relation %q does not exist", likeName.Name),
+				}
 			}
 		}
 		addCol := func(c parser.ColumnDef) {
@@ -466,12 +527,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				includeConstraints := strings.Contains(likeFlags, ":+constraints")
 				includeIndexes := strings.Contains(likeFlags, ":+indexes")
 				includeComments := strings.Contains(likeFlags, ":+comments")
+				includeStatistics := strings.Contains(likeFlags, ":+statistics")
+				includeStorage := strings.Contains(likeFlags, ":+storage")
 				src, ok := likeByKey[baseKey]
 				if !ok {
 					continue
 				}
 				if includeComments {
 					likeCommentSources = append(likeCommentSources, likeCommentSource{src: src})
+				}
+				if includeStatistics {
+					likeStatisticsSources = append(likeStatisticsSources, likeStatisticsSource{src: src})
 				}
 				for _, sc := range src.Columns {
 					colNameLower := strings.ToLower(sc.Name)
@@ -484,9 +550,32 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					}
 					if found {
 						if inheritedColNames[colNameLower] {
-							// Column came from INHERITS — emit NOTICE "merging column X with
-							// inherited definition" and skip (matches PostgreSQL merge semantics).
+							// PostgreSQL emits the merging NOTICE before the storage conflict error.
 							o.ctx.AddNotice(fmt.Sprintf("merging column %q with inherited definition", sc.Name))
+							// Check for storage conflict when INCLUDING STORAGE.
+							if includeStorage {
+								for _, ec := range cols {
+									if strings.EqualFold(ec.Name, sc.Name) {
+										ecStor := strings.ToLower(ec.Storage)
+										scStor := strings.ToLower(sc.Storage)
+										if ecStor == "" {
+											ecStor = "extended"
+										}
+										if scStor == "" {
+											scStor = "extended"
+										}
+										if ecStor != scStor {
+											return &ExecError{
+												Code:    "42611",
+												Pos:     s.Pos(),
+												Message: fmt.Sprintf("inherited column %q has a storage parameter conflict", sc.Name),
+												Detail:  fmt.Sprintf("%s versus %s", strings.ToUpper(ecStor), strings.ToUpper(scStor)),
+											}
+										}
+										break
+									}
+								}
+							}
 						} else {
 							// Column already defined by an explicit column or a previous LIKE clause.
 							// PostgreSQL raises "column X specified more than once" (42701).
@@ -516,7 +605,28 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					if !includeDefaults {
 						c.DefaultExpr = nil
 					}
+					// Clear Storage unless INCLUDING STORAGE or INCLUDING ALL was specified.
+					if !includeStorage {
+						c.Storage = ""
+					}
 					cols = append(cols, c)
+					// Carry forward the source table's NOT NULL constraint name for
+					// this column (if one exists), so comments can be copied by name.
+					if sc.NotNull {
+						for _, nnc := range src.NotNullConstraints {
+							if strings.EqualFold(nnc.ColName, sc.Name) {
+								colKey := strings.ToLower(sc.Name)
+								if _, alreadyMapped := likeNotNullByCol[colKey]; !alreadyMapped {
+									likeNotNullByCol[colKey] = likeNotNullEntry{
+										name:      nnc.Name,
+										colName:   sc.Name,
+										noInherit: nnc.NoInherit,
+									}
+								}
+								break
+							}
+						}
+					}
 					// Copy CHECK constraints from source table when INCLUDING CONSTRAINTS.
 					if includeConstraints {
 						likeCheckConstraints = appendLikeChecks(likeCheckConstraints, src)
@@ -555,6 +665,16 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 						}
 					}
 				}
+				// Emit "merging constraint" NOTICEs when the LIKE source is also an
+				// INHERITS parent. In PG, INHERITS propagates CHECK constraints, so LIKE's
+				// copy "merges" with the inherited copy. M0097-0023.
+				if includeConstraints && inheritParentOIDSet[src.OID] {
+					for _, nc := range src.NamedChecks {
+						if nc.Name != "" {
+							o.ctx.AddNotice(fmt.Sprintf("merging constraint %q with inherited definition", nc.Name))
+						}
+					}
+				}
 			} else {
 				c, ok := colByName[strings.ToLower(item)]
 				if ok {
@@ -581,17 +701,42 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			})
 		}
 	}
+	// PG18: NO INHERIT constraints cannot be added to partitioned tables. M0097-0023.
+	if s.PartitionBy != nil {
+		// Check LIKE-sourced NOT NULL constraints.
+		for _, entry := range likeNotNullByCol {
+			if entry.noInherit {
+				return &ExecError{
+					Code:    "42P16",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
+				}
+			}
+		}
+		// Check LIKE-sourced CHECK constraints.
+		for _, nc := range likeCheckConstraints {
+			if nc.NoInherit {
+				return &ExecError{
+					Code:    "42P16",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
+				}
+			}
+		}
+		// Check explicit column NOT NULL NO INHERIT.
+		for _, c := range s.Columns {
+			if c.NotNullNoInherit || c.CheckNoInherit {
+				return &ExecError{
+					Code:    "42P16",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
+				}
+			}
+		}
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
-	}
-	// If the table was created without an explicit schema qualifier, record the
-	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
-	// Temp tables are session-scoped and not schema-tracked. M0097-0022.
-	if s.Name.Schema == "" && !s.Temporary {
-		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
-			tbl.Schema = ws
-		}
 	}
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
@@ -860,6 +1005,25 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	for _, chk := range s.TableChecks {
 		tbl.AddCheck("", chk, 0)
 	}
+	// Copy statistics from LIKE INCLUDING STATISTICS (or INCLUDING ALL) sources. M0097-0023.
+	if len(likeStatisticsSources) > 0 {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			const oidPgStatExt = uint32(3381)
+			for _, lss := range likeStatisticsSources {
+				for _, srcStat := range im.AllStatistics() {
+					if srcStat.TableOID != lss.src.OID {
+						continue
+					}
+					newName := deriveStatisticsName(srcStat.Name, lss.src.Name, tbl.Name)
+					newStat := im.RegisterStatistics(srcStat.Schema, newName, tbl.OID)
+					// Copy any existing comment for this statistics object.
+					if desc, ok := im.GetComment(oidPgStatExt, srcStat.OID, 0); ok && desc != "" {
+						im.SetComment(oidPgStatExt, newStat.OID, 0, desc)
+					}
+				}
+			}
+		}
+	}
 	// Apply LIKE INCLUDING CONSTRAINTS checks (copied from LIKE source tables).
 	// PostgreSQL preserves the source constraint name; the name is retained so
 	// enforcement can report it. Named constraints get a fresh OID so they
@@ -867,6 +1031,48 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// previously masked this was fixed in M0097-0023-loop34). M0097-0023.
 	for _, nc := range likeCheckConstraints {
 		tbl.AddCheck(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name))
+	}
+	// PG18: register named NOT NULL constraints for every NOT-NULL column.
+	// LIKE INCLUDING ALL/CONSTRAINTS preserves the source constraint name;
+	// explicit or inherited columns get auto-name <tablename>_<colname>_not_null.
+	// M0097-0023.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		pkColSet := make(map[string]bool, len(pkCols))
+		for _, pk := range pkCols {
+			pkColSet[strings.ToLower(pk)] = true
+		}
+		for _, nc := range s.NamedConstraints {
+			if nc.IsPrimary {
+				for _, pc := range nc.Columns {
+					pkColSet[strings.ToLower(pc)] = true
+				}
+			}
+		}
+		// Build set of explicit column defs that carry NOT NULL NO INHERIT.
+		explicitNoInherit := make(map[string]bool)
+		for _, origCol := range s.Columns {
+			if origCol.NotNullNoInherit {
+				explicitNoInherit[strings.ToLower(origCol.Name)] = true
+			}
+		}
+		for _, col := range tbl.Columns {
+			if !col.NotNull || pkColSet[strings.ToLower(col.Name)] {
+				continue
+			}
+			colKey := strings.ToLower(col.Name)
+			noInherit := explicitNoInherit[colKey]
+			name := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+			if entry, ok2 := likeNotNullByCol[colKey]; ok2 {
+				// LIKE INCLUDING preserves the source NOT NULL constraint name.
+				if entry.name != "" {
+					name = entry.name
+				}
+				if entry.noInherit {
+					noInherit = true
+				}
+			}
+			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit)
+		}
 	}
 	// Copy pg_description comments from LIKE INCLUDING COMMENTS sources:
 	// indexes (matched by column set), named CHECK constraints (matched by name),
@@ -908,6 +1114,23 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 						}
 					}
 				}
+				// Named NOT NULL constraint comments — match by column name from LIKE
+				// source then map source OID → dest OID via the new table's constraints.
+				for _, srcNN := range lcs.src.NotNullConstraints {
+					if srcNN.OID == 0 {
+						continue
+					}
+					desc, hasComment := im.GetComment(oidPgConstraint, srcNN.OID, 0)
+					if !hasComment || desc == "" {
+						continue
+					}
+					for _, dstNN := range tbl.NotNullConstraints {
+						if strings.EqualFold(srcNN.ColName, dstNN.ColName) && dstNN.OID != 0 {
+							im.SetComment(oidPgConstraint, dstNN.OID, 0, desc)
+							break
+						}
+					}
+				}
 				// Column comments — match by column name.
 				for i, srcCol := range lcs.src.Columns {
 					desc, hasComment := im.GetComment(oidPgClass, lcs.src.OID, int32(i+1))
@@ -934,6 +1157,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 // unnamed, and PG-faithful auto-naming is a separate follow-up. A named
 // constraint gets a real OID so psql \d and pg_constraint queries see it.
 // M0097-0023.
+// deriveStatisticsName computes the name for a statistics object copied from
+// srcTableName to dstTableName. If the stat name starts with srcTableName_,
+// that prefix is replaced with dstTableName_; otherwise srcTableName_ prefix is
+// prepended. M0097-0023.
+func deriveStatisticsName(statName, srcTableName, dstTableName string) string {
+	prefix := srcTableName + "_"
+	if strings.HasPrefix(strings.ToLower(statName), strings.ToLower(prefix)) {
+		return dstTableName + "_" + statName[len(prefix):]
+	}
+	return dstTableName + "_" + statName
+}
 // likeIndexColsMatch returns true when two index column lists are identical
 // (case-insensitive). Empty-string entries (expression columns) match each other.
 func likeIndexColsMatch(a, b []string) bool {
@@ -1763,14 +1997,30 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				return err
 			}
 			if s.Behavior == parser.DropCascade {
-				inheritChildren := im.InheritanceChildren(tbl.OID)
-				// Only emit notices for children NOT in the explicit drop list.
-				// PostgreSQL suppresses cascade notices when the cascaded object
-				// is also explicitly named in the DROP TABLE statement.
+				// Recursively collect all inheritance descendants (depth-first) so that
+				// grandchildren of a child-that-is-also-explicit are also dropped.
+				// When ctla→ctlb→inhe and ctla+ctlb are explicit, dropping ctla cascades
+				// ctlb (explicit, no notice) but we must still cascade ctlb→inhe.
+				// M0097-0023.
+				var collectInheritanceTree func(parent *catalog.Table) []*catalog.Table
+				collectInheritanceTree = func(parent *catalog.Table) []*catalog.Table {
+					var result []*catalog.Table
+					for _, child := range im.InheritanceChildren(parent.OID) {
+						childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+						if cascadeDropped[childName.String()] {
+							continue
+						}
+						result = append(result, child)
+						result = append(result, collectInheritanceTree(child)...)
+					}
+					return result
+				}
+				allDescendants := collectInheritanceTree(tbl)
+				// Emit cascade notices for descendants not in the explicit drop list.
 				var noticeChildren []*catalog.Table
-				for _, child := range inheritChildren {
+				for _, child := range allDescendants {
 					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
-					if !explicitDropSet[childName.String()] {
+					if !explicitDropSet[childName.String()] && !cascadeDropped[childName.String()] {
 						noticeChildren = append(noticeChildren, child)
 					}
 				}
@@ -1790,9 +2040,12 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 						strings.Join(detail, "\n"),
 					)
 				}
-				for _, child := range inheritChildren {
+				for _, child := range allDescendants {
 					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
-					cascadeDropped[childName.String()] = true // mark so we skip if it appears in s.Names
+					if cascadeDropped[childName.String()] {
+						continue
+					}
+					cascadeDropped[childName.String()] = true
 					if err := o.dropTableByRef(childName, child); err != nil {
 						return err
 					}
@@ -2556,6 +2809,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableNoInherit:
 			// NO INHERIT parent_table — no-op in v0; just accept the syntax.
+		case parser.AlterTableSetStorage:
+			// SET STORAGE type — record on the catalog column for conflict detection.
+			if act.ColumnName != "" && act.StorageType != "" {
+				for i := range tbl.Columns {
+					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+						tbl.Columns[i].Storage = act.StorageType
+						break
+					}
+				}
+			}
 		case parser.AlterTableAlterColumnSet:
 			// SET (options) on a column of a heap table: no-op in goopg v0.
 		case parser.AlterTableAlterColumnType:
@@ -6212,8 +6475,9 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 	}
 	// classOID constants match PostgreSQL system catalog OIDs.
 	const (
-		oidPgClass      = 1259 // pg_class: tables, indexes, views
-		oidPgConstraint = 2606 // pg_constraint
+		oidPgClass          = 1259 // pg_class: tables, indexes, views
+		oidPgConstraint     = 2606 // pg_constraint
+		oidPgStatisticExt   = 3381 // pg_statistic_ext
 	)
 	switch s.ObjKind {
 	case "table":
@@ -6247,10 +6511,48 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		for _, nc := range tbl.NamedChecks {
 			if strings.EqualFold(nc.Name, s.SubName) {
 				im.SetComment(oidPgConstraint, nc.OID, 0, s.Description)
-				break
+				return nil
 			}
 		}
+		// PG18 NOT NULL constraints are also named constraints. M0097-0023.
+		for _, nn := range tbl.NotNullConstraints {
+			if strings.EqualFold(nn.Name, s.SubName) && nn.OID != 0 {
+				im.SetComment(oidPgConstraint, nn.OID, 0, s.Description)
+				return nil
+			}
+		}
+	case "statistics":
+		stat, ok := im.LookupStatistics(s.ObjName.Name)
+		if !ok {
+			return nil
+		}
+		im.SetComment(oidPgStatisticExt, stat.OID, 0, s.Description)
 	}
+	return nil
+}
+
+// execCreateStatistics registers a new extended statistics object. M0097-0023.
+func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	// Resolve the table that this statistics object refers to.
+	var tableOID uint32
+	if s.FromTable.Name != "" {
+		tbl, ok := im.LookupTable(s.FromTable)
+		if ok {
+			tableOID = tbl.OID
+		}
+	}
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = currentWritableSchema(o.ctx)
+		if schema == "" {
+			schema = "public"
+		}
+	}
+	im.RegisterStatistics(schema, s.Name.Name, tableOID)
 	return nil
 }
 

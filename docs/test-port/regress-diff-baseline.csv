@@ -84,7 +84,7 @@ uuid,0,pass
 vacuum,0,pass
 varchar,0,pass
 xid,0,pass
-create_table_like,47,failed
+create_table_like,0,pass
 matview,69,failed
 insert_conflict,113,failed
 join_hash,142,failed

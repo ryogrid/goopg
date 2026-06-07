@@ -81,14 +81,35 @@ type Column struct {
 	// dropped columns are invisible in SELECT *, RETURNING *, and column lookups.
 	// M0097-0028.
 	Dropped bool
+	// Storage is the column storage type: "plain", "main", "external", "extended".
+	// Empty means the default for the column's type.
+	Storage string
 }
 
 // NamedCheckConstraint holds a CHECK constraint with an explicit name.
 // Name may be empty for anonymous constraints (e.g. inline column-level CHECK).
 type NamedCheckConstraint struct {
-	Name string // constraint name; empty for auto-named constraints
-	Expr string // raw SQL expression (same as CheckConstraints entry)
-	OID  uint32 // synthetic OID for pg_constraint virtual table
+	Name      string // constraint name; empty for auto-named constraints
+	Expr      string // raw SQL expression (same as CheckConstraints entry)
+	OID       uint32 // synthetic OID for pg_constraint virtual table
+	NoInherit bool   // PG18: CHECK NO INHERIT — not propagated to child tables
+}
+
+// NamedNotNullConstraint holds a NOT NULL constraint with a catalog-visible name.
+// PostgreSQL 18 introduces named NOT NULL constraints (contype='n' in pg_constraint).
+// Auto-named as <table>_<col>_not_null on CREATE; preserved on LIKE copy. M0097-0023.
+type NamedNotNullConstraint struct {
+	Name      string // e.g. "tablename_colname_not_null"
+	ColName   string // column this constraint applies to
+	OID       uint32 // synthetic OID for pg_constraint virtual table
+	NoInherit bool   // PG18: NOT NULL NO INHERIT
+}
+
+// AddNotNull appends a named NOT NULL constraint to the table.
+func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool) {
+	t.NotNullConstraints = append(t.NotNullConstraints, NamedNotNullConstraint{
+		Name: name, ColName: colName, OID: oid, NoInherit: noInherit,
+	})
 }
 
 // AddCheck appends a CHECK constraint, keeping CheckConstraints and
@@ -168,6 +189,11 @@ type Table struct {
 	// explicit CONSTRAINT name clause. Index i of NamedChecks corresponds to
 	// index i of CheckConstraints; Name may be empty for anonymous constraints.
 	NamedChecks []NamedCheckConstraint
+
+	// NotNullConstraints holds NOT NULL constraints with catalog-visible names.
+	// PostgreSQL 18 tracks NOT NULL constraints as contype='n' in pg_constraint.
+	// Auto-named <table>_<col>_not_null on CREATE TABLE; preserved on LIKE copy.
+	NotNullConstraints []NamedNotNullConstraint
 
 	// IsMatView marks this table as a materialized view. The underlying
 	// SELECT query is stored in View; data is materialized in the heap
@@ -494,6 +520,10 @@ type InMemory struct {
 	// comments stores COMMENT ON descriptions keyed by (classoid, objoid, objsubid).
 	// Populated by SetComment; read by pg_description VirtualRows. M0097-comments.
 	comments map[commentKey]string
+
+	// statisticsObjs tracks CREATE STATISTICS objects. Key = "schema.name" (lowercase).
+	// Populated by RegisterStatistics; read by pg_statistic_ext VirtualRows. M0097-0023.
+	statisticsObjs map[string]*StatisticsObject
 }
 
 // commentKey is the composite key for pg_description.
@@ -501,6 +531,23 @@ type commentKey struct {
 	ClassOID uint32
 	ObjOID   uint32
 	ObjSubID int32
+}
+
+// StatisticsObject tracks one CREATE STATISTICS object. M0097-0023.
+type StatisticsObject struct {
+	Name     string // unqualified name
+	Schema   string // schema name (empty = public)
+	OID      uint32
+	TableOID uint32 // stxrelid — the table the statistics are defined on
+}
+
+// qualifiedKey returns the lowercase schema.name key used in statisticsObjs.
+func (s *StatisticsObject) qualifiedKey() string {
+	schema := s.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	return strings.ToLower(schema + "." + s.Name)
 }
 
 // CommentRow is one row for pg_description.
@@ -624,11 +671,57 @@ func NewInMemory() *InMemory {
 			"information_schema": 99,
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
-		roles:    make(map[string]struct{}),
-		comments: make(map[commentKey]string),
+		roles:          make(map[string]struct{}),
+		comments:       make(map[commentKey]string),
+		statisticsObjs: make(map[string]*StatisticsObject),
 	}
 	c.registerSystemTables()
 	return c
+}
+
+// RegisterStatistics adds a new statistics object to the catalog and returns it.
+// If a statistics object with the same schema-qualified name already exists it
+// is overwritten. M0097-0023.
+func (c *InMemory) RegisterStatistics(schema, name string, tableOID uint32) *StatisticsObject {
+	if schema == "" {
+		schema = "public"
+	}
+	obj := &StatisticsObject{Name: name, Schema: schema, OID: c.AllocOID(), TableOID: tableOID}
+	key := obj.qualifiedKey()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		c.statisticsObjs = make(map[string]*StatisticsObject)
+	}
+	c.statisticsObjs[key] = obj
+	return obj
+}
+
+// LookupStatistics finds a statistics object by name. The name may be
+// schema-qualified; if not, the public schema is tried. M0097-0023.
+func (c *InMemory) LookupStatistics(name string) (*StatisticsObject, bool) {
+	key := strings.ToLower(name)
+	if !strings.Contains(key, ".") {
+		key = "public." + key
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.statisticsObjs == nil {
+		return nil, false
+	}
+	obj, ok := c.statisticsObjs[key]
+	return obj, ok
+}
+
+// AllStatistics returns a snapshot of all registered statistics objects. M0097-0023.
+func (c *InMemory) AllStatistics() []*StatisticsObject {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*StatisticsObject, 0, len(c.statisticsObjs))
+	for _, obj := range c.statisticsObjs {
+		out = append(out, obj)
+	}
+	return out
 }
 
 // SetComment stores a description for an object in pg_description.
@@ -2327,6 +2420,52 @@ func (c *InMemory) registerSystemTables() {
 			row[19] = "{" + strings.Join(keyNums, ",") + "}"
 			out = append(out, row)
 		}
+		// Emit NOT NULL constraints (contype='n', PG18). M0097-0023.
+		for _, tbl := range c.tables {
+			if tbl.Virtual || tbl.OID == 0 {
+				continue
+			}
+			for _, nc := range tbl.NotNullConstraints {
+				if nc.Name == "" || nc.OID == 0 {
+					continue
+				}
+				colOrd := 0
+				for i, col := range tbl.Columns {
+					if strings.EqualFold(col.Name, nc.ColName) {
+						colOrd = i + 1
+						break
+					}
+				}
+				row := make([]string, 25)
+				row[0] = fmt.Sprintf("%d", nc.OID)
+				row[1] = nc.Name
+				row[2] = "2200"
+				row[3] = "n" // contype = not null
+				row[4] = "f"
+				row[5] = "f"
+				row[6] = "t"
+				row[7] = fmt.Sprintf("%d", tbl.OID)
+				row[8] = "0"
+				row[9] = "0"
+				row[10] = "0"
+				row[11] = "0"
+				row[12] = " "
+				row[13] = " "
+				row[14] = " "
+				row[15] = "t"
+				row[16] = "0"
+				if nc.NoInherit {
+					row[17] = "t"
+				} else {
+					row[17] = "f"
+				}
+				row[18] = "f"
+				if colOrd > 0 {
+					row[19] = fmt.Sprintf("{%d}", colOrd)
+				}
+				out = append(out, row)
+			}
+		}
 		return out
 	}
 	c.tables["pg_catalog.pg_constraint"] = pgConstraint
@@ -2502,7 +2641,36 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3381,
 	}
-	pgStatisticExt.VirtualRows = func() [][]string { return nil }
+	pgStatisticExt.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		if len(c.statisticsObjs) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(c.statisticsObjs))
+		for _, obj := range c.statisticsObjs {
+			schema := obj.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			nsOID := "2200" // public namespace OID
+			if schema != "public" {
+				nsOID = "0"
+			}
+			row := make([]string, 9)
+			row[0] = fmt.Sprintf("%d", obj.OID)      // oid
+			row[1] = fmt.Sprintf("%d", obj.TableOID) // stxrelid
+			row[2] = obj.Name                        // stxname
+			row[3] = nsOID                           // stxnamespace
+			row[4] = "10"                            // stxowner (bootstrap superuser)
+			row[5] = "-1"                            // stxstattarget (default)
+			row[6] = ""                              // stxkeys
+			row[7] = ""                              // stxexprs
+			row[8] = ""                              // stxkind
+			out = append(out, row)
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_statistic_ext"] = pgStatisticExt
 
 	// pg_collation — stores collation definitions (OID 3456).
@@ -4353,6 +4521,14 @@ func (c *InMemory) LookupCompositeTypeFields(name string) []CompositeField {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.compositeTypeFields[k]
+}
+
+// HasCompositeType reports whether the given name refers to a composite type.
+func (c *InMemory) HasCompositeType(name string) bool {
+	k := strings.ToLower(name)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.compositeTypeNames[k]
 }
 
 // DropCompositeType removes a composite type name. Returns an error if not

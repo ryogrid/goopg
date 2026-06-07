@@ -282,6 +282,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
+		ectx.BeginLocalTransaction = sess.BeginTransaction
+		ectx.EndLocalTransaction = sess.EndTransaction
 	}
 	if ectx.Session != nil {
 		advisoryReleaseTarget = ectx.Session
@@ -1324,6 +1326,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					}
 				}
 				connTx.Begin(ctx.Tx)
+				if ctx.BeginLocalTransaction != nil {
+					ctx.BeginLocalTransaction()
+				}
 			}
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		case planner.TxCommit:
@@ -1343,6 +1348,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
+					if ctx.EndLocalTransaction != nil {
+						ctx.EndLocalTransaction()
+					}
 					ctx.PendingEnumValues = nil
 					ctx.PendingEnumRenames = nil
 					ctx.PendingCreatedEnums = nil
@@ -1370,6 +1378,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						_ = s.cfg.TxnMgr.Rollback(explicitTx)
 						undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 						connTx.End()
+						if ctx.EndLocalTransaction != nil {
+							ctx.EndLocalTransaction()
+						}
 						ctx.PendingEnumValues = nil
 						ctx.PendingEnumRenames = nil
 						ctx.PendingCreatedEnums = nil
@@ -1380,6 +1391,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
 					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
+					if ctx.EndLocalTransaction != nil {
+						ctx.EndLocalTransaction()
+					}
 					ctx.PendingEnumValues = nil
 					ctx.PendingEnumRenames = nil
 					ctx.PendingCreatedEnums = nil
@@ -1390,6 +1404,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					sess.TakePendingRoutineDrops()
 				}
 				connTx.End()
+				if ctx.EndLocalTransaction != nil {
+					ctx.EndLocalTransaction()
+				}
 				ctx.PendingEnumValues = nil
 				ctx.PendingEnumRenames = nil
 				ctx.PendingCreatedEnums = nil
@@ -1419,6 +1436,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 				undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 				connTx.End()
+				if ctx.EndLocalTransaction != nil {
+					ctx.EndLocalTransaction()
+				}
 				ctx.PendingEnumValues = nil
 				ctx.PendingEnumRenames = nil
 				ctx.PendingCreatedEnums = nil

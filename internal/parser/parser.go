@@ -1906,6 +1906,14 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptIdentKeyword("statistics"):
+		// COMMENT ON STATISTICS name IS '...'. M0097-0023.
+		cs.ObjKind = "statistics"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
 	default:
 		return nil, false, nil
 	}
