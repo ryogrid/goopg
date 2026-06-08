@@ -2691,6 +2691,33 @@ M0097-0001 wires it up.
         Remaining 62 diffs: `\d` include-column display (~10), NULL row-comparison
         (~14), float format (~2), DETAIL messages (~4), gist/spgist errors (~10+),
         USING INDEX syntax (~2), exclusion enforcement missing (~4).
+      - **Progress 2026-06-08 (M0097-0023-loop42 — circular inheritance crash fix +
+        system catalog guard + relfilenode + ON COMMIT parser):**
+        (a) Circular inheritance: `ALTER TABLE INHERIT` now rejects self-inheritance,
+        circular cycles, and duplicate parents via `IsInheritanceDescendant` (new BFS
+        helper). `collectInheritanceTree` in `execDropTable` gains a `visitedOIDs`
+        guard. `ALTER TABLE NO INHERIT` now calls `UnregisterInheritanceChild` (was
+        no-op). Fixes server crash (stack overflow) on `DROP TABLE CASCADE` with
+        circular inheritance in `alter_table` regress.
+        (b) System catalog guard: `execAlterTable` now rejects modifications to
+        tables in `pg_catalog` / `information_schema` with `42501 permission denied`.
+        Before this fix, `ALTER TABLE pg_class DROP COLUMN relname` succeeded and
+        all subsequent `\d` commands failed with "column relname does not exist"
+        (79 occurrences in alter_table diff). Unlocks `create_table_like` → PASS.
+        (c) `pg_class.relfilenode` column added (ordinal 22); value = table/index OID.
+        Fixes 7 "column relfilenode does not exist" errors in `create_index`.
+        (d) `ON COMMIT DELETE ROWS / DROP` parser: `acceptIdentKeyword("delete")`
+        can never match a reserved keyword token; fixed to `acceptKeyword(KwDelete)`
+        in three parser sites. Also added ON COMMIT handling to `parseCreateTableTail`
+        for tables with column definitions (was only handled in the empty-column-list
+        path). Fixes 13 "syntax error at or near delete/on" in `temp`.
+        New PASS tests: `create_table_like`, `drop_if_exists`, `index_including`,
+        `index_including_gist`. Tests still PASS: `btree_index`, `hash_index`.
+        Remaining: `alter_table` (1725 diff lines — my_locks/pg_locks, syntax gaps,
+        array type creation); `create_index` (1556 lines — GIN, point_tbl, relid);
+        `temp` (290 lines — ON COMMIT runtime semantics, plpgsql cursor);
+        `truncate` (231 lines — identity restart, FK violations);
+        `create_table` (278 lines — pg_get_partkeydef, pg_inherits, aggregate-in-bound).
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
