@@ -2741,6 +2741,23 @@ M0097-0001 wires it up.
         (`trunc_a1 CASCADE` should cascade via parent `trunc_a`'s FK refs);
         `tp_chk_data` SETOF RECORD schema mismatch; DROP TABLE not dropping
         OWNED BY sequences; ref_b/ref_c FK INSERT errors (pre-existing).
+      - **Progress 2026-06-09 (M0097-0023-loop44 — transactional TRUNCATE + sequence cascade + SETOF OUT params: 135→0):**
+        commit 56dcab51. Six fixes bringing `truncate` regress to PASS (0 diffs):
+        (a) `RecordDDLCreate` guards on `s.inTx` — autocommit CREATE TABLE was
+        accumulating in pendingDDL and getting dropped by unrelated ROLLBACKs;
+        (b) `ProcessRollbackUndos` exported and wired into TxRollback handler —
+        TRUNCATE page snapshots restored on ROLLBACK; (c) ALTER SEQUENCE OWNED BY
+        tracked via new `OwnedBy` field + `SetSequenceOwnedBy` +
+        `DropSequencesOwnedByTable`; DROP TABLE cascade-drops owned sequences;
+        `evalNextval` returns 42P01 instead of auto-creating; (d) parser OWNED BY
+        extraction in `AlterSequenceStmt`; (e) TRUNCATE CASCADE partition-aware FK
+        with full ancestor chain traversal; (f) FK parent-key scan recurses through
+        all partition/inheritance descendants (`allDescendants` helper) — fixes
+        multi-level partition tree (trunc_a→trunc_a2→trunc_a21); (g) SETOF record
+        functions with OUT params now expand to multi-column schema in planner;
+        composite text decomposed in executor; `datumForCompositeText` fixes int
+        formatting in RETURN QUERY rows. `truncate` regress: 135→0 diffs (PASS).
+        Total: 24 regress cases pass.
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
