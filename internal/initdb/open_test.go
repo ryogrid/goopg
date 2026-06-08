@@ -422,15 +422,17 @@ func TestOpenOldClusterWithoutM0030FilesStillWorks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Remove the M0030-0001 relfiles to simulate an old cluster.
-	base := filepath.Join(dir, "base", fmt.Sprint(catalog.DefaultDBOid))
-	for _, oid := range []uint32{
-		catalog.TypeRelationId,
-		catalog.AttributeRelationId,
-		catalog.RelationRelationId,
-	} {
-		if err := os.Remove(filepath.Join(base, fmt.Sprint(oid))); err != nil {
-			t.Fatalf("remove OID %d: %v", oid, err)
+	// Remove the M0030-0001 relfiles from ALL database directories to simulate
+	// an old cluster. bootstrapPgClassTuples writes to both base/1 and base/5
+	// (template1 and postgres), so we must remove from both.
+	baseDirs, _ := filepath.Glob(filepath.Join(dir, "base", "*"))
+	for _, baseDir := range baseDirs {
+		for _, oid := range []uint32{
+			catalog.TypeRelationId,
+			catalog.AttributeRelationId,
+			catalog.RelationRelationId,
+		} {
+			_ = os.Remove(filepath.Join(baseDir, fmt.Sprint(oid))) // ignore missing
 		}
 	}
 
@@ -514,7 +516,11 @@ func TestPGAttributeSQLSurfaceForUserTable(t *testing.T) {
 			}
 			row, err := catalog.DecodePGAttributeRow(ht.Data)
 			if err != nil {
-				continue
+				var err2 error
+				row, err2 = catalog.DecodePGAttributePhysicalRow(ht.Data)
+				if err2 != nil {
+					continue
+				}
 			}
 			if row.AttRelID == tbl.OID {
 				colsByName[row.AttName] = row

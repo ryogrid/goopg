@@ -4448,7 +4448,10 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 		}
 		return &FuncCall{pos: x.Pos(), Name: "array_construct", Args: args}, nil
 	case *parser.StarExpr:
-		return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
+		if x.Table == "" && x.Schema == "" {
+			return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
+		}
+		return expandQualifiedStarToRowExpr(x, agg.input)
 	}
 	return nil, &PlanError{Pos: e.Pos(), Code: "0A000", Message: fmt.Sprintf("unsupported expression %T", e)}
 }
@@ -6983,6 +6986,23 @@ func resolveTargets(targets []parser.ResTarget, ctx *resolveContext) ([]Expr, Sc
 	return out, schema, nil
 }
 
+// expandQualifiedStarToRowExpr expands a table-qualified star expression (e.g.
+// `t.*`, `excluded.*`) that appears in an expression context (not in a SELECT
+// target list) to a RowExpr containing all columns of the referenced table.
+// This supports whole-row variable references such as `WHERE i.* != excluded.*`
+// or `SET fruit = excluded.*::text` in ON CONFLICT DO UPDATE clauses.
+func expandQualifiedStarToRowExpr(star *parser.StarExpr, ctx *resolveContext) (*RowExpr, error) {
+	elems, colSchema, err := expandStarTarget(star, ctx)
+	if err != nil {
+		return nil, err
+	}
+	types := make([]catalog.Type, len(colSchema))
+	for i, sc := range colSchema {
+		types[i] = sc.Type
+	}
+	return &RowExpr{pos: star.Pos(), Elems: elems, Types: types}, nil
+}
+
 func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schema, error) {
 	if len(ctx.bindings) == 0 {
 		return nil, nil, &PlanError{Pos: star.Pos(), Code: "42601", Message: "SELECT * with no FROM clause"}
@@ -8409,7 +8429,13 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		}
 		return &FuncCall{pos: x.Pos(), Name: x.Name.String(), Args: args, Star: x.Star, Variadic: varExp, ReturnType: returnType}, nil
 	case *parser.StarExpr:
-		return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
+		// Unqualified * is not valid in expression context. A qualified t.* is a
+		// whole-row variable reference (e.g. `WHERE i.* != excluded.*`) — expand
+		// it to a RowExpr so the executor can evaluate row comparisons.
+		if x.Table == "" && x.Schema == "" {
+			return nil, &PlanError{Pos: x.Pos(), Code: "42601", Message: "'*' is not allowed here"}
+		}
+		return expandQualifiedStarToRowExpr(x, ctx)
 	case *parser.CastExpr:
 		// M0097-0003: emit CastExpr so the executor can coerce at runtime.
 		operand, err := resolveExpr(x.Operand, ctx)

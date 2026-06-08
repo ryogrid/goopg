@@ -1316,6 +1316,10 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				if !p.acceptSymbol("(") {
 					return nil, p.errAtCur("expected '(' after IN")
 				}
+				// Empty IN list is a syntax error (PostgreSQL: "syntax error at or near ')'").
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+					return nil, p.errSyntaxAtCur()
+				}
 				vals, err := p.parseExprList()
 				if err != nil {
 					return nil, err
@@ -1399,7 +1403,13 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				case p.acceptIdentKeyword("hash"):
 					method = "HASH"
 				default:
-					return nil, p.errAtCur("expected LIST, RANGE, or HASH after PARTITION BY")
+					// Accept any identifier; executor validates the strategy name.
+					if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+						method = p.cur().Value
+						p.advance()
+					} else {
+						return nil, p.errAtCur("expected partition strategy after PARTITION BY")
+					}
 				}
 				if !p.acceptSymbol("(") {
 					return nil, p.errAtCur("expected '(' after partition method")
@@ -1738,7 +1748,13 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		case p.acceptIdentKeyword("hash"):
 			method = "HASH"
 		default:
-			return nil, p.errAtCur("expected LIST, RANGE, or HASH after PARTITION BY")
+			// Accept any identifier; executor validates the strategy name.
+			if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+				method = p.cur().Value
+				p.advance()
+			} else {
+				return nil, p.errAtCur("expected partition strategy after PARTITION BY")
+			}
 		}
 		if !p.acceptSymbol("(") {
 			return nil, p.errAtCur("expected '(' after partition method")
@@ -1821,7 +1837,20 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 			}
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith:
 			p.advance()
-			_, _ = p.parseWithOptions()
+			// Handle: WITH OIDS (no parens) and WITH (oids), WITH (oids = true/false).
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "oids") {
+				// WITH OIDS form — no parens; note as oids=true.
+				p.advance()
+				stmt.WithOIDS = true
+			} else {
+				opts, _ := p.parseWithOptions()
+				if v, ok := opts[strings.ToLower("oids")]; ok {
+					stmt.WithOIDS = !strings.EqualFold(v, "false") && v != "0"
+				}
+			}
+		case p.acceptIdentKeyword("without"):
+			// WITHOUT OIDS — accepted and silently ignored.
+			_ = p.acceptIdentKeyword("oids")
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTablespace:
 			p.advance()
 			_, _ = p.parseIdent()
@@ -2305,21 +2334,23 @@ func (p *parser) parseWithOptions() (map[string]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		if cur := p.cur(); !(cur.Kind == TokenOperator && cur.Value == "=") {
-			return nil, p.errAtCur("expected '='")
-		}
-		p.advance()
-		t := p.cur()
 		var val string
-		switch t.Kind {
-		case TokenIntLit, TokenStringLit:
-			val = t.Value
-		case TokenIdent, TokenQuotedIdent, TokenKeyword:
-			val = identText(t)
-		default:
-			return nil, p.errAtCur("expected option value")
+		if cur := p.cur(); cur.Kind == TokenOperator && cur.Value == "=" {
+			p.advance() // consume '='
+			t := p.cur()
+			switch t.Kind {
+			case TokenIntLit, TokenStringLit:
+				val = t.Value
+			case TokenIdent, TokenQuotedIdent, TokenKeyword:
+				val = identText(t)
+			default:
+				return nil, p.errAtCur("expected option value")
+			}
+			p.advance()
+		} else {
+			// Boolean flag without '= value' (e.g. 'oids' in WITH (oids)).
+			val = "true"
 		}
-		p.advance()
 		out[identText(key)] = val
 		if p.acceptSymbol(",") {
 			continue
@@ -3785,6 +3816,21 @@ func (p *parser) parseAlter() (Stmt, error) {
 		})
 		return stmt, nil
 	}
+	// SET LOGGED / SET UNLOGGED — parse and store action for executor.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet {
+		if p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "logged") {
+			p.advance() // SET
+			p.advance() // LOGGED
+			stmt.SetLogged = "logged"
+			return stmt, nil
+		}
+		if p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "unlogged") {
+			p.advance() // SET
+			p.advance() // UNLOGGED
+			stmt.SetLogged = "unlogged"
+			return stmt, nil
+		}
+	}
 	// SET SCHEMA schema_name — update table/view schema. M0097-0025.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet {
 		if p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema") {
@@ -3950,6 +3996,9 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			} else if p.acceptKeyword(KwIn) {
 				if !p.acceptSymbol("(") {
 					return AlterTableAction{}, p.errAtCur("expected '(' after IN")
+				}
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+					return AlterTableAction{}, p.errSyntaxAtCur()
 				}
 				vals, err := p.parseExprList()
 				if err != nil {
