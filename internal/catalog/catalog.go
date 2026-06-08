@@ -232,6 +232,10 @@ type Table struct {
 	// partition keys. Parallel to PartitionKey: nil entry = plain column name,
 	// non-nil entry = expression (e.g. abs(b), (a+b)/2, NOT a). M0097-0023.
 	PartitionKeyExprs []parser.Expr
+
+	// Unlogged / Temp track relpersistence. 'u' for UNLOGGED, 't' for TEMP, 'p' for permanent.
+	Unlogged bool
+	Temp     bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -282,6 +286,7 @@ type PartitionBound struct {
 	Remainder  int64    // HASH: remainder (partition index)
 	IsHash     bool     // true for HASH partitions
 	IsDefault  bool     // true for DEFAULT partitions
+	ChildName  string   // name of the child partition that owns this bound
 }
 
 // TableStats captures the pg_class-shaped table-level stats
@@ -1480,6 +1485,8 @@ func (c *InMemory) registerSystemTables() {
 				relkind = "v"
 			} else if t.IsMatView {
 				relkind = "m"
+			} else if t.PartitionMethod != "" && t.PartitionParentOID == 0 {
+				relkind = "p"
 			}
 			populated := "t"
 			if t.IsMatView && !t.IsPopulated {
@@ -1502,12 +1509,18 @@ func (c *InMemory) registerSystemTables() {
 			if t.PartitionParentOID != 0 {
 				isPartition = "t"
 			}
+			relpers := "p"
+			if t.Unlogged {
+				relpers = "u"
+			} else if t.Temp {
+				relpers = "t"
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // oid: numeric OID (M0103-0008 rung 16)
 				t.Name,                       // relname
 				relkind,                      // relkind
 				strconv.Itoa(int(nsOID)),     // relnamespace: schema OID
-				"p",                          // relpersistence: permanent
+				relpers,                      // relpersistence
 				"0",                          // reltoastrelid: no TOAST table
 				"0",                          // relpages: estimated page count
 				populated,                    // relispopulated
@@ -1551,12 +1564,20 @@ func (c *InMemory) registerSystemTables() {
 			if idx.Method == "hash" {
 				idxRelam = "405"
 			}
+			idxPers := "p"
+			if idx.Table != nil {
+				if idx.Table.Unlogged {
+					idxPers = "u"
+				} else if idx.Table.Temp {
+					idxPers = "t"
+				}
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),  // oid
 				idx.Name,                    // relname
 				"i",                         // relkind = index
 				strconv.Itoa(int(idxNsOID)), // relnamespace
-				"p",                         // relpersistence
+				idxPers,                     // relpersistence
 				"0",                         // reltoastrelid
 				"0",                         // relpages
 				"t",                         // relispopulated

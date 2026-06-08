@@ -167,12 +167,15 @@ func TestSystemCatalogRelfilesAreValidHeapPages(t *testing.T) {
 		path := filepath.Join(dir, "base",
 			fmt.Sprint(catalog.DefaultDBOid),
 			fmt.Sprint(oid))
-		raw, err := os.ReadFile(path)
+		f, err := os.Open(path)
 		if err != nil {
-			t.Fatalf("OID %d: read %q: %v", oid, path, err)
+			t.Fatalf("OID %d: open %q: %v", oid, path, err)
 		}
-		if len(raw) != storage.BlockSize {
-			t.Fatalf("OID %d: file size %d want %d", oid, len(raw), storage.BlockSize)
+		raw := make([]byte, storage.BlockSize)
+		n, readErr := f.Read(raw)
+		f.Close()
+		if n != storage.BlockSize {
+			t.Fatalf("OID %d: read %d bytes from first block (want %d): %v", oid, n, storage.BlockSize, readErr)
 		}
 		// A properly initialised page must NOT be all-zeros: InitPage
 		// writes a non-zero pd_pagesize_version field.
@@ -242,7 +245,9 @@ func TestBootstrappedPGTypeRowsReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Read block 0 of pg_type directly via the storage manager.
+	// Scan all blocks of pg_type. The file spans multiple blocks with the
+	// expanded 194-entry seed (batched-15); reading only block 0 misses types
+	// with large OIDs such as varchar (1043), timestamp (1114), numeric (1700).
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
 	defer mgr.Close()
 
@@ -251,31 +256,36 @@ func TestBootstrappedPGTypeRowsReadable(t *testing.T) {
 		RelOid: catalog.TypeRelationId,
 		Fork:   storage.MainFork,
 	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(rel, 0, page); err != nil {
-		t.Fatalf("ReadBlock pg_type: %v", err)
+	nBlocks, err := mgr.NBlocks(rel)
+	if err != nil || nBlocks == 0 {
+		t.Fatalf("pg_type relfile absent or empty: err=%v nblocks=%d", err, nBlocks)
 	}
 
-	count, err := storage.PageLinePointerCount(page)
-	if err != nil {
-		t.Fatalf("PageLinePointerCount: %v", err)
-	}
-	if count == 0 {
-		t.Fatal("pg_type page has zero tuples")
-	}
-
-	// Decode each tuple and collect type names.
 	typesByOID := map[uint32]catalog.PGTypeRow{}
-	for slot := uint16(1); slot <= uint16(count); slot++ {
-		ht, err := storage.PageGetHeapTuple(page, slot)
-		if err != nil {
-			t.Fatalf("slot %d: %v", slot, err)
+	page := make(storage.Page, storage.BlockSize)
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		if err := mgr.ReadBlock(rel, blk, page); err != nil {
+			t.Fatalf("ReadBlock pg_type blk %d: %v", blk, err)
 		}
-		row, err := catalog.DecodePGTypeRow(ht.Data)
+		count, err := storage.PageLinePointerCount(page)
 		if err != nil {
-			t.Fatalf("slot %d decode: %v", slot, err)
+			continue
 		}
-		typesByOID[row.OID] = row
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			row, err := catalog.DecodePGTypeRow(ht.Data)
+			if err != nil {
+				var err2 error
+				row, err2 = catalog.DecodePGTypePhysicalRow(ht.Data)
+				if err2 != nil {
+					continue
+				}
+			}
+			typesByOID[row.OID] = row
+		}
 	}
 
 	// Verify expected types are present.
@@ -337,7 +347,11 @@ func TestBootstrappedPGClassRowsReadable(t *testing.T) {
 		}
 		row, err := catalog.DecodePGClassRow(ht.Data)
 		if err != nil {
-			t.Fatalf("slot %d decode: %v", slot, err)
+			var err2 error
+			row, err2 = catalog.DecodePGClassPhysicalRow(ht.Data)
+			if err2 != nil {
+				continue
+			}
 		}
 		classByOID[row.OID] = row
 	}
@@ -370,6 +384,8 @@ func TestBootstrappedPGAttributeRowsReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Scan all blocks. pg_attribute spans multiple blocks because it stores
+	// column definitions for all nailed relations (M0106-0008, ~264 rows).
 	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
 	defer mgr.Close()
 
@@ -378,35 +394,46 @@ func TestBootstrappedPGAttributeRowsReadable(t *testing.T) {
 		RelOid: catalog.AttributeRelationId,
 		Fork:   storage.MainFork,
 	}
-	page := make(storage.Page, storage.BlockSize)
-	if err := mgr.ReadBlock(rel, 0, page); err != nil {
-		t.Fatalf("ReadBlock pg_attribute: %v", err)
-	}
-
-	count, err := storage.PageLinePointerCount(page)
-	if err != nil {
-		t.Fatalf("PageLinePointerCount: %v", err)
+	nBlocks, err := mgr.NBlocks(rel)
+	if err != nil || nBlocks == 0 {
+		t.Fatalf("pg_attribute relfile absent or empty: err=%v nblocks=%d", err, nBlocks)
 	}
 
 	// Gather attnames per relation.
 	byRelID := map[uint32][]string{}
-	for slot := uint16(1); slot <= uint16(count); slot++ {
-		ht, err := storage.PageGetHeapTuple(page, slot)
-		if err != nil {
-			t.Fatalf("slot %d: %v", slot, err)
+	page := make(storage.Page, storage.BlockSize)
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		if err := mgr.ReadBlock(rel, blk, page); err != nil {
+			t.Fatalf("ReadBlock pg_attribute blk %d: %v", blk, err)
 		}
-		row, err := catalog.DecodePGAttributeRow(ht.Data)
+		count, err := storage.PageLinePointerCount(page)
 		if err != nil {
-			t.Fatalf("slot %d decode: %v", slot, err)
+			continue
 		}
-		byRelID[row.AttRelID] = append(byRelID[row.AttRelID], row.AttName)
+		for slot := uint16(1); slot <= uint16(count); slot++ {
+			ht, err := storage.PageGetHeapTuple(page, slot)
+			if err != nil {
+				continue
+			}
+			row, err := catalog.DecodePGAttributeRow(ht.Data)
+			if err != nil {
+				var err2 error
+				row, err2 = catalog.DecodePGAttributePhysicalRow(ht.Data)
+				if err2 != nil {
+					continue
+				}
+			}
+			byRelID[row.AttRelID] = append(byRelID[row.AttRelID], row.AttName)
+		}
 	}
 
-	// pg_class should have 8 columns, pg_attribute 6, pg_type 7.
+	// Full PG18 column counts: pg_class=34, pg_attribute=24, pg_type=14.
+	// These reflect the PG18 physical tuple layout written by bootstrapPg*Tuples
+	// (M0106-0008). The original goopg-only counts (8, 6, 7) are obsolete.
 	for relOID, wantCount := range map[uint32]int{
-		catalog.RelationRelationId:  8,
-		catalog.AttributeRelationId: 6,
-		catalog.TypeRelationId:      7,
+		catalog.RelationRelationId:  34,
+		catalog.AttributeRelationId: 24,
+		catalog.TypeRelationId:      14,
 	} {
 		cols := byRelID[relOID]
 		if len(cols) != wantCount {

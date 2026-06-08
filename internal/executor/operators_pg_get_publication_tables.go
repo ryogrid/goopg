@@ -12,7 +12,6 @@ package executor
 
 import (
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -105,31 +104,14 @@ func buildPgGetPublicationTablesRows(ctx *Context, args []Datum) ([]Row, error) 
 		}
 		tables := publicationTablesForCtx(ctx, pub)
 		for _, t := range tables {
-			// M0103-0008 rung 16: emit relid as the table's numeric OID
-			// in decimal-text form (KindString). Two requirements have to
-			// hold simultaneously:
-			//
-			//   (a) the wire emit must be a decimal-text OID literal so
-			//       libpqrcv's `DatumGetObjectId(c.oid)` decodes a real
-			//       numeric OID instead of parsing "t" as uint32 → 0 and
-			//       silently sinking every column-list LATERAL probe;
-			//
-			//   (b) the internal JOIN `gpt.relid = c.oid` against the
-			//       virtual `pg_catalog.pg_class.oid` cell (which always
-			//       arrives KindString through buildVirtualValues) must
-			//       still match — and the hash-join key path
-			//       (`datumKey` in operators_join_agg.go) keys
-			//       KindString as `"s:16384"` but KindInt as
-			//       `"m:16384:0"`, so a KindInt/KindString mix would miss.
-			//
-			// Emitting decimal-text KindString satisfies both: wire-text
-			// OID for (a), KindString-equal hash key for (b). NULL is
-			// reserved for the unresolved-table corner case (t.OID == 0).
+			// M0103-0008 rung 16: emit relid as a KindInt numeric OID so it
+			// hash-joins against pg_class.oid (which TypedVirtualCell converts
+			// from the virtual-row string to KindInt). NULL for t.OID==0.
 			var relidDatum Datum
 			if t.OID == 0 {
 				relidDatum = NullDatum
 			} else {
-				relidDatum = NewStringDatum(strconv.Itoa(int(t.OID)))
+				relidDatum = NewIntDatum(int64(t.OID))
 			}
 			rows = append(rows, Row{
 				relidDatum,

@@ -937,6 +937,7 @@ type CreateTableStmt struct {
 	// as a string→string map; the analyzer interprets known options
 	// (fillfactor, autovacuum_*, …) and rejects the rest.
 	With map[string]string
+	WithOIDS bool // true when WITH OIDS or WITH (oids[=true]) is present
 	// PartitionBy is non-nil when `PARTITION BY {LIST|RANGE|HASH} (col, …)` is present.
 	// M0096-0007.
 	PartitionBy *PartitionByClause
@@ -1503,6 +1504,8 @@ type AlterTableStmt struct {
 	// SetSchema holds the target schema name for ALTER TABLE/VIEW/MATERIALIZED VIEW
 	// ... SET SCHEMA <newschema>. Empty means no SET SCHEMA action. M0097-0025.
 	SetSchema string
+	// SetLogged is "logged" or "unlogged" when ALTER TABLE SET LOGGED/UNLOGGED is parsed.
+	SetLogged string
 }
 
 func (s *AlterTableStmt) Pos() int  { return s.pos }

@@ -1082,6 +1082,11 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 		}
 		return NewStringDatum(string(payload)), n, nil
 	case "bytea":
+		if len(data) >= 13 && data[0] == 0x01 {
+			ptr := make([]byte, 12)
+			copy(ptr, data[1:13])
+			return NewToastPointerDatum(ptr), 13, nil
+		}
 		payload, n, err := decodePhysicalPGVarlena(data)
 		if err != nil {
 			return Datum{}, 0, err

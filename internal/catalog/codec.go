@@ -469,6 +469,30 @@ func DecodePGTypeRow(data []byte) (PGTypeRow, error) {
 	return r, nil
 }
 
+// DecodePGTypePhysicalRow parses the fixed-layout PostgreSQL heap tuple data
+// for pg_type. Only the fields present in PGTypeRow are decoded.
+func DecodePGTypePhysicalRow(data []byte) (PGTypeRow, error) {
+	const pgTypeMinSize = 81 // to reach typcategory at offset 80
+	var r PGTypeRow
+	if len(data) < pgTypeMinSize {
+		return r, fmt.Errorf("pg_type physical row too short: len=%d", len(data))
+	}
+	r.OID = binary.LittleEndian.Uint32(data[0:4])
+	// typname: 64-byte NameData at offset 4, null-terminated
+	end := bytes.IndexByte(data[4:68], 0)
+	if end < 0 {
+		end = 64
+	}
+	r.TypName = string(data[4 : 4+end])
+	r.TypNamespace = binary.LittleEndian.Uint32(data[68:72])
+	// typowner at 72 (4 bytes): skip
+	r.TypLen = int32(int16(binary.LittleEndian.Uint16(data[76:78])))
+	r.TypByVal = data[78] != 0
+	r.TypType = string(data[79:80])
+	r.TypCategory = string(data[80:81])
+	return r, nil
+}
+
 // --- Encoding helpers ---
 
 // appendInt4Col appends a not-null int4 column: 1 null byte (0) + 4 big-endian bytes.

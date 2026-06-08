@@ -734,10 +734,32 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 	}
+	// WITH OIDS is no longer supported.
+	if s.WithOIDS {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "tables declared WITH OIDS are not supported"}
+	}
+	// UNLOGGED partitioned tables are not supported in PostgreSQL.
+	if s.Unlogged && s.PartitionBy != nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
+	}
+	// Validate DEFAULT expressions (no column refs, aggregates, subqueries, SRFs).
+	for _, c := range s.Columns {
+		if c.DefaultExpr != nil {
+			if err := validateDefaultExpr(c.DefaultExpr, s.Pos(), o.ctx); err != nil {
+				return err
+			}
+		}
+	}
+	// Validate PARTITION BY clause (method, key columns, key expressions).
+	if err := validatePartitionKey(s, cols, o.ctx); err != nil {
+		return err
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	tbl.Unlogged = s.Unlogged
+	tbl.Temp = s.Temporary
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -1315,6 +1337,10 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		return &ExecError{Code: "42P01", Pos: s.Pos(),
 			Message: fmt.Sprintf("relation %q does not exist", poc.Parent.String())}
 	}
+	// Validate the partition.
+	if err := validatePartitionChild(s, parent, o.ctx); err != nil {
+		return err
+	}
 	// Inherit columns from parent (partition children use parent's schema).
 	cols := make([]catalog.Column, len(parent.Columns))
 	copy(cols, parent.Columns)
@@ -1330,6 +1356,9 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			tbl.Schema = ws
 		}
 	}
+	// Set persistence flags on the child.
+	tbl.Unlogged = s.Unlogged
+	tbl.Temp = s.Temporary
 	// Set partition metadata on the child.
 	tbl.PartitionParentOID = parent.OID
 	// Use the child's own PARTITION BY clause when present (e.g. nested
@@ -1344,6 +1373,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 
 	// Build partition bounds from the FOR VALUES clause.
 	var pb catalog.PartitionBound
+	pb.ChildName = tbl.Name
 	if poc.Default {
 		// DEFAULT partition: catches all values not matched by other partitions.
 		pb.IsDefault = true
@@ -1376,6 +1406,8 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		}
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	}
+	// Also register bounds on the PARENT so validatePartitionChild can scan them.
+	parent.PartitionBounds = append(parent.PartitionBounds, pb)
 
 	// Register child with parent.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -1431,6 +1463,150 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	return nil
 }
 
+// validatePartitionChild checks that the partition child definition is valid.
+// This runs BEFORE CreateTable, so errors prevent the table from being created
+// and avoid cascade "already exists" errors on retry.
+func validatePartitionChild(s *parser.CreateTableStmt, parent *catalog.Table, ctx *Context) error {
+	poc := s.PartitionOf
+	pos := s.Pos()
+	childName := s.Name.Name
+
+	// 1. Parent must be partitioned.
+	if len(parent.PartitionKey) == 0 && len(parent.PartitionKeyExprs) == 0 {
+		return &ExecError{Code: "42601", Pos: pos,
+			Message: fmt.Sprintf("%q is not partitioned", poc.Parent.String())}
+	}
+
+	// 2. Temporary/permanent mixing.
+	if parent.Temp && !s.Temporary {
+		return &ExecError{Code: "0A000", Pos: pos,
+			Message: fmt.Sprintf("cannot create a permanent relation as partition of temporary relation %q", poc.Parent.String())}
+	}
+	if !parent.Temp && s.Temporary {
+		return &ExecError{Code: "0A000", Pos: pos,
+			Message: fmt.Sprintf("cannot create a temporary relation as partition of permanent relation %q", poc.Parent.String())}
+	}
+
+	// 3. Unlogged child not allowed.
+	if s.Unlogged {
+		return &ExecError{Code: "0A000", Pos: pos,
+			Message: "partitioned tables cannot be unlogged"}
+	}
+
+	strategy := strings.ToLower(parent.PartitionMethod)
+
+	// 4. Validate bound type matches parent strategy.
+	if !poc.Default {
+		if poc.IsHash && strategy != "hash" {
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: fmt.Sprintf("invalid bound specification for a %s partition", strategy)}
+		}
+		if len(poc.InValues) > 0 && strategy != "list" {
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: fmt.Sprintf("invalid bound specification for a %s partition", strategy)}
+		}
+		if (len(poc.FromValues) > 0 || len(poc.ToValues) > 0) && strategy != "range" {
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: fmt.Sprintf("invalid bound specification for a %s partition", strategy)}
+		}
+	}
+
+	// 5. Hash-specific: no default partition.
+	if poc.Default && strategy == "hash" {
+		return &ExecError{Code: "42P16", Pos: pos,
+			Message: "a hash-partitioned table may not have a default partition"}
+	}
+
+	// 6. Validate bound expressions for column refs, aggregates, subqueries, SRFs.
+	var boundExprs []parser.Expr
+	boundExprs = append(boundExprs, poc.InValues...)
+	boundExprs = append(boundExprs, poc.FromValues...)
+	boundExprs = append(boundExprs, poc.ToValues...)
+	for _, e := range boundExprs {
+		if err := validatePartBoundExpr(e, pos, parent); err != nil {
+			return err
+		}
+	}
+
+	// 7. HASH-specific validation.
+	if poc.IsHash {
+		if poc.Modulus <= 0 {
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: "modulus for hash partition must be an integer value greater than zero"}
+		}
+		if poc.Remainder < 0 || poc.Remainder >= poc.Modulus {
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: "remainder for hash partition must be less than modulus"}
+		}
+		if err := validateHashBounds(childName, poc.Modulus, poc.Remainder, parent, pos, ctx); err != nil {
+			return err
+		}
+	}
+
+	// 8. RANGE-specific validation.
+	if len(poc.FromValues) > 0 || len(poc.ToValues) > 0 {
+		nKeyCols := len(parent.PartitionKey)
+		if len(parent.PartitionKeyExprs) > nKeyCols {
+			nKeyCols = len(parent.PartitionKeyExprs)
+		}
+		if nKeyCols == 0 {
+			nKeyCols = 1
+		}
+		if len(poc.FromValues) > 0 && len(poc.FromValues) != nKeyCols {
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: "FROM must specify exactly one value per partitioning column"}
+		}
+		if len(poc.ToValues) > 0 && len(poc.ToValues) != nKeyCols {
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: "TO must specify exactly one value per partitioning column"}
+		}
+		for _, e := range poc.FromValues {
+			if _, isNull := e.(*parser.NullConst); isNull {
+				return &ExecError{Code: "42P16", Pos: pos,
+					Message: "cannot specify NULL in range bound"}
+			}
+		}
+		for _, e := range poc.ToValues {
+			if _, isNull := e.(*parser.NullConst); isNull {
+				return &ExecError{Code: "42P16", Pos: pos,
+					Message: "cannot specify NULL in range bound"}
+			}
+		}
+		if err := validateRangeBoundOrder(childName, poc.FromValues, poc.ToValues, pos); err != nil {
+			return err
+		}
+		if err := validateRangeOverlap(childName, poc.FromValues, poc.ToValues, parent, pos, ctx); err != nil {
+			return err
+		}
+	}
+
+	// 9. LIST-specific overlap.
+	if len(poc.InValues) > 0 && strategy == "list" {
+		if err := validateListOverlap(childName, poc.InValues, parent, pos, ctx); err != nil {
+			return err
+		}
+	}
+
+	// 10. DEFAULT partition conflict.
+	if poc.Default && strategy != "hash" {
+		if err := validateDefaultPartition(childName, parent, ctx, pos); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateDefaultPartition(childName string, parent *catalog.Table, ctx *Context, pos int) error {
+	for _, pb := range parent.PartitionBounds {
+		if pb.IsDefault {
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: fmt.Sprintf("partition %q conflicts with existing default partition %q", childName, pb.ChildName)}
+		}
+	}
+	return nil
+}
+
 // exprToString converts a simple parser expression to a string for partition bounds.
 func exprToString(e parser.Expr) string {
 	switch v := e.(type) {
@@ -1440,6 +1616,14 @@ func exprToString(e parser.Expr) string {
 		return v.Value
 	case *parser.NullConst:
 		return "null"
+	case *parser.ColumnRef:
+		// MINVALUE / MAXVALUE in partition bounds are parsed as ColumnRef.
+		return strings.ToLower(v.Column)
+	case *parser.UnaryOp:
+		if v.Op == parser.OpUnaryNeg {
+			inner := exprToString(v.Operand)
+			return "-" + inner
+		}
 	}
 	return fmt.Sprintf("%v", e)
 }
@@ -2541,6 +2725,16 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 }
 
 func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
+	// Handle SET LOGGED / SET UNLOGGED.
+	if s.SetLogged != "" {
+		tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
+		if !ok {
+			if s.IfExists { return nil }
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
+		}
+		_ = tbl
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("ALTER action SET %s cannot be performed on relation %q", strings.ToUpper(s.SetLogged), s.Name.Name)}
+	}
 	// Handle SET SCHEMA — move a table/matview to a new schema. M0097-0025.
 	if s.SetSchema != "" {
 		tbl, ok := o.ctx.Catalog.LookupTable(s.Name)

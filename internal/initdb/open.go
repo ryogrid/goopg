@@ -1520,9 +1520,18 @@ func registerStatCheckpointerView(cat *catalog.InMemory, cp *wal.Checkpointer) e
 func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
 	base := filepath.Join(dataDir, "base", fmt.Sprint(cat.DBOID()))
 
+	// heapFilePresent returns true only when the file exists AND has at least
+	// one full block. The storage manager opens files with O_CREATE, so a
+	// 0-byte stub can appear as a side-effect of NBlocks calls (e.g. in
+	// highestCatalogXID) even when the relfile was never bootstrapped.
+	heapFilePresent := func(path string) bool {
+		fi, err := os.Stat(path)
+		return err == nil && fi.Size() >= int64(storage.BlockSize)
+	}
+
 	// pg_type (OID 1247) — built-in type catalog.
 	pgTypeFile := filepath.Join(base, fmt.Sprint(catalog.TypeRelationId))
-	if _, err := os.Stat(pgTypeFile); err == nil {
+	if heapFilePresent(pgTypeFile) {
 		t := &catalog.Table{
 			Schema:  "pg_catalog",
 			Name:    "pg_type",
@@ -1536,7 +1545,7 @@ func loadSystemCatalogsIfPresent(dataDir string, cat *catalog.InMemory) error {
 
 	// pg_attribute (OID 1249) — column definition catalog.
 	pgAttrFile := filepath.Join(base, fmt.Sprint(catalog.AttributeRelationId))
-	if _, err := os.Stat(pgAttrFile); err == nil {
+	if heapFilePresent(pgAttrFile) {
 		t := &catalog.Table{
 			Schema:  "pg_catalog",
 			Name:    "pg_attribute",

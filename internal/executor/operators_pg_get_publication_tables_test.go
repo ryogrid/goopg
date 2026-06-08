@@ -461,7 +461,7 @@ func TestPgGetPublicationTablesRelidMatchesPgClassOid(t *testing.T) {
 	if rows[0][1].IsNull() {
 		t.Fatalf("rows[0].relid is NULL, want %q (table OID)", wantOID)
 	}
-	if got := rows[0][1].StringValue(); got != wantOID {
+	if got := rows[0][1].Format(); got != wantOID {
 		t.Fatalf("rows[0].relid = %q, want %q (numeric OID, M0103-0008 rung 16)", got, wantOID)
 	}
 }

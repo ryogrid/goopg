@@ -96,7 +96,11 @@ func scanPGClassByOID(t *testing.T, rt *Runtime, oid uint32) *catalog.PGClassRow
 			}
 			row, err := catalog.DecodePGClassRow(ht.Data)
 			if err != nil {
-				continue
+				var err2 error
+				row, err2 = catalog.DecodePGClassPhysicalRow(ht.Data)
+				if err2 != nil {
+					continue
+				}
 			}
 			if row.OID == oid {
 				rt.Pool.Unpin(slot)
@@ -138,7 +142,11 @@ func scanPGAttributeByRelID(t *testing.T, rt *Runtime, relOID uint32) []catalog.
 			}
 			row, err := catalog.DecodePGAttributeRow(ht.Data)
 			if err != nil {
-				continue
+				var err2 error
+				row, err2 = catalog.DecodePGAttributePhysicalRow(ht.Data)
+				if err2 != nil {
+					continue
+				}
 			}
 			if row.AttRelID == relOID {
 				out = append(out, row)

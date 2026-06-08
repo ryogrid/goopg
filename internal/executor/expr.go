@@ -6302,6 +6302,65 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Decompiles an internal expression tree. Stub: return empty string. M0097-0023.
 		return NewStringDatum(""), nil
 
+	case "obj_description":
+		// obj_description(object_oid [, catalog_name]) → text
+		// Returns the description for a database object from pg_description.
+		if len(x.Args) >= 1 {
+			oidDatum, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			var objOID uint32
+			switch oidDatum.Kind {
+			case KindInt:
+				objOID = uint32(oidDatum.Int)
+			case KindString:
+				n, _ := strconv.ParseUint(oidDatum.StringValue(), 10, 32)
+				objOID = uint32(n)
+			}
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok && objOID != 0 {
+				// classoid 1259 = pg_class
+				if desc, found := im.GetComment(1259, objOID, 0); found {
+					return NewStringDatum(desc), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "pg_relation_filenode":
+		// pg_relation_filenode(relation regclass) → oid
+		// Returns the filenode for a relation. For temporary tables returns NULL.
+		if len(x.Args) >= 1 {
+			relDatum, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			var relOID uint32
+			switch relDatum.Kind {
+			case KindInt:
+				relOID = uint32(relDatum.Int)
+			case KindString:
+				n, _ := strconv.ParseUint(relDatum.StringValue(), 10, 32)
+				relOID = uint32(n)
+			}
+			if relOID != 0 {
+				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+					if tbl, exists := im.LookupTableByOID(relOID); exists {
+						if tbl.Temp {
+							return NullDatum, nil
+						}
+						return Datum{Kind: KindInt, Int: int64(relOID)}, nil
+					}
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "pg_filenode_relation":
+		// pg_filenode_relation(tablespace oid, filenode oid) → regclass
+		// Returns the relation for a given filenode. Stub: returns NULL.
+		return NullDatum, nil
+
 	case "point":
 		// point(x, y) → text "(x,y)" — minimal geometric point. M0097-0023.
 		if len(x.Args) == 2 {
