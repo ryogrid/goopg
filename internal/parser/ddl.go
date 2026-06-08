@@ -1428,7 +1428,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
 			p.advance()
 			if p.acceptKeyword(KwCommit) {
-				_ = p.acceptIdentKeyword("preserve") || p.acceptIdentKeyword("delete")
+				_ = p.acceptIdentKeyword("preserve") || p.acceptKeyword(KwDelete)
 				_ = p.acceptIdentKeyword("rows") || p.acceptKeyword(KwDrop)
 			}
 		}
@@ -1804,6 +1804,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			return nil, p.errAtCur("expected ')'")
 		}
 	}
+	// ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } for temp tables.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
+		p.advance()
+		if p.acceptKeyword(KwCommit) {
+			_ = p.acceptIdentKeyword("preserve") || p.acceptKeyword(KwDelete)
+			_ = p.acceptIdentKeyword("rows") || p.acceptKeyword(KwDrop)
+		}
+	}
 	return stmt, nil
 }
 
@@ -1860,7 +1868,7 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 			if !p.acceptKeyword(KwCommit) {
 				return
 			}
-			_ = p.acceptIdentKeyword("preserve") || p.acceptIdentKeyword("delete")
+			_ = p.acceptIdentKeyword("preserve") || p.acceptKeyword(KwDelete)
 			_ = p.acceptIdentKeyword("rows") || p.acceptKeyword(KwDrop)
 		default:
 			return

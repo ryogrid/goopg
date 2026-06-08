@@ -1499,6 +1499,10 @@ func (c *InMemory) registerSystemTables() {
 			// relam: access method OID. 2=heap for tables, method OID for indexes.
 			// Required by psql \d+ and pg_class.relam joins with pg_am. M0097-0023.
 			{Name: "relam", Type: Type{Name: "oid"}, Ordinal: 21},
+			// relfilenode: storage file node OID. Equals the table OID when first
+			// created; changes on REINDEX/CLUSTER. Exposed so that regress tests
+			// can detect filenode changes (create_index.sql REINDEX section).
+			{Name: "relfilenode", Type: Type{Name: "oid"}, Ordinal: 22},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -1577,6 +1581,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",                          // reloftype
 				"",                           // reloptions: empty (NULL via TypedVirtualCell empty-string fallback)
 				"2",                          // relam: heap access method OID (OID 2)
+				strconv.Itoa(int(t.OID)),     // relfilenode: equals OID (no rewrite tracking in v0)
 			})
 		}
 		// Emit index rows (relkind='i') so pg_class can be used to count indexes.
@@ -1634,6 +1639,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",                         // reloftype
 				"",                          // reloptions: NULL
 				idxRelam,                    // relam: index access method OID
+				strconv.Itoa(int(idx.OID)), // relfilenode: equals OID
 			})
 		}
 		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
@@ -1649,7 +1655,7 @@ func (c *InMemory) registerSystemTables() {
 			"0",        // reltoastrelid
 			"0",        // relpages
 			"t",        // relispopulated
-			"22",       // relnatts: 22 columns (including relam added M0097-0023)
+			"23",       // relnatts: 23 columns (including relfilenode added M0097-0023)
 			"n",        // relreplident
 			"0",        // relchecks
 			"t",        // relhasindex (pg_class itself has indexes)
@@ -1663,6 +1669,7 @@ func (c *InMemory) registerSystemTables() {
 			"0",        // reloftype
 			"",         // reloptions: NULL
 			"2",        // relam: heap access method OID
+			"1259",     // relfilenode: equals OID for pg_class
 		})
 		return out
 	}
