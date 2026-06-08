@@ -5667,16 +5667,48 @@ is an impossible data-varlena header.
         in `insert_unique_constraint_test.go`. Write-path-only change → TPC-H
         read-only Q12/Q13 row counts structurally unaffected.
       - Analysis: `analysis/pgbench-tellers-duplicate-key-fix-20260608.md`.
-      - **Follow-up discovered (NOT fixed here):** under heavier contention
-        (`pgbench -c 4 -j 4`, scale 1) a backend that returns 40001 (EPQ
-        retries exhausted) mid-transaction leaves the connection wedged —
-        pgbench reports `current transaction is aborted, commands ignored`,
-        TPS→0, surviving clients hang forever; the erroring backend's goroutine
-        vanishes (no defers run, 0 CPU, all OS threads parked, socket
-        ESTAB/CLOSE-WAIT, `pg_stat_activity` still active). This corroborates
-        M0111-0001's deferred "next step (d) investigate 10-psql hang (possible
-        page-lock deadlock)". Out of CI scope (`-c 2` is robust); needs its own
-        transaction-error-recovery / protocol-state investigation.
+      - **Follow-up RESOLVED in M0111-0009 (below):** under heavier contention
+        a backend returned a spurious 40001 mid-transaction and the surviving
+        clients hung. Root-caused to two distinct bugs (spurious 40001 under
+        READ COMMITTED + leaked XID on disconnect) and fixed. The earlier
+        "vanishing goroutine" diagnosis was a Go-1.26 pprof artifact — a SIGQUIT
+        runtime traceback showed the backends were blocked in WaitForXID, not
+        gone.
+
+- [x] **M0111-0009 — Fix pgbench TPC-B hang + "current transaction is aborted" under concurrency**
+      - Summary: after M0111-0008, CI `pgbench -T 30 -c 2 -j 2` progressed ~15 s
+        then aborted with `current transaction is aborted, commands ignored
+        until end of transaction block` and hung. CI is ~3× faster than the
+        local box, so its `-c 2` hits a contention level the local box only
+        reaches at `-c 8` (the local repro).
+      - Two compounding bugs:
+        * **Bug A (client abort):** the EvalPlanQual retry loop capped at
+          `maxEPQRetries=3` for ALL isolation levels; under contention a backend
+          lapped >3× escalated to a spurious 40001. Instrumentation confirmed
+          every spurious 40001 came from the cap under READ COMMITTED, none from
+          the wait-for-graph. PG never surfaces a serialization failure for
+          plain UPDATE/DELETE contention under RC — it blocks and retries.
+          Fix: `epqRetryLimit(iso)` → high backstop `maxEPQRetriesRC=100000`
+          under RC (paced by epqWait blocking; WFG still breaks real deadlocks),
+          prompt `maxEPQRetries=3` under RR/SERIALIZABLE. Applied at the 3 EPQ
+          cap sites in `operators_storage.go`.
+        * **Bug B (hang):** a client that disconnected with an explicit
+          transaction still open never had it rolled back —
+          `runPostStartupLoop` returns on EOF and `serveConn`'s defers close the
+          socket but left the XID in the ProcArray, so every concurrent backend
+          blocked in `WaitForXID` on it hung forever (SIGQUIT traceback: 7
+          backends all on `WaitForXID(13)`). Fix: `rollbackOpenTxnOnTeardown`
+          deferred in `runPostStartupLoop` rolls back the open transaction →
+          `TxnMgr.Rollback` clears the XID and broadcasts `commitCond`.
+      - **Fixed (2026-06-08, commit `<pending>`):** `internal/executor/operators_storage.go`
+        (Bug A) + `internal/server/server.go` (Bug B).
+      - Verification: `pgbench -c 2/4/8/16` × 30 s all → exit 0, 0 failed,
+        0 aborts, 0 hang (`-c 8`: 9849 tx, 328 tps, ~2× prior). Unit tests
+        `TestEPQRetryLimitByIsolation` (executor),
+        `TestRollbackOpenTxnOnTeardownReleasesXID` (server). Verified in an
+        isolated git worktree (a concurrent Ralph loop was mutating
+        executor/server in the main checkout). Analysis:
+        `analysis/pgbench-tpcb-hang-and-abort-fix-20260608.md`.
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 
