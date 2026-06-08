@@ -6,7 +6,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     if: github.actor == github.repository_owner
 
     steps:
