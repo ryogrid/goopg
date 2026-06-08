@@ -2718,6 +2718,29 @@ M0097-0001 wires it up.
         `temp` (290 lines — ON COMMIT runtime semantics, plpgsql cursor);
         `truncate` (231 lines — identity restart, FK violations);
         `create_table` (278 lines — pg_get_partkeydef, pg_inherits, aggregate-in-bound).
+      - **Progress 2026-06-08 (M0097-0023-loop43 — TRUNCATE triggers, RESTART IDENTITY, FK cascade, 179→135 diff):**
+        commit 876dd69d. Four fixes targeting the `truncate` regress test:
+        (a) Trigger event parsing: `CREATE TRIGGER ... BEFORE TRUNCATE` was silently
+        failing because `TRUNCATE` tokenizes as `KwTruncate` (reserved) but parser
+        used `acceptIdentKeyword("truncate")` which requires `TokenIdent`. Fixed to
+        `acceptKeyword(KwTruncate) || acceptIdentKeyword("truncate")`. TRUNCATE
+        triggers now fire correctly; trunc_trigger_log gets rows.
+        (b) IDENTITY START WITH parsing: `GENERATED ALWAYS AS IDENTITY (START WITH N)`
+        stored `IdentityStart=0` because `WITH` is a reserved keyword and
+        `acceptIdentKeyword("with")` was a no-op. Fixed to
+        `_ = p.acceptKeyword(KwWith) || p.acceptIdentKeyword("with")`.
+        RESTART IDENTITY now resets to the correct start value.
+        (c) ALTER TABLE ADD FK now stores FKs in `tbl.ForeignKeys` (was only
+        validating). This allows TRUNCATE CASCADE BFS to follow FK references
+        added via ALTER TABLE, not just inline table-definition FKs.
+        (d) TRUNCATE CASCADE with partitioned/inherited tables: after FK BFS
+        expands the tableSet, a second BFS adds partition/inheritance children
+        of newly-added tables with "truncate cascades to table" NOTICEs.
+        Remaining in `truncate` (~135 diff lines): transactional TRUNCATE
+        (ROLLBACK semantics — WAL infrastructure gap); partition-aware FK cascade
+        (`trunc_a1 CASCADE` should cascade via parent `trunc_a`'s FK refs);
+        `tp_chk_data` SETOF RECORD schema mismatch; DROP TABLE not dropping
+        OWNED BY sequences; ref_b/ref_c FK INSERT errors (pre-existing).
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
