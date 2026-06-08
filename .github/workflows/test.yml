@@ -1,0 +1,174 @@
+name: Run Tests
+
+# Manually triggered by the repository owner only.
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-26.04
+    if: github.actor == github.repository_owner
+
+    steps:
+      # ------------------------------------------------------------------ #
+      # Checkout
+      # ------------------------------------------------------------------ #
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Submodule is handled separately so we can cache it.
+          submodules: false
+
+      # ------------------------------------------------------------------ #
+      # PostgreSQL submodule — cache by pinned commit SHA
+      # ------------------------------------------------------------------ #
+      - name: Get PostgreSQL submodule commit SHA
+        id: postgres-sha
+        run: |
+          echo "sha=$(git ls-tree HEAD -- postgres | awk '{print $3}')" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Restore PostgreSQL submodule cache
+        id: cache-postgres
+        uses: actions/cache@v4
+        with:
+          path: postgres
+          key: postgres-submodule-${{ steps.postgres-sha.outputs.sha }}
+
+      - name: Checkout PostgreSQL submodule
+        if: steps.cache-postgres.outputs.cache-hit != 'true'
+        run: git submodule update --init --depth 1 postgres
+
+      # ------------------------------------------------------------------ #
+      # HammerDB — cache by version (content never changes for a given tag)
+      # ------------------------------------------------------------------ #
+      - name: Restore HammerDB cache
+        id: cache-hammerdb
+        uses: actions/cache@v4
+        with:
+          path: HammerDB-5.0
+          key: hammerdb-5.0
+
+      - name: Download and extract HammerDB
+        if: steps.cache-hammerdb.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL \
+            https://github.com/TPC-Council/HammerDB/releases/download/v5.0/HammerDB-5.0-Prod-Lin-UBU24.tar.gz \
+            | tar -xz
+
+      # ------------------------------------------------------------------ #
+      # Go toolchain
+      # ------------------------------------------------------------------ #
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+          cache: true
+
+      # ------------------------------------------------------------------ #
+      # System packages
+      #   postgresql-client  — psql, pgbench, pg_isready
+      #   build-essential    — gcc / make for tools/segv_backtrace
+      #   libpq-dev          — libpq headers
+      # goopg uses its own init/start subcommands, so the full postgresql
+      # server package is not required.
+      # If pgbench is missing from postgresql-client on this distro, also
+      # install postgresql-contrib.
+      # ------------------------------------------------------------------ #
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            postgresql-client \
+            build-essential \
+            libpq-dev
+
+      # ------------------------------------------------------------------ #
+      # Build goopg binary (needed for pgbench steps)
+      # ------------------------------------------------------------------ #
+      - name: Build goopg
+        run: go build -o bin/goopg ./cmd/goopg
+
+      # ------------------------------------------------------------------ #
+      # Unit and component tests (no live server required)
+      # Excluded packages all require a running goopg or PostgreSQL cluster:
+      #   internal/testport         — full port suite, cluster-backed
+      #   internal/server           — starts a goopg instance per test
+      #   internal/testutil/cluster — crash recovery needs a cluster
+      #   internal/testutil/replcluster  — multi-node replication
+      #   internal/testutil/pgcluster    — upstream PostgreSQL cluster
+      #   internal/testutil/pubsubcluster — pub/sub multi-node
+      #   internal/testutil/tpch    — TPC-H parity against PostgreSQL
+      #   /bench/                   — benchmarks; smoke test run separately
+      # ------------------------------------------------------------------ #
+      - name: Run unit and component tests
+        run: |
+          EXCLUDE='internal/testport|internal/server
+                   |internal/testutil/cluster|internal/testutil/replcluster
+                   |internal/testutil/pgcluster|internal/testutil/pubsubcluster
+                   |internal/testutil/tpch|/bench/'
+          go test -timeout 10m $(go list ./... | grep -vE "$EXCLUDE")
+
+      # ------------------------------------------------------------------ #
+      # pgbench workloads
+      # goopg exposes "init" and "start" subcommands; no pg_ctl needed.
+      # ------------------------------------------------------------------ #
+      - name: Initialize goopg data directory
+        run: ./bin/goopg init -D tmp/ci-goopg-data
+
+      - name: Start goopg server
+        run: |
+          mkdir -p tmp
+          ./bin/goopg start \
+            -D tmp/ci-goopg-data \
+            --listen 127.0.0.1:5432 \
+            > tmp/ci-goopg.log 2>&1 &
+          echo $! > tmp/goopg.pid
+          # Wait up to 30 s for the server to accept connections.
+          timeout 30 bash -c \
+            'until pg_isready -h 127.0.0.1 -p 5432 -U postgres -q; do sleep 1; done'
+
+      - name: Initialize pgbench tables
+        run: pgbench -i -h 127.0.0.1 -p 5432 -U postgres postgres
+
+      - name: pgbench standard workload (TPC-B-like)
+        run: |
+          pgbench -T 30 -c 2 -j 2 -P 5 \
+            -h 127.0.0.1 -p 5432 -U postgres postgres
+
+      - name: pgbench simple-update workload
+        run: |
+          pgbench -T 30 -c 2 -j 2 -P 5 -N \
+            -h 127.0.0.1 -p 5432 -U postgres postgres
+
+      - name: pgbench select-only workload
+        run: |
+          pgbench -T 30 -c 2 -j 2 -P 5 -S \
+            -h 127.0.0.1 -p 5432 -U postgres postgres
+
+      - name: Stop goopg server
+        if: always()
+        run: |
+          if [ -f tmp/goopg.pid ]; then
+            kill "$(cat tmp/goopg.pid)" 2>/dev/null || true
+          fi
+
+      # ------------------------------------------------------------------ #
+      # HammerDB TPC-H smoke test
+      # TestSmokeLoadAgainstCluster spins up its own in-process goopg cluster
+      # (via cluster.New / go run ./cmd/goopg) and loads 200 orders.
+      # The three heavier baseline tests are not included here (-run filter).
+      # ------------------------------------------------------------------ #
+      - name: HammerDB TPC-H smoke test
+        run: |
+          go test -v \
+            -run TestSmokeLoadAgainstCluster \
+            -timeout 120s \
+            ./bench/tpch/cmd/hammerdb_load/...
+
+      # ------------------------------------------------------------------ #
+      # Diagnostics
+      # ------------------------------------------------------------------ #
+      - name: Dump goopg server log on failure
+        if: failure()
+        run: cat tmp/ci-goopg.log || true
