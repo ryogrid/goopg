@@ -894,9 +894,28 @@ type ColumnDef struct {
 	// CheckExpr holds the raw SQL expression for an inline CHECK constraint.
 	// M0097-0014.
 	CheckExpr string
+	// NotNullNoInherit is true when the NOT NULL constraint carries NO INHERIT
+	// (PG18: `c int NOT NULL NO INHERIT`). goopg v0 tracks the flag to emit
+	// the partitioned-table error for LIKE INCLUDING ALL. M0097-0023.
+	NotNullNoInherit bool
+	// CheckNoInherit is true when the inline CHECK constraint carries NO INHERIT.
+	// Stored so LIKE INCLUDING ALL can error on partitioned tables. M0097-0023.
+	CheckNoInherit bool
 }
 
 func (c ColumnDef) Pos() int { return c.pos }
+
+// TableConstraintDef describes a named UNIQUE or PRIMARY KEY table-level constraint
+// that may carry INCLUDE covering columns. Used in CreateTableStmt.NamedConstraints.
+type TableConstraintDef struct {
+	Name           string   // constraint/index name
+	Columns        []string // key columns
+	IncludeColumns []string // non-key covering columns from INCLUDE (…)
+	IsPrimary      bool     // true for PRIMARY KEY, false for UNIQUE
+	IsExclusion    bool     // true for EXCLUDE USING constraints
+	ExclusionOp    string   // per-column operator (e.g. "=") for single-column EXCLUDE
+	Method         string   // index method for EXCLUDE (e.g. "btree")
+}
 
 // CreateTableStmt — `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name
 //
@@ -946,8 +965,22 @@ type CreateTableStmt struct {
 	TableChecks []string
 	// TableUniques holds column-name lists from table-level UNIQUE (col1, col2)
 	// constraints. Each entry is the list of columns for one UNIQUE clause.
-	// M0097-0028.
+	// Anonymous constraints only; named ones are in NamedConstraints. M0097-0028.
 	TableUniques [][]string
+	// TableUniqueIncludes holds the INCLUDE covering columns parallel to
+	// TableUniques: TableUniqueIncludes[i] is the include list for TableUniques[i].
+	// May be shorter than TableUniques if trailing entries have no INCLUDE. M0097-0023.
+	TableUniqueIncludes [][]string
+	// PrimaryKeyInclude holds the INCLUDE covering columns for an anonymous
+	// table-level PRIMARY KEY constraint. M0097-0023.
+	PrimaryKeyInclude []string
+	// NamedConstraints holds explicitly named UNIQUE/PRIMARY KEY/EXCLUDE constraints,
+	// which may carry INCLUDE covering columns. The parser places named constraints
+	// here so the executor can use the constraint name as the index name. M0097-0023.
+	NamedConstraints []TableConstraintDef
+	// TableExclusions holds anonymous EXCLUDE USING constraints (no CONSTRAINT name).
+	// Named ones are folded into NamedConstraints. M0097-0023.
+	TableExclusions []TableConstraintDef
 	// LikeTables holds the source table names from LIKE clauses.
 	// `CREATE TABLE t (LIKE src INCLUDING DEFAULTS)` copies src's columns. M0097-0069.
 	// Deprecated: use BodyOrder for positional interleaving.
@@ -1018,7 +1051,8 @@ type CreateIndexStmt struct {
 	// most built-in operator classes have no options, so a non-empty value
 	// here causes an error at execution time. M0097-0023.
 	OpClassWithOptions string
-	HasPredicate       bool // true when a WHERE clause (partial index predicate) is present
+	HasPredicate       bool     // true when a WHERE clause (partial index predicate) is present
+	IncludeColumns     []string // non-key covering columns from INCLUDE (…)
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }
@@ -1237,6 +1271,31 @@ func (s *DropCompatStmt) stmtNode() {}
 func (s *CompatNoopStmt) Pos() int  { return s.pos }
 func (s *CompatNoopStmt) stmtNode() {}
 
+// CommentOnStmt represents a COMMENT ON statement for objects goopg tracks
+// (TABLE, INDEX, COLUMN, CONSTRAINT). The executor stores the description in
+// pg_description via catalog.SetComment. M0097-0023.
+type CommentOnStmt struct {
+	pos         int
+	ObjKind     string     // "table", "index", "column", "constraint", "statistics"
+	ObjName     ObjectName // table/index name, or table for constraint/column
+	SubName     string     // column name (ObjKind=column) or constraint name (ObjKind=constraint)
+	Description string     // comment text; empty string = IS NULL (delete comment)
+}
+
+func (s *CommentOnStmt) Pos() int  { return s.pos }
+func (s *CommentOnStmt) stmtNode() {}
+
+// CreateStatisticsStmt represents CREATE STATISTICS name ON ... FROM table. M0097-0023.
+type CreateStatisticsStmt struct {
+	pos         int
+	Name        ObjectName // statistics object name (possibly schema-qualified)
+	FromTable   ObjectName // the table the statistics are defined on
+	IfNotExists bool
+}
+
+func (s *CreateStatisticsStmt) Pos() int  { return s.pos }
+func (s *CreateStatisticsStmt) stmtNode() {}
+
 // LockTableRelation is one relation target inside a LOCK TABLE statement.
 type LockTableRelation struct {
 	Schema string
@@ -1363,6 +1422,18 @@ const (
 	// Marks the named column as dropped (hidden from user queries) while
 	// retaining its heap slot for backward heap-tuple compatibility. M0097-0028.
 	AlterTableDropColumn
+	// AlterTableAddUnique — `ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)]`.
+	// Creates a btree unique index; the index name comes from ConstraintName or
+	// is auto-generated. M0097-0023.
+	AlterTableAddUnique
+	// AlterTableSetStatistics — `ALTER INDEX name ALTER COLUMN N SET STATISTICS value`.
+	// Raises appropriate errors based on the column position and kind (key/expression/include).
+	// ColumnName holds the column number as a string; CheckExpr holds the statistics value. M0097-0023.
+	AlterTableSetStatistics
+	// AlterTableSetStorage — `ALTER COLUMN name SET STORAGE type`.
+	// Records the storage type (plain/main/external/extended) on the catalog column.
+	// StorageType holds the storage name; ColumnName holds the column. M0097-0023.
+	AlterTableSetStorage
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1375,6 +1446,7 @@ type AlterTableAction struct {
 	Kind           AlterTableActionKind
 	ConstraintName string    // optional, ADD CONSTRAINT name PRIMARY KEY …
 	Columns        []string  // populated for AddPrimaryKey + AddForeignKey (local cols)
+	IncludeColumns []string  // non-key covering columns from INCLUDE (…) for PK/UNIQUE
 	Column         ColumnDef // populated for AddColumn
 
 	// Foreign-key extras (only populated for AddForeignKey).
@@ -1409,6 +1481,9 @@ type AlterTableAction struct {
 	// ColumnName is the column being modified for AlterTableAlterColumnType.
 	// M0097-0022.
 	ColumnName string
+	// StorageType is the storage strategy for AlterTableSetStorage.
+	// Values: "plain", "main", "external", "extended". M0097-0023.
+	StorageType string
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

@@ -16,7 +16,7 @@ avoid the [[concurrent_ralph_loops_corrupt_tree]] failure mode.
 | **T1 loop-health metric** | `make ralph-metrics` prints success rate / cost / cache-read / status coverage / permission denials / failure breakdown. | `Makefile`, `pipeline/metrics_report.py` |
 | **T3 practice cards** | the 4 remaining cards authored (wal-replication, tpch-perf, regress-port, catalog-ddl); all 7 now exist. | `practice-cards/*.md` |
 | **Task-conditional practice loading** | `UserPromptSubmit` hook runs `route.py` (verified: the hook *does* fire for `claude -p`). Cards are injected only when the task/diff matches, capped at 3. | `.claude/settings.local.json`, `practice-cards/route.py` |
-| **T7 concurrency guard** | `SessionStart` hook warns (never blocks) when a ralph loop is already running — exactly the situation that bit this session. | `.claude/settings.local.json`, `practice-cards/concurrency_guard.py` |
+| **T7 concurrency guard** | `SessionStart` hook warns (never blocks) when a ralph loop is already running — exactly the situation that bit this session. **Fixed 2026-06-06:** counted bare `pgrep` lines, so the `--live` `portable_timeout` pipeline subshell (shares argv `ralph_loop.sh`) read as a phantom "2nd loop" and paralysed 7 loops; now counts independent loops by ppid and excludes this session's own driver. See [`practice-cards/concurrency-guard-false-positive-fix.md`](practice-cards/concurrency-guard-false-positive-fix.md). | `.claude/settings.local.json`, `practice-cards/concurrency_guard.py` |
 
 ### H1 verified impact (from the classifier)
 

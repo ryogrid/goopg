@@ -402,6 +402,12 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 						return NewStringDatum(tbl.Name), nil
 					}
 				}
+				// Also resolve index OIDs to index names. M0097-0023.
+				for _, idx := range ctx.Catalog.AllIndexes() {
+					if idx.OID == uint32(v.Int) {
+						return NewStringDatum(idx.Name), nil
+					}
+				}
 			case KindString:
 				schema, rel := splitQualifiedTable(v.StringValue())
 				objName := parser.ObjectName{Schema: schema, Name: rel}
@@ -1129,6 +1135,31 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 			matched = !matched
 		}
 		return NewBoolDatum(matched), nil
+	case parser.OpContainedBy, parser.OpContains, parser.OpOverlap:
+		// Geometric box operators: <@ (contained by), @> (contains), && (overlap). M0097-0023.
+		ls, lok := datumAsString(left)
+		rs, rok := datumAsString(right)
+		if !lok || !rok {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires box operands", op)}
+		}
+		aur, all, aok := parseBoxText(ls)
+		bur, bll, bok := parseBoxText(rs)
+		if !aok || !bok {
+			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s: invalid box value", op)}
+		}
+		var result bool
+		switch op {
+		case parser.OpContainedBy:
+			// a <@ b: b contains a; b.ll <= a.ll AND a.ur <= b.ur (both axes)
+			result = bll[0] <= all[0] && aur[0] <= bur[0] && bll[1] <= all[1] && aur[1] <= bur[1]
+		case parser.OpContains:
+			// a @> b: a contains b
+			result = all[0] <= bll[0] && bur[0] <= aur[0] && all[1] <= bll[1] && bur[1] <= aur[1]
+		case parser.OpOverlap:
+			// a && b: boxes overlap (share area or touch on closed boundary)
+			result = !(aur[0] < bll[0] || bur[0] < all[0] || aur[1] < bll[1] || bur[1] < all[1])
+		}
+		return NewBoolDatum(result), nil
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
 }
@@ -1146,6 +1177,71 @@ func datumAsString(d Datum) (string, bool) {
 		return string(d.BytesValue()), true
 	}
 	return "", false
+}
+
+// datumAsFloat64 extracts a numeric value from a Datum for geometric operations.
+func datumAsFloat64(d Datum) (float64, bool) {
+	switch d.Kind {
+	case KindInt:
+		return float64(d.Int), true
+	case KindNumeric:
+		f, err := strconv.ParseFloat(d.Format(), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	case KindString:
+		f, err := strconv.ParseFloat(d.StringValue(), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
+	}
+	return 0, false
+}
+
+// parsePointText parses a PostgreSQL point literal "(x,y)" or "x,y" into [x,y].
+func parsePointText(s string) ([2]float64, bool) {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "(")
+	s = strings.TrimSuffix(s, ")")
+	parts := strings.SplitN(s, ",", 2)
+	if len(parts) != 2 {
+		return [2]float64{}, false
+	}
+	x, err1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	y, err2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err1 != nil || err2 != nil {
+		return [2]float64{}, false
+	}
+	return [2]float64{x, y}, true
+}
+
+// parseBoxText parses a PostgreSQL box literal "(x1,y1),(x2,y2)" into upper-right, lower-left.
+func parseBoxText(s string) (ur, ll [2]float64, ok bool) {
+	s = strings.TrimSpace(s)
+	// Find the comma between the two coordinate pairs.
+	depth := 0
+	split := -1
+	for i, c := range s {
+		if c == '(' {
+			depth++
+		} else if c == ')' {
+			depth--
+		} else if c == ',' && depth == 0 {
+			split = i
+			break
+		}
+	}
+	if split < 0 {
+		return
+	}
+	p1, ok1 := parsePointText(s[:split])
+	p2, ok2 := parsePointText(s[split+1:])
+	if !ok1 || !ok2 {
+		return
+	}
+	return p1, p2, true
 }
 
 // matchSQLLike implements SQL LIKE pattern semantics: '%' matches
@@ -4015,6 +4111,44 @@ func evalAge(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	return NewIntervalDatum(totalMonths, int32(days)), nil
 }
 
+// buildIndexDefString delegates to catalog.BuildIndexDef. M0097-0023.
+func buildIndexDefString(idx *catalog.Index) string {
+	return catalog.BuildIndexDef(idx)
+}
+
+// buildConstraintDefString builds the pg_get_constraintdef text for a
+// UNIQUE, PRIMARY KEY, or EXCLUDE constraint backed by idx. M0097-0023.
+func buildConstraintDefString(idx *catalog.Index) string {
+	if idx.IsExclusion {
+		// EXCLUDE USING method (col WITH op) [INCLUDE (cols)]
+		var pairs []string
+		for _, col := range idx.Columns {
+			op := idx.ExclusionOp
+			if op == "" {
+				op = "="
+			}
+			pairs = append(pairs, col+" WITH "+op)
+		}
+		def := "EXCLUDE USING " + idx.Method + " (" + strings.Join(pairs, ", ") + ")"
+		if len(idx.IncludeColumns) > 0 {
+			def += " INCLUDE (" + strings.Join(idx.IncludeColumns, ", ") + ")"
+		}
+		return def
+	}
+	keyCols := "(" + strings.Join(idx.Columns, ", ") + ")"
+	var keyword string
+	if idx.Primary {
+		keyword = "PRIMARY KEY"
+	} else {
+		keyword = "UNIQUE"
+	}
+	def := keyword + " " + keyCols
+	if len(idx.IncludeColumns) > 0 {
+		def += " INCLUDE (" + strings.Join(idx.IncludeColumns, ", ") + ")"
+	}
+	return def
+}
+
 // evalMakeDate implements make_date(year, month, day) → date. M0097-0004.
 func evalMakeDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 3 {
@@ -6113,6 +6247,107 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(seqName), nil
 		}
 		return NullDatum, nil
+	case "pg_get_indexdef":
+		// pg_get_indexdef(indexrelid) → text — reconstructs CREATE INDEX DDL. M0097-0023.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		for _, idx := range ctx.Catalog.AllIndexes() {
+			if idx.OID != targetOID {
+				continue
+			}
+			return NewStringDatum(buildIndexDefString(idx)), nil
+		}
+		return NullDatum, nil
+
+	case "pg_get_constraintdef":
+		// pg_get_constraintdef(oid [, pretty bool]) → text
+		// Reconstructs the constraint definition DDL. M0097-0023.
+		// Handles UNIQUE/PRIMARY KEY/EXCLUDE constraints backed by indexes.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		for _, idx := range ctx.Catalog.AllIndexes() {
+			if idx.OID != targetOID || (!idx.IsConstraint && !idx.IsExclusion) {
+				continue
+			}
+			return NewStringDatum(buildConstraintDefString(idx)), nil
+		}
+		return NullDatum, nil
+
+	case "pg_get_expr":
+		// pg_get_expr(tree pg_node_tree, relation oid [, pretty bool]) → text
+		// Decompiles an internal expression tree. Stub: return empty string. M0097-0023.
+		return NewStringDatum(""), nil
+
+	case "point":
+		// point(x, y) → text "(x,y)" — minimal geometric point. M0097-0023.
+		if len(x.Args) == 2 {
+			av, aerr := evalExpr(x.Args[0], row, ctx)
+			bv, berr := evalExpr(x.Args[1], row, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if berr != nil {
+				return Datum{}, berr
+			}
+			ax, aok := datumAsFloat64(av)
+			bx, bok := datumAsFloat64(bv)
+			if aok && bok {
+				return NewStringDatum(fmt.Sprintf("(%g,%g)", ax, bx)), nil
+			}
+		}
+		return NullDatum, nil
+
+	case "box":
+		// box(point, point) → text "(max_x,max_y),(min_x,min_y)". M0097-0023.
+		if len(x.Args) == 2 {
+			av, aerr := evalExpr(x.Args[0], row, ctx)
+			bv, berr := evalExpr(x.Args[1], row, ctx)
+			if aerr != nil {
+				return Datum{}, aerr
+			}
+			if berr != nil {
+				return Datum{}, berr
+			}
+			as, aok := datumAsString(av)
+			bs, bok := datumAsString(bv)
+			if aok && bok {
+				p1, ok1 := parsePointText(as)
+				p2, ok2 := parsePointText(bs)
+				if ok1 && ok2 {
+					urx := math.Max(p1[0], p2[0])
+					ury := math.Max(p1[1], p2[1])
+					llx := math.Min(p1[0], p2[0])
+					lly := math.Min(p1[1], p2[1])
+					return NewStringDatum(fmt.Sprintf("(%g,%g),(%g,%g)", urx, ury, llx, lly)), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
 	case "pg_sequence_parameters":
 		// SRF returning sequence parameters — stub returns NULL.
 		return NullDatum, nil
@@ -7793,6 +8028,27 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NewStringDatum("text"), nil
 			}
 		}
+	case "format_type":
+		// format_type(oid, typemod) — returns the SQL name of a data type given
+		// its type OID and optional type modifier. Used by psql \d+ meta-commands.
+		// NULL OID → NULL result. typemod=-1 or NULL means no modifier.
+		// M0097-0023.
+		if len(x.Args) >= 1 {
+			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || oidArg.IsNull() {
+				return NullDatum, nil
+			}
+			typeOID := oidArg.Int
+			typmod := int64(-1)
+			if len(x.Args) >= 2 {
+				modArg, merr := evalExpr(x.Args[1], row, ctx)
+				if merr == nil && !modArg.IsNull() {
+					typmod = modArg.Int
+				}
+			}
+			name := formatTypeOID(typeOID, typmod)
+			return NewStringDatum(name), nil
+		}
 	case "pg_column_size":
 		if len(x.Args) == 1 {
 			v, err := evalExpr(x.Args[0], row, ctx)
@@ -9198,6 +9454,96 @@ func pgFormatTypeName(t string) string {
 		return "numeric"
 	}
 	return t
+}
+
+// formatTypeOID implements PostgreSQL's format_type(oid, typemod) built-in.
+// Maps well-known system type OIDs to their SQL display names. Unknown OIDs
+// return "???". Used by psql \d+ meta-commands. M0097-0023.
+func formatTypeOID(typeOID, typmod int64) string {
+	switch typeOID {
+	case 16:
+		return "boolean"
+	case 17:
+		return "bytea"
+	case 18:
+		return "\"char\""
+	case 19:
+		return "name"
+	case 20:
+		return "bigint"
+	case 21:
+		return "smallint"
+	case 22:
+		return "smallint[]"
+	case 23:
+		return "integer"
+	case 25:
+		return "text"
+	case 26:
+		return "oid"
+	case 27:
+		return "tid"
+	case 28:
+		return "xid"
+	case 29:
+		return "cid"
+	case 30:
+		return "oid[]"
+	case 114:
+		return "json"
+	case 142:
+		return "xml"
+	case 600:
+		return "point"
+	case 700:
+		return "real"
+	case 701:
+		return "double precision"
+	case 1005:
+		return "smallint[]"
+	case 1007:
+		return "integer[]"
+	case 1009:
+		return "text[]"
+	case 1016:
+		return "bigint[]"
+	case 1042:
+		if typmod > 4 {
+			return fmt.Sprintf("character(%d)", typmod-4)
+		}
+		return "character"
+	case 1043:
+		if typmod > 4 {
+			return fmt.Sprintf("character varying(%d)", typmod-4)
+		}
+		return "character varying"
+	case 1082:
+		return "date"
+	case 1083:
+		return "time without time zone"
+	case 1114:
+		return "timestamp without time zone"
+	case 1184:
+		return "timestamp with time zone"
+	case 1186:
+		return "interval"
+	case 1700:
+		return "numeric"
+	case 2249:
+		return "record"
+	case 2950:
+		return "uuid"
+	case 3614:
+		return "tsvector"
+	case 3615:
+		return "tsquery"
+	case 3802:
+		return "jsonb"
+	case 4072:
+		return "jsonpath"
+	default:
+		return "???"
+	}
 }
 
 // uuidToBytes parses a UUID string (any PG-accepted format) into 16 bytes.

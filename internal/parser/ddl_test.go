@@ -268,3 +268,32 @@ func TestParseAlterIndexAlterColumnSet(t *testing.T) {
 		t.Errorf("Actions[0].Kind = %v, want AlterTableAlterColumnSet", at.Actions[0].Kind)
 	}
 }
+
+// TestParseColumnDefCompression verifies that COMPRESSION method is silently
+// ignored in column definitions (PG 14+). goopg v0 doesn't track compression.
+func TestParseColumnDefCompression(t *testing.T) {
+	sql := `CREATE TABLE t (b varchar COMPRESSION pglz, c text COMPRESSION lz4 NOT NULL)`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(stmts))
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected *CreateTableStmt, got %T", stmts[0])
+	}
+	if len(ct.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(ct.Columns))
+	}
+	if ct.Columns[0].Name != "b" || ct.Columns[0].Type.Name != "varchar" {
+		t.Errorf("col[0]=%+v", ct.Columns[0])
+	}
+	if ct.Columns[1].Name != "c" || ct.Columns[1].Type.Name != "text" {
+		t.Errorf("col[1]=%+v", ct.Columns[1])
+	}
+	if !ct.Columns[1].NotNull {
+		t.Errorf("col[1].NotNull=false, want true")
+	}
+}

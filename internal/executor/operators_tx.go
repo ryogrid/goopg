@@ -100,6 +100,9 @@ func (o *transactionOp) execBegin() error {
 	o.ctx.Session.BeginExplicitTransaction(tx, snap)
 	o.ctx.Tx = tx
 	o.ctx.Snap = snap.Clone()
+	if o.ctx.BeginLocalTransaction != nil {
+		o.ctx.BeginLocalTransaction()
+	}
 	return nil
 }
 
@@ -154,6 +157,9 @@ func (o *transactionOp) execCommit() error {
 		_ = o.ctx.SyncRep.WaitForLSN(o.ctx.Ctx, o.ctx.WAL.WrittenLSN(), o.ctx.SyncCommitMode)
 	}
 	o.ctx.Session.EndExplicitTransaction()
+	if o.ctx.EndLocalTransaction != nil {
+		o.ctx.EndLocalTransaction()
+	}
 	// Clear pending routine drops — they're committed, no need to restore.
 	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
 		sess.TakePendingRoutineDrops()
@@ -190,6 +196,9 @@ func (o *transactionOp) execRollback() error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	o.ctx.Session.EndExplicitTransaction()
+	if o.ctx.EndLocalTransaction != nil {
+		o.ctx.EndLocalTransaction()
+	}
 	globalRelLockMgr.ReleaseSession(o.ctx.Session)
 	undoEnumDDLFromContext(o.ctx)
 	o.clearCtxTransaction()

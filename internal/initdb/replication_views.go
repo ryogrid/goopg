@@ -336,12 +336,18 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 			{Name: "oid", Type: catalog.Type{Name: "text"}},
 			{Name: "pubname", Type: catalog.Type{Name: "text"}},
 			{Name: "pubowner", Type: catalog.Type{Name: "text"}},
-			{Name: "puballtables", Type: catalog.Type{Name: "text"}},
-			{Name: "pubinsert", Type: catalog.Type{Name: "text"}},
-			{Name: "pubupdate", Type: catalog.Type{Name: "text"}},
-			{Name: "pubdelete", Type: catalog.Type{Name: "text"}},
-			{Name: "pubtruncate", Type: catalog.Type{Name: "text"}},
-			{Name: "pubviaroot", Type: catalog.Type{Name: "text"}},
+			// Boolean flags: declared bool so the analyzer types bare
+			// column refs as boolean. psql's `\d` publication probe issues
+			// `WHERE p.puballtables AND pg_relation_is_publishable(...)`,
+			// which fails with "operator AND requires boolean operands"
+			// if these are typed text. VirtualRows emits "t"/"f" (boolText),
+			// which TypedVirtualCell decodes to BooleanConst. M0097-0023.
+			{Name: "puballtables", Type: catalog.Type{Name: "bool"}},
+			{Name: "pubinsert", Type: catalog.Type{Name: "bool"}},
+			{Name: "pubupdate", Type: catalog.Type{Name: "bool"}},
+			{Name: "pubdelete", Type: catalog.Type{Name: "bool"}},
+			{Name: "pubtruncate", Type: catalog.Type{Name: "bool"}},
+			{Name: "pubviaroot", Type: catalog.Type{Name: "bool"}},
 		},
 		Virtual: true,
 	}

@@ -62,6 +62,11 @@ const (
 	OpBitNot       // ~a      (unary bitwise NOT)
 	OpBitShiftLeft  // a << b
 	OpBitShiftRight // a >> b
+
+	// Geometric operators (M0097-0023)
+	OpContainedBy // a <@ b  (a is contained by b)
+	OpContains    // a @> b  (a contains b)
+	OpOverlap     // a && b  (a overlaps b)
 )
 
 // ParseUnaryOp converts the token text the parser emits
@@ -140,6 +145,12 @@ func ParseBinaryOp(s string) OpCode {
 		return OpBitShiftLeft
 	case ">>":
 		return OpBitShiftRight
+	case "<@":
+		return OpContainedBy
+	case "@>":
+		return OpContains
+	case "&&":
+		return OpOverlap
 	}
 	return OpUnknown
 }
@@ -213,6 +224,12 @@ func (o OpCode) String() string {
 		return "<<"
 	case OpBitShiftRight:
 		return ">>"
+	case OpContainedBy:
+		return "<@"
+	case OpContains:
+		return "@>"
+	case OpOverlap:
+		return "&&"
 	}
 	return "<unknown>"
 }

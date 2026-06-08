@@ -2324,6 +2324,12 @@ func (p *parser) peekBinaryOp() (OpCode, int, bool) {
 			return OpBitOr, precBitOr, true
 		case "#":
 			return OpBitXor, precBitXor, true
+		case "<@":
+			return OpContainedBy, precCompare, true
+		case "@>":
+			return OpContains, precCompare, true
+		case "&&":
+			return OpOverlap, precCompare, true
 		}
 	case TokenSymbol:
 		// '*' is also a symbol token (target-list wildcard) — but in

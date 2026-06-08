@@ -114,6 +114,10 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateOpClass(s)
 	case *parser.CompatNoopStmt:
 		return nil, o.execCompatNoop(s)
+	case *parser.CommentOnStmt:
+		return nil, o.execCommentOn(s)
+	case *parser.CreateStatisticsStmt:
+		return nil, o.execCreateStatistics(s)
 	case *parser.LockTableStmt:
 		return nil, o.execLockTable(s)
 	case *parser.DoStmt:
@@ -319,7 +323,23 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 }
 
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
-	if _, exists := o.ctx.Catalog.LookupTable(s.Name); exists {
+	// Pre-resolve schema from search_path before the existence check so that
+	// CREATE TABLE ctlt1 in ctl_schema context doesn't falsely collide with
+	// public.ctlt1 (which shares the bare "ctlt1" catalog key). M0097-0023.
+	if s.Name.Schema == "" && !s.Temporary {
+		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
+			s.Name.Schema = ws
+		}
+	}
+	// For the existence check, use a schema-qualified name so that unqualified
+	// names like "pg_attrdef" don't match pg_catalog virtual tables.
+	// CREATE TABLE pg_attrdef should create a user table, not conflict with
+	// pg_catalog.pg_attrdef. M0097-0023.
+	checkName := s.Name
+	if checkName.Schema == "" && !s.Temporary {
+		checkName.Schema = "public"
+	}
+	if _, exists := o.ctx.Catalog.LookupTable(checkName); exists {
 		if s.IfNotExists {
 			o.ctx.Notices = append(o.ctx.Notices,
 				fmt.Sprintf("relation %q already exists, skipping", s.Name.String()))
@@ -381,6 +401,25 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				for _, ec := range cols {
 					if strings.EqualFold(ec.Name, pc.Name) {
 						found = true
+						// Detect storage parameter conflicts between multiple INHERITS parents.
+						pcStor := strings.ToLower(pc.Storage)
+						ecStor := strings.ToLower(ec.Storage)
+						if pcStor == "" {
+							pcStor = "extended"
+						}
+						if ecStor == "" {
+							ecStor = "extended"
+						}
+						// PostgreSQL emits the merging notice BEFORE reporting the conflict.
+						o.ctx.AddNotice(fmt.Sprintf("merging multiple inherited definitions of column %q", pc.Name))
+						if pcStor != ecStor {
+							return &ExecError{
+								Code:    "42611",
+								Pos:     s.Pos(),
+								Message: fmt.Sprintf("column %q has a storage parameter conflict", pc.Name),
+								Detail:  fmt.Sprintf("%s versus %s", strings.ToUpper(ecStor), strings.ToUpper(pcStor)),
+							}
+						}
 						break
 					}
 				}
@@ -396,9 +435,35 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	for _, c := range cols {
 		inheritedColNames[strings.ToLower(c.Name)] = true
 	}
+	// Build a set of INHERITS parent OIDs so LIKE can detect overlap. M0097-0023.
+	inheritParentOIDSet := make(map[uint32]bool, len(inheritParents))
+	for _, p := range inheritParents {
+		inheritParentOIDSet[p.OID] = true
+	}
 
 	// CHECK constraints to inherit from LIKE INCLUDING CONSTRAINTS clauses.
-	var likeCheckConstraints []string
+	// Carries the source constraint name so the copy keeps its identity
+	// (PostgreSQL preserves the original CHECK constraint name on LIKE
+	// INCLUDING CONSTRAINTS). M0097-0023.
+	var likeCheckConstraints []catalog.NamedCheckConstraint
+	// Indexes to copy from LIKE INCLUDING INDEXES clauses (non-PK unique indexes).
+	var likeUniqueIndexes []*catalog.Index
+	// Non-unique plain indexes to copy from LIKE INCLUDING INDEXES clauses.
+	var likeNonUniqueIndexes []*catalog.Index
+	// Source tables for LIKE INCLUDING COMMENTS (pairs: srcTable, indexPrefix).
+	type likeCommentSource struct{ src *catalog.Table }
+	var likeCommentSources []likeCommentSource
+	// Source tables for LIKE INCLUDING STATISTICS. M0097-0023.
+	type likeStatisticsSource struct{ src *catalog.Table }
+	var likeStatisticsSources []likeStatisticsSource
+	// NOT NULL constraints to copy from LIKE sources (preserving source name).
+	// Maps col name (lower) → NamedNotNullConstraint from source table. M0097-0023.
+	type likeNotNullEntry struct {
+		name      string
+		colName   string
+		noInherit bool
+	}
+	likeNotNullByCol := make(map[string]likeNotNullEntry)
 	// Append body elements in declaration order: explicit columns and LIKE clauses
 	// interleaved by their BodyOrder. M0097-0069.
 	if len(s.BodyOrder) > 0 {
@@ -414,6 +479,22 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			src, ok := o.ctx.Catalog.LookupTable(likeName)
 			if ok {
 				likeByKey["@@LIKE:"+likeName.String()] = src
+			} else if LookupSequence(likeName.String()) != nil {
+				return &ExecError{
+					Code:    "42809",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("relation %q is invalid in LIKE clause", likeName.Name),
+					Detail:  "This operation is not supported for sequences.",
+				}
+			} else if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && im.HasCompositeType(likeName.Name) {
+				// Composite types are valid LIKE sources in PostgreSQL; goopg
+				// doesn't evaluate their fields, so we produce no columns from them.
+			} else {
+				return &ExecError{
+					Code:    "42P01",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("relation %q does not exist", likeName.Name),
+				}
 			}
 		}
 		addCol := func(c parser.ColumnDef) {
@@ -444,9 +525,19 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				includeGenerated := strings.Contains(likeFlags, ":+generated")
 				includeDefaults := strings.Contains(likeFlags, ":+defaults")
 				includeConstraints := strings.Contains(likeFlags, ":+constraints")
+				includeIndexes := strings.Contains(likeFlags, ":+indexes")
+				includeComments := strings.Contains(likeFlags, ":+comments")
+				includeStatistics := strings.Contains(likeFlags, ":+statistics")
+				includeStorage := strings.Contains(likeFlags, ":+storage")
 				src, ok := likeByKey[baseKey]
 				if !ok {
 					continue
+				}
+				if includeComments {
+					likeCommentSources = append(likeCommentSources, likeCommentSource{src: src})
+				}
+				if includeStatistics {
+					likeStatisticsSources = append(likeStatisticsSources, likeStatisticsSource{src: src})
 				}
 				for _, sc := range src.Columns {
 					colNameLower := strings.ToLower(sc.Name)
@@ -459,9 +550,32 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					}
 					if found {
 						if inheritedColNames[colNameLower] {
-							// Column came from INHERITS — emit NOTICE "merging column X with
-							// inherited definition" and skip (matches PostgreSQL merge semantics).
+							// PostgreSQL emits the merging NOTICE before the storage conflict error.
 							o.ctx.AddNotice(fmt.Sprintf("merging column %q with inherited definition", sc.Name))
+							// Check for storage conflict when INCLUDING STORAGE.
+							if includeStorage {
+								for _, ec := range cols {
+									if strings.EqualFold(ec.Name, sc.Name) {
+										ecStor := strings.ToLower(ec.Storage)
+										scStor := strings.ToLower(sc.Storage)
+										if ecStor == "" {
+											ecStor = "extended"
+										}
+										if scStor == "" {
+											scStor = "extended"
+										}
+										if ecStor != scStor {
+											return &ExecError{
+												Code:    "42611",
+												Pos:     s.Pos(),
+												Message: fmt.Sprintf("inherited column %q has a storage parameter conflict", sc.Name),
+												Detail:  fmt.Sprintf("%s versus %s", strings.ToUpper(ecStor), strings.ToUpper(scStor)),
+											}
+										}
+										break
+									}
+								}
+							}
 						} else {
 							// Column already defined by an explicit column or a previous LIKE clause.
 							// PostgreSQL raises "column X specified more than once" (42701).
@@ -473,18 +587,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 						}
 						// Either way, skip (don't add the column again) and continue.
 						if includeConstraints {
-							for _, chk := range src.CheckConstraints {
-								found := false
-								for _, existing := range likeCheckConstraints {
-									if existing == chk {
-										found = true
-										break
-									}
-								}
-								if !found {
-									likeCheckConstraints = append(likeCheckConstraints, chk)
-								}
-							}
+							likeCheckConstraints = appendLikeChecks(likeCheckConstraints, src)
 						}
 						continue
 					}
@@ -502,21 +605,73 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					if !includeDefaults {
 						c.DefaultExpr = nil
 					}
+					// Clear Storage unless INCLUDING STORAGE or INCLUDING ALL was specified.
+					if !includeStorage {
+						c.Storage = ""
+					}
 					cols = append(cols, c)
+					// Carry forward the source table's NOT NULL constraint name for
+					// this column (if one exists), so comments can be copied by name.
+					if sc.NotNull {
+						for _, nnc := range src.NotNullConstraints {
+							if strings.EqualFold(nnc.ColName, sc.Name) {
+								colKey := strings.ToLower(sc.Name)
+								if _, alreadyMapped := likeNotNullByCol[colKey]; !alreadyMapped {
+									likeNotNullByCol[colKey] = likeNotNullEntry{
+										name:      nnc.Name,
+										colName:   sc.Name,
+										noInherit: nnc.NoInherit,
+									}
+								}
+								break
+							}
+						}
+					}
 					// Copy CHECK constraints from source table when INCLUDING CONSTRAINTS.
 					if includeConstraints {
-						for _, chk := range src.CheckConstraints {
-							// Avoid duplicating constraints already present (e.g. from column-level).
-							found := false
-							for _, existing := range likeCheckConstraints {
-								if existing == chk {
-									found = true
+						likeCheckConstraints = appendLikeChecks(likeCheckConstraints, src)
+					}
+				}
+				// Copy indexes when INCLUDING INDEXES.
+				if includeIndexes {
+					if im2, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+						if im2.HasPrimaryKey(src) {
+							// Check if new table already has a PK (from explicit columns or prior LIKE).
+							if len(s.PrimaryKey) > 0 {
+								return &ExecError{
+									Code:    "42P16",
+									Pos:     s.Pos(),
+									Message: fmt.Sprintf("multiple primary keys for table %q are not allowed", s.Name.Name),
+								}
+							}
+							// Copy PK columns from source.
+							for _, idx := range im2.IndexesOnTable(src) {
+								if idx.Primary {
+									s.PrimaryKey = append(s.PrimaryKey, idx.Columns...)
 									break
 								}
 							}
-							if !found {
-								likeCheckConstraints = append(likeCheckConstraints, chk)
+						}
+						// Copy unique (non-PK) non-partial indexes and non-unique plain indexes.
+						for _, idx := range im2.IndexesOnTable(src) {
+							if idx.Primary || idx.HasPredicate || idx.IsExclusion {
+								continue
 							}
+							if idx.Unique {
+								likeUniqueIndexes = append(likeUniqueIndexes, idx)
+							} else {
+								likeNonUniqueIndexes = append(likeNonUniqueIndexes, idx)
+							}
+						}
+					}
+				}
+				// Emit "merging constraint" NOTICEs when the LIKE source is also an
+				// INHERITS parent. In PG, INHERITS propagates CHECK constraints, so LIKE's
+				// copy "merges" with the inherited copy. M0097-0023.
+				if includeConstraints && inheritParentOIDSet[src.OID] {
+					for _, nc := range src.NamedChecks {
+						if nc.Name != "" {
+							o.ctx.AddNotice(fmt.Sprintf("merging constraint %q with inherited definition", nc.Name))
 						}
 					}
 				}
@@ -546,17 +701,42 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			})
 		}
 	}
+	// PG18: NO INHERIT constraints cannot be added to partitioned tables. M0097-0023.
+	if s.PartitionBy != nil {
+		// Check LIKE-sourced NOT NULL constraints.
+		for _, entry := range likeNotNullByCol {
+			if entry.noInherit {
+				return &ExecError{
+					Code:    "42P16",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
+				}
+			}
+		}
+		// Check LIKE-sourced CHECK constraints.
+		for _, nc := range likeCheckConstraints {
+			if nc.NoInherit {
+				return &ExecError{
+					Code:    "42P16",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
+				}
+			}
+		}
+		// Check explicit column NOT NULL NO INHERIT.
+		for _, c := range s.Columns {
+			if c.NotNullNoInherit || c.CheckNoInherit {
+				return &ExecError{
+					Code:    "42P16",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
+				}
+			}
+		}
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
-	}
-	// If the table was created without an explicit schema qualifier, record the
-	// resolved writable schema so TablesInSchema() can find it for DROP CASCADE.
-	// Temp tables are session-scoped and not schema-tracked. M0097-0022.
-	if s.Name.Schema == "" && !s.Temporary {
-		if ws := currentWritableSchema(o.ctx); ws != "" && !strings.EqualFold(ws, "public") {
-			tbl.Schema = ws
-		}
 	}
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
@@ -640,6 +820,51 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 	}
 
+	// Named UNIQUE/PRIMARY KEY/EXCLUDE constraints with optional INCLUDE columns. M0097-0023.
+	// These override the generic PK/UNIQUE index name with the constraint name.
+	namedPKCreated := false
+	for _, nc := range s.NamedConstraints {
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: nc.Name}
+		if nc.IsExclusion {
+			if nc.ExclusionOp == "=" && strings.ToLower(nc.Method) == "btree" {
+				// btree equality exclusion == unique constraint: build a real btree
+				// so checkExclusionConstraintsForInsert can probe it at INSERT time.
+				if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, false, false); err != nil {
+					return err
+				}
+				if idx, ok2 := o.ctx.Catalog.LookupIndex(idxName); ok2 {
+					idx.IsExclusion = true
+					idx.ExclusionOp = "="
+					idx.IncludeColumns = nc.IncludeColumns
+					idx.IsConstraint = true
+				}
+			} else {
+				// Other exclusion operators: stub catalog entry; no enforcement in v0.
+				if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, nc); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		primary := nc.IsPrimary
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, true, primary); err != nil {
+			return err
+		}
+		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			idx.IsConstraint = true
+			idx.IncludeColumns = nc.IncludeColumns
+		}
+		if primary {
+			namedPKCreated = true
+			// PRIMARY KEY implies NOT NULL on all key columns (SQL standard).
+			for _, pkCol := range nc.Columns {
+				if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
+					col.NotNull = true
+				}
+			}
+		}
+	}
+
 	// Primary key index creation (M0096-0005).
 	//
 	// Two syntactic forms are supported:
@@ -658,13 +883,23 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 	}
-	if len(pkCols) > 0 {
+	if len(pkCols) > 0 && !namedPKCreated {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_pkey"}
 		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, nil, true, true); err != nil {
 			// Propagate B-tree index errors (e.g. unsupported key type).
 			// This makes CREATE TABLE fail cleanly rather than silently creating
 			// a table without its primary key constraint.
 			return err
+		}
+		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			idx.IsConstraint = true
+			idx.IncludeColumns = s.PrimaryKeyInclude
+		}
+		// PRIMARY KEY implies NOT NULL on all key columns (SQL standard).
+		for _, pkCol := range pkCols {
+			if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
+				col.NotNull = true
+			}
 		}
 	}
 	// Create btree indexes for inline column-level UNIQUE constraints.
@@ -675,33 +910,307 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false); err != nil {
 				return err
 			}
+			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+				idx.IsConstraint = true
+			}
 		}
 	}
-	// Create btree indexes for table-level UNIQUE (col1, col2) constraints.
+	// Create btree indexes for table-level UNIQUE (col1, col2) [INCLUDE (…)] constraints.
 	// e.g. `UNIQUE (a, b)` — M0097-0028.
 	for i, cols := range s.TableUniques {
-		suffix := "_key"
-		if len(cols) == 1 {
-			suffix = "_" + cols[0] + "_key"
+		var inclCols []string
+		if i < len(s.TableUniqueIncludes) {
+			inclCols = s.TableUniqueIncludes[i]
 		}
-		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: fmt.Sprintf("%s%s%d", tbl.Name, suffix, i)}
-		if len(s.TableUniques) == 1 {
-			idxName.Name = tbl.Name + suffix
-		}
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: o.autoIndexNameWithIncludes(tbl, cols, inclCols, "key")}
 		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, cols, nil, true, false); err != nil {
 			return err
 		}
-	}
-	// Register CHECK constraints from columns and table-level. M0097-0014.
-	for _, c := range s.Columns {
-		if c.CheckExpr != "" {
-			tbl.CheckConstraints = append(tbl.CheckConstraints, c.CheckExpr)
+		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			idx.IsConstraint = true
+			idx.IncludeColumns = inclCols
 		}
 	}
-	tbl.CheckConstraints = append(tbl.CheckConstraints, s.TableChecks...)
+	// Create indexes for anonymous EXCLUDE USING constraints. M0097-0023.
+	for _, ec := range s.TableExclusions {
+		name := ec.Name
+		if name == "" {
+			name = o.autoIndexNameWithIncludes(tbl, ec.Columns, ec.IncludeColumns, "excl")
+		}
+		ec.Name = name
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: name}
+		if ec.ExclusionOp == "=" && strings.ToLower(ec.Method) == "btree" {
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false); err != nil {
+				return err
+			}
+			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+				idx.IsExclusion = true
+				idx.ExclusionOp = "="
+				idx.IncludeColumns = ec.IncludeColumns
+				idx.IsConstraint = true
+			}
+		} else {
+			if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, ec); err != nil {
+				return err
+			}
+		}
+	}
+	// Create btree indexes for LIKE INCLUDING INDEXES unique (non-PK) indexes.
+	for _, idx := range likeUniqueIndexes {
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + strings.Join(idx.Columns, "_") + "_key"}
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, nil, true, false); err != nil {
+			return err
+		}
+	}
+	// Create btree indexes for LIKE INCLUDING INDEXES non-unique plain indexes.
+	// PostgreSQL copies all non-partial non-PK non-exclusion indexes; non-unique
+	// ones get auto-generated names with the "_idx" suffix. M0097-0023.
+	for _, idx := range likeNonUniqueIndexes {
+		// For expression columns (Columns[i]==""), use "expr" as the name part.
+		nameCols := make([]string, len(idx.Columns))
+		for i, c := range idx.Columns {
+			if c == "" {
+				nameCols[i] = "expr"
+			} else {
+				nameCols[i] = c
+			}
+		}
+		var colExprs []parser.Expr
+		if idx.ColExprs != nil {
+			colExprs = make([]parser.Expr, len(idx.ColExprs))
+			for i, ce := range idx.ColExprs {
+				if ce != nil {
+					colExprs[i] = *ce
+				}
+			}
+		}
+		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: o.autoIndexNameWithIncludes(tbl, nameCols, nil, "idx")}
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, colExprs, false, false); err != nil {
+			continue // skip indexes with unsupported expression types
+		}
+	}
+	// Register CHECK constraints from columns and table-level. M0097-0014.
+	// CheckConstraints and NamedChecks are kept parallel (index i ↔ index i)
+	// via Table.AddCheck so the enforcement path can recover the constraint
+	// name for violation messages. Inline/table-level checks are anonymous in
+	// the current parser, so they get empty names (invisible to pg_constraint).
+	// Column-level CHECKs are auto-named using PostgreSQL's convention
+	// {tablename}_{colname}_check (mirrors how PG assigns names in DDL). M0097-0023.
+	for _, c := range s.Columns {
+		if c.CheckExpr != "" {
+			autoName := tbl.Name + "_" + c.Name + "_check"
+			tbl.AddCheck(autoName, c.CheckExpr, o.allocConstraintOID(autoName))
+		}
+	}
+	for _, chk := range s.TableChecks {
+		tbl.AddCheck("", chk, 0)
+	}
+	// Copy statistics from LIKE INCLUDING STATISTICS (or INCLUDING ALL) sources. M0097-0023.
+	if len(likeStatisticsSources) > 0 {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			const oidPgStatExt = uint32(3381)
+			for _, lss := range likeStatisticsSources {
+				for _, srcStat := range im.AllStatistics() {
+					if srcStat.TableOID != lss.src.OID {
+						continue
+					}
+					newName := deriveStatisticsName(srcStat.Name, lss.src.Name, tbl.Name)
+					newStat := im.RegisterStatistics(srcStat.Schema, newName, tbl.OID)
+					// Copy any existing comment for this statistics object.
+					if desc, ok := im.GetComment(oidPgStatExt, srcStat.OID, 0); ok && desc != "" {
+						im.SetComment(oidPgStatExt, newStat.OID, 0, desc)
+					}
+				}
+			}
+		}
+	}
 	// Apply LIKE INCLUDING CONSTRAINTS checks (copied from LIKE source tables).
-	tbl.CheckConstraints = append(tbl.CheckConstraints, likeCheckConstraints...)
+	// PostgreSQL preserves the source constraint name; the name is retained so
+	// enforcement can report it. Named constraints get a fresh OID so they
+	// surface through pg_constraint (the LEFT JOIN column-mapping crash that
+	// previously masked this was fixed in M0097-0023-loop34). M0097-0023.
+	for _, nc := range likeCheckConstraints {
+		tbl.AddCheck(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name))
+	}
+	// PG18: register named NOT NULL constraints for every NOT-NULL column.
+	// LIKE INCLUDING ALL/CONSTRAINTS preserves the source constraint name;
+	// explicit or inherited columns get auto-name <tablename>_<colname>_not_null.
+	// M0097-0023.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		pkColSet := make(map[string]bool, len(pkCols))
+		for _, pk := range pkCols {
+			pkColSet[strings.ToLower(pk)] = true
+		}
+		for _, nc := range s.NamedConstraints {
+			if nc.IsPrimary {
+				for _, pc := range nc.Columns {
+					pkColSet[strings.ToLower(pc)] = true
+				}
+			}
+		}
+		// Build set of explicit column defs that carry NOT NULL NO INHERIT.
+		explicitNoInherit := make(map[string]bool)
+		for _, origCol := range s.Columns {
+			if origCol.NotNullNoInherit {
+				explicitNoInherit[strings.ToLower(origCol.Name)] = true
+			}
+		}
+		for _, col := range tbl.Columns {
+			if !col.NotNull || pkColSet[strings.ToLower(col.Name)] {
+				continue
+			}
+			colKey := strings.ToLower(col.Name)
+			noInherit := explicitNoInherit[colKey]
+			name := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+			if entry, ok2 := likeNotNullByCol[colKey]; ok2 {
+				// LIKE INCLUDING preserves the source NOT NULL constraint name.
+				if entry.name != "" {
+					name = entry.name
+				}
+				if entry.noInherit {
+					noInherit = true
+				}
+			}
+			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit)
+		}
+	}
+	// Copy pg_description comments from LIKE INCLUDING COMMENTS sources:
+	// indexes (matched by column set), named CHECK constraints (matched by name),
+	// and table columns (matched by name). M0097-0023.
+	if len(likeCommentSources) > 0 {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			const (
+				oidPgClass      = uint32(1259)
+				oidPgConstraint = uint32(2606)
+			)
+			dstIndexes := im.IndexesOnTable(tbl)
+			for _, lcs := range likeCommentSources {
+				// Index comments — match by column set.
+				for _, srcIdx := range im.IndexesOnTable(lcs.src) {
+					desc, hasComment := im.GetComment(oidPgClass, srcIdx.OID, 0)
+					if !hasComment || desc == "" {
+						continue
+					}
+					for _, dstIdx := range dstIndexes {
+						if likeIndexColsMatch(srcIdx.Columns, dstIdx.Columns) {
+							im.SetComment(oidPgClass, dstIdx.OID, 0, desc)
+							break
+						}
+					}
+				}
+				// Named CHECK constraint comments — match by constraint name.
+				for _, srcNC := range lcs.src.NamedChecks {
+					if srcNC.OID == 0 {
+						continue
+					}
+					desc, hasComment := im.GetComment(oidPgConstraint, srcNC.OID, 0)
+					if !hasComment || desc == "" {
+						continue
+					}
+					for _, dstNC := range tbl.NamedChecks {
+						if strings.EqualFold(srcNC.Name, dstNC.Name) && dstNC.OID != 0 {
+							im.SetComment(oidPgConstraint, dstNC.OID, 0, desc)
+							break
+						}
+					}
+				}
+				// Named NOT NULL constraint comments — match by column name from LIKE
+				// source then map source OID → dest OID via the new table's constraints.
+				for _, srcNN := range lcs.src.NotNullConstraints {
+					if srcNN.OID == 0 {
+						continue
+					}
+					desc, hasComment := im.GetComment(oidPgConstraint, srcNN.OID, 0)
+					if !hasComment || desc == "" {
+						continue
+					}
+					for _, dstNN := range tbl.NotNullConstraints {
+						if strings.EqualFold(srcNN.ColName, dstNN.ColName) && dstNN.OID != 0 {
+							im.SetComment(oidPgConstraint, dstNN.OID, 0, desc)
+							break
+						}
+					}
+				}
+				// Column comments — match by column name.
+				for i, srcCol := range lcs.src.Columns {
+					desc, hasComment := im.GetComment(oidPgClass, lcs.src.OID, int32(i+1))
+					if !hasComment || desc == "" {
+						continue
+					}
+					for j, dstCol := range tbl.Columns {
+						if strings.EqualFold(srcCol.Name, dstCol.Name) {
+							im.SetComment(oidPgClass, tbl.OID, int32(j+1), desc)
+							break
+						}
+					}
+				}
+			}
+		}
+	}
 	return nil
+}
+
+// allocConstraintOID returns a fresh catalog OID for a named constraint, or
+// 0 for an anonymous one. Anonymous CHECK constraints are kept at OID 0 so
+// pg_constraint's VirtualRows (which skips empty-name / zero-OID rows) does
+// not surface them — the current parser leaves inline/table-level checks
+// unnamed, and PG-faithful auto-naming is a separate follow-up. A named
+// constraint gets a real OID so psql \d and pg_constraint queries see it.
+// M0097-0023.
+// deriveStatisticsName computes the name for a statistics object copied from
+// srcTableName to dstTableName. If the stat name starts with srcTableName_,
+// that prefix is replaced with dstTableName_; otherwise srcTableName_ prefix is
+// prepended. M0097-0023.
+func deriveStatisticsName(statName, srcTableName, dstTableName string) string {
+	prefix := srcTableName + "_"
+	if strings.HasPrefix(strings.ToLower(statName), strings.ToLower(prefix)) {
+		return dstTableName + "_" + statName[len(prefix):]
+	}
+	return dstTableName + "_" + statName
+}
+// likeIndexColsMatch returns true when two index column lists are identical
+// (case-insensitive). Empty-string entries (expression columns) match each other.
+func likeIndexColsMatch(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !strings.EqualFold(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (o *ddlOp) allocConstraintOID(name string) uint32 {
+	if name == "" || o.ctx == nil || o.ctx.Catalog == nil {
+		return 0
+	}
+	return o.ctx.Catalog.AllocOID()
+}
+
+// appendLikeChecks copies src's CHECK constraints (name + expression) into
+// dst for a LIKE INCLUDING CONSTRAINTS clause, deduplicating by expression so
+// a constraint already inherited (e.g. from a column-level definition) is not
+// added twice. M0097-0023.
+func appendLikeChecks(dst []catalog.NamedCheckConstraint, src *catalog.Table) []catalog.NamedCheckConstraint {
+	for i, expr := range src.CheckConstraints {
+		nc := catalog.NamedCheckConstraint{Expr: expr}
+		if i < len(src.NamedChecks) {
+			nc = src.NamedChecks[i]
+		}
+		dup := false
+		for _, existing := range dst {
+			if existing.Expr == nc.Expr {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			dst = append(dst, nc)
+		}
+	}
+	return dst
 }
 
 // execCreateTableAs implements `CREATE TABLE name AS SELECT …`.
@@ -1150,9 +1659,9 @@ func deriveTargetName(e parser.Expr) string {
 // transitiveDep describes a single view or materialized view that will be
 // transitively dropped when its parent is dropped with CASCADE.
 type transitiveDep struct {
-	kind       string             // "view" or "materialized view"
+	kind       string // "view" or "materialized view"
 	name       parser.ObjectName
-	parentKind string             // "table", "view", or "materialized view"
+	parentKind string // "table", "view", or "materialized view"
 	parentName parser.ObjectName
 }
 
@@ -1438,7 +1947,19 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP TABLE requires Pool in Context"}
 	}
+	// Track tables already dropped by cascade during this statement so we can skip
+	// them if they also appear explicitly in s.Names (avoids "does not exist" errors).
+	cascadeDropped := make(map[string]bool)
+	// Pre-build the explicit drop set so we can suppress cascade notices for tables
+	// that are also being dropped explicitly (PostgreSQL doesn't emit those notices).
+	explicitDropSet := make(map[string]bool, len(s.Names))
+	for _, n := range s.Names {
+		explicitDropSet[n.String()] = true
+	}
 	for _, name := range s.Names {
+		if cascadeDropped[name.String()] {
+			continue // already removed by cascade from a prior table in this statement
+		}
 		if s.IfExists && o.dropSchemaQualifiedNotice(name) {
 			continue
 		}
@@ -1476,25 +1997,55 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				return err
 			}
 			if s.Behavior == parser.DropCascade {
-				inheritChildren := im.InheritanceChildren(tbl.OID)
-				if len(inheritChildren) == 1 {
-					childName := parser.ObjectName{Schema: inheritChildren[0].Schema, Name: inheritChildren[0].Name}
+				// Recursively collect all inheritance descendants (depth-first) so that
+				// grandchildren of a child-that-is-also-explicit are also dropped.
+				// When ctla→ctlb→inhe and ctla+ctlb are explicit, dropping ctla cascades
+				// ctlb (explicit, no notice) but we must still cascade ctlb→inhe.
+				// M0097-0023.
+				var collectInheritanceTree func(parent *catalog.Table) []*catalog.Table
+				collectInheritanceTree = func(parent *catalog.Table) []*catalog.Table {
+					var result []*catalog.Table
+					for _, child := range im.InheritanceChildren(parent.OID) {
+						childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+						if cascadeDropped[childName.String()] {
+							continue
+						}
+						result = append(result, child)
+						result = append(result, collectInheritanceTree(child)...)
+					}
+					return result
+				}
+				allDescendants := collectInheritanceTree(tbl)
+				// Emit cascade notices for descendants not in the explicit drop list.
+				var noticeChildren []*catalog.Table
+				for _, child := range allDescendants {
+					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+					if !explicitDropSet[childName.String()] && !cascadeDropped[childName.String()] {
+						noticeChildren = append(noticeChildren, child)
+					}
+				}
+				if len(noticeChildren) == 1 {
+					childName := parser.ObjectName{Schema: noticeChildren[0].Schema, Name: noticeChildren[0].Name}
 					o.ctx.AddNotice(fmt.Sprintf("drop cascades to table %s", childName.String()))
-				} else if len(inheritChildren) > 1 {
+				} else if len(noticeChildren) > 1 {
 					// PostgreSQL emits summary NOTICE + DETAIL listing each child.
 					// Normalizer strips DETAIL prefix and moves all lines to error section.
-					detail := make([]string, len(inheritChildren))
-					for i, child := range inheritChildren {
+					detail := make([]string, len(noticeChildren))
+					for i, child := range noticeChildren {
 						childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
 						detail[i] = fmt.Sprintf("drop cascades to table %s", childName.String())
 					}
 					o.ctx.AddNoticeWithDetail(
-						fmt.Sprintf("drop cascades to %d other objects", len(inheritChildren)),
+						fmt.Sprintf("drop cascades to %d other objects", len(noticeChildren)),
 						strings.Join(detail, "\n"),
 					)
 				}
-				for _, child := range inheritChildren {
+				for _, child := range allDescendants {
 					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
+					if cascadeDropped[childName.String()] {
+						continue
+					}
+					cascadeDropped[childName.String()] = true
 					if err := o.dropTableByRef(childName, child); err != nil {
 						return err
 					}
@@ -1550,10 +2101,10 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				// Collect all dependents in display order: views, matviews (including transitively
 				// reached via view chains), then functions.
 				type cascadeDep struct {
-					kind     string             // "view", "materialized view", or "function"
-					display  string             // full display text, e.g. "view functestv3"
-					viewName parser.ObjectName  // for view/matview drops
-					routine  *catalog.Routine   // for function drops
+					kind     string            // "view", "materialized view", or "function"
+					display  string            // full display text, e.g. "view functestv3"
+					viewName parser.ObjectName // for view/matview drops
+					routine  *catalog.Routine  // for function drops
 				}
 				var deps []cascadeDep
 				seen := map[string]bool{}
@@ -1764,7 +2315,11 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error
 	}
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	relOID := tbl.OID
-	if err := o.ctx.Catalog.DropTable(name); err != nil {
+	// Use the table's stored name for DropTable so that bare-keyed tables
+	// (schema="") found via a schema-qualified lookup can be removed correctly.
+	// M0097-0023.
+	dropName := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
+	if err := o.ctx.Catalog.DropTable(dropName); err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
 	// If this table was shadowing a permanent one, restore it. M0097-0003.
@@ -1837,7 +2392,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	}
 	name := s.Name
 	if name == "" {
-		name = o.autoIndexName(tbl, s.Columns, "idx")
+		name = o.autoIndexNameWithIncludes(tbl, s.Columns, s.IncludeColumns, "idx")
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
 	if _, exists := o.ctx.Catalog.LookupIndex(idxName); exists {
@@ -1856,8 +2411,41 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			Detail:  "Valid values are between \"10\" and \"100\"."}
 	}
 	method := strings.ToLower(strings.TrimSpace(s.Method))
-	if method == "" || method == "hash" {
+	if method == "rtree" {
+		o.ctx.AddNotice("substituting access method \"gist\" for obsolete method \"rtree\"")
+		method = "gist"
+	}
+	if method == "" {
 		method = "btree"
+	}
+	// brin, gin, hash do not support INCLUDE columns; hash is silently upgraded
+	// to btree only when there are no INCLUDE columns. M0097-0023.
+	if len(s.IncludeColumns) > 0 {
+		switch method {
+		case "brin", "gin", "hash":
+			return &ExecError{Code: "0A000", Pos: s.Pos(),
+				Message: fmt.Sprintf("access method \"%s\" does not support included columns", method)}
+		}
+	}
+	if method == "hash" {
+		method = "btree"
+	}
+	// gist and spgist: register catalog metadata only (no physical storage).
+	// pg_index / pg_class / pg_get_indexdef queries work correctly; no actual
+	// index acceleration or constraint enforcement.
+	if method == "gist" || method == "spgist" {
+		idx, createErr := o.ctx.Catalog.CreateIndex(idxName, tbl, s.Columns, s.Unique, method, false)
+		if createErr != nil {
+			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: createErr.Error()}
+		}
+		idx.HasPredicate = s.HasPredicate
+		idx.IncludeColumns = s.IncludeColumns
+		if catalogHeapSyncAvailable(o.ctx) {
+			if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
+				return fmt.Errorf("DDL catalog sync: %w", syncErr)
+			}
+		}
+		return nil
 	}
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
@@ -1865,10 +2453,11 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false); err != nil {
 		return err
 	}
-	// Mark partial indexes so they are excluded from REFRESH CONCURRENTLY checks.
-	if s.HasPredicate {
+	// Store INCLUDE columns and partial index flag on the newly created index.
+	if s.HasPredicate || len(s.IncludeColumns) > 0 {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
-			idx.HasPredicate = true
+			idx.HasPredicate = s.HasPredicate
+			idx.IncludeColumns = s.IncludeColumns
 		}
 	}
 	return nil
@@ -1981,6 +2570,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						Detail:  detail,
 					}
 				}
+				if act.Kind == parser.AlterTableSetStatistics {
+					if err := o.execIndexSetStatistics(s.Name.Name, idx, act); err != nil {
+						return err
+					}
+				}
 			}
 			// Other ALTER actions on index: silently accept in v0.
 			return nil
@@ -2000,6 +2594,10 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if err := o.execAlterTableAddPrimaryKey(tbl, act); err != nil {
 				return err
 			}
+		case parser.AlterTableAddUnique:
+			if err := o.execAlterTableAddUnique(tbl, act); err != nil {
+				return err
+			}
 		case parser.AlterTableAddForeignKey:
 			// v0 accepts the syntax for HammerDB TPC-H
 			// compatibility but does not enforce. The
@@ -2012,8 +2610,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableAddCheck:
 			// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
+			// Track the constraint name so violations report it. A named
+			// constraint gets a fresh OID so it surfaces in pg_constraint
+			// (the latent virtual-table join crash was fixed in
+			// M0097-0023-loop34). M0097-0023.
 			if act.CheckExpr != "" {
-				tbl.CheckConstraints = append(tbl.CheckConstraints, act.CheckExpr)
+				tbl.AddCheck(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName))
 			}
 		case parser.AlterTableNoOp:
 			// Unknown ADD CONSTRAINT type — no-op.
@@ -2207,6 +2809,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableNoInherit:
 			// NO INHERIT parent_table — no-op in v0; just accept the syntax.
+		case parser.AlterTableSetStorage:
+			// SET STORAGE type — record on the catalog column for conflict detection.
+			if act.ColumnName != "" && act.StorageType != "" {
+				for i := range tbl.Columns {
+					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+						tbl.Columns[i].Storage = act.StorageType
+						break
+					}
+				}
+			}
 		case parser.AlterTableAlterColumnSet:
 			// SET (options) on a column of a heap table: no-op in goopg v0.
 		case parser.AlterTableAlterColumnType:
@@ -2405,6 +3017,44 @@ func numericConstAsType(s string, t catalog.Type) (Datum, bool) {
 	return Datum{}, false
 }
 
+// execIndexSetStatistics validates ALTER INDEX name ALTER COLUMN N SET STATISTICS value.
+// Raises appropriate errors matching PostgreSQL behaviour:
+//   - column N is a non-expression key column → cannot alter statistics on non-expression column
+//   - column N is an INCLUDE (non-key) column → cannot alter statistics on included column
+//   - column N > total column count → column number N of relation does not exist
+//
+// On success (expression key column) it is a no-op in v0. M0097-0023.
+func (o *ddlOp) execIndexSetStatistics(idxRelName string, idx *catalog.Index, act parser.AlterTableAction) error {
+	colNum, err := strconv.Atoi(act.ColumnName)
+	if err != nil || colNum < 1 {
+		// Non-numeric column name in ALTER INDEX … ALTER COLUMN — no-op for now.
+		return nil
+	}
+	nKey := len(idx.Columns)
+	nInclude := len(idx.IncludeColumns)
+	total := nKey + nInclude
+	if colNum > total {
+		return &ExecError{Code: "42703", Pos: act.Pos(),
+			Message: fmt.Sprintf("column number %d of relation %q does not exist", colNum, idxRelName)}
+	}
+	if colNum <= nKey {
+		// Key column: check whether it's an expression column.
+		// goopg stores expression columns as empty string in Columns (ColExprs holds the AST).
+		colName := idx.Columns[colNum-1]
+		if colName != "" {
+			return &ExecError{Code: "42P17", Pos: act.Pos(),
+				Message: fmt.Sprintf("cannot alter statistics on non-expression column %q of index %q", colName, idxRelName),
+				Hint:    "Alter statistics on table column instead."}
+		}
+		// Expression column: success (no physical change in v0).
+		return nil
+	}
+	// INCLUDE column.
+	inclColName := idx.IncludeColumns[colNum-nKey-1]
+	return &ExecError{Code: "42P17", Pos: act.Pos(),
+		Message: fmt.Sprintf("cannot alter statistics on included column %q of index %q", inclColName, idxRelName)}
+}
+
 func stringConstAsType(s string, t catalog.Type) (Datum, bool) {
 	switch strings.ToLower(t.Name) {
 	case "text", "varchar", "bpchar", "char", "name":
@@ -2427,7 +3077,41 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		name = tbl.Name + "_pkey"
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	return o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true)
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true); err != nil {
+		return err
+	}
+	if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+		idx.IsConstraint = true
+		idx.IncludeColumns = act.IncludeColumns
+	}
+	// PRIMARY KEY implies NOT NULL on all key columns (SQL standard).
+	for _, pkCol := range act.Columns {
+		if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
+			col.NotNull = true
+		}
+	}
+	return nil
+}
+
+// execAlterTableAddUnique handles ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)].
+// Creates a btree unique index. M0097-0023.
+func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTableAction) error {
+	if len(act.Columns) == 0 {
+		return nil // UNIQUE USING INDEX — index already exists, treat as no-op
+	}
+	name := act.ConstraintName
+	if name == "" {
+		name = o.autoIndexNameWithIncludes(tbl, act.Columns, act.IncludeColumns, "key")
+	}
+	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false); err != nil {
+		return err
+	}
+	if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+		idx.IsConstraint = true
+		idx.IncludeColumns = act.IncludeColumns
+	}
+	return nil
 }
 
 // execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name [RESTRICT|CASCADE]`.
@@ -2582,6 +3266,36 @@ func addGroupByPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkCons
 			}
 		}
 	}
+}
+
+// createExclusionIndexStub registers an EXCLUDE USING constraint in the catalog
+// without type-validation or B-tree building. Exclusion semantics are not
+// enforced in v0; the stub exists so pg_constraint and pg_index queries return
+// correct rows. M0097-0023.
+func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl *catalog.Table, ec parser.TableConstraintDef) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil // unsupported catalog — silently skip
+	}
+	idx, err := im.CreateIndex(idxName, tbl, ec.Columns, false, "btree", false)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return &ExecError{Code: "42P07", Pos: pos, Message: err.Error()}
+		}
+		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	}
+	idx.IsExclusion = true
+	idx.ExclusionOp = ec.ExclusionOp
+	idx.IncludeColumns = ec.IncludeColumns
+	if sess, ok2 := o.ctx.Session.(*BasicSession); ok2 {
+		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
+	}
+	if catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+	}
+	return nil
 }
 
 func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool) error {
@@ -2745,9 +3459,10 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 			if scanRow == nil || len(scanRow) != len(tbl.Columns) {
 				scanRow = make(Row, len(tbl.Columns))
 			}
-			// Single on-disk row format (PG-physical) since M0111-0002.
-			decErr := decodePhysicalPGRowIntoMctx(scanRow, tbl.Columns, tuple.Data, sctxDDL)
-			if decErr != nil {
+			// Use DecodeHeapTupleRowInto (not decodePhysicalPGRowIntoMctx) so that
+			// the null bitmap is respected — rows with null non-key columns (e.g. box)
+			// were previously skipped with a "truncated" decode error.
+			if decErr := DecodeHeapTupleRowInto(scanRow, tbl.Columns, tuple, sctxDDL); decErr != nil {
 				continue
 			}
 			row := scanRow
@@ -2811,7 +3526,7 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 		for i := 1; i < len(entries); i++ {
 			if bytesEqual(entries[i].Key, entries[i-1].Key) {
 				return nil, &ExecError{Code: "23505", Pos: pos,
-					Message: fmt.Sprintf("duplicate key value violates unique index %q", indexName)}
+					Message: fmt.Sprintf("could not create unique index %q", indexName)}
 			}
 		}
 	}
@@ -3056,8 +3771,42 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 	return nil, &ExecError{Code: "0A000", Pos: pos, Message: fmt.Sprintf("btree v0 cannot index column %q of type %q", col.Name, col.Type.Name)}
 }
 
+// pgDeduplicateColNames replicates PostgreSQL's ChooseIndexColumnNames logic:
+// if a column name already appears in the result list, it gets a numeric suffix
+// (e.g., a second "c1" becomes "c11"). This matches PG's auto-naming for
+// covering indexes where include columns may repeat key column names. M0097-0023.
+func pgDeduplicateColNames(cols []string) []string {
+	seen := make([]string, 0, len(cols))
+	result := make([]string, 0, len(cols))
+	for _, col := range cols {
+		cur := col
+		for i := 1; ; i++ {
+			found := false
+			for _, s := range seen {
+				if s == cur {
+					found = true
+					break
+				}
+			}
+			if !found {
+				break
+			}
+			cur = fmt.Sprintf("%s%d", col, i)
+		}
+		seen = append(seen, cur)
+		result = append(result, cur)
+	}
+	return result
+}
+
 func (o *ddlOp) autoIndexName(tbl *catalog.Table, columns []string, suffix string) string {
-	base := tbl.Name + "_" + strings.Join(columns, "_") + "_" + suffix
+	return o.autoIndexNameWithIncludes(tbl, columns, nil, suffix)
+}
+
+func (o *ddlOp) autoIndexNameWithIncludes(tbl *catalog.Table, keyColumns, includeColumns []string, suffix string) string {
+	allCols := append(keyColumns, includeColumns...)
+	deduped := pgDeduplicateColNames(allCols)
+	base := tbl.Name + "_" + strings.Join(deduped, "_") + "_" + suffix
 	candidate := base
 	for i := 1; ; i++ {
 		if _, exists := o.ctx.Catalog.LookupIndex(parser.ObjectName{Schema: tbl.Schema, Name: candidate}); !exists {
@@ -3297,11 +4046,11 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		}
 	}
 	r := &catalog.Routine{
-		Schema:   schema,
-		Name:     s.Name.Name,
-		ArgNames: argNames,
-		ArgTypes: argTypes,
-		ArgModes: argModes,
+		Schema:      schema,
+		Name:        s.Name.Name,
+		ArgNames:    argNames,
+		ArgTypes:    argTypes,
+		ArgModes:    argModes,
 		ArgDefaults: argDefaults,
 		ReturnType: catalog.Type{
 			Name: strings.ToLower(s.ReturnType.Name),
@@ -4061,8 +4810,8 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 		// PG format: "procedure name() does not exist"
 		argListStr := buildCallArgListStr(s.Args)
 		return &ExecError{Code: "42883", Pos: s.Pos(),
-			Message:  fmt.Sprintf("%s %s%s does not exist", objKind, s.Name.Name, argListStr),
-			Hint:     "No procedure matches the given name and argument types. You might need to add explicit type casts.",
+			Message: fmt.Sprintf("%s %s%s does not exist", objKind, s.Name.Name, argListStr),
+			Hint:    "No procedure matches the given name and argument types. You might need to add explicit type casts.",
 		}
 	}
 	// DROP PROCEDURE on a function should fail.
@@ -4527,7 +5276,6 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 
 	return nil
 }
-
 
 // syncIndexToCatalogHeap writes a pg_class row and a pg_index row for idx.
 // Called by createBTreeIndex after the full index build succeeds. The row
@@ -5110,6 +5858,28 @@ func (o *ddlOp) dropSchemaQualifiedNotice(name parser.ObjectName) bool {
 func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	objType := strings.ToLower(s.ObjType)
 
+	// DROP FOREIGN TABLE [IF EXISTS] name [, ...] — drop the underlying table from catalog.
+	// CREATE FOREIGN TABLE now creates real catalog entries, so we must drop them here.
+	if objType == "foreign table" {
+		for _, name := range s.Names {
+			if s.IfExists && o.dropSchemaQualifiedNotice(name) {
+				continue
+			}
+			tbl, ok := o.ctx.Catalog.LookupTable(name)
+			if !ok {
+				if s.IfExists {
+					o.ctx.AddNotice(fmt.Sprintf("foreign table %q does not exist, skipping", name.String()))
+					continue
+				}
+				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("foreign table %q does not exist", name.String())}
+			}
+			if err := o.dropTableByRef(name, tbl); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	// DROP SCHEMA [IF EXISTS] name [CASCADE|RESTRICT] — M0097-0020.
 	// Find all user tables in the schema and cascade-drop them.
 	if objType == "schema" {
@@ -5595,6 +6365,36 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					return nil
 				}
 			}
+		case "server":
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if im.DropCompatObject("server", s.Names[0].String()) {
+					return nil
+				}
+			}
+		case "foreign-data wrapper":
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				fdwName := s.Names[0].String()
+				if im.DropCompatObject("foreign-data wrapper", fdwName) {
+					// CASCADE: drop all servers associated with this FDW.
+					if s.Behavior == parser.DropCascade {
+						// Find servers registered under this FDW via "fdw-server:fdwname:servername".
+						prefix := fdwName + ":"
+						var cascadeServers []string
+						for _, entry := range im.ListCompatObjects("fdw-server") {
+							if strings.HasPrefix(entry, prefix) {
+								serverName := strings.TrimPrefix(entry, prefix)
+								cascadeServers = append(cascadeServers, serverName)
+							}
+						}
+						for _, serverName := range cascadeServers {
+							im.DropCompatObject("fdw-server", fdwName+":"+serverName)
+							im.DropCompatObject("server", serverName)
+							o.ctx.AddNotice(fmt.Sprintf("drop cascades to server %s", serverName))
+						}
+					}
+					return nil
+				}
+			}
 		}
 		return &ExecError{
 			Code:    "42704",
@@ -5617,6 +6417,16 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		return nil
 	}
 	switch s.ObjType {
+	case "server":
+		// Register server so DROP SERVER can succeed.
+		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+		// If the server references a FDW, store the association for DROP FDW CASCADE.
+		if s.TableName.Name != "" {
+			im.RegisterCompatObject("fdw-server", s.TableName.String()+":"+s.ObjName.String())
+		}
+	case "foreign-data wrapper":
+		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed.
+		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 	case "operator":
 		// Build the compat key as opName(leftCanon,rightCanon) to match DROP OPERATOR lookup.
 		leftArg, rightArg := "", ""
@@ -5634,6 +6444,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		}
 		key := s.ObjName.Name + "(" + leftCanon + "," + rightCanon + ")"
 		im.RegisterCompatObject("operator", key)
+	case "schema":
+		// Register user-created schema so schema-qualified queries resolve correctly.
+		if s.ObjName.Name != "" {
+			im.RegisterSchema(s.ObjName.Name)
+		}
 	case "rule":
 		// Key format must match DROP RULE: ruleName@tableName.
 		if s.TableName.Name != "" {
@@ -5648,6 +6463,96 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// conversion, text search dictionary/configuration/parser/template, etc.
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 	}
+	return nil
+}
+
+// execCommentOn stores a description for a TABLE, INDEX, COLUMN, or CONSTRAINT
+// in pg_description via catalog.SetComment. M0097-0023.
+func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	// classOID constants match PostgreSQL system catalog OIDs.
+	const (
+		oidPgClass          = 1259 // pg_class: tables, indexes, views
+		oidPgConstraint     = 2606 // pg_constraint
+		oidPgStatisticExt   = 3381 // pg_statistic_ext
+	)
+	switch s.ObjKind {
+	case "table":
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		im.SetComment(oidPgClass, tbl.OID, 0, s.Description)
+	case "index":
+		idx, ok := im.LookupIndex(s.ObjName)
+		if !ok {
+			return nil
+		}
+		im.SetComment(oidPgClass, idx.OID, 0, s.Description)
+	case "column":
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		for i, col := range tbl.Columns {
+			if strings.EqualFold(col.Name, s.SubName) {
+				im.SetComment(oidPgClass, tbl.OID, int32(i+1), s.Description)
+				break
+			}
+		}
+	case "constraint":
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		for _, nc := range tbl.NamedChecks {
+			if strings.EqualFold(nc.Name, s.SubName) {
+				im.SetComment(oidPgConstraint, nc.OID, 0, s.Description)
+				return nil
+			}
+		}
+		// PG18 NOT NULL constraints are also named constraints. M0097-0023.
+		for _, nn := range tbl.NotNullConstraints {
+			if strings.EqualFold(nn.Name, s.SubName) && nn.OID != 0 {
+				im.SetComment(oidPgConstraint, nn.OID, 0, s.Description)
+				return nil
+			}
+		}
+	case "statistics":
+		stat, ok := im.LookupStatistics(s.ObjName.Name)
+		if !ok {
+			return nil
+		}
+		im.SetComment(oidPgStatisticExt, stat.OID, 0, s.Description)
+	}
+	return nil
+}
+
+// execCreateStatistics registers a new extended statistics object. M0097-0023.
+func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	// Resolve the table that this statistics object refers to.
+	var tableOID uint32
+	if s.FromTable.Name != "" {
+		tbl, ok := im.LookupTable(s.FromTable)
+		if ok {
+			tableOID = tbl.OID
+		}
+	}
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = currentWritableSchema(o.ctx)
+		if schema == "" {
+			schema = "public"
+		}
+	}
+	im.RegisterStatistics(schema, s.Name.Name, tableOID)
 	return nil
 }
 
@@ -5842,17 +6747,17 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 // user-defined routines catalog, so the finalfunc validation skips them.
 // M0097-0112.
 var knownBuiltinAggFinalFuncs = map[string]bool{
-	"int8_avg":              true,
-	"numeric_avg":           true,
-	"numeric_avg_combine":   true,
-	"numeric_out":           true,
-	"percentile_disc_final": true,
-	"percentile_cont_final": true,
-	"rank_final":            true,
-	"dense_rank_final":      true,
-	"cume_dist_final":       true,
-	"percent_rank_final":    true,
-	"mode_final":            true,
+	"int8_avg":                       true,
+	"numeric_avg":                    true,
+	"numeric_avg_combine":            true,
+	"numeric_out":                    true,
+	"percentile_disc_final":          true,
+	"percentile_cont_final":          true,
+	"rank_final":                     true,
+	"dense_rank_final":               true,
+	"cume_dist_final":                true,
+	"percent_rank_final":             true,
+	"mode_final":                     true,
 	"hypothetical_rank_common_final": true,
 }
 
@@ -6178,7 +7083,33 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 		tbl.Columns[i].Ordinal = i
 	}
 
-	// Phase 3: truncate the heap and all indexes.
+	// Phase 3: drop indexes that reference the dropped column (key or INCLUDE),
+	// then truncate the heap and remaining indexes.
+	droppedColName := strings.ToLower(act.ColumnName)
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		refsDropped := false
+		for _, c := range idx.Columns {
+			if strings.EqualFold(c, droppedColName) {
+				refsDropped = true
+				break
+			}
+		}
+		if !refsDropped {
+			for _, c := range idx.IncludeColumns {
+				if strings.EqualFold(c, droppedColName) {
+					refsDropped = true
+					break
+				}
+			}
+		}
+		if refsDropped {
+			idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+			o.ctx.Pool.InvalidateRel(idxRel)
+			_ = o.ctx.Pool.Manager().TruncateRelation(idxRel)
+			idxName := parser.ObjectName{Schema: idx.Schema, Name: idx.Name}
+			_ = o.ctx.Catalog.DropIndex(idxName)
+		}
+	}
 	o.ctx.Pool.InvalidateRel(rel)
 	if terr := o.ctx.Pool.Manager().TruncateRelation(rel); terr != nil {
 		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: terr.Error()}

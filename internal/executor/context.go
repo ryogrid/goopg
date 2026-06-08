@@ -186,6 +186,12 @@ type Context struct {
 	ResetSetting     func(name string) error
 	ResetAllSettings func()
 
+	// BeginLocalTransaction and EndLocalTransaction bracket an explicit
+	// transaction so that SET LOCAL changes are discarded on COMMIT/ROLLBACK.
+	// Wired to SessionRegistry.BeginTransaction / EndTransaction. M0097-0023.
+	BeginLocalTransaction func()
+	EndLocalTransaction   func()
+
 	// EnableOpportunisticPrune mirrors the enable_opportunistic_prune
 	// GUC (M0046-0002). When true, the HOT-update path calls
 	// PagePruneOpt before falling back to a relation extension.

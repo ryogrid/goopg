@@ -370,7 +370,7 @@ func assertNoChildRows(ctx *Context, childTbl *catalog.Table, fk catalog.Foreign
 			}
 		}
 		return &ExecError{
-			Code:    "23503",
+			Code: "23503",
 			Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint %q on table %q",
 				fk.RefTable, constraintName, childTbl.Name),
 			Detail: fmt.Sprintf("Key (%s)=(%s) is still referenced from table %q.",
@@ -801,7 +801,6 @@ func scanTableForMatchFKWait(ctx *Context, tbl *catalog.Table, colNames []string
 	return false, nil
 }
 
-
 // detectInFlightChildInsert scans childTbl (plus its partition / inheritance
 // children) for the first row whose FK columns match vals AND whose xmin is
 // an in-flight non-self transaction.  Returns (xid, true) when such a row is
@@ -1020,7 +1019,7 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 	}
 	colNamesJoined := strings.Join(colNames, ", ")
 
-	for _, exprSQL := range tbl.CheckConstraints {
+	for ci, exprSQL := range tbl.CheckConstraints {
 		if exprSQL == "" {
 			continue
 		}
@@ -1073,12 +1072,25 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 			continue
 		}
 		if result.Kind == KindBool && !result.BoolValue() {
+			// PostgreSQL always names the violated constraint and appends a
+			// "Failing row contains (…)" DETAIL line. The constraint name is
+			// recovered from the parallel NamedChecks slice (index i ↔ index i
+			// with CheckConstraints); anonymous constraints have an empty name
+			// and fall back to the unnamed wording. M0097-0023.
+			name := ""
+			if ci < len(tbl.NamedChecks) {
+				name = tbl.NamedChecks[ci].Name
+			}
+			msg := fmt.Sprintf("new row for relation %q violates check constraint", tbl.Name)
+			if name != "" {
+				msg = fmt.Sprintf("new row for relation %q violates check constraint %q", tbl.Name, name)
+			}
 			return &ExecError{
 				Code:    "23514",
-				Message: fmt.Sprintf("new row for relation %q violates check constraint", tbl.Name),
+				Message: msg,
+				Detail:  formatRowForDetail(tbl.Columns, row),
 			}
 		}
 	}
 	return nil
 }
-

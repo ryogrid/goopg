@@ -128,6 +128,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt,
 		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt,
 		*parser.CompatNoopStmt,
+		*parser.CommentOnStmt,
+		*parser.CreateStatisticsStmt,
 		*parser.LockTableStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
 		*parser.CreateDomainStmt, *parser.DropDomainStmt,
@@ -8821,6 +8823,33 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 			args[i] = shiftColumnRefsBy(a, delta)
 		}
 		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic}
+	case *InExpr:
+		// Mirror walkColumnRefs' InExpr handling so this rewriter stays in
+		// sync with the side-classifier (classifyConjunctSide). A literal-list
+		// `col IN (a, b, ...)` conjunct that classifyConjunctSide tags as
+		// inner-only is pushed to a Filter on the inner plan; its ColumnRef
+		// indices MUST be shifted by -leftWidth just like every other node
+		// kind. Omitting this case left the operand/list refs at their
+		// outer-cumulative index, so e.g. psql `\d`'s
+		// `con.contype IN ('p','u','x')` (over pg_index LEFT JOIN
+		// pg_constraint) indexed past the inner row width and panicked
+		// "index out of range" in Slot.Get. The subquery form (Plan != nil)
+		// is never pushed down (walkColumnRefs reports it out-of-scope), and
+		// its Plan lives in a separate column scope, so Plan is preserved
+		// as-is without shifting.
+		list := make([]Expr, len(x.List))
+		for i, item := range x.List {
+			list[i] = shiftColumnRefsBy(item, delta)
+		}
+		return &InExpr{
+			pos:             x.Pos(),
+			Operand:         shiftColumnRefsBy(x.Operand, delta),
+			Negated:         x.Negated,
+			NotEqualAny:     x.NotEqualAny,
+			Plan:            x.Plan,
+			List:            list,
+			IsNonCorrelated: x.IsNonCorrelated,
+		}
 	case *CaseExpr:
 		whens := make([]CaseWhen, len(x.Whens))
 		for i, w := range x.Whens {

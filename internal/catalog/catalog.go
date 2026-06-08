@@ -81,6 +81,46 @@ type Column struct {
 	// dropped columns are invisible in SELECT *, RETURNING *, and column lookups.
 	// M0097-0028.
 	Dropped bool
+	// Storage is the column storage type: "plain", "main", "external", "extended".
+	// Empty means the default for the column's type.
+	Storage string
+}
+
+// NamedCheckConstraint holds a CHECK constraint with an explicit name.
+// Name may be empty for anonymous constraints (e.g. inline column-level CHECK).
+type NamedCheckConstraint struct {
+	Name      string // constraint name; empty for auto-named constraints
+	Expr      string // raw SQL expression (same as CheckConstraints entry)
+	OID       uint32 // synthetic OID for pg_constraint virtual table
+	NoInherit bool   // PG18: CHECK NO INHERIT — not propagated to child tables
+}
+
+// NamedNotNullConstraint holds a NOT NULL constraint with a catalog-visible name.
+// PostgreSQL 18 introduces named NOT NULL constraints (contype='n' in pg_constraint).
+// Auto-named as <table>_<col>_not_null on CREATE; preserved on LIKE copy. M0097-0023.
+type NamedNotNullConstraint struct {
+	Name      string // e.g. "tablename_colname_not_null"
+	ColName   string // column this constraint applies to
+	OID       uint32 // synthetic OID for pg_constraint virtual table
+	NoInherit bool   // PG18: NOT NULL NO INHERIT
+}
+
+// AddNotNull appends a named NOT NULL constraint to the table.
+func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool) {
+	t.NotNullConstraints = append(t.NotNullConstraints, NamedNotNullConstraint{
+		Name: name, ColName: colName, OID: oid, NoInherit: noInherit,
+	})
+}
+
+// AddCheck appends a CHECK constraint, keeping CheckConstraints and
+// NamedChecks parallel so index i of each always corresponds. name is
+// empty for anonymous constraints; oid is 0 for anonymous constraints
+// (pg_constraint's VirtualRows skips empty-name / zero-OID rows so the
+// common unnamed case stays invisible in the catalog, matching the
+// pre-existing stub behaviour). M0097-0023.
+func (t *Table) AddCheck(name, expr string, oid uint32) {
+	t.CheckConstraints = append(t.CheckConstraints, expr)
+	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{Name: name, Expr: expr, OID: oid})
 }
 
 // Table is one relation in the catalog.
@@ -143,6 +183,17 @@ type Table struct {
 	// CheckConstraints holds the raw SQL expressions for table-level and
 	// column-level CHECK constraints. M0097-0014.
 	CheckConstraints []string
+
+	// NamedChecks holds named CHECK constraints (name + expression).
+	// Parallel to CheckConstraints; populated when the constraint has an
+	// explicit CONSTRAINT name clause. Index i of NamedChecks corresponds to
+	// index i of CheckConstraints; Name may be empty for anonymous constraints.
+	NamedChecks []NamedCheckConstraint
+
+	// NotNullConstraints holds NOT NULL constraints with catalog-visible names.
+	// PostgreSQL 18 tracks NOT NULL constraints as contype='n' in pg_constraint.
+	// Auto-named <table>_<col>_not_null on CREATE TABLE; preserved on LIKE copy.
+	NotNullConstraints []NamedNotNullConstraint
 
 	// IsMatView marks this table as a materialized view. The underlying
 	// SELECT query is stored in View; data is materialized in the heap
@@ -290,8 +341,12 @@ type Index struct {
 	// columns (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil
 	// when Columns[i] == "" (expression column); nil for plain column names.
 	// Not persisted to JSON (parser.Expr is not JSON-serializable).
-	ColExprs     []*parser.Expr
-	HasPredicate bool // true if this is a partial index (has a WHERE clause)
+	ColExprs       []*parser.Expr
+	HasPredicate   bool     // true if this is a partial index (has a WHERE clause)
+	IncludeColumns []string // non-key covering columns from INCLUDE (…)
+	IsConstraint   bool     // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
+	IsExclusion    bool     // true when index backs an EXCLUDE USING constraint
+	ExclusionOp    string   // per-column exclusion operator (e.g. "=")
 }
 
 // QualifiedName renders the table's name in the canonical
@@ -345,6 +400,8 @@ type Catalog interface {
 	// UnregisterRole removes a role from the registry. M0097-drop_if_exists.
 	UnregisterRole(name string)
 	IndexesOnTable(table *Table) []*Index
+	// AllIndexes returns every index in the catalog, sorted by OID. M0097-0023.
+	AllIndexes() []*Index
 	HasPrimaryKey(table *Table) bool
 	RelFileNode(table *Table) storage.RelFileNode
 	IndexRelFileNode(index *Index) storage.RelFileNode
@@ -366,6 +423,11 @@ type Catalog interface {
 	// type registered via RegisterCompositeTypeWithFields. Returns nil if the
 	// type has no field metadata. M0097-composite.
 	LookupCompositeTypeFields(name string) []CompositeField
+	// AllocOID atomically allocates and returns a fresh catalog OID from the
+	// running counter. Used to give catalog objects a stable identity when no
+	// dedicated creation method exists — e.g. named CHECK constraints that must
+	// surface in pg_constraint with a real OID. M0097-0023.
+	AllocOID() uint32
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -454,6 +516,46 @@ type InMemory struct {
 	// tableRuleKinds tracks the most-recently-registered rule kind per table.
 	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
 	tableRuleKinds map[string]string
+
+	// comments stores COMMENT ON descriptions keyed by (classoid, objoid, objsubid).
+	// Populated by SetComment; read by pg_description VirtualRows. M0097-comments.
+	comments map[commentKey]string
+
+	// statisticsObjs tracks CREATE STATISTICS objects. Key = "schema.name" (lowercase).
+	// Populated by RegisterStatistics; read by pg_statistic_ext VirtualRows. M0097-0023.
+	statisticsObjs map[string]*StatisticsObject
+}
+
+// commentKey is the composite key for pg_description.
+type commentKey struct {
+	ClassOID uint32
+	ObjOID   uint32
+	ObjSubID int32
+}
+
+// StatisticsObject tracks one CREATE STATISTICS object. M0097-0023.
+type StatisticsObject struct {
+	Name     string // unqualified name
+	Schema   string // schema name (empty = public)
+	OID      uint32
+	TableOID uint32 // stxrelid — the table the statistics are defined on
+}
+
+// qualifiedKey returns the lowercase schema.name key used in statisticsObjs.
+func (s *StatisticsObject) qualifiedKey() string {
+	schema := s.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	return strings.ToLower(schema + "." + s.Name)
+}
+
+// CommentRow is one row for pg_description.
+type CommentRow struct {
+	ObjOID      uint32
+	ClassOID    uint32
+	ObjSubID    int32
+	Description string
 }
 
 // EnumValue is one label in a user-defined enum type together with its sort
@@ -562,17 +664,107 @@ func NewInMemory() *InMemory {
 		constraintViewDeps:  make(map[string][]string),
 		opClassHashFuncs:    make(map[string]string),
 		opClassSchemas:      make(map[string]string),
-		userAggregates: make(map[string]*UserAggregate),
+		userAggregates:      make(map[string]*UserAggregate),
 		schemas: map[string]uint32{
 			"pg_catalog":         11,
 			"public":             2200,
 			"information_schema": 99,
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
-		roles: make(map[string]struct{}),
+		roles:          make(map[string]struct{}),
+		comments:       make(map[commentKey]string),
+		statisticsObjs: make(map[string]*StatisticsObject),
 	}
 	c.registerSystemTables()
 	return c
+}
+
+// RegisterStatistics adds a new statistics object to the catalog and returns it.
+// If a statistics object with the same schema-qualified name already exists it
+// is overwritten. M0097-0023.
+func (c *InMemory) RegisterStatistics(schema, name string, tableOID uint32) *StatisticsObject {
+	if schema == "" {
+		schema = "public"
+	}
+	obj := &StatisticsObject{Name: name, Schema: schema, OID: c.AllocOID(), TableOID: tableOID}
+	key := obj.qualifiedKey()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		c.statisticsObjs = make(map[string]*StatisticsObject)
+	}
+	c.statisticsObjs[key] = obj
+	return obj
+}
+
+// LookupStatistics finds a statistics object by name. The name may be
+// schema-qualified; if not, the public schema is tried. M0097-0023.
+func (c *InMemory) LookupStatistics(name string) (*StatisticsObject, bool) {
+	key := strings.ToLower(name)
+	if !strings.Contains(key, ".") {
+		key = "public." + key
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.statisticsObjs == nil {
+		return nil, false
+	}
+	obj, ok := c.statisticsObjs[key]
+	return obj, ok
+}
+
+// AllStatistics returns a snapshot of all registered statistics objects. M0097-0023.
+func (c *InMemory) AllStatistics() []*StatisticsObject {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*StatisticsObject, 0, len(c.statisticsObjs))
+	for _, obj := range c.statisticsObjs {
+		out = append(out, obj)
+	}
+	return out
+}
+
+// SetComment stores a description for an object in pg_description.
+// classoid is the OID of the system catalog that tracks the object
+// (e.g. 2606 for pg_constraint, 1259 for pg_class, 3381 for pg_statistic_ext).
+// objoid is the OID of the object; objsubid is 0 for whole-object comments,
+// or the attnum for column comments.
+func (c *InMemory) SetComment(classoid, objoid uint32, objsubid int32, description string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.comments == nil {
+		c.comments = make(map[commentKey]string)
+	}
+	k := commentKey{ClassOID: classoid, ObjOID: objoid, ObjSubID: objsubid}
+	if description == "" {
+		delete(c.comments, k)
+	} else {
+		c.comments[k] = description
+	}
+}
+
+// GetComment retrieves a stored description, returning ("", false) when absent.
+func (c *InMemory) GetComment(classoid, objoid uint32, objsubid int32) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.comments[commentKey{ClassOID: classoid, ObjOID: objoid, ObjSubID: objsubid}]
+	return v, ok
+}
+
+// AllComments returns all stored comments as a slice of CommentRow.
+func (c *InMemory) AllComments() []CommentRow {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]CommentRow, 0, len(c.comments))
+	for k, desc := range c.comments {
+		out = append(out, CommentRow{
+			ObjOID:      k.ObjOID,
+			ClassOID:    k.ClassOID,
+			ObjSubID:    k.ObjSubID,
+			Description: desc,
+		})
+	}
+	return out
 }
 
 // RegisterUserAggregate registers a user-defined aggregate in the catalog.
@@ -1142,6 +1334,19 @@ func (c *InMemory) AdvanceNextOIDPast(oid uint32) {
 	c.advanceNextOIDLocked(oid)
 }
 
+// AllocOID atomically allocates and returns a fresh OID, advancing the
+// running counter. Mirrors the inline `t.OID = c.nextOID; c.nextOID++`
+// pattern used by CreateTable/CreateIndex, but exposed through the Catalog
+// interface so executor DDL paths (e.g. named CHECK constraint creation)
+// can mint synthetic OIDs without a dedicated catalog mutator. M0097-0023.
+func (c *InMemory) AllocOID() uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oid := c.nextOID
+	c.nextOID++
+	return oid
+}
+
 // ListDatabases returns the registered database names in
 // deterministic (lexicographic) order. Backs the `pg_database`
 // virtual table.
@@ -1347,28 +1552,28 @@ func (c *InMemory) registerSystemTables() {
 				idxRelam = "405"
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(idx.OID)),   // oid
-				idx.Name,                     // relname
-				"i",                          // relkind = index
+				strconv.Itoa(int(idx.OID)),  // oid
+				idx.Name,                    // relname
+				"i",                         // relkind = index
 				strconv.Itoa(int(idxNsOID)), // relnamespace
-				"p",                          // relpersistence
-				"0",                          // reltoastrelid
-				"0",                          // relpages
-				"t",                          // relispopulated
-				"0",                          // relnatts
-				"n",                          // relreplident: not applicable for indexes
-				"0",                          // relchecks
-				"f",                          // relhasindex
-				"f",                          // relhasrules
-				"f",                          // relhastriggers
-				"f",                          // relrowsecurity
-				"f",                          // relforcerowsecurity
-				"f",                          // relhasoids
-				"f",                          // relispartition
-				"0",                          // reltablespace
-				"0",                          // reloftype
-				"",                           // reloptions: NULL
-				idxRelam,                     // relam: index access method OID
+				"p",                         // relpersistence
+				"0",                         // reltoastrelid
+				"0",                         // relpages
+				"t",                         // relispopulated
+				"0",                         // relnatts
+				"n",                         // relreplident: not applicable for indexes
+				"0",                         // relchecks
+				"f",                         // relhasindex
+				"f",                         // relhasrules
+				"f",                         // relhastriggers
+				"f",                         // relrowsecurity
+				"f",                         // relforcerowsecurity
+				"f",                         // relhasoids
+				"f",                         // relispartition
+				"0",                         // reltablespace
+				"0",                         // reloftype
+				"",                          // reloptions: NULL
+				idxRelam,                    // relam: index access method OID
 			})
 		}
 		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
@@ -1445,6 +1650,8 @@ func (c *InMemory) registerSystemTables() {
 
 	// pg_indexes view. HammerDB's checkschema step queries
 	// `select tablename, indexname from pg_indexes where
+	// NOTE: pg_indexes is a VIEW (not a catalog table); OID 11024 is assigned
+	// here to avoid conflicting with the catalog table pg_attrdef (OID 2604).
 	// tablename = '$table'` to verify each TPC-H table has at
 	// least one index after CreateIndexes runs. Mirrors the
 	// upstream view's first three columns; tablespace and
@@ -1460,7 +1667,7 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "tablespace", Type: Type{Name: "text"}, Ordinal: 3},
 			{Name: "indexdef", Type: Type{Name: "text"}, Ordinal: 4},
 		},
-		OID:     2604, // upstream's pg_indexes OID
+		OID:     11024, // VIEW (not catalog table); pg_attrdef owns OID 2604
 		Virtual: true,
 	}
 	pgIndexes.VirtualRows = func() [][]string {
@@ -1495,7 +1702,7 @@ func (c *InMemory) registerSystemTables() {
 					t.Name,
 					idx.Name,
 					"", // tablespace
-					"",
+					BuildIndexDef(idx),
 				})
 			}
 		}
@@ -2064,8 +2271,451 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2609,
 	}
-	pgDescription.VirtualRows = func() [][]string { return nil }
+	pgDescription.VirtualRows = func() [][]string {
+		rows := c.AllComments()
+		out := make([][]string, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, []string{
+				fmt.Sprintf("%d", r.ObjOID),
+				fmt.Sprintf("%d", r.ClassOID),
+				fmt.Sprintf("%d", r.ObjSubID),
+				r.Description,
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_description"] = pgDescription
+
+	// pg_attrdef — stores column default expressions (OID 2604).
+	// COMMENT ON and DEFAULT tracking are stubs in goopg v0; this virtual table
+	// lets psql \d+ meta-queries succeed (returning 0 rows) instead of erroring
+	// with "relation pg_attrdef does not exist". M0097-0023.
+	pgAttrdef := &Table{
+		Schema: "pg_catalog", Name: "pg_attrdef", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "adrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "adnum", Type: Type{Name: "int2"}, Ordinal: 2},
+			{Name: "adbin", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID: 2604,
+	}
+	pgAttrdef.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_attrdef"] = pgAttrdef
+
+	// pg_constraint — stores table and domain constraint definitions (OID 2606).
+	// Constraint tracking is a stub in goopg v0; this virtual table lets queries
+	// like SELECT conname FROM pg_constraint WHERE conrelid = ... succeed (returning
+	// 0 rows) instead of erroring with "relation pg_constraint does not exist".
+	// M0097-0023.
+	pgConstraint := &Table{
+		Schema: "pg_catalog", Name: "pg_constraint", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "conname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "connamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "contype", Type: Type{Name: "char"}, Ordinal: 3},
+			{Name: "condeferrable", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "condeferred", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "convalidated", Type: Type{Name: "bool"}, Ordinal: 6},
+			{Name: "conrelid", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "contypid", Type: Type{Name: "oid"}, Ordinal: 8},
+			{Name: "conindid", Type: Type{Name: "oid"}, Ordinal: 9},
+			{Name: "conparentid", Type: Type{Name: "oid"}, Ordinal: 10},
+			{Name: "confrelid", Type: Type{Name: "oid"}, Ordinal: 11},
+			{Name: "confupdtype", Type: Type{Name: "char"}, Ordinal: 12},
+			{Name: "confdeltype", Type: Type{Name: "char"}, Ordinal: 13},
+			{Name: "confmatchtype", Type: Type{Name: "char"}, Ordinal: 14},
+			{Name: "conislocal", Type: Type{Name: "bool"}, Ordinal: 15},
+			{Name: "coninhcount", Type: Type{Name: "int2"}, Ordinal: 16},
+			{Name: "connoinherit", Type: Type{Name: "bool"}, Ordinal: 17},
+			{Name: "conperiod", Type: Type{Name: "bool"}, Ordinal: 18},
+			{Name: "conkey", Type: Type{Name: "int2[]"}, Ordinal: 19},
+			{Name: "confkey", Type: Type{Name: "int2[]"}, Ordinal: 20},
+			{Name: "conpfeqop", Type: Type{Name: "oid[]"}, Ordinal: 21},
+			{Name: "conppeqop", Type: Type{Name: "oid[]"}, Ordinal: 22},
+			{Name: "confdelsetcols", Type: Type{Name: "int2[]"}, Ordinal: 23},
+			{Name: "conbin", Type: Type{Name: "text"}, Ordinal: 24},
+		},
+		OID: 2606,
+	}
+	pgConstraint.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var out [][]string
+		for _, tbl := range c.tables {
+			if tbl.Virtual || tbl.OID == 0 {
+				continue
+			}
+			// Emit named CHECK constraints.
+			for _, nc := range tbl.NamedChecks {
+				if nc.Name == "" || nc.OID == 0 {
+					continue
+				}
+				row := make([]string, 25)
+				row[0] = fmt.Sprintf("%d", nc.OID)  // oid
+				row[1] = nc.Name                    // conname
+				row[2] = "2200"                     // connamespace (public)
+				row[3] = "c"                        // contype = check
+				row[4] = "f"                        // condeferrable
+				row[5] = "f"                        // condeferred
+				row[6] = "t"                        // convalidated
+				row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
+				row[8] = "0"                        // contypid
+				row[9] = "0"                        // conindid
+				row[10] = "0"                       // conparentid
+				row[11] = "0"                       // confrelid
+				row[12] = " "                       // confupdtype
+				row[13] = " "                       // confdeltype
+				row[14] = " "                       // confmatchtype
+				row[15] = "t"                       // conislocal
+				row[16] = "0"                       // coninhcount
+				row[17] = "f"                       // connoinherit
+				row[18] = "f"                       // conperiod
+				row[24] = nc.Expr                   // conbin
+				out = append(out, row)
+			}
+		}
+		// Emit UNIQUE, PRIMARY KEY, and EXCLUDE constraints from constraint-backed indexes.
+		for _, idx := range c.indexes {
+			if (!idx.IsConstraint && !idx.IsExclusion) || idx.Table == nil {
+				continue
+			}
+			colOrdMap := make(map[string]int, len(idx.Table.Columns))
+			for _, col := range idx.Table.Columns {
+				colOrdMap[col.Name] = col.Ordinal + 1
+			}
+			var keyNums []string
+			for _, colName := range idx.Columns {
+				if ord, ok := colOrdMap[colName]; ok {
+					keyNums = append(keyNums, fmt.Sprintf("%d", ord))
+				}
+			}
+			contype := "u"
+			if idx.Primary {
+				contype = "p"
+			} else if idx.IsExclusion {
+				contype = "x"
+			}
+			row := make([]string, 25)
+			row[0] = fmt.Sprintf("%d", idx.OID)
+			row[1] = idx.Name
+			row[2] = "2200"
+			row[3] = contype
+			row[4] = "f"
+			row[5] = "f"
+			row[6] = "t"
+			row[7] = fmt.Sprintf("%d", idx.Table.OID)
+			row[8] = "0"
+			row[9] = fmt.Sprintf("%d", idx.OID)
+			row[10] = "0"
+			row[11] = "0"
+			row[12] = " "
+			row[13] = " "
+			row[14] = " "
+			row[15] = "t"
+			row[16] = "0"
+			row[17] = "f"
+			row[18] = "f"
+			row[19] = "{" + strings.Join(keyNums, ",") + "}"
+			out = append(out, row)
+		}
+		// Emit NOT NULL constraints (contype='n', PG18). M0097-0023.
+		for _, tbl := range c.tables {
+			if tbl.Virtual || tbl.OID == 0 {
+				continue
+			}
+			for _, nc := range tbl.NotNullConstraints {
+				if nc.Name == "" || nc.OID == 0 {
+					continue
+				}
+				colOrd := 0
+				for i, col := range tbl.Columns {
+					if strings.EqualFold(col.Name, nc.ColName) {
+						colOrd = i + 1
+						break
+					}
+				}
+				row := make([]string, 25)
+				row[0] = fmt.Sprintf("%d", nc.OID)
+				row[1] = nc.Name
+				row[2] = "2200"
+				row[3] = "n" // contype = not null
+				row[4] = "f"
+				row[5] = "f"
+				row[6] = "t"
+				row[7] = fmt.Sprintf("%d", tbl.OID)
+				row[8] = "0"
+				row[9] = "0"
+				row[10] = "0"
+				row[11] = "0"
+				row[12] = " "
+				row[13] = " "
+				row[14] = " "
+				row[15] = "t"
+				row[16] = "0"
+				if nc.NoInherit {
+					row[17] = "t"
+				} else {
+					row[17] = "f"
+				}
+				row[18] = "f"
+				if colOrd > 0 {
+					row[19] = fmt.Sprintf("{%d}", colOrd)
+				}
+				out = append(out, row)
+			}
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_constraint"] = pgConstraint
+
+	// pg_index — stores index definitions (OID 2610).
+	// This virtual stub lets queries that join against pg_index (e.g. psql \d+
+	// meta-queries) succeed instead of erroring with "relation pg_index does not
+	// exist". M0097-0023.
+	pgIndexCatalog := &Table{
+		Schema: "pg_catalog", Name: "pg_index", Virtual: true,
+		Columns: []Column{
+			{Name: "indexrelid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "indrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "indnatts", Type: Type{Name: "int2"}, Ordinal: 2},
+			{Name: "indnkeyatts", Type: Type{Name: "int2"}, Ordinal: 3},
+			{Name: "indisunique", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "indnullsnotdistinct", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "indisprimary", Type: Type{Name: "bool"}, Ordinal: 6},
+			{Name: "indisexclusion", Type: Type{Name: "bool"}, Ordinal: 7},
+			{Name: "indimmediate", Type: Type{Name: "bool"}, Ordinal: 8},
+			{Name: "indisclustered", Type: Type{Name: "bool"}, Ordinal: 9},
+			{Name: "indisvalid", Type: Type{Name: "bool"}, Ordinal: 10},
+			{Name: "indcheckxmin", Type: Type{Name: "bool"}, Ordinal: 11},
+			{Name: "indisready", Type: Type{Name: "bool"}, Ordinal: 12},
+			{Name: "indislive", Type: Type{Name: "bool"}, Ordinal: 13},
+			{Name: "indisreplident", Type: Type{Name: "bool"}, Ordinal: 14},
+			{Name: "indkey", Type: Type{Name: "int2[]"}, Ordinal: 15},
+			{Name: "indcollation", Type: Type{Name: "oid[]"}, Ordinal: 16},
+			{Name: "indclass", Type: Type{Name: "oid[]"}, Ordinal: 17},
+			{Name: "indoption", Type: Type{Name: "int2[]"}, Ordinal: 18},
+			{Name: "indexprs", Type: Type{Name: "text"}, Ordinal: 19},
+			{Name: "indpred", Type: Type{Name: "text"}, Ordinal: 20},
+			{Name: "indcoloptions", Type: Type{Name: "int2[]"}, Ordinal: 21},
+		},
+		OID: 2610,
+	}
+	pgIndexCatalog.VirtualRows = func() [][]string {
+		idxs := c.AllIndexes()
+		out := make([][]string, 0, len(idxs))
+		for _, idx := range idxs {
+			if idx.Table == nil {
+				continue
+			}
+			// Build column-ordinal lookups (1-based) for the parent table.
+			colOrd := make(map[string]int, len(idx.Table.Columns))
+			for _, col := range idx.Table.Columns {
+				colOrd[col.Name] = col.Ordinal + 1
+			}
+			// indkey: key columns then include columns; expression columns get ordinal 0.
+			keyParts := make([]string, 0, len(idx.Columns)+len(idx.IncludeColumns))
+			for _, col := range idx.Columns {
+				if col == "" {
+					keyParts = append(keyParts, "0")
+				} else if ord, ok := colOrd[col]; ok {
+					keyParts = append(keyParts, fmt.Sprintf("%d", ord))
+				} else {
+					keyParts = append(keyParts, "0")
+				}
+			}
+			for _, col := range idx.IncludeColumns {
+				if ord, ok := colOrd[col]; ok {
+					keyParts = append(keyParts, fmt.Sprintf("%d", ord))
+				} else {
+					keyParts = append(keyParts, "0")
+				}
+			}
+			indkey := strings.Join(keyParts, " ")
+			// indclass: one opclass OID per key column (0 = unknown; btree int4=1978).
+			classOIDs := make([]string, len(idx.Columns))
+			for i, col := range idx.Columns {
+				oid := "0"
+				if col != "" {
+					for _, tc := range idx.Table.Columns {
+						if tc.Name == col {
+							switch tc.Type.Name {
+							case "int2", "smallint":
+								oid = "1970"
+							case "int4", "int", "integer", "serial":
+								oid = "1978"
+							case "int8", "bigint", "bigserial":
+								oid = "1980"
+							case "float4", "real":
+								oid = "2968"
+							case "float8", "double precision":
+								oid = "2970"
+							case "text", "varchar", "character varying":
+								oid = "1994"
+							case "name":
+								oid = "1996"
+							case "bpchar", "char", "character":
+								oid = "426"
+							case "oid":
+								oid = "2990"
+							case "bool", "boolean":
+								oid = "424"
+							case "date":
+								oid = "434"
+							case "timestamp", "timestamp without time zone":
+								oid = "2040"
+							case "timestamptz", "timestamp with time zone":
+								oid = "2040"
+							}
+							break
+						}
+					}
+				}
+				classOIDs[i] = oid
+			}
+			indclass := strings.Join(classOIDs, " ")
+			boolStr := func(b bool) string {
+				if b {
+					return "t"
+				}
+				return "f"
+			}
+			natts := len(idx.Columns) + len(idx.IncludeColumns)
+			nkeyatts := len(idx.Columns)
+			// Build space-separated zero-vector for indcollation/indoption.
+			buildZeroVec := func(n int) string {
+				if n <= 0 {
+					return ""
+				}
+				parts := make([]string, n)
+				for i := range parts {
+					parts[i] = "0"
+				}
+				return strings.Join(parts, " ")
+			}
+			out = append(out, []string{
+				fmt.Sprintf("%d", idx.OID),       // indexrelid
+				fmt.Sprintf("%d", idx.Table.OID), // indrelid
+				fmt.Sprintf("%d", natts),          // indnatts
+				fmt.Sprintf("%d", nkeyatts),       // indnkeyatts
+				boolStr(idx.Unique),               // indisunique
+				"f",                               // indnullsnotdistinct
+				boolStr(idx.Primary),              // indisprimary
+				boolStr(idx.IsExclusion),          // indisexclusion
+				"t",                               // indimmediate
+				"f",                               // indisclustered
+				"t",                               // indisvalid
+				"f",                               // indcheckxmin
+				"t",                               // indisready
+				"t",                               // indislive
+				"f",                               // indisreplident
+				indkey,                            // indkey
+				buildZeroVec(nkeyatts),            // indcollation
+				indclass,                          // indclass
+				buildZeroVec(nkeyatts),            // indoption
+				"",                                // indexprs (NULL)
+				"",                                // indpred (NULL)
+				"",                                // indcoloptions (NULL)
+			})
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_index"] = pgIndexCatalog
+
+	// pg_statistic_ext — stores extended statistics objects (OID 3381).
+	// This virtual stub lets queries against pg_statistic_ext succeed instead
+	// of erroring with "relation pg_statistic_ext does not exist". M0097-0023.
+	pgStatisticExt := &Table{
+		Schema: "pg_catalog", Name: "pg_statistic_ext", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "stxrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "stxname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "stxnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "stxowner", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "stxstattarget", Type: Type{Name: "int4"}, Ordinal: 5},
+			{Name: "stxkeys", Type: Type{Name: "int2[]"}, Ordinal: 6},
+			{Name: "stxexprs", Type: Type{Name: "text"}, Ordinal: 7},
+			{Name: "stxkind", Type: Type{Name: "text"}, Ordinal: 8},
+		},
+		OID: 3381,
+	}
+	pgStatisticExt.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		if len(c.statisticsObjs) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(c.statisticsObjs))
+		for _, obj := range c.statisticsObjs {
+			schema := obj.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			nsOID := "2200" // public namespace OID
+			if schema != "public" {
+				nsOID = "0"
+			}
+			row := make([]string, 9)
+			row[0] = fmt.Sprintf("%d", obj.OID)      // oid
+			row[1] = fmt.Sprintf("%d", obj.TableOID) // stxrelid
+			row[2] = obj.Name                        // stxname
+			row[3] = nsOID                           // stxnamespace
+			row[4] = "10"                            // stxowner (bootstrap superuser)
+			row[5] = "-1"                            // stxstattarget (default)
+			row[6] = ""                              // stxkeys
+			row[7] = ""                              // stxexprs
+			row[8] = ""                              // stxkind
+			out = append(out, row)
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_statistic_ext"] = pgStatisticExt
+
+	// pg_collation — stores collation definitions (OID 3456).
+	// This virtual stub lets psql \d+ meta-queries succeed instead of erroring
+	// with "relation pg_collation does not exist". M0097-0023.
+	pgCollation := &Table{
+		Schema: "pg_catalog", Name: "pg_collation", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "collname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "collnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "collowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "collprovider", Type: Type{Name: "char"}, Ordinal: 4},
+			{Name: "collisdeterministic", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "collencoding", Type: Type{Name: "int4"}, Ordinal: 6},
+			{Name: "collcollate", Type: Type{Name: "text"}, Ordinal: 7},
+			{Name: "collctype", Type: Type{Name: "text"}, Ordinal: 8},
+			{Name: "colllocale", Type: Type{Name: "text"}, Ordinal: 9},
+			{Name: "collicurules", Type: Type{Name: "text"}, Ordinal: 10},
+			{Name: "collversion", Type: Type{Name: "text"}, Ordinal: 11},
+		},
+		OID: 3456,
+	}
+	pgCollation.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_collation"] = pgCollation
+
+	// pg_policy — stores row-level security policies (OID 3256).
+	// Row-level security is not implemented in goopg v0; this stub lets psql
+	// \d+ meta-queries succeed instead of erroring. M0097-0023.
+	pgPolicy := &Table{
+		Schema: "pg_catalog", Name: "pg_policy", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "polname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "polrelid", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "polcmd", Type: Type{Name: "char"}, Ordinal: 3},
+			{Name: "polpermissive", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "polroles", Type: Type{Name: "oid[]"}, Ordinal: 5},
+			{Name: "polqual", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "polwithcheck", Type: Type{Name: "text"}, Ordinal: 7},
+		},
+		OID: 3256,
+	}
+	pgPolicy.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_policy"] = pgPolicy
 
 	// pg_wait_events — needs at least one row per type.
 	pgWaitEvents := &Table{
@@ -2792,8 +3442,16 @@ func (c *InMemory) LookupTable(name parser.ObjectName) (*Table, bool) {
 	} else {
 		// Schema-qualified lookup: fall back to unqualified key to handle tables
 		// that were moved to a different schema via SET SCHEMA (catalog key is unchanged).
-		if t, ok := c.tables[name.Name]; ok && strings.EqualFold(t.Schema, name.Schema) {
-			return t, true
+		// A table stored without an explicit schema (t.Schema="") is treated as being
+		// in "public", so a "public.foo" lookup finds a bare-keyed "foo" entry. M0097-0023.
+		if t, ok := c.tables[name.Name]; ok {
+			tSchema := t.Schema
+			if tSchema == "" {
+				tSchema = "public"
+			}
+			if strings.EqualFold(tSchema, name.Schema) {
+				return t, true
+			}
 		}
 	}
 	return nil, false
@@ -2820,10 +3478,15 @@ func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
 	if idx, ok := c.indexes[key(name)]; ok {
 		return idx, ok
 	}
-	// Fallback: try bare name when schema-qualified lookup failed.
-	// Mirrors LookupTable's fallback for the common case where an index
-	// is stored without an explicit schema (e.g. created in search_path context).
-	if name.Schema != "" {
+	if name.Schema == "" {
+		// Unqualified name: try "public.<name>" first (indexes created via DDL
+		// always carry the table's schema, which defaults to "public").
+		if idx, ok := c.indexes["public."+name.Name]; ok {
+			return idx, ok
+		}
+	} else {
+		// Schema-qualified lookup failed: fall back to bare name for indexes
+		// created without an explicit schema in the catalog key.
 		if idx, ok := c.indexes[name.Name]; ok {
 			return idx, ok
 		}
@@ -3035,10 +3698,19 @@ func (c *InMemory) UnregisterSchema(name string) {
 }
 
 // allSchemasLocked returns all (name, oid) pairs. Must be called with mu held.
-func (c *InMemory) allSchemasLocked() []struct{ name string; oid uint32 } {
-	out := make([]struct{ name string; oid uint32 }, 0, len(c.schemas))
+func (c *InMemory) allSchemasLocked() []struct {
+	name string
+	oid  uint32
+} {
+	out := make([]struct {
+		name string
+		oid  uint32
+	}, 0, len(c.schemas))
 	for name, oid := range c.schemas {
-		out = append(out, struct{ name string; oid uint32 }{name, oid})
+		out = append(out, struct {
+			name string
+			oid  uint32
+		}{name, oid})
 	}
 	return out
 }
@@ -3093,6 +3765,26 @@ func (c *InMemory) DropCompatObject(objType, name string) bool {
 		return true
 	}
 	return false
+}
+
+// ListCompatObjects returns all registered names for a given object type.
+func (c *InMemory) ListCompatObjects(objType string) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	key := strings.ToLower(objType)
+	if c.compatObjects == nil {
+		return nil
+	}
+	m := c.compatObjects[key]
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for name := range m {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // RegisterTableRuleKind records the most recently created rule kind for a table.
@@ -3207,6 +3899,69 @@ func (c *InMemory) IndexesOnTable(table *Table) []*Index {
 		out = append(out, idx)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].QualifiedName() < out[j].QualifiedName() })
+	return out
+}
+
+// BuildIndexDef reconstructs the CREATE INDEX DDL string for an index.
+// Used by pg_indexes.indexdef and pg_get_indexdef(). M0097-0023.
+func BuildIndexDef(idx *Index) string {
+	var sb strings.Builder
+	sb.WriteString("CREATE ")
+	if idx.Unique {
+		sb.WriteString("UNIQUE ")
+	}
+	sb.WriteString("INDEX ")
+	sb.WriteString(idx.Name)
+	sb.WriteString(" ON ")
+	schema := idx.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	sb.WriteString(schema)
+	sb.WriteByte('.')
+	if idx.Table != nil {
+		sb.WriteString(idx.Table.Name)
+	}
+	method := idx.Method
+	if method == "" {
+		method = "btree"
+	}
+	sb.WriteString(" USING ")
+	sb.WriteString(method)
+	sb.WriteString(" (")
+	for i, col := range idx.Columns {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		if col == "" {
+			sb.WriteString("(expr)")
+		} else {
+			sb.WriteString(col)
+		}
+	}
+	sb.WriteByte(')')
+	if len(idx.IncludeColumns) > 0 {
+		sb.WriteString(" INCLUDE (")
+		for i, col := range idx.IncludeColumns {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(col)
+		}
+		sb.WriteByte(')')
+	}
+	return sb.String()
+}
+
+// AllIndexes returns every index in the catalog, sorted by OID.
+func (c *InMemory) AllIndexes() []*Index {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*Index, 0, len(c.indexes))
+	for _, idx := range c.indexes {
+		out = append(out, idx)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
 	return out
 }
 
@@ -3707,7 +4462,6 @@ func (c *InMemory) AddEnumValueResult(name, value string, ifNotExists bool, befo
 	return false, nil
 }
 
-
 // RemoveEnumValue removes a label from an existing enum type.
 // Used to roll back ALTER TYPE … ADD VALUE on transaction ROLLBACK. M0097-0022.
 func (c *InMemory) RemoveEnumValue(typeName, label string) {
@@ -3767,6 +4521,14 @@ func (c *InMemory) LookupCompositeTypeFields(name string) []CompositeField {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.compositeTypeFields[k]
+}
+
+// HasCompositeType reports whether the given name refers to a composite type.
+func (c *InMemory) HasCompositeType(name string) bool {
+	k := strings.ToLower(name)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.compositeTypeNames[k]
 }
 
 // DropCompositeType removes a composite type name. Returns an error if not
