@@ -512,6 +512,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				GeneratedAlways: c.GeneratedAlways,
 				DefaultExpr:     c.DefaultExpr,
 				IdentityColumn:  c.IdentityColumn,
+				IdentityStart:   c.IdentityStart,
 			})
 		}
 		for _, item := range s.BodyOrder {
@@ -796,7 +797,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		var seqMin, seqMax int64
 		isSerial := false
 		switch colTypeLow {
-		case "serial", "int4", "integer":
+		case "serial", "int4", "integer", "int":
 			seqMin, seqMax = 1, 2147483647
 			isSerial = colTypeLow == "serial"
 		case "bigserial", "int8", "bigint":
@@ -805,12 +806,21 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		case "smallserial", "int2", "smallint":
 			seqMin, seqMax = 1, 32767
 			isSerial = colTypeLow == "smallserial"
+		default:
+			// Unknown type: use int4 range as a safe default for identity columns.
+			if c.IdentityColumn {
+				seqMin, seqMax = 1, 2147483647
+			}
 		}
 		if !isSerial && !c.IdentityColumn {
 			continue // only register sequences for serial/identity types
 		}
 		seqName := strings.ToLower(s.Name.Name) + "_" + strings.ToLower(c.Name) + "_seq"
-		RegisterSequence(seqName, 1, 1, seqMin, seqMax, false)
+		seqStart := int64(1)
+		if c.IdentityStart != 0 {
+			seqStart = c.IdentityStart
+		}
+		RegisterSequence(seqName, seqStart, 1, seqMin, seqMax, false)
 	}
 
 	// If PARTITION BY, annotate the table with partition metadata
@@ -2803,14 +2813,22 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableAddForeignKey:
 			// v0 accepts the syntax for HammerDB TPC-H
-			// compatibility but does not enforce. The
-			// referenced table must exist (so typos and
-			// dropped relations still surface here); column-
-			// level validation is deferred. See
-			// docs/design/0003-0004-hammerdb-tpch-integration.md.
+			// compatibility but does not enforce referential
+			// integrity. The referenced table must exist (so
+			// typos and dropped relations still surface here);
+			// column-level validation is deferred. Store the FK
+			// so TRUNCATE CASCADE BFS can find referencing tables.
+			// See docs/design/0003-0004-hammerdb-tpch-integration.md.
 			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable); !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
 			}
+			fk := catalog.ForeignKey{
+				Columns:    append([]string(nil), act.Columns...),
+				RefTable:   act.RefTable.Name,
+				RefColumns: append([]string(nil), act.RefColumns...),
+				Deferrable: act.Deferrable,
+			}
+			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		case parser.AlterTableAddCheck:
 			// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
 			// Track the constraint name so violations report it. A named
@@ -4140,16 +4158,177 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "TRUNCATE requires Pool in Context"}
 	}
-	for _, name := range s.Names {
+	im, hasIM := o.ctx.Catalog.(*catalog.InMemory)
+
+	// Build the initial set of tables (OID → table pointer).
+	type tableEntry struct {
+		tbl  *catalog.Table
+		only bool
+	}
+	tableSet := make(map[uint32]*tableEntry) // deduplicated by OID
+	for i, name := range s.Names {
 		tbl, ok := o.ctx.Catalog.LookupTable(name)
 		if !ok {
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", name.String())}
 		}
-		if err := o.truncateTableAndPartitions(tbl, s.Pos()); err != nil {
+		only := len(s.Only) > i && s.Only[i]
+		if _, exists := tableSet[tbl.OID]; !exists {
+			tableSet[tbl.OID] = &tableEntry{tbl: tbl, only: only}
+		}
+	}
+
+	// FK constraint check / CASCADE expansion.
+	// For each table in the set, find all tables (not in the set) that have an FK
+	// pointing to it. If behavior is CASCADE, expand the set and emit NOTICEs.
+	// Otherwise fail with "cannot truncate a table referenced in a foreign key constraint".
+	if hasIM {
+		allTables := im.AllTables()
+		// Process in a BFS loop because CASCADE expansion may introduce new referencing tables.
+		for {
+			expanded := false
+			for _, entry := range tableSet {
+				tbl := entry.tbl
+				for _, other := range allTables {
+					if _, inSet := tableSet[other.OID]; inSet {
+						continue // already in set
+					}
+					for _, fk := range other.ForeignKeys {
+						refName := strings.ToLower(fk.RefTable)
+						if refName != strings.ToLower(tbl.Name) {
+							continue
+						}
+						// other references tbl and is not in the truncation set.
+						if s.Behavior == parser.DropCascade {
+							tableSet[other.OID] = &tableEntry{tbl: other, only: false}
+							o.ctx.AddNotice(fmt.Sprintf("truncate cascades to table %q", other.Name))
+							expanded = true
+						} else {
+							return &ExecError{
+								Code:    "0A000",
+								Pos:     s.Pos(),
+								Message: "cannot truncate a table referenced in a foreign key constraint",
+								Detail:  fmt.Sprintf("Table %q references %q.", other.Name, tbl.Name),
+								Hint:    fmt.Sprintf("Truncate table %q at the same time, or use TRUNCATE ... CASCADE.", other.Name),
+							}
+						}
+					}
+				}
+			}
+			if !expanded {
+				break
+			}
+		}
+
+		// When CASCADE is used, also emit NOTICEs for partition/inheritance
+		// children of CASCADE-added tables (children not explicitly listed).
+		// BFS until stable so grandchildren are covered too.
+		if s.Behavior == parser.DropCascade {
+			for {
+				expanded := false
+				for _, entry := range tableSet {
+					children := append(im.PartitionChildren(entry.tbl.OID), im.InheritanceChildren(entry.tbl.OID)...)
+					for _, child := range children {
+						if _, inSet := tableSet[child.OID]; inSet {
+							continue
+						}
+						tableSet[child.OID] = &tableEntry{tbl: child, only: false}
+						o.ctx.AddNotice(fmt.Sprintf("truncate cascades to table %q", child.Name))
+						expanded = true
+					}
+				}
+				if !expanded {
+					break
+				}
+			}
+		}
+
+		// Also validate: TRUNCATE ONLY on a partitioned table is not allowed.
+		for _, entry := range tableSet {
+			if entry.only && len(entry.tbl.PartitionKey) > 0 {
+				return &ExecError{
+					Code:    "0A000",
+					Pos:     s.Pos(),
+					Message: "cannot truncate only a partitioned table",
+					Hint:    "Do not specify the ONLY keyword, or use TRUNCATE ONLY on the partitions directly.",
+				}
+			}
+		}
+	}
+
+	// Fire BEFORE TRUNCATE FOR EACH STATEMENT triggers on all tables.
+	for _, entry := range tableSet {
+		if err := fireStatementTriggers(o.ctx, entry.tbl, "before", "truncate"); err != nil {
 			return err
 		}
 	}
+
+	// Truncate all tables (and their partition children unless ONLY).
+	for _, entry := range tableSet {
+		if err := o.truncateTableAndPartitions(entry.tbl, s.Pos(), entry.only); err != nil {
+			return err
+		}
+	}
+
+	// RESTART IDENTITY: reset sequences for all truncated tables.
+	if s.RestartIdentity {
+		for _, entry := range tableSet {
+			tbl := entry.tbl
+			for _, col := range tbl.Columns {
+				if col.Dropped {
+					continue
+				}
+				colTypeLow := strings.ToLower(col.Type.Name)
+				isSerial := colTypeLow == "serial" || colTypeLow == "bigserial" || colTypeLow == "smallserial"
+				var seqName string
+				if isSerial || col.IdentityColumn {
+					seqName = strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+				} else {
+					// Column uses an explicit nextval(seqname) default — reset the referenced sequence.
+					seqName = extractNextvalSeqNameFromExpr(col.DefaultExpr)
+				}
+				if seqName != "" {
+					ResetSequence(seqName)
+				}
+			}
+		}
+	}
+
+	// Fire AFTER TRUNCATE FOR EACH STATEMENT triggers on all tables.
+	for _, entry := range tableSet {
+		if err := fireStatementTriggers(o.ctx, entry.tbl, "after", "truncate"); err != nil {
+			return err
+		}
+	}
+
 	return nil
+}
+
+// extractNextvalSeqNameFromExpr extracts the sequence name from a nextval() AST expression.
+// Returns "" if the expression is not a nextval() call.
+func extractNextvalSeqNameFromExpr(expr parser.Expr) string {
+	if expr == nil {
+		return ""
+	}
+	fc, ok := expr.(*parser.FuncCall)
+	if !ok || !strings.EqualFold(fc.Name.Name, "nextval") || len(fc.Args) == 0 {
+		return ""
+	}
+	// Handle nextval('seqname') and nextval('seqname'::regclass)
+	arg := fc.Args[0]
+	// Unwrap cast if present: nextval('seqname'::regclass)
+	if cast, ok2 := arg.(*parser.CastExpr); ok2 {
+		arg = cast.Operand
+	}
+	sc, ok := arg.(*parser.StringConst)
+	if !ok {
+		return ""
+	}
+	name := sc.Value
+	// Strip schema prefix.
+	if idx := strings.LastIndex(name, "."); idx >= 0 {
+		name = name[idx+1:]
+	}
+	return strings.ToLower(strings.TrimSpace(name))
 }
 
 // truncateTableAndPartitions truncates a single table's heap + indexes and
@@ -4158,14 +4337,19 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 // M0097-0028 fix: without recursion, TRUNCATE on a multi-level partitioned
 // table left data in grandchild partitions, causing subsequent tests to see
 // stale rows.
-func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int) error {
-	// First recurse into partition children so the leaves are cleared before
-	// the parent (matches PG's depth-first traversal order, though the order
-	// doesn't matter for correctness here).
-	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		for _, child := range im.PartitionChildren(tbl.OID) {
-			if err := o.truncateTableAndPartitions(child, pos); err != nil {
-				return err
+func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only bool) error {
+	// Recurse into partition/inheritance children unless ONLY was specified.
+	if !only {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			for _, child := range im.PartitionChildren(tbl.OID) {
+				if err := o.truncateTableAndPartitions(child, pos, false); err != nil {
+					return err
+				}
+			}
+			for _, child := range im.InheritanceChildren(tbl.OID) {
+				if err := o.truncateTableAndPartitions(child, pos, false); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -5611,6 +5795,7 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 		ForEachRow: s.ForEachRow,
 		FuncName:   s.FuncName.Name,
 		FuncSchema: s.FuncName.Schema,
+		Args:       append([]string(nil), s.FuncArgs...),
 	}
 	// Remove any existing trigger with the same name on this table.
 	filtered := tbl.Triggers[:0]

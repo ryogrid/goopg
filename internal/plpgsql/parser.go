@@ -1154,6 +1154,9 @@ func (p *bodyParser) scanExprToSemicolon(ctx string) (parser.Expr, error) {
 
 // parseReturn parses `RETURN [NEXT] expr;`. RETURN NEXT emits one row
 // from a SETOF function and continues; plain RETURN exits the function.
+// parseReturn parses `RETURN [NEXT] expr;` or `RETURN QUERY <select>;`.
+// RETURN NEXT emits one row from a SETOF function and continues; plain RETURN
+// exits the function; RETURN QUERY runs a SELECT and returns all rows.
 func (p *bodyParser) parseReturn() (Stmt, error) {
 	retTok, err := p.expectKeyword(parser.KwReturn)
 	if err != nil {
@@ -1170,6 +1173,27 @@ func (p *bodyParser) parseReturn() (Stmt, error) {
 			return nil, p.errAtCur("expected ';' to terminate RETURN NEXT")
 		}
 		return &ReturnNextStmt{pos: retTok.Pos, Expr: expr}, nil
+	}
+	// RETURN QUERY <select>; — runs a query and returns all rows. M0097-0024.
+	if p.cur().Kind == parser.TokenIdent && strings.EqualFold(p.cur().Value, "query") {
+		p.advance() // consume QUERY
+		// Collect the raw SQL text up to the matching semicolon.
+		sqlStart := p.cur().Pos
+		for p.cur().Kind != parser.TokenEOF {
+			if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		sqlEnd := p.cur().Pos
+		if p.cur().Kind != parser.TokenSymbol || p.cur().Value != ";" {
+			return nil, p.errAtCur("expected ';' to terminate RETURN QUERY")
+		}
+		querySrc := strings.TrimSpace(p.src[sqlStart:sqlEnd])
+		if !p.acceptSymbol(";") {
+			return nil, p.errAtCur("expected ';' to terminate RETURN QUERY")
+		}
+		return &ReturnQueryStmt{pos: retTok.Pos, QuerySrc: querySrc}, nil
 	}
 	expr, err := p.scanExprToSemicolon("RETURN expression")
 	if err != nil {

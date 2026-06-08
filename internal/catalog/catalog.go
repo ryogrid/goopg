@@ -76,6 +76,8 @@ type Column struct {
 	// IdentityColumn is true for GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
 	// When true, INSERT without an explicit value calls nextval(tablename_colname_seq).
 	IdentityColumn bool
+	// IdentityStart is the START WITH value from the sequence options (0 = use default=1).
+	IdentityStart int64
 	// Dropped is true for columns removed via ALTER TABLE DROP COLUMN.
 	// The column's heap slot (Ordinal) is retained for tuple compatibility;
 	// dropped columns are invisible in SELECT *, RETURNING *, and column lookups.
@@ -254,10 +256,11 @@ type Trigger struct {
 	Name       string
 	TableOID   uint32
 	Timing     TriggerTiming
-	Events     []string // "insert", "update", "delete"
+	Events     []string // "insert", "update", "delete", "truncate"
 	ForEachRow bool
 	FuncName   string // function/procedure name (unschemed)
 	FuncSchema string
+	Args       []string // trigger function arguments (TG_ARGV)
 }
 
 // ForeignKey describes one referential integrity constraint stored on a

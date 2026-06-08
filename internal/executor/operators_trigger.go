@@ -37,6 +37,9 @@ func fireTriggers(ctx *Context, tbl *catalog.Table, timing, event string, oldRow
 
 	for i := range tbl.Triggers {
 		trig := &tbl.Triggers[i]
+		if !trig.ForEachRow {
+			continue // row-level only; statement-level handled by fireStatementTriggers
+		}
 		if !triggerMatchesEvent(trig, timingLow, eventLow) {
 			continue
 		}
@@ -53,6 +56,7 @@ func fireTriggers(ctx *Context, tbl *catalog.Table, timing, event string, oldRow
 			TGOp:    strings.ToUpper(event),   // PostgreSQL uses uppercase INSERT/UPDATE/DELETE
 			TGLevel: "ROW",                     // PostgreSQL uses uppercase ROW/STATEMENT
 			TGTable: tbl.Name,
+			TGArgs:  trig.Args,
 		}
 		retRow, ok, err := executePLpgSQLTriggerBody(r, trigCtx, ctx)
 		if err != nil {
@@ -78,11 +82,48 @@ func fireTriggers(ctx *Context, tbl *catalog.Table, timing, event string, oldRow
 	return newRow, true
 }
 
+// fireStatementTriggers fires FOR EACH STATEMENT triggers for the given event
+// on a table. Used for TRUNCATE triggers. Returns any execution error.
+func fireStatementTriggers(ctx *Context, tbl *catalog.Table, timing, event string) error {
+	rs := ctx.Catalog.Routines()
+	if rs == nil {
+		return nil
+	}
+	timingLow := strings.ToLower(timing)
+	eventLow := strings.ToLower(event)
+	for i := range tbl.Triggers {
+		trig := &tbl.Triggers[i]
+		if trig.ForEachRow {
+			continue // skip row-level triggers
+		}
+		if !triggerMatchesEvent(trig, timingLow, eventLow) {
+			continue
+		}
+		r := lookupTriggerRoutine(ctx, trig)
+		if r == nil {
+			continue
+		}
+		trigCtx := &plpgsqlTrigCtx{
+			OldRow:  nil,
+			NewRow:  nil,
+			Cols:    tbl.Columns,
+			TGName:  trig.Name,
+			TGWhen:  strings.ToUpper(timing),
+			TGOp:    strings.ToUpper(event),
+			TGLevel: "STATEMENT",
+			TGTable: tbl.Name,
+			TGArgs:  trig.Args,
+		}
+		_, _, err := executePLpgSQLTriggerBody(r, trigCtx, ctx)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // triggerMatchesEvent reports whether trig fires for the given timing+event.
 func triggerMatchesEvent(trig *catalog.Trigger, timing, event string) bool {
-	if !trig.ForEachRow {
-		return false // statement-level triggers not yet supported
-	}
 	switch strings.ToLower(timing) {
 	case "before":
 		if trig.Timing != catalog.TriggerBefore {

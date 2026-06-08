@@ -1996,7 +1996,8 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			if p.acceptIdentKeyword("identity") {
 				col.IdentityColumn = true
 				col.IdentityAlways = isAlways
-				// Skip optional sequence options: (START WITH n INCREMENT BY m ...)
+				// Parse optional sequence options: (START WITH n INCREMENT BY m ...)
+				// We capture START WITH to initialize the sequence correctly.
 				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 					depth := 1
 					p.advance()
@@ -2009,6 +2010,26 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 								if depth == 0 {
 									p.advance()
 									break
+								}
+							}
+						}
+						// Capture START WITH value.
+						if depth == 1 && p.cur().Kind == TokenIdent &&
+							strings.EqualFold(p.cur().Value, "start") {
+							p.advance() // consume START
+							// WITH is a reserved keyword (KwWith), so accept both forms.
+							_ = p.acceptKeyword(KwWith) || p.acceptIdentKeyword("with")
+							neg := p.cur().Kind == TokenSymbol && p.cur().Value == "-"
+							if neg {
+								p.advance()
+							}
+							if p.cur().Kind == TokenIntLit {
+								if v, err2 := strconv.ParseInt(p.cur().Value, 10, 64); err2 == nil {
+									if neg {
+										col.IdentityStart = -v
+									} else {
+										col.IdentityStart = v
+									}
 								}
 							}
 						}
@@ -3256,7 +3277,7 @@ func (p *parser) parseCreateTriggerTail(pos int) (Stmt, error) {
 		return nil, p.errAtCur("expected BEFORE, AFTER, or INSTEAD OF after trigger name")
 	}
 
-	// Events: INSERT | UPDATE | DELETE [OR ...]
+	// Events: INSERT | UPDATE | DELETE | TRUNCATE [OR ...]
 	for {
 		switch {
 		case p.acceptKeyword(KwInsert):
@@ -3265,8 +3286,10 @@ func (p *parser) parseCreateTriggerTail(pos int) (Stmt, error) {
 			stmt.Events = append(stmt.Events, "update")
 		case p.acceptKeyword(KwDelete):
 			stmt.Events = append(stmt.Events, "delete")
+		case p.acceptKeyword(KwTruncate) || p.acceptIdentKeyword("truncate"):
+			stmt.Events = append(stmt.Events, "truncate")
 		default:
-			return nil, p.errAtCur("expected INSERT, UPDATE, or DELETE in trigger events")
+			return nil, p.errAtCur("expected INSERT, UPDATE, DELETE, or TRUNCATE in trigger events")
 		}
 		if !p.acceptKeyword(KwOr) {
 			break
@@ -3321,10 +3344,20 @@ func (p *parser) parseCreateTriggerTail(pos int) (Stmt, error) {
 		return nil, err
 	}
 	stmt.FuncName = funcName
-	// Skip the argument list (trigger functions take no SQL arguments).
+	// Parse the optional argument list (string literals passed as TG_ARGV).
 	if p.acceptSymbol("(") {
-		for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
-			p.advance()
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				p.advance()
+				break
+			}
+			if p.cur().Kind == TokenStringLit {
+				stmt.FuncArgs = append(stmt.FuncArgs, p.cur().Value)
+				p.advance()
+			} else {
+				p.advance() // skip non-string args
+			}
+			p.acceptSymbol(",")
 		}
 	}
 	return stmt, nil
@@ -4727,21 +4760,26 @@ func (p *parser) parseTruncate() (Stmt, error) {
 	_ = p.acceptKeyword(KwTable) // optional
 	// Parse table list with optional ONLY prefix per entry.
 	var names []ObjectName
+	var onlyFlags []bool
 	for {
-		_ = p.acceptIdentKeyword("only") // ONLY is optional before each name
+		only := p.acceptIdentKeyword("only") // ONLY is optional before each name
 		name, err := p.parseObjectName()
 		if err != nil {
 			return nil, err
 		}
 		names = append(names, name)
+		onlyFlags = append(onlyFlags, only)
 		if !p.acceptSymbol(",") {
 			break
 		}
 	}
-	stmt := &TruncateStmt{pos: t.Pos, Names: names}
+	stmt := &TruncateStmt{pos: t.Pos, Names: names, Only: onlyFlags}
 	// Optional RESTART IDENTITY | CONTINUE IDENTITY clause.
-	_ = p.acceptIdentKeyword("restart") && p.acceptIdentKeyword("identity") ||
-		p.acceptIdentKeyword("continue") && p.acceptIdentKeyword("identity")
+	if p.acceptIdentKeyword("restart") && p.acceptIdentKeyword("identity") {
+		stmt.RestartIdentity = true
+	} else {
+		_ = p.acceptIdentKeyword("continue") && p.acceptIdentKeyword("identity")
+	}
 	switch {
 	case p.acceptKeyword(KwCascade):
 		stmt.Behavior = DropCascade
