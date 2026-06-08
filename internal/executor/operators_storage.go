@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
@@ -2305,12 +2306,17 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				}
 				// Check unique constraints AFTER stamping xmax so isLiveForUniqueCheck
 				// treats the old row version as dead. Mirrors the normal seqscan update path.
+				// Skip indexes whose key columns are unchanged: a no-key-change UPDATE
+				// cannot violate its own uniqueness, and probing would spuriously flag a
+				// concurrently-updated sibling version of the same key as a live duplicate
+				// (pgbench TPC-B UPDATE pgbench_tellers contention). Cross-partition moves
+				// force a full probe against the destination relation.
 				{
 					chkTbl := idxTbl
 					if destPartIdx != nil {
 						chkTbl = destPartIdx
 					}
-					if uerr := checkUniqueIndexesForInsert(o.ctx, chkTbl, targetWriteCols, pu.newRow, o.plan.Pos()); uerr != nil {
+					if uerr := checkUniqueIndexesForUpdate(o.ctx, chkTbl, targetWriteCols, pu.oldRow, pu.newRow, isCrossPartitionMoveIdx, o.plan.Pos()); uerr != nil {
 						return nil, uerr
 					}
 				}
@@ -2716,6 +2722,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				}
 				// Check unique constraints on the new row AFTER stamping xmax on the
 				// old tuple (so isLiveForUniqueCheck treats the old version as dead).
+				// Skip indexes whose key columns are unchanged: a no-key-change UPDATE
+				// cannot violate its own uniqueness, and probing would spuriously flag a
+				// concurrently-updated sibling version of the same key as a live duplicate
+				// (pgbench TPC-B UPDATE pgbench_tellers contention). Cross-partition moves
+				// force a full probe against the destination relation.
 				{
 					chkTbl := pu.scanTbl
 					if chkTbl == nil {
@@ -2724,7 +2735,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					if destPart != nil {
 						chkTbl = destPart
 					}
-					if uerr := checkUniqueIndexesForInsert(o.ctx, chkTbl, targetWriteCols, pu.newRow, o.plan.Pos()); uerr != nil {
+					if uerr := checkUniqueIndexesForUpdate(o.ctx, chkTbl, targetWriteCols, pu.oldRow, pu.newRow, isCrossPartitionMove, o.plan.Pos()); uerr != nil {
 						return nil, uerr
 					}
 				}
@@ -3824,6 +3835,74 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 			continue
 		}
 		detail := buildUniqueConstraintDetail(idx, cols, row)
+		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
+			return raiseErr
+		}
+	}
+	return nil
+}
+
+// indexKeyColumnsChanged reports whether any of idx's key columns differ
+// between oldRow and newRow. Comparison is on the encoded index-key bytes so
+// it matches exactly the value the btree stores (collation / type
+// normalisation included). If either row cannot be encoded, it conservatively
+// reports "changed" so the caller still performs the uniqueness probe.
+func indexKeyColumnsChanged(idx *catalog.Index, cols []catalog.Column, oldRow, newRow Row, cat catalog.Catalog) bool {
+	oldKey, oerr := encodeIndexKeyFromCols(idx, cols, oldRow, cat)
+	newKey, nerr := encodeIndexKeyFromCols(idx, cols, newRow, cat)
+	if oerr != nil || nerr != nil || oldKey == nil || newKey == nil {
+		return true
+	}
+	return !bytes.Equal(oldKey, newKey)
+}
+
+// checkUniqueIndexesForUpdate enforces unique-constraint violations for the
+// new version produced by an UPDATE.
+//
+// Unlike the INSERT-time check, it SKIPS any unique/primary index whose key
+// columns are unchanged between oldRow and newRow: an UPDATE that does not
+// alter an index's key cannot violate that index's uniqueness — the row
+// already legitimately occupies that key slot, and the "duplicate" the probe
+// would find is just another MVCC version of the very row being updated.
+//
+// Mirrors PostgreSQL, where a no-key-change UPDATE never raises 23505 against
+// its own row (the index is not even touched for a HOT update, and for a
+// non-HOT update _bt_check_unique recognises the prior versions as the same
+// logical row). Without this scoping, a no-key-change UPDATE that falls back
+// to the non-HOT path under concurrency (HOT blocked by a sibling client's
+// in-flight xmax / a full page) re-probes the index and finds a concurrently
+// updated version of the same key whose xmax is still in-flight; the
+// INSERT-time visibility test classifies that as a live duplicate and raises a
+// spurious "duplicate key value violates unique constraint" (the pgbench
+// TPC-B `UPDATE pgbench_tellers` contention failure).
+//
+// forceAll bypasses the skip and probes every unique index regardless of
+// whether the key changed. It is set for cross-partition moves, which are an
+// internal DELETE+INSERT into a different relation that may already hold the
+// key independently of this row's prior version.
+func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalog.Column, oldRow, newRow Row, forceAll bool, pos int) error {
+	if ctx.Catalog == nil || ctx.Pool == nil {
+		return nil
+	}
+	rel := ctx.Catalog.RelFileNode(tbl)
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if !idx.Unique && !idx.Primary {
+			continue
+		}
+		if !forceAll && oldRow != nil && !indexKeyColumnsChanged(idx, cols, oldRow, newRow, ctx.Catalog) {
+			// Key columns unchanged — cannot collide with itself. Skip the probe.
+			continue
+		}
+		idxRel := ctx.Catalog.IndexRelFileNode(idx)
+		tree, err := btree.Open(ctx.Pool, idxRel)
+		if err != nil {
+			continue
+		}
+		key, err := encodeIndexKeyFromCols(idx, cols, newRow, ctx.Catalog)
+		if err != nil || key == nil {
+			continue
+		}
+		detail := buildUniqueConstraintDetail(idx, cols, newRow)
 		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
 			return raiseErr
 		}

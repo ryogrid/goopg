@@ -5638,6 +5638,46 @@ is an impossible data-varlena header.
 **Geometric mean:** 36.30 s  
 **Full report:** `bench/tpch/logs/tpch_power_test_20260526.md`
 
+- [x] **M0111-0008 — Fix spurious `pgbench_tellers_pkey` 23505 on no-key-change UPDATE under concurrency**
+      - Summary: CI (`.github/workflows/test.yml`) `pgbench -T 30 -c 2 -j 2`
+        aborted with `duplicate key value violates unique constraint
+        "pgbench_tellers_pkey"` on the TPC-B `UPDATE pgbench_tellers SET
+        tbalance = …` (~750 tx in, i.e. a concurrency race, not first-tx).
+      - Root cause: the UPDATE does not change the key (`tid`) and is
+        HOT-eligible, but under contention HOT falls back to the non-HOT
+        delete+insert path, which (since commit `2c779d66`) ran the INSERT-time
+        `checkUniqueIndexesForInsert`. `uniqueCheckWithWait` waits only on a
+        concurrent `xmin`, never on an in-flight `xmax`, so `isLiveForUniqueCheck`
+        classified a sibling MVCC version of the same `tid` (being updated by a
+        concurrent client, `xmax` active) as a *live duplicate* → spurious 23505.
+        A no-key-change UPDATE can never violate its own uniqueness (PG touches
+        no index for HOT; `_bt_check_unique` recognises prior versions as the
+        same row).
+      - **Fixed (2026-06-08, commit `<pending>`):** new
+        `checkUniqueIndexesForUpdate` + `indexKeyColumnsChanged` in
+        `internal/executor/operators_storage.go`; the two UPDATE non-HOT call
+        sites (`updateViaIndex`, seqscan update) skip any unique/primary index
+        whose key columns are unchanged. `forceAll=true` for cross-partition
+        moves preserves the full probe. INSERT/MERGE paths and the shared
+        unique-check helpers are unchanged; a genuine key-changing UPDATE that
+        collides still raises 23505 (preserves `2c779d66` / M0100-0005r).
+      - Verification: `pgbench -T 30 -c 2 -j 2` (CI config) × 3 → exit 0,
+        0 failed, 0 errors (4989 / 5036 / 6759 tx). New regression tests
+        `TestCheckUniqueIndexesForUpdate_{NoKeyChangeSkips,KeyChangeStillEnforced,ForceAllProbesUnchangedKey}`
+        in `insert_unique_constraint_test.go`. Write-path-only change → TPC-H
+        read-only Q12/Q13 row counts structurally unaffected.
+      - Analysis: `analysis/pgbench-tellers-duplicate-key-fix-20260608.md`.
+      - **Follow-up discovered (NOT fixed here):** under heavier contention
+        (`pgbench -c 4 -j 4`, scale 1) a backend that returns 40001 (EPQ
+        retries exhausted) mid-transaction leaves the connection wedged —
+        pgbench reports `current transaction is aborted, commands ignored`,
+        TPS→0, surviving clients hang forever; the erroring backend's goroutine
+        vanishes (no defers run, 0 CPU, all OS threads parked, socket
+        ESTAB/CLOSE-WAIT, `pg_stat_activity` still active). This corroborates
+        M0111-0001's deferred "next step (d) investigate 10-psql hang (possible
+        page-lock deadlock)". Out of CI scope (`-c 2` is robust); needs its own
+        transaction-error-recovery / protocol-state investigation.
+
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 
 Operational note (2026-05-22):
