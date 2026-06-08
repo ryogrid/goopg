@@ -27,6 +27,7 @@ type seqState struct {
 	min       int64
 	max       int64
 	cycle     bool
+	ownedBy   string     // "table.column" set by ALTER SEQUENCE ... OWNED BY
 	mu        sync.Mutex // serialises nextval
 }
 
@@ -95,6 +96,35 @@ func DropSequence(name string) bool {
 	return loaded
 }
 
+// SetSequenceOwnedBy records that the sequence with the given name is owned by
+// "table.column" (as produced by ALTER SEQUENCE ... OWNED BY). Pass "" to clear.
+func SetSequenceOwnedBy(name, owner string) {
+	v, ok := seqRegistry.Load(seqKey(name))
+	if !ok {
+		return
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	s.ownedBy = strings.ToLower(owner)
+	s.mu.Unlock()
+}
+
+// DropSequencesOwnedByTable drops all sequences whose ownedBy field starts with
+// "tableName." (case-insensitive). Called by DROP TABLE to cascade-drop owned sequences.
+func DropSequencesOwnedByTable(tableName string) {
+	prefix := strings.ToLower(tableName) + "."
+	seqRegistry.Range(func(k, v any) bool {
+		s := v.(*seqState)
+		s.mu.Lock()
+		owned := s.ownedBy
+		s.mu.Unlock()
+		if strings.HasPrefix(owned, prefix) {
+			seqRegistry.Delete(k)
+		}
+		return true
+	})
+}
+
 // ResetSequence resets a sequence to its start value (equivalent to TRUNCATE ... RESTART IDENTITY).
 // Returns false if the sequence does not exist.
 func ResetSequence(name string) bool {
@@ -106,6 +136,26 @@ func ResetSequence(name string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.current.Store(s.start - s.increment)
+	return true
+}
+
+// GetSequenceCurrentValue returns the raw internal current counter of the sequence.
+// The next nextval() call will return current+increment. Returns (0, false) if not found.
+func GetSequenceCurrentValue(name string) (int64, bool) {
+	v, ok := seqRegistry.Load(seqKey(name))
+	if !ok {
+		return 0, false
+	}
+	return v.(*seqState).current.Load(), true
+}
+
+// SetSequenceCurrentValue directly sets the internal counter (used for ROLLBACK of RESTART IDENTITY).
+func SetSequenceCurrentValue(name string, val int64) bool {
+	v, ok := seqRegistry.Load(seqKey(name))
+	if !ok {
+		return false
+	}
+	v.(*seqState).current.Store(val)
 	return true
 }
 
@@ -123,11 +173,7 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	name := args[0].StringValue()
 	s := LookupSequence(name)
 	if s == nil {
-		// Auto-create a sequence with defaults if it doesn't exist.
-		// This handles cases where SERIAL columns reference sequences
-		// that haven't been explicitly created.
-		RegisterSequence(name, 1, 1, 1, 9223372036854775807, false)
-		s = LookupSequence(name)
+		return Datum{}, &ExecError{Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", name)}
 	}
 	v, err := s.nextVal()
 	if err != nil {

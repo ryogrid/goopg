@@ -3486,12 +3486,37 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return nil, err
 		}
 		stmt.Name = name
-		// Consume options until end of statement (no semicolon, just stop).
+		// Consume options until end of statement, extracting OWNED BY if present.
 		for p.cur().Kind != TokenEOF {
 			t := p.cur()
 			if t.Kind == TokenSymbol && t.Value == ";" {
 				break
 			}
+			// Detect OWNED BY clause.
+			if p.acceptIdentKeyword("owned") {
+				_ = p.acceptKeyword(KwBy)
+				if p.acceptIdentKeyword("none") {
+					stmt.OwnedBy = ""
+					continue
+				}
+				// Parse table.column or just table.
+				owner, err := p.parseObjectName()
+				if err != nil {
+					break
+				}
+				if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+					p.advance()
+					col, err := p.parseIdent()
+					if err != nil {
+						break
+					}
+					stmt.OwnedBy = owner.String() + "." + identText(col)
+				} else {
+					stmt.OwnedBy = owner.String()
+				}
+				continue
+			}
+			_ = t
 			p.advance()
 		}
 		return stmt, nil

@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"strings"
+
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -57,5 +59,33 @@ func (o *userSrfScanOp) Next() (TupleSlot, error) {
 	d := o.rows[o.idx]
 	o.idx++
 	sch := o.Schema()
+	// When the schema has multiple OUT-parameter columns, the datum is a
+	// composite text "(v1,v2,...)" — decompose it into individual column values.
+	if len(sch) > 1 && d.Kind == KindString {
+		row := decomposeCompositeText(d.StringValue(), len(sch))
+		return asSlot(sch, row), nil
+	}
 	return asSlot(sch, Row{d}), nil
+}
+
+// decomposeCompositeText splits a PostgreSQL composite literal "(v1,v2,...)"
+// into n Datum values. Empty fields become NullDatum.
+func decomposeCompositeText(s string, n int) Row {
+	// Strip outer parens.
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '(' && s[len(s)-1] == ')' {
+		s = s[1 : len(s)-1]
+	}
+	// Simple comma-split (no quoted-string handling — sufficient for
+	// text/int/regclass values that don't contain commas).
+	parts := strings.SplitN(s, ",", n)
+	row := make(Row, n)
+	for i := range row {
+		if i < len(parts) && parts[i] != "" {
+			row[i] = NewStringDatum(parts[i])
+		} else {
+			row[i] = NullDatum
+		}
+	}
+	return row
 }

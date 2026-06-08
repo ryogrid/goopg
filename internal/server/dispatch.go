@@ -1425,8 +1425,11 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		case planner.TxRollback:
 			if connTx != nil && connTx.InExplicit() {
-				// Restore any routines dropped in this transaction before rolling back.
+				// Undo DDL creates, TRUNCATE page snapshots, and RESTART IDENTITY
+				// before TxnMgr.Rollback so catalog lookups still work.
 				if sess := connTx.Session(); sess != nil {
+					executor.ProcessRollbackUndos(ctx, sess)
+					// Restore any routines dropped in this transaction.
 					if rs := s.cfg.Catalog.Routines(); rs != nil {
 						for _, r := range sess.TakePendingRoutineDrops() {
 							_, _ = rs.Create(r, true)

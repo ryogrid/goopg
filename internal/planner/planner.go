@@ -2928,21 +2928,51 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 					if alias == "" {
 						alias = strings.ToLower(tf.Name)
 					}
-					colName := alias
-					if len(rv.Columns) > 0 {
-						colName = rv.Columns[0]
+					// If the routine has OUT parameters, expand them as separate
+					// columns (matches PostgreSQL's treatment of SETOF record
+					// functions with named OUT params).
+					var outCols []catalog.Column
+					for i, mode := range r.ArgModes {
+						if mode == "o" || mode == "b" {
+							name := ""
+							if i < len(r.ArgNames) {
+								name = r.ArgNames[i]
+							}
+							if name == "" {
+								name = fmt.Sprintf("column%d", len(outCols)+1)
+							}
+							typ := catalog.Type{Name: "text"}
+							if i < len(r.ArgTypes) {
+								typ = r.ArgTypes[i]
+							}
+							outCols = append(outCols, catalog.Column{Name: name, Type: typ, Ordinal: len(outCols)})
+						}
 					}
-					retType := r.ReturnType.Name
-					if retType == "" {
-						retType = "text"
+					var tbl *catalog.Table
+					var schema Schema
+					if len(outCols) > 0 {
+						// Multi-column schema from OUT parameters.
+						tbl = &catalog.Table{Name: alias, Columns: outCols}
+						for _, c := range outCols {
+							schema = append(schema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: sourceIdx})
+						}
+					} else {
+						colName := alias
+						if len(rv.Columns) > 0 {
+							colName = rv.Columns[0]
+						}
+						retType := r.ReturnType.Name
+						if retType == "" {
+							retType = "text"
+						}
+						tbl = &catalog.Table{
+							Name: alias,
+							Columns: []catalog.Column{
+								{Name: colName, Type: catalog.Type{Name: retType}, Ordinal: 0},
+							},
+						}
+						schema = Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: retType}, SourceTableIdx: sourceIdx}}
 					}
-					tbl := &catalog.Table{
-						Name: alias,
-						Columns: []catalog.Column{
-							{Name: colName, Type: catalog.Type{Name: retType}, Ordinal: 0},
-						},
-					}
-					schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: retType}, SourceTableIdx: sourceIdx}}
 					node := &UserSrfScan{pos: tf.Pos(), Routine: r, Args: resolvedArgs, schema: schema}
 					b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 					return node, b, nil

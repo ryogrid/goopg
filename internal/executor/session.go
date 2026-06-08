@@ -39,6 +39,26 @@ type DDLUndoEntry struct {
 	IsIndex bool
 }
 
+// relPageSnapshot captures the full page contents of one relation before
+// a TRUNCATE so that ROLLBACK can restore them.
+type relPageSnapshot struct {
+	Rel   storage.RelFileNode
+	Pages [][]byte // one entry per block; each slice is BlockSize bytes
+}
+
+// TruncateUndoEntry records the before-image of one table (heap + indexes)
+// truncated inside an explicit transaction. Used by ROLLBACK to restore.
+type TruncateUndoEntry struct {
+	Heap    relPageSnapshot
+	Indexes []relPageSnapshot
+}
+
+// SeqRestoreEntry records the pre-restart sequence counter for rollback.
+type SeqRestoreEntry struct {
+	Name    string
+	OldCurr int64 // seqState.current value before RESTART
+}
+
 // BasicSession is a minimal Session implementation for the v0
 // executor path.
 type BasicSession struct {
@@ -46,12 +66,14 @@ type BasicSession struct {
 	inTx             bool
 	tx               mvcc.Transaction
 	snap             mvcc.Snapshot
-	pendingDDL       []DDLUndoEntry    // DDL creates pending rollback
+	pendingDDL          []DDLUndoEntry     // DDL creates pending rollback
 	pendingRoutineDrops []*catalog.Routine // routines dropped in current tx, for rollback
-	subxactStack     mvcc.SubxactStack // savepoint stack (M0050-0004)
-	currentSubXid    storage.TransactionID // 0 = use top-level tx.XID
-	txFailed         bool              // in_failed_sql_transaction (25P02)
-	deferredFKChecks []DeferredFKCheck // INITIALLY DEFERRED FK checks (M0096-0011)
+	pendingTruncates    []TruncateUndoEntry // heap/index page snapshots for TRUNCATE rollback
+	pendingSeqRestores  []SeqRestoreEntry  // sequence counter restores for RESTART IDENTITY rollback
+	subxactStack        mvcc.SubxactStack  // savepoint stack (M0050-0004)
+	currentSubXid       storage.TransactionID // 0 = use top-level tx.XID
+	txFailed            bool               // in_failed_sql_transaction (25P02)
+	deferredFKChecks    []DeferredFKCheck  // INITIALLY DEFERRED FK checks (M0096-0011)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -111,6 +133,8 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.snap = mvcc.Snapshot{}
 	s.inTx = false
 	s.pendingDDL = nil
+	s.pendingTruncates = nil
+	s.pendingSeqRestores = nil
 	s.subxactStack = mvcc.SubxactStack{}
 	s.currentSubXid = 0
 	s.txFailed = false
@@ -196,7 +220,12 @@ func (s *BasicSession) SetTransactionFailed() { s.txFailed = true }
 
 // RecordDDLCreate records a CREATE TABLE or CREATE INDEX for potential rollback.
 // Called by DDL operators after catalog.CreateTable / catalog.CreateIndex succeed.
+// Only records when inside an explicit transaction; autocommit DDL is durable
+// immediately and must not be undone by a later ROLLBACK.
 func (s *BasicSession) RecordDDLCreate(e DDLUndoEntry) {
+	if !s.inTx {
+		return
+	}
 	s.pendingDDL = append(s.pendingDDL, e)
 }
 
@@ -218,4 +247,29 @@ func (s *BasicSession) TakePendingRoutineDrops() []*catalog.Routine {
 	drops := s.pendingRoutineDrops
 	s.pendingRoutineDrops = nil
 	return drops
+}
+
+// RecordTruncate saves the before-image of a table (heap + indexes) so
+// ROLLBACK can restore them. Must be called BEFORE the physical truncation.
+func (s *BasicSession) RecordTruncate(e TruncateUndoEntry) {
+	s.pendingTruncates = append(s.pendingTruncates, e)
+}
+
+// TakePendingTruncates returns and clears the queued truncate undo entries.
+func (s *BasicSession) TakePendingTruncates() []TruncateUndoEntry {
+	t := s.pendingTruncates
+	s.pendingTruncates = nil
+	return t
+}
+
+// RecordSeqRestore records a sequence's current counter for RESTART IDENTITY rollback.
+func (s *BasicSession) RecordSeqRestore(e SeqRestoreEntry) {
+	s.pendingSeqRestores = append(s.pendingSeqRestores, e)
+}
+
+// TakePendingSeqRestores returns and clears the queued sequence restore entries.
+func (s *BasicSession) TakePendingSeqRestores() []SeqRestoreEntry {
+	r := s.pendingSeqRestores
+	s.pendingSeqRestores = nil
+	return r
 }

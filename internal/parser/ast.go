@@ -1099,6 +1099,7 @@ type AlterSequenceStmt struct {
 	pos      int
 	Name     ObjectName
 	IfExists bool
+	OwnedBy  string   // "table.column" or "" from OWNED BY clause
 	Options  []string // opaque option list; accepted for syntax compatibility
 }
 
