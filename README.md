@@ -1,3 +1,5 @@
+[![Run Tests](https://github.com/ryogrid/goopg/actions/workflows/test.yml/badge.svg)](https://github.com/ryogrid/goopg/actions/workflows/test.yml)
+
 # goopg
 
 goopg is an experimental PostgreSQL-compatible database server written in Go.
