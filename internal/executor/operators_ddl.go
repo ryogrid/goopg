@@ -2780,6 +2780,13 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		}
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
 	}
+	// Reject structural modifications to system catalogs. pg_catalog and
+	// information_schema tables are virtual — mutating them corrupts the
+	// catalog state for the rest of the session. PG returns 42501 here.
+	if tbl.Schema == "pg_catalog" || tbl.Schema == "information_schema" {
+		return &ExecError{Code: "42501", Pos: s.Pos(),
+			Message: fmt.Sprintf("permission denied: %q is a system catalog", tbl.Name)}
+	}
 	for _, act := range s.Actions {
 		switch act.Kind {
 		case parser.AlterTableAddColumn:
