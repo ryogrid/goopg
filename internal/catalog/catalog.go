@@ -832,6 +832,45 @@ func (c *InMemory) RegisterInheritanceChild(parentOID, childOID uint32) {
 	c.mu.Unlock()
 }
 
+// IsInheritanceDescendant reports whether descendantOID appears anywhere in
+// the transitive inheritance-children subtree of rootOID. Used to detect
+// circular inheritance before registering a new parent-child edge.
+func (c *InMemory) IsInheritanceDescendant(rootOID, descendantOID uint32) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	visited := map[uint32]bool{}
+	var walk func(oid uint32) bool
+	walk = func(oid uint32) bool {
+		if visited[oid] {
+			return false
+		}
+		visited[oid] = true
+		for _, childOID := range c.inheritanceChildren[oid] {
+			if childOID == descendantOID {
+				return true
+			}
+			if walk(childOID) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(rootOID)
+}
+
+// UnregisterInheritanceChild removes childOID from parentOID's child list.
+func (c *InMemory) UnregisterInheritanceChild(parentOID, childOID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	children := c.inheritanceChildren[parentOID]
+	for i, oid := range children {
+		if oid == childOID {
+			c.inheritanceChildren[parentOID] = append(children[:i], children[i+1:]...)
+			return
+		}
+	}
+}
+
 // InheritanceChildren returns the direct inheritance children of parentOID.
 // Returns nil if the table has no inheritance children. M0096-0009.
 func (c *InMemory) InheritanceChildren(parentOID uint32) []*Table {

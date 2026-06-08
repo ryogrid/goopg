@@ -2186,14 +2186,16 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				// When ctla→ctlb→inhe and ctla+ctlb are explicit, dropping ctla cascades
 				// ctlb (explicit, no notice) but we must still cascade ctlb→inhe.
 				// M0097-0023.
+				visitedOIDs := map[uint32]bool{tbl.OID: true}
 				var collectInheritanceTree func(parent *catalog.Table) []*catalog.Table
 				collectInheritanceTree = func(parent *catalog.Table) []*catalog.Table {
 					var result []*catalog.Table
 					for _, child := range im.InheritanceChildren(parent.OID) {
 						childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
-						if cascadeDropped[childName.String()] {
+						if cascadeDropped[childName.String()] || visitedOIDs[child.OID] {
 							continue
 						}
+						visitedOIDs[child.OID] = true
 						result = append(result, child)
 						result = append(result, collectInheritanceTree(child)...)
 					}
@@ -2987,6 +2989,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.InheritParent.String())}
 			}
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				// Self-inheritance.
+				if parentTbl.OID == tbl.OID {
+					return &ExecError{Code: "42P07", Pos: act.Pos(),
+						Message: fmt.Sprintf("cannot make relation inherit from itself")}
+				}
+				// Circular inheritance: tbl is already an ancestor of parentTbl.
+				if im.IsInheritanceDescendant(tbl.OID, parentTbl.OID) {
+					return &ExecError{Code: "42P07", Pos: act.Pos(),
+						Message: fmt.Sprintf("circular inheritance not allowed"),
+						Detail:  fmt.Sprintf("%q is an ancestor of %q", tbl.Name, parentTbl.Name)}
+				}
+				// Duplicate parent.
+				for _, existing := range im.InheritanceChildren(parentTbl.OID) {
+					if existing.OID == tbl.OID {
+						return &ExecError{Code: "42710", Pos: act.Pos(),
+							Message: fmt.Sprintf("relation %q would be inherited from more than once", parentTbl.Name)}
+					}
+				}
 				im.RegisterInheritanceChild(parentTbl.OID, tbl.OID)
 			}
 			// Copy parent columns that the child doesn't already have.
@@ -3002,7 +3022,15 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 			}
 		case parser.AlterTableNoInherit:
-			// NO INHERIT parent_table — no-op in v0; just accept the syntax.
+			// NO INHERIT parent_table — unregister the inheritance relationship.
+			parentTbl, ok := o.ctx.Catalog.LookupTable(act.InheritParent)
+			if !ok {
+				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.InheritParent.String())}
+			}
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				// Silently ignore if not currently a child (matches PG behavior on repeated NO INHERIT).
+				im.UnregisterInheritanceChild(parentTbl.OID, tbl.OID)
+			}
 		case parser.AlterTableSetStorage:
 			// SET STORAGE type — record on the catalog column for conflict detection.
 			if act.ColumnName != "" && act.StorageType != "" {
