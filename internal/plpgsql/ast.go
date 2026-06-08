@@ -204,6 +204,16 @@ type ReturnNextStmt struct {
 	Expr parser.Expr
 }
 
+// ReturnQueryStmt implements RETURN QUERY <select>; — executes a query and
+// returns all rows as the function's output. Used in SETOF-returning functions. M0097-0024.
+type ReturnQueryStmt struct {
+	pos        int
+	QuerySrc   string // raw SQL text of the SELECT
+}
+
+func (s *ReturnQueryStmt) Pos() int           { return s.pos }
+func (s *ReturnQueryStmt) plpgsqlStmtNode()   {}
+
 func (r *ReturnNextStmt) Pos() int          { return r.pos }
 func (r *ReturnNextStmt) plpgsqlStmtNode() {}
 

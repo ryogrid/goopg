@@ -88,9 +88,10 @@ type plpgsqlTrigCtx struct {
 	Cols    []catalog.Column // table columns (both OLD and NEW use the same schema)
 	TGName  string
 	TGWhen  string // "before" or "after"
-	TGOp    string // "insert", "update", "delete"
+	TGOp    string // "insert", "update", "delete", "truncate"
 	TGLevel string // "row" or "statement"
 	TGTable string
+	TGArgs  []string // trigger function arguments (TG_ARGV)
 }
 
 func newPLpgSQLFrame() *plpgsqlFrame {
@@ -1173,6 +1174,59 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		frame.returnNextRows = append(frame.returnNextRows, v)
 		return Datum{}, flowNone, nil
 
+	case *plpgsql.ReturnQueryStmt:
+		// RETURN QUERY SELECT — run query and append all result rows to SETOF accumulator.
+		sql := s.QuerySrc
+		stmts, perr := parser.Parse(sql)
+		if perr != nil || len(stmts) == 0 {
+			return Datum{}, flowNone, &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("RETURN QUERY: %v", perr)}
+		}
+		plan, perr := planner.Plan(stmts[0], ctx.Catalog)
+		if perr != nil {
+			return Datum{}, flowNone, perr
+		}
+		op, perr := Build(plan)
+		if perr != nil {
+			return Datum{}, flowNone, perr
+		}
+		if perr := op.Open(ctx); perr != nil {
+			op.Close()
+			return Datum{}, flowNone, perr
+		}
+		for {
+			slot, rerr := op.Next()
+			if rerr == EOF {
+				break
+			}
+			if rerr != nil {
+				op.Close()
+				return Datum{}, flowNone, rerr
+			}
+			if slot == nil {
+				continue
+			}
+			row := slot.Row()
+			if len(row) == 1 {
+				frame.returnNextRows = append(frame.returnNextRows, row[0])
+			} else if len(row) > 1 {
+				// Pack multi-column row as PostgreSQL composite text (v1,v2,...).
+				var buf strings.Builder
+				buf.WriteByte('(')
+				for i, d := range row {
+					if i > 0 {
+						buf.WriteByte(',')
+					}
+					if !d.IsNull() {
+						buf.WriteString(d.StringValue())
+					}
+				}
+				buf.WriteByte(')')
+				frame.returnNextRows = append(frame.returnNextRows, NewStringDatum(buf.String()))
+			}
+		}
+		op.Close()
+		return Datum{}, flowNone, nil
+
 	case *plpgsql.RaiseStmt:
 		// RAISE EXCEPTION/ERROR: surface as an executor error.
 		// RAISE NOTICE/WARNING/INFO/LOG/DEBUG: queue via context so the server
@@ -1750,6 +1804,11 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 		if err != nil {
 			return nil, err
 		}
+		// tg_argv uses 0-based indexing (PostgreSQL convention for trigger arguments).
+		// Adjust by adding 1 to convert to our 1-based array_subscript function.
+		if cr, ok := x.Base.(*parser.ColumnRef); ok && strings.ToLower(cr.Column) == "tg_argv" {
+			sub = &planner.BinaryOp{Op: parser.OpAdd, Left: sub, Right: &planner.IntegerConst{Value: 1}}
+		}
 		return &planner.FuncCall{Name: "array_subscript", Args: []planner.Expr{arr, sub}}, nil
 	default:
 		return nil, &ExecError{Code: "0A000", Pos: e.Pos(), Message: fmt.Sprintf("unsupported PL/pgSQL expression %T", e)}
@@ -1999,6 +2058,24 @@ func injectTriggerVars(frame *plpgsqlFrame, trig *plpgsqlTrigCtx) {
 	_ = frame.add("tg_op", strType, NewStringDatum(trig.TGOp))
 	_ = frame.add("tg_table_name", strType, NewStringDatum(trig.TGTable))
 	_ = frame.add("tg_relname", strType, NewStringDatum(trig.TGTable))
+	// Inject tg_argv as a text[] array (0-based indexing per PG convention).
+	// Build as "{arg0,arg1,...}" text array. Individual elements are quoted if
+	// they contain commas, braces, or backslashes.
+	{
+		arrType := catalog.Type{Name: "text[]"}
+		var elems []string
+		for _, a := range trig.TGArgs {
+			// Escape backslash and double-quote for text array format.
+			a = strings.ReplaceAll(a, "\\", "\\\\")
+			a = strings.ReplaceAll(a, `"`, `\"`)
+			if strings.ContainsAny(a, ",{}\" ") {
+				a = `"` + a + `"`
+			}
+			elems = append(elems, a)
+		}
+		arrStr := "{" + strings.Join(elems, ",") + "}"
+		_ = frame.add("tg_argv", arrType, NewStringDatum(arrStr))
+	}
 	// Inject OLD/NEW as composite-text row variables so RAISE NOTICE '%', OLD works.
 	if trig.OldRow != nil {
 		_ = frame.add("old", strType, NewStringDatum(rowToCompositeText(trig.Cols, trig.OldRow)))
@@ -2129,6 +2206,8 @@ func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error
 	if frame.trig != nil {
 		sql = substituteTriggerRefs(sql, frame.trig)
 	}
+	// Substitute PL/pgSQL frame variable references (tg_argv[N], tg_op, etc.).
+	sql = substitutePlpgsqlFrameVarsInSQL(sql, frame)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		return &ExecError{Code: "42601", Message: fmt.Sprintf("PL/pgSQL embedded SQL parse error: %v", err)}
@@ -2375,6 +2454,122 @@ func splitTopLevelCommas(s string) []string {
 	}
 	parts = append(parts, s[start:])
 	return parts
+}
+
+// substitutePlpgsqlFrameVarsInSQL replaces PL/pgSQL frame variable references
+// in embedded SQL text with SQL literal equivalents from the frame.
+// This enables INSERT/SELECT with PL/pgSQL variable values (e.g. tg_op, tg_argv[0], c).
+// Two passes: first varname[N] subscripts, then bare identifier references.
+// A preceding or following "." is treated as a table/column qualifier and suppresses substitution.
+// String literals and double-quoted identifiers are skipped.
+func substitutePlpgsqlFrameVarsInSQL(sql string, frame *plpgsqlFrame) string {
+	// Pass 1: substitute varname[N] patterns (array subscripts).
+	var p1 strings.Builder
+	i := 0
+	for i < len(sql) {
+		if isIdentStartByte(sql[i]) {
+			j := i
+			for j < len(sql) && isIdentContByte(sql[j]) {
+				j++
+			}
+			varName := sql[i:j]
+			if j < len(sql) && sql[j] == '[' {
+				k := j + 1
+				numStart := k
+				for k < len(sql) && sql[k] >= '0' && sql[k] <= '9' {
+					k++
+				}
+				if k < len(sql) && sql[k] == ']' && k > numStart {
+					idxStr := sql[numStart:k]
+					if idx64, err2 := strconv.ParseInt(idxStr, 10, 64); err2 == nil {
+						if fi, ok := frame.lookup(varName); ok {
+							val := frame.values[fi]
+							if !val.IsNull() {
+								elems := parseTextArray(val.StringValue())
+								var elemIdx int
+								if strings.EqualFold(varName, "tg_argv") {
+									elemIdx = int(idx64) // tg_argv is 0-based
+								} else {
+									elemIdx = int(idx64) - 1 // regular PL/pgSQL arrays are 1-based
+								}
+								if elemIdx >= 0 && elemIdx < len(elems) {
+									escaped := strings.ReplaceAll(elems[elemIdx], "'", "''")
+									p1.WriteByte('\'')
+									p1.WriteString(escaped)
+									p1.WriteByte('\'')
+									i = k + 1
+									continue
+								}
+							}
+						}
+					}
+				}
+			}
+			p1.WriteString(varName)
+			i = j
+		} else {
+			p1.WriteByte(sql[i])
+			i++
+		}
+	}
+	s1 := p1.String()
+
+	// Pass 2: substitute bare variable names (skip string/quoted literals, skip qualified names).
+	var out strings.Builder
+	i = 0
+	for i < len(s1) {
+		switch {
+		case s1[i] == '\'':
+			// Skip single-quoted string literal.
+			j := i + 1
+			for j < len(s1) {
+				if s1[j] == '\'' {
+					j++
+					if j < len(s1) && s1[j] == '\'' {
+						j++
+						continue
+					}
+					break
+				}
+				j++
+			}
+			out.WriteString(s1[i:j])
+			i = j
+		case s1[i] == '"':
+			// Skip double-quoted identifier.
+			j := i + 1
+			for j < len(s1) && s1[j] != '"' {
+				j++
+			}
+			if j < len(s1) {
+				j++
+			}
+			out.WriteString(s1[i:j])
+			i = j
+		case isIdentStartByte(s1[i]):
+			j := i
+			for j < len(s1) && isIdentContByte(s1[j]) {
+				j++
+			}
+			// Skip if preceded by '.' (qualified name) or followed by '.' or '['.
+			preceded := i > 0 && s1[i-1] == '.'
+			followed := j < len(s1) && (s1[j] == '.' || s1[j] == '[')
+			varName := s1[i:j]
+			if !preceded && !followed {
+				if fi, ok := frame.lookup(varName); ok {
+					out.WriteString(datumToSQLLiteral(frame.values[fi]))
+					i = j
+					continue
+				}
+			}
+			out.WriteString(varName)
+			i = j
+		default:
+			out.WriteByte(s1[i])
+			i++
+		}
+	}
+	return out.String()
 }
 
 // substitutePlpgsqlArraySubscripts replaces `varname[N]` patterns in a SQL expression

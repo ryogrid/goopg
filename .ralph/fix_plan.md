@@ -2691,6 +2691,56 @@ M0097-0001 wires it up.
         Remaining 62 diffs: `\d` include-column display (~10), NULL row-comparison
         (~14), float format (~2), DETAIL messages (~4), gist/spgist errors (~10+),
         USING INDEX syntax (~2), exclusion enforcement missing (~4).
+      - **Progress 2026-06-08 (M0097-0023-loop42 — circular inheritance crash fix +
+        system catalog guard + relfilenode + ON COMMIT parser):**
+        (a) Circular inheritance: `ALTER TABLE INHERIT` now rejects self-inheritance,
+        circular cycles, and duplicate parents via `IsInheritanceDescendant` (new BFS
+        helper). `collectInheritanceTree` in `execDropTable` gains a `visitedOIDs`
+        guard. `ALTER TABLE NO INHERIT` now calls `UnregisterInheritanceChild` (was
+        no-op). Fixes server crash (stack overflow) on `DROP TABLE CASCADE` with
+        circular inheritance in `alter_table` regress.
+        (b) System catalog guard: `execAlterTable` now rejects modifications to
+        tables in `pg_catalog` / `information_schema` with `42501 permission denied`.
+        Before this fix, `ALTER TABLE pg_class DROP COLUMN relname` succeeded and
+        all subsequent `\d` commands failed with "column relname does not exist"
+        (79 occurrences in alter_table diff). Unlocks `create_table_like` → PASS.
+        (c) `pg_class.relfilenode` column added (ordinal 22); value = table/index OID.
+        Fixes 7 "column relfilenode does not exist" errors in `create_index`.
+        (d) `ON COMMIT DELETE ROWS / DROP` parser: `acceptIdentKeyword("delete")`
+        can never match a reserved keyword token; fixed to `acceptKeyword(KwDelete)`
+        in three parser sites. Also added ON COMMIT handling to `parseCreateTableTail`
+        for tables with column definitions (was only handled in the empty-column-list
+        path). Fixes 13 "syntax error at or near delete/on" in `temp`.
+        New PASS tests: `create_table_like`, `drop_if_exists`, `index_including`,
+        `index_including_gist`. Tests still PASS: `btree_index`, `hash_index`.
+        Remaining: `alter_table` (1725 diff lines — my_locks/pg_locks, syntax gaps,
+        array type creation); `create_index` (1556 lines — GIN, point_tbl, relid);
+        `temp` (290 lines — ON COMMIT runtime semantics, plpgsql cursor);
+        `truncate` (231 lines — identity restart, FK violations);
+        `create_table` (278 lines — pg_get_partkeydef, pg_inherits, aggregate-in-bound).
+      - **Progress 2026-06-08 (M0097-0023-loop43 — TRUNCATE triggers, RESTART IDENTITY, FK cascade, 179→135 diff):**
+        commit 876dd69d. Four fixes targeting the `truncate` regress test:
+        (a) Trigger event parsing: `CREATE TRIGGER ... BEFORE TRUNCATE` was silently
+        failing because `TRUNCATE` tokenizes as `KwTruncate` (reserved) but parser
+        used `acceptIdentKeyword("truncate")` which requires `TokenIdent`. Fixed to
+        `acceptKeyword(KwTruncate) || acceptIdentKeyword("truncate")`. TRUNCATE
+        triggers now fire correctly; trunc_trigger_log gets rows.
+        (b) IDENTITY START WITH parsing: `GENERATED ALWAYS AS IDENTITY (START WITH N)`
+        stored `IdentityStart=0` because `WITH` is a reserved keyword and
+        `acceptIdentKeyword("with")` was a no-op. Fixed to
+        `_ = p.acceptKeyword(KwWith) || p.acceptIdentKeyword("with")`.
+        RESTART IDENTITY now resets to the correct start value.
+        (c) ALTER TABLE ADD FK now stores FKs in `tbl.ForeignKeys` (was only
+        validating). This allows TRUNCATE CASCADE BFS to follow FK references
+        added via ALTER TABLE, not just inline table-definition FKs.
+        (d) TRUNCATE CASCADE with partitioned/inherited tables: after FK BFS
+        expands the tableSet, a second BFS adds partition/inheritance children
+        of newly-added tables with "truncate cascades to table" NOTICEs.
+        Remaining in `truncate` (~135 diff lines): transactional TRUNCATE
+        (ROLLBACK semantics — WAL infrastructure gap); partition-aware FK cascade
+        (`trunc_a1 CASCADE` should cascade via parent `trunc_a`'s FK refs);
+        `tp_chk_data` SETOF RECORD schema mismatch; DROP TABLE not dropping
+        OWNED BY sequences; ref_b/ref_c FK INSERT errors (pre-existing).
 
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
@@ -5587,6 +5637,46 @@ is an impossible data-varlena header.
 **Total elapsed:** 1469 s (~24.5 min)  
 **Geometric mean:** 36.30 s  
 **Full report:** `bench/tpch/logs/tpch_power_test_20260526.md`
+
+- [x] **M0111-0008 — Fix spurious `pgbench_tellers_pkey` 23505 on no-key-change UPDATE under concurrency**
+      - Summary: CI (`.github/workflows/test.yml`) `pgbench -T 30 -c 2 -j 2`
+        aborted with `duplicate key value violates unique constraint
+        "pgbench_tellers_pkey"` on the TPC-B `UPDATE pgbench_tellers SET
+        tbalance = …` (~750 tx in, i.e. a concurrency race, not first-tx).
+      - Root cause: the UPDATE does not change the key (`tid`) and is
+        HOT-eligible, but under contention HOT falls back to the non-HOT
+        delete+insert path, which (since commit `2c779d66`) ran the INSERT-time
+        `checkUniqueIndexesForInsert`. `uniqueCheckWithWait` waits only on a
+        concurrent `xmin`, never on an in-flight `xmax`, so `isLiveForUniqueCheck`
+        classified a sibling MVCC version of the same `tid` (being updated by a
+        concurrent client, `xmax` active) as a *live duplicate* → spurious 23505.
+        A no-key-change UPDATE can never violate its own uniqueness (PG touches
+        no index for HOT; `_bt_check_unique` recognises prior versions as the
+        same row).
+      - **Fixed (2026-06-08, commit `<pending>`):** new
+        `checkUniqueIndexesForUpdate` + `indexKeyColumnsChanged` in
+        `internal/executor/operators_storage.go`; the two UPDATE non-HOT call
+        sites (`updateViaIndex`, seqscan update) skip any unique/primary index
+        whose key columns are unchanged. `forceAll=true` for cross-partition
+        moves preserves the full probe. INSERT/MERGE paths and the shared
+        unique-check helpers are unchanged; a genuine key-changing UPDATE that
+        collides still raises 23505 (preserves `2c779d66` / M0100-0005r).
+      - Verification: `pgbench -T 30 -c 2 -j 2` (CI config) × 3 → exit 0,
+        0 failed, 0 errors (4989 / 5036 / 6759 tx). New regression tests
+        `TestCheckUniqueIndexesForUpdate_{NoKeyChangeSkips,KeyChangeStillEnforced,ForceAllProbesUnchangedKey}`
+        in `insert_unique_constraint_test.go`. Write-path-only change → TPC-H
+        read-only Q12/Q13 row counts structurally unaffected.
+      - Analysis: `analysis/pgbench-tellers-duplicate-key-fix-20260608.md`.
+      - **Follow-up discovered (NOT fixed here):** under heavier contention
+        (`pgbench -c 4 -j 4`, scale 1) a backend that returns 40001 (EPQ
+        retries exhausted) mid-transaction leaves the connection wedged —
+        pgbench reports `current transaction is aborted, commands ignored`,
+        TPS→0, surviving clients hang forever; the erroring backend's goroutine
+        vanishes (no defers run, 0 CPU, all OS threads parked, socket
+        ESTAB/CLOSE-WAIT, `pg_stat_activity` still active). This corroborates
+        M0111-0001's deferred "next step (d) investigate 10-psql hang (possible
+        page-lock deadlock)". Out of CI scope (`-c 2` is robust); needs its own
+        transaction-error-recovery / protocol-state investigation.
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 

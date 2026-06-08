@@ -95,6 +95,20 @@ func DropSequence(name string) bool {
 	return loaded
 }
 
+// ResetSequence resets a sequence to its start value (equivalent to TRUNCATE ... RESTART IDENTITY).
+// Returns false if the sequence does not exist.
+func ResetSequence(name string) bool {
+	v, ok := seqRegistry.Load(seqKey(name))
+	if !ok {
+		return false
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.current.Store(s.start - s.increment)
+	return true
+}
+
 
 // evalNextval implements nextval(sequence_name text) → int8.
 // Advances the sequence and returns the new value. Also stores the

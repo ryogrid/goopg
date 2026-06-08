@@ -290,9 +290,10 @@ type CreateTriggerStmt struct {
 	Name       string
 	Table      ObjectName
 	Timing     TriggerTiming
-	Events     []string // "insert", "update", "delete"
+	Events     []string // "insert", "update", "delete", "truncate"
 	ForEachRow bool     // true = ROW, false = STATEMENT
 	FuncName   ObjectName
+	FuncArgs   []string // trigger function arguments (EXECUTE PROCEDURE name('arg1', 'arg2'))
 	// IfNotExists: PostgreSQL 14+ only, not supported yet.
 }
 
@@ -876,6 +877,9 @@ type ColumnDef struct {
 	// IdentityAlways is true when the identity generation is ALWAYS (vs BY DEFAULT).
 	// ALWAYS means user-provided values are rejected; BY DEFAULT allows them.
 	IdentityAlways bool
+	// IdentityStart is the START WITH value from the sequence options clause, or 0
+	// to use the type-default start (1 for ascending sequences). M0097-0024.
+	IdentityStart int64
 
 	// DefaultExpr holds the parsed AST of the column's DEFAULT clause when
 	// one was given (`col INT DEFAULT 0`). nil for columns without a DEFAULT.
@@ -1366,9 +1370,11 @@ func (s *DropSubscriptionStmt) stmtNode() {}
 
 // TruncateStmt — `TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT]`.
 type TruncateStmt struct {
-	pos      int
-	Names    []ObjectName
-	Behavior DropBehavior
+	pos             int
+	Names           []ObjectName
+	Only            []bool // parallel to Names: true = ONLY (skip inheritance children)
+	Behavior        DropBehavior
+	RestartIdentity bool // RESTART IDENTITY (false = CONTINUE IDENTITY default)
 }
 
 func (s *TruncateStmt) Pos() int  { return s.pos }

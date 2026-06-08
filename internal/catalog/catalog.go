@@ -76,6 +76,8 @@ type Column struct {
 	// IdentityColumn is true for GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
 	// When true, INSERT without an explicit value calls nextval(tablename_colname_seq).
 	IdentityColumn bool
+	// IdentityStart is the START WITH value from the sequence options (0 = use default=1).
+	IdentityStart int64
 	// Dropped is true for columns removed via ALTER TABLE DROP COLUMN.
 	// The column's heap slot (Ordinal) is retained for tuple compatibility;
 	// dropped columns are invisible in SELECT *, RETURNING *, and column lookups.
@@ -254,10 +256,11 @@ type Trigger struct {
 	Name       string
 	TableOID   uint32
 	Timing     TriggerTiming
-	Events     []string // "insert", "update", "delete"
+	Events     []string // "insert", "update", "delete", "truncate"
 	ForEachRow bool
 	FuncName   string // function/procedure name (unschemed)
 	FuncSchema string
+	Args       []string // trigger function arguments (TG_ARGV)
 }
 
 // ForeignKey describes one referential integrity constraint stored on a
@@ -830,6 +833,45 @@ func (c *InMemory) RegisterInheritanceChild(parentOID, childOID uint32) {
 	c.mu.Lock()
 	c.inheritanceChildren[parentOID] = append(c.inheritanceChildren[parentOID], childOID)
 	c.mu.Unlock()
+}
+
+// IsInheritanceDescendant reports whether descendantOID appears anywhere in
+// the transitive inheritance-children subtree of rootOID. Used to detect
+// circular inheritance before registering a new parent-child edge.
+func (c *InMemory) IsInheritanceDescendant(rootOID, descendantOID uint32) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	visited := map[uint32]bool{}
+	var walk func(oid uint32) bool
+	walk = func(oid uint32) bool {
+		if visited[oid] {
+			return false
+		}
+		visited[oid] = true
+		for _, childOID := range c.inheritanceChildren[oid] {
+			if childOID == descendantOID {
+				return true
+			}
+			if walk(childOID) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(rootOID)
+}
+
+// UnregisterInheritanceChild removes childOID from parentOID's child list.
+func (c *InMemory) UnregisterInheritanceChild(parentOID, childOID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	children := c.inheritanceChildren[parentOID]
+	for i, oid := range children {
+		if oid == childOID {
+			c.inheritanceChildren[parentOID] = append(children[:i], children[i+1:]...)
+			return
+		}
+	}
 }
 
 // InheritanceChildren returns the direct inheritance children of parentOID.
@@ -1460,6 +1502,10 @@ func (c *InMemory) registerSystemTables() {
 			// relam: access method OID. 2=heap for tables, method OID for indexes.
 			// Required by psql \d+ and pg_class.relam joins with pg_am. M0097-0023.
 			{Name: "relam", Type: Type{Name: "oid"}, Ordinal: 21},
+			// relfilenode: storage file node OID. Equals the table OID when first
+			// created; changes on REINDEX/CLUSTER. Exposed so that regress tests
+			// can detect filenode changes (create_index.sql REINDEX section).
+			{Name: "relfilenode", Type: Type{Name: "oid"}, Ordinal: 22},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -1538,6 +1584,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",                          // reloftype
 				"",                           // reloptions: empty (NULL via TypedVirtualCell empty-string fallback)
 				"2",                          // relam: heap access method OID (OID 2)
+				strconv.Itoa(int(t.OID)),     // relfilenode: equals OID (no rewrite tracking in v0)
 			})
 		}
 		// Emit index rows (relkind='i') so pg_class can be used to count indexes.
@@ -1595,6 +1642,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",                         // reloftype
 				"",                          // reloptions: NULL
 				idxRelam,                    // relam: index access method OID
+				strconv.Itoa(int(idx.OID)), // relfilenode: equals OID
 			})
 		}
 		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
@@ -1610,7 +1658,7 @@ func (c *InMemory) registerSystemTables() {
 			"0",        // reltoastrelid
 			"0",        // relpages
 			"t",        // relispopulated
-			"22",       // relnatts: 22 columns (including relam added M0097-0023)
+			"23",       // relnatts: 23 columns (including relfilenode added M0097-0023)
 			"n",        // relreplident
 			"0",        // relchecks
 			"t",        // relhasindex (pg_class itself has indexes)
@@ -1624,6 +1672,7 @@ func (c *InMemory) registerSystemTables() {
 			"0",        // reloftype
 			"",         // reloptions: NULL
 			"2",        // relam: heap access method OID
+			"1259",     // relfilenode: equals OID for pg_class
 		})
 		return out
 	}
