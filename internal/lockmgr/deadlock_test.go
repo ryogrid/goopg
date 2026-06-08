@@ -53,37 +53,41 @@ func TestDeadlockDetectsTwoSessionCycle(t *testing.T) {
 		t.Fatal("deadlock check did not detect cycle")
 	}
 
-	// Exactly one of res1/res2 should return ErrDeadlockDetected;
-	// the other should later succeed once the victim's holdings
-	// are released.
-	var victimErr, survivorErr error
-	var victim BackendID
-	select {
-	case err := <-res1:
-		victimErr = err
-		victim = 1
-	case err := <-res2:
-		victimErr = err
-		victim = 2
-	case <-time.After(time.Second):
-		t.Fatal("neither backend was cancelled")
-	}
-	if !errors.Is(victimErr, ErrDeadlockDetected) {
-		t.Errorf("victim got %v, want ErrDeadlockDetected", victimErr)
-	}
-
-	// The survivor should now be able to make progress.
-	survivor := res1
-	if victim == 1 {
-		survivor = res2
-	}
-	select {
-	case survivorErr = <-survivor:
-		if survivorErr != nil {
-			t.Errorf("survivor: %v", survivorErr)
+	// After the cycle is broken, exactly one backend must be the victim
+	// (ErrDeadlockDetected) and the other the survivor (nil, once the
+	// victim's holdings are released). Both Acquire calls become ready at
+	// nearly the same instant — cancelling the victim immediately frees the
+	// lock the survivor was waiting on — so we must NOT assume which channel
+	// is ready first. Collect BOTH results and check the pair
+	// order-independently.
+	//
+	// (Previously this used a `select` and labelled the first-ready channel
+	// the victim; Go's randomised select made it flake under -race whenever
+	// the survivor's success landed first — "victim got <nil>".)
+	results := make([]error, 0, 2)
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-res1:
+			results = append(results, err)
+		case err := <-res2:
+			results = append(results, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("a backend neither was cancelled nor made progress")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("survivor did not progress after victim cancelled")
+	}
+	var deadlocks, survivors int
+	for _, err := range results {
+		switch {
+		case errors.Is(err, ErrDeadlockDetected):
+			deadlocks++
+		case err == nil:
+			survivors++
+		default:
+			t.Errorf("unexpected Acquire error: %v", err)
+		}
+	}
+	if deadlocks != 1 || survivors != 1 {
+		t.Errorf("got %d deadlock victim(s) and %d survivor(s); want exactly 1 each", deadlocks, survivors)
 	}
 }
 
