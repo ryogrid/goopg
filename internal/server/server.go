@@ -948,6 +948,36 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // simple Query messages into handleQuery; Terminate closes the connection
 // cleanly; anything else is an "unsupported" ErrorResponse followed by
 // another ReadyForQuery so the client can keep going.
+// rollbackOpenTxnOnTeardown aborts an explicit transaction that is still open
+// when the connection's dispatch loop exits. It mirrors the dispatch
+// `planner.TxRollback` path (restore pending routine drops, roll back the
+// TxnMgr transaction, undo in-transaction enum DDL, clear per-connection
+// state). The critical effect is `TxnMgr.Rollback`, which clears the XID from
+// the ProcArray and broadcasts `commitCond` — releasing every backend blocked
+// in WaitForXID on this transaction's XID. A no-op when no explicit
+// transaction is active (auto-commit statements finish their own per-statement
+// transaction inline).
+func (s *Server) rollbackOpenTxnOnTeardown(connTx *connTxState, logger *slog.Logger) {
+	if connTx == nil || !connTx.InExplicit() || s.cfg.TxnMgr == nil {
+		return
+	}
+	if sess := connTx.Session(); sess != nil && s.cfg.Catalog != nil {
+		if rs := s.cfg.Catalog.Routines(); rs != nil {
+			for _, r := range sess.TakePendingRoutineDrops() {
+				_, _ = rs.Create(r, true)
+			}
+		}
+	}
+	_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
+	if s.cfg.Catalog != nil {
+		undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+	}
+	connTx.End()
+	if logger != nil {
+		logger.Info("rolled back open transaction on connection teardown")
+	}
+}
+
 func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName string, sessCtx *mctx.Context, pid uint32) {
 	extended := newExtendedState()
 	// Assign a ProcArray slot for this backend (M0107-0004). The slot is
@@ -956,6 +986,15 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 	procNum := int32((pid-1) % uint32(mvcc.DefaultProcArraySize))
 	extended.ProcNum = procNum // thread through to executeExtendedQueryViaExecutor
 	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum} // per-connection explicit transaction state (M0096-0005)
+	// On connection teardown (client disconnect, EOF, read error, admin
+	// shutdown — every `return` from the loop below), roll back any still-open
+	// explicit transaction so its XID is released from the ProcArray and any
+	// goroutine blocked in WaitForXID on that XID is woken. Without this, a
+	// client that abandons a connection mid-transaction — e.g. pgbench dropping
+	// a connection after a client-level abort — leaves its XID in-progress
+	// forever, deadlocking every concurrent backend waiting on it via
+	// epqWait → WaitForXID (the pgbench TPC-B UPDATE-contention hang).
+	defer s.rollbackOpenTxnOnTeardown(connTx, logger)
 	prepStmts := newPreparedStatements() // per-connection prepared statements (M0096-0006)
 	var copyIn *copyInState
 	for {

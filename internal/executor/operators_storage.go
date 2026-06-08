@@ -21,6 +21,30 @@ import (
 // escalating to SQLSTATE 40001. M0098-0004.
 const maxEPQRetries = 3
 
+// maxEPQRetriesRC is the EvalPlanQual re-check backstop under READ COMMITTED.
+// PostgreSQL never surfaces a serialization failure for plain UPDATE/DELETE
+// row contention under READ COMMITTED — it blocks (XactLockTableWait) and
+// re-evaluates against the latest row version until it can apply the change.
+// goopg mirrors that here: each re-check is paced by epqWait blocking on the
+// current xmax holder, and the wait-for-graph still breaks genuine deadlock
+// cycles. This high backstop exists only to bound a pathological livelock
+// (sustained lapping with no holder ever yielding) rather than to enforce a
+// first-update-wins policy; under any realistic workload the update applies
+// long before it is reached. Hitting it under high pgbench TPC-B contention
+// was the "current transaction is aborted" client-abort cascade.
+const maxEPQRetriesRC = 100000
+
+// epqRetryLimit returns the EvalPlanQual retry budget before escalating to a
+// serialization failure, by isolation level. READ COMMITTED retries (blocking)
+// essentially until success; REPEATABLE READ / SERIALIZABLE surface 40001
+// promptly to preserve first-update-wins semantics.
+func epqRetryLimit(iso mvcc.IsolationLevel) int {
+	if iso == mvcc.IsolationReadCommitted {
+		return maxEPQRetriesRC
+	}
+	return maxEPQRetries
+}
+
 // maxWFGHops is the maximum chain length walked during WFG cycle detection.
 // Limits the O(N) scan to a constant bound under adversarial workloads.
 const maxWFGHops = 64
@@ -2119,7 +2143,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					xmax := oldTup.Header.Xmax
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					if epqRetry >= maxEPQRetries {
+					if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
 						return nil, &ExecError{
 							Code:    "40001",
 							Pos:     o.plan.Pos(),
@@ -2578,7 +2602,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					xmax := oldTup.Header.Xmax
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					if epqRetry >= maxEPQRetries {
+					if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
 						return nil, &ExecError{
 							Code:    "40001",
 							Pos:     o.plan.Pos(),
@@ -3018,7 +3042,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				xmax := oldTup.Header.Xmax
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
-				if epqRetry >= maxEPQRetries {
+				if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
 					return nil, &ExecError{
 						Code:    "40001",
 						Pos:     o.plan.Pos(),
