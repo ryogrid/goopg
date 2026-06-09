@@ -161,6 +161,38 @@ gofmt -l .          # must produce empty output
 go vet ./...
 ```
 
+## Pre-commit test gate — MANDATORY
+
+Before you create **any** commit, you MUST run the project's unit/component
+test suite, and it MUST pass cleanly:
+
+```bash
+scripts/ralph-precommit-test.sh
+```
+
+This runs exactly the test set that CI's **"Run unit and component tests"**
+step runs (`.github/workflows/test.yml`): the whole module minus the
+cluster-backed packages that need a live goopg/PostgreSQL server. A green run
+here is the bar every commit has to clear, so the branch never lands in a
+state that CI would reject.
+
+If the run surfaces **any** failing or flaky test, fixing it is mandatory and
+takes priority over closing the current task:
+
+- Fix it **even when the failure is unrelated to the current loop's task.**
+  "Not my task" is never a reason to commit over a red or flaky suite — a
+  broken shared suite blocks every subsequent loop.
+- A test that passes only intermittently (flaky) counts as failing. Make it
+  deterministic — do not paper over it with retries, sleeps, or by skipping
+  it.
+- Fold the fix into the **same commit** as the current work (or a preceding
+  commit on the same branch) so the tree is never committed while red.
+
+Never commit while this suite is red. If a failure is genuinely impossible to
+resolve within the current loop, stop and record the blocker per the
+**Completion and Deferral Discipline** rules below instead of committing
+around it.
+
 ## Reference oracle: `./postgres/`
 
 A read-only clone of the upstream PostgreSQL source tree lives at `./postgres/`.
