@@ -68,6 +68,18 @@ func PlanSchemaOnly(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	return node, nil
 }
 
+// ResolveIndexPredicate resolves a partial-index WHERE-clause expression
+// against the given table's column schema and returns a planner Expr that the
+// executor can evaluate via evalExpr. Returns nil if predicate is nil.
+// Used by the CREATE INDEX bulk-build path to filter rows for partial indexes.
+func ResolveIndexPredicate(predicate parser.Expr, tbl *catalog.Table) (Expr, error) {
+	if predicate == nil {
+		return nil, nil
+	}
+	ctx := singleBindingContext(tbl, tbl.Name)
+	return resolveExpr(predicate, ctx)
+}
+
 func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
@@ -6568,6 +6580,12 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 	}
 	for _, idx := range cat.IndexesOnTable(tbl) {
 		if !idx.Unique {
+			continue
+		}
+		// Partial indexes require an inference predicate in the ON CONFLICT
+		// target. Without one, the index does not cover all rows and cannot
+		// be used as a conflict arbiter. Mirrors PostgreSQL's behaviour.
+		if idx.HasPredicate && target.Where == nil {
 			continue
 		}
 		// Liberal matching: each index column must be covered by the target.

@@ -2936,7 +2936,12 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
 	}
-	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false); err != nil {
+	// For partial indexes, resolve the WHERE predicate so bulk build can filter rows.
+	var resolvedPred planner.Expr
+	if s.HasPredicate && s.Predicate != nil {
+		resolvedPred, _ = planner.ResolveIndexPredicate(s.Predicate, tbl)
+	}
+	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, resolvedPred); err != nil {
 		return err
 	}
 	// Store INCLUDE columns, partial index flag, and predicate expression.
@@ -3921,7 +3926,7 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	return nil
 }
 
-func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool) error {
+func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, predExpr ...planner.Expr) error {
 	if len(columns) == 0 {
 		return &ExecError{Code: "42601", Pos: pos, Message: "index must have at least one key column"}
 	}
@@ -3970,11 +3975,17 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		}
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
-	if err := o.bulkBuildBTree(idxRel, tbl, cols, unique, idxName.String(), pos); err != nil {
+	var buildErr error
+	if len(predExpr) > 0 && predExpr[0] != nil {
+		buildErr = o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, idxName.String(), pos, predExpr[0])
+	} else {
+		buildErr = o.bulkBuildBTree(idxRel, tbl, cols, unique, idxName.String(), pos)
+	}
+	if buildErr != nil {
 		_ = o.ctx.Catalog.DropIndex(idxName)
 		o.ctx.Pool.InvalidateRel(idxRel)
 		_ = o.ctx.Pool.Manager().DropRelation(idxRel)
-		return err
+		return buildErr
 	}
 	// Record for rollback before heap sync (index is live in catalog now).
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
@@ -4027,7 +4038,11 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 // the old Create+backfillBTree flow and is significantly faster for large
 // tables because it avoids per-key tree traversals and page splits.
 func (o *ddlOp) bulkBuildBTree(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) error {
-	entries, err := o.collectBTreeEntries(tbl, cols, unique, indexName, pos)
+	return o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, indexName, pos, nil)
+}
+
+func (o *ddlOp) bulkBuildBTreeWithPredicate(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int, predExpr planner.Expr) error {
+	entries, err := o.collectBTreeEntries(tbl, cols, unique, indexName, pos, predExpr)
 	if err != nil {
 		return err
 	}
@@ -4040,7 +4055,7 @@ func (o *ddlOp) bulkBuildBTree(idxRel storage.RelFileNode, tbl *catalog.Table, c
 
 // collectBTreeEntries scans the heap, decodes visible tuples, encodes
 // B-tree keys, enforces uniqueness, and returns the entries for bulk build.
-func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) ([]btree.BulkEntry, error) {
+func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
@@ -4116,6 +4131,13 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 							}
 						}
 					}
+				}
+			}
+			// For partial indexes, skip rows not matching the predicate.
+			if predExpr != nil {
+				pv, pErr := evalExpr(predExpr, row, o.ctx)
+				if pErr != nil || pv.IsNull() || pv.Kind != KindBool || !pv.BoolValue() {
+					continue
 				}
 			}
 			key, encErr := encodeCompositeBTreeKey(row, cols, pos)

@@ -348,6 +348,13 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				if partLeaf != nil {
 					updatedForLeaf = remapRowForPartition(parentCols, partLeaf.Columns, updated)
 				}
+				// Check secondary unique constraints. The arbiter index is implicitly
+				// valid (already resolved above); checkUniqueIndexesForUpdate skips
+				// indexes whose key columns are unchanged, so the arbiter is normally
+				// skipped. This catches violations in non-arbiter unique indexes.
+				if uerr := checkUniqueIndexesForUpdate(o.ctx, writeTbl, cols, conflictRow, updatedForLeaf, false, o.plan.Pos()); uerr != nil {
+					return nil, uerr
+				}
 				if err := o.applyUpdate(rel, writeTbl, cols, conflictPtr, updatedForLeaf, updated); err != nil {
 					return nil, err
 				}

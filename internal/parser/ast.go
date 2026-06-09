@@ -755,6 +755,9 @@ type OnConflictTarget struct {
 	// Columns[i] == "" (expression column); nil for plain column names.
 	Exprs      []Expr
 	Constraint string // populated for `ON CONFLICT ON CONSTRAINT name`
+	// Where holds the optional partial-index predicate from
+	// `ON CONFLICT (cols) WHERE predicate`. nil when absent.
+	Where Expr
 }
 
 // Pos returns the position of the leading token of the target
