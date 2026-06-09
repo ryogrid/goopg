@@ -206,8 +206,8 @@ func returningSchemaOf(n Node) Schema {
 // Returns "" when no rule is registered, in which case the generic "must have
 // a RETURNING clause" error applies. M0097-0140.
 func copyDMLRuleError(dml parser.Stmt, cat catalog.Catalog) string {
-	im, ok := cat.(*catalog.InMemory)
-	if !ok {
+	im := inMemoryCat(cat)
+	if im == nil {
 		return ""
 	}
 	// Extract target table name from INSERT/UPDATE/DELETE.

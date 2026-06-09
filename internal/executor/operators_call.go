@@ -352,7 +352,7 @@ func evalCallDefault(expr string, ctx *Context) (Datum, error) {
 	if err != nil || len(stmts) != 1 {
 		return NullDatum, nil
 	}
-	node, err := planner.Plan(stmts[0], ctx.Catalog)
+	node, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
 	if err != nil {
 		return NullDatum, nil
 	}

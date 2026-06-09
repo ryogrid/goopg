@@ -1996,7 +1996,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// nested partitioned children). Multi-level partition hierarchies require
 	// collecting ALL leaf descendants, not only direct children.
 	if len(tbl.PartitionKey) > 0 {
-		if im, ok := cat.(*catalog.InMemory); ok {
+		if im := inMemoryCat(cat); im != nil {
 			// Collect all leaf partitions recursively.
 			leaves := collectAllPartitionLeaves(im, tbl.OID)
 			if len(leaves) > 0 {
@@ -2044,7 +2044,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// is always included first.  M0097-0046: expand recursively so that
 	// grandchildren (e.g. stud_emp → emp → person) are included too.
 	// FROM ONLY tablename skips all children (M0097-0099).
-	if im, ok := cat.(*catalog.InMemory); ok && !rv.Only {
+	if im := inMemoryCat(cat); im != nil && !rv.Only {
 		allDesc := collectInheritanceDescendants(im, tbl.OID)
 
 		if len(allDesc) > 0 {
@@ -2082,6 +2082,27 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 // collectInheritanceDescendants performs a breadth-first traversal of the
 // inheritance tree rooted at parentOID and returns all descendants in BFS
 // order, deduplicated (a table can be a descendant via multiple paths, e.g.
+// inMemoryCat unwraps a Catalog to its underlying *catalog.InMemory, peeling
+// through SearchPathCatalog layers. Returns nil if the core is not InMemory.
+// Required because SearchPathCatalog wraps InMemory for search-path resolution
+// but planner internals need the concrete type for partition/inheritance BFS.
+// M0097-0022.
+func inMemoryCat(cat catalog.Catalog) *catalog.InMemory {
+	type unwrapper interface {
+		Unwrap() catalog.Catalog
+	}
+	for {
+		if im, ok := cat.(*catalog.InMemory); ok {
+			return im
+		}
+		if u, ok := cat.(unwrapper); ok {
+			cat = u.Unwrap()
+		} else {
+			return nil
+		}
+	}
+}
+
 // stud_emp inherits from both emp and student which both inherit from person).
 // M0097-0046.
 func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32) []*catalog.Table {
@@ -5805,7 +5826,7 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		// runtime and routes through EncodeVarchar/EncodeChar.
 		// For user-defined enum columns, wrap in CastExpr so the
 		// executor converts the string to KindEnum (sort order). M0097-0022.
-		if col2, ok2 := cat.(*catalog.InMemory); ok2 {
+		if col2 := inMemoryCat(cat); col2 != nil {
 			if _, isEnum := col2.LookupEnum(col.Type.Name); isEnum {
 				resolvedKey = &CastExpr{pos: keyExpr.Pos(), Operand: resolvedKey, TargetType: col.Type.Name}
 			}
@@ -6033,7 +6054,7 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 		// For user-defined enum columns, wrap string literals in CastExpr
 		// so the executor converts them to KindEnum (sort order). M0097-0022.
 		if _, ok2 := resolvedKey.(*StringConst); ok2 {
-			if col2, ok3 := cat.(*catalog.InMemory); ok3 {
+			if col2 := inMemoryCat(cat); col2 != nil {
 				if _, isEnum := col2.LookupEnum(col.Type.Name); isEnum {
 					resolvedKey = &CastExpr{pos: keyExpr.Pos(), Operand: resolvedKey, TargetType: col.Type.Name}
 				}

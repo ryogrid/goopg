@@ -4121,7 +4121,9 @@ func (c *InMemory) TablesInSchema(schemaName string) []parser.ObjectName {
 		}
 		// Partition children are dropped implicitly when their parent is dropped;
 		// skip them from the direct schema-level cascade list.
-		if len(t.PartitionBounds) > 0 {
+		// Use PartitionParentOID (not PartitionBounds) to identify children —
+		// PartitionBounds is also appended to the parent when children register.
+		if t.PartitionParentOID != 0 {
 			continue
 		}
 		tSchema := t.Schema
@@ -5012,3 +5014,38 @@ func (c *InMemory) resolveColumnTypeLocked(typeName string) string {
 	}
 	return typeName
 }
+
+// SearchPathCatalog wraps a Catalog and applies a dynamically-fetched
+// search_path when resolving unqualified table names in LookupTable.
+// All other Catalog methods are delegated to the wrapped catalog unchanged.
+// Use WithSearchPath to construct. M0097-0022.
+type SearchPathCatalog struct {
+	Catalog
+	GetSchemas func() []string
+}
+
+// WithSearchPath returns a SearchPathCatalog that falls back to the schemas
+// returned by getSchemas (in order) when LookupTable finds no match for an
+// unqualified name.
+func WithSearchPath(cat Catalog, getSchemas func() []string) *SearchPathCatalog {
+	return &SearchPathCatalog{Catalog: cat, GetSchemas: getSchemas}
+}
+
+// LookupTable overrides the embedded Catalog.LookupTable to apply the
+// current search_path when the name has no explicit schema qualifier.
+func (c *SearchPathCatalog) LookupTable(name parser.ObjectName) (*Table, bool) {
+	tbl, ok := c.Catalog.LookupTable(name)
+	if !ok && name.Schema == "" && c.GetSchemas != nil {
+		for _, sc := range c.GetSchemas() {
+			tbl, ok = c.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name})
+			if ok {
+				return tbl, ok
+			}
+		}
+	}
+	return tbl, ok
+}
+
+// Unwrap returns the underlying Catalog, allowing callers to peel the
+// search-path layer for type assertions (e.g., to *InMemory). M0097-0022.
+func (c *SearchPathCatalog) Unwrap() Catalog { return c.Catalog }

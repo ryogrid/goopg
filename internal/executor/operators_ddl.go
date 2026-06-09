@@ -40,6 +40,21 @@ type ddlOp struct {
 
 func newDDLOp(p *planner.DDL) *ddlOp { return &ddlOp{plan: p} }
 
+// planCatalog returns the search-path-aware catalog for planner.Plan calls.
+// Falls back to the raw catalog when PlanCatalog is not set. M0097-0022.
+func (o *ddlOp) planCatalog() catalog.Catalog {
+	return ctxPlanCatalog(o.ctx)
+}
+
+// ctxPlanCatalog returns the search-path-aware catalog from a Context.
+// Used throughout the executor for all planner.Plan calls. M0097-0022.
+func ctxPlanCatalog(ctx *Context) catalog.Catalog {
+	if ctx.PlanCatalog != nil {
+		return ctx.PlanCatalog
+	}
+	return ctx.Catalog
+}
+
 func (o *ddlOp) Schema() planner.Schema { return nil }
 func (o *ddlOp) Open(ctx *Context) error {
 	if ctx.Catalog == nil {
@@ -1317,7 +1332,7 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 		return nil
 	}
 	// Plan the SELECT to derive the schema.
-	selectNode, err := planner.Plan(s.SelectSource, o.ctx.Catalog)
+	selectNode, err := planner.Plan(s.SelectSource, o.planCatalog())
 	if err != nil {
 		return &ExecError{Code: "42601", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -1406,7 +1421,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			Message: fmt.Sprintf("column %q specified more than once", poc.DuplicateColumn)}
 	}
 	// Look up the parent partitioned table.
-	parent, ok := o.ctx.Catalog.LookupTable(poc.Parent)
+	parent, ok := o.lookupTableWithSearch(poc.Parent)
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(),
 			Message: fmt.Sprintf("relation %q does not exist", poc.Parent.String())}
@@ -1976,7 +1991,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// v0-planner "feature not supported" (0A000) errors are ignored so the
 	// planner's incompleteness does not reject views upstream would accept;
 	// those still fail at reference time. M0097-0003 (functional_deps).
-	if _, err := planner.Plan(s.Query, o.ctx.Catalog); err != nil {
+	if _, err := planner.Plan(s.Query, o.planCatalog()); err != nil {
 		// Surface the validation failure as an *ExecError so the wire
 		// layer renders a clean "ERROR:  <message>" line. Returning the
 		// raw *planner.PlanError would let its Error() string —
@@ -2017,7 +2032,7 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			_ = im.DropView(s.Name, true) // remove old def so plan can't cycle back to it
 		}
 	}
-	if viewPlan, planErr := planner.Plan(s.Query, o.ctx.Catalog); planErr == nil {
+	if viewPlan, planErr := planner.Plan(s.Query, o.planCatalog()); planErr == nil {
 		planSchema = viewPlan.Output()
 	}
 	// Ignore plan errors during view creation (including circular-view 42P10).
@@ -2411,6 +2426,15 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 			continue
 		}
 		tbl, ok := o.ctx.Catalog.LookupTable(name)
+		if !ok && name.Schema == "" {
+			// search_path fallback: try each schema in search order (mirrors LOCK TABLE). M0097-0022.
+			for _, sc := range lockTableSearchSchemas(o.ctx) {
+				tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name})
+				if ok {
+					break
+				}
+			}
+		}
 		if !ok {
 			if s.IfExists {
 				o.ctx.AddNotice(fmt.Sprintf("table %q does not exist, skipping", name.String()))
@@ -3009,7 +3033,7 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 	// Handle SET LOGGED / SET UNLOGGED.
 	if s.SetLogged != "" {
-		tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
+		tbl, ok := o.lookupTableWithSearch(s.Name)
 		if !ok {
 			if s.IfExists { return nil }
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
@@ -3019,7 +3043,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 	}
 	// Handle SET SCHEMA — move a table/matview to a new schema. M0097-0025.
 	if s.SetSchema != "" {
-		tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
+		tbl, ok := o.lookupTableWithSearch(s.Name)
 		if !ok {
 			if s.IfExists {
 				return nil
@@ -3029,7 +3053,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		tbl.Schema = s.SetSchema
 		return nil
 	}
-	tbl, ok := o.ctx.Catalog.LookupTable(s.Name)
+	tbl, ok := o.lookupTableWithSearch(s.Name)
 	if !ok {
 		// Not a heap table — check if it's an index.
 		if idx, isIdx := o.ctx.Catalog.LookupIndex(s.Name); isIdx {
@@ -6757,9 +6781,9 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	if s.WithNoData {
 		// WITH NO DATA: use schema-only planning that suppresses runtime
 		// evaluation errors (e.g. division by zero) — the query will never execute.
-		selectPlan, err = planner.PlanSchemaOnly(s.Query, o.ctx.Catalog)
+		selectPlan, err = planner.PlanSchemaOnly(s.Query, o.planCatalog())
 	} else {
-		selectPlan, err = planner.Plan(s.Query, o.ctx.Catalog)
+		selectPlan, err = planner.Plan(s.Query, o.planCatalog())
 	}
 	if err != nil {
 		return err
@@ -6937,7 +6961,7 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	if err := analyzer.Analyze(tbl.View, o.ctx.Catalog); err != nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: fmt.Sprintf("refresh plan error: %v", err)}
 	}
-	selectPlan, err := planner.Plan(tbl.View, o.ctx.Catalog)
+	selectPlan, err := planner.Plan(tbl.View, o.planCatalog())
 	if err != nil {
 		return err
 	}
@@ -7114,7 +7138,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						if t, ok := o.ctx.Catalog.LookupTable(tbl); ok && t.IsMatView {
 							kind = "materialized view"
 						}
-						detailLines = append(detailLines, fmt.Sprintf("drop cascades to %s %s", kind, tbl.String()))
+						detailLines = append(detailLines, fmt.Sprintf("drop cascades to %s %s", kind, dropCascadeObjectName(tbl, o.ctx)))
 					}
 					for _, vn := range droppedViews {
 						detailLines = append(detailLines, fmt.Sprintf("drop cascades to view %s", vn))
@@ -8641,6 +8665,36 @@ func collectExprTableRefs(expr parser.Expr, out *[]parser.RangeVar) {
 // lockTableSearchSchemas returns the ordered list of schemas to search when
 // resolving an unqualified LOCK TABLE target. Reads search_path GUC; falls
 // back to "public" when not available.
+// dropCascadeObjectName returns the name to use in DROP CASCADE notices.
+// Mirrors PostgreSQL: omit the schema prefix when the schema is in the
+// current search_path (it's implicit), qualify otherwise. M0097-0022.
+func dropCascadeObjectName(name parser.ObjectName, ctx *Context) string {
+	if name.Schema == "" {
+		return name.Name
+	}
+	for _, sc := range lockTableSearchSchemas(ctx) {
+		if strings.EqualFold(sc, name.Schema) {
+			return name.Name
+		}
+	}
+	return name.String()
+}
+
+// lookupTableWithSearch finds a table by name, falling back to search_path schemas
+// for unqualified names. M0097-0022.
+func (o *ddlOp) lookupTableWithSearch(name parser.ObjectName) (*catalog.Table, bool) {
+	tbl, ok := o.ctx.Catalog.LookupTable(name)
+	if !ok && name.Schema == "" {
+		for _, sc := range lockTableSearchSchemas(o.ctx) {
+			tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Schema: sc, Name: name.Name})
+			if ok {
+				break
+			}
+		}
+	}
+	return tbl, ok
+}
+
 func lockTableSearchSchemas(ctx *Context) []string {
 	sp := `"$user", public`
 	if ctx.GetSetting != nil {

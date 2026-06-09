@@ -247,7 +247,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	// VOID functions: run all statements for side-effects, return NULL.
 	if strings.EqualFold(r.ReturnType.Name, "void") {
 		for si, stmt := range stmts {
-			node, err := planner.Plan(stmt, child.Catalog)
+			node, err := planner.Plan(stmt, ctxPlanCatalog(child))
 			if err != nil {
 				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
 			}
@@ -281,7 +281,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	// Execute all statements except the last as side effects; return from last.
 	for i, stmt := range stmts {
 		stmtNum := i + 1
-		node, err := planner.Plan(stmt, child.Catalog)
+		node, err := planner.Plan(stmt, ctxPlanCatalog(child))
 		if err != nil {
 			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -389,7 +389,7 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 	var lastRow Row
 	for i, stmt := range stmts {
 		stmtNum := i + 1
-		node, err := planner.Plan(stmt, child.Catalog)
+		node, err := planner.Plan(stmt, ctxPlanCatalog(child))
 		if err != nil {
 			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -470,7 +470,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	// Execute all statements except the last as side effects; collect rows from last.
 	for i, stmt := range stmts {
 		stmtNum := i + 1
-		node, err := planner.Plan(stmt, child.Catalog)
+		node, err := planner.Plan(stmt, ctxPlanCatalog(child))
 		if err != nil {
 			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -1198,7 +1198,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if perr != nil || len(stmts) == 0 {
 			return Datum{}, flowNone, &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("RETURN QUERY: %v", perr)}
 		}
-		plan, perr := planner.Plan(stmts[0], ctx.Catalog)
+		plan, perr := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
@@ -1299,7 +1299,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			}
 			return Datum{}, flowNone, nil
 		}
-		plan, perr := planner.Plan(stmts[0], ctx.Catalog)
+		plan, perr := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
@@ -1377,7 +1377,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if len(stmts) == 0 {
 			return Datum{}, flowNone, nil
 		}
-		plan, err := planner.Plan(stmts[0], ctx.Catalog)
+		plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
@@ -2240,7 +2240,7 @@ func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error
 		return nil
 	}
 	for _, stmt := range stmts {
-		plan, err := planner.Plan(stmt, ctx.Catalog)
+		plan, err := planner.Plan(stmt, ctxPlanCatalog(ctx))
 		if err != nil {
 			return err
 		}
