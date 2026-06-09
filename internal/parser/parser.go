@@ -245,6 +245,15 @@ func (p *parser) errSyntaxAtCur() error {
 	near := t.Value
 	if t.Kind == TokenEOF {
 		near = "end of input"
+	} else if t.Kind == TokenKeyword {
+		near = strings.ToUpper(near)
+	} else if t.Kind == TokenIdent {
+		// PG lexes some words as keywords (e.g. OIDS) and prints them uppercase
+		// in "syntax error at or near" messages. Mirror that for known soft keywords.
+		switch strings.ToLower(t.Value) {
+		case "oids":
+			near = strings.ToUpper(t.Value)
+		}
 	}
 	return &SyntaxError{Pos: t.Pos, Message: near}
 }

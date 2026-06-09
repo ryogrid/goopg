@@ -165,7 +165,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 	parentRel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	parentCols := o.plan.Table.Columns
 	parentTree := o.arbiterTree
-	isPartitioned := len(o.plan.Table.PartitionKey) > 0
+	isPartitioned := o.plan.Table.PartitionMethod != ""
 	nextSourceRow:
 	for {
 		srcSlot, err := o.child.Next()

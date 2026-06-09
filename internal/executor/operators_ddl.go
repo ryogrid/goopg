@@ -328,6 +328,15 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if s.Temporary && s.Name.Schema != "" && !strings.EqualFold(s.Name.Schema, "pg_temp") {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "cannot create temporary relation in non-temporary schema"}
 	}
+	// Non-temporary, non-unlogged tables created in pg_temp are implicitly
+	// temporary (PG behavior). Unlogged tables may not be in the temp schema.
+	if !s.Temporary && strings.EqualFold(s.Name.Schema, "pg_temp") {
+		if s.Unlogged {
+			return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "only temporary relations may be created in temporary schemas"}
+		}
+		s.Temporary = true
+		s.Name.Schema = "" // store under bare key like other temp tables
+	}
 	// Pre-resolve schema from search_path before the existence check so that
 	// CREATE TABLE ctlt1 in ctl_schema context doesn't falsely collide with
 	// public.ctlt1 (which shares the bare "ctlt1" catalog key). M0097-0023.
@@ -397,7 +406,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 			if parent.PartitionMethod != "" {
 				return &ExecError{Code: "42809", Pos: s.Pos(),
-					Message: fmt.Sprintf("cannot inherit from partitioned table %q", parentName.Name)}
+					Message:  fmt.Sprintf("cannot inherit from partitioned table %q", parentName.Name),
+					Detail: "This operation is not supported for partitioned tables."}
 			}
 			inheritParents = append(inheritParents, parent)
 			// Append parent columns (deep copy to avoid aliasing).
@@ -508,14 +518,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		addCol := func(c parser.ColumnDef) {
 			typeName := strings.ToLower(c.Type.Name)
+			declaredTypeName := "" // non-empty only when a domain is resolved
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				if resolved := im.ResolveColumnType(typeName); resolved != typeName {
+					declaredTypeName = typeName
 					typeName = resolved
 				}
 			}
 			cols = append(cols, catalog.Column{
-				Name:            c.Name,
-				Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
+				Name:             c.Name,
+				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
+				DeclaredTypeName: declaredTypeName,
 				NotNull:         c.NotNull || c.IdentityColumn,
 				GeneratedExpr:   c.GeneratedExpr,
 				GeneratedAlways: c.GeneratedAlways,
@@ -751,13 +764,25 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if s.WithOIDS {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "tables declared WITH OIDS are not supported"}
 	}
+	// Validate storage parameter names: double-quoted names are case-sensitive,
+	// and all recognized option names are lowercase. A mixed-case key means the
+	// user wrote WITH ("Fillfactor" = 10) which PG rejects as unrecognized.
+	for k := range s.With {
+		if k != strings.ToLower(k) {
+			return &ExecError{Code: "42000", Pos: s.Pos(),
+				Message: fmt.Sprintf("unrecognized parameter %q", k)}
+		}
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
 	}
 	// Storage parameters (WITH clause) are not supported for partitioned tables.
 	if s.PartitionBy != nil && len(s.With) > 0 {
-		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "cannot specify storage parameters for a partitioned table"}
+		return &ExecError{Code: "0A000", Pos: s.Pos(),
+			Message: "cannot specify storage parameters for a partitioned table",
+			Detail:  "This operation is not supported for partitioned tables.",
+			Hint:    "Specify storage parameters for its leaf partitions instead."}
 	}
 	// Validate DEFAULT expressions (no column refs, aggregates, subqueries, SRFs).
 	for _, c := range s.Columns {
@@ -1060,6 +1085,10 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	for _, chk := range s.TableChecks {
 		tbl.AddCheck("", chk, 0)
 	}
+	// Named table-level CHECK constraints from CONSTRAINT name CHECK (expr). M0097-0023.
+	for _, nc := range s.TableNamedChecks {
+		tbl.AddCheck(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name))
+	}
 	// Copy statistics from LIKE INCLUDING STATISTICS (or INCLUDING ALL) sources. M0097-0023.
 	if len(likeStatisticsSources) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -1126,7 +1155,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					noInherit = true
 				}
 			}
-			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit)
+			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, true, 0)
 		}
 	}
 	// Copy pg_description comments from LIKE INCLUDING COMMENTS sources:
@@ -1272,6 +1301,13 @@ func appendLikeChecks(dst []catalog.NamedCheckConstraint, src *catalog.Table) []
 // It plans and executes the SELECT, derives column definitions from the result
 // schema, creates the table, and inserts all rows from the SELECT.  M0096-0008.
 func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
+	// Validate storage parameter names (same rule as execCreateTable).
+	for k := range s.With {
+		if k != strings.ToLower(k) {
+			return &ExecError{Code: "42000", Pos: s.Pos(),
+				Message: fmt.Sprintf("unrecognized parameter %q", k)}
+		}
+	}
 	if o.ctx.Pool == nil || o.ctx.Catalog == nil || o.ctx.TxnMgr == nil {
 		// No storage: create an empty table with no columns.
 		_, err := o.ctx.Catalog.CreateTable(s.Name, nil)
@@ -1385,6 +1421,12 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	for i := range cols {
 		cols[i].Inherited = true
 	}
+	// Validate sub-partition key (e.g. PARTITION BY RANGE (c)) against inherited cols.
+	if s.PartitionBy != nil {
+		if err := validatePartitionKey(s, cols, o.ctx); err != nil {
+			return err
+		}
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
@@ -1427,6 +1469,28 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		pb.Remainder = poc.Remainder
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	} else if len(poc.InValues) > 0 {
+		// Validate IN values are type-compatible with the partition key column type.
+		// Integer literals cannot be directly used as boolean partition bounds (PG rejects
+		// "FOR VALUES IN (1)" for bool columns; string literal '1' is allowed).
+		if len(parent.PartitionKey) > 0 {
+			for _, col := range parent.Columns {
+				if strings.EqualFold(col.Name, parent.PartitionKey[0]) {
+					keyType := strings.ToLower(col.Type.Name)
+					if keyType == "bool" || keyType == "boolean" {
+						for _, e := range poc.InValues {
+							if _, isInt := e.(*parser.IntegerConst); isInt {
+								return &ExecError{
+									Code:    "42804",
+									Pos:     s.Pos(),
+									Message: fmt.Sprintf("specified value cannot be cast to type boolean for column %q", col.Name),
+								}
+							}
+						}
+					}
+					break
+				}
+			}
+		}
 		// LIST partition: evaluate each IN value as a string.
 		for _, e := range poc.InValues {
 			pb.InValues = append(pb.InValues, exprToString(e))
@@ -1456,6 +1520,24 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		im.RegisterPartitionChild(parent.OID, tbl.OID)
 	}
 
+	// Propagate NOT NULL and DEFAULT overrides from the PARTITION OF column list
+	// BEFORE syncTableToCatalogHeap so that pg_attribute.attnotnull is correct.
+	for _, colName := range poc.NotNullColumns {
+		for i := range tbl.Columns {
+			if strings.EqualFold(tbl.Columns[i].Name, colName) {
+				tbl.Columns[i].NotNull = true
+				break
+			}
+		}
+	}
+	for _, cd := range poc.ColDefaults {
+		for i := range tbl.Columns {
+			if strings.EqualFold(tbl.Columns[i].Name, cd.ColName) {
+				tbl.Columns[i].DefaultExpr = cd.Expr
+				break
+			}
+		}
+	}
 	// Record for rollback.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
@@ -1500,6 +1582,56 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		childIdxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + colName + "_key"}
 		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, []string{colName}, nil, true, false); err != nil {
 			return err
+		}
+	}
+	// Inherit named CHECK constraints from parent (non-NoInherit only). M0097-0023.
+	im2, isIM2 := o.ctx.Catalog.(*catalog.InMemory)
+	for _, pnc := range parent.NamedChecks {
+		if pnc.Name == "" || pnc.OID == 0 || pnc.NoInherit {
+			continue
+		}
+		var oid uint32
+		if isIM2 {
+			oid = im2.AllocOID()
+		}
+		tbl.AddCheckInherited(pnc.Name, pnc.Expr, oid)
+	}
+	// Apply CHECK constraints declared explicitly in the PARTITION OF column list
+	// (e.g. CONSTRAINT check_b CHECK (b > 0)). If the same name was already
+	// inherited from the parent, emit NOTICE "merging" and keep the inherited
+	// version. Otherwise add as a locally-defined constraint. M0097-0023.
+	for _, pcc := range poc.CheckConstraints {
+		if pcc.Name == "" {
+			continue
+		}
+		// Check if already inherited from parent.
+		alreadyInherited := false
+		for _, existing := range tbl.NamedChecks {
+			if strings.EqualFold(existing.Name, pcc.Name) {
+				alreadyInherited = true
+				break
+			}
+		}
+		if alreadyInherited {
+			o.ctx.AddNotice(fmt.Sprintf("merging constraint %q with inherited definition", pcc.Name))
+			continue
+		}
+		var oid uint32
+		if isIM2 {
+			oid = im2.AllocOID()
+		}
+		tbl.AddCheck(pcc.Name, pcc.Expr, oid)
+	}
+	// Register named NOT NULL constraints for NOT NULL columns declared in the
+	// PARTITION OF column override list. These columns come from the parent schema
+	// but the partition child explicitly adds NOT NULL, so IsLocal=true. All
+	// partition child NOT NULL constraints have InhCount=1 (one partition parent).
+	// M0097-0023.
+	if isIM2 {
+		for _, colName := range poc.NotNullColumns {
+			colKey := strings.ToLower(colName)
+			constraintName := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+			tbl.AddNotNull(constraintName, colName, im2.AllocOID(), false, true, 1)
 		}
 	}
 	return nil
@@ -2908,6 +3040,27 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// M0097-0023-loop34). M0097-0023.
 			if act.CheckExpr != "" {
 				tbl.AddCheck(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName))
+				// Propagate to partition children: merge if child already has the
+				// same constraint (locally defined), otherwise inherit it. M0097-0023.
+				if im3, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
+					for _, childTbl := range im3.PartitionChildren(tbl.OID) {
+						merged := false
+						for j := range childTbl.NamedChecks {
+							if strings.EqualFold(childTbl.NamedChecks[j].Name, act.ConstraintName) {
+								// Child already has it locally — merge: mark inherited.
+								childTbl.NamedChecks[j].IsLocal = false
+								childTbl.NamedChecks[j].InhCount = 1
+								o.ctx.AddNotice(fmt.Sprintf("merging constraint %q with inherited definition", act.ConstraintName))
+								merged = true
+								break
+							}
+						}
+						if !merged {
+							oid3 := im3.AllocOID()
+							childTbl.AddCheckInherited(act.ConstraintName, act.CheckExpr, oid3)
+						}
+					}
+				}
 			}
 		case parser.AlterTableNoOp:
 			// Unknown ADD CONSTRAINT type — no-op.
@@ -2927,6 +3080,8 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				childTbl, ok := o.ctx.Catalog.LookupTable(act.AttachPartitionOf.Parent)
 				if ok {
 					childTbl.PartitionParentOID = tbl.OID
+					// Mark child as DEFAULT so checkDefaultPartitionDataConflict can find it.
+					childTbl.PartitionBounds = []catalog.PartitionBound{{IsDefault: true, ChildName: childTbl.Name}}
 					if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
 						im.RegisterPartitionChild(tbl.OID, childTbl.OID)
 					}
@@ -3434,9 +3589,43 @@ func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTabl
 
 // execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name [RESTRICT|CASCADE]`.
 // For PK constraints it enforces view→constraint dependencies (RESTRICT mode)
-// before removing the index. M0097-0036 / functional_deps.
+// before removing the index. For CHECK constraints it blocks inherited drops.
+// M0097-0036 / functional_deps / M0097-0023.
 func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.AlterTableAction) error {
-	// Find the named constraint among this table's primary-key indexes.
+	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
+
+	// 1. Check constraints: handle before PK so inherited check takes priority.
+	for i, nc := range tbl.NamedChecks {
+		if !strings.EqualFold(nc.Name, act.ConstraintName) {
+			continue
+		}
+		// Cannot drop an inherited constraint (coninhcount > 0).
+		if nc.InhCount > 0 {
+			return &ExecError{
+				Code:    "42704",
+				Pos:     act.Pos(),
+				Message: fmt.Sprintf("cannot drop inherited constraint %q of relation %q", act.ConstraintName, tbl.Name),
+			}
+		}
+		// Drop from this table (keep CheckConstraints and NamedChecks in sync).
+		tbl.CheckConstraints = append(tbl.CheckConstraints[:i], tbl.CheckConstraints[i+1:]...)
+		tbl.NamedChecks = append(tbl.NamedChecks[:i], tbl.NamedChecks[i+1:]...)
+		// Cascade to partition children: drop the inherited copy from each child.
+		if isIM {
+			for _, childTbl := range im.PartitionChildren(tbl.OID) {
+				for j, cnc := range childTbl.NamedChecks {
+					if strings.EqualFold(cnc.Name, act.ConstraintName) {
+						childTbl.CheckConstraints = append(childTbl.CheckConstraints[:j], childTbl.CheckConstraints[j+1:]...)
+						childTbl.NamedChecks = append(childTbl.NamedChecks[:j], childTbl.NamedChecks[j+1:]...)
+						break
+					}
+				}
+			}
+		}
+		return nil
+	}
+
+	// 2. PRIMARY KEY constraints.
 	var pkIdx *catalog.Index
 	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
 		if idx.Primary && strings.EqualFold(idx.Name, act.ConstraintName) {
@@ -3451,7 +3640,6 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 			Message: fmt.Sprintf("constraint %q of relation %q does not exist", act.ConstraintName, tbl.Name),
 		}
 	}
-	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
 	if isIM && act.Restrict {
 		deps := im.ViewsDependingOnConstraint(tbl.OID, act.ConstraintName)
 		if len(deps) > 0 {
@@ -3469,7 +3657,6 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 			}
 		}
 	}
-	// No blocking dependencies (or CASCADE) — remove the PK index.
 	if isIM {
 		im.DropPrimaryKeyConstraint(tbl.OID, act.ConstraintName)
 	}
@@ -5552,6 +5739,37 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		}
 	}
 
+	// Check partition-key expression dependencies (no CASCADE).
+	if s.Behavior != parser.DropCascade {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			funcLower := strings.ToLower(s.Name.Name)
+			var depTables []string
+			for _, tbl := range im.AllTables() {
+				for _, expr := range tbl.PartitionKeyExprs {
+					if funcExprContainsName(expr, funcLower) {
+						depTables = append(depTables, tbl.Name)
+						break
+					}
+				}
+			}
+			if len(depTables) > 0 {
+				argTypes := make([]catalog.Type, len(s.Args))
+				for i, a := range s.Args {
+					argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+				}
+				funcSig := s.Name.Name + routineArgListStr(argTypes)
+				details := make([]string, len(depTables))
+				for i, name := range depTables {
+					details[i] = fmt.Sprintf("table %s depends on function %s", name, funcSig)
+				}
+				return &ExecError{Code: "2BP01", Pos: s.Pos(),
+					Message: fmt.Sprintf("cannot drop function %s because other objects depend on it", funcSig),
+					Detail:  strings.Join(details, "\n"),
+					Hint:    "Use DROP ... CASCADE to drop the dependent objects too."}
+			}
+		}
+	}
+
 	var err error
 	if s.Args == nil {
 		err = rs.DropByName(s.Name)
@@ -6705,6 +6923,14 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		// Known or missing access method.
 		if len(s.Names) > 0 {
 			name := s.Names[0]
+			// Check if the operator class was registered via CREATE OPERATOR CLASS.
+			// If found in the catalog registry, remove it and succeed silently.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if im.HasOpClass(name.Name) {
+					im.RemoveOpClass(name.Name)
+					return nil
+				}
+			}
 			var msg string
 			if method != "" {
 				msg = fmt.Sprintf("%s %q does not exist for access method %q", s.ObjType, name.String(), s.UsingMethod)
@@ -7582,14 +7808,29 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		if s.IfExists && o.dropSchemaQualifiedNotice(name) {
 			continue
 		}
-		// Always try to drop with ifExists=false first to detect not-found.
-		// We need to emit a notice when IF EXISTS + not found.
-		err := cat.DropDomain(name.Name, false, s.Cascade)
+		// names = dropped tables (CASCADE) or blocking tables (RESTRICT).
+		names, err := cat.DropDomain(name.Name, false, s.Cascade)
 		if err == nil {
-			continue // dropped successfully
+			for _, tblName := range names {
+				o.ctx.AddNotice(fmt.Sprintf("drop cascades to table %s", tblName))
+			}
+			continue
+		}
+		if err.Error() == "dependent objects" {
+			// names contains the tables blocking the drop.
+			depName := ""
+			if len(names) > 0 {
+				depName = names[0]
+			}
+			return &ExecError{
+				Code:    "2BP01",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("cannot drop type %s because other objects depend on it", name.Name),
+				Detail:  fmt.Sprintf("table %s depends on type %s", depName, name.Name),
+				Hint:    "Use DROP ... CASCADE to drop the dependent objects too.",
+			}
 		}
 		if s.IfExists {
-			// Domain does not exist; emit PG-style notice and continue.
 			o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", name.Name))
 			continue
 		}
@@ -7628,6 +7869,13 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 		colLower := strings.ToLower(act.ColumnName)
 		for _, keyCol := range tbl.PartitionKey {
 			if strings.ToLower(keyCol) == colLower {
+				return &ExecError{Code: "0A000", Pos: act.Pos(),
+					Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
+			}
+		}
+		// Also check expression partition keys (e.g. PARTITION BY RANGE (plusone(a))).
+		for _, expr := range tbl.PartitionKeyExprs {
+			if strings.Contains(strings.ToLower(fmt.Sprintf("%v", expr)), colLower) {
 				return &ExecError{Code: "0A000", Pos: act.Pos(),
 					Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
 			}

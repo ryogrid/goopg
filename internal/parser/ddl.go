@@ -588,6 +588,10 @@ func (p *parser) parseCreateOpClassTail(pos int) (Stmt, error) {
 			} else if p.cur().Kind == TokenIdent {
 				p.advance() // bare identifier operator
 			}
+			// Skip optional operand type list: (type, type).
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				p.skipBalancedParens()
+			}
 		} else if isFunction {
 			p.advance() // consume "function"
 			numTok := p.cur()
@@ -1290,8 +1294,51 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						inTableConstraint = false
 						p.advance()
 					} else if depth == 1 && !inTableConstraint && curColName == "" && t.Kind == TokenKeyword &&
-						(t.Keyword == KwConstraint || t.Keyword == KwCheck || t.Keyword == KwPrimary || t.Keyword == KwForeign) {
-						// Table-level constraint entry — skip until next depth-1 comma.
+						t.Keyword == KwConstraint {
+						// Table-level CONSTRAINT name CHECK (expr) in PARTITION OF column list.
+						// Parse name + CHECK expression if present; otherwise skip.
+						p.advance() // consume CONSTRAINT
+						var constraintName string
+						if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+							constraintName = p.cur().Value
+							p.advance()
+						}
+						if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
+							p.advance() // consume CHECK
+							// Collect the expression text inside the balanced parens.
+							if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+								p.advance() // consume opening (
+								var exprTokens []string
+								exprDepth := 1
+								for exprDepth > 0 && p.cur().Kind != TokenEOF {
+									tok := p.cur()
+									if tok.Kind == TokenSymbol && tok.Value == "(" {
+										exprDepth++
+										exprTokens = append(exprTokens, tok.Value)
+										p.advance()
+									} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+										exprDepth--
+										if exprDepth > 0 {
+											exprTokens = append(exprTokens, tok.Value)
+										}
+										p.advance()
+									} else {
+										exprTokens = append(exprTokens, tok.Value)
+										p.advance()
+									}
+								}
+								if constraintName != "" {
+									poc.CheckConstraints = append(poc.CheckConstraints, PartitionCheckConstraint{
+										Name: constraintName,
+										Expr: strings.Join(exprTokens, " "),
+									})
+								}
+							}
+						}
+						inTableConstraint = true
+					} else if depth == 1 && !inTableConstraint && curColName == "" && t.Kind == TokenKeyword &&
+						(t.Keyword == KwCheck || t.Keyword == KwPrimary || t.Keyword == KwForeign) {
+						// Other table-level constraint (CHECK without CONSTRAINT name, FK, PK) — skip.
 						inTableConstraint = true
 						p.advance()
 					} else if depth == 1 && !inTableConstraint && curColName == "" && (t.Kind == TokenIdent || t.Kind == TokenKeyword) {
@@ -1305,6 +1352,23 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					} else if depth == 1 && !inTableConstraint && t.Kind == TokenKeyword && t.Keyword == KwUnique && curColName != "" {
 						poc.UniqueColumns = append(poc.UniqueColumns, curColName)
 						p.advance()
+					} else if depth == 1 && !inTableConstraint && t.Kind == TokenKeyword && t.Keyword == KwNot && curColName != "" {
+						// NOT NULL constraint in PARTITION OF column override list.
+						p.advance()
+						if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull {
+							poc.NotNullColumns = append(poc.NotNullColumns, curColName)
+							p.advance()
+						}
+					} else if depth == 1 && !inTableConstraint && t.Kind == TokenKeyword && t.Keyword == KwDefault && curColName != "" {
+						// DEFAULT expr override in PARTITION OF column override list.
+						p.advance()
+						expr, err := p.parseExpr()
+						if err == nil {
+							poc.ColDefaults = append(poc.ColDefaults, PartitionColDefault{
+								ColName: curColName,
+								Expr:    expr,
+							})
+						}
 					} else {
 						p.advance()
 					}
@@ -1446,6 +1510,41 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			}
 		}
 		return stmt, nil
+	}
+
+	// CREATE TABLE name WITH (opts) AS SELECT … (CTAS with pre-AS storage params).
+	// Handle WITH clause that precedes AS rather than following column definitions.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith {
+		savedIdx := p.idx
+		p.advance()
+		if opts, err := p.parseWithOptions(); err == nil {
+			stmt.With = opts
+			if v, ok := opts["oids"]; ok {
+				stmt.WithOIDS = !strings.EqualFold(v, "false") && v != "0"
+			}
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
+				p.advance()
+				sel, err2 := p.parseSelect()
+				if err2 != nil {
+					return nil, err2
+				}
+				if ss, ok := sel.(*SelectStmt); ok {
+					stmt.SelectSource = ss
+				}
+				if p.acceptKeyword(KwWith) {
+					if p.acceptIdentKeyword("no") {
+						_ = p.acceptIdentKeyword("data")
+						stmt.WithNoData = true
+					} else {
+						_ = p.acceptIdentKeyword("data")
+					}
+				}
+				return stmt, nil
+			}
+			// WITH without following AS: fall through (opts already consumed).
+		} else {
+			p.idx = savedIdx
+		}
 	}
 
 	// Regular CREATE TABLE with column definitions
@@ -1632,7 +1731,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				if err != nil {
 					return nil, err
 				}
-				stmt.TableChecks = append(stmt.TableChecks, expr)
+				if constraintName != "" {
+					// Named CHECK constraint: store with its name for pg_constraint.
+					stmt.TableNamedChecks = append(stmt.TableNamedChecks, PartitionCheckConstraint{
+						Name: constraintName, Expr: expr,
+					})
+				} else {
+					stmt.TableChecks = append(stmt.TableChecks, expr)
+				}
 				if p.acceptKeyword(KwNot) {
 					_ = p.acceptIdentKeyword("enforced")
 				} else {

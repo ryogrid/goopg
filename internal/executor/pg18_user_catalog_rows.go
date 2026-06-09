@@ -294,7 +294,7 @@ func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 		NewStringDatum(string(attrs.TypStorage)),  // attstorage
 		NewStringDatum(""),                        // attcompression (PG18 default: '\0' meaning "default")
 		NewBoolDatum(col.NotNull),                 // attnotnull
-		NewBoolDatum(false),                       // atthasdef
+		NewBoolDatum(col.DefaultExpr != nil),      // atthasdef
 		NewBoolDatum(false),                       // atthasmissing
 		NewStringDatum(""),                        // attidentity
 		NewStringDatum(attGeneratedFor(col)),      // attgenerated

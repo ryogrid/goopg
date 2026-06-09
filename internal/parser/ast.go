@@ -968,6 +968,9 @@ type CreateTableStmt struct {
 	// TableChecks holds raw SQL expressions from table-level CHECK constraints.
 	// M0097-0014.
 	TableChecks []string
+	// TableNamedChecks holds explicitly named table-level CHECK constraints,
+	// e.g. `CONSTRAINT check_a CHECK (a > 0)`. M0097-0023.
+	TableNamedChecks []PartitionCheckConstraint
 	// TableUniques holds column-name lists from table-level UNIQUE (col1, col2)
 	// constraints. Each entry is the list of columns for one UNIQUE clause.
 	// Anonymous constraints only; named ones are in NamedConstraints. M0097-0028.
@@ -1033,10 +1036,35 @@ type PartitionOfClause struct {
 	// in PARTITION OF, e.g. `CREATE TABLE t1 PARTITION OF t (b UNIQUE) FOR VALUES IN (1)`.
 	// Each entry is a column name to create a unique index on. M0097-0028.
 	UniqueColumns []string
+	// NotNullColumns holds column names from the PARTITION OF column-constraint
+	// list that carry an explicit NOT NULL, e.g. `(b NOT NULL DEFAULT 1)`.
+	// Used to create named NOT NULL constraints on the child. M0097-0023.
+	NotNullColumns []string
+	// CheckConstraints holds named CHECK constraints from the PARTITION OF
+	// column-constraint list, e.g. `CONSTRAINT check_b CHECK (b > 0)`.
+	// Used to create local check constraints on the child. M0097-0023.
+	CheckConstraints []PartitionCheckConstraint
+	// ColDefaults holds per-column DEFAULT expression overrides declared in the
+	// PARTITION OF column-override list, e.g. `(b DEFAULT 1)`. M0097-0023.
+	ColDefaults []PartitionColDefault
 	// DuplicateColumn is non-empty when a column name appears more than once
 	// in the PARTITION OF column override list (e.g. `(b NOT NULL, b DEFAULT 1, ...)`).
 	// The executor returns an error when this is set.
 	DuplicateColumn string
+}
+
+// PartitionColDefault holds a DEFAULT expression override for a single column
+// in a PARTITION OF column-override list. M0097-0023.
+type PartitionColDefault struct {
+	ColName string
+	Expr    Expr
+}
+
+// PartitionCheckConstraint is a named CHECK constraint declared in a PARTITION
+// OF column-override list. M0097-0023.
+type PartitionCheckConstraint struct {
+	Name string // constraint name (from CONSTRAINT name CHECK (...))
+	Expr string // raw SQL expression text
 }
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]

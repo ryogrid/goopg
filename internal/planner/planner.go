@@ -2903,6 +2903,40 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "pg_partition_ancestors") {
+		// pg_partition_ancestors(regclass) → SETOF regclass (column: relid).
+		// Returns each ancestor table OID. Implemented as a scalar stub that
+		// returns the input OID once (non-partition → just itself). M0097-0023.
+		// alias defaults to "relid" (the output column name) so unqualified
+		// WHERE relid IS NOT NULL resolves via both the column-name search and
+		// the whole-row alias path (same pattern as planScalarFuncScan). M0097-0023.
+		alias := rv.Alias
+		if alias == "" {
+			alias = "relid"
+		}
+		colAlias := alias
+		if len(rv.Columns) > 0 {
+			colAlias = rv.Columns[0]
+		}
+		ctx := &resolveContext{}
+		args := make([]Expr, 0, len(tf.Args))
+		for _, a := range tf.Args {
+			pa, err := resolveExpr(a, ctx)
+			if err != nil {
+				return nil, rangeBinding{}, err
+			}
+			args = append(args, pa)
+		}
+		fc := &FuncCall{pos: tf.Pos(), Name: "pg_partition_ancestors", Args: args}
+		schema := Schema{SchemaColumn{Name: colAlias, Type: catalog.Type{Name: "oid"}, SourceTableIdx: sourceIdx}}
+		tbl := &catalog.Table{
+			Name:    alias,
+			Columns: []catalog.Column{{Name: colAlias, Type: catalog.Type{Name: "oid"}, Ordinal: 0}},
+		}
+		node := &ScalarFuncScan{pos: tf.Pos(), Func: fc, schema: schema}
+		b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+		return node, b, nil
+	}
 	if strings.EqualFold(tf.Name, "unnest") {
 		return planFromUnnest(rv, sourceIdx, lateralCtx)
 	}
@@ -2986,18 +3020,29 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
 			Message: "generate_series requires 2 or 3 arguments"}
 	}
-	ctx := &resolveContext{}
-	start, err := resolveExpr(tf.Args[0], ctx)
+	// Build arg context: lateral siblings + outer-scope parent chain so
+	// correlated references like pr.prattrs in generate_series args resolve.
+	argCtx := &resolveContext{cat: cat, parent: planParent}
+	if lateralCtx != nil {
+		if lateralCtx.parent == nil {
+			cp := *lateralCtx
+			cp.parent = planParent
+			argCtx = &cp
+		} else {
+			argCtx = lateralCtx
+		}
+	}
+	start, err := resolveExpr(tf.Args[0], argCtx)
 	if err != nil {
 		return nil, rangeBinding{}, err
 	}
-	stop, err := resolveExpr(tf.Args[1], ctx)
+	stop, err := resolveExpr(tf.Args[1], argCtx)
 	if err != nil {
 		return nil, rangeBinding{}, err
 	}
 	var step Expr
 	if len(tf.Args) == 3 {
-		step, err = resolveExpr(tf.Args[2], ctx)
+		step, err = resolveExpr(tf.Args[2], argCtx)
 		if err != nil {
 			return nil, rangeBinding{}, err
 		}

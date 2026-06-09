@@ -4756,9 +4756,11 @@ func evalSubquery(x *planner.SubqueryExpr, row Row, ctx *Context) (Datum, error)
 
 	// Check cache for scalar subquery results. For non-correlated
 	// subqueries (M0058-0001), use a constant cache key.
-	cacheKey := subqueryCacheKey(row)
+	var cacheKey string
 	if x.IsNonCorrelated {
 		cacheKey = nonCorrelatedCacheKey(x)
+	} else {
+		cacheKey = fmt.Sprintf("%p|%s", x, subqueryCacheKey(row))
 	}
 	if ctx.SubqueryCache != nil {
 		if ctx.SubqueryCacheScope != len(ctx.OuterRows) {
@@ -6297,9 +6299,115 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NullDatum, nil
 
+	case "array_to_string":
+		// array_to_string(anyarray, text [, text]) → text — joins array elements with separator.
+		if len(x.Args) < 2 {
+			return NullDatum, nil
+		}
+		arrDatum, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arrDatum.IsNull() {
+			return NullDatum, nil
+		}
+		sepDatum, err := evalExpr(x.Args[1], row, ctx)
+		if err != nil {
+			return NullDatum, nil
+		}
+		sep := ""
+		if !sepDatum.IsNull() {
+			sep = sepDatum.StringValue()
+		}
+		nullStr := ""
+		useNullStr := false
+		if len(x.Args) >= 3 {
+			nsDatum, err2 := evalExpr(x.Args[2], row, ctx)
+			if err2 == nil && !nsDatum.IsNull() {
+				nullStr = nsDatum.StringValue()
+				useNullStr = true
+			}
+		}
+		elems := parseTextArray(arrDatum.StringValue())
+		var parts []string
+		for _, el := range elems {
+			if el == "NULL" {
+				if useNullStr {
+					parts = append(parts, nullStr)
+				}
+			} else {
+				parts = append(parts, el)
+			}
+		}
+		return NewStringDatum(strings.Join(parts, sep)), nil
+
+	case "pg_get_partkeydef":
+		// pg_get_partkeydef(relation oid) → text — reconstructs PARTITION BY clause. M0097-0023.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		tbl, found := im.LookupTableByOID(targetOID)
+		if !found || tbl.PartitionMethod == "" {
+			return NullDatum, nil
+		}
+		numKeys := len(tbl.PartitionKey)
+		if n := len(tbl.PartitionKeyExprs); n > numKeys {
+			numKeys = n
+		}
+		var parts []string
+		for i := 0; i < numKeys; i++ {
+			var part string
+			colName := ""
+			if i < len(tbl.PartitionKey) {
+				colName = tbl.PartitionKey[i]
+			}
+			var keyExpr parser.Expr
+			if i < len(tbl.PartitionKeyExprs) {
+				keyExpr = tbl.PartitionKeyExprs[i]
+			}
+			if keyExpr != nil {
+				part = defaultExprToSQL(keyExpr)
+			} else {
+				part = colName
+			}
+			if i < len(tbl.PartitionKeyOpClasses) && tbl.PartitionKeyOpClasses[i] != "" {
+				part += " " + tbl.PartitionKeyOpClasses[i]
+			}
+			if i < len(tbl.PartitionKeyCollations) {
+				coll := tbl.PartitionKeyCollations[i]
+				if coll != "" && strings.ToLower(coll) != "default" && strings.ToLower(coll) != "pg_default" {
+					part += ` COLLATE "` + coll + `"`
+				}
+			}
+			parts = append(parts, part)
+		}
+		return NewStringDatum(strings.ToUpper(tbl.PartitionMethod) + " (" + strings.Join(parts, ", ") + ")"), nil
+
 	case "pg_get_expr":
 		// pg_get_expr(tree pg_node_tree, relation oid [, pretty bool]) → text
-		// Decompiles an internal expression tree. Stub: return empty string. M0097-0023.
+		// Decompiles an internal expression tree. Goopg stores pre-formatted strings
+		// in pg_node_tree columns (e.g. relpartbound), so pass them through directly.
+		if len(x.Args) >= 1 {
+			treeArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			if !treeArg.IsNull() && treeArg.StringValue() != "" {
+				return NewStringDatum(treeArg.StringValue()), nil
+			}
+		}
 		return NewStringDatum(""), nil
 
 	case "obj_description":

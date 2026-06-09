@@ -2775,6 +2775,24 @@ M0097-0001 wires it up.
         unknown" in CREATE TABLE and CREATE TYPE composite.
         Baseline CSV: create_table 388→91.
 
+      - **Progress 2026-06-09 (M0097-0023-loop46 — NOT NULL leaf-partition + OIDS upper + Fillfactor + DEFAULT ATTACH: 91→18):**
+        Seven fixes reducing `create_table` normalized diffs from 91 to 18:
+        (a) `operators_storage.go`: deferred NOT NULL check past partition routing so the
+        error message names the leaf child table (PG behaviour); leaf check uses remapped
+        row and child table name; (b) `testport/framework/regress.go`: OIDS keyword token
+        uppercased in syntax-error normalizer (PG uppercases keyword tokens); (c)
+        `operators_ddl.go` + `parser/ddl.go`: `CREATE TABLE … WITH ("Fillfactor"=10) AS
+        SELECT` — parser now handles `WITH (opts) AS SELECT` CTAS form; executor rejects
+        mixed-case storage parameter names with `42000 unrecognized parameter "Fillfactor"`;
+        (d) boolean partition bounds: `execCreatePartitionChild` rejects integer-literal
+        (IntegerConst AST node) IN values for bool-keyed partitions with `42804`; (e)
+        `operators_ddl.go` AlterTableAttachPartition DEFAULT handler: sets
+        `PartitionBounds[0].IsDefault = true` so `checkDefaultPartitionDataConflict`
+        locates the default partition. Remaining 18 diffs: PL/pgSQL CONTEXT lines,
+        partition child-index inheritance, DDL-during-active-query guard, DDL ROLLBACK TO
+        SAVEPOINT, and statement-level INSERT trigger — all require major feature work.
+        Baseline CSV: create_table 91→18.
+
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
         `copy`, `copy2`, `copydml`, `copyselect`, `sequence`,

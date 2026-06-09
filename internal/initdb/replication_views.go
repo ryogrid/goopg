@@ -379,11 +379,11 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 		Schema: "pg_catalog",
 		Name:   "pg_publication_rel",
 		Columns: []catalog.Column{
-			{Name: "oid", Type: catalog.Type{Name: "text"}},
-			{Name: "prpubid", Type: catalog.Type{Name: "text"}},
-			{Name: "prrelid", Type: catalog.Type{Name: "text"}},
+			{Name: "oid", Type: catalog.Type{Name: "oid"}},
+			{Name: "prpubid", Type: catalog.Type{Name: "oid"}},
+			{Name: "prrelid", Type: catalog.Type{Name: "oid"}},
 			{Name: "prqual", Type: catalog.Type{Name: "text"}},
-			{Name: "prattrs", Type: catalog.Type{Name: "text"}},
+			{Name: "prattrs", Type: catalog.Type{Name: "int2vector"}},
 		},
 		Virtual: true,
 	}
@@ -531,7 +531,24 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 		}
 		return out
 	}
-	return cat.RegisterVirtualTable(pgSubRel)
+	if err := cat.RegisterVirtualTable(pgSubRel); err != nil {
+		return err
+	}
+
+	// pg_publication_namespace — namespace-level publication filtering (PG15+).
+	// Stub: always empty; goopg does not support schema-level publications.
+	pgPubNS := &catalog.Table{
+		Schema: "pg_catalog",
+		Name:   "pg_publication_namespace",
+		Columns: []catalog.Column{
+			{Name: "oid", Type: catalog.Type{Name: "oid"}},
+			{Name: "pnpubid", Type: catalog.Type{Name: "oid"}},
+			{Name: "pnnspid", Type: catalog.Type{Name: "oid"}},
+		},
+		Virtual: true,
+	}
+	pgPubNS.VirtualRows = func() [][]string { return nil }
+	return cat.RegisterVirtualTable(pgPubNS)
 }
 
 // lookupRelOID resolves a qualified table name ("schema.name" or

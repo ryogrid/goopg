@@ -26,10 +26,6 @@ Root node: `Projection`
 | 3 | Seq Scan | supplier | — |
 | 4 | Index Scan | partsupp | idx_partsupp_suppkey |
 | 5 | Index Scan | part | idx_part_size |
-| 6 | Seq Scan | region | — |
-| 7 | Seq Scan | nation | — |
-| 8 | Seq Scan | supplier | — |
-| 9 | Seq Scan | partsupp | — |
 
 ### Q3
 
@@ -48,7 +44,6 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Index Scan | orders | idx_orders_orderdate |
-| 2 | Seq Scan | lineitem | — |
 
 ### Q5
 
@@ -194,7 +189,6 @@ Root node: `Projection`
 |---|-----------|-------|-------|
 | 1 | Seq Scan | lineitem | — |
 | 2 | Index Scan | part | part_pk |
-| 3 | Seq Scan | lineitem | — |
 
 ### Q18
 
@@ -238,8 +232,6 @@ Root node: `Projection`
 | 2 | Seq Scan | supplier | — |
 | 3 | Seq Scan | orders | — |
 | 4 | Seq Scan | lineitem l1 | — |
-| 5 | Index Scan | lineitem | idx_lineitem_orderkey |
-| 6 | Seq Scan | lineitem l3 | — |
 
 ### Q22
 
@@ -248,7 +240,6 @@ Root node: `Projection`
 | # | Node Type | Table | Index |
 |---|-----------|-------|-------|
 | 1 | Seq Scan | customer | — |
-| 2 | Index Scan | orders | idx_orders_custkey |
 
 ## Aggregate gaps
 
@@ -259,14 +250,13 @@ for an M0054-0003 sub-task investigation.
 | Table | Seq Scan queries | Index Scan queries |
 |-------|------------------|--------------------|
 | customer | Q10, Q18, Q22, Q7 | Q13, Q3, Q5, Q8 |
-| lineitem | Q10, Q17, Q18, Q19, Q4, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q20, Q21, Q3, Q5, Q6, Q7, Q8 |
+| lineitem | Q10, Q17, Q18, Q19, Q9 | Q1, Q12, Q14, Q15a, Q15b, Q20, Q3, Q5, Q6, Q7, Q8 |
 | lineitem l1 | Q21 | — |
-| lineitem l3 | Q21 | — |
-| nation | Q10, Q11, Q2, Q21 | Q2, Q20, Q5, Q7, Q8, Q9 |
+| nation | Q10, Q11, Q21 | Q2, Q20, Q5, Q7, Q8, Q9 |
 | nation n2 | Q7 | — |
-| orders | Q13, Q18, Q21, Q7, Q9 | Q10, Q12, Q22, Q3, Q4, Q5, Q8 |
+| orders | Q13, Q18, Q21, Q7, Q9 | Q10, Q12, Q3, Q4, Q5, Q8 |
 | part | Q20, Q9 | Q14, Q16, Q17, Q19, Q2, Q8 |
-| partsupp | Q11, Q16, Q2, Q20 | Q2, Q9 |
+| partsupp | Q11, Q16, Q20 | Q2, Q9 |
 | region | Q2, Q5, Q8 | — |
 | supplier | Q11, Q15b, Q2, Q20, Q21, Q9 | Q5, Q7, Q8 |
 
