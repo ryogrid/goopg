@@ -1453,6 +1453,9 @@ const (
 	// AlterTableAttachPartition — `ATTACH PARTITION child FOR VALUES …`.
 	// Registers an existing table as a partition of the parent. M0096-0007.
 	AlterTableAttachPartition
+	// AlterTableDetachPartition — `DETACH PARTITION child`.
+	// Removes a table from its partition parent. M0097-0028.
+	AlterTableDetachPartition
 	// AlterTableDropConstraint — `DROP CONSTRAINT name [RESTRICT|CASCADE]`.
 	// For PK constraints, checks view→constraint dependencies before dropping.
 	// M0097-0036 (functional_deps).
@@ -1552,6 +1555,9 @@ type AlterTableAction struct {
 	// ChildIndexName is populated for AlterIndexAttachPartition and holds
 	// the name of the child index to attach. M0097-0023.
 	ChildIndexName string
+	// DetachPartitionChild is populated for AlterTableDetachPartition and
+	// holds the child table name. M0097-0028.
+	DetachPartitionChild ObjectName
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

@@ -3332,6 +3332,22 @@ M0097-0001 wires it up.
         - `join_hash`: 142 → 0 diffs
         - `incremental_sort`: 1057 → 0 diffs
         - `merge`: 2355 → 0 diffs
+      - **Progress 2026-06-10 (DETACH PARTITION — partition_join 357→0 — loop 2):**
+        `ALTER TABLE DETACH PARTITION` was a no-op. Fixed:
+        (a) Parser (`internal/parser/ddl.go`): parse DETACH PARTITION properly,
+            emit `AlterTableDetachPartition` with `DetachPartitionChild` ObjectName.
+            Accepts optional CONCURRENTLY/FINALIZE keywords (ignored).
+        (b) AST (`internal/parser/ast.go`): add `AlterTableDetachPartition` kind +
+            `DetachPartitionChild ObjectName` field to `AlterTableAction`.
+        (c) Catalog (`internal/catalog/catalog.go`): add `UnregisterPartitionChild`
+            method to `InMemory` (removes childOID from parent's partitionChildren slice).
+        (d) Executor (`internal/executor/operators_ddl.go`): handle
+            `AlterTableDetachPartition`: look up child table, call
+            `UnregisterPartitionChild`, clear `PartitionParentOID` and
+            `PartitionBounds` on the child.
+        Root cause: DETACH was a no-op so detached partitions were still scanned,
+        causing duplicate rows when re-attaching with new NULL-inclusive partitions.
+        Result: `partition_join` 357 → 0 diffs (PASS).
 
 - [x] **M0097-0029 — Port extended-type / dbsize regress tests**
       - Summary: Make these 22 tests reach `pass`:

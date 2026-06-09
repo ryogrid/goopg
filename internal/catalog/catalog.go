@@ -1001,6 +1001,21 @@ func (c *InMemory) RegisterPartitionChild(parentOID, childOID uint32) {
 	c.mu.Unlock()
 }
 
+// UnregisterPartitionChild removes childOID from parentOID's partition children
+// list (DETACH PARTITION). M0097-0028.
+func (c *InMemory) UnregisterPartitionChild(parentOID, childOID uint32) {
+	c.mu.Lock()
+	children := c.partitionChildren[parentOID]
+	filtered := children[:0]
+	for _, oid := range children {
+		if oid != childOID {
+			filtered = append(filtered, oid)
+		}
+	}
+	c.partitionChildren[parentOID] = filtered
+	c.mu.Unlock()
+}
+
 // RegisterIndexPartitionChild registers childOID as a partition child of
 // parentOID in the index partition tree. M0097-0023.
 func (c *InMemory) RegisterIndexPartitionChild(parentOID, childOID uint32) {

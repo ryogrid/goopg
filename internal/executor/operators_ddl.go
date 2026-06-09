@@ -3277,6 +3277,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary)
 			}
+		case parser.AlterTableDetachPartition:
+			// ALTER TABLE parent DETACH PARTITION child — remove child from parent's
+			// partition tree. M0097-0028.
+			im, ok := o.ctx.Catalog.(*catalog.InMemory)
+			if !ok {
+				break
+			}
+			childTbl, ok := o.ctx.Catalog.LookupTable(act.DetachPartitionChild)
+			if !ok {
+				break
+			}
+			im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
+			childTbl.PartitionParentOID = 0
+			childTbl.PartitionBounds = nil
+
 		case parser.AlterIndexAttachPartition:
 			// ALTER INDEX parent ATTACH PARTITION child — register index partition hierarchy.
 			// Both parent and child must already exist as index catalog entries. M0097-0023.

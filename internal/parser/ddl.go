@@ -4314,15 +4314,17 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act := AlterTableAction{pos: poc.pos, Kind: AlterTableAttachPartition, AttachPartitionOf: poc}
 		return act, nil
 	}
-	// DETACH PARTITION child (accept and ignore for v0)
+	// DETACH PARTITION child [CONCURRENTLY|FINALIZE]
 	if p.acceptIdentKeyword("detach") {
 		_ = p.acceptKeyword(KwPartition)
-		if _, err := p.parseObjectName(); err != nil {
+		// Accept optional CONCURRENTLY / FINALIZE (PG14+) — ignored for now.
+		p.acceptIdentKeyword("concurrently")
+		p.acceptIdentKeyword("finalize")
+		childName, err := p.parseObjectName()
+		if err != nil {
 			return AlterTableAction{}, err
 		}
-		// No-op detach: return an empty ADD action that the executor ignores.
-		act := AlterTableAction{pos: p.cur().Pos, Kind: AlterTableAttachPartition}
-		return act, nil
+		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableDetachPartition, DetachPartitionChild: childName}, nil
 	}
 	// INHERIT parent_table (M0097-0048)
 	if p.acceptIdentKeyword("inherit") {
