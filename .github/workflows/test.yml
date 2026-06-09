@@ -154,17 +154,42 @@ jobs:
           fi
 
       # ------------------------------------------------------------------ #
-      # HammerDB TPC-H smoke test
+      # HammerDB TPC-H load runs (smoke + baseline)
       # TestSmokeLoadAgainstCluster spins up its own in-process goopg cluster
       # (via cluster.New / go run ./cmd/goopg) and loads 200 orders.
-      # The three heavier baseline tests are not included here (-run filter).
+      # The three heavier baseline runs — TestBaselineLoad10k / 50k / 200k —
+      # load 10 k / 50 k / 200 k orders to characterise loader throughput and
+      # confirm the connection survives past the prior failure region. They now
+      # run on every invocation (no -run filter, previously off by default); the
+      # longer timeout covers the 200 k run (~1-2 min) plus the others.
       # ------------------------------------------------------------------ #
-      - name: HammerDB TPC-H smoke test
+      - name: HammerDB TPC-H load runs (smoke + baseline)
         run: |
           go test -v \
-            -run TestSmokeLoadAgainstCluster \
-            -timeout 120s \
+            -timeout 30m \
             ./bench/tpch/cmd/hammerdb_load/...
+
+      # ------------------------------------------------------------------ #
+      # TPC-H query run at 2,000,000 orders
+      # TestTPCHScaleLoadAndQueryRun spins up its own in-process goopg
+      # cluster, generates + bulk-loads a 2 M-order TPC-H dataset across
+      # all eight tables (orders + ~8 M lineitems plus SF-scaled
+      # dimensions), then runs every Q1..Q22 against it, asserting each
+      # query executes without an executor error at scale.
+      #
+      # This package (internal/testutil/tpch) is in the unit-step EXCLUDE
+      # list because it is cluster-backed, so it is run here by explicit
+      # path + -run. Heavy: ~20 min load plus query time at 2 M orders;
+      # the 120 m timeout leaves headroom for the slowest queries (Q9).
+      # The dataset size is overridable via GOOPG_TPCH_ORDERS and the
+      # query set via GOOPG_TPCH_QUERIES (see the test's doc comment).
+      # ------------------------------------------------------------------ #
+      - name: TPC-H query run (2,000,000 orders)
+        run: |
+          go test -v \
+            -run TestTPCHScaleLoadAndQueryRun \
+            -timeout 120m \
+            ./internal/testutil/tpch/
 
       # ------------------------------------------------------------------ #
       # Diagnostics

@@ -537,6 +537,23 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 // evalPLpgSQLFunctionSetof calls a SETOF PL/pgSQL function via RETURN NEXT
 // accumulation and returns all collected rows. Used by the ProjectSet operator
 // for user-defined SETOF plpgsql functions in SELECT target lists. M0097-0073.
+// datumForCompositeText returns the text representation of d for use
+// inside a PostgreSQL composite literal "(v1,v2,...)". Unlike StringValue()
+// which only handles string/bytes kinds, this covers int and bool too.
+func datumForCompositeText(d Datum) string {
+	switch d.Kind {
+	case KindInt:
+		return fmt.Sprintf("%d", d.Int)
+	case KindBool:
+		if d.Int != 0 {
+			return "t"
+		}
+		return "f"
+	default:
+		return d.StringValue()
+	}
+}
+
 func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos int) ([]Datum, error) {
 	// STRICT: if any argument is NULL, return empty set without executing the body.
 	if r.Strict {
@@ -1210,6 +1227,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				frame.returnNextRows = append(frame.returnNextRows, row[0])
 			} else if len(row) > 1 {
 				// Pack multi-column row as PostgreSQL composite text (v1,v2,...).
+				// Use datumForCompositeText for correct integer/bool/etc. formatting.
 				var buf strings.Builder
 				buf.WriteByte('(')
 				for i, d := range row {
@@ -1217,7 +1235,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 						buf.WriteByte(',')
 					}
 					if !d.IsNull() {
-						buf.WriteString(d.StringValue())
+						buf.WriteString(datumForCompositeText(d))
 					}
 				}
 				buf.WriteByte(')')

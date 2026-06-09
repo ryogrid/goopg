@@ -160,9 +160,11 @@ func (o *transactionOp) execCommit() error {
 	if o.ctx.EndLocalTransaction != nil {
 		o.ctx.EndLocalTransaction()
 	}
-	// Clear pending routine drops — they're committed, no need to restore.
+	// Clear pending routine drops and truncate undos — they're committed.
 	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
 		sess.TakePendingRoutineDrops()
+		sess.TakePendingTruncates()
+		sess.TakePendingSeqRestores()
 	}
 	globalRelLockMgr.ReleaseSession(o.ctx.Session)
 	o.clearCtxTransaction()
@@ -180,9 +182,8 @@ func (o *transactionOp) execRollback() error {
 	// TxnMgr.Rollback so the catalog DropTable/DropIndex can still
 	// find the entries (they're still in the in-memory map).
 	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
-		for _, entry := range sess.TakePendingDDLCreates() {
-			rollbackDDLCreate(o.ctx, entry)
-		}
+		// Undo DDL creates, TRUNCATE page snapshots, and RESTART IDENTITY.
+		ProcessRollbackUndos(o.ctx, sess)
 		// Restore any routines that were dropped in this transaction.
 		for _, r := range sess.TakePendingRoutineDrops() {
 			if rs := o.ctx.Catalog.Routines(); rs != nil {
@@ -233,6 +234,28 @@ func rollbackDDLCreate(ctx *Context, entry DDLUndoEntry) {
 		for _, dbOid := range catalogDBOids(ctx) {
 			deleteCatalogRowsForOID(ctx, dbOid, entry.RelOID, ctx.Tx.XID)
 		}
+	}
+}
+
+// ProcessRollbackUndos runs all in-memory undo actions stored in sess:
+//  1. DDL creates (CREATE TABLE / CREATE INDEX) — remove from catalog + relfile
+//  2. TRUNCATE page snapshots — restore heap and index pages to pre-truncate state
+//  3. RESTART IDENTITY sequence counter restores
+//
+// Exported so dispatch.go's TxRollback shortcut path can call it with the
+// production-server Context (which has Pool set).  Must be called BEFORE
+// TxnMgr.Rollback so catalog.DropTable/DropIndex can still find entries.
+func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
+	for _, entry := range sess.TakePendingDDLCreates() {
+		rollbackDDLCreate(ctx, entry)
+	}
+	if ctx.Pool != nil {
+		for _, entry := range sess.TakePendingTruncates() {
+			restoreTruncateUndo(ctx, entry)
+		}
+	}
+	for _, sr := range sess.TakePendingSeqRestores() {
+		SetSequenceCurrentValue(sr.Name, sr.OldCurr)
 	}
 }
 

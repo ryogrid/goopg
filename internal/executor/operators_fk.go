@@ -554,22 +554,33 @@ func fkSetNull(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, val
 
 // scanTableForMatch returns true if tbl has a visible row where the named
 // columns match the given values exactly.
+// allDescendants returns all partition/inheritance descendants of tbl
+// (direct children, their children, etc.) in breadth-first order.
+// Multi-level partition hierarchies (e.g. trunc_a → trunc_a2 → trunc_a21)
+// require this recursive expansion so FK scans find leaf partition data.
+func allDescendants(im *catalog.InMemory, tbl *catalog.Table) []*catalog.Table {
+	var out []*catalog.Table
+	queue := []*catalog.Table{tbl}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		kids := append([]*catalog.Table(nil), im.InheritanceChildren(cur.OID)...)
+		kids = append(kids, im.PartitionChildren(cur.OID)...)
+		for _, k := range kids {
+			out = append(out, k)
+			queue = append(queue, k)
+		}
+	}
+	return out
+}
+
 func scanTableForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, error) {
-	// Also scan partition/inheritance children.
 	found, err := scanRelForMatch(ctx, tbl, colNames, vals)
 	if err != nil || found {
 		return found, err
 	}
-	// Check inheritance children (covers partition children too, since PartitionChildren
-	// returns the same *Table slice as InheritanceChildren for partition parents).
 	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-		for _, child := range im.InheritanceChildren(tbl.OID) {
-			found, err = scanRelForMatch(ctx, child, colNames, vals)
-			if err != nil || found {
-				return found, err
-			}
-		}
-		for _, child := range im.PartitionChildren(tbl.OID) {
+		for _, child := range allDescendants(im, tbl) {
 			found, err = scanRelForMatch(ctx, child, colNames, vals)
 			if err != nil || found {
 				return found, err
@@ -744,12 +755,11 @@ func scanTableForMatchFKWait(ctx *Context, tbl *catalog.Table, colNames []string
 		if found {
 			return true, nil
 		}
-		// Then partition/inheritance children — return on first clean match,
-		// accumulate the first pending xmax we see.
+		// Then all partition/inheritance descendants (recursive) — return on
+		// first clean match, accumulate the first pending xmax we see.
+		// Recursive expansion is required for multi-level partition trees.
 		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-			children := append([]*catalog.Table(nil), im.InheritanceChildren(tbl.OID)...)
-			children = append(children, im.PartitionChildren(tbl.OID)...)
-			for _, child := range children {
+			for _, child := range allDescendants(im, tbl) {
 				cfound, cpending, cerr := scanRelForFKMatch(ctx, child, colNames, vals)
 				if cerr != nil {
 					return false, cerr

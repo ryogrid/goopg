@@ -101,7 +101,7 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 	case *parser.CreateSequenceStmt:
 		return nil, o.execCreateSequence(s)
 	case *parser.AlterSequenceStmt:
-		return nil, nil // ALTER SEQUENCE accepted, no-op executor
+		return nil, o.execAlterSequence(s)
 	case *parser.CreateMatViewStmt:
 		return nil, o.execCreateMatView(s)
 	case *parser.RefreshMatViewStmt:
@@ -821,6 +821,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			seqStart = c.IdentityStart
 		}
 		RegisterSequence(seqName, seqStart, 1, seqMin, seqMax, false)
+		// Record implicit ownership so DROP TABLE cascades to this sequence.
+		SetSequenceOwnedBy(seqName, strings.ToLower(s.Name.Name)+"."+strings.ToLower(c.Name))
 	}
 
 	// If PARTITION BY, annotate the table with partition metadata
@@ -2518,6 +2520,9 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error
 	if err := o.ctx.Catalog.DropTable(dropName); err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}
+	// Drop sequences that are owned by columns of this table (created via
+	// ALTER SEQUENCE ... OWNED BY table.col, or SERIAL column defaults).
+	DropSequencesOwnedByTable(tbl.Name)
 	// If this table was shadowing a permanent one, restore it. M0097-0003.
 	if o.ctx.TempTableShadows != nil {
 		key := strings.ToLower(name.Name)
@@ -4192,12 +4197,30 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 					if _, inSet := tableSet[other.OID]; inSet {
 						continue // already in set
 					}
+					// Collect tbl and all its partition ancestors (full chain) so
+				// that FK constraints on a parent partitioned table are found.
+				tblNames := []string{strings.ToLower(tbl.Name)}
+				for oid := tbl.PartitionParentOID; oid != 0; {
+						anc, ok := im.LookupTableByOID(oid)
+						if !ok {
+							break
+						}
+						tblNames = append(tblNames, strings.ToLower(anc.Name))
+						oid = anc.PartitionParentOID
+					}
 					for _, fk := range other.ForeignKeys {
 						refName := strings.ToLower(fk.RefTable)
-						if refName != strings.ToLower(tbl.Name) {
+						matched := false
+						for _, tn := range tblNames {
+							if refName == tn {
+								matched = true
+								break
+							}
+						}
+						if !matched {
 							continue
 						}
-						// other references tbl and is not in the truncation set.
+						// other references tbl (or its partition parent) and is not in the truncation set.
 						if s.Behavior == parser.DropCascade {
 							tableSet[other.OID] = &tableEntry{tbl: other, only: false}
 							o.ctx.AddNotice(fmt.Sprintf("truncate cascades to table %q", other.Name))
@@ -4271,6 +4294,8 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 
 	// RESTART IDENTITY: reset sequences for all truncated tables.
 	if s.RestartIdentity {
+		sess, isBas := o.ctx.Session.(*BasicSession)
+		inExplicitTx := isBas && sess.InExplicitTransaction()
 		for _, entry := range tableSet {
 			tbl := entry.tbl
 			for _, col := range tbl.Columns {
@@ -4287,6 +4312,12 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 					seqName = extractNextvalSeqNameFromExpr(col.DefaultExpr)
 				}
 				if seqName != "" {
+					if inExplicitTx {
+						// Save old counter so ROLLBACK can restore it.
+						if oldCurr, ok := GetSequenceCurrentValue(seqName); ok {
+							sess.RecordSeqRestore(SeqRestoreEntry{Name: seqName, OldCurr: oldCurr})
+						}
+					}
 					ResetSequence(seqName)
 				}
 			}
@@ -4331,6 +4362,71 @@ func extractNextvalSeqNameFromExpr(expr parser.Expr) string {
 	return strings.ToLower(strings.TrimSpace(name))
 }
 
+// snapshotRelPages reads all pages of rel into a relPageSnapshot before truncation.
+// Reads each page through the pool (so dirty in-memory pages are captured).
+// Returns an empty snapshot if the relation has no pages.
+func snapshotRelPages(ctx *Context, rel storage.RelFileNode) relPageSnapshot {
+	if ctx.Pool == nil {
+		return relPageSnapshot{Rel: rel}
+	}
+	nBlocks, err := ctx.Pool.Manager().NBlocks(rel)
+	if err != nil || nBlocks == 0 {
+		return relPageSnapshot{Rel: rel}
+	}
+	pages := make([][]byte, nBlocks)
+	for i := storage.BlockNumber(0); i < nBlocks; i++ {
+		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: i})
+		if perr != nil {
+			pages[i] = nil
+			continue
+		}
+		s.RLock()
+		cp := make([]byte, storage.BlockSize)
+		copy(cp, s.Page())
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		pages[i] = cp
+	}
+	return relPageSnapshot{Rel: rel, Pages: pages}
+}
+
+// restoreTruncateUndo re-creates the physical files for one TruncateUndoEntry.
+// Called during ROLLBACK to undo a TRUNCATE performed in a rolled-back transaction.
+func restoreTruncateUndo(ctx *Context, entry TruncateUndoEntry) {
+	mgr := ctx.Pool.Manager()
+
+	restoreRel := func(snap relPageSnapshot) {
+		if len(snap.Pages) == 0 {
+			return
+		}
+		// Discard any pool-buffered pages for this rel (they belong to the rolled-back tx).
+		ctx.Pool.InvalidateRel(snap.Rel)
+		// Re-truncate to zero so we start fresh (handles case where new pages were added).
+		_ = mgr.TruncateRelation(snap.Rel)
+		// Re-extend with the saved pages.
+		for _, pg := range snap.Pages {
+			if pg == nil {
+				continue
+			}
+			_, _ = mgr.Extend(snap.Rel, pg)
+		}
+		// Invalidate again so the pool re-reads from disk on next access.
+		ctx.Pool.InvalidateRel(snap.Rel)
+	}
+
+	restoreRel(entry.Heap)
+	// Clear FSM/VM stale entries — they'll be rebuilt on next access.
+	if ctx.FSM != nil {
+		ctx.FSM.DropRelation(entry.Heap.Rel)
+	}
+	if ctx.VM != nil {
+		ctx.VM.DropRelation(entry.Heap.Rel)
+	}
+	for _, idxSnap := range entry.Indexes {
+		restoreRel(idxSnap)
+	}
+}
+
 // truncateTableAndPartitions truncates a single table's heap + indexes and
 // recursively cascades to all partition descendants. This matches PostgreSQL's
 // TRUNCATE behaviour where a partitioned table implicitly truncates every leaf.
@@ -4355,6 +4451,19 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	}
 	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
 	rel := o.ctx.Catalog.RelFileNode(tbl)
+
+	// Snapshot pages before truncation for transactional rollback support.
+	if sess, isBas := o.ctx.Session.(*BasicSession); isBas && sess.InExplicitTransaction() {
+		entry := TruncateUndoEntry{
+			Heap: snapshotRelPages(o.ctx, rel),
+		}
+		for _, idx := range idxs {
+			idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+			entry.Indexes = append(entry.Indexes, snapshotRelPages(o.ctx, idxRel))
+		}
+		sess.RecordTruncate(entry)
+	}
+
 	o.ctx.Pool.InvalidateRel(rel)
 	if err := o.ctx.Pool.Manager().TruncateRelation(rel); err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
@@ -5932,6 +6041,15 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	}
 	cycle := s.Cycle
 	RegisterSequence(name, start, increment, minV, maxV, cycle)
+	return nil
+}
+
+// execAlterSequence handles ALTER SEQUENCE statements. Currently implements
+// OWNED BY (records sequence ownership for DROP TABLE cascade).
+func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
+	if s.OwnedBy != "" {
+		SetSequenceOwnedBy(s.Name.String(), s.OwnedBy)
+	}
 	return nil
 }
 
