@@ -2759,6 +2759,22 @@ M0097-0001 wires it up.
         formatting in RETURN QUERY rows. `truncate` regress: 135→0 diffs (PASS).
         Total: 24 regress cases pass.
 
+      - **Progress 2026-06-09 (M0097-0023-loop45 — partition DDL validation: 388→91):**
+        commit 03222aa7. Eight fixes reducing `create_table` diffs from 388 to 91:
+        (a) `relkind='p'` for partitioned tables in pg18_user_catalog_rows — fixes
+        `\d part_column_drop` showing empty output (psql centering stripped by normalizer);
+        (b) Partition-key pre-check in `execAlterDropColumn` — "cannot drop column X
+        because it is part of the partition key"; (c) Temp-in-non-temp-schema check —
+        "cannot create temporary relation in non-temporary schema"; (d) INHERITS from
+        partitioned table check — "cannot inherit from partitioned table"; (e) WITH
+        clause + PARTITION BY check — "cannot specify storage parameters for a
+        partitioned table"; (f) Parser fix for `ALTER TABLE SET UNLOGGED`: UNLOGGED is
+        TokenKeyword not TokenIdent; (g) PARTITION OF duplicate column detection —
+        "column X specified more than once" (parser tracks seenCols, skips CONSTRAINT
+        keyword entries); (h) Pseudo-type unknown rejection — "column X has pseudo-type
+        unknown" in CREATE TABLE and CREATE TYPE composite.
+        Baseline CSV: create_table 388→91.
+
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
         `copy`, `copy2`, `copydml`, `copyselect`, `sequence`,
