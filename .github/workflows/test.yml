@@ -154,16 +154,19 @@ jobs:
           fi
 
       # ------------------------------------------------------------------ #
-      # HammerDB TPC-H smoke test
+      # HammerDB TPC-H load runs (smoke + baseline)
       # TestSmokeLoadAgainstCluster spins up its own in-process goopg cluster
       # (via cluster.New / go run ./cmd/goopg) and loads 200 orders.
-      # The three heavier baseline tests are not included here (-run filter).
+      # The three heavier baseline runs — TestBaselineLoad10k / 50k / 200k —
+      # load 10 k / 50 k / 200 k orders to characterise loader throughput and
+      # confirm the connection survives past the prior failure region. They now
+      # run on every invocation (no -run filter, previously off by default); the
+      # longer timeout covers the 200 k run (~1-2 min) plus the others.
       # ------------------------------------------------------------------ #
-      - name: HammerDB TPC-H smoke test
+      - name: HammerDB TPC-H load runs (smoke + baseline)
         run: |
           go test -v \
-            -run TestSmokeLoadAgainstCluster \
-            -timeout 120s \
+            -timeout 30m \
             ./bench/tpch/cmd/hammerdb_load/...
 
       # ------------------------------------------------------------------ #
