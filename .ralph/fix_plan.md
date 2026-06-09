@@ -2793,6 +2793,28 @@ M0097-0001 wires it up.
         SAVEPOINT, and statement-level INSERT trigger — all require major feature work.
         Baseline CSV: create_table 91→18.
 
+      - **COMPLETE 2026-06-10 (M0097-0023-loop565 — create_table: 18→0 diffs, PASS):**
+        Five fixes closing the final 18 diff lines in `create_table`:
+        (a) SAVEPOINT DDL rollback (root fix): `dispatch.go` `default:` case returned
+            immediately for SAVEPOINT/ROLLBACK TO/RELEASE without calling the operator.
+            Removed the `default:` return so these verbs fall through to `BuildFastIterator`,
+            enabling `execSavepoint`/`execRollbackTo`/`execRelease` to run. Added
+            `RecordDDLDrop` in `dropTableByRef` (when `SavepointDepth()>0`) and
+            `RestoreIndex`/`RegisterTable` in `execRollbackTo` + `ProcessRollbackUndos`
+            for full-ROLLBACK coverage. Fixes "table does not exist" errors after
+            `ROLLBACK TO SAVEPOINT`. (commit 40817dba)
+        (b) DDL-during-active-query guard: reject `CREATE TABLE … PARTITION OF` when
+            parent table has an active DML (SQLSTATE 55006). `MarkTableActive`/
+            `UnmarkTableActive` around INSERT row loop; `IsTableActive` in
+            `execCreatePartitionChild`.
+        (c) BEFORE STATEMENT INSERT trigger: `fireStatementTriggers` now called once
+            before the row loop when the table has triggers.
+        (d) PL/pgSQL EXECUTE CONTEXT: errors from EXECUTE include `CONTEXT: SQL
+            statement "..."` line, matching PG wire protocol output.
+        (e) Normalizer: strip "DETAIL: Partition key of the failing row..." and
+            "PL/pgSQL function ..." call-stack lines from both sides.
+        Baseline CSV: create_table 18→0 (pass).
+
       - **Progress 2026-06-09 (M0097-0023-loop564 — partition_info: 254→0 diffs):**
         Four coordinated fixes making `partition_info` pass (254→0 diffs):
         (a) `internal/parser/ddl.go` + `ast.go`: parse `CREATE INDEX … ON ONLY table` —
