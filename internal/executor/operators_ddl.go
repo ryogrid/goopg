@@ -1584,6 +1584,57 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			return err
 		}
 	}
+	// Inherit regular (non-PK, non-unique) btree indexes from parent onto the
+	// partition child. PostgreSQL automatically creates matching indexes on each
+	// leaf partition when the parent has non-constraint indexes (e.g. partial
+	// indexes or expression indexes). We clone every non-PK/non-unique btree
+	// parent index and auto-generate a name using the partition name + column
+	// names + "_idx". Expression columns get "expr" as their name part so that
+	// two expression indexes on the same child get "_expr_idx" / "_expr_idx1".
+	for _, parentIdx := range o.ctx.Catalog.IndexesOnTable(parent) {
+		if parentIdx.Method != "btree" || parentIdx.Primary || parentIdx.Unique {
+			continue
+		}
+		// Replace empty column names (expression cols) with "expr" for naming.
+		nameCols := make([]string, len(parentIdx.Columns))
+		for i, col := range parentIdx.Columns {
+			if col == "" {
+				nameCols[i] = "expr"
+			} else {
+				nameCols[i] = col
+			}
+		}
+		childIdxName := parser.ObjectName{
+			Schema: s.Name.Schema,
+			Name:   o.autoIndexNameWithIncludes(tbl, nameCols, nil, "idx"),
+		}
+		// Reconstruct colExprs slice (parallel to parentIdx.Columns).
+		var colExprs []parser.Expr
+		if len(parentIdx.ColExprs) > 0 {
+			colExprs = make([]parser.Expr, len(parentIdx.ColExprs))
+			for i, ep := range parentIdx.ColExprs {
+				if ep != nil {
+					colExprs[i] = *ep
+				}
+			}
+		}
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, colExprs, false, false); err != nil {
+			return err
+		}
+		// Copy predicate (WHERE clause) and ColExprStrings from parent index.
+		if idx, ok2 := o.ctx.Catalog.LookupIndex(childIdxName); ok2 {
+			if parentIdx.HasPredicate {
+				idx.HasPredicate = parentIdx.HasPredicate
+				idx.Predicate = parentIdx.Predicate
+				idx.PredicateString = parentIdx.PredicateString
+			}
+			for i, s := range parentIdx.ColExprStrings {
+				if s != "" && i < len(idx.ColExprStrings) {
+					idx.ColExprStrings[i] = s
+				}
+			}
+		}
+	}
 	// Inherit named CHECK constraints from parent (non-NoInherit only). M0097-0023.
 	im2, isIM2 := o.ctx.Catalog.(*catalog.InMemory)
 	for _, pnc := range parent.NamedChecks {
