@@ -2903,37 +2903,63 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
-	if strings.EqualFold(tf.Name, "pg_partition_ancestors") {
-		// pg_partition_ancestors(regclass) → SETOF regclass (column: relid).
-		// Returns each ancestor table OID. Implemented as a scalar stub that
-		// returns the input OID once (non-partition → just itself). M0097-0023.
-		// alias defaults to "relid" (the output column name) so unqualified
-		// WHERE relid IS NOT NULL resolves via both the column-name search and
-		// the whole-row alias path (same pattern as planScalarFuncScan). M0097-0023.
+	if strings.EqualFold(tf.Name, "pg_partition_tree") || strings.EqualFold(tf.Name, "pg_partition_ancestors") {
+		// pg_partition_tree / pg_partition_ancestors — multi-row SRF that traverses
+		// the catalog partition hierarchy. Uses the PgPartitionTree plan node which
+		// materialises all rows on Open(). M0097-0023.
+		isTree := strings.EqualFold(tf.Name, "pg_partition_tree")
 		alias := rv.Alias
 		if alias == "" {
-			alias = "relid"
-		}
-		colAlias := alias
-		if len(rv.Columns) > 0 {
-			colAlias = rv.Columns[0]
+			if isTree {
+				alias = "pg_partition_tree"
+			} else {
+				alias = "relid"
+			}
 		}
 		ctx := &resolveContext{}
-		args := make([]Expr, 0, len(tf.Args))
-		for _, a := range tf.Args {
-			pa, err := resolveExpr(a, ctx)
+		var arg Expr
+		if len(tf.Args) > 0 {
+			var err error
+			arg, err = resolveExpr(tf.Args[0], ctx)
 			if err != nil {
 				return nil, rangeBinding{}, err
 			}
-			args = append(args, pa)
 		}
-		fc := &FuncCall{pos: tf.Pos(), Name: "pg_partition_ancestors", Args: args}
-		schema := Schema{SchemaColumn{Name: colAlias, Type: catalog.Type{Name: "oid"}, SourceTableIdx: sourceIdx}}
-		tbl := &catalog.Table{
-			Name:    alias,
-			Columns: []catalog.Column{{Name: colAlias, Type: catalog.Type{Name: "oid"}, Ordinal: 0}},
+		var schema Schema
+		var cols []catalog.Column
+		if isTree {
+			// pg_partition_tree output: relid regclass, parentrelid regclass, isleaf bool, level int4
+			colNames := []string{"relid", "parentrelid", "isleaf", "level"}
+			if len(rv.Columns) >= 4 {
+				colNames = rv.Columns[:4]
+			}
+			schema = Schema{
+				SchemaColumn{Name: colNames[0], Type: catalog.Type{Name: "regclass"}, SourceTableIdx: sourceIdx},
+				SchemaColumn{Name: colNames[1], Type: catalog.Type{Name: "regclass"}, SourceTableIdx: sourceIdx},
+				SchemaColumn{Name: colNames[2], Type: catalog.Type{Name: "bool"}, SourceTableIdx: sourceIdx},
+				SchemaColumn{Name: colNames[3], Type: catalog.Type{Name: "int4"}, SourceTableIdx: sourceIdx},
+			}
+			cols = []catalog.Column{
+				{Name: colNames[0], Type: catalog.Type{Name: "regclass"}, Ordinal: 0},
+				{Name: colNames[1], Type: catalog.Type{Name: "regclass"}, Ordinal: 1},
+				{Name: colNames[2], Type: catalog.Type{Name: "bool"}, Ordinal: 2},
+				{Name: colNames[3], Type: catalog.Type{Name: "int4"}, Ordinal: 3},
+			}
+		} else {
+			// pg_partition_ancestors output: relid regclass
+			colName := "relid"
+			if len(rv.Columns) >= 1 {
+				colName = rv.Columns[0]
+			}
+			schema = Schema{
+				SchemaColumn{Name: colName, Type: catalog.Type{Name: "regclass"}, SourceTableIdx: sourceIdx},
+			}
+			cols = []catalog.Column{
+				{Name: colName, Type: catalog.Type{Name: "regclass"}, Ordinal: 0},
+			}
 		}
-		node := &ScalarFuncScan{pos: tf.Pos(), Func: fc, schema: schema}
+		node := &PgPartitionTree{pos: tf.Pos(), FuncName: tf.Name, Arg: arg, schema: schema}
+		tbl := &catalog.Table{Name: alias, Columns: cols}
 		b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 		return node, b, nil
 	}
@@ -4705,7 +4731,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if x.Subquery != nil {
 			return planInExpr(x, win.input)
 		}
-		return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, List: list}, nil
+		return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, List: list}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExprAfterWindow(x.Operand, win)
 		if err != nil {
@@ -8089,7 +8115,7 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny}
+	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp}
 	if x.Subquery != nil {
 		if ctx == nil || ctx.cat == nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "IN (subquery) not supported in this context"}
@@ -8947,6 +8973,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 			Operand:         shiftColumnRefsBy(x.Operand, delta),
 			Negated:         x.Negated,
 			NotEqualAny:     x.NotEqualAny,
+			AnyOp:           x.AnyOp,
 			Plan:            x.Plan,
 			List:            list,
 			IsNonCorrelated: x.IsNonCorrelated,

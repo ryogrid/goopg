@@ -1578,6 +1578,26 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						} else {
 							valueBuf = d.AppendValueText(valueBuf)
 						}
+					case "regclass":
+						// OID values with type regclass display as relation names. M0097-0023.
+						if d.Kind == executor.KindInt {
+							oid := uint32(d.Int)
+							found := false
+							if im, ok2 := s.cfg.Catalog.(*catalog.InMemory); ok2 {
+								if tbl, ok3 := im.LookupTableByOID(oid); ok3 {
+									valueBuf = append(valueBuf, tbl.Name...)
+									found = true
+								} else if idx, ok3 := im.LookupIndexByOID(oid); ok3 {
+									valueBuf = append(valueBuf, idx.Name...)
+									found = true
+								}
+							}
+							if !found {
+								valueBuf = d.AppendValueText(valueBuf)
+							}
+						} else {
+							valueBuf = d.AppendValueText(valueBuf)
+						}
 					default:
 						valueBuf = d.AppendValueText(valueBuf)
 					}

@@ -1138,6 +1138,24 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, err
 	}
 
+	// pg_sequences: virtual catalog view listing all registered sequences.
+	// M0097-0024.
+	if err := registerPgSequencesView(cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+
+	// information_schema.sequences: standard SQL view of sequence metadata.
+	// M0097-0068.
+	if err := registerInformationSchemaSequencesView(cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
+
 	// pg_stat_activity: M0022 Stage A. Backend-activity registry
 	// tracking connection lifecycle, current query, and state.
 	// One row per active backend. Backed by *activity.Registry.

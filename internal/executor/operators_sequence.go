@@ -27,8 +27,12 @@ type seqState struct {
 	min       int64
 	max       int64
 	cycle     bool
-	ownedBy   string     // "table.column" set by ALTER SEQUENCE ... OWNED BY
-	mu        sync.Mutex // serialises nextval
+	called    atomic.Bool // true after first nextval or setval
+	ownedBy   string      // "table.column" set by ALTER SEQUENCE ... OWNED BY
+	schema    string      // schema name (default "public")
+	seqName   string      // bare sequence name (no schema prefix)
+	dataType  string      // "smallint", "integer", or "bigint" (default)
+	mu        sync.Mutex  // serialises nextval
 }
 
 // nextVal atomically advances the sequence and returns the new value.
@@ -37,12 +41,16 @@ func (s *seqState) nextVal() (int64, error) {
 	defer s.mu.Unlock()
 	cur := s.current.Load()
 	next := cur + s.increment
+	seqName := s.schema + "." + s.seqName
+	if s.schema == "" || s.schema == "public" {
+		seqName = s.seqName
+	}
 	if s.increment > 0 {
 		if next > s.max {
 			if s.cycle {
 				next = s.min
 			} else {
-				return 0, fmt.Errorf("nextval: reached maximum value of sequence (%d)", s.max)
+				return 0, fmt.Errorf("nextval: reached maximum value of sequence %q (%d)", seqName, s.max)
 			}
 		}
 	} else {
@@ -50,11 +58,12 @@ func (s *seqState) nextVal() (int64, error) {
 			if s.cycle {
 				next = s.max
 			} else {
-				return 0, fmt.Errorf("nextval: reached minimum value of sequence (%d)", s.min)
+				return 0, fmt.Errorf("nextval: reached minimum value of sequence %q (%d)", seqName, s.min)
 			}
 		}
 	}
 	s.current.Store(next)
+	s.called.Store(true)
 	return next, nil
 }
 
@@ -69,16 +78,42 @@ func seqKey(name string) string {
 // RegisterSequence creates or replaces a sequence in the registry.
 // Called by CREATE SEQUENCE and by SERIAL column initialisation.
 func RegisterSequence(name string, start, increment, min, max int64, cycle bool) {
+	schema, bare := splitSeqName(strings.ToLower(strings.TrimSpace(name)))
 	s := &seqState{
 		start:     start,
 		increment: increment,
 		min:       min,
 		max:       max,
 		cycle:     cycle,
+		schema:    schema,
+		seqName:   bare,
+		dataType:  "bigint",
 	}
 	// current starts at start-increment so that the first nextval returns start.
 	s.current.Store(start - increment)
 	seqRegistry.Store(seqKey(name), s)
+}
+
+// SetSequenceDataType records the declared data type of a sequence (e.g. from
+// CREATE SEQUENCE ... AS smallint). M0097-0068.
+func SetSequenceDataType(name, dataType string) {
+	v, ok := seqRegistry.Load(seqKey(name))
+	if !ok {
+		return
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	s.dataType = strings.ToLower(dataType)
+	s.mu.Unlock()
+}
+
+// splitSeqName splits "schema.name" into (schema, name).
+// If no schema prefix is present, schema defaults to "public".
+func splitSeqName(name string) (schema, bare string) {
+	if i := strings.Index(name, "."); i >= 0 {
+		return name[:i], name[i+1:]
+	}
+	return "public", name
 }
 
 // LookupSequence returns the seqState for name, or nil if not found.
@@ -234,12 +269,22 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 		RegisterSequence(name, 1, 1, 1, 9223372036854775807, false)
 		s = LookupSequence(name)
 	}
+	// Validate value is within sequence bounds.
+	s.mu.Lock()
+	seqMin, seqMax := s.min, s.max
+	s.mu.Unlock()
+	if value < seqMin || value > seqMax {
+		return Datum{}, &ExecError{Code: "22003",
+			Message: fmt.Sprintf("setval: value %d is out of bounds for sequence \"%s\" (%d..%d)", value, name, seqMin, seqMax)}
+	}
 	if isCalled {
 		// Next nextval returns value+increment.
 		s.current.Store(value)
+		s.called.Store(true)
 	} else {
 		// Next nextval returns value.
 		s.current.Store(value - s.increment)
+		s.called.Store(false)
 	}
 	// Update session state.
 	if ctx != nil {
@@ -260,4 +305,89 @@ func evalLastval(ctx *Context) (Datum, error) {
 		return Datum{}, &ExecError{Code: "55000", Message: "lastval is not yet defined in this session"}
 	}
 	return Datum{Kind: KindInt, Int: ctx.LastSeqVal}, nil
+}
+
+// UpdateSequenceParams applies ALTER SEQUENCE parameter changes to a sequence.
+// All pointer fields: nil means "leave unchanged". restart=true resets current
+// to start-increment (honoring newStart if also supplied). restartWith, if not
+// nil, overrides the restart target. M0097-0068.
+func UpdateSequenceParams(name string, increment, minVal, maxVal, startWith, restartWith *int64,
+	restart, cycle, noCycle bool) error {
+	s := LookupSequence(name)
+	if s == nil {
+		return fmt.Errorf("sequence %q does not exist", name)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if increment != nil {
+		s.increment = *increment
+	}
+	if minVal != nil {
+		s.min = *minVal
+	}
+	if maxVal != nil {
+		s.max = *maxVal
+	}
+	if cycle {
+		s.cycle = true
+	} else if noCycle {
+		s.cycle = false
+	}
+	if startWith != nil {
+		s.start = *startWith
+	}
+	if restartWith != nil {
+		// RESTART WITH n: set current so next nextval returns n.
+		s.current.Store(*restartWith - s.increment)
+		s.called.Store(false)
+	} else if restart {
+		// RESTART: reset to stored start.
+		s.current.Store(s.start - s.increment)
+		s.called.Store(false)
+	}
+	return nil
+}
+
+// SeqInfo is a snapshot of a single sequence's state, used by pg_sequences.
+type SeqInfo struct {
+	Schema    string
+	Name      string
+	DataType  string // "smallint", "integer", or "bigint"
+	Start     int64
+	Min       int64
+	Max       int64
+	Increment int64
+	Cycle     bool
+	LastValue int64
+	Called    bool // false → last_value is NULL in pg_sequences
+}
+
+// AllSequenceInfos returns a snapshot of all registered sequences.
+// Called by the pg_sequences virtual table VirtualRows callback.
+func AllSequenceInfos() []SeqInfo {
+	var out []SeqInfo
+	seqRegistry.Range(func(_, v any) bool {
+		s := v.(*seqState)
+		s.mu.Lock()
+		dt := s.dataType
+		if dt == "" {
+			dt = "bigint"
+		}
+		info := SeqInfo{
+			Schema:    s.schema,
+			Name:      s.seqName,
+			DataType:  dt,
+			Start:     s.start,
+			Min:       s.min,
+			Max:       s.max,
+			Increment: s.increment,
+			Cycle:     s.cycle,
+			Called:    s.called.Load(),
+			LastValue: s.current.Load(),
+		}
+		s.mu.Unlock()
+		out = append(out, info)
+		return true
+	})
+	return out
 }

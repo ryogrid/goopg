@@ -1446,6 +1446,20 @@ func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Col
 			colName = colAliases[0]
 		}
 		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "text[]"}, Ordinal: 0}}
+	case "pg_partition_tree":
+		// pg_partition_tree(regclass) → (relid, parentrelid, isleaf, level). M0097-0023.
+		names := []string{"relid", "parentrelid", "isleaf", "level"}
+		types := []string{"oid", "oid", "bool", "int4"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
 	case "pg_partition_ancestors":
 		// pg_partition_ancestors(regclass) → SETOF regclass, output column named "relid". M0097-0023.
 		colName := "relid"

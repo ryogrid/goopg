@@ -424,6 +424,10 @@ type Index struct {
 	IsConstraint   bool     // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
 	IsExclusion    bool     // true when index backs an EXCLUDE USING constraint
 	ExclusionOp    string   // per-column exclusion operator (e.g. "=")
+	// PartitionParentOID is the OID of the parent index for partition index
+	// trees (ALTER INDEX parent ATTACH PARTITION child). Zero if not a partition
+	// index child. M0097-0023.
+	PartitionParentOID uint32
 }
 
 // QualifiedName renders the table's name in the canonical
@@ -541,6 +545,9 @@ type InMemory struct {
 	// partitionChildren maps parent table OID → slice of child OIDs
 	// for partitioned-table support (M0096-0007).
 	partitionChildren map[uint32][]uint32
+	// indexPartitionChildren maps parent index OID → slice of child index OIDs
+	// for partition index trees (ALTER INDEX parent ATTACH PARTITION child). M0097-0023.
+	indexPartitionChildren map[uint32][]uint32
 
 	// inheritanceChildren maps parent table OID → slice of child OIDs
 	// for table inheritance support (M0096-0009).
@@ -732,7 +739,8 @@ func NewInMemory() *InMemory {
 		dbOid:               DefaultDBOid,
 		routines:            NewRoutines(),
 		databases:           map[string]bool{"postgres": true},
-		partitionChildren:   make(map[uint32][]uint32),
+		partitionChildren:        make(map[uint32][]uint32),
+		indexPartitionChildren:   make(map[uint32][]uint32),
 		inheritanceChildren: make(map[uint32][]uint32),
 		enumTypes:           make(map[string]*EnumType),
 		domains:             make(map[string]*Domain),
@@ -991,6 +999,45 @@ func (c *InMemory) RegisterPartitionChild(parentOID, childOID uint32) {
 	c.mu.Lock()
 	c.partitionChildren[parentOID] = append(c.partitionChildren[parentOID], childOID)
 	c.mu.Unlock()
+}
+
+// RegisterIndexPartitionChild registers childOID as a partition child of
+// parentOID in the index partition tree. M0097-0023.
+func (c *InMemory) RegisterIndexPartitionChild(parentOID, childOID uint32) {
+	c.mu.Lock()
+	c.indexPartitionChildren[parentOID] = append(c.indexPartitionChildren[parentOID], childOID)
+	c.mu.Unlock()
+}
+
+// IndexPartitionChildren returns the direct partition-child indexes of parentOID.
+// Returns nil if none are registered. M0097-0023.
+func (c *InMemory) IndexPartitionChildren(parentOID uint32) []*Index {
+	c.mu.RLock()
+	children := c.indexPartitionChildren[parentOID]
+	c.mu.RUnlock()
+	if len(children) == 0 {
+		return nil
+	}
+	out := make([]*Index, 0, len(children))
+	for _, oid := range children {
+		if idx, ok := c.LookupIndexByOID(oid); ok {
+			out = append(out, idx)
+		}
+	}
+	return out
+}
+
+// LookupIndexByOID returns the index with the given OID, or false if not found.
+// M0097-0023.
+func (c *InMemory) LookupIndexByOID(oid uint32) (*Index, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, idx := range c.indexes {
+		if idx.OID == oid {
+			return idx, true
+		}
+	}
+	return nil, false
 }
 
 // FindPartitionForValue finds the partition child that matches a given key value

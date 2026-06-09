@@ -179,14 +179,17 @@ func (*ExtractExpr) exprNode()  {}
 // key in that case so the SubPlan executes only once across
 // all outer rows. (M0058-0001.)
 type InExpr struct {
-	pos             int
-	Operand         Expr
-	Negated         bool
+	pos         int
+	Operand     Expr
+	Negated     bool
 	// NotEqualAny marks `x != ANY(list)` semantics: true if operand is
 	// not equal to at least one element in List (OR of != comparisons).
 	// Distinct from Negated which means NOT IN (AND of != comparisons).
 	// M0097-0067.
-	NotEqualAny     bool
+	NotEqualAny bool
+	// AnyOp, when non-zero, indicates `left op ANY(array)` with the given operator.
+	// Used for non-equality ANY predicates such as `col ~ ANY(ARRAY[...])`.
+	AnyOp           parser.OpCode
 	Plan            Node // populated when the source is a subquery
 	List            []Expr
 	IsNonCorrelated bool
@@ -1065,6 +1068,19 @@ type ScalarFuncScan struct {
 
 func (n *ScalarFuncScan) Pos() int       { return n.pos }
 func (n *ScalarFuncScan) Output() Schema { return n.schema }
+
+// PgPartitionTree is a multi-row SRF plan node for pg_partition_tree and
+// pg_partition_ancestors. It traverses the catalog partition hierarchy and
+// returns one row per node (table or index). M0097-0023.
+type PgPartitionTree struct {
+	pos         int
+	FuncName    string // "pg_partition_tree" or "pg_partition_ancestors"
+	Arg         Expr   // the input regclass expression
+	schema      Schema
+}
+
+func (n *PgPartitionTree) Pos() int       { return n.pos }
+func (n *PgPartitionTree) Output() Schema { return n.schema }
 
 // Insert — writes rows from Source into Table. ColumnIndex maps each
 // source column to a target heap-tuple ordinal; columns not listed

@@ -2550,6 +2550,7 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 	if _, err := p.expectKeyword(KwOn); err != nil {
 		return nil, err
 	}
+	stmt.OnOnly = p.acceptIdentKeyword("only")
 	tbl, err := p.parseObjectName()
 	if err != nil {
 		return nil, err
@@ -3291,7 +3292,7 @@ func (p *parser) parseCreateSequenceTail(pos int, temp bool) (Stmt, error) {
 	// Option loop — consume all recognised options until we hit something else.
 	for {
 		switch {
-		case p.acceptIdentKeyword("as"):
+		case p.acceptIdentKeyword("as") || p.acceptKeyword(KwAs):
 			// AS datatype
 			dt, err := p.parseIdent()
 			if err != nil {
@@ -3365,7 +3366,8 @@ func (p *parser) parseCreateSequenceTail(pos int, temp bool) (Stmt, error) {
 // parseInt64 parses a (possibly negative) integer literal. M0097-0009.
 // M0097-0003: uses parseIntLiteral to support 0b/0o/0x prefixes and _ separators.
 func (p *parser) parseInt64() (int64, error) {
-	neg := p.cur().Kind == TokenSymbol && p.cur().Value == "-"
+	// The minus sign may be tokenized as TokenOperator or TokenSymbol.
+	neg := (p.cur().Kind == TokenOperator || p.cur().Kind == TokenSymbol) && p.cur().Value == "-"
 	if neg {
 		p.advance()
 	}
@@ -3619,40 +3621,97 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return nil, err
 		}
 		stmt.Name = name
-		// Consume options until end of statement, extracting OWNED BY if present.
-		for p.cur().Kind != TokenEOF {
-			t := p.cur()
-			if t.Kind == TokenSymbol && t.Value == ";" {
-				break
-			}
-			// Detect OWNED BY clause.
-			if p.acceptIdentKeyword("owned") {
+		// Parse sequence options — same switch pattern as CREATE SEQUENCE.
+		for {
+			switch {
+			case p.acceptIdentKeyword("as") || p.acceptKeyword(KwAs):
+				dt, err := p.parseIdent()
+				if err != nil {
+					return stmt, nil
+				}
+				stmt.DataType = strings.ToLower(identText(dt))
+			case p.acceptIdentKeyword("increment"):
+				_ = p.acceptKeyword(KwBy)
+				val, err := p.parseInt64()
+				if err != nil {
+					return stmt, nil
+				}
+				stmt.Increment = &val
+			case p.acceptIdentKeyword("minvalue"):
+				val, err := p.parseInt64()
+				if err != nil {
+					return stmt, nil
+				}
+				stmt.MinValue = &val
+			case p.acceptIdentKeyword("maxvalue"):
+				val, err := p.parseInt64()
+				if err != nil {
+					return stmt, nil
+				}
+				stmt.MaxValue = &val
+			case p.acceptIdentKeyword("no"):
+				switch {
+				case p.acceptIdentKeyword("minvalue"):
+					stmt.NoMinValue = true
+				case p.acceptIdentKeyword("maxvalue"):
+					stmt.NoMaxValue = true
+				case p.acceptIdentKeyword("cycle"):
+					stmt.NoCycle = true
+				default:
+					p.advance()
+				}
+			case p.acceptIdentKeyword("start"):
+				_ = p.acceptKeyword(KwWith)
+				val, err := p.parseInt64()
+				if err != nil {
+					return stmt, nil
+				}
+				stmt.StartWith = &val
+			case p.acceptIdentKeyword("restart"):
+				// RESTART or RESTART [WITH] n
+				_ = p.acceptKeyword(KwWith)
+				t2 := p.cur()
+				if t2.Kind == TokenIntLit || t2.Kind == TokenNumericLit || (t2.Kind == TokenOperator && t2.Value == "-") || (t2.Kind == TokenOperator && t2.Value == "+") {
+					val, err := p.parseInt64()
+					if err != nil {
+						return stmt, nil
+					}
+					stmt.RestartWith = &val
+				} else {
+					stmt.Restart = true
+				}
+			case p.acceptIdentKeyword("cycle"):
+				stmt.Cycle = true
+			case p.acceptIdentKeyword("cache"):
+				_, _ = p.parseInt64()
+			case p.acceptIdentKeyword("set"):
+				// SET LOGGED / SET UNLOGGED — no-op.
+				_ = p.acceptIdentKeyword("logged") || p.acceptIdentKeyword("unlogged")
+			case p.acceptIdentKeyword("owned"):
 				_ = p.acceptKeyword(KwBy)
 				if p.acceptIdentKeyword("none") {
+					stmt.ClearOwnedBy = true
 					stmt.OwnedBy = ""
-					continue
-				}
-				// Parse table.column or just table.
-				owner, err := p.parseObjectName()
-				if err != nil {
-					break
-				}
-				if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
-					p.advance()
-					col, err := p.parseIdent()
-					if err != nil {
-						break
-					}
-					stmt.OwnedBy = owner.String() + "." + identText(col)
 				} else {
-					stmt.OwnedBy = owner.String()
+					owner, err := p.parseObjectName()
+					if err != nil {
+						return stmt, nil
+					}
+					if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+						p.advance()
+						col, err := p.parseIdent()
+						if err != nil {
+							return stmt, nil
+						}
+						stmt.OwnedBy = owner.String() + "." + identText(col)
+					} else {
+						stmt.OwnedBy = owner.String()
+					}
 				}
-				continue
+			default:
+				return stmt, nil
 			}
-			_ = t
-			p.advance()
 		}
-		return stmt, nil
 	}
 	// ALTER TYPE name ADD VALUE … — M0097-0017.
 	if p.acceptIdentKeyword("type") {
@@ -3761,6 +3820,23 @@ func (p *parser) parseAlter() (Stmt, error) {
 					return stmt, nil
 				}
 			}
+		}
+		// ALTER INDEX parent ATTACH PARTITION child — register index partition hierarchy.
+		if p.acceptIdentKeyword("attach") {
+			if !p.acceptKeyword(KwPartition) {
+				return nil, p.errAtCur("expected PARTITION after ATTACH")
+			}
+			childName, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			stmt := &AlterTableStmt{pos: t.Pos, Name: idxName}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				Kind:           AlterIndexAttachPartition,
+				ConstraintName: idxName.Name,
+				ChildIndexName: childName.Name,
+			})
+			return stmt, nil
 		}
 		// Other ALTER INDEX forms: consume rest as no-op.
 		for p.cur().Kind != TokenEOF {

@@ -1092,9 +1092,10 @@ type CreateIndexStmt struct {
 	// most built-in operator classes have no options, so a non-empty value
 	// here causes an error at execution time. M0097-0023.
 	OpClassWithOptions string
-	HasPredicate       bool   // true when a WHERE clause (partial index predicate) is present
-	Predicate          Expr   // WHERE predicate expression (nil if no WHERE clause)
+	HasPredicate       bool     // true when a WHERE clause (partial index predicate) is present
+	Predicate          Expr     // WHERE predicate expression (nil if no WHERE clause)
 	IncludeColumns     []string // non-key covering columns from INCLUDE (…)
+	OnOnly             bool     // ON ONLY — create on parent table without propagating to children
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }
@@ -1133,11 +1134,22 @@ func (s *CreateSequenceStmt) stmtNode() {}
 
 // AlterSequenceStmt — `ALTER SEQUENCE [IF EXISTS] name [option …]`. M0097-0009.
 type AlterSequenceStmt struct {
-	pos      int
-	Name     ObjectName
-	IfExists bool
-	OwnedBy  string   // "table.column" or "" from OWNED BY clause
-	Options  []string // opaque option list; accepted for syntax compatibility
+	pos          int
+	Name         ObjectName
+	IfExists     bool
+	DataType     string // AS type: "smallint", "integer", "bigint"
+	Increment    *int64 // INCREMENT [BY] n
+	MinValue     *int64 // MINVALUE n (nil = unchanged)
+	NoMinValue   bool   // NO MINVALUE (reset to type default)
+	MaxValue     *int64 // MAXVALUE n
+	NoMaxValue   bool   // NO MAXVALUE (reset to type default)
+	StartWith    *int64 // START [WITH] n — updates stored start_value only
+	Restart      bool   // RESTART (no value) — reset current to start_value
+	RestartWith  *int64 // RESTART [WITH] n — reset current and update start_value
+	Cycle        bool   // CYCLE
+	NoCycle      bool   // NO CYCLE
+	OwnedBy      string // "table.column" or "" from OWNED BY clause
+	ClearOwnedBy bool   // OWNED BY NONE
 }
 
 func (s *AlterSequenceStmt) Pos() int  { return s.pos }
@@ -1479,6 +1491,10 @@ const (
 	// Records the storage type (plain/main/external/extended) on the catalog column.
 	// StorageType holds the storage name; ColumnName holds the column. M0097-0023.
 	AlterTableSetStorage
+	// AlterIndexAttachPartition — `ALTER INDEX parent ATTACH PARTITION child`.
+	// Registers child as a partition of parent in the index partition tree.
+	// ConstraintName holds the parent index name; ChildIndexName holds the child. M0097-0023.
+	AlterIndexAttachPartition
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1529,6 +1545,9 @@ type AlterTableAction struct {
 	// StorageType is the storage strategy for AlterTableSetStorage.
 	// Values: "plain", "main", "external", "extended". M0097-0023.
 	StorageType string
+	// ChildIndexName is populated for AlterIndexAttachPartition and holds
+	// the name of the child index to attach. M0097-0023.
+	ChildIndexName string
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

@@ -4336,6 +4336,24 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 	if err != nil {
 		return Datum{}, err
 	}
+	// op ANY semantics (ScalarArrayOpExpr): `left op ANY(array)` — OR of
+	// (left op elem) for each element. Used for non-equality operators like
+	// `col ~ ANY(ARRAY[...])`. M0097-0068.
+	if x.AnyOp != 0 {
+		for _, v := range values {
+			if v.IsNull() {
+				continue
+			}
+			res, err := evalBinary(x.AnyOp, operand, v, 0)
+			if err != nil {
+				return Datum{}, err
+			}
+			if res.Kind == KindBool && res.BoolValue() {
+				return NewBoolDatum(true), nil
+			}
+		}
+		return NewBoolDatum(false), nil
+	}
 	// != ANY semantics: return true if operand != at least one element (OR
 	// of inequality comparisons). M0097-0067.
 	if x.NotEqualAny {
@@ -6245,7 +6263,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err1 != nil || err2 != nil || tbl.IsNull() || col.IsNull() {
 				return NullDatum, nil
 			}
-			seqName := fmt.Sprintf("public.%s_%s_seq", tbl.StringValue(), col.StringValue())
+			seqName := fmt.Sprintf("public.%s_%s_seq", strings.ToLower(tbl.StringValue()), strings.ToLower(col.StringValue()))
 			return NewStringDatum(seqName), nil
 		}
 		return NullDatum, nil
@@ -6521,17 +6539,64 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 	// ── Partition metadata functions (M0097-0015) ─────────────────────────
 	case "pg_partition_tree", "pg_partition_ancestors":
-		// SRF returning partition hierarchy — stub returns NULL (no rows). M0097-0015.
+		// SRF — handled by the PgPartitionTree plan node; never reach this path
+		// when used in FROM. As a scalar fallback (SELECT pg_partition_tree(...))
+		// return NULL. M0097-0023.
 		return NullDatum, nil
 	case "pg_partition_root":
-		// pg_partition_root(relid) → regclass — returns the root of the partition tree.
-		// Stub: return the input itself (assume root). M0097-0015.
-		if len(x.Args) == 1 {
-			v, err := evalExpr(x.Args[0], row, ctx)
-			if err != nil || v.IsNull() {
+		// pg_partition_root(relid) → regclass: walk the PartitionParentOID chain
+		// to find the root. Returns NULL for non-partitioned tables, views, matviews,
+		// legacy-inheritance tables, and NULL input. M0097-0023.
+		if len(x.Args) != 1 || ctx == nil || ctx.Catalog == nil {
+			return NullDatum, nil
+		}
+		v, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || v.IsNull() {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		relName := partitionResolveRegclass(v, im)
+		if relName == "" {
+			return NullDatum, nil
+		}
+		// Try table first.
+		if tbl, ok2 := im.LookupTable(parser.ObjectName{Name: relName}); ok2 {
+			// Non-partitioned table (no PartitionKey) and not a partition child → NULL.
+			if len(tbl.PartitionKey) == 0 && tbl.PartitionParentOID == 0 {
 				return NullDatum, nil
 			}
-			return v, nil
+			// Walk up to root.
+			cur := tbl
+			visited := map[uint32]bool{}
+			for cur.PartitionParentOID != 0 && !visited[cur.OID] {
+				visited[cur.OID] = true
+				parent, ok3 := im.LookupTableByOID(cur.PartitionParentOID)
+				if !ok3 {
+					break
+				}
+				cur = parent
+			}
+			return NewStringDatum(cur.Name), nil
+		}
+		// Try index.
+		if idx, ok2 := im.LookupIndex(parser.ObjectName{Name: relName}); ok2 {
+			if idx.PartitionParentOID == 0 && len(im.IndexPartitionChildren(idx.OID)) == 0 {
+				return NullDatum, nil
+			}
+			cur := idx
+			visited := map[uint32]bool{}
+			for cur.PartitionParentOID != 0 && !visited[cur.OID] {
+				visited[cur.OID] = true
+				parent, ok3 := im.LookupIndexByOID(cur.PartitionParentOID)
+				if !ok3 {
+					break
+				}
+				cur = parent
+			}
+			return NewStringDatum(cur.Name), nil
 		}
 		return NullDatum, nil
 	case "satisfies_hash_partition":
