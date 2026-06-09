@@ -107,7 +107,7 @@ jobs:
                    |internal/testutil/cluster|internal/testutil/replcluster
                    |internal/testutil/pgcluster|internal/testutil/pubsubcluster
                    |internal/testutil/tpch|/bench/'
-          go test -timeout 10m $(go list ./... | grep -vE "$EXCLUDE")
+          go test  -buildvcs=false -timeout 10m $(go list ./... | grep -vE "$EXCLUDE")
 
       # ------------------------------------------------------------------ #
       # pgbench workloads
@@ -165,7 +165,7 @@ jobs:
       # ------------------------------------------------------------------ #
       - name: HammerDB TPC-H load runs (smoke + baseline)
         run: |
-          go test -v \
+          go test -buildvcs=false -v \
             -timeout 30m \
             ./bench/tpch/cmd/hammerdb_load/...
 
@@ -186,7 +186,7 @@ jobs:
       # ------------------------------------------------------------------ #
       - name: TPC-H query run (2,000,000 orders)
         run: |
-          go test -v \
+          go test -buildvcs=false -v \
             -run TestTPCHScaleLoadAndQueryRun \
             -timeout 120m \
             ./internal/testutil/tpch/
