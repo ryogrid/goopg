@@ -45,6 +45,10 @@ type Context struct {
 	// statements (SELECT 1, …) don't.
 	Pool    *storage.Pool
 	Catalog catalog.Catalog
+	// PlanCatalog is a search-path-aware wrapper around Catalog used when
+	// calling planner.Plan so that unqualified table names resolve via the
+	// session's search_path. Falls back to Catalog when nil. M0097-0022.
+	PlanCatalog catalog.Catalog
 	TxnMgr  *mvcc.Manager
 	Tx      mvcc.Transaction
 	Snap    mvcc.Snapshot

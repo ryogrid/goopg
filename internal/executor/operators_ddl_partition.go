@@ -1086,7 +1086,7 @@ func checkDefaultPartitionDataConflict(childName string, parent *catalog.Table, 
 	if err != nil || len(stmts) == 0 {
 		return nil
 	}
-	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
 	if err != nil {
 		return nil
 	}

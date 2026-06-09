@@ -44,9 +44,49 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 	}
 	// Accept optional SETOF modifier (set-returning functions). M0096-0007.
 	returnsSet := p.acceptIdentKeyword("setof")
-	retType, err := p.parseColumnType()
-	if err != nil {
-		return nil, err
+	var retType ColumnType
+	// RETURNS TABLE (col type, ...) — syntactic sugar for RETURNS SETOF RECORD
+	// with named OUT parameters. Append OUT params to args list. M0097-0028.
+	if !returnsSet && p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTable {
+		p.advance() // consume TABLE
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after RETURNS TABLE")
+		}
+		for {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				break
+			}
+			colPos := p.cur().Pos
+			colName, cerr := p.parseIdent()
+			if cerr != nil {
+				return nil, cerr
+			}
+			colType, cerr := p.parseColumnType()
+			if cerr != nil {
+				return nil, cerr
+			}
+			args = append(args, FunctionArg{
+				pos:          colPos,
+				Name:         identText(colName),
+				Mode:         FuncArgOut,
+				ModeExplicit: true,
+				Type:         colType,
+			})
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close RETURNS TABLE column list")
+		}
+		returnsSet = true
+		retType = ColumnType{Name: "record"}
+	} else {
+		var err error
+		retType, err = p.parseColumnType()
+		if err != nil {
+			return nil, err
+		}
 	}
 	stmt := &CreateFunctionStmt{
 		pos:        pos,

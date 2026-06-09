@@ -1049,7 +1049,7 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 		if err != nil || len(stmts) == 0 {
 			continue
 		}
-		plan, err := planner.Plan(stmts[0], ctx.Catalog)
+		plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if err != nil {
 			continue
 		}

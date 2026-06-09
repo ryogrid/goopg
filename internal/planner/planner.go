@@ -68,6 +68,18 @@ func PlanSchemaOnly(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	return node, nil
 }
 
+// ResolveIndexPredicate resolves a partial-index WHERE-clause expression
+// against the given table's column schema and returns a planner Expr that the
+// executor can evaluate via evalExpr. Returns nil if predicate is nil.
+// Used by the CREATE INDEX bulk-build path to filter rows for partial indexes.
+func ResolveIndexPredicate(predicate parser.Expr, tbl *catalog.Table) (Expr, error) {
+	if predicate == nil {
+		return nil, nil
+	}
+	ctx := singleBindingContext(tbl, tbl.Name)
+	return resolveExpr(predicate, ctx)
+}
+
 func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	switch s := stmt.(type) {
 	case *parser.SelectStmt:
@@ -287,6 +299,15 @@ type rangeBinding struct {
 	// assigned" (CTE / subquery-only / ON CONFLICT excluded) and
 	// falls back to Name-only matching in downstream rebinds.
 	sourceIdx int16
+	// notReferenceable marks a binding that is present in scope for
+	// error-diagnostic purposes only — any attempt to actually
+	// reference it (qualified or unqualified) produces the PG
+	// "invalid reference … cannot be referenced from this part of
+	// the query" error. Used to surface a helpful diagnostic when
+	// `excluded` is referenced in the RETURNING clause of an INSERT
+	// … ON CONFLICT DO UPDATE (excluded is in-scope for DO UPDATE
+	// SET/WHERE but not for RETURNING).
+	notReferenceable bool
 	// tableOidColIdx, when > 0, holds the relative offset within
 	// this binding's row of the synthetic `tableoid` column. Set
 	// by the planner-side per-leaf Project wrapping in partition
@@ -1996,7 +2017,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// nested partitioned children). Multi-level partition hierarchies require
 	// collecting ALL leaf descendants, not only direct children.
 	if len(tbl.PartitionKey) > 0 {
-		if im, ok := cat.(*catalog.InMemory); ok {
+		if im := inMemoryCat(cat); im != nil {
 			// Collect all leaf partitions recursively.
 			leaves := collectAllPartitionLeaves(im, tbl.OID)
 			if len(leaves) > 0 {
@@ -2044,7 +2065,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// is always included first.  M0097-0046: expand recursively so that
 	// grandchildren (e.g. stud_emp → emp → person) are included too.
 	// FROM ONLY tablename skips all children (M0097-0099).
-	if im, ok := cat.(*catalog.InMemory); ok && !rv.Only {
+	if im := inMemoryCat(cat); im != nil && !rv.Only {
 		allDesc := collectInheritanceDescendants(im, tbl.OID)
 
 		if len(allDesc) > 0 {
@@ -2082,6 +2103,27 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 // collectInheritanceDescendants performs a breadth-first traversal of the
 // inheritance tree rooted at parentOID and returns all descendants in BFS
 // order, deduplicated (a table can be a descendant via multiple paths, e.g.
+// inMemoryCat unwraps a Catalog to its underlying *catalog.InMemory, peeling
+// through SearchPathCatalog layers. Returns nil if the core is not InMemory.
+// Required because SearchPathCatalog wraps InMemory for search-path resolution
+// but planner internals need the concrete type for partition/inheritance BFS.
+// M0097-0022.
+func inMemoryCat(cat catalog.Catalog) *catalog.InMemory {
+	type unwrapper interface {
+		Unwrap() catalog.Catalog
+	}
+	for {
+		if im, ok := cat.(*catalog.InMemory); ok {
+			return im
+		}
+		if u, ok := cat.(unwrapper); ok {
+			cat = u.Unwrap()
+		} else {
+			return nil
+		}
+	}
+}
+
 // stud_emp inherits from both emp and student which both inherit from person).
 // M0097-0046.
 func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32) []*catalog.Table {
@@ -5805,7 +5847,7 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 		// runtime and routes through EncodeVarchar/EncodeChar.
 		// For user-defined enum columns, wrap in CastExpr so the
 		// executor converts the string to KindEnum (sort order). M0097-0022.
-		if col2, ok2 := cat.(*catalog.InMemory); ok2 {
+		if col2 := inMemoryCat(cat); col2 != nil {
 			if _, isEnum := col2.LookupEnum(col.Type.Name); isEnum {
 				resolvedKey = &CastExpr{pos: keyExpr.Pos(), Operand: resolvedKey, TargetType: col.Type.Name}
 			}
@@ -6033,7 +6075,7 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 		// For user-defined enum columns, wrap string literals in CastExpr
 		// so the executor converts them to KindEnum (sort order). M0097-0022.
 		if _, ok2 := resolvedKey.(*StringConst); ok2 {
-			if col2, ok3 := cat.(*catalog.InMemory); ok3 {
+			if col2 := inMemoryCat(cat); col2 != nil {
 				if _, isEnum := col2.LookupEnum(col.Type.Name); isEnum {
 					resolvedKey = &CastExpr{pos: keyExpr.Pos(), Operand: resolvedKey, TargetType: col.Type.Name}
 				}
@@ -6318,6 +6360,19 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 	if len(s.Returning) > 0 {
 		retCtx := singleBindingContext(tbl, s.Target.Alias)
 		retCtx.cat = cat
+		// When this INSERT has ON CONFLICT DO UPDATE, add `excluded` to the
+		// RETURNING scope as notReferenceable. This lets resolveColumnRefAt
+		// detect the reference and produce PG's specific "cannot be
+		// referenced from this part of the query" diagnostic instead of a
+		// generic "missing FROM-clause entry" error.
+		if insert.OnConflict != nil && insert.OnConflict.Action == OnConflictActionUpdate {
+			retCtx.bindings = append(retCtx.bindings, rangeBinding{
+				table:           tbl,
+				alias:           "excluded",
+				qualifiedOnly:   true,
+				notReferenceable: true,
+			})
+		}
 		retExprs, retSchema, err := resolveTargets(s.Returning, retCtx)
 		if err != nil {
 			return nil, err
@@ -6413,8 +6468,16 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 	// to the same catalog table but disambiguate by source so
 	// `excluded.col` and `<target>.col` rebind helpers don't
 	// collapse into the same Index.
+	primaryBinding := rangeBinding{table: tbl, alias: primaryAlias, offset: 0, sourceIdx: 1}
+	if targetAlias != "" {
+		// When the INSERT target has an alias, the original table name must
+		// not resolve the primary binding — only the alias is valid.
+		// blockOriginalName is deferred (not an immediate error) so that a
+		// qualifiedOnly binding like `excluded` can still match.
+		primaryBinding.blockOriginalName = true
+	}
 	bindings := []rangeBinding{
-		{table: tbl, alias: primaryAlias, offset: 0, sourceIdx: 1},
+		primaryBinding,
 		{table: tbl, alias: "excluded", offset: n, qualifiedOnly: true, sourceIdx: 2},
 	}
 	mergedSchema := make(Schema, 0, 2*n)
@@ -6549,6 +6612,12 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 		if !idx.Unique {
 			continue
 		}
+		// Partial indexes require an inference predicate in the ON CONFLICT
+		// target. Without one, the index does not cover all rows and cannot
+		// be used as a conflict arbiter. Mirrors PostgreSQL's behaviour.
+		if idx.HasPredicate && target.Where == nil {
+			continue
+		}
 		// Liberal matching: each index column must be covered by the target.
 		// Target may have more or duplicate columns (allowed per PG semantics).
 		match := true
@@ -6605,6 +6674,16 @@ func insertValuesSchema(tbl *catalog.Table, colIndex []int) Schema {
 // applyUpdateAssign resolves one SET assignment (single- or multi-column form)
 // and stores the resulting expression(s) into the set slice indexed by column ordinal.
 func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ctx *resolveContext, cat catalog.Catalog) error {
+	// Reject qualified SET target (e.g. "SET t.col = val").
+	// PG produces "column 'T' of relation 'T' does not exist" + hint.
+	if a.TableQualifier != "" {
+		return &PlanError{
+			Pos:     a.Pos(),
+			Code:    "42703",
+			Message: fmt.Sprintf("column %q of relation %q does not exist", a.TableQualifier, tbl.Name),
+			Hint:    "SET target columns cannot be qualified with the relation name.",
+		}
+	}
 	if len(a.Columns) > 0 {
 		// Multi-column tuple form: (c1, c2, ...) = (e1, e2, ...) or subquery.
 		switch rhs := a.Expr.(type) {
@@ -7108,7 +7187,18 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 	if len(ctx.bindings) == 0 {
 		return nil, nil, &PlanError{Pos: star.Pos(), Code: "42601", Message: "SELECT * with no FROM clause"}
 	}
-	bset := ctx.bindings
+	// Unqualified `*` skips qualifiedOnly and notReferenceable bindings
+	// (e.g. the `excluded` pseudo-table in ON CONFLICT DO UPDATE and the
+	// diagnostic-only `excluded` added to the RETURNING scope).
+	var bset []rangeBinding
+	for _, b := range ctx.bindings {
+		if !b.qualifiedOnly && !b.notReferenceable {
+			bset = append(bset, b)
+		}
+	}
+	if len(bset) == 0 {
+		bset = ctx.bindings // fallback: shouldn't happen, but avoid empty expansion
+	}
 	// A table-qualified star (`t.*`) expands to ALL of that table's
 	// columns, including any JOIN USING / NATURAL join columns — only an
 	// unqualified `*` merges (hides the right-side copy of) USING columns.
@@ -7118,6 +7208,9 @@ func expandStarTarget(star *parser.StarExpr, ctx *resolveContext) ([]Expr, Schem
 	if qualified {
 		matches := make([]rangeBinding, 0, 1)
 		for _, b := range ctx.bindings {
+			if b.notReferenceable {
+				continue // diagnostic-only binding — not a real FROM-clause entry
+			}
 			if bindingMatchesRelation(b, star.Table, star.Schema) {
 				matches = append(matches, b)
 			}
@@ -8653,6 +8746,7 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 
 	if x.Table != "" || x.Schema != "" {
 		matches := make([]rangeBinding, 0, 1)
+		var deferredBlockErr *PlanError
 		for _, b := range ctx.bindings {
 			if b.qualifiedOnly {
 				// Pseudo-tables (e.g. ON CONFLICT's `excluded`) reach name
@@ -8666,21 +8760,27 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			// When blockOriginalName is set (DELETE FROM t AS a), using the
 			// original table name produces the PostgreSQL-compatible error with
 			// a hint. M0097-0003.
+			// Defer the error so that a qualifiedOnly binding (e.g. the ON
+			// CONFLICT `excluded` pseudo-table) can still match first.
 			if b.blockOriginalName && b.alias != "" &&
 				strings.EqualFold(x.Table, b.table.Name) {
-				return nil, false, &PlanError{
+				deferredBlockErr = &PlanError{
 					Pos:  x.Pos(),
 					Code: "42712",
 					Message: fmt.Sprintf("invalid reference to FROM-clause entry for table %q",
 						b.table.Name),
 					Hint: fmt.Sprintf("Perhaps you meant to reference the table alias %q.", b.alias),
 				}
+				continue
 			}
 			if bindingMatchesRelation(b, x.Table, x.Schema) {
 				matches = append(matches, b)
 			}
 		}
 		if len(matches) == 0 {
+			if deferredBlockErr != nil {
+				return nil, false, deferredBlockErr
+			}
 			// Not in this level — caller walks up.
 			return nil, false, nil
 		}
@@ -8688,6 +8788,20 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 			return nil, false, &PlanError{Pos: x.Pos(), Code: "42702", Message: fmt.Sprintf("table reference %q is ambiguous", x.Table)}
 		}
 		b := matches[0]
+		// notReferenceable bindings are in scope only to provide a
+		// better error — any actual reference must be rejected.
+		if b.notReferenceable {
+			qualifier := b.alias
+			if qualifier == "" {
+				qualifier = b.table.Name
+			}
+			return nil, false, &PlanError{
+				Pos:     x.Pos(),
+				Code:    "42P01",
+				Message: fmt.Sprintf("invalid reference to FROM-clause entry for table %q", qualifier),
+				Detail:  fmt.Sprintf("There is an entry for table %q, but it cannot be referenced from this part of the query.", qualifier),
+			}
+		}
 		for i, c := range b.table.Columns {
 			if strings.EqualFold(c.Name, x.Column) {
 				idx := b.offset + i
@@ -8709,7 +8823,20 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 		// column didn't — that's a hard error (no point walking
 		// up; an outer-scope `t.c` for a different `t` would be
 		// caught by the qualifier mismatch instead).
-		return nil, false, &PlanError{Pos: x.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", x.Column)}
+		// Use the qualified "table.col" format to match PG's output.
+		qualifier := b.alias
+		if qualifier == "" {
+			qualifier = b.table.Name
+		}
+		pe := &PlanError{
+			Pos:     x.Pos(),
+			Code:    "42703",
+			Message: fmt.Sprintf("column %s.%s does not exist", qualifier, x.Column),
+		}
+		if hint := suggestColumnHint(b.table.Columns, qualifier, x.Column); hint != "" {
+			pe.Hint = hint
+		}
+		return nil, false, pe
 	}
 
 	var found Expr
@@ -9126,6 +9253,54 @@ func findExprInSchema(re Expr, outSchema Schema, proj Node) int {
 		}
 	}
 	return -1
+}
+
+// suggestColumnHint returns a HINT string when there is a column in cols that
+// looks similar to want (within edit distance 1). The qualifier is prepended in
+// the suggestion so the hint reads `Perhaps you meant to reference the column
+// "qualifier.X".`. Returns "" when no close match is found.
+func suggestColumnHint(cols []catalog.Column, qualifier, want string) string {
+	wl := strings.ToLower(want)
+	for _, c := range cols {
+		cl := strings.ToLower(c.Name)
+		if cl == wl {
+			return "" // exact match means we shouldn't be here
+		}
+		if columnEditDistance1(cl, wl) {
+			return fmt.Sprintf("Perhaps you meant to reference the column %q.", qualifier+"."+c.Name)
+		}
+	}
+	return ""
+}
+
+// columnEditDistance1 returns true when a and b differ by at most one
+// insertion, deletion, or substitution (single edit distance ≤ 1).
+func columnEditDistance1(a, b string) bool {
+	la, lb := len(a), len(b)
+	if la == lb {
+		diff := 0
+		for i := range a {
+			if a[i] != b[i] {
+				diff++
+			}
+		}
+		return diff == 1
+	}
+	if la > lb {
+		a, b, la, lb = b, a, lb, la
+	}
+	// la < lb; if lb-la > 1 can't be edit-1
+	if lb-la > 1 {
+		return false
+	}
+	// deletion from b gives a
+	for i := range b {
+		candidate := b[:i] + b[i+1:]
+		if candidate == a {
+			return true
+		}
+	}
+	return false
 }
 
 // findExprInTargets finds the index of a resolved ColumnRef in the targets

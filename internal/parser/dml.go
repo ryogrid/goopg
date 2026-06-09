@@ -128,15 +128,17 @@ func (p *parser) parseOnConflict() (*OnConflictClause, error) {
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
 		}
-		// Optional WHERE predicate on the conflict target (partial index).
-		// Parse and discard — v0 doesn't filter on partial-index predicates.
+		// Optional WHERE predicate on the conflict target (partial index inference).
+		var targetWhere Expr
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhere {
 			p.advance()
-			if _, werr := p.parseExpr(); werr != nil {
+			w, werr := p.parseExpr()
+			if werr != nil {
 				return nil, werr
 			}
+			targetWhere = w
 		}
-		clause.Target = &OnConflictTarget{pos: tgtPos, Columns: cols, Exprs: colExprs}
+		clause.Target = &OnConflictTarget{pos: tgtPos, Columns: cols, Exprs: colExprs, Where: targetWhere}
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn:
 		tgtPos := p.cur().Pos
 		p.advance()
@@ -457,6 +459,19 @@ func (p *parser) parseAssign() (UpdateAssign, error) {
 	if err != nil {
 		return UpdateAssign{}, err
 	}
+	// Accept "table.col = expr" — store the qualifier so the semantic
+	// layer can produce the PG-compatible error + hint (SET targets
+	// must not be qualified with the relation name).
+	var tableQualifier string
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+		p.advance() // consume '.'
+		subCol, serr := p.parseIdent()
+		if serr != nil {
+			return UpdateAssign{}, serr
+		}
+		tableQualifier = identText(col)
+		col = subCol
+	}
 	cur := p.cur()
 	if cur.Kind != TokenOperator || cur.Value != "=" {
 		return UpdateAssign{}, p.errAtCur("expected '='")
@@ -475,7 +490,7 @@ func (p *parser) parseAssign() (UpdateAssign, error) {
 	if err != nil {
 		return UpdateAssign{}, err
 	}
-	return UpdateAssign{pos: pos, Column: identText(col), Expr: expr}, nil
+	return UpdateAssign{pos: pos, Column: identText(col), TableQualifier: tableQualifier, Expr: expr}, nil
 }
 
 // parseDelete: DELETE FROM target [WHERE expr] [RETURNING target_list].

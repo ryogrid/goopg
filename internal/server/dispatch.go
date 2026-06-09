@@ -222,6 +222,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	ectx.Ctx = ctx
 	ectx.Pool = s.cfg.Pool
 	ectx.Catalog = s.cfg.Catalog
+	// PlanCatalog will be set to a search-path-aware wrapper after sess is wired.
 	ectx.TxnMgr = s.cfg.TxnMgr
 	ectx.Tx = tx
 	// Wire the per-connection session into the executor so advisory locks
@@ -284,6 +285,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.ResetAllSettings = sess.ResetAll
 		ectx.BeginLocalTransaction = sess.BeginTransaction
 		ectx.EndLocalTransaction = sess.EndTransaction
+		// Set PlanCatalog to a search-path-aware wrapper so DDL executor can
+		// use it when calling planner.Plan for internal validation. M0097-0022.
+		ectx.PlanCatalog = sessionPlanCatalog(sess, s.cfg.Catalog)
 	}
 	if ectx.Session != nil {
 		advisoryReleaseTarget = ectx.Session
@@ -417,7 +421,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				}
 				// Infer result column types and undeclared parameter types by planning/walking.
 				if ectx.Catalog != nil {
-					if plan, planErr := planner.Plan(ps.Query, ectx.Catalog); planErr == nil {
+					if plan, planErr := planner.Plan(ps.Query, sessionPlanCatalog(sess, ectx.Catalog)); planErr == nil {
 						schema := plan.Output()
 						if len(schema) > 0 {
 							resultTypes := make([]string, len(schema))
@@ -618,7 +622,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				precached = cached
 			} else {
 				// Cache miss: plan now so we can store it.
-				freshNode, perr := planner.Plan(stmt, s.cfg.Catalog)
+				freshNode, perr := planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog))
 				if perr != nil {
 					code, msg := planErrorFields(perr)
 					return s.writeQueryError(w, code, msg, planErrorHintFields(perr)...)
@@ -787,6 +791,71 @@ func sessionStatementTimeout(sess *config.SessionRegistry) int64 {
 		return 0
 	}
 	return ms
+}
+
+// sessionPlanCatalog returns a search-path-aware catalog wrapper for use when
+// calling planner.Plan. The wrapper re-reads search_path dynamically so that
+// SET search_path changes take effect on the next statement. When sess is nil
+// the base catalog is returned unchanged. M0097-0022.
+func sessionPlanCatalog(sess *config.SessionRegistry, base catalog.Catalog) catalog.Catalog {
+	if sess == nil {
+		return base
+	}
+	return catalog.WithSearchPath(base, func() []string {
+		return searchPathSchemas(sess)
+	})
+}
+
+// ctxPlanCatalog is like sessionPlanCatalog but reads search_path from an
+// executor.Context's GetSetting hook. Used inside executeOneSimpleStmt and
+// materializeCursor which receive an executor.Context rather than a *config.SessionRegistry.
+func ctxPlanCatalog(ctx *executor.Context, base catalog.Catalog) catalog.Catalog {
+	if ctx == nil || ctx.GetSetting == nil {
+		return base
+	}
+	getSetting := ctx.GetSetting // capture
+	return catalog.WithSearchPath(base, func() []string {
+		sp, ok := getSetting("search_path")
+		if !ok || sp == "" {
+			return []string{"public"}
+		}
+		return parseSearchPathSchemas(sp)
+	})
+}
+
+// parseSearchPathSchemas parses a search_path string (e.g. "temp_func_test, public")
+// into an ordered list of user schemas (pg_catalog and information_schema excluded).
+func parseSearchPathSchemas(sp string) []string {
+	var out []string
+	for _, raw := range strings.Split(sp, ",") {
+		s := strings.TrimSpace(strings.Trim(strings.TrimSpace(raw), `"'`))
+		if s == "" || s == "$user" {
+			continue
+		}
+		lc := strings.ToLower(s)
+		if lc == "pg_catalog" || lc == "information_schema" {
+			continue
+		}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		out = []string{"public"}
+	}
+	return out
+}
+
+// searchPathSchemas parses the session's search_path GUC and returns the
+// ordered list of schemas to search for unqualified name resolution.
+// Called by the SearchPathCatalog wrapper on every table lookup. M0097-0022.
+func searchPathSchemas(sess *config.SessionRegistry) []string {
+	if sess == nil {
+		return []string{"public"}
+	}
+	_, eff, ok := sess.Get("search_path")
+	if !ok || eff == "" {
+		return []string{"public"}
+	}
+	return parseSearchPathSchemas(eff)
 }
 
 func compatNoopCommandTag(sql string) (string, bool) {
@@ -1270,7 +1339,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		node = cachedNode[0]
 	} else {
 		var err error
-		node, err = planner.Plan(stmt, s.cfg.Catalog)
+		node, err = planner.Plan(stmt, ctxPlanCatalog(ctx, s.cfg.Catalog))
 		if err != nil {
 			code, msg := planErrorFields(err)
 			return s.writeQueryError(w, code, msg, planErrorHintFields(err)...)
@@ -1456,11 +1525,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				})
 			}
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
-		default:
-			// Other verbs (SAVEPOINT, ROLLBACK TO, RELEASE) pass through
-			// the existing logic.
-			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		}
+		// SAVEPOINT, ROLLBACK TO, and RELEASE fall through to BuildFastIterator
+		// so execSavepoint / execRollbackTo / execRelease run properly (M0097-0023).
 	}
 	op, err := executor.BuildFastIterator(node)
 	if err != nil {
@@ -2148,7 +2215,7 @@ func (s *Server) materializeCursor(ectx *executor.Context, cur *cursorEntry, cur
 		return &executor.ExecError{Code: "26000", Message: fmt.Sprintf("cursor \"%s\" query not found", cursorName)}
 	}
 
-	node, planErr := planner.Plan(selectStmt, s.cfg.Catalog)
+	node, planErr := planner.Plan(selectStmt, ctxPlanCatalog(ectx, s.cfg.Catalog))
 	if planErr != nil {
 		code, msg := planErrorFields(planErr)
 		return &executor.ExecError{Code: string(code), Message: msg}

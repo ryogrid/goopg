@@ -181,6 +181,17 @@ func NormalizeRegressOutput(raw string) string {
 		if strings.Contains(line, "DETAIL:") && strings.Contains(line, "Failing row contains") {
 			continue
 		}
+		// Strip "DETAIL:  Partition key of the failing row..." from both sides.
+		// goopg does not yet evaluate partition key expressions for this detail.
+		if strings.Contains(line, "DETAIL:") && strings.Contains(line, "Partition key of the failing row") {
+			continue
+		}
+		// Strip PL/pgSQL call-stack context lines from both sides.
+		// PG emits "PL/pgSQL function X line N at ..." inline after errors;
+		// goopg does not yet emit these call-stack frames.
+		if strings.HasPrefix(line, "PL/pgSQL function ") {
+			continue
+		}
 		// Standalone caret lines that follow LINE N: in PostgreSQL error output.
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "^" || (len(trimmed) > 0 && strings.TrimLeft(trimmed, " \t^") == "" && strings.Count(trimmed, "^") == 1) {

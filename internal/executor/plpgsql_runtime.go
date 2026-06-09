@@ -247,7 +247,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	// VOID functions: run all statements for side-effects, return NULL.
 	if strings.EqualFold(r.ReturnType.Name, "void") {
 		for si, stmt := range stmts {
-			node, err := planner.Plan(stmt, child.Catalog)
+			node, err := planner.Plan(stmt, ctxPlanCatalog(child))
 			if err != nil {
 				return Datum{}, wrapSQLFunctionContext(err, r.Name, si+1)
 			}
@@ -281,7 +281,7 @@ func executeSQLRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos int) 
 	// Execute all statements except the last as side effects; return from last.
 	for i, stmt := range stmts {
 		stmtNum := i + 1
-		node, err := planner.Plan(stmt, child.Catalog)
+		node, err := planner.Plan(stmt, ctxPlanCatalog(child))
 		if err != nil {
 			return Datum{}, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -389,7 +389,7 @@ func executeSQLProcedureCore(r *catalog.Routine, args []Datum, ctx *Context, pos
 	var lastRow Row
 	for i, stmt := range stmts {
 		stmtNum := i + 1
-		node, err := planner.Plan(stmt, child.Catalog)
+		node, err := planner.Plan(stmt, ctxPlanCatalog(child))
 		if err != nil {
 			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -470,7 +470,7 @@ func evalSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, pos in
 	// Execute all statements except the last as side effects; collect rows from last.
 	for i, stmt := range stmts {
 		stmtNum := i + 1
-		node, err := planner.Plan(stmt, child.Catalog)
+		node, err := planner.Plan(stmt, ctxPlanCatalog(child))
 		if err != nil {
 			return nil, wrapSQLFunctionContext(err, r.Name, stmtNum)
 		}
@@ -588,6 +588,17 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 			if err := frame.add(r.ArgNames[i], declared, coerced); err != nil {
 				return nil, &ExecError{Code: "42P13", Pos: pos, Message: err.Error()}
 			}
+		}
+	}
+	// Initialize OUT parameters as NULL variables (RETURNS TABLE / OUT args not
+	// passed by caller). M0097-0028.
+	for i, mode := range r.ArgModes {
+		if (mode == "o" || mode == "b") && i < len(r.ArgNames) && r.ArgNames[i] != "" {
+			typ := catalog.Type{Name: "unknown"}
+			if i < len(r.ArgTypes) {
+				typ = normalizeCatalogType(r.ArgTypes[i])
+			}
+			_ = frame.add(r.ArgNames[i], typ, NullDatum) // ignore dup (INOUT already added)
 		}
 	}
 	for _, d := range block.Declarations {
@@ -1184,6 +1195,38 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 
 	case *plpgsql.ReturnNextStmt:
 		// RETURN NEXT — append one value to the SETOF accumulator. M0097-0073.
+		if s.Expr == nil {
+			// RETURN NEXT; (no expression) — collect current OUT param values.
+			// Used by RETURNS TABLE functions. M0097-0028.
+			var outNames []string
+			for i, mode := range r.ArgModes {
+				if (mode == "o" || mode == "b") && i < len(r.ArgNames) {
+					outNames = append(outNames, r.ArgNames[i])
+				}
+			}
+			if len(outNames) == 1 {
+				val := NullDatum
+				if idx, ok := frame.lookup(outNames[0]); ok {
+					val = frame.values[idx]
+				}
+				frame.returnNextRows = append(frame.returnNextRows, val)
+			} else if len(outNames) > 1 {
+				parts := make([]string, len(outNames))
+				for i, name := range outNames {
+					val := NullDatum
+					if idx, ok := frame.lookup(name); ok {
+						val = frame.values[idx]
+					}
+					if val.IsNull() {
+						parts[i] = ""
+					} else {
+						parts[i] = val.StringValue()
+					}
+				}
+				frame.returnNextRows = append(frame.returnNextRows, NewStringDatum("("+strings.Join(parts, ",")+")"))
+			}
+			return Datum{}, flowNone, nil
+		}
 		v, err := evalPLpgSQLExpr(s.Expr, frame, ctx)
 		if err != nil {
 			return Datum{}, flowNone, err
@@ -1198,7 +1241,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if perr != nil || len(stmts) == 0 {
 			return Datum{}, flowNone, &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("RETURN QUERY: %v", perr)}
 		}
-		plan, perr := planner.Plan(stmts[0], ctx.Catalog)
+		plan, perr := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
@@ -1299,7 +1342,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			}
 			return Datum{}, flowNone, nil
 		}
-		plan, perr := planner.Plan(stmts[0], ctx.Catalog)
+		plan, perr := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
@@ -1307,9 +1350,15 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
+		addExecCtx := func(err error) error {
+			if ee, ok := err.(*ExecError); ok && ee.Context == "" {
+				ee.Context = fmt.Sprintf("SQL statement %q", dynSQL)
+			}
+			return err
+		}
 		if perr := op.Open(ctx); perr != nil {
 			op.Close()
-			return Datum{}, flowNone, perr
+			return Datum{}, flowNone, addExecCtx(perr)
 		}
 		slot, perr := op.Next()
 		// Copy the INTO result datum before Close() so releaseRow() does not
@@ -1323,7 +1372,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		op.Close()
 		if perr != nil && perr != EOF {
-			return Datum{}, flowNone, perr
+			return Datum{}, flowNone, addExecCtx(perr)
 		}
 		if s.IntoVar != "" {
 			if idx, ok := frame.lookup(s.IntoVar); ok {
@@ -1371,7 +1420,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if len(stmts) == 0 {
 			return Datum{}, flowNone, nil
 		}
-		plan, err := planner.Plan(stmts[0], ctx.Catalog)
+		plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
@@ -2234,7 +2283,7 @@ func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error
 		return nil
 	}
 	for _, stmt := range stmts {
-		plan, err := planner.Plan(stmt, ctx.Catalog)
+		plan, err := planner.Plan(stmt, ctxPlanCatalog(ctx))
 		if err != nil {
 			return err
 		}

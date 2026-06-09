@@ -755,6 +755,9 @@ type OnConflictTarget struct {
 	// Columns[i] == "" (expression column); nil for plain column names.
 	Exprs      []Expr
 	Constraint string // populated for `ON CONFLICT ON CONSTRAINT name`
+	// Where holds the optional partial-index predicate from
+	// `ON CONFLICT (cols) WHERE predicate`. nil when absent.
+	Where Expr
 }
 
 // Pos returns the position of the leading token of the target
@@ -782,10 +785,11 @@ func (s *InsertStmt) stmtNode() {}
 
 // UpdateAssign is one `column = expr` pair in an UPDATE SET clause.
 type UpdateAssign struct {
-	pos     int
-	Column  string   // single-column form: "col = expr"
-	Columns []string // multi-column form: "(c1, c2, …) = (e1, e2, …)"
-	Expr    Expr     // RHS: single expr, or *RowExpr for multi-column form
+	pos            int
+	Column         string   // single-column form: "col = expr"
+	TableQualifier string   // non-empty when user wrote "table.col = expr" (illegal; rejected in semantic layer)
+	Columns        []string // multi-column form: "(c1, c2, …) = (e1, e2, …)"
+	Expr           Expr     // RHS: single expr, or *RowExpr for multi-column form
 }
 
 func (a UpdateAssign) Pos() int { return a.pos }
@@ -1449,6 +1453,9 @@ const (
 	// AlterTableAttachPartition — `ATTACH PARTITION child FOR VALUES …`.
 	// Registers an existing table as a partition of the parent. M0096-0007.
 	AlterTableAttachPartition
+	// AlterTableDetachPartition — `DETACH PARTITION child`.
+	// Removes a table from its partition parent. M0097-0028.
+	AlterTableDetachPartition
 	// AlterTableDropConstraint — `DROP CONSTRAINT name [RESTRICT|CASCADE]`.
 	// For PK constraints, checks view→constraint dependencies before dropping.
 	// M0097-0036 (functional_deps).
@@ -1548,6 +1555,9 @@ type AlterTableAction struct {
 	// ChildIndexName is populated for AlterIndexAttachPartition and holds
 	// the name of the child index to attach. M0097-0023.
 	ChildIndexName string
+	// DetachPartitionChild is populated for AlterTableDetachPartition and
+	// holds the child table name. M0097-0028.
+	DetachPartitionChild ObjectName
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

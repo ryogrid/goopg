@@ -56,7 +56,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			node = cached
 		} else {
 			var perr error
-			node, perr = planner.Plan(stmt, s.cfg.Catalog)
+			node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog))
 			if perr != nil {
 				code, msg := planErrorFields(perr)
 				return nil, &extendedQueryError{Code: code, Message: msg}
@@ -67,7 +67,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		}
 	} else {
 		var perr error
-		node, perr = planner.Plan(stmt, s.cfg.Catalog)
+		node, perr = planner.Plan(stmt, sessionPlanCatalog(sess, s.cfg.Catalog))
 		if perr != nil {
 			code, msg := planErrorFields(perr)
 			return nil, &extendedQueryError{Code: code, Message: msg}
