@@ -2550,6 +2550,7 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 	if _, err := p.expectKeyword(KwOn); err != nil {
 		return nil, err
 	}
+	stmt.OnOnly = p.acceptIdentKeyword("only")
 	tbl, err := p.parseObjectName()
 	if err != nil {
 		return nil, err

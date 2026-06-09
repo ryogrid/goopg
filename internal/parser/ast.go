@@ -1092,9 +1092,10 @@ type CreateIndexStmt struct {
 	// most built-in operator classes have no options, so a non-empty value
 	// here causes an error at execution time. M0097-0023.
 	OpClassWithOptions string
-	HasPredicate       bool   // true when a WHERE clause (partial index predicate) is present
-	Predicate          Expr   // WHERE predicate expression (nil if no WHERE clause)
+	HasPredicate       bool     // true when a WHERE clause (partial index predicate) is present
+	Predicate          Expr     // WHERE predicate expression (nil if no WHERE clause)
 	IncludeColumns     []string // non-key covering columns from INCLUDE (…)
+	OnOnly             bool     // ON ONLY — create on parent table without propagating to children
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }

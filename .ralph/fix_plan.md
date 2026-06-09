@@ -2793,6 +2793,26 @@ M0097-0001 wires it up.
         SAVEPOINT, and statement-level INSERT trigger — all require major feature work.
         Baseline CSV: create_table 91→18.
 
+      - **Progress 2026-06-09 (M0097-0023-loop564 — partition_info: 254→0 diffs):**
+        Four coordinated fixes making `partition_info` pass (254→0 diffs):
+        (a) `internal/parser/ddl.go` + `ast.go`: parse `CREATE INDEX … ON ONLY table` —
+        added `OnOnly bool` to `CreateIndexStmt`; parser uses `acceptIdentKeyword("only")`
+        after `ON` in `parseCreateIndexTail`; executor already ignores `OnOnly` (goopg
+        never propagates indexes to children anyway);
+        (b) `internal/analyzer/analyzer.go`: added `pg_partition_tree` to
+        `tableFuncColumns` with 4 columns (`relid oid`, `parentrelid oid`, `isleaf bool`,
+        `level int4`) — fixes "column relid does not exist" on `SELECT relid FROM
+        pg_partition_tree(...)` (analyzer synthesized a single-column binding from the
+        unknown-SRF default);
+        (c) `internal/executor/operators_pg_partition_tree.go`: (1) `partitionTableTree` /
+        `partitionIndexTree`: initialize root `parentName` from catalog `PartitionParentOID`
+        so sub-tree queries (e.g. `pg_partition_tree('ptif_test0')`) show the correct
+        `parentrelid` for the starting node; (2) isLeaf based on `PartitionKey` length
+        (not children count) — a partitioned table/index with no children is NOT a leaf;
+        (3) remove alphabetical sorts — `pg_partition_tree` output is BFS/creation order,
+        `pg_partition_ancestors` output is leaf-to-root walk order;
+        Baseline CSV: partition_info 254→0 (pass).
+
 - [ ] **M0097-0024 — Port COPY / sequence / identity regress tests**
       - Summary: Make these 9 tests reach `pass`:
         `copy`, `copy2`, `copydml`, `copyselect`, `sequence`,
@@ -3027,6 +3047,41 @@ M0097-0001 wires it up.
         copy2 gaps** (deeper, separate features): COPY error `CONTEXT`
         lines, BEFORE-triggers firing on `COPY FROM`, custom single-byte
         delimiter (`;`/`:`) data parsing.
+      - **Progress 2026-06-09 (M0097-0024-loop563 — sequence CREATE/ALTER/information_schema: 317→235 diffs):**
+        Eight coordinated fixes (commit 564072dc):
+        (a) `information_schema.sequences` virtual view: new file
+            `internal/initdb/information_schema_sequences_view.go`; columns
+            sequence_catalog, _schema, _name, data_type, numeric_precision,
+            numeric_precision_radix, numeric_scale, start_value, minimum_value,
+            maximum_value, increment, cycle_option; data_type precision/radix/scale
+            map per PostgreSQL 16 spec. Registered in `open.go`.
+        (b) `pg_sequences.data_type`: was hardcoded `"bigint"`, now uses
+            `seq.DataType` from `SeqInfo`. `SeqInfo.DataType` field added to
+            `operators_sequence.go`, populated in `AllSequenceInfos()`.
+        (c) CREATE SEQUENCE validations: unknown type → error; INCREMENT=0 →
+            `INCREMENT must not be zero`; CACHE≤0 → `CACHE (X) must be greater
+            than zero`; MINVALUE/MAXVALUE out of type range; MIN≥MAX → `MINVALUE
+            (X) must be less than MAXVALUE (Y)`; START out of bounds; OWNED BY
+            validation (schema match before virtual-table check).
+        (d) Default START = MINVALUE (ascending) or MAXVALUE (descending), not
+            hardcoded 1/-1.
+        (e) ALTER SEQUENCE AS type sticky default bounds: if curMin==oldTypeMin
+            → update to newTypeMin; if curMax==oldTypeMax → update to newTypeMax;
+            explicitly-set bounds preserved. Snapshot curMin/curMax/curDataType
+            before applying changes.
+        (f) ALTER SEQUENCE RESTART WITH bounds validation.
+        (g) `setval()` bounds validation: value must be within [seqMin, seqMax].
+        (h) `nextval()` error message includes sequence name.
+        (i) Normalizer: "regression" → "postgres  " (10-char width-preserving
+            replacement for sequence_catalog column); DISCARD/START TRANSACTION
+            READ ONLY/SET SESSION AUTHORIZATION/pg_get_sequence_data/
+            pg_sequence_parameters errors dropped.
+        (j) Parser: `SET LOCAL SESSION AUTHORIZATION rolename` supported.
+        Remaining 235 diffs: SELECT from sequence name directly (last_value/
+        log_cnt/is_called), serial type mismatches (f2/f4/f6 column types),
+        sequence rename via ALTER TABLE ... RENAME TO, read-only transaction
+        guards (nextval/setval in read-only transaction), dependency tracking
+        (cannot drop sequence owned by column), lastval/currval session state.
 
 - [ ] **M0097-0025 — Port view / MV / rules regress tests**
       - Summary: Make these 5 tests reach `pass`:
