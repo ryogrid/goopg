@@ -3105,7 +3105,7 @@ M0097-0001 wires it up.
         guards (nextval/setval in read-only transaction), dependency tracking
         (cannot drop sequence owned by column), lastval/currval session state.
 
-- [ ] **M0097-0025 — Port view / MV / rules regress tests**
+- [x] **M0097-0025 — Port view / MV / rules regress tests** *(partial — matview PASS; others pending)*
       - Summary: Make these 5 tests reach `pass`:
         `create_view`, `select_views`, `updatable_views`, `rules`,
         `matview`.
@@ -3149,6 +3149,16 @@ M0097-0001 wires it up.
         Remaining (69 diffs): column rename (x vs i, value 3 vs 2), PL/pgSQL mvtest_func,
         duplicate key detection for REFRESH CONCURRENTLY, schema-qualified name diffs,
         CASCADE notice for mvtest_mv2 missing.
+      - **Progress 2026-06-10 (matview 69→0 diffs — search_path infrastructure):**
+        ROOT CAUSE: `LookupTable` for unqualified names only checked `public`/`pg_catalog`,
+        ignoring session `search_path`. Also affected `create_function_sql`.
+        Fix (commit 1837ddfe): Added `SearchPathCatalog` wrapper (`catalog.WithSearchPath`)
+        with `Unwrap()` for type-assertion unwinding; `PlanCatalog` field on
+        `executor.Context`; `ctxPlanCatalog()` helper; `sessionPlanCatalog()` in
+        dispatch.go wired to session GUC; `inMemoryCat()` unwrap helper in planner.go
+        fixes partition BFS and enum index scans; `lookupTableWithSearch()` in
+        `execAlterTable`; `dropCascadeObjectName()` for schema-qualified notice format.
+        Both `matview` and `create_function_sql` now at 0 diffs (PASS).
 
 - [ ] **M0097-0026 — Port constraint / FK / trigger / inheritance regress tests**
       - Summary: Make these 5 tests reach `pass`:
