@@ -785,10 +785,11 @@ func (s *InsertStmt) stmtNode() {}
 
 // UpdateAssign is one `column = expr` pair in an UPDATE SET clause.
 type UpdateAssign struct {
-	pos     int
-	Column  string   // single-column form: "col = expr"
-	Columns []string // multi-column form: "(c1, c2, …) = (e1, e2, …)"
-	Expr    Expr     // RHS: single expr, or *RowExpr for multi-column form
+	pos            int
+	Column         string   // single-column form: "col = expr"
+	TableQualifier string   // non-empty when user wrote "table.col = expr" (illegal; rejected in semantic layer)
+	Columns        []string // multi-column form: "(c1, c2, …) = (e1, e2, …)"
+	Expr           Expr     // RHS: single expr, or *RowExpr for multi-column form
 }
 
 func (a UpdateAssign) Pos() int { return a.pos }

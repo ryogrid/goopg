@@ -459,6 +459,19 @@ func (p *parser) parseAssign() (UpdateAssign, error) {
 	if err != nil {
 		return UpdateAssign{}, err
 	}
+	// Accept "table.col = expr" — store the qualifier so the semantic
+	// layer can produce the PG-compatible error + hint (SET targets
+	// must not be qualified with the relation name).
+	var tableQualifier string
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+		p.advance() // consume '.'
+		subCol, serr := p.parseIdent()
+		if serr != nil {
+			return UpdateAssign{}, serr
+		}
+		tableQualifier = identText(col)
+		col = subCol
+	}
 	cur := p.cur()
 	if cur.Kind != TokenOperator || cur.Value != "=" {
 		return UpdateAssign{}, p.errAtCur("expected '='")
@@ -477,7 +490,7 @@ func (p *parser) parseAssign() (UpdateAssign, error) {
 	if err != nil {
 		return UpdateAssign{}, err
 	}
-	return UpdateAssign{pos: pos, Column: identText(col), Expr: expr}, nil
+	return UpdateAssign{pos: pos, Column: identText(col), TableQualifier: tableQualifier, Expr: expr}, nil
 }
 
 // parseDelete: DELETE FROM target [WHERE expr] [RETURNING target_list].

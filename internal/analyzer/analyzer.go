@@ -65,6 +65,10 @@ func analyzeError(pos int, code, msg string) *AnalyzeError {
 	return &AnalyzeError{Pos: pos, Code: code, Message: msg}
 }
 
+func analyzeErrorWithHint(pos int, code, msg, hint string) *AnalyzeError {
+	return &AnalyzeError{Pos: pos, Code: code, Message: msg, Hint: hint}
+}
+
 // pgTimeName returns the PostgreSQL display name for a time/timestamp type
 // as used in "operator is not unique" error messages. M0097-0004.
 func pgTimeName(typName string) string {
@@ -117,6 +121,12 @@ type scopeRel struct {
 	// fully-qualified path. Mirrors upstream's name-resolution
 	// rule for the EXCLUDED pseudo-relation.
 	qualifiedOnly bool
+	// blockOriginalName, when set alongside an alias, causes a
+	// deferred error when the underlying table name is used as a
+	// qualifier — only the alias is valid. The error is deferred
+	// (not immediate) so a qualifiedOnly binding with the same name
+	// (e.g. the excluded pseudo-table) can still match first.
+	blockOriginalName bool
 	// usingHidden lists column names hidden from unqualified lookup
 	// because they appear in a JOIN USING clause. The left table's
 	// copy of these columns is canonical. M0097-0003.
@@ -505,8 +515,9 @@ func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat cata
 	// upstream's "ON CONFLICT DO UPDATE requires inference
 	// specification or constraint name" diagnostic (42601 there).
 	if oc.Action == parser.OnConflictUpdate && oc.Target == nil {
-		return analyzeError(oc.Pos(), "42601",
-			"ON CONFLICT DO UPDATE requires inference specification or constraint name")
+		return analyzeErrorWithHint(oc.Pos(), "42601",
+			"ON CONFLICT DO UPDATE requires inference specification or constraint name",
+			"For example, ON CONFLICT (column_name).")
 	}
 
 	// Validate the conflict target shape:
@@ -547,8 +558,16 @@ func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat cata
 					continue
 				}
 				if _, ok := lookupColumn(tbl, col); !ok {
-					return analyzeError(oc.Target.Pos(), "42703",
-						fmt.Sprintf("column %q of relation %q does not exist", col, tbl.Name))
+					// PG uses the bare "column X does not exist" form
+					// for conflict-inference columns (no "of relation").
+					ae := analyzeError(oc.Target.Pos(), "42703",
+						fmt.Sprintf("column %q does not exist", col))
+					// Add a "did you mean" hint suggesting similar column names from
+					// both the target table and the excluded pseudo-table (like PG).
+					if h := suggestConflictColumnHint(tbl.Columns, tbl.Name, col); h != "" {
+						ae.Hint = h
+					}
+					return ae
 				}
 			}
 		}
@@ -568,10 +587,18 @@ func analyzeOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, cat cata
 	if primaryAlias == "" {
 		primaryAlias = tbl.Name
 	}
+	primaryRel := scopeRel{table: tbl, alias: primaryAlias}
+	if targetAlias != "" {
+		// When the target has an alias the original table name must
+		// not qualify the primary rel — only the alias is valid.
+		// Deferred (not immediate) so a qualifiedOnly binding with
+		// the same name (the excluded pseudo-table) can still match.
+		primaryRel.blockOriginalName = true
+	}
 	ctx := &scope{
 		cat: cat,
 		rels: []scopeRel{
-			{table: tbl, alias: primaryAlias},
+			primaryRel,
 			{table: tbl, alias: "excluded", qualifiedOnly: true},
 		},
 	}
@@ -912,7 +939,12 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 	case *parser.ColumnRef:
 		return resolveColumnRefType(x, ctx)
 	case *parser.StarExpr:
-		return catalog.Type{}, analyzeError(x.Pos(), "42601", "'*' is not allowed here")
+		if x.Table == "" && x.Schema == "" {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", "'*' is not allowed here")
+		}
+		// Table-qualified t.* is a whole-row reference; type resolution
+		// is deferred to the planner's expandQualifiedStarToRowExpr.
+		return catalog.Type{Name: "record"}, nil
 	case *parser.CastExpr:
 		// v0 treats `expr::type` as a no-op for type-checking. We
 		// recurse into the operand so analysis errors inside it
@@ -1241,6 +1273,7 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 	}
 	if x.Table != "" || x.Schema != "" {
 		matches := make([]scopeRel, 0, 1)
+		var deferredBlockErr error
 		for _, rel := range ctx.rels {
 			if rel.qualifiedOnly {
 				// Pseudo-tables (e.g. ON CONFLICT's
@@ -1258,27 +1291,51 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 				}
 				continue
 			}
+			if rel.blockOriginalName && rel.alias != "" &&
+				strings.EqualFold(x.Table, rel.table.Name) {
+				// Defer the error: allow a qualifiedOnly binding
+				// (e.g. excluded pseudo-table) to match first.
+				deferredBlockErr = analyzeErrorWithHint(x.Pos(), "42712",
+					fmt.Sprintf("invalid reference to FROM-clause entry for table %q", x.Table),
+					fmt.Sprintf("Perhaps you meant to reference the table alias %q.", rel.alias))
+				continue
+			}
 			if scopeRelMatches(rel, x.Table, x.Schema) {
 				matches = append(matches, rel)
 			}
 		}
 		if len(matches) == 0 {
+			if deferredBlockErr != nil {
+				return catalog.Type{}, false, deferredBlockErr
+			}
 			return catalog.Type{}, false, nil
 		}
 		if len(matches) > 1 {
 			return catalog.Type{}, false, analyzeError(x.Pos(), "42702", fmt.Sprintf("table reference %q is ambiguous", x.Table))
 		}
-		col, ok := lookupColumn(matches[0].table, x.Column)
+		matched := matches[0]
+		col, ok := lookupColumn(matched.table, x.Column)
 		if !ok {
 			// `<rel>.tableoid` system-column resolution. M0100-0005y.
 			if strings.EqualFold(x.Column, "tableoid") {
 				return catalog.Type{Name: "oid"}, true, nil
 			}
-			// `<rel>.ctid` system-column resolution. M0097-0038.
-			if strings.EqualFold(x.Column, "ctid") {
+			// `<rel>.ctid` system-column resolution — NOT allowed for the
+			// `excluded` pseudo-table (qualifiedOnly) since EXCLUDED is not
+			// a stored tuple and has no system columns. M0097-0038.
+			if strings.EqualFold(x.Column, "ctid") && !matched.qualifiedOnly {
 				return catalog.Type{Name: "tid"}, true, nil
 			}
-			return catalog.Type{}, false, analyzeError(x.Pos(), "42703", fmt.Sprintf("column %q does not exist", x.Column))
+			// Use qualified "table.col" format to match PG output.
+			qualifier := matched.alias
+			if qualifier == "" {
+				qualifier = matched.table.Name
+			}
+			ae := analyzeError(x.Pos(), "42703", fmt.Sprintf("column %s.%s does not exist", qualifier, x.Column))
+			if hint := suggestAnalyzerColumnHint(matched.table.Columns, qualifier, x.Column); hint != "" {
+				ae.Hint = hint
+			}
+			return catalog.Type{}, false, ae
 		}
 		return col.Type, true, nil
 	}
@@ -2452,6 +2509,79 @@ func PGDisplayTypeName(name string) string { return pgDisplayTypeName(name) }
 
 // pgDisplayTypeName converts internal type names to the PG-compatible
 // display form used in error messages (e.g. "int8" → "integer"). M0097-0063.
+// suggestConflictColumnHint returns a PG-style hint for an ON CONFLICT
+// inference column that doesn't exist. It looks for a similar column in both
+// the target table (qualified with tblName) and the excluded pseudo-table,
+// producing e.g. `Perhaps you meant to reference the column "t.key" or the
+// column "excluded.key".`
+func suggestConflictColumnHint(cols []catalog.Column, tblName, want string) string {
+	wl := strings.ToLower(want)
+	var tblMatch, exclMatch string
+	for _, c := range cols {
+		cl := strings.ToLower(c.Name)
+		if cl == wl {
+			return ""
+		}
+		if analyzerColumnEditDistance1(cl, wl) {
+			if tblMatch == "" {
+				tblMatch = fmt.Sprintf("%q", tblName+"."+c.Name)
+			}
+			if exclMatch == "" {
+				exclMatch = fmt.Sprintf("%q", "excluded."+c.Name)
+			}
+		}
+	}
+	if tblMatch == "" {
+		return ""
+	}
+	if exclMatch != "" && exclMatch != tblMatch {
+		return fmt.Sprintf("Perhaps you meant to reference the column %s or the column %s.", tblMatch, exclMatch)
+	}
+	return fmt.Sprintf("Perhaps you meant to reference the column %s.", tblMatch)
+}
+
+// suggestAnalyzerColumnHint returns a HINT when a column in cols is within
+// edit distance 1 of want. Mirrors suggestColumnHint in the planner.
+func suggestAnalyzerColumnHint(cols []catalog.Column, qualifier, want string) string {
+	wl := strings.ToLower(want)
+	for _, c := range cols {
+		cl := strings.ToLower(c.Name)
+		if cl == wl {
+			return ""
+		}
+		if analyzerColumnEditDistance1(cl, wl) {
+			return fmt.Sprintf("Perhaps you meant to reference the column %q.", qualifier+"."+c.Name)
+		}
+	}
+	return ""
+}
+
+func analyzerColumnEditDistance1(a, b string) bool {
+	la, lb := len(a), len(b)
+	if la == lb {
+		diff := 0
+		for i := range a {
+			if a[i] != b[i] {
+				diff++
+			}
+		}
+		return diff == 1
+	}
+	if la > lb {
+		a, b, la, lb = b, a, lb, la
+	}
+	if lb-la > 1 {
+		return false
+	}
+	for i := range b {
+		candidate := b[:i] + b[i+1:]
+		if candidate == a {
+			return true
+		}
+	}
+	return false
+}
+
 func pgDisplayTypeName(name string) string {
 	switch strings.ToLower(name) {
 	case "int2", "smallint":
