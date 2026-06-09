@@ -86,7 +86,7 @@ varchar,0,pass
 xid,0,pass
 create_table_like,0,pass
 matview,0,pass
-insert_conflict,113,failed
+insert_conflict,33,failed
 join_hash,142,failed
 partition_info,0,pass
 create_table,0,pass

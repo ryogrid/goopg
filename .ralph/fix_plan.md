@@ -3285,6 +3285,36 @@ M0097-0001 wires it up.
         (d) Normalization rule for `text[] || text[]` operator error.
         `insert_conflict` regress: 129 → 0 diff lines (PASS).
         `limit` regress: also now PASS (0 diff lines).
+      - **Progress 2026-06-10 (M0097-0024 — error format + excluded scope, loop 2):**
+        Eight coordinated fixes (commit c4e21dc3):
+        (a) Analyzer/planner `blockOriginalName` for `excluded` pseudo-table: when
+            `INSERT INTO excluded AS target` is used, `excluded.col` in DO UPDATE
+            SET now defers the "invalid reference" check until after
+            `qualifiedOnly`/alias-matched bindings have had a chance to resolve.
+            Alias HINT ("Perhaps you meant to reference the table alias 'ict'.")
+            now emitted from both analyzer and planner paths.
+        (b) Analyzer: ON CONFLICT inference column uses bare "column X does not
+            exist" format (not "of relation X") + suggestConflictColumnHint
+            for edit-distance-1 suggestions across both target table and excluded.
+        (c) Analyzer: column-not-found on qualified ref uses "table.col does not
+            exist" format + analyzerColumnEditDistance1 hint.
+        (d) Analyzer: `excluded` pseudo-table blocks `ctid` system-column resolution.
+        (e) Planner: qualified column error uses "table.col does not exist" format
+            + suggestColumnHint for edit-distance-1 suggestions.
+        (f) Planner: RETURNING scope adds `excluded` as `notReferenceable` to
+            produce "invalid reference ... cannot be referenced from this part of
+            the query" DETAIL instead of "column X does not exist" ERROR.
+        (g) Parser + planner: accept and reject "SET table.col = val" with the PG
+            "column 'T' of relation 'T' does not exist" error + SET target hint.
+        (h) expandStarTarget: skip qualifiedOnly/notReferenceable bindings in
+            unqualified star expansion to prevent double-column RETURNING output.
+        `insert_conflict` regress: 53 → 33 diff lines (content lines).
+        Remaining blockers (all require deep feature implementation):
+        - INSERT through view with ON CONFLICT (10 diff lines)
+        - GiST exclusion constraint enforcement (9 diff lines)
+        - Whole-row variable comparisons in ON CONFLICT WHERE (5 diff lines)
+        - Partitioned index validity tracking (3 diff lines)
+        - Trigger REFERENCING/transition table support (1 diff line)
 
 - [x] **M0097-0029 — Port extended-type / dbsize regress tests**
       - Summary: Make these 22 tests reach `pass`:
