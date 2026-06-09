@@ -87,7 +87,7 @@ jobs:
       # Build goopg binary (needed for pgbench steps)
       # ------------------------------------------------------------------ #
       - name: Build goopg
-        run: go build -o bin/goopg ./cmd/goopg
+        run: go build -buildvcs=false -o bin/goopg ./cmd/goopg
 
       # ------------------------------------------------------------------ #
       # Unit and component tests (no live server required)
