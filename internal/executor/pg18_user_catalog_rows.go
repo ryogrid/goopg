@@ -187,6 +187,15 @@ const (
 // a user-defined table. Mirrors initdb.pgClassRow's per-column ordering and
 // default values.
 func buildUserPGClassRow(tbl *catalog.Table) Row {
+	relkind := "r"
+	if tbl.PartitionMethod != "" {
+		relkind = "p" // partitioned table
+	}
+	relfilenode := int64(tbl.OID)
+	if relkind == "p" {
+		relfilenode = 0 // partitioned tables have no physical storage
+	}
+	isPartition := tbl.PartitionParentOID != 0
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                  // oid
 		NewStringDatum(tbl.Name),                                     // relname (name)
@@ -195,7 +204,7 @@ func buildUserPGClassRow(tbl *catalog.Table) Row {
 		NewIntDatum(0),                                               // reloftype
 		NewIntDatum(bootstrapSuperuserOID),                           // relowner
 		NewIntDatum(pgHeapAccessMethodOID),                           // relam
-		NewIntDatum(int64(tbl.OID)),                                  // relfilenode
+		NewIntDatum(relfilenode),                                     // relfilenode
 		NewIntDatum(0),                                               // reltablespace (default per-db tablespace)
 		NewIntDatum(0),                                               // relpages
 		NewIntDatum(0),                                               // reltuples (float4 here; stored 0 == 0.0)
@@ -205,7 +214,7 @@ func buildUserPGClassRow(tbl *catalog.Table) Row {
 		NewBoolDatum(false),                                          // relhasindex (updated by CREATE INDEX later)
 		NewBoolDatum(false),                                          // relisshared
 		NewStringDatum("p"),                                          // relpersistence
-		NewStringDatum("r"),                                          // relkind
+		NewStringDatum(relkind),                                      // relkind
 		NewIntDatum(int64(len(tbl.Columns))),                         // relnatts
 		NewIntDatum(0),                                               // relchecks
 		NewBoolDatum(false),                                          // relhasrules
@@ -215,7 +224,7 @@ func buildUserPGClassRow(tbl *catalog.Table) Row {
 		NewBoolDatum(false),                                          // relforcerowsecurity
 		NewBoolDatum(true),                                           // relispopulated
 		NewStringDatum("n"),                                          // relreplident (REPLICA_IDENTITY_DEFAULT)
-		NewBoolDatum(false),                                          // relispartition
+		NewBoolDatum(isPartition),                                    // relispartition
 		NewIntDatum(0),                                               // relrewrite
 		NewIntDatum(minFrozenXID),                                    // relfrozenxid
 		NewIntDatum(minFrozenMXID),                                   // relminmxid
@@ -290,8 +299,13 @@ func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 		NewStringDatum(""),                        // attidentity
 		NewStringDatum(attGeneratedFor(col)),      // attgenerated
 		NewBoolDatum(false),                       // attisdropped
-		NewBoolDatum(true),                        // attislocal
-		NewIntDatum(0),                            // attinhcount
+		NewBoolDatum(!col.Inherited),              // attislocal
+		func() Datum {
+			if col.Inherited {
+				return NewIntDatum(1)
+			}
+			return NewIntDatum(0)
+		}(),                                       // attinhcount
 		NewIntDatum(int64(attrs.TypCollation)),    // attcollation
 		// attacl / attoptions / attfdwoptions / attmissingval are nullable
 		// varlena columns; PG18 stores NULL when unset. NullDatum signals

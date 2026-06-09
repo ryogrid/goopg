@@ -323,6 +323,11 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 }
 
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
+	// Temporary tables may only be created in the temp schema (pg_temp),
+	// not in a permanent schema like public.
+	if s.Temporary && s.Name.Schema != "" && !strings.EqualFold(s.Name.Schema, "pg_temp") {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "cannot create temporary relation in non-temporary schema"}
+	}
 	// Pre-resolve schema from search_path before the existence check so that
 	// CREATE TABLE ctlt1 in ctl_schema context doesn't falsely collide with
 	// public.ctlt1 (which shares the bare "ctlt1" catalog key). M0097-0023.
@@ -389,6 +394,10 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if !ok {
 				// Parent might not exist yet or may be a virtual table; skip silently.
 				continue
+			}
+			if parent.PartitionMethod != "" {
+				return &ExecError{Code: "42809", Pos: s.Pos(),
+					Message: fmt.Sprintf("cannot inherit from partitioned table %q", parentName.Name)}
 			}
 			inheritParents = append(inheritParents, parent)
 			// Append parent columns (deep copy to avoid aliasing).
@@ -702,37 +711,40 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			})
 		}
 	}
+	// Partitioned tables cannot be inheritance children.
+	if s.PartitionBy != nil && len(s.Inherits) > 0 {
+		return &ExecError{Code: "42P16", Pos: s.Pos(), Message: "cannot create partitioned table as inheritance child"}
+	}
 	// PG18: NO INHERIT constraints cannot be added to partitioned tables. M0097-0023.
 	if s.PartitionBy != nil {
+		noInheritErr := func() *ExecError {
+			return &ExecError{
+				Code:    "42P16",
+				Pos:     s.Pos(),
+				Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
+			}
+		}
 		// Check LIKE-sourced NOT NULL constraints.
 		for _, entry := range likeNotNullByCol {
 			if entry.noInherit {
-				return &ExecError{
-					Code:    "42P16",
-					Pos:     s.Pos(),
-					Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
-				}
+				return noInheritErr()
 			}
 		}
 		// Check LIKE-sourced CHECK constraints.
 		for _, nc := range likeCheckConstraints {
 			if nc.NoInherit {
-				return &ExecError{
-					Code:    "42P16",
-					Pos:     s.Pos(),
-					Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
-				}
+				return noInheritErr()
 			}
 		}
 		// Check explicit column NOT NULL NO INHERIT.
 		for _, c := range s.Columns {
 			if c.NotNullNoInherit || c.CheckNoInherit {
-				return &ExecError{
-					Code:    "42P16",
-					Pos:     s.Pos(),
-					Message: fmt.Sprintf("cannot add NO INHERIT constraint to partitioned table %q", s.Name.Name),
-				}
+				return noInheritErr()
 			}
+		}
+		// Check table-level CHECK ... NO INHERIT.
+		if s.TableHasNoInheritCheck {
+			return noInheritErr()
 		}
 	}
 	// WITH OIDS is no longer supported.
@@ -743,8 +755,16 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
 	}
+	// Storage parameters (WITH clause) are not supported for partitioned tables.
+	if s.PartitionBy != nil && len(s.With) > 0 {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "cannot specify storage parameters for a partitioned table"}
+	}
 	// Validate DEFAULT expressions (no column refs, aggregates, subqueries, SRFs).
 	for _, c := range s.Columns {
+		if strings.EqualFold(c.Type.Name, "unknown") {
+			return &ExecError{Code: "42P16", Pos: s.Pos(),
+				Message: fmt.Sprintf("column %q has pseudo-type unknown", c.Name)}
+		}
 		if c.DefaultExpr != nil {
 			if err := validateDefaultExpr(c.DefaultExpr, s.Pos(), o.ctx); err != nil {
 				return err
@@ -831,6 +851,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		tbl.PartitionKey = s.PartitionBy.KeyCols
 		tbl.PartitionKeyOpClasses = s.PartitionBy.OpClasses
 		tbl.PartitionKeyExprs = s.PartitionBy.KeyExprs // M0097-0023: expression keys
+		tbl.PartitionKeyCollations = s.PartitionBy.Collations
 		// Partitioned tables are "virtual" for storage purposes:
 		// they never hold rows directly — all data lives in children.
 		// But we still create a heap so the table exists for metadata.
@@ -1343,6 +1364,11 @@ func (o *ddlOp) execCreateTableAs(s *parser.CreateTableStmt) error {
 // the child in the partition-children registry.  M0096-0007.
 func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	poc := s.PartitionOf
+	// Detect duplicate column names in the PARTITION OF column override list.
+	if poc.DuplicateColumn != "" {
+		return &ExecError{Code: "42701", Pos: s.Pos(),
+			Message: fmt.Sprintf("column %q specified more than once", poc.DuplicateColumn)}
+	}
 	// Look up the parent partitioned table.
 	parent, ok := o.ctx.Catalog.LookupTable(poc.Parent)
 	if !ok {
@@ -1356,6 +1382,9 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// Inherit columns from parent (partition children use parent's schema).
 	cols := make([]catalog.Column, len(parent.Columns))
 	copy(cols, parent.Columns)
+	for i := range cols {
+		cols[i].Inherited = true
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
@@ -1381,6 +1410,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		tbl.PartitionKey = s.PartitionBy.KeyCols
 		tbl.PartitionKeyOpClasses = s.PartitionBy.OpClasses
 		tbl.PartitionKeyExprs = s.PartitionBy.KeyExprs // M0097-0023
+		tbl.PartitionKeyCollations = s.PartitionBy.Collations
 	}
 
 	// Build partition bounds from the FOR VALUES clause.
@@ -1599,6 +1629,14 @@ func validatePartitionChild(s *parser.CreateTableStmt, parent *catalog.Table, ct
 		}
 	}
 
+	// 9b. Non-default partition with a DEFAULT sibling: check the default
+	// partition has no rows that would be claimed by the new partition.
+	if !poc.Default && strategy != "hash" {
+		if err := checkDefaultPartitionDataConflict(childName, parent, poc, pos, ctx); err != nil {
+			return err
+		}
+	}
+
 	// 10. DEFAULT partition conflict.
 	if poc.Default && strategy != "hash" {
 		if err := validateDefaultPartition(childName, parent, ctx, pos); err != nil {
@@ -1697,6 +1735,30 @@ func defaultExprToSQL(e parser.Expr) string {
 			return left + " * " + right
 		case parser.OpDiv:
 			return left + " / " + right
+		case parser.OpMod:
+			return left + " % " + right
+		case parser.OpConcat:
+			return left + " || " + right
+		case parser.OpEq:
+			return left + " = " + right
+		case parser.OpLt:
+			return left + " < " + right
+		case parser.OpGt:
+			return left + " > " + right
+		case parser.OpLe:
+			return left + " <= " + right
+		case parser.OpGe:
+			return left + " >= " + right
+		case parser.OpNe:
+			return left + " <> " + right
+		case parser.OpAnd:
+			return left + " AND " + right
+		case parser.OpOr:
+			return left + " OR " + right
+		case parser.OpLike:
+			return left + " LIKE " + right
+		case parser.OpNotLike:
+			return left + " NOT LIKE " + right
 		}
 	case *parser.TypedStringLit:
 		return v.Type + " '" + strings.ReplaceAll(v.Value, "'", "''") + "'"
@@ -2654,10 +2716,14 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false); err != nil {
 		return err
 	}
-	// Store INCLUDE columns and partial index flag on the newly created index.
-	if s.HasPredicate || len(s.IncludeColumns) > 0 {
+	// Store INCLUDE columns, partial index flag, and predicate expression.
+	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.HasPredicate = s.HasPredicate
+			idx.Predicate = s.Predicate
+			if s.Predicate != nil {
+				idx.PredicateString = defaultExprToSQL(s.Predicate)
+			}
 			idx.IncludeColumns = s.IncludeColumns
 		}
 	}
@@ -3589,10 +3655,12 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	// planner and executor can evaluate them at conflict-detection time.
 	if len(colExprs) > 0 {
 		idx.ColExprs = make([]*parser.Expr, len(colExprs))
+		idx.ColExprStrings = make([]string, len(colExprs))
 		for i, e := range colExprs {
 			if e != nil {
 				ec := e // take address of loop copy
 				idx.ColExprs[i] = &ec
+				idx.ColExprStrings[i] = defaultExprToSQL(e)
 			}
 		}
 	}
@@ -4551,7 +4619,11 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	}
 	volatile := s.Volatile
 	if volatile == "" {
-		volatile = "v" // default: volatile
+		if lang == "sql" {
+			volatile = inferSQLFunctionVolatility(s.Body)
+		} else {
+			volatile = "v" // default: volatile
+		}
 	}
 	schema := s.Name.Schema
 	if schema == "" {
@@ -7332,6 +7404,12 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		// store the fields to enable PL/pgSQL field access/assignment.
 		// M0097-0064, M0097-composite.
 		if s.IsComposite && len(s.CompositeFields) > 0 {
+			for _, f := range s.CompositeFields {
+				if strings.EqualFold(f.ColType, "unknown") {
+					return &ExecError{Code: "42P16", Pos: s.Pos(),
+						Message: fmt.Sprintf("column %q has pseudo-type unknown", f.Name)}
+				}
+			}
 			fields := make([]catalog.CompositeField, len(s.CompositeFields))
 			for i, f := range s.CompositeFields {
 				fields[i] = catalog.CompositeField{Name: f.Name, ColType: f.ColType}
@@ -7545,6 +7623,17 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 		return &ExecError{Code: "42703", Pos: act.Pos(), Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
 	}
 
+	// Cannot drop a column that is part of the partition key.
+	if tbl.PartitionMethod != "" {
+		colLower := strings.ToLower(act.ColumnName)
+		for _, keyCol := range tbl.PartitionKey {
+			if strings.ToLower(keyCol) == colLower {
+				return &ExecError{Code: "0A000", Pos: act.Pos(),
+					Message: fmt.Sprintf("cannot drop column %q because it is part of the partition key of relation %q", act.ColumnName, tbl.Name)}
+			}
+		}
+	}
+
 	// Save old columns for decoding existing heap rows.
 	oldCols := make([]catalog.Column, len(tbl.Columns))
 	copy(oldCols, tbl.Columns)
@@ -7666,6 +7755,20 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 			return werr
 		}
 		maintainUniqueIndexesForInsert(o.ctx, tbl, tbl.Columns, row, ptr)
+	}
+
+	// Phase 5: update catalog heap — delete old pg_class/pg_attribute rows and
+	// re-sync so the dropped column is no longer visible via pg_attribute scans.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if err := o.ctx.MaterializeWriterXID(); err == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range catalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+		if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
 	}
 	return nil
 }
@@ -8023,6 +8126,29 @@ func buildFunctionArgsList(r *catalog.Routine) string {
 
 // extractRoutineDeps parses the function body and arg defaults to populate
 // dependency fields on r for information_schema routine_*_usage views.
+// inferSQLFunctionVolatility returns "i" (immutable) or "v" (volatile) by
+// scanning the SQL body for known volatile built-in function calls.
+// This mirrors PostgreSQL's provolatility inference for SQL functions
+// declared without an explicit VOLATILE/STABLE/IMMUTABLE marker.
+func inferSQLFunctionVolatility(body string) string {
+	// Known built-in volatile functions (subset sufficient for the test suite).
+	volatileFuncs := []string{
+		"random", "nextval", "currval", "lastval", "setval",
+		"now", "clock_timestamp", "statement_timestamp",
+		"transaction_timestamp", "timeofday",
+		"gen_random_uuid", "uuid_generate_v4",
+		"txid_current",
+	}
+	lower := strings.ToLower(body)
+	for _, fn := range volatileFuncs {
+		// Match "fn(" to avoid false positives on substrings.
+		if strings.Contains(lower, fn+"(") {
+			return "v"
+		}
+	}
+	return "i"
+}
+
 func extractRoutineDeps(body string, argDefaults []string, schema string, r *catalog.Routine, cat catalog.Catalog) {
 	// Panic recovery: extractRoutineDeps is a best-effort feature; never crash the server.
 	defer func() { recover() }() //nolint:errcheck

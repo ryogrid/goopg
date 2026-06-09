@@ -986,6 +986,9 @@ type CreateTableStmt struct {
 	// TableExclusions holds anonymous EXCLUDE USING constraints (no CONSTRAINT name).
 	// Named ones are folded into NamedConstraints. M0097-0023.
 	TableExclusions []TableConstraintDef
+	// TableHasNoInheritCheck is true when any table-level CHECK constraint carries
+	// NO INHERIT. Partitioned tables reject such constraints. M0097-0023.
+	TableHasNoInheritCheck bool
 	// LikeTables holds the source table names from LIKE clauses.
 	// `CREATE TABLE t (LIKE src INCLUDING DEFAULTS)` copies src's columns. M0097-0069.
 	// Deprecated: use BodyOrder for positional interleaving.
@@ -1006,7 +1009,8 @@ type PartitionByClause struct {
 	Method   string   // "LIST", "RANGE", or "HASH"
 	KeyCols  []string // partition key column names; empty string for expression keys
 	KeyExprs []Expr   // expression-based partition keys; nil for plain column keys (M0097-0023)
-	OpClasses []string // operator class per key col (empty string = default); M0097-0027
+	OpClasses  []string // operator class per key col (empty string = default); M0097-0027
+	Collations []string // per-key collation name ("" = default, i.e. not shown); M0097-0023
 }
 
 // PartitionOfClause describes a PARTITION OF parent FOR VALUES … clause.
@@ -1029,6 +1033,10 @@ type PartitionOfClause struct {
 	// in PARTITION OF, e.g. `CREATE TABLE t1 PARTITION OF t (b UNIQUE) FOR VALUES IN (1)`.
 	// Each entry is a column name to create a unique index on. M0097-0028.
 	UniqueColumns []string
+	// DuplicateColumn is non-empty when a column name appears more than once
+	// in the PARTITION OF column override list (e.g. `(b NOT NULL, b DEFAULT 1, ...)`).
+	// The executor returns an error when this is set.
+	DuplicateColumn string
 }
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]
@@ -1056,7 +1064,8 @@ type CreateIndexStmt struct {
 	// most built-in operator classes have no options, so a non-empty value
 	// here causes an error at execution time. M0097-0023.
 	OpClassWithOptions string
-	HasPredicate       bool     // true when a WHERE clause (partial index predicate) is present
+	HasPredicate       bool   // true when a WHERE clause (partial index predicate) is present
+	Predicate          Expr   // WHERE predicate expression (nil if no WHERE clause)
 	IncludeColumns     []string // non-key covering columns from INCLUDE (…)
 }
 
