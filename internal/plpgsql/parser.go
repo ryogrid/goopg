@@ -1165,6 +1165,10 @@ func (p *bodyParser) parseReturn() (Stmt, error) {
 	// RETURN NEXT expr; — PL/pgSQL SETOF row emitter. M0097-0073.
 	if p.cur().Kind == parser.TokenIdent && strings.EqualFold(p.cur().Value, "next") {
 		p.advance() // consume NEXT
+		// RETURN NEXT; with no expression — emits current OUT param values as a row.
+		if p.acceptSymbol(";") {
+			return &ReturnNextStmt{pos: retTok.Pos, Expr: nil}, nil
+		}
 		expr, err := p.scanExprToSemicolon("RETURN NEXT expression")
 		if err != nil {
 			return nil, err

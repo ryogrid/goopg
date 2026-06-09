@@ -590,6 +590,17 @@ func evalPLpgSQLFunctionSetof(r *catalog.Routine, args []Datum, ctx *Context, po
 			}
 		}
 	}
+	// Initialize OUT parameters as NULL variables (RETURNS TABLE / OUT args not
+	// passed by caller). M0097-0028.
+	for i, mode := range r.ArgModes {
+		if (mode == "o" || mode == "b") && i < len(r.ArgNames) && r.ArgNames[i] != "" {
+			typ := catalog.Type{Name: "unknown"}
+			if i < len(r.ArgTypes) {
+				typ = normalizeCatalogType(r.ArgTypes[i])
+			}
+			_ = frame.add(r.ArgNames[i], typ, NullDatum) // ignore dup (INOUT already added)
+		}
+	}
 	for _, d := range block.Declarations {
 		typ := catalogTypeFromColumnType(d.Type)
 		value := NullDatum
@@ -1184,6 +1195,38 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 
 	case *plpgsql.ReturnNextStmt:
 		// RETURN NEXT — append one value to the SETOF accumulator. M0097-0073.
+		if s.Expr == nil {
+			// RETURN NEXT; (no expression) — collect current OUT param values.
+			// Used by RETURNS TABLE functions. M0097-0028.
+			var outNames []string
+			for i, mode := range r.ArgModes {
+				if (mode == "o" || mode == "b") && i < len(r.ArgNames) {
+					outNames = append(outNames, r.ArgNames[i])
+				}
+			}
+			if len(outNames) == 1 {
+				val := NullDatum
+				if idx, ok := frame.lookup(outNames[0]); ok {
+					val = frame.values[idx]
+				}
+				frame.returnNextRows = append(frame.returnNextRows, val)
+			} else if len(outNames) > 1 {
+				parts := make([]string, len(outNames))
+				for i, name := range outNames {
+					val := NullDatum
+					if idx, ok := frame.lookup(name); ok {
+						val = frame.values[idx]
+					}
+					if val.IsNull() {
+						parts[i] = ""
+					} else {
+						parts[i] = val.StringValue()
+					}
+				}
+				frame.returnNextRows = append(frame.returnNextRows, NewStringDatum("("+strings.Join(parts, ",")+")"))
+			}
+			return Datum{}, flowNone, nil
+		}
 		v, err := evalPLpgSQLExpr(s.Expr, frame, ctx)
 		if err != nil {
 			return Datum{}, flowNone, err

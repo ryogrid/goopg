@@ -87,7 +87,7 @@ xid,0,pass
 create_table_like,0,pass
 matview,0,pass
 insert_conflict,33,failed
-join_hash,142,failed
+join_hash,0,pass
 partition_info,0,pass
 create_table,0,pass
 partition_join,397,failed
@@ -108,7 +108,7 @@ constraints,818,failed
 float8,884,failed
 jsonpath,939,failed
 generated_stored,1042,failed
-incremental_sort,1057,failed
+incremental_sort,0,pass
 date,1160,failed
 generated_virtual,1209,failed
 copy,1211,failed
@@ -117,7 +117,7 @@ groupingsets,1589,failed
 alter_table,1702,failed
 interval,1709,failed
 json,2156,failed
-merge,2355,failed
+merge,0,pass
 arrays,2383,failed
 foreign_key,2936,failed
 join,3480,failed

@@ -3315,6 +3315,23 @@ M0097-0001 wires it up.
         - Whole-row variable comparisons in ON CONFLICT WHERE (5 diff lines)
         - Partitioned index validity tracking (3 diff lines)
         - Trigger REFERENCING/transition table support (1 diff line)
+      - **Progress 2026-06-10 (M0097-0028 — RETURNS TABLE + RETURN NEXT; — loop 2):**
+        Three coordinated fixes:
+        (a) Parser (`internal/parser/function.go`): parse `RETURNS TABLE (col type, ...)`
+            as syntactic sugar for `RETURNS SETOF RECORD` with OUT params appended to
+            the arg list.  Uses `FuncArgOut` mode, sets `ReturnsSet=true`, `retType=record`.
+        (b) PL/pgSQL parser (`internal/plpgsql/parser.go`): allow `RETURN NEXT;` with no
+            expression; emits `ReturnNextStmt{Expr: nil}`.
+        (c) Executor (`internal/executor/plpgsql_runtime.go`):
+            - `evalPLpgSQLFunctionSetof`: initialize OUT-param variables as NULL in the
+              frame (they are not passed by caller, but the body assigns to them by name).
+            - `ReturnNextStmt` handler: when `Expr==nil`, collect current OUT-param values
+              from the frame; if 1 OUT param, append the datum directly; if 2+ OUT params,
+              build composite text `"(v1,v2,...)"` (matches `decomposeCompositeText` format).
+        Results (all 0 diffs, PASS):
+        - `join_hash`: 142 → 0 diffs
+        - `incremental_sort`: 1057 → 0 diffs
+        - `merge`: 2355 → 0 diffs
 
 - [x] **M0097-0029 — Port extended-type / dbsize regress tests**
       - Summary: Make these 22 tests reach `pass`:
