@@ -2984,6 +2984,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						return err
 					}
 				}
+				if act.Kind == parser.AlterIndexAttachPartition {
+					childName := parser.ObjectName{Name: act.ChildIndexName}
+					childIdx, ok2 := o.ctx.Catalog.LookupIndex(childName)
+					if ok2 {
+						childIdx.PartitionParentOID = idx.OID
+						if im2, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
+							im2.RegisterIndexPartitionChild(idx.OID, childIdx.OID)
+						}
+					}
+				}
 			}
 			// Other ALTER actions on index: silently accept in v0.
 			return nil
@@ -3170,6 +3180,23 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + suffix}
 				}
 				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary)
+			}
+		case parser.AlterIndexAttachPartition:
+			// ALTER INDEX parent ATTACH PARTITION child — register index partition hierarchy.
+			// Both parent and child must already exist as index catalog entries. M0097-0023.
+			parentName := parser.ObjectName{Name: act.ConstraintName}
+			parentIdx, ok := o.ctx.Catalog.LookupIndex(parentName)
+			if !ok {
+				break
+			}
+			childName := parser.ObjectName{Name: act.ChildIndexName}
+			childIdx, ok := o.ctx.Catalog.LookupIndex(childName)
+			if !ok {
+				break
+			}
+			childIdx.PartitionParentOID = parentIdx.OID
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+				im.RegisterIndexPartitionChild(parentIdx.OID, childIdx.OID)
 			}
 		case parser.AlterTableRenameTable:
 			newName := act.NewName
@@ -6291,6 +6318,40 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 		Message: fmt.Sprintf("rule %q for relation %q does not exist", s.Name, s.Table.Name)}
 }
 
+// seqTypeBounds returns the min/max int64 bounds for a sequence data type.
+// Accepts PG aliases ("int2", "int4", "int8", "int", etc.). M0097-0068.
+func seqTypeBounds(dt string) (min, max int64) {
+	switch strings.ToLower(dt) {
+	case "smallint", "int2":
+		return -32768, 32767
+	case "integer", "int4", "int":
+		return -2147483648, 2147483647
+	default: // bigint / int8
+		return -9223372036854775808, 9223372036854775807
+	}
+}
+
+// canonSeqType returns the canonical SQL type name for sequence data type error messages.
+func canonSeqType(dt string) string {
+	switch strings.ToLower(dt) {
+	case "smallint", "int2":
+		return "smallint"
+	case "integer", "int4", "int":
+		return "integer"
+	default:
+		return "bigint"
+	}
+}
+
+// isKnownSeqType returns true for valid sequence data types. M0097-0068.
+func isKnownSeqType(dt string) bool {
+	switch strings.ToLower(dt) {
+	case "", "bigint", "int8", "integer", "int4", "int", "smallint", "int2":
+		return true
+	}
+	return false
+}
+
 // execCreateSequence registers a new sequence in the process-global registry.
 // M0097-0009.
 func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
@@ -6298,47 +6359,259 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	if LookupSequence(name) != nil && s.IfNotExists {
 		return nil
 	}
-	// Determine defaults based on data type.
-	var minV, maxV int64
-	switch strings.ToLower(s.DataType) {
-	case "smallint", "int2":
-		minV, maxV = -32768, 32767
-	case "integer", "int4", "int":
-		minV, maxV = -2147483648, 2147483647
-	default: // bigint / int8 (default)
-		minV, maxV = -9223372036854775808, 9223372036854775807
+	// Validate data type.
+	if !isKnownSeqType(s.DataType) {
+		// Distinguish "no such type" from "not a valid sequence type" based on
+		// whether the type name looks like a built-in integer alias.
+		if strings.ToLower(s.DataType) != "text" && !strings.HasPrefix(strings.ToLower(s.DataType), "int") {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.DataType)}
+		}
+		return &ExecError{Code: "42804", Pos: s.Pos(),
+			Message: "sequence type must be smallint, integer, or bigint"}
 	}
-	// Apply explicit options.
+	typeMin, typeMax := seqTypeBounds(s.DataType)
+	increment := int64(1)
+	if s.Increment != nil {
+		increment = *s.Increment
+	}
+	if increment == 0 {
+		return &ExecError{Code: "22003", Pos: s.Pos(), Message: "INCREMENT must not be zero"}
+	}
+	if s.Cache != nil && *s.Cache <= 0 {
+		return &ExecError{Code: "22003", Pos: s.Pos(),
+			Message: fmt.Sprintf("CACHE (%d) must be greater than zero", *s.Cache)}
+	}
+	// PostgreSQL default min/max depend on sequence direction:
+	//   ascending  → minValue = 1,       maxValue = type_max
+	//   descending → minValue = type_min, maxValue = -1
+	// M0097-0042, M0097-0068.
+	var minV, maxV int64
+	if increment >= 0 {
+		minV, maxV = 1, typeMax
+	} else {
+		minV, maxV = typeMin, -1
+	}
+	// Explicit MINVALUE/MAXVALUE override the direction-based defaults.
 	if s.MinValue != nil {
 		minV = *s.MinValue
 	}
 	if s.MaxValue != nil {
 		maxV = *s.MaxValue
 	}
-	increment := int64(1)
-	if s.Increment != nil {
-		increment = *s.Increment
+	// Validate explicit bounds against type range.
+	canon := canonSeqType(s.DataType)
+	if minV < typeMin || minV > typeMax {
+		return &ExecError{Code: "22003", Pos: s.Pos(),
+			Message: fmt.Sprintf("MINVALUE (%d) is out of range for sequence data type %s", minV, canon)}
 	}
-	// Default start values follow PostgreSQL convention (not the type minimum):
-	// ascending (increment > 0) → start = 1; descending → start = -1.
-	// M0097-0042.
-	start := int64(1)
+	if maxV < typeMin || maxV > typeMax {
+		return &ExecError{Code: "22003", Pos: s.Pos(),
+			Message: fmt.Sprintf("MAXVALUE (%d) is out of range for sequence data type %s", maxV, canon)}
+	}
+	// Validate min < max.
+	if minV >= maxV {
+		return &ExecError{Code: "22003", Pos: s.Pos(),
+			Message: fmt.Sprintf("MINVALUE (%d) must be less than MAXVALUE (%d)", minV, maxV)}
+	}
+	// Default START = MINVALUE (ascending) or MAXVALUE (descending).
+	// Must be computed after final minV/maxV are determined. M0097-0042, M0097-0068.
+	start := minV
 	if increment < 0 {
-		start = int64(-1)
+		start = maxV
 	}
 	if s.Start != nil {
 		start = *s.Start
 	}
+	// Validate START within [minV, maxV].
+	if start > maxV {
+		return &ExecError{Code: "22003", Pos: s.Pos(),
+			Message: fmt.Sprintf("START value (%d) cannot be greater than MAXVALUE (%d)", start, maxV)}
+	}
+	if start < minV {
+		return &ExecError{Code: "22003", Pos: s.Pos(),
+			Message: fmt.Sprintf("START value (%d) cannot be less than MINVALUE (%d)", start, minV)}
+	}
+	// Validate OWNED BY before registering. M0097-0068.
+	if s.OwnedBy != "" {
+		if err := o.validateSeqOwnedBy(s.Pos(), name, s.OwnedBy); err != nil {
+			return err
+		}
+	}
 	cycle := s.Cycle
 	RegisterSequence(name, start, increment, minV, maxV, cycle)
+	dt := s.DataType
+	if dt == "" {
+		dt = "bigint"
+	}
+	SetSequenceDataType(name, dt)
+	if s.OwnedBy != "" {
+		SetSequenceOwnedBy(name, s.OwnedBy)
+	}
 	return nil
 }
 
-// execAlterSequence handles ALTER SEQUENCE statements. Currently implements
-// OWNED BY (records sequence ownership for DROP TABLE cascade).
+// validateSeqOwnedBy checks OWNED BY table.column before the sequence is
+// registered/updated. Returns an error matching PostgreSQL's messages. M0097-0068.
+func (o *ddlOp) validateSeqOwnedBy(pos int, seqName, ownedBy string) error {
+	dot := strings.Index(ownedBy, ".")
+	if dot < 0 {
+		return &ExecError{Code: "42601", Pos: pos, Message: "invalid OWNED BY option"}
+	}
+	tblPart := ownedBy[:dot]
+	colPart := ownedBy[dot+1:]
+
+	// Look up the table in the catalog.
+	tbl, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Name: tblPart})
+	if !ok {
+		// May be schema-qualified: try schema.table
+		schemaDot := strings.Index(tblPart, ".")
+		if schemaDot >= 0 {
+			tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{
+				Schema: tblPart[:schemaDot],
+				Name:   tblPart[schemaDot+1:],
+			})
+		}
+	}
+	if !ok {
+		return &ExecError{Code: "42P01", Pos: pos,
+			Message: fmt.Sprintf("sequence cannot be owned by relation %q", tblPart)}
+	}
+	// Check same schema first (mirrors PostgreSQL error priority). M0097-0068.
+	seqDot := strings.Index(seqName, ".")
+	seqSchema := "public"
+	if seqDot >= 0 {
+		seqSchema = strings.ToLower(seqName[:seqDot])
+	}
+	tblSchema := strings.ToLower(tbl.Schema)
+	if tblSchema == "" {
+		tblSchema = "public"
+	}
+	if seqSchema != tblSchema {
+		return &ExecError{Code: "0A000", Pos: pos,
+			Message: "sequence must be in same schema as table it is linked to"}
+	}
+	if tbl.Virtual {
+		return &ExecError{Code: "42809", Pos: pos,
+			Message: fmt.Sprintf("sequence cannot be owned by relation %q", tblPart)}
+	}
+	// Check column exists.
+	found := false
+	for _, col := range tbl.Columns {
+		if strings.EqualFold(col.Name, colPart) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return &ExecError{Code: "42703", Pos: pos,
+			Message: fmt.Sprintf("column %q of relation %q does not exist", colPart, tblPart)}
+	}
+	return nil
+}
+
+// execAlterSequence handles ALTER SEQUENCE statements. M0097-0068.
 func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
+	name := s.Name.String()
+	seq := LookupSequence(name)
+	if seq == nil {
+		if s.IfExists {
+			return nil
+		}
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", name)}
+	}
+
+	// Snapshot current state for sticky-default computation.
+	seq.mu.Lock()
+	curMin := seq.min
+	curMax := seq.max
+	curDataType := seq.dataType
+	seq.mu.Unlock()
+	if curDataType == "" {
+		curDataType = "bigint"
+	}
+
+	var minV, maxV *int64
+	if s.DataType != "" {
+		// "Sticky default" semantics: bounds that equal the old type's extremes are
+		// updated to the new type's extremes; explicitly-set bounds are preserved.
+		// Mirrors PostgreSQL's ALTER SEQUENCE ... AS type behaviour. M0097-0068.
+		oldMin, oldMax := seqTypeBounds(curDataType)
+		newMin, newMax := seqTypeBounds(s.DataType)
+
+		if curMin == oldMin {
+			v := newMin
+			minV = &v
+		}
+		if curMax == oldMax {
+			v := newMax
+			maxV = &v
+		}
+	}
+	// Explicit MINVALUE / MAXVALUE override sticky defaults.
+	if s.MinValue != nil {
+		minV = s.MinValue
+	}
+	if s.MaxValue != nil {
+		maxV = s.MaxValue
+	}
+
+	// Validate new bounds against the target type range.
+	if s.DataType != "" {
+		newMin, newMax := seqTypeBounds(s.DataType)
+		canon := canonSeqType(s.DataType)
+		effectiveMin := curMin
+		if minV != nil {
+			effectiveMin = *minV
+		}
+		effectiveMax := curMax
+		if maxV != nil {
+			effectiveMax = *maxV
+		}
+		if effectiveMin < newMin || effectiveMin > newMax {
+			return &ExecError{Code: "22003", Pos: s.Pos(),
+				Message: fmt.Sprintf("MINVALUE (%d) is out of range for sequence data type %s", effectiveMin, canon)}
+		}
+		if effectiveMax < newMin || effectiveMax > newMax {
+			return &ExecError{Code: "22003", Pos: s.Pos(),
+				Message: fmt.Sprintf("MAXVALUE (%d) is out of range for sequence data type %s", effectiveMax, canon)}
+		}
+	}
+
+	// Validate RESTART WITH against the effective [min, max]. M0097-0068.
+	if s.RestartWith != nil {
+		// Determine effective min/max after any pending changes.
+		seq.mu.Lock()
+		effectiveMin2, effectiveMax2 := seq.min, seq.max
+		seq.mu.Unlock()
+		if minV != nil {
+			effectiveMin2 = *minV
+		}
+		if maxV != nil {
+			effectiveMax2 = *maxV
+		}
+		rv := *s.RestartWith
+		if rv < effectiveMin2 {
+			return &ExecError{Code: "22003", Pos: s.Pos(),
+				Message: fmt.Sprintf("RESTART value (%d) cannot be less than MINVALUE (%d)", rv, effectiveMin2)}
+		}
+		if rv > effectiveMax2 {
+			return &ExecError{Code: "22003", Pos: s.Pos(),
+				Message: fmt.Sprintf("RESTART value (%d) cannot be greater than MAXVALUE (%d)", rv, effectiveMax2)}
+		}
+	}
+
+	if err := UpdateSequenceParams(name, s.Increment, minV, maxV, s.StartWith, s.RestartWith,
+		s.Restart, s.Cycle, s.NoCycle); err != nil {
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
+	}
+	if s.DataType != "" {
+		SetSequenceDataType(name, s.DataType)
+	}
 	if s.OwnedBy != "" {
-		SetSequenceOwnedBy(s.Name.String(), s.OwnedBy)
+		SetSequenceOwnedBy(name, s.OwnedBy)
+	} else if s.ClearOwnedBy {
+		SetSequenceOwnedBy(name, "")
 	}
 	return nil
 }

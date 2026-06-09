@@ -1708,6 +1708,21 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				if op != OpUnknown {
 					pos := t.Pos
 					p.advance() // consume the operator token
+					// `expr ~ ANY(array)` / `expr ~* ANY(array)` etc. — ScalarArrayOpExpr.
+					// Desugar to InExpr with AnyOp set so the executor applies the
+					// operator element-wise and OR-s the results. M0097-0068.
+					if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAny {
+						p.advance() // ANY
+						inExpr, err := p.parseAnyTail(left, pos)
+						if err != nil {
+							return nil, err
+						}
+						if ie, ok := inExpr.(*InExpr); ok {
+							ie.AnyOp = op
+						}
+						left = inExpr
+						continue
+					}
 					rhs, err := p.parseExprPrec(precCompare + 1)
 					if err != nil {
 						return nil, err

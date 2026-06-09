@@ -44,6 +44,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newProjectSetOp(p, child)), nil
 	case *planner.ScalarFuncScan:
 		return maybeInstrument(p, newScalarFuncScanOp(p)), nil
+	case *planner.PgPartitionTree:
+		return maybeInstrument(p, newPgPartitionTreeOp(p)), nil
 	case *planner.CTEScan:
 		// CTEScan wraps the inlined CTE body. Use cteScanOp which materializes
 		// all rows on first Open() and replays them on subsequent Open() calls

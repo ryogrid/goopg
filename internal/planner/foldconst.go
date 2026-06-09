@@ -63,7 +63,7 @@ func FoldConstants(e Expr) Expr {
 		for i, item := range x.List {
 			folded[i] = FoldConstants(item)
 		}
-		return &InExpr{pos: x.pos, Operand: FoldConstants(x.Operand), Negated: x.Negated, NotEqualAny: x.NotEqualAny, Plan: x.Plan, List: folded, IsNonCorrelated: x.IsNonCorrelated}
+		return &InExpr{pos: x.pos, Operand: FoldConstants(x.Operand), Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, Plan: x.Plan, List: folded, IsNonCorrelated: x.IsNonCorrelated}
 
 	case *FuncCall:
 		foldedArgs := make([]Expr, len(x.Args))

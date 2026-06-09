@@ -100,8 +100,11 @@ type InExpr struct {
 	Operand     Expr
 	Negated     bool        // NOT IN
 	NotEqualAny bool        // != ANY semantics (OR of != comparisons). M0097-0067.
-	Subquery    *SelectStmt // populated for IN (subquery)
-	List        []Expr      // populated for IN (val_list)
+	// AnyOp, when non-zero, indicates `left op ANY(array)` with the given operator.
+	// Used for non-equality ANY predicates such as `col ~ ANY(ARRAY[...])`.
+	AnyOp    OpCode
+	Subquery *SelectStmt // populated for IN (subquery)
+	List     []Expr      // populated for IN (val_list)
 }
 
 func (e *InExpr) Pos() int { return e.pos }

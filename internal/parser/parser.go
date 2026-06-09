@@ -1192,6 +1192,20 @@ func (p *parser) parseSet() (Stmt, error) {
 	if p.acceptKeyword(KwLocal) {
 		s.Local = true
 		isLocal = true
+		// SET LOCAL SESSION AUTHORIZATION rolename — accept as session_authorization GUC.
+		if p.acceptKeyword(KwSession) {
+			if p.acceptIdentKeyword("authorization") {
+				s.Name = "session_authorization"
+				if p.acceptKeyword(KwDefault) {
+					s.Default = true
+				} else {
+					roleTok, _ := p.parseIdent()
+					s.Value = roleTok.Value
+				}
+				return s, nil
+			}
+			// SET LOCAL SESSION TRANSACTION ... — treat SESSION as having been consumed.
+		}
 	} else if p.acceptKeyword(KwSession) {
 		// SET SESSION AUTHORIZATION name — store the role name in s.Value so
 		// the executor can update the session's non-superuser role tracking.
