@@ -170,6 +170,28 @@ jobs:
             ./bench/tpch/cmd/hammerdb_load/...
 
       # ------------------------------------------------------------------ #
+      # TPC-H query run at 2,000,000 orders
+      # TestTPCHScaleLoadAndQueryRun spins up its own in-process goopg
+      # cluster, generates + bulk-loads a 2 M-order TPC-H dataset across
+      # all eight tables (orders + ~8 M lineitems plus SF-scaled
+      # dimensions), then runs every Q1..Q22 against it, asserting each
+      # query executes without an executor error at scale.
+      #
+      # This package (internal/testutil/tpch) is in the unit-step EXCLUDE
+      # list because it is cluster-backed, so it is run here by explicit
+      # path + -run. Heavy: ~20 min load plus query time at 2 M orders;
+      # the 120 m timeout leaves headroom for the slowest queries (Q9).
+      # The dataset size is overridable via GOOPG_TPCH_ORDERS and the
+      # query set via GOOPG_TPCH_QUERIES (see the test's doc comment).
+      # ------------------------------------------------------------------ #
+      - name: TPC-H query run (2,000,000 orders)
+        run: |
+          go test -v \
+            -run TestTPCHScaleLoadAndQueryRun \
+            -timeout 120m \
+            ./internal/testutil/tpch/
+
+      # ------------------------------------------------------------------ #
       # Diagnostics
       # ------------------------------------------------------------------ #
       - name: Dump goopg server log on failure
