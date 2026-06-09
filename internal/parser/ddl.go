@@ -588,6 +588,10 @@ func (p *parser) parseCreateOpClassTail(pos int) (Stmt, error) {
 			} else if p.cur().Kind == TokenIdent {
 				p.advance() // bare identifier operator
 			}
+			// Skip optional operand type list: (type, type).
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				p.skipBalancedParens()
+			}
 		} else if isFunction {
 			p.advance() // consume "function"
 			numTok := p.cur()
@@ -1273,6 +1277,8 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				// We track depth so nested parens (e.g. DEFAULT values) are skipped.
 				depth := 1
 				var curColName string
+				inTableConstraint := false
+				seenCols := make(map[string]bool)
 				for depth > 0 && p.cur().Kind != TokenEOF {
 					t := p.cur()
 					if t.Kind == TokenSymbol && t.Value == "(" {
@@ -1285,13 +1291,84 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						}
 					} else if depth == 1 && t.Kind == TokenSymbol && t.Value == "," {
 						curColName = ""
+						inTableConstraint = false
 						p.advance()
-					} else if depth == 1 && curColName == "" && (t.Kind == TokenIdent || t.Kind == TokenKeyword) {
+					} else if depth == 1 && !inTableConstraint && curColName == "" && t.Kind == TokenKeyword &&
+						t.Keyword == KwConstraint {
+						// Table-level CONSTRAINT name CHECK (expr) in PARTITION OF column list.
+						// Parse name + CHECK expression if present; otherwise skip.
+						p.advance() // consume CONSTRAINT
+						var constraintName string
+						if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+							constraintName = p.cur().Value
+							p.advance()
+						}
+						if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
+							p.advance() // consume CHECK
+							// Collect the expression text inside the balanced parens.
+							if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+								p.advance() // consume opening (
+								var exprTokens []string
+								exprDepth := 1
+								for exprDepth > 0 && p.cur().Kind != TokenEOF {
+									tok := p.cur()
+									if tok.Kind == TokenSymbol && tok.Value == "(" {
+										exprDepth++
+										exprTokens = append(exprTokens, tok.Value)
+										p.advance()
+									} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+										exprDepth--
+										if exprDepth > 0 {
+											exprTokens = append(exprTokens, tok.Value)
+										}
+										p.advance()
+									} else {
+										exprTokens = append(exprTokens, tok.Value)
+										p.advance()
+									}
+								}
+								if constraintName != "" {
+									poc.CheckConstraints = append(poc.CheckConstraints, PartitionCheckConstraint{
+										Name: constraintName,
+										Expr: strings.Join(exprTokens, " "),
+									})
+								}
+							}
+						}
+						inTableConstraint = true
+					} else if depth == 1 && !inTableConstraint && curColName == "" && t.Kind == TokenKeyword &&
+						(t.Keyword == KwCheck || t.Keyword == KwPrimary || t.Keyword == KwForeign) {
+						// Other table-level constraint (CHECK without CONSTRAINT name, FK, PK) — skip.
+						inTableConstraint = true
+						p.advance()
+					} else if depth == 1 && !inTableConstraint && curColName == "" && (t.Kind == TokenIdent || t.Kind == TokenKeyword) {
+						colLower := strings.ToLower(t.Value)
+						if seenCols[colLower] && poc.DuplicateColumn == "" {
+							poc.DuplicateColumn = t.Value
+						}
+						seenCols[colLower] = true
 						curColName = t.Value
 						p.advance()
-					} else if depth == 1 && t.Kind == TokenKeyword && t.Keyword == KwUnique && curColName != "" {
+					} else if depth == 1 && !inTableConstraint && t.Kind == TokenKeyword && t.Keyword == KwUnique && curColName != "" {
 						poc.UniqueColumns = append(poc.UniqueColumns, curColName)
 						p.advance()
+					} else if depth == 1 && !inTableConstraint && t.Kind == TokenKeyword && t.Keyword == KwNot && curColName != "" {
+						// NOT NULL constraint in PARTITION OF column override list.
+						p.advance()
+						if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull {
+							poc.NotNullColumns = append(poc.NotNullColumns, curColName)
+							p.advance()
+						}
+					} else if depth == 1 && !inTableConstraint && t.Kind == TokenKeyword && t.Keyword == KwDefault && curColName != "" {
+						// DEFAULT expr override in PARTITION OF column override list.
+						p.advance()
+						expr, err := p.parseExpr()
+						if err == nil {
+							poc.ColDefaults = append(poc.ColDefaults, PartitionColDefault{
+								ColName: curColName,
+								Expr:    expr,
+							})
+						}
 					} else {
 						p.advance()
 					}
@@ -1414,14 +1491,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				if !p.acceptSymbol("(") {
 					return nil, p.errAtCur("expected '(' after partition method")
 				}
-				keyCols, keyExprs, opClasses, err2 := p.parsePartitionKeyCols()
+				keyCols, keyExprs, opClasses, colls, err2 := p.parsePartitionKeyCols()
 				if err2 != nil {
 					return nil, err2
 				}
 				if !p.acceptSymbol(")") {
 					return nil, p.errAtCur("expected ')'")
 				}
-				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses}
+				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
 			}
 		}
 		// ON COMMIT clause may follow FOR VALUES ... in partition tables.
@@ -1433,6 +1510,41 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			}
 		}
 		return stmt, nil
+	}
+
+	// CREATE TABLE name WITH (opts) AS SELECT … (CTAS with pre-AS storage params).
+	// Handle WITH clause that precedes AS rather than following column definitions.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith {
+		savedIdx := p.idx
+		p.advance()
+		if opts, err := p.parseWithOptions(); err == nil {
+			stmt.With = opts
+			if v, ok := opts["oids"]; ok {
+				stmt.WithOIDS = !strings.EqualFold(v, "false") && v != "0"
+			}
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
+				p.advance()
+				sel, err2 := p.parseSelect()
+				if err2 != nil {
+					return nil, err2
+				}
+				if ss, ok := sel.(*SelectStmt); ok {
+					stmt.SelectSource = ss
+				}
+				if p.acceptKeyword(KwWith) {
+					if p.acceptIdentKeyword("no") {
+						_ = p.acceptIdentKeyword("data")
+						stmt.WithNoData = true
+					} else {
+						_ = p.acceptIdentKeyword("data")
+					}
+				}
+				return stmt, nil
+			}
+			// WITH without following AS: fall through (opts already consumed).
+		} else {
+			p.idx = savedIdx
+		}
 	}
 
 	// Regular CREATE TABLE with column definitions
@@ -1529,6 +1641,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			// Accept optional NO INHERIT.
 			if p.acceptIdentKeyword("no") {
 				_ = p.acceptIdentKeyword("inherit")
+				stmt.TableHasNoInheritCheck = true
 			}
 		} else if p.acceptIdentKeyword("exclude") {
 			// Anonymous EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
@@ -1618,7 +1731,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				if err != nil {
 					return nil, err
 				}
-				stmt.TableChecks = append(stmt.TableChecks, expr)
+				if constraintName != "" {
+					// Named CHECK constraint: store with its name for pg_constraint.
+					stmt.TableNamedChecks = append(stmt.TableNamedChecks, PartitionCheckConstraint{
+						Name: constraintName, Expr: expr,
+					})
+				} else {
+					stmt.TableChecks = append(stmt.TableChecks, expr)
+				}
 				if p.acceptKeyword(KwNot) {
 					_ = p.acceptIdentKeyword("enforced")
 				} else {
@@ -1627,6 +1747,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				// Accept optional NO INHERIT (CONSTRAINT name CHECK NO INHERIT).
 				if p.acceptIdentKeyword("no") {
 					_ = p.acceptIdentKeyword("inherit")
+					stmt.TableHasNoInheritCheck = true
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
 				// Already handled by FK parsing in parseColumnDef / REFERENCES
@@ -1734,6 +1855,26 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		}
 		break
 	}
+	// INHERITS (parent [, …]) — table inheritance. Must come before PARTITION BY
+	// to match PG grammar order.
+	if p.acceptIdentKeyword("inherits") {
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after INHERITS")
+		}
+		for {
+			name, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Inherits = append(stmt.Inherits, name)
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')'")
+		}
+	}
 	// Optional PARTITION BY {LIST|RANGE|HASH} (col, …) (M0096-0007)
 	if p.acceptKeyword(KwPartition) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
@@ -1760,14 +1901,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			return nil, p.errAtCur("expected '(' after partition method")
 		}
 		// Parse column names (or expressions) with optional operator class names. M0097-0015/M0097-0027/M0097-0023.
-		keyCols, keyExprs, opClasses, err2 := p.parsePartitionKeyCols()
+		keyCols, keyExprs, opClasses, colls, err2 := p.parsePartitionKeyCols()
 		if err2 != nil {
 			return nil, err2
 		}
 		if !p.acceptSymbol(")") {
 			return nil, p.errAtCur("expected ')'")
 		}
-		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses}
+		stmt.PartitionBy = &PartitionByClause{pos: pos, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
 	}
 	if p.acceptKeyword(KwWith) {
 		opts, err := p.parseWithOptions()
@@ -1781,27 +1922,6 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		// honour tablespaces yet.
 		if _, err := p.parseIdent(); err != nil {
 			return nil, err
-		}
-	}
-	// INHERITS (parent [, …]) — table inheritance. Accept and record parent names.
-	// Full inheritance semantics land in M0096-0009; for now, the syntax is accepted
-	// so that `CREATE TABLE c () INHERITS (p)` does not produce a parse error.
-	if p.acceptIdentKeyword("inherits") {
-		if !p.acceptSymbol("(") {
-			return nil, p.errAtCur("expected '(' after INHERITS")
-		}
-		for {
-			name, err := p.parseObjectName()
-			if err != nil {
-				return nil, err
-			}
-			stmt.Inherits = append(stmt.Inherits, name)
-			if !p.acceptSymbol(",") {
-				break
-			}
-		}
-		if !p.acceptSymbol(")") {
-			return nil, p.errAtCur("expected ')'")
 		}
 	}
 	// ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP } for temp tables.
@@ -1845,16 +1965,12 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 			}
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith:
 			p.advance()
-			// Handle: WITH OIDS (no parens) and WITH (oids), WITH (oids = true/false).
-			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "oids") {
-				// WITH OIDS form — no parens; note as oids=true.
-				p.advance()
-				stmt.WithOIDS = true
-			} else {
-				opts, _ := p.parseWithOptions()
-				if v, ok := opts[strings.ToLower("oids")]; ok {
-					stmt.WithOIDS = !strings.EqualFold(v, "false") && v != "0"
-				}
+			// WITH OIDS (no parens) is a syntax error in PG; only WITH (oids) is accepted.
+			// If parseWithOptions fails (no '('), the token stays unread, the default case
+			// fires, and the upper-level parser emits "syntax error at or near OIDS".
+			opts, _ := p.parseWithOptions()
+			if v, ok := opts[strings.ToLower("oids")]; ok {
+				stmt.WithOIDS = !strings.EqualFold(v, "false") && v != "0"
 			}
 		case p.acceptIdentKeyword("without"):
 			// WITHOUT OIDS — accepted and silently ignored.
@@ -1879,12 +1995,13 @@ func (p *parser) consumeCreateTableSuffix(stmt *CreateTableStmt) {
 // parsePartitionKeyCols parses the column-list (and possibly expression-list)
 // inside PARTITION BY (key1, key2, ...). Each key may be either a plain column
 // name or a parenthesised expression such as (abs(b)) or ((a+b)/2). M0097-0023.
-func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opClasses []string, err error) {
+func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opClasses []string, collations []string, err error) {
 	for {
 		var colName string
 		var expr Expr
+		var collation string
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-			// Expression key: consume the outer '(' and parse a full expression.
+			// Explicitly parenthesised expression key: (b+1), (a+b), etc.
 			p.advance()
 			expr, err = p.parseExpr()
 			if err != nil {
@@ -1895,13 +2012,26 @@ func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opC
 				return
 			}
 		} else {
-			// Plain column name.
-			var col Token
-			col, err = p.parseIdent()
+			// Parse a full expression.  For plain column names this yields a
+			// ColumnRef; for function-call keys like abs(a) or COLLATE expressions
+			// like (a collate "C") we get a richer node.
+			expr, err = p.parseExpr()
 			if err != nil {
 				return
 			}
-			colName = identText(col)
+			// Unwrap: ColumnRef → plain column name (most common case).
+			// CollateExpr wrapping a ColumnRef → use column name + store collation.
+			switch v := expr.(type) {
+			case *ColumnRef:
+				colName = v.Column
+				expr = nil
+			case *CollateExpr:
+				if cr, ok := v.Operand.(*ColumnRef); ok {
+					colName = cr.Column
+					collation = v.CollationName
+					expr = nil
+				}
+			}
 		}
 		keyCols = append(keyCols, colName)
 		keyExprs = append(keyExprs, expr)
@@ -1912,6 +2042,7 @@ func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opC
 			p.advance()
 		}
 		opClasses = append(opClasses, opClass)
+		collations = append(collations, collation)
 		if !p.acceptSymbol(",") {
 			break
 		}
@@ -2507,10 +2638,12 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 	// Optional WHERE predicate (partial index) — parse and record.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhere {
 		p.advance()
-		if _, err := p.parseExpr(); err != nil {
+		pred, err := p.parseExpr()
+		if err != nil {
 			return nil, err
 		}
 		stmt.HasPredicate = true
+		stmt.Predicate = pred
 	}
 	return stmt, nil
 }
@@ -3890,7 +4023,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			stmt.SetLogged = "logged"
 			return stmt, nil
 		}
-		if p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "unlogged") {
+		if (p.peek(1).Kind == TokenIdent || p.peek(1).Kind == TokenKeyword) && strings.EqualFold(p.peek(1).Value, "unlogged") {
 			p.advance() // SET
 			p.advance() // UNLOGGED
 			stmt.SetLogged = "unlogged"

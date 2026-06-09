@@ -1115,6 +1115,13 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 		if baseTyp.Name == "" || strings.EqualFold(baseTyp.Name, "unknown") {
 			return catalog.Type{Name: "unknown"}, nil
 		}
+		// Vector types: subscript returns the scalar element type.
+		switch strings.ToLower(baseTyp.Name) {
+		case "int2vector":
+			return catalog.Type{Name: "int2"}, nil
+		case "oidvector":
+			return catalog.Type{Name: "oid"}, nil
+		}
 		return catalog.Type{Name: "text"}, nil
 	case *parser.IndirectionStar:
 		// `(expr).*` — record/composite star expansion. The planner
@@ -1439,6 +1446,13 @@ func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Col
 			colName = colAliases[0]
 		}
 		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "text[]"}, Ordinal: 0}}
+	case "pg_partition_ancestors":
+		// pg_partition_ancestors(regclass) → SETOF regclass, output column named "relid". M0097-0023.
+		colName := "relid"
+		if len(colAliases) > 0 && colAliases[0] != "" {
+			colName = colAliases[0]
+		}
+		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "oid"}, Ordinal: 0}}
 	default:
 		// generate_series and unknown SRFs: 1 int8 column named after
 		// the alias. Preserves pre-M0103-0008 behaviour.

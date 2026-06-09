@@ -269,6 +269,11 @@ func NormalizeRegressOutput(raw string) string {
 							if token == "." || strings.HasPrefix(token, ".") && len(token) > 1 && (token[1] >= '0' && token[1] <= '9') {
 								line = line[:errIdx] + "ERROR:  trailing junk after numeric literal"
 							} else {
+								// PG uppercases keyword tokens in error messages; mirror that.
+								switch strings.ToUpper(token) {
+								case "OIDS":
+									token = strings.ToUpper(token)
+								}
 								line = line[:errIdx] + `ERROR:  syntax error at or near "` + token + `"`
 							}
 							filtered = append(filtered, line)

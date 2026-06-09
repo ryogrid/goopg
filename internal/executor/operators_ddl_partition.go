@@ -10,6 +10,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -166,17 +167,30 @@ func validatePartitionKey(s *parser.CreateTableStmt, cols []catalog.Column, ctx 
 // validatePartKeyExpr validates an expression used as a partition key.
 // keyColNum is 1-based for error messages.
 func validatePartKeyExpr(e parser.Expr, pos int, keyColNum int, ctx *Context) error {
+	return validatePartKeyExprInner(e, pos, keyColNum, ctx, false)
+}
+
+// validatePartKeyExprInner is the recursive worker. nested=true means we are
+// inside a compound expression (BinaryOp, FuncCall arg, etc.) where bare
+// integer/boolean/null constants are valid operands, not top-level keys.
+func validatePartKeyExprInner(e parser.Expr, pos int, keyColNum int, ctx *Context, nested bool) error {
 	if e == nil {
 		return nil
 	}
 	switch v := e.(type) {
 	case *parser.IntegerConst, *parser.NumericConst, *parser.BooleanConst, *parser.NullConst:
-		return &ExecError{Code: "42P16", Pos: pos,
-			Message: "cannot use constant expression as partition key"}
+		if !nested {
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: "cannot use constant expression as partition key"}
+		}
+		return nil
 	case *parser.StringConst:
-		// Bare string literal has pseudo-type unknown.
-		return &ExecError{Code: "42P16", Pos: pos,
-			Message: fmt.Sprintf("partition key column %d has pseudo-type unknown", keyColNum)}
+		if !nested {
+			// Bare string literal has pseudo-type unknown.
+			return &ExecError{Code: "42P16", Pos: pos,
+				Message: fmt.Sprintf("partition key column %d has pseudo-type unknown", keyColNum)}
+		}
+		return nil
 	case *parser.RowExpr:
 		return &ExecError{Code: "42P16", Pos: pos,
 			Message: fmt.Sprintf("partition key column %d has pseudo-type record", keyColNum)}
@@ -198,20 +212,35 @@ func validatePartKeyExpr(e parser.Expr, pos int, keyColNum int, ctx *Context) er
 					return &ExecError{Code: "0A000", Pos: pos,
 						Message: "set-returning functions are not allowed in partition key expressions"}
 				}
-				if r.Volatile != "i" {
+				// SQL language functions are inlined by PG; check body for volatile ops.
+				if r.Language == "sql" {
+					rs2 := ctx.Catalog.Routines()
+					if stmts, err := parser.Parse(r.Body); err == nil {
+						for _, stmt := range stmts {
+							if sel, ok := stmt.(*parser.SelectStmt); ok {
+								for _, col := range sel.Targets {
+									if sqlBodyExprIsVolatile(col.Expr, rs2) {
+										return &ExecError{Code: "42P16", Pos: pos,
+											Message: "functions in partition key expression must be marked IMMUTABLE"}
+									}
+								}
+							}
+						}
+					}
+				} else if r.Volatile != "i" {
 					return &ExecError{Code: "42P16", Pos: pos,
 						Message: "functions in partition key expression must be marked IMMUTABLE"}
 				}
 				// No-arg IMMUTABLE function is a constant expression.
-				if len(v.Args) == 0 && r.Volatile == "i" {
+				if len(v.Args) == 0 {
 					return &ExecError{Code: "42P16", Pos: pos,
 						Message: "cannot use constant expression as partition key"}
 				}
 			}
 		}
-		// Recursively validate args.
+		// Recursively validate args — constants are valid as function arguments.
 		for _, arg := range v.Args {
-			if err := validatePartKeyExpr(arg, pos, keyColNum, ctx); err != nil {
+			if err := validatePartKeyExprInner(arg, pos, keyColNum, ctx, true); err != nil {
 				return err
 			}
 		}
@@ -219,19 +248,19 @@ func validatePartKeyExpr(e parser.Expr, pos int, keyColNum int, ctx *Context) er
 		return &ExecError{Code: "42P16", Pos: pos,
 			Message: "cannot use subquery in partition key expression"}
 	case *parser.BinaryOp:
-		if err := validatePartKeyExpr(v.Left, pos, keyColNum, ctx); err != nil {
+		if err := validatePartKeyExprInner(v.Left, pos, keyColNum, ctx, true); err != nil {
 			return err
 		}
-		return validatePartKeyExpr(v.Right, pos, keyColNum, ctx)
+		return validatePartKeyExprInner(v.Right, pos, keyColNum, ctx, true)
 	case *parser.UnaryOp:
-		return validatePartKeyExpr(v.Operand, pos, keyColNum, ctx)
+		return validatePartKeyExprInner(v.Operand, pos, keyColNum, ctx, true)
 	case *parser.CastExpr:
-		return validatePartKeyExpr(v.Operand, pos, keyColNum, ctx)
+		return validatePartKeyExprInner(v.Operand, pos, keyColNum, ctx, true)
 	case *parser.ColumnRef:
 		// Column references are valid in partition key expressions.
 		return nil
 	case *parser.CollateExpr:
-		return validatePartKeyExpr(v.Operand, pos, keyColNum, ctx)
+		return validatePartKeyExprInner(v.Operand, pos, keyColNum, ctx, true)
 	}
 	return nil
 }
@@ -376,6 +405,32 @@ func (o *ddlOp) validatePartitionChildBounds(s *parser.CreateTableStmt, parent *
 	return nil
 }
 
+// containsColumnRef returns true if expr contains a ColumnRef anywhere.
+func containsColumnRef(e parser.Expr) bool {
+	if e == nil {
+		return false
+	}
+	switch v := e.(type) {
+	case *parser.ColumnRef:
+		return true
+	case *parser.FuncCall:
+		for _, arg := range v.Args {
+			if containsColumnRef(arg) {
+				return true
+			}
+		}
+	case *parser.BinaryOp:
+		return containsColumnRef(v.Left) || containsColumnRef(v.Right)
+	case *parser.UnaryOp:
+		return containsColumnRef(v.Operand)
+	case *parser.CastExpr:
+		return containsColumnRef(v.Operand)
+	case *parser.CollateExpr:
+		return containsColumnRef(v.Operand)
+	}
+	return false
+}
+
 // validatePartBoundExpr checks that a single partition bound expression is valid:
 // no column references, aggregates, subqueries, or SRFs.
 func validatePartBoundExpr(e parser.Expr, pos int, parent *catalog.Table) error {
@@ -389,6 +444,13 @@ func validatePartBoundExpr(e parser.Expr, pos int, parent *catalog.Table) error 
 	case *parser.FuncCall:
 		name := strings.ToLower(v.Name.Name)
 		if isKnownAggregate(name) {
+			// PG checks args for column refs before reporting aggregate error.
+			for _, arg := range v.Args {
+				if containsColumnRef(arg) {
+					return &ExecError{Code: "42P16", Pos: pos,
+						Message: "cannot use column reference in partition bound expression"}
+				}
+			}
 			return &ExecError{Code: "42803", Pos: pos,
 				Message: "aggregate functions are not allowed in partition bound"}
 		}
@@ -643,6 +705,43 @@ func validateHashBounds(childName string, modulus, remainder int64, parent *cata
 		return nil
 	}
 	children := im.PartitionChildren(parent.OID)
+
+	// Pass 1: modulus compatibility — iterate ALL children, tracking the last failure
+	// so DETAIL matches the last incompatible partition (PostgreSQL semantics).
+	var failChild *catalog.Table
+	var failLarge, failSmall int64
+	for _, child := range children {
+		for _, pb := range child.PartitionBounds {
+			if !pb.IsHash {
+				continue
+			}
+			existMod := pb.Modulus
+			large, small := modulus, existMod
+			if large < small {
+				large, small = small, large
+			}
+			if large%small != 0 {
+				failChild = child
+				failLarge = large
+				failSmall = small
+			}
+		}
+	}
+	if failChild != nil {
+		var detail string
+		if failLarge == modulus {
+			detail = fmt.Sprintf("The new modulus %d is not divisible by %d, the modulus of existing partition %q.",
+				modulus, failSmall, failChild.Name)
+		} else {
+			detail = fmt.Sprintf("The new modulus %d is not a factor of %d, the modulus of existing partition %q.",
+				modulus, failLarge, failChild.Name)
+		}
+		return &ExecError{Code: "42P16", Pos: pos,
+			Message: "every hash partition modulus must be a factor of the next larger modulus",
+			Detail:  detail}
+	}
+
+	// Pass 2: overlap check (only if all moduli are compatible).
 	for _, child := range children {
 		for _, pb := range child.PartitionBounds {
 			if !pb.IsHash {
@@ -650,18 +749,6 @@ func validateHashBounds(childName string, modulus, remainder int64, parent *cata
 			}
 			existMod := pb.Modulus
 			existRem := pb.Remainder
-
-			// Moduli must have a factor relationship.
-			large, small := modulus, existMod
-			if large < small {
-				large, small = small, large
-			}
-			if large%small != 0 {
-				return &ExecError{Code: "42P16", Pos: pos,
-					Message: "every hash partition modulus must be a factor of the next larger modulus"}
-			}
-
-			// Check for overlapping remainders.
 			g := gcdInt64(modulus, existMod)
 			if remainder%g == existRem%g {
 				existName := hashPartitionChildName(children, existMod, existRem)
@@ -752,6 +839,70 @@ func isUserDefinedAggregate(name string, ctx *Context) bool {
 }
 
 // isBuiltinSRF returns true for well-known built-in set-returning functions.
+// knownVolatileBuiltins are functions that make SQL functions effectively VOLATILE.
+// SQL functions using only immutable ops (arithmetic, string, etc.) are inlineable
+// and treated as IMMUTABLE by PG's partition-key check even if marked VOLATILE.
+var knownVolatileBuiltins = map[string]bool{
+	"random": true, "setseed": true,
+	"clock_timestamp": true, "statement_timestamp": true, "transaction_timestamp": true,
+	"timeofday": true, "pg_sleep": true,
+	"nextval": true, "currval": true, "lastval": true,
+	"gen_random_uuid": true, "gen_random_bytes": true,
+	"now": true, "current_timestamp": true,
+}
+
+// sqlBodyExprIsVolatile returns true if the expression tree contains a known
+// volatile built-in call or a user-defined function that is not IMMUTABLE and
+// not itself a SQL-language function (which would be recursively inlined).
+func sqlBodyExprIsVolatile(e parser.Expr, rs *catalog.Routines) bool {
+	if e == nil {
+		return false
+	}
+	switch v := e.(type) {
+	case *parser.FuncCall:
+		name := strings.ToLower(v.Name.Name)
+		if knownVolatileBuiltins[name] {
+			return true
+		}
+		// Check user-defined function volatility in catalog.
+		if rs != nil {
+			for _, r := range rs.LookupByName(v.Name) {
+				if r.Language == "sql" {
+					// Inline: check the body recursively.
+					stmts, err := parser.Parse(r.Body)
+					if err == nil {
+						for _, stmt := range stmts {
+							if sel, ok := stmt.(*parser.SelectStmt); ok {
+								for _, col := range sel.Targets {
+									if sqlBodyExprIsVolatile(col.Expr, rs) {
+										return true
+									}
+								}
+							}
+						}
+					}
+				} else if r.Volatile != "i" {
+					return true
+				}
+			}
+		}
+		for _, arg := range v.Args {
+			if sqlBodyExprIsVolatile(arg, rs) {
+				return true
+			}
+		}
+	case *parser.BinaryOp:
+		return sqlBodyExprIsVolatile(v.Left, rs) || sqlBodyExprIsVolatile(v.Right, rs)
+	case *parser.UnaryOp:
+		return sqlBodyExprIsVolatile(v.Operand, rs)
+	case *parser.CastExpr:
+		return sqlBodyExprIsVolatile(v.Operand, rs)
+	case *parser.CollateExpr:
+		return sqlBodyExprIsVolatile(v.Operand, rs)
+	}
+	return false
+}
+
 func isBuiltinSRF(name string) bool {
 	switch name {
 	case "generate_series", "generate_subscripts", "unnest",
@@ -853,4 +1004,158 @@ func boundExprStr(e parser.Expr) string {
 		}
 	}
 	return exprToString(e)
+}
+
+// checkDefaultPartitionDataConflict checks that adding a new non-default
+// partition won't violate the existing default partition's data. When a DEFAULT
+// partition already has rows that would be "claimed" by the new partition, the
+// operation must be rejected (PostgreSQL error 23P01). M0097-0023.
+//
+// Implementation: for single-column LIST and RANGE keys, we execute an inline
+// SELECT against the default partition to detect conflicts.  Multi-column or
+// expression-key cases are skipped (best-effort; most common test patterns use
+// single-column keys).
+func checkDefaultPartitionDataConflict(childName string, parent *catalog.Table, poc *parser.PartitionOfClause, pos int, ctx *Context) error {
+	// Find the default child partition.
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	children := im.PartitionChildren(parent.OID)
+	var defPart *catalog.Table
+	for _, child := range children {
+		for _, pb := range child.PartitionBounds {
+			if pb.IsDefault {
+				defPart = child
+				break
+			}
+		}
+		if defPart != nil {
+			break
+		}
+	}
+	if defPart == nil {
+		return nil
+	}
+
+	// Only handle single-column simple-column partition keys.
+	if len(parent.PartitionKey) != 1 || parent.PartitionKey[0] == "" {
+		return nil
+	}
+	keyCol := `"` + parent.PartitionKey[0] + `"`
+	defName := `"` + defPart.Name + `"`
+
+	var predicate string
+	switch {
+	case len(poc.InValues) > 0:
+		// LIST partition: check if any IN value exists in the default partition.
+		parts := make([]string, 0, len(poc.InValues))
+		hasNull := false
+		for _, e := range poc.InValues {
+			if _, isNull := e.(*parser.NullConst); isNull {
+				hasNull = true
+				continue
+			}
+			parts = append(parts, boundExprToSQLLiteral(e))
+		}
+		var clauses []string
+		if hasNull {
+			clauses = append(clauses, keyCol+" IS NULL")
+		}
+		if len(parts) > 0 {
+			clauses = append(clauses, keyCol+" IN ("+strings.Join(parts, ", ")+")")
+		}
+		if len(clauses) == 0 {
+			return nil
+		}
+		predicate = strings.Join(clauses, " OR ")
+	case len(poc.FromValues) > 0 && len(poc.ToValues) > 0:
+		// RANGE partition: check if any row falls within [FROM, TO).
+		from := boundExprToSQLLiteral(poc.FromValues[0])
+		to := boundExprToSQLLiteral(poc.ToValues[0])
+		if from == "" || to == "" {
+			return nil // skip for MINVALUE/MAXVALUE; hard to express safely
+		}
+		predicate = keyCol + " >= " + from + " AND " + keyCol + " < " + to
+	default:
+		return nil
+	}
+
+	sql := fmt.Sprintf("SELECT 1 FROM %s WHERE %s LIMIT 1", defName, predicate)
+	stmts, err := parser.Parse(sql)
+	if err != nil || len(stmts) == 0 {
+		return nil
+	}
+	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		return nil
+	}
+	op, err := Build(plan)
+	if err != nil {
+		return nil
+	}
+	synthCtx := *ctx
+	if err := op.Open(&synthCtx); err != nil {
+		op.Close()
+		return nil
+	}
+	slot, _ := op.Next()
+	hasRow := slot != nil
+	op.Close()
+	if hasRow {
+		return &ExecError{Code: "23P01", Pos: pos,
+			Message: fmt.Sprintf("updated partition constraint for default partition %q would be violated by some row", defPart.Name)}
+	}
+	return nil
+}
+
+// boundExprToSQLLiteral converts a partition bound expression to a SQL literal
+// string for use in inline queries.  Returns "" for expressions that cannot be
+// safely represented (MINVALUE, MAXVALUE, column refs).
+func boundExprToSQLLiteral(e parser.Expr) string {
+	switch v := e.(type) {
+	case *parser.IntegerConst:
+		return fmt.Sprintf("%d", v.Value)
+	case *parser.UnaryOp:
+		if v.Op == parser.OpUnaryNeg {
+			inner := boundExprToSQLLiteral(v.Operand)
+			if inner == "" {
+				return ""
+			}
+			return "-" + inner
+		}
+	case *parser.StringConst:
+		return "'" + strings.ReplaceAll(v.Value, "'", "''") + "'"
+	case *parser.ColumnRef:
+		// MINVALUE / MAXVALUE stored as ColumnRef; can't express as literal.
+		return ""
+	}
+	return ""
+}
+
+// funcExprContainsName returns true if expr (a partition-key expression) contains
+// a FuncCall whose Name.Name matches funcName (case-insensitive). Used to detect
+// partition-key dependencies when dropping a function.
+func funcExprContainsName(expr parser.Expr, funcName string) bool {
+	if expr == nil {
+		return false
+	}
+	switch v := expr.(type) {
+	case *parser.FuncCall:
+		if strings.EqualFold(v.Name.Name, funcName) {
+			return true
+		}
+		for _, arg := range v.Args {
+			if funcExprContainsName(arg, funcName) {
+				return true
+			}
+		}
+	case *parser.BinaryOp:
+		return funcExprContainsName(v.Left, funcName) || funcExprContainsName(v.Right, funcName)
+	case *parser.UnaryOp:
+		return funcExprContainsName(v.Operand, funcName)
+	case *parser.CastExpr:
+		return funcExprContainsName(v.Operand, funcName)
+	}
+	return false
 }

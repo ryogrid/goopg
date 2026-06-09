@@ -83,6 +83,15 @@ type Column struct {
 	// dropped columns are invisible in SELECT *, RETURNING *, and column lookups.
 	// M0097-0028.
 	Dropped bool
+	// Inherited is true for columns that were copied from a parent partitioned
+	// table when this table was created as a partition child. Sets attislocal=false
+	// and attinhcount=1 in pg_attribute. M0097-0023.
+	Inherited bool
+	// DeclaredTypeName is the original type name as written in DDL before domain
+	// resolution (e.g. "intdom1" when Type.Name has been resolved to "int").
+	// Used for DROP DOMAIN dependency tracking. Empty when the type was not a domain.
+	// M0097-0023.
+	DeclaredTypeName string
 	// Storage is the column storage type: "plain", "main", "external", "extended".
 	// Empty means the default for the column's type.
 	Storage string
@@ -95,6 +104,8 @@ type NamedCheckConstraint struct {
 	Expr      string // raw SQL expression (same as CheckConstraints entry)
 	OID       uint32 // synthetic OID for pg_constraint virtual table
 	NoInherit bool   // PG18: CHECK NO INHERIT — not propagated to child tables
+	IsLocal   bool   // conislocal: true if locally defined (not purely inherited)
+	InhCount  int    // coninhcount: number of direct parents this was inherited from
 }
 
 // NamedNotNullConstraint holds a NOT NULL constraint with a catalog-visible name.
@@ -105,24 +116,38 @@ type NamedNotNullConstraint struct {
 	ColName   string // column this constraint applies to
 	OID       uint32 // synthetic OID for pg_constraint virtual table
 	NoInherit bool   // PG18: NOT NULL NO INHERIT
+	IsLocal   bool   // conislocal: true if locally declared
+	InhCount  int    // coninhcount: 1 for partition children (they always inherit from one parent)
 }
 
 // AddNotNull appends a named NOT NULL constraint to the table.
-func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool) {
+// isLocal=true means the constraint is locally declared; inhCount=1 for partition children.
+func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool, isLocal bool, inhCount int) {
 	t.NotNullConstraints = append(t.NotNullConstraints, NamedNotNullConstraint{
 		Name: name, ColName: colName, OID: oid, NoInherit: noInherit,
+		IsLocal: isLocal, InhCount: inhCount,
 	})
 }
 
-// AddCheck appends a CHECK constraint, keeping CheckConstraints and
-// NamedChecks parallel so index i of each always corresponds. name is
-// empty for anonymous constraints; oid is 0 for anonymous constraints
-// (pg_constraint's VirtualRows skips empty-name / zero-OID rows so the
-// common unnamed case stays invisible in the catalog, matching the
-// pre-existing stub behaviour). M0097-0023.
+// AddCheck appends a locally-defined CHECK constraint (IsLocal=true, InhCount=0),
+// keeping CheckConstraints and NamedChecks parallel so index i of each always
+// corresponds. name is empty for anonymous constraints; oid is 0 for anonymous
+// constraints (pg_constraint's VirtualRows skips empty-name / zero-OID rows so
+// the common unnamed case stays invisible in the catalog). M0097-0023.
 func (t *Table) AddCheck(name, expr string, oid uint32) {
 	t.CheckConstraints = append(t.CheckConstraints, expr)
-	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{Name: name, Expr: expr, OID: oid})
+	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{
+		Name: name, Expr: expr, OID: oid, IsLocal: true,
+	})
+}
+
+// AddCheckInherited appends a CHECK constraint inherited from a partition parent
+// (IsLocal=false, InhCount=1). Used when creating partition children.
+func (t *Table) AddCheckInherited(name, expr string, oid uint32) {
+	t.CheckConstraints = append(t.CheckConstraints, expr)
+	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{
+		Name: name, Expr: expr, OID: oid, IsLocal: false, InhCount: 1,
+	})
 }
 
 // Table is one relation in the catalog.
@@ -234,6 +259,9 @@ type Table struct {
 	// partition keys. Parallel to PartitionKey: nil entry = plain column name,
 	// non-nil entry = expression (e.g. abs(b), (a+b)/2, NOT a). M0097-0023.
 	PartitionKeyExprs []parser.Expr
+	// PartitionKeyCollations is the explicit collation name per key column.
+	// Empty string means default (not shown in pg_get_partkeydef). M0097-0023.
+	PartitionKeyCollations []string
 
 	// Unlogged / Temp track relpersistence. 'u' for UNLOGGED, 't' for TEMP, 'p' for permanent.
 	Unlogged bool
@@ -290,6 +318,39 @@ type PartitionBound struct {
 	IsHash     bool     // true for HASH partitions
 	IsDefault  bool     // true for DEFAULT partitions
 	ChildName  string   // name of the child partition that owns this bound
+}
+
+// FormatPartitionBound formats a PartitionBound as the "FOR VALUES ..." string
+// that PostgreSQL stores in pg_class.relpartbound (decompiled by pg_get_expr).
+func FormatPartitionBound(pb PartitionBound) string {
+	if pb.IsDefault {
+		return "DEFAULT"
+	}
+	if pb.IsHash {
+		return fmt.Sprintf("FOR VALUES WITH (modulus %d, remainder %d)", pb.Modulus, pb.Remainder)
+	}
+	if len(pb.InValues) > 0 {
+		quoted := make([]string, len(pb.InValues))
+		for i, v := range pb.InValues {
+			quoted[i] = v
+		}
+		return "FOR VALUES IN (" + strings.Join(quoted, ", ") + ")"
+	}
+	// RANGE partition.
+	fromParts := pb.FromValues
+	if len(fromParts) == 0 && pb.From != "" {
+		fromParts = []string{pb.From}
+	}
+	toParts := pb.ToValues
+	if len(toParts) == 0 && pb.To != "" {
+		toParts = []string{pb.To}
+	}
+	if len(fromParts) > 0 || len(toParts) > 0 {
+		fromStr := "(" + strings.Join(fromParts, ", ") + ")"
+		toStr := "(" + strings.Join(toParts, ", ") + ")"
+		return "FOR VALUES FROM " + fromStr + " TO " + toStr
+	}
+	return ""
 }
 
 // TableStats captures the pg_class-shaped table-level stats
@@ -349,9 +410,17 @@ type Index struct {
 	// columns (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil
 	// when Columns[i] == "" (expression column); nil for plain column names.
 	// Not persisted to JSON (parser.Expr is not JSON-serializable).
-	ColExprs       []*parser.Expr
-	HasPredicate   bool     // true if this is a partial index (has a WHERE clause)
-	IncludeColumns []string // non-key covering columns from INCLUDE (…)
+	ColExprs        []*parser.Expr
+	// ColExprStrings is a pre-serialized SQL string for each expression column
+	// (parallel to ColExprs). Non-empty when Columns[i]=="" and the executor
+	// has serialized the expression via defaultExprToSQL. M0097-0023.
+	ColExprStrings  []string
+	HasPredicate    bool         // true if this is a partial index (has a WHERE clause)
+	Predicate       parser.Expr  // WHERE predicate expression (nil if no WHERE clause)
+	// PredicateString is a pre-serialized SQL string for the WHERE predicate.
+	// Set by the executor at CREATE INDEX time. M0097-0023.
+	PredicateString string
+	IncludeColumns  []string     // non-key covering columns from INCLUDE (…)
 	IsConstraint   bool     // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
 	IsExclusion    bool     // true when index backs an EXCLUDE USING constraint
 	ExclusionOp    string   // per-column exclusion operator (e.g. "=")
@@ -1336,6 +1405,22 @@ func (c *InMemory) RegisterOpClassSchema(opClassName, schema string) {
 	c.opClassSchemas[opClassName] = schema
 }
 
+// HasOpClass returns true if the named operator class was registered via
+// RegisterOpClassSchema. Used by DROP OPERATOR CLASS to check existence.
+func (c *InMemory) HasOpClass(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.opClassSchemas[name]
+	return ok
+}
+
+// RemoveOpClass deletes an operator class from the registry.
+func (c *InMemory) RemoveOpClass(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.opClassSchemas, name)
+}
+
 // OpClassesInSchema returns the names of operator classes in the given schema,
 // sorted alphabetically. Used for DROP SCHEMA CASCADE detail output. M0097-0022.
 func (c *InMemory) OpClassesInSchema(schemaName string) []string {
@@ -1506,6 +1591,9 @@ func (c *InMemory) registerSystemTables() {
 			// created; changes on REINDEX/CLUSTER. Exposed so that regress tests
 			// can detect filenode changes (create_index.sql REINDEX section).
 			{Name: "relfilenode", Type: Type{Name: "oid"}, Ordinal: 22},
+			// relpartbound: partition bound expression tree for partition children.
+			// Stores the pre-formatted "FOR VALUES ..." string; pg_get_expr returns it as-is.
+			{Name: "relpartbound", Type: Type{Name: "pg_node_tree"}, Ordinal: 23},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -1555,6 +1643,11 @@ func (c *InMemory) registerSystemTables() {
 			if t.PartitionParentOID != 0 {
 				isPartition = "t"
 			}
+			// Build relpartbound: "FOR VALUES ..." string for partition children.
+			partBound := ""
+			if t.PartitionParentOID != 0 && len(t.PartitionBounds) > 0 {
+				partBound = FormatPartitionBound(t.PartitionBounds[0])
+			}
 			relpers := "p"
 			if t.Unlogged {
 				relpers = "u"
@@ -1585,6 +1678,7 @@ func (c *InMemory) registerSystemTables() {
 				"",                           // reloptions: empty (NULL via TypedVirtualCell empty-string fallback)
 				"2",                          // relam: heap access method OID (OID 2)
 				strconv.Itoa(int(t.OID)),     // relfilenode: equals OID (no rewrite tracking in v0)
+				partBound,                    // relpartbound: partition bound string for children
 			})
 		}
 		// Emit index rows (relkind='i') so pg_class can be used to count indexes.
@@ -1643,6 +1737,7 @@ func (c *InMemory) registerSystemTables() {
 				"",                          // reloptions: NULL
 				idxRelam,                    // relam: index access method OID
 				strconv.Itoa(int(idx.OID)), // relfilenode: equals OID
+				"",                          // relpartbound: indexes are never partition children
 			})
 		}
 		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
@@ -1658,7 +1753,7 @@ func (c *InMemory) registerSystemTables() {
 			"0",        // reltoastrelid
 			"0",        // relpages
 			"t",        // relispopulated
-			"23",       // relnatts: 23 columns (including relfilenode added M0097-0023)
+			"24",       // relnatts: 24 columns (including relpartbound added M0097-0023)
 			"n",        // relreplident
 			"0",        // relchecks
 			"t",        // relhasindex (pg_class itself has indexes)
@@ -1673,6 +1768,7 @@ func (c *InMemory) registerSystemTables() {
 			"",         // reloptions: NULL
 			"2",        // relam: heap access method OID
 			"1259",     // relfilenode: equals OID for pg_class
+			"",         // relpartbound: pg_class is not a partition child
 		})
 		return out
 	}
@@ -2370,7 +2466,31 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2604,
 	}
-	pgAttrdef.VirtualRows = func() [][]string { return nil }
+	pgAttrdef.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var rows [][]string
+		var oid uint32 = 1
+		for _, tbl := range c.tables {
+			if tbl.Virtual {
+				continue
+			}
+			for _, col := range tbl.Columns {
+				if col.DefaultExpr == nil {
+					continue
+				}
+				adbin := formatExprForAttrdef(col.DefaultExpr)
+				rows = append(rows, []string{
+					fmt.Sprintf("%d", oid),
+					fmt.Sprintf("%d", tbl.OID),
+					fmt.Sprintf("%d", col.Ordinal+1),
+					adbin,
+				})
+				oid++
+			}
+		}
+		return rows
+	}
 	c.tables["pg_catalog.pg_attrdef"] = pgAttrdef
 
 	// pg_constraint — stores table and domain constraint definitions (OID 2606).
@@ -2438,11 +2558,15 @@ func (c *InMemory) registerSystemTables() {
 				row[12] = " "                       // confupdtype
 				row[13] = " "                       // confdeltype
 				row[14] = " "                       // confmatchtype
-				row[15] = "t"                       // conislocal
-				row[16] = "0"                       // coninhcount
-				row[17] = "f"                       // connoinherit
-				row[18] = "f"                       // conperiod
-				row[24] = nc.Expr                   // conbin
+				if nc.IsLocal {
+					row[15] = "t"
+				} else {
+					row[15] = "f"
+				}
+				row[16] = fmt.Sprintf("%d", nc.InhCount) // coninhcount
+				row[17] = "f"                             // connoinherit
+				row[18] = "f"                             // conperiod
+				row[24] = nc.Expr                         // conbin
 				out = append(out, row)
 			}
 		}
@@ -2522,8 +2646,12 @@ func (c *InMemory) registerSystemTables() {
 				row[12] = " "
 				row[13] = " "
 				row[14] = " "
-				row[15] = "t"
-				row[16] = "0"
+				if nc.IsLocal {
+					row[15] = "t"
+				} else {
+					row[15] = "f"
+				}
+				row[16] = fmt.Sprintf("%d", nc.InhCount)
 				if nc.NoInherit {
 					row[17] = "t"
 				} else {
@@ -2539,6 +2667,40 @@ func (c *InMemory) registerSystemTables() {
 		return out
 	}
 	c.tables["pg_catalog.pg_constraint"] = pgConstraint
+
+	// pg_inherits — stores inheritance/partition parent-child relationships (OID 2611).
+	// Used by psql \d to identify partition children. M0097-0023.
+	pgInherits := &Table{
+		Schema: "pg_catalog", Name: "pg_inherits", Virtual: true,
+		Columns: []Column{
+			{Name: "inhrelid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "inhparent", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "inhseqno", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "inhdetachpending", Type: Type{Name: "bool"}, Ordinal: 3},
+		},
+		OID: 2611,
+	}
+	pgInherits.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var out [][]string
+		parentSeq := make(map[uint32]int)
+		for _, tbl := range c.tables {
+			if tbl.Virtual || tbl.PartitionParentOID == 0 {
+				continue
+			}
+			parentSeq[tbl.PartitionParentOID]++
+			seq := parentSeq[tbl.PartitionParentOID]
+			out = append(out, []string{
+				fmt.Sprintf("%d", tbl.OID),
+				fmt.Sprintf("%d", tbl.PartitionParentOID),
+				fmt.Sprintf("%d", seq),
+				"f",
+			})
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_inherits"] = pgInherits
 
 	// pg_index — stores index definitions (OID 2610).
 	// This virtual stub lets queries that join against pg_index (e.g. psql \d+
@@ -4004,7 +4166,18 @@ func BuildIndexDef(idx *Index) string {
 			sb.WriteString(", ")
 		}
 		if col == "" {
-			sb.WriteString("(expr)")
+			// Expression column: use pre-serialized string if available.
+			exprStr := ""
+			if i < len(idx.ColExprStrings) {
+				exprStr = idx.ColExprStrings[i]
+			}
+			if exprStr != "" {
+				sb.WriteByte('(')
+				sb.WriteString(exprStr)
+				sb.WriteByte(')')
+			} else {
+				sb.WriteString("(expr)")
+			}
 		} else {
 			sb.WriteString(col)
 		}
@@ -4019,6 +4192,10 @@ func BuildIndexDef(idx *Index) string {
 			sb.WriteString(col)
 		}
 		sb.WriteByte(')')
+	}
+	if idx.PredicateString != "" {
+		sb.WriteString(" WHERE ")
+		sb.WriteString(idx.PredicateString)
 	}
 	return sb.String()
 }
@@ -4646,20 +4823,104 @@ func (c *InMemory) LookupDomain(name string) (*Domain, bool) {
 	return d, ok
 }
 
-// DropDomain removes a domain. cascade=true is accepted (stub). Returns an
-// error if not found and ifExists is false. M0097-0017.
-func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) error {
+// TablesWithColumnOfType returns all non-virtual tables that have at least one
+// column whose declared type name matches typeName (case-insensitive). Used by
+// execDropDomain to detect dependent objects before dropping. M0097-0023.
+func (c *InMemory) TablesWithColumnOfType(typeName string) []*Table {
+	lk := strings.ToLower(typeName)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out []*Table
+	for _, tbl := range c.tables {
+		if tbl.Virtual {
+			continue
+		}
+		for _, col := range tbl.Columns {
+			if strings.ToLower(col.Type.Name) == lk || strings.ToLower(col.DeclaredTypeName) == lk {
+				out = append(out, tbl)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// formatExprForAttrdef converts a parsed default expression to a display string
+// for pg_attrdef.adbin. Used by pg_get_expr to display column defaults in \d.
+func formatExprForAttrdef(e parser.Expr) string {
+	if e == nil {
+		return ""
+	}
+	switch v := e.(type) {
+	case *parser.IntegerConst:
+		return fmt.Sprintf("%d", v.Value)
+	case *parser.NumericConst:
+		return v.Value
+	case *parser.StringConst:
+		return "'" + strings.ReplaceAll(v.Value, "'", "''") + "'"
+	case *parser.NullConst:
+		return "NULL"
+	case *parser.BooleanConst:
+		if v.Value {
+			return "true"
+		}
+		return "false"
+	}
+	return fmt.Sprintf("%v", e)
+}
+
+// DropDomain removes a domain. Returns (names, nil) on success where names are
+// tables dropped via CASCADE. Returns (blockingTables, "dependent objects") when
+// cascade=false and dependents exist. M0097-0023.
+func (c *InMemory) DropDomain(name string, ifExists bool, cascade bool) ([]string, error) {
 	k := strings.ToLower(name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.domains[k]; !ok {
 		if ifExists {
-			return nil
+			return nil, nil
 		}
-		return fmt.Errorf("type %q does not exist", name)
+		return nil, fmt.Errorf("type %q does not exist", name)
+	}
+	// Find tables that use this domain as a column type.
+	var dependentTables []string
+	for _, tbl := range c.tables {
+		if tbl.Virtual {
+			continue
+		}
+		for _, col := range tbl.Columns {
+			if strings.ToLower(col.Type.Name) == k || strings.ToLower(col.DeclaredTypeName) == k {
+				dependentTables = append(dependentTables, tbl.Name)
+				break
+			}
+		}
+	}
+	if len(dependentTables) > 0 && !cascade {
+		// Return sentinel so caller can emit proper DETAIL/HINT.
+		return dependentTables, fmt.Errorf("dependent objects")
+	}
+	// CASCADE: drop all dependent tables.
+	var dropped []string
+	if cascade {
+		for _, tblName := range dependentTables {
+			for tableKey, tbl := range c.tables {
+				if strings.EqualFold(tbl.Name, tblName) {
+					dropped = append(dropped, tblName)
+					tblOID := tbl.OID
+					delete(c.tables, tableKey)
+					// Remove indexes on this table.
+					for idxOID, idx := range c.indexes {
+						if idx.Table != nil && idx.Table.OID == tblOID {
+							delete(c.indexes, idxOID)
+						}
+					}
+					break
+				}
+			}
+		}
 	}
 	delete(c.domains, k)
-	return nil
+	return dropped, nil
 }
 
 // ResolveColumnType resolves a column type name through the domain and enum

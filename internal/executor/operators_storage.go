@@ -1012,7 +1012,7 @@ func (o *insertOp) Next() (TupleSlot, error) {
 	o.done = true
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	cols := o.plan.Table.Columns
-	isPartitioned := len(o.plan.Table.PartitionKey) > 0
+	isPartitioned := o.plan.Table.PartitionMethod != ""
 	// insertMissing[i]=true for every target column the source row does
 	// not provide. Computed once per Open since ColumnIndex is immutable
 	// across rows; applyDefaultsForMissing reads it to evaluate per-column
@@ -1094,12 +1094,16 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		}
 
 		// NOT NULL constraint enforcement.
-		for i, col := range cols {
-			if col.NotNull && i < len(row) && row[i].IsNull() {
-				return nil, &ExecError{
-					Code:    "23502",
-					Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, o.plan.Table.Name),
-					Detail:  formatRowForDetail(cols, row),
+		// For partitioned tables, defer until after routing so the error names
+		// the leaf partition (matches PG behavior).
+		if !isPartitioned {
+			for i, col := range cols {
+				if col.NotNull && i < len(row) && row[i].IsNull() {
+					return nil, &ExecError{
+						Code:    "23502",
+						Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, o.plan.Table.Name),
+						Detail:  formatRowForDetail(cols, row),
+					}
 				}
 			}
 		}
@@ -1128,6 +1132,10 @@ func (o *insertOp) Next() (TupleSlot, error) {
 				if routeErr != nil {
 					return nil, routeErr
 				}
+				if routedPart == nil {
+					return nil, &ExecError{Code: "23514", Pos: o.plan.Pos(),
+						Message: fmt.Sprintf("no partition of relation %q found for row", o.plan.Table.Name)}
+				}
 			}
 		}
 
@@ -1148,6 +1156,16 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			// Partition children may have columns in a different order (ATTACH
 			// PARTITION allows mismatched column order). M0096-0013.
 			partRow := remapRowForPartition(o.plan.Table.Columns, partTable.Columns, row)
+			// NOT NULL check at the leaf partition level (PG names the child table).
+			for i, col := range partTable.Columns {
+				if col.NotNull && i < len(partRow) && partRow[i].IsNull() {
+					return nil, &ExecError{
+						Code:    "23502",
+						Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, partTable.Name),
+						Detail:  formatRowForDetail(partTable.Columns, partRow),
+					}
+				}
+			}
 			// Recompute generated columns using partition child's schema.
 			_ = computeGeneratedColumns(partTable.Columns, partRow)
 			if uerr := checkUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, o.plan.Pos()); uerr != nil {
@@ -1366,6 +1384,8 @@ func evalPartitionKeyExpr(expr parser.Expr, cols []catalog.Column, row Row) (Dat
 				}
 			}
 		}
+		// Unknown function — return null so routing falls through to "no partition found".
+		return NullDatum, nil
 	case *parser.IntegerConst:
 		return NewIntDatum(x.Value), nil
 	case *parser.BooleanConst:
@@ -1379,7 +1399,7 @@ func evalPartitionKeyExpr(expr parser.Expr, cols []catalog.Column, row Row) (Dat
 // routeToPartitionDepth recurses through nested partition hierarchies. The
 // depth guard (max 8) prevents infinite loops on circular catalog states.
 func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory, ctx *Context, depth int) (*catalog.Table, error) {
-	if len(parent.PartitionKey) == 0 || depth > 8 {
+	if (len(parent.PartitionKey) == 0 && len(parent.PartitionKeyExprs) == 0) || depth > 8 {
 		return nil, nil
 	}
 

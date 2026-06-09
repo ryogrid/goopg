@@ -968,6 +968,9 @@ type CreateTableStmt struct {
 	// TableChecks holds raw SQL expressions from table-level CHECK constraints.
 	// M0097-0014.
 	TableChecks []string
+	// TableNamedChecks holds explicitly named table-level CHECK constraints,
+	// e.g. `CONSTRAINT check_a CHECK (a > 0)`. M0097-0023.
+	TableNamedChecks []PartitionCheckConstraint
 	// TableUniques holds column-name lists from table-level UNIQUE (col1, col2)
 	// constraints. Each entry is the list of columns for one UNIQUE clause.
 	// Anonymous constraints only; named ones are in NamedConstraints. M0097-0028.
@@ -986,6 +989,9 @@ type CreateTableStmt struct {
 	// TableExclusions holds anonymous EXCLUDE USING constraints (no CONSTRAINT name).
 	// Named ones are folded into NamedConstraints. M0097-0023.
 	TableExclusions []TableConstraintDef
+	// TableHasNoInheritCheck is true when any table-level CHECK constraint carries
+	// NO INHERIT. Partitioned tables reject such constraints. M0097-0023.
+	TableHasNoInheritCheck bool
 	// LikeTables holds the source table names from LIKE clauses.
 	// `CREATE TABLE t (LIKE src INCLUDING DEFAULTS)` copies src's columns. M0097-0069.
 	// Deprecated: use BodyOrder for positional interleaving.
@@ -1006,7 +1012,8 @@ type PartitionByClause struct {
 	Method   string   // "LIST", "RANGE", or "HASH"
 	KeyCols  []string // partition key column names; empty string for expression keys
 	KeyExprs []Expr   // expression-based partition keys; nil for plain column keys (M0097-0023)
-	OpClasses []string // operator class per key col (empty string = default); M0097-0027
+	OpClasses  []string // operator class per key col (empty string = default); M0097-0027
+	Collations []string // per-key collation name ("" = default, i.e. not shown); M0097-0023
 }
 
 // PartitionOfClause describes a PARTITION OF parent FOR VALUES … clause.
@@ -1029,6 +1036,35 @@ type PartitionOfClause struct {
 	// in PARTITION OF, e.g. `CREATE TABLE t1 PARTITION OF t (b UNIQUE) FOR VALUES IN (1)`.
 	// Each entry is a column name to create a unique index on. M0097-0028.
 	UniqueColumns []string
+	// NotNullColumns holds column names from the PARTITION OF column-constraint
+	// list that carry an explicit NOT NULL, e.g. `(b NOT NULL DEFAULT 1)`.
+	// Used to create named NOT NULL constraints on the child. M0097-0023.
+	NotNullColumns []string
+	// CheckConstraints holds named CHECK constraints from the PARTITION OF
+	// column-constraint list, e.g. `CONSTRAINT check_b CHECK (b > 0)`.
+	// Used to create local check constraints on the child. M0097-0023.
+	CheckConstraints []PartitionCheckConstraint
+	// ColDefaults holds per-column DEFAULT expression overrides declared in the
+	// PARTITION OF column-override list, e.g. `(b DEFAULT 1)`. M0097-0023.
+	ColDefaults []PartitionColDefault
+	// DuplicateColumn is non-empty when a column name appears more than once
+	// in the PARTITION OF column override list (e.g. `(b NOT NULL, b DEFAULT 1, ...)`).
+	// The executor returns an error when this is set.
+	DuplicateColumn string
+}
+
+// PartitionColDefault holds a DEFAULT expression override for a single column
+// in a PARTITION OF column-override list. M0097-0023.
+type PartitionColDefault struct {
+	ColName string
+	Expr    Expr
+}
+
+// PartitionCheckConstraint is a named CHECK constraint declared in a PARTITION
+// OF column-override list. M0097-0023.
+type PartitionCheckConstraint struct {
+	Name string // constraint name (from CONSTRAINT name CHECK (...))
+	Expr string // raw SQL expression text
 }
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]
@@ -1056,7 +1092,8 @@ type CreateIndexStmt struct {
 	// most built-in operator classes have no options, so a non-empty value
 	// here causes an error at execution time. M0097-0023.
 	OpClassWithOptions string
-	HasPredicate       bool     // true when a WHERE clause (partial index predicate) is present
+	HasPredicate       bool   // true when a WHERE clause (partial index predicate) is present
+	Predicate          Expr   // WHERE predicate expression (nil if no WHERE clause)
 	IncludeColumns     []string // non-key covering columns from INCLUDE (…)
 }
 
