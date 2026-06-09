@@ -257,6 +257,17 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 	for _, sr := range sess.TakePendingSeqRestores() {
 		SetSequenceCurrentValue(sr.Name, sr.OldCurr)
 	}
+	// Restore catalog entries for any DROP TABLEs that happened inside savepoints.
+	// On full ROLLBACK these are all being undone (the top-level transaction aborts).
+	// M0097-0023.
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		for _, drop := range sess.TakePendingDDLDrops() {
+			im.RegisterTable(drop.Table)
+			for _, idx := range drop.Indexes {
+				im.RestoreIndex(idx)
+			}
+		}
+	}
 }
 
 func (o *transactionOp) clearCtxTransaction() {
@@ -379,6 +390,18 @@ func (o *transactionOp) execRollbackTo() error {
 	for _, entry := range aborted {
 		if entry.SubXid != 0 {
 			o.ctx.TxnMgr.MarkSubxactAborted(entry.SubXid)
+		}
+	}
+	// Restore catalog entries for DROP TABLEs performed inside the rolled-back
+	// savepoint. Physical files were already deleted (idempotent on re-drop).
+	// M0097-0023.
+	newDepth := sess.SavepointDepth()
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		for _, drop := range sess.RollbackDDLDropsToDepth(newDepth) {
+			im.RegisterTable(drop.Table)
+			for _, idx := range drop.Indexes {
+				im.RestoreIndex(idx)
+			}
 		}
 	}
 	o.ctx.Tx.XID = newSubXid

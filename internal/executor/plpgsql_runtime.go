@@ -1307,9 +1307,15 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if perr != nil {
 			return Datum{}, flowNone, perr
 		}
+		addExecCtx := func(err error) error {
+			if ee, ok := err.(*ExecError); ok && ee.Context == "" {
+				ee.Context = fmt.Sprintf("SQL statement %q", dynSQL)
+			}
+			return err
+		}
 		if perr := op.Open(ctx); perr != nil {
 			op.Close()
-			return Datum{}, flowNone, perr
+			return Datum{}, flowNone, addExecCtx(perr)
 		}
 		slot, perr := op.Next()
 		// Copy the INTO result datum before Close() so releaseRow() does not
@@ -1323,7 +1329,7 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		op.Close()
 		if perr != nil && perr != EOF {
-			return Datum{}, flowNone, perr
+			return Datum{}, flowNone, addExecCtx(perr)
 		}
 		if s.IntoVar != "" {
 			if idx, ok := frame.lookup(s.IntoVar); ok {

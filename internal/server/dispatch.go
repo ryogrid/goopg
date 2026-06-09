@@ -1456,11 +1456,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				})
 			}
 			return w.WriteCommandComplete(transactionTag(txNode.Verb))
-		default:
-			// Other verbs (SAVEPOINT, ROLLBACK TO, RELEASE) pass through
-			// the existing logic.
-			return w.WriteCommandComplete(transactionTag(txNode.Verb))
 		}
+		// SAVEPOINT, ROLLBACK TO, and RELEASE fall through to BuildFastIterator
+		// so execSavepoint / execRollbackTo / execRelease run properly (M0097-0023).
 	}
 	op, err := executor.BuildFastIterator(node)
 	if err != nil {

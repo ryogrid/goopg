@@ -39,6 +39,14 @@ type DDLUndoEntry struct {
 	IsIndex bool
 }
 
+// DDLDropUndoEntry records a DROP TABLE performed inside an active savepoint
+// so that ROLLBACK TO SAVEPOINT can restore the catalog entries. M0097-0023.
+type DDLDropUndoEntry struct {
+	Table          *catalog.Table
+	Indexes        []*catalog.Index
+	SavepointDepth int // subxactStack depth at time of drop
+}
+
 // relPageSnapshot captures the full page contents of one relation before
 // a TRUNCATE so that ROLLBACK can restore them.
 type relPageSnapshot struct {
@@ -66,14 +74,16 @@ type BasicSession struct {
 	inTx             bool
 	tx               mvcc.Transaction
 	snap             mvcc.Snapshot
-	pendingDDL          []DDLUndoEntry     // DDL creates pending rollback
-	pendingRoutineDrops []*catalog.Routine // routines dropped in current tx, for rollback
+	pendingDDL          []DDLUndoEntry      // DDL creates pending rollback
+	pendingRoutineDrops []*catalog.Routine  // routines dropped in current tx, for rollback
 	pendingTruncates    []TruncateUndoEntry // heap/index page snapshots for TRUNCATE rollback
-	pendingSeqRestores  []SeqRestoreEntry  // sequence counter restores for RESTART IDENTITY rollback
-	subxactStack        mvcc.SubxactStack  // savepoint stack (M0050-0004)
+	pendingSeqRestores  []SeqRestoreEntry   // sequence counter restores for RESTART IDENTITY rollback
+	savepointDDLDrops   []DDLDropUndoEntry  // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
+	subxactStack        mvcc.SubxactStack   // savepoint stack (M0050-0004)
 	currentSubXid       storage.TransactionID // 0 = use top-level tx.XID
-	txFailed            bool               // in_failed_sql_transaction (25P02)
-	deferredFKChecks    []DeferredFKCheck  // INITIALLY DEFERRED FK checks (M0096-0011)
+	txFailed            bool                // in_failed_sql_transaction (25P02)
+	deferredFKChecks    []DeferredFKCheck   // INITIALLY DEFERRED FK checks (M0096-0011)
+	activeQueryTables   map[uint32]bool     // OIDs of tables currently in active DML (M0097-0023)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -135,10 +145,12 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.pendingDDL = nil
 	s.pendingTruncates = nil
 	s.pendingSeqRestores = nil
+	s.savepointDDLDrops = nil
 	s.subxactStack = mvcc.SubxactStack{}
 	s.currentSubXid = 0
 	s.txFailed = false
 	s.deferredFKChecks = nil
+	s.activeQueryTables = nil
 }
 
 // AddDeferredFKCheck queues a FK constraint to be checked at COMMIT time.
@@ -272,4 +284,59 @@ func (s *BasicSession) TakePendingSeqRestores() []SeqRestoreEntry {
 	r := s.pendingSeqRestores
 	s.pendingSeqRestores = nil
 	return r
+}
+
+// SavepointDepth returns the current number of active savepoint stack entries.
+func (s *BasicSession) SavepointDepth() int {
+	return s.subxactStack.Len()
+}
+
+// RecordDDLDrop records a DROP TABLE performed inside an active savepoint
+// so ROLLBACK TO SAVEPOINT can restore the catalog entries. M0097-0023.
+func (s *BasicSession) RecordDDLDrop(e DDLDropUndoEntry) {
+	s.savepointDDLDrops = append(s.savepointDDLDrops, e)
+}
+
+// RollbackDDLDropsToDepth returns all DDL drop entries recorded at
+// savepointDepth >= depth and removes them from the list.
+// Called by ROLLBACK TO SAVEPOINT to identify entries to restore.
+func (s *BasicSession) RollbackDDLDropsToDepth(depth int) []DDLDropUndoEntry {
+	var toUndo, keep []DDLDropUndoEntry
+	for _, e := range s.savepointDDLDrops {
+		if e.SavepointDepth >= depth {
+			toUndo = append(toUndo, e)
+		} else {
+			keep = append(keep, e)
+		}
+	}
+	s.savepointDDLDrops = keep
+	return toUndo
+}
+
+// TakePendingDDLDrops drains and returns all recorded DDL drop entries.
+// Called at full ROLLBACK time to restore all tables dropped inside savepoints.
+func (s *BasicSession) TakePendingDDLDrops() []DDLDropUndoEntry {
+	out := s.savepointDDLDrops
+	s.savepointDDLDrops = nil
+	return out
+}
+
+// MarkTableActive marks a table OID as currently being mutated by a DML
+// statement. Used by the DDL-during-active-query guard. M0097-0023.
+func (s *BasicSession) MarkTableActive(oid uint32) {
+	if s.activeQueryTables == nil {
+		s.activeQueryTables = make(map[uint32]bool)
+	}
+	s.activeQueryTables[oid] = true
+}
+
+// UnmarkTableActive clears the active-DML mark for a table OID.
+func (s *BasicSession) UnmarkTableActive(oid uint32) {
+	delete(s.activeQueryTables, oid)
+}
+
+// IsTableActive reports whether a table OID is currently being mutated
+// by an active DML statement in this session.
+func (s *BasicSession) IsTableActive(oid uint32) bool {
+	return s.activeQueryTables[oid]
 }

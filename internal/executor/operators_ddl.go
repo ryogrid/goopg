@@ -1411,6 +1411,12 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		return &ExecError{Code: "42P01", Pos: s.Pos(),
 			Message: fmt.Sprintf("relation %q does not exist", poc.Parent.String())}
 	}
+	// DDL-during-active-query guard: reject CREATE PARTITION OF while the parent
+	// table is being mutated by an active DML statement in this session. M0097-0023.
+	if bsess, ok2 := o.ctx.Session.(*BasicSession); ok2 && bsess.IsTableActive(parent.OID) {
+		return &ExecError{Code: "55006", Pos: s.Pos(),
+			Message: fmt.Sprintf(`cannot CREATE TABLE .. PARTITION OF %q because it is being used by active queries in this session`, poc.Parent.Name)}
+	}
 	// Validate the partition.
 	if err := validatePartitionChild(s, parent, o.ctx); err != nil {
 		return err
@@ -2762,6 +2768,16 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error
 	// (schema="") found via a schema-qualified lookup can be removed correctly.
 	// M0097-0023.
 	dropName := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
+	// Record the drop for ROLLBACK TO SAVEPOINT if we're inside a savepoint.
+	// The physical deletion is idempotent (os.IsNotExist guard in DropRelation),
+	// so restoring only the catalog entry is sufficient. M0097-0023.
+	if bsess, ok := o.ctx.Session.(*BasicSession); ok && bsess.InExplicitTransaction() && bsess.SavepointDepth() > 0 {
+		bsess.RecordDDLDrop(DDLDropUndoEntry{
+			Table:          tbl,
+			Indexes:        idxs,
+			SavepointDepth: bsess.SavepointDepth(),
+		})
+	}
 	if err := o.ctx.Catalog.DropTable(dropName); err != nil {
 		return &ExecError{Code: "XX000", Message: err.Error()}
 	}

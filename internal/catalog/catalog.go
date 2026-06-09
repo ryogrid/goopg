@@ -3862,6 +3862,20 @@ func (c *InMemory) RegisterTable(tbl *Table) {
 	c.tables[k] = tbl
 }
 
+// RestoreIndex re-inserts a previously-dropped index back into the catalog.
+// Used when ROLLBACK TO SAVEPOINT undoes a DROP TABLE that happened inside
+// a savepoint. M0097-0023.
+func (c *InMemory) RestoreIndex(idx *Index) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := key(parser.ObjectName{Schema: idx.Schema, Name: idx.Name})
+	c.indexes[k] = idx
+	if c.byTable[idx.Table.OID] == nil {
+		c.byTable[idx.Table.OID] = map[string]*Index{}
+	}
+	c.byTable[idx.Table.OID][k] = idx
+}
+
 // DropTable removes a table from the catalog. Returns an error when
 // the name doesn't resolve.
 // CreateView installs a view in the catalog. The view is

@@ -1013,6 +1013,18 @@ func (o *insertOp) Next() (TupleSlot, error) {
 	rel := o.ctx.Catalog.RelFileNode(o.plan.Table)
 	cols := o.plan.Table.Columns
 	isPartitioned := o.plan.Table.PartitionMethod != ""
+	// BEFORE STATEMENT triggers fire once before any rows are processed.
+	// Mark the table as in active DML first so the DDL-during-active-query
+	// guard (execCreatePartitionChild) can detect concurrent DDL. M0097-0023.
+	if len(o.plan.Table.Triggers) > 0 {
+		if bsess, ok := o.ctx.Session.(*BasicSession); ok {
+			bsess.MarkTableActive(o.plan.Table.OID)
+			defer bsess.UnmarkTableActive(o.plan.Table.OID)
+		}
+		if err := fireStatementTriggers(o.ctx, o.plan.Table, "before", "insert"); err != nil {
+			return nil, err
+		}
+	}
 	// insertMissing[i]=true for every target column the source row does
 	// not provide. Computed once per Open since ColumnIndex is immutable
 	// across rows; applyDefaultsForMissing reads it to evaluate per-column
