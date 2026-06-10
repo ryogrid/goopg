@@ -222,6 +222,11 @@ type Table struct {
 	// Auto-named <table>_<col>_not_null on CREATE TABLE; preserved on LIKE copy.
 	NotNullConstraints []NamedNotNullConstraint
 
+	// IsSequence marks this table as a sequence virtual table. The three columns
+	// (last_value int8, log_cnt int8, is_called bool) are served by VirtualRows.
+	// SELECT * FROM seq_name returns the sequence's current state. M0097-0024.
+	IsSequence bool
+
 	// IsMatView marks this table as a materialized view. The underlying
 	// SELECT query is stored in View; data is materialized in the heap
 	// (unlike regular views). M0097-0013.
@@ -509,6 +514,9 @@ type Catalog interface {
 	// dedicated creation method exists — e.g. named CHECK constraints that must
 	// surface in pg_constraint with a real OID. M0097-0023.
 	AllocOID() uint32
+	// RenameTable renames a table/sequence/view by swapping its catalog key.
+	// Returns an error if old does not exist or new already exists. M0097-0024.
+	RenameTable(old, new parser.ObjectName) error
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -3862,6 +3870,28 @@ func (c *InMemory) AddColumn(table *Table, col Column) (*Column, error) {
 	col.Ordinal = len(t.Columns)
 	t.Columns = append(t.Columns, col)
 	return &t.Columns[len(t.Columns)-1], nil
+}
+
+// RenameTable renames a catalog table/view/sequence entry from old to new.
+// Returns an error when old does not exist or new already exists. M0097-0024.
+func (c *InMemory) RenameTable(old, new parser.ObjectName) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oldK := key(old)
+	newK := key(new)
+	tbl, exists := c.tables[oldK]
+	if !exists {
+		return fmt.Errorf("relation %q does not exist", oldK)
+	}
+	if _, exists2 := c.tables[newK]; exists2 {
+		return fmt.Errorf("relation %q already exists", newK)
+	}
+	// Re-key the table entry under the new name, preserving the pointer.
+	tbl.Schema = new.Schema
+	tbl.Name = new.Name
+	c.tables[newK] = tbl
+	delete(c.tables, oldK)
+	return nil
 }
 
 // RegisterTable re-inserts a previously-dropped table back into the catalog.

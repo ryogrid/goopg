@@ -38,6 +38,7 @@ func (o ObjectName) String() string {
 type BeginStmt struct {
 	pos            int
 	IsolationLevel string // "" = use session default
+	ReadOnly       bool   // true when START TRANSACTION READ ONLY / BEGIN READ ONLY
 }
 
 func (s *BeginStmt) Pos() int  { return s.pos }

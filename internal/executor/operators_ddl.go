@@ -857,15 +857,15 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		var seqMin, seqMax int64
 		isSerial := false
 		switch colTypeLow {
-		case "serial", "int4", "integer", "int":
+		case "serial", "serial4", "int4", "integer", "int":
 			seqMin, seqMax = 1, 2147483647
-			isSerial = colTypeLow == "serial"
-		case "bigserial", "int8", "bigint":
+			isSerial = colTypeLow == "serial" || colTypeLow == "serial4"
+		case "bigserial", "serial8", "int8", "bigint":
 			seqMin, seqMax = 1, 9223372036854775807
-			isSerial = colTypeLow == "bigserial"
-		case "smallserial", "int2", "smallint":
+			isSerial = colTypeLow == "bigserial" || colTypeLow == "serial8"
+		case "smallserial", "serial2", "int2", "smallint":
 			seqMin, seqMax = 1, 32767
-			isSerial = colTypeLow == "smallserial"
+			isSerial = colTypeLow == "smallserial" || colTypeLow == "serial2"
 		default:
 			// Unknown type: use int4 range as a safe default for identity columns.
 			if c.IdentityColumn {
@@ -3311,11 +3311,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableRenameTable:
 			newName := act.NewName
-			probe := parser.ObjectName{Schema: tbl.Schema, Name: newName}
-			if _, exists := o.ctx.Catalog.LookupTable(probe); exists {
-				return &ExecError{Code: "42P07", Pos: act.Pos(), Message: fmt.Sprintf("relation %q already exists", newName)}
+			oldObjName := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
+			newObjName := parser.ObjectName{Schema: tbl.Schema, Name: newName}
+			if err := o.ctx.Catalog.RenameTable(oldObjName, newObjName); err != nil {
+				return &ExecError{Code: "42P07", Pos: act.Pos(), Message: err.Error()}
 			}
-			// No actual rename implemented yet — just validate the conflict.
+			if tbl.IsSequence {
+				oldFull := tbl.Schema + "." + tbl.Name
+				newFull := tbl.Schema + "." + newName
+				RenameSequence(oldFull, newFull)
+			}
 		case parser.AlterTableRenameColumn:
 			oldColName := act.OldColumnName
 			newColName := act.NewName
@@ -4480,7 +4485,7 @@ func (o *ddlOp) autoIndexNameWithIncludes(tbl *catalog.Table, keyColumns, includ
 
 func isInt4Type(name string) bool {
 	switch strings.ToLower(name) {
-	case "int4", "integer", "int", "serial": // serial maps to int4 (M0096-0006)
+	case "int4", "integer", "int", "serial", "serial4": // serial/serial4 maps to int4 (M0096-0006)
 		return true
 	default:
 		return false
@@ -4489,7 +4494,7 @@ func isInt4Type(name string) bool {
 
 func isInt8Type(name string) bool {
 	switch strings.ToLower(name) {
-	case "int8", "bigint", "bigserial": // bigserial maps to int8 (M0096-0006)
+	case "int8", "bigint", "bigserial", "serial8": // bigserial/serial8 maps to int8 (M0096-0006)
 		return true
 	default:
 		return false
@@ -4713,7 +4718,7 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 					continue
 				}
 				colTypeLow := strings.ToLower(col.Type.Name)
-				isSerial := colTypeLow == "serial" || colTypeLow == "bigserial" || colTypeLow == "smallserial"
+				isSerial := colTypeLow == "serial" || colTypeLow == "serial4" || colTypeLow == "bigserial" || colTypeLow == "serial8" || colTypeLow == "smallserial" || colTypeLow == "serial2"
 				var seqName string
 				if isSerial || col.IdentityColumn {
 					seqName = strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_seq"
@@ -6568,6 +6573,9 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	}
 	cycle := s.Cycle
 	RegisterSequence(name, start, increment, minV, maxV, cycle)
+	if s.Temporary {
+		SetSequenceTemporary(name, true)
+	}
 	dt := s.DataType
 	if dt == "" {
 		dt = "bigint"
@@ -6575,6 +6583,36 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	SetSequenceDataType(name, dt)
 	if s.OwnedBy != "" {
 		SetSequenceOwnedBy(name, s.OwnedBy)
+	}
+	// Create a virtual catalog table for SELECT * FROM seq_name.
+	// Columns: last_value int8, log_cnt int8, is_called bool. M0097-0024.
+	if _, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		seqCols := []catalog.Column{
+			{Name: "last_value", Type: catalog.Type{Name: "int8"}, Ordinal: 0},
+			{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
+			{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
+		}
+		seqTbl, err2 := o.ctx.Catalog.CreateTable(s.Name, seqCols)
+		if err2 == nil {
+			seqTbl.Virtual = true
+			seqTbl.IsSequence = true
+			seqName := name // capture for closure
+			seqTbl.VirtualRows = func() [][]string {
+				lv, lc, called, ok2 := SequenceRowData(seqName)
+				if !ok2 {
+					return nil
+				}
+				calledStr := "f"
+				if called {
+					calledStr = "t"
+				}
+				return [][]string{{
+					fmt.Sprintf("%d", lv),
+					fmt.Sprintf("%d", lc),
+					calledStr,
+				}}
+			}
+		}
 	}
 	return nil
 }
@@ -7389,6 +7427,8 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					Message: fmt.Sprintf("sequence %q does not exist", name.String()),
 				}
 			}
+			// Remove the virtual catalog entry created for SELECT * FROM seq_name. M0097-0024.
+			_ = o.ctx.Catalog.DropTable(name)
 		}
 		return nil
 	}
@@ -7821,11 +7861,11 @@ func dropCompatPGCatalogType(canonical string) string {
 // (e.g. int → int4) as PG uses in error messages. M0097-drop_if_exists.
 func dropCompatFuncTypeCanon(typeName string) string {
 	switch strings.ToLower(typeName) {
-	case "int", "int4", "integer", "serial":
+	case "int", "int4", "integer", "serial", "serial4":
 		return "int4"
-	case "int2", "smallint", "smallserial":
+	case "int2", "smallint", "smallserial", "serial2":
 		return "int2"
-	case "int8", "bigint", "bigserial":
+	case "int8", "bigint", "bigserial", "serial8":
 		return "int8"
 	case "bool", "boolean":
 		return "bool"
@@ -7839,11 +7879,11 @@ func dropCompatFuncTypeCanon(typeName string) string {
 
 func dropCompatCanonicalType(typeName string) string {
 	switch strings.ToLower(typeName) {
-	case "int4", "integer", "int", "serial":
+	case "int4", "integer", "int", "serial", "serial4":
 		return "integer"
-	case "int2", "smallint", "smallserial":
+	case "int2", "smallint", "smallserial", "serial2":
 		return "smallint"
-	case "int8", "bigint", "bigserial":
+	case "int8", "bigint", "bigserial", "serial8":
 		return "bigint"
 	case "bool", "boolean":
 		return "boolean"
