@@ -1188,12 +1188,13 @@ type DropTableStmt struct {
 func (s *DropTableStmt) Pos() int  { return s.pos }
 func (s *DropTableStmt) stmtNode() {}
 
-// DropIndexStmt — `DROP INDEX [IF EXISTS] name [, …] [CASCADE|RESTRICT]`.
+// DropIndexStmt — `DROP INDEX [CONCURRENTLY] [IF EXISTS] name [, …] [CASCADE|RESTRICT]`.
 type DropIndexStmt struct {
-	pos      int
-	IfExists bool
-	Names    []ObjectName
-	Behavior DropBehavior
+	pos        int
+	Concurrent bool
+	IfExists   bool
+	Names      []ObjectName
+	Behavior   DropBehavior
 }
 
 func (s *DropIndexStmt) Pos() int  { return s.pos }
