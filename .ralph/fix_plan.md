@@ -351,6 +351,16 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
                 PartitionKeyUpdate{1,2,3,4}, MergeDelete, MergeInsertUpdate,
                 MergeMatchRecheck, MergeJoin, DropIndexConcurrently1.
 
+                **M0100-0011 (loop 2) — PASS count = 19**: EvalPlanQualTrigger
+                added. Phase 1 inline EPQ + BEFORE trigger inline firing in
+                updateOp and deleteOp; ON CONFLICT trigger paths in upsertOp;
+                bpchar output fix; PL/pgSQL NULL RAISE rendering + parser fix.
+                Current PASS: ReadWriteUnique, LockCommittedUpdate,
+                LockCommittedKeyupdate, InsertConflictDoUpdate{,2,3,4},
+                InsertConflictDoNothing, FkSnapshot, PartitionKeyUpdate{1,2,3,4},
+                MergeDelete, MergeInsertUpdate, MergeMatchRecheck, MergeJoin,
+                DropIndexConcurrently1, EvalPlanQualTrigger.
+
         - [x] **M0100-0009 — DropIndexConcurrently1: CONCURRENTLY two-phase wait semantics**
               - Summary: `TestPort_IsolationDropIndexConcurrently1` SKIP —
                 missing `<waiting ...>` on the DROP step; subsequent SELECT
@@ -382,19 +392,16 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
                 `ExecUpdate`/`ExecDelete` EPQ loops, align NOTICE output
                 ordering and content. Write a design doc first.
 
-        - [ ] **M0100-0011 — EvalPlanQualTrigger: EPQ trigger output parity**
-              - Summary: `TestPort_IsolationEvalPlanQualTrigger` SKIP — first
-                divergence at L13: expected column headers `key|data` but
-                got `step s1_ins_b: INSERT INTO trigtest ...`. Output: 2185
-                lines vs 2733 expected (548 missing).
-              - Root cause: trigger bodies in EPQ-rechecked UPDATE/DELETE
-                paths either do not fire or produce output at different
-                points in the execution flow. BEFORE/AFTER trigger NOTICE
-                emission and step-header ordering differ from PG.
-              - Required: trace trigger execution during EPQ rechecks,
-                ensure BEFORE/AFTER triggers fire at correct points and
-                output appears at the expected positions. Write a design
-                doc first.
+        - [x] **M0100-0011 — EvalPlanQualTrigger: EPQ trigger output parity**
+              - COMPLETE (loop 2, commit 54e738c6): Phase 1 inline EPQ in
+                updateOp and deleteOp fn callbacks — blocks on in-progress
+                xmax before processing next row, so BEFORE trigger + subsequent
+                NOTICEs interleave per PG's per-row semantics. `beforeFired`
+                flag prevents double-fire in Phase 2. RR: HasAbortedXID +
+                IsXIDActive resolve frozen-snapshot ambiguity; CTID self-pointer
+                check distinguishes "concurrent delete" from "concurrent update".
+                ON CONFLICT trigger paths added to upsertOp. bpchar output fix
+                in dispatch.go (no re-padding). `TestPort_IsolationEvalPlanQualTrigger` PASS.
 
 ### Stale notes carried from M0096-0013 (do NOT re-implement)
 
