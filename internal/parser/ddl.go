@@ -2769,14 +2769,12 @@ func (p *parser) parseDrop() (Stmt, error) {
 		return &DropTableStmt{pos: t.Pos, IfExists: ifExists, Names: names, Behavior: behavior}, nil
 	case KwIndex:
 		p.advance()
-		// DROP INDEX CONCURRENTLY — accept the keyword, treat as synchronous.
-		// True concurrent drop protocol is out of scope for v0 (M0096-0006).
-		_ = p.acceptIdentKeyword("concurrently")
+		concurrent := p.acceptIdentKeyword("concurrently")
 		ifExists, names, behavior, err := p.parseDropTail()
 		if err != nil {
 			return nil, err
 		}
-		return &DropIndexStmt{pos: t.Pos, IfExists: ifExists, Names: names, Behavior: behavior}, nil
+		return &DropIndexStmt{pos: t.Pos, Concurrent: concurrent, IfExists: ifExists, Names: names, Behavior: behavior}, nil
 	case KwView:
 		p.advance()
 		ifExists, names, behavior, err := p.parseDropTail()

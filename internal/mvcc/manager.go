@@ -527,6 +527,62 @@ func (m *Manager) WaitForXID(ctx context.Context, xid storage.TransactionID) err
 	return ctx.Err()
 }
 
+// WaitForOlderSlotsToCommit waits until every backend slot that was in an
+// active transaction (inTxn==1) at the time of the call has finished its
+// transaction (inTxn back to 0). The caller's own slot (selfHandle) is
+// excluded to prevent the caller from waiting for itself.
+//
+// Used by DROP INDEX CONCURRENTLY to drain all snapshots that were open
+// before the drop: once this returns, no transaction that started before
+// the DROP is still running, so the index may be safely removed.
+// M0100-0009.
+func (m *Manager) WaitForOlderSlotsToCommit(ctx context.Context, selfHandle TxnHandle) error {
+	selfIdx := int(selfHandle) - 1 // Handle = procNum+1
+
+	// Snapshot which slots are active right now (excluding self).
+	active := make([]int, 0, 4)
+	for i := range m.procArray.slots {
+		if i == selfIdx {
+			continue
+		}
+		if m.procArray.slots[i].inTxn.Load() == 1 {
+			active = append(active, i)
+		}
+	}
+	if len(active) == 0 {
+		return nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			m.commitCond.Broadcast()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	m.waitMu.Lock()
+	defer m.waitMu.Unlock()
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		allDone := true
+		for _, i := range active {
+			if m.procArray.slots[i].inTxn.Load() == 1 {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			return nil
+		}
+		m.commitCond.Wait()
+	}
+}
+
 // xidInProgress reports whether xid is assigned to any currently active
 // transaction. Lock-free: uses atomic loads on procArray slots.
 func (m *Manager) xidInProgress(xid storage.TransactionID) bool {

@@ -2977,6 +2977,23 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "DROP INDEX requires Pool in Context"}
 	}
+
+	// DROP INDEX CONCURRENTLY cannot run inside an explicit transaction block.
+	// M0100-0009.
+	if s.Concurrent && o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		return &ExecError{Code: "25001", Pos: s.Pos(), Message: "DROP INDEX CONCURRENTLY cannot run inside a transaction block"}
+	}
+
+	// DROP INDEX CONCURRENTLY: wait for all transactions that were active at
+	// DROP time to commit/abort before physically removing the index. This
+	// ensures no snapshot taken before the DROP can still reference the index.
+	// M0100-0009.
+	if s.Concurrent && o.ctx.TxnMgr != nil && o.ctx.Ctx != nil {
+		if err := o.ctx.TxnMgr.WaitForOlderSlotsToCommit(o.ctx.Ctx, o.ctx.Tx.Handle); err != nil {
+			return &ExecError{Code: "57014", Pos: s.Pos(), Message: "DROP INDEX CONCURRENTLY cancelled"}
+		}
+	}
+
 	flagInval := false
 	droppedOIDs := make([]uint32, 0, len(s.Names))
 	for _, name := range s.Names {

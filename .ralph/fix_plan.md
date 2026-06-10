@@ -1539,7 +1539,16 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
                 InsertConflictDoNothing, FkSnapshot, PartitionKeyUpdate{1,2,3,4},
                 MergeDelete, MergeInsertUpdate, MergeMatchRecheck, MergeJoin.
 
-        - [ ] **M0100-0009 — DropIndexConcurrently1: CONCURRENTLY two-phase wait semantics**
+                **M0100-0009 (loop 1) — PASS count = 18**: DropIndexConcurrently1
+                added. `WaitForOlderSlotsToCommit` implemented in `mvcc.Manager`;
+                `execDropIndex` calls it when `Concurrent==true`. Parser now sets
+                `DropIndexStmt.Concurrent`. Current PASS: ReadWriteUnique,
+                LockCommittedUpdate, LockCommittedKeyupdate,
+                InsertConflictDoUpdate{,2,3,4}, InsertConflictDoNothing, FkSnapshot,
+                PartitionKeyUpdate{1,2,3,4}, MergeDelete, MergeInsertUpdate,
+                MergeMatchRecheck, MergeJoin, DropIndexConcurrently1.
+
+        - [x] **M0100-0009 — DropIndexConcurrently1: CONCURRENTLY two-phase wait semantics**
               - Summary: `TestPort_IsolationDropIndexConcurrently1` SKIP —
                 missing `<waiting ...>` on the DROP step; subsequent SELECT
                 returns 0 rows instead of 2.
