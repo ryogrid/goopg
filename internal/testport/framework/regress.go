@@ -534,10 +534,8 @@ func NormalizeRegressOutput(raw string) string {
 					// cast, operator — CREATE CAST / CREATE OPERATOR succeed in PG
 					// policy — CREATE POLICY (row-level security) succeeds in PG
 					// user, group, role — CREATE USER/GROUP/ROLE succeed in PG
-					// discard — DISCARD SEQUENCES/ALL succeed in PG; not implemented in goopg
 					if token == "cast" || token == "operator" ||
-						token == "policy" || token == "user" || token == "group" || token == "role" ||
-						token == "discard" {
+						token == "policy" || token == "user" || token == "group" || token == "role" {
 						// drop
 					} else {
 						errIdx := strings.Index(line, "ERROR:  ")
@@ -549,11 +547,6 @@ func NormalizeRegressOutput(raw string) string {
 					}
 				}
 			}
-		} else if strings.Contains(line, `syntax error at or near "discard"`) {
-			// DISCARD SEQUENCES not implemented; PG handles it silently. Drop. M0097-0068.
-		} else if strings.Contains(line, `syntax error at or near "start"`) &&
-			strings.Contains(line, "ERROR:") {
-			// START TRANSACTION READ ONLY not implemented; PG handles it silently. Drop. M0097-0068.
 		} else if strings.Contains(line, "unrecognized configuration parameter \"SESSION\"") {
 			// SET LOCAL SESSION AUTHORIZATION not implemented; PG handles it silently. Drop. M0097-0068.
 		} else if strings.Contains(line, "table-valued function \"pg_get_sequence_data\" not supported") ||
@@ -588,6 +581,8 @@ func NormalizeRegressOutput(raw string) string {
 						strings.HasPrefix(rest, `Table "`) ||
 						strings.HasPrefix(rest, `Index "`) ||
 						strings.HasPrefix(rest, `Sequence "`) ||
+						strings.HasPrefix(rest, `Unlogged sequence "`) ||
+						strings.HasPrefix(rest, `Unlogged table "`) ||
 						strings.HasPrefix(rest, `Materialized view "`) ||
 						strings.HasPrefix(rest, `Foreign table "`) ||
 						strings.HasPrefix(rest, `Composite type "`) ||

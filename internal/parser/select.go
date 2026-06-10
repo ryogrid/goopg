@@ -1230,6 +1230,13 @@ func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
 			return rv, nil
 		}
 	}
+	// ROWS FROM(func1(args), func2(args), ...) [WITH ORDINALITY] [AS alias]
+	// Used in rangefuncs and similar multi-SRF scenarios.
+	if fromClause &&
+		p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "rows") &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwFrom {
+		return p.parseRowsFrom()
+	}
 	obj, err := p.parseObjectName()
 	if err != nil {
 		return RangeVar{}, err
@@ -1292,6 +1299,13 @@ func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
 		}
 		rv.Name = ""
 		rv.TableFunc = &TableFuncRef{pos: obj.pos, Name: srfFuncName, Args: args}
+		// WITH ORDINALITY: adds a bigint ordinal column (1-based) to SRF output.
+		if p.acceptKeyword(KwWith) {
+			if !p.acceptIdentKeyword("ordinality") {
+				return RangeVar{}, p.errAtCur("expected ORDINALITY after WITH")
+			}
+			rv.TableFunc.WithOrdinality = true
+		}
 	}
 
 	// `table*` syntax: the `*` means "include inheritance children".  In
@@ -3399,4 +3413,89 @@ func parseIntLiteralExpr(t Token) (Expr, error) {
 	}
 	// Decimal overflow — return the string as a numeric literal.
 	return &NumericConst{pos: t.Pos, Value: s}, nil
+}
+
+// parseRowsFrom handles the ROWS FROM(func1(args), func2(args), ...) [WITH ORDINALITY] syntax.
+// Each entry is a function call that produces a set of rows; the results are
+// zipped together (shorter arrays are NULL-padded to the longest).
+func (p *parser) parseRowsFrom() (RangeVar, error) {
+	p.advance() // consume "rows"
+	pos := p.cur().Pos
+	p.advance() // consume FROM
+	if !p.acceptSymbol("(") {
+		return RangeVar{}, p.errAtCur("expected '(' after ROWS FROM")
+	}
+	var entries []RowsFromEntry
+	for {
+		// Parse function name
+		obj, err := p.parseObjectName()
+		if err != nil {
+			return RangeVar{}, err
+		}
+		if !p.acceptSymbol("(") {
+			return RangeVar{}, p.errAtCur("expected '(' for function in ROWS FROM")
+		}
+		var args []Expr
+		if !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
+			for {
+				e, err := p.parseExpr()
+				if err != nil {
+					return RangeVar{}, err
+				}
+				args = append(args, e)
+				if !p.acceptSymbol(",") {
+					break
+				}
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return RangeVar{}, p.errAtCur("expected ')' after ROWS FROM function arguments")
+		}
+		entries = append(entries, RowsFromEntry{Name: obj.Name, Args: args})
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return RangeVar{}, p.errAtCur("expected ')' after ROWS FROM list")
+	}
+
+	rv := RangeVar{pos: pos}
+	rv.TableFunc = &TableFuncRef{pos: pos, RowsFuncs: entries}
+	// WITH ORDINALITY
+	if p.acceptKeyword(KwWith) {
+		if !p.acceptIdentKeyword("ordinality") {
+			return RangeVar{}, p.errAtCur("expected ORDINALITY after WITH")
+		}
+		rv.TableFunc.WithOrdinality = true
+	}
+	// Parse alias
+	if p.acceptKeyword(KwAs) {
+		t, err := p.parseIdent()
+		if err != nil {
+			return RangeVar{}, err
+		}
+		rv.Alias = identText(t)
+	} else if isAliasStart(p.cur()) {
+		t := p.advance()
+		rv.Alias = identText(t)
+	}
+	// Optional column alias list
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		p.advance()
+		for {
+			colTok, cerr := p.parseIdent()
+			if cerr != nil {
+				return RangeVar{}, cerr
+			}
+			rv.Columns = append(rv.Columns, identText(colTok))
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return RangeVar{}, p.errAtCur("expected ')' after column alias list")
+		}
+	}
+	return rv, nil
 }

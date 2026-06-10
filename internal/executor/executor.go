@@ -30,6 +30,22 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newGenerateSubscriptsOp(p)), nil
 	case *planner.FromUnnest:
 		return maybeInstrument(p, newFromUnnestOp(p)), nil
+	case *planner.OrdinalityWrap:
+		child, err := Build(p.Child)
+		if err != nil {
+			return nil, err
+		}
+		return maybeInstrument(p, newOrdinalityOp(p, child)), nil
+	case *planner.RowsFrom:
+		children := make([]Operator, len(p.Funcs))
+		for i, f := range p.Funcs {
+			c, err := Build(f)
+			if err != nil {
+				return nil, err
+			}
+			children[i] = c
+		}
+		return maybeInstrument(p, newRowsFromOp(p, children)), nil
 	case *planner.PgInputErrorInfo:
 		return maybeInstrument(p, newPgInputErrorInfoOp(p)), nil
 	case *planner.PgGetPublicationTables:
@@ -238,6 +254,9 @@ func Build(plan planner.Node) (Operator, error) {
 			return newUtilitySettingsOp(p), nil
 		}
 		if _, ok := p.Stmt.(*parser.ResetStmt); ok {
+			return newUtilitySettingsOp(p), nil
+		}
+		if _, ok := p.Stmt.(*parser.DiscardStmt); ok {
 			return newUtilitySettingsOp(p), nil
 		}
 		if _, ok := p.Stmt.(*parser.VacuumStmt); ok {

@@ -244,9 +244,10 @@ type Context struct {
 
 	// Sequence session state — maps sequence key → last nextval result
 	// for currval(); LastSeqVal/LastSeqSet track the lastval() return. M0097-0009.
-	CurrSeqVals map[string]int64
-	LastSeqVal  int64
-	LastSeqSet  bool
+	CurrSeqVals  map[string]int64
+	LastSeqVal   int64
+	LastSeqSet   bool
+	LastSeqName  string // name of sequence that produced LastSeqVal (for drop-detection)
 
 	// TempTableShadows maps table name → original permanent *catalog.Table for
 	// CREATE TEMP TABLE shadowing. Populated by execCreateTable; restored on DROP.
@@ -353,6 +354,15 @@ type Context struct {
 	// parser path (multi-statement batches). The caller (operators_utility_settings)
 	// passes the role name or "" to restore superuser status.
 	SetSessionAuthorization func(role string)
+
+	// MergeAction holds the current MERGE action for MergeActionExpr evaluation
+	// in a MERGE RETURNING clause. Set by mergeOp.collectReturningRow. M0100-0007.
+	MergeAction planner.MergeActionKind
+	// MergeOldRow/MergeNewRow hold the pre/post action rows for MergeWholeRowRef
+	// evaluation in a MERGE RETURNING clause. nil = absent (INSERT has no old;
+	// DELETE has no new). M0100-0007.
+	MergeOldRow Row
+	MergeNewRow Row
 }
 
 // SettingValue is one effective session setting exposed to SHOW ALL.

@@ -544,6 +544,35 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 
+	// vacuum_cost_delay — sleep duration between vacuum cost cycles. Default 0
+	// (disabled). Unit is ms; values < 1ms display in µs (e.g. "900us").
+	// M0097-0031: stub so guc.sql SET/SHOW round-trips work.
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_cost_delay", Type: TypeReal, Unit: UnitMs, BootVal: "0",
+		MinVal: 0, MaxVal: 100,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// track_activities — controls pg_stat_activity tracking.
+	r.MustRegister(NewVariable(Variable{
+		Name: "track_activities", Type: TypeBool, BootVal: "on",
+		Context: ContextSuset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// default_with_oids — removed in PG12, retained as a recognised no-op.
+	r.MustRegister(NewVariable(Variable{
+		Name: "default_with_oids", Type: TypeBool, BootVal: "off",
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// seq_page_cost — planner cost estimate for sequential page fetch.
+	r.MustRegister(NewVariable(Variable{
+		Name: "seq_page_cost", Type: TypeReal, BootVal: "1.0",
+		MinVal: 0, MaxVal: 1<<30,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+
 	// Tuple-freeze age thresholds (M0046-0005). vacuum_freeze_min_age is
 	// the minimum XID age before VACUUM rewrites xmin → FrozenTransactionId.
 	// autovacuum_freeze_max_age is the maximum XID age before autovacuum

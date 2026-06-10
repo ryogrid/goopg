@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -141,16 +142,112 @@ func (v *Variable) canonicalize(value string) (string, error) {
 		}
 		return strconv.FormatInt(n, 10), nil
 	case TypeReal:
-		f, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			return "", fmt.Errorf("invalid real value %q: %w", value, err)
+		// Strip leading/trailing whitespace and attempt to separate numeric
+		// part from unit suffix (e.g. "900us" → 900, "us").
+		trimmed := strings.TrimSpace(value)
+		numEnd := 0
+		for numEnd < len(trimmed) {
+			c := trimmed[numEnd]
+			if c == '+' || c == '-' || c == '.' || (c >= '0' && c <= '9') {
+				numEnd++
+			} else {
+				break
+			}
+		}
+		suffix := strings.TrimSpace(strings.ToLower(trimmed[numEnd:]))
+		numStr := strings.TrimSpace(trimmed[:numEnd])
+		if numStr == "" {
+			// No numeric prefix (e.g. "NaN", "Inf") — treat entire string as value.
+			numStr = trimmed
+			suffix = ""
+		}
+		f, err := strconv.ParseFloat(numStr, 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return "", fmt.Errorf("invalid value for parameter %q: %q", v.Name, value)
+		}
+		// Convert unit suffix for time-unit GUCs (e.g. vacuum_cost_delay in ms).
+		if suffix != "" && v.Unit != UnitNone {
+			// Handle "us" (microseconds) specially: 1 us = 0.001 ms.
+			if suffix == "us" {
+				switch v.Unit {
+				case UnitMs:
+					f = f * 0.001
+				default:
+					return "", fmt.Errorf("invalid unit %q for parameter %q", suffix, v.Name)
+				}
+			} else {
+				suffixUnit, ok := unitFromSuffix(suffix)
+				if !ok {
+					return "", fmt.Errorf("invalid unit %q for parameter %q", suffix, v.Name)
+				}
+				// Map suffix unit to ms multiplier.
+				var fromMs float64
+				switch suffixUnit {
+				case UnitMs:
+					fromMs = 1
+				case UnitS:
+					fromMs = 1000
+				case UnitMin:
+					fromMs = 60000
+				case UnitH:
+					fromMs = 3600000
+				case UnitD:
+					fromMs = 86400000
+				default:
+					return "", fmt.Errorf("unsupported unit suffix %q for real parameter", suffix)
+				}
+				// Convert to native unit.
+				var toMs float64
+				switch v.Unit {
+				case UnitMs:
+					toMs = 1
+				case UnitS:
+					toMs = 1000
+				case UnitMin:
+					toMs = 60000
+				default:
+					toMs = 1
+				}
+				f = f * fromMs / toMs
+			}
 		}
 		if v.MinVal != 0 || v.MaxVal != 0 {
 			if f < v.MinVal || f > v.MaxVal {
-				return "", fmt.Errorf("value %g out of range [%g, %g]", f, v.MinVal, v.MaxVal)
+				// Produce range error similar to PostgreSQL format.
+				nativeStr := func(x float64) string {
+					switch v.Unit {
+					case UnitMs:
+						if x == float64(int64(x)) {
+							return fmt.Sprintf("%g ms", x)
+						}
+						return fmt.Sprintf("%g ms", x)
+					default:
+						return fmt.Sprintf("%g", x)
+					}
+				}
+				return "", fmt.Errorf("%s is outside the valid range for parameter %q (%s .. %s)",
+					nativeStr(f), v.Name, nativeStr(v.MinVal), nativeStr(v.MaxVal))
 			}
 		}
-		return strconv.FormatFloat(f, 'g', -1, 64), nil
+		fStr := strconv.FormatFloat(f, 'g', -1, 64)
+		// For time-unit GUCs, format the display value with units like PostgreSQL:
+		// - Use "us" if the value has sub-ms precision or is < 1ms
+		// - Use "ms" if the value is an exact integer number of ms
+		if v.Unit == UnitMs && (f != 0) {
+			usVal := f * 1000 // convert to microseconds
+			if usVal == float64(int64(usVal)) && f < 1.0 {
+				// Exact µs value, less than 1ms → show in µs
+				fStr = fmt.Sprintf("%gus", usVal)
+			} else if f == float64(int64(f)) {
+				// Exact integer ms → show in ms
+				fStr = fmt.Sprintf("%gms", f)
+			} else {
+				// Fractional ms → show in µs (e.g. 80.1ms → 80100us)
+				usRounded := math.Round(f * 1000)
+				fStr = fmt.Sprintf("%gus", usRounded)
+			}
+		}
+		return fStr, nil
 	case TypeString:
 		return value, nil
 	case TypeEnum:
@@ -345,9 +442,9 @@ func setFromFile(v *Variable, value string) error {
 // accepts.
 func parseBoolish(s string) (bool, bool) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "on", "true", "yes", "1":
+	case "on", "true", "yes", "1", "t":
 		return true, true
-	case "off", "false", "no", "0":
+	case "off", "false", "no", "0", "f":
 		return false, true
 	}
 	return false, false

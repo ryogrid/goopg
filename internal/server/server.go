@@ -36,6 +36,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -596,7 +597,9 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	var exitErr any
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("backend goroutine panic", "panic", r)
+			buf := make([]byte, 65536)
+			n := runtime.Stack(buf, false)
+			logger.Error("backend goroutine panic", "panic", r, "stack", string(buf[:n]))
 			exitErr = r
 		}
 		_ = raw.Close()

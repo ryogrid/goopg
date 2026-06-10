@@ -26,11 +26,46 @@ func (o *fromUnnestOp) Open(ctx *Context) error {
 	o.idx = 0
 	o.rows = nil
 
-	// Evaluate the array expression using outer rows if this is lateral.
+	// Evaluate the array expression(s) using outer rows if this is lateral.
 	var outerRow Row
 	if len(ctx.OuterRows) > 0 {
 		outerRow = ctx.OuterRows[len(ctx.OuterRows)-1]
 	}
+
+	if len(o.plan.ArrExprs) >= 2 {
+		// Multi-arg unnest: zip N arrays, NULL-padding shorter ones.
+		arrays := make([][]Datum, len(o.plan.ArrExprs))
+		maxLen := 0
+		for i, arrExpr := range o.plan.ArrExprs {
+			arrD, err := evalExpr(arrExpr, outerRow, ctx)
+			if err != nil {
+				return err
+			}
+			if arrD.IsNull() {
+				arrays[i] = nil
+			} else {
+				arrays[i] = expandArrayDatum(arrD)
+			}
+			if len(arrays[i]) > maxLen {
+				maxLen = len(arrays[i])
+			}
+		}
+		o.rows = make([]Row, maxLen)
+		for pos := range maxLen {
+			row := make(Row, len(arrays))
+			for j, arr := range arrays {
+				if pos < len(arr) {
+					row[j] = arr[pos]
+				} else {
+					row[j] = NullDatum
+				}
+			}
+			o.rows[pos] = row
+		}
+		return nil
+	}
+
+	// Single-arg form.
 	arrD, err := evalExpr(o.plan.ArrExpr, outerRow, ctx)
 	if err != nil {
 		return err

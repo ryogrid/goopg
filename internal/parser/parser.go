@@ -392,6 +392,26 @@ func (p *parser) parseStatement() (Stmt, error) {
 identLedStatement:
 	if t.Kind == TokenIdent {
 		switch strings.ToLower(t.Value) {
+		case "start":
+			// START [TRANSACTION [...]] is a synonym for BEGIN.
+			p.advance() // consume "start"
+			_ = p.acceptKeyword(KwTransaction)
+			return p.parseBeginStart(t.Pos)
+		case "discard":
+			// DISCARD { ALL | SEQUENCES | PLANS | TEMP | TEMPORARY }
+			p.advance() // consume "discard"
+			mode := "ALL"
+			switch {
+			case p.acceptIdentKeyword("all"):
+				mode = "ALL"
+			case p.acceptIdentKeyword("sequences"):
+				mode = "SEQUENCES"
+			case p.acceptIdentKeyword("plans"):
+				mode = "PLANS"
+			case p.acceptIdentKeyword("temp"), p.acceptIdentKeyword("temporary"):
+				mode = "TEMP"
+			}
+			return &DiscardStmt{pos: t.Pos, Mode: mode}, nil
 		case "fetch":
 			return p.parseFetchCursor()
 		case "move":
@@ -744,6 +764,17 @@ func (p *parser) parseBegin() (Stmt, error) {
 	t := p.advance() // BEGIN
 	s := &BeginStmt{pos: t.Pos}
 	_ = p.acceptKeyword(KwWork) || p.acceptKeyword(KwTransaction)
+	return p.parseBeginModes(s)
+}
+
+// parseBeginStart handles START TRANSACTION [...] — a synonym for BEGIN.
+func (p *parser) parseBeginStart(pos int) (Stmt, error) {
+	// "start" ident and optional TRANSACTION keyword already consumed.
+	s := &BeginStmt{pos: pos}
+	return p.parseBeginModes(s)
+}
+
+func (p *parser) parseBeginModes(s *BeginStmt) (Stmt, error) {
 	// Optional transaction modes.
 	for {
 		switch {

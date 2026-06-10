@@ -69,6 +69,23 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			return s.handleShowAll(w, sess)
 		}
 		return s.handleShow(w, sess, name)
+	// SET LOCAL SESSION AUTHORIZATION name — must check before generic "SET LOCAL ".
+	case strings.HasPrefix(upper, "SET LOCAL SESSION AUTHORIZATION "),
+		upper == "SET LOCAL SESSION AUTHORIZATION":
+		if connTx != nil {
+			role := strings.TrimSpace(matchable[len("SET LOCAL SESSION AUTHORIZATION"):])
+			role = strings.Trim(role, `"'`)
+			switch strings.ToUpper(role) {
+			case "", "DEFAULT", "RESET", "POSTGRES":
+				connTx.NonSuperuserRole = ""
+			default:
+				connTx.NonSuperuserRole = role
+			}
+		}
+		if err := w.WriteCommandComplete("SET"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	case strings.HasPrefix(upper, "SET LOCAL "):
 		return s.handleSet(w, sess, matchable[len("SET LOCAL "):], true)
 	// SET SESSION AUTHORIZATION name — track non-superuser role for privilege checks.

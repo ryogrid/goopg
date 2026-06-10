@@ -76,6 +76,26 @@ type TableOidExpr struct {
 func (e *TableOidExpr) Pos() int { return e.pos }
 func (*TableOidExpr) exprNode()  {}
 
+// MergeActionExpr evaluates to the action string ('INSERT','UPDATE','DELETE')
+// within a MERGE RETURNING expression. The executor reads ctx.MergeAction.
+// M0100-0007.
+type MergeActionExpr struct{ pos int }
+
+func (e *MergeActionExpr) Pos() int { return e.pos }
+func (*MergeActionExpr) exprNode()  {}
+
+// MergeWholeRowRef evaluates to the composite row value for the old or new
+// target row in a MERGE RETURNING clause. Returns a NULL datum when the row
+// is absent (old is absent for INSERT; new is absent for DELETE), rather than
+// a non-null composite with all-null fields. M0100-0007.
+type MergeWholeRowRef struct {
+	pos   int
+	IsOld bool // true = old (pre-action) row; false = new (post-action) row
+}
+
+func (e *MergeWholeRowRef) Pos() int { return e.pos }
+func (*MergeWholeRowRef) exprNode()  {}
+
 // CTIDExpr is the per-row `ctid` system column for a heap scan.
 // The block/offset pair is injected at runtime by seqScanOp via
 // MaterializedSlot.hasCTID. M0097-0038.
@@ -952,14 +972,41 @@ func (n *GenerateSubscripts) Output() Schema { return n.schema }
 // if it is invalid. M0097-0003.
 // FromUnnest expands an array expression into one row per element in the
 // FROM clause: `FROM unnest(arr_expr) alias(col)`. M0097-0035.
+// For multi-arg unnest: `FROM unnest(arr1, arr2, ...)`, ArrExprs holds each
+// array and the schema has one column per array (NULL-padded ZIP semantics).
 type FromUnnest struct {
-	pos     int
-	ArrExpr Expr
-	schema  Schema
+	pos      int
+	ArrExpr  Expr   // single-arg form (len(ArrExprs)==0)
+	ArrExprs []Expr // multi-arg form (len>=2)
+	schema   Schema
 }
 
 func (n *FromUnnest) Pos() int       { return n.pos }
 func (n *FromUnnest) Output() Schema { return n.schema }
+
+// OrdinalityWrap wraps a child FROM-clause SRF and appends a bigint ordinal
+// column (1-based, named by OrdColName). Used by WITH ORDINALITY.
+type OrdinalityWrap struct {
+	pos        int
+	Child      Node
+	OrdColName string
+	schema     Schema // child schema + ordinality column
+}
+
+func (n *OrdinalityWrap) Pos() int       { return n.pos }
+func (n *OrdinalityWrap) Output() Schema { return n.schema }
+
+// RowsFrom zips multiple FROM-clause SRFs side-by-side, NULL-padding the
+// shorter ones. Used by `ROWS FROM(f1, f2, ...)`. Each entry in Funcs is a
+// planned SRF node; the combined schema is the concatenation of all schemas.
+type RowsFrom struct {
+	pos    int
+	Funcs  []Node // one per ROWS FROM entry
+	schema Schema
+}
+
+func (n *RowsFrom) Pos() int       { return n.pos }
+func (n *RowsFrom) Output() Schema { return n.schema }
 
 type PgInputErrorInfo struct {
 	pos    int
@@ -1301,7 +1348,8 @@ const (
 
 // MergeWhenClause is the planned form of one WHEN arm.
 type MergeWhenClause struct {
-	Matched   bool
+	Matched  bool
+	BySource bool // true for WHEN NOT MATCHED BY SOURCE. M0100-0007.
 	Condition Expr // nil when no AND condition
 	Action    MergeActionKind
 

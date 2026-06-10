@@ -1072,15 +1072,24 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// Auto-generate values for SERIAL / BIGSERIAL / SMALLSERIAL columns
 		// and GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
 		// M0097-0009: if a serial/identity column's slot is still NullDatum (not provided
-		// in the INSERT), call nextval on the implicit sequence.
+		// in the INSERT), call nextval on the implicit sequence. An explicit NULL
+		// (column in INSERT target list but value is NULL) must NOT trigger
+		// auto-generation — it falls through to the NOT NULL check below.
 		for i, col := range cols {
-			if !row[i].IsNull() {
+			// Skip: already has a value, or was explicitly supplied (even as NULL).
+			if !row[i].IsNull() || !insertMissing[i] {
 				continue
 			}
 			seqName := ""
 			switch strings.ToLower(col.Type.Name) {
-			case "serial", "bigserial", "smallserial":
+			case "serial", "serial4", "bigserial", "serial8", "smallserial", "serial2":
 				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+				// If the standard tablename_colname_seq was renamed, look up by ownership.
+				if LookupSequence(seqName) == nil {
+					if owned := FindSequenceOwnedBy(strings.ToLower(o.plan.Table.Name) + "." + strings.ToLower(col.Name)); owned != "" {
+						seqName = owned
+					}
+				}
 			default:
 				if col.IdentityColumn {
 					seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
@@ -1094,6 +1103,31 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if err == nil && !v.IsNull() {
 				row[i] = v
 			}
+		}
+
+		// Integer range enforcement: coerce explicitly-provided int values to
+		// the column's declared type (catches smallint/int4 out-of-range and
+		// bigint overflow from over-wide numeric literals).
+		for i, col := range cols {
+			if insertMissing[i] || row[i].IsNull() {
+				continue
+			}
+			var coerced Datum
+			var cerr error
+			switch strings.ToLower(col.Type.Name) {
+			case "int2", "smallint", "smallserial", "serial2":
+				coerced, cerr = evalCast(row[i], "int2", o.plan.Pos())
+			case "int4", "integer", "int", "serial", "serial4":
+				coerced, cerr = evalCast(row[i], "int4", o.plan.Pos())
+			case "int8", "bigint", "bigserial", "serial8":
+				coerced, cerr = evalCast(row[i], "int8", o.plan.Pos())
+			default:
+				continue
+			}
+			if cerr != nil {
+				return nil, cerr
+			}
+			row[i] = coerced
 		}
 
 		// BEFORE INSERT triggers (M0096-0012).
@@ -3847,10 +3881,85 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 		}
 		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
 		if err != nil || key == nil {
-			continue
+			// Fall back to expression-column encoding for expression-based indexes
+			// (e.g. CREATE UNIQUE INDEX ON t(lower(col))). encodeIndexKeyFromCols
+			// returns nil when idx.Columns[i]=="" (expression column); evaluate the
+			// stored ColExprs to produce the btree key so concurrent sessions can
+			// detect the in-progress insert via the arbiter scan. M0100-0005.
+			key = encodeExprIndexKey(ctx, idx, tbl, row)
+			if key == nil {
+				continue
+			}
 		}
 		_ = tree.Insert(key, ptr)
 	}
+}
+
+// encodeExprIndexKey encodes a btree key for an expression-based index by
+// resolving and evaluating each ColExpr in idx against the given row.
+// Returns nil if any expression column lacks a stored ColExpr, fails to
+// evaluate, or produces NULL (NULLs don't participate in unique constraints).
+// Used by maintainUniqueIndexesForInsert as a fallback when encodeIndexKeyFromCols
+// returns nil (which happens for indexes like CREATE UNIQUE INDEX ON t(lower(col))).
+func encodeExprIndexKey(ctx *Context, idx *catalog.Index, tbl *catalog.Table, row Row) []byte {
+	if len(idx.ColExprs) == 0 {
+		return nil
+	}
+	var hasExpr bool
+	for i, colName := range idx.Columns {
+		if colName == "" && i < len(idx.ColExprs) && idx.ColExprs[i] != nil {
+			hasExpr = true
+			break
+		}
+	}
+	if !hasExpr {
+		return nil
+	}
+	var out []byte
+	for i, colName := range idx.Columns {
+		if colName != "" {
+			// Plain column — encode normally.
+			var col *catalog.Column
+			var colOrd int
+			for j := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[j].Name, colName) {
+					col = &tbl.Columns[j]
+					colOrd = j
+					break
+				}
+			}
+			if col == nil || colOrd >= len(row) {
+				return nil
+			}
+			v := row[colOrd]
+			if v.IsNull() {
+				return nil
+			}
+			keyPart, err := encodeBTreeKeyForColumn(v, col, 0)
+			if err != nil {
+				return nil
+			}
+			out = append(out, keyPart...)
+		} else if i < len(idx.ColExprs) && idx.ColExprs[i] != nil {
+			// Expression column — resolve then evaluate.
+			planExpr, err := planner.ResolveIndexPredicate(*idx.ColExprs[i], tbl)
+			if err != nil || planExpr == nil {
+				return nil
+			}
+			v, err := evalExpr(planExpr, row, ctx)
+			if err != nil || v.IsNull() {
+				return nil
+			}
+			k := encodeArbiterExprKey(v, 0)
+			if k == nil {
+				return nil
+			}
+			out = append(out, k...)
+		} else {
+			return nil // expression column without stored ColExpr
+		}
+	}
+	return out
 }
 
 // checkUniqueIndexesForInsert enforces unique-constraint violations at INSERT

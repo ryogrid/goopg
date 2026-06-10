@@ -1664,6 +1664,9 @@ func (c *InMemory) registerSystemTables() {
 			// relpartbound: partition bound expression tree for partition children.
 			// Stores the pre-formatted "FOR VALUES ..." string; pg_get_expr returns it as-is.
 			{Name: "relpartbound", Type: Type{Name: "pg_node_tree"}, Ordinal: 23},
+			// relhassubclass: true if any child tables (inheritance or partition children)
+			// or child indexes (partition index children) exist. M0097-0026.
+			{Name: "relhassubclass", Type: Type{Name: "bool"}, Ordinal: 24},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -1749,9 +1752,10 @@ func (c *InMemory) registerSystemTables() {
 				"2",                          // relam: heap access method OID (OID 2)
 				strconv.Itoa(int(t.OID)),     // relfilenode: equals OID (no rewrite tracking in v0)
 				partBound,                    // relpartbound: partition bound string for children
+				func() string { if len(c.partitionChildren[t.OID]) > 0 { return "t" }; return "f" }(), // relhassubclass
 			})
 		}
-		// Emit index rows (relkind='i') so pg_class can be used to count indexes.
+		// Emit index rows (relkind='i'/'I') so pg_class can be used to count indexes.
 		idxKeys := make([]string, 0, len(c.indexes))
 		for k := range c.indexes {
 			idxKeys = append(idxKeys, k)
@@ -1783,10 +1787,20 @@ func (c *InMemory) registerSystemTables() {
 					idxPers = "t"
 				}
 			}
+			// 'I' = partitioned index (has partition children); 'i' = regular index.
+			hasIdxChildren := len(c.indexPartitionChildren[idx.OID]) > 0
+			idxRelkind := "i"
+			if hasIdxChildren {
+				idxRelkind = "I"
+			}
+			idxHasSubclass := "f"
+			if hasIdxChildren {
+				idxHasSubclass = "t"
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),  // oid
 				idx.Name,                    // relname
-				"i",                         // relkind = index
+				idxRelkind,                  // relkind: 'I' if partitioned, 'i' otherwise
 				strconv.Itoa(int(idxNsOID)), // relnamespace
 				idxPers,                     // relpersistence
 				"0",                         // reltoastrelid
@@ -1808,6 +1822,7 @@ func (c *InMemory) registerSystemTables() {
 				idxRelam,                    // relam: index access method OID
 				strconv.Itoa(int(idx.OID)), // relfilenode: equals OID
 				"",                          // relpartbound: indexes are never partition children
+				idxHasSubclass,              // relhassubclass: true if partitioned index
 			})
 		}
 		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
@@ -1823,7 +1838,7 @@ func (c *InMemory) registerSystemTables() {
 			"0",        // reltoastrelid
 			"0",        // relpages
 			"t",        // relispopulated
-			"24",       // relnatts: 24 columns (including relpartbound added M0097-0023)
+			"25",       // relnatts: 25 columns (including relhassubclass added M0097-0026)
 			"n",        // relreplident
 			"0",        // relchecks
 			"t",        // relhasindex (pg_class itself has indexes)
@@ -1839,6 +1854,7 @@ func (c *InMemory) registerSystemTables() {
 			"2",        // relam: heap access method OID
 			"1259",     // relfilenode: equals OID for pg_class
 			"",         // relpartbound: pg_class is not a partition child
+			"f",        // relhassubclass: pg_class itself has no subclasses
 		})
 		return out
 	}
@@ -2596,6 +2612,9 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "conppeqop", Type: Type{Name: "oid[]"}, Ordinal: 22},
 			{Name: "confdelsetcols", Type: Type{Name: "int2[]"}, Ordinal: 23},
 			{Name: "conbin", Type: Type{Name: "text"}, Ordinal: 24},
+			// conenforced: PG18 column; true = constraint is enforced (default),
+			// false = NOT ENFORCED. goopg v0 always enforces. M0097-0026.
+			{Name: "conenforced", Type: Type{Name: "bool"}, Ordinal: 25},
 		},
 		OID: 2606,
 	}
@@ -2612,7 +2631,7 @@ func (c *InMemory) registerSystemTables() {
 				if nc.Name == "" || nc.OID == 0 {
 					continue
 				}
-				row := make([]string, 25)
+				row := make([]string, 26)
 				row[0] = fmt.Sprintf("%d", nc.OID)  // oid
 				row[1] = nc.Name                    // conname
 				row[2] = "2200"                     // connamespace (public)
@@ -2637,6 +2656,7 @@ func (c *InMemory) registerSystemTables() {
 				row[17] = "f"                             // connoinherit
 				row[18] = "f"                             // conperiod
 				row[24] = nc.Expr                         // conbin
+				row[25] = "t"                             // conenforced: always true in v0
 				out = append(out, row)
 			}
 		}
@@ -2661,7 +2681,7 @@ func (c *InMemory) registerSystemTables() {
 			} else if idx.IsExclusion {
 				contype = "x"
 			}
-			row := make([]string, 25)
+			row := make([]string, 26)
 			row[0] = fmt.Sprintf("%d", idx.OID)
 			row[1] = idx.Name
 			row[2] = "2200"
@@ -2682,6 +2702,7 @@ func (c *InMemory) registerSystemTables() {
 			row[17] = "f"
 			row[18] = "f"
 			row[19] = "{" + strings.Join(keyNums, ",") + "}"
+			row[25] = "t" // conenforced: always true in v0
 			out = append(out, row)
 		}
 		// Emit NOT NULL constraints (contype='n', PG18). M0097-0023.
@@ -2700,7 +2721,7 @@ func (c *InMemory) registerSystemTables() {
 						break
 					}
 				}
-				row := make([]string, 25)
+				row := make([]string, 26)
 				row[0] = fmt.Sprintf("%d", nc.OID)
 				row[1] = nc.Name
 				row[2] = "2200"
@@ -2731,6 +2752,7 @@ func (c *InMemory) registerSystemTables() {
 				if colOrd > 0 {
 					row[19] = fmt.Sprintf("{%d}", colOrd)
 				}
+				row[25] = "t" // conenforced: always true in v0
 				out = append(out, row)
 			}
 		}
@@ -2764,6 +2786,24 @@ func (c *InMemory) registerSystemTables() {
 			out = append(out, []string{
 				fmt.Sprintf("%d", tbl.OID),
 				fmt.Sprintf("%d", tbl.PartitionParentOID),
+				fmt.Sprintf("%d", seq),
+				"f",
+			})
+		}
+		// Emit index partition rows: each index with PartitionParentOID set is a
+		// partition child of its parent index. These rows enable the join pattern:
+		//   pg_index LEFT JOIN pg_inherits ON (indexrelid = inhrelid)
+		// used by indexing.sql to discover partitioned-index parent/child chains.
+		idxParentSeq := make(map[uint32]int)
+		for _, idx := range c.indexes {
+			if idx.PartitionParentOID == 0 {
+				continue
+			}
+			idxParentSeq[idx.PartitionParentOID]++
+			seq := idxParentSeq[idx.PartitionParentOID]
+			out = append(out, []string{
+				fmt.Sprintf("%d", idx.OID),
+				fmt.Sprintf("%d", idx.PartitionParentOID),
 				fmt.Sprintf("%d", seq),
 				"f",
 			})

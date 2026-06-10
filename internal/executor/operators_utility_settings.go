@@ -111,6 +111,21 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 			return nil, &ExecError{Code: "42704", Pos: stmt.Pos(), Message: err.Error()}
 		}
 		return nil, EOF
+	case *parser.DiscardStmt:
+		if o.done {
+			return nil, EOF
+		}
+		o.done = true
+		// DISCARD SEQUENCES (and DISCARD ALL) clear per-session currval/lastval state.
+		if stmt.Mode == "SEQUENCES" || stmt.Mode == "ALL" {
+			if o.ctx != nil {
+				o.ctx.CurrSeqVals = map[string]int64{}
+				o.ctx.LastSeqSet = false
+				o.ctx.LastSeqVal = 0
+				o.ctx.LastSeqName = ""
+			}
+		}
+		return nil, EOF
 	default:
 		if o.done {
 			return nil, EOF

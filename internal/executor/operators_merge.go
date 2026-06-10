@@ -73,15 +73,52 @@ func (o *mergeOp) Open(ctx *Context) error {
 
 func (o *mergeOp) Close() error { return nil }
 
-// collectReturningRow evaluates the RETURNING expressions against row and
-// appends the result to o.retRows. No-op when plan has no RETURNING clause.
-func (o *mergeOp) collectReturningRow(row Row) {
+// collectReturningRow evaluates the RETURNING expressions for one MERGE action.
+// oldRow is the pre-action target row (nil = NULLs for INSERT).
+// newRow is the post-action target row (nil = NULLs for DELETE).
+// The evaluation row has layout: [std || old || new] where std is the
+// post-action row for INSERT/UPDATE and pre-action row for DELETE.
+// M0100-0007.
+func (o *mergeOp) collectReturningRow(action planner.MergeActionKind, oldRow, newRow Row) {
 	if len(o.plan.Returning) == 0 {
 		return
 	}
+	n := len(o.plan.Target.Columns)
+	nullRow := make(Row, n)
+
+	var stdRow, oldR, newR Row
+	switch action {
+	case planner.MergeActionInsert:
+		stdRow = newRow
+		oldR = nullRow
+		newR = newRow
+	case planner.MergeActionDelete:
+		stdRow = oldRow
+		oldR = oldRow
+		newR = nullRow
+	default: // UPDATE
+		stdRow = newRow
+		oldR = oldRow
+		newR = newRow
+	}
+
+	combined := make(Row, 3*n)
+	if len(stdRow) > 0 {
+		copy(combined[0:n], stdRow)
+	}
+	if len(oldR) > 0 {
+		copy(combined[n:2*n], oldR)
+	}
+	if len(newR) > 0 {
+		copy(combined[2*n:3*n], newR)
+	}
+
+	o.ctx.MergeAction = action
+	o.ctx.MergeOldRow = oldRow
+	o.ctx.MergeNewRow = newRow
 	retRow := make([]Datum, len(o.plan.Returning))
 	for i, expr := range o.plan.Returning {
-		val, _ := evalExpr(expr, row, o.ctx)
+		val, _ := evalExpr(expr, combined, o.ctx)
 		retRow[i] = val
 	}
 	o.retRows = append(o.retRows, retRow)
@@ -143,6 +180,17 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 	// Step 2: scan target, apply WHEN MATCHED clauses.
 	// For partitioned tables, scan all partition children (the parent has no rows). M0100-0005.
 	var mods []mergePendingMod
+
+	// unmatchedTarget records a target row that had no matching source row,
+	// for WHEN NOT MATCHED BY SOURCE processing in step 2b. M0100-0007.
+	type unmatchedTarget struct {
+		rel    storage.RelFileNode
+		tblRef *catalog.Table
+		blk    storage.BlockNumber
+		slot   uint16
+		tgtRow Row
+	}
+	var unmatchedTargets []unmatchedTarget
 
 	// For partitioned tables, scan only the children (parent has no rows).
 	// For non-partitioned tables, scan only the parent. M0100-0005.
@@ -216,6 +264,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 		o.ctx.Pool.Unpin(s)
 
 		for _, vt := range visible {
+			matchedSrc := false
 			for si := range srcRows {
 				combined := mergedRow(vt.tgtRow, srcRows[si].row)
 				v, err := evalExpr(o.plan.On, combined, o.ctx)
@@ -227,6 +276,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				}
 				// ON matched — first matching WHEN MATCHED clause wins.
 				srcRows[si].matched = true
+				matchedSrc = true
 				for _, clause := range o.plan.Clauses {
 					if !clause.Matched {
 						continue
@@ -264,9 +314,65 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				}
 				break // first source match wins
 			}
+			// Target row had no matching source row — record for WHEN NOT MATCHED BY SOURCE. M0100-0007.
+			if !matchedSrc {
+				unmatchedTargets = append(unmatchedTargets, unmatchedTarget{
+					rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx, tgtRow: vt.tgtRow,
+				})
+			}
 		}
 	} // end for blk
 	} // end for scanTbl
+
+	// Step 2b: WHEN NOT MATCHED BY SOURCE — target rows with no source match. M0100-0007.
+	// Evaluate conditions/actions against a null-padded source row so that
+	// expressions referencing source columns simply get NULL.
+	if len(unmatchedTargets) > 0 {
+		srcColCount := len(o.plan.Source.Output())
+		nullSrcRow := make(Row, srcColCount)
+		for _, ut := range unmatchedTargets {
+			combined := mergedRow(ut.tgtRow, nullSrcRow)
+			for _, clause := range o.plan.Clauses {
+				if clause.Matched || !clause.BySource {
+					continue
+				}
+				if !mergeClauseCondMatches(clause, combined, o.ctx) {
+					continue
+				}
+				switch clause.Action {
+				case planner.MergeActionUpdate:
+					newRow := make(Row, n)
+					for i := range tbl.Columns {
+						if i >= len(clause.UpdateSet) || clause.UpdateSet[i] == nil {
+							newRow[i] = ut.tgtRow[i]
+							continue
+						}
+						val, err := evalExpr(clause.UpdateSet[i], combined, o.ctx)
+						if err != nil {
+							newRow[i] = ut.tgtRow[i]
+							continue
+						}
+						newRow[i] = val
+					}
+					_ = computeGeneratedColumns(ut.tblRef.Columns, newRow)
+					mods = append(mods, mergePendingMod{
+						rel: ut.rel, tblRef: ut.tblRef, blk: ut.blk, slot: ut.slot,
+						action: planner.MergeActionUpdate, newRow: newRow,
+						tgtRow: cloneRow(ut.tgtRow),
+					})
+				case planner.MergeActionDelete:
+					mods = append(mods, mergePendingMod{
+						rel: ut.rel, tblRef: ut.tblRef, blk: ut.blk, slot: ut.slot,
+						action: planner.MergeActionDelete,
+						tgtRow: cloneRow(ut.tgtRow),
+					})
+				case planner.MergeActionDoNothing:
+					// skip
+				}
+				break // first matching clause wins
+			}
+		}
+	}
 
 	// Apply pending modifications (with EPQ retry loop for concurrent updates).
 	for i := range mods {
@@ -294,9 +400,9 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			// Collect RETURNING row using post-EPQ values (mod is a pointer so
 			// applyMod's EPQ re-evaluation of mod.newRow propagates here).
 			if mod.action == planner.MergeActionUpdate {
-				o.collectReturningRow(mod.newRow)
+				o.collectReturningRow(planner.MergeActionUpdate, mod.tgtRow, mod.newRow)
 			} else if mod.action == planner.MergeActionDelete {
-				o.collectReturningRow(mod.tgtRow)
+				o.collectReturningRow(planner.MergeActionDelete, mod.tgtRow, nil)
 			}
 		}
 	}
@@ -381,7 +487,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			}
 			maintainUniqueIndexesForInsert(o.ctx, insertTbl, insertTbl.Columns, row, ptr)
 			o.rowsAffected++
-			o.collectReturningRow(row)
+			o.collectReturningRow(planner.MergeActionInsert, nil, row)
 			break // first matching clause wins
 		}
 	}
