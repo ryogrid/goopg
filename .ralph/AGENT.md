@@ -170,6 +170,14 @@ test suite, and it MUST pass cleanly:
 scripts/ralph-precommit-test.sh
 ```
 
+For executor/planner/codec changes, additionally run the TPC-H silent-regression
+spot-check (fresh capped server + Q12/Q13 canonical row counts, ~1 min; skips
+cleanly when no TPC-H data dir is loaded):
+
+```bash
+scripts/tpch-spotcheck.sh
+```
+
 This runs exactly the test set that CI's **"Run unit and component tests"**
 step runs (`.github/workflows/test.yml`): the whole module minus the
 cluster-backed packages that need a live goopg/PostgreSQL server. A green run
@@ -207,11 +215,18 @@ global -rx SymbolName           # locate references
 global -f path/to/file.c        # list symbols defined in a file
 ```
 
+Faster than grep/global for most lookups: the `mcp__any-script__pg_*` MCP tools
+query a pre-built symbol database over this tree —
+`pg_search_symbols` (SQL-LIKE patterns like `heap_%`), `pg_symbol_source`,
+`pg_symbol_overview`/`pg_symbol_document`, and `pg_references_to`/`pg_references_from`
+for caller/callee analysis. Prefer them; fall back to `global -x` when they miss.
+
 When porting any concept, cite the upstream file path (e.g.
 `postgres/src/backend/storage/buffer/bufmgr.c`) in the relevant design doc
 and/or code comment. Never modify, vendor, or import code from `./postgres/`.
 
-Markdowned official PostgreSQL documentation is placed `postgres/official_docs_in_md/` for easy reference and linking. When citing the official docs, link to
+Markdowned official PostgreSQL documentation is placed `postgres/official_docs_in_md/` for easy reference and linking. When citing the official docs, link to the
+corresponding file under that directory (repository-relative path).
 
 ## Design reference policy
 
