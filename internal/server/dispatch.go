@@ -1609,15 +1609,10 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						// for normal ones. Convert KindNumeric to float64 and use %g. M0097-0003.
 						valueBuf = appendFloat8Text(valueBuf, d)
 					case "char", "bpchar":
-						// Pad char(N)/bpchar(N) values to declared width with trailing spaces.
-						// PostgreSQL always returns char(N) padded to N bytes. M0097-0003.
+						// bpcharout (PG) uses bcTruelen which trims trailing spaces before
+						// sending over the wire. Input coercion already strips trailing spaces
+						// (codec.go), so just emit the stored value without re-padding.
 						valueBuf = d.AppendValueText(valueBuf)
-						if len(sc.Type.Args) > 0 {
-							width := int(sc.Type.Args[0])
-							for len(valueBuf)-start < width {
-								valueBuf = append(valueBuf, ' ')
-							}
-						}
 					case "date":
 						// Date columns display as YYYY-MM-DD. M0097-0004.
 						if d.Kind == executor.KindTime {

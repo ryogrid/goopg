@@ -2244,12 +2244,31 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							epqDoUpdate = true
 							continue
 						}
+						// M0100-0011: RR/Serializable firstSnap is frozen at BEGIN;
+						// HasInProgress may still return true for an XID that has
+						// since aborted. Confirm via the manager's global abort list.
+						if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
+							epqDoUpdate = true
+							continue
+						}
 						continue // still in-progress; retry
 					}
-					// Concurrent tx committed — row was updated.
+					// Concurrent tx committed — row was updated or deleted.
 					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+						errMsg := "could not serialize access due to concurrent update"
+						if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: pu.blk}); perr == nil {
+							sp.RLock()
+							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), pu.slot); gerr == nil {
+								ctid := ot.Header.CTID
+								if ctid.Block == pu.blk && ctid.Offset == pu.slot {
+									errMsg = "could not serialize access due to concurrent delete"
+								}
+							}
+							sp.RUnlock()
+							o.ctx.Pool.Unpin(sp)
+						}
 						return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
-							Message: "could not serialize access due to concurrent update"}
+							Message: errMsg}
 					}
 					// RC: follow HOT chain and re-evaluate WHERE + SET.
 					// Before deciding the chain terminated, check the
@@ -2512,14 +2531,15 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	// loop forever. The two-pass approach trades a bit of memory for
 	// straightforward iteration semantics.
 	type pendingUpdate struct {
-		rel     storage.RelFileNode
-		blk     storage.BlockNumber
-		slot    uint16
-		cols    []catalog.Column // columns of the source relation
-		newRow  Row
-		retRow  Row            // parent-aligned row for RETURNING (nil = use newRow); M0097-0078
-		oldRow  Row            // for BEFORE UPDATE trigger firing
-		scanTbl *catalog.Table // table the row came from (M0100-0005o: partition-child triggers)
+		rel         storage.RelFileNode
+		blk         storage.BlockNumber
+		slot        uint16
+		cols        []catalog.Column // columns of the source relation
+		newRow      Row
+		retRow      Row            // parent-aligned row for RETURNING (nil = use newRow); M0097-0078
+		oldRow      Row            // for BEFORE UPDATE trigger firing
+		scanTbl     *catalog.Table // table the row came from (M0100-0005o: partition-child triggers)
+		beforeFired bool           // BEFORE trigger already fired in Phase 1 (M0100-0011)
 	}
 	pending := make([]pendingUpdate, 0, 1)
 
@@ -2608,13 +2628,137 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				}
 			}
 			_ = computeGeneratedColumns(captureCols, newRow)
+
+			// M0100-0011: Phase 1 EPQ for all isolation levels — wait for any
+			// in-progress xmax before processing the next row, so BEFORE trigger
+			// and subsequent-row NOTICEs interleave correctly (PG per-row order).
+			// RC: follow HOT chain after concurrent commit. RR/SSI: raise 40001.
+			writeBlk, writeSlot := blk, slot
+			oldRow := cloneRow(evalRow)
+			beforeFiredP1 := false
+			if !isInheritChild {
+				for epqRetry := 0; ; epqRetry++ {
+					s, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: captureRel, Block: writeBlk})
+					if perr != nil {
+						return perr
+					}
+					s.Lock()
+					tupHdr, tErr := storage.PageGetHeapTuple(s.Page(), writeSlot)
+					noConflict := tErr != nil || !isConcurrentlyUpdated(tupHdr.Header, o.ctx.Tx.XID, &o.ctx.Snap)
+					xmax := tupHdr.Header.Xmax
+					s.Unlock()
+					o.ctx.Pool.Unpin(s)
+					if noConflict {
+						break
+					}
+					if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
+						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
+							Message: "could not serialize access due to concurrent update"}
+					}
+					if epqWait(o.ctx, xmax) {
+						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
+							Message: "could not serialize access due to concurrent update (deadlock)"}
+					}
+					visible, _ := epqRecheckVisible(o.ctx, captureRel, writeBlk, writeSlot)
+					if visible {
+						if !o.ctx.Snap.HasInProgress(xmax) {
+							break // xmax aborted; row unchanged
+						}
+						// RR/SSI: snapshot is frozen at BEGIN; HasInProgress may still
+						// return true for a xmax that has since settled globally.
+						if o.ctx.TxnMgr != nil {
+							if o.ctx.TxnMgr.HasAbortedXID(xmax) {
+								break // xmax globally aborted; row unchanged
+							}
+							if !o.ctx.TxnMgr.IsXIDActive(xmax) {
+								// xmax committed; frozen snapshot is stale. Raise 40001.
+								errMsg := "could not serialize access due to concurrent update"
+								if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: captureRel, Block: writeBlk}); perr == nil {
+									sp.RLock()
+									if ot, gerr := storage.PageGetHeapTuple(sp.Page(), writeSlot); gerr == nil {
+										ctid := ot.Header.CTID
+										if ctid.Block == writeBlk && ctid.Offset == writeSlot {
+											errMsg = "could not serialize access due to concurrent delete"
+										}
+									}
+									sp.RUnlock()
+									o.ctx.Pool.Unpin(sp)
+								}
+								return &ExecError{Code: "40001", Pos: o.plan.Pos(), Message: errMsg}
+							}
+						}
+						continue
+					}
+					// Concurrent tx committed (visible=false via fresh RC snapshot).
+					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+						// Distinguish update vs delete: self-pointer CTID means deleted.
+						errMsg := "could not serialize access due to concurrent update"
+						if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: captureRel, Block: writeBlk}); perr == nil {
+							sp.RLock()
+							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), writeSlot); gerr == nil {
+								ctid := ot.Header.CTID
+								if ctid.Block == writeBlk && ctid.Offset == writeSlot {
+									errMsg = "could not serialize access due to concurrent delete"
+								}
+							}
+							sp.RUnlock()
+							o.ctx.Pool.Unpin(sp)
+						}
+						return &ExecError{Code: "40001", Pos: o.plan.Pos(), Message: errMsg}
+					}
+					// RC: follow HOT chain and re-evaluate WHERE + SET.
+					if epqSlotMovedToAnotherPartition(o.ctx, captureRel, writeBlk, writeSlot) {
+						return errMovedToAnotherPartition(o.plan.Pos())
+					}
+					newBlk := writeBlk
+					newSlot, baseRow, found := epqFollowHOT(o.ctx, captureRel, writeBlk, writeSlot, captureCols, o.pred)
+					if !found {
+						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, captureRel, writeBlk, writeSlot, captureCols, o.pred); cFound {
+							newBlk, newSlot, baseRow, found = cBlk, cSlot, cRow, true
+						}
+					}
+					if !found {
+						return nil // row deleted by concurrent tx
+					}
+					clear(o.ctx.MultiAssignSubqCache)
+					for i := range captureCols {
+						if i < len(o.plan.Set) && o.plan.Set[i] != nil {
+							v, e := evalExpr(o.plan.Set[i], baseRow, o.ctx)
+							if e != nil {
+								return e
+							}
+							newRow[i] = v
+						} else {
+							if i < len(baseRow) {
+								newRow[i] = baseRow[i]
+							}
+						}
+					}
+					_ = computeGeneratedColumns(captureCols, newRow)
+					oldRow = cloneRow(baseRow)
+					writeBlk, writeSlot = newBlk, newSlot
+					continue
+				}
+				if len(scanTbl.Triggers) > 0 {
+					ret, ok := fireTriggers(o.ctx, scanTbl, "before", "update", oldRow, newRow)
+					if !ok {
+						return nil // RETURN NULL — skip row
+					}
+					newRow = ret
+				}
+				beforeFiredP1 = true
+			}
+
 			// Parent-aligned retRow so RETURNING exprs (parent ordinals) evaluate correctly.
 			var retRow Row
 			if isInheritChild && len(o.plan.Returning) > 0 {
 				retRow = remapChildRowToParent(newRow, inheritColMap)
 			}
-			pending = append(pending, pendingUpdate{rel: captureRel, blk: blk, slot: slot, cols: captureCols, newRow: newRow,
-				retRow: retRow, oldRow: cloneRow(evalRow), scanTbl: scanTbl})
+			pending = append(pending, pendingUpdate{
+				rel: captureRel, blk: writeBlk, slot: writeSlot, cols: captureCols,
+				newRow: newRow, retRow: retRow, oldRow: oldRow,
+				scanTbl: scanTbl, beforeFired: beforeFiredP1,
+			})
 			return nil
 		}); err != nil {
 			return nil, err
@@ -2630,7 +2774,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		if scanTblForTrig == nil {
 			scanTblForTrig = tbl
 		}
-		if len(scanTblForTrig.Triggers) > 0 {
+		if !pu.beforeFired && len(scanTblForTrig.Triggers) > 0 {
 			retRow, ok := fireTriggers(o.ctx, scanTblForTrig, "before", "update", pu.oldRow, pu.newRow)
 			if !ok {
 				continue // RETURN NULL — skip this row
@@ -2690,12 +2834,34 @@ func (o *updateOp) Next() (TupleSlot, error) {
 							epqDoUpdateSeq = true
 							continue // bypass EPQ on next iter; update code executes
 						}
+						// M0100-0011: RR/Serializable firstSnap is frozen at BEGIN;
+						// HasInProgress may still return true for an XID that has
+						// since aborted. Confirm via the manager's global abort list.
+						if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
+							epqDoUpdateSeq = true
+							continue
+						}
 						continue // still in-progress; retry
 					}
-					// Concurrent tx committed — row was updated.
+					// Concurrent tx committed — row was updated or deleted.
 					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+						// Distinguish UPDATE vs DELETE by checking the old
+						// tuple's CTID: a self-pointer means no new version
+						// exists (the row was deleted, not re-placed).
+						errMsg := "could not serialize access due to concurrent update"
+						if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: puRel, Block: pu.blk}); perr == nil {
+							sp.RLock()
+							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), pu.slot); gerr == nil {
+								ctid := ot.Header.CTID
+								if ctid.Block == pu.blk && ctid.Offset == pu.slot {
+									errMsg = "could not serialize access due to concurrent delete"
+								}
+							}
+							sp.RUnlock()
+							o.ctx.Pool.Unpin(sp)
+						}
 						return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
-							Message: "could not serialize access due to concurrent update"}
+							Message: errMsg}
 					}
 					// RC: follow HOT chain and re-evaluate WHERE + SET.
 					// Cross-partition UPDATE sentinel check (see comment in the
@@ -3002,13 +3168,14 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 
 	type victim struct {
-		rel     storage.RelFileNode
-		blk     storage.BlockNumber
-		slot    uint16
-		row     Row
-		retRow  Row              // parent-aligned row for RETURNING (nil = use row); M0097-0078
-		cols    []catalog.Column // for EPQ chain-following (M0100-0004)
-		scanTbl *catalog.Table   // table the row came from (M0100-0005o: partition-child triggers)
+		rel         storage.RelFileNode
+		blk         storage.BlockNumber
+		slot        uint16
+		row         Row
+		retRow      Row              // parent-aligned row for RETURNING (nil = use row); M0097-0078
+		cols        []catalog.Column // for EPQ chain-following (M0100-0004)
+		scanTbl     *catalog.Table   // table the row came from (M0100-0005o: partition-child triggers)
+		beforeFired bool             // BEFORE trigger already fired in Phase 1 (M0100-0011)
 	}
 	// Collect victims from parent + partition/inheritance children. M0096-0013.
 	// For inheritance children, remap rows to parent ordinals for predicate/RETURNING. M0097-0078.
@@ -3059,7 +3226,91 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					retRow = parentAligned
 				}
 			}
-			victims = append(victims, victim{rel: captureRel, blk: blk, slot: slot, row: cloneRow(row), retRow: retRow, cols: captureCols, scanTbl: captureTbl})
+			// M0100-0011: Phase 1 inline EPQ for RC non-inheritance rows.
+			// Wait for any in-progress xmax BEFORE scanMatching processes the
+			// next row, so WHERE NOTICEs and trigger NOTICEs interleave per PG's
+			// per-row scan semantics (key-a EPQ → key-b scan, not key-b before
+			// key-a's EPQ wait).
+			// M0100-0011: Phase 1 EPQ for all isolation levels — same rationale
+			// as updateOp Phase 1: block on in-progress xmax before processing
+			// the next row so BEFORE trigger + subsequent NOTICEs stay in order.
+			deleteBlk, deleteSlot, deleteRow := blk, slot, row
+			beforeFiredDel := false
+			if !isDelInheritChild {
+				for epqRetry := 0; ; epqRetry++ {
+					s, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: captureRel, Block: deleteBlk})
+					if perr != nil {
+						return perr
+					}
+					s.Lock()
+					tupHdr, tErr := storage.PageGetHeapTuple(s.Page(), deleteSlot)
+					noConflict := tErr != nil || !isConcurrentlyUpdated(tupHdr.Header, o.ctx.Tx.XID, &o.ctx.Snap)
+					xmax := tupHdr.Header.Xmax
+					s.Unlock()
+					o.ctx.Pool.Unpin(s)
+					if noConflict {
+						break
+					}
+					if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
+						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
+							Message: "could not serialize access due to concurrent update"}
+					}
+					if epqWait(o.ctx, xmax) {
+						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
+							Message: "could not serialize access due to concurrent update (deadlock)"}
+					}
+					visible, _ := epqRecheckVisible(o.ctx, captureRel, deleteBlk, deleteSlot)
+					if visible {
+						if !o.ctx.Snap.HasInProgress(xmax) {
+							break // xmax aborted; row unchanged, proceed with delete
+						}
+						// RR/SSI: snapshot frozen at BEGIN; check global state.
+						if o.ctx.TxnMgr != nil {
+							if o.ctx.TxnMgr.HasAbortedXID(xmax) {
+								break // xmax globally aborted; row unchanged
+							}
+							if !o.ctx.TxnMgr.IsXIDActive(xmax) {
+								// xmax committed; frozen snapshot is stale. Raise 40001.
+								return &ExecError{Code: "40001", Pos: o.plan.Pos(),
+									Message: "could not serialize access due to concurrent update"}
+							}
+						}
+						continue
+					}
+					// Concurrent tx committed — row was updated or deleted.
+					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
+							Message: "could not serialize access due to concurrent update"}
+					}
+					if epqSlotMovedToAnotherPartition(o.ctx, captureRel, deleteBlk, deleteSlot) {
+						return errMovedToAnotherPartition(o.plan.Pos())
+					}
+					newBlk := deleteBlk
+					newSlot, newRow, found := epqFollowHOT(o.ctx, captureRel, deleteBlk, deleteSlot, captureCols, o.pred)
+					if !found {
+						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, captureRel, deleteBlk, deleteSlot, captureCols, o.pred); cFound {
+							newBlk, newSlot, newRow, found = cBlk, cSlot, cRow, true
+						}
+					}
+					if !found {
+						return nil // row deleted (or predicate no longer matches) via concurrent tx
+					}
+					deleteBlk, deleteSlot, deleteRow = newBlk, newSlot, cloneRow(newRow)
+					break
+				}
+				trigTbl := captureTbl
+				if trigTbl == nil {
+					trigTbl = tbl
+				}
+				if len(trigTbl.Triggers) > 0 {
+					_, ok := fireTriggers(o.ctx, trigTbl, "before", "delete", cloneRow(deleteRow), nil)
+					if !ok {
+						return nil // trigger returned NULL — skip deletion
+					}
+				}
+				beforeFiredDel = true
+			}
+			victims = append(victims, victim{rel: captureRel, blk: deleteBlk, slot: deleteSlot, row: cloneRow(deleteRow), retRow: retRow, cols: captureCols, scanTbl: captureTbl, beforeFired: beforeFiredDel})
 			return nil
 		}); err != nil {
 			return nil, err
@@ -3074,7 +3325,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		if trigTbl == nil {
 			trigTbl = tbl
 		}
-		if len(trigTbl.Triggers) > 0 {
+		if !v.beforeFired && len(trigTbl.Triggers) > 0 {
 			_, ok := fireTriggers(o.ctx, trigTbl, "before", "delete", v.row, nil)
 			if !ok {
 				continue // trigger returned NULL — skip deletion
@@ -3130,9 +3381,16 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 						epqDoDelete = true
 						continue // bypass EPQ on next iter; delete code executes
 					}
+					// M0100-0011: RR/Serializable firstSnap is frozen at BEGIN;
+					// HasInProgress may still return true for an XID that has
+					// since aborted. Confirm via the manager's global abort list.
+					if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
+						epqDoDelete = true
+						continue
+					}
 					continue // still in-progress; retry
 				}
-				// Concurrent tx committed — row was updated.
+				// Concurrent tx committed — row was updated or deleted.
 				if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
 					return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
 						Message: "could not serialize access due to concurrent update"}
@@ -3723,14 +3981,16 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			ctx.Pool.Unpin(s)
 			return err
 		}
-		matches := make([]struct {
+		// Collect all visible tuples with decoded rows under RLock, then
+		// evaluate predicates and call fn outside the lock. This ensures
+		// per-row interleaving of WHERE side-effects (RAISE NOTICE) and
+		// callbacks (BEFORE triggers), matching PG's per-row scan semantics.
+		type visibleTuple struct {
 			slot     uint16
 			row      Row
 			lockedBy storage.TransactionID
-		}, 0, 1)
-		// Reusable row buffer — DecodeRowInto fills it without
-		// allocating (M0027-0001).  Copy into matches only for
-		// tuples that pass the predicate.
+		}
+		var visible []visibleTuple
 		scanRow := make(Row, len(cols))
 		for slot := uint16(1); slot <= uint16(count); slot++ {
 			tuple, err := storage.PageGetHeapTuple(page, slot)
@@ -3757,42 +4017,43 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			if err := DecodeRowIntoMctxPGTuple(scanRow, cols, tuple.Data, tuple.Bitmap, storedNatts, nil); err != nil {
 				continue // skip undecodable tuples (e.g. schema mismatch)
 			}
+			rowCopy := make(Row, len(cols))
+			copy(rowCopy, scanRow)
+			visible = append(visible, visibleTuple{
+				slot:     slot,
+				row:      rowCopy,
+				lockedBy: lockedByForeign(tuple.Header, ctx.Tx.XID),
+			})
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		// Process visible tuples one at a time: eval predicate then call fn
+		// immediately, so WHERE side-effects (NOTICE) and trigger NOTICEs
+		// interleave per-row rather than all predicates firing before all
+		// callbacks.
+		for _, vt := range visible {
 			if pred != nil {
-				v, err := evalExpr(pred, scanRow, ctx)
+				v, err := evalExpr(pred, vt.row, ctx)
 				if err != nil {
-					s.RUnlock()
-					ctx.Pool.Unpin(s)
 					return err
 				}
 				if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
 					continue
 				}
 			}
-			// Matching tuple — copy the row (scanRow is reused).
-			matchedRow := make(Row, len(cols))
-			copy(matchedRow, scanRow)
-			matches = append(matches, struct {
-				slot     uint16
-				row      Row
-				lockedBy storage.TransactionID
-			}{slot: slot, row: matchedRow, lockedBy: lockedByForeign(tuple.Header, ctx.Tx.XID)})
-		}
-		s.RUnlock()
-		ctx.Pool.Unpin(s)
-		for _, m := range matches {
 			// M0021 step 2b: if the tuple is row-locked by
 			// another live xact (HEAP_XMAX_LOCK_ONLY +
 			// xmax != ours), block on the locker's tuple-tag
 			// in the lockmgr. ReleaseAll on the locker's
 			// commit/abort wakes us up; we then proceed
 			// with the UPDATE / DELETE atomic stamp.
-			if m.lockedBy != storage.InvalidTransactionID {
-				ptr := storage.ItemPointer{Block: blk, Offset: m.slot}
+			if vt.lockedBy != storage.InvalidTransactionID {
+				ptr := storage.ItemPointer{Block: blk, Offset: vt.slot}
 				if err := ctx.acquireTupleLock(rel, ptr, lockmgr.ExclusiveLock); err != nil {
 					return err
 				}
 			}
-			if err := fn(blk, m.slot, m.row); err != nil {
+			if err := fn(blk, vt.slot, vt.row); err != nil {
 				return err
 			}
 		}

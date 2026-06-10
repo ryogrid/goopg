@@ -223,6 +223,22 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			insertedForLeaf = remapRowForPartition(parentCols, partLeaf.Columns, inserted)
 		}
 
+		// Fire BEFORE INSERT trigger inline — PG fires BEFORE triggers per-row
+		// before the conflict probe, so BEFORE INSERT NOTICEs appear before any
+		// lock wait (M0100-0011).
+		if len(writeTbl.Triggers) > 0 {
+			ret, ok := fireTriggers(o.ctx, writeTbl, "before", "insert", nil, insertedForLeaf)
+			if !ok {
+				continue // BEFORE INSERT returned NULL — skip the row
+			}
+			insertedForLeaf = ret
+			if partLeaf != nil {
+				inserted = remapRowForPartition(partLeaf.Columns, parentCols, insertedForLeaf)
+			} else {
+				inserted = insertedForLeaf
+			}
+		}
+
 		// probeArbiterWaiting calls encodeArbiterKey with o.plan.Table (parent)
 		// columns and reads inserted[parent_col_ord]. Always pass parent-order
 		// inserted for key encoding; conflictRow is decoded in leaf order (cols).
@@ -233,6 +249,9 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		if !conflicted {
 			if err := o.applyInsert(rel, writeTbl, cols, insertedForLeaf, arbiterKey); err != nil {
 				return nil, err
+			}
+			if len(writeTbl.Triggers) > 0 {
+				fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf)
 			}
 			o.appendUpsertRetRow(inserted)
 			o.rowsAffected++
@@ -320,6 +339,9 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 						if err := o.applyInsert(rel, writeTbl, cols, insertedForLeaf, arbiterKey); err != nil {
 							return nil, err
 						}
+						if len(writeTbl.Triggers) > 0 {
+							fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf)
+						}
 						o.appendUpsertRetRow(inserted)
 						o.rowsAffected++
 						continue nextSourceRow
@@ -355,8 +377,24 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				if uerr := checkUniqueIndexesForUpdate(o.ctx, writeTbl, cols, conflictRow, updatedForLeaf, false, o.plan.Pos()); uerr != nil {
 					return nil, uerr
 				}
+				// Fire BEFORE UPDATE trigger per-row before applying the update (M0100-0011).
+				if len(writeTbl.Triggers) > 0 {
+					ret, ok := fireTriggers(o.ctx, writeTbl, "before", "update", conflictRow, updatedForLeaf)
+					if !ok {
+						continue nextSourceRow
+					}
+					updatedForLeaf = ret
+					if partLeaf != nil {
+						updated = remapRowForPartition(partLeaf.Columns, parentCols, updatedForLeaf)
+					} else {
+						updated = updatedForLeaf
+					}
+				}
 				if err := o.applyUpdate(rel, writeTbl, cols, conflictPtr, updatedForLeaf, updated); err != nil {
 					return nil, err
+				}
+				if len(writeTbl.Triggers) > 0 {
+					fireTriggers(o.ctx, writeTbl, "after", "update", conflictRow, updatedForLeaf)
 				}
 				o.appendUpsertRetRow(updated)
 				o.rowsAffected++
