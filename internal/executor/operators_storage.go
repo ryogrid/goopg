@@ -2260,7 +2260,9 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							sp.RLock()
 							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), pu.slot); gerr == nil {
 								ctid := ot.Header.CTID
-								if ctid.Block == pu.blk && ctid.Offset == pu.slot {
+								// goopg initial CTID is {InvalidBlockNumber,0}; stampOldCtid
+								// only runs on UPDATE. So InvalidBlockNumber means deleted.
+								if ctid.Block == storage.InvalidBlockNumber {
 									errMsg = "could not serialize access due to concurrent delete"
 								}
 							}
@@ -2677,7 +2679,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 									sp.RLock()
 									if ot, gerr := storage.PageGetHeapTuple(sp.Page(), writeSlot); gerr == nil {
 										ctid := ot.Header.CTID
-										if ctid.Block == writeBlk && ctid.Offset == writeSlot {
+										// goopg initial CTID is {InvalidBlockNumber,0}; stampOldCtid
+										// only runs on UPDATE. InvalidBlockNumber ⇒ deleted.
+										if ctid.Block == storage.InvalidBlockNumber {
 											errMsg = "could not serialize access due to concurrent delete"
 										}
 									}
@@ -2691,13 +2695,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					// Concurrent tx committed (visible=false via fresh RC snapshot).
 					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
-						// Distinguish update vs delete: self-pointer CTID means deleted.
+						// Distinguish update vs delete: goopg initial CTID is
+						// {InvalidBlockNumber,0}; stampOldCtid only runs on UPDATE.
 						errMsg := "could not serialize access due to concurrent update"
 						if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: captureRel, Block: writeBlk}); perr == nil {
 							sp.RLock()
 							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), writeSlot); gerr == nil {
 								ctid := ot.Header.CTID
-								if ctid.Block == writeBlk && ctid.Offset == writeSlot {
+								if ctid.Block == storage.InvalidBlockNumber {
 									errMsg = "could not serialize access due to concurrent delete"
 								}
 							}
@@ -2845,15 +2850,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					// Concurrent tx committed — row was updated or deleted.
 					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
-						// Distinguish UPDATE vs DELETE by checking the old
-						// tuple's CTID: a self-pointer means no new version
-						// exists (the row was deleted, not re-placed).
+						// Distinguish UPDATE vs DELETE: goopg initial CTID is
+						// {InvalidBlockNumber,0}; stampOldCtid only runs on UPDATE.
 						errMsg := "could not serialize access due to concurrent update"
 						if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: puRel, Block: pu.blk}); perr == nil {
 							sp.RLock()
 							if ot, gerr := storage.PageGetHeapTuple(sp.Page(), pu.slot); gerr == nil {
 								ctid := ot.Header.CTID
-								if ctid.Block == pu.blk && ctid.Offset == pu.slot {
+								if ctid.Block == storage.InvalidBlockNumber {
 									errMsg = "could not serialize access due to concurrent delete"
 								}
 							}
