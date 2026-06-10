@@ -73,9 +73,11 @@ type connTxState struct {
 	// Session-scoped: persists across statements and transactions. M0097-0042.
 	SeqCurrVals map[string]int64
 	// SeqLastVal / SeqLastSet track the most recent nextval across all sequences
-	// (for lastval()). Session-scoped. M0097-0042.
-	SeqLastVal int64
-	SeqLastSet bool
+	// (for lastval()). SeqLastName is the name of the sequence that produced it
+	// (to detect if that sequence was dropped). Session-scoped. M0097-0042.
+	SeqLastVal  int64
+	SeqLastSet  bool
+	SeqLastName string
 	// PendingEnumValues tracks enum labels added via ALTER TYPE … ADD VALUE
 	// inside the current explicit transaction.  They are "unsafe" until COMMIT.
 	// map[enumTypeName][label]=true.  Cleared on COMMIT/ROLLBACK (End()).

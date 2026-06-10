@@ -2189,7 +2189,9 @@ func isNumericTypeName(name string) bool {
 		// integer base so `serial_col = 1` / `serial_col + 1` type-check the
 		// same as int columns. The stored catalog type stays "serial" because
 		// the INSERT auto-increment path (operators_storage.go) keys off it.
-		"serial", "bigserial", "smallserial":
+		"serial", "bigserial", "smallserial",
+		// PostgreSQL aliases: serial2=smallserial, serial4=serial, serial8=bigserial
+		"serial2", "serial4", "serial8":
 		return true
 	}
 	return false
@@ -2480,9 +2482,9 @@ func isDateTimeTarget(name string) bool {
 func isNumericOrIntegerTarget(name string) bool {
 	switch strings.ToLower(name) {
 	case "numeric", "decimal",
-		"int2", "smallint",
-		"int4", "integer", "int",
-		"int8", "bigint",
+		"int2", "smallint", "serial2", "smallserial",
+		"int4", "integer", "int", "serial4", "serial",
+		"int8", "bigint", "serial8", "bigserial",
 		"float", "float4", "real",
 		"float8", "double precision", "double":
 		return true

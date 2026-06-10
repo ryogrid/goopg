@@ -179,7 +179,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt,
 		*parser.ReindexStmt, *parser.ClusterStmt,
 		*parser.SetTransactionStmt,
-		*parser.PrepareStmt, *parser.ExecuteStmt, *parser.DeallocateStmt:
+		*parser.PrepareStmt, *parser.ExecuteStmt, *parser.DeallocateStmt,
+		*parser.DiscardStmt:
 		return &Utility{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CheckpointStmt:
@@ -255,7 +256,11 @@ type resolveContext struct {
 	// walking through a lateralSibling context, so OuterColumnRef
 	// nodes get the correct level for the executor's OuterRows stack.
 	// M0097-0065.
-	lateralSibling bool
+	lateralSibling   bool
+	// allowMergeAction enables resolution of merge_action() FuncCall to
+	// MergeActionExpr in MERGE RETURNING context. M0100-0007.
+	allowMergeAction bool
+
 	// havingAgg, when non-nil, marks this context as the outer parent
 	// for a HAVING clause subquery. Aggregate function calls that match
 	// entries in havingAgg.aggregateByKey are "outer aggregate refs" —
@@ -299,6 +304,10 @@ type rangeBinding struct {
 	// assigned" (CTE / subquery-only / ON CONFLICT excluded) and
 	// falls back to Name-only matching in downstream rebinds.
 	sourceIdx int16
+	// mergeRowKind: 0=normal, 1=MERGE old-row, 2=MERGE new-row.
+	// Bare alias references produce a MergeWholeRowRef (NULL-aware composite)
+	// instead of a RowExpr for absent rows in MERGE RETURNING. M0100-0007.
+	mergeRowKind int
 	// notReferenceable marks a binding that is present in scope for
 	// error-diagnostic purposes only — any attempt to actually
 	// reference it (qualified or unqualified) produces the PG
@@ -1851,7 +1860,11 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		return planSubqueryRangeVar(rv, cat, sourceIdx, lateralCtx)
 	}
 	if rv.TableFunc != nil {
-		return planTableFuncRangeVar(rv, cat, sourceIdx, lateralCtx)
+		node, b, err := planTableFuncRangeVar(rv, cat, sourceIdx, lateralCtx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		return node, b, nil
 	}
 	// CTE substitution (M0016-0002): an unschemed name takes the
 	// CTE before falling through to the catalog. CTE names are
@@ -2928,11 +2941,38 @@ func exprOutputName(e parser.Expr) string {
 	return "?column?"
 }
 
+// wrapOrdinality wraps node and binding with an OrdinalityWrap plan node,
+// appending a bigint ordinality column as the last column. The ordinality
+// column name is taken from the last element of rv.Columns (if present) or
+// defaults to "ordinality".
+func wrapOrdinality(node Node, b rangeBinding, rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding) {
+	ordColName := "ordinality"
+	// If column aliases were provided, the last one names the ordinality column.
+	// The preceding ones were already applied when planning the child node.
+	if len(rv.Columns) > 0 {
+		ordColName = rv.Columns[len(rv.Columns)-1]
+	}
+	childSchema := node.Output()
+	ordCol := SchemaColumn{Name: ordColName, Type: catalog.Type{Name: "int8"}, SourceTableIdx: sourceIdx}
+	newSchema := append(append(Schema(nil), childSchema...), ordCol)
+	wrapped := &OrdinalityWrap{pos: node.Pos(), Child: node, OrdColName: ordColName, schema: newSchema}
+	// Also extend the binding table columns
+	newCols := append(append([]catalog.Column(nil), b.table.Columns...), catalog.Column{
+		Name: ordColName, Type: catalog.Type{Name: "int8"}, Ordinal: len(b.table.Columns),
+	})
+	newTbl := &catalog.Table{Name: b.table.Name, Columns: newCols, Virtual: b.table.Virtual}
+	return wrapped, rangeBinding{table: newTbl, alias: b.alias, offset: b.offset, sourceIdx: b.sourceIdx}
+}
+
 // planTableFuncRangeVar plans a table-valued function in the FROM clause.
 // Currently only generate_series(start, stop[, step]) and pg_input_error_info(value, type)
 // are supported.
 func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
+	// ROWS FROM(func1, func2, ...) [WITH ORDINALITY]
+	if len(tf.RowsFuncs) > 0 {
+		return planRowsFrom(rv, cat, sourceIdx, lateralCtx)
+	}
 	if strings.EqualFold(tf.Name, "pg_input_error_info") {
 		return planPgInputErrorInfo(rv, sourceIdx)
 	}
@@ -3050,33 +3090,64 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 							outCols = append(outCols, catalog.Column{Name: name, Type: typ, Ordinal: len(outCols)})
 						}
 					}
+					// Strip ordinality alias if WITH ORDINALITY.
+					userSrfColAliases := rv.Columns
+					if tf.WithOrdinality && len(userSrfColAliases) > 0 {
+						userSrfColAliases = userSrfColAliases[:len(userSrfColAliases)-1]
+					}
 					var tbl *catalog.Table
 					var schema Schema
 					if len(outCols) > 0 {
 						// Multi-column schema from OUT parameters.
+						// Apply column aliases.
+						for i := range outCols {
+							if i < len(userSrfColAliases) {
+								outCols[i].Name = userSrfColAliases[i]
+							}
+						}
 						tbl = &catalog.Table{Name: alias, Columns: outCols}
 						for _, c := range outCols {
 							schema = append(schema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: sourceIdx})
 						}
 					} else {
-						colName := alias
-						if len(rv.Columns) > 0 {
-							colName = rv.Columns[0]
+						retTypeName := r.ReturnType.Name
+						if retTypeName == "" {
+							retTypeName = "text"
 						}
-						retType := r.ReturnType.Name
-						if retType == "" {
-							retType = "text"
+						// If the return type is a composite (table) type, expand its columns.
+						if compTbl, ok := cat.LookupTable(parser.ObjectName{Name: retTypeName}); ok && len(compTbl.Columns) > 0 {
+							compositeCols := make([]catalog.Column, len(compTbl.Columns))
+							copy(compositeCols, compTbl.Columns)
+							for i := range compositeCols {
+								compositeCols[i].Ordinal = i
+								if i < len(userSrfColAliases) {
+									compositeCols[i].Name = userSrfColAliases[i]
+								}
+							}
+							tbl = &catalog.Table{Name: alias, Columns: compositeCols}
+							for _, c := range compositeCols {
+								schema = append(schema, SchemaColumn{Name: c.Name, Type: c.Type, SourceTableIdx: sourceIdx})
+							}
+						} else {
+							colName := alias
+							if len(userSrfColAliases) > 0 {
+								colName = userSrfColAliases[0]
+							}
+							tbl = &catalog.Table{
+								Name: alias,
+								Columns: []catalog.Column{
+									{Name: colName, Type: catalog.Type{Name: retTypeName}, Ordinal: 0},
+								},
+							}
+							schema = Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: retTypeName}, SourceTableIdx: sourceIdx}}
 						}
-						tbl = &catalog.Table{
-							Name: alias,
-							Columns: []catalog.Column{
-								{Name: colName, Type: catalog.Type{Name: retType}, Ordinal: 0},
-							},
-						}
-						schema = Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: retType}, SourceTableIdx: sourceIdx}}
 					}
 					node := &UserSrfScan{pos: tf.Pos(), Routine: r, Args: resolvedArgs, schema: schema}
 					b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+					if tf.WithOrdinality {
+						node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
+						return node2, b2, nil
+					}
 					return node, b, nil
 				}
 			}
@@ -3119,9 +3190,14 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if alias == "" {
 		alias = "generate_series"
 	}
+	// Strip ordinality alias from column list if WITH ORDINALITY.
+	gsColAliases := rv.Columns
+	if tf.WithOrdinality && len(gsColAliases) > 0 {
+		gsColAliases = gsColAliases[:len(gsColAliases)-1]
+	}
 	colName := alias
-	if len(rv.Columns) > 0 {
-		colName = rv.Columns[0]
+	if len(gsColAliases) > 0 {
+		colName = gsColAliases[0]
 	}
 	// Use int4 when args are integer literals or int4-typed (PG overload resolution). M0097-0122.
 	seriesType := "int8"
@@ -3139,7 +3215,150 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	schema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: seriesType}, SourceTableIdx: sourceIdx}}
 	node := &GenerateSeries{pos: tf.Pos(), Start: start, Stop: stop, Step: step, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	if tf.WithOrdinality {
+		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
+		return node2, b2, nil
+	}
 	return node, b, nil
+}
+
+// planRowsFrom plans ROWS FROM(func1, func2, ...) [WITH ORDINALITY].
+// Each function is planned as a UserSrfScan/GenerateSeries/FromUnnest. The
+// results are zipped side-by-side with NULL-padding for shorter outputs.
+func planRowsFrom(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	// Strip ordinality alias from column list if WITH ORDINALITY.
+	colAliases := rv.Columns
+	if tf.WithOrdinality && len(colAliases) > 0 {
+		colAliases = colAliases[:len(colAliases)-1]
+	}
+	// Plan each function independently. Track how many output columns each produces.
+	var funcNodes []Node
+	var schema Schema
+	var tableCols []catalog.Column
+	colOffset := 0
+	for i, entry := range tf.RowsFuncs {
+		// Build a fake RangeVar for this function entry.
+		entryRV := parser.RangeVar{}
+		entryRV = rv // copy alias/columns
+		entryRV.Columns = nil
+		entryRV.Alias = rv.Alias
+		// Assign a sub-block of column aliases to this function.
+		// We can't know in advance how many columns each function produces
+		// without type-resolution, so plan without aliases first, then rename.
+		fakeRef := &parser.TableFuncRef{}
+		*fakeRef = parser.TableFuncRef{} // zero value
+
+		// Plan the SRF using the user-SRF path.
+		var entryNode Node
+		var entryBinding rangeBinding
+		var err error
+		if cat != nil && cat.Routines() != nil {
+			cands := cat.Routines().LookupByName(parser.ObjectName{Name: entry.Name})
+			for _, r := range cands {
+				if r.ReturnsSet {
+					ctx := &resolveContext{}
+					if lateralCtx != nil {
+						ctx = lateralCtx
+					}
+					resolvedArgs := make([]Expr, len(entry.Args))
+					for j, a := range entry.Args {
+						re, err2 := resolveExpr(a, ctx)
+						if err2 != nil {
+							return nil, rangeBinding{}, err2
+						}
+						resolvedArgs[j] = re
+					}
+					alias := fmt.Sprintf("__rowsfunc_%d", i)
+					var outCols []catalog.Column
+					for k, mode := range r.ArgModes {
+						if mode == "o" || mode == "b" {
+							name := ""
+							if k < len(r.ArgNames) {
+								name = r.ArgNames[k]
+							}
+							if name == "" {
+								name = fmt.Sprintf("column%d", len(outCols)+1)
+							}
+							typ := catalog.Type{Name: "text"}
+							if k < len(r.ArgTypes) {
+								typ = r.ArgTypes[k]
+							}
+							outCols = append(outCols, catalog.Column{Name: name, Type: typ, Ordinal: len(outCols)})
+						}
+					}
+					var entrySchema Schema
+					var entryTableCols []catalog.Column
+					if len(outCols) > 0 {
+						for _, c := range outCols {
+							n := c.Name
+							if colOffset+len(entryTableCols) < len(colAliases) {
+								n = colAliases[colOffset+len(entryTableCols)]
+							}
+							entrySchema = append(entrySchema, SchemaColumn{Name: n, Type: c.Type, SourceTableIdx: sourceIdx})
+							entryTableCols = append(entryTableCols, catalog.Column{Name: n, Type: c.Type, Ordinal: len(tableCols) + len(entryTableCols)})
+						}
+					} else {
+						retType := catalog.Type{Name: "text"}
+						if r.ReturnType.Name != "" {
+							retType = r.ReturnType
+						}
+						n := strings.ToLower(entry.Name)
+						if colOffset+0 < len(colAliases) {
+							n = colAliases[colOffset]
+						}
+						entrySchema = Schema{SchemaColumn{Name: n, Type: retType, SourceTableIdx: sourceIdx}}
+						entryTableCols = []catalog.Column{{Name: n, Type: retType, Ordinal: len(tableCols)}}
+					}
+					entryNode = &UserSrfScan{pos: tf.Pos(), Routine: r, Args: resolvedArgs, schema: entrySchema}
+					entryBinding = rangeBinding{table: &catalog.Table{Name: alias, Columns: entryTableCols}, alias: alias, sourceIdx: sourceIdx}
+					break
+				}
+			}
+		}
+		if entryNode == nil {
+			// Fallback: treat as single-column text SRF.
+			ctx := &resolveContext{}
+			if lateralCtx != nil {
+				ctx = lateralCtx
+			}
+			resolvedArgs := make([]Expr, len(entry.Args))
+			for j, a := range entry.Args {
+				re, err2 := resolveExpr(a, ctx)
+				if err2 != nil {
+					return nil, rangeBinding{}, err2
+				}
+				resolvedArgs[j] = re
+			}
+			colName := strings.ToLower(entry.Name)
+			if colOffset < len(colAliases) {
+				colName = colAliases[colOffset]
+			}
+			entrySchema := Schema{SchemaColumn{Name: colName, Type: catalog.Type{Name: "text"}, SourceTableIdx: sourceIdx}}
+			entryNode = &UserSrfScan{pos: tf.Pos(), Routine: &catalog.Routine{Name: entry.Name, ReturnsSet: true, ReturnType: catalog.Type{Name: "text"}, ArgTypes: nil}, Args: resolvedArgs, schema: entrySchema}
+			entryBinding = rangeBinding{alias: entry.Name, sourceIdx: sourceIdx}
+		}
+		_ = err
+		_ = entryBinding
+		schema = append(schema, entryNode.Output()...)
+		for _, sc := range entryNode.Output() {
+			tableCols = append(tableCols, catalog.Column{Name: sc.Name, Type: sc.Type, Ordinal: len(tableCols)})
+		}
+		colOffset += len(entryNode.Output())
+		funcNodes = append(funcNodes, entryNode)
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "rows_from"
+	}
+	tbl := &catalog.Table{Name: alias, Columns: tableCols}
+	rowsFromNode := &RowsFrom{pos: tf.Pos(), Funcs: funcNodes, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	if tf.WithOrdinality {
+		rowsFromNode2, b2 := wrapOrdinality(rowsFromNode, b, rv, sourceIdx)
+		return rowsFromNode2, b2, nil
+	}
+	return rowsFromNode, b, nil
 }
 
 // planScalarFuncScan plans a scalar function in FROM clause that returns one
@@ -3191,53 +3410,104 @@ func planGenerateSubscripts(rv parser.RangeVar, sourceIdx int16, lateralCtx *res
 }
 
 // row with a single column of the given colType. Used for parse_ident etc.
-// planFromUnnest plans FROM unnest(array_expr) alias(col).
-// Expands an array expression into one row per element. M0097-0035.
+// planFromUnnest plans FROM unnest(array_expr [, ...]) alias(col [, ...]).
+// Single-arg: expands one array into one row per element. M0097-0035.
+// Multi-arg: zips multiple arrays, NULL-padding shorter ones. M0097-0xxx.
 func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
-	if len(tf.Args) != 1 {
+	if len(tf.Args) == 0 {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
-			Message: "unnest requires exactly 1 argument"}
+			Message: "unnest requires at least 1 argument"}
 	}
-	// Resolve the array argument. Use lateralCtx if provided (LATERAL FROM).
 	ctx := &resolveContext{}
 	if lateralCtx != nil {
 		ctx = lateralCtx
-	}
-	arrExpr, err := resolveExpr(tf.Args[0], ctx)
-	if err != nil {
-		return nil, rangeBinding{}, err
-	}
-	// Infer the element type from the array expression type (strip ALL [] for 2D). M0097-0125.
-	elemTypeName := "text"
-	arrType := exprType(arrExpr)
-	{
-		base := arrType.Name
-		for strings.HasSuffix(base, "[]") {
-			base = base[:len(base)-2]
-		}
-		if base != arrType.Name && base != "" {
-			elemTypeName = base
-		}
 	}
 	alias := rv.Alias
 	if alias == "" {
 		alias = "unnest"
 	}
-	colName := alias
-	if len(rv.Columns) > 0 {
-		colName = rv.Columns[0]
+	// Strip ordinality alias from column list if WITH ORDINALITY.
+	colAliases := rv.Columns
+	if tf.WithOrdinality && len(colAliases) > 0 {
+		colAliases = colAliases[:len(colAliases)-1]
 	}
-	elemType := catalog.Type{Name: elemTypeName}
-	tbl := &catalog.Table{
-		Name: alias,
-		Columns: []catalog.Column{
-			{Name: colName, Type: elemType, Ordinal: 0},
-		},
+	if len(tf.Args) == 1 {
+		// Single-arg form (original behaviour).
+		arrExpr, err := resolveExpr(tf.Args[0], ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		elemTypeName := "text"
+		arrType := exprType(arrExpr)
+		{
+			base := arrType.Name
+			for strings.HasSuffix(base, "[]") {
+				base = base[:len(base)-2]
+			}
+			if base != arrType.Name && base != "" {
+				elemTypeName = base
+			}
+		}
+		colName := alias
+		if len(colAliases) > 0 {
+			colName = colAliases[0]
+		}
+		elemType := catalog.Type{Name: elemTypeName}
+		tbl := &catalog.Table{
+			Name: alias,
+			Columns: []catalog.Column{
+				{Name: colName, Type: elemType, Ordinal: 0},
+			},
+		}
+		schema := Schema{SchemaColumn{Name: colName, Type: elemType, SourceTableIdx: sourceIdx}}
+		node := &FromUnnest{pos: tf.Pos(), ArrExpr: arrExpr, schema: schema}
+		b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+		if tf.WithOrdinality {
+			node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
+			return node2, b2, nil
+		}
+		return node, b, nil
 	}
-	schema := Schema{SchemaColumn{Name: colName, Type: elemType, SourceTableIdx: sourceIdx}}
-	node := &FromUnnest{pos: tf.Pos(), ArrExpr: arrExpr, schema: schema}
+	// Multi-arg form: zip N arrays. Each array becomes one output column.
+	arrExprs := make([]Expr, len(tf.Args))
+	for i, a := range tf.Args {
+		resolved, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		arrExprs[i] = resolved
+	}
+	// Column names: from alias list, or "unnest" for each column.
+	var tableCols []catalog.Column
+	var schema Schema
+	for i, arrExpr := range arrExprs {
+		colName := "unnest"
+		if i < len(colAliases) {
+			colName = colAliases[i]
+		}
+		elemTypeName := "text"
+		arrType := exprType(arrExpr)
+		{
+			base := arrType.Name
+			for strings.HasSuffix(base, "[]") {
+				base = base[:len(base)-2]
+			}
+			if base != arrType.Name && base != "" {
+				elemTypeName = base
+			}
+		}
+		elemType := catalog.Type{Name: elemTypeName}
+		tableCols = append(tableCols, catalog.Column{Name: colName, Type: elemType, Ordinal: i})
+		schema = append(schema, SchemaColumn{Name: colName, Type: elemType, SourceTableIdx: sourceIdx})
+	}
+	tbl := &catalog.Table{Name: alias, Columns: tableCols}
+	node := &FromUnnest{pos: tf.Pos(), ArrExprs: arrExprs, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	if tf.WithOrdinality {
+		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
+		return node2, b2, nil
+	}
 	return node, b, nil
 }
 
@@ -7040,8 +7310,9 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
 	clauses := make([]*MergeWhenClause, 0, len(s.Clauses))
 	for _, wc := range s.Clauses {
 		pc := &MergeWhenClause{
-			Matched: wc.Matched,
-			Action:  MergeActionKind(wc.Action),
+			Matched:  wc.Matched,
+			BySource: wc.BySource,
+			Action:   MergeActionKind(wc.Action),
 		}
 		if wc.Condition != nil {
 			cond, err := resolveExpr(wc.Condition, mergedCtx)
@@ -7092,12 +7363,23 @@ func planMerge(s *parser.MergeStmt, cat catalog.Catalog) (Node, error) {
 	}
 	m := &Merge{pos: s.Pos(), Target: tbl, Source: sourceNode, On: onExpr, Clauses: clauses}
 
-	// RETURNING clause (M0100 DML-CTE): resolve against target-table binding.
+	// RETURNING clause: resolve with target (offset 0), old (offset n), new (offset 2n).
+	// old/new are qualifiedOnly so they don't pollute unqualified column resolution
+	// but can be referenced as `old.col`, `new.col`, or as whole-row composites.
+	// merge_action() is enabled via allowMergeAction. M0100-0007.
 	if len(s.Returning) > 0 {
+		nn := len(tbl.Columns)
+		retSchema := make(Schema, 0, 3*nn)
+		retSchema = append(retSchema, tableSchemaWithSource(tbl, 1)...)
+		retSchema = append(retSchema, tableSchemaWithSource(tbl, 2)...)
+		retSchema = append(retSchema, tableSchemaWithSource(tbl, 3)...)
 		retCtx := newResolveContext([]rangeBinding{
 			{table: tbl, alias: targetAlias, offset: 0, sourceIdx: 1},
-		}, tableSchemaWithSource(tbl, 1))
+			{table: tbl, alias: "old", offset: nn, sourceIdx: 2, qualifiedOnly: true, mergeRowKind: 1},
+			{table: tbl, alias: "new", offset: 2 * nn, sourceIdx: 3, qualifiedOnly: true, mergeRowKind: 2},
+		}, retSchema)
 		retCtx.cat = cat
+		retCtx.allowMergeAction = true
 		exprs, schema, err := resolveTargets(s.Returning, retCtx)
 		if err != nil {
 			return nil, err
@@ -7316,6 +7598,16 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	}
 	if _, ok := e.(*CTIDExpr); ok {
 		return "ctid", catalog.Type{Name: "tid"}
+	}
+	// merge_action() uses the function name as the column label. M0100-0007.
+	if _, ok := e.(*MergeActionExpr); ok {
+		return "merge_action", catalog.Type{Name: "text"}
+	}
+	// MERGE old/new whole-row refs use the original alias name. M0100-0007.
+	if _, ok := e.(*MergeWholeRowRef); ok {
+		if cr, ok := t.Expr.(*parser.ColumnRef); ok {
+			return cr.Column, catalog.Type{Name: "text"}
+		}
 	}
 	// TypedStringLit `int2 'value'`: column name is the type name.
 	// Matches PostgreSQL's FigureColname() for `type 'string'` syntax. M0097-0003.
@@ -7604,6 +7896,10 @@ func exprType(e Expr) catalog.Type {
 	case *NullConst:
 		return catalog.Type{Name: "unknown"}
 	case *RowExpr:
+		return catalog.Type{Name: "text"} // composite displayed as text
+	case *MergeActionExpr:
+		return catalog.Type{Name: "text"}
+	case *MergeWholeRowRef:
 		return catalog.Type{Name: "text"} // composite displayed as text
 	case *TypedStringLit:
 		// Typed string literals carry their explicit type (e.g. int2 '2').
@@ -8078,7 +8374,7 @@ func isIntegerLikeType(name string) bool {
 	switch strings.ToLower(name) {
 	case "int2", "smallint", "int4", "integer", "int", "int8", "bigint",
 		// SERIAL family resolve to int2/int4/int8 (see analyzer.isNumericTypeName).
-		"smallserial", "serial", "bigserial":
+		"smallserial", "serial2", "serial", "serial4", "bigserial", "serial8":
 		return true
 	}
 	return false
@@ -8092,12 +8388,12 @@ func promoteIntType(a, b string) catalog.Type {
 	a = strings.ToLower(a)
 	b = strings.ToLower(b)
 	// SERIAL family promote as their integer base (serial→int4, etc.).
-	aIsSmall := a == "int2" || a == "smallint" || a == "smallserial"
-	bIsSmall := b == "int2" || b == "smallint" || b == "smallserial"
-	aIsInt4 := a == "int4" || a == "integer" || a == "int" || a == "serial"
-	bIsInt4 := b == "int4" || b == "integer" || b == "int" || b == "serial"
-	aIsInt8 := a == "int8" || a == "bigint" || a == "bigserial"
-	bIsInt8 := b == "int8" || b == "bigint" || b == "bigserial"
+	aIsSmall := a == "int2" || a == "smallint" || a == "smallserial" || a == "serial2"
+	bIsSmall := b == "int2" || b == "smallint" || b == "smallserial" || b == "serial2"
+	aIsInt4 := a == "int4" || a == "integer" || a == "int" || a == "serial" || a == "serial4"
+	bIsInt4 := b == "int4" || b == "integer" || b == "int" || b == "serial" || b == "serial4"
+	aIsInt8 := a == "int8" || a == "bigint" || a == "bigserial" || a == "serial8"
+	bIsInt8 := b == "int8" || b == "bigint" || b == "bigserial" || b == "serial8"
 	switch {
 	case aIsInt8 || bIsInt8:
 		return catalog.Type{Name: "int8"}
@@ -8539,6 +8835,10 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 		}
 		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: op}, nil
 	case *parser.FuncCall:
+		// merge_action() is only valid in MERGE RETURNING context. M0100-0007.
+		if strings.EqualFold(x.Name.String(), "merge_action") && len(x.Args) == 0 && !x.Star && ctx.allowMergeAction {
+			return &MergeActionExpr{pos: x.Pos()}, nil
+		}
 		if x.Over != nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "window functions must be planned via WindowAgg"}
 		}
@@ -8912,16 +9212,26 @@ func resolveColumnRefAt(x *parser.ColumnRef, ctx *resolveContext, level int) (Ex
 	}
 	// Whole-row variable: unqualified column name matches a binding alias → composite row.
 	// E.g. `select foo from (select 1) as foo` returns `(1)`. M0097-0020.
+	// qualifiedOnly bindings (e.g. MERGE RETURNING `old`/`new`) also match here
+	// by alias so that bare `old`/`new` produce a composite row value. M0100-0007.
 	for _, b := range ctx.bindings {
-		if b.qualifiedOnly {
+		if b.notReferenceable {
 			continue
 		}
 		name := b.alias
 		if name == "" {
+			if b.qualifiedOnly {
+				continue // qualifiedOnly with no alias cannot be a whole-row ref
+			}
 			name = b.table.Name
 		}
 		if !strings.EqualFold(x.Column, name) {
 			continue
+		}
+		// MERGE RETURNING old/new: return a MergeWholeRowRef so absent rows
+		// produce a true NULL composite rather than a non-null (,). M0100-0007.
+		if b.mergeRowKind > 0 {
+			return &MergeWholeRowRef{pos: x.Pos(), IsOld: b.mergeRowKind == 1}, true, nil
 		}
 		elems := make([]Expr, len(b.table.Columns))
 		types := make([]catalog.Type, len(b.table.Columns))

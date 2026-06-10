@@ -3684,9 +3684,9 @@ func (p *parser) parseAlter() (Stmt, error) {
 				stmt.Cycle = true
 			case p.acceptIdentKeyword("cache"):
 				_, _ = p.parseInt64()
-			case p.acceptIdentKeyword("set"):
+			case p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet):
 				// SET LOGGED / SET UNLOGGED — no-op.
-				_ = p.acceptIdentKeyword("logged") || p.acceptIdentKeyword("unlogged")
+				_ = p.acceptIdentKeyword("logged") || p.acceptIdentKeyword("unlogged") || p.acceptKeyword(KwUnlogged)
 			case p.acceptIdentKeyword("owned"):
 				_ = p.acceptKeyword(KwBy)
 				if p.acceptIdentKeyword("none") {
@@ -3869,7 +3869,8 @@ func (p *parser) parseAlter() (Stmt, error) {
 		// Consume one or more function attributes
 		for p.isFunctionAttribute() || (p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "owner")) ||
 			(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "rename")) ||
-			(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) {
+			(p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) ||
+			(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReset) {
 			// OWNER TO role — no-op (no role system in goopg v0)
 			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "owner") {
 				p.advance() // OWNER
@@ -3885,12 +3886,35 @@ func (p *parser) parseAlter() (Stmt, error) {
 				stmt.RenameTo = identText(newName)
 				continue
 			}
-			// SET SCHEMA schema — no-op
+			// SET SCHEMA schema | SET guc_name {TO|=} value | SET FROM CURRENT — no-op
 			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set") {
 				p.advance() // SET
 				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "schema") {
 					p.advance() // SCHEMA
 					p.advance() // schema name
+				} else if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "from") {
+					p.advance() // FROM
+					p.acceptIdentKeyword("current")
+				} else {
+					// SET guc_name {TO|=} value — consume name and value as no-op.
+					p.advance() // guc name (or quoted name)
+					if p.acceptKeyword(KwTo) || p.acceptSymbol("=") {
+						// Consume the value (could be DEFAULT, a literal, or FROM CURRENT).
+						if p.acceptIdentKeyword("default") || p.acceptIdentKeyword("from") {
+							p.acceptIdentKeyword("current")
+						} else {
+							p.advance() // value token
+						}
+					}
+				}
+				continue
+			}
+			// RESET guc_name | RESET ALL — no-op
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReset {
+				p.advance() // RESET
+				// ALL or a guc name.
+				if !p.acceptIdentKeyword("all") {
+					p.advance() // guc name
 				}
 				continue
 			}
@@ -4492,8 +4516,22 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		if err != nil {
 			return AlterTableAction{}, err
 		}
-		// Consume optional NOT VALID trailer.
-		_ = p.acceptKeyword(KwNot) && p.acceptIdentKeyword("valid")
+		// Consume optional NOT VALID and/or [NOT] ENFORCED trailers (PG18+).
+		// Possible orderings: NOT VALID, ENFORCED, NOT ENFORCED, NOT VALID ENFORCED.
+		if p.acceptKeyword(KwNot) {
+			if !p.acceptIdentKeyword("valid") {
+				_ = p.acceptIdentKeyword("enforced") // NOT ENFORCED
+			} else {
+				// NOT VALID — also accept optional trailing [NOT] ENFORCED.
+				if p.acceptKeyword(KwNot) {
+					_ = p.acceptIdentKeyword("enforced")
+				} else {
+					_ = p.acceptIdentKeyword("enforced")
+				}
+			}
+		} else {
+			_ = p.acceptIdentKeyword("enforced") // bare ENFORCED
+		}
 		act.Kind = AlterTableAddCheck
 		act.CheckExpr = expr
 		return act, nil

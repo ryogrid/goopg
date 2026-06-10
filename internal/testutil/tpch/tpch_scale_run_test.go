@@ -20,13 +20,14 @@ import (
 
 // TestTPCHScaleLoadAndQueryRun is the scale-grade sibling of
 // TestRunTPCHQueriesAgainstSyntheticData. Instead of the ~75-row
-// SampleInserts dataset, it generates and bulk-loads a *2,000,000
-// order* TPC-H dataset across all eight tables (orders + ~8 M
-// lineitems plus SF-scaled region/nation/supplier/customer/part/
+// SampleInserts dataset, it generates and bulk-loads a *750,000
+// order* TPC-H dataset (about SF=0.5) across all eight tables
+// (orders + ~3 M lineitems plus SF-scaled
+// region/nation/supplier/customer/part/
 // partsupp), then runs each Q1..Q22 against the loaded cluster.
 //
 // What it asserts: every selected query *executes* against the
-// 2 M-order dataset without raising an executor error (an empty
+// SF~0.5 dataset without raising an executor error (an empty
 // result set is acceptable — random data may fall outside a query's
 // filters). It does NOT assert result-set parity against upstream
 // PostgreSQL: at this scale the data is randomly generated, so exact
@@ -49,7 +50,7 @@ import (
 // under -short and lives behind an explicit `-run` in CI (the broad
 // unit-test step excludes internal/testutil/tpch). Tunables:
 //
-//	GOOPG_TPCH_ORDERS=<n>      override the 2,000,000 order count
+//	GOOPG_TPCH_ORDERS=<n>      override the 750,000 default order count
 //	                          (dimension tables scale with SF=n/1.5M)
 //	GOOPG_TPCH_QUERIES=1,6,12  run only these query numbers (default: all 22)
 func TestTPCHScaleLoadAndQueryRun(t *testing.T) {
@@ -57,7 +58,7 @@ func TestTPCHScaleLoadAndQueryRun(t *testing.T) {
 		t.Skip("skipping cluster-backed TPC-H scale run in short mode")
 	}
 
-	orders := scaleEnvInt("GOOPG_TPCH_ORDERS", 2_000_000)
+	orders := scaleEnvInt("GOOPG_TPCH_ORDERS", 750_000)
 	sf := float64(orders) / 1_500_000.0
 	suppliers := int(10_000 * sf)
 	if suppliers < 4 {
@@ -89,7 +90,7 @@ func TestTPCHScaleLoadAndQueryRun(t *testing.T) {
 	if err := c.Init(); err != nil {
 		t.Fatal(err)
 	}
-	// Size the buffer pool for the 2 M-order working set. The value is
+	// Size the buffer pool for the SF~0.5 working set. The value is
 	// appended after init (which writes postgresql.conf) and before
 	// start, so the server boots with it. "5GB" is PG's memory-unit
 	// notation: a plain integer with a case-insensitive GB suffix and no

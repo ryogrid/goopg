@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/goopg/goopg/internal/catalog"
 )
 
 // seqState holds the mutable state of one sequence.
@@ -144,12 +146,28 @@ func splitSeqName(name string) (schema, bare string) {
 }
 
 // LookupSequence returns the seqState for name, or nil if not found.
+// Tries both the bare name and the "public.<name>" qualified form to handle
+// sequences registered with or without schema prefix.
 func LookupSequence(name string) *seqState {
-	v, ok := seqRegistry.Load(seqKey(name))
-	if !ok {
-		return nil
+	k := seqKey(name)
+	if v, ok := seqRegistry.Load(k); ok {
+		return v.(*seqState)
 	}
-	return v.(*seqState)
+	// Try "public.<bare>" if input has no schema, or bare if input has "public." prefix.
+	if strings.Contains(k, ".") {
+		// Strip schema prefix and retry with bare name.
+		if _, bare, ok2 := strings.Cut(k, "."); ok2 {
+			if v, ok := seqRegistry.Load(bare); ok {
+				return v.(*seqState)
+			}
+		}
+	} else {
+		// Try with "public." prefix.
+		if v, ok := seqRegistry.Load("public." + k); ok {
+			return v.(*seqState)
+		}
+	}
+	return nil
 }
 
 // DropSequence removes a sequence from the registry. M0097-0038.
@@ -209,6 +227,26 @@ func SequenceOwnedBy(name string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ownedBy
+}
+
+// FindSequenceOwnedBy searches seqRegistry for a sequence whose ownedBy field
+// matches owner ("table.column"). Returns the sequence name, or "" if not found.
+func FindSequenceOwnedBy(owner string) string {
+	owner = strings.ToLower(owner)
+	var found string
+	seqRegistry.Range(func(k, v any) bool {
+		s := v.(*seqState)
+		s.mu.Lock()
+		ob := s.ownedBy
+		nm := s.seqName
+		s.mu.Unlock()
+		if ob == owner {
+			found = nm
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // SetSequenceOwnedBy records that the sequence with the given name is owned by
@@ -278,6 +316,21 @@ func SetSequenceCurrentValue(name string, val int64) bool {
 // evalNextval implements nextval(sequence_name text) → int8.
 // Advances the sequence and returns the new value. Also stores the
 // value in ctx.LastSeqVal and ctx.CurrSeqVals for currval/lastval.
+// seqNameFromDatum resolves a sequence name from a Datum argument.
+// When the caller uses 'seqname'::regclass, the cast produces a KindInt OID;
+// we resolve it back to a name via the catalog. Plain text args go through
+// StringValue as before.
+func seqNameFromDatum(d Datum, ctx *Context) string {
+	if d.Kind == KindInt && ctx != nil && ctx.Catalog != nil {
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if tbl, found := im.LookupTableByOID(uint32(d.Int)); found && tbl != nil {
+				return tbl.Name
+			}
+		}
+	}
+	return d.StringValue()
+}
+
 func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	if len(args) == 0 {
 		return NullDatum, nil
@@ -285,7 +338,7 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	if args[0].IsNull() {
 		return NullDatum, nil
 	}
-	name := args[0].StringValue()
+	name := seqNameFromDatum(args[0], ctx)
 	// Read-only transaction guard: non-temp sequences cannot be advanced.
 	if ctx != nil && ctx.Session != nil && ctx.Session.IsReadOnlyTxn() && !IsSequenceTemporary(name) {
 		return Datum{}, &ExecError{Code: "25006", Message: "cannot execute nextval() in a read-only transaction"}
@@ -306,6 +359,7 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 		ctx.CurrSeqVals[seqKey(name)] = v
 		ctx.LastSeqVal = v
 		ctx.LastSeqSet = true
+		ctx.LastSeqName = name
 	}
 	return Datum{Kind: KindInt, Int: v}, nil
 }
@@ -320,7 +374,7 @@ func evalCurrval(args []Datum, ctx *Context) (Datum, error) {
 	if args[0].IsNull() {
 		return NullDatum, nil
 	}
-	name := args[0].StringValue()
+	name := seqNameFromDatum(args[0], ctx)
 	if ctx == nil || ctx.CurrSeqVals == nil {
 		return Datum{}, &ExecError{Code: "55000", Message: fmt.Sprintf("currval of sequence %q is not yet defined in this session", name)}
 	}
@@ -341,7 +395,7 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 	if args[0].IsNull() || args[1].IsNull() {
 		return NullDatum, nil
 	}
-	name := args[0].StringValue()
+	name := seqNameFromDatum(args[0], ctx)
 	// Read-only transaction guard: non-temp sequences cannot be set.
 	if ctx != nil && ctx.Session != nil && ctx.Session.IsReadOnlyTxn() && !IsSequenceTemporary(name) {
 		return Datum{}, &ExecError{Code: "25006", Message: "cannot execute setval() in a read-only transaction"}
@@ -382,6 +436,7 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 		ctx.CurrSeqVals[seqKey(name)] = value
 		ctx.LastSeqVal = value
 		ctx.LastSeqSet = true
+		ctx.LastSeqName = name
 	}
 	return Datum{Kind: KindInt, Int: value}, nil
 }
@@ -390,6 +445,11 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 // Returns the most recent value returned by nextval in the current session.
 func evalLastval(ctx *Context) (Datum, error) {
 	if ctx == nil || !ctx.LastSeqSet {
+		return Datum{}, &ExecError{Code: "55000", Message: "lastval is not yet defined in this session"}
+	}
+	// If the last-used sequence was dropped, lastval() must error.
+	if ctx.LastSeqName != "" && LookupSequence(ctx.LastSeqName) == nil {
+		ctx.LastSeqSet = false
 		return Datum{}, &ExecError{Code: "55000", Message: "lastval is not yet defined in this session"}
 	}
 	return Datum{Kind: KindInt, Int: ctx.LastSeqVal}, nil

@@ -184,6 +184,7 @@
 
 # - Planner Cost Constants -
 
+#seq_page_cost = 1.0                    # 0-1e9
 #random_page_cost = 4.0                 # 0-1e9
 #effective_cache_size = 4GB             # 1-1099511627776 kB
 #jit_above_cost = 100000                # perform JIT compilation when query cost is above this; -1 disables
@@ -205,6 +206,7 @@
 
 # - Process Title / I/O Timing -
 
+#track_activities = on                  # collect info in pg_stat_activity
 #track_io_timing = off                  # collect per-I/O wait timing
 #jit = off                              # allow JIT compilation
 #compute_query_id = off                 # compute query identifiers
@@ -219,6 +221,7 @@
 # AUTOVACUUM
 #------------------------------------------------------------------------------
 
+#vacuum_cost_delay = 0                  # 0-100 ms; 0 disables cost-based delay
 #autovacuum_freeze_max_age = 200000000  # 100000-2000000000 xids
                                         # (change requires restart)
 
@@ -259,6 +262,7 @@
 # - Other Defaults -
 
 #standard_conforming_strings = on
+#default_with_oids = off               # removed in PG12; accepted as no-op
 
 
 #------------------------------------------------------------------------------

@@ -540,11 +540,15 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					typeName = resolved
 				}
 			}
+			serialTyp := strings.ToLower(c.Type.Name)
+			isSerialCol := serialTyp == "serial" || serialTyp == "serial4" ||
+				serialTyp == "bigserial" || serialTyp == "serial8" ||
+				serialTyp == "smallserial" || serialTyp == "serial2"
 			cols = append(cols, catalog.Column{
 				Name:             c.Name,
 				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
 				DeclaredTypeName: declaredTypeName,
-				NotNull:         c.NotNull || c.IdentityColumn,
+				NotNull:         c.NotNull || c.IdentityColumn || isSerialCol,
 				GeneratedExpr:   c.GeneratedExpr,
 				GeneratedAlways: c.GeneratedAlways,
 				DefaultExpr:     c.DefaultExpr,
@@ -881,6 +885,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			seqStart = c.IdentityStart
 		}
 		RegisterSequence(seqName, seqStart, 1, seqMin, seqMax, false)
+		// Set the data type so information_schema.sequences shows the correct type.
+		var seqDataType string
+		switch colTypeLow {
+		case "smallserial", "serial2":
+			seqDataType = "smallint"
+		case "bigserial", "serial8":
+			seqDataType = "bigint"
+		default:
+			seqDataType = "integer"
+		}
+		SetSequenceDataType(seqName, seqDataType)
 		// Record implicit ownership so DROP TABLE cascades to this sequence.
 		SetSequenceOwnedBy(seqName, strings.ToLower(s.Name.Name)+"."+strings.ToLower(c.Name))
 	}
@@ -3097,6 +3112,17 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		if s.IfExists {
 			return nil
 		}
+		// Fallback: implicit sequences (from SERIAL columns) have no catalog entry.
+		// Handle RENAME TABLE on them via the sequence registry directly.
+		for _, act := range s.Actions {
+			if act.Kind == parser.AlterTableRenameTable {
+				oldName := s.Name.Name
+				newName := act.NewName
+				if RenameSequence(oldName, newName) || RenameSequence("public."+oldName, newName) {
+					return nil
+				}
+			}
+		}
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
 	}
 	// Reject structural modifications to system catalogs. pg_catalog and
@@ -3311,15 +3337,42 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 		case parser.AlterTableRenameTable:
 			newName := act.NewName
+			oldBare := tbl.Name // capture before RenameTable updates tbl.Name
 			oldObjName := parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name}
 			newObjName := parser.ObjectName{Schema: tbl.Schema, Name: newName}
 			if err := o.ctx.Catalog.RenameTable(oldObjName, newObjName); err != nil {
 				return &ExecError{Code: "42P07", Pos: act.Pos(), Message: err.Error()}
 			}
 			if tbl.IsSequence {
-				oldFull := tbl.Schema + "." + tbl.Name
-				newFull := tbl.Schema + "." + newName
-				RenameSequence(oldFull, newFull)
+				// Build qualified names; fall back to bare name when schema is empty.
+				qualName := func(schema, name string) string {
+					if schema == "" {
+						return name
+					}
+					return schema + "." + name
+				}
+				oldFull := qualName(tbl.Schema, oldBare)
+				newFull := qualName(tbl.Schema, newName)
+				if !RenameSequence(oldFull, newFull) {
+					RenameSequence(oldBare, newFull)
+				}
+				// Regenerate the VirtualRows closure to reference the new registry key.
+				capturedNewFull := newFull
+				tbl.VirtualRows = func() [][]string {
+					lv, lc, called, ok2 := SequenceRowData(capturedNewFull)
+					if !ok2 {
+						return nil
+					}
+					calledStr := "f"
+					if called {
+						calledStr = "t"
+					}
+					return [][]string{{
+						fmt.Sprintf("%d", lv),
+						fmt.Sprintf("%d", lc),
+						calledStr,
+					}}
+				}
 			}
 		case parser.AlterTableRenameColumn:
 			oldColName := act.OldColumnName

@@ -437,6 +437,15 @@ type ResetStmt struct {
 func (s *ResetStmt) Pos() int  { return s.pos }
 func (s *ResetStmt) stmtNode() {}
 
+// DiscardStmt represents DISCARD { ALL | SEQUENCES | PLANS | TEMP | TEMPORARY }.
+type DiscardStmt struct {
+	pos  int
+	Mode string // "ALL", "SEQUENCES", "PLANS", "TEMP", "TEMPORARY"
+}
+
+func (s *DiscardStmt) Pos() int  { return s.pos }
+func (s *DiscardStmt) stmtNode() {}
+
 // ResTarget is one entry in a SELECT target list: `expr [AS alias]`.
 type ResTarget struct {
 	pos   int
@@ -463,9 +472,17 @@ type RangeVar struct {
 }
 
 // TableFuncRef is a table-valued function used in the FROM clause.
-// Currently only generate_series(start, stop [, step]) is recognised.
+// Handles generate_series, unnest, user-defined SETOF functions, and ROWS FROM.
 type TableFuncRef struct {
-	pos  int
+	pos            int
+	Name           string
+	Args           []Expr
+	WithOrdinality bool     // WITH ORDINALITY appends a bigint ordinal column
+	RowsFuncs      []RowsFromEntry // non-nil when ROWS FROM(...) syntax was used
+}
+
+// RowsFromEntry is one function call in a ROWS FROM(...) list.
+type RowsFromEntry struct {
 	Name string
 	Args []Expr
 }

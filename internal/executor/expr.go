@@ -244,6 +244,29 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// `tableoid` slot added by the partition-union wrapper.
 		// M0100-0005y.
 		return Datum{Kind: KindInt, Int: int64(x.TableOID)}, nil
+	case *planner.MergeActionExpr:
+		// MERGE RETURNING merge_action() — returns the action text for this row. M0100-0007.
+		switch ctx.MergeAction {
+		case planner.MergeActionInsert:
+			return NewStringDatum("INSERT"), nil
+		case planner.MergeActionUpdate:
+			return NewStringDatum("UPDATE"), nil
+		case planner.MergeActionDelete:
+			return NewStringDatum("DELETE"), nil
+		}
+		return Datum{}, nil
+	case *planner.MergeWholeRowRef:
+		// MERGE RETURNING old/new composite. nil row → true NULL. M0100-0007.
+		var row Row
+		if x.IsOld {
+			row = ctx.MergeOldRow
+		} else {
+			row = ctx.MergeNewRow
+		}
+		if row == nil {
+			return Datum{}, nil
+		}
+		return evalMergeWholeRow(row), nil
 	case *planner.CTIDExpr:
 		// `ctid` system column: per-row TID injected by seqScanOp
 		// into MaterializedSlot.hasCTID. M0097-0038.
@@ -10040,6 +10063,44 @@ func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error)
 		return NullDatum, nil
 	}
 	return NewStringDatum("(" + strings.Join(parts, ",") + ")"), nil
+}
+
+// evalMergeWholeRow formats a pre-materialised row as a composite text value
+// using the same quoting rules as evalRowExpr. Used for MERGE RETURNING
+// old/new composite references (MergeWholeRowRef). M0100-0007.
+func evalMergeWholeRow(row Row) Datum {
+	parts := make([]string, len(row))
+	for i, d := range row {
+		if d.IsNull() {
+			parts[i] = ""
+			continue
+		}
+		s := string(d.AppendValueText(nil))
+		needsQuote := s == ""
+		if !needsQuote {
+			for _, c := range s {
+				if c == ',' || c == '(' || c == ')' || c == '"' || c == '\\' || c == ' ' || c == '\t' || c == '\n' {
+					needsQuote = true
+					break
+				}
+			}
+		}
+		if needsQuote {
+			var b strings.Builder
+			b.WriteByte('"')
+			for _, c := range s {
+				if c == '"' || c == '\\' {
+					b.WriteByte('\\')
+				}
+				b.WriteRune(c)
+			}
+			b.WriteByte('"')
+			parts[i] = b.String()
+		} else {
+			parts[i] = s
+		}
+	}
+	return NewStringDatum("(" + strings.Join(parts, ",") + ")")
 }
 
 // parseTZHourMin parses "HH" or "HH:MM" into hours and minutes.

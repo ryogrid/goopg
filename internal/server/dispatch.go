@@ -251,6 +251,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		ectx.LastSeqVal = connTx.SeqLastVal
 		ectx.LastSeqSet = connTx.SeqLastSet
+		ectx.LastSeqName = connTx.SeqLastName
 		// Save sequence session state back to the connection after dispatch.
 		defer func() {
 			if ectx.CurrSeqVals != nil {
@@ -258,6 +259,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 			connTx.SeqLastVal = ectx.LastSeqVal
 			connTx.SeqLastSet = ectx.LastSeqSet
+			connTx.SeqLastName = ectx.LastSeqName
 		}()
 	}
 	ectx.Snap = snap
@@ -1395,6 +1397,10 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					}
 				}
 				connTx.Begin(ctx.Tx)
+				// Propagate READ ONLY / READ WRITE mode from START TRANSACTION / BEGIN.
+				if connTx.Session() != nil {
+					connTx.Session().SetReadOnlyTxn(txNode.ReadOnly)
+				}
 				if ctx.BeginLocalTransaction != nil {
 					ctx.BeginLocalTransaction()
 				}
@@ -1836,6 +1842,8 @@ func utilityTag(stmt parser.Stmt) string {
 		return "SET"
 	case *parser.ResetStmt:
 		return "RESET"
+	case *parser.DiscardStmt:
+		return "DISCARD"
 	}
 	return "OK"
 }
