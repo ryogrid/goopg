@@ -98,6 +98,7 @@ func (o *transactionOp) execBegin() error {
 		}
 	}
 	o.ctx.Session.BeginExplicitTransaction(tx, snap)
+	o.ctx.Session.SetReadOnlyTxn(o.plan.ReadOnly)
 	o.ctx.Tx = tx
 	o.ctx.Snap = snap.Clone()
 	if o.ctx.BeginLocalTransaction != nil {
@@ -273,6 +274,9 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 func (o *transactionOp) clearCtxTransaction() {
 	o.ctx.Tx = mvcc.Transaction{}
 	o.ctx.Snap = mvcc.Snapshot{}
+	if o.ctx.Session != nil {
+		o.ctx.Session.SetReadOnlyTxn(false)
+	}
 	// Clear pending enum values so that after COMMIT/ROLLBACK the
 	// write-back in dispatch.go does not restore stale pending labels
 	// and incorrectly block usage of committed enum values.

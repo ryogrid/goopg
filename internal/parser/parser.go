@@ -757,8 +757,12 @@ func (p *parser) parseBegin() (Stmt, error) {
 			}
 			s.IsolationLevel = level
 		case p.acceptIdentKeyword("read"):
-			// READ ONLY / READ WRITE — accepted, no-op for v0.
-			_ = p.acceptIdentKeyword("only") || p.acceptIdentKeyword("write")
+			if p.acceptIdentKeyword("only") {
+				s.ReadOnly = true
+			} else {
+				_ = p.acceptIdentKeyword("write")
+				s.ReadOnly = false
+			}
 		case p.acceptKeyword(KwNot):
 			_ = p.acceptIdentKeyword("deferrable")
 		case p.acceptIdentKeyword("deferrable"):

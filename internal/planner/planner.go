@@ -163,7 +163,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.BeginStmt:
-		return &Transaction{pos: s.Pos(), Verb: TxBegin, IsolationLevel: s.IsolationLevel}, nil
+		return &Transaction{pos: s.Pos(), Verb: TxBegin, IsolationLevel: s.IsolationLevel, ReadOnly: s.ReadOnly}, nil
 	case *parser.CommitStmt:
 		return &Transaction{pos: s.Pos(), Verb: TxCommit}, nil
 	case *parser.RollbackStmt:

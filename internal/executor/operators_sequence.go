@@ -32,6 +32,7 @@ type seqState struct {
 	schema    string      // schema name (default "public")
 	seqName   string      // bare sequence name (no schema prefix)
 	dataType  string      // "smallint", "integer", or "bigint" (default)
+	temporary bool        // true for TEMPORARY sequences (allowed in READ ONLY txns)
 	mu        sync.Mutex  // serialises nextval
 }
 
@@ -107,6 +108,32 @@ func SetSequenceDataType(name, dataType string) {
 	s.mu.Unlock()
 }
 
+// SetSequenceTemporary marks a sequence as temporary (allowed in READ ONLY txns).
+// M0097-0024.
+func SetSequenceTemporary(name string, tmp bool) {
+	v, ok := seqRegistry.Load(seqKey(name))
+	if !ok {
+		return
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	s.temporary = tmp
+	s.mu.Unlock()
+}
+
+// IsSequenceTemporary returns true if the named sequence is temporary.
+func IsSequenceTemporary(name string) bool {
+	v, ok := seqRegistry.Load(seqKey(name))
+	if !ok {
+		return false
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	tmp := s.temporary
+	s.mu.Unlock()
+	return tmp
+}
+
 // splitSeqName splits "schema.name" into (schema, name).
 // If no schema prefix is present, schema defaults to "public".
 func splitSeqName(name string) (schema, bare string) {
@@ -129,6 +156,59 @@ func LookupSequence(name string) *seqState {
 func DropSequence(name string) bool {
 	_, loaded := seqRegistry.LoadAndDelete(seqKey(name))
 	return loaded
+}
+
+// RenameSequence moves a sequence from oldName to newName in the registry.
+// Updates the internal schema/seqName fields. Returns false if oldName is not found.
+// M0097-0024.
+func RenameSequence(oldName, newName string) bool {
+	v, loaded := seqRegistry.LoadAndDelete(seqKey(oldName))
+	if !loaded {
+		return false
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	schema, bare := splitSeqName(strings.ToLower(strings.TrimSpace(newName)))
+	s.schema = schema
+	s.seqName = bare
+	s.mu.Unlock()
+	seqRegistry.Store(seqKey(newName), s)
+	return true
+}
+
+// SequenceRowData returns (lastValue, logCnt, isCalled) for SELECT * FROM seq.
+// lastValue is the last returned value (or start value if not yet called).
+// logCnt is 32 when called (mirrors PG's write-ahead log cache size), 0 otherwise.
+// Returns ok=false if the sequence does not exist. M0097-0024.
+func SequenceRowData(name string) (lastValue int64, logCnt int64, isCalled bool, ok bool) {
+	v, exists := seqRegistry.Load(seqKey(name))
+	if !exists {
+		return 0, 0, false, false
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	isCalled = s.called.Load()
+	if isCalled {
+		lastValue = s.current.Load()
+		logCnt = 32
+	} else {
+		lastValue = s.start
+		logCnt = 0
+	}
+	s.mu.Unlock()
+	return lastValue, logCnt, isCalled, true
+}
+
+// SequenceOwnedBy returns the "table.column" owner string for a sequence (empty if unowned).
+func SequenceOwnedBy(name string) string {
+	v, ok := seqRegistry.Load(seqKey(name))
+	if !ok {
+		return ""
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ownedBy
 }
 
 // SetSequenceOwnedBy records that the sequence with the given name is owned by
@@ -206,6 +286,10 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 	name := args[0].StringValue()
+	// Read-only transaction guard: non-temp sequences cannot be advanced.
+	if ctx != nil && ctx.Session != nil && ctx.Session.IsReadOnlyTxn() && !IsSequenceTemporary(name) {
+		return Datum{}, &ExecError{Code: "25006", Message: "cannot execute nextval() in a read-only transaction"}
+	}
 	s := LookupSequence(name)
 	if s == nil {
 		return Datum{}, &ExecError{Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", name)}
@@ -258,6 +342,10 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 	name := args[0].StringValue()
+	// Read-only transaction guard: non-temp sequences cannot be set.
+	if ctx != nil && ctx.Session != nil && ctx.Session.IsReadOnlyTxn() && !IsSequenceTemporary(name) {
+		return Datum{}, &ExecError{Code: "25006", Message: "cannot execute setval() in a read-only transaction"}
+	}
 	value := args[1].Int
 	isCalled := true
 	if len(args) >= 3 && !args[2].IsNull() && args[2].Kind == KindBool {

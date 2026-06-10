@@ -25,6 +25,8 @@ type Session interface {
 	// Used by BEGIN ISOLATION LEVEL and SET TRANSACTION ISOLATION LEVEL.
 	SetIsolationLevel(level mvcc.IsolationLevel) error
 	InExplicitTransaction() bool
+	IsReadOnlyTxn() bool // true when the current transaction was started with READ ONLY
+	SetReadOnlyTxn(v bool)
 	CurrentTransaction() (mvcc.Transaction, mvcc.Snapshot, bool)
 	BeginExplicitTransaction(tx mvcc.Transaction, snap mvcc.Snapshot)
 	EndExplicitTransaction()
@@ -82,6 +84,7 @@ type BasicSession struct {
 	subxactStack        mvcc.SubxactStack   // savepoint stack (M0050-0004)
 	currentSubXid       storage.TransactionID // 0 = use top-level tx.XID
 	txFailed            bool                // in_failed_sql_transaction (25P02)
+	txnReadOnly         bool                // true while inside a READ ONLY transaction (M0097-0024)
 	deferredFKChecks    []DeferredFKCheck   // INITIALLY DEFERRED FK checks (M0096-0011)
 	activeQueryTables   map[uint32]bool     // OIDs of tables currently in active DML (M0097-0023)
 }
@@ -106,6 +109,9 @@ func (s *BasicSession) SetIsolationLevel(level mvcc.IsolationLevel) error {
 func (s *BasicSession) IsolationLevel() mvcc.IsolationLevel { return s.isolation }
 
 func (s *BasicSession) InExplicitTransaction() bool { return s.inTx }
+
+func (s *BasicSession) IsReadOnlyTxn() bool    { return s.txnReadOnly }
+func (s *BasicSession) SetReadOnlyTxn(v bool)  { s.txnReadOnly = v }
 
 func (s *BasicSession) CurrentTransaction() (mvcc.Transaction, mvcc.Snapshot, bool) {
 	if !s.inTx {
