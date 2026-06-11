@@ -56,6 +56,20 @@ fi
 go test -timeout 10m $pkgs
 
 # --------------------------------------------------------------------------- #
+# Part 1b — optional race detector pass (RALPH_PRECOMMIT_RACE=1 to enable)
+#
+# Runs the same package set under -race to catch data races specific to
+# goopg's thread-parallel architecture.  Off by default because it adds
+# ~5–10 min and is most valuable after changes to lock/mvcc/storage.
+# Enable with: RALPH_PRECOMMIT_RACE=1 scripts/ralph-precommit-test.sh
+# --------------------------------------------------------------------------- #
+if [ "${RALPH_PRECOMMIT_RACE:-0}" = "1" ]; then
+  echo "ralph-precommit-test.sh: Part 1b — race detector pass (RALPH_PRECOMMIT_RACE=1)..."
+  go test -race -timeout 15m $pkgs
+  echo "ralph-precommit-test.sh: race pass PASS"
+fi
+
+# --------------------------------------------------------------------------- #
 # Part 2 — pgbench smoke against a live goopg server
 #
 # Mirrors the test.yml steps: build goopg, init a data dir, start the server,
@@ -149,5 +163,19 @@ pgbench -i              -h 127.0.0.1 -p "$PORT" -U postgres postgres
 pgbench -T 30 -c 2 -j 2 -P 5    -h 127.0.0.1 -p "$PORT" -U postgres postgres
 pgbench -T 30 -c 2 -j 2 -P 5 -N -h 127.0.0.1 -p "$PORT" -U postgres postgres
 pgbench -T 30 -c 2 -j 2 -P 5 -S -h 127.0.0.1 -p "$PORT" -U postgres postgres
+
+# --------------------------------------------------------------------------- #
+# Part 3 — optional plan-diff gate (RALPH_PRECOMMIT_PLAN_DIFF=1 to enable)
+#
+# Runs `make plan-gate` which diffs EXPLAIN plans against the latest
+# baseline snapshot. Only meaningful for planner/executor changes; off
+# by default because it requires the TPC-H bench server on port 65433.
+# Enable with: RALPH_PRECOMMIT_PLAN_DIFF=1 scripts/ralph-precommit-test.sh
+# --------------------------------------------------------------------------- #
+if [ "${RALPH_PRECOMMIT_PLAN_DIFF:-0}" = "1" ]; then
+  echo "ralph-precommit-test.sh: Part 3 — plan-diff gate (RALPH_PRECOMMIT_PLAN_DIFF=1)..."
+  make plan-gate
+  echo "ralph-precommit-test.sh: plan-diff gate PASS"
+fi
 
 # Server teardown (kill -KILL) + data-dir cleanup run from the EXIT trap.

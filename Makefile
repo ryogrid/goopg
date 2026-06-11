@@ -43,7 +43,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff runtimeshim-matrix
+.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -65,6 +65,12 @@ help:
 	@echo "  make pgbench-compare    Run pgbench comparison between goopg and PostgreSQL."
 	@echo "  make pgbench-compare-matrix Run the full goopg pgbench matrix survey."
 	@echo "  make pgbench-compare-report Generate markdown report from latest pgbench results."
+	@echo "  make race-gate          Run concurrency-critical packages under -race (Go data race detector)."
+	@echo "  make plan-gate          Diff EXPLAIN plans against latest baseline; SKIP when unavailable."
+	@echo "  make parity-dashboard   Generate docs/parity-dashboard.md (GUC/SQLSTATE/catalog parity vs PG 18.3)."
+	@echo
+	@echo "  scripts/pg-oracle-diff.sh   Run SQL against goopg AND vanilla PG 18.3, diff output."
+	@echo "  scripts/pg-regress-runner.sh  Run upstream regress .sql tests against goopg, report parity %."
 	@echo
 	@echo "Variables (override with 'make VAR=value'):"
 	@echo "  DATA_DIR=$(DATA_DIR)"
@@ -349,3 +355,60 @@ plan-diff: plan-snapshot-build
 	"$(PLAN_SNAPSHOT_BIN)" diff --label "$(LABEL)" --mode "$(MODE)" \
 		--host "$(PLAN_HOST)" --port $(PLAN_PORT) \
 		--db "$(PLAN_DB)" --user "$(PLAN_USER)" --password "$(PLAN_PASS)"
+
+# ---------------------------------------------------------------
+# plan-gate: run plan-diff against the latest baseline if one
+# exists and the TPC-H server is available.  Used as a pre-commit
+# gate for planner/executor changes.  Exits SKIP (0) when there is
+# no data or no baseline so it never hard-blocks loops without data.
+# ---------------------------------------------------------------
+plan-gate: plan-snapshot-build
+	@LATEST=$$(ls -t "$(REPO_ROOT)/plan_snapshots"/*.txt 2>/dev/null | head -1); \
+	if [ -z "$$LATEST" ]; then \
+		echo "plan-gate: SKIPPED (no plan_snapshots/*.txt baseline found)"; \
+		exit 0; \
+	fi; \
+	if ! pg_isready -h "$(PLAN_HOST)" -p $(PLAN_PORT) -U "$(PLAN_USER)" -q 2>/dev/null; then \
+		echo "plan-gate: SKIPPED (goopg not reachable on $(PLAN_HOST):$(PLAN_PORT) — start the bench server first)"; \
+		exit 0; \
+	fi; \
+	LNAME=$$(basename "$$LATEST" .txt); \
+	echo "plan-gate: diffing against baseline $$LNAME (mode=$(MODE))"; \
+	"$(PLAN_SNAPSHOT_BIN)" diff --label "$$LNAME" --mode "$(MODE)" \
+		--host "$(PLAN_HOST)" --port $(PLAN_PORT) \
+		--db "$(PLAN_DB)" --user "$(PLAN_USER)" --password "$(PLAN_PASS)"
+
+# ---------------------------------------------------------------
+# race-gate: run concurrency-critical packages under -race to catch
+# data races specific to goopg's thread-parallel architecture (as
+# opposed to PG's process-parallel design where data races aren't
+# possible between backends).
+#
+# Packages included: lock manager, MVCC/transaction state, storage
+# (shared buffer pool), async I/O, WAL, B-tree access, autovacuum,
+# activity tracking.  Excluded: packages requiring a live server
+# (testport, server, testutil/cluster*) which are covered by the
+# integration test suite.
+#
+# RACE_TIMEOUT defaults to 15m (race tests run ~2–3× slower than
+# normal due to shadow memory overhead).
+# ---------------------------------------------------------------
+RACE_TIMEOUT ?= 15m
+RACE_EXCLUDE = internal/testport|internal/server|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/
+
+race-gate:
+	@echo "race-gate: collecting packages (excluding server/cluster/bench)..."
+	@PKGS=$$(go list ./... | grep -vE "$(RACE_EXCLUDE)"); \
+	if [ -z "$$PKGS" ]; then \
+		echo "race-gate: no packages selected" >&2; exit 1; \
+	fi; \
+	echo "race-gate: running go test -race on $$(echo "$$PKGS" | wc -l) packages (timeout $(RACE_TIMEOUT))..."; \
+	go test -race -timeout $(RACE_TIMEOUT) $$PKGS
+
+# ---------------------------------------------------------------
+# parity-dashboard: diff PG 18.3's GUC list, SQLSTATE codes, and
+# system catalog object names against goopg's implementations.
+# Writes docs/parity-dashboard.md.
+# ---------------------------------------------------------------
+parity-dashboard:
+	@bash "$(REPO_ROOT)/scripts/gen-parity-dashboard.sh"
