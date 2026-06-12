@@ -302,20 +302,30 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
 
         - [ ] **M0100-0006 — InsertConflictSpecconflict: speculative insertion for ON CONFLICT**
               - Summary: `TestPort_IsolationInsertConflictSpecconflict` SKIP —
-                first divergence at L49 after UPSERT NOTICE-count fixes.
-              - Root cause: goopg writes btree index entries only after the
-                arbiter expression returns (`applyInsert`), so concurrent
-                sessions that wake from an advisory-lock wait do not see each
-                other's unconfirmed entries. PostgreSQL's "speculative
-                insertion" writes the index entry *before* evaluating the
-                arbiter expression, so waiters find in-progress conflicts.
-                Without this, s1's upsert completes immediately after
-                controller_unlock_1_3 (no conflict found) instead of waiting
-                for s2's in-progress xact. This also causes missing NOTICE
-                lines at L49–L50 (s1 arbiter re-evaluation after wake).
-              - Required: restructure upsertOp to insert a speculative btree
-                entry before arbiter evaluation, and either confirm it on
-                success or remove it on conflict. Write a design doc first.
+                perms 1–4 now PASS (loop 9, 2026-06-12); perm 5 deferred
+                (requires spectoken infrastructure).
+              - Phase B fix (DONE, loop 9): applyInsert now calls
+                encodeArbiterKey before writeHeapRowReturning (Phase B first
+                call), inserts arbiter btree entry with pre-computed key, and
+                probeSpeculativeConflict detects concurrent commits after the
+                Phase B blocking window. cancelSpeculativeRow stamps xmax on
+                the speculatively-inserted row when a conflict is found.
+                DO UPDATE entry adds explicit ExecBuildArbiterKey equivalent;
+                applyUpdate uses explicit encodeArbiterKey for the updated
+                row's btree entry.
+              - Perm 5 gap: requires (a) locktype='spectoken' in pg_locks,
+                (b) locktype='transactionid' entries in pg_locks,
+                (c) `(step notices N)` coordination in isolation runner.
+                New sub-task: M0100-0006b.
+
+        - [ ] **M0100-0006b — InsertConflictSpecconflict perm 5: spectoken infrastructure**
+              - Summary: perm 5 of insert-conflict-specconflict.spec requires
+                speculative token locks in pg_locks + transactionid lock
+                entries. Not implementable without dedicated infrastructure.
+              - Required: (a) implement speculative token acquire/release
+                visible in pg_locks as locktype='spectoken', (b) expose own
+                XID as transactionid ExclusiveLock in pg_locks, (c) implement
+                `(step notices N)` wait annotation in isolation runner.
 
         - [ ] **M0100-0007 — MergeUpdate: MERGE RETURNING old/new aliases + merge_action()**
               - Summary: `TestPort_IsolationMergeUpdate` SKIP — `ERROR: column

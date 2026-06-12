@@ -1873,6 +1873,11 @@ func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionI
 	if storage.IsHeapTupleLockOnly(h.Infomask) {
 		return false
 	}
+	// If the deleting/updating transaction already aborted, the xmax is stale
+	// — the row was never actually deleted or updated. M0100-0007.
+	if snap != nil && snap.HasAborted(h.Xmax) {
+		return false
+	}
 	return true
 }
 
@@ -4502,6 +4507,36 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 			// returns nil when idx.Columns[i]=="" (expression column); evaluate the
 			// stored ColExprs to produce the btree key so concurrent sessions can
 			// detect the in-progress insert via the arbiter scan. M0100-0005.
+			key = encodeExprIndexKey(ctx, idx, tbl, row)
+			if key == nil {
+				continue
+			}
+		}
+		_ = tree.Insert(key, ptr)
+	}
+}
+
+// maintainUniqueIndexesForInsertSkipArbiter is like maintainUniqueIndexesForInsert
+// but skips the index identified by skipOID. Used by applyInsert after an
+// expression-based arbiter entry was already inserted via maintainArbiter with a
+// pre-computed Phase-B key, so the expression is not re-evaluated here (which
+// would produce extra NOTICEs for plain INSERT paths in specconflict tests).
+// Pass skipOID=0 to get identical behaviour to maintainUniqueIndexesForInsert.
+func maintainUniqueIndexesForInsertSkipArbiter(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, ptr storage.ItemPointer, skipOID uint32) {
+	if ctx.Catalog == nil || ctx.Pool == nil {
+		return
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if skipOID != 0 && idx.OID == skipOID {
+			continue
+		}
+		idxRel := ctx.Catalog.IndexRelFileNode(idx)
+		tree, err := btree.Open(ctx.Pool, idxRel)
+		if err != nil {
+			continue
+		}
+		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+		if err != nil || key == nil {
 			key = encodeExprIndexKey(ctx, idx, tbl, row)
 			if key == nil {
 				continue
