@@ -56,6 +56,19 @@ var (
 	waitForGraph = make(map[storage.TransactionID]storage.TransactionID)
 )
 
+// Self-modification error sentinels (ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION = 09000).
+// Raised when a sub-command triggered by the current command already modified the tuple.
+var (
+	errTupleAlreadyModifiedByUpdate = &ExecError{
+		Code:    "09000",
+		Message: "tuple to be updated was already modified by an operation triggered by the current command",
+	}
+	errTupleAlreadyModifiedByDelete = &ExecError{
+		Code:    "09000",
+		Message: "tuple to be deleted was already modified by an operation triggered by the current command",
+	}
+)
+
 // registerWFGAndCheckCycle adds the edge myXID→blockingXID and walks the
 // graph up to maxWFGHops looking for a cycle (deadlock). Returns true when
 // a cycle is detected; the edge is removed before returning (caller must NOT
@@ -155,30 +168,63 @@ func epqRecheckVisible(ctx *Context, rel storage.RelFileNode, blk storage.BlockN
 // Only valid for HOT updates (same-page chain). For cross-page (non-HOT)
 // updates the old tuple has no HeapHotUpdated and followHOTChain returns
 // not-found — the row is skipped (v0 compromise).
+// epqFollowHOT follows the HOT chain from (rel, blk, slot) to find the latest
+// visible version of the row, evaluates pred against it, and returns
+// (newSlot, row, hotFound, predOk). hotFound is true when the HOT chain was
+// traversed regardless of pred result; predOk is true when pred passed.
+// Callers must NOT fall through to epqFollowChain when hotFound=true, because
+// the HOT chain and CTID chain share the same tail tuple — a second evaluation
+// would emit duplicate side-effecting NOTICE calls.
+// origSnap, if non-nil, is used temporarily for predicate evaluation —
+// matching PostgreSQL's EvalPlanQual semantics where the chain-follow uses a
+// refreshed snapshot but sub-plan quals run against the original BEGIN-time
+// snapshot (so correlated subqueries see pre-commit values).
 func epqFollowHOT(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
-	slot uint16, cols []catalog.Column, pred planner.Expr) (uint16, Row, bool) {
+	slot uint16, cols []catalog.Column, pred planner.Expr, origSnap *mvcc.Snapshot) (uint16, Row, bool, bool) {
 	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 	if err != nil {
-		return 0, nil, false
+		return 0, nil, false, false
 	}
 	s.RLock()
 	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID)
 	s.RUnlock()
 	ctx.Pool.Unpin(s)
 	if !found {
-		return 0, nil, false
+		return 0, nil, false, false // no HOT chain — caller may try epqFollowChain
 	}
 	latestRow, decErr := DecodeHeapTupleRow(cols, latestTup, nil)
 	if decErr != nil {
-		return 0, nil, false
+		return 0, nil, true, false // HOT chain found but decode failed
 	}
 	if pred != nil {
-		pv, perr := evalExpr(pred, latestRow, ctx)
+		var pv Datum
+		var perr error
+		// Wrap latestRow in a MaterializedSlot with the successor CTID so that
+		// CTIDExpr predicates (e.g. WHERE ctid = '(0,3)') evaluate against the
+		// NEW tuple's TID rather than the original. Without this, CTID conditions
+		// in UPDATE WHERE always return NULL after EPQ chain-follow (M0100-0010).
+		ms := &MaterializedSlot{
+			row:       latestRow,
+			hasCTID:   true,
+			ctidBlock: uint32(blk),
+			ctidOff:   latestSlot,
+		}
+		if origSnap != nil {
+			// Temporarily restore the original snapshot so correlated
+			// sub-plans (EXISTS, scalar subqueries) evaluate against
+			// pre-commit data, matching PG's EvalPlanQual behaviour.
+			savedSnap := ctx.Snap
+			ctx.Snap = *origSnap
+			pv, perr = evalExprSlot(pred, ms, ctx)
+			ctx.Snap = savedSnap
+		} else {
+			pv, perr = evalExprSlot(pred, ms, ctx)
+		}
 		if perr != nil || pv.IsNull() || pv.Kind != KindBool || !pv.BoolValue() {
-			return 0, nil, false
+			return 0, nil, true, false // HOT chain found but pred failed
 		}
 	}
-	return latestSlot, latestRow, true
+	return latestSlot, latestRow, true, true
 }
 
 // epqSlotMovedToAnotherPartition reports whether the tuple at
@@ -323,6 +369,10 @@ func epqChainCheckMovedPartition(ctx *Context, rel storage.RelFileNode,
 // returns not-found because the concurrent UPDATE was non-HOT and therefore
 // links via raw t_ctid rather than the HeapHotUpdated bit (M0100-0005z).
 //
+// origSnap, if non-nil, is used temporarily for predicate evaluation —
+// matching PostgreSQL's EvalPlanQual semantics where correlated sub-plans
+// (EXISTS, scalar subqueries) run against the original BEGIN-time snapshot.
+//
 // Returns (newBlk, newSlot, row, true) when a matching version is found,
 // or (0, 0, nil, false) when the chain terminates (sentinel, self-CTID,
 // invalid offset, or chain depth exceeded) without finding a visible match.
@@ -331,8 +381,8 @@ func epqChainCheckMovedPartition(ctx *Context, rel storage.RelFileNode,
 // EPQ semantics: if the latest visible version still matches WHERE, the
 // updater proceeds against it; otherwise the row is skipped.
 func epqFollowChain(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
-	slot uint16, cols []catalog.Column, pred planner.Expr) (storage.BlockNumber, uint16, Row, bool) {
-	_, found, movedPart := epqFollowChainFull(ctx, rel, blk, slot, cols, pred)
+	slot uint16, cols []catalog.Column, pred planner.Expr, origSnap *mvcc.Snapshot) (storage.BlockNumber, uint16, Row, bool) {
+	_, found, movedPart := epqFollowChainFull(ctx, rel, blk, slot, cols, pred, origSnap)
 	if movedPart {
 		return 0, 0, nil, false
 	}
@@ -348,8 +398,10 @@ type epqChainResult struct {
 
 // epqFollowChainFull walks the t_ctid chain and returns the live successor row.
 // movedPart is true if the chain ended because of a moved-partition sentinel.
+// origSnap, if non-nil, is used temporarily for predicate evaluation so that
+// correlated sub-plans run against the original snapshot (PG EvalPlanQual semantics).
 func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber,
-	slot uint16, cols []catalog.Column, pred planner.Expr) (relNode storage.RelFileNode, found epqChainResult, movedPart bool) {
+	slot uint16, cols []catalog.Column, pred planner.Expr, origSnap *mvcc.Snapshot) (relNode storage.RelFileNode, found epqChainResult, movedPart bool) {
 	const maxChain = 64
 	curBlk, curSlot := blk, slot
 	for i := 0; i < maxChain; i++ {
@@ -384,7 +436,19 @@ func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.Block
 				return rel, epqChainResult{}, false
 			}
 			if pred != nil {
-				pv, perr := evalExpr(pred, row, ctx)
+				var pv Datum
+				var perr error
+				if origSnap != nil {
+					// Temporarily restore the original snapshot so correlated
+					// sub-plans (EXISTS, scalar subqueries) evaluate against
+					// pre-commit data, matching PG's EvalPlanQual behaviour.
+					savedSnap := ctx.Snap
+					ctx.Snap = *origSnap
+					pv, perr = evalExpr(pred, row, ctx)
+					ctx.Snap = savedSnap
+				} else {
+					pv, perr = evalExpr(pred, row, ctx)
+				}
 				if perr != nil || pv.IsNull() || pv.Kind != KindBool || !pv.BoolValue() {
 					return rel, epqChainResult{}, false
 				}
@@ -1954,6 +2018,24 @@ func tryApplyHOTUpdate(
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, ctx.Tx.XID, tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
+	if derr == nil && ctx.InDMLCTE && ctx.CTEWriteFence != nil {
+		newItemPtr := storage.ItemPointer{Block: blk, Offset: newSlot}
+		oldItemPtr := storage.ItemPointer{Block: blk, Offset: oldSlot}
+		if _, inFence := ctx.CTEWriteFence[oldItemPtr]; inFence {
+			if ctx.CTENewToOld != nil {
+				if orig, ok := ctx.CTENewToOld[oldItemPtr]; ok {
+					if ctx.CTESelfModifiedErrors == nil {
+						ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
+					}
+					ctx.CTESelfModifiedErrors[orig] = struct{}{}
+				}
+			}
+		}
+		ctx.CTEWriteFence[newItemPtr] = struct{}{}
+		if ctx.CTENewToOld != nil {
+			ctx.CTENewToOld[newItemPtr] = oldItemPtr
+		}
+	}
 	return true, derr
 }
 
@@ -2216,6 +2298,14 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							Message: "could not serialize access due to concurrent update",
 						}
 					}
+					// Save origSnap before epqWait: epqWait itself refreshes
+					// ctx.Snap (so epqRecheckVisible sees committed changes), so
+					// origSnap must be captured here — before that first refresh —
+					// to hold the true query-start snapshot. epqFollowHOT uses it
+					// to evaluate sub-plan quals (EXISTS, scalar subqueries) with
+					// the original snapshot, matching PG's EvalPlanQual semantics
+					// (chain-follow uses refreshed snapshot; qual eval uses origSnap).
+					origSnap := o.ctx.Snap
 					if epqWait(o.ctx, xmax) {
 						return nil, &ExecError{
 							Code:    "40001",
@@ -2223,7 +2313,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 							Message: "could not serialize access due to concurrent update (deadlock)",
 						}
 					}
-					// RC: refresh snapshot so committed deletes/updates are
+					// RC: refresh snapshot again so committed deletes/updates are
 					// visible without relying on the frozen BEGIN-time snapshot.
 					// Without this, the committed xmax stays in snap.InProgress
 					// and epqRecheckVisible returns true indefinitely (tight loop
@@ -2282,11 +2372,12 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						return nil, errMovedToAnotherPartition(o.plan.Pos())
 					}
 					newBlk := pu.blk
-					newSlot, baseRow, chainFound := epqFollowHOT(o.ctx, rel, pu.blk, pu.slot, cols, o.pred)
-					if !chainFound {
+					newSlot, baseRow, hotFound, predOk := epqFollowHOT(o.ctx, rel, pu.blk, pu.slot, cols, o.pred, &origSnap)
+					chainFound := predOk
+					if !chainFound && !hotFound {
 						// Non-HOT cross-page chain (M0100-0005z): fall back
 						// to raw t_ctid chain walk.
-						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, rel, pu.blk, pu.slot, cols, o.pred); cFound {
+						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, rel, pu.blk, pu.slot, cols, o.pred, &origSnap); cFound {
 							newBlk, newSlot, baseRow, chainFound = cBlk, cSlot, cRow, true
 						}
 					}
@@ -2435,6 +2526,23 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				if werr != nil {
 					return nil, werr
 				}
+				if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
+					oldPtr := storage.ItemPointer{Block: pu.blk, Offset: pu.slot}
+					if _, inFence := o.ctx.CTEWriteFence[oldPtr]; inFence {
+						if o.ctx.CTENewToOld != nil {
+							if orig, ok := o.ctx.CTENewToOld[oldPtr]; ok {
+								if o.ctx.CTESelfModifiedErrors == nil {
+									o.ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
+								}
+								o.ctx.CTESelfModifiedErrors[orig] = struct{}{}
+							}
+						}
+					}
+					o.ctx.CTEWriteFence[newPtr] = struct{}{}
+					if o.ctx.CTENewToOld != nil {
+						o.ctx.CTENewToOld[newPtr] = oldPtr
+					}
+				}
 				// Maintain unique/PK btree entries for the new row version.
 				if destPartIdx != nil {
 					maintainUniqueIndexesForInsert(o.ctx, destPartIdx, targetWriteCols, pu.newRow, newPtr)
@@ -2510,6 +2618,13 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	if err := o.ctx.MaterializeWriterXID(); err != nil {
 		return nil, err
 	}
+	// Self-modification error setup: if a sub-command during the CTE phase
+	// already modified a row we are about to update, scanMatching will raise
+	// errTupleAlreadyModifiedByUpdate when it encounters the original tuple.
+	if o.ctx.CTESelfModifiedErrors != nil {
+		o.ctx.CTESelfModErr = errTupleAlreadyModifiedByUpdate
+		defer func() { o.ctx.CTESelfModErr = nil }()
+	}
 	tbl := o.plan.Table
 	cols := tbl.Columns
 	rel := o.ctx.Catalog.RelFileNode(tbl)
@@ -2533,15 +2648,16 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	// loop forever. The two-pass approach trades a bit of memory for
 	// straightforward iteration semantics.
 	type pendingUpdate struct {
-		rel         storage.RelFileNode
-		blk         storage.BlockNumber
-		slot        uint16
-		cols        []catalog.Column // columns of the source relation
-		newRow      Row
-		retRow      Row            // parent-aligned row for RETURNING (nil = use newRow); M0097-0078
-		oldRow      Row            // for BEFORE UPDATE trigger firing
-		scanTbl     *catalog.Table // table the row came from (M0100-0005o: partition-child triggers)
-		beforeFired bool           // BEFORE trigger already fired in Phase 1 (M0100-0011)
+		rel            storage.RelFileNode
+		blk            storage.BlockNumber
+		slot           uint16
+		cols           []catalog.Column // columns of the source relation
+		newRow         Row
+		retRow         Row            // parent-aligned row for RETURNING (nil = use newRow); M0097-0078
+		inheritColMap  []int          // parent→child col mapping; non-nil only for inherit/partition children
+		oldRow         Row            // for BEFORE UPDATE trigger firing
+		scanTbl        *catalog.Table // table the row came from (M0100-0005o: partition-child triggers)
+		beforeFired    bool           // BEFORE trigger already fired in Phase 1 (M0100-0011)
 	}
 	pending := make([]pendingUpdate, 0, 1)
 
@@ -2653,6 +2769,12 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					if noConflict {
 						break
 					}
+					// Save origSnap before epqWait: epqWait refreshes ctx.Snap, so
+					// origSnap must be captured here to hold the query-start snapshot.
+					// epqFollowHOT/Chain use it to evaluate sub-plan quals (EXISTS,
+					// scalar subqueries) with the original snapshot, matching PG's
+					// EvalPlanQual semantics.
+					origSnap := o.ctx.Snap
 					if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
 						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update"}
@@ -2716,9 +2838,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						return errMovedToAnotherPartition(o.plan.Pos())
 					}
 					newBlk := writeBlk
-					newSlot, baseRow, found := epqFollowHOT(o.ctx, captureRel, writeBlk, writeSlot, captureCols, o.pred)
-					if !found {
-						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, captureRel, writeBlk, writeSlot, captureCols, o.pred); cFound {
+					newSlot, baseRow, hotFound, predOk := epqFollowHOT(o.ctx, captureRel, writeBlk, writeSlot, captureCols, o.pred, &origSnap)
+					found := predOk
+					if !found && !hotFound {
+						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, captureRel, writeBlk, writeSlot, captureCols, o.pred, &origSnap); cFound {
 							newBlk, newSlot, baseRow, found = cBlk, cSlot, cRow, true
 						}
 					}
@@ -2756,12 +2879,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 
 			// Parent-aligned retRow so RETURNING exprs (parent ordinals) evaluate correctly.
 			var retRow Row
+			var storedColMap []int
 			if isInheritChild && len(o.plan.Returning) > 0 {
 				retRow = remapChildRowToParent(newRow, inheritColMap)
+				storedColMap = inheritColMap
 			}
 			pending = append(pending, pendingUpdate{
 				rel: captureRel, blk: writeBlk, slot: writeSlot, cols: captureCols,
-				newRow: newRow, retRow: retRow, oldRow: oldRow,
+				newRow: newRow, retRow: retRow, inheritColMap: storedColMap, oldRow: oldRow,
 				scanTbl: scanTbl, beforeFired: beforeFiredP1,
 			})
 			return nil
@@ -2874,13 +2999,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						return nil, errMovedToAnotherPartition(o.plan.Pos())
 					}
 					newBlk := pu.blk
-					newSlot, baseRow, chainFound := epqFollowHOT(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred)
-					if !chainFound {
+					newSlot, baseRow, hotFound, predOk := epqFollowHOT(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred, nil)
+					chainFound := predOk
+					if !chainFound && !hotFound {
 						// Non-HOT cross-page chain (M0100-0005z): updates that
 						// land on a different page leave no HeapHotUpdated bit;
 						// followHOTChain terminates immediately. Walk the raw
 						// t_ctid chain instead.
-						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred); cFound {
+						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, puRel, pu.blk, pu.slot, puCols, o.pred, nil); cFound {
 							newBlk, newSlot, baseRow, chainFound = cBlk, cSlot, cRow, true
 						}
 					}
@@ -2912,6 +3038,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					// triglog; without the refresh OLD still reflects the row as it
 					// looked at scan-time, before s2's update2.
 					pu.oldRow = cloneRow(baseRow)
+					// Refresh the parent-aligned retRow so RETURNING reflects the
+					// EPQ-rechecked values rather than the stale scan-time snapshot.
+					if pu.retRow != nil && pu.inheritColMap != nil {
+						pu.retRow = remapChildRowToParent(pu.newRow, pu.inheritColMap)
+					}
 					pu.blk = newBlk
 					pu.slot = newSlot
 					continue // re-run loop to stamp xmax on new slot
@@ -3007,6 +3138,23 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				newPtr, werr := writeHeapRowReturning(o.ctx, targetWriteRel, targetWriteCols, pu.newRow)
 				if werr != nil {
 					return nil, werr
+				}
+				if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
+					oldPtr := storage.ItemPointer{Block: pu.blk, Offset: pu.slot}
+					if _, inFence := o.ctx.CTEWriteFence[oldPtr]; inFence {
+						if o.ctx.CTENewToOld != nil {
+							if orig, ok := o.ctx.CTENewToOld[oldPtr]; ok {
+								if o.ctx.CTESelfModifiedErrors == nil {
+									o.ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
+								}
+								o.ctx.CTESelfModifiedErrors[orig] = struct{}{}
+							}
+						}
+					}
+					o.ctx.CTEWriteFence[newPtr] = struct{}{}
+					if o.ctx.CTENewToOld != nil {
+						o.ctx.CTENewToOld[newPtr] = oldPtr
+					}
 				}
 				if destPart != nil {
 					maintainUniqueIndexesForInsert(o.ctx, destPart, targetWriteCols, pu.newRow, newPtr)
@@ -3157,6 +3305,12 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		o.retIdx++
 		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
+	// If a CTE sub-command already modified a row we are about to delete,
+	// scanMatching must surface the 09000 error (TM_SelfModified equivalent).
+	if o.ctx.CTESelfModifiedErrors != nil {
+		o.ctx.CTESelfModErr = errTupleAlreadyModifiedByDelete
+		defer func() { o.ctx.CTESelfModErr = nil }()
+	}
 	// DELETE … USING: nested-loop cross-product path. M0097-0076.
 	if len(o.plan.UsingScans) > 0 {
 		return o.deleteWithUsing()
@@ -3290,9 +3444,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 						return errMovedToAnotherPartition(o.plan.Pos())
 					}
 					newBlk := deleteBlk
-					newSlot, newRow, found := epqFollowHOT(o.ctx, captureRel, deleteBlk, deleteSlot, captureCols, o.pred)
-					if !found {
-						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, captureRel, deleteBlk, deleteSlot, captureCols, o.pred); cFound {
+					newSlot, newRow, hotFound, predOk := epqFollowHOT(o.ctx, captureRel, deleteBlk, deleteSlot, captureCols, o.pred, nil)
+					found := predOk
+					if !found && !hotFound {
+						if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, captureRel, deleteBlk, deleteSlot, captureCols, o.pred, nil); cFound {
 							newBlk, newSlot, newRow, found = cBlk, cSlot, cRow, true
 						}
 					}
@@ -3412,10 +3567,11 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					victimCols = tbl.Columns
 				}
 				newBlk := v.blk
-				newSlot, newRow, chainFound := epqFollowHOT(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred)
-				if !chainFound {
+				newSlot, newRow, hotFound, predOk := epqFollowHOT(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred, nil)
+				chainFound := predOk
+				if !chainFound && !hotFound {
 					// Non-HOT cross-page chain (M0100-0005z).
-					if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred); cFound {
+					if cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, victimRel, v.blk, v.slot, victimCols, o.pred, nil); cFound {
 						newBlk, newSlot, newRow, chainFound = cBlk, cSlot, cRow, true
 					}
 				}
@@ -3534,11 +3690,13 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	// Step 2: scan target table (parent + inheritance children) without predicate;
 	// for each target row, cross-product with FROM-table rows. M0097-0065, M0097-0078.
 	type pendingUpdate struct {
-		rel         storage.RelFileNode // source relation (parent or child)
-		tgtCols     []catalog.Column   // columns of source relation
-		blk         storage.BlockNumber
-		slot        uint16
-		newRow      Row
+		srcRel  storage.RelFileNode // source relation — xmax is stamped here
+		rel     storage.RelFileNode // destination relation — new row is written here
+		tgtCols []catalog.Column   // columns of destination relation
+		tbl     *catalog.Table     // catalog table for source relation (nil = parent)
+		blk     storage.BlockNumber
+		slot    uint16
+		newRow  Row
 		retNewRow   Row // parent-aligned new row for RETURNING (nil = use newRow); M0097-0078
 		oldRow      Row
 		fromPortion Row // joined FROM-table columns for RETURNING; nil when RETURNING absent
@@ -3547,14 +3705,30 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	tgtColCount := len(tgtCols)
 	needFromForReturning := len(o.plan.Returning) > 0
 
-	// Collect inheritance children for the FROM target scan. M0097-0078.
+	// Collect inheritance children and partition children for the FROM target scan.
+	// Partition children share the parent's column ordinals (no remapping), but may
+	// have overridden GeneratedExpr values — use child.Columns for generated-column
+	// recomputation. M0097-0078, M0100-0010.
 	type fromScanTarget struct {
 		rel    storage.RelFileNode
 		cols   []catalog.Column
-		colMap []int // nil = parent (no remapping); set for inheritance children
+		colMap []int // nil = parent/partition child (no remapping); set for inheritance children
+		tbl    *catalog.Table
 	}
-	fromScanTargets := []fromScanTarget{{rel: rel, cols: tgtCols}}
+	fromScanTargets := []fromScanTarget{{rel: rel, cols: tgtCols, tbl: o.plan.Table}}
 	if imFrom, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		// Partition children: same column ordinals as parent, possibly overridden GeneratedExpr.
+		for _, pc := range imFrom.PartitionChildren(o.plan.Table.OID) {
+			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(pc), lockmgr.RowExclusiveLock); err != nil {
+				return nil, err
+			}
+			fromScanTargets = append(fromScanTargets, fromScanTarget{
+				rel:  o.ctx.Catalog.RelFileNode(pc),
+				cols: pc.Columns,
+				tbl:  pc,
+			})
+		}
+		// Inheritance children: require column remapping.
 		for _, ic := range imFrom.InheritanceChildren(o.plan.Table.OID) {
 			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lockmgr.RowExclusiveLock); err != nil {
 				return nil, err
@@ -3563,6 +3737,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				rel:    o.ctx.Catalog.RelFileNode(ic),
 				cols:   ic.Columns,
 				colMap: buildInheritColMap(tgtCols, ic.Columns),
+				tbl:    ic,
 			})
 		}
 	}
@@ -3613,13 +3788,33 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 					} else {
 						actualNewRow = parentNewRow
 					}
-					_ = computeGeneratedColumns(fst.cols, actualNewRow)
+					// Determine write destination: may be a different partition if the
+					// partition key changed (cross-partition move). M0100-0010.
+					writeRel := fst.rel
+					writeCols := fst.cols
+					writeTbl := fst.tbl
+					if fst.tbl != nil && fst.tbl.PartitionParentOID != 0 {
+						// fst is a partition child; check if the new row still routes here.
+						if im2, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+							parentTbl, parentOK := im2.LookupTableByOID(fst.tbl.PartitionParentOID)
+							if parentOK {
+								if destPart, _ := routeToPartition(parentTbl, parentNewRow, im2, o.ctx); destPart != nil && destPart.OID != fst.tbl.OID {
+									writeRel = o.ctx.Catalog.RelFileNode(destPart)
+									writeCols = destPart.Columns
+									writeTbl = destPart
+									actualNewRow = parentNewRow // destination uses parent ordinals
+									retNewRow = parentNewRow
+								}
+							}
+						}
+					}
+					_ = computeGeneratedColumns(writeCols, actualNewRow)
 					var fromPortion Row
 					if needFromForReturning && len(combinedRow) > tgtColCount {
 						fromPortion = cloneRow(combinedRow[tgtColCount:])
 					}
 					pending = append(pending, pendingUpdate{
-						rel: fst.rel, tgtCols: fst.cols,
+						srcRel: fst.rel, rel: writeRel, tgtCols: writeCols, tbl: writeTbl,
 						blk: blk, slot: slot,
 						newRow: actualNewRow, retNewRow: retNewRow,
 						oldRow: cloneRow(rawRow), fromPortion: fromPortion,
@@ -3642,11 +3837,16 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	}
 
 	// Step 3: apply pending updates. M0097-0065.
-	// pu.rel / pu.tgtCols are used for child tables (inheritance); fall back to
-	// parent rel/tgtCols when unset. M0097-0078.
+	// pu.srcRel = relation where xmax is stamped (source of the row).
+	// pu.rel    = relation where the new row is written (destination; may differ on cross-partition move).
+	// pu.tgtCols = columns of the destination relation. M0097-0078, M0100-0010.
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
 	seen := make(map[[2]uint64]bool)
 	for _, pu := range pending {
+		puSrcRel := pu.srcRel
+		if puSrcRel == (storage.RelFileNode{}) {
+			puSrcRel = rel
+		}
 		puRel := pu.rel
 		if puRel == (storage.RelFileNode{}) {
 			puRel = rel
@@ -3670,7 +3870,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 			pu.newRow = retRow
 		}
 		used := false
-		if hotEligible && puRel == rel {
+		if hotEligible && puSrcRel == rel && puRel == rel {
 			var err error
 			used, err = tryApplyHOTUpdate(o.ctx, rel, tgtCols, pu.blk, pu.slot, pu.newRow)
 			if err != nil {
@@ -3678,8 +3878,9 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 			}
 		}
 		if !used {
-			// Non-HOT update: stamp xmax on old tuple, write new tuple.
-			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: puRel, Block: pu.blk})
+			// Non-HOT update: stamp xmax on old tuple (in source rel), write new tuple
+			// to destination rel (which may differ for cross-partition moves). M0100-0010.
+			s, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: pu.blk})
 			if err != nil {
 				return nil, err
 			}
@@ -3691,12 +3892,111 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				continue // slot gone (concurrent prune)
 			}
 			if isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+				xmax := oldTup.Header.Xmax
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
-				// Simplified: skip concurrent-update EPQ for FROM case.
-				continue
+				// EPQ: wait for the concurrent transaction and recheck. M0100-0010.
+				if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
+					return nil, &ExecError{Code: "40001", Pos: o.plan.Pos(),
+						Message: "could not serialize access due to concurrent update"}
+				}
+				origSnap := o.ctx.Snap
+				if epqWait(o.ctx, xmax) {
+					return nil, &ExecError{Code: "40P01", Pos: o.plan.Pos(),
+						Message: "deadlock detected"}
+				}
+				// Re-check: follow HOT chain for the latest version in the source relation.
+				newSlot, epqRow, hotFound, _ := epqFollowHOT(o.ctx, puSrcRel, pu.blk, pu.slot, puCols, nil, &origSnap)
+				epqBlk := pu.blk
+				if !hotFound {
+					// HOT chain failed. Check for moved-partition sentinel before
+					// trying the CTID chain (non-HOT same-partition update). M0100-0010.
+					if epqSlotMovedToAnotherPartition(o.ctx, puSrcRel, pu.blk, pu.slot) {
+						return nil, &ExecError{Code: "55000", Pos: o.plan.Pos(),
+							Message: "tuple to be locked was already moved to another partition due to concurrent update"}
+					}
+					cBlk, cSlot, cRow, cFound := epqFollowChain(o.ctx, puSrcRel, pu.blk, pu.slot, puCols, nil, &origSnap)
+					if !cFound {
+						continue // row deleted or chain exhausted
+					}
+					epqBlk, newSlot, epqRow = cBlk, cSlot, cRow
+				}
+				// CTE isolation: if the EPQ chain led to a CTE-written tuple, the CTE
+				// already owns this row. Skip to preserve savedSnap isolation semantics.
+				// Verify xmin == currentTx to avoid false positives when another table's
+				// CTE-written rows coincidentally share the same {block,slot}. M0100-0010.
+				if o.ctx.CTEWriteFence != nil {
+					if _, inFence := o.ctx.CTEWriteFence[storage.ItemPointer{Block: epqBlk, Offset: newSlot}]; inFence {
+						skipRow := false
+						if s2, serr := o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: epqBlk}); serr == nil {
+							s2.RLock()
+							if tup2, terr := storage.PageGetHeapTuple(s2.Page(), newSlot); terr == nil {
+								skipRow = mvcc.IsSelfXID(tup2.Header.Xmin, o.ctx.Tx.XID, o.ctx.TxnMgr)
+							}
+							s2.RUnlock()
+							o.ctx.Pool.Unpin(s2)
+						}
+						if skipRow {
+							continue
+						}
+					}
+				}
+				// Re-evaluate predicate against the new row + FROM portion.
+				epqCombined := append(append(Row(nil), epqRow...), pu.fromPortion...)
+				if o.plan.FromPred != nil {
+					v, _ := evalExpr(o.plan.FromPred, epqCombined, o.ctx)
+					if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+						continue
+					}
+				}
+				// Re-compute SET expressions against the EPQ-fetched row.
+				parentNewRow := make(Row, tgtColCount)
+				for i := range tgtCols {
+					if i < len(o.plan.Set) && o.plan.Set[i] != nil {
+						v, evalErr := evalExpr(o.plan.Set[i], epqCombined, o.ctx)
+						if evalErr != nil {
+							return nil, evalErr
+						}
+						parentNewRow[i] = v
+					} else if i < len(epqRow) {
+						parentNewRow[i] = epqRow[i]
+					}
+				}
+				// Re-route to partition if partition key changed. M0100-0010.
+				epqWriteRel := puSrcRel
+				epqWriteCols := puCols
+				if pu.tbl != nil && pu.tbl.PartitionParentOID != 0 {
+					if im2, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 {
+						parentTbl, parentOK := im2.LookupTableByOID(pu.tbl.PartitionParentOID)
+						if parentOK {
+							if destPart, _ := routeToPartition(parentTbl, parentNewRow, im2, o.ctx); destPart != nil && destPart.OID != pu.tbl.OID {
+								epqWriteRel = o.ctx.Catalog.RelFileNode(destPart)
+								epqWriteCols = destPart.Columns
+							}
+						}
+					}
+				}
+				_ = computeGeneratedColumns(epqWriteCols, parentNewRow)
+				pu.newRow = parentNewRow
+				pu.retNewRow = nil // EPQ recomputed parentNewRow into pu.newRow; clear stale retNewRow so RETURNING uses pu.newRow
+				pu.oldRow = cloneRow(epqRow)
+				pu.blk = epqBlk
+				pu.slot = newSlot
+				puRel = epqWriteRel
+				puCols = epqWriteCols
 			}
 			var oldTupleBytes []byte
+			s, err = o.ctx.Pool.Pin(storage.BufferTag{Rel: puSrcRel, Block: pu.blk})
+			if err != nil {
+				return nil, err
+			}
+			s.Lock()
+			oldTup, oldGerr = storage.PageGetHeapTuple(s.Page(), pu.slot)
+			if oldGerr != nil {
+				s.Unlock()
+				o.ctx.Pool.Unpin(s)
+				continue
+			}
 			oldTupleBytes, _ = oldTup.MarshalBinary()
 			stampErr := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
 			if stampErr != nil {
@@ -3707,22 +4007,48 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				}
 				return nil, stampErr
 			}
-			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puRel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puSrcRel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
 				return nil, derr
 			}
+			// For cross-partition move: also need to handle stampOldCtid from srcRel to new location.
+			isCrossPartMove := puSrcRel != puRel
 			newPtr, werr := writeHeapRowReturning(o.ctx, puRel, puCols, pu.newRow)
 			if werr != nil {
 				return nil, werr
 			}
+			if isCrossPartMove {
+				if cerr := stampOldCtid(o.ctx, puSrcRel, pu.blk, pu.slot, newPtr); cerr != nil {
+					return nil, cerr
+				}
+			}
+			if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
+				oldPtr := storage.ItemPointer{Block: pu.blk, Offset: pu.slot}
+				if _, inFence := o.ctx.CTEWriteFence[oldPtr]; inFence {
+					if o.ctx.CTENewToOld != nil {
+						if orig, ok := o.ctx.CTENewToOld[oldPtr]; ok {
+							if o.ctx.CTESelfModifiedErrors == nil {
+								o.ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
+							}
+							o.ctx.CTESelfModifiedErrors[orig] = struct{}{}
+						}
+					}
+				}
+				o.ctx.CTEWriteFence[newPtr] = struct{}{}
+				if o.ctx.CTENewToOld != nil {
+					o.ctx.CTENewToOld[newPtr] = oldPtr
+				}
+			}
 			maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, puCols, pu.newRow, newPtr)
-			if cerr := stampOldCtid(o.ctx, puRel, pu.blk, pu.slot, newPtr); cerr != nil {
-				return nil, cerr
+			if !isCrossPartMove {
+				if cerr := stampOldCtid(o.ctx, puSrcRel, pu.blk, pu.slot, newPtr); cerr != nil {
+					return nil, cerr
+				}
 			}
 			if o.ctx.LogCanonical != nil {
-				if derr := emitCanonicalHeapDelete(o.ctx, puRel, pu.blk, pu.slot); derr != nil {
+				if derr := emitCanonicalHeapDelete(o.ctx, puSrcRel, pu.blk, pu.slot); derr != nil {
 					return nil, derr
 				}
 				if ierr := emitCanonicalHeapInsert(o.ctx, puRel, newPtr); ierr != nil {
@@ -3730,7 +4056,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				}
 			}
 		}
-		ssiRecordTupleWrite(o.ctx, puRel, pu.blk, pu.slot)
+		ssiRecordTupleWrite(o.ctx, puSrcRel, pu.blk, pu.slot)
 		o.rowsAffected++
 		// Use retNewRow for RETURNING when available (inheritance children). M0097-0078.
 		retForRet := pu.newRow
@@ -4007,7 +4333,26 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 				return err
 			}
 			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+				// CTESelfModifiedErrors: if a sub-command during the CTE phase
+				// modified this invisible (own-xmax) tuple, the outer
+				// UPDATE/DELETE must raise ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION.
+				if ctx.CTESelfModErr != nil && ctx.CTESelfModifiedErrors != nil {
+					ptr := storage.ItemPointer{Block: blk, Offset: slot}
+					if _, inErr := ctx.CTESelfModifiedErrors[ptr]; inErr {
+						s.RUnlock()
+						ctx.Pool.Unpin(s)
+						return ctx.CTESelfModErr
+					}
+				}
 				continue
+			}
+			// Skip rows written by DML CTEs — outer UPDATE/DELETE must see
+			// pre-CTE state (PostgreSQL CTE snapshot-isolation semantics).
+			if ctx.CTEWriteFence != nil {
+				ptr := storage.ItemPointer{Block: blk, Offset: slot}
+				if _, inFence := ctx.CTEWriteFence[ptr]; inFence {
+					continue
+				}
 			}
 			// M0104-0008: SSI read-path hook for the UPDATE / DELETE
 			// scanMatching loop (mirrors the seqScanOp.Next site). A
@@ -4037,7 +4382,13 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 		// callbacks.
 		for _, vt := range visible {
 			if pred != nil {
-				v, err := evalExpr(pred, vt.row, ctx)
+				predSlot := &MaterializedSlot{
+					row:       vt.row,
+					hasCTID:   true,
+					ctidBlock: uint32(blk),
+					ctidOff:   vt.slot,
+				}
+				v, err := evalExprSlot(pred, predSlot, ctx)
 				if err != nil {
 					return err
 				}

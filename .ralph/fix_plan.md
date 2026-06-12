@@ -378,19 +378,14 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
                 elimination (`Sort Key: id, data` vs `Sort Key: id`).
                 Write a design doc first.
 
-        - [ ] **M0100-0010 — EvalPlanQual: EPQ recheck NOTICE parity**
-              - Summary: `TestPort_IsolationEvalPlanQual` SKIP — first
-                divergence at L411: NOTICE content differs (`lock_id: text
-                checking = text checking: t` vs `upid: text savings = text
-                checking: f`). Output: 1281 lines vs 1494 expected.
-              - Root cause: the EPQ re-evaluation path in UPDATE/DELETE
-                produces different comparison results from PostgreSQL. The
-                `noisy_oper` PL/pgSQL function's side effects diverge,
-                suggesting the EPQ chain-following, snapshot refresh, or
-                trigger evaluation differs from upstream semantics.
-              - Required: trace the EPQ code paths in goopg against PG's
-                `ExecUpdate`/`ExecDelete` EPQ loops, align NOTICE output
-                ordering and content. Write a design doc first.
+        - [x] **M0100-0010 — EvalPlanQual: EPQ recheck NOTICE parity**
+              - COMPLETE (loop 6): `updateWithFrom` EPQ path set `pu.newRow` to
+                the EPQ-corrected row but forgot to clear the stale `pu.retNewRow`
+                (set during scan-phase cross-partition routing with old b value).
+                RETURNING used stale `retNewRow` → fix: `pu.retNewRow = nil` after
+                EPQ recomputes `parentNewRow`. Design doc:
+                `docs/design/0100-0010-epq-updatewithfrom-retrow-fix.md`.
+                `TestPort_IsolationEvalPlanQual` → PASS. **PASS count = 20**.
 
         - [x] **M0100-0011 — EvalPlanQualTrigger: EPQ trigger output parity**
               - COMPLETE (loop 2, commit 54e738c6): Phase 1 inline EPQ in
