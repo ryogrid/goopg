@@ -34,15 +34,16 @@ type mergeOp struct {
 // mergePendingMod records a single MERGE modification to apply after the
 // target scan completes. srcRow is kept for EPQ re-evaluation. M0100-0005.
 type mergePendingMod struct {
-	rel    storage.RelFileNode // actual relfilenode to write to (child for partitioned)
-	tblRef *catalog.Table      // actual table metadata (child for partitioned)
-	blk    storage.BlockNumber
-	slot   uint16
-	action planner.MergeActionKind
-	newRow Row // for UPDATE
-	srcRow Row // source row for EPQ re-evaluation
-	tgtRow Row // target old row for BEFORE trigger firing
-	srcIdx int // index into srcRows for EPQ-delete fallback to NOT MATCHED
+	rel          storage.RelFileNode // actual relfilenode to write to (child for partitioned)
+	tblRef       *catalog.Table      // actual table metadata (child for partitioned)
+	blk          storage.BlockNumber
+	slot         uint16
+	action       planner.MergeActionKind
+	newRow       Row  // for UPDATE
+	srcRow       Row  // source row for EPQ re-evaluation
+	tgtRow       Row  // target old row for BEFORE trigger firing
+	srcIdx       int  // index into srcRows for EPQ-delete fallback to NOT MATCHED
+	hasDuplicate bool // a second source row also matched this target during scan; error after apply
 }
 
 func newMergeOp(p *planner.Merge) *mergeOp { return &mergeOp{plan: p} }
@@ -62,6 +63,20 @@ type mergeEPQError struct {
 }
 
 func (e *mergeEPQError) Error() string { return "merge EPQ recheck" }
+
+// mergeEPQOnFailedError is returned by applyMod when EPQ produced a live target
+// row that no longer satisfies the ON condition. The caller must unmark the
+// source row (so step 3 retries it as NOT MATCHED INSERT) and apply WHEN NOT
+// MATCHED BY SOURCE against epqTgtRow. M0100-0007.
+type mergeEPQOnFailedError struct {
+	blk       storage.BlockNumber
+	slot      uint16
+	epqTgtRow Row // in parent column order
+	rel       storage.RelFileNode
+	tblRef    *catalog.Table
+}
+
+func (e *mergeEPQOnFailedError) Error() string { return "merge EPQ: ON failed" }
 
 func (o *mergeOp) Schema() planner.Schema { return o.plan.ReturningSchema }
 func (o *mergeOp) RowsAffected() int64   { return o.rowsAffected }
@@ -265,8 +280,15 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 
 		for _, vt := range visible {
 			matchedSrc := false
+			// Normalize scanned row to parent column order so plan expressions
+			// (which use parent indices) evaluate correctly for child partitions
+			// with different column ordering (e.g. part2 with val,key). M0100-0007.
+			vtTgtRow := vt.tgtRow
+			if scanTbl != tbl {
+				vtTgtRow = remapRowForPartition(scanTbl.Columns, tbl.Columns, vt.tgtRow)
+			}
 			for si := range srcRows {
-				combined := mergedRow(vt.tgtRow, srcRows[si].row)
+				combined := mergedRow(vtTgtRow, srcRows[si].row)
 				v, err := evalExpr(o.plan.On, combined, o.ctx)
 				if err != nil {
 					continue
@@ -274,7 +296,18 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
 					continue
 				}
-				// ON matched — first matching WHEN MATCHED clause wins.
+				// ON matched. If a previous source row already matched this target
+				// row, mark the pending mod as having a duplicate — we defer the
+				// error to the apply phase so that any concurrent lock on the
+				// target row (causing epqWait) is resolved first, matching PG's
+				// blocking behaviour. M0100-0007.
+				if matchedSrc {
+					mods[len(mods)-1].hasDuplicate = true
+					srcRows[si].matched = true
+					break // only need to detect the first duplicate
+				}
+				// First source match — record action and continue scanning to detect
+				// if a second source row also matches (potential duplicate).
 				srcRows[si].matched = true
 				matchedSrc = true
 				for _, clause := range o.plan.Clauses {
@@ -289,30 +322,32 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 						newRow := make(Row, n)
 						for i := range tbl.Columns {
 							if i >= len(clause.UpdateSet) || clause.UpdateSet[i] == nil {
-								newRow[i] = vt.tgtRow[i]
+								newRow[i] = vtTgtRow[i]
 								continue
 							}
 							val, err := evalExpr(clause.UpdateSet[i], combined, o.ctx)
 							if err != nil {
-								newRow[i] = vt.tgtRow[i]
+								newRow[i] = vtTgtRow[i]
 								continue
 							}
 							newRow[i] = val
 						}
-						_ = computeGeneratedColumns(scanTbl.Columns, newRow)
+						_ = computeGeneratedColumns(tbl.Columns, newRow)
+						// tgtRow/newRow in parent order; applyMod remaps to child at write.
 						mods = append(mods, mergePendingMod{rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx,
 							action: planner.MergeActionUpdate, newRow: newRow,
-							srcRow: cloneRow(srcRows[si].row), tgtRow: cloneRow(vt.tgtRow), srcIdx: si})
+							srcRow: cloneRow(srcRows[si].row), tgtRow: vtTgtRow, srcIdx: si})
 					case planner.MergeActionDelete:
 						mods = append(mods, mergePendingMod{rel: scanRel, tblRef: scanTbl, blk: blk, slot: vt.slotIdx,
 							action: planner.MergeActionDelete, srcRow: cloneRow(srcRows[si].row),
-							tgtRow: cloneRow(vt.tgtRow), srcIdx: si})
+							tgtRow: vtTgtRow, srcIdx: si})
 					case planner.MergeActionDoNothing:
 						// DO NOTHING — skip this row. M0097-0016.
 					}
 					break // first clause wins
 				}
-				break // first source match wins
+				// Do NOT break here — continue scanning remaining source rows to
+				// detect duplicates that would match the same target row.
 			}
 			// Target row had no matching source row — record for WHEN NOT MATCHED BY SOURCE. M0100-0007.
 			if !matchedSrc {
@@ -331,7 +366,14 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 		srcColCount := len(o.plan.Source.Output())
 		nullSrcRow := make(Row, srcColCount)
 		for _, ut := range unmatchedTargets {
-			combined := mergedRow(ut.tgtRow, nullSrcRow)
+			// Normalize tgtRow to parent column order for expression evaluation
+			// and RETURNING. Partition children may have different column ordering
+			// than the parent (e.g. part2 with (val,key) vs parent (key,val)). M0100-0007.
+			utTgtRow := ut.tgtRow
+			if ut.tblRef != nil && ut.tblRef != tbl {
+				utTgtRow = remapRowForPartition(ut.tblRef.Columns, tbl.Columns, ut.tgtRow)
+			}
+			combined := mergedRow(utTgtRow, nullSrcRow)
 			for _, clause := range o.plan.Clauses {
 				if clause.Matched || !clause.BySource {
 					continue
@@ -344,27 +386,28 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 					newRow := make(Row, n)
 					for i := range tbl.Columns {
 						if i >= len(clause.UpdateSet) || clause.UpdateSet[i] == nil {
-							newRow[i] = ut.tgtRow[i]
+							newRow[i] = utTgtRow[i]
 							continue
 						}
 						val, err := evalExpr(clause.UpdateSet[i], combined, o.ctx)
 						if err != nil {
-							newRow[i] = ut.tgtRow[i]
+							newRow[i] = utTgtRow[i]
 							continue
 						}
 						newRow[i] = val
 					}
-					_ = computeGeneratedColumns(ut.tblRef.Columns, newRow)
+					_ = computeGeneratedColumns(tbl.Columns, newRow)
+					// Store tgtRow/newRow in parent order; applyMod remaps to child for write.
 					mods = append(mods, mergePendingMod{
 						rel: ut.rel, tblRef: ut.tblRef, blk: ut.blk, slot: ut.slot,
 						action: planner.MergeActionUpdate, newRow: newRow,
-						tgtRow: cloneRow(ut.tgtRow),
+						tgtRow: utTgtRow,
 					})
 				case planner.MergeActionDelete:
 					mods = append(mods, mergePendingMod{
 						rel: ut.rel, tblRef: ut.tblRef, blk: ut.blk, slot: ut.slot,
 						action: planner.MergeActionDelete,
-						tgtRow: cloneRow(ut.tgtRow),
+						tgtRow: utTgtRow,
 					})
 				case planner.MergeActionDoNothing:
 					// skip
@@ -392,6 +435,16 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 			srcRows[mod.srcIdx].matched = false
 			continue
 		}
+		if epqOf, ok := err.(*mergeEPQOnFailedError); ok {
+			// Concurrent commit changed target key so ON no longer matches.
+			// Unmark source (→ NOT MATCHED INSERT in step 3) and apply WHEN
+			// NOT MATCHED BY SOURCE against the now-visible EPQ row. M0100-0007.
+			srcRows[mod.srcIdx].matched = false
+			if applyErr := o.applyNotMatchedBySource(epqOf.rel, epqOf.tblRef, tbl, rel, n, epqOf.blk, epqOf.slot, epqOf.epqTgtRow); applyErr != nil {
+				return nil, applyErr
+			}
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -403,6 +456,13 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				o.collectReturningRow(planner.MergeActionUpdate, mod.tgtRow, mod.newRow)
 			} else if mod.action == planner.MergeActionDelete {
 				o.collectReturningRow(planner.MergeActionDelete, mod.tgtRow, nil)
+			}
+			// Raise duplicate-source error AFTER the apply (and any epqWait blocking)
+			// so concurrent callers see the <waiting...> / <...completed> sequence that
+			// PostgreSQL produces. M0100-0007.
+			if mod.hasDuplicate {
+				return nil, &ExecError{Code: "21000", Pos: o.plan.Pos(),
+					Message: "MERGE command cannot affect row a second time"}
 			}
 		}
 	}
@@ -510,11 +570,25 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 		// Triggers are fired inside mergeApplyUpdate/Delete after EPQ resolves,
 		// so they fire exactly once per successful write. M0100-0005.
 		var err error
+		// mod.newRow and mod.tgtRow are in parent column order. Remap to child
+		// order for the on-disk write; RETURNING uses the parent-order values. M0100-0007.
+		parentTbl := o.plan.Target
+		writeNewRow := mod.newRow
+		writeTgtRow := mod.tgtRow
+		destRel := rel
+		destCols := tbl.Columns
+		if tbl != parentTbl {
+			writeTgtRow = remapRowForPartition(parentTbl.Columns, tbl.Columns, mod.tgtRow)
+			// Route newRow to the correct partition; for cross-partition UPDATEs
+			// (e.g. key change that moves a row to a different child), destRel/destCols
+			// will differ from rel/tbl.Columns. M0100-0007.
+			destRel, destCols, writeNewRow = o.routeModNewRow(parentTbl, tbl, rel, mod.newRow)
+		}
 		switch mod.action {
 		case planner.MergeActionUpdate:
-			err = mergeApplyUpdate(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, mod.newRow, mod.tgtRow, o.plan.Pos())
+			err = mergeApplyUpdate(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, writeNewRow, writeTgtRow, destRel, destCols, o.plan.Pos())
 		case planner.MergeActionDelete:
-			err = mergeApplyDelete(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, mod.tgtRow, o.plan.Pos())
+			err = mergeApplyDelete(o.ctx, rel, tbl, tbl.Columns, mod.blk, mod.slot, writeTgtRow, o.plan.Pos())
 		default:
 			return false, nil
 		}
@@ -529,11 +603,25 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 			return false, err
 		}
 
+		// Normalize EPQ row to parent column order so plan expressions
+		// (which use parent column indices) evaluate correctly. M0100-0007.
+		epqTgtNorm := epqErr.newTgtRow
+		if tbl != parentTbl {
+			epqTgtNorm = remapRowForPartition(tbl.Columns, parentTbl.Columns, epqErr.newTgtRow)
+		}
 		// Re-evaluate WHEN MATCHED conditions against the new live row.
-		combined := mergedRow(epqErr.newTgtRow, mod.srcRow)
+		combined := mergedRow(epqTgtNorm, mod.srcRow)
 		v, evErr := evalExpr(o.plan.On, combined, o.ctx)
 		if evErr != nil || v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
-			return false, nil // no longer matches ON condition
+			// ON failed after EPQ: the concurrent commit changed the target row
+			// so it no longer matches this source. Report the live row so the
+			// caller can route it through WHEN NOT MATCHED BY SOURCE. M0100-0007.
+			return false, &mergeEPQOnFailedError{
+				blk: epqErr.newBlk, slot: epqErr.newSlot,
+				epqTgtRow: epqTgtNorm,
+				rel:    mod.rel,
+				tblRef: mod.tblRef,
+			}
 		}
 		reMatched := false
 		for _, clause := range o.plan.Clauses {
@@ -546,25 +634,25 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 			switch clause.Action {
 			case planner.MergeActionUpdate:
 				newRow := make(Row, n)
-				for i := range tbl.Columns {
+				for i := range parentTbl.Columns {
 					if i >= len(clause.UpdateSet) || clause.UpdateSet[i] == nil {
-						newRow[i] = epqErr.newTgtRow[i]
+						newRow[i] = epqTgtNorm[i]
 						continue
 					}
 					val, _ := evalExpr(clause.UpdateSet[i], combined, o.ctx)
 					newRow[i] = val
 				}
-				_ = computeGeneratedColumns(tbl.Columns, newRow)
+				_ = computeGeneratedColumns(parentTbl.Columns, newRow)
 				mod.blk = epqErr.newBlk
 				mod.slot = epqErr.newSlot
-				mod.tgtRow = epqErr.newTgtRow // update for trigger firing in next iteration
-				mod.newRow = newRow
+				mod.tgtRow = epqTgtNorm // parent order for RETURNING
+				mod.newRow = newRow     // parent order; remapped to child at write time
 				mod.action = planner.MergeActionUpdate
 				reMatched = true
 			case planner.MergeActionDelete:
 				mod.blk = epqErr.newBlk
 				mod.slot = epqErr.newSlot
-				mod.tgtRow = epqErr.newTgtRow
+				mod.tgtRow = epqTgtNorm
 				mod.action = planner.MergeActionDelete
 				reMatched = true
 			case planner.MergeActionDoNothing:
@@ -577,6 +665,94 @@ func (o *mergeOp) applyMod(rel storage.RelFileNode, tbl *catalog.Table, n int, m
 		}
 		// Loop back to retry with updated slot/newRow. mergeApplyUpdate/Delete fires trigger.
 	}
+}
+
+// routeModNewRow returns the destination rel/cols and the write-order newRow for
+// a MERGE UPDATE, applying partition routing when the new key would move the row
+// to a different child partition. newRowParent must be in parentTbl column order.
+// If routing is unavailable or the row stays in the same partition, scanRel/scanTbl
+// are returned unchanged. M0100-0007.
+func (o *mergeOp) routeModNewRow(parentTbl, scanTbl *catalog.Table, scanRel storage.RelFileNode, newRowParent Row) (destRel storage.RelFileNode, destCols []catalog.Column, writeNewRow Row) {
+	destRel = scanRel
+	destCols = scanTbl.Columns
+	writeNewRow = remapRowForPartition(parentTbl.Columns, scanTbl.Columns, newRowParent)
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		dp, _ := routeToPartition(parentTbl, newRowParent, im, o.ctx)
+		if dp != nil && dp.OID != scanTbl.OID {
+			destRel = o.ctx.Catalog.RelFileNode(dp)
+			destCols = dp.Columns
+			writeNewRow = remapRowForPartition(parentTbl.Columns, dp.Columns, newRowParent)
+		}
+	}
+	return
+}
+
+// applyNotMatchedBySource evaluates WHEN NOT MATCHED BY SOURCE clauses against
+// tgtRow (in parent column order) at (epqRel, epqTbl, blk, slot) and applies
+// the first matching clause. Used when EPQ reveals a target row no longer
+// matches the source ON condition. M0100-0007.
+func (o *mergeOp) applyNotMatchedBySource(epqRel storage.RelFileNode, epqTbl *catalog.Table, parentTbl *catalog.Table, fallbackRel storage.RelFileNode, n int, blk storage.BlockNumber, slot uint16, tgtRow Row) error {
+	if epqTbl == nil {
+		epqTbl = parentTbl
+	}
+	if epqRel == (storage.RelFileNode{}) {
+		epqRel = fallbackRel
+	}
+	srcColCount := len(o.plan.Source.Output())
+	nullSrcRow := make(Row, srcColCount)
+	combined := mergedRow(tgtRow, nullSrcRow)
+	for _, clause := range o.plan.Clauses {
+		if clause.Matched || !clause.BySource {
+			continue
+		}
+		if !mergeClauseCondMatches(clause, combined, o.ctx) {
+			continue
+		}
+		switch clause.Action {
+		case planner.MergeActionUpdate:
+			newRow := make(Row, n)
+			for i := range parentTbl.Columns {
+				if i >= len(clause.UpdateSet) || clause.UpdateSet[i] == nil {
+					newRow[i] = tgtRow[i]
+					continue
+				}
+				val, _ := evalExpr(clause.UpdateSet[i], combined, o.ctx)
+				newRow[i] = val
+			}
+			_ = computeGeneratedColumns(parentTbl.Columns, newRow)
+			mod := &mergePendingMod{
+				rel: epqRel, tblRef: epqTbl,
+				blk: blk, slot: slot,
+				action: planner.MergeActionUpdate, newRow: newRow, tgtRow: tgtRow,
+			}
+			applied, applyErr := o.applyMod(epqRel, epqTbl, n, mod)
+			if applyErr != nil {
+				return applyErr
+			}
+			if applied {
+				o.rowsAffected++
+				o.collectReturningRow(planner.MergeActionUpdate, tgtRow, newRow)
+			}
+		case planner.MergeActionDelete:
+			mod := &mergePendingMod{
+				rel: epqRel, tblRef: epqTbl,
+				blk: blk, slot: slot,
+				action: planner.MergeActionDelete, tgtRow: tgtRow,
+			}
+			applied, applyErr := o.applyMod(epqRel, epqTbl, n, mod)
+			if applyErr != nil {
+				return applyErr
+			}
+			if applied {
+				o.rowsAffected++
+				o.collectReturningRow(planner.MergeActionDelete, tgtRow, nil)
+			}
+		case planner.MergeActionDoNothing:
+			// skip
+		}
+		break
+	}
+	return nil
 }
 
 // mergeEPQRefreshSnap refreshes ctx.Snap for READ COMMITTED after epqWait so
@@ -624,7 +800,10 @@ func mergeClauseCondMatches(clause *planner.MergeWhenClause, row Row, ctx *Conte
 // conflicting transaction to complete (EPQ) and then re-checks the row.
 // If the row is still updatable, the update is applied; otherwise it is
 // skipped (the MERGE WHEN clause no longer matches after the concurrent update).
-func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, blk storage.BlockNumber, slot uint16, newRow, tgtRow Row, pos int) error {
+// mergeApplyUpdate writes a MERGE MATCHED UPDATE.  destRel/destCols specify the
+// destination partition for cross-partition moves (same as rel/cols when the row
+// stays in the same partition). M0100-0007.
+func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, blk storage.BlockNumber, slot uint16, newRow, tgtRow Row, destRel storage.RelFileNode, destCols []catalog.Column, pos int) error {
 	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
@@ -646,8 +825,8 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 			return errMovedToAnotherPartition(pos)
 		}
 		// Follow HOT chain to find the current live tuple.
-		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
-		if found {
+		newSlot, newTgtRow, _, predOk := epqFollowHOT(ctx, rel, blk, slot, cols, nil, nil)
+		if predOk {
 			// Signal the caller to re-evaluate WHEN MATCHED conditions with the new row.
 			// Trigger will fire on the NEXT call with the correct live row. M0100-0005.
 			return &mergeEPQError{newBlk: blk, newSlot: newSlot, newTgtRow: newTgtRow}
@@ -656,7 +835,7 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		// puRel != rel): fall back to raw t_ctid chain, same pattern as updateOp.Next().
 		// Use epqFollowChainFull to detect when the chain ended due to a moved-partition
 		// sentinel (e.g. HOT chain where the live successor was itself cross-partition moved).
-		_, cRes, chainHadSentinel := epqFollowChainFull(ctx, rel, blk, slot, cols, nil)
+		_, cRes, chainHadSentinel := epqFollowChainFull(ctx, rel, blk, slot, cols, nil, nil)
 		if cRes.ok {
 			return &mergeEPQError{newBlk: cRes.blk, newSlot: cRes.slot, newTgtRow: cRes.row}
 		}
@@ -691,10 +870,24 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	if oldGerr == nil {
 		oldTupleBytes, _ = oldTup.MarshalBinary()
 	}
-	if err := storage.PageSetHeapTupleXmax(s.Page(), slot, ctx.Tx.XID); err != nil {
-		s.Unlock()
-		ctx.Pool.Unpin(s)
-		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+	// For cross-partition moves: use PageSetHeapTupleMovedPartition which sets
+	// BOTH xmax AND the sentinel CTID {InvalidBlockNumber, MovedPartitionsOffsetNumber}
+	// so that concurrent EPQ callers can detect the partition move via
+	// epqSlotMovedToAnotherPartition. For same-partition updates: use the standard
+	// PageSetHeapTupleXmax + stampOldCtid chain. M0100-0007.
+	crossPart := destRel != rel
+	if crossPart {
+		if err := storage.PageSetHeapTupleMovedPartition(s.Page(), slot, ctx.Tx.XID); err != nil {
+			s.Unlock()
+			ctx.Pool.Unpin(s)
+			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+		}
+	} else {
+		if err := storage.PageSetHeapTupleXmax(s.Page(), slot, ctx.Tx.XID); err != nil {
+			s.Unlock()
+			ctx.Pool.Unpin(s)
+			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
+		}
 	}
 	derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, ctx.Tx.XID, oldTupleBytes)
 	s.Unlock()
@@ -702,15 +895,18 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	if derr != nil {
 		return derr
 	}
-	// Write new tuple version and link old→new via t_ctid so EPQ chain
-	// followers (epqFollowChainFull) can locate the latest version after
-	// a concurrent committed update (M0100-0005).
-	newPtr, werr := writeHeapRowReturning(ctx, rel, cols, newRow)
+	// Write new tuple to destination (may differ for cross-partition moves).
+	newPtr, werr := writeHeapRowReturning(ctx, destRel, destCols, newRow)
 	if werr != nil {
 		return werr
 	}
-	if cerr := stampOldCtid(ctx, rel, blk, slot, newPtr); cerr != nil {
-		return cerr
+	// Link old→new via t_ctid for same-partition updates so EPQ chain
+	// followers (epqFollowChainFull) can locate the latest version. Cross-partition
+	// moves use the sentinel CTID (already set above) instead. M0100-0007.
+	if !crossPart {
+		if cerr := stampOldCtid(ctx, rel, blk, slot, newPtr); cerr != nil {
+			return cerr
+		}
 	}
 	return nil
 }
@@ -742,11 +938,11 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		if epqSlotMovedToAnotherPartition(ctx, rel, blk, slot) {
 			return errMovedToAnotherPartition(pos)
 		}
-		newSlot, newTgtRow, found := epqFollowHOT(ctx, rel, blk, slot, cols, nil)
-		if found {
+		newSlot, newTgtRow, _, predOk2 := epqFollowHOT(ctx, rel, blk, slot, cols, nil, nil)
+		if predOk2 {
 			return &mergeEPQError{newBlk: blk, newSlot: newSlot, newTgtRow: newTgtRow}
 		}
-		_, cRes2, chainHadSentinel2 := epqFollowChainFull(ctx, rel, blk, slot, cols, nil)
+		_, cRes2, chainHadSentinel2 := epqFollowChainFull(ctx, rel, blk, slot, cols, nil, nil)
 		if cRes2.ok {
 			return &mergeEPQError{newBlk: cRes2.blk, newSlot: cRes2.slot, newTgtRow: cRes2.row}
 		}
