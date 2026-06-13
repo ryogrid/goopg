@@ -3,6 +3,7 @@ package amcheck
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -399,5 +400,185 @@ func TestVerifyBtreeItemOrder_DeletedPageNil(t *testing.T) {
 	p := makeItemsPage(t, btree.BTLeaf|btree.BTDeleted, 0, 5, nil, k(3), k(1))
 	if rs := VerifyBtreeItemOrder(p, 11, "ix"); len(rs) != 0 {
 		t.Fatalf("deleted page reported %d, want 0: %+v", len(rs), rs)
+	}
+}
+
+// --- Cross-page sibling-link tier (VerifyBtreeLevelSiblingLinks) -------------
+
+// makeLinkedPage builds a non-meta page carrying explicit prev/next sibling
+// links plus a level and flags, so a horizontal level walk can be assembled from
+// a map. Self-checks the links through btree.ParseOpaque.
+func makeLinkedPage(t *testing.T, prev, next storage.BlockNumber, level uint32, flags uint16) storage.Page {
+	t.Helper()
+	p := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(p); err != nil {
+		t.Fatalf("InitPage: %v", err)
+	}
+	off := btSpecial()
+	binary.LittleEndian.PutUint32(p[off:off+4], uint32(prev))   // Prev
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(next)) // Next
+	binary.LittleEndian.PutUint32(p[off+8:off+12], level)       // Level
+	binary.LittleEndian.PutUint16(p[off+12:off+14], flags)      // Flags
+	op := btree.ParseOpaque(p)
+	if op.Prev != prev || op.Next != next || op.Level != level || op.Flags != flags {
+		t.Fatalf("makeLinkedPage self-check: got %+v, want prev=%d next=%d level=%d flags=%#x", op, prev, next, level, flags)
+	}
+	return p
+}
+
+// mapSource turns a block→page map into a PageSource; an unknown block errors
+// (exercises the damaged-page path).
+func mapSource(pages map[storage.BlockNumber]storage.Page) PageSource {
+	return func(b storage.BlockNumber) (storage.Page, error) {
+		p, ok := pages[b]
+		if !ok {
+			return nil, fmt.Errorf("no such block %d", b)
+		}
+		return p, nil
+	}
+}
+
+const none = storage.InvalidBlockNumber
+
+// A clean three-page level (1 → 2 → 3) with mutually-agreeing links and a
+// uniform level walks without findings.
+func TestVerifyBtreeSiblingLinks_CleanLevel(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeLinkedPage(t, none, 2, 0, btree.BTLeaf),
+		2: makeLinkedPage(t, 1, 3, 0, btree.BTLeaf),
+		3: makeLinkedPage(t, 2, none, 0, btree.BTLeaf),
+	}
+	if rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix"); len(rs) != 0 {
+		t.Fatalf("clean level reported %d, want 0: %+v", len(rs), rs)
+	}
+}
+
+// Block 3's back-link points at 9 instead of 2 — the sibling links disagree.
+func TestVerifyBtreeSiblingLinks_BackLinkMismatch(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeLinkedPage(t, none, 2, 0, btree.BTLeaf),
+		2: makeLinkedPage(t, 1, 3, 0, btree.BTLeaf),
+		3: makeLinkedPage(t, 9, none, 0, btree.BTLeaf),
+	}
+	rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix")
+	if len(rs) != 1 {
+		t.Fatalf("mismatch reported %d, want 1: %+v", len(rs), rs)
+	}
+	want := `left link/right link pair in index "ix" not in agreement`
+	if rs[0].Msg != want {
+		t.Fatalf("msg = %q, want %q", rs[0].Msg, want)
+	}
+	if rs[0].Block != 3 {
+		t.Fatalf("block = %d, want 3", rs[0].Block)
+	}
+}
+
+// The leftmost page is exempt from the back-link check: a non-P_NONE Prev on the
+// first page (left sibling half-dead) is tolerated, matching upstream's
+// leftcurrent != P_NONE gate.
+func TestVerifyBtreeSiblingLinks_LeftmostPrevExempt(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeLinkedPage(t, 7, 2, 0, btree.BTLeaf), // Prev=7 but it's leftmost
+		2: makeLinkedPage(t, 1, none, 0, btree.BTLeaf),
+	}
+	if rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix"); len(rs) != 0 {
+		t.Fatalf("leftmost-prev-exempt reported %d, want 0: %+v", len(rs), rs)
+	}
+}
+
+// A page on the level whose btpo_level differs from the leftmost page's level
+// trips the per-level uniformity check.
+func TestVerifyBtreeSiblingLinks_LevelMismatch(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeLinkedPage(t, none, 2, 1, 0),
+		2: makeLinkedPage(t, 1, none, 2, 0), // level 2, expected 1
+	}
+	rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix")
+	if len(rs) != 1 {
+		t.Fatalf("level mismatch reported %d, want 1: %+v", len(rs), rs)
+	}
+	want := `leftmost down link for level points to block in index "ix" whose level is not one level down`
+	if rs[0].Msg != want {
+		t.Fatalf("msg = %q, want %q", rs[0].Msg, want)
+	}
+}
+
+// A two-page cycle (1 → 2 → 1) is caught when block 1 is revisited.
+func TestVerifyBtreeSiblingLinks_CircularChain(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeLinkedPage(t, none, 2, 0, btree.BTLeaf),
+		2: makeLinkedPage(t, 1, 1, 0, btree.BTLeaf), // Next loops back to 1
+	}
+	rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix")
+	if len(rs) != 1 {
+		t.Fatalf("cycle reported %d, want 1: %+v", len(rs), rs)
+	}
+	want := `circular link chain found in block 1 of index "ix"`
+	if rs[0].Msg != want {
+		t.Fatalf("msg = %q, want %q", rs[0].Msg, want)
+	}
+}
+
+// A self-loop (1 → 1) is the degenerate cycle and is caught on the second visit.
+func TestVerifyBtreeSiblingLinks_SelfLoop(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeLinkedPage(t, none, 1, 0, btree.BTLeaf),
+	}
+	rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix")
+	if len(rs) != 1 || rs[0].Msg != `circular link chain found in block 1 of index "ix"` {
+		t.Fatalf("self-loop want single circular finding, got %+v", rs)
+	}
+}
+
+// Reaching a fully deleted page through a sibling link is corruption in
+// readonly mode.
+func TestVerifyBtreeSiblingLinks_DeletedReachable(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeLinkedPage(t, none, 2, 0, btree.BTLeaf),
+		2: makeLinkedPage(t, 1, none, 0, btree.BTLeaf|btree.BTDeleted),
+	}
+	rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix")
+	if len(rs) != 1 {
+		t.Fatalf("deleted-reachable reported %d, want 1: %+v", len(rs), rs)
+	}
+	want := `downlink or sibling link points to deleted block in index "ix"`
+	if rs[0].Msg != want {
+		t.Fatalf("msg = %q, want %q", rs[0].Msg, want)
+	}
+}
+
+// A right link to a block the source cannot supply surfaces as a damaged-page
+// finding, not a panic.
+func TestVerifyBtreeSiblingLinks_DanglingRightLink(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeLinkedPage(t, none, 2, 0, btree.BTLeaf),
+		// block 2 absent
+	}
+	rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix")
+	if len(rs) != 1 {
+		t.Fatalf("dangling right link reported %d, want 1: %+v", len(rs), rs)
+	}
+	if !strings.Contains(rs[0].Msg, `has a damaged page at block 2`) {
+		t.Fatalf("msg = %q, want a damaged-page finding for block 2", rs[0].Msg)
+	}
+}
+
+// A leftmost of the metapage is a damaged starting point (the metapage carries
+// no sibling links).
+func TestVerifyBtreeSiblingLinks_MetaLeftmost(t *testing.T) {
+	rs := VerifyBtreeLevelSiblingLinks(mapSource(nil), btree.MetaBlock, "ix")
+	if len(rs) != 1 || !strings.Contains(rs[0].Msg, "metapage is not part of a level") {
+		t.Fatalf("meta-leftmost want single damaged finding, got %+v", rs)
+	}
+}
+
+// A single rightmost leaf (the new-tree shape: one page, Prev=None, Next=None)
+// is a clean level of length one.
+func TestVerifyBtreeSiblingLinks_SinglePageLevel(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeLinkedPage(t, none, none, 0, btree.BTLeaf|btree.BTRoot),
+	}
+	if rs := VerifyBtreeLevelSiblingLinks(mapSource(pages), 1, "ix"); len(rs) != 0 {
+		t.Fatalf("single-page level reported %d, want 0: %+v", len(rs), rs)
 	}
 }

@@ -40,9 +40,14 @@
 //
 // The page-local key-comparison tier of bt_target_page_check — the item-order
 // and high-key invariants that need only the page's own bytes plus its high key
-// — is ported in VerifyBtreeItemOrder below. The clog/sibling-dependent tiers
-// (downlink/sibling-link agreement, cross-page item order, cross-level descent
-// via bt_index_parent_check) are deferred; see the design doc.
+// — is ported in VerifyBtreeItemOrder below. The cross-page sibling-link tier —
+// the left-link/right-link agreement, per-level uniformity, and circular-chain
+// checks that a horizontal walk of one level performs (verify_nbtree.c's
+// bt_check_level_from_leftmost loop) — is ported in VerifyBtreeLevelSiblingLinks.
+// The remaining clog/downlink-dependent tiers (downlink-to-child agreement and
+// cross-level descent via bt_index_parent_check, which need the child page's
+// pivot keys compared against the parent downlink) are deferred; see the design
+// doc.
 package amcheck
 
 import (
@@ -211,6 +216,118 @@ func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName s
 			return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 				"item order invariant violated for index \"%s\"", indexName)}}
 		}
+	}
+	return nil
+}
+
+// PageSource yields the raw bytes of a B-tree page by block number. It is the
+// minimal relation-walking dependency the cross-page tier needs: the SQL surface
+// will satisfy it from the index's smgr (read block N), while page-bytes-only
+// callers and tests can back it with an in-memory map. An error (block out of
+// range, short read) is surfaced by the driver as a damaged-page finding, never
+// a Go panic — matching the report-and-continue model of the per-page tiers.
+type PageSource func(storage.BlockNumber) (storage.Page, error)
+
+// VerifyBtreeLevelSiblingLinks ports the cross-page sibling-link checks that
+// upstream amcheck performs while walking one B-tree level left-to-right, in
+// bt_check_level_from_leftmost (verify_nbtree.c:650-790). Starting from leftmost
+// it follows each page's btpo_next (BTPageOpaque.Next) to the rightmost page of
+// the level, applying the three invariants that need only sibling-link state —
+// no clog, no index TupleDesc, no parent/downlink descent:
+//
+//   - Sibling-link agreement. Each page's btpo_prev (BTPageOpaque.Prev) must
+//     equal the block we arrived from. Upstream gates this on leftcurrent != P_NONE
+//     (`opaque->btpo_prev != leftcurrent && leftcurrent != P_NONE`), so the
+//     leftmost page — reached with leftcurrent == P_NONE — is exempt (its left
+//     link may legitimately differ when its left sibling is half-dead). Violation
+//     message: `left link/right link pair in index "%s" not in agreement`
+//     (verify_nbtree.c:1193, the bt_recheck_sibling_links readonly path).
+//
+//   - Per-level uniformity. Every page reached on this horizontal walk must
+//     report the same btpo_level as the leftmost page of the level (upstream's
+//     `level.level != opaque->btpo_level`). Violation message: `leftmost down
+//     link for level points to block in index "%s" whose level is not one level
+//     down` (verify_nbtree.c:774).
+//
+//   - Circular link chain. A corrupt index can form a sibling cycle; upstream
+//     detects the immediate case (`current == leftcurrent || current ==
+//     opaque->btpo_prev`). goopg tracks every block visited on the walk and flags
+//     a revisit — this subsumes the immediate case (a self-loop or back-link
+//     revisits within one step) and also bounds the walk against longer cycles a
+//     bytes-only checker cannot otherwise terminate. Message: `circular link
+//     chain found in block %u of index "%s"` (verify_nbtree.c:787).
+//
+// goopg / upstream divergences:
+//
+//   - P_NONE is storage.InvalidBlockNumber; a rightmost page (btpo_next ==
+//     P_NONE) ends the walk, exactly as upstream's P_RIGHTMOST.
+//   - Reaching a fully deleted page through a sibling link is itself corruption
+//     in readonly mode: upstream ereports `downlink or sibling link points to
+//     deleted block in index "%s"` (verify_nbtree.c:676). goopg mirrors that —
+//     a deleted page is unlinked and must not be reachable.
+//   - The metapage is never part of a level walk (it carries no sibling links),
+//     so a leftmost of MetaBlock is treated as a damaged starting point.
+//
+// Like the per-page tiers it returns 0 or 1 findings: upstream ereport(ERROR)s on
+// the first cross-page violation, so the first one the walk reaches is conclusive.
+// It performs only the cross-page checks; per-page structure (VerifyBtreePage) and
+// per-page key order (VerifyBtreeItemOrder) are run separately and composed by the
+// SQL surface.
+func VerifyBtreeLevelSiblingLinks(src PageSource, leftmost storage.BlockNumber, indexName string) []BtreeReport {
+	if leftmost == btree.MetaBlock {
+		return []BtreeReport{{Block: leftmost, Msg: fmt.Sprintf(
+			"index \"%s\" has a damaged page at block %d: metapage is not part of a level",
+			indexName, leftmost)}}
+	}
+
+	// leftcurrent is the block we arrived from; P_NONE for the leftmost page.
+	leftcurrent := storage.InvalidBlockNumber
+	current := leftmost
+	var expectLevel uint32
+	first := true
+	visited := make(map[storage.BlockNumber]bool)
+
+	for current != storage.InvalidBlockNumber {
+		// Circular detection: a block reached twice on one horizontal walk is a
+		// sibling cycle (subsumes upstream's immediate current==leftcurrent /
+		// current==btpo_prev check and bounds longer cycles).
+		if visited[current] {
+			return []BtreeReport{{Block: current, Msg: fmt.Sprintf(
+				"circular link chain found in block %d of index \"%s\"", current, indexName)}}
+		}
+		visited[current] = true
+
+		p, err := src(current)
+		if err != nil {
+			return []BtreeReport{{Block: current, Msg: fmt.Sprintf(
+				"index \"%s\" has a damaged page at block %d: %v", indexName, current, err)}}
+		}
+		opaque := btree.ParseOpaque(p)
+
+		// A deleted page must not be reachable through a sibling link.
+		if opaque.IsDeleted() {
+			return []BtreeReport{{Block: current, Msg: fmt.Sprintf(
+				"downlink or sibling link points to deleted block in index \"%s\"", indexName)}}
+		}
+
+		// Sibling-link agreement (exempt only the leftmost page, leftcurrent == P_NONE).
+		if leftcurrent != storage.InvalidBlockNumber && opaque.Prev != leftcurrent {
+			return []BtreeReport{{Block: current, Msg: fmt.Sprintf(
+				"left link/right link pair in index \"%s\" not in agreement", indexName)}}
+		}
+
+		// Per-level uniformity: pin the expected level from the leftmost page.
+		if first {
+			expectLevel = opaque.Level
+			first = false
+		} else if opaque.Level != expectLevel {
+			return []BtreeReport{{Block: current, Msg: fmt.Sprintf(
+				"leftmost down link for level points to block in index \"%s\" whose level is not one level down",
+				indexName)}}
+		}
+
+		leftcurrent = current
+		current = opaque.Next
 	}
 	return nil
 }

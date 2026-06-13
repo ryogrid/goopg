@@ -3,7 +3,8 @@
 Status: accepted (partial)
 Milestone: M0110-0003
 Date: 2026-06-14 (extended 2026-06-14, loop #52: infomask-only header invariants;
-loop #55: B-tree index verification (`verify_nbtree`) page-structural tier)
+loop #55: B-tree index verification (`verify_nbtree`) page-structural tier;
+loop #58: B-tree cross-page sibling-link tier)
 
 > Scope note: this doc now covers both amcheck verify engines in
 > `internal/amcheck` — the heap-page checker (`verify_heapam.go`, the bulk of
@@ -443,10 +444,83 @@ item over asserts the exact upstream message + block; a non-multiple `pd_lower`
 yields a damaged-page finding; a deleted page with an over-ceiling `pd_lower` is
 suppressed. 5 tests.
 
+## B-tree cross-page sibling-link tier (`VerifyBtreeLevelSiblingLinks`)
+
+The per-page tiers (`VerifyBtreePage`, `VerifyBtreeItemOrder`) inspect one page's
+bytes in isolation. The next faithful slice is the first **cross-page** tier: the
+checks upstream amcheck performs while walking one B-tree level left-to-right in
+`bt_check_level_from_leftmost` (`verify_nbtree.c:650-790`). It needs no clog, no
+index `TupleDesc`, and no parent/downlink descent — only the sibling-link state
+(`btpo_prev` / `btpo_next`) of the pages on a single level — so it ports cleanly
+onto goopg's `BTPageOpaque.Prev` / `BTPageOpaque.Next`.
+
+### Relation-walking dependency (`PageSource`)
+
+To stay new-file/additive while the working tree carries another session's
+uncommitted WIP, the driver does **not** open the index catalog itself. It takes
+a `PageSource` — `func(storage.BlockNumber) (storage.Page, error)` — the minimal
+seam over "read block N of this index". The SQL surface (a later loop) satisfies
+it from the index's smgr; tests back it with an in-memory `map`. A source error
+(out-of-range block, short read) becomes a damaged-page finding, never a panic,
+matching the per-page tiers' report-and-continue model.
+
+### Ported checks (each upstream-verbatim message)
+
+- **Sibling-link agreement.** Following `btpo_next` from `leftmost`, each page's
+  `btpo_prev` must equal the block we arrived from. Upstream gates this on
+  `leftcurrent != P_NONE`, so the leftmost page is exempt (its left link may
+  legitimately differ when the left sibling is half-dead). Message: `left
+  link/right link pair in index "%s" not in agreement` (`verify_nbtree.c:1193`).
+- **Per-level uniformity.** Every page reached on the horizontal walk must report
+  the same `btpo_level` as the leftmost page. Message: `leftmost down link for
+  level points to block in index "%s" whose level is not one level down`
+  (`verify_nbtree.c:774`).
+- **Circular link chain.** A corrupt index can form a sibling cycle. Upstream
+  catches the immediate case (`current == leftcurrent || current == btpo_prev`);
+  goopg tracks every block visited on the walk and flags a revisit, which
+  subsumes the immediate case (a self-loop or back-link revisits within one step)
+  **and** bounds the walk against longer cycles a bytes-only checker cannot
+  otherwise terminate. Message: `circular link chain found in block %u of index
+  "%s"` (`verify_nbtree.c:787`).
+
+### Divergences
+
+- `P_NONE` is `storage.InvalidBlockNumber`; a rightmost page (`btpo_next ==
+  P_NONE`) ends the walk, exactly as `P_RIGHTMOST`.
+- Reaching a fully deleted page through a sibling link is itself corruption in
+  readonly mode — upstream ereports `downlink or sibling link points to deleted
+  block in index "%s"` (`verify_nbtree.c:676`); goopg mirrors that (a deleted
+  page is unlinked and must not be reachable).
+- A `leftmost` of the metapage is a damaged starting point (the metapage carries
+  no sibling links) and surfaces as a damaged-page finding.
+- Like the per-page tiers it returns 0 or 1 findings (upstream ereports on the
+  first violation). It performs **only** the cross-page checks; per-page
+  structure and key order are run by the per-page tiers and composed by the SQL
+  surface.
+
+### Deferred (still need more than sibling state)
+
+The remaining `bt_index_check` tiers — downlink-to-child agreement and
+cross-level descent via `bt_index_parent_check` — compare a child page's pivot
+keys against the parent downlink, so they need both the parent and child pages
+plus the key comparator across levels. They are deferred to a dedicated loop
+(and ultimately the SQL surface, which supplies the catalog/regclass lookup).
+
+### Testing (sibling-link tier)
+
+`verify_nbtree_test.go` gains a `makeLinkedPage` builder (explicit `prev`/`next`
+links) and a `mapSource` adapter (block→page map → `PageSource`). 10 tests: a
+clean three-page level; a back-link mismatch (exact message + block); the
+leftmost-prev exemption; a level mismatch; a two-page cycle and a self-loop
+(both → circular message); a deleted page reached via sibling link; a dangling
+right link (→ damaged-page finding); a metapage leftmost; and the single-page
+new-tree level.
+
 ## Upstream references
 
-- `postgres/contrib/amcheck/verify_nbtree.c` (`palloc_btree_page`) — the
-  mirrored per-page metapage/level checks and messages.
+- `postgres/contrib/amcheck/verify_nbtree.c` (`palloc_btree_page`,
+  `bt_check_level_from_leftmost`, `bt_recheck_sibling_links`) — the mirrored
+  per-page and cross-page sibling-link checks and messages.
 - `postgres/contrib/amcheck/verify_heapam.c` (`verify_heapam`,
   `check_tuple_header`) — the mirrored check order and messages.
 - `postgres/src/include/access/htup_details.h` — `SizeofHeapTupleHeader` (23),

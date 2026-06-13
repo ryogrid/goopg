@@ -1098,6 +1098,36 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         ("B-tree item-count ceiling tier"); README index updated. STILL DEFERRED:
         cross-page/cross-level tiers, and the SQL surface (still blocked on a
         clean tree).
+      - **PROGRESS 2026-06-14 (loop #58):** added the first **cross-page** B-tree
+        tier, `VerifyBtreeLevelSiblingLinks` (new code in `verify_nbtree.go`),
+        porting the sibling-link checks `bt_check_level_from_leftmost` performs
+        walking one level left-to-right (`verify_nbtree.c:650-790`): (1) **left-link/
+        right-link agreement** — each page's `btpo_prev` must equal the block we
+        arrived from, with the leftmost page exempt exactly as upstream's
+        `leftcurrent != P_NONE` gate (`left link/right link pair in index "%s"
+        not in agreement`, :1193); (2) **per-level `btpo_level` uniformity**
+        (`leftmost down link for level points to block in index "%s" whose level
+        is not one level down`, :774); (3) **circular-chain detection** via a
+        visited-set that subsumes upstream's immediate `current==leftcurrent ||
+        current==btpo_prev` case AND bounds longer cycles a bytes-only checker
+        can't otherwise terminate (`circular link chain found in block %u of
+        index "%s"`, :787); plus deleted-page-reached-via-sibling
+        (`downlink or sibling link points to deleted block in index "%s"`, :676).
+        To stay new-file/additive while the tree is dirty, the driver takes a
+        minimal `PageSource func(BlockNumber)(Page,error)` seam instead of opening
+        the index catalog — the SQL surface will fill it from the index's smgr,
+        tests back it with an in-memory map; a source error becomes a damaged-page
+        finding, never a panic. 10 new amcheck tests (`makeLinkedPage` +
+        `mapSource` helpers): clean 3-page level, back-link mismatch (exact msg +
+        block), leftmost-prev exemption, level mismatch, two-page cycle, self-loop,
+        deleted-reachable, dangling right link, metapage-leftmost, single-page
+        level. `go test ./internal/amcheck ./internal/access/btree` PASS; gofmt/vet
+        clean; zero contaminated files touched (all in `verify_nbtree.go` +
+        `_test.go`). Design doc `0110-0005` extended ("B-tree cross-page
+        sibling-link tier"); README index updated. STILL DEFERRED: the
+        downlink-to-child / cross-level descent tiers (`bt_index_parent_check`,
+        need parent+child pivot-key comparison across levels), and the SQL surface
+        (still blocked on a clean tree).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 
