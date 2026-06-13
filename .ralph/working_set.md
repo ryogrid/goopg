@@ -1,44 +1,38 @@
-Task: M0110-0004 — Port pg_resetwal TAP tests. Landed the CLI-decidable tier
-of 001_basic.pl; server-dependent tier + 002_corrupted.pl deferred under RW-002.
-(idle — nothing in flight on this task once committed.)
+Task: M0102-0010 — add the next initdb CLI option. This loop landed
+`-X`/`--waldir` (external WAL directory relocation). Committed → idle on this slice.
 
 Files (this loop):
-- internal/testport/pgresetwal_port_test.go (NEW) — TestPort_PgResetwal001Basic.
-  Reuses programHelpOk/programVersionOk/programOptionsHandlingOk/
-  commandFailsContaining/clientToolBin/runTool (no new helper needed).
-- docs/test-port/postgres-oracle-port-status.csv — RW-001 (port) + RW-002
-  (defer) added below AC-002.
-- docs/test-port/postgres-oracle-port-status.md — regenerated.
-- docs/design/0110-0004-pg-resetwal-tap-port.md (NEW) + README index row.
-- .ralph/fix_plan.md (M0110-0004 progress).
-- .ralph/progress.json — reconciled stale "completed" → "in_progress" (the
-  guard's auto-repair could not match: progress ts was within max-skew and
-  OLDER than status ts, so its only rule — mark status completed — didn't fire;
-  the loop was actively running so in_progress is the correct mid-loop state).
+- internal/initdb/initdb.go — `Options.WALDir`; early absolute-path validation in
+  `Init` (before ensureEmptyDir); new `setupWALDir` helper; subdir loop skips the
+  literal "pg_wal" when relocating.
+- internal/initdb/waldir_test.go (NEW) — 4 unit tests (relative reject / non-empty
+  reject / relocation symlink+subdirs / default-is-plain-dir).
+- cmd/goopg/main.go — `-X`/`--waldir` flags on `runInit` → `Options.WALDir`.
+- docs/design/0102-0011-initdb-waldir-option.md (NEW) + README index row.
+- .ralph/fix_plan.md (M0102-0010 PROGRESS loop #20; removed --waldir from the
+  remaining-options list), .ralph/deferral_ledger.md (line), .ralph/progress.json
+  (reconciled stale "completed"→"in_progress"; timestamp aligned to status.json
+  17:30:27 to satisfy 2m skew — guard PASS).
 
-Key facts learned this loop:
-- pg_resetwal/t/001_basic.pl is 247 lines, two tiers. CLI tier = help/version/
-  options + too-many-args/no-data-dir/nonexistent-dir + option-arg validation
-  (-c/-e/-l/-m/-o/-O/-u/-x/--wal-segsize/--char-signedness).
-- ORDERING (pg_resetwal.c main): --help/--version short-circuit; then getopt_long
-  loop emits every option-arg error and exit(1) INSIDE the loop; then
-  too-many-args / no-data-dir checks; only THEN GetDataDirectoryCreatePerm /
-  chdir / read_controlfile touch the dir. So all CLI-tier cases are decided
-  before any directory access → pass a nonexistent dir, stays server-free.
-- The two upstream cases that SUCCEED (`-m 0,10`, control-override block) need a
-  real initialized dir → server tier, deferred.
-- pg_resetwal does NOT link libpq → plain runTool (no LD_LIBRARY_PATH shim,
-  unlike pg_amcheck's runToolWithLib in M0110-0003).
-- Test-only port (drives upstream binary); no executor/planner/catalog code
-  touched → TPC-H spotcheck gate not applicable.
+Key facts:
+- Mirrors initdb.c create_xlog_or_symlink/pg_check_dir: absent→create / empty→reuse
+  (chmod 0700) / non-empty→reject ("exists but is not empty"); relative path
+  rejected before any layout (initdb.c:2961). pg_wal becomes a symlink to WALDir;
+  os.Mkdir of pg_wal/archive_status + summaries follows the symlink so they land
+  inside WALDir.
+- Touches only internal/initdb + cmd/goopg — NO executor/planner/catalog/codec, so
+  the TPC-H spotcheck gate does NOT apply.
+- NOTE: ~771 lines of FOREIGN uncommitted changes sit in internal/{analyzer,catalog,
+  executor,mvcc,planner,parser,server} + 2 untracked *_test.go — NOT mine (likely a
+  concurrent loop / worktree agents). Build is clean with them present. I committed
+  selectively (only my 8 files); do NOT `git add -A`.
 
-Next step: commit + push. Then pick next topmost fix_plan item. Remaining M0110:
-M0110-0001/0002/0003 server tiers (need catalog/AM parity), M0110-0004 RW-002
-server tier (needs pg_control round-trip M0106 + SLRU layout parity). Also open:
-M0095-0003 (basebackup streaming), M0102-0009 (sync_remote_apply 45s),
-M0102-0010 (more initdb options — encoding/locale/waldir/checksums/auth/...).
+Next step (next loop): continue M0102-0010 in 001_initdb.pl subtest order — next
+contiguous gap is `--sync-only` (sync an existing data dir) and/or the
+`--no-sync`+`--text-search-config`+`--set` combo in the "successful creation"
+block. Design doc first, one option per loop.
 
-Gates run: gofmt clean; go vet ./internal/testport PASS;
-go test -run TestPort_PgResetwal001Basic ./internal/testport PASS;
-go build ./... PASS; gen-oracle-port-status regenerated OK;
-make ralph-state-guard PASS (after progress.json reconcile).
+Gates run: gofmt clean; go vet ./internal/initdb ./cmd/goopg PASS;
+go test ./internal/initdb (full pkg) PASS; go build ./... PASS; CLI smoke
+(`goopg init -X` symlink OK, `--waldir relwal` exit 1) PASS;
+make ralph-state-guard PASS.

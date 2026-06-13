@@ -549,10 +549,20 @@ if 21-spec pass surfaces a real divergence:
         filesystem layout (mirrors `initdb.c:3479`). Design doc:
         `docs/design/0102-0010-initdb-superuser-name-option.md`. Tests:
         `internal/initdb/superuser_name_test.go`.
+      - **PROGRESS 2026-06-13 (loop #20):** `-X`/`--waldir` (external WAL
+        directory) landed. `Options.WALDir` threads through `Init`; relative
+        paths rejected before any filesystem layout (mirrors `initdb.c:2961`
+        "WAL directory location must be an absolute path"); new `setupWALDir`
+        helper mirrors `initdb.c` `create_xlog_or_symlink`/`pg_check_dir`
+        (absent→create / empty→reuse / non-empty→reject) then symlinks
+        `<DataDir>/pg_wal` → `WALDir` with `archive_status`/`summaries` created
+        inside it via the symlink. `-X`/`--waldir` registered on the `init` CLI.
+        Design doc: `docs/design/0102-0011-initdb-waldir-option.md`. Tests:
+        `internal/initdb/waldir_test.go`.
       - **Remaining initdb options** (each pulls in a distinct subsystem; one
         per future loop, design doc first):
         `--encoding` (encoding catalogs), `--locale`/`--lc-*` +
-        `--locale-provider`/`--icu-locale` (ICU), `--waldir` (WAL relocation),
+        `--locale-provider`/`--icu-locale` (ICU),
         `--data-checksums` (page checksums), `--allow-group-access` (0o750
         dir mode), `--auth`/`--auth-host`/`--auth-local`/`--pwfile`
         (auth bootstrap), `--sync-only`/`--no-sync`/`--sync-method`

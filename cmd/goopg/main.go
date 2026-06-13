@@ -119,6 +119,10 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	// initdb default ("postgres").
 	username := fs.String("U", "", "name of the bootstrap superuser (default \"postgres\")")
 	fs.StringVar(username, "username", "", "name of the bootstrap superuser (default \"postgres\")")
+	// External WAL directory (upstream initdb -X/--waldir). Both forms
+	// bind to the same variable; empty means pg_wal lives under -D.
+	walDir := fs.String("X", "", "location for the write-ahead log directory (absolute path)")
+	fs.StringVar(walDir, "waldir", "", "location for the write-ahead log directory (absolute path)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -126,7 +130,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "goopg init: -D <data-directory> is required")
 		return 2
 	}
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username}); err != nil {
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}

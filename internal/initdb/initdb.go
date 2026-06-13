@@ -150,6 +150,18 @@ type Options struct {
 	// initdb.c:3479.
 	SuperuserName string
 
+	// WALDir, when non-empty, relocates the write-ahead log directory
+	// outside the data directory, mirroring upstream initdb's
+	// -X/--waldir (initdb.c create_xlog_or_symlink). It must be an
+	// absolute path — relative paths are rejected before any filesystem
+	// layout, like initdb.c's "WAL directory location must be an
+	// absolute path" — and must be empty or non-existent (a non-empty
+	// directory is rejected). On success <DataDir>/pg_wal is created as
+	// a symlink to WALDir, and pg_wal/archive_status and
+	// pg_wal/summaries are created inside WALDir via that symlink. When
+	// empty, pg_wal is a plain subdirectory of DataDir as before.
+	WALDir string
+
 	// Registry, when non-nil, is the server's live GUC registry.
 	// Its values for max_connections, max_worker_processes,
 	// max_wal_senders, max_prepared_transactions,
@@ -175,6 +187,40 @@ func createPerDatabaseScaffolding(dataDir string, dbOID uint32) error {
 	return nil
 }
 
+// setupWALDir relocates pg_wal outside the data directory, mirroring
+// upstream initdb's -X/--waldir (initdb.c create_xlog_or_symlink). walDir
+// must already be validated as an absolute path. Mirroring upstream's
+// pg_check_dir switch: a non-existent directory is created, an existing
+// empty one is reused (permissions fixed), and a non-empty one is
+// rejected. On success <abs>/pg_wal is created as a symlink to walDir.
+func setupWALDir(abs, walDir string) error {
+	entries, err := os.ReadDir(walDir)
+	switch {
+	case err == nil:
+		// Present: reuse only if empty (upstream pg_check_dir case 1).
+		// Any entry — including a lost+found mount-point marker — makes
+		// it non-empty and is rejected (cases 2/3/4 → exit 1).
+		if len(entries) > 0 {
+			return fmt.Errorf("WAL directory %q exists but is not empty", walDir)
+		}
+		if err := os.Chmod(walDir, 0o700); err != nil {
+			return fmt.Errorf("change permissions of WAL directory %q: %w", walDir, err)
+		}
+	case errors.Is(err, os.ErrNotExist):
+		// Not there, must create it (upstream pg_check_dir case 0).
+		if err := os.MkdirAll(walDir, 0o700); err != nil {
+			return fmt.Errorf("create WAL directory %q: %w", walDir, err)
+		}
+	default:
+		return fmt.Errorf("access WAL directory %q: %w", walDir, err)
+	}
+	link := filepath.Join(abs, "pg_wal")
+	if err := os.Symlink(walDir, link); err != nil {
+		return fmt.Errorf("create symbolic link %q: %w", link, err)
+	}
+	return nil
+}
+
 func Init(opts Options) error {
 	if opts.DataDir == "" {
 		return errors.New("goopg init: -D <data-directory> is required")
@@ -193,13 +239,33 @@ func Init(opts Options) error {
 	if strings.HasPrefix(superuser, "pg_") {
 		return fmt.Errorf("goopg init: superuser name %q is disallowed; role names cannot begin with \"pg_\"", superuser)
 	}
+	// Resolve the optional external WAL directory (upstream initdb
+	// -X/--waldir). It must be an absolute path; reject a relative path
+	// before any filesystem layout happens, mirroring initdb.c's "WAL
+	// directory location must be an absolute path" (initdb.c:2961).
+	walDir := opts.WALDir
+	if walDir != "" && !filepath.IsAbs(walDir) {
+		return fmt.Errorf("goopg init: WAL directory location must be an absolute path: %q", walDir)
+	}
 	if err := ensureEmptyDir(abs); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(abs, 0o700); err != nil {
 		return fmt.Errorf("goopg init: create %q: %w", abs, err)
 	}
+	// When an external WAL directory is requested, set up <abs>/pg_wal as
+	// a symlink to it before the subdir loop. The loop then skips the
+	// literal "pg_wal" entry but still creates pg_wal/archive_status and
+	// pg_wal/summaries, which land inside walDir through the symlink.
+	if walDir != "" {
+		if err := setupWALDir(abs, walDir); err != nil {
+			return fmt.Errorf("goopg init: %w", err)
+		}
+	}
 	for _, sub := range Subdirs {
+		if sub == "pg_wal" && walDir != "" {
+			continue // already created as a symlink to the external WAL dir
+		}
 		path := filepath.Join(abs, sub)
 		if err := os.Mkdir(path, 0o700); err != nil {
 			return fmt.Errorf("goopg init: mkdir %q: %w", path, err)
