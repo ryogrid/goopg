@@ -172,12 +172,15 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(allowGroupAccess, "allow-group-access", false, "allow group read/execute on the data directory")
 	// Data-page checksums (upstream initdb -k/--data-checksums and its
 	// negation --no-data-checksums). -k/--data-checksums stamps a pd_checksum
-	// into every data page and sets pg_control's data_checksum_version=1;
-	// --no-data-checksums is the goopg default. (Upstream PG 18 defaults ON;
-	// goopg keeps it off until recovery/replication validation lands, then
-	// flips the default — M0102-0010.) --no-data-checksums overrides -k.
-	dataChecksums := fs.Bool("k", false, "use data page checksums")
-	fs.BoolVar(dataChecksums, "data-checksums", false, "use data page checksums")
+	// into every data page and sets pg_control's data_checksum_version=1.
+	// Matching upstream PG 18 (commit 04bec894 made initdb default to data
+	// checksums ON), goopg now defaults ON: both validation gates passed —
+	// gate (a) crash-recovery/FPI replay and gate (b) cross-impl standby read
+	// (a checksummed goopg primary streaming to a real PG standby that verifies
+	// pd_checksum byte-for-byte) — see M0102-0010 / docs/design/0102-0019.
+	// --no-data-checksums disables and overrides -k.
+	dataChecksums := fs.Bool("k", true, "use data page checksums")
+	fs.BoolVar(dataChecksums, "data-checksums", true, "use data page checksums")
 	noDataChecksums := fs.Bool("no-data-checksums", false, "do not use data page checksums")
 	// Authentication methods written into pg_hba.conf (upstream initdb
 	// -A/--auth, --auth-host, --auth-local) and the superuser password file

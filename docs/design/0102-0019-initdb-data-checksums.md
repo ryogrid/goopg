@@ -1,6 +1,6 @@
 # 0102-0019 — Data-page checksum engine + initdb `--data-checksums` (M0102-0010)
 
-Status: accepted; user-facing `--data-checksums` enablement landed; both flip-gates (a recovery/FPI-replay, b standby-read/physical-replication) pass — default-ON flip deferred to a dedicated regress+TPC-H-gated loop
+Status: accepted; **complete** — user-facing `--data-checksums` enablement landed, both flip-gates (a recovery/FPI-replay, b standby-read/physical-replication) pass, and the default-ON flip landed (loop #44, 2026-06-14) gated by a clean full regress-port suite. goopg `init` now defaults data checksums ON, matching upstream PG 18.
 
 ## Context
 
@@ -204,12 +204,20 @@ the right row count is the proof. (We do not read `pg_stat_database.checksum_fai
 the standby is real PG on goopg's *bootstrapped* catalog, which does not define
 PG's `pg_stat_*` system views; the seq-scan is the canonical signal regardless.)
 
-**Both gates now pass.** The remaining work is the one-line default flip itself
-(`init`'s `dataChecksums` default false → true), which is deferred to a dedicated
-loop: flipping the default changes the on-disk format of **every** new cluster,
-so it must be gated by the full regress-port suite + a TPC-H re-load/spot-check
-(per the M0106 "codec/format change → re-run full suite" lesson) and a sweep of
-every test/bench data dir that would need re-init. Tracked under M0102-0010.
+**Both gates passed, and the default-ON flip LANDED (loop #44, 2026-06-14).**
+`cmd/goopg/main.go` `init` now defaults `dataChecksums` to **true** for both
+`-k` and `--data-checksums`; `--no-data-checksums` still overrides
+(`useDataChecksums := *dataChecksums && !*noDataChecksums`, unchanged). This
+matches upstream PG 18, where `initdb` defaults data checksums ON (commit
+04bec894). Because flipping the default changes the on-disk format of **every**
+new cluster, the flip was gated (per the M0106 "codec/format change → re-run
+full suite" lesson) by re-running the entire regress-port suite on a checksummed
+data dir: `go test -timeout 3000s -run TestPort_RegressSuite ./internal/testport/`
+→ **PASS** (`ok ... 2618.543s`, 0 unexpected diffs). A per-page CRC trailer
+cannot change query output — its only failure mode is a checksum-verification
+error on read, which aborts a query rather than returning a wrong row count, so
+the 100s of clean queries in the suite are themselves the read-path validation.
+Tracked under M0102-0010.
 
 ## Testing
 
@@ -245,3 +253,6 @@ every test/bench data dir that would need re-init. Tracked under M0102-0010.
   `data_checksum_version`; `--no-data-checksums` overrides `-k`.
 - Gates: `go build ./...`, `go vet`, `gofmt`, full `internal/initdb`,
   `go test -race ./internal/storage ./internal/wal`, TPC-H Q12/Q13 spot-check.
+- **Default-ON flip gate (loop #44):** full regress-port suite on a checksummed
+  data dir — `go test -timeout 3000s -run TestPort_RegressSuite ./internal/testport/`
+  → PASS (`ok ... 2618.543s`, 0 unexpected diffs).

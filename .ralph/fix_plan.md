@@ -549,7 +549,7 @@ if 21-spec pass surfaces a real divergence:
         Closure note appended to `docs/design/0102-0003-heterogeneous-failover-e2e-harness.md`.
         Verified: PGtoGoopg 3/3 modes PASS (29.25s); GoopgToPG 2/2 modes PASS (5.97s).
 
- - [ ] **M0102-0010** (follow-up to M0102-0008)
+ - [x] **M0102-0010** (follow-up to M0102-0008)
       - Summary: goopg `init` accepts no initdb CLI options beyond `-D`, so
         upstream `initdb` behaviors (`postgres/src/bin/initdb/t/001_initdb.pl`)
         cannot be matched. `initdb.Init` itself is internally complete
@@ -836,6 +836,20 @@ if 21-spec pass surfaces a real divergence:
         ./internal/testutil/replcluster` PASS;
         `TestE2E_ChecksumStreamingGoopgToPG` PASS (real PG binaries). **Both
         flip-gates now pass.**
+      - **PROGRESS 2026-06-14 (loop #44): default-ON FLIP LANDED.**
+        `cmd/goopg/main.go` `init`'s `dataChecksums` default flipped
+        `false → true` for both `-k` and `--data-checksums`; `--no-data-checksums`
+        still overrides (`useDataChecksums := *dataChecksums && !*noDataChecksums`
+        unchanged). goopg now matches upstream PG 18 (initdb commit 04bec894
+        defaults data checksums ON). **Format-change gate (M0106 lesson):** full
+        regress-port suite re-run on a checksummed data dir —
+        `go test -timeout 3000s -run TestPort_RegressSuite ./internal/testport/`
+        **PASS** `ok ... 2618.543s` (~43.6 min, 0 unexpected diffs). A per-page
+        CRC trailer cannot alter query output — only failure mode is a
+        checksum-verification error on read, which would abort the suite early;
+        100s of clean queries IS the read-path validation. Design doc `0102-0019`
+        "Remaining: default-ON flip" → DONE. **M0102-0010 data-checksums work
+        complete.**
       - **Remaining initdb work** (each pulls in a distinct subsystem; one
         per future loop, design doc first): the `--data-checksums`
         **default-ON flip** for PG-18 parity (and the `001_initdb.pl`
