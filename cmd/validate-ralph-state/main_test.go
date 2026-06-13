@@ -136,6 +136,49 @@ func TestParseTimestamp(t *testing.T) {
 	}
 }
 
+// TestParseTimestampTzNaiveUsesLocal pins that a timezone-less timestamp is
+// interpreted in the local zone (how the Ralph driver writes progress.json),
+// not as UTC. Regression for the spurious skew error in loops #14/#15.
+func TestParseTimestampTzNaiveUsesLocal(t *testing.T) {
+	const wall = "2026-06-13 16:51:12"
+	got, err := parseTimestamp(wall)
+	if err != nil {
+		t.Fatalf("parseTimestamp(%q): %v", wall, err)
+	}
+	want := time.Date(2026, 6, 13, 16, 51, 12, 0, time.Local)
+	if !got.Equal(want) {
+		t.Fatalf("parseTimestamp(%q) = %v, want %v (local zone)", wall, got, want)
+	}
+}
+
+// TestValidateNoFalseSkewAcrossZones reproduces the real-world layout: status.json
+// in RFC3339 UTC and progress.json in tz-naive local wall-clock for the same
+// instant. The two must not register a timestamp skew. Regression for #14/#15.
+func TestValidateNoFalseSkewAcrossZones(t *testing.T) {
+	statusTS := time.Date(2026, 6, 13, 7, 51, 17, 0, time.UTC)
+	// progress completes 5s earlier, recorded as a tz-naive local wall clock.
+	progLocal := statusTS.Add(-5 * time.Second).In(time.Local)
+
+	status := statusFile{
+		Status:            "running",
+		LastAction:        "executing",
+		LoopCount:         15,
+		CallsMadeThisHour: 1,
+		MaxCallsPerHour:   100,
+		Timestamp:         statusTS.Format(time.RFC3339),
+	}
+	progress := progressFile{
+		Status:    "completed",
+		Timestamp: progLocal.Format("2006-01-02 15:04:05"),
+	}
+
+	for _, issue := range validate(status, progress, 2*time.Minute) {
+		if strings.Contains(issue, "newer than status.timestamp") {
+			t.Fatalf("unexpected false skew issue across zones: %v", issue)
+		}
+	}
+}
+
 func TestAutoRepairStaleRunningStatus(t *testing.T) {
 	status := statusFile{
 		Status:            "running",

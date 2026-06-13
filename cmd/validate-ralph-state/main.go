@@ -223,14 +223,22 @@ func parseTimestamp(raw string) (time.Time, error) {
 	if raw == "" {
 		return time.Time{}, errors.New("empty timestamp")
 	}
-	layouts := []string{
-		time.RFC3339,
+	// RFC3339 carries its own zone offset, so time.Parse resolves the instant
+	// exactly. The tz-less formats below have no offset; they must be read in
+	// the local zone because the Ralph loop driver writes progress.json wall
+	// clocks in local time. Parsing a tz-less local timestamp as UTC (which is
+	// time.Parse's default) makes it look hours ahead of a UTC status.json
+	// timestamp and trips a spurious "progress newer than status" skew error
+	// (observed loops #14/#15: JST progress vs UTC status, ~9h false skew).
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t, nil
+	}
+	tzNaiveLayouts := []string{
 		"2006-01-02 15:04:05",
 		"2006-01-02T15:04:05",
 	}
-	for _, layout := range layouts {
-		t, err := time.Parse(layout, raw)
-		if err == nil {
+	for _, layout := range tzNaiveLayouts {
+		if t, err := time.ParseInLocation(layout, raw, time.Local); err == nil {
 			return t, nil
 		}
 	}
