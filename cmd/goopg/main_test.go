@@ -235,6 +235,63 @@ func TestInitCommandSyncMethodAndNoSyncDataFiles(t *testing.T) {
 	}
 }
 
+// TestInitCommandAuthAndPwfile checks that -A/--auth-host/--auth-local and
+// --pwfile thread through to Init: the resolved methods land in pg_hba.conf,
+// and a password method without --pwfile is rejected.
+func TestInitCommandAuthAndPwfile(t *testing.T) {
+	base := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	// -A scram-sha-256 sets both sides; --pwfile satisfies check_need_password.
+	dir := filepath.Join(base, "data1")
+	pwPath := filepath.Join(base, "pw.txt")
+	if err := os.WriteFile(pwPath, []byte("sekret\n"), 0o600); err != nil {
+		t.Fatalf("write pwfile: %v", err)
+	}
+	if code := run([]string{"init", "-D", dir, "--no-sync", "-A", "scram-sha-256", "--pwfile", pwPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("-A scram --pwfile exit=%d stderr=%q", code, stderr.String())
+	}
+	hba, err := os.ReadFile(filepath.Join(dir, "pg_hba.conf"))
+	if err != nil {
+		t.Fatalf("read pg_hba.conf: %v", err)
+	}
+	if !strings.Contains(string(hba), "127.0.0.1/32    scram-sha-256") {
+		t.Errorf("pg_hba.conf missing scram host rule:\n%s", grepLines(string(hba), "all"))
+	}
+	if !strings.Contains(string(hba), "local    all       all                    scram-sha-256") {
+		t.Errorf("pg_hba.conf missing scram local rule:\n%s", grepLines(string(hba), "local"))
+	}
+
+	// --auth-host overrides only the host side; local stays the -A value.
+	stdout.Reset()
+	stderr.Reset()
+	dir2 := filepath.Join(base, "data2")
+	if code := run([]string{"init", "-D", dir2, "--no-sync", "-A", "trust", "--auth-host", "reject"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("--auth-host override exit=%d stderr=%q", code, stderr.String())
+	}
+	hba2, err := os.ReadFile(filepath.Join(dir2, "pg_hba.conf"))
+	if err != nil {
+		t.Fatalf("read pg_hba.conf #2: %v", err)
+	}
+	if !strings.Contains(string(hba2), "127.0.0.1/32    reject") {
+		t.Errorf("--auth-host=reject not reflected:\n%s", grepLines(string(hba2), "127.0.0.1"))
+	}
+	if !strings.Contains(string(hba2), "local    all       all                    trust") {
+		t.Errorf("local side should stay trust:\n%s", grepLines(string(hba2), "local"))
+	}
+
+	// Password method without --pwfile is rejected (exit 1).
+	stdout.Reset()
+	stderr.Reset()
+	dir3 := filepath.Join(base, "data3")
+	if code := run([]string{"init", "-D", dir3, "--no-sync", "-A", "md5"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("-A md5 without --pwfile exit=%d, want 1 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "must specify a password") {
+		t.Errorf("stderr=%q want a 'must specify a password' diagnostic", stderr.String())
+	}
+}
+
 // grepLines returns the lines of s containing substr, for test diagnostics.
 func grepLines(s, substr string) string {
 	var b strings.Builder

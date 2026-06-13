@@ -628,13 +628,41 @@ if 21-spec pass surfaces a real divergence:
         `internal/initdb/sync_test.go` (resolveSyncMethod table,
         base/-exclusion behavioral, syncfs, no-sync-data-files),
         `cmd/goopg/main_test.go` (`TestInitCommandSyncMethodAndNoSyncDataFiles`).
+      - **PROGRESS 2026-06-13 (loop #25):** `-A`/`--auth`,
+        `--auth-host`/`--auth-local`, and `--pwfile` (auth bootstrap) landed.
+        New `Options.AuthMethodHost`/`AuthMethodLocal`/`PwFile`. New
+        `internal/initdb/auth_bootstrap.go`: `resolveAuthMethods` ports
+        `check_authmethod_unspecified` (default `trust` + warn), the
+        ident↔peer cross-map (initdb.c:3255-3258), `check_authmethod_valid`,
+        and `check_need_password` (both sides a password method without
+        `--pwfile` → `must specify a password`), all validated up front before
+        any filesystem layout. `buildPgHBAConf(host,local)` substitutes the
+        methods into the local/loopback rules (external `0.0.0.0/0`/`::/0`
+        stay `reject`); `defaultPgHBAConf()` is now
+        `buildPgHBAConf("trust","trust")` (byte-identical default).
+        `readSuperuserPasswordFile` ports `get_su_pwd` (first line, CRLF
+        strip, empty/unreadable → error). `encodeSuperuserPassword` builds the
+        `pg_authid.rolpassword` verifier — `auth.NewSCRAMSecret(...).String()`
+        by default, `auth.MD5Shadow` (new exported wrapper) when md5 chosen
+        per initdb.c:1402-1413 — and seeds `password_encryption = md5` only in
+        the md5 case (via a new `passwordEncryption` arg on
+        `seedPostgresqlConf`, applied before the `-c`/`--set` loop).
+        `bootstrapPostgresRoleWithPassword` writes the verifier into the
+        OID-10 superuser row (non-NULL text → HEAP_HASNULL stays clear,
+        t_hoff=24). `-A`/`--auth` sets both sides; `--auth-host`/`--auth-local`
+        override one side. `-W`/`--pwprompt` is out of scope (non-interactive);
+        goopg's own auth does not yet read `rolpassword`, so the verifier is
+        for on-disk PG-compat. This satisfies `001_initdb.pl`'s `--auth=trust`
+        usage (line 137). Design doc:
+        `docs/design/0102-0016-initdb-auth-options.md`. Tests:
+        `internal/initdb/auth_bootstrap_test.go`, `cmd/goopg/main_test.go`
+        (`TestInitCommandAuthAndPwfile`).
       - **Remaining initdb options** (each pulls in a distinct subsystem; one
         per future loop, design doc first):
         `--encoding` (encoding catalogs), `--locale`/`--lc-*` +
         `--locale-provider`/`--icu-locale` (ICU),
         `--data-checksums` (page checksums — needs the full page-checksum
-        write/verify path, NOT just a control-file field; high blast radius),
-        `--auth`/`--auth-host`/`--auth-local`/`--pwfile` (auth bootstrap).
+        write/verify path, NOT just a control-file field; high blast radius).
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 

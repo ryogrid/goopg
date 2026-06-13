@@ -166,6 +166,15 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	// bind to the same variable; relaxes the cluster to mode 0750/0640.
 	allowGroupAccess := fs.Bool("g", false, "allow group read/execute on the data directory")
 	fs.BoolVar(allowGroupAccess, "allow-group-access", false, "allow group read/execute on the data directory")
+	// Authentication methods written into pg_hba.conf (upstream initdb
+	// -A/--auth, --auth-host, --auth-local) and the superuser password file
+	// (--pwfile). -A/--auth sets both host and local; the per-side flags
+	// override one side. Empty defaults to "trust".
+	authMethod := fs.String("A", "", "default authentication method for local and host connections")
+	fs.StringVar(authMethod, "auth", "", "default authentication method for local and host connections")
+	authHost := fs.String("auth-host", "", "authentication method for local TCP/IP connections")
+	authLocal := fs.String("auth-local", "", "authentication method for local-socket connections")
+	pwFile := fs.String("pwfile", "", "read password for the new superuser from file")
 	// GUC overrides seeded into postgresql.conf (upstream initdb -c/--set).
 	// Repeatable; each value is NAME=VALUE.
 	var extraGUC gucFlag
@@ -182,7 +191,16 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "goopg init: %s\n", extraGUC.err)
 		return 2
 	}
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, AllowGroupAccess: *allowGroupAccess, ExtraGUC: extraGUC.settings}); err != nil {
+	// -A/--auth sets both host and local; the per-side flags override one
+	// side (matching upstream initdb's option handling).
+	resolvedAuthHost, resolvedAuthLocal := *authMethod, *authMethod
+	if *authHost != "" {
+		resolvedAuthHost = *authHost
+	}
+	if *authLocal != "" {
+		resolvedAuthLocal = *authLocal
+	}
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, AllowGroupAccess: *allowGroupAccess, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}

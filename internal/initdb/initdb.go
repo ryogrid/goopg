@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -219,6 +220,28 @@ type Options struct {
 	// default_text_search_config). Each entry rewrites an existing
 	// (possibly commented) assignment in place, or appends a new line.
 	ExtraGUC []GUCSetting
+
+	// AuthMethodHost and AuthMethodLocal select the authentication
+	// methods written into pg_hba.conf for host and local connections,
+	// mirroring upstream initdb's -A/--auth (sets both), --auth-host, and
+	// --auth-local (initdb.c:3248-3264). Empty defaults to "trust" (with a
+	// warning, like initdb's check_authmethod_unspecified). A single
+	// --auth=ident maps the local side to "peer" and --auth=peer maps the
+	// host side to "ident" (the ident↔peer cross-map). An invalid method,
+	// or a password method (md5/password/scram-sha-256) on both sides
+	// without PwFile, is rejected before any filesystem work.
+	AuthMethodHost  string
+	AuthMethodLocal string
+
+	// PwFile, when non-empty, is a path whose first line is the cleartext
+	// password for the bootstrap superuser, mirroring upstream initdb's
+	// --pwfile (initdb.c get_su_pwd file branch). The password is encoded
+	// into pg_authid.rolpassword as a SCRAM-SHA-256 verifier (or md5 when an
+	// md5 auth method was chosen), and password_encryption is seeded to md5
+	// in that case. An unreadable or empty file is rejected. The
+	// interactive -W/--pwprompt form is not supported (goopg init is
+	// non-interactive).
+	PwFile string
 
 	// Registry, when non-nil, is the server's live GUC registry.
 	// Its values for max_connections, max_worker_processes,
@@ -551,6 +574,33 @@ func Init(opts Options) error {
 	if strings.HasPrefix(superuser, "pg_") {
 		return fmt.Errorf("goopg init: superuser name %q is disallowed; role names cannot begin with \"pg_\"", superuser)
 	}
+	// Resolve + validate the authentication methods up front (upstream
+	// initdb -A/--auth, --auth-host, --auth-local) before any filesystem
+	// work, so a bad method or a password method without --pwfile aborts
+	// before the tree is created. Then read --pwfile (if any) and encode the
+	// superuser's rolpassword verifier; both are needed below when writing
+	// pg_hba.conf, postgresql.conf, and pg_authid.
+	authHost, authLocal, authWarn, err := resolveAuthMethods(opts.AuthMethodHost, opts.AuthMethodLocal, opts.PwFile != "")
+	if err != nil {
+		return err
+	}
+	var rolpassword, passwordEncryption string
+	if opts.PwFile != "" {
+		pwd, perr := readSuperuserPasswordFile(opts.PwFile)
+		if perr != nil {
+			return perr
+		}
+		rolpassword, passwordEncryption, perr = encodeSuperuserPassword(pwd, authHost, authLocal, superuser)
+		if perr != nil {
+			return perr
+		}
+	}
+	if authWarn {
+		// Mirrors initdb's trust-default warning (initdb.c authwarning,
+		// 3518). Non-fatal; the cluster is created with trust auth.
+		log.Printf("goopg init: enabling \"trust\" authentication for local connections; "+
+			"you can change this by editing pg_hba.conf or using -A, --auth-local, or --auth-host (data dir %q)", abs)
+	}
 	// Resolve the optional external WAL directory (upstream initdb
 	// -X/--waldir). It must be an absolute path; reject a relative path
 	// before any filesystem layout happens, mirroring initdb.c's "WAL
@@ -598,10 +648,20 @@ func Init(opts Options) error {
 			return fmt.Errorf("goopg init: write %q: %w", path, err)
 		}
 	}
+	// Overwrite pg_hba.conf with the resolved auth methods (upstream
+	// initdb's @authmethodhost@/@authmethodlocal@ token replacement in
+	// setup_config). SampleFiles wrote the trust default above; this
+	// substitutes the requested methods (a no-op when both are trust).
+	hbaPath := filepath.Join(abs, "pg_hba.conf")
+	if err := os.WriteFile(hbaPath, buildPgHBAConf(authHost, authLocal), 0o600); err != nil {
+		return fmt.Errorf("goopg init: write %q: %w", hbaPath, err)
+	}
 	// Seed any --text-search-config / --set GUC overrides into the
 	// just-written postgresql.conf, mirroring upstream initdb's
-	// setup_config (initdb.c). No-op when neither option was given.
-	if err := seedPostgresqlConf(abs, opts.TextSearchConfig, opts.AllowGroupAccess, opts.ExtraGUC); err != nil {
+	// setup_config (initdb.c). password_encryption is seeded to md5 when an
+	// md5 auth method was chosen (initdb.c:1402-1413). No-op when no
+	// relevant option was given.
+	if err := seedPostgresqlConf(abs, opts.TextSearchConfig, passwordEncryption, opts.AllowGroupAccess, opts.ExtraGUC); err != nil {
 		return fmt.Errorf("goopg init: seed postgresql.conf: %w", err)
 	}
 	if err := bootstrapSystemCatalogs(abs); err != nil {
@@ -616,7 +676,7 @@ func Init(opts Options) error {
 	// Overwrite pg_authid placeholder with a minimal superuser row for
 	// `superuser` (default "postgres") plus (if distinct) an OS-user role
 	// at OID 16384.
-	pgAuthidEntries, err := bootstrapPostgresRole(abs, superuser)
+	pgAuthidEntries, err := bootstrapPostgresRoleWithPassword(abs, superuser, rolpassword)
 	if err != nil {
 		return fmt.Errorf("goopg init: postgres role: %w", err)
 	}
@@ -1278,6 +1338,16 @@ func makeBtreeRootPage() []byte {
 // "postgres" superuser so PG standby accepts connections. The tuple
 // uses PG's native heap-tuple encoding (not goopg's internal format).
 func bootstrapPostgresRole(dataDir, superuser string) ([]pgAuthidEntry, error) {
+	return bootstrapPostgresRoleWithPassword(dataDir, superuser, "")
+}
+
+// bootstrapPostgresRoleWithPassword is bootstrapPostgresRole with an optional
+// pre-encoded rolpassword verifier for the bootstrap superuser (OID 10),
+// supplied by --pwfile (upstream initdb's setup_auth ALTER USER … PASSWORD).
+// An empty rolpassword leaves the row's password empty (the no-password
+// default). The verifier is a non-NULL text value, so the bootstrap row keeps
+// HEAP_HASNULL clear and its t_hoff is unchanged.
+func bootstrapPostgresRoleWithPassword(dataDir, superuser, rolpassword string) ([]pgAuthidEntry, error) {
 	// pg_authid columns (postgres/src/include/catalog/pg_authid.h)
 	cols := []catalog.Column{
 		{Name: "oid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
@@ -1296,7 +1366,13 @@ func bootstrapPostgresRole(dataDir, superuser string) ([]pgAuthidEntry, error) {
 	// Bootstrap superuser row (OID 10) and optional OS-user row (OID 16384).
 	// rolpassword/rolvaliduntil are written as empty-string/epoch for the
 	// bootstrap rows to keep HEAP_HASNULL clear (no null bitmap, t_hoff=24).
+	// The OID-10 superuser carries the --pwfile verifier (when supplied);
+	// it remains a non-NULL text value, so HEAP_HASNULL stays clear.
 	buildBootstrapRow := func(oid int64, rolname string) executor.Row {
+		pw := ""
+		if oid == 10 {
+			pw = rolpassword
+		}
 		return executor.Row{
 			executor.NewIntDatum(oid),                    // oid
 			executor.NewStringDatum(rolname),             // rolname
@@ -1308,7 +1384,7 @@ func bootstrapPostgresRole(dataDir, superuser string) ([]pgAuthidEntry, error) {
 			executor.NewBoolDatum(true),                  // rolreplication
 			executor.NewBoolDatum(true),                  // rolbypassrls
 			executor.NewIntDatum(-1),                     // rolconnlimit
-			executor.NewStringDatum(""),                  // rolpassword (empty, not null)
+			executor.NewStringDatum(pw),                  // rolpassword (verifier or empty, not null)
 			executor.NewTimeDatum(time.Unix(0, 0).UTC()), // rolvaliduntil (epoch, not null)
 		}
 	}
@@ -6123,18 +6199,9 @@ func defaultPgIdentConf() []byte {
 `)
 }
 
+// defaultPgHBAConf is the trust-everywhere default file used by SampleFiles
+// and the no-auth-option path. Init overwrites pg_hba.conf with
+// buildPgHBAConf(host, local) when an explicit auth method is requested.
 func defaultPgHBAConf() []byte {
-	return []byte(`# goopg pg_hba.conf — host-based authentication rules.
-#
-# Same format as upstream PostgreSQL: TYPE  DATABASE  USER  ADDRESS  METHOD
-# The first matching rule wins. Default policy: trust loopback,
-# reject everything else.
-
-# TYPE   DATABASE  USER   ADDRESS         METHOD
-local    all       all                    trust
-host     all       all    127.0.0.1/32    trust
-host     all       all    ::1/128         trust
-host     all       all    0.0.0.0/0       reject
-host     all       all    ::/0            reject
-`)
+	return buildPgHBAConf("trust", "trust")
 }

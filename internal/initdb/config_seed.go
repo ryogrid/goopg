@@ -29,8 +29,8 @@ type GUCSetting struct {
 // uses the same replace_guc_value algorithm: an existing (possibly
 // commented-out) assignment line is rewritten in place, otherwise a new
 // line is appended.
-func seedPostgresqlConf(abs, tsConfig string, allowGroupAccess bool, extra []GUCSetting) error {
-	if tsConfig == "" && !allowGroupAccess && len(extra) == 0 {
+func seedPostgresqlConf(abs, tsConfig, passwordEncryption string, allowGroupAccess bool, extra []GUCSetting) error {
+	if tsConfig == "" && passwordEncryption == "" && !allowGroupAccess && len(extra) == 0 {
 		return nil
 	}
 	path := filepath.Join(abs, "postgresql.conf")
@@ -46,6 +46,13 @@ func seedPostgresqlConf(abs, tsConfig string, allowGroupAccess bool, extra []GUC
 	if tsConfig != "" {
 		// initdb.c:1343 always prefixes the catalog schema.
 		lines = replaceGUCValue(lines, "default_text_search_config", "pg_catalog."+tsConfig)
+	}
+	if passwordEncryption != "" {
+		// initdb.c:1402-1413: md5 is chosen as the encryption when an md5
+		// auth method was selected (unless scram-sha-256 was chosen for the
+		// other side). Applied before the -c/--set loop so an explicit
+		// override still wins.
+		lines = replaceGUCValue(lines, "password_encryption", passwordEncryption)
 	}
 	if allowGroupAccess {
 		// initdb.c:1421-1425: when the cluster allows group access, log

@@ -145,6 +145,16 @@ func md5Shadow(password, user string) string {
 	return "md5" + md5Hex(password+user)
 }
 
+// MD5Shadow is the exported form of md5Shadow: it computes the upstream
+// pg_authid.rolpassword "md5HEX" string for (password, username), matching
+// PostgreSQL's pg_md5_encrypt(password+username). initdb uses it to seed the
+// bootstrap superuser's rolpassword when the md5 auth method is selected, so
+// the on-disk verifier has a single source of truth shared with the md5
+// challenge-verification path.
+func MD5Shadow(password, user string) string {
+	return md5Shadow(password, user)
+}
+
 func md5Hex(s string) string {
 	sum := md5.Sum([]byte(s))
 	return hex.EncodeToString(sum[:])
