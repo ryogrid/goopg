@@ -1024,6 +1024,30 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         extended; all in new files (`internal/amcheck/`), zero contaminated
         files touched. STILL DEFERRED: clog-dependent HOT-chain checks + the SQL
         surface (AC-002-promoting slice, still blocked on a clean tree).
+      - **PROGRESS 2026-06-14 (loop #55):** started the **B-tree index checker**
+        — the index-side companion to the heap engine, since `pg_amcheck` runs
+        `bt_index_check()` on every index (`003_check`/`005_opclass_damage`
+        exercise it), so AC-002 needs it too. New `internal/amcheck/
+        verify_nbtree.go` (`VerifyBtreePage(p, blkno, indexName)`) ports the
+        page-structural `palloc_btree_page` tier: metapage (block 0) magic +
+        version validation (`index "%s" meta page is corrupt`, `version mismatch
+        in index "%s": …`), and leaf/internal page-level consistency
+        (`invalid leaf page level %u …`, `invalid internal page level 0 …`),
+        with deleted pages exempt — verbatim upstream messages. To avoid
+        re-decoding goopg's metapage/opaque format (which changed v3→v4 — a
+        sibling-path drift hazard), added thin **exported accessors** to the
+        uncontaminated `internal/access/btree/btree.go`: `BTreeMagic`,
+        `BTreeVersion`, `ParseMeta`, `ParseOpaque`, and a `BTPageOpaque.IsDeleted`
+        method (purely additive). goopg/PG divergences documented as NOT ported:
+        high-key-as-item-`P_HIKEY` checks (goopg keeps the high key in the opaque
+        area) and the `MaxIndexTuplesPerPage` ceiling (goopg's inline index-tuple
+        layout needs its own size accounting). 10 new unit tests PASS (hand-built
+        clean/corrupt pages, each self-checked through the real decoders); btree
+        package tests still PASS; gofmt/vet clean. Design doc `0110-0005` extended
+        with a "B-tree index verification" section; README index updated. STILL
+        DEFERRED: intra-page item-order/high-key + cross-page tiers, and the SQL
+        surface (`bt_index_check`/`verify_heapam` SRF, the AC-002-promoting slice,
+        still blocked on a clean tree).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

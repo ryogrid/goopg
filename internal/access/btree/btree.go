@@ -11,8 +11,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/big"
 	"math"
+	"math/big"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -81,6 +81,15 @@ const (
 
 	btreeMagic   uint32 = 0x053162
 	btreeVersion uint32 = 4 // bumped by M0011-0002 (v3: variable-length HighKey, 48-byte opaque); v4: widened HighKey field to 256 bytes for text keys (272-byte opaque)
+
+	// BTreeMagic and BTreeVersion expose the on-disk metapage magic and
+	// version for out-of-package readers that validate a metapage without
+	// opening the tree — notably the amcheck verify engine
+	// (internal/amcheck). Keeping a single exported source of truth prevents
+	// the magic/version from drifting between the writer (writeMeta) and any
+	// independent validator.
+	BTreeMagic   = btreeMagic
+	BTreeVersion = btreeVersion
 )
 
 // BTreeMeta is the v0 metapage payload.
@@ -122,10 +131,23 @@ func (o BTPageOpaque) IsHalfDead() bool { return o.Flags&BTHalfDead != 0 }
 // IsRoot reports whether the page is the current root.
 func (o BTPageOpaque) IsRoot() bool { return o.Flags&BTRoot != 0 }
 
+// IsDeleted reports whether this page has been fully deleted (unlinked from
+// the tree, awaiting recycle). Deleted pages carry no items and may type-pun
+// fields such as the level, so structural validators must exempt them.
+func (o BTPageOpaque) IsDeleted() bool { return o.Flags&BTDeleted != 0 }
+
 // HasHighKey reports whether this page advertises a high-key
 // boundary. Pages without a high key are rightmost on their level
 // (or freshly created) and cover all remaining keys.
 func (o BTPageOpaque) HasHighKey() bool { return o.Flags&BTHasHighKey != 0 }
+
+// ParseOpaque exposes the page-bytes → BTPageOpaque decode for out-of-package
+// readers (notably the amcheck verify engine, internal/amcheck) so they share
+// this package's single definition of the opaque layout rather than
+// re-implementing it — the opaque format has changed across versions (v3 grew
+// it for variable-length HighKeys, v4 widened that field), and a duplicated
+// decoder would silently drift on the next bump.
+func ParseOpaque(p storage.Page) BTPageOpaque { return readOpaque(p) }
 
 // readOpaque returns the parsed opaque from page bytes.
 func readOpaque(p storage.Page) BTPageOpaque {
@@ -881,6 +903,11 @@ func (bt *BTree) unpinW(s *storage.Slot) {
 	s.Unlock()
 	bt.pool.Unpin(s)
 }
+
+// ParseMeta exposes the metapage decode for out-of-package readers (the
+// amcheck verify engine) that validate a metapage's magic/version without
+// opening the tree. See ParseOpaque for the single-source-of-truth rationale.
+func ParseMeta(p storage.Page) BTreeMeta { return parseMeta(p) }
 
 func parseMeta(p storage.Page) BTreeMeta {
 	off := storage.SizeOfPageHeaderData

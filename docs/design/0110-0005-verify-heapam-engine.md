@@ -2,7 +2,14 @@
 
 Status: accepted (partial)
 Milestone: M0110-0003
-Date: 2026-06-14 (extended 2026-06-14, loop #52: infomask-only header invariants)
+Date: 2026-06-14 (extended 2026-06-14, loop #52: infomask-only header invariants;
+loop #55: B-tree index verification (`verify_nbtree`) page-structural tier)
+
+> Scope note: this doc now covers both amcheck verify engines in
+> `internal/amcheck` — the heap-page checker (`verify_heapam.go`, the bulk of
+> this doc) and the B-tree index checker (`verify_nbtree.go`, the
+> "B-tree index verification" section near the end). Both follow the same
+> engine-first/wire-later pattern and feed the same `AC-002` promotion.
 
 ## Goal
 
@@ -265,8 +272,84 @@ with hand-built clean and corrupt fixtures — no server, no buffer pool, no clo
   fewer-or-equal natts reports nothing, that the page-bytes-only `VerifyHeapPage`
   never runs the check, and that a header-corrupt tuple suppresses it.
 
+## B-tree index verification (`verify_nbtree`) tier (added loop #55)
+
+`pg_amcheck` does not only run `verify_heapam()` on heap relations — for every
+B-tree index it runs `bt_index_check()` (and, with `--parent-check`,
+`bt_index_parent_check()`). `003_check.pl` and `005_opclass_damage.pl` both
+exercise the index path, so the `AC-002` promotion needs a B-tree checker as
+well as the heap checker. This tier lands its page-structural core as
+`internal/amcheck/verify_nbtree.go`, the index-side companion to
+`verify_heapam.go`, following the same engine-first/wire-later pattern.
+
+The slice ports the per-page sanity checks upstream applies to **every** page it
+reads, in `verify_nbtree.c:palloc_btree_page`:
+
+- **Metapage (block 0) magic/version** — `index "%s" meta page is corrupt` when
+  the magic word does not match, and `version mismatch in index "%s": file
+  version %d, current version %d, minimum supported version %d` when the version
+  does. goopg writes exactly one on-disk version (`btree.BTreeVersion`), so the
+  version check is an equality test and "minimum supported version" equals the
+  current version.
+- **Page-level consistency** — a leaf page must sit at level 0
+  (`invalid leaf page level %u for block %u in index "%s"`) and an internal page
+  must not (`invalid internal page level 0 for block %u in index "%s"`). Fully
+  deleted pages type-pun their level field and hold no items, so they are exempt
+  (upstream's `!P_ISDELETED` guard; goopg's `BTPageOpaque.IsDeleted`).
+
+Messages are byte-for-byte upstream, including the `in index "<name>"` clause —
+the index name is the one piece of context not in the page bytes, so
+`VerifyBtreePage` takes it as a parameter (the SQL surface supplies it from the
+`regclass`).
+
+**Layout single-source-of-truth.** Rather than re-decode the metapage and opaque
+formats (which have changed across versions — v3 grew the opaque for
+variable-length high keys, v4 widened that field), the engine reads through
+newly exported accessors on the `btree` package: `btree.ParseMeta`,
+`btree.ParseOpaque`, `btree.BTreeMagic`, `btree.BTreeVersion`, and the
+`BTPageOpaque.IsDeleted` method. A duplicated decoder would be a classic
+sibling-path drift hazard (`pattern_sibling_paths_must_agree`).
+
+### goopg vs upstream PG divergences (not ported)
+
+- **High-key placement.** Upstream stores a page's high key as line-pointer item
+  `P_HIKEY` (offset 1) and derives `P_FIRSTDATAKEY` from it; goopg keeps the high
+  key in the opaque special area (`BTPageOpaque.HighKey`). The upstream item-count
+  checks phrased in terms of `P_HIKEY`/`P_FIRSTDATAKEY` ("internal block lacks
+  high key and/or at least one downlink", "non-rightmost leaf block lacks high
+  key item") therefore do **not** translate and are not ported.
+- **`MaxIndexTuplesPerPage` ceiling.** Upstream's item-count upper bound is a
+  constant from PG's `IndexTupleData` size; goopg's index-tuple layout differs
+  (inline key with a 2-byte length), so a faithful ceiling needs goopg-specific
+  tuple-size accounting — deferred to its own tier rather than shipped with a
+  wrong constant.
+
+### Deferred (B-tree, with resume points)
+
+- The `MaxIndexTuplesPerPage`-equivalent item-count ceiling (goopg tuple-size
+  accounting).
+- Intra-page **item-order** and **high-key invariant** checks
+  (`bt_target_page_check`) — need the key-comparison machinery
+  (`CompareKeys`) and the opaque high key; page-structural but a larger tier.
+- Cross-page tiers (`bt_check_level_from_leftmost`, downlink/sibling-link
+  agreement, root-descent) — need multi-page traversal state.
+- The SQL surface: `bt_index_check` / `bt_index_parent_check` registration,
+  shared with the `verify_heapam` SRF wiring above; waits for a clean tree.
+
+### Testing (`verify_nbtree_test.go`)
+
+Hand-built clean and corrupt pages (no server/buffer pool), each self-checked
+through `btree.ParseMeta`/`btree.ParseOpaque` so a future layout change fails the
+fixture loudly: clean metapage → no reports; bad magic and bad version each
+assert the exact upstream message; magic masks version (first conclusive problem
+wins); clean leaf-at-0 and internal-at-2; bad leaf level and internal-level-0
+each assert the exact message and block number; a deleted page suppresses the
+level check; a root+leaf single-page tree is clean. 10 tests.
+
 ## Upstream references
 
+- `postgres/contrib/amcheck/verify_nbtree.c` (`palloc_btree_page`) — the
+  mirrored per-page metapage/level checks and messages.
 - `postgres/contrib/amcheck/verify_heapam.c` (`verify_heapam`,
   `check_tuple_header`) — the mirrored check order and messages.
 - `postgres/src/include/access/htup_details.h` — `SizeofHeapTupleHeader` (23),
