@@ -1025,6 +1025,47 @@ func pageItems(p storage.Page) ([]item, error) {
 	return out, nil
 }
 
+// PageItemKeys returns the separator/index key of every line pointer on a
+// B-tree page, in physical slot order (slot 1..N). Posting-list items
+// (M0047-0003), which pack many heap TIDs under a single shared key, contribute
+// that one key exactly once: callers that verify on-disk key ordering (amcheck's
+// item-order / high-key invariants) compare the stored separator keys, not the
+// expanded (key, TID) pairs that pageItems materialises. It returns an error if
+// any line pointer cannot be decoded, so a structurally damaged page surfaces
+// to the caller rather than producing a misleading key sequence.
+//
+// This is exported so the amcheck verification engine (internal/amcheck) decodes
+// keys through the canonical on-disk reader here instead of re-implementing the
+// item layout — the same single-source-of-truth discipline as ParseMeta /
+// ParseOpaque (the inline 2-byte-length key layout is a v3->v4 drift hazard).
+func PageItemKeys(p storage.Page) ([][]byte, error) {
+	count, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]byte, 0, count)
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(p, slot)
+		if err != nil {
+			return nil, err
+		}
+		if isPostingRaw(raw) {
+			key, _, perr := parsePostingRaw(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			out = append(out, key)
+		} else {
+			it, perr := parseItem(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			out = append(out, it.key)
+		}
+	}
+	return out, nil
+}
+
 // findChildBlock returns the block number of the child to descend into
 // for `key` from the items on an internal page. Items are sorted by key;
 // the entry to descend into is the rightmost item whose key ≤ search

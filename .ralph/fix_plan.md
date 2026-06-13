@@ -1048,6 +1048,29 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         DEFERRED: intra-page item-order/high-key + cross-page tiers, and the SQL
         surface (`bt_index_check`/`verify_heapam` SRF, the AC-002-promoting slice,
         still blocked on a clean tree).
+      - **PROGRESS 2026-06-14 (loop #56):** added the **second B-tree tier**,
+        `VerifyBtreeItemOrder` — `bt_target_page_check`'s two page-local key
+        invariants (`verify_nbtree.c:1565-1642`): the **item-order** invariant
+        (items strictly ascending: `item order invariant violated for index
+        "%s"`) and the **high-key** invariant (each key `<=` the high key on a
+        leaf, strictly `<` on an internal page: `high key invariant violated for
+        index "%s"`) — verbatim upstream messages. Keys are decoded through a new
+        exported `btree.PageItemKeys` (one separator key per physical line
+        pointer, **collapsing** a posting-list item's many TIDs to its single
+        shared key — additive to the uncontaminated `btree.go`) and compared with
+        `btree.CompareKeys`, the same comparator the live index uses (single
+        source of truth, no re-decode of the inline item layout). goopg specifics
+        handled faithfully: the high key lives in the opaque area (no `P_HIKEY`
+        slot to skip; rightmost gating via `Next == InvalidBlockNumber`), and an
+        internal page's leftmost negative-infinity downlink (empty key) satisfies
+        both invariants without a special case. 10 new amcheck tests (new
+        `makeItemsPage` builder, each self-checked through the real readers) + 1
+        new btree `TestPageItemKeys` (posting-collapse) PASS; full `btree` +
+        `amcheck` suites PASS; gofmt/vet clean; all changes in new code / additive
+        exports, zero contaminated files touched. Design doc `0110-0005` extended
+        ("B-tree item-order / high-key tier"); README index updated. STILL
+        DEFERRED: the item-count ceiling, cross-page/cross-level tiers, and the
+        SQL surface (still blocked on a clean tree).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

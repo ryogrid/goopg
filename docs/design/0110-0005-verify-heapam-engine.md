@@ -328,11 +328,9 @@ sibling-path drift hazard (`pattern_sibling_paths_must_agree`).
 
 - The `MaxIndexTuplesPerPage`-equivalent item-count ceiling (goopg tuple-size
   accounting).
-- Intra-page **item-order** and **high-key invariant** checks
-  (`bt_target_page_check`) — need the key-comparison machinery
-  (`CompareKeys`) and the opaque high key; page-structural but a larger tier.
 - Cross-page tiers (`bt_check_level_from_leftmost`, downlink/sibling-link
-  agreement, root-descent) — need multi-page traversal state.
+  agreement, cross-page item order, root-descent via `bt_index_parent_check`) —
+  need multi-page traversal state.
 - The SQL surface: `bt_index_check` / `bt_index_parent_check` registration,
   shared with the `verify_heapam` SRF wiring above; waits for a clean tree.
 
@@ -345,6 +343,61 @@ assert the exact upstream message; magic masks version (first conclusive problem
 wins); clean leaf-at-0 and internal-at-2; bad leaf level and internal-level-0
 each assert the exact message and block number; a deleted page suppresses the
 level check; a root+leaf single-page tree is clean. 10 tests.
+
+## B-tree item-order / high-key tier (`VerifyBtreeItemOrder`, added loop #56)
+
+The second `verify_nbtree` tier ports the two **page-local** key invariants from
+upstream `bt_target_page_check` (`verify_nbtree.c:1565-1642`) — the checks that
+need only a page's own bytes plus its high key, no sibling traversal or
+cross-level descent:
+
+- **High-key invariant.** On a non-rightmost page every item key must respect the
+  page's high key — `<=` on a leaf, strictly `<` on an internal page. Upstream
+  weakens the leaf check to `<=` because suffix truncation can leave a leaf high
+  key that is an untruncated copy of the last data item; an internal high key is
+  "just another separator", unique on its level. Message:
+  `high key invariant violated for index "%s"`.
+- **Item-order invariant.** Items must be stored in strictly ascending key order:
+  each key strictly less than the next. Message:
+  `item order invariant violated for index "%s"`.
+
+goopg specifics making the port faithful:
+
+- The high key lives in the opaque special area (`BTPageOpaque.HighKey`), never a
+  line-pointer item, so there is no `P_HIKEY` slot to skip; rightmost /
+  has-high-key gating matches the engine's own `keyExceedsHighKey`
+  (`Next == InvalidBlockNumber` ⇒ rightmost).
+- An internal page's leftmost negative-infinity downlink has an **empty** key
+  (see `findChildBlock`); empty compares strictly less than any real separator
+  and any high key, so it satisfies both invariants without a special case —
+  exactly as upstream's zero-attribute negative-infinity tuple does.
+- Keys are decoded through the new `btree.PageItemKeys` (one separator key per
+  physical line pointer, **collapsing** a posting-list item's many TIDs to its
+  single shared key) and compared with `btree.CompareKeys` — the same
+  order-preserving comparator the live index uses. The comparison is over stored
+  separators, not expanded `(key, TID)` pairs. `PageItemKeys` is exported so the
+  engine never re-implements the inline `2-byte-len | TID | key` item layout (a
+  v3→v4 drift hazard), the same single-source-of-truth discipline as
+  `ParseMeta`/`ParseOpaque`.
+
+Like `VerifyBtreePage`, `VerifyBtreeItemOrder` returns 0 or 1 findings (upstream
+`ereport(ERROR)`s on the first violation) and never a Go error; an undecodable
+page surfaces as a finding. The metapage and deleted pages hold no orderable
+items and yield nil.
+
+### Testing (item-order tier)
+
+`verify_nbtree_test.go` gains a `makeItemsPage` builder (sets `pd_special`/
+`pd_upper` to the B-tree special offset before adding items so item data grows
+above the opaque area, then writes the opaque bytes; self-checks the decoded
+opaque + key sequence through `btree.ParseOpaque`/`btree.PageItemKeys`):
+ascending leaf clean; out-of-order and duplicate-adjacent keys each assert the
+item-order message + block; leaf `key == high key` clean (`<=`) vs leaf
+`key > high key` violation; internal `key == high key` violation (`<`) vs
+internal negative-infinity clean; rightmost page ignores a lingering high key;
+metapage and deleted pages yield nil. 10 tests. `btree/posting_test.go` gains
+`TestPageItemKeys` asserting the posting-collapse behaviour (regular + 3-TID
+posting → 2 keys).
 
 ## Upstream references
 

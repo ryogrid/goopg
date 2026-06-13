@@ -38,9 +38,11 @@
 //     and the "minimum supported version" reported in the message equals the
 //     current version.
 //
-// The clog/sibling-dependent and tuple-comparison tiers of bt_index_check
-// (item-order within a page, high-key invariants, downlink/sibling-link
-// agreement, cross-level descent) are deferred; see the design doc.
+// The page-local key-comparison tier of bt_target_page_check — the item-order
+// and high-key invariants that need only the page's own bytes plus its high key
+// — is ported in VerifyBtreeItemOrder below. The clog/sibling-dependent tiers
+// (downlink/sibling-link agreement, cross-page item order, cross-level descent
+// via bt_index_parent_check) are deferred; see the design doc.
 package amcheck
 
 import (
@@ -108,5 +110,83 @@ func VerifyBtreePage(p storage.Page, blkno storage.BlockNumber, indexName string
 			blkno, indexName)}}
 	}
 
+	return nil
+}
+
+// VerifyBtreeItemOrder ports the two per-item key invariants from upstream
+// amcheck's bt_target_page_check (verify_nbtree.c:1565-1642) — the page-local
+// checks that need only the page's own bytes plus its high key, not sibling
+// traversal or cross-level descent:
+//
+//   - High-key invariant. On a non-rightmost page every item key must respect
+//     the page's high key: <= the high key on a leaf page, but strictly < the
+//     high key on an internal page (upstream weakens the leaf check to <=
+//     because suffix truncation can leave a leaf high key that is an untruncated
+//     copy of the last data item; an internal high key is "just another
+//     separator" and is unique on its level). Violation message:
+//     `high key invariant violated for index "%s"`.
+//
+//   - Item-order invariant. Items must be stored in strictly ascending key
+//     order: each item's key must be strictly less than the next item's key.
+//     Violation message: `item order invariant violated for index "%s"`.
+//
+// goopg specifics that make this port faithful:
+//
+//   - The high key lives in the opaque special area (BTPageOpaque.HighKey), not
+//     as line-pointer item P_HIKEY, so it is never one of the page's items and
+//     needs no P_HIKEY-skip; rightmost / has-high-key gating matches the engine's
+//     own keyExceedsHighKey (Next == InvalidBlockNumber means rightmost).
+//   - Internal pages carry a leftmost negative-infinity downlink whose key is
+//     empty (see findChildBlock); an empty key compares strictly less than any
+//     real separator, so it satisfies both invariants without a special case,
+//     exactly as upstream's zero-attribute negative-infinity tuple does.
+//   - Keys compare with btree.CompareKeys (order-preserving encoded bytes), the
+//     same comparator the live index uses, and are decoded through
+//     btree.PageItemKeys so posting-list items contribute their shared separator
+//     key once — the comparison is over stored separators, not expanded TIDs.
+//
+// Like VerifyBtreePage it returns 0 or 1 findings: upstream ereport(ERROR)s on
+// the first violation, so the first per-page violation is conclusive. The
+// metapage and deleted pages hold no orderable items and yield nil. A page whose
+// items cannot be decoded surfaces as a finding, never a Go error, matching the
+// report-and-continue model of the heap engine.
+func VerifyBtreeItemOrder(p storage.Page, blkno storage.BlockNumber, indexName string) []BtreeReport {
+	// The metapage has no data items; deleted pages hold none either (their
+	// level field is type-punned and the page carries no live tuples).
+	if blkno == btree.MetaBlock {
+		return nil
+	}
+	opaque := btree.ParseOpaque(p)
+	if opaque.IsDeleted() {
+		return nil
+	}
+
+	keys, err := btree.PageItemKeys(p)
+	if err != nil {
+		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
+			"index \"%s\" has a damaged page at block %d: %v", indexName, blkno, err)}}
+	}
+
+	leaf := opaque.IsLeaf()
+	// A non-rightmost page that carries a high key bounds every item from above.
+	// This mirrors the engine's keyExceedsHighKey gating (rightmost pages have no
+	// high key to honour).
+	checkHighKey := opaque.HasHighKey() && opaque.Next != storage.InvalidBlockNumber
+
+	for i, key := range keys {
+		if checkHighKey {
+			// Leaf: key <= high key. Internal: key < high key.
+			cmp := btree.CompareKeys(key, opaque.HighKey)
+			if (leaf && cmp > 0) || (!leaf && cmp >= 0) {
+				return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
+					"high key invariant violated for index \"%s\"", indexName)}}
+			}
+		}
+		// Item order: current key strictly less than the next item's key.
+		if i+1 < len(keys) && btree.CompareKeys(key, keys[i+1]) >= 0 {
+			return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
+				"item order invariant violated for index \"%s\"", indexName)}}
+		}
+	}
 	return nil
 }

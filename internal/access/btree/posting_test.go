@@ -116,7 +116,7 @@ func TestBulkCreateDeduplication(t *testing.T) {
 	// 500 entries each = 3500 total.
 	const numKeys = 7
 	const perKey = 1000 // 1000 TIDs per key → each posting item ≈6 KB = 1 leaf page
-	const padTo = 29   // 29 chars + 0x00 terminator = 30 bytes ≤ MaxHighKeyLen=256
+	const padTo = 29    // 29 chars + 0x00 terminator = 30 bytes ≤ MaxHighKeyLen=256
 	baseKeys := []string{"AIR", "MAIL", "RAIL", "REGAIR", "SHIP", "TRUCK", "FOB"}
 
 	padKey := func(s string) []byte {
@@ -331,5 +331,41 @@ func TestPostingKeyOf(t *testing.T) {
 	got := postingKeyOf(raw)
 	if string(got) != string(key) {
 		t.Errorf("postingKeyOf: want %q got %q", key, got)
+	}
+}
+
+// TestPageItemKeys verifies PageItemKeys returns one separator key per physical
+// line pointer in slot order, collapsing a posting-list item (many TIDs, one
+// shared key) to its single key rather than expanding it per TID — the behaviour
+// the amcheck item-order tier relies on.
+func TestPageItemKeys(t *testing.T) {
+	p := make(storage.Page, storage.BlockSize)
+	initPage(p, BTPageOpaque{Prev: storage.InvalidBlockNumber, Next: storage.InvalidBlockNumber, Flags: BTLeaf})
+
+	// Slot 1: regular single-TID item, key = int4(1).
+	reg := item{keyLen: uint16(len(EncodeInt4(1))), ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(1)}
+	if _, err := storage.PageAddItemRaw(p, reg.marshal()); err != nil {
+		t.Fatalf("add regular: %v", err)
+	}
+	// Slot 2: posting item, key = int4(2), three TIDs — must collapse to one key.
+	post := marshalPosting(EncodeInt4(2), []storage.ItemPointer{
+		{Block: 0, Offset: 2}, {Block: 0, Offset: 3}, {Block: 1, Offset: 1},
+	})
+	if _, err := storage.PageAddItemRaw(p, post); err != nil {
+		t.Fatalf("add posting: %v", err)
+	}
+
+	keys, err := PageItemKeys(p)
+	if err != nil {
+		t.Fatalf("PageItemKeys: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("PageItemKeys returned %d keys, want 2 (posting collapses to one key)", len(keys))
+	}
+	if CompareKeys(keys[0], EncodeInt4(1)) != 0 {
+		t.Errorf("slot 1 key mismatch: got %x want %x", keys[0], EncodeInt4(1))
+	}
+	if CompareKeys(keys[1], EncodeInt4(2)) != 0 {
+		t.Errorf("slot 2 posting key mismatch: got %x want %x", keys[1], EncodeInt4(2))
 	}
 }
