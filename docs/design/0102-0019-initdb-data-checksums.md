@@ -1,6 +1,6 @@
 # 0102-0019 — Data-page checksum engine + initdb `--data-checksums` (M0102-0010)
 
-Status: accepted (infrastructure); user-facing `--data-checksums` option deferred
+Status: accepted; user-facing `--data-checksums` enablement landed (default-ON flip deferred)
 
 ## Context
 
@@ -95,67 +95,75 @@ threads a `dataChecksums bool` and writes `1`/`0` into offset 252.
   replay rewrites pages with valid checksums on a checksummed cluster. (The
   runtime uses `ReplayFromDirWithMgr` with the already-configured Manager.)
 
-## Deferred — user-facing `--data-checksums` (remaining M0102-0010 work)
+## User-facing `--data-checksums` enablement (landed)
 
-`Options.DataChecksums` exists as the seam, but **`Init` rejects it** with
-"data-page checksums are not yet supported". Reason: a bootable checksummed
-cluster needs `pd_checksum` set on **every** page the bootstrap writes, and
-the bootstrap has **~38 distinct direct `os.WriteFile` page-write sites with
-no shared helper**:
+A bootable checksummed cluster needs `pd_checksum` set on **every** page the
+bootstrap writes. The bootstrap has **~40 distinct direct `os.WriteFile`
+page-write sites** (across `initdb.go`, `btree_index_bootstrap.go`,
+`pg_tablespace_bootstrap.go`, `pg_proc_proname_args_nsp_index_bootstrap.go`)
+plus the Manager-written `pg_type`/`pg_class`/`pg_attribute`. Missing even one
+site yields a cluster whose pg_control claims checksums while a catalog page
+carries none → verification failure on first read.
 
-- `internal/initdb/initdb.go`: `bootstrapSharedCatalogPlaceholders`,
-  `bootstrapMappedLocalCatalogHeaps`, `bootstrapPostgresRoleWithPassword`,
-  `writeMultiPageHeapRows` (pg_proc/pg_operator/… multi-page heaps),
-  `bootstrapPostgresDatabase` (pg_database + ~50 btree placeholders).
-- `internal/initdb/btree_index_bootstrap.go`: ~30 per-index bootstrappers
-  (each writes a metapage + leaf page(s)).
-- (`bootstrapSystemCatalogs` already writes via the Manager — pg_type /
-  pg_class / pg_attribute would be checksummed automatically.)
+### Chosen approach: one offline stamp pass, not a 40-site thread
 
-Missing even one site yields a cluster whose pg_control claims checksums
-while a catalog page carries none → verification failure on first read.
+Rather than thread the cluster's checksum flag through every one of those
+scattered sites — where a single missed site is a silent unbootable-cluster
+bug, and the threading churns ~140 call sites — goopg stamps checksums in **one
+offline pass after all bootstrap writes complete**, exactly as upstream's
+`pg_checksums --enable` tool does (`postgres/src/bin/pg_checksums`). This is the
+same operation PostgreSQL itself uses to convert a live cluster to checksums;
+applying it at the end of `Init` is its natural analogue.
 
-### Routing primitive — `checksumRelationData` (landed)
+`internal/initdb/checksum_bootstrap.go` `stampClusterChecksums(dataDir)`:
 
-The single checksum-aware helper the site-sweep routes through is
-`internal/initdb/checksum_bootstrap.go`:
+- Walks `<dataDir>/global/` and `<dataDir>/base/<db>/`.
+- For each file whose name matches `relFileNamePattern`
+  (`^[0-9]+(_(fsm|vm|init))?(\.[0-9]+)?$` — the goopg analogue of
+  pg_checksums' `parse_filename_for_nontemp_relation`), reads it, runs every
+  `BlockSize` block through `checksumRelationData(raw, true)`, and rewrites it
+  in place. `os.WriteFile` preserves the existing file's mode (perm applies
+  only on creation), so a later `-g/--allow-group-access` relax pass still owns
+  the final mode.
+- **Cluster metadata that is not a relation page file** — `PG_VERSION`,
+  `pg_filenode.map`, `pg_internal.init`, `pg_control`, config files, and
+  CLOG/WAL (outside base/ & global/) — is named non-numerically (or lives
+  elsewhere) and so is never matched. The strict numeric-relfilenode filter is
+  what makes "stamp everything" safe: it cannot corrupt a CRC-protected
+  metadata file by mistaking it for pages.
 
-```go
-func checksumRelationData(raw []byte, enabled bool) []byte
-```
+`Init` calls it (guarded by `opts.DataChecksums`) right after `writePgControl`
+and before the trailing fsync, so the checksummed bytes are flushed durably.
+**When `opts.DataChecksums` is false (the default) the pass never runs and the
+bootstrap is byte-identical to before** — the structural guard, not a
+per-byte equivalence claim, is the invariant.
 
-When `enabled` is false (the default, and the only reachable mode while `Init`
-rejects `--data-checksums`) it returns `raw` **verbatim** — no copy, no
-allocation, byte-identical to a plain `os.WriteFile`. When enabled it returns a
-copy with `pd_checksum` stamped into every `BlockSize` block, built on the
-loop-#29 engine's `storage.PageSetChecksumCopy`.
+### Routing primitive — `checksumRelationData`
 
-The block number folded into each checksum is **derived from the block's byte
-offset within the file** (block N at offset `N*BlockSize`), matching exactly how
-the runtime smgr verifies a block on read (`smgr.go`: `off/BlockSize`). This
-makes one helper uniform across single-page heaps, multi-page heaps, and
-multi-page btree files **without any per-site block-number bookkeeping** —
-each direct writer becomes `os.WriteFile(path, checksumRelationData(data, enabled), 0o600)`.
-New (all-zero) pages are passed through unchanged, exactly as upstream
-`PageIsNew` skips them. The trickiest property — correct per-block numbering on
-multi-page files and never mutating the caller's slice — is proven in isolation
-by `internal/initdb/checksum_bootstrap_test.go` (identity-when-disabled,
-no-input-mutation, per-block verify + transposition rejection, new-page skip,
-partial-tail-verbatim).
+`stampClusterChecksums` is built on the loop-#30 primitive
+`checksumRelationData(raw []byte, enabled bool) []byte`: a copy with
+`pd_checksum` stamped into every `BlockSize` block (`storage.PageSetChecksumCopy`),
+block number **derived from the block's byte offset within the file** (block N
+at offset `N*BlockSize`), matching exactly how the runtime smgr verifies a
+block on read (`smgr.go`: `off/BlockSize`). New (all-zero) pages are passed
+through unchanged, exactly as upstream `PageIsNew` skips them. The per-block
+numbering and never-mutate-input invariants are proven in isolation by
+`internal/initdb/checksum_bootstrap_test.go`.
 
-### Remaining (the sweep)
+### CLI flags
 
-Routing the ~50 direct writers (initdb.go, btree_index_bootstrap.go,
-pg_tablespace_bootstrap.go, pg_proc_proname_args_nsp_index_bootstrap.go) through
-`checksumRelationData` by threading the cluster's checksum flag from
-`opts.DataChecksums` into the bootstrap functions; an end-to-end test that inits
-with `--data-checksums` and reads every catalog relation's block 0 through a
-checksummed Manager; dropping the `Init` reject; and adding the
-`-k`/`--data-checksums`/`--no-data-checksums` CLI flags. The PG-18 default-ON
-parity (and the `001_initdb.pl` default-version-1 assertion) ride on that same
-work, flipped LAST after recovery/replication validation. Because the flag stays
-off while the reject is in place, the sweep is byte-identical and can land
-incrementally and safely.
+`cmd/goopg`'s `init` registers `-k`/`--data-checksums` and
+`--no-data-checksums` (upstream initdb's `-k` and its negation).
+`--no-data-checksums` overrides `-k` and is the current goopg default.
+
+### Remaining: default-ON flip
+
+PG 18 defaults checksums **on** (`001_initdb.pl` asserts
+`Data page checksum version: 1` by default). goopg keeps the default **off**
+for now; flipping it is deferred until physical-replication / recovery
+validation confirms a checksummed cluster replays and streams cleanly
+(the FPI-replay and standby-read paths). That flip is a one-line default change
+plus its validation, tracked under M0102-0010.
 
 ## Testing
 
@@ -165,7 +173,17 @@ incrementally and safely.
   corruption detection (`*ChecksumError`), `IgnoreChecksumFailure` +
   `OnChecksumFailure`, disabled = byte-identical, `ExtendBatch` per-block
   checksums, new-page skip.
-- `internal/initdb/data_checksums_test.go` (new) — `buildPgControl` writes
-  version 1/0; `Init` rejects `DataChecksums=true` before creating the dir.
+- `internal/initdb/data_checksums_test.go` — `buildPgControl` writes
+  version 1/0; **`TestInitDataChecksumsBootstrapsVerifiablePages`** is the e2e
+  boot test: inits with `DataChecksums=true`, asserts pg_control version 1,
+  then verifies every relation page under base/ & global/ carries a valid
+  checksum (off/BlockSize convention) — a missed file fails the test — and
+  reads block 0 of pg_type/pg_class/pg_attribute through a checksummed
+  Manager (the production read path).
+- `internal/initdb/checksum_bootstrap_test.go` — `checksumRelationData`
+  per-block numbering / no-input-mutation / transposition-rejection.
+- `cmd/goopg/main_test.go` `TestInitCommandDataChecksums` — the `-k` /
+  `--data-checksums` / `--no-data-checksums` flags drive pg_control's
+  `data_checksum_version`; `--no-data-checksums` overrides `-k`.
 - Gates: `go build ./...`, `go vet`, `gofmt`, full `internal/initdb`,
   `go test -race ./internal/storage ./internal/wal`, TPC-H Q12/Q13 spot-check.

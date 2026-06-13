@@ -292,16 +292,16 @@ type Options struct {
 	ICULocale     string
 	ICURules      string
 
-	// DataChecksums is the seam for upstream initdb's -k/--data-checksums.
-	// The storage engine, pg_control plumbing (data_checksum_version), and
-	// runtime read/verify path are all implemented (see ManagerConfig.
-	// ChecksumsEnabled), but Init currently REJECTS this option: producing a
-	// bootable checksummed cluster requires setting pd_checksum on every one
-	// of the ~38 direct page-write sites in the bootstrap (none share a
-	// helper), and missing one yields an unbootable cluster. That exhaustive
-	// wiring + an end-to-end boot test is tracked as the remaining
-	// M0102-0010 work. When false (the default) the cluster is checksum-less
-	// and the I/O path is byte-identical. See
+	// DataChecksums requests upstream initdb's -k/--data-checksums: a cluster
+	// whose pg_control data_checksum_version is 1 and whose every data page
+	// carries a valid pd_checksum. When true, Init stamps checksums into every
+	// relation page in one offline pass after the bootstrap completes
+	// (stampClusterChecksums, mirroring pg_checksums --enable); the storage
+	// engine then verifies them on read (ManagerConfig.ChecksumsEnabled, set
+	// from pg_control at Open). When false (the goopg default) the cluster is
+	// checksum-less and the bootstrap + I/O path is byte-identical to before.
+	// PG 18 defaults this ON; goopg keeps it off until recovery/replication
+	// validation precedes flipping the default (M0102-0010). See
 	// docs/design/0102-0019-initdb-data-checksums.md.
 	DataChecksums bool
 
@@ -650,17 +650,6 @@ func Init(opts Options) error {
 	// option combination, or an encoding/locale mismatch aborts before any
 	// filesystem work. The result feeds pg_database (datlocprovider /
 	// datcollate / datctype / datlocale) and the lc_* GUC seeding below.
-	// Data-page checksums: the storage/runtime infrastructure is in place
-	// (ManagerConfig.ChecksumsEnabled, pg_control data_checksum_version),
-	// but a bootable checksummed cluster also needs pd_checksum on every
-	// bootstrap page-write site (~38 distinct os.WriteFile callers with no
-	// shared helper). Until that exhaustive wiring + an end-to-end boot test
-	// land, reject the option rather than emit a cluster whose pg_control
-	// claims checksums (version 1) while its catalog pages carry none — that
-	// cluster would fail verification on first read. Tracked: M0102-0010.
-	if opts.DataChecksums {
-		return errors.New("goopg init: --data-checksums is not yet supported (data-page checksum bootstrap wiring pending; see M0102-0010)")
-	}
 	locale, err := resolveLocale(opts, encodingID)
 	if err != nil {
 		return err
@@ -1161,6 +1150,20 @@ func Init(opts Options) error {
 	// (M0095-0001).
 	if err := writePgControl(abs, sysID, opts.Registry, opts.DataChecksums); err != nil {
 		return fmt.Errorf("goopg init: pg_control: %w", err)
+	}
+	// Data-page checksums (upstream initdb -k/--data-checksums): pg_control's
+	// data_checksum_version=1 (written just above) is a promise that every
+	// data page on disk carries a valid pd_checksum. The bootstrap wrote all
+	// relation files without checksums; stamp them now in one offline pass
+	// over base/ and global/ (mirroring pg_checksums --enable), after every
+	// relation file — including the base/1 → base/5 / template0 copies and
+	// the mapped-local-catalog heaps — is final, and before the trailing fsync
+	// so the checksummed bytes are flushed durably. A version-0 cluster (the
+	// default) skips this entirely and is byte-identical to before.
+	if opts.DataChecksums {
+		if err := stampClusterChecksums(abs); err != nil {
+			return fmt.Errorf("goopg init: data-page checksums: %w", err)
+		}
 	}
 	// Relax the whole tree to group-readable mode when -g/--allow-group-access
 	// was given (upstream SetDataDirectoryCreatePerm(PG_DIR_MODE_GROUP)). Done

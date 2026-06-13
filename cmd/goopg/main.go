@@ -170,6 +170,15 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	// bind to the same variable; relaxes the cluster to mode 0750/0640.
 	allowGroupAccess := fs.Bool("g", false, "allow group read/execute on the data directory")
 	fs.BoolVar(allowGroupAccess, "allow-group-access", false, "allow group read/execute on the data directory")
+	// Data-page checksums (upstream initdb -k/--data-checksums and its
+	// negation --no-data-checksums). -k/--data-checksums stamps a pd_checksum
+	// into every data page and sets pg_control's data_checksum_version=1;
+	// --no-data-checksums is the goopg default. (Upstream PG 18 defaults ON;
+	// goopg keeps it off until recovery/replication validation lands, then
+	// flips the default — M0102-0010.) --no-data-checksums overrides -k.
+	dataChecksums := fs.Bool("k", false, "use data page checksums")
+	fs.BoolVar(dataChecksums, "data-checksums", false, "use data page checksums")
+	noDataChecksums := fs.Bool("no-data-checksums", false, "do not use data page checksums")
 	// Authentication methods written into pg_hba.conf (upstream initdb
 	// -A/--auth, --auth-host, --auth-local) and the superuser password file
 	// (--pwfile). -A/--auth sets both host and local; the per-side flags
@@ -220,7 +229,10 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	if *authLocal != "" {
 		resolvedAuthLocal = *authLocal
 	}
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, Encoding: *encoding, AllowGroupAccess: *allowGroupAccess, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings, LocaleProvider: *localeProvider, Locale: *locale, LCCollate: *lcCollate, LCCtype: *lcCtype, LCMessages: *lcMessages, LCMonetary: *lcMonetary, LCNumeric: *lcNumeric, LCTime: *lcTime, BuiltinLocale: *builtinLocale, ICULocale: *icuLocale, ICURules: *icuRules}); err != nil {
+	// -k/--data-checksums enables; --no-data-checksums overrides it back off
+	// (and is the current goopg default).
+	useDataChecksums := *dataChecksums && !*noDataChecksums
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, Encoding: *encoding, AllowGroupAccess: *allowGroupAccess, DataChecksums: useDataChecksums, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings, LocaleProvider: *localeProvider, Locale: *locale, LCCollate: *lcCollate, LCCtype: *lcCtype, LCMessages: *lcMessages, LCMonetary: *lcMonetary, LCNumeric: *lcNumeric, LCTime: *lcTime, BuiltinLocale: *builtinLocale, ICULocale: *icuLocale, ICURules: *icuRules}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}

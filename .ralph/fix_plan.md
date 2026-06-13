@@ -758,15 +758,39 @@ if 21-spec pass surfaces a real divergence:
         and the `-k`/`--data-checksums` CLI flags. Because the flag stays off
         while the reject is in place, the sweep is byte-identical and can land
         incrementally and safely.
+      - **PROGRESS 2026-06-13 (loop #31):** `--data-checksums` **user-facing
+        enablement landed.** Instead of the deferred ~50-site threading sweep,
+        the enablement is one offline stamp pass after bootstrap completes
+        (`internal/initdb/checksum_bootstrap.go` `stampClusterChecksums`),
+        mirroring upstream `pg_checksums --enable`
+        (`postgres/src/bin/pg_checksums`): it walks `global/` + `base/<db>/`,
+        and for every file matching `relFileNamePattern`
+        (`^[0-9]+(_(fsm|vm|init))?(\.[0-9]+)?$`, the analogue of
+        `parse_filename_for_nontemp_relation`) runs each block through the
+        loop-#30 `checksumRelationData` and rewrites it in place. Non-relation
+        metadata (PG_VERSION, pg_filenode.map, pg_internal.init, pg_control,
+        CLOG/WAL) is named non-numerically / lives elsewhere → never matched,
+        so the "stamp everything" pass cannot corrupt a CRC-protected file.
+        `Init` calls it (guarded by `opts.DataChecksums`) after `writePgControl`
+        and before the trailing fsync; the `Init` reject is **removed**.
+        Default stays **OFF** (byte-identical bootstrap when the flag is off,
+        structurally guaranteed by the guard). CLI `-k`/`--data-checksums`/
+        `--no-data-checksums` registered (`--no-data-checksums` overrides
+        `-k`). e2e boot test
+        `TestInitDataChecksumsBootstrapsVerifiablePages` verifies every
+        relation page under base/+global/ checksums-clean (off/BlockSize) and
+        reads pg_type/pg_class/pg_attribute block 0 through a checksummed
+        Manager; `TestInitCommandDataChecksums` drives the CLI flags. Design
+        doc `0102-0019` updated (chosen-approach + testing sections). Gates:
+        gofmt/vet/`go build ./...` clean; `go test ./internal/initdb
+        ./internal/storage` PASS; CLI test PASS.
       - **Remaining initdb work** (each pulls in a distinct subsystem; one
-        per future loop, design doc first):
-        `--data-checksums`/`--no-data-checksums` **user-facing enablement** —
-        the engine (loop #29) and the routing primitive (loop #30) are landed;
-        what remains is the ~50-site sweep through `checksumRelationData` + an
-        e2e `Init(--data-checksums)`→read-every-catalog-block-0 boot test +
-        dropping the `Init` reject + adding the CLI flag, then flipping the
-        default to ON for PG-18 parity (and the `001_initdb.pl` version-1
-        assertion). The locale-derived default encoding
+        per future loop, design doc first): the `--data-checksums`
+        **default-ON flip** for PG-18 parity (and the `001_initdb.pl`
+        version-1 assertion) — deferred until physical-replication / recovery
+        validation confirms a checksummed cluster replays (FPI) and streams to
+        a standby cleanly; the flip itself is a one-line default change plus
+        that validation. The locale-derived default encoding
         (`pg_get_encoding_from_locale` on an unset `--encoding`) remains a
         no-op under goopg's fixed C locale.
 

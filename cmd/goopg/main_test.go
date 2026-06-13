@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/control"
 )
 
 // TestNoArgsPrintsUsage guards the contract from
@@ -189,6 +190,40 @@ func TestInitCommandAllowGroupAccess(t *testing.T) {
 	if !strings.Contains(string(data), "log_file_mode = 0640") {
 		t.Errorf("postgresql.conf missing seeded `log_file_mode = 0640`; got:\n%s",
 			grepLines(string(data), "log_file_mode"))
+	}
+}
+
+// TestInitCommandDataChecksums drives the -k/--data-checksums and
+// --no-data-checksums flags (upstream initdb -k) through the CLI and asserts
+// pg_control's data_checksum_version reflects the requested mode.
+// --no-data-checksums (the current goopg default) overrides -k.
+func TestInitCommandDataChecksums(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantVers uint32
+	}{
+		{"default-off", []string{}, 0},
+		{"k-short", []string{"-k"}, 1},
+		{"long", []string{"--data-checksums"}, 1},
+		{"no-data-checksums", []string{"--no-data-checksums"}, 0},
+		{"no-overrides-k", []string{"-k", "--no-data-checksums"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "data")
+			var stdout, stderr bytes.Buffer
+			args := append([]string{"init", "-D", dir, "--no-sync"}, tc.args...)
+			if code := run(args, &stdout, &stderr); code != 0 {
+				t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+			}
+			ctrl, err := control.ReadControlFile(dir)
+			if err != nil {
+				t.Fatalf("ReadControlFile: %v", err)
+			}
+			if ctrl.DataChecksumVersion != tc.wantVers {
+				t.Fatalf("data_checksum_version = %d, want %d", ctrl.DataChecksumVersion, tc.wantVers)
+			}
+		})
 	}
 }
 
