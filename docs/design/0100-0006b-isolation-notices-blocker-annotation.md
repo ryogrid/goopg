@@ -90,14 +90,61 @@ exercises them yet — adding enforcement is a localized follow-up in
   `…MergeUpdate` (notice-heavy specs that use the pending/drain paths) still
   PASS — confirming the `len(blockers)==0` gating leaves them untouched.
 
+## Parts (a)/(b) — speculative locks surface through pg_locks ⋈ pg_stat_activity
+
+Loop 2 (2026-06-13) made both `controller_print_speculative_locks` steps match
+PG. The `spectoken`/`transactionid` rows were already emitted by
+`internal/executor/spec_insert_registry.go`, but the controller's
+`pg_locks pl JOIN pg_stat_activity pa USING (pid)` query returned 0 rows. Three
+defects, all now fixed:
+
+1. **Empty backend PID.** The registry stamped each synthetic `pg_locks` row with
+   `ExecContext.ActivityPID`, a field deprecated to the empty string ("use ProcNum
+   + Activity instead"). With `pid=""` the rows could never join `pg_stat_activity`.
+   Fix: `activity.(*Registry).PIDForProcNum(procNum)` resolves the live PID from the
+   per-backend slot, exposed via a new `ExecContext.backendPID()` helper that the
+   three spec-registry call sites now use.
+
+2. **`Activity` not wired into the executor context.** `backendPID()` still saw
+   `ctx.Activity == nil` because `internal/server/dispatch.go` never set
+   `ectx.Activity` (only `ProcNum`). Fix: `ectx.Activity = s.cfg.Activity` in the
+   simple-query dispatch path (the path the isolation runner uses; it also enables
+   the relation-lock WaitEvent markers, which the view still renders as NULL).
+
+3. **`pg_stat_activity.pid` typed as `text`, `pg_locks.pid` as `int4`.** A
+   text↔int4 `USING (pid)` join silently yields zero rows. In PostgreSQL both are
+   `int4`. Fix: `internal/initdb/pg_stat_activity_view.go` types `pid`/`leader_pid`
+   as `int4`; non-numeric internal pids (background workers such as `cp-0`) are
+   emitted as NULL via `numericPIDOrNull` so the `int4` decode never fails. This is
+   the kind of representation alignment the `align-data-structure-with-pg` branch
+   targets and a cheap PG parity win (`psql \d pg_stat_activity` now shows
+   `pid integer`).
+
+The row **model** was also completed: every transaction holding an XID owns a
+`transactionid ExclusiveLock` on its own XID. A pure waiter (blocked before its
+own speculative insert) is absent from the `active` map, so `LockRows` now emits
+the self-lock from each spec-/xid-waiter's `ownXID` (deduped against the active
+entries). This yields PG's exact 4-row / 3-row prints.
+
+### Verification (parts a/b)
+
+* `TestPort_IsolationInsertConflictSpecconflict` — both `print_speculative_locks`
+  steps now match (4 rows: s1/s2 × {spectoken, transactionid}; then 3 rows once
+  s2 releases the token and s1 waits on s2's XID). Diff advanced from L496 to L533.
+* `TestPort_PgStatActivity`, `…WaitEventsNull`, `TestSyntax_Catalog_PgStatActivity`,
+  plpgsql/syntax-catalog pid scans, all dedicated isolation specs
+  (`EvalPlanQual*`, `InsertConflictDoNothing`, `InsertConflictDoUpdate[2-4]`,
+  `LockCommitted*`, `ReadWriteUnique`, `FkSnapshot`), `internal/initdb`,
+  `internal/activity`, `internal/catalog`, `internal/executor` — all PASS.
+
 ## Remaining work (tracked under M0100-0006b)
 
-The test still SKIPs: `controller_print_speculative_locks` returns no rows in
-goopg, while PG shows the `spectoken` ShareLock (s1 waiter) and `spectoken`
-ExclusiveLock (s2 holder) via `pg_locks ⋈ pg_stat_activity USING (pid)` filtered
-by `application_name`. The `spectoken`/`transactionid` rows are emitted by
-`internal/executor/spec_insert_registry.go` but are not surfacing through that
-join at the moment the step runs (timing of spec-token hold window vs. the
-controller's query, and/or the `pg_locks`↔`pg_stat_activity` pid/application_name
-linkage). That is parts (a)/(b) integration of M0100-0006b — see the deferral
-ledger entry for the resume point.
+The test still SKIPs, now for an **unrelated** reason: a +2-line offset that
+cascades to EOF. After `s2_commit`, s1 wakes from the XID wait and completes its
+`ON CONFLICT DO UPDATE`; goopg re-evaluates the **non-unique** index expression
+`blurt_and_lock_4(key)` on that retry/update path, emitting two extra NOTICEs
+(`blurt_and_lock_4() called …` / `acquiring advisory lock on 4`) that PG does not
+emit at completion (PG evaluates it only once, during the speculative insert).
+This is an executor index-maintenance issue on the ON CONFLICT update path, not
+part of the speculative-lock infrastructure (parts a/b/c, now complete). See the
+deferral ledger for the resume point.

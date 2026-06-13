@@ -365,6 +365,20 @@ type Context struct {
 	MergeNewRow Row
 }
 
+// backendPID resolves the owning backend's PID string for synthetic pg_locks
+// rows (spectoken / transactionid) that must join pg_stat_activity USING (pid).
+// ActivityPID is deprecated and always empty; the live PID lives in the activity
+// registry keyed by ProcNum. Falls back to ActivityPID when no registry is wired
+// (unit tests). Returns "" when unresolvable — such rows simply won't join.
+func (c *Context) backendPID() string {
+	if c.Activity != nil {
+		if pid := c.Activity.PIDForProcNum(c.ProcNum); pid != "" {
+			return pid
+		}
+	}
+	return c.ActivityPID
+}
+
 // SettingValue is one effective session setting exposed to SHOW ALL.
 type SettingValue struct {
 	Name  string

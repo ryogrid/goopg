@@ -303,6 +303,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	ectx.PubSub = s.cfg.PubSub
 	ectx.LockMgr = s.cfg.LockMgr
 	ectx.BackendID = backendID
+	ectx.Activity = s.cfg.Activity
 	if connTx != nil {
 		ectx.ProcNum = connTx.ProcNum
 	}

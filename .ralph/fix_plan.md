@@ -333,12 +333,23 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
                 the referenced session emits ≥N notices. Design doc:
                 `docs/design/0100-0006b-isolation-notices-blocker-annotation.md`.
                 Perm-5 diff advanced past the NOTICE-interleave region to
-                `controller_print_speculative_locks` (L497). Parts (a)/(b)
-                infra exists in `internal/executor/spec_insert_registry.go`
-                (emits spectoken/transactionid rows) but those rows are not
-                surfacing through `pg_locks ⋈ pg_stat_activity USING (pid)`
-                filtered by application_name at the moment the controller
-                queries them — remaining gap. See deferral ledger.
+                `controller_print_speculative_locks` (L497).
+              - Progress (loop 2, 2026-06-13): parts (a)/(b) DONE — both
+                `controller_print_speculative_locks` steps now match PG (4-row
+                then 3-row prints). Three fixes: (1) `Activity.PIDForProcNum` +
+                `ExecContext.backendPID()` resolve the live backend PID (the
+                deprecated `ActivityPID` was always ""); (2) `dispatch.go` wires
+                `ectx.Activity`; (3) `pg_stat_activity.pid`/`leader_pid` retyped
+                `text`→`int4` so the `USING (pid)` join with `pg_locks` (int4)
+                matches — non-numeric bg-worker pids emit NULL. Row model
+                completed: waiters emit their own-XID `transactionid
+                ExclusiveLock`. Diff advanced L496→L533.
+              - Remaining (separate issue): test still SKIPs on a +2-line
+                offset — after `s2_commit`, s1's ON CONFLICT DO UPDATE retry
+                re-evaluates the non-unique index expr `blurt_and_lock_4`,
+                emitting 2 extra NOTICEs PG does not. Executor index-maintenance
+                bug on the upsert update path, not spec-lock infra. See deferral
+                ledger.
 
         - [ ] **M0100-0007 — MergeUpdate: MERGE RETURNING old/new aliases + merge_action()**
               - Summary: `TestPort_IsolationMergeUpdate` SKIP — `ERROR: column

@@ -321,6 +321,22 @@ func New(cfg Config) *Server {
 	if cfg.hasStorage() {
 		s.pc = newPlanCache()
 	}
+	// M0100-0006b: wire spec-insert registry cleanup on transaction end.
+	if cfg.TxnMgr != nil {
+		cfg.TxnMgr.SetOnTxnEnd(executor.DeregisterSpecXID)
+	}
+	// M0100-0006b: propagate SET application_name to the activity registry
+	// so pg_locks JOIN with pg_stat_activity reflects the updated name.
+	if cfg.Registry != nil {
+		cfg.Registry.OnChange("application_name", func(effVal string) {
+			reg, procNum, ok := activity.LookupCurrentGoroutine()
+			if !ok {
+				return
+			}
+			reg.UpdateApplicationName(procNum, effVal)
+		})
+	}
+
 	// Build the apply-worker launcher when logical replication is
 	// wired (PubSub + storage handles). Server.Run starts it so its
 	// lifetime matches the listener's. M0103-0002.

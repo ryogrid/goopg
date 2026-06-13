@@ -255,6 +255,8 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			// Detects commits from concurrent sessions that happened during
 			// Phase B's blocking window (advisory lock 2 in specconflict tests).
 			specConflictPtr, specConflictRow, specConflicted, serr := o.probeSpeculativeConflict(rel, cols, arbiterKey, o.ctx.Tx.XID)
+			// Release the speculative token regardless of conflict outcome. M0100-0006b.
+			globalSpecReg.SettleSpec(o.ctx.Tx.XID)
 			if serr != nil {
 				return nil, serr
 			}
@@ -344,8 +346,27 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 					if qctx == nil {
 						qctx = context.Background()
 					}
+					// M0100-0006b: if the conflicting XID is still in speculative
+					// insertion mode, wait for the spec token to be settled before
+					// waiting on the transaction itself. This maps to PG's
+					// SpeculativeInsertionLockAcquire / ShareLock path.
+					if isInFlightInsert {
+						waited, serr := globalSpecReg.WaitForSpecToken(qctx, inProgressXID, o.ctx.backendPID(), o.ctx.Tx.XID)
+						if serr != nil {
+							return nil, serr
+						}
+						if waited {
+							// Re-run arbiter expression after spec token released.
+							if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+								return nil, err
+							}
+						}
+					}
 					if o.ctx.TxnMgr != nil {
-						if werr := o.ctx.TxnMgr.WaitForXID(qctx, inProgressXID); werr != nil {
+						globalSpecReg.RegisterXIDWait(o.ctx.backendPID(), o.ctx.Tx.XID, inProgressXID)
+						werr := o.ctx.TxnMgr.WaitForXID(qctx, inProgressXID)
+						globalSpecReg.DeregisterXIDWait(o.ctx.Tx.XID)
+						if werr != nil {
 							return nil, werr
 						}
 					}
@@ -374,6 +395,7 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 						}
 						// Post-insert speculative probe on the retry path.
 						specPtr2, specRow2, specConflicted2, serr2 := o.probeSpeculativeConflict(rel, cols, arbiterKey, o.ctx.Tx.XID)
+						globalSpecReg.SettleSpec(o.ctx.Tx.XID)
 						if serr2 != nil {
 							return nil, serr2
 						}
@@ -823,6 +845,12 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols
 	// expression is not re-evaluated (avoiding extra NOTICEs for plain INSERT).
 	if phaseBKey != nil {
 		_ = o.maintainArbiter(phaseBKey, ptr)
+		// Register the speculative insertion token now that the unique index
+		// entry is visible. SettleSpec is called by the caller after
+		// probeSpeculativeConflict returns. M0100-0006b.
+		if xid := o.ctx.Tx.XID; xid != storage.InvalidTransactionID {
+			globalSpecReg.RegisterSpec(xid, o.ctx.backendPID())
+		}
 	}
 	// Maintain all non-arbiter unique/PK indexes. The arbiter was already handled
 	// above; skipping it here prevents double-insertion and expression re-evaluation.
