@@ -225,6 +225,26 @@ type item struct {
 // itemPrefixSize is the fixed bytes before key_bytes.
 const itemPrefixSize = 2 + 4 + 2
 
+// MaxItemsPerPage is the goopg analogue of upstream's MaxIndexTuplesPerPage
+// (postgres/src/include/access/itup.h): an upper bound on how many line-pointer
+// items can physically fit on one B-tree page. amcheck's page-structural check
+// (amcheck.VerifyBtreePage) flags any page whose line-pointer count exceeds this
+// bound, mirroring palloc_btree_page's `maxoffset > MaxIndexTuplesPerPage` test
+// (postgres/contrib/amcheck/verify_nbtree.c:3397).
+//
+// The divisor is goopg's minimum per-item footprint: a 4-byte line pointer (the
+// itemIDSize that pageHasSpaceFor reserves) plus the smallest possible item
+// body. The smallest body is a bare itemPrefix with a zero-length key — an
+// internal page's negative-infinity downlink. goopg stores items unaligned
+// (pageHasSpaceFor reserves exactly itemIDSize+itemPrefixSize+len(key)), so
+// there is no MAXALIGN term, unlike upstream's MAXALIGN(sizeof(IndexTupleData)+1).
+// Like upstream the bound is deliberately conservative: it ignores the per-page
+// special (opaque) area, so the true maximum is a little lower — that headroom is
+// exactly what keeps the corruption check free of false positives. Defined here,
+// alongside itemPrefixSize, so the tuple-size accounting has a single source of
+// truth (the engine never re-derives the inline item layout).
+const MaxItemsPerPage = (storage.BlockSize - storage.SizeOfPageHeaderData) / (4 + itemPrefixSize)
+
 func (it item) marshal() []byte {
 	out := make([]byte, itemPrefixSize+len(it.key))
 	binary.LittleEndian.PutUint16(out[0:2], it.keyLen)

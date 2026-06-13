@@ -320,14 +320,12 @@ sibling-path drift hazard (`pattern_sibling_paths_must_agree`).
   key item") therefore do **not** translate and are not ported.
 - **`MaxIndexTuplesPerPage` ceiling.** Upstream's item-count upper bound is a
   constant from PG's `IndexTupleData` size; goopg's index-tuple layout differs
-  (inline key with a 2-byte length), so a faithful ceiling needs goopg-specific
-  tuple-size accounting — deferred to its own tier rather than shipped with a
-  wrong constant.
+  (inline key with a 2-byte length), so the ceiling is computed from goopg's own
+  per-item footprint — see the item-count tier below. (Was deferred through loop
+  #56; ported loop #57.)
 
 ### Deferred (B-tree, with resume points)
 
-- The `MaxIndexTuplesPerPage`-equivalent item-count ceiling (goopg tuple-size
-  accounting).
 - Cross-page tiers (`bt_check_level_from_leftmost`, downlink/sibling-link
   agreement, cross-page item order, root-descent via `bt_index_parent_check`) —
   need multi-page traversal state.
@@ -398,6 +396,52 @@ internal negative-infinity clean; rightmost page ignores a lingering high key;
 metapage and deleted pages yield nil. 10 tests. `btree/posting_test.go` gains
 `TestPageItemKeys` asserting the posting-collapse behaviour (regular + 3-TID
 posting → 2 keys).
+
+## B-tree item-count ceiling tier (`VerifyBtreePage`, added loop #57)
+
+The third `verify_nbtree` tier ports `palloc_btree_page`'s item-count upper bound
+(`verify_nbtree.c:3396-3402`): a page whose line-pointer count exceeds the number
+of index tuples that can physically fit is corrupt. Upstream phrases the bound as
+the constant `MaxIndexTuplesPerPage`
+(`(BLCKSZ - SizeOfPageHeaderData) / (MAXALIGN(sizeof(IndexTupleData)+1) + sizeof(ItemIdData))`,
+`postgres/src/include/access/itup.h`). The check is folded into `VerifyBtreePage`
+(the `palloc_btree_page` tier) after the leaf/internal level checks, matching the
+upstream order. Message is upstream-verbatim:
+`Number of items on block %u of index "%s" exceeds MaxIndexTuplesPerPage (%u)`.
+
+goopg specifics making the port faithful:
+
+- **The bound is goopg's, not PG's.** goopg's index tuple is `keyLen(2) |
+  block(4) | offset(2) | key` stored **unaligned** (the writer's `pageHasSpaceFor`
+  reserves exactly `itemIDSize + itemPrefixSize + len(key)`), where the smallest
+  possible body is a zero-length-key negative-infinity downlink. The ceiling is
+  therefore `(BlockSize - SizeOfPageHeaderData) / (4 + itemPrefixSize)` =
+  `8168 / 12` = **680**, exported as `btree.MaxItemsPerPage`. It lives in
+  `btree.go` beside `itemPrefixSize` so the tuple-size accounting has a single
+  source of truth — the engine never re-derives the inline item layout (the same
+  v3→v4 drift discipline as `ParseMeta`/`ParseOpaque`/`PageItemKeys`). Like
+  upstream the bound deliberately ignores the per-page special (opaque) area, so
+  the real maximum is a little lower; that headroom keeps the check free of false
+  positives.
+- **Deleted-page divergence.** Upstream applies the count check to deleted pages
+  too (it sits outside `palloc_btree_page`'s `!P_ISDELETED` guard); goopg returns
+  for deleted pages before the count check. A goopg deleted page holds no live
+  items so the check is moot there, and skipping it avoids reading a deleted
+  page's type-punned fields. Documented in-code.
+- A corrupt `pd_lower` whose line-pointer area is not an `itemIDSize` multiple
+  surfaces as a damaged-page finding (`PageLinePointerCount` errors), never a Go
+  error or panic — matching the report-and-continue model.
+
+### Testing (item-count tier)
+
+`verify_nbtree_test.go` gains a `makeCountPage` builder that bumps `pd_lower` to
+claim an arbitrary line-pointer count without materialising item bodies (a count
+above the ceiling cannot physically fit, so a corrupt `pd_lower` is the only way
+the corruption arises). `TestBtreeMaxItemsPerPageValue` pins the derived constant
+(680) so a layout change trips it; a page exactly at the ceiling is clean; one
+item over asserts the exact upstream message + block; a non-multiple `pd_lower`
+yields a damaged-page finding; a deleted page with an over-ceiling `pd_lower` is
+suppressed. 5 tests.
 
 ## Upstream references
 

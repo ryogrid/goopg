@@ -28,9 +28,9 @@
 //   - MaxIndexTuplesPerPage ceiling. Upstream's item-count upper bound is a
 //     constant derived from PG's IndexTupleData size; goopg's index-tuple
 //     on-disk layout differs (keys are stored inline with a 2-byte length, see
-//     btree.go), so a faithful ceiling needs goopg-specific tuple-size
-//     accounting. That check is deferred to its own tier rather than ported
-//     with a wrong constant.
+//     btree.go), so the ceiling is computed from goopg's own per-item footprint
+//     and exported as btree.MaxItemsPerPage. VerifyBtreePage flags a page whose
+//     line-pointer count exceeds it (upstream-verbatim message, goopg constant).
 //
 //   - Single on-disk version. Upstream accepts a range
 //     [BTREE_MIN_VERSION, BTREE_VERSION]; goopg writes exactly one metapage
@@ -108,6 +108,30 @@ func VerifyBtreePage(p storage.Page, blkno storage.BlockNumber, indexName string
 		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
 			"invalid internal page level 0 for block %d in index \"%s\"",
 			blkno, indexName)}}
+	}
+
+	// Item-count ceiling: a page cannot hold more line-pointer items than
+	// physically fit (palloc_btree_page, verify_nbtree.c:3396-3402). goopg's
+	// per-item footprint differs from PG's, so the bound is
+	// btree.MaxItemsPerPage rather than PG's MaxIndexTuplesPerPage, but the
+	// message text is upstream-verbatim. A line-pointer count above the bound
+	// can only mean a corrupt pd_lower (the item bodies could never have fit).
+	//
+	// Divergence: upstream applies this check to deleted pages too (it sits
+	// outside palloc_btree_page's !P_ISDELETED guard); goopg returns above for
+	// deleted pages, but a goopg deleted page holds no live items so the check
+	// is moot there. Reading pd_lower only after the deleted guard also avoids
+	// a deleted page's type-punned fields. The metapage returned earlier (it
+	// carries no line pointers).
+	count, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
+			"index \"%s\" has a damaged page at block %d: %v", indexName, blkno, err)}}
+	}
+	if count > btree.MaxItemsPerPage {
+		return []BtreeReport{{Block: blkno, Msg: fmt.Sprintf(
+			"Number of items on block %d of index \"%s\" exceeds MaxIndexTuplesPerPage (%d)",
+			blkno, indexName, btree.MaxItemsPerPage)}}
 	}
 
 	return nil

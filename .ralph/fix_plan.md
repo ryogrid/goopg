@@ -1071,6 +1071,33 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         ("B-tree item-order / high-key tier"); README index updated. STILL
         DEFERRED: the item-count ceiling, cross-page/cross-level tiers, and the
         SQL surface (still blocked on a clean tree).
+      - **PROGRESS 2026-06-14 (loop #57):** added the **third B-tree tier**, the
+        **item-count ceiling**, folded into `VerifyBtreePage` after the level
+        checks (matching `palloc_btree_page`'s order, `verify_nbtree.c:3396-3402`):
+        a page whose line-pointer count exceeds what can physically fit is
+        corrupt. goopg's index tuple (`keyLen|block|offset|key`, stored
+        **unaligned**) gives a different bound than PG's `MaxIndexTuplesPerPage`,
+        so the ceiling is computed from goopg's own per-item footprint and
+        exported as `btree.MaxItemsPerPage` =
+        `(BlockSize - SizeOfPageHeaderData) / (4 + itemPrefixSize)` = **680**,
+        defined beside `itemPrefixSize` in the uncontaminated `btree.go` (single
+        source of truth — the engine never re-derives the inline item layout).
+        Message is upstream-verbatim (`Number of items on block %u of index "%s"
+        exceeds MaxIndexTuplesPerPage (%u)`), with goopg's constant. Divergences
+        handled: like upstream the bound ignores the per-page opaque area (extra
+        headroom → no false positives); unlike upstream the check is skipped on
+        deleted pages (goopg returns earlier; a goopg deleted page holds no live
+        items, and skipping avoids reading type-punned fields); a non-`itemIDSize`
+        `pd_lower` surfaces as a damaged-page finding, never a Go error/panic.
+        5 new amcheck tests (`makeCountPage` builder bumps `pd_lower` to claim a
+        count without materialising bodies: constant pin = 680, at-ceiling clean,
+        over-ceiling exact message, damaged `pd_lower`, deleted-page suppression).
+        `go test ./internal/amcheck ./internal/access/btree` PASS; gofmt/vet
+        clean; all changes in new amcheck code + one additive `btree.go` const,
+        zero contaminated files touched. Design doc `0110-0005` extended
+        ("B-tree item-count ceiling tier"); README index updated. STILL DEFERRED:
+        cross-page/cross-level tiers, and the SQL surface (still blocked on a
+        clean tree).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

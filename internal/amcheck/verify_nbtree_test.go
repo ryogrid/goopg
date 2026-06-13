@@ -3,6 +3,7 @@ package amcheck
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -154,6 +155,86 @@ func TestVerifyBtreePage_RootLeafClean(t *testing.T) {
 	p := makeDataPage(t, btree.BTLeaf|btree.BTRoot, 0)
 	if rs := VerifyBtreePage(p, 1, "ix"); len(rs) != 0 {
 		t.Fatalf("root+leaf page reported %d, want 0: %+v", len(rs), rs)
+	}
+}
+
+// makeCountPage builds a non-meta B-tree page whose header claims exactly
+// `count` line pointers, by bumping pd_lower to header + count*itemIDSize. The
+// item bodies are NOT materialised — a count above btree.MaxItemsPerPage cannot
+// physically fit, so this is the only way to exercise the item-count ceiling:
+// the on-disk corruption it detects is precisely a pd_lower that claims more
+// line pointers than the page could ever hold. The opaque area is written as a
+// clean leaf-at-0 so the level checks pass first and the count check is reached.
+func makeCountPage(t *testing.T, count int) storage.Page {
+	t.Helper()
+	const itemIDSize = 4
+	p := makeDataPage(t, btree.BTLeaf, 0)
+	storage.MustHeader(p).SetLower(uint16(storage.SizeOfPageHeaderData + count*itemIDSize))
+	got, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		t.Fatalf("makeCountPage self-check PageLinePointerCount: %v", err)
+	}
+	if got != count {
+		t.Fatalf("makeCountPage self-check: line-pointer count = %d, want %d", got, count)
+	}
+	return p
+}
+
+// MaxItemsPerPage is derived from goopg's per-item footprint, not PG's; assert
+// the exact value so a layout change (itemPrefixSize / line-pointer size) trips
+// this test rather than silently shifting the ceiling.
+func TestBtreeMaxItemsPerPageValue(t *testing.T) {
+	const want = (storage.BlockSize - storage.SizeOfPageHeaderData) / (4 + 8) // 8168/12 = 680
+	if btree.MaxItemsPerPage != want {
+		t.Fatalf("btree.MaxItemsPerPage = %d, want %d", btree.MaxItemsPerPage, want)
+	}
+}
+
+// A page at exactly the ceiling is clean; one item over the ceiling is a finding.
+func TestVerifyBtreePage_ItemCountAtCeilingClean(t *testing.T) {
+	p := makeCountPage(t, btree.MaxItemsPerPage)
+	if rs := VerifyBtreePage(p, 3, "ix"); len(rs) != 0 {
+		t.Fatalf("page at ceiling reported %d, want 0: %+v", len(rs), rs)
+	}
+}
+
+func TestVerifyBtreePage_ItemCountExceedsCeiling(t *testing.T) {
+	p := makeCountPage(t, btree.MaxItemsPerPage+1)
+	rs := VerifyBtreePage(p, 3, "ix")
+	if len(rs) != 1 {
+		t.Fatalf("over-ceiling page reported %d, want 1: %+v", len(rs), rs)
+	}
+	want := `Number of items on block 3 of index "ix" exceeds MaxIndexTuplesPerPage (680)`
+	if rs[0].Msg != want {
+		t.Fatalf("msg = %q, want %q", rs[0].Msg, want)
+	}
+	if rs[0].Block != 3 {
+		t.Fatalf("block = %d, want 3", rs[0].Block)
+	}
+}
+
+// A corrupt pd_lower whose line-pointer area is not an itemIDSize multiple is
+// surfaced as a damaged-page finding rather than a Go error or a panic.
+func TestVerifyBtreePage_DamagedLinePointerArea(t *testing.T) {
+	p := makeDataPage(t, btree.BTLeaf, 0)
+	storage.MustHeader(p).SetLower(storage.SizeOfPageHeaderData + 3) // not a multiple of 4
+	rs := VerifyBtreePage(p, 6, "ix")
+	if len(rs) != 1 {
+		t.Fatalf("damaged line-pointer area reported %d, want 1: %+v", len(rs), rs)
+	}
+	if !strings.Contains(rs[0].Msg, `index "ix" has a damaged page at block 6`) {
+		t.Fatalf("msg = %q, want damaged-page finding", rs[0].Msg)
+	}
+}
+
+// The deleted-page early return is reached before the count check, so a deleted
+// page with an over-ceiling pd_lower is still suppressed (matches the existing
+// level-check suppression).
+func TestVerifyBtreePage_DeletedPageSuppressesItemCount(t *testing.T) {
+	p := makeDataPage(t, btree.BTLeaf|btree.BTDeleted, 0)
+	storage.MustHeader(p).SetLower(uint16(storage.SizeOfPageHeaderData + (btree.MaxItemsPerPage+5)*4))
+	if rs := VerifyBtreePage(p, 8, "ix"); len(rs) != 0 {
+		t.Fatalf("deleted page reported %d, want 0: %+v", len(rs), rs)
 	}
 }
 

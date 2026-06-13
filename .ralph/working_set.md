@@ -1,51 +1,55 @@
 Task: M0110-0003 (pg_amcheck) — amcheck verify engines in `internal/amcheck`.
-Engine-first/wire-later. Loop #56 added the **second B-tree tier**
-(`VerifyBtreeItemOrder`), the page-local item-order + high-key invariants. SQL
-surface still deferred (needs a CLEAN tree).
+Engine-first/wire-later. Loop #57 added the **third B-tree tier**: the
+item-count ceiling (palloc_btree_page's maxoffset>MaxIndexTuplesPerPage).
+SQL surface still deferred (needs a CLEAN tree).
 
-Landed loop #56 (all NEW code in new funcs + purely-additive exports):
-  - internal/amcheck/verify_nbtree.go: new `VerifyBtreeItemOrder(p, blkno,
-    indexName)` ports bt_target_page_check's two page-local key invariants
-    (verify_nbtree.c:1565-1642): item-order (strictly ascending →
-    `item order invariant violated for index "%s"`) and high-key (leaf `<=`,
-    internal `<` → `high key invariant violated for index "%s"`). Verbatim msgs,
-    returns 0/1 finding (first violation conclusive), meta+deleted pages → nil.
-  - internal/access/btree/btree.go (UNCONTAMINATED, additive): new exported
-    `PageItemKeys(p) ([][]byte, error)` — one separator key per physical line
-    pointer, collapsing posting-list items to their single shared key. Single
-    source of truth for the inline item layout (v3→v4 drift hazard).
-  - internal/amcheck/verify_nbtree_test.go: 10 tests + new `makeItemsPage`
-    builder (sets pd_special/pd_upper before adding items so item data doesn't
-    clobber the opaque; self-checks via real readers).
-  - internal/access/btree/posting_test.go: `TestPageItemKeys` (regular + 3-TID
-    posting → 2 keys).
-  - docs/design/0110-0005 + README index extended; fix_plan loop-#56 PROGRESS +
-    deferral_ledger line.
+Landed loop #57 (all NEW amcheck code + ONE additive btree.go const):
+  - internal/access/btree/btree.go: new exported `MaxItemsPerPage` const
+    (=680), beside `itemPrefixSize`. goopg analogue of PG's
+    MaxIndexTuplesPerPage = (BlockSize - SizeOfPageHeaderData) / (4 + itemPrefixSize)
+    = 8168/12. goopg items are UNALIGNED (pageHasSpaceFor reserves exactly
+    itemIDSize+itemPrefixSize+len(key)), so no MAXALIGN term. Single source of
+    truth — engine never re-derives the inline item layout.
+  - internal/amcheck/verify_nbtree.go: `VerifyBtreePage` now does the
+    item-count check AFTER the leaf/internal level checks (upstream order,
+    verify_nbtree.c:3396-3402). count>MaxItemsPerPage → verbatim msg
+    `Number of items on block %u of index "%s" exceeds MaxIndexTuplesPerPage (%u)`
+    (goopg constant). Damaged pd_lower (PageLinePointerCount error) → damaged-page
+    finding, no panic. File-header comment updated (ceiling no longer "deferred").
+  - internal/amcheck/verify_nbtree_test.go: new `makeCountPage(t,count)` builder
+    (bumps pd_lower to claim count without materialising bodies — a count > ceiling
+    can't physically fit, so corrupt pd_lower is the only way it arises) + `strings`
+    import. 5 tests: TestBtreeMaxItemsPerPageValue (pins 680), at-ceiling clean,
+    over-ceiling exact msg, damaged pd_lower, deleted-page suppression.
+  - docs/design/0110-0005 ("B-tree item-count ceiling tier") + README index;
+    fix_plan loop-#57 PROGRESS + deferral_ledger line.
 
-KEY divergences handled (faithful port): high key in opaque area (no P_HIKEY slot
-to skip; rightmost = Next==InvalidBlockNumber); internal leftmost neg-infinity
-downlink has EMPTY key → strictly less than all → satisfies both invariants with
-no special case; CompareKeys = bytes.Compare on order-preserving keys.
+KEY divergences handled: bound ignores opaque area (like upstream, extra
+headroom → no false positives); deleted pages SKIP the count check (goopg returns
+earlier; deleted pages hold no live items; avoids reading type-punned fields)
+whereas upstream checks them — documented in-code.
 
-Gates run: go test ./internal/amcheck (PASS), go test ./internal/access/btree
-(PASS), verbose run of all 11 new tests PASS, gofmt -l my files clean, go vet
-clean, go build ./internal/amcheck ./internal/access/btree clean,
+Gates run: go test ./internal/amcheck (PASS) + ./internal/access/btree (PASS),
+verbose run of all 5 new tests PASS, gofmt clean, go vet clean, go build clean,
 make ralph-state-guard (run before status block).
 
 Next step (DEFERRED — needs CLEAN tree): the SQL surface — CREATE EXTENSION
 amcheck + verify_heapam(regclass) SRF + bt_index_check(regclass) wired on
 VerifyHeapPageWithRel / VerifyBtreePage / VerifyBtreeItemOrder — then port
-002_nonesuch.pl. Next NEW-file btree tier while tree stays dirty: the goopg
-MaxIndexTuplesPerPage-equivalent item-count ceiling (needs goopg tuple-size
-accounting).
+002_nonesuch.pl. Next NEW-file btree tier while tree stays dirty: the
+cross-page/cross-level tiers (downlink/sibling-link agreement, root-descent via
+bt_index_parent_check) — these need multi-page traversal state, so they want a
+small relation-walking driver (can take an already-opened page source as a
+param to stay new-file/additive and defer the catalog lookup to the SQL surface).
 
-⚠ TREE NOTE (STILL TRUE, STATIC since 2026-06-13 14:28 — now >1 day): a SEPARATE
+⚠ TREE NOTE (STILL TRUE, STATIC since 2026-06-13 14:28 — now >14h): a SEPARATE
 manual session's uncommitted gen-column WIP spans
 internal/{executor,planner,catalog,analyzer,parser,mvcc}/ + server/dispatch.go +
 cmd/goopg/main_test.go + untracked gen_override test files + postgres/ +
 validate-ralph-state. NOT ralph's — stage only your own files (git add <paths>),
-never `git add -A`. Static mtime suggests it may be abandoned; if it blocks for
-many more loops, consider surfacing to the user for a stash/commit decision.
+never `git add -A`. Static mtime suggests it may be abandoned; with the engine
+now quite complete and only the SQL surface (gated on this) + cross-page tiers
+left, consider surfacing to the user for a stash/commit decision next loop.
 
 Other OPEN tasks (all blocked on big features): M0095-0003 (WAL streaming -X
 stream), M0110-0001 (pg_dump 002+ catalog parity), M0110-0002 (pg_waldump 002 /
