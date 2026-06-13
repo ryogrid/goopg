@@ -1,37 +1,44 @@
-Task: M0110-0003 — Port pg_amcheck TAP tests. Landed the CLI-only tier of
-001_basic.pl; server-dependent tests (002–005) deferred under AC-002.
+Task: M0110-0004 — Port pg_resetwal TAP tests. Landed the CLI-decidable tier
+of 001_basic.pl; server-dependent tier + 002_corrupted.pl deferred under RW-002.
 (idle — nothing in flight on this task once committed.)
 
 Files (this loop):
-- internal/testport/pgamcheck_port_test.go (NEW) — TestPort_PgAmcheck001Basic +
-  runToolWithLib helper (sets LD_LIBRARY_PATH=postgres/local_install/lib).
-  Reuses clientToolBin + repoRoot from the same package.
-- docs/test-port/postgres-oracle-port-status.csv — AC-001 (port) + AC-002
-  (defer) added below WD-002.
+- internal/testport/pgresetwal_port_test.go (NEW) — TestPort_PgResetwal001Basic.
+  Reuses programHelpOk/programVersionOk/programOptionsHandlingOk/
+  commandFailsContaining/clientToolBin/runTool (no new helper needed).
+- docs/test-port/postgres-oracle-port-status.csv — RW-001 (port) + RW-002
+  (defer) added below AC-002.
 - docs/test-port/postgres-oracle-port-status.md — regenerated.
-- docs/design/0110-0003-pg-amcheck-tap-port.md (NEW) + README index row.
-- .ralph/fix_plan.md (M0110-0003 progress), .ralph/deferral_ledger.md.
+- docs/design/0110-0004-pg-resetwal-tap-port.md (NEW) + README index row.
+- .ralph/fix_plan.md (M0110-0004 progress).
+- .ralph/progress.json — reconciled stale "completed" → "in_progress" (the
+  guard's auto-repair could not match: progress ts was within max-skew and
+  OLDER than status ts, so its only rule — mark status completed — didn't fire;
+  the loop was actively running so in_progress is the correct mid-loop state).
 
 Key facts learned this loop:
-- pg_amcheck/t/001_basic.pl is only 14 lines: program_help_ok /
-  program_version_ok / program_options_handling_ok / done_testing. Pure CLI.
-- WRINKLE vs pg_dump/pg_waldump: bundled pg_amcheck links PQcancelBlocking
-  (PG 17+ libpq cancel API). Run against the host's older libpq.so.5 it dies at
-  startup: "undefined symbol: PQcancelBlocking". Fix = LD_LIBRARY_PATH at
-  postgres/local_install/lib (new runToolWithLib helper; runTool left untouched
-  so pg_dump/pg_waldump ports keep behaviour). util.CommandSpec.Env appends to
-  os.Environ() (later wins), so setting just LD_LIBRARY_PATH is enough.
-- Test-only port (internal/testport, drives upstream binary); no
-  executor/planner/catalog code touched → TPC-H spotcheck gate not applicable.
+- pg_resetwal/t/001_basic.pl is 247 lines, two tiers. CLI tier = help/version/
+  options + too-many-args/no-data-dir/nonexistent-dir + option-arg validation
+  (-c/-e/-l/-m/-o/-O/-u/-x/--wal-segsize/--char-signedness).
+- ORDERING (pg_resetwal.c main): --help/--version short-circuit; then getopt_long
+  loop emits every option-arg error and exit(1) INSIDE the loop; then
+  too-many-args / no-data-dir checks; only THEN GetDataDirectoryCreatePerm /
+  chdir / read_controlfile touch the dir. So all CLI-tier cases are decided
+  before any directory access → pass a nonexistent dir, stays server-free.
+- The two upstream cases that SUCCEED (`-m 0,10`, control-override block) need a
+  real initialized dir → server tier, deferred.
+- pg_resetwal does NOT link libpq → plain runTool (no LD_LIBRARY_PATH shim,
+  unlike pg_amcheck's runToolWithLib in M0110-0003).
+- Test-only port (drives upstream binary); no executor/planner/catalog code
+  touched → TPC-H spotcheck gate not applicable.
 
-Next step: pick next topmost fix_plan item. Candidates still isolated to
-testport: M0110-0004 (pg_resetwal 001_basic — 247 lines, control-file parse,
-depends on M0106 pg_control byte-compat; check whether a CLI-only tier exists).
-Or M0110-0001/0002 server-tier resume once catalog/AM parity lands. Note
-M0102-0009 (sync_remote_apply 45s timeout) and M0102-0010 (more initdb options)
-are also open but heavier.
+Next step: commit + push. Then pick next topmost fix_plan item. Remaining M0110:
+M0110-0001/0002/0003 server tiers (need catalog/AM parity), M0110-0004 RW-002
+server tier (needs pg_control round-trip M0106 + SLRU layout parity). Also open:
+M0095-0003 (basebackup streaming), M0102-0009 (sync_remote_apply 45s),
+M0102-0010 (more initdb options — encoding/locale/waldir/checksums/auth/...).
 
 Gates run: gofmt clean; go vet ./internal/testport PASS;
-go test -run TestPort_PgAmcheck001Basic ./internal/testport PASS;
-go build ./... PASS; gen-oracle-port-status regenerated OK.
-Pending: make ralph-state-guard (run immediately before status block).
+go test -run TestPort_PgResetwal001Basic ./internal/testport PASS;
+go build ./... PASS; gen-oracle-port-status regenerated OK;
+make ralph-state-guard PASS (after progress.json reconcile).

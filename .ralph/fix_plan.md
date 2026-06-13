@@ -651,11 +651,18 @@ Porting validates goopg's pg_control and WAL segment layout on disk.
       - Target tests:
         | Test | Status | Rationale |
         |------|--------|-----------|
-        | `postgres/src/bin/pg_resetwal/t/001_basic.pl` | UNIMPLEMENTED | Requires pg_resetwal binary; validates control-file reading and WAL reset. |
-        | `postgres/src/bin/pg_resetwal/t/002_corrupted.pl` | UNIMPLEMENTED | Simulates corrupted WAL and verifies pg_resetwal recovery behaviour. |
-      - Action: depends on pg_control byte-level compatibility (M0106).
-        Port 001 to validate goopg's control file can be parsed by upstream
-        pg_resetwal.
+        | `postgres/src/bin/pg_resetwal/t/001_basic.pl` | **PORTED 2026-06-13 (CLI tier)** | `TestPort_PgResetwal001Basic` (`internal/testport/pgresetwal_port_test.go`). The CLI-decidable tier (help/version/options + too-many-args/no-data-directory/nonexistent-directory + the option-argument validation cases for `-c`/`-e`/`-l`/`-m`/`-o`/`-O`/`-u`/`-x`/`--wal-segsize`/`--char-signedness`) — all decided inside pg_resetwal's `getopt_long` loop (or the immediately-following arg-count/DataDir checks) before `GetDataDirectoryCreatePerm`/`read_controlfile` touch the data directory, so the port passes a nonexistent dir and needs no server. pg_resetwal does not link libpq → plain `runTool`. CSV row RW-001 → port. Design: `docs/design/0110-0004-pg-resetwal-tap-port.md`. |
+        | `postgres/src/bin/pg_resetwal/t/002_corrupted.pl` | UNIMPLEMENTED (deferred RW-002) | Simulates corrupted WAL and verifies pg_resetwal recovery behaviour. |
+      - Action: 001_basic CLI tier ported (loop #19). The server-dependent tier
+        of 001_basic.pl (init/start/--force reset round-trips + the
+        SLRU-derived `--commit-timestamp-ids`/`--multixact-ids`/
+        `--multixact-offset`/`--oldest-transaction-id`/`--next-transaction-id`
+        overrides) and 002_corrupted.pl are deferred under CSV row RW-002,
+        blocked on pg_control byte-level read/write round-trip compatibility
+        (M0106) + on-disk SLRU-segment-layout parity. Resume = promote RW-002
+        once goopg's pg_control round-trips through upstream pg_resetwal and the
+        pg_commit_ts/pg_multixact/pg_xact SLRU directories expose the expected
+        segment-file layout.
 
 ### pg_verifybackup (10 tests — excluded → no action)
 
