@@ -985,6 +985,27 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         incl. two false-positive guards). Design doc `0110-0005` extended; all in
         new files (`internal/amcheck/`), zero contaminated files touched. The SQL
         surface remains the AC-002-promoting slice, still blocked on a clean tree.
+      - **PROGRESS 2026-06-14 (loop #53):** extended the engine with the
+        **page-structural subset of the HOT-chain (update-chain) tier** — the
+        part of `verify_heapam.c`'s second/third loops decidable from page bytes +
+        the page's own block number, no clog. `VerifyHeapPage` now takes `blkno`
+        and builds `successor[]`/`predecessor[]` to mirror upstream: a redirect
+        must target a heap-only tuple (`redirected line pointer points to a
+        non-heap-only tuple`); HOT chains must not intersect (`redirect line
+        pointer points to offset N, but offset M also points there` +
+        `tuple points to new version at offset N, but offset M also points
+        there`); a link's HOT-updated/heap-only flags must agree
+        (`non-heap-only update produced a heap-only tuple` + `heap-only update
+        produced a non-heap only tuple`) — all upstream-verbatim. goopg
+        divergence handled: `t_ctid.block` is a plain `uint32` at `off+12`
+        (not PG's `bi_hi`/`bi_lo` split), and the HOT/heap-only bits live in
+        `t_infomask`. Normal links form only on `curr_xmax==next_xmin && !=0`
+        (non-multi update xid). 23 unit tests PASS (8 new: 5 corruption + 3
+        false-positive guards incl. cross-block CTID). Design doc `0110-0005`
+        extended; all in new files (`internal/amcheck/`), zero contaminated
+        files touched. DEFERRED: the clog-dependent HOT-chain checks (xmin
+        commit-status across a link + root-of-chain-but-heap-only) and the SQL
+        surface (still the AC-002-promoting slice, still blocked on a clean tree).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

@@ -45,7 +45,7 @@ func addCleanTuple(t *testing.T, p storage.Page, dataLen int) uint16 {
 
 func TestVerifyHeapPage_NewPageClean(t *testing.T) {
 	p := make(storage.Page, storage.BlockSize) // all zero == new
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestVerifyHeapPage_NewPageClean(t *testing.T) {
 
 func TestVerifyHeapPage_EmptyInitPageClean(t *testing.T) {
 	p := newPage(t)
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestVerifyHeapPage_CleanTuplesNoReports(t *testing.T) {
 		t.Fatalf("PageAddHeapTuple(withNulls): %v", err)
 	}
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestVerifyHeapPage_UnalignedOffset(t *testing.T) {
 	// Nudge the offset by 1 so it is no longer 8-byte aligned.
 	setItemID(p, slot, item.Offset+1, storage.ItemIDNormal, item.Length)
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestVerifyHeapPage_LengthBelowMinimum(t *testing.T) {
 	item, _ := storage.PageGetItemID(p, slot)
 	setItemID(p, slot, item.Offset, storage.ItemIDNormal, 16) // < 24
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestVerifyHeapPage_EndsBeyondPage(t *testing.T) {
 	off := uint16(storage.BlockSize - 16) // 8176, 8-byte aligned
 	setItemID(p, slot, off, storage.ItemIDNormal, 32)
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestVerifyHeapPage_HoffBeyondLength(t *testing.T) {
 	setItemID(p, slot, item.Offset, storage.ItemIDNormal, 24)
 	p[int(item.Offset)+22] = 32 // t_hoff = 32 > lp_len 24
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestVerifyHeapPage_HoffMismatchNoNulls(t *testing.T) {
 	item, _ := storage.PageGetItemID(p, slot)
 	p[int(item.Offset)+22] = 32 // corrupt t_hoff to 32 (still <= lp_len)
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestVerifyHeapPage_MultixactMarkedCommitted(t *testing.T) {
 	// HEAP_XMAX_COMMITTED | HEAP_XMAX_IS_MULTI — an impossible combination.
 	setInfomask(t, p, slot, storage.HeapXmaxCommitted|heapXmaxIsMulti)
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestVerifyHeapPage_HotUpdatedXmaxZero(t *testing.T) {
 	setInfomask(t, p, slot, storage.HeapHotUpdated|storage.HeapXminCommitted)
 	setXmax(t, p, slot, 0)
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestVerifyHeapPage_HealthyHotUpdatedNoReport(t *testing.T) {
 	setInfomask(t, p, slot, storage.HeapHotUpdated|storage.HeapXminCommitted)
 	setXmax(t, p, slot, 4242) // valid successor xmax
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestVerifyHeapPage_HotBitWithXmaxInvalidNoReport(t *testing.T) {
 	setInfomask(t, p, slot, storage.HeapHotUpdated|storage.HeapXmaxInvalid|storage.HeapXminCommitted)
 	setXmax(t, p, slot, 0)
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestVerifyHeapPage_RedirectOutOfRange(t *testing.T) {
 	// Turn it into a redirect to offset 99, which exceeds maxoff (1).
 	setItemID(p, slot, 99, storage.ItemIDRedirect, 0)
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestVerifyHeapPage_RedirectToUnused(t *testing.T) {
 	setItemID(p, s1, s2, storage.ItemIDRedirect, 0)
 	setItemID(p, s2, 0, storage.ItemIDUnused, 0)
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestVerifyHeapPage_RedirectToRedirect(t *testing.T) {
 	setItemID(p, s1, s2, storage.ItemIDRedirect, 0)
 	setItemID(p, s2, 1, storage.ItemIDRedirect, 0)
 
-	reports, err := VerifyHeapPage(p)
+	reports, err := VerifyHeapPage(p, 0)
 	if err != nil {
 		t.Fatalf("VerifyHeapPage: %v", err)
 	}
@@ -313,6 +313,184 @@ func TestVerifyHeapPage_RedirectToRedirect(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("missing expected s1 redirect-to-redirect report: %+v", reports)
+	}
+}
+
+// setCTID overwrites a tuple's t_ctid (block at off+12..16 as a uint32, offset
+// at off+16..18), making it point at a same-page successor for HOT-chain tests.
+func setCTID(t *testing.T, p storage.Page, slot uint16, block uint32, offset uint16) {
+	t.Helper()
+	item, err := storage.PageGetItemID(p, slot)
+	if err != nil {
+		t.Fatalf("PageGetItemID(%d): %v", slot, err)
+	}
+	off := int(item.Offset)
+	binary.LittleEndian.PutUint32(p[off+12:off+16], block)
+	binary.LittleEndian.PutUint16(p[off+16:off+18], offset)
+}
+
+// setXmin overwrites a tuple's raw t_xmin (off+0..4).
+func setXmin(t *testing.T, p storage.Page, slot uint16, xmin uint32) {
+	t.Helper()
+	item, err := storage.PageGetItemID(p, slot)
+	if err != nil {
+		t.Fatalf("PageGetItemID(%d): %v", slot, err)
+	}
+	binary.LittleEndian.PutUint32(p[int(item.Offset):int(item.Offset)+4], xmin)
+}
+
+// makeRedirect converts the 1-based slot into an LP_REDIRECT pointing at target.
+func makeRedirect(p storage.Page, slot, target uint16) {
+	setItemID(p, slot, target, storage.ItemIDRedirect, 0)
+}
+
+// A healthy same-page HOT chain (HOT-updated root -> heap-only successor, linked
+// by xmax==xmin) must NOT be flagged — false-positive guard for the chain pass.
+func TestVerifyHeapPage_HotChainHealthyNoReport(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16)
+	s2 := addCleanTuple(t, p, 16)
+	setInfomask(t, p, s1, storage.HeapHotUpdated|storage.HeapXminCommitted)
+	setXmax(t, p, s1, 555)
+	setCTID(t, p, s1, 0, s2)
+	setInfomask(t, p, s2, storage.HeapOnlyTuple|storage.HeapXminCommitted)
+	setXmin(t, p, s2, 555)
+
+	reports, err := VerifyHeapPage(p, 0)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("healthy HOT chain reported %d corruptions: %+v", len(reports), reports)
+	}
+}
+
+func TestVerifyHeapPage_NonHeapOnlyUpdateProducedHeapOnly(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16) // not HOT-updated (infomask 0)
+	s2 := addCleanTuple(t, p, 16)
+	setXmax(t, p, s1, 777)
+	setCTID(t, p, s1, 0, s2)
+	setInfomask(t, p, s2, storage.HeapOnlyTuple) // successor IS heap-only
+	setXmin(t, p, s2, 777)
+
+	reports, err := VerifyHeapPage(p, 0)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	wantReport(t, reports, s1,
+		"non-heap-only update produced a heap-only tuple at offset 2")
+}
+
+func TestVerifyHeapPage_HeapOnlyUpdateProducedNonHeapOnly(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16)
+	s2 := addCleanTuple(t, p, 16) // NOT heap-only
+	setInfomask(t, p, s1, storage.HeapHotUpdated|storage.HeapXminCommitted)
+	setXmax(t, p, s1, 888)
+	setCTID(t, p, s1, 0, s2)
+	setXmin(t, p, s2, 888)
+
+	reports, err := VerifyHeapPage(p, 0)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	wantReport(t, reports, s1,
+		"heap-only update produced a non-heap only tuple at offset 2")
+}
+
+func TestVerifyHeapPage_HotChainIntersectionNormal(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16)
+	s2 := addCleanTuple(t, p, 16)
+	s3 := addCleanTuple(t, p, 16)
+	// Both s1 and s2 link to s3 (xmax==s3.xmin); both HOT-updated, s3 heap-only.
+	for _, s := range []uint16{s1, s2} {
+		setInfomask(t, p, s, storage.HeapHotUpdated|storage.HeapXminCommitted)
+		setXmax(t, p, s, 999)
+		setCTID(t, p, s, 0, s3)
+	}
+	setInfomask(t, p, s3, storage.HeapOnlyTuple|storage.HeapXminCommitted)
+	setXmin(t, p, s3, 999)
+
+	reports, err := VerifyHeapPage(p, 0)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	wantReport(t, reports, s2,
+		"tuple points to new version at offset 3, but offset 1 also points there")
+}
+
+func TestVerifyHeapPage_RedirectToNonHeapOnly(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16)
+	s2 := addCleanTuple(t, p, 16) // valid normal target, NOT heap-only
+	makeRedirect(p, s1, s2)
+
+	reports, err := VerifyHeapPage(p, 0)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	wantReport(t, reports, s1,
+		"redirected line pointer points to a non-heap-only tuple at offset 2")
+}
+
+func TestVerifyHeapPage_RedirectChainIntersection(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16)
+	s2 := addCleanTuple(t, p, 16)
+	s3 := addCleanTuple(t, p, 16)
+	// s1 (normal, HOT-updated) links to s3; s2 (redirect) also points at s3.
+	setInfomask(t, p, s1, storage.HeapHotUpdated|storage.HeapXminCommitted)
+	setXmax(t, p, s1, 1234)
+	setCTID(t, p, s1, 0, s3)
+	makeRedirect(p, s2, s3)
+	setInfomask(t, p, s3, storage.HeapOnlyTuple|storage.HeapXminCommitted)
+	setXmin(t, p, s3, 1234)
+
+	reports, err := VerifyHeapPage(p, 0)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	// s1 establishes predecessor[3]=1 first; the s2 redirect then intersects.
+	wantReport(t, reports, s2,
+		"redirect line pointer points to offset 3, but offset 1 also points there")
+}
+
+// A healthy redirect -> heap-only successor must NOT be flagged.
+func TestVerifyHeapPage_RedirectToHeapOnlyNoReport(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16)
+	s2 := addCleanTuple(t, p, 16)
+	makeRedirect(p, s1, s2)
+	setInfomask(t, p, s2, storage.HeapOnlyTuple|storage.HeapXminCommitted)
+
+	reports, err := VerifyHeapPage(p, 0)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("healthy redirect->heap-only reported %d corruptions: %+v", len(reports), reports)
+	}
+}
+
+// A tuple whose CTID points to a different block is not a same-page successor,
+// so it must not start an in-page chain (no false intersection/flag).
+func TestVerifyHeapPage_CtidOnOtherBlockNoChain(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16)
+	s2 := addCleanTuple(t, p, 16)
+	setInfomask(t, p, s1, storage.HeapHotUpdated|storage.HeapXminCommitted)
+	setXmax(t, p, s1, 4321)
+	setCTID(t, p, s1, 7, s2) // successor on block 7, not this page (block 0)
+	setXmin(t, p, s2, 4321)
+
+	reports, err := VerifyHeapPage(p, 0)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("cross-block CTID reported %d corruptions: %+v", len(reports), reports)
 	}
 }
 

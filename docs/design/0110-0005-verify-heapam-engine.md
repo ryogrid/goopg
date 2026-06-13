@@ -117,10 +117,45 @@ only, but not the result of an update" is **deferred**: goopg never sets
 goopg HOT successor tuple. Resume point: port once goopg stamps `HEAP_UPDATED`
 on update-produced tuples.
 
+### Page-structural HOT-chain (update-chain) tier (added loop #53)
+
+The HOT-chain tier (`verify_heapam.c`'s second and third loops over the
+`successor`/`predecessor` arrays) splits into a page-structural subset — links
+and flag agreement decidable from the page bytes plus the page's own block
+number — and a clog-dependent subset (xmin commit-status across a link). The
+page-structural subset lands in this engine:
+
+- Build `successor[]` in the first pass: a redirect's target offset, or a normal
+  tuple's same-page CTID successor (`t_ctid.block == blkno && offset != self &&
+  in range`). goopg stores `t_ctid.block` as a plain `uint32` at byte `off+12`
+  (not upstream's `bi_hi`/`bi_lo` `BlockIdData` split) and the offset at
+  `off+16`; the engine therefore reads it from goopg's positions. This is why
+  `VerifyHeapPage` now takes the page's `blkno` — without it a same-page CTID
+  successor cannot be recognised.
+- `redirected line pointer points to a non-heap-only tuple at offset N`
+  (`verify_heapam.c:677`) — a redirect must target a HOT (heap-only) tuple.
+- `redirect line pointer points to offset N, but offset M also points there`
+  (`:686`) and `tuple points to new version at offset N, but offset M also
+  points there` (`:720`) — HOT chains must not intersect; `predecessor[]`
+  detects a second pointer reaching the same successor.
+- `non-heap-only update produced a heap-only tuple at offset N` (`:743`) and
+  `heap-only update produced a non-heap only tuple at offset N` (`:751`) — a
+  link's HOT-updated flag (read as the **raw** `t_infomask` HOT bit, per goopg's
+  layout and matching upstream's deliberate raw-bit use here) must agree with
+  the successor's heap-only flag.
+
+A normal→normal link is only formed when `curr_xmax == next_xmin` and
+`curr_xmax != 0` (the non-multi `HeapTupleHeaderGetUpdateXid`); a multi xmax is
+skipped (goopg has no on-disk multixact, so it is injected-only and its update
+xid is not page-resolvable). Healthy same-page chains and cross-block CTIDs are
+covered by dedicated false-positive guards.
+
 ### Deferred (recorded, with resume points)
 
-- HOT-chain `successor`/`predecessor` consistency (tier 2) — needs goopg's HOT-bit
-  convention reconciled against upstream message wording.
+- HOT-chain **clog-dependent** checks — the xmin commit-status consistency across
+  a link (`verify_heapam.c:768`, `:790`) and the "root of chain but heap-only"
+  check (`:828`) both need per-tuple `XID_COMMITTED`/`XID_ABORTED`/
+  `XID_IN_PROGRESS` status, i.e. clog. Resume with the tier-3 clog wiring.
 - `check_tuple_header`'s heap-only-but-not-updated invariant — deferred until
   goopg stamps `HEAP_UPDATED` (see above).
 - `check_tuple_visibility` xmin/xmax bounds + multixact (tier 3) — needs clog.
@@ -144,12 +179,12 @@ type Report struct {
     Msg    string
 }
 
-// VerifyHeapPage runs the page-structural (tier-1) checks of upstream
-// verify_heapam against a single 8 KiB heap page. relNatts is the relation's
-// attribute count (HeapTupleHeaderGetNatts is validated against the tuple's own
-// natts; relNatts is reserved for the deferred attribute tier and currently
-// unused beyond a sanity ceiling). Returns nil for a clean page.
-func VerifyHeapPage(p storage.Page) ([]Report, error)
+// VerifyHeapPage runs the page-structural checks of upstream verify_heapam
+// against a single 8 KiB heap page. blkno is the page's own block number, used
+// to recognise a tuple's same-page CTID successor for the HOT-chain pass.
+// Returns nil for a clean page; reports are ordered first-pass then
+// HOT-chain-pass, each in ascending offset order (upstream's two-loop order).
+func VerifyHeapPage(p storage.Page, blkno storage.BlockNumber) ([]Report, error)
 ```
 
 The engine takes raw `storage.Page` bytes and is therefore trivially testable
@@ -170,6 +205,11 @@ with hand-built clean and corrupt fixtures — no server, no buffer pool, no clo
 - false-positive guards (must report **no** corruption): a healthy HOT-updated
   tuple (HOT bit set + valid xmax), and a HOT bit set together with
   `HEAP_XMAX_INVALID` and `t_xmax==0` (IsHotUpdated is false, so skipped).
+- HOT-chain tier (added loop #53): each new message asserted via a built chain —
+  redirect-to-non-heap-only, redirect/normal chain intersection,
+  non-heap-only↔heap-only update mismatch; plus false-positive guards for a
+  healthy normal chain, a healthy redirect→heap-only chain, and a cross-block
+  CTID (must not start an in-page chain).
 
 ## Upstream references
 

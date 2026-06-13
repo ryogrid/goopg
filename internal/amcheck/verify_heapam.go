@@ -8,14 +8,20 @@
 // the engine-first rationale.
 //
 // Only the page-structural tier is implemented here: line-pointer bounds and
-// alignment, redirect-target validity, and tuple-header offset/t_hoff
-// consistency, plus the two infomask-only invariants from check_tuple_header
-// (a multixact xmax must not be hint-bit "committed"; a HOT-updated tuple must
-// carry a valid xmax). These are deterministic functions of the raw 8 KiB page
-// bytes and need neither clog, the relation TupleDesc, nor the toast relation.
-// The HOT-chain tier (successor/predecessor consistency) and the
-// MVCC/attribute tier (xmin/xmax bounds vs clog, multixact members, TOAST
-// pointer validation) are deferred; see the design doc.
+// alignment, redirect-target validity, tuple-header offset/t_hoff consistency,
+// the two infomask-only invariants from check_tuple_header (a multixact xmax
+// must not be hint-bit "committed"; a HOT-updated tuple must carry a valid
+// xmax), and the page-structural subset of the HOT-chain (update-chain) tier:
+// a redirect must point at a heap-only tuple, HOT chains must not intersect,
+// and the HOT-updated/heap-only flags of a chain link must agree. These are
+// deterministic functions of the raw 8 KiB page bytes plus the page's own
+// block number (to recognise same-page CTID successors) and need neither
+// clog, the relation TupleDesc, nor the toast relation. The clog-dependent
+// HOT-chain checks (xmin commit-status consistency across a link, and the
+// "root of chain but heap-only" check, both of which require knowing whether
+// each tuple's xmin committed/aborted/in-progress) and the MVCC/attribute
+// tier (xmin/xmax bounds vs clog, multixact members, TOAST pointer validation)
+// are deferred; see the design doc.
 //
 // Infomask layout divergence (goopg vs upstream PG): upstream stores
 // HEAP_HOT_UPDATED / HEAP_ONLY_TUPLE in t_infomask2, but goopg packs them into
@@ -44,6 +50,11 @@ import (
 // firstOffsetNumber mirrors upstream FirstOffsetNumber: line pointers are
 // 1-based (postgres/src/include/storage/off.h).
 const firstOffsetNumber = 1
+
+// invalidOffsetNumber mirrors upstream InvalidOffsetNumber (0): the sentinel
+// for "no such line pointer" used in the successor/predecessor chain arrays
+// (postgres/src/include/storage/off.h).
+const invalidOffsetNumber uint16 = 0
 
 // heapXmaxIsMulti mirrors upstream HEAP_XMAX_IS_MULTI
 // (postgres/src/include/access/htup_details.h, 0x1000): xmax holds a MultiXactId
@@ -76,17 +87,34 @@ func maxAlign(n int) int { return (n + 7) &^ 7 }
 // covering natts attributes (postgres/src/include/access/htup_details.h).
 func bitmapLen(natts int) int { return (natts + 7) / 8 }
 
+// lpEntry caches, per 1-based offset, what the first pass learned about a line
+// pointer so the second (HOT-chain) pass can examine links without re-decoding.
+// valid mirrors upstream's lp_valid[]: the pointer passed basic sanity (a
+// redirect with a valid target, or a normal pointer with sane off/len), so it
+// is safe to dereference. successor mirrors upstream's successor[]: the
+// same-page offset this pointer points at (a redirect's target, or a normal
+// tuple's same-page CTID), or invalidOffsetNumber.
+type lpEntry struct {
+	flags     storage.ItemIDFlags
+	valid     bool
+	lpOff     int // tuple-body offset, for LP_NORMAL
+	successor uint16
+}
+
 // VerifyHeapPage runs the page-structural (tier-1) checks of upstream
-// verify_heapam against a single heap page. It returns one Report per detected
-// structural corruption, in ascending offset order, and nil for a clean (or
-// new/empty) page.
+// verify_heapam against a single heap page. blkno is the page's own block
+// number, needed to recognise a tuple's same-page CTID successor (upstream's
+// nextblkno == ctx.blkno). It returns one Report per detected structural
+// corruption — all first-pass (per-line-pointer) reports in ascending offset
+// order, then all HOT-chain-pass reports in ascending offset order, matching
+// upstream's two-loop structure — and nil for a clean (or new/empty) page.
 //
 // A brand-new (all-zero) page carries no line pointers and is reported clean,
 // matching upstream's PageGetMaxOffsetNumber == 0 short-circuit. A page whose
 // header is too malformed to even count line pointers yields an error (the
 // engine cannot safely proceed) rather than a Report — upstream relies on the
 // page-header check that runs before this loop.
-func VerifyHeapPage(p storage.Page) ([]Report, error) {
+func VerifyHeapPage(p storage.Page, blkno storage.BlockNumber) ([]Report, error) {
 	if len(p) != storage.BlockSize {
 		return nil, fmt.Errorf("amcheck: page is %d bytes, want %d", len(p), storage.BlockSize)
 	}
@@ -104,12 +132,19 @@ func VerifyHeapPage(p storage.Page) ([]Report, error) {
 		reports = append(reports, Report{Offset: off, Msg: msg})
 	}
 
+	// entries is 1-indexed by offset number; index 0 is unused.
+	entries := make([]lpEntry, maxoff+1)
+
+	// First pass: per-line-pointer sanity, mirroring verify_heapam.c's first
+	// loop. Populates entries[].valid and entries[].successor for the second
+	// (HOT-chain) pass.
 	for off := firstOffsetNumber; off <= maxoff; off++ {
 		offnum := uint16(off)
 		item, err := storage.PageGetItemID(p, offnum)
 		if err != nil {
 			return nil, fmt.Errorf("amcheck: reading line pointer %d: %w", offnum, err)
 		}
+		entries[offnum] = lpEntry{flags: item.Flags, successor: invalidOffsetNumber}
 
 		// Skip unused / dead line pointers: they carry no tuple body.
 		if item.Flags == storage.ItemIDUnused || item.Flags == storage.ItemIDDead {
@@ -135,16 +170,21 @@ func VerifyHeapPage(p storage.Page) ([]Report, error) {
 			if err != nil {
 				return nil, fmt.Errorf("amcheck: reading redirect target %d: %w", rd, err)
 			}
-			switch {
-			case rditem.Flags == storage.ItemIDUnused:
+			switch rditem.Flags {
+			case storage.ItemIDUnused:
 				report(offnum, fmt.Sprintf(
 					"redirected line pointer points to an unused item at offset %d", rd))
-			case rditem.Flags == storage.ItemIDDead:
+			case storage.ItemIDDead:
 				report(offnum, fmt.Sprintf(
 					"redirected line pointer points to a dead item at offset %d", rd))
-			case rditem.Flags == storage.ItemIDRedirect:
+			case storage.ItemIDRedirect:
 				report(offnum, fmt.Sprintf(
 					"redirected line pointer points to another redirected line pointer at offset %d", rd))
+			default:
+				// Valid redirect to an LP_NORMAL target: record it for the
+				// HOT-chain pass.
+				entries[offnum].valid = true
+				entries[offnum].successor = rd
 			}
 			continue
 		}
@@ -172,10 +212,123 @@ func VerifyHeapPage(p storage.Page) ([]Report, error) {
 		}
 
 		// Tuple header is now safe to examine.
+		entries[offnum].valid = true
+		entries[offnum].lpOff = lpOff
 		checkTupleHeader(p, lpOff, lpLen, offnum, report)
+
+		// If this tuple's CTID points to another tuple on the same page,
+		// record that tuple as the successor (verify_heapam.c first loop).
+		nextblk := storage.BlockNumber(binary.LittleEndian.Uint32(p[lpOff+12 : lpOff+16]))
+		nextoff := binary.LittleEndian.Uint16(p[lpOff+16 : lpOff+18])
+		if nextblk == blkno && nextoff != offnum &&
+			nextoff >= firstOffsetNumber && int(nextoff) <= maxoff {
+			entries[offnum].successor = nextoff
+		}
 	}
 
+	checkUpdateChains(p, maxoff, entries, report)
+
 	return reports, nil
+}
+
+// checkUpdateChains runs the page-structural subset of verify_heapam.c's HOT
+// (update) chain validation: a redirect must point at a heap-only tuple, HOT
+// chains must not intersect (two pointers reaching the same successor), and a
+// chain link's HOT-updated/heap-only flags must agree. The clog-dependent
+// checks (xmin commit-status consistency across a link and the "root of chain
+// but heap-only" check) are deferred — they require per-tuple commit status
+// (XID_COMMITTED / XID_ABORTED / XID_IN_PROGRESS) that the page bytes alone
+// cannot supply.
+//
+// predecessor[off] mirrors upstream's predecessor[]: the offset whose link
+// established off as a chain successor; a second pointer reaching off is an
+// intersection. HOT-updated is read as the raw t_infomask bit (goopg's
+// position — see the package doc), matching upstream's deliberate use of the
+// raw bit here rather than HeapTupleHeaderIsHotUpdated.
+func checkUpdateChains(p storage.Page, maxoff int, entries []lpEntry, report func(uint16, string)) {
+	predecessor := make([]uint16, maxoff+1)
+
+	for off := firstOffsetNumber; off <= maxoff; off++ {
+		offnum := uint16(off)
+		nextoff := entries[offnum].successor
+		// No successor, or the successor isn't a dereferenceable line pointer.
+		if nextoff == invalidOffsetNumber || !entries[nextoff].valid {
+			continue
+		}
+
+		// Current pointer is a redirect: its target must be a heap-only tuple,
+		// and chains must not intersect.
+		if entries[offnum].flags == storage.ItemIDRedirect {
+			// The redirect target was validated LP_NORMAL in the first pass.
+			if !isHeapOnly(p, entries[nextoff].lpOff) {
+				report(offnum, fmt.Sprintf(
+					"redirected line pointer points to a non-heap-only tuple at offset %d", nextoff))
+			}
+			if predecessor[nextoff] != invalidOffsetNumber {
+				report(offnum, fmt.Sprintf(
+					"redirect line pointer points to offset %d, but offset %d also points there",
+					nextoff, predecessor[nextoff]))
+				continue
+			}
+			predecessor[nextoff] = offnum
+			continue
+		}
+
+		// Current pointer is LP_NORMAL. A redirect successor cannot be a chain
+		// link target here (upstream gives up); only a normal successor whose
+		// xmin matches this tuple's update-xmax forms a link.
+		if entries[nextoff].flags == storage.ItemIDRedirect {
+			continue
+		}
+		currOff := entries[offnum].lpOff
+		nextOff := entries[nextoff].lpOff
+
+		// curr_xmax = HeapTupleHeaderGetUpdateXid: for a non-multi xmax this is
+		// the raw xmax. goopg has no on-disk multixact, so a multi xmax can
+		// only be injected corruption whose update xid we cannot resolve
+		// page-structurally — give up on the link (no false chain).
+		currInfomask := readInfomask(p, currOff)
+		if currInfomask&heapXmaxIsMulti != 0 {
+			continue
+		}
+		currXmax := rawXmax(p, currOff)
+		nextXmin := binary.LittleEndian.Uint32(p[nextOff : nextOff+4])
+		if currXmax == 0 || currXmax != nextXmin {
+			continue
+		}
+
+		// Two tuples linked by xmax==xmin: a HOT/update chain edge.
+		if predecessor[nextoff] != invalidOffsetNumber {
+			report(offnum, fmt.Sprintf(
+				"tuple points to new version at offset %d, but offset %d also points there",
+				nextoff, predecessor[nextoff]))
+			continue
+		}
+		predecessor[nextoff] = offnum
+
+		currHotUpdated := currInfomask&storage.HeapHotUpdated != 0
+		nextHeapOnly := isHeapOnly(p, nextOff)
+		if !currHotUpdated && nextHeapOnly {
+			report(offnum, fmt.Sprintf(
+				"non-heap-only update produced a heap-only tuple at offset %d", nextoff))
+		}
+		if currHotUpdated && !nextHeapOnly {
+			report(offnum, fmt.Sprintf(
+				"heap-only update produced a non-heap only tuple at offset %d", nextoff))
+		}
+	}
+}
+
+// readInfomask returns the tuple's t_infomask (off+20..22).
+func readInfomask(p storage.Page, lpOff int) uint16 {
+	return binary.LittleEndian.Uint16(p[lpOff+20 : lpOff+22])
+}
+
+// isHeapOnly mirrors HeapTupleHeaderIsHeapOnly for goopg's layout: the
+// HEAP_ONLY_TUPLE bit lives in t_infomask here (not t_infomask2 — see the
+// package doc).
+func isHeapOnly(p storage.Page, lpOff int) bool {
+	return readInfomask(p, lpOff)&storage.HeapOnlyTuple != 0
 }
 
 // checkTupleHeader mirrors verify_heapam.c:check_tuple_header for the checks
@@ -187,7 +340,12 @@ func VerifyHeapPage(p storage.Page) ([]Report, error) {
 //
 // On-disk tuple header layout (storage/heap.go MarshalBinary):
 //
-//	off+4..8 xmax   off+18..20 t_infomask2   off+20..22 t_infomask   off+22 t_hoff
+//	off+0..4  xmin        off+4..8   xmax
+//	off+12..16 t_ctid.block (uint32)  off+16..18 t_ctid.offset (uint16)
+//	off+18..20 t_infomask2  off+20..22 t_infomask  off+22 t_hoff
+//
+// Note goopg stores t_ctid.block as a plain uint32 at off+12..16, not as
+// upstream's bi_hi/bi_lo BlockIdData split.
 func checkTupleHeader(p storage.Page, lpOff, lpLen int, offnum uint16, report func(uint16, string)) {
 	infomask2 := binary.LittleEndian.Uint16(p[lpOff+18 : lpOff+20])
 	infomask := binary.LittleEndian.Uint16(p[lpOff+20 : lpOff+22])
