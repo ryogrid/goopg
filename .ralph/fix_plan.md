@@ -616,10 +616,11 @@ Porting validates goopg's WAL record format compatibility with upstream.
       - Target tests:
         | Test | Status | Rationale |
         |------|--------|-----------|
-        | `postgres/src/bin/pg_waldump/t/001_basic.pl` | BUG_FIX | goopg WAL format is PG-compatible (M0014, M0101), but edge cases (record alignment, continuation records, cross-segment records) may differ. |
-        | `postgres/src/bin/pg_waldump/t/002_save_fullpage.pl` | UNIMPLEMENTED | `pg_waldump --save-fullpage` requires full-page-image extraction; goopg may not emit FPI in all the same places as PG. |
-      - Action: port 001 first; triage against a fresh goopg WAL segment;
-        fix WAL format gaps discovered.
+        | `postgres/src/bin/pg_waldump/t/001_basic.pl` | **PORTED 2026-06-13 (CLI tier)** | `TestPort_PgWaldump001Basic` (`internal/testport/pgwaldump_port_test.go`). The pure CLI option-handling tier (help/version/options + no-args/too-many-args + invalid `--block`/`--fork`/`--limit`/`--relation`/`--rmgr`/`--start`/`--end` + `--rmgr=list`) — decided by the upstream binary's parser before any WAL file is opened; no server. CSV row WD-001 → port. Design: `docs/design/0110-0002-pg-waldump-tap-port.md`. The server-dependent tier of 001_basic.pl is deferred under WD-002 (needs hash/gin/gist/spgist/brin AMs; WAL-format readability already covered by W-001 `TestPort_WALPgWaldumpCompat`). |
+        | `postgres/src/bin/pg_waldump/t/002_save_fullpage.pl` | UNIMPLEMENTED (deferred WD-002) | `pg_waldump --save-fullpage` requires full-page-image extraction; goopg may not emit FPI in all the same places as PG. |
+      - Action: 001_basic CLI tier ported (loop #17). Resume = promote WD-002
+        when goopg gains the index access methods the server-tier workload
+        needs (hash/gin/gist/spgist/brin) + FPI extraction for 002.
 
 ### pg_amcheck (5 tests — excluded → candidate)
 
