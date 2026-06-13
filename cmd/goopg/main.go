@@ -123,6 +123,12 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	// bind to the same variable; empty means pg_wal lives under -D.
 	walDir := fs.String("X", "", "location for the write-ahead log directory (absolute path)")
 	fs.StringVar(walDir, "waldir", "", "location for the write-ahead log directory (absolute path)")
+	// Fsync control (upstream initdb -N/--no-sync and -S/--sync-only).
+	// Both forms of each option bind to the same variable.
+	noSync := fs.Bool("N", false, "do not wait for changes to be written safely to disk")
+	fs.BoolVar(noSync, "no-sync", false, "do not wait for changes to be written safely to disk")
+	syncOnly := fs.Bool("S", false, "only sync an existing data directory to disk, then exit")
+	fs.BoolVar(syncOnly, "sync-only", false, "only sync an existing data directory to disk, then exit")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -130,11 +136,15 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "goopg init: -D <data-directory> is required")
 		return 2
 	}
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir}); err != nil {
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "goopg init: created data directory at %s\n", *dataDir)
+	if *syncOnly {
+		fmt.Fprintf(stdout, "goopg init: synced data directory at %s\n", *dataDir)
+	} else {
+		fmt.Fprintf(stdout, "goopg init: created data directory at %s\n", *dataDir)
+	}
 	return 0
 }
 

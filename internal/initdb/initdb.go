@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -162,6 +163,22 @@ type Options struct {
 	// empty, pg_wal is a plain subdirectory of DataDir as before.
 	WALDir string
 
+	// NoSync, when true, skips the final recursive fsync of the data
+	// directory that Init otherwise performs before returning, mirroring
+	// upstream initdb's -N/--no-sync. Faster, but the cluster is not
+	// guaranteed durable on disk if the host crashes immediately after
+	// init (initdb.c: do_sync gated on nosync).
+	NoSync bool
+
+	// SyncOnly, when true, makes Init fsync an already-initialized data
+	// directory to disk and return without creating a new cluster,
+	// mirroring upstream initdb's -S/--sync-only (initdb.c:3439). The
+	// DataDir must already exist and be accessible; a missing directory
+	// is rejected (mirrors initdb.c's "could not access directory" via
+	// pg_check_dir <= 0). NoSync is ignored when SyncOnly is set, since
+	// syncing is the entire purpose of the operation.
+	SyncOnly bool
+
 	// Registry, when non-nil, is the server's live GUC registry.
 	// Its values for max_connections, max_worker_processes,
 	// max_wal_senders, max_prepared_transactions,
@@ -221,6 +238,100 @@ func setupWALDir(abs, walDir string) error {
 	return nil
 }
 
+// fsyncDataDir recursively fsyncs every regular file and directory under
+// dataDir so the cluster is durable on disk, mirroring upstream initdb's
+// sync_pgdata with the default FSYNC method (src/common/file_utils.c).
+//
+// The top-level walk ignores symlinks, exactly as sync_pgdata does, so an
+// external WAL directory linked at <dataDir>/pg_wal is fsynced separately
+// by recursing through that symlink. goopg init creates no tablespace
+// symlinks under pg_tblspc, so (unlike upstream) there is no second
+// process_symlinks pass for pg_tblspc.
+func fsyncDataDir(dataDir string) error {
+	if err := walkAndFsync(dataDir, false); err != nil {
+		return err
+	}
+	// If pg_wal is a symlink to an external WAL directory, the walk
+	// above skipped it; recurse through the link to flush its contents.
+	pgWal := filepath.Join(dataDir, "pg_wal")
+	if info, err := os.Lstat(pgWal); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if err := walkAndFsync(pgWal, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// walkAndFsync recursively applies fsync to path and everything beneath it,
+// mirroring upstream initdb's walkdir (src/common/file_utils.c): each regular
+// file and directory is fsynced, and the directory itself is fsynced after
+// its children. Symlinks are ignored except at the top level when
+// followTopSymlink is true (used to descend into a relocated pg_wal). Symlinks
+// encountered in subdirectories are always ignored, matching upstream's
+// intentional choice not to propagate process_symlinks into recursive calls.
+func walkAndFsync(path string, followTopSymlink bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		if !followTopSymlink {
+			return nil
+		}
+		// Resolve the symlink target so we recurse into the real dir/file.
+		if info, err = os.Stat(path); err != nil {
+			return err
+		}
+	}
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			child := filepath.Join(path, e.Name())
+			// Subdirectory recursion never follows symlinks (upstream
+			// passes process_symlinks=false to nested walkdir calls).
+			if e.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			if e.IsDir() {
+				if err := walkAndFsync(child, false); err != nil {
+					return err
+				}
+			} else if e.Type().IsRegular() {
+				if err := fsyncPath(child, false); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return fsyncPath(path, info.IsDir())
+}
+
+// fsyncPath opens path read-only and fsyncs it, mirroring upstream initdb's
+// fsync_fname_ext (src/common/file_utils.c). Benign errors are tolerated the
+// same way upstream does: EACCES on open (and EISDIR for directories), and
+// EBADF/EINVAL on the fsync itself for directories — some filesystems reject
+// fsync of a directory opened O_RDONLY, and that is not a durability failure.
+func fsyncPath(path string, isDir bool) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) || (isDir && errors.Is(err, syscall.EISDIR)) {
+			return nil
+		}
+		return fmt.Errorf("open %q for fsync: %w", path, err)
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		if isDir && (errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EINVAL)) {
+			return nil
+		}
+		return fmt.Errorf("fsync %q: %w", path, err)
+	}
+	return nil
+}
+
 func Init(opts Options) error {
 	if opts.DataDir == "" {
 		return errors.New("goopg init: -D <data-directory> is required")
@@ -228,6 +339,23 @@ func Init(opts Options) error {
 	abs, err := filepath.Abs(opts.DataDir)
 	if err != nil {
 		return fmt.Errorf("goopg init: resolve %q: %w", opts.DataDir, err)
+	}
+	// Sync-only mode (upstream initdb -S/--sync-only, initdb.c:3439):
+	// fsync an already-initialized data directory to disk and exit
+	// without creating a new cluster. The directory must already exist
+	// and be accessible; a missing directory is rejected, mirroring
+	// initdb.c's pg_check_dir(pg_data) <= 0 → "could not access
+	// directory". This branch runs before any layout/validation so it
+	// never mutates the tree.
+	if opts.SyncOnly {
+		info, err := os.Stat(abs)
+		if err != nil || !info.IsDir() {
+			return fmt.Errorf("goopg init: could not access directory %q", abs)
+		}
+		if err := fsyncDataDir(abs); err != nil {
+			return fmt.Errorf("goopg init: sync data to disk: %w", err)
+		}
+		return nil
 	}
 	// Resolve the bootstrap superuser name (upstream initdb -U/--username).
 	// Default "postgres"; reject the reserved "pg_" prefix exactly as
@@ -692,6 +820,15 @@ func Init(opts Options) error {
 	// (M0095-0001).
 	if err := writePgControl(abs, sysID, opts.Registry); err != nil {
 		return fmt.Errorf("goopg init: pg_control: %w", err)
+	}
+	// Flush the freshly written cluster to disk so it survives a host
+	// crash, mirroring upstream initdb's default trailing
+	// sync_pgdata (initdb.c:3512). Skipped when NoSync is set
+	// (-N/--no-sync), which trades durability for speed.
+	if !opts.NoSync {
+		if err := fsyncDataDir(abs); err != nil {
+			return fmt.Errorf("goopg init: sync data to disk: %w", err)
+		}
 	}
 	return nil
 }

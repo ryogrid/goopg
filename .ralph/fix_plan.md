@@ -559,14 +559,28 @@ if 21-spec pass surfaces a real divergence:
         inside it via the symlink. `-X`/`--waldir` registered on the `init` CLI.
         Design doc: `docs/design/0102-0011-initdb-waldir-option.md`. Tests:
         `internal/initdb/waldir_test.go`.
+      - **PROGRESS 2026-06-13 (loop #21):** `-N`/`--no-sync` and
+        `-S`/`--sync-only` (fsync control) landed. `Init` previously did NO
+        fsync; it now recursively fsyncs the data dir before returning
+        (`fsyncDataDir`/`walkAndFsync`/`fsyncPath` mirror `sync_pgdata`/
+        `walkdir`/`fsync_fname_ext`, FSYNC method), gated off by
+        `Options.NoSync`. `Options.SyncOnly` fsyncs an existing cluster and
+        exits without layout; a missing/non-dir path is rejected with
+        `could not access directory` (mirrors `initdb.c:3444`
+        `pg_check_dir <= 0`). Top-level walk ignores symlinks and recurses
+        through a relocated `pg_wal` separately. `-N`/`--no-sync` +
+        `-S`/`--sync-only` registered on the `init` CLI. Design doc:
+        `docs/design/0102-0012-initdb-sync-options.md`. Tests:
+        `internal/initdb/sync_test.go`.
       - **Remaining initdb options** (each pulls in a distinct subsystem; one
         per future loop, design doc first):
         `--encoding` (encoding catalogs), `--locale`/`--lc-*` +
         `--locale-provider`/`--icu-locale` (ICU),
         `--data-checksums` (page checksums), `--allow-group-access` (0o750
         dir mode), `--auth`/`--auth-host`/`--auth-local`/`--pwfile`
-        (auth bootstrap), `--sync-only`/`--no-sync`/`--sync-method`
-        (fsync control), `--set`/`--text-search-config` (GUC seeding).
+        (auth bootstrap), `--sync-method`/`--no-sync-data-files`
+        (syncfs sync method + base/ exclusion — deferred from loop #21),
+        `--set`/`--text-search-config` (GUC seeding).
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 
