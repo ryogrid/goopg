@@ -1,33 +1,40 @@
-(idle — M0102-0010 recovery/FPI checksum-replay validation gate COMPLETE & committed this loop)
+(idle — M0102-0009 resolved & committed this loop)
 
-Loop #32 landed gate (a) of two for the deferred `--data-checksums` default-ON
-flip: a crash-recovery test proving a checksum-enabled cluster replays its WAL
-(full-page images included) with valid pd_checksums after an unclean shutdown.
-- File: internal/initdb/recovery_test.go
-  `TestCrashRecoveryReplaysChecksummedClusterCleanly` (modeled on the existing
-  TestCrashRecoveryReplaysWALAfterUncleanShutdown + data_checksums_test.go's
-  on-disk VerifyPage walk). Reuses collectRelationFiles.
-- Key path proven: wal/recovery.go restoreDecodedXLogBlockImage →
-  writeBlockOrExtend → Manager.WriteBlock → checksummedForWrite recomputes
-  pd_checksum per replayed block (architecturally already correct; now tested).
-- Docs: docs/design/0102-0019-initdb-data-checksums.md "Remaining: default-ON
-  flip" now records gate (a) DONE, gate (b) pending. fix_plan.md M0102-0010
-  progress note added.
-- Gates: gofmt/vet clean; go test ./internal/initdb PASS; go test -race
-  ./internal/storage ./internal/wal PASS.
+Loop #33 closed **M0102-0009** (PG↔goopg physical failover `/sync_remote_apply`
+"did not reach streaming state within 45s"). The failure no longer reproduces —
+it was fixed by the `sync_state` wiring (design 0105-0008, real FIRST/ANY rule
+in `registerStatReplicationView`). Empirically verified all modes pass:
+- `TestE2E_FailoverPGtoGoopg` async / sync_remote_apply / sync_on — PASS (29.25s)
+- `TestE2E_FailoverGoopgToPG` async / sync_remote_apply — PASS (5.97s)
 
-Default stays OFF. The flip is still blocked on **gate (b): standby-read /
-physical-replication validation** — a checksummed goopg primary must stream to a
-PG (or goopg) standby whose read path verifies pd_checksum. That is the single
-concrete next step toward the flip (then the flip is a one-line default change).
+Change was test-gating only (no production code): removed the
+`GOOPG_RUN_BLOCKED_M0102_E2E` opt-in gate from both failover test files; they now
+follow the standard heterogeneous-E2E convention (skip under `-short` or
+`GOOPG_SKIP_M0102_E2E=1`), matching e2e_replication_test.go. Also gofmt-fixed a
+pre-existing misformat (line ~320) in e2e_failover_pg_to_goopg_test.go.
+- Files: internal/testport/e2e_failover_pg_to_goopg_test.go,
+  internal/testport/e2e_failover_goopg_to_pg_test.go,
+  docs/design/0102-0003-heterogeneous-failover-e2e-harness.md (closure note),
+  .ralph/fix_plan.md (M0102-0009 → [x]).
+- Gates: gofmt clean; go vet ./internal/testport PASS; both failover E2E suites
+  PASS un-gated; make ralph-state-guard OK (had to reset stale
+  progress.json "completed"→"running" to match live status.json).
 
-⚠️ WORKING-TREE CONTAMINATION (still present — separate session, DO NOT commit):
-~18 modified files + 2 new test files belong to an UNRELATED partition
-generated-column-override feature: analyzer/analyzer.go, catalog/catalog.go
-(+_test), executor/* (operators.go, operators_ddl.go, operators_join_agg.go,
+Next candidate tasks (pick one next loop):
+- **M0102-0010 gate (b)**: standby-read / physical-replication validation for
+  the `--data-checksums` default-ON flip — a checksummed goopg primary streaming
+  to a PG standby that verifies pd_checksum. Now UNBLOCKED since physical
+  failover/streaming works (M0102-0009 closed). This is the last gate before the
+  one-line default flip.
+- M0095-0003 WAL-streaming tier (pg_basebackup -X stream) — needs walsender loop
+  parity.
+- M0110-0001..0004 server-dependent TAP tiers.
+
+⚠️ WORKING-TREE CONTAMINATION (separate session, DO NOT commit): ~18 modified
+files + 2 new test files belong to an UNRELATED partition generated-column-
+override feature: analyzer/analyzer.go, catalog/catalog.go(+_test),
+executor/* (operators.go, operators_ddl.go, operators_join_agg.go,
 operators_lockrows.go, opnode.go), mvcc/subxact_visibility.go, parser/ast.go,
 parser/ddl.go, planner/* (bushy, nl_index_join, plan, planner, unnest),
 server/dispatch.go + parser/gen_override_test.go +
-executor/partition_gen_override_test.go. Tree builds clean WITH them. I staged
-ONLY my own files (recovery_test.go, design doc, fix_plan, working_set,
-progress.json). The override-feature owner should commit or revert the rest.
+executor/partition_gen_override_test.go. Stage ONLY M0102-0009 files below.

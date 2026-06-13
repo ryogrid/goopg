@@ -533,9 +533,21 @@ if 21-spec pass surfaces a real divergence:
         regression suites listed in the milestone DoD and confirm zero
         regressions.
 
- - [ ] **M0102-0009** (follow-up to M0102-0008)
-      - Summary: `/sync_remote_apply` still fails at "physical
-        replication did not reach streaming state within 45s"
+ - [x] **M0102-0009** (follow-up to M0102-0008) — RESOLVED (loop #33, 2026-06-13)
+      - Summary: `/sync_remote_apply` previously failed at "physical
+        replication did not reach streaming state within 45s (requireSync=true)"
+        because the primary's `pg_stat_replication.sync_state` never became
+        `'sync'`.
+      - **RESOLVED:** the `sync_state` wiring (design `0105-0008`, real FIRST/ANY
+        rule evaluation in `registerStatReplicationView`) closed the gap. Both
+        `TestE2E_FailoverPGtoGoopg` (async / sync_remote_apply / sync_on) and
+        `TestE2E_FailoverGoopgToPG` (async / sync_remote_apply) now reach
+        streaming state and pass all modes. The `GOOPG_RUN_BLOCKED_M0102_E2E`
+        opt-in gate was removed from both failover tests; they now follow the
+        standard heterogeneous-E2E convention (skip under `-short` or
+        `GOOPG_SKIP_M0102_E2E=1`), matching `e2e_replication_test.go`.
+        Closure note appended to `docs/design/0102-0003-heterogeneous-failover-e2e-harness.md`.
+        Verified: PGtoGoopg 3/3 modes PASS (29.25s); GoopgToPG 2/2 modes PASS (5.97s).
 
  - [ ] **M0102-0010** (follow-up to M0102-0008)
       - Summary: goopg `init` accepts no initdb CLI options beyond `-D`, so

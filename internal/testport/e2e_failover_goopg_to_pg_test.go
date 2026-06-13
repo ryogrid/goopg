@@ -20,12 +20,14 @@ import (
 )
 
 func TestE2E_FailoverGoopgToPG(t *testing.T) {
-	if os.Getenv("GOOPG_RUN_BLOCKED_M0102_E2E") == "" {
-		t.Skip("blocked: set GOOPG_RUN_BLOCKED_M0102_E2E=1 to run the goopg->PG physical failover repro")
-	}
-
-	if testing.Short() {
-		t.Skip("skipping heterogeneous failover e2e in short mode")
+	// M0102-0009 RESOLVED (2026-06-13): the goopg->PG physical failover repro
+	// (async / sync_remote_apply) now reaches streaming state and passes both
+	// modes; it is no longer "blocked". Gate only on short mode + tool
+	// availability, matching the other heterogeneous E2E tests
+	// (e2e_replication_test.go). Set GOOPG_SKIP_M0102_E2E=1 to opt out of the
+	// (slow, PG-binary-dependent) repro locally.
+	if testing.Short() || os.Getenv("GOOPG_SKIP_M0102_E2E") != "" {
+		t.Skip("skipping heterogeneous failover e2e (short mode or GOOPG_SKIP_M0102_E2E set)")
 	}
 
 	repo := repoRoot(t)

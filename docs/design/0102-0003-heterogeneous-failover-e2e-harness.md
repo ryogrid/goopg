@@ -209,3 +209,32 @@ go test -v -run TestE2E_PhysicalReplication ./internal/testport/
   mid-stream, the standby may have partial WAL records. The standby must
   recover gracefully (skip the torn tail per M0088 if landed; else
   document the workaround).
+
+## Status update (2026-06-13, M0102-0009 closure)
+
+The PG↔goopg physical failover repros (`TestE2E_FailoverPGtoGoopg`,
+`TestE2E_FailoverGoopgToPG`) were previously gated behind the
+`GOOPG_RUN_BLOCKED_M0102_E2E` opt-in env var because `sync_remote_apply` mode
+could not reach streaming state — the primary's
+`pg_stat_replication.sync_state` never became `'sync'`
+("physical replication did not reach streaming state within 45s
+(requireSync=true)"). That gap was closed by the `sync_state` wiring tracked in
+`0105-0008-sync-state-pg-stat-replication.md` (real FIRST/ANY rule evaluation in
+`registerStatReplicationView` instead of a hard-coded `"async"`).
+
+Both directions now pass all modes (`async`, `sync_remote_apply`, `sync_on`):
+
+```
+--- PASS: TestE2E_FailoverPGtoGoopg (29.25s)
+    --- PASS: TestE2E_FailoverPGtoGoopg/async
+    --- PASS: TestE2E_FailoverPGtoGoopg/sync_remote_apply
+    --- PASS: TestE2E_FailoverPGtoGoopg/sync_on
+--- PASS: TestE2E_FailoverGoopgToPG (5.97s)
+    --- PASS: TestE2E_FailoverGoopgToPG/async
+    --- PASS: TestE2E_FailoverGoopgToPG/sync_remote_apply
+```
+
+The "blocked" env gate has been removed; the tests now follow the standard
+heterogeneous-E2E convention (run in the non-short suite when the PG binaries
+are present, skipped under `-short` or `GOOPG_SKIP_M0102_E2E=1`), matching
+`e2e_replication_test.go`. M0102-0009 is resolved.
