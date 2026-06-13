@@ -278,7 +278,7 @@ func TestBootstrapPgAuthidIndexesAllRoles(t *testing.T) {
 		t.Fatalf("mkdir global: %v", err)
 	}
 
-	entries, err := bootstrapPostgresRole(dir)
+	entries, err := bootstrapPostgresRole(dir, "postgres")
 	if err != nil {
 		t.Fatalf("bootstrapPostgresRole: %v", err)
 	}

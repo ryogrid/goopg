@@ -114,6 +114,11 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dataDir := fs.String("D", "", "data directory to initialize (required)")
+	// Bootstrap superuser name (upstream initdb -U/--username). Both the
+	// short and long forms bind to the same variable; empty means the
+	// initdb default ("postgres").
+	username := fs.String("U", "", "name of the bootstrap superuser (default \"postgres\")")
+	fs.StringVar(username, "username", "", "name of the bootstrap superuser (default \"postgres\")")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -121,7 +126,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "goopg init: -D <data-directory> is required")
 		return 2
 	}
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir}); err != nil {
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}

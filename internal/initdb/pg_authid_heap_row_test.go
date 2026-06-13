@@ -49,7 +49,7 @@ func TestBootstrapPostgresRoleHeapRowRolnameByteLayout(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o700); err != nil {
 		t.Fatalf("mkdir global: %v", err)
 	}
-	entries, err := bootstrapPostgresRole(dir)
+	entries, err := bootstrapPostgresRole(dir, "postgres")
 	if err != nil {
 		t.Fatalf("bootstrapPostgresRole: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestBootstrapPredefinedRolesHaveNullBitmapAndFrozenXmin(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o700); err != nil {
 		t.Fatalf("mkdir global: %v", err)
 	}
-	entries, err := bootstrapPostgresRole(dir)
+	entries, err := bootstrapPostgresRole(dir, "postgres")
 	if err != nil {
 		t.Fatalf("bootstrapPostgresRole: %v", err)
 	}

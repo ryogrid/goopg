@@ -538,7 +538,25 @@ if 21-spec pass surfaces a real divergence:
         replication did not reach streaming state within 45s"
 
  - [ ] **M0102-0010** (follow-up to M0102-0008)
-      - Summary: 15 initdb test failures
+      - Summary: goopg `init` accepts no initdb CLI options beyond `-D`, so
+        upstream `initdb` behaviors (`postgres/src/bin/initdb/t/001_initdb.pl`)
+        cannot be matched. `initdb.Init` itself is internally complete
+        (full catalog bootstrap, non-empty-dir guard via `ensureEmptyDir`);
+        the gap is option coverage on the CLI + a few bootstrap params.
+      - **PROGRESS 2026-06-13:** `-U`/`--username` (bootstrap superuser name)
+        landed. `Options.SuperuserName` (default `"postgres"`) threads through
+        `bootstrapPostgresRole`; reserved `pg_` prefix rejected before any
+        filesystem layout (mirrors `initdb.c:3479`). Design doc:
+        `docs/design/0102-0010-initdb-superuser-name-option.md`. Tests:
+        `internal/initdb/superuser_name_test.go`.
+      - **Remaining initdb options** (each pulls in a distinct subsystem; one
+        per future loop, design doc first):
+        `--encoding` (encoding catalogs), `--locale`/`--lc-*` +
+        `--locale-provider`/`--icu-locale` (ICU), `--waldir` (WAL relocation),
+        `--data-checksums` (page checksums), `--allow-group-access` (0o750
+        dir mode), `--auth`/`--auth-host`/`--auth-local`/`--pwfile`
+        (auth bootstrap), `--sync-only`/`--no-sync`/`--sync-method`
+        (fsync control), `--set`/`--text-search-config` (GUC seeding).
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 
