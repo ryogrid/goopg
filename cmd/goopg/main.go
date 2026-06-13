@@ -512,6 +512,17 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.VM = rt.VM
 		cfg.Checkpointer = rt.Checkpointer
 		cfg.Slots = rt.Slots
+		// M0110-0004 / RW-002 b: `goopg stop -mode immediate` arrives as the
+		// control-plane STOPIMMEDIATE command. Flag the runtime so the
+		// deferred rt.Close() above skips its final shutdown checkpoint,
+		// leaving pg_control at DB_IN_PRODUCTION (an unclean cluster). This
+		// reproduces upstream's immediate (SIGQUIT) shutdown for pg_resetwal
+		// /pg_rewind/pg_controldata compatibility; the pidfile is still
+		// removed by the normal control-plane teardown.
+		cfg.OnStopImmediate = func() error {
+			rt.SetImmediateShutdown()
+			return nil
+		}
 		// M0102-0007: report the cluster's real system_identifier in
 		// IDENTIFY_SYSTEM so a PG standby's walreceiver can verify
 		// the primary's identity against its own pg_control.
@@ -991,7 +1002,7 @@ func runStop(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dataDir := fs.String("D", "", "data directory of the server to stop (required)")
-	mode := fs.String("mode", "fast", "shutdown mode: smart|fast|immediate (v0 treats all three as graceful)")
+	mode := fs.String("mode", "fast", "shutdown mode: smart|fast (graceful, DB_SHUTDOWNED) | immediate (no checkpoint, DB_IN_PRODUCTION)")
 	timeoutSec := fs.Int("t", 30, "seconds to wait for shutdown to complete")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -1009,10 +1020,17 @@ func runStop(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "goopg stop: %v\n", err)
 		return 1
 	}
-	// v0 collapses smart/fast/immediate onto the same graceful
-	// path; the flag is preserved so future loops can split them.
-	_ = *mode
-	reply, err := control.Send(pf.SocketPath, "STOP", time.Duration(*timeoutSec)*time.Second)
+	// smart/fast both run a graceful shutdown (final checkpoint →
+	// pg_control State = DB_SHUTDOWNED). immediate skips the shutdown
+	// checkpoint so the cluster is left at DB_IN_PRODUCTION (recovered via
+	// WAL replay on the next start), mirroring upstream's immediate
+	// (SIGQUIT) shutdown — see runStart's cfg.OnStopImmediate wiring and
+	// the control-plane STOPIMMEDIATE handler. (M0110-0004 / RW-002 b.)
+	stopCmd := "STOP"
+	if strings.EqualFold(*mode, "immediate") {
+		stopCmd = "STOPIMMEDIATE"
+	}
+	reply, err := control.Send(pf.SocketPath, stopCmd, time.Duration(*timeoutSec)*time.Second)
 	if err != nil {
 		fmt.Fprintf(stderr, "goopg stop: %v\n", err)
 		return 1

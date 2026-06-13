@@ -1,8 +1,8 @@
 # 0110-0004 — pg_resetwal TAP test port (001_basic CLI tier)
 
-Status: accepted (partial)
+Status: accepted (complete — full pg_resetwal TAP suite ported, loop #50)
 Milestone: M0110-0004
-Date: 2026-06-13
+Date: 2026-06-13 (updated 2026-06-14)
 
 ## Goal
 
@@ -251,11 +251,53 @@ have issued >1M fsyncs).
   state change does not regress recovery).
 - `go run ./cmd/gen-oracle-port-status` regenerated the `.md` view.
 
+## Loop #50 — RW-002 (b): real immediate shutdown unblocks the `--force` branch
+
+The last deferred piece — the `database server was not shut down cleanly` +
+`--force` pair (`001_basic.pl` l.41-52) — is now ported as
+`TestPort_PgResetwal001BasicForce`. The prior block ("goopg v0 has no unclean
+shutdown state, every `goopg stop` writes a graceful `DB_SHUTDOWNED`
+checkpoint") was closed by giving goopg a **real immediate shutdown**:
+
+- **Control protocol** (`internal/control/control.go`): new `STOPIMMEDIATE`
+  verb + `OnStopImmediate` callback (falls back to `OnStop` if unwired).
+- **Server** (`internal/server/server.go`): `Config.OnStopImmediate` and an
+  `cl.OnStopImmediate` handler that — unlike the graceful `OnStop` —
+  runs **no** `CheckpointNow`, invokes the runtime hook, then `runCancel`s.
+  The pidfile is still removed by the normal `defer s.stopControlPlane()`.
+- **Runtime** (`internal/initdb/open.go`): `Runtime.SetImmediateShutdown()`
+  sets a flag that makes `Close()` **skip** the final `CheckpointShutdown()`,
+  so `pg_control.State` stays `DB_IN_PRODUCTION`.
+- **CLI** (`cmd/goopg/main.go`): `goopg stop -mode immediate` sends
+  `STOPIMMEDIATE`; `runStart` wires `cfg.OnStopImmediate` to
+  `rt.SetImmediateShutdown()`. `smart`/`fast` still map to the graceful `STOP`.
+
+Result: after `goopg stop -mode immediate` the cluster is left looking
+exactly like an upstream `stop immediate` (SIGQUIT): `pg_control` at
+`DB_IN_PRODUCTION`, pidfile gone. `pg_resetwal` then refuses without `--force`
+("database server was not shut down cleanly") and proceeds with it; goopg's own
+next start recovers via WAL replay (the existing crash-recovery path, cf.
+`TestKillKillRecovery`).
+
+Faithfulness note: upstream stamps `DB_IN_PRODUCTION` at the end of startup
+recovery; goopg stamps it on each *running* checkpoint (initdb leaves
+`DB_SHUTDOWNED`), so the test runs one explicit checkpoint after start to
+establish the running state before the immediate stop. The resulting on-disk
+state is identical. A startup-time `DB_IN_PRODUCTION` stamp is still
+intentionally deferred (a standby in recovery must not be flagged in-production
+prematurely — see the loop-#45 note above).
+
+Verification: `TestPort_PgResetwal001Basic{,Server,Force}` +
+`TestPort_PgResetwal002Corrupted` all PASS;
+`go test -race ./internal/control ./internal/server` clean;
+`go build ./...` clean.
+
+**RW-002 is now fully ported** (`port` / `pass_required=yes`); the entire
+pg_resetwal TAP suite (RW-001/003/004 + RW-002) is closed. M0110-0004 is
+complete.
+
 ## Resume point
 
-The maximal-override final restart (RW-002 (a)) landed in loop #49 (batched
-SLRU mirror, above). Promote the **last** piece of `RW-002` to `port` once
-goopg gains a true unclean/crash shutdown state so the
-`--force`-after-unclean-shutdown branch of `001_basic.pl` can be reproduced —
-in v0 every `goopg stop` writes a graceful `DB_SHUTDOWNED` shutdown checkpoint,
-so there is no unclean state to trigger that branch.
+None for M0110-0004 — the pg_resetwal suite is fully ported. Remaining
+client-tool porting (pg_dump 002+, pg_waldump 002, pg_amcheck 002-005,
+pg_basebackup `-X stream`) tracks under M0095-0003 / M0110-0001..0003.

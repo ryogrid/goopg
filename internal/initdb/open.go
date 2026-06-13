@@ -89,6 +89,26 @@ type Runtime struct {
 	// bgwriter is the background page-writer goroutine (M0048-0003).
 	// nil when BgwriterDelay == 0 or BgwriterMaxPages == 0.
 	bgwriter *storage.Bgwriter
+
+	// immediateShutdown, when true, makes Close() skip the final
+	// shutdown checkpoint so pg_control's State stays DB_IN_PRODUCTION
+	// (an unclean cluster). Set via SetImmediateShutdown from the
+	// control-plane STOPIMMEDIATE handler (`goopg stop -mode
+	// immediate`), mirroring upstream's immediate (SIGQUIT) shutdown.
+	// (M0110-0004 / RW-002 b.)
+	immediateShutdown bool
+}
+
+// SetImmediateShutdown marks the runtime so the next Close() skips its
+// final shutdown checkpoint, leaving pg_control's State at
+// DB_IN_PRODUCTION. Used by the control-plane STOPIMMEDIATE command to
+// reproduce upstream's immediate (SIGQUIT) shutdown semantics: the
+// cluster is left looking unclean and is recovered via WAL replay on the
+// next start. (M0110-0004 / RW-002 b.)
+func (r *Runtime) SetImmediateShutdown() {
+	if r != nil {
+		r.immediateShutdown = true
+	}
 }
 
 // OpenOptions controls Open.
@@ -2000,7 +2020,16 @@ func (r *Runtime) Close() error {
 	//
 	// Errors here are logged but do not abort Close — file handles
 	// must still be released so the process can exit cleanly.
-	if r.Checkpointer != nil {
+	if r.Checkpointer != nil && r.immediateShutdown {
+		// Immediate shutdown (`goopg stop -mode immediate`): skip the
+		// final checkpoint entirely so pg_control's State stays at
+		// DB_IN_PRODUCTION. External tools (pg_resetwal/pg_rewind/
+		// pg_controldata) then see an unclean cluster that needs
+		// recovery, and goopg's own next start replays WAL. Mirrors
+		// upstream's immediate (SIGQUIT) shutdown. (M0110-0004 / RW-002 b.)
+		slog.Default().Info("immediate shutdown: skipping final checkpoint",
+			"note", "pg_control left at DB_IN_PRODUCTION; recovery on next start")
+	} else if r.Checkpointer != nil {
 		// Use the shutdown variant so pg_control's State lands on
 		// DB_SHUTDOWNED — this is the final durable checkpoint of a clean
 		// shutdown, after which no further WAL is written. External tools

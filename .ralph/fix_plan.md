@@ -954,7 +954,10 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
 pg_resetwal resets the WAL and control file of a non-running cluster.
 Porting validates goopg's pg_control and WAL segment layout on disk.
 
-- [ ] **M0110-0004 — Port pg_resetwal TAP tests**
+- [x] **M0110-0004 — Port pg_resetwal TAP tests** (COMPLETE loop #50 — full
+      pg_resetwal TAP suite ported: 001_basic CLI tier (RW-001), server tier
+      (RW-003 + RW-002 a/b), 002_corrupted (RW-004). All four
+      `TestPort_PgResetwal*` PASS.)
       - Target tests:
         | Test | Status | Rationale |
         |------|--------|-----------|
@@ -1015,6 +1018,20 @@ Porting validates goopg's pg_control and WAL segment layout on disk.
         (b) the unclean-shutdown/`--force` branch — blocked on goopg v0 having no
         crash/unclean shutdown state (graceful DB_SHUTDOWNED always). Design:
         `docs/design/0110-0004-pg-resetwal-tap-port.md`.
+      - **PROGRESS 2026-06-14 (loop #50):** RW-002 (b) DONE — **M0110-0004 now
+        COMPLETE.** Gave goopg a real immediate shutdown so the unclean-shutdown
+        + `--force` branch of `001_basic.pl` (l.41-52) can be reproduced, ported
+        as `TestPort_PgResetwal001BasicForce`. New `STOPIMMEDIATE` control verb
+        (`internal/control/control.go`) + `Config.OnStopImmediate` handler
+        (`internal/server/server.go`) tear the server down running **no**
+        shutdown checkpoint; `Runtime.SetImmediateShutdown()`
+        (`internal/initdb/open.go`) makes `Close()` skip the final
+        `CheckpointShutdown`, leaving `pg_control.State=DB_IN_PRODUCTION`.
+        `goopg stop -mode immediate` (`cmd/goopg/main.go`) sends the new verb
+        (smart/fast stay graceful). pg_resetwal then refuses without `--force`
+        and the cluster recovers via WAL replay on the next start. All four
+        `TestPort_PgResetwal*` PASS (4.9s); `go test -race ./internal/control
+        ./internal/server` clean; `go build ./...` clean. CSV RW-002 → port.
 
 ### pg_verifybackup (10 tests — excluded → no action)
 

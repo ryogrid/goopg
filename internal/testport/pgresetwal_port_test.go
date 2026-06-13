@@ -55,12 +55,15 @@ package testport
 // NextXID past the bootstrap pg_xact segment) now also passes: M0110-0004
 // RW-002 (a) batched the startup CLOG implicit-abort sweep's SLRU mirror to one
 // fsync per segment (was one per XID → ~1M fsyncs → looked hung).
-// What stays deferred under RW-002:
-//   - the "database server was not shut down cleanly" + --force pair: goopg's
-//     stop is always a graceful checkpoint (no crash state in v0), so the
-//     unclean-shutdown branch cannot be reproduced.
+// UPDATE (M0110-0004 loop #50): the last RW-002 remainder is now ported. The
+// "database server was not shut down cleanly" + --force pair is exercised by
+// TestPort_PgResetwal001BasicForce below. `goopg stop -mode immediate`
+// (control-plane STOPIMMEDIATE) now tears the server down without a shutdown
+// checkpoint, leaving pg_control at DB_IN_PRODUCTION — an unclean cluster that
+// pg_resetwal refuses without --force, recovered via WAL replay on the next
+// start. RW-002 is therefore fully ported (server tier of 001_basic.pl).
 //
-// 002_corrupted.pl is now ported in TestPort_PgResetwal002Corrupted (RW-004);
+// 002_corrupted.pl is ported in TestPort_PgResetwal002Corrupted (RW-004);
 // it needs no server, only goopg's pg_control header compatibility (RW-003).
 
 import (
@@ -381,6 +384,96 @@ func TestPort_PgResetwal001BasicServer(t *testing.T) {
 	assertSelect1(t, c)
 	if err := c.Stop(cluster.ShutdownFast); err != nil {
 		t.Fatalf("stop after maximal override restart: %v", err)
+	}
+	started = false
+}
+
+// TestPort_PgResetwal001BasicForce ports the unclean-shutdown + --force
+// branch of postgres/src/bin/pg_resetwal/t/001_basic.pl (upstream l.41-52,
+// M0110-0004 / RW-002 b):
+//
+//	$node->stop('immediate');
+//	command_fails_like([ 'pg_resetwal', $dir ],
+//	    qr/database server was not shut down cleanly/, ...);
+//	command_ok([ 'pg_resetwal', '--force', $dir ], ...);
+//	$node->start;
+//	is($node->safe_psql("postgres", "SELECT 1;"), 1, ...);
+//
+// This was the last piece of RW-002 deferred under "goopg v0 has no
+// unclean shutdown state". That gap is now closed: `goopg stop -mode
+// immediate` (control-plane STOPIMMEDIATE) tears the server down WITHOUT a
+// shutdown checkpoint, so pg_control's State stays DB_IN_PRODUCTION — an
+// unclean cluster that pg_resetwal refuses to reset without --force, and
+// that goopg's own next start recovers via WAL replay. See
+// cmd/goopg/main.go (runStop / cfg.OnStopImmediate),
+// internal/server/server.go (OnStopImmediate handler), and
+// internal/initdb/open.go (Runtime.SetImmediateShutdown / Close).
+//
+// Faithfulness note: upstream's `stop immediate` (SIGQUIT) leaves
+// DB_IN_PRODUCTION because PG stamps that state at the end of startup
+// recovery. goopg stamps DB_IN_PRODUCTION on each running checkpoint
+// (initdb leaves DB_SHUTDOWNED), so the test runs one explicit checkpoint
+// after start to establish the running state before the immediate stop —
+// the resulting on-disk state (DB_IN_PRODUCTION + pidfile removed) is
+// identical to what an immediate shutdown leaves upstream.
+func TestPort_PgResetwal001BasicForce(t *testing.T) {
+	// upstream: postgres/src/bin/pg_resetwal/t/001_basic.pl (l.41-52)
+	bin := clientToolBin(t, "pg_resetwal")
+	if bin == "" {
+		t.Skip("pg_resetwal not in PATH or postgres/local_install/bin")
+	}
+
+	c := newCluster(t, "pgresetwal001_force")
+	if err := c.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	dir := c.DataDir()
+
+	if err := c.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	started := true
+	defer func() {
+		if started {
+			_ = c.Stop(cluster.ShutdownImmediate)
+		}
+	}()
+	assertSelect1(t, c)
+
+	// Establish the running state on disk: a checkpoint stamps pg_control
+	// State = DB_IN_PRODUCTION (initdb leaves DB_SHUTDOWNED). The immediate
+	// stop below deliberately skips the final shutdown checkpoint, so this
+	// running state is what pg_resetwal observes.
+	if err := c.Checkpoint(); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	// `stop immediate`: no shutdown checkpoint, pidfile still removed.
+	if err := c.Stop(cluster.ShutdownImmediate); err != nil {
+		t.Fatalf("stop immediate: %v", err)
+	}
+	started = false
+
+	// Without --force, pg_resetwal refuses an uncleanly-shut-down cluster.
+	if res := runTool(t, bin, dir); res.ExitCode == 0 {
+		t.Errorf("pg_resetwal succeeded on unclean cluster without --force; want failure\nstdout=%s", res.Stdout)
+	} else if !strings.Contains(res.Stderr, "database server was not shut down cleanly") {
+		t.Errorf("pg_resetwal unclean-shutdown error missing expected text:\n%s", res.Stderr)
+	}
+
+	// With --force, it proceeds and rewrites pg_control.
+	if res := runTool(t, bin, "--force", dir); res.ExitCode != 0 {
+		t.Fatalf("pg_resetwal --force after immediate shutdown exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+
+	// The server starts and works after the forced reset (upstream l.49-51).
+	if err := c.Start(); err != nil {
+		t.Fatalf("start after forced reset: %v", err)
+	}
+	started = true
+	assertSelect1(t, c)
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop after forced reset: %v", err)
 	}
 	started = false
 }
