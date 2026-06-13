@@ -984,6 +984,21 @@ Porting validates goopg's pg_control and WAL segment layout on disk.
         deferred under RW-002: the unclean-shutdown/`--force` branch (goopg v0
         has no crash state) and the SLRU-derived id overrides + 002_corrupted.
         Design: `docs/design/0110-0004-pg-resetwal-tap-port.md`.
+      - **PROGRESS 2026-06-14 (loop #48):** `002_corrupted.pl` now PORTED as
+        `TestPort_PgResetwal002Corrupted` (CSV row RW-004 → port). It inits a
+        goopg cluster (never started), corrupts `global/pg_control` two ways, and
+        drives upstream pg_resetwal: (1) all-zeroes → "broken or wrong version;
+        ignoring it" + guessed dump under --dry-run (exit 0); (2) 16-byte header
+        restored + body zeroed → "invalid WAL segment size (0 bytes); proceed
+        with caution" via the version-matches/CRC-fails path (exit 0); (3) plain
+        run refuses on guessed values (exit 1); (4) --force rewrites pg_control
+        (exit 0). Generic pg_resetwal logic; only goopg dependency is the
+        pg_control header compatibility already proven by RW-003. Needs NO server
+        start, so independent of the deferred CLOG-startup restart — correcting
+        the earlier note that wrongly paired 002_corrupted with the unclean-
+        shutdown branch. RW-002 remainder now: only (a) the maximal-override
+        final restart (PG-style StartupCLOG page-fill) and (b) the
+        unclean-shutdown/`--force` branch. PASS 0.88s.
 
 ### pg_verifybackup (10 tests — excluded → no action)
 

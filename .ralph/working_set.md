@@ -1,38 +1,36 @@
 (idle — nothing in flight)
 
-Last completed: M0110-0004 server-tier pg_control round-trip ported (loop #45).
+Last completed (loop #48): M0110-0004 — ported pg_resetwal/t/002_corrupted.pl
+as TestPort_PgResetwal002Corrupted (CSV row RW-004 → port). Committed + pushed.
 
-**Root cause found + fixed (WAL/control):** every checkpoint — including the
-final `Runtime.Close` shutdown checkpoint — stamped pg_control
-`State=DB_IN_PRODUCTION`. So after a clean `goopg stop`, `pg_controldata`
-showed "in production" and upstream `pg_resetwal` refused without `--force`
-("database server was not shut down cleanly"). This was the sole blocker for
-RW-002's pg_control round-trip tier.
+What this loop did: 002_corrupted.pl drives upstream pg_resetwal against a
+deliberately corrupted global/pg_control on an init'd-but-never-started goopg
+cluster — (1) all-zeroes → "broken or wrong version; ignoring it" + guessed
+--dry-run dump; (2) 16-byte header restored + body zeroed → "invalid WAL
+segment size (0 bytes); proceed with caution" (version-matches/CRC-fails code
+path); (3) plain run refuses on guessed values; (4) --force rewrites. Generic
+pg_resetwal logic; only goopg dependency is the pg_control header compat already
+proven by RW-003. NO server start, so the earlier note pairing 002_corrupted
+with the unclean-shutdown/--force deferral was wrong (corrected in CSV/design).
+Files: internal/testport/pgresetwal_port_test.go (+TestPort_PgResetwal002Corrupted
++ header-comment fix), docs/test-port/postgres-oracle-port-status.{csv,md}
+(RW-004 added, RW-002 trimmed), docs/design/0110-0004-pg-resetwal-tap-port.md
+(loop #48 update + CSV rows + resume point), .ralph/fix_plan.md.
+Gates: gofmt clean, go vet clean, all 3 TestPort_PgResetwal* PASS (3.3s).
 
-**Fix:** `wal.Checkpointer.CheckpointShutdown()` (new) runs the checkpoint with
-a `shutdown` flag → stamps `DB_SHUTDOWNED` (mirrors PG CHECKPOINT_IS_SHUTDOWN);
-wired into `Runtime.Close` (the last durable checkpoint). OnStop checkpoint
-stays DB_IN_PRODUCTION on purpose (crash in the OnStop→Close window stays
-unclean). goopg startup replays WAL regardless of State, so restart/crash
-recovery unaffected (verified).
+RW-002 remainder still open (the last pg_resetwal deferral): (a) maximal-override
+FINAL RESTART — --next-transaction-id advances NextXID past the bootstrap
+pg_xact segment; CLog.MarkUnknownAsAborted (internal/mvcc/clog.go) walks the
+whole xid range w/ per-step fsync during initdb.Open → startup looks hung.
+Fix = PG-style StartupCLOG page-fill (separate WAL/MVCC task). (b) the
+unclean-shutdown/--force branch of 001_basic.pl — goopg v0 has no crash state.
 
-Files: internal/wal/checkpointer.go (+CheckpointShutdown, shutdown flag),
-internal/wal/checkpointer_test.go (+TestCheckpointerShutdownSetsDBShutdowned),
-internal/initdb/open.go (Close → CheckpointShutdown),
-internal/testport/pgresetwal_port_test.go (+TestPort_PgResetwal001BasicServer),
-docs/test-port CSV+md (RW-003 port, RW-002 narrowed), design 0110-0004.
+Other open M0110/M0095 tasks (blocked on big features): M0095-0003 (WAL
+streaming), M0110-0001 (pg_dump catalog parity), M0110-0002 (pg_waldump index
+AMs), M0110-0003 (pg_amcheck verify_heapam).
 
-Gates run: build OK; `go test -race ./internal/wal ./internal/control
-./internal/initdb` PASS; new wal unit test PASS; both pg_resetwal tiers PASS;
-`TestPort_Recovery` PASS; ralph-state-guard PASS.
-
-⚠️ Pre-existing failure NOT mine: `TestPort_WALPgWaldumpCompat` fails
-("no WAL segments found") even with my source edits stashed — likely from the
-concurrent session's uncommitted executor/parser/planner changes in the tree.
-Out of RW-002 scope; flag separately.
-
-Follow-up (deferred, documented in design doc): a *running* goopg shows
-DB_SHUTDOWNED until the first online checkpoint; a startup DB_IN_PRODUCTION
-stamp was deferred to avoid the standby-in-recovery edge (replication blast
-radius). RW-002 still open for SLRU-derived overrides + unclean/--force +
-002_corrupted.
+⚠️ TREE NOTE: a SEPARATE manual claude session left ~930 lines uncommitted WIP
+across internal/{executor,planner,catalog,analyzer,parser,mvcc,server}/ + 2
+untracked test files (executor/partition_gen_override_test.go,
+parser/gen_override_test.go). NOT ralph's — do NOT commit/clobber. Stage your
+own files explicitly (git add <paths>), never `git add -A`.

@@ -39,8 +39,11 @@ package testport
 // not link libpq (it never connects to a server), so the plain runTool helper
 // suffices — no LD_LIBRARY_PATH shim is needed.
 //
-// CSV row: RW-001 (the CLI tier of 001_basic.pl). The server tier and
-// 002_corrupted.pl remain deferred under row RW-002.
+// CSV row: RW-001 (the CLI tier of 001_basic.pl). The server tier of
+// 001_basic.pl is split: its pg_control read/write round-trip half is ported
+// (RW-003, TestPort_PgResetwal001BasicServer); the SLRU-derived-override
+// restart remainder stays deferred under RW-002.
+// 002_corrupted.pl is ported in TestPort_PgResetwal002Corrupted below (RW-004).
 // Design doc: docs/design/0110-0004-pg-resetwal-tap-port.md (M0110-0004).
 //
 // UPDATE (M0110-0004 loop #45): the pg_control read/write round-trip half of
@@ -52,11 +55,12 @@ package testport
 //   - the "database server was not shut down cleanly" + --force pair: goopg's
 //     stop is always a graceful checkpoint (no crash state in v0), so the
 //     unclean-shutdown branch cannot be reproduced;
-//   - the SLRU-derived control overrides (--commit-timestamp-ids /
-//     --multixact-ids / --multixact-offset / --oldest-transaction-id /
-//     --next-transaction-id) and 002_corrupted.pl, which need
-//     track_commit_timestamp segment files + exact pg_commit_ts / pg_multixact
-//     / pg_xact on-disk segment layout parity.
+//   - the maximal SLRU-derived-override RESTART (--next-transaction-id advances
+//     NextXID past the bootstrap pg_xact segment, which goopg's per-xid CLOG
+//     walk at startup makes pathologically slow — a separate WAL/MVCC task).
+//
+// 002_corrupted.pl is now ported in TestPort_PgResetwal002Corrupted (RW-004);
+// it needs no server, only goopg's pg_control header compatibility (RW-003).
 
 import (
 	"context"
@@ -375,6 +379,111 @@ func TestPort_PgResetwal001BasicServer(t *testing.T) {
 	// advanced-CLOG id blocks it. The fix (PG-style StartupCLOG page-fill instead
 	// of a per-xid walk) is a separate WAL/MVCC task tracked in the deferral
 	// ledger.
+}
+
+// TestPort_PgResetwal002Corrupted ports
+// postgres/src/bin/pg_resetwal/t/002_corrupted.pl (M0110-0004 / RW-002):
+// pg_resetwal's handling of a corrupted global/pg_control.
+//
+// The test inits a goopg cluster (never started), corrupts pg_control two
+// ways, and drives the upstream pg_resetwal binary against it:
+//
+//  1. ALL ZEROES — pg_resetwal cannot match PG_CONTROL_VERSION, so it warns
+//     "pg_control exists but is broken or wrong version; ignoring it",
+//     GuessControlValues(), and (under --dry-run) prints the guessed dump
+//     (which starts with "pg_control version number"). Exit 0.
+//  2. HEADER RESTORED, REST ZEROED — the first 16 bytes (system_identifier +
+//     pg_control_version + catalog_version_no) make pg_control_version match
+//     PG_CONTROL_VERSION, taking the "different code path" (read_controlfile
+//     succeeds the version check but the CRC fails over the zeroed body), so
+//     pg_resetwal warns "pg_control specifies invalid WAL segment size (0
+//     bytes); proceed with caution", marks the values guessed, and again
+//     prints the dump under --dry-run. Exit 0.
+//  3. PLAIN RUN (no --force) — guessed values block the reset:
+//     "not proceeding because control file values were guessed". Exit 1.
+//  4. --force — proceeds and rewrites the control file. Exit 0.
+//
+// Steps 1–4 are generic pg_resetwal logic (pg_resetwal.c read_controlfile /
+// main). The single goopg-specific dependency is step 2: goopg's pg_control
+// header must carry a pg_control_version that upstream pg_resetwal recognizes,
+// so the header-restored path is reached rather than the broken-version path.
+// That byte-level pg_control compatibility was proven by RW-003
+// (TestPort_PgResetwal001BasicServer); this test exercises the guessed-values
+// code path on top of it. No server is started, so it is independent of the
+// CLOG-startup limitation that defers the maximal-override restart.
+func TestPort_PgResetwal002Corrupted(t *testing.T) {
+	// upstream: postgres/src/bin/pg_resetwal/t/002_corrupted.pl
+	bin := clientToolBin(t, "pg_resetwal")
+	if bin == "" {
+		t.Skip("pg_resetwal not in PATH or postgres/local_install/bin")
+	}
+
+	c := newCluster(t, "pgresetwal002_corrupted")
+	if err := c.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	pgControl := filepath.Join(c.DataDir(), "global", "pg_control")
+
+	// Read out the head of the file to get PG_CONTROL_VERSION in particular
+	// (upstream reads the first 16 bytes).
+	orig, err := os.ReadFile(pgControl)
+	if err != nil {
+		t.Fatalf("read pg_control: %v", err)
+	}
+	size := len(orig)
+	if size < 16 {
+		t.Fatalf("pg_control is only %d bytes; expected >= 16", size)
+	}
+	header := append([]byte(nil), orig[:16]...)
+
+	// --- (1) Fill pg_control with zeros: broken/wrong version, ignored.
+	if err := os.WriteFile(pgControl, make([]byte, size), 0o600); err != nil {
+		t.Fatalf("zero pg_control: %v", err)
+	}
+	res := runTool(t, bin, "--dry-run", c.DataDir())
+	if res.ExitCode != 0 {
+		t.Fatalf("all-zero --dry-run exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	if !strings.Contains(res.Stdout, "pg_control version number") {
+		t.Errorf("all-zero --dry-run stdout missing %q:\n%s", "pg_control version number", res.Stdout)
+	}
+	if !strings.Contains(res.Stderr, "pg_control exists but is broken or wrong version; ignoring it") {
+		t.Errorf("all-zero --dry-run stderr missing broken-version warning:\n%s", res.Stderr)
+	}
+
+	// --- (2) Restore the saved 16-byte header, zero the rest: this uses a
+	// different code path internally, allowing pg_resetwal to process a zero
+	// WAL segment size.
+	restored := make([]byte, size)
+	copy(restored, header)
+	if err := os.WriteFile(pgControl, restored, 0o600); err != nil {
+		t.Fatalf("restore pg_control header: %v", err)
+	}
+	res = runTool(t, bin, "--dry-run", c.DataDir())
+	if res.ExitCode != 0 {
+		t.Fatalf("header-only --dry-run exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	if !strings.Contains(res.Stdout, "pg_control version number") {
+		t.Errorf("header-only --dry-run stdout missing %q:\n%s", "pg_control version number", res.Stdout)
+	}
+	if !strings.Contains(res.Stderr, "pg_control specifies invalid WAL segment size (0 bytes); proceed with caution") {
+		t.Errorf("header-only --dry-run stderr missing zero-segsize warning:\n%s", res.Stderr)
+	}
+
+	// --- (3) A real run refuses while the values were guessed (no --force).
+	res = runTool(t, bin, c.DataDir())
+	if res.ExitCode == 0 {
+		t.Errorf("pg_resetwal succeeded on guessed values without --force; want failure")
+	}
+	if !strings.Contains(res.Stderr, "not proceeding because control file values were guessed") {
+		t.Errorf("guessed-values failure missing expected message:\n%s", res.Stderr)
+	}
+
+	// --- (4) --force proceeds and rewrites the control file.
+	res = runTool(t, bin, "--force", c.DataDir())
+	if res.ExitCode != 0 {
+		t.Errorf("pg_resetwal --force on guessed values exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
 }
 
 // assertSelect1 fails the test unless `SELECT 1` returns a single "1".

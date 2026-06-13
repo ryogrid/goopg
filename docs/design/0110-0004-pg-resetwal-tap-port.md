@@ -168,8 +168,34 @@ during `initdb.Open`, so startup is pathologically slow (looks hung). The
 supported-override restart already exercises the post-reset restart path; only
 the advanced-CLOG id blocks it. The fix — a PG-style `StartupCLOG` page-fill
 instead of a per-xid walk — is a separate WAL/MVCC task. Also still deferred:
-the unclean-shutdown/`--force` branch and `002_corrupted.pl` (no goopg
-crash state in v0).
+the unclean-shutdown/`--force` branch (no goopg crash state in v0).
+
+## Update (loop #48): `002_corrupted.pl` ported (RW-004)
+
+`TestPort_PgResetwal002Corrupted` ports `002_corrupted.pl` faithfully. It inits
+a goopg cluster (never started), then corrupts `global/pg_control` two ways and
+drives the upstream `pg_resetwal` binary:
+
+1. **All zeroes** — `pg_resetwal` cannot match `PG_CONTROL_VERSION`, warns
+   `pg_control exists but is broken or wrong version; ignoring it`,
+   `GuessControlValues()`, and under `--dry-run` prints the dump (which begins
+   `pg_control version number`). Exit 0.
+2. **16-byte header restored, body zeroed** — `pg_control_version` now matches
+   `PG_CONTROL_VERSION`, taking the "different code path" (`read_controlfile`
+   passes the version check but the CRC fails over the zeroed body), so it warns
+   `pg_control specifies invalid WAL segment size (0 bytes); proceed with
+   caution`, marks the values guessed, and again prints the dump. Exit 0.
+3. **Plain run** (no `--force`) — guessed values block the reset:
+   `not proceeding because control file values were guessed`. Exit 1.
+4. **`--force`** — proceeds and rewrites the control file. Exit 0.
+
+Steps 1/3/4 are generic `pg_resetwal` logic. The single goopg dependency is
+step 2: goopg's `pg_control` header must carry a `pg_control_version` upstream
+`pg_resetwal` recognizes — already proven by RW-003. Crucially this test needs
+**no server start**, so it is *not* blocked on goopg's lack of a crash/unclean
+shutdown state (the earlier deferral note that paired `002_corrupted.pl` with
+the `--force` branch was wrong: corrupting `pg_control` on disk directly drives
+the guessed-values path without any unclean shutdown).
 
 ## CSV rows
 
@@ -178,16 +204,18 @@ crash state in v0).
 - `RW-003` → `port` / `pass_required=yes`: `001_basic.pl` server-tier
   pg_control round-trip = `TestPort_PgResetwal001BasicServer`, now including
   the SLRU-derived maximal-override round-trip (loop #47).
+- `RW-004` → `port` / `pass_required=yes`: `002_corrupted.pl` =
+  `TestPort_PgResetwal002Corrupted` (loop #48).
 - `RW-002` → `defer` / `pass_required=no`: the remaining server tier — the
   advanced-CLOG maximal-override **restart** (blocked on a PG-style
-  `StartupCLOG` page-fill), the unclean-shutdown/`--force` branch (no goopg
-  crash state in v0), and `002_corrupted.pl`.
+  `StartupCLOG` page-fill) and the unclean-shutdown/`--force` branch (no goopg
+  crash state in v0).
 
 ## Verification
 
 - `gofmt -l` clean; `go vet ./internal/testport/` clean.
-- `go test -run TestPort_PgResetwal001 ./internal/testport/` → PASS (both CLI
-  and server tiers).
+- `go test -run TestPort_PgResetwal ./internal/testport/` → PASS (CLI tier,
+  server tier, and `002_corrupted.pl` = `TestPort_PgResetwal002Corrupted`).
 - `go test -run TestCheckpointerShutdownSetsDBShutdowned ./internal/wal/` → PASS.
 - `go test -race ./internal/wal/ ./internal/control/ ./internal/initdb/` → PASS.
 - `go test -run TestPort_Recovery ./internal/testport/` → PASS (clean-shutdown
@@ -196,10 +224,10 @@ crash state in v0).
 
 ## Resume point
 
-The SLRU-derived override round-trip is now covered (loop #47). Promote the
-rest of `RW-002` to `port` once (a) `CLog.MarkUnknownAsAborted` is replaced by
-a PG-style `StartupCLOG` page-fill so a cluster whose `NextXID` was advanced by
+`002_corrupted.pl` is now ported (loop #48, RW-004). Promote the rest of
+`RW-002` to `port` once (a) `CLog.MarkUnknownAsAborted` is replaced by a
+PG-style `StartupCLOG` page-fill so a cluster whose `NextXID` was advanced by
 `--next-transaction-id` restarts in bounded time (enabling the upstream
 l.244-245 final restart for the maximal override); and (b) goopg gains a true
-unclean/crash shutdown state so the `--force` branch and `002_corrupted.pl`
-can be reproduced.
+unclean/crash shutdown state so the `--force`-after-unclean-shutdown branch of
+`001_basic.pl` can be reproduced.
