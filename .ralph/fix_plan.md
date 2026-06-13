@@ -784,6 +784,27 @@ if 21-spec pass surfaces a real divergence:
         doc `0102-0019` updated (chosen-approach + testing sections). Gates:
         gofmt/vet/`go build ./...` clean; `go test ./internal/initdb
         ./internal/storage` PASS; CLI test PASS.
+      - **PROGRESS 2026-06-13 (loop #32):** recovery/FPI-replay validation gate
+        for the deferred default-ON flip **landed** (gate (a) of two). New
+        `internal/initdb/recovery_test.go`
+        `TestCrashRecoveryReplaysChecksummedClusterCleanly`: runs the SIGKILL /
+        WAL-replay sequence (build multi-page btree → force WAL durable → drop
+        Manager + WAL writer without flushing the dirty pool → reopen → replay)
+        on a `DataChecksums=true` cluster, then proves every recovered page is
+        checksum-valid two ways — Phase-4 btree reads go through the
+        checksum-enabled Manager (a bad replayed page surfaces as `*ChecksumError`,
+        not a wrong answer) and a Phase-5 on-disk `VerifyPage` walk re-checks
+        every populated block's `pd_checksum`. This is the architectural proof
+        that the FPI restore path (`wal/recovery.go` `restoreDecodedXLogBlockImage`
+        → `writeBlockOrExtend` → `Manager.WriteBlock` → `checksummedForWrite`)
+        recomputes the checksum per replayed block rather than writing a stale
+        image verbatim or bypassing the checksum write seam. Default stays
+        **OFF**: the flip is still gated on (b) standby-read / physical-replication
+        validation (a checksummed primary streaming to a PG standby that verifies
+        `pd_checksum`). Design doc `0102-0019` "Remaining: default-ON flip"
+        updated with gate (a) DONE / gate (b) pending. Gates: gofmt/vet clean;
+        `go test ./internal/initdb` PASS; `go test -race ./internal/storage
+        ./internal/wal` PASS.
       - **Remaining initdb work** (each pulls in a distinct subsystem; one
         per future loop, design doc first): the `--data-checksums`
         **default-ON flip** for PG-18 parity (and the `001_initdb.pl`

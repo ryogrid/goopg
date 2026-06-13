@@ -160,10 +160,30 @@ numbering and never-mutate-input invariants are proven in isolation by
 
 PG 18 defaults checksums **on** (`001_initdb.pl` asserts
 `Data page checksum version: 1` by default). goopg keeps the default **off**
-for now; flipping it is deferred until physical-replication / recovery
-validation confirms a checksummed cluster replays and streams cleanly
-(the FPI-replay and standby-read paths). That flip is a one-line default change
-plus its validation, tracked under M0102-0010.
+for now; flipping it is deferred until two validation gates pass — a checksummed
+cluster must (a) replay its WAL, full-page images included, after an unclean
+shutdown, and (b) stream to a PG standby cleanly.
+
+**Gate (a) — recovery / FPI replay — DONE.**
+`internal/initdb/recovery_test.go`
+`TestCrashRecoveryReplaysChecksummedClusterCleanly` runs the SIGKILL /
+WAL-replay sequence on a `DataChecksums=true` cluster (build a multi-page btree
+→ force WAL durable → drop the Manager + WAL writer without flushing the dirty
+pool → reopen, which replays) and then proves every recovered page is
+checksum-valid two ways: the Phase-4 btree reads go through the checksum-enabled
+Manager (a bad replayed page would surface as `*ChecksumError`, not a wrong
+answer), and a Phase-5 on-disk walk re-verifies every populated block's
+`pd_checksum` under the `off/BlockSize` convention. This is the architectural
+proof that the FPI restore path
+(`wal/recovery.go` `restoreDecodedXLogBlockImage` → `writeBlockOrExtend` →
+`Manager.WriteBlock` → `checksummedForWrite`) recomputes the checksum for each
+replayed block rather than writing a stale image verbatim or bypassing the
+checksum write seam.
+
+**Gate (b) — standby-read / physical replication — still pending.** A checksummed
+goopg primary must stream to a PG (or goopg) standby whose read path verifies
+`pd_checksum`. Once that is validated, the flip itself is a one-line default
+change. Tracked under M0102-0010.
 
 ## Testing
 
@@ -180,6 +200,11 @@ plus its validation, tracked under M0102-0010.
   checksum (off/BlockSize convention) — a missed file fails the test — and
   reads block 0 of pg_type/pg_class/pg_attribute through a checksummed
   Manager (the production read path).
+- `internal/initdb/recovery_test.go` **`TestCrashRecoveryReplaysChecksummedClusterCleanly`**
+  — recovery/FPI-replay gate (a) for the default-ON flip: SIGKILL + WAL replay on
+  a `DataChecksums=true` cluster, then proves every recovered page is
+  checksum-valid via both the checksum-enabled Manager read path and an on-disk
+  `VerifyPage` walk.
 - `internal/initdb/checksum_bootstrap_test.go` — `checksumRelationData`
   per-block numbering / no-input-mutation / transposition-rejection.
 - `cmd/goopg/main_test.go` `TestInitCommandDataChecksums` — the `-k` /
