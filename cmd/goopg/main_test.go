@@ -292,6 +292,49 @@ func TestInitCommandAuthAndPwfile(t *testing.T) {
 	}
 }
 
+// TestInitCommandEncoding drives -E/--encoding through the CLI: a valid name
+// (in initdb's punctuation-insensitive form) lays out a cluster, while an
+// unknown or client-only encoding is rejected (exit 1) with initdb's exact
+// "is not a valid server encoding name" wording and lays out nothing. The
+// byte-level pg_database.encoding wiring is pinned in the initdb package.
+func TestInitCommandEncoding(t *testing.T) {
+	base := t.TempDir()
+
+	// Valid server encoding via the long form, punctuation-insensitive.
+	var stdout, stderr bytes.Buffer
+	dir := filepath.Join(base, "ok")
+	if code := run([]string{"init", "-D", dir, "--no-sync", "--encoding", "LATIN1"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("--encoding LATIN1 exit=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "PG_VERSION")); err != nil {
+		t.Errorf("cluster not laid out: %v", err)
+	}
+
+	// Client-only encoding (SJIS): recognized but rejected as a server encoding.
+	stdout.Reset()
+	stderr.Reset()
+	bad := filepath.Join(base, "client-only")
+	if code := run([]string{"init", "-D", bad, "--no-sync", "-E", "SJIS"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("-E SJIS exit=%d, want 1 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "is not a valid server encoding name") {
+		t.Errorf("stderr=%q want a 'not a valid server encoding name' diagnostic", stderr.String())
+	}
+	if _, err := os.Stat(bad); !os.IsNotExist(err) {
+		t.Errorf("rejected encoding should lay out nothing, but %q exists (err=%v)", bad, err)
+	}
+
+	// Unknown encoding name is likewise rejected.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"init", "-D", filepath.Join(base, "unknown"), "--no-sync", "-E", "bogus"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("-E bogus exit=%d, want 1 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "is not a valid server encoding name") {
+		t.Errorf("stderr=%q want a 'not a valid server encoding name' diagnostic", stderr.String())
+	}
+}
+
 // grepLines returns the lines of s containing substr, for test diagnostics.
 func grepLines(s, substr string) string {
 	var b strings.Builder

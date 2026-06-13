@@ -657,12 +657,39 @@ if 21-spec pass surfaces a real divergence:
         `docs/design/0102-0016-initdb-auth-options.md`. Tests:
         `internal/initdb/auth_bootstrap_test.go`, `cmd/goopg/main_test.go`
         (`TestInitCommandAuthAndPwfile`).
+      - **PROGRESS 2026-06-13 (loop #26):** `-E`/`--encoding` (default database
+        encoding) landed. New `Options.Encoding` + new
+        `internal/initdb/encoding.go` porting `clean_encoding_name`,
+        `pg_char_to_encoding` (full `pg_encname_tbl` alias set +
+        `NAMEDATALEN` 64-byte guard), `pg_valid_server_encoding`
+        (`PG_VALID_BE_ENCODING`: ≤ `PG_KOI8U`=34, so the seven client-only
+        encodings SJIS/BIG5/GBK/UHC/GB18030/JOHAB/SHIFT_JIS_2004 are rejected),
+        `pg_encoding_to_char`, and `resolveEncoding` = `get_encoding_id`
+        (empty→UTF8 default; valid server encoding→ID;
+        unknown/client-only→`"%s" is not a valid server encoding name`). `Init`
+        validates the name up front (right after the superuser check, before
+        auth/trust-warning and any filesystem layout) and threads the ID into
+        `bootstrapPostgresDatabase(dir, encodingID)`, which writes it into the
+        `encoding` column of all three seeded databases instead of the
+        hard-coded `6`. `-E`/`--encoding` registered on the `init` CLI.
+        **Scope:** name validation + ID mapping only. The locale-derived
+        default (`pg_get_encoding_from_locale`) and the
+        `check_locale_encoding`/`check_icu_locale_encoding` mismatch checks are
+        deferred with the `--locale` family (goopg's fixed C/UTF8 locale →
+        SQL_ASCII makes them no-ops); there is no server-side encoding
+        enforcement (on-disk PG-compat only, like the 0102-0016 pwfile
+        verifier). No on-disk format change (same 18-col `pg_database` tuple).
+        Design doc: `docs/design/0102-0017-initdb-encoding-option.md`. Tests:
+        `internal/initdb/encoding_test.go`,
+        `internal/initdb/pg_database_encoding_test.go`, `cmd/goopg/main_test.go`
+        (`TestInitCommandEncoding`).
       - **Remaining initdb options** (each pulls in a distinct subsystem; one
         per future loop, design doc first):
-        `--encoding` (encoding catalogs), `--locale`/`--lc-*` +
-        `--locale-provider`/`--icu-locale` (ICU),
-        `--data-checksums` (page checksums — needs the full page-checksum
-        write/verify path, NOT just a control-file field; high blast radius).
+        `--locale`/`--lc-*` + `--locale-provider`/`--icu-locale` (ICU; also
+        unlocks the deferred locale-derived encoding default + encoding↔locale
+        mismatch checks), `--data-checksums` (page checksums — needs the full
+        page-checksum write/verify path, NOT just a control-file field; high
+        blast radius).
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 

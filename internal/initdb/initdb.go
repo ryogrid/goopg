@@ -243,6 +243,18 @@ type Options struct {
 	// non-interactive).
 	PwFile string
 
+	// Encoding selects the default character-set encoding for the new
+	// cluster's databases, mirroring upstream initdb's -E/--encoding. The
+	// name is matched case-insensitively and punctuation-insensitively
+	// (so "UTF-8", "utf8", and "unicode" all select UTF8) and must name a
+	// valid server-side encoding; an unknown name or a client-only encoding
+	// (SJIS, BIG5, GBK, UHC, GB18030, JOHAB, SHIFT_JIS_2004) is rejected
+	// before any filesystem work, with initdb's exact "is not a valid server
+	// encoding name" wording. When empty, the default is UTF8 (goopg's locale
+	// is fixed at C/UTF8 pending the --locale option family). The chosen
+	// encoding ID is written into pg_database.encoding.
+	Encoding string
+
 	// Registry, when non-nil, is the server's live GUC registry.
 	// Its values for max_connections, max_worker_processes,
 	// max_wal_senders, max_prepared_transactions,
@@ -574,6 +586,14 @@ func Init(opts Options) error {
 	if strings.HasPrefix(superuser, "pg_") {
 		return fmt.Errorf("goopg init: superuser name %q is disallowed; role names cannot begin with \"pg_\"", superuser)
 	}
+	// Resolve + validate the default database encoding up front (upstream
+	// initdb -E/--encoding via get_encoding_id, initdb.c:846) so an unknown
+	// or client-only encoding name aborts before any filesystem work — and
+	// before the trust-default auth warning is printed.
+	encodingID, err := resolveEncoding(opts.Encoding)
+	if err != nil {
+		return err
+	}
 	// Resolve + validate the authentication methods up front (upstream
 	// initdb -A/--auth, --auth-host, --auth-local) before any filesystem
 	// work, so a bad method or a password method without --pwfile aborts
@@ -680,7 +700,7 @@ func Init(opts Options) error {
 	if err != nil {
 		return fmt.Errorf("goopg init: postgres role: %w", err)
 	}
-	if err := bootstrapPostgresDatabase(abs); err != nil {
+	if err := bootstrapPostgresDatabase(abs, encodingID); err != nil {
 		return fmt.Errorf("goopg init: postgres database: %w", err)
 	}
 	// M0106-0010 step 3cs: overwrite the empty btree placeholder at
@@ -1509,7 +1529,7 @@ func bootstrapPostgresRoleWithPassword(dataDir, superuser, rolpassword string) (
 // `Assert("j > attnum")` in nocachegetattr because HEAP_HASVARWIDTH is
 // missing while the TupleDesc believes there are var-width attrs
 // before the target attnum. M0106-0010 Step 3ct.
-func bootstrapPostgresDatabase(dataDir string) error {
+func bootstrapPostgresDatabase(dataDir string, encodingID int32) error {
 	// PG18 pg_database schema (18 cols) per postgres/src/include/catalog/pg_database.h:
 	//   1  oid              Oid
 	//   2  datname          NameData (NAMEDATALEN=64)
@@ -1559,7 +1579,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 			executor.NewIntDatum(int64(oid)),  // oid
 			executor.NewStringDatum(name),     // datname
 			executor.NewIntDatum(10),          // datdba = bootstrap superuser
-			executor.NewIntDatum(6),           // encoding = PG_UTF8
+			executor.NewIntDatum(int64(encodingID)), // encoding (default PG_UTF8=6; -E/--encoding)
 			executor.NewStringDatum("c"),      // datlocprovider = libc
 			executor.NewBoolDatum(isTemplate), // datistemplate
 			executor.NewBoolDatum(allowConn),  // datallowconn

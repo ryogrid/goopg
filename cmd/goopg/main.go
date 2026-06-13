@@ -162,6 +162,10 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	// Both forms bind to the same variable; empty leaves the template default.
 	tsConfig := fs.String("T", "", "default text search configuration")
 	fs.StringVar(tsConfig, "text-search-config", "", "default text search configuration")
+	// Default database encoding (upstream initdb -E/--encoding). Both forms
+	// bind to the same variable; empty means the default (UTF8).
+	encoding := fs.String("E", "", "set default encoding for new databases")
+	fs.StringVar(encoding, "encoding", "", "set default encoding for new databases")
 	// Group access (upstream initdb -g/--allow-group-access). Both forms
 	// bind to the same variable; relaxes the cluster to mode 0750/0640.
 	allowGroupAccess := fs.Bool("g", false, "allow group read/execute on the data directory")
@@ -200,7 +204,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	if *authLocal != "" {
 		resolvedAuthLocal = *authLocal
 	}
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, AllowGroupAccess: *allowGroupAccess, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings}); err != nil {
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, Encoding: *encoding, AllowGroupAccess: *allowGroupAccess, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}

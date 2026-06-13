@@ -83,7 +83,7 @@ func TestBootstrapPostgresDatabaseTupleHasVarWidthAndNullBitmap(t *testing.T) {
 			t.Fatalf("mkdir %s: %v", sub, err)
 		}
 	}
-	if err := bootstrapPostgresDatabase(dir); err != nil {
+	if err := bootstrapPostgresDatabase(dir, pgEncUTF8); err != nil {
 		t.Fatalf("bootstrapPostgresDatabase: %v", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "global", "1262"))
