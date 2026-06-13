@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -188,6 +189,49 @@ func TestInitCommandAllowGroupAccess(t *testing.T) {
 	if !strings.Contains(string(data), "log_file_mode = 0640") {
 		t.Errorf("postgresql.conf missing seeded `log_file_mode = 0640`; got:\n%s",
 			grepLines(string(data), "log_file_mode"))
+	}
+}
+
+// TestInitCommandSyncMethodAndNoSyncDataFiles drives 001_initdb.pl's
+// `initdb --sync-only [--no-sync-data-files] [--sync-method=syncfs]` tier
+// through the CLI: a previously laid-out cluster is re-synced via each
+// option and must exit 0. A bogus --sync-method exits 1 with the
+// "unrecognized sync method" diagnostic.
+func TestInitCommandSyncMethodAndNoSyncDataFiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	var stdout, stderr bytes.Buffer
+	// Lay out a cluster first (no fsync for speed).
+	if code := run([]string{"init", "-D", dir, "--no-sync"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("initial init exit=%d stderr=%q", code, stderr.String())
+	}
+
+	// --sync-only --no-sync-data-files (skips the base/ subtree).
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"init", "-D", dir, "--sync-only", "--no-sync-data-files"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("--sync-only --no-sync-data-files exit=%d stderr=%q", code, stderr.String())
+	}
+
+	// --sync-only --sync-method=syncfs (Linux only).
+	stdout.Reset()
+	stderr.Reset()
+	code := run([]string{"init", "-D", dir, "--sync-only", "--sync-method", "syncfs"}, &stdout, &stderr)
+	if runtime.GOOS == "linux" {
+		if code != 0 {
+			t.Fatalf("--sync-method=syncfs on linux exit=%d stderr=%q", code, stderr.String())
+		}
+	} else if code == 0 {
+		t.Fatalf("--sync-method=syncfs should fail on %s", runtime.GOOS)
+	}
+
+	// Bogus method is rejected with the upstream wording.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"init", "-D", dir, "--sync-only", "--sync-method", "bogus"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("--sync-method=bogus exit=%d, want 1 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "unrecognized sync method") {
+		t.Errorf("stderr=%q want an 'unrecognized sync method' diagnostic", stderr.String())
 	}
 }
 

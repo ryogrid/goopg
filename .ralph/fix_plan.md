@@ -607,14 +607,34 @@ if 21-spec pass surfaces a real divergence:
         Tests: `internal/initdb/group_access_test.go`, `cmd/goopg/main_test.go`
         (`TestInitCommandAllowGroupAccess`). This **completes the entire
         `001_initdb.pl` "Check group access on PGDATA" case.**
+      - **PROGRESS 2026-06-13 (loop #24):** `--sync-method` and
+        `--no-sync-data-files` (sync-method selection + base/ exclusion)
+        landed — **completes the `001_initdb.pl` `--sync-only` tier**
+        (lines 78-91). New `Options.SyncMethod` (`""`/`"fsync"`/`"syncfs"`)
+        + `Options.NoSyncDataFiles`. `fsyncDataDir` generalised to
+        `syncDataDir(dir, method, syncDataFiles)`: FSYNC walks the tree
+        excluding `<dir>/base` when `!syncDataFiles` (new `excludeDir`
+        param on `walkAndFsync`, porting `walkdir`'s
+        `if (exclude_dir && strcmp==0) return`); SYNCFS issues one
+        `syncfs(2)` on the data dir + a relocated `pg_wal` symlink target.
+        `resolveSyncMethod` ports `parse_sync_method` (unrecognized →
+        error; `syncfs` rejected on non-Linux builds via `syncfsSupported`,
+        in build-tagged `syncfs_linux.go`/`syncfs_other.go` using
+        `unix.Syncfs`). Validated up front so both sync-only and full-init
+        reject a bad method before any filesystem work. goopg has no
+        tablespaces, so the upstream `pg_tblspc` passes are intentionally
+        absent and `--no-sync-data-files` is inert under syncfs. Design
+        doc: `docs/design/0102-0015-initdb-sync-method-options.md`. Tests:
+        `internal/initdb/sync_test.go` (resolveSyncMethod table,
+        base/-exclusion behavioral, syncfs, no-sync-data-files),
+        `cmd/goopg/main_test.go` (`TestInitCommandSyncMethodAndNoSyncDataFiles`).
       - **Remaining initdb options** (each pulls in a distinct subsystem; one
         per future loop, design doc first):
         `--encoding` (encoding catalogs), `--locale`/`--lc-*` +
         `--locale-provider`/`--icu-locale` (ICU),
-        `--data-checksums` (page checksums),
-        `--auth`/`--auth-host`/`--auth-local`/`--pwfile`
-        (auth bootstrap), `--sync-method`/`--no-sync-data-files`
-        (syncfs sync method + base/ exclusion — deferred from loop #21).
+        `--data-checksums` (page checksums — needs the full page-checksum
+        write/verify path, NOT just a control-file field; high blast radius),
+        `--auth`/`--auth-host`/`--auth-local`/`--pwfile` (auth bootstrap).
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 

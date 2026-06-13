@@ -179,6 +179,23 @@ type Options struct {
 	// syncing is the entire purpose of the operation.
 	SyncOnly bool
 
+	// SyncMethod selects how the data directory is flushed to disk:
+	// "" or "fsync" (default, a recursive fsync of every file/dir) or
+	// "syncfs" (one syncfs(2) per filesystem). Mirrors upstream initdb's
+	// --sync-method (parse_sync_method, src/fe_utils/option_utils.c:90).
+	// An unrecognized value is rejected before any work; "syncfs" is
+	// rejected on builds without syncfs support (non-Linux), matching
+	// upstream's HAVE_SYNCFS gate.
+	SyncMethod string
+
+	// NoSyncDataFiles, when true, excludes the per-database data files in
+	// base/ from the fsync pass, mirroring upstream initdb's
+	// --no-sync-data-files (sync_data_files=false, initdb.c:3396). Under
+	// the syncfs method it has no effect, because syncfs flushes the whole
+	// filesystem and goopg creates no tablespace symlinks (the only place
+	// upstream's sync_data_files gate applies under syncfs).
+	NoSyncDataFiles bool
+
 	// TextSearchConfig, when non-empty, seeds
 	// default_text_search_config in postgresql.conf as
 	// 'pg_catalog.<value>', mirroring upstream initdb's
@@ -262,24 +279,78 @@ func setupWALDir(abs, walDir string) error {
 	return nil
 }
 
-// fsyncDataDir recursively fsyncs every regular file and directory under
-// dataDir so the cluster is durable on disk, mirroring upstream initdb's
-// sync_pgdata with the default FSYNC method (src/common/file_utils.c).
+// dataDirSyncMethod selects how syncDataDir flushes the cluster to disk,
+// mirroring upstream's DataDirSyncMethod (src/include/common/file_utils.h).
+type dataDirSyncMethod int
+
+const (
+	syncMethodFsync  dataDirSyncMethod = iota // recursive fsync (default)
+	syncMethodSyncfs                          // one syncfs(2) per filesystem
+)
+
+// resolveSyncMethod ports parse_sync_method (src/fe_utils/option_utils.c:90):
+// "" or "fsync" → FSYNC; "syncfs" → SYNCFS, but only where syncfs is
+// supported (HAVE_SYNCFS / Linux), else rejected; anything else is an
+// "unrecognized sync method" error.
+func resolveSyncMethod(s string) (dataDirSyncMethod, error) {
+	switch s {
+	case "", "fsync":
+		return syncMethodFsync, nil
+	case "syncfs":
+		if !syncfsSupported {
+			return 0, fmt.Errorf("goopg init: this build does not support sync method \"syncfs\"")
+		}
+		return syncMethodSyncfs, nil
+	default:
+		return 0, fmt.Errorf("goopg init: unrecognized sync method: %s", s)
+	}
+}
+
+// syncDataDir flushes dataDir to disk so the cluster is durable, mirroring
+// upstream initdb's sync_pgdata (src/common/file_utils.c).
 //
-// The top-level walk ignores symlinks, exactly as sync_pgdata does, so an
-// external WAL directory linked at <dataDir>/pg_wal is fsynced separately
-// by recursing through that symlink. goopg init creates no tablespace
-// symlinks under pg_tblspc, so (unlike upstream) there is no second
-// process_symlinks pass for pg_tblspc.
-func fsyncDataDir(dataDir string) error {
-	if err := walkAndFsync(dataDir, false); err != nil {
+// FSYNC method: recursively fsync every regular file and directory under
+// dataDir. When syncDataFiles is false, the base/ subtree (the per-database
+// data files) is excluded, exactly as upstream sets exclude_dir =
+// "<pg_data>/base" for --no-sync-data-files. The top-level walk ignores
+// symlinks, so an external WAL directory linked at <dataDir>/pg_wal is
+// fsynced separately by recursing through that symlink. goopg init creates
+// no tablespace symlinks under pg_tblspc, so (unlike upstream) there is no
+// second process_symlinks pass for pg_tblspc.
+//
+// SYNCFS method: a single syncfs(2) on dataDir flushes its whole filesystem,
+// plus a syncfs of a relocated pg_wal symlink target. syncDataFiles has no
+// effect here — upstream only uses it to gate per-tablespace syncfs calls,
+// and goopg has no tablespaces.
+func syncDataDir(dataDir string, method dataDirSyncMethod, syncDataFiles bool) error {
+	pgWal := filepath.Join(dataDir, "pg_wal")
+	walIsSymlink := false
+	if info, err := os.Lstat(pgWal); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		walIsSymlink = true
+	}
+
+	if method == syncMethodSyncfs {
+		if err := syncfsPath(dataDir); err != nil {
+			return err
+		}
+		if walIsSymlink {
+			if err := syncfsPath(pgWal); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// FSYNC method.
+	excludeDir := ""
+	if !syncDataFiles {
+		excludeDir = filepath.Join(dataDir, "base")
+	}
+	if err := walkAndFsync(dataDir, false, excludeDir); err != nil {
 		return err
 	}
-	// If pg_wal is a symlink to an external WAL directory, the walk
-	// above skipped it; recurse through the link to flush its contents.
-	pgWal := filepath.Join(dataDir, "pg_wal")
-	if info, err := os.Lstat(pgWal); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		if err := walkAndFsync(pgWal, true); err != nil {
+	if walIsSymlink {
+		if err := walkAndFsync(pgWal, true, ""); err != nil {
 			return err
 		}
 	}
@@ -293,7 +364,17 @@ func fsyncDataDir(dataDir string) error {
 // followTopSymlink is true (used to descend into a relocated pg_wal). Symlinks
 // encountered in subdirectories are always ignored, matching upstream's
 // intentional choice not to propagate process_symlinks into recursive calls.
-func walkAndFsync(path string, followTopSymlink bool) error {
+//
+// excludeDir, when non-empty, is a directory path that is skipped entirely
+// (neither descended nor fsynced), porting walkdir's
+// `if (exclude_dir && strcmp(exclude_dir, path) == 0) return;`. It is used
+// for --no-sync-data-files (excludeDir = <dataDir>/base) and is propagated
+// into recursive calls exactly as upstream does, though it only ever matches
+// the top-level base/ directory.
+func walkAndFsync(path string, followTopSymlink bool, excludeDir string) error {
+	if excludeDir != "" && path == excludeDir {
+		return nil
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		return err
@@ -320,7 +401,7 @@ func walkAndFsync(path string, followTopSymlink bool) error {
 				continue
 			}
 			if e.IsDir() {
-				if err := walkAndFsync(child, false); err != nil {
+				if err := walkAndFsync(child, false, excludeDir); err != nil {
 					return err
 				}
 			} else if e.Type().IsRegular() {
@@ -436,6 +517,13 @@ func Init(opts Options) error {
 	if err != nil {
 		return fmt.Errorf("goopg init: resolve %q: %w", opts.DataDir, err)
 	}
+	// Validate the sync method up front (mirrors parse_sync_method, which
+	// initdb runs during option parsing) so both the sync-only and full-init
+	// paths reject a bad value before touching the filesystem.
+	syncMethod, err := resolveSyncMethod(opts.SyncMethod)
+	if err != nil {
+		return err
+	}
 	// Sync-only mode (upstream initdb -S/--sync-only, initdb.c:3439):
 	// fsync an already-initialized data directory to disk and exit
 	// without creating a new cluster. The directory must already exist
@@ -448,7 +536,7 @@ func Init(opts Options) error {
 		if err != nil || !info.IsDir() {
 			return fmt.Errorf("goopg init: could not access directory %q", abs)
 		}
-		if err := fsyncDataDir(abs); err != nil {
+		if err := syncDataDir(abs, syncMethod, !opts.NoSyncDataFiles); err != nil {
 			return fmt.Errorf("goopg init: sync data to disk: %w", err)
 		}
 		return nil
@@ -938,7 +1026,7 @@ func Init(opts Options) error {
 	// sync_pgdata (initdb.c:3512). Skipped when NoSync is set
 	// (-N/--no-sync), which trades durability for speed.
 	if !opts.NoSync {
-		if err := fsyncDataDir(abs); err != nil {
+		if err := syncDataDir(abs, syncMethod, !opts.NoSyncDataFiles); err != nil {
 			return fmt.Errorf("goopg init: sync data to disk: %w", err)
 		}
 	}

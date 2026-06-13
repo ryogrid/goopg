@@ -152,6 +152,12 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(noSync, "no-sync", false, "do not wait for changes to be written safely to disk")
 	syncOnly := fs.Bool("S", false, "only sync an existing data directory to disk, then exit")
 	fs.BoolVar(syncOnly, "sync-only", false, "only sync an existing data directory to disk, then exit")
+	// Sync method + data-file exclusion (upstream initdb --sync-method and
+	// --no-sync-data-files). --sync-method accepts "fsync" (default) or
+	// "syncfs"; --no-sync-data-files skips the base/ subtree. Both are
+	// long-form only, matching upstream (no short forms).
+	syncMethod := fs.String("sync-method", "", "set method for syncing files to disk (fsync or syncfs)")
+	noSyncDataFiles := fs.Bool("no-sync-data-files", false, "do not sync files within database directories")
 	// Default text search configuration (upstream initdb -T/--text-search-config).
 	// Both forms bind to the same variable; empty leaves the template default.
 	tsConfig := fs.String("T", "", "default text search configuration")
@@ -176,7 +182,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "goopg init: %s\n", extraGUC.err)
 		return 2
 	}
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, TextSearchConfig: *tsConfig, AllowGroupAccess: *allowGroupAccess, ExtraGUC: extraGUC.settings}); err != nil {
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, AllowGroupAccess: *allowGroupAccess, ExtraGUC: extraGUC.settings}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
