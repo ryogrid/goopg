@@ -632,14 +632,15 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
       - Target tests:
         | Test | Status | Rationale |
         |------|--------|-----------|
-        | `postgres/src/bin/pg_amcheck/t/001_basic.pl` | UNIMPLEMENTED | Basic --help/--version + connection check. |
-        | `postgres/src/bin/pg_amcheck/t/002_nonesuch.pl` | UNIMPLEMENTED | Handles non-existent database/relation. |
-        | `postgres/src/bin/pg_amcheck/t/003_check.pl` | UNIMPLEMENTED | Runs actual heap/btree corruption checks against a server. |
-        | `postgres/src/bin/pg_amcheck/t/004_verify_heapam.pl` | UNIMPLEMENTED | `verify_heapam()` function required (not in goopg). |
-        | `postgres/src/bin/pg_amcheck/t/005_opclass_damage.pl` | UNIMPLEMENTED | Operator-class damage detection; requires opclass system catalog parity. |
-      - Action: all blocked on `verify_heapam()` SRF + opclass catalog
-        coverage.  Low priority; revisit when system catalog maturity
-        increases and the pg_dump tests pass.
+        | `postgres/src/bin/pg_amcheck/t/001_basic.pl` | **PORTED 2026-06-13 (CLI tier)** | `TestPort_PgAmcheck001Basic` (`internal/testport/pgamcheck_port_test.go`). 14-line CLI-only test (`program_help_ok`/`program_version_ok`/`program_options_handling_ok`) — decided by the binary's arg parser before any server connection. New `runToolWithLib` helper sets `LD_LIBRARY_PATH=postgres/local_install/lib` (bundled pg_amcheck links `PQcancelBlocking`, a PG 17+ libpq symbol absent from older host libpq). CSV row AC-001 → port. Design: `docs/design/0110-0003-pg-amcheck-tap-port.md`. |
+        | `postgres/src/bin/pg_amcheck/t/002_nonesuch.pl` | UNIMPLEMENTED (deferred AC-002) | Handles non-existent database/relation; still issues catalog queries against a live server. |
+        | `postgres/src/bin/pg_amcheck/t/003_check.pl` | UNIMPLEMENTED (deferred AC-002) | Runs actual heap/btree corruption checks against a server. |
+        | `postgres/src/bin/pg_amcheck/t/004_verify_heapam.pl` | UNIMPLEMENTED (deferred AC-002) | `verify_heapam()` function required (not in goopg). |
+        | `postgres/src/bin/pg_amcheck/t/005_opclass_damage.pl` | UNIMPLEMENTED (deferred AC-002) | Operator-class damage detection; requires opclass system catalog parity. |
+      - Action: 001_basic CLI tier ported (loop #18). The four server-dependent
+        tests are deferred under CSV row AC-002, blocked on `verify_heapam()` SRF
+        + opclass catalog coverage. Resume = promote AC-002 (002_nonesuch first —
+        only error-path catalog lookups) when those land.
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

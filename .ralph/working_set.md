@@ -1,39 +1,37 @@
-Task: M0110-0002 — Port pg_waldump TAP tests. Landed the CLI-only tier of
-001_basic.pl; server tier + 002_save_fullpage.pl deferred. (idle — nothing in
-flight on this task.)
+Task: M0110-0003 — Port pg_amcheck TAP tests. Landed the CLI-only tier of
+001_basic.pl; server-dependent tests (002–005) deferred under AC-002.
+(idle — nothing in flight on this task once committed.)
 
 Files (this loop):
-- internal/testport/pgwaldump_port_test.go (NEW) — TestPort_PgWaldump001Basic +
-  commandLikeMatching helper (mirror command_like). Reuses programHelpOk/
-  programVersionOk/programOptionsHandlingOk/commandFailsContaining from
-  pgdump_port_test.go (same package).
-- docs/test-port/postgres-oracle-port-status.csv — WD-001 (port) + WD-002
-  (defer) added below W-001.
+- internal/testport/pgamcheck_port_test.go (NEW) — TestPort_PgAmcheck001Basic +
+  runToolWithLib helper (sets LD_LIBRARY_PATH=postgres/local_install/lib).
+  Reuses clientToolBin + repoRoot from the same package.
+- docs/test-port/postgres-oracle-port-status.csv — AC-001 (port) + AC-002
+  (defer) added below WD-002.
 - docs/test-port/postgres-oracle-port-status.md — regenerated.
-- docs/design/0110-0002-pg-waldump-tap-port.md (NEW) + README index row.
-- .ralph/fix_plan.md (M0110-0002 progress), .ralph/deferral_ledger.md.
+- docs/design/0110-0003-pg-amcheck-tap-port.md (NEW) + README index row.
+- .ralph/fix_plan.md (M0110-0003 progress), .ralph/deferral_ledger.md.
 
 Key facts learned this loop:
-- 001_basic.pl has TWO tiers: (1) pure CLI option-handling (lines 10-77, no
-  server) — PORTED; (2) server tier (lines 80-323) running DDL over
-  heap/btree/hash/gin/gist/spgist/brin + tablespaces + logical messages then
-  asserting per-rmgr/-relation/-block filtering — DEFERRED (goopg lacks
-  hash/gin/gist/spgist/brin AMs).
-- Upstream binaries in postgres/local_install/bin have rpath baked in — run
-  fine WITHOUT LD_LIBRARY_PATH (runTool needs no env tweak).
-- W-001 (TestPort_WALPgWaldumpCompat) already covers goopg WAL-format
-  readability by upstream pg_waldump for supported record types — so deferring
-  the server tier leaves no compat gap for implemented features.
-- PG 18.3 --rmgr=list output pinned in test (22 rmgrs, XLOG..LogicalMessage).
-- This is a test-only port (internal/testport, drives upstream binary); no
+- pg_amcheck/t/001_basic.pl is only 14 lines: program_help_ok /
+  program_version_ok / program_options_handling_ok / done_testing. Pure CLI.
+- WRINKLE vs pg_dump/pg_waldump: bundled pg_amcheck links PQcancelBlocking
+  (PG 17+ libpq cancel API). Run against the host's older libpq.so.5 it dies at
+  startup: "undefined symbol: PQcancelBlocking". Fix = LD_LIBRARY_PATH at
+  postgres/local_install/lib (new runToolWithLib helper; runTool left untouched
+  so pg_dump/pg_waldump ports keep behaviour). util.CommandSpec.Env appends to
+  os.Environ() (later wins), so setting just LD_LIBRARY_PATH is enough.
+- Test-only port (internal/testport, drives upstream binary); no
   executor/planner/catalog code touched → TPC-H spotcheck gate not applicable.
 
 Next step: pick next topmost fix_plan item. Candidates still isolated to
-testport: M0110-0003 (pg_amcheck — all UNIMPLEMENTED, blocked on verify_heapam
-SRF + opclass catalog), M0110-0004 (pg_resetwal 001_basic — control-file
-parse, depends on M0106 pg_control byte-compat). Or M0110-0001 resume
-(pg_dump 002_pg_dump) once catalog-view parity lands.
+testport: M0110-0004 (pg_resetwal 001_basic — 247 lines, control-file parse,
+depends on M0106 pg_control byte-compat; check whether a CLI-only tier exists).
+Or M0110-0001/0002 server-tier resume once catalog/AM parity lands. Note
+M0102-0009 (sync_remote_apply 45s timeout) and M0102-0010 (more initdb options)
+are also open but heavier.
 
 Gates run: gofmt clean; go vet ./internal/testport PASS;
-go test -run TestPort_PgWaldump001Basic ./internal/testport PASS;
-gen-oracle-port-status regenerated OK; go build ./... PASS.
+go test -run TestPort_PgAmcheck001Basic ./internal/testport PASS;
+go build ./... PASS; gen-oracle-port-status regenerated OK.
+Pending: make ralph-state-guard (run immediately before status block).
