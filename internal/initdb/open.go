@@ -2001,7 +2001,14 @@ func (r *Runtime) Close() error {
 	// Errors here are logged but do not abort Close — file handles
 	// must still be released so the process can exit cleanly.
 	if r.Checkpointer != nil {
-		if err := r.Checkpointer.CheckpointNow(); err != nil {
+		// Use the shutdown variant so pg_control's State lands on
+		// DB_SHUTDOWNED — this is the final durable checkpoint of a clean
+		// shutdown, after which no further WAL is written. External tools
+		// (pg_resetwal/pg_rewind/pg_controldata) read this byte to decide
+		// whether the cluster needs recovery (M0110-0004 / RW-002). The
+		// earlier OnStop checkpoint deliberately stays DB_IN_PRODUCTION so
+		// a crash in the OnStop→Close window is still flagged as unclean.
+		if err := r.Checkpointer.CheckpointShutdown(); err != nil {
 			slog.Default().Warn(
 				"final shutdown checkpoint failed",
 				"err", err,

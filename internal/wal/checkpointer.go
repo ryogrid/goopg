@@ -158,7 +158,7 @@ type Checkpointer struct {
 	// caller opts in by passing SetRetainer).
 	retainer Retainer
 
-	lastCheckpointLSN atomic.Uint64
+	lastCheckpointLSN     atomic.Uint64
 	lastCheckpointRedoLSN atomic.Uint64
 
 	// Aggregate counters surfaced through pg_stat_checkpointer.
@@ -291,7 +291,7 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := c.runCheckpoint(ctx, true); err != nil {
+			if err := c.runCheckpoint(ctx, true, false); err != nil {
 				c.cfg.Logger.Warn("checkpoint failed", "err", err)
 			}
 		case <-volumeC:
@@ -301,7 +301,7 @@ func (c *Checkpointer) Run(ctx context.Context) error {
 			// Volume-triggered checkpoints run at IMMEDIATE
 			// speed: max_wal_size is a backpressure signal,
 			// not a cadence knob.
-			if err := c.runCheckpoint(ctx, false); err != nil {
+			if err := c.runCheckpoint(ctx, false, false); err != nil {
 				c.cfg.Logger.Warn("volume-triggered checkpoint failed", "err", err)
 			}
 		}
@@ -331,7 +331,22 @@ func (c *Checkpointer) volumeTriggerFires(vr volumeReporter) bool {
 // subcommand both call this. Spread/throttling is bypassed;
 // the caller asked for fast.
 func (c *Checkpointer) CheckpointNow() error {
-	return c.runCheckpoint(context.Background(), false)
+	return c.runCheckpoint(context.Background(), false, false)
+}
+
+// CheckpointShutdown runs a synchronous shutdown checkpoint: identical
+// to CheckpointNow except it stamps pg_control's State field with
+// DB_SHUTDOWNED instead of DB_IN_PRODUCTION. This mirrors upstream's
+// CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN) path (xlog.c), which sets
+// ControlFile->state = DB_SHUTDOWNED once a shutdown checkpoint
+// completes. It MUST be the last checkpoint of a clean shutdown (goopg
+// wires it into Runtime.Close, the final durable checkpoint before WAL
+// is closed) so external tools — pg_resetwal, pg_rewind, pg_controldata
+// — observe a cleanly-shut-down cluster. goopg's own startup replays
+// WAL regardless of State, so this is primarily an on-disk
+// compatibility surface (M0110-0004 / RW-002).
+func (c *Checkpointer) CheckpointShutdown() error {
+	return c.runCheckpoint(context.Background(), false, true)
 }
 
 // runCheckpoint executes one checkpoint cycle. When `spread` is
@@ -346,7 +361,7 @@ func (c *Checkpointer) CheckpointNow() error {
 // CHECKPOINT / CLI ctl / volume-triggered cycles set `spread=false`
 // and bump num_requested. write_time_ms accumulates the wall time
 // spent in flushDirty, matching upstream's checkpointer view.
-func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
+func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool) error {
 	start := time.Now()
 	checkpointType := "requested"
 	if spread {
@@ -437,7 +452,18 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread bool) error {
 		now := time.Now().Unix()
 		guc := c.cfg.GUCParams
 		if err := control.UpdateControlFile(c.cfg.DataDir, func(cd *control.ControlFileData) {
-			cd.State = control.DBStateInProduction
+			// A shutdown checkpoint leaves the cluster cleanly shut down
+			// (DB_SHUTDOWNED); every other checkpoint runs while the
+			// cluster is live (DB_IN_PRODUCTION). Mirrors upstream's
+			// CreateCheckPoint state assignment in xlog.c — only the
+			// CHECKPOINT_IS_SHUTDOWN path sets DB_SHUTDOWNED. External
+			// tools (pg_resetwal/pg_rewind/pg_controldata) gate on this
+			// byte to decide whether recovery is required.
+			if shutdown {
+				cd.State = control.DBStateShutdowned
+			} else {
+				cd.State = control.DBStateInProduction
+			}
 			cd.Time = now
 			cd.CheckPoint = checkLSN0
 			cd.CheckPointCopyRedo = redoLSN0

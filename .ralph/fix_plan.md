@@ -970,6 +970,20 @@ Porting validates goopg's pg_control and WAL segment layout on disk.
         once goopg's pg_control round-trips through upstream pg_resetwal and the
         pg_commit_ts/pg_multixact/pg_xact SLRU directories expose the expected
         segment-file layout.
+      - **PROGRESS 2026-06-14 (loop #45):** the pg_control read/write round-trip
+        HALF of the server tier is now PORTED as
+        `TestPort_PgResetwal001BasicServer` (CSV row RW-003 → port). Root cause
+        of the prior block was a clean-shutdown state bug: every checkpoint
+        (incl. the final `Runtime.Close` shutdown checkpoint) stamped
+        pg_control `State=DB_IN_PRODUCTION`, so after a clean `goopg stop`
+        pg_resetwal reported "database server was not shut down cleanly" and
+        refused without `--force`. Fix: new `wal.Checkpointer.CheckpointShutdown`
+        stamps `DB_SHUTDOWNED` (mirrors PG `CHECKPOINT_IS_SHUTDOWN`), wired into
+        `Runtime.Close`. The ported test exercises perms/`-n`/lock-file/clean
+        `--pgdata` reset/`SELECT 1`/`--next-oid` override + restart. Still
+        deferred under RW-002: the unclean-shutdown/`--force` branch (goopg v0
+        has no crash state) and the SLRU-derived id overrides + 002_corrupted.
+        Design: `docs/design/0110-0004-pg-resetwal-tap-port.md`.
 
 ### pg_verifybackup (10 tests — excluded → no action)
 

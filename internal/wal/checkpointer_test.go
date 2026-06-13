@@ -69,7 +69,7 @@ func TestCheckpointerSpreadPacing(t *testing.T) {
 		CompletionTarget: 0.5,
 	})
 
-	if err := cp.runCheckpoint(context.Background(), true); err != nil {
+	if err := cp.runCheckpoint(context.Background(), true, false); err != nil {
 		t.Fatalf("runCheckpoint(spread): %v", err)
 	}
 	if len(pf.progresses) != 4 {
@@ -123,7 +123,7 @@ func TestCheckpointerSpreadHonoursDeadlines(t *testing.T) {
 		CompletionTarget: 0.5,
 	})
 	start := time.Now()
-	if err := cp.runCheckpoint(context.Background(), true); err != nil {
+	if err := cp.runCheckpoint(context.Background(), true, false); err != nil {
 		t.Fatal(err)
 	}
 	elapsed := time.Since(start)
@@ -189,7 +189,7 @@ func TestCheckpointerDoDWritePacing(t *testing.T) {
 		CompletionTarget: target,
 	})
 	start := time.Now()
-	if err := cp.runCheckpoint(context.Background(), true); err != nil {
+	if err := cp.runCheckpoint(context.Background(), true, false); err != nil {
 		t.Fatalf("runCheckpoint(spread): %v", err)
 	}
 	elapsed := time.Since(start)
@@ -211,7 +211,7 @@ func TestCheckpointerDoDWritePacing(t *testing.T) {
 		CompletionTarget: target,
 	})
 	immediateStart := time.Now()
-	if err := cp2.runCheckpoint(context.Background(), false); err != nil {
+	if err := cp2.runCheckpoint(context.Background(), false, false); err != nil {
 		t.Fatalf("runCheckpoint(immediate): %v", err)
 	}
 	immediateElapsed := time.Since(immediateStart)
@@ -496,7 +496,6 @@ func TestEncodeDecodePageImageRoundTrip(t *testing.T) {
 	}
 }
 
-
 // TestCheckpointerUpdatesPgControl verifies that runCheckpoint writes an
 // updated pg_control to disk (state=DB_IN_PRODUCTION, non-zero checkPoint)
 // when CheckpointerConfig.DataDir is set.
@@ -534,7 +533,7 @@ func TestCheckpointerUpdatesPgControl(t *testing.T) {
 	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
 		DataDir: dir,
 	})
-	if err := cp.runCheckpoint(context.Background(), false); err != nil {
+	if err := cp.runCheckpoint(context.Background(), false, false); err != nil {
 		t.Fatalf("runCheckpoint: %v", err)
 	}
 
@@ -560,6 +559,68 @@ func TestCheckpointerUpdatesPgControl(t *testing.T) {
 	gotCRC := le.Uint32(got[292:])
 	if gotCRC != wantCRC {
 		t.Errorf("CRC mismatch after checkpoint: got %#x want %#x", gotCRC, wantCRC)
+	}
+}
+
+// TestCheckpointerShutdownSetsDBShutdowned pins the M0110-0004 invariant:
+// CheckpointShutdown stamps pg_control State = DB_SHUTDOWNED (1) while an
+// ordinary checkpoint leaves DB_IN_PRODUCTION (6). Upstream tools
+// (pg_resetwal/pg_rewind/pg_controldata) read this byte to decide whether
+// the cluster needs recovery; a clean goopg shutdown must look clean.
+func TestCheckpointerShutdownSetsDBShutdowned(t *testing.T) {
+	newCP := func(t *testing.T) (*Checkpointer, string) {
+		t.Helper()
+		dir := t.TempDir()
+		globalDir := filepath.Join(dir, "global")
+		if err := os.MkdirAll(globalDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 8192)
+		le := binary.LittleEndian
+		le.PutUint64(buf[0:], 0x0102030405060708)
+		le.PutUint32(buf[8:], 1800)
+		le.PutUint32(buf[16:], 6) // start from DB_IN_PRODUCTION
+		crcTable := crc32.MakeTable(crc32.Castagnoli)
+		le.PutUint32(buf[292:], crc32.Checksum(buf[:292], crcTable))
+		if err := os.WriteFile(filepath.Join(globalDir, "pg_control"), buf, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		w, err := NewWriter(Config{WALDir: filepath.Join(dir, "pg_wal"),
+			SegmentSize: 4096, PageHeaders: true, TimelineID: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = w.Close() })
+		return NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{DataDir: dir}), dir
+	}
+	readState := func(t *testing.T, dir string) uint32 {
+		t.Helper()
+		got, err := os.ReadFile(filepath.Join(dir, "global", "pg_control"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return binary.LittleEndian.Uint32(got[16:])
+	}
+
+	// CheckpointShutdown → DB_SHUTDOWNED (1).
+	cp, dir := newCP(t)
+	if err := cp.CheckpointShutdown(); err != nil {
+		t.Fatalf("CheckpointShutdown: %v", err)
+	}
+	if state := readState(t, dir); state != 1 {
+		t.Errorf("shutdown checkpoint state: got %d want %d (DB_SHUTDOWNED)",
+			state, 1)
+	}
+
+	// CheckpointNow → DB_IN_PRODUCTION (6), confirming the flag is honoured
+	// in both directions on the same code path.
+	cp2, dir2 := newCP(t)
+	if err := cp2.CheckpointNow(); err != nil {
+		t.Fatalf("CheckpointNow: %v", err)
+	}
+	if state := readState(t, dir2); state != 6 {
+		t.Errorf("online checkpoint state: got %d want %d (DB_IN_PRODUCTION)",
+			state, 6)
 	}
 }
 
@@ -605,7 +666,7 @@ func TestCheckpointerWritesNextXidIntoPgControl(t *testing.T) {
 			return 4711
 		},
 	})
-	if err := cp.runCheckpoint(context.Background(), false); err != nil {
+	if err := cp.runCheckpoint(context.Background(), false, false); err != nil {
 		t.Fatalf("runCheckpoint: %v", err)
 	}
 	if nextCalls == 0 {
@@ -626,7 +687,7 @@ func TestCheckpointerWritesNextXidIntoPgControl(t *testing.T) {
 		DataDir:   dir,
 		NextXIDFn: func() uint64 { return 100 },
 	})
-	if err := cp2.runCheckpoint(context.Background(), false); err != nil {
+	if err := cp2.runCheckpoint(context.Background(), false, false); err != nil {
 		t.Fatalf("runCheckpoint (regression attempt): %v", err)
 	}
 	got, err = os.ReadFile(filepath.Join(globalDir, "pg_control"))
@@ -665,7 +726,7 @@ func TestCheckpointerCallsPostCheckpointFn(t *testing.T) {
 			return nil
 		},
 	})
-	if err := cp.runCheckpoint(context.Background(), false); err != nil {
+	if err := cp.runCheckpoint(context.Background(), false, false); err != nil {
 		t.Fatalf("runCheckpoint: %v", err)
 	}
 	if callCount != 1 {
@@ -673,7 +734,7 @@ func TestCheckpointerCallsPostCheckpointFn(t *testing.T) {
 	}
 
 	// A second checkpoint must also invoke the hook.
-	if err := cp.runCheckpoint(context.Background(), false); err != nil {
+	if err := cp.runCheckpoint(context.Background(), false, false); err != nil {
 		t.Fatalf("second runCheckpoint: %v", err)
 	}
 	if callCount != 2 {
@@ -699,7 +760,7 @@ func TestCheckpointerPostCheckpointFnErrorIsNonFatal(t *testing.T) {
 		},
 	})
 	// runCheckpoint must succeed even when the hook errors.
-	if err := cp.runCheckpoint(context.Background(), false); err != nil {
+	if err := cp.runCheckpoint(context.Background(), false, false); err != nil {
 		t.Errorf("runCheckpoint returned error %v, want nil (hook errors must be non-fatal)", err)
 	}
 }

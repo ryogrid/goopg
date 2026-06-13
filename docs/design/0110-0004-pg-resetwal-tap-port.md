@@ -77,25 +77,91 @@ pg_control byte-level read/write round-trip compatibility (M0106) plus on-disk
 SLRU-segment-layout parity (`pg_commit_ts`, `pg_multixact`, `pg_xact`).
 `002_corrupted.pl` is deferred under the same row.
 
+## Update (loop #45): server-tier pg_control round-trip ported (RW-003)
+
+The pg_control read/write round-trip half of the server tier is now ported.
+Empirically, upstream `pg_resetwal` already reads goopg's `global/pg_control`
+fully (`-n` prints the complete checkpoint dump), rewrites it (`--pgdata` resets
+the WAL + control file), and goopg restarts cleanly from the reset directory.
+The one remaining blocker was a **clean-shutdown state bug**, fixed here.
+
+### Root cause: clean shutdown left `DB_IN_PRODUCTION`
+
+`wal.Checkpointer.runCheckpoint` unconditionally stamped
+`pg_control.State = DB_IN_PRODUCTION` on every checkpoint, including the final
+shutdown checkpoint taken in `Runtime.Close`. So after a clean `goopg stop`,
+`pg_controldata` reported `Database cluster state: in production`, and
+`pg_resetwal` refused without `--force`:
+
+```
+pg_resetwal: error: database server was not shut down cleanly
+```
+
+PostgreSQL's `CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN)` path sets
+`ControlFile->state = DB_SHUTDOWNED` once a shutdown checkpoint completes
+(`postgres/src/backend/access/transam/xlog.c`). External tools gate on this
+byte to decide whether recovery is required.
+
+### Fix
+
+- `runCheckpoint(ctx, spread, shutdown bool)` — new `shutdown` flag selects
+  `DBStateShutdowned` vs `DBStateInProduction` for the on-disk `State`.
+- `Checkpointer.CheckpointShutdown()` — public entry that runs the checkpoint
+  with `shutdown=true`.
+- `Runtime.Close` calls `CheckpointShutdown()` for the *final* durable
+  checkpoint (after which no further WAL is written). The earlier `OnStop`
+  checkpoint deliberately stays `DB_IN_PRODUCTION`, so a crash in the
+  `OnStop`→`Close` window is still correctly flagged unclean.
+
+goopg's own startup replays WAL regardless of `State` (verified: no startup
+path branches on it), so this is purely an on-disk compatibility surface — a
+clean restart and `SELECT 1` still succeed, and crash recovery is unaffected.
+
+### Known minor divergence (follow-up, not blocking)
+
+A *running* goopg shows `State=DB_SHUTDOWNED` from restart until the first
+online checkpoint flips it back to `DB_IN_PRODUCTION` (PostgreSQL stamps
+`DB_IN_PRODUCTION` at the end of `StartupXLOG`). No functional path depends on
+this; a startup stamp was intentionally deferred because a standby in recovery
+must *not* be marked in-production, which widens blast radius into the
+replication paths.
+
+### Test: `TestPort_PgResetwal001BasicServer`
+
+Drives the upstream `pg_resetwal` binary against a real goopg cluster:
+PGDATA 0700/0600 perms; `-n` prints the checkpoint dump; refuses while the
+server runs (`postmaster.pid` lock); `--pgdata` succeeds after a clean shutdown
+**without** `--force`; `SELECT 1` works after the reset; a `--next-oid 100000`
+override is applied and spot-checked; server works after the override reset.
+
 ## CSV rows
 
 - `RW-001` → `port` / `pass_required=yes`: `001_basic.pl` CLI tier =
   `TestPort_PgResetwal001Basic`.
-- `RW-002` → `defer` / `pass_required=no`: server-dependent tier of
-  `001_basic.pl` + `002_corrupted.pl`; blocked on pg_control round-trip
-  compatibility (M0106) + SLRU-segment-layout parity.
+- `RW-003` → `port` / `pass_required=yes`: `001_basic.pl` server-tier
+  pg_control round-trip = `TestPort_PgResetwal001BasicServer`.
+- `RW-002` → `defer` / `pass_required=no`: the remaining server tier — the
+  unclean-shutdown/`--force` branch (no goopg crash state in v0) and the
+  SLRU-derived id overrides — plus `002_corrupted.pl`; blocked on
+  `track_commit_timestamp` SLRU emission + SLRU-segment-layout parity.
 
 ## Verification
 
 - `gofmt -l` clean; `go vet ./internal/testport/` clean.
-- `go test -run TestPort_PgResetwal001Basic ./internal/testport/` → PASS.
+- `go test -run TestPort_PgResetwal001 ./internal/testport/` → PASS (both CLI
+  and server tiers).
+- `go test -run TestCheckpointerShutdownSetsDBShutdowned ./internal/wal/` → PASS.
+- `go test -race ./internal/wal/ ./internal/control/ ./internal/initdb/` → PASS.
+- `go test -run TestPort_Recovery ./internal/testport/` → PASS (clean-shutdown
+  state change does not regress recovery).
 - `go run ./cmd/gen-oracle-port-status` regenerated the `.md` view.
 
 ## Resume point
 
-Promote `RW-002` to `port` once goopg's pg_control file round-trips
-byte-for-byte through upstream pg_resetwal (read + rewrite) and the
-`pg_commit_ts` / `pg_multixact` / `pg_xact` SLRU directories present the
-segment-file layout the override-option computation reads. `001_basic.pl`'s
-server tier is the cheapest next step (no corruption injection); `002_corrupted`
-adds deliberate WAL/control corruption on top.
+Promote the rest of `RW-002` to `port` once (a) goopg emits `pg_commit_ts`
+segments under `track_commit_timestamp=on` and the `pg_multixact` / `pg_xact`
+SLRU directories present the segment-file layout the override-option
+computation reads, enabling the `--commit-timestamp-ids` / `--multixact-ids` /
+`--multixact-offset` / `--oldest-transaction-id` / `--next-transaction-id`
+cases; and (b) goopg gains a true unclean/crash shutdown state so the
+`--force` branch and `002_corrupted.pl` can be reproduced.
