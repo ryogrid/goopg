@@ -572,6 +572,23 @@ if 21-spec pass surfaces a real divergence:
         `-S`/`--sync-only` registered on the `init` CLI. Design doc:
         `docs/design/0102-0012-initdb-sync-options.md`. Tests:
         `internal/initdb/sync_test.go`.
+      - **PROGRESS 2026-06-13 (loop #22):** `-T`/`--text-search-config` and
+        `-c`/`--set` (GUC seeding) landed — **completes the `001_initdb.pl`
+        "successful creation" option set** (`--no-sync` + `--text-search-config`
+        + `--set` + `--waldir`). New `Options.TextSearchConfig` +
+        `Options.ExtraGUC []GUCSetting`; `seedPostgresqlConf` runs after the
+        `SampleFiles()` loop and rewrites the generated `postgresql.conf`
+        via a faithful `replaceGUCValue` port (in-place rewrite of a
+        leading-`#`/whitespace-skipped `name =` line preserving casing +
+        inline comment, else append) + `formatGUCValue`/
+        `gucValueRequiresQuotes` quoting (`internal/initdb/config_seed.go`).
+        `-T` writes `default_text_search_config = 'pg_catalog.<cfg>'`;
+        `--set` pairs apply last so they override (incl. the `-T` value),
+        mirroring `initdb.c` `setup_config` order. `--set` lacking `=` ->
+        exit 2 `-c <v> requires a value`. Design doc:
+        `docs/design/0102-0013-initdb-config-seeding.md`. Tests:
+        `internal/initdb/config_seed_test.go`, `cmd/goopg/main_test.go`
+        (`TestInitCommandSeedsGUCs`, `TestInitCommandSetRequiresValue`).
       - **Remaining initdb options** (each pulls in a distinct subsystem; one
         per future loop, design doc first):
         `--encoding` (encoding catalogs), `--locale`/`--lc-*` +
@@ -579,8 +596,7 @@ if 21-spec pass surfaces a real divergence:
         `--data-checksums` (page checksums), `--allow-group-access` (0o750
         dir mode), `--auth`/`--auth-host`/`--auth-local`/`--pwfile`
         (auth bootstrap), `--sync-method`/`--no-sync-data-files`
-        (syncfs sync method + base/ exclusion — deferred from loop #21),
-        `--set`/`--text-search-config` (GUC seeding).
+        (syncfs sync method + base/ exclusion — deferred from loop #21).
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 

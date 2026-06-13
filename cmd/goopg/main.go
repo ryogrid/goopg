@@ -110,6 +110,29 @@ func notImplemented(name string, fs *flag.FlagSet, args []string, stderr io.Writ
 	return 1
 }
 
+// gucFlag collects repeated -c/--set NAME=VALUE options for `goopg init`,
+// mirroring upstream initdb's -c/--set (initdb.c case 'c'). A value lacking
+// an '=' is recorded as an error and surfaced after parsing, matching
+// initdb's "-c %s requires a value".
+type gucFlag struct {
+	settings []initdb.GUCSetting
+	err      string
+}
+
+func (g *gucFlag) String() string { return "" }
+
+func (g *gucFlag) Set(v string) error {
+	name, value, ok := strings.Cut(v, "=")
+	if !ok {
+		// Defer reporting so the error message matches initdb's wording
+		// and we don't abort flag parsing mid-stream.
+		g.err = fmt.Sprintf("-c %s requires a value", v)
+		return nil
+	}
+	g.settings = append(g.settings, initdb.GUCSetting{Name: name, Value: value})
+	return nil
+}
+
 func runInit(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -129,6 +152,15 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(noSync, "no-sync", false, "do not wait for changes to be written safely to disk")
 	syncOnly := fs.Bool("S", false, "only sync an existing data directory to disk, then exit")
 	fs.BoolVar(syncOnly, "sync-only", false, "only sync an existing data directory to disk, then exit")
+	// Default text search configuration (upstream initdb -T/--text-search-config).
+	// Both forms bind to the same variable; empty leaves the template default.
+	tsConfig := fs.String("T", "", "default text search configuration")
+	fs.StringVar(tsConfig, "text-search-config", "", "default text search configuration")
+	// GUC overrides seeded into postgresql.conf (upstream initdb -c/--set).
+	// Repeatable; each value is NAME=VALUE.
+	var extraGUC gucFlag
+	fs.Var(&extraGUC, "c", "set NAME=VALUE in generated postgresql.conf (may be repeated)")
+	fs.Var(&extraGUC, "set", "set NAME=VALUE in generated postgresql.conf (may be repeated)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -136,7 +168,11 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "goopg init: -D <data-directory> is required")
 		return 2
 	}
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly}); err != nil {
+	if extraGUC.err != "" {
+		fmt.Fprintf(stderr, "goopg init: %s\n", extraGUC.err)
+		return 2
+	}
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, TextSearchConfig: *tsConfig, ExtraGUC: extraGUC.settings}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}

@@ -179,6 +179,21 @@ type Options struct {
 	// syncing is the entire purpose of the operation.
 	SyncOnly bool
 
+	// TextSearchConfig, when non-empty, seeds
+	// default_text_search_config in postgresql.conf as
+	// 'pg_catalog.<value>', mirroring upstream initdb's
+	// -T/--text-search-config (initdb.c:1343-1346, 3347). When empty the
+	// template's commented-out default is left untouched.
+	TextSearchConfig string
+
+	// ExtraGUC are name=value GUC overrides seeded into postgresql.conf,
+	// mirroring upstream initdb's -c/--set (initdb.c:3266-3281,
+	// 1430-1436). They are applied after TextSearchConfig so a -c switch
+	// can override an earlier assignment (including
+	// default_text_search_config). Each entry rewrites an existing
+	// (possibly commented) assignment in place, or appends a new line.
+	ExtraGUC []GUCSetting
+
 	// Registry, when non-nil, is the server's live GUC registry.
 	// Its values for max_connections, max_worker_processes,
 	// max_wal_senders, max_prepared_transactions,
@@ -413,6 +428,12 @@ func Init(opts Options) error {
 		if err := os.WriteFile(path, f.Build(), f.Mode); err != nil {
 			return fmt.Errorf("goopg init: write %q: %w", path, err)
 		}
+	}
+	// Seed any --text-search-config / --set GUC overrides into the
+	// just-written postgresql.conf, mirroring upstream initdb's
+	// setup_config (initdb.c). No-op when neither option was given.
+	if err := seedPostgresqlConf(abs, opts.TextSearchConfig, opts.ExtraGUC); err != nil {
+		return fmt.Errorf("goopg init: seed postgresql.conf: %w", err)
 	}
 	if err := bootstrapSystemCatalogs(abs); err != nil {
 		return fmt.Errorf("goopg init: system catalogs: %w", err)

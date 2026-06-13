@@ -109,6 +109,57 @@ func TestInitCommandRequiresD(t *testing.T) {
 	}
 }
 
+// TestInitCommandSeedsGUCs drives the full 001_initdb.pl "successful
+// creation" option set through the CLI: --no-sync --text-search-config
+// german --set default_text_search_config=german. The -c override must
+// win, leaving an unquoted 'german' in postgresql.conf.
+func TestInitCommandSeedsGUCs(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"init", "-D", dir, "--no-sync",
+		"--text-search-config", "german",
+		"--set", "default_text_search_config=german",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "postgresql.conf"))
+	if err != nil {
+		t.Fatalf("read postgresql.conf: %v", err)
+	}
+	if !strings.Contains(string(data), "\ndefault_text_search_config = german") {
+		t.Errorf("postgresql.conf missing seeded default_text_search_config; got:\n%s",
+			grepLines(string(data), "default_text_search_config"))
+	}
+}
+
+// TestInitCommandSetRequiresValue: a --set without '=' exits 2 with
+// initdb's "requires a value" wording, and lays out nothing.
+func TestInitCommandSetRequiresValue(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"init", "-D", dir, "--set", "bogus"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit=%d, want 2 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "requires a value") {
+		t.Errorf("stderr=%q want a 'requires a value' diagnostic", stderr.String())
+	}
+}
+
+// grepLines returns the lines of s containing substr, for test diagnostics.
+func grepLines(s, substr string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, substr) {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
 // TestPoolSlotsFromGUC pins the postgresql.conf -> shared_buffers ->
 // PoolSlots wiring so a future loop can't silently drop the override.
 // Default 128MB matches upstream PostgreSQL boot. 32 MB / 8 KB per
