@@ -817,13 +817,37 @@ if 21-spec pass surfaces a real divergence:
         updated with gate (a) DONE / gate (b) pending. Gates: gofmt/vet clean;
         `go test ./internal/initdb` PASS; `go test -race ./internal/storage
         ./internal/wal` PASS.
+      - **PROGRESS 2026-06-13 (loop #34):** standby-read / physical-replication
+        validation gate for the deferred default-ON flip **landed** (gate (b)
+        of two — the last gate). New
+        `internal/testport/e2e_checksum_replication_test.go`
+        `TestE2E_ChecksumStreamingGoopgToPG`: a `--data-checksums` goopg primary
+        (new `cluster.Options.InitArgs` threads the flag) fills a table spanning
+        ~115 heap pages, `CHECKPOINT`s them to disk before the clone, then
+        `pg_basebackup -X stream`s the cluster to a **real PG** standby. PG
+        copies goopg's version-1 `pg_control` (`SHOW data_checksums = on`) and
+        verifies `pd_checksum` on every page read; a full seq-scan returning the
+        exact 4 000 rows + `sum(length(payload))` proves goopg's FNV-1a checksum
+        bytes are **byte-identical** to upstream's — a mismatch would abort the
+        scan with `invalid page in block N`. This is the cross-implementation
+        proof gate (a) (goopg-verifies-goopg) cannot give. PASS in 2.45s.
+        Design doc `0102-0019` "Gate (b)" + Testing + status updated. Gates:
+        gofmt/vet clean; `go test ./internal/testutil/cluster
+        ./internal/testutil/replcluster` PASS;
+        `TestE2E_ChecksumStreamingGoopgToPG` PASS (real PG binaries). **Both
+        flip-gates now pass.**
       - **Remaining initdb work** (each pulls in a distinct subsystem; one
         per future loop, design doc first): the `--data-checksums`
         **default-ON flip** for PG-18 parity (and the `001_initdb.pl`
-        version-1 assertion) — deferred until physical-replication / recovery
-        validation confirms a checksummed cluster replays (FPI) and streams to
-        a standby cleanly; the flip itself is a one-line default change plus
-        that validation. The locale-derived default encoding
+        version-1 assertion) — **both validation gates now pass** (gate (a)
+        recovery/FPI replay loop #32; gate (b) standby-read/physical-replication
+        loop #34), so the flip itself is the one-line default change
+        (`init`'s `dataChecksums` default false → true). DEFERRED to a dedicated
+        loop because flipping the default changes the on-disk format of every
+        new cluster: it must be gated by the full regress-port suite + a TPC-H
+        re-load/spot-check (M0106 "codec/format change → re-run full suite"
+        lesson) + a sweep of every test/bench data dir needing re-init.
+        The locale-derived default encoding
         (`pg_get_encoding_from_locale` on an unset `--encoding`) remains a
         no-op under goopg's fixed C locale.
 

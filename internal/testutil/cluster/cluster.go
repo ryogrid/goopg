@@ -43,6 +43,10 @@ type Options struct {
 	Database     string   // default: "postgres"
 	StartupWait  time.Duration
 	ShutdownWait time.Duration
+	// InitArgs are extra arguments appended to `goopg init -D <dir>` (e.g.
+	// "--data-checksums"). Empty by default, so a plain cluster inits exactly
+	// as before.
+	InitArgs []string
 }
 
 // Cluster is a single goopg test instance (multi-cluster orchestration is
@@ -60,6 +64,7 @@ type Cluster struct {
 	startupWait  time.Duration
 	shutdownWait time.Duration
 	logPath      string
+	initArgs     []string
 
 	mu  sync.Mutex
 	cmd *exec.Cmd
@@ -131,6 +136,7 @@ func New(name string, opts Options) (*Cluster, error) {
 		startupWait:  startup,
 		shutdownWait: shutdown,
 		logPath:      filepath.Join(dataDir, "cluster.log"),
+		initArgs:     opts.InitArgs,
 	}, nil
 }
 
@@ -139,9 +145,10 @@ func (c *Cluster) DataDir() string    { return c.dataDir }
 func (c *Cluster) ListenAddr() string { return c.listenAddr }
 func (c *Cluster) LogPath() string    { return c.logPath }
 
-// Init runs `goopg init -D <dir>`.
+// Init runs `goopg init -D <dir>` (plus any configured InitArgs).
 func (c *Cluster) Init() error {
-	res, err := c.runGoopg("init", "-D", c.dataDir)
+	args := append([]string{"init", "-D", c.dataDir}, c.initArgs...)
+	res, err := c.runGoopg(args...)
 	if err != nil {
 		return err
 	}

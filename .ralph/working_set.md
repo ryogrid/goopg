@@ -1,40 +1,36 @@
-(idle — M0102-0009 resolved & committed this loop)
+(idle — M0102-0010 gate (b) landed & committed this loop)
 
-Loop #33 closed **M0102-0009** (PG↔goopg physical failover `/sync_remote_apply`
-"did not reach streaming state within 45s"). The failure no longer reproduces —
-it was fixed by the `sync_state` wiring (design 0105-0008, real FIRST/ANY rule
-in `registerStatReplicationView`). Empirically verified all modes pass:
-- `TestE2E_FailoverPGtoGoopg` async / sync_remote_apply / sync_on — PASS (29.25s)
-- `TestE2E_FailoverGoopgToPG` async / sync_remote_apply — PASS (5.97s)
+Loop #34 landed **gate (b)** of the `--data-checksums` default-ON flip
+(standby-read / physical-replication validation — the last gate).
 
-Change was test-gating only (no production code): removed the
-`GOOPG_RUN_BLOCKED_M0102_E2E` opt-in gate from both failover test files; they now
-follow the standard heterogeneous-E2E convention (skip under `-short` or
-`GOOPG_SKIP_M0102_E2E=1`), matching e2e_replication_test.go. Also gofmt-fixed a
-pre-existing misformat (line ~320) in e2e_failover_pg_to_goopg_test.go.
-- Files: internal/testport/e2e_failover_pg_to_goopg_test.go,
-  internal/testport/e2e_failover_goopg_to_pg_test.go,
-  docs/design/0102-0003-heterogeneous-failover-e2e-harness.md (closure note),
-  .ralph/fix_plan.md (M0102-0009 → [x]).
-- Gates: gofmt clean; go vet ./internal/testport PASS; both failover E2E suites
-  PASS un-gated; make ralph-state-guard OK (had to reset stale
-  progress.json "completed"→"running" to match live status.json).
+- New `internal/testport/e2e_checksum_replication_test.go`
+  `TestE2E_ChecksumStreamingGoopgToPG`: a `--data-checksums` goopg primary fills
+  ~115 heap pages, `CHECKPOINT`s before the clone, `pg_basebackup -X stream`s to
+  a **real PG** standby that verifies goopg's `pd_checksum` on read
+  (`SHOW data_checksums = on` + full seq-scan of 4000 rows +
+  `sum(length(payload))`). A wrong checksum byte aborts the scan with
+  `invalid page in block N` — byte-level cross-impl proof gate (a) cannot give.
+  **PASS 2.45s** against real PG binaries.
+- Harness change (additive): `cluster.Options.InitArgs []string` threads extra
+  `init` args (`--data-checksums` here). Empty default → byte-identical to before.
+- Files: internal/testutil/cluster/cluster.go (InitArgs),
+  internal/testport/e2e_checksum_replication_test.go (new),
+  docs/design/0102-0019-initdb-data-checksums.md (gate (b) DONE + Testing + status),
+  .ralph/fix_plan.md (M0102-0010 progress), .ralph/deferral_ledger.md.
+- Gates: gofmt/vet clean; `go test ./internal/testutil/cluster
+  ./internal/testutil/replcluster` PASS; TestE2E_ChecksumStreamingGoopgToPG PASS;
+  make ralph-state-guard OK (reset stale progress.json completed→running again).
 
-Next candidate tasks (pick one next loop):
-- **M0102-0010 gate (b)**: standby-read / physical-replication validation for
-  the `--data-checksums` default-ON flip — a checksummed goopg primary streaming
-  to a PG standby that verifies pd_checksum. Now UNBLOCKED since physical
-  failover/streaming works (M0102-0009 closed). This is the last gate before the
-  one-line default flip.
-- M0095-0003 WAL-streaming tier (pg_basebackup -X stream) — needs walsender loop
-  parity.
-- M0110-0001..0004 server-dependent TAP tiers.
+**Both flip-gates now pass** (gate (a) FPI-replay loop #32; gate (b) loop #34).
+
+Next loop candidate: the **`--data-checksums` default-ON flip** itself — the
+one-line `init` default false→true (`cmd/goopg/main.go:180`). DEFERRED to a
+dedicated loop (ledger 2026-06-13): it changes every new cluster's on-disk
+format, so it MUST be gated by the full regress-port suite + a TPC-H
+re-load/spot-check (M0106 codec/format lesson) and re-init of every test/bench
+data dir the format change invalidates.
 
 ⚠️ WORKING-TREE CONTAMINATION (separate session, DO NOT commit): ~18 modified
 files + 2 new test files belong to an UNRELATED partition generated-column-
-override feature: analyzer/analyzer.go, catalog/catalog.go(+_test),
-executor/* (operators.go, operators_ddl.go, operators_join_agg.go,
-operators_lockrows.go, opnode.go), mvcc/subxact_visibility.go, parser/ast.go,
-parser/ddl.go, planner/* (bushy, nl_index_join, plan, planner, unnest),
-server/dispatch.go + parser/gen_override_test.go +
-executor/partition_gen_override_test.go. Stage ONLY M0102-0009 files below.
+override feature (analyzer, catalog, executor/*, mvcc, parser, planner/*,
+server/dispatch.go + gen_override tests). Commit ONLY the gate-(b) files above.

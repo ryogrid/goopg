@@ -1,6 +1,6 @@
 # 0102-0019 — Data-page checksum engine + initdb `--data-checksums` (M0102-0010)
 
-Status: accepted; user-facing `--data-checksums` enablement landed (default-ON flip deferred)
+Status: accepted; user-facing `--data-checksums` enablement landed; both flip-gates (a recovery/FPI-replay, b standby-read/physical-replication) pass — default-ON flip deferred to a dedicated regress+TPC-H-gated loop
 
 ## Context
 
@@ -180,10 +180,36 @@ proof that the FPI restore path
 replayed block rather than writing a stale image verbatim or bypassing the
 checksum write seam.
 
-**Gate (b) — standby-read / physical replication — still pending.** A checksummed
-goopg primary must stream to a PG (or goopg) standby whose read path verifies
-`pd_checksum`. Once that is validated, the flip itself is a one-line default
-change. Tracked under M0102-0010.
+**Gate (b) — standby-read / physical replication — DONE.**
+`internal/testport/e2e_checksum_replication_test.go`
+`TestE2E_ChecksumStreamingGoopgToPG` validates the strongest form of the gate: a
+checksummed goopg primary streaming to a **real PostgreSQL** standby that
+verifies `pd_checksum` on read. This proves goopg's FNV-1a page-checksum bytes
+are **byte-identical** to what upstream PG computes — the cross-implementation
+compatibility gate (a) cannot cover (gate (a) only proves goopg verifies its own
+checksums).
+
+Sequence: init a goopg primary with `--data-checksums` (`InitArgs` on the
+`cluster` harness — a new additive option); fill a table with ~4 000 rows
+spanning ~115 heap pages and `CHECKPOINT` so those checksummed pages are flushed
+to disk **before** the clone and land before the backup's redo point (so WAL
+replay never rewrites them with PG's own checksums); `pg_basebackup -X stream`
+the cluster to a real PG data dir (PG copies goopg's version-1 `pg_control`, so
+PG turns checksum verification on); start the PG standby and let it stream; then
+on the standby assert `SHOW data_checksums = on` and seq-scan the whole table
+(`count(*)` = 4 000 and `sum(length(payload))`). A bad checksum on any page would
+abort the scan with `invalid page in block N of relation ...` — exactly how
+upstream's own checksum tests detect a corrupt page — so a clean full scan with
+the right row count is the proof. (We do not read `pg_stat_database.checksum_failures`:
+the standby is real PG on goopg's *bootstrapped* catalog, which does not define
+PG's `pg_stat_*` system views; the seq-scan is the canonical signal regardless.)
+
+**Both gates now pass.** The remaining work is the one-line default flip itself
+(`init`'s `dataChecksums` default false → true), which is deferred to a dedicated
+loop: flipping the default changes the on-disk format of **every** new cluster,
+so it must be gated by the full regress-port suite + a TPC-H re-load/spot-check
+(per the M0106 "codec/format change → re-run full suite" lesson) and a sweep of
+every test/bench data dir that would need re-init. Tracked under M0102-0010.
 
 ## Testing
 
@@ -207,6 +233,13 @@ change. Tracked under M0102-0010.
   `VerifyPage` walk.
 - `internal/initdb/checksum_bootstrap_test.go` — `checksumRelationData`
   per-block numbering / no-input-mutation / transposition-rejection.
+- `internal/testport/e2e_checksum_replication_test.go`
+  **`TestE2E_ChecksumStreamingGoopgToPG`** — standby-read/physical-replication
+  gate (b) for the default-ON flip: a `--data-checksums` goopg primary streams
+  (via `pg_basebackup -X stream`) to a real PG standby that verifies goopg's
+  `pd_checksum` on every page read; a full seq-scan returning the exact row
+  count with `data_checksums = on` proves byte-level checksum compatibility.
+  Skipped under `-short` / `GOOPG_SKIP_M0102_E2E` / missing PG binaries.
 - `cmd/goopg/main_test.go` `TestInitCommandDataChecksums` — the `-k` /
   `--data-checksums` / `--no-data-checksums` flags drive pg_control's
   `data_checksum_version`; `--no-data-checksums` overrides `-k`.
