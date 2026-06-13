@@ -45,8 +45,8 @@ type Runtime struct {
 	FSM *storage.FSM
 	// VM is the in-memory visibility map (M0046-0004). VACUUM sets the
 	// ALL_VISIBLE bit; index-only scans check it to skip heap fetches.
-	VM           *storage.VisibilityMap
-	WAL          *wal.Writer
+	VM  *storage.VisibilityMap
+	WAL *wal.Writer
 	// LogCanonical is the callback for emitting PG-canonical WAL records
 	// (XLOG_HEAP_INSERT, XLOG_BTREE_INSERT_LEAF) from DDL paths so a PG18
 	// standby can replay catalog mutations. Non-nil only when PageHeaders=true.
@@ -203,8 +203,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		slots = 16384
 	}
 
+	// Read pg_control's data_checksum_version up front so the storage
+	// Manager knows whether to checksum every block it writes and verify
+	// every block it reads. Version 1 ⇒ enabled (initdb --data-checksums);
+	// 0 (the goopg default) ⇒ a checksum-less cluster, the byte-identical
+	// fast path. A missing/unreadable control file leaves checksums off.
+	checksumsEnabled := false
+	if pgCtrl, pce := control.ReadControlFile(abs); pce == nil && pgCtrl != nil {
+		checksumsEnabled = pgCtrl.DataChecksumVersion != 0
+	}
+
 	mgr := storage.NewManager(storage.ManagerConfig{
-		DataDir: abs,
+		DataDir:          abs,
+		ChecksumsEnabled: checksumsEnabled,
 	})
 
 	// Activity registry (M0022 / M0107-0005): per-backend slot array with
@@ -2094,9 +2105,9 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 	page := make(storage.Page, storage.BlockSize)
 
 	type indexClassRow struct {
-		oid   uint32
-		name  string
-		nsp   uint32
+		oid  uint32
+		name string
+		nsp  uint32
 	}
 	var indexRows []indexClassRow
 

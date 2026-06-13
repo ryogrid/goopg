@@ -1,44 +1,55 @@
-Task: M0102-0010 — initdb CLI options. Loop #27 landed the `--locale-provider`
-/ `--locale` / `--lc-*` / `--builtin-locale` family (9th option gap). Committed
-+ pushed → idle on this slice.
+Task: M0102-0010 — initdb CLI options. Loop #29 landed the data-page
+checksum ENGINE (the reusable, high-blast-radius core); the user-facing
+`--data-checksums` initdb option is DEFERRED (Init rejects it). Committed +
+pushed → idle on the engine slice.
 
 Files (this loop):
-- internal/initdb/locale.go (NEW) — resolveLocaleProvider (initdb.c:3367),
-  pgGetEncodingFromLocale (codeset-suffix port; C/POSIX→SQL_ASCII), 
-  checkLocaleEncoding (2265), resolveLocale (= setlocales 2424 + setup_encoding
-  2772 validation: combo checks 3424-3434, "locale must be specified" 2471,
-  builtin canon C/C.UTF-8/PG_UNICODE_FAST 2477, ICU reject 2503, builtin-UTF8
-  req 2778-2783), localeSettings + localeGUCSettings().
-- internal/initdb/initdb.go — Options.{LocaleProvider,Locale,LCCollate,LCCtype,
-  LCMessages,LCMonetary,LCNumeric,LCTime,BuiltinLocale,ICULocale,ICURules};
-  Init calls resolveLocale after resolveEncoding; bootstrapPostgresDatabase
-  signature +localeSettings, row writes datlocprovider/datcollate/datctype/
-  datlocale (default byte-identical to old libc/"C" row — datlocale NULL).
-- internal/initdb/config_seed.go — seedPostgresqlConf +localeGUCs param applied
-  FIRST (before tsConfig + -c/--set, matching setup_config order).
-- cmd/goopg/main.go — 11 long-form locale flags on `init`.
-- internal/initdb/locale_test.go (NEW), cmd/goopg/main_test.go
-  (TestInitCommandLocaleProvider); pg_database_encoding_test.go +
-  pg_database_pg18_schema_test.go callers updated (default libc localeSettings).
-- docs/design/0102-0018-initdb-locale-options.md (NEW) + README index row.
-- .ralph/fix_plan.md (loop #27 progress + trimmed remaining-options note).
+- internal/storage/checksum.go — added PageSetChecksumCopy (copy-then-set,
+  never mutates the shared buffer; new page returned verbatim) + VerifyPage
+  (checksum half of PageIsVerifiedExtended; new/all-zero page valid).
+- internal/storage/smgr.go — ManagerConfig.{ChecksumsEnabled,
+  IgnoreChecksumFailure,OnChecksumFailure}; relFile gains checksums/
+  ignoreChecksum/onChecksumFail/rel fields (set in relFile()); ChecksumError
+  type + verifyOnRead/checksummedForWrite helpers; wired into readBlock,
+  writeBlock, extend, extendBatch, engine ReadAt/WriteAt. Disabled = a single
+  bool check → byte-identical (no copy/verify/alloc).
+- internal/storage/checksum_io_test.go (NEW) — Manager round-trip, corruption
+  detect (*ChecksumError), IgnoreChecksumFailure+OnChecksumFailure, disabled=
+  byte-identical, ExtendBatch per-block, new-page skip.
+- internal/control/pgcontrol.go — ControlFileData.DataChecksumVersion
+  (offset 252) decode+encode (preserved across UpdateControlFile).
+- internal/initdb/pgcontrol.go — writePgControl/buildPgControl +dataChecksums
+  bool; writes 1/0 at offset 252.
+- internal/initdb/initdb.go — Options.DataChecksums (seam); Init REJECTS it;
+  writePgControl call threads opts.DataChecksums.
+- internal/initdb/open.go — reads DataChecksumVersion before NewManager →
+  ChecksumsEnabled.
+- internal/wal/recovery.go — ReplayFromDir reads DataChecksumVersion (runtime
+  uses ReplayFromDirWithMgr w/ already-configured Manager).
+- internal/initdb/pg_control_test.go — buildPgControl calls +false arg.
+- internal/initdb/data_checksums_test.go (NEW) — buildPgControl 1/0; Init reject.
+- docs/design/0102-0019-initdb-data-checksums.md (NEW) + README index row.
+- .ralph/{fix_plan.md, deferral_ledger.md} updated.
 
-Key facts:
-- Scope: on-disk PG-compat only (engine keeps fixed C/UTF8 locale; no runtime
-  collation). icu provider recognized but rejected (no USE_ICU build).
-- DEFERRED: locale-derived default encoding (no-op under fixed C locale).
-- NO format change (same 18-col pg_database tuple, only values) → TPC-H
-  spotcheck gate N/A. Touches only internal/initdb + cmd/goopg.
-- ~19 files of FOREIGN uncommitted changes remain untouched; commit
-  selectively, never git add -A.
+Next step (next loop = close M0102-0010 user-facing --data-checksums):
+route the ~38 direct os.WriteFile bootstrap page-writers through ONE
+checksum-aware helper so every bootstrap page gets pd_checksum. Sites
+(from the loop-#29 Explore inventory): initdb.go —
+bootstrapSharedCatalogPlaceholders (~1225), bootstrapMappedLocalCatalogHeaps
+(~1348), bootstrapPostgresRoleWithPassword (~1575), writeMultiPageHeapRows
+(~5931/5938, MULTI-PAGE → per-block blkno!), bootstrapPostgresDatabase
+(~1694 pg_database + ~50 btree placeholders via makeBtreeRootPage);
+btree_index_bootstrap.go — ~30 per-index bootstrappers (metapage+leaf,
+multi-page → per-block blkno). bootstrapSystemCatalogs already uses the
+Manager (auto-checksummed). Add e2e test: Init(DataChecksums:true) → open a
+checksummed Manager → ReadBlock block 0 of pg_type/pg_class/pg_attribute/
+pg_database/pg_proc/a btree index (catches any missed site). THEN drop the
+Init reject + add `-k`/`--data-checksums`/`--no-data-checksums` CLI flags +
+cmd/goopg/main_test.go. Flip default to ON for PG-18 parity LAST (separate
+risk; validate recovery+replication first).
 
-Next step (next loop): only `--data-checksums`/`--no-data-checksums` remains
-for M0102-0010 — but it needs the FULL page-checksum write/verify path (high
-blast radius), NOT just the pg_control field (faking the field breaks a PG
-standby reading the pages). Design doc first; consider whether to bound it or
-pick a different fix_plan item. M0102-0010 could otherwise be near-closeable.
-
-Gates run: gofmt clean (my files); go build ./... PASS; go vet
-./internal/initdb ./cmd/goopg PASS; go test ./internal/initdb (111s) full pkg
-PASS; go test ./cmd/goopg -run TestInitCommand PASS; make ralph-state-guard
-(run before status block).
+Gates run: gofmt clean; go build ./... PASS; go vet storage/control/initdb/
+wal PASS; go test ./internal/storage (and -race) PASS; go test -race
+./internal/wal PASS; go test ./internal/initdb (103s, full pkg) PASS;
+scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33); make ralph-state-guard
+(before status block).

@@ -110,6 +110,26 @@ type ManagerConfig struct {
 	// DataDir is the root data directory. Files live at
 	// <DataDir>/base/<dbOid>/<relOid>[<fork-suffix>].
 	DataDir string
+
+	// ChecksumsEnabled turns on PG-compatible data-page checksums for
+	// every block this Manager reads and writes. When false (the
+	// default) the read/write path is byte-identical to a checksum-less
+	// cluster — no copy, no verification, no overhead. The runtime sets
+	// this from pg_control's data_checksum_version (1 ⇒ enabled), which
+	// initdb writes from the --data-checksums option. See
+	// docs/design/0102-0019-initdb-data-checksums.md.
+	ChecksumsEnabled bool
+
+	// IgnoreChecksumFailure, when true, downgrades a checksum mismatch on
+	// read from a hard error to a non-fatal event: the page is returned
+	// as read and OnChecksumFailure (if set) is invoked. Mirrors the
+	// ignore_checksum_failure GUC. Has no effect unless ChecksumsEnabled.
+	IgnoreChecksumFailure bool
+
+	// OnChecksumFailure, if set, is invoked when a block fails checksum
+	// verification on read (whether or not the failure is fatal). The
+	// server wires this to its log / pg_stat checksum-failure counters.
+	OnChecksumFailure func(rel RelFileNode, blk BlockNumber)
 }
 
 // NewManager constructs an empty Manager. Files open lazily on first
@@ -457,9 +477,13 @@ func (m *Manager) relFile(rel RelFileNode) (*relFile, error) {
 		return nil, fmt.Errorf("file %s size %d not multiple of %d", path, st.Size(), BlockSize)
 	}
 	f := &relFile{
-		f:       osFile,
-		path:    path,
-		nblocks: BlockNumber(st.Size() / BlockSize),
+		f:              osFile,
+		path:           path,
+		nblocks:        BlockNumber(st.Size() / BlockSize),
+		rel:            rel,
+		checksums:      m.cfg.ChecksumsEnabled,
+		ignoreChecksum: m.cfg.IgnoreChecksumFailure,
+		onChecksumFail: m.cfg.OnChecksumFailure,
 	}
 	m.files[rel] = f
 	return f, nil
@@ -483,11 +507,65 @@ func (m *Manager) relPath(rel RelFileNode) string {
 // ErrShortRead indicates a ReadBlock landed past EOF.
 var ErrShortRead = errors.New("short read at block")
 
+// ChecksumError is returned by a read when data-page checksums are enabled
+// and a block's stored pd_checksum does not match its recomputed value.
+// Mirrors upstream's "page verification failed, calculated checksum %u but
+// expected %u" ERRCODE_DATA_CORRUPTED report.
+type ChecksumError struct {
+	Path  string
+	Block BlockNumber
+}
+
+func (e *ChecksumError) Error() string {
+	return fmt.Sprintf("invalid page in block %d of relation %s: data-page checksum verification failed", e.Block, e.Path)
+}
+
+// verifyOnRead checks buf's checksum after a read of block blk. It is a
+// no-op unless checksums are enabled. On mismatch it always notifies
+// onChecksumFail (if set), then returns a ChecksumError unless
+// ignoreChecksum is set (mirrors the ignore_checksum_failure GUC).
+func (r *relFile) verifyOnRead(blk BlockNumber, buf []byte) error {
+	if !r.checksums {
+		return nil
+	}
+	if VerifyPage(buf, blk) {
+		return nil
+	}
+	if r.onChecksumFail != nil {
+		r.onChecksumFail(r.rel, blk)
+	}
+	if r.ignoreChecksum {
+		return nil
+	}
+	return &ChecksumError{Path: r.path, Block: blk}
+}
+
+// checksummedForWrite returns the byte slice to write for block blk: when
+// checksums are enabled it is a fresh copy of buf with pd_checksum set (the
+// caller's buffer is never mutated), otherwise buf itself (zero-copy, the
+// checksum-less fast path).
+func (r *relFile) checksummedForWrite(blk BlockNumber, buf []byte) []byte {
+	if !r.checksums {
+		return buf
+	}
+	return PageSetChecksumCopy(buf, blk)
+}
+
 type relFile struct {
 	mu      sync.Mutex
 	f       *os.File
 	path    string
 	nblocks BlockNumber
+
+	// rel identifies this file for OnChecksumFailure callbacks.
+	rel RelFileNode
+	// checksums mirrors ManagerConfig.ChecksumsEnabled: when set, every
+	// block written through this file carries a fresh pd_checksum and
+	// every block read is verified. When clear the I/O path is
+	// byte-identical to a checksum-less cluster.
+	checksums      bool
+	ignoreChecksum bool
+	onChecksumFail func(rel RelFileNode, blk BlockNumber)
 }
 
 // ReadAt is the engine-facing offset-shaped read. The relFile
@@ -498,7 +576,13 @@ type relFile struct {
 func (r *relFile) ReadAt(p []byte, off int64) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.f.ReadAt(p, off)
+	n, err := r.f.ReadAt(p, off)
+	if err == nil && r.checksums && n == BlockSize && off%BlockSize == 0 {
+		if verr := r.verifyOnRead(BlockNumber(off/BlockSize), p[:n]); verr != nil {
+			return n, verr
+		}
+	}
+	return n, err
 }
 
 // WriteAt is the engine-facing offset-shaped write. Mirrors
@@ -510,6 +594,15 @@ func (r *relFile) ReadAt(p []byte, off int64) (int, error) {
 func (r *relFile) WriteAt(p []byte, off int64) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.checksums && len(p) == BlockSize && off%BlockSize == 0 {
+		out := r.checksummedForWrite(BlockNumber(off/BlockSize), p)
+		n, err := r.f.WriteAt(out, off)
+		// Report the byte count against the caller's buffer length.
+		if n > len(p) {
+			n = len(p)
+		}
+		return n, err
+	}
 	return r.f.WriteAt(p, off)
 }
 
@@ -535,7 +628,7 @@ func (r *relFile) readBlock(blk BlockNumber, buf []byte) error {
 	if n != BlockSize {
 		return fmt.Errorf("read %s blk %d: short %d of %d", r.path, blk, n, BlockSize)
 	}
-	return nil
+	return r.verifyOnRead(blk, buf)
 }
 
 func (r *relFile) writeBlock(blk BlockNumber, buf []byte) error {
@@ -545,7 +638,7 @@ func (r *relFile) writeBlock(blk BlockNumber, buf []byte) error {
 		return fmt.Errorf("write %s blk %d: out of range (nblocks=%d)", r.path, blk, r.nblocks)
 	}
 	off := int64(blk) * BlockSize
-	n, err := r.f.WriteAt(buf, off)
+	n, err := r.f.WriteAt(r.checksummedForWrite(blk, buf), off)
 	if err != nil {
 		return fmt.Errorf("write %s blk %d: %w", r.path, blk, err)
 	}
@@ -560,7 +653,7 @@ func (r *relFile) extend(buf []byte) (BlockNumber, error) {
 	defer r.mu.Unlock()
 	blk := r.nblocks
 	off := int64(blk) * BlockSize
-	n, err := r.f.WriteAt(buf, off)
+	n, err := r.f.WriteAt(r.checksummedForWrite(blk, buf), off)
 	if err != nil {
 		return InvalidBlockNumber, fmt.Errorf("extend %s: %w", r.path, err)
 	}
@@ -594,6 +687,17 @@ func (r *relFile) extendBatch(buf []byte, n int) (BlockNumber, error) {
 	defer r.mu.Unlock()
 	first := r.nblocks
 	off := int64(first) * BlockSize
+	if r.checksums {
+		// big is freshly allocated and not shared, so set each block's
+		// pd_checksum in place. Block numbers are only known now that the
+		// starting block (first) is assigned under the lock.
+		for i := 0; i < n; i++ {
+			blkBuf := big[i*BlockSize : (i+1)*BlockSize]
+			if !IsNew(blkBuf) {
+				MustHeader(blkBuf).SetChecksum(PageChecksum(blkBuf, first+BlockNumber(i)))
+			}
+		}
+	}
 	w, err := r.f.WriteAt(big, off)
 	if err != nil {
 		return InvalidBlockNumber, fmt.Errorf("extendBatch %s: %w", r.path, err)

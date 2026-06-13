@@ -17,7 +17,7 @@ import (
 func TestBuildPgControlCheckpointFields(t *testing.T) {
 	const sysID = uint64(0xABCDEF0123456789)
 	before := time.Now()
-	buf := buildPgControl(sysID, before, nil)
+	buf := buildPgControl(sysID, before, nil, false)
 	after := time.Now()
 
 	le := binary.LittleEndian
@@ -154,7 +154,7 @@ func TestBuildPgControlCheckpointFields(t *testing.T) {
 // TestBuildPgControlFileSize verifies the total file size and that zero-pad
 // bytes beyond the active payload are all zero.
 func TestBuildPgControlFileSize(t *testing.T) {
-	buf := buildPgControl(0x1234567890ABCDEF, time.Now(), nil)
+	buf := buildPgControl(0x1234567890ABCDEF, time.Now(), nil, false)
 	if len(buf) != pgControlFileSize {
 		t.Fatalf("buildPgControl: len=%d, want %d", len(buf), pgControlFileSize)
 	}
@@ -171,7 +171,7 @@ func TestBuildPgControlFileSize(t *testing.T) {
 // maxAlign, floatFormat, blcksz, relseg_size, xlog_blcksz, xlog_seg_size,
 // nameDataLen, indexMaxKeys, toast_max_chunk_size, loblksize, float8ByVal.
 func TestBuildPgControlCompatibilityFields(t *testing.T) {
-	buf := buildPgControl(0, time.Now(), nil)
+	buf := buildPgControl(0, time.Now(), nil, false)
 	le := binary.LittleEndian
 
 	checks := []struct {
@@ -222,7 +222,7 @@ func TestBuildPgControlCompatibilityFields(t *testing.T) {
 // CreateUnloggedFile to treat every unlogged relation as if it were at the
 // start of the LSN space, which confuses recovery (xlogdefs.h:37).
 func TestBuildPgControlUnloggedLSN(t *testing.T) {
-	buf := buildPgControl(0, time.Now(), nil)
+	buf := buildPgControl(0, time.Now(), nil, false)
 	le := binary.LittleEndian
 	got := le.Uint64(buf[128:])
 	if got != pgFirstNormalUnloggedLSN {
@@ -253,7 +253,7 @@ func TestBuildPgControlGUCWiring(t *testing.T) {
 		}
 	}
 
-	buf := buildPgControl(0, time.Now(), reg)
+	buf := buildPgControl(0, time.Now(), reg, false)
 	le := binary.LittleEndian
 
 	checks := []struct {

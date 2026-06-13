@@ -50,10 +50,10 @@ const (
 	pgInitCheckpointLSN = uint64(16*1024*1024 + 40)
 
 	// Bootstrap values from BootStrapXLOG (xlog.c:5115-5132).
-	pgFirstNormalXID  = uint64(3)     // FirstNormalTransactionId
-	pgFirstGenbkiOID  = uint32(10000) // FirstGenbkiObjectId
-	pgFirstMultiXact  = uint32(1)     // FirstMultiXactId
-	pgTemplate1DbOID  = uint32(1)     // Template1DbOid
+	pgFirstNormalXID = uint64(3)     // FirstNormalTransactionId
+	pgFirstGenbkiOID = uint32(10000) // FirstGenbkiObjectId
+	pgFirstMultiXact = uint32(1)     // FirstMultiXactId
+	pgTemplate1DbOID = uint32(1)     // Template1DbOid
 
 	// pgFirstNormalUnloggedLSN mirrors FirstNormalUnloggedLSN
 	// (src/include/access/xlogdefs.h:37). Unlogged relations use a
@@ -74,8 +74,8 @@ var crcCastagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 // <dataDir>/global/pg_control. The file is 8192 bytes (PG_CONTROL_FILE_SIZE)
 // with a 296-byte ControlFileData struct at the start and zeros elsewhere.
 // systemID must match the cluster's system_identifier (see LoadOrCreateSystemID).
-func writePgControl(dataDir string, systemID uint64, cfg *config.Registry) error {
-	buf := buildPgControl(systemID, time.Now(), cfg)
+func writePgControl(dataDir string, systemID uint64, cfg *config.Registry, dataChecksums bool) error {
+	buf := buildPgControl(systemID, time.Now(), cfg, dataChecksums)
 	path := filepath.Join(dataDir, pgControlFile)
 	if err := os.WriteFile(path, buf, 0o600); err != nil {
 		return fmt.Errorf("goopg: write pg_control: %w", err)
@@ -158,7 +158,7 @@ func UpdateControlCheckpoint(dataDir string, redoLSN uint64) error {
 // the given system identifier and timestamp. The payload is 8192 bytes
 // total; the first 296 bytes are the ControlFileData struct, the rest
 // is zero padding (matching upstream's WriteControlFile).
-func buildPgControl(systemID uint64, now time.Time, cfg *config.Registry) []byte {
+func buildPgControl(systemID uint64, now time.Time, cfg *config.Registry, dataChecksums bool) []byte {
 	file := make([]byte, pgControlFileSize)
 	hdr := file[:pgControlDataSize]
 
@@ -276,8 +276,13 @@ func buildPgControl(systemID uint64, now time.Time, cfg *config.Registry) []byte
 	// float8ByVal (bool): offset 248 — true on 64-bit platforms
 	hdr[248] = 1
 	// pad 3: 249..252
-	// data_checksum_version (uint32): offset 252 — no checksums
-	le.PutUint32(hdr[252:], 0)
+	// data_checksum_version (uint32): offset 252 — PG_DATA_CHECKSUM_VERSION
+	// (1) when --data-checksums was given, else 0 (no checksums).
+	if dataChecksums {
+		le.PutUint32(hdr[252:], 1)
+	} else {
+		le.PutUint32(hdr[252:], 0)
+	}
 	// default_char_signedness (bool): offset 256 — true on x86_64/ARM64 Linux
 	hdr[256] = 1
 	// mock_authentication_nonce (char[32]): offset 257..289

@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	pgControlFilePath = "global/pg_control"
-	pgControlFileSize = 8192
+	pgControlFilePath  = "global/pg_control"
+	pgControlFileSize  = 8192
 	pgControlCRCOffset = 292 // offsetof(ControlFileData, crc) on x86_64
 )
 
@@ -103,6 +103,12 @@ type ControlFileData struct {
 	MaxLocksPerXact uint32
 	// offset 200: track_commit_timestamp (bool)
 	TrackCommitTimestamp bool
+	// offset 252: data_checksum_version (uint32). 0 ⇒ data-page checksums
+	// disabled, 1 ⇒ enabled (PG_DATA_CHECKSUM_VERSION). Set by initdb
+	// (--data-checksums) and never changed at runtime by goopg; the
+	// storage Manager reads it to decide whether to checksum/verify every
+	// block. See docs/design/0102-0019-initdb-data-checksums.md.
+	DataChecksumVersion uint32
 }
 
 // decodeControlFileData reads the mutable runtime fields from a raw
@@ -135,6 +141,7 @@ func decodeControlFileData(buf []byte) *ControlFileData {
 		MaxPreparedXacts:             le.Uint32(buf[192:]),
 		MaxLocksPerXact:              le.Uint32(buf[196:]),
 		TrackCommitTimestamp:         buf[200] != 0,
+		DataChecksumVersion:          le.Uint32(buf[252:]),
 	}
 }
 
@@ -183,6 +190,7 @@ func encodeControlFileData(buf []byte, cd *ControlFileData) {
 	} else {
 		buf[200] = 0
 	}
+	le.PutUint32(buf[252:], cd.DataChecksumVersion)
 }
 
 // UpdateControlFile reads the on-disk pg_control file at

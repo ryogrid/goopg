@@ -714,16 +714,42 @@ if 21-spec pass surfaces a real divergence:
         deferred. Design doc: `docs/design/0102-0018-initdb-locale-options.md`.
         Tests: `internal/initdb/locale_test.go`, `cmd/goopg/main_test.go`
         (`TestInitCommandLocaleProvider`).
-      - **Remaining initdb options** (each pulls in a distinct subsystem; one
+      - **PROGRESS 2026-06-13 (loop #29):** data-page checksum **engine**
+        landed (the reusable, high-blast-radius core), `--data-checksums`
+        initdb option deferred. `internal/storage/checksum.go` gains
+        `PageSetChecksumCopy` (copy-then-set, never mutates the shared
+        buffer) + `VerifyPage`; `internal/storage/smgr.go` `ManagerConfig`
+        gains `ChecksumsEnabled`/`IgnoreChecksumFailure`/`OnChecksumFailure`
+        wired at the `relFile` level (the single lowest seam shared by the
+        sync `readBlock`/`writeBlock`/`extend`/`extendBatch` and AIO
+        `ReadAt`/`WriteAt` paths, where the block number is always known) —
+        writes emit a checksummed copy, reads verify and return
+        `*ChecksumError` on mismatch (non-fatal under IgnoreChecksumFailure).
+        **Disabled (the default) is byte-identical** (one bool check, no copy,
+        no alloc; TPC-H Q12=2/Q13=33 unchanged). `internal/control/pgcontrol.go`
+        exposes `DataChecksumVersion` (offset 252, preserved across
+        UpdateControlFile); `internal/initdb/pgcontrol.go` `buildPgControl`
+        writes 1/0; `open.go` + `wal/recovery.go` read the field to enable
+        the Manager. **DEFERRED:** `Init` REJECTS `--data-checksums` — a
+        bootable checksummed cluster needs `pd_checksum` on ~38 distinct
+        direct `os.WriteFile` bootstrap page-write sites (no shared helper),
+        and missing one yields an unbootable cluster; that exhaustive wiring
+        + an end-to-end boot test + the PG-18 default-ON parity is the
+        remaining work (deferral ledger 2026-06-13). Design doc:
+        `docs/design/0102-0019-initdb-data-checksums.md`. Tests:
+        `internal/storage/checksum_io_test.go`,
+        `internal/initdb/data_checksums_test.go`.
+      - **Remaining initdb work** (each pulls in a distinct subsystem; one
         per future loop, design doc first):
-        `--data-checksums`/`--no-data-checksums` (PG 18 defaults checksums ON;
-        `001_initdb.pl` checks `pg_controldata` reports "Data page checksum
-        version: 1" by default / 0 with `--no-data-checksums` — but a faithful
-        implementation needs the full page-checksum write/verify path, NOT just
-        the control-file field, else a PG standby reading the pages would fail
-        the checksum; high blast radius). The locale-derived default encoding
-        (`pg_get_encoding_from_locale` on an unset `--encoding`) remains a
-        no-op under goopg's fixed C locale.
+        `--data-checksums`/`--no-data-checksums` **user-facing enablement** —
+        the engine is landed (loop #29 above); what remains is checksumming
+        the ~38 bootstrap page-write sites (route them through one
+        checksum-aware helper) + an e2e `Init(--data-checksums)`→read-every-
+        catalog-block-0 boot test + dropping the `Init` reject + adding the
+        CLI flag, then flipping the default to ON for PG-18 parity (and the
+        `001_initdb.pl` version-1 assertion). The locale-derived default
+        encoding (`pg_get_encoding_from_locale` on an unset `--encoding`)
+        remains a no-op under goopg's fixed C locale.
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 
