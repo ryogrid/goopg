@@ -15,7 +15,7 @@ Status meanings:
 | mixed | 0 | 2 | 0 |
 | modules | 0 | 0 | 1 |
 | regress | 0 | 1 | 0 |
-| tap | 49 | 3 | 1 |
+| tap | 50 | 3 | 1 |
 | utility | 1 | 0 | 0 |
 
 ## Entries
@@ -71,7 +71,8 @@ Status meanings:
 | D-006 | `postgres/src/test/modules` | mixed | defer | no | Modules migration is staged by dependency class and extension assumptions. | `M0060-0005` |
 | D-007 | `postgres/contrib` | mixed | defer | no | Contrib migration is staged by dependency class and extension/runtime assumptions. | `M0060-0005` |
 | E-001 | `postgres/src/test/modules/unsafe_tests` | modules | excluded | no | Explicit unsafe suite is outside compatibility scope by policy. | `-` |
-| E-002 | `postgres/src/bin/pg_dump/t` | tap | excluded | no | Client binary behavior depends on utility surfaces intentionally outside current server-focused scope. | `-` |
+| DU-001 | `postgres/src/bin/pg_dump/t/001_basic.pl` | tap | port | yes | Ported as TestPort_PgDump001Basic in internal/testport/pgdump_port_test.go (M0110-0001); pure CLI option-handling test (help/version/options + invalid-option and disallowed-combination cases for pg_dump/pg_restore/pg_dumpall) — requires no server connection. | `-` |
+| E-002 | `postgres/src/bin/pg_dump/t` | tap | excluded | no | Directory umbrella for the pg_dump TAP suite. 001_basic.pl ported separately as DU-001; 002-010 stay excluded pending broad catalog-view parity (pg_class/pg_attribute/pg_type/pg_proc/pg_depend/pg_extension) and a dump+restore round-trip against a live goopg server (M0110-0001). | `-` |
 | W-001 | `postgres/src/bin/pg_waldump` | utility | port | yes | Ported as TestPort_WALPgWaldumpCompat in internal/testport/wal_pg_waldump_test.go; verifies PG-compatible WAL format (M0101-0001) | `-` |
 | e2e-logical-failover-pg-to-goopg-async | `postgres/src/test/subscription` | tap | port | yes | Scenario A async: pinned by TestPort_PgoutputInteropPGToGoopgPgbenchKillAsync in internal/testport/pgoutput_interop_test.go (M0103-0007 rung 23; design 0103-0046) | `-` |
 | e2e-logical-failover-pg-to-goopg-sync | `postgres/src/test/subscription` | tap | port | yes | Scenario A sync_remote_apply: pinned by TestPort_PgoutputInteropPGToGoopgPgbenchKillSyncRemoteApply in internal/testport/pgoutput_interop_test.go (M0103-0007 rung 26; design 0103-0049) | `-` |

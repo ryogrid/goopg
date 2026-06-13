@@ -591,7 +591,7 @@ object support.
       - Target tests:
         | Test | Status | Rationale |
         |------|--------|-----------|
-        | `postgres/src/bin/pg_dump/t/001_basic.pl` | UNIMPLEMENTED | Requires pg_dump binary; tests --help/--version and basic dump of a running server. |
+        | `postgres/src/bin/pg_dump/t/001_basic.pl` | **PORTED 2026-06-13** | `TestPort_PgDump001Basic` (`internal/testport/pgdump_port_test.go`). Pure CLI option-handling test — help/version/options + invalid-option/disallowed-combination cases for pg_dump/pg_restore/pg_dumpall; needs no server. CSV row DU-001 → port. Design: `docs/design/0110-0001-pg-dump-tap-port.md`. |
         | `postgres/src/bin/pg_dump/t/002_pg_dump.pl` | UNIMPLEMENTED | Comprehensive schema/object dump; requires full catalog parity (pg_class, pg_attribute, pg_type, pg_proc, pg_depend, pg_extension, etc.). |
         | `postgres/src/bin/pg_dump/t/003_pg_dump_with_server.pl` | UNIMPLEMENTED | Dump+restore round-trip against a live server; exercises SQL-level object creation and data restoration. |
         | `postgres/src/bin/pg_dump/t/004_pg_dump_parallel.pl` | UNIMPLEMENTED | Parallel dump; additionally requires multi-connection catalog snapshot consistency. |
@@ -601,6 +601,11 @@ object support.
         test; start with 001 and 003 (basic server round-trip).  Most tests
         are blocked on catalog-view coverage (pg_class, pg_attribute,
         pg_type, pg_proc, pg_depend, pg_extension).
+      - **PROGRESS 2026-06-13 (loop #16):** 001_basic ported (the CLI-only
+        tier, no server dependency) — see DU-001 above. 002-010 remain
+        deferred under CSV row E-002 pending the catalog-view parity + dump
+        /restore round-trip enumerated in `docs/design/0110-0001-pg-dump-tap-port.md`.
+        Resume point: 002_pg_dump (schema dump) then 003 (round-trip).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
