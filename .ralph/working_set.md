@@ -1,45 +1,43 @@
-# Working Set (carried from loop 9, 2026-06-12)
+# Working Set (carried from loop 1, 2026-06-13)
 
 ## Completed this loop
 
-**M0100-0006 — InsertConflictSpecconflict speculative insertion (perms 1–4)** — DONE
-- Phase B first call: applyInsert now calls encodeArbiterKey BEFORE writeHeapRowReturning,
-  inserts arbiter btree entry with pre-computed key.
-- probeSpeculativeConflict: scans arbiter btree after applyInsert, skips own-xmin rows,
-  detects concurrent commits during Phase B blocking window.
-- cancelSpeculativeRow: stamps xmax=selfXID on speculatively-inserted heap row when conflict found.
-- maintainUniqueIndexesForInsertSkipArbiter: like maintainUniqueIndexesForInsert but skips arbiter OID.
-- DO UPDATE entry: explicit ExecBuildArbiterKey equivalent (2 NOTICEs before in-progress wait).
-- applyUpdate: explicit encodeArbiterKey for updated row's btree entry (2 NOTICEs at completion).
-- DO NOTHING: doubled to 2 encodeArbiterKey calls (4 NOTICEs total at completion).
-- Perms 1–4 all pass; test diff now starts at L503 (perm 5 only).
-- Perm 5 deferred to M0100-0006b (requires spectoken/transactionid pg_locks infrastructure).
-- PASS count: 21 (no change — test still SKIP due to perm 5)
+**M0100-0006b part (c) — `(step notices N)` completion-blocker annotations** — DONE
+- Isolation runner previously DROPPED parenthesised markers; now parses them.
+- isolation.go: `BlockerKind`/`StepBlocker` types; `IsolationSpec.PermutationBlockers`
+  (parallel to Permutations); `permTokenize` (char-level, handles glued `mystep(*)`);
+  `parsePermutation` + `parseBlockerGroup` replace `parsePermutationTokens`.
+- isolation_runner.go: `sessionNoticeQueue.count()` monotonic counter;
+  `noticeBaselines`/`blockersSatisfied`/`waitForStepBlockers`; wait invoked before
+  every step-completion-report site (immediate-complete, drainWithTimeout,
+  drainCompleted, same-session pre-launch drain, final drain). Gated on
+  `len(blockers)>0` so the 20 passing specs are unchanged.
+- Design doc: docs/design/0100-0006b-isolation-notices-blocker-annotation.md (+ README row).
+- Verified: perm-5 diff advanced from NOTICE-interleave region to
+  `controller_print_speculative_locks` (L497). Test still SKIP (parts a/b gap).
 
-## Current PASS / SKIP
+## Next task (M0100-0006b parts a/b — remaining)
 
-PASS (21): ReadWriteUnique, LockCommittedUpdate, LockCommittedKeyupdate,
-  InsertConflictDoUpdate{,2,3,4}, InsertConflictDoNothing, FkSnapshot,
-  PartitionKeyUpdate{1,2,3,4}, MergeDelete, MergeInsertUpdate, MergeMatchRecheck,
-  MergeJoin, DropIndexConcurrently1, EvalPlanQualTrigger, EvalPlanQual, MergeUpdate
-
-SKIP (1): InsertConflictSpecconflict (perm 5 requires spectoken infra)
-
-## Next task (topmost unchecked in fix_plan.md)
-
-**M0100-0006b — InsertConflictSpecconflict perm 5: spectoken infrastructure**
-- Required: (a) implement speculative token acquire/release visible in pg_locks
-  as locktype='spectoken', (b) expose own XID as transactionid ExclusiveLock in
-  pg_locks, (c) implement `(step notices N)` wait annotation in isolation runner.
+Make `controller_print_speculative_locks` return the spectoken/transactionid rows.
+- spec_insert_registry.go ALREADY emits spectoken (s1 ShareLock waiter, s2 ExclusiveLock
+  holder) + transactionid rows. But `pg_locks ⋈ pg_stat_activity USING (pid)` filtered by
+  `application_name LIKE 'isolation/insert-conflict-specconflict/s%'` returns 0 rows.
+- Investigate: (1) spec-token hold-window timing vs. when controller queries (s1 must be in
+  speculative-wait, s2 holding token); (2) does the pg_locks row carry the backend pid, and
+  does pg_stat_activity join it to application_name? Diff at expected L497+ (perm 5 only).
 
 ## Files of interest
 
-- internal/executor/operators_upsert.go — speculative insertion changes (loop 9)
-- internal/executor/operators_storage.go — maintainUniqueIndexesForInsertSkipArbiter (loop 9)
+- internal/testport/framework/isolation.go — parser + data model (loop 1)
+- internal/testport/framework/isolation_runner.go — notices blocker wait (loop 1)
+- internal/executor/spec_insert_registry.go — spectoken/transactionid pg_locks rows (parts a/b)
+- internal/catalog/catalog.go:2149-2239 — pg_locks view; VirtualSpecLockRowsFunc
 
 ## Gates run
 
-- go build: PASS
-- executor/mvcc/server/planner -race: PASS
-- Isolation suite: 21 PASS / 1 SKIP (diff starts at L503 perm 5 only)
-- TPC-H spotcheck: SKIPPED (no data dir)
+- go build ./... : PASS
+- go vet ./internal/testport/framework/ : PASS
+- framework unit tests : PASS (incl. new TestParsePermutationBlockers*)
+- TestPort_IsolationInsertConflictSpecconflict : SKIP (diff advanced to L497, parts a/b gap)
+- Regression: EvalPlanQual / InsertConflictDoNothing / MergeUpdate : PASS
+- TPC-H spotcheck: N/A (test-framework-only change; no executor/planner/codec touch)

@@ -326,6 +326,19 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
                 visible in pg_locks as locktype='spectoken', (b) expose own
                 XID as transactionid ExclusiveLock in pg_locks, (c) implement
                 `(step notices N)` wait annotation in isolation runner.
+              - Progress (loop 1, 2026-06-13): part (c) DONE — isolation runner
+                now parses completion markers (`*`, `<step>`, `<step> notices
+                <n>`) into `IsolationSpec.PermutationBlockers` and
+                `waitForStepBlockers` delays a step's completion report until
+                the referenced session emits ≥N notices. Design doc:
+                `docs/design/0100-0006b-isolation-notices-blocker-annotation.md`.
+                Perm-5 diff advanced past the NOTICE-interleave region to
+                `controller_print_speculative_locks` (L497). Parts (a)/(b)
+                infra exists in `internal/executor/spec_insert_registry.go`
+                (emits spectoken/transactionid rows) but those rows are not
+                surfacing through `pg_locks ⋈ pg_stat_activity USING (pid)`
+                filtered by application_name at the moment the controller
+                queries them — remaining gap. See deferral ledger.
 
         - [ ] **M0100-0007 — MergeUpdate: MERGE RETURNING old/new aliases + merge_action()**
               - Summary: `TestPort_IsolationMergeUpdate` SKIP — `ERROR: column

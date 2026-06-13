@@ -27,13 +27,20 @@ const (
 	drainWindow = 5 * time.Second
 )
 
-// stepOutcome is the result of executing one step in a goroutine.
-type stepOutcome struct {
+// oneResult holds the output of one SELECT-like statement within a step.
+type oneResult struct {
 	rows     [][]string // rows[0] = column names; rows[1:] = data rows
 	colTypes []string   // "numeric" or "text" per column
-	errText  string     // non-empty when execution returned an error
-	notices  []string   // NOTICE messages emitted during execution
-	session  string     // session name for "session: NOTICE:  msg" prefix
+}
+
+// stepOutcome is the result of executing one step in a goroutine.
+// A step may contain multiple SQL statements; each SELECT-like statement
+// that returns rows is captured as a separate oneResult in results.
+type stepOutcome struct {
+	results []oneResult // one entry per SELECT result set (in statement order)
+	errText string      // non-empty when execution returned an error
+	notices []string    // NOTICE messages emitted during execution
+	session string      // session name for "session: NOTICE:  msg" prefix
 }
 
 // pendingStep tracks a step goroutine that has been submitted but has not yet
@@ -45,6 +52,12 @@ type pendingStep struct {
 	outCh    chan stepOutcome
 	queue    *sessionNoticeQueue // nil for non-blocking steps; set for blocked steps
 	cancelFn context.CancelFunc  // cancels this step's context; nil for non-blocking steps
+	// blockers/baselines implement PostgreSQL isolationtester completion
+	// markers: this step's completion report is delayed until its blockers are
+	// satisfied. baselines records the referenced session's notice count at the
+	// moment this step was launched (for "notices <n>" markers).
+	blockers  []StepBlocker
+	baselines map[string]int
 }
 
 // IsolationRunner executes an IsolationSpec against a live database.
@@ -108,7 +121,11 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 			_ = monitor.Close()
 		}
 
-		out, err := r.runPermutation(ctx, db, spec, perm)
+		var permBlockers [][]StepBlocker
+		if i < len(spec.PermutationBlockers) {
+			permBlockers = spec.PermutationBlockers[i]
+		}
+		out, err := r.runPermutation(ctx, db, spec, perm, permBlockers)
 
 		// Global teardown runs after each permutation (mirrors isolationtester.c).
 		if spec.TeardownSQL != "" {
@@ -136,12 +153,22 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 type sessionNoticeQueue struct {
 	mu      sync.Mutex
 	notices []string
+	total   int // monotonic count of all notices ever pushed; never reset by drain
 }
 
 func (q *sessionNoticeQueue) push(msg string) {
 	q.mu.Lock()
 	q.notices = append(q.notices, msg)
+	q.total++
 	q.mu.Unlock()
+}
+
+// count returns the total number of NOTICE messages ever pushed to this queue
+// (independent of drain). Used to enforce "notices <n>" completion blockers.
+func (q *sessionNoticeQueue) count() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.total
 }
 
 // drain returns and clears all collected notices.
@@ -154,7 +181,7 @@ func (q *sessionNoticeQueue) drain() []string {
 }
 
 // runPermutation executes one permutation using fresh session connections.
-func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec IsolationSpec, perm []string) (string, error) {
+func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec IsolationSpec, perm []string, permBlockers [][]StepBlocker) (string, error) {
 	sessionNames := spec.Sessions
 	if len(sessionNames) == 0 {
 		sessionNames = []string{"s1"}
@@ -242,8 +269,21 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		}
 	}()
 
-	// Per-session setup.
+	// Derive spec basename (e.g. "insert-conflict-specconflict") for
+	// the application_name used by pg_locks / pg_stat_activity queries.
+	specBase := spec.Path
+	if i := strings.LastIndex(specBase, "/"); i >= 0 {
+		specBase = specBase[i+1:]
+	}
+	specBase = strings.TrimSuffix(specBase, ".spec")
+
+	// Per-session setup: set application_name first so pg_locks queries
+	// filtered by application_name can identify sessions. M0100-0006b.
 	for _, sname := range sessionNames {
+		appName := "isolation/" + specBase + "/" + sname
+		if err := execConn(ctx, conns[sname], "SET application_name = '"+appName+"'"); err != nil {
+			return "", fmt.Errorf("session %q set application_name: %w", sname, err)
+		}
 		if setupSQL, ok := spec.SessionSetup[sname]; ok && setupSQL != "" {
 			if err := execConn(ctx, conns[sname], setupSQL); err != nil {
 				return "", fmt.Errorf("session %q setup: %w", sname, err)
@@ -256,11 +296,18 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 
 	var pending []pendingStep
 
-	for _, stepName := range perm {
+	for stepIdx, stepName := range perm {
 		step, ok := spec.Steps[stepName]
 		if !ok {
 			fmt.Fprintf(&sb, "step %s: (missing)\n", stepName)
 			continue
+		}
+
+		// Completion blockers attached to this step (PostgreSQL isolationtester
+		// markers). Empty for every step in the 21 already-passing specs.
+		var stepBlockers []StepBlocker
+		if stepIdx < len(permBlockers) {
+			stepBlockers = permBlockers[stepIdx]
 		}
 
 		conn, ok := conns[step.Session]
@@ -287,6 +334,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			if p.session == step.Session {
 				select {
 				case o := <-p.outCh:
+					waitForStepBlockers(spec, sessionQueues, p.blockers, p.baselines)
 					if p.queue != nil {
 						o.notices = p.queue.drain()
 					}
@@ -316,6 +364,10 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 
 		outCh := make(chan stepOutcome, 1)
 		q := sessionQueues[step.Session]
+		// Capture referenced-session notice baselines at launch time, so a
+		// "notices <n>" blocker counts only notices emitted after this step
+		// starts (PostgreSQL isolationtester semantics).
+		stepBaselines := noticeBaselines(spec, sessionQueues, stepBlockers)
 		// Use a per-step cancellable context so timed-out goroutines can
 		// be promptly cancelled rather than holding the connection open.
 		stepCtx, stepCancel := context.WithCancel(ctx)
@@ -331,6 +383,9 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			// Step completed immediately — release its context.
 			stepCancel()
 			activeSteps[step.Session] = nil
+			// Honor completion blockers: delay reporting this step's
+			// completion until the markers are satisfied (e.g. "notices <n>").
+			waitForStepBlockers(spec, sessionQueues, stepBlockers, stepBaselines)
 			// Drain notices generated during this non-blocking step.
 			if q != nil {
 				outcome.notices = q.drain()
@@ -339,7 +394,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			// window to complete (matching PostgreSQL isolationtester order:
 			// unblocked waiting steps appear before the next regular step).
 			sb.WriteString(formatStepOutput(step.Name, step.SQL, outcome, false))
-			pending = drainWithTimeout(&sb, pending, postStepDrainWait)
+			pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait)
 
 		case <-time.After(blockDetectWait):
 			// Step appears blocked.  Drain notices that arrived before the
@@ -361,7 +416,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			// leading newline in step.SQL, which renders as `step name: \n
 			// <body> <waiting ...>` — same single format.
 			sb.WriteString(formatWaitingStepHeader(step.Name, step.SQL))
-			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh, queue: q, cancelFn: stepCancel})
+			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh, queue: q, cancelFn: stepCancel, blockers: stepBlockers, baselines: stepBaselines})
 		}
 	}
 
@@ -374,6 +429,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			if p.cancelFn != nil {
 				p.cancelFn()
 			}
+			waitForStepBlockers(spec, sessionQueues, p.blockers, p.baselines)
 			if p.queue != nil {
 				outcome.notices = p.queue.drain()
 			}
@@ -404,6 +460,73 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 	return sb.String(), nil
 }
 
+// sessionOfStep returns the session that owns the named step, or "" if unknown.
+func sessionOfStep(spec IsolationSpec, stepName string) string {
+	if st, ok := spec.Steps[stepName]; ok {
+		return st.Session
+	}
+	return ""
+}
+
+// noticeBaselines captures, at step-launch time, the referenced session's
+// current NOTICE count for each "notices <n>" blocker. nil when there are no
+// such blockers.
+func noticeBaselines(spec IsolationSpec, queues map[string]*sessionNoticeQueue, blockers []StepBlocker) map[string]int {
+	var base map[string]int
+	for _, b := range blockers {
+		if b.Kind != BlockerNotices {
+			continue
+		}
+		if q := queues[sessionOfStep(spec, b.StepName)]; q != nil {
+			if base == nil {
+				base = make(map[string]int)
+			}
+			base[b.StepName] = q.count()
+		}
+	}
+	return base
+}
+
+// blockersSatisfied reports whether all of a step's completion blockers are
+// currently met. Only BlockerNotices is enforced (the only marker kind
+// exercised by the ported specs); BlockerStepComplete and BlockerStar are
+// treated as already satisfied here (best-effort).
+func blockersSatisfied(spec IsolationSpec, queues map[string]*sessionNoticeQueue, blockers []StepBlocker, baselines map[string]int) bool {
+	for _, b := range blockers {
+		if b.Kind != BlockerNotices {
+			continue
+		}
+		q := queues[sessionOfStep(spec, b.StepName)]
+		if q == nil {
+			continue
+		}
+		if q.count()-baselines[b.StepName] < b.Count {
+			return false
+		}
+	}
+	return true
+}
+
+// waitForStepBlockers blocks until a step's completion blockers are satisfied
+// or drainWindow elapses, then returns. A no-op when the step has no blockers,
+// so steps in the 21 already-passing specs are unaffected.
+func waitForStepBlockers(spec IsolationSpec, queues map[string]*sessionNoticeQueue, blockers []StepBlocker, baselines map[string]int) {
+	if len(blockers) == 0 {
+		return
+	}
+	deadline := time.After(drainWindow)
+	for {
+		if blockersSatisfied(spec, queues, blockers, baselines) {
+			return
+		}
+		select {
+		case <-deadline:
+			return
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 // writeCompletedStep writes a blocked step's completed output: NOTICEs first
 // (matching PostgreSQL isolationtester's ordering for waiting steps), then
 // the "<... completed>" marker, then result rows.
@@ -415,9 +538,8 @@ func writeCompletedStep(sb *strings.Builder, name, sql string, o stepOutcome) {
 	}
 	fmt.Fprintf(sb, "step %s: <... completed>\n", name)
 	sb.WriteString(formatStepOutput(name, sql, stepOutcome{
-		rows:     o.rows,
-		colTypes: o.colTypes,
-		errText:  o.errText,
+		results: o.results,
+		errText: o.errText,
 	}, true))
 }
 
@@ -432,11 +554,12 @@ func drainPendingStepNotices(sb *strings.Builder, p pendingStep) {
 
 // drainCompleted checks each pending step non-blockingly; completed results
 // are appended to sb and removed from the returned slice.
-func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
+func drainCompleted(sb *strings.Builder, spec IsolationSpec, queues map[string]*sessionNoticeQueue, pending []pendingStep) []pendingStep {
 	remaining := pending[:0]
 	for _, p := range pending {
 		select {
 		case o := <-p.outCh:
+			waitForStepBlockers(spec, queues, p.blockers, p.baselines)
 			if p.queue != nil {
 				o.notices = p.queue.drain()
 			}
@@ -452,7 +575,7 @@ func drainCompleted(sb *strings.Builder, pending []pendingStep) []pendingStep {
 // drainWithTimeout drains pending steps that complete within the given window.
 // After a regular step completes, this lets unblocked waiting steps surface
 // before the next regular step, matching PostgreSQL isolationtester ordering.
-func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Duration) []pendingStep {
+func drainWithTimeout(sb *strings.Builder, spec IsolationSpec, queues map[string]*sessionNoticeQueue, pending []pendingStep, window time.Duration) []pendingStep {
 	if len(pending) == 0 {
 		return pending
 	}
@@ -463,6 +586,7 @@ func drainWithTimeout(sb *strings.Builder, pending []pendingStep, window time.Du
 			if p.cancelFn != nil {
 				p.cancelFn()
 			}
+			waitForStepBlockers(spec, queues, p.blockers, p.baselines)
 			if p.queue != nil {
 				o.notices = p.queue.drain()
 			}
@@ -490,17 +614,78 @@ func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session str
 	return o
 }
 
-// execStep executes sqlText on conn and returns the result as a stepOutcome.
-func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcome {
+// splitSQLStatements splits a multi-statement SQL block into individual
+// statement strings. Handles single-quoted strings (with '' escapes) and
+// single-line (--) comments. Sufficient for all isolation spec files.
+func splitSQLStatements(sql string) []string {
+	var stmts []string
+	var cur strings.Builder
+	inSingleQuote := false
+
+	i := 0
+	for i < len(sql) {
+		c := sql[i]
+
+		if inSingleQuote {
+			cur.WriteByte(c)
+			if c == '\'' {
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					// Escaped single quote ''
+					i++
+					cur.WriteByte(sql[i])
+				} else {
+					inSingleQuote = false
+				}
+			}
+			i++
+			continue
+		}
+
+		switch c {
+		case '\'':
+			inSingleQuote = true
+			cur.WriteByte(c)
+			i++
+		case '-':
+			if i+1 < len(sql) && sql[i+1] == '-' {
+				// Single-line comment: include until end of line
+				for i < len(sql) && sql[i] != '\n' {
+					cur.WriteByte(sql[i])
+					i++
+				}
+			} else {
+				cur.WriteByte(c)
+				i++
+			}
+		case ';':
+			if stmt := strings.TrimSpace(cur.String()); stmt != "" {
+				stmts = append(stmts, stmt)
+			}
+			cur.Reset()
+			i++
+		default:
+			cur.WriteByte(c)
+			i++
+		}
+	}
+	if stmt := strings.TrimSpace(cur.String()); stmt != "" {
+		stmts = append(stmts, stmt)
+	}
+	return stmts
+}
+
+// execOneStatement executes a single SQL statement on conn and returns the
+// result as a oneResult. Returns ("", errText) on error.
+func execOneStatement(ctx context.Context, conn *sql.Conn, sqlText string) (oneResult, string) {
 	rows, err := conn.QueryContext(ctx, sqlText)
 	if err != nil {
-		return stepOutcome{errText: formatPQError(err)}
+		return oneResult{}, formatPQError(err)
 	}
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return stepOutcome{errText: formatPQError(err)}
+		return oneResult{}, formatPQError(err)
 	}
 
 	colTypes, _ := rows.ColumnTypes()
@@ -519,10 +704,10 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcom
 		}
 	}
 
-	var result stepOutcome
-	result.colTypes = numericCols
+	var rs oneResult
+	rs.colTypes = numericCols
 	if len(cols) > 0 {
-		result.rows = append(result.rows, cols)
+		rs.rows = append(rs.rows, cols)
 	}
 
 	for rows.Next() {
@@ -532,7 +717,7 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcom
 			ptrs[i] = &vals[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
-			return stepOutcome{errText: formatPQError(err)}
+			return oneResult{}, formatPQError(err)
 		}
 		row := make([]string, len(cols))
 		for i, v := range vals {
@@ -543,10 +728,33 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcom
 				}
 			}
 		}
-		result.rows = append(result.rows, row)
+		rs.rows = append(rs.rows, row)
 	}
 	if err := rows.Err(); err != nil {
-		return stepOutcome{errText: formatPQError(err)}
+		return oneResult{}, formatPQError(err)
+	}
+	return rs, ""
+}
+
+// execStep executes sqlText on conn and returns the result as a stepOutcome.
+// Multi-statement SQL is split on semicolons; each statement is executed
+// separately so that all result sets (EXPLAIN + SELECT FOR UPDATE, etc.) are
+// captured. This matches PostgreSQL isolationtester which calls PQgetResult in
+// a loop and prints every non-empty result set.
+func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcome {
+	stmts := splitSQLStatements(sqlText)
+	if len(stmts) == 0 {
+		stmts = []string{sqlText}
+	}
+	var result stepOutcome
+	for _, stmt := range stmts {
+		rs, errText := execOneStatement(ctx, conn, stmt)
+		if errText != "" {
+			return stepOutcome{errText: errText}
+		}
+		if len(rs.rows) > 0 {
+			result.results = append(result.results, rs)
+		}
 	}
 	return result
 }
@@ -592,17 +800,14 @@ func formatStepOutput(name, sqlText string, o stepOutcome, afterWaiting bool) st
 		return sb.String()
 	}
 
-	if len(o.rows) == 0 {
-		return sb.String()
+	for _, rs := range o.results {
+		if len(rs.rows) == 0 || len(rs.rows[0]) == 0 {
+			continue
+		}
+		cols := rs.rows[0]
+		data := rs.rows[1:]
+		sb.WriteString(pqprintFormat(cols, data, rs.colTypes))
 	}
-
-	cols := o.rows[0]
-	data := o.rows[1:]
-	if len(cols) == 0 {
-		return sb.String()
-	}
-
-	sb.WriteString(pqprintFormat(cols, data, o.colTypes))
 	return sb.String()
 }
 
@@ -697,15 +902,14 @@ func execConnCapture(ctx context.Context, conn *sql.Conn, sqlText string) string
 	if outcome.errText != "" {
 		return outcome.errText + "\n"
 	}
-	if len(outcome.rows) == 0 {
+	if len(outcome.results) == 0 {
 		return ""
 	}
-	cols := outcome.rows[0]
-	data := outcome.rows[1:]
-	if len(cols) == 0 {
+	rs := outcome.results[0]
+	if len(rs.rows) == 0 || len(rs.rows[0]) == 0 {
 		return ""
 	}
-	return pqprintFormat(cols, data, outcome.colTypes)
+	return pqprintFormat(rs.rows[0], rs.rows[1:], rs.colTypes)
 }
 
 // formatPQError formats a database error as isolationtester would print it.
@@ -854,7 +1058,7 @@ func normalizeIsoOutput(s string) string {
 				out = append(out, line)
 				continue
 			}
-			if trimmed == "QUERY PLAN" {
+			if trimmed == "QUERY PLAN" || trimmed == "explain_filter" {
 				inExplain = true
 				continue
 			}
