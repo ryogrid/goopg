@@ -948,6 +948,27 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         tests are deferred under CSV row AC-002, blocked on `verify_heapam()` SRF
         + opclass catalog coverage. Resume = promote AC-002 (002_nonesuch first —
         only error-path catalog lookups) when those land.
+      - **PROGRESS 2026-06-14 (loop #51):** the **page-structural core of
+        `verify_heapam()` landed** as a standalone `internal/amcheck` engine
+        (`VerifyHeapPage`), following the engine-first/wire-later pattern (cf. the
+        M0102-0010 checksum engine). Tier 1 only — line-pointer bounds/alignment,
+        redirect-target validity, and tuple-header `t_hoff` consistency — all
+        deterministic functions of the raw 8 KiB page bytes (no clog/TupleDesc/
+        toast). Corruption messages mirror `postgres/contrib/amcheck/verify_heapam.c`
+        verbatim (`check_tuple_header` + the line-pointer loop) so the later SRF +
+        `004_verify_heapam` port reuse them. 11 unit tests PASS (clean empty/new/
+        tuple pages → no reports; each targeted corruption → exact upstream
+        message). Design doc `docs/design/0110-0005-verify-heapam-engine.md`.
+        **Deferred** (deferral ledger 2026-06-14): the HOT-chain tier, the
+        MVCC/attribute tier (xmin/xmax/multixact/TOAST pointer checks), and the
+        SQL surface — `CREATE EXTENSION amcheck` (parser + `pg_extension` row +
+        `pg_proc` registration) + the `verify_heapam(regclass,…)` SRF that walks a
+        relation's blocks through this engine — which is the slice that promotes
+        AC-002 (`002_nonesuch`). The SQL surface edits parser/planner/executor/
+        catalog, which currently carry uncommitted gen-column WIP from a separate
+        session; it must wait for a clean tree. Resume = wire `CREATE EXTENSION
+        amcheck` + the `verify_heapam` SRF on top of this engine, then port
+        `002_nonesuch.pl`.
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

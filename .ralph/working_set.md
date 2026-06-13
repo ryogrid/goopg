@@ -1,45 +1,43 @@
-(idle — nothing in flight)
+Task: M0110-0003 (pg_amcheck) — landed the page-structural CORE of amcheck's
+verify_heapam() as a standalone engine, engine-first (SQL surface deferred to a
+clean tree). This is the keystone blocker for the 4 deferred pg_amcheck TAP
+tests (AC-002: 002_nonesuch/003_check/004_verify_heapam/005_opclass_damage).
 
-Last completed (loop #50): M0110-0004 — RW-002 (b), the unclean-shutdown +
---force branch of pg_resetwal 001_basic.pl. **M0110-0004 is now COMPLETE**
-(full pg_resetwal TAP suite ported: RW-001/002/003/004 all `port`).
-Committed + pushed.
+Files (all NEW — none touch the contaminated gen-column WIP files):
+  - internal/amcheck/verify_heapam.go — VerifyHeapPage(p storage.Page) []Report.
+    Tier-1 only: line-pointer bounds/alignment, redirect-target validity,
+    tuple-header t_hoff consistency. Messages mirror verify_heapam.c verbatim.
+  - internal/amcheck/verify_heapam_test.go — 11 unit tests (clean→0 reports;
+    each corruption→exact upstream message). All PASS (0.003s).
+  - docs/design/0110-0005-verify-heapam-engine.md (new) + README.md index row.
+  - fix_plan.md M0110-0003 progress note + deferral_ledger.md line.
 
-What this loop did: gave goopg a *real* immediate shutdown so the
-"database server was not shut down cleanly" + `--force` branch can be
-reproduced (the last RW-002 remainder, previously deferred as "goopg v0 has
-no unclean shutdown state").
-  - internal/control/control.go: new STOPIMMEDIATE verb + OnStopImmediate
-    callback (falls back to OnStop).
-  - internal/server/server.go: Config.OnStopImmediate + cl.OnStopImmediate
-    handler — runs NO CheckpointNow, invokes the hook, then runCancel; pidfile
-    still removed by the normal defer s.stopControlPlane().
-  - internal/initdb/open.go: Runtime.SetImmediateShutdown() sets a flag;
-    Close() then SKIPS the final CheckpointShutdown → pg_control stays
-    DB_IN_PRODUCTION (unclean; recovered via WAL replay next start).
-  - cmd/goopg/main.go: `goopg stop -mode immediate` sends STOPIMMEDIATE and
-    wires cfg.OnStopImmediate→rt.SetImmediateShutdown(); smart/fast stay STOP.
-  - internal/testport/pgresetwal_port_test.go: TestPort_PgResetwal001BasicForce
-    (start → checkpoint to stamp DB_IN_PRODUCTION → stop immediate → pg_resetwal
-    refuses w/o --force → --force → restart → SELECT 1).
-Docs: design 0110-0004 (Status→complete, loop-#50 section), README index row,
-CSV RW-002→port + regenerated .md, fix_plan M0110-0004 [x] + loop-#50 note,
-deferral_ledger closure line.
+Key symbols: amcheck.VerifyHeapPage, checkTupleHeader; storage primitives used:
+  PageGetItemID / PageLinePointerCount / IsNew / HeapNattsMask / HeapHasNull /
+  SizeOfHeapTupleHeaderData / ItemID{Unused,Normal,Redirect,Dead}.
 
-Gates: all 4 TestPort_PgResetwal* PASS (4.9s); go test -race
-./internal/control ./internal/server clean; go test ./internal/initdb PASS
-(109s); go build ./... clean.
+Gates run: go test ./internal/amcheck (11 PASS), gofmt/vet clean,
+  go build ./... clean, make ralph-state-guard OK (had to restore
+  .ralph/progress.json running→in_progress to match status.json; a stale
+  loop-#50 "completed" write had desynced it).
 
-Faithfulness note: upstream stamps DB_IN_PRODUCTION at end of startup recovery;
-goopg stamps it on each running checkpoint (initdb leaves DB_SHUTDOWNED), so the
-test runs one explicit checkpoint after start. A startup-time stamp stays
-intentionally deferred (a standby in recovery must not be flagged in-production).
+Next step (DEFERRED — needs a CLEAN working tree; current tree carries another
+  session's uncommitted gen-column/partition WIP across parser/planner/executor/
+  catalog/analyzer/mvcc + server/dispatch.go): wire the SQL surface on top of the
+  engine — (1) CREATE EXTENSION amcheck (parser + pg_extension row + pg_proc
+  registration of verify_heapam/bt_index_check/bt_index_parent_check), (2) the
+  verify_heapam(regclass,…) SRF that walks a relation's blocks through
+  VerifyHeapPage emitting one row per Report — then port 002_nonesuch.pl (its only
+  actually-checked relation is a clean pg_catalog.pg_class, so the tier-1 engine
+  suffices for the exit-0 path). HOT/MVCC tiers needed only for 003/004's
+  deliberately-corrupt fixtures.
 
-Other OPEN tasks (all blocked on big features): M0095-0003 (WAL streaming
--X stream), M0110-0001 (pg_dump 002+ catalog parity), M0110-0002 (pg_waldump
-002 / index AMs), M0110-0003 (pg_amcheck verify_heapam + opclass).
+⚠ TREE NOTE (still true): a SEPARATE manual session has uncommitted WIP across
+internal/{executor,planner,catalog,analyzer,parser,mvcc}/ + server/dispatch.go +
+untracked gen_override test files + postgres/ + validate-ralph-state. NOT
+ralph's — stage only your own files (git add <paths>), never `git add -A`.
 
-⚠ TREE NOTE: a SEPARATE manual claude session has uncommitted WIP across
-internal/{executor,planner,catalog,analyzer,parser,mvcc,server}/dispatch.go +
-untracked test files + postgres/ + validate-ralph-state. NOT ralph's — stage
-only your own files (git add <paths>), never `git add -A`.
+Other OPEN tasks (all blocked on big features): M0095-0003 (WAL streaming -X
+stream), M0110-0001 (pg_dump 002+ catalog parity), M0110-0002 (pg_waldump 002 /
+index AMs hash/gin/gist/spgist/brin).
+</content>
