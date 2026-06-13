@@ -11,13 +11,18 @@ Completed milestones are archived under `completed_milestones/` (latest: `comple
 
 ## Maintenance (small, do when convenient — does not preempt milestone order)
 
-- [ ] **MAINT-TPCH-RELOAD** — Reload the TPC-H bench dataset so the silent-regression
+- [x] **MAINT-TPCH-RELOAD** — Reload the TPC-H bench dataset so the silent-regression
       gate works again. `bench/tpch/runtime_goopg/data` is a stale husk (no PG_VERSION,
       last real load 2026-05-26), so `scripts/tpch-spotcheck.sh` currently SKIPs.
       Steps: run `bench/tpch/build_schema_goopg.sh` (capped via the wrapper), then run
       `scripts/tpch-spotcheck.sh`, and re-pin `Q13_EXPECTED` in
       `bench/tpch/spotcheck_expected.env` from the fresh load (Q13 is load-dependent;
       Q12 must be 2). DoD: spotcheck exits PASS and the env file cites the new run log.
+      **DONE 2026-06-13:** HammerDB SF=1 reload (build_goopg_20260613-144815.log,
+      lineitem=5,999,786 / orders=1,500,000, FINISHED SUCCESS). Spotcheck PASS:
+      Q12=2 (invariant), Q13 re-pinned 35→33 (load-dependent, stable across 2 runs;
+      tmp/spotcheck_run_20260613.log + spotcheck_rerun_20260613.log). The gate that
+      detects silent row-count regressions is live again.
 
 ## M0095 — Client-Tools TAP Test Porting (filed 2026-05-12)
 
