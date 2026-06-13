@@ -152,7 +152,9 @@ alongside the suite.
 
 ### Sub-milestones
 
-- [ ] **M0096-0013**
+- [x] **M0096-0013** — CLOSED via M0100-0005 (loop 6, 2026-06-13): all 23
+      dedicated `TestPort_Isolation*` functions PASS, 0 FAIL / 0 SKIP. M0096-0005
+      (ON CONFLICT wait-state propagation) was closed earlier via M0100-0002.
       - Summary: End-to-end pass confirmation: run all 21 dedicated
         test functions from M0096-0001, confirm every spec reports `pass`.
       - Fix any remaining output-normalization or row-ordering mismatches.
@@ -279,10 +281,18 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
       - NOTE: eval-plan-qual/merge-match-recheck defer due to missing RETURNING support in planner
         (not an EPQ issue — RETURNING is parsed but not planned; needs separate work).
 
-- [ ] **M0100-0005**
+- [x] **M0100-0005** — DONE (loop 6, 2026-06-13). All DoD criteria met;
+      milestone 0100 set `accepted` (doc + README). Verbose run:
+      all 23 dedicated `TestPort_Isolation*` PASS, 0 FAIL / 0 SKIP
+      (`tmp/perf-optimize/isolation-m0100-verbose.log`). pgbench-S = 48,984 TPS.
+      M0096-0005 and M0096-0013 closed via cross-reference (below).
       - Summary: E2E pass confirmation: all 21 dedicated RC isolation
         tests pass. **Closes M0096-0005 and M0096-0013 via cross-reference.**
-      - **Depends**: Close of M0107
+      - ~~**Depends**: Close of M0107~~ **STRUCK (loop 6, 2026-06-13):** the
+        0100 milestone-doc DoD (`docs/milestones/0100-…md` lines 52-62) does NOT
+        list M0107; its perf criterion is "pgbench-S ≥ 2,000 TPS at -c 10", which
+        is now verified directly (see blocker 3 below). M0107 was a stale forward
+        reference, not a real dependency.
       - Run: `go test -v -run TestPort_Isolation -timeout 30m ./internal/testport/`.
       - DoD: every `TestPort_Isolation*` listed in M0096-0001 reports `pass`
         (none `defer`, none `excluded`). On completion:
@@ -315,11 +325,15 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
            The other ~771 uncommitted lines (gen_override, lockrows, planner) are
            SEPARATE in-flight features, not referenced by any committed file; left
            uncommitted for their owning task.
-        2. `Depends: Close of M0107` (above) — M0107 is an unstarted `planned` perf
-           refactor; this forward dependency must be reconciled or struck (the
-           0100 milestone-doc DoD itself does NOT list M0107; the pgbench-S
-           TPS≥2000 DoD criterion is the likely intent).
-        3. pgbench-S TPS≥2000 DoD criterion unverified (no server/data dir).
+        2. ~~`Depends: Close of M0107`~~ **RESOLVED (loop 6, 2026-06-13):** struck
+           as a stale forward reference; the milestone-doc DoD does not list M0107
+           (see the struck Depends line above).
+        3. ~~pgbench-S TPS≥2000 DoD criterion unverified~~ **RESOLVED (loop 6,
+           2026-06-13):** fresh capped server (port 5533, `tmp/perf-optimize/`),
+           `pgbench -i -s 10` then `pgbench -S -c 10 -j 10 -T 30` →
+           **tps = 48,984** (0 failed txns; warmup 48,868). Decisively clears the
+           ≥2,000 bar (and the M0093 2,740 baseline). Log:
+           `tmp/perf-optimize/pgbench-m0100-server.log`.
         4. `docs/test-port/executable-isolation-tests.md` has no `status=` column —
            the "flip defer→port" instruction is stale; the canonical status lives in
            `docs/test-port/postgres-oracle-port-status.csv` (D-002 isolation suite).
