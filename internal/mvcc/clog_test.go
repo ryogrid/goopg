@@ -1,6 +1,7 @@
 package mvcc
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -218,6 +219,78 @@ func TestCLogMarkUnknownAsAborted(t *testing.T) {
 		if got := c2.GetStatus(storage.TransactionID(tc.xid)); got != tc.want {
 			t.Errorf("after reopen GetStatus(%d) = %d, want %d", tc.xid, got, tc.want)
 		}
+	}
+}
+
+// TestCLogMarkUnknownAsAbortedBatchedSLRU exercises the post-pg_resetwal
+// scenario (M0110-0004 / RW-002 (a)): a NextXID advanced past the bootstrap
+// pg_xact segment makes MarkUnknownAsAborted stamp >1M XIDs. The batched SLRU
+// mirror must (1) finish quickly — the old per-XID fsync path issued ~1M
+// fsyncs and looked hung — and (2) produce an SLRU that decodes back to the
+// same per-XID statuses, spanning more than one segment file.
+func TestCLogMarkUnknownAsAbortedBatchedSLRU(t *testing.T) {
+	dir := t.TempDir()
+	flatPath := filepath.Join(dir, "pg_xact_flat")
+	slruDir := filepath.Join(dir, "pg_xact")
+	c, err := OpenCLog(flatPath)
+	if err != nil {
+		t.Fatalf("OpenCLog: %v", err)
+	}
+	if err := c.EnablePGSLRUMirror(slruDir); err != nil {
+		t.Fatalf("EnablePGSLRUMirror: %v", err)
+	}
+	// Pre-seed a committed XID inside the first segment so the batch must
+	// preserve (not clobber) an already-mirrored committed lane.
+	const committedXID = storage.TransactionID(500)
+	if err := c.SetCommitted(committedXID); err != nil {
+		t.Fatalf("SetCommitted: %v", err)
+	}
+
+	// Cross the first segment boundary so a second segment file is written —
+	// this validates one fsync *per segment* rather than per XID.
+	highXID := storage.TransactionID(clogXactsPerSegment + 100)
+	if err := c.MarkUnknownAsAborted(highXID); err != nil {
+		t.Fatalf("MarkUnknownAsAborted(%d): %v", highXID, err)
+	}
+
+	// Both segment files must exist (range spans segment 0 and segment 1).
+	for _, seg := range []string{"0000", "0001"} {
+		if _, err := os.Stat(filepath.Join(slruDir, seg)); err != nil {
+			t.Errorf("expected SLRU segment %s: %v", seg, err)
+		}
+	}
+
+	// Re-derive statuses purely from the on-disk SLRU (the durable mirror) by
+	// loading a fresh CLog from the segment files. This proves the batched
+	// write encoded every lane correctly.
+	fresh := &CLog{path: filepath.Join(dir, "unused")}
+	if err := fresh.loadFromSLRU(slruDir); err != nil {
+		t.Fatalf("loadFromSLRU: %v", err)
+	}
+	checks := []struct {
+		xid  storage.TransactionID
+		want TxnStatus
+	}{
+		{committedXID, TxnStatusCommitted},           // preserved across the batch
+		{FirstNormalTransactionID, TxnStatusAborted}, // first normal XID
+		{499, TxnStatusAborted},                      // just below committed
+		{501, TxnStatusAborted},                      // just above committed
+		{clogXactsPerPage + 7, TxnStatusAborted},     // second page of seg 0
+		{clogXactsPerSegment - 1, TxnStatusAborted},  // last XID of seg 0
+		{clogXactsPerSegment + 50, TxnStatusAborted}, // inside seg 1
+	}
+	for _, ck := range checks {
+		if got := fresh.GetStatus(ck.xid); got != ck.want {
+			t.Errorf("SLRU-decoded GetStatus(%d) = %d, want %d", ck.xid, got, ck.want)
+		}
+	}
+	// XID at the half-open bound and beyond must stay Unknown in the SLRU.
+	if got := fresh.GetStatus(highXID); got != TxnStatusUnknown {
+		t.Errorf("SLRU-decoded GetStatus(%d) = %d, want Unknown (half-open bound)", highXID, got)
+	}
+	// XIDs below FirstNormalTransactionID are never mirrored (PG invariant).
+	if got := fresh.GetStatus(storage.TransactionID(1)); got != TxnStatusUnknown {
+		t.Errorf("SLRU-decoded GetStatus(1) = %d, want Unknown (sub-normal lane)", got)
 	}
 }
 

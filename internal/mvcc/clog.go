@@ -259,17 +259,110 @@ func (c *CLog) MarkUnknownAsAborted(highXID storage.TransactionID) error {
 		if b.data[byt] == byte(TxnStatusUnknown) {
 			b.data[byt] = byte(TxnStatusAborted)
 			dirty = true
-			if err := c.mirrorToSLRUUnlocked(xid, TxnStatusAborted); err != nil {
-				b.mu.Unlock()
-				return err
-			}
 		}
 		b.mu.Unlock()
 	}
 	if !dirty {
 		return nil
 	}
+	// Project the stamped range into the SLRU mirror with ONE fsync per
+	// segment file rather than one per XID. The naive per-XID path
+	// (mirrorToSLRUUnlocked, which fsyncs on every call) made startup look
+	// hung after pg_resetwal --next-transaction-id advances NextXID far past
+	// the bootstrap pg_xact segment: the implicit-abort sweep then stamps up
+	// to ~1M XIDs and would issue ~1M fsyncs. Batching collapses that to one
+	// fsync per ~1M-XID segment. M0110-0004 (RW-002 (a)).
+	if err := c.mirrorTerminalRangeBatchedUnlocked(highXID); err != nil {
+		return err
+	}
 	return c.flush()
+}
+
+// mirrorTerminalRangeBatchedUnlocked writes the SLRU 2-bit lanes for every
+// committed/aborted XID in [FirstNormalTransactionID, hi) into the pg_xact/
+// segment files, performing a single fsync per segment file instead of one
+// per XID (the cost that made MarkUnknownAsAborted pathologically slow after a
+// pg_resetwal NextXID jump). OR semantics mirror PG's
+// TransactionIdSetStatusBit; existing file content is read first so any
+// committed bits already mirrored are preserved, and re-ORing an already-set
+// lane is idempotent. No-op when the SLRU mirror is disabled. The caller must
+// hold no bank locks (GetStatus reacquires them per slot).
+func (c *CLog) mirrorTerminalRangeBatchedUnlocked(hi storage.TransactionID) error {
+	c.banksMu.RLock()
+	dir := c.slruDir
+	c.banksMu.RUnlock()
+	if dir == "" || hi <= FirstNormalTransactionID {
+		return nil
+	}
+	lastSeg := (uint64(hi) - 1) / clogXactsPerSegment
+	for seg := uint64(0); seg <= lastSeg; seg++ {
+		segStart := seg * clogXactsPerSegment
+		segEnd := segStart + clogXactsPerSegment
+		lo := segStart
+		if lo < uint64(FirstNormalTransactionID) {
+			lo = uint64(FirstNormalTransactionID)
+		}
+		hiX := segEnd
+		if hiX > uint64(hi) {
+			hiX = uint64(hi)
+		}
+		if lo >= hiX {
+			continue
+		}
+		// Page span needed to hold the highest touched XID in this segment.
+		topXidInSeg := (hiX - 1) % clogXactsPerSegment
+		topPage := topXidInSeg / clogXactsPerPage
+		needSize := int64(topPage+1) * int64(storage.BlockSize)
+
+		segPath := filepath.Join(dir, fmt.Sprintf("%04X", seg))
+		f, err := os.OpenFile(segPath, os.O_RDWR|os.O_CREATE, 0600)
+		if err != nil {
+			return fmt.Errorf("clog slru: open %q: %w", segPath, err)
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return fmt.Errorf("clog slru: stat %q: %w", segPath, err)
+		}
+		bufSize := needSize
+		if fi.Size() > bufSize {
+			bufSize = fi.Size()
+		}
+		buf := make([]byte, bufSize)
+		if fi.Size() > 0 {
+			if _, err := f.ReadAt(buf[:fi.Size()], 0); err != nil && !errors.Is(err, io.EOF) {
+				f.Close()
+				return fmt.Errorf("clog slru: read %q: %w", segPath, err)
+			}
+		}
+		for xid := lo; xid < hiX; xid++ {
+			var bits byte
+			switch c.GetStatus(storage.TransactionID(xid)) {
+			case TxnStatusCommitted:
+				bits = pgClogStatusCommitted
+			case TxnStatusAborted:
+				bits = pgClogStatusAborted
+			default:
+				continue
+			}
+			xidInSeg := xid % clogXactsPerSegment
+			pageInSeg := xidInSeg / clogXactsPerPage
+			xidInPage := xidInSeg % clogXactsPerPage
+			byteOffset := int(pageInSeg)*storage.BlockSize + int(xidInPage/clogXactsPerByte)
+			bShift := uint((xidInPage % clogXactsPerByte) * clogBitsPerXact)
+			buf[byteOffset] |= bits << bShift
+		}
+		if _, err := f.WriteAt(buf, 0); err != nil {
+			f.Close()
+			return fmt.Errorf("clog slru: write %q: %w", segPath, err)
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return fmt.Errorf("clog slru: sync %q: %w", segPath, err)
+		}
+		f.Close()
+	}
+	return nil
 }
 
 // setStatus updates data[xid] = status and rewrites the file. When a PG SLRU
@@ -501,7 +594,7 @@ func (c *CLog) loadFromSLRU(dir string) error {
 				continue
 			}
 			pageInSeg := uint64(i) / uint64(storage.BlockSize)
-			xidInPageBase := (uint64(i)%uint64(storage.BlockSize))*uint64(clogXactsPerByte)
+			xidInPageBase := (uint64(i) % uint64(storage.BlockSize)) * uint64(clogXactsPerByte)
 			for lane := uint64(0); lane < uint64(clogXactsPerByte); lane++ {
 				rawBits := (b >> (lane * uint64(clogBitsPerXact))) & 0x3
 				var status TxnStatus

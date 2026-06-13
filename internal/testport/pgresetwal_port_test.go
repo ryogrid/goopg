@@ -51,13 +51,14 @@ package testport
 // The prerequisite — goopg's clean shutdown leaving pg_control State =
 // DB_SHUTDOWNED so pg_resetwal accepts the cluster without --force — landed in
 // this loop (wal.Checkpointer.CheckpointShutdown, wired into Runtime.Close).
+// The maximal SLRU-derived-override RESTART (--next-transaction-id advances
+// NextXID past the bootstrap pg_xact segment) now also passes: M0110-0004
+// RW-002 (a) batched the startup CLOG implicit-abort sweep's SLRU mirror to one
+// fsync per segment (was one per XID → ~1M fsyncs → looked hung).
 // What stays deferred under RW-002:
 //   - the "database server was not shut down cleanly" + --force pair: goopg's
 //     stop is always a graceful checkpoint (no crash state in v0), so the
-//     unclean-shutdown branch cannot be reproduced;
-//   - the maximal SLRU-derived-override RESTART (--next-transaction-id advances
-//     NextXID past the bootstrap pg_xact segment, which goopg's per-xid CLOG
-//     walk at startup makes pathologically slow — a separate WAL/MVCC task).
+//     unclean-shutdown branch cannot be reproduced.
 //
 // 002_corrupted.pl is now ported in TestPort_PgResetwal002Corrupted (RW-004);
 // it needs no server, only goopg's pg_control header compatibility (RW-003).
@@ -298,15 +299,12 @@ func TestPort_PgResetwal001BasicServer(t *testing.T) {
 	// pg_control round-trips EVERY override field (goopg's on-disk SLRU layout
 	// parity + control read/write under upstream pg_resetwal).
 	//
-	// The upstream final restart (l.244-245) is DEFERRED under RW-002 for THIS
-	// maximal override only: --next-transaction-id advances NextXID far past the
-	// bootstrap pg_xact segment, and goopg's CLog.MarkUnknownAsAborted
-	// (internal/mvcc/clog.go:262 -> mirrorToSLRUUnlocked:653) walks the whole
-	// xid range with an fsync per step during initdb.Open, so startup is
-	// pathologically slow (looks hung). The supported-override restart above
-	// already covers the multixact/commit-ts/oid restart path; only the
-	// advanced CLOG id blocks restart, and fixing it (PG-style StartupCLOG
-	// page-fill instead of a per-xid walk) is a separate WAL/MVCC task.
+	// The upstream final restart (l.244-245) is exercised below. It used to be
+	// deferred under RW-002 because --next-transaction-id advances NextXID far
+	// past the bootstrap pg_xact segment, so initdb.Open's implicit-abort sweep
+	// (CLog.MarkUnknownAsAborted) stamps ~1M XIDs; the old per-XID SLRU mirror
+	// fsynced every one and startup looked hung. M0110-0004 RW-002 (a) batched
+	// that mirror to one fsync per segment, so the restart completes promptly.
 	blcksz := parseBlockSize(t, runTool(t, bin, "--dry-run", dir).Stdout)
 
 	// commit-timestamp ids: "old,new"; old defaults to 3 when the first
@@ -369,16 +367,22 @@ func TestPort_PgResetwal001BasicServer(t *testing.T) {
 		t.Errorf("control override not applied; NextOID line missing 100000:\n%s", res.Stdout)
 	}
 
-	// NOTE: the upstream final restart (002_corrupted.pl l.244-245) is DEFERRED
-	// under RW-002 for THIS maximal override only — see the override-block
-	// comment above. --next-transaction-id advances NextXID far past the
-	// bootstrap pg_xact segment, and goopg's CLog.MarkUnknownAsAborted walks the
-	// whole xid range with an fsync per step during initdb.Open, so startup is
-	// pathologically slow (looks hung). The supported-override restart earlier
-	// in this test already exercises the post-reset restart path; only the
-	// advanced-CLOG id blocks it. The fix (PG-style StartupCLOG page-fill instead
-	// of a per-xid walk) is a separate WAL/MVCC task tracked in the deferral
-	// ledger.
+	// Upstream final restart (001_basic.pl l.244-245): the server must come
+	// back up after the maximal override. --next-transaction-id advanced
+	// NextXID past the bootstrap pg_xact segment, so initdb.Open's implicit-
+	// abort sweep (CLog.MarkUnknownAsAborted) stamps ~1M XIDs. Before
+	// M0110-0004 RW-002 (a) that sweep fsynced once per XID and startup looked
+	// hung; the batched SLRU mirror (one fsync per segment) makes this restart
+	// complete promptly.
+	if err := c.Start(); err != nil {
+		t.Fatalf("start after maximal override reset: %v", err)
+	}
+	started = true
+	assertSelect1(t, c)
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop after maximal override restart: %v", err)
+	}
+	started = false
 }
 
 // TestPort_PgResetwal002Corrupted ports

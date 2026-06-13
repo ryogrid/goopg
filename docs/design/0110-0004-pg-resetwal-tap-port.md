@@ -206,10 +206,39 @@ the guessed-values path without any unclean shutdown).
   the SLRU-derived maximal-override round-trip (loop #47).
 - `RW-004` → `port` / `pass_required=yes`: `002_corrupted.pl` =
   `TestPort_PgResetwal002Corrupted` (loop #48).
-- `RW-002` → `defer` / `pass_required=no`: the remaining server tier — the
-  advanced-CLOG maximal-override **restart** (blocked on a PG-style
-  `StartupCLOG` page-fill) and the unclean-shutdown/`--force` branch (no goopg
-  crash state in v0).
+- `RW-002` → `defer` / `pass_required=no`: the remaining server tier — now
+  **only** the unclean-shutdown/`--force` branch (no goopg crash state in v0).
+  The advanced-CLOG maximal-override **restart** was unblocked in loop #49 (see
+  below) and is now exercised by `TestPort_PgResetwal001BasicServer`.
+
+## Loop #49 — RW-002 (a): batched CLOG implicit-abort SLRU mirror
+
+The maximal SLRU-derived-override **final restart** (upstream `001_basic.pl`
+l.244-245) is now enabled and passes. The blocker was a startup fsync storm,
+not a missing `StartupCLOG` rewrite:
+
+- `--next-transaction-id` advances `NextXID` ~1M XIDs past the bootstrap
+  `pg_xact` segment. On the next `initdb.Open`, the implicit-abort sweep
+  `CLog.MarkUnknownAsAborted([1, NextXID))` stamps every still-`Unknown` slot
+  `Aborted`.
+- The old sweep called `mirrorToSLRUUnlocked` **per XID**, and that helper
+  `f.Sync()`s on every call → ~1M fsyncs → startup looked hung (~20s+).
+
+Fix (`internal/mvcc/clog.go`): the per-XID mirror call is removed from the
+sweep's hot loop; after the in-memory stamping pass completes,
+`CLog.mirrorTerminalRangeBatchedUnlocked(highXID)` projects the whole range
+into the `pg_xact/` SLRU segment files with **one fsync per segment**
+(~1,048,576 XIDs per segment). It reads each segment's existing bytes first and
+OR-merges the terminal-status bits (mirroring PG's `TransactionIdSetStatusBit`),
+so the on-disk result is byte-identical to the per-XID path — only the fsync
+count changes. XIDs below `FirstNormalTransactionID` are skipped, matching the
+per-XID invariant and PG's `pg_xact/0000` lane-zero layout.
+
+Regression coverage: `TestCLogMarkUnknownAsAbortedBatchedSLRU` stamps across a
+segment boundary, asserts both segment files exist, and re-derives every
+sampled status purely from the on-disk SLRU (via `loadFromSLRU`) — proving the
+batched encode is complete and correct. Runs in ~0.05s (the per-XID path would
+have issued >1M fsyncs).
 
 ## Verification
 
@@ -224,10 +253,9 @@ the guessed-values path without any unclean shutdown).
 
 ## Resume point
 
-`002_corrupted.pl` is now ported (loop #48, RW-004). Promote the rest of
-`RW-002` to `port` once (a) `CLog.MarkUnknownAsAborted` is replaced by a
-PG-style `StartupCLOG` page-fill so a cluster whose `NextXID` was advanced by
-`--next-transaction-id` restarts in bounded time (enabling the upstream
-l.244-245 final restart for the maximal override); and (b) goopg gains a true
-unclean/crash shutdown state so the `--force`-after-unclean-shutdown branch of
-`001_basic.pl` can be reproduced.
+The maximal-override final restart (RW-002 (a)) landed in loop #49 (batched
+SLRU mirror, above). Promote the **last** piece of `RW-002` to `port` once
+goopg gains a true unclean/crash shutdown state so the
+`--force`-after-unclean-shutdown branch of `001_basic.pl` can be reproduced —
+in v0 every `goopg stop` writes a graceful `DB_SHUTDOWNED` shutdown checkpoint,
+so there is no unclean state to trigger that branch.

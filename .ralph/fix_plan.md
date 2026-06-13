@@ -999,6 +999,22 @@ Porting validates goopg's pg_control and WAL segment layout on disk.
         shutdown branch. RW-002 remainder now: only (a) the maximal-override
         final restart (PG-style StartupCLOG page-fill) and (b) the
         unclean-shutdown/`--force` branch. PASS 0.88s.
+      - **PROGRESS 2026-06-14 (loop #49):** RW-002 (a) DONE — the maximal
+        SLRU-derived-override FINAL RESTART is now enabled and PASSES in
+        `TestPort_PgResetwal001BasicServer` (2.5s, no hang). Root cause: after
+        `--next-transaction-id` advances NextXID ~1M past the bootstrap pg_xact
+        segment, `initdb.Open`'s implicit-abort sweep (`CLog.MarkUnknownAsAborted`)
+        stamps ~1M XIDs, and the old per-XID SLRU mirror (`mirrorToSLRUUnlocked`)
+        fsynced on every one → ~1M fsyncs → startup looked hung. Fix: new
+        `CLog.mirrorTerminalRangeBatchedUnlocked` (`internal/mvcc/clog.go`)
+        projects the swept range into the pg_xact/ SLRU with ONE fsync per
+        ~1M-XID segment, OR-merging onto existing content (idempotent, byte-
+        identical final state). Regression test
+        `TestCLogMarkUnknownAsAbortedBatchedSLRU` (cross-segment, 0.05s).
+        Race-clean (`go test -race ./internal/mvcc`). RW-002 remainder now: ONLY
+        (b) the unclean-shutdown/`--force` branch — blocked on goopg v0 having no
+        crash/unclean shutdown state (graceful DB_SHUTDOWNED always). Design:
+        `docs/design/0110-0004-pg-resetwal-tap-port.md`.
 
 ### pg_verifybackup (10 tests — excluded → no action)
 
