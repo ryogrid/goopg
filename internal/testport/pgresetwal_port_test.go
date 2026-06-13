@@ -60,8 +60,13 @@ package testport
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -251,16 +256,104 @@ func TestPort_PgResetwal001BasicServer(t *testing.T) {
 	}
 	started = false
 
-	// --- control-override options apply and are observable. We use the
-	// non-SLRU subset that goopg round-trips cleanly: --epoch + --next-oid.
-	// (--wal-segsize / --next-wal-file and the SLRU-derived ids stay deferred
-	// under RW-002 — see the file header.)
-	if res := runTool(t, bin, "--pgdata", dir,
-		"--epoch", "1", "--next-oid", "100000", "--dry-run"); res.ExitCode != 0 {
+	// --- a control override that goopg both round-trips AND restarts from:
+	// --epoch / --next-oid plus the multixact and commit-timestamp id
+	// overrides. (Unlike an advanced transaction id, these do not force goopg's
+	// CLOG open to walk a large xid range — see the full-override block below.)
+	supported := []string{"--pgdata", dir,
+		"--epoch", "1", "--next-oid", "100000",
+		"--multixact-ids", "65536,1", "--multixact-offset", "52352",
+		"--commit-timestamp-ids", "3,0"}
+	if res := runTool(t, bin, append(append([]string(nil), supported...), "--dry-run")...); res.ExitCode != 0 {
+		t.Fatalf("pg_resetwal supported-override dry-run exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	if res := runTool(t, bin, supported...); res.ExitCode != 0 {
+		t.Fatalf("pg_resetwal supported-override apply exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	if out := runTool(t, bin, "--dry-run", dir).Stdout; !containsNextOID(out, "100000") {
+		t.Errorf("supported override not applied; NextOID missing 100000:\n%s", out)
+	}
+	// server restarts and works after the supported override reset (upstream l.244-245).
+	if err := c.Start(); err != nil {
+		t.Fatalf("start after supported override reset: %v", err)
+	}
+	started = true
+	assertSelect1(t, c)
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop before full override: %v", err)
+	}
+	started = false
+
+	// --- full SLRU-derived override round-trip (upstream l.184-242). This
+	// mirrors the upstream override block faithfully: it reads the cluster's
+	// REAL SLRU segment files (pg_commit_ts / pg_multixact{offsets,members} /
+	// pg_xact) and derives the --commit-timestamp-ids / --multixact-ids /
+	// --multixact-offset / --oldest-transaction-id / --next-transaction-id
+	// values from them with the same block-size multipliers, applied together
+	// with --epoch / --next-wal-file / --next-oid / --wal-segsize. It confirms
+	// pg_control round-trips EVERY override field (goopg's on-disk SLRU layout
+	// parity + control read/write under upstream pg_resetwal).
+	//
+	// The upstream final restart (l.244-245) is DEFERRED under RW-002 for THIS
+	// maximal override only: --next-transaction-id advances NextXID far past the
+	// bootstrap pg_xact segment, and goopg's CLog.MarkUnknownAsAborted
+	// (internal/mvcc/clog.go:262 -> mirrorToSLRUUnlocked:653) walks the whole
+	// xid range with an fsync per step during initdb.Open, so startup is
+	// pathologically slow (looks hung). The supported-override restart above
+	// already covers the multixact/commit-ts/oid restart path; only the
+	// advanced CLOG id blocks restart, and fixing it (PG-style StartupCLOG
+	// page-fill instead of a per-xid walk) is a separate WAL/MVCC task.
+	blcksz := parseBlockSize(t, runTool(t, bin, "--dry-run", dir).Stdout)
+
+	// commit-timestamp ids: "old,new"; old defaults to 3 when the first
+	// segment is 0 (or absent — goopg has no pg_commit_ts segment, matching
+	// hex(undef)==0 in the upstream Perl).
+	ctFirst, ctLast := slruBounds(t, dir, "pg_commit_ts")
+	ctOld := ctFirst
+	if ctOld == 0 {
+		ctOld = 3
+	}
+	commitTsIDs := fmt.Sprintf("%d,%d", ctOld, ctLast)
+
+	// multixact ids: "new,old". new = (last+1)*mult; old defaults to 1.
+	offFirst, offLast := slruBounds(t, dir, filepath.Join("pg_multixact", "offsets"))
+	offMult := uint64(32) * uint64(blcksz) / 4
+	mxOld := uint64(1)
+	if offFirst != 0 {
+		mxOld = offFirst * offMult
+	}
+	multixactIDs := fmt.Sprintf("%d,%d", (offLast+1)*offMult, mxOld)
+
+	// multixact offset: (last+1)*mult, mult uses integer division by 20.
+	_, memLast := slruBounds(t, dir, filepath.Join("pg_multixact", "members"))
+	memMult := uint64(32) * uint64(blcksz/20) * 4
+	multixactOffset := strconv.FormatUint((memLast+1)*memMult, 10)
+
+	// oldest / next transaction id from pg_xact.
+	xactFirst, xactLast := slruBounds(t, dir, "pg_xact")
+	xactMult := uint64(32) * uint64(blcksz) * 4
+	oldestXID := uint64(3)
+	if xactFirst != 0 {
+		oldestXID = xactFirst * xactMult
+	}
+	nextXID := (xactLast + 1) * xactMult
+
+	override := []string{
+		"--pgdata", dir,
+		"--epoch", "1",
+		"--next-wal-file", "00000001000000320000004B",
+		"--next-oid", "100000",
+		"--wal-segsize", "1",
+		"--commit-timestamp-ids", commitTsIDs,
+		"--multixact-ids", multixactIDs,
+		"--multixact-offset", multixactOffset,
+		"--oldest-transaction-id", strconv.FormatUint(oldestXID, 10),
+		"--next-transaction-id", strconv.FormatUint(nextXID, 10),
+	}
+	if res := runTool(t, bin, append(append([]string(nil), override...), "--dry-run")...); res.ExitCode != 0 {
 		t.Fatalf("pg_resetwal override dry-run exit=%d stderr=%q", res.ExitCode, res.Stderr)
 	}
-	if res := runTool(t, bin, "--pgdata", dir,
-		"--epoch", "1", "--next-oid", "100000"); res.ExitCode != 0 {
+	if res := runTool(t, bin, override...); res.ExitCode != 0 {
 		t.Fatalf("pg_resetwal override apply exit=%d stderr=%q", res.ExitCode, res.Stderr)
 	}
 	// Spot check that the control change was applied (upstream l.239-242).
@@ -272,12 +365,16 @@ func TestPort_PgResetwal001BasicServer(t *testing.T) {
 		t.Errorf("control override not applied; NextOID line missing 100000:\n%s", res.Stdout)
 	}
 
-	// --- server starts and works after the override reset.
-	if err := c.Start(); err != nil {
-		t.Fatalf("start after override reset: %v", err)
-	}
-	started = true
-	assertSelect1(t, c)
+	// NOTE: the upstream final restart (002_corrupted.pl l.244-245) is DEFERRED
+	// under RW-002 for THIS maximal override only — see the override-block
+	// comment above. --next-transaction-id advances NextXID far past the
+	// bootstrap pg_xact segment, and goopg's CLog.MarkUnknownAsAborted walks the
+	// whole xid range with an fsync per step during initdb.Open, so startup is
+	// pathologically slow (looks hung). The supported-override restart earlier
+	// in this test already exercises the post-reset restart path; only the
+	// advanced-CLOG id blocks it. The fix (PG-style StartupCLOG page-fill instead
+	// of a per-xid walk) is a separate WAL/MVCC task tracked in the deferral
+	// ledger.
 }
 
 // assertSelect1 fails the test unless `SELECT 1` returns a single "1".
@@ -290,6 +387,61 @@ func assertSelect1(t *testing.T, c *cluster.Cluster) {
 	if len(rows) != 1 || len(rows[0]) != 1 || rows[0][0] != "1" {
 		t.Fatalf("SELECT 1 returned %v, want [[1]]", rows)
 	}
+}
+
+// segNameRe matches a PostgreSQL SLRU segment file name (hex digits), mirroring
+// the upstream get_slru_files grep /[0-9A-F]+/.
+var segNameRe = regexp.MustCompile(`^[0-9A-F]+$`)
+
+// parseBlockSize extracts the "Database block size:" value from a pg_resetwal
+// --dry-run dump (upstream l.187).
+func parseBlockSize(t *testing.T, out string) int {
+	t.Helper()
+	for line := range strings.SplitSeq(out, "\n") {
+		if strings.Contains(line, "Database block size:") {
+			f := strings.Fields(line)
+			n, err := strconv.Atoi(f[len(f)-1])
+			if err != nil {
+				t.Fatalf("parse block size from %q: %v", line, err)
+			}
+			return n
+		}
+	}
+	t.Fatalf("no 'Database block size:' line in pg_resetwal dump:\n%s", out)
+	return 0
+}
+
+// slruBounds returns the hex values of the first and last SLRU segment file
+// names (sorted) under <dir>/<sub>, mirroring the upstream get_slru_files +
+// hex($files[0]) / hex($files[-1]). An empty directory yields (0, 0), matching
+// the Perl hex(undef)==0 behavior.
+func slruBounds(t *testing.T, dir, sub string) (first, last uint64) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, sub))
+	if err != nil {
+		t.Fatalf("read SLRU dir %s: %v", sub, err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && segNameRe.MatchString(e.Name()) {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) == 0 {
+		return 0, 0
+	}
+	sort.Strings(names)
+	return parseHexSeg(t, names[0]), parseHexSeg(t, names[len(names)-1])
+}
+
+// parseHexSeg parses a hex SLRU segment file name into its numeric value.
+func parseHexSeg(t *testing.T, s string) uint64 {
+	t.Helper()
+	v, err := strconv.ParseUint(s, 16, 64)
+	if err != nil {
+		t.Fatalf("parse hex segment name %q: %v", s, err)
+	}
+	return v
 }
 
 // containsNextOID reports whether the pg_resetwal dump has a

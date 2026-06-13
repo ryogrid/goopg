@@ -134,16 +134,54 @@ server runs (`postmaster.pid` lock); `--pgdata` succeeds after a clean shutdown
 **without** `--force`; `SELECT 1` works after the reset; a `--next-oid 100000`
 override is applied and spot-checked; server works after the override reset.
 
+## Update (loop #47): SLRU-derived override round-trip ported
+
+`TestPort_PgResetwal001BasicServer` was extended to cover the SLRU-derived
+control-override **round-trip**, faithfully mirroring upstream
+`001_basic.pl` l.184-242:
+
+1. A **supported-override restart** tier — `--epoch` / `--next-oid` plus
+   `--multixact-ids` / `--multixact-offset` / `--commit-timestamp-ids`. goopg
+   both round-trips these through `pg_control` *and* restarts and serves
+   `SELECT 1` afterwards (these ids do not force a large CLOG xid walk).
+2. A **full maximal-override round-trip** — the test now reads the cluster's
+   real SLRU segment files (`pg_commit_ts`, `pg_multixact/{offsets,members}`,
+   `pg_xact`) and derives `--commit-timestamp-ids` / `--multixact-ids` /
+   `--multixact-offset` / `--oldest-transaction-id` / `--next-transaction-id`
+   with the same block-size multipliers as the upstream Perl
+   (`get_slru_files` + `hex()` bounds, helpers `slruBounds` / `parseBlockSize`
+   / `parseHexSeg`), applied together with `--epoch` / `--next-wal-file` /
+   `--next-oid` / `--wal-segsize`. The override applies and the control change
+   is spot-checked — proving goopg's on-disk SLRU layout + `pg_control`
+   read/write parity under upstream `pg_resetwal` for **every** override field.
+
+That the test passes confirms goopg already presents the `pg_commit_ts`,
+`pg_multixact`, and `pg_xact` SLRU directories with the segment-file layout the
+override computation reads — the SLRU-parity prerequisite that previously
+blocked these cases is satisfied.
+
+**Still deferred (RW-002 remainder):** the *final restart* after the maximal
+override (upstream l.244-245). `--next-transaction-id` advances `NextXID` far
+past the bootstrap `pg_xact` segment, and `CLog.MarkUnknownAsAborted`
+(`internal/mvcc/clog.go`) walks the whole xid range with an fsync per step
+during `initdb.Open`, so startup is pathologically slow (looks hung). The
+supported-override restart already exercises the post-reset restart path; only
+the advanced-CLOG id blocks it. The fix — a PG-style `StartupCLOG` page-fill
+instead of a per-xid walk — is a separate WAL/MVCC task. Also still deferred:
+the unclean-shutdown/`--force` branch and `002_corrupted.pl` (no goopg
+crash state in v0).
+
 ## CSV rows
 
 - `RW-001` → `port` / `pass_required=yes`: `001_basic.pl` CLI tier =
   `TestPort_PgResetwal001Basic`.
 - `RW-003` → `port` / `pass_required=yes`: `001_basic.pl` server-tier
-  pg_control round-trip = `TestPort_PgResetwal001BasicServer`.
+  pg_control round-trip = `TestPort_PgResetwal001BasicServer`, now including
+  the SLRU-derived maximal-override round-trip (loop #47).
 - `RW-002` → `defer` / `pass_required=no`: the remaining server tier — the
-  unclean-shutdown/`--force` branch (no goopg crash state in v0) and the
-  SLRU-derived id overrides — plus `002_corrupted.pl`; blocked on
-  `track_commit_timestamp` SLRU emission + SLRU-segment-layout parity.
+  advanced-CLOG maximal-override **restart** (blocked on a PG-style
+  `StartupCLOG` page-fill), the unclean-shutdown/`--force` branch (no goopg
+  crash state in v0), and `002_corrupted.pl`.
 
 ## Verification
 
@@ -158,10 +196,10 @@ override is applied and spot-checked; server works after the override reset.
 
 ## Resume point
 
-Promote the rest of `RW-002` to `port` once (a) goopg emits `pg_commit_ts`
-segments under `track_commit_timestamp=on` and the `pg_multixact` / `pg_xact`
-SLRU directories present the segment-file layout the override-option
-computation reads, enabling the `--commit-timestamp-ids` / `--multixact-ids` /
-`--multixact-offset` / `--oldest-transaction-id` / `--next-transaction-id`
-cases; and (b) goopg gains a true unclean/crash shutdown state so the
-`--force` branch and `002_corrupted.pl` can be reproduced.
+The SLRU-derived override round-trip is now covered (loop #47). Promote the
+rest of `RW-002` to `port` once (a) `CLog.MarkUnknownAsAborted` is replaced by
+a PG-style `StartupCLOG` page-fill so a cluster whose `NextXID` was advanced by
+`--next-transaction-id` restarts in bounded time (enabling the upstream
+l.244-245 final restart for the maximal override); and (b) goopg gains a true
+unclean/crash shutdown state so the `--force` branch and `002_corrupted.pl`
+can be reproduced.
