@@ -114,11 +114,48 @@ no shared helper**:
 
 Missing even one site yields a cluster whose pg_control claims checksums
 while a catalog page carries none → verification failure on first read.
-Doing this correctly and **exhaustively** — ideally by routing the direct
-writers through a single checksum-aware helper, plus an end-to-end test that
-inits with `--data-checksums` and reads every catalog relation's block 0
-through a checksummed Manager — is its own loop. The PG-18 default-ON parity
-(and the `001_initdb.pl` default-version-1 assertion) ride on that same work.
+
+### Routing primitive — `checksumRelationData` (landed)
+
+The single checksum-aware helper the site-sweep routes through is
+`internal/initdb/checksum_bootstrap.go`:
+
+```go
+func checksumRelationData(raw []byte, enabled bool) []byte
+```
+
+When `enabled` is false (the default, and the only reachable mode while `Init`
+rejects `--data-checksums`) it returns `raw` **verbatim** — no copy, no
+allocation, byte-identical to a plain `os.WriteFile`. When enabled it returns a
+copy with `pd_checksum` stamped into every `BlockSize` block, built on the
+loop-#29 engine's `storage.PageSetChecksumCopy`.
+
+The block number folded into each checksum is **derived from the block's byte
+offset within the file** (block N at offset `N*BlockSize`), matching exactly how
+the runtime smgr verifies a block on read (`smgr.go`: `off/BlockSize`). This
+makes one helper uniform across single-page heaps, multi-page heaps, and
+multi-page btree files **without any per-site block-number bookkeeping** —
+each direct writer becomes `os.WriteFile(path, checksumRelationData(data, enabled), 0o600)`.
+New (all-zero) pages are passed through unchanged, exactly as upstream
+`PageIsNew` skips them. The trickiest property — correct per-block numbering on
+multi-page files and never mutating the caller's slice — is proven in isolation
+by `internal/initdb/checksum_bootstrap_test.go` (identity-when-disabled,
+no-input-mutation, per-block verify + transposition rejection, new-page skip,
+partial-tail-verbatim).
+
+### Remaining (the sweep)
+
+Routing the ~50 direct writers (initdb.go, btree_index_bootstrap.go,
+pg_tablespace_bootstrap.go, pg_proc_proname_args_nsp_index_bootstrap.go) through
+`checksumRelationData` by threading the cluster's checksum flag from
+`opts.DataChecksums` into the bootstrap functions; an end-to-end test that inits
+with `--data-checksums` and reads every catalog relation's block 0 through a
+checksummed Manager; dropping the `Init` reject; and adding the
+`-k`/`--data-checksums`/`--no-data-checksums` CLI flags. The PG-18 default-ON
+parity (and the `001_initdb.pl` default-version-1 assertion) ride on that same
+work, flipped LAST after recovery/replication validation. Because the flag stays
+off while the reject is in place, the sweep is byte-identical and can land
+incrementally and safely.
 
 ## Testing
 

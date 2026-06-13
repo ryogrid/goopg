@@ -739,17 +739,36 @@ if 21-spec pass surfaces a real divergence:
         `docs/design/0102-0019-initdb-data-checksums.md`. Tests:
         `internal/storage/checksum_io_test.go`,
         `internal/initdb/data_checksums_test.go`.
+      - **PROGRESS 2026-06-13 (loop #30):** the **bootstrap checksum routing
+        primitive** landed — `internal/initdb/checksum_bootstrap.go`
+        `checksumRelationData(raw, enabled)`: identity (no copy/alloc) when
+        disabled, else a copy with `pd_checksum` on every `BlockSize` block,
+        block number derived from byte offset (`off/BlockSize`, matching the
+        runtime smgr read-verify) so ONE helper is uniform across single-page
+        heaps, multi-page heaps, and multi-page btree files with no per-site
+        block bookkeeping. Built on loop-#29's `storage.PageSetChecksumCopy`;
+        skips new/all-zero pages like upstream `PageIsNew`. The multi-page
+        block-numbering + never-mutate-input invariants are proven in isolation
+        by `checksum_bootstrap_test.go` (5 cases incl. transposition rejection
+        and partial-tail-verbatim). Design doc 0102-0019 updated with the
+        "Routing primitive" + "Remaining (the sweep)" sections. **DEFERRED**
+        (next loop, deferral ledger 2026-06-13): the ~50-site sweep that routes
+        every direct `os.WriteFile` through this helper (threading
+        `opts.DataChecksums`), the e2e boot test, dropping the `Init` reject,
+        and the `-k`/`--data-checksums` CLI flags. Because the flag stays off
+        while the reject is in place, the sweep is byte-identical and can land
+        incrementally and safely.
       - **Remaining initdb work** (each pulls in a distinct subsystem; one
         per future loop, design doc first):
         `--data-checksums`/`--no-data-checksums` **user-facing enablement** —
-        the engine is landed (loop #29 above); what remains is checksumming
-        the ~38 bootstrap page-write sites (route them through one
-        checksum-aware helper) + an e2e `Init(--data-checksums)`→read-every-
-        catalog-block-0 boot test + dropping the `Init` reject + adding the
-        CLI flag, then flipping the default to ON for PG-18 parity (and the
-        `001_initdb.pl` version-1 assertion). The locale-derived default
-        encoding (`pg_get_encoding_from_locale` on an unset `--encoding`)
-        remains a no-op under goopg's fixed C locale.
+        the engine (loop #29) and the routing primitive (loop #30) are landed;
+        what remains is the ~50-site sweep through `checksumRelationData` + an
+        e2e `Init(--data-checksums)`→read-every-catalog-block-0 boot test +
+        dropping the `Init` reject + adding the CLI flag, then flipping the
+        default to ON for PG-18 parity (and the `001_initdb.pl` version-1
+        assertion). The locale-derived default encoding
+        (`pg_get_encoding_from_locale` on an unset `--encoding`) remains a
+        no-op under goopg's fixed C locale.
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 
