@@ -9,11 +9,29 @@
 //
 // Only the page-structural tier is implemented here: line-pointer bounds and
 // alignment, redirect-target validity, and tuple-header offset/t_hoff
-// consistency. These are deterministic functions of the raw 8 KiB page bytes
-// and need neither clog, the relation TupleDesc, nor the toast relation. The
-// HOT-chain tier (successor/predecessor consistency) and the MVCC/attribute
-// tier (xmin/xmax bounds, TOAST pointer validation) are deferred; see the
-// design doc.
+// consistency, plus the two infomask-only invariants from check_tuple_header
+// (a multixact xmax must not be hint-bit "committed"; a HOT-updated tuple must
+// carry a valid xmax). These are deterministic functions of the raw 8 KiB page
+// bytes and need neither clog, the relation TupleDesc, nor the toast relation.
+// The HOT-chain tier (successor/predecessor consistency) and the
+// MVCC/attribute tier (xmin/xmax bounds vs clog, multixact members, TOAST
+// pointer validation) are deferred; see the design doc.
+//
+// Infomask layout divergence (goopg vs upstream PG): upstream stores
+// HEAP_HOT_UPDATED / HEAP_ONLY_TUPLE in t_infomask2, but goopg packs them into
+// t_infomask (storage/heap.go HeapHotUpdated/HeapOnlyTuple are read/written
+// against HeapTupleHeader.Infomask — see storage/prune.go and the heap_update
+// path). Because this engine inspects goopg's own on-disk pages, the
+// HOT-updated check below reads the flag from t_infomask (goopg's position),
+// not t_infomask2. The corruption messages stay byte-for-byte identical to
+// upstream so the later SRF + 004_verify_heapam port can reuse them.
+//
+// One upstream check_tuple_header invariant is intentionally NOT ported here:
+// "tuple is heap only, but not the result of an update" tests
+// (t_infomask & HEAP_UPDATED) == 0, but goopg never sets HEAP_UPDATED (0x2000;
+// goopg reuses that bit for HeapKeysUpdated in t_infomask2). Porting it
+// verbatim would false-positive on every legitimate goopg HOT successor tuple,
+// so it is deferred until goopg stamps HEAP_UPDATED. See the design doc.
 package amcheck
 
 import (
@@ -26,6 +44,15 @@ import (
 // firstOffsetNumber mirrors upstream FirstOffsetNumber: line pointers are
 // 1-based (postgres/src/include/storage/off.h).
 const firstOffsetNumber = 1
+
+// heapXmaxIsMulti mirrors upstream HEAP_XMAX_IS_MULTI
+// (postgres/src/include/access/htup_details.h, 0x1000): xmax holds a MultiXactId
+// rather than a plain TransactionId. goopg has no multixact on disk and never
+// sets this bit, so on a healthy goopg page it is only ever set by corruption —
+// exactly what the multixact-marked-committed check below detects. The storage
+// package does not export it (goopg consumes no multixact bits), so the engine
+// defines it locally at the upstream value.
+const heapXmaxIsMulti uint16 = 0x1000
 
 // minTupleHeaderSize is MAXALIGN(SizeofHeapTupleHeader): the smallest a
 // LP_NORMAL line pointer's length may legitimately be. Upstream's
@@ -151,14 +178,16 @@ func VerifyHeapPage(p storage.Page) ([]Report, error) {
 	return reports, nil
 }
 
-// checkTupleHeader mirrors verify_heapam.c:check_tuple_header for the
-// offset/t_hoff consistency checks. The MVCC-dependent checks
-// (multixact-marked-committed, HOT-updated-but-xmax-0, heap-only-but-not-updated)
-// are deferred with the HOT/MVCC tiers; see the design doc.
+// checkTupleHeader mirrors verify_heapam.c:check_tuple_header for the checks
+// that are decidable from the page bytes alone: the offset/t_hoff consistency
+// checks, the multixact-marked-committed invariant, and the HOT-updated-but-
+// xmax-0 invariant. The remaining check_tuple_header invariant (heap-only-but-
+// not-updated) and the clog/multixact-dependent checks are deferred; see the
+// package doc and the design doc.
 //
 // On-disk tuple header layout (storage/heap.go MarshalBinary):
 //
-//	off+18..20 t_infomask2   off+20..22 t_infomask   off+22 t_hoff
+//	off+4..8 xmax   off+18..20 t_infomask2   off+20..22 t_infomask   off+22 t_hoff
 func checkTupleHeader(p storage.Page, lpOff, lpLen int, offnum uint16, report func(uint16, string)) {
 	infomask2 := binary.LittleEndian.Uint16(p[lpOff+18 : lpOff+20])
 	infomask := binary.LittleEndian.Uint16(p[lpOff+20 : lpOff+22])
@@ -169,6 +198,22 @@ func checkTupleHeader(p storage.Page, lpOff, lpLen int, offnum uint16, report fu
 		report(offnum, fmt.Sprintf(
 			"data begins at offset %d beyond the tuple length %d", hoff, lpLen))
 		return
+	}
+
+	// HEAP_XMAX_COMMITTED with HEAP_XMAX_IS_MULTI is an impossible combination:
+	// a multixact xmax is never hint-bit "committed" (verify_heapam.c:1015).
+	// Upstream does not skip further checks on this, and neither do we.
+	if infomask&storage.HeapXmaxCommitted != 0 && infomask&heapXmaxIsMulti != 0 {
+		report(offnum, "multixact should not be marked committed")
+	}
+
+	// A HOT-updated tuple must carry a valid xmax pointing at its successor
+	// (verify_heapam.c:1029). curr_xmax for a non-multi xmax is the raw xmax
+	// field; the multixact case needs a member-table lookup we cannot do
+	// page-structurally, so it is skipped. HEAP_HOT_UPDATED is read from
+	// t_infomask per goopg's layout (see the package doc).
+	if infomask&heapXmaxIsMulti == 0 && isHotUpdated(infomask) && rawXmax(p, lpOff) == 0 {
+		report(offnum, "tuple has been HOT updated, but xmax is 0")
 	}
 
 	var expectedHoff int
@@ -198,4 +243,26 @@ func checkTupleHeader(p storage.Page, lpOff, lpLen int, offnum uint16, report fu
 				expectedHoff, hoff, natts))
 		}
 	}
+}
+
+// rawXmax returns the tuple's raw t_xmax field (off+4..8). For a non-multi
+// xmax this is curr_xmax (HeapTupleHeaderGetUpdateXid's non-multi branch);
+// the InvalidTransactionId sentinel is 0.
+func rawXmax(p storage.Page, lpOff int) uint32 {
+	return binary.LittleEndian.Uint32(p[lpOff+4 : lpOff+8])
+}
+
+// isHotUpdated mirrors HeapTupleHeaderIsHotUpdated for goopg's layout: the
+// HEAP_HOT_UPDATED bit (in t_infomask here, not t_infomask2 — see the package
+// doc) is set, xmax is not marked invalid, and xmin is not marked invalid.
+func isHotUpdated(infomask uint16) bool {
+	return infomask&storage.HeapHotUpdated != 0 &&
+		infomask&storage.HeapXmaxInvalid == 0 &&
+		!xminInvalid(infomask)
+}
+
+// xminInvalid mirrors HeapTupleHeaderXminInvalid: the xmin hint bits say the
+// inserting transaction is known invalid (rolled back).
+func xminInvalid(infomask uint16) bool {
+	return infomask&(storage.HeapXminCommitted|storage.HeapXminInvalid) == storage.HeapXminInvalid
 }

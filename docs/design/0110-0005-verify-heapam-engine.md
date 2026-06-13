@@ -2,7 +2,7 @@
 
 Status: accepted (partial)
 Milestone: M0110-0003
-Date: 2026-06-14
+Date: 2026-06-14 (extended 2026-06-14, loop #52: infomask-only header invariants)
 
 ## Goal
 
@@ -79,10 +79,50 @@ verbatim. For each line pointer over `[FirstOffsetNumber, maxoff]`:
 `continue` semantics match upstream: a failed bounds/alignment check skips the
 remaining checks for that line pointer (it would be unsafe to read the tuple).
 
+### Infomask-only `check_tuple_header` invariants (added loop #52)
+
+Two further `check_tuple_header` invariants are decidable from the tuple header
+bytes alone — no clog, no `TupleDesc`, no toast — so they land in this engine:
+
+- `HEAP_XMAX_COMMITTED && HEAP_XMAX_IS_MULTI` → `multixact should not be marked
+  committed` (`verify_heapam.c:1015`). A multixact xmax is never hint-bit
+  "committed". goopg has no multixact on disk and never sets `HEAP_XMAX_IS_MULTI`
+  (0x1000, defined locally in the engine at the upstream value), so on a healthy
+  goopg page this fires only on injected corruption — zero false positives.
+- `HeapTupleHeaderIsHotUpdated && curr_xmax == 0` → `tuple has been HOT updated,
+  but xmax is 0` (`verify_heapam.c:1029`). `curr_xmax` is the raw `t_xmax` field
+  (the non-multi branch of `HeapTupleHeaderGetUpdateXid`); the multixact branch
+  is skipped (it needs a member-table lookup). `HEAP_HOT_UPDATED` is read from
+  **`t_infomask`** per goopg's divergent layout (see below). A healthy goopg
+  HOT-updated tuple always carries a valid xmax, so this also has zero false
+  positives — verified by a dedicated test.
+
+Both follow upstream's "report but do not skip" semantics.
+
+#### goopg vs upstream infomask layout
+
+Upstream stores `HEAP_HOT_UPDATED`/`HEAP_ONLY_TUPLE` in `t_infomask2`; **goopg
+packs them into `t_infomask`** (`storage/heap.go` `HeapHotUpdated`/
+`HeapOnlyTuple` are read/written against `HeapTupleHeader.Infomask` — see
+`storage/prune.go` and the `heap_update` path). Because this engine inspects
+goopg's own pages, the HOT-updated check reads the flag from `t_infomask`; the
+emitted message is byte-identical to upstream regardless.
+
+#### One invariant intentionally NOT ported
+
+`HeapTupleHeaderIsHeapOnly && (t_infomask & HEAP_UPDATED) == 0` → "tuple is heap
+only, but not the result of an update" is **deferred**: goopg never sets
+`HEAP_UPDATED` (0x2000; goopg reuses that bit value for `HeapKeysUpdated` in
+`t_infomask2`). Porting it verbatim would false-positive on every legitimate
+goopg HOT successor tuple. Resume point: port once goopg stamps `HEAP_UPDATED`
+on update-produced tuples.
+
 ### Deferred (recorded, with resume points)
 
 - HOT-chain `successor`/`predecessor` consistency (tier 2) — needs goopg's HOT-bit
   convention reconciled against upstream message wording.
+- `check_tuple_header`'s heap-only-but-not-updated invariant — deferred until
+  goopg stamps `HEAP_UPDATED` (see above).
 - `check_tuple_visibility` xmin/xmax bounds + multixact (tier 3) — needs clog.
 - `check_tuple_attribute` per-attribute TOAST validation (tier 3) — needs the
   relation `TupleDesc` + toast relation.
@@ -125,7 +165,11 @@ with hand-built clean and corrupt fixtures — no server, no buffer pool, no clo
 - targeted corruptions, each asserting the exact upstream message:
   unaligned `lp_off`; `lp_len` below the 24-byte minimum; `lp_off+lp_len` past
   `BLCKSZ`; `t_hoff` beyond `lp_len`; `t_hoff` mismatching `expected_hoff`;
-  redirect out of range; redirect to unused/dead/redirect targets.
+  redirect out of range; redirect to unused/dead/redirect targets;
+  `HEAP_XMAX_COMMITTED|HEAP_XMAX_IS_MULTI`; `HEAP_HOT_UPDATED` with `t_xmax==0`.
+- false-positive guards (must report **no** corruption): a healthy HOT-updated
+  tuple (HOT bit set + valid xmax), and a HOT bit set together with
+  `HEAP_XMAX_INVALID` and `t_xmax==0` (IsHotUpdated is false, so skipped).
 
 ## Upstream references
 

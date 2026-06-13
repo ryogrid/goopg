@@ -969,6 +969,22 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         session; it must wait for a clean tree. Resume = wire `CREATE EXTENSION
         amcheck` + the `verify_heapam` SRF on top of this engine, then port
         `002_nonesuch.pl`.
+      - **PROGRESS 2026-06-14 (loop #52):** extended the engine with the two
+        **infomask-only** `check_tuple_header` invariants that need no clog/
+        TupleDesc/toast — `multixact should not be marked committed`
+        (`HEAP_XMAX_COMMITTED|HEAP_XMAX_IS_MULTI`) and `tuple has been HOT
+        updated, but xmax is 0` — both upstream-verbatim. Notable goopg/PG
+        divergence handled: goopg packs `HEAP_HOT_UPDATED`/`HEAP_ONLY_TUPLE` into
+        `t_infomask` (not `t_infomask2`), so the HOT check reads goopg's field;
+        `HEAP_XMAX_IS_MULTI` (0x1000) is defined locally (goopg has no on-disk
+        multixact, so it fires only on injected corruption — zero false
+        positives). The third header invariant (heap-only-but-not-updated) is
+        intentionally NOT ported: goopg never sets `HEAP_UPDATED` (reuses 0x2000
+        for `HeapKeysUpdated` in `t_infomask2`), so a verbatim port would
+        false-positive on every healthy HOT successor. 15 unit tests PASS (4 new,
+        incl. two false-positive guards). Design doc `0110-0005` extended; all in
+        new files (`internal/amcheck/`), zero contaminated files touched. The SQL
+        surface remains the AC-002-promoting slice, still blocked on a clean tree.
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

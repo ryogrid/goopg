@@ -175,6 +175,93 @@ func TestVerifyHeapPage_HoffMismatchNoNulls(t *testing.T) {
 		"tuple data should begin at byte 24, but actually begins at byte 32 (1 attribute, no nulls)")
 }
 
+// infomaskOffset returns the byte offset of a tuple's t_infomask field, given
+// the tuple's 1-based slot (header layout: t_infomask at off+20..22).
+func infomaskOffset(t *testing.T, p storage.Page, slot uint16) int {
+	t.Helper()
+	item, err := storage.PageGetItemID(p, slot)
+	if err != nil {
+		t.Fatalf("PageGetItemID(%d): %v", slot, err)
+	}
+	return int(item.Offset) + 20
+}
+
+func setInfomask(t *testing.T, p storage.Page, slot uint16, mask uint16) {
+	t.Helper()
+	binary.LittleEndian.PutUint16(p[infomaskOffset(t, p, slot):infomaskOffset(t, p, slot)+2], mask)
+}
+
+func setXmax(t *testing.T, p storage.Page, slot uint16, xmax uint32) {
+	t.Helper()
+	item, err := storage.PageGetItemID(p, slot)
+	if err != nil {
+		t.Fatalf("PageGetItemID(%d): %v", slot, err)
+	}
+	binary.LittleEndian.PutUint32(p[int(item.Offset)+4:int(item.Offset)+8], xmax)
+}
+
+func TestVerifyHeapPage_MultixactMarkedCommitted(t *testing.T) {
+	p := newPage(t)
+	slot := addCleanTuple(t, p, 16)
+	// HEAP_XMAX_COMMITTED | HEAP_XMAX_IS_MULTI — an impossible combination.
+	setInfomask(t, p, slot, storage.HeapXmaxCommitted|heapXmaxIsMulti)
+
+	reports, err := VerifyHeapPage(p)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	wantReport(t, reports, slot, "multixact should not be marked committed")
+}
+
+func TestVerifyHeapPage_HotUpdatedXmaxZero(t *testing.T) {
+	p := newPage(t)
+	slot := addCleanTuple(t, p, 16)
+	// HOT-updated (xmin committed so xmin is valid; xmax-invalid clear) but the
+	// raw xmax field is 0 — corruption.
+	setInfomask(t, p, slot, storage.HeapHotUpdated|storage.HeapXminCommitted)
+	setXmax(t, p, slot, 0)
+
+	reports, err := VerifyHeapPage(p)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	wantReport(t, reports, slot, "tuple has been HOT updated, but xmax is 0")
+}
+
+// A healthy HOT-updated tuple (HOT bit set, valid xmax) must NOT be flagged —
+// guards the keystone requirement that a clean relation reports no corruption.
+func TestVerifyHeapPage_HealthyHotUpdatedNoReport(t *testing.T) {
+	p := newPage(t)
+	slot := addCleanTuple(t, p, 16)
+	setInfomask(t, p, slot, storage.HeapHotUpdated|storage.HeapXminCommitted)
+	setXmax(t, p, slot, 4242) // valid successor xmax
+
+	reports, err := VerifyHeapPage(p)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("healthy HOT-updated tuple reported %d corruptions: %+v", len(reports), reports)
+	}
+}
+
+// HEAP_HOT_UPDATED with xmax 0 but the xmax-invalid hint set is NOT corruption:
+// IsHotUpdated is false when HEAP_XMAX_INVALID is set, so the check is skipped.
+func TestVerifyHeapPage_HotBitWithXmaxInvalidNoReport(t *testing.T) {
+	p := newPage(t)
+	slot := addCleanTuple(t, p, 16)
+	setInfomask(t, p, slot, storage.HeapHotUpdated|storage.HeapXmaxInvalid|storage.HeapXminCommitted)
+	setXmax(t, p, slot, 0)
+
+	reports, err := VerifyHeapPage(p)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("xmax-invalid HOT tuple reported %d corruptions: %+v", len(reports), reports)
+	}
+}
+
 func TestVerifyHeapPage_RedirectOutOfRange(t *testing.T) {
 	p := newPage(t)
 	slot := addCleanTuple(t, p, 16)
