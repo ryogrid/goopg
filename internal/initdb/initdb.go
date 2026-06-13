@@ -255,6 +255,43 @@ type Options struct {
 	// encoding ID is written into pg_database.encoding.
 	Encoding string
 
+	// LocaleProvider selects the default collation provider for the new
+	// cluster, mirroring upstream initdb's --locale-provider (initdb.c:3367).
+	// "" or "libc" use the operating-system C library (the default);
+	// "builtin" uses PG's built-in C/C.UTF-8/PG_UNICODE_FAST locales; "icu"
+	// is recognized but rejected ("ICU is not supported in this build")
+	// because goopg is built without ICU. An unrecognized value is rejected
+	// before any filesystem work. The chosen provider is written to
+	// pg_database.datlocprovider.
+	LocaleProvider string
+
+	// Locale and the LC* fields mirror initdb's --locale and the per-category
+	// --lc-collate/--lc-ctype/--lc-messages/--lc-monetary/--lc-numeric/--lc-time
+	// (initdb.c setlocales). Locale supplies the default for any unset
+	// category; each unset category ultimately falls back to "C" (goopg's
+	// fixed locale — the running engine does not vary collation, so these are
+	// recorded on disk for PG-compat only). For a non-libc provider, --locale
+	// also supplies the per-database collation (datlocale) when no
+	// provider-specific locale is given.
+	Locale     string
+	LCCollate  string
+	LCCtype    string
+	LCMessages string
+	LCMonetary string
+	LCNumeric  string
+	LCTime     string
+
+	// BuiltinLocale, ICULocale, and ICURules mirror initdb's --builtin-locale,
+	// --icu-locale, and --icu-rules. Each is only legal with its matching
+	// provider (initdb.c:3424-3434): --builtin-locale needs --locale-provider
+	// builtin (valid values C / C.UTF-8 / PG_UNICODE_FAST, recorded in
+	// pg_database.datlocale), and --icu-locale/--icu-rules need the icu
+	// provider (always rejected here, as goopg has no ICU). A mismatched
+	// combination is rejected before any filesystem work.
+	BuiltinLocale string
+	ICULocale     string
+	ICURules      string
+
 	// Registry, when non-nil, is the server's live GUC registry.
 	// Its values for max_connections, max_worker_processes,
 	// max_wal_senders, max_prepared_transactions,
@@ -594,6 +631,16 @@ func Init(opts Options) error {
 	if err != nil {
 		return err
 	}
+	// Resolve + validate the locale provider and lc_* settings up front
+	// (upstream initdb --locale-provider / --locale / --lc-* / --builtin-locale
+	// / --icu-* via setlocales + setup_encoding). A bad provider, an illegal
+	// option combination, or an encoding/locale mismatch aborts before any
+	// filesystem work. The result feeds pg_database (datlocprovider /
+	// datcollate / datctype / datlocale) and the lc_* GUC seeding below.
+	locale, err := resolveLocale(opts, encodingID)
+	if err != nil {
+		return err
+	}
 	// Resolve + validate the authentication methods up front (upstream
 	// initdb -A/--auth, --auth-host, --auth-local) before any filesystem
 	// work, so a bad method or a password method without --pwfile aborts
@@ -681,7 +728,7 @@ func Init(opts Options) error {
 	// setup_config (initdb.c). password_encryption is seeded to md5 when an
 	// md5 auth method was chosen (initdb.c:1402-1413). No-op when no
 	// relevant option was given.
-	if err := seedPostgresqlConf(abs, opts.TextSearchConfig, passwordEncryption, opts.AllowGroupAccess, opts.ExtraGUC); err != nil {
+	if err := seedPostgresqlConf(abs, opts.TextSearchConfig, passwordEncryption, opts.AllowGroupAccess, locale.localeGUCSettings(), opts.ExtraGUC); err != nil {
 		return fmt.Errorf("goopg init: seed postgresql.conf: %w", err)
 	}
 	if err := bootstrapSystemCatalogs(abs); err != nil {
@@ -700,7 +747,7 @@ func Init(opts Options) error {
 	if err != nil {
 		return fmt.Errorf("goopg init: postgres role: %w", err)
 	}
-	if err := bootstrapPostgresDatabase(abs, encodingID); err != nil {
+	if err := bootstrapPostgresDatabase(abs, encodingID, locale); err != nil {
 		return fmt.Errorf("goopg init: postgres database: %w", err)
 	}
 	// M0106-0010 step 3cs: overwrite the empty btree placeholder at
@@ -1529,7 +1576,7 @@ func bootstrapPostgresRoleWithPassword(dataDir, superuser, rolpassword string) (
 // `Assert("j > attnum")` in nocachegetattr because HEAP_HASVARWIDTH is
 // missing while the TupleDesc believes there are var-width attrs
 // before the target attnum. M0106-0010 Step 3ct.
-func bootstrapPostgresDatabase(dataDir string, encodingID int32) error {
+func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSettings) error {
 	// PG18 pg_database schema (18 cols) per postgres/src/include/catalog/pg_database.h:
 	//   1  oid              Oid
 	//   2  datname          NameData (NAMEDATALEN=64)
@@ -1570,30 +1617,38 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32) error {
 		{Name: "datcollversion", Type: catalog.Type{Name: "text"}, Ordinal: 16},
 		{Name: "datacl", Type: catalog.Type{Name: "aclitem[]"}, Ordinal: 17},
 	}
-	// libc / "C" locale defaults — matches a fresh `initdb --locale=C`.
-	// datlocale, daticurules, datcollversion, datacl are NULL per BKI defaults
-	// (libc uses datcollate/datctype, not datlocale; no ICU rules; no recorded
-	// collation version; no ACL means default-public access).
+	// Locale columns come from the resolved --locale-provider / --locale /
+	// --lc-* options (resolveLocale). The default (no options) reproduces a
+	// fresh `initdb --locale=C` under the libc provider: datlocprovider='c',
+	// datcollate/datctype="C", datlocale NULL. daticurules, datcollversion,
+	// datacl stay NULL per BKI defaults (no ICU rules; no recorded collation
+	// version; no ACL means default-public access). For the builtin provider
+	// datlocale carries the per-database collation (C / C.UTF-8 /
+	// PG_UNICODE_FAST); libc records no datlocale.
+	datlocaleDatum := executor.NullDatum
+	if locale.datlocale != "" {
+		datlocaleDatum = executor.NewStringDatum(locale.datlocale)
+	}
 	buildRow := func(oid uint32, name string, isTemplate bool, allowConn bool) executor.Row {
 		return executor.Row{
-			executor.NewIntDatum(int64(oid)),  // oid
-			executor.NewStringDatum(name),     // datname
-			executor.NewIntDatum(10),          // datdba = bootstrap superuser
-			executor.NewIntDatum(int64(encodingID)), // encoding (default PG_UTF8=6; -E/--encoding)
-			executor.NewStringDatum("c"),      // datlocprovider = libc
-			executor.NewBoolDatum(isTemplate), // datistemplate
-			executor.NewBoolDatum(allowConn),  // datallowconn
-			executor.NewBoolDatum(false),      // dathasloginevt
-			executor.NewIntDatum(-1),          // datconnlimit
-			executor.NewIntDatum(3),           // datfrozenxid
-			executor.NewIntDatum(1),           // datminmxid
-			executor.NewIntDatum(1663),        // dattablespace = pg_default
-			executor.NewStringDatum("C"),      // datcollate (text, NOT NULL)
-			executor.NewStringDatum("C"),      // datctype   (text, NOT NULL)
-			executor.NullDatum,                // datlocale (NULL for libc)
-			executor.NullDatum,                // daticurules
-			executor.NullDatum,                // datcollversion
-			executor.NullDatum,                // datacl
+			executor.NewIntDatum(int64(oid)),                 // oid
+			executor.NewStringDatum(name),                    // datname
+			executor.NewIntDatum(10),                         // datdba = bootstrap superuser
+			executor.NewIntDatum(int64(encodingID)),          // encoding (default PG_UTF8=6; -E/--encoding)
+			executor.NewStringDatum(string(locale.provider)), // datlocprovider (--locale-provider)
+			executor.NewBoolDatum(isTemplate),                // datistemplate
+			executor.NewBoolDatum(allowConn),                 // datallowconn
+			executor.NewBoolDatum(false),                     // dathasloginevt
+			executor.NewIntDatum(-1),                         // datconnlimit
+			executor.NewIntDatum(3),                          // datfrozenxid
+			executor.NewIntDatum(1),                          // datminmxid
+			executor.NewIntDatum(1663),                       // dattablespace = pg_default
+			executor.NewStringDatum(locale.collate),          // datcollate (text, NOT NULL)
+			executor.NewStringDatum(locale.ctype),            // datctype   (text, NOT NULL)
+			datlocaleDatum,                                   // datlocale (NULL for libc)
+			executor.NullDatum,                               // daticurules
+			executor.NullDatum,                               // datcollversion
+			executor.NullDatum,                               // datacl
 		}
 	}
 	writeRow := func(page storage.Page, row executor.Row) error {

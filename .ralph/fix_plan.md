@@ -683,13 +683,47 @@ if 21-spec pass surfaces a real divergence:
         `internal/initdb/encoding_test.go`,
         `internal/initdb/pg_database_encoding_test.go`, `cmd/goopg/main_test.go`
         (`TestInitCommandEncoding`).
+      - **PROGRESS 2026-06-13 (loop #27):** `--locale-provider` + `--locale` +
+        `--lc-collate`/`--lc-ctype`/`--lc-messages`/`--lc-monetary`/
+        `--lc-numeric`/`--lc-time` + `--builtin-locale` (libc + builtin
+        collation providers) landed; `icu`/`--icu-locale`/`--icu-rules`
+        recognized but rejected (`ICU is not supported in this build`). New
+        `internal/initdb/locale.go` ports `resolveLocaleProvider`
+        (initdb.c:3367, `unrecognized locale provider`),
+        `pg_get_encoding_from_locale` (codeset-suffix mapping; a frontend that
+        cannot `setlocale` — `C`/`POSIX`→SQL_ASCII, `.CODESET`→enc, else -1),
+        `check_locale_encoding` (initdb.c:2265), and `resolveLocale` = the
+        post-parse `setlocales`+`setup_encoding` validation: option-combination
+        checks (3424-3434), `locale must be specified if provider is <name>`
+        (2471), builtin canonicalization C/C.UTF-8/PG_UNICODE_FAST (2477), the
+        `#ifndef USE_ICU` rejection (2503), and the builtin
+        C.UTF-8/PG_UNICODE_FAST ⇒ UTF8 requirement (2778-2783). `Init`
+        validates up front (after `resolveEncoding`, before auth/layout);
+        `seedPostgresqlConf` gains a `localeGUCs` arg applied first
+        (lc_messages/lc_monetary/lc_numeric/lc_time, only when a locale option
+        is given); `bootstrapPostgresDatabase(dir, enc, locale)` writes
+        datlocprovider/datcollate/datctype/datlocale — **no-option default is
+        byte-identical to the prior libc/"C" row** (datlocale stays NULL, null
+        bitmap + t_hoff unchanged), builtin adds a non-NULL datlocale with no
+        format change (same 18-col tuple, only values vary). Closes the always-
+        run non-ICU locale cases of `001_initdb.pl` (builtin --locale C ok;
+        builtin C.UTF-8+UTF-8 ok; builtin-no-locale/xyz-provider/libc+icu-locale
+        /icu-no-build/builtin-C.UTF-8+SQL_ASCII fail). **Scope:** on-disk
+        PG-compat only (goopg's engine keeps its fixed C/UTF8 locale — no
+        runtime collation); the locale-derived default encoding is still
+        deferred. Design doc: `docs/design/0102-0018-initdb-locale-options.md`.
+        Tests: `internal/initdb/locale_test.go`, `cmd/goopg/main_test.go`
+        (`TestInitCommandLocaleProvider`).
       - **Remaining initdb options** (each pulls in a distinct subsystem; one
         per future loop, design doc first):
-        `--locale`/`--lc-*` + `--locale-provider`/`--icu-locale` (ICU; also
-        unlocks the deferred locale-derived encoding default + encoding↔locale
-        mismatch checks), `--data-checksums` (page checksums — needs the full
-        page-checksum write/verify path, NOT just a control-file field; high
-        blast radius).
+        `--data-checksums`/`--no-data-checksums` (PG 18 defaults checksums ON;
+        `001_initdb.pl` checks `pg_controldata` reports "Data page checksum
+        version: 1" by default / 0 with `--no-data-checksums` — but a faithful
+        implementation needs the full page-checksum write/verify path, NOT just
+        the control-file field, else a PG standby reading the pages would fail
+        the checksum; high blast radius). The locale-derived default encoding
+        (`pg_get_encoding_from_locale` on an unset `--encoding`) remains a
+        no-op under goopg's fixed C locale.
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
 

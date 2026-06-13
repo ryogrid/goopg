@@ -50,7 +50,7 @@ func TestBootstrapPostgresDatabaseWritesEncoding(t *testing.T) {
 					t.Fatalf("mkdir %s: %v", sub, err)
 				}
 			}
-			if err := bootstrapPostgresDatabase(dir, c.enc); err != nil {
+			if err := bootstrapPostgresDatabase(dir, c.enc, localeSettings{provider: collProviderLibc, collate: "C", ctype: "C"}); err != nil {
 				t.Fatalf("bootstrapPostgresDatabase: %v", err)
 			}
 			if got := readPgDatabaseEncoding(t, dir); got != c.enc {

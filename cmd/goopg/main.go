@@ -179,6 +179,22 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	authHost := fs.String("auth-host", "", "authentication method for local TCP/IP connections")
 	authLocal := fs.String("auth-local", "", "authentication method for local-socket connections")
 	pwFile := fs.String("pwfile", "", "read password for the new superuser from file")
+	// Locale provider + locale settings (upstream initdb --locale-provider,
+	// --locale, --lc-*, --builtin-locale, --icu-locale, --icu-rules). All are
+	// long-form only, matching upstream (no short forms). goopg runs with a
+	// fixed C/UTF8 locale, so these affect the on-disk pg_database catalog
+	// (datlocprovider/datcollate/datctype/datlocale) and the seeded lc_* GUCs.
+	localeProvider := fs.String("locale-provider", "", "set default locale provider for new databases (libc or builtin)")
+	locale := fs.String("locale", "", "set default locale for new databases")
+	lcCollate := fs.String("lc-collate", "", "set default locale for string sorting")
+	lcCtype := fs.String("lc-ctype", "", "set default locale for character classification")
+	lcMessages := fs.String("lc-messages", "", "set default locale for message display")
+	lcMonetary := fs.String("lc-monetary", "", "set default locale for monetary formatting")
+	lcNumeric := fs.String("lc-numeric", "", "set default locale for number formatting")
+	lcTime := fs.String("lc-time", "", "set default locale for time formatting")
+	builtinLocale := fs.String("builtin-locale", "", "set builtin provider locale for new databases")
+	icuLocale := fs.String("icu-locale", "", "set ICU locale ID for new databases")
+	icuRules := fs.String("icu-rules", "", "set additional ICU collation rules for new databases")
 	// GUC overrides seeded into postgresql.conf (upstream initdb -c/--set).
 	// Repeatable; each value is NAME=VALUE.
 	var extraGUC gucFlag
@@ -204,7 +220,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	if *authLocal != "" {
 		resolvedAuthLocal = *authLocal
 	}
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, Encoding: *encoding, AllowGroupAccess: *allowGroupAccess, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings}); err != nil {
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, Encoding: *encoding, AllowGroupAccess: *allowGroupAccess, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings, LocaleProvider: *localeProvider, Locale: *locale, LCCollate: *lcCollate, LCCtype: *lcCtype, LCMessages: *lcMessages, LCMonetary: *lcMonetary, LCNumeric: *lcNumeric, LCTime: *lcTime, BuiltinLocale: *builtinLocale, ICULocale: *icuLocale, ICURules: *icuRules}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}

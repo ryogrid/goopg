@@ -335,6 +335,61 @@ func TestInitCommandEncoding(t *testing.T) {
 	}
 }
 
+// TestInitCommandLocaleProvider exercises the --locale-provider / --locale /
+// --lc-* / --builtin-locale option family through the CLI, mirroring the
+// non-ICU locale cases of upstream initdb's 001_initdb.pl.
+func TestInitCommandLocaleProvider(t *testing.T) {
+	base := t.TempDir()
+
+	// builtin provider with --locale C succeeds and lays out a cluster.
+	var stdout, stderr bytes.Buffer
+	ok := filepath.Join(base, "builtin-ok")
+	if code := run([]string{"init", "-D", ok, "--no-sync", "--locale-provider", "builtin", "--locale", "C"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("builtin --locale C exit=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(ok, "PG_VERSION")); err != nil {
+		t.Errorf("cluster not laid out: %v", err)
+	}
+
+	// builtin C.UTF-8 with --encoding UTF-8 succeeds.
+	stdout.Reset()
+	stderr.Reset()
+	utf8dir := filepath.Join(base, "builtin-cutf8")
+	if code := run([]string{"init", "-D", utf8dir, "--no-sync", "--locale-provider", "builtin", "--encoding", "UTF-8", "--lc-collate", "C", "--lc-ctype", "C", "--builtin-locale", "C.UTF-8"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("builtin C.UTF-8 + UTF-8 exit=%d stderr=%q", code, stderr.String())
+	}
+
+	// Each rejection path: bad provider, builtin-without-locale, ICU
+	// provider (no ICU build), libc+--icu-locale combo, and builtin C.UTF-8
+	// with a non-UTF8 encoding. All must exit 1 and lay out nothing.
+	rejects := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"xyz", []string{"--locale-provider", "xyz"}, "unrecognized locale provider"},
+		{"builtin-no-locale", []string{"--locale-provider", "builtin"}, "locale must be specified if provider is builtin"},
+		{"icu-no-build", []string{"--locale-provider", "icu", "--icu-locale", "en"}, "ICU is not supported in this build"},
+		{"libc-icu-combo", []string{"--locale-provider", "libc", "--icu-locale", "en"}, "--icu-locale cannot be specified"},
+		{"builtin-cutf8-sqlascii", []string{"--locale-provider", "builtin", "--encoding", "SQL_ASCII", "--lc-collate", "C", "--lc-ctype", "C", "--builtin-locale", "C.UTF-8"}, "requires encoding"},
+	}
+	for _, c := range rejects {
+		stdout.Reset()
+		stderr.Reset()
+		dir := filepath.Join(base, "rej-"+c.name)
+		args := append([]string{"init", "-D", dir, "--no-sync"}, c.args...)
+		if code := run(args, &stdout, &stderr); code != 1 {
+			t.Errorf("%s: exit=%d, want 1 (stderr=%q)", c.name, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), c.want) {
+			t.Errorf("%s: stderr=%q, want containing %q", c.name, stderr.String(), c.want)
+		}
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("%s: rejected init should lay out nothing, but %q exists (err=%v)", c.name, dir, err)
+		}
+	}
+}
+
 // grepLines returns the lines of s containing substr, for test diagnostics.
 func grepLines(s, substr string) string {
 	var b strings.Builder

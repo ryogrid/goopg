@@ -29,8 +29,8 @@ type GUCSetting struct {
 // uses the same replace_guc_value algorithm: an existing (possibly
 // commented-out) assignment line is rewritten in place, otherwise a new
 // line is appended.
-func seedPostgresqlConf(abs, tsConfig, passwordEncryption string, allowGroupAccess bool, extra []GUCSetting) error {
-	if tsConfig == "" && passwordEncryption == "" && !allowGroupAccess && len(extra) == 0 {
+func seedPostgresqlConf(abs, tsConfig, passwordEncryption string, allowGroupAccess bool, localeGUCs, extra []GUCSetting) error {
+	if tsConfig == "" && passwordEncryption == "" && !allowGroupAccess && len(localeGUCs) == 0 && len(extra) == 0 {
 		return nil
 	}
 	path := filepath.Join(abs, "postgresql.conf")
@@ -42,6 +42,14 @@ func seedPostgresqlConf(abs, tsConfig, passwordEncryption string, allowGroupAcce
 	hadFinalNewline := strings.HasSuffix(text, "\n")
 	text = strings.TrimSuffix(text, "\n")
 	lines := strings.Split(text, "\n")
+
+	// lc_messages/lc_monetary/lc_numeric/lc_time are written first in
+	// upstream setup_config (initdb.c:1351-1366), before
+	// default_text_search_config and before the -c/--set loop so an
+	// explicit -c override still wins.
+	for _, g := range localeGUCs {
+		lines = replaceGUCValue(lines, g.Name, g.Value)
+	}
 
 	if tsConfig != "" {
 		// initdb.c:1343 always prefixes the catalog schema.
