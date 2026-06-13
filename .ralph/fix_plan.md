@@ -295,6 +295,37 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         `docs/milestones/README.md` index row to `accepted`.
       - Historical loop-by-loop progress notes archived to completed_milestones/m0100-0005-progress-log.md
 
+      - **E2E RUN CONFIRMED (loop 4, 2026-06-13)**: all 22 dedicated
+        `TestPort_Isolation*` functions PASS (the 21 RC specs from M0096-0001 +
+        ReadWriteUnique). Run: `go test -v -run TestPort_Isolation… ./internal/testport/`
+        → `ok …/internal/testport 126.455s`, 0 FAIL / 0 SKIP among the 22.
+        M0100-0007 (the last open implementation sub-item) closed this loop.
+      - **BLOCKERS to full `accepted` (NOT cleared this loop)**:
+        1. **HEAD does not build standalone.** Commit `920d03f2` (HEAD) compiles
+           only with a large UNCOMMITTED changeset present in the worktree:
+           committed `internal/executor/operators_storage.go` references
+           `ctx.CTENewToOld` / `ctx.CTESelfModifiedErrors`, fields defined only
+           in the uncommitted `internal/executor/context.go` diff. Stashing the
+           uncommitted `internal/` changes makes `go build ./...` FAIL. This is a
+           split-brain commit consistent with the concurrent-loop tree-corruption
+           hazard (see memory `concurrent_ralph_loops_corrupt_tree`). 788 insertions
+           across analyzer/catalog/executor/parser/planner/mvcc are uncommitted and
+           NOT owned by the isolation work (includes an unrelated `gen_override`
+           feature + new test files). Milestone DoD requires `gofmt -l .` empty and
+           `go vet ./...` clean — uncertifiable until the tree is committed/cleaned
+           by its owner.
+        2. `Depends: Close of M0107` (above) — M0107 is an unstarted `planned` perf
+           refactor; this forward dependency must be reconciled or struck (the
+           0100 milestone-doc DoD itself does NOT list M0107; the pgbench-S
+           TPS≥2000 DoD criterion is the likely intent).
+        3. pgbench-S TPS≥2000 DoD criterion unverified this loop (no server/data dir).
+        4. `docs/test-port/executable-isolation-tests.md` has no `status=` column —
+           the "flip defer→port" instruction is stale; the canonical status lives in
+           `docs/test-port/postgres-oracle-port-status.csv` (D-002 isolation suite).
+        Resume point: once the contaminated tree is committed/cleaned and HEAD
+        builds, re-run the 22 tests on the clean HEAD, verify gofmt/vet/pgbench,
+        reconcile the M0107 dependency, then flip statuses + accept the milestone.
+
         - **Remaining gaps (2026-05-22)**: 16 PASS, 6 SKIP. Each remaining test
           requires a design doc under `docs/design/` before implementation
           begins. Follow the pattern `0100-NNNN-<slug>.md` and update
@@ -364,18 +395,24 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
                 `TestPort_IsolationInsertConflictSpecconflict` PASS (all 5 perms)
                 → **21/21 RC isolation tests pass**.
 
-        - [ ] **M0100-0007 — MergeUpdate: MERGE RETURNING old/new aliases + merge_action()**
-              - Summary: `TestPort_IsolationMergeUpdate` SKIP — `ERROR: column
-                "old" does not exist`.
-              - Root cause: MERGE RETURNING supports `old` and `new` as
-                implicit composite aliases for the pre-action and post-action
-                row, plus `merge_action()` to return the action kind
-                (`INSERT`/`UPDATE`/`DELETE`). Neither is implemented.
-              - Required: (a) parser recognition of `old`/`new` in MERGE
-                RETURNING context, (b) planner resolution mapping them to the
-                target-table column set with old/new semantics, (c) executor
-                population of old/new values in `mergeOp.collectReturningRow`,
-                (d) `merge_action()` function. Write a design doc first.
+        - [x] **M0100-0007 — MergeUpdate: MERGE RETURNING old/new aliases + merge_action()**
+              - COMPLETE (verified loop 4, 2026-06-13). `TestPort_IsolationMergeUpdate`
+                PASS (4.74s). Implemented across two commits:
+                (1) `3c931d05` "feat(isolation): ... MERGE RETURNING old/new ..."
+                landed the `old`/`new` implicit composite aliases (parser
+                recognition + planner resolution + executor population) and
+                `merge_action()` (`internal/executor/expr.go`,
+                `internal/parser/parser.go`);
+                (2) `01356f1c` "fix(merge): cross-partition routing + deferred
+                duplicate-source error (M0100-0007)" finished the remaining
+                merge-update.spec divergences (cross-partition row routing and
+                the deferred TM_MultipleResults / "tuple to be updated was
+                already modified" duplicate-source error).
+              - Original symptom (`ERROR: column "old" does not exist`) gone;
+                merge-update.spec exercises `RETURNING merge_action(), old, new,
+                t.*` (L113/L128/L162/L177) and the full output now matches the
+                upstream expected `.out`.
+              - Design coverage: `docs/design/0100-0005-dml-cte-with-merge-returning.md`.
 
         - [x] **M0100-0008 — MergeJoin: MERGE EXPLAIN plan-tree parity**
               - COMPLETE (loop 13 + loop 14, commits 9b915fad): EXPLAIN MERGE
