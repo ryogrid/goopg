@@ -494,6 +494,88 @@ func TestVerifyHeapPage_CtidOnOtherBlockNoChain(t *testing.T) {
 	}
 }
 
+// setNatts overwrites a tuple's stored attribute count (the low bits of
+// t_infomask2 at off+18..20), preserving the high flag bits.
+func setNatts(t *testing.T, p storage.Page, slot uint16, natts uint16) {
+	t.Helper()
+	item, err := storage.PageGetItemID(p, slot)
+	if err != nil {
+		t.Fatalf("PageGetItemID(%d): %v", slot, err)
+	}
+	off := int(item.Offset)
+	cur := binary.LittleEndian.Uint16(p[off+18 : off+20])
+	cur = (cur &^ storage.HeapNattsMask) | (natts & storage.HeapNattsMask)
+	binary.LittleEndian.PutUint16(p[off+18:off+20], cur)
+}
+
+// A tuple storing more attributes than the table has is corruption — but only
+// when a relation descriptor is supplied (verify_heapam.c:check_tuple).
+func TestVerifyHeapPage_NattsExceedsTable(t *testing.T) {
+	p := newPage(t)
+	slot := addCleanTuple(t, p, 16) // no-null tuple: hoff=24 regardless of natts
+	setNatts(t, p, slot, 5)
+
+	reports, err := VerifyHeapPageWithRel(p, 0, RelDesc{Natts: 3})
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithRel: %v", err)
+	}
+	wantReport(t, reports, slot,
+		"number of attributes 5 exceeds maximum expected for table 3")
+}
+
+// A tuple with fewer-or-equal attributes than the table is legitimate (trailing
+// columns may have been added after the tuple was written) — no report.
+func TestVerifyHeapPage_NattsWithinTableNoReport(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16) // natts=1 < 3
+	s2 := addCleanTuple(t, p, 16)
+	setNatts(t, p, s2, 3) // natts==3 == table natts (boundary, still ok)
+
+	reports, err := VerifyHeapPageWithRel(p, 0, RelDesc{Natts: 3})
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithRel: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("within-table natts reported %d corruptions: %+v", len(reports), reports)
+	}
+	_ = s1
+}
+
+// Without a relation descriptor the natts check is disabled, even for a tuple
+// whose stored count is absurdly high — VerifyHeapPage is page-bytes-only.
+func TestVerifyHeapPage_NattsCheckDisabledWithoutRel(t *testing.T) {
+	p := newPage(t)
+	slot := addCleanTuple(t, p, 16)
+	setNatts(t, p, slot, 5)
+
+	reports, err := VerifyHeapPage(p, 0)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("page-bytes-only path reported %d corruptions: %+v", len(reports), reports)
+	}
+}
+
+// The natts check is gated on the header being clean enough to continue: a tuple
+// whose t_hoff overruns its length reports only the header error, not natts
+// (mirrors check_tuple bailing out when check_tuple_header returns false).
+func TestVerifyHeapPage_NattsSkippedWhenHeaderCorrupt(t *testing.T) {
+	p := newPage(t)
+	slot := addCleanTuple(t, p, 16)
+	setNatts(t, p, slot, 5)
+	item, _ := storage.PageGetItemID(p, slot)
+	setItemID(p, slot, item.Offset, storage.ItemIDNormal, 24) // lp_len=24 (>= min)
+	p[int(item.Offset)+22] = 32                               // t_hoff=32 > lp_len 24
+
+	reports, err := VerifyHeapPageWithRel(p, 0, RelDesc{Natts: 3})
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithRel: %v", err)
+	}
+	wantReport(t, reports, slot,
+		"data begins at offset 32 beyond the tuple length 24")
+}
+
 // itoa is a tiny strconv.Itoa stand-in kept local to avoid an import solely for
 // one assertion-message helper.
 func itoa(n int) string {

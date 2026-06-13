@@ -1006,6 +1006,24 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         files touched. DEFERRED: the clog-dependent HOT-chain checks (xmin
         commit-status across a link + root-of-chain-but-heap-only) and the SQL
         surface (still the AC-002-promoting slice, still blocked on a clean tree).
+      - **PROGRESS 2026-06-14 (loop #54):** added the **relation-natts tier** —
+        the one relation-dependent `check_tuple` check that is faithful to
+        goopg's on-disk layout (`number of attributes %u exceeds maximum expected
+        for table %u`, `verify_heapam.c:1942`). The tuple's `natts` is decoded
+        page-structurally from `t_infomask2`; the only relation metadata needed
+        is the column count, supplied via new `RelDesc{Natts}` through new entry
+        point `VerifyHeapPageWithRel(p, blkno, rel)` (`VerifyHeapPage` is now a
+        thin zero-`RelDesc` wrapper, page-bytes-only behaviour unchanged).
+        `checkTupleHeader` now returns a `bool` (header clean enough to
+        continue), gating the natts check exactly as upstream's `check_tuple`
+        gates on `check_tuple_header`. Visibility-gate divergence documented
+        (no clog → applied to every header-clean tuple; safe for goopg). Also
+        recorded that `check_tuple_attribute` is **goopg-divergent** (PG on-disk
+        varlena/`varatt_external` TOAST format vs goopg's chunk-relation TOAST),
+        not merely deferred. 27 unit tests PASS (4 new). Design doc `0110-0005`
+        extended; all in new files (`internal/amcheck/`), zero contaminated
+        files touched. STILL DEFERRED: clog-dependent HOT-chain checks + the SQL
+        surface (AC-002-promoting slice, still blocked on a clean tree).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

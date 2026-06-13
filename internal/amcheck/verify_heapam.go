@@ -16,7 +16,19 @@
 // and the HOT-updated/heap-only flags of a chain link must agree. These are
 // deterministic functions of the raw 8 KiB page bytes plus the page's own
 // block number (to recognise same-page CTID successors) and need neither
-// clog, the relation TupleDesc, nor the toast relation. The clog-dependent
+// clog, the relation TupleDesc, nor the toast relation.
+//
+// One relation-dependent check is also available, via VerifyHeapPageWithRel:
+// the tuple-natts-vs-table check (verify_heapam.c:check_tuple) — a tuple's
+// stored attribute count (from t_infomask2, itself page-structural) must not
+// exceed the relation's column count. It needs only that one scalar, supplied
+// by the SQL surface (the verify_heapam SRF) in RelDesc.Natts; it needs no
+// clog, no per-attribute TupleDesc, and no toast relation, so it is faithful
+// to goopg's on-disk layout. The per-attribute walk (check_tuple_attribute)
+// is NOT ported: it decodes PG's on-disk varlena/TOAST-pointer format, which
+// goopg does not use (goopg's TOAST is a separate chunk relation with a
+// goopg-specific in-heap pointer datum — see internal/executor/toast.go), so a
+// verbatim port would false-positive on valid goopg pages. The clog-dependent
 // HOT-chain checks (xmin commit-status consistency across a link, and the
 // "root of chain but heap-only" check, both of which require knowing whether
 // each tuple's xmin committed/aborted/in-progress) and the MVCC/attribute
@@ -79,6 +91,25 @@ type Report struct {
 	Msg    string
 }
 
+// RelDesc carries the relation-level metadata the page checker needs for the
+// checks that compare a tuple against its table definition (verify_heapam.c's
+// check_tuple, which gates these on the relation's TupleDesc). It is supplied
+// by the SQL surface — the verify_heapam set-returning function — once that is
+// wired; the page-bytes-only entry point VerifyHeapPage leaves it unset, which
+// disables the relation-dependent checks. Only the metadata that is faithful to
+// goopg's on-disk layout lives here: goopg has neither PG's on-disk varlena/
+// TOAST pointer format nor a separately stored relation-wide attribute
+// descriptor on the page, so the per-attribute (check_tuple_attribute) walk is
+// not represented; see the package doc.
+type RelDesc struct {
+	// Natts is the relation's column count (RelationGetDescr(rel)->natts). A
+	// visible tuple may carry fewer attributes than the table (trailing columns
+	// added later), but never more — a stored count above Natts is corruption
+	// (verify_heapam.c:1942). Zero (the unset value used by VerifyHeapPage)
+	// means "unknown", which skips this check.
+	Natts int
+}
+
 // maxAlign rounds n up to the nearest multiple of 8 (PG's MAXALIGN on 64-bit
 // platforms; postgres/src/include/c.h).
 func maxAlign(n int) int { return (n + 7) &^ 7 }
@@ -114,7 +145,23 @@ type lpEntry struct {
 // header is too malformed to even count line pointers yields an error (the
 // engine cannot safely proceed) rather than a Report — upstream relies on the
 // page-header check that runs before this loop.
+//
+// VerifyHeapPage runs only the checks decidable from the page bytes alone. The
+// relation-dependent checks (currently the tuple-natts-vs-table check) are left
+// disabled; callers that have the relation's descriptor — the SQL surface —
+// should use VerifyHeapPageWithRel.
 func VerifyHeapPage(p storage.Page, blkno storage.BlockNumber) ([]Report, error) {
+	return verifyHeapPage(p, blkno, RelDesc{})
+}
+
+// VerifyHeapPageWithRel is VerifyHeapPage plus the relation-dependent checks
+// driven by rel (verify_heapam.c's check_tuple). A zero-value rel disables
+// those checks and makes it identical to VerifyHeapPage.
+func VerifyHeapPageWithRel(p storage.Page, blkno storage.BlockNumber, rel RelDesc) ([]Report, error) {
+	return verifyHeapPage(p, blkno, rel)
+}
+
+func verifyHeapPage(p storage.Page, blkno storage.BlockNumber, rel RelDesc) ([]Report, error) {
 	if len(p) != storage.BlockSize {
 		return nil, fmt.Errorf("amcheck: page is %d bytes, want %d", len(p), storage.BlockSize)
 	}
@@ -214,7 +261,26 @@ func VerifyHeapPage(p storage.Page, blkno storage.BlockNumber) ([]Report, error)
 		// Tuple header is now safe to examine.
 		entries[offnum].valid = true
 		entries[offnum].lpOff = lpOff
-		checkTupleHeader(p, lpOff, lpLen, offnum, report)
+		headerOK := checkTupleHeader(p, lpOff, lpLen, offnum, report)
+
+		// Relation-dependent check (verify_heapam.c:check_tuple): a tuple may
+		// have fewer attributes than the table but never more. Upstream gates
+		// this on check_tuple_header succeeding (headerOK) and on the tuple
+		// being visible; goopg has no clog for the visibility gate, so we apply
+		// it to every header-clean tuple — safe for goopg because a stored
+		// natts above the table's column count is structural corruption
+		// regardless of visibility, and goopg drops columns logically
+		// (attisdropped) rather than shrinking a tuple's natts. Disabled when
+		// the relation descriptor is unset (rel.Natts == 0).
+		if headerOK && rel.Natts > 0 {
+			infomask2 := binary.LittleEndian.Uint16(p[lpOff+18 : lpOff+20])
+			natts := int(infomask2 & storage.HeapNattsMask)
+			if natts > rel.Natts {
+				report(offnum, fmt.Sprintf(
+					"number of attributes %d exceeds maximum expected for table %d",
+					natts, rel.Natts))
+			}
+		}
 
 		// If this tuple's CTID points to another tuple on the same page,
 		// record that tuple as the successor (verify_heapam.c first loop).
@@ -338,6 +404,12 @@ func isHeapOnly(p storage.Page, lpOff int) bool {
 // not-updated) and the clog/multixact-dependent checks are deferred; see the
 // package doc and the design doc.
 //
+// It returns false when the header is too corrupt to continue with the
+// downstream relation-dependent checks (t_hoff beyond the line-pointer length,
+// or t_hoff not equal to the expected data offset), mirroring upstream's
+// boolean result that gates check_tuple's attribute and natts checks. The
+// non-fatal invariants (multixact/HOT) still report but do not flip the result.
+//
 // On-disk tuple header layout (storage/heap.go MarshalBinary):
 //
 //	off+0..4  xmin        off+4..8   xmax
@@ -346,7 +418,7 @@ func isHeapOnly(p storage.Page, lpOff int) bool {
 //
 // Note goopg stores t_ctid.block as a plain uint32 at off+12..16, not as
 // upstream's bi_hi/bi_lo BlockIdData split.
-func checkTupleHeader(p storage.Page, lpOff, lpLen int, offnum uint16, report func(uint16, string)) {
+func checkTupleHeader(p storage.Page, lpOff, lpLen int, offnum uint16, report func(uint16, string)) bool {
 	infomask2 := binary.LittleEndian.Uint16(p[lpOff+18 : lpOff+20])
 	infomask := binary.LittleEndian.Uint16(p[lpOff+20 : lpOff+22])
 	hoff := int(p[lpOff+22])
@@ -355,7 +427,7 @@ func checkTupleHeader(p storage.Page, lpOff, lpLen int, offnum uint16, report fu
 	if hoff > lpLen {
 		report(offnum, fmt.Sprintf(
 			"data begins at offset %d beyond the tuple length %d", hoff, lpLen))
-		return
+		return false
 	}
 
 	// HEAP_XMAX_COMMITTED with HEAP_XMAX_IS_MULTI is an impossible combination:
@@ -400,7 +472,9 @@ func checkTupleHeader(p storage.Page, lpOff, lpLen int, offnum uint16, report fu
 				"tuple data should begin at byte %d, but actually begins at byte %d (%d attributes, no nulls)",
 				expectedHoff, hoff, natts))
 		}
+		return false
 	}
+	return true
 }
 
 // rawXmax returns the tuple's raw t_xmax field (off+4..8). For a non-multi

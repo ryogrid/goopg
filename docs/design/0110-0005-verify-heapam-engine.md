@@ -150,6 +150,44 @@ skipped (goopg has no on-disk multixact, so it is injected-only and its update
 xid is not page-resolvable). Healthy same-page chains and cross-block CTIDs are
 covered by dedicated false-positive guards.
 
+### Relation-natts tier (added loop #54)
+
+`verify_heapam.c`'s `check_tuple` (line 1942) rejects a visible tuple whose
+stored attribute count exceeds the relation's column count
+(`RelationGetDescr(rel)->natts < ctx->natts` → `number of attributes %u exceeds
+maximum expected for table %u`). A tuple may legitimately carry *fewer*
+attributes than the table (trailing columns added after it was written) but
+never *more*. This is the one relation-dependent check that is faithful to
+goopg's on-disk layout: the tuple's `natts` is read page-structurally from
+`t_infomask2` (the engine already decodes it for the `t_hoff` check), and the
+only relation metadata needed is one scalar — the column count — supplied via
+`RelDesc.Natts`.
+
+- Exposed through a new entry point `VerifyHeapPageWithRel(p, blkno, rel)`;
+  `VerifyHeapPage` is now a thin wrapper passing a zero-value `RelDesc`, which
+  disables the relation-dependent checks (page-bytes-only behaviour unchanged).
+- `check_tuple_header` now returns a `bool` (header clean enough to continue),
+  mirroring upstream's `result`. The natts check is gated on it exactly as
+  upstream's `check_tuple` is gated on `check_tuple_header` — a `t_hoff`-overrun
+  or `t_hoff`-mismatch tuple reports only the header error, not natts.
+- **Visibility gate divergence:** upstream also gates the natts check on
+  `check_tuple_visibility` (an aborted in-flight DDL could mean the tuple was
+  built against a different `TupleDesc`). goopg has no clog for that gate, so the
+  engine applies the check to every header-clean tuple. This is safe for goopg
+  because a stored `natts` above the table's column count is structural
+  corruption regardless of visibility, and goopg drops columns logically
+  (`attisdropped`) rather than shrinking a tuple's `natts`.
+
+The per-attribute walk (`check_tuple_attribute`) is **not** ported and is no
+longer merely deferred — it is goopg-divergent: it decodes PG's on-disk varlena
+1-byte/4-byte headers and `varatt_external` TOAST pointers (`va_rawsize`,
+`VARTAG_ONDISK`, compression-method id), a format goopg does not use. goopg's
+TOAST is a separate chunk relation (`chunk_id`/`chunk_seq`/`chunk_data`) reached
+through a goopg-specific in-heap pointer datum (`internal/executor/toast.go`), so
+a verbatim port would false-positive on every valid goopg toasted page. A
+goopg-faithful attribute/TOAST tier would be a separate reimplementation against
+goopg's own codec, not a port; recorded here as out-of-scope for the port.
+
 ### Deferred (recorded, with resume points)
 
 - HOT-chain **clog-dependent** checks — the xmin commit-status consistency across
@@ -159,8 +197,9 @@ covered by dedicated false-positive guards.
 - `check_tuple_header`'s heap-only-but-not-updated invariant — deferred until
   goopg stamps `HEAP_UPDATED` (see above).
 - `check_tuple_visibility` xmin/xmax bounds + multixact (tier 3) — needs clog.
-- `check_tuple_attribute` per-attribute TOAST validation (tier 3) — needs the
-  relation `TupleDesc` + toast relation.
+- `check_tuple_attribute` per-attribute TOAST validation — goopg-divergent
+  on-disk format (see the relation-natts tier above); a goopg-faithful version
+  is a reimplementation against goopg's codec, not a verify_heapam.c port.
 - The SQL surface: `CREATE EXTENSION amcheck` (parser + `pg_extension` row +
   `pg_proc` registration of `verify_heapam`/`bt_index_check`/`bt_index_parent_check`)
   and the `verify_heapam(regclass, …)` set-returning operator that walks a
@@ -179,12 +218,23 @@ type Report struct {
     Msg    string
 }
 
-// VerifyHeapPage runs the page-structural checks of upstream verify_heapam
+// RelDesc carries the relation-level metadata for the relation-dependent
+// checks. Natts is the table's column count; zero means "unknown" (skip).
+type RelDesc struct {
+    Natts int
+}
+
+// VerifyHeapPage runs the page-bytes-only checks of upstream verify_heapam
 // against a single 8 KiB heap page. blkno is the page's own block number, used
 // to recognise a tuple's same-page CTID successor for the HOT-chain pass.
 // Returns nil for a clean page; reports are ordered first-pass then
 // HOT-chain-pass, each in ascending offset order (upstream's two-loop order).
 func VerifyHeapPage(p storage.Page, blkno storage.BlockNumber) ([]Report, error)
+
+// VerifyHeapPageWithRel adds the relation-dependent checks (currently the
+// tuple-natts-vs-table check) driven by rel. A zero-value rel makes it
+// identical to VerifyHeapPage.
+func VerifyHeapPageWithRel(p storage.Page, blkno storage.BlockNumber, rel RelDesc) ([]Report, error)
 ```
 
 The engine takes raw `storage.Page` bytes and is therefore trivially testable
@@ -210,6 +260,10 @@ with hand-built clean and corrupt fixtures — no server, no buffer pool, no clo
   non-heap-only↔heap-only update mismatch; plus false-positive guards for a
   healthy normal chain, a healthy redirect→heap-only chain, and a cross-block
   CTID (must not start an in-page chain).
+- relation-natts tier (added loop #54): `natts > RelDesc.Natts` via
+  `VerifyHeapPageWithRel` asserts the exact message; plus guards that
+  fewer-or-equal natts reports nothing, that the page-bytes-only `VerifyHeapPage`
+  never runs the check, and that a header-corrupt tuple suppresses it.
 
 ## Upstream references
 
