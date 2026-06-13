@@ -15,20 +15,22 @@ type GUCSetting struct {
 	Value string
 }
 
-// seedPostgresqlConf applies the optional --text-search-config (-T) and
-// --set (-c) GUC overrides to the freshly written <abs>/postgresql.conf,
-// mirroring upstream initdb's setup_config (src/bin/initdb/initdb.c:1283).
+// seedPostgresqlConf applies the optional --text-search-config (-T),
+// --allow-group-access (-g) log_file_mode, and --set (-c) GUC overrides to
+// the freshly written <abs>/postgresql.conf, mirroring upstream initdb's
+// setup_config (src/bin/initdb/initdb.c:1283).
 //
 // Upstream order is preserved: default_text_search_config is written
-// first (initdb.c:1343-1346, always as the value 'pg_catalog.<cfg>'),
-// then every -c/--set override is applied last (initdb.c:1430-1436) so a
-// -c switch can override an earlier assignment — including
-// default_text_search_config itself. Each replacement uses the same
-// replace_guc_value algorithm: an existing (possibly commented-out)
-// assignment line is rewritten in place, otherwise a new line is
-// appended.
-func seedPostgresqlConf(abs, tsConfig string, extra []GUCSetting) error {
-	if tsConfig == "" && len(extra) == 0 {
+// first (initdb.c:1343-1346, always as the value 'pg_catalog.<cfg>'), then
+// log_file_mode is set to 0640 when group access is enabled
+// (initdb.c:1421-1425), then every -c/--set override is applied last
+// (initdb.c:1430-1436) so a -c switch can override an earlier assignment —
+// including default_text_search_config or log_file_mode. Each replacement
+// uses the same replace_guc_value algorithm: an existing (possibly
+// commented-out) assignment line is rewritten in place, otherwise a new
+// line is appended.
+func seedPostgresqlConf(abs, tsConfig string, allowGroupAccess bool, extra []GUCSetting) error {
+	if tsConfig == "" && !allowGroupAccess && len(extra) == 0 {
 		return nil
 	}
 	path := filepath.Join(abs, "postgresql.conf")
@@ -44,6 +46,13 @@ func seedPostgresqlConf(abs, tsConfig string, extra []GUCSetting) error {
 	if tsConfig != "" {
 		// initdb.c:1343 always prefixes the catalog schema.
 		lines = replaceGUCValue(lines, "default_text_search_config", "pg_catalog."+tsConfig)
+	}
+	if allowGroupAccess {
+		// initdb.c:1421-1425: when the cluster allows group access, log
+		// files should too, else a group-member backup would fail on
+		// non-relocated logs. Written unquoted as 0640 (replace_guc_value
+		// quote=false).
+		lines = replaceGUCValue(lines, "log_file_mode", "0640")
 	}
 	for _, g := range extra {
 		lines = replaceGUCValue(lines, g.Name, g.Value)

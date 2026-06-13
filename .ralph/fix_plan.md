@@ -589,12 +589,30 @@ if 21-spec pass surfaces a real divergence:
         `docs/design/0102-0013-initdb-config-seeding.md`. Tests:
         `internal/initdb/config_seed_test.go`, `cmd/goopg/main_test.go`
         (`TestInitCommandSeedsGUCs`, `TestInitCommandSetRequiresValue`).
+      - **PROGRESS 2026-06-13 (loop #23):** `-g`/`--allow-group-access`
+        landed. New `Options.AllowGroupAccess`; relaxes the cluster from
+        owner-only (`0o700`/`0o600`) to group mode (`0o750` dirs / `0o640`
+        files = `PG_DIR_MODE_GROUP`/`PG_FILE_MODE_GROUP`) and seeds
+        `log_file_mode = 0640` into `postgresql.conf`, mirroring `initdb.c`
+        `SetDataDirectoryCreatePerm(PG_DIR_MODE_GROUP)` (3360) + `setup_config`
+        (1421-1425). goopg lays out at owner mode then relaxes in one recursive
+        `relaxToGroupAccess`/`chmodTreeGroup` pass (modeled on `fsyncDataDir`'s
+        traversal, following a relocated `pg_wal` symlink) before the trailing
+        fsync — net on-disk result identical to upstream's create-at-group-mode,
+        satisfying `001_initdb.pl`'s `check_mode_recursive($datadir, 0750,
+        0640)`. `seedPostgresqlConf` gains an `allowGroupAccess` param; the
+        `log_file_mode` seed lands before the `-c`/`--set` loop so an explicit
+        override still wins. `-g`/`--allow-group-access` registered on the
+        `init` CLI. Design doc: `docs/design/0102-0014-initdb-allow-group-access.md`.
+        Tests: `internal/initdb/group_access_test.go`, `cmd/goopg/main_test.go`
+        (`TestInitCommandAllowGroupAccess`). This **completes the entire
+        `001_initdb.pl` "Check group access on PGDATA" case.**
       - **Remaining initdb options** (each pulls in a distinct subsystem; one
         per future loop, design doc first):
         `--encoding` (encoding catalogs), `--locale`/`--lc-*` +
         `--locale-provider`/`--icu-locale` (ICU),
-        `--data-checksums` (page checksums), `--allow-group-access` (0o750
-        dir mode), `--auth`/`--auth-host`/`--auth-local`/`--pwfile`
+        `--data-checksums` (page checksums),
+        `--auth`/`--auth-host`/`--auth-local`/`--pwfile`
         (auth bootstrap), `--sync-method`/`--no-sync-data-files`
         (syncfs sync method + base/ exclusion — deferred from loop #21).
 

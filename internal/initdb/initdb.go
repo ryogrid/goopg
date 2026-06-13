@@ -186,6 +186,15 @@ type Options struct {
 	// template's commented-out default is left untouched.
 	TextSearchConfig string
 
+	// AllowGroupAccess, when true, relaxes the data directory so the
+	// owner's group may read (and traverse) it, mirroring upstream
+	// initdb's -g/--allow-group-access (initdb.c:3360
+	// SetDataDirectoryCreatePerm(PG_DIR_MODE_GROUP)). Every directory is
+	// created/left at 0o750 and every file at 0o640 (vs the default
+	// 0o700/0o600), and postgresql.conf's log_file_mode is seeded to 0640
+	// (initdb.c:1421-1425). When false the cluster is owner-only.
+	AllowGroupAccess bool
+
 	// ExtraGUC are name=value GUC overrides seeded into postgresql.conf,
 	// mirroring upstream initdb's -c/--set (initdb.c:3266-3281,
 	// 1430-1436). They are applied after TextSearchConfig so a -c switch
@@ -347,6 +356,78 @@ func fsyncPath(path string, isDir bool) error {
 	return nil
 }
 
+// relaxToGroupAccess relaxes every directory under dataDir to 0o750
+// (PG_DIR_MODE_GROUP) and every regular file to 0o640 (PG_FILE_MODE_GROUP),
+// mirroring the net on-disk effect of upstream initdb's
+// SetDataDirectoryCreatePerm(PG_DIR_MODE_GROUP) (src/common/file_perm.c,
+// initdb.c:3360). Upstream creates each file/dir at the group mode from the
+// start via the pg_dir_create_mode / pg_file_create_mode globals; goopg lays
+// the tree out at owner mode (0o700/0o600) and relaxes it here in one pass,
+// producing an identical final tree — the invariant that 001_initdb.pl's
+// check_mode_recursive($datadir, 0750, 0640) validates.
+//
+// Like fsyncDataDir, the top-level walk ignores symlinks, so a relocated
+// pg_wal (-X/--waldir) is descended through separately to relax its external
+// target and contents too (check_mode_recursive follows symlinks with
+// follow_fast, so the WAL directory must satisfy the same modes).
+func relaxToGroupAccess(dataDir string) error {
+	if err := chmodTreeGroup(dataDir, false); err != nil {
+		return err
+	}
+	pgWal := filepath.Join(dataDir, "pg_wal")
+	if info, err := os.Lstat(pgWal); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if err := chmodTreeGroup(pgWal, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// chmodTreeGroup recursively chmods path and everything beneath it: every
+// directory to 0o750 and every regular file to 0o640. Symlinks are ignored
+// except at the top level when followTopSymlink is true (used to descend into
+// a relocated pg_wal), exactly mirroring walkAndFsync's traversal so the two
+// passes agree on which entries they touch.
+func chmodTreeGroup(path string, followTopSymlink bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		if !followTopSymlink {
+			return nil
+		}
+		if info, err = os.Stat(path); err != nil {
+			return err
+		}
+	}
+	if info.IsDir() {
+		if err := os.Chmod(path, 0o750); err != nil {
+			return fmt.Errorf("chmod dir %q: %w", path, err)
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			// Nested symlinks are never followed (matches walkAndFsync).
+			if e.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			if err := chmodTreeGroup(filepath.Join(path, e.Name()), false); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if info.Mode().IsRegular() {
+		if err := os.Chmod(path, 0o640); err != nil {
+			return fmt.Errorf("chmod file %q: %w", path, err)
+		}
+	}
+	return nil
+}
+
 func Init(opts Options) error {
 	if opts.DataDir == "" {
 		return errors.New("goopg init: -D <data-directory> is required")
@@ -432,7 +513,7 @@ func Init(opts Options) error {
 	// Seed any --text-search-config / --set GUC overrides into the
 	// just-written postgresql.conf, mirroring upstream initdb's
 	// setup_config (initdb.c). No-op when neither option was given.
-	if err := seedPostgresqlConf(abs, opts.TextSearchConfig, opts.ExtraGUC); err != nil {
+	if err := seedPostgresqlConf(abs, opts.TextSearchConfig, opts.AllowGroupAccess, opts.ExtraGUC); err != nil {
 		return fmt.Errorf("goopg init: seed postgresql.conf: %w", err)
 	}
 	if err := bootstrapSystemCatalogs(abs); err != nil {
@@ -841,6 +922,16 @@ func Init(opts Options) error {
 	// (M0095-0001).
 	if err := writePgControl(abs, sysID, opts.Registry); err != nil {
 		return fmt.Errorf("goopg init: pg_control: %w", err)
+	}
+	// Relax the whole tree to group-readable mode when -g/--allow-group-access
+	// was given (upstream SetDataDirectoryCreatePerm(PG_DIR_MODE_GROUP)). Done
+	// after the full layout but before the fsync below, so the relaxed modes
+	// are flushed durably (upstream creates at the group mode from the start;
+	// the net on-disk result is identical — every dir 0o750, every file 0o640).
+	if opts.AllowGroupAccess {
+		if err := relaxToGroupAccess(abs); err != nil {
+			return fmt.Errorf("goopg init: allow group access: %w", err)
+		}
 	}
 	// Flush the freshly written cluster to disk so it survives a host
 	// crash, mirroring upstream initdb's default trailing

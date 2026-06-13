@@ -148,6 +148,49 @@ func TestInitCommandSetRequiresValue(t *testing.T) {
 	}
 }
 
+// TestInitCommandAllowGroupAccess drives 001_initdb.pl's "successful creation
+// with group access" through the CLI (initdb --allow-group-access <dir>) and
+// asserts the resulting cluster satisfies check_mode_recursive(0750, 0640):
+// every directory 0750, every file 0640, plus the seeded log_file_mode.
+func TestInitCommandAllowGroupAccess(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data_group")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"init", "-D", dir, "--allow-group-access"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case d.IsDir():
+			if got := info.Mode().Perm(); got != 0o750 {
+				t.Errorf("dir %q mode = %04o, want 0750", p, got)
+			}
+		case info.Mode().IsRegular():
+			if got := info.Mode().Perm(); got != 0o640 {
+				t.Errorf("file %q mode = %04o, want 0640", p, got)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "postgresql.conf"))
+	if err != nil {
+		t.Fatalf("read postgresql.conf: %v", err)
+	}
+	if !strings.Contains(string(data), "log_file_mode = 0640") {
+		t.Errorf("postgresql.conf missing seeded `log_file_mode = 0640`; got:\n%s",
+			grepLines(string(data), "log_file_mode"))
+	}
+}
+
 // grepLines returns the lines of s containing substr, for test diagnostics.
 func grepLines(s, substr string) string {
 	var b strings.Builder

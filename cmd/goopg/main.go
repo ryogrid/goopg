@@ -156,6 +156,10 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	// Both forms bind to the same variable; empty leaves the template default.
 	tsConfig := fs.String("T", "", "default text search configuration")
 	fs.StringVar(tsConfig, "text-search-config", "", "default text search configuration")
+	// Group access (upstream initdb -g/--allow-group-access). Both forms
+	// bind to the same variable; relaxes the cluster to mode 0750/0640.
+	allowGroupAccess := fs.Bool("g", false, "allow group read/execute on the data directory")
+	fs.BoolVar(allowGroupAccess, "allow-group-access", false, "allow group read/execute on the data directory")
 	// GUC overrides seeded into postgresql.conf (upstream initdb -c/--set).
 	// Repeatable; each value is NAME=VALUE.
 	var extraGUC gucFlag
@@ -172,7 +176,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "goopg init: %s\n", extraGUC.err)
 		return 2
 	}
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, TextSearchConfig: *tsConfig, ExtraGUC: extraGUC.settings}); err != nil {
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, TextSearchConfig: *tsConfig, AllowGroupAccess: *allowGroupAccess, ExtraGUC: extraGUC.settings}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
