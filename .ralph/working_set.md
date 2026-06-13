@@ -1,40 +1,40 @@
-# Working Set (carried from loop 4, 2026-06-13)
+# Working Set (carried from loop 5, 2026-06-13)
 
-## Done this loop — M0100-0007 CLOSED + M0100-0005 E2E confirmed (not yet acceptable)
+## Done this loop — RESTORED BUILDABLE HEAD (M0100-0005 blocker #1 cleared)
 
-**M0100-0007 (MergeUpdate) marked `[x]`** — was stale; the test PASSES.
-Implemented across `3c931d05` (MERGE RETURNING old/new aliases + merge_action())
-and `01356f1c` (cross-partition routing + deferred duplicate-source error).
-`TestPort_IsolationMergeUpdate` PASS (4.74s).
+Commit `c0e4842f` "fix(executor): commit missing CTE self-modification Context
+fields (restore buildable HEAD)".
 
-**M0100-0005 E2E run confirmed**: ran all 22 dedicated `TestPort_Isolation*`
-functions → 22/22 PASS, 0 FAIL / 0 SKIP (`ok …/internal/testport 126.455s`).
-The 21 RC specs from M0096-0001 all pass.
+**Root cause (corrected from loop 4's wrong hypothesis):** NOT concurrent-loop
+contamination. ppid analysis: the two `ralph_loop.sh --live` procs are ONE loop
+(pid 2214963.ppid == 2113421 = the portable_timeout subshell; see memory
+`concurrent_ralph_loops_corrupt_tree`). The break was a chronic split-brain from
+`29de7a95` (M0100-0010): it committed consumer refs to `ctx.CTENewToOld` /
+`CTESelfModifiedErrors` / `CTESelfModErr` in operators_storage.go, but the field
+declarations in context.go were never committed. Every later loop ran `go build`
+with the uncommitted context.go present → passed locally, masking the break.
 
-## ⚠️ BLOCKER discovered — do NOT close M0100-0005 / accept milestone yet
-- **HEAD (`920d03f2`) does NOT build standalone.** Committed
-  `internal/executor/operators_storage.go` references `ctx.CTENewToOld` /
-  `ctx.CTESelfModifiedErrors`, which exist only in the UNCOMMITTED
-  `internal/executor/context.go` diff. `git stash`-ing the `internal/` changes
-  makes `go build ./...` FAIL. Split-brain commit — matches the
-  `concurrent_ralph_loops_corrupt_tree` hazard.
-- 788 uncommitted insertions (analyzer/catalog/executor/parser/planner/mvcc +
-  an unrelated `gen_override` feature + 2 new test files) are NOT owned by the
-  isolation work. 3 `.claude/worktrees/agent-*` entries modified → concurrent
-  agents likely active. I did NOT commit any code; only `.ralph` docs touched.
+**Fix:** committed only the 2 coherent files — context.go (declare 3 fields) +
+operators_cte_dml.go (init 2 maps). Verified pure-HEAD `go build ./...` fails
+ONLY on those 3 fields; with them, builds standalone. gofmt+vet clean.
+
+## Still uncommitted (DO NOT bundle — separate WIP, ~771 lines, 21 files)
+gen_override (parser/ddl, ast, catalog, executor + 2 untracked test files —
+`TestPartitionChildGeneratedExprOverride` currently FAILS, impl incomplete),
+lockrows (+393), planner (bushy/nl_index_join/unnest/plan/planner), join_agg,
+analyzer, subxact_visibility, dispatch, opnode, operators.go. None referenced by
+committed code; owned by other in-flight tasks. Backup: /tmp/loop5-backup/.
 
 ## Gates run this loop
-- go build ./... : PASS (with uncommitted changes present)
-- go build clean HEAD (stash internal/) : **FAIL** (CTENewToOld undefined) — restored via stash pop
-- 22 dedicated TestPort_Isolation* : PASS (22/22)
-- make ralph-state-guard : auto-repaired status/progress inconsistency → OK
-- Committed: only `.ralph/fix_plan.md` + `.ralph/working_set.md` (no code)
+- pure-HEAD `go build ./...` (WIP stashed, untracked tests moved out): PASS
+- gofmt -l (committed files): clean ; go vet ./internal/executor/: clean
+- go test ./internal/executor/ : only FAIL is gen_override test (impl stashed) —
+  not part of this commit
+- make ralph-state-guard: (run at loop end)
 
-## Next task (next loop)
-M0100-0005 final closure, BLOCKED until the contaminated tree is committed/cleaned
-by its owner and HEAD builds standalone. Then: re-run 22 tests on clean HEAD,
-verify gofmt/vet + pgbench-S TPS≥2000, reconcile the spurious `Depends: Close of
-M0107` note (M0107 unstarted; 0100 milestone-doc DoD does not list it), update
-status in `docs/test-port/postgres-oracle-port-status.csv` (NOT the no-status-column
-`executable-isolation-tests.md`), mark M0096-0005/M0096-0013 `[x]`, set milestone
-0100 + README to `accepted`.
+## Next step (M0100-0005 remaining, next loop)
+Re-run 22 `TestPort_Isolation*` on clean HEAD; verify pgbench-S TPS≥2000 (needs
+data dir — see MAINT-TPCH-RELOAD); reconcile/strike `Depends: Close of M0107`
+against the 0100 milestone-doc DoD; flip statuses in
+postgres-oracle-port-status.csv (D-002), mark M0096-0005/M0096-0013 `[x]`, set
+milestone 0100 + README `accepted`.

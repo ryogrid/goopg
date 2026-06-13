@@ -300,31 +300,34 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
         ReadWriteUnique). Run: `go test -v -run TestPort_Isolation… ./internal/testport/`
         → `ok …/internal/testport 126.455s`, 0 FAIL / 0 SKIP among the 22.
         M0100-0007 (the last open implementation sub-item) closed this loop.
-      - **BLOCKERS to full `accepted` (NOT cleared this loop)**:
-        1. **HEAD does not build standalone.** Commit `920d03f2` (HEAD) compiles
-           only with a large UNCOMMITTED changeset present in the worktree:
-           committed `internal/executor/operators_storage.go` references
-           `ctx.CTENewToOld` / `ctx.CTESelfModifiedErrors`, fields defined only
-           in the uncommitted `internal/executor/context.go` diff. Stashing the
-           uncommitted `internal/` changes makes `go build ./...` FAIL. This is a
-           split-brain commit consistent with the concurrent-loop tree-corruption
-           hazard (see memory `concurrent_ralph_loops_corrupt_tree`). 788 insertions
-           across analyzer/catalog/executor/parser/planner/mvcc are uncommitted and
-           NOT owned by the isolation work (includes an unrelated `gen_override`
-           feature + new test files). Milestone DoD requires `gofmt -l .` empty and
-           `go vet ./...` clean — uncertifiable until the tree is committed/cleaned
-           by its owner.
+      - **BLOCKERS to full `accepted`**:
+        1. ~~**HEAD does not build standalone.**~~ **RESOLVED (loop 5, 2026-06-13,
+           commit `c0e4842f`).** Root cause was NOT concurrent-loop contamination:
+           ppid analysis showed a single `--live` loop (the second `ralph_loop.sh`
+           is the portable_timeout subshell, ppid=first loop — see memory
+           `concurrent_ralph_loops_corrupt_tree`). The break was a chronic
+           split-brain dating to `29de7a95` (M0100-0010): that commit added
+           consumer refs to `ctx.CTENewToOld`/`CTESelfModifiedErrors`/`CTESelfModErr`
+           in `operators_storage.go`, but the field declarations in `context.go`
+           were never committed. Verified pure-HEAD build failed ONLY on those 3
+           fields; committed `context.go` (declarations) + `operators_cte_dml.go`
+           (map init) → `go build ./...` PASS standalone, `gofmt`+`vet` clean.
+           The other ~771 uncommitted lines (gen_override, lockrows, planner) are
+           SEPARATE in-flight features, not referenced by any committed file; left
+           uncommitted for their owning task.
         2. `Depends: Close of M0107` (above) — M0107 is an unstarted `planned` perf
            refactor; this forward dependency must be reconciled or struck (the
            0100 milestone-doc DoD itself does NOT list M0107; the pgbench-S
            TPS≥2000 DoD criterion is the likely intent).
-        3. pgbench-S TPS≥2000 DoD criterion unverified this loop (no server/data dir).
+        3. pgbench-S TPS≥2000 DoD criterion unverified (no server/data dir).
         4. `docs/test-port/executable-isolation-tests.md` has no `status=` column —
            the "flip defer→port" instruction is stale; the canonical status lives in
            `docs/test-port/postgres-oracle-port-status.csv` (D-002 isolation suite).
-        Resume point: once the contaminated tree is committed/cleaned and HEAD
-        builds, re-run the 22 tests on the clean HEAD, verify gofmt/vet/pgbench,
-        reconcile the M0107 dependency, then flip statuses + accept the milestone.
+        Resume point: blocker 1 cleared. Next: re-run the 22 `TestPort_Isolation*`
+        on clean HEAD, verify pgbench-S TPS≥2000 (needs data dir), reconcile/strike
+        the M0107 dependency against the milestone-doc DoD, flip statuses in the CSV
+        (not the no-status-column .md), mark M0096-0005/M0096-0013 `[x]`, set
+        milestone 0100 + README to `accepted`.
 
         - **Remaining gaps (2026-05-22)**: 16 PASS, 6 SKIP. Each remaining test
           requires a design doc under `docs/design/` before implementation
