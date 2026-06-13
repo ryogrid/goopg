@@ -4516,36 +4516,6 @@ func maintainUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []cat
 	}
 }
 
-// maintainUniqueIndexesForInsertSkipArbiter is like maintainUniqueIndexesForInsert
-// but skips the index identified by skipOID. Used by applyInsert after an
-// expression-based arbiter entry was already inserted via maintainArbiter with a
-// pre-computed Phase-B key, so the expression is not re-evaluated here (which
-// would produce extra NOTICEs for plain INSERT paths in specconflict tests).
-// Pass skipOID=0 to get identical behaviour to maintainUniqueIndexesForInsert.
-func maintainUniqueIndexesForInsertSkipArbiter(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, ptr storage.ItemPointer, skipOID uint32) {
-	if ctx.Catalog == nil || ctx.Pool == nil {
-		return
-	}
-	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
-		if skipOID != 0 && idx.OID == skipOID {
-			continue
-		}
-		idxRel := ctx.Catalog.IndexRelFileNode(idx)
-		tree, err := btree.Open(ctx.Pool, idxRel)
-		if err != nil {
-			continue
-		}
-		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
-		if err != nil || key == nil {
-			key = encodeExprIndexKey(ctx, idx, tbl, row)
-			if key == nil {
-				continue
-			}
-		}
-		_ = tree.Insert(key, ptr)
-	}
-}
-
 // encodeExprIndexKey encodes a btree key for an expression-based index by
 // resolving and evaluating each ColExpr in idx against the given row.
 // Returns nil if any expression column lacks a stored ColExpr, fails to
@@ -5123,6 +5093,12 @@ func isLiveForUniqueCheck(ctx *Context, xmin, xmax storage.TransactionID) bool {
 	}
 	if xmax == storage.InvalidTransactionID {
 		return true
+	}
+	// Speculative row self-cancelled: the inserting XID stamped xmax on
+	// the row it just inserted (cancelSpeculativeRow). Dead to all
+	// observers regardless of the XID's active state.
+	if xmin == xmax {
+		return false
 	}
 	// Deletion by our own xact (DELETE then INSERT in the same transaction
 	// must succeed).  Without this short-circuit, an in-progress self-xmax

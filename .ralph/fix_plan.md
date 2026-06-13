@@ -300,7 +300,9 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
           begins. Follow the pattern `0100-NNNN-<slug>.md` and update
           `docs/design/README.md` in the same commit.
 
-        - [ ] **M0100-0006 — InsertConflictSpecconflict: speculative insertion for ON CONFLICT**
+        - [x] **M0100-0006 — InsertConflictSpecconflict: speculative insertion for ON CONFLICT**
+              - COMPLETE (loop 3, 2026-06-13): perm 5 now passes via M0100-0006b.
+                `TestPort_IsolationInsertConflictSpecconflict` PASS (all 5 perms).
               - Summary: `TestPort_IsolationInsertConflictSpecconflict` SKIP —
                 perms 1–4 now PASS (loop 9, 2026-06-12); perm 5 deferred
                 (requires spectoken infrastructure).
@@ -318,7 +320,7 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
                 (c) `(step notices N)` coordination in isolation runner.
                 New sub-task: M0100-0006b.
 
-        - [ ] **M0100-0006b — InsertConflictSpecconflict perm 5: spectoken infrastructure**
+        - [x] **M0100-0006b — InsertConflictSpecconflict perm 5: spectoken infrastructure**
               - Summary: perm 5 of insert-conflict-specconflict.spec requires
                 speculative token locks in pg_locks + transactionid lock
                 entries. Not implementable without dedicated infrastructure.
@@ -344,12 +346,23 @@ Milestone doc: `docs/milestones/0100-rc-isolation-runtime-correctness-and-spec-p
                 matches — non-numeric bg-worker pids emit NULL. Row model
                 completed: waiters emit their own-XID `transactionid
                 ExclusiveLock`. Diff advanced L496→L533.
-              - Remaining (separate issue): test still SKIPs on a +2-line
-                offset — after `s2_commit`, s1's ON CONFLICT DO UPDATE retry
-                re-evaluates the non-unique index expr `blurt_and_lock_4`,
-                emitting 2 extra NOTICEs PG does not. Executor index-maintenance
-                bug on the upsert update path, not spec-lock infra. See deferral
-                ledger.
+              - COMPLETE (loop 3, 2026-06-13): the remaining +2-NOTICE offset is
+                fixed. PG's ON CONFLICT DO UPDATE is a HOT update (no indexed
+                column changed → zero index tuples inserted, no expression
+                re-evaluation); goopg (no HOT) re-inserted every index entry on
+                `applyUpdate`, re-evaluating the non-unique `blurt_and_lock_4`
+                expression index → 2 extra NOTICEs. Fix: `applyInsert` caches each
+                non-arbiter index key (`maintainNonArbiterIndexesCapture` →
+                `specIndexKeys`/`specInsertedLeaf`, reset per source row) and
+                `applyUpdate` reuses the cached key
+                (`maintainNonArbiterIndexesForUpdate`) when
+                `indexKeyUnchangedFromSpec` proves the index's referenced base
+                columns are unchanged (`collectExprColumnNames` conservative AST
+                walker). Byte-identical btree state, side-effect evaluation elided.
+                Orphaned `maintainUniqueIndexesForInsertSkipArbiter` removed.
+                Design doc: `docs/design/0100-0006b-upsert-hot-index-key-reuse.md`.
+                `TestPort_IsolationInsertConflictSpecconflict` PASS (all 5 perms)
+                → **21/21 RC isolation tests pass**.
 
         - [ ] **M0100-0007 — MergeUpdate: MERGE RETURNING old/new aliases + merge_action()**
               - Summary: `TestPort_IsolationMergeUpdate` SKIP — `ERROR: column

@@ -10,6 +10,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -86,6 +87,16 @@ type upsertOp struct {
 	// raise SQLSTATE 21000 "ON CONFLICT DO UPDATE command cannot affect
 	// row a second time".  M0097-0028.
 	writtenPtrs map[storage.ItemPointer]struct{}
+	// specIndexKeys caches the non-arbiter index keys computed during the
+	// speculative applyInsert for the current source row, keyed by index OID.
+	// specInsertedLeaf is the leaf-ordered row those keys were computed from.
+	// On the ON CONFLICT DO UPDATE retry, applyUpdate reuses a cached key when
+	// the index's referenced base columns are unchanged from the speculative
+	// row, so a side-effectful expression index (e.g. blurt_and_lock_*) is not
+	// re-evaluated — mirroring PG's HOT update, which touches no index when no
+	// indexed column changed. Both are reset per source row. M0100-0006b.
+	specIndexKeys    map[uint32][]byte
+	specInsertedLeaf Row
 }
 
 // RowsAffected satisfies executor.RowCounter — for UPSERT, the
@@ -184,6 +195,11 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		for srcIdx, tgtIdx := range o.plan.ColumnIndex {
 			inserted[tgtIdx] = src[srcIdx]
 		}
+		// Clear the speculative-insert index-key cache so a later source row
+		// that conflicts directly (no speculative insert) cannot wrongly reuse
+		// a prior row's keys. applyInsert repopulates it. M0100-0006b.
+		o.specIndexKeys = nil
+		o.specInsertedLeaf = nil
 
 		// M0100-0005t: partition routing for INSERT … ON CONFLICT.  When
 		// the target is partitioned, route the row to a leaf and swap
@@ -852,13 +868,16 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols
 			globalSpecReg.RegisterSpec(xid, o.ctx.backendPID())
 		}
 	}
-	// Maintain all non-arbiter unique/PK indexes. The arbiter was already handled
-	// above; skipping it here prevents double-insertion and expression re-evaluation.
+	// Maintain all non-arbiter indexes. The arbiter was already handled above;
+	// skipping it here prevents double-insertion and expression re-evaluation.
+	// Capture each index's key so the DO UPDATE retry can reuse it without
+	// re-evaluating a side-effectful expression index. M0100-0006b.
 	var arbiterOID uint32
 	if o.plan.OnConflict != nil && o.plan.OnConflict.ArbiterIndex != nil {
 		arbiterOID = o.plan.OnConflict.ArbiterIndex.OID
 	}
-	maintainUniqueIndexesForInsertSkipArbiter(o.ctx, tbl, cols, insertedLeaf, ptr, arbiterOID)
+	o.specIndexKeys = o.maintainNonArbiterIndexesCapture(tbl, cols, insertedLeaf, ptr, arbiterOID)
+	o.specInsertedLeaf = insertedLeaf
 	return ptr, nil
 }
 
@@ -922,10 +941,11 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 			return err
 		}
 		_ = o.maintainArbiter(key, newPtr)
-		maintainUniqueIndexesForInsertSkipArbiter(o.ctx, tbl, cols, updatedLeaf, newPtr, o.plan.OnConflict.ArbiterIndex.OID)
+		o.maintainNonArbiterIndexesForUpdate(tbl, cols, updatedLeaf, newPtr, o.plan.OnConflict.ArbiterIndex.OID)
 	} else {
-		// No explicit arbiter: maintain all unique/PK indexes normally. M0097-0028.
-		maintainUniqueIndexesForInsert(o.ctx, tbl, cols, updatedLeaf, newPtr)
+		// No explicit arbiter: maintain all indexes, reusing speculative keys
+		// where the indexed columns are unchanged. M0097-0028 / M0100-0006b.
+		o.maintainNonArbiterIndexesForUpdate(tbl, cols, updatedLeaf, newPtr, 0)
 	}
 	return nil
 }
@@ -944,6 +964,183 @@ func (o *upsertOp) maintainArbiter(key []byte, ptr storage.ItemPointer) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	return nil
+}
+
+// maintainNonArbiterIndexesCapture inserts a (key → ptr) entry into every
+// non-arbiter index on tbl and returns the per-index key bytes it computed,
+// keyed by index OID. skipOID is the arbiter index (handled separately by the
+// caller); pass 0 to maintain all indexes. The captured keys let the ON
+// CONFLICT DO UPDATE retry reuse a side-effectful expression index's key
+// without re-evaluating it. Mirrors maintainUniqueIndexesForInsertSkipArbiter
+// but records what it wrote. M0100-0006b.
+func (o *upsertOp) maintainNonArbiterIndexesCapture(tbl *catalog.Table, cols []catalog.Column, row Row, ptr storage.ItemPointer, skipOID uint32) map[uint32][]byte {
+	if o.ctx.Catalog == nil || o.ctx.Pool == nil {
+		return nil
+	}
+	captured := make(map[uint32][]byte)
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		if skipOID != 0 && idx.OID == skipOID {
+			continue
+		}
+		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+		tree, err := btree.Open(o.ctx.Pool, idxRel)
+		if err != nil {
+			continue
+		}
+		key, err := encodeIndexKeyFromCols(idx, cols, row, o.ctx.Catalog)
+		if err != nil || key == nil {
+			key = encodeExprIndexKey(o.ctx, idx, tbl, row)
+			if key == nil {
+				continue
+			}
+		}
+		_ = tree.Insert(key, ptr)
+		captured[idx.OID] = key
+	}
+	return captured
+}
+
+// maintainNonArbiterIndexesForUpdate inserts (key → ptr) entries for the
+// updated row into every non-arbiter index. When an index's key value is
+// provably unchanged from the speculatively-inserted row (cached in
+// o.specIndexKeys), the cached key is reused so a side-effectful expression
+// index (e.g. blurt_and_lock_*) is not re-evaluated — mirroring PG's HOT
+// update, which touches no index when no indexed column changed. Indexes whose
+// referenced columns changed, whose expression we cannot statically analyse, or
+// that were never speculatively inserted are evaluated normally. M0100-0006b.
+func (o *upsertOp) maintainNonArbiterIndexesForUpdate(tbl *catalog.Table, cols []catalog.Column, row Row, ptr storage.ItemPointer, skipOID uint32) {
+	if o.ctx.Catalog == nil || o.ctx.Pool == nil {
+		return
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		if skipOID != 0 && idx.OID == skipOID {
+			continue
+		}
+		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+		tree, err := btree.Open(o.ctx.Pool, idxRel)
+		if err != nil {
+			continue
+		}
+		if cached, ok := o.specIndexKeys[idx.OID]; ok && o.indexKeyUnchangedFromSpec(idx, cols, row) {
+			_ = tree.Insert(cached, ptr)
+			continue
+		}
+		key, err := encodeIndexKeyFromCols(idx, cols, row, o.ctx.Catalog)
+		if err != nil || key == nil {
+			key = encodeExprIndexKey(o.ctx, idx, tbl, row)
+			if key == nil {
+				continue
+			}
+		}
+		_ = tree.Insert(key, ptr)
+	}
+}
+
+// indexKeyUnchangedFromSpec reports whether idx's key value is provably the same
+// for the updated row as for the speculatively-inserted row (o.specInsertedLeaf).
+// It is true only when every base column the index references holds an equal
+// Datum in both rows. It returns false conservatively when the speculative row
+// is absent, a referenced column cannot be resolved, or an expression contains
+// an AST node collectExprColumnNames does not understand — in which case the
+// caller re-evaluates the index expression. M0100-0006b.
+func (o *upsertOp) indexKeyUnchangedFromSpec(idx *catalog.Index, cols []catalog.Column, row Row) bool {
+	if o.specInsertedLeaf == nil {
+		return false
+	}
+	refs := make(map[string]struct{})
+	for i, colName := range idx.Columns {
+		if colName != "" {
+			refs[strings.ToLower(colName)] = struct{}{}
+			continue
+		}
+		if i >= len(idx.ColExprs) || idx.ColExprs[i] == nil {
+			return false
+		}
+		if !collectExprColumnNames(*idx.ColExprs[i], refs) {
+			return false
+		}
+	}
+	for name := range refs {
+		ord := -1
+		for j := range cols {
+			if strings.EqualFold(cols[j].Name, name) {
+				ord = j
+				break
+			}
+		}
+		if ord < 0 || ord >= len(row) || ord >= len(o.specInsertedLeaf) {
+			return false
+		}
+		if !datumEquals(row[ord], o.specInsertedLeaf[ord]) {
+			return false
+		}
+	}
+	return true
+}
+
+// collectExprColumnNames walks an index-expression AST and records every
+// base-column name it references (lower-cased) into out. It returns false if it
+// meets a node type it does not understand — a subquery, parameter, or any
+// shape that could hide a column dependency — so the caller conservatively
+// assumes the expression may depend on a changed column. Only the node shapes
+// that can legally appear in an index expression are handled. M0100-0006b.
+func collectExprColumnNames(e parser.Expr, out map[string]struct{}) bool {
+	switch n := e.(type) {
+	case nil:
+		return true
+	case *parser.ColumnRef:
+		out[strings.ToLower(n.Column)] = struct{}{}
+		return true
+	case *parser.IntegerConst, *parser.StringConst, *parser.NumericConst,
+		*parser.NullConst, *parser.BooleanConst, *parser.TypedStringLit,
+		*parser.IntervalLit, *parser.DefaultMarker, *parser.ParamRef:
+		return true
+	case *parser.FuncCall:
+		for i := range n.Args {
+			if !collectExprColumnNames(n.Args[i], out) {
+				return false
+			}
+		}
+		return true
+	case *parser.BinaryOp:
+		return collectExprColumnNames(n.Left, out) && collectExprColumnNames(n.Right, out)
+	case *parser.UnaryOp:
+		return collectExprColumnNames(n.Operand, out)
+	case *parser.CastExpr:
+		return collectExprColumnNames(n.Operand, out)
+	case *parser.CollateExpr:
+		return collectExprColumnNames(n.Operand, out)
+	case *parser.CaseExpr:
+		if !collectExprColumnNames(n.Operand, out) || !collectExprColumnNames(n.Else, out) {
+			return false
+		}
+		for _, w := range n.Whens {
+			if !collectExprColumnNames(w.When, out) || !collectExprColumnNames(w.Then, out) {
+				return false
+			}
+		}
+		return true
+	case *parser.RowExpr:
+		for i := range n.Elems {
+			if !collectExprColumnNames(n.Elems[i], out) {
+				return false
+			}
+		}
+		return true
+	case *parser.ArrayConstructorExpr:
+		for i := range n.Elements {
+			if !collectExprColumnNames(n.Elements[i], out) {
+				return false
+			}
+		}
+		return true
+	case *parser.ArraySubscriptExpr:
+		return collectExprColumnNames(n.Base, out) && collectExprColumnNames(n.Index, out)
+	case *parser.IsNullExpr:
+		return collectExprColumnNames(n.Operand, out)
+	default:
+		return false
+	}
 }
 
 // probeSpeculativeConflict scans the arbiter btree for a live row that is NOT
