@@ -22,6 +22,14 @@ const (
 	TxnStatusCommitted TxnStatus = 1
 	// TxnStatusAborted records a ROLLBACK or crash-implied abort.
 	TxnStatusAborted TxnStatus = 2
+	// TxnStatusSubCommitted records a subtransaction that has committed while its
+	// parent (top-level) transaction is still in progress. It is NOT a terminal
+	// answer: a reader must resolve it by consulting the parent's status (see
+	// DidCommit), mirroring PG's TRANSACTION_STATUS_SUB_COMMITTED
+	// (postgres/src/include/access/clog.h:30 and transam.c TransactionIdDidCommit).
+	// The raw byte value (3) is chosen to equal the on-disk SLRU 2-bit lane
+	// (0x03) so the flat-file and SLRU encodings agree. M0117-0004.
+	TxnStatusSubCommitted TxnStatus = 3
 )
 
 // xidsPerBank is the number of XIDs managed by a single clogBank. 128K XIDs
@@ -261,6 +269,61 @@ func (c *CLog) SetAborted(xid storage.TransactionID) error {
 	return c.setStatus(xid, TxnStatusAborted)
 }
 
+// SetSubCommitted records xid as a sub-committed subtransaction (PG's
+// TRANSACTION_STATUS_SUB_COMMITTED, 0x03) in both the flat file and the SLRU
+// mirror. Caller contract: xid is a subtransaction that has committed while
+// its parent top-level XID is still in progress — the caller is responsible
+// for checking that condition; this method only records the lane. Resolve a
+// sub-committed XID's true commit fate with DidCommit (which consults the
+// parent link). M0117-0004.
+func (c *CLog) SetSubCommitted(xid storage.TransactionID) error {
+	return c.setStatus(xid, TxnStatusSubCommitted)
+}
+
+// DidCommit resolves whether xid is committed, mirroring PostgreSQL's
+// transam.c TransactionIdDidCommit:
+//
+//   - TxnStatusCommitted              → true;
+//   - TxnStatusAborted / Unknown      → false;
+//   - TxnStatusSubCommitted           → recurse on the parent top-level XID.
+//
+// parentOf maps a sub-XID to its immediate parent (the M0117-0003 SubxactMap
+// supplies this; SubxactMap.TopLevelXid or a parents lookup). A nil parentOf,
+// or a parent that resolves to 0/the XID itself, yields false — matching PG's
+// "no pg_subtrans entry for subcommitted XID" branch (which WARNs and returns
+// false). Recursion is bounded by a visited set so a corrupt self/cyclic
+// parent link cannot loop. M0117-0004.
+func (c *CLog) DidCommit(xid storage.TransactionID, parentOf func(storage.TransactionID) storage.TransactionID) bool {
+	visited := make(map[storage.TransactionID]struct{})
+	for {
+		if xid < FirstNormalTransactionID {
+			// Bootstrap/frozen/invalid XIDs are treated as committed by PG's
+			// TransactionLogFetch short-circuit (transam.c).
+			return xid == BootstrapTransactionID || xid == FrozenTransactionID
+		}
+		if _, seen := visited[xid]; seen {
+			return false // cyclic/corrupt parent chain
+		}
+		visited[xid] = struct{}{}
+		switch c.GetStatus(xid) {
+		case TxnStatusCommitted:
+			return true
+		case TxnStatusSubCommitted:
+			if parentOf == nil {
+				return false
+			}
+			parent := parentOf(xid)
+			if parent == 0 || parent == xid {
+				return false
+			}
+			xid = parent
+			continue
+		default: // Aborted or Unknown
+			return false
+		}
+	}
+}
+
 // InitializeAsCommitted marks every XID in the range [1, highXID) as
 // TxnStatusCommitted, leaving entries that are already non-zero unchanged.
 // Called by Open when the clog file was absent (upgrade from a pre-clog
@@ -482,6 +545,8 @@ func (c *CLog) mirrorTerminalRangeBatchedUnlocked(loXID, hi storage.TransactionI
 				bits = pgClogStatusCommitted
 			case TxnStatusAborted:
 				bits = pgClogStatusAborted
+			case TxnStatusSubCommitted:
+				bits = pgClogStatusSubCommitted
 			default:
 				continue
 			}
@@ -603,9 +668,10 @@ const (
 
 	// PG XidStatus constants, must match TRANSACTION_STATUS_* in
 	// postgres/src/include/access/clog.h.
-	pgClogStatusInProgress = 0x00
-	pgClogStatusCommitted  = 0x01
-	pgClogStatusAborted    = 0x02
+	pgClogStatusInProgress   = 0x00
+	pgClogStatusCommitted    = 0x01
+	pgClogStatusAborted      = 0x02
+	pgClogStatusSubCommitted = 0x03
 )
 
 // EnablePGSLRUMirror wires this CLog to also write each
@@ -745,14 +811,18 @@ func (c *CLog) loadFromSLRU(dir string) error {
 					status = TxnStatusAborted
 				case pgClogStatusInProgress:
 					continue
-				default:
-					// 0x03 = both bits set. This is PG's SUB_COMMITTED state
-					// (not used by goopg), but can appear as a corruption
-					// artifact if MarkUnknownAsAborted previously ORed the
-					// aborted bit onto a committed XID. Treat as committed:
-					// the committed bit (0x01) was definitely set at some
-					// point.
-					status = TxnStatusCommitted
+				case pgClogStatusSubCommitted:
+					// 0x03 = PG's TRANSACTION_STATUS_SUB_COMMITTED: a
+					// subtransaction committed while its parent was still in
+					// progress. Decode it back as SubCommitted (M0117-0004);
+					// its true commit fate is resolved against the parent link
+					// by DidCommit. (Historically goopg conflated 0x03 with
+					// Committed as an OR-artifact of MarkUnknownAsAborted ORing
+					// the aborted bit onto a committed lane — that case
+					// resolves identically: DidCommit treats a SubCommitted XID
+					// whose parent is committed/unknown as committed, absent a
+					// definite parent abort.)
+					status = TxnStatusSubCommitted
 				}
 				xid := baseXID + pageInSeg*uint64(clogXactsPerPage) + xidInPageBase + lane
 				if xid == 0 || xid > uint64(^storage.TransactionID(0)) {
@@ -846,6 +916,8 @@ func (c *CLog) mirrorToSLRUUnlocked(xid storage.TransactionID, status TxnStatus)
 		bits = pgClogStatusCommitted
 	case TxnStatusAborted:
 		bits = pgClogStatusAborted
+	case TxnStatusSubCommitted:
+		bits = pgClogStatusSubCommitted
 	default:
 		return nil
 	}
