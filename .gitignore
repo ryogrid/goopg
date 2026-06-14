@@ -84,6 +84,12 @@ serena/
 # Scratch tree-dump from exploration tools.
 code_tree.txt
 
+# Stray `go build ./cmd/validate-ralph-state` output at repo root. The
+# Makefile guard uses `go run`, so this compiled binary is pure junk; a prior
+# loop left a 3.2 MB ELF here that polluted `git status` and risked an
+# accidental commit. Ignore it (root-anchored so it never masks the cmd/ pkg).
+/validate-ralph-state
+
 # TPC-H goopg runtime artifacts (PostgreSQL data dir, pid, logs) — must never be committed.
 bench/tpch/runtime_goopg/data/
 bench/tpch/runtime_goopg/*.pid
