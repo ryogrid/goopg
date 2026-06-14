@@ -872,6 +872,56 @@ It splits into two outcomes by insertion order, which is itself the finding:
   the current (buggy) behaviour as a detection assertion and must flip to a
   silence assertion when the split is fixed.
 
+## Real-producer page-deletion validation (and a vacuum bug it surfaced)
+
+The real-tree harness above only ever built trees with `Create`/`Insert`/split.
+It never exercised the *other* load-bearing on-disk mutator: **page deletion via
+`btree.VacuumIndexPages`**, which empties leaves whose entries all point at dead
+heap TIDs and then `unlinkEmptyLeaf`s them — rewriting the left sibling's
+`btpo_next`, the right sibling's `btpo_prev`, removing the leaf's parent downlink,
+and flagging the leaf `BTDeleted`. That is the deletion-path mirror of the split
+relink the previous section's bug lived in, and it had no end-to-end check that
+goopg's real output is amcheck-clean.
+
+`internal/amcheck/verify_nbtree_pagedel_test.go` drives the real
+`VacuumIndexPages` over live multi-level trees and runs every tier (per-page,
+item-order, cross-level downlinks, sibling-link walk, heapallindexed round-trip)
+over the post-deletion pages. It splits into clean cases and a detection case:
+
+- **Single interior-leaf deletion** and **multiple non-adjacent interior-leaf
+  deletions** in one pass are fully consistent — every tier stays silent. This
+  validates `unlinkEmptyLeaf`'s three-way relink (left `Next` → right sibling,
+  right `Prev` → left sibling, parent downlink removal) and the engine's
+  deleted-page exemptions against goopg's real layout.
+
+- **Adjacent interior-leaf deletion** exposes a genuine goopg correctness gap.
+  `unlinkEmptyLeaf` relinks neighbours from pointers captured at PHASE-1 scan time
+  (`emptyLeafInfo.prev/next`), **before any leaf is unlinked**. When a neighbour
+  is itself one of the leaves deleted in the same pass, those pointers go stale:
+  for `L0→L1→L2→L3→L4` with `L1,L2,L3` emptied, `unlink(L1)` sets `L0.next=L2`,
+  `unlink(L3)` sets `L4.prev=L2` — so the surviving edges `L0.next` and `L4.prev`
+  end up pointing at the **deleted** block `L2`. The leaf sibling chain is left
+  structurally broken; the sibling-link tier correctly flags `downlink or sibling
+  link points to deleted block`, while every other tier stays silent
+  (`CollectBtreeLeafEntries` tolerates the broken chain by skipping deleted pages,
+  so the survivor count is still exact). Both the WAL-emitter path
+  (`unlinkEmptyLeaf`) and the FPI fallback (`unlinkEmptyLeafFPI`) share the bug —
+  both trust the stale captured pointers.
+
+  An adjacent dead-tuple run is the common case for a range `DELETE` + `VACUUM`,
+  so this corrupts the on-disk sibling chain (load-bearing for backward scans and
+  future page-deletion relinking) in ordinary operation. Upstream avoids it:
+  `_bt_unlink_halfdead_page` re-reads the **current** left/right siblings at
+  unlink time and defers when a sibling is itself half-dead, rather than trusting
+  pointers captured earlier in the pass. The fix is tracked as **M0110-0010**
+  (re-read live siblings / defer adjacent unlinks; a WAL/concurrency change that
+  must fold the corrected sibling blocks into the unlink record + replay, with
+  `-race` and recovery gates) rather than landing blind in an engine loop —
+  exactly how the split bug above became M0110-0007.
+  `TestVerifyBtreeEngineDetectsStaleSiblingLinkAfterAdjacentLeafDeletion` pins the
+  current (buggy) behaviour and must flip to a silence assertion when M0110-0010
+  lands.
+
 ## Upstream references
 
 - `postgres/contrib/amcheck/verify_nbtree.c` (`palloc_btree_page`,
