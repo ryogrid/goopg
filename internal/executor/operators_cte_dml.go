@@ -37,6 +37,8 @@ func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 	// PostgreSQL CTE semantics hold (outer SELECT sees pre-CTE state).
 	savedSnap := ctx.Snap
 	ctx.CTEWriteFence = make(map[storage.ItemPointer]struct{})
+	ctx.CTENewToOld = make(map[storage.ItemPointer]storage.ItemPointer)
+	ctx.CTESelfModifiedErrors = make(map[storage.ItemPointer]struct{})
 	ctx.InDMLCTE = true
 
 	// Execute each DML CTE in order, collecting RETURNING rows.

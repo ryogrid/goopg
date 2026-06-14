@@ -61,6 +61,13 @@ type Manager struct {
 	xactMarkerMu sync.RWMutex
 	xactMarker   func(storage.TransactionID, XactMarker) error
 
+	// onTxnEnd is called after every transaction commit or abort, once the
+	// XID slot has been cleared and commitCond has been broadcast. Use case:
+	// cleaning up cross-session registries (e.g. spec insert registry for
+	// pg_locks). The callback must be non-blocking and short.
+	onTxnEndMu sync.RWMutex
+	onTxnEnd   func(xid storage.TransactionID)
+
 	// relcacheInvalPending is set by DDL that writes to nailed catalog
 	// relations (pg_class, pg_attribute, pg_proc, pg_type) so the
 	// xact-marker hook can emit RecordKindXactCommitInval and unlink
@@ -493,7 +500,25 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 	m.commitCond.Broadcast()
 	m.waitMu.Unlock()
 
+	if xid != storage.InvalidTransactionID {
+		m.onTxnEndMu.RLock()
+		hook := m.onTxnEnd
+		m.onTxnEndMu.RUnlock()
+		if hook != nil {
+			hook(xid)
+		}
+	}
+
 	return nil
+}
+
+// SetOnTxnEnd registers a callback fired after every transaction commit or
+// abort (once the slot is cleared and WaitForXID waiters are unblocked).
+// Only one callback is supported; a second call replaces the first.
+func (m *Manager) SetOnTxnEnd(fn func(xid storage.TransactionID)) {
+	m.onTxnEndMu.Lock()
+	m.onTxnEnd = fn
+	m.onTxnEndMu.Unlock()
 }
 
 // WaitForXID blocks until the transaction identified by xid is no longer

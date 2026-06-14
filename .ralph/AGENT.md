@@ -144,8 +144,12 @@ infrastructure not yet available. Run them explicitly when investigating
 a specific feature area:
 
 ```bash
-# Regress (SQL-level, requires pg_regress-compatible runner — D-001)
-# see docs/test-port/upstream-regress-coverage.md
+# Regress (SQL-level) — D-001 infrastructure is now available:
+scripts/pg-regress-runner.sh                   # default ~40 quick type tests
+scripts/pg-regress-runner.sh --all             # all 232 upstream tests (slow)
+scripts/pg-regress-runner.sh -v int4 float8    # specific tests, show diff on fail
+# Reports parity % and writes diffs to tmp/regress-diffs/.
+# Re-run after any SQL surface change; rising pass rate = converging PG compat.
 
 # Isolation (multi-session scheduler — D-002)
 # see docs/test-port/upstream-isolation-coverage.md
@@ -168,6 +172,30 @@ test suite, and it MUST pass cleanly:
 
 ```bash
 scripts/ralph-precommit-test.sh
+```
+
+For executor/planner/codec changes, additionally run the TPC-H silent-regression
+spot-check (fresh capped server + Q12/Q13 canonical row counts, ~1 min; skips
+cleanly when no TPC-H data dir is loaded):
+
+```bash
+scripts/tpch-spotcheck.sh
+```
+
+For planner/executor changes, also diff EXPLAIN plans against the latest baseline
+(skips when no bench server or no baseline exists):
+
+```bash
+make plan-gate
+# or: RALPH_PRECOMMIT_PLAN_DIFF=1 scripts/ralph-precommit-test.sh
+```
+
+For changes to concurrency-critical packages (`internal/lock`, `internal/mvcc`,
+`internal/storage`, `internal/aio`, `internal/wal` …), run the race-detector pass:
+
+```bash
+make race-gate                         # standalone (~15 min, covers all non-cluster pkgs)
+# or: RALPH_PRECOMMIT_RACE=1 scripts/ralph-precommit-test.sh
 ```
 
 This runs exactly the test set that CI's **"Run unit and component tests"**
@@ -207,11 +235,51 @@ global -rx SymbolName           # locate references
 global -f path/to/file.c        # list symbols defined in a file
 ```
 
+Faster than grep/global for most lookups: the `mcp__any-script__pg_*` MCP tools
+query a pre-built symbol database over this tree —
+`pg_search_symbols` (SQL-LIKE patterns like `heap_%`), `pg_symbol_source`,
+`pg_symbol_overview`/`pg_symbol_document`, and `pg_references_to`/`pg_references_from`
+for caller/callee analysis. Prefer them; fall back to `global -x` when they miss.
+
 When porting any concept, cite the upstream file path (e.g.
 `postgres/src/backend/storage/buffer/bufmgr.c`) in the relevant design doc
 and/or code comment. Never modify, vendor, or import code from `./postgres/`.
 
-Markdowned official PostgreSQL documentation is placed `postgres/official_docs_in_md/` for easy reference and linking. When citing the official docs, link to
+Markdowned official PostgreSQL documentation is placed `postgres/official_docs_in_md/` for easy reference and linking. When citing the official docs, link to the
+corresponding file under that directory (repository-relative path).
+
+### Quick compatibility check: goopg vs vanilla PG 18.3
+
+When you want to verify that goopg returns the same output as upstream PG for a
+specific SQL snippet or file, use the oracle-diff harness instead of starting
+two psql sessions manually:
+
+```bash
+# Check a SQL file against both (requires both servers running):
+scripts/pg-oracle-diff.sh path/to/query.sql
+
+# Check inline SQL:
+scripts/pg-oracle-diff.sh --sql "SELECT array_agg(i) FROM generate_series(1,5) i"
+
+# Auto-start throwaway servers, run, teardown:
+scripts/pg-oracle-diff.sh --auto-start path/to/query.sql
+
+# Run a PG regress test and see current parity:
+scripts/pg-regress-runner.sh int4              # PASS/FAIL + diff
+```
+
+A `PASS` means goopg output (after normalisation) matches PG 18.3 exactly.
+Any `FAIL` is a goopg compatibility bug to fix — never a reason to adjust PG.
+
+### Parity dashboard (no live server needed)
+
+```bash
+make parity-dashboard       # writes docs/parity-dashboard.md
+# Current baseline: GUC 17%, SQLSTATE 100%, pg_catalog 20%
+```
+
+Rising scores here are a lagging indicator of PG compatibility coverage.
+Use them to identify which GUC or catalog gap is blocking a specific feature.
 
 ## Design reference policy
 

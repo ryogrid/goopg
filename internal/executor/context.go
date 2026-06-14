@@ -49,9 +49,9 @@ type Context struct {
 	// calling planner.Plan so that unqualified table names resolve via the
 	// session's search_path. Falls back to Catalog when nil. M0097-0022.
 	PlanCatalog catalog.Catalog
-	TxnMgr  *mvcc.Manager
-	Tx      mvcc.Transaction
-	Snap    mvcc.Snapshot
+	TxnMgr      *mvcc.Manager
+	Tx          mvcc.Transaction
+	Snap        mvcc.Snapshot
 
 	// Session, if set, is consulted by the Transaction operator to
 	// drive BEGIN/COMMIT/ROLLBACK. It also tracks whether the current
@@ -244,10 +244,10 @@ type Context struct {
 
 	// Sequence session state — maps sequence key → last nextval result
 	// for currval(); LastSeqVal/LastSeqSet track the lastval() return. M0097-0009.
-	CurrSeqVals  map[string]int64
-	LastSeqVal   int64
-	LastSeqSet   bool
-	LastSeqName  string // name of sequence that produced LastSeqVal (for drop-detection)
+	CurrSeqVals map[string]int64
+	LastSeqVal  int64
+	LastSeqSet  bool
+	LastSeqName string // name of sequence that produced LastSeqVal (for drop-detection)
 
 	// TempTableShadows maps table name → original permanent *catalog.Table for
 	// CREATE TEMP TABLE shadowing. Populated by execCreateTable; restored on DROP.
@@ -333,6 +333,21 @@ type Context struct {
 	// not be visible to the outer SELECT. Cleared between statements.
 	CTEWriteFence map[storage.ItemPointer]struct{}
 
+	// CTENewToOld maps each new tuple pointer added to CTEWriteFence to the
+	// original (pre-CTE) tuple it replaced. Used to detect when a sub-command
+	// within the CTE's expression evaluation modifies a CTE-written row, which
+	// must raise an error in the outer UPDATE/DELETE.
+	CTENewToOld map[storage.ItemPointer]storage.ItemPointer
+
+	// CTESelfModifiedErrors is the set of original (pre-CTE) tuple pointers
+	// for which the outer UPDATE/DELETE must raise ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION.
+	// Populated when InDMLCTE=true and a write stamps xmax on a CTEWriteFence tuple.
+	CTESelfModifiedErrors map[storage.ItemPointer]struct{}
+
+	// CTESelfModErr, when non-nil, is the error scanMatching returns upon
+	// encountering an invisible-due-to-own-xmax tuple in CTESelfModifiedErrors.
+	CTESelfModErr error
+
 	// InDMLCTE is true while cteDMLPrefixOp is executing its DML sub-plans.
 	// Write operators register their output pointers in CTEWriteFence when this is set.
 	InDMLCTE bool
@@ -363,6 +378,20 @@ type Context struct {
 	// DELETE has no new). M0100-0007.
 	MergeOldRow Row
 	MergeNewRow Row
+}
+
+// backendPID resolves the owning backend's PID string for synthetic pg_locks
+// rows (spectoken / transactionid) that must join pg_stat_activity USING (pid).
+// ActivityPID is deprecated and always empty; the live PID lives in the activity
+// registry keyed by ProcNum. Falls back to ActivityPID when no registry is wired
+// (unit tests). Returns "" when unresolvable — such rows simply won't join.
+func (c *Context) backendPID() string {
+	if c.Activity != nil {
+		if pid := c.Activity.PIDForProcNum(c.ProcNum); pid != "" {
+			return pid
+		}
+	}
+	return c.ActivityPID
 }
 
 // SettingValue is one effective session setting exposed to SHOW ALL.
@@ -612,7 +641,6 @@ func (c *Context) MaterializeWriterXID() error {
 	}
 	return nil
 }
-
 
 // EnumRenameEntry records one ALTER TYPE … RENAME TO operation for transactional rollback.
 // OldName and NewName are lowercase. M0097-0022.

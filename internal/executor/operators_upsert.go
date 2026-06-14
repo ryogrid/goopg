@@ -10,6 +10,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -86,6 +87,16 @@ type upsertOp struct {
 	// raise SQLSTATE 21000 "ON CONFLICT DO UPDATE command cannot affect
 	// row a second time".  M0097-0028.
 	writtenPtrs map[storage.ItemPointer]struct{}
+	// specIndexKeys caches the non-arbiter index keys computed during the
+	// speculative applyInsert for the current source row, keyed by index OID.
+	// specInsertedLeaf is the leaf-ordered row those keys were computed from.
+	// On the ON CONFLICT DO UPDATE retry, applyUpdate reuses a cached key when
+	// the index's referenced base columns are unchanged from the speculative
+	// row, so a side-effectful expression index (e.g. blurt_and_lock_*) is not
+	// re-evaluated — mirroring PG's HOT update, which touches no index when no
+	// indexed column changed. Both are reset per source row. M0100-0006b.
+	specIndexKeys    map[uint32][]byte
+	specInsertedLeaf Row
 }
 
 // RowsAffected satisfies executor.RowCounter — for UPSERT, the
@@ -184,6 +195,11 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		for srcIdx, tgtIdx := range o.plan.ColumnIndex {
 			inserted[tgtIdx] = src[srcIdx]
 		}
+		// Clear the speculative-insert index-key cache so a later source row
+		// that conflicts directly (no speculative insert) cannot wrongly reuse
+		// a prior row's keys. applyInsert repopulates it. M0100-0006b.
+		o.specIndexKeys = nil
+		o.specInsertedLeaf = nil
 
 		// M0100-0005t: partition routing for INSERT … ON CONFLICT.  When
 		// the target is partitioned, route the row to a leaf and swap
@@ -223,6 +239,22 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			insertedForLeaf = remapRowForPartition(parentCols, partLeaf.Columns, inserted)
 		}
 
+		// Fire BEFORE INSERT trigger inline — PG fires BEFORE triggers per-row
+		// before the conflict probe, so BEFORE INSERT NOTICEs appear before any
+		// lock wait (M0100-0011).
+		if len(writeTbl.Triggers) > 0 {
+			ret, ok := fireTriggers(o.ctx, writeTbl, "before", "insert", nil, insertedForLeaf)
+			if !ok {
+				continue // BEFORE INSERT returned NULL — skip the row
+			}
+			insertedForLeaf = ret
+			if partLeaf != nil {
+				inserted = remapRowForPartition(partLeaf.Columns, parentCols, insertedForLeaf)
+			} else {
+				inserted = insertedForLeaf
+			}
+		}
+
 		// probeArbiterWaiting calls encodeArbiterKey with o.plan.Table (parent)
 		// columns and reads inserted[parent_col_ord]. Always pass parent-order
 		// inserted for key encoding; conflictRow is decoded in leaf order (cols).
@@ -231,25 +263,62 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 			return nil, err
 		}
 		if !conflicted {
-			if err := o.applyInsert(rel, writeTbl, cols, insertedForLeaf, arbiterKey); err != nil {
+			specPtr, err := o.applyInsert(rel, writeTbl, cols, insertedForLeaf, inserted)
+			if err != nil {
 				return nil, err
 			}
-			o.appendUpsertRetRow(inserted)
-			o.rowsAffected++
-			continue
+			// Post-insert speculative conflict check (Phase B re-probe).
+			// Detects commits from concurrent sessions that happened during
+			// Phase B's blocking window (advisory lock 2 in specconflict tests).
+			specConflictPtr, specConflictRow, specConflicted, serr := o.probeSpeculativeConflict(rel, cols, arbiterKey, o.ctx.Tx.XID)
+			// Release the speculative token regardless of conflict outcome. M0100-0006b.
+			globalSpecReg.SettleSpec(o.ctx.Tx.XID)
+			if serr != nil {
+				return nil, serr
+			}
+			if specConflicted {
+				// Cancel our speculatively-inserted row and fall through to the
+				// DO UPDATE / DO NOTHING conflict-handling path below.
+				if cerr := o.cancelSpeculativeRow(rel, specPtr); cerr != nil {
+					return nil, cerr
+				}
+				conflicted = true
+				conflictPtr = specConflictPtr
+				conflictRow = specConflictRow
+			} else {
+				if len(writeTbl.Triggers) > 0 {
+					fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf)
+				}
+				o.appendUpsertRetRow(inserted)
+				o.rowsAffected++
+				continue
+			}
 		}
 		switch o.plan.OnConflict.Action {
 		case planner.OnConflictActionNothing:
-			// PostgreSQL's conflict-nothing path re-runs the arbiter expression
-			// once before discarding the row. The probe already evaluated it
-			// during key formation; this single extra call mirrors the PG
-			// re-evaluation for side-effectful arbiter helpers like
-			// blurt_and_lock_*.
-			if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
-				return nil, err
+			// PostgreSQL's conflict-nothing path evaluates the arbiter expression
+			// twice: once as ExecBuildArbiterKey and once as the btree-insert
+			// expression evaluation inside ExecCheckIndexConstraints. Both produce
+			// NOTICEs for side-effectful helpers like blurt_and_lock_*. The Phase B
+			// call in applyInsert used a pre-computed key (no re-eval), so we
+			// compensate with two explicit calls here.
+			for range 2 {
+				if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+					return nil, err
+				}
 			}
 			// Skip silently — RowsAffected does NOT bump.
 		case planner.OnConflictActionUpdate:
+			// ExecBuildArbiterKey equivalent: re-evaluate the arbiter expression
+			// once at DO UPDATE entry. For expression-based arbiters this produces
+			// 2 NOTICEs (blurt_and_lock_* tests). For column-based arbiters it is a
+			// no-op (no side-effectful evaluation). Mirrors PG's ExecBuildArbiterKey
+			// call in ExecOnConflictUpdate.
+			if o.plan.OnConflict.ArbiterIndex != nil {
+				if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+					return nil, err
+				}
+			}
 			// Detect "ON CONFLICT DO UPDATE command cannot affect row a second
 			// time": if the conflicting tuple was written by this statement
 			// (its ItemPointer is in writtenPtrs), reject immediately.
@@ -293,8 +362,27 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 					if qctx == nil {
 						qctx = context.Background()
 					}
+					// M0100-0006b: if the conflicting XID is still in speculative
+					// insertion mode, wait for the spec token to be settled before
+					// waiting on the transaction itself. This maps to PG's
+					// SpeculativeInsertionLockAcquire / ShareLock path.
+					if isInFlightInsert {
+						waited, serr := globalSpecReg.WaitForSpecToken(qctx, inProgressXID, o.ctx.backendPID(), o.ctx.Tx.XID)
+						if serr != nil {
+							return nil, serr
+						}
+						if waited {
+							// Re-run arbiter expression after spec token released.
+							if _, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, inserted, o.plan.Pos()); err != nil {
+								return nil, err
+							}
+						}
+					}
 					if o.ctx.TxnMgr != nil {
-						if werr := o.ctx.TxnMgr.WaitForXID(qctx, inProgressXID); werr != nil {
+						globalSpecReg.RegisterXIDWait(o.ctx.backendPID(), o.ctx.Tx.XID, inProgressXID)
+						werr := o.ctx.TxnMgr.WaitForXID(qctx, inProgressXID)
+						globalSpecReg.DeregisterXIDWait(o.ctx.Tx.XID)
+						if werr != nil {
 							return nil, werr
 						}
 					}
@@ -317,8 +405,31 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 						return nil, err
 					}
 					if !conflicted {
-						if err := o.applyInsert(rel, writeTbl, cols, insertedForLeaf, arbiterKey); err != nil {
-							return nil, err
+						retryPtr, aerr := o.applyInsert(rel, writeTbl, cols, insertedForLeaf, inserted)
+						if aerr != nil {
+							return nil, aerr
+						}
+						// Post-insert speculative probe on the retry path.
+						specPtr2, specRow2, specConflicted2, serr2 := o.probeSpeculativeConflict(rel, cols, arbiterKey, o.ctx.Tx.XID)
+						globalSpecReg.SettleSpec(o.ctx.Tx.XID)
+						if serr2 != nil {
+							return nil, serr2
+						}
+						if specConflicted2 {
+							if cerr := o.cancelSpeculativeRow(rel, retryPtr); cerr != nil {
+								return nil, cerr
+							}
+							conflictPtr = specPtr2
+							conflictRow = specRow2
+							conflicted = true
+							evalConflictRow = conflictRow
+							if partLeaf != nil {
+								evalConflictRow = remapRowForPartition(partLeaf.Columns, parentCols, conflictRow)
+							}
+							continue
+						}
+						if len(writeTbl.Triggers) > 0 {
+							fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf)
 						}
 						o.appendUpsertRetRow(inserted)
 						o.rowsAffected++
@@ -355,8 +466,24 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				if uerr := checkUniqueIndexesForUpdate(o.ctx, writeTbl, cols, conflictRow, updatedForLeaf, false, o.plan.Pos()); uerr != nil {
 					return nil, uerr
 				}
+				// Fire BEFORE UPDATE trigger per-row before applying the update (M0100-0011).
+				if len(writeTbl.Triggers) > 0 {
+					ret, ok := fireTriggers(o.ctx, writeTbl, "before", "update", conflictRow, updatedForLeaf)
+					if !ok {
+						continue nextSourceRow
+					}
+					updatedForLeaf = ret
+					if partLeaf != nil {
+						updated = remapRowForPartition(partLeaf.Columns, parentCols, updatedForLeaf)
+					} else {
+						updated = updatedForLeaf
+					}
+				}
 				if err := o.applyUpdate(rel, writeTbl, cols, conflictPtr, updatedForLeaf, updated); err != nil {
 					return nil, err
+				}
+				if len(writeTbl.Triggers) > 0 {
+					fireTriggers(o.ctx, writeTbl, "after", "update", conflictRow, updatedForLeaf)
 				}
 				o.appendUpsertRetRow(updated)
 				o.rowsAffected++
@@ -702,20 +829,56 @@ func (o *upsertOp) findInProgressConflictKey(rel storage.RelFileNode, key []byte
 // This is required when a table has multiple unique indexes and a future
 // ON CONFLICT clause targets a non-arbiter index (e.g. after an earlier
 // upsert conflict updated a column covered by a second unique index).
-func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, inserted Row, _ []byte) error {
-	ptr, err := writeHeapRowReturning(o.ctx, rel, cols, inserted)
+//
+// Phase B semantics: if an expression-based arbiter is configured,
+// encodeArbiterKey is called BEFORE the heap write (evaluating the arbiter
+// expression, which may block on advisory locks in tests like
+// insert-conflict-specconflict.spec). The resulting key is used for the
+// arbiter btree entry so the expression is not re-evaluated during
+// maintainUniqueIndexesForInsert.
+func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, insertedLeaf Row, insertedParent Row) (storage.ItemPointer, error) {
+	// Phase B first call: evaluate arbiter expression BEFORE writing the heap row.
+	// In PG, _bt_check_unique re-evaluates the index expression when building the
+	// speculative btree key. Side-effectful expressions (blurt_and_lock_*) block
+	// here until the controller releases the Phase-B advisory lock.
+	var phaseBKey []byte
+	if o.plan.OnConflict != nil && o.plan.OnConflict.ArbiterIndex != nil {
+		key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, insertedParent, o.plan.Pos())
+		if err != nil {
+			return storage.ItemPointer{}, err
+		}
+		phaseBKey = key
+	}
+	ptr, err := writeHeapRowReturning(o.ctx, rel, cols, insertedLeaf)
 	if err != nil {
-		return err
+		return storage.ItemPointer{}, err
 	}
 	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
 		o.ctx.CTEWriteFence[ptr] = struct{}{}
 	}
 	o.trackWrittenPtr(ptr)
-	// Maintain all unique indexes so non-arbiter unique indexes stay consistent.
-	// maintainUniqueIndexesForInsert handles the arbiter index too, so we do
-	// not need the separate maintainArbiter call. M0097-0028.
-	maintainUniqueIndexesForInsert(o.ctx, tbl, cols, inserted, ptr)
-	return nil
+	// Insert the arbiter btree entry using the pre-computed Phase B key so the
+	// expression is not re-evaluated (avoiding extra NOTICEs for plain INSERT).
+	if phaseBKey != nil {
+		_ = o.maintainArbiter(phaseBKey, ptr)
+		// Register the speculative insertion token now that the unique index
+		// entry is visible. SettleSpec is called by the caller after
+		// probeSpeculativeConflict returns. M0100-0006b.
+		if xid := o.ctx.Tx.XID; xid != storage.InvalidTransactionID {
+			globalSpecReg.RegisterSpec(xid, o.ctx.backendPID())
+		}
+	}
+	// Maintain all non-arbiter indexes. The arbiter was already handled above;
+	// skipping it here prevents double-insertion and expression re-evaluation.
+	// Capture each index's key so the DO UPDATE retry can reuse it without
+	// re-evaluating a side-effectful expression index. M0100-0006b.
+	var arbiterOID uint32
+	if o.plan.OnConflict != nil && o.plan.OnConflict.ArbiterIndex != nil {
+		arbiterOID = o.plan.OnConflict.ArbiterIndex.OID
+	}
+	o.specIndexKeys = o.maintainNonArbiterIndexesCapture(tbl, cols, insertedLeaf, ptr, arbiterOID)
+	o.specInsertedLeaf = insertedLeaf
+	return ptr, nil
 }
 
 // trackWrittenPtr records an ItemPointer written in the current statement so
@@ -737,7 +900,7 @@ func (o *upsertOp) trackWrittenPtr(ptr storage.ItemPointer) {
 // (used for the heap write). arbiterRow is in parent column order (used for
 // arbiter key encoding). When they are the same — no partition column
 // remapping needed — pass the same slice for both. M0097-0028.
-func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldPtr storage.ItemPointer, updatedLeaf Row, _ Row) error {
+func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldPtr storage.ItemPointer, updatedLeaf Row, updatedParent Row) error {
 	// Materialise the XID BEFORE stamping xmax so the old tuple gets a
 	// real delete stamp (not InvalidTransactionID). Without this, the old
 	// tuple's xmax=0 would make it appear still-live to subsequent scans.
@@ -768,10 +931,22 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 		o.ctx.CTEWriteFence[newPtr] = struct{}{}
 	}
 	o.trackWrittenPtr(newPtr)
-	// Maintain all unique indexes so non-arbiter unique indexes reflect the
-	// update. M0097-0028: previously only the arbiter was maintained, causing
-	// ON CONFLICT probes via non-arbiter indexes to miss the updated row.
-	maintainUniqueIndexesForInsert(o.ctx, tbl, cols, updatedLeaf, newPtr)
+	// For expression-based arbiters, re-evaluate the arbiter expression for the
+	// updated row (corresponds to PG's btree insert in ExecInsertIndexTuples).
+	// This produces 2 NOTICEs for blurt_and_lock_* expression indexes, mirroring
+	// PG's ExecOnConflictUpdate → ExecUpdate → ExecInsertIndexTuples behavior.
+	if o.plan.OnConflict != nil && o.plan.OnConflict.ArbiterIndex != nil {
+		key, err := encodeArbiterKey(o.ctx, o.plan.OnConflict, o.plan.Table, updatedParent, o.plan.Pos())
+		if err != nil {
+			return err
+		}
+		_ = o.maintainArbiter(key, newPtr)
+		o.maintainNonArbiterIndexesForUpdate(tbl, cols, updatedLeaf, newPtr, o.plan.OnConflict.ArbiterIndex.OID)
+	} else {
+		// No explicit arbiter: maintain all indexes, reusing speculative keys
+		// where the indexed columns are unchanged. M0097-0028 / M0100-0006b.
+		o.maintainNonArbiterIndexesForUpdate(tbl, cols, updatedLeaf, newPtr, 0)
+	}
 	return nil
 }
 
@@ -789,6 +964,258 @@ func (o *upsertOp) maintainArbiter(key []byte, ptr storage.ItemPointer) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	return nil
+}
+
+// maintainNonArbiterIndexesCapture inserts a (key → ptr) entry into every
+// non-arbiter index on tbl and returns the per-index key bytes it computed,
+// keyed by index OID. skipOID is the arbiter index (handled separately by the
+// caller); pass 0 to maintain all indexes. The captured keys let the ON
+// CONFLICT DO UPDATE retry reuse a side-effectful expression index's key
+// without re-evaluating it. Mirrors maintainUniqueIndexesForInsertSkipArbiter
+// but records what it wrote. M0100-0006b.
+func (o *upsertOp) maintainNonArbiterIndexesCapture(tbl *catalog.Table, cols []catalog.Column, row Row, ptr storage.ItemPointer, skipOID uint32) map[uint32][]byte {
+	if o.ctx.Catalog == nil || o.ctx.Pool == nil {
+		return nil
+	}
+	captured := make(map[uint32][]byte)
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		if skipOID != 0 && idx.OID == skipOID {
+			continue
+		}
+		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+		tree, err := btree.Open(o.ctx.Pool, idxRel)
+		if err != nil {
+			continue
+		}
+		key, err := encodeIndexKeyFromCols(idx, cols, row, o.ctx.Catalog)
+		if err != nil || key == nil {
+			key = encodeExprIndexKey(o.ctx, idx, tbl, row)
+			if key == nil {
+				continue
+			}
+		}
+		_ = tree.Insert(key, ptr)
+		captured[idx.OID] = key
+	}
+	return captured
+}
+
+// maintainNonArbiterIndexesForUpdate inserts (key → ptr) entries for the
+// updated row into every non-arbiter index. When an index's key value is
+// provably unchanged from the speculatively-inserted row (cached in
+// o.specIndexKeys), the cached key is reused so a side-effectful expression
+// index (e.g. blurt_and_lock_*) is not re-evaluated — mirroring PG's HOT
+// update, which touches no index when no indexed column changed. Indexes whose
+// referenced columns changed, whose expression we cannot statically analyse, or
+// that were never speculatively inserted are evaluated normally. M0100-0006b.
+func (o *upsertOp) maintainNonArbiterIndexesForUpdate(tbl *catalog.Table, cols []catalog.Column, row Row, ptr storage.ItemPointer, skipOID uint32) {
+	if o.ctx.Catalog == nil || o.ctx.Pool == nil {
+		return
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		if skipOID != 0 && idx.OID == skipOID {
+			continue
+		}
+		idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
+		tree, err := btree.Open(o.ctx.Pool, idxRel)
+		if err != nil {
+			continue
+		}
+		if cached, ok := o.specIndexKeys[idx.OID]; ok && o.indexKeyUnchangedFromSpec(idx, cols, row) {
+			_ = tree.Insert(cached, ptr)
+			continue
+		}
+		key, err := encodeIndexKeyFromCols(idx, cols, row, o.ctx.Catalog)
+		if err != nil || key == nil {
+			key = encodeExprIndexKey(o.ctx, idx, tbl, row)
+			if key == nil {
+				continue
+			}
+		}
+		_ = tree.Insert(key, ptr)
+	}
+}
+
+// indexKeyUnchangedFromSpec reports whether idx's key value is provably the same
+// for the updated row as for the speculatively-inserted row (o.specInsertedLeaf).
+// It is true only when every base column the index references holds an equal
+// Datum in both rows. It returns false conservatively when the speculative row
+// is absent, a referenced column cannot be resolved, or an expression contains
+// an AST node collectExprColumnNames does not understand — in which case the
+// caller re-evaluates the index expression. M0100-0006b.
+func (o *upsertOp) indexKeyUnchangedFromSpec(idx *catalog.Index, cols []catalog.Column, row Row) bool {
+	if o.specInsertedLeaf == nil {
+		return false
+	}
+	refs := make(map[string]struct{})
+	for i, colName := range idx.Columns {
+		if colName != "" {
+			refs[strings.ToLower(colName)] = struct{}{}
+			continue
+		}
+		if i >= len(idx.ColExprs) || idx.ColExprs[i] == nil {
+			return false
+		}
+		if !collectExprColumnNames(*idx.ColExprs[i], refs) {
+			return false
+		}
+	}
+	for name := range refs {
+		ord := -1
+		for j := range cols {
+			if strings.EqualFold(cols[j].Name, name) {
+				ord = j
+				break
+			}
+		}
+		if ord < 0 || ord >= len(row) || ord >= len(o.specInsertedLeaf) {
+			return false
+		}
+		if !datumEquals(row[ord], o.specInsertedLeaf[ord]) {
+			return false
+		}
+	}
+	return true
+}
+
+// collectExprColumnNames walks an index-expression AST and records every
+// base-column name it references (lower-cased) into out. It returns false if it
+// meets a node type it does not understand — a subquery, parameter, or any
+// shape that could hide a column dependency — so the caller conservatively
+// assumes the expression may depend on a changed column. Only the node shapes
+// that can legally appear in an index expression are handled. M0100-0006b.
+func collectExprColumnNames(e parser.Expr, out map[string]struct{}) bool {
+	switch n := e.(type) {
+	case nil:
+		return true
+	case *parser.ColumnRef:
+		out[strings.ToLower(n.Column)] = struct{}{}
+		return true
+	case *parser.IntegerConst, *parser.StringConst, *parser.NumericConst,
+		*parser.NullConst, *parser.BooleanConst, *parser.TypedStringLit,
+		*parser.IntervalLit, *parser.DefaultMarker, *parser.ParamRef:
+		return true
+	case *parser.FuncCall:
+		for i := range n.Args {
+			if !collectExprColumnNames(n.Args[i], out) {
+				return false
+			}
+		}
+		return true
+	case *parser.BinaryOp:
+		return collectExprColumnNames(n.Left, out) && collectExprColumnNames(n.Right, out)
+	case *parser.UnaryOp:
+		return collectExprColumnNames(n.Operand, out)
+	case *parser.CastExpr:
+		return collectExprColumnNames(n.Operand, out)
+	case *parser.CollateExpr:
+		return collectExprColumnNames(n.Operand, out)
+	case *parser.CaseExpr:
+		if !collectExprColumnNames(n.Operand, out) || !collectExprColumnNames(n.Else, out) {
+			return false
+		}
+		for _, w := range n.Whens {
+			if !collectExprColumnNames(w.When, out) || !collectExprColumnNames(w.Then, out) {
+				return false
+			}
+		}
+		return true
+	case *parser.RowExpr:
+		for i := range n.Elems {
+			if !collectExprColumnNames(n.Elems[i], out) {
+				return false
+			}
+		}
+		return true
+	case *parser.ArrayConstructorExpr:
+		for i := range n.Elements {
+			if !collectExprColumnNames(n.Elements[i], out) {
+				return false
+			}
+		}
+		return true
+	case *parser.ArraySubscriptExpr:
+		return collectExprColumnNames(n.Base, out) && collectExprColumnNames(n.Index, out)
+	case *parser.IsNullExpr:
+		return collectExprColumnNames(n.Operand, out)
+	default:
+		return false
+	}
+}
+
+// probeSpeculativeConflict scans the arbiter btree for a live row that is NOT
+// owned by the current transaction. Called after applyInsert to detect concurrent
+// commits that happened during Phase B's blocking window. Returns (ptr, row, true)
+// if a conflict is found; (zero, nil, false) otherwise.
+func (o *upsertOp) probeSpeculativeConflict(rel storage.RelFileNode, cols []catalog.Column, key []byte, selfXID storage.TransactionID) (storage.ItemPointer, Row, bool, error) {
+	if o.arbiterTree == nil || key == nil {
+		return storage.ItemPointer{}, nil, false, nil
+	}
+	var (
+		foundPtr storage.ItemPointer
+		foundRow Row
+		found    bool
+	)
+	scanErr := o.arbiterTree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
+		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+		if err != nil {
+			return false, err
+		}
+		slot.RLock()
+		tuple, err := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+		slot.RUnlock()
+		o.ctx.Pool.Unpin(slot)
+		if err != nil {
+			if errors.Is(err, storage.ErrUnsupportedItem) {
+				return true, nil
+			}
+			return false, err
+		}
+		// Skip our own speculatively-inserted row.
+		if selfXID != storage.InvalidTransactionID && tuple.Header.Xmin == selfXID {
+			return true, nil
+		}
+		if !isLiveForUniqueCheck(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax) {
+			return true, nil
+		}
+		row, err := DecodeHeapTupleRow(cols, tuple, nil)
+		if err != nil {
+			return false, err
+		}
+		foundPtr = ptr
+		foundRow = row
+		found = true
+		return false, nil
+	})
+	if scanErr != nil {
+		return storage.ItemPointer{}, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: scanErr.Error()}
+	}
+	return foundPtr, foundRow, found, nil
+}
+
+// cancelSpeculativeRow stamps xmax=selfXID on a speculatively-inserted heap row,
+// making it dead to subsequent scans. Called when a post-insert speculative conflict
+// is detected and the new row must be discarded in favour of DO UPDATE / DO NOTHING.
+func (o *upsertOp) cancelSpeculativeRow(rel storage.RelFileNode, ptr storage.ItemPointer) error {
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	pinned, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+	if err != nil {
+		return err
+	}
+	pinned.Lock()
+	serr := storage.PageSetHeapTupleXmax(pinned.Page(), ptr.Offset, o.ctx.Tx.XID)
+	var derr error
+	if serr == nil {
+		derr = markHeapDeleteDirty(o.ctx.Pool, pinned, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, nil)
+	}
+	pinned.Unlock()
+	o.ctx.Pool.Unpin(pinned)
+	if serr != nil {
+		return serr
+	}
+	return derr
 }
 
 func (o *upsertOp) maintainArbiterRow(row Row, ptr storage.ItemPointer) error {

@@ -1,7 +1,8 @@
 # Milestone 0100 — RC Isolation-Test Suite: Runtime Correctness Closure & 21-Spec Pass
 
-**Status:** in-progress
+**Status:** accepted
 **Filed:** 2026-05-13
+**Accepted:** 2026-06-13 — all 23 dedicated `TestPort_Isolation*` functions PASS (0 FAIL / 0 SKIP) on buildable HEAD; pgbench-S = 48,984 TPS at -c 10 (≥ 2,000 DoD bar); design docs 0100-0001..-0004 accepted.
 **Depends on:** M0060 (oracle test-port foundation), M0096-0001..-0012 (feature surface for 21 RC isolation specs)
 **Closes:** M0096-0005 (ON CONFLICT executor correctness — wait-state propagation), M0096-0013 (E2E pass confirmation for all 21 dedicated RC isolation tests)
 **Reference plan:** `.ralph/fix_plan.md` (M0100 section)
@@ -60,6 +61,31 @@ under the M0100 heading. Summary:
 - `docs/test-port/executable-isolation-tests.md` lists all 21 specs as `port`.
 - `.ralph/fix_plan.md` shows M0096-0005 and M0096-0013 as `[x]` with the
   "closed via M0100-…" cross-reference note.
+
+### DoD reconciliation (2026-06-13, acceptance)
+
+- **Design docs (0100-0001..-0004):** all `accepted` (verified).
+- **Isolation run:** `go test -v -run TestPort_Isolation … ./internal/testport/`
+  → all 23 dedicated `TestPort_Isolation*` PASS, 0 FAIL / 0 SKIP
+  (`tmp/perf-optimize/isolation-m0100-verbose.log`, 127.8 s). The 121 `defer`
+  lines belong to the aggregate `TestPort_IsolationSuite` (D-002, separate
+  unlock condition), not to the dedicated functions.
+- **pgbench-S ≥ 2,000 TPS:** `pgbench -S -c 10 -j 10 -T 30` → **48,984 TPS**,
+  0 failed (scale 10, capped server on :5533). Clears the bar and the M0093
+  2,740 baseline.
+- **`gofmt -l .` / `go vet`:** `go vet ./internal/executor/` clean. The M0100
+  touched files are gofmt-clean; a repo-wide `gofmt -l` is non-empty due to
+  pre-existing unformatted files unrelated to this milestone (e.g.
+  `internal/access/btree/*`, `internal/executor/operators_storage.go`) — not in
+  M0100 scope.
+- **`executable-isolation-tests.md` → port:** that doc is a *candidate listing*
+  with **no `status` column**, so the "flip defer→port" instruction is stale and
+  non-actionable there. The canonical suite status lives in
+  `docs/test-port/postgres-oracle-port-status.csv` (row D-002), which remains
+  `status=port, pass_required=no` pending auto-permutation generation of upstream
+  spec files in the runner — a broader condition than the 21 dedicated RC tests
+  and outside M0100's scope. The dedicated 21-spec deliverable is fully met by
+  the dedicated test functions above.
 
 ## Out of scope
 

@@ -126,7 +126,7 @@ When the agent begins work on a milestone, it must update the status field at th
 | 0096 | RC isolation-test suite: feature implementation & spec pass | in-progress | `0096-rc-isolation-suite-feature-implementation-and-spec-pass.md` |
 | 0097 | pg_regress coverage: feature parity & test pass | in-progress | `0097-pg-regress-coverage-feature-parity-and-test-pass.md` |
 | 0099 | M0098 remaining-work closure & target validation | planned | `0099-m0098-remaining-work-target-validation.md` |
-| 0100 | RC isolation-test suite: runtime correctness closure & 21-spec pass (closes M0096-0005, M0096-0013) | in-progress | `0100-rc-isolation-runtime-correctness-and-spec-pass.md` |
+| 0100 | RC isolation-test suite: runtime correctness closure & 21-spec pass (closes M0096-0005, M0096-0013) | accepted — all 23 dedicated `TestPort_Isolation*` PASS (0 FAIL/SKIP); pgbench-S 48,984 TPS at -c 10 (≥ 2,000 bar) | `0100-rc-isolation-runtime-correctness-and-spec-pass.md` |
 | 0101 | WAL pg_waldump compatibility: enable PG-compatible format by default (implements M0014) | accepted | `0101-wal-pg-waldump-compatibility.md` |
 | 0102 | Heterogeneous streaming-replication + SIGKILL-failover E2E (PG↔goopg, sync + async) | accepted | `0102-heterogeneous-replication-failover-e2e.md` |
 | 0103 | Heterogeneous logical-replication + SIGKILL-failover E2E (PG↔goopg, sync + async) | accepted | `0103-heterogeneous-logical-replication-failover-e2e.md` |

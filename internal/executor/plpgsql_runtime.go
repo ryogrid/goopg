@@ -2456,7 +2456,7 @@ func evalRaiseMsg(rawMsg string, frame *plpgsqlFrame, ctx *Context) string {
 			continue
 		}
 		if val.IsNull() {
-			argVals = append(argVals, "")
+			argVals = append(argVals, "<NULL>")
 		} else {
 			argVals = append(argVals, val.Format())
 		}

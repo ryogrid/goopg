@@ -116,7 +116,7 @@ func TestBulkCreateDeduplication(t *testing.T) {
 	// 500 entries each = 3500 total.
 	const numKeys = 7
 	const perKey = 1000 // 1000 TIDs per key → each posting item ≈6 KB = 1 leaf page
-	const padTo = 29   // 29 chars + 0x00 terminator = 30 bytes ≤ MaxHighKeyLen=256
+	const padTo = 29    // 29 chars + 0x00 terminator = 30 bytes ≤ MaxHighKeyLen=256
 	baseKeys := []string{"AIR", "MAIL", "RAIL", "REGAIR", "SHIP", "TRUCK", "FOB"}
 
 	padKey := func(s string) []byte {
@@ -331,5 +331,86 @@ func TestPostingKeyOf(t *testing.T) {
 	got := postingKeyOf(raw)
 	if string(got) != string(key) {
 		t.Errorf("postingKeyOf: want %q got %q", key, got)
+	}
+}
+
+// TestPageItemKeys verifies PageItemKeys returns one separator key per physical
+// line pointer in slot order, collapsing a posting-list item (many TIDs, one
+// shared key) to its single key rather than expanding it per TID — the behaviour
+// the amcheck item-order tier relies on.
+func TestPageItemKeys(t *testing.T) {
+	p := make(storage.Page, storage.BlockSize)
+	initPage(p, BTPageOpaque{Prev: storage.InvalidBlockNumber, Next: storage.InvalidBlockNumber, Flags: BTLeaf})
+
+	// Slot 1: regular single-TID item, key = int4(1).
+	reg := item{keyLen: uint16(len(EncodeInt4(1))), ptr: storage.ItemPointer{Block: 0, Offset: 1}, key: EncodeInt4(1)}
+	if _, err := storage.PageAddItemRaw(p, reg.marshal()); err != nil {
+		t.Fatalf("add regular: %v", err)
+	}
+	// Slot 2: posting item, key = int4(2), three TIDs — must collapse to one key.
+	post := marshalPosting(EncodeInt4(2), []storage.ItemPointer{
+		{Block: 0, Offset: 2}, {Block: 0, Offset: 3}, {Block: 1, Offset: 1},
+	})
+	if _, err := storage.PageAddItemRaw(p, post); err != nil {
+		t.Fatalf("add posting: %v", err)
+	}
+
+	keys, err := PageItemKeys(p)
+	if err != nil {
+		t.Fatalf("PageItemKeys: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("PageItemKeys returned %d keys, want 2 (posting collapses to one key)", len(keys))
+	}
+	if CompareKeys(keys[0], EncodeInt4(1)) != 0 {
+		t.Errorf("slot 1 key mismatch: got %x want %x", keys[0], EncodeInt4(1))
+	}
+	if CompareKeys(keys[1], EncodeInt4(2)) != 0 {
+		t.Errorf("slot 2 posting key mismatch: got %x want %x", keys[1], EncodeInt4(2))
+	}
+}
+
+// TestPageLeafEntries verifies PageLeafEntries returns one (key, heap TID) entry
+// per heap TID — unlike PageItemKeys it EXPANDS a posting-list item to one entry
+// per TID, the behaviour amcheck's heapallindexed tier relies on to fingerprint
+// every heap row the index references (verify_nbtree.c's bt_posting_plain_tuple).
+func TestPageLeafEntries(t *testing.T) {
+	p := make(storage.Page, storage.BlockSize)
+	initPage(p, BTPageOpaque{Prev: storage.InvalidBlockNumber, Next: storage.InvalidBlockNumber, Flags: BTLeaf})
+
+	// Slot 1: regular single-TID item, key = int4(1), TID = (0,1).
+	regTID := storage.ItemPointer{Block: 0, Offset: 1}
+	reg := item{keyLen: uint16(len(EncodeInt4(1))), ptr: regTID, key: EncodeInt4(1)}
+	if _, err := storage.PageAddItemRaw(p, reg.marshal()); err != nil {
+		t.Fatalf("add regular: %v", err)
+	}
+	// Slot 2: posting item, key = int4(2), three TIDs — must expand to three.
+	postTIDs := []storage.ItemPointer{{Block: 0, Offset: 2}, {Block: 0, Offset: 3}, {Block: 1, Offset: 1}}
+	if _, err := storage.PageAddItemRaw(p, marshalPosting(EncodeInt4(2), postTIDs)); err != nil {
+		t.Fatalf("add posting: %v", err)
+	}
+
+	entries, err := PageLeafEntries(p)
+	if err != nil {
+		t.Fatalf("PageLeafEntries: %v", err)
+	}
+	// 1 plain + 3 posting TIDs = 4 expanded entries.
+	if len(entries) != 4 {
+		t.Fatalf("PageLeafEntries returned %d entries, want 4 (posting expanded per TID)", len(entries))
+	}
+
+	// Slot 1 entry.
+	if CompareKeys(entries[0].Key, EncodeInt4(1)) != 0 || entries[0].TID != regTID {
+		t.Errorf("entry 0 = (%x, %v), want (%x, %v)", entries[0].Key, entries[0].TID, EncodeInt4(1), regTID)
+	}
+	// The three posting entries share key int4(2) and carry the TIDs in order.
+	for i, tid := range postTIDs {
+		e := entries[1+i]
+		if CompareKeys(e.Key, EncodeInt4(2)) != 0 {
+			t.Errorf("posting entry %d key = %x, want %x", i, e.Key, EncodeInt4(2))
+		}
+		if e.TID != tid {
+			t.Errorf("posting entry %d TID = %v, want %v", i, e.TID, tid)
+		}
 	}
 }

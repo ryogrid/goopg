@@ -110,10 +110,108 @@ func notImplemented(name string, fs *flag.FlagSet, args []string, stderr io.Writ
 	return 1
 }
 
+// gucFlag collects repeated -c/--set NAME=VALUE options for `goopg init`,
+// mirroring upstream initdb's -c/--set (initdb.c case 'c'). A value lacking
+// an '=' is recorded as an error and surfaced after parsing, matching
+// initdb's "-c %s requires a value".
+type gucFlag struct {
+	settings []initdb.GUCSetting
+	err      string
+}
+
+func (g *gucFlag) String() string { return "" }
+
+func (g *gucFlag) Set(v string) error {
+	name, value, ok := strings.Cut(v, "=")
+	if !ok {
+		// Defer reporting so the error message matches initdb's wording
+		// and we don't abort flag parsing mid-stream.
+		g.err = fmt.Sprintf("-c %s requires a value", v)
+		return nil
+	}
+	g.settings = append(g.settings, initdb.GUCSetting{Name: name, Value: value})
+	return nil
+}
+
 func runInit(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dataDir := fs.String("D", "", "data directory to initialize (required)")
+	// Bootstrap superuser name (upstream initdb -U/--username). Both the
+	// short and long forms bind to the same variable; empty means the
+	// initdb default ("postgres").
+	username := fs.String("U", "", "name of the bootstrap superuser (default \"postgres\")")
+	fs.StringVar(username, "username", "", "name of the bootstrap superuser (default \"postgres\")")
+	// External WAL directory (upstream initdb -X/--waldir). Both forms
+	// bind to the same variable; empty means pg_wal lives under -D.
+	walDir := fs.String("X", "", "location for the write-ahead log directory (absolute path)")
+	fs.StringVar(walDir, "waldir", "", "location for the write-ahead log directory (absolute path)")
+	// Fsync control (upstream initdb -N/--no-sync and -S/--sync-only).
+	// Both forms of each option bind to the same variable.
+	noSync := fs.Bool("N", false, "do not wait for changes to be written safely to disk")
+	fs.BoolVar(noSync, "no-sync", false, "do not wait for changes to be written safely to disk")
+	syncOnly := fs.Bool("S", false, "only sync an existing data directory to disk, then exit")
+	fs.BoolVar(syncOnly, "sync-only", false, "only sync an existing data directory to disk, then exit")
+	// Sync method + data-file exclusion (upstream initdb --sync-method and
+	// --no-sync-data-files). --sync-method accepts "fsync" (default) or
+	// "syncfs"; --no-sync-data-files skips the base/ subtree. Both are
+	// long-form only, matching upstream (no short forms).
+	syncMethod := fs.String("sync-method", "", "set method for syncing files to disk (fsync or syncfs)")
+	noSyncDataFiles := fs.Bool("no-sync-data-files", false, "do not sync files within database directories")
+	// Default text search configuration (upstream initdb -T/--text-search-config).
+	// Both forms bind to the same variable; empty leaves the template default.
+	tsConfig := fs.String("T", "", "default text search configuration")
+	fs.StringVar(tsConfig, "text-search-config", "", "default text search configuration")
+	// Default database encoding (upstream initdb -E/--encoding). Both forms
+	// bind to the same variable; empty means the default (UTF8).
+	encoding := fs.String("E", "", "set default encoding for new databases")
+	fs.StringVar(encoding, "encoding", "", "set default encoding for new databases")
+	// Group access (upstream initdb -g/--allow-group-access). Both forms
+	// bind to the same variable; relaxes the cluster to mode 0750/0640.
+	allowGroupAccess := fs.Bool("g", false, "allow group read/execute on the data directory")
+	fs.BoolVar(allowGroupAccess, "allow-group-access", false, "allow group read/execute on the data directory")
+	// Data-page checksums (upstream initdb -k/--data-checksums and its
+	// negation --no-data-checksums). -k/--data-checksums stamps a pd_checksum
+	// into every data page and sets pg_control's data_checksum_version=1.
+	// Matching upstream PG 18 (commit 04bec894 made initdb default to data
+	// checksums ON), goopg now defaults ON: both validation gates passed —
+	// gate (a) crash-recovery/FPI replay and gate (b) cross-impl standby read
+	// (a checksummed goopg primary streaming to a real PG standby that verifies
+	// pd_checksum byte-for-byte) — see M0102-0010 / docs/design/0102-0019.
+	// --no-data-checksums disables and overrides -k.
+	dataChecksums := fs.Bool("k", true, "use data page checksums")
+	fs.BoolVar(dataChecksums, "data-checksums", true, "use data page checksums")
+	noDataChecksums := fs.Bool("no-data-checksums", false, "do not use data page checksums")
+	// Authentication methods written into pg_hba.conf (upstream initdb
+	// -A/--auth, --auth-host, --auth-local) and the superuser password file
+	// (--pwfile). -A/--auth sets both host and local; the per-side flags
+	// override one side. Empty defaults to "trust".
+	authMethod := fs.String("A", "", "default authentication method for local and host connections")
+	fs.StringVar(authMethod, "auth", "", "default authentication method for local and host connections")
+	authHost := fs.String("auth-host", "", "authentication method for local TCP/IP connections")
+	authLocal := fs.String("auth-local", "", "authentication method for local-socket connections")
+	pwFile := fs.String("pwfile", "", "read password for the new superuser from file")
+	// Locale provider + locale settings (upstream initdb --locale-provider,
+	// --locale, --lc-*, --builtin-locale, --icu-locale, --icu-rules). All are
+	// long-form only, matching upstream (no short forms). goopg runs with a
+	// fixed C/UTF8 locale, so these affect the on-disk pg_database catalog
+	// (datlocprovider/datcollate/datctype/datlocale) and the seeded lc_* GUCs.
+	localeProvider := fs.String("locale-provider", "", "set default locale provider for new databases (libc or builtin)")
+	locale := fs.String("locale", "", "set default locale for new databases")
+	lcCollate := fs.String("lc-collate", "", "set default locale for string sorting")
+	lcCtype := fs.String("lc-ctype", "", "set default locale for character classification")
+	lcMessages := fs.String("lc-messages", "", "set default locale for message display")
+	lcMonetary := fs.String("lc-monetary", "", "set default locale for monetary formatting")
+	lcNumeric := fs.String("lc-numeric", "", "set default locale for number formatting")
+	lcTime := fs.String("lc-time", "", "set default locale for time formatting")
+	builtinLocale := fs.String("builtin-locale", "", "set builtin provider locale for new databases")
+	icuLocale := fs.String("icu-locale", "", "set ICU locale ID for new databases")
+	icuRules := fs.String("icu-rules", "", "set additional ICU collation rules for new databases")
+	// GUC overrides seeded into postgresql.conf (upstream initdb -c/--set).
+	// Repeatable; each value is NAME=VALUE.
+	var extraGUC gucFlag
+	fs.Var(&extraGUC, "c", "set NAME=VALUE in generated postgresql.conf (may be repeated)")
+	fs.Var(&extraGUC, "set", "set NAME=VALUE in generated postgresql.conf (may be repeated)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -121,11 +219,31 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "goopg init: -D <data-directory> is required")
 		return 2
 	}
-	if err := initdb.Init(initdb.Options{DataDir: *dataDir}); err != nil {
+	if extraGUC.err != "" {
+		fmt.Fprintf(stderr, "goopg init: %s\n", extraGUC.err)
+		return 2
+	}
+	// -A/--auth sets both host and local; the per-side flags override one
+	// side (matching upstream initdb's option handling).
+	resolvedAuthHost, resolvedAuthLocal := *authMethod, *authMethod
+	if *authHost != "" {
+		resolvedAuthHost = *authHost
+	}
+	if *authLocal != "" {
+		resolvedAuthLocal = *authLocal
+	}
+	// -k/--data-checksums enables; --no-data-checksums overrides it back off
+	// (and is the current goopg default).
+	useDataChecksums := *dataChecksums && !*noDataChecksums
+	if err := initdb.Init(initdb.Options{DataDir: *dataDir, SuperuserName: *username, WALDir: *walDir, NoSync: *noSync, SyncOnly: *syncOnly, SyncMethod: *syncMethod, NoSyncDataFiles: *noSyncDataFiles, TextSearchConfig: *tsConfig, Encoding: *encoding, AllowGroupAccess: *allowGroupAccess, DataChecksums: useDataChecksums, AuthMethodHost: resolvedAuthHost, AuthMethodLocal: resolvedAuthLocal, PwFile: *pwFile, ExtraGUC: extraGUC.settings, LocaleProvider: *localeProvider, Locale: *locale, LCCollate: *lcCollate, LCCtype: *lcCtype, LCMessages: *lcMessages, LCMonetary: *lcMonetary, LCNumeric: *lcNumeric, LCTime: *lcTime, BuiltinLocale: *builtinLocale, ICULocale: *icuLocale, ICURules: *icuRules}); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "goopg init: created data directory at %s\n", *dataDir)
+	if *syncOnly {
+		fmt.Fprintf(stdout, "goopg init: synced data directory at %s\n", *dataDir)
+	} else {
+		fmt.Fprintf(stdout, "goopg init: created data directory at %s\n", *dataDir)
+	}
 	return 0
 }
 
@@ -394,6 +512,17 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.VM = rt.VM
 		cfg.Checkpointer = rt.Checkpointer
 		cfg.Slots = rt.Slots
+		// M0110-0004 / RW-002 b: `goopg stop -mode immediate` arrives as the
+		// control-plane STOPIMMEDIATE command. Flag the runtime so the
+		// deferred rt.Close() above skips its final shutdown checkpoint,
+		// leaving pg_control at DB_IN_PRODUCTION (an unclean cluster). This
+		// reproduces upstream's immediate (SIGQUIT) shutdown for pg_resetwal
+		// /pg_rewind/pg_controldata compatibility; the pidfile is still
+		// removed by the normal control-plane teardown.
+		cfg.OnStopImmediate = func() error {
+			rt.SetImmediateShutdown()
+			return nil
+		}
 		// M0102-0007: report the cluster's real system_identifier in
 		// IDENTIFY_SYSTEM so a PG standby's walreceiver can verify
 		// the primary's identity against its own pg_control.
@@ -873,7 +1002,7 @@ func runStop(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dataDir := fs.String("D", "", "data directory of the server to stop (required)")
-	mode := fs.String("mode", "fast", "shutdown mode: smart|fast|immediate (v0 treats all three as graceful)")
+	mode := fs.String("mode", "fast", "shutdown mode: smart|fast (graceful, DB_SHUTDOWNED) | immediate (no checkpoint, DB_IN_PRODUCTION)")
 	timeoutSec := fs.Int("t", 30, "seconds to wait for shutdown to complete")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -891,10 +1020,17 @@ func runStop(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "goopg stop: %v\n", err)
 		return 1
 	}
-	// v0 collapses smart/fast/immediate onto the same graceful
-	// path; the flag is preserved so future loops can split them.
-	_ = *mode
-	reply, err := control.Send(pf.SocketPath, "STOP", time.Duration(*timeoutSec)*time.Second)
+	// smart/fast both run a graceful shutdown (final checkpoint →
+	// pg_control State = DB_SHUTDOWNED). immediate skips the shutdown
+	// checkpoint so the cluster is left at DB_IN_PRODUCTION (recovered via
+	// WAL replay on the next start), mirroring upstream's immediate
+	// (SIGQUIT) shutdown — see runStart's cfg.OnStopImmediate wiring and
+	// the control-plane STOPIMMEDIATE handler. (M0110-0004 / RW-002 b.)
+	stopCmd := "STOP"
+	if strings.EqualFold(*mode, "immediate") {
+		stopCmd = "STOPIMMEDIATE"
+	}
+	reply, err := control.Send(pf.SocketPath, stopCmd, time.Duration(*timeoutSec)*time.Second)
 	if err != nil {
 		fmt.Fprintf(stderr, "goopg stop: %v\n", err)
 		return 1

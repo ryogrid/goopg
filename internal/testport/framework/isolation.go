@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -15,6 +16,33 @@ type IsolationStep struct {
 	Name    string
 	Session string
 	SQL     string
+}
+
+// BlockerKind classifies a permutation-step completion blocker, mirroring the
+// parenthesised markers documented in postgres/src/test/isolation/README.
+// A blocker only delays *reporting* a step as completed; it never delays the
+// launch of a step.
+type BlockerKind int
+
+const (
+	// BlockerStepComplete delays the annotated step's completion report until
+	// the referenced step has completed. Marker form: "<other step name>".
+	BlockerStepComplete BlockerKind = iota
+	// BlockerNotices delays the annotated step's completion report until the
+	// referenced step's session has emitted at least Count NOTICE messages,
+	// counted from when the annotated step is launched. Marker form:
+	// "<other step name> notices <n>".
+	BlockerNotices
+	// BlockerStar forces the annotated step to be reported as waiting as soon
+	// as it is launched, regardless of later detection. Marker form: "*".
+	BlockerStar
+)
+
+// StepBlocker is one parenthesised marker attached to a permutation step.
+type StepBlocker struct {
+	Kind     BlockerKind
+	StepName string // referenced step name (empty for BlockerStar)
+	Count    int    // NOTICE threshold (BlockerNotices only)
 }
 
 type IsolationSpec struct {
@@ -27,6 +55,11 @@ type IsolationSpec struct {
 	Steps            map[string]IsolationStep
 	StepOrder        []string          // step names in declaration order (for "unused step" warnings)
 	Permutations     [][]string
+	// PermutationBlockers is parallel to Permutations: PermutationBlockers[p][i]
+	// holds the completion blockers attached to Permutations[p][i]. Steps with
+	// no markers have a nil slice. Always the same outer/inner length as
+	// Permutations so it can be indexed in lockstep.
+	PermutationBlockers [][][]StepBlocker
 }
 
 type IsolationStepResult struct {
@@ -46,7 +79,6 @@ var (
 	reStepStart    = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*\{(.*)$`)
 	reStepNoBlock  = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*$`)
 	rePermutation  = regexp.MustCompile(`^permutation(?:\s+(.+))?$`)
-	reQuotedTokens = regexp.MustCompile(`"([^"]+)"`)
 )
 
 // DiscoverIsolationSpecs returns all upstream isolation .spec files.
@@ -220,7 +252,10 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 
 		// permutation — may span multiple lines; continuation lines are indented
 		if m := rePermutation.FindStringSubmatch(line); len(m) == 2 {
-			tokens := parsePermutationTokens(m[1])
+			rawParts := make([]string, 0, 4)
+			if strings.TrimSpace(m[1]) != "" {
+				rawParts = append(rawParts, m[1])
+			}
 			// Read continuation lines (indented lines with only step names).
 			for {
 				nextRaw, ok2 := nextLine()
@@ -247,9 +282,13 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 					// Blank line or indented comment-only line — skip.
 					continue
 				}
-				tokens = append(tokens, parsePermutationTokens(stripped)...)
+				rawParts = append(rawParts, stripped)
 			}
-			s.Permutations = append(s.Permutations, tokens)
+			// Parse the joined permutation body in one pass so parenthesised
+			// markers can attach to the preceding step even across line breaks.
+			steps, blockers := parsePermutation(strings.Join(rawParts, " "))
+			s.Permutations = append(s.Permutations, steps)
+			s.PermutationBlockers = append(s.PermutationBlockers, blockers)
 			continue
 		}
 	}
@@ -387,37 +426,112 @@ func inferSession(stepName string, sessions []string, currentSession string) str
 	return "session1"
 }
 
-func parsePermutationTokens(raw string) []string {
-	quoted := reQuotedTokens.FindAllStringSubmatch(raw, -1)
-	if len(quoted) > 0 {
-		out := make([]string, 0, len(quoted))
-		for _, q := range quoted {
-			out = append(out, q[1])
+// permTokenize splits a (comment-stripped, possibly multi-line) permutation
+// body into tokens. Double-quoted identifiers are returned without their
+// quotes as a single token; the punctuation characters '(', ')' and ',' are
+// each returned as standalone tokens; all other runs of non-space,
+// non-punctuation characters form bareword tokens. This char-level scan
+// handles glued forms such as "mystep(*)".
+func permTokenize(raw string) []string {
+	var toks []string
+	var cur strings.Builder
+	inQuote := false
+	flush := func() {
+		if cur.Len() > 0 {
+			toks = append(toks, cur.String())
+			cur.Reset()
 		}
-		return out
 	}
-	fields := strings.Fields(raw)
-	out := make([]string, 0, len(fields))
-	inAnnotation := false
-	for _, f := range fields {
-		f = strings.TrimSpace(strings.Trim(f, `"`))
-		if f == "" {
-			continue
-		}
-		// Skip (step notices N) and other parenthesised annotations.
-		// An annotation begins when a token starts with '(' and ends
-		// when a token ends with ')'. PG isolationtester ignores these
-		// annotations (they control the test harness, not the runner).
-		if strings.HasPrefix(f, "(") {
-			inAnnotation = true
-		}
-		if inAnnotation {
-			if strings.HasSuffix(f, ")") {
-				inAnnotation = false
+	for _, r := range raw {
+		switch {
+		case inQuote:
+			if r == '"' {
+				toks = append(toks, cur.String())
+				cur.Reset()
+				inQuote = false
+			} else {
+				cur.WriteRune(r)
 			}
-			continue
+		case r == '"':
+			flush()
+			inQuote = true
+		case r == '(' || r == ')' || r == ',':
+			flush()
+			toks = append(toks, string(r))
+		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
+			flush()
+		default:
+			cur.WriteRune(r)
 		}
-		out = append(out, f)
 	}
-	return out
+	flush()
+	return toks
+}
+
+// parsePermutation parses a permutation body into the ordered list of step
+// names and a parallel slice of per-step completion blockers. Parenthesised
+// markers attach to the most recently seen step, matching PostgreSQL
+// isolationtester semantics (postgres/src/test/isolation/README). The returned
+// slices always have equal length; steps without markers carry a nil slice.
+func parsePermutation(raw string) ([]string, [][]StepBlocker) {
+	toks := permTokenize(raw)
+	steps := make([]string, 0, len(toks))
+	blockers := make([][]StepBlocker, 0, len(toks))
+	for i := 0; i < len(toks); {
+		t := toks[i]
+		switch t {
+		case "(":
+			grp, next := parseBlockerGroup(toks, i+1)
+			if n := len(steps); n > 0 && len(grp) > 0 {
+				blockers[n-1] = append(blockers[n-1], grp...)
+			}
+			i = next
+		case ")", ",":
+			i++
+		default:
+			steps = append(steps, t)
+			blockers = append(blockers, nil)
+			i++
+		}
+	}
+	return steps, blockers
+}
+
+// parseBlockerGroup parses comma-separated markers beginning just after '('
+// until the matching ')'. It returns the parsed blockers and the index just
+// past the ')'. Recognised markers are "*", "<step>", and
+// "<step> notices <n>"; unrecognised marker shapes are ignored.
+func parseBlockerGroup(toks []string, start int) ([]StepBlocker, int) {
+	var out []StepBlocker
+	var marker []string
+	emit := func() {
+		switch {
+		case len(marker) == 0:
+			// nothing
+		case len(marker) == 1 && marker[0] == "*":
+			out = append(out, StepBlocker{Kind: BlockerStar})
+		case len(marker) == 3 && marker[1] == "notices":
+			if n, err := strconv.Atoi(marker[2]); err == nil && n > 0 {
+				out = append(out, StepBlocker{Kind: BlockerNotices, StepName: marker[0], Count: n})
+			}
+		case len(marker) == 1:
+			out = append(out, StepBlocker{Kind: BlockerStepComplete, StepName: marker[0]})
+		}
+		marker = marker[:0]
+	}
+	i := start
+	for i < len(toks) {
+		switch toks[i] {
+		case ")":
+			emit()
+			return out, i + 1
+		case ",":
+			emit()
+		default:
+			marker = append(marker, toks[i])
+		}
+		i++
+	}
+	emit()
+	return out, i
 }

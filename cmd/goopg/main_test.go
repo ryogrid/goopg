@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/control"
 )
 
 // TestNoArgsPrintsUsage guards the contract from
@@ -107,6 +109,332 @@ func TestInitCommandRequiresD(t *testing.T) {
 	if !strings.Contains(stderr.String(), "-D") {
 		t.Errorf("stderr=%q want a -D diagnostic", stderr.String())
 	}
+}
+
+// TestInitCommandSeedsGUCs drives the full 001_initdb.pl "successful
+// creation" option set through the CLI: --no-sync --text-search-config
+// german --set default_text_search_config=german. The -c override must
+// win, leaving an unquoted 'german' in postgresql.conf.
+func TestInitCommandSeedsGUCs(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"init", "-D", dir, "--no-sync",
+		"--text-search-config", "german",
+		"--set", "default_text_search_config=german",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "postgresql.conf"))
+	if err != nil {
+		t.Fatalf("read postgresql.conf: %v", err)
+	}
+	if !strings.Contains(string(data), "\ndefault_text_search_config = german") {
+		t.Errorf("postgresql.conf missing seeded default_text_search_config; got:\n%s",
+			grepLines(string(data), "default_text_search_config"))
+	}
+}
+
+// TestInitCommandSetRequiresValue: a --set without '=' exits 2 with
+// initdb's "requires a value" wording, and lays out nothing.
+func TestInitCommandSetRequiresValue(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"init", "-D", dir, "--set", "bogus"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit=%d, want 2 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "requires a value") {
+		t.Errorf("stderr=%q want a 'requires a value' diagnostic", stderr.String())
+	}
+}
+
+// TestInitCommandAllowGroupAccess drives 001_initdb.pl's "successful creation
+// with group access" through the CLI (initdb --allow-group-access <dir>) and
+// asserts the resulting cluster satisfies check_mode_recursive(0750, 0640):
+// every directory 0750, every file 0640, plus the seeded log_file_mode.
+func TestInitCommandAllowGroupAccess(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data_group")
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"init", "-D", dir, "--allow-group-access"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+	}
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case d.IsDir():
+			if got := info.Mode().Perm(); got != 0o750 {
+				t.Errorf("dir %q mode = %04o, want 0750", p, got)
+			}
+		case info.Mode().IsRegular():
+			if got := info.Mode().Perm(); got != 0o640 {
+				t.Errorf("file %q mode = %04o, want 0640", p, got)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "postgresql.conf"))
+	if err != nil {
+		t.Fatalf("read postgresql.conf: %v", err)
+	}
+	if !strings.Contains(string(data), "log_file_mode = 0640") {
+		t.Errorf("postgresql.conf missing seeded `log_file_mode = 0640`; got:\n%s",
+			grepLines(string(data), "log_file_mode"))
+	}
+}
+
+// TestInitCommandDataChecksums drives the -k/--data-checksums and
+// --no-data-checksums flags (upstream initdb -k) through the CLI and asserts
+// pg_control's data_checksum_version reflects the requested mode.
+// --no-data-checksums (the current goopg default) overrides -k.
+func TestInitCommandDataChecksums(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantVers uint32
+	}{
+		{"default-off", []string{}, 0},
+		{"k-short", []string{"-k"}, 1},
+		{"long", []string{"--data-checksums"}, 1},
+		{"no-data-checksums", []string{"--no-data-checksums"}, 0},
+		{"no-overrides-k", []string{"-k", "--no-data-checksums"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "data")
+			var stdout, stderr bytes.Buffer
+			args := append([]string{"init", "-D", dir, "--no-sync"}, tc.args...)
+			if code := run(args, &stdout, &stderr); code != 0 {
+				t.Fatalf("exit=%d stderr=%q", code, stderr.String())
+			}
+			ctrl, err := control.ReadControlFile(dir)
+			if err != nil {
+				t.Fatalf("ReadControlFile: %v", err)
+			}
+			if ctrl.DataChecksumVersion != tc.wantVers {
+				t.Fatalf("data_checksum_version = %d, want %d", ctrl.DataChecksumVersion, tc.wantVers)
+			}
+		})
+	}
+}
+
+// TestInitCommandSyncMethodAndNoSyncDataFiles drives 001_initdb.pl's
+// `initdb --sync-only [--no-sync-data-files] [--sync-method=syncfs]` tier
+// through the CLI: a previously laid-out cluster is re-synced via each
+// option and must exit 0. A bogus --sync-method exits 1 with the
+// "unrecognized sync method" diagnostic.
+func TestInitCommandSyncMethodAndNoSyncDataFiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	var stdout, stderr bytes.Buffer
+	// Lay out a cluster first (no fsync for speed).
+	if code := run([]string{"init", "-D", dir, "--no-sync"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("initial init exit=%d stderr=%q", code, stderr.String())
+	}
+
+	// --sync-only --no-sync-data-files (skips the base/ subtree).
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"init", "-D", dir, "--sync-only", "--no-sync-data-files"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("--sync-only --no-sync-data-files exit=%d stderr=%q", code, stderr.String())
+	}
+
+	// --sync-only --sync-method=syncfs (Linux only).
+	stdout.Reset()
+	stderr.Reset()
+	code := run([]string{"init", "-D", dir, "--sync-only", "--sync-method", "syncfs"}, &stdout, &stderr)
+	if runtime.GOOS == "linux" {
+		if code != 0 {
+			t.Fatalf("--sync-method=syncfs on linux exit=%d stderr=%q", code, stderr.String())
+		}
+	} else if code == 0 {
+		t.Fatalf("--sync-method=syncfs should fail on %s", runtime.GOOS)
+	}
+
+	// Bogus method is rejected with the upstream wording.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"init", "-D", dir, "--sync-only", "--sync-method", "bogus"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("--sync-method=bogus exit=%d, want 1 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "unrecognized sync method") {
+		t.Errorf("stderr=%q want an 'unrecognized sync method' diagnostic", stderr.String())
+	}
+}
+
+// TestInitCommandAuthAndPwfile checks that -A/--auth-host/--auth-local and
+// --pwfile thread through to Init: the resolved methods land in pg_hba.conf,
+// and a password method without --pwfile is rejected.
+func TestInitCommandAuthAndPwfile(t *testing.T) {
+	base := t.TempDir()
+	var stdout, stderr bytes.Buffer
+
+	// -A scram-sha-256 sets both sides; --pwfile satisfies check_need_password.
+	dir := filepath.Join(base, "data1")
+	pwPath := filepath.Join(base, "pw.txt")
+	if err := os.WriteFile(pwPath, []byte("sekret\n"), 0o600); err != nil {
+		t.Fatalf("write pwfile: %v", err)
+	}
+	if code := run([]string{"init", "-D", dir, "--no-sync", "-A", "scram-sha-256", "--pwfile", pwPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("-A scram --pwfile exit=%d stderr=%q", code, stderr.String())
+	}
+	hba, err := os.ReadFile(filepath.Join(dir, "pg_hba.conf"))
+	if err != nil {
+		t.Fatalf("read pg_hba.conf: %v", err)
+	}
+	if !strings.Contains(string(hba), "127.0.0.1/32    scram-sha-256") {
+		t.Errorf("pg_hba.conf missing scram host rule:\n%s", grepLines(string(hba), "all"))
+	}
+	if !strings.Contains(string(hba), "local    all       all                    scram-sha-256") {
+		t.Errorf("pg_hba.conf missing scram local rule:\n%s", grepLines(string(hba), "local"))
+	}
+
+	// --auth-host overrides only the host side; local stays the -A value.
+	stdout.Reset()
+	stderr.Reset()
+	dir2 := filepath.Join(base, "data2")
+	if code := run([]string{"init", "-D", dir2, "--no-sync", "-A", "trust", "--auth-host", "reject"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("--auth-host override exit=%d stderr=%q", code, stderr.String())
+	}
+	hba2, err := os.ReadFile(filepath.Join(dir2, "pg_hba.conf"))
+	if err != nil {
+		t.Fatalf("read pg_hba.conf #2: %v", err)
+	}
+	if !strings.Contains(string(hba2), "127.0.0.1/32    reject") {
+		t.Errorf("--auth-host=reject not reflected:\n%s", grepLines(string(hba2), "127.0.0.1"))
+	}
+	if !strings.Contains(string(hba2), "local    all       all                    trust") {
+		t.Errorf("local side should stay trust:\n%s", grepLines(string(hba2), "local"))
+	}
+
+	// Password method without --pwfile is rejected (exit 1).
+	stdout.Reset()
+	stderr.Reset()
+	dir3 := filepath.Join(base, "data3")
+	if code := run([]string{"init", "-D", dir3, "--no-sync", "-A", "md5"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("-A md5 without --pwfile exit=%d, want 1 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "must specify a password") {
+		t.Errorf("stderr=%q want a 'must specify a password' diagnostic", stderr.String())
+	}
+}
+
+// TestInitCommandEncoding drives -E/--encoding through the CLI: a valid name
+// (in initdb's punctuation-insensitive form) lays out a cluster, while an
+// unknown or client-only encoding is rejected (exit 1) with initdb's exact
+// "is not a valid server encoding name" wording and lays out nothing. The
+// byte-level pg_database.encoding wiring is pinned in the initdb package.
+func TestInitCommandEncoding(t *testing.T) {
+	base := t.TempDir()
+
+	// Valid server encoding via the long form, punctuation-insensitive.
+	var stdout, stderr bytes.Buffer
+	dir := filepath.Join(base, "ok")
+	if code := run([]string{"init", "-D", dir, "--no-sync", "--encoding", "LATIN1"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("--encoding LATIN1 exit=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "PG_VERSION")); err != nil {
+		t.Errorf("cluster not laid out: %v", err)
+	}
+
+	// Client-only encoding (SJIS): recognized but rejected as a server encoding.
+	stdout.Reset()
+	stderr.Reset()
+	bad := filepath.Join(base, "client-only")
+	if code := run([]string{"init", "-D", bad, "--no-sync", "-E", "SJIS"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("-E SJIS exit=%d, want 1 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "is not a valid server encoding name") {
+		t.Errorf("stderr=%q want a 'not a valid server encoding name' diagnostic", stderr.String())
+	}
+	if _, err := os.Stat(bad); !os.IsNotExist(err) {
+		t.Errorf("rejected encoding should lay out nothing, but %q exists (err=%v)", bad, err)
+	}
+
+	// Unknown encoding name is likewise rejected.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"init", "-D", filepath.Join(base, "unknown"), "--no-sync", "-E", "bogus"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("-E bogus exit=%d, want 1 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "is not a valid server encoding name") {
+		t.Errorf("stderr=%q want a 'not a valid server encoding name' diagnostic", stderr.String())
+	}
+}
+
+// TestInitCommandLocaleProvider exercises the --locale-provider / --locale /
+// --lc-* / --builtin-locale option family through the CLI, mirroring the
+// non-ICU locale cases of upstream initdb's 001_initdb.pl.
+func TestInitCommandLocaleProvider(t *testing.T) {
+	base := t.TempDir()
+
+	// builtin provider with --locale C succeeds and lays out a cluster.
+	var stdout, stderr bytes.Buffer
+	ok := filepath.Join(base, "builtin-ok")
+	if code := run([]string{"init", "-D", ok, "--no-sync", "--locale-provider", "builtin", "--locale", "C"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("builtin --locale C exit=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(ok, "PG_VERSION")); err != nil {
+		t.Errorf("cluster not laid out: %v", err)
+	}
+
+	// builtin C.UTF-8 with --encoding UTF-8 succeeds.
+	stdout.Reset()
+	stderr.Reset()
+	utf8dir := filepath.Join(base, "builtin-cutf8")
+	if code := run([]string{"init", "-D", utf8dir, "--no-sync", "--locale-provider", "builtin", "--encoding", "UTF-8", "--lc-collate", "C", "--lc-ctype", "C", "--builtin-locale", "C.UTF-8"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("builtin C.UTF-8 + UTF-8 exit=%d stderr=%q", code, stderr.String())
+	}
+
+	// Each rejection path: bad provider, builtin-without-locale, ICU
+	// provider (no ICU build), libc+--icu-locale combo, and builtin C.UTF-8
+	// with a non-UTF8 encoding. All must exit 1 and lay out nothing.
+	rejects := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"xyz", []string{"--locale-provider", "xyz"}, "unrecognized locale provider"},
+		{"builtin-no-locale", []string{"--locale-provider", "builtin"}, "locale must be specified if provider is builtin"},
+		{"icu-no-build", []string{"--locale-provider", "icu", "--icu-locale", "en"}, "ICU is not supported in this build"},
+		{"libc-icu-combo", []string{"--locale-provider", "libc", "--icu-locale", "en"}, "--icu-locale cannot be specified"},
+		{"builtin-cutf8-sqlascii", []string{"--locale-provider", "builtin", "--encoding", "SQL_ASCII", "--lc-collate", "C", "--lc-ctype", "C", "--builtin-locale", "C.UTF-8"}, "requires encoding"},
+	}
+	for _, c := range rejects {
+		stdout.Reset()
+		stderr.Reset()
+		dir := filepath.Join(base, "rej-"+c.name)
+		args := append([]string{"init", "-D", dir, "--no-sync"}, c.args...)
+		if code := run(args, &stdout, &stderr); code != 1 {
+			t.Errorf("%s: exit=%d, want 1 (stderr=%q)", c.name, code, stderr.String())
+		}
+		if !strings.Contains(stderr.String(), c.want) {
+			t.Errorf("%s: stderr=%q, want containing %q", c.name, stderr.String(), c.want)
+		}
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("%s: rejected init should lay out nothing, but %q exists (err=%v)", c.name, dir, err)
+		}
+	}
+}
+
+// grepLines returns the lines of s containing substr, for test diagnostics.
+func grepLines(s, substr string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, substr) {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
 }
 
 // TestPoolSlotsFromGUC pins the postgresql.conf -> shared_buffers ->

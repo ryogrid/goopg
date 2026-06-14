@@ -10,10 +10,22 @@ query. See [02 Theme A](../02-pain-points.md).
 
 ## Must-run gate BEFORE committing
 
+The gate is now ONE command:
+
+```bash
+scripts/tpch-spotcheck.sh
+```
+
+It does the fresh server restart + Q12/Q13 row-count spot-check for you
+(memory-capped start, canonical counts from `bench/tpch/spotcheck_expected.env`,
+exit 1 on mismatch). On machines without the TPC-H data dir it prints
+SKIPPED and exits 0 — in that case fall back to the manual steps below
+where data exists.
+
 1. **Fresh server restart** — stale state hides regressions.
 2. **Q12 / Q13 row-count spot-check** — these are the canonical silent-regression
-   tripwires (`Q12=2/Q13=35` is the known failure signature). Confirm canonical
-   row counts, not just "no error".
+   tripwires (canonical is `Q12=2/Q13=35`; `Q12=0/Q13=2` is the known failure
+   signature). Confirm canonical row counts, not just "no error".
 3. **Run the affected query set**, then broaden if row counts shifted anywhere.
 
 (Encodes `feedback_tpch_pre_commit_gates`, `m0071_stage_b_silent_regression`.)

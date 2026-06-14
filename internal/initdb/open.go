@@ -45,8 +45,8 @@ type Runtime struct {
 	FSM *storage.FSM
 	// VM is the in-memory visibility map (M0046-0004). VACUUM sets the
 	// ALL_VISIBLE bit; index-only scans check it to skip heap fetches.
-	VM           *storage.VisibilityMap
-	WAL          *wal.Writer
+	VM  *storage.VisibilityMap
+	WAL *wal.Writer
 	// LogCanonical is the callback for emitting PG-canonical WAL records
 	// (XLOG_HEAP_INSERT, XLOG_BTREE_INSERT_LEAF) from DDL paths so a PG18
 	// standby can replay catalog mutations. Non-nil only when PageHeaders=true.
@@ -89,6 +89,26 @@ type Runtime struct {
 	// bgwriter is the background page-writer goroutine (M0048-0003).
 	// nil when BgwriterDelay == 0 or BgwriterMaxPages == 0.
 	bgwriter *storage.Bgwriter
+
+	// immediateShutdown, when true, makes Close() skip the final
+	// shutdown checkpoint so pg_control's State stays DB_IN_PRODUCTION
+	// (an unclean cluster). Set via SetImmediateShutdown from the
+	// control-plane STOPIMMEDIATE handler (`goopg stop -mode
+	// immediate`), mirroring upstream's immediate (SIGQUIT) shutdown.
+	// (M0110-0004 / RW-002 b.)
+	immediateShutdown bool
+}
+
+// SetImmediateShutdown marks the runtime so the next Close() skips its
+// final shutdown checkpoint, leaving pg_control's State at
+// DB_IN_PRODUCTION. Used by the control-plane STOPIMMEDIATE command to
+// reproduce upstream's immediate (SIGQUIT) shutdown semantics: the
+// cluster is left looking unclean and is recovered via WAL replay on the
+// next start. (M0110-0004 / RW-002 b.)
+func (r *Runtime) SetImmediateShutdown() {
+	if r != nil {
+		r.immediateShutdown = true
+	}
 }
 
 // OpenOptions controls Open.
@@ -203,8 +223,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		slots = 16384
 	}
 
+	// Read pg_control's data_checksum_version up front so the storage
+	// Manager knows whether to checksum every block it writes and verify
+	// every block it reads. Version 1 ⇒ enabled (initdb --data-checksums);
+	// 0 (the goopg default) ⇒ a checksum-less cluster, the byte-identical
+	// fast path. A missing/unreadable control file leaves checksums off.
+	checksumsEnabled := false
+	if pgCtrl, pce := control.ReadControlFile(abs); pce == nil && pgCtrl != nil {
+		checksumsEnabled = pgCtrl.DataChecksumVersion != 0
+	}
+
 	mgr := storage.NewManager(storage.ManagerConfig{
-		DataDir: abs,
+		DataDir:          abs,
+		ChecksumsEnabled: checksumsEnabled,
 	})
 
 	// Activity registry (M0022 / M0107-0005): per-backend slot array with
@@ -1989,8 +2020,24 @@ func (r *Runtime) Close() error {
 	//
 	// Errors here are logged but do not abort Close — file handles
 	// must still be released so the process can exit cleanly.
-	if r.Checkpointer != nil {
-		if err := r.Checkpointer.CheckpointNow(); err != nil {
+	if r.Checkpointer != nil && r.immediateShutdown {
+		// Immediate shutdown (`goopg stop -mode immediate`): skip the
+		// final checkpoint entirely so pg_control's State stays at
+		// DB_IN_PRODUCTION. External tools (pg_resetwal/pg_rewind/
+		// pg_controldata) then see an unclean cluster that needs
+		// recovery, and goopg's own next start replays WAL. Mirrors
+		// upstream's immediate (SIGQUIT) shutdown. (M0110-0004 / RW-002 b.)
+		slog.Default().Info("immediate shutdown: skipping final checkpoint",
+			"note", "pg_control left at DB_IN_PRODUCTION; recovery on next start")
+	} else if r.Checkpointer != nil {
+		// Use the shutdown variant so pg_control's State lands on
+		// DB_SHUTDOWNED — this is the final durable checkpoint of a clean
+		// shutdown, after which no further WAL is written. External tools
+		// (pg_resetwal/pg_rewind/pg_controldata) read this byte to decide
+		// whether the cluster needs recovery (M0110-0004 / RW-002). The
+		// earlier OnStop checkpoint deliberately stays DB_IN_PRODUCTION so
+		// a crash in the OnStop→Close window is still flagged as unclean.
+		if err := r.Checkpointer.CheckpointShutdown(); err != nil {
 			slog.Default().Warn(
 				"final shutdown checkpoint failed",
 				"err", err,
@@ -2094,9 +2141,9 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 	page := make(storage.Page, storage.BlockSize)
 
 	type indexClassRow struct {
-		oid   uint32
-		name  string
-		nsp   uint32
+		oid  uint32
+		name string
+		nsp  uint32
 	}
 	var indexRows []indexClassRow
 

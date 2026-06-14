@@ -57,11 +57,13 @@ var _ [0]struct{} = [64 - unsafe.Sizeof(activitySlot{})]struct{}{}
 // block query execution.
 type coldActivity struct {
 	// Immutable after Acquire.
-	PID             string
-	DatName         string
-	UserName        string
-	ApplicationName string
-	ClientAddr      string
+	PID        string
+	DatName    string
+	UserName   string
+	ClientAddr string
+	// ApplicationName is mutable: SET application_name updates it via
+	// UpdateApplicationName. Use atomic.Pointer so Snapshot readers never block.
+	ApplicationName atomic.Pointer[string]
 	ClientPort      string
 	BackendStart    int64 // unix nanos; 0 = not set
 	BackendType     string
@@ -331,6 +333,22 @@ func (r *ActivityRegistry) GetBackendType(procNum int32) string {
 	return c.BackendType
 }
 
+// PIDForProcNum returns the backend PID string occupying the given proc slot,
+// or "" if the slot is unoccupied or procNum is out of range. Used to stamp
+// synthetic pg_locks rows (spectoken / transactionid) with the owning backend's
+// PID so they join pg_stat_activity USING (pid). Mirrors GetBackendType's
+// lock-free cold-slot read.
+func (r *ActivityRegistry) PIDForProcNum(procNum int32) string {
+	if procNum < 0 || int(procNum) >= len(r.slots) {
+		return ""
+	}
+	c := r.slots[procNum].cold
+	if c == nil {
+		return ""
+	}
+	return c.PID
+}
+
 // GetBackendTypeByPID returns the BackendType for the backend with PID string.
 func (r *ActivityRegistry) GetBackendTypeByPID(pid string) string {
 	r.pidMu.RLock()
@@ -356,16 +374,18 @@ func (r *ActivityRegistry) Snapshot() []Backend {
 		sc := s.stateChange.Load()
 
 		b := Backend{
-			PID:             c.PID,
-			DatName:         c.DatName,
-			UserName:        c.UserName,
-			ApplicationName: c.ApplicationName,
-			ClientAddr:      c.ClientAddr,
-			ClientPort:      c.ClientPort,
-			BackendStart:    formatNanos(c.BackendStart),
-			BackendType:     c.BackendType,
-			State:           backendStateCode(c.State.Load()).String(),
-			StateChange:     formatNanos(r.monoToWall(sc)),
+			PID:          c.PID,
+			DatName:      c.DatName,
+			UserName:     c.UserName,
+			ClientAddr:   c.ClientAddr,
+			ClientPort:   c.ClientPort,
+			BackendStart: formatNanos(c.BackendStart),
+			BackendType:  c.BackendType,
+			State:        backendStateCode(c.State.Load()).String(),
+			StateChange:  formatNanos(r.monoToWall(sc)),
+		}
+		if p := c.ApplicationName.Load(); p != nil {
+			b.ApplicationName = *p
 		}
 		if xs := c.XactStart.Load(); xs != 0 {
 			b.XactStart = formatNanos(r.monoToWall(xs))
@@ -439,16 +459,31 @@ func (r *ActivityRegistry) procNumForPID(pid string) int32 {
 
 func coldFromBackend(b *Backend) *coldActivity {
 	c := &coldActivity{
-		PID:             b.PID,
-		DatName:         b.DatName,
-		UserName:        b.UserName,
-		ApplicationName: b.ApplicationName,
-		ClientAddr:      b.ClientAddr,
-		ClientPort:      b.ClientPort,
-		BackendType:     b.BackendType,
+		PID:         b.PID,
+		DatName:     b.DatName,
+		UserName:    b.UserName,
+		ClientAddr:  b.ClientAddr,
+		ClientPort:  b.ClientPort,
+		BackendType: b.BackendType,
 	}
+	n := b.ApplicationName
+	c.ApplicationName.Store(&n)
 	c.State.Store(uint32(parseBackendState(b.State)))
 	return c
+}
+
+// UpdateApplicationName atomically updates the ApplicationName for procNum.
+// Called from the GUC OnChange hook when SET application_name runs.
+func (r *ActivityRegistry) UpdateApplicationName(procNum int32, name string) {
+	if procNum < 0 || int(procNum) >= len(r.slots) {
+		return
+	}
+	c := r.slots[procNum].cold
+	if c == nil {
+		return
+	}
+	n := name
+	c.ApplicationName.Store(&n)
 }
 
 // formatNanos converts unix nanos to RFC3339Nano string.  0 → "".

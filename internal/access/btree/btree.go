@@ -11,8 +11,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/big"
 	"math"
+	"math/big"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -81,6 +81,15 @@ const (
 
 	btreeMagic   uint32 = 0x053162
 	btreeVersion uint32 = 4 // bumped by M0011-0002 (v3: variable-length HighKey, 48-byte opaque); v4: widened HighKey field to 256 bytes for text keys (272-byte opaque)
+
+	// BTreeMagic and BTreeVersion expose the on-disk metapage magic and
+	// version for out-of-package readers that validate a metapage without
+	// opening the tree — notably the amcheck verify engine
+	// (internal/amcheck). Keeping a single exported source of truth prevents
+	// the magic/version from drifting between the writer (writeMeta) and any
+	// independent validator.
+	BTreeMagic   = btreeMagic
+	BTreeVersion = btreeVersion
 )
 
 // BTreeMeta is the v0 metapage payload.
@@ -122,10 +131,23 @@ func (o BTPageOpaque) IsHalfDead() bool { return o.Flags&BTHalfDead != 0 }
 // IsRoot reports whether the page is the current root.
 func (o BTPageOpaque) IsRoot() bool { return o.Flags&BTRoot != 0 }
 
+// IsDeleted reports whether this page has been fully deleted (unlinked from
+// the tree, awaiting recycle). Deleted pages carry no items and may type-pun
+// fields such as the level, so structural validators must exempt them.
+func (o BTPageOpaque) IsDeleted() bool { return o.Flags&BTDeleted != 0 }
+
 // HasHighKey reports whether this page advertises a high-key
 // boundary. Pages without a high key are rightmost on their level
 // (or freshly created) and cover all remaining keys.
 func (o BTPageOpaque) HasHighKey() bool { return o.Flags&BTHasHighKey != 0 }
+
+// ParseOpaque exposes the page-bytes → BTPageOpaque decode for out-of-package
+// readers (notably the amcheck verify engine, internal/amcheck) so they share
+// this package's single definition of the opaque layout rather than
+// re-implementing it — the opaque format has changed across versions (v3 grew
+// it for variable-length HighKeys, v4 widened that field), and a duplicated
+// decoder would silently drift on the next bump.
+func ParseOpaque(p storage.Page) BTPageOpaque { return readOpaque(p) }
 
 // readOpaque returns the parsed opaque from page bytes.
 func readOpaque(p storage.Page) BTPageOpaque {
@@ -202,6 +224,26 @@ type item struct {
 
 // itemPrefixSize is the fixed bytes before key_bytes.
 const itemPrefixSize = 2 + 4 + 2
+
+// MaxItemsPerPage is the goopg analogue of upstream's MaxIndexTuplesPerPage
+// (postgres/src/include/access/itup.h): an upper bound on how many line-pointer
+// items can physically fit on one B-tree page. amcheck's page-structural check
+// (amcheck.VerifyBtreePage) flags any page whose line-pointer count exceeds this
+// bound, mirroring palloc_btree_page's `maxoffset > MaxIndexTuplesPerPage` test
+// (postgres/contrib/amcheck/verify_nbtree.c:3397).
+//
+// The divisor is goopg's minimum per-item footprint: a 4-byte line pointer (the
+// itemIDSize that pageHasSpaceFor reserves) plus the smallest possible item
+// body. The smallest body is a bare itemPrefix with a zero-length key — an
+// internal page's negative-infinity downlink. goopg stores items unaligned
+// (pageHasSpaceFor reserves exactly itemIDSize+itemPrefixSize+len(key)), so
+// there is no MAXALIGN term, unlike upstream's MAXALIGN(sizeof(IndexTupleData)+1).
+// Like upstream the bound is deliberately conservative: it ignores the per-page
+// special (opaque) area, so the true maximum is a little lower — that headroom is
+// exactly what keeps the corruption check free of false positives. Defined here,
+// alongside itemPrefixSize, so the tuple-size accounting has a single source of
+// truth (the engine never re-derives the inline item layout).
+const MaxItemsPerPage = (storage.BlockSize - storage.SizeOfPageHeaderData) / (4 + itemPrefixSize)
 
 func (it item) marshal() []byte {
 	out := make([]byte, itemPrefixSize+len(it.key))
@@ -882,6 +924,11 @@ func (bt *BTree) unpinW(s *storage.Slot) {
 	bt.pool.Unpin(s)
 }
 
+// ParseMeta exposes the metapage decode for out-of-package readers (the
+// amcheck verify engine) that validate a metapage's magic/version without
+// opening the tree. See ParseOpaque for the single-source-of-truth rationale.
+func ParseMeta(p storage.Page) BTreeMeta { return parseMeta(p) }
+
 func parseMeta(p storage.Page) BTreeMeta {
 	off := storage.SizeOfPageHeaderData
 	return BTreeMeta{
@@ -994,6 +1041,144 @@ func pageItems(p storage.Page) ([]item, error) {
 			}
 			out = append(out, it)
 		}
+	}
+	return out, nil
+}
+
+// PageItemKeys returns the separator/index key of every line pointer on a
+// B-tree page, in physical slot order (slot 1..N). Posting-list items
+// (M0047-0003), which pack many heap TIDs under a single shared key, contribute
+// that one key exactly once: callers that verify on-disk key ordering (amcheck's
+// item-order / high-key invariants) compare the stored separator keys, not the
+// expanded (key, TID) pairs that pageItems materialises. It returns an error if
+// any line pointer cannot be decoded, so a structurally damaged page surfaces
+// to the caller rather than producing a misleading key sequence.
+//
+// This is exported so the amcheck verification engine (internal/amcheck) decodes
+// keys through the canonical on-disk reader here instead of re-implementing the
+// item layout — the same single-source-of-truth discipline as ParseMeta /
+// ParseOpaque (the inline 2-byte-length key layout is a v3->v4 drift hazard).
+func PageItemKeys(p storage.Page) ([][]byte, error) {
+	count, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]byte, 0, count)
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(p, slot)
+		if err != nil {
+			return nil, err
+		}
+		if isPostingRaw(raw) {
+			key, _, perr := parsePostingRaw(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			out = append(out, key)
+		} else {
+			it, perr := parseItem(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			out = append(out, it.key)
+		}
+	}
+	return out, nil
+}
+
+// LeafEntry is one (index key, heap TID) pair on a B-tree leaf page: the key
+// and the heap location it points to. Posting-list items (M0047-0003) — which
+// pack many heap TIDs under one shared key — are expanded to one LeafEntry per
+// TID, so the entries returned here are the "plain" tuples upstream amcheck
+// fingerprints for heapallindexed verification (verify_nbtree.c's
+// bt_posting_plain_tuple expansion).
+type LeafEntry struct {
+	Key []byte
+	TID storage.ItemPointer
+}
+
+// PageLeafEntries returns every (key, heap TID) entry on a B-tree leaf page, in
+// physical slot order (slot 1..N), expanding each posting-list item to one
+// entry per TID. It returns an error if any line pointer cannot be decoded, so a
+// structurally damaged leaf page surfaces to the caller rather than yielding a
+// misleading entry set.
+//
+// Exported, like PageItemKeys / PageDownlinks, so amcheck's heapallindexed
+// checker (internal/amcheck.VerifyBtreeHeapAllIndexed) fingerprints the leaf
+// entries through the canonical on-disk reader here instead of re-deriving the
+// inline (keyLen, TID) item layout — the same single-source-of-truth discipline
+// that guards against the v3->v4 layout drift. Unlike PageItemKeys (which
+// collapses a posting item to its one separator key for the item-order tier),
+// this expands posting items because heapallindexed fingerprints every heap TID
+// the index references.
+func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
+	count, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LeafEntry, 0, count)
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(p, slot)
+		if err != nil {
+			return nil, err
+		}
+		if isPostingRaw(raw) {
+			key, tids, perr := parsePostingRaw(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			for _, tid := range tids {
+				out = append(out, LeafEntry{Key: key, TID: tid})
+			}
+		} else {
+			it, perr := parseItem(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			out = append(out, LeafEntry{Key: it.key, TID: it.ptr})
+		}
+	}
+	return out, nil
+}
+
+// Downlink is one (separator key, child block) entry on an internal B-tree
+// page: the key routes a search to the child block it precedes. By v0
+// convention the leftmost item's key is empty (negative infinity), so its
+// child is the subtree that holds everything below the next separator.
+type Downlink struct {
+	Key   []byte
+	Child storage.BlockNumber
+}
+
+// PageDownlinks returns the (separator key, child block) downlink entries of an
+// internal B-tree page, in physical slot order (slot 1..N). Internal pages never
+// carry posting-list items (those are leaf-only, M0047-0003), so each line
+// pointer decodes to exactly one downlink whose pointer Block is the child page.
+// It returns an error if any line pointer cannot be decoded, so a structurally
+// damaged internal page surfaces to the caller rather than yielding misleading
+// downlinks.
+//
+// Exported, like PageItemKeys, so amcheck's cross-level checker
+// (internal/amcheck.VerifyBtreeParentDownlinks) follows each parent downlink to
+// its child through the canonical on-disk reader here instead of re-deriving the
+// inline (keyLen, child-block) item layout — the same single-source-of-truth
+// discipline that guards against the v3->v4 layout drift.
+func PageDownlinks(p storage.Page) ([]Downlink, error) {
+	count, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Downlink, 0, count)
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(p, slot)
+		if err != nil {
+			return nil, err
+		}
+		it, perr := parseItem(raw)
+		if perr != nil {
+			return nil, perr
+		}
+		out = append(out, Downlink{Key: it.key, Child: it.ptr.Block})
 	}
 	return out, nil
 }

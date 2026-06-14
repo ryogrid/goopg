@@ -39,6 +39,12 @@ var RelationLockRowsFunc func() [][]string
 // M0097-0021.
 var AdvisoryLockRowsFunc func() [][]string
 
+// VirtualSpecLockRowsFunc is optionally set by the executor to provide
+// synthetic spectoken/transactionid rows for pg_locks representing active
+// speculative insertions. Same column order as AdvisoryLockRowsFunc.
+// M0100-0006b.
+var VirtualSpecLockRowsFunc func() [][]string
+
 // Type is the textual type tag plus an optional typmod argument list.
 // v0 keeps types as strings so the planner doesn't need a real type
 // system; the executor casts based on Type.Name until the type system
@@ -2202,6 +2208,9 @@ func (c *InMemory) registerSystemTables() {
 		}
 		if AdvisoryLockRowsFunc != nil {
 			rows = append(rows, AdvisoryLockRowsFunc()...)
+		}
+		if VirtualSpecLockRowsFunc != nil {
+			rows = append(rows, VirtualSpecLockRowsFunc()...)
 		}
 		return rows
 	}

@@ -724,7 +724,8 @@ func (p *bodyParser) parseAssign() (Stmt, error) {
 	isAssign := false
 	if p.cur().Kind == parser.TokenOperator && p.cur().Value == ":=" {
 		isAssign = true
-	} else if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "=" {
+	} else if p.cur().Value == "=" {
+		// The lexer emits '=' as TokenOperator; accept both to be safe.
 		isAssign = true
 	}
 	if !isAssign {
@@ -825,7 +826,7 @@ func (p *bodyParser) parseArraySubscriptAssign(nameTok parser.Token) (*ArraySubs
 	isAssign := false
 	if p.cur().Kind == parser.TokenOperator && p.cur().Value == ":=" {
 		isAssign = true
-	} else if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "=" {
+	} else if p.cur().Value == "=" {
 		isAssign = true
 	}
 	if !isAssign {

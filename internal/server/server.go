@@ -162,6 +162,16 @@ type Config struct {
 	// M0106-0010 batched-34.
 	IsStandby func() bool
 
+	// OnStopImmediate, when set, is invoked by the control-plane
+	// STOPIMMEDIATE command (`goopg stop -mode immediate`) BEFORE the
+	// run context is cancelled. It must mark the runtime so the final
+	// teardown skips its shutdown checkpoint, leaving pg_control at
+	// DB_IN_PRODUCTION (an unclean cluster that needs recovery) —
+	// mirroring upstream's immediate (SIGQUIT) shutdown. Unlike the
+	// graceful STOP path, no CheckpointNow runs here either. nil makes
+	// STOPIMMEDIATE behave like a graceful STOP. (M0110-0004 / RW-002 b.)
+	OnStopImmediate func() error
+
 	// AutovacuumLauncher, when set, is started as a background
 	// goroutine during Run. nil disables autovacuum.
 	AutovacuumLauncher *autovacuum.Launcher
@@ -321,6 +331,22 @@ func New(cfg Config) *Server {
 	if cfg.hasStorage() {
 		s.pc = newPlanCache()
 	}
+	// M0100-0006b: wire spec-insert registry cleanup on transaction end.
+	if cfg.TxnMgr != nil {
+		cfg.TxnMgr.SetOnTxnEnd(executor.DeregisterSpecXID)
+	}
+	// M0100-0006b: propagate SET application_name to the activity registry
+	// so pg_locks JOIN with pg_stat_activity reflects the updated name.
+	if cfg.Registry != nil {
+		cfg.Registry.OnChange("application_name", func(effVal string) {
+			reg, procNum, ok := activity.LookupCurrentGoroutine()
+			if !ok {
+				return
+			}
+			reg.UpdateApplicationName(procNum, effVal)
+		})
+	}
+
 	// Build the apply-worker launcher when logical replication is
 	// wired (PubSub + storage handles). Server.Run starts it so its
 	// lifetime matches the listener's. M0103-0002.
@@ -499,6 +525,23 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 					"err", err)
 			} else {
 				s.cfg.Logger.Info("shutdown checkpoint complete")
+			}
+		}
+		runCancel()
+		return nil
+	}
+	cl.OnStopImmediate = func() error {
+		s.cfg.Logger.Info("control: immediate stop requested")
+		// Immediate shutdown: deliberately skip BOTH the OnStop
+		// CheckpointNow AND (via the runtime flag set by the wired
+		// callback) the final Runtime.Close shutdown checkpoint, so
+		// pg_control's State stays DB_IN_PRODUCTION. The cluster then
+		// looks unclean to pg_resetwal/pg_rewind/pg_controldata and is
+		// recovered via WAL replay on the next start. Mirrors upstream's
+		// immediate (SIGQUIT) shutdown. (M0110-0004 / RW-002 b.)
+		if s.cfg.OnStopImmediate != nil {
+			if err := s.cfg.OnStopImmediate(); err != nil {
+				s.cfg.Logger.Warn("immediate-stop hook failed", "err", err)
 			}
 		}
 		runCancel()

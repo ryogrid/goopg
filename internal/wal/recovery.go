@@ -892,14 +892,14 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid
 	le := binary.LittleEndian
 	now := time.Now()
 
-	le.PutUint64(payload[0:8], redoLSN0)             // redo
-	le.PutUint32(payload[8:12], tli)                 // ThisTimeLineID
-	le.PutUint32(payload[20:24], 1)                  // wal_level (replica)
-	le.PutUint64(payload[24:32], nextXid)            // nextXid (>= FirstNormalTxnId)
-	le.PutUint32(payload[32:36], nextOid)            // nextOid (>= FirstNormalObjectId)
-	le.PutUint32(payload[36:40], 1)                  // nextMulti
-	le.PutUint32(payload[44:48], 3)                  // oldestXid
-	le.PutUint32(payload[52:56], 1)                  // oldestMulti
+	le.PutUint64(payload[0:8], redoLSN0)  // redo
+	le.PutUint32(payload[8:12], tli)      // ThisTimeLineID
+	le.PutUint32(payload[20:24], 1)       // wal_level (replica)
+	le.PutUint64(payload[24:32], nextXid) // nextXid (>= FirstNormalTxnId)
+	le.PutUint32(payload[32:36], nextOid) // nextOid (>= FirstNormalObjectId)
+	le.PutUint32(payload[36:40], 1)       // nextMulti
+	le.PutUint32(payload[44:48], 3)       // oldestXid
+	le.PutUint32(payload[52:56], 1)       // oldestMulti
 	// time (pg_time_t=int64, 8-byte aligned → starts at offset 64)
 	le.PutUint64(payload[64:72], uint64(now.Unix())) // time
 	// After time (offset 72): oldestCommitTsXid, newestCommitTsXid,
@@ -907,9 +907,9 @@ func EncodeCheckpointCompat(redoLSN0 uint64, tli uint32, nextXid uint64, nextOid
 	// NOTE: pg_time_t alignment forces 4-byte pad before time, pushing
 	// offsets: time=64, oldestCommitTsXid=72, newestCommitTsXid=76,
 	// oldestActiveXid=80, sizeof(CheckPoint)=88.
-	le.PutUint32(payload[72:76], 3)                  // oldestCommitTsXid
-	le.PutUint32(payload[76:80], 3)                  // newestCommitTsXid
-	le.PutUint32(payload[80:84], uint32(nextXid))    // oldestActiveXid
+	le.PutUint32(payload[72:76], 3)               // oldestCommitTsXid
+	le.PutUint32(payload[76:80], 3)               // newestCommitTsXid
+	le.PutUint32(payload[80:84], uint32(nextXid)) // oldestActiveXid
 
 	return payload
 }
@@ -2551,7 +2551,16 @@ func ReplayFromDir(dataDir string, segmentSize int64) (ReplayStats, error) {
 	if err != nil {
 		return ReplayStats{}, err
 	}
-	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	// Honor the cluster's data_checksum_version so FPI replay rewrites
+	// pages with valid checksums on a --data-checksums cluster (0 ⇒ the
+	// checksum-less default). The runtime path uses ReplayFromDirWithMgr
+	// with its already-configured Manager; this standalone entry point
+	// reads pg_control itself.
+	checksums := false
+	if pgCtrl, pce := control.ReadControlFile(dataDir); pce == nil && pgCtrl != nil {
+		checksums = pgCtrl.DataChecksumVersion != 0
+	}
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir, ChecksumsEnabled: checksums})
 	defer func() { _ = mgr.Close() }()
 	return ReplayRecords(mgr, records)
 }

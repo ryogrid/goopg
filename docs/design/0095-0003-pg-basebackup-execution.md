@@ -132,13 +132,60 @@ assertion updated from `T/D/C/Z` (4 frames) to `T/D/C/C/Z` (5 frames).
   cluster end-to-end with the real `postgres/local_install/bin/pg_basebackup`
   binary; passes with `-X none --no-manifest --no-sync`; verifies extracted
   `backup_label`, `global/pg_control`, and `PG_VERSION`.
+- `TestPort_PgBasebackup010StreamWAL` — `-X stream` variant (M0102 walsender).
+- `TestPort_PgBasebackup010Manifest` (new, 2026-06-14) — runs pg_basebackup
+  WITHOUT `--no-manifest` (default CRC32C manifest); independently recomputes
+  every `Files[]` CRC32C and the SHA-256 `Manifest-Checksum`, then runs the
+  upstream oracle `pg_verifybackup -n` over the extracted backup, which
+  accepts it.
+
+## Backup manifest (`--manifest`, 2026-06-14)
+
+pg_basebackup requests `MANIFEST 'yes'` by default (only `--no-manifest`
+disables it), so the original `--no-manifest`-only support was a stop-gap.
+The server now emits a PG-version-2 backup manifest, mirroring
+`backup_manifest.c` + `bbsink_copystream`'s manifest framing.
+
+Wire framing (`basebackup_copy.c:260-292`): after the last tar archive byte
+and before `CopyDone`, the server sends a `CopyData('m')` begin-manifest
+marker, then the manifest bytes through the same `CopyData('d' …)` framing as
+the tar (`streamBackupManifest`). No explicit terminator — the existing
+`CopyDone` closes the stream.
+
+Manifest document (`buildBackupManifest`, byte-for-byte ordering from
+`backup_manifest.c`):
+
+- `{ "PostgreSQL-Backup-Manifest-Version": 2, "System-Identifier": <id>, …`
+  — `System-Identifier` is `initdb.LoadOrCreateSystemID(DataDir)`, the same
+  value written into `global/pg_control`, so pg_verifybackup's
+  system-identifier cross-check passes.
+- `"Files": [ … ]` — one entry per shipped file (`backup_label`, every
+  base/global file, `global/pg_control`) with `Path`/`Size`/`Last-Modified`
+  (GMT) and, by default, `Checksum-Algorithm: CRC32C` + `Checksum`. WAL
+  segments under `pg_wal/` are **omitted** from `Files[]` (PG tracks WAL only
+  via `WAL-Ranges`; a concurrent `-X stream` rewrites those segments client
+  side, which would otherwise break checksum verification).
+- `"WAL-Ranges": [ { "Timeline", "Start-LSN", "End-LSN" } ]` — start = the
+  backup-label start LSN (0-based), end = `WrittenLSN()-1`.
+- `"Manifest-Checksum": "<sha256hex>"}` — SHA-256 over every byte up to but
+  not including the `"Manifest-Checksum"` field (always SHA-256 regardless of
+  the per-file algorithm, the `SendBackupManifest` invariant).
+
+CRC32C parity detail: PG's `pg_checksum_final` `memcpy`s the native
+(little-endian on amd64) 4-byte `pg_crc32c` value before hex-encoding, and its
+INIT/FIN convention matches Go's `crc32.Checksum` with the Castagnoli table —
+so the manifest hex is `binary.LittleEndian` of the CRC32C value.
+
+`MANIFEST_CHECKSUMS` is parsed and honoured: `NONE` (omit `Checksum-*`
+fields), `CRC32C` (default), and `SHA224/256/384/512`. An unrecognised
+algorithm is rejected early with `FeatureNotSupported`. `force-encode`
+(`--manifest-force-encode`) and any non-UTF-8 path switch the entry to
+`"Encoded-Path": "<hex>"`, matching `AddFileToBackupManifest`.
 
 ## Out of scope (follow-ups)
 
-- `-X stream` / `-X fetch` — needs START_REPLICATION + walsender loop parity
-  (M0102-0006 will be the first user).
-- `--manifest` (default) — needs `bbsink_manifest` parity emitting a second
-  CopyOut stream after the tar with SHA256 entries.
+- `-X fetch` — `-X stream` landed (M0102 walsender); fetch still needs the
+  WAL-fetch path.
 - Server-side compression (gzip/lz4/zstd) — needs `bbsink_gzip/lz4/zstd`
   parity.
 - Tablespaces beyond the default — out of v0 scope (M0095-0003 011 stays

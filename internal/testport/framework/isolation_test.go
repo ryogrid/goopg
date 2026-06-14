@@ -125,7 +125,7 @@ func TestDrainCompleted_EmitsPendingStepNotices(t *testing.T) {
 		queue:   q,
 	}}
 
-	remaining := drainCompleted(&sb, pending)
+	remaining := drainCompleted(&sb, IsolationSpec{}, nil, pending)
 	if got, want := sb.String(), "s1: NOTICE:  hello from pending step\n"; got != want {
 		t.Fatalf("drainCompleted output = %q, want %q", got, want)
 	}
@@ -147,7 +147,7 @@ func TestDrainWithTimeout_EmitsPendingStepNotices(t *testing.T) {
 		queue:   q,
 	}}
 
-	remaining := drainWithTimeout(&sb, pending, time.Millisecond)
+	remaining := drainWithTimeout(&sb, IsolationSpec{}, nil, pending, time.Millisecond)
 	if got, want := sb.String(), "s2: NOTICE:  hello after unblock\n"; got != want {
 		t.Fatalf("drainWithTimeout output = %q, want %q", got, want)
 	}
@@ -482,5 +482,84 @@ func TestParseIsolationSpecNoticesAnnotationStripped(t *testing.T) {
 	want := []string{"s1_upsert", "s2_upsert", "next"}
 	if !equalSlices(parsed.Permutations[0], want) {
 		t.Errorf("Permutations[0] = %v, want %v (annotation must be stripped)", parsed.Permutations[0], want)
+	}
+}
+
+// TestParsePermutationBlockers covers the parenthesised completion markers
+// (M0100-0006b part c): "*", "<step>", and "<step> notices <n>", including the
+// glued "mystep(*)" form and multiple comma-separated markers. The step list
+// must always exclude markers, while PermutationBlockers carries them parallel
+// to Permutations.
+func TestParsePermutationBlockers(t *testing.T) {
+	steps, blockers := parsePermutation("s1_upsert s2_upsert (s1_upsert notices 10) next")
+	wantSteps := []string{"s1_upsert", "s2_upsert", "next"}
+	if !equalSlices(steps, wantSteps) {
+		t.Fatalf("steps = %v, want %v", steps, wantSteps)
+	}
+	if len(blockers) != 3 {
+		t.Fatalf("blockers len = %d, want 3", len(blockers))
+	}
+	if blockers[0] != nil || blockers[2] != nil {
+		t.Errorf("only s2_upsert should carry a blocker; got %v", blockers)
+	}
+	if len(blockers[1]) != 1 {
+		t.Fatalf("s2_upsert blockers = %v, want 1", blockers[1])
+	}
+	if b := blockers[1][0]; b.Kind != BlockerNotices || b.StepName != "s1_upsert" || b.Count != 10 {
+		t.Errorf("notices blocker = %+v, want {Notices s1_upsert 10}", b)
+	}
+}
+
+func TestParsePermutationBlockerKinds(t *testing.T) {
+	// Glued star, plain step-complete, and a multi-marker group.
+	steps, blockers := parsePermutation(`a(*) b (c) d (e notices 3, f)`)
+	wantSteps := []string{"a", "b", "d"}
+	if !equalSlices(steps, wantSteps) {
+		t.Fatalf("steps = %v, want %v", steps, wantSteps)
+	}
+	if len(blockers[0]) != 1 || blockers[0][0].Kind != BlockerStar {
+		t.Errorf("a blockers = %+v, want [Star]", blockers[0])
+	}
+	if len(blockers[1]) != 1 || blockers[1][0].Kind != BlockerStepComplete || blockers[1][0].StepName != "c" {
+		t.Errorf("b blockers = %+v, want [StepComplete c]", blockers[1])
+	}
+	if len(blockers[2]) != 2 {
+		t.Fatalf("d blockers = %+v, want 2 markers", blockers[2])
+	}
+	if blockers[2][0].Kind != BlockerNotices || blockers[2][0].StepName != "e" || blockers[2][0].Count != 3 {
+		t.Errorf("d marker 0 = %+v, want {Notices e 3}", blockers[2][0])
+	}
+	if blockers[2][1].Kind != BlockerStepComplete || blockers[2][1].StepName != "f" {
+		t.Errorf("d marker 1 = %+v, want {StepComplete f}", blockers[2][1])
+	}
+}
+
+// TestParseIsolationSpecPopulatesBlockers verifies that ParseIsolationSpec
+// surfaces blockers parallel to Permutations across a multi-line permutation.
+func TestParseIsolationSpecPopulatesBlockers(t *testing.T) {
+	spec := "session \"s1\"\n" +
+		"step \"s1_upsert\" { SELECT 1; }\n" +
+		"step \"s2_upsert\" { SELECT 2; }\n" +
+		"step \"next\" { SELECT 3; }\n" +
+		"permutation\n" +
+		"   s1_upsert s2_upsert (s1_upsert notices 10)\n" +
+		"   next\n"
+	path := filepath.Join(t.TempDir(), "blk.spec")
+	if err := os.WriteFile(path, []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseIsolationSpec(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.PermutationBlockers) != 1 {
+		t.Fatalf("PermutationBlockers len = %d, want 1", len(parsed.PermutationBlockers))
+	}
+	pb := parsed.PermutationBlockers[0]
+	if len(pb) != len(parsed.Permutations[0]) {
+		t.Fatalf("blockers/steps length mismatch: %d vs %d", len(pb), len(parsed.Permutations[0]))
+	}
+	if len(pb[1]) != 1 || pb[1][0].Kind != BlockerNotices || pb[1][0].Count != 10 {
+		t.Errorf("s2_upsert blocker = %+v, want notices 10", pb[1])
 	}
 }

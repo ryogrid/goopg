@@ -157,6 +157,16 @@ type Listener struct {
 	// shutdown sequence (typically by cancelling the server
 	// context), which then drains the listener.
 	OnStop func() error
+	// OnStopImmediate is invoked when a client sends STOPIMMEDIATE
+	// (`goopg stop -mode immediate`). Unlike OnStop, the handler must
+	// NOT run any shutdown checkpoint: it tears the server down leaving
+	// pg_control's State at DB_IN_PRODUCTION so external tools
+	// (pg_resetwal/pg_rewind/pg_controldata) observe an unclean cluster
+	// that needs recovery — mirroring upstream's immediate (SIGQUIT)
+	// shutdown. The pidfile/socket are still removed on the way out, so
+	// a subsequent reset/start does not trip the lock-file guard. nil
+	// falls back to the graceful OnStop path. (M0110-0004 / RW-002 b.)
+	OnStopImmediate func() error
 	// OnReload is invoked when a client sends RELOAD. Should be
 	// fast; v0's only consumer is a no-op.
 	OnReload func() error
@@ -259,6 +269,18 @@ func (l *Listener) handleConn(conn net.Conn) {
 	case "STOP":
 		_, _ = conn.Write([]byte("OK\n"))
 		if l.OnStop != nil {
+			_ = l.OnStop()
+		}
+	case "STOPIMMEDIATE":
+		// Reply before invoking the handler (same ordering as STOP) so
+		// the client sees OK even though the server is about to tear
+		// down without a checkpoint. Falls back to OnStop if no
+		// immediate handler is wired.
+		_, _ = conn.Write([]byte("OK\n"))
+		switch {
+		case l.OnStopImmediate != nil:
+			_ = l.OnStopImmediate()
+		case l.OnStop != nil:
 			_ = l.OnStop()
 		}
 	case "RELOAD":

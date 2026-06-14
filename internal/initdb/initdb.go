@@ -23,11 +23,14 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -115,9 +118,9 @@ var Subdirs = []string{
 // callers (and tests) can introspect the layout without re-running
 // init.
 type FileSpec struct {
-	Path    string
-	Build   func() []byte
-	Mode    os.FileMode
+	Path  string
+	Build func() []byte
+	Mode  os.FileMode
 }
 
 // SampleFiles returns the file list goopg init writes. The values
@@ -141,6 +144,166 @@ type Options struct {
 	// doesn't exist; if it exists and is non-empty, init refuses
 	// (matching upstream initdb's "directory not empty" guard).
 	DataDir string
+
+	// SuperuserName is the name of the bootstrap superuser role
+	// (pg_authid OID 10), matching upstream initdb's -U/--username
+	// option. When empty, it defaults to "postgres". Names beginning
+	// with "pg_" are rejected (reserved namespace), mirroring
+	// initdb.c:3479.
+	SuperuserName string
+
+	// WALDir, when non-empty, relocates the write-ahead log directory
+	// outside the data directory, mirroring upstream initdb's
+	// -X/--waldir (initdb.c create_xlog_or_symlink). It must be an
+	// absolute path — relative paths are rejected before any filesystem
+	// layout, like initdb.c's "WAL directory location must be an
+	// absolute path" — and must be empty or non-existent (a non-empty
+	// directory is rejected). On success <DataDir>/pg_wal is created as
+	// a symlink to WALDir, and pg_wal/archive_status and
+	// pg_wal/summaries are created inside WALDir via that symlink. When
+	// empty, pg_wal is a plain subdirectory of DataDir as before.
+	WALDir string
+
+	// NoSync, when true, skips the final recursive fsync of the data
+	// directory that Init otherwise performs before returning, mirroring
+	// upstream initdb's -N/--no-sync. Faster, but the cluster is not
+	// guaranteed durable on disk if the host crashes immediately after
+	// init (initdb.c: do_sync gated on nosync).
+	NoSync bool
+
+	// SyncOnly, when true, makes Init fsync an already-initialized data
+	// directory to disk and return without creating a new cluster,
+	// mirroring upstream initdb's -S/--sync-only (initdb.c:3439). The
+	// DataDir must already exist and be accessible; a missing directory
+	// is rejected (mirrors initdb.c's "could not access directory" via
+	// pg_check_dir <= 0). NoSync is ignored when SyncOnly is set, since
+	// syncing is the entire purpose of the operation.
+	SyncOnly bool
+
+	// SyncMethod selects how the data directory is flushed to disk:
+	// "" or "fsync" (default, a recursive fsync of every file/dir) or
+	// "syncfs" (one syncfs(2) per filesystem). Mirrors upstream initdb's
+	// --sync-method (parse_sync_method, src/fe_utils/option_utils.c:90).
+	// An unrecognized value is rejected before any work; "syncfs" is
+	// rejected on builds without syncfs support (non-Linux), matching
+	// upstream's HAVE_SYNCFS gate.
+	SyncMethod string
+
+	// NoSyncDataFiles, when true, excludes the per-database data files in
+	// base/ from the fsync pass, mirroring upstream initdb's
+	// --no-sync-data-files (sync_data_files=false, initdb.c:3396). Under
+	// the syncfs method it has no effect, because syncfs flushes the whole
+	// filesystem and goopg creates no tablespace symlinks (the only place
+	// upstream's sync_data_files gate applies under syncfs).
+	NoSyncDataFiles bool
+
+	// TextSearchConfig, when non-empty, seeds
+	// default_text_search_config in postgresql.conf as
+	// 'pg_catalog.<value>', mirroring upstream initdb's
+	// -T/--text-search-config (initdb.c:1343-1346, 3347). When empty the
+	// template's commented-out default is left untouched.
+	TextSearchConfig string
+
+	// AllowGroupAccess, when true, relaxes the data directory so the
+	// owner's group may read (and traverse) it, mirroring upstream
+	// initdb's -g/--allow-group-access (initdb.c:3360
+	// SetDataDirectoryCreatePerm(PG_DIR_MODE_GROUP)). Every directory is
+	// created/left at 0o750 and every file at 0o640 (vs the default
+	// 0o700/0o600), and postgresql.conf's log_file_mode is seeded to 0640
+	// (initdb.c:1421-1425). When false the cluster is owner-only.
+	AllowGroupAccess bool
+
+	// ExtraGUC are name=value GUC overrides seeded into postgresql.conf,
+	// mirroring upstream initdb's -c/--set (initdb.c:3266-3281,
+	// 1430-1436). They are applied after TextSearchConfig so a -c switch
+	// can override an earlier assignment (including
+	// default_text_search_config). Each entry rewrites an existing
+	// (possibly commented) assignment in place, or appends a new line.
+	ExtraGUC []GUCSetting
+
+	// AuthMethodHost and AuthMethodLocal select the authentication
+	// methods written into pg_hba.conf for host and local connections,
+	// mirroring upstream initdb's -A/--auth (sets both), --auth-host, and
+	// --auth-local (initdb.c:3248-3264). Empty defaults to "trust" (with a
+	// warning, like initdb's check_authmethod_unspecified). A single
+	// --auth=ident maps the local side to "peer" and --auth=peer maps the
+	// host side to "ident" (the ident↔peer cross-map). An invalid method,
+	// or a password method (md5/password/scram-sha-256) on both sides
+	// without PwFile, is rejected before any filesystem work.
+	AuthMethodHost  string
+	AuthMethodLocal string
+
+	// PwFile, when non-empty, is a path whose first line is the cleartext
+	// password for the bootstrap superuser, mirroring upstream initdb's
+	// --pwfile (initdb.c get_su_pwd file branch). The password is encoded
+	// into pg_authid.rolpassword as a SCRAM-SHA-256 verifier (or md5 when an
+	// md5 auth method was chosen), and password_encryption is seeded to md5
+	// in that case. An unreadable or empty file is rejected. The
+	// interactive -W/--pwprompt form is not supported (goopg init is
+	// non-interactive).
+	PwFile string
+
+	// Encoding selects the default character-set encoding for the new
+	// cluster's databases, mirroring upstream initdb's -E/--encoding. The
+	// name is matched case-insensitively and punctuation-insensitively
+	// (so "UTF-8", "utf8", and "unicode" all select UTF8) and must name a
+	// valid server-side encoding; an unknown name or a client-only encoding
+	// (SJIS, BIG5, GBK, UHC, GB18030, JOHAB, SHIFT_JIS_2004) is rejected
+	// before any filesystem work, with initdb's exact "is not a valid server
+	// encoding name" wording. When empty, the default is UTF8 (goopg's locale
+	// is fixed at C/UTF8 pending the --locale option family). The chosen
+	// encoding ID is written into pg_database.encoding.
+	Encoding string
+
+	// LocaleProvider selects the default collation provider for the new
+	// cluster, mirroring upstream initdb's --locale-provider (initdb.c:3367).
+	// "" or "libc" use the operating-system C library (the default);
+	// "builtin" uses PG's built-in C/C.UTF-8/PG_UNICODE_FAST locales; "icu"
+	// is recognized but rejected ("ICU is not supported in this build")
+	// because goopg is built without ICU. An unrecognized value is rejected
+	// before any filesystem work. The chosen provider is written to
+	// pg_database.datlocprovider.
+	LocaleProvider string
+
+	// Locale and the LC* fields mirror initdb's --locale and the per-category
+	// --lc-collate/--lc-ctype/--lc-messages/--lc-monetary/--lc-numeric/--lc-time
+	// (initdb.c setlocales). Locale supplies the default for any unset
+	// category; each unset category ultimately falls back to "C" (goopg's
+	// fixed locale — the running engine does not vary collation, so these are
+	// recorded on disk for PG-compat only). For a non-libc provider, --locale
+	// also supplies the per-database collation (datlocale) when no
+	// provider-specific locale is given.
+	Locale     string
+	LCCollate  string
+	LCCtype    string
+	LCMessages string
+	LCMonetary string
+	LCNumeric  string
+	LCTime     string
+
+	// BuiltinLocale, ICULocale, and ICURules mirror initdb's --builtin-locale,
+	// --icu-locale, and --icu-rules. Each is only legal with its matching
+	// provider (initdb.c:3424-3434): --builtin-locale needs --locale-provider
+	// builtin (valid values C / C.UTF-8 / PG_UNICODE_FAST, recorded in
+	// pg_database.datlocale), and --icu-locale/--icu-rules need the icu
+	// provider (always rejected here, as goopg has no ICU). A mismatched
+	// combination is rejected before any filesystem work.
+	BuiltinLocale string
+	ICULocale     string
+	ICURules      string
+
+	// DataChecksums requests upstream initdb's -k/--data-checksums: a cluster
+	// whose pg_control data_checksum_version is 1 and whose every data page
+	// carries a valid pd_checksum. When true, Init stamps checksums into every
+	// relation page in one offline pass after the bootstrap completes
+	// (stampClusterChecksums, mirroring pg_checksums --enable); the storage
+	// engine then verifies them on read (ManagerConfig.ChecksumsEnabled, set
+	// from pg_control at Open). When false (the goopg default) the cluster is
+	// checksum-less and the bootstrap + I/O path is byte-identical to before.
+	// PG 18 defaults this ON; goopg keeps it off until recovery/replication
+	// validation precedes flipping the default (M0102-0010). See
+	// docs/design/0102-0019-initdb-data-checksums.md.
+	DataChecksums bool
 
 	// Registry, when non-nil, is the server's live GUC registry.
 	// Its values for max_connections, max_worker_processes,
@@ -167,6 +330,270 @@ func createPerDatabaseScaffolding(dataDir string, dbOID uint32) error {
 	return nil
 }
 
+// setupWALDir relocates pg_wal outside the data directory, mirroring
+// upstream initdb's -X/--waldir (initdb.c create_xlog_or_symlink). walDir
+// must already be validated as an absolute path. Mirroring upstream's
+// pg_check_dir switch: a non-existent directory is created, an existing
+// empty one is reused (permissions fixed), and a non-empty one is
+// rejected. On success <abs>/pg_wal is created as a symlink to walDir.
+func setupWALDir(abs, walDir string) error {
+	entries, err := os.ReadDir(walDir)
+	switch {
+	case err == nil:
+		// Present: reuse only if empty (upstream pg_check_dir case 1).
+		// Any entry — including a lost+found mount-point marker — makes
+		// it non-empty and is rejected (cases 2/3/4 → exit 1).
+		if len(entries) > 0 {
+			return fmt.Errorf("WAL directory %q exists but is not empty", walDir)
+		}
+		if err := os.Chmod(walDir, 0o700); err != nil {
+			return fmt.Errorf("change permissions of WAL directory %q: %w", walDir, err)
+		}
+	case errors.Is(err, os.ErrNotExist):
+		// Not there, must create it (upstream pg_check_dir case 0).
+		if err := os.MkdirAll(walDir, 0o700); err != nil {
+			return fmt.Errorf("create WAL directory %q: %w", walDir, err)
+		}
+	default:
+		return fmt.Errorf("access WAL directory %q: %w", walDir, err)
+	}
+	link := filepath.Join(abs, "pg_wal")
+	if err := os.Symlink(walDir, link); err != nil {
+		return fmt.Errorf("create symbolic link %q: %w", link, err)
+	}
+	return nil
+}
+
+// dataDirSyncMethod selects how syncDataDir flushes the cluster to disk,
+// mirroring upstream's DataDirSyncMethod (src/include/common/file_utils.h).
+type dataDirSyncMethod int
+
+const (
+	syncMethodFsync  dataDirSyncMethod = iota // recursive fsync (default)
+	syncMethodSyncfs                          // one syncfs(2) per filesystem
+)
+
+// resolveSyncMethod ports parse_sync_method (src/fe_utils/option_utils.c:90):
+// "" or "fsync" → FSYNC; "syncfs" → SYNCFS, but only where syncfs is
+// supported (HAVE_SYNCFS / Linux), else rejected; anything else is an
+// "unrecognized sync method" error.
+func resolveSyncMethod(s string) (dataDirSyncMethod, error) {
+	switch s {
+	case "", "fsync":
+		return syncMethodFsync, nil
+	case "syncfs":
+		if !syncfsSupported {
+			return 0, fmt.Errorf("goopg init: this build does not support sync method \"syncfs\"")
+		}
+		return syncMethodSyncfs, nil
+	default:
+		return 0, fmt.Errorf("goopg init: unrecognized sync method: %s", s)
+	}
+}
+
+// syncDataDir flushes dataDir to disk so the cluster is durable, mirroring
+// upstream initdb's sync_pgdata (src/common/file_utils.c).
+//
+// FSYNC method: recursively fsync every regular file and directory under
+// dataDir. When syncDataFiles is false, the base/ subtree (the per-database
+// data files) is excluded, exactly as upstream sets exclude_dir =
+// "<pg_data>/base" for --no-sync-data-files. The top-level walk ignores
+// symlinks, so an external WAL directory linked at <dataDir>/pg_wal is
+// fsynced separately by recursing through that symlink. goopg init creates
+// no tablespace symlinks under pg_tblspc, so (unlike upstream) there is no
+// second process_symlinks pass for pg_tblspc.
+//
+// SYNCFS method: a single syncfs(2) on dataDir flushes its whole filesystem,
+// plus a syncfs of a relocated pg_wal symlink target. syncDataFiles has no
+// effect here — upstream only uses it to gate per-tablespace syncfs calls,
+// and goopg has no tablespaces.
+func syncDataDir(dataDir string, method dataDirSyncMethod, syncDataFiles bool) error {
+	pgWal := filepath.Join(dataDir, "pg_wal")
+	walIsSymlink := false
+	if info, err := os.Lstat(pgWal); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		walIsSymlink = true
+	}
+
+	if method == syncMethodSyncfs {
+		if err := syncfsPath(dataDir); err != nil {
+			return err
+		}
+		if walIsSymlink {
+			if err := syncfsPath(pgWal); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// FSYNC method.
+	excludeDir := ""
+	if !syncDataFiles {
+		excludeDir = filepath.Join(dataDir, "base")
+	}
+	if err := walkAndFsync(dataDir, false, excludeDir); err != nil {
+		return err
+	}
+	if walIsSymlink {
+		if err := walkAndFsync(pgWal, true, ""); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// walkAndFsync recursively applies fsync to path and everything beneath it,
+// mirroring upstream initdb's walkdir (src/common/file_utils.c): each regular
+// file and directory is fsynced, and the directory itself is fsynced after
+// its children. Symlinks are ignored except at the top level when
+// followTopSymlink is true (used to descend into a relocated pg_wal). Symlinks
+// encountered in subdirectories are always ignored, matching upstream's
+// intentional choice not to propagate process_symlinks into recursive calls.
+//
+// excludeDir, when non-empty, is a directory path that is skipped entirely
+// (neither descended nor fsynced), porting walkdir's
+// `if (exclude_dir && strcmp(exclude_dir, path) == 0) return;`. It is used
+// for --no-sync-data-files (excludeDir = <dataDir>/base) and is propagated
+// into recursive calls exactly as upstream does, though it only ever matches
+// the top-level base/ directory.
+func walkAndFsync(path string, followTopSymlink bool, excludeDir string) error {
+	if excludeDir != "" && path == excludeDir {
+		return nil
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		if !followTopSymlink {
+			return nil
+		}
+		// Resolve the symlink target so we recurse into the real dir/file.
+		if info, err = os.Stat(path); err != nil {
+			return err
+		}
+	}
+	if info.IsDir() {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			child := filepath.Join(path, e.Name())
+			// Subdirectory recursion never follows symlinks (upstream
+			// passes process_symlinks=false to nested walkdir calls).
+			if e.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			if e.IsDir() {
+				if err := walkAndFsync(child, false, excludeDir); err != nil {
+					return err
+				}
+			} else if e.Type().IsRegular() {
+				if err := fsyncPath(child, false); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return fsyncPath(path, info.IsDir())
+}
+
+// fsyncPath opens path read-only and fsyncs it, mirroring upstream initdb's
+// fsync_fname_ext (src/common/file_utils.c). Benign errors are tolerated the
+// same way upstream does: EACCES on open (and EISDIR for directories), and
+// EBADF/EINVAL on the fsync itself for directories — some filesystems reject
+// fsync of a directory opened O_RDONLY, and that is not a durability failure.
+func fsyncPath(path string, isDir bool) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) || (isDir && errors.Is(err, syscall.EISDIR)) {
+			return nil
+		}
+		return fmt.Errorf("open %q for fsync: %w", path, err)
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		if isDir && (errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EINVAL)) {
+			return nil
+		}
+		return fmt.Errorf("fsync %q: %w", path, err)
+	}
+	return nil
+}
+
+// relaxToGroupAccess relaxes every directory under dataDir to 0o750
+// (PG_DIR_MODE_GROUP) and every regular file to 0o640 (PG_FILE_MODE_GROUP),
+// mirroring the net on-disk effect of upstream initdb's
+// SetDataDirectoryCreatePerm(PG_DIR_MODE_GROUP) (src/common/file_perm.c,
+// initdb.c:3360). Upstream creates each file/dir at the group mode from the
+// start via the pg_dir_create_mode / pg_file_create_mode globals; goopg lays
+// the tree out at owner mode (0o700/0o600) and relaxes it here in one pass,
+// producing an identical final tree — the invariant that 001_initdb.pl's
+// check_mode_recursive($datadir, 0750, 0640) validates.
+//
+// Like fsyncDataDir, the top-level walk ignores symlinks, so a relocated
+// pg_wal (-X/--waldir) is descended through separately to relax its external
+// target and contents too (check_mode_recursive follows symlinks with
+// follow_fast, so the WAL directory must satisfy the same modes).
+func relaxToGroupAccess(dataDir string) error {
+	if err := chmodTreeGroup(dataDir, false); err != nil {
+		return err
+	}
+	pgWal := filepath.Join(dataDir, "pg_wal")
+	if info, err := os.Lstat(pgWal); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if err := chmodTreeGroup(pgWal, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// chmodTreeGroup recursively chmods path and everything beneath it: every
+// directory to 0o750 and every regular file to 0o640. Symlinks are ignored
+// except at the top level when followTopSymlink is true (used to descend into
+// a relocated pg_wal), exactly mirroring walkAndFsync's traversal so the two
+// passes agree on which entries they touch.
+func chmodTreeGroup(path string, followTopSymlink bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		if !followTopSymlink {
+			return nil
+		}
+		if info, err = os.Stat(path); err != nil {
+			return err
+		}
+	}
+	if info.IsDir() {
+		if err := os.Chmod(path, 0o750); err != nil {
+			return fmt.Errorf("chmod dir %q: %w", path, err)
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			// Nested symlinks are never followed (matches walkAndFsync).
+			if e.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			if err := chmodTreeGroup(filepath.Join(path, e.Name()), false); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if info.Mode().IsRegular() {
+		if err := os.Chmod(path, 0o640); err != nil {
+			return fmt.Errorf("chmod file %q: %w", path, err)
+		}
+	}
+	return nil
+}
+
 func Init(opts Options) error {
 	if opts.DataDir == "" {
 		return errors.New("goopg init: -D <data-directory> is required")
@@ -175,13 +602,112 @@ func Init(opts Options) error {
 	if err != nil {
 		return fmt.Errorf("goopg init: resolve %q: %w", opts.DataDir, err)
 	}
+	// Validate the sync method up front (mirrors parse_sync_method, which
+	// initdb runs during option parsing) so both the sync-only and full-init
+	// paths reject a bad value before touching the filesystem.
+	syncMethod, err := resolveSyncMethod(opts.SyncMethod)
+	if err != nil {
+		return err
+	}
+	// Sync-only mode (upstream initdb -S/--sync-only, initdb.c:3439):
+	// fsync an already-initialized data directory to disk and exit
+	// without creating a new cluster. The directory must already exist
+	// and be accessible; a missing directory is rejected, mirroring
+	// initdb.c's pg_check_dir(pg_data) <= 0 → "could not access
+	// directory". This branch runs before any layout/validation so it
+	// never mutates the tree.
+	if opts.SyncOnly {
+		info, err := os.Stat(abs)
+		if err != nil || !info.IsDir() {
+			return fmt.Errorf("goopg init: could not access directory %q", abs)
+		}
+		if err := syncDataDir(abs, syncMethod, !opts.NoSyncDataFiles); err != nil {
+			return fmt.Errorf("goopg init: sync data to disk: %w", err)
+		}
+		return nil
+	}
+	// Resolve the bootstrap superuser name (upstream initdb -U/--username).
+	// Default "postgres"; reject the reserved "pg_" prefix exactly as
+	// initdb.c:3479 does, before touching the filesystem.
+	superuser := opts.SuperuserName
+	if superuser == "" {
+		superuser = "postgres"
+	}
+	if strings.HasPrefix(superuser, "pg_") {
+		return fmt.Errorf("goopg init: superuser name %q is disallowed; role names cannot begin with \"pg_\"", superuser)
+	}
+	// Resolve + validate the default database encoding up front (upstream
+	// initdb -E/--encoding via get_encoding_id, initdb.c:846) so an unknown
+	// or client-only encoding name aborts before any filesystem work — and
+	// before the trust-default auth warning is printed.
+	encodingID, err := resolveEncoding(opts.Encoding)
+	if err != nil {
+		return err
+	}
+	// Resolve + validate the locale provider and lc_* settings up front
+	// (upstream initdb --locale-provider / --locale / --lc-* / --builtin-locale
+	// / --icu-* via setlocales + setup_encoding). A bad provider, an illegal
+	// option combination, or an encoding/locale mismatch aborts before any
+	// filesystem work. The result feeds pg_database (datlocprovider /
+	// datcollate / datctype / datlocale) and the lc_* GUC seeding below.
+	locale, err := resolveLocale(opts, encodingID)
+	if err != nil {
+		return err
+	}
+	// Resolve + validate the authentication methods up front (upstream
+	// initdb -A/--auth, --auth-host, --auth-local) before any filesystem
+	// work, so a bad method or a password method without --pwfile aborts
+	// before the tree is created. Then read --pwfile (if any) and encode the
+	// superuser's rolpassword verifier; both are needed below when writing
+	// pg_hba.conf, postgresql.conf, and pg_authid.
+	authHost, authLocal, authWarn, err := resolveAuthMethods(opts.AuthMethodHost, opts.AuthMethodLocal, opts.PwFile != "")
+	if err != nil {
+		return err
+	}
+	var rolpassword, passwordEncryption string
+	if opts.PwFile != "" {
+		pwd, perr := readSuperuserPasswordFile(opts.PwFile)
+		if perr != nil {
+			return perr
+		}
+		rolpassword, passwordEncryption, perr = encodeSuperuserPassword(pwd, authHost, authLocal, superuser)
+		if perr != nil {
+			return perr
+		}
+	}
+	if authWarn {
+		// Mirrors initdb's trust-default warning (initdb.c authwarning,
+		// 3518). Non-fatal; the cluster is created with trust auth.
+		log.Printf("goopg init: enabling \"trust\" authentication for local connections; "+
+			"you can change this by editing pg_hba.conf or using -A, --auth-local, or --auth-host (data dir %q)", abs)
+	}
+	// Resolve the optional external WAL directory (upstream initdb
+	// -X/--waldir). It must be an absolute path; reject a relative path
+	// before any filesystem layout happens, mirroring initdb.c's "WAL
+	// directory location must be an absolute path" (initdb.c:2961).
+	walDir := opts.WALDir
+	if walDir != "" && !filepath.IsAbs(walDir) {
+		return fmt.Errorf("goopg init: WAL directory location must be an absolute path: %q", walDir)
+	}
 	if err := ensureEmptyDir(abs); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(abs, 0o700); err != nil {
 		return fmt.Errorf("goopg init: create %q: %w", abs, err)
 	}
+	// When an external WAL directory is requested, set up <abs>/pg_wal as
+	// a symlink to it before the subdir loop. The loop then skips the
+	// literal "pg_wal" entry but still creates pg_wal/archive_status and
+	// pg_wal/summaries, which land inside walDir through the symlink.
+	if walDir != "" {
+		if err := setupWALDir(abs, walDir); err != nil {
+			return fmt.Errorf("goopg init: %w", err)
+		}
+	}
 	for _, sub := range Subdirs {
+		if sub == "pg_wal" && walDir != "" {
+			continue // already created as a symlink to the external WAL dir
+		}
 		path := filepath.Join(abs, sub)
 		if err := os.Mkdir(path, 0o700); err != nil {
 			return fmt.Errorf("goopg init: mkdir %q: %w", path, err)
@@ -202,6 +728,22 @@ func Init(opts Options) error {
 			return fmt.Errorf("goopg init: write %q: %w", path, err)
 		}
 	}
+	// Overwrite pg_hba.conf with the resolved auth methods (upstream
+	// initdb's @authmethodhost@/@authmethodlocal@ token replacement in
+	// setup_config). SampleFiles wrote the trust default above; this
+	// substitutes the requested methods (a no-op when both are trust).
+	hbaPath := filepath.Join(abs, "pg_hba.conf")
+	if err := os.WriteFile(hbaPath, buildPgHBAConf(authHost, authLocal), 0o600); err != nil {
+		return fmt.Errorf("goopg init: write %q: %w", hbaPath, err)
+	}
+	// Seed any --text-search-config / --set GUC overrides into the
+	// just-written postgresql.conf, mirroring upstream initdb's
+	// setup_config (initdb.c). password_encryption is seeded to md5 when an
+	// md5 auth method was chosen (initdb.c:1402-1413). No-op when no
+	// relevant option was given.
+	if err := seedPostgresqlConf(abs, opts.TextSearchConfig, passwordEncryption, opts.AllowGroupAccess, locale.localeGUCSettings(), opts.ExtraGUC); err != nil {
+		return fmt.Errorf("goopg init: seed postgresql.conf: %w", err)
+	}
 	if err := bootstrapSystemCatalogs(abs); err != nil {
 		return fmt.Errorf("goopg init: system catalogs: %w", err)
 	}
@@ -211,13 +753,14 @@ func Init(opts Options) error {
 	if err := bootstrapSharedCatalogPlaceholders(abs); err != nil {
 		return fmt.Errorf("goopg init: shared catalog placeholders: %w", err)
 	}
-	// Overwrite pg_authid placeholder with a minimal "postgres" superuser row
-	// plus (if distinct from "postgres") an OS-user role at OID 16384.
-	pgAuthidEntries, err := bootstrapPostgresRole(abs)
+	// Overwrite pg_authid placeholder with a minimal superuser row for
+	// `superuser` (default "postgres") plus (if distinct) an OS-user role
+	// at OID 16384.
+	pgAuthidEntries, err := bootstrapPostgresRoleWithPassword(abs, superuser, rolpassword)
 	if err != nil {
 		return fmt.Errorf("goopg init: postgres role: %w", err)
 	}
-	if err := bootstrapPostgresDatabase(abs); err != nil {
+	if err := bootstrapPostgresDatabase(abs, encodingID, locale); err != nil {
 		return fmt.Errorf("goopg init: postgres database: %w", err)
 	}
 	// M0106-0010 step 3cs: overwrite the empty btree placeholder at
@@ -605,8 +1148,41 @@ func Init(opts Options) error {
 	// Write the PG-compatible pg_control file so pg_controldata,
 	// pg_checksums, and other client tools can inspect the cluster
 	// (M0095-0001).
-	if err := writePgControl(abs, sysID, opts.Registry); err != nil {
+	if err := writePgControl(abs, sysID, opts.Registry, opts.DataChecksums); err != nil {
 		return fmt.Errorf("goopg init: pg_control: %w", err)
+	}
+	// Data-page checksums (upstream initdb -k/--data-checksums): pg_control's
+	// data_checksum_version=1 (written just above) is a promise that every
+	// data page on disk carries a valid pd_checksum. The bootstrap wrote all
+	// relation files without checksums; stamp them now in one offline pass
+	// over base/ and global/ (mirroring pg_checksums --enable), after every
+	// relation file — including the base/1 → base/5 / template0 copies and
+	// the mapped-local-catalog heaps — is final, and before the trailing fsync
+	// so the checksummed bytes are flushed durably. A version-0 cluster (the
+	// default) skips this entirely and is byte-identical to before.
+	if opts.DataChecksums {
+		if err := stampClusterChecksums(abs); err != nil {
+			return fmt.Errorf("goopg init: data-page checksums: %w", err)
+		}
+	}
+	// Relax the whole tree to group-readable mode when -g/--allow-group-access
+	// was given (upstream SetDataDirectoryCreatePerm(PG_DIR_MODE_GROUP)). Done
+	// after the full layout but before the fsync below, so the relaxed modes
+	// are flushed durably (upstream creates at the group mode from the start;
+	// the net on-disk result is identical — every dir 0o750, every file 0o640).
+	if opts.AllowGroupAccess {
+		if err := relaxToGroupAccess(abs); err != nil {
+			return fmt.Errorf("goopg init: allow group access: %w", err)
+		}
+	}
+	// Flush the freshly written cluster to disk so it survives a host
+	// crash, mirroring upstream initdb's default trailing
+	// sync_pgdata (initdb.c:3512). Skipped when NoSync is set
+	// (-N/--no-sync), which trades durability for speed.
+	if !opts.NoSync {
+		if err := syncDataDir(abs, syncMethod, !opts.NoSyncDataFiles); err != nil {
+			return fmt.Errorf("goopg init: sync data to disk: %w", err)
+		}
 	}
 	return nil
 }
@@ -855,7 +1431,17 @@ func makeBtreeRootPage() []byte {
 // bootstrapPostgresRole writes a minimal pg_authid tuple for the
 // "postgres" superuser so PG standby accepts connections. The tuple
 // uses PG's native heap-tuple encoding (not goopg's internal format).
-func bootstrapPostgresRole(dataDir string) ([]pgAuthidEntry, error) {
+func bootstrapPostgresRole(dataDir, superuser string) ([]pgAuthidEntry, error) {
+	return bootstrapPostgresRoleWithPassword(dataDir, superuser, "")
+}
+
+// bootstrapPostgresRoleWithPassword is bootstrapPostgresRole with an optional
+// pre-encoded rolpassword verifier for the bootstrap superuser (OID 10),
+// supplied by --pwfile (upstream initdb's setup_auth ALTER USER … PASSWORD).
+// An empty rolpassword leaves the row's password empty (the no-password
+// default). The verifier is a non-NULL text value, so the bootstrap row keeps
+// HEAP_HASNULL clear and its t_hoff is unchanged.
+func bootstrapPostgresRoleWithPassword(dataDir, superuser, rolpassword string) ([]pgAuthidEntry, error) {
 	// pg_authid columns (postgres/src/include/catalog/pg_authid.h)
 	cols := []catalog.Column{
 		{Name: "oid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
@@ -874,19 +1460,25 @@ func bootstrapPostgresRole(dataDir string) ([]pgAuthidEntry, error) {
 	// Bootstrap superuser row (OID 10) and optional OS-user row (OID 16384).
 	// rolpassword/rolvaliduntil are written as empty-string/epoch for the
 	// bootstrap rows to keep HEAP_HASNULL clear (no null bitmap, t_hoff=24).
+	// The OID-10 superuser carries the --pwfile verifier (when supplied);
+	// it remains a non-NULL text value, so HEAP_HASNULL stays clear.
 	buildBootstrapRow := func(oid int64, rolname string) executor.Row {
+		pw := ""
+		if oid == 10 {
+			pw = rolpassword
+		}
 		return executor.Row{
-			executor.NewIntDatum(oid),         // oid
-			executor.NewStringDatum(rolname),  // rolname
-			executor.NewBoolDatum(true),       // rolsuper
-			executor.NewBoolDatum(true),       // rolinherit
-			executor.NewBoolDatum(true),       // rolcreaterole
-			executor.NewBoolDatum(false),      // rolcreatedb
-			executor.NewBoolDatum(true),       // rolcanlogin
-			executor.NewBoolDatum(true),       // rolreplication
-			executor.NewBoolDatum(true),       // rolbypassrls
-			executor.NewIntDatum(-1),          // rolconnlimit
-			executor.NewStringDatum(""),       // rolpassword (empty, not null)
+			executor.NewIntDatum(oid),                    // oid
+			executor.NewStringDatum(rolname),             // rolname
+			executor.NewBoolDatum(true),                  // rolsuper
+			executor.NewBoolDatum(true),                  // rolinherit
+			executor.NewBoolDatum(true),                  // rolcreaterole
+			executor.NewBoolDatum(false),                 // rolcreatedb
+			executor.NewBoolDatum(true),                  // rolcanlogin
+			executor.NewBoolDatum(true),                  // rolreplication
+			executor.NewBoolDatum(true),                  // rolbypassrls
+			executor.NewIntDatum(-1),                     // rolconnlimit
+			executor.NewStringDatum(pw),                  // rolpassword (verifier or empty, not null)
 			executor.NewTimeDatum(time.Unix(0, 0).UTC()), // rolvaliduntil (epoch, not null)
 		}
 	}
@@ -896,18 +1488,18 @@ func bootstrapPostgresRole(dataDir string) ([]pgAuthidEntry, error) {
 	// visible without a VACUUM FREEZE pass.
 	buildPredefinedRow := func(oid int64, rolname string) executor.Row {
 		return executor.Row{
-			executor.NewIntDatum(oid),    // oid
+			executor.NewIntDatum(oid),        // oid
 			executor.NewStringDatum(rolname), // rolname
-			executor.NewBoolDatum(false), // rolsuper
-			executor.NewBoolDatum(true),  // rolinherit
-			executor.NewBoolDatum(false), // rolcreaterole
-			executor.NewBoolDatum(false), // rolcreatedb
-			executor.NewBoolDatum(false), // rolcanlogin
-			executor.NewBoolDatum(false), // rolreplication
-			executor.NewBoolDatum(false), // rolbypassrls
-			executor.NewIntDatum(-1),     // rolconnlimit
-			executor.NullDatum,           // rolpassword (NULL)
-			executor.NullDatum,           // rolvaliduntil (NULL)
+			executor.NewBoolDatum(false),     // rolsuper
+			executor.NewBoolDatum(true),      // rolinherit
+			executor.NewBoolDatum(false),     // rolcreaterole
+			executor.NewBoolDatum(false),     // rolcreatedb
+			executor.NewBoolDatum(false),     // rolcanlogin
+			executor.NewBoolDatum(false),     // rolreplication
+			executor.NewBoolDatum(false),     // rolbypassrls
+			executor.NewIntDatum(-1),         // rolconnlimit
+			executor.NullDatum,               // rolpassword (NULL)
+			executor.NullDatum,               // rolvaliduntil (NULL)
 		}
 	}
 
@@ -920,9 +1512,9 @@ func bootstrapPostgresRole(dataDir string) ([]pgAuthidEntry, error) {
 		oid     int64
 		rolname string
 	}
-	seeds := []roleSeed{{oid: 10, rolname: "postgres"}}
+	seeds := []roleSeed{{oid: 10, rolname: superuser}}
 	osUser := os.Getenv("USER")
-	if osUser != "" && osUser != "postgres" {
+	if osUser != "" && osUser != superuser {
 		seeds = append(seeds, roleSeed{oid: 16384, rolname: osUser})
 	}
 
@@ -1011,7 +1603,7 @@ func bootstrapPostgresRole(dataDir string) ([]pgAuthidEntry, error) {
 // `Assert("j > attnum")` in nocachegetattr because HEAP_HASVARWIDTH is
 // missing while the TupleDesc believes there are var-width attrs
 // before the target attnum. M0106-0010 Step 3ct.
-func bootstrapPostgresDatabase(dataDir string) error {
+func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSettings) error {
 	// PG18 pg_database schema (18 cols) per postgres/src/include/catalog/pg_database.h:
 	//   1  oid              Oid
 	//   2  datname          NameData (NAMEDATALEN=64)
@@ -1052,30 +1644,38 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		{Name: "datcollversion", Type: catalog.Type{Name: "text"}, Ordinal: 16},
 		{Name: "datacl", Type: catalog.Type{Name: "aclitem[]"}, Ordinal: 17},
 	}
-	// libc / "C" locale defaults — matches a fresh `initdb --locale=C`.
-	// datlocale, daticurules, datcollversion, datacl are NULL per BKI defaults
-	// (libc uses datcollate/datctype, not datlocale; no ICU rules; no recorded
-	// collation version; no ACL means default-public access).
+	// Locale columns come from the resolved --locale-provider / --locale /
+	// --lc-* options (resolveLocale). The default (no options) reproduces a
+	// fresh `initdb --locale=C` under the libc provider: datlocprovider='c',
+	// datcollate/datctype="C", datlocale NULL. daticurules, datcollversion,
+	// datacl stay NULL per BKI defaults (no ICU rules; no recorded collation
+	// version; no ACL means default-public access). For the builtin provider
+	// datlocale carries the per-database collation (C / C.UTF-8 /
+	// PG_UNICODE_FAST); libc records no datlocale.
+	datlocaleDatum := executor.NullDatum
+	if locale.datlocale != "" {
+		datlocaleDatum = executor.NewStringDatum(locale.datlocale)
+	}
 	buildRow := func(oid uint32, name string, isTemplate bool, allowConn bool) executor.Row {
 		return executor.Row{
-			executor.NewIntDatum(int64(oid)),     // oid
-			executor.NewStringDatum(name),        // datname
-			executor.NewIntDatum(10),             // datdba = bootstrap superuser
-			executor.NewIntDatum(6),              // encoding = PG_UTF8
-			executor.NewStringDatum("c"),         // datlocprovider = libc
-			executor.NewBoolDatum(isTemplate),    // datistemplate
-			executor.NewBoolDatum(allowConn),     // datallowconn
-			executor.NewBoolDatum(false),         // dathasloginevt
-			executor.NewIntDatum(-1),             // datconnlimit
-			executor.NewIntDatum(3),              // datfrozenxid
-			executor.NewIntDatum(1),              // datminmxid
-			executor.NewIntDatum(1663),           // dattablespace = pg_default
-			executor.NewStringDatum("C"),         // datcollate (text, NOT NULL)
-			executor.NewStringDatum("C"),         // datctype   (text, NOT NULL)
-			executor.NullDatum,                   // datlocale (NULL for libc)
-			executor.NullDatum,                   // daticurules
-			executor.NullDatum,                   // datcollversion
-			executor.NullDatum,                   // datacl
+			executor.NewIntDatum(int64(oid)),                 // oid
+			executor.NewStringDatum(name),                    // datname
+			executor.NewIntDatum(10),                         // datdba = bootstrap superuser
+			executor.NewIntDatum(int64(encodingID)),          // encoding (default PG_UTF8=6; -E/--encoding)
+			executor.NewStringDatum(string(locale.provider)), // datlocprovider (--locale-provider)
+			executor.NewBoolDatum(isTemplate),                // datistemplate
+			executor.NewBoolDatum(allowConn),                 // datallowconn
+			executor.NewBoolDatum(false),                     // dathasloginevt
+			executor.NewIntDatum(-1),                         // datconnlimit
+			executor.NewIntDatum(3),                          // datfrozenxid
+			executor.NewIntDatum(1),                          // datminmxid
+			executor.NewIntDatum(1663),                       // dattablespace = pg_default
+			executor.NewStringDatum(locale.collate),          // datcollate (text, NOT NULL)
+			executor.NewStringDatum(locale.ctype),            // datctype   (text, NOT NULL)
+			datlocaleDatum,                                   // datlocale (NULL for libc)
+			executor.NullDatum,                               // daticurules
+			executor.NullDatum,                               // datcollversion
+			executor.NullDatum,                               // datacl
 		}
 	}
 	writeRow := func(page storage.Page, row executor.Row) error {
@@ -1123,8 +1723,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	base1Dir := filepath.Join(dataDir, "base", "1")
 	btreePage := makeBtreeRootPage()
 	for _, oid := range []uint32{
-		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
-		828, // pg_default_acl_oid_index (Step 3am)
+		827,  // pg_default_acl_role_nsp_obj_index (Step 3al)
+		828,  // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
@@ -1140,7 +1740,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688,
-		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
+		2689,       // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
 		// 2692, 2693: dedicated bootstrappers (pg_rewrite_oid_index/pg_rewrite_rel_rulename_index)
 		2701, 2703,
@@ -1163,8 +1763,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3351, // pg_partitioned_table_partrelid_index (Step 3bt)
 		6111, // pg_publication_pubname_index (Step 3bv)
 		6110, // pg_publication_oid_index (Step 3bw)
-		} {
-			if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
+	} {
+		if err := os.WriteFile(filepath.Join(base1Dir, strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
 		}
 	}
@@ -1263,8 +1863,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 	btreePage = makeBtreeRootPage()
 	perDBIndexOIDs := []uint32{
 		// Local critical indexes
-		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
-		828, // pg_default_acl_oid_index (Step 3am)
+		827,  // pg_default_acl_role_nsp_obj_index (Step 3al)
+		828,  // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
@@ -1280,7 +1880,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688,
-		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
+		2689,       // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
 		// 2692, 2693: dedicated bootstrappers (pg_rewrite_oid_index/pg_rewrite_rel_rulename_index)
 		2701, 2703,
@@ -1356,8 +1956,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		6002, // pg_replication_origin_roname_index (Step 3ca)
 		2965, // pg_db_role_setting_databaseid_rol_index (Step 3cu)
 		// Also copy all local critical indexes to global/
-		827, // pg_default_acl_role_nsp_obj_index (Step 3al)
-		828, // pg_default_acl_oid_index (Step 3am)
+		827,  // pg_default_acl_role_nsp_obj_index (Step 3al)
+		828,  // pg_default_acl_oid_index (Step 3am)
 		2650, // pg_aggregate_fnoid_index (Step 3x)
 		2653, // pg_amop_fam_strat_index (Step 3y)
 		2654, 2655, 2658, 2659,
@@ -1373,7 +1973,7 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		// 2684, 2685: dedicated bootstrappers (bootstrapPgNamespaceNspnameIndex/OidIndex)
 		2686, // pg_opclass_am_name_nsp_index (Step 3ad)
 		2687, 2688,
-		2689, // pg_operator_oprname_l_r_n_index (Step 3bl)
+		2689,       // pg_operator_oprname_l_r_n_index (Step 3bl)
 		2690, 2691, // pg_proc_oid_index, pg_proc_proname_args_nsp_index
 		// 2692, 2693: dedicated bootstrappers (pg_rewrite_oid_index/pg_rewrite_rel_rulename_index)
 		2701, 2703,
@@ -1427,8 +2027,8 @@ func bootstrapPostgresDatabase(dataDir string) error {
 		3767, // pg_ts_template_oid_index (Step 3co)
 		174,  // pg_user_mapping_oid_index (Step 3cp)
 		175,  // pg_user_mapping_user_server_index (Step 3cp)
-		} {
-			if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
+	} {
+		if err := os.WriteFile(filepath.Join(dataDir, "global", strconv.FormatUint(uint64(oid), 10)), btreePage, 0o600); err != nil {
 			return err
 		}
 	}
@@ -1625,10 +2225,10 @@ func pgNamespaceInitialEntries() []pgNamespaceEntry {
 
 func pgNamespaceRow(e pgNamespaceEntry) executor.Row {
 	return executor.Row{
-		executor.NewIntDatum(int64(e.OID)),       // oid
-		executor.NewStringDatum(e.NspName),       // nspname
-		executor.NewIntDatum(int64(e.NspOwner)),  // nspowner
-		executor.NewStringDatum("{}"),            // nspacl (empty aclitem[])
+		executor.NewIntDatum(int64(e.OID)),      // oid
+		executor.NewStringDatum(e.NspName),      // nspname
+		executor.NewIntDatum(int64(e.NspOwner)), // nspowner
+		executor.NewStringDatum("{}"),           // nspacl (empty aclitem[])
 	}
 }
 
@@ -1726,7 +2326,6 @@ func bootstrapPgNamespaceOidIndex(dataDir string, tids map[uint32]heapTID) error
 	}
 	return nil
 }
-
 
 // oidVectorBytes returns the on-disk PG-native serialization of an
 // `oidvector` value (1-D Oid array with lbound=0, elemtype=OID(26)).
@@ -1915,39 +2514,39 @@ type pgProcEntry struct {
 // so PG can dereference GETSTRUCT(tup)→Form_pg_proc directly.
 func pgProcColDefs() []catalog.Column {
 	return []catalog.Column{
-		{Name: "oid", Type: catalog.Type{Name: "oid"}},                   // 1
-		{Name: "proname", Type: catalog.Type{Name: "name"}},              // 2
-		{Name: "pronamespace", Type: catalog.Type{Name: "oid"}},          // 3
-		{Name: "proowner", Type: catalog.Type{Name: "oid"}},              // 4
-		{Name: "prolang", Type: catalog.Type{Name: "oid"}},               // 5
-		{Name: "procost", Type: catalog.Type{Name: "float4"}},            // 6
-		{Name: "prorows", Type: catalog.Type{Name: "float4"}},            // 7
-		{Name: "provariadic", Type: catalog.Type{Name: "oid"}},           // 8
-		{Name: "prosupport", Type: catalog.Type{Name: "regproc"}},        // 9
-		{Name: "prokind", Type: catalog.Type{Name: "char"}},              // 10
-		{Name: "prosecdef", Type: catalog.Type{Name: "bool"}},            // 11
-		{Name: "proleakproof", Type: catalog.Type{Name: "bool"}},         // 12
-		{Name: "proisstrict", Type: catalog.Type{Name: "bool"}},          // 13
-		{Name: "proretset", Type: catalog.Type{Name: "bool"}},            // 14
-		{Name: "provolatile", Type: catalog.Type{Name: "char"}},          // 15
-		{Name: "proparallel", Type: catalog.Type{Name: "char"}},          // 16
-		{Name: "pronargs", Type: catalog.Type{Name: "int2"}},             // 17
-		{Name: "pronargdefaults", Type: catalog.Type{Name: "int2"}},      // 18
-		{Name: "prorettype", Type: catalog.Type{Name: "oid"}},            // 19
-		{Name: "proargtypes", Type: catalog.Type{Name: "oidvector"}},     // 20
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},               // 1
+		{Name: "proname", Type: catalog.Type{Name: "name"}},          // 2
+		{Name: "pronamespace", Type: catalog.Type{Name: "oid"}},      // 3
+		{Name: "proowner", Type: catalog.Type{Name: "oid"}},          // 4
+		{Name: "prolang", Type: catalog.Type{Name: "oid"}},           // 5
+		{Name: "procost", Type: catalog.Type{Name: "float4"}},        // 6
+		{Name: "prorows", Type: catalog.Type{Name: "float4"}},        // 7
+		{Name: "provariadic", Type: catalog.Type{Name: "oid"}},       // 8
+		{Name: "prosupport", Type: catalog.Type{Name: "regproc"}},    // 9
+		{Name: "prokind", Type: catalog.Type{Name: "char"}},          // 10
+		{Name: "prosecdef", Type: catalog.Type{Name: "bool"}},        // 11
+		{Name: "proleakproof", Type: catalog.Type{Name: "bool"}},     // 12
+		{Name: "proisstrict", Type: catalog.Type{Name: "bool"}},      // 13
+		{Name: "proretset", Type: catalog.Type{Name: "bool"}},        // 14
+		{Name: "provolatile", Type: catalog.Type{Name: "char"}},      // 15
+		{Name: "proparallel", Type: catalog.Type{Name: "char"}},      // 16
+		{Name: "pronargs", Type: catalog.Type{Name: "int2"}},         // 17
+		{Name: "pronargdefaults", Type: catalog.Type{Name: "int2"}},  // 18
+		{Name: "prorettype", Type: catalog.Type{Name: "oid"}},        // 19
+		{Name: "proargtypes", Type: catalog.Type{Name: "oidvector"}}, // 20
 		// CATALOG_VARLEN section: nullable in PG but we emit empty
 		// binary arrays so the relacl-style "raw bytes as ArrayType*"
 		// dereferences in PG do not trip ARR_ELEMTYPE assertions.
-		{Name: "proallargtypes", Type: catalog.Type{Name: "oid[]"}},      // 21
-		{Name: "proargmodes", Type: catalog.Type{Name: "char[]"}},        // 22
-		{Name: "proargnames", Type: catalog.Type{Name: "text[]"}},        // 23
+		{Name: "proallargtypes", Type: catalog.Type{Name: "oid[]"}},        // 21
+		{Name: "proargmodes", Type: catalog.Type{Name: "char[]"}},          // 22
+		{Name: "proargnames", Type: catalog.Type{Name: "text[]"}},          // 23
 		{Name: "proargdefaults", Type: catalog.Type{Name: "pg_node_tree"}}, // 24
-		{Name: "protrftypes", Type: catalog.Type{Name: "oid[]"}},         // 25
-		{Name: "prosrc", Type: catalog.Type{Name: "text"}},               // 26 — FORCE_NOT_NULL
-		{Name: "probin", Type: catalog.Type{Name: "text"}},               // 27
-		{Name: "prosqlbody", Type: catalog.Type{Name: "pg_node_tree"}},   // 28
-		{Name: "proconfig", Type: catalog.Type{Name: "text[]"}},          // 29
-		{Name: "proacl", Type: catalog.Type{Name: "aclitem[]"}},          // 30
+		{Name: "protrftypes", Type: catalog.Type{Name: "oid[]"}},           // 25
+		{Name: "prosrc", Type: catalog.Type{Name: "text"}},                 // 26 — FORCE_NOT_NULL
+		{Name: "probin", Type: catalog.Type{Name: "text"}},                 // 27
+		{Name: "prosqlbody", Type: catalog.Type{Name: "pg_node_tree"}},     // 28
+		{Name: "proconfig", Type: catalog.Type{Name: "text[]"}},            // 29
+		{Name: "proacl", Type: catalog.Type{Name: "aclitem[]"}},            // 30
 	}
 }
 
@@ -2006,11 +2605,11 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		argNames = executor.NewBytesDatum(textArrayBytes(e.ArgNames))
 	}
 	return executor.Row{
-		executor.NewIntDatum(int64(e.OID)),               // 1  oid
-		executor.NewStringDatum(e.Name),                  // 2  proname
-		executor.NewIntDatum(11),                         // 3  pronamespace = pg_catalog
-		executor.NewIntDatum(10),                         // 4  proowner = BOOTSTRAP_SUPERUSERID
-		executor.NewIntDatum(func() int64 {               // 5  prolang
+		executor.NewIntDatum(int64(e.OID)), // 1  oid
+		executor.NewStringDatum(e.Name),    // 2  proname
+		executor.NewIntDatum(11),           // 3  pronamespace = pg_catalog
+		executor.NewIntDatum(10),           // 4  proowner = BOOTSTRAP_SUPERUSERID
+		executor.NewIntDatum(func() int64 { // 5  prolang
 			if e.Lang != 0 {
 				return int64(e.Lang)
 			}
@@ -2031,16 +2630,16 @@ func pgProcRow(e pgProcEntry) executor.Row {
 		executor.NewIntDatum(0),                          // 18 pronargdefaults
 		executor.NewIntDatum(int64(e.RetType)),           // 19 prorettype
 		executor.NewBytesDatum(oidVectorBytes(argTypes)), // 20 proargtypes
-		allArgs,                                          // 21 proallargtypes
-		argModes,                                         // 22 proargmodes
-		argNames,                                         // 23 proargnames
-		executor.NewStringDatum(""),                      // 24 proargdefaults (pg_node_tree)
-		executor.NewStringDatum(""),                      // 25 protrftypes
-		executor.NewStringDatum(e.HandlerName),           // 26 prosrc — fmgr internal lookup key
-		executor.NewStringDatum(""),                      // 27 probin
-		executor.NewStringDatum(""),                      // 28 prosqlbody
-		executor.NewStringDatum(""),                      // 29 proconfig
-		executor.NewStringDatum(""),                      // 30 proacl
+		allArgs,                                // 21 proallargtypes
+		argModes,                               // 22 proargmodes
+		argNames,                               // 23 proargnames
+		executor.NewStringDatum(""),            // 24 proargdefaults (pg_node_tree)
+		executor.NewStringDatum(""),            // 25 protrftypes
+		executor.NewStringDatum(e.HandlerName), // 26 prosrc — fmgr internal lookup key
+		executor.NewStringDatum(""),            // 27 probin
+		executor.NewStringDatum(""),            // 28 prosqlbody
+		executor.NewStringDatum(""),            // 29 proconfig
+		executor.NewStringDatum(""),            // 30 proacl
 	}
 }
 
@@ -2536,7 +3135,6 @@ func bootstrapPgOpclassTuples(dataDir string) (map[uint32]heapTID, error) {
 	return tidMap, nil
 }
 
-
 // pgAmopEntry mirrors one row of PG18's pg_amop.dat — see
 // `postgres/src/include/catalog/pg_amop.dat` and the
 // `FormData_pg_amop` struct in `pg_amop.h`. goopg only seeds
@@ -2544,15 +3142,15 @@ func bootstrapPgOpclassTuples(dataDir string) (map[uint32]heapTID, error) {
 // operators for the btree opclasses pinned in
 // pgOpclassInitialEntries; cross-type entries are out of scope.
 type pgAmopEntry struct {
-	OID         uint32 // amop OID
-	Family      uint32 // amopfamily — pg_opfamily OID
-	LeftType    uint32 // amoplefttype — pg_type OID
-	RightType   uint32 // amoprighttype — pg_type OID
-	Strategy    int16  // amopstrategy — 1..5 for btree
-	Purpose     byte   // amoppurpose — 's' (search) or 'o' (order)
-	Operator    uint32 // amopopr — pg_operator OID
-	Method      uint32 // amopmethod — pg_am OID (403 = btree)
-	SortFamily  uint32 // amopsortfamily — 0 for search ops
+	OID        uint32 // amop OID
+	Family     uint32 // amopfamily — pg_opfamily OID
+	LeftType   uint32 // amoplefttype — pg_type OID
+	RightType  uint32 // amoprighttype — pg_type OID
+	Strategy   int16  // amopstrategy — 1..5 for btree
+	Purpose    byte   // amoppurpose — 's' (search) or 'o' (order)
+	Operator   uint32 // amopopr — pg_operator OID
+	Method     uint32 // amopmethod — pg_am OID (403 = btree)
+	SortFamily uint32 // amopsortfamily — 0 for search ops
 }
 
 // pgAmopColDefs returns the PG18 9-column FormData_pg_amop shape.
@@ -2645,15 +3243,15 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	}
 
 	// family=1976 (integer_ops) btree
-	addPair(1976, 23, 23, amBtree, [5]uint32{97, 523, 96, 525, 521}) // int4 x int4
-	addPair(1976, 23, 21, amBtree, [5]uint32{535, 541, 533, 543, 537}) // int4 x int2
-	addPair(1976, 23, 20, amBtree, [5]uint32{37, 80, 15, 82, 76}) // int4 x int8
-	addPair(1976, 21, 21, amBtree, [5]uint32{95, 522, 94, 524, 520}) // int2 x int2
-	addPair(1976, 21, 23, amBtree, [5]uint32{534, 540, 532, 542, 536}) // int2 x int4
+	addPair(1976, 23, 23, amBtree, [5]uint32{97, 523, 96, 525, 521})        // int4 x int4
+	addPair(1976, 23, 21, amBtree, [5]uint32{535, 541, 533, 543, 537})      // int4 x int2
+	addPair(1976, 23, 20, amBtree, [5]uint32{37, 80, 15, 82, 76})           // int4 x int8
+	addPair(1976, 21, 21, amBtree, [5]uint32{95, 522, 94, 524, 520})        // int2 x int2
+	addPair(1976, 21, 23, amBtree, [5]uint32{534, 540, 532, 542, 536})      // int2 x int4
 	addPair(1976, 21, 20, amBtree, [5]uint32{1864, 1866, 1862, 1867, 1865}) // int2 x int8
-	addPair(1976, 20, 20, amBtree, [5]uint32{412, 414, 410, 415, 413}) // int8 x int8
+	addPair(1976, 20, 20, amBtree, [5]uint32{412, 414, 410, 415, 413})      // int8 x int8
 	addPair(1976, 20, 21, amBtree, [5]uint32{1870, 1872, 1868, 1873, 1871}) // int8 x int2
-	addPair(1976, 20, 23, amBtree, [5]uint32{418, 420, 416, 430, 419}) // int8 x int4
+	addPair(1976, 20, 23, amBtree, [5]uint32{418, 420, 416, 430, 419})      // int8 x int4
 
 	// family=1989 (oid_ops) btree
 	addPair(1989, 26, 26, amBtree, [5]uint32{609, 611, 607, 612, 610}) // oid x oid
@@ -2668,17 +3266,17 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	addPair(1991, 30, 30, amBtree, [5]uint32{645, 647, 649, 648, 646}) // oidvector x oidvector
 
 	// family=1970 (float_ops) btree
-	addPair(1970, 700, 700, amBtree, [5]uint32{622, 624, 620, 625, 623}) // float4 x float4
+	addPair(1970, 700, 700, amBtree, [5]uint32{622, 624, 620, 625, 623})      // float4 x float4
 	addPair(1970, 700, 701, amBtree, [5]uint32{1122, 1124, 1120, 1125, 1123}) // float4 x float8
-	addPair(1970, 701, 701, amBtree, [5]uint32{672, 673, 670, 675, 674}) // float8 x float8
+	addPair(1970, 701, 701, amBtree, [5]uint32{672, 673, 670, 675, 674})      // float8 x float8
 	addPair(1970, 701, 700, amBtree, [5]uint32{1132, 1134, 1130, 1135, 1133}) // float8 x float4
 
 	// family=429 (char_ops) btree
 	addPair(429, 18, 18, amBtree, [5]uint32{631, 632, 92, 634, 633}) // char x char
 
 	// family=1994 (text_ops) btree
-	addPair(1994, 25, 25, amBtree, [5]uint32{664, 665, 98, 667, 666}) // text x text
-	addPair(1994, 19, 19, amBtree, [5]uint32{660, 661, 93, 663, 662}) // name x name
+	addPair(1994, 25, 25, amBtree, [5]uint32{664, 665, 98, 667, 666})  // text x text
+	addPair(1994, 19, 19, amBtree, [5]uint32{660, 661, 93, 663, 662})  // name x name
 	addPair(1994, 19, 25, amBtree, [5]uint32{255, 256, 254, 257, 258}) // name x text
 	addPair(1994, 25, 19, amBtree, [5]uint32{261, 262, 260, 263, 264}) // text x name
 
@@ -2781,8 +3379,8 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(435, 1082, 1082, 1, 1093, amHash) // strat=1 =(date,date) (date x date)
 
 	// family=1971 (float_ops) hash
-	amOp(1971, 700, 700, 1, 620, amHash) // strat=1 =(float4,float4) (float4 x float4)
-	amOp(1971, 701, 701, 1, 670, amHash) // strat=1 =(float8,float8) (float8 x float8)
+	amOp(1971, 700, 700, 1, 620, amHash)  // strat=1 =(float4,float4) (float4 x float4)
+	amOp(1971, 701, 701, 1, 670, amHash)  // strat=1 =(float8,float8) (float8 x float8)
 	amOp(1971, 700, 701, 1, 1120, amHash) // strat=1 =(float4,float8) (float4 x float8)
 	amOp(1971, 701, 700, 1, 1130, amHash) // strat=1 =(float8,float4) (float8 x float4)
 
@@ -2790,15 +3388,15 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(1975, 869, 869, 1, 1201, amHash) // strat=1 =(inet,inet) (inet x inet)
 
 	// family=1977 (integer_ops) hash
-	amOp(1977, 21, 21, 1, 94, amHash) // strat=1 =(int2,int2) (int2 x int2)
-	amOp(1977, 23, 23, 1, 96, amHash) // strat=1 =(int4,int4) (int4 x int4)
-	amOp(1977, 20, 20, 1, 410, amHash) // strat=1 =(int8,int8) (int8 x int8)
-	amOp(1977, 21, 23, 1, 532, amHash) // strat=1 =(int2,int4) (int2 x int4)
+	amOp(1977, 21, 21, 1, 94, amHash)   // strat=1 =(int2,int2) (int2 x int2)
+	amOp(1977, 23, 23, 1, 96, amHash)   // strat=1 =(int4,int4) (int4 x int4)
+	amOp(1977, 20, 20, 1, 410, amHash)  // strat=1 =(int8,int8) (int8 x int8)
+	amOp(1977, 21, 23, 1, 532, amHash)  // strat=1 =(int2,int4) (int2 x int4)
 	amOp(1977, 21, 20, 1, 1862, amHash) // strat=1 =(int2,int8) (int2 x int8)
-	amOp(1977, 23, 21, 1, 533, amHash) // strat=1 =(int4,int2) (int4 x int2)
-	amOp(1977, 23, 20, 1, 15, amHash) // strat=1 =(int4,int8) (int4 x int8)
+	amOp(1977, 23, 21, 1, 533, amHash)  // strat=1 =(int4,int2) (int4 x int2)
+	amOp(1977, 23, 20, 1, 15, amHash)   // strat=1 =(int4,int8) (int4 x int8)
 	amOp(1977, 20, 21, 1, 1868, amHash) // strat=1 =(int8,int2) (int8 x int2)
-	amOp(1977, 20, 23, 1, 416, amHash) // strat=1 =(int8,int4) (int8 x int4)
+	amOp(1977, 20, 23, 1, 416, amHash)  // strat=1 =(int8,int4) (int8 x int4)
 
 	// family=1983 (interval_ops) hash
 	amOp(1983, 1186, 1186, 1, 1330, amHash) // strat=1 =(interval,interval) (interval x interval)
@@ -2819,8 +3417,8 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(6194, 2249, 2249, 1, 2988, amHash) // strat=1 =(record,record) (record x record)
 
 	// family=1995 (text_ops) hash
-	amOp(1995, 25, 25, 1, 98, amHash) // strat=1 =(text,text) (text x text)
-	amOp(1995, 19, 19, 1, 93, amHash) // strat=1 =(name,name) (name x name)
+	amOp(1995, 25, 25, 1, 98, amHash)  // strat=1 =(text,text) (text x text)
+	amOp(1995, 19, 19, 1, 93, amHash)  // strat=1 =(name,name) (name x name)
 	amOp(1995, 19, 25, 1, 254, amHash) // strat=1 =(name,text) (name x text)
 	amOp(1995, 25, 19, 1, 260, amHash) // strat=1 =(text,name) (text x name)
 
@@ -2876,61 +3474,61 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(627, 2277, 2277, 1, 1070, amHash) // strat=1 =(anyarray,anyarray) (anyarray x anyarray)
 
 	// family=2593 (box_ops) gist
-	amOp(2593, 603, 603, 1, 493, amGist) // strat=1 <<(box,box) (box x box)
-	amOp(2593, 603, 603, 2, 494, amGist) // strat=2 &<(box,box) (box x box)
-	amOp(2593, 603, 603, 3, 500, amGist) // strat=3 &&(box,box) (box x box)
-	amOp(2593, 603, 603, 4, 495, amGist) // strat=4 &>(box,box) (box x box)
-	amOp(2593, 603, 603, 5, 496, amGist) // strat=5 >>(box,box) (box x box)
-	amOp(2593, 603, 603, 6, 499, amGist) // strat=6 ~=(box,box) (box x box)
-	amOp(2593, 603, 603, 7, 498, amGist) // strat=7 @>(box,box) (box x box)
-	amOp(2593, 603, 603, 8, 497, amGist) // strat=8 <@(box,box) (box x box)
-	amOp(2593, 603, 603, 9, 2571, amGist) // strat=9 &<|(box,box) (box x box)
-	amOp(2593, 603, 603, 10, 2570, amGist) // strat=10 <<|(box,box) (box x box)
-	amOp(2593, 603, 603, 11, 2573, amGist) // strat=11 |>>(box,box) (box x box)
-	amOp(2593, 603, 603, 12, 2572, amGist) // strat=12 |&>(box,box) (box x box)
+	amOp(2593, 603, 603, 1, 493, amGist)             // strat=1 <<(box,box) (box x box)
+	amOp(2593, 603, 603, 2, 494, amGist)             // strat=2 &<(box,box) (box x box)
+	amOp(2593, 603, 603, 3, 500, amGist)             // strat=3 &&(box,box) (box x box)
+	amOp(2593, 603, 603, 4, 495, amGist)             // strat=4 &>(box,box) (box x box)
+	amOp(2593, 603, 603, 5, 496, amGist)             // strat=5 >>(box,box) (box x box)
+	amOp(2593, 603, 603, 6, 499, amGist)             // strat=6 ~=(box,box) (box x box)
+	amOp(2593, 603, 603, 7, 498, amGist)             // strat=7 @>(box,box) (box x box)
+	amOp(2593, 603, 603, 8, 497, amGist)             // strat=8 <@(box,box) (box x box)
+	amOp(2593, 603, 603, 9, 2571, amGist)            // strat=9 &<|(box,box) (box x box)
+	amOp(2593, 603, 603, 10, 2570, amGist)           // strat=10 <<|(box,box) (box x box)
+	amOp(2593, 603, 603, 11, 2573, amGist)           // strat=11 |>>(box,box) (box x box)
+	amOp(2593, 603, 603, 12, 2572, amGist)           // strat=12 |&>(box,box) (box x box)
 	amOpOrder(2593, 603, 600, 15, 606, amGist, 1970) // strat=15 <->(box,point) (box x point)
 
 	// family=1029 (point_ops) gist
-	amOp(1029, 600, 600, 11, 4161, amGist) // strat=11 |>>(point,point) (point x point)
-	amOp(1029, 600, 600, 30, 506, amGist) // strat=30 >^(point,point) (point x point)
-	amOp(1029, 600, 600, 1, 507, amGist) // strat=1 <<(point,point) (point x point)
-	amOp(1029, 600, 600, 5, 508, amGist) // strat=5 >>(point,point) (point x point)
-	amOp(1029, 600, 600, 10, 4162, amGist) // strat=10 <<|(point,point) (point x point)
-	amOp(1029, 600, 600, 29, 509, amGist) // strat=29 <^(point,point) (point x point)
-	amOp(1029, 600, 600, 6, 510, amGist) // strat=6 ~=(point,point) (point x point)
+	amOp(1029, 600, 600, 11, 4161, amGist)           // strat=11 |>>(point,point) (point x point)
+	amOp(1029, 600, 600, 30, 506, amGist)            // strat=30 >^(point,point) (point x point)
+	amOp(1029, 600, 600, 1, 507, amGist)             // strat=1 <<(point,point) (point x point)
+	amOp(1029, 600, 600, 5, 508, amGist)             // strat=5 >>(point,point) (point x point)
+	amOp(1029, 600, 600, 10, 4162, amGist)           // strat=10 <<|(point,point) (point x point)
+	amOp(1029, 600, 600, 29, 509, amGist)            // strat=29 <^(point,point) (point x point)
+	amOp(1029, 600, 600, 6, 510, amGist)             // strat=6 ~=(point,point) (point x point)
 	amOpOrder(1029, 600, 600, 15, 517, amGist, 1970) // strat=15 <->(point,point) (point x point)
-	amOp(1029, 600, 603, 28, 511, amGist) // strat=28 <@(point,box) (point x box)
-	amOp(1029, 600, 604, 48, 756, amGist) // strat=48 <@(point,polygon) (point x polygon)
-	amOp(1029, 600, 718, 68, 758, amGist) // strat=68 <@(point,circle) (point x circle)
+	amOp(1029, 600, 603, 28, 511, amGist)            // strat=28 <@(point,box) (point x box)
+	amOp(1029, 600, 604, 48, 756, amGist)            // strat=48 <@(point,polygon) (point x polygon)
+	amOp(1029, 600, 718, 68, 758, amGist)            // strat=68 <@(point,circle) (point x circle)
 
 	// family=2594 (poly_ops) gist
-	amOp(2594, 604, 604, 1, 485, amGist) // strat=1 <<(polygon,polygon) (polygon x polygon)
-	amOp(2594, 604, 604, 2, 486, amGist) // strat=2 &<(polygon,polygon) (polygon x polygon)
-	amOp(2594, 604, 604, 3, 492, amGist) // strat=3 &&(polygon,polygon) (polygon x polygon)
-	amOp(2594, 604, 604, 4, 487, amGist) // strat=4 &>(polygon,polygon) (polygon x polygon)
-	amOp(2594, 604, 604, 5, 488, amGist) // strat=5 >>(polygon,polygon) (polygon x polygon)
-	amOp(2594, 604, 604, 6, 491, amGist) // strat=6 ~=(polygon,polygon) (polygon x polygon)
-	amOp(2594, 604, 604, 7, 490, amGist) // strat=7 @>(polygon,polygon) (polygon x polygon)
-	amOp(2594, 604, 604, 8, 489, amGist) // strat=8 <@(polygon,polygon) (polygon x polygon)
-	amOp(2594, 604, 604, 9, 2575, amGist) // strat=9 &<|(polygon,polygon) (polygon x polygon)
-	amOp(2594, 604, 604, 10, 2574, amGist) // strat=10 <<|(polygon,polygon) (polygon x polygon)
-	amOp(2594, 604, 604, 11, 2577, amGist) // strat=11 |>>(polygon,polygon) (polygon x polygon)
-	amOp(2594, 604, 604, 12, 2576, amGist) // strat=12 |&>(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 1, 485, amGist)              // strat=1 <<(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 2, 486, amGist)              // strat=2 &<(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 3, 492, amGist)              // strat=3 &&(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 4, 487, amGist)              // strat=4 &>(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 5, 488, amGist)              // strat=5 >>(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 6, 491, amGist)              // strat=6 ~=(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 7, 490, amGist)              // strat=7 @>(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 8, 489, amGist)              // strat=8 <@(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 9, 2575, amGist)             // strat=9 &<|(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 10, 2574, amGist)            // strat=10 <<|(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 11, 2577, amGist)            // strat=11 |>>(polygon,polygon) (polygon x polygon)
+	amOp(2594, 604, 604, 12, 2576, amGist)            // strat=12 |&>(polygon,polygon) (polygon x polygon)
 	amOpOrder(2594, 604, 600, 15, 3289, amGist, 1970) // strat=15 <->(polygon,point) (polygon x point)
 
 	// family=2595 (circle_ops) gist
-	amOp(2595, 718, 718, 1, 1506, amGist) // strat=1 <<(circle,circle) (circle x circle)
-	amOp(2595, 718, 718, 2, 1507, amGist) // strat=2 &<(circle,circle) (circle x circle)
-	amOp(2595, 718, 718, 3, 1513, amGist) // strat=3 &&(circle,circle) (circle x circle)
-	amOp(2595, 718, 718, 4, 1508, amGist) // strat=4 &>(circle,circle) (circle x circle)
-	amOp(2595, 718, 718, 5, 1509, amGist) // strat=5 >>(circle,circle) (circle x circle)
-	amOp(2595, 718, 718, 6, 1512, amGist) // strat=6 ~=(circle,circle) (circle x circle)
-	amOp(2595, 718, 718, 7, 1511, amGist) // strat=7 @>(circle,circle) (circle x circle)
-	amOp(2595, 718, 718, 8, 1510, amGist) // strat=8 <@(circle,circle) (circle x circle)
-	amOp(2595, 718, 718, 9, 2589, amGist) // strat=9 &<|(circle,circle) (circle x circle)
-	amOp(2595, 718, 718, 10, 1515, amGist) // strat=10 <<|(circle,circle) (circle x circle)
-	amOp(2595, 718, 718, 11, 1514, amGist) // strat=11 |>>(circle,circle) (circle x circle)
-	amOp(2595, 718, 718, 12, 2590, amGist) // strat=12 |&>(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 1, 1506, amGist)             // strat=1 <<(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 2, 1507, amGist)             // strat=2 &<(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 3, 1513, amGist)             // strat=3 &&(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 4, 1508, amGist)             // strat=4 &>(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 5, 1509, amGist)             // strat=5 >>(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 6, 1512, amGist)             // strat=6 ~=(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 7, 1511, amGist)             // strat=7 @>(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 8, 1510, amGist)             // strat=8 <@(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 9, 2589, amGist)             // strat=9 &<|(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 10, 1515, amGist)            // strat=10 <<|(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 11, 1514, amGist)            // strat=11 |>>(circle,circle) (circle x circle)
+	amOp(2595, 718, 718, 12, 2590, amGist)            // strat=12 |&>(circle,circle) (circle x circle)
 	amOpOrder(2595, 718, 600, 15, 3291, amGist, 1970) // strat=15 <->(circle,point) (circle x point)
 
 	// family=2745 (array_ops) gin
@@ -2957,42 +3555,42 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(3903, 3831, 3831, 1, 3882, amHash) // strat=1 =(anyrange,anyrange) (anyrange x anyrange)
 
 	// family=3919 (range_ops) gist
-	amOp(3919, 3831, 3831, 1, 3893, amGist) // strat=1 <<(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3919, 3831, 4537, 1, 4395, amGist) // strat=1 <<(anyrange,anymultirange) (anyrange x anymultirange)
-	amOp(3919, 3831, 3831, 2, 3895, amGist) // strat=2 &<(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3919, 3831, 4537, 2, 2875, amGist) // strat=2 &<(anyrange,anymultirange) (anyrange x anymultirange)
-	amOp(3919, 3831, 3831, 3, 3888, amGist) // strat=3 &&(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3919, 3831, 4537, 3, 2866, amGist) // strat=3 &&(anyrange,anymultirange) (anyrange x anymultirange)
-	amOp(3919, 3831, 3831, 4, 3896, amGist) // strat=4 &>(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3919, 3831, 4537, 4, 3585, amGist) // strat=4 &>(anyrange,anymultirange) (anyrange x anymultirange)
-	amOp(3919, 3831, 3831, 5, 3894, amGist) // strat=5 >>(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3919, 3831, 4537, 5, 4398, amGist) // strat=5 >>(anyrange,anymultirange) (anyrange x anymultirange)
-	amOp(3919, 3831, 3831, 6, 3897, amGist) // strat=6 -|-(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3919, 3831, 4537, 6, 4179, amGist) // strat=6 -|-(anyrange,anymultirange) (anyrange x anymultirange)
-	amOp(3919, 3831, 3831, 7, 3890, amGist) // strat=7 @>(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3919, 3831, 4537, 7, 4539, amGist) // strat=7 @>(anyrange,anymultirange) (anyrange x anymultirange)
-	amOp(3919, 3831, 3831, 8, 3892, amGist) // strat=8 <@(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3919, 3831, 4537, 8, 2873, amGist) // strat=8 <@(anyrange,anymultirange) (anyrange x anymultirange)
+	amOp(3919, 3831, 3831, 1, 3893, amGist)  // strat=1 <<(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3919, 3831, 4537, 1, 4395, amGist)  // strat=1 <<(anyrange,anymultirange) (anyrange x anymultirange)
+	amOp(3919, 3831, 3831, 2, 3895, amGist)  // strat=2 &<(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3919, 3831, 4537, 2, 2875, amGist)  // strat=2 &<(anyrange,anymultirange) (anyrange x anymultirange)
+	amOp(3919, 3831, 3831, 3, 3888, amGist)  // strat=3 &&(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3919, 3831, 4537, 3, 2866, amGist)  // strat=3 &&(anyrange,anymultirange) (anyrange x anymultirange)
+	amOp(3919, 3831, 3831, 4, 3896, amGist)  // strat=4 &>(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3919, 3831, 4537, 4, 3585, amGist)  // strat=4 &>(anyrange,anymultirange) (anyrange x anymultirange)
+	amOp(3919, 3831, 3831, 5, 3894, amGist)  // strat=5 >>(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3919, 3831, 4537, 5, 4398, amGist)  // strat=5 >>(anyrange,anymultirange) (anyrange x anymultirange)
+	amOp(3919, 3831, 3831, 6, 3897, amGist)  // strat=6 -|-(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3919, 3831, 4537, 6, 4179, amGist)  // strat=6 -|-(anyrange,anymultirange) (anyrange x anymultirange)
+	amOp(3919, 3831, 3831, 7, 3890, amGist)  // strat=7 @>(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3919, 3831, 4537, 7, 4539, amGist)  // strat=7 @>(anyrange,anymultirange) (anyrange x anymultirange)
+	amOp(3919, 3831, 3831, 8, 3892, amGist)  // strat=8 <@(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3919, 3831, 4537, 8, 2873, amGist)  // strat=8 <@(anyrange,anymultirange) (anyrange x anymultirange)
 	amOp(3919, 3831, 2283, 16, 3889, amGist) // strat=16 @>(anyrange,anyelement) (anyrange x anyelement)
 	amOp(3919, 3831, 3831, 18, 3882, amGist) // strat=18 =(anyrange,anyrange) (anyrange x anyrange)
 
 	// family=6158 (multirange_ops) gist
-	amOp(6158, 4537, 4537, 1, 4397, amGist) // strat=1 <<(anymultirange,anymultirange) (anymultirange x anymultirange)
-	amOp(6158, 4537, 3831, 1, 4396, amGist) // strat=1 <<(anymultirange,anyrange) (anymultirange x anyrange)
-	amOp(6158, 4537, 4537, 2, 2877, amGist) // strat=2 &<(anymultirange,anymultirange) (anymultirange x anymultirange)
-	amOp(6158, 4537, 3831, 2, 2876, amGist) // strat=2 &<(anymultirange,anyrange) (anymultirange x anyrange)
-	amOp(6158, 4537, 4537, 3, 2868, amGist) // strat=3 &&(anymultirange,anymultirange) (anymultirange x anymultirange)
-	amOp(6158, 4537, 3831, 3, 2867, amGist) // strat=3 &&(anymultirange,anyrange) (anymultirange x anyrange)
-	amOp(6158, 4537, 4537, 4, 4142, amGist) // strat=4 &>(anymultirange,anymultirange) (anymultirange x anymultirange)
-	amOp(6158, 4537, 3831, 4, 4035, amGist) // strat=4 &>(anymultirange,anyrange) (anymultirange x anyrange)
-	amOp(6158, 4537, 4537, 5, 4400, amGist) // strat=5 >>(anymultirange,anymultirange) (anymultirange x anymultirange)
-	amOp(6158, 4537, 3831, 5, 4399, amGist) // strat=5 >>(anymultirange,anyrange) (anymultirange x anyrange)
-	amOp(6158, 4537, 4537, 6, 4198, amGist) // strat=6 -|-(anymultirange,anymultirange) (anymultirange x anymultirange)
-	amOp(6158, 4537, 3831, 6, 4180, amGist) // strat=6 -|-(anymultirange,anyrange) (anymultirange x anyrange)
-	amOp(6158, 4537, 4537, 7, 2871, amGist) // strat=7 @>(anymultirange,anymultirange) (anymultirange x anymultirange)
-	amOp(6158, 4537, 3831, 7, 2870, amGist) // strat=7 @>(anymultirange,anyrange) (anymultirange x anyrange)
-	amOp(6158, 4537, 4537, 8, 2874, amGist) // strat=8 <@(anymultirange,anymultirange) (anymultirange x anymultirange)
-	amOp(6158, 4537, 3831, 8, 4540, amGist) // strat=8 <@(anymultirange,anyrange) (anymultirange x anyrange)
+	amOp(6158, 4537, 4537, 1, 4397, amGist)  // strat=1 <<(anymultirange,anymultirange) (anymultirange x anymultirange)
+	amOp(6158, 4537, 3831, 1, 4396, amGist)  // strat=1 <<(anymultirange,anyrange) (anymultirange x anyrange)
+	amOp(6158, 4537, 4537, 2, 2877, amGist)  // strat=2 &<(anymultirange,anymultirange) (anymultirange x anymultirange)
+	amOp(6158, 4537, 3831, 2, 2876, amGist)  // strat=2 &<(anymultirange,anyrange) (anymultirange x anyrange)
+	amOp(6158, 4537, 4537, 3, 2868, amGist)  // strat=3 &&(anymultirange,anymultirange) (anymultirange x anymultirange)
+	amOp(6158, 4537, 3831, 3, 2867, amGist)  // strat=3 &&(anymultirange,anyrange) (anymultirange x anyrange)
+	amOp(6158, 4537, 4537, 4, 4142, amGist)  // strat=4 &>(anymultirange,anymultirange) (anymultirange x anymultirange)
+	amOp(6158, 4537, 3831, 4, 4035, amGist)  // strat=4 &>(anymultirange,anyrange) (anymultirange x anyrange)
+	amOp(6158, 4537, 4537, 5, 4400, amGist)  // strat=5 >>(anymultirange,anymultirange) (anymultirange x anymultirange)
+	amOp(6158, 4537, 3831, 5, 4399, amGist)  // strat=5 >>(anymultirange,anyrange) (anymultirange x anyrange)
+	amOp(6158, 4537, 4537, 6, 4198, amGist)  // strat=6 -|-(anymultirange,anymultirange) (anymultirange x anymultirange)
+	amOp(6158, 4537, 3831, 6, 4180, amGist)  // strat=6 -|-(anymultirange,anyrange) (anymultirange x anyrange)
+	amOp(6158, 4537, 4537, 7, 2871, amGist)  // strat=7 @>(anymultirange,anymultirange) (anymultirange x anymultirange)
+	amOp(6158, 4537, 3831, 7, 2870, amGist)  // strat=7 @>(anymultirange,anyrange) (anymultirange x anyrange)
+	amOp(6158, 4537, 4537, 8, 2874, amGist)  // strat=8 <@(anymultirange,anymultirange) (anymultirange x anymultirange)
+	amOp(6158, 4537, 3831, 8, 4540, amGist)  // strat=8 <@(anymultirange,anyrange) (anymultirange x anyrange)
 	amOp(6158, 4537, 2283, 16, 2869, amGist) // strat=16 @>(anymultirange,anyelement) (anymultirange x anyelement)
 	amOp(6158, 4537, 4537, 18, 2860, amGist) // strat=18 =(anymultirange,anymultirange) (anymultirange x anymultirange)
 
@@ -3000,122 +3598,122 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(4225, 4537, 4537, 1, 2860, amHash) // strat=1 =(anymultirange,anymultirange) (anymultirange x anymultirange)
 
 	// family=4015 (quad_point_ops) spgist
-	amOp(4015, 600, 600, 11, 4161, amSpgist) // strat=11 |>>(point,point) (point x point)
-	amOp(4015, 600, 600, 30, 506, amSpgist) // strat=30 >^(point,point) (point x point)
-	amOp(4015, 600, 600, 1, 507, amSpgist) // strat=1 <<(point,point) (point x point)
-	amOp(4015, 600, 600, 5, 508, amSpgist) // strat=5 >>(point,point) (point x point)
-	amOp(4015, 600, 600, 10, 4162, amSpgist) // strat=10 <<|(point,point) (point x point)
-	amOp(4015, 600, 600, 29, 509, amSpgist) // strat=29 <^(point,point) (point x point)
-	amOp(4015, 600, 600, 6, 510, amSpgist) // strat=6 ~=(point,point) (point x point)
-	amOp(4015, 600, 603, 8, 511, amSpgist) // strat=8 <@(point,box) (point x box)
+	amOp(4015, 600, 600, 11, 4161, amSpgist)           // strat=11 |>>(point,point) (point x point)
+	amOp(4015, 600, 600, 30, 506, amSpgist)            // strat=30 >^(point,point) (point x point)
+	amOp(4015, 600, 600, 1, 507, amSpgist)             // strat=1 <<(point,point) (point x point)
+	amOp(4015, 600, 600, 5, 508, amSpgist)             // strat=5 >>(point,point) (point x point)
+	amOp(4015, 600, 600, 10, 4162, amSpgist)           // strat=10 <<|(point,point) (point x point)
+	amOp(4015, 600, 600, 29, 509, amSpgist)            // strat=29 <^(point,point) (point x point)
+	amOp(4015, 600, 600, 6, 510, amSpgist)             // strat=6 ~=(point,point) (point x point)
+	amOp(4015, 600, 603, 8, 511, amSpgist)             // strat=8 <@(point,box) (point x box)
 	amOpOrder(4015, 600, 600, 15, 517, amSpgist, 1970) // strat=15 <->(point,point) (point x point)
 
 	// family=4016 (kd_point_ops) spgist
-	amOp(4016, 600, 600, 11, 4161, amSpgist) // strat=11 |>>(point,point) (point x point)
-	amOp(4016, 600, 600, 30, 506, amSpgist) // strat=30 >^(point,point) (point x point)
-	amOp(4016, 600, 600, 1, 507, amSpgist) // strat=1 <<(point,point) (point x point)
-	amOp(4016, 600, 600, 5, 508, amSpgist) // strat=5 >>(point,point) (point x point)
-	amOp(4016, 600, 600, 10, 4162, amSpgist) // strat=10 <<|(point,point) (point x point)
-	amOp(4016, 600, 600, 29, 509, amSpgist) // strat=29 <^(point,point) (point x point)
-	amOp(4016, 600, 600, 6, 510, amSpgist) // strat=6 ~=(point,point) (point x point)
-	amOp(4016, 600, 603, 8, 511, amSpgist) // strat=8 <@(point,box) (point x box)
+	amOp(4016, 600, 600, 11, 4161, amSpgist)           // strat=11 |>>(point,point) (point x point)
+	amOp(4016, 600, 600, 30, 506, amSpgist)            // strat=30 >^(point,point) (point x point)
+	amOp(4016, 600, 600, 1, 507, amSpgist)             // strat=1 <<(point,point) (point x point)
+	amOp(4016, 600, 600, 5, 508, amSpgist)             // strat=5 >>(point,point) (point x point)
+	amOp(4016, 600, 600, 10, 4162, amSpgist)           // strat=10 <<|(point,point) (point x point)
+	amOp(4016, 600, 600, 29, 509, amSpgist)            // strat=29 <^(point,point) (point x point)
+	amOp(4016, 600, 600, 6, 510, amSpgist)             // strat=6 ~=(point,point) (point x point)
+	amOp(4016, 600, 603, 8, 511, amSpgist)             // strat=8 <@(point,box) (point x box)
 	amOpOrder(4016, 600, 600, 15, 517, amSpgist, 1970) // strat=15 <->(point,point) (point x point)
 
 	// family=4017 (text_ops) spgist
-	amOp(4017, 25, 25, 1, 2314, amSpgist) // strat=1 ~<~(text,text) (text x text)
-	amOp(4017, 25, 25, 2, 2315, amSpgist) // strat=2 ~<=~(text,text) (text x text)
-	amOp(4017, 25, 25, 3, 98, amSpgist) // strat=3 =(text,text) (text x text)
-	amOp(4017, 25, 25, 4, 2317, amSpgist) // strat=4 ~>=~(text,text) (text x text)
-	amOp(4017, 25, 25, 5, 2318, amSpgist) // strat=5 ~>~(text,text) (text x text)
-	amOp(4017, 25, 25, 11, 664, amSpgist) // strat=11 <(text,text) (text x text)
-	amOp(4017, 25, 25, 12, 665, amSpgist) // strat=12 <=(text,text) (text x text)
-	amOp(4017, 25, 25, 14, 667, amSpgist) // strat=14 >=(text,text) (text x text)
-	amOp(4017, 25, 25, 15, 666, amSpgist) // strat=15 >(text,text) (text x text)
+	amOp(4017, 25, 25, 1, 2314, amSpgist)  // strat=1 ~<~(text,text) (text x text)
+	amOp(4017, 25, 25, 2, 2315, amSpgist)  // strat=2 ~<=~(text,text) (text x text)
+	amOp(4017, 25, 25, 3, 98, amSpgist)    // strat=3 =(text,text) (text x text)
+	amOp(4017, 25, 25, 4, 2317, amSpgist)  // strat=4 ~>=~(text,text) (text x text)
+	amOp(4017, 25, 25, 5, 2318, amSpgist)  // strat=5 ~>~(text,text) (text x text)
+	amOp(4017, 25, 25, 11, 664, amSpgist)  // strat=11 <(text,text) (text x text)
+	amOp(4017, 25, 25, 12, 665, amSpgist)  // strat=12 <=(text,text) (text x text)
+	amOp(4017, 25, 25, 14, 667, amSpgist)  // strat=14 >=(text,text) (text x text)
+	amOp(4017, 25, 25, 15, 666, amSpgist)  // strat=15 >(text,text) (text x text)
 	amOp(4017, 25, 25, 28, 3877, amSpgist) // strat=28 ^@(text,text) (text x text)
 
 	// family=4034 (jsonb_ops) hash
 	amOp(4034, 3802, 3802, 1, 3240, amHash) // strat=1 =(jsonb,jsonb) (jsonb x jsonb)
 
 	// family=4036 (jsonb_ops) gin
-	amOp(4036, 3802, 3802, 7, 3246, amGin) // strat=7 @>(jsonb,jsonb) (jsonb x jsonb)
-	amOp(4036, 3802, 25, 9, 3247, amGin) // strat=9 ?(jsonb,text) (jsonb x text)
+	amOp(4036, 3802, 3802, 7, 3246, amGin)  // strat=7 @>(jsonb,jsonb) (jsonb x jsonb)
+	amOp(4036, 3802, 25, 9, 3247, amGin)    // strat=9 ?(jsonb,text) (jsonb x text)
 	amOp(4036, 3802, 1009, 10, 3248, amGin) // strat=10 ?|(jsonb,_text) (jsonb x _text)
 	amOp(4036, 3802, 1009, 11, 3249, amGin) // strat=11 ?&(jsonb,_text) (jsonb x _text)
 	amOp(4036, 3802, 4072, 15, 4012, amGin) // strat=15 @?(jsonb,jsonpath) (jsonb x jsonpath)
 	amOp(4036, 3802, 4072, 16, 4013, amGin) // strat=16 @@(jsonb,jsonpath) (jsonb x jsonpath)
 
 	// family=4037 (jsonb_path_ops) gin
-	amOp(4037, 3802, 3802, 7, 3246, amGin) // strat=7 @>(jsonb,jsonb) (jsonb x jsonb)
+	amOp(4037, 3802, 3802, 7, 3246, amGin)  // strat=7 @>(jsonb,jsonb) (jsonb x jsonb)
 	amOp(4037, 3802, 4072, 15, 4012, amGin) // strat=15 @?(jsonb,jsonpath) (jsonb x jsonpath)
 	amOp(4037, 3802, 4072, 16, 4013, amGin) // strat=16 @@(jsonb,jsonpath) (jsonb x jsonpath)
 
 	// family=3474 (range_ops) spgist
-	amOp(3474, 3831, 3831, 1, 3893, amSpgist) // strat=1 <<(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3474, 3831, 3831, 2, 3895, amSpgist) // strat=2 &<(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3474, 3831, 3831, 3, 3888, amSpgist) // strat=3 &&(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3474, 3831, 3831, 4, 3896, amSpgist) // strat=4 &>(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3474, 3831, 3831, 5, 3894, amSpgist) // strat=5 >>(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3474, 3831, 3831, 6, 3897, amSpgist) // strat=6 -|-(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3474, 3831, 3831, 7, 3890, amSpgist) // strat=7 @>(anyrange,anyrange) (anyrange x anyrange)
-	amOp(3474, 3831, 3831, 8, 3892, amSpgist) // strat=8 <@(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3474, 3831, 3831, 1, 3893, amSpgist)  // strat=1 <<(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3474, 3831, 3831, 2, 3895, amSpgist)  // strat=2 &<(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3474, 3831, 3831, 3, 3888, amSpgist)  // strat=3 &&(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3474, 3831, 3831, 4, 3896, amSpgist)  // strat=4 &>(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3474, 3831, 3831, 5, 3894, amSpgist)  // strat=5 >>(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3474, 3831, 3831, 6, 3897, amSpgist)  // strat=6 -|-(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3474, 3831, 3831, 7, 3890, amSpgist)  // strat=7 @>(anyrange,anyrange) (anyrange x anyrange)
+	amOp(3474, 3831, 3831, 8, 3892, amSpgist)  // strat=8 <@(anyrange,anyrange) (anyrange x anyrange)
 	amOp(3474, 3831, 2283, 16, 3889, amSpgist) // strat=16 @>(anyrange,anyelement) (anyrange x anyelement)
 	amOp(3474, 3831, 3831, 18, 3882, amSpgist) // strat=18 =(anyrange,anyrange) (anyrange x anyrange)
 
 	// family=5000 (box_ops) spgist
-	amOp(5000, 603, 603, 1, 493, amSpgist) // strat=1 <<(box,box) (box x box)
-	amOp(5000, 603, 603, 2, 494, amSpgist) // strat=2 &<(box,box) (box x box)
-	amOp(5000, 603, 603, 3, 500, amSpgist) // strat=3 &&(box,box) (box x box)
-	amOp(5000, 603, 603, 4, 495, amSpgist) // strat=4 &>(box,box) (box x box)
-	amOp(5000, 603, 603, 5, 496, amSpgist) // strat=5 >>(box,box) (box x box)
-	amOp(5000, 603, 603, 6, 499, amSpgist) // strat=6 ~=(box,box) (box x box)
-	amOp(5000, 603, 603, 7, 498, amSpgist) // strat=7 @>(box,box) (box x box)
-	amOp(5000, 603, 603, 8, 497, amSpgist) // strat=8 <@(box,box) (box x box)
-	amOp(5000, 603, 603, 9, 2571, amSpgist) // strat=9 &<|(box,box) (box x box)
-	amOp(5000, 603, 603, 10, 2570, amSpgist) // strat=10 <<|(box,box) (box x box)
-	amOp(5000, 603, 603, 11, 2573, amSpgist) // strat=11 |>>(box,box) (box x box)
-	amOp(5000, 603, 603, 12, 2572, amSpgist) // strat=12 |&>(box,box) (box x box)
+	amOp(5000, 603, 603, 1, 493, amSpgist)             // strat=1 <<(box,box) (box x box)
+	amOp(5000, 603, 603, 2, 494, amSpgist)             // strat=2 &<(box,box) (box x box)
+	amOp(5000, 603, 603, 3, 500, amSpgist)             // strat=3 &&(box,box) (box x box)
+	amOp(5000, 603, 603, 4, 495, amSpgist)             // strat=4 &>(box,box) (box x box)
+	amOp(5000, 603, 603, 5, 496, amSpgist)             // strat=5 >>(box,box) (box x box)
+	amOp(5000, 603, 603, 6, 499, amSpgist)             // strat=6 ~=(box,box) (box x box)
+	amOp(5000, 603, 603, 7, 498, amSpgist)             // strat=7 @>(box,box) (box x box)
+	amOp(5000, 603, 603, 8, 497, amSpgist)             // strat=8 <@(box,box) (box x box)
+	amOp(5000, 603, 603, 9, 2571, amSpgist)            // strat=9 &<|(box,box) (box x box)
+	amOp(5000, 603, 603, 10, 2570, amSpgist)           // strat=10 <<|(box,box) (box x box)
+	amOp(5000, 603, 603, 11, 2573, amSpgist)           // strat=11 |>>(box,box) (box x box)
+	amOp(5000, 603, 603, 12, 2572, amSpgist)           // strat=12 |&>(box,box) (box x box)
 	amOpOrder(5000, 603, 600, 15, 606, amSpgist, 1970) // strat=15 <->(box,point) (box x point)
 
 	// family=5008 (poly_ops) spgist
-	amOp(5008, 604, 604, 1, 485, amSpgist) // strat=1 <<(polygon,polygon) (polygon x polygon)
-	amOp(5008, 604, 604, 2, 486, amSpgist) // strat=2 &<(polygon,polygon) (polygon x polygon)
-	amOp(5008, 604, 604, 3, 492, amSpgist) // strat=3 &&(polygon,polygon) (polygon x polygon)
-	amOp(5008, 604, 604, 4, 487, amSpgist) // strat=4 &>(polygon,polygon) (polygon x polygon)
-	amOp(5008, 604, 604, 5, 488, amSpgist) // strat=5 >>(polygon,polygon) (polygon x polygon)
-	amOp(5008, 604, 604, 6, 491, amSpgist) // strat=6 ~=(polygon,polygon) (polygon x polygon)
-	amOp(5008, 604, 604, 7, 490, amSpgist) // strat=7 @>(polygon,polygon) (polygon x polygon)
-	amOp(5008, 604, 604, 8, 489, amSpgist) // strat=8 <@(polygon,polygon) (polygon x polygon)
-	amOp(5008, 604, 604, 9, 2575, amSpgist) // strat=9 &<|(polygon,polygon) (polygon x polygon)
-	amOp(5008, 604, 604, 10, 2574, amSpgist) // strat=10 <<|(polygon,polygon) (polygon x polygon)
-	amOp(5008, 604, 604, 11, 2577, amSpgist) // strat=11 |>>(polygon,polygon) (polygon x polygon)
-	amOp(5008, 604, 604, 12, 2576, amSpgist) // strat=12 |&>(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 1, 485, amSpgist)              // strat=1 <<(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 2, 486, amSpgist)              // strat=2 &<(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 3, 492, amSpgist)              // strat=3 &&(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 4, 487, amSpgist)              // strat=4 &>(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 5, 488, amSpgist)              // strat=5 >>(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 6, 491, amSpgist)              // strat=6 ~=(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 7, 490, amSpgist)              // strat=7 @>(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 8, 489, amSpgist)              // strat=8 <@(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 9, 2575, amSpgist)             // strat=9 &<|(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 10, 2574, amSpgist)            // strat=10 <<|(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 11, 2577, amSpgist)            // strat=11 |>>(polygon,polygon) (polygon x polygon)
+	amOp(5008, 604, 604, 12, 2576, amSpgist)            // strat=12 |&>(polygon,polygon) (polygon x polygon)
 	amOpOrder(5008, 604, 600, 15, 3289, amSpgist, 1970) // strat=15 <->(polygon,point) (polygon x point)
 
 	// family=3550 (network_ops) gist
-	amOp(3550, 869, 869, 3, 3552, amGist) // strat=3 &&(inet,inet) (inet x inet)
+	amOp(3550, 869, 869, 3, 3552, amGist)  // strat=3 &&(inet,inet) (inet x inet)
 	amOp(3550, 869, 869, 18, 1201, amGist) // strat=18 =(inet,inet) (inet x inet)
 	amOp(3550, 869, 869, 19, 1202, amGist) // strat=19 <>(inet,inet) (inet x inet)
 	amOp(3550, 869, 869, 20, 1203, amGist) // strat=20 <(inet,inet) (inet x inet)
 	amOp(3550, 869, 869, 21, 1204, amGist) // strat=21 <=(inet,inet) (inet x inet)
 	amOp(3550, 869, 869, 22, 1205, amGist) // strat=22 >(inet,inet) (inet x inet)
 	amOp(3550, 869, 869, 23, 1206, amGist) // strat=23 >=(inet,inet) (inet x inet)
-	amOp(3550, 869, 869, 24, 931, amGist) // strat=24 <<(inet,inet) (inet x inet)
-	amOp(3550, 869, 869, 25, 932, amGist) // strat=25 <<=(inet,inet) (inet x inet)
-	amOp(3550, 869, 869, 26, 933, amGist) // strat=26 >>(inet,inet) (inet x inet)
-	amOp(3550, 869, 869, 27, 934, amGist) // strat=27 >>=(inet,inet) (inet x inet)
+	amOp(3550, 869, 869, 24, 931, amGist)  // strat=24 <<(inet,inet) (inet x inet)
+	amOp(3550, 869, 869, 25, 932, amGist)  // strat=25 <<=(inet,inet) (inet x inet)
+	amOp(3550, 869, 869, 26, 933, amGist)  // strat=26 >>(inet,inet) (inet x inet)
+	amOp(3550, 869, 869, 27, 934, amGist)  // strat=27 >>=(inet,inet) (inet x inet)
 
 	// family=3794 (network_ops) spgist
-	amOp(3794, 869, 869, 3, 3552, amSpgist) // strat=3 &&(inet,inet) (inet x inet)
+	amOp(3794, 869, 869, 3, 3552, amSpgist)  // strat=3 &&(inet,inet) (inet x inet)
 	amOp(3794, 869, 869, 18, 1201, amSpgist) // strat=18 =(inet,inet) (inet x inet)
 	amOp(3794, 869, 869, 19, 1202, amSpgist) // strat=19 <>(inet,inet) (inet x inet)
 	amOp(3794, 869, 869, 20, 1203, amSpgist) // strat=20 <(inet,inet) (inet x inet)
 	amOp(3794, 869, 869, 21, 1204, amSpgist) // strat=21 <=(inet,inet) (inet x inet)
 	amOp(3794, 869, 869, 22, 1205, amSpgist) // strat=22 >(inet,inet) (inet x inet)
 	amOp(3794, 869, 869, 23, 1206, amSpgist) // strat=23 >=(inet,inet) (inet x inet)
-	amOp(3794, 869, 869, 24, 931, amSpgist) // strat=24 <<(inet,inet) (inet x inet)
-	amOp(3794, 869, 869, 25, 932, amSpgist) // strat=25 <<=(inet,inet) (inet x inet)
-	amOp(3794, 869, 869, 26, 933, amSpgist) // strat=26 >>(inet,inet) (inet x inet)
-	amOp(3794, 869, 869, 27, 934, amSpgist) // strat=27 >>=(inet,inet) (inet x inet)
+	amOp(3794, 869, 869, 24, 931, amSpgist)  // strat=24 <<(inet,inet) (inet x inet)
+	amOp(3794, 869, 869, 25, 932, amSpgist)  // strat=25 <<=(inet,inet) (inet x inet)
+	amOp(3794, 869, 869, 26, 933, amSpgist)  // strat=26 >>(inet,inet) (inet x inet)
+	amOp(3794, 869, 869, 27, 934, amSpgist)  // strat=27 >>=(inet,inet) (inet x inet)
 
 	// family=4064 (bytea_minmax_ops) brin
 	amOp(4064, 17, 17, 1, 1957, amBrin) // strat=1 <(bytea,bytea) (bytea x bytea)
@@ -3130,7 +3728,7 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	// family=4062 (char_minmax_ops) brin
 	amOp(4062, 18, 18, 1, 631, amBrin) // strat=1 <(char,char) (char x char)
 	amOp(4062, 18, 18, 2, 632, amBrin) // strat=2 <=(char,char) (char x char)
-	amOp(4062, 18, 18, 3, 92, amBrin) // strat=3 =(char,char) (char x char)
+	amOp(4062, 18, 18, 3, 92, amBrin)  // strat=3 =(char,char) (char x char)
 	amOp(4062, 18, 18, 4, 634, amBrin) // strat=4 >=(char,char) (char x char)
 	amOp(4062, 18, 18, 5, 633, amBrin) // strat=5 >(char,char) (char x char)
 
@@ -3140,7 +3738,7 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	// family=4065 (name_minmax_ops) brin
 	amOp(4065, 19, 19, 1, 660, amBrin) // strat=1 <(name,name) (name x name)
 	amOp(4065, 19, 19, 2, 661, amBrin) // strat=2 <=(name,name) (name x name)
-	amOp(4065, 19, 19, 3, 93, amBrin) // strat=3 =(name,name) (name x name)
+	amOp(4065, 19, 19, 3, 93, amBrin)  // strat=3 =(name,name) (name x name)
 	amOp(4065, 19, 19, 4, 663, amBrin) // strat=4 >=(name,name) (name x name)
 	amOp(4065, 19, 19, 5, 662, amBrin) // strat=5 >(name,name) (name x name)
 
@@ -3148,108 +3746,108 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(4579, 19, 19, 1, 93, amBrin) // strat=1 =(name,name) (name x name)
 
 	// family=4054 (integer_minmax_ops) brin
-	amOp(4054, 20, 20, 1, 412, amBrin) // strat=1 <(int8,int8) (int8 x int8)
-	amOp(4054, 20, 20, 2, 414, amBrin) // strat=2 <=(int8,int8) (int8 x int8)
-	amOp(4054, 20, 20, 3, 410, amBrin) // strat=3 =(int8,int8) (int8 x int8)
-	amOp(4054, 20, 20, 4, 415, amBrin) // strat=4 >=(int8,int8) (int8 x int8)
-	amOp(4054, 20, 20, 5, 413, amBrin) // strat=5 >(int8,int8) (int8 x int8)
+	amOp(4054, 20, 20, 1, 412, amBrin)  // strat=1 <(int8,int8) (int8 x int8)
+	amOp(4054, 20, 20, 2, 414, amBrin)  // strat=2 <=(int8,int8) (int8 x int8)
+	amOp(4054, 20, 20, 3, 410, amBrin)  // strat=3 =(int8,int8) (int8 x int8)
+	amOp(4054, 20, 20, 4, 415, amBrin)  // strat=4 >=(int8,int8) (int8 x int8)
+	amOp(4054, 20, 20, 5, 413, amBrin)  // strat=5 >(int8,int8) (int8 x int8)
 	amOp(4054, 20, 21, 1, 1870, amBrin) // strat=1 <(int8,int2) (int8 x int2)
 	amOp(4054, 20, 21, 2, 1872, amBrin) // strat=2 <=(int8,int2) (int8 x int2)
 	amOp(4054, 20, 21, 3, 1868, amBrin) // strat=3 =(int8,int2) (int8 x int2)
 	amOp(4054, 20, 21, 4, 1873, amBrin) // strat=4 >=(int8,int2) (int8 x int2)
 	amOp(4054, 20, 21, 5, 1871, amBrin) // strat=5 >(int8,int2) (int8 x int2)
-	amOp(4054, 20, 23, 1, 418, amBrin) // strat=1 <(int8,int4) (int8 x int4)
-	amOp(4054, 20, 23, 2, 420, amBrin) // strat=2 <=(int8,int4) (int8 x int4)
-	amOp(4054, 20, 23, 3, 416, amBrin) // strat=3 =(int8,int4) (int8 x int4)
-	amOp(4054, 20, 23, 4, 430, amBrin) // strat=4 >=(int8,int4) (int8 x int4)
-	amOp(4054, 20, 23, 5, 419, amBrin) // strat=5 >(int8,int4) (int8 x int4)
-	amOp(4054, 21, 21, 1, 95, amBrin) // strat=1 <(int2,int2) (int2 x int2)
-	amOp(4054, 21, 21, 2, 522, amBrin) // strat=2 <=(int2,int2) (int2 x int2)
-	amOp(4054, 21, 21, 3, 94, amBrin) // strat=3 =(int2,int2) (int2 x int2)
-	amOp(4054, 21, 21, 4, 524, amBrin) // strat=4 >=(int2,int2) (int2 x int2)
-	amOp(4054, 21, 21, 5, 520, amBrin) // strat=5 >(int2,int2) (int2 x int2)
+	amOp(4054, 20, 23, 1, 418, amBrin)  // strat=1 <(int8,int4) (int8 x int4)
+	amOp(4054, 20, 23, 2, 420, amBrin)  // strat=2 <=(int8,int4) (int8 x int4)
+	amOp(4054, 20, 23, 3, 416, amBrin)  // strat=3 =(int8,int4) (int8 x int4)
+	amOp(4054, 20, 23, 4, 430, amBrin)  // strat=4 >=(int8,int4) (int8 x int4)
+	amOp(4054, 20, 23, 5, 419, amBrin)  // strat=5 >(int8,int4) (int8 x int4)
+	amOp(4054, 21, 21, 1, 95, amBrin)   // strat=1 <(int2,int2) (int2 x int2)
+	amOp(4054, 21, 21, 2, 522, amBrin)  // strat=2 <=(int2,int2) (int2 x int2)
+	amOp(4054, 21, 21, 3, 94, amBrin)   // strat=3 =(int2,int2) (int2 x int2)
+	amOp(4054, 21, 21, 4, 524, amBrin)  // strat=4 >=(int2,int2) (int2 x int2)
+	amOp(4054, 21, 21, 5, 520, amBrin)  // strat=5 >(int2,int2) (int2 x int2)
 	amOp(4054, 21, 20, 1, 1864, amBrin) // strat=1 <(int2,int8) (int2 x int8)
 	amOp(4054, 21, 20, 2, 1866, amBrin) // strat=2 <=(int2,int8) (int2 x int8)
 	amOp(4054, 21, 20, 3, 1862, amBrin) // strat=3 =(int2,int8) (int2 x int8)
 	amOp(4054, 21, 20, 4, 1867, amBrin) // strat=4 >=(int2,int8) (int2 x int8)
 	amOp(4054, 21, 20, 5, 1865, amBrin) // strat=5 >(int2,int8) (int2 x int8)
-	amOp(4054, 21, 23, 1, 534, amBrin) // strat=1 <(int2,int4) (int2 x int4)
-	amOp(4054, 21, 23, 2, 540, amBrin) // strat=2 <=(int2,int4) (int2 x int4)
-	amOp(4054, 21, 23, 3, 532, amBrin) // strat=3 =(int2,int4) (int2 x int4)
-	amOp(4054, 21, 23, 4, 542, amBrin) // strat=4 >=(int2,int4) (int2 x int4)
-	amOp(4054, 21, 23, 5, 536, amBrin) // strat=5 >(int2,int4) (int2 x int4)
-	amOp(4054, 23, 23, 1, 97, amBrin) // strat=1 <(int4,int4) (int4 x int4)
-	amOp(4054, 23, 23, 2, 523, amBrin) // strat=2 <=(int4,int4) (int4 x int4)
-	amOp(4054, 23, 23, 3, 96, amBrin) // strat=3 =(int4,int4) (int4 x int4)
-	amOp(4054, 23, 23, 4, 525, amBrin) // strat=4 >=(int4,int4) (int4 x int4)
-	amOp(4054, 23, 23, 5, 521, amBrin) // strat=5 >(int4,int4) (int4 x int4)
-	amOp(4054, 23, 21, 1, 535, amBrin) // strat=1 <(int4,int2) (int4 x int2)
-	amOp(4054, 23, 21, 2, 541, amBrin) // strat=2 <=(int4,int2) (int4 x int2)
-	amOp(4054, 23, 21, 3, 533, amBrin) // strat=3 =(int4,int2) (int4 x int2)
-	amOp(4054, 23, 21, 4, 543, amBrin) // strat=4 >=(int4,int2) (int4 x int2)
-	amOp(4054, 23, 21, 5, 537, amBrin) // strat=5 >(int4,int2) (int4 x int2)
-	amOp(4054, 23, 20, 1, 37, amBrin) // strat=1 <(int4,int8) (int4 x int8)
-	amOp(4054, 23, 20, 2, 80, amBrin) // strat=2 <=(int4,int8) (int4 x int8)
-	amOp(4054, 23, 20, 3, 15, amBrin) // strat=3 =(int4,int8) (int4 x int8)
-	amOp(4054, 23, 20, 4, 82, amBrin) // strat=4 >=(int4,int8) (int4 x int8)
-	amOp(4054, 23, 20, 5, 76, amBrin) // strat=5 >(int4,int8) (int4 x int8)
+	amOp(4054, 21, 23, 1, 534, amBrin)  // strat=1 <(int2,int4) (int2 x int4)
+	amOp(4054, 21, 23, 2, 540, amBrin)  // strat=2 <=(int2,int4) (int2 x int4)
+	amOp(4054, 21, 23, 3, 532, amBrin)  // strat=3 =(int2,int4) (int2 x int4)
+	amOp(4054, 21, 23, 4, 542, amBrin)  // strat=4 >=(int2,int4) (int2 x int4)
+	amOp(4054, 21, 23, 5, 536, amBrin)  // strat=5 >(int2,int4) (int2 x int4)
+	amOp(4054, 23, 23, 1, 97, amBrin)   // strat=1 <(int4,int4) (int4 x int4)
+	amOp(4054, 23, 23, 2, 523, amBrin)  // strat=2 <=(int4,int4) (int4 x int4)
+	amOp(4054, 23, 23, 3, 96, amBrin)   // strat=3 =(int4,int4) (int4 x int4)
+	amOp(4054, 23, 23, 4, 525, amBrin)  // strat=4 >=(int4,int4) (int4 x int4)
+	amOp(4054, 23, 23, 5, 521, amBrin)  // strat=5 >(int4,int4) (int4 x int4)
+	amOp(4054, 23, 21, 1, 535, amBrin)  // strat=1 <(int4,int2) (int4 x int2)
+	amOp(4054, 23, 21, 2, 541, amBrin)  // strat=2 <=(int4,int2) (int4 x int2)
+	amOp(4054, 23, 21, 3, 533, amBrin)  // strat=3 =(int4,int2) (int4 x int2)
+	amOp(4054, 23, 21, 4, 543, amBrin)  // strat=4 >=(int4,int2) (int4 x int2)
+	amOp(4054, 23, 21, 5, 537, amBrin)  // strat=5 >(int4,int2) (int4 x int2)
+	amOp(4054, 23, 20, 1, 37, amBrin)   // strat=1 <(int4,int8) (int4 x int8)
+	amOp(4054, 23, 20, 2, 80, amBrin)   // strat=2 <=(int4,int8) (int4 x int8)
+	amOp(4054, 23, 20, 3, 15, amBrin)   // strat=3 =(int4,int8) (int4 x int8)
+	amOp(4054, 23, 20, 4, 82, amBrin)   // strat=4 >=(int4,int8) (int4 x int8)
+	amOp(4054, 23, 20, 5, 76, amBrin)   // strat=5 >(int4,int8) (int4 x int8)
 
 	// family=4602 (integer_minmax_multi_ops) brin
-	amOp(4602, 20, 20, 1, 412, amBrin) // strat=1 <(int8,int8) (int8 x int8)
-	amOp(4602, 20, 20, 2, 414, amBrin) // strat=2 <=(int8,int8) (int8 x int8)
-	amOp(4602, 20, 20, 3, 410, amBrin) // strat=3 =(int8,int8) (int8 x int8)
-	amOp(4602, 20, 20, 4, 415, amBrin) // strat=4 >=(int8,int8) (int8 x int8)
-	amOp(4602, 20, 20, 5, 413, amBrin) // strat=5 >(int8,int8) (int8 x int8)
+	amOp(4602, 20, 20, 1, 412, amBrin)  // strat=1 <(int8,int8) (int8 x int8)
+	amOp(4602, 20, 20, 2, 414, amBrin)  // strat=2 <=(int8,int8) (int8 x int8)
+	amOp(4602, 20, 20, 3, 410, amBrin)  // strat=3 =(int8,int8) (int8 x int8)
+	amOp(4602, 20, 20, 4, 415, amBrin)  // strat=4 >=(int8,int8) (int8 x int8)
+	amOp(4602, 20, 20, 5, 413, amBrin)  // strat=5 >(int8,int8) (int8 x int8)
 	amOp(4602, 20, 21, 1, 1870, amBrin) // strat=1 <(int8,int2) (int8 x int2)
 	amOp(4602, 20, 21, 2, 1872, amBrin) // strat=2 <=(int8,int2) (int8 x int2)
 	amOp(4602, 20, 21, 3, 1868, amBrin) // strat=3 =(int8,int2) (int8 x int2)
 	amOp(4602, 20, 21, 4, 1873, amBrin) // strat=4 >=(int8,int2) (int8 x int2)
 	amOp(4602, 20, 21, 5, 1871, amBrin) // strat=5 >(int8,int2) (int8 x int2)
-	amOp(4602, 20, 23, 1, 418, amBrin) // strat=1 <(int8,int4) (int8 x int4)
-	amOp(4602, 20, 23, 2, 420, amBrin) // strat=2 <=(int8,int4) (int8 x int4)
-	amOp(4602, 20, 23, 3, 416, amBrin) // strat=3 =(int8,int4) (int8 x int4)
-	amOp(4602, 20, 23, 4, 430, amBrin) // strat=4 >=(int8,int4) (int8 x int4)
-	amOp(4602, 20, 23, 5, 419, amBrin) // strat=5 >(int8,int4) (int8 x int4)
-	amOp(4602, 21, 21, 1, 95, amBrin) // strat=1 <(int2,int2) (int2 x int2)
-	amOp(4602, 21, 21, 2, 522, amBrin) // strat=2 <=(int2,int2) (int2 x int2)
-	amOp(4602, 21, 21, 3, 94, amBrin) // strat=3 =(int2,int2) (int2 x int2)
-	amOp(4602, 21, 21, 4, 524, amBrin) // strat=4 >=(int2,int2) (int2 x int2)
-	amOp(4602, 21, 21, 5, 520, amBrin) // strat=5 >(int2,int2) (int2 x int2)
+	amOp(4602, 20, 23, 1, 418, amBrin)  // strat=1 <(int8,int4) (int8 x int4)
+	amOp(4602, 20, 23, 2, 420, amBrin)  // strat=2 <=(int8,int4) (int8 x int4)
+	amOp(4602, 20, 23, 3, 416, amBrin)  // strat=3 =(int8,int4) (int8 x int4)
+	amOp(4602, 20, 23, 4, 430, amBrin)  // strat=4 >=(int8,int4) (int8 x int4)
+	amOp(4602, 20, 23, 5, 419, amBrin)  // strat=5 >(int8,int4) (int8 x int4)
+	amOp(4602, 21, 21, 1, 95, amBrin)   // strat=1 <(int2,int2) (int2 x int2)
+	amOp(4602, 21, 21, 2, 522, amBrin)  // strat=2 <=(int2,int2) (int2 x int2)
+	amOp(4602, 21, 21, 3, 94, amBrin)   // strat=3 =(int2,int2) (int2 x int2)
+	amOp(4602, 21, 21, 4, 524, amBrin)  // strat=4 >=(int2,int2) (int2 x int2)
+	amOp(4602, 21, 21, 5, 520, amBrin)  // strat=5 >(int2,int2) (int2 x int2)
 	amOp(4602, 21, 20, 1, 1864, amBrin) // strat=1 <(int2,int8) (int2 x int8)
 	amOp(4602, 21, 20, 2, 1866, amBrin) // strat=2 <=(int2,int8) (int2 x int8)
 	amOp(4602, 21, 20, 3, 1862, amBrin) // strat=3 =(int2,int8) (int2 x int8)
 	amOp(4602, 21, 20, 4, 1867, amBrin) // strat=4 >=(int2,int8) (int2 x int8)
 	amOp(4602, 21, 20, 5, 1865, amBrin) // strat=5 >(int2,int8) (int2 x int8)
-	amOp(4602, 21, 23, 1, 534, amBrin) // strat=1 <(int2,int4) (int2 x int4)
-	amOp(4602, 21, 23, 2, 540, amBrin) // strat=2 <=(int2,int4) (int2 x int4)
-	amOp(4602, 21, 23, 3, 532, amBrin) // strat=3 =(int2,int4) (int2 x int4)
-	amOp(4602, 21, 23, 4, 542, amBrin) // strat=4 >=(int2,int4) (int2 x int4)
-	amOp(4602, 21, 23, 5, 536, amBrin) // strat=5 >(int2,int4) (int2 x int4)
-	amOp(4602, 23, 23, 1, 97, amBrin) // strat=1 <(int4,int4) (int4 x int4)
-	amOp(4602, 23, 23, 2, 523, amBrin) // strat=2 <=(int4,int4) (int4 x int4)
-	amOp(4602, 23, 23, 3, 96, amBrin) // strat=3 =(int4,int4) (int4 x int4)
-	amOp(4602, 23, 23, 4, 525, amBrin) // strat=4 >=(int4,int4) (int4 x int4)
-	amOp(4602, 23, 23, 5, 521, amBrin) // strat=5 >(int4,int4) (int4 x int4)
-	amOp(4602, 23, 21, 1, 535, amBrin) // strat=1 <(int4,int2) (int4 x int2)
-	amOp(4602, 23, 21, 2, 541, amBrin) // strat=2 <=(int4,int2) (int4 x int2)
-	amOp(4602, 23, 21, 3, 533, amBrin) // strat=3 =(int4,int2) (int4 x int2)
-	amOp(4602, 23, 21, 4, 543, amBrin) // strat=4 >=(int4,int2) (int4 x int2)
-	amOp(4602, 23, 21, 5, 537, amBrin) // strat=5 >(int4,int2) (int4 x int2)
-	amOp(4602, 23, 20, 1, 37, amBrin) // strat=1 <(int4,int8) (int4 x int8)
-	amOp(4602, 23, 20, 2, 80, amBrin) // strat=2 <=(int4,int8) (int4 x int8)
-	amOp(4602, 23, 20, 3, 15, amBrin) // strat=3 =(int4,int8) (int4 x int8)
-	amOp(4602, 23, 20, 4, 82, amBrin) // strat=4 >=(int4,int8) (int4 x int8)
-	amOp(4602, 23, 20, 5, 76, amBrin) // strat=5 >(int4,int8) (int4 x int8)
+	amOp(4602, 21, 23, 1, 534, amBrin)  // strat=1 <(int2,int4) (int2 x int4)
+	amOp(4602, 21, 23, 2, 540, amBrin)  // strat=2 <=(int2,int4) (int2 x int4)
+	amOp(4602, 21, 23, 3, 532, amBrin)  // strat=3 =(int2,int4) (int2 x int4)
+	amOp(4602, 21, 23, 4, 542, amBrin)  // strat=4 >=(int2,int4) (int2 x int4)
+	amOp(4602, 21, 23, 5, 536, amBrin)  // strat=5 >(int2,int4) (int2 x int4)
+	amOp(4602, 23, 23, 1, 97, amBrin)   // strat=1 <(int4,int4) (int4 x int4)
+	amOp(4602, 23, 23, 2, 523, amBrin)  // strat=2 <=(int4,int4) (int4 x int4)
+	amOp(4602, 23, 23, 3, 96, amBrin)   // strat=3 =(int4,int4) (int4 x int4)
+	amOp(4602, 23, 23, 4, 525, amBrin)  // strat=4 >=(int4,int4) (int4 x int4)
+	amOp(4602, 23, 23, 5, 521, amBrin)  // strat=5 >(int4,int4) (int4 x int4)
+	amOp(4602, 23, 21, 1, 535, amBrin)  // strat=1 <(int4,int2) (int4 x int2)
+	amOp(4602, 23, 21, 2, 541, amBrin)  // strat=2 <=(int4,int2) (int4 x int2)
+	amOp(4602, 23, 21, 3, 533, amBrin)  // strat=3 =(int4,int2) (int4 x int2)
+	amOp(4602, 23, 21, 4, 543, amBrin)  // strat=4 >=(int4,int2) (int4 x int2)
+	amOp(4602, 23, 21, 5, 537, amBrin)  // strat=5 >(int4,int2) (int4 x int2)
+	amOp(4602, 23, 20, 1, 37, amBrin)   // strat=1 <(int4,int8) (int4 x int8)
+	amOp(4602, 23, 20, 2, 80, amBrin)   // strat=2 <=(int4,int8) (int4 x int8)
+	amOp(4602, 23, 20, 3, 15, amBrin)   // strat=3 =(int4,int8) (int4 x int8)
+	amOp(4602, 23, 20, 4, 82, amBrin)   // strat=4 >=(int4,int8) (int4 x int8)
+	amOp(4602, 23, 20, 5, 76, amBrin)   // strat=5 >(int4,int8) (int4 x int8)
 
 	// family=4572 (integer_bloom_ops) brin
 	amOp(4572, 20, 20, 1, 410, amBrin) // strat=1 =(int8,int8) (int8 x int8)
-	amOp(4572, 21, 21, 1, 94, amBrin) // strat=1 =(int2,int2) (int2 x int2)
-	amOp(4572, 23, 23, 1, 96, amBrin) // strat=1 =(int4,int4) (int4 x int4)
+	amOp(4572, 21, 21, 1, 94, amBrin)  // strat=1 =(int2,int2) (int2 x int2)
+	amOp(4572, 23, 23, 1, 96, amBrin)  // strat=1 =(int4,int4) (int4 x int4)
 
 	// family=4056 (text_minmax_ops) brin
 	amOp(4056, 25, 25, 1, 664, amBrin) // strat=1 <(text,text) (text x text)
 	amOp(4056, 25, 25, 2, 665, amBrin) // strat=2 <=(text,text) (text x text)
-	amOp(4056, 25, 25, 3, 98, amBrin) // strat=3 =(text,text) (text x text)
+	amOp(4056, 25, 25, 3, 98, amBrin)  // strat=3 =(text,text) (text x text)
 	amOp(4056, 25, 25, 4, 667, amBrin) // strat=4 >=(text,text) (text x text)
 	amOp(4056, 25, 25, 5, 666, amBrin) // strat=5 >(text,text) (text x text)
 
@@ -3276,7 +3874,7 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	// family=4069 (tid_minmax_ops) brin
 	amOp(4069, 27, 27, 1, 2799, amBrin) // strat=1 <(tid,tid) (tid x tid)
 	amOp(4069, 27, 27, 2, 2801, amBrin) // strat=2 <=(tid,tid) (tid x tid)
-	amOp(4069, 27, 27, 3, 387, amBrin) // strat=3 =(tid,tid) (tid x tid)
+	amOp(4069, 27, 27, 3, 387, amBrin)  // strat=3 =(tid,tid) (tid x tid)
 	amOp(4069, 27, 27, 4, 2802, amBrin) // strat=4 >=(tid,tid) (tid x tid)
 	amOp(4069, 27, 27, 5, 2800, amBrin) // strat=5 >(tid,tid) (tid x tid)
 
@@ -3286,16 +3884,16 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	// family=4607 (tid_minmax_multi_ops) brin
 	amOp(4607, 27, 27, 1, 2799, amBrin) // strat=1 <(tid,tid) (tid x tid)
 	amOp(4607, 27, 27, 2, 2801, amBrin) // strat=2 <=(tid,tid) (tid x tid)
-	amOp(4607, 27, 27, 3, 387, amBrin) // strat=3 =(tid,tid) (tid x tid)
+	amOp(4607, 27, 27, 3, 387, amBrin)  // strat=3 =(tid,tid) (tid x tid)
 	amOp(4607, 27, 27, 4, 2802, amBrin) // strat=4 >=(tid,tid) (tid x tid)
 	amOp(4607, 27, 27, 5, 2800, amBrin) // strat=5 >(tid,tid) (tid x tid)
 
 	// family=4070 (float_minmax_ops) brin
-	amOp(4070, 700, 700, 1, 622, amBrin) // strat=1 <(float4,float4) (float4 x float4)
-	amOp(4070, 700, 700, 2, 624, amBrin) // strat=2 <=(float4,float4) (float4 x float4)
-	amOp(4070, 700, 700, 3, 620, amBrin) // strat=3 =(float4,float4) (float4 x float4)
-	amOp(4070, 700, 700, 4, 625, amBrin) // strat=4 >=(float4,float4) (float4 x float4)
-	amOp(4070, 700, 700, 5, 623, amBrin) // strat=5 >(float4,float4) (float4 x float4)
+	amOp(4070, 700, 700, 1, 622, amBrin)  // strat=1 <(float4,float4) (float4 x float4)
+	amOp(4070, 700, 700, 2, 624, amBrin)  // strat=2 <=(float4,float4) (float4 x float4)
+	amOp(4070, 700, 700, 3, 620, amBrin)  // strat=3 =(float4,float4) (float4 x float4)
+	amOp(4070, 700, 700, 4, 625, amBrin)  // strat=4 >=(float4,float4) (float4 x float4)
+	amOp(4070, 700, 700, 5, 623, amBrin)  // strat=5 >(float4,float4) (float4 x float4)
 	amOp(4070, 700, 701, 1, 1122, amBrin) // strat=1 <(float4,float8) (float4 x float8)
 	amOp(4070, 700, 701, 2, 1124, amBrin) // strat=2 <=(float4,float8) (float4 x float8)
 	amOp(4070, 700, 701, 3, 1120, amBrin) // strat=3 =(float4,float8) (float4 x float8)
@@ -3306,18 +3904,18 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(4070, 701, 700, 3, 1130, amBrin) // strat=3 =(float8,float4) (float8 x float4)
 	amOp(4070, 701, 700, 4, 1135, amBrin) // strat=4 >=(float8,float4) (float8 x float4)
 	amOp(4070, 701, 700, 5, 1133, amBrin) // strat=5 >(float8,float4) (float8 x float4)
-	amOp(4070, 701, 701, 1, 672, amBrin) // strat=1 <(float8,float8) (float8 x float8)
-	amOp(4070, 701, 701, 2, 673, amBrin) // strat=2 <=(float8,float8) (float8 x float8)
-	amOp(4070, 701, 701, 3, 670, amBrin) // strat=3 =(float8,float8) (float8 x float8)
-	amOp(4070, 701, 701, 4, 675, amBrin) // strat=4 >=(float8,float8) (float8 x float8)
-	amOp(4070, 701, 701, 5, 674, amBrin) // strat=5 >(float8,float8) (float8 x float8)
+	amOp(4070, 701, 701, 1, 672, amBrin)  // strat=1 <(float8,float8) (float8 x float8)
+	amOp(4070, 701, 701, 2, 673, amBrin)  // strat=2 <=(float8,float8) (float8 x float8)
+	amOp(4070, 701, 701, 3, 670, amBrin)  // strat=3 =(float8,float8) (float8 x float8)
+	amOp(4070, 701, 701, 4, 675, amBrin)  // strat=4 >=(float8,float8) (float8 x float8)
+	amOp(4070, 701, 701, 5, 674, amBrin)  // strat=5 >(float8,float8) (float8 x float8)
 
 	// family=4608 (float_minmax_multi_ops) brin
-	amOp(4608, 700, 700, 1, 622, amBrin) // strat=1 <(float4,float4) (float4 x float4)
-	amOp(4608, 700, 700, 2, 624, amBrin) // strat=2 <=(float4,float4) (float4 x float4)
-	amOp(4608, 700, 700, 3, 620, amBrin) // strat=3 =(float4,float4) (float4 x float4)
-	amOp(4608, 700, 700, 4, 625, amBrin) // strat=4 >=(float4,float4) (float4 x float4)
-	amOp(4608, 700, 700, 5, 623, amBrin) // strat=5 >(float4,float4) (float4 x float4)
+	amOp(4608, 700, 700, 1, 622, amBrin)  // strat=1 <(float4,float4) (float4 x float4)
+	amOp(4608, 700, 700, 2, 624, amBrin)  // strat=2 <=(float4,float4) (float4 x float4)
+	amOp(4608, 700, 700, 3, 620, amBrin)  // strat=3 =(float4,float4) (float4 x float4)
+	amOp(4608, 700, 700, 4, 625, amBrin)  // strat=4 >=(float4,float4) (float4 x float4)
+	amOp(4608, 700, 700, 5, 623, amBrin)  // strat=5 >(float4,float4) (float4 x float4)
 	amOp(4608, 700, 701, 1, 1122, amBrin) // strat=1 <(float4,float8) (float4 x float8)
 	amOp(4608, 700, 701, 2, 1124, amBrin) // strat=2 <=(float4,float8) (float4 x float8)
 	amOp(4608, 700, 701, 3, 1120, amBrin) // strat=3 =(float4,float8) (float4 x float8)
@@ -3328,11 +3926,11 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(4608, 701, 700, 3, 1130, amBrin) // strat=3 =(float8,float4) (float8 x float4)
 	amOp(4608, 701, 700, 4, 1135, amBrin) // strat=4 >=(float8,float4) (float8 x float4)
 	amOp(4608, 701, 700, 5, 1133, amBrin) // strat=5 >(float8,float4) (float8 x float4)
-	amOp(4608, 701, 701, 1, 672, amBrin) // strat=1 <(float8,float8) (float8 x float8)
-	amOp(4608, 701, 701, 2, 673, amBrin) // strat=2 <=(float8,float8) (float8 x float8)
-	amOp(4608, 701, 701, 3, 670, amBrin) // strat=3 =(float8,float8) (float8 x float8)
-	amOp(4608, 701, 701, 4, 675, amBrin) // strat=4 >=(float8,float8) (float8 x float8)
-	amOp(4608, 701, 701, 5, 674, amBrin) // strat=5 >(float8,float8) (float8 x float8)
+	amOp(4608, 701, 701, 1, 672, amBrin)  // strat=1 <(float8,float8) (float8 x float8)
+	amOp(4608, 701, 701, 2, 673, amBrin)  // strat=2 <=(float8,float8) (float8 x float8)
+	amOp(4608, 701, 701, 3, 670, amBrin)  // strat=3 =(float8,float8) (float8 x float8)
+	amOp(4608, 701, 701, 4, 675, amBrin)  // strat=4 >=(float8,float8) (float8 x float8)
+	amOp(4608, 701, 701, 5, 674, amBrin)  // strat=5 >(float8,float8) (float8 x float8)
 
 	// family=4582 (float_bloom_ops) brin
 	amOp(4582, 700, 700, 1, 620, amBrin) // strat=1 =(float4,float4) (float4 x float4)
@@ -3390,12 +3988,12 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(4585, 869, 869, 1, 1201, amBrin) // strat=1 =(inet,inet) (inet x inet)
 
 	// family=4102 (network_inclusion_ops) brin
-	amOp(4102, 869, 869, 3, 3552, amBrin) // strat=3 &&(inet,inet) (inet x inet)
-	amOp(4102, 869, 869, 7, 934, amBrin) // strat=7 >>=(inet,inet) (inet x inet)
-	amOp(4102, 869, 869, 8, 932, amBrin) // strat=8 <<=(inet,inet) (inet x inet)
+	amOp(4102, 869, 869, 3, 3552, amBrin)  // strat=3 &&(inet,inet) (inet x inet)
+	amOp(4102, 869, 869, 7, 934, amBrin)   // strat=7 >>=(inet,inet) (inet x inet)
+	amOp(4102, 869, 869, 8, 932, amBrin)   // strat=8 <<=(inet,inet) (inet x inet)
 	amOp(4102, 869, 869, 18, 1201, amBrin) // strat=18 =(inet,inet) (inet x inet)
-	amOp(4102, 869, 869, 24, 933, amBrin) // strat=24 >>(inet,inet) (inet x inet)
-	amOp(4102, 869, 869, 26, 931, amBrin) // strat=26 <<(inet,inet) (inet x inet)
+	amOp(4102, 869, 869, 24, 933, amBrin)  // strat=24 >>(inet,inet) (inet x inet)
+	amOp(4102, 869, 869, 26, 931, amBrin)  // strat=26 <<(inet,inet) (inet x inet)
 
 	// family=4076 (bpchar_minmax_ops) brin
 	amOp(4076, 1042, 1042, 1, 1058, amBrin) // strat=1 <(bpchar,bpchar) (bpchar x bpchar)
@@ -3606,13 +4204,13 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(4589, 2950, 2950, 1, 2972, amBrin) // strat=1 =(uuid,uuid) (uuid x uuid)
 
 	// family=4103 (range_inclusion_ops) brin
-	amOp(4103, 3831, 3831, 1, 3893, amBrin) // strat=1 <<(anyrange,anyrange) (anyrange x anyrange)
-	amOp(4103, 3831, 3831, 2, 3895, amBrin) // strat=2 &<(anyrange,anyrange) (anyrange x anyrange)
-	amOp(4103, 3831, 3831, 3, 3888, amBrin) // strat=3 &&(anyrange,anyrange) (anyrange x anyrange)
-	amOp(4103, 3831, 3831, 4, 3896, amBrin) // strat=4 &>(anyrange,anyrange) (anyrange x anyrange)
-	amOp(4103, 3831, 3831, 5, 3894, amBrin) // strat=5 >>(anyrange,anyrange) (anyrange x anyrange)
-	amOp(4103, 3831, 3831, 7, 3890, amBrin) // strat=7 @>(anyrange,anyrange) (anyrange x anyrange)
-	amOp(4103, 3831, 3831, 8, 3892, amBrin) // strat=8 <@(anyrange,anyrange) (anyrange x anyrange)
+	amOp(4103, 3831, 3831, 1, 3893, amBrin)  // strat=1 <<(anyrange,anyrange) (anyrange x anyrange)
+	amOp(4103, 3831, 3831, 2, 3895, amBrin)  // strat=2 &<(anyrange,anyrange) (anyrange x anyrange)
+	amOp(4103, 3831, 3831, 3, 3888, amBrin)  // strat=3 &&(anyrange,anyrange) (anyrange x anyrange)
+	amOp(4103, 3831, 3831, 4, 3896, amBrin)  // strat=4 &>(anyrange,anyrange) (anyrange x anyrange)
+	amOp(4103, 3831, 3831, 5, 3894, amBrin)  // strat=5 >>(anyrange,anyrange) (anyrange x anyrange)
+	amOp(4103, 3831, 3831, 7, 3890, amBrin)  // strat=7 @>(anyrange,anyrange) (anyrange x anyrange)
+	amOp(4103, 3831, 3831, 8, 3892, amBrin)  // strat=8 <@(anyrange,anyrange) (anyrange x anyrange)
 	amOp(4103, 3831, 2283, 16, 3889, amBrin) // strat=16 @>(anyrange,anyelement) (anyrange x anyelement)
 	amOp(4103, 3831, 3831, 17, 3897, amBrin) // strat=17 -|-(anyrange,anyrange) (anyrange x anyrange)
 	amOp(4103, 3831, 3831, 18, 3882, amBrin) // strat=18 =(anyrange,anyrange) (anyrange x anyrange)
@@ -3639,19 +4237,19 @@ func pgAmopInitialEntries() []pgAmopEntry {
 	amOp(4590, 3220, 3220, 1, 3222, amBrin) // strat=1 =(pg_lsn,pg_lsn) (pg_lsn x pg_lsn)
 
 	// family=4104 (box_inclusion_ops) brin
-	amOp(4104, 603, 603, 1, 493, amBrin) // strat=1 <<(box,box) (box x box)
-	amOp(4104, 603, 603, 2, 494, amBrin) // strat=2 &<(box,box) (box x box)
-	amOp(4104, 603, 603, 3, 500, amBrin) // strat=3 &&(box,box) (box x box)
-	amOp(4104, 603, 603, 4, 495, amBrin) // strat=4 &>(box,box) (box x box)
-	amOp(4104, 603, 603, 5, 496, amBrin) // strat=5 >>(box,box) (box x box)
-	amOp(4104, 603, 603, 6, 499, amBrin) // strat=6 ~=(box,box) (box x box)
-	amOp(4104, 603, 603, 7, 498, amBrin) // strat=7 @>(box,box) (box x box)
-	amOp(4104, 603, 603, 8, 497, amBrin) // strat=8 <@(box,box) (box x box)
-	amOp(4104, 603, 603, 9, 2571, amBrin) // strat=9 &<|(box,box) (box x box)
+	amOp(4104, 603, 603, 1, 493, amBrin)   // strat=1 <<(box,box) (box x box)
+	amOp(4104, 603, 603, 2, 494, amBrin)   // strat=2 &<(box,box) (box x box)
+	amOp(4104, 603, 603, 3, 500, amBrin)   // strat=3 &&(box,box) (box x box)
+	amOp(4104, 603, 603, 4, 495, amBrin)   // strat=4 &>(box,box) (box x box)
+	amOp(4104, 603, 603, 5, 496, amBrin)   // strat=5 >>(box,box) (box x box)
+	amOp(4104, 603, 603, 6, 499, amBrin)   // strat=6 ~=(box,box) (box x box)
+	amOp(4104, 603, 603, 7, 498, amBrin)   // strat=7 @>(box,box) (box x box)
+	amOp(4104, 603, 603, 8, 497, amBrin)   // strat=8 <@(box,box) (box x box)
+	amOp(4104, 603, 603, 9, 2571, amBrin)  // strat=9 &<|(box,box) (box x box)
 	amOp(4104, 603, 603, 10, 2570, amBrin) // strat=10 <<|(box,box) (box x box)
 	amOp(4104, 603, 603, 11, 2573, amBrin) // strat=11 |>>(box,box) (box x box)
 	amOp(4104, 603, 603, 12, 2572, amBrin) // strat=12 |&>(box,box) (box x box)
-	amOp(4104, 603, 600, 7, 433, amBrin) // strat=7 @>(box,point) (box x point)
+	amOp(4104, 603, 600, 7, 433, amBrin)   // strat=7 @>(box,point) (box x point)
 
 	// Total non-btree amOp calls: 660
 	// Grand total: 945 rows (= 945 pg_amop entries)
@@ -3706,12 +4304,12 @@ func bootstrapPgAmopTuples(dataDir string) error {
 // in_range (amprocnum=3) and skipsupport (amprocnum=6) remain
 // out of scope.
 type pgAmprocEntry struct {
-	OID            uint32 // amproc OID
-	Family         uint32 // amprocfamily — pg_opfamily OID
-	LeftType       uint32 // amproclefttype — pg_type OID
-	RightType      uint32 // amprocrighttype — pg_type OID
-	Num            int16  // amprocnum — 1 for cmp
-	Proc           uint32 // amproc — pg_proc OID (regproc)
+	OID       uint32 // amproc OID
+	Family    uint32 // amprocfamily — pg_opfamily OID
+	LeftType  uint32 // amproclefttype — pg_type OID
+	RightType uint32 // amprocrighttype — pg_type OID
+	Num       int16  // amprocnum — 1 for cmp
+	Proc      uint32 // amproc — pg_proc OID (regproc)
 }
 
 // pgAmprocColDefs returns the PG18 6-column FormData_pg_amproc
@@ -3719,12 +4317,12 @@ type pgAmprocEntry struct {
 // PG's GETSTRUCT cast yields a valid Form_pg_amproc.
 func pgAmprocColDefs() []catalog.Column {
 	return []catalog.Column{
-		{Name: "oid", Type: catalog.Type{Name: "oid"}},               // 1
-		{Name: "amprocfamily", Type: catalog.Type{Name: "oid"}},      // 2
-		{Name: "amproclefttype", Type: catalog.Type{Name: "oid"}},    // 3
-		{Name: "amprocrighttype", Type: catalog.Type{Name: "oid"}},   // 4
-		{Name: "amprocnum", Type: catalog.Type{Name: "int2"}},        // 5
-		{Name: "amproc", Type: catalog.Type{Name: "regproc"}},        // 6
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},             // 1
+		{Name: "amprocfamily", Type: catalog.Type{Name: "oid"}},    // 2
+		{Name: "amproclefttype", Type: catalog.Type{Name: "oid"}},  // 3
+		{Name: "amprocrighttype", Type: catalog.Type{Name: "oid"}}, // 4
+		{Name: "amprocnum", Type: catalog.Type{Name: "int2"}},      // 5
+		{Name: "amproc", Type: catalog.Type{Name: "regproc"}},      // 6
 	}
 }
 
@@ -3749,7 +4347,6 @@ func pgAmprocColDefs() []catalog.Column {
 //   - amprocnum=1 → cmp        (always present)
 //   - amprocnum=2 → sortsupport (where PG18 ships one)
 //   - amprocnum=4 → equalimage  (always present in PG18)
-
 
 // pgAmprocRow encodes one pg_amproc row. Field order mirrors
 // FormData_pg_amproc so PG's GETSTRUCT cast is byte-for-byte
@@ -3792,30 +4389,30 @@ func bootstrapPgAmprocTuples(dataDir string) ([]heapTID, error) {
 // PG's `heap_deformtuple → Form_pg_index` cast agree.
 func pgIndexColDefs() []catalog.Column {
 	return []catalog.Column{
-		{Name: "indexrelid", Type: catalog.Type{Name: "oid"}},          // 1
-		{Name: "indrelid", Type: catalog.Type{Name: "oid"}},            // 2
-		{Name: "indnatts", Type: catalog.Type{Name: "int2"}},           // 3
-		{Name: "indnkeyatts", Type: catalog.Type{Name: "int2"}},        // 4
-		{Name: "indisunique", Type: catalog.Type{Name: "bool"}},        // 5
+		{Name: "indexrelid", Type: catalog.Type{Name: "oid"}},           // 1
+		{Name: "indrelid", Type: catalog.Type{Name: "oid"}},             // 2
+		{Name: "indnatts", Type: catalog.Type{Name: "int2"}},            // 3
+		{Name: "indnkeyatts", Type: catalog.Type{Name: "int2"}},         // 4
+		{Name: "indisunique", Type: catalog.Type{Name: "bool"}},         // 5
 		{Name: "indnullsnotdistinct", Type: catalog.Type{Name: "bool"}}, // 6
-		{Name: "indisprimary", Type: catalog.Type{Name: "bool"}},       // 7
-		{Name: "indisexclusion", Type: catalog.Type{Name: "bool"}},     // 8
-		{Name: "indimmediate", Type: catalog.Type{Name: "bool"}},       // 9
-		{Name: "indisclustered", Type: catalog.Type{Name: "bool"}},     // 10
-		{Name: "indisvalid", Type: catalog.Type{Name: "bool"}},         // 11
-		{Name: "indcheckxmin", Type: catalog.Type{Name: "bool"}},       // 12
-		{Name: "indisready", Type: catalog.Type{Name: "bool"}},         // 13
-		{Name: "indislive", Type: catalog.Type{Name: "bool"}},          // 14
-		{Name: "indisreplident", Type: catalog.Type{Name: "bool"}},     // 15
+		{Name: "indisprimary", Type: catalog.Type{Name: "bool"}},        // 7
+		{Name: "indisexclusion", Type: catalog.Type{Name: "bool"}},      // 8
+		{Name: "indimmediate", Type: catalog.Type{Name: "bool"}},        // 9
+		{Name: "indisclustered", Type: catalog.Type{Name: "bool"}},      // 10
+		{Name: "indisvalid", Type: catalog.Type{Name: "bool"}},          // 11
+		{Name: "indcheckxmin", Type: catalog.Type{Name: "bool"}},        // 12
+		{Name: "indisready", Type: catalog.Type{Name: "bool"}},          // 13
+		{Name: "indislive", Type: catalog.Type{Name: "bool"}},           // 14
+		{Name: "indisreplident", Type: catalog.Type{Name: "bool"}},      // 15
 		// Variable-length region. int2vector indkey is BKI_FORCE_NOT_NULL.
-		{Name: "indkey", Type: catalog.Type{Name: "int2vector"}},       // 16
-		{Name: "indcollation", Type: catalog.Type{Name: "oidvector"}},  // 17
-		{Name: "indclass", Type: catalog.Type{Name: "oidvector"}},      // 18
-		{Name: "indoption", Type: catalog.Type{Name: "int2vector"}},    // 19
+		{Name: "indkey", Type: catalog.Type{Name: "int2vector"}},      // 16
+		{Name: "indcollation", Type: catalog.Type{Name: "oidvector"}}, // 17
+		{Name: "indclass", Type: catalog.Type{Name: "oidvector"}},     // 18
+		{Name: "indoption", Type: catalog.Type{Name: "int2vector"}},   // 19
 		// pg_node_tree fields are nullable; we always encode NULL via
 		// the null bitmap (see pgIndexRow).
-		{Name: "indexprs", Type: catalog.Type{Name: "pg_node_tree"}},   // 20
-		{Name: "indpred", Type: catalog.Type{Name: "pg_node_tree"}},    // 21
+		{Name: "indexprs", Type: catalog.Type{Name: "pg_node_tree"}}, // 20
+		{Name: "indpred", Type: catalog.Type{Name: "pg_node_tree"}},  // 21
 	}
 }
 
@@ -3843,16 +4440,16 @@ type pgIndexEntry struct {
 // index rows must be present in every per-database pg_index too.
 func pgIndexInitialEntries() []pgIndexEntry {
 	const (
-		oidOps             uint32 = 1981
-		int2Ops            uint32 = 1979
-		int4Ops            uint32 = 1978
-		nameOps            uint32 = 1986
-		textOps            uint32 = 3126
-		charOps            uint32 = 1985
-		oidvectorOps       uint32 = 1987
-		boolOps            uint32 = 1984
-		float4Ops          uint32 = 10012 // btree float4_ops (postgres.bki: am=403 / btree)
-		cCollation         uint32 = 950   // C_COLLATION_OID — name/text use C in catalogs
+		oidOps       uint32 = 1981
+		int2Ops      uint32 = 1979
+		int4Ops      uint32 = 1978
+		nameOps      uint32 = 1986
+		textOps      uint32 = 3126
+		charOps      uint32 = 1985
+		oidvectorOps uint32 = 1987
+		boolOps      uint32 = 1984
+		float4Ops    uint32 = 10012 // btree float4_ops (postgres.bki: am=403 / btree)
+		cCollation   uint32 = 950   // C_COLLATION_OID — name/text use C in catalogs
 	)
 	// Helper builders.
 	entry := func(idxOID, relOID uint32, key []int16, class []uint32, coll []uint32, unique, primary bool) pgIndexEntry {
@@ -3871,10 +4468,10 @@ func pgIndexInitialEntries() []pgIndexEntry {
 	}
 	// Shared-catalog index rows (also written to per-database pg_index).
 	shared := []pgIndexEntry{
-		entry(2671, 1262, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),  // pg_database_datname_index
-		entry(2672, 1262, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),             // pg_database_oid_index
-		entry(2676, 1260, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),  // pg_authid_rolname_index
-		entry(2677, 1260, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),             // pg_authid_oid_index
+		entry(2671, 1262, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),                   // pg_database_datname_index
+		entry(2672, 1262, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                              // pg_database_oid_index
+		entry(2676, 1260, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),                   // pg_authid_rolname_index
+		entry(2677, 1260, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                              // pg_authid_oid_index
 		entry(2695, 1261, []int16{3, 2, 4}, []uint32{oidOps, oidOps, oidOps}, []uint32{0, 0, 0}, true, false), // pg_auth_members_member_role_index
 		// M0106-0010 Step 3z: pg_auth_members_role_member_index (OID 2694).
 		// postgres/src/include/catalog/pg_auth_members.h:49 —
@@ -4030,17 +4627,17 @@ func pgIndexInitialEntries() []pgIndexEntry {
 	}
 	// Local-catalog index rows mirroring nailedLocalRels.
 	local := []pgIndexEntry{
-		entry(2703, 1247, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_type_oid_index
-		entry(2704, 1247, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),              // pg_type_typname_nsp_index
-		entry(2658, 1249, []int16{1, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_attribute_relid_attnam_index
+		entry(2703, 1247, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                          // pg_type_oid_index
+		entry(2704, 1247, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false), // pg_type_typname_nsp_index
+		entry(2658, 1249, []int16{1, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_attribute_relid_attnam_index
 		// pg_attribute columns (PG18, pg_attribute.h): 1=attrelid, 2=attname,
 		// 3=atttypid, 4=attlen, 5=attnum, ... Earlier goopg pinned
 		// attnum at heap col 6 (legacy PG11/12 layout); PG18 sets
 		// Anum_pg_attribute_attnum = 5, so the index must point at col 5.
-		entry(2659, 1249, []int16{1, 5}, []uint32{oidOps, int2Ops}, []uint32{0, 0}, true, true),                        // pg_attribute_relid_attnum_index
-		entry(2662, 1259, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_class_oid_index
-		entry(2663, 1259, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),              // pg_class_relname_nsp_index
-		entry(2690, 1255, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_proc_oid_index
+		entry(2659, 1249, []int16{1, 5}, []uint32{oidOps, int2Ops}, []uint32{0, 0}, true, true),                                // pg_attribute_relid_attnum_index
+		entry(2662, 1259, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                               // pg_class_oid_index
+		entry(2663, 1259, []int16{2, 3}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),                      // pg_class_relname_nsp_index
+		entry(2690, 1255, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                               // pg_proc_oid_index
 		entry(2691, 1255, []int16{2, 20, 3}, []uint32{nameOps, oidvectorOps, oidOps}, []uint32{cCollation, 0, 0}, true, false), // pg_proc_proname_args_nsp_index
 		// PG18 (postgres/src/include/catalog/indexing.h + pg_index_d.h):
 		//   IndexIndrelidIndexId = 2678 = pg_index_indrelid_index
@@ -4058,16 +4655,16 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		// file remains the empty Step-3k placeholder because
 		// pg_index_indrelid_index is not used for a syscache lookup
 		// during early backend startup.
-		entry(2678, 2610, []int16{2}, []uint32{oidOps}, []uint32{0}, false, false),                                     // pg_index_indrelid_index
-		entry(2679, 2610, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_index_indexrelid_index
-		entry(2687, 2616, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_opclass_oid_index
+		entry(2678, 2610, []int16{2}, []uint32{oidOps}, []uint32{0}, false, false), // pg_index_indrelid_index
+		entry(2679, 2610, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),   // pg_index_indexrelid_index
+		entry(2687, 2616, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),   // pg_opclass_oid_index
 		// OID 2655 in upstream is pg_amproc_fam_proc_index (on amprocfamily,
 		// amproclefttype, amprocrighttype, amprocnum), not the oid index;
 		// the label in nailedLocalRels is historical.
 		entry(2655, 2603, []int16{2, 3, 4, 5}, []uint32{oidOps, oidOps, oidOps, int2Ops}, []uint32{0, 0, 0, 0}, true, false), // pg_amproc_fam_proc_index
 		// pg_rewrite columns (PG18, pg_rewrite.h): 1=oid, 2=rulename,
 		// 3=ev_class. Index = btree(ev_class oid_ops, rulename name_ops).
-		entry(2693, 2618, []int16{3, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_rewrite_rel_rulename_index
+		entry(2693, 2618, []int16{3, 2}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_rewrite_rel_rulename_index
 		// M0106-0010 Step 3dm phase B: pg_rewrite_oid_index.
 		//   postgres/src/include/catalog/pg_rewrite.h:46
 		//     DECLARE_UNIQUE_INDEX_PKEY(pg_rewrite_oid_index, 2692,
@@ -4079,27 +4676,27 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		entry(2692, 2618, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true), // pg_rewrite_oid_index
 		// pg_trigger columns (PG18, pg_trigger.h): 1=oid, 2=tgrelid,
 		// 3=tgparentid, 4=tgname. Index = btree(tgrelid, tgname).
-		entry(2701, 2620, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false),              // pg_trigger_tgrelid_tgname_index
-		entry(2667, 2606, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_constraint_oid_index
+		entry(2701, 2620, []int16{2, 4}, []uint32{oidOps, nameOps}, []uint32{0, cCollation}, true, false), // pg_trigger_tgrelid_tgname_index
+		entry(2667, 2606, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                          // pg_constraint_oid_index
 		// M0106-0010 batched-48: pg_constraint_conrelid_contypid_conname_index
 		// (OID 2665, ConstraintRelidTypidNameIndexId). pg_constraint attnums
 		// (pg_constraint.h): 2=conname (name), 9=conrelid (oid),
 		// 10=contypid (oid). PG declares UNIQUE not PKEY.
 		entry(2665, 2606, []int16{9, 10, 2}, []uint32{oidOps, oidOps, nameOps}, []uint32{0, 0, cCollation}, true, false), // pg_constraint_conrelid_contypid_conname_index
-		entry(2688, 2617, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                       // pg_operator_oid_index
-		entry(2680, 2611, []int16{1, 3}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true),                        // pg_inherits_relid_seqno_index
+		entry(2688, 2617, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                         // pg_operator_oid_index
+		entry(2680, 2611, []int16{1, 3}, []uint32{oidOps, int4Ops}, []uint32{0, 0}, true, true),                          // pg_inherits_relid_seqno_index
 		// pg_namespace columns (PG18, pg_namespace.h): 1=oid, 2=nspname,
 		// 3=nspowner, 4=nspacl. PG18 indexing.h:
 		//   NamespaceNameIndexId = 2684 = pg_namespace_nspname_index
 		//     btree(nspname name_ops) UNIQUE
 		//   NamespaceOidIndexId  = 2685 = pg_namespace_oid_index
 		//     btree(oid oid_ops) UNIQUE PRIMARY KEY
-		entry(2684, 2615, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false),                           // pg_namespace_nspname_index
-		entry(2685, 2615, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                      // pg_namespace_oid_index
+		entry(2684, 2615, []int16{2}, []uint32{nameOps}, []uint32{cCollation}, true, false), // pg_namespace_nspname_index
+		entry(2685, 2615, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),            // pg_namespace_oid_index
 		// OID 2654 = pg_amop_opr_fam_index: btree(amopopr oid_ops,
 		// amoppurpose char_ops, amopfamily oid_ops). amoppurpose is
 		// pg_amop attnum 6 (char), amopopr is attnum 7, amopfamily attnum 2.
-		entry(2654, 2602, []int16{7, 6, 2}, []uint32{oidOps, charOps, oidOps}, []uint32{0, 0, 0}, true, false),         // pg_amop_opr_fam_index
+		entry(2654, 2602, []int16{7, 6, 2}, []uint32{oidOps, charOps, oidOps}, []uint32{0, 0, 0}, true, false), // pg_amop_opr_fam_index
 		// M0106-0010 Step 3y: pg_amop_fam_strat_index (OID 2653).
 		// postgres/src/include/catalog/pg_amop.h:90 —
 		//   DECLARE_UNIQUE_INDEX(pg_amop_fam_strat_index, 2653,
@@ -4774,9 +5371,9 @@ func pgIndexInitialEntries() []pgIndexEntry {
 		//  - 3997 UNIQUE composite name_ops (cCollation) + oid_ops over
 		//         attnums 3,4 (stxname, stxnamespace)
 		//  - 3379 NON-UNIQUE single oid_ops over attnum 2 (stxrelid)
-		entry(3380, 3381, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                                  // pg_statistic_ext_oid_index
-		entry(3997, 3381, []int16{3, 4}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false),         // pg_statistic_ext_name_index
-		entry(3379, 3381, []int16{2}, []uint32{oidOps}, []uint32{0}, false, false),                                // pg_statistic_ext_relid_index
+		entry(3380, 3381, []int16{1}, []uint32{oidOps}, []uint32{0}, true, true),                          // pg_statistic_ext_oid_index
+		entry(3997, 3381, []int16{3, 4}, []uint32{nameOps, oidOps}, []uint32{cCollation, 0}, true, false), // pg_statistic_ext_name_index
+		entry(3379, 3381, []int16{2}, []uint32{oidOps}, []uint32{0}, false, false),                        // pg_statistic_ext_relid_index
 		// M0106-0010 Step 3ce: pg_statistic_relid_att_inh_index. PG18
 		//   postgres/src/include/catalog/pg_statistic.h:139
 		//     DECLARE_UNIQUE_INDEX_PKEY(pg_statistic_relid_att_inh_index, 2696,
@@ -4964,27 +5561,27 @@ func pgIndexNattsByOID() map[uint32]int16 {
 func pgIndexRow(e pgIndexEntry) executor.Row {
 	natts := int16(len(e.IndKey))
 	return executor.Row{
-		executor.NewIntDatum(int64(e.IndexRelid)),       // 1 indexrelid
-		executor.NewIntDatum(int64(e.IndRelid)),         // 2 indrelid
-		executor.NewIntDatum(int64(natts)),              // 3 indnatts
-		executor.NewIntDatum(int64(natts)),              // 4 indnkeyatts
-		executor.NewBoolDatum(e.IsUnique),               // 5 indisunique
-		executor.NewBoolDatum(false),                    // 6 indnullsnotdistinct
-		executor.NewBoolDatum(e.IsPrimary),              // 7 indisprimary
-		executor.NewBoolDatum(false),                    // 8 indisexclusion
-		executor.NewBoolDatum(true),                     // 9 indimmediate
-		executor.NewBoolDatum(false),                    // 10 indisclustered
-		executor.NewBoolDatum(true),                     // 11 indisvalid
-		executor.NewBoolDatum(false),                    // 12 indcheckxmin
-		executor.NewBoolDatum(true),                     // 13 indisready
-		executor.NewBoolDatum(true),                     // 14 indislive
-		executor.NewBoolDatum(false),                    // 15 indisreplident
-		executor.NewBytesDatum(int2VectorBytes(e.IndKey)),    // 16 indkey
+		executor.NewIntDatum(int64(e.IndexRelid)),              // 1 indexrelid
+		executor.NewIntDatum(int64(e.IndRelid)),                // 2 indrelid
+		executor.NewIntDatum(int64(natts)),                     // 3 indnatts
+		executor.NewIntDatum(int64(natts)),                     // 4 indnkeyatts
+		executor.NewBoolDatum(e.IsUnique),                      // 5 indisunique
+		executor.NewBoolDatum(false),                           // 6 indnullsnotdistinct
+		executor.NewBoolDatum(e.IsPrimary),                     // 7 indisprimary
+		executor.NewBoolDatum(false),                           // 8 indisexclusion
+		executor.NewBoolDatum(true),                            // 9 indimmediate
+		executor.NewBoolDatum(false),                           // 10 indisclustered
+		executor.NewBoolDatum(true),                            // 11 indisvalid
+		executor.NewBoolDatum(false),                           // 12 indcheckxmin
+		executor.NewBoolDatum(true),                            // 13 indisready
+		executor.NewBoolDatum(true),                            // 14 indislive
+		executor.NewBoolDatum(false),                           // 15 indisreplident
+		executor.NewBytesDatum(int2VectorBytes(e.IndKey)),      // 16 indkey
 		executor.NewBytesDatum(oidVectorBytes(e.IndCollation)), // 17 indcollation
-		executor.NewBytesDatum(oidVectorBytes(e.IndClass)),    // 18 indclass
-		executor.NewBytesDatum(int2VectorBytes(e.IndOption)), // 19 indoption
-		executor.NullDatum,                              // 20 indexprs (NULL — no expression indexes)
-		executor.NullDatum,                              // 21 indpred  (NULL — no partial indexes)
+		executor.NewBytesDatum(oidVectorBytes(e.IndClass)),     // 18 indclass
+		executor.NewBytesDatum(int2VectorBytes(e.IndOption)),   // 19 indoption
+		executor.NullDatum,                                     // 20 indexprs (NULL — no expression indexes)
+		executor.NullDatum,                                     // 21 indpred  (NULL — no partial indexes)
 	}
 }
 
@@ -5022,44 +5619,44 @@ func bootstrapPgIndexTuples(dataDir string) (map[uint32]heapTID, error) {
 // be present at the correct struct offset.
 func pgClassColDefs() []catalog.Column {
 	return []catalog.Column{
-		{Name: "oid", Type: catalog.Type{Name: "oid"}},               // 0
-		{Name: "relname", Type: catalog.Type{Name: "name"}},          // 4 (64 bytes)
-		{Name: "relnamespace", Type: catalog.Type{Name: "oid"}},      // 68
-		{Name: "reltype", Type: catalog.Type{Name: "oid"}},           // 72
-		{Name: "reloftype", Type: catalog.Type{Name: "oid"}},         // 76
-		{Name: "relowner", Type: catalog.Type{Name: "oid"}},          // 80
-		{Name: "relam", Type: catalog.Type{Name: "oid"}},             // 84
-		{Name: "relfilenode", Type: catalog.Type{Name: "oid"}},       // 88
-		{Name: "reltablespace", Type: catalog.Type{Name: "oid"}},     // 92
-		{Name: "relpages", Type: catalog.Type{Name: "int4"}},         // 96
-		{Name: "reltuples", Type: catalog.Type{Name: "float4"}},      // 100
-		{Name: "relallvisible", Type: catalog.Type{Name: "int4"}},    // 104
-		{Name: "relallfrozen", Type: catalog.Type{Name: "int4"}},     // 108
-		{Name: "reltoastrelid", Type: catalog.Type{Name: "oid"}},     // 112
-		{Name: "relhasindex", Type: catalog.Type{Name: "bool"}},      // 116
-		{Name: "relisshared", Type: catalog.Type{Name: "bool"}},      // 117
-		{Name: "relpersistence", Type: catalog.Type{Name: "char"}},   // 118
-		{Name: "relkind", Type: catalog.Type{Name: "char"}},          // 119
-		{Name: "relnatts", Type: catalog.Type{Name: "int2"}},         // 120
-		{Name: "relchecks", Type: catalog.Type{Name: "int2"}},        // 122
-		{Name: "relhasrules", Type: catalog.Type{Name: "bool"}},      // 124
-		{Name: "relhastriggers", Type: catalog.Type{Name: "bool"}},   // 125
-		{Name: "relhassubclass", Type: catalog.Type{Name: "bool"}},   // 126
-		{Name: "relrowsecurity", Type: catalog.Type{Name: "bool"}},   // 127
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},                  // 0
+		{Name: "relname", Type: catalog.Type{Name: "name"}},             // 4 (64 bytes)
+		{Name: "relnamespace", Type: catalog.Type{Name: "oid"}},         // 68
+		{Name: "reltype", Type: catalog.Type{Name: "oid"}},              // 72
+		{Name: "reloftype", Type: catalog.Type{Name: "oid"}},            // 76
+		{Name: "relowner", Type: catalog.Type{Name: "oid"}},             // 80
+		{Name: "relam", Type: catalog.Type{Name: "oid"}},                // 84
+		{Name: "relfilenode", Type: catalog.Type{Name: "oid"}},          // 88
+		{Name: "reltablespace", Type: catalog.Type{Name: "oid"}},        // 92
+		{Name: "relpages", Type: catalog.Type{Name: "int4"}},            // 96
+		{Name: "reltuples", Type: catalog.Type{Name: "float4"}},         // 100
+		{Name: "relallvisible", Type: catalog.Type{Name: "int4"}},       // 104
+		{Name: "relallfrozen", Type: catalog.Type{Name: "int4"}},        // 108
+		{Name: "reltoastrelid", Type: catalog.Type{Name: "oid"}},        // 112
+		{Name: "relhasindex", Type: catalog.Type{Name: "bool"}},         // 116
+		{Name: "relisshared", Type: catalog.Type{Name: "bool"}},         // 117
+		{Name: "relpersistence", Type: catalog.Type{Name: "char"}},      // 118
+		{Name: "relkind", Type: catalog.Type{Name: "char"}},             // 119
+		{Name: "relnatts", Type: catalog.Type{Name: "int2"}},            // 120
+		{Name: "relchecks", Type: catalog.Type{Name: "int2"}},           // 122
+		{Name: "relhasrules", Type: catalog.Type{Name: "bool"}},         // 124
+		{Name: "relhastriggers", Type: catalog.Type{Name: "bool"}},      // 125
+		{Name: "relhassubclass", Type: catalog.Type{Name: "bool"}},      // 126
+		{Name: "relrowsecurity", Type: catalog.Type{Name: "bool"}},      // 127
 		{Name: "relforcerowsecurity", Type: catalog.Type{Name: "bool"}}, // 128
-		{Name: "relispopulated", Type: catalog.Type{Name: "bool"}},   // 129
-		{Name: "relreplident", Type: catalog.Type{Name: "char"}},     // 130
-		{Name: "relispartition", Type: catalog.Type{Name: "bool"}},   // 131
-		{Name: "relrewrite", Type: catalog.Type{Name: "oid"}},        // 132
-		{Name: "relfrozenxid", Type: catalog.Type{Name: "xid"}},      // 136
-		{Name: "relminmxid", Type: catalog.Type{Name: "xid"}},        // 140
+		{Name: "relispopulated", Type: catalog.Type{Name: "bool"}},      // 129
+		{Name: "relreplident", Type: catalog.Type{Name: "char"}},        // 130
+		{Name: "relispartition", Type: catalog.Type{Name: "bool"}},      // 131
+		{Name: "relrewrite", Type: catalog.Type{Name: "oid"}},           // 132
+		{Name: "relfrozenxid", Type: catalog.Type{Name: "xid"}},         // 136
+		{Name: "relminmxid", Type: catalog.Type{Name: "xid"}},           // 140
 		// Varlena columns. PG's extractRelOptions / aclitem-walking code
 		// casts the raw datum as ArrayType*; the empty placeholder MUST
 		// therefore be a valid binary ArrayType, not a text "{}" varlena.
 		// See encodeValuePG's "aclitem[]" / "text[]" cases and
 		// docs/design/0106-0010-pg-class-empty-array-encoding.md.
-		{Name: "relacl", Type: catalog.Type{Name: "aclitem[]"}},     // 144 varlena (16-byte empty ArrayType)
-		{Name: "reloptions", Type: catalog.Type{Name: "text[]"}},    // varlena
+		{Name: "relacl", Type: catalog.Type{Name: "aclitem[]"}},          // 144 varlena (16-byte empty ArrayType)
+		{Name: "reloptions", Type: catalog.Type{Name: "text[]"}},         // varlena
 		{Name: "relpartbound", Type: catalog.Type{Name: "pg_node_tree"}}, // varlena text
 	}
 }
@@ -5093,14 +5690,14 @@ func pgClassRow(rel nailedRel) executor.Row {
 		// relHasRules = true
 	}
 	return executor.Row{
-		executor.NewIntDatum(int64(rel.OID)),      // 0: oid
-		executor.NewStringDatum(rel.RelName),      // 4: relname
-		executor.NewIntDatum(11),                  // 68: relnamespace
-		executor.NewIntDatum(int64(relType)),      // 72: reltype
-		executor.NewIntDatum(0),                   // 76: reloftype
-		executor.NewIntDatum(10),                  // 80: relowner
-		executor.NewIntDatum(relAm),               // 84: relam
-		executor.NewIntDatum(relFilenode),         // 88: relfilenode
+		executor.NewIntDatum(int64(rel.OID)), // 0: oid
+		executor.NewStringDatum(rel.RelName), // 4: relname
+		executor.NewIntDatum(11),             // 68: relnamespace
+		executor.NewIntDatum(int64(relType)), // 72: reltype
+		executor.NewIntDatum(0),              // 76: reloftype
+		executor.NewIntDatum(10),             // 80: relowner
+		executor.NewIntDatum(relAm),          // 84: relam
+		executor.NewIntDatum(relFilenode),    // 88: relfilenode
 		// M0106-0010 Step 3cr: shared catalogs must store reltablespace
 		// = GLOBALTABLESPACE_OID (1664). PG's RelationInitPhysicalAddr
 		// (postgres/src/backend/utils/cache/relcache.c:1347-1354)
@@ -5115,32 +5712,32 @@ func pgClassRow(rel nailedRel) executor.Row {
 		// formrdesc sets this in memory at Phase 2 (relcache.c:1948),
 		// but Phase 3 then overrides rd_rel with the on-disk pg_class
 		// row, so the on-disk value must match.
-		pgClassReltablespaceFor(rel.IsShared),     // 92: reltablespace
-		executor.NewIntDatum(0),                   // 96: relpages
-		executor.NewIntDatum(0),                   // 100: reltuples
-		executor.NewIntDatum(0),                   // 104: relallvisible
-		executor.NewIntDatum(0),                   // 108: relallfrozen
-		executor.NewIntDatum(0),                   // 112: reltoastrelid
-		executor.NewBoolDatum(false),              // 116: relhasindex
-		executor.NewBoolDatum(rel.IsShared),       // 117: relisshared
-		executor.NewStringDatum("p"),              // 118: relpersistence
+		pgClassReltablespaceFor(rel.IsShared),              // 92: reltablespace
+		executor.NewIntDatum(0),                            // 96: relpages
+		executor.NewIntDatum(0),                            // 100: reltuples
+		executor.NewIntDatum(0),                            // 104: relallvisible
+		executor.NewIntDatum(0),                            // 108: relallfrozen
+		executor.NewIntDatum(0),                            // 112: reltoastrelid
+		executor.NewBoolDatum(false),                       // 116: relhasindex
+		executor.NewBoolDatum(rel.IsShared),                // 117: relisshared
+		executor.NewStringDatum("p"),                       // 118: relpersistence
 		executor.NewStringDatum(string(rune(rel.RelKind))), // 119: relkind
-		executor.NewIntDatum(int64(rel.RelNatts)), // 120: relnatts
-		executor.NewIntDatum(0),                   // 122: relchecks
-		executor.NewBoolDatum(relHasRules),        // 124: relhasrules
-		executor.NewBoolDatum(false),              // 125: relhastriggers
-		executor.NewBoolDatum(false),              // 126: relhassubclass
-		executor.NewBoolDatum(false),              // 127: relrowsecurity
-		executor.NewBoolDatum(false),              // 128: relforcerowsecurity
-		executor.NewBoolDatum(true),               // 129: relispopulated
-		executor.NewStringDatum("n"),              // 130: relreplident
-		executor.NewBoolDatum(false),              // 131: relispartition
-		executor.NewIntDatum(0),                   // 132: relrewrite
-		executor.NewIntDatum(3),                   // 136: relfrozenxid
-		executor.NewIntDatum(1),                   // 140: relminmxid
-		executor.NewStringDatum("{}"),             // relacl (empty aclitem[])
-		executor.NewStringDatum("{}"),             // reloptions (empty text[])
-		executor.NewStringDatum(""),               // relpartbound (empty pg_node_tree)
+		executor.NewIntDatum(int64(rel.RelNatts)),          // 120: relnatts
+		executor.NewIntDatum(0),                            // 122: relchecks
+		executor.NewBoolDatum(relHasRules),                 // 124: relhasrules
+		executor.NewBoolDatum(false),                       // 125: relhastriggers
+		executor.NewBoolDatum(false),                       // 126: relhassubclass
+		executor.NewBoolDatum(false),                       // 127: relrowsecurity
+		executor.NewBoolDatum(false),                       // 128: relforcerowsecurity
+		executor.NewBoolDatum(true),                        // 129: relispopulated
+		executor.NewStringDatum("n"),                       // 130: relreplident
+		executor.NewBoolDatum(false),                       // 131: relispartition
+		executor.NewIntDatum(0),                            // 132: relrewrite
+		executor.NewIntDatum(3),                            // 136: relfrozenxid
+		executor.NewIntDatum(1),                            // 140: relminmxid
+		executor.NewStringDatum("{}"),                      // relacl (empty aclitem[])
+		executor.NewStringDatum("{}"),                      // reloptions (empty text[])
+		executor.NewStringDatum(""),                        // relpartbound (empty pg_node_tree)
 	}
 }
 
@@ -5234,21 +5831,21 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NewIntDatum(int64(a.TypeOID)),
 		executor.NewIntDatum(int64(a.Len)),
 		executor.NewIntDatum(int64(a.Num)),
-		executor.NewIntDatum(-1),            // atttypmod
-		executor.NewIntDatum(0),             // attndims
+		executor.NewIntDatum(-1), // atttypmod
+		executor.NewIntDatum(0),  // attndims
 		executor.NewBoolDatum(pgTypeByVal(a.TypeOID)),
 		executor.NewStringDatum(pgTypeAlignChar(a.TypeOID)),
 		executor.NewStringDatum(pgTypeStorageChar(a.TypeOID)),
-		executor.NewStringDatum(""),         // attcompression
+		executor.NewStringDatum(""), // attcompression
 		executor.NewBoolDatum(a.NotNull),
-		executor.NewBoolDatum(false),        // atthasdef
-		executor.NewBoolDatum(false),        // atthasmissing
-		executor.NewStringDatum(""),         // attidentity
-		executor.NewStringDatum(""),         // attgenerated
-		executor.NewBoolDatum(false),        // attisdropped
-		executor.NewBoolDatum(true),         // attislocal
-		executor.NewIntDatum(0),             // attinhcount
-		executor.NewIntDatum(0),             // attcollation
+		executor.NewBoolDatum(false), // atthasdef
+		executor.NewBoolDatum(false), // atthasmissing
+		executor.NewStringDatum(""),  // attidentity
+		executor.NewStringDatum(""),  // attgenerated
+		executor.NewBoolDatum(false), // attisdropped
+		executor.NewBoolDatum(true),  // attislocal
+		executor.NewIntDatum(0),      // attinhcount
+		executor.NewIntDatum(0),      // attcollation
 		// Step 3u: Emit NULL (not empty-text varlena) for the four nullable
 		// trailing varlena/array columns. Previously NewStringDatum("") wrote
 		// a 1-byte empty varlena which PG's RelationGetIndexAttOptions →
@@ -5258,10 +5855,10 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		// RelationInitIndexAccessInfo on the very index whose error message
 		// is being formatted → ERRORDATA_STACK_SIZE PANIC. PG18's default
 		// for an unconfigured catalog row is SQL NULL on all four columns.
-		executor.NullDatum,                  // attacl
-		executor.NullDatum,                  // attoptions
-		executor.NullDatum,                  // attfdwoptions
-		executor.NullDatum,                  // attmissingval
+		executor.NullDatum, // attacl
+		executor.NullDatum, // attoptions
+		executor.NullDatum, // attfdwoptions
+		executor.NullDatum, // attmissingval
 	}
 }
 
@@ -5292,7 +5889,6 @@ type heapTID struct {
 	Block  uint32
 	Offset uint16
 }
-
 
 // pgAuthidEntry describes a bootstrapped pg_authid row and the heap-TID
 // where it was written, so the rolname / oid index bootstrap (Step 3cx)
@@ -5705,18 +6301,9 @@ func defaultPgIdentConf() []byte {
 `)
 }
 
+// defaultPgHBAConf is the trust-everywhere default file used by SampleFiles
+// and the no-auth-option path. Init overwrites pg_hba.conf with
+// buildPgHBAConf(host, local) when an explicit auth method is requested.
 func defaultPgHBAConf() []byte {
-	return []byte(`# goopg pg_hba.conf — host-based authentication rules.
-#
-# Same format as upstream PostgreSQL: TYPE  DATABASE  USER  ADDRESS  METHOD
-# The first matching rule wins. Default policy: trust loopback,
-# reject everything else.
-
-# TYPE   DATABASE  USER   ADDRESS         METHOD
-local    all       all                    trust
-host     all       all    127.0.0.1/32    trust
-host     all       all    ::1/128         trust
-host     all       all    0.0.0.0/0       reject
-host     all       all    ::/0            reject
-`)
+	return buildPgHBAConf("trust", "trust")
 }
