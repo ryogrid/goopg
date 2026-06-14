@@ -1335,6 +1335,35 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         STILL DEFERRED: `heapallindexed` heap scan + the `CREATE EXTENSION
         amcheck`/SRF SQL surface (AC-002-promoting, still blocked on a clean tree
         — separate live session pid 2177381 holds the gen-column WIP).
+      - **PROGRESS 2026-06-14 (loop #63):** ported the heap **relation-walking
+        driver** — the outer loop of the `verify_heapam()` SRF body
+        (`verify_heapam.c:367-405,480-501`) — as `VerifyHeapRelation` in new
+        `internal/amcheck/verify_heapam_relation.go`. The per-page checks were
+        already ported (`VerifyHeapPage*`); this adds the relation-level walk:
+        empty-relation early exit (`nblocks==0` → no rows), `startblock`/`endblock`
+        resolution from the SRF's int8 args (`*int64`, nil = SQL NULL → 0 /
+        nblocks-1) with the upstream-verbatim `ERRCODE_INVALID_PARAMETER_VALUE`
+        range errors, and block iteration that runs each page through
+        `verifyHeapPage` and tags every finding with its block
+        (`HeapRelReport{Blkno,Offset,Msg}` → one SRF `(blkno,offnum,msg)` row;
+        attnum -1, SRF-supplied). It **reuses the same `PageSource` seam the
+        B-tree relation walkers already take**, making the heap and index sides
+        symmetric and reducing SQL slice S3 (`0110-0008`) from "executor contains
+        the block loop" to a thin smgr adapter. relkind/relam guard + relation
+        open/lock + toast walk stay at the wire layer (catalog/goopg-storage
+        coupled), matching where upstream draws the line — documented. 9 new tests
+        (`heapMapSource` builder + fake `PageSource`): clean multi-block (asserts
+        every block read), empty-relation (source untouched), finding tagged with
+        non-zero block, ordered across blocks, sub-range restriction, both
+        range-validation messages + negative case, surfaced read error, nil-source,
+        and `RelDesc` threading through to the per-page natts check. `go test -race
+        ./internal/amcheck` PASS; `go build ./...` OK; gofmt/vet clean; **all in new
+        files only — zero contaminated files touched.** Design doc `0110-0005`
+        extended ("Relation-walking driver"); `0110-0008` S3 row + engine-API
+        section updated. STILL DEFERRED: the `heapallindexed` heap scan + the
+        `CREATE EXTENSION amcheck`/SRF SQL surface (AC-002-promoting, still blocked
+        on a clean tree — pid 2177381 still holds the gen-column WIP, frozen since
+        2026-06-13 14:28).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

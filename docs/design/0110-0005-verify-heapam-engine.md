@@ -635,6 +635,49 @@ an aborted heap-only root (gated off), a current-xid root, an unknown-status
 root, a nil callback (proves page-bytes-only callers unchanged), and a frozen
 xmin that resolves to committed without the callback being consulted.
 
+## Relation-walking driver (`verify_heapam_relation.go`)
+
+The per-page entry points (`VerifyHeapPage*`) check one page; the SRF must walk a
+whole relation. `VerifyHeapRelation(src PageSource, nblocks, opts)` ports the
+**outer loop** of the `verify_heapam()` SRF body
+(`verify_heapam.c:367-405,480-501`): the empty-relation early exit
+(`nblocks == 0` → no rows), block-range resolution from the `startblock` /
+`endblock` SRF args (`*int64`, nil = SQL NULL → 0 / nblocks-1) with the
+upstream-worded `ERRCODE_INVALID_PARAMETER_VALUE` range errors
+(`starting/ending block number must be between 0 and N`), and the block
+iteration that runs each page through `verifyHeapPage` and tags every finding
+with its block number (`HeapRelReport{Blkno, Offset, Msg}`, mapping 1:1 to the
+SRF's `(blkno, offnum, msg)` output rows; `attnum` is always -1 for these
+structural checks and is supplied by the SRF).
+
+This reuses the same `PageSource func(BlockNumber)(Page,error)` seam the B-tree
+relation walkers already take, making the heap and index sides symmetric: the
+SRF fills the seam from the buffer manager, tests from a map. Keeping the block
+loop in the engine (not in the eventual `verify_heapam` executor op) reduces SQL
+slice **S3** (docs/design/0110-0008) to a thin adapter — fill a `PageSource`,
+pass `nblocks` + `RelDesc.Natts` + a clog-backed `XidStatusFunc`, stream the
+returned rows — and lets the block-iteration logic be unit-tested without an
+execution context.
+
+Deliberately **out of scope** here, matching where upstream draws the line: the
+relkind / relam guard (`verify_heapam.c:333-349`) and relation open/lock are
+catalog- and goopg-storage-coupled, so they stay in the SRF executor (S3); the
+caller invokes `VerifyHeapRelation` only on a heap relation. The toast walk
+(`check_toast`, goopg-divergent) and the read-stream skip-pages optimisation are
+buffer-manager concerns, also left to the wire layer.
+
+### Testing (relation tier)
+
+`verify_heapam_relation_test.go` adds a `heapMapSource` builder (map-backed
+`PageSource`) and 9 tests: clean multi-block relation (asserts every in-range
+block is actually read), empty-relation early exit (source never touched),
+finding tagged with its non-zero block, ordered findings across blocks,
+`startblock`/`endblock` sub-range restriction, the two range-validation error
+messages (plus the negative-value case), a surfaced read error, nil-source
+rejection, and the `RelDesc` option threading through to the per-page natts
+check (off without `Rel`, on with it — which by the same seam covers
+`XidStatusFunc` forwarding).
+
 ## Upstream references
 
 - `postgres/contrib/amcheck/verify_nbtree.c` (`palloc_btree_page`,

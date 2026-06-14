@@ -103,7 +103,7 @@ type-check; their execution is exercised by `003`/`004`, not `002`.
 |-------|-------|----------|-------|
 | **S1** | `CREATE EXTENSION amcheck` DDL: parse → dispatch → executor → `pg_extension` row + `pg_namespace` resolve | — | parser `ast.go`/`ddl.go`, `server/dispatch.go`, `executor/operators_ddl.go`, `catalog/catalog.go` |
 | **S2** | `pg_extension` catalog relation + the §1 probe answerable; seed `pg_proc` rows for the three SRFs (exist, not yet callable) | **AC-002** (`002_nonesuch`) | `catalog/catalog.go`, `planner/planner.go` (FROM whitelist) |
-| **S3** | `verify_heapam(...)` SRF executor over `amcheck.VerifyHeapPage*` | AC-004 (heap path) | `planner/plan.go`, `planner/planner.go`, new `executor/operators_verify_heapam.go` |
+| **S3** | `verify_heapam(...)` SRF executor — now a **thin adapter** over `amcheck.VerifyHeapRelation` (the block loop already lives in the engine, `verify_heapam_relation.go`): fill a `PageSource` from smgr, pass `nblocks` + `RelDesc.Natts` + a clog-backed `XidStatusFunc`, stream `HeapRelReport`s as rows | AC-004 (heap path) | `planner/plan.go`, `planner/planner.go`, new `executor/operators_verify_heapam.go` |
 | **S4** | `bt_index_check` / `bt_index_parent_check` SRFs over `amcheck.VerifyBtree*` (+ heapallindexed) | AC-003/004 (index path) | `planner/plan.go`, new `executor/operators_bt_index_check.go` |
 | **S5** | port `002`→`005` TAP tests; flip CSV `AC-002…AC-005`→`port`; regen md | — | `internal/testport/pgamcheck_port_test.go`, `docs/test-port/*` |
 
@@ -122,7 +122,12 @@ overlap. Preferred path remains: wait for a clean tree.
 
 ## Engine API the SRFs call (already committed, stable)
 
-- `amcheck.VerifyHeapPage(p, blkno) []Report` / `VerifyHeapPageWithRel(p, blkno, rel)` — `Report{Blkno, Offnum, Attnum, Msg}`.
+- `amcheck.VerifyHeapPage(p, blkno) []Report` / `VerifyHeapPageWithRel(p, blkno, rel)` /
+  `VerifyHeapPageWithXminStatus(p, blkno, rel, xidStatus)` — `Report{Offset, Msg}` (per page).
+- `amcheck.VerifyHeapRelation(src PageSource, nblocks, HeapRelOptions{StartBlock, EndBlock, Rel, XidStatus})
+  []HeapRelReport` — the relation walk (block-range resolve + iterate + per-page check),
+  `HeapRelReport{Blkno, Offset, Msg}` → one SRF row each (attnum -1, set by the SRF);
+  **this is what the S3 SRF calls** — reuses the same `PageSource` seam as the B-tree side.
 - `amcheck.VerifyBtreePage`, `VerifyBtreeItemOrder`, `VerifyBtreeLevelSiblingLinks`,
   `VerifyBtreeParentDownlinks` (via `PageSource func(BlockNumber)(Page,error)` seam — the
   SRF fills it from smgr), `VerifyBtreeHeapAllIndexed` — all return `[]BtreeReport`.
