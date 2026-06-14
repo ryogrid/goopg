@@ -224,6 +224,41 @@ segments — the defining invariant that the WAL came from the server tar (fetch
 streams nothing separately). `-X none`/`-X stream`/manifest tests still pass
 (no regression). Parser cases added to `TestBaseBackupParseOptions`.
 
+## pg_receivewal streaming tier (BB-020) + READ_REPLICATION_SLOT
+
+`020_pg_receivewal.pl` drives the `pg_receivewal` client, which streams WAL
+to a directory over the physical replication protocol. Previously only the
+CLI/option-validation tier was ported; the slot-management + streaming tier
+was deferred "pending replication protocol in goopg". That protocol now
+exists (the same physical walsender path `pg_basebackup -X stream` uses), so
+`TestPort_PgReceivewal020` now reproduces upstream's
+**create-slot → stream → drop** sequence end-to-end against a live cluster:
+
+1. `pg_receivewal --slot S --create-slot` → `CREATE_REPLICATION_SLOT S PHYSICAL`;
+   the slot is then asserted present in `pg_replication_slots` (`slot_type =
+   'physical'`).
+2. `pg_receivewal --slot S -D dir` streams WAL into `dir` while the test
+   generates WAL; the test asserts a 24-hex WAL segment (optionally
+   `.partial`, since pg_receivewal only renames on a segment boundary) lands
+   in `dir`, then kills the streamer.
+3. `pg_receivewal --slot S --drop-slot` → `DROP_REPLICATION_SLOT S`; the slot
+   is asserted gone.
+
+**Engine gap closed: `READ_REPLICATION_SLOT`.** Step 2 surfaced a real gap —
+`pg_receivewal`, when streaming *with* a slot, issues `READ_REPLICATION_SLOT
+<name>` (PG 15+, `walsender.c:ReadReplicationSlot`) before
+`START_REPLICATION` to learn the slot's restart LSN/timeline. goopg's
+walsender rejected it with a syntax error and pg_receivewal looped on
+reconnect. `internal/server/replication.go` now handles it
+(`replyReadReplicationSlot`): a single three-column row
+`(slot_type text, restart_lsn text, restart_tli int8)` — `('physical', 'X/X',
+1)` for an existing physical slot (NULL LSN/tli when no position is reserved),
+all-NULL for an absent/invalidated slot, and `feature_not_supported` for a
+logical slot — mirroring upstream verbatim. Covered by
+`TestReplicationReadReplicationSlot` (server unit test, the sibling of the
+CREATE/DROP slot tests). `restart_tli` is always 1 because goopg operates on a
+single timeline (see `0005-0001`).
+
 ## Out of scope (follow-ups)
 
 - Server-side compression (gzip/lz4/zstd) — needs `bbsink_gzip/lz4/zstd`

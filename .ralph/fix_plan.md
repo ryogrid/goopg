@@ -97,7 +97,7 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
         backup execution PASS (2026-05-14, see below).
       - 011: SKIP entirely (in-place tablespace backup needs BASE_BACKUP protocol).
       - 020: --help/--version/options + no-dir + slot-conflict + sync-conflict + compress PASS;
-        WAL streaming SKIP (replication protocol).
+        slot create -> WAL stream -> drop tier now PASS (loop #19, see below).
       - 030: --help/--version/options + no-slot/db/action/file checks PASS;
         logical streaming SKIP.
       - 040: --help/--version/options + no-datadir/publisher/database PASS;
@@ -195,6 +195,27 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
         fetched pg_wal/ segments) + 3 parser cases. `-X none`/`-X stream`/manifest
         tests still PASS; `go test -race ./internal/server/` green. Design doc
         `0095-0003-pg-basebackup-execution.md` + CSV BB-010 + markdown updated.
+      - **PROGRESS 2026-06-14 (loop #19):** `020_pg_receivewal.pl` streaming
+        tier LANDED. `TestPort_PgReceivewal020`'s deferred `t.Skip` is replaced
+        by the real **create-slot → stream → drop** sequence against a live
+        goopg cluster: `pg_receivewal --create-slot` (asserted in
+        `pg_replication_slots`), a backgrounded `pg_receivewal --slot S -D dir`
+        that streams a 24-hex WAL segment (`.partial` accepted) while the test
+        generates WAL, then `--drop-slot` (asserted gone). Engine gap closed:
+        `pg_receivewal` issues `READ_REPLICATION_SLOT <name>` (PG 15+) before
+        `START_REPLICATION` to learn the slot's restart LSN — goopg's walsender
+        rejected it (syntax error → reconnect loop). Added
+        `replyReadReplicationSlot` to `internal/server/replication.go`
+        (uncontaminated): one `(slot_type text, restart_lsn text, restart_tli
+        int8)` row — `('physical','X/X',1)` for a physical slot, all-NULL for
+        absent, feature_not_supported for logical — verbatim
+        `walsender.c:ReadReplicationSlot`. Sibling unit test
+        `TestReplicationReadReplicationSlot`. Gates: `go test -race
+        ./internal/server` green; `TestE2E_PhysicalReplication` +
+        `TestPort_PgBasebackup010StreamWAL` (shared walsender) no regression.
+        Design doc `0095-0003` extended; CSV BB-020 + markdown updated. Resume =
+        030 (`pg_recvlogical`, needs logical decoding) / 011 (in-place
+        tablespace) backup-execution branches.
       - Action: remaining M0095-0003 increments — 011/020 backup-execution
         branches and recvlogical still require the same dependencies (BASE_BACKUP
         for in-place tablespace; logical replication protocol for recvlogical).

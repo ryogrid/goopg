@@ -56,6 +56,8 @@ func (s *Server) handleReplicationCommand(ctx context.Context, r *protocol.Frame
 		return true, s.replyCreateReplicationSlot(w, trimmed[len("CREATE_REPLICATION_SLOT "):])
 	case strings.HasPrefix(upper, "DROP_REPLICATION_SLOT "):
 		return true, s.replyDropReplicationSlot(w, trimmed[len("DROP_REPLICATION_SLOT "):])
+	case strings.HasPrefix(upper, "READ_REPLICATION_SLOT "):
+		return true, s.replyReadReplicationSlot(w, trimmed[len("READ_REPLICATION_SLOT "):])
 	case strings.HasPrefix(upper, "START_REPLICATION"):
 		return true, s.replyStartReplication(ctx, r, w, trimmed, appName)
 	case strings.HasPrefix(upper, "TIMELINE_HISTORY "):
@@ -330,6 +332,66 @@ func (s *Server) replyDropReplicationSlot(w *protocol.FrameWriter, args string) 
 		return s.writeQueryError(w, replicationSlotErrCode(err), err.Error())
 	}
 	if err := w.WriteCommandComplete("DROP_REPLICATION_SLOT"); err != nil {
+		return err
+	}
+	return w.WriteReadyForQuery(protocol.TxStatusIdle)
+}
+
+// replyReadReplicationSlot serves the upstream READ_REPLICATION_SLOT
+// command (PG 15+, walsender.c:ReadReplicationSlot). pg_receivewal issues
+// it before START_REPLICATION to learn a physical slot's restart position
+// and timeline so it can resume streaming from the right LSN. Argument
+// shape is just the slot name.
+//
+// The result is a single row of three text/int8 columns
+// (slot_type, restart_lsn, restart_tli):
+//   - slot absent or invalidated  -> all three NULL (upstream returns
+//     all-NULL when the slot is not in use);
+//   - physical slot               -> ('physical', 'X/X', tli), with
+//     restart_lsn/restart_tli NULL when the slot has no reserved LSN;
+//   - logical slot                -> feature_not_supported, mirroring
+//     upstream's "cannot use READ_REPLICATION_SLOT with a logical
+//     replication slot".
+func (s *Server) replyReadReplicationSlot(w *protocol.FrameWriter, args string) error {
+	if s.cfg.Slots == nil {
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+			"replication slots are not configured on this server")
+	}
+	tokens := strings.Fields(args)
+	if len(tokens) == 0 {
+		return s.writeQueryError(w, sqlstate.SyntaxError,
+			"READ_REPLICATION_SLOT requires a slot name")
+	}
+	name := unquoteIdent(tokens[0])
+
+	if err := w.WriteRowDescription([]protocol.FieldDescription{
+		{Name: "slot_type", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
+		{Name: "restart_lsn", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
+		// TimeLineID is unsigned, so int8 is used (upstream INT8OID).
+		{Name: "restart_tli", TypeOID: oidInt8, TypeSize: 8, TypeModifier: -1, Format: 0},
+	}); err != nil {
+		return err
+	}
+
+	row := [][]byte{nil, nil, nil} // default: slot absent -> all NULL
+	slot, err := s.cfg.Slots.Get(name)
+	if err == nil && !slot.Invalidated {
+		if slot.Kind == wal.SlotLogical {
+			return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+				"cannot use READ_REPLICATION_SLOT with a logical replication slot")
+		}
+		row[0] = []byte("physical")
+		if slot.RestartLSN != 0 {
+			row[1] = []byte(formatLSN(slot.RestartLSN))
+			// goopg operates on a single timeline (see 0005-0001);
+			// any reserved position is on timeline 1.
+			row[2] = []byte("1")
+		}
+	}
+	if err := w.WriteDataRow(row); err != nil {
+		return err
+	}
+	if err := w.WriteCommandComplete("READ_REPLICATION_SLOT"); err != nil {
 		return err
 	}
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)

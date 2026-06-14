@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/testutil/cluster"
 )
@@ -832,11 +833,143 @@ func TestPort_PgReceivewal020(t *testing.T) {
 		t.Fatalf("expected 'none' in --compress=none:1 error; got %q", res.Stdout+res.Stderr)
 	}
 
-	// WAL streaming, slot creation/drop, and compression sub-cases deferred:
-	// goopg v0 does not implement the pg_receivewal streaming replication protocol.
-	// Remove this Skip when goopg supports START_REPLICATION / WAL receiver protocol.
-	t.Skip("pg_receivewal streaming and slot management require replication protocol " +
-		"not yet implemented in goopg v0")
+	// ----------------------------------------------------------------------
+	// Slot-management + WAL-streaming execution tier.
+	//
+	// Previously deferred ("goopg v0 does not implement the pg_receivewal
+	// streaming replication protocol"). goopg now exposes the full physical
+	// walsender path pg_receivewal drives — IDENTIFY_SYSTEM,
+	// CREATE_REPLICATION_SLOT name PHYSICAL [RESERVE_WAL], START_REPLICATION,
+	// DROP_REPLICATION_SLOT, and the pg_replication_slots view
+	// (internal/server/replication.go) — the same protocol the working
+	// TestPort_PgBasebackup010StreamWAL `-X stream` test exercises. This tier
+	// reproduces upstream 020's slot create -> stream -> drop sequence against
+	// a live goopg cluster.
+	c := newCluster(t, "pgreceivewal020")
+	if err := c.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	host, port, err := net.SplitHostPort(c.ListenAddr())
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+	connArgs := []string{"-h", host, "-p", port, "-U", "postgres"}
+	const slotName = "pgrecvwal_test"
+
+	// Upstream: command_ok([pg_receivewal --slot test --create-slot]) creating
+	// a replication slot. pg_receivewal sends CREATE_REPLICATION_SLOT ... PHYSICAL.
+	createArgs := append([]string{"--slot=" + slotName, "--create-slot", "--if-not-exists",
+		"--directory=" + streamDir}, connArgs...)
+	res = runTool(t, bin, createArgs...)
+	if res.ExitCode != 0 {
+		t.Fatalf("--create-slot exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+	}
+
+	// Upstream: $primary->slot($slot_name) — the slot is now visible in
+	// pg_replication_slots as a physical slot.
+	rows, err := c.Query(context.Background(),
+		"SELECT slot_type FROM pg_replication_slots WHERE slot_name = '"+slotName+"'")
+	if err != nil {
+		t.Fatalf("query pg_replication_slots: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row for slot %q in pg_replication_slots, got %d (%v)", slotName, len(rows), rows)
+	}
+	if got := rows[0][0]; got != "physical" {
+		t.Errorf("slot_type = %q, want %q", got, "physical")
+	}
+
+	// Stream WAL into a fresh directory via the slot. pg_receivewal runs until
+	// killed; it opens the current segment as <name>.partial as soon as it
+	// starts receiving WAL.
+	recvDir := t.TempDir()
+	streamArgs := append([]string{"--slot=" + slotName, "--directory=" + recvDir, "--no-sync", "--verbose"}, connArgs...)
+	stream := exec.Command(bin, streamArgs...)
+	stream.Env = append(os.Environ(), "PGPASSWORD=")
+	var streamErr bytes.Buffer
+	stream.Stdout = &streamErr
+	stream.Stderr = &streamErr
+	if err := stream.Start(); err != nil {
+		t.Fatalf("start pg_receivewal stream: %v", err)
+	}
+	streamKilled := false
+	killStream := func() {
+		if !streamKilled {
+			_ = stream.Process.Kill()
+			_ = stream.Wait()
+			streamKilled = true
+		}
+	}
+	defer killStream()
+
+	// Generate WAL while polling for a streamed segment to appear. The walfile
+	// is created once pg_receivewal receives the first records. (lib/pq's
+	// extended protocol rejects multi-statement strings, so each statement is
+	// issued separately.)
+	if _, err := c.Query(context.Background(), "CREATE TABLE IF NOT EXISTS pgrecvwal_seed (a int)"); err != nil {
+		t.Fatalf("create seed table: %v", err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	var streamed string
+	for time.Now().Before(deadline) {
+		_, _ = c.Query(context.Background(), "INSERT INTO pgrecvwal_seed VALUES (1),(2),(3)")
+		entries, _ := os.ReadDir(recvDir)
+		for _, e := range entries {
+			name := e.Name()
+			base := strings.TrimSuffix(name, ".partial")
+			// WAL segment file names are 24 hex chars (TLI + logid + segno).
+			if !e.IsDir() && len(base) == 24 && isHex(base) {
+				streamed = name
+				break
+			}
+		}
+		if streamed != "" {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if streamed == "" {
+		entries, _ := os.ReadDir(recvDir)
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		killStream()
+		t.Fatalf("pg_receivewal streamed no WAL segment within timeout; dir=%v\npg_receivewal output:\n%s",
+			names, streamErr.String())
+	}
+	killStream()
+
+	// Upstream: command_ok([pg_receivewal --slot test --drop-slot]) dropping
+	// the replication slot via DROP_REPLICATION_SLOT.
+	dropArgs := append([]string{"--slot=" + slotName, "--drop-slot"}, connArgs...)
+	res = runTool(t, bin, dropArgs...)
+	if res.ExitCode != 0 {
+		t.Fatalf("--drop-slot exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	rows, err = c.Query(context.Background(),
+		"SELECT count(*) FROM pg_replication_slots WHERE slot_name = '"+slotName+"'")
+	if err != nil {
+		t.Fatalf("query pg_replication_slots after drop: %v", err)
+	}
+	if len(rows) != 1 || rows[0][0] != "0" {
+		t.Errorf("slot %q still present after --drop-slot: %v", slotName, rows)
+	}
+}
+
+// isHex reports whether s consists solely of hexadecimal digits.
+func isHex(s string) bool {
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 // TestPort_PgRecvlogical030 ports postgres/src/bin/pg_basebackup/t/030_pg_recvlogical.pl.
