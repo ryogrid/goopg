@@ -1614,6 +1614,32 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         test -race ./internal/amcheck` PASS; `go build ./...` + `go vet` clean; all
         in a new `_test.go` — zero contaminated files touched. Design doc
         `0110-0005` extended ("Real-producer B-tree validation").
+      - **PROGRESS 2026-06-14 (loop #31):** the SQL surface is STILL blocked on the
+        foreign gen-column WIP (parser/planner/executor/catalog dirty, build-clean
+        but uncommittable-clean; a HUMAN must clear it), and both engines are
+        logic-complete, so I closed the last unvalidated **producer-pair** path:
+        the heapallindexed soundness invariant (fingerprint phase ↔ probe phase
+        agree on `fingerprintLeafEntry` bytes) had only ever been tested with
+        HAND-BUILT entries — never a REAL heap tuple (`PageAddHeapTuple`) scanned
+        through `CollectHeapIndexEntries` + a former, compared against a REAL
+        `btree.Insert`-built index. A divergence there (t_hoff skip, key/TID
+        pairing, two key encoders) would make `bt_index_check(…, heapallindexed)`
+        flag EVERY healthy table+index. New `heapallindexed_realproducer_test.go`
+        (2 tests): builds a real multi-leaf B-tree (2000 int4 keys > MaxItemsPerPage
+        → leaf splits) + a real multi-block heap (~32 blocks), stores the column
+        value REVERSED vs row index so key order ≠ TID order (catches key/TID
+        swaps), scans both via the engine's relation walkers and asserts the
+        round-trip is silent through both `VerifyBtreeHeapAllIndexed` and the
+        composed `VerifyBtreeHeapAllIndexedRelation` (SRF wiring); the negative
+        omits one interior index entry and asserts exactly one report naming that
+        heap tuple's (block,offset) with the verbatim upstream message. Mirrors the
+        real-producer guards that found the vacuum bug (loop #64) and the split
+        prev-link bug (M0110-0007). Both PASS; `go test -race ./internal/amcheck`
+        green; `go build ./...` + gofmt/vet clean; **only new files — zero
+        contaminated files touched.** Design doc `0110-0007` extended
+        ("Real-producer end-to-end validation"). STILL DEFERRED: the catalog-coupled
+        `HeapEntryFormer` impl + the `CREATE EXTENSION amcheck`/SRF SQL surface
+        (AC-002-promoting, blocked on a clean tree).
 
 - [x] **M0110-0007 — B-tree split must maintain the old right sibling's prev-link**
       - **DONE 2026-06-14 (loop #30).** `insertIntoBlock`

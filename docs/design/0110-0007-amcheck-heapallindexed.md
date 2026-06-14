@@ -205,6 +205,54 @@ With both producers landed, the heapallindexed SQL slice reduces to a thin
 adapter: fill one `PageSource` from the index's smgr and one from the heap's,
 supply the `TupleDesc`-coupled `HeapEntryFormer`, and compose.
 
+## Real-producer end-to-end validation (loop #31)
+
+Every prior heapallindexed test exercises the soundness invariant — the
+fingerprint phase (index leaf entries) and the probe phase (heap-formed entries)
+must encode an identical `(key, heap TID)` to identical bytes through
+`fingerprintLeafEntry` — with **hand-built** entries: synthetic `LeafEntry`
+slices (`heapallindexed_test.go`), a stub former returning pre-made entries (the
+loop-#25 compose guard), or the index's own leaf entries fed back as the probe
+set (`verify_nbtree_realtree_test.go`'s round-trip). None ran a **real** heap
+tuple, written by `storage.PageAddHeapTuple`, through a former that decodes the
+tuple bytes and re-encodes the indexed column, and compared the result against a
+**real** B-tree built by `btree.Insert`. That end-to-end producer pair — the
+exact path the SQL surface takes — was unvalidated, and a divergence there
+(e.g. a `t_hoff` skip mismatch, a key/TID pairing slip, or two divergent key
+encoders) would make `bt_index_check(…, heapallindexed => true)` report
+corruption on **every** healthy table+index — the project's most expensive class
+of compatibility bug.
+
+`heapallindexed_realproducer_test.go` closes the gap, mirroring the bug-finding
+discipline of `verify_heapam_realpage_test.go` (which surfaced the
+`VacuumHeapPageBySlots` MAXALIGN bug) and `verify_nbtree_realtree_test.go` (which
+surfaced the split right-sibling prev-link bug, M0110-0007):
+
+- builds a **real multi-leaf B-tree** (2000 int4 keys > `MaxItemsPerPage`, so the
+  leaf level splits into siblings) via `btree.Create`/`Insert` with
+  `btree.EncodeInt4`, over a live `storage.Pool`;
+- builds a **real multi-block heap** (64 tuples/page → ~32 blocks) via
+  `storage.PageAddHeapTuple`, each tuple's data area carrying the row's
+  little-endian int4 column;
+- pairs each row's heap TID with its index TID by construction, and stores the
+  column value **reversed** vs. the row index so key order (sorted in the index)
+  deliberately differs from heap TID order — a former that paired a key with the
+  wrong TID, or a fingerprint that swapped the two halves, would then mismatch;
+- scans both through the engine's relation walkers (`CollectBtreeLeafEntries`,
+  `CollectHeapIndexEntries` with a former that decodes `tuple[t_hoff:]` and
+  re-encodes via `btree.EncodeInt4`), and asserts the round-trip is **silent**
+  through both `VerifyBtreeHeapAllIndexed` and the composed
+  `VerifyBtreeHeapAllIndexedRelation` (the SRF wiring);
+- the negative case omits one interior row's index entry (heap keeps the tuple)
+  and asserts **exactly one** report, naming that heap tuple's `(block,offset)`
+  with the verbatim upstream message — proving the pair detects real "index lost
+  an entry" corruption, not merely that it stays quiet.
+
+The real producers agree with the engine on healthy storage (round-trip silent)
+and the probe pinpoints the injected gap, so the heapallindexed soundness
+invariant holds across the real heap-scan→key-form→fingerprint pipeline, not just
+hand-built fixtures.
+
 ## Deferred (resume points)
 
 - **The `HeapEntryFormer` implementation** — the catalog-coupled half of the heap
