@@ -177,12 +177,27 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
         oracle (which ACCEPTS all four). All 4 PASS (1.78s); the 010 exec /
         stream / default-manifest tests still PASS (5.84s, no regression). CSV
         BB-010 rationale updated; markdown regenerated.
-      - Action: remaining M0095-0003 increments — `-X fetch` (WAL-fetch path:
-        parse the BASE_BACKUP `WAL` boolean, then append in-range WAL segments to
-        the open tar in `pg_wal/` with goopg→PG 24-char segment-name conversion,
-        mirroring `basebackup.c` `includewal`), 011/020 backup-execution branches
-        and recvlogical still require the same dependencies (BASE_BACKUP for
-        in-place tablespace; logical replication protocol for recvlogical).
+      - **PROGRESS 2026-06-14 (loop #12):** `-X fetch` (FETCH_WAL) LANDED.
+        `internal/server/basebackup.go` now (a) parses the BASE_BACKUP `WAL`
+        boolean option (`baseBackupOptions.IncludeWAL`; bare flag in new syntax +
+        legacy keyword, `parseOptionBool` honours explicit false), (b) stops
+        walking `pg_wal` — it ships as an empty dir + `archive_status`/`summaries`
+        empty subdirs, mirroring `basebackup.c` sendDir():1385-1407 (previously
+        goopg shipped full pg_wal contents on EVERY backup, a deviation), and
+        (c) when `WAL` is set, `appendWALSegments` appends the in-range
+        `[XLByteToSeg(startptr), XLByteToPrevSeg(endptr)]` segments to the tar
+        under `pg_wal/`, oldest first, with the upstream contiguity sanity check.
+        Note: the planned "goopg→PG name conversion" is NOT needed — goopg's
+        on-disk WAL names are already PG-format (`wal.formatSegmentName`), so the
+        dead/wrong `parseGoopgWalName` helper was removed and selection uses
+        `wal.ParseXLogFileName`. New `TestPort_PgBasebackup010FetchWAL` (real
+        `pg_basebackup -X fetch`, asserts backup_label START segment present among
+        fetched pg_wal/ segments) + 3 parser cases. `-X none`/`-X stream`/manifest
+        tests still PASS; `go test -race ./internal/server/` green. Design doc
+        `0095-0003-pg-basebackup-execution.md` + CSV BB-010 + markdown updated.
+      - Action: remaining M0095-0003 increments — 011/020 backup-execution
+        branches and recvlogical still require the same dependencies (BASE_BACKUP
+        for in-place tablespace; logical replication protocol for recvlogical).
 
 ## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
 

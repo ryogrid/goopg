@@ -1,43 +1,40 @@
-Task: MAINT-STATEGUARD-RECONCILE — root-cause + fix the every-loop
-`make ralph-state-guard` failure. LANDED loop #11.
+Task: M0095-0003 — pg_basebackup `-X fetch` (FETCH_WAL / in-tar WAL).
+LANDED loop #12, committed.
 
-What it was: NOT concurrent-loop corruption. ppid analysis showed a single
-`--live` loop (child 3900929 ppid=3813356 = the portable_timeout subshell). The
-driver writes progress={"status":"completed"} after EVERY clean claude exit
-(~/.ralph/ralph_loop.sh:~1832, "Clear progress file") — "completed" = this loop's
-claude finished, NOT project done. The next loop sets status=running without
-touching progress, so steady state during any loop is status=running (loop N) +
-progress=completed (loop N-1 marker). The guard flagged that normal transient as
-corruption; prior loops' manual progress restore got stomped on next exit →
-recurred every loop (#5-#11).
+What landed: server now honours the BASE_BACKUP `WAL` boolean so a single-
+connection `pg_basebackup -X fetch` clones a goopg primary with consistent WAL
+included in the data tar (no walsender). Three parts in
+internal/server/basebackup.go:
+  (a) parse `WAL` option → baseBackupOptions.IncludeWAL (bare flag new-syntax +
+      legacy keyword; parseOptionBool honours explicit false).
+  (b) pg_wal is no longer walked — shipped as empty dir + archive_status/
+      summaries empty subdirs (mirrors basebackup.c sendDir():1385-1407). FIXES
+      a prior deviation where goopg shipped full pg_wal contents on EVERY backup.
+  (c) appendWALSegments: when IncludeWAL, append in-range
+      [XLByteToSeg(startptr) .. XLByteToPrevSeg(endptr)] segments under pg_wal/,
+      oldest first, with upstream contiguity sanity check; +history files.
 
-Fix: new autoRepair rule in cmd/validate-ralph-state/main.go — complement of the
-stale-status rule — when progress=completed is NOT newer than a running status by
-> max-skew, reconcile progress→in_progress (live status authoritative). Guard now
-self-heals via `-fix`; no manual edits. Genuine completion unaffected (status is
-completed/graceful_exit, not running).
+Key finding (corrects the prior loop's plan): NO goopg→PG name conversion
+needed — goopg on-disk WAL names are ALREADY PG-format (wal.formatSegmentName →
+%08X%08X%08X). The speculatively-added `parseGoopgWalName` (raw %024X parse) was
+WRONG and is REMOVED; selection uses wal.ParseXLogFileName.
 
-Files: cmd/validate-ralph-state/main.go (+rule), main_test.go (3 tests; replaced
-TestAutoRepairNoopWhenNotStale which pinned the buggy noop),
-docs/design/root-0018-ralph-state-guard-prev-loop-marker-reconcile.md (new) +
-README.md index row, .ralph/fix_plan.md (MAINT note). Memory
-concurrent_ralph_loops_corrupt_tree.md updated (Loop #11 entry supersedes Loop #10
-manual-restore advice).
+Files: internal/server/basebackup.go (impl), internal/server/basebackup_test.go
+(+3 parser cases), internal/testport/pgbasebackup_port_test.go
+(+TestPort_PgBasebackup010FetchWAL + parseBackupLabelStartSegment helper),
+docs/design/0095-0003-pg-basebackup-execution.md (+WAL-inclusion section),
+docs/test-port/postgres-oracle-port-status.{csv,md} (BB-010), .ralph/fix_plan.md.
 
-Key symbols: autoRepair, validate (cmd/validate-ralph-state/main.go).
+Gates run loop #12: gofmt clean; go vet clean; go build ./... OK;
+go test ./internal/server/ PASS; go test -race ./internal/server/ PASS;
+TestPort_PgBasebackup010{FetchWAL,StreamWAL,BackupExecution,Manifest*} all PASS
+(real pg_basebackup + pg_verifybackup oracle); make ralph-state-guard OK.
 
-Gates run loop #11: gofmt -l (clean), go vet (clean), go test -count=1
-./cmd/validate-ralph-state/ PASS, make ralph-state-guard RC=0 (self-healed,
-REPAIRED 1 fix → OK).
-
-CONTAMINATION (unchanged, NOT mine): the 18 foreign-WIP modified files
-(catalog.go, operators_lockrows.go, parser/ddl.go, planner/*, analyzer, dispatch,
+CONTAMINATION (NOT mine, do NOT git add -A): the 18 foreign-WIP modified files
+(catalog.go, operators_*.go, parser/ddl.go, planner/*, analyzer, dispatch,
 mvcc/subxact_visibility, …) + untracked gen_override_test.go + .claude/worktrees/*
-remain a static foreign snapshot. Do NOT git add -A. Commit ONLY the guard-fix
-files above.
++ stray ./postgres marker. Commit ONLY the 7 files above.
 
-Next step: resume the M0095-0003 FEATURE increment — pg_basebackup `-X fetch`
-(WAL-fetch path): parse BASE_BACKUP `WAL` boolean option (basebackup.go
-baseBackupOptions + parseBaseBackupOptionList), then after the data-dir tar append
-in-range WAL segments under pg_wal/ with goopg→PG 24-char segment-name conversion
-(mirror basebackup.c includewal lines 408-520; reuse replication.go conversion).
+Next step (M0095-0003 remaining): 011/020 backup-execution branches +
+recvlogical — all still blocked on BASE_BACKUP in-place tablespace protocol /
+logical replication protocol (same long-standing deps, not this loop's scope).

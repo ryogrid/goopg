@@ -296,6 +296,130 @@ func TestPort_PgBasebackup010StreamWAL(t *testing.T) {
 	}
 }
 
+// TestPort_PgBasebackup010FetchWAL exercises the upstream "-X fetch"
+// (FETCH_WAL) sub-case of 010_pg_basebackup.pl. Unlike -X stream, fetch
+// opens NO second replication connection: pg_basebackup sends the
+// BASE_BACKUP `WAL` boolean option (pg_basebackup.c:1905-1906) and the
+// server must append the in-range pg_wal segments to the backup tar
+// itself (basebackup.c:408-560 includewal block). The defining property
+// is therefore that the extracted pg_wal/ holds the WAL covering the
+// backup's start LSN even though nothing streamed it — it can only have
+// come from the server-side tar.
+func TestPort_PgBasebackup010FetchWAL(t *testing.T) {
+	bin := clientToolBin(t, "pg_basebackup")
+	if bin == "" {
+		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
+	}
+	c := newCluster(t, "pgbasebackup010_fetch")
+	if err := c.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	// Seed a small table so the backup carries real heap pages and the
+	// pre-backup checkpoint has WAL to cover.
+	if _, err := c.Query(context.Background(),
+		`CREATE TABLE pgbb_fetch_seed (a int)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := c.Query(context.Background(),
+		`INSERT INTO pgbb_fetch_seed VALUES (1), (2), (3)`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	host, port, err := net.SplitHostPort(c.ListenAddr())
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "backup")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cmd := exec.Command(bin,
+		"-h", host,
+		"-p", port,
+		"-U", "postgres",
+		"-D", out,
+		// -X fetch sets the BASE_BACKUP WAL option; the WAL must arrive
+		// inside the data tar over the single connection — no walsender.
+		"-X", "fetch",
+		"--no-sync",
+		"--no-manifest",
+		"-l", "TestPort_PgBasebackup010FetchWAL")
+	cmd.Env = append(os.Environ(), "PGPASSWORD=")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pg_basebackup -X fetch failed: %v\ncombined output:\n%s", err, string(output))
+	}
+
+	for _, rel := range []string{"backup_label", "global/pg_control", "PG_VERSION"} {
+		if _, err := os.Stat(filepath.Join(out, rel)); err != nil {
+			t.Errorf("missing %s in extracted backup: %v", rel, err)
+		}
+	}
+
+	// The extracted pg_wal/ must hold at least one 24-char WAL segment that
+	// the server placed in the tar (fetch streams nothing separately).
+	walEntries, err := os.ReadDir(filepath.Join(out, "pg_wal"))
+	if err != nil {
+		t.Fatalf("read pg_wal in extracted backup: %v", err)
+	}
+	segNames := map[string]struct{}{}
+	for _, e := range walEntries {
+		if !e.IsDir() && len(e.Name()) == 24 {
+			segNames[e.Name()] = struct{}{}
+		}
+	}
+	if len(segNames) == 0 {
+		var names []string
+		for _, e := range walEntries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("expected >=1 fetched WAL segment in pg_wal/, found none; entries=%v", names)
+	}
+
+	// Stronger check: the START WAL segment named in backup_label must be
+	// among the fetched segments, proving the includewal range covers the
+	// backup's consistency point.
+	labelBytes, err := os.ReadFile(filepath.Join(out, "backup_label"))
+	if err != nil {
+		t.Fatalf("read backup_label: %v", err)
+	}
+	startSeg := parseBackupLabelStartSegment(t, string(labelBytes))
+	if _, ok := segNames[startSeg]; !ok {
+		var names []string
+		for n := range segNames {
+			names = append(names, n)
+		}
+		t.Errorf("START WAL segment %s from backup_label not present among fetched WAL %v", startSeg, names)
+	}
+}
+
+// parseBackupLabelStartSegment extracts the WAL segment file name from the
+// "START WAL LOCATION: X/Y (file ZZZZ...)" line of a backup_label.
+func parseBackupLabelStartSegment(t *testing.T, label string) string {
+	t.Helper()
+	for _, line := range strings.Split(label, "\n") {
+		if !strings.HasPrefix(line, "START WAL LOCATION:") {
+			continue
+		}
+		_, after, ok := strings.Cut(line, "(file ")
+		if !ok {
+			break
+		}
+		seg, _, ok := strings.Cut(after, ")")
+		if !ok {
+			break
+		}
+		return strings.TrimSpace(seg)
+	}
+	t.Fatalf("could not find START WAL LOCATION file in backup_label:\n%s", label)
+	return ""
+}
+
 // TestPort_PgBasebackup010Manifest exercises the upstream backup-manifest
 // path of 010_pg_basebackup.pl: pg_basebackup run WITHOUT --no-manifest
 // requests `MANIFEST 'yes'` (CRC32C by default), and the server must stream

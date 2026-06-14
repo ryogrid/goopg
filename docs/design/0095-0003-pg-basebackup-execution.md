@@ -133,6 +133,8 @@ assertion updated from `T/D/C/Z` (4 frames) to `T/D/C/C/Z` (5 frames).
   binary; passes with `-X none --no-manifest --no-sync`; verifies extracted
   `backup_label`, `global/pg_control`, and `PG_VERSION`.
 - `TestPort_PgBasebackup010StreamWAL` — `-X stream` variant (M0102 walsender).
+- `TestPort_PgBasebackup010FetchWAL` (new, 2026-06-14) — `-X fetch` variant;
+  server appends the in-range WAL to the tar (see "WAL inclusion" below).
 - `TestPort_PgBasebackup010Manifest` (new, 2026-06-14) — runs pg_basebackup
   WITHOUT `--no-manifest` (default CRC32C manifest); independently recomputes
   every `Files[]` CRC32C and the SHA-256 `Manifest-Checksum`, then runs the
@@ -182,10 +184,48 @@ algorithm is rejected early with `FeatureNotSupported`. `force-encode`
 (`--manifest-force-encode`) and any non-UTF-8 path switch the entry to
 `"Encoded-Path": "<hex>"`, matching `AddFileToBackupManifest`.
 
+## WAL inclusion (`-X fetch`, 2026-06-14)
+
+`pg_basebackup -X fetch` (FETCH_WAL) sends the BASE_BACKUP `WAL` boolean
+option (`pg_basebackup.c:1905-1906`,
+`AppendPlainCommandOption(&buf, ..., "WAL")`) and, unlike `-X stream`, opens
+**no** second replication connection: the WAL needed to make the backup
+self-consistent must be appended to the data tar by the server. goopg now
+mirrors upstream's `includewal` block (`basebackup.c:408-560`):
+
+- **`WAL` option parsing** (`baseBackupOptions.IncludeWAL`) — accepted in both
+  the PG15+ option-list form (a bare `WAL` flag; `parseOptionBool` honours an
+  explicit `'f'`/`off`/`0` false) and the legacy keyword form.
+- **pg_wal is never walked.** The directory walk now ships `pg_wal` as an
+  *empty* directory plus the `pg_wal/archive_status` and `pg_wal/summaries`
+  empty subdirs PG emits (`sendDir():1385-1407`). Previously goopg shipped the
+  full `pg_wal` contents on *every* backup (a deviation); now WAL is only
+  present when the client asked for it — matching PG for `-X none`/`-X stream`
+  (the stream path rewrites `pg_wal` client-side anyway).
+- **In-range segment append** (`appendWALSegments`). When `IncludeWAL` is set,
+  after the data files + `global/pg_control` the server appends the segments in
+  the inclusive range `[XLByteToSeg(startptr), XLByteToPrevSeg(endptr)]` under
+  `pg_wal/`, oldest first, where `startptr` is the 0-based redo point and
+  `endptr` is the 0-based stop LSN (`WrittenLSN()-1`). goopg's on-disk WAL
+  names are already PG-compatible (`wal.formatSegmentName` →
+  `%08X%08X%08X`), so segment selection parses each name via
+  `wal.ParseXLogFileName` and compares segment numbers — no goopg→PG name
+  conversion is required. The upstream contiguity sanity check
+  (`basebackup.c:484-520`) is preserved: a missing segment inside the range is
+  a hard error naming the first absent file. Any `*.history` files are shipped
+  too (always, per upstream). Appended WAL is deliberately **not** recorded in
+  the manifest `Files[]` — PG tracks it via `WAL-Ranges` only.
+
+Verified by `TestPort_PgBasebackup010FetchWAL` (new): drives the real
+`pg_basebackup -X fetch` against a live goopg cluster and asserts the extracted
+`backup_label`/`global/pg_control`/`PG_VERSION` **plus** that the START WAL
+segment named in `backup_label` is present among the fetched `pg_wal/`
+segments — the defining invariant that the WAL came from the server tar (fetch
+streams nothing separately). `-X none`/`-X stream`/manifest tests still pass
+(no regression). Parser cases added to `TestBaseBackupParseOptions`.
+
 ## Out of scope (follow-ups)
 
-- `-X fetch` — `-X stream` landed (M0102 walsender); fetch still needs the
-  WAL-fetch path.
 - Server-side compression (gzip/lz4/zstd) — needs `bbsink_gzip/lz4/zstd`
   parity.
 - Tablespaces beyond the default — out of v0 scope (M0095-0003 011 stays
