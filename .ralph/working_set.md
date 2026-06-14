@@ -1,39 +1,35 @@
-Task: M0110-0002 — port pg_waldump 002_save_fullpage.pl. LANDED (self-promoting
-skip test) + uncovered a real WAL blocker. M0110-0003 still HARD-BLOCKED.
+Task: M0101-0003 / M0110-0002 — WAL xl_prev restart-seeding fix. COMPLETE + committed.
 
-This loop (#17): productive uncontaminated work while M0110-0003's SQL surface
-stays blocked by the foreign session (pid 2177381 still alive, WIP frozen since
-2026-06-13 14:28, ~23h).
+This loop (#18): fixed the real WAL blocker the prior loops diagnosed (and
+corrected the diagnosis), while M0110-0003's SQL surface stays HARD-BLOCKED on
+the foreign session (pid 2177381 still alive, ~23h frozen gen-column WIP).
 
-Landed:
-- internal/testport/pgwaldump_savefullpage_test.go — TestPort_PgWaldump002SaveFullpage.
-  Drives the full `pg_waldump --save-fullpage --relation` path (goopg emits PG
-  FPIs; full RelFileLocator spc=1663/db/relNumber; pg_relation_filenode matches).
-  Asserts filename format + page-LSN ≤ file-LSN. Currently t.Skips on a REAL
-  blocker; auto-promotes once the WAL fix lands. Run: PASS (skips). 001 still PASS.
-- docs/design/0110-0002 + deferral ledger + fix_plan M0110-0002 updated.
-- memory: goopg_wal_xl_prev_1based_pg_waldump.md.
+Landed (commit on align-data-structure-with-pg):
+- internal/wal/writer.go detectWritePos: prevRecPtr = lastRecPtr-1 (0-guarded).
+  Root cause was NOT "xl_prev globally 1-based" — the live-append path already
+  stores start-1 (0-based) via resetPosition. The restart-seed path
+  (detectWritePos:917) assigned scanLastSegmentEnd's 1-based public start-LSN
+  verbatim to the 0-based prevRecPtr field, so the FIRST record after boot got
+  +1 xl_prev → pg_waldump "incorrect prev-link" at the 2nd record.
+- Output-only fix: writePos / client LSNs unchanged; goopg recovery never
+  validates xl_prev. Strictly improves goopg→PG (M0102) prev-link validation.
+- W-001 (TestPort_WALPgWaldumpCompat) repaired (native-PG segment discovery via
+  listWALSegments; old ParseUint(24-hex) overflow skipped all segments) → PASS,
+  now guards the fix via the prev-link check.
+- 002 (TestPort_PgWaldump002SaveFullpage): prev-link gone; self-skips on the
+  SEPARATE remaining blocker (no PG-decodable FPI records — all non-checkpoint
+  records route RmgrXLog/0xF0, opaque to PG). Stays under WD-002.
+- docs/design/0101-0003-...md + README index + CSV W-001 rationale + regenerated
+  markdown + fix_plan M0110-0002 + memory goopg_wal_xl_prev_1based_pg_waldump.md.
 
-KEY FINDING (the blocker): goopg writes `xl_prev` as a **1-based** LSN on disk,
-so pg_waldump (0-based, anchored on segment name) aborts the record chain at the
-2nd record (`incorrect prev-link 0/1000029 at 0/10000A0`, constant +1).
-Origin: internal/wal/writer.go ~L1346/L1491 (`start=writePos+leading+1`) →
-insert_pos.go reserveLocked (`t.prev=old`) → format.go:263 encodeRecordXLog
-writes verbatim. NOT in the frozen WIP set — internal/wal is editable.
-
-SECONDARY FINDING: TestPort_WALPgWaldumpCompat (row W-001, M0101-0003,
-pass_required) is SILENTLY RED — segment names are now native PG-format
-(TLI prefix), so its ParseUint(name,16,64) overflow + alias logic t.Fatals at
-"no WAL segments found". Excluded from `go test ./...` so it escaped notice.
+Gates run: go test ./internal/wal/ PASS; go test -race ./internal/wal/
+./internal/mvcc/ PASS; both pg_waldump oracle tests pass (W-001 PASS, 002 skip);
+TestE2E_PhysicalReplication PASS; gofmt+vet clean. (No TPC-H gate — no
+planner/executor/codec change.)
 
 Next step (pick one):
-- WAL-correctness loop: emit xl_prev 0-based on disk (encode↔decode SIBLINGS —
-  goopg recovery decode reads it back), re-verify M0102 walsender + recovery
-  E2E + re-init data dir, then un-skip 002 test + repair W-001 (reuse
-  listWALSegments/isHex24). HIGH blast radius — its own loop.
+- 002 FULL pass: emit PG-decodable heap WAL records with backup blocks
+  (XLogRecordBlockHeader + BKPIMAGE) so pg_waldump --save-fullpage extracts FPIs.
+  Large, separate feature — its own milestone.
 - OR M0110-0003 SQL surface (slice S1 of docs/design/0110-0008) once a HUMAN
-  clears the foreign session's static gen-column WIP.
-
-Gates run: go vet ./internal/testport/ clean; gofmt clean; both pg_waldump port
-tests PASS (002 skips on blocker). No TPC-H/WAL-race gate (test-only change; no
-engine code modified). make ralph-state-guard: run before status block.
+  clears the foreign session's static gen-column WIP (pid 2177381).

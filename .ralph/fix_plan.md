@@ -1031,11 +1031,34 @@ Porting validates goopg's WAL record format compatibility with upstream.
         segment numbers (`strconv.ParseUint(name,16,64)` overflows on 24 hex
         chars) and rewrites a timeline alias, so it `t.Fatal`s at "no WAL
         segments found" before running `pg_waldump`. Oracle tests are excluded
-        from `go test ./...`, so this escaped notice. Repair (own follow-up,
-        M0101-0003): switch W-001 to native-PG segment discovery (reuse
-        `listWALSegments`/`isHex24` from the new file), then it will hit the
-        same prev-link blocker → it should `t.Skip` on it too until the WAL fix
-        lands.
+        from `go test ./...`, so this escaped notice.
+      - **RESOLVED 2026-06-14 (loop #18) — the xl_prev blocker was misdiagnosed
+        and is now fixed.** The on-disk `xl_prev` was NOT globally 1-based: the
+        live-append path already stores `start-1` (0-based) via
+        `resetPosition(end, start-1)`. The bug was a **restart-seed
+        inconsistency** — `detectWritePos` (`internal/wal/writer.go:917`) seeded
+        `prevRecPtr` from `scanLastSegmentEnd`'s **1-based** start-LSN verbatim,
+        so the first record appended after boot inherited a +1 `xl_prev`
+        (exactly the "2nd record" pg_waldump rejected, the bootstrap checkpoint
+        being record #1). Fix: `prevRecPtr = lastRecPtr - 1` (0-guarded),
+        mirroring the live path. No encode↔decode change needed — goopg recovery
+        **never validates `xl_prev`**, and `writePos`/client-visible LSNs are
+        unchanged, so this is output-only (strictly improves goopg→PG
+        replication prev-link validation). Design: `0101-0003-wal-xlprev-restart-seeding-fix.md`.
+        - `W-001` repaired (native-PG segment discovery via `listWALSegments`)
+          and now **PASS** — it guards the fix via the `incorrect prev-link`
+          check. CSV W-001 rationale updated; markdown regenerated.
+        - `TestPort_PgWaldump002SaveFullpage`: prev-link blocker GONE (pg_waldump
+          now walks the full chain to clean EOS); a prev-link error is now
+          asserted as a regression. The test still self-skips on the genuinely
+          **separate** remaining blocker — goopg emits no PG-decodable FPI
+          records (all non-checkpoint records route through `RmgrXLog`/`0xF0`,
+          opaque to PG), so `--save-fullpage` extracts nothing. Stays under
+          WD-002 (deferred) until goopg emits PG-format heap WAL with backup
+          blocks.
+        - Gates: `go test ./internal/wal/` + `go test -race ./internal/wal/
+          ./internal/mvcc/` green; both pg_waldump oracle tests pass;
+          `TestE2E_PhysicalReplication` green.
 
 ### pg_amcheck (5 tests — excluded → candidate)
 

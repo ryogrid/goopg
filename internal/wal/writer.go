@@ -914,7 +914,21 @@ func detectWritePos(walDir string, segSize int64, pageHeaders bool) (int64, uint
 			return 0, 0, scanErr
 		}
 		writePos += usedBytes
-		prevRecPtr = lastRecPtr
+		// scanLastSegmentEnd returns the *1-based* start-LSN of the last
+		// record (goopg's public RecPtr convention, matching state.append's
+		// `start = writePos + leading + 1`). prevRecPtr is the *0-based*
+		// RecPtr (the header byte offset written verbatim into the next
+		// record's xl_prev), so convert by -1 — exactly mirroring the live
+		// append path's `resetPosition(end, start-1)`. Without this, the
+		// first record appended after a restart/boot inherits a +1 xl_prev
+		// and pg_waldump aborts the chain with "incorrect prev-link"
+		// (goopg's own recovery never validates xl_prev, so this was
+		// silently wrong until the pg_waldump oracle surfaced it).
+		if lastRecPtr > 0 {
+			prevRecPtr = lastRecPtr - 1
+		} else {
+			prevRecPtr = 0
+		}
 	}
 
 	return writePos, prevRecPtr, nil

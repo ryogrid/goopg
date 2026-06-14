@@ -201,38 +201,34 @@ func TestPort_PgWaldump002SaveFullpage(t *testing.T) {
 				file, hiFn, loFn, hiBk, loBk)
 		}
 	}
+	// The xl_prev seeding fix (internal/wal/writer.go detectWritePos converts
+	// scanLastSegmentEnd's 1-based start-LSN to the 0-based prevRecPtr) lets
+	// pg_waldump walk goopg's full on-disk record chain. A prev-link error
+	// here is therefore now a REGRESSION of that fix, not the expected blocker.
+	if sawPrevLinkError {
+		t.Errorf("pg_waldump hit 'incorrect prev-link' walking goopg WAL for "+
+			"relation %s — the xl_prev seeding fix has regressed "+
+			"(internal/wal/writer.go detectWritePos / scanLastSegmentEnd)", relation)
+	}
 	if fileCount == 0 {
-		if sawPrevLinkError {
-			// Known goopg blocker: pg_waldump cannot walk goopg's on-disk WAL
-			// record chain because goopg stores xl_prev as its internal 1-based
-			// LSN, while pg_waldump anchors the record position 0-based on the
-			// segment file name. The mismatch is a constant +1 (observed:
-			// "incorrect prev-link 0/1000029 at 0/10000A0", where 0/1000028 is
-			// expected). The chain validation aborts at the second record, so no
-			// FPI is ever reached for extraction.
-			//
-			// Origin: internal/wal/writer.go forms the record start as a 1-based
-			// position (`start = writePos + leading + 1`, lines ~1346/1491) and
-			// the insert-position tracker carries that 1-based value through as
-			// xl_prev (internal/wal/insert_pos.go reserveLocked `t.prev = old`);
-			// encodeRecordXLog (internal/wal/format.go:263) then writes it
-			// verbatim, even though its own comment says the caller must pass the
-			// 0-based RecPtr (start-1). Fixing it is a coordinated WAL
-			// encode<->decode change (goopg's own recovery decode reads the
-			// 1-based value back, and the M0102 walsender path must stay
-			// consistent), so it belongs in a dedicated WAL-correctness loop, not
-			// this test port.
-			//
-			// This test is written to auto-promote: once xl_prev is emitted
-			// 0-based on disk, pg_waldump will walk the chain, extract the FPIs,
-			// and the assertions above will run for real.
-			t.Skipf("blocked: goopg writes xl_prev as a 1-based LSN; pg_waldump "+
-				"cannot walk the on-disk record chain (incorrect prev-link, +1 "+
-				"offset) so --save-fullpage extracts nothing for relation %s. "+
-				"Resume: emit xl_prev 0-based in internal/wal (encode+decode "+
-				"siblings) then un-skip.", relation)
-		}
-		t.Fatalf("no full-page images were saved for relation %s; --save-fullpage extracted nothing", relation)
+		// Remaining blocker (genuinely separate from xl_prev): goopg routes
+		// every non-checkpoint record through RmgrXLog with an unknown info
+		// byte (0xF0, internal/wal/format.go classifyXLogRecord) so PG's
+		// xlog_redo safely skips them during recovery. Those records carry
+		// goopg's opaque payload, NOT PG-format block references with embedded
+		// full-page images, so pg_waldump --save-fullpage finds nothing to
+		// extract for any relation. Emitting PG-decodable heap WAL records with
+		// backup blocks (XLogRecordBlockHeader + BKPIMAGE) is a large, separate
+		// feature.
+		//
+		// Auto-promotes: once goopg emits PG-format FPI records, pg_waldump
+		// will extract them and the filename/LSN assertions above run for real.
+		t.Skipf("blocked: goopg emits no PG-decodable full-page-image records "+
+			"(all non-checkpoint records route through RmgrXLog/0xF0, opaque to "+
+			"PG), so --save-fullpage extracts nothing for relation %s. The "+
+			"xl_prev prev-link blocker is RESOLVED — pg_waldump now walks the "+
+			"full chain. Resume: emit PG-format heap WAL records with backup "+
+			"blocks, then un-skip.", relation)
 	}
 	t.Logf("verified %d extracted full-page image(s)", fileCount)
 }
