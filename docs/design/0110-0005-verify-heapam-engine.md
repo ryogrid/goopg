@@ -7,7 +7,9 @@ loop #55: B-tree index verification (`verify_nbtree`) page-structural tier;
 loop #58: B-tree cross-page sibling-link tier;
 loop #59: B-tree cross-level downlink tier (`bt_child_check`);
 loop #62: heap clog-dependent HOT-chain tier (xmin commit-status checks),
-completing the heap engine to logic-complete parity)
+completing the heap engine to logic-complete parity;
+loop #64: real-producer false-positive validation — surfaced & fixed a vacuum
+MAXALIGN bug, see "Real-producer false-positive validation" below)
 
 > Scope note: this doc now covers both amcheck verify engines in
 > `internal/amcheck` — the heap-page checker (`verify_heapam.go`, the bulk of
@@ -677,6 +679,40 @@ messages (plus the negative-value case), a surfaced read error, nil-source
 rejection, and the `RelDesc` option threading through to the per-page natts
 check (off without `Rel`, on with it — which by the same seam covers
 `XidStatusFunc` forwarding).
+
+## Real-producer false-positive validation (loop #64, 2026-06-14)
+
+The per-page tests inject corruption by hand (`setItemID` + direct byte pokes) —
+the only way to produce damage, since the clean storage API refuses to write it.
+That leaves the complementary risk untested: does the engine stay *silent* on a
+page produced by goopg's *real* on-disk mutators? A divergence between the
+engine's page-byte assumptions and what storage actually writes would make the
+eventual `verify_heapam()` SRF report corruption on healthy user tables — the
+most expensive compatibility-bug class in this project.
+
+`verify_heapam_realpage_test.go` closes that gap: six tests drive the real
+producers and assert zero findings — a same-page HOT chain built via
+`storage.PageStampHotOldTuple` + a heap-only successor (mirroring the executor's
+`tryApplyHOTUpdate`), the same chain after `PageSetItemIDRedirect` pruning, a
+`VacuumHeapPage`-pruned page, a `NewHeapTupleWithNulls` nullable multi-attribute
+tuple, the HOT chain through the clog tier, and the whole-relation driver over a
+mix of all three real page shapes.
+
+**Bug surfaced and fixed:** the vacuumed-page test failed — goopg's vacuum
+repack kernel (`storage.VacuumHeapPageBySlots`) re-laid surviving tuples with
+`upper -= len(body)`, **without MAXALIGN**, producing line-pointer offsets that
+are not 8-byte aligned. This is a genuine latent data bug, not a test artifact:
+its sibling the insert path (`PageAddHeapTuple`) deliberately MAXALIGNs, with a
+comment (M0106-0010) noting that a non-aligned offset segfaults a PG18 standby's
+`heap_deform_tuple` on the first SELECT. The engine faithfully ports PG's
+"line pointer ... is not maximally aligned" check, so it correctly flagged the
+vacuumed page. Fix: `upper -= maxAlign8(len(e.body))` in the repack loop,
+restoring sibling-path agreement (`pattern_sibling_paths_must_agree`). The
+repack never needs more space than survivors already occupied (each was inserted
+with the same alignment; vacuum only removes tuples), so the change cannot
+overflow the page. Verified: `internal/storage`, `internal/vacuum`,
+`internal/wal` (replay shares the kernel), `internal/executor`, `internal/mvcc`
+all green under `-race`.
 
 ## Upstream references
 

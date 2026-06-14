@@ -775,7 +775,16 @@ func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, err
 	}
 	upper := special
 	for _, e := range survivors {
-		upper -= len(e.body)
+		// MAXALIGN the tuple offset, exactly as the insert path does
+		// (PageAddHeapTuple: alignedSize = maxAlign8(len(raw))). The repack
+		// is the insert path's sibling: a survivor re-laid at a non-8-byte
+		// boundary segfaults a PG18 standby's heap_deform_tuple on the first
+		// SELECT and trips amcheck's "not maximally aligned" check. The
+		// line-pointer Length still reports the real body length; the trailing
+		// 0..7 padding bytes were already zeroed above. Survivors were placed
+		// with this same alignment by the insert path, so the aligned footprint
+		// never exceeds the space they originally occupied.
+		upper -= maxAlign8(len(e.body))
 		copy(p[upper:upper+len(e.body)], e.body)
 		item, err := readItemID(p, e.idx)
 		if err != nil {

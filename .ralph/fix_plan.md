@@ -1364,6 +1364,32 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         `CREATE EXTENSION amcheck`/SRF SQL surface (AC-002-promoting, still blocked
         on a clean tree — pid 2177381 still holds the gen-column WIP, frozen since
         2026-06-13 14:28).
+      - **PROGRESS 2026-06-14 (loop #64):** the SQL surface is still blocked on
+        the external gen-column WIP (pid 2177381, frozen since 2026-06-13 14:28),
+        so instead of idling I added the engine's missing **false-positive
+        guard** — and it paid off by surfacing a real storage bug. The per-page
+        tests inject corruption by hand (the only way to write damage); nothing
+        verified the engine stays *silent* on pages produced by goopg's *real*
+        mutators. New `internal/amcheck/verify_heapam_realpage_test.go` (6 tests)
+        drives the real producers — a same-page HOT chain via
+        `PageStampHotOldTuple` + heap-only successor (mirroring the executor's
+        `tryApplyHOTUpdate`), the chain after `PageSetItemIDRedirect` pruning, a
+        `VacuumHeapPage`-pruned page, a `NewHeapTupleWithNulls` nullable
+        multi-attr tuple, the HOT chain through the clog tier, and the
+        whole-relation driver over all three — asserting zero findings.
+        **Bug found + fixed:** `storage.VacuumHeapPageBySlots` repacked survivors
+        with `upper -= len(body)` (no MAXALIGN), producing non-8-byte-aligned
+        line-pointer offsets — its sibling `PageAddHeapTuple` deliberately
+        MAXALIGNs because (per its M0106-0010 comment) a non-aligned offset
+        segfaults a PG18 standby's `heap_deform_tuple`. The engine correctly
+        flagged it. Fix: `upper -= maxAlign8(len(e.body))` (one line, restores
+        sibling-path agreement; vacuum only removes tuples so it cannot overflow
+        the page). Verified `-race`: `internal/{storage,vacuum,wal,executor,
+        mvcc,amcheck}` all green (wal = replay shares the kernel). Design doc
+        `0110-0005` extended ("Real-producer false-positive validation"). All
+        non-contaminating: only `verify_heapam_realpage_test.go` (new) +
+        `storage/heap.go` (1-line fix) + docs touched. SQL surface S1/S2/S3
+        remains the AC-002-promoting slice, still blocked on a clean tree.
 
 ### pg_resetwal (2 tests — excluded → candidate)
 
