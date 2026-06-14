@@ -726,12 +726,28 @@ func TestPort_PgBasebackup010ManifestChecksums(t *testing.T) {
 // TestPort_PgBasebackup011InPlaceTablespace ports
 // postgres/src/bin/pg_basebackup/t/011_in_place_tablespace.pl.
 //
-// Upstream tests: backup of a cluster containing an in-place tablespace.
-// All sub-cases require a running primary with pg_basebackup physical streaming.
+// Upstream test: create an in-place tablespace
+// (`SET allow_in_place_tablespaces = on; CREATE TABLESPACE inplace LOCATION ''`),
+// back the cluster up in tar format with --wal-method none, and assert the
+// backup contains base.tar plus exactly one per-tablespace `<oid>.tar`.
 //
-// Deferred entirely: in-place tablespace backup requires physical streaming
-// replication (--wal-method none still needs BASE_BACKUP protocol) which is
-// not yet implemented in goopg v0.
+// NOTE (loop #28, 2026-06-14): the prior skip note here was STALE — it blamed
+// the BASE_BACKUP physical-streaming protocol, but that protocol is fully
+// implemented and exercised by TestPort_PgBasebackup010StreamWAL / 010FetchWAL
+// (-X stream / -X fetch). The REAL remaining blocker is the in-place
+// tablespace feature, which goopg does not have:
+//   1. the `allow_in_place_tablespaces` GUC (absent),
+//   2. `CREATE TABLESPACE <name> LOCATION ''` DDL — goopg parses only the
+//      TABLESPACE *clause* (and ignores it); there is no CREATE TABLESPACE
+//      statement, no pg_tablespace row insertion, and no in-place
+//      pg_tblspc/<oid> directory creation,
+//   3. BASE_BACKUP emitting each non-default tablespace as a separate
+//      `<oid>.tar` member (internal/server/basebackup.go — uncontaminated).
+//
+// Items (1)+(3) are uncontaminated; item (2) edits the parser/executor/catalog
+// packages, so the feature cannot land until those are clean. Resume point:
+// add the GUC + CREATE TABLESPACE DDL + per-tablespace tar emission, then
+// enable this test.
 func TestPort_PgBasebackup011InPlaceTablespace(t *testing.T) {
 	// upstream: postgres/src/bin/pg_basebackup/t/011_in_place_tablespace.pl
 	bin := clientToolBin(t, "pg_basebackup")
@@ -739,10 +755,12 @@ func TestPort_PgBasebackup011InPlaceTablespace(t *testing.T) {
 		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
 	}
 
-	// All sub-cases require BASE_BACKUP physical streaming.
-	// Deferred until goopg implements pg_basebackup-compatible replication protocol.
-	t.Skip("in-place tablespace backup requires physical streaming replication " +
-		"(BASE_BACKUP protocol) not yet implemented in goopg v0")
+	// BASE_BACKUP physical streaming is implemented (see 010StreamWAL); the
+	// real gap is the in-place tablespace feature (allow_in_place_tablespaces
+	// GUC + CREATE TABLESPACE ... LOCATION '' DDL + per-tablespace <oid>.tar).
+	t.Skip("in-place tablespace backup requires CREATE TABLESPACE DDL + " +
+		"allow_in_place_tablespaces GUC + per-tablespace tar emission " +
+		"(not BASE_BACKUP, which goopg already implements)")
 }
 
 // TestPort_PgReceivewal020 ports postgres/src/bin/pg_basebackup/t/020_pg_receivewal.pl.

@@ -216,9 +216,20 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
         Design doc `0095-0003` extended; CSV BB-020 + markdown updated. Resume =
         030 (`pg_recvlogical`, needs logical decoding) / 011 (in-place
         tablespace) backup-execution branches.
-      - Action: remaining M0095-0003 increments — 011/020 backup-execution
-        branches and recvlogical still require the same dependencies (BASE_BACKUP
-        for in-place tablespace; logical replication protocol for recvlogical).
+      - Action: remaining M0095-0003 increments — 011 and recvlogical (030).
+      - **CORRECTION 2026-06-14 (loop #28):** the long-standing "011 needs
+        BASE_BACKUP for in-place tablespace" note was WRONG. BASE_BACKUP physical
+        streaming is fully implemented (010 `-X stream`/`-X fetch` PASS). The real
+        blocker for `011_in_place_tablespace.pl` is the in-place **tablespace
+        feature**, which goopg lacks: (1) the `allow_in_place_tablespaces` GUC,
+        (2) `CREATE TABLESPACE <name> LOCATION ''` DDL (goopg parses only the
+        TABLESPACE *clause* and ignores it — no statement, no pg_tablespace row
+        insert, no in-place `pg_tblspc/<oid>` dir), and (3) BASE_BACKUP emitting
+        each non-default tablespace as a separate `<oid>.tar`. Items (1)+(3) are
+        uncontaminated; item (2) edits parser/executor/catalog, so it is blocked
+        on a clean tree (same gen-column WIP that holds the amcheck SQL surface).
+        Skip note in `TestPort_PgBasebackup011InPlaceTablespace` corrected to match.
+        recvlogical (030) still needs the logical replication / decoding protocol.
 
 ## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
 
