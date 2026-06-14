@@ -1594,6 +1594,55 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         points): the catalog-coupled `HeapEntryFormer` impl (snapshot visibility +
         `index_form_tuple`), multixact-member bounds, and the `CREATE EXTENSION
         amcheck`/SRF SQL surface (AC-002-promoting, blocked on a clean tree).
+      - **PROGRESS 2026-06-14 (loop #29):** the SQL surface is STILL blocked on the
+        same foreign gen-column WIP (frozen 2026-06-13 14:28, ~28h; a HUMAN must
+        clear it), and the B-tree + heap engines are logic-complete, so I added the
+        engine's missing **real-producer validation** — the symmetric counterpart
+        to loop #64's heap `verify_heapam_realpage_test.go` (which found a real
+        vacuum bug). New `internal/amcheck/verify_nbtree_realtree_test.go` builds
+        LIVE multi-level B-trees via real `btree.Create`/`Insert`/split and runs
+        every engine tier (per-page structure, item-order, cross-level downlinks,
+        sibling-link walk, heapallindexed round-trip) over the on-disk pages.
+        Sorted int4/int8/varchar trees → all tiers silent (validates the engine's
+        decode assumptions against goopg's real layout, incl. variable-length
+        opaque high keys). **It surfaced a real goopg btree bug** (now filed as
+        M0110-0007 below): shuffled inserts force middle-of-level splits and
+        `splitAndInsert` never updates the OLD right sibling's `btpo_prev`, leaving
+        a stale left-link the sibling-link tier correctly flags. The shuffled test
+        (`TestVerifyBtreeEngineDetectsStaleSiblingLinkOnRealTree`) pins this as a
+        detection assertion (flip to silence when M0110-0007 lands). Gates: `go
+        test -race ./internal/amcheck` PASS; `go build ./...` + `go vet` clean; all
+        in a new `_test.go` — zero contaminated files touched. Design doc
+        `0110-0005` extended ("Real-producer B-tree validation").
+
+- [ ] **M0110-0007 — B-tree split must maintain the old right sibling's prev-link**
+      - **Discovered 2026-06-14 (loop #29)** by the new real-producer B-tree
+        validation (`internal/amcheck/verify_nbtree_realtree_test.go`).
+      - Symptom: after any **non-rightmost** leaf/internal split (i.e. the split
+        page had a right sibling — the common case for non-append insert patterns:
+        random PKs, UUIDs, secondary indexes), the OLD right sibling's `btpo_prev`
+        is left pointing at the original left page instead of the newly inserted
+        middle page. `splitAndInsert` (`internal/access/btree/btree.go`
+        ~L1454-1466 sets the new right page's `Prev=blk`; L1522 sets the left
+        page's `Next=rightBlk`) never touches the old right sibling.
+      - Why it matters: `btpo_prev` is load-bearing — page deletion
+        (`internal/access/btree/btree_vacuum.go`) reads `op.Prev` to find the left
+        sibling and WAL-logs `RightSibNewPrev` to relink it; a stale left-link can
+        mislead page-deletion relinking and any backward navigation. PG fixes this
+        inside the atomic `_bt_split` WAL record (updates the original right
+        sibling's left-link, WAL-logged).
+      - Required (bounded, with gates — this is a WAL/concurrency change, not a
+        one-liner): (1) in `splitAndInsert`, when the pre-split `op.Next !=
+        InvalidBlockNumber`, pin+lock the old right sibling and set its `Prev =
+        rightBlk`; (2) fold that page into the atomic split WAL record + replay
+        (`internal/access/btree/replay.go`) so crash recovery restores it — mirror
+        the existing `RightSibNewPrev` precedent in the page-deletion path; (3)
+        respect Lehman-Yao left-to-right lock ordering to avoid deadlock; (4) gate
+        with `go test -race ./internal/access/btree` (incl.
+        `multi_writer_stress_test`) + a recovery/replay test.
+      - DoD: flip `TestVerifyBtreeEngineDetectsStaleSiblingLinkOnRealTree` from a
+        detection assertion to the silence assertion the sorted cases use; write a
+        design doc (`docs/design/0110-NNNN-btree-split-rightsibling-prevlink.md`).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

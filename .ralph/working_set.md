@@ -1,43 +1,47 @@
-Task: M0095-0003 (pg_basebackup 011) blocker-diagnosis correction + M0110-0003
-amcheck SQL surface still BLOCKED on the orphaned foreign gen-column WIP.
+Task: M0110-0003 amcheck (SQL surface still BLOCKED on foreign gen-column WIP) +
+NEW M0110-0007 (btree split prev-link bug discovered this loop).
 
-DISPOSITION THIS LOOP (loop #28, 2026-06-14): did NOT rubber-stamp BLOCKED.
-Independently investigated whether ANY remaining task has an uncontaminated
-opening, then landed the one safe valuable change found.
+DISPOSITION loop #29 (2026-06-14): did NOT rubber-stamp BLOCKED. The amcheck
+engine is logic-complete (heap + B-tree), so I added the engine's missing
+real-producer validation — and it found a real bug.
 
-WHAT LANDED (uncontaminated, test+docs only):
-- Corrected the STALE/WRONG skip note in
-  `internal/testport/pgbasebackup_port_test.go`
-  (`TestPort_PgBasebackup011InPlaceTablespace`) — it blamed BASE_BACKUP, which
-  is fully implemented (010 `-X stream`/`-X fetch` PASS). Real 011 blocker is the
-  in-place tablespace FEATURE: (1) `allow_in_place_tablespaces` GUC (absent),
-  (2) `CREATE TABLESPACE <name> LOCATION ''` DDL (goopg parses only the
-  TABLESPACE *clause* and ignores it — no statement / no pg_tablespace insert /
-  no `pg_tblspc/<oid>` dir), (3) BASE_BACKUP per-tablespace `<oid>.tar`.
-  Items (1)+(3) uncontaminated; (2) edits parser/executor/catalog → blocked.
-- Mirrored the correction into fix_plan M0095-0003 note + deferral ledger.
+WHAT LANDED (uncontaminated, new test file only):
+- `internal/amcheck/verify_nbtree_realtree_test.go` — builds LIVE multi-level
+  B-trees via real btree.Create/Insert/split and runs every engine tier
+  (per-page, item-order, cross-level downlinks, sibling-link walk, heapallindexed
+  round-trip) over real on-disk pages. Symmetric counterpart to loop #64's heap
+  verify_heapam_realpage_test.go.
+- Sorted int4/int8/varchar trees → ALL tiers silent (validates engine decode vs
+  goopg's real layout, incl. variable-length opaque high keys).
+- Design doc 0110-0005 extended ("Real-producer B-tree validation"); fix_plan
+  progress note + new item M0110-0007; deferral ledger appended.
 
-KEY FACTS RE-VERIFIED THIS LOOP:
-- Foreign gen-column WIP STILL dirty in catalog/parser/planner/executor (+analyzer,
-  mvcc, server/dispatch), frozen mtime 2026-06-13 14:28 (~28h). ORIGINAL holder
-  pid 2177381 is now DEAD; no live process owns the edits (the alive
-  `claude --resume ec98936f` PID 3999013 started ~3h ago, did not create them).
-  Still MUST NOT touch — memory concurrent_ralph_loops_corrupt_tree: a HUMAN clears it.
-- pg_tablespace catalog bootstrap exists (initdb); CREATE TABLESPACE DDL does not.
-- amcheck engine is logic-complete (heap + B-tree, incl. heapallindexed producer
-  pair, xmin/xmax bounds). Only the SQL surface (CREATE EXTENSION amcheck +
-  verify_heapam/bt_index_check SRF, docs/design/0110-0008 S1/S2) promotes AC-002,
-  and it edits the contaminated tree.
+BUG FOUND (filed M0110-0007, NOT fixed this loop):
+- goopg `splitAndInsert` (internal/access/btree/btree.go ~L1454-1466 / L1522)
+  never updates the OLD right sibling's btpo_prev on a non-rightmost split → stale
+  left-link on any non-append insert pattern (random PK/UUID/secondary index).
+  Only manifests on MIDDLE splits (sorted inserts split only rightmost → no
+  sibling → invisible; that's why only the shuffled test trips it).
+- btpo_prev is load-bearing: btree_vacuum.go reads op.Prev + WAL-logs
+  RightSibNewPrev to relink siblings on page deletion. Real correctness gap.
+- Fix is a WAL/concurrency change (fold old right sibling into atomic split WAL
+  record + replay + Lehman-Yao lock order); needs -race + recovery gates → its own
+  bounded loop, NOT a blind engine-loop change. internal/access/btree is CLEAN.
+- TestVerifyBtreeEngineDetectsStaleSiblingLinkOnRealTree pins current behaviour as
+  a DETECTION assertion; flip to silence when M0110-0007 lands.
 
-Gates run: go vet ./internal/testport (clean); go build ./... (clean);
-deferral-ledger appended; make ralph-state-guard (run before status block).
+Gates run: go test -race ./internal/amcheck (PASS); go build ./... (clean);
+go vet ./internal/amcheck ./internal/access/btree (clean); ralph-state-guard
+(before status block).
 
-Next step: HUMAN must clear the orphaned foreign WIP (git status clean on
-catalog/parser/planner/executor). THEN, in priority order:
-1. amcheck SQL surface S1/S2 (0110-0008) over the finished engine → port
-   002_nonesuch.pl → flip CSV AC-002→port (M0110-0003).
-2. CREATE TABLESPACE DDL + allow_in_place_tablespaces GUC + per-tablespace
-   <oid>.tar → enable TestPort_PgBasebackup011InPlaceTablespace (M0095-0003/011).
-3. pg_dump 002+ catalog-view parity (M0110-0001).
-Until cleared, every loop here is BLOCKED; do NOT fabricate isolated engine tiers
-and do NOT chase BASE_BACKUP for 011 (it is done).
+Contamination UNCHANGED: foreign gen-column WIP frozen 2026-06-13 14:28 (~28h);
+catalog/parser/planner/executor/analyzer/mvcc + server/dispatch dirty + 2
+untracked gen_override tests. HUMAN must clear it.
+
+Next step (priority order):
+1. M0110-0007: dedicated bounded btree/WAL loop on the CLEAN internal/access/btree
+   package — update old right sibling prev-link on split + atomic WAL + replay +
+   race/recovery gates; flip the detection test to silence.
+2. After human clears tree: amcheck SQL surface S1/S2 (0110-0008) over finished
+   engine → port 002_nonesuch → flip CSV AC-002→port.
+3. CREATE TABLESPACE DDL (M0095-0003/011); pg_dump 002+ catalog parity (M0110-0001).

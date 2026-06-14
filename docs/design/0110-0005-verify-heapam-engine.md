@@ -833,6 +833,45 @@ The remaining `check_tuple_visibility` work — multixact-member bounds
 goopg has no on-disk multixact, so it is corruption-only territory with no
 relation-level multixact horizon to compare against.
 
+## Real-producer B-tree validation (and a split bug it surfaced)
+
+Every B-tree tier above was unit-tested against hand-constructed pages (the only
+way to inject corruption). Mirroring the heap engine's real-producer guard
+(`verify_heapam_realpage_test.go`, which surfaced the `VacuumHeapPageBySlots`
+MAXALIGN bug), `internal/amcheck/verify_nbtree_realtree_test.go` now drives the
+**real** `btree.Create`/`Insert`/split machinery — building live multi-level
+trees and running every tier over the on-disk pages — as a false-positive guard
+and an on-disk-format-drift guard.
+
+It splits into two outcomes by insertion order, which is itself the finding:
+
+- **Sorted (append-only) inserts** split only the rightmost page of a level (no
+  right sibling), so every tier — per-page structure, item-order, cross-level
+  downlinks, the sibling-link walk, and the heapallindexed round-trip — stays
+  silent. Covered for int4, int8, and variable-length varchar keys (the last
+  exercising the opaque-area high key directly).
+
+- **Shuffled inserts** force middle-of-level splits and expose a genuine goopg
+  btree correctness gap: `splitAndInsert` (`internal/access/btree/btree.go`
+  ~L1454-1466 / L1522) links the new right page's `btpo_prev` to the left page
+  and the left page's `btpo_next` to the new page, but **never updates the OLD
+  right sibling's `btpo_prev`** to point at the new middle page. After any
+  non-rightmost split that sibling's left-link is left stale. The sibling-link
+  tier correctly flags it (`left link/right link pair ... not in agreement`);
+  all other tiers stay silent (they do not read `btpo_prev`).
+
+  `btpo_prev` is load-bearing in goopg, not vestigial: page deletion
+  (`internal/access/btree/btree_vacuum.go`) reads `op.Prev` to find the left
+  sibling and WAL-logs `RightSibNewPrev` to relink it. A stale left-link can
+  therefore mislead page-deletion relinking and any backward navigation. PG
+  avoids this by updating the original right sibling's left-link inside the
+  atomic `_bt_split` WAL record. The fix is tracked as a separate
+  WAL/concurrency task (it must fold the old right sibling into the split WAL
+  record + replay, with `-race` and recovery gates) rather than landing blind in
+  an engine loop. `TestVerifyBtreeEngineDetectsStaleSiblingLinkOnRealTree` pins
+  the current (buggy) behaviour as a detection assertion and must flip to a
+  silence assertion when the split is fixed.
+
 ## Upstream references
 
 - `postgres/contrib/amcheck/verify_nbtree.c` (`palloc_btree_page`,
