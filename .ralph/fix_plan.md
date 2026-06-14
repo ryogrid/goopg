@@ -1808,6 +1808,95 @@ complete, these can be re-evaluated.
 | `pg_upgrade` | Multi-server orchestration; pg_upgrade binary. |
 
 
+## M0117 — CLOG ↔ PostgreSQL subsystem alignment (filed 2026-06-14)
+
+Milestone doc: `docs/milestones/0117-clog-postgresql-subsystem-alignment.md`.
+
+Goal: finish bringing goopg's commit-log (`pg_xact`) and subtransaction
+(`pg_subtrans`) behavior to PostgreSQL 18.3 parity. The bounded CLOG build landed
+truncation (G1) + the `CLOG_TRUNCATE` WAL record (G9) + the `pg_subtrans` write path
+(G5 partial) + consistency/standby tests (G2/G3). This milestone files the explicitly
+**deferred** and **follow-up** work recorded in
+`docs/analysis/clog-goopg-gaps-and-remediation-2026-06-14.md` and
+`docs/analysis/clog-impl-task-division-2026-06-14.md` (Review-outcomes / deferral
+section): runtime visibility integration, subtransaction durability, the
+`SUB_COMMITTED` lane, group commit + a bounded SLRU buffer pool, async-commit LSN
+tracking, and wraparound-safe horizon selection.
+
+**Per-task discipline (hard requirement): for EVERY M0117-NNNN task, author the
+design doc `docs/design/0117-NNNN-*.md` AND index it in `docs/design/README.md`
+BEFORE writing any implementation code.** WAL/MVCC changes carry the practice-card
+gate (`go test -race ./internal/wal/... ./internal/mvcc/...` + recovery/standby E2E);
+visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
+(`scripts/tpch-spotcheck.sh`, canonical Q12=2/Q13=35) / regress-port re-run.
+
+### Sub-milestones
+
+- [ ] **M0117-0001**
+      - Summary: Wraparound-safe XID horizon comparison (gap M2; P0/correctness).
+        Add exported `storage.XIDPrecedes(a, b)` (mirroring `clog.go`'s `txnPrecedes`
+        / PG `TransactionIdPrecedes`) and use it for horizon selection in
+        `catalog.DatFrozenXID` and the checkpointer `TruncateCLOGFn`
+        (`internal/initdb/open.go`) instead of plain `<`.
+      - Author `docs/design/0117-0001-xid-precedes-horizon-comparison.md` and index it before coding.
+      - Gate: `go test ./internal/mvcc/... ./internal/catalog/...` (+ unit tests near 2^32). Effort: S.
+
+- [ ] **M0117-0002**
+      - Summary: Runtime CLOG-consulting visibility fallback (gap G4; P1). Add a CLOG
+        fallback in `Snapshot.SeesCommittedXID` for in-window XIDs not classified by
+        the in-memory `InProgress`/`Aborted` arrays, keeping the arrays as the fast
+        path; audit the `visibility.go` ↔ `subxact_visibility.go` sibling paths.
+      - Author `docs/design/0117-0002-visibility-clog-fallback.md` and index it before coding.
+      - Gate: TPC-H spot-check (`scripts/tpch-spotcheck.sh`, Q12=2/Q13=35) + `go test -race ./internal/mvcc/...`. Effort: M.
+
+- [ ] **M0117-0003**
+      - Summary: `pg_subtrans` restore-on-restart (gap G5 read path; P1). Wire
+        `SubxactMap.EnablePersistence` into the `internal/initdb/open.go` recovery
+        sequence and load persisted parent links from the `pg_subtrans` SLRU back into
+        the in-memory `SubxactMap` so subxact parentage survives a restart.
+      - Author `docs/design/0117-0003-pg-subtrans-restore-on-restart.md` and index it before coding.
+      - Gate: standby-attach E2E + `go test -race ./internal/mvcc/...`. Effort: M.
+
+- [ ] **M0117-0004**
+      - Summary: `SUB_COMMITTED` (0x03) CLOG lane (gap G5 SUB_COMMITTED; P1; builds on
+        M0117-0003). Generate the 0x03 lane in the commit path (`mirrorToSLRUUnlocked`)
+        for committed subxacts whose parent is still in-progress, and read it back in
+        `loadFromSLRU`; document which code path writes each state.
+      - Author `docs/design/0117-0004-clog-sub-committed-lane.md` and index it before coding.
+      - Gate: extend the dual-store consistency test + `go test -race ./internal/mvcc/...`. Effort: S–M.
+
+- [ ] **M0117-0005**
+      - Summary: Incremental flush + group commit (gap G7; P2). Make `CLog.flush`
+        write only changed pages/segments (not the whole flat file) and add a
+        group-commit batching layer (lock-free queue, mirroring PG's
+        `TransactionGroupUpdateXidStatus`) over the SLRU fsync; new file
+        `internal/mvcc/clog_groupcommit.go`.
+      - Author `docs/design/0117-0005-clog-incremental-flush-group-commit.md` and index it before coding.
+      - Gate: `go test -race ./internal/mvcc/...` + commit-throughput sanity check. Effort: M.
+
+- [ ] **M0117-0006**
+      - Summary: SLRU buffer pool / 2-bit collapse (gap G6; P2; follows M0117-0005).
+        Replace the fully-resident per-bank byte slices with a bounded page-cache over
+        the 2-bit SLRU representation (LRU eviction; `transaction_buffers` GUC).
+      - Author `docs/design/0117-0006-clog-slru-buffer-pool.md` and index it before coding.
+      - Gate: `go test -race ./internal/mvcc/...`; full mvcc/wal/initdb suites; re-init data dir (memory-model change). Effort: L.
+
+- [ ] **M0117-0007**
+      - Summary: Async-commit LSN tracking (gap G8; P2; feature-gated on a real
+        `synchronous_commit=off` path). Add per-group commit-LSN tracking
+        (`CLOG_XACTS_PER_LSN_GROUP`) and gate honoring a committed status / hint-bit
+        setting on WAL flush position.
+      - Author `docs/design/0117-0007-clog-async-commit-lsn.md` and index it before coding.
+      - Gate: `go test -race ./internal/mvcc/...` + recovery E2E. Effort: L.
+
+- [ ] **M0117-0008**
+      - Summary: Persist `datfrozenxid` in the `pg_database` catalog tuple at VACUUM
+        end (rather than only computing it on demand) and extend the dual-store
+        consistency tests for round-trip coverage of all status codes.
+      - Author `docs/design/0117-0008-datfrozenxid-persistence.md` and index it before coding.
+      - Gate: `go test ./internal/catalog/...`; re-init data dir + regress-port re-run (catalog tuple-format change). Effort: S.
+
+
 ## Notes
 
 - This file is the authoritative TODO list for Ralph. Update it after every
