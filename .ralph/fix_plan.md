@@ -11,6 +11,18 @@ Completed milestones are archived under `completed_milestones/` (latest: `comple
 
 ## Maintenance (small, do when convenient — does not preempt milestone order)
 
+- [x] **MAINT-STATEGUARD-RECONCILE** — Stop `make ralph-state-guard` failing at the
+      start of every loop. Root cause (NOT concurrency — single `--live` loop confirmed
+      by ppid): the driver writes `progress={"status":"completed"}` after every clean
+      claude exit (`~/.ralph/ralph_loop.sh:~1832`, "Clear progress file"), so the next
+      loop's `status=running` always pairs with the prior loop's `progress=completed`.
+      **DONE 2026-06-14 (loop #11):** added an `autoRepair` rule in
+      `cmd/validate-ralph-state/main.go` — the complement of the stale-status rule —
+      that reconciles a `completed` progress NOT newer than a live `running` status to
+      `in_progress`, so the guard self-heals via `-fix`. 3 new tests; design
+      `docs/design/root-0018-ralph-state-guard-prev-loop-marker-reconcile.md`. No more
+      per-loop manual `progress.json` restores.
+
 - [x] **MAINT-TPCH-RELOAD** — Reload the TPC-H bench dataset so the silent-regression
       gate works again. `bench/tpch/runtime_goopg/data` is a stale husk (no PG_VERSION,
       last real load 2026-05-26), so `scripts/tpch-spotcheck.sh` currently SKIPs.

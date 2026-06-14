@@ -130,6 +130,30 @@ func autoRepair(status statusFile, progress progressFile, maxSkew time.Duration)
 				fmt.Sprintf("status marked completed/idle because progress completed is newer by > %s", maxSkew))
 		}
 
+		// Safe rule: a live "running/executing" loop whose progress.json still
+		// carries the PREVIOUS loop's clean-exit "completed" marker. The Ralph
+		// driver writes progress={"status":"completed"} after every successful
+		// claude exit (ralph_loop.sh "Clear progress file") — that "completed"
+		// means "the prior loop's claude call finished cleanly", NOT "project
+		// done". The next loop then sets status=running/executing without
+		// touching progress, so the steady state during any loop is
+		// status=running (loop N) + progress=completed (loop N-1's marker).
+		// When that completed marker is NOT newer than the running status by
+		// more than max-skew, the live status is authoritative and progress is
+		// the stale prior-loop marker: reconcile progress forward to in_progress
+		// (matching the live loop) so the guard self-heals. Without this, the
+		// guard tripped on every loop and required a manual progress restore
+		// that the driver stomped again on the next clean exit (recurring
+		// "concurrent-loop corruption" mis-diagnosis, loops #5-#11). This is
+		// the exact complement of the rule above (which fires only when
+		// progress IS newer by > max-skew), so the two never overlap.
+		if isStatusRunning && isProgressCompleted && isExecuting && !progressTS.After(statusTS.Add(maxSkew)) {
+			repairedProgress.Status = "in_progress"
+			repairedProgress.Timestamp = statusTS.Format(time.RFC3339)
+			repairs = append(repairs,
+				"progress reconciled to in_progress because its completed marker is the previous loop's clean-exit marker, not a project completion")
+		}
+
 		// Safe rule: stale "running/executing" status with newer failed progress.
 		isProgressFailed := strings.EqualFold(progress.Status, "failed") || strings.EqualFold(progress.Status, "error")
 		if isStatusRunning && isProgressFailed && isExecuting && progressTS.After(statusTS.Add(maxSkew)) {

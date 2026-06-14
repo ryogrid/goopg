@@ -213,7 +213,85 @@ func TestAutoRepairStaleRunningStatus(t *testing.T) {
 	}
 }
 
-func TestAutoRepairNoopWhenNotStale(t *testing.T) {
+// TestAutoRepairReconcilesPrevLoopCompletedMarker pins the recurring real-world
+// case: a live loop is running/executing while progress.json still holds the
+// PREVIOUS loop's clean-exit "completed" marker (written by the Ralph driver
+// after every successful claude exit). Because that completed marker is not
+// newer than the running status by more than max-skew, the live status is
+// authoritative and progress must be reconciled forward to in_progress so the
+// guard self-heals instead of failing every loop. Regression for the loops
+// #5-#11 "concurrent-loop corruption" mis-diagnosis.
+func TestAutoRepairReconcilesPrevLoopCompletedMarker(t *testing.T) {
+	status := statusFile{
+		Status:            "running",
+		LastAction:        "executing",
+		LoopCount:         42,
+		CallsMadeThisHour: 3,
+		MaxCallsPerHour:   100,
+		Timestamp:         "2026-04-30T00:00:05Z",
+	}
+	// Previous loop's clean-exit marker, recorded 5s before the live loop
+	// started — older than the running status, i.e. not a real completion.
+	progress := progressFile{
+		Status:    "completed",
+		Timestamp: "2026-04-30T00:00:00Z",
+	}
+
+	repairedStatus, repairedProgress, repairs := autoRepair(status, progress, 2*time.Minute)
+	if len(repairs) == 0 {
+		t.Fatal("expected at least one repair")
+	}
+	if repairedStatus != status {
+		t.Fatalf("expected status unchanged, got %+v", repairedStatus)
+	}
+	if repairedProgress.Status != "in_progress" {
+		t.Fatalf("expected progress in_progress, got %q", repairedProgress.Status)
+	}
+
+	issues := validate(repairedStatus, repairedProgress, 2*time.Minute)
+	if len(issues) != 0 {
+		t.Fatalf("expected no issues after repair, got %v", issues)
+	}
+}
+
+// TestAutoRepairReconcilesLongRunningLoop covers the same reconcile path when a
+// loop has been running longer than max-skew: status.timestamp is now well
+// newer than the prior-loop completed marker. Both the "running while completed"
+// and the "status newer than progress" skew issues must clear.
+func TestAutoRepairReconcilesLongRunningLoop(t *testing.T) {
+	status := statusFile{
+		Status:            "running",
+		LastAction:        "executing",
+		LoopCount:         42,
+		CallsMadeThisHour: 3,
+		MaxCallsPerHour:   100,
+		Timestamp:         "2026-04-30T00:10:00Z",
+	}
+	progress := progressFile{
+		Status:    "completed",
+		Timestamp: "2026-04-30T00:00:00Z",
+	}
+
+	repairedStatus, repairedProgress, repairs := autoRepair(status, progress, 2*time.Minute)
+	if len(repairs) == 0 {
+		t.Fatal("expected at least one repair")
+	}
+	if repairedStatus != status {
+		t.Fatalf("expected status unchanged, got %+v", repairedStatus)
+	}
+	if repairedProgress.Status != "in_progress" {
+		t.Fatalf("expected progress in_progress, got %q", repairedProgress.Status)
+	}
+
+	issues := validate(repairedStatus, repairedProgress, 2*time.Minute)
+	if len(issues) != 0 {
+		t.Fatalf("expected no issues after repair, got %v", issues)
+	}
+}
+
+// TestAutoRepairNoopWhenConsistent confirms a genuinely consistent live loop
+// (running + in_progress) is left untouched.
+func TestAutoRepairNoopWhenConsistent(t *testing.T) {
 	status := statusFile{
 		Status:            "running",
 		LastAction:        "executing",
@@ -223,8 +301,8 @@ func TestAutoRepairNoopWhenNotStale(t *testing.T) {
 		Timestamp:         "2026-04-30T00:00:00Z",
 	}
 	progress := progressFile{
-		Status:    "completed",
-		Timestamp: "2026-04-30T00:00:30Z",
+		Status:    "in_progress",
+		Timestamp: "2026-04-30T00:00:00Z",
 	}
 
 	repairedStatus, repairedProgress, repairs := autoRepair(status, progress, 2*time.Minute)
