@@ -248,3 +248,170 @@ func TestVacuumIndexPagesLargeTree(t *testing.T) {
 		t.Errorf("expected %d remaining, got %d", n/2, count)
 	}
 }
+
+// vacLeafChain walks the live leaf chain left-to-right from the leftmost leaf
+// (deleted leaves are already unlinked from this chain) and returns the block
+// numbers in order. It fails on a cycle.
+func vacLeafChain(t *testing.T, bt *BTree) []storage.BlockNumber {
+	t.Helper()
+	lm, err := bt.findLeftmostLeaf()
+	if err != nil {
+		t.Fatalf("findLeftmostLeaf: %v", err)
+	}
+	var out []storage.BlockNumber
+	seen := make(map[storage.BlockNumber]bool)
+	for cur := lm; cur != storage.InvalidBlockNumber; {
+		if seen[cur] {
+			t.Fatalf("cycle in live leaf chain at block %d", cur)
+		}
+		seen[cur] = true
+		slot, err := bt.pinR(cur)
+		if err != nil {
+			t.Fatalf("pinR(%d): %v", cur, err)
+		}
+		op := readOpaque(slot.Page())
+		next := op.Next
+		bt.unpinR(slot)
+		out = append(out, cur)
+		cur = next
+	}
+	return out
+}
+
+// vacLeafTIDs returns every heap TID stored on the given leaf block.
+func vacLeafTIDs(t *testing.T, bt *BTree, blk storage.BlockNumber) []storage.ItemPointer {
+	t.Helper()
+	slot, err := bt.pinR(blk)
+	if err != nil {
+		t.Fatalf("pinR(%d): %v", blk, err)
+	}
+	items, err := pageItems(slot.Page())
+	bt.unpinR(slot)
+	if err != nil {
+		t.Fatalf("pageItems(%d): %v", blk, err)
+	}
+	tids := make([]storage.ItemPointer, 0, len(items))
+	for _, it := range items {
+		tids = append(tids, it.ptr)
+	}
+	return tids
+}
+
+// vacOpaque reads a block's BTPageOpaque.
+func vacOpaque(t *testing.T, bt *BTree, blk storage.BlockNumber) BTPageOpaque {
+	t.Helper()
+	slot, err := bt.pinR(blk)
+	if err != nil {
+		t.Fatalf("pinR(%d): %v", blk, err)
+	}
+	op := readOpaque(slot.Page())
+	bt.unpinR(slot)
+	return op
+}
+
+// TestVacuumIndexPagesAdjacentLeafRunRelinksLiveSiblings is the storage-layer
+// regression for M0110-0010: deleting an ADJACENT run of empty leaves in one
+// VacuumIndexPages pass must leave every surviving leaf's btpo_prev/btpo_next
+// pointing at a LIVE (non-deleted) block, and the leaf sibling chain must be
+// fully intact. Before the fix, unlinkEmptyLeaf relinked neighbours from the
+// PHASE-1-captured pointers, so the survivors at a deleted run's edges were left
+// pointing at a block deleted in the same pass.
+func TestVacuumIndexPagesAdjacentLeafRunRelinksLiveSiblings(t *testing.T) {
+	pool, rel := newVacuumTestPool(t)
+	const n = 3000
+	entries := make([]BulkEntry, n)
+	for i := 0; i < n; i++ {
+		entries[i] = BulkEntry{
+			Key: EncodeInt4(int32(i)),
+			Ptr: storage.ItemPointer{Block: storage.BlockNumber(i / 100), Offset: uint16(i%100 + 1)},
+		}
+	}
+	tree, err := BulkCreate(pool, rel, entries)
+	if err != nil {
+		t.Fatalf("BulkCreate: %v", err)
+	}
+
+	leaves := vacLeafChain(t, tree)
+	if len(leaves) < 5 {
+		t.Fatalf("need >=5 leaves to delete an adjacent interior run, got %d", len(leaves))
+	}
+	// A contiguous run of interior leaves (each adjacent to the next target).
+	targets := []storage.BlockNumber{leaves[1], leaves[2], leaves[3]}
+	targetSet := map[storage.BlockNumber]bool{}
+	var deadTIDs []storage.ItemPointer
+	for _, blk := range targets {
+		tids := vacLeafTIDs(t, tree, blk)
+		if len(tids) == 0 {
+			t.Fatalf("target interior leaf %d had no entries", blk)
+		}
+		deadTIDs = append(deadTIDs, tids...)
+		targetSet[blk] = true
+	}
+
+	removed, err := tree.VacuumIndexPages(deadTIDs)
+	if err != nil {
+		t.Fatalf("VacuumIndexPages: %v", err)
+	}
+	if removed != len(deadTIDs) {
+		t.Fatalf("VacuumIndexPages removed %d, expected %d", removed, len(deadTIDs))
+	}
+
+	// Every target leaf must now be flagged deleted (the unlink really ran).
+	for _, blk := range targets {
+		if !vacOpaque(t, tree, blk).IsDeleted() {
+			t.Fatalf("target leaf %d was expected deleted but is still live", blk)
+		}
+	}
+
+	// Walk the live leaf chain and assert structural integrity: no survivor's
+	// prev/next references a deleted block, and the chain is bidirectionally
+	// consistent (a.next==b implies b.prev==a) with proper Invalid edges.
+	live := vacLeafChain(t, tree)
+	for _, blk := range live {
+		if targetSet[blk] {
+			t.Fatalf("deleted leaf %d is still reachable on the live chain", blk)
+		}
+	}
+	for i, blk := range live {
+		op := vacOpaque(t, tree, blk)
+		if op.Prev != storage.InvalidBlockNumber {
+			if vacOpaque(t, tree, op.Prev).IsDeleted() {
+				t.Fatalf("survivor leaf %d btpo_prev=%d points at a DELETED block (M0110-0010 regression)", blk, op.Prev)
+			}
+		}
+		if op.Next != storage.InvalidBlockNumber {
+			if vacOpaque(t, tree, op.Next).IsDeleted() {
+				t.Fatalf("survivor leaf %d btpo_next=%d points at a DELETED block (M0110-0010 regression)", blk, op.Next)
+			}
+		}
+		// Edge invariants.
+		if i == 0 && op.Prev != storage.InvalidBlockNumber {
+			t.Fatalf("leftmost live leaf %d has non-Invalid btpo_prev=%d", blk, op.Prev)
+		}
+		if i == len(live)-1 && op.Next != storage.InvalidBlockNumber {
+			t.Fatalf("rightmost live leaf %d has non-Invalid btpo_next=%d", blk, op.Next)
+		}
+		// Bidirectional consistency with the next live leaf.
+		if i < len(live)-1 {
+			if op.Next != live[i+1] {
+				t.Fatalf("leaf %d btpo_next=%d but next live leaf is %d", blk, op.Next, live[i+1])
+			}
+			if rp := vacOpaque(t, tree, live[i+1]).Prev; rp != blk {
+				t.Fatalf("leaf %d btpo_prev=%d but its left live neighbour is %d", live[i+1], rp, blk)
+			}
+		}
+	}
+
+	// Surviving entry count must be exact, and a full scan must not error.
+	want := n - len(deadTIDs)
+	var count int
+	if err := tree.RangeScan(nil, nil, func(_ []byte, _ storage.ItemPointer) (bool, error) {
+		count++
+		return true, nil
+	}); err != nil {
+		t.Fatalf("RangeScan after adjacent-run vacuum: %v", err)
+	}
+	if count != want {
+		t.Fatalf("expected %d surviving entries, got %d", want, count)
+	}
+}

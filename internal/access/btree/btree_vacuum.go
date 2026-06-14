@@ -15,7 +15,7 @@ func tidKey(tid storage.ItemPointer) uint64 {
 // emptyLeafInfo records state needed to unlink and delete an empty leaf.
 type emptyLeafInfo struct {
 	blk      storage.BlockNumber
-	firstKey []byte             // key saved before leaf was emptied (for parent descent)
+	firstKey []byte              // key saved before leaf was emptied (for parent descent)
 	prev     storage.BlockNumber // Prev from opaque
 	next     storage.BlockNumber // Next from opaque
 }
@@ -228,15 +228,33 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 		return err
 	}
 
+	// M0110-0010: relink the nearest *live* siblings, not the
+	// captured neighbours. When an adjacent run of leaves is
+	// deleted in one pass, leaf.prev/leaf.next may themselves be
+	// deleted-in-this-pass blocks; trusting them leaves a
+	// survivor's btpo_prev/btpo_next pointing at a deleted block.
+	// Walk past any deleted/half-dead page (their original links
+	// remain navigable — recycleBlock does not wipe the page) to
+	// the live page just outside the run. Order-independent, so it
+	// is correct for both the in-pass batch and CompleteDeferredDeletions.
+	leftLive, err := bt.liveSibling(leaf.prev, false)
+	if err != nil {
+		return err
+	}
+	rightLive, err := bt.liveSibling(leaf.next, true)
+	if err != nil {
+		return err
+	}
+
 	req := storage.BtreeUnlinkPageRequest{
 		LeafBlk:          leaf.blk,
 		LeafFlagsAfter:   leafFlagsAfter,
-		HasLeftSib:       leaf.prev != storage.InvalidBlockNumber,
-		LeftSibBlk:       leaf.prev,
-		LeftSibNewNext:   leaf.next,
-		HasRightSib:      leaf.next != storage.InvalidBlockNumber,
-		RightSibBlk:      leaf.next,
-		RightSibNewPrev:  leaf.prev,
+		HasLeftSib:       leftLive != storage.InvalidBlockNumber,
+		LeftSibBlk:       leftLive,
+		LeftSibNewNext:   rightLive,
+		HasRightSib:      rightLive != storage.InvalidBlockNumber,
+		RightSibBlk:      rightLive,
+		RightSibNewPrev:  leftLive,
 		HasParent:        hasParent,
 		ParentBlk:        parentBlk,
 		ParentRemoveSlot: parentSlot,
@@ -287,6 +305,47 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// be reused by future allocations on this tree.
 	bt.recycleBlock(leaf.blk)
 	return nil
+}
+
+// liveSibling walks the leaf sibling chain starting from `start`,
+// skipping any page that is itself BTDeleted or BTHalfDead (i.e.
+// a leaf being unlinked in the same vacuum pass), and returns the
+// nearest LIVE leaf block. `forward` true walks via btpo_next
+// (rightward), false via btpo_prev (leftward). Returns
+// InvalidBlockNumber when the chain end is reached without finding
+// a live page (the run extends to the edge of the level).
+//
+// M0110-0010: deleted/half-dead pages retain their original
+// btpo_prev/btpo_next (recycleBlock does not wipe the page), so the
+// chain through them stays navigable until the block is reused.
+// PHASE 1 of VacuumIndexPages stamps BTDeleted|BTHalfDead on every
+// target leaf BEFORE any unlink runs, so this walk recognises the
+// whole adjacent run from the very first unlink — making the result
+// independent of the order the run's leaves are processed in.
+func (bt *BTree) liveSibling(start storage.BlockNumber, forward bool) (storage.BlockNumber, error) {
+	cur := start
+	for steps := 0; cur != storage.InvalidBlockNumber; steps++ {
+		s, err := bt.pinR(cur)
+		if err != nil {
+			return storage.InvalidBlockNumber, err
+		}
+		op := readOpaque(s.Page())
+		bt.unpinR(s)
+		if !op.IsDeleted() && !op.IsHalfDead() {
+			return cur, nil // nearest live page
+		}
+		if forward {
+			cur = op.Next
+		} else {
+			cur = op.Prev
+		}
+		// Guard against a malformed/cyclic chain of dead pages.
+		if steps > 1<<24 {
+			return storage.InvalidBlockNumber, fmt.Errorf(
+				"btree: sibling chain walk exceeded bound from block %d", start)
+		}
+	}
+	return storage.InvalidBlockNumber, nil
 }
 
 // resolveParentDownlink finds the parent of `leaf` and the
@@ -456,16 +515,29 @@ func (bt *BTree) applyParentDownlinkRemoval(parentBlk storage.BlockNumber, remov
 // kept as the fallback when LogBtreeUnlinkPage is unwired
 // (test harnesses). (M0079-0003.)
 func (bt *BTree) unlinkEmptyLeafFPI(leaf emptyLeafInfo) error {
+	// M0110-0010: relink the nearest *live* siblings (see the
+	// sibling-path twin unlinkEmptyLeaf for the rationale) so an
+	// adjacent deleted run never leaves a survivor pointing at a
+	// deleted block.
+	leftLive, err := bt.liveSibling(leaf.prev, false)
+	if err != nil {
+		return err
+	}
+	rightLive, err := bt.liveSibling(leaf.next, true)
+	if err != nil {
+		return err
+	}
+
 	// Update left sibling's Next.
-	if leaf.prev != storage.InvalidBlockNumber {
-		s, err := bt.pinW(leaf.prev)
+	if leftLive != storage.InvalidBlockNumber {
+		s, err := bt.pinW(leftLive)
 		if err != nil {
 			return err
 		}
 		op := readOpaque(s.Page())
-		op.Next = leaf.next
+		op.Next = rightLive
 		writeOpaque(s.Page(), op)
-		err = bt.markDirtyWithPageRecord(s, leaf.prev)
+		err = bt.markDirtyWithPageRecord(s, leftLive)
 		bt.unpinW(s)
 		if err != nil {
 			return err
@@ -473,15 +545,15 @@ func (bt *BTree) unlinkEmptyLeafFPI(leaf emptyLeafInfo) error {
 	}
 
 	// Update right sibling's Prev.
-	if leaf.next != storage.InvalidBlockNumber {
-		s, err := bt.pinW(leaf.next)
+	if rightLive != storage.InvalidBlockNumber {
+		s, err := bt.pinW(rightLive)
 		if err != nil {
 			return err
 		}
 		op := readOpaque(s.Page())
-		op.Prev = leaf.prev
+		op.Prev = leftLive
 		writeOpaque(s.Page(), op)
-		err = bt.markDirtyWithPageRecord(s, leaf.next)
+		err = bt.markDirtyWithPageRecord(s, rightLive)
 		bt.unpinW(s)
 		if err != nil {
 			return err

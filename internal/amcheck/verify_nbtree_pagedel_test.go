@@ -1,7 +1,6 @@
 package amcheck_test
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -239,32 +238,24 @@ func TestVerifyBtreeEngineSilentAfterMultiLeafDeletion(t *testing.T) {
 	}
 }
 
-// TestVerifyBtreeEngineDetectsStaleSiblingLinkAfterAdjacentLeafDeletion is a
-// DETECTION test (mirroring the original shuffled-tree test before M0110-0007):
-// the real-producer harness uncovered that VacuumIndexPages mishandles the
-// deletion of ADJACENT empty leaves in a single pass.
+// TestVerifyBtreeEngineSilentAfterAdjacentLeafDeletion empties a contiguous run
+// of ADJACENT interior leaves in a single VacuumIndexPages pass and asserts the
+// engine — including the cross-page sibling-link walk — stays SILENT.
 //
-// unlinkEmptyLeaf relinks neighbours from pointers captured at PHASE-1 scan time
-// (emptyLeafInfo.prev/next), BEFORE any leaf is unlinked. When a neighbour is
-// itself one of the leaves being deleted in the same pass, those captured
-// pointers go stale: for an adjacent run L0->L1->L2->L3->L4 with L1,L2,L3 all
-// emptied, unlink(L1) sets L0.next=L2, unlink(L2) sets L3.prev=L1 / L1.next=L3,
-// unlink(L3) sets L2.next=L4 / L4.prev=L2 — so the surviving left edge L0.next
-// ends up pointing at the DELETED block L2, and L4.prev at the DELETED block L2.
-// The leaf sibling chain is left structurally broken; the engine's sibling-link
-// tier correctly flags "downlink or sibling link points to deleted block".
+// This was originally a DETECTION test: the real-producer harness uncovered that
+// VacuumIndexPages mishandled adjacent-run deletion. unlinkEmptyLeaf relinked
+// neighbours from pointers captured at PHASE-1 scan time (emptyLeafInfo.prev/next)
+// BEFORE any leaf was unlinked, so for an adjacent run L0->L1->L2->L3->L4 with
+// L1,L2,L3 emptied the surviving edges L0.next and L4.prev ended up pointing at a
+// block deleted in the same pass — a structurally broken leaf sibling chain that
+// the sibling-link tier (correctly) flagged "points to deleted block".
 //
-// btpo_prev/btpo_next are load-bearing (backward scans + future page-deletion
-// relinking read them), and an adjacent dead-tuple run is the common case for a
-// range DELETE + VACUUM, so this is a genuine on-disk correctness gap. Upstream
-// avoids it: _bt_unlink_halfdead_page re-reads the CURRENT left/right siblings at
-// unlink time and defers when a sibling is itself half-dead, rather than trusting
-// pointers captured earlier in the pass.
-//
-// Tracked for fix as M0110-0010 (B-tree vacuum: relink the live siblings when
-// deleting adjacent empty leaves). When that lands, this test must FLIP to a
-// silence assertion exactly like TestVerifyBtreeEngineSilentAfterMultiLeafDeletion.
-func TestVerifyBtreeEngineDetectsStaleSiblingLinkAfterAdjacentLeafDeletion(t *testing.T) {
+// Fixed in M0110-0010 (commit on this branch): unlinkEmptyLeaf / unlinkEmptyLeafFPI
+// now walk past any deleted/half-dead page to relink the nearest LIVE left/right
+// sibling (mirroring upstream _bt_unlink_halfdead_page). This test was flipped
+// from a detection assertion to the silence assertion below — it is the DoD for
+// M0110-0010 and guards against regression of the relink logic.
+func TestVerifyBtreeEngineSilentAfterAdjacentLeafDeletion(t *testing.T) {
 	const n = 3000
 	keys := make([][]byte, n)
 	for i := range n {
@@ -293,25 +284,14 @@ func TestVerifyBtreeEngineDetectsStaleSiblingLinkAfterAdjacentLeafDeletion(t *te
 		assertLeafDeleted(t, src, blk)
 	}
 
-	// Every NON-sibling tier remains clean (the survivors' contents, the parent
-	// downlinks, and the heapallindexed round-trip are unaffected — only the
-	// inter-leaf links are corrupt). CollectBtreeLeafEntries tolerates the broken
-	// chain by skipping deleted pages, so the survivor count is still exact.
+	// Every tier — including the cross-page sibling-link walk — must be silent
+	// over the post-deletion tree now that adjacent-run relinking is correct.
 	want := n - len(deadTIDs)
-	lms := assertNonSiblingTiersSilent(t, mgr, pool, rel, want)
-
-	// The sibling-link tier MUST fire, naming a deleted block — the bug signature.
-	found := false
-	for _, lm := range lms {
-		for _, r := range amcheck.VerifyBtreeLevelSiblingLinks(src, lm, "ix_real") {
-			if strings.Contains(r.Msg, "deleted block") {
-				found = true
-			}
+	for _, lm := range assertNonSiblingTiersSilent(t, mgr, pool, rel, want) {
+		if r := amcheck.VerifyBtreeLevelSiblingLinks(src, lm, "ix_real"); r != nil {
+			t.Fatalf("VerifyBtreeLevelSiblingLinks(leftmost %d) false positive after "+
+				"adjacent-leaf deletion — a survivor's btpo_prev/btpo_next was left "+
+				"pointing at a deleted block (M0110-0010 regression): %+v", lm, r)
 		}
-	}
-	if !found {
-		t.Fatalf("expected the sibling-link tier to flag a deleted-block reference after " +
-			"adjacent-leaf deletion (the known VacuumIndexPages stale-relink bug); got none " +
-			"— if VacuumIndexPages was fixed (M0110-0010), flip this test to a silence assertion")
 	}
 }
