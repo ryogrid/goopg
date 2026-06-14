@@ -1086,6 +1086,48 @@ func PageItemKeys(p storage.Page) ([][]byte, error) {
 	return out, nil
 }
 
+// Downlink is one (separator key, child block) entry on an internal B-tree
+// page: the key routes a search to the child block it precedes. By v0
+// convention the leftmost item's key is empty (negative infinity), so its
+// child is the subtree that holds everything below the next separator.
+type Downlink struct {
+	Key   []byte
+	Child storage.BlockNumber
+}
+
+// PageDownlinks returns the (separator key, child block) downlink entries of an
+// internal B-tree page, in physical slot order (slot 1..N). Internal pages never
+// carry posting-list items (those are leaf-only, M0047-0003), so each line
+// pointer decodes to exactly one downlink whose pointer Block is the child page.
+// It returns an error if any line pointer cannot be decoded, so a structurally
+// damaged internal page surfaces to the caller rather than yielding misleading
+// downlinks.
+//
+// Exported, like PageItemKeys, so amcheck's cross-level checker
+// (internal/amcheck.VerifyBtreeParentDownlinks) follows each parent downlink to
+// its child through the canonical on-disk reader here instead of re-deriving the
+// inline (keyLen, child-block) item layout — the same single-source-of-truth
+// discipline that guards against the v3->v4 layout drift.
+func PageDownlinks(p storage.Page) ([]Downlink, error) {
+	count, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Downlink, 0, count)
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(p, slot)
+		if err != nil {
+			return nil, err
+		}
+		it, perr := parseItem(raw)
+		if perr != nil {
+			return nil, perr
+		}
+		out = append(out, Downlink{Key: it.key, Child: it.ptr.Block})
+	}
+	return out, nil
+}
+
 // findChildBlock returns the block number of the child to descend into
 // for `key` from the items on an internal page. Items are sorted by key;
 // the entry to descend into is the rightmost item whose key ≤ search

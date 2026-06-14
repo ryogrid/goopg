@@ -1128,6 +1128,39 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         downlink-to-child / cross-level descent tiers (`bt_index_parent_check`,
         need parent+child pivot-key comparison across levels), and the SQL surface
         (still blocked on a clean tree).
+      - **PROGRESS 2026-06-14 (loop #59):** added the **cross-level** B-tree tier,
+        `VerifyBtreeParentDownlinks` (new code in `verify_nbtree.go`), porting
+        `bt_child_check`'s per-downlink checks (`verify_nbtree.c:2393-2543`):
+        given an internal parent it follows every downlink to its child and
+        enforces (1) **downlink-to-deleted** (`downlink to deleted page found in
+        index "%s"`, :2494), (2) **child level one down** (`downlink points to
+        block in index "%s" whose level is not one level down`, :2655), and (3)
+        the **down-link lower-bound invariant** (`down-link lower bound invariant
+        violated for index "%s"`, :2535 — `invariant_l_nontarget_offset` loop).
+        Reuses the loop-#58 `PageSource` seam; a new exported
+        `btree.PageDownlinks` decodes an internal page's `(separator key, child
+        block)` entries through the canonical reader (single source of truth,
+        like `PageItemKeys`). Two goopg-faithful divergences keep it false-
+        positive-free: (a) the bound is **inclusive** (`CompareKeys(childKey,
+        K_i) >= 0`) because `findChildBlock` routes to the rightmost item `<=`
+        key so a child covers `[K_i, K_{i+1})` — upstream's strict heapkeyspace
+        `<` would misfire on separators equal to the child's first key; (b) the
+        internal child's empty negative-infinity item (item 0 only) is skipped,
+        exactly as `offset_is_negative_infinity`. Returns 0/1 findings; leaf or
+        deleted parent and the metapage have no downlinks → nil; read errors
+        become damaged-page findings, never panics. 10 new amcheck tests
+        (`makeInternalPage` + `btDownlinkRaw` helpers): clean two-downlink parent,
+        leaf-child below separator, downlink-to-deleted, child-level-not-one-down,
+        neg-inf-child-item-skipped (clean), internal-child real-key-below-bound,
+        leaf parent (nil), metapage (nil), damaged parent, dangling child.
+        `go test ./internal/amcheck ./internal/access/btree` PASS; gofmt/vet
+        clean; zero contaminated files touched (all in `verify_nbtree.go` +
+        `_test.go` + one additive `btree.go` accessor). Design doc `0110-0005`
+        extended ("B-tree cross-level downlink tier"); README index updated.
+        STILL DEFERRED: only `heapallindexed` (needs a heap scan + index
+        `TupleDesc`) and the SQL surface (`CREATE EXTENSION amcheck` +
+        `verify_heapam`/`bt_index_check` SRF, the AC-002-promoting slice, still
+        blocked on a clean tree).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

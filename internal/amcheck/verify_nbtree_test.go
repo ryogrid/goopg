@@ -582,3 +582,194 @@ func TestVerifyBtreeSiblingLinks_SinglePageLevel(t *testing.T) {
 		t.Fatalf("single-page level reported %d, want 0: %+v", len(rs), rs)
 	}
 }
+
+// --- Cross-level downlink tier (VerifyBtreeParentDownlinks) ------------------
+
+// btDownlinkRaw marshals an internal-page line pointer in parseItem's on-disk
+// layout (keyLen(2) | child-block(4) | offset(2) | key), setting the downlink's
+// child block — the field btItemRaw leaves zero.
+func btDownlinkRaw(key []byte, child storage.BlockNumber) []byte {
+	raw := make([]byte, 8+len(key))
+	binary.LittleEndian.PutUint16(raw[0:2], uint16(len(key)))
+	binary.LittleEndian.PutUint32(raw[2:6], uint32(child))
+	copy(raw[8:], key)
+	return raw
+}
+
+// dl is a (separator key, child block) downlink for makeInternalPage.
+type dl struct {
+	key   []byte
+	child storage.BlockNumber
+}
+
+// makeInternalPage builds an internal B-tree page carrying (key, child)
+// downlinks in slot order, with the given level and next-sibling link. By v0
+// convention the leftmost downlink's key should be empty (negative infinity);
+// callers pass that explicitly. Self-checks the decoded downlinks through
+// btree.PageDownlinks so a layout change fails loudly here.
+func makeInternalPage(t *testing.T, level uint32, next storage.BlockNumber, downlinks ...dl) storage.Page {
+	t.Helper()
+	p := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(p); err != nil {
+		t.Fatalf("InitPage: %v", err)
+	}
+	h := storage.MustHeader(p)
+	h.SetSpecial(uint16(btSpecial()))
+	h.SetUpper(uint16(btSpecial()))
+	for i, d := range downlinks {
+		if _, err := storage.PageAddItemRaw(p, btDownlinkRaw(d.key, d.child)); err != nil {
+			t.Fatalf("PageAddItemRaw[%d]: %v", i, err)
+		}
+	}
+	off := btSpecial()
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(next)) // Next
+	binary.LittleEndian.PutUint32(p[off+8:off+12], level)       // Level
+	// Flags = 0 → internal (not leaf), not deleted.
+	got, err := btree.PageDownlinks(p)
+	if err != nil {
+		t.Fatalf("makeInternalPage PageDownlinks self-check: %v", err)
+	}
+	if len(got) != len(downlinks) {
+		t.Fatalf("makeInternalPage self-check: got %d downlinks, want %d", len(got), len(downlinks))
+	}
+	for i, d := range downlinks {
+		if got[i].Child != d.child || !bytes.Equal(got[i].Key, d.key) {
+			t.Fatalf("makeInternalPage self-check slot %d: got {key=%x child=%d}, want {key=%x child=%d}",
+				i, got[i].Key, got[i].Child, d.key, d.child)
+		}
+	}
+	op := btree.ParseOpaque(p)
+	if op.IsLeaf() || op.IsDeleted() || op.Level != level || op.Next != next {
+		t.Fatalf("makeInternalPage opaque self-check: got %+v, want internal level=%d next=%d", op, level, next)
+	}
+	return p
+}
+
+// A clean internal parent (level 1) with two downlinks: a negative-infinity
+// child (block 2, keys all >= empty) and a separator-keyed child (block 3, keys
+// all >= k(5)). No findings.
+func TestVerifyBtreeParentDownlinks_Clean(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeInternalPage(t, 1, none, dl{nil, 2}, dl{k(5), 3}),
+		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
+		3: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(5), k(7)),
+	}
+	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix"); len(rs) != 0 {
+		t.Fatalf("clean parent reported %d, want 0: %+v", len(rs), rs)
+	}
+}
+
+// A child key below the parent's separator violates the down-link lower bound.
+func TestVerifyBtreeParentDownlinks_LowerBoundViolation(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeInternalPage(t, 1, none, dl{nil, 2}, dl{k(5), 3}),
+		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
+		3: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(4), k(7)), // k(4) < k(5)
+	}
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix")
+	want := `down-link lower bound invariant violated for index "ix"`
+	if len(rs) != 1 || rs[0].Msg != want {
+		t.Fatalf("lower-bound case = %+v, want single %q", rs, want)
+	}
+	if rs[0].Block != 3 {
+		t.Fatalf("block = %d, want child 3", rs[0].Block)
+	}
+}
+
+// A downlink to a deleted child is corruption (readonly mode).
+func TestVerifyBtreeParentDownlinks_DownlinkToDeleted(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeInternalPage(t, 1, none, dl{nil, 2}, dl{k(5), 3}),
+		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
+		3: makeItemsPage(t, btree.BTLeaf|btree.BTDeleted, 0, none, nil),
+	}
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix")
+	want := `downlink to deleted page found in index "ix"`
+	if len(rs) != 1 || rs[0].Msg != want {
+		t.Fatalf("deleted-child case = %+v, want single %q", rs, want)
+	}
+	if rs[0].Block != 3 {
+		t.Fatalf("block = %d, want child 3", rs[0].Block)
+	}
+}
+
+// A child whose level is not exactly one below the parent's is flagged before
+// the lower-bound loop.
+func TestVerifyBtreeParentDownlinks_ChildLevelNotOneDown(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeInternalPage(t, 1, none, dl{nil, 2}, dl{k(5), 3}),
+		2: makeItemsPage(t, btree.BTLeaf, 0, 3, k(5), k(1), k(3)),
+		3: makeItemsPage(t, btree.BTLeaf, 2, none, nil, k(5)), // level 2, expected 0
+	}
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix")
+	want := `downlink points to block in index "ix" whose level is not one level down`
+	if len(rs) != 1 || rs[0].Msg != want {
+		t.Fatalf("level case = %+v, want single %q", rs, want)
+	}
+}
+
+// The child's own negative-infinity item (the first item of an INTERNAL child,
+// stored with the empty key) is below the parent separator but must be skipped,
+// so an otherwise-clean internal child yields no finding.
+func TestVerifyBtreeParentDownlinks_NegInfChildItemSkipped(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeInternalPage(t, 2, none, dl{k(5), 3}),
+		// Internal child at level 1: leftmost neg-inf (empty) downlink, then
+		// real separators k(6), k(8) — all real keys >= the parent's k(5).
+		3: makeInternalPage(t, 1, none, dl{nil, 10}, dl{k(6), 11}, dl{k(8), 12}),
+	}
+	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix"); len(rs) != 0 {
+		t.Fatalf("internal child with neg-inf item reported %d, want 0: %+v", len(rs), rs)
+	}
+}
+
+// A real (non-neg-inf) key below the parent separator on an internal child still
+// trips the lower bound — the skip is only for the first item.
+func TestVerifyBtreeParentDownlinks_InternalChildRealKeyBelowBound(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeInternalPage(t, 2, none, dl{k(5), 3}),
+		3: makeInternalPage(t, 1, none, dl{nil, 10}, dl{k(4), 11}), // k(4) < k(5)
+	}
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix")
+	want := `down-link lower bound invariant violated for index "ix"`
+	if len(rs) != 1 || rs[0].Msg != want {
+		t.Fatalf("internal-child real-key case = %+v, want single %q", rs, want)
+	}
+}
+
+// A leaf parentBlk has no downlinks to descend; nil.
+func TestVerifyBtreeParentDownlinks_LeafParentNoFindings(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeItemsPage(t, btree.BTLeaf, 0, none, nil, k(1), k(2)),
+	}
+	if rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix"); rs != nil {
+		t.Fatalf("leaf parent reported %+v, want nil", rs)
+	}
+}
+
+// The metapage carries no downlinks; nil (no read attempted).
+func TestVerifyBtreeParentDownlinks_MetaPageNil(t *testing.T) {
+	if rs := VerifyBtreeParentDownlinks(mapSource(nil), btree.MetaBlock, "ix"); rs != nil {
+		t.Fatalf("metapage reported %+v, want nil", rs)
+	}
+}
+
+// An unreadable parent surfaces as a damaged-page finding, not a panic.
+func TestVerifyBtreeParentDownlinks_DamagedParent(t *testing.T) {
+	rs := VerifyBtreeParentDownlinks(mapSource(nil), 7, "ix")
+	if len(rs) != 1 || !strings.Contains(rs[0].Msg, "has a damaged page at block 7") {
+		t.Fatalf("damaged parent = %+v, want single damaged-page finding", rs)
+	}
+}
+
+// An unreadable child (dangling downlink) surfaces as a damaged-page finding for
+// the child block, not a panic.
+func TestVerifyBtreeParentDownlinks_DanglingChild(t *testing.T) {
+	pages := map[storage.BlockNumber]storage.Page{
+		1: makeInternalPage(t, 1, none, dl{nil, 99}), // child 99 absent
+	}
+	rs := VerifyBtreeParentDownlinks(mapSource(pages), 1, "ix")
+	if len(rs) != 1 || !strings.Contains(rs[0].Msg, "has a damaged page at block 99") {
+		t.Fatalf("dangling child = %+v, want single damaged-page finding for block 99", rs)
+	}
+}

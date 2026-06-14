@@ -44,10 +44,12 @@
 // the left-link/right-link agreement, per-level uniformity, and circular-chain
 // checks that a horizontal walk of one level performs (verify_nbtree.c's
 // bt_check_level_from_leftmost loop) — is ported in VerifyBtreeLevelSiblingLinks.
-// The remaining clog/downlink-dependent tiers (downlink-to-child agreement and
-// cross-level descent via bt_index_parent_check, which need the child page's
-// pivot keys compared against the parent downlink) are deferred; see the design
-// doc.
+// The cross-level descent tier — the per-downlink child checks that
+// bt_index_parent_check performs (verify_nbtree.c's bt_child_check: child not
+// deleted, child level one down, and the parent's separator key as a lower bound
+// on every child key) — is ported in VerifyBtreeParentDownlinks. The remaining
+// clog-dependent tier (heapallindexed / bloom-filter fingerprinting, which needs
+// a heap scan and the index TupleDesc) is deferred; see the design doc.
 package amcheck
 
 import (
@@ -328,6 +330,128 @@ func VerifyBtreeLevelSiblingLinks(src PageSource, leftmost storage.BlockNumber, 
 
 		leftcurrent = current
 		current = opaque.Next
+	}
+	return nil
+}
+
+// VerifyBtreeParentDownlinks ports the cross-level (parent->child) checks that
+// upstream amcheck's bt_index_parent_check applies to every downlink of an
+// internal page, in bt_child_check (verify_nbtree.c:2393-2543). parentBlk must
+// be an internal page; for each of its downlink entries (separator key K_i,
+// child block C_i) the child page is read through src and three invariants —
+// none of which need clog, the index TupleDesc, or sibling traversal — are
+// checked:
+//
+//   - Downlink-to-deleted. A fully deleted page is unlinked and cannot be a
+//     legitimate downlink target in readonly mode. Violation message:
+//     `downlink to deleted page found in index "%s"` (verify_nbtree.c:2494).
+//
+//   - Child level one down. An internal parent at btpo_level L must only point
+//     to children at level L-1 (upstream checks this while combining the
+//     downlink visit with bt_child_highkey_check's connectivity test). Violation
+//     message: `downlink points to block in index "%s" whose level is not one
+//     level down` (verify_nbtree.c:2655, errmsg_internal).
+//
+//   - Down-link lower bound invariant. The parent's separator key K_i must be a
+//     lower bound on every key in child C_i (bt_child_check's
+//     invariant_l_nontarget_offset loop, verify_nbtree.c:2500-2540). Violation
+//     message: `down-link lower bound invariant violated for index "%s"`
+//     (verify_nbtree.c:2535).
+//
+// goopg / upstream divergences that make this port faithful:
+//
+//   - Inclusive vs strict lower bound. Upstream (heapkeyspace) requires the
+//     downlink key strictly less than every non-negative-infinity child key,
+//     because nbtree suffix-truncates separators and tie-breaks on heap TID.
+//     goopg routes a search to the rightmost internal item whose key <= the
+//     search key (findChildBlock), so child C_i covers the half-open range
+//     [K_i, K_{i+1}); K_i is therefore an INCLUSIVE lower bound and the faithful
+//     goopg test is CompareKeys(childKey, K_i) >= 0. Using upstream's strict
+//     test here would raise false positives on every separator that equals its
+//     child's first key.
+//
+//   - Negative-infinity skip. Upstream skips the child's negative-infinity item
+//     (offset_is_negative_infinity: the first data item of an internal page).
+//     goopg stores that item with the empty key (findChildBlock's leftmost
+//     convention); an empty key sorts below any real K_i and would falsely trip
+//     the lower-bound test, so the first item of an internal child is skipped,
+//     exactly as upstream. A leaf child has no negative-infinity item and all of
+//     its keys are checked.
+//
+//   - P_NONE / block reads. A child read error (out of range, short read)
+//     surfaces as a damaged-page finding, never a Go panic, matching the
+//     report-and-continue model of the other tiers.
+//
+// Like the other tiers it returns 0 or 1 findings: upstream ereport(ERROR)s on
+// the first violation, so the first downlink problem the scan reaches is
+// conclusive. A leaf or deleted parentBlk (no downlinks to descend) and the
+// metapage yield nil. It performs only the cross-level checks; per-page
+// structure and key order are run separately and composed by the SQL surface.
+func VerifyBtreeParentDownlinks(src PageSource, parentBlk storage.BlockNumber, indexName string) []BtreeReport {
+	if parentBlk == btree.MetaBlock {
+		return nil
+	}
+
+	parent, err := src(parentBlk)
+	if err != nil {
+		return []BtreeReport{{Block: parentBlk, Msg: fmt.Sprintf(
+			"index \"%s\" has a damaged page at block %d: %v", indexName, parentBlk, err)}}
+	}
+	popaque := btree.ParseOpaque(parent)
+
+	// Only internal, live pages have downlinks to descend. A leaf or deleted
+	// page yields nil (upstream descends from internal target pages only).
+	if popaque.IsLeaf() || popaque.IsDeleted() {
+		return nil
+	}
+
+	downlinks, err := btree.PageDownlinks(parent)
+	if err != nil {
+		return []BtreeReport{{Block: parentBlk, Msg: fmt.Sprintf(
+			"index \"%s\" has a damaged page at block %d: %v", indexName, parentBlk, err)}}
+	}
+
+	for _, dl := range downlinks {
+		child, err := src(dl.Child)
+		if err != nil {
+			return []BtreeReport{{Block: dl.Child, Msg: fmt.Sprintf(
+				"index \"%s\" has a damaged page at block %d: %v", indexName, dl.Child, err)}}
+		}
+		copaque := btree.ParseOpaque(child)
+
+		// Downlink-to-deleted: a deleted page is unlinked and must not be a
+		// downlink target.
+		if copaque.IsDeleted() {
+			return []BtreeReport{{Block: dl.Child, Msg: fmt.Sprintf(
+				"downlink to deleted page found in index \"%s\"", indexName)}}
+		}
+
+		// Child level must be exactly one below the parent's.
+		if copaque.Level != popaque.Level-1 {
+			return []BtreeReport{{Block: dl.Child, Msg: fmt.Sprintf(
+				"downlink points to block in index \"%s\" whose level is not one level down", indexName)}}
+		}
+
+		// Down-link lower bound: every real child key must be >= the parent's
+		// separator key for this child. Skip the child's negative-infinity item
+		// (the first item of an internal child, stored with the empty key).
+		keys, err := btree.PageItemKeys(child)
+		if err != nil {
+			return []BtreeReport{{Block: dl.Child, Msg: fmt.Sprintf(
+				"index \"%s\" has a damaged page at block %d: %v", indexName, dl.Child, err)}}
+		}
+		childLeaf := copaque.IsLeaf()
+		for i, k := range keys {
+			if !childLeaf && i == 0 {
+				// Negative-infinity downlink on an internal child — no lower
+				// bound applies (offset_is_negative_infinity).
+				continue
+			}
+			if btree.CompareKeys(k, dl.Key) < 0 {
+				return []BtreeReport{{Block: dl.Child, Msg: fmt.Sprintf(
+					"down-link lower bound invariant violated for index \"%s\"", indexName)}}
+			}
+		}
 	}
 	return nil
 }

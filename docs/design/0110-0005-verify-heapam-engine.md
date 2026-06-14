@@ -4,7 +4,8 @@ Status: accepted (partial)
 Milestone: M0110-0003
 Date: 2026-06-14 (extended 2026-06-14, loop #52: infomask-only header invariants;
 loop #55: B-tree index verification (`verify_nbtree`) page-structural tier;
-loop #58: B-tree cross-page sibling-link tier)
+loop #58: B-tree cross-page sibling-link tier;
+loop #59: B-tree cross-level downlink tier (`bt_child_check`))
 
 > Scope note: this doc now covers both amcheck verify engines in
 > `internal/amcheck` — the heap-page checker (`verify_heapam.go`, the bulk of
@@ -498,14 +499,6 @@ matching the per-page tiers' report-and-continue model.
   structure and key order are run by the per-page tiers and composed by the SQL
   surface.
 
-### Deferred (still need more than sibling state)
-
-The remaining `bt_index_check` tiers — downlink-to-child agreement and
-cross-level descent via `bt_index_parent_check` — compare a child page's pivot
-keys against the parent downlink, so they need both the parent and child pages
-plus the key comparator across levels. They are deferred to a dedicated loop
-(and ultimately the SQL surface, which supplies the catalog/regclass lookup).
-
 ### Testing (sibling-link tier)
 
 `verify_nbtree_test.go` gains a `makeLinkedPage` builder (explicit `prev`/`next`
@@ -516,11 +509,79 @@ leftmost-prev exemption; a level mismatch; a two-page cycle and a self-loop
 right link (→ damaged-page finding); a metapage leftmost; and the single-page
 new-tree level.
 
+## B-tree cross-level downlink tier (`VerifyBtreeParentDownlinks`)
+
+The next faithful slice descends one level: given an internal `parentBlk`, it
+follows every downlink to its child and applies the per-downlink checks of
+upstream's `bt_child_check` (verify_nbtree.c:2393-2543), reading children through
+the same `PageSource` seam as the sibling-link tier. A new exported accessor,
+`btree.PageDownlinks`, decodes an internal page's `(separator key, child block)`
+entries through the canonical on-disk reader (single source of truth, like
+`PageItemKeys`), so the engine never re-derives the inline item layout.
+
+Three invariants are checked per downlink — none needs clog, the index
+`TupleDesc`, or sibling traversal:
+
+- **Downlink-to-deleted.** A child marked `BTDeleted` is unlinked and cannot be a
+  legitimate downlink target in readonly mode →
+  `downlink to deleted page found in index "%s"` (verify_nbtree.c:2494).
+- **Child level one down.** An internal parent at `btpo_level` *L* must point
+  only to children at level *L−1* →
+  `downlink points to block in index "%s" whose level is not one level down`
+  (verify_nbtree.c:2655).
+- **Down-link lower bound.** The parent's separator key *K_i* must bound every
+  key in child *C_i* from below (`bt_child_check`'s
+  `invariant_l_nontarget_offset` loop, verify_nbtree.c:2500-2540) →
+  `down-link lower bound invariant violated for index "%s"`
+  (verify_nbtree.c:2535).
+
+**goopg / upstream divergences that keep the port false-positive-free:**
+
+- **Inclusive vs strict lower bound.** Upstream (heapkeyspace) requires the
+  downlink key *strictly* less than each non-negative-infinity child key, because
+  nbtree suffix-truncates separators and tie-breaks on heap TID. goopg routes a
+  search to the rightmost internal item whose key `<=` the search key
+  (`findChildBlock`), so child *C_i* covers the half-open range `[K_i, K_{i+1})`;
+  *K_i* is an **inclusive** lower bound and the faithful goopg test is
+  `CompareKeys(childKey, K_i) >= 0`. Upstream's strict test would misfire on
+  every separator that equals its child's first key.
+- **Negative-infinity skip.** Upstream skips the child's negative-infinity item
+  (`offset_is_negative_infinity`: the first data item of an internal page).
+  goopg stores that item with the empty key; an empty key sorts below any real
+  *K_i* and would falsely trip the bound, so the first item of an *internal*
+  child is skipped. A leaf child has no negative-infinity item and all its keys
+  are checked.
+
+Like the other tiers it returns 0 or 1 findings (upstream `ereport(ERROR)`s on
+the first violation). A leaf or deleted `parentBlk` and the metapage have no
+downlinks to descend → nil. Per-page structure (`VerifyBtreePage`) and key order
+(`VerifyBtreeItemOrder`) run separately; the SQL surface composes all four
+B-tree tiers.
+
+### Deferred (needs a heap scan / TupleDesc)
+
+The remaining `bt_index_check` tier — `heapallindexed` (bloom-filter
+fingerprinting that cross-checks the index against a fresh heap scan) — needs the
+heap relation and the index `TupleDesc`, so it is deferred to the SQL surface,
+which supplies the catalog/regclass lookup.
+
+### Testing (cross-level tier)
+
+`verify_nbtree_test.go` gains a `makeInternalPage` builder (`(key, child)`
+downlinks + `btDownlinkRaw`) reusing `mapSource`. 10 tests: a clean two-downlink
+parent; a leaf-child key below the separator (lower-bound message + child block);
+a downlink to a deleted child; a child whose level is not one down; an internal
+child whose negative-infinity item is correctly skipped; an internal child with a
+*real* key below the bound (skip applies only to item 0); a leaf parent and the
+metapage (both nil); a damaged parent; and a dangling child downlink (both →
+damaged-page finding).
+
 ## Upstream references
 
 - `postgres/contrib/amcheck/verify_nbtree.c` (`palloc_btree_page`,
-  `bt_check_level_from_leftmost`, `bt_recheck_sibling_links`) — the mirrored
-  per-page and cross-page sibling-link checks and messages.
+  `bt_check_level_from_leftmost`, `bt_recheck_sibling_links`, `bt_child_check`,
+  `invariant_l_nontarget_offset`) — the mirrored per-page, cross-page
+  sibling-link, and cross-level downlink checks and messages.
 - `postgres/contrib/amcheck/verify_heapam.c` (`verify_heapam`,
   `check_tuple_header`) — the mirrored check order and messages.
 - `postgres/src/include/access/htup_details.h` — `SizeofHeapTupleHeader` (23),
