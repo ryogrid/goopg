@@ -7,14 +7,27 @@ import (
 )
 
 // SubxactMap is an in-memory map from subxact XID to its parent XID
-// and status. It mirrors upstream's pg_subtrans SLRU but lives
-// entirely in memory for the lifetime of each top-level transaction.
+// and status. It mirrors upstream's pg_subtrans SLRU.
+//
+// By default the map lives entirely in memory (slru == nil) and parentage
+// is lost on restart — the original v0 behaviour, preserved for every
+// existing caller. When persistence is enabled via EnablePersistence (gap
+// G5), each parent link is ALSO written through to an on-disk pg_subtrans
+// SLRU mirror so it survives a restart, matching upstream subtrans.c.
+//
+// Abort status is intentionally NOT persisted here: PG's pg_subtrans only
+// stores parent TransactionIds, never abort flags — abort status stays in
+// CLOG / in-memory. See MarkAborted below.
 //
 // All operations are safe for concurrent use.
 type SubxactMap struct {
 	mu      sync.RWMutex
 	parents map[storage.TransactionID]storage.TransactionID // subxid → parent xid
 	aborted map[storage.TransactionID]bool                  // aborted subxids
+
+	// slru, when non-nil, is the persistent pg_subtrans mirror that parent
+	// links are written through to. nil = persistence disabled (default).
+	slru *SubtransSLRU
 }
 
 // NewSubxactMap constructs an empty map.
@@ -25,17 +38,59 @@ func NewSubxactMap() *SubxactMap {
 	}
 }
 
+// EnablePersistence turns on the on-disk pg_subtrans SLRU mirror for this
+// map (gap G5). After this call, every Register also writes the parent link
+// through to dir so it survives a restart. Opt-in: NewSubxactMap leaves slru
+// nil, so existing callers keep the pure in-memory behaviour unchanged.
+// Idempotent enough to call once at startup; returns an error only if the
+// SLRU directory cannot be opened/created.
+//
+// Only parent links are persisted — abort status stays in CLOG / in-memory
+// (PG's pg_subtrans stores parent TransactionIds, not abort flags).
+func (m *SubxactMap) EnablePersistence(dir string) error {
+	slru, err := OpenSubtransSLRU(dir)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.slru = slru
+	m.mu.Unlock()
+	return nil
+}
+
 // Register records that subxid is a child of parentXid. Must be called
-// when a subtransaction first writes (lazy XID allocation).
+// when a subtransaction first writes (lazy XID allocation). When persistence
+// is enabled (EnablePersistence), the parent link is also written through to
+// the on-disk pg_subtrans SLRU mirror so it survives a restart (gap G5).
 func (m *SubxactMap) Register(subxid, parentXid storage.TransactionID) {
 	m.mu.Lock()
 	m.parents[subxid] = parentXid
+	slru := m.slru
 	m.mu.Unlock()
+	// Best-effort durable mirror: a failed SLRU write must not break the
+	// in-memory registration (which is the source of truth at runtime) and
+	// must never panic. The error is dropped, consistent with this file's
+	// non-erroring method signatures; the parent link remains correct in
+	// memory for the lifetime of the process.
+	if slru != nil {
+		_ = slru.SetParent(subxid, parentXid)
+	}
 }
 
 // MarkAborted records that subxid was rolled back (ROLLBACK TO
 // SAVEPOINT). Rows inserted under subxid remain invisible even after
 // the top-level parent commits.
+//
+// Abort status is NOT mirrored to the pg_subtrans SLRU: upstream's
+// pg_subtrans only stores parent links, not abort flags — abort/commit
+// status lives in CLOG (and in-memory here). Only parent links are
+// persisted (see Register / EnablePersistence).
+//
+// TODO(G5, deferred): the SUB_COMMITTED CLOG-mirror encoding that PG uses
+// to record a subxact's commit status (TRANSACTION_STATUS_SUB_COMMITTED,
+// the 0x03 lane in pg_xact) is intentionally NOT implemented here: it would
+// require editing internal/mvcc/clog.go (owned by Foundation), so it is left
+// for a follow-up that touches the CLOG mirror.
 func (m *SubxactMap) MarkAborted(subxid storage.TransactionID) {
 	m.mu.Lock()
 	m.aborted[subxid] = true

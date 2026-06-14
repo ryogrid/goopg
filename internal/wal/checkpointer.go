@@ -124,6 +124,17 @@ type CheckpointerConfig struct {
 	// M0106-0011 follow-up (b).
 	PostCheckpointFn func() error
 
+	// TruncateCLOGFn, when non-nil, is called at the end of each successful
+	// checkpoint AFTER the checkpoint marker is durable, to truncate CLOG
+	// (pg_xact) up to the conservative oldest-safe XID (G1). Wiring truncation
+	// here makes it durable-ordered: the checkpoint that records the advanced
+	// redo point is on disk before any clog segment is removed, so a crash
+	// between the two leaves recoverable state. The callee is responsible for
+	// computing a conservative horizon (never above OldestXmin or any live
+	// snapshot's xmin) and for emitting the CLOG_TRUNCATE WAL record. Errors
+	// are logged as warnings and do not fail the checkpoint. G1.
+	TruncateCLOGFn func() error
+
 	// PGCompatCheckpoints, when true, writes an 88-byte PG18 CheckPoint
 	// struct (EncodeCheckpointCompat) so PG standbys can parse the
 	// record. When false (default), the legacy 1-byte RecordKindCheckpoint
@@ -531,6 +542,13 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	if c.cfg.PostCheckpointFn != nil {
 		if err := c.cfg.PostCheckpointFn(); err != nil {
 			c.cfg.Logger.Warn("post-checkpoint init file refresh failed", "err", err)
+		}
+	}
+	// G1: durable-ordered CLOG truncation. The checkpoint marker is now on
+	// disk, so removing clog segments below the frozen horizon is crash-safe.
+	if c.cfg.TruncateCLOGFn != nil {
+		if err := c.cfg.TruncateCLOGFn(); err != nil {
+			c.cfg.Logger.Warn("post-checkpoint clog truncation failed", "err", err)
 		}
 	}
 	// M0057-0001: log checkpoint complete so benchmark runs can see
