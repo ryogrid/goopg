@@ -1554,6 +1554,35 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         has no on-disk multixact horizon), the `heapEntries` producer (heap scan +
         index-tuple formation), and the `CREATE EXTENSION amcheck`/SRF SQL surface
         (AC-002-promoting, blocked on a clean tree).
+      - **PROGRESS 2026-06-14 (loop #25):** SQL surface STILL blocked on the same
+        foreign gen-column WIP, so I landed the **heap-side relation walk** of the
+        heapallindexed tier — the symmetric counterpart to loop #65's index-side
+        walk, completing the producer pair. New
+        `internal/amcheck/heapallindexed_heapscan.go`:
+        `CollectHeapIndexEntries(src, nblocks, form)` ports
+        `table_index_build_scan`'s heap walk (block loop + per-page `LP_NORMAL`
+        line-pointer iteration + `(block,offset)` TID formation — the
+        deterministic page-bytes part), handing each tuple's bytes+TID to an
+        injected `HeapEntryFormer` callback (upstream's `heapallindexedCallback`/
+        `bt_tuple_present_callback` — decides inclusion via visibility/HOT-root and
+        forms the entry via `index_form_tuple`; both are MVCC/clog- and
+        `TupleDesc`-coupled so they stay at the wire layer). Skips
+        unused/dead/redirect items (redirect targets reached on their own offset →
+        no double-count); surfaces read/parse/out-of-bounds/former errors rather
+        than yielding a **truncated** probe set (which would silently mask missing
+        index entries — the heapallindexed soundness invariant). 10 new tests
+        (`heapallindexed_heapscan_test.go`) incl. the sibling-path **compose**
+        guard (producer entries + matching index set → 0 reports; drop one index
+        entry → exactly the orphaned heap tuple flagged with the verbatim upstream
+        message), proving producer + `VerifyBtreeHeapAllIndexed` agree on the
+        `fingerprintLeafEntry` encoding. `go test ./internal/amcheck` PASS;
+        gofmt/vet clean; **only new files — zero contaminated files touched.**
+        Design doc `0110-0007` extended ("Heap-side relation walk"); package doc
+        updated. With both relation-walk skeletons now in the engine, the
+        heapallindexed SQL slice reduces to a thin adapter. STILL DEFERRED (resume
+        points): the catalog-coupled `HeapEntryFormer` impl (snapshot visibility +
+        `index_form_tuple`), multixact-member bounds, and the `CREATE EXTENSION
+        amcheck`/SRF SQL surface (AC-002-promoting, blocked on a clean tree).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

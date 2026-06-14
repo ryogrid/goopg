@@ -160,14 +160,60 @@ composing driver clean / missing-entry (exact upstream message + block) /
 index-walk-error-propagates. New helpers `makeLeafPage` / `btLeafRaw` /
 `makeMetaWithRoot` / `makeDeletedLeaf` self-check through the real readers.
 
+## Heap-side relation walk (loop #25)
+
+The probe phase's heap enumeration is now ported as the symmetric counterpart to
+the index-side walk, behind the same `PageSource` seam
+(`internal/amcheck/heapallindexed_heapscan.go`):
+
+- `CollectHeapIndexEntries(src PageSource, nblocks storage.BlockNumber, form HeapEntryFormer) ([]btree.LeafEntry, error)`
+  walks blocks `[0, nblocks-1]`, iterates each page's `LP_NORMAL` line pointers
+  (`unused`/`dead`/`redirect` carry no tuple body and are skipped — a redirect's
+  target is itself an `LP_NORMAL` item reached on its own offset, so following
+  redirects here would double-count), and hands each tuple's bytes + `(block,
+  offset)` TID to `form`. An empty relation and all-zero (new) pages contribute
+  nothing. A read error, unparseable page, an out-of-page line pointer, or a
+  `form` error is returned rather than yielding a **truncated** probe set — a
+  truncated set silently masks missing index entries (the entries that would have
+  been probed are simply never checked), violating the heapallindexed soundness
+  invariant, so completeness is enforced by surfacing the error.
+- `HeapEntryFormer func(tid storage.ItemPointer, tuple []byte) (entry btree.LeafEntry, include bool, err error)`
+  is upstream's per-tuple callback (`heapallindexedCallback` /
+  `bt_tuple_present_callback`) by another name: it decides whether to index the
+  tuple (`include`) and forms the entry it would produce.
+
+**Scope boundary** (mirroring where `table_index_build_scan` draws the line):
+deciding inclusion (the visibility / HOT-chain-root determination — MVCC snapshot
++ clog) and forming the entry (`index_form_tuple` — index key columns,
+expressions, collations, i.e. the `TupleDesc`) are catalog- and
+execution-context coupled, so they stay at the wire layer, injected as the single
+`HeapEntryFormer` callback. What this file ports is exactly the deterministic
+function of the heap's page bytes plus the block range: the block loop, the
+per-page `LP_NORMAL` line-pointer iteration, and the TID each tuple carries.
+
+Tests (`heapallindexed_heapscan_test.go`, 10): empty relation, new-page skip,
+multi-block `(block,offset)` ordering (with the former asserting it saw the full
+MAXALIGN'd tuple body), former-excludes, non-`LP_NORMAL`-skip (dead/redirect/
+unused), out-of-bounds line pointer (errors), former-error / read-error
+propagation, nil-arg guards, and the sibling-path **compose** guard — the
+producer's entries fed to `VerifyBtreeHeapAllIndexed` with a matching index set
+yield zero reports, and dropping one index entry flags exactly the orphaned heap
+tuple with the verbatim upstream message + block (proves producer and probe core
+agree on the `fingerprintLeafEntry` encoding).
+
+With both producers landed, the heapallindexed SQL slice reduces to a thin
+adapter: fill one `PageSource` from the index's smgr and one from the heap's,
+supply the `TupleDesc`-coupled `HeapEntryFormer`, and compose.
+
 ## Deferred (resume points)
 
-- **Heap scan + index-tuple formation** (the `heapEntries` producer). The
-  wire-later caller runs a snapshot-consistent heap scan that re-forms each live
-  heap tuple's index tuple via the index `TupleDesc` (the `index_form_tuple`
-  analog), feeding the result to `VerifyBtreeHeapAllIndexedRelation`. Needs the
-  heap relation + index `TupleDesc` — catalog coupling. (The index-side leaf walk
-  is now done — see above.)
+- **The `HeapEntryFormer` implementation** — the catalog-coupled half of the heap
+  producer. The wire-later caller supplies a snapshot-consistent visibility test
+  + an `index_form_tuple` analog that re-forms each live heap tuple's index tuple
+  via the index `TupleDesc`, then drives `CollectHeapIndexEntries` and composes
+  with `VerifyBtreeHeapAllIndexedRelation`. Needs the heap relation + index
+  `TupleDesc` — catalog coupling. (Both relation-walk skeletons — index leaf
+  enumeration and heap line-pointer iteration — are now done; see above.)
 - **SQL surface.** `CREATE EXTENSION amcheck` + `bt_index_check(index,
   heapallindexed => true)` wiring; promotes `AC-002`. Blocked on a clean tree.
 - **Hash unification** (carried from 0110-0006): substitute the shared Jenkins
