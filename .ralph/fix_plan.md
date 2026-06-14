@@ -1908,8 +1908,33 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
         `synchronous_commit=off` path). Add per-group commit-LSN tracking
         (`CLOG_XACTS_PER_LSN_GROUP`) and gate honoring a committed status / hint-bit
         setting on WAL flush position.
-      - Author `docs/design/0117-0007-clog-async-commit-lsn.md` and index it before coding.
+      - Author `docs/design/0117-0007-clog-async-commit-lsn.md` and index it before coding. (DONE — design indexed.)
       - Gate: `go test -race ./internal/mvcc/...` + recovery E2E. Effort: L.
+      - **Part A (landed):** the async-commit per-LSN-group tracking on the M0117-0006 buffer pool
+        (`internal/mvcc/clog_bufferpool.go`), composing infrastructure with nil live blast radius
+        (the pool is not yet the live store — M0117-0006 Part B deferred): `clogXactsPerLSNGroup=32`
+        / `clogLSNsPerPage=clogXactsPerPage/32=1024` + `lsnIndexInPage` (= PG `GetLSNIndex` minus the
+        `slotno*CLOG_LSNS_PER_PAGE` base, since each `clogPageSlot` owns its `groupLSN[1024]uint64`);
+        `setStatusWithLSN(xid,status,lsn)` raises `groupLSN[lsnIndexInPage]` to `max(…,lsn)`
+        (≙ `TransactionIdSetPageStatusInternal`; `setStatus` = `setStatusWithLSN(…,0)`, byte-identical
+        for LSN-free callers; `lsn==0` ≙ `InvalidXLogRecPtr` no-op); `groupLSNFor` read side
+        (≙ the `*lsn` out-param of `TransactionIdGetStatus`); an injected `flushWAL func(uint64) error`
+        barrier (nil ⇒ off, default) that `writePageToDisk`/`flushDirty` call with the page's max group
+        LSN BEFORE writing the page out (≙ `XLogFlush` in `SlruPhysicalWritePage`), to be wired to
+        `wal.Writer.FlushUpTo` when the pool goes live. `groupLSN` is in-memory only (zeroed on
+        fault-in ≙ PG never persisting it). Pinned by `internal/mvcc/clog_bufferpool_lsn_test.go`
+        (GetLSNIndex arithmetic, max-LSN monotonicity, zeroed-on-reopen vs durable status bits,
+        barrier-fires-before-write ordering for both flushDirty + eviction).
+      - **Part B (deferred):** live `synchronous_commit=off` activation — wire `flushWAL` to the live
+        WAL writer, thread the commit-record LSN from the commit path into `setStatusWithLSN`, and skip
+        the inline per-commit WAL fsync (rely on the page-write barrier). Changes the live durability
+        path ⇒ needs the full TPC-H Q12/Q13 + crash-recovery/standby E2E (SKIP under worktree
+        isolation). Defers with M0117-0006 Part B (the barrier only fires once the pool is the live
+        store). Resume point in the design doc.
+      - Gates run (Part A): `go build ./...` PASS; `go test -race ./internal/mvcc/...` PASS;
+        `go test ./internal/config/... ./internal/initdb/... ./internal/server/...` PASS;
+        `TestE2E_PhysicalReplication{,Sync}` PASS; gofmt/vet clean. TPC-H spotcheck SKIPs under worktree
+        isolation — no-op (no live CLOG path changed).
 
 - [ ] **M0117-0008**
       - Summary: Persist `datfrozenxid` in the `pg_database` catalog tuple at VACUUM

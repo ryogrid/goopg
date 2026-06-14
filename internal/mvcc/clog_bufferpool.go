@@ -22,7 +22,26 @@ const (
 	// clogMaxAllowedBuffers mirrors SLRU_MAX_ALLOWED_BUFFERS = 1 GiB / BLCKSZ
 	// (slru.h:24). The largest resident-page budget the GUC will honor.
 	clogMaxAllowedBuffers = (1024 * 1024 * 1024) / storage.BlockSize
+
+	// clogXactsPerLSNGroup mirrors PG's CLOG_XACTS_PER_LSN_GROUP (clog.c:92):
+	// the number of consecutive XIDs that share one async-commit group LSN.
+	// Must be a power of 2.
+	clogXactsPerLSNGroup = 32
+	// clogLSNsPerPage mirrors CLOG_LSNS_PER_PAGE (clog.c:93): the count of
+	// group-LSN slots per CLOG page (clogXactsPerPage / clogXactsPerLSNGroup =
+	// 32768/32 = 1024 with BLCKSZ=8192).
+	clogLSNsPerPage = clogXactsPerPage / clogXactsPerLSNGroup
 )
+
+// lsnIndexInPage returns the index of xid's async-commit group within a single
+// page's groupLSN array. It is PG's GetLSNIndex (clog.c:95-96) MINUS the
+// slotno*CLOG_LSNS_PER_PAGE base term: PG keeps one flat group_lsn array across
+// every SLRU slot, whereas each goopg clogPageSlot carries its own
+// groupLSN[clogLSNsPerPage], so the per-slot index is just the intra-page group
+// number. Same LSN for the same XID either way.
+func lsnIndexInPage(xid storage.TransactionID) int {
+	return int((uint64(xid) % clogXactsPerPage) / clogXactsPerLSNGroup)
+}
 
 // EffectiveCLOGBuffers resolves the resident-page budget (number of BLCKSZ
 // CLOG pages held in memory at once) from the transaction_buffers GUC value,
@@ -85,11 +104,12 @@ func statusFromLane(lane byte) TxnStatus {
 // 2-bit-packed SLRU representation: clogXactsPerPage XIDs at clogBitsPerXact
 // bits each). Mirrors one slot of PG's SimpleLruCtl shared buffer array.
 type clogPageSlot struct {
-	pageNo   int64  // SLRU page number = xid / clogXactsPerPage
-	data     []byte // BLCKSZ bytes; nil until first use
-	valid    bool   // false for an empty/never-faulted slot
-	dirty    bool   // page modified since last writeback
-	lastUsed uint64 // recency stamp for LRU victim selection
+	pageNo   int64    // SLRU page number = xid / clogXactsPerPage
+	data     []byte   // BLCKSZ bytes; nil until first use
+	groupLSN []uint64 // clogLSNsPerPage async-commit group LSNs; nil until first use
+	valid    bool     // false for an empty/never-faulted slot
+	dirty    bool     // page modified since last writeback
+	lastUsed uint64   // recency stamp for LRU victim selection
 }
 
 // clogBufferPool is a bounded LRU page cache over the 2-bit-packed CLOG SLRU
@@ -116,6 +136,17 @@ type clogBufferPool struct {
 	slots   []clogPageSlot
 	pageMap map[int64]int // pageNo → index into slots
 	clock   uint64        // monotonic recency counter
+
+	// flushWAL is the async-commit write barrier (≙ XLogFlush in PG's
+	// SlruPhysicalWritePage). When non-nil, it is invoked with a page's maximum
+	// group LSN immediately BEFORE that page's bytes are written back to disk,
+	// guaranteeing the commit WAL record behind every claimed commit is durable
+	// before a CLOG page reaching disk can advertise it. nil (the default, and
+	// every state where the pool is not the live store) ⇒ no barrier, so the
+	// not-yet-live pool and all unit tests are unchanged. Wired to
+	// wal.Writer.FlushUpTo by the CLog layer when the pool goes live (Part B);
+	// injection keeps the mvcc package free of a wal import.
+	flushWAL func(lsn uint64) error
 }
 
 // newCLOGBufferPool creates a pool over the segment directory dir holding at
@@ -194,6 +225,12 @@ func (p *clogBufferPool) pinPageLocked(pageNo int64) (int, error) {
 	} else {
 		idx = p.evictVictimLocked()
 		if p.slots[idx].dirty {
+			// Async-commit barrier: flush WAL up to the victim page's max group
+			// LSN before its bytes reach disk (≙ XLogFlush in
+			// SlruPhysicalWritePage).
+			if err := p.flushWALBeforeWriteLocked(p.maxGroupLSNLocked(idx)); err != nil {
+				return -1, err
+			}
 			if err := p.writePageToDisk(p.slots[idx].pageNo, p.slots[idx].data); err != nil {
 				return -1, err
 			}
@@ -205,6 +242,16 @@ func (p *clogBufferPool) pinPageLocked(pageNo int64) (int, error) {
 	s := &p.slots[idx]
 	if s.data == nil {
 		s.data = make([]byte, storage.BlockSize)
+	}
+	if s.groupLSN == nil {
+		s.groupLSN = make([]uint64, clogLSNsPerPage)
+	} else {
+		// Zero the group LSNs on every fault-in: the array is never persisted
+		// (≙ PG's shared-memory-only group_lsn), and a page read back from disk
+		// has its WAL already durable, so its group LSN is invalid (0).
+		for i := range s.groupLSN {
+			s.groupLSN[i] = 0
+		}
 	}
 	if err := p.readPageFromDisk(pageNo, s.data); err != nil {
 		s.valid = false
@@ -259,13 +306,26 @@ func (p *clogBufferPool) getStatus(xid storage.TransactionID) (TxnStatus, error)
 	return statusFromLane(lane), nil
 }
 
-// setStatus records status for xid using PG's clear-then-set lane update
-// (TransactionIdSetStatusBit: the 2-bit field is masked off and rewritten, so a
-// lane can move between any two values, unlike the legacy OR-only mirror). The
-// page is marked dirty for the next flushDirty/eviction. Returns whether the
-// stored lane actually changed (false ⇒ idempotent no-op). status must be a
-// terminal status (Committed/Aborted/SubCommitted).
+// setStatus records status for xid with no async-commit LSN association
+// (synchronous-commit semantics). Equivalent to setStatusWithLSN(xid, status, 0)
+// and kept byte-identical for the LSN-free callers and tests.
 func (p *clogBufferPool) setStatus(xid storage.TransactionID, status TxnStatus) (bool, error) {
+	return p.setStatusWithLSN(xid, status, 0)
+}
+
+// setStatusWithLSN records status for xid using PG's clear-then-set lane update
+// (TransactionIdSetStatusBit: the 2-bit field is masked off and rewritten, so a
+// lane can move between any two values, unlike the legacy OR-only mirror) and,
+// when lsn != 0, raises xid's async-commit group LSN to max(current, lsn)
+// (≙ TransactionIdSetPageStatusInternal, clog.c:702-716). lsn == 0 is goopg's
+// InvalidXLogRecPtr (the WAL writer treats position 0 as "nothing to flush"),
+// so it leaves the group array untouched — matching PG's recovery branch where
+// the supplied LSN is invalid. The page is marked dirty for the next
+// flushDirty/eviction. Returns whether the stored lane actually changed
+// (false ⇒ idempotent no-op; the group LSN is still raised if lsn is higher,
+// since a later same-group commit can legitimately raise an already-set lane's
+// barrier). status must be a terminal status (Committed/Aborted/SubCommitted).
+func (p *clogBufferPool) setStatusWithLSN(xid storage.TransactionID, status TxnStatus, lsn uint64) (bool, error) {
 	lane, ok := laneFromStatus(status)
 	if !ok {
 		return false, fmt.Errorf("clog bufpool: status %d has no storable lane", status)
@@ -281,6 +341,18 @@ func (p *clogBufferPool) setStatus(xid storage.TransactionID, status TxnStatus) 
 	if err != nil {
 		return false, err
 	}
+
+	// Raise the group LSN first so an idempotent lane (changed == false) still
+	// advances the async-commit barrier when a later same-group commit reports
+	// a higher LSN (≙ PG bumping group_lsn regardless of the prior byte value).
+	if lsn != 0 {
+		li := lsnIndexInPage(xid)
+		if p.slots[idx].groupLSN[li] < lsn {
+			p.slots[idx].groupLSN[li] = lsn
+			p.slots[idx].dirty = true
+		}
+	}
+
 	cur := (p.slots[idx].data[byteInPage] >> shift) & 0x3
 	if cur == lane {
 		return false, nil
@@ -288,6 +360,47 @@ func (p *clogBufferPool) setStatus(xid storage.TransactionID, status TxnStatus) 
 	p.slots[idx].data[byteInPage] = (p.slots[idx].data[byteInPage] &^ (0x3 << shift)) | (lane << shift)
 	p.slots[idx].dirty = true
 	return true, nil
+}
+
+// groupLSNFor returns the async-commit group LSN recorded for xid's page (≙ the
+// *lsn out-parameter of clog.c:TransactionIdGetStatus): an LSN late enough that
+// flushing WAL to it guarantees xid's commit record is durable. It may be a
+// later transaction's LSN in the same 32-XID group (never earlier), and 0 if no
+// LSN was associated (or the page faulted in fresh from disk). Faults the page
+// in if not resident.
+func (p *clogBufferPool) groupLSNFor(xid storage.TransactionID) (uint64, error) {
+	pageNo := int64(uint64(xid) / clogXactsPerPage)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	idx, err := p.pinPageLocked(pageNo)
+	if err != nil {
+		return 0, err
+	}
+	return p.slots[idx].groupLSN[lsnIndexInPage(xid)], nil
+}
+
+// maxGroupLSNLocked returns the highest async-commit group LSN over the whole
+// page held in slot idx (the value PG XLogFlushes before writing a page out).
+// Caller holds p.mu.
+func (p *clogBufferPool) maxGroupLSNLocked(idx int) uint64 {
+	var m uint64
+	for _, l := range p.slots[idx].groupLSN {
+		if l > m {
+			m = l
+		}
+	}
+	return m
+}
+
+// flushWALBeforeWriteLocked invokes the injected async-commit WAL-flush barrier
+// (if any) with lsn. A nil hook (the default, and every state where the pool is
+// not the live store) or a zero lsn is a no-op. Caller holds p.mu; the hook is
+// expected not to re-enter the pool.
+func (p *clogBufferPool) flushWALBeforeWriteLocked(lsn uint64) error {
+	if p.flushWAL == nil || lsn == 0 {
+		return nil
+	}
+	return p.flushWAL(lsn)
 }
 
 // flushDirty writes every dirty resident page back to its segment file and
@@ -299,11 +412,22 @@ func (p *clogBufferPool) flushDirty() error {
 	defer p.mu.Unlock()
 
 	bySeg := make(map[int64][]int)
+	var maxLSN uint64
 	for i := range p.slots {
 		if p.slots[i].valid && p.slots[i].dirty {
 			segNo := p.slots[i].pageNo / slruPagesPerSegment
 			bySeg[segNo] = append(bySeg[segNo], i)
+			if l := p.maxGroupLSNLocked(i); l > maxLSN {
+				maxLSN = l
+			}
 		}
+	}
+	// Async-commit barrier: flush WAL up to the highest group LSN across every
+	// dirty page before any page reaches disk (≙ XLogFlush in
+	// SlruPhysicalWritePage). Flushing the global max once is conservative —
+	// each page's own required LSN ≤ maxLSN is satisfied before its write.
+	if err := p.flushWALBeforeWriteLocked(maxLSN); err != nil {
+		return err
 	}
 	for segNo, idxs := range bySeg {
 		segPath := filepath.Join(p.dir, fmt.Sprintf("%04X", segNo))
