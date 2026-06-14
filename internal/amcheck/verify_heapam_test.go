@@ -599,3 +599,238 @@ func itoa(n int) string {
 	}
 	return string(b[i:])
 }
+
+// mapXidStatus builds an XidStatusFunc backed by a fixed map: any xid not in the
+// map resolves to XidStatusUnknown (undeterminable), mirroring an out-of-range
+// xid from get_xid_status.
+func mapXidStatus(m map[uint32]XidCommitStatus) XidStatusFunc {
+	return func(xid uint32) XidCommitStatus {
+		if s, ok := m[xid]; ok {
+			return s
+		}
+		return XidStatusUnknown
+	}
+}
+
+// A HOT chain whose root tuple's xmin is still in-progress but whose successor's
+// xmin is committed is corruption (verify_heapam.c:759). The HOT-updated/heap-
+// only flags are consistent so ONLY the clog-dependent report appears.
+func TestVerifyHeapPage_InProgressXminUpdatedToCommitted(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16) // xmin 100 (NewHeapTuple); infomask set below
+	s2 := addCleanTuple(t, p, 16) // xmin set to 555 below
+	setInfomask(t, p, s1, storage.HeapHotUpdated)
+	setXmax(t, p, s1, 555)
+	setCTID(t, p, s1, 0, s2)
+	setInfomask(t, p, s2, storage.HeapOnlyTuple)
+	setXmin(t, p, s2, 555)
+
+	status := mapXidStatus(map[uint32]XidCommitStatus{
+		100: XidStatusInProgress,
+		555: XidStatusCommitted,
+	})
+	reports, err := VerifyHeapPageWithXminStatus(p, 0, RelDesc{}, status)
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithXminStatus: %v", err)
+	}
+	wantReport(t, reports, s1,
+		"tuple with in-progress xmin 100 was updated to produce a tuple at offset 1 with committed xmin 555")
+}
+
+// A non-HOT update chain whose root tuple's xmin is aborted but whose successor's
+// xmin is committed is corruption (verify_heapam.c:797). Both tuples are normal
+// (non-HOT, non-heap-only) so the flag checks stay silent.
+func TestVerifyHeapPage_AbortedXminUpdatedToCommitted(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16) // xmin 100
+	s2 := addCleanTuple(t, p, 16) // xmin 777
+	setXmax(t, p, s1, 777)
+	setCTID(t, p, s1, 0, s2)
+	setXmin(t, p, s2, 777)
+
+	status := mapXidStatus(map[uint32]XidCommitStatus{
+		100: XidStatusAborted,
+		777: XidStatusCommitted,
+	})
+	reports, err := VerifyHeapPageWithXminStatus(p, 0, RelDesc{}, status)
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithXminStatus: %v", err)
+	}
+	wantReport(t, reports, s1,
+		"tuple with aborted xmin 100 was updated to produce a tuple at offset 1 with committed xmin 777")
+}
+
+// Aborted root xmin updated to an in-progress successor xmin (verify_heapam.c:791).
+func TestVerifyHeapPage_AbortedXminUpdatedToInProgress(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16) // xmin 100
+	s2 := addCleanTuple(t, p, 16) // xmin 777
+	setXmax(t, p, s1, 777)
+	setCTID(t, p, s1, 0, s2)
+	setXmin(t, p, s2, 777)
+
+	status := mapXidStatus(map[uint32]XidCommitStatus{
+		100: XidStatusAborted,
+		777: XidStatusInProgress,
+	})
+	reports, err := VerifyHeapPageWithXminStatus(p, 0, RelDesc{}, status)
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithXminStatus: %v", err)
+	}
+	wantReport(t, reports, s1,
+		"tuple with aborted xmin 100 was updated to produce a tuple at offset 1 with in-progress xmin 777")
+}
+
+// A heap-only tuple with a committed/in-progress xmin and no predecessor is the
+// root of a chain that wrongly starts with a heap-only tuple (verify_heapam.c:831).
+func TestVerifyHeapPage_HeapOnlyRootOfChain(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16) // xmin 100, no predecessor
+	setInfomask(t, p, s1, storage.HeapOnlyTuple)
+
+	status := mapXidStatus(map[uint32]XidCommitStatus{100: XidStatusCommitted})
+	reports, err := VerifyHeapPageWithXminStatus(p, 0, RelDesc{}, status)
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithXminStatus: %v", err)
+	}
+	wantReport(t, reports, s1,
+		"tuple is root of chain but is marked as heap-only tuple")
+}
+
+// A heap-only tuple that DOES have a predecessor (the legitimate middle/tail of
+// a HOT chain) must NOT be flagged as a root — false-positive guard.
+func TestVerifyHeapPage_HeapOnlyWithPredecessorNoRootReport(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16) // root, normal, HOT-updated, xmin 100
+	s2 := addCleanTuple(t, p, 16) // heap-only successor, xmin 555
+	setInfomask(t, p, s1, storage.HeapHotUpdated)
+	setXmax(t, p, s1, 555)
+	setCTID(t, p, s1, 0, s2)
+	setInfomask(t, p, s2, storage.HeapOnlyTuple)
+	setXmin(t, p, s2, 555)
+
+	status := mapXidStatus(map[uint32]XidCommitStatus{
+		100: XidStatusCommitted,
+		555: XidStatusCommitted,
+	})
+	reports, err := VerifyHeapPageWithXminStatus(p, 0, RelDesc{}, status)
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithXminStatus: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("healthy committed HOT chain reported %d corruptions: %+v", len(reports), reports)
+	}
+}
+
+// A heap-only root whose xmin is ABORTED must NOT be flagged (upstream gates the
+// root check on committed/in-progress only) — false-positive guard.
+func TestVerifyHeapPage_HeapOnlyRootAbortedNoReport(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16) // xmin 100
+	setInfomask(t, p, s1, storage.HeapOnlyTuple)
+
+	status := mapXidStatus(map[uint32]XidCommitStatus{100: XidStatusAborted})
+	reports, err := VerifyHeapPageWithXminStatus(p, 0, RelDesc{}, status)
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithXminStatus: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("aborted heap-only root reported %d corruptions: %+v", len(reports), reports)
+	}
+}
+
+// A current-transaction xmin must trip neither the in-progress cross-link check
+// nor the root-of-chain check (XidStatusCurrent is distinct from
+// XidStatusInProgress) — false-positive guard against collapsing the two.
+func TestVerifyHeapPage_CurrentXminNoReport(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16) // heap-only root, xmin 100 = current xact
+	setInfomask(t, p, s1, storage.HeapOnlyTuple)
+
+	status := mapXidStatus(map[uint32]XidCommitStatus{100: XidStatusCurrent})
+	reports, err := VerifyHeapPageWithXminStatus(p, 0, RelDesc{}, status)
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithXminStatus: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("current-xid heap-only root reported %d corruptions: %+v", len(reports), reports)
+	}
+}
+
+// An undeterminable xmin status (callback returns XidStatusUnknown, e.g. an
+// out-of-range xid) disables the clog-dependent checks for that tuple, exactly
+// as upstream's xmin_commit_status_ok gate — false-positive guard.
+func TestVerifyHeapPage_UnknownXminStatusSkips(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16) // heap-only root, xmin 100 not in map -> Unknown
+	setInfomask(t, p, s1, storage.HeapOnlyTuple)
+
+	reports, err := VerifyHeapPageWithXminStatus(p, 0, RelDesc{}, mapXidStatus(nil))
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithXminStatus: %v", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("unknown-status heap-only root reported %d corruptions: %+v", len(reports), reports)
+	}
+}
+
+// A nil XidStatusFunc disables exactly the clog-dependent checks: the same page
+// that reports under VerifyHeapPageWithXminStatus reports nothing under the
+// page-bytes-only entry point — proves existing callers are byte-for-byte
+// unchanged.
+func TestVerifyHeapPage_NilXminStatusDisablesClogChecks(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16)
+	s2 := addCleanTuple(t, p, 16)
+	setInfomask(t, p, s1, storage.HeapHotUpdated)
+	setXmax(t, p, s1, 555)
+	setCTID(t, p, s1, 0, s2)
+	setInfomask(t, p, s2, storage.HeapOnlyTuple)
+	setXmin(t, p, s2, 555)
+
+	// With a status callback that would flag in-progress -> committed:
+	status := mapXidStatus(map[uint32]XidCommitStatus{
+		100: XidStatusInProgress,
+		555: XidStatusCommitted,
+	})
+	withStatus, err := VerifyHeapPageWithXminStatus(p, 0, RelDesc{}, status)
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithXminStatus: %v", err)
+	}
+	if len(withStatus) != 1 {
+		t.Fatalf("want 1 clog report with status, got %d: %+v", len(withStatus), withStatus)
+	}
+	// Same page, nil callback (the page-bytes-only path): no clog report.
+	noStatus, err := VerifyHeapPage(p, 0)
+	if err != nil {
+		t.Fatalf("VerifyHeapPage: %v", err)
+	}
+	if len(noStatus) != 0 {
+		t.Fatalf("nil callback still produced %d clog reports: %+v", len(noStatus), noStatus)
+	}
+}
+
+// A frozen xmin (FrozenTransactionID) resolves to committed without consulting
+// the callback: a heap-only frozen root is still flagged, and the callback is
+// never asked about xid 2.
+func TestVerifyHeapPage_FrozenXminResolvesCommitted(t *testing.T) {
+	p := newPage(t)
+	s1 := addCleanTuple(t, p, 16)
+	setInfomask(t, p, s1, storage.HeapOnlyTuple)
+	setXmin(t, p, s1, uint32(storage.FrozenTransactionID)) // 2
+
+	called := false
+	status := func(xid uint32) XidCommitStatus {
+		called = true
+		return XidStatusUnknown
+	}
+	reports, err := VerifyHeapPageWithXminStatus(p, 0, RelDesc{}, status)
+	if err != nil {
+		t.Fatalf("VerifyHeapPageWithXminStatus: %v", err)
+	}
+	if called {
+		t.Fatalf("callback consulted for frozen xid 2 (should resolve to committed directly)")
+	}
+	wantReport(t, reports, s1,
+		"tuple is root of chain but is marked as heap-only tuple")
+}

@@ -5,7 +5,9 @@ Milestone: M0110-0003
 Date: 2026-06-14 (extended 2026-06-14, loop #52: infomask-only header invariants;
 loop #55: B-tree index verification (`verify_nbtree`) page-structural tier;
 loop #58: B-tree cross-page sibling-link tier;
-loop #59: B-tree cross-level downlink tier (`bt_child_check`))
+loop #59: B-tree cross-level downlink tier (`bt_child_check`);
+loop #62: heap clog-dependent HOT-chain tier (xmin commit-status checks),
+completing the heap engine to logic-complete parity)
 
 > Scope note: this doc now covers both amcheck verify engines in
 > `internal/amcheck` — the heap-page checker (`verify_heapam.go`, the bulk of
@@ -575,6 +577,63 @@ child whose negative-infinity item is correctly skipped; an internal child with 
 *real* key below the bound (skip applies only to item 0); a leaf parent and the
 metapage (both nil); a damaged parent; and a dangling child downlink (both →
 damaged-page finding).
+
+## Heap clog-dependent HOT-chain tier (2026-06-14)
+
+The heap engine's last update-chain tier — the three checks that need to know
+each tuple's xmin commit status — is now ported, completing the heap side to
+logic-complete parity with the B-tree side. These mirror `verify_heapam.c`'s
+second and third update-chain loops (`verify_heapam.c:759-833`):
+
+1. **in-progress xmin → committed xmin** (`:759`): a chain root whose xmin is
+   still in progress cannot have produced a successor whose xmin has committed.
+2. **aborted xmin → in-progress/committed xmin** (`:791`/`:797`): a chain root
+   whose xmin aborted cannot have produced a live successor.
+3. **root of chain but heap-only** (`:831`, the separate third loop): a tuple
+   with a committed/in-progress xmin and no predecessor must not be heap-only —
+   a chain starts with a normal tuple or a redirect, never a heap-only tuple.
+
+### Decoupling seam: `XidStatusFunc`
+
+Upstream fills a per-offset `xmin_commit_status[]` / `xmin_commit_status_ok[]`
+array from `get_xid_status` (a clog + proc-array lookup). To keep the engine free
+of the contaminated `internal/mvcc` package and fully unit-testable, the port
+injects the status as a callback, `XidStatusFunc func(xid uint32) XidCommitStatus`,
+threaded through the new entry point `VerifyHeapPageWithXminStatus(p, blkno, rel,
+xidStatus)`. `XidCommitStatus` is the branch-relevant subset of upstream's enum:
+`Unknown` (= `xmin_commit_status_ok == false`; gates the check off), `Committed`,
+`InProgress`, `Aborted`, and `Current` (upstream `XID_IS_CURRENT_XID`, kept
+distinct so a current-transaction xmin trips neither the in-progress nor the
+root-of-chain check). The bootstrap (1) and frozen (2, or the
+`HEAP_XMIN_COMMITTED | HEAP_XMIN_INVALID` hint pair) xids resolve to committed
+without consulting the callback, mirroring `get_xid_status`'s special-casing.
+
+The page-bytes-only entry points (`VerifyHeapPage`, `VerifyHeapPageWithRel`)
+pass a nil callback, which leaves `xminStatusOK` false for every tuple and
+disables exactly these three checks — their output is byte-for-byte unchanged
+(regression-guarded by `TestVerifyHeapPage_NilXminStatusDisablesClogChecks`).
+
+The reported offset and xmins are verbatim from upstream: the message names the
+**current** tuple's offset and the **frozen-resolved** xmins of both tuples.
+
+Still deferred (the MVCC/attribute tier): xmin/xmax numeric bounds against the
+cluster's xid range, multixact member validation, and TOAST-pointer validation
+(goopg's TOAST is a separate chunk relation, so `check_tuple_attribute` is
+goopg-divergent, not merely deferred). The SQL surface — `CREATE EXTENSION
+amcheck` + the `verify_heapam` SRF that supplies `RelDesc` and a clog-backed
+`XidStatusFunc` — remains blocked on a clean tree (a separate live session holds
+uncommitted gen-column WIP across parser/planner/executor/catalog).
+
+### Testing (clog tier)
+
+`verify_heapam_test.go` gains a `mapXidStatus` builder (map-backed
+`XidStatusFunc`, missing xid → `Unknown`) and 10 tests: the three positive
+corruption cases (in-progress→committed, aborted→committed, aborted→in-progress,
+each isolated so only the clog report appears); the heap-only-root positive; and
+false-positive guards — a heap-only tuple with a predecessor (legit chain tail),
+an aborted heap-only root (gated off), a current-xid root, an unknown-status
+root, a nil callback (proves page-bytes-only callers unchanged), and a frozen
+xmin that resolves to committed without the callback being consulted.
 
 ## Upstream references
 

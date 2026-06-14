@@ -1,40 +1,35 @@
-Task: M0095-0003 — pg_basebackup `-X fetch` (FETCH_WAL / in-tar WAL).
-LANDED loop #12, committed.
+Task: M0110-0003 — pg_amcheck. Loop #62: closed the HEAP engine's last
+update-chain tier (clog-dependent HOT-chain checks). Committed.
 
-What landed: server now honours the BASE_BACKUP `WAL` boolean so a single-
-connection `pg_basebackup -X fetch` clones a goopg primary with consistent WAL
-included in the data tar (no walsender). Three parts in
-internal/server/basebackup.go:
-  (a) parse `WAL` option → baseBackupOptions.IncludeWAL (bare flag new-syntax +
-      legacy keyword; parseOptionBool honours explicit false).
-  (b) pg_wal is no longer walked — shipped as empty dir + archive_status/
-      summaries empty subdirs (mirrors basebackup.c sendDir():1385-1407). FIXES
-      a prior deviation where goopg shipped full pg_wal contents on EVERY backup.
-  (c) appendWALSegments: when IncludeWAL, append in-range
-      [XLByteToSeg(startptr) .. XLByteToPrevSeg(endptr)] segments under pg_wal/,
-      oldest first, with upstream contiguity sanity check; +history files.
+What landed (new code in internal/amcheck/, zero contaminated files touched):
+  verify_heapam.go — new entry point VerifyHeapPageWithXminStatus(p, blkno, rel,
+  xidStatus XidStatusFunc) + XidCommitStatus enum (Unknown/Committed/InProgress/
+  Aborted/Current). Ports verify_heapam.c:759-833: (1) in-progress→committed
+  xmin, (2) aborted→in-progress/committed xmin, (3) heap-only-root-of-chain.
+  Decoupling seam = injected XidStatusFunc (keeps engine off contaminated mvcc);
+  bootstrap(1)/frozen(2 or both-hint-bits) resolve committed w/o callback.
+  Page-bytes-only paths pass nil → checks disabled, output byte-identical.
+  + resolveXminStatus / headerXmin helpers; lpEntry gains xminStatus/xminStatusOK.
+  verify_heapam_test.go — mapXidStatus helper + 10 tests (3 cross-link positive,
+  heap-only-root positive, 6 FP guards incl nil-callback regression + frozen).
 
-Key finding (corrects the prior loop's plan): NO goopg→PG name conversion
-needed — goopg on-disk WAL names are ALREADY PG-format (wal.formatSegmentName →
-%08X%08X%08X). The speculatively-added `parseGoopgWalName` (raw %024X parse) was
-WRONG and is REMOVED; selection uses wal.ParseXLogFileName.
+Heap engine is now LOGIC-COMPLETE (parity w/ B-tree side, done loop #61).
 
-Files: internal/server/basebackup.go (impl), internal/server/basebackup_test.go
-(+3 parser cases), internal/testport/pgbasebackup_port_test.go
-(+TestPort_PgBasebackup010FetchWAL + parseBackupLabelStartSegment helper),
-docs/design/0095-0003-pg-basebackup-execution.md (+WAL-inclusion section),
-docs/test-port/postgres-oracle-port-status.{csv,md} (BB-010), .ralph/fix_plan.md.
+Gates loop #62: gofmt clean; go vet clean; go build ./... OK; go test -race
+./internal/amcheck ./internal/access/btree ./internal/storage PASS; ralph-state-guard OK.
 
-Gates run loop #12: gofmt clean; go vet clean; go build ./... OK;
-go test ./internal/server/ PASS; go test -race ./internal/server/ PASS;
-TestPort_PgBasebackup010{FetchWAL,StreamWAL,BackupExecution,Manifest*} all PASS
-(real pg_basebackup + pg_verifybackup oracle); make ralph-state-guard OK.
+CONTAMINATION (confirmed external, do NOT git add -A / do NOT commit): a SEPARATE
+LIVE claude session (pid 2177381, parent 1330899) holds uncommitted gen-column
+WIP — modified internal/{catalog,parser,analyzer,executor,planner,mvcc/subxact_
+visibility}.go + server/dispatch.go + cmd/goopg/main_test.go, untracked
+gen_override_test.go x2, .claude/worktrees/*, stray ./postgres marker. WIP
+mtimes 2026-06-13 14:19-14:28. Commit ONLY my files (verify_heapam.go +_test.go,
+docs/design/0110-0005*.md, docs/design/README.md, .ralph/fix_plan.md, working_set.md).
 
-CONTAMINATION (NOT mine, do NOT git add -A): the 18 foreign-WIP modified files
-(catalog.go, operators_*.go, parser/ddl.go, planner/*, analyzer, dispatch,
-mvcc/subxact_visibility, …) + untracked gen_override_test.go + .claude/worktrees/*
-+ stray ./postgres marker. Commit ONLY the 7 files above.
-
-Next step (M0095-0003 remaining): 011/020 backup-execution branches +
-recvlogical — all still blocked on BASE_BACKUP in-place tablespace protocol /
-logical replication protocol (same long-standing deps, not this loop's scope).
+Next step (M0110-0003 remaining — ALL blocked on a clean tree): the SQL surface
+— CREATE EXTENSION amcheck (parser ddl.go) + pg_extension/pg_proc rows
+(catalog.go) + verify_heapam/bt_index_check SRFs (planner/executor) — edits
+exactly the contaminated files, so it must wait until pid 2177381's WIP commits.
+That SQL surface is the slice that promotes AC-002 (002_nonesuch). Also pending:
+heapallindexed heap scan + index-tuple formation (needs index TupleDesc, catalog
+coupling). Engine itself (heap + btree) is logic-complete — no more engine tiers.

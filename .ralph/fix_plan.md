@@ -1303,6 +1303,38 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         still blocked on a clean tree), and hash unification (distribution-only).
         **The B-tree verification engine is now logic-complete** — every tier
         `bt_check_every_level` performs is ported; only the SQL surface remains.
+      - **PROGRESS 2026-06-14 (loop #62):** closed the **heap** engine's last
+        update-chain tier — the **clog-dependent HOT-chain checks**
+        (`verify_heapam.c:759-833`), the three checks that need each tuple's xmin
+        commit status: (1) in-progress xmin updated to a committed xmin, (2)
+        aborted xmin updated to an in-progress or committed xmin, and (3) a
+        heap-only tuple that is the root of an update chain (no predecessor) yet
+        has a committed/in-progress xmin — all upstream-verbatim (message names
+        the current tuple's offset + frozen-resolved xmins). Ported via a new
+        `VerifyHeapPageWithXminStatus(p, blkno, rel, xidStatus)` entry point
+        taking an injected `XidStatusFunc func(xid uint32) XidCommitStatus`
+        callback — the decoupling seam that keeps the engine off the contaminated
+        `internal/mvcc` (the SQL surface will supply a clog+proc-array-backed
+        impl; tests supply a map). `XidCommitStatus` is the branch-relevant
+        subset of upstream's enum (Unknown=`xmin_commit_status_ok==false`,
+        Committed, InProgress, Aborted, Current); bootstrap(1)/frozen(2 or the
+        `HEAP_XMIN_COMMITTED|HEAP_XMIN_INVALID` hint pair) resolve to committed
+        without the callback (mirrors `get_xid_status`). The page-bytes-only entry
+        points pass nil → `xminStatusOK` stays false → these three checks are
+        disabled, output byte-for-byte unchanged (regression-guarded). 10 new
+        tests (3 positive cross-link cases isolated so only the clog report
+        appears, heap-only-root positive, + 6 false-positive guards: heap-only
+        WITH predecessor, aborted heap-only root, current-xid root, unknown-status
+        root, nil-callback regression, frozen-resolves-committed). `go test -race
+        ./internal/amcheck ./internal/access/btree ./internal/storage` PASS; `go
+        build ./...` OK; gofmt/vet clean; all changes in `verify_heapam.go` +
+        `_test.go` only — zero contaminated files touched. **The heap engine is
+        now logic-complete** (parity with the B-tree side); only the MVCC/attribute
+        tier (xmin/xmax numeric bounds, multixact, goopg-divergent TOAST) and the
+        SQL surface remain. Design doc `0110-0005` extended; README index updated.
+        STILL DEFERRED: `heapallindexed` heap scan + the `CREATE EXTENSION
+        amcheck`/SRF SQL surface (AC-002-promoting, still blocked on a clean tree
+        — separate live session pid 2177381 holds the gen-column WIP).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

@@ -7,7 +7,7 @@
 // later loop. See docs/design/0110-0005-verify-heapam-engine.md for scope and
 // the engine-first rationale.
 //
-// Only the page-structural tier is implemented here: line-pointer bounds and
+// The page-structural tier is implemented here: line-pointer bounds and
 // alignment, redirect-target validity, tuple-header offset/t_hoff consistency,
 // the two infomask-only invariants from check_tuple_header (a multixact xmax
 // must not be hint-bit "committed"; a HOT-updated tuple must carry a valid
@@ -17,6 +17,22 @@
 // deterministic functions of the raw 8 KiB page bytes plus the page's own
 // block number (to recognise same-page CTID successors) and need neither
 // clog, the relation TupleDesc, nor the toast relation.
+//
+// The clog-dependent HOT-chain tier (verify_heapam.c's second/third
+// update-chain loops) is also implemented here, via VerifyHeapPageWithXminStatus
+// and an injected XidStatusFunc that resolves a tuple's xmin commit status
+// (committed / aborted / in-progress / current). These are the three checks
+// that need to know whether each tuple's inserting transaction committed:
+// (1) an in-progress xmin updated to a committed xmin, (2) an aborted xmin
+// updated to an in-progress or committed xmin, and (3) a heap-only tuple that
+// is the root of an update chain (no predecessor) yet has a committed/in-progress
+// xmin. The callback keeps the engine decoupled from goopg's clog/proc-array:
+// the SQL surface (the verify_heapam SRF) supplies a clog-backed implementation,
+// tests supply a map. Bootstrap (xid 1) and frozen (xid 2, or the frozen hint
+// bits) xmins resolve to "committed" without consulting the callback, mirroring
+// get_xid_status's special-casing. The page-bytes-only entry points pass a nil
+// callback, which disables exactly these three checks and leaves their output
+// byte-for-byte unchanged.
 //
 // One relation-dependent check is also available, via VerifyHeapPageWithRel:
 // the tuple-natts-vs-table check (verify_heapam.c:check_tuple) — a tuple's
@@ -28,12 +44,9 @@
 // is NOT ported: it decodes PG's on-disk varlena/TOAST-pointer format, which
 // goopg does not use (goopg's TOAST is a separate chunk relation with a
 // goopg-specific in-heap pointer datum — see internal/executor/toast.go), so a
-// verbatim port would false-positive on valid goopg pages. The clog-dependent
-// HOT-chain checks (xmin commit-status consistency across a link, and the
-// "root of chain but heap-only" check, both of which require knowing whether
-// each tuple's xmin committed/aborted/in-progress) and the MVCC/attribute
-// tier (xmin/xmax bounds vs clog, multixact members, TOAST pointer validation)
-// are deferred; see the design doc.
+// verbatim port would false-positive on valid goopg pages. The MVCC/attribute
+// tier (xmin/xmax numeric bounds vs the cluster's xid range, multixact member
+// validation, TOAST pointer validation) remains deferred; see the design doc.
 //
 // Infomask layout divergence (goopg vs upstream PG): upstream stores
 // HEAP_HOT_UPDATED / HEAP_ONLY_TUPLE in t_infomask2, but goopg packs them into
@@ -110,6 +123,36 @@ type RelDesc struct {
 	Natts int
 }
 
+// XidCommitStatus is the commit status of a tuple's inserting transaction, the
+// subset of upstream's XidCommitStatus (verify_heapam.c) that the clog-dependent
+// HOT-chain checks branch on. XidStatusUnknown stands in for upstream's
+// xmin_commit_status_ok == false (the xid was out of the cluster's valid range,
+// invalid, or otherwise undeterminable): the clog-dependent checks skip a tuple
+// whose status is unknown, exactly as upstream gates on xmin_commit_status_ok.
+// XidStatusCurrent (upstream XID_IS_CURRENT_XID) is kept distinct from
+// XidStatusInProgress because the chain checks match the latter strictly — a
+// current-transaction xmin must NOT trip the in-progress or root-of-chain
+// checks, so collapsing the two would produce false positives.
+type XidCommitStatus int
+
+const (
+	XidStatusUnknown XidCommitStatus = iota
+	XidStatusCommitted
+	XidStatusInProgress
+	XidStatusAborted
+	XidStatusCurrent
+)
+
+// XidStatusFunc resolves the commit status of a normal (non-bootstrap,
+// non-frozen) transaction id. It is the engine's decoupling seam from goopg's
+// clog / proc-array: the verify_heapam SRF supplies a clog-backed implementation
+// (committed/aborted from clog, in-progress/current from the proc array), tests
+// supply a map. Returning XidStatusUnknown means "could not determine" and makes
+// the clog-dependent checks skip that tuple. The engine never calls this for the
+// bootstrap (1) or frozen (2 / frozen hint bits) xids — those resolve to
+// committed directly, mirroring get_xid_status.
+type XidStatusFunc func(xid uint32) XidCommitStatus
+
 // maxAlign rounds n up to the nearest multiple of 8 (PG's MAXALIGN on 64-bit
 // platforms; postgres/src/include/c.h).
 func maxAlign(n int) int { return (n + 7) &^ 7 }
@@ -130,6 +173,15 @@ type lpEntry struct {
 	valid     bool
 	lpOff     int // tuple-body offset, for LP_NORMAL
 	successor uint16
+	// xminStatus / xminStatusOK mirror upstream's xmin_commit_status[] /
+	// xmin_commit_status_ok[]: the commit status of this tuple's xmin, set in
+	// the first pass for valid LP_NORMAL tuples when an XidStatusFunc was
+	// supplied. xminStatusOK stays false for redirect/unused/dead pointers, for
+	// header-corrupt tuples, and whenever no callback was given, which disables
+	// the clog-dependent HOT-chain checks for that tuple — exactly as upstream
+	// gates those checks on xmin_commit_status_ok.
+	xminStatus   XidCommitStatus
+	xminStatusOK bool
 }
 
 // VerifyHeapPage runs the page-structural (tier-1) checks of upstream
@@ -151,17 +203,27 @@ type lpEntry struct {
 // disabled; callers that have the relation's descriptor — the SQL surface —
 // should use VerifyHeapPageWithRel.
 func VerifyHeapPage(p storage.Page, blkno storage.BlockNumber) ([]Report, error) {
-	return verifyHeapPage(p, blkno, RelDesc{})
+	return verifyHeapPage(p, blkno, RelDesc{}, nil)
 }
 
 // VerifyHeapPageWithRel is VerifyHeapPage plus the relation-dependent checks
 // driven by rel (verify_heapam.c's check_tuple). A zero-value rel disables
 // those checks and makes it identical to VerifyHeapPage.
 func VerifyHeapPageWithRel(p storage.Page, blkno storage.BlockNumber, rel RelDesc) ([]Report, error) {
-	return verifyHeapPage(p, blkno, rel)
+	return verifyHeapPage(p, blkno, rel, nil)
 }
 
-func verifyHeapPage(p storage.Page, blkno storage.BlockNumber, rel RelDesc) ([]Report, error) {
+// VerifyHeapPageWithXminStatus is VerifyHeapPageWithRel plus the clog-dependent
+// HOT-chain checks (verify_heapam.c's second and third update-chain loops),
+// driven by xidStatus — a resolver for each tuple's xmin commit status. A nil
+// xidStatus disables exactly those three checks and makes this identical to
+// VerifyHeapPageWithRel; rel may be zero-value to disable the relation-dependent
+// checks independently.
+func VerifyHeapPageWithXminStatus(p storage.Page, blkno storage.BlockNumber, rel RelDesc, xidStatus XidStatusFunc) ([]Report, error) {
+	return verifyHeapPage(p, blkno, rel, xidStatus)
+}
+
+func verifyHeapPage(p storage.Page, blkno storage.BlockNumber, rel RelDesc, xidStatus XidStatusFunc) ([]Report, error) {
 	if len(p) != storage.BlockSize {
 		return nil, fmt.Errorf("amcheck: page is %d bytes, want %d", len(p), storage.BlockSize)
 	}
@@ -262,6 +324,16 @@ func verifyHeapPage(p storage.Page, blkno storage.BlockNumber, rel RelDesc) ([]R
 		entries[offnum].valid = true
 		entries[offnum].lpOff = lpOff
 		headerOK := checkTupleHeader(p, lpOff, lpLen, offnum, report)
+
+		// Resolve this tuple's xmin commit status for the clog-dependent
+		// HOT-chain checks (verify_heapam.c populates xmin_commit_status[] here,
+		// via check_tuple). Done for every valid LP_NORMAL tuple, gated on a
+		// callback having been supplied; the page-bytes-only entry points pass
+		// nil so xminStatusOK stays false and those checks are disabled.
+		if xidStatus != nil {
+			entries[offnum].xminStatus, entries[offnum].xminStatusOK =
+				resolveXminStatus(p, lpOff, xidStatus)
+		}
 
 		// Relation-dependent check (verify_heapam.c:check_tuple): a tuple may
 		// have fewer attributes than the table but never more. Upstream gates
@@ -382,7 +454,98 @@ func checkUpdateChains(p storage.Page, maxoff int, entries []lpEntry, report fun
 			report(offnum, fmt.Sprintf(
 				"heap-only update produced a non-heap only tuple at offset %d", nextoff))
 		}
+
+		// Clog-dependent cross-link xmin commit-status checks
+		// (verify_heapam.c:759-800). Only run when both tuples' xmin status was
+		// determinable (xmin_commit_status_ok for both offsets). The reported
+		// offset is the CURRENT tuple's offset and the reported xmins are the
+		// frozen-resolved xmins, both verbatim from upstream.
+		if entries[offnum].xminStatusOK && entries[nextoff].xminStatusOK {
+			currXmin := headerXmin(p, currOff)
+			nextXmin := headerXmin(p, nextOff)
+			cs := entries[offnum].xminStatus
+			ns := entries[nextoff].xminStatus
+			switch {
+			case cs == XidStatusInProgress && ns == XidStatusCommitted:
+				report(offnum, fmt.Sprintf(
+					"tuple with in-progress xmin %d was updated to produce a tuple at offset %d with committed xmin %d",
+					currXmin, offnum, nextXmin))
+			case cs == XidStatusAborted && ns == XidStatusInProgress:
+				report(offnum, fmt.Sprintf(
+					"tuple with aborted xmin %d was updated to produce a tuple at offset %d with in-progress xmin %d",
+					currXmin, offnum, nextXmin))
+			case cs == XidStatusAborted && ns == XidStatusCommitted:
+				report(offnum, fmt.Sprintf(
+					"tuple with aborted xmin %d was updated to produce a tuple at offset %d with committed xmin %d",
+					currXmin, offnum, nextXmin))
+			}
+		}
 	}
+
+	// Root-of-chain check (verify_heapam.c:805-833, the third update-chain
+	// loop): an update chain can start with a non-heap-only tuple or a redirect
+	// line pointer, but never with a heap-only tuple. Run in a separate loop
+	// because it needs the fully-populated predecessor[] array. Gated on the
+	// tuple's xmin being committed or in-progress and determinable — a redirect/
+	// unused/dead pointer never has xminStatusOK, so it is skipped here exactly
+	// as upstream's xmin_commit_status_ok gate (the explicit redirect guard
+	// mirrors upstream's !ItemIdIsRedirected for clarity).
+	for off := firstOffsetNumber; off <= maxoff; off++ {
+		offnum := uint16(off)
+		if !entries[offnum].xminStatusOK {
+			continue
+		}
+		st := entries[offnum].xminStatus
+		if st != XidStatusCommitted && st != XidStatusInProgress {
+			continue
+		}
+		if predecessor[offnum] != invalidOffsetNumber {
+			continue
+		}
+		if entries[offnum].flags == storage.ItemIDRedirect {
+			continue
+		}
+		if isHeapOnly(p, entries[offnum].lpOff) {
+			report(offnum, "tuple is root of chain but is marked as heap-only tuple")
+		}
+	}
+}
+
+// resolveXminStatus mirrors get_xid_status (verify_heapam.c) for the subset the
+// HOT-chain checks need: it returns the tuple's xmin commit status and whether
+// it was determinable (upstream's xmin_commit_status_ok). The bootstrap (1) and
+// frozen (2, or the frozen hint bits) xids resolve to committed without
+// consulting the callback; the invalid xid (0) is undeterminable; any other xid
+// is delegated to fn, and an XidStatusUnknown from fn (out of range /
+// undeterminable) maps to ok == false.
+func resolveXminStatus(p storage.Page, lpOff int, fn XidStatusFunc) (XidCommitStatus, bool) {
+	xmin := headerXmin(p, lpOff)
+	switch xmin {
+	case 0: // InvalidTransactionId: undeterminable
+		return XidStatusUnknown, false
+	case 1, uint32(storage.FrozenTransactionID): // bootstrap / frozen: committed
+		return XidStatusCommitted, true
+	}
+	st := fn(xmin)
+	if st == XidStatusUnknown {
+		return XidStatusUnknown, false
+	}
+	return st, true
+}
+
+// headerXmin returns the tuple's effective xmin (HeapTupleHeaderGetXmin): the
+// frozen-transaction id when the frozen hint bits are set (HEAP_XMIN_COMMITTED |
+// HEAP_XMIN_INVALID together), otherwise the raw t_xmin field (off+0..4). goopg
+// usually freezes by rewriting xmin to FrozenTransactionID(2) directly, but the
+// both-hint-bits representation is recognised too so a frozen tuple is never
+// mis-resolved through the callback.
+func headerXmin(p storage.Page, lpOff int) uint32 {
+	infomask := readInfomask(p, lpOff)
+	if infomask&(storage.HeapXminCommitted|storage.HeapXminInvalid) ==
+		(storage.HeapXminCommitted | storage.HeapXminInvalid) {
+		return uint32(storage.FrozenTransactionID)
+	}
+	return binary.LittleEndian.Uint32(p[lpOff : lpOff+4])
 }
 
 // readInfomask returns the tuple's t_infomask (off+20..22).
