@@ -116,10 +116,26 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
       - Verified: `go test -race ./internal/wal/ ./internal/mvcc/
         ./internal/executor/ ./internal/server/ ./internal/initdb/
         ./internal/config/` all green.
-      - Action: extend coverage to `-X stream` once START_REPLICATION + walsender
-        loop parity lands; add `--manifest` parity via `bbsink_manifest`
+      - **PROGRESS 2026-06-14 (loop #7):** `-X stream` backup-execution coverage
+        LANDED. The START_REPLICATION + physical walsender loop the prior action
+        item waited on shipped with M0102 (`internal/server/replication.go`
+        `replyStartReplication`, lines 354-571; the line-9 "ships in the next loop"
+        header comment is stale). New `TestPort_PgBasebackup010StreamWAL` drives the
+        real `pg_basebackup -X stream` against a live goopg cluster: it opens the
+        second replication connection, issues START_REPLICATION, and streams WAL
+        into the backup's `pg_wal/` concurrently with BASE_BACKUP. Asserts the
+        extracted `backup_label`/`global/pg_control`/`PG_VERSION` PLUS the defining
+        invariant — ≥1 streamed 24-char WAL segment lands in `pg_wal/` (distinguishes
+        a working stream from a no-op). PASS (1.76s); `-X none` execution test still
+        PASS (no regression). CSV row BB-010 rationale updated; markdown regenerated.
+        All in `internal/testport/pgbasebackup_port_test.go` (uncontaminated) — zero
+        engine change needed (the walsender already does the work). Resume = add
+        `--manifest` parity via `bbsink_manifest` emulation; then 011/020/030/040
+        streaming branches.
+      - Action: extend coverage with `--manifest` parity via `bbsink_manifest`
         emulation; M0095-0003 011/020 backup-execution branches and M0095-0003
-        WAL streaming/recvlogical still require the same dependencies.
+        recvlogical still require the same dependencies (BASE_BACKUP for in-place
+        tablespace; logical replication protocol for recvlogical).
 
 ## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
 

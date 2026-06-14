@@ -114,9 +114,12 @@ func TestPort_PgBasebackup010(t *testing.T) {
 // BASE_BACKUP, and unpack the resulting tar into a fresh data
 // directory. Verification mirrors upstream's "real backup" assertion
 // — backup_label and global/pg_control are present in the extracted
-// directory. WAL streaming (`-X stream`) and backup manifests are
-// left disabled (`-X none --no-manifest`) until START_REPLICATION and
-// `bbsink_manifest` parity ship under M0095-0003 follow-ups.
+// directory. This test deliberately keeps WAL streaming disabled
+// (`-X none`) to isolate the BASE_BACKUP data-copy path; the `-X stream`
+// walsender path is covered separately by
+// TestPort_PgBasebackup010StreamWAL. Backup manifests remain disabled
+// (`--no-manifest`) until `bbsink_manifest` parity ships under an
+// M0095-0003 follow-up.
 //
 // Implementation notes:
 //
@@ -192,6 +195,97 @@ func TestPort_PgBasebackup010BackupExecution(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(out, rel)); err != nil {
 			t.Errorf("missing %s in extracted backup: %v", rel, err)
 		}
+	}
+}
+
+// TestPort_PgBasebackup010StreamWAL exercises the upstream
+// "-X stream" sub-case of 010_pg_basebackup.pl: pg_basebackup opens a
+// SECOND replication connection alongside the BASE_BACKUP and issues
+// START_REPLICATION to stream WAL into the backup's pg_wal/ directory
+// concurrently with the data copy. This validates goopg's physical
+// walsender loop (internal/server/replication.go replyStartReplication)
+// through pg_basebackup's walreceiver, the same protocol M0102 exercises
+// for a streaming standby.
+//
+// Unlike the -X none execution test, a -X stream backup must contain at
+// least one streamed WAL segment under pg_wal/ on completion; that is the
+// assertion that distinguishes a working stream from a no-op.
+func TestPort_PgBasebackup010StreamWAL(t *testing.T) {
+	bin := clientToolBin(t, "pg_basebackup")
+	if bin == "" {
+		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
+	}
+	c := newCluster(t, "pgbasebackup010_stream")
+	if err := c.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	// Seed a small table so the backup includes non-empty heap pages and
+	// the WAL stream carries real records.
+	if _, err := c.Query(context.Background(),
+		`CREATE TABLE pgbb_stream_seed (a int)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := c.Query(context.Background(),
+		`INSERT INTO pgbb_stream_seed VALUES (1), (2), (3)`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	host, port, err := net.SplitHostPort(c.ListenAddr())
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "backup")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cmd := exec.Command(bin,
+		"-h", host,
+		"-p", port,
+		"-U", "postgres",
+		"-D", out,
+		// -X stream forces the START_REPLICATION + walreceiver path: a
+		// second replication connection streams WAL into pg_wal/ while the
+		// BASE_BACKUP copies the data directory.
+		"-X", "stream",
+		"--no-sync",
+		"--no-manifest",
+		"-l", "TestPort_PgBasebackup010StreamWAL")
+	cmd.Env = append(os.Environ(), "PGPASSWORD=")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pg_basebackup -X stream failed: %v\ncombined output:\n%s", err, string(output))
+	}
+
+	for _, rel := range []string{"backup_label", "global/pg_control", "PG_VERSION"} {
+		if _, err := os.Stat(filepath.Join(out, rel)); err != nil {
+			t.Errorf("missing %s in extracted backup: %v", rel, err)
+		}
+	}
+
+	// The defining assertion: -X stream must have streamed at least one WAL
+	// segment into the backup's pg_wal/ directory.
+	walEntries, err := os.ReadDir(filepath.Join(out, "pg_wal"))
+	if err != nil {
+		t.Fatalf("read pg_wal in extracted backup: %v", err)
+	}
+	var segs int
+	for _, e := range walEntries {
+		// WAL segment file names are 24 hex chars (TLI + logid + segno).
+		if !e.IsDir() && len(e.Name()) == 24 {
+			segs++
+		}
+	}
+	if segs == 0 {
+		var names []string
+		for _, e := range walEntries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("expected >=1 streamed WAL segment in pg_wal/, found none; entries=%v", names)
 	}
 }
 
