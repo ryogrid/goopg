@@ -71,6 +71,14 @@ type Snapshot struct {
 	Xmax       storage.TransactionID
 	InProgress []storage.TransactionID
 	Aborted    []storage.TransactionID
+
+	// clog, when non-nil, is the durable commit log consulted as a fallback
+	// for in-window XIDs the in-memory InProgress/Aborted arrays cannot
+	// classify (gap G4 / M0117-0002). It mirrors PostgreSQL's
+	// TransactionIdDidCommit/DidAbort consult after the running-array check in
+	// HeapTupleSatisfiesMVCC. nil (the default) preserves the pre-M0117-0002
+	// v0 behaviour exactly. Set via WithCLog / Manager.SetCLog.
+	clog *CLog
 }
 
 // Clone deep-copies the snapshot so callers can hold it independently
@@ -81,10 +89,21 @@ func (s Snapshot) Clone() Snapshot {
 		Xmax:       s.Xmax,
 		InProgress: make([]storage.TransactionID, len(s.InProgress)),
 		Aborted:    make([]storage.TransactionID, len(s.Aborted)),
+		clog:       s.clog,
 	}
 	copy(out.InProgress, s.InProgress)
 	copy(out.Aborted, s.Aborted)
 	return out
+}
+
+// WithCLog returns a copy of the snapshot whose visibility checks consult the
+// durable commit log c as a fallback for in-window XIDs the in-memory
+// InProgress/Aborted arrays cannot classify (M0117-0002). Passing nil restores
+// the pure in-memory v0 behaviour. The snapshot is otherwise unchanged; the XID
+// arrays are shared (not deep-copied) since they are immutable after capture.
+func (s Snapshot) WithCLog(c *CLog) Snapshot {
+	s.clog = c
+	return s
 }
 
 // snapshotLinearScanThreshold is the InProgress array length at or
@@ -157,5 +176,29 @@ func (s Snapshot) SeesCommittedXID(xid storage.TransactionID) bool {
 	if xid >= s.Xmax {
 		return false
 	}
-	return !s.HasInProgress(xid)
+	if s.HasInProgress(xid) {
+		return false
+	}
+	// In-window residual case: xid is not running relative to this snapshot and
+	// not in the in-memory Aborted list. The in-memory arrays assume such an XID
+	// committed, but that list is rebuilt empty on restart and is NOT the durable
+	// commit log. Consult the CLOG when available (gap G4 / M0117-0002), mirroring
+	// PostgreSQL's TransactionIdDidAbort consult in HeapTupleSatisfiesMVCC.
+	//
+	// Conservative contract: only a positive TxnStatusAborted overrides the v0
+	// default. TxnStatusUnknown (the steady-state status for runtime-new XIDs,
+	// since goopg's commit path does not write CLOG) and TxnStatusCommitted both
+	// fall through to "committed", so wiring the CLOG cannot regress the live
+	// path — it only hides recovered aborts the in-memory array forgot.
+	if s.clog != nil {
+		// Below the oldest retained CLOG XID, status has been truncated away and
+		// the XID is older than every relfrozenxid (treat as committed/frozen).
+		// Use the wraparound-safe comparison (M0117-0001).
+		if oldest := s.clog.OldestClogXid(); oldest == 0 || !storage.XIDPrecedes(xid, oldest) {
+			if s.clog.GetStatus(xid) == TxnStatusAborted {
+				return false
+			}
+		}
+	}
+	return true
 }
