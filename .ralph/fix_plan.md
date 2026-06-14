@@ -150,10 +150,27 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
         parity). `-X none`/`-X stream` execution tests still PASS;
         `go test -race ./internal/server/` green. Design doc + CSV BB-010 +
         markdown updated.
-      - Action: remaining M0095-0003 increments — `-X fetch` (WAL-fetch path),
-        011/020 backup-execution branches and recvlogical still require the same
-        dependencies (BASE_BACKUP for in-place tablespace; logical replication
-        protocol for recvlogical).
+      - **PROGRESS 2026-06-14 (loop #9):** SHA-family manifest-checksum
+        oracle coverage LANDED (test-only; no engine change). Loop #8 added the
+        `MANIFEST_CHECKSUMS` SHA224/256/384/512 branches to
+        `internal/server/basebackup.go` (`checksumFile`/`algoName`) but only the
+        default CRC32C path had an end-to-end test — a bug in the SHA per-file
+        hash or its `Checksum-Algorithm` JSON field would have been invisible.
+        New `TestPort_PgBasebackup010ManifestChecksums` (subtests SHA224, SHA256,
+        SHA384, SHA512) drives `pg_basebackup --manifest-checksums=<algo>`,
+        asserts every `Files[]` entry uses the requested algo, independently
+        recomputes each per-file checksum from disk (sha256.Sum224/Sum256,
+        sha512.Sum384/Sum512), recomputes the always-SHA-256 `Manifest-Checksum`
+        over the document prefix, and runs the upstream `pg_verifybackup -n`
+        oracle (which ACCEPTS all four). All 4 PASS (1.78s); the 010 exec /
+        stream / default-manifest tests still PASS (5.84s, no regression). CSV
+        BB-010 rationale updated; markdown regenerated.
+      - Action: remaining M0095-0003 increments — `-X fetch` (WAL-fetch path:
+        parse the BASE_BACKUP `WAL` boolean, then append in-range WAL segments to
+        the open tar in `pg_wal/` with goopg→PG 24-char segment-name conversion,
+        mirroring `basebackup.c` `includewal`), 011/020 backup-execution branches
+        and recvlogical still require the same dependencies (BASE_BACKUP for
+        in-place tablespace; logical replication protocol for recvlogical).
 
 ## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
 

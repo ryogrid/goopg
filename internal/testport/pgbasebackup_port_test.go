@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -369,7 +370,7 @@ func TestPort_PgBasebackup010Manifest(t *testing.T) {
 		t.Fatalf("read backup_manifest: %v", err)
 	}
 	var manifest struct {
-		Version int    `json:"PostgreSQL-Backup-Manifest-Version"`
+		Version int `json:"PostgreSQL-Backup-Manifest-Version"`
 		Files   []struct {
 			Path     string `json:"Path"`
 			Size     int64  `json:"Size"`
@@ -437,6 +438,163 @@ func TestPort_PgBasebackup010Manifest(t *testing.T) {
 		if verr != nil {
 			t.Errorf("pg_verifybackup -n rejected the backup: %v\n%s", verr, string(vout))
 		}
+	}
+}
+
+// TestPort_PgBasebackup010ManifestChecksums exercises the SHA-family
+// MANIFEST_CHECKSUMS branches of the backup-manifest emitter
+// (internal/server/basebackup.go buildBackupManifest / checksumFile /
+// algoName). The default-CRC32C path is covered by
+// TestPort_PgBasebackup010Manifest; this test drives pg_basebackup with
+// --manifest-checksums=SHA224|SHA256|SHA384|SHA512 so the per-file
+// SHA-{224,256,384,512} hash computation, the Checksum-Algorithm JSON
+// field, and the (always SHA-256) Manifest-Checksum are each validated
+// end-to-end against an independent recomputation AND the upstream
+// pg_verifybackup oracle. Mirrors upstream
+// postgres/src/bin/pg_basebackup/t/010_pg_basebackup.pl's
+// "backup and verify with manifest checksum <algo>" cases.
+func TestPort_PgBasebackup010ManifestChecksums(t *testing.T) {
+	bin := clientToolBin(t, "pg_basebackup")
+	if bin == "" {
+		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
+	}
+	c := newCluster(t, "pgbasebackup010_manifest_checksums")
+	if err := c.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	// Seed a small table so the backup includes non-empty heap pages and
+	// the manifest lists real base/<oid>/<relfilenode> files to checksum.
+	if _, err := c.Query(context.Background(),
+		`CREATE TABLE pgbb_mc_seed (a int)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := c.Query(context.Background(),
+		`INSERT INTO pgbb_mc_seed VALUES (1), (2), (3)`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	host, port, err := net.SplitHostPort(c.ListenAddr())
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+
+	// recompute returns the lowercase-hex per-file checksum for the given
+	// algorithm, matching manifestChecksumKind.checksumFile in the server.
+	recompute := func(algo string, data []byte) string {
+		switch algo {
+		case "SHA224":
+			sum := sha256.Sum224(data)
+			return hex.EncodeToString(sum[:])
+		case "SHA256":
+			sum := sha256.Sum256(data)
+			return hex.EncodeToString(sum[:])
+		case "SHA384":
+			sum := sha512.Sum384(data)
+			return hex.EncodeToString(sum[:])
+		case "SHA512":
+			sum := sha512.Sum512(data)
+			return hex.EncodeToString(sum[:])
+		default:
+			t.Fatalf("unhandled algo %q", algo)
+			return ""
+		}
+	}
+
+	for _, algo := range []string{"SHA224", "SHA256", "SHA384", "SHA512"} {
+		t.Run(algo, func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "backup")
+			if err := os.MkdirAll(out, 0o755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			cmd := exec.Command(bin,
+				"-h", host,
+				"-p", port,
+				"-U", "postgres",
+				"-D", out,
+				"--manifest-checksums="+algo,
+				"-X", "none",
+				"--no-sync",
+				"-l", "TestPort_PgBasebackup010ManifestChecksums_"+algo)
+			cmd.Env = append(os.Environ(), "PGPASSWORD=")
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("pg_basebackup --manifest-checksums=%s failed: %v\ncombined output:\n%s",
+					algo, err, string(output))
+			}
+
+			raw, err := os.ReadFile(filepath.Join(out, "backup_manifest"))
+			if err != nil {
+				t.Fatalf("read backup_manifest: %v", err)
+			}
+			var manifest struct {
+				Version int `json:"PostgreSQL-Backup-Manifest-Version"`
+				Files   []struct {
+					Path     string `json:"Path"`
+					Size     int64  `json:"Size"`
+					Algo     string `json:"Checksum-Algorithm"`
+					Checksum string `json:"Checksum"`
+				} `json:"Files"`
+				ManifestChecksum string `json:"Manifest-Checksum"`
+			}
+			if err := json.Unmarshal(raw, &manifest); err != nil {
+				t.Fatalf("backup_manifest is not valid JSON: %v\n%s", err, string(raw))
+			}
+			if manifest.Version != 2 {
+				t.Errorf("manifest version = %d, want 2", manifest.Version)
+			}
+			if len(manifest.Files) == 0 {
+				t.Fatalf("manifest Files[] is empty")
+			}
+
+			// Every file must use the requested algorithm and its declared
+			// checksum must match an independent recomputation from disk.
+			for _, f := range manifest.Files {
+				if f.Algo != algo {
+					t.Errorf("file %q: Checksum-Algorithm = %q, want %q", f.Path, f.Algo, algo)
+					continue
+				}
+				data, err := os.ReadFile(filepath.Join(out, filepath.FromSlash(f.Path)))
+				if err != nil {
+					t.Errorf("manifest lists %q but it is missing on disk: %v", f.Path, err)
+					continue
+				}
+				if int64(len(data)) != f.Size {
+					t.Errorf("file %q: size on disk = %d, manifest = %d", f.Path, len(data), f.Size)
+				}
+				if got := recompute(algo, data); got != f.Checksum {
+					t.Errorf("file %q: %s on disk = %s, manifest = %s", f.Path, algo, got, f.Checksum)
+				}
+			}
+
+			// The Manifest-Checksum is always SHA-256 over the document
+			// prefix, regardless of the per-file checksum algorithm
+			// (upstream backup_manifest.c AddWALInfoToBackupManifest /
+			// SendBackupManifest always finalises with PG_SHA256).
+			marker := []byte("\"Manifest-Checksum\": \"")
+			idx := bytes.LastIndex(raw, marker)
+			if idx < 0 {
+				t.Fatalf("backup_manifest has no Manifest-Checksum field")
+			}
+			sum := sha256.Sum256(raw[:idx])
+			if got := hex.EncodeToString(sum[:]); got != manifest.ManifestChecksum {
+				t.Errorf("Manifest-Checksum = %s, recomputed (SHA256) = %s", manifest.ManifestChecksum, got)
+			}
+
+			// Oracle cross-check: pg_verifybackup -n must accept the backup,
+			// independently validating every per-file SHA checksum and the
+			// manifest checksum against the on-disk files.
+			if vb := clientToolBin(t, "pg_verifybackup"); vb != "" {
+				vcmd := exec.Command(vb, "-n", out)
+				vout, verr := vcmd.CombinedOutput()
+				if verr != nil {
+					t.Errorf("pg_verifybackup -n rejected the %s backup: %v\n%s", algo, verr, string(vout))
+				}
+			}
+		})
 	}
 }
 
