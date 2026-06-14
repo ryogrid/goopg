@@ -9,7 +9,10 @@ loop #59: B-tree cross-level downlink tier (`bt_child_check`);
 loop #62: heap clog-dependent HOT-chain tier (xmin commit-status checks),
 completing the heap engine to logic-complete parity;
 loop #64: real-producer false-positive validation — surfaced & fixed a vacuum
-MAXALIGN bug, see "Real-producer false-positive validation" below)
+MAXALIGN bug, see "Real-producer false-positive validation" below;
+loop #23 (2026-06-14): heap xmin numeric-bounds tier (`check_tuple_visibility`'s
+future / cluster-min / rel-min xid-range checks), see "Heap xmin numeric-bounds
+tier" below)
 
 > Scope note: this doc now covers both amcheck verify engines in
 > `internal/amcheck` — the heap-page checker (`verify_heapam.go`, the bulk of
@@ -713,6 +716,61 @@ with the same alignment; vacuum only removes tuples), so the change cannot
 overflow the page. Verified: `internal/storage`, `internal/vacuum`,
 `internal/wal` (replay shares the kernel), `internal/executor`, `internal/mvcc`
 all green under `-race`.
+
+## Heap xmin numeric-bounds tier (2026-06-14)
+
+The clog-dependent HOT-chain tier resolves *what a tuple's xmin committed to*;
+this tier checks the prior, cheaper question `get_xid_status` asks first: is the
+xmin even a plausible transaction id for this cluster? It ports the
+`XID_IN_FUTURE` / `XID_PRECEDES_CLUSTERMIN` / `XID_PRECEDES_RELMIN` arms of
+`verify_heapam.c:check_tuple_visibility` (driven by `get_xid_status`'s bound
+comparisons), reporting the three upstream-verbatim messages:
+
+- `xmin %u equals or exceeds next valid transaction ID %u:%u`
+- `xmin %u precedes oldest valid transaction ID %u:%u`
+- `xmin %u precedes relation freeze threshold %u:%u`
+
+**Inputs.** Three new `RelDesc` fields carry the cluster/relation xid range the
+SQL surface (the `verify_heapam` SRF) will supply: `NextXid`
+(`TransamVariables->nextXid`; goopg `mvcc.Manager.NextXID`), `OldestXid` (cluster
+freeze horizon), and `RelFrozenXid` (this relation's `pg_class.relfrozenxid`).
+`checkXminBounds` enforces `OldestXid <= xmin < NextXid` and
+`xmin >= RelFrozenXid`, in `get_xid_status`'s comparison order (future, then
+cluster-min, then rel-min) so an xmin in `[OldestXid, RelFrozenXid)` is reported
+as a freeze-threshold violation while one below `OldestXid` is a cluster-min
+violation — matching `relfrozenxid >= oldestXid`.
+
+**Gating.** `NextXid == 0` is the unset sentinel that disables the whole tier
+(a live cluster's nextXid is always `>= FirstNormalTransactionID = 3`), so the
+page-bytes-only (`VerifyHeapPage`) and natts-only (`VerifyHeapPageWithRel` with a
+bare `Natts`) callers see no behaviour change. `OldestXid`/`RelFrozenXid == 0`
+disable only their own arm, leaving the future-xid check active. Special xids are
+always in bounds, mirroring `get_xid_status`'s quick check: InvalidTransactionId
+(0) is a silent non-check (`XID_INVALID` returns false with no report) and
+bootstrap (1) / frozen (2) are implicitly valid; `headerXmin` resolves the
+both-hint-bits frozen representation to 2 so a frozen tuple never trips the
+future-xid arm. The check runs on every valid `LP_NORMAL` tuple independent of
+`check_tuple_header` success, matching upstream's order (visibility runs before
+the header-garbled early return); the xmin field (`off+0..4`) is always inside
+the line-pointer length already validated.
+
+**Divergence.** PG works in `FullTransactionId` (epoch:xid) space with
+wraparound-aware comparisons; goopg has no on-disk xid epoch (a goopg cluster's
+monotonic uint32 nextXid has not wrapped), so the comparisons are plain unsigned
+— exactly equivalent to upstream within epoch 0 — and the messages embed the
+epoch as a literal `0` (`EpochFromFullTransactionId` is always 0).
+
+**Testing (`verify_heapam_xminbounds_test.go`).** Eight tests stamp a clean
+tuple's xmin via `setXmin` against a `[50, 200)` range with freeze threshold 80:
+future (`xmin=250`), the boundary `xmin == NextXid` (the `>=` arm), cluster-min
+(`xmin=30`), rel-min (`xmin=70`, exercising the ordering), the in-bounds silent
+case, the `NextXid==0` disabled-tier case, the unset-`OldestXid` no-false-report
+case, and bootstrap/frozen special xids below `OldestXid` staying silent.
+
+This tier is purely additive to the engine; the clog-dependent commit-status
+tier (resolved separately by `resolveXminStatus`) and the xmax/multixact bounds
+are unchanged. The remaining `check_tuple_visibility` work (xmax numeric bounds +
+multixact membership) stays deferred per the resume points above.
 
 ## Upstream references
 

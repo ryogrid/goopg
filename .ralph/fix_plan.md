@@ -1499,6 +1499,38 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         discard) — editing them would entangle the amcheck registration hooks with
         an unfinished foreign feature. STILL DEFERRED: the `heapEntries` producer
         (heap scan + index-tuple formation) + the SQL surface.
+      - **PROGRESS 2026-06-14 (loop #66 / driver loop #23):** the SQL surface is
+        STILL blocked on the same foreign gen-column WIP (frozen 2026-06-13 14:28,
+        ~27.5h; `claude --resume ec98936f` alive — must NOT be touched), so I
+        landed the next uncontaminated engine slice: the heap **xmin
+        numeric-bounds tier**. A prior loop had added three `RelDesc` fields
+        (`NextXid`/`OldestXid`/`RelFrozenXid`) for it but never wrote the check —
+        they were declared-but-unused. New `checkXminBounds` ports the
+        `XID_IN_FUTURE` / `XID_PRECEDES_CLUSTERMIN` / `XID_PRECEDES_RELMIN` arms of
+        `verify_heapam.c:check_tuple_visibility` (driven by `get_xid_status`'s bound
+        comparisons), with the three upstream-verbatim messages. Enforces
+        `OldestXid <= xmin < NextXid` and `xmin >= RelFrozenXid` in
+        `get_xid_status`'s order (future → cluster-min → rel-min, matching
+        `relfrozenxid >= oldestXid`). Gated on `rel.NextXid != 0` (unset sentinel)
+        so every page-bytes-only / natts-only caller is byte-for-byte unchanged;
+        `OldestXid`/`RelFrozenXid == 0` disable only their own arm. Special xids
+        (Invalid=0 silent, bootstrap=1, frozen=2 incl. the both-hint-bit form via
+        `headerXmin`) are always in bounds, mirroring the quick check. Runs on every
+        valid `LP_NORMAL` tuple independent of `check_tuple_header` success
+        (upstream runs visibility before the header-garbled early return).
+        Divergence: plain-unsigned epoch-0 comparisons vs upstream's
+        wraparound-aware FullTransactionId; messages embed epoch as literal `0`.
+        8 new tests (`verify_heapam_xminbounds_test.go`): future, boundary
+        `xmin==NextXid` (the `>=` arm), cluster-min, rel-min (ordering), in-bounds
+        silent, `NextXid==0` disabled tier, unset-`OldestXid` no-false-report,
+        bootstrap/frozen-below-oldest silent. `go test ./internal/amcheck
+        ./internal/access/btree` PASS; gofmt/vet clean; **all in `verify_heapam.go`
+        + new `_test.go` only — zero contaminated files touched.** Design doc
+        `0110-0005` extended ("Heap xmin numeric-bounds tier"); README index
+        updated. STILL DEFERRED (resume points): xmax numeric bounds + multixact
+        membership (the rest of the MVCC tier), the `heapEntries` producer (heap
+        scan + index-tuple formation), and the `CREATE EXTENSION amcheck`/SRF SQL
+        surface (AC-002-promoting, blocked on a clean tree).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

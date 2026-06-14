@@ -1,39 +1,34 @@
-Task: M0110-0003 — pg_amcheck port. Loop #65 landed the heapallindexed
-index-side relation walk (engine). COMMITTED this loop.
+Task: M0110-0003 (pg_amcheck port) — SQL surface still HARD-BLOCKED, but the
+amcheck ENGINE is NOT exhausted. This loop landed the heap xmin numeric-bounds
+tier (committed). The MVCC tier still has uncontaminated runway (xmax bounds +
+multixact) for future blocked loops.
 
-This loop (#65): added `CollectBtreeLeafEntries` + `VerifyBtreeHeapAllIndexedRelation`
-in new `internal/amcheck/heapallindexed_relation.go` (+ _test.go, 10 tests),
-symmetric with loop-#63 `VerifyHeapRelation`, behind the existing `PageSource`
-seam. Descends metapage Root→leftmost leaf→sibling walk, collects leaf entries
-(posting-expanded), composes the pure loop-#61 fingerprint+probe core. All new
-files; zero contaminated files touched. gofmt/vet clean; -race PASS on
-internal/amcheck + internal/access/btree; go build ./... OK.
+LANDED THIS LOOP (loop #66 / driver #23, 2026-06-14):
+- internal/amcheck/verify_heapam.go: new `checkXminBounds` + call site in
+  verifyHeapPage. Ports verify_heapam.c:check_tuple_visibility's
+  XID_IN_FUTURE / XID_PRECEDES_CLUSTERMIN / XID_PRECEDES_RELMIN arms (driven by
+  get_xid_status bounds). Consumes the previously declared-but-unused RelDesc
+  fields NextXid/OldestXid/RelFrozenXid. Gated on NextXid!=0 (unset sentinel →
+  tier off → page-bytes-only callers byte-for-byte unchanged).
+- internal/amcheck/verify_heapam_xminbounds_test.go: 8 tests (all PASS).
+- docs/design/0110-0005 + docs/design/README.md: tier documented + indexed.
+- .ralph/fix_plan.md (loop #66 note), deferral_ledger.md (productive-loop line).
+Key symbols: checkXminBounds, headerXmin, RelDesc{NextXid,OldestXid,RelFrozenXid},
+verifyHeapPage. Upstream: contrib/amcheck/verify_heapam.c get_xid_status (2111),
+check_tuple_visibility (1112).
 
-STATE CHANGE this loop: the gen-column WIP holder (pid 2177381) is now DEAD.
-Its uncommitted changes still sit in the shared parser/planner/executor/catalog
-files (frozen 2026-06-13 14:28, ~25h stale). A different `claude --resume
-ec98936f` session is alive but NOT editing them. The amcheck SQL surface
-(CREATE EXTENSION amcheck + verify_heapam/bt_index_check SRF) edits exactly
-those shared files, so it still must NOT be attempted — a HUMAN must first
-clear those uncommitted changes (commit/stash/discard).
+Gates run: `go test ./internal/amcheck ./internal/access/btree` PASS;
+gofmt -l + go vet ./internal/amcheck clean; make ralph-state-guard consistent.
+(No TPC-H gate — amcheck is its own package, no executor/planner code touched.)
 
-amcheck engine status: BOTH heap and B-tree engines are now logic-complete
-(every tier `bt_check_every_level` / `verify_heapam` performs is ported,
-relation-walk drivers present for both sides). Only remaining engine gap is the
-`heapEntries` producer (heap scan + index_form_tuple via index TupleDesc —
-catalog coupled, wire layer).
+STATE: foreign gen-column WIP STILL frozen at 2026-06-13 14:28 across
+internal/{parser,planner,executor,catalog,analyzer,mvcc}/ + server/dispatch.go +
+untracked gen_override test files. Owning session `claude --resume ec98936f`
+ALIVE. DO NOT touch/stash/commit it — a HUMAN must clear it.
 
-Next step (pick one):
-- PREFERRED once tree is clean: wire the SQL surface — `CREATE EXTENSION
-  amcheck` (parser + pg_extension row + pg_proc) + `verify_heapam(regclass,…)`
-  SRF (uses VerifyHeapRelation) + `bt_index_check`/`bt_index_parent_check` SRF
-  (uses the btree tiers + VerifyBtreeHeapAllIndexedRelation), filling PageSource
-  from the smgr. Then port `002_nonesuch.pl` (AC-002, error-path only first).
-- If tree still dirty: the engine is logic-complete; further engine work is
-  diminishing returns. Consider M0110-0001 (pg_dump 002 — catalog-coupled, also
-  contaminated) or M0110-0002 (pg_waldump 002 — needs PG-format FPI heap WAL,
-  high blast radius) instead, or flag the dirty-tree blocker for a human.
-
-Gates run: go test -race ./internal/amcheck ./internal/access/btree PASS;
-go build ./... OK; gofmt+vet clean. (No TPC-H gate — no planner/executor/codec
-change; all changes confined to new internal/amcheck files.)
+Next step (while tree stays blocked): port the NEXT uncontaminated engine slice —
+the xmax numeric-bounds + multixact-membership checks of check_tuple_visibility
+(verify_heapam.c after the xmin arms), same RelDesc-driven pattern, in
+verify_heapam.go only. Once the tree is CLEAN: wire SQL surface slice S1 from
+docs/design/0110-0008 (CREATE EXTENSION amcheck + pg_extension row), then S2,
+then port 002_nonesuch.pl.

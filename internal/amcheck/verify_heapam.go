@@ -121,6 +121,30 @@ type RelDesc struct {
 	// (verify_heapam.c:1942). Zero (the unset value used by VerifyHeapPage)
 	// means "unknown", which skips this check.
 	Natts int
+
+	// NextXid, OldestXid and RelFrozenXid bound the valid transaction-id range
+	// for the xmin numeric-bounds tier (verify_heapam.c:check_tuple_visibility's
+	// get_xid_status). The SQL surface (the verify_heapam SRF) supplies them:
+	// NextXid is the cluster's next-to-assign xid (TransamVariables->nextXid;
+	// goopg mvcc.Manager.NextXID), OldestXid is the cluster freeze horizon
+	// (oldestXid), and RelFrozenXid is this relation's pg_class.relfrozenxid.
+	//
+	// A normal tuple's xmin must satisfy OldestXid <= xmin < NextXid and
+	// xmin >= RelFrozenXid; an xmin outside that range is corruption (see
+	// checkXminBounds).
+	// NextXid == 0 is the unset sentinel (a live cluster's nextXid is always
+	// >= FirstNormalTransactionID = 3): it disables the whole tier, so the
+	// page-bytes-only and natts-only callers see no behaviour change.
+	//
+	// Divergence from upstream: PG works in FullTransactionId (epoch:xid) space
+	// and compares with modulo-2^32 (wraparound-aware) FullTransactionIdPrecedes.
+	// goopg has no on-disk xid epoch — nextXid is a monotonic uint32 that, for a
+	// goopg cluster, has not wrapped — so the comparisons here are plain unsigned,
+	// exactly equivalent to upstream within epoch 0, and the corruption messages
+	// embed the epoch as a literal 0 (EpochFromFullTransactionId is always 0).
+	NextXid      uint32
+	OldestXid    uint32
+	RelFrozenXid uint32
 }
 
 // XidCommitStatus is the commit status of a tuple's inserting transaction, the
@@ -335,6 +359,18 @@ func verifyHeapPage(p storage.Page, blkno storage.BlockNumber, rel RelDesc, xidS
 				resolveXminStatus(p, lpOff, xidStatus)
 		}
 
+		// xmin numeric-bounds tier (verify_heapam.c:check_tuple_visibility via
+		// get_xid_status): a normal tuple's xmin must fall within the cluster's
+		// valid xid range. Independent of the clog callback above and of
+		// headerOK — upstream runs check_tuple_visibility before the
+		// header-garbled early-return — so it is gated only on the cluster's xid
+		// range being known (rel.NextXid != 0, the unset sentinel). The xmin
+		// field (off+0..4) is always inside the line-pointer length validated
+		// above, so the read is safe.
+		if rel.NextXid != 0 {
+			checkXminBounds(p, lpOff, offnum, rel, report)
+		}
+
 		// Relation-dependent check (verify_heapam.c:check_tuple): a tuple may
 		// have fewer attributes than the table but never more. Upstream gates
 		// this on check_tuple_header succeeding (headerOK) and on the tuple
@@ -531,6 +567,56 @@ func resolveXminStatus(p storage.Page, lpOff int, fn XidStatusFunc) (XidCommitSt
 		return XidStatusUnknown, false
 	}
 	return st, true
+}
+
+// checkXminBounds mirrors the xmin numeric-bounds tier of
+// verify_heapam.c:check_tuple_visibility (the XID_IN_FUTURE /
+// XID_PRECEDES_CLUSTERMIN / XID_PRECEDES_RELMIN arms) driven by get_xid_status's
+// bound comparisons. A normal tuple's xmin must satisfy
+// rel.OldestXid <= xmin < rel.NextXid and xmin >= rel.RelFrozenXid; an xmin
+// outside that range is corruption. The caller gates this on rel.NextXid != 0.
+//
+// Special xids are always in bounds, matching get_xid_status's quick check:
+// InvalidTransactionId (0) is a silent non-check (XID_INVALID returns false in
+// check_tuple_visibility with no report), and bootstrap (1) / frozen (2) are
+// implicitly valid. headerXmin resolves the both-hint-bits frozen representation
+// to 2 so a frozen tuple never trips the future-xid arm.
+//
+// The check order — future, then cluster-min, then rel-min — matches
+// get_xid_status (FullTransactionIdPrecedesOrEquals(next), then
+// FullTransactionIdPrecedes(oldest), then FullTransactionIdPrecedes(relfrozen)).
+// Because pg_class.relfrozenxid >= the cluster oldestXid, an xmin in
+// [oldestXid, relFrozenXid) is reported as a freeze-threshold violation while an
+// xmin below oldestXid is reported as a cluster-min violation.
+//
+// Divergence from upstream: PG works in FullTransactionId (epoch:xid) space with
+// wraparound-aware comparisons. goopg has no on-disk xid epoch — nextXid is a
+// monotonic uint32 that, for a goopg cluster, has not wrapped — so the
+// comparisons here are plain unsigned, exactly equivalent to upstream within
+// epoch 0, and the corruption messages embed the epoch as a literal 0
+// (EpochFromFullTransactionId is always 0). OldestXid / RelFrozenXid == 0 (unset
+// by the SQL surface) disable only their own arm, leaving the future-xid check
+// active.
+func checkXminBounds(p storage.Page, lpOff int, offnum uint16, rel RelDesc, report func(uint16, string)) {
+	xmin := headerXmin(p, lpOff)
+	switch xmin {
+	case 0, 1, uint32(storage.FrozenTransactionID):
+		return
+	}
+	switch {
+	case xmin >= rel.NextXid:
+		report(offnum, fmt.Sprintf(
+			"xmin %d equals or exceeds next valid transaction ID 0:%d",
+			xmin, rel.NextXid))
+	case rel.OldestXid != 0 && xmin < rel.OldestXid:
+		report(offnum, fmt.Sprintf(
+			"xmin %d precedes oldest valid transaction ID 0:%d",
+			xmin, rel.OldestXid))
+	case rel.RelFrozenXid != 0 && xmin < rel.RelFrozenXid:
+		report(offnum, fmt.Sprintf(
+			"xmin %d precedes relation freeze threshold 0:%d",
+			xmin, rel.RelFrozenXid))
+	}
 }
 
 // headerXmin returns the tuple's effective xmin (HeapTupleHeaderGetXmin): the
