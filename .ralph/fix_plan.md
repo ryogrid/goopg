@@ -1527,10 +1527,33 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         ./internal/access/btree` PASS; gofmt/vet clean; **all in `verify_heapam.go`
         + new `_test.go` only — zero contaminated files touched.** Design doc
         `0110-0005` extended ("Heap xmin numeric-bounds tier"); README index
-        updated. STILL DEFERRED (resume points): xmax numeric bounds + multixact
-        membership (the rest of the MVCC tier), the `heapEntries` producer (heap
-        scan + index-tuple formation), and the `CREATE EXTENSION amcheck`/SRF SQL
-        surface (AC-002-promoting, blocked on a clean tree).
+        updated.
+      - **PROGRESS 2026-06-14 (loop #24):** SQL surface STILL blocked on the same
+        foreign gen-column WIP, so I landed the sibling slice: the heap **xmax
+        numeric-bounds tier**. New `checkXmaxBounds` ports the plain-XID xmax
+        sanity check of `verify_heapam.c:check_tuple_visibility` (lines 1466-1496,
+        same `get_xid_status` bound comparisons), with the three upstream-verbatim
+        xmax messages, reusing the existing `RelDesc` horizons (no new fields).
+        Page-structural gating mirrors upstream's path to that check:
+        `HEAP_XMAX_IS_MULTI` (multixact update-xid unresolvable page-structurally),
+        `HEAP_XMAX_INVALID` (tuple live, early return), `HEAP_XMAX_IS_LOCKED_ONLY`
+        (`storage.IsHeapTupleLockOnly`; lock not delete), raw `xmax==0`
+        (`XID_INVALID` → live), and bootstrap/frozen special xids all skip.
+        Clog-independent like the xmin tier (the upstream xmin-committed ordering
+        gate governs checkability, not the numeric invariant — cannot
+        false-positive on a valid page). 12 new tests
+        (`verify_heapam_xmaxbounds_test.go`): future, boundary `xmax==NextXid`,
+        cluster-min, rel-min (ordering), in-bounds silent, `xmax==0` live silent,
+        the three gate-skips (invalid/lock-only/multi each with an out-of-range raw
+        value), `NextXid==0` disabled tier, unset-`OldestXid` no-false-report,
+        bootstrap/frozen-below-oldest silent. `go test ./internal/amcheck` PASS;
+        gofmt/vet clean; **only `verify_heapam.go` + new `_test.go` — zero
+        contaminated files.** Design doc `0110-0005` extended ("Heap xmax
+        numeric-bounds tier"); package doc + deferred list updated. STILL DEFERRED
+        (resume points): multixact-member bounds (`check_mxid_valid_in_rel`; goopg
+        has no on-disk multixact horizon), the `heapEntries` producer (heap scan +
+        index-tuple formation), and the `CREATE EXTENSION amcheck`/SRF SQL surface
+        (AC-002-promoting, blocked on a clean tree).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

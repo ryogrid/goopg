@@ -12,7 +12,9 @@ loop #64: real-producer false-positive validation — surfaced & fixed a vacuum
 MAXALIGN bug, see "Real-producer false-positive validation" below;
 loop #23 (2026-06-14): heap xmin numeric-bounds tier (`check_tuple_visibility`'s
 future / cluster-min / rel-min xid-range checks), see "Heap xmin numeric-bounds
-tier" below)
+tier" below;
+loop #24 (2026-06-14): heap xmax numeric-bounds tier (the plain-XID xmax sibling
+of the xmin check), see "Heap xmax numeric-bounds tier" below)
 
 > Scope note: this doc now covers both amcheck verify engines in
 > `internal/amcheck` — the heap-page checker (`verify_heapam.go`, the bulk of
@@ -212,7 +214,11 @@ goopg's own codec, not a port; recorded here as out-of-scope for the port.
   `XID_IN_PROGRESS` status, i.e. clog. Resume with the tier-3 clog wiring.
 - `check_tuple_header`'s heap-only-but-not-updated invariant — deferred until
   goopg stamps `HEAP_UPDATED` (see above).
-- `check_tuple_visibility` xmin/xmax bounds + multixact (tier 3) — needs clog.
+- `check_tuple_visibility` xmin/xmax numeric bounds — **DONE** (loops #23/#24,
+  clog-independent; see the "Heap xmin/xmax numeric-bounds tier" sections).
+  Multixact-member bounds (`check_mxid_valid_in_rel`) + the multixact update-xid
+  path stay deferred: goopg has no on-disk multixact, so there is no relation
+  multixact horizon (`relminmxid`/`oldest_mxact`/`next_mxact`) to compare against.
 - `check_tuple_attribute` per-attribute TOAST validation — goopg-divergent
   on-disk format (see the relation-natts tier above); a goopg-faithful version
   is a reimplementation against goopg's codec, not a verify_heapam.c port.
@@ -768,9 +774,64 @@ case, the `NextXid==0` disabled-tier case, the unset-`OldestXid` no-false-report
 case, and bootstrap/frozen special xids below `OldestXid` staying silent.
 
 This tier is purely additive to the engine; the clog-dependent commit-status
-tier (resolved separately by `resolveXminStatus`) and the xmax/multixact bounds
-are unchanged. The remaining `check_tuple_visibility` work (xmax numeric bounds +
-multixact membership) stays deferred per the resume points above.
+tier (resolved separately by `resolveXminStatus`) is unchanged.
+
+## Heap xmax numeric-bounds tier (2026-06-14, loop #24)
+
+The sibling of the xmin tier: it ports the plain-XID xmax sanity check of
+`verify_heapam.c:check_tuple_visibility` (lines 1466-1496, driven by the same
+`get_xid_status` bound comparisons), reporting the three upstream-verbatim
+messages for a deleting transaction's xmax:
+
+- `xmax %u equals or exceeds next valid transaction ID %u:%u`
+- `xmax %u precedes oldest valid transaction ID %u:%u`
+- `xmax %u precedes relation freeze threshold %u:%u`
+
+**Inputs.** Reuses the `RelDesc.NextXid`/`OldestXid`/`RelFrozenXid` horizons
+already carried for the xmin tier; no new fields. `checkXmaxBounds` enforces the
+same `OldestXid <= xmax < NextXid` and `xmax >= RelFrozenXid` invariant in
+`get_xid_status`'s comparison order (future, cluster-min, rel-min).
+
+**Gating.** Page-structural, mirroring the path upstream takes to *reach* the
+plain-XID xmax check:
+
+- `HEAP_XMAX_IS_MULTI` set → upstream routes through the multixact path
+  (`check_mxid_valid_in_rel` + the multixact's update xid). goopg has no on-disk
+  multixact and `RelDesc` carries no multixact horizons, so the update xid is not
+  page-structurally resolvable — skipped (a valid goopg page never sets this bit,
+  so skipping cannot miss a real-page case). This is the deferred multixact work.
+- `HEAP_XMAX_INVALID` set → upstream returns early (tuple live, line 1371) before
+  any xmax bounds check — skipped (via `storage.HeapXmaxInvalid`).
+- `HEAP_XMAX_IS_LOCKED_ONLY` (`storage.IsHeapTupleLockOnly`) → upstream returns
+  early (line 1383) — skipped (the xmax is a row lock, not a delete).
+- raw `xmax == 0` (InvalidTransactionId) → `get_xid_status`'s `XID_INVALID` arm
+  (line 1470) marks the tuple live and reports nothing — skipped.
+- bootstrap (1) / frozen (2) xmax → special xids, always in bounds.
+- `NextXid == 0` (unset sentinel) disables the whole tier; `OldestXid` /
+  `RelFrozenXid == 0` disable only their own arm — identical to the xmin tier.
+
+**Divergence from upstream — clog-independence.** Upstream only *reaches* the
+xmax check after proving the inserter committed (it returns `false` earlier
+otherwise). That ordering governs checkability/visibility, not the numeric
+invariant: any xmax set on a valid goopg page is a real xid within range
+regardless of xmin status. Keeping this tier clog-callback-free (like
+`checkXminBounds`) means it cannot false-positive on a valid page and needs
+neither clog nor the proc array. Epoch handling is the literal-`0` plain-unsigned
+treatment described for the xmin tier.
+
+**Testing (`verify_heapam_xmaxbounds_test.go`).** Twelve tests stamp a clean
+tuple's xmax via `setXmax` against the same `[50, 200)` / freeze-80 range:
+future (`xmax=250`), the boundary `xmax == NextXid`, cluster-min (`xmax=30`),
+rel-min (`xmax=70`, exercising the ordering), the in-bounds silent case, the
+`xmax==0` live-tuple silent case, the three gate-skip cases
+(`HEAP_XMAX_INVALID` / lock-only / multi each with an out-of-range raw value),
+the `NextXid==0` disabled-tier case, the unset-`OldestXid` no-false-report case,
+and bootstrap/frozen special xids below `OldestXid` staying silent.
+
+The remaining `check_tuple_visibility` work — multixact-member bounds
+(`check_mxid_valid_in_rel`) and the multixact update-xid path — stays deferred:
+goopg has no on-disk multixact, so it is corruption-only territory with no
+relation-level multixact horizon to compare against.
 
 ## Upstream references
 

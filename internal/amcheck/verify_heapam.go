@@ -44,9 +44,18 @@
 // is NOT ported: it decodes PG's on-disk varlena/TOAST-pointer format, which
 // goopg does not use (goopg's TOAST is a separate chunk relation with a
 // goopg-specific in-heap pointer datum — see internal/executor/toast.go), so a
-// verbatim port would false-positive on valid goopg pages. The MVCC/attribute
-// tier (xmin/xmax numeric bounds vs the cluster's xid range, multixact member
-// validation, TOAST pointer validation) remains deferred; see the design doc.
+// verbatim port would false-positive on valid goopg pages.
+//
+// The MVCC numeric-bounds tier is also available, via VerifyHeapPageWithRel:
+// check_tuple_visibility's xmin and xmax sanity checks (the XID_IN_FUTURE /
+// XID_PRECEDES_CLUSTERMIN / XID_PRECEDES_RELMIN arms) verify that a normal
+// tuple's xmin and a deleting tuple's xmax fall within the cluster's valid xid
+// range, driven by the RelDesc.NextXid/OldestXid/RelFrozenXid horizons the SQL
+// surface supplies (see checkXminBounds / checkXmaxBounds). These are plain
+// page-byte reads of t_xmin/t_xmax against three scalars and need no clog. What
+// remains deferred from this tier is multixact member validation (goopg has no
+// on-disk multixact) and TOAST pointer validation (goopg's TOAST layout differs
+// from PG's on-disk varlena format); see the design doc.
 //
 // Infomask layout divergence (goopg vs upstream PG): upstream stores
 // HEAP_HOT_UPDATED / HEAP_ONLY_TUPLE in t_infomask2, but goopg packs them into
@@ -369,6 +378,7 @@ func verifyHeapPage(p storage.Page, blkno storage.BlockNumber, rel RelDesc, xidS
 		// above, so the read is safe.
 		if rel.NextXid != 0 {
 			checkXminBounds(p, lpOff, offnum, rel, report)
+			checkXmaxBounds(p, lpOff, offnum, rel, report)
 		}
 
 		// Relation-dependent check (verify_heapam.c:check_tuple): a tuple may
@@ -616,6 +626,70 @@ func checkXminBounds(p storage.Page, lpOff int, offnum uint16, rel RelDesc, repo
 		report(offnum, fmt.Sprintf(
 			"xmin %d precedes relation freeze threshold 0:%d",
 			xmin, rel.RelFrozenXid))
+	}
+}
+
+// checkXmaxBounds mirrors the xmax numeric-bounds tier of
+// verify_heapam.c:check_tuple_visibility — the plain-XID xmax sanity check (the
+// XID_IN_FUTURE / XID_PRECEDES_RELMIN / XID_PRECEDES_CLUSTERMIN arms at
+// verify_heapam.c:1466-1496, driven by get_xid_status's bound comparisons). A
+// deleting transaction's xmax must satisfy rel.OldestXid <= xmax < rel.NextXid
+// and xmax >= rel.RelFrozenXid; an xmax outside that range is corruption. The
+// caller gates this on rel.NextXid != 0.
+//
+// Page-structural gating mirrors the path upstream takes to reach this check:
+//   - HEAP_XMAX_IS_MULTI set: upstream routes through the multixact path
+//     (check_mxid_valid_in_rel, then the update xid of the multixact). goopg has
+//     no on-disk multixact and RelDesc carries no multixact horizons, so the
+//     update xid cannot be resolved page-structurally — skip. A valid goopg page
+//     never sets this bit, so skipping cannot miss a real-page case.
+//   - HEAP_XMAX_INVALID set: upstream returns early (tuple live,
+//     verify_heapam.c:1371) before any xmax bounds check — skip.
+//   - HEAP_XMAX_IS_LOCKED_ONLY: upstream returns early (line 1383) — skip.
+//   - raw xmax == 0 (InvalidTransactionId): get_xid_status's XID_INVALID arm
+//     (line 1470) marks the tuple live and reports nothing — skip.
+//   - bootstrap (1) / frozen (2) xmax: special xids, always in bounds
+//     (get_xid_status's quick check) — skip.
+//
+// The bounds-arm order — future, then cluster-min, then rel-min — matches
+// get_xid_status exactly (as in checkXminBounds); because relfrozenxid >=
+// oldestXid, an xmax in [oldestXid, relFrozenXid) is reported as a freeze-
+// threshold violation and an xmax below oldestXid as a cluster-min violation.
+//
+// Divergence from upstream: this tier is independent of the xmin commit status.
+// Upstream only reaches the xmax check after proving the inserter committed (it
+// returns false earlier otherwise), but that ordering governs checkability /
+// visibility, not the numeric invariant — any xmax set on a valid goopg page is
+// a real xid within range regardless of xmin status. Keeping the tier clog-
+// callback-free (like checkXminBounds) means it cannot false-positive on a valid
+// page and needs neither clog nor the proc array. As with xmin, comparisons are
+// plain unsigned (goopg has no on-disk xid epoch, so the embedded epoch is a
+// literal 0) and OldestXid / RelFrozenXid == 0 disable only their own arm.
+func checkXmaxBounds(p storage.Page, lpOff int, offnum uint16, rel RelDesc, report func(uint16, string)) {
+	infomask := readInfomask(p, lpOff)
+	if infomask&heapXmaxIsMulti != 0 ||
+		infomask&storage.HeapXmaxInvalid != 0 ||
+		storage.IsHeapTupleLockOnly(infomask) {
+		return
+	}
+	xmax := rawXmax(p, lpOff)
+	switch xmax {
+	case 0, 1, uint32(storage.FrozenTransactionID):
+		return
+	}
+	switch {
+	case xmax >= rel.NextXid:
+		report(offnum, fmt.Sprintf(
+			"xmax %d equals or exceeds next valid transaction ID 0:%d",
+			xmax, rel.NextXid))
+	case rel.OldestXid != 0 && xmax < rel.OldestXid:
+		report(offnum, fmt.Sprintf(
+			"xmax %d precedes oldest valid transaction ID 0:%d",
+			xmax, rel.OldestXid))
+	case rel.RelFrozenXid != 0 && xmax < rel.RelFrozenXid:
+		report(offnum, fmt.Sprintf(
+			"xmax %d precedes relation freeze threshold 0:%d",
+			xmax, rel.RelFrozenXid))
 	}
 }
 
