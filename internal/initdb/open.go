@@ -1093,7 +1093,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 				return nil // nothing frozen yet — never truncate
 			}
 			horizon := datFrozen
-			if ox := txnMgr.OldestXmin(); ox != 0 && ox < horizon {
+			// horizon = min(datfrozenxid, OldestXmin) using wraparound-safe
+			// modular comparison (PG TransactionIdPrecedes), not plain `<`,
+			// which would mis-order XIDs across the 2^32 boundary and let
+			// truncation overrun the snapshot horizon. The `< FirstNormal`
+			// guards stay plain — they are TransactionIdIsNormal sentinel
+			// checks against the bootstrap constant, not horizon comparisons.
+			if ox := txnMgr.OldestXmin(); ox != 0 && storage.XIDPrecedes(ox, horizon) {
 				horizon = ox
 			}
 			if horizon < mvcc.FirstNormalTransactionID {

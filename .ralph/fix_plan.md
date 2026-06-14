@@ -1832,7 +1832,7 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
 
 ### Sub-milestones
 
-- [ ] **M0117-0001**
+- [x] **M0117-0001** — DONE (branch `m0117-0001-xid-precedes` off b8dd6403; design `docs/design/0117-0001-xid-precedes-horizon-comparison.md`). Added `storage.XIDPrecedes`, routed `catalog.DatFrozenXID` + checkpointer `TruncateCLOGFn` through it, made `mvcc.txnPrecedes` delegate; pinned by `internal/storage/xid_test.go`. Gates: build + `go test ./internal/storage/... ./internal/mvcc/... ./internal/catalog/... ./internal/initdb/...` PASS. Pending human merge (foreign M0100-0010 WIP holds the main tree).
       - Summary: Wraparound-safe XID horizon comparison (gap M2; P0/correctness).
         Add exported `storage.XIDPrecedes(a, b)` (mirroring `clog.go`'s `txnPrecedes`
         / PG `TransactionIdPrecedes`) and use it for horizon selection in

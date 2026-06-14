@@ -94,9 +94,12 @@ func (c *CLog) AdvanceOldestClogXid(xid storage.TransactionID) {
 
 // txnPrecedes reports whether a is logically before b in modulo-2^32 XID space
 // (the half older than b). Mirrors PG's TransactionIdPrecedes. XID 0 (Invalid)
-// is handled by callers; here it is treated as the smallest value.
+// is handled by callers; here it is treated as the smallest value. Delegates to
+// storage.XIDPrecedes so the modular-comparison formula has a single source of
+// truth shared with catalog.DatFrozenXID / the checkpointer TruncateCLOGFn
+// (M0117-0001); the two must not drift.
 func txnPrecedes(a, b storage.TransactionID) bool {
-	return int32(a-b) < 0
+	return storage.XIDPrecedes(a, b)
 }
 
 // CLOGPagePrecedes reports whether SLRU page1 logically precedes page2 in the

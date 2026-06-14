@@ -4522,7 +4522,12 @@ func (c *InMemory) DatFrozenXID() storage.TransactionID {
 		if t.RelFrozenXID == storage.InvalidTransactionID {
 			continue
 		}
-		if oldest == storage.InvalidTransactionID || t.RelFrozenXID < oldest {
+		// Select the oldest relfrozenxid using wraparound-safe modular
+		// comparison (mirrors PG vac_update_datfrozenxid's
+		// TransactionIdPrecedes). Plain `<` would mis-order XIDs that
+		// straddle the 2^32 boundary and pick a too-recent horizon,
+		// truncating CLOG status still needed by older frozen tuples.
+		if oldest == storage.InvalidTransactionID || storage.XIDPrecedes(t.RelFrozenXID, oldest) {
 			oldest = t.RelFrozenXID
 		}
 	}
