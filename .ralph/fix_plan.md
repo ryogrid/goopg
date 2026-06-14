@@ -132,10 +132,28 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
         engine change needed (the walsender already does the work). Resume = add
         `--manifest` parity via `bbsink_manifest` emulation; then 011/020/030/040
         streaming branches.
-      - Action: extend coverage with `--manifest` parity via `bbsink_manifest`
-        emulation; M0095-0003 011/020 backup-execution branches and M0095-0003
-        recvlogical still require the same dependencies (BASE_BACKUP for in-place
-        tablespace; logical replication protocol for recvlogical).
+      - **PROGRESS 2026-06-14 (loop #8):** `--manifest` parity LANDED. The
+        server now emits a PG-version-2 backup manifest (`buildBackupManifest`
+        + `streamBackupManifest` in `internal/server/basebackup.go`), mirroring
+        `backup_manifest.c` + `bbsink_copystream`'s manifest framing: after the
+        tar and before CopyDone, a `CopyData('m')` begin-manifest marker then
+        the manifest bytes via `CopyData('d')` chunks. The document carries
+        `System-Identifier` (from pg_control), `Files[]` (each shipped file with
+        CRC32C checksum by default — pg_wal segments omitted, tracked via
+        WAL-Ranges), `WAL-Ranges`, and the SHA-256 `Manifest-Checksum`.
+        `MANIFEST_CHECKSUMS` honoured (NONE / CRC32C / SHA224/256/384/512);
+        `force-encode`/non-UTF-8 paths use `Encoded-Path`. New
+        `TestPort_PgBasebackup010Manifest` runs pg_basebackup WITHOUT
+        `--no-manifest`, independently recomputes every CRC32C + the SHA-256
+        manifest checksum, then runs the upstream oracle `pg_verifybackup -n`
+        which ACCEPTS the extracted backup (full file-checksum + system-id
+        parity). `-X none`/`-X stream` execution tests still PASS;
+        `go test -race ./internal/server/` green. Design doc + CSV BB-010 +
+        markdown updated.
+      - Action: remaining M0095-0003 increments — `-X fetch` (WAL-fetch path),
+        011/020 backup-execution branches and recvlogical still require the same
+        dependencies (BASE_BACKUP for in-place tablespace; logical replication
+        protocol for recvlogical).
 
 ## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
 

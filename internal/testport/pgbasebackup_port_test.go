@@ -19,7 +19,13 @@ package testport
 // (via clientToolBin in client_tools_port_test.go).
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"hash/crc32"
 	"net"
 	"os"
 	"os/exec"
@@ -286,6 +292,151 @@ func TestPort_PgBasebackup010StreamWAL(t *testing.T) {
 			names = append(names, e.Name())
 		}
 		t.Errorf("expected >=1 streamed WAL segment in pg_wal/, found none; entries=%v", names)
+	}
+}
+
+// TestPort_PgBasebackup010Manifest exercises the upstream backup-manifest
+// path of 010_pg_basebackup.pl: pg_basebackup run WITHOUT --no-manifest
+// requests `MANIFEST 'yes'` (CRC32C by default), and the server must stream
+// a PG-version-2 backup manifest after the tar archive. This validates
+// goopg's bbsink_manifest emulation (internal/server/basebackup.go
+// buildBackupManifest / streamBackupManifest) end-to-end through the real
+// pg_basebackup binary, which receives the 'm'/'d' manifest frames and
+// writes backup_manifest.
+//
+// Assertions, strongest first:
+//  1. pg_basebackup succeeds with manifests enabled (wire framing correct).
+//  2. backup_manifest is well-formed: version 2, lists backup_label and
+//     global/pg_control.
+//  3. Every Files[] checksum recomputed independently (CRC32C over the
+//     extracted file) matches the manifest (no self-referential trust).
+//  4. The SHA-256 Manifest-Checksum recomputed over the document prefix
+//     matches the trailer.
+//  5. If pg_verifybackup is available, `pg_verifybackup -n` accepts the
+//     backup (the upstream oracle's own verdict on file-checksum parity).
+func TestPort_PgBasebackup010Manifest(t *testing.T) {
+	bin := clientToolBin(t, "pg_basebackup")
+	if bin == "" {
+		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
+	}
+	c := newCluster(t, "pgbasebackup010_manifest")
+	if err := c.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	// Seed a small table so the backup includes non-empty heap pages and
+	// the manifest lists real base/<oid>/<relfilenode> files.
+	if _, err := c.Query(context.Background(),
+		`CREATE TABLE pgbb_manifest_seed (a int)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := c.Query(context.Background(),
+		`INSERT INTO pgbb_manifest_seed VALUES (1), (2), (3)`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	host, port, err := net.SplitHostPort(c.ListenAddr())
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "backup")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cmd := exec.Command(bin,
+		"-h", host,
+		"-p", port,
+		"-U", "postgres",
+		"-D", out,
+		// Default manifest (CRC32C) — note the ABSENCE of --no-manifest.
+		"-X", "none",
+		"--no-sync",
+		"-l", "TestPort_PgBasebackup010Manifest")
+	cmd.Env = append(os.Environ(), "PGPASSWORD=")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pg_basebackup (manifest) failed: %v\ncombined output:\n%s", err, string(output))
+	}
+
+	// 2. backup_manifest exists and parses.
+	manifestPath := filepath.Join(out, "backup_manifest")
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read backup_manifest: %v", err)
+	}
+	var manifest struct {
+		Version int    `json:"PostgreSQL-Backup-Manifest-Version"`
+		Files   []struct {
+			Path     string `json:"Path"`
+			Size     int64  `json:"Size"`
+			Algo     string `json:"Checksum-Algorithm"`
+			Checksum string `json:"Checksum"`
+		} `json:"Files"`
+		ManifestChecksum string `json:"Manifest-Checksum"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatalf("backup_manifest is not valid JSON: %v\n%s", err, string(raw))
+	}
+	if manifest.Version != 2 {
+		t.Errorf("manifest version = %d, want 2", manifest.Version)
+	}
+	byPath := make(map[string]int) // path -> index
+	for i, f := range manifest.Files {
+		byPath[f.Path] = i
+	}
+	for _, want := range []string{"backup_label", "global/pg_control"} {
+		if _, ok := byPath[want]; !ok {
+			t.Errorf("manifest Files[] missing %q", want)
+		}
+	}
+
+	// 3. Independently recompute each file's CRC32C from the extracted
+	// backup and compare to the manifest's declared checksum.
+	crcTab := crc32.MakeTable(crc32.Castagnoli)
+	for _, f := range manifest.Files {
+		if f.Algo != "CRC32C" {
+			t.Errorf("file %q: Checksum-Algorithm = %q, want CRC32C", f.Path, f.Algo)
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(out, filepath.FromSlash(f.Path)))
+		if err != nil {
+			t.Errorf("manifest lists %q but it is missing on disk: %v", f.Path, err)
+			continue
+		}
+		if int64(len(data)) != f.Size {
+			t.Errorf("file %q: size on disk = %d, manifest = %d", f.Path, len(data), f.Size)
+		}
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], crc32.Checksum(data, crcTab))
+		if got := hex.EncodeToString(b[:]); got != f.Checksum {
+			t.Errorf("file %q: CRC32C on disk = %s, manifest = %s", f.Path, got, f.Checksum)
+		}
+	}
+
+	// 4. Recompute the SHA-256 Manifest-Checksum over the document prefix
+	// (everything before the "Manifest-Checksum" field).
+	marker := []byte("\"Manifest-Checksum\": \"")
+	idx := bytes.LastIndex(raw, marker)
+	if idx < 0 {
+		t.Fatalf("backup_manifest has no Manifest-Checksum field")
+	}
+	sum := sha256.Sum256(raw[:idx])
+	if got := hex.EncodeToString(sum[:]); got != manifest.ManifestChecksum {
+		t.Errorf("Manifest-Checksum = %s, recomputed = %s", manifest.ManifestChecksum, got)
+	}
+
+	// 5. Oracle cross-check: pg_verifybackup -n (skip WAL parsing, which
+	// needs pg_waldump parity that is out of this increment's scope).
+	if vb := clientToolBin(t, "pg_verifybackup"); vb != "" {
+		vcmd := exec.Command(vb, "-n", out)
+		vout, verr := vcmd.CombinedOutput()
+		if verr != nil {
+			t.Errorf("pg_verifybackup -n rejected the backup: %v\n%s", verr, string(vout))
+		}
 	}
 }
 

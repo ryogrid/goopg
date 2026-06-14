@@ -46,9 +46,14 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/fs"
 	"os"
@@ -56,6 +61,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/protocol"
@@ -154,6 +160,10 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 	if err != nil {
 		return s.writeQueryError(w, sqlstate.SyntaxError, err.Error())
 	}
+	if _, ok := parseManifestChecksumKind(opts.ManifestChecksums); !ok {
+		return s.writeQueryError(w, sqlstate.FeatureNotSupported,
+			fmt.Sprintf("BASE_BACKUP: unsupported manifest checksum type %q", opts.ManifestChecksums))
+	}
 
 	// Force a synchronous IMMEDIATE checkpoint so the start-LSN we
 	// report names a record whose redo image is on disk. Upstream's
@@ -235,7 +245,10 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 		nextProgressMark: baseBackupProgressInterval,
 		ctx:              ctx,
 	}
-	if err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, startTLI, segSize); err != nil {
+	wantManifest := opts.Manifest == "yes" || opts.Manifest == "force-encode"
+	mck, _ := parseManifestChecksumKind(opts.ManifestChecksums) // validated at entry
+	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, startTLI, segSize, mck)
+	if err != nil {
 		return s.writeStreamingError(w, sqlstate.InternalError,
 			fmt.Sprintf("BASE_BACKUP: tar: %v", err))
 	}
@@ -244,15 +257,36 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 		return err
 	}
 
-	if err := w.WriteCopyDone(); err != nil {
-		return err
-	}
-
-	// --- result-set 3: end LSN + TLI ---
+	// --- backup manifest (before CopyDone, matching upstream's
+	// SendBackupManifest → bbsink_copystream_begin_manifest sequence).
+	// The 'm' frame announces the manifest; its bytes then flow through
+	// the same CopyData 'd' framing as the tar. stopLSN is the WAL-range
+	// end the manifest records, so compute it before building.
 	stopLSN := startLSN
 	if s.cfg.WAL != nil {
 		stopLSN = s.cfg.WAL.WrittenLSN()
 	}
+	if wantManifest {
+		sysID, err := initdb.LoadOrCreateSystemID(s.cfg.DataDir)
+		if err != nil {
+			return s.writeStreamingError(w, sqlstate.InternalError,
+				fmt.Sprintf("BASE_BACKUP: manifest system id: %v", err))
+		}
+		stopLSN0 := stopLSN
+		if stopLSN0 > 0 {
+			stopLSN0--
+		}
+		manifestBytes := buildBackupManifest(entries, sysID, startTLI, baseLSN0, stopLSN0, opts.Manifest == "force-encode")
+		if err := streamBackupManifest(w, manifestBytes); err != nil {
+			return s.writeStreamingError(w, sqlstate.InternalError,
+				fmt.Sprintf("BASE_BACKUP: manifest: %v", err))
+		}
+	}
+
+	if err := w.WriteCopyDone(); err != nil {
+		return err
+	}
+
 	if err := writeRecPtrResult(w, stopLSN, startTLI); err != nil {
 		return err
 	}
@@ -374,18 +408,150 @@ func (s *baseBackupStreamer) Write(p []byte) (int, error) {
 	return written, nil
 }
 
+// castagnoliTable is the CRC-32C (Castagnoli) table used for backup
+// manifest per-file checksums. PG's default MANIFEST_CHECKSUMS is
+// CRC32C; its INIT/FIN convention (init ^0, final XOR ^0) matches Go's
+// crc32.Checksum, and pg_checksum_final memcpy's the native (little-
+// endian on amd64) 4-byte value before hex-encoding — so the manifest
+// hex is the little-endian byte image of the CRC32C value.
+var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
+
+// manifestChecksumKind enumerates the per-file checksum algorithms the
+// backup manifest can carry. Mirrors PG's pg_checksum_type.
+type manifestChecksumKind int
+
+const (
+	mckCRC32C manifestChecksumKind = iota // PG default
+	mckNone
+	mckSHA224
+	mckSHA256
+	mckSHA384
+	mckSHA512
+)
+
+// parseManifestChecksumKind maps a MANIFEST_CHECKSUMS option value
+// (already upper-cased; "" means the client omitted it) to a kind.
+// Returns false for an unrecognised algorithm.
+func parseManifestChecksumKind(s string) (manifestChecksumKind, bool) {
+	switch s {
+	case "", "CRC32C":
+		return mckCRC32C, true
+	case "NONE":
+		return mckNone, true
+	case "SHA224":
+		return mckSHA224, true
+	case "SHA256":
+		return mckSHA256, true
+	case "SHA384":
+		return mckSHA384, true
+	case "SHA512":
+		return mckSHA512, true
+	default:
+		return mckCRC32C, false
+	}
+}
+
+// algoName returns the manifest "Checksum-Algorithm" string for a kind,
+// matching PG's pg_checksum_type_name output.
+func (k manifestChecksumKind) algoName() string {
+	switch k {
+	case mckCRC32C:
+		return "CRC32C"
+	case mckSHA224:
+		return "SHA224"
+	case mckSHA256:
+		return "SHA256"
+	case mckSHA384:
+		return "SHA384"
+	case mckSHA512:
+		return "SHA512"
+	default:
+		return "NONE"
+	}
+}
+
+// checksumFile computes the lowercase-hex per-file checksum for `data`
+// under kind `k`. The bool reports whether a checksum is emitted at all
+// (false for mckNone, so the caller omits the Checksum-Algorithm fields,
+// matching PG's CHECKSUM_TYPE_NONE branch in AddFileToBackupManifest).
+func (k manifestChecksumKind) checksumFile(data []byte) (string, bool) {
+	switch k {
+	case mckNone:
+		return "", false
+	case mckCRC32C:
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], crc32.Checksum(data, castagnoliTable))
+		return hex.EncodeToString(b[:]), true
+	case mckSHA224:
+		sum := sha256.Sum224(data)
+		return hex.EncodeToString(sum[:]), true
+	case mckSHA256:
+		sum := sha256.Sum256(data)
+		return hex.EncodeToString(sum[:]), true
+	case mckSHA384:
+		sum := sha512.Sum384(data)
+		return hex.EncodeToString(sum[:]), true
+	case mckSHA512:
+		sum := sha512.Sum512(data)
+		return hex.EncodeToString(sum[:]), true
+	default:
+		return "", false
+	}
+}
+
+// manifestEntry is one Files[] record in the backup manifest: a file
+// shipped in the base tar, with the metadata pg_verifybackup needs to
+// cross-check it against the extracted backup.
+type manifestEntry struct {
+	path  string    // slash path relative to the data directory
+	size  int64     // byte length as shipped
+	mtime time.Time // tar-header mtime (reported as GMT in the manifest)
+	algo  string    // "Checksum-Algorithm" value; "" if mckNone
+	cksum string    // lowercase-hex digest; "" if mckNone
+}
+
 // emitBaseBackupTar walks `dataDir` and writes a POSIX ustar archive
 // into `out`. Ordering: `backup_label` first, then everything except
 // `global/pg_control` in lexical order, then `global/pg_control`
 // last. Excluded entries (see `baseBackupExcluded`) are skipped.
-func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN uint64, tli uint32, segSize int64) error {
+//
+// It also returns the per-file metadata for the backup manifest, in the
+// same order the files are shipped (PG appends manifest entries as it
+// streams). `mck` selects the per-file checksum algorithm. WAL segments
+// under pg_wal/ are deliberately omitted from the manifest list — PG
+// tracks needed WAL via "WAL-Ranges", never as Files[] entries, and a
+// concurrent `-X stream` rewrites those segments on the client side,
+// which would otherwise break checksum verification.
+func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN uint64, tli uint32, segSize int64, mck manifestChecksumKind) ([]manifestEntry, error) {
 	tw := tar.NewWriter(out)
 
-	// 1. backup_label (synthetic).
-	labelBytes := buildBackupLabel(label, startLSN, tli, segSize)
-	if err := writeTarFile(tw, "backup_label", labelBytes, time.Now()); err != nil {
-		return err
+	var manifest []manifestEntry
+	record := func(name string, data []byte, mtime time.Time) {
+		slash := filepath.ToSlash(name)
+		// WAL segments are manifest-tracked via WAL-Ranges, not Files[].
+		if slash == "pg_wal" || strings.HasPrefix(slash, "pg_wal/") {
+			return
+		}
+		algo, cksum := "", ""
+		if name, ok := mck.checksumFile(data); ok {
+			algo, cksum = mck.algoName(), name
+		}
+		manifest = append(manifest, manifestEntry{
+			path:  slash,
+			size:  int64(len(data)),
+			mtime: mtime,
+			algo:  algo,
+			cksum: cksum,
+		})
 	}
+
+	// 1. backup_label (synthetic).
+	labelMTime := time.Now()
+	labelBytes := buildBackupLabel(label, startLSN, tli, segSize)
+	if err := writeTarFile(tw, "backup_label", labelBytes, labelMTime); err != nil {
+		return nil, err
+	}
+	record("backup_label", labelBytes, labelMTime)
 
 	// 2. Collect entries up-front so we can defer pg_control to the
 	// end and skip excluded paths. We don't need to sort — tar
@@ -433,24 +599,25 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, e := range entries {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		if e.isFile {
 			data, err := os.ReadFile(e.abs)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if err := writeTarFileWithMode(tw, e.rel, data, e.info.ModTime(), e.info.Mode().Perm()); err != nil {
-				return err
+				return nil, err
 			}
+			record(e.rel, data, e.info.ModTime())
 		} else {
 			if err := writeTarDir(tw, e.rel+"/", e.info.ModTime(), e.info.Mode().Perm()); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
@@ -459,14 +626,19 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 	if pgControlPath != "" {
 		data, err := os.ReadFile(pgControlPath)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if err := writeTarFileWithMode(tw, filepath.Join("global", "pg_control"), data, time.Now(), 0o600); err != nil {
-			return err
+		pgControlMTime := time.Now()
+		if err := writeTarFileWithMode(tw, filepath.Join("global", "pg_control"), data, pgControlMTime, 0o600); err != nil {
+			return nil, err
 		}
+		record(filepath.Join("global", "pg_control"), data, pgControlMTime)
 	}
 
-	return tw.Close()
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	return manifest, nil
 }
 
 // writeTarFile / writeTarFileWithMode / writeTarDir are thin
@@ -526,13 +698,109 @@ func buildBackupLabel(label string, startLSN uint64, tli uint32, segSize int64) 
 	return b.Bytes()
 }
 
+// buildBackupManifest renders a PG-version-2 backup manifest (the JSON
+// document pg_basebackup writes to `backup_manifest` and pg_verifybackup
+// validates). Byte-for-byte field ordering and whitespace mirror
+// backup_manifest.c so the trailing SHA-256 "Manifest-Checksum" — which
+// is computed over every byte up to but not including that field — comes
+// out identical to upstream.
+//
+//	{ "PostgreSQL-Backup-Manifest-Version": 2,
+//	"System-Identifier": <sysid>,
+//	"Files": [
+//	{ "Path": ..., "Size": ..., "Last-Modified": ..., "Checksum-Algorithm": ..., "Checksum": ... },
+//	...
+//	],
+//	"WAL-Ranges": [
+//	{ "Timeline": <tli>, "Start-LSN": "X/X", "End-LSN": "X/X" }
+//	],
+//	"Manifest-Checksum": "<sha256hex>"}
+//
+// forceEncode hex-encodes every path (PG's MANIFEST_OPTION_FORCE_ENCODE /
+// --manifest-force-encode); otherwise valid-UTF-8 paths use "Path" and
+// only non-UTF-8 paths fall back to "Encoded-Path".
+func buildBackupManifest(entries []manifestEntry, sysID uint64, tli uint32, startLSN, endLSN uint64, forceEncode bool) []byte {
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "{ \"PostgreSQL-Backup-Manifest-Version\": 2,\n")
+	fmt.Fprintf(&b, "\"System-Identifier\": %d,\n", sysID)
+	b.WriteString("\"Files\": [")
+	for i, e := range entries {
+		if i == 0 {
+			b.WriteByte('\n')
+		} else {
+			b.WriteString(",\n")
+		}
+		if forceEncode || !utf8.ValidString(e.path) {
+			fmt.Fprintf(&b, "{ \"Encoded-Path\": \"%s\", ", hex.EncodeToString([]byte(e.path)))
+		} else {
+			fmt.Fprintf(&b, "{ \"Path\": %s, ", encodeJSONString(e.path))
+		}
+		fmt.Fprintf(&b, "\"Size\": %d, ", e.size)
+		fmt.Fprintf(&b, "\"Last-Modified\": \"%s\"", e.mtime.UTC().Format("2006-01-02 15:04:05")+" GMT")
+		if e.algo != "" {
+			fmt.Fprintf(&b, ", \"Checksum-Algorithm\": \"%s\", \"Checksum\": \"%s\"", e.algo, e.cksum)
+		}
+		b.WriteString(" }")
+	}
+	// Terminate Files[] and open WAL-Ranges (AddWALInfoToBackupManifest).
+	b.WriteString("\n],\n")
+	b.WriteString("\"WAL-Ranges\": [\n")
+	fmt.Fprintf(&b, "{ \"Timeline\": %d, \"Start-LSN\": \"%s\", \"End-LSN\": \"%s\" }",
+		tli, formatLSN(startLSN), formatLSN(endLSN))
+	b.WriteString("\n],\n")
+
+	// SHA-256 over everything written so far (always SHA-256 regardless
+	// of the per-file checksum algorithm — SendBackupManifest invariant).
+	sum := sha256.Sum256(b.Bytes())
+	fmt.Fprintf(&b, "\"Manifest-Checksum\": \"%s\"}\n", hex.EncodeToString(sum[:]))
+	return b.Bytes()
+}
+
+// encodeJSONString renders s as a JSON string literal (including the
+// surrounding quotes), matching PG's escape_json for the manifest path.
+func encodeJSONString(s string) string {
+	buf, _ := json.Marshal(s)
+	return string(buf)
+}
+
+// streamBackupManifest sends the manifest over the open CopyOut stream:
+// first the 'm' begin-manifest marker (bbsink_copystream_begin_manifest),
+// then the manifest bytes in 'd' CopyData frames chunked like the tar
+// stream (bbsink_copystream_manifest_contents). No explicit terminator —
+// the caller's CopyDone closes the stream.
+func streamBackupManifest(w *protocol.FrameWriter, manifest []byte) error {
+	if err := w.WriteCopyData([]byte{'m'}); err != nil {
+		return err
+	}
+	for len(manifest) > 0 {
+		n := len(manifest)
+		if n > baseBackupChunkBytes {
+			n = baseBackupChunkBytes
+		}
+		buf := make([]byte, 1+n)
+		buf[0] = 'd'
+		copy(buf[1:], manifest[:n])
+		if err := w.WriteCopyData(buf); err != nil {
+			return err
+		}
+		manifest = manifest[n:]
+	}
+	return nil
+}
+
 // baseBackupOptions is the parsed form of the optional `(...)` block.
 type baseBackupOptions struct {
 	Label    string
 	Progress bool
 	Manifest string // "yes" | "no" | "force-encode" | ""
-	Target   string // "client" by default; goopg ignores non-client targets
-	Wait     int    // 0 means "don't wait for WAL"; goopg treats both the same
+	// ManifestChecksums names the per-file checksum algorithm the
+	// client requested for the manifest (PG's MANIFEST_CHECKSUMS
+	// option). Empty means the client did not send it; pg_basebackup
+	// defaults to CRC32C. Recognised: "NONE", "CRC32C", "SHA224",
+	// "SHA256", "SHA384", "SHA512" (case-insensitive).
+	ManifestChecksums string
+	Target            string // "client" by default; goopg ignores non-client targets
+	Wait              int    // 0 means "don't wait for WAL"; goopg treats both the same
 }
 
 // parseBaseBackupOptions parses upstream PG17+ grammar
@@ -583,8 +851,10 @@ func parseBaseBackupOptionList(body string) (baseBackupOptions, error) {
 				}
 				opts.Wait = n
 			}
+		case "MANIFEST_CHECKSUMS":
+			opts.ManifestChecksums = strings.ToUpper(trimSingleQuotes(val))
 		case "CHECKPOINT", "TABLESPACE_MAP", "VERIFY_CHECKSUMS", "MAX_RATE",
-			"NOVERIFY_CHECKSUMS", "MANIFEST_CHECKSUMS", "COMPRESSION",
+			"NOVERIFY_CHECKSUMS", "COMPRESSION",
 			"COMPRESSION_DETAIL", "INCREMENTAL":
 			// Accept but ignore — they don't affect what the v0
 			// emitter produces and rejecting them would break
