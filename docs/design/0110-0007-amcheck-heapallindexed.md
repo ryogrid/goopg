@@ -120,14 +120,54 @@ drift.
 page with a plain item + a 3-TID posting item and asserts the reader expands to
 4 entries with the right keys/TIDs.
 
+## Index-side relation walk (loop #65)
+
+The fingerprint phase's leaf-level enumeration is now ported as a driver behind
+the same `PageSource` seam the cross-page / cross-level B-tree tiers take
+(`internal/amcheck/heapallindexed_relation.go`), making it symmetric with the
+heap engine's `VerifyHeapRelation` (loop #63). Two entry points:
+
+- `CollectBtreeLeafEntries(src PageSource) ([]btree.LeafEntry, error)` — reads
+  the metapage, descends `Root` → leftmost leaf following the slot-1
+  (negative-infinity) downlink at each internal level (`leftmostLeafBlock`), then
+  walks `btpo_next` across the leaf level collecting `btree.PageLeafEntries`
+  (posting items expanded to one entry per TID). Fully deleted leaf pages are
+  skipped (deleted-page exemption, matching the per-page tiers). A `Root` of the
+  metapage / `InvalidBlockNumber` (no key level — a real goopg tree always roots
+  at block 1) and an empty leaf both yield zero entries with no error; a read
+  error, unparseable page, or sibling/downlink **cycle** is returned as an error
+  rather than silently fingerprinting a truncated set (a truncated set would
+  manufacture spurious "lacks matching index tuple" reports — the heapallindexed
+  soundness invariant). Both the descent and the sibling walk are bounded by
+  visited-sets so a corrupt cycle terminates.
+- `VerifyBtreeHeapAllIndexedRelation(idxSrc, heapEntries, indexName, tableName,
+  seed)` — composes `CollectBtreeLeafEntries` (fingerprint set) with the
+  caller-supplied `heapEntries` (probe set) through the pure
+  `VerifyBtreeHeapAllIndexed` core.
+
+**Scope boundary** (where loop #63's heap driver and upstream draw the line): the
+heap scan + `index_form_tuple` that produce `heapEntries` are catalog- and
+`TupleDesc`-coupled (they need the index's key columns, expressions, and
+collations to re-form each heap tuple's would-be index tuple), so they stay at
+the wire layer and are passed in as a slice — the shape
+`VerifyBtreeHeapAllIndexed` already consumes. What this file ports is exactly the
+part that is a deterministic function of the index's page bytes.
+
+Tests (`heapallindexed_relation_test.go`, 10): single root-leaf, multi-level
+descent-then-sibling walk (order asserted), no-key-level, empty leaf,
+deleted-leaf-skipped, sibling cycle (errors), descent read error; plus the
+composing driver clean / missing-entry (exact upstream message + block) /
+index-walk-error-propagates. New helpers `makeLeafPage` / `btLeafRaw` /
+`makeMetaWithRoot` / `makeDeletedLeaf` self-check through the real readers.
+
 ## Deferred (resume points)
 
-- **Heap scan + index-tuple formation.** The wire-later caller must (a) walk the
-  leaf level collecting `btree.PageLeafEntries`, and (b) run a
-  snapshot-consistent heap scan that re-forms each live heap tuple's index tuple
-  via the index `TupleDesc` (the `index_form_tuple` analog), feeding both slices
-  to `VerifyBtreeHeapAllIndexed`. Needs the heap relation + index `TupleDesc` —
-  catalog coupling.
+- **Heap scan + index-tuple formation** (the `heapEntries` producer). The
+  wire-later caller runs a snapshot-consistent heap scan that re-forms each live
+  heap tuple's index tuple via the index `TupleDesc` (the `index_form_tuple`
+  analog), feeding the result to `VerifyBtreeHeapAllIndexedRelation`. Needs the
+  heap relation + index `TupleDesc` — catalog coupling. (The index-side leaf walk
+  is now done — see above.)
 - **SQL surface.** `CREATE EXTENSION amcheck` + `bt_index_check(index,
   heapallindexed => true)` wiring; promotes `AC-002`. Blocked on a clean tree.
 - **Hash unification** (carried from 0110-0006): substitute the shared Jenkins

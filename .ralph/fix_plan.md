@@ -1464,6 +1464,41 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         non-contaminating: only `verify_heapam_realpage_test.go` (new) +
         `storage/heap.go` (1-line fix) + docs touched. SQL surface S1/S2/S3
         remains the AC-002-promoting slice, still blocked on a clean tree.
+      - **PROGRESS 2026-06-14 (loop #65):** ported the **index-side relation walk
+        of the heapallindexed tier** — the fingerprint phase's leaf-level
+        enumeration — as `CollectBtreeLeafEntries` + `VerifyBtreeHeapAllIndexedRelation`
+        in new `internal/amcheck/heapallindexed_relation.go`, symmetric with the
+        heap engine's loop-#63 `VerifyHeapRelation` and behind the same
+        `PageSource` seam. `CollectBtreeLeafEntries` reads the metapage, descends
+        `Root`→leftmost leaf (slot-1 negative-infinity downlink at each internal
+        level, via `leftmostLeafBlock`), then walks `btpo_next` collecting
+        `btree.PageLeafEntries` (posting items expanded per-TID), skipping deleted
+        leaves; both descent and sibling walk are visited-set-bounded so a corrupt
+        cycle ERRORS instead of looping (a truncated fingerprint set would
+        manufacture spurious "lacks matching index tuple" reports — the
+        heapallindexed soundness invariant). No-key-level/empty-leaf yield zero
+        entries, no error. `VerifyBtreeHeapAllIndexedRelation` composes it with
+        the caller-supplied `heapEntries` through the pure loop-#61
+        `VerifyBtreeHeapAllIndexed`. Scope boundary (same place loop #63 + upstream
+        draw it): the heap scan + `index_form_tuple` that PRODUCE `heapEntries`
+        stay at the wire layer (catalog/`TupleDesc` coupled). 10 new tests
+        (`heapallindexed_relation_test.go`, new `makeLeafPage`/`btLeafRaw`/
+        `makeMetaWithRoot`/`makeDeletedLeaf` helpers self-checked through the real
+        readers): single root-leaf, multi-level descent+sibling order, no-key-
+        level, empty leaf, deleted-leaf-skipped, sibling cycle, descent read
+        error, + composing driver clean/missing-entry(exact msg+block)/index-walk-
+        error. `go test -race ./internal/amcheck ./internal/access/btree` PASS;
+        `go build ./...` OK; gofmt/vet clean; **all in new files only — zero
+        contaminated files touched.** Design doc `0110-0007` extended ("Index-side
+        relation walk"); README already indexed. NOTE: the original gen-column WIP
+        holder (pid 2177381) is now DEAD, but its uncommitted changes remain in the
+        shared parser/planner/executor/catalog files (frozen at 2026-06-13 14:28,
+        ~25h stale; a separate `claude --resume ec98936f` session is alive but not
+        editing them). The SQL surface (S1/S2/S3, AC-002-promoting) still must NOT
+        be attempted until a HUMAN clears those uncommitted changes (commit/stash/
+        discard) — editing them would entangle the amcheck registration hooks with
+        an unfinished foreign feature. STILL DEFERRED: the `heapEntries` producer
+        (heap scan + index-tuple formation) + the SQL surface.
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

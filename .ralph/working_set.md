@@ -1,35 +1,39 @@
-Task: M0101-0003 / M0110-0002 — WAL xl_prev restart-seeding fix. COMPLETE + committed.
+Task: M0110-0003 — pg_amcheck port. Loop #65 landed the heapallindexed
+index-side relation walk (engine). COMMITTED this loop.
 
-This loop (#18): fixed the real WAL blocker the prior loops diagnosed (and
-corrected the diagnosis), while M0110-0003's SQL surface stays HARD-BLOCKED on
-the foreign session (pid 2177381 still alive, ~23h frozen gen-column WIP).
+This loop (#65): added `CollectBtreeLeafEntries` + `VerifyBtreeHeapAllIndexedRelation`
+in new `internal/amcheck/heapallindexed_relation.go` (+ _test.go, 10 tests),
+symmetric with loop-#63 `VerifyHeapRelation`, behind the existing `PageSource`
+seam. Descends metapage Root→leftmost leaf→sibling walk, collects leaf entries
+(posting-expanded), composes the pure loop-#61 fingerprint+probe core. All new
+files; zero contaminated files touched. gofmt/vet clean; -race PASS on
+internal/amcheck + internal/access/btree; go build ./... OK.
 
-Landed (commit on align-data-structure-with-pg):
-- internal/wal/writer.go detectWritePos: prevRecPtr = lastRecPtr-1 (0-guarded).
-  Root cause was NOT "xl_prev globally 1-based" — the live-append path already
-  stores start-1 (0-based) via resetPosition. The restart-seed path
-  (detectWritePos:917) assigned scanLastSegmentEnd's 1-based public start-LSN
-  verbatim to the 0-based prevRecPtr field, so the FIRST record after boot got
-  +1 xl_prev → pg_waldump "incorrect prev-link" at the 2nd record.
-- Output-only fix: writePos / client LSNs unchanged; goopg recovery never
-  validates xl_prev. Strictly improves goopg→PG (M0102) prev-link validation.
-- W-001 (TestPort_WALPgWaldumpCompat) repaired (native-PG segment discovery via
-  listWALSegments; old ParseUint(24-hex) overflow skipped all segments) → PASS,
-  now guards the fix via the prev-link check.
-- 002 (TestPort_PgWaldump002SaveFullpage): prev-link gone; self-skips on the
-  SEPARATE remaining blocker (no PG-decodable FPI records — all non-checkpoint
-  records route RmgrXLog/0xF0, opaque to PG). Stays under WD-002.
-- docs/design/0101-0003-...md + README index + CSV W-001 rationale + regenerated
-  markdown + fix_plan M0110-0002 + memory goopg_wal_xl_prev_1based_pg_waldump.md.
+STATE CHANGE this loop: the gen-column WIP holder (pid 2177381) is now DEAD.
+Its uncommitted changes still sit in the shared parser/planner/executor/catalog
+files (frozen 2026-06-13 14:28, ~25h stale). A different `claude --resume
+ec98936f` session is alive but NOT editing them. The amcheck SQL surface
+(CREATE EXTENSION amcheck + verify_heapam/bt_index_check SRF) edits exactly
+those shared files, so it still must NOT be attempted — a HUMAN must first
+clear those uncommitted changes (commit/stash/discard).
 
-Gates run: go test ./internal/wal/ PASS; go test -race ./internal/wal/
-./internal/mvcc/ PASS; both pg_waldump oracle tests pass (W-001 PASS, 002 skip);
-TestE2E_PhysicalReplication PASS; gofmt+vet clean. (No TPC-H gate — no
-planner/executor/codec change.)
+amcheck engine status: BOTH heap and B-tree engines are now logic-complete
+(every tier `bt_check_every_level` / `verify_heapam` performs is ported,
+relation-walk drivers present for both sides). Only remaining engine gap is the
+`heapEntries` producer (heap scan + index_form_tuple via index TupleDesc —
+catalog coupled, wire layer).
 
 Next step (pick one):
-- 002 FULL pass: emit PG-decodable heap WAL records with backup blocks
-  (XLogRecordBlockHeader + BKPIMAGE) so pg_waldump --save-fullpage extracts FPIs.
-  Large, separate feature — its own milestone.
-- OR M0110-0003 SQL surface (slice S1 of docs/design/0110-0008) once a HUMAN
-  clears the foreign session's static gen-column WIP (pid 2177381).
+- PREFERRED once tree is clean: wire the SQL surface — `CREATE EXTENSION
+  amcheck` (parser + pg_extension row + pg_proc) + `verify_heapam(regclass,…)`
+  SRF (uses VerifyHeapRelation) + `bt_index_check`/`bt_index_parent_check` SRF
+  (uses the btree tiers + VerifyBtreeHeapAllIndexedRelation), filling PageSource
+  from the smgr. Then port `002_nonesuch.pl` (AC-002, error-path only first).
+- If tree still dirty: the engine is logic-complete; further engine work is
+  diminishing returns. Consider M0110-0001 (pg_dump 002 — catalog-coupled, also
+  contaminated) or M0110-0002 (pg_waldump 002 — needs PG-format FPI heap WAL,
+  high blast radius) instead, or flag the dirty-tree blocker for a human.
+
+Gates run: go test -race ./internal/amcheck ./internal/access/btree PASS;
+go build ./... OK; gofmt+vet clean. (No TPC-H gate — no planner/executor/codec
+change; all changes confined to new internal/amcheck files.)
