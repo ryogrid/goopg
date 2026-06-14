@@ -1,57 +1,45 @@
-Task: M0110-0003 (pg_amcheck) — amcheck verify engines in `internal/amcheck`.
-Engine-first/wire-later. Loop #61 ported the **heapallindexed fingerprint+probe
-core** — the LAST B-tree verification tier. The B-tree engine is now
-LOGIC-COMPLETE: every tier `bt_check_every_level` performs is ported. What
-remains is the heap-scan plumbing + the SQL surface — both blocked on a CLEAN
-tree.
+Task: M0110-0003 (pg_amcheck) — amcheck SQL surface. Engine-first/wire-later.
+**STILL HARD-BLOCKED on a clean tree (since loop #62). Loop #64 landed the wiring
+PLAN as a design doc — the only safe new-file work left.**
 
-Landed loop #61 (all NEW/additive code — ZERO contaminated files):
-  - internal/amcheck/heapallindexed.go: `VerifyBtreeHeapAllIndexed(indexLeafEntries,
-    heapEntries []btree.LeafEntry, indexName, tableName string, seed uint64)
-    []BtreeReport`. Pure fn: bloomCreate(len(index), 64MB, seed) → fingerprint
-    every index leaf entry → probe every heap entry → one report per
-    bloomLacksElement with verbatim upstream msg `heap tuple (b,o) from table
-    "T" lacks matching index tuple within index "I"`. Sound via no-false-negatives.
-    `fingerprintLeafEntry` (TID.Block BE:4 ++ TID.Offset:2 ++ key bytes) drives
-    BOTH phases — the load-bearing sibling-path invariant. Divergences: no
-    bt_normalize_tuple (goopg doesn't TOAST index keys → leaf & heap-formed key
-    bytes already one canonical EncodeXxxKey form); seed is a param (caller
-    randomizes, tests pin). heapAllIndexedWorkMemKB=64MB const (wire-later GUC hook).
-  - internal/access/btree/btree.go: new exported `LeafEntry{Key,TID}` +
-    `PageLeafEntries(p)` — canonical leaf reader that EXPANDS posting items to one
-    entry per heap TID (contrast PageItemKeys which collapses to one key). Beside
-    PageItemKeys/PageDownlinks. btree.go was NOT contaminated.
-  - Tests: heapallindexed_test.go (6: NoFalseNegatives load-bearing @n=100k,
-    DetectsMissingHeapTuple exact msg+block, DistinguishesByTID, EmptyIndex,
-    EmptyHeap, SharedKeyDistinctTIDs) + posting_test.go TestPageLeafEntries
-    (plain + 3-TID posting → 4 entries).
-  - docs/design/0110-0007-amcheck-heapallindexed.md + README row; fix_plan loop-#61
-    PROGRESS; deferral_ledger loop-#61 line.
+WHAT LANDED loop #64 (documentation only, no code/engine change):
+  docs/design/0110-0008-amcheck-sql-surface-plan.md (+ README index row).
+  Execute-ready plan so the unblocking loop stops re-deriving scope (#62/#63 each
+  re-read 002_nonesuch.pl from scratch). Captures:
+  - The 3 exact queries pg_amcheck.c issues (verbatim, with line refs):
+    1. install probe `amcheck_sql` (L173): SELECT n.nspname, x.extversion FROM
+       pg_catalog.pg_extension x JOIN pg_catalog.pg_namespace n ON
+       x.extnamespace=n.oid WHERE x.extname='amcheck'.
+    2. verify_heapam SRF (L843): SETOF (blkno i8, offnum i8, attnum i4, msg text);
+       args relation/on_error_stop/check_toast/skip/startblock/endblock.
+    3. bt_index_check / bt_index_parent_check (L887): RETURNS void, corruption
+       raised as errors.
+  - CATALOG GAP: pg_namespace EXISTS (catalog.go:1895); pg_extension MISSING — the
+    one new catalog relation needed.
+  - SCOPE REFINEMENT loop #63 missed: 002_nonesuch is ~all client-side pattern
+    resolution + the install probe; it does NOT run real verify_heapam corruption
+    (that's 004/005). So Slices S1+S2 ALONE promote AC-002 — SRFs need only EXIST
+    in pg_proc to type-check, not execute.
+  - 5 committable slices: S1 CREATE EXTENSION DDL → S2 pg_extension+probe(AC-002)
+    → S3 verify_heapam SRF → S4 bt_index_check SRFs → S5 port 002–005 TAP tests.
 
-Gates run: go test ./internal/amcheck ./internal/access/btree PASS (7 new + existing);
-go build OK; gofmt -l clean; go vet ./internal/amcheck clean. make ralph-state-guard
-(run before status block).
+WHY STILL BLOCKED (unchanged from #63): the surface edits parser/ast.go+ddl.go,
+server/dispatch.go, executor/operators_ddl.go, planner/plan.go+planner.go,
+catalog/catalog.go — all carry a separate manual session's uncommitted M0100-0010
+gen-column WIP (`WITH OPTIONS GENERATED ALWAYS AS`), static since 2026-06-13 14:28.
+Confirmed foreign this loop by reading the diffs. Do NOT git add -A / commit it.
+`go build ./...` PASSES with the WIP present (block is the do-not-commit rule only).
 
-Next step (BLOCKED on a clean tree): the SQL surface is now the ONLY remaining
-amcheck work — CREATE EXTENSION amcheck + verify_heapam(regclass) SRF +
-bt_index_check(regclass [, heapallindexed]) wired on the VerifyHeap*/VerifyBtree*
-engines, with the heapallindexed path (a) walking the leaf level via
-btree.PageLeafEntries and (b) running a snapshot heap scan that re-forms each
-tuple's index tuple via the index TupleDesc, feeding both slices to
-VerifyBtreeHeapAllIndexed. Then port 002_nonesuch.pl (promotes AC-002). Also:
-hash unification (substitute shared Jenkins for bloomHash64 once it can leave
-internal/executor) — distribution-only, no contract change.
+Committed engine (healthy, all new files): bloomfilter.go, heapallindexed.go,
+verify_heapam.go, verify_nbtree.go (+tests). Last engine commit 62e67c03.
 
-⚠ TREE NOTE (STILL TRUE, STATIC since 2026-06-13 14:28 — now ~2 days): a SEPARATE
-manual session's uncommitted gen-column WIP spans internal/{executor,planner,
-catalog,analyzer,parser,mvcc}/ + server/dispatch.go + cmd/goopg/main_test.go +
-untracked gen_override test files + postgres/ + validate-ralph-state. NOT ralph's
-— stage only your own files (git add <explicit paths>), never `git add -A`. The
-amcheck SQL surface is BLOCKED on this clearing — it must touch parser (CREATE
-EXTENSION / SRF), planner, executor, catalog, all contaminated. STRONGLY consider
-surfacing to the user for a stash/commit decision: the B-tree engine is now
-logic-complete and amcheck cannot progress past it without a clean tree.
+HUMAN ACTION REQUIRED to unblock: stash/commit the foreign gen-column WIP.
 
-Other OPEN tasks (all blocked on big features): M0095-0003 (WAL streaming -X
-stream), M0110-0001 (pg_dump 002+ catalog parity), M0110-0002 (pg_waldump 002 /
-index AMs hash/gin/gist/spgist/brin).
+Next step (once tree clean): execute Slice S1 in 0110-0008 — parse/dispatch/execute
+`CREATE EXTENSION amcheck` + seed a pg_extension row; then S2 promotes AC-002.
+
+Other OPEN tasks (also blocked on big features): M0095-0003 (pg_basebackup -X
+stream), M0110-0001 (pg_dump → catalog parity), M0110-0002 (pg_waldump FPI).
+
+Gates run loop #64: go build ./... PASS; go test ./internal/amcheck PASS;
+make ralph-state-guard (run before status block).
