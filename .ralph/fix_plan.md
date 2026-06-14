@@ -1161,6 +1161,35 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         `TupleDesc`) and the SQL surface (`CREATE EXTENSION amcheck` +
         `verify_heapam`/`bt_index_check` SRF, the AC-002-promoting slice, still
         blocked on a clean tree).
+      - **PROGRESS 2026-06-14 (loop #60):** ported the **Bloom filter primitive**
+        for the last remaining B-tree tier, `heapallindexed`
+        (`postgres/src/backend/lib/bloomfilter.c` + `.h` → new
+        `internal/amcheck/bloomfilter.go`). heapallindexed fingerprints every
+        index tuple into a Bloom filter, then scans the heap and asserts each
+        visible heap tuple's index tuple is present (`bt_tuple_present_callback`);
+        an absent result is a genuine "heap tuple not represented in index"
+        corruption. The filter is a self-contained data structure (no
+        clog/TupleDesc/catalog/SQL coupling), so it lands engine-first/wire-later
+        in **new files only** — zero contaminated files touched. Every part is
+        upstream-verbatim (`bloomCreate`/`bloomAddElement`/`bloomLacksElement`/
+        `bloomPropBitsSet`/`myBloomPower`/`optimalK`/`kHashesValues`/`modM`, the
+        1MB-floor/512MB-cap power-of-two sizing, enhanced double hashing) with a
+        **single documented divergence**: the hash. Upstream seeds from
+        `hash_any_extended` (Jenkins lookup3, mirrored as the unexported
+        `pgHashBytesExtended` in `internal/executor/hash_partition.go`); importing
+        it would entangle amcheck with the contaminated executor package, and
+        since no-false-negatives holds for any shared hash, the port uses a
+        self-contained seeded FNV-1a + MurmurHash3 `fmix64` finalizer. 8 unit
+        tests: no-false-negatives (load-bearing — a false negative is a spurious
+        corruption report), realistic-regime FP rate < 5%, seed-distinguishes-FPs,
+        sizing invariants, empty/variable-length elements, `myBloomPower`/
+        `optimalK`/`modM` helpers. `go test ./internal/amcheck` PASS; `go build
+        ./...` OK; gofmt/vet clean. Design doc `0110-0006-amcheck-bloom-filter.md`
+        + README index. STILL DEFERRED (resume points): the heapallindexed heap
+        scan + index-tuple formation (needs heap relation + index `TupleDesc`),
+        the `CREATE EXTENSION amcheck` + SRF SQL surface (AC-002-promoting, still
+        blocked on a clean tree), and hash unification once Jenkins can be shared
+        without cross-package entanglement (distribution-only, no contract change).
 
 ### pg_resetwal (2 tests — excluded → candidate)
 
