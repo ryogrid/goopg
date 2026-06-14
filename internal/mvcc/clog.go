@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -36,6 +37,15 @@ const (
 // per bank gives fine-grained locking: concurrent commits on different banks
 // never contend on the same mutex.
 const xidsPerBank = 128 * 1024
+
+// clogFlatPageSize is the granularity of an incremental flat-file flush
+// (M0117-0005). The flat file is one byte per XID, so a flat page covers this
+// many consecutive XIDs starting at file offset page*clogFlatPageSize. Chosen
+// equal to the storage block size (8192); xidsPerBank is an exact multiple of
+// it (128*1024 / 8192 = 16 pages per bank) so a flat page never straddles two
+// banks — page p lives in bank p/(xidsPerBank/clogFlatPageSize) at intra-bank
+// offset (p%…)*clogFlatPageSize.
+const clogFlatPageSize = 8192
 
 // clogBank holds the per-bank lock and XID status bytes.
 type clogBank struct {
@@ -67,6 +77,29 @@ type CLog struct {
 	// CLOG_TRUNCATE WAL record (G9). Installed by initdb.Open after recovery
 	// completes; nil during recovery so replay does not re-append. nil-safe.
 	truncateLogger func(oldestXid storage.TransactionID) error
+
+	// --- M0117-0005: incremental flush + group commit (gap G7) ---
+
+	// flushMu is the single serialisation point for durable writes (the flat
+	// file and the SLRU). The group-commit leader (clog_groupcommit.go) holds
+	// it while applying a batch; the whole-file flush() callers
+	// (InitializeAsCommitted / MarkUnknownAsAborted / TruncateCLOG) hold it so a
+	// full rewrite never interleaves with an incremental page write.
+	flushMu sync.Mutex
+
+	// dirtyMu guards dirtyPages.
+	dirtyMu sync.Mutex
+	// dirtyPages is the set of flat-file pages (clogFlatPageSize units) whose
+	// bytes changed since the last durable flush. setStatus records the touched
+	// page here; the group-commit leader replays ONLY these pages with WriteAt
+	// instead of rewriting the whole file. Lazily created (nil-safe for the
+	// direct &CLog{} construction used by tests).
+	dirtyPages map[int64]struct{}
+
+	// groupHead is the head of the lock-free group-commit stack (Treiber stack),
+	// mirroring PG's ProcGlobal->clogGroupFirst. Zero value (nil) means the
+	// group is empty. See clog_groupcommit.go.
+	groupHead atomic.Pointer[clogGroupNode]
 }
 
 // SetTruncateLogger installs the WAL-writer hook that TruncateCLOG calls to
@@ -592,15 +625,106 @@ func (c *CLog) setStatus(xid storage.TransactionID, status TxnStatus) error {
 	b.data[byt] = byte(status)
 	b.mu.Unlock()
 
-	if err := c.flush(); err != nil {
-		return err
+	// Record the touched flat-file page so the durable write replays only the
+	// changed page(s), not the whole file (M0117-0005 Part A).
+	c.markFlatDirty(xid)
+
+	// Route the durable write (incremental flat page + SLRU fsync) through the
+	// group-commit layer so concurrent committers share one batched flush
+	// (M0117-0005 Part B, mirroring PG TransactionGroupUpdateXidStatus).
+	return c.groupUpdate(xid, status)
+}
+
+// markFlatDirty records that the flat-file page holding xid has changed and
+// must be re-written on the next durable flush (M0117-0005).
+func (c *CLog) markFlatDirty(xid storage.TransactionID) {
+	page := int64(xid) / clogFlatPageSize
+	c.dirtyMu.Lock()
+	if c.dirtyPages == nil {
+		c.dirtyPages = make(map[int64]struct{})
 	}
-	return c.mirrorToSLRUUnlocked(xid, status)
+	c.dirtyPages[page] = struct{}{}
+	c.dirtyMu.Unlock()
+}
+
+// flushDirtyPagesLocked writes only the flat-file pages recorded by
+// markFlatDirty back to disk, then clears the dirty set. Each dirty page is
+// assembled from its bank's bytes and written with WriteAt at offset
+// page*clogFlatPageSize (extending the file with a zero gap if needed — zero ==
+// TxnStatusUnknown, harmless). Like the legacy whole-file flush(), the flat
+// file is NOT fsynced: the fsynced pg_xact/ SLRU is the durable source of truth
+// and MarkUnknownAsAborted repairs the flat cache after a crash. The caller
+// MUST hold flushMu so a concurrent whole-file flush() cannot interleave.
+// M0117-0005.
+func (c *CLog) flushDirtyPagesLocked() error {
+	c.dirtyMu.Lock()
+	if len(c.dirtyPages) == 0 {
+		c.dirtyMu.Unlock()
+		return nil
+	}
+	pages := make([]int64, 0, len(c.dirtyPages))
+	for p := range c.dirtyPages {
+		pages = append(pages, p)
+	}
+	c.dirtyPages = make(map[int64]struct{})
+	c.dirtyMu.Unlock()
+
+	f, err := os.OpenFile(c.path, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return fmt.Errorf("clog: open %q: %w", c.path, err)
+	}
+	defer f.Close()
+
+	const pagesPerBank = xidsPerBank / clogFlatPageSize
+	buf := make([]byte, clogFlatPageSize)
+	for _, page := range pages {
+		// Assemble the page from its owning bank (a flat page never straddles
+		// two banks — see clogFlatPageSize).
+		for i := range buf {
+			buf[i] = 0
+		}
+		bi := int(page) / pagesPerBank
+		within := (int(page) % pagesPerBank) * clogFlatPageSize
+		if b := c.getBank(bi); b != nil {
+			b.mu.RLock()
+			if within < len(b.data) {
+				end := within + clogFlatPageSize
+				if end > len(b.data) {
+					end = len(b.data)
+				}
+				copy(buf, b.data[within:end])
+			}
+			b.mu.RUnlock()
+		}
+		if _, err := f.WriteAt(buf, page*clogFlatPageSize); err != nil {
+			return fmt.Errorf("clog: write page %d to %q: %w", page, c.path, err)
+		}
+	}
+	return nil
 }
 
 // flush collects all bank data into a single flat slice and writes it to the
 // clog file. Acquires banksMu.RLock() and per-bank mu.RLock() to read data.
+//
+// This is the whole-file rewrite, retained for the bulk/relayout callers
+// (InitializeAsCommitted, MarkUnknownAsAborted, TruncateCLOG); the per-commit
+// hot path uses incremental page writes via the group-commit layer instead
+// (M0117-0005). flush() takes flushMu so a full rewrite never interleaves with
+// an incremental page write, and clears the dirty-page set because the full
+// rewrite supersedes every pending page.
 func (c *CLog) flush() error {
+	c.flushMu.Lock()
+	defer c.flushMu.Unlock()
+	return c.flushLocked()
+}
+
+// flushLocked is flush() without acquiring flushMu; the caller must already
+// hold it (the group-commit leader does, when it needs a full rewrite).
+func (c *CLog) flushLocked() error {
+	c.dirtyMu.Lock()
+	c.dirtyPages = nil // superseded by the whole-file rewrite below
+	c.dirtyMu.Unlock()
+
 	c.banksMu.RLock()
 	nBanks := len(c.banks)
 	c.banksMu.RUnlock()
