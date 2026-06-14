@@ -1,47 +1,40 @@
-Task: M0110-0003 amcheck (SQL surface still BLOCKED on foreign gen-column WIP) +
-NEW M0110-0007 (btree split prev-link bug discovered this loop).
+Task: M0117-0006 (SLRU buffer pool / 2-bit collapse, gap G6; P2, Effort-L) —
+Part A DONE this loop. Part B/C DEFERRED (see deferral ledger 2026-06-15).
 
-DISPOSITION loop #29 (2026-06-14): did NOT rubber-stamp BLOCKED. The amcheck
-engine is logic-complete (heap + B-tree), so I added the engine's missing
-real-producer validation — and it found a real bug.
+CONTEXT / GROUND TRUTH: main HEAD still carries the foreign M0100-0010 catalog WIP
+(unreconciled). All M0117 work continues in stacked isolated worktrees off the
+previous M0117 tip — never touching the main tree's foreign WIP.
 
-WHAT LANDED (uncontaminated, new test file only):
-- `internal/amcheck/verify_nbtree_realtree_test.go` — builds LIVE multi-level
-  B-trees via real btree.Create/Insert/split and runs every engine tier
-  (per-page, item-order, cross-level downlinks, sibling-link walk, heapallindexed
-  round-trip) over real on-disk pages. Symmetric counterpart to loop #64's heap
-  verify_heapam_realpage_test.go.
-- Sorted int4/int8/varchar trees → ALL tiers silent (validates engine decode vs
-  goopg's real layout, incl. variable-length opaque high keys).
-- Design doc 0110-0005 extended ("Real-producer B-tree validation"); fix_plan
-  progress note + new item M0110-0007; deferral ledger appended.
+WHAT LANDED (M0117-0006 Part A): branch `m0117-0006-clog-slru-buffer-pool` off
+`5fcdb27b` (M0117-0005), worktree `.claude/worktrees/m0117-0006`. Files:
+  - internal/config/defaults.go + postgresql.conf.sample: `transaction_buffers`
+    GUC (PGC_POSTMASTER, boot_val 0, max 1GiB/8192; unit-less raw buffer count).
+  - internal/mvcc/clog_bufferpool.go (NEW): EffectiveCLOGBuffers (port of
+    clog.c:CLOGShmemBuffers + SimpleLruAutotuneBuffers); clogBufferPool — bounded
+    LRU page cache over the 2-bit SLRU repr, backed by pg_xact/ segment files
+    (pinPageLocked fault-in, evictVictimLocked LRU + dirty writeback, getStatus,
+    setStatus clear-then-set ≙ TransactionIdSetStatusBit, flushDirty per-segment
+    fsync). NOT wired into live CLOG — blast radius nil.
+  - internal/mvcc/clog_bufferpool_test.go (NEW): 5 tests incl. encode↔encode
+    equivalence vs mirrorToSLRUUnlocked (sibling-path guard).
+  - design 0117-0006 + README index; fix_plan M0117-0006 updated (Part A/B/C);
+    deferral ledger line.
 
-BUG FOUND (filed M0110-0007, NOT fixed this loop):
-- goopg `splitAndInsert` (internal/access/btree/btree.go ~L1454-1466 / L1522)
-  never updates the OLD right sibling's btpo_prev on a non-rightmost split → stale
-  left-link on any non-append insert pattern (random PK/UUID/secondary index).
-  Only manifests on MIDDLE splits (sorted inserts split only rightmost → no
-  sibling → invisible; that's why only the shuffled test trips it).
-- btpo_prev is load-bearing: btree_vacuum.go reads op.Prev + WAL-logs
-  RightSibNewPrev to relink siblings on page deletion. Real correctness gap.
-- Fix is a WAL/concurrency change (fold old right sibling into atomic split WAL
-  record + replay + Lehman-Yao lock order); needs -race + recovery gates → its own
-  bounded loop, NOT a blind engine-loop change. internal/access/btree is CLEAN.
-- TestVerifyBtreeEngineDetectsStaleSiblingLinkOnRealTree pins current behaviour as
-  a DETECTION assertion; flip to silence when M0110-0007 lands.
+KEY NOTES: Part A is purely additive (no live caller of the pool yet), so it
+cannot regress visibility. Pool encoding pinned byte-identical to the existing
+SLRU writer. clear-then-set is the PG-faithful primitive; the live wiring (Part B)
+must reconcile it with the legacy OR-mirror durability invariant (M0117-0004).
 
-Gates run: go test -race ./internal/amcheck (PASS); go build ./... (clean);
-go vet ./internal/amcheck ./internal/access/btree (clean); ralph-state-guard
-(before status block).
+Gates run: build ./... PASS; -race ./internal/mvcc/... PASS; config (GUC+sample)
+PASS; initdb+server PASS; gofmt/vet clean; ralph-state-guard. TPC-H spotcheck SKIPs
+under worktree isolation (no-op — no live CLOG path changed).
 
-Contamination UNCHANGED: foreign gen-column WIP frozen 2026-06-13 14:28 (~28h);
-catalog/parser/planner/executor/analyzer/mvcc + server/dispatch dirty + 2
-untracked gen_override tests. HUMAN must clear it.
+Next step: M0117-0006 Part B in a DEDICATED session that can run the full TPC-H
+Q12/Q13 + standby-visibility gate: wire CLog.GetStatus/setStatus through
+clogBufferPool, settling the design-doc open questions (mirror-disabled fallback,
+OR-vs-clear-then-set, truncation-via-page-invalidation); then Part C drops the
+resident banks + flat file. OR pick the next P2 item: M0117-0007 (async-commit LSN)
+or M0117-0008 (datfrozenxid persistence).
 
-Next step (priority order):
-1. M0110-0007: dedicated bounded btree/WAL loop on the CLEAN internal/access/btree
-   package — update old right sibling prev-link on split + atomic WAL + replay +
-   race/recovery gates; flip the detection test to silence.
-2. After human clears tree: amcheck SQL surface S1/S2 (0110-0008) over finished
-   engine → port 002_nonesuch → flip CSV AC-002→port.
-3. CREATE TABLESPACE DDL (M0095-0003/011); pg_dump 002+ catalog parity (M0110-0001).
+PENDING HUMAN: reconcile foreign M0100-0010 WIP, then merge stacked chain in order
+m0117-0001 → -0002 → -0003 → -0004 → -0005 → -0006.

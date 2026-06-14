@@ -49,6 +49,9 @@
 
 #shared_buffers = 128MB                 # min 128kB
                                         # (change requires restart)
+#transaction_buffers = 0                # CLOG SLRU page-cache buffers;
+                                        # 0 = auto from shared_buffers
+                                        # (change requires restart)
 #work_mem = 512MB                       # min 64kB
 
 # - Background Writer -

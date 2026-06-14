@@ -1874,12 +1874,34 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
       - Author `docs/design/0117-0005-clog-incremental-flush-group-commit.md` and index it before coding.
       - Gate: `go test -race ./internal/mvcc/...` + commit-throughput sanity check. Effort: M.
 
-- [ ] **M0117-0006**
+- [ ] **M0117-0006** — Part A DONE; Part B/C DEFERRED (Effort-L memory-model rewrite of the
+      highest-blast-radius subsystem, decomposed; see deferral ledger 2026-06-15).
+      Branch `m0117-0006-clog-slru-buffer-pool` (off `5fcdb27b`; design
+      `docs/design/0117-0006-clog-slru-buffer-pool.md`, indexed).
+      - **Part A (landed):** the `transaction_buffers` GUC (`defaults.go` +
+        `postgresql.conf.sample`, PGC_POSTMASTER, boot_val 0, max 1GiB/BLCKSZ; raw buffer
+        count == PG's GUC_UNIT_BLOCKS value) + `EffectiveCLOGBuffers` (faithful port of
+        `clog.c:CLOGShmemBuffers + SimpleLruAutotuneBuffers`) + `clogBufferPool`
+        (`internal/mvcc/clog_bufferpool.go`): bounded LRU page cache over the 2-bit SLRU
+        representation backed by the `pg_xact/` segment files (fault-in, LRU eviction with
+        dirty writeback, clear-then-set lane update ≙ `TransactionIdSetStatusBit`, per-segment
+        fsync in `flushDirty`). NOT wired into the live path — blast radius nil. Pinned by
+        `internal/mvcc/clog_bufferpool_test.go` incl. a sibling-path encode↔encode equivalence
+        test vs `mirrorToSLRUUnlocked`.
+      - **Part B (deferred):** wire `CLog.GetStatus`/`setStatus` (+ bulk callers, `loadFromSLRU`,
+        `HighestKnownXID`, `TruncateCLOG`, `distributeToBanks`) through the pool. Resume point /
+        open questions in the design doc: mirror-disabled fallback, OR-vs-clear-then-set semantics
+        (keep the M0117-0004 visibility invariant), truncation-via-page-invalidation.
+      - **Part C (deferred):** remove the resident `banks` + `global/pg_xact` flat file (the 2-bit
+        collapse, 16× memory reduction).
       - Summary: SLRU buffer pool / 2-bit collapse (gap G6; P2; follows M0117-0005).
         Replace the fully-resident per-bank byte slices with a bounded page-cache over
         the 2-bit SLRU representation (LRU eviction; `transaction_buffers` GUC).
-      - Author `docs/design/0117-0006-clog-slru-buffer-pool.md` and index it before coding.
       - Gate: `go test -race ./internal/mvcc/...`; full mvcc/wal/initdb suites; re-init data dir (memory-model change). Effort: L.
+      - Gates run (Part A): `go build ./...` PASS; `go test -race ./internal/mvcc/...` PASS;
+        `go test ./internal/config/...` PASS (GUC + sample coverage); `go test
+        ./internal/initdb/... ./internal/server/...` PASS; gofmt/vet clean. TPC-H spotcheck SKIPs
+        under worktree isolation — no-op (no live CLOG path changed).
 
 - [ ] **M0117-0007**
       - Summary: Async-commit LSN tracking (gap G8; P2; feature-gated on a real
