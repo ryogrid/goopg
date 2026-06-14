@@ -369,3 +369,48 @@ func TestPageItemKeys(t *testing.T) {
 		t.Errorf("slot 2 posting key mismatch: got %x want %x", keys[1], EncodeInt4(2))
 	}
 }
+
+// TestPageLeafEntries verifies PageLeafEntries returns one (key, heap TID) entry
+// per heap TID — unlike PageItemKeys it EXPANDS a posting-list item to one entry
+// per TID, the behaviour amcheck's heapallindexed tier relies on to fingerprint
+// every heap row the index references (verify_nbtree.c's bt_posting_plain_tuple).
+func TestPageLeafEntries(t *testing.T) {
+	p := make(storage.Page, storage.BlockSize)
+	initPage(p, BTPageOpaque{Prev: storage.InvalidBlockNumber, Next: storage.InvalidBlockNumber, Flags: BTLeaf})
+
+	// Slot 1: regular single-TID item, key = int4(1), TID = (0,1).
+	regTID := storage.ItemPointer{Block: 0, Offset: 1}
+	reg := item{keyLen: uint16(len(EncodeInt4(1))), ptr: regTID, key: EncodeInt4(1)}
+	if _, err := storage.PageAddItemRaw(p, reg.marshal()); err != nil {
+		t.Fatalf("add regular: %v", err)
+	}
+	// Slot 2: posting item, key = int4(2), three TIDs — must expand to three.
+	postTIDs := []storage.ItemPointer{{Block: 0, Offset: 2}, {Block: 0, Offset: 3}, {Block: 1, Offset: 1}}
+	if _, err := storage.PageAddItemRaw(p, marshalPosting(EncodeInt4(2), postTIDs)); err != nil {
+		t.Fatalf("add posting: %v", err)
+	}
+
+	entries, err := PageLeafEntries(p)
+	if err != nil {
+		t.Fatalf("PageLeafEntries: %v", err)
+	}
+	// 1 plain + 3 posting TIDs = 4 expanded entries.
+	if len(entries) != 4 {
+		t.Fatalf("PageLeafEntries returned %d entries, want 4 (posting expanded per TID)", len(entries))
+	}
+
+	// Slot 1 entry.
+	if CompareKeys(entries[0].Key, EncodeInt4(1)) != 0 || entries[0].TID != regTID {
+		t.Errorf("entry 0 = (%x, %v), want (%x, %v)", entries[0].Key, entries[0].TID, EncodeInt4(1), regTID)
+	}
+	// The three posting entries share key int4(2) and carry the TIDs in order.
+	for i, tid := range postTIDs {
+		e := entries[1+i]
+		if CompareKeys(e.Key, EncodeInt4(2)) != 0 {
+			t.Errorf("posting entry %d key = %x, want %x", i, e.Key, EncodeInt4(2))
+		}
+		if e.TID != tid {
+			t.Errorf("posting entry %d TID = %v, want %v", i, e.TID, tid)
+		}
+	}
+}

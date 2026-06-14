@@ -1190,6 +1190,41 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         the `CREATE EXTENSION amcheck` + SRF SQL surface (AC-002-promoting, still
         blocked on a clean tree), and hash unification once Jenkins can be shared
         without cross-package entanglement (distribution-only, no contract change).
+      - **PROGRESS 2026-06-14 (loop #61):** ported the **heapallindexed
+        fingerprint+probe core** — the last B-tree verification tier — as a pure
+        function `VerifyBtreeHeapAllIndexed` (new `internal/amcheck/heapallindexed.go`),
+        consuming the loop-#60 Bloom primitive. It fingerprints every index leaf
+        entry into a filter sized to the exact count, then probes the index tuple
+        each live heap tuple would form; emits one `BtreeReport` per lacking entry
+        with the verbatim upstream message `heap tuple (b,o) from table "T" lacks
+        matching index tuple within index "I"` (+ heap block). Soundness rests on
+        the filter's no-false-negatives contract: a healthy heap tuple is never
+        flagged; false positives only mask a `<2%` fraction of real misses, never
+        invent corruption. One `fingerprintLeafEntry` (`TID.Block` big-endian ++
+        `TID.Offset` ++ key bytes) drives BOTH the fingerprint and probe phases, so
+        a present `(key, TID)` hashes identically on both sides (sibling-path
+        invariant). New exported `btree.PageLeafEntries` is the canonical leaf
+        reader the wire-later fingerprint phase will use — it EXPANDS posting-list
+        items to one entry per heap TID (unlike `PageItemKeys`, which collapses to
+        one separator key), placed beside `PageItemKeys`/`PageDownlinks` as single
+        source of truth against v3→v4 inline-item drift. Divergences from upstream:
+        no `bt_normalize_tuple` step (goopg does not TOAST index keys → leaf and
+        heap-formed key bytes are already one canonical `EncodeXxxKey` form), and
+        the Bloom seed is a parameter (caller randomizes per run, tests pin it).
+        Still **new files only** — zero contaminated files touched. Tests: 6 amcheck
+        (`heapallindexed_test.go`: no-false-negatives load-bearing at n=100k,
+        missing-tuple detection w/ exact message+block, TID-distinguishes,
+        empty-index/empty-heap boundaries, shared-key-distinct-TIDs posting
+        semantics) + 1 btree (`TestPageLeafEntries`: plain + 3-TID posting → 4
+        expanded entries). `go test ./internal/amcheck ./internal/access/btree`
+        PASS; `go build` OK; gofmt/vet clean. Design doc
+        `0110-0007-amcheck-heapallindexed.md` + README index. STILL DEFERRED
+        (resume points): the lazy heap scan + index-tuple formation via index
+        `TupleDesc` (catalog coupling), the `CREATE EXTENSION amcheck` +
+        `bt_index_check(…, heapallindexed => true)` SQL surface (AC-002-promoting,
+        still blocked on a clean tree), and hash unification (distribution-only).
+        **The B-tree verification engine is now logic-complete** — every tier
+        `bt_check_every_level` performs is ported; only the SQL surface remains.
 
 ### pg_resetwal (2 tests — excluded → candidate)
 

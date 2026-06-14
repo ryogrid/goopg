@@ -1086,6 +1086,61 @@ func PageItemKeys(p storage.Page) ([][]byte, error) {
 	return out, nil
 }
 
+// LeafEntry is one (index key, heap TID) pair on a B-tree leaf page: the key
+// and the heap location it points to. Posting-list items (M0047-0003) — which
+// pack many heap TIDs under one shared key — are expanded to one LeafEntry per
+// TID, so the entries returned here are the "plain" tuples upstream amcheck
+// fingerprints for heapallindexed verification (verify_nbtree.c's
+// bt_posting_plain_tuple expansion).
+type LeafEntry struct {
+	Key []byte
+	TID storage.ItemPointer
+}
+
+// PageLeafEntries returns every (key, heap TID) entry on a B-tree leaf page, in
+// physical slot order (slot 1..N), expanding each posting-list item to one
+// entry per TID. It returns an error if any line pointer cannot be decoded, so a
+// structurally damaged leaf page surfaces to the caller rather than yielding a
+// misleading entry set.
+//
+// Exported, like PageItemKeys / PageDownlinks, so amcheck's heapallindexed
+// checker (internal/amcheck.VerifyBtreeHeapAllIndexed) fingerprints the leaf
+// entries through the canonical on-disk reader here instead of re-deriving the
+// inline (keyLen, TID) item layout — the same single-source-of-truth discipline
+// that guards against the v3->v4 layout drift. Unlike PageItemKeys (which
+// collapses a posting item to its one separator key for the item-order tier),
+// this expands posting items because heapallindexed fingerprints every heap TID
+// the index references.
+func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
+	count, err := storage.PageLinePointerCount(p)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]LeafEntry, 0, count)
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(p, slot)
+		if err != nil {
+			return nil, err
+		}
+		if isPostingRaw(raw) {
+			key, tids, perr := parsePostingRaw(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			for _, tid := range tids {
+				out = append(out, LeafEntry{Key: key, TID: tid})
+			}
+		} else {
+			it, perr := parseItem(raw)
+			if perr != nil {
+				return nil, perr
+			}
+			out = append(out, LeafEntry{Key: it.key, TID: it.ptr})
+		}
+	}
+	return out, nil
+}
+
 // Downlink is one (separator key, child block) entry on an internal B-tree
 // page: the key routes a search to the child block it precedes. By v0
 // convention the leftmost item's key is empty (negative infinity), so its
