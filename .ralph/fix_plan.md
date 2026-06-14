@@ -1936,12 +1936,34 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
         `TestE2E_PhysicalReplication{,Sync}` PASS; gofmt/vet clean. TPC-H spotcheck SKIPs under worktree
         isolation — no-op (no live CLOG path changed).
 
-- [ ] **M0117-0008**
+- [ ] **M0117-0008** — Part A DONE (via chain M0117-0004); Part B DEFERRED (see deferral
+      ledger 2026-06-15). Design `docs/design/0117-0008-datfrozenxid-persistence.md`
+      authored + indexed (branch `m0117-0008-datfrozenxid-persist` off `1f1100e8`).
       - Summary: Persist `datfrozenxid` in the `pg_database` catalog tuple at VACUUM
         end (rather than only computing it on demand) and extend the dual-store
         consistency tests for round-trip coverage of all status codes.
-      - Author `docs/design/0117-0008-datfrozenxid-persistence.md` and index it before coding.
-      - Gate: `go test ./internal/catalog/...`; re-init data dir + regress-port re-run (catalog tuple-format change). Effort: S.
+      - Author `docs/design/0117-0008-datfrozenxid-persistence.md` and index it before coding. (DONE.)
+      - **Part A (DONE via chain M0117-0004):** the "dual-store consistency for all
+        status codes" deliverable is already satisfied —
+        `internal/mvcc/clog_dual_store_consistency_test.go` round-trips all four CLOG
+        lanes (IN_PROGRESS/Unknown 0x00 via truncation, COMMITTED 0x01, ABORTED 0x02,
+        SUB_COMMITTED 0x03) flat-file ↔ SLRU across adjacent lanes, a page boundary,
+        two segments, and a TruncateCLOG. Verified green this loop (`go test -race
+        -run 'TestCLogDualStoreConsistency|TestCLogSubCommittedResolvesViaParent|TestCLogTruncateKeepsStoresConsistent' ./internal/mvcc/`).
+      - **Part B (DEFERRED):** on-disk in-place `pg_database.datfrozenxid` persistence
+        at VACUUM end. NOT the labelled Effort-S — investigation established: no
+        runtime shared-catalog `RelFileNode` resolver (pg_database is shared at
+        `global/1262`; the in-memory catalog maps only user tables); the only runtime
+        catalog-heap precedent (`syncTableToCatalogHeap`) is an *append* of
+        pg_class/pg_attribute, not an in-place field overwrite; a faithful
+        `heap_inplace_update` needs buffer-lock + WAL logging + a PG-standby-attach
+        E2E to verify (SKIPs under worktree isolation). goopg's own CLOG truncation
+        reads in-memory `cat.DatFrozenXID()` directly, so this is purely external
+        (standby/tooling) parity + restart-survivability — blast radius bounded.
+        Full 5-step Part-B plan in the design doc. Defers to a dedicated full-gate
+        session per `m0074_partial_scope_lessons`.
+      - Gate (Part B): `go test ./internal/catalog/...`; re-init data dir + regress-port
+        re-run (catalog tuple-format change) + PG-standby-attach E2E. Effort: M (not S).
 
 
 ## Notes
