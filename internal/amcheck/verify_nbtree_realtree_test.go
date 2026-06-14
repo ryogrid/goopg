@@ -268,22 +268,25 @@ func TestVerifyBtreeEngineSilentOnRealInt8(t *testing.T) {
 	}
 }
 
-// TestVerifyBtreeEngineDetectsStaleSiblingLinkOnRealTree builds a B-tree with
-// SHUFFLED inserts (forcing middle-of-level splits) and pins the real goopg btree
-// bug the real-producer harness uncovered: splitAndInsert never updates the old
-// right sibling's btpo_prev (btree.go:1454-1466 sets the NEW right page's prev to
-// the left block and the left page's next to the new page, but the page that was
-// the left page's right sibling keeps its prev pointing at the left page). The
-// sibling-link tier therefore finds at least one "left link/right link pair ...
-// not in agreement" on the leaf level, while every other tier stays silent
-// (they do not read btpo_prev).
+// TestVerifyBtreeEngineSilentOnRealShuffledInt4 builds a B-tree with SHUFFLED
+// inserts (forcing MIDDLE-of-level splits, not just rightmost ones) and asserts
+// every tier — including the cross-page sibling-link walk — stays silent.
 //
-// This is the false-positive guard working in reverse — it asserts the engine
-// CORRECTLY DETECTS a real on-disk inconsistency a healthy PG tree would never
-// have. When the split is fixed to maintain the old right sibling's prev-link
-// (the tracked follow-up), this test must FLIP: replace the detection assertion
-// below with the silence assertion the sorted tests use.
-func TestVerifyBtreeEngineDetectsStaleSiblingLinkOnRealTree(t *testing.T) {
+// This test was previously a DETECTION assertion: the real-producer harness
+// uncovered that goopg's splitAndInsert never updated the OLD right sibling's
+// btpo_prev on a non-rightmost split (it set the new right page's prev and the
+// left page's next, but the page that used to be left's right sibling kept its
+// btpo_prev pointing at the left block — a stale left-link on any non-append
+// insert pattern). btpo_prev is load-bearing (btree_vacuum.go reads op.Prev and
+// WAL-logs RightSibNewPrev to relink siblings on page deletion), so the stale
+// link was a genuine on-disk correctness gap.
+//
+// M0110-0007 fixed the split path to relink the old right sibling's btpo_prev to
+// the new right page, atomically with the split (third page in the
+// BtreeSplit WAL record; mirrors PostgreSQL _bt_split). The shuffled tree is now
+// internally consistent, so the sibling-link tier — which a healthy PG tree
+// never trips — must stay silent here, exactly as it does for the sorted cases.
+func TestVerifyBtreeEngineSilentOnRealShuffledInt4(t *testing.T) {
 	const n = 3000
 	rng := rand.New(rand.NewSource(20260614))
 	perm := rng.Perm(n)
@@ -295,21 +298,13 @@ func TestVerifyBtreeEngineDetectsStaleSiblingLinkOnRealTree(t *testing.T) {
 	defer cleanup()
 	src := realPageSource(t, pool, rel)
 
-	// Every non-sibling tier is still silent on the (otherwise healthy) pages.
-	levels := assertNonSiblingTiersSilent(t, mgr, pool, rel, n)
-
-	detected := false
-	for _, lm := range levels {
-		for _, r := range amcheck.VerifyBtreeLevelSiblingLinks(src, lm, "ix_real") {
-			if r.Msg == `left link/right link pair in index "ix_real" not in agreement` {
-				detected = true
-			}
+	for _, lm := range assertNonSiblingTiersSilent(t, mgr, pool, rel, n) {
+		// Shuffled inserts split middle pages, so each split must relink the
+		// old right sibling's btpo_prev — the sibling-link tier proves it did.
+		if r := amcheck.VerifyBtreeLevelSiblingLinks(src, lm, "ix_real"); r != nil {
+			t.Fatalf("VerifyBtreeLevelSiblingLinks(leftmost %d) false positive on "+
+				"shuffled tree — a stale old-right-sibling prev-link survived a "+
+				"middle-of-level split (M0110-0007 regression?): %+v", lm, r)
 		}
-	}
-	if !detected {
-		t.Fatalf("expected the sibling-link tier to detect the stale old-right-sibling " +
-			"prev-link left by splitAndInsert on a middle-of-level split; got none — " +
-			"either the split bug was fixed (flip this test to a silence assertion) or " +
-			"the engine regressed")
 	}
 }

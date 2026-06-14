@@ -312,7 +312,7 @@ func TestReplayBtreeSplitAtomic(t *testing.T) {
 	leftAfter := mustPageWithByte(t, 0x44)
 	rightAfter := mustPageWithByte(t, 0x55)
 
-	rec, err := EncodeBtreeSplit(rel, 1, 2, leftAfter, rightAfter)
+	rec, err := EncodeBtreeSplit(rel, 1, 2, leftAfter, rightAfter, storage.InvalidBlockNumber, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,6 +343,58 @@ func TestReplayBtreeSplitAtomic(t *testing.T) {
 	}
 }
 
+// TestReplayBtreeSplitAtomicNonRightmost pins M0110-0007: a
+// non-rightmost split's record carries a THIRD page — the old right
+// sibling whose btpo_prev was relinked to the new right block —
+// and replay applies it so crash recovery never leaves the sibling
+// chain half-relinked. The sibling already exists on disk (it
+// predates the split), so replay must WriteBlock it, not Extend.
+func TestReplayBtreeSplitAtomicNonRightmost(t *testing.T) {
+	dataDir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dataDir})
+	defer mgr.Close()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 903, Fork: storage.MainFork}
+
+	// Blocks 0 (meta stand-in), 1 (left), 2 (old right sibling) all
+	// pre-exist; block 3 (new right) is Extend'd by replay.
+	zero := mustPageWithByte(t, 0)
+	for i := 0; i < 3; i++ {
+		if _, err := mgr.Extend(rel, zero); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	leftAfter := mustPageWithByte(t, 0x44)
+	rightAfter := mustPageWithByte(t, 0x55)
+	sibAfter := mustPageWithByte(t, 0x66) // old right sibling, relinked
+
+	rec, err := EncodeBtreeSplit(rel, 1, 3, leftAfter, rightAfter, 2, sibAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := ReplayRecords(mgr, []Record{{StartLSN: 1, EndLSN: 100, Payload: rec}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Applied != 1 {
+		t.Fatalf("Applied=%d want 1", stats.Applied)
+	}
+
+	for _, c := range []struct {
+		blk  storage.BlockNumber
+		want byte
+	}{{1, 0x44}, {3, 0x55}, {2, 0x66}} {
+		got := make(storage.Page, storage.BlockSize)
+		if err := mgr.ReadBlock(rel, c.blk, got); err != nil {
+			t.Fatal(err)
+		}
+		if got[100] != c.want {
+			t.Fatalf("block %d byte = %#x, want %#x", c.blk, got[100], c.want)
+		}
+	}
+}
+
 // TestEncodeDecodeBtreeSplitRoundTrip pins the on-the-wire shape
 // of the new record so a future-format change can't silently
 // rearrange fields and break replay against pre-existing WAL.
@@ -350,14 +402,14 @@ func TestEncodeDecodeBtreeSplitRoundTrip(t *testing.T) {
 	rel := storage.RelFileNode{DBOid: 7, RelOid: 8, Fork: storage.MainFork}
 	left := mustPageWithByte(t, 0x10)
 	right := mustPageWithByte(t, 0x20)
-	enc, err := EncodeBtreeSplit(rel, 41, 42, left, right)
+	enc, err := EncodeBtreeSplit(rel, 41, 42, left, right, storage.InvalidBlockNumber, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if enc[0] != RecordKindBtreeSplit {
 		t.Errorf("kind byte = %d, want %d", enc[0], RecordKindBtreeSplit)
 	}
-	gotRel, gotL, gotR, leftP, rightP, err := DecodeBtreeSplit(enc)
+	gotRel, gotL, gotR, leftP, rightP, gotSib, sibP, err := DecodeBtreeSplit(enc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,6 +418,30 @@ func TestEncodeDecodeBtreeSplitRoundTrip(t *testing.T) {
 	}
 	if leftP[100] != 0x10 || rightP[100] != 0x20 {
 		t.Errorf("decoded page bytes mismatched")
+	}
+	if gotSib != storage.InvalidBlockNumber || sibP != nil {
+		t.Errorf("rightmost split decoded a sibling: blk=%d page=%v", gotSib, sibP != nil)
+	}
+
+	// Non-rightmost split: the record carries a third (old right
+	// sibling) page whose btpo_prev was relinked to the new right.
+	sib := mustPageWithByte(t, 0x30)
+	enc3, err := EncodeBtreeSplit(rel, 41, 42, left, right, 40, sib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(enc3) != btreeSplitHeaderSize+3*storage.BlockSize {
+		t.Fatalf("3-page record len=%d want %d", len(enc3), btreeSplitHeaderSize+3*storage.BlockSize)
+	}
+	gotRel, gotL, gotR, leftP, rightP, gotSib, sibP, err = DecodeBtreeSplit(enc3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRel != rel || gotL != 41 || gotR != 42 || gotSib != 40 {
+		t.Errorf("decoded rel/blocks=%v %d %d sib=%d", gotRel, gotL, gotR, gotSib)
+	}
+	if leftP[100] != 0x10 || rightP[100] != 0x20 || sibP == nil || sibP[100] != 0x30 {
+		t.Errorf("decoded 3-page bytes mismatched")
 	}
 }
 

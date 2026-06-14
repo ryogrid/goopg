@@ -379,8 +379,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Atomic B-tree split record (Landing 3a of M0002 — see
 	// docs/design/0002-0002-btree-concurrency.md). Same import-cycle
 	// dodge as logFPI.
-	logBtreeSplit := func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) (storage.LSN, error) {
-		payload, err := wal.EncodeBtreeSplit(rel, leftBlk, rightBlk, leftPage, rightPage)
+	logBtreeSplit := func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error) {
+		payload, err := wal.EncodeBtreeSplit(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage)
 		if err != nil {
 			return 0, err
 		}

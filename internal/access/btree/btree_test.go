@@ -188,9 +188,15 @@ func TestSplitInvokesLogSplit(t *testing.T) {
 		left, right storage.BlockNumber
 	}
 	var calls []call
-	logSplit := func(_ storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) (storage.LSN, error) {
+	logSplit := func(_ storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error) {
 		if len(leftPage) != storage.BlockSize || len(rightPage) != storage.BlockSize {
 			t.Errorf("page sizes = %d/%d, want %d", len(leftPage), len(rightPage), storage.BlockSize)
+		}
+		if sibBlk != storage.InvalidBlockNumber && len(sibPage) != storage.BlockSize {
+			t.Errorf("sibling page size = %d, want %d", len(sibPage), storage.BlockSize)
+		}
+		if sibBlk == storage.InvalidBlockNumber && sibPage != nil {
+			t.Errorf("rightmost split carried a sibling page")
 		}
 		calls = append(calls, call{leftBlk, rightBlk})
 		return storage.LSN(1000 + len(calls)), nil

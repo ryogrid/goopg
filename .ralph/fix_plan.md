@@ -1615,7 +1615,33 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         in a new `_test.go` — zero contaminated files touched. Design doc
         `0110-0005` extended ("Real-producer B-tree validation").
 
-- [ ] **M0110-0007 — B-tree split must maintain the old right sibling's prev-link**
+- [x] **M0110-0007 — B-tree split must maintain the old right sibling's prev-link**
+      - **DONE 2026-06-14 (loop #30).** `insertIntoBlock`
+        (`internal/access/btree/btree.go`) now, on a non-rightmost split
+        (pre-split `op.Next != InvalidBlockNumber`), pins+locks the old right
+        sibling and relinks its `btpo_prev` to the new right block, folded into
+        the atomic split WAL record. The `BtreeSplit` record
+        (`internal/wal/recovery.go` `EncodeBtreeSplit`/`DecodeBtreeSplit`,
+        `btreeSplitHeaderSize` 18→22 with a `SibBlk` field) carries an OPTIONAL
+        third page; `replayBtreeSplit` applies it (WriteBlock — the sibling
+        predates the split) so crash recovery never leaves the chain
+        half-relinked. Mirrors PostgreSQL `_bt_split` (locks the original right
+        sibling, stamps its left-link under the same xl_btree_split record).
+        Lock order is strictly left→right (blk → rightBlk → oldNext), matching
+        `_bt_split`, so no deadlock vs a concurrent left-descending split. On-disk
+        page format UNCHANGED (only the WAL record format changed). Signature
+        change rippled through `storage.LogBtreeSplitFunc`, `btree.LogSplitFunc`,
+        `adaptPoolLogSplit`, and the `initdb/open.go` closure.
+      - DoD met: `TestVerifyBtreeEngineDetectsStaleSiblingLinkOnRealTree` flipped
+        to the silence assertion `TestVerifyBtreeEngineSilentOnRealShuffledInt4`;
+        new `TestReplayBtreeSplitAtomicNonRightmost` (3-page replay) +
+        3-page encode/decode round-trip; `TestSplitInvokesLogSplit` extended to
+        assert sibling-page invariants. Design doc
+        `docs/design/0110-0009-btree-split-rightsibling-prevlink.md`.
+      - Gates: `go test -race ./internal/access/btree ./internal/wal
+        ./internal/mvcc ./internal/storage` PASS; `go test ./internal/amcheck
+        ./internal/executor ./internal/initdb` PASS; `go build ./...` clean;
+        TPC-H spotcheck PASS (Q12=2/Q13=33).
       - **Discovered 2026-06-14 (loop #29)** by the new real-producer B-tree
         validation (`internal/amcheck/verify_nbtree_realtree_test.go`).
       - Symptom: after any **non-rightmost** leaf/internal split (i.e. the split

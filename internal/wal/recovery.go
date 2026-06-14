@@ -426,8 +426,12 @@ const (
 
 	pageImageHeaderSize = 14
 	// btreeSplitHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
-	// Fork(1) + LeftBlk(4) + RightBlk(4) = 18.
-	btreeSplitHeaderSize = 18
+	// Fork(1) + LeftBlk(4) + RightBlk(4) + SibBlk(4) = 22.
+	// SibBlk is the old right sibling whose btpo_prev is relinked
+	// to RightBlk on a non-rightmost split; it is
+	// storage.InvalidBlockNumber for a rightmost split (no third
+	// page follows in the payload).
+	btreeSplitHeaderSize = 22
 	// heapInsertHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
 	// Fork(1) + Block(4) + LineSlot(2) = 16.
 	heapInsertHeaderSize = 16
@@ -1906,36 +1910,66 @@ func DecodeBtreeInsert(payload []byte) (rel storage.RelFileNode, blk storage.Blo
 	return
 }
 
-// EncodeBtreeSplit encodes one atomic B-tree split record. Both
-// pages must be exactly storage.BlockSize bytes; the record
-// embeds them in left-then-right order so replay applies the new
-// right page before any reader could follow left's right-link to
+// EncodeBtreeSplit encodes one atomic B-tree split record. The left
+// and right pages must be exactly storage.BlockSize bytes; the
+// record embeds them in left-then-right order so replay applies the
+// new right page before any reader could follow left's right-link to
 // it.
-func EncodeBtreeSplit(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) ([]byte, error) {
+//
+// On a NON-rightmost split the page that used to be left's right
+// sibling has its btpo_prev relinked from leftBlk to rightBlk;
+// callers pass that block as sibBlk with its post-relink image as
+// sibPage, and the record carries a third page so the relink is
+// crash-atomic with the split (mirrors PostgreSQL _bt_split, which
+// locks and stamps the original right sibling under the same WAL
+// record — nbtxlog.c xl_btree_split + the SPLIT redo applying the
+// rnext page). On a RIGHTMOST split sibBlk is
+// storage.InvalidBlockNumber and sibPage must be nil; no third page
+// follows.
+func EncodeBtreeSplit(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) ([]byte, error) {
 	if len(leftPage) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-split left page is %d bytes, want %d", len(leftPage), storage.BlockSize)
 	}
 	if len(rightPage) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-split right page is %d bytes, want %d", len(rightPage), storage.BlockSize)
 	}
-	out := make([]byte, btreeSplitHeaderSize+2*storage.BlockSize)
+	hasSib := sibBlk != storage.InvalidBlockNumber
+	if hasSib && len(sibPage) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: btree-split sibling page is %d bytes, want %d", len(sibPage), storage.BlockSize)
+	}
+	if !hasSib && sibPage != nil {
+		return nil, fmt.Errorf("wal: btree-split rightmost split must not carry a sibling page")
+	}
+	nPages := 2
+	if hasSib {
+		nPages = 3
+	}
+	out := make([]byte, btreeSplitHeaderSize+nPages*storage.BlockSize)
 	out[0] = RecordKindBtreeSplit
 	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
 	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
 	out[9] = byte(rel.Fork)
 	binary.LittleEndian.PutUint32(out[10:14], uint32(leftBlk))
 	binary.LittleEndian.PutUint32(out[14:18], uint32(rightBlk))
+	binary.LittleEndian.PutUint32(out[18:22], uint32(sibBlk))
 	copy(out[btreeSplitHeaderSize:btreeSplitHeaderSize+storage.BlockSize], leftPage)
-	copy(out[btreeSplitHeaderSize+storage.BlockSize:], rightPage)
+	copy(out[btreeSplitHeaderSize+storage.BlockSize:btreeSplitHeaderSize+2*storage.BlockSize], rightPage)
+	if hasSib {
+		copy(out[btreeSplitHeaderSize+2*storage.BlockSize:], sibPage)
+	}
 	return out, nil
 }
 
 // DecodeBtreeSplit returns the rel + (left,right) blocks + page
-// images carried by a BtreeSplit record payload.
-func DecodeBtreeSplit(payload []byte) (rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, err error) {
-	want := btreeSplitHeaderSize + 2*storage.BlockSize
-	if len(payload) != want {
-		err = fmt.Errorf("wal: invalid btree-split payload len %d (want %d)", len(payload), want)
+// images carried by a BtreeSplit record payload. On a non-rightmost
+// split sibBlk is the old right sibling and sibPage its relinked
+// image; on a rightmost split sibBlk is storage.InvalidBlockNumber
+// and sibPage is nil.
+func DecodeBtreeSplit(payload []byte) (rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page, err error) {
+	want2 := btreeSplitHeaderSize + 2*storage.BlockSize
+	want3 := btreeSplitHeaderSize + 3*storage.BlockSize
+	if len(payload) != want2 && len(payload) != want3 {
+		err = fmt.Errorf("wal: invalid btree-split payload len %d (want %d or %d)", len(payload), want2, want3)
 		return
 	}
 	if payload[0] != RecordKindBtreeSplit {
@@ -1949,10 +1983,20 @@ func DecodeBtreeSplit(payload []byte) (rel storage.RelFileNode, leftBlk, rightBl
 	}
 	leftBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
 	rightBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[14:18]))
+	sibBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[18:22]))
+	hasSib := len(payload) == want3
+	if hasSib != (sibBlk != storage.InvalidBlockNumber) {
+		err = fmt.Errorf("wal: btree-split sibBlk/payload-length mismatch (sibBlk=%d len=%d)", sibBlk, len(payload))
+		return
+	}
 	leftPage = make(storage.Page, storage.BlockSize)
 	copy(leftPage, payload[btreeSplitHeaderSize:btreeSplitHeaderSize+storage.BlockSize])
 	rightPage = make(storage.Page, storage.BlockSize)
-	copy(rightPage, payload[btreeSplitHeaderSize+storage.BlockSize:])
+	copy(rightPage, payload[btreeSplitHeaderSize+storage.BlockSize:btreeSplitHeaderSize+2*storage.BlockSize])
+	if hasSib {
+		sibPage = make(storage.Page, storage.BlockSize)
+		copy(sibPage, payload[btreeSplitHeaderSize+2*storage.BlockSize:])
+	}
 	return
 }
 
@@ -3214,7 +3258,7 @@ func replayHeapPruneOpt(mgr *storage.Manager, r Record) error {
 // left → right so a reader following left's right-link from the
 // post-replay state always finds a real right page on disk.
 func replayBtreeSplit(mgr *storage.Manager, payload []byte) error {
-	rel, leftBlk, rightBlk, leftPage, rightPage, err := DecodeBtreeSplit(payload)
+	rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage, err := DecodeBtreeSplit(payload)
 	if err != nil {
 		return err
 	}
@@ -3223,6 +3267,15 @@ func replayBtreeSplit(mgr *storage.Manager, payload []byte) error {
 	}
 	if err := writeBlockOrExtend(mgr, rel, rightBlk, rightPage); err != nil {
 		return fmt.Errorf("apply right block %d: %w", rightBlk, err)
+	}
+	// Non-rightmost split: relink the old right sibling's btpo_prev
+	// to the new right page. Applied last; the sibling already
+	// exists on disk (it predates the split) so this is always a
+	// WriteBlock, never an Extend.
+	if sibBlk != storage.InvalidBlockNumber {
+		if err := writeBlockOrExtend(mgr, rel, sibBlk, sibPage); err != nil {
+			return fmt.Errorf("apply old-right-sibling block %d: %w", sibBlk, err)
+		}
 	}
 	return nil
 }
