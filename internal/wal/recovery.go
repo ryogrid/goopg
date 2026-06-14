@@ -398,6 +398,21 @@ const (
 	// invalidation is implicit in the kind byte rather than encoded as a flag.
 	RecordKindXactCommitInval byte = 32
 
+	// RecordKindClogTruncate logs a CLOG (pg_xact) truncation: the oldest
+	// XID whose commit status is still retained. Emitted by
+	// mvcc.CLog.TruncateCLOG after VACUUM/freeze advances the cluster
+	// datfrozenxid, so a standby learns the new valid xid before the next
+	// checkpoint and crash recovery re-applies the (idempotent) truncation.
+	// Mirrors PG's XLOG_CLOG record with op CLOG_TRUNCATE (see
+	// postgres/src/backend/access/transam/clog.c:WriteTruncateXlogRec and
+	// clog_redo's CLOG_TRUNCATE branch, postgres/src/include/access/clog.h
+	// xl_clog_truncate). goopg carries only the oldestXid (the cutoff page is
+	// derivable and the cluster is single-database), so the wire format is
+	// "kind(1) | oldestXid(4)" = 5 bytes — identical to the xact markers.
+	// Physical page recovery is a no-op (clog is a write-behind cache); the
+	// recovery driver in internal/initdb replays it against the CLog.
+	RecordKindClogTruncate byte = 33
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -779,6 +794,29 @@ func EncodeXactCommitInval(xid storage.TransactionID) []byte {
 	out[0] = RecordKindXactCommitInval
 	binary.LittleEndian.PutUint32(out[1:5], uint32(xid))
 	return out
+}
+
+// EncodeClogTruncate encodes a CLOG_TRUNCATE record carrying oldestXid — the
+// oldest XID whose commit status is still retained after the truncation.
+// Wire format: "kind(1) | oldestXid(4)" = 5 bytes. Mirrors PG's
+// WriteTruncateXlogRec (postgres/src/backend/access/transam/clog.c:1029).
+func EncodeClogTruncate(xid storage.TransactionID) []byte {
+	out := make([]byte, xactRecordSize)
+	out[0] = RecordKindClogTruncate
+	binary.LittleEndian.PutUint32(out[1:5], uint32(xid))
+	return out
+}
+
+// DecodeClogTruncate decodes a RecordKindClogTruncate payload, returning the
+// retained oldestXid.
+func DecodeClogTruncate(payload []byte) (storage.TransactionID, error) {
+	if len(payload) != xactRecordSize {
+		return 0, fmt.Errorf("wal: clog-truncate payload len %d (want %d)", len(payload), xactRecordSize)
+	}
+	if payload[0] != RecordKindClogTruncate {
+		return 0, fmt.Errorf("wal: record kind %d is not clog-truncate", payload[0])
+	}
+	return storage.TransactionID(binary.LittleEndian.Uint32(payload[1:5])), nil
 }
 
 // ProcessCommittedInvalidationMessages unlinks both pg_internal.init files
@@ -2200,6 +2238,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// same transaction; this record carries no additional data.
 		_ = ProcessCommittedInvalidationMessages(mgr.DataDir(), defaultRecoveryDBOid)
 		return false, nil
+	case RecordKindClogTruncate:
+		// CLOG truncation marker (G9). Physical page recovery is a no-op: the
+		// clog (pg_xact) is a write-behind cache whose authoritative state is
+		// the WAL. The recovery driver in internal/initdb scans the WAL for
+		// this record after physical replay and re-applies the (idempotent)
+		// truncation to the CLog, which has no access to mvcc.Manager from
+		// here. Mirrors PG clog_redo's CLOG_TRUNCATE branch
+		// (postgres/src/backend/access/transam/clog.c:1131).
+		return false, nil
 	case RecordKindCreateDatabase, RecordKindDropDatabase:
 		// CREATE/DROP DATABASE records (M0054-0001) carry only a database
 		// name; goopg v0 has no per-database file namespacing, so the
@@ -2281,6 +2328,7 @@ func nativeApplyRecordKindKnown(kind byte) bool {
 		RecordKindXactCommit,
 		RecordKindXactAbort,
 		RecordKindXactCommitInval,
+		RecordKindClogTruncate,
 		RecordKindCreateDatabase,
 		RecordKindDropDatabase,
 		RecordKindCreateIndex,

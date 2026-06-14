@@ -991,6 +991,33 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
+	// G1/G9: install the CLOG truncate WAL hook NOW — after replayCLogFromWAL
+	// has finished re-applying any CLOG_TRUNCATE records (which call
+	// TruncateCLOG with a nil logger so recovery does not recursively append
+	// to the WAL). From here on, every live TruncateCLOG (driven by the
+	// checkpointer's TruncateCLOGFn) emits a durable RecordKindClogTruncate so
+	// a standby learns the new valid xid and a subsequent crash recovery can
+	// re-apply the idempotent truncation. Mirrors PG's WriteTruncateXlogRec
+	// (postgres/src/backend/access/transam/clog.c:1029). Best-effort flush:
+	// the truncation is durable-ordered after the checkpoint marker, so the
+	// record need not block; the next checkpoint/flush persists it.
+	if walWriter != nil {
+		clog.SetTruncateLogger(func(oldestXid storage.TransactionID) error {
+			payload := wal.EncodeClogTruncate(oldestXid)
+			_, endLSN, err := walWriter.Append(payload)
+			if err != nil {
+				return err
+			}
+			if ferr := walWriter.FlushUpTo(endLSN); ferr != nil {
+				// Non-fatal: the record is in the WAL buffer and the next
+				// checkpoint flush will persist it; the physical clog removal
+				// already happened durable-ordered after a checkpoint.
+				slog.Default().Warn("clog-truncate WAL flush failed", "err", ferr)
+			}
+			return nil
+		})
+	}
+
 	// Replication-slot registry. The retention path on the
 	// checkpointer (wired below in cmd/goopg start once the GUC
 	// values are known) consults this to decide which WAL
@@ -1047,6 +1074,32 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			return catalog.WithRelCacheInitLock(func() error {
 				return bootstrapRelcacheInitFiles(abs)
 			})
+		},
+		// G1: durable-ordered CLOG truncation. After each checkpoint is on
+		// disk, truncate pg_xact up to a conservative horizon and emit a
+		// CLOG_TRUNCATE WAL record (via the truncate logger installed on the
+		// clog above). The horizon is min(datfrozenxid, OldestXmin):
+		//   - datfrozenxid = min(relfrozenxid) across user tables — every XID
+		//     below it is frozen in every user heap, so its status is dead;
+		//   - OldestXmin guards against truncating status still consultable by
+		//     any in-progress or future snapshot.
+		// TruncateCLOG itself never drops the page containing the horizon, is
+		// idempotent, and is nil-safe on the logger. Conservative by design:
+		// when no user table has a relfrozenxid yet, datfrozenxid is 0 and we
+		// skip truncation entirely (truncate less when in doubt).
+		TruncateCLOGFn: func() error {
+			datFrozen := cat.DatFrozenXID()
+			if datFrozen < mvcc.FirstNormalTransactionID {
+				return nil // nothing frozen yet — never truncate
+			}
+			horizon := datFrozen
+			if ox := txnMgr.OldestXmin(); ox != 0 && ox < horizon {
+				horizon = ox
+			}
+			if horizon < mvcc.FirstNormalTransactionID {
+				return nil
+			}
+			return clog.TruncateCLOG(horizon)
 		},
 	})
 

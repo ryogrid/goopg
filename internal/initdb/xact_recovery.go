@@ -72,6 +72,14 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 				xid := storage.TransactionID(binary.LittleEndian.Uint32(r.Payload[1:5]))
 				xactStampAndAdvance(clog, txnMgr, xid, false)
 				continue
+			case wal.RecordKindClogTruncate:
+				// G9: re-apply the (idempotent) CLOG truncation so the
+				// post-recovery clog matches the durable WAL state. PG's
+				// clog_redo CLOG_TRUNCATE branch does the same
+				// (postgres/src/backend/access/transam/clog.c:1131).
+				oldestXid := storage.TransactionID(binary.LittleEndian.Uint32(r.Payload[1:5]))
+				replayClogTruncate(clog, oldestXid)
+				continue
 			}
 		}
 		// --- Canonical PG-format records (emitted alongside native in
@@ -83,6 +91,22 @@ func replayCLogFromWAL(walDir string, clog *mvcc.CLog, txnMgr *mvcc.Manager) err
 		}
 	}
 	return nil
+}
+
+// replayClogTruncate re-applies a CLOG_TRUNCATE record (G9). Truncation is
+// idempotent: TruncateCLOG advances oldestClogXid monotonically and removes
+// only segments/banks/flat-file-prefix entirely below oldestXid's page, so
+// replaying the same (or an older) record after recovery is a no-op. Errors
+// are logged-and-ignored at the caller's discretion; the WAL record is the
+// authoritative durability guarantee. We pass the in-recovery clog so its
+// truncate-logger hook is NOT re-fired (open.go installs the logger only
+// after this replay pass completes), preventing a recursive WAL append
+// during recovery.
+func replayClogTruncate(clog *mvcc.CLog, oldestXid storage.TransactionID) {
+	if oldestXid == storage.InvalidTransactionID {
+		return
+	}
+	_ = clog.TruncateCLOG(oldestXid)
 }
 
 // xactStampAndAdvance stamps the clog and advances txnMgr.NextXID past xid.

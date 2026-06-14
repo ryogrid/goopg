@@ -421,20 +421,20 @@ type Index struct {
 	// columns (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil
 	// when Columns[i] == "" (expression column); nil for plain column names.
 	// Not persisted to JSON (parser.Expr is not JSON-serializable).
-	ColExprs        []*parser.Expr
+	ColExprs []*parser.Expr
 	// ColExprStrings is a pre-serialized SQL string for each expression column
 	// (parallel to ColExprs). Non-empty when Columns[i]=="" and the executor
 	// has serialized the expression via defaultExprToSQL. M0097-0023.
-	ColExprStrings  []string
-	HasPredicate    bool         // true if this is a partial index (has a WHERE clause)
-	Predicate       parser.Expr  // WHERE predicate expression (nil if no WHERE clause)
+	ColExprStrings []string
+	HasPredicate   bool        // true if this is a partial index (has a WHERE clause)
+	Predicate      parser.Expr // WHERE predicate expression (nil if no WHERE clause)
 	// PredicateString is a pre-serialized SQL string for the WHERE predicate.
 	// Set by the executor at CREATE INDEX time. M0097-0023.
 	PredicateString string
-	IncludeColumns  []string     // non-key covering columns from INCLUDE (…)
-	IsConstraint   bool     // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
-	IsExclusion    bool     // true when index backs an EXCLUDE USING constraint
-	ExclusionOp    string   // per-column exclusion operator (e.g. "=")
+	IncludeColumns  []string // non-key covering columns from INCLUDE (…)
+	IsConstraint    bool     // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
+	IsExclusion     bool     // true when index backs an EXCLUDE USING constraint
+	ExclusionOp     string   // per-column exclusion operator (e.g. "=")
 	// PartitionParentOID is the OID of the parent index for partition index
 	// trees (ALTER INDEX parent ATTACH PARTITION child). Zero if not a partition
 	// index child. M0097-0023.
@@ -746,24 +746,24 @@ const PostgresDBOid uint32 = 5
 // virtual views.
 func NewInMemory() *InMemory {
 	c := &InMemory{
-		tables:              make(map[string]*Table),
-		indexes:             make(map[string]*Index),
-		byTable:             make(map[uint32]map[string]*Index),
-		nextOID:             FirstUserOID,
-		dbOid:               DefaultDBOid,
-		routines:            NewRoutines(),
-		databases:           map[string]bool{"postgres": true},
-		partitionChildren:        make(map[uint32][]uint32),
-		indexPartitionChildren:   make(map[uint32][]uint32),
-		inheritanceChildren: make(map[uint32][]uint32),
-		enumTypes:           make(map[string]*EnumType),
-		domains:             make(map[string]*Domain),
-		compositeTypeNames:  make(map[string]bool),
-		compositeTypeFields: make(map[string][]CompositeField),
-		constraintViewDeps:  make(map[string][]string),
-		opClassHashFuncs:    make(map[string]string),
-		opClassSchemas:      make(map[string]string),
-		userAggregates:      make(map[string]*UserAggregate),
+		tables:                 make(map[string]*Table),
+		indexes:                make(map[string]*Index),
+		byTable:                make(map[uint32]map[string]*Index),
+		nextOID:                FirstUserOID,
+		dbOid:                  DefaultDBOid,
+		routines:               NewRoutines(),
+		databases:              map[string]bool{"postgres": true},
+		partitionChildren:      make(map[uint32][]uint32),
+		indexPartitionChildren: make(map[uint32][]uint32),
+		inheritanceChildren:    make(map[uint32][]uint32),
+		enumTypes:              make(map[string]*EnumType),
+		domains:                make(map[string]*Domain),
+		compositeTypeNames:     make(map[string]bool),
+		compositeTypeFields:    make(map[string][]CompositeField),
+		constraintViewDeps:     make(map[string][]string),
+		opClassHashFuncs:       make(map[string]string),
+		opClassSchemas:         make(map[string]string),
+		userAggregates:         make(map[string]*UserAggregate),
 		schemas: map[string]uint32{
 			"pg_catalog":         11,
 			"public":             2200,
@@ -1758,7 +1758,12 @@ func (c *InMemory) registerSystemTables() {
 				"2",                          // relam: heap access method OID (OID 2)
 				strconv.Itoa(int(t.OID)),     // relfilenode: equals OID (no rewrite tracking in v0)
 				partBound,                    // relpartbound: partition bound string for children
-				func() string { if len(c.partitionChildren[t.OID]) > 0 { return "t" }; return "f" }(), // relhassubclass
+				func() string {
+					if len(c.partitionChildren[t.OID]) > 0 {
+						return "t"
+					}
+					return "f"
+				}(), // relhassubclass
 			})
 		}
 		// Emit index rows (relkind='i'/'I') so pg_class can be used to count indexes.
@@ -1826,7 +1831,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",                         // reloftype
 				"",                          // reloptions: NULL
 				idxRelam,                    // relam: index access method OID
-				strconv.Itoa(int(idx.OID)), // relfilenode: equals OID
+				strconv.Itoa(int(idx.OID)),  // relfilenode: equals OID
 				"",                          // relpartbound: indexes are never partition children
 				idxHasSubclass,              // relhassubclass: true if partitioned index
 			})
@@ -2662,10 +2667,10 @@ func (c *InMemory) registerSystemTables() {
 					row[15] = "f"
 				}
 				row[16] = fmt.Sprintf("%d", nc.InhCount) // coninhcount
-				row[17] = "f"                             // connoinherit
-				row[18] = "f"                             // conperiod
-				row[24] = nc.Expr                         // conbin
-				row[25] = "t"                             // conenforced: always true in v0
+				row[17] = "f"                            // connoinherit
+				row[18] = "f"                            // conperiod
+				row[24] = nc.Expr                        // conbin
+				row[25] = "t"                            // conenforced: always true in v0
 				out = append(out, row)
 			}
 		}
@@ -2948,26 +2953,26 @@ func (c *InMemory) registerSystemTables() {
 			out = append(out, []string{
 				fmt.Sprintf("%d", idx.OID),       // indexrelid
 				fmt.Sprintf("%d", idx.Table.OID), // indrelid
-				fmt.Sprintf("%d", natts),          // indnatts
-				fmt.Sprintf("%d", nkeyatts),       // indnkeyatts
-				boolStr(idx.Unique),               // indisunique
-				"f",                               // indnullsnotdistinct
-				boolStr(idx.Primary),              // indisprimary
-				boolStr(idx.IsExclusion),          // indisexclusion
-				"t",                               // indimmediate
-				"f",                               // indisclustered
-				"t",                               // indisvalid
-				"f",                               // indcheckxmin
-				"t",                               // indisready
-				"t",                               // indislive
-				"f",                               // indisreplident
-				indkey,                            // indkey
-				buildZeroVec(nkeyatts),            // indcollation
-				indclass,                          // indclass
-				buildZeroVec(nkeyatts),            // indoption
-				"",                                // indexprs (NULL)
-				"",                                // indpred (NULL)
-				"",                                // indcoloptions (NULL)
+				fmt.Sprintf("%d", natts),         // indnatts
+				fmt.Sprintf("%d", nkeyatts),      // indnkeyatts
+				boolStr(idx.Unique),              // indisunique
+				"f",                              // indnullsnotdistinct
+				boolStr(idx.Primary),             // indisprimary
+				boolStr(idx.IsExclusion),         // indisexclusion
+				"t",                              // indimmediate
+				"f",                              // indisclustered
+				"t",                              // indisvalid
+				"f",                              // indcheckxmin
+				"t",                              // indisready
+				"t",                              // indislive
+				"f",                              // indisreplident
+				indkey,                           // indkey
+				buildZeroVec(nkeyatts),           // indcollation
+				indclass,                         // indclass
+				buildZeroVec(nkeyatts),           // indoption
+				"",                               // indexprs (NULL)
+				"",                               // indpred (NULL)
+				"",                               // indcoloptions (NULL)
 			})
 		}
 		return out
@@ -4496,6 +4501,32 @@ func (c *InMemory) AllTables() []*Table {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
 	return out
+}
+
+// DatFrozenXID returns the minimum RelFrozenXID across all user (non-virtual,
+// non-system) tables that have a valid relfrozenxid, or 0 when none do. This
+// is the cluster-wide datfrozenxid candidate: every XID strictly below it is
+// frozen in every user heap, so CLOG status for those XIDs can be truncated.
+// Mirrors PG's per-database datfrozenxid = min(pg_class.relfrozenxid) computed
+// at the end of VACUUM (vac_update_datfrozenxid). System relations are
+// excluded because goopg does not freeze them; including their default-zero
+// relfrozenxid would pin truncation at 0. Does NOT mutate any catalog state.
+func (c *InMemory) DatFrozenXID() storage.TransactionID {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var oldest storage.TransactionID
+	for _, t := range c.tables {
+		if t.Virtual || IsSystemRelation(t.OID) {
+			continue
+		}
+		if t.RelFrozenXID == storage.InvalidTransactionID {
+			continue
+		}
+		if oldest == storage.InvalidTransactionID || t.RelFrozenXID < oldest {
+			oldest = t.RelFrozenXID
+		}
+	}
+	return oldest
 }
 
 // AllUserViews returns deep copies of every user-created non-materialized view.

@@ -47,7 +47,7 @@ type Launcher struct {
 	OnRunStart func()
 	OnRunEnd   func()
 
-	lastVacuum  map[string]time.Time   // key: qualified table name
+	lastVacuum  map[string]time.Time // key: qualified table name
 	lastAnalyze map[string]time.Time
 
 	logger *slog.Logger
@@ -185,6 +185,15 @@ const autovacuumFreezeMaxAge = storage.TransactionID(200_000_000)
 // needsVacuum returns true if the table should be vacuumed.
 // The primary trigger is the regular data-change heuristic; the secondary
 // (higher-priority) trigger is XID-age anti-wraparound (M0046-0005).
+//
+// CLOG truncation (G1) is intentionally NOT driven from this anti-wraparound
+// path. Once VACUUM/freeze advances a table's relfrozenxid, the cluster
+// datfrozenxid (= min relfrozenxid across user tables, catalog.DatFrozenXID)
+// rises, and the single durable-ordered truncation integration point — the
+// checkpointer's post-checkpoint TruncateCLOGFn hook (see internal/initdb/
+// open.go) — removes the now-dead pg_xact segments AFTER the checkpoint marker
+// is on disk. Keeping truncation off the vacuum path avoids removing clog
+// status that a not-yet-durable checkpoint might still need on crash recovery.
 func (l *Launcher) needsVacuum(tbl *catalog.Table) bool {
 	// Anti-wraparound trigger: force vacuum when relfrozenxid is too old.
 	if tbl.RelFrozenXID != storage.InvalidTransactionID && l.TxnMgr != nil {
@@ -204,4 +213,3 @@ func (l *Launcher) needsVacuum(tbl *catalog.Table) bool {
 func (l *Launcher) needsAnalyze(tbl *catalog.Table) bool {
 	return true
 }
-
